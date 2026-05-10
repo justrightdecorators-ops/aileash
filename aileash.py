@@ -8,7 +8,7 @@ from collections import defaultdict, deque
 
 DB = "aileash.db"
 SAFE_COUNTRIES = {"UK", "US", "DE", "FR", "CA", "AU"}
-REQUIRED_FIELDS = {"user_id","action","amount","country","device_id","anomaly","device_risk"}
+REQUIRED_FIELDS = {"user_id", "action", "amount", "country", "device_id", "anomaly", "device_risk"}
 
 _db_lock = threading.Lock()
 
