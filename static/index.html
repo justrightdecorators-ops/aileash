@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AILeash — AI Governance Firewall</title>
+
+<style>
+body {
+  margin: 0;
+  font-family: Arial, sans-serif;
+  background: #ffffff;
+  color: #d60000;
+}
+
+/* HEADER */
+header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 20px 40px;
+  border-bottom: 2px solid #d60000;
+}
+
+.logo {
+  font-weight: 900;
+  font-size: 20px;
+  letter-spacing: 3px;
+  color: #d60000;
+}
+
+.btn {
+  background: #d60000;
+  color: white;
+  padding: 10px 18px;
+  border: none;
+  cursor: pointer;
+  font-weight: bold;
+  text-decoration: none;
+  border-radius: 4px;
+}
+
+/* HERO */
+.hero {
+  text-align: center;
+  padding: 100px 20px;
+  max-width: 900px;
+  margin: auto;
+}
+
+.hero h1 {
+  font-size: 52px;
+  margin-bottom: 20px;
+  font-weight: 900;
+  letter-spacing: -1px;
+}
+
+.hero p {
+  font-size: 18px;
+  color: #a00000;
+  line-height: 1.7;
+  max-width: 700px;
+  margin: auto;
+}
+
+/* SECTIONS */
+.section {
+  max-width: 900px;
+  margin: 60px auto;
+  padding: 0 20px;
+}
+
+.card {
+  border: 2px solid #d60000;
+  padding: 18px;
+  margin: 12px 0;
+  font-weight: bold;
+  background: #fff5f5;
+}
+
+/* FORM */
+input, textarea {
+  width: 100%;
+  padding: 12px;
+  margin: 8px 0;
+  border: 2px solid #d60000;
+  outline: none;
+  font-size: 14px;
+}
+
+input:focus, textarea:focus {
+  background: #fff0f0;
+}
+
+/* BUTTON HOVER */
+.btn:hover {
+  background: #a80000;
+}
+
+/* FOOTER */
+footer {
+  text-align: center;
+  padding: 40px;
+  border-top: 2px solid #d60000;
+  color: #a00000;
+  font-size: 14px;
+}
+</style>
+
+</head>
+
+<body>
+
+<header>
+  <div class="logo">AILeash</div>
+  <a class="btn" href="#pricing">Get Started</a>
+</header>
+
+<div class="hero">
+  <h1>AI GOVERNANCE.<br>REAL-TIME CONTROL.</h1>
+  <p>
+    AILeash sits between your AI and the real world — scoring every decision instantly,
+    blocking unsafe actions before they happen, and logging everything for compliance.
+  </p>
+</div>
+
+<div class="section">
+  <h2>How it works</h2>
+
+  <div class="card">1. AI sends request → /govern</div>
+  <div class="card">2. Risk engine calculates score (0.00 – 1.00)</div>
+  <div class="card">3. System responds: ALLOW / CHALLENGE / BLOCK</div>
+  <div class="card">4. Every decision is logged in an audit chain</div>
+</div>
+
+<div class="section">
+  <h2>Why it matters</h2>
+
+  <div class="card">EU AI Act compliance required by 2026</div>
+  <div class="card">Prevents unsafe AI actions in real time</div>
+  <div class="card">Creates legal-grade audit trails automatically</div>
+  <div class="card">No infrastructure changes needed</div>
+</div>
+
+<div class="section" id="pricing">
+  <h2>Start Free</h2>
+
+  <input id="email" placeholder="Enter email">
+
+  <button class="btn" onclick="checkout()">Get Free Access</button>
+
+  <p id="msg"></p>
+</div>
+
+<div class="section">
+  <h2>Contact</h2>
+
+  <input id="name" placeholder="Name">
+  <input id="cemail" placeholder="Email">
+  <textarea id="message" placeholder="Message"></textarea>
+
+  <button class="btn" onclick="contact()">Send Message</button>
+
+  <p id="contactMsg"></p>
+</div>
+
+<footer>
+  AILeash — AI Safety Infrastructure
+</footer>
+
+<script>
+function checkout() {
+  const email = document.getElementById("email").value;
+
+  if (!email || !email.includes("@")) {
+    document.getElementById("msg").innerText = "Enter a valid email";
+    return;
+  }
+
+  window.location.href = "/checkout?email=" + encodeURIComponent(email);
+}
+
+async function contact() {
+  const res = await fetch("/contact", {
+    method: "POST",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({
+      name: document.getElementById("name").value,
+      email: document.getElementById("cemail").value,
+      message: document.getElementById("message").value
+    })
+  });
+
+  document.getElementById("contactMsg").innerText =
+    res.ok ? "Sent successfully" : "Error sending message";
+}
+</script>
+
+</body>
+</html>
