@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+gunicorn
+stripe
+requests
+python-multipart
