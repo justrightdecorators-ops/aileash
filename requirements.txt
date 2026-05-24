@@ -1,0 +1,54 @@
+import random
+import datetime
+
+HOOKS = [
+    "We tested prompt injection on real AI systems",
+    "Most AI agents fail silently under simple attacks",
+    "We ran security tests against production AI apps",
+    "AI systems behave unpredictably under adversarial input",
+    "Most LLM apps leak data without logging it"
+]
+
+INSIGHTS = [
+    "The real issue isn't model intelligence — it's runtime visibility",
+    "AI systems are being deployed without governance layers",
+    "Prompt injection is still widely unmonitored in production",
+    "Most teams have no audit trail for AI decisions",
+    "Security in AI apps is still largely reactive, not real-time"
+]
+
+CTAS = [
+    "We built AILeash to monitor this in real time",
+    "This is exactly what AILeash is designed to detect",
+    "We built a runtime firewall for these cases",
+    "AILeash adds governance layers to production AI systems"
+]
+
+PLATFORMS = ["Hacker News", "Reddit", "X (Twitter)", "LinkedIn"]
+
+def generate_post():
+    hook = random.choice(HOOKS)
+    insight = random.choice(INSIGHTS)
+    cta = random.choice(CTAS)
+    platform = random.choice(PLATFORMS)
+
+    post = f"""
+===========================
+PLATFORM: {platform}
+TIME: {datetime.datetime.utcnow()}
+===========================
+
+{hook}.
+
+{insight}.
+
+{cta}.
+
+===========================
+"""
+
+    return post
+
+
+if __name__ == "__main__":
+    print(generate_post())
