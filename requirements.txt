@@ -1,1 +1,0 @@
-# Pure Python — zero external dependencies
