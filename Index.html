@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>AILeash ETERNAL v4.0 — Monop Mint Legend</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700;800&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#03050a;--surface:#080d16;--surface2:#0d1520;--border:rgba(255,255,255,0.05);--accent:#00e5ff;--accent2:#ff3b5c;--accent3:#00ff88;--warn:#ffaa00;--text:#dde4f0;--muted:#5a6a8a}
+*{box-sizing:border-box;margin:0;padding:0}body{background:var(--bg);color:var(--text);font-family:'Syne',sans-serif}
+.logo{font-family:'JetBrains Mono',monospace;font-size:22px;font-weight:800;color:var(--accent);letter-spacing:-1px}
+.hero{min-height:100vh;display:flex;align-items:center;padding:120px 48px 80px;position:relative}
+.hero-grid{max-width:1280px;margin:0 auto;display:grid;grid-template-columns:1.1fr 0.9fr;gap:80px;align-items:center}
+h1{font-size:clamp(48px,6vw,82px);font-weight:800;line-height:1.05;letter-spacing:-2.5px}
+.chip{display:inline-flex;align-items:center;gap:10px;background:rgba(0,229,255,0.08);border:1px solid rgba(0,229,255,0.2);padding:8px 20px;border-radius:100px;font-family:'JetBrains Mono';font-size:13px}
+.term{background:var(--surface);border:1px solid var(--border);border-radius:16px;overflow:hidden;font-family:'JetBrains Mono';font-size:14px}
+.law-tags{display:flex;flex-wrap:wrap;gap:10px;margin-top:40px}
+.law-tag{background:rgba(124,58,237,0.1);border:1px solid rgba(124,58,237,0.3);padding:8px 16px;border-radius:6px;font-size:13px}
+.feature-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:28px;margin-top:60px}
+.card{background:var(--surface);border:1px solid var(--border);padding:32px;border-radius:16px}
+</style>
+</head>
+<body>
+
+<nav style="position:fixed;top:0;left:0;right:0;background:rgba(3,5,10,0.95);backdrop-filter:blur(12px);z-index:100;padding:20px 48px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--border)">
+  <div class="logo">AILeash <span style="color:#666;font-size:14px">ETERNAL v4.0</span></div>
+  <div style="display:flex;gap:32px;align-items:center">
+    <a href="#compliance" style="color:var(--muted);text-decoration:none">Compliance</a>
+    <a href="#oracle" style="color:var(--muted);text-decoration:none">The Oracle</a>
+    <a href="#pricing" style="color:var(--muted);text-decoration:none">Pricing</a>
+    <a href="#signup" style="background:var(--accent);color:#000;padding:10px 24px;border-radius:8px;font-weight:700;text-decoration:none">Get API Key</a>
+  </div>
+</nav>
+
+<section class="hero">
+  <div class="hero-grid">
+    <div>
+      <div class="chip"><span style="color:var(--accent)">● LIVE</span> EU AI Act Enforcement Window Open</div>
+      <h1>Every Agent Action.<br>Scored. <span style="color:var(--accent)">Predicted.</span> <span style="color:var(--accent3)">Aligned.</span><br><span style="color:var(--accent2)">Leashed Forever.</span></h1>
+      <p style="font-size:19px;color:var(--muted);max-width:520px;margin:32px 0">The original 9-signal governance engine, now legendary. Cascade Impact Prediction, Oracle Intent Alignment, and automatic regulator-ready Compliance Attestations.</p>
+      <div class="law-tags">
+        <span class="law-tag">EU AI Act Art.9 • 12 • 13</span>
+        <span class="law-tag">GDPR Art.22</span>
+        <span class="law-tag">ISO 42001</span>
+        <span class="law-tag">Runtime Agent Firewall</span>
+      </div>
+    </div>
+    <div class="term">
+      <div style="background:#111;padding:16px;display:flex;gap:8px">
+        <div style="width:12px;height:12px;background:#ff5f56;border-radius:50%"></div>
+        <div style="width:12px;height:12px;background:#ffbd2e;border-radius:50%"></div>
+        <div style="width:12px;height:12px;background:#27c93f;border-radius:50%"></div>
+      </div>
+      <div style="padding:28px;line-height:1.9">
+        <div style="color:#666">// POST /govern — Agent attempting high-value transfer</div>
+        <div style="margin-top:12px">{ ... }</div>
+        <div style="margin:20px 0;color:var(--accent)">→ decision: <span style="color:var(--accent3)">ALLOW</span></div>
+        <div style="color:#888">cascade_risk: LOW • oracle_alignment: EXCELLENT</div>
+        <div style="color:#666;margin-top:12px">attestation_id: 0x8f91a3b...</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="section" id="compliance" style="padding:100px 48px;background:var(--surface)">
+  <div style="max-width:1100px;margin:0 auto">
+    <h2 style="text-align:center;font-size:52px">Regulation Grade. Developer Simple.</h2>
+    <div class="feature-grid">
+      <div class="card">
+        <h3>EU AI Act Compliance</h3>
+        <p>Full support for high-risk AI systems. Automatic logging, risk management, transparency, and human oversight pathways.</p>
+      </div>
+      <div class="card">
+        <h3>Oracle Intent Alignment™</h3>
+        <p>Goes beyond risk scoring — understands the deeper intent and long-term consequences of agent actions.</p>
+      </div>
+      <div class="card">
+        <h3>Cascade Impact Engine</h3>
+        <p>Predicts downstream financial, legal, and reputational ripple effects before the action executes.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="section" id="oracle" style="padding:100px 48px">
+  <div style="max-width:1100px;margin:0 auto">
+    <h2 style="text-align:center">The Oracle Layer — What Nobody Else Has</h2>
+    <p style="text-align:center;max-width:700px;margin:0 auto 60px;color:var(--muted)">Your original 9-signal algorithm at the core, now with strategic foresight and intent understanding.</p>
+    <!-- More sections can be added here -->
+  </div>
+</section>
+
+<section id="signup" style="padding:120px 48px;background:var(--surface);text-align:center">
+  <h2 style="font-size:48px">Start Leashing Your Agents Today</h2>
+  <p style="max-width:600px;margin:30px auto;color:var(--muted)">Free tier available. Pro tier unlocks full Oracle + Cascade + Attestations.</p>
+  <a href="#" style="background:var(--accent);color:#000;padding:18px 48px;border-radius:12px;font-size:18px;font-weight:700;text-decoration:none">Get API Key Free →</a>
+</section>
+
+</body>
+        </html>
