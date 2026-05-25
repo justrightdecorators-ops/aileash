@@ -1,0 +1,1 @@
+{\n  \"$schema\": \"https://railway.app/railway.schema.json\",\n  \"build\": {\n    \"builder\": \"DOCKERFILE\"\n  },\n  \"deploy\": {\n    \"startCommand\": \"gunicorn --bind 0.0.0.0:$PORT --workers 4 --timeout 120 aileash:application\",\n    \"restartPolicyType\": \"ON_FAILURE\",\n    \"restartPolicyMaxRetries\": 5\n  }\n}\n"
