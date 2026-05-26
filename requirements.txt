@@ -1,3 +1,0 @@
-# AILeash ETERNAL v4.0 — Monop Mint Legend
-stripe>=10.0.0
-# No heavy dependencies — pure Python for maximum deployability
