@@ -53,23 +53,26 @@ def setup_stripe():
     if not STRIPE_SECRET:
         print("  WARNING: No STRIPE_SECRET env var set.")
         return
-    with _db_lock:
-        row = _conn.execute("SELECT v FROM config WHERE k='stripe_price_id'").fetchone()
-    if row:
-        STRIPE_PRICE_ID = row[0]
-        print(f"  Stripe ready: {STRIPE_PRICE_ID}")
-        return
-    print("  Setting up Stripe...")
-    product = stripe_call("POST", "/products", {"name": "AILeash Governance API", "description": "AI governance API — charged per action. EU AI Act compliant."})
-    if "error" in product:
-        print(f"  Stripe error: {product['error']}")
-        return
-    price = stripe_call("POST", "/prices", {"product": product["id"], "currency": "gbp", "billing_scheme": "per_unit", "unit_amount": 1, "recurring[interval]": "month", "recurring[usage_type]": "metered", "nickname": "Per Action"})
-    STRIPE_PRICE_ID = price["id"]
-    with _db_lock:
-        _conn.execute("INSERT INTO config(k,v) VALUES('stripe_price_id',?)", (STRIPE_PRICE_ID,))
-        _conn.commit()
-    print(f"  Stripe done: {STRIPE_PRICE_ID}")
+    try:
+        with _db_lock:
+            row = _conn.execute("SELECT v FROM config WHERE k='stripe_price_id'").fetchone()
+        if row:
+            STRIPE_PRICE_ID = row[0]
+            print(f"  Stripe ready: {STRIPE_PRICE_ID}")
+            return
+        print("  Setting up Stripe...")
+        product = stripe_call("POST", "/products", {"name": "AILeash Governance API", "description": "AI governance API — charged per action. EU AI Act compliant."})
+        if "error" in product:
+            print(f"  Stripe error: {product['error']}")
+            return
+        price = stripe_call("POST", "/prices", {"product": product["id"], "currency": "gbp", "billing_scheme": "per_unit", "unit_amount": 1, "recurring[interval]": "month", "recurring[usage_type]": "metered"})
+        STRIPE_PRICE_ID = price["id"]
+        with _db_lock:
+            _conn.execute("INSERT INTO config(k,v) VALUES('stripe_price_id',?)", (STRIPE_PRICE_ID,))
+            _conn.commit()
+        print(f"  Stripe done: {STRIPE_PRICE_ID}")
+    except Exception as e:
+        print(f"  WARNING: Stripe setup error: {e}")
 
 def create_api_key(email, stripe_customer):
     key = "al_live_" + secrets.token_hex(24)
@@ -238,7 +241,7 @@ def govern(event,api_key=None):
     state=load_user(event["user_id"])
     update_windows(event["user_id"])
     v=velocity(event["user_id"])
-    signals={"trust":state["trust"],"v60":v["60s"],"v5m":v["5m"],"v1h":v["1h"],"amount":event["amount"],"device_risk":event["device_risk"],"anomaly":event["anomaly"],"country_shift":state["last_country"] is not None and state["last_country"]!=event["country"],"unsafe_country":event["country"] not in SAFE_COUNTRIES}
+    signals={"trust":state["trust"],"v60":v["60s"],"v5m":v["5m"],"v1h":v["1h"],"amount":event["amount"],"device_risk":event["device_risk"],"anomaly":event["anomaly"],"country_shift":state["last_country"] and state["last_country"]!=event["country"],"unsafe_country":event["country"] not in SAFE_COUNTRIES}
     action_type=event.get("action","default")
     score=compute_score(signals,action_type)
     decision=decide(score)
@@ -302,9 +305,9 @@ h1{font-family:var(--display);font-size:clamp(56px,6vw,88px);line-height:.95;let
 h1 .red{color:var(--red)}
 .hero-p{font-size:17px;color:var(--muted);line-height:1.75;margin-bottom:36px;max-width:520px}
 .btns{display:flex;gap:14px;flex-wrap:wrap}
-.btn-p{background:var(--red);color:#fff;padding:14px 28px;border:none;font-family:var(--sans);font-weight:700;font-size:14px;letter-spacing:1px;text-transform:uppercase;cursor:pointer;text-decoration:none;transition:all .2s;border-radius:4px;display:inline-block}
+.btn-p{background:var(--red);color:#fff;padding:14px 28px;border:none;font-family:var(--sans);font-weight:700;font-size:14px;letter-spacing:1px;text-transform:uppercase;cursor:pointer;text-decoration:none;display:inline-block;border-radius:4px;transition:background .2s}
 .btn-p:hover{background:var(--red2)}
-.btn-o{background:transparent;color:var(--black);padding:14px 28px;border:2px solid var(--black);font-family:var(--sans);font-weight:700;font-size:14px;letter-spacing:1px;text-transform:uppercase;cursor:pointer;text-decoration:none;transition:all .2s;border-radius:4px;display:inline-block}
+.btn-o{background:transparent;color:var(--black);padding:14px 28px;border:2px solid var(--black);font-family:var(--sans);font-weight:700;font-size:14px;letter-spacing:1px;text-transform:uppercase;cursor:pointer;text-decoration:none;display:inline-block;border-radius:4px;transition:all .2s}
 .btn-o:hover{background:var(--black);color:#fff}
 .pills{display:flex;flex-wrap:wrap;gap:8px;margin-top:28px}
 .pill{border:1px solid var(--red);color:var(--red);padding:4px 12px;font-family:var(--mono);font-size:11px;border-radius:2px}
@@ -354,7 +357,7 @@ h2 span{color:var(--red)}
 .price-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:24px;margin-top:40px}
 .price-card{border:1px solid var(--border);padding:36px;position:relative}
 .price-card.featured{border:2px solid var(--red);background:#f8f8f8}
-.price-badge{position:absolute;top:-14px;left:50%;transform:translateX(-50%);background:var(--red);color:#fff;font-family:var(--mono);font-size:10px;font-weight:700;padding:4px 16px;letter-spacing:2px;text-transform:uppercase;white-space:nowrap}
+.price-badge{position:absolute;top:-14px;left:50%;transform:translateX(-50%);background:var(--red);color:#fff;font-family:var(--mono);font-size:10px;font-weight:700;padding:4px 16px;letter-spacing:1px}
 .price-tier{font-family:var(--mono);font-size:11px;letter-spacing:2px;color:var(--muted);text-transform:uppercase;margin-bottom:16px}
 .price-num{font-family:var(--display);font-size:56px;letter-spacing:-1px;margin-bottom:4px}
 .price-num sup{font-size:24px;vertical-align:super;color:var(--red)}
@@ -373,7 +376,7 @@ h2 span{color:var(--red)}
 .key-result.show{display:block}
 .key-lbl{font-family:var(--mono);font-size:10px;letter-spacing:2px;color:var(--red);margin-bottom:10px;text-transform:uppercase}
 .key-val{font-family:var(--mono);font-size:13px;color:#00ff88;word-break:break-all;background:#0d0d0d;padding:14px;border-radius:4px;border:1px solid #222}
-.key-copy{margin-top:12px;background:transparent;border:1px solid #333;color:#666;padding:8px 18px;font-family:var(--mono);font-size:11px;cursor:pointer;transition:all .2s;letter-spacing:1px;text-transform:uppercase;border-radius:4px}
+.key-copy{margin-top:12px;background:transparent;border:1px solid #333;color:#666;padding:8px 18px;font-family:var(--mono);font-size:11px;cursor:pointer;transition:all .2s;letter-spacing:1px;text-transform:uppercase}
 .key-copy:hover{border-color:var(--red);color:var(--red)}
 .usage-box{margin-top:16px;font-family:var(--mono);font-size:12px;color:#555;background:#0d0d0d;padding:16px;border-radius:4px;line-height:2.2}
 .usage-box em{color:#79b8ff;font-style:normal}
@@ -469,14 +472,14 @@ nav{padding:0 20px}.nav-links a:not(.nav-cta){display:none}
   <div class="sec-inner">
     <div class="sec-lbl">Regulatory Compliance</div>
     <h2>Built for the <span>EU AI Act</span></h2>
-    <p class="sec-sub">Regulation 2024/1689 enforcement begins August 2026. High-risk AI systems must implement risk management, audit trails, transparency, and human oversight. AILeash delivers every mandatory layer.</p>
+    <p class="sec-sub">Regulation 2024/1689 enforcement begins August 2026. High-risk AI systems must implement risk management, audit trails, transparency, and human oversight. AILeash delivers all four.</p>
     <div class="grid3">
-      <div class="card"><div class="card-ref">Art. 9 — Risk Management</div><h3>Continuous Assessment</h3><p>Every AI action assessed in real time using a proprietary multi-signal risk engine. Risk accumulates across sessions. No action escapes governance.</p></div>
-      <div class="card"><div class="card-ref">Art. 12 — Record Keeping</div><h3>Tamper-Evident Chain</h3><p>SHA-256 chained ledger with Merkle proof verification. Every decision cryptographically linked. Chain integrity verifiable at any time.</p></div>
-      <div class="card"><div class="card-ref">Art. 13 — Transparency</div><h3>Explainable Decisions</h3><p>Every ALLOW, CHALLENGE, or BLOCK returns human-readable reasons. No black boxes. Every factor surfaced for regulatory review.</p></div>
-      <div class="card"><div class="card-ref">Art. 17 — Quality Management</div><h3>Deterministic Scoring</h3><p>Same inputs always produce the same output. Version-locked scoring logic. Full reproducibility for regulatory audit.</p></div>
-      <div class="card"><div class="card-ref">GDPR Art. 22</div><h3>Human Oversight</h3><p>CHALLENGE decisions create a mandatory human review pathway. No fully automated high-risk decisions without oversight capability.</p></div>
-      <div class="card"><div class="card-ref">ISO 42001</div><h3>AI Management System</h3><p>Aligned with ISO 42001. Risk identification, treatment, monitoring baked into the core. Persistent audit trail survives restarts.</p></div>
+      <div class="card"><div class="card-ref">Art. 9 — Risk Management</div><h3>Continuous Assessment</h3><p>Every AI action assessed in real time using a proprietary multi-signal risk engine. Trust-weighted scoring.</p></div>
+      <div class="card"><div class="card-ref">Art. 12 — Record Keeping</div><h3>Tamper-Evident Chain</h3><p>SHA-256 chained ledger with Merkle proof verification. Every decision cryptographically audited forever.</p></div>
+      <div class="card"><div class="card-ref">Art. 13 — Transparency</div><h3>Explainable Decisions</h3><p>Every ALLOW, CHALLENGE, or BLOCK returns human-readable reasons. No black boxes.</p></div>
+      <div class="card"><div class="card-ref">Art. 17 — Quality Management</div><h3>Deterministic Scoring</h3><p>Same inputs always produce the same output. Version-locked scoring logic.</p></div>
+      <div class="card"><div class="card-ref">GDPR Art. 22</div><h3>Human Oversight</h3><p>CHALLENGE decisions create a mandatory human review pathway. No automated high-risk decisions alone.</p></div>
+      <div class="card"><div class="card-ref">ISO 42001</div><h3>AI Management System</h3><p>Risk identification, treatment, monitoring, and documentation baked in. Persistent audit trail.</p></div>
     </div>
   </div>
 </section>
@@ -486,14 +489,14 @@ nav{padding:0 20px}.nav-links a:not(.nav-cta){display:none}
     <h2>Three Steps. <span>One Decision.</span></h2>
     <p class="sec-sub">Every AI action passes through AILeash before it executes. Real-time. Automatic. Fully audited.</p>
     <div class="how-grid">
-      <div class="how-card"><div class="how-num">01</div><h3>Send The Action</h3><p>Your AI agent sends the proposed action to AILeash via a single API call before executing. Amount, location, device context, and behavioural signals included.</p></div>
-      <div class="how-card"><div class="how-num">02</div><h3>Proprietary Scoring</h3><p>AILeash runs the action through a proprietary multi-signal risk engine with action-type profiles. Behavioural patterns, velocity, geography, and trust history analysed.</p></div>
-      <div class="how-card"><div class="how-num">03</div><h3>Decision & Audit</h3><p>A decision returned in under 15ms with reasons and a Merkle-proofed SHA-256 audit record written to the tamper-evident chain.</p></div>
+      <div class="how-card"><div class="how-num">01</div><h3>Send The Action</h3><p>Your AI agent sends the proposed action to AILeash via a single API call before executing.</p></div>
+      <div class="how-card"><div class="how-num">02</div><h3>Proprietary Scoring</h3><p>AILeash runs the action through a multi-signal risk engine with action-type profiles.</p></div>
+      <div class="how-card"><div class="how-num">03</div><h3>Decision & Audit</h3><p>A decision returned in under 15ms with reasons and a Merkle-proofed audit record written.</p></div>
     </div>
     <div class="dec-grid">
-      <div class="dec-card dec-a"><div class="dec-v">ALLOW</div><div class="dec-r">LOW RISK — ACTION PROCEEDS</div><div class="dec-d">Action within acceptable risk parameters. Trust maintained. SHA-256 + Merkle audit record written.</div></div>
-      <div class="dec-card dec-c"><div class="dec-v">CHALLENGE</div><div class="dec-r">ELEVATED RISK — HUMAN REVIEW</div><div class="dec-d">Action flagged. GDPR Art.22 oversight pathway triggered. Full signal breakdown returned.</div></div>
-      <div class="dec-card dec-b"><div class="dec-v">BLOCK</div><div class="dec-r">HIGH RISK — ACTION HALTED</div><div class="dec-d">Action stopped immediately. Trust decays. Full explainability reasons returned. Audit record written.</div></div>
+      <div class="dec-card dec-a"><div class="dec-v">ALLOW</div><div class="dec-r">LOW RISK — ACTION PROCEEDS</div><div class="dec-d">Action within acceptable risk parameters. Trust maintained.</div></div>
+      <div class="dec-card dec-c"><div class="dec-v">CHALLENGE</div><div class="dec-r">ELEVATED RISK — HUMAN REVIEW</div><div class="dec-d">Action flagged. GDPR Art.22 oversight triggered.</div></div>
+      <div class="dec-card dec-b"><div class="dec-v">BLOCK</div><div class="dec-r">HIGH RISK — ACTION HALTED</div><div class="dec-d">Action stopped immediately. Trust decays.</div></div>
     </div>
   </div>
 </section>
@@ -503,12 +506,12 @@ nav{padding:0 20px}.nav-links a:not(.nav-cta){display:none}
     <h2>Regulation <span>References</span></h2>
     <p class="sec-sub">The specific articles of EU law AILeash addresses.</p>
     <div class="legal-grid">
-      <div class="legal-card"><div class="legal-act">EU AI Act — Reg. 2024/1689 — Art. 6</div><h3>High-Risk Classification</h3><p>Article 6 classifies AI systems used in critical infrastructure, employment, education, essential services, and financial services as high-risk. Must comply before August 2026. Fines up to €30M or 6% of global annual turnover.</p></div>
-      <div class="legal-card"><div class="legal-act">EU AI Act — Reg. 2024/1689 — Art. 9</div><h3>Risk Management System</h3><p>Requires continuous, iterative risk management throughout the entire AI system lifecycle. Must identify known and foreseeable risks, estimate and evaluate them, and adopt appropriate measures.</p></div>
-      <div class="legal-card"><div class="legal-act">EU AI Act — Reg. 2024/1689 — Art. 12</div><h3>Record Keeping & Logging</h3><p>High-risk AI systems must have automatic logging capabilities ensuring traceability. AILeash's SHA-256 chained ledger with Merkle proofs provides mathematically verifiable integrity.</p></div>
-      <div class="legal-card"><div class="legal-act">EU AI Act — Reg. 2024/1689 — Art. 13</div><h3>Transparency & Information</h3><p>Systems must be sufficiently transparent to enable deployers to interpret outputs. Every AILeash decision includes human-readable explainability reasons available for regulatory review.</p></div>
-      <div class="legal-card"><div class="legal-act">GDPR — Reg. 2016/679 — Art. 22</div><h3>Automated Decision-Making</h3><p>Data subjects have the right not to be subject to decisions based solely on automated processing. AILeash's CHALLENGE class triggers mandatory human review — a legally defensible oversight pathway.</p></div>
-      <div class="legal-card"><div class="legal-act">ISO/IEC 42001:2023</div><h3>AI Management Systems</h3><p>Specifies requirements for establishing and improving an AI management system. AILeash's continuous risk assessment, persistent audit trail, and explainable decisions align with core requirements.</p></div>
+      <div class="legal-card"><div class="legal-act">EU AI Act — Reg. 2024/1689 — Art. 6</div><h3>High-Risk Classification</h3><p>Article 6 classifies AI systems used in critical infrastructure and decision-making as high-risk.</p></div>
+      <div class="legal-card"><div class="legal-act">EU AI Act — Reg. 2024/1689 — Art. 9</div><h3>Risk Management System</h3><p>Requires continuous, iterative risk management throughout the entire lifecycle.</p></div>
+      <div class="legal-card"><div class="legal-act">EU AI Act — Reg. 2024/1689 — Art. 12</div><h3>Record Keeping & Logging</h3><p>High-risk AI systems must have automatic logging capabilities for all decisions.</p></div>
+      <div class="legal-card"><div class="legal-act">EU AI Act — Reg. 2024/1689 — Art. 13</div><h3>Transparency & Information</h3><p>Systems must be sufficiently transparent to enable deployers and users to understand decisions.</p></div>
+      <div class="legal-card"><div class="legal-act">GDPR — Reg. 2016/679 — Art. 22</div><h3>Automated Decision-Making</h3><p>Data subjects have the right not to be subject to decisions based solely on automated processing.</p></div>
+      <div class="legal-card"><div class="legal-act">ISO/IEC 42001:2023</div><h3>AI Management Systems</h3><p>Specifies requirements for establishing and improving an AI management system.</p></div>
     </div>
   </div>
 </section>
