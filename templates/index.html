@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NEON PROTOCOL</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700&family=Roboto+Mono&display=swap');
+        body { margin:0; padding:0; background:#0a0a0f; color:#00ffcc; font-family:'Roboto Mono', monospace; overflow:hidden; }
+        .hero { min-height:100vh; background:linear-gradient(45deg,#0a0a0f,#1a0033); display:flex; align-items:center; justify-content:center; position:relative; text-align:center; }
+        .content { z-index:2; max-width:800px; padding:40px; }
+        h1 { font-family:'Orbitron', sans-serif; font-size:4.5rem; text-shadow:0 0 30px #00ffcc; letter-spacing:4px; }
+        p { font-size:1.4rem; margin-bottom:50px; }
+        .btn { background:transparent; color:#00ffcc; border:3px solid #00ffcc; padding:18px 50px; font-size:1.3rem; font-family:'Orbitron', sans-serif; cursor:pointer; text-transform:uppercase; letter-spacing:3px; }
+        .btn:hover { background:#00ffcc; color:#0a0a0f; box-shadow:0 0 40px #00ffcc; }
+    </style>
+</head>
+<body>
+    <div class="hero">
+        <div class="content">
+            <h1>Welcome to Your Product</h1>
+            <p>Simple, clean, and ready to go.</p>
+            <button class="btn" onclick="checkout()">Buy Now</button>
+        </div>
+    </div>
+
+    <script>
+        function checkout() {
+            fetch('/create-checkout-session', { method: 'POST' })
+                .then(res => res.json())
+                .then(data => { if (data.url) window.location.href = data.url; });
+        }
+    </script>
+</body>
+</html>
