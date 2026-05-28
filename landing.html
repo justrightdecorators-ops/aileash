@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AILeash - AI Action Governance</title>
+    <style>
+        body { font-family: 'Segoe UI', sans-serif; margin: 0; background: #0f0f17; color: #eee; }
+        .container { max-width: 1000px; margin: 0 auto; padding: 2rem; }
+        header { text-align: center; padding: 4rem 0; background: linear-gradient(135deg, #1a1a2e, #16213e); }
+        h1 { font-size: 3rem; margin: 0; }
+        .tagline { color: #00ff9d; font-size: 1.3rem; }
+        .btn {
+            padding: 14px 32px; margin: 10px; font-size: 1.1rem; border: none; border-radius: 8px;
+            cursor: pointer; text-decoration: none; display: inline-block;
+        }
+        .btn-primary { background: #00ff9d; color: #000; font-weight: bold; }
+        .btn-secondary { background: #333; color: white; }
+        .features { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 2rem; margin: 4rem 0; }
+        .card { background: #1a1a2e; padding: 2rem; border-radius: 12px; }
+        footer { text-align: center; padding: 3rem; color: #666; }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="container">
+            <h1>AILeash</h1>
+            <p class="tagline">v3.0.0 • Real-time AI Action Risk Governance</p>
+            <div style="margin: 2rem 0;">
+                <a href="#" onclick="createKey()" class="btn btn-primary">Sign Up - Get API Key</a>
+                <a href="mailto:justrightdecorators@gmail.com" class="btn btn-secondary">Contact Sales</a>
+            </div>
+        </div>
+    </header>
+
+    <div class="container">
+        <div class="features">
+            <div class="card">
+                <h2>🔒 Risk Engine</h2>
+                <p>Behavioral analysis, velocity control, country risk, device fingerprinting, and more.</p>
+            </div>
+            <div class="card">
+                <h2>📊 Audit Chain</h2>
+                <p>Cryptographically verifiable audit log with Merkle roots.</p>
+            </div>
+            <div class="card">
+                <h2>💳 Stripe Ready</h2>
+                <p>Production subscription billing integration.</p>
+            </div>
+        </div>
+
+        <h2 style="text-align:center">How to Get Started</h2>
+        <ol>
+            <li>Click <strong>"Sign Up - Get API Key"</strong></li>
+            <li>Enter your email</li>
+            <li>Use the returned key in your Authorization header</li>
+        </ol>
+    </div>
+
+    <footer>
+        <p>AILeash • Secure AI Operations</p>
+        <p><a href="/api/status" style="color:#00ff9d">Status</a> • 
+           <a href="/api/verify" style="color:#00ff9d">Verify Chain</a></p>
+    </footer>
+
+    <script>
+    async function createKey() {
+        const email = prompt("Enter your email address:");
+        if (!email) return;
+
+        try {
+            const res = await fetch('/api/keys', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ email })
+            });
+            
+            const data = await res.json();
+            
+            if (res.ok) {
+                alert(`✅ API Key Created!\n\nKey: ${data.key}\n\nSave this key securely!`);
+            } else {
+                alert(`Error: ${data.error || 'Failed to create key'}`);
+            }
+        } catch(e) {
+            alert("Connection error. Is the server running?");
+        }
+    }
+    </script>
+</body>
+</html>
