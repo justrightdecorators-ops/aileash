@@ -31,6 +31,7 @@ def get_conn():
     conn.execute("CREATE TABLE IF NOT EXISTS api_keys (key TEXT PRIMARY KEY, email TEXT, stripe_customer TEXT, actions_used INTEGER DEFAULT 0, created REAL, active INTEGER DEFAULT 1)")
     conn.execute("CREATE TABLE IF NOT EXISTS config (k TEXT PRIMARY KEY, v TEXT)")
     conn.execute("CREATE TABLE IF NOT EXISTS velocity_history (user_id TEXT, window_type TEXT, timestamps TEXT, PRIMARY KEY(user_id, window_type))")
+    conn.execute("CREATE TABLE IF NOT EXISTS contacts (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, email TEXT, message TEXT, created REAL)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_log(user_id)")
     conn.commit()
     return conn
@@ -46,7 +47,8 @@ def stripe_call(method, endpoint, data=None):
         with urllib.request.urlopen(req) as r:
             return json.loads(r.read())
     except urllib.error.HTTPError as e:
-        return json.loads(e.read())
+        err_body = e.read().decode()
+        return json.loads(err_body)
 
 def setup_stripe():
     global STRIPE_PRICE_ID
@@ -64,10 +66,42 @@ def setup_stripe():
         return
     print("  No STRIPE_PRICE_ID set. Add it in Railway Variables.")
 
-def create_api_key(email, stripe_customer):
+def create_stripe_customer(email):
+    """Create a Stripe customer for the given email."""
+    if not STRIPE_SECRET:
+        return None
+    result = stripe_call("POST", "/customers", {"email": email, "description": f"AILeash user: {email}"})
+    if "id" in result:
+        return result["id"]
+    return None
+
+def create_stripe_subscription(customer_id):
+    """Create a subscription for the customer."""
+    if not STRIPE_SECRET or not STRIPE_PRICE_ID:
+        return None
+    result = stripe_call("POST", "/subscriptions", {
+        "customer": customer_id,
+        "items": [{"price": STRIPE_PRICE_ID}],
+        "billing_cycle_anchor": "automatic"
+    })
+    if "id" in result:
+        return result["id"]
+    return None
+
+def create_api_key(email, create_stripe=True):
     key = "al_live_" + secrets.token_hex(24)
+    stripe_customer = ""
+    
+    # Create Stripe customer and subscription if enabled
+    if create_stripe and STRIPE_SECRET:
+        customer_id = create_stripe_customer(email)
+        if customer_id:
+            stripe_customer = customer_id
+            create_stripe_subscription(customer_id)
+    
     with _db_lock:
-        _conn.execute("INSERT INTO api_keys(key,email,stripe_customer,created) VALUES(?,?,?,?)", (key, email, stripe_customer, time.time()))
+        _conn.execute("INSERT INTO api_keys(key,email,stripe_customer,created) VALUES(?,?,?,?)", 
+                     (key, email, stripe_customer, time.time()))
         _conn.commit()
     return key
 
@@ -85,11 +119,24 @@ def increment_usage(key):
 def report_usage(key):
     with _db_lock:
         row = _conn.execute("SELECT stripe_customer FROM api_keys WHERE key=?", (key,)).fetchone()
-    if not row: return
+    if not row or not row[0]: return
+    
     subs = stripe_call("GET", f"/subscriptions?customer={row[0]}&status=active")
     if not subs.get("data"): return
-    item_id = subs["data"][0]["items"]["data"][0]["id"]
-    stripe_call("POST", f"/subscription_items/{item_id}/usage_records", {"quantity": 1, "timestamp": int(time.time()), "action": "increment"})
+    
+    try:
+        item_id = subs["data"][0]["items"]["data"][0]["id"]
+        stripe_call("POST", f"/subscription_items/{item_id}/usage_records", 
+                   {"quantity": 1, "timestamp": int(time.time()), "action": "increment"})
+    except (IndexError, KeyError):
+        pass
+
+def save_contact(name, email, message):
+    """Save contact form submission to database."""
+    with _db_lock:
+        _conn.execute("INSERT INTO contacts(name,email,message,created) VALUES(?,?,?,?)", 
+                     (name, email, message, time.time()))
+        _conn.commit()
 
 WINDOW_60S = defaultdict(deque)
 WINDOW_5M  = defaultdict(deque)
@@ -110,7 +157,8 @@ def load_velocity(uid):
 def save_velocity(uid):
     with _db_lock:
         for wtype, q in [("60s",WINDOW_60S[uid]),("5m",WINDOW_5M[uid]),("1h",WINDOW_1H[uid])]:
-            _conn.execute("INSERT INTO velocity_history(user_id,window_type,timestamps) VALUES(?,?,?) ON CONFLICT(user_id,window_type) DO UPDATE SET timestamps=excluded.timestamps", (uid,wtype,json.dumps(list(q))))
+            _conn.execute("INSERT INTO velocity_history(user_id,window_type,timestamps) VALUES(?,?,?) ON CONFLICT(user_id,window_type) DO UPDATE SET timestamps=excluded.timestamps", 
+                         (uid,wtype,json.dumps(list(q))))
         _conn.commit()
 
 def prune(q,s):
@@ -231,7 +279,7 @@ def govern(event,api_key=None):
     state=load_user(event["user_id"])
     update_windows(event["user_id"])
     v=velocity(event["user_id"])
-    signals={"trust":state["trust"],"v60":v["60s"],"v5m":v["5m"],"v1h":v["1h"],"amount":event["amount"],"device_risk":event["device_risk"],"anomaly":event["anomaly"],"country_shift":state["last_country"] is not None and state["last_country"]!=event["country"],"unsafe_country":event["country"] not in SAFE_COUNTRIES}
+    signals={"trust":state["trust"],"v60":v["60s"],"v5m":v["5m"],"v1h":v["1h"],"amount":event["amount"],"device_risk":event["device_risk"],"anomaly":event["anomaly"],"country_shift":state["last_country"] and state["last_country"]!=event["country"],"unsafe_country":event["country"] not in SAFE_COUNTRIES}
     action_type=event.get("action","default")
     score=compute_score(signals,action_type)
     decision=decide(score)
@@ -292,6 +340,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         
         if path=="/api/govern": self.govern_post(data)
         elif path=="/api/keys": self.create_key(data)
+        elif path=="/api/contact": self.create_contact(data)
         else: err(self,"Not found",404)
     
     def do_OPTIONS(self):
@@ -353,7 +402,6 @@ class RequestHandler(BaseHTTPRequestHandler):
     
     def create_key(self,data):
         email=data.get("email","").strip()
-        stripe_customer=data.get("stripe_customer","")
         
         if not email:
             return err(self,"email required",400)
@@ -362,10 +410,33 @@ class RequestHandler(BaseHTTPRequestHandler):
             return err(self,"invalid email format",400)
         
         try:
-            key=create_api_key(email,stripe_customer)
+            key=create_api_key(email, create_stripe=True)
             send(self,{"key":key,"email":email,"created":time.time()},201)
         except Exception as e:
             err(self,f"Failed to create key: {str(e)}",500)
+    
+    def create_contact(self,data):
+        name=data.get("name","").strip()
+        email=data.get("email","").strip()
+        message=data.get("message","").strip()
+        
+        if not name:
+            return err(self,"name required",400)
+        
+        if not email:
+            return err(self,"email required",400)
+        
+        if not message:
+            return err(self,"message required",400)
+        
+        if "@" not in email:
+            return err(self,"invalid email format",400)
+        
+        try:
+            save_contact(name, email, message)
+            send(self,{"status":"Message received","name":name,"email":email,"timestamp":time.time()},201)
+        except Exception as e:
+            err(self,f"Failed to save contact: {str(e)}",500)
     
     def log_message(self,format,*args): 
         pass
