@@ -253,6 +253,8 @@ def send(h,data,status=200):
     h.send_header("Content-Type","application/json")
     h.send_header("Content-Length",str(len(body)))
     h.send_header("Access-Control-Allow-Origin","*")
+    h.send_header("Access-Control-Allow-Methods","GET, POST, OPTIONS")
+    h.send_header("Access-Control-Allow-Headers","Authorization, Content-Type")
     h.end_headers()
     h.wfile.write(body)
 
@@ -261,6 +263,7 @@ def send_html(h,html):
     h.send_response(200)
     h.send_header("Content-Type","text/html; charset=utf-8")
     h.send_header("Content-Length",str(len(body)))
+    h.send_header("Access-Control-Allow-Origin","*")
     h.end_headers()
     h.wfile.write(body)
 
@@ -276,13 +279,14 @@ class RequestHandler(BaseHTTPRequestHandler):
         if path=="/": self.landing()
         elif path=="/api/govern": self.govern_get()
         elif path=="/api/verify": self.verify_get()
+        elif path=="/api/status": self.status()
         elif path=="/health": self.health()
         else: err(self,"Not found",404)
     
     def do_POST(self):
         path=urlparse(self.path).path
         length=int(self.headers.get("Content-Length",0))
-        body=self.rfile.read(length).decode()
+        body=self.rfile.read(length).decode() if length else ""
         try: data=json.loads(body) if body else {}
         except: return err(self,"Invalid JSON",400)
         
@@ -290,43 +294,96 @@ class RequestHandler(BaseHTTPRequestHandler):
         elif path=="/api/keys": self.create_key(data)
         else: err(self,"Not found",404)
     
+    def do_OPTIONS(self):
+        h=self
+        h.send_response(200)
+        h.send_header("Access-Control-Allow-Origin","*")
+        h.send_header("Access-Control-Allow-Methods","GET, POST, OPTIONS")
+        h.send_header("Access-Control-Allow-Headers","Authorization, Content-Type")
+        h.end_headers()
+    
     def landing(self):
-        with open("landing.html","r") as f:
-            send_html(self,f.read())
+        try:
+            with open("landing.html","r") as f:
+                send_html(self,f.read())
+        except:
+            err(self,"Landing page not found",404)
     
     def govern_get(self):
         err(self,"POST required",405)
     
     def govern_post(self,data):
+        key=get_key(self)
+        if not key:
+            return err(self,"Authorization header required: Bearer <api_key>",401)
+        
+        validated=validate_key(key)
+        if not validated:
+            return err(self,"Invalid or inactive API key",403)
+        
         try:
-            result=govern(data,get_key(self))
+            result=govern(data,key)
             send(self,result)
         except ValueError as e:
             err(self,str(e),400)
         except Exception as e:
-            err(self,str(e),500)
+            err(self,f"Server error: {str(e)}",500)
     
     def verify_get(self):
         result=verify_chain()
         send(self,result)
     
+    def status(self):
+        with _db_lock:
+            block_count=_conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0]
+            key_count=_conn.execute("SELECT COUNT(*) FROM api_keys WHERE active=1").fetchone()[0]
+            user_count=_conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        
+        send(self,{
+            "status":"operational",
+            "version":VERSION,
+            "blocks":block_count,
+            "active_keys":key_count,
+            "users_tracked":user_count,
+            "timestamp":time.time()
+        })
+    
     def health(self):
-        send(self,{"status":"ok","version":VERSION})
+        send(self,{"status":"ok","version":VERSION,"uptime":"running"})
     
     def create_key(self,data):
-        email=data.get("email")
+        email=data.get("email","").strip()
         stripe_customer=data.get("stripe_customer","")
-        if not email: return err(self,"email required",400)
-        key=create_api_key(email,stripe_customer)
-        send(self,{"key":key,"email":email},201)
+        
+        if not email:
+            return err(self,"email required",400)
+        
+        if "@" not in email:
+            return err(self,"invalid email format",400)
+        
+        try:
+            key=create_api_key(email,stripe_customer)
+            send(self,{"key":key,"email":email,"created":time.time()},201)
+        except Exception as e:
+            err(self,f"Failed to create key: {str(e)}",500)
     
-    def log_message(self,format,*args): pass
+    def log_message(self,format,*args): 
+        pass
 
 def main():
     setup_stripe()
     server=HTTPServer(("0.0.0.0",PORT),RequestHandler)
-    print(f"AILeash v{VERSION} running on port {PORT}")
-    server.serve_forever()
+    print(f"AILeash v{VERSION} starting on port {PORT}...")
+    print(f"  Landing page: http://localhost:{PORT}/")
+    print(f"  API endpoint: http://localhost:{PORT}/api/govern")
+    print(f"  Status: http://localhost:{PORT}/api/status")
+    print(f"  Verify chain: http://localhost:{PORT}/api/verify")
+    print(f"  Health check: http://localhost:{PORT}/health")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down gracefully...")
+        server.shutdown()
 
 if __name__=="__main__":
     main()
