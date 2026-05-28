@@ -1,0 +1,3 @@
+# AILeash v3.0.0 - Zero External Dependencies
+# Pure Python standard library only
+# No pip installs required
