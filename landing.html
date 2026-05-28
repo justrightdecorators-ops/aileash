@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>AILeash — AI Governance & Compliance Infrastructure</title>
+
+<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+
+<style>
+:root{
+  --red:#cc0000;
+  --black:#0a0a0a;
+  --muted:#666;
+  --border:#e6e6e6;
+  --bg:#ffffff;
+  --mono:'JetBrains Mono',monospace;
+  --sans:'DM Sans',sans-serif;
+  --display:'Bebas Neue',sans-serif;
+}
+
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{font-family:var(--sans);background:var(--bg);color:var(--black);overflow-x:hidden}
+
+/* NAV */
+nav{
+  position:fixed;
+  top:0;left:0;right:0;
+  height:64px;
+  background:#fff;
+  border-bottom:3px solid var(--red);
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  padding:0 48px;
+  z-index:100;
+}
+
+.logo{font-family:var(--display);font-size:28px;letter-spacing:2px}
+.logo span{color:var(--red)}
+
+.nav a{
+  margin-left:24px;
+  text-decoration:none;
+  color:var(--muted);
+  font-size:14px;
+}
+.nav a:hover{color:var(--red)}
+
+.cta{
+  background:var(--red);
+  color:#fff;
+  padding:10px 18px;
+  border-radius:4px;
+  font-weight:700;
+}
+
+/* HERO */
+.hero{
+  padding:140px 48px 90px;
+  border-bottom:1px solid var(--border);
+}
+
+.hero-inner{
+  max-width:1200px;
+  margin:auto;
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:80px;
+  align-items:center;
+}
+
+h1{
+  font-family:var(--display);
+  font-size:74px;
+  line-height:0.95;
+  letter-spacing:2px;
+}
+
+h1 span{color:var(--red)}
+
+.sub{
+  margin-top:18px;
+  font-size:17px;
+  color:var(--muted);
+  line-height:1.7;
+  max-width:540px;
+}
+
+.buttons{
+  margin-top:30px;
+  display:flex;
+  gap:12px;
+}
+
+.btn{
+  padding:14px 22px;
+  border-radius:4px;
+  text-transform:uppercase;
+  font-weight:700;
+  font-size:13px;
+  text-decoration:none;
+}
+
+.primary{background:var(--red);color:#fff}
+.secondary{border:2px solid #000;color:#000}
+
+/* TERMINAL */
+.terminal{
+  background:#0a0a0a;
+  color:#ccc;
+  font-family:var(--mono);
+  padding:24px;
+  border-radius:8px;
+}
+
+/* SECTION */
+section{
+  padding:90px 48px;
+  border-bottom:1px solid var(--border);
+}
+
+.container{
+  max-width:1200px;
+  margin:auto;
+}
+
+h2{
+  font-family:var(--display);
+  font-size:52px;
+  letter-spacing:2px;
+}
+
+h2 span{color:var(--red)}
+
+p.lead{
+  margin-top:12px;
+  color:var(--muted);
+  max-width:720px;
+  line-height:1.7;
+}
+
+/* GRID */
+.grid{
+  margin-top:50px;
+  display:grid;
+  grid-template-columns:repeat(3,1fr);
+  gap:24px;
+}
+
+.card{
+  border:1px solid var(--border);
+  padding:28px;
+}
+
+.card h3{
+  font-family:var(--display);
+  margin-bottom:10px;
+}
+
+/* PRICING */
+.pricing{
+  display:grid;
+  grid-template-columns:repeat(3,1fr);
+  gap:24px;
+  margin-top:50px;
+}
+
+.price{
+  border:1px solid var(--border);
+  padding:30px;
+}
+
+.price h3{font-family:var(--display);font-size:26px}
+.price .amt{font-size:42px;color:var(--red);margin:10px 0}
+
+/* FOOTER */
+footer{
+  background:#0a0a0a;
+  color:#666;
+  padding:60px 48px;
+  margin-top:60px;
+}
+
+</style>
+</head>
+
+<body>
+
+<nav>
+  <div class="logo">AI<span>Leash</span></div>
+  <div class="nav">
+    <a href="#features">Features</a>
+    <a href="#compliance">Compliance</a>
+    <a href="#pricing">Pricing</a>
+    <a class="cta" href="#signup">Get API Key</a>
+  </div>
+</nav>
+
+<!-- HERO -->
+<div class="hero">
+  <div class="hero-inner">
+    <div>
+      <h1>AI Governance<br><span>Infrastructure</span></h1>
+
+      <p class="sub">
+        AILeash is a real-time governance layer for AI systems.
+        Every action is scored, audited, and approved before execution using cryptographic verification and behavioural risk analysis.
+      </p>
+
+      <div class="buttons">
+        <a class="btn primary" href="#signup">Get API Key</a>
+        <a class="btn secondary" href="#features">Explore</a>
+      </div>
+    </div>
+
+    <div class="terminal">
+      // AI ACTION
+      {"action":"transfer","amount":12000,"country":"RU"}
+
+      // RESULT
+      {"decision":"BLOCK","score":0.91,"reason":"risk_anomaly"}
+    </div>
+  </div>
+</div>
+
+<!-- FEATURES -->
+<section id="features">
+<div class="container">
+<h2>Core <span>Features</span></h2>
+<p class="lead">A deterministic governance layer designed for production AI systems operating in regulated environments.</p>
+
+<div class="grid">
+  <div class="card">
+    <h3>Real-Time Scoring</h3>
+    <p>Every AI action is evaluated instantly using behavioural, financial, and device-based risk signals.</p>
+  </div>
+
+  <div class="card">
+    <h3>Audit Chain</h3>
+    <p>SHA-256 + Merkle tree logging ensures tamper-proof decision history for compliance audits.</p>
+  </div>
+
+  <div class="card">
+    <h3>Explainable Decisions</h3>
+    <p>Every decision returns structured reasons for transparency under EU AI Act Article 13.</p>
+  </div>
+</div>
+
+</div>
+</section>
+
+<!-- COMPLIANCE -->
+<section id="compliance">
+<div class="container">
+<h2>EU AI Act <span>Compliance</span></h2>
+
+<p class="lead">
+Built specifically for Regulation (EU) 2024/1689 covering high-risk AI systems in finance, infrastructure, and automated decision-making.
+</p>
+
+<div class="grid">
+  <div class="card">
+    <h3>Article 9</h3>
+    <p>Continuous risk management across all AI actions and sessions.</p>
+  </div>
+
+  <div class="card">
+    <h3>Article 12</h3>
+    <p>Mandatory logging with immutable audit trails and traceability.</p>
+  </div>
+
+  <div class="card">
+    <h3>Article 13</h3>
+    <p>Explainability for every decision output and risk classification.</p>
+  </div>
+</div>
+
+</div>
+</section>
+
+<!-- PRICING -->
+<section id="pricing">
+<div class="container">
+<h2>Simple <span>Pricing</span></h2>
+
+<div class="pricing">
+
+<div class="price">
+<h3>Free</h3>
+<div class="amt">£0</div>
+<p>1,000 API calls / month<br>Basic governance layer</p>
+</div>
+
+<div class="price">
+<h3>Pro</h3>
+<div class="amt">£0.001</div>
+<p>Unlimited usage<br>Full audit + Stripe billing</p>
+</div>
+
+<div class="price">
+<h3>Enterprise</h3>
+<div class="amt">Custom</div>
+<p>On-premise<br>White-label + SLA</p>
+</div>
+
+</div>
+</div>
+</section>
+
+<!-- FOOTER -->
+<footer>
+AILeash — AI Governance Infrastructure Layer<br>
+EU AI Act Compliance Engine · SHA-256 Audit Chain · Built 2026
+</footer>
+
+</body>
+  </html>
