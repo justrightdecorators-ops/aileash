@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>AILeash — AI Governance Infrastructure</title>
+
+<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet"/>
+
+<style>
+:root{
+  --bg:#0b0b0b;
+  --card:#111;
+  --muted:#9aa0a6;
+  --text:#ffffff;
+  --red:#ff2d2d;
+  --red2:#b80000;
+  --border:#222;
+  --mono:'JetBrains Mono', monospace;
+  --sans:'DM Sans', sans-serif;
+  --display:'Bebas Neue', sans-serif;
+}
+
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#fff;color:#111;font-family:var(--sans);overflow-x:hidden}
+
+nav{
+  position:fixed;top:0;left:0;right:0;height:64px;
+  display:flex;justify-content:space-between;align-items:center;
+  padding:0 40px;background:#fff;border-bottom:2px solid var(--red);
+  z-index:1000;
+}
+
+.logo{font-family:var(--display);font-size:28px;letter-spacing:2px}
+.logo span{color:var(--red)}
+
+.nav a{
+  margin-left:20px;text-decoration:none;color:#555;font-size:14px
+}
+.nav a:hover{color:var(--red)}
+
+.btn{
+  padding:10px 18px;background:var(--red);color:#fff;
+  border:none;border-radius:4px;font-weight:700;
+  cursor:pointer;text-decoration:none;display:inline-block
+}
+.btn:hover{background:var(--red2)}
+
+.hero{
+  padding:120px 40px 60px;
+  display:grid;grid-template-columns:1.2fr 1fr;
+  gap:40px;align-items:center
+}
+
+h1{
+  font-family:var(--display);
+  font-size:76px;
+  line-height:0.95;
+  letter-spacing:2px;
+}
+h1 span{color:var(--red)}
+
+p{color:#555;line-height:1.6;font-size:16px}
+
+.tag{
+  display:inline-block;
+  background:var(--red);
+  color:#fff;
+  padding:6px 12px;
+  font-size:11px;
+  letter-spacing:2px;
+  font-family:var(--mono);
+  margin-bottom:20px
+}
+
+.card{
+  background:#111;
+  color:#fff;
+  padding:20px;
+  border-radius:8px;
+  font-family:var(--mono);
+  font-size:13px;
+  box-shadow:8px 8px 0 var(--red)
+}
+
+.grid{
+  display:grid;
+  grid-template-columns:repeat(3,1fr);
+  gap:20px;
+  padding:60px 40px
+}
+
+.section{
+  padding:80px 40px
+}
+
+.section h2{
+  font-family:var(--display);
+  font-size:48px;
+  margin-bottom:10px
+}
+
+.small{
+  color:#666;
+  max-width:700px
+}
+
+.feature{
+  border:1px solid #eee;
+  padding:20px;
+  border-left:4px solid var(--red)
+}
+
+.price{
+  display:grid;
+  grid-template-columns:repeat(3,1fr);
+  gap:20px;
+  margin-top:40px
+}
+
+.price-box{
+  border:1px solid #eee;
+  padding:24px;
+  border-radius:6px
+}
+
+.price-box h3{
+  font-family:var(--display);
+  font-size:28px
+}
+
+.price-box strong{
+  font-size:32px;
+  display:block;
+  margin:10px 0
+}
+
+.signup{
+  background:#f6f6f6;
+  padding:80px 40px
+}
+
+input{
+  width:100%;
+  padding:14px;
+  margin:10px 0;
+  border:1px solid #ddd;
+  border-radius:4px;
+  font-size:14px
+}
+
+.footer{
+  background:#111;
+  color:#777;
+  padding:60px 40px;
+  font-size:13px
+}
+</style>
+</head>
+
+<body>
+
+<nav>
+  <div class="logo">AI<span>Leash</span></div>
+  <div class="nav">
+    <a href="#features">Features</a>
+    <a href="#pricing">Pricing</a>
+    <a href="#signup">Get API</a>
+    <a class="btn" href="#signup">Start Free</a>
+  </div>
+</nav>
+
+<section class="hero">
+  <div>
+    <div class="tag">EU AI ACT READY • GOVERNANCE ENGINE</div>
+    <h1>AI GOVERNANCE<br/><span>INFRASTRUCTURE</span></h1>
+    <p>
+      AILeash is a real-time AI governance engine that scores, audits, and blocks unsafe AI actions before execution.
+      Built for compliance, risk control, and production AI systems.
+    </p>
+    <br/>
+    <a class="btn" href="#signup">Get API Key — Free</a>
+  </div>
+
+  <div class="card">
+    // LIVE GOVERNANCE EVENT<br/><br/>
+    user_id: agent_01<br/>
+    action: wire_transfer<br/>
+    amount: 18500<br/>
+    country: RU<br/>
+    device_risk: 0.61<br/><br/>
+    ----------------------<br/>
+    DECISION: BLOCK<br/>
+    score: 0.9141<br/>
+    reasons: unsafe_country, anomaly<br/>
+    latency: 12ms
+  </div>
+</section>
+
+<section class="section" id="features">
+  <h2>Compliance Engine</h2>
+  <p class="small">
+    Built around EU AI Act (2024/1689), GDPR Art.22, and ISO 42001 principles.
+  </p>
+
+  <div class="grid">
+    <div class="feature">Art.9 Risk Management — Continuous scoring per action</div>
+    <div class="feature">Art.12 Logging — SHA-256 audit trail per decision</div>
+    <div class="feature">Art.13 Transparency — Explainable AI decisions</div>
+    <div class="feature">GDPR Art.22 — Human override via CHALLENGE mode</div>
+    <div class="feature">ISO 42001 — Full AI management lifecycle</div>
+    <div class="feature">Merkle Chain — Tamper-proof audit structure</div>
+  </div>
+</section>
+
+<section class="section" id="pricing">
+  <h2>Pricing</h2>
+  <p class="small">Simple usage-based pricing. No lock-in.</p>
+
+  <div class="price">
+    <div class="price-box">
+      <h3>Free</h3>
+      <strong>£0</strong>
+      1,000 actions/month<br/><br/>
+      <a class="btn" href="#signup">Start Free</a>
+    </div>
+
+    <div class="price-box">
+      <h3>Pay As You Go</h3>
+      <strong>£0.001</strong>
+      per action<br/><br/>
+      <button class="btn" onclick="startStripe()">Upgrade with Stripe</button>
+    </div>
+
+    <div class="price-box">
+      <h3>Enterprise</h3>
+      <strong>Custom</strong>
+      SLA + on-prem + audit tools<br/><br/>
+      <a class="btn" href="#signup">Contact</a>
+    </div>
+  </div>
+</section>
+
+<section class="signup" id="signup">
+  <h2>Get API Key</h2>
+  <p class="small">Instant access. No credit card required for free tier.</p>
+
+  <input id="email" placeholder="Work email address"/>
+
+  <button class="btn" onclick="createKey()">Generate API Key</button>
+  <button class="btn" style="margin-left:10px" onclick="startStripe()">Upgrade via Stripe</button>
+
+  <pre id="result" style="margin-top:20px;background:#111;color:#0f0;padding:15px;display:none"></pre>
+</section>
+
+<footer class="footer">
+  AILeash — Governance Infrastructure for AI Systems<br/>
+  EU AI Act • GDPR • ISO 42001 • SHA-256 Audit Chain
+</footer>
+
+<script>
+async function createKey(){
+  const email = document.getElementById("email").value;
+  const res = await fetch("/api/create_key", {
+    method:"POST",
+    headers:{ "Content-Type":"application/json" },
+    body: JSON.stringify({ email })
+  });
+
+  const data = await res.json();
+
+  const box = document.getElementById("result");
+  box.style.display="block";
+  box.textContent = JSON.stringify(data, null, 2);
+}
+
+async function startStripe(){
+  const res = await fetch("/create-checkout-session", {
+    method:"POST"
+  });
+
+  const data = await res.json();
+
+  if(data.url){
+    window.location.href = data.url;
+  } else {
+    alert("Stripe not configured");
+  }
+}
+</script>
+
+</body>
+</html>
