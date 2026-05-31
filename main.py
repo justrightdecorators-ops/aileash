@@ -72,7 +72,210 @@ def govern(event):
     }
 
 # ---------------- LANDING PAGE (v3.1.1) ----------------
-LANDING_HTML = f"""[Same beautiful HTML as previous message - omitted here for brevity]"""
+LANDING_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AILeash - AI Governance Engine</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .container {
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            max-width: 500px;
+            width: 100%;
+            padding: 40px;
+            text-align: center;
+        }
+        h1 {
+            color: #333;
+            margin-bottom: 10px;
+            font-size: 28px;
+        }
+        .subtitle {
+            color: #666;
+            margin-bottom: 30px;
+            font-size: 14px;
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        input[type="email"] {
+            width: 100%;
+            padding: 12px 16px;
+            border: 2px solid #e0e0e0;
+            border-radius: 6px;
+            font-size: 14px;
+            transition: border-color 0.3s;
+        }
+        input[type="email"]:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        .btn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 12px 32px;
+            border: none;
+            border-radius: 6px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+            width: 100%;
+        }
+        .btn:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(102, 126, 234, 0.4);
+        }
+        .btn:disabled {
+            opacity: 0.7;
+            cursor: not-allowed;
+        }
+        .message {
+            margin-top: 20px;
+            padding: 12px;
+            border-radius: 6px;
+            font-size: 14px;
+            display: none;
+        }
+        .message.success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        .message.error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        .loader {
+            display: none;
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #667eea;
+            border-radius: 50%;
+            width: 20px;
+            height: 20px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔐 AILeash</h1>
+        <p class="subtitle">AI Governance Engine for the EU AI Act</p>
+        
+        <form id="signupForm">
+            <div class="form-group">
+                <input 
+                    type="email" 
+                    id="email" 
+                    placeholder="Enter your email" 
+                    required 
+                    aria-label="Email address"
+                >
+            </div>
+            <button type="submit" class="btn" id="signupBtn">
+                Sign Up & Go to Stripe
+            </button>
+            <div class="loader" id="loader"></div>
+        </form>
+        
+        <div class="message" id="message"></div>
+    </div>
+
+    <script>
+        const form = document.getElementById('signupForm');
+        const emailInput = document.getElementById('email');
+        const signupBtn = document.getElementById('signupBtn');
+        const loader = document.getElementById('loader');
+        const message = document.getElementById('message');
+
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const email = emailInput.value.trim();
+            if (!email) {
+                showMessage('Please enter a valid email', 'error');
+                return;
+            }
+
+            signupBtn.disabled = true;
+            loader.style.display = 'block';
+            message.style.display = 'none';
+
+            try {
+                const response = await fetch('/api/checkout', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ email })
+                });
+
+                const data = await response.json();
+
+                if (!response.ok) {
+                    showMessage(data.error || 'An error occurred', 'error');
+                    signupBtn.disabled = false;
+                    loader.style.display = 'none';
+                    return;
+                }
+
+                if (data.checkout_url) {
+                    // Redirect to Stripe checkout
+                    window.location.href = data.checkout_url;
+                } else {
+                    showMessage('Error getting checkout URL', 'error');
+                    signupBtn.disabled = false;
+                    loader.style.display = 'none';
+                }
+            } catch (error) {
+                showMessage('Network error: ' + error.message, 'error');
+                signupBtn.disabled = false;
+                loader.style.display = 'none';
+            }
+        });
+
+        function showMessage(text, type) {
+            message.textContent = text;
+            message.className = 'message ' + type;
+            message.style.display = 'block';
+        }
+
+        // Check for success/cancel from Stripe redirect
+        const urlParams = new URLSearchParams(window.location.search);
+        if (urlParams.has('success')) {
+            showMessage('✅ Payment successful! Welcome to AILeash.', 'success');
+            emailInput.disabled = true;
+            signupBtn.disabled = true;
+        } else if (urlParams.has('cancel')) {
+            showMessage('❌ Payment cancelled. Please try again.', 'error');
+        }
+    </script>
+</body>
+</html>
+"""
 
 # ---------------- HTTP HELPERS ----------------
 def send(h, data, status=200):
