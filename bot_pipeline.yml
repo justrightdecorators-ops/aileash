@@ -1,0 +1,49 @@
+name: Complete AI Bot Discovery Pipeline
+
+on:
+  schedule:
+    - cron: '0 0 * * *' # Runs automatically once every day at midnight
+  workflow_dispatch:      # Allows you to click "Run workflow" manually in GitHub
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Set up Python Environment
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+
+    - name: Install Network Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install requests
+
+    - name: Execute Embedded Bot Scanner Script
+      shell: python
+      run: |
+        import requests
+        import json
+
+        # List of endpoints or subdomains to check
+        TARGETS = [
+            "https://example-bot-endpoint.com",
+            "https://example-organization.com"
+        ]
+
+        print("Starting automated AI agent discovery scan...")
+        
+        for url in TARGETS:
+            print(f"Checking connection to potential AI target: {url}")
+            test_payload = {"message": "System ping test", "stream": False}
+            
+            try:
+                response = requests.post(url, json=test_payload, timeout=5)
+                if response.status_code == 200:
+                    print(f"[SUCCESS] Active AI endpoint verified at {url}")
+                else:
+                    print(f"[WARNING] Endpoint responded with status code: {response.status_code}")
+            except requests.exceptions.RequestException as e:
+                print(f"[ERROR] Could not connect to {url}: {e}")
+                
+        print("Scan complete.")
