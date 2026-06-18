@@ -1,0 +1,26 @@
+name: Automated Search Indexing
+
+on:
+  push:
+    branches:
+      - main  # Runs automatically when you deploy/push code to main
+  schedule:
+    - cron: '0 0 * * *'  # Runs automatically every day at midnight as a backup
+
+jobs:
+  index-site:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/actions-setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install Dependencies
+        run: pip install requests
+
+      - name: Run Indexing Script
+        run: python index_site.py
