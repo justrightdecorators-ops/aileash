@@ -61,7 +61,20 @@ The server reads these environment variables (defaults shown in parentheses):
 - STRIPE_SECRET ("") — Stripe API secret (required for billing/checkout)
 - BREVO_API_KEY ("") — Brevo/Sendinblue API key for outgoing emails
 
-Production deployments should set STRIPE_SECRET and BREVO_API_KEY only in secret stores or CI/CD environment variables (do not commit secrets).
+Optional SMTP fallback (recommended for staging or if you don't use Brevo):
+
+- SMTP_HOST — SMTP server hostname (e.g. smtp.sendgrid.net)
+- SMTP_PORT — SMTP port (default 587)
+- SMTP_USER — SMTP username (if required)
+- SMTP_PASS — SMTP password (if required)
+- SMTP_FROM — From address for SMTP-sent emails (default: noreply@monopcontent.com)
+- EMAIL_LOG_DIR — Directory to save emails when no delivery method is configured (default: /var/log/aileash)
+
+Test email endpoint (staging only):
+- POST /_test_email — send a test email; protected by TEST_EMAIL_TOKEN if set.
+  - JSON body: {"email":"you@example.com","name":"You","subject":"Test","html":"<p>Hi</p>"}
+
+Production deployments should set STRIPE_SECRET and BREVO_API_KEY and/or SMTP_* in the environment or via your platform's secret store.
 
 ## Persistence
 
@@ -74,6 +87,7 @@ By default the server uses a local SQLite file named `aileash.db`. For single-in
 - POST /signup or /api/keys — create API key
 - POST /contact — contact form
 - GET /api/verify-chain — verify tamper-evident audit chain integrity
+- POST /_test_email — send a test email (staging)
 
 Required fields for /api/govern:
 
