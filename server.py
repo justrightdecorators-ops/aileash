@@ -224,7 +224,7 @@ body{{font-family:'DM Sans',Arial,sans-serif;background:#f5f7fa;margin:0;padding
   </div>
   <div class="body">
     <div class="greeting">Welcome{', ' + name.split()[0] if name.strip() else ''}.</div>
-    <p class="intro">Your {product_name} API key is ready. You have 100 free decisions to start &mdash; no card required. After your trial, billing is &pound;{monthly:.2f}/month for {devices} dev[...]</p>
+    <p class="intro">Your {product_name} API key is ready. You have 100 free decisions to start &mdash; no card required. After your trial, billing is £{monthly:.2f}/month for {devices} device(s).</p>
     <div class="key-box">
       <div class="key-lbl">Your API Key &mdash; Save This Now</div>
       <div class="key-val">{api_key}</div>
@@ -233,7 +233,7 @@ body{{font-family:'DM Sans',Arial,sans-serif;background:#f5f7fa;margin:0;padding
       <strong>Billing summary</strong><br>
       Product: {product_name}<br>
       Devices: {devices}<br>
-      Monthly total: &pound;{monthly:.2f}<br>
+      Monthly total: £{monthly:.2f}<br>
       Free decisions remaining: 100
     </div>
     <div class="code-box">
@@ -271,21 +271,5 @@ def send_contact_notification(name, email, phone, org, message):
 </body></html>"""
     send_email(OWNER_EMAIL, OWNER_NAME, f"New Contact: {name}", html)
 
-# ============================================================================
-# STRIPE
-# ============================================================================
-def stripe_call(method, endpoint, data=None):
-    if not STRIPE_SECRET: return None
-    url  = "https://api.stripe.com/v1" + endpoint
-    hdrs = {"Authorization": "Bearer " + STRIPE_SECRET, "Content-Type": "application/x-www-form-urlencoded"}
-    body = urllib.parse.urlencode(data).encode() if data else None
-    req  = urllib.request.Request(url, data=body, headers=hdrs, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=10) as r: return json.loads(r.read())
-    except urllib.error.HTTPError as e:
-        try:    return json.loads(e.read())
-        except: return None
-    except Exception as e:
-        print(f"Stripe error: {e}", flush=True); return None
-
-# ... rest of server.py unchanged ...
+if __name__ == '__main__':
+    print(f"AILeash v{VERSION} starting on port {PORT}", flush=True)
