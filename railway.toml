@@ -1,0 +1,16 @@
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "python server.py"
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 5
+
+[[services]]
+name = "aileash"
+
+[services.scaling]
+minInstances = 1
+maxInstances = 5
+targetCPUPercent = 70
+targetMemoryPercent = 80
