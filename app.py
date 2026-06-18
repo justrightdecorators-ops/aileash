@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify, Response
 import os
 import server
 from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST
+import urllib.request, urllib.parse
 
 app = Flask(__name__)
 
@@ -58,7 +59,10 @@ def stats():
 @app.route('/robots.txt', methods=['GET'])
 def robots():
     server.track_request()
-    return Response("User-agent: *\nAllow: /\n", mimetype='text/plain')
+    host = os.environ.get('HOST', 'http://localhost:8080').rstrip('/')
+    sitemap_url = f"{host}/sitemap.xml"
+    lines = ["User-agent: *", "Allow: /", f"Sitemap: {sitemap_url}"]
+    return Response("\n".join(lines)+"\n", mimetype='text/plain')
 
 @app.route('/openapi.json', methods=['GET'])
 def openapi():
@@ -70,6 +74,22 @@ def metrics():
     # Expose basic Prometheus metrics
     server.track_request()
     return Response(generate_latest(), mimetype=CONTENT_TYPE_LATEST)
+
+# Sitemap generation
+@app.route('/sitemap.xml', methods=['GET'])
+def sitemap():
+    server.track_request()
+    host = os.environ.get('HOST', 'http://localhost:8080').rstrip('/')
+    pages = ['/', '/scan', '/contact', '/signup', '/api/verify-chain']
+    now_iso = __import__('datetime').datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+    urls = []
+    for p in pages:
+        urls.append(f"  <url>\n    <loc>{host}{p}</loc>\n    <lastmod>{now_iso}</lastmod>\n    <changefreq>monthly</changefreq>\n  </url>")
+    xml = '<?xml version="1.0" encoding="UTF-8"?>\n'
+    xml += '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+    xml += "\n".join(urls)
+    xml += '\n</urlset>'
+    return Response(xml, mimetype='application/xml')
 
 # Decision endpoint
 @app.route('/api/govern', methods=['POST'])
@@ -187,6 +207,32 @@ def test_email():
         return jsonify({'ok': bool(ok)}), (200 if ok else 500)
     except Exception as e:
         return jsonify({'ok':False,'error':str(e)}), 500
+
+# Submit sitemap to search engines (protected by ADMIN_TOKEN if set)
+@app.route('/_submit_sitemap', methods=['POST'])
+def submit_sitemap():
+    token = os.environ.get('ADMIN_TOKEN','')
+    provided = request.headers.get('X-Admin-Token','') or request.args.get('token','')
+    if token and provided != token:
+        return jsonify({'error':'unauthorized'}), 401
+    host = os.environ.get('HOST', 'http://localhost:8080').rstrip('/')
+    sitemap_url = f"{host}/sitemap.xml"
+    results = {}
+    # Ping Google
+    try:
+        google_url = f"http://www.google.com/ping?sitemap={urllib.parse.quote(sitemap_url, safe='') }"
+        with urllib.request.urlopen(google_url, timeout=10) as r:
+            results['google'] = {'code': r.getcode(), 'reason': r.reason if hasattr(r, 'reason') else ''}
+    except Exception as e:
+        results['google'] = {'error': str(e)}
+    # Ping Bing
+    try:
+        bing_url = f"https://www.bing.com/ping?sitemap={urllib.parse.quote(sitemap_url, safe='') }"
+        with urllib.request.urlopen(bing_url, timeout=10) as r:
+            results['bing'] = {'code': r.getcode(), 'reason': r.reason if hasattr(r, 'reason') else ''}
+    except Exception as e:
+        results['bing'] = {'error': str(e)}
+    return jsonify({'sitemap': sitemap_url, 'results': results})
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))

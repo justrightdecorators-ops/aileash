@@ -1,125 +1,30 @@
-# AILeash
+## Indexing and SEO
 
-AILeash is a lightweight Python HTTP service providing real-time AI governance and child-safety decisioning (ALLOW / CHALLENGE / BLOCK) with a tamper-evident SHA-256 audit chain. It is implemented as a small threaded HTTP server (server.py) and stores persistent data in a local SQLite database by default.
+I added automatic sitemap support and a submission endpoint to help get your site indexed quickly by search engines.
 
-This repository contains the full platform for evaluation and small deployments. For production readiness see the "Production & Enterprise" section.
+What I added
 
-## Features
+- /sitemap.xml — dynamically-generated sitemap of primary pages (/, /scan, /contact, /signup, /api/verify-chain).
+- /robots.txt — updated to include the Sitemap: line pointing to your sitemap.xml so crawlers discover it automatically.
+- /_submit_sitemap — an admin-protected endpoint that attempts to notify Google and Bing by pinging their sitemap endpoints. Protect it by setting ADMIN_TOKEN in your environment and then POST to this endpoint to trigger pings.
 
-- Real-time decisioning API: /api/govern (POST)
-- Health and status: /api/health
-- Audit chain verification: /api/verify-chain
-- Signup, contact, and simple web pages for marketing and scanner UI
-- Per-key and global rate limits, basic load tracking and graceful throttling
+How to use
 
-## Quick start (development)
+1. Deploy the site to your public host (ensure HOST env is set to the canonical URL, e.g. https://sebbi.pro).
+2. Visit https://your-host/sitemap.xml to confirm it is reachable.
+3. Visit https://your-host/robots.txt to confirm it references the sitemap.
+4. Optionally submit the site to Google Search Console and Bing Webmaster Tools for verification and indexing. Use the same HOST value as the property.
+5. To programmatically ping crawlers from the server (after deployment):
 
-Requirements:
+   curl -X POST https://your-host/_submit_sitemap -H "X-Admin-Token: <ADMIN_TOKEN>"
 
-- Python 3.10+ (recommended)
-- git
+Notes
 
-Run locally:
+- Submitting the sitemap via these pings is a courtesy; to fully manage indexing, verify your site in Google Search Console and Bing Webmaster Tools and submit the sitemap there as well.
+- For Google Search Console you will need to verify site ownership — follow the instructions in Search Console. Once verified you can submit sitemaps and request indexing for individual URLs.
 
-1. Clone the repo
+If you want, I can also:
 
-   git clone https://github.com/justrightdecorators-ops/aileash.git
-   cd aileash
-
-2. (Optional) Create a virtualenv
-
-   python -m venv .venv
-   source .venv/bin/activate
-
-3. Start the server (defaults to port 8080):
-
-   python -u server.py
-
-4. Check health:
-
-   curl http://localhost:8080/api/health
-
-5. Test governance endpoint:
-
-   curl -s -X POST http://localhost:8080/api/govern \
-     -H "Content-Type: application/json" \
-     -d '{"user_id":"u1","action":"test","amount":0,"country":"UK","device_id":"d1","anomaly":0,"device_risk":0}'
-
-## Docker (recommended for consistent environments)
-
-A simple Dockerfile is included (or can be added on request). Typical steps:
-
-  docker build -t aileash:latest .
-  docker run -p 8080:8080 -e PORT=8080 --env-file .env aileash:latest
-
-## Environment variables
-
-The server reads these environment variables (defaults shown in parentheses):
-
-- PORT (8080) — TCP port the server listens on
-- HOST (https://sebbi.pro) — canonical host used in emails/links
-- STRIPE_SECRET ("") — Stripe API secret (required for billing/checkout)
-- BREVO_API_KEY ("") — Brevo/Sendinblue API key for outgoing emails
-
-Optional SMTP fallback (recommended for staging or if you don't use Brevo):
-
-- SMTP_HOST — SMTP server hostname (e.g. smtp.sendgrid.net)
-- SMTP_PORT — SMTP port (default 587)
-- SMTP_USER — SMTP username (if required)
-- SMTP_PASS — SMTP password (if required)
-- SMTP_FROM — From address for SMTP-sent emails (default: noreply@monopcontent.com)
-- EMAIL_LOG_DIR — Directory to save emails when no delivery method is configured (default: /var/log/aileash)
-
-Test email endpoint (staging only):
-- POST /_test_email — send a test email; protected by TEST_EMAIL_TOKEN if set.
-  - JSON body: {"email":"you@example.com","name":"You","subject":"Test","html":"<p>Hi</p>"}
-
-Production deployments should set STRIPE_SECRET and BREVO_API_KEY and/or SMTP_* in the environment or via your platform's secret store.
-
-## Persistence
-
-By default the server uses a local SQLite file named `aileash.db`. For single-instance testing this is fine. For production use, replace SQLite with a managed Postgres instance (see "Production & Enterprise" below).
-
-## Endpoints (important)
-
-- GET /api/health — service health and rps
-- POST /api/govern — main decision endpoint (JSON body, required fields listed below)
-- POST /signup or /api/keys — create API key
-- POST /contact — contact form
-- GET /api/verify-chain — verify tamper-evident audit chain integrity
-- POST /_test_email — send a test email (staging)
-
-Required fields for /api/govern:
-
-- user_id, action, amount, country, device_id, anomaly, device_risk
-
-Responses are JSON and include a decision (ALLOW / CHALLENGE / BLOCK) plus an audit_hash.
-
-## Security & operational notes
-
-See SECURITY.md for responsible disclosure, secrets handling, and hardening recommendations. Key points:
-
-- Do not store secrets in repository files or environment files committed to VCS.
-- Use HTTPS/TLS in front of the server in production (reverse proxy, load balancer).
-- Replace SQLite with Postgres for multi-instance deployments.
-- Run the app under a process manager (systemd, or container with an orchestrator) or with Gunicorn when refactored to a WSGI app.
-
-## Production & Enterprise (recommended)
-
-For enterprise use I recommend:
-
-- Refactor server into a WSGI app (Flask) and serve with Gunicorn using gthread or gthread+workers.
-- Use a managed Postgres database and set DATABASE_URL environment variable.
-- Add CI to build, lint, run unit tests, and build a container image.
-- Add monitoring (Prometheus metrics), structured JSON logging, and alerting.
-- Add automatic backups for the DB and secure secret rotation.
-
-I can implement the above (Dockerfile, Gunicorn/Werkzeug wrapper, Postgres migration, CI) — tell me which items to prioritize.
-
-## License
-
-This repository includes a LICENCE file. Check the license before commercial use.
-
-## Contact
-
-For questions, or to report issues: justin@monopcontent.com
+- Add JSON-LD structured data to the landing page (Organization and WebSite schema).
+- Expand the sitemap to include dynamically-created pages (e.g., per-customer pages) if you add them later.
+- Automate Search Console API submissions (requires OAuth and verification access).
