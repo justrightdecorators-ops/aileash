@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>AILeash Partner Programme &mdash; Resell AI Compliance</title>
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;800;900&family=DM+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--navy:#0a0f1e;--gold:#c9a84c;--red:#cc0000;--green:#00875a;--white:#fff;--off:#f5f7fa;--border:#e2e8f0;--muted:#64748b;--mono:'JetBrains Mono',monospace;--sans:'DM Sans',sans-serif;--display:'Playfair Display',serif}
+html,body{background:var(--white);color:var(--navy);font-family:var(--sans)}
+nav{position:fixed;top:0;left:0;right:0;z-index:100;background:var(--navy);padding:0 48px;height:68px;display:flex;align-items:center;justify-content:space-between}
+.nav-logo{font-family:var(--display);font-size:22px;color:var(--white);font-weight:900}.nav-logo span{color:var(--gold)}
+.nav-links{display:flex;gap:20px;align-items:center}
+.nav-links a{color:rgba(255,255,255,0.5);text-decoration:none;font-size:13px;font-weight:500}.nav-links a:hover{color:var(--white)}
+.nav-cta{background:var(--gold)!important;color:var(--navy)!important;padding:9px 20px;font-weight:700!important;border-radius:4px}
+.hero{background:var(--navy);padding:120px 48px 80px;text-align:center}
+.hero h1{font-family:var(--display);font-size:clamp(40px,5vw,68px);color:var(--white);font-weight:900;line-height:1.05;margin-bottom:20px}
+.hero h1 em{color:var(--gold);font-style:normal}
+.hero p{font-size:18px;color:rgba(255,255,255,0.5);max-width:640px;margin:0 auto 40px;line-height:1.75}
+.badge{display:inline-block;background:rgba(201,168,76,0.15);border:1px solid rgba(201,168,76,0.3);color:var(--gold);font-family:var(--mono);font-size:11px;letter-spacing:2px;text-transform:uppercase;padding:8px 20px;border-radius:4px;margin-bottom:24px}
+.model-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:2px;background:rgba(255,255,255,0.05);max-width:960px;margin:48px auto 0}
+.model-box{background:var(--navy);padding:32px;text-align:center}
+.model-icon{font-size:36px;margin-bottom:12px}
+.model-n{font-family:var(--mono);font-size:10px;color:var(--gold);letter-spacing:2px;text-transform:uppercase;margin-bottom:8px}
+.model-box h3{font-family:var(--display);font-size:22px;color:var(--white);font-weight:900;margin-bottom:8px}
+.model-box p{font-size:13px;color:rgba(255,255,255,0.4);line-height:1.65}
+.model-price{font-family:var(--display);font-size:36px;color:var(--gold);font-weight:900;margin-top:16px}
+.model-sub{font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.3);margin-top:4px}
+.arrow{font-size:28px;color:var(--gold);display:flex;align-items:center;justify-content:center;padding:32px 0;background:var(--navy)}
+.sec{padding:80px 48px}
+.sec-inner{max-width:1100px;margin:0 auto}
+.slbl{font-family:var(--mono);font-size:11px;letter-spacing:3px;text-transform:uppercase;margin-bottom:12px;color:var(--muted)}
+h2{font-family:var(--display);font-size:clamp(32px,3.5vw,48px);font-weight:900;margin-bottom:16px;line-height:1.1}
+h2 em{color:var(--gold);font-style:normal}
+.sec-sub{font-size:15px;color:var(--muted);max-width:580px;line-height:1.7;margin-bottom:48px}
+.partner-types{display:grid;grid-template-columns:repeat(3,1fr);gap:20px;margin-bottom:48px}
+.pt{border:2px solid var(--border);border-radius:8px;padding:28px;border-top:4px solid var(--gold)}
+.pt-icon{font-size:32px;margin-bottom:12px}
+.pt h3{font-family:var(--display);font-size:20px;font-weight:800;margin-bottom:8px}
+.pt p{font-size:13px;color:var(--muted);line-height:1.65;margin-bottom:16px}
+.pt-example{font-family:var(--mono);font-size:11px;color:var(--gold);background:var(--off);padding:8px 12px;border-radius:4px;line-height:1.8}
+.how-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:48px}
+.how-box{text-align:center;padding:24px 16px}
+.how-n{width:48px;height:48px;background:var(--navy);color:var(--gold);font-family:var(--display);font-size:24px;font-weight:900;border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto 16px}
+.how-box h3{font-size:15px;font-weight:700;margin-bottom:8px}
+.how-box p{font-size:13px;color:var(--muted);line-height:1.6}
+.margin-calc{background:var(--navy);border-radius:12px;padding:48px;margin-bottom:48px}
+.mc-title{font-family:var(--display);font-size:28px;color:var(--white);font-weight:900;margin-bottom:8px;text-align:center}
+.mc-sub{font-size:14px;color:rgba(255,255,255,0.4);text-align:center;margin-bottom:32px}
+.mc-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+.mc-box{background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:24px;text-align:center}
+.mc-devices{font-family:var(--mono);font-size:11px;color:rgba(255,255,255,0.4);letter-spacing:1px;text-transform:uppercase;margin-bottom:8px}
+.mc-charge{font-family:var(--display);font-size:36px;color:var(--gold);font-weight:900;margin-bottom:4px}
+.mc-cost{font-size:13px;color:rgba(255,255,255,0.3);margin-bottom:8px}
+.mc-profit{font-family:var(--display);font-size:24px;color:#00ff88;font-weight:900}
+.mc-profit-label{font-size:11px;color:rgba(255,255,255,0.3);font-family:var(--mono)}
+.signup-sec{background:var(--off);padding:80px 48px}
+.signup-inner{max-width:580px;margin:0 auto;text-align:center}
+.signup-inner h2{margin-bottom:8px}
+.signup-inner p{font-size:15px;color:var(--muted);margin-bottom:32px;line-height:1.7}
+.form-wrap{background:var(--white);border:2px solid var(--border);border-radius:8px;padding:32px;text-align:left}
+.fg{margin-bottom:14px}
+.fg label{display:block;font-family:var(--mono);font-size:10px;color:var(--muted);letter-spacing:2px;text-transform:uppercase;margin-bottom:6px}
+.fg input,.fg select,.fg textarea{width:100%;background:var(--off);border:2px solid var(--border);color:var(--navy);padding:12px 14px;font-size:14px;font-family:var(--sans);outline:none;transition:border-color .2s;border-radius:4px}
+.fg input:focus,.fg select:focus{border-color:var(--navy)}
+.fg-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.btn{width:100%;padding:16px;background:var(--gold);color:var(--navy);border:none;font-family:var(--sans);font-weight:700;font-size:15px;cursor:pointer;border-radius:4px;transition:all .2s;margin-top:8px}
+.btn:hover{background:#e8c96a}
+.msg{display:none;padding:12px;border-radius:4px;font-family:var(--mono);font-size:11px;margin-top:12px}
+.msg.show{display:block}
+.msg-ok{background:#f0fff8;border:1px solid #bbf7d0;color:var(--green)}
+.msg-err{background:#fff0f0;border:1px solid #ffcccc;color:var(--red)}
+.key-reveal{display:none;background:var(--navy);border-radius:8px;padding:24px;margin-top:16px;text-align:left}
+.key-reveal.show{display:block}
+.key-lbl{font-family:var(--mono);font-size:9px;color:var(--gold);letter-spacing:2px;text-transform:uppercase;margin-bottom:8px}
+.key-val{font-family:var(--mono);font-size:12px;color:#00ff88;word-break:break-all;background:rgba(0,0,0,0.3);padding:10px;border-radius:4px}
+.key-next{margin-top:12px;font-size:13px;color:rgba(255,255,255,0.5);line-height:1.7}
+.key-next a{color:var(--gold)}
+footer{background:#0a0f1e;padding:40px 48px;text-align:center;font-size:12px;color:rgba(255,255,255,0.2);font-family:var(--mono)}
+@media(max-width:900px){
+nav{padding:0 20px}.nav-links a:not(.nav-cta){display:none}
+.model-grid,.partner-types,.how-grid,.mc-grid{grid-template-columns:1fr!important}
+.sec,.signup-sec{padding:52px 20px!important}.hero{padding:100px 20px 60px}
+.fg-row{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="nav-logo">AILeash <span>Platform</span></div>
+  <div class="nav-links">
+    <a href="/">Home</a>
+    <a href="/#guardian">Guardian</a>
+    <a href="/scan">AI Act Scanner</a>
+    <a href="/contact">Contact</a>
+    <a href="/reseller#signup" class="nav-cta">Become a Partner</a>
+  </div>
+</nav>
+
+<div class="hero">
+  <div class="badge">Partner &amp; Reseller Programme</div>
+  <h1>Give it away free.<br><em>Keep the margin.</em></h1>
+  <p>AILeash costs platforms nothing. You charge your clients whatever you want. We take 50p per device per month. You keep everything above that. No limits. No caps. No permission needed.</p>
+  <div class="model-grid">
+    <div class="model-box">
+      <div class="model-icon">&#127970;</div>
+      <div class="model-n">Platform / Client</div>
+      <h3>Pays Nothing</h3>
+      <p>Free API integration. Full compliance. Full child safety. Zero cost to the platform.</p>
+      <div class="model-price">£0</div>
+      <div class="model-sub">to integrate</div>
+    </div>
+    <div class="arrow">&#8594;</div>
+    <div class="model-box">
+      <div class="model-icon">&#128181;</div>
+      <div class="model-n">End User</div>
+      <h3>Pays You</h3>
+      <p>Users pay whatever you charge for safety. £1, £2.99, £4.99 per device. You decide.</p>
+      <div class="model-price">Your Price</div>
+      <div class="model-sub">you set it</div>
+    </div>
+    <div class="arrow">&#8594;</div>
+    <div class="model-box">
+      <div class="model-icon">&#9881;</div>
+      <div class="model-n">AILeash</div>
+      <h3>Takes 50p</h3>
+      <p>We take 50p per device per month from your revenue. Everything above that is yours.</p>
+      <div class="model-price">50p</div>
+      <div class="model-sub">per device we take</div>
+    </div>
+  </div>
+</div>
+
+<section class="sec">
+  <div class="sec-inner">
+    <div class="slbl">Who This Is For</div>
+    <h2>Three ways to <em>make money</em></h2>
+    <p class="sec-sub">Whether you run a call centre, manage IT for businesses, or operate a platform — there is a model here that works for you.</p>
+    <div class="partner-types">
+      <div class="pt">
+        <div class="pt-icon">&#128222;</div>
+        <h3>Call Centres</h3>
+        <p>Put your team on the phone selling AILeash to platforms and businesses. You set your price. We take 50p. You keep the margin on every device you sign up — forever, for as long as they stay subscribed.</p>
+        <div class="pt-example">1,000 devices at £2/mo<br>You keep: £1,500/mo<br>We take: £500/mo</div>
+      </div>
+      <div class="pt">
+        <div class="pt-icon">&#128187;</div>
+        <h3>IT Managed Service Providers</h3>
+        <p>Add AILeash to your client stack. Give them free compliance and child safety infrastructure. Bill them a monthly safety fee. Pure margin on top of your existing contracts.</p>
+        <div class="pt-example">500 devices at £1.50/mo<br>You keep: £500/mo<br>We take: £250/mo</div>
+      </div>
+      <div class="pt">
+        <div class="pt-icon">&#127760;</div>
+        <h3>Platforms &amp; Apps</h3>
+        <p>Integrate the free API. Offer users a premium safety subscription. New revenue stream. Full Online Safety Act and EU AI Act compliance. Zero infrastructure cost to you.</p>
+        <div class="pt-example">10,000 users at £0.99/mo<br>You keep: £4,900/mo<br>We take: £5,000/mo</div>
+      </div>
+    </div>
+
+    <div class="slbl">How It Works</div>
+    <h2>Four steps. <em>Done.</em></h2>
+    <p class="sec-sub">From signup to revenue in under an hour.</p>
+    <div class="how-grid">
+      <div class="how-box">
+        <div class="how-n">1</div>
+        <h3>Sign Up Free</h3>
+        <p>Register as a partner below. Get your free reseller API key instantly. No card. No contract.</p>
+      </div>
+      <div class="how-box">
+        <div class="how-n">2</div>
+        <h3>Integrate or Sell</h3>
+        <p>Integrate the API into your platform or start calling businesses. One API call per interaction.</p>
+      </div>
+      <div class="how-box">
+        <div class="how-n">3</div>
+        <h3>Set Your Price</h3>
+        <p>Charge your clients or users whatever you want. £1, £2.99, £9.99. Your call. Your margin.</p>
+      </div>
+      <div class="how-box">
+        <div class="how-n">4</div>
+        <h3>We Take 50p</h3>
+        <p>We bill you 50p per active device per month. Everything above that is yours to keep forever.</p>
+      </div>
+    </div>
+
+    <div class="margin-calc">
+      <div class="mc-title">Your Potential Margin</div>
+      <div class="mc-sub">Charging £1.99 per device per month — you keep £1.49 per device</div>
+      <div class="mc-grid">
+        <div class="mc-box">
+          <div class="mc-devices">100 Devices</div>
+          <div class="mc-charge">£199/mo</div>
+          <div class="mc-cost">You pay us £50/mo</div>
+          <div class="mc-profit">£149/mo</div>
+          <div class="mc-profit-label">your profit</div>
+        </div>
+        <div class="mc-box">
+          <div class="mc-devices">1,000 Devices</div>
+          <div class="mc-charge">£1,990/mo</div>
+          <div class="mc-cost">You pay us £500/mo</div>
+          <div class="mc-profit">£1,490/mo</div>
+          <div class="mc-profit-label">your profit</div>
+        </div>
+        <div class="mc-box">
+          <div class="mc-devices">10,000 Devices</div>
+          <div class="mc-charge">£19,900/mo</div>
+          <div class="mc-cost">You pay us £5,000/mo</div>
+          <div class="mc-profit">£14,900/mo</div>
+          <div class="mc-profit-label">your profit</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="signup-sec" id="signup">
+  <div class="signup-inner">
+    <div class="slbl">Join the Programme</div>
+    <h2>Get your <em>free partner key</em></h2>
+    <p>Sign up in 60 seconds. Free API key delivered instantly. Start selling or integrating today.</p>
+    <div class="form-wrap">
+      <div class="fg-row">
+        <div class="fg"><label>First Name</label><input type="text" id="fn" placeholder="Justin"></div>
+        <div class="fg"><label>Last Name</label><input type="text" id="ln" placeholder="Smith"></div>
+      </div>
+      <div class="fg"><label>Email Address</label><input type="email" id="em" placeholder="you@company.com"></div>
+      <div class="fg"><label>Phone Number</label><input type="tel" id="ph" placeholder="+44 7700 000000"></div>
+      <div class="fg"><label>Company Name</label><input type="text" id="org" placeholder="Your company"></div>
+      <div class="fg"><label>Partner Type</label>
+        <select id="pt">
+          <option value="">Select type</option>
+          <option value="callcentre">Call Centre</option>
+          <option value="msp">IT Managed Service Provider</option>
+          <option value="platform">Platform / App</option>
+          <option value="agency">Agency / Consultancy</option>
+          <option value="other">Other</option>
+        </select>
+      </div>
+      <div class="fg"><label>Expected Monthly Devices</label>
+        <select id="devices">
+          <option value="100">Under 100</option>
+          <option value="500">100 to 500</option>
+          <option value="1000">500 to 1,000</option>
+          <option value="5000">1,000 to 5,000</option>
+          <option value="10000">5,000 to 10,000</option>
+          <option value="50000">10,000+</option>
+        </select>
+      </div>
+      <button class="btn" onclick="signupPartner()">Get Free Partner API Key &rarr;</button>
+      <div class="msg msg-ok" id="msg-ok"></div>
+      <div class="msg msg-err" id="msg-err"></div>
+      <div class="key-reveal" id="key-reveal">
+        <div class="key-lbl">Your Partner API Key</div>
+        <div class="key-val" id="key-val"></div>
+        <div class="key-next">
+          Next step: <a href="https://sebbi.pro/docs" target="_blank">Read the integration docs</a> or <a href="mailto:justin@monopcontent.com">email Justin</a> to discuss your reseller arrangement.<br><br>
+          Justin will be in touch within 24 hours to set up your billing arrangement.
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  &copy; 2026 Monop Content &middot; Justin Antony Dobson &middot; Blyth, UK &middot; justin@monopcontent.com &middot; 07908 269428 &middot; sebbi.pro
+</footer>
+
+<script>
+async function signupPartner() {
+  var fn  = document.getElementById('fn').value.trim();
+  var ln  = document.getElementById('ln').value.trim();
+  var em  = document.getElementById('em').value.trim();
+  var ph  = document.getElementById('ph').value.trim();
+  var org = document.getElementById('org').value.trim();
+  var pt  = document.getElementById('pt').value;
+  var dv  = document.getElementById('devices').value;
+  var ok  = document.getElementById('msg-ok');
+  var err = document.getElementById('msg-err');
+  var kr  = document.getElementById('key-reveal');
+  ok.classList.remove('show'); err.classList.remove('show'); kr.classList.remove('show');
+  if (!em || !em.includes('@')) { err.textContent = 'Please enter a valid email address.'; err.classList.add('show'); return; }
+  if (!org) { err.textContent = 'Please enter your company name.'; err.classList.add('show'); return; }
+  try {
+    var r = await fetch('/signup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: em, phone: ph, name: fn + ' ' + ln, org: org, org_type: 'reseller_' + pt, product: 'aileash', devices: parseInt(dv) })
+    });
+    var d = await r.json();
+    if (d.api_key) {
+      document.getElementById('key-val').textContent = d.api_key;
+      kr.classList.add('show');
+      ok.textContent = 'Partner key created. Justin will be in touch within 24 hours.';
+      ok.classList.add('show');
+    } else {
+      err.textContent = d.error || 'Something went wrong. Email justin@monopcontent.com directly.';
+      err.classList.add('show');
+    }
+  } catch(e) {
+    err.textContent = 'Cannot reach server. Email justin@monopcontent.com directly.';
+    err.classList.add('show');
+  }
+}
+</script>
+</body>
+</html>
