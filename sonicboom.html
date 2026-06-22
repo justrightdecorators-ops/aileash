@@ -1,0 +1,497 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>SonicBoom &mdash; Your Own AI Compliance Engine. Runs Local. Sub-20ms.</title>
+<meta name="description" content="SonicBoom gives you your own AILeash compliance engine. Runs inside your infrastructure. Every decision is local. No round trip. Sub-20ms. One line of code.">
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;800;900&family=DM+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --navy:#0a0f1e;
+  --cyan:#00d4ff;
+  --cyan-dim:rgba(0,212,255,0.15);
+  --gold:#c9a84c;
+  --white:#fff;
+  --off:#f5f7fa;
+  --muted:#64748b;
+  --border:#e2e8f0;
+  --text:#1a202c;
+  --green:#00ff88;
+  --mono:'JetBrains Mono',monospace;
+  --sans:'DM Sans',sans-serif;
+  --display:'Playfair Display',serif
+}
+html,body{background:var(--navy);color:var(--white);font-family:var(--sans);overflow-x:hidden}
+html{scroll-behavior:smooth}
+
+nav{position:fixed;top:0;left:0;right:0;z-index:100;background:rgba(10,15,30,0.95);backdrop-filter:blur(12px);padding:0 48px;height:68px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid rgba(0,212,255,0.1)}
+.nav-logo{font-family:var(--display);font-size:20px;color:var(--white);font-weight:900;text-decoration:none}.nav-logo span{color:var(--cyan)}
+.nav-links{display:flex;gap:16px;align-items:center}
+.nav-links a{color:rgba(255,255,255,0.4);text-decoration:none;font-size:13px;font-weight:500;transition:color .2s}.nav-links a:hover{color:var(--white)}
+.nav-cta{background:var(--cyan)!important;color:var(--navy)!important;padding:9px 18px;font-weight:700!important;border-radius:4px}
+
+.hero{padding:140px 48px 100px;position:relative;overflow:hidden;text-align:center}
+.hero::before{content:'';position:absolute;inset:0;background:radial-gradient(ellipse at 50% 40%,rgba(0,212,255,0.08) 0%,transparent 65%)}
+.hero::after{content:'';position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,var(--cyan),transparent)}
+.hero-inner{max-width:900px;margin:0 auto;position:relative;z-index:1}
+.eyebrow{font-family:var(--mono);font-size:11px;letter-spacing:3px;text-transform:uppercase;color:var(--cyan);margin-bottom:20px;display:block}
+h1{font-family:var(--display);font-size:clamp(42px,6vw,80px);line-height:1.02;font-weight:900;margin-bottom:24px}
+h1 em{color:var(--cyan);font-style:normal}
+h1 span{color:rgba(255,255,255,0.25)}
+.hero-sub{font-size:18px;color:rgba(255,255,255,0.45);line-height:1.8;max-width:640px;margin:0 auto 48px}
+.hero-sub strong{color:var(--white)}
+
+.speed-number{font-family:var(--display);font-size:clamp(80px,12vw,140px);font-weight:900;color:var(--cyan);line-height:1;margin-bottom:0;opacity:0.9;letter-spacing:-4px}
+.speed-label{font-family:var(--mono);font-size:12px;letter-spacing:3px;text-transform:uppercase;color:rgba(255,255,255,0.2);margin-bottom:48px}
+
+.hero-btns{display:flex;gap:12px;justify-content:center;flex-wrap:wrap}
+.btn-cyan{background:var(--cyan);color:var(--navy);padding:14px 28px;border:none;font-family:var(--sans);font-weight:700;font-size:14px;cursor:pointer;text-decoration:none;border-radius:4px;display:inline-block;transition:all .2s}.btn-cyan:hover{background:#33ddff;transform:translateY(-2px)}
+.btn-ghost{background:transparent;color:rgba(255,255,255,0.4);padding:14px 28px;border:1px solid rgba(255,255,255,0.1);font-family:var(--sans);font-weight:600;font-size:14px;cursor:pointer;text-decoration:none;border-radius:4px;display:inline-block;transition:all .2s}.btn-ghost:hover{color:var(--white);border-color:rgba(255,255,255,0.3)}
+
+.divider{height:1px;background:linear-gradient(90deg,transparent,rgba(0,212,255,0.3),transparent)}
+
+.what-sec{padding:80px 48px;border-bottom:1px solid rgba(255,255,255,0.05)}
+.what-inner{max-width:1100px;margin:0 auto}
+.sec-eyebrow{font-family:var(--mono);font-size:10px;letter-spacing:3px;text-transform:uppercase;color:rgba(0,212,255,0.5);margin-bottom:16px;display:block}
+h2{font-family:var(--display);font-size:clamp(28px,3.5vw,48px);font-weight:900;line-height:1.1;margin-bottom:16px}
+h2 em{color:var(--cyan);font-style:normal}
+.sec-sub{font-size:15px;color:rgba(255,255,255,0.35);line-height:1.8;max-width:580px;margin-bottom:52px}
+
+.two-col{display:grid;grid-template-columns:1fr 1fr;gap:2px;background:rgba(255,255,255,0.04)}
+.col{background:var(--navy);padding:40px 36px}
+.col-label{font-family:var(--mono);font-size:9px;letter-spacing:2px;text-transform:uppercase;margin-bottom:20px;padding:4px 10px;border-radius:2px;display:inline-block}
+.col-old .col-label{color:rgba(255,255,255,0.2);background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08)}
+.col-new .col-label{color:var(--cyan);background:rgba(0,212,255,0.06);border:1px solid rgba(0,212,255,0.2)}
+.col h3{font-family:var(--display);font-size:22px;font-weight:900;margin-bottom:12px}
+.col-old h3{color:rgba(255,255,255,0.3)}
+.col-new h3{color:var(--white)}
+.col p{font-size:14px;line-height:1.75;margin-bottom:20px}
+.col-old p{color:rgba(255,255,255,0.2)}
+.col-new p{color:rgba(255,255,255,0.5)}
+.col-stat{font-family:var(--display);font-size:52px;font-weight:900;line-height:1;margin-bottom:4px}
+.col-old .col-stat{color:rgba(255,255,255,0.1)}
+.col-new .col-stat{color:var(--cyan)}
+.col-stat-label{font-family:var(--mono);font-size:9px;letter-spacing:2px;color:rgba(255,255,255,0.2);text-transform:uppercase}
+
+.engine-sec{padding:80px 48px;background:rgba(0,212,255,0.02);border-bottom:1px solid rgba(0,212,255,0.08)}
+.engine-inner{max-width:1100px;margin:0 auto}
+.engine-card{background:rgba(255,255,255,0.03);border:1px solid rgba(0,212,255,0.15);border-radius:8px;overflow:hidden;margin-top:40px}
+.engine-card-header{background:rgba(0,212,255,0.06);border-bottom:1px solid rgba(0,212,255,0.1);padding:24px 32px;display:flex;align-items:center;justify-content:space-between;flex-wrap:gap}
+.engine-card-title{font-family:var(--display);font-size:24px;font-weight:900;color:var(--white)}
+.engine-card-title span{color:var(--cyan)}
+.engine-badge{font-family:var(--mono);font-size:9px;letter-spacing:2px;text-transform:uppercase;color:var(--cyan);background:rgba(0,212,255,0.1);border:1px solid rgba(0,212,255,0.2);padding:5px 12px;border-radius:2px}
+.engine-body{padding:32px;display:grid;grid-template-columns:1fr 1fr;gap:40px}
+.engine-features{display:flex;flex-direction:column;gap:16px}
+.ef{display:flex;align-items:flex-start;gap:12px}
+.ef-icon{font-family:var(--mono);font-size:9px;font-weight:700;color:var(--cyan);flex-shrink:0;margin-top:2px;letter-spacing:1px}
+.ef-text h4{font-size:14px;font-weight:700;color:var(--white);margin-bottom:3px}
+.ef-text p{font-size:13px;color:rgba(255,255,255,0.35);line-height:1.6}
+.engine-download{background:rgba(0,0,0,0.3);border:1px solid rgba(0,212,255,0.1);border-radius:6px;padding:28px;display:flex;flex-direction:column;gap:16px}
+.dl-label{font-family:var(--mono);font-size:9px;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,0.2);margin-bottom:4px}
+.dl-filename{font-family:var(--mono);font-size:16px;color:var(--cyan);font-weight:600}
+.dl-size{font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.15);margin-top:2px}
+.dl-steps{display:flex;flex-direction:column;gap:8px;margin:8px 0}
+.dl-step{font-family:var(--mono);font-size:12px;color:rgba(255,255,255,0.4);line-height:1.5}
+.dl-step strong{color:var(--cyan)}
+
+.code-block{background:rgba(0,0,0,0.4);border:1px solid rgba(0,212,255,0.1);border-radius:6px;padding:20px;font-family:var(--mono);font-size:12px;line-height:1.8;color:rgba(255,255,255,0.5);overflow-x:auto;white-space:pre}
+.code-block .c-cyan{color:var(--cyan)}
+.code-block .c-green{color:var(--green)}
+.code-block .c-gold{color:var(--gold)}
+.code-block .c-dim{color:rgba(255,255,255,0.2)}
+
+.how-sec{padding:80px 48px;border-bottom:1px solid rgba(255,255,255,0.05)}
+.how-inner{max-width:1100px;margin:0 auto}
+.steps{display:grid;grid-template-columns:repeat(4,1fr);gap:2px;background:rgba(255,255,255,0.04);margin-top:40px}
+.step{background:var(--navy);padding:32px 24px}
+.step-n{font-family:var(--display);font-size:56px;font-weight:900;color:var(--cyan);opacity:0.15;line-height:1;margin-bottom:12px}
+.step h3{font-family:var(--display);font-size:18px;font-weight:900;color:var(--white);margin-bottom:10px}
+.step p{font-size:13px;color:rgba(255,255,255,0.35);line-height:1.7}
+
+.arch-sec{padding:80px 48px;background:rgba(0,212,255,0.02);border-bottom:1px solid rgba(0,212,255,0.08)}
+.arch-inner{max-width:1100px;margin:0 auto}
+.arch-diagram{margin-top:40px;background:rgba(0,0,0,0.3);border:1px solid rgba(0,212,255,0.1);border-radius:8px;padding:40px;font-family:var(--mono);font-size:13px;color:rgba(255,255,255,0.5);line-height:2.2;text-align:center}
+.arch-diagram .node{display:inline-block;background:rgba(0,212,255,0.08);border:1px solid rgba(0,212,255,0.2);padding:8px 20px;border-radius:4px;color:var(--cyan);font-weight:600}
+.arch-diagram .node-grey{display:inline-block;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);padding:8px 20px;border-radius:4px;color:rgba(255,255,255,0.3)}
+.arch-diagram .arrow{color:rgba(0,212,255,0.3);margin:0 12px;font-size:16px}
+.arch-diagram .note{font-size:10px;color:rgba(255,255,255,0.15);letter-spacing:1px;text-transform:uppercase;margin-top:8px;display:block}
+
+.pricing-sec{padding:80px 48px;border-bottom:1px solid rgba(255,255,255,0.05)}
+.pricing-inner{max-width:700px;margin:0 auto;text-align:center}
+.price-card{background:rgba(255,255,255,0.03);border:1px solid rgba(0,212,255,0.15);border-radius:8px;padding:48px;margin-top:40px}
+.price-big{font-family:var(--display);font-size:96px;font-weight:900;color:var(--cyan);line-height:1;margin-bottom:4px}
+.price-per{font-family:var(--mono);font-size:11px;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,0.2);margin-bottom:32px}
+.price-includes{display:flex;flex-direction:column;gap:10px;text-align:left;margin-bottom:32px}
+.pi{display:flex;align-items:center;gap:10px;font-size:14px;color:rgba(255,255,255,0.5)}
+.pi::before{content:'OK';font-family:var(--mono);font-size:9px;font-weight:700;color:var(--cyan);flex-shrink:0}
+
+.signup-sec{padding:80px 48px}
+.signup-inner{max-width:520px;margin:0 auto;text-align:center}
+.signup-inner h2{margin-bottom:12px}
+.signup-inner p{font-size:15px;color:rgba(255,255,255,0.35);line-height:1.7;margin-bottom:32px}
+.fg{margin-bottom:12px;text-align:left}
+.fg label{display:block;font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.25);letter-spacing:2px;text-transform:uppercase;margin-bottom:6px}
+.fg input,.fg select{width:100%;background:rgba(255,255,255,0.05);border:2px solid rgba(255,255,255,0.08);color:var(--white);padding:12px 14px;font-size:14px;font-family:var(--sans);outline:none;border-radius:4px;transition:border-color .2s}
+.fg input:focus,.fg select:focus{border-color:var(--cyan)}
+.fg input::placeholder{color:rgba(255,255,255,0.2)}
+.fg select option{background:var(--navy)}
+.fg-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.btn-full{width:100%;padding:14px;font-size:15px;font-weight:700;border-radius:4px;border:none;cursor:pointer;font-family:var(--sans);transition:all .2s;background:var(--cyan);color:var(--navy);margin-top:8px}
+.btn-full:hover{background:#33ddff}
+.key-box{display:none;margin-top:24px;background:rgba(0,0,0,0.4);border:1px solid rgba(0,212,255,0.2);border-radius:6px;padding:24px;text-align:left}
+.key-box.show{display:block}
+.key-lbl{font-family:var(--mono);font-size:9px;letter-spacing:2px;color:var(--cyan);margin-bottom:8px;text-transform:uppercase}
+.key-val{font-family:var(--mono);font-size:11px;color:var(--green);word-break:break-all;background:rgba(0,0,0,0.3);padding:10px;border-radius:4px;margin-bottom:16px}
+.dl-btn{display:block;text-align:center;background:rgba(0,212,255,0.1);border:1px solid rgba(0,212,255,0.3);color:var(--cyan);padding:12px;border-radius:4px;font-family:var(--mono);font-size:12px;font-weight:600;text-decoration:none;transition:all .2s;cursor:pointer}
+.dl-btn:hover{background:rgba(0,212,255,0.2)}
+.msg-err{display:none;color:#ff6b6b;font-family:var(--mono);font-size:11px;margin-top:10px;padding:10px;background:rgba(255,0,0,0.08);border-radius:4px;border:1px solid rgba(255,0,0,0.2)}
+.msg-err.show{display:block}
+
+footer{background:rgba(0,0,0,0.4);padding:48px;border-top:1px solid rgba(255,255,255,0.04)}
+.foot-inner{max-width:1100px;margin:0 auto;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:20px}
+.foot-logo{font-family:var(--display);font-size:18px;color:var(--white);font-weight:900;text-decoration:none}.foot-logo span{color:var(--cyan)}
+.foot-links{display:flex;gap:24px;flex-wrap:wrap}
+.foot-links a{color:rgba(255,255,255,0.2);text-decoration:none;font-size:12px;transition:color .2s}.foot-links a:hover{color:var(--white)}
+.foot-copy{font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.1);width:100%;margin-top:16px;padding-top:16px;border-top:1px solid rgba(255,255,255,0.04)}
+
+@media(max-width:900px){
+  nav{padding:0 20px}
+  .nav-links a:not(.nav-cta){display:none}
+  .hero,.what-sec,.engine-sec,.how-sec,.arch-sec,.pricing-sec,.signup-sec{padding:56px 20px!important}
+  .two-col,.engine-body,.steps{grid-template-columns:1fr!important}
+  .fg-row{grid-template-columns:1fr!important}
+  footer{padding:36px 20px}
+  .foot-inner{flex-direction:column;align-items:flex-start}
+}
+</style>
+</head>
+<body>
+
+<nav>
+  <a href="https://sebbi.pro" class="nav-logo">Monop <span>Content</span></a>
+  <div class="nav-links">
+    <a href="https://sebbi.pro/#products">All Products</a>
+    <a href="https://sebbi.pro/scan">Free Scanner</a>
+    <a href="https://sebbi.pro/contact">Contact</a>
+    <a href="#signup" class="nav-cta">Get SonicBoom Free</a>
+  </div>
+</nav>
+
+<section class="hero">
+  <div class="hero-inner">
+    <span class="eyebrow">SonicBoom &mdash; Sebdog Engine</span>
+    <h1>Your own<br><em>compliance engine.</em><br><span>Runs where you do.</span></h1>
+    <p class="hero-sub">Not an API you call. <strong>Your own engine</strong> — running inside your infrastructure, making every compliance decision locally. No round trip. No latency. No data leaving your network.</p>
+    <div class="speed-number">&lt;20ms</div>
+    <div class="speed-label">Per decision &mdash; local &mdash; no network hop</div>
+    <div class="hero-btns">
+      <a href="#engine" class="btn-cyan">Get The Engine &darr;</a>
+      <a href="#how" class="btn-ghost">See How It Works</a>
+    </div>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<section class="what-sec">
+  <div class="what-inner">
+    <span class="sec-eyebrow">The Problem</span>
+    <h2>Every API call is a<br><em>round trip you pay for.</em></h2>
+    <p class="sec-sub">Standard cloud AI compliance tools make you send every decision to their server and wait for a response. That latency adds up. That data leaves your network. That dependency is their leverage over you.</p>
+    <div class="two-col">
+      <div class="col col-old">
+        <div class="col-label">The old way</div>
+        <h3>Call someone else's server</h3>
+        <p>Your platform makes a decision. You send it to a remote API. You wait. They respond. You act. Every single time. Every single decision. Your data leaves your network on every call.</p>
+        <div class="col-stat">200ms</div>
+        <div class="col-stat-label">typical round trip latency</div>
+      </div>
+      <div class="col col-new">
+        <div class="col-label">SonicBoom</div>
+        <h3>Your engine. Your server. Your speed.</h3>
+        <p>The Sebdog Engine runs inside your own infrastructure. Every compliance decision happens locally. Nothing leaves your network. The audit chain builds on your own machine. You own it completely.</p>
+        <div class="col-stat">&lt;20ms</div>
+        <div class="col-stat-label">local decision &mdash; no network hop</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="engine-sec" id="engine">
+  <div class="engine-inner">
+    <span class="sec-eyebrow">The Engine</span>
+    <h2>Sebdog Engine &mdash;<br><em>everything AILeash does,</em> running on yours.</h2>
+    <p class="sec-sub">One Python file. Runs anywhere Python runs. Licence-validated against sebbi.pro on startup. Every decision after that is yours, local, and instant.</p>
+
+    <div class="engine-card">
+      <div class="engine-card-header">
+        <div class="engine-card-title">sebdog_engine<span>.py</span></div>
+        <div class="engine-badge">Included with SonicBoom</div>
+      </div>
+      <div class="engine-body">
+        <div class="engine-features">
+          <div class="ef">
+            <div class="ef-icon">OK</div>
+            <div class="ef-text">
+              <h4>9-signal weighted scoring engine</h4>
+              <p>The full AILeash scoring algorithm — EWMA trust decay, velocity windows, anomaly detection — running entirely on your machine.</p>
+            </div>
+          </div>
+          <div class="ef">
+            <div class="ef-icon">OK</div>
+            <div class="ef-text">
+              <h4>SHA-256 Merkle audit chain</h4>
+              <p>Every decision sealed into a tamper-evident chain stored in your own SQLite database. Nobody can alter it. Not even you.</p>
+            </div>
+          </div>
+          <div class="ef">
+            <div class="ef-icon">OK</div>
+            <div class="ef-text">
+              <h4>Licence validates once, runs forever</h4>
+              <p>Phones home to sebbi.pro on startup and every 24 hours. Between checks every decision is purely local. 24-hour grace if connectivity drops.</p>
+            </div>
+          </div>
+          <div class="ef">
+            <div class="ef-icon">OK</div>
+            <div class="ef-text">
+              <h4>Data sovereignty</h4>
+              <p>Your users' data never leaves your network. Ever. Regulators love this. Your legal team will too.</p>
+            </div>
+          </div>
+          <div class="ef">
+            <div class="ef-icon">OK</div>
+            <div class="ef-text">
+              <h4>EU AI Act Articles 9, 12, 13, 14 compliant</h4>
+              <p>Full compliance audit trail generated automatically on every decision. Regulator-ready from day one.</p>
+            </div>
+          </div>
+          <div class="ef">
+            <div class="ef-icon">OK</div>
+            <div class="ef-text">
+              <h4>Zero external dependencies</h4>
+              <p>Pure Python standard library only. No pip install. No dependency hell. Runs anywhere.</p>
+            </div>
+          </div>
+        </div>
+        <div class="engine-download">
+          <div>
+            <div class="dl-label">Engine File</div>
+            <div class="dl-filename">sebdog_engine.py</div>
+            <div class="dl-size">Pure Python &mdash; zero dependencies &mdash; runs anywhere</div>
+          </div>
+          <div class="dl-steps">
+            <div class="dl-step"><strong>1.</strong> Get your free API key below</div>
+            <div class="dl-step"><strong>2.</strong> Download the engine with your key</div>
+            <div class="dl-step"><strong>3.</strong> Run it on your own server</div>
+            <div class="dl-step"><strong>4.</strong> Call localhost instead of sebbi.pro</div>
+          </div>
+          <div class="code-block"><span class="c-dim"># Run the engine on your server</span>
+<span class="c-cyan">python</span> sebdog_engine.py \
+  <span class="c-gold">--key</span> al_live_your_key \
+  <span class="c-gold">--port</span> 9090
+
+<span class="c-dim"># Every decision is now local</span>
+<span class="c-cyan">POST</span> http://localhost:9090/govern
+<span class="c-green">→ ALLOW / CHALLENGE / BLOCK</span>
+<span class="c-green">→ audit_hash sealed locally</span>
+<span class="c-green">→ &lt;20ms. No network hop.</span></div>
+          <a href="#signup" class="dl-btn">Get API Key &amp; Download Engine &darr;</a>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="how-sec" id="how">
+  <div class="how-inner">
+    <span class="sec-eyebrow">How It Works</span>
+    <h2>Four steps.<br><em>Then it runs forever.</em></h2>
+    <p class="sec-sub">From signup to local engine running in under five minutes.</p>
+    <div class="steps">
+      <div class="step">
+        <div class="step-n">01</div>
+        <h3>Get your free API key</h3>
+        <p>Sign up below. No card. 100 free decisions included. Takes 60 seconds.</p>
+      </div>
+      <div class="step">
+        <div class="step-n">02</div>
+        <h3>Download the Sebdog Engine</h3>
+        <p>One Python file. Download it with your API key. Drop it on your server.</p>
+      </div>
+      <div class="step">
+        <div class="step-n">03</div>
+        <h3>Run it on your infrastructure</h3>
+        <p>One command. It validates your licence and starts listening on any port you choose.</p>
+      </div>
+      <div class="step">
+        <div class="step-n">04</div>
+        <h3>Point your platform at localhost</h3>
+        <p>Change one URL in your code. Everything else stays the same. Now you have sub-20ms local compliance decisions forever.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="arch-sec">
+  <div class="arch-inner">
+    <span class="sec-eyebrow">Architecture</span>
+    <h2>Your platform.<br><em>Your engine. Your data.</em></h2>
+    <p class="sec-sub">The engine sits inside your infrastructure. sebbi.pro only sees a licence ping. Your users' data never travels anywhere.</p>
+    <div class="arch-diagram">
+      <div style="margin-bottom:24px">
+        <span class="node">Your Platform</span>
+        <span class="arrow">&rarr;</span>
+        <span class="node">Sebdog Engine (localhost)</span>
+        <span class="arrow">&rarr;</span>
+        <span class="node">ALLOW / CHALLENGE / BLOCK</span>
+      </div>
+      <span class="note">All of this happens inside your network &mdash; sub-20ms &mdash; no data leaves</span>
+      <div style="margin-top:32px;padding-top:24px;border-top:1px solid rgba(255,255,255,0.05)">
+        <span class="node-grey">Sebdog Engine</span>
+        <span class="arrow" style="color:rgba(255,255,255,0.1)">&rarr;</span>
+        <span class="node-grey">sebbi.pro (licence ping only)</span>
+      </div>
+      <span class="note">Once on startup. Once every 24 hours. That is it.</span>
+    </div>
+  </div>
+</section>
+
+<section class="pricing-sec">
+  <div class="pricing-inner">
+    <span class="sec-eyebrow">Pricing</span>
+    <h2>Same model.<br><em>Your own engine included.</em></h2>
+    <p class="sec-sub" style="margin:0 auto 0">50p per device per month. That is it. No setup fee. No enterprise contract. No minimum commitment.</p>
+    <div class="price-card">
+      <div class="price-big">50p</div>
+      <div class="price-per">per device per month &mdash; billed via stripe</div>
+      <div class="price-includes">
+        <div class="pi">Sebdog Engine file &mdash; runs on your own server</div>
+        <div class="pi">Full 9-signal scoring algorithm included</div>
+        <div class="pi">SHA-256 local audit chain &mdash; your database</div>
+        <div class="pi">EU AI Act Articles 9, 12, 13, 14 compliant</div>
+        <div class="pi">100 free decisions to test before you commit</div>
+        <div class="pi">Zero dependencies &mdash; pure Python standard library</div>
+        <div class="pi">Referral code included &mdash; earn 10p per device you refer</div>
+      </div>
+      <a href="#signup" class="btn-cyan" style="display:block;text-align:center;padding:14px">Get Free API Key &amp; Engine &rarr;</a>
+    </div>
+  </div>
+</section>
+
+<section class="signup-sec" id="signup">
+  <div class="signup-inner">
+    <span class="sec-eyebrow">Get Started</span>
+    <h2>Free API key.<br><em>Engine download. Now.</em></h2>
+    <p>Sign up. Get your key. Download the Sebdog Engine. Running in under five minutes.</p>
+    <div class="fg-row">
+      <div class="fg"><label>First Name</label><input type="text" id="fn" placeholder="Justin"></div>
+      <div class="fg"><label>Last Name</label><input type="text" id="ln" placeholder="Smith"></div>
+    </div>
+    <div class="fg"><label>Email Address</label><input type="email" id="em" placeholder="you@company.com"></div>
+    <div class="fg"><label>Phone Number</label><input type="tel" id="ph" placeholder="+44 7700 000000"></div>
+    <div class="fg"><label>Platform or Company Name</label><input type="text" id="org" placeholder="e.g. MyPlatform Ltd"></div>
+    <div class="fg"><label>Estimated Devices</label>
+      <select id="dv">
+        <option value="100">Under 100</option>
+        <option value="500">100 to 500</option>
+        <option value="1000">500 to 1,000</option>
+        <option value="5000">1,000 to 5,000</option>
+        <option value="10000">5,000 to 10,000</option>
+        <option value="50000">10,000 plus</option>
+      </select>
+    </div>
+    <button class="btn-full" onclick="doSignup()">Get Free API Key &amp; Download Engine &rarr;</button>
+    <div class="msg-err" id="msg-err"></div>
+    <div class="key-box" id="key-box">
+      <div class="key-lbl">Your API Key &mdash; Save This Now</div>
+      <div class="key-val" id="key-val"></div>
+      <div style="font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.3);margin-top:16px;line-height:1.9;background:rgba(0,212,255,0.05);border:1px solid rgba(0,212,255,0.1);border-radius:4px;padding:12px">
+        Redirecting to Stripe to set up billing&hellip;<br>
+        Engine download unlocks after payment.<br>
+        100 free decisions active now while you complete setup.
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="foot-inner">
+    <a href="https://sebbi.pro" class="foot-logo">Monop <span>Content</span></a>
+    <div class="foot-links">
+      <a href="https://sebbi.pro/#products">All Products</a>
+      <a href="https://sebbi.pro/#signup">AILeash</a>
+      <a href="https://sebbi.pro/#signup">Guardian</a>
+      <a href="https://sebbi.pro/#signup">Sentinel</a>
+      <a href="https://sebbi.pro/scan">Free Scanner</a>
+      <a href="https://sebbi.pro/contact">Contact Justin</a>
+    </div>
+    <div class="foot-copy">&copy; 2026 Monop Content &middot; Justin Antony Dobson &middot; Blyth, Northumberland, UK &middot; justin@monopcontent.com &middot; 07908 269428</div>
+  </div>
+</footer>
+
+<script>
+async function doSignup() {
+  var fn = document.getElementById('fn').value.trim();
+  var ln = document.getElementById('ln').value.trim();
+  var em = document.getElementById('em').value.trim();
+  var ph = document.getElementById('ph').value.trim();
+  var org = document.getElementById('org').value.trim();
+  var dv = parseInt(document.getElementById('dv').value) || 1;
+  var err = document.getElementById('msg-err');
+  var kb = document.getElementById('key-box');
+  var btn = document.querySelector('.btn-full');
+  err.classList.remove('show'); kb.classList.remove('show');
+  if (!em || !em.includes('@')) { err.textContent = 'Please enter a valid email address.'; err.classList.add('show'); return; }
+  if (!org) { err.textContent = 'Please enter your company or platform name.'; err.classList.add('show'); return; }
+  var orig = btn.textContent; btn.textContent = 'Creating key\u2026'; btn.disabled = true;
+  try {
+    // Step 1 — create the API key
+    var r = await fetch('https://sebbi.pro/signup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: em, phone: ph, name: fn + ' ' + ln, org: org, org_type: 'sonicboom', product: 'aileash', devices: dv })
+    });
+    var d = await r.json();
+    if (d.api_key) {
+      document.getElementById('key-val').textContent = d.api_key;
+      kb.classList.add('show');
+      btn.textContent = 'Key created \u2014 setting up billing\u2026';
+
+      // Step 2 — push straight to Stripe checkout
+      // Engine download only unlocks after payment via webhook setting is_paid=1
+      try {
+        var r2 = await fetch('https://sebbi.pro/create-checkout', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: em, product: 'aileash', devices: dv })
+        });
+        var d2 = await r2.json();
+        if (d2.checkout_url) {
+          // Brief pause so they see their key, then redirect to Stripe
+          setTimeout(function() {
+            window.location.href = d2.checkout_url;
+          }, 2500);
+        } else {
+          // Stripe not configured — show key, tell them Justin will be in touch
+          btn.textContent = 'Key ready \u2713';
+          document.getElementById('dl-link').style.display = 'none';
+          document.querySelector('.key-box .key-lbl:last-of-type').textContent = 'Next step';
+          document.querySelector('#key-box div:last-of-type').innerHTML = 'Justin will be in touch to set up billing and unlock your engine download.<br><a href="mailto:justin@monopcontent.com" style="color:var(--cyan)">justin@monopcontent.com</a>';
+        }
+      } catch(e2) {
+        btn.textContent = 'Key ready \u2713';
+      }
+    } else {
+      err.textContent = d.error || 'Something went wrong. Email justin@monopcontent.com';
+      err.classList.add('show'); btn.textContent = orig; btn.disabled = false;
+    }
+  } catch(e) {
+    err.textContent = 'Cannot reach server. Email justin@monopcontent.com';
+    err.classList.add('show'); btn.textContent = orig; btn.disabled = false;
+  }
+}
+</script>
+</body>
+</html>
