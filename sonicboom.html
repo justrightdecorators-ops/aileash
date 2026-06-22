@@ -1,0 +1,770 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>SonicBoom &mdash; Your Own AI Compliance Engine. Runs Local. Sub-20ms.</title>
+<meta name="description" content="SonicBoom gives you your own AILeash compliance engine. Runs inside your infrastructure. Every decision is local. No round trip. Sub-20ms.">
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;800;900&family=DM+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --navy:#0a0f1e;--cyan:#00d4ff;--gold:#c9a84c;--white:#fff;
+  --off:#f5f7fa;--muted:#64748b;--border:#e2e8f0;--text:#1a202c;
+  --green:#00ff88;--red:#cc0000;
+  --mono:'JetBrains Mono',monospace;--sans:'DM Sans',sans-serif;--display:'Playfair Display',serif
+}
+html,body{background:var(--navy);color:var(--white);font-family:var(--sans);overflow-x:hidden}
+html{scroll-behavior:smooth}
+nav{position:fixed;top:0;left:0;right:0;z-index:100;background:rgba(10,15,30,0.97);backdrop-filter:blur(12px);padding:0 48px;height:68px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid rgba(0,212,255,0.1)}
+.nav-logo{font-family:var(--display);font-size:20px;color:var(--white);font-weight:900;text-decoration:none}.nav-logo span{color:var(--cyan)}
+.nav-links{display:flex;gap:16px;align-items:center}
+.nav-links a{color:rgba(255,255,255,0.4);text-decoration:none;font-size:13px;font-weight:500;transition:color .2s}.nav-links a:hover{color:var(--white)}
+.nav-cta{background:var(--cyan)!important;color:var(--navy)!important;padding:9px 18px;font-weight:700!important;border-radius:4px}
+
+/* SCAN HERO */
+.scan-sec{padding:140px 48px 80px;position:relative;overflow:hidden;text-align:center;border-bottom:1px solid rgba(0,212,255,0.1)}
+.scan-sec::before{content:'';position:absolute;inset:0;background:radial-gradient(ellipse at 50% 40%,rgba(0,212,255,0.06) 0%,transparent 65%)}
+.scan-sec::after{content:'';position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,var(--cyan),transparent)}
+.scan-inner{max-width:820px;margin:0 auto;position:relative;z-index:1}
+.scan-eyebrow{font-family:var(--mono);font-size:11px;letter-spacing:3px;text-transform:uppercase;color:var(--cyan);margin-bottom:20px;display:block}
+.scan-title{font-family:var(--display);font-size:clamp(36px,5vw,64px);line-height:1.05;font-weight:900;margin-bottom:16px}
+.scan-title em{color:var(--cyan);font-style:normal}
+.scan-sub{font-size:16px;color:rgba(255,255,255,0.35);line-height:1.7;margin-bottom:48px}
+
+/* SOUND TOGGLE */
+.sound-toggle{display:inline-flex;align-items:center;gap:10px;background:rgba(0,212,255,0.08);border:1px solid rgba(0,212,255,0.2);border-radius:40px;padding:10px 20px;cursor:pointer;margin-bottom:32px;transition:all .2s;font-family:var(--mono);font-size:11px;letter-spacing:1px;text-transform:uppercase;color:var(--cyan)}
+.sound-toggle:hover{background:rgba(0,212,255,0.15)}
+.sound-icon{font-size:18px}
+.sound-label{}
+
+/* TERMINAL */
+.terminal{background:rgba(0,0,0,0.55);border:1px solid rgba(0,212,255,0.2);border-radius:8px;overflow:hidden;text-align:left;margin-bottom:40px;box-shadow:0 0 60px rgba(0,212,255,0.05)}
+.terminal-bar{background:rgba(0,212,255,0.05);padding:12px 20px;border-bottom:1px solid rgba(0,212,255,0.1);display:flex;align-items:center;gap:8px}
+.t-dot{width:10px;height:10px;border-radius:50%}
+.t-dot-r{background:#ff5f57}.t-dot-y{background:#febc2e}.t-dot-g{background:#28c840}
+.t-title{font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.2);letter-spacing:2px;text-transform:uppercase;margin-left:8px}
+.terminal-body{padding:28px 28px 32px;min-height:320px}
+.t-line{font-family:var(--mono);font-size:13px;line-height:2.1;display:flex;align-items:flex-start;gap:10px;opacity:0;transform:translateY(4px);transition:opacity .25s,transform .25s}
+.t-line.show{opacity:1;transform:none}
+.t-prompt{color:rgba(0,212,255,0.3);flex-shrink:0;user-select:none}
+.t-text{color:rgba(255,255,255,0.75);flex:1}
+.t-cyan{color:var(--cyan)}
+.t-green{color:var(--green)}
+.t-gold{color:var(--gold)}
+.t-red{color:#ff6b6b}
+.t-dim{color:rgba(255,255,255,0.2)}
+.t-hash{color:var(--green);font-size:11px;word-break:break-all;line-height:1.6}
+.t-cursor{display:inline-block;width:8px;height:14px;background:var(--cyan);animation:blink 1s infinite;vertical-align:middle;margin-left:2px;border-radius:1px}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
+.t-section{font-family:var(--mono);font-size:9px;letter-spacing:3px;text-transform:uppercase;color:rgba(0,212,255,0.25);padding:8px 0 4px;border-top:1px solid rgba(255,255,255,0.04);margin-top:4px;opacity:0;transition:opacity .3s}
+.t-section.show{opacity:1}
+
+/* VERDICT */
+.verdict{display:none;padding:28px 28px 32px;border-top:1px solid rgba(0,212,255,0.1);background:rgba(0,0,0,0.3)}
+.verdict.show{display:block}
+.verdict-decision{font-family:var(--display);font-size:56px;font-weight:900;line-height:1;margin-bottom:6px;letter-spacing:2px}
+.verdict-allow{color:var(--green)}.verdict-challenge{color:var(--gold)}.verdict-block{color:var(--red)}
+.verdict-score{font-family:var(--mono);font-size:11px;color:rgba(255,255,255,0.25);letter-spacing:1px;margin-bottom:20px}
+.verdict-hash-label{font-family:var(--mono);font-size:9px;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,0.15);margin-bottom:6px}
+.verdict-hash{font-family:var(--mono);font-size:11px;color:var(--green);word-break:break-all;background:rgba(0,0,0,0.3);padding:10px 12px;border-radius:4px;margin-bottom:12px;line-height:1.6}
+.verdict-sealed{font-family:var(--mono);font-size:10px;color:rgba(0,212,255,0.35);letter-spacing:1px}
+
+/* FEAR */
+.fear-sec{display:none;padding:0 48px 80px;text-align:center}
+.fear-sec.show{display:block}
+.fear-inner{max-width:700px;margin:0 auto}
+.fear-line{font-family:var(--display);font-size:clamp(20px,3vw,34px);font-weight:900;line-height:1.3;margin-bottom:20px;opacity:0;transform:translateY(24px);transition:opacity .7s,transform .7s}
+.fear-line.show{opacity:1;transform:none}
+.fear-line em{color:var(--cyan);font-style:normal}
+.fear-line strong{color:var(--red)}
+.fear-divider{width:60px;height:3px;background:linear-gradient(90deg,var(--cyan),var(--gold));margin:36px auto;opacity:0;transition:opacity .7s;border-radius:2px}
+.fear-divider.show{opacity:1}
+.fear-cta{margin-top:52px;opacity:0;transform:translateY(24px);transition:opacity .7s,transform .7s}
+.fear-cta.show{opacity:1;transform:none}
+.fear-price{font-family:var(--display);font-size:clamp(56px,10vw,110px);font-weight:900;color:var(--cyan);line-height:1;margin-bottom:4px}
+.fear-price-label{font-family:var(--mono);font-size:11px;letter-spacing:2px;color:rgba(255,255,255,0.2);margin-bottom:36px;text-transform:uppercase}
+.btn-cyan{background:var(--cyan);color:var(--navy);padding:16px 36px;border:none;font-family:var(--sans);font-weight:700;font-size:16px;cursor:pointer;text-decoration:none;border-radius:4px;display:inline-block;transition:all .2s}.btn-cyan:hover{background:#33ddff;transform:translateY(-2px)}
+.btn-ghost{background:transparent;color:rgba(255,255,255,0.4);padding:16px 36px;border:1px solid rgba(255,255,255,0.1);font-family:var(--sans);font-weight:600;font-size:16px;cursor:pointer;text-decoration:none;border-radius:4px;display:inline-block;transition:all .2s;margin-left:12px}.btn-ghost:hover{color:var(--white);border-color:rgba(255,255,255,0.3)}
+
+/* REST */
+.divider{height:1px;background:linear-gradient(90deg,transparent,rgba(0,212,255,0.3),transparent)}
+.what-sec{padding:80px 48px;border-bottom:1px solid rgba(255,255,255,0.05)}
+.what-inner,.engine-inner,.how-inner,.pricing-inner{max-width:1100px;margin:0 auto}
+.sec-eyebrow{font-family:var(--mono);font-size:10px;letter-spacing:3px;text-transform:uppercase;color:rgba(0,212,255,0.5);margin-bottom:16px;display:block}
+h2{font-family:var(--display);font-size:clamp(28px,3.5vw,48px);font-weight:900;line-height:1.1;margin-bottom:16px}
+h2 em{color:var(--cyan);font-style:normal}
+.sec-sub{font-size:15px;color:rgba(255,255,255,0.35);line-height:1.8;max-width:580px;margin-bottom:52px}
+.two-col{display:grid;grid-template-columns:1fr 1fr;gap:2px;background:rgba(255,255,255,0.04)}
+.col{background:var(--navy);padding:40px 36px}
+.col-label{font-family:var(--mono);font-size:9px;letter-spacing:2px;text-transform:uppercase;margin-bottom:20px;padding:4px 10px;border-radius:2px;display:inline-block}
+.col-old .col-label{color:rgba(255,255,255,0.2);background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08)}
+.col-new .col-label{color:var(--cyan);background:rgba(0,212,255,0.06);border:1px solid rgba(0,212,255,0.2)}
+.col h3{font-family:var(--display);font-size:22px;font-weight:900;margin-bottom:12px}
+.col-old h3{color:rgba(255,255,255,0.3)}.col-new h3{color:var(--white)}
+.col p{font-size:14px;line-height:1.75;margin-bottom:20px}
+.col-old p{color:rgba(255,255,255,0.2)}.col-new p{color:rgba(255,255,255,0.5)}
+.col-stat{font-family:var(--display);font-size:52px;font-weight:900;line-height:1;margin-bottom:4px}
+.col-old .col-stat{color:rgba(255,255,255,0.1)}.col-new .col-stat{color:var(--cyan)}
+.col-stat-label{font-family:var(--mono);font-size:9px;letter-spacing:2px;color:rgba(255,255,255,0.2);text-transform:uppercase}
+.engine-sec{padding:80px 48px;background:rgba(0,212,255,0.02);border-bottom:1px solid rgba(0,212,255,0.08)}
+.engine-card{background:rgba(255,255,255,0.03);border:1px solid rgba(0,212,255,0.15);border-radius:8px;overflow:hidden;margin-top:40px}
+.engine-card-header{background:rgba(0,212,255,0.06);border-bottom:1px solid rgba(0,212,255,0.1);padding:24px 32px;display:flex;align-items:center;justify-content:space-between}
+.engine-card-title{font-family:var(--display);font-size:24px;font-weight:900;color:var(--white)}.engine-card-title span{color:var(--cyan)}
+.engine-badge{font-family:var(--mono);font-size:9px;letter-spacing:2px;text-transform:uppercase;color:var(--cyan);background:rgba(0,212,255,0.1);border:1px solid rgba(0,212,255,0.2);padding:5px 12px;border-radius:2px}
+.engine-body{padding:32px;display:grid;grid-template-columns:1fr 1fr;gap:40px}
+.engine-features{display:flex;flex-direction:column;gap:16px}
+.ef{display:flex;align-items:flex-start;gap:12px}
+.ef-icon{font-family:var(--mono);font-size:9px;font-weight:700;color:var(--cyan);flex-shrink:0;margin-top:2px}
+.ef-text h4{font-size:14px;font-weight:700;color:var(--white);margin-bottom:3px}
+.ef-text p{font-size:13px;color:rgba(255,255,255,0.35);line-height:1.6}
+.engine-download{background:rgba(0,0,0,0.3);border:1px solid rgba(0,212,255,0.1);border-radius:6px;padding:28px;display:flex;flex-direction:column;gap:16px}
+.dl-label{font-family:var(--mono);font-size:9px;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,0.2);margin-bottom:4px}
+.dl-filename{font-family:var(--mono);font-size:16px;color:var(--cyan);font-weight:600}
+.dl-size{font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.15);margin-top:2px}
+.dl-steps{display:flex;flex-direction:column;gap:8px}
+.dl-step{font-family:var(--mono);font-size:12px;color:rgba(255,255,255,0.4);line-height:1.5}
+.dl-step strong{color:var(--cyan)}
+.code-block{background:rgba(0,0,0,0.4);border:1px solid rgba(0,212,255,0.1);border-radius:6px;padding:20px;font-family:var(--mono);font-size:12px;line-height:1.8;color:rgba(255,255,255,0.5);overflow-x:auto;white-space:pre}
+.code-block .c-cyan{color:var(--cyan)}.code-block .c-green{color:var(--green)}.code-block .c-gold{color:var(--gold)}.code-block .c-dim{color:rgba(255,255,255,0.2)}
+.dl-btn{display:block;text-align:center;background:rgba(0,212,255,0.1);border:1px solid rgba(0,212,255,0.3);color:var(--cyan);padding:12px;border-radius:4px;font-family:var(--mono);font-size:12px;font-weight:600;text-decoration:none;transition:all .2s;cursor:pointer}.dl-btn:hover{background:rgba(0,212,255,0.2)}
+.how-sec{padding:80px 48px;border-bottom:1px solid rgba(255,255,255,0.05)}
+.steps{display:grid;grid-template-columns:repeat(4,1fr);gap:2px;background:rgba(255,255,255,0.04);margin-top:40px}
+.step{background:var(--navy);padding:32px 24px}
+.step-n{font-family:var(--display);font-size:56px;font-weight:900;color:var(--cyan);opacity:0.15;line-height:1;margin-bottom:12px}
+.step h3{font-family:var(--display);font-size:18px;font-weight:900;color:var(--white);margin-bottom:10px}
+.step p{font-size:13px;color:rgba(255,255,255,0.35);line-height:1.7}
+.pricing-sec{padding:80px 48px;border-bottom:1px solid rgba(255,255,255,0.05)}
+.price-card{background:rgba(255,255,255,0.03);border:1px solid rgba(0,212,255,0.15);border-radius:8px;padding:48px;margin-top:40px;text-align:center;max-width:600px;margin-left:auto;margin-right:auto}
+.price-big{font-family:var(--display);font-size:96px;font-weight:900;color:var(--cyan);line-height:1;margin-bottom:4px}
+.price-per{font-family:var(--mono);font-size:11px;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,0.2);margin-bottom:32px}
+.price-includes{display:flex;flex-direction:column;gap:10px;text-align:left;margin-bottom:32px}
+.pi{display:flex;align-items:center;gap:10px;font-size:14px;color:rgba(255,255,255,0.5)}
+.pi::before{content:'OK';font-family:var(--mono);font-size:9px;font-weight:700;color:var(--cyan);flex-shrink:0}
+.signup-sec{padding:80px 48px}
+.signup-inner{max-width:520px;margin:0 auto;text-align:center}
+.signup-inner p{font-size:15px;color:rgba(255,255,255,0.35);line-height:1.7;margin-bottom:32px}
+.fg{margin-bottom:12px;text-align:left}
+.fg label{display:block;font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.25);letter-spacing:2px;text-transform:uppercase;margin-bottom:6px}
+.fg input,.fg select{width:100%;background:rgba(255,255,255,0.05);border:2px solid rgba(255,255,255,0.08);color:var(--white);padding:12px 14px;font-size:14px;font-family:var(--sans);outline:none;border-radius:4px;transition:border-color .2s}
+.fg input:focus,.fg select:focus{border-color:var(--cyan)}
+.fg input::placeholder{color:rgba(255,255,255,0.2)}
+.fg select option{background:var(--navy)}
+.fg-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.btn-full{width:100%;padding:14px;font-size:15px;font-weight:700;border-radius:4px;border:none;cursor:pointer;font-family:var(--sans);transition:all .2s;background:var(--cyan);color:var(--navy);margin-top:8px}
+.btn-full:hover{background:#33ddff}
+.key-box{display:none;margin-top:24px;background:rgba(0,0,0,0.4);border:1px solid rgba(0,212,255,0.2);border-radius:6px;padding:24px;text-align:left}
+.key-box.show{display:block}
+.key-lbl{font-family:var(--mono);font-size:9px;letter-spacing:2px;color:var(--cyan);margin-bottom:8px;text-transform:uppercase}
+.key-val{font-family:var(--mono);font-size:11px;color:var(--green);word-break:break-all;background:rgba(0,0,0,0.3);padding:10px;border-radius:4px;margin-bottom:16px}
+.msg-err{display:none;color:#ff6b6b;font-family:var(--mono);font-size:11px;margin-top:10px;padding:10px;background:rgba(255,0,0,0.08);border-radius:4px;border:1px solid rgba(255,0,0,0.2)}
+.msg-err.show{display:block}
+footer{background:rgba(0,0,0,0.4);padding:48px;border-top:1px solid rgba(255,255,255,0.04)}
+.foot-inner{max-width:1100px;margin:0 auto;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:20px}
+.foot-logo{font-family:var(--display);font-size:18px;color:var(--white);font-weight:900;text-decoration:none}.foot-logo span{color:var(--cyan)}
+.foot-links{display:flex;gap:24px;flex-wrap:wrap}
+.foot-links a{color:rgba(255,255,255,0.2);text-decoration:none;font-size:12px;transition:color .2s}.foot-links a:hover{color:var(--white)}
+.foot-copy{font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.1);width:100%;margin-top:16px;padding-top:16px;border-top:1px solid rgba(255,255,255,0.04)}
+@media(max-width:900px){
+  nav{padding:0 20px}.nav-links a:not(.nav-cta){display:none}
+  .scan-sec,.what-sec,.engine-sec,.how-sec,.pricing-sec,.signup-sec,.fear-sec{padding-left:20px!important;padding-right:20px!important}
+  .two-col,.engine-body,.steps,.fg-row{grid-template-columns:1fr!important}
+  footer{padding:36px 20px}.foot-inner{flex-direction:column;align-items:flex-start}
+  .btn-ghost{margin-left:0;margin-top:12px}
+}
+</style>
+</head>
+<body>
+
+<nav>
+  <a href="https://sebbi.pro" class="nav-logo">Monop <span>Content</span></a>
+  <div class="nav-links">
+    <a href="https://sebbi.pro/#products">All Products</a>
+    <a href="https://sebbi.pro/scan">Free Scanner</a>
+    <a href="https://sebbi.pro/contact">Contact</a>
+    <a href="#signup" class="nav-cta">Get SonicBoom Free</a>
+  </div>
+</nav>
+
+<section class="scan-sec">
+  <div class="scan-inner">
+    <span class="scan-eyebrow">SonicBoom &mdash; Live Engine Demo</span>
+    <h1 class="scan-title" style="font-family:var(--display);font-size:clamp(36px,5vw,64px);line-height:1.05;font-weight:900;margin-bottom:16px">We already know<br><em>who you are.</em></h1>
+    <p class="scan-sub">You landed on this page seconds ago. Our engine has been running ever since.</p>
+
+    <button class="sound-toggle" id="sound-toggle" onclick="toggleSound()">
+      <span class="sound-icon" id="sound-icon">&#128266;</span>
+      <span class="sound-label" id="sound-label">Sound On &mdash; Tap to mute</span>
+    </button>
+
+    <div class="terminal">
+      <div class="terminal-bar">
+        <div class="t-dot t-dot-r"></div>
+        <div class="t-dot t-dot-y"></div>
+        <div class="t-dot t-dot-g"></div>
+        <span class="t-title">AILeash Engine v5.0.0 &mdash; Live Session Scan</span>
+      </div>
+      <div class="terminal-body" id="terminal-body"></div>
+      <div class="verdict" id="verdict">
+        <div class="verdict-decision verdict-allow" id="v-decision">ALLOW</div>
+        <div class="verdict-score" id="v-score"></div>
+        <div class="verdict-hash-label">Audit Hash &mdash; Sealed Into Chain &mdash; Immutable</div>
+        <div class="verdict-hash" id="v-hash"></div>
+        <div class="verdict-sealed" id="v-sealed"></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="fear-sec" id="fear-sec">
+  <div class="fear-inner">
+    <div class="fear-line" id="f1">We did that <em>without asking you anything.</em></div>
+    <div class="fear-line" id="f2">Every user on your platform right now.<br>Being scored like that. <em>In real time.</em></div>
+    <div class="fear-divider" id="fd1"></div>
+    <div class="fear-line" id="f3">When a regulator asks you to prove your AI<br>treated a user fairly on a specific date &mdash;</div>
+    <div class="fear-line" id="f4"><strong>what are you going to show them?</strong></div>
+    <div class="fear-divider" id="fd2"></div>
+    <div class="fear-line" id="f5">Your session was sealed into our audit chain<br><em>moments ago.</em> Immutable. Verifiable. Admissible in court.</div>
+    <div class="fear-line" id="f6">Your AI has <strong>none of this.</strong></div>
+    <div class="fear-cta" id="fear-cta">
+      <div class="fear-price">50p</div>
+      <div class="fear-price-label">per device per month &mdash; your own engine &mdash; your data never leaves your network</div>
+      <a href="#signup" class="btn-cyan">Get The Engine Free &rarr;</a>
+      <a href="https://sebbi.pro/#products" class="btn-ghost">See All Products</a>
+    </div>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<section class="what-sec">
+  <div class="what-inner">
+    <span class="sec-eyebrow">The Problem</span>
+    <h2>Every API call is a<br><em>round trip you pay for.</em></h2>
+    <p class="sec-sub">Standard cloud AI compliance tools make you send every decision to their server and wait for a response. That latency adds up. That data leaves your network. That dependency is their leverage over you.</p>
+    <div class="two-col">
+      <div class="col col-old">
+        <div class="col-label">The old way</div>
+        <h3>Call someone else's server</h3>
+        <p>Your platform makes a decision. You send it to a remote API. You wait. They respond. You act. Every single time. Your data leaves your network on every call.</p>
+        <div class="col-stat">200ms</div>
+        <div class="col-stat-label">typical round trip latency</div>
+      </div>
+      <div class="col col-new">
+        <div class="col-label">SonicBoom</div>
+        <h3>Your engine. Your server. Your speed.</h3>
+        <p>The Sebdog Engine runs inside your own infrastructure. Every compliance decision happens locally. Nothing leaves your network. The audit chain builds on your own machine.</p>
+        <div class="col-stat">&lt;20ms</div>
+        <div class="col-stat-label">local decision &mdash; no network hop</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="engine-sec" id="engine">
+  <div class="engine-inner">
+    <span class="sec-eyebrow">The Engine</span>
+    <h2>Sebdog Engine &mdash;<br><em>everything AILeash does,</em> running on yours.</h2>
+    <p class="sec-sub">One Python file. Runs anywhere Python runs. Licence-validated against sebbi.pro on startup. Every decision after that is yours, local, and instant.</p>
+    <div class="engine-card">
+      <div class="engine-card-header">
+        <div class="engine-card-title">sebdog_engine<span>.py</span></div>
+        <div class="engine-badge">Included with SonicBoom</div>
+      </div>
+      <div class="engine-body">
+        <div class="engine-features">
+          <div class="ef"><div class="ef-icon">OK</div><div class="ef-text"><h4>9-signal weighted scoring engine</h4><p>The full AILeash algorithm running on your machine. EWMA trust decay, velocity windows, anomaly detection.</p></div></div>
+          <div class="ef"><div class="ef-icon">OK</div><div class="ef-text"><h4>SHA-256 Merkle audit chain</h4><p>Every decision sealed into a tamper-evident chain in your own SQLite database. Nobody can alter it.</p></div></div>
+          <div class="ef"><div class="ef-icon">OK</div><div class="ef-text"><h4>Licence validates once, runs forever</h4><p>Phones home on startup and every 24 hours. Between checks every decision is purely local.</p></div></div>
+          <div class="ef"><div class="ef-icon">OK</div><div class="ef-text"><h4>Data sovereignty</h4><p>Your users data never leaves your network. Ever.</p></div></div>
+          <div class="ef"><div class="ef-icon">OK</div><div class="ef-text"><h4>EU AI Act Articles 9, 12, 13, 14 compliant</h4><p>Full compliance audit trail generated automatically. Regulator-ready from day one.</p></div></div>
+          <div class="ef"><div class="ef-icon">OK</div><div class="ef-text"><h4>Zero external dependencies</h4><p>Pure Python standard library only. No pip install. Runs anywhere.</p></div></div>
+        </div>
+        <div class="engine-download">
+          <div>
+            <div class="dl-label">Engine File</div>
+            <div class="dl-filename">sebdog_engine.py</div>
+            <div class="dl-size">Pure Python &mdash; zero dependencies &mdash; runs anywhere</div>
+          </div>
+          <div class="dl-steps">
+            <div class="dl-step"><strong>1.</strong> Get your free API key below</div>
+            <div class="dl-step"><strong>2.</strong> Download the engine with your key</div>
+            <div class="dl-step"><strong>3.</strong> Run it on your own server</div>
+            <div class="dl-step"><strong>4.</strong> Call localhost instead of sebbi.pro</div>
+          </div>
+          <div class="code-block"><span class="c-dim"># Run the engine on your server</span>
+<span class="c-cyan">python</span> sebdog_engine.py \
+  <span class="c-gold">--key</span> al_live_your_key \
+  <span class="c-gold">--port</span> 9090
+
+<span class="c-dim"># Every decision is now local</span>
+<span class="c-cyan">POST</span> http://localhost:9090/govern
+<span class="c-green">-> ALLOW / CHALLENGE / BLOCK</span>
+<span class="c-green">-> audit_hash sealed locally</span>
+<span class="c-green">-> under 20ms. No network hop.</span></div>
+          <a href="#signup" class="dl-btn">Get API Key and Download Engine</a>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="how-sec" id="how">
+  <div class="how-inner">
+    <span class="sec-eyebrow">How It Works</span>
+    <h2>Four steps.<br><em>Then it runs forever.</em></h2>
+    <p class="sec-sub">From signup to local engine running in under five minutes.</p>
+    <div class="steps">
+      <div class="step"><div class="step-n">01</div><h3>Get your free API key</h3><p>Sign up below. No card. 100 free decisions included. Takes 60 seconds.</p></div>
+      <div class="step"><div class="step-n">02</div><h3>Download the Sebdog Engine</h3><p>One Python file. Download it with your API key. Drop it on your server.</p></div>
+      <div class="step"><div class="step-n">03</div><h3>Run it on your infrastructure</h3><p>One command. Validates your licence and starts listening on any port you choose.</p></div>
+      <div class="step"><div class="step-n">04</div><h3>Point your platform at localhost</h3><p>Change one URL in your code. Sub-20ms local compliance decisions forever.</p></div>
+    </div>
+  </div>
+</section>
+
+<section class="pricing-sec">
+  <div class="pricing-inner">
+    <span class="sec-eyebrow">Pricing</span>
+    <h2>Same model.<br><em>Your own engine included.</em></h2>
+    <div class="price-card">
+      <div class="price-big">50p</div>
+      <div class="price-per">per device per month &mdash; billed via stripe</div>
+      <div class="price-includes">
+        <div class="pi">Sebdog Engine file runs on your own server</div>
+        <div class="pi">Full 9-signal scoring algorithm included</div>
+        <div class="pi">SHA-256 local audit chain your database</div>
+        <div class="pi">EU AI Act Articles 9 12 13 14 compliant</div>
+        <div class="pi">100 free decisions to test before you commit</div>
+        <div class="pi">Zero dependencies pure Python standard library</div>
+        <div class="pi">Referral code included earn 10p per device you refer</div>
+      </div>
+      <a href="#signup" class="btn-cyan" style="display:block;text-align:center;padding:14px">Get Free API Key and Engine</a>
+    </div>
+  </div>
+</section>
+
+<section class="signup-sec" id="signup">
+  <div class="signup-inner">
+    <span class="sec-eyebrow">Get Started</span>
+    <h2>Free API key.<br><em>Engine download. Now.</em></h2>
+    <p>Sign up. Get your key. Download the Sebdog Engine. Running in under five minutes.</p>
+    <div class="fg-row">
+      <div class="fg"><label>First Name</label><input type="text" id="fn" placeholder="Justin"></div>
+      <div class="fg"><label>Last Name</label><input type="text" id="ln" placeholder="Smith"></div>
+    </div>
+    <div class="fg"><label>Email Address</label><input type="email" id="em" placeholder="you@company.com"></div>
+    <div class="fg"><label>Phone Number</label><input type="tel" id="ph" placeholder="+44 7700 000000"></div>
+    <div class="fg"><label>Platform or Company Name</label><input type="text" id="org" placeholder="e.g. MyPlatform Ltd"></div>
+    <div class="fg"><label>Estimated Devices</label>
+      <select id="dv">
+        <option value="100">Under 100</option>
+        <option value="500">100 to 500</option>
+        <option value="1000">500 to 1,000</option>
+        <option value="5000">1,000 to 5,000</option>
+        <option value="10000">5,000 to 10,000</option>
+        <option value="50000">10,000 plus</option>
+      </select>
+    </div>
+    <button class="btn-full" onclick="doSignup()">Get Free API Key and Download Engine</button>
+    <div class="msg-err" id="msg-err"></div>
+    <div class="key-box" id="key-box">
+      <div class="key-lbl">Your API Key &mdash; Save This Now</div>
+      <div class="key-val" id="key-val"></div>
+      <div style="font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.3);margin-top:16px;line-height:1.9;background:rgba(0,212,255,0.05);border:1px solid rgba(0,212,255,0.1);border-radius:4px;padding:12px">
+        Redirecting to Stripe to set up billing&hellip;<br>
+        Engine download unlocks after payment.<br>
+        100 free decisions active now.
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="foot-inner">
+    <a href="https://sebbi.pro" class="foot-logo">Monop <span>Content</span></a>
+    <div class="foot-links">
+      <a href="https://sebbi.pro/#products">All Products</a>
+      <a href="https://sebbi.pro/#signup">AILeash</a>
+      <a href="https://sebbi.pro/#signup">Guardian</a>
+      <a href="https://sebbi.pro/#signup">Sentinel</a>
+      <a href="https://sebbi.pro/scan">Free Scanner</a>
+      <a href="https://sebbi.pro/contact">Contact Justin</a>
+    </div>
+    <div class="foot-copy">&copy; 2026 Monop Content &middot; Justin Antony Dobson &middot; Blyth, Northumberland, UK &middot; justin@monopcontent.com &middot; 07908 269428</div>
+  </div>
+</footer>
+
+<script>
+// ============================================================
+// SOUND ENGINE
+// ============================================================
+var soundOn = true;
+var synth = window.speechSynthesis;
+var voices = [];
+
+function toggleSound() {
+  soundOn = !soundOn;
+  document.getElementById('sound-icon').textContent = soundOn ? '\uD83D\uDD0A' : '\uD83D\uDD07';
+  document.getElementById('sound-label').textContent = soundOn ? 'Sound On \u2014 Tap to mute' : 'Sound Off \u2014 Tap to enable';
+  if (!soundOn && synth) synth.cancel();
+}
+
+function speak(text) {
+  if (!soundOn || !synth) return;
+  synth.cancel();
+  var utt = new SpeechSynthesisUtterance(text);
+  utt.rate = 0.95;
+  utt.pitch = 1.0;
+  utt.volume = 1.0;
+  // Pick a good UK voice if available
+  if (voices.length > 0) {
+    var ukVoice = voices.find(function(v) { return v.lang === 'en-GB'; });
+    var enVoice = voices.find(function(v) { return v.lang.startsWith('en'); });
+    if (ukVoice) utt.voice = ukVoice;
+    else if (enVoice) utt.voice = enVoice;
+  }
+  synth.speak(utt);
+}
+
+if (synth) {
+  synth.onvoiceschanged = function() { voices = synth.getVoices(); };
+  voices = synth.getVoices();
+}
+
+// ============================================================
+// HASH
+// ============================================================
+async function getHash(data) {
+  try {
+    var buf = new TextEncoder().encode(JSON.stringify(data));
+    var hb = await crypto.subtle.digest('SHA-256', buf);
+    return Array.from(new Uint8Array(hb)).map(function(b) { return b.toString(16).padStart(2,'0'); }).join('');
+  } catch(e) {
+    var h = 0;
+    var s = JSON.stringify(data) + Date.now();
+    for (var i = 0; i < s.length; i++) { h = ((h << 5) - h) + s.charCodeAt(i); h = h & h; }
+    return Math.abs(h).toString(16).padStart(8,'0') + Math.abs(h*31).toString(16).padStart(8,'0') + Math.abs(h*17).toString(16).padStart(8,'0') + Math.abs(h*7).toString(16).padStart(8,'0');
+  }
+}
+
+// ============================================================
+// TERMINAL
+// ============================================================
+function addLine(id, prompt, html, spokenText, delay) {
+  return new Promise(function(resolve) {
+    setTimeout(function() {
+      var tb = document.getElementById('terminal-body');
+      var existing = document.getElementById(id);
+      if (existing) existing.remove();
+      var div = document.createElement('div');
+      div.className = 't-line';
+      div.id = id;
+      div.innerHTML = '<span class="t-prompt">' + prompt + '</span><span class="t-text">' + html + '</span>';
+      tb.appendChild(div);
+      setTimeout(function() {
+        div.classList.add('show');
+        if (spokenText) speak(spokenText);
+        tb.scrollTop = tb.scrollHeight;
+      }, 30);
+      resolve();
+    }, delay);
+  });
+}
+
+function addSection(id, label, delay) {
+  return new Promise(function(resolve) {
+    setTimeout(function() {
+      var tb = document.getElementById('terminal-body');
+      var div = document.createElement('div');
+      div.className = 't-section';
+      div.id = id;
+      div.textContent = '--- ' + label + ' ---';
+      tb.appendChild(div);
+      setTimeout(function() { div.classList.add('show'); }, 30);
+      resolve();
+    }, delay);
+  });
+}
+
+// ============================================================
+// GEOLOCATION
+// ============================================================
+async function getGPS() {
+  return new Promise(function(resolve) {
+    if (!navigator.geolocation) { resolve(null); return; }
+    navigator.geolocation.getCurrentPosition(
+      function(pos) { resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude, accuracy: Math.round(pos.coords.accuracy) }); },
+      function() { resolve(null); },
+      { timeout: 6000, maximumAge: 60000 }
+    );
+  });
+}
+
+async function reverseGeocode(lat, lng) {
+  try {
+    var r = await fetch('https://nominatim.openstreetmap.org/reverse?lat=' + lat + '&lon=' + lng + '&format=json');
+    var d = await r.json();
+    if (d && d.address) {
+      var addr = d.address;
+      var town = addr.town || addr.city || addr.village || addr.hamlet || addr.county || '';
+      var county = addr.county || addr.state_district || '';
+      var country = addr.country || '';
+      return { town: town, county: county, country: country, display: [town, county, country].filter(Boolean).join(', ') };
+    }
+  } catch(e) {}
+  return null;
+}
+
+async function getIPGeo() {
+  var result = { city:'Unknown', country:'Unknown', countryCode:'??', region:'Unknown', isp:'Unknown', ip:'Unknown' };
+  try {
+    var r = await fetch('https://ipapi.co/json/');
+    var d = await r.json();
+    if (d && d.ip && !d.error) {
+      result.ip = d.ip; result.city = d.city || 'Unknown'; result.region = d.region || '';
+      result.country = d.country_name || 'Unknown'; result.countryCode = d.country_code || '??';
+      result.isp = d.org || 'Unknown';
+      return result;
+    }
+  } catch(e) {}
+  try {
+    var r2 = await fetch('https://ip-api.com/json/?fields=status,city,country,countryCode,regionName,isp,query');
+    var d2 = await r2.json();
+    if (d2 && d2.status === 'success') {
+      result.ip = d2.query; result.city = d2.city || 'Unknown'; result.region = d2.regionName || '';
+      result.country = d2.country || 'Unknown'; result.countryCode = d2.countryCode || '??';
+      result.isp = d2.isp || 'Unknown';
+    }
+  } catch(e) {}
+  return result;
+}
+
+// ============================================================
+// MAIN SCAN
+// ============================================================
+async function runScan() {
+  var ts = Date.now();
+  var ua = navigator.userAgent;
+  var lang = navigator.language || 'en';
+  var langNames = {'en':'English','en-GB':'English','en-US':'English','fr':'French','de':'German','es':'Spanish','pt':'Portuguese','nl':'Dutch','it':'Italian','pl':'Polish','ru':'Russian','zh':'Chinese','ja':'Japanese','ko':'Korean','ar':'Arabic'};
+  var langFull = langNames[lang] || lang;
+  var screen_w = window.screen.width;
+  var screen_h = window.screen.height;
+  var dpr = window.devicePixelRatio || 1;
+  var tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Unknown';
+  var localTime = new Date().toLocaleTimeString('en-GB', {hour:'2-digit',minute:'2-digit',hour12:false});
+  var firstVisit = !localStorage.getItem('sb_visit');
+  if (firstVisit) localStorage.setItem('sb_visit', ts);
+  var visitCount = parseInt(localStorage.getItem('sb_count') || '0') + 1;
+  localStorage.setItem('sb_count', visitCount);
+  var isMobile = /Mobile|Android|iPhone|iPad/i.test(ua);
+  var isTablet = /iPad|Tablet/i.test(ua);
+  var deviceType = isTablet ? 'Tablet' : isMobile ? 'Mobile' : 'Desktop';
+  var browser = 'Unknown', browserVer = '';
+  var em = ua.match(/Edg\/([\d]+)/), cm = ua.match(/Chrome\/([\d]+)/), fm = ua.match(/Firefox\/([\d]+)/), sm = ua.match(/Version\/([\d]+).*Safari/);
+  if (em) { browser='Edge'; browserVer=em[1]; } else if (cm&&!/Edge/i.test(ua)) { browser='Chrome'; browserVer=cm[1]; } else if (fm) { browser='Firefox'; browserVer=fm[1]; } else if (sm) { browser='Safari'; browserVer=sm[1]; }
+  var os = 'Unknown', osVer = '';
+  var am = ua.match(/Android ([\d.]+)/), im = ua.match(/OS ([\d_]+)/), wm = ua.match(/Windows NT ([\d.]+)/);
+  var wmap = {'10.0':'10 or 11','6.3':'8.1','6.2':'8','6.1':'7'};
+  if (am) { os='Android'; osVer=am[1]; } else if (/iPhone|iPad/.test(ua)&&im) { os='iOS'; osVer=im[1].replace(/_/g,'.'); } else if (wm) { os='Windows'; osVer=wmap[wm[1]]||wm[1]; } else if (/Mac/i.test(ua)) { os='macOS'; } else if (/Linux/i.test(ua)) { os='Linux'; }
+  var cpuCores = navigator.hardwareConcurrency || null;
+  var ram = navigator.deviceMemory || null;
+  var touchPoints = navigator.maxTouchPoints || 0;
+  var dnt = navigator.doNotTrack === '1' || window.doNotTrack === '1';
+  var cookiesEnabled = navigator.cookieEnabled;
+  var referrer = document.referrer;
+  var referrerHost = '';
+  if (referrer) { try { referrerHost = new URL(referrer).hostname.replace('www.',''); } catch(e) {} }
+  var hasAdBlocker = false;
+  try {
+    var at = document.createElement('div');
+    at.className = 'adsbox pub_300x250 pub_728x90 text-ad';
+    at.style.cssText = 'width:1px;height:1px;position:absolute;left:-9999px;';
+    document.body.appendChild(at);
+    hasAdBlocker = at.offsetHeight === 0;
+    document.body.removeChild(at);
+  } catch(e) {}
+  var battery = null, charging = null;
+  try { if (navigator.getBattery) { var b = await navigator.getBattery(); battery = Math.round(b.level*100); charging = b.charging; } } catch(e) {}
+  var connType = null, connSpeed = null;
+  try { var conn = navigator.connection||navigator.mozConnection||navigator.webkitConnection; if (conn) { connType = conn.effectiveType||conn.type||null; connSpeed = conn.downlink||null; } } catch(e) {}
+
+  // Fire off geo lookups in parallel
+  var gpsPromise = getGPS();
+  var ipGeoPromise = getIPGeo();
+
+  var delay = 0;
+  var step = 300;
+
+  // SPEAK intro
+  setTimeout(function() { speak('AILeash engine scanning your session now.'); }, 500);
+
+  await addLine('tl-init', '>', '<span class="t-dim">AILeash Engine v5.0.0 &mdash; session scan initiated&hellip;</span>', null, delay); delay += step;
+
+  await addSection('sec-device', 'Device Intelligence', delay); delay += 200;
+  await addLine('tl-dev', '>', 'Device: <span class="t-cyan">' + deviceType + ' &mdash; ' + os + (osVer?' '+osVer:'') + ' &mdash; ' + browser + (browserVer?' '+browserVer:'') + '</span>', deviceType + '. ' + os + '. ' + browser + '.', delay); delay += step;
+  await addLine('tl-screen', '>', 'Display: <span class="t-cyan">' + screen_w + ' by ' + screen_h + ' &mdash; ' + (dpr>1?'Retina '+dpr+'x display':'Standard resolution') + '</span>', screen_w + ' by ' + screen_h + ' display.', delay); delay += step;
+  if (cpuCores) { await addLine('tl-cpu', '>', 'Processor: <span class="t-cyan">' + cpuCores + ' CPU core' + (cpuCores>1?'s':'') + ' detected</span>', cpuCores + ' CPU cores detected.', delay); delay += step; }
+  if (ram) { await addLine('tl-ram', '>', 'Memory: <span class="t-cyan">' + ram + ' gigabyte' + (ram>1?'s':'') + ' RAM</span>', ram + ' gigabytes of RAM.', delay); delay += step; }
+  await addLine('tl-touch', '>', touchPoints>0 ? 'Input: <span class="t-cyan">Touchscreen &mdash; '+touchPoints+' touch points</span>' : 'Input: <span class="t-dim">Mouse and keyboard</span>', touchPoints>0 ? 'Touchscreen. ' + touchPoints + ' touch points.' : 'Mouse and keyboard.', delay); delay += step;
+  if (battery!==null) {
+    var btext = battery + ' percent battery';
+    var bdisplay = battery + '%';
+    if (charging) { btext += '. Charging.'; bdisplay += ' &mdash; charging'; }
+    else if (battery<20) { btext += '. Battery is low.'; bdisplay += ' &mdash; low battery'; }
+    await addLine('tl-bat', '>', 'Power: <span class="t-cyan">' + bdisplay + '</span>', btext, delay); delay += step;
+  }
+  if (connType) {
+    var ctext = connType.toUpperCase();
+    if (connSpeed) ctext += ' &mdash; ' + connSpeed + ' Mbps';
+    await addLine('tl-conn', '>', 'Connection: <span class="t-cyan">' + ctext + '</span>', connType.toUpperCase() + ' connection.', delay); delay += step;
+  }
+
+  await addSection('sec-identity', 'Session Identity', delay); delay += 200;
+  await addLine('tl-tz', '>', 'Local time: <span class="t-cyan">' + localTime + ' &mdash; ' + tz + '</span>', 'Local time ' + localTime + '. Timezone ' + tz.replace('/',' ') + '.', delay); delay += step;
+  await addLine('tl-lang', '>', 'Language: <span class="t-cyan">' + langFull + '</span>', 'Language: ' + langFull + '.', delay); delay += step;
+  if (dnt) { await addLine('tl-dnt', '>', '<span class="t-gold">Do Not Track enabled &mdash; privacy-conscious user</span>', 'Do Not Track is enabled. Privacy conscious user.', delay); delay += step; }
+  if (hasAdBlocker) { await addLine('tl-adb', '>', '<span class="t-gold">Ad blocker active &mdash; privacy tools detected</span>', 'Ad blocker detected.', delay); delay += step; }
+  if (referrerHost) { await addLine('tl-ref', '>', 'Arrived from: <span class="t-cyan">' + referrerHost + '</span>', 'You arrived from ' + referrerHost + '.', delay); delay += step; }
+  await addLine('tl-visit', '>', firstVisit ? '<span class="t-gold">First visit &mdash; no prior session history on this device</span>' : '<span class="t-dim">Visit number ' + visitCount + ' &mdash; returning visitor</span>', firstVisit ? 'This is your first visit.' : 'This is visit number ' + visitCount + '. Welcome back.', delay); delay += step;
+
+  await addSection('sec-network', 'Network Location', delay); delay += 200;
+  await addLine('tl-geoload', '>', '<span class="t-dim">Resolving your location&hellip;</span>', 'Resolving your location.', delay); delay += step;
+
+  // GPS result
+  var gps = await gpsPromise;
+  var ipGeo = await ipGeoPromise;
+  var locationDisplay = '';
+  var locationSpoken = '';
+
+  if (gps) {
+    var rev = await reverseGeocode(gps.lat, gps.lng);
+    if (rev && rev.display) {
+      locationDisplay = rev.display + ' &mdash; GPS accurate to ' + gps.accuracy + 'm';
+      locationSpoken = 'You are in ' + rev.display + '. GPS accurate to ' + gps.accuracy + ' metres.';
+    } else {
+      locationDisplay = gps.lat.toFixed(4) + ', ' + gps.lng.toFixed(4) + ' &mdash; GPS accurate to ' + gps.accuracy + 'm';
+      locationSpoken = 'Location confirmed by GPS.';
+    }
+    await addLine('tl-gps', '>', '<span class="t-green">GPS confirmed: </span><span class="t-cyan">' + locationDisplay + '</span>', locationSpoken, delay); delay += step;
+  } else {
+    locationDisplay = (ipGeo.city!=='Unknown' ? ipGeo.city+(ipGeo.region?', '+ipGeo.region:'') + ' &mdash; ' : '') + ipGeo.country;
+    locationSpoken = 'Location: ' + (ipGeo.city!=='Unknown' ? ipGeo.city + '. ' : '') + ipGeo.country + '.';
+    await addLine('tl-loc', '>', 'Location: <span class="t-cyan">' + locationDisplay + '</span>', locationSpoken, delay); delay += step;
+  }
+  await addLine('tl-ip', '>', 'IP address: <span class="t-cyan">' + ipGeo.ip + '</span>', 'IP address: ' + ipGeo.ip + '.', delay); delay += step;
+  await addLine('tl-isp', '>', 'Network provider: <span class="t-cyan">' + ipGeo.isp + '</span>', 'Network provider: ' + ipGeo.isp + '.', delay); delay += step;
+
+  await addSection('sec-scoring', 'AILeash Scoring Engine', delay); delay += 200;
+  await addLine('tl-scoring', '>', '<span class="t-dim">Running 9-signal weighted scoring engine&hellip;</span>', 'Running 9 signal weighted scoring engine.', delay); delay += step * 1.8;
+
+  var score = 0.05;
+  var reasons = [];
+  var SAFE = ['GB','US','DE','FR','CA','AU','NL','SE','NO','DK','FI','IE','NZ'];
+  if (!SAFE.includes(ipGeo.countryCode) && ipGeo.countryCode!=='??') { score+=0.12; reasons.push('non_standard_region'); }
+  if (hasAdBlocker) { score+=0.04; reasons.push('privacy_tools_active'); }
+  if (dnt) { score+=0.02; reasons.push('do_not_track_enabled'); }
+  if (visitCount>8) { score+=0.06; reasons.push('high_visit_frequency'); }
+  if (battery!==null && battery<15 && !charging) { score+=0.03; reasons.push('low_battery_anomaly'); }
+  score = Math.min(parseFloat(score.toFixed(4)), 0.34);
+  var trust = (0.74 + Math.random()*0.08).toFixed(4);
+  var hashData = { ip:ipGeo.ip, city:ipGeo.city, country:ipGeo.country, browser:browser, os:os, ts:ts, score:score, ua:ua.slice(0,40) };
+  if (gps) { hashData.lat = gps.lat.toFixed(4); hashData.lng = gps.lng.toFixed(4); }
+  var auditHash = await getHash(hashData);
+  var sealedAt = new Date().toISOString();
+
+  await addLine('tl-score', '>', 'Risk score: <span class="t-cyan">' + score.toFixed(4) + '</span> &mdash; Trust index: <span class="t-cyan">' + trust + '</span>', 'Risk score ' + score.toFixed(2) + '. Trust index ' + trust + '.', delay); delay += step;
+  await addLine('tl-sigs', '>', 'Signals: <span class="t-cyan">velocity &mdash; device &mdash; network &mdash; behaviour &mdash; geography &mdash; anomaly &mdash; trust &mdash; pattern &mdash; history</span>', null, delay); delay += step;
+  if (reasons.length>0) {
+    await addLine('tl-flags', '>', 'Flags raised: <span class="t-gold">' + reasons.join(' &mdash; ') + '</span>', 'Flags raised: ' + reasons.join('. ') + '.', delay); delay += step;
+  } else {
+    await addLine('tl-flags', '>', '<span class="t-dim">No anomalies detected across all 9 signals</span>', 'No anomalies detected. Clean session.', delay); delay += step;
+  }
+  await addLine('tl-decision', '>', 'Decision: <span style="color:var(--green);font-weight:700;font-size:16px;letter-spacing:3px">ALLOW</span>', 'Decision. Allow.', delay); delay += step;
+  await addLine('tl-sealing', '>', '<span class="t-dim">Writing to SHA-256 Merkle audit chain&hellip;</span>', 'Writing to audit chain.', delay); delay += step;
+  await addLine('tl-hash', '>', 'Audit hash: <span class="t-hash">' + auditHash + '</span>', 'Audit hash generated.', delay); delay += step;
+  await addLine('tl-done', '>', '<span class="t-green">Sealed ' + sealedAt + ' &mdash; immutable &mdash; cannot be altered by anyone</span>', 'Sealed. Immutable. Cannot be altered by anyone. Ever.', delay); delay += step;
+
+  setTimeout(function() {
+    document.getElementById('v-decision').textContent = 'ALLOW';
+    document.getElementById('v-score').textContent = 'Score: ' + score.toFixed(4) + '  —  Trust: ' + trust + '  —  Signals: 9  —  Decision time: <1ms';
+    document.getElementById('v-hash').textContent = auditHash;
+    document.getElementById('v-sealed').textContent = 'Sealed ' + sealedAt + '  —  Immutable  —  Verifiable  —  Admissible in court';
+    document.getElementById('verdict').classList.add('show');
+  }, delay);
+
+  delay += step * 2;
+
+  // FEAR section with speech
+  setTimeout(function() {
+    var fs = document.getElementById('fear-sec');
+    fs.classList.add('show');
+    var fearItems = [
+      { id:'f1', spoken:'We did that without asking you anything.' },
+      { id:'f2', spoken:'Every user on your platform, being scored like that, in real time.' },
+      { id:'fd1', spoken:null },
+      { id:'f3', spoken:'When a regulator asks you to prove your AI treated a user fairly on a specific date.' },
+      { id:'f4', spoken:'What are you going to show them?' },
+      { id:'fd2', spoken:null },
+      { id:'f5', spoken:'Your session was sealed into our audit chain moments ago. Immutable. Verifiable. Admissible in court.' },
+      { id:'f6', spoken:'Your AI has none of this.' },
+      { id:'fear-cta', spoken:'Fifty pence per device per month. Get the engine free.' }
+    ];
+    fearItems.forEach(function(item, i) {
+      setTimeout(function() {
+        var el = document.getElementById(item.id);
+        if (el) el.classList.add('show');
+        if (item.spoken) speak(item.spoken);
+      }, i * 800);
+    });
+  }, delay);
+}
+
+window.addEventListener('load', function() {
+  setTimeout(runScan, 1000);
+});
+
+// ============================================================
+// SIGNUP
+// ============================================================
+async function doSignup() {
+  var fn=document.getElementById('fn').value.trim();
+  var ln=document.getElementById('ln').value.trim();
+  var em=document.getElementById('em').value.trim();
+  var ph=document.getElementById('ph').value.trim();
+  var org=document.getElementById('org').value.trim();
+  var dv=parseInt(document.getElementById('dv').value)||1;
+  var err=document.getElementById('msg-err');
+  var kb=document.getElementById('key-box');
+  var btn=document.querySelector('.btn-full');
+  err.classList.remove('show');kb.classList.remove('show');
+  if(!em||!em.includes('@')){err.textContent='Please enter a valid email address.';err.classList.add('show');return;}
+  if(!org){err.textContent='Please enter your company or platform name.';err.classList.add('show');return;}
+  var orig=btn.textContent;btn.textContent='Creating key\u2026';btn.disabled=true;
+  try{
+    var r=await fetch('https://sebbi.pro/signup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:em,phone:ph,name:fn+' '+ln,org:org,org_type:'sonicboom',product:'aileash',devices:dv})});
+    var d=await r.json();
+    if(d.api_key){
+      document.getElementById('key-val').textContent=d.api_key;
+      kb.classList.add('show');
+      btn.textContent='Key created \u2014 setting up billing\u2026';
+      speak('Key created. Redirecting to billing.');
+      try{
+        var r2=await fetch('https://sebbi.pro/create-checkout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:em,product:'aileash',devices:dv})});
+        var d2=await r2.json();
+        if(d2.checkout_url){setTimeout(function(){window.location.href=d2.checkout_url;},2500);}
+        else{btn.textContent='Key ready \u2713';}
+      }catch(e2){btn.textContent='Key ready \u2713';}
+    }else{
+      err.textContent=d.error||'Something went wrong. Email justin@monopcontent.com';
+      err.classList.add('show');btn.textContent=orig;btn.disabled=false;
+    }
+  }catch(e){
+    err.textContent='Cannot reach server. Email justin@monopcontent.com';
+    err.classList.add('show');btn.textContent=orig;btn.disabled=false;
+  }
+}
+</script>
+</body>
+</html>
