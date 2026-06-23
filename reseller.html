@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Partner Programme &amp; Referral Programme &mdash; sebbi.pro</title>
+<meta name="description" content="Two ways to make money with AILeash. Partner Programme: deploy it, sell it, set your price, keep the margin. Referral Programme: share your code, earn 10p per device per month forever.">
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;800;900&family=DM+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--navy:#0a0f1e;--gold:#c9a84c;--white:#fff;--green:#00ff88;--red:#cc0000;--cyan:#00d4ff;--mono:'JetBrains Mono',monospace;--sans:'DM Sans',sans-serif;--display:'Playfair Display',serif}
+html,body{background:var(--navy);color:var(--white);font-family:var(--sans);overflow-x:hidden}
+html{scroll-behavior:smooth}
+nav{position:fixed;top:0;left:0;right:0;z-index:100;background:rgba(10,15,30,0.97);backdrop-filter:blur(12px);padding:0 48px;height:68px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid rgba(201,168,76,0.15)}
+.nav-logo{font-family:var(--display);font-size:20px;color:var(--white);font-weight:900;text-decoration:none}.nav-logo span{color:var(--gold)}
+.nav-links{display:flex;gap:16px;align-items:center}
+.nav-links a{color:rgba(255,255,255,0.4);text-decoration:none;font-size:13px;font-weight:500;transition:color .2s}.nav-links a:hover{color:var(--white)}
+.nav-cta{background:var(--gold)!important;color:var(--navy)!important;padding:9px 18px;font-weight:700!important;border-radius:4px}
+
+/* HERO */
+.hero{padding:120px 48px 80px;text-align:center;position:relative;overflow:hidden;border-bottom:4px solid var(--gold)}
+.hero::before{content:'';position:absolute;inset:0;background:radial-gradient(ellipse at 50% 40%,rgba(201,168,76,0.07) 0%,transparent 65%)}
+.hero-inner{max-width:800px;margin:0 auto;position:relative;z-index:1}
+.eyebrow{font-family:var(--mono);font-size:11px;letter-spacing:3px;text-transform:uppercase;color:var(--gold);margin-bottom:20px;display:block}
+h1{font-family:var(--display);font-size:clamp(32px,5vw,64px);line-height:1.05;font-weight:900;margin-bottom:20px}
+h1 em{color:var(--gold);font-style:normal}
+.hero-sub{font-size:17px;color:rgba(255,255,255,0.4);line-height:1.8;max-width:620px;margin:0 auto 40px}
+.hero-sub strong{color:var(--white)}
+
+/* TWO CARDS ON HERO */
+.two-options{display:grid;grid-template-columns:1fr 1fr;gap:2px;background:rgba(255,255,255,0.06);max-width:700px;margin:0 auto;border-radius:6px;overflow:hidden}
+.option-card{background:var(--navy);padding:32px 28px;text-align:left;text-decoration:none;transition:background .2s;display:block}
+.option-card:hover{background:rgba(255,255,255,0.04)}
+.option-badge{font-family:var(--mono);font-size:9px;letter-spacing:2px;text-transform:uppercase;margin-bottom:12px;padding:4px 10px;border-radius:2px;display:inline-block}
+.option-badge-gold{color:var(--gold);background:rgba(201,168,76,0.1);border:1px solid rgba(201,168,76,0.2)}
+.option-badge-green{color:var(--green);background:rgba(0,255,136,0.06);border:1px solid rgba(0,255,136,0.2)}
+.option-card h3{font-family:var(--display);font-size:22px;font-weight:900;color:var(--white);margin-bottom:8px}
+.option-card p{font-size:13px;color:rgba(255,255,255,0.4);line-height:1.65;margin-bottom:16px}
+.option-earn{font-family:var(--display);font-size:36px;font-weight:900;line-height:1}
+.option-earn-gold{color:var(--gold)}.option-earn-green{color:var(--green)}
+.option-earn-label{font-family:var(--mono);font-size:9px;color:rgba(255,255,255,0.2);letter-spacing:1px;text-transform:uppercase;margin-top:4px}
+.option-link{font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.25);letter-spacing:1px;margin-top:12px;display:block}
+
+/* SECTION DIVIDER */
+.sec-divider{height:4px;background:linear-gradient(90deg,var(--gold),rgba(255,255,255,0.05))}
+.sec-divider-green{height:4px;background:linear-gradient(90deg,var(--green),rgba(255,255,255,0.05))}
+
+/* PARTNER SECTION */
+.partner-sec{padding:80px 48px;border-bottom:1px solid rgba(255,255,255,0.05)}
+.partner-inner{max-width:1100px;margin:0 auto}
+.sec-eyebrow{font-family:var(--mono);font-size:10px;letter-spacing:3px;text-transform:uppercase;margin-bottom:16px;display:block}
+.eyebrow-gold{color:rgba(201,168,76,0.6)}
+.eyebrow-green{color:rgba(0,255,136,0.6)}
+h2{font-family:var(--display);font-size:clamp(26px,3.5vw,44px);font-weight:900;line-height:1.1;margin-bottom:16px}
+h2 em{color:var(--gold);font-style:normal}
+h2 em.green{color:var(--green)}
+.sec-sub{font-size:15px;color:rgba(255,255,255,0.35);line-height:1.8;max-width:580px;margin-bottom:48px}
+
+/* PARTNER EXPLANATION */
+.partner-explain{display:grid;grid-template-columns:1fr 1fr;gap:32px;margin-bottom:48px}
+.explain-card{background:rgba(255,255,255,0.03);border:1px solid rgba(201,168,76,0.1);border-radius:6px;padding:28px}
+.explain-card h3{font-family:var(--display);font-size:18px;font-weight:900;color:var(--white);margin-bottom:10px}
+.explain-card p{font-size:13px;color:rgba(255,255,255,0.4);line-height:1.7}
+
+/* WHO GRID */
+.who-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;margin-bottom:48px}
+.who-card{background:rgba(255,255,255,0.03);border:1px solid rgba(201,168,76,0.08);border-radius:6px;padding:24px}
+.who-card h3{font-family:var(--display);font-size:16px;font-weight:900;color:var(--white);margin-bottom:8px}
+.who-card p{font-size:13px;color:rgba(255,255,255,0.4);line-height:1.65;margin-bottom:12px}
+.who-earn{font-family:var(--display);font-size:28px;color:var(--gold);font-weight:900}
+.who-earn-label{font-family:var(--mono);font-size:9px;color:rgba(255,255,255,0.2);letter-spacing:1px;text-transform:uppercase}
+
+/* CALCULATOR */
+.calc-wrap{background:rgba(255,255,255,0.03);border:2px solid rgba(201,168,76,0.2);border-radius:10px;padding:40px;margin-bottom:48px}
+.calc-title{font-family:var(--display);font-size:24px;font-weight:900;color:var(--white);margin-bottom:8px}
+.calc-sub{font-size:14px;color:rgba(255,255,255,0.35);margin-bottom:28px}
+.calc-inputs{display:grid;grid-template-columns:1fr 1fr 1fr;gap:20px;margin-bottom:28px}
+.calc-label{font-family:var(--mono);font-size:9px;color:rgba(255,255,255,0.25);letter-spacing:2px;text-transform:uppercase;margin-bottom:10px}
+.calc-input{background:rgba(255,255,255,0.06);border:2px solid rgba(201,168,76,0.2);color:var(--white);padding:12px;font-size:20px;font-family:var(--display);font-weight:700;width:120px;border-radius:6px;outline:none;text-align:center}
+.calc-input:focus{border-color:var(--gold)}
+.calc-select{background:rgba(255,255,255,0.06);border:2px solid rgba(255,255,255,0.08);color:var(--white);padding:12px 16px;font-size:14px;font-family:var(--sans);width:100%;border-radius:6px;outline:none}
+.calc-select option{background:var(--navy)}
+.calc-results{display:grid;grid-template-columns:repeat(4,1fr);gap:2px;background:rgba(255,255,255,0.04);border-radius:6px;overflow:hidden;margin-bottom:20px}
+.cr{background:rgba(0,0,0,0.3);padding:20px;text-align:center}
+.cr-label{font-family:var(--mono);font-size:9px;color:rgba(255,255,255,0.2);letter-spacing:2px;text-transform:uppercase;margin-bottom:8px}
+.cr-amount{font-family:var(--display);font-size:28px;font-weight:900;line-height:1}
+.cr-you{color:var(--green)}.cr-we{color:rgba(255,255,255,0.2)}.cr-client{color:var(--gold)}.cr-year{color:var(--cyan)}
+.cr-sub{font-family:var(--mono);font-size:9px;color:rgba(255,255,255,0.15);margin-top:4px}
+.calc-pitch{background:rgba(201,168,76,0.04);border:1px solid rgba(201,168,76,0.12);border-radius:4px;padding:16px 20px;font-family:var(--mono);font-size:12px;color:rgba(255,255,255,0.45);line-height:1.8;margin-bottom:16px}
+.calc-note{font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.15);letter-spacing:1px}
+
+/* HOW IT WORKS */
+.steps-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:2px;background:rgba(255,255,255,0.04);margin-bottom:48px}
+.step{background:var(--navy);padding:28px 20px}
+.step-n{font-family:var(--display);font-size:48px;font-weight:900;color:var(--gold);opacity:0.15;line-height:1;margin-bottom:10px}
+.step h3{font-family:var(--display);font-size:16px;font-weight:900;color:var(--white);margin-bottom:8px}
+.step p{font-size:13px;color:rgba(255,255,255,0.35);line-height:1.65}
+
+/* PARTNER SIGNUP */
+.partner-signup{background:rgba(255,255,255,0.03);border:1px solid rgba(201,168,76,0.15);border-radius:8px;padding:40px}
+.partner-signup h3{font-family:var(--display);font-size:28px;font-weight:900;color:var(--white);margin-bottom:8px}
+.partner-signup p{font-size:14px;color:rgba(255,255,255,0.35);line-height:1.7;margin-bottom:24px}
+
+/* REFERRAL SECTION */
+.referral-sec{padding:80px 48px;background:rgba(0,255,136,0.02);border-bottom:1px solid rgba(0,255,136,0.08)}
+.referral-inner{max-width:900px;margin:0 auto;text-align:center}
+.ref-three{display:grid;grid-template-columns:1fr 1fr 1fr;gap:2px;background:rgba(255,255,255,0.04);margin:40px 0}
+.ref-card{background:var(--navy);padding:32px 24px;text-align:center}
+.ref-icon{font-size:32px;margin-bottom:12px}
+.ref-card h3{font-family:var(--display);font-size:18px;font-weight:900;color:var(--white);margin-bottom:8px}
+.ref-card p{font-size:13px;color:rgba(255,255,255,0.4);line-height:1.65}
+.ref-earn{font-family:var(--display);font-size:40px;color:var(--green);font-weight:900;margin-top:12px}
+.ref-earn-label{font-family:var(--mono);font-size:9px;color:rgba(255,255,255,0.2);letter-spacing:1px;text-transform:uppercase}
+
+/* REFERRAL CODE BOX */
+.ref-code-sec{background:rgba(255,255,255,0.03);border:2px solid rgba(0,255,136,0.15);border-radius:10px;padding:40px;max-width:700px;margin:0 auto;text-align:center}
+.ref-code-title{font-family:var(--display);font-size:24px;font-weight:900;color:var(--white);margin-bottom:8px}
+.ref-code-sub{font-size:14px;color:rgba(255,255,255,0.35);margin-bottom:28px;line-height:1.65}
+.ref-code-display{font-family:var(--display);font-size:48px;font-weight:900;color:var(--green);letter-spacing:4px;margin-bottom:8px}
+.ref-code-hint{font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.2);letter-spacing:1px;margin-bottom:24px}
+.ref-share-text{background:rgba(0,255,136,0.04);border:1px solid rgba(0,255,136,0.12);border-radius:6px;padding:20px;font-family:var(--mono);font-size:12px;color:rgba(255,255,255,0.5);line-height:1.9;text-align:left;margin-bottom:20px}
+.ref-share-text strong{color:var(--green)}
+.ref-link{font-family:var(--mono);font-size:12px;color:var(--green);word-break:break-all;background:rgba(0,0,0,0.3);padding:12px 16px;border-radius:4px;margin-bottom:20px;display:block;text-align:left}
+.ref-earnings{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-top:20px}
+.ref-earn-card{background:rgba(0,0,0,0.3);border-radius:4px;padding:16px;text-align:center}
+.ref-earn-num{font-family:var(--display);font-size:24px;font-weight:900;color:var(--green)}
+.ref-earn-desc{font-family:var(--mono);font-size:9px;color:rgba(255,255,255,0.2);letter-spacing:1px;text-transform:uppercase;margin-top:4px}
+
+/* SIGNUP FORM */
+.fg{margin-bottom:12px;text-align:left}
+.fg label{display:block;font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.25);letter-spacing:2px;text-transform:uppercase;margin-bottom:6px}
+.fg input,.fg select{width:100%;background:rgba(255,255,255,0.05);border:2px solid rgba(255,255,255,0.08);color:var(--white);padding:12px 14px;font-size:14px;font-family:var(--sans);outline:none;border-radius:4px;transition:border-color .2s}
+.fg input:focus,.fg select:focus{border-color:var(--gold)}
+.fg input::placeholder{color:rgba(255,255,255,0.2)}
+.fg select option{background:var(--navy)}
+.fg-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.btn-gold{background:var(--gold);color:var(--navy);padding:14px 28px;border:none;font-family:var(--sans);font-weight:700;font-size:14px;cursor:pointer;text-decoration:none;border-radius:4px;display:inline-block;transition:all .2s}.btn-gold:hover{background:#e8c96a;transform:translateY(-2px)}
+.btn-full-gold{width:100%;padding:14px;font-size:15px;font-weight:700;border-radius:4px;border:none;cursor:pointer;font-family:var(--sans);transition:all .2s;background:var(--gold);color:var(--navy);margin-top:8px}
+.btn-full-gold:hover{background:#e8c96a}
+.key-box{display:none;margin-top:24px;background:rgba(0,0,0,0.4);border:1px solid rgba(201,168,76,0.2);border-radius:6px;padding:24px;text-align:left}
+.key-box.show{display:block}
+.key-lbl{font-family:var(--mono);font-size:9px;letter-spacing:2px;color:var(--gold);margin-bottom:8px;text-transform:uppercase}
+.key-val{font-family:var(--mono);font-size:11px;color:var(--green);word-break:break-all;background:rgba(0,0,0,0.3);padding:10px;border-radius:4px;margin-bottom:12px}
+.ref-box-inner{background:rgba(0,255,136,0.06);border:1px solid rgba(0,255,136,0.2);border-radius:4px;padding:16px;margin-bottom:12px}
+.ref-code-big{font-family:var(--display);font-size:32px;color:var(--green);font-weight:900;margin:6px 0;letter-spacing:3px}
+.demo-link-box{background:rgba(0,212,255,0.04);border:1px solid rgba(0,212,255,0.15);border-radius:4px;padding:16px}
+.demo-link-label{font-family:var(--mono);font-size:9px;letter-spacing:2px;color:var(--cyan);text-transform:uppercase;margin-bottom:6px}
+.demo-link-url{font-family:var(--mono);font-size:12px;color:var(--cyan);word-break:break-all;margin-bottom:10px}
+.msg-err{display:none;color:#ff6b6b;font-family:var(--mono);font-size:11px;margin-top:10px;padding:10px;background:rgba(255,0,0,0.08);border-radius:4px;border:1px solid rgba(255,0,0,0.2)}
+.msg-err.show{display:block}
+
+footer{background:rgba(0,0,0,0.4);padding:48px;border-top:1px solid rgba(255,255,255,0.04)}
+.foot-inner{max-width:1100px;margin:0 auto;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:20px}
+.foot-logo{font-family:var(--display);font-size:18px;color:var(--white);font-weight:900;text-decoration:none}.foot-logo span{color:var(--gold)}
+.foot-links{display:flex;gap:24px;flex-wrap:wrap}
+.foot-links a{color:rgba(255,255,255,0.2);text-decoration:none;font-size:12px;transition:color .2s}.foot-links a:hover{color:var(--white)}
+.foot-copy{font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.1);width:100%;margin-top:16px;padding-top:16px;border-top:1px solid rgba(255,255,255,0.04)}
+
+@media(max-width:900px){
+  nav{padding:0 20px}.nav-links a:not(.nav-cta){display:none}
+  .hero,.partner-sec,.referral-sec{padding-left:20px!important;padding-right:20px!important}
+  .two-options,.partner-explain,.who-grid,.calc-inputs,.calc-results,.steps-grid,.ref-three,.ref-earnings,.fg-row{grid-template-columns:1fr!important}
+  footer{padding:36px 20px}.foot-inner{flex-direction:column;align-items:flex-start}
+}
+</style>
+</head>
+<body>
+
+<nav>
+  <a href="https://sebbi.pro" class="nav-logo">Monop <span>Content</span></a>
+  <div class="nav-links">
+    <a href="https://sebbi.pro/#products">Products</a>
+    <a href="https://sebbi.pro/sonicboom">SonicBoom</a>
+    <a href="https://sebbi.pro/contact">Contact</a>
+    <a href="#partner-signup" class="nav-cta">Become a Partner</a>
+  </div>
+</nav>
+
+<!-- HERO -->
+<section class="hero">
+  <div class="hero-inner">
+    <span class="eyebrow">sebbi.pro &mdash; Two Ways To Make Money</span>
+    <h1>Partner Programme.<br><em>Referral Programme.</em></h1>
+    <p class="hero-sub">Two completely different things. <strong>Choose one. Or both.</strong> Here is exactly what each one means and how much you can make.</p>
+
+    <div class="two-options">
+      <a href="#partner" class="option-card">
+        <div class="option-badge option-badge-gold">Partner Programme</div>
+        <h3>You actively sell it</h3>
+        <p>You deploy AILeash inside your clients. You set your own price. You keep everything above 50p. This is a proper business opportunity.</p>
+        <div class="option-earn option-earn-gold">&pound;14,500</div>
+        <div class="option-earn-label">per month on 5 clients at 1,000 devices each</div>
+        <span class="option-link">Jump to Partner Programme &darr;</span>
+      </a>
+      <a href="#referral" class="option-card">
+        <div class="option-badge option-badge-green">Referral Programme</div>
+        <h3>You share a code</h3>
+        <p>You give someone your referral code. They sign up. You earn 10p per device per month forever. No work required after sharing.</p>
+        <div class="option-earn option-earn-green">10p</div>
+        <div class="option-earn-label">per device per month forever &mdash; no cap &mdash; no expiry</div>
+        <span class="option-link">Jump to Referral Programme &darr;</span>
+      </a>
+    </div>
+  </div>
+</section>
+
+<!-- PARTNER PROGRAMME -->
+<div class="sec-divider" id="partner"></div>
+<section class="partner-sec">
+  <div class="partner-inner">
+    <span class="sec-eyebrow eyebrow-gold">Partner Programme</span>
+    <h2>You deploy it.<br>You sell it.<br><em>You keep the margin. Forever.</em></h2>
+    <p class="sec-sub">You are an IT consultancy, a managed service provider, a call centre technology supplier, or a compliance firm. You have clients who need AI compliance. You sell it to them at whatever price you want. We take 50p per device. You keep everything above that.</p>
+
+    <div class="partner-explain">
+      <div class="explain-card">
+        <h3>What you do</h3>
+        <p>You sign up free. You get your API key, your referral code, and your personalised demo link. You send that link to your client. The engine scans them live, speaks to them, and delivers a targeted sales pitch. You follow up and close. They sign up. Their devices are linked to you. You earn your margin every month forever.</p>
+      </div>
+      <div class="explain-card">
+        <h3>What you charge your client</h3>
+        <p>Whatever you want. £1.99 per device. £5 per device. £10 per device. Your price. Your relationship. Your invoice. We take 50p per device per month from whatever they pay. You keep everything above that. No minimum. No contract. No cap.</p>
+      </div>
+    </div>
+
+    <h3 style="font-family:var(--display);font-size:24px;font-weight:900;color:var(--white);margin-bottom:20px">Who this is for</h3>
+    <div class="who-grid">
+      <div class="who-card">
+        <h3>&#127963; IT Consultancies</h3>
+        <p>Add AILeash to every client engagement as a managed compliance service. Monthly recurring revenue on top of your existing contracts.</p>
+        <div class="who-earn">&pound;9,500</div>
+        <div class="who-earn-label">per month on 10 clients</div>
+      </div>
+      <div class="who-card">
+        <h3>&#128222; Call Centres</h3>
+        <p>Before your agent picks up, AILeash already knows the caller. Device, location, risk score. Fraud flagged before a word is spoken.</p>
+        <div class="who-earn">&pound;1,490</div>
+        <div class="who-earn-label">per month on 1,000 seats</div>
+      </div>
+      <div class="who-card">
+        <h3>&#127968; MSPs</h3>
+        <p>Deploy the Sebdog Engine inside your client infrastructure. Their data never leaves their network. You bill them monthly.</p>
+        <div class="who-earn">&pound;4,750</div>
+        <div class="who-earn-label">per month on 5 clients</div>
+      </div>
+      <div class="who-card">
+        <h3>&#128203; Legal &amp; Compliance</h3>
+        <p>Offer AILeash as part of your EU AI Act audit service. Recurring revenue on top of your consulting fees.</p>
+        <div class="who-earn">&pound;7,500</div>
+        <div class="who-earn-label">per month on 10 clients</div>
+      </div>
+      <div class="who-card">
+        <h3>&#127918; Gaming Platforms</h3>
+        <p>Sell Guardian to gaming platforms with child users. Online Safety Act compliance as a managed service.</p>
+        <div class="who-earn">&pound;2,490</div>
+        <div class="who-earn-label">per month on 3,000 devices</div>
+      </div>
+      <div class="who-card">
+        <h3>&#127970; Financial Services</h3>
+        <p>Every AI decision your client makes needs an audit chain. FCA compliant. Court admissible. You provide it.</p>
+        <div class="who-earn">&pound;22,500</div>
+        <div class="who-earn-label">per month on 5,000 devices</div>
+      </div>
+    </div>
+
+    <!-- MARGIN CALCULATOR -->
+    <div class="calc-wrap">
+      <div class="calc-title">Your Margin Calculator</div>
+      <div class="calc-sub">Set your price. See what you keep. We take 50p. You keep everything above that.</div>
+      <div class="calc-inputs">
+        <div>
+          <div class="calc-label">You charge per device</div>
+          <div style="display:flex;align-items:center;gap:8px">
+            <span style="font-family:var(--display);font-size:28px;color:var(--gold);font-weight:900">&pound;</span>
+            <input class="calc-input" type="number" id="p-charge" value="2.99" min="0.51" step="0.01" oninput="pCalc()">
+          </div>
+        </div>
+        <div>
+          <div class="calc-label">Devices per client</div>
+          <select class="calc-select" id="p-devices" onchange="pCalc()">
+            <option value="100">100 devices</option>
+            <option value="500">500 devices</option>
+            <option value="1000" selected>1,000 devices</option>
+            <option value="5000">5,000 devices</option>
+            <option value="10000">10,000 devices</option>
+            <option value="50000">50,000 devices</option>
+          </select>
+        </div>
+        <div>
+          <div class="calc-label">Number of clients</div>
+          <select class="calc-select" id="p-clients" onchange="pCalc()">
+            <option value="1">1 client</option>
+            <option value="3">3 clients</option>
+            <option value="5" selected>5 clients</option>
+            <option value="10">10 clients</option>
+            <option value="20">20 clients</option>
+            <option value="50">50 clients</option>
+          </select>
+        </div>
+      </div>
+      <div class="calc-results">
+        <div class="cr"><div class="cr-label">Client Pays</div><div class="cr-amount cr-client" id="p-r-client">&pound;2.99</div><div class="cr-sub">per device per month</div></div>
+        <div class="cr"><div class="cr-label">You Keep</div><div class="cr-amount cr-you" id="p-r-profit">&pound;12,450</div><div class="cr-sub">per month profit</div></div>
+        <div class="cr"><div class="cr-label">We Take</div><div class="cr-amount cr-we" id="p-r-we">&pound;2,500</div><div class="cr-sub">50p per device</div></div>
+        <div class="cr"><div class="cr-label">Per Year</div><div class="cr-amount cr-year" id="p-r-year">&pound;149,400</div><div class="cr-sub">annual profit</div></div>
+      </div>
+      <div class="calc-pitch" id="p-pitch">Your clients pay &pound;2.99 per device. You get &pound;12,450 a month across 5 clients. We get &pound;2,500. Everyone wins.</div>
+      <p class="calc-note">Your partner code locks every device to your account permanently. You earn your margin every month forever.</p>
+    </div>
+
+    <!-- HOW IT WORKS -->
+    <h3 style="font-family:var(--display);font-size:24px;font-weight:900;color:var(--white);margin-bottom:20px">How it works</h3>
+    <div class="steps-grid">
+      <div class="step"><div class="step-n">01</div><h3>Sign up free</h3><p>Get your API key, your partner code, and your personalised demo link. Takes 60 seconds. No cost.</p></div>
+      <div class="step"><div class="step-n">02</div><h3>Send the demo link</h3><p>One URL. Your prospect clicks it. The engine scans them live, speaks to them, delivers your pitch. You follow up.</p></div>
+      <div class="step"><div class="step-n">03</div><h3>They sign up</h3><p>Their devices are permanently linked to your partner code. Every device. Every month. Forever.</p></div>
+      <div class="step"><div class="step-n">04</div><h3>You earn your margin</h3><p>They pay you. You keep everything above 50p. We take 50p. You keep the rest. Every month. Forever.</p></div>
+    </div>
+
+    <!-- PARTNER SIGNUP FORM -->
+    <div class="partner-signup" id="partner-signup">
+      <h3>Become a Partner</h3>
+      <p>Free to join. Get your partner code, your demo link, and your API key. Start sending prospects today.</p>
+      <div class="fg-row">
+        <div class="fg"><label>First Name</label><input type="text" id="p-fn" placeholder="Justin"></div>
+        <div class="fg"><label>Last Name</label><input type="text" id="p-ln" placeholder="Smith"></div>
+      </div>
+      <div class="fg"><label>Email Address</label><input type="email" id="p-em" placeholder="you@company.com"></div>
+      <div class="fg"><label>Phone Number</label><input type="tel" id="p-ph" placeholder="+44 7700 000000"></div>
+      <div class="fg"><label>Company Name</label><input type="text" id="p-org" placeholder="e.g. ACME IT Solutions"></div>
+      <div class="fg"><label>Your Industry</label>
+        <select id="p-industry">
+          <option value="it">IT Consultancy / MSP</option>
+          <option value="callcentre">Call Centre / Contact Platform</option>
+          <option value="legal">Legal / Compliance Firm</option>
+          <option value="finance">Financial Services</option>
+          <option value="gaming">Gaming / Consumer Platform</option>
+          <option value="other">Other</option>
+        </select>
+      </div>
+      <button class="btn-full-gold" onclick="doPartnerSignup()">Get My Partner Code &amp; Demo Link &rarr;</button>
+      <div class="msg-err" id="p-msg-err"></div>
+      <div class="key-box" id="p-key-box">
+        <div class="key-lbl">Your API Key &mdash; Save This</div>
+        <div class="key-val" id="p-key-val"></div>
+        <div class="ref-box-inner">
+          <div class="key-lbl">Your Partner Code &mdash; Links Every Client To You</div>
+          <div class="ref-code-big" id="p-ref-code">REF-XXXX-0000</div>
+          <div style="font-size:12px;color:rgba(255,255,255,0.35);line-height:1.6">Every device that signs up using this code earns you your margin every month forever.</div>
+        </div>
+        <div class="demo-link-box">
+          <div class="demo-link-label">Your Personalised Demo Link &mdash; Send This To Prospects</div>
+          <div class="demo-link-url" id="p-demo-link">https://sebbi.pro/reseller?ref=REF-XXXX-0000</div>
+          <button onclick="copyPartnerLink()" style="background:rgba(0,212,255,0.1);border:1px solid rgba(0,212,255,0.2);color:var(--cyan);padding:8px 16px;border-radius:4px;font-family:var(--mono);font-size:10px;cursor:pointer;letter-spacing:1px;text-transform:uppercase">Copy Demo Link</button>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</section>
+
+<!-- REFERRAL PROGRAMME -->
+<div class="sec-divider-green" id="referral"></div>
+<section class="referral-sec">
+  <div class="referral-inner">
+    <span class="sec-eyebrow eyebrow-green">Referral Programme</span>
+    <h2 style="font-family:var(--display);font-size:clamp(26px,3.5vw,44px);font-weight:900;margin-bottom:16px">Tell a friend.<br><em class="green">Earn forever.</em></h2>
+    <p style="font-size:15px;color:rgba(255,255,255,0.35);line-height:1.8;max-width:580px;margin:0 auto 0">This is the simple one. You get a referral code when you sign up. You share it with anyone &mdash; a colleague, a friend, a business contact. Every device they sign up earns you 10p per device per month. Forever. No cap. No expiry. No work required after sharing the code.</p>
+
+    <div class="ref-three">
+      <div class="ref-card">
+        <div class="ref-icon">&#128272;</div>
+        <h3>You get a code</h3>
+        <p>When you sign up you get a unique referral code. It looks like REF-JOHN-1234. That code is yours forever.</p>
+      </div>
+      <div class="ref-card">
+        <div class="ref-icon">&#128172;</div>
+        <h3>You share it</h3>
+        <p>Send it to anyone. A colleague, a tech mate, a call centre manager. Anyone who signs up using your code is linked to you permanently.</p>
+        <div class="ref-earn">10p</div>
+        <div class="ref-earn-label">per device per month forever</div>
+      </div>
+      <div class="ref-card">
+        <div class="ref-icon">&#128176;</div>
+        <h3>You earn forever</h3>
+        <p>10 referrals with 100 devices each &mdash; £100 a month doing nothing. 10 referrals with 1,000 devices each &mdash; £1,000 a month. Forever.</p>
+      </div>
+    </div>
+
+    <div class="ref-code-sec">
+      <div class="ref-code-title">Your referral code</div>
+      <div class="ref-code-sub">Sign up as a partner above and your referral code appears here automatically. Or sign up on the main homepage to get just the referral code without the partner programme.</div>
+      <div class="ref-code-display" id="r-code-display">REF-XXXX-0000</div>
+      <div class="ref-code-hint">Your unique code &mdash; share this with anyone</div>
+
+      <div class="ref-share-text">
+        &ldquo;I use AILeash for AI compliance &mdash; it seals every AI decision into a cryptographic chain so you can prove what your system decided. Free to start. 50p per device per month after trial. Use my code <strong id="r-code-inline">REF-XXXX-0000</strong> when you sign up at sebbi.pro&rdquo;
+      </div>
+
+      <div class="ref-link" id="r-link-display">https://sebbi.pro/#signup</div>
+
+      <button onclick="copyRefCode()" style="background:rgba(0,255,136,0.1);border:1px solid rgba(0,255,136,0.2);color:var(--green);padding:10px 20px;border-radius:4px;font-family:var(--mono);font-size:11px;cursor:pointer;letter-spacing:1px;text-transform:uppercase;margin-bottom:20px">Copy Referral Code</button>
+
+      <div class="ref-earnings">
+        <div class="ref-earn-card">
+          <div class="ref-earn-num">&pound;100</div>
+          <div class="ref-earn-desc">10 referrals &mdash; 100 devices each</div>
+        </div>
+        <div class="ref-earn-card">
+          <div class="ref-earn-num">&pound;1,000</div>
+          <div class="ref-earn-desc">10 referrals &mdash; 1,000 devices each</div>
+        </div>
+        <div class="ref-earn-card">
+          <div class="ref-earn-num">&pound;5,000</div>
+          <div class="ref-earn-desc">10 referrals &mdash; 5,000 devices each</div>
+        </div>
+      </div>
+
+      <p style="font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.2);margin-top:16px;letter-spacing:1px">Check your referral earnings at <a href="https://sebbi.pro/referrals" style="color:var(--green)">sebbi.pro/referrals?code=YOUR-CODE</a></p>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="foot-inner">
+    <a href="https://sebbi.pro" class="foot-logo">Monop <span>Content</span></a>
+    <div class="foot-links">
+      <a href="https://sebbi.pro/#products">All Products</a>
+      <a href="https://sebbi.pro/sonicboom">SonicBoom</a>
+      <a href="https://sebbi.pro/compliance-assistant">AILeash</a>
+      <a href="https://sebbi.pro/sentinel">Sentinel</a>
+      <a href="https://sebbi.pro/scan">Free Scanner</a>
+      <a href="https://sebbi.pro/contact">Contact Justin</a>
+    </div>
+    <div class="foot-copy">&copy; 2026 Monop Content &middot; Justin Antony Dobson &middot; Blyth, Northumberland, UK &middot; justin@monopcontent.com &middot; 07908 269428</div>
+  </div>
+</footer>
+
+<script>
+// CALCULATOR
+function pCalc(){
+  var charge=parseFloat(document.getElementById('p-charge').value)||0;
+  var devices=parseInt(document.getElementById('p-devices').value)||0;
+  var clients=parseInt(document.getElementById('p-clients').value)||1;
+  var total=devices*clients;
+  var profit=Math.max(0,charge-0.50)*total;
+  var we=0.50*total;
+  var annual=profit*12;
+  document.getElementById('p-r-client').textContent='\u00a3'+charge.toFixed(2);
+  document.getElementById('p-r-profit').textContent='\u00a3'+profit.toLocaleString('en-GB',{minimumFractionDigits:0,maximumFractionDigits:0});
+  document.getElementById('p-r-we').textContent='\u00a3'+we.toLocaleString('en-GB',{minimumFractionDigits:0,maximumFractionDigits:0});
+  document.getElementById('p-r-year').textContent='\u00a3'+annual.toLocaleString('en-GB',{minimumFractionDigits:0,maximumFractionDigits:0});
+  document.getElementById('p-pitch').textContent='Your clients pay \u00a3'+charge.toFixed(2)+' per device. You get \u00a3'+profit.toLocaleString('en-GB',{minimumFractionDigits:0,maximumFractionDigits:0})+' a month across '+clients+' client'+(clients>1?'s':'')+'. We get \u00a3'+we.toLocaleString('en-GB',{minimumFractionDigits:0,maximumFractionDigits:0})+'. Everyone wins.';
+}
+pCalc();
+
+function copyPartnerLink(){
+  var url=document.getElementById('p-demo-link').textContent;
+  navigator.clipboard.writeText(url).then(function(){alert('Demo link copied!');}).catch(function(){});
+}
+
+function copyRefCode(){
+  var code=document.getElementById('r-code-display').textContent;
+  navigator.clipboard.writeText(code).then(function(){alert('Referral code copied!');}).catch(function(){});
+}
+
+function updateRefDisplay(code){
+  document.getElementById('r-code-display').textContent=code;
+  document.getElementById('r-code-inline').textContent=code;
+  document.getElementById('r-link-display').textContent='https://sebbi.pro/#signup?ref='+code;
+}
+
+// PARTNER SIGNUP
+async function doPartnerSignup(){
+  var fn=document.getElementById('p-fn').value.trim();
+  var ln=document.getElementById('p-ln').value.trim();
+  var em=document.getElementById('p-em').value.trim();
+  var ph=document.getElementById('p-ph').value.trim();
+  var org=document.getElementById('p-org').value.trim();
+  var industry=document.getElementById('p-industry').value;
+  var err=document.getElementById('p-msg-err');
+  var kb=document.getElementById('p-key-box');
+  var btn=document.querySelector('.btn-full-gold');
+  err.classList.remove('show');kb.classList.remove('show');
+  if(!em||!em.includes('@')){err.textContent='Please enter a valid email address.';err.classList.add('show');return;}
+  if(!org){err.textContent='Please enter your company name.';err.classList.add('show');return;}
+  var orig=btn.textContent;btn.textContent='Creating account\u2026';btn.disabled=true;
+  try{
+    var r=await fetch('https://sebbi.pro/signup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:em,phone:ph,name:fn+' '+ln,org:org,org_type:'partner_'+industry,product:'aileash',devices:1})});
+    var d=await r.json();
+    if(d.api_key){
+      document.getElementById('p-key-val').textContent=d.api_key;
+      var code=d.ref_code||'REF-XXXX-0000';
+      document.getElementById('p-ref-code').textContent=code;
+      document.getElementById('p-demo-link').textContent='https://sebbi.pro/reseller?ref='+code;
+      updateRefDisplay(code);
+      kb.classList.add('show');
+      btn.textContent='Account created \u2713';
+    }else{
+      err.textContent=d.error||'Something went wrong. Email justin@monopcontent.com';
+      err.classList.add('show');btn.textContent=orig;btn.disabled=false;
+    }
+  }catch(e){
+    err.textContent='Cannot reach server. Email justin@monopcontent.com';
+    err.classList.add('show');btn.textContent=orig;btn.disabled=false;
+  }
+}
+</script>
+</body>
+</html>
