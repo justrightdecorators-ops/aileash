@@ -1,0 +1,491 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>AILeash Guardian &mdash; Keep Your Children Safe Online</title>
+<meta name="description" content="Real-time child safety monitoring. Parent dashboard. Up to 10 children. Grooming detection. SHA-256 audit trail. 50p per device per month.">
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;900&family=DM+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --navy:#0a0f1e;--red:#cc0000;--red2:#ff2d2d;--gold:#c9a84c;
+  --green:#00c853;--white:#fff;--off:#f8f9fb;--border:#e8edf3;
+  --muted:#64748b;--text:#1a202c;
+  --mono:'JetBrains Mono',monospace;--sans:'DM Sans',sans-serif;--display:'Playfair Display',serif
+}
+html,body{background:var(--white);color:var(--text);font-family:var(--sans);overflow-x:hidden}
+html{scroll-behavior:smooth}
+nav{position:fixed;top:0;left:0;right:0;z-index:100;background:var(--navy);padding:0 48px;height:64px;display:flex;align-items:center;justify-content:space-between}
+.nav-logo{display:flex;align-items:center;gap:10px;text-decoration:none}
+.nav-logo-text{font-family:var(--display);font-size:18px;color:var(--white);font-weight:900}.nav-logo-text span{color:var(--red2)}
+.nav-right{display:flex;gap:12px;align-items:center}
+.nav-link{color:rgba(255,255,255,0.5);text-decoration:none;font-size:13px;font-weight:500}
+.nav-btn{background:var(--red);color:var(--white);padding:9px 18px;font-weight:700;font-size:13px;border-radius:4px;text-decoration:none}
+.alert{background:var(--red);padding:11px 48px;text-align:center;font-family:var(--mono);font-size:11px;color:var(--white);letter-spacing:1px;text-transform:uppercase;margin-top:64px}
+.alert strong{color:#ffd700}
+.hero{background:var(--navy);padding:80px 48px 100px;position:relative;overflow:hidden}
+.hero::before{content:'';position:absolute;inset:0;background:radial-gradient(ellipse at 30% 50%,rgba(204,0,0,0.08) 0%,transparent 60%)}
+.hero-inner{max-width:1100px;margin:0 auto;position:relative;z-index:1;display:grid;grid-template-columns:1fr 420px;gap:60px;align-items:center}
+.hero-eyebrow{font-family:var(--mono);font-size:10px;letter-spacing:3px;text-transform:uppercase;color:var(--red2);margin-bottom:16px}
+h1{font-family:var(--display);font-size:clamp(38px,4.5vw,62px);line-height:1.05;color:var(--white);font-weight:900;margin-bottom:20px}
+h1 em{color:var(--red2);font-style:normal}
+h2{font-family:var(--display);font-size:clamp(28px,3vw,42px);font-weight:900;margin-bottom:12px;line-height:1.1;color:var(--navy)}
+h2 em{color:var(--red);font-style:normal}
+.hero-sub{font-size:16px;color:rgba(255,255,255,0.5);line-height:1.8;margin-bottom:32px;max-width:500px}
+.hero-sub strong{color:var(--white)}
+.hero-actions{display:flex;flex-direction:column;gap:10px}
+.btn-red{background:var(--red);color:var(--white);padding:15px 28px;border:none;font-family:var(--sans);font-weight:700;font-size:15px;cursor:pointer;text-decoration:none;border-radius:6px;display:inline-flex;align-items:center;gap:8px;width:fit-content}
+.btn-outline{background:transparent;color:rgba(255,255,255,0.5);padding:13px 24px;border:1px solid rgba(255,255,255,0.15);font-family:var(--sans);font-weight:600;font-size:14px;cursor:pointer;text-decoration:none;border-radius:6px;display:inline-flex;align-items:center;gap:8px;width:fit-content}
+.hero-trust{display:flex;gap:20px;margin-top:20px;flex-wrap:wrap}
+.ht{display:flex;align-items:center;gap:6px;font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.25);letter-spacing:1px;text-transform:uppercase}
+.ht::before{content:'OK';color:var(--green);font-size:9px;font-weight:700}
+.phone-wrap{position:relative;display:flex;justify-content:center}
+.phone{width:280px;background:#111;border-radius:40px;padding:12px;box-shadow:0 40px 80px rgba(0,0,0,0.6),0 0 0 1px rgba(255,255,255,0.05)}
+.phone-screen{background:#0d1117;border-radius:30px;overflow:hidden;aspect-ratio:9/19;position:relative}
+.phone-notch{position:absolute;top:0;left:50%;transform:translateX(-50%);width:80px;height:24px;background:#111;border-radius:0 0 16px 16px;z-index:2}
+.ps-header{background:#0a0f1e;padding:28px 16px 12px;border-bottom:1px solid rgba(255,255,255,0.05)}
+.ps-title{font-family:var(--mono);font-size:8px;color:var(--red2);letter-spacing:2px;text-transform:uppercase}
+.ps-name{font-size:14px;color:var(--white);font-weight:700;margin-top:2px}
+.ps-status{display:flex;align-items:center;gap:4px;margin-top:4px}
+.ps-dot{width:6px;height:6px;background:var(--green);border-radius:50%;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}
+.ps-dot-label{font-size:9px;color:rgba(255,255,255,0.3);font-family:var(--mono)}
+.ps-alerts{padding:10px}
+.ps-alert{background:rgba(204,0,0,0.15);border:1px solid rgba(204,0,0,0.3);border-radius:6px;padding:8px 10px;margin-bottom:6px}
+.ps-alert-label{font-family:var(--mono);font-size:7px;color:var(--red2);letter-spacing:1px;text-transform:uppercase;margin-bottom:2px}
+.ps-alert-text{font-size:9px;color:rgba(255,255,255,0.6);line-height:1.4}
+.ps-alert-time{font-family:var(--mono);font-size:7px;color:rgba(255,255,255,0.2);margin-top:3px}
+.ps-safe{background:rgba(0,200,83,0.08);border:1px solid rgba(0,200,83,0.2);border-radius:6px;padding:8px 10px;margin-bottom:6px}
+.ps-safe-label{font-family:var(--mono);font-size:7px;color:var(--green);letter-spacing:1px;text-transform:uppercase;margin-bottom:2px}
+.ps-safe-text{font-size:9px;color:rgba(255,255,255,0.4);line-height:1.4}
+.ps-children{padding:10px;border-top:1px solid rgba(255,255,255,0.05)}
+.ps-child{display:flex;align-items:center;justify-content:space-between;padding:5px 0}
+.ps-child-name{font-size:9px;color:rgba(255,255,255,0.5)}
+.ps-child-status{font-family:var(--mono);font-size:7px;padding:2px 6px;border-radius:2px}
+.pcs-safe{background:rgba(0,200,83,0.15);color:var(--green)}
+.pcs-warn{background:rgba(204,0,0,0.15);color:var(--red2)}
+.divider{height:4px;background:linear-gradient(90deg,var(--red) 0%,#ff6b6b 50%,var(--red) 100%)}
+.stats{background:var(--navy)}
+.stats-inner{max-width:1100px;margin:0 auto;display:grid;grid-template-columns:repeat(4,1fr)}
+.stat{padding:24px;border-right:1px solid rgba(255,255,255,0.05);text-align:center}.stat:last-child{border:none}
+.stat-n{font-family:var(--display);font-size:36px;color:var(--red2);font-weight:900}
+.stat-l{font-size:10px;color:rgba(255,255,255,0.2);margin-top:4px;letter-spacing:1px;text-transform:uppercase;font-family:var(--mono)}
+.how{padding:80px 48px;background:var(--off);border-bottom:1px solid var(--border)}
+.how-inner{max-width:1100px;margin:0 auto}
+.section-eyebrow{font-family:var(--mono);font-size:10px;letter-spacing:3px;text-transform:uppercase;color:var(--red);margin-bottom:12px}
+.how-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:2px;background:var(--border);margin-top:40px}
+.how-card{background:var(--white);padding:32px 28px}
+.how-n{font-family:var(--display);font-size:52px;color:var(--red);opacity:0.15;font-weight:900;margin-bottom:8px;line-height:1}
+.how-card h3{font-family:var(--display);font-size:20px;font-weight:900;color:var(--navy);margin-bottom:10px}
+.how-card p{font-size:13px;color:var(--muted);line-height:1.75}
+.features{padding:80px 48px;border-bottom:1px solid var(--border)}
+.features-inner{max-width:1100px;margin:0 auto}
+.feat-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:16px;margin-top:40px}
+.feat{background:var(--off);border:1px solid var(--border);padding:28px;border-left:4px solid var(--red)}
+.feat-icon{font-size:28px;margin-bottom:12px}
+.feat h3{font-family:var(--display);font-size:18px;font-weight:900;color:var(--navy);margin-bottom:8px}
+.feat p{font-size:13px;color:var(--muted);line-height:1.7}
+.feat-tag{display:inline-block;font-family:var(--mono);font-size:8px;letter-spacing:1px;text-transform:uppercase;padding:3px 8px;border-radius:2px;margin-top:10px;background:rgba(204,0,0,0.08);color:var(--red);border:1px solid rgba(204,0,0,0.2)}
+.compliance{padding:80px 48px;background:var(--navy);border-bottom:4px solid var(--red)}
+.compliance-inner{max-width:1100px;margin:0 auto}
+.comp-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:2px;background:rgba(255,255,255,0.05);margin-top:40px}
+.comp-card{background:rgba(255,255,255,0.02);padding:28px;border-top:3px solid var(--red)}
+.comp-act{font-family:var(--mono);font-size:8px;color:var(--red2);letter-spacing:2px;text-transform:uppercase;margin-bottom:8px}
+.comp-card h3{font-family:var(--display);font-size:17px;font-weight:900;color:var(--white);margin-bottom:8px}
+.comp-card p{font-size:12px;color:rgba(255,255,255,0.35);line-height:1.7}
+.comp-checks{margin-top:12px;display:flex;flex-direction:column;gap:5px}
+.cc{display:flex;align-items:flex-start;gap:7px;font-size:11px;color:rgba(255,255,255,0.4)}
+.cc::before{content:'OK';color:var(--green);font-weight:700;flex-shrink:0;font-family:var(--mono);font-size:9px}
+.install{padding:80px 48px;background:var(--white);border-bottom:1px solid var(--border)}
+.install-inner{max-width:900px;margin:0 auto}
+.install-steps{display:grid;grid-template-columns:1fr 1fr;gap:32px;margin-top:40px}
+.install-col{background:var(--off);border:1px solid var(--border);border-radius:8px;padding:32px}
+.install-col-title{font-family:var(--mono);font-size:10px;letter-spacing:2px;text-transform:uppercase;margin-bottom:20px;color:var(--navy)}
+.install-step{display:flex;gap:14px;margin-bottom:20px;align-items:flex-start}
+.is-num{width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:12px;font-weight:700;flex-shrink:0}
+.isn-parent{background:var(--navy);color:var(--white)}
+.isn-child{background:var(--red);color:var(--white)}
+.is-text h4{font-size:14px;font-weight:700;color:var(--navy);margin-bottom:3px}
+.is-text p{font-size:12px;color:var(--muted);line-height:1.6}
+.install-btn{display:block;text-align:center;padding:14px;border-radius:6px;font-family:var(--sans);font-weight:700;font-size:14px;text-decoration:none;margin-top:20px}
+.ib-parent{background:var(--navy);color:var(--white)}
+.ib-child{background:var(--red);color:var(--white)}
+.signup{padding:80px 48px;background:var(--off);border-top:4px solid var(--red)}
+.signup-inner{max-width:560px;margin:0 auto;text-align:center}
+.signup-form{background:var(--white);border:1px solid var(--border);border-radius:8px;padding:36px;margin-top:32px;text-align:left}
+.fg{margin-bottom:14px}
+.fg label{display:block;font-family:var(--mono);font-size:9px;color:var(--muted);letter-spacing:2px;text-transform:uppercase;margin-bottom:6px}
+.fg input,.fg select{width:100%;background:var(--off);border:2px solid var(--border);color:var(--text);padding:12px 14px;font-size:14px;font-family:var(--sans);outline:none;border-radius:4px;transition:border-color .2s}
+.fg input:focus,.fg select:focus{border-color:var(--red)}
+.fg input::placeholder{color:#bbb}
+.fg-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.signup-btn{width:100%;padding:15px;font-size:15px;font-weight:700;border-radius:6px;border:none;cursor:pointer;font-family:var(--sans);background:var(--red);color:var(--white);margin-top:8px}
+.signup-btn:disabled{opacity:0.5}
+.msg-err{display:none;color:var(--red);font-family:var(--mono);font-size:11px;margin-top:10px;padding:10px;background:#fff0f0;border-radius:4px;border:1px solid #ffcccc}
+.msg-err.show{display:block}
+.msg-ok{display:none;color:#00875a;font-family:var(--mono);font-size:11px;margin-top:10px;padding:10px;background:#f0fff8;border-radius:4px;border:1px solid #bbf7d0}
+.msg-ok.show{display:block}
+.key-box{display:none;margin-top:20px;background:var(--navy);border-radius:6px;padding:22px}
+.key-box.show{display:block}
+.key-lbl{font-family:var(--mono);font-size:9px;letter-spacing:2px;color:var(--red2);margin-bottom:8px;text-transform:uppercase}
+.key-val{font-family:var(--mono);font-size:11px;color:#00ff88;word-break:break-all;background:rgba(0,0,0,0.3);padding:10px;border-radius:4px}
+.key-next{margin-top:16px;display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.kn-btn{display:block;text-align:center;padding:11px;border-radius:4px;font-weight:700;font-size:13px;text-decoration:none;font-family:var(--sans)}
+.kn-parent{background:var(--navy);color:var(--white)}
+.kn-child{background:var(--red);color:var(--white)}
+footer{background:#0d1117;padding:40px 48px;border-top:1px solid rgba(255,255,255,0.04)}
+.foot-inner{max-width:1100px;margin:0 auto;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:16px}
+.foot-logo{font-family:var(--display);font-size:18px;color:var(--white);font-weight:900}.foot-logo span{color:var(--red2)}
+.foot-links{display:flex;gap:20px}
+.foot-links a{color:rgba(255,255,255,0.2);text-decoration:none;font-size:12px}
+.foot-copy{font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.1);margin-top:16px;max-width:1100px;margin-left:auto;margin-right:auto;padding:0 0 0 0}
+@media(max-width:900px){
+  nav{padding:0 20px}
+  .hero{padding:48px 20px 60px}
+  .hero-inner{grid-template-columns:1fr}
+  .phone-wrap{display:none}
+  .how,.features,.compliance,.install,.signup{padding:48px 20px}
+  .how-grid,.feat-grid,.comp-grid,.install-steps{grid-template-columns:1fr}
+  .stats-inner{grid-template-columns:repeat(2,1fr)}
+  .fg-row,.key-next{grid-template-columns:1fr}
+  footer{padding:32px 20px}
+  .foot-inner{flex-direction:column}
+  .alert{padding:11px 20px}
+}
+</style>
+</head>
+<body>
+
+<nav>
+  <a href="/" class="nav-logo">
+    <div class="nav-logo-text">AILeash <span>Guardian</span></div>
+  </a>
+  <div class="nav-right">
+    <a href="/" class="nav-link">Back to Platform</a>
+    <a href="#signup" class="nav-btn">Install Free</a>
+  </div>
+</nav>
+
+<div class="alert"><strong>UK Online Safety Act &amp; Children's Code:</strong> &nbsp; Now in force. Platforms face fines of up to <strong>10% of global turnover</strong> for failures to protect children.</div>
+
+<section class="hero">
+  <div class="hero-inner">
+    <div>
+      <div class="hero-eyebrow">AILeash Guardian &mdash; Child Safety Platform</div>
+      <h1>Your child is online.<br><em>Know they're safe.</em></h1>
+      <p class="hero-sub">Real-time monitoring of up to <strong>10 children</strong>. Grooming detection. Suspicious message flagging. Every alert hashed into a tamper-proof evidence chain. Instant notification on your phone the moment something looks wrong.</p>
+      <div class="hero-actions">
+        <a href="#install" class="btn-red">Install Guardian &rarr;</a>
+        <a href="#how" class="btn-outline">See How It Works</a>
+      </div>
+      <div class="hero-trust">
+        <span class="ht">Online Safety Act</span>
+        <span class="ht">ICO Children's Code</span>
+        <span class="ht">SHA-256 Evidence Chain</span>
+        <span class="ht">No App Store Needed</span>
+      </div>
+    </div>
+    <div class="phone-wrap">
+      <div class="phone">
+        <div class="phone-screen">
+          <div class="phone-notch"></div>
+          <div class="ps-header">
+            <div class="ps-title">Guardian Parent Dashboard</div>
+            <div class="ps-name">My Children</div>
+            <div class="ps-status">
+              <div class="ps-dot"></div>
+              <div class="ps-dot-label">Live monitoring active</div>
+            </div>
+          </div>
+          <div class="ps-alerts">
+            <div class="ps-alert">
+              <div class="ps-alert-label">Grooming Pattern Detected</div>
+              <div class="ps-alert-text">Isolation language detected in message to Emma. Flagged and hashed.</div>
+              <div class="ps-alert-time">2 minutes ago &middot; Score: 0.87</div>
+            </div>
+            <div class="ps-safe">
+              <div class="ps-safe-label">Activity Normal</div>
+              <div class="ps-safe-text">Jake &mdash; 14 messages scanned, all safe</div>
+            </div>
+            <div class="ps-alert">
+              <div class="ps-alert-label">Unknown Adult Contact</div>
+              <div class="ps-alert-text">New adult attempting to message Sophie. Blocked automatically.</div>
+              <div class="ps-alert-time">18 minutes ago &middot; BLOCKED</div>
+            </div>
+          </div>
+          <div class="ps-children">
+            <div class="ps-child"><span class="ps-child-name">Emma, 13</span><span class="ps-child-status pcs-warn">1 Alert</span></div>
+            <div class="ps-child"><span class="ps-child-name">Jake, 15</span><span class="ps-child-status pcs-safe">Safe</span></div>
+            <div class="ps-child"><span class="ps-child-name">Sophie, 11</span><span class="ps-child-status pcs-warn">Blocked</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<div class="stats">
+  <div class="stats-inner">
+    <div class="stat"><div class="stat-n">10</div><div class="stat-l">Children Per Account</div></div>
+    <div class="stat"><div class="stat-n">&lt;1s</div><div class="stat-l">Alert Speed</div></div>
+    <div class="stat"><div class="stat-n">SHA256</div><div class="stat-l">Evidence Chain</div></div>
+    <div class="stat"><div class="stat-n">50p</div><div class="stat-l">Per Device / Month</div></div>
+  </div>
+</div>
+
+<section class="how" id="how">
+  <div class="how-inner">
+    <div class="section-eyebrow">How It Works</div>
+    <h2>Two apps. <em>Complete protection.</em></h2>
+    <p style="font-size:15px;color:var(--muted);line-height:1.75;max-width:600px">No app store. No contract. Install both PWAs in under five minutes. Guardian starts working immediately.</p>
+    <div class="how-grid">
+      <div class="how-card">
+        <div class="how-n">01</div>
+        <h3>You install the Parent App</h3>
+        <p>Visit sebbi.pro/guardian-parent on your phone. Sign up, add your children, add each child's name and generate their Guardian code. Your live dashboard is ready instantly.</p>
+      </div>
+      <div class="how-card">
+        <div class="how-n">02</div>
+        <h3>Your child installs the Child App</h3>
+        <p>Your child visits sebbi.pro/guardian-child on their phone and enters their Guardian code. They use it as their safe browser for social media and messaging. Guardian scans everything in real time.</p>
+      </div>
+      <div class="how-card">
+        <div class="how-n">03</div>
+        <h3>You get alerts. They stay safe.</h3>
+        <p>The moment Guardian detects grooming, suspicious contacts, isolation attempts or any threat you get an instant notification. Every alert is hashed into a tamper-proof evidence chain automatically.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="features" id="features">
+  <div class="features-inner">
+    <div class="section-eyebrow">What Guardian Detects</div>
+    <h2>Every threat. <em>In real time.</em></h2>
+    <p style="font-size:15px;color:var(--muted);line-height:1.75;max-width:600px;margin-bottom:0">9-signal scoring engine. Every message scored. Every threat flagged. Everything logged permanently into the SHA-256 audit chain.</p>
+    <div class="feat-grid">
+      <div class="feat">
+        <div class="feat-icon">&#128245;</div>
+        <h3>Grooming Pattern Detection</h3>
+        <p>Guardian identifies the linguistic patterns used by predators — trust building, secrecy requests, isolation language, inappropriate escalation. Flagged before your child can respond.</p>
+        <span class="feat-tag">Real-time NLP scoring</span>
+      </div>
+      <div class="feat">
+        <div class="feat-icon">&#128683;</div>
+        <h3>Unknown Adult Contact Blocking</h3>
+        <p>Any adult attempting first contact with your child is flagged immediately. You approve or block from your dashboard. Your child never sees the message unless you allow it.</p>
+        <span class="feat-tag">Contact screening</span>
+      </div>
+      <div class="feat">
+        <div class="feat-icon">&#128248;</div>
+        <h3>CSAM Auto-Block</h3>
+        <p>Any attempt to send or receive child sexual abuse material triggers an immediate permanent block. An evidence package is generated automatically for Action Fraud and CEOP.</p>
+        <span class="feat-tag">Zero tolerance &middot; Auto evidence package</span>
+      </div>
+      <div class="feat">
+        <div class="feat-icon">&#10024;</div>
+        <h3>Love Bombing &amp; Manipulation</h3>
+        <p>Excessive flattery, gift offers, special treatment. Guardian scores these signals and alerts you when the pattern matches known manipulation tactics used by predators.</p>
+        <span class="feat-tag">Psychological threat scoring</span>
+      </div>
+      <div class="feat">
+        <div class="feat-icon">&#128205;</div>
+        <h3>Location Request Detection</h3>
+        <p>Any request for a child's location, school, home address or routine is flagged instantly with a high-risk score. The contact is placed under enhanced monitoring automatically.</p>
+        <span class="feat-tag">Location threat detection</span>
+      </div>
+      <div class="feat">
+        <div class="feat-icon">&#128274;</div>
+        <h3>SHA-256 Evidence Chain</h3>
+        <p>Every alert, every flagged message, every block is hashed into a tamper-proof Merkle chain. Admissible in court. Shareable with CEOP, Action Fraud or any law enforcement agency.</p>
+        <span class="feat-tag">Court-admissible evidence</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="compliance">
+  <div class="compliance-inner">
+    <div class="section-eyebrow" style="color:var(--red2)">Legal Compliance</div>
+    <h2 style="color:var(--white)">Built for the <em>law as it stands today.</em></h2>
+    <p style="font-size:15px;color:rgba(255,255,255,0.4);line-height:1.75;max-width:600px">Designed from the ground up around UK child safety legislation. Not retrofitted. Built for it.</p>
+    <div class="comp-grid">
+      <div class="comp-card">
+        <div class="comp-act">Online Safety Act 2023 &mdash; UK</div>
+        <h3>Platforms must protect children now</h3>
+        <p>Ofcom is already investigating platforms. Guardian gives platforms the documented, systematic, auditable risk assessment Ofcom requires on demand.</p>
+        <div class="comp-checks">
+          <div class="cc">Real-time content moderation with evidence trail</div>
+          <div class="cc">Systematic risk assessment documentation</div>
+          <div class="cc">Age-appropriate design enforcement</div>
+          <div class="cc">Ofcom-ready audit packages</div>
+        </div>
+      </div>
+      <div class="comp-card">
+        <div class="comp-act">ICO Children's Code &mdash; UK</div>
+        <h3>Best interests of the child by default</h3>
+        <p>The Children's Code requires protection by default. Guardian enforces data minimisation, no profiling, and human oversight automatically.</p>
+        <div class="comp-checks">
+          <div class="cc">Data minimisation for child users</div>
+          <div class="cc">No profiling unless strictly necessary</div>
+          <div class="cc">Human oversight of automated decisions</div>
+          <div class="cc">Privacy-first architecture</div>
+        </div>
+      </div>
+      <div class="comp-card">
+        <div class="comp-act">UK Gov U16 Social Media Rules 2025</div>
+        <h3>Under-16 safe social built in</h3>
+        <p>The new government rules require platforms to enforce safer experiences for under-16s. Guardian creates a compliant monitored environment without banning access entirely.</p>
+        <div class="comp-checks">
+          <div class="cc">Age-verified safer social browsing</div>
+          <div class="cc">U16 contact restrictions enforced</div>
+          <div class="cc">Parent consent and oversight logged</div>
+          <div class="cc">Regulator-ready evidence packages</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="install" id="install">
+  <div class="install-inner">
+    <div style="text-align:center">
+      <div class="section-eyebrow" style="text-align:center">Install Guardian</div>
+      <h2 style="text-align:center">Two apps. <em>Five minutes.</em></h2>
+      <p style="font-size:15px;color:var(--muted);line-height:1.75;max-width:560px;margin:0 auto">No app store. No waiting. Both apps install directly from your browser on any phone.</p>
+    </div>
+    <div class="install-steps">
+      <div class="install-col">
+        <div class="install-col-title">Parent App &mdash; Your Phone</div>
+        <div class="install-step">
+          <div class="is-num isn-parent">1</div>
+          <div class="is-text"><h4>Sign up below and get your API key</h4><p>Takes 60 seconds. Free trial. No card.</p></div>
+        </div>
+        <div class="install-step">
+          <div class="is-num isn-parent">2</div>
+          <div class="is-text"><h4>Open the Parent Dashboard</h4><p>Visit sebbi.pro/guardian-parent on your phone. Enter your API key when prompted.</p></div>
+        </div>
+        <div class="install-step">
+          <div class="is-num isn-parent">3</div>
+          <div class="is-text"><h4>Add your children</h4><p>Enter each child's name. Up to 10 children per account. Generate each child's unique Guardian code.</p></div>
+        </div>
+        <div class="install-step">
+          <div class="is-num isn-parent">4</div>
+          <div class="is-text"><h4>Add to home screen</h4><p>Tap Share then Add to Home Screen. Guardian is on your phone like any other app.</p></div>
+        </div>
+        <a href="/guardian-parent" class="install-btn ib-parent">Open Parent Dashboard &rarr;</a>
+      </div>
+      <div class="install-col">
+        <div class="install-col-title" style="color:var(--red)">Child App &mdash; Child's Phone</div>
+        <div class="install-step">
+          <div class="is-num isn-child">1</div>
+          <div class="is-text"><h4>Get the child's Guardian code</h4><p>You generate this in the Parent App. It is a short unique code for each child.</p></div>
+        </div>
+        <div class="install-step">
+          <div class="is-num isn-child">2</div>
+          <div class="is-text"><h4>Open the Child App on their phone</h4><p>Visit sebbi.pro/guardian-child on your child's phone. Enter their Guardian code.</p></div>
+        </div>
+        <div class="install-step">
+          <div class="is-num isn-child">3</div>
+          <div class="is-text"><h4>Add to home screen</h4><p>Tap Share then Add to Home Screen. The child now has their safe social browser installed.</p></div>
+        </div>
+        <div class="install-step">
+          <div class="is-num isn-child">4</div>
+          <div class="is-text"><h4>Guardian is live</h4><p>Every message your child sends or receives through Guardian is scanned in real time. You get alerts instantly.</p></div>
+        </div>
+        <a href="/guardian-child" class="install-btn ib-child">Open Child App &rarr;</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="signup" id="signup">
+  <div class="signup-inner">
+    <div class="section-eyebrow" style="text-align:center">Get Started Free</div>
+    <h2>Free API key. <em>Right now.</em></h2>
+    <p style="font-size:15px;color:var(--muted);line-height:1.75;margin-bottom:0">100 free scans. No card required. 50p per child per month after trial.</p>
+    <div class="signup-form">
+      <div class="fg-row">
+        <div class="fg"><label>First Name</label><input type="text" id="fn" placeholder="Jane"></div>
+        <div class="fg"><label>Last Name</label><input type="text" id="ln" placeholder="Smith"></div>
+      </div>
+      <div class="fg"><label>Email Address</label><input type="email" id="em" placeholder="you@email.com"></div>
+      <div class="fg"><label>Phone Number</label><input type="tel" id="ph" placeholder="+44 7700 000000"></div>
+      <div class="fg"><label>Number of Children to Monitor</label>
+        <select id="ch">
+          <option value="1">1 child</option>
+          <option value="2">2 children</option>
+          <option value="3">3 children</option>
+          <option value="4">4 children</option>
+          <option value="5">5 children</option>
+          <option value="10">6 to 10 children</option>
+        </select>
+      </div>
+      <button class="signup-btn" id="go-btn" onclick="doSignup()">Get Free Guardian API Key &rarr;</button>
+      <div class="msg-err" id="msg-err"></div>
+      <div class="msg-ok" id="msg-ok"></div>
+      <div class="key-box" id="key-box">
+        <div class="key-lbl">Your Guardian API Key &mdash; Save This</div>
+        <div class="key-val" id="key-val"></div>
+        <div class="key-next">
+          <a href="/guardian-parent" class="kn-btn kn-parent" id="parent-link">Open Parent App</a>
+          <a href="/guardian-child" class="kn-btn kn-child">Open Child App</a>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="foot-inner">
+    <div class="foot-logo">AILeash <span>Guardian</span></div>
+    <div class="foot-links">
+      <a href="/">AILeash Platform</a>
+      <a href="/guardian-parent">Parent App</a>
+      <a href="/guardian-child">Child App</a>
+      <a href="/contact">Contact</a>
+      <a href="/report-threat">Report a Threat</a>
+    </div>
+  </div>
+  <div class="foot-copy">&copy; 2026 Monop Content &middot; Justin Antony Dobson &middot; Blyth, UK &middot; Guardian v2.0.0 &middot; Online Safety Act &middot; ICO Children's Code</div>
+</footer>
+
+<script>
+async function doSignup(){
+  var fn=document.getElementById('fn').value.trim();
+  var ln=document.getElementById('ln').value.trim();
+  var em=document.getElementById('em').value.trim();
+  var ph=document.getElementById('ph').value.trim();
+  var ch=parseInt(document.getElementById('ch').value)||1;
+  var err=document.getElementById('msg-err');
+  var ok=document.getElementById('msg-ok');
+  var kb=document.getElementById('key-box');
+  var btn=document.getElementById('go-btn');
+  err.classList.remove('show');ok.classList.remove('show');kb.classList.remove('show');
+  if(!em||!em.includes('@')){err.textContent='Please enter a valid email address.';err.classList.add('show');return;}
+  var orig=btn.textContent;btn.textContent='Creating key...';btn.disabled=true;
+  try{
+    var r=await fetch('/signup',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({email:em,phone:ph,name:fn+' '+ln,org:'Guardian Family Account',org_type:'family',product:'guardian',devices:ch})});
+    var d=await r.json();
+    if(d.api_key){
+      document.getElementById('key-val').textContent=d.api_key;
+      document.getElementById('parent-link').href='/guardian-parent?key='+encodeURIComponent(d.api_key);
+      kb.classList.add('show');
+      ok.textContent='Key created. Open the Parent App to get started.';ok.classList.add('show');
+      btn.textContent='Key Created';
+    }else{
+      err.textContent=d.error||'Something went wrong. Email justin@monopcontent.com';
+      err.classList.add('show');btn.textContent=orig;btn.disabled=false;
+    }
+  }catch(e){
+    err.textContent='Cannot reach server. Email justin@monopcontent.com';
+    err.classList.add('show');btn.textContent=orig;btn.disabled=false;
+  }
+}
+</script>
+</body>
+</html>
