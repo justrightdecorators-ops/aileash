@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="apple-mobile-web-app-title" content="Guardian Safe">
+<meta name="theme-color" content="#0a0f1e">
+<title>Guardian Safe &mdash; Your Safe Space Online</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+:root{
+  --navy:#0a0f1e;--red:#cc0000;--green:#00c853;--gold:#c9a84c;
+  --purple:#7c3aed;--blue:#0ea5e9;
+  --bg:#0d1117;--card:#161b22;--border:rgba(255,255,255,0.07);
+  --muted:rgba(255,255,255,0.4);--text:rgba(255,255,255,0.85);
+  --sans:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  --mono:'SF Mono','Fira Code',monospace
+}
+html,body{background:var(--bg);color:var(--text);font-family:var(--sans);min-height:100vh;overflow-x:hidden}
+
+/* SETUP */
+#setup{min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:32px 20px;background:linear-gradient(160deg,#0a0f1e 0%,#1a0a2e 100%)}
+.setup-shield{font-size:64px;margin-bottom:12px;animation:float 3s ease-in-out infinite}
+@keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-8px)}}
+.setup-title{font-size:26px;font-weight:700;color:#fff;margin-bottom:6px;text-align:center}
+.setup-sub{font-size:14px;color:var(--muted);margin-bottom:32px;text-align:center;line-height:1.6;max-width:300px}
+.setup-form{width:100%;max-width:340px}
+.sf-label{font-size:11px;color:var(--muted);letter-spacing:1px;text-transform:uppercase;font-family:var(--mono);margin-bottom:8px;display:block}
+.sf-input{width:100%;background:rgba(255,255,255,0.06);border:1.5px solid var(--border);color:#fff;padding:14px;font-size:16px;font-family:var(--mono);outline:none;border-radius:10px;margin-bottom:6px;text-transform:uppercase;letter-spacing:4px;text-align:center}
+.sf-input:focus{border-color:var(--green)}
+.sf-input::placeholder{letter-spacing:0;text-transform:none;color:rgba(255,255,255,0.2);font-size:14px}
+.sf-name{text-transform:none;letter-spacing:0;text-align:left;font-family:var(--sans);font-size:15px}
+.sf-btn{width:100%;padding:15px;font-size:16px;font-weight:700;border-radius:10px;border:none;cursor:pointer;font-family:var(--sans);background:var(--green);color:#000;margin-top:8px}
+.sf-err{color:#ff3b3b;font-size:12px;font-family:var(--mono);margin-top:8px;text-align:center;display:none}
+.sf-err.show{display:block}
+.setup-install{margin-top:24px;font-size:12px;color:var(--muted);text-align:center;line-height:1.6;max-width:300px;background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:10px;padding:14px}
+
+/* MAIN APP */
+#app{display:none;min-height:100vh;padding-bottom:80px}
+
+/* HEADER */
+.app-header{background:var(--navy);padding:52px 20px 16px;border-bottom:1px solid var(--border);position:sticky;top:0;z-index:50}
+.ah-row{display:flex;align-items:center;justify-content:space-between}
+.ah-left{display:flex;align-items:center;gap:10px}
+.ah-avatar{font-size:28px}
+.ah-info h2{font-size:17px;font-weight:700;color:#fff}
+.ah-info p{font-size:11px;color:var(--muted);margin-top:1px}
+.ah-status{display:flex;align-items:center;gap:5px;font-size:11px;color:var(--green);font-family:var(--mono)}
+.status-dot{width:7px;height:7px;background:var(--green);border-radius:50%;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}
+
+/* SAFE STATUS CARD */
+.safe-card{margin:16px;background:linear-gradient(135deg,rgba(0,200,83,0.1) 0%,rgba(0,200,83,0.05) 100%);border:1px solid rgba(0,200,83,0.2);border-radius:16px;padding:20px;text-align:center}
+.sc-icon{font-size:40px;margin-bottom:8px}
+.sc-title{font-size:18px;font-weight:700;color:#fff;margin-bottom:4px}
+.sc-sub{font-size:13px;color:var(--muted);line-height:1.5}
+.sc-count{font-family:var(--mono);font-size:11px;color:rgba(0,200,83,0.6);margin-top:10px}
+
+/* SCAN BOX */
+.scan-section{padding:0 16px 16px}
+.scan-label{font-size:11px;color:var(--muted);letter-spacing:1px;text-transform:uppercase;font-family:var(--mono);margin-bottom:10px}
+.scan-box{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px}
+.scan-textarea{width:100%;background:rgba(255,255,255,0.04);border:1.5px solid var(--border);color:#fff;padding:13px;font-size:15px;font-family:var(--sans);outline:none;border-radius:10px;resize:none;height:100px;line-height:1.5}
+.scan-textarea:focus{border-color:var(--blue)}
+.scan-textarea::placeholder{color:rgba(255,255,255,0.2);font-size:14px}
+.scan-btn{width:100%;padding:13px;font-size:15px;font-weight:700;border-radius:10px;border:none;cursor:pointer;font-family:var(--sans);background:var(--blue);color:#fff;margin-top:10px}
+.scan-btn:disabled{opacity:0.5}
+
+/* RESULT */
+.scan-result{margin-top:12px;border-radius:10px;padding:14px;display:none}
+.scan-result.show{display:block}
+.sr-safe{background:rgba(0,200,83,0.08);border:1px solid rgba(0,200,83,0.2)}
+.sr-warn{background:rgba(255,149,0,0.08);border:1px solid rgba(255,149,0,0.25)}
+.sr-danger{background:rgba(204,0,0,0.1);border:1px solid rgba(204,0,0,0.3)}
+.sr-label{font-family:var(--mono);font-size:10px;letter-spacing:1.5px;text-transform:uppercase;font-weight:700;margin-bottom:6px}
+.srl-safe{color:var(--green)}.srl-warn{color:#ff9500}.srl-danger{color:#ff3b3b}
+.sr-text{font-size:13px;color:var(--muted);line-height:1.55}
+.sr-action{font-size:13px;font-weight:600;margin-top:10px;padding:10px;border-radius:8px;text-align:center}
+.sra-tell{background:rgba(255,149,0,0.15);color:#ff9500}
+.sra-block{background:rgba(204,0,0,0.15);color:#ff3b3b}
+
+/* QUICK TIPS */
+.tips-section{padding:0 16px 16px}
+.tip-card{background:var(--card);border-radius:12px;padding:14px 16px;margin-bottom:8px;border:1px solid var(--border);display:flex;align-items:flex-start;gap:12px}
+.tip-icon{font-size:22px;flex-shrink:0;margin-top:2px}
+.tip-text h4{font-size:14px;font-weight:600;color:#fff;margin-bottom:3px}
+.tip-text p{font-size:12px;color:var(--muted);line-height:1.55}
+
+/* CONTACTS */
+.contacts-section{padding:0 16px 16px}
+.contact-row{background:var(--card);border-radius:10px;margin-bottom:6px;border:1px solid var(--border);display:flex;align-items:center;gap:12px;padding:12px 14px}
+.cr-avatar{width:40px;height:40px;border-radius:50%;background:rgba(255,255,255,0.06);display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0}
+.cr-info{flex:1}
+.cr-name{font-size:14px;font-weight:600;color:#fff}
+.cr-status{font-size:11px;color:var(--muted);margin-top:2px;font-family:var(--mono)}
+.cr-badge{font-size:10px;font-weight:700;padding:3px 8px;border-radius:6px;font-family:var(--mono)}
+.crb-safe{background:rgba(0,200,83,0.12);color:var(--green)}
+.crb-warn{background:rgba(255,149,0,0.12);color:#ff9500}
+.crb-blocked{background:rgba(204,0,0,0.12);color:#ff3b3b}
+
+/* EMERGENCY */
+.emergency-banner{margin:16px;background:rgba(204,0,0,0.08);border:1px solid rgba(204,0,0,0.2);border-radius:14px;padding:16px;text-align:center}
+.eb-title{font-size:14px;font-weight:700;color:#fff;margin-bottom:6px}
+.eb-sub{font-size:12px;color:var(--muted);margin-bottom:12px;line-height:1.5}
+.eb-btn{display:block;padding:13px;border-radius:10px;font-weight:700;font-size:15px;text-decoration:none;background:var(--red);color:#fff;margin-bottom:8px}
+.eb-btn-ghost{display:block;padding:11px;border-radius:10px;font-weight:600;font-size:13px;text-decoration:none;background:rgba(255,255,255,0.06);color:var(--muted)}
+
+/* BOTTOM NAV */
+.bottom-nav{position:fixed;bottom:0;left:0;right:0;background:var(--navy);border-top:1px solid var(--border);display:flex;padding:8px 0 20px;z-index:100}
+.bn-item{flex:1;display:flex;flex-direction:column;align-items:center;gap:3px;cursor:pointer;padding:6px 0}
+.bn-icon{font-size:22px}
+.bn-label{font-size:9px;color:var(--muted);font-family:var(--mono)}
+.bn-item.active .bn-label{color:var(--green)}
+</style>
+</head>
+<body>
+
+<!-- SETUP -->
+<div id="setup">
+  <div class="setup-shield">&#128737;</div>
+  <div class="setup-title">Guardian Safe</div>
+  <div class="setup-sub">Your safe space online. Enter your Guardian code from your parent to get started.</div>
+  <div class="setup-form">
+    <label class="sf-label">Your Guardian Code</label>
+    <input class="sf-input" type="text" id="setup-code" placeholder="GRD-XXXX-0000" autocomplete="off" spellcheck="false" oninput="this.value=this.value.toUpperCase()">
+    <label class="sf-label" style="margin-top:14px">Your First Name</label>
+    <input class="sf-input sf-name" type="text" id="setup-child-name" placeholder="Your name">
+    <button class="sf-btn" onclick="doChildSetup()">Start Guardian &rarr;</button>
+    <div class="sf-err" id="sf-err">Please enter your Guardian code from your parent app.</div>
+  </div>
+  <div class="setup-install">
+    <strong style="color:#fff;font-size:12px">Add to Home Screen</strong><br>
+    Tap Share then "Add to Home Screen" to install Guardian on your phone like any other app.
+  </div>
+</div>
+
+<!-- APP -->
+<div id="app">
+
+  <div class="app-header">
+    <div class="ah-row">
+      <div class="ah-left">
+        <div class="ah-avatar" id="child-avatar">&#128737;</div>
+        <div class="ah-info">
+          <h2 id="child-greeting">Hey there!</h2>
+          <p>Guardian is keeping you safe</p>
+        </div>
+      </div>
+      <div class="ah-status"><div class="status-dot"></div>Protected</div>
+    </div>
+  </div>
+
+  <!-- HOME TAB -->
+  <div id="tab-home">
+    <div class="safe-card">
+      <div class="sc-icon">&#128737;</div>
+      <div class="sc-title">You're Protected</div>
+      <div class="sc-sub">Guardian is watching out for you. If anything looks dodgy, we'll warn you straight away.</div>
+      <div class="sc-count" id="scan-count-display">0 messages scanned today</div>
+    </div>
+
+    <div class="scan-section">
+      <div class="scan-label">Check a Message</div>
+      <div class="scan-box">
+        <textarea class="scan-textarea" id="scan-text" placeholder="Paste a message here if something feels weird and we'll check it for you..."></textarea>
+        <button class="scan-btn" id="scan-btn" onclick="doScan()">Check This Message &rarr;</button>
+        <div class="scan-result" id="scan-result"></div>
+      </div>
+    </div>
+
+    <div class="tips-section">
+      <div class="scan-label">Stay Safe Online</div>
+      <div class="tip-card">
+        <div class="tip-icon">&#128274;</div>
+        <div class="tip-text">
+          <h4>Keep your location private</h4>
+          <p>Never tell anyone online where you live, which school you go to or where you hang out. Even if they seem nice.</p>
+        </div>
+      </div>
+      <div class="tip-card">
+        <div class="tip-icon">&#128561;</div>
+        <div class="tip-text">
+          <h4>Secrets are a red flag</h4>
+          <p>If someone asks you to keep your conversations secret from your parents, that is a warning sign. Tell a trusted adult.</p>
+        </div>
+      </div>
+      <div class="tip-card">
+        <div class="tip-icon">&#127873;</div>
+        <div class="tip-text">
+          <h4>No real gifts online</h4>
+          <p>If someone you only know online offers you gifts, money or free stuff — they want something in return. Tell your parents.</p>
+        </div>
+      </div>
+      <div class="tip-card">
+        <div class="tip-icon">&#128172;</div>
+        <div class="tip-text">
+          <h4>Block feels good</h4>
+          <p>Blocking someone who makes you uncomfortable is always the right move. You do not owe anyone your time online.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- CONTACTS TAB -->
+  <div id="tab-contacts" style="display:none">
+    <div style="padding:20px 16px 12px">
+      <div class="scan-label">Your Contacts</div>
+      <div id="contacts-list"></div>
+    </div>
+  </div>
+
+  <!-- EMERGENCY TAB -->
+  <div id="tab-help" style="display:none">
+    <div class="emergency-banner">
+      <div class="eb-title">Something Happened?</div>
+      <div class="eb-sub">If you feel unsafe, scared or someone has done something that feels wrong — you can get help right now. You are not in trouble.</div>
+      <a href="tel:999" class="eb-btn">&#9999; Call 999 &mdash; Emergency</a>
+      <a href="https://www.ceop.police.uk/Safety-Centre/" target="_blank" class="eb-btn" style="background:var(--purple)">Report to CEOP</a>
+      <a href="https://www.childline.org.uk/" target="_blank" class="eb-btn-ghost">Childline &mdash; 0800 1111</a>
+    </div>
+
+    <div style="padding:0 16px">
+      <div class="scan-label" style="margin-bottom:12px">What counts as unsafe?</div>
+      <div class="tip-card"><div class="tip-icon">&#9888;</div><div class="tip-text"><h4>Someone asked to meet in person</h4><p>If someone you met online wants to meet you in real life, tell your parents or a trusted adult immediately. Do not go alone.</p></div></div>
+      <div class="tip-card"><div class="tip-icon">&#9888;</div><div class="tip-text"><h4>Someone sent you a weird photo</h4><p>If someone sent you a photo that made you uncomfortable, do not share it. Tell a trusted adult. You have done nothing wrong.</p></div></div>
+      <div class="tip-card"><div class="tip-icon">&#9888;</div><div class="tip-text"><h4>Someone is being nasty to you</h4><p>Bullying online is serious. Screenshot it, block them, and tell a parent or teacher. You do not have to put up with it.</p></div></div>
+      <div class="tip-card"><div class="tip-icon">&#9888;</div><div class="tip-text"><h4>Someone asked you to keep a secret</h4><p>Trustworthy people do not ask children to keep secrets. If this happened, tell your parents. They will not be angry at you.</p></div></div>
+    </div>
+  </div>
+
+  <!-- BOTTOM NAV -->
+  <div class="bottom-nav">
+    <div class="bn-item active" onclick="showChildTab('home')" id="cbn-home">
+      <div class="bn-icon">&#127968;</div>
+      <div class="bn-label">Home</div>
+    </div>
+    <div class="bn-item" onclick="showChildTab('contacts')" id="cbn-contacts">
+      <div class="bn-icon">&#128172;</div>
+      <div class="bn-label">Contacts</div>
+    </div>
+    <div class="bn-item" onclick="showChildTab('help')" id="cbn-help">
+      <div class="bn-icon">&#128737;</div>
+      <div class="bn-label">Get Help</div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+var CHILD={
+  code:'',
+  name:'',
+  scanCount:0,
+  contacts:[
+    {name:'Mia',emoji:'&#128103;',status:'Friend from school',trust:'safe'},
+    {name:'Jake',emoji:'&#128102;',status:'Gaming friend',trust:'safe'},
+    {name:'Unknown123',emoji:'&#128100;',status:'New contact &mdash; flagged',trust:'warn'}
+  ]
+};
+
+var THREAT_PATTERNS=[
+  {re:/secret|don't tell|our little secret|keep this between us/i,type:'SECRECY_REQUEST',score:0.85,msg:'This message is asking you to keep a secret from your parents. That is a warning sign. Tell a trusted adult.'},
+  {re:/where do you live|what school|where are you|your address|meet up|come and meet/i,type:'LOCATION_REQUEST',score:0.78,msg:'This message is asking for your location or wants to meet you. Do not share this information. Tell your parents.'},
+  {re:/send me a photo|send a pic|selfie|what do you look like naked|show me/i,type:'PHOTO_REQUEST',score:0.92,msg:'This message is asking for photos. This is not okay. Block this person and tell a trusted adult immediately.'},
+  {re:/you're so mature|you're not like other kids|you're special|I love you|you're beautiful/i,type:'LOVE_BOMBING',score:0.65,msg:'This message is being unusually flattering. Adults who say this to children online may not have good intentions. Be careful.'},
+  {re:/I'll give you|free gift|I'll buy you|money for you|reward/i,type:'GIFT_OFFER',score:0.61,msg:'Someone offering gifts or money online usually wants something in return. Tell your parents about this.'},
+  {re:/don't tell your mum|don't tell your dad|your parents won't understand|they'll be angry/i,type:'ISOLATION',score:0.88,msg:'This message is trying to isolate you from your parents. This is a serious warning sign. Tell them about this message now.'},
+];
+
+window.onload=function(){
+  var saved=localStorage.getItem('guardian_child');
+  if(saved){
+    try{
+      var s=JSON.parse(saved);
+      CHILD.code=s.code||'';
+      CHILD.name=s.name||'';
+      CHILD.scanCount=s.scanCount||0;
+    }catch(e){}
+  }
+  var urlCode=new URLSearchParams(window.location.search).get('code');
+  if(urlCode){CHILD.code=urlCode;}
+  if(CHILD.code&&CHILD.name){showChildApp();}
+};
+
+function saveChild(){localStorage.setItem('guardian_child',JSON.stringify(CHILD));}
+
+function doChildSetup(){
+  var code=document.getElementById('setup-code').value.trim().toUpperCase();
+  var name=document.getElementById('setup-child-name').value.trim();
+  var err=document.getElementById('sf-err');
+  if(!code||!code.startsWith('GRD-')){
+    err.style.display='block';
+    err.textContent='Please enter a valid Guardian code. It starts with GRD- and comes from your parent app.';
+    return;
+  }
+  if(!name){
+    err.style.display='block';
+    err.textContent='Please enter your name.';
+    return;
+  }
+  CHILD.code=code;
+  CHILD.name=name;
+  saveChild();
+  showChildApp();
+}
+
+function showChildApp(){
+  document.getElementById('setup').style.display='none';
+  document.getElementById('app').style.display='block';
+  document.getElementById('child-greeting').textContent='Hey '+CHILD.name+'!';
+  document.getElementById('scan-count-display').textContent=CHILD.scanCount+' messages scanned today';
+  renderContacts();
+}
+
+function showChildTab(tab){
+  var tabs=['home','contacts','help'];
+  tabs.forEach(function(t){
+    document.getElementById('tab-'+t).style.display=t===tab?'block':'none';
+    var bn=document.getElementById('cbn-'+t);
+    if(bn)bn.className='bn-item'+(t===tab?' active':'');
+  });
+}
+
+function doScan(){
+  var text=document.getElementById('scan-text').value.trim();
+  var result=document.getElementById('scan-result');
+  var btn=document.getElementById('scan-btn');
+  if(!text){result.className='scan-result';result.style.display='none';return;}
+  btn.disabled=true;btn.textContent='Checking...';
+  setTimeout(function(){
+    var found=null;
+    for(var i=0;i<THREAT_PATTERNS.length;i++){
+      if(THREAT_PATTERNS[i].re.test(text)){found=THREAT_PATTERNS[i];break;}
+    }
+    CHILD.scanCount++;
+    saveChild();
+    document.getElementById('scan-count-display').textContent=CHILD.scanCount+' messages scanned today';
+    if(found&&found.score>0.75){
+      result.className='scan-result sr-danger show';
+      result.innerHTML='<div class="sr-label srl-danger">Warning &mdash; '+found.type.replace(/_/g,' ')+'</div>'
+        +'<div class="sr-text">'+found.msg+'</div>'
+        +'<div class="sr-action sra-block">Tell a parent or trusted adult about this message.</div>';
+    }else if(found){
+      result.className='scan-result sr-warn show';
+      result.innerHTML='<div class="sr-label srl-warn">Be Careful</div>'
+        +'<div class="sr-text">'+found.msg+'</div>'
+        +'<div class="sr-action sra-tell">If this feels wrong, trust your gut and tell your parents.</div>';
+    }else{
+      result.className='scan-result sr-safe show';
+      result.innerHTML='<div class="sr-label srl-safe">Looks Safe</div>'
+        +'<div class="sr-text">We did not spot anything obviously dangerous in this message. But always trust your gut. If something feels wrong, tell a trusted adult.</div>';
+    }
+    btn.disabled=false;btn.textContent='Check This Message \u2192';
+    reportScanToParent(text,found);
+  },800);
+}
+
+function reportScanToParent(text,threat){
+  if(!CHILD.code)return;
+  var payload={
+    user_id:'guardian_child_'+CHILD.code,
+    action:'message_scan',
+    amount:0,
+    country:'UK',
+    device_id:CHILD.code,
+    anomaly:threat?threat.score:0.05,
+    device_risk:threat?0.3:0.05,
+    child_name:CHILD.name,
+    threat_type:threat?threat.type:'SAFE',
+    guardian_code:CHILD.code
+  };
+  fetch('/api/govern',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(payload)
+  }).catch(function(){});
+}
+
+function renderContacts(){
+  var el=document.getElementById('contacts-list');
+  if(!el)return;
+  el.innerHTML=CHILD.contacts.map(function(c){
+    var badgeClass={'safe':'crb-safe','warn':'crb-warn','blocked':'crb-blocked'}[c.trust]||'crb-safe';
+    var badgeLabel={'safe':'Safe','warn':'Check this one','blocked':'Blocked'}[c.trust]||'Safe';
+    return '<div class="contact-row">'
+      +'<div class="cr-avatar">'+c.emoji+'</div>'
+      +'<div class="cr-info"><div class="cr-name">'+c.name+'</div><div class="cr-status">'+c.status+'</div></div>'
+      +'<div class="cr-badge '+badgeClass+'">'+badgeLabel+'</div>'
+      +'</div>';
+  }).join('');
+}
+</script>
+</body>
+</html>
