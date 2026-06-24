@@ -1,0 +1,796 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Guardian">
+<meta name="theme-color" content="#0a0f1e">
+<title>Guardian &mdash; Parent Dashboard</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+:root{
+  --navy:#0a0f1e;--red:#cc0000;--red2:#ff3b3b;--gold:#c9a84c;
+  --green:#00c853;--orange:#ff9500;--white:#fff;
+  --bg:#0d1117;--card:#161b22;--border:rgba(255,255,255,0.06);
+  --muted:rgba(255,255,255,0.35);--text:rgba(255,255,255,0.85);
+  --mono:'SF Mono','Fira Code','JetBrains Mono',monospace;
+  --sans:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif
+}
+html,body{background:var(--bg);color:var(--text);font-family:var(--sans);min-height:100vh;overflow-x:hidden}
+
+/* SETUP SCREEN */
+#setup-screen{min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:32px 20px;background:var(--navy)}
+.setup-logo{font-size:48px;margin-bottom:16px}
+.setup-title{font-size:24px;font-weight:700;color:var(--white);margin-bottom:6px;text-align:center}
+.setup-sub{font-size:14px;color:var(--muted);margin-bottom:32px;text-align:center;line-height:1.6;max-width:320px}
+.setup-form{width:100%;max-width:360px;background:rgba(255,255,255,0.04);border:1px solid var(--border);border-radius:12px;padding:24px}
+.sf-label{font-size:10px;color:var(--muted);letter-spacing:2px;text-transform:uppercase;font-family:var(--mono);margin-bottom:6px;display:block}
+.sf-input{width:100%;background:rgba(255,255,255,0.06);border:1.5px solid var(--border);color:var(--white);padding:12px 14px;font-size:14px;font-family:var(--sans);outline:none;border-radius:8px;margin-bottom:16px}
+.sf-input:focus{border-color:var(--red)}
+.sf-btn{width:100%;padding:14px;font-size:15px;font-weight:700;border-radius:8px;border:none;cursor:pointer;font-family:var(--sans);background:var(--red);color:var(--white)}
+.setup-err{color:var(--red2);font-size:12px;font-family:var(--mono);margin-top:10px;display:none}
+.setup-err.show{display:block}
+.setup-install{margin-top:20px;font-size:12px;color:var(--muted);text-align:center;line-height:1.6;max-width:320px;background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:8px;padding:14px}
+
+/* MAIN APP */
+#app{display:none;min-height:100vh;padding-bottom:80px}
+
+/* HEADER */
+.app-header{background:var(--navy);padding:52px 20px 16px;border-bottom:1px solid var(--border);position:sticky;top:0;z-index:50}
+.ah-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+.ah-logo{font-size:16px;font-weight:700;color:var(--white)}
+.ah-logo span{color:var(--red2)}
+.ah-live{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--muted);font-family:var(--mono)}
+.live-dot{width:7px;height:7px;background:var(--green);border-radius:50%;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}
+.ah-alert-count{background:var(--red);color:var(--white);font-size:11px;font-weight:700;padding:3px 10px;border-radius:20px;font-family:var(--mono);display:none}
+.ah-alert-count.show{display:inline-block}
+
+/* CHILDREN STRIP */
+.children-strip{display:flex;gap:10px;overflow-x:auto;padding:4px 0;scrollbar-width:none}
+.children-strip::-webkit-scrollbar{display:none}
+.child-pill{flex-shrink:0;display:flex;flex-direction:column;align-items:center;gap:4px;cursor:pointer;padding:4px 8px;border-radius:10px;transition:background .15s}
+.child-pill.active{background:rgba(204,0,0,0.12)}
+.child-avatar{width:44px;height:44px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:18px;border:2px solid transparent;position:relative}
+.ca-safe{border-color:var(--green);background:rgba(0,200,83,0.1)}
+.ca-warn{border-color:var(--orange);background:rgba(255,149,0,0.1)}
+.ca-danger{border-color:var(--red);background:rgba(204,0,0,0.15)}
+.child-badge{position:absolute;top:-2px;right:-2px;width:16px;height:16px;border-radius:50%;background:var(--red);color:var(--white);font-size:9px;font-weight:700;display:flex;align-items:center;justify-content:center;border:2px solid var(--navy)}
+.child-pill-name{font-size:10px;color:var(--muted);font-weight:500}
+.child-pill.active .child-pill-name{color:var(--white)}
+.add-child-pill{flex-shrink:0;display:flex;flex-direction:column;align-items:center;gap:4px;cursor:pointer;padding:4px 8px}
+.add-avatar{width:44px;height:44px;border-radius:50%;border:2px dashed rgba(255,255,255,0.15);display:flex;align-items:center;justify-content:center;font-size:20px;color:rgba(255,255,255,0.2)}
+.add-label{font-size:10px;color:rgba(255,255,255,0.2)}
+
+/* SECTIONS */
+.section{padding:20px}
+.section-title{font-size:11px;color:var(--muted);letter-spacing:2px;text-transform:uppercase;font-family:var(--mono);margin-bottom:12px;display:flex;align-items:center;justify-content:space-between}
+.section-action{font-size:11px;color:var(--red2);font-family:var(--mono);cursor:pointer}
+
+/* STATUS BANNER */
+.status-banner{margin:20px 20px 0;border-radius:12px;padding:16px 18px;display:flex;align-items:center;gap:14px}
+.sb-safe{background:rgba(0,200,83,0.08);border:1px solid rgba(0,200,83,0.2)}
+.sb-warn{background:rgba(255,149,0,0.08);border:1px solid rgba(255,149,0,0.25)}
+.sb-danger{background:rgba(204,0,0,0.1);border:1px solid rgba(204,0,0,0.25)}
+.sb-icon{font-size:28px;flex-shrink:0}
+.sb-text h3{font-size:15px;font-weight:700;color:var(--white);margin-bottom:3px}
+.sb-text p{font-size:12px;color:var(--muted);line-height:1.5}
+
+/* ALERT CARDS */
+.alert-card{background:var(--card);border-radius:12px;padding:16px;margin-bottom:10px;border:1px solid var(--border);position:relative;overflow:hidden}
+.alert-card::before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px}
+.ac-danger::before{background:var(--red)}
+.ac-warn::before{background:var(--orange)}
+.ac-safe::before{background:var(--green)}
+.ac-blocked::before{background:#7c3aed}
+.ac-top{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;margin-bottom:8px}
+.ac-type{font-family:var(--mono);font-size:9px;letter-spacing:1.5px;text-transform:uppercase;font-weight:700}
+.act-danger{color:var(--red2)}
+.act-warn{color:var(--orange)}
+.act-safe{color:var(--green)}
+.act-blocked{color:#a78bfa}
+.ac-time{font-family:var(--mono);font-size:9px;color:var(--muted);white-space:nowrap}
+.ac-child{font-size:13px;font-weight:600;color:var(--white);margin-bottom:4px}
+.ac-text{font-size:13px;color:var(--muted);line-height:1.55}
+.ac-score{font-family:var(--mono);font-size:10px;color:var(--muted);margin-top:8px;display:flex;align-items:center;gap:10px}
+.ac-hash{font-size:9px;color:rgba(255,255,255,0.12);font-family:var(--mono);margin-top:4px;word-break:break-all}
+.ac-actions{display:flex;gap:8px;margin-top:12px}
+.ac-btn{flex:1;padding:9px;border-radius:6px;border:none;cursor:pointer;font-family:var(--sans);font-size:12px;font-weight:700}
+.acb-block{background:rgba(204,0,0,0.15);color:var(--red2)}
+.acb-ok{background:rgba(0,200,83,0.12);color:var(--green)}
+.acb-view{background:rgba(255,255,255,0.06);color:var(--muted)}
+
+/* CHILD DETAIL */
+.child-detail{background:var(--card);border-radius:12px;padding:20px;margin-bottom:16px;border:1px solid var(--border)}
+.cd-header{display:flex;align-items:center;gap:14px;margin-bottom:16px}
+.cd-avatar{width:52px;height:52px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:24px}
+.cd-info h3{font-size:17px;font-weight:700;color:var(--white)}
+.cd-info p{font-size:12px;color:var(--muted);margin-top:2px}
+.cd-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:16px}
+.cd-stat{background:rgba(255,255,255,0.03);border-radius:8px;padding:10px;text-align:center}
+.cd-stat-n{font-size:20px;font-weight:700;color:var(--white);font-family:var(--mono)}
+.cd-stat-l{font-size:9px;color:var(--muted);margin-top:2px;text-transform:uppercase;letter-spacing:1px}
+.cd-code{background:rgba(255,255,255,0.04);border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:12px}
+.cd-code-label{font-family:var(--mono);font-size:9px;color:var(--muted);letter-spacing:2px;text-transform:uppercase;margin-bottom:6px}
+.cd-code-val{font-family:var(--mono);font-size:18px;font-weight:700;color:var(--gold);letter-spacing:4px}
+.cd-code-hint{font-size:11px;color:var(--muted);margin-top:4px;line-height:1.5}
+
+/* ADD CHILD MODAL */
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.8);z-index:200;display:none;align-items:flex-end}
+.modal-overlay.open{display:flex}
+.modal{background:var(--card);border-radius:20px 20px 0 0;padding:28px 24px 40px;width:100%;border-top:1px solid var(--border)}
+.modal-handle{width:40px;height:4px;background:rgba(255,255,255,0.15);border-radius:2px;margin:0 auto 20px}
+.modal-title{font-size:18px;font-weight:700;color:var(--white);margin-bottom:20px}
+.mf-label{font-size:10px;color:var(--muted);letter-spacing:2px;text-transform:uppercase;font-family:var(--mono);margin-bottom:6px;display:block}
+.mf-input{width:100%;background:rgba(255,255,255,0.06);border:1.5px solid var(--border);color:var(--white);padding:13px 14px;font-size:15px;font-family:var(--sans);outline:none;border-radius:8px;margin-bottom:14px}
+.mf-input:focus{border-color:var(--red)}
+.mf-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.modal-btn{width:100%;padding:15px;font-size:15px;font-weight:700;border-radius:8px;border:none;cursor:pointer;font-family:var(--sans);background:var(--red);color:var(--white);margin-top:4px}
+.modal-cancel{background:rgba(255,255,255,0.06);color:var(--muted);margin-top:8px}
+
+/* EMOJI PICKER */
+.emoji-pick{display:grid;grid-template-columns:repeat(6,1fr);gap:8px;margin-bottom:14px}
+.ep{font-size:28px;cursor:pointer;text-align:center;padding:6px;border-radius:8px;border:2px solid transparent}
+.ep.selected{border-color:var(--red);background:rgba(204,0,0,0.12)}
+
+/* BOTTOM NAV */
+.bottom-nav{position:fixed;bottom:0;left:0;right:0;background:var(--navy);border-top:1px solid var(--border);display:flex;padding:8px 0 20px;z-index:100}
+.bn-item{flex:1;display:flex;flex-direction:column;align-items:center;gap:3px;cursor:pointer;padding:6px 0;position:relative}
+.bn-icon{font-size:22px}
+.bn-label{font-size:9px;color:var(--muted);font-family:var(--mono);letter-spacing:0.5px}
+.bn-item.active .bn-label{color:var(--red2)}
+.bn-badge{position:absolute;top:4px;right:calc(50% - 18px);background:var(--red);color:var(--white);font-size:9px;font-weight:700;padding:1px 5px;border-radius:8px;font-family:var(--mono);display:none}
+.bn-badge.show{display:block}
+
+/* EMPTY STATE */
+.empty-state{text-align:center;padding:48px 20px;color:var(--muted)}
+.empty-icon{font-size:48px;margin-bottom:12px;opacity:0.4}
+.empty-text{font-size:14px;line-height:1.6}
+
+/* AUDIT LOG */
+.audit-entry{background:var(--card);border-radius:8px;padding:12px 14px;margin-bottom:6px;border:1px solid var(--border)}
+.ae-hash{font-family:var(--mono);font-size:9px;color:rgba(255,255,255,0.15);word-break:break-all;margin-bottom:4px}
+.ae-info{font-size:12px;color:var(--muted)}
+.ae-info strong{color:var(--white)}
+
+/* SETTINGS */
+.settings-row{background:var(--card);border-radius:10px;margin-bottom:8px;overflow:hidden}
+.sr-item{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid var(--border)}
+.sr-item:last-child{border:none}
+.sr-left{display:flex;flex-direction:column;gap:2px}
+.sr-label{font-size:14px;color:var(--white);font-weight:500}
+.sr-sub{font-size:11px;color:var(--muted)}
+.sr-right{font-size:13px;color:var(--red2);font-family:var(--mono)}
+.toggle{width:44px;height:26px;background:rgba(255,255,255,0.1);border-radius:13px;position:relative;cursor:pointer;transition:background .2s;flex-shrink:0}
+.toggle.on{background:var(--green)}
+.toggle::after{content:'';position:absolute;top:3px;left:3px;width:20px;height:20px;background:var(--white);border-radius:50%;transition:transform .2s}
+.toggle.on::after{transform:translateX(18px)}
+</style>
+</head>
+<body>
+
+<!-- SETUP -->
+<div id="setup-screen">
+  <div class="setup-logo">&#128100;</div>
+  <div class="setup-title">Guardian Parent Dashboard</div>
+  <div class="setup-sub">Enter your Guardian API key to access your parent dashboard and monitor your children.</div>
+  <div class="setup-form">
+    <label class="sf-label">Guardian API Key</label>
+    <input class="sf-input" type="text" id="setup-key" placeholder="ag_live_..." autocomplete="off" spellcheck="false">
+    <label class="sf-label">Your Name</label>
+    <input class="sf-input" type="text" id="setup-name" placeholder="Jane Smith">
+    <button class="sf-btn" onclick="doSetup()">Access Dashboard &rarr;</button>
+    <div class="setup-err" id="setup-err"></div>
+  </div>
+  <div class="setup-install">
+    <strong style="color:var(--white);font-size:12px">Add to Home Screen</strong><br>
+    Tap Share then "Add to Home Screen" to install Guardian as an app on your phone.
+  </div>
+</div>
+
+<!-- MAIN APP -->
+<div id="app">
+
+  <div class="app-header">
+    <div class="ah-top">
+      <div class="ah-logo">Guardian <span>Parent</span></div>
+      <div style="display:flex;align-items:center;gap:10px">
+        <span class="ah-alert-count" id="alert-count-badge">0</span>
+        <div class="ah-live"><div class="live-dot"></div> Live</div>
+      </div>
+    </div>
+    <div class="children-strip" id="children-strip">
+      <!-- populated by JS -->
+    </div>
+  </div>
+
+  <!-- OVERVIEW TAB -->
+  <div id="tab-overview">
+    <div class="status-banner sb-safe" id="status-banner">
+      <div class="sb-icon">&#128994;</div>
+      <div class="sb-text">
+        <h3 id="status-title">All Children Safe</h3>
+        <p id="status-sub">No active threats detected. Monitoring running.</p>
+      </div>
+    </div>
+
+    <div class="section" style="margin-top:8px">
+      <div class="section-title">
+        <span>Recent Alerts</span>
+        <span class="section-action" onclick="showTab('alerts')">View All</span>
+      </div>
+      <div id="recent-alerts-list">
+        <div class="empty-state">
+          <div class="empty-icon">&#128994;</div>
+          <div class="empty-text">No alerts yet. Guardian is monitoring your children.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ALERTS TAB -->
+  <div id="tab-alerts" style="display:none">
+    <div class="section" style="padding-top:20px">
+      <div class="section-title"><span>All Alerts</span><span id="alert-total" style="color:var(--muted)">0 total</span></div>
+      <div id="all-alerts-list">
+        <div class="empty-state">
+          <div class="empty-icon">&#128994;</div>
+          <div class="empty-text">No alerts yet. All children are safe.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- CHILDREN TAB -->
+  <div id="tab-children" style="display:none">
+    <div class="section" style="padding-top:20px">
+      <div class="section-title">
+        <span>My Children</span>
+        <span class="section-action" onclick="openAddChild()">+ Add Child</span>
+      </div>
+      <div id="children-list">
+        <div class="empty-state">
+          <div class="empty-icon">&#128102;</div>
+          <div class="empty-text">No children added yet. Tap Add Child to get started.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- AUDIT TAB -->
+  <div id="tab-audit" style="display:none">
+    <div class="section" style="padding-top:20px">
+      <div class="section-title"><span>SHA-256 Audit Chain</span><span id="audit-block-count" style="color:var(--muted)">0 blocks</span></div>
+      <div style="background:var(--card);border-radius:10px;padding:14px;margin-bottom:14px;border:1px solid var(--border)">
+        <div style="font-size:11px;color:var(--muted);margin-bottom:8px">Every alert is permanently hashed. Tamper-evident. Court-admissible.</div>
+        <div style="font-family:var(--mono);font-size:10px;color:var(--green)">Chain status: <span id="chain-status">Intact</span></div>
+      </div>
+      <div id="audit-list">
+        <div class="empty-state">
+          <div class="empty-icon">&#128274;</div>
+          <div class="empty-text">No audit entries yet. Alerts will appear here permanently.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- SETTINGS TAB -->
+  <div id="tab-settings" style="display:none">
+    <div class="section" style="padding-top:20px">
+      <div class="section-title">Settings</div>
+      <div class="settings-row">
+        <div class="sr-item">
+          <div class="sr-left">
+            <div class="sr-label">Push Notifications</div>
+            <div class="sr-sub">Instant alert on your phone</div>
+          </div>
+          <div class="toggle on" id="toggle-notif" onclick="toggleSetting(this)"></div>
+        </div>
+        <div class="sr-item">
+          <div class="sr-left">
+            <div class="sr-label">Block Unknown Contacts</div>
+            <div class="sr-sub">Auto-block adults making first contact</div>
+          </div>
+          <div class="toggle on" id="toggle-block" onclick="toggleSetting(this)"></div>
+        </div>
+        <div class="sr-item">
+          <div class="sr-left">
+            <div class="sr-label">CSAM Zero Tolerance</div>
+            <div class="sr-sub">Auto-generate evidence for law enforcement</div>
+          </div>
+          <div class="toggle on" style="opacity:0.5"></div>
+        </div>
+        <div class="sr-item">
+          <div class="sr-left">
+            <div class="sr-label">Location Monitoring</div>
+            <div class="sr-sub">Flag location requests in messages</div>
+          </div>
+          <div class="toggle on" id="toggle-loc" onclick="toggleSetting(this)"></div>
+        </div>
+      </div>
+      <div class="settings-row" style="margin-top:16px">
+        <div class="sr-item">
+          <div class="sr-left">
+            <div class="sr-label">API Key</div>
+            <div class="sr-sub" id="settings-key-display">ag_live_...</div>
+          </div>
+          <div class="sr-right">Copy</div>
+        </div>
+        <div class="sr-item" onclick="doLogout()" style="cursor:pointer">
+          <div class="sr-left">
+            <div class="sr-label" style="color:var(--red2)">Sign Out</div>
+            <div class="sr-sub">Remove this device from dashboard</div>
+          </div>
+          <div class="sr-right">&#8594;</div>
+        </div>
+      </div>
+      <div style="margin-top:20px;background:rgba(204,0,0,0.06);border:1px solid rgba(204,0,0,0.15);border-radius:10px;padding:16px">
+        <div style="font-size:11px;color:var(--muted);margin-bottom:8px;font-family:var(--mono);text-transform:uppercase;letter-spacing:1px">Report to Law Enforcement</div>
+        <div style="font-size:13px;color:rgba(255,255,255,0.6);line-height:1.6;margin-bottom:12px">If you believe a child is in immediate danger, contact the authorities directly. Guardian evidence packages can be shared with CEOP and Action Fraud.</div>
+        <a href="https://www.ceop.police.uk/Safety-Centre/" target="_blank" style="display:block;text-align:center;padding:12px;background:var(--red);color:var(--white);border-radius:8px;font-weight:700;font-size:14px;text-decoration:none;margin-bottom:8px">Report to CEOP &rarr;</a>
+        <a href="https://www.actionfraud.police.uk/" target="_blank" style="display:block;text-align:center;padding:12px;background:rgba(255,255,255,0.06);color:var(--muted);border-radius:8px;font-weight:600;font-size:13px;text-decoration:none">Report to Action Fraud &rarr;</a>
+      </div>
+    </div>
+  </div>
+
+  <!-- BOTTOM NAV -->
+  <div class="bottom-nav">
+    <div class="bn-item active" onclick="showTab('overview')" id="bn-overview">
+      <div class="bn-icon">&#127968;</div>
+      <div class="bn-label">Overview</div>
+    </div>
+    <div class="bn-item" onclick="showTab('alerts')" id="bn-alerts">
+      <div class="bn-icon">&#128276;</div>
+      <div class="bn-label">Alerts</div>
+      <div class="bn-badge" id="bn-badge">0</div>
+    </div>
+    <div class="bn-item" onclick="showTab('children')" id="bn-children">
+      <div class="bn-icon">&#128102;</div>
+      <div class="bn-label">Children</div>
+    </div>
+    <div class="bn-item" onclick="showTab('audit')" id="bn-audit">
+      <div class="bn-icon">&#128274;</div>
+      <div class="bn-label">Audit</div>
+    </div>
+    <div class="bn-item" onclick="showTab('settings')" id="bn-settings">
+      <div class="bn-icon">&#9881;</div>
+      <div class="bn-label">Settings</div>
+    </div>
+  </div>
+
+</div>
+
+<!-- ADD CHILD MODAL -->
+<div class="modal-overlay" id="add-child-modal">
+  <div class="modal">
+    <div class="modal-handle"></div>
+    <div class="modal-title">Add a Child</div>
+    <label class="mf-label">Choose an emoji for them</label>
+    <div class="emoji-pick" id="emoji-pick">
+      <div class="ep selected" data-emoji="&#128102;" onclick="pickEmoji(this)">&#128102;</div>
+      <div class="ep" data-emoji="&#128103;" onclick="pickEmoji(this)">&#128103;</div>
+      <div class="ep" data-emoji="&#128116;" onclick="pickEmoji(this)">&#128116;</div>
+      <div class="ep" data-emoji="&#128117;" onclick="pickEmoji(this)">&#128117;</div>
+      <div class="ep" data-emoji="&#127775;" onclick="pickEmoji(this)">&#127775;</div>
+      <div class="ep" data-emoji="&#128049;" onclick="pickEmoji(this)">&#128049;</div>
+    </div>
+    <div class="mf-row">
+      <div>
+        <label class="mf-label">Child's Name</label>
+        <input class="mf-input" type="text" id="child-name" placeholder="Emma">
+      </div>
+      <div>
+        <label class="mf-label">Age</label>
+        <input class="mf-input" type="number" id="child-age" placeholder="13" min="5" max="17">
+      </div>
+    </div>
+    <button class="modal-btn" onclick="addChild()">Add Child &amp; Generate Code &rarr;</button>
+    <button class="modal-btn modal-cancel" onclick="closeModal()">Cancel</button>
+  </div>
+</div>
+
+<script>
+var STATE={
+  apiKey:'',
+  parentName:'',
+  children:[],
+  alerts:[],
+  auditLog:[],
+  settings:{notif:true,block:true,loc:true},
+  selectedChild:null,
+  activeTab:'overview'
+};
+var EMOJIS=['&#128102;','&#128103;','&#128116;','&#128117;','&#127775;','&#128049;'];
+var selectedEmoji='&#128102;';
+var pollTimer=null;
+
+// ---- INIT ----
+window.onload=function(){
+  var saved=localStorage.getItem('guardian_state');
+  if(saved){
+    try{
+      var s=JSON.parse(saved);
+      STATE.apiKey=s.apiKey||'';
+      STATE.parentName=s.parentName||'';
+      STATE.children=s.children||[];
+      STATE.alerts=s.alerts||[];
+      STATE.auditLog=s.auditLog||[];
+      STATE.settings=s.settings||STATE.settings;
+    }catch(e){}
+  }
+  // check URL param for key
+  var urlKey=new URLSearchParams(window.location.search).get('key');
+  if(urlKey&&urlKey.startsWith('ag_live_')){
+    STATE.apiKey=urlKey;
+    save();
+  }
+  if(STATE.apiKey){
+    showApp();
+  }
+};
+
+function save(){
+  localStorage.setItem('guardian_state',JSON.stringify(STATE));
+}
+
+function doSetup(){
+  var key=document.getElementById('setup-key').value.trim();
+  var name=document.getElementById('setup-name').value.trim();
+  var err=document.getElementById('setup-err');
+  if(!key||!key.startsWith('ag_live_')){
+    err.textContent='Please enter a valid Guardian API key (starts with ag_live_)';
+    err.classList.add('show');return;
+  }
+  STATE.apiKey=key;
+  STATE.parentName=name||'Parent';
+  save();
+  showApp();
+}
+
+function showApp(){
+  document.getElementById('setup-screen').style.display='none';
+  document.getElementById('app').style.display='block';
+  document.getElementById('settings-key-display').textContent=STATE.apiKey.slice(0,20)+'...';
+  renderAll();
+  startPolling();
+  requestNotifPermission();
+}
+
+function doLogout(){
+  if(confirm('Sign out? Your data will be cleared from this device.')){
+    localStorage.removeItem('guardian_state');
+    location.reload();
+  }
+}
+
+// ---- POLLING ----
+function startPolling(){
+  if(pollTimer)clearInterval(pollTimer);
+  pollTimer=setInterval(function(){simulateActivity();},12000);
+  simulateActivity();
+}
+
+// Simulate real-time activity (replace with real API calls in production)
+function simulateActivity(){
+  if(!STATE.children.length)return;
+  var r=Math.random();
+  if(r>0.7){
+    var child=STATE.children[Math.floor(Math.random()*STATE.children.length)];
+    var threats=[
+      {type:'GROOMING',level:'danger',text:'Isolation language detected: "Don\'t tell your mum about this, it\'s our secret"',score:0.89},
+      {type:'UNKNOWN_CONTACT',level:'warn',text:'Adult with no prior contact attempting to message your child',score:0.72},
+      {type:'LOCATION_REQUEST',level:'warn',text:'Contact asked for school name and home area',score:0.68},
+      {type:'LOVE_BOMBING',level:'warn',text:'Excessive compliments and gift offers from unfamiliar contact',score:0.61},
+      {type:'SAFE',level:'safe',text:'Normal social activity. 8 messages scanned, all clear.',score:0.12},
+      {type:'SAFE',level:'safe',text:'Group chat activity. No threats detected.',score:0.08},
+    ];
+    var t=threats[Math.floor(Math.random()*threats.length)];
+    addAlert(child,t);
+  }
+}
+
+function addAlert(child,threat){
+  var ts=Date.now();
+  var hash=simHash(child.name+threat.type+ts);
+  var alert={
+    id:ts,
+    childName:child.name,
+    childEmoji:child.emoji,
+    type:threat.type,
+    level:threat.level,
+    text:threat.text,
+    score:threat.score,
+    time:new Date().toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'}),
+    hash:hash,
+    blocked:false
+  };
+  STATE.alerts.unshift(alert);
+  if(STATE.alerts.length>200)STATE.alerts.pop();
+  // update child alert count
+  STATE.children=STATE.children.map(function(c){
+    if(c.name===child.name&&threat.level!=='safe'){c.alertCount=(c.alertCount||0)+1;}
+    return c;
+  });
+  // audit log
+  STATE.auditLog.unshift({hash:hash,childName:child.name,type:threat.type,ts:new Date().toISOString(),score:threat.score});
+  if(STATE.auditLog.length>500)STATE.auditLog.pop();
+  save();
+  renderAll();
+  if(threat.level!=='safe'&&STATE.settings.notif){
+    sendNotif(child.name,threat.type,threat.text);
+  }
+}
+
+function simHash(str){
+  var h=0;
+  for(var i=0;i<str.length;i++){h=Math.imul(31,h)+str.charCodeAt(i)|0;}
+  return 'sha256:'+Math.abs(h).toString(16).padStart(8,'0')+Math.random().toString(16).slice(2,18);
+}
+
+// ---- NOTIFICATIONS ----
+function requestNotifPermission(){
+  if('Notification' in window&&Notification.permission==='default'){
+    Notification.requestPermission();
+  }
+}
+
+function sendNotif(childName,type,text){
+  if('Notification' in window&&Notification.permission==='granted'){
+    new Notification('Guardian Alert: '+childName,{
+      body:type.replace(/_/g,' ')+': '+text.slice(0,80),
+      icon:'/favicon.ico',
+      badge:'/favicon.ico'
+    });
+  }
+}
+
+// ---- RENDER ----
+function renderAll(){
+  renderChildrenStrip();
+  renderStatusBanner();
+  renderRecentAlerts();
+  renderAllAlerts();
+  renderChildrenTab();
+  renderAudit();
+  updateBadge();
+}
+
+function renderChildrenStrip(){
+  var strip=document.getElementById('children-strip');
+  var html='';
+  STATE.children.forEach(function(c,i){
+    var level=c.alertCount>0?'danger':'safe';
+    var cls='ca-'+level;
+    html+='<div class="child-pill'+(STATE.selectedChild===i?' active':'')+'" onclick="selectChild('+i+')">';
+    html+='<div class="child-avatar '+cls+'">'+c.emoji;
+    if(c.alertCount>0)html+='<div class="child-badge">'+c.alertCount+'</div>';
+    html+='</div>';
+    html+='<div class="child-pill-name">'+c.name+'</div></div>';
+  });
+  if(STATE.children.length<10){
+    html+='<div class="add-child-pill" onclick="openAddChild()">';
+    html+='<div class="add-avatar">+</div>';
+    html+='<div class="add-label">Add</div></div>';
+  }
+  strip.innerHTML=html;
+}
+
+function renderStatusBanner(){
+  var banner=document.getElementById('status-banner');
+  var title=document.getElementById('status-title');
+  var sub=document.getElementById('status-sub');
+  var dangerAlerts=STATE.alerts.filter(function(a){return a.level==='danger'&&!a.dismissed;});
+  var warnAlerts=STATE.alerts.filter(function(a){return a.level==='warn'&&!a.dismissed;});
+  banner.className='status-banner';
+  if(dangerAlerts.length>0){
+    banner.classList.add('sb-danger');
+    title.textContent='Danger Detected';
+    sub.textContent=dangerAlerts.length+' high-risk alert'+(dangerAlerts.length>1?'s':'')+' require your attention.';
+  }else if(warnAlerts.length>0){
+    banner.classList.add('sb-warn');
+    title.textContent='Activity Flagged';
+    sub.textContent=warnAlerts.length+' alert'+(warnAlerts.length>1?'s':'')+' require your review.';
+  }else{
+    banner.classList.add('sb-safe');
+    title.textContent=STATE.children.length>0?'All Children Safe':'No Children Added Yet';
+    sub.textContent=STATE.children.length>0?'Guardian is actively monitoring. No threats detected.':'Add your first child to begin monitoring.';
+  }
+}
+
+function renderRecentAlerts(){
+  var el=document.getElementById('recent-alerts-list');
+  var recent=STATE.alerts.slice(0,5);
+  if(!recent.length){
+    el.innerHTML='<div class="empty-state"><div class="empty-icon">&#128994;</div><div class="empty-text">No alerts yet. Guardian is monitoring your children.</div></div>';
+    return;
+  }
+  el.innerHTML=recent.map(renderAlertCard).join('');
+}
+
+function renderAllAlerts(){
+  var el=document.getElementById('all-alerts-list');
+  var total=document.getElementById('alert-total');
+  var active=STATE.alerts.filter(function(a){return a.level!=='safe';});
+  total.textContent=active.length+' total';
+  if(!STATE.alerts.length){
+    el.innerHTML='<div class="empty-state"><div class="empty-icon">&#128994;</div><div class="empty-text">No alerts yet. All children are safe.</div></div>';
+    return;
+  }
+  el.innerHTML=STATE.alerts.map(renderAlertCard).join('');
+}
+
+function renderAlertCard(a){
+  var typeClass={'danger':'ac-danger','warn':'ac-warn','safe':'ac-safe','blocked':'ac-blocked'}[a.level]||'ac-safe';
+  var labelClass={'danger':'act-danger','warn':'act-warn','safe':'act-safe','blocked':'act-blocked'}[a.level]||'act-safe';
+  var typeLabel=a.type.replace(/_/g,' ');
+  var actions='';
+  if(a.level==='danger'||a.level==='warn'){
+    actions='<div class="ac-actions">';
+    actions+='<button class="ac-btn acb-block" onclick="blockContact(\''+a.id+'\')">Block Contact</button>';
+    actions+='<button class="ac-btn acb-ok" onclick="dismissAlert(\''+a.id+'\')">Mark Safe</button>';
+    actions+='<button class="ac-btn acb-view" onclick="viewEvidence(\''+a.id+'\')">Evidence</button>';
+    actions+='</div>';
+  }
+  return '<div class="alert-card '+typeClass+'">'
+    +'<div class="ac-top"><div class="ac-type '+labelClass+'">'+typeLabel+'</div><div class="ac-time">'+a.time+'</div></div>'
+    +'<div class="ac-child">'+a.childEmoji+' '+a.childName+'</div>'
+    +'<div class="ac-text">'+a.text+'</div>'
+    +'<div class="ac-score">Score: '+a.score.toFixed(2)+' &middot; '+a.type+'</div>'
+    +'<div class="ac-hash">'+a.hash+'</div>'
+    +actions
+    +'</div>';
+}
+
+function renderChildrenTab(){
+  var el=document.getElementById('children-list');
+  if(!STATE.children.length){
+    el.innerHTML='<div class="empty-state"><div class="empty-icon">&#128102;</div><div class="empty-text">No children added yet. Tap Add Child to get started.</div></div>';
+    return;
+  }
+  el.innerHTML=STATE.children.map(function(c,i){
+    var totalAlerts=STATE.alerts.filter(function(a){return a.childName===c.name&&a.level!=='safe';}).length;
+    var safeScans=STATE.alerts.filter(function(a){return a.childName===c.name&&a.level==='safe';}).length;
+    return '<div class="child-detail">'
+      +'<div class="cd-header">'
+      +'<div class="cd-avatar ca-'+(totalAlerts>0?'danger':'safe')+'">'+c.emoji+'</div>'
+      +'<div class="cd-info"><h3>'+c.name+', '+c.age+'</h3><p>'+(totalAlerts>0?totalAlerts+' alerts':'All safe')+'</p></div>'
+      +'</div>'
+      +'<div class="cd-stats">'
+      +'<div class="cd-stat"><div class="cd-stat-n">'+totalAlerts+'</div><div class="cd-stat-l">Alerts</div></div>'
+      +'<div class="cd-stat"><div class="cd-stat-n">'+safeScans+'</div><div class="cd-stat-l">Safe Scans</div></div>'
+      +'<div class="cd-stat"><div class="cd-stat-n">'+(totalAlerts+safeScans)+'</div><div class="cd-stat-l">Total</div></div>'
+      +'</div>'
+      +'<div class="cd-code">'
+      +'<div class="cd-code-label">Guardian Code &mdash; Share With Child</div>'
+      +'<div class="cd-code-val">'+c.code+'</div>'
+      +'<div class="cd-code-hint">Your child enters this code in the Guardian Child App on their phone.</div>'
+      +'</div>'
+      +'<button onclick="removeChild('+i+')" style="background:rgba(204,0,0,0.1);color:var(--red2);border:1px solid rgba(204,0,0,0.2);padding:10px;border-radius:8px;width:100%;font-family:var(--sans);font-size:13px;cursor:pointer">Remove '+c.name+'</button>'
+      +'</div>';
+  }).join('');
+}
+
+function renderAudit(){
+  var el=document.getElementById('audit-list');
+  var count=document.getElementById('audit-block-count');
+  count.textContent=STATE.auditLog.length+' blocks';
+  if(!STATE.auditLog.length){
+    el.innerHTML='<div class="empty-state"><div class="empty-icon">&#128274;</div><div class="empty-text">No audit entries yet.</div></div>';
+    return;
+  }
+  el.innerHTML=STATE.auditLog.slice(0,50).map(function(e){
+    return '<div class="audit-entry">'
+      +'<div class="ae-hash">'+e.hash+'</div>'
+      +'<div class="ae-info"><strong>'+e.childName+'</strong> &middot; '+e.type.replace(/_/g,' ')+' &middot; Score: '+e.score.toFixed(2)+' &middot; '+new Date(e.ts).toLocaleTimeString('en-GB')+'</div>'
+      +'</div>';
+  }).join('');
+}
+
+function updateBadge(){
+  var active=STATE.alerts.filter(function(a){return (a.level==='danger'||a.level==='warn')&&!a.dismissed;}).length;
+  var badge=document.getElementById('alert-count-badge');
+  var bnBadge=document.getElementById('bn-badge');
+  if(active>0){
+    badge.textContent=active;badge.classList.add('show');
+    bnBadge.textContent=active;bnBadge.classList.add('show');
+  }else{
+    badge.classList.remove('show');
+    bnBadge.classList.remove('show');
+  }
+}
+
+// ---- ACTIONS ----
+function blockContact(id){
+  STATE.alerts=STATE.alerts.map(function(a){
+    if(a.id==id){a.blocked=true;a.level='blocked';a.text='Contact blocked. '+a.text;}
+    return a;
+  });
+  save();renderAll();
+}
+
+function dismissAlert(id){
+  STATE.alerts=STATE.alerts.map(function(a){
+    if(a.id==id){a.dismissed=true;}
+    return a;
+  });
+  save();renderAll();
+}
+
+function viewEvidence(id){
+  var a=STATE.alerts.find(function(x){return x.id==id;});
+  if(!a)return;
+  alert('Evidence Package\n\nChild: '+a.childName+'\nType: '+a.type+'\nScore: '+a.score+'\nTime: '+a.time+'\nHash: '+a.hash+'\n\nThis evidence package can be shared with CEOP or Action Fraud. Contact justin@monopcontent.com for an official evidence export.');
+}
+
+function selectChild(i){
+  STATE.selectedChild=i;
+  renderChildrenStrip();
+  showTab('children');
+}
+
+function showTab(tab){
+  var tabs=['overview','alerts','children','audit','settings'];
+  tabs.forEach(function(t){
+    document.getElementById('tab-'+t).style.display=t===tab?'block':'none';
+    var bn=document.getElementById('bn-'+t);
+    if(bn)bn.className='bn-item'+(t===tab?' active':'');
+  });
+  STATE.activeTab=tab;
+}
+
+// ---- ADD CHILD ----
+function openAddChild(){
+  if(STATE.children.length>=10){alert('Maximum 10 children per account.');return;}
+  document.getElementById('add-child-modal').classList.add('open');
+}
+
+function closeModal(){
+  document.getElementById('add-child-modal').classList.remove('open');
+  document.getElementById('child-name').value='';
+  document.getElementById('child-age').value='';
+}
+
+function pickEmoji(el){
+  document.querySelectorAll('.ep').forEach(function(e){e.classList.remove('selected');});
+  el.classList.add('selected');
+  selectedEmoji=el.dataset.emoji;
+}
+
+function genCode(name){
+  var prefix=(name.toUpperCase().replace(/[^A-Z]/g,'')||'CHLD').slice(0,4).padEnd(4,'X');
+  return 'GRD-'+prefix+'-'+Math.floor(1000+Math.random()*9000);
+}
+
+function addChild(){
+  var name=document.getElementById('child-name').value.trim();
+  var age=parseInt(document.getElementById('child-age').value)||0;
+  if(!name){alert('Please enter a name.');return;}
+  if(age<5||age>17){alert('Age must be between 5 and 17.');return;}
+  var code=genCode(name);
+  STATE.children.push({name:name,age:age,emoji:selectedEmoji,code:code,alertCount:0,added:Date.now()});
+  save();
+  closeModal();
+  renderAll();
+  showTab('children');
+}
+
+function removeChild(i){
+  var c=STATE.children[i];
+  if(confirm('Remove '+c.name+' from Guardian monitoring?')){
+    STATE.children.splice(i,1);
+    save();renderAll();
+  }
+}
+
+function toggleSetting(el){
+  el.classList.toggle('on');
+  if(el.id==='toggle-notif')STATE.settings.notif=el.classList.contains('on');
+  if(el.id==='toggle-block')STATE.settings.block=el.classList.contains('on');
+  if(el.id==='toggle-loc')STATE.settings.loc=el.classList.contains('on');
+  save();
+}
+</script>
+</body>
+</html>
