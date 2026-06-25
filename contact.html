@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Contact &mdash; Monop Content</title>
+<meta name="description" content="Get in touch with Monop Content about AILeash, Guardian, SonicBoom or Sentinel.">
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;900&family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--navy:#0a0f1e;--gold:#c9a84c;--green:#00875a;--red:#cc0000;--white:#fff;--off:#f5f7fa;--border:#e2e8f0;--muted:#64748b;--text:#1a202c;--mono:'JetBrains Mono',monospace;--sans:'DM Sans',sans-serif;--display:'Playfair Display',serif}
+html,body{background:var(--off);color:var(--text);font-family:var(--sans);min-height:100vh}
+nav{background:var(--navy);padding:0 48px;height:68px;display:flex;align-items:center;justify-content:space-between}
+.nav-logo{font-family:var(--display);font-size:22px;color:var(--white);font-weight:900;text-decoration:none}.nav-logo span{color:var(--gold)}
+.nav-back{color:rgba(255,255,255,0.5);text-decoration:none;font-size:13px;font-weight:500}
+.nav-back:hover{color:var(--white)}
+.page{max-width:600px;margin:0 auto;padding:60px 24px}
+.page-label{font-family:var(--mono);font-size:10px;letter-spacing:3px;text-transform:uppercase;color:var(--gold);margin-bottom:12px}
+h1{font-family:var(--display);font-size:clamp(32px,4vw,48px);font-weight:900;color:var(--navy);margin-bottom:12px;line-height:1.1}
+h1 em{color:var(--gold);font-style:normal}
+.page-sub{font-size:15px;color:var(--muted);line-height:1.75;margin-bottom:40px}
+.form-card{background:var(--white);border:1px solid var(--border);border-radius:8px;padding:36px}
+.fg{margin-bottom:16px}
+.fg label{display:block;font-family:var(--mono);font-size:9px;color:var(--muted);letter-spacing:2px;text-transform:uppercase;margin-bottom:6px}
+.fg input,.fg select,.fg textarea{width:100%;background:var(--off);border:2px solid var(--border);color:var(--text);padding:12px 14px;font-size:14px;font-family:var(--sans);outline:none;border-radius:4px;transition:border-color .2s}
+.fg input:focus,.fg select:focus,.fg textarea:focus{border-color:var(--navy)}
+.fg input::placeholder,.fg textarea::placeholder{color:#bbb}
+.fg textarea{resize:vertical;min-height:120px;line-height:1.6}
+.fg-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.submit-btn{width:100%;padding:14px;font-size:15px;font-weight:700;border-radius:4px;border:none;cursor:pointer;font-family:var(--sans);background:var(--gold);color:var(--navy);margin-top:8px;transition:background .2s}
+.submit-btn:hover{background:#e8c96a}
+.submit-btn:disabled{opacity:0.5;cursor:not-allowed}
+.msg-ok{display:none;color:var(--green);font-family:var(--mono);font-size:11px;margin-top:12px;padding:12px;background:#f0fff8;border-radius:4px;border:1px solid #bbf7d0}
+.msg-ok.show{display:block}
+.msg-err{display:none;color:var(--red);font-family:var(--mono);font-size:11px;margin-top:12px;padding:12px;background:#fff0f0;border-radius:4px;border:1px solid #ffcccc}
+.msg-err.show{display:block}
+.direct{margin-top:32px;background:var(--navy);border-radius:8px;padding:28px}
+.direct-label{font-family:var(--mono);font-size:9px;color:rgba(255,255,255,0.3);letter-spacing:2px;text-transform:uppercase;margin-bottom:16px}
+.direct-item{display:flex;align-items:center;gap:12px;margin-bottom:12px}
+.direct-item:last-child{margin:0}
+.di-icon{font-size:18px;flex-shrink:0}
+.di-text{font-size:14px;color:rgba(255,255,255,0.6)}
+.di-text a{color:var(--gold);text-decoration:none}
+@media(max-width:600px){
+  nav{padding:0 20px}
+  .page{padding:40px 16px}
+  .form-card{padding:24px}
+  .fg-row{grid-template-columns:1fr}
+}
+</style>
+</head>
+<body>
+
+<nav>
+  <a href="/" class="nav-logo">Monop <span>Content</span></a>
+  <a href="/" class="nav-back">&larr; Back to Platform</a>
+</nav>
+
+<div class="page">
+  <div class="page-label">Get In Touch</div>
+  <h1>Send us a <em>message.</em></h1>
+  <p class="page-sub">Questions about AILeash, Guardian, SonicBoom or Sentinel. Partnership enquiries. Press. Anything. We reply within 24 hours.</p>
+
+  <div class="form-card">
+    <div class="fg-row">
+      <div class="fg"><label>First Name</label><input type="text" id="fn" placeholder="Jane"></div>
+      <div class="fg"><label>Last Name</label><input type="text" id="ln" placeholder="Smith"></div>
+    </div>
+    <div class="fg"><label>Email Address</label><input type="email" id="em" placeholder="you@company.com"></div>
+    <div class="fg"><label>Phone (optional)</label><input type="tel" id="ph" placeholder="+44 7700 000000"></div>
+    <div class="fg"><label>Organisation</label><input type="text" id="org" placeholder="Company or platform name"></div>
+    <div class="fg"><label>Message</label><textarea id="msg" placeholder="Tell us what you need..."></textarea></div>
+    <button class="submit-btn" id="submit-btn" onclick="doSubmit()">Send Message &rarr;</button>
+    <div class="msg-ok" id="msg-ok">Message sent. We will reply within 24 hours.</div>
+    <div class="msg-err" id="msg-err">Something went wrong. Email justin@monopcontent.com directly.</div>
+  </div>
+
+  <div class="direct">
+    <div class="direct-label">Or contact directly</div>
+    <div class="direct-item">
+      <div class="di-icon">&#9993;</div>
+      <div class="di-text"><a href="mailto:justin@monopcontent.com">justin@monopcontent.com</a></div>
+    </div>
+    <div class="direct-item">
+      <div class="di-icon">&#128222;</div>
+      <div class="di-text"><a href="tel:07908269428">07908 269428</a></div>
+    </div>
+    <div class="direct-item">
+      <div class="di-icon">&#127968;</div>
+      <div class="di-text" style="color:rgba(255,255,255,0.4)">Monop Content &middot; Blyth, Northumberland, UK</div>
+    </div>
+  </div>
+</div>
+
+<script>
+async function doSubmit(){
+  var fn=document.getElementById('fn').value.trim();
+  var ln=document.getElementById('ln').value.trim();
+  var em=document.getElementById('em').value.trim();
+  var ph=document.getElementById('ph').value.trim();
+  var org=document.getElementById('org').value.trim();
+  var msg=document.getElementById('msg').value.trim();
+  var ok=document.getElementById('msg-ok');
+  var err=document.getElementById('msg-err');
+  var btn=document.getElementById('submit-btn');
+  ok.classList.remove('show');err.classList.remove('show');
+  if(!em||!em.includes('@')){err.textContent='Please enter a valid email address.';err.classList.add('show');return;}
+  if(!msg){err.textContent='Please enter a message.';err.classList.add('show');return;}
+  btn.disabled=true;btn.textContent='Sending...';
+  try{
+    var r=await fetch('/contact',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({name:fn+' '+ln,email:em,phone:ph,org:org,message:msg})});
+    var d=await r.json();
+    if(d.ok){
+      ok.classList.add('show');
+      btn.textContent='Sent';
+      document.getElementById('fn').value='';
+      document.getElementById('ln').value='';
+      document.getElementById('em').value='';
+      document.getElementById('ph').value='';
+      document.getElementById('org').value='';
+      document.getElementById('msg').value='';
+    }else{
+      err.textContent=d.error||'Something went wrong. Email justin@monopcontent.com directly.';
+      err.classList.add('show');btn.disabled=false;btn.textContent='Send Message \u2192';
+    }
+  }catch(e){
+    err.classList.add('show');btn.disabled=false;btn.textContent='Send Message \u2192';
+  }
+}
+</script>
+</body>
+</html>
