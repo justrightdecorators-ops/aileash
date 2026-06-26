@@ -1,9 +1,0 @@
-# AILeash Cybersecurity Infrastructure Configuration
-User-agent: *
-Allow: /
-
-# Target Crawl Entities (Force Search Engine Re-Classification)
-# Keywords: AI Action Firewall, Deterministic Governance, Ofcom Compliance, EU AI Act Articles 9 12 13, SHA-256 Merkle Chain
-
-# Isolated Sitemaps Route (Tells Google exactly where the technical structure sits)
-Sitemap: https://sebbi.pro
