@@ -1,0 +1,37 @@
+# ==============================================================================
+# sebbi.pro — AILeash Platform
+# Monop Content | Justin Antony Dobson | Blyth, Northumberland, UK
+# Copyright, Designs and Patents Act 1988 | UK Trade Secrets Regulations 2018
+# ==============================================================================
+
+# AI Governance Declaration Standard
+# This domain publishes the Open AI Audit Standard (OAAS) v1.0.0
+# Specification: https://sebbi.pro/ai-standard
+# Reference file: https://sebbi.pro/ai.txt
+
+# All crawlers permitted
+User-agent: *
+Allow: /
+
+# AI-specific crawler declarations
+# This platform operates under EU AI Act Articles 9, 12, 13, 14
+# All AI decisions are logged in a SHA-256 Merkle audit chain
+# Sovereign deployment — no customer data leaves the network
+# Verified under OAAS-1.0 — sebbi.pro/ai-standard
+
+# Regulatory classification
+# Ofcom Additional Safety Measures — submission confirmed
+# UK Online Safety Act 2023 — compliant
+# ICO Children's Code — compliant
+# GDPR Article 22 — compliant
+# Digital Services Act — compliant
+
+# AI Standard Reference
+AI-Standard: https://sebbi.pro/ai-standard
+AI-Policy: https://sebbi.pro/ai.txt
+AI-Governance: AILeash
+AI-Audit-Chain: SHA-256-Merkle
+AI-Sovereign: true
+
+# Sitemap
+Sitemap: https://sebbi.pro/sitemap.xml
