@@ -1,0 +1,44 @@
+# ai.txt — AI Governance Declaration
+# Standard v1.0.0 | sebbi.pro/ai-standard
+# Place this file at: yourdomain.com/ai.txt
+# Published by: Monop Content, Blyth, Northumberland, UK
+
+# ── IDENTITY ──────────────────────────────────
+AI-Org:            Monop Content
+AI-Contact:        justrightdecorators@gmail.com
+AI-Policy:         https://sebbi.pro/whitepaper
+
+# ── GOVERNANCE ────────────────────────────────
+AI-Governance:     AILeash
+AI-Standard:       OAAS-1.0
+AI-Audit-Chain:    verified
+AI-Chain-Algo:     SHA-256-Merkle
+AI-Sovereign:      true
+
+# ── REGULATORY COMPLIANCE ─────────────────────
+AI-EU-Act:         compliant   # Art. 9, 12, 13, 14
+AI-UK-OSA:         compliant   # Online Safety Act 2023
+AI-GDPR:           compliant   # Art. 22 automated decisions
+AI-DSA:            compliant   # Digital Services Act
+AI-ICO-Code:       compliant   # Children's Code
+
+# ── RISK CLASSIFICATION ───────────────────────
+AI-Risk-Class:     limited
+AI-Human-Override: enabled
+AI-Decision-Log:   tamper-evident
+AI-Explainability: enabled
+
+# ── DATA SOVEREIGNTY ──────────────────────────
+AI-Data-Location:  GB
+AI-Third-Party:    none
+AI-Training-Data:  proprietary
+
+# ── VERIFICATION ──────────────────────────────
+AI-Verified-By:    AILeash
+AI-Verified-Date:  2026-06-26
+AI-Verify-URL:     https://sebbi.pro/api/verify-chain
+
+# ── STANDARD REFERENCE ────────────────────────
+# This file conforms to the Open AI Audit Standard (OAAS) v1.0.0
+# Specification: https://sebbi.pro/ai-standard
+# To generate your own verified ai.txt: https://sebbi.pro/#signup
