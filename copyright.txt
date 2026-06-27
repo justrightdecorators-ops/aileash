@@ -1,0 +1,75 @@
+# COPYRIGHT.TXT — Copyright and Originality Declaration
+# sebbi.pro | Monop Content | Justin Antony Dobson
+# Published: June 2026
+# Linked to: sebbi.pro/ai.txt | sebbi.pro/dis.txt | sebbi.pro/legal.txt
+# Verification: sebbi.pro/api/verify-chain
+
+## Automatic Copyright Notice
+
+Under the Copyright, Designs and Patents Act 1988, copyright in an original work arises automatically upon creation. No registration is required. The following original works are the intellectual property of Justin Antony Dobson, trading as Monop Content, from the date of their creation.
+
+## Original Works Declared
+
+COPYRIGHT-001: OAAS-1.0 — Open AI Audit Standard
+The concept, structure, format, and specific wording of the Open AI Audit Standard, including the ai.txt declaration format, is an original work created by Justin Antony Dobson in June 2026. First published at sebbi.pro/ai.txt.
+
+COPYRIGHT-002: dis.txt — Disinformation Protection Standard
+The concept, structure, and format of a machine-readable disinformation protection declaration file linked to a cryptographic audit chain is an original work created by Justin Antony Dobson in June 2026. First published at sebbi.pro/dis.txt.
+
+COPYRIGHT-003: legal.txt — Legal Declaration Standard
+The concept, structure, and format of a machine-readable legal declaration file linked to a cryptographic audit chain is an original work created by Justin Antony Dobson in June 2026. First published at sebbi.pro/legal.txt.
+
+COPYRIGHT-004: copyright.txt — Copyright Declaration Standard
+The concept, structure, and format of this file is an original work created by Justin Antony Dobson in June 2026. First published at sebbi.pro/copyright.txt.
+
+COPYRIGHT-005: AILeash Platform
+The AILeash platform including its governance engine, 9-signal weighted scoring system, SHA-256 Merkle audit chain implementation, trust decay model, velocity tracking system, and sovereign deployment architecture is an original work created by Justin Antony Dobson between 2021 and 2026.
+
+COPYRIGHT-006: AILeash Guardian
+The AILeash Guardian child safety platform including its grooming detection methodology, parent PWA dashboard, and evidence chain implementation is an original work created by Justin Antony Dobson.
+
+COPYRIGHT-007: SonicBoom
+The SonicBoom speed and compliance layer concept and implementation is an original work created by Justin Antony Dobson.
+
+COPYRIGHT-008: AILeash Sentinel
+The AILeash Sentinel fraud and anomaly detection platform is an original work created by Justin Antony Dobson.
+
+## What Is Protected
+
+The following are protected by copyright and may not be reproduced, copied, or distributed without permission:
+
+- The specific wording, format, and structure of ai.txt, dis.txt, legal.txt, and copyright.txt
+- The source code of server.py, engine.py, and all associated platform files
+- The specific implementation of the SHA-256 Merkle chain audit system as built by Justin Antony Dobson
+- All HTML, CSS, and JavaScript files published at sebbi.pro
+- The OAAS-1.0 standard document published at sebbi.pro/ai-standard
+
+## What Is Not Restricted
+
+Others may:
+- Build their own AI compliance products using different code and different approaches
+- Implement the general concept of AI audit chains using their own implementations
+- Reference OAAS-1.0 provided they attribute authorship to Justin Antony Dobson
+
+Others may not:
+- Copy the specific format of these declaration files and present them as their own
+- Reproduce the source code of the AILeash platform without permission
+- Claim authorship or co-authorship of OAAS-1.0 or any of the above works
+
+## Prior Art Declaration
+
+This file, combined with the SHA-256 Merkle chain at sebbi.pro/api/verify-chain, constitutes a timestamped prior art declaration. The chain provides cryptographic proof of the date and content of all original works listed above.
+
+If any third party seeks to patent, trademark, or claim ownership of concepts substantially similar to those listed above after the publication date of this file, this declaration and the associated Merkle chain evidence will be submitted as prior art.
+
+## Linked Files
+
+ai.txt: https://sebbi.pro/ai.txt
+dis.txt: https://sebbi.pro/dis.txt
+legal.txt: https://sebbi.pro/legal.txt
+copyright.txt: https://sebbi.pro/copyright.txt
+Verification: https://sebbi.pro/api/verify-chain
+
+© 2026 Justin Antony Dobson / Monop Content
+Blyth, Northumberland, United Kingdom
+All rights reserved under the Copyright, Designs and Patents Act 1988.
