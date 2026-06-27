@@ -23,6 +23,8 @@ OWNER_PHONE="07908 269428"
 SAFE={"UK","US","DE","FR","CA","AU","NL","SE","NO","DK","FI","IE","NZ"}
 REQ={"user_id","action","amount","country","device_id","anomaly","device_risk"}
 FREE_QUOTA=100
+ADMIN_PASSWORD=os.environ.get("ADMIN_PASSWORD","Racecar198066")
+_admin_tokens=set()
 STRIPE_PRICE_AL=""
 STRIPE_PRICE_GU=""
 STRIPE_PRICE_SB=""
@@ -1149,6 +1151,18 @@ class Handler(BaseHTTPRequestHandler):
             c=load_file("certificate.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
         elif path=="/registry":
             c=load_file("registry.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
+            elif path=="/aileash-compliance.zip":
+            try:
+                with open("aileash-compliance.zip","rb") as f:body=f.read()
+                self.send_response(200)
+                self.send_header("Content-Type","application/zip")
+                self.send_header("Content-Disposition",'attachment; filename="aileash-compliance.zip"')
+                self.send_header("Content-Length",str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except:send_json(self,{"error":"not found"},404)
+        elif path=="/admin":
+            c=load_file("admin.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
         elif path=="/referrals":
             code=qs.get("code",[""])[0].strip().upper()
             send_html(self,referrals_page(code))
