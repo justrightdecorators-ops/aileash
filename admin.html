@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>AILeash Admin</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--navy:#0a0f1e;--gold:#c9a84c;--green:#00e5a0;--red:#ff4757;--bg:#07070f;--surface:#10101a;--border:#1a1a2a;--text:#e0e0f0;--muted:#5a5a70;--mono:'JetBrains Mono',monospace}
+body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;min-height:100vh}
+
+/* LOGIN */
+#login-screen{display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
+.login-box{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:40px;width:100%;max-width:380px}
+.login-logo{font-size:20px;font-weight:900;color:var(--gold);margin-bottom:4px;letter-spacing:-0.5px}
+.login-sub{font-size:12px;color:var(--muted);margin-bottom:32px;font-family:var(--mono);letter-spacing:0.05em}
+.login-label{font-size:11px;color:var(--muted);font-family:var(--mono);letter-spacing:0.1em;text-transform:uppercase;margin-bottom:8px;display:block}
+.login-input{width:100%;background:#0a0a14;border:1px solid var(--border);color:var(--text);padding:12px 14px;font-size:14px;border-radius:6px;outline:none;margin-bottom:16px;transition:border-color .2s}
+.login-input:focus{border-color:var(--gold)}
+.login-btn{width:100%;background:var(--gold);color:#000;border:none;padding:13px;font-size:14px;font-weight:700;border-radius:6px;cursor:pointer;transition:background .2s}
+.login-btn:hover{background:#e0c055}
+.login-err{color:var(--red);font-size:12px;font-family:var(--mono);margin-top:12px;display:none}
+.login-err.show{display:block}
+.forgot-link{display:block;text-align:center;margin-top:16px;font-size:12px;color:var(--muted);cursor:pointer;text-decoration:underline}
+.forgot-link:hover{color:var(--gold)}
+
+/* FORGOT */
+#forgot-screen{display:none;align-items:center;justify-content:center;min-height:100vh;padding:20px}
+.forgot-box{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:40px;width:100%;max-width:380px}
+.forgot-box h2{font-size:18px;font-weight:700;margin-bottom:8px}
+.forgot-box p{font-size:13px;color:var(--muted);margin-bottom:24px;line-height:1.6}
+.back-link{display:block;text-align:center;margin-top:16px;font-size:12px;color:var(--muted);cursor:pointer;text-decoration:underline}
+.back-link:hover{color:var(--gold)}
+.forgot-status{font-size:12px;font-family:var(--mono);margin-top:12px;color:var(--green);display:none}
+.forgot-status.show{display:block}
+
+/* DASHBOARD */
+#dashboard{display:none;flex-direction:column;min-height:100vh}
+.topbar{background:var(--surface);border-bottom:1px solid var(--border);padding:0 20px;height:52px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:10}
+.topbar-logo{font-size:16px;font-weight:900;color:var(--gold)}
+.topbar-right{display:flex;align-items:center;gap:16px}
+.topbar-time{font-family:var(--mono);font-size:11px;color:var(--muted)}
+.logout-btn{background:none;border:1px solid var(--border);color:var(--muted);padding:6px 12px;border-radius:4px;font-size:11px;cursor:pointer;font-family:var(--mono);transition:all .2s}
+.logout-btn:hover{border-color:var(--red);color:var(--red)}
+
+.dash-inner{padding:20px;max-width:1100px;margin:0 auto;width:100%}
+
+/* STATS ROW */
+.stats-row{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:24px}
+.stat-card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:18px 20px}
+.stat-card-label{font-size:10px;font-family:var(--mono);color:var(--muted);text-transform:uppercase;letter-spacing:0.1em;margin-bottom:8px}
+.stat-card-value{font-size:28px;font-weight:700;line-height:1}
+.stat-card-value.gold{color:var(--gold)}
+.stat-card-value.green{color:var(--green)}
+.stat-card-value.red{color:var(--red)}
+.stat-card-value.white{color:var(--text)}
+
+/* SECTION */
+.section{background:var(--surface);border:1px solid var(--border);border-radius:8px;margin-bottom:20px;overflow:hidden}
+.section-header{padding:14px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
+.section-title{font-size:13px;font-weight:600;font-family:var(--mono);color:var(--gold);letter-spacing:0.05em;text-transform:uppercase}
+.section-count{font-size:11px;color:var(--muted);font-family:var(--mono)}
+
+/* TABLE */
+.table-wrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{padding:10px 16px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em;border-bottom:1px solid var(--border);white-space:nowrap}
+td{padding:11px 16px;border-bottom:1px solid rgba(255,255,255,0.04);vertical-align:middle;white-space:nowrap}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:rgba(255,255,255,0.02)}
+
+.badge{display:inline-block;padding:2px 8px;border-radius:3px;font-family:var(--mono);font-size:10px;font-weight:600;letter-spacing:0.05em}
+.badge-paid{background:rgba(0,229,160,0.15);color:var(--green);border:1px solid rgba(0,229,160,0.2)}
+.badge-free{background:rgba(201,168,76,0.1);color:var(--gold);border:1px solid rgba(201,168,76,0.15)}
+.badge-al{background:rgba(201,168,76,0.1);color:var(--gold)}
+.badge-gu{background:rgba(255,71,87,0.1);color:var(--red)}
+.badge-sb{background:rgba(0,212,255,0.1);color:#00d4ff}
+.badge-se{background:rgba(124,58,237,0.1);color:#a78bfa}
+
+.email-cell{font-family:var(--mono);font-size:11px;color:var(--text)}
+.name-cell{color:var(--text)}
+.muted-cell{color:var(--muted);font-family:var(--mono);font-size:11px}
+.usage-bar-wrap{display:flex;align-items:center;gap:8px}
+.usage-bar{height:4px;background:var(--border);border-radius:2px;width:60px;overflow:hidden}
+.usage-bar-fill{height:100%;background:var(--gold);border-radius:2px;transition:width .3s}
+.usage-bar-fill.full{background:var(--green)}
+
+/* LOADING */
+.loading{padding:40px;text-align:center;color:var(--muted);font-family:var(--mono);font-size:12px}
+.dot-anim::after{content:'...';animation:dots 1.5s infinite}
+@keyframes dots{0%{content:'.'}33%{content:'..'}66%{content:'...'}}
+
+/* REFERRAL TABLE */
+.ref-earn{color:var(--green);font-family:var(--mono);font-size:12px}
+
+/* CHAIN STATUS */
+.chain-ok{color:var(--green);font-family:var(--mono);font-size:12px}
+.chain-err{color:var(--red);font-family:var(--mono);font-size:12px}
+
+/* REFRESH */
+.refresh-btn{background:none;border:1px solid var(--border);color:var(--muted);padding:5px 10px;border-radius:4px;font-size:10px;cursor:pointer;font-family:var(--mono);transition:all .2s}
+.refresh-btn:hover{border-color:var(--gold);color:var(--gold)}
+
+@media(max-width:700px){
+  .stats-row{grid-template-columns:1fr 1fr}
+  .topbar-time{display:none}
+  td,th{padding:9px 10px}
+}
+@media(max-width:400px){
+  .stats-row{grid-template-columns:1fr}
+}
+</style>
+</head>
+<body>
+
+<!-- LOGIN -->
+<div id="login-screen">
+  <div class="login-box">
+    <div class="login-logo">AILeash Admin</div>
+    <div class="login-sub">// sebbi.pro · restricted access</div>
+    <label class="login-label">Password</label>
+    <input class="login-input" type="password" id="pw-input" placeholder="Enter admin password" onkeydown="if(event.key==='Enter')doLogin()">
+    <button class="login-btn" onclick="doLogin()">Sign In →</button>
+    <div class="login-err" id="login-err">Incorrect password.</div>
+    <span class="forgot-link" onclick="showForgot()">Forgot password?</span>
+  </div>
+</div>
+
+<!-- FORGOT -->
+<div id="forgot-screen" style="display:none;align-items:center;justify-content:center;min-height:100vh;padding:20px">
+  <div class="forgot-box">
+    <h2>Reset Password</h2>
+    <p>Enter the email address on the account and we will send reset instructions.</p>
+    <label class="login-label">Email Address</label>
+    <input class="login-input" type="email" id="forgot-email" placeholder="justrightdecorators@gmail.com">
+    <button class="login-btn" onclick="doForgot()">Send Reset Email →</button>
+    <div class="forgot-status" id="forgot-status">If that email exists, reset instructions have been sent.</div>
+    <span class="back-link" onclick="showLogin()">← Back to login</span>
+  </div>
+</div>
+
+<!-- DASHBOARD -->
+<div id="dashboard">
+  <div class="topbar">
+    <div class="topbar-logo">AILeash Admin</div>
+    <div class="topbar-right">
+      <div class="topbar-time" id="clock"></div>
+      <button class="refresh-btn" onclick="loadAll()">↻ Refresh</button>
+      <button class="logout-btn" onclick="doLogout()">Sign Out</button>
+    </div>
+  </div>
+
+  <div class="dash-inner">
+
+    <!-- STATS -->
+    <div class="stats-row">
+      <div class="stat-card">
+        <div class="stat-card-label">Total Signups</div>
+        <div class="stat-card-value gold" id="s-total">—</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-card-label">Paid Accounts</div>
+        <div class="stat-card-value green" id="s-paid">—</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-card-label">Audit Blocks</div>
+        <div class="stat-card-value white" id="s-blocks">—</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-card-label">Chain Status</div>
+        <div class="stat-card-value" id="s-chain">—</div>
+      </div>
+    </div>
+
+    <!-- API KEYS -->
+    <div class="section">
+      <div class="section-header">
+        <div class="section-title">API Keys</div>
+        <div class="section-count" id="keys-count"></div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Email</th>
+              <th>Product</th>
+              <th>Plan</th>
+              <th>Devices</th>
+              <th>Usage</th>
+              <th>Signed Up</th>
+              <th>Key (prefix)</th>
+            </tr>
+          </thead>
+          <tbody id="keys-tbody">
+            <tr><td colspan="8" class="loading"><span class="dot-anim">Loading</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- REFERRALS -->
+    <div class="section">
+      <div class="section-header">
+        <div class="section-title">Referrals</div>
+        <div class="section-count" id="refs-count"></div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Code</th>
+              <th>Name</th>
+              <th>Email</th>
+              <th>Devices Referred</th>
+              <th>Earnings</th>
+              <th>Created</th>
+            </tr>
+          </thead>
+          <tbody id="refs-tbody">
+            <tr><td colspan="6" class="loading"><span class="dot-anim">Loading</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- CONTACTS -->
+    <div class="section">
+      <div class="section-header">
+        <div class="section-title">Contact Messages</div>
+        <div class="section-count" id="contacts-count"></div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Email</th>
+              <th>Org</th>
+              <th>Message</th>
+              <th>Date</th>
+            </tr>
+          </thead>
+          <tbody id="contacts-tbody">
+            <tr><td colspan="5" class="loading"><span class="dot-anim">Loading</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+var SESSION_KEY = 'aileash_admin_auth';
+var adminToken = '';
+
+function doLogin() {
+  var pw = document.getElementById('pw-input').value;
+  var err = document.getElementById('login-err');
+  err.classList.remove('show');
+  if (!pw) return;
+  fetch('/admin/auth', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({password: pw})
+  }).then(function(r){ return r.json(); }).then(function(d) {
+    if (d.token) {
+      adminToken = d.token;
+      sessionStorage.setItem(SESSION_KEY, d.token);
+      showDashboard();
+    } else {
+      err.classList.add('show');
+      document.getElementById('pw-input').value = '';
+    }
+  }).catch(function() {
+    err.textContent = 'Cannot reach server.';
+    err.classList.add('show');
+  });
+}
+
+function doLogout() {
+  adminToken = '';
+  sessionStorage.removeItem(SESSION_KEY);
+  document.getElementById('dashboard').style.display = 'none';
+  document.getElementById('login-screen').style.display = 'flex';
+  document.getElementById('pw-input').value = '';
+}
+
+function showForgot() {
+  document.getElementById('login-screen').style.display = 'none';
+  document.getElementById('forgot-screen').style.display = 'flex';
+}
+
+function showLogin() {
+  document.getElementById('forgot-screen').style.display = 'none';
+  document.getElementById('login-screen').style.display = 'flex';
+}
+
+function doForgot() {
+  var email = document.getElementById('forgot-email').value.trim();
+  var status = document.getElementById('forgot-status');
+  if (!email) return;
+  fetch('/admin/forgot', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({email: email})
+  }).then(function() {
+    status.classList.add('show');
+  }).catch(function() {
+    status.classList.add('show');
+  });
+}
+
+function showDashboard() {
+  document.getElementById('login-screen').style.display = 'none';
+  document.getElementById('forgot-screen').style.display = 'none';
+  document.getElementById('dashboard').style.display = 'flex';
+  loadAll();
+  startClock();
+}
+
+function startClock() {
+  function tick() {
+    var now = new Date();
+    document.getElementById('clock').textContent = now.toLocaleTimeString('en-GB');
+  }
+  tick();
+  setInterval(tick, 1000);
+}
+
+function apiGet(path) {
+  return fetch(path, {
+    headers: {'Authorization': 'Bearer ' + adminToken}
+  }).then(function(r) {
+    if (r.status === 401) { doLogout(); throw new Error('auth'); }
+    return r.json();
+  });
+}
+
+function loadAll() {
+  loadStats();
+  loadKeys();
+  loadRefs();
+  loadContacts();
+}
+
+function loadStats() {
+  apiGet('/admin/stats').then(function(d) {
+    document.getElementById('s-total').textContent = d.total_keys || 0;
+    document.getElementById('s-paid').textContent = d.paid_keys || 0;
+    document.getElementById('s-blocks').textContent = (d.audit_blocks || 0).toLocaleString();
+    var chainEl = document.getElementById('s-chain');
+    if (d.chain_valid) {
+      chainEl.textContent = 'OK';
+      chainEl.className = 'stat-card-value green';
+    } else {
+      chainEl.textContent = 'ERR';
+      chainEl.className = 'stat-card-value red';
+    }
+  }).catch(function(){});
+}
+
+function fmtDate(ts) {
+  if (!ts) return '—';
+  var d = new Date(ts * 1000);
+  return d.toLocaleDateString('en-GB') + ' ' + d.toLocaleTimeString('en-GB', {hour:'2-digit',minute:'2-digit'});
+}
+
+function productBadge(p) {
+  var map = {aileash:'badge-al',guardian:'badge-gu',sonicboom:'badge-sb',sentinel:'badge-se'};
+  var labels = {aileash:'AILeash',guardian:'Guardian',sonicboom:'SonicBoom',sentinel:'Sentinel'};
+  return '<span class="badge ' + (map[p]||'badge-al') + '">' + (labels[p]||p) + '</span>';
+}
+
+function loadKeys() {
+  apiGet('/admin/keys').then(function(d) {
+    var tbody = document.getElementById('keys-tbody');
+    var count = document.getElementById('keys-count');
+    var keys = d.keys || [];
+    count.textContent = keys.length + ' total';
+    if (!keys.length) {
+      tbody.innerHTML = '<tr><td colspan="8" class="loading" style="color:var(--muted)">No signups yet.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = keys.map(function(k) {
+      var pct = Math.min(100, Math.round((k.actions_used / (k.free_quota || 100)) * 100));
+      var barFill = k.is_paid ? 'full' : '';
+      var usageBar = k.is_paid
+        ? '<span style="color:var(--green);font-family:var(--mono);font-size:11px">paid</span>'
+        : '<div class="usage-bar-wrap"><div class="usage-bar"><div class="usage-bar-fill ' + barFill + '" style="width:' + pct + '%"></div></div><span style="font-family:var(--mono);font-size:10px;color:var(--muted)">' + k.actions_used + '/' + k.free_quota + '</span></div>';
+      return '<tr>'
+        + '<td class="name-cell">' + (k.name || '—') + '</td>'
+        + '<td class="email-cell">' + k.email + '</td>'
+        + '<td>' + productBadge(k.product) + '</td>'
+        + '<td><span class="badge ' + (k.is_paid ? 'badge-paid' : 'badge-free') + '">' + (k.is_paid ? 'PAID' : 'FREE') + '</span></td>'
+        + '<td class="muted-cell">' + (k.devices || 1) + '</td>'
+        + '<td>' + usageBar + '</td>'
+        + '<td class="muted-cell">' + fmtDate(k.created) + '</td>'
+        + '<td class="muted-cell">' + (k.key || '').slice(0, 16) + '…</td>'
+        + '</tr>';
+    }).join('');
+  }).catch(function(){});
+}
+
+function loadRefs() {
+  apiGet('/admin/referrals').then(function(d) {
+    var tbody = document.getElementById('refs-tbody');
+    var count = document.getElementById('refs-count');
+    var refs = d.referrals || [];
+    count.textContent = refs.length + ' total';
+    if (!refs.length) {
+      tbody.innerHTML = '<tr><td colspan="6" class="loading" style="color:var(--muted)">No referrals yet.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = refs.map(function(r) {
+      return '<tr>'
+        + '<td style="font-family:var(--mono);font-size:11px;color:var(--gold)">' + r.code + '</td>'
+        + '<td class="name-cell">' + (r.referrer_name || '—') + '</td>'
+        + '<td class="email-cell">' + (r.referrer_email || '—') + '</td>'
+        + '<td class="muted-cell">' + (r.devices_referred || 0) + '</td>'
+        + '<td class="ref-earn">£' + ((r.earnings_pence || 0) / 100).toFixed(2) + '</td>'
+        + '<td class="muted-cell">' + fmtDate(r.created) + '</td>'
+        + '</tr>';
+    }).join('');
+  }).catch(function(){});
+}
+
+function loadContacts() {
+  apiGet('/admin/contacts').then(function(d) {
+    var tbody = document.getElementById('contacts-tbody');
+    var count = document.getElementById('contacts-count');
+    var contacts = d.contacts || [];
+    count.textContent = contacts.length + ' total';
+    if (!contacts.length) {
+      tbody.innerHTML = '<tr><td colspan="5" class="loading" style="color:var(--muted)">No messages yet.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = contacts.map(function(c) {
+      var msg = c.message || '';
+      if (msg.length > 80) msg = msg.slice(0, 80) + '…';
+      return '<tr>'
+        + '<td class="name-cell">' + (c.name || '—') + '</td>'
+        + '<td class="email-cell">' + (c.email || '—') + '</td>'
+        + '<td class="muted-cell">' + (c.org || '—') + '</td>'
+        + '<td style="color:var(--text);font-size:12px;max-width:300px;white-space:normal">' + msg + '</td>'
+        + '<td class="muted-cell">' + fmtDate(c.ts) + '</td>'
+        + '</tr>';
+    }).join('');
+  }).catch(function(){});
+}
+
+// Auto-login if session exists
+(function() {
+  var saved = sessionStorage.getItem(SESSION_KEY);
+  if (saved) {
+    adminToken = saved;
+    showDashboard();
+  }
+})();
+</script>
+</body>
+</html>
