@@ -23,7 +23,7 @@ OWNER_PHONE="07908 269428"
 SAFE={"UK","US","DE","FR","CA","AU","NL","SE","NO","DK","FI","IE","NZ"}
 REQ={"user_id","action","amount","country","device_id","anomaly","device_risk"}
 FREE_QUOTA=100
-ADMIN_PASSWORD=os.environ.get("ADMIN_PASSWORD","Racecar198066")
+ADMIN_PASSWORD=os.environ.get("ADMIN_PASSWORD","")
 _admin_tokens=set()
 STRIPE_PRICE_AL=""
 STRIPE_PRICE_GU=""
@@ -1153,6 +1153,8 @@ class Handler(BaseHTTPRequestHandler):
             c=load_file("registry.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
         elif path=="/admin":
             c=load_file("admin.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
+            elif path=="/brain":
+            c=load_file("brain.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
         elif path=="/referrals":
             code=qs.get("code",[""])[0].strip().upper()
             send_html(self,referrals_page(code))
