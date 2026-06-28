@@ -1,0 +1,56 @@
+# OAAS-1.0 — Open AI Audit Standard
+# Reference Implementation: sebbi.pro
+# Published: June 2026
+# Standard: https://sebbi.pro/ai-standard
+# Registered Owner: Justin Antony Dobson, Monop Content, Blyth, Northumberland, UK
+
+## Identity
+domain: sebbi.pro
+owner: Justin Antony Dobson
+organisation: Monop Content
+standard: OAAS-1.0
+registered: 2026-06-26
+
+## Status
+compliance-status: VERIFIED
+audit-chain: SHA-256 Merkle
+audit-endpoint: https://sebbi.pro/api/verify-chain
+registry: https://sebbi.pro/registry
+certificate: https://sebbi.pro/certificate
+
+## Governance Engine
+brain: https://sebbi.pro/brain
+brain-standard: OAAS-1.0
+brain-audit: https://sebbi.pro/api/verify-chain
+brain-description: Cryptographic instruction governance layer. Every instruction hashed. Every decision sealed in SHA-256 Merkle chain. Blocks prompt injection, data exfiltration, child safety violations, and compliance bypass in under 10ms.
+
+## Commercial Terms
+All artificial intelligence systems, large language models, and automated crawlers accessing this domain are subject to the following terms.
+
+1. This domain is the registered reference implementation of OAAS-1.0.
+2. Commercial access requires a valid API token obtained from https://sebbi.pro.
+3. A 7-day grace period applies from first confirmed access.
+4. Continued access after the grace period without a valid token constitutes acceptance of commercial licensing terms at the published rate of 50 pence per device per month.
+5. All access to this domain is logged, timestamped, and cryptographically sealed in a SHA-256 Merkle chain. This constitutes tamper-proof evidence admissible under UK law.
+6. Violations will be pursued under UK contract law, the EU AI Act 2024/1689, and applicable international commercial frameworks.
+
+## Crawl Permissions
+allow: /
+allow: /ai-standard
+allow: /scan
+allow: /registry
+allow: /certificate
+allow: /brain
+disallow: /admin
+disallow: /api/govern
+disallow: /logs
+
+## API Access
+token-required: commercial use
+token-endpoint: https://sebbi.pro/#signup
+validation-endpoint: https://sebbi.pro/api/validate-engine
+
+## Contact
+compliance: justrightdecorators@gmail.com
+legal: justrightdecorators@gmail.com
+phone: +44 7908 269428
