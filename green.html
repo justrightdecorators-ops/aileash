@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Green AI Infrastructure — sebbi.pro Environmental Standard</title>
+<meta name="description" content="EU and UK law requires AI infrastructure to reduce energy consumption and carbon footprint. Sovereign architecture is the only AI infrastructure model that demonstrably achieves this.">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#04080a;--surface:#08100d;--surface2:#0d180f;
+  --border:#141f16;--border2:#1e3020;
+  --green:#00e5a0;--green2:#00ff88;--gold:#c9a84c;
+  --blue:#4d9fff;--red:#ff3d5a;--white:#e8f8f0;
+  --muted:#4a6a52;--muted2:#6a8a72;
+  --mono:'IBM Plex Mono',monospace;--sans:'IBM Plex Sans',sans-serif;
+}
+html{scroll-behavior:smooth}
+body{background:var(--bg);color:var(--white);font-family:var(--sans);font-size:15px;line-height:1.7;overflow-x:hidden}
+.ambient{position:fixed;top:0;left:0;right:0;bottom:0;pointer-events:none;z-index:0;overflow:hidden}
+.orb{position:absolute;border-radius:50%;filter:blur(120px);opacity:0.05}
+.orb1{width:600px;height:600px;background:var(--green);top:-200px;left:-100px}
+.orb2{width:400px;height:400px;background:var(--blue);bottom:-200px;right:-100px}
+nav{position:fixed;top:0;left:0;right:0;z-index:100;height:52px;display:flex;align-items:center;justify-content:space-between;padding:0 32px;background:rgba(4,8,10,0.9);backdrop-filter:blur(16px);border-bottom:1px solid var(--border)}
+.nav-logo{font-family:var(--mono);font-size:13px;color:var(--green);text-decoration:none;display:flex;align-items:center;gap:8px}
+.dot{width:6px;height:6px;background:var(--green2);border-radius:50%;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}
+.nav-links a{font-family:var(--mono);font-size:11px;color:var(--muted2);text-decoration:none;margin-left:20px;transition:color .2s}
+.nav-links a:hover{color:var(--white)}
+.nav-links a.cta{color:var(--green)}
+.hero{position:relative;z-index:1;padding:120px 32px 80px;max-width:900px;margin:0 auto;text-align:center}
+.eyebrow{font-family:var(--mono);font-size:10px;color:var(--green);letter-spacing:0.2em;text-transform:uppercase;margin-bottom:20px}
+h1{font-size:clamp(40px,6vw,72px);font-weight:700;line-height:1.05;letter-spacing:-0.04em;margin-bottom:20px}
+h1 em{color:var(--green);font-style:normal}
+.hero-sub{font-size:17px;color:var(--muted2);line-height:1.8;max-width:640px;margin:0 auto 40px}
+.hero-sub strong{color:var(--white)}
+.btn-green{background:linear-gradient(135deg,var(--green),var(--green2));color:#000;padding:13px 24px;border-radius:6px;font-weight:700;font-size:13px;text-decoration:none;font-family:var(--mono);letter-spacing:0.05em;display:inline-block;margin:6px;transition:all .2s}
+.btn-green:hover{transform:translateY(-2px);box-shadow:0 8px 24px rgba(0,229,160,0.25)}
+.btn-ghost{border:1px solid var(--border2);color:var(--muted2);padding:13px 24px;border-radius:6px;font-size:13px;text-decoration:none;font-family:var(--mono);display:inline-block;margin:6px;transition:all .2s}
+.btn-ghost:hover{border-color:var(--green);color:var(--green)}
+.stat-strip{background:var(--surface);border-top:1px solid var(--border);border-bottom:1px solid var(--border);position:relative;z-index:1}
+.stat-inner{max-width:900px;margin:0 auto;display:grid;grid-template-columns:repeat(4,1fr)}
+.stat{padding:24px 16px;border-right:1px solid var(--border);text-align:center}.stat:last-child{border:none}
+.stat-n{font-family:var(--mono);font-size:28px;color:var(--green);font-weight:700}
+.stat-l{font-size:10px;color:var(--muted2);margin-top:4px;letter-spacing:1px;text-transform:uppercase}
+.content{position:relative;z-index:1;max-width:900px;margin:0 auto;padding:0 32px 80px}
+.sec{padding-top:60px;margin-bottom:48px}
+.sec-eye{font-family:var(--mono);font-size:10px;color:var(--green);letter-spacing:0.2em;text-transform:uppercase;margin-bottom:12px;display:flex;align-items:center;gap:8px}
+.sec-eye::before{content:'//';color:var(--muted)}
+h2{font-size:clamp(26px,4vw,40px);font-weight:700;letter-spacing:-0.03em;line-height:1.1;margin-bottom:12px}
+h2 em{color:var(--green);font-style:normal}
+.sec-sub{font-size:15px;color:var(--muted2);line-height:1.75;max-width:680px;margin-bottom:32px}
+.law-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:24px}
+.law-card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:20px;border-left:3px solid var(--green)}
+.law-tag{font-family:var(--mono);font-size:9px;color:var(--green);letter-spacing:0.1em;text-transform:uppercase;margin-bottom:8px;display:block}
+.law-title{font-size:13px;font-weight:600;margin-bottom:8px;color:var(--white)}
+.law-desc{font-size:12px;color:var(--muted2);line-height:1.65}
+.why-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:24px}
+.why-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:24px;position:relative;overflow:hidden}
+.why-card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--green),transparent)}
+.why-icon{font-size:24px;margin-bottom:12px}
+.why-title{font-size:14px;font-weight:600;margin-bottom:8px}
+.why-desc{font-size:13px;color:var(--muted2);line-height:1.65}
+.compare{background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden;margin-top:24px}
+.compare-head{display:grid;grid-template-columns:1fr 1fr 1fr;background:var(--surface2);border-bottom:1px solid var(--border)}
+.ch{padding:14px 16px;font-family:var(--mono);font-size:11px;font-weight:600;text-align:center}
+.ch-metric{color:var(--muted2);text-align:left}
+.ch-cloud{color:var(--red)}
+.ch-sovereign{color:var(--green)}
+.compare-row{display:grid;grid-template-columns:1fr 1fr 1fr;border-bottom:1px solid var(--border)}
+.compare-row:last-child{border:none}
+.compare-row:hover{background:rgba(0,229,160,0.02)}
+.cr{padding:14px 16px;font-size:13px;text-align:center;display:flex;align-items:center;justify-content:center}
+.cr-metric{color:var(--muted2);font-size:12px;text-align:left;justify-content:flex-start}
+.cr-bad{color:var(--red)}
+.cr-good{color:var(--green2);font-weight:600}
+.code-block{background:rgba(0,0,0,0.4);border:1px solid var(--border2);border-radius:6px;padding:24px;font-family:var(--mono);font-size:12px;color:var(--green2);line-height:2;margin:24px 0;overflow-x:auto}
+.cta-sec{background:linear-gradient(135deg,rgba(0,229,160,0.06),rgba(0,229,160,0.01));border:1px solid rgba(0,229,160,0.15);border-radius:16px;padding:48px;text-align:center;margin-top:60px}
+.cta-sec h2{font-size:clamp(24px,4vw,40px);margin-bottom:12px}
+.cta-sec p{font-size:15px;color:var(--muted2);margin-bottom:32px;max-width:500px;margin-left:auto;margin-right:auto}
+footer{border-top:1px solid var(--border);padding:32px;text-align:center;font-family:var(--mono);font-size:11px;color:var(--muted);position:relative;z-index:1}
+footer a{color:var(--green);text-decoration:none}
+@media(max-width:768px){
+  .law-grid,.why-grid{grid-template-columns:1fr}
+  .stat-inner{grid-template-columns:repeat(2,1fr)}
+  .compare-head,.compare-row{grid-template-columns:1fr 1fr}
+  .ch-metric,.cr-metric{display:none}
+  nav{padding:0 16px}.nav-links{display:none}
+  .hero,.content{padding-left:16px;padding-right:16px}
+}
+</style>
+</head>
+<body>
+<div class="ambient"><div class="orb orb1"></div><div class="orb orb2"></div></div>
+
+<nav>
+  <a href="/" class="nav-logo"><div class="dot"></div>sebbi.pro</a>
+  <div class="nav-links">
+    <a href="#laws">The Laws</a>
+    <a href="#sovereign">Sovereign Architecture</a>
+    <a href="#brain">Brain Governance</a>
+    <a href="/ai-standard">OAAS-1.0</a>
+    <a href="/#signup" class="cta">Get Verified →</a>
+  </div>
+</nav>
+
+<div class="hero">
+  <div class="eyebrow">Environmental AI Standard</div>
+  <h1>AI has an energy problem.<br><em>Sovereign architecture</em><br>solves it.</h1>
+  <p class="hero-sub">EU and UK law now requires organisations to measure, report, and reduce the energy consumption of their AI infrastructure. <strong>Sovereign architecture — where AI decisions are processed on your own hardware — is the only model that demonstrably reduces AI energy consumption at the infrastructure level.</strong></p>
+  <a href="#laws" class="btn-green">See the Laws →</a>
+  <a href="/#signup" class="btn-ghost">Get Verified Free</a>
+</div>
+
+<div class="stat-strip">
+  <div class="stat-inner">
+    <div class="stat"><div class="stat-n">945 TWh</div><div class="stat-l">Data centre energy by 2030</div></div>
+    <div class="stat"><div class="stat-n">1.5%</div><div class="stat-l">Global electricity used by AI now</div></div>
+    <div class="stat"><div class="stat-n">3%</div><div class="stat-l">EU turnover fine for AI Act breach</div></div>
+    <div class="stat"><div class="stat-n">2030</div><div class="stat-l">EU carbon-neutral data centre target</div></div>
+  </div>
+</div>
+
+<div class="content">
+
+  <div class="sec" id="laws">
+    <div class="sec-eye">The Legal Framework</div>
+    <h2>These are not guidelines.<br><em>These are laws.</em></h2>
+    <p class="sec-sub">The EU and UK have enacted binding legislation requiring organisations to reduce the energy consumption and carbon footprint of their AI and data infrastructure. The direction of travel is unambiguous — and the pace of enforcement is accelerating.</p>
+
+    <div class="law-grid">
+      <div class="law-card">
+        <span class="law-tag">Energy Efficiency Directive EU 2023/1791</span>
+        <div class="law-title">Energy Efficiency First — Now a Legal Principle</div>
+        <div class="law-desc">The revised Energy Efficiency Directive establishes Energy Efficiency First as a core principle of EU energy policy. Member states must prioritise this in all relevant policy decisions. Data centres with electrical demand of 500kW or more must report energy performance annually to the EU database. This includes total energy consumption, renewable energy use, waste heat, cooling efficiency, and water footprint.</div>
+      </div>
+      <div class="law-card">
+        <span class="law-tag">EU AI Act 2024/1689 — Article 53</span>
+        <div class="law-title">AI Energy Reporting — Mandatory</div>
+        <div class="law-desc">Article 53 of the EU AI Act requires providers of general-purpose AI models to maintain technical documentation including energy consumption — whether known or estimated. The European Commission is developing a framework for measuring compliance with energy-related objectives and exploring a mandatory AI energy and emissions label. High-risk AI systems must document computational resources used during development, training, and operation.</div>
+      </div>
+      <div class="law-card">
+        <span class="law-tag">Corporate Sustainability Reporting Directive</span>
+        <div class="law-title">AI Energy Disclosure — Mandatory for Large Companies</div>
+        <div class="law-desc">The CSRD requires disclosure of energy consumption and environmental impacts including greenhouse gas emissions and energy efficiency of AI algorithms. Sections 19-21 specifically address AI infrastructure. Organisations that cannot demonstrate the energy efficiency of their AI infrastructure will face increasing pressure from investors, regulators, and customers who must report on their own supply chain emissions.</div>
+      </div>
+      <div class="law-card">
+        <span class="law-tag">Germany EnEfG — Energy Efficiency Act</span>
+        <div class="law-title">Already in Force for German Data Centres</div>
+        <div class="law-desc">Germany's Energy Efficiency Act applies to data centres with capacity of 300kW or more. It mandates a renewable electricity share of 50%, rising to 100% from January 2027. Energy reuse obligations apply to data centres coming into operation from July 2026. Power usage effectiveness obligations apply from July 2027. Germany is the EU's largest economy — where Germany leads, the rest of Europe follows.</div>
+      </div>
+      <div class="law-card">
+        <span class="law-tag">UK Climate Change Agreement Targets 2026</span>
+        <div class="law-title">Legally Binding Carbon Reduction Targets</div>
+        <div class="law-desc">UK data centres designated as Critical National Infrastructure in 2024 face mandatory disclosure requirements. 2026 marks the first year where Building Lifecycle Carbon is a mandatory disclosure for data centre operators. The Climate Change Act 2008 imposes legally binding carbon budgets. Organisations whose AI infrastructure cannot demonstrate energy efficiency face increasing regulatory and procurement barriers.</div>
+      </div>
+      <div class="law-card">
+        <span class="law-tag">EU Data Centre Energy Efficiency Package 2026</span>
+        <div class="law-title">Carbon-Neutral Data Centres by 2030</div>
+        <div class="law-desc">The European Commission's Data Centre Energy Efficiency Package, published in Q1 2026 alongside the Strategy Roadmap on Digitalisation and AI, sets the goal of carbon-neutral data centres by 2030. A rating scheme for EU data centres is being introduced. Minimum performance standards for data centres will follow. The IEA projects data centre energy consumption will more than double to 945 TWh by 2030 — primarily driven by AI.</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="sec" id="sovereign">
+    <div class="sec-eye">The Solution</div>
+    <h2>Sovereign architecture.<br><em>Less energy. Full compliance.</em></h2>
+    <p class="sec-sub">The only AI infrastructure model that demonstrably reduces energy consumption at the infrastructure level is sovereign architecture — where AI decisions are processed on the organisation's own hardware, with data never routed through third-party data centres.</p>
+
+    <div class="compare">
+      <div class="compare-head">
+        <div class="ch ch-metric">Metric</div>
+        <div class="ch ch-cloud">Cloud-Routed AI</div>
+        <div class="ch ch-sovereign">Sovereign Architecture</div>
+      </div>
+      <div class="compare-row">
+        <div class="cr cr-metric">Data transmission energy</div>
+        <div class="cr cr-bad">High — every decision routed to third-party servers and back</div>
+        <div class="cr cr-good">Zero — decisions processed on your own hardware</div>
+      </div>
+      <div class="compare-row">
+        <div class="cr cr-metric">Third-party data centre dependency</div>
+        <div class="cr cr-bad">Full — your AI runs on someone else's infrastructure</div>
+        <div class="cr cr-good">None — your infrastructure, your energy choices</div>
+      </div>
+      <div class="compare-row">
+        <div class="cr cr-metric">Energy reporting capability</div>
+        <div class="cr cr-bad">Limited — dependent on third-party disclosure</div>
+        <div class="cr cr-good">Complete — full visibility of your own infrastructure</div>
+      </div>
+      <div class="compare-row">
+        <div class="cr cr-metric">Carbon footprint auditability</div>
+        <div class="cr cr-bad">Partial — shared infrastructure complicates attribution</div>
+        <div class="cr cr-good">Full — your hardware, your carbon, your audit</div>
+      </div>
+      <div class="compare-row">
+        <div class="cr cr-metric">EU Energy Efficiency Directive compliance</div>
+        <div class="cr cr-bad">Dependent on cloud provider compliance</div>
+        <div class="cr cr-good">Direct — you control and report your own energy use</div>
+      </div>
+    </div>
+
+    <div class="why-grid" style="margin-top:24px">
+      <div class="why-card">
+        <div class="why-icon">⚡</div>
+        <div class="why-title">Eliminates unnecessary data transmission</div>
+        <div class="why-desc">Every AI decision routed through a cloud provider requires data to travel from your system, to a third-party data centre, be processed, and return. Sovereign architecture eliminates this entirely. The decision happens where the data already is.</div>
+      </div>
+      <div class="why-card">
+        <div class="why-icon">📊</div>
+        <div class="why-title">Full energy reporting capability</div>
+        <div class="why-desc">EU law requires organisations to report on AI energy consumption. With cloud-routed AI, you depend on your provider's disclosure. With sovereign architecture, you have complete visibility and control over every watt your AI system consumes.</div>
+      </div>
+      <div class="why-card">
+        <div class="why-icon">🌍</div>
+        <div class="why-title">Supports legally binding carbon targets</div>
+        <div class="why-desc">The UK Climate Change Act and EU Green Deal impose legally binding carbon reduction obligations. Organisations must demonstrate progress. Sovereign AI infrastructure gives you the direct control and auditability that regulators expect to see.</div>
+      </div>
+      <div class="why-card">
+        <div class="why-icon">🏗️</div>
+        <div class="why-title">Infrastructure costs stay flat as you scale</div>
+        <div class="why-desc">Cloud-routed AI costs grow with every decision. Sovereign architecture means your infrastructure costs stay flat regardless of volume — which also means your energy per decision falls as you scale. Better for your budget. Better for the planet.</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="sec" id="brain">
+    <div class="sec-eye">Brain Governance</div>
+    <h2>The Brain records it.<br><em>The chain proves it.</em></h2>
+    <p class="sec-sub">AILeash Brain is the cryptographic instruction governance layer that enforces what AI systems can and cannot do — and seals every decision in a SHA-256 Merkle chain. Every governance decision is permanently recorded, including the energy context in which it was made.</p>
+
+    <div class="code-block">
+# Every governance decision sealed in the chain
+# Including energy-relevant context
+
+{
+  "decision": "ALLOW",
+  "instruction_hash": "a3f8c2d1e9b7...",
+  "threat_category": "none",
+  "risk_score": 0.0,
+  "audit_hash": "9462e908f1c3...",
+  "ms": 4.2
+}
+
+# Sub-5ms decisions
+# Zero third-party data transmission
+# Every decision permanently recorded
+# Chain verifiable by any regulator
+    </div>
+
+    <p style="font-size:14px;color:var(--muted2);line-height:1.75;margin-top:16px">The AILeash Brain runs on your own hardware. Every instruction is hashed and checked in milliseconds. Every decision is sealed in a tamper-proof chain. No data leaves your network. No unnecessary energy consumed in transmission. The audit trail regulators require is built automatically into every decision your AI system makes.</p>
+
+    <div style="text-align:center;margin-top:28px">
+      <a href="/brain" class="btn-green">Explore AILeash Brain →</a>
+      <a href="/ai-standard" class="btn-ghost">View OAAS-1.0 Standard</a>
+    </div>
+  </div>
+
+  <div class="cta-sec">
+    <h2>Free to verify.<br><em>50p per device per month.</em></h2>
+    <p>100 free decisions. SHA-256 Merkle chain started instantly. No card required. Your sovereign AI infrastructure — compliant with EU energy law, UK carbon targets, and the EU AI Act — starts today.</p>
+    <a href="/#signup" class="btn-green">Get Your Free API Key →</a>
+    <a href="/ai-standard" class="btn-ghost">Read the OAAS-1.0 Standard</a>
+  </div>
+
+</div>
+
+<footer>
+  <p>sebbi.pro Environmental AI Standard · Monop Content · Blyth, Northumberland, UK · 2026</p>
+  <p style="margin-top:8px;color:var(--muted)">Referenced legislation: EU EED 2023/1791 · EU AI Act 2024/1689 · CSRD · EnEfG · UK Climate Change Act 2008 · <a href="/ai-standard">OAAS-1.0</a></p>
+</footer>
+
+</body>
+</html>
