@@ -1155,6 +1155,7 @@ class Handler(BaseHTTPRequestHandler):
             c=load_file("admin.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
             elif path=="/brain":
             c=load_file("brain.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
+        
         elif path=="/referrals":
             code=qs.get("code",[""])[0].strip().upper()
             send_html(self,referrals_page(code))
