@@ -1347,6 +1347,25 @@ class Handler(BaseHTTPRequestHandler):
                 send_json(self,{"token":tok})
             else:
                 send_json(self,{"error":"invalid_password"},401)
+                elif path=="/api/generate-airgap-token":
+    auth=get_bearer(self)
+    ki=get_key(auth) if auth else None
+    if not ki:send_json(self,{"error":"invalid_api_key"},401);return
+    email,used,active,is_paid,quota,plan,product=ki
+    if not is_paid:send_json(self,{"error":"paid_plan_required"},403);return
+    with _db_lock:
+        devices=_conn.execute("SELECT devices FROM api_keys WHERE key=?",(auth,)).fetchone()
+    import hmac,base64,secrets as sec
+    secret=os.environ.get("LICENCE_SECRET","").encode()
+    if not secret:send_json(self,{"error":"licence_secret_not_configured"},503);return
+    import json as _json
+    issued=int(time.time())
+    expires=issued+(365*86400)
+    payload=_json.dumps({"v":"1","key":auth,"devices":devices[0] if devices else 1,"plan":plan,"email":email,"issued":issued,"expires":expires},sort_keys=True,separators=(',',':'))
+    sig=hmac.new(secret,payload.encode(),hashlib.sha256).hexdigest()
+    token_data=_json.dumps({"payload":payload,"sig":sig},separators=(',',':'))
+    token=base64.urlsafe_b64encode(token_data.encode()).decode()
+    send_json(self,{"token":token,"expires":expires,"days":365})
         elif path=="/admin/forgot":
             email=str(data.get("email","")).strip().lower()
             if email==OWNER_EMAIL.lower():
