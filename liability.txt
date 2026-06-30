@@ -1,0 +1,111 @@
+OAAS-1.0 — LIABILITY & ROLE ADDENDUM
+Monop Content / AILeash (sebbi.pro)
+Drafted for review by a qualified solicitor before publication. This is not legal advice.
+
+================================================================================
+1. ROLE DEFINITION — PROVIDER VS DEPLOYER
+================================================================================
+
+1.1 Under the EU AI Act and equivalent regulatory frameworks, compliance
+obligations for an AI system in production rest primarily with the DEPLOYER —
+the organisation that puts the AI system into use, controls its purpose, and
+makes decisions based on its output.
+
+1.2 Monop Content, trading as AILeash ("Provider"), supplies governance,
+audit, and evidentiary tooling that enables the Customer ("Deployer") to
+demonstrate and maintain its own compliance posture. Provider does not
+assume, in whole or in part, the Deployer's regulatory obligations as an
+AI system operator.
+
+1.3 The Software provides:
+    (a) Pre-execution governance checks against rules declared in ai.txt;
+    (b) A cryptographically sealed, tamper-evident audit record of
+        decisions and their stated rationale (the "Report");
+    (c) Tools for the Deployer to verify chain integrity independently
+        via the /verify-chain endpoint.
+
+1.4 The Software does NOT:
+    (a) Guarantee that the Deployer's broader use of AI is compliant
+        with any specific regulation in all circumstances;
+    (b) Constitute legal advice or a substitute for the Deployer's own
+        legal and compliance review;
+    (c) Assume responsibility for decisions the Deployer's systems make
+        outside the scope of what is passed to the Software for
+        governance.
+
+1.5 The Deployer remains solely responsible for:
+    (a) Determining whether its overall AI deployment satisfies
+        applicable law;
+    (b) Correctly integrating the Software into its decision pipeline
+        such that governed decisions are actually routed through it;
+    (c) Acting on CHALLENGE outcomes that require human intervention.
+
+================================================================================
+2. LIMITATION OF LIABILITY
+================================================================================
+
+2.1 AGGREGATE CAP. Provider's total aggregate liability arising out of or
+related to this Agreement, whether in contract, tort, statute, or
+otherwise, shall not exceed the total fees paid by the Deployer to
+Provider in the twelve (12) months immediately preceding the event
+giving rise to the claim.
+
+2.2 EXCLUSION OF CONSEQUENTIAL LOSS. Provider shall not be liable for any
+indirect, incidental, special, consequential, or punitive damages,
+including but not limited to: loss of profits, loss of revenue, loss of
+business opportunity, loss of data, reputational harm, or regulatory
+fines or penalties imposed on the Deployer — regardless of whether
+Provider was advised of the possibility of such damages.
+
+2.3 NO INDEMNIFICATION OF REGULATORY FINES. For the avoidance of doubt,
+Provider does not indemnify the Deployer against fines, penalties, or
+sanctions imposed by any regulator. Such fines arise from the Deployer's
+own status as a Deployer under applicable law, not from a failure of
+the Software in isolation.
+
+2.4 CARVE-OUTS. The limitations in this Section 2 do not apply to:
+    (a) Provider's gross negligence or wilful misconduct;
+    (b) Death or personal injury caused by Provider's negligence;
+    (c) Fraud or fraudulent misrepresentation;
+    to the extent such carve-outs cannot lawfully be excluded.
+
+2.5 BASIS OF THE BARGAIN. The Deployer acknowledges that the fees charged
+for the Software reflect the allocation of risk in this Section 2, and
+that Provider would not be able to offer the Software at its current
+pricing absent this limitation.
+
+================================================================================
+3. WARRANTY DISCLAIMER
+================================================================================
+
+3.1 The Software is provided "as is." Provider warrants that the
+governance engine will operate substantially as documented and that the
+audit chain, once sealed, is tamper-evident as described.
+
+3.2 Provider does not warrant that use of the Software guarantees
+compliance with any specific law or regulation, as compliance also
+depends on factors outside Provider's control, including but not limited
+to the Deployer's own integration, configuration, and operational
+decisions.
+
+================================================================================
+4. INSURANCE
+================================================================================
+
+4.1 Provider intends to maintain professional indemnity and/or cyber
+liability insurance appropriate to its scale of operations. Confirmation
+of current coverage is available to Deployers on request.
+
+================================================================================
+NOTES FOR JUSTIN (remove before publishing)
+================================================================================
+
+- This needs a solicitor's review before it goes live — particularly
+  Section 2's enforceability varies by jurisdiction (UK vs EU consumer
+  protection law treats liability caps differently for B2C vs B2B).
+- Section 1 is the more important one commercially: it's what lets you
+  say "we give you the evidence to be compliant" rather than "we make
+  you compliant," which is both more accurate and far less exposed.
+- Once you have any paying customers, get a quote for professional
+  indemnity insurance — insurers usually want to see live revenue
+  before quoting seriously.
