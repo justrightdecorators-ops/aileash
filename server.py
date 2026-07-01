@@ -1322,6 +1322,8 @@ class Handler(BaseHTTPRequestHandler):
             with _db_lock:devices=_conn.execute("SELECT devices FROM api_keys WHERE key=?",(api_key,)).fetchone()
             send_json(self,{"valid":True,"plan":plan,"product":product,"devices":devices[0] if devices else 1,"email":email})
         elif path=="/report-threat":
+        elif path=="/child-safety-guide":
+            c=load_file("child-safety-guide.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
             ref="AIDX-"+hashlib.sha256(json.dumps(data,sort_keys=True).encode()).hexdigest()[:12].upper()
             with _db_lock:
                 _conn.execute("INSERT INTO threat_log(ts,ref,data_json) VALUES(?,?,?)",(time.time(),ref,json.dumps(data)))
