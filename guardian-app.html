@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>AILeash Guardian &mdash; Free Child Safety Tool</title>
+<meta name="description" content="A free tool to help children check suspicious messages, learn the warning signs of grooming, and get help fast. Free for every family, always.">
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;900&family=DM+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --navy:#0a0f1e;--red:#cc0000;--red2:#ff2d2d;--gold:#c9a84c;
+  --green:#00c853;--white:#fff;--off:#f8f9fb;--border:#e8edf3;
+  --muted:#64748b;--text:#1a202c;
+  --mono:'JetBrains Mono',monospace;--sans:'DM Sans',sans-serif;--display:'Playfair Display',serif
+}
+html,body{background:var(--white);color:var(--text);font-family:var(--sans);overflow-x:hidden}
+html{scroll-behavior:smooth}
+nav{position:fixed;top:0;left:0;right:0;z-index:100;background:var(--navy);padding:0 48px;height:64px;display:flex;align-items:center;justify-content:space-between}
+.nav-logo{display:flex;align-items:center;gap:10px;text-decoration:none}
+.nav-logo-text{font-family:var(--display);font-size:18px;color:var(--white);font-weight:900}.nav-logo-text span{color:var(--red2)}
+.nav-right{display:flex;gap:12px;align-items:center}
+.nav-link{color:rgba(255,255,255,0.5);text-decoration:none;font-size:13px;font-weight:500}
+.nav-btn{background:var(--red);color:var(--white);padding:9px 18px;font-weight:700;font-size:13px;border-radius:4px;text-decoration:none}
+.alert{background:var(--green);padding:11px 48px;text-align:center;font-family:var(--mono);font-size:11px;color:#00250f;letter-spacing:1px;text-transform:uppercase;margin-top:64px;font-weight:700}
+.hero{background:var(--navy);padding:80px 48px 100px;position:relative;overflow:hidden}
+.hero::before{content:'';position:absolute;inset:0;background:radial-gradient(ellipse at 30% 50%,rgba(204,0,0,0.08) 0%,transparent 60%)}
+.hero-inner{max-width:1100px;margin:0 auto;position:relative;z-index:1;display:grid;grid-template-columns:1fr 420px;gap:60px;align-items:center}
+.hero-eyebrow{font-family:var(--mono);font-size:10px;letter-spacing:3px;text-transform:uppercase;color:var(--green);margin-bottom:16px}
+h1{font-family:var(--display);font-size:clamp(38px,4.5vw,60px);line-height:1.05;color:var(--white);font-weight:900;margin-bottom:20px}
+h1 em{color:var(--red2);font-style:normal}
+h2{font-family:var(--display);font-size:clamp(28px,3vw,42px);font-weight:900;margin-bottom:12px;line-height:1.1;color:var(--navy)}
+h2 em{color:var(--red);font-style:normal}
+.hero-sub{font-size:16px;color:rgba(255,255,255,0.5);line-height:1.8;margin-bottom:32px;max-width:500px}
+.hero-sub strong{color:var(--white)}
+.hero-actions{display:flex;flex-direction:column;gap:10px}
+.btn-red{background:var(--red);color:var(--white);padding:15px 28px;border:none;font-family:var(--sans);font-weight:700;font-size:15px;cursor:pointer;text-decoration:none;border-radius:6px;display:inline-flex;align-items:center;gap:8px;width:fit-content}
+.btn-outline{background:transparent;color:rgba(255,255,255,0.5);padding:13px 24px;border:1px solid rgba(255,255,255,0.15);font-family:var(--sans);font-weight:600;font-size:14px;cursor:pointer;text-decoration:none;border-radius:6px;display:inline-flex;align-items:center;gap:8px;width:fit-content}
+.hero-trust{display:flex;gap:20px;margin-top:20px;flex-wrap:wrap}
+.ht{display:flex;align-items:center;gap:6px;font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.25);letter-spacing:1px;text-transform:uppercase}
+.ht::before{content:'OK';color:var(--green);font-size:9px;font-weight:700}
+.phone-wrap{position:relative;display:flex;justify-content:center}
+.phone{width:280px;background:#111;border-radius:40px;padding:12px;box-shadow:0 40px 80px rgba(0,0,0,0.6),0 0 0 1px rgba(255,255,255,0.05)}
+.phone-screen{background:#0d1117;border-radius:30px;overflow:hidden;aspect-ratio:9/19;position:relative}
+.phone-notch{position:absolute;top:0;left:50%;transform:translateX(-50%);width:80px;height:24px;background:#111;border-radius:0 0 16px 16px;z-index:2}
+.ps-header{background:#0a0f1e;padding:28px 16px 12px;border-bottom:1px solid rgba(255,255,255,0.05)}
+.ps-title{font-family:var(--mono);font-size:8px;color:var(--green);letter-spacing:2px;text-transform:uppercase}
+.ps-name{font-size:14px;color:var(--white);font-weight:700;margin-top:2px}
+.ps-status{display:flex;align-items:center;gap:4px;margin-top:4px}
+.ps-dot{width:6px;height:6px;background:var(--green);border-radius:50%;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}
+.ps-dot-label{font-size:9px;color:rgba(255,255,255,0.3);font-family:var(--mono)}
+.ps-alerts{padding:10px}
+.ps-alert{background:rgba(255,149,0,0.12);border:1px solid rgba(255,149,0,0.25);border-radius:6px;padding:8px 10px;margin-bottom:6px}
+.ps-alert-label{font-family:var(--mono);font-size:7px;color:#ff9500;letter-spacing:1px;text-transform:uppercase;margin-bottom:2px}
+.ps-alert-text{font-size:9px;color:rgba(255,255,255,0.6);line-height:1.4}
+.ps-alert-time{font-family:var(--mono);font-size:7px;color:rgba(255,255,255,0.2);margin-top:3px}
+.ps-safe{background:rgba(0,200,83,0.08);border:1px solid rgba(0,200,83,0.2);border-radius:6px;padding:8px 10px;margin-bottom:6px}
+.ps-safe-label{font-family:var(--mono);font-size:7px;color:var(--green);letter-spacing:1px;text-transform:uppercase;margin-bottom:2px}
+.ps-safe-text{font-size:9px;color:rgba(255,255,255,0.4);line-height:1.4}
+.divider{height:4px;background:linear-gradient(90deg,var(--green) 0%,#66ffb2 50%,var(--green) 100%)}
+.stats{background:var(--navy)}
+.stats-inner{max-width:1100px;margin:0 auto;display:grid;grid-template-columns:repeat(4,1fr)}
+.stat{padding:24px;border-right:1px solid rgba(255,255,255,0.05);text-align:center}.stat:last-child{border:none}
+.stat-n{font-family:var(--display);font-size:36px;color:var(--green);font-weight:900}
+.stat-l{font-size:10px;color:rgba(255,255,255,0.2);margin-top:4px;letter-spacing:1px;text-transform:uppercase;font-family:var(--mono)}
+.how{padding:80px 48px;background:var(--off);border-bottom:1px solid var(--border)}
+.how-inner{max-width:1100px;margin:0 auto}
+.section-eyebrow{font-family:var(--mono);font-size:10px;letter-spacing:3px;text-transform:uppercase;color:var(--red);margin-bottom:12px}
+.how-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:2px;background:var(--border);margin-top:40px}
+.how-card{background:var(--white);padding:32px 28px}
+.how-n{font-family:var(--display);font-size:52px;color:var(--red);opacity:0.15;font-weight:900;margin-bottom:8px;line-height:1}
+.how-card h3{font-family:var(--display);font-size:20px;font-weight:900;color:var(--navy);margin-bottom:10px}
+.how-card p{font-size:13px;color:var(--muted);line-height:1.75}
+.honest-box{max-width:1100px;margin:0 auto 40px;background:#fff9ec;border:1px solid #f0d99a;border-radius:8px;padding:24px 28px}
+.honest-box h4{font-family:var(--display);font-size:16px;color:var(--navy);margin-bottom:8px}
+.honest-box p{font-size:13px;color:#5a4a2a;line-height:1.75;margin-bottom:0}
+.features{padding:80px 48px;border-bottom:1px solid var(--border)}
+.features-inner{max-width:1100px;margin:0 auto}
+.feat-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:16px;margin-top:40px}
+.feat{background:var(--off);border:1px solid var(--border);padding:28px;border-left:4px solid var(--red)}
+.feat-icon{font-size:28px;margin-bottom:12px}
+.feat h3{font-family:var(--display);font-size:18px;font-weight:900;color:var(--navy);margin-bottom:8px}
+.feat p{font-size:13px;color:var(--muted);line-height:1.7}
+.feat-tag{display:inline-block;font-family:var(--mono);font-size:8px;letter-spacing:1px;text-transform:uppercase;padding:3px 8px;border-radius:2px;margin-top:10px;background:rgba(204,0,0,0.08);color:var(--red);border:1px solid rgba(204,0,0,0.2)}
+.install{padding:80px 48px;background:var(--white);border-bottom:1px solid var(--border)}
+.install-inner{max-width:900px;margin:0 auto}
+.install-steps{display:grid;grid-template-columns:1fr 1fr;gap:32px;margin-top:40px}
+.install-col{background:var(--off);border:1px solid var(--border);border-radius:8px;padding:32px}
+.install-col-title{font-family:var(--mono);font-size:10px;letter-spacing:2px;text-transform:uppercase;margin-bottom:20px;color:var(--navy)}
+.install-step{display:flex;gap:14px;margin-bottom:20px;align-items:flex-start}
+.is-num{width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:12px;font-weight:700;flex-shrink:0}
+.isn-parent{background:var(--navy);color:var(--white)}
+.isn-child{background:var(--red);color:var(--white)}
+.is-text h4{font-size:14px;font-weight:700;color:var(--navy);margin-bottom:3px}
+.is-text p{font-size:12px;color:var(--muted);line-height:1.6}
+.install-btn{display:block;text-align:center;padding:14px;border-radius:6px;font-family:var(--sans);font-weight:700;font-size:14px;text-decoration:none;margin-top:20px}
+.ib-parent{background:var(--navy);color:var(--white)}
+.ib-child{background:var(--red);color:var(--white)}
+.signup{padding:80px 48px;background:var(--off);border-top:4px solid var(--green)}
+.signup-inner{max-width:560px;margin:0 auto;text-align:center}
+.free-badge{display:inline-block;background:var(--green);color:#00250f;font-family:var(--mono);font-weight:700;font-size:13px;letter-spacing:1px;text-transform:uppercase;padding:8px 18px;border-radius:20px;margin-bottom:16px}
+.signup-form{background:var(--white);border:1px solid var(--border);border-radius:8px;padding:36px;margin-top:32px;text-align:left}
+.fg{margin-bottom:14px}
+.fg label{display:block;font-family:var(--mono);font-size:9px;color:var(--muted);letter-spacing:2px;text-transform:uppercase;margin-bottom:6px}
+.fg input,.fg select{width:100%;background:var(--off);border:2px solid var(--border);color:var(--text);padding:12px 14px;font-size:14px;font-family:var(--sans);outline:none;border-radius:4px;transition:border-color .2s}
+.fg input:focus,.fg select:focus{border-color:var(--red)}
+.fg input::placeholder{color:#bbb}
+.fg-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.signup-btn{width:100%;padding:15px;font-size:15px;font-weight:700;border-radius:6px;border:none;cursor:pointer;font-family:var(--sans);background:var(--green);color:#00250f;margin-top:8px}
+.signup-btn:disabled{opacity:0.5}
+.msg-err{display:none;color:var(--red);font-family:var(--mono);font-size:11px;margin-top:10px;padding:10px;background:#fff0f0;border-radius:4px;border:1px solid #ffcccc}
+.msg-err.show{display:block}
+.msg-ok{display:none;color:#00875a;font-family:var(--mono);font-size:11px;margin-top:10px;padding:10px;background:#f0fff8;border-radius:4px;border:1px solid #bbf7d0}
+.msg-ok.show{display:block}
+.key-box{display:none;margin-top:20px;background:var(--navy);border-radius:6px;padding:22px}
+.key-box.show{display:block}
+.key-lbl{font-family:var(--mono);font-size:9px;letter-spacing:2px;color:var(--green);margin-bottom:8px;text-transform:uppercase}
+.key-val{font-family:var(--mono);font-size:11px;color:#00ff88;word-break:break-all;background:rgba(0,0,0,0.3);padding:10px;border-radius:4px}
+.key-next{margin-top:16px;display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.kn-btn{display:block;text-align:center;padding:11px;border-radius:4px;font-weight:700;font-size:13px;text-decoration:none;font-family:var(--sans)}
+.kn-parent{background:var(--navy);color:var(--white)}
+.kn-child{background:var(--red);color:var(--white)}
+footer{background:#0d1117;padding:40px 48px;border-top:1px solid rgba(255,255,255,0.04)}
+.foot-inner{max-width:1100px;margin:0 auto;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:16px}
+.foot-logo{font-family:var(--display);font-size:18px;color:var(--white);font-weight:900}.foot-logo span{color:var(--red2)}
+.foot-links{display:flex;gap:20px}
+.foot-links a{color:rgba(255,255,255,0.2);text-decoration:none;font-size:12px}
+.foot-copy{font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.1);margin-top:16px;max-width:1100px;margin-left:auto;margin-right:auto}
+@media(max-width:900px){
+  nav{padding:0 20px}
+  .hero{padding:48px 20px 60px}
+  .hero-inner{grid-template-columns:1fr}
+  .phone-wrap{display:none}
+  .how,.features,.install,.signup{padding:48px 20px}
+  .how-grid,.feat-grid,.install-steps{grid-template-columns:1fr}
+  .stats-inner{grid-template-columns:repeat(2,1fr)}
+  .fg-row,.key-next{grid-template-columns:1fr}
+  footer{padding:32px 20px}
+  .foot-inner{flex-direction:column}
+  .alert{padding:11px 20px}
+}
+</style>
+</head>
+<body>
+
+<nav>
+  <a href="/" class="nav-logo">
+    <div class="nav-logo-text">AILeash <span>Guardian</span></div>
+  </a>
+  <div class="nav-right">
+    <a href="/" class="nav-link">Back to Platform</a>
+    <a href="#signup" class="nav-btn">Get It Free</a>
+  </div>
+</nav>
+
+<div class="alert">Free for every child. No card. No catch. Always.</div>
+
+<section class="hero">
+  <div class="hero-inner">
+    <div>
+      <div class="hero-eyebrow">AILeash Guardian &mdash; Free Child Safety Tool</div>
+      <h1>Help your child<br><em>spot the warning signs.</em></h1>
+      <p class="hero-sub">A free tool your child can use to check a message that feels off, learn what grooming and manipulation actually look like, and get real help fast if something's wrong. <strong>Free for every family. Always.</strong></p>
+      <div class="hero-actions">
+        <a href="#install" class="btn-red">Set Up Guardian &rarr;</a>
+        <a href="#how" class="btn-outline">See How It Works</a>
+      </div>
+      <div class="hero-trust">
+        <span class="ht">100% Free</span>
+        <span class="ht">No Card Required</span>
+        <span class="ht">SHA-256 Evidence Chain</span>
+        <span class="ht">No App Store Needed</span>
+      </div>
+    </div>
+    <div class="phone-wrap">
+      <div class="phone">
+        <div class="phone-screen">
+          <div class="phone-notch"></div>
+          <div class="ps-header">
+            <div class="ps-title">Guardian &mdash; Check a Message</div>
+            <div class="ps-name">Hey Emma!</div>
+            <div class="ps-status">
+              <div class="ps-dot"></div>
+              <div class="ps-dot-label">Ready to help</div>
+            </div>
+          </div>
+          <div class="ps-alerts">
+            <div class="ps-alert">
+              <div class="ps-alert-label">Be Careful</div>
+              <div class="ps-alert-text">This message is asking you to keep a secret. That's a warning sign.</div>
+              <div class="ps-alert-time">Just checked</div>
+            </div>
+            <div class="ps-safe">
+              <div class="ps-safe-label">Tip</div>
+              <div class="ps-safe-text">Blocking someone who makes you uncomfortable is always okay.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<div class="stats">
+  <div class="stats-inner">
+    <div class="stat"><div class="stat-n">Free</div><div class="stat-l">For Every Child</div></div>
+    <div class="stat"><div class="stat-n">10</div><div class="stat-l">Children Per Family</div></div>
+    <div class="stat"><div class="stat-n">&lt;1s</div><div class="stat-l">Message Check Speed</div></div>
+    <div class="stat"><div class="stat-n">SHA256</div><div class="stat-l">Evidence Chain</div></div>
+  </div>
+</div>
+
+<section class="how" id="how">
+  <div class="how-inner">
+    <div class="section-eyebrow">How It Works</div>
+    <h2>Two apps. <em>Zero cost.</em></h2>
+    <p style="font-size:15px;color:var(--muted);line-height:1.75;max-width:600px">No app store. No contract. No payment, ever. Install both PWAs in under five minutes.</p>
+    <div class="how-grid">
+      <div class="how-card">
+        <div class="how-n">01</div>
+        <h3>You install the Parent App</h3>
+        <p>Visit sebbi.pro/guardian-parent on your phone. Sign up free, add your children, and generate each child's own Guardian code.</p>
+      </div>
+      <div class="how-card">
+        <div class="how-n">02</div>
+        <h3>Your child installs their app</h3>
+        <p>Your child visits sebbi.pro/guardian-child and enters their Guardian code. They can use it any time something feels off online.</p>
+      </div>
+      <div class="how-card">
+        <div class="how-n">03</div>
+        <h3>They check a message. They get real help.</h3>
+        <p>When something feels wrong, your child pastes the message in and Guardian checks it instantly for known warning signs — plus one-tap access to CEOP, Childline and 999.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<div class="honest-box" style="margin-top:-40px;margin-bottom:0">
+  <h4>What Guardian actually does — in plain terms</h4>
+  <p>Guardian is a tool your child chooses to use when a message feels wrong. They paste it in, and Guardian checks it against known grooming and manipulation patterns — secrecy requests, location requests, unusual flattery, gift offers, isolation tactics. It gives them a straight answer and a next step, plus direct links to CEOP, Childline and 999 if they need real help. <strong>It does not automatically read or monitor every message your child sends on WhatsApp, Instagram, Snapchat or any other app</strong> — no tool can do that without deep access most phones don't allow. Guardian works when your child brings something to it. Keep talking to your child directly — that's still the strongest protection there is.</p>
+</div>
+
+<section class="features" id="features">
+  <div class="features-inner">
+    <div class="section-eyebrow">What Guardian Checks For</div>
+    <h2>The patterns predators use. <em>Explained simply.</em></h2>
+    <p style="font-size:15px;color:var(--muted);line-height:1.75;max-width:600px;margin-bottom:0">When your child pastes in a message, Guardian checks it against these known warning signs — instantly, and for free.</p>
+    <div class="feat-grid">
+      <div class="feat">
+        <div class="feat-icon">&#128561;</div>
+        <h3>Secrecy Requests</h3>
+        <p>"Don't tell your parents" or "keep this between us" is one of the clearest warning signs there is. Guardian flags it immediately and tells your child why it matters.</p>
+        <span class="feat-tag">Pattern check</span>
+      </div>
+      <div class="feat">
+        <div class="feat-icon">&#128205;</div>
+        <h3>Location &amp; Meet-Up Requests</h3>
+        <p>Questions about where your child lives, goes to school, or requests to meet up are flagged with a clear explanation of why it's risky.</p>
+        <span class="feat-tag">Pattern check</span>
+      </div>
+      <div class="feat">
+        <div class="feat-icon">&#10024;</div>
+        <h3>Love Bombing &amp; Flattery</h3>
+        <p>Excessive praise, "you're not like other kids," or unusual attention from an adult online. Guardian explains why this pattern is used to build trust before harm.</p>
+        <span class="feat-tag">Pattern check</span>
+      </div>
+      <div class="feat">
+        <div class="feat-icon">&#127873;</div>
+        <h3>Gift &amp; Money Offers</h3>
+        <p>Offers of gifts, money or "free stuff" from someone your child only knows online are flagged as a common manipulation tactic.</p>
+        <span class="feat-tag">Pattern check</span>
+      </div>
+      <div class="feat">
+        <div class="feat-icon">&#128274;</div>
+        <h3>Isolation Language</h3>
+        <p>Messages designed to pull a child away from parents or trusted adults ("they won't understand," "they'll be angry") are flagged as a serious warning sign.</p>
+        <span class="feat-tag">Pattern check</span>
+      </div>
+      <div class="feat">
+        <div class="feat-icon">&#128274;</div>
+        <h3>SHA-256 Evidence Chain</h3>
+        <p>Every check your child runs is hashed into a tamper-evident record, so if something serious needs reporting to CEOP or the police, there's a timestamped log of it.</p>
+        <span class="feat-tag">Tamper-evident record</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="install" id="install">
+  <div class="install-inner">
+    <div style="text-align:center">
+      <div class="section-eyebrow" style="text-align:center">Set Up Guardian</div>
+      <h2 style="text-align:center">Two apps. <em>Five minutes. Free.</em></h2>
+      <p style="font-size:15px;color:var(--muted);line-height:1.75;max-width:560px;margin:0 auto">No app store. No waiting. No payment, ever.</p>
+    </div>
+    <div class="install-steps">
+      <div class="install-col">
+        <div class="install-col-title">Parent App &mdash; Your Phone</div>
+        <div class="install-step">
+          <div class="is-num isn-parent">1</div>
+          <div class="is-text"><h4>Sign up below — completely free</h4><p>Takes 60 seconds. No card, ever.</p></div>
+        </div>
+        <div class="install-step">
+          <div class="is-num isn-parent">2</div>
+          <div class="is-text"><h4>Open the Parent Dashboard</h4><p>Visit sebbi.pro/guardian-parent on your phone. Enter your key when prompted.</p></div>
+        </div>
+        <div class="install-step">
+          <div class="is-num isn-parent">3</div>
+          <div class="is-text"><h4>Add your children</h4><p>Enter each child's name. Up to 10 children per account. Generate each child's unique Guardian code.</p></div>
+        </div>
+        <div class="install-step">
+          <div class="is-num isn-parent">4</div>
+          <div class="is-text"><h4>Add to home screen</h4><p>Tap Share then Add to Home Screen. Guardian is on your phone like any other app.</p></div>
+        </div>
+        <a href="/guardian-parent" class="install-btn ib-parent">Open Parent Dashboard &rarr;</a>
+      </div>
+      <div class="install-col">
+        <div class="install-col-title" style="color:var(--red)">Child App &mdash; Child's Phone</div>
+        <div class="install-step">
+          <div class="is-num isn-child">1</div>
+          <div class="is-text"><h4>Get the child's Guardian code</h4><p>You generate this in the Parent App. It is a short unique code for each child.</p></div>
+        </div>
+        <div class="install-step">
+          <div class="is-num isn-child">2</div>
+          <div class="is-text"><h4>Open the Child App on their phone</h4><p>Visit sebbi.pro/guardian-child on your child's phone. Enter their Guardian code.</p></div>
+        </div>
+        <div class="install-step">
+          <div class="is-num isn-child">3</div>
+          <div class="is-text"><h4>Add to home screen</h4><p>Tap Share then Add to Home Screen.</p></div>
+        </div>
+        <div class="install-step">
+          <div class="is-num isn-child">4</div>
+          <div class="is-text"><h4>Ready when they need it</h4><p>If a message ever feels wrong, your child can check it instantly — and reach CEOP, Childline or 999 in one tap.</p></div>
+        </div>
+        <a href="/guardian-child" class="install-btn ib-child">Open Child App &rarr;</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="signup" id="signup">
+  <div class="signup-inner">
+    <div class="free-badge">100% Free &middot; Forever</div>
+    <h2>Set up Guardian. <em>Right now. For free.</em></h2>
+    <p style="font-size:15px;color:var(--muted);line-height:1.75;margin-bottom:0">No card. No trial. No catch. Every child, every family, free.</p>
+    <div class="signup-form">
+      <div class="fg-row">
+        <div class="fg"><label>First Name</label><input type="text" id="fn" placeholder="Jane"></div>
+        <div class="fg"><label>Last Name</label><input type="text" id="ln" placeholder="Smith"></div>
+      </div>
+      <div class="fg"><label>Email Address</label><input type="email" id="em" placeholder="you@email.com"></div>
+      <div class="fg"><label>Phone Number</label><input type="tel" id="ph" placeholder="+44 7700 000000"></div>
+      <div class="fg"><label>Number of Children</label>
+        <select id="ch">
+          <option value="1">1 child</option>
+          <option value="2">2 children</option>
+          <option value="3">3 children</option>
+          <option value="4">4 children</option>
+          <option value="5">5 children</option>
+          <option value="10">6 to 10 children</option>
+        </select>
+      </div>
+      <button class="signup-btn" id="go-btn" onclick="doSignup()">Get Guardian Free &rarr;</button>
+      <div class="msg-err" id="msg-err"></div>
+      <div class="msg-ok" id="msg-ok"></div>
+      <div class="key-box" id="key-box">
+        <div class="key-lbl">Your Guardian Key &mdash; Save This</div>
+        <div class="key-val" id="key-val"></div>
+        <div class="key-next">
+          <a href="/guardian-parent" class="kn-btn kn-parent" id="parent-link">Open Parent App</a>
+          <a href="/guardian-child" class="kn-btn kn-child">Open Child App</a>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="foot-inner">
+    <div class="foot-logo">AILeash <span>Guardian</span></div>
+    <div class="foot-links">
+      <a href="/">AILeash Platform</a>
+      <a href="/guardian-parent">Parent App</a>
+      <a href="/guardian-child">Child App</a>
+      <a href="/contact">Contact</a>
+      <a href="/report-threat">Report a Threat</a>
+    </div>
+  </div>
+  <div class="foot-copy">&copy; 2026 Monop Content &middot; Justin Antony Dobson &middot; Blyth, UK &middot; Guardian v2.1.0 (Free) &middot; This tool supports parents and children but does not replace open conversation, parental guidance, or professional advice. If a child is in immediate danger, call 999.</div>
+</footer>
+
+<script>
+async function doSignup(){
+  var fn=document.getElementById('fn').value.trim();
+  var ln=document.getElementById('ln').value.trim();
+  var em=document.getElementById('em').value.trim();
+  var ph=document.getElementById('ph').value.trim();
+  var ch=parseInt(document.getElementById('ch').value)||1;
+  var err=document.getElementById('msg-err');
+  var ok=document.getElementById('msg-ok');
+  var kb=document.getElementById('key-box');
+  var btn=document.getElementById('go-btn');
+  err.classList.remove('show');ok.classList.remove('show');kb.classList.remove('show');
+  if(!em||!em.includes('@')){err.textContent='Please enter a valid email address.';err.classList.add('show');return;}
+  var orig=btn.textContent;btn.textContent='Setting up...';btn.disabled=true;
+  try{
+    var r=await fetch('/signup',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({email:em,phone:ph,name:fn+' '+ln,org:'Guardian Family Account (Free)',org_type:'family',product:'guardian',devices:ch})});
+    var d=await r.json();
+    if(d.api_key){
+      document.getElementById('key-val').textContent=d.api_key;
+      document.getElementById('parent-link').href='/guardian-parent?key='+encodeURIComponent(d.api_key);
+      kb.classList.add('show');
+      ok.textContent='All set — Guardian is free for your family. Open the Parent App to get started.';ok.classList.add('show');
+      btn.textContent='Ready \u2713';
+    }else{
+      err.textContent=d.error||'Something went wrong. Email justrightdecorators@gmail.com';
+      err.classList.add('show');btn.textContent=orig;btn.disabled=false;
+    }
+  }catch(e){
+    err.textContent='Cannot reach server. Email justrightdecorators@gmail.com';
+    err.classList.add('show');btn.textContent=orig;btn.disabled=false;
+  }
+}
+</script>
+</body>
+</html>
