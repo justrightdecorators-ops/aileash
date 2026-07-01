@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Whitepaper — AILeash by sebbi.pro</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Inter:wght@300;400;500;600;700&display=swap');
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #0a0a0f;
+    --surface: #12121a;
+    --border: #1e1e2e;
+    --gold: #c9a84c;
+    --gold-dim: #8a6f2e;
+    --green: #00e5a0;
+    --green-dim: #00b87d;
+    --amber: #ffb020;
+    --text: #e8e8f0;
+    --muted: #6b6b80;
+    --red: #ff4757;
+  }
+
+  html { scroll-behavior: smooth; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Inter', sans-serif;
+    font-size: 16px;
+    line-height: 1.6;
+  }
+
+  nav {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+    background: rgba(10,10,15,0.92);
+    backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--border);
+    padding: 0 24px; height: 56px;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .nav-logo { font-family: 'JetBrains Mono', monospace; font-size: 14px; color: var(--gold); text-decoration: none; letter-spacing: 0.05em; }
+  .nav-links { display: flex; gap: 24px; list-style: none; }
+  .nav-links a { color: var(--muted); text-decoration: none; font-size: 13px; transition: color 0.2s; }
+  .nav-links a:hover { color: var(--text); }
+  .nav-cta { background: var(--gold); color: #000; padding: 8px 16px; border-radius: 4px; font-size: 13px; font-weight: 600; text-decoration: none; transition: background 0.2s; }
+  .nav-cta:hover { background: #e0b958; }
+
+  .hero { padding: 120px 24px 60px; max-width: 860px; margin: 0 auto; }
+  .eyebrow { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--gold); letter-spacing: 0.15em; text-transform: uppercase; margin-bottom: 16px; }
+  h1 { font-size: clamp(28px, 4vw, 44px); font-weight: 700; line-height: 1.15; letter-spacing: -0.02em; margin-bottom: 16px; }
+  .hero-meta { display: flex; gap: 24px; flex-wrap: wrap; margin-bottom: 32px; }
+  .meta-item { font-size: 13px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  .meta-item span { color: var(--text); }
+  .hero-abstract { background: var(--surface); border-left: 3px solid var(--gold); padding: 20px 24px; border-radius: 0 6px 6px 0; color: var(--muted); font-size: 15px; line-height: 1.8; margin-bottom: 20px; }
+  .hero-abstract strong { color: var(--text); }
+
+  .update-notice { background: rgba(255,176,32,0.07); border: 1px solid rgba(255,176,32,0.3); border-radius: 6px; padding: 16px 20px; margin-bottom: 32px; font-size: 13.5px; color: var(--muted); line-height: 1.7; }
+  .update-notice strong { color: var(--amber); }
+
+  .download-btn { display: inline-flex; align-items: center; gap: 8px; background: var(--gold); color: #000; padding: 12px 24px; border-radius: 4px; font-weight: 600; font-size: 14px; text-decoration: none; transition: background 0.2s; }
+  .download-btn:hover { background: #e0b958; }
+
+  .content { max-width: 860px; margin: 0 auto; padding: 0 24px 80px; }
+  .paper-section { padding: 48px 0; border-top: 1px solid var(--border); }
+  h2 { font-size: 22px; font-weight: 600; margin-bottom: 16px; letter-spacing: -0.01em; }
+  h3 { font-size: 16px; font-weight: 600; margin-bottom: 10px; color: var(--gold); }
+  p { color: var(--muted); font-size: 15px; line-height: 1.8; margin-bottom: 16px; }
+  p strong { color: var(--text); }
+
+  .compare-wrap { margin: 40px 0; }
+  .compare-label { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--muted); letter-spacing: 0.12em; text-transform: uppercase; margin-bottom: 16px; }
+  .compare-table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  .compare-table thead tr { background: var(--surface); }
+  .compare-table th { padding: 14px 18px; text-align: left; font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); border-bottom: 2px solid var(--border); }
+  .compare-table th.highlight { color: var(--gold); background: rgba(201,168,76,0.06); }
+  .compare-table td { padding: 15px 18px; border-bottom: 1px solid var(--border); vertical-align: middle; font-size: 14px; }
+  .compare-table td.highlight { background: rgba(201,168,76,0.04); }
+  .compare-table tr:last-child td { border-bottom: none; }
+  .compare-table td:first-child { color: var(--text); font-weight: 500; }
+  .tick { color: var(--green); font-size: 17px; font-weight: 600; }
+  .cross { color: var(--red); font-size: 17px; }
+  .partial { color: var(--gold); font-size: 13px; font-weight: 500; }
+
+  .merkle-viz { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 28px; margin: 24px 0; font-family: 'JetBrains Mono', monospace; font-size: 12px; }
+  .chain-row { display: flex; align-items: center; gap: 4px; margin: 6px 0; flex-wrap: wrap; }
+  .chain-block { background: #0d0d14; border: 1px solid var(--border); border-radius: 4px; padding: 8px 12px; font-size: 11px; line-height: 1.5; }
+  .chain-block.genesis { border-color: var(--gold-dim); }
+  .chain-block.entry { border-color: var(--green-dim); }
+  .chain-arrow { color: var(--border); margin: 0 6px; font-size: 16px; }
+  .chain-label { font-size: 10px; color: var(--muted); display: block; margin-bottom: 2px; text-transform: uppercase; letter-spacing: 0.08em; }
+  .chain-value { color: var(--green); }
+  .chain-value.gold { color: var(--gold); }
+
+  .callout { border-radius: 8px; padding: 24px 28px; margin: 24px 0; }
+  .callout.gold { background: linear-gradient(135deg, rgba(201,168,76,0.08), rgba(201,168,76,0.02)); border: 1px solid var(--gold-dim); }
+  .callout.green { background: linear-gradient(135deg, rgba(0,229,160,0.07), rgba(0,229,160,0.01)); border: 1px solid var(--green-dim); }
+  .callout.amber { background: linear-gradient(135deg, rgba(255,176,32,0.08), rgba(255,176,32,0.02)); border: 1px solid rgba(255,176,32,0.35); }
+  .callout h3 { margin-bottom: 8px; }
+  .callout.green h3 { color: var(--green); }
+  .callout.amber h3 { color: var(--amber); }
+  .callout p { margin-bottom: 0; }
+
+  .reg-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin: 24px 0; }
+  @media (max-width: 600px) {
+    .reg-grid { grid-template-columns: 1fr; }
+    .compare-table th:nth-child(3), .compare-table td:nth-child(3) { display: none; }
+  }
+  .reg-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 20px; }
+  .reg-card h4 { font-size: 13px; font-weight: 600; color: var(--gold); margin-bottom: 8px; font-family: 'JetBrains Mono', monospace; letter-spacing: 0.05em; }
+  .reg-card p { font-size: 13px; margin-bottom: 0; }
+
+  .fine-tiers { display: flex; flex-direction: column; gap: 2px; margin: 20px 0; background: var(--border); border-radius: 8px; overflow: hidden; }
+  .tier-row { background: var(--surface); padding: 16px 20px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
+  .tier-name { font-size: 13.5px; color: var(--text); font-weight: 500; }
+  .tier-amount { font-family: 'JetBrains Mono', monospace; font-size: 13px; color: var(--gold); }
+
+  .pricing-strip { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 28px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 16px; margin-top: 48px; }
+  .pricing-text h3 { font-size: 18px; font-weight: 600; margin-bottom: 6px; }
+  .pricing-text p { font-size: 14px; margin-bottom: 0; }
+  .pricing-text span { color: var(--gold); font-weight: 600; }
+  .btn-primary { background: var(--gold); color: #000; padding: 12px 24px; border-radius: 4px; font-weight: 600; font-size: 14px; text-decoration: none; white-space: nowrap; transition: background 0.2s; }
+  .btn-primary:hover { background: #e0b958; }
+
+  .toc { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 24px; margin-bottom: 48px; }
+  .toc h3 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); margin-bottom: 12px; font-family: 'JetBrains Mono', monospace; }
+  .toc ol { padding-left: 20px; display: flex; flex-direction: column; gap: 6px; }
+  .toc a { color: var(--muted); text-decoration: none; font-size: 14px; transition: color 0.2s; }
+  .toc a:hover { color: var(--gold); }
+
+  /* INVESTOR STRIP */
+  .investor-strip { background: linear-gradient(135deg, rgba(0,229,160,0.06), rgba(201,168,76,0.04)); border: 1px solid var(--green-dim); border-radius: 8px; padding: 32px; margin-top: 24px; }
+  .investor-strip .eyebrow { color: var(--green); }
+  .investor-strip h2 { margin-bottom: 10px; }
+  .investor-strip p { max-width: 62ch; }
+  .investor-btn { display: inline-flex; align-items: center; gap: 8px; background: var(--green); color: #000; padding: 12px 24px; border-radius: 4px; font-weight: 600; font-size: 14px; text-decoration: none; margin-top: 8px; transition: background 0.2s; }
+  .investor-btn:hover { background: #00ffb0; }
+
+  footer { border-top: 1px solid var(--border); padding: 32px 24px; text-align: center; color: var(--muted); font-size: 13px; max-width: 860px; margin: 0 auto; }
+  footer a { color: var(--gold); text-decoration: none; }
+  footer p { margin-bottom: 6px; }
+</style>
+</head>
+<body>
+
+<nav>
+  <a href="/" class="nav-logo">sebbi.pro</a>
+  <ul class="nav-links">
+    <li><a href="/developers">Developers</a></li>
+    <li><a href="/whitepaper">Whitepaper</a></li>
+    <li><a href="/scan">Scanner</a></li>
+  </ul>
+  <a href="/#pricing" class="nav-cta">Get API Key</a>
+</nav>
+
+<div class="hero">
+  <div class="eyebrow">// Technical Whitepaper</div>
+  <h1>AILeash: Sovereign AI Governance Infrastructure for the EU AI Act</h1>
+
+  <div class="hero-meta">
+    <div class="meta-item">Publisher: <span>Monop Content</span></div>
+    <div class="meta-item">Version: <span>1.1</span></div>
+    <div class="meta-item">Submitted to: <span>Ofcom Additional Safety Measures Consultation</span></div>
+  </div>
+
+  <div class="hero-abstract">
+    <strong>Abstract.</strong> AILeash is a sovereign AI governance engine providing real-time decision auditing, SHA-256 Merkle chain integrity, and infrastructure aligned to the EU AI Act's record-keeping and risk management obligations. It runs within the customer's own network — decision data does not need to leave their infrastructure to be logged and hashed. Every AI decision is logged, hashed, chained, and timestamped, producing a tamper-evident audit record. Pricing is flat at <strong>50p per device per month</strong>.
+  </div>
+
+  <div class="update-notice">
+    <strong>Regulatory update (May 2026):</strong> On 7 May 2026, the EU reached a provisional "Digital Omnibus" agreement that would defer the high-risk AI system deadline (Annex III) from 2 August 2026 to 2 December 2027, pending formal adoption. Prohibited-practice rules (in force since February 2025) and GPAI model obligations (in force since August 2025) are unaffected. This document treats December 2027 as the working planning date for high-risk obligations while noting that formal adoption is still pending.
+  </div>
+
+  <a href="/static/aileash-whitepaper.pdf" class="download-btn" download>
+    ↓ Download PDF
+  </a>
+</div>
+
+<div class="content">
+
+  <div class="toc">
+    <h3>Contents</h3>
+    <ol>
+      <li><a href="#problem">The compliance gap</a></li>
+      <li><a href="#comparison">AILeash vs alternatives</a></li>
+      <li><a href="#architecture">Technical architecture</a></li>
+      <li><a href="#merkle">The Merkle audit chain</a></li>
+      <li><a href="#sovereign">Sovereign deployment</a></li>
+      <li><a href="#regulation">Regulatory alignment</a></li>
+      <li><a href="#pricing">Pricing model</a></li>
+      <li><a href="#investors">For investors</a></li>
+    </ol>
+  </div>
+
+  <!-- PROBLEM -->
+  <div class="paper-section" id="problem">
+    <div class="eyebrow">// Section 01</div>
+    <h2>The compliance gap.</h2>
+    <p>The EU AI Act creates binding obligations for organisations deploying AI systems in high-risk categories — including credit scoring, employment tools, critical infrastructure, and law enforcement. These obligations include maintaining <strong>detailed logs of AI decision-making</strong>, ensuring human oversight, and demonstrating that systems operate within defined risk parameters.</p>
+    <p>Most organisations currently deploying AI have no infrastructure in place to produce this evidence. Consultancy documents and policy frameworks describe what should be done. They do not, by themselves, provide the technical mechanism to do it.</p>
+    <p><strong>AILeash is built to fill that specific gap.</strong> It is not a dashboard, a report, or a framework — it is live infrastructure. An API endpoint sits between an AI system and its decisions, logging every action into a cryptographically chained audit record before the response is returned to the caller.</p>
+
+    <div class="callout amber">
+      <h3>The enforcement timeline, accurately stated</h3>
+      <p>Prohibited AI practices have been enforceable since February 2025, and GPAI model transparency obligations since August 2025 — both unaffected by recent developments. The high-risk system obligations most relevant to this platform were set to apply from 2 August 2026, but a provisional agreement (the "Digital Omnibus," 7 May 2026) proposes deferring that specific deadline to 2 December 2027, pending formal EU adoption. Organisations should treat compliance infrastructure as something to build ahead of enforcement either way — audit trails and documentation take time to establish properly, and cannot be retrofitted after an incident.</p>
+    </div>
+
+    <div class="fine-tiers">
+      <div class="tier-row"><span class="tier-name">Tier 1 — Prohibited AI practices (Article 5)</span><span class="tier-amount">Up to €35m or 7% of global turnover</span></div>
+      <div class="tier-row"><span class="tier-name">Tier 2 — High-risk / operator obligations (Articles 9, 16, 26 etc.)</span><span class="tier-amount">Up to €15m or 3% of global turnover</span></div>
+      <div class="tier-row"><span class="tier-name">Tier 3 — Misleading information to authorities</span><span class="tier-amount">Up to €7.5m or 1.5% of global turnover</span></div>
+    </div>
+    <p style="font-size:12.5px;color:var(--muted);">Whichever figure is higher applies for large organisations; for SMEs and startups, the lower of the two applies. Source: Article 99, Regulation (EU) 2024/1689.</p>
+  </div>
+
+  <!-- COMPARISON -->
+  <div class="paper-section" id="comparison">
+    <div class="eyebrow">// Section 02</div>
+    <h2>AILeash vs alternatives.</h2>
+    <p>Most AI governance tools are observation layers — dashboards that summarise what has already happened. AILeash is designed as governance infrastructure: decisions pass through it in real time, producing a verifiable record as part of the decision flow itself, not after the fact.</p>
+
+    <div class="compare-wrap">
+      <div class="compare-label">// Capability comparison</div>
+      <div style="overflow-x:auto;">
+        <table class="compare-table">
+          <thead>
+            <tr>
+              <th>Capability</th>
+              <th class="highlight">AILeash</th>
+              <th>Cloud AI Platforms</th>
+              <th>Compliance Consultants</th>
+              <th>Internal Logging</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td>Tamper-evident audit chain</td><td class="highlight"><span class="tick">✓</span></td><td><span class="cross">✗</span></td><td><span class="cross">✗</span></td><td><span class="partial">Depends on build</span></td></tr>
+            <tr><td>Data stays on your hardware</td><td class="highlight"><span class="tick">✓</span></td><td><span class="cross">✗</span></td><td><span class="tick">✓</span></td><td><span class="tick">✓</span></td></tr>
+            <tr><td>Real-time ALLOW / CHALLENGE / BLOCK</td><td class="highlight"><span class="tick">✓</span></td><td><span class="partial">Partial</span></td><td><span class="cross">✗</span></td><td><span class="cross">✗</span></td></tr>
+            <tr><td>SHA-256 Merkle chain integrity</td><td class="highlight"><span class="tick">✓</span></td><td><span class="cross">✗</span></td><td><span class="cross">✗</span></td><td><span class="partial">Depends on build</span></td></tr>
+            <tr><td>Designed around EU AI Act record-keeping</td><td class="highlight"><span class="tick">✓</span></td><td><span class="partial">Partial</span></td><td><span class="partial">Partial</span></td><td><span class="partial">Partial</span></td></tr>
+            <tr><td>Precise decision timestamps</td><td class="highlight"><span class="tick">✓</span></td><td><span class="partial">Varies</span></td><td><span class="cross">✗</span></td><td><span class="partial">Varies</span></td></tr>
+            <tr><td>Independently verifiable chain integrity</td><td class="highlight"><span class="tick">✓</span></td><td><span class="cross">✗</span></td><td><span class="cross">✗</span></td><td><span class="partial">Depends on build</span></td></tr>
+            <tr><td>Fast integration (single API endpoint)</td><td class="highlight"><span class="tick">✓</span></td><td><span class="partial">Varies</span></td><td><span class="cross">Weeks–months</span></td><td><span class="partial">Varies</span></td></tr>
+            <tr><td>Flat predictable pricing</td><td class="highlight"><span class="tick">✓ 50p/device</span></td><td><span class="cross">Usage-based</span></td><td><span class="cross">£££ retainer</span></td><td><span class="tick">✓ (staffing cost)</span></td></tr>
+            <tr><td>No vendor data dependency</td><td class="highlight"><span class="tick">✓</span></td><td><span class="cross">✗</span></td><td><span class="tick">✓</span></td><td><span class="tick">✓</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ARCHITECTURE -->
+  <div class="paper-section" id="architecture">
+    <div class="eyebrow">// Section 03</div>
+    <h2>Technical architecture.</h2>
+    <p>AILeash is built on pure Python with minimal external runtime dependencies. The data layer uses SQLite in WAL (Write-Ahead Logging) mode for concurrent read performance. The audit chain is maintained in a dedicated table with each entry containing a SHA-256 hash of the previous entry — forming an unbroken Merkle chain from genesis block to present.</p>
+
+    <h3>Request lifecycle</h3>
+    <p>When a governance call arrives at <code style="font-family:'JetBrains Mono',monospace;color:var(--green);font-size:13px;">POST /api/govern</code>, risk scoring, decisioning, and the chain write complete in a median of 28ms, measured live in production.</p>
+
+    <div class="merkle-viz">
+      <div style="color:var(--muted);font-size:11px;margin-bottom:16px;text-transform:uppercase;letter-spacing:0.1em;">// Request → Chain → Response</div>
+
+      <div class="chain-row">
+        <div class="chain-block"><span class="chain-label">Incoming</span><span style="color:var(--text)">device_id + action + context</span></div>
+        <span class="chain-arrow">→</span>
+        <div class="chain-block"><span class="chain-label">Risk eval</span><span style="color:var(--text)">ALLOW / CHALLENGE / BLOCK</span></div>
+        <span class="chain-arrow">→</span>
+        <div class="chain-block entry"><span class="chain-label">Chain write</span><span class="chain-value">SHA-256(prev_hash + payload)</span></div>
+      </div>
+
+      <div style="color:var(--border);text-align:left;padding-left:80px;margin:4px 0;">↓</div>
+
+      <div class="chain-row">
+        <div class="chain-block genesis"><span class="chain-label">Genesis block</span><span class="chain-value gold">000000...0000</span></div>
+        <span class="chain-arrow">→</span>
+        <div class="chain-block entry"><span class="chain-label">Entry #1</span><span class="chain-value">a3f9c2d1...</span></div>
+        <span class="chain-arrow">→</span>
+        <div class="chain-block entry"><span class="chain-label">Entry #2</span><span class="chain-value">7bc1d4e8...</span></div>
+        <span class="chain-arrow">→</span>
+        <div style="color:var(--muted);font-size:11px;align-self:center;">... N</div>
+      </div>
+
+      <div style="margin-top:16px;color:var(--muted);font-size:11px;">
+        Each hash is computed over: previous_hash + decision + timestamp + device_id + action
+      </div>
+    </div>
+
+    <p>The response is returned with the decision, the new chain hash, and the chain index. The full chain can be independently verified at any time — any alteration to a historical record changes its hash, which breaks every subsequent link.</p>
+  </div>
+
+  <!-- MERKLE -->
+  <div class="paper-section" id="merkle">
+    <div class="eyebrow">// Section 04</div>
+    <h2>The Merkle audit chain.</h2>
+    <p>A Merkle chain provides a mathematically checkable guarantee of record integrity. Each entry contains a SHA-256 hash computed over the content of that entry plus the hash of the previous entry.</p>
+    <p><strong>Any modification to any historical record — no matter how small — produces a different hash, which breaks every subsequent entry in the chain.</strong> The break is detectable by recomputing hashes forward from genesis. There is no way to alter a past record and repair the chain without redoing every hash after it, which is computationally the same work as building a new chain.</p>
+
+    <div class="callout green">
+      <h3>What this means in practice</h3>
+      <p>A valid, unbroken chain demonstrates that the audit log has not been altered since the genesis block. This is a stronger integrity guarantee than a conventional append-only log, because tampering is mathematically detectable rather than merely against policy. Whether a given regulator or court accepts this as sufficient evidence in a specific case is a legal question outside the scope of this document — organisations should seek their own legal advice on evidentiary standards in their jurisdiction.</p>
+    </div>
+  </div>
+
+  <!-- SOVEREIGN -->
+  <div class="paper-section" id="sovereign">
+    <div class="eyebrow">// Section 05</div>
+    <h2>Sovereign deployment.</h2>
+    <p>Cloud AI governance tools introduce a structural issue: the data required to demonstrate compliance leaves the customer's network and is stored by a third party. This raises data transfer questions under GDPR, introduces vendor dependency, and means the audit trail's trustworthiness partly rests on the vendor's own security posture.</p>
+    <p>AILeash is designed to run on the customer's own infrastructure. The engine, database, and audit chain operate within the customer's network perimeter. <strong>Decision data does not need to leave the customer's infrastructure to be logged, hashed, and chained.</strong></p>
+
+    <div class="callout gold">
+      <h3>GDPR alignment</h3>
+      <p>Because data can remain within the customer's own network, cross-border data transfer questions and third-party processor obligations are reduced. This is a design choice that supports GDPR alignment — it is not itself a certification of compliance, which depends on the customer's full data handling practices.</p>
+    </div>
+  </div>
+
+  <!-- REGULATION -->
+  <div class="paper-section" id="regulation">
+    <div class="eyebrow">// Section 06</div>
+    <h2>Regulatory alignment.</h2>
+    <p>AILeash is designed to support the audit and transparency obligations introduced by the EU AI Act for high-risk AI systems, as well as related frameworks. This section describes design intent, not a legal certification — organisations remain responsible for their own compliance assessment.</p>
+
+    <div class="reg-grid">
+      <div class="reg-card"><h4>EU AI Act — Art. 12</h4><p>Record-keeping obligations for high-risk AI systems. AILeash provides automatic, tamper-evident logging of AI-assisted decisions with precise timestamps.</p></div>
+      <div class="reg-card"><h4>EU AI Act — Art. 9</h4><p>Risk management system requirements. AILeash's ALLOW / CHALLENGE / BLOCK framework provides a live risk control layer that can support this requirement.</p></div>
+      <div class="reg-card"><h4>GDPR — Art. 22</h4><p>Automated individual decision-making. AILeash logs can help demonstrate human oversight and support explainability of AI-assisted decisions.</p></div>
+      <div class="reg-card"><h4>UK Regulatory Engagement</h4><p>A white paper describing this approach was submitted to the Ofcom Additional Safety Measures consultation and acknowledged, with publication consent granted.</p></div>
+    </div>
+  </div>
+
+  <!-- PRICING -->
+  <div class="paper-section" id="pricing">
+    <div class="eyebrow">// Section 07</div>
+    <h2>Pricing model.</h2>
+    <p>AILeash is priced at <strong style="color:var(--gold);">50p per device per month</strong>. This is a flat rate — it does not vary by decision volume. An organisation with 10,000 devices pays £5,000 per month regardless of how many AI decisions those devices generate.</p>
+    <p>Partners and resellers set their own margin above the 50p base. New accounts receive <strong style="color:var(--text);">100 free decisions</strong> with no payment method required, so integration can be validated before any commercial commitment.</p>
+  </div>
+
+  <div class="pricing-strip">
+    <div class="pricing-text">
+      <h3>Start with 100 free decisions.</h3>
+      <p>Then <span>50p per device per month</span>. Sovereign deployment. Auditable by design.</p>
+    </div>
+    <a href="/#pricing" class="btn-primary">Get your API key →</a>
+  </div>
+
+  <!-- INVESTORS -->
+  <div class="paper-section" id="investors">
+    <div class="eyebrow">// Section 08</div>
+    <h2>For investors.</h2>
+    <div class="investor-strip">
+      <div class="eyebrow">Seed Round — Open</div>
+      <h2>Raising £500,000.</h2>
+      <p>A separate document covers the commercial picture in full — where things stand honestly (including the fact that there are no paying customers yet), the funding ask, use of funds, and the risks involved. If you're evaluating this as an investment rather than as technical infrastructure, that's the document to read next.</p>
+      <a href="/investors" class="investor-btn">Read the investor prospectus →</a>
+    </div>
+  </div>
+
+</div>
+
+<footer>
+  <p>sebbi.pro · AILeash · <a href="/developers">Developer Docs</a> · <a href="/scan">Compliance Scanner</a> · <a href="/investors">Investors</a></p>
+  <p>Submitted to Ofcom Additional Safety Measures Consultation · Publication consent confirmed.</p>
+  <p style="color:#4a4a5a;font-size:11.5px;">This document is provided for informational purposes. It does not constitute legal advice, a compliance certification, or an offer of securities. Regulatory information current as of the date of publication and subject to change — see the regulatory update notice above.</p>
+</footer>
+
+</body>
+</html>
