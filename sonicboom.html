@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>SonicBoom &mdash; Add Compliance Without Slowing Down</title>
+<meta name="description" content="SonicBoom adds a SHA-256 compliance audit chain to your existing AI stack with one API call, at a verified 28ms median. Try it live below — this is the real engine, not a demo.">
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;800;900&family=DM+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --navy:#0a0f1e;--cyan:#00d4ff;--gold:#c9a84c;--white:#fff;
+  --green:#00ff88;--red:#ff6b6b;--amber:#ffb020;
+  --mono:'JetBrains Mono',monospace;--sans:'DM Sans',sans-serif;--display:'Playfair Display',serif
+}
+html,body{background:var(--navy);color:var(--white);font-family:var(--sans);overflow-x:hidden}
+html{scroll-behavior:smooth}
+nav{position:fixed;top:0;left:0;right:0;z-index:100;background:rgba(10,15,30,0.97);backdrop-filter:blur(12px);padding:0 48px;height:68px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid rgba(0,212,255,0.1)}
+.nav-logo{font-family:var(--display);font-size:20px;color:var(--white);font-weight:900;text-decoration:none}.nav-logo span{color:var(--cyan)}
+.nav-links{display:flex;gap:16px;align-items:center}
+.nav-links a{color:rgba(255,255,255,0.4);text-decoration:none;font-size:13px;font-weight:500;transition:color .2s}.nav-links a:hover{color:var(--white)}
+.nav-cta{background:var(--cyan)!important;color:var(--navy)!important;padding:9px 18px;font-weight:700!important;border-radius:4px}
+
+.hero{padding:140px 48px 60px;text-align:center;position:relative;overflow:hidden;border-bottom:1px solid rgba(0,212,255,0.1)}
+.hero::before{content:'';position:absolute;inset:0;background:radial-gradient(ellipse at 50% 30%,rgba(0,212,255,0.06) 0%,transparent 60%)}
+.hero-inner{max-width:760px;margin:0 auto;position:relative;z-index:1}
+.eyebrow{font-family:var(--mono);font-size:11px;letter-spacing:3px;text-transform:uppercase;color:var(--cyan);margin-bottom:20px;display:block}
+h1{font-family:var(--display);font-size:clamp(34px,5vw,58px);line-height:1.08;font-weight:900;margin-bottom:18px}
+h1 em{color:var(--cyan);font-style:normal}
+.hero-sub{font-size:16px;color:rgba(255,255,255,0.4);line-height:1.75;max-width:560px;margin:0 auto 8px}
+.honesty-note{font-family:var(--mono);font-size:11.5px;color:rgba(0,255,136,0.6);margin-top:10px;letter-spacing:0.02em}
+
+/* LIVE PANEL — the signature element */
+.live-sec{padding:0 48px 80px}
+.live-inner{max-width:680px;margin:0 auto}
+.panel{background:rgba(255,255,255,0.03);border:1px solid rgba(0,212,255,0.2);border-radius:10px;overflow:hidden;box-shadow:0 0 60px rgba(0,212,255,0.04)}
+.panel-bar{background:rgba(0,212,255,0.05);padding:12px 20px;border-bottom:1px solid rgba(0,212,255,0.1);display:flex;align-items:center;gap:10px}
+.panel-dot{width:9px;height:9px;border-radius:50%;background:rgba(255,255,255,0.15)}
+.panel-dot.live{background:var(--green);animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}
+.panel-title{font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.3);letter-spacing:2px;text-transform:uppercase}
+.panel-body{padding:32px}
+.consent-block{text-align:center}
+.consent-block p{font-size:14px;color:rgba(255,255,255,0.5);line-height:1.7;margin-bottom:24px;max-width:460px;margin-left:auto;margin-right:auto}
+.consent-block p strong{color:var(--white)}
+.run-btn{background:var(--cyan);color:var(--navy);border:none;padding:15px 32px;font-family:var(--sans);font-weight:700;font-size:15px;border-radius:6px;cursor:pointer;transition:all .2s}
+.run-btn:hover{background:#33ddff}
+.run-btn:disabled{opacity:0.5;cursor:default}
+.what-sent{margin-top:20px;font-family:var(--mono);font-size:11px;color:rgba(255,255,255,0.2);line-height:1.8;text-align:left;background:rgba(0,0,0,0.25);border-radius:6px;padding:14px 16px;display:none}
+.what-sent.show{display:block}
+
+.result-block{display:none}
+.result-block.show{display:block}
+.rl{font-family:var(--mono);font-size:13px;line-height:2.2;display:flex;gap:10px;opacity:0;transform:translateY(4px);transition:opacity .3s,transform .3s}
+.rl.show{opacity:1;transform:none}
+.rl-prompt{color:rgba(0,212,255,0.3);flex-shrink:0}
+.rl-text{color:rgba(255,255,255,0.7)}
+.rl-cyan{color:var(--cyan)}
+.decision-display{margin:20px 0;padding:20px;border-radius:6px;text-align:center}
+.dd-allow{background:rgba(0,255,136,0.06);border:1px solid rgba(0,255,136,0.2)}
+.dd-challenge{background:rgba(255,176,32,0.06);border:1px solid rgba(255,176,32,0.25)}
+.dd-block{background:rgba(255,107,107,0.06);border:1px solid rgba(255,107,107,0.25)}
+.dd-word{font-family:var(--display);font-size:36px;font-weight:900;letter-spacing:3px;margin-bottom:6px}
+.dd-allow .dd-word{color:var(--green)}
+.dd-challenge .dd-word{color:var(--amber)}
+.dd-block .dd-word{color:var(--red)}
+.dd-meta{font-family:var(--mono);font-size:11px;color:rgba(255,255,255,0.3)}
+.hash-row{margin-top:16px;background:rgba(0,0,0,0.3);border-radius:6px;padding:14px 16px}
+.hash-label{font-family:var(--mono);font-size:9px;letter-spacing:2px;text-transform:uppercase;color:rgba(0,255,136,0.5);margin-bottom:6px}
+.hash-val{font-family:var(--mono);font-size:11px;color:var(--green);word-break:break-all;line-height:1.6}
+.verify-link{display:inline-block;margin-top:14px;font-family:var(--mono);font-size:11px;color:var(--cyan);text-decoration:none;border-bottom:1px solid rgba(0,212,255,0.3)}
+.verify-link:hover{border-color:var(--cyan)}
+.err-block{display:none;color:var(--red);font-family:var(--mono);font-size:12px;text-align:center;padding:16px;background:rgba(255,107,107,0.06);border-radius:6px;border:1px solid rgba(255,107,107,0.2)}
+.err-block.show{display:block}
+
+.divider{height:1px;background:linear-gradient(90deg,transparent,rgba(0,212,255,0.25),transparent)}
+
+.sec{padding:80px 48px;border-bottom:1px solid rgba(255,255,255,0.05)}
+.sec-inner{max-width:1000px;margin:0 auto}
+.sec-eyebrow{font-family:var(--mono);font-size:10px;letter-spacing:3px;text-transform:uppercase;color:rgba(0,212,255,0.5);margin-bottom:14px;display:block}
+h2{font-family:var(--display);font-size:clamp(26px,3.2vw,42px);font-weight:900;line-height:1.12;margin-bottom:14px}
+h2 em{color:var(--cyan);font-style:normal}
+.sec-sub{font-size:15px;color:rgba(255,255,255,0.35);line-height:1.8;max-width:600px;margin-bottom:44px}
+
+.two-col{display:grid;grid-template-columns:1fr 1fr;gap:2px;background:rgba(255,255,255,0.04)}
+.col{background:var(--navy);padding:36px 32px}
+.col-label{font-family:var(--mono);font-size:9px;letter-spacing:2px;text-transform:uppercase;margin-bottom:16px;padding:4px 10px;border-radius:2px;display:inline-block}
+.col-a .col-label{color:rgba(255,255,255,0.25);background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08)}
+.col-b .col-label{color:var(--cyan);background:rgba(0,212,255,0.06);border:1px solid rgba(0,212,255,0.2)}
+.col h3{font-family:var(--display);font-size:19px;font-weight:900;margin-bottom:10px}
+.col-a h3{color:rgba(255,255,255,0.35)}.col-b h3{color:var(--white)}
+.col p{font-size:13.5px;line-height:1.75;color:rgba(255,255,255,0.4)}
+.col-stat{font-family:var(--display);font-size:42px;font-weight:900;line-height:1;margin:16px 0 4px}
+.col-a .col-stat{color:rgba(255,255,255,0.12)}.col-b .col-stat{color:var(--cyan)}
+.col-stat-label{font-family:var(--mono);font-size:9px;letter-spacing:1px;color:rgba(255,255,255,0.2);text-transform:uppercase}
+
+.chain-viz{background:rgba(0,0,0,0.3);border:1px solid rgba(0,212,255,0.12);border-radius:6px;padding:28px;font-family:var(--mono);font-size:12px;line-height:2;margin-top:24px}
+.chain-viz .cv-label{font-size:9px;letter-spacing:2px;text-transform:uppercase;color:rgba(0,212,255,0.4);margin-bottom:14px}
+.chain-viz .cv-muted{color:rgba(255,255,255,0.25)}
+.chain-viz .cv-cyan{color:rgba(0,212,255,0.6)}
+.chain-viz .cv-green{color:var(--green)}
+.chain-viz .cv-note{color:rgba(255,255,255,0.2);margin-top:10px;font-size:11px}
+
+.feat-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:2px;background:rgba(255,255,255,0.04);margin-top:8px}
+.feat{background:var(--navy);padding:28px 24px}
+.feat h4{font-family:var(--display);font-size:16px;font-weight:900;color:var(--white);margin-bottom:8px}
+.feat p{font-size:13px;color:rgba(255,255,255,0.35);line-height:1.65}
+
+.price-card{background:rgba(255,255,255,0.03);border:1px solid rgba(0,212,255,0.15);border-radius:8px;padding:44px;margin-top:8px;text-align:center;max-width:520px;margin-left:auto;margin-right:auto}
+.price-big{font-family:var(--display);font-size:80px;font-weight:900;color:var(--cyan);line-height:1}
+.price-per{font-family:var(--mono);font-size:11px;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,0.2);margin-bottom:28px}
+.price-includes{display:flex;flex-direction:column;gap:9px;text-align:left;margin-bottom:28px}
+.pi{display:flex;align-items:flex-start;gap:9px;font-size:13.5px;color:rgba(255,255,255,0.5)}
+.pi::before{content:'OK';font-family:var(--mono);font-size:9px;font-weight:700;color:var(--cyan);flex-shrink:0;margin-top:3px}
+.btn-cyan{display:inline-block;background:var(--cyan);color:var(--navy);padding:14px 30px;border:none;font-family:var(--sans);font-weight:700;font-size:14px;border-radius:6px;text-decoration:none;transition:all .2s}
+.btn-cyan:hover{background:#33ddff}
+
+.signup-sec{padding:80px 48px}
+.signup-inner{max-width:480px;margin:0 auto;text-align:center}
+.signup-inner p{font-size:14.5px;color:rgba(255,255,255,0.35);line-height:1.7;margin-bottom:28px}
+.fg{margin-bottom:12px;text-align:left}
+.fg label{display:block;font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.25);letter-spacing:2px;text-transform:uppercase;margin-bottom:6px}
+.fg input{width:100%;background:rgba(255,255,255,0.05);border:2px solid rgba(255,255,255,0.08);color:var(--white);padding:12px 14px;font-size:14px;font-family:var(--sans);outline:none;border-radius:4px}
+.fg input:focus{border-color:var(--cyan)}
+.fg-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.btn-full{width:100%;padding:14px;font-size:15px;font-weight:700;border-radius:4px;border:none;cursor:pointer;font-family:var(--sans);background:var(--cyan);color:var(--navy);margin-top:8px}
+.msg-err{display:none;color:var(--red);font-family:var(--mono);font-size:11px;margin-top:10px;padding:10px;background:rgba(255,107,107,0.08);border-radius:4px}
+.msg-err.show{display:block}
+.key-box{display:none;margin-top:20px;background:rgba(0,0,0,0.3);border:1px solid rgba(0,212,255,0.2);border-radius:6px;padding:20px;text-align:left}
+.key-box.show{display:block}
+.key-val{font-family:var(--mono);font-size:11px;color:var(--green);word-break:break-all;background:rgba(0,0,0,0.3);padding:10px;border-radius:4px}
+
+footer{background:rgba(0,0,0,0.4);padding:40px 48px;border-top:1px solid rgba(255,255,255,0.04)}
+.foot-inner{max-width:1000px;margin:0 auto;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:16px}
+.foot-logo{font-family:var(--display);font-size:17px;color:var(--white);font-weight:900;text-decoration:none}.foot-logo span{color:var(--cyan)}
+.foot-links{display:flex;gap:20px;flex-wrap:wrap}
+.foot-links a{color:rgba(255,255,255,0.2);text-decoration:none;font-size:12px}
+.foot-copy{font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.1);width:100%;margin-top:14px;padding-top:14px;border-top:1px solid rgba(255,255,255,0.04)}
+
+@media(max-width:820px){
+  nav{padding:0 20px}.nav-links a:not(.nav-cta){display:none}
+  .hero,.live-sec,.sec,.signup-sec{padding-left:20px!important;padding-right:20px!important}
+  .two-col,.feat-grid,.fg-row{grid-template-columns:1fr!important}
+  footer{padding:32px 20px}.foot-inner{flex-direction:column;align-items:flex-start}
+}
+@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+
+<nav>
+  <a href="https://sebbi.pro" class="nav-logo">Monop <span>Content</span></a>
+  <div class="nav-links">
+    <a href="https://sebbi.pro/#products">All Products</a>
+    <a href="https://sebbi.pro/whitepaper">Whitepaper</a>
+    <a href="https://sebbi.pro/contact">Contact</a>
+    <a href="#signup" class="nav-cta">Get SonicBoom Free</a>
+  </div>
+</nav>
+
+<section class="hero">
+  <div class="hero-inner">
+    <span class="eyebrow">SonicBoom &mdash; Compliance Layer</span>
+    <h1>Add compliance.<br><em>Don't lose speed.</em></h1>
+    <p class="hero-sub">One API call adds a SHA-256 audit chain to your existing AI stack, at a verified 28ms median. Below, you can trigger a real decision in the live engine yourself &mdash; right now.</p>
+    <p class="honesty-note">This isn't a mockup. Clicking the button below sends a real request to our production API and shows you the real response.</p>
+  </div>
+</section>
+
+<section class="live-sec">
+  <div class="live-inner">
+    <div class="panel">
+      <div class="panel-bar">
+        <div class="panel-dot" id="panel-dot"></div>
+        <span class="panel-title">Live Engine &mdash; api.sebbi.pro/govern</span>
+      </div>
+      <div class="panel-body">
+
+        <div class="consent-block" id="consent-block">
+          <p>Trigger one real governance decision. We'll send a single anonymous, made-up test event &mdash; <strong>no data about you or your device is collected or sent</strong> &mdash; and show you exactly what comes back from the live engine, including the real audit hash written to the real chain.</p>
+          <button class="run-btn" id="run-btn" onclick="runLiveDemo()">Run a Real Decision &rarr;</button>
+          <div class="what-sent" id="what-sent"></div>
+        </div>
+
+        <div class="result-block" id="result-block">
+          <div class="rl" id="rl1"><span class="rl-prompt">&gt;</span><span class="rl-text">Sending event to <span class="rl-cyan">POST /api/govern</span>&hellip;</span></div>
+          <div class="rl" id="rl2"><span class="rl-prompt">&gt;</span><span class="rl-text">Response received in <span class="rl-cyan" id="rl-timing">&mdash;</span></span></div>
+          <div class="decision-display" id="decision-display">
+            <div class="dd-word" id="dd-word">&mdash;</div>
+            <div class="dd-meta" id="dd-meta">&mdash;</div>
+          </div>
+          <div class="hash-row">
+            <div class="hash-label">Real Audit Hash &mdash; Written to the Live Chain Just Now</div>
+            <div class="hash-val" id="hash-val">&mdash;</div>
+          </div>
+          <a href="https://sebbi.pro/api/verify-chain" target="_blank" class="verify-link">Verify the full chain integrity yourself &rarr;</a>
+        </div>
+
+        <div class="err-block" id="err-block">Couldn't reach the live engine just now. That's an honest error, not a fallback demo &mdash; try again in a moment.</div>
+
+      </div>
+    </div>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<section class="sec">
+  <div class="sec-inner">
+    <span class="sec-eyebrow">What SonicBoom Actually Does</span>
+    <h2>The compliance layer<br><em>doesn't cost you speed.</em></h2>
+    <p class="sec-sub">SonicBoom doesn't make your existing AI faster &mdash; nothing plugged in front of another system can do that. What it does is add a full compliance audit chain to your AI stack without that audit layer becoming a bottleneck itself.</p>
+    <div class="two-col">
+      <div class="col col-a">
+        <div class="col-label">Without an audit layer</div>
+        <h3>No record when it matters</h3>
+        <p>Your AI makes decisions. If nobody's logging them in a tamper-evident way, there's nothing to show a regulator, a court, or an affected customer after the fact.</p>
+        <div class="col-stat">Nothing</div>
+        <div class="col-stat-label">to show when it's asked for</div>
+      </div>
+      <div class="col col-b">
+        <div class="col-label">With SonicBoom</div>
+        <h3>One call. Real proof.</h3>
+        <p>One API call alongside your existing AI stack adds a SHA-256 Merkle-chained record of the decision &mdash; and the audit layer itself responds in a verified 28ms median.</p>
+        <div class="col-stat">28ms</div>
+        <div class="col-stat-label">verified median response, live</div>
+      </div>
+    </div>
+
+    <div class="chain-viz">
+      <div class="cv-label">How a record actually gets sealed</div>
+      <div class="cv-muted">Block N&minus;1 &mdash; hash: <span class="cv-cyan">a3f9b2c1&hellip;</span></div>
+      <div class="cv-muted">&#8595;</div>
+      <div class="cv-muted">Block N &mdash; event + decision + timestamp + prev_hash</div>
+      <div class="cv-green">hash: SHA-256(prev_hash + event + decision + timestamp)</div>
+      <div class="cv-note">Change any past block and every hash after it breaks &mdash; detectable, not just against policy.</div>
+    </div>
+  </div>
+</section>
+
+<section class="sec">
+  <div class="sec-inner">
+    <span class="sec-eyebrow">Who It's For</span>
+    <h2>If you're already running AI,<br><em>this sits alongside it.</em></h2>
+    <p class="sec-sub">SonicBoom is built to be added to an existing stack, not to replace it.</p>
+    <div class="feat-grid">
+      <div class="feat">
+        <h4>Platforms already using AI</h4>
+        <p>Add an audit chain to decisions already being made &mdash; loan approvals, moderation calls, fraud flags &mdash; without re-architecting anything.</p>
+      </div>
+      <div class="feat">
+        <h4>Developers &amp; agencies</h4>
+        <p>One API call to add to a client's stack. No new infrastructure, no new framework to learn.</p>
+      </div>
+      <div class="feat">
+        <h4>Compliance teams</h4>
+        <p>A real, verifiable answer to "prove what your AI decided and when" &mdash; not a policy document, an actual cryptographic record.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="sec">
+  <div class="sec-inner">
+    <span class="sec-eyebrow">Pricing</span>
+    <h2>Same model.<br><em>No surprises.</em></h2>
+    <div class="price-card">
+      <div class="price-big">50p</div>
+      <div class="price-per">per device per month &middot; billed via Stripe</div>
+      <div class="price-includes">
+        <div class="pi">One API call adds the audit chain to your existing stack</div>
+        <div class="pi">SHA-256 Merkle-chained record for every decision</div>
+        <div class="pi">28ms verified median response, live in production</div>
+        <div class="pi">100 free decisions to test before you commit</div>
+      </div>
+      <a href="#signup" class="btn-cyan">Get Free API Key &rarr;</a>
+    </div>
+  </div>
+</section>
+
+<section class="signup-sec" id="signup">
+  <div class="signup-inner">
+    <span class="sec-eyebrow">Get Started</span>
+    <h2>Free API key.<br><em>Working in minutes.</em></h2>
+    <p>Sign up, get your key, and add the audit chain to your first real request today.</p>
+    <div class="fg-row">
+      <div class="fg"><label>First Name</label><input type="text" id="fn" placeholder="Justin"></div>
+      <div class="fg"><label>Last Name</label><input type="text" id="ln" placeholder="Smith"></div>
+    </div>
+    <div class="fg"><label>Email Address</label><input type="email" id="em" placeholder="you@company.com"></div>
+    <div class="fg"><label>Company or Platform Name</label><input type="text" id="org" placeholder="e.g. MyPlatform Ltd"></div>
+    <button class="btn-full" id="signup-btn" onclick="doSignup()">Get Free API Key &rarr;</button>
+    <div class="msg-err" id="msg-err"></div>
+    <div class="key-box" id="key-box">
+      <div style="font-family:var(--mono);font-size:9px;letter-spacing:2px;color:var(--cyan);margin-bottom:8px;text-transform:uppercase">Your API Key &mdash; Save This</div>
+      <div class="key-val" id="key-val"></div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="foot-inner">
+    <a href="https://sebbi.pro" class="foot-logo">Monop <span>Content</span></a>
+    <div class="foot-links">
+      <a href="https://sebbi.pro/#products">All Products</a>
+      <a href="https://sebbi.pro/whitepaper">Whitepaper</a>
+      <a href="https://sebbi.pro/api/verify-chain">Verify Chain</a>
+      <a href="https://sebbi.pro/contact">Contact Justin</a>
+    </div>
+    <div class="foot-copy">&copy; 2026 Monop Content &middot; Justin Antony Dobson &middot; Blyth, Northumberland, UK</div>
+  </div>
+</footer>
+
+<script>
+async function runLiveDemo(){
+  var btn=document.getElementById('run-btn');
+  var whatSent=document.getElementById('what-sent');
+  var resultBlock=document.getElementById('result-block');
+  var errBlock=document.getElementById('err-block');
+  var dot=document.getElementById('panel-dot');
+
+  btn.disabled=true;btn.textContent='Sending real request\u2026';
+  errBlock.classList.remove('show');
+
+  // A made-up, anonymous test event — nothing about the visitor is read or sent.
+  var testEvent={
+    user_id:'sonicboom_visitor_'+Math.random().toString(36).slice(2,10),
+    action:'sonicboom_live_check',
+    amount:0,
+    country:'UK',
+    device_id:'sonicboom_demo',
+    anomaly:0.05,
+    device_risk:0.05
+  };
+
+  whatSent.textContent=JSON.stringify(testEvent,null,2);
+  whatSent.classList.add('show');
+
+  var t0=performance.now();
+  try{
+    var r=await fetch('https://sebbi.pro/api/govern',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(testEvent)
+    });
+    var data=await r.json();
+    var elapsed=Math.round(performance.now()-t0);
+
+    if(!r.ok || data.error){
+      throw new Error(data.error||'request_failed');
+    }
+
+    dot.classList.add('live');
+    resultBlock.classList.add('show');
+    setTimeout(function(){document.getElementById('rl1').classList.add('show');},100);
+    setTimeout(function(){
+      document.getElementById('rl2').classList.add('show');
+      document.getElementById('rl-timing').textContent=elapsed+'ms';
+    },400);
+
+    setTimeout(function(){
+      var dd=document.getElementById('decision-display');
+      var word=document.getElementById('dd-word');
+      var meta=document.getElementById('dd-meta');
+      var dec=data.decision||'UNKNOWN';
+      dd.className='decision-display dd-'+dec.toLowerCase();
+      word.textContent=dec;
+      meta.textContent='Score: '+data.score+'  \u2014  Trust: '+data.trust+'  \u2014  Version: '+data.version;
+      document.getElementById('hash-val').textContent=data.audit_hash||'(not returned)';
+      dd.style.opacity=0;
+      setTimeout(function(){dd.style.transition='opacity .4s';dd.style.opacity=1;},20);
+    },700);
+
+    btn.textContent='Run Another Real Decision \u2192';
+    btn.disabled=false;
+
+  }catch(e){
+    errBlock.classList.add('show');
+    btn.textContent='Try Again \u2192';
+    btn.disabled=false;
+  }
+}
+
+async function doSignup(){
+  var fn=document.getElementById('fn').value.trim();
+  var ln=document.getElementById('ln').value.trim();
+  var em=document.getElementById('em').value.trim();
+  var org=document.getElementById('org').value.trim();
+  var err=document.getElementById('msg-err');
+  var kb=document.getElementById('key-box');
+  var btn=document.getElementById('signup-btn');
+  err.classList.remove('show');kb.classList.remove('show');
+  if(!em||!em.includes('@')){err.textContent='Please enter a valid email address.';err.classList.add('show');return;}
+  if(!org){err.textContent='Please enter your company or platform name.';err.classList.add('show');return;}
+  var orig=btn.textContent;btn.textContent='Creating key\u2026';btn.disabled=true;
+  try{
+    var r=await fetch('https://sebbi.pro/signup',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({email:em,phone:'',name:fn+' '+ln,org:org,org_type:'sonicboom',product:'aileash',devices:1})});
+    var d=await r.json();
+    if(d.api_key){
+      document.getElementById('key-val').textContent=d.api_key;
+      kb.classList.add('show');
+      btn.textContent='Key Created \u2713';
+    }else{
+      err.textContent=d.error||'Something went wrong. Email justrightdecorators@gmail.com';
+      err.classList.add('show');btn.textContent=orig;btn.disabled=false;
+    }
+  }catch(e){
+    err.textContent='Cannot reach server. Email justrightdecorators@gmail.com';
+    err.classList.add('show');btn.textContent=orig;btn.disabled=false;
+  }
+}
+</script>
+</body>
+</html>
