@@ -1,0 +1,88 @@
+{
+  "routes": [
+    {
+      "path": "/",
+      "method": "GET",
+      "auth": "none",
+      "description": "Homepage",
+      "returns": "HTML"
+    },
+    {
+      "path": "/api/govern",
+      "method": "POST",
+      "auth": "Bearer API key",
+      "description": "Core decision endpoint",
+      "returns": "{decision, score, trust, reasons, audit_hash, receipt_seq}"
+    },
+    {
+      "path": "/api/keys",
+      "method": "POST",
+      "auth": "none",
+      "description": "Create API key (signup)",
+      "returns": "{api_key, quota, ref_code, badge_id}"
+    },
+    {
+      "path": "/signup",
+      "method": "POST",
+      "auth": "none",
+      "description": "Create API key (alternative endpoint)",
+      "returns": "{api_key, quota, ref_code, badge_id}"
+    },
+    {
+      "path": "/api/spec",
+      "method": "GET",
+      "auth": "none",
+      "description": "Engine specification",
+      "returns": "{engine, version, features, signals}"
+    },
+    {
+      "path": "/api/verify-chain",
+      "method": "GET",
+      "auth": "none",
+      "description": "Audit chain integrity",
+      "returns": "{valid, blocks, tip, message}"
+    },
+    {
+      "path": "/api/health",
+      "method": "GET",
+      "auth": "none",
+      "description": "Server health",
+      "returns": "{status, version, rps}"
+    },
+    {
+      "path": "/stripe-webhook",
+      "method": "POST",
+      "auth": "Stripe signature verification",
+      "description": "Stripe webhook receiver",
+      "returns": "{ok: true}"
+    },
+    {
+      "path": "/admin/auth",
+      "method": "POST",
+      "auth": "Admin password",
+      "description": "Admin login (rate limited)",
+      "returns": "{token, expires_in}"
+    },
+    {
+      "path": "/api/forensic/{audit_id}",
+      "method": "GET",
+      "auth": "Bearer API key",
+      "description": "Full forensic evidence (v6.4.2)",
+      "returns": "{request_context, timing_phases, signal_derivation, decision_trace, geoip, chain_continuity}"
+    },
+    {
+      "path": "/api/guardian/pattern-detect",
+      "method": "POST",
+      "auth": "Bearer Guardian key",
+      "description": "Detect predatory patterns (v6.4.2)",
+      "returns": "{pattern_detected, pattern_type, severity, confidence, behavioral_timeline}"
+    },
+    {
+      "path": "/api/guardian/report-ceop",
+      "method": "POST",
+      "auth": "Bearer Guardian key",
+      "description": "Report to CEOP (v6.4.2)",
+      "returns": "{report_ref, status, message}"
+    }
+  ]
+}
