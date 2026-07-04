@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Whitepaper v1.2 — AILeash by Monop Content</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Inter:wght@300;400;500;600;700&display=swap');
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#0a0f1e;--surface:#111a30;--border:#1e2a45;--gold:#c9a84c;--gold-dim:#8a6f2e;--green:#00e5a0;--green-dim:#00b87d;--amber:#ffb020;--text:#e8e8f0;--muted:#7d849a;--red:#ff4757}
+html{scroll-behavior:smooth}
+body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;font-size:16px;line-height:1.6}
+nav{position:fixed;top:0;left:0;right:0;z-index:100;background:rgba(10,15,30,0.92);backdrop-filter:blur(12px);border-bottom:1px solid var(--border);padding:0 24px;height:56px;display:flex;align-items:center;justify-content:space-between}
+.nav-logo{display:flex;align-items:center;gap:8px;font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--gold);text-decoration:none;letter-spacing:0.05em}
+.nav-links{display:flex;gap:24px;list-style:none}
+.nav-links a{color:var(--muted);text-decoration:none;font-size:13px;transition:color .2s}
+.nav-links a:hover{color:var(--text)}
+.nav-cta{background:var(--gold);color:#000;padding:8px 16px;border-radius:4px;font-size:13px;font-weight:600;text-decoration:none}
+.hero{padding:110px 24px 50px;max-width:880px;margin:0 auto}
+.eyebrow{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--gold);letter-spacing:0.15em;text-transform:uppercase;margin-bottom:14px}
+h1{font-size:clamp(28px,4vw,44px);font-weight:700;line-height:1.15;letter-spacing:-0.02em;margin-bottom:16px}
+.hero-meta{display:flex;gap:22px;flex-wrap:wrap;margin-bottom:28px}
+.meta-item{font-size:13px;color:var(--muted)}
+.meta-item span{color:var(--text)}
+.hero-abstract{background:var(--surface);border-left:3px solid var(--gold);padding:20px 24px;border-radius:0 6px 6px 0;color:var(--muted);font-size:15px;line-height:1.8;margin-bottom:20px}
+.hero-abstract strong{color:var(--text)}
+.update-notice{background:rgba(255,176,32,0.07);border:1px solid rgba(255,176,32,0.3);border-radius:6px;padding:16px 20px;margin-bottom:28px;font-size:13.5px;color:var(--muted);line-height:1.7}
+.update-notice strong{color:var(--amber)}
+.content{max-width:880px;margin:0 auto;padding:0 24px 80px}
+.paper-section{padding:46px 0;border-top:1px solid var(--border)}
+h2{font-size:22px;font-weight:600;margin-bottom:16px;letter-spacing:-0.01em}
+h3{font-size:15px;font-weight:600;margin:22px 0 10px;color:var(--gold)}
+p{color:var(--muted);font-size:15px;line-height:1.8;margin-bottom:14px}
+p strong{color:var(--text)}
+code,.mono{font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--green)}
+.spec{background:#0b1226;border:1px solid var(--border);border-radius:8px;padding:20px 24px;margin:18px 0;font-family:'JetBrains Mono',monospace;font-size:12.5px;line-height:1.9;color:var(--muted);overflow-x:auto;white-space:pre}
+.spec b{color:var(--green);font-weight:400}.spec i{color:var(--gold);font-style:normal}.spec em{color:var(--text);font-style:normal}
+table{width:100%;border-collapse:collapse;font-size:13.5px;margin:18px 0}
+thead tr{background:var(--surface)}
+th{padding:12px 14px;text-align:left;font-weight:600;font-size:11.5px;text-transform:uppercase;letter-spacing:0.08em;color:var(--muted);border-bottom:2px solid var(--border)}
+th.hl{color:var(--gold);background:rgba(201,168,76,0.06)}
+td{padding:13px 14px;border-bottom:1px solid var(--border);vertical-align:middle}
+td.hl{background:rgba(201,168,76,0.04)}
+td:first-child{color:var(--text);font-weight:500}
+tr:last-child td{border-bottom:none}
+.tick{color:var(--green);font-weight:600}.cross{color:var(--red)}.partial{color:var(--gold);font-size:12.5px}
+.callout{border-radius:8px;padding:22px 26px;margin:22px 0}
+.callout.gold{background:linear-gradient(135deg,rgba(201,168,76,0.08),rgba(201,168,76,0.02));border:1px solid var(--gold-dim)}
+.callout.green{background:linear-gradient(135deg,rgba(0,229,160,0.07),rgba(0,229,160,0.01));border:1px solid var(--green-dim)}
+.callout.amber{background:linear-gradient(135deg,rgba(255,176,32,0.08),rgba(255,176,32,0.02));border:1px solid rgba(255,176,32,0.35)}
+.callout h3{margin-top:0;margin-bottom:8px}
+.callout.green h3{color:var(--green)}.callout.amber h3{color:var(--amber)}
+.callout p{margin-bottom:0}
+.reg-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:22px 0}
+@media(max-width:640px){.reg-grid{grid-template-columns:1fr}.hide-m{display:none}}
+.reg-card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:18px}
+.reg-card h4{font-size:12.5px;font-weight:600;color:var(--gold);margin-bottom:8px;font-family:'JetBrains Mono',monospace}
+.reg-card p{font-size:13px;margin-bottom:0}
+.fine-tiers{display:flex;flex-direction:column;gap:2px;margin:18px 0;background:var(--border);border-radius:8px;overflow:hidden}
+.tier-row{background:var(--surface);padding:15px 18px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px}
+.tier-name{font-size:13.5px;color:var(--text);font-weight:500}
+.tier-amount{font-family:'JetBrains Mono',monospace;font-size:12.5px;color:var(--gold)}
+.toc{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:22px;margin-bottom:44px}
+.toc h3{margin-top:0;font-size:11px;text-transform:uppercase;letter-spacing:0.1em;color:var(--muted);margin-bottom:12px;font-family:'JetBrains Mono',monospace}
+.toc ol{padding-left:20px;display:flex;flex-direction:column;gap:6px}
+.toc a{color:var(--muted);text-decoration:none;font-size:14px}
+.toc a:hover{color:var(--gold)}
+.investor-strip{background:linear-gradient(135deg,rgba(0,229,160,0.06),rgba(201,168,76,0.04));border:1px solid var(--green-dim);border-radius:8px;padding:30px;margin-top:20px}
+.investor-strip .eyebrow{color:var(--green)}
+.investor-btn{display:inline-flex;gap:8px;background:var(--green);color:#000;padding:12px 24px;border-radius:4px;font-weight:600;font-size:14px;text-decoration:none;margin-top:8px}
+.pricing-strip{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:26px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:16px;margin-top:40px}
+.btn-primary{background:var(--gold);color:#000;padding:12px 24px;border-radius:4px;font-weight:600;font-size:14px;text-decoration:none;white-space:nowrap}
+footer{border-top:1px solid var(--border);padding:32px 24px;text-align:center;color:var(--muted);font-size:13px;max-width:880px;margin:0 auto}
+footer a{color:var(--gold);text-decoration:none}
+footer p{margin-bottom:6px}
+</style>
+</head>
+<body>
+<nav>
+  <a href="/" class="nav-logo"><svg width="20" height="20" viewBox="0 0 32 32"><circle cx="16" cy="16" r="13.5" fill="none" stroke="#c9a84c" stroke-width="2.6" stroke-dasharray="66 20" stroke-linecap="round" transform="rotate(-50 16 16)"/><circle cx="26.5" cy="7" r="3.1" fill="#c9a84c"/></svg>AILeash &middot; Monop Content</a>
+  <ul class="nav-links"><li><a href="/developers">Developers</a></li><li><a href="/ai.txt">ai.txt</a></li><li><a href="/scan">Scanner</a></li></ul>
+  <a href="/#signup" class="nav-cta">Get API Key</a>
+</nav>
+
+<div class="hero">
+  <div class="eyebrow">// Technical Whitepaper &middot; v1.2</div>
+  <h1>AILeash: Sovereign, Tamper-Evident AI Governance Infrastructure</h1>
+  <div class="hero-meta">
+    <div class="meta-item">Publisher: <span>Monop Content, Blyth, UK</span></div>
+    <div class="meta-item">Engine: <span>v6.2 (production)</span></div>
+    <div class="meta-item">Regulatory engagement: <span>Ofcom ASM consultation — acknowledged</span></div>
+  </div>
+  <div class="hero-abstract">
+    <strong>Abstract.</strong> AILeash is a deterministic AI governance engine providing real-time decision scoring, per-decision SHA-256 chain sealing, real-time block alerting with sealed evidence, and sovereign deployment in which decision data never leaves customer infrastructure. This paper specifies the scoring model, hash construction, concurrency guarantees, and verification surfaces precisely enough that every claim can be checked against the running system at sebbi.pro. It also states the economics: <strong>50p per device per month</strong>, flat, with partner-set margin above it — and describes the structural switching costs ("technical capture") that compliance history creates.
+  </div>
+  <div class="update-notice">
+    <strong>Regulatory update (May 2026):</strong> On 7 May 2026 the EU reached a provisional "Digital Omnibus" agreement that would defer the high-risk (Annex III) deadline from 2 August 2026 to 2 December 2027, pending formal adoption. Prohibited-practice rules (in force since February 2025) and GPAI obligations (in force since August 2025) are unaffected. This document treats December 2027 as the working planning date for high-risk obligations while noting formal adoption is pending.
+  </div>
+</div>
+
+<div class="content">
+  <div class="toc"><h3>Contents</h3><ol>
+    <li><a href="#problem">The compliance gap</a></li>
+    <li><a href="#engine">The scoring engine, exactly</a></li>
+    <li><a href="#chain">The audit chain, exactly</a></li>
+    <li><a href="#realtime">Real-time visibility (v6.2)</a></li>
+    <li><a href="#sovereign">Sovereign deployment &amp; licensing</a></li>
+    <li><a href="#verify">Public verification surfaces</a></li>
+    <li><a href="#aitxt">The ai.txt standard</a></li>
+    <li><a href="#capture">Technical capture: the market thesis</a></li>
+    <li><a href="#comparison">Comparison</a></li>
+    <li><a href="#regulation">Regulatory alignment</a></li>
+    <li><a href="#economics">Economics &amp; pricing</a></li>
+    <li><a href="#funding">Funding</a></li>
+  </ol></div>
+
+  <div class="paper-section" id="problem">
+    <div class="eyebrow">// Section 01</div>
+    <h2>The compliance gap.</h2>
+    <p>The EU AI Act creates binding obligations for organisations deploying AI in high-risk categories: maintain <strong>detailed logs of AI decision-making</strong> (Art. 12), operate a risk management system (Art. 9), explain decisions in accessible language (Art. 13), and preserve a human override pathway (Art. 14). The UK Online Safety Act and the ICO Children's Code impose parallel evidentiary duties on platforms today.</p>
+    <p>Most organisations deploying AI have no infrastructure that produces this evidence. Policy frameworks describe what should be done; they are not a mechanism for doing it. <strong>AILeash is the mechanism</strong>: an API endpoint that sits in the decision path, scoring and sealing every action before the response returns to the caller.</p>
+    <div class="fine-tiers">
+      <div class="tier-row"><span class="tier-name">Tier 1 — Prohibited practices (Art. 5)</span><span class="tier-amount">Up to €35m or 7% global turnover</span></div>
+      <div class="tier-row"><span class="tier-name">Tier 2 — High-risk / operator obligations (Arts. 9, 16, 26)</span><span class="tier-amount">Up to €15m or 3% global turnover</span></div>
+      <div class="tier-row"><span class="tier-name">Tier 3 — Misleading information to authorities</span><span class="tier-amount">Up to €7.5m or 1.5% global turnover</span></div>
+    </div>
+    <p style="font-size:12.5px">Higher figure applies for large organisations; lower for SMEs. Source: Art. 99, Regulation (EU) 2024/1689.</p>
+  </div>
+
+  <div class="paper-section" id="engine">
+    <div class="eyebrow">// Section 02</div>
+    <h2>The scoring engine, exactly.</h2>
+    <p>The engine is <strong>deterministic weighted scoring</strong> — a deliberate architectural constraint. Weights are immutable in code; there is no learned model in the decision path and therefore no model drift, no retraining opacity, and no explanation gap. Identical inputs produce identical outputs, forever. For a system whose output must survive regulatory scrutiny, determinism is a feature, not a limitation.</p>
+    <h3>The nine signals and their exact weights</h3>
+    <div class="spec"><em>score</em> = clamp( Σ , 0, 1 ) where Σ =
+  (1 − trust)                              × <i>0.30</i>
++ min(velocity_60s / 20, 1)                × <i>0.15</i>
++ min(velocity_5m / 50, 1)                 × <i>0.10</i>
++ min(velocity_1h / 200, 1)                × <i>0.10</i>
++ min(ln(1+amount) / ln(1+10000), 1)       × <i>0.15</i>   <b># log-scaled: £100 and £10,000 differ sanely</b>
++ device_risk                              × <i>0.10</i>
++ behavioural_anomaly                      × <i>0.10</i>
++ country_shift                            × <i>0.10</i>   <b># prior country ≠ current country</b>
++ unsafe_country                           × <i>0.10</i>   <b># outside allow-list of 13 jurisdictions</b>
+
+<em>decision</em> = ALLOW      if score &lt; <i>0.35</i>
+         = CHALLENGE  if score &lt; <i>0.70</i>
+         = BLOCK      otherwise</div>
+    <p>Weights sum to a maximum of 1.20 before clamping — deliberate headroom so that multiple simultaneous risk factors saturate the score rather than diluting each other.</p>
+    <h3>Trust dynamics</h3>
+    <div class="spec">on ALLOW:      trust += (1 − trust) × <i>0.01</i>   <b># slow asymptotic earn</b>
+on CHALLENGE:  trust −= trust × <i>0.02</i>
+on BLOCK:      trust −= trust × <i>0.08</i>         <b># 8× faster to lose than to earn</b>
+clamp to [<i>0.05</i>, <i>1.0</i>]                       <b># floor: no identity is ever fully written off</b></div>
+    <p>Trust is per-user and persistent. It takes roughly 70 clean events to climb from neutral (0.5) to 0.75, and three blocks to fall below it. This asymmetry is the engine's institutional memory: burst attacks self-amplify (each BLOCK lowers trust, raising the next score) — observed in production testing as escalation from CHALLENGE 0.61 to BLOCK 0.95 across fifteen hostile events.</p>
+    <h3>Velocity windows</h3>
+    <p>Three sliding windows (60s / 5m / 1h) per user, maintained in memory with periodic eviction. They catch the three canonical attack tempos: burst (bot), sustained (scripted abuse), and slow-roll (patient fraud).</p>
+  </div>
+
+  <div class="paper-section" id="chain">
+    <div class="eyebrow">// Section 03</div>
+    <h2>The audit chain, exactly.</h2>
+    <p>Every decision is sealed before the API response returns. The construction:</p>
+    <div class="spec"><em>payload</em>  = canonical_json({ prev_hash, ts, event, result })   <b># sorted keys — one byte, one hash</b>
+<em>hash_n</em>   = SHA-256(payload)
+<em>genesis</em>  = "GENESIS"</div>
+    <p><strong>Concurrency guarantee:</strong> the tip read, hash computation, and insert occur inside a single lock hold on a SQLite database in WAL mode. Two simultaneous requests cannot read the same tip and fork the chain — verified under 30 concurrent writes in testing, chain intact. This matters: a governance product whose own chain can fork under load would report false tampering on itself.</p>
+    <p><strong>Attribution without invalidation (v6.2):</strong> each block is attributed to the API key that produced it, stored <em style="color:var(--text)">alongside</em> the block, never inside the hash payload. Existing chains remain valid across the upgrade — a worked example of schema evolution on tamper-evident data: metadata may grow; hashed content is frozen forever.</p>
+    <div class="callout green">
+      <h3>What the chain proves — and what it doesn't</h3>
+      <p>A valid chain proves the record has not been altered since genesis: change one character and every subsequent hash breaks, detectably, by anyone recomputing forward. It does <strong>not</strong> prove the recorded events were true — hashing seals claims; it does not certify them. This is precisely the property regulators require: tamper-evidence makes lying <em style="color:var(--text)">permanent and detectable</em>, not impossible. Whether a specific court accepts a chain as sufficient evidence is a legal question; organisations should take their own advice. The gap between self-consistency and external truth is what cross-chain anchoring (Section 08, roadmap) exists to close.</p>
+    </div>
+  </div>
+
+  <div class="paper-section" id="realtime">
+    <div class="eyebrow">// Section 04</div>
+    <h2>Real-time visibility (v6.2).</h2>
+    <p>Industry surveys circulating in 2026 suggest fewer than one in five firms can detect an AI problem while it is happening. v6.2 addresses this with two mechanisms:</p>
+    <h3>Sealed-evidence alerting</h3>
+    <p>The moment the engine returns BLOCK on a customer's traffic, the account holder is emailed the evidence: user, action, score, plain-language reasons, and the audit hash under which the event is already sealed. Alerts are throttled to one per hour per key so a burst attack cannot become an inbox attack — production-tested: fourteen consecutive blocks produced exactly one email, chain intact throughout.</p>
+    <h3>The pulse endpoint</h3>
+    <div class="spec"><b>GET</b> /api/pulse   <b>Authorization: Bearer &lt;key&gt;</b>
+→ { last_hour: { ALLOW, CHALLENGE, BLOCK },
+    recent: [ { ts, action, decision, score, reasons[], sealed } × 10 ],
+    chain_tip }</div>
+    <p>One call gives an operator their live risk posture and the chain tip their evidence is sealed under. Governance stops being a quarterly report and becomes an instrument reading.</p>
+  </div>
+
+  <div class="paper-section" id="sovereign">
+    <div class="eyebrow">// Section 05</div>
+    <h2>Sovereign deployment &amp; licensing.</h2>
+    <p>Cloud governance tools create a structural contradiction: the data proving compliance leaves the customer's network and rests on a vendor's security posture. The <strong>Sebdog engine</strong> inverts this — engine, database, and chain run inside the customer's perimeter. Decision data does not need to leave their infrastructure to be scored, sealed, and verified.</p>
+    <h3>Air-gapped licence tokens</h3>
+    <div class="spec"><em>payload</em> = canonical_json({ v, key, devices, plan, email, issued, expires })
+<em>token</em>   = base64url( { payload, sig: HMAC-SHA256(secret, payload) } )
+<b># 365-day validity · verified offline · no callback required</b></div>
+    <p>A sovereign install validates its licence with pure cryptography — no phone-home, suitable for isolated environments. This also fixes the vendor's economics: infrastructure cost stays flat regardless of customer decision volume, because the decisions run on customer hardware.</p>
+    <div class="callout gold"><h3>GDPR alignment</h3><p>Because data can remain within the customer's network, cross-border transfer questions and third-party processor obligations are reduced. This is a design property supporting GDPR alignment — not itself a certification, which depends on the customer's full data practices.</p></div>
+  </div>
+
+  <div class="paper-section" id="verify">
+    <div class="eyebrow">// Section 06</div>
+    <h2>Public verification surfaces.</h2>
+    <p>Every guarantee in this paper is checkable against the running system, unauthenticated where possible. This table is the paper's bibliography:</p>
+    <table>
+      <thead><tr><th>Endpoint</th><th>Auth</th><th>Proves</th></tr></thead>
+      <tbody>
+        <tr><td class="mono">GET /api/verify-chain</td><td>none</td><td>Full chain integrity, genesis to tip</td></tr>
+        <tr><td class="mono">GET /api/inclusion?hash=</td><td>none</td><td>Any receipt hash is (or is not) sealed — with block index and sequence</td></tr>
+        <tr><td class="mono">GET /api/coverage</td><td>API key</td><td>Receipts issued vs blocks sealed — completeness, true/false</td></tr>
+        <tr><td class="mono">GET /api/pulse</td><td>API key</td><td>Live posture: last-hour decisions, recent events, chain tip</td></tr>
+        <tr><td class="mono">GET /api/regulation-map</td><td>none</td><td>Versioned, hash-sealed mapping of engine features to legal obligations</td></tr>
+        <tr><td class="mono">GET /api/partner/status?badge=</td><td>none</td><td>Partner account standing and platform status — independently attributable</td></tr>
+        <tr><td class="mono">GET /api/spec</td><td>none</td><td>The API's self-documentation — machine-readable continuity</td></tr>
+      </tbody>
+    </table>
+    <h3>Completeness receipts (v6.3)</h3>
+    <p>Integrity proves records weren't edited; it does not prove all records exist. AILeash closes the gap that can be closed: every decision returns a <strong>gapless per-key sequence number</strong>, issued inside the same transaction as the chain write. There is no code path where a decision occurs without its numbered receipt. A caller holding receipts <span class="mono">N</span> and <span class="mono">N+2</span> proves the omission of <span class="mono">N+1</span> by arithmetic, not policy. <strong>Edited records break the chain. Missing records break the sequence. Either way, it shows.</strong></p>
+    <h3>Hosted challenge resolution (v6.4)</h3>
+    <p>A CHALLENGE verdict returns a signed <span class="mono">challenge_url</span> — a verification page AILeash hosts. The end user confirms or denies; the resolution is sealed into the chain as its own block; the platform polls one status endpoint. Clients integrate exception handling in three lines instead of building workflow. Challenge tokens are stateless (HMAC-signed, time-limited), so the mechanism adds no storage and runs unchanged on sovereign installs.</p>
+    <h3>Regulatory provenance (v6.4)</h3>
+    <p>The mapping from engine features to legal obligations is published, versioned, and hash-sealed at <span class="mono">/api/regulation-map</span> — and every version change is itself sealed into the audit chain as a block. When regulation shifts, history shows exactly which map governed which historical decision. Regulatory churn becomes auditable provenance rather than silent reinterpretation.</p>
+  </div>
+
+  <div class="paper-section" id="aitxt">
+    <div class="eyebrow">// Section 07</div>
+    <h2>The ai.txt standard.</h2>
+    <p>robots.txt is a thirty-year-old text file that still governs how every crawler treats every website. <strong>ai.txt</strong> (AI-TXT/1.0, proposed) applies the same mechanism to AI governance: one machine-readable file at a domain's root declaring how its AI is governed — engine, decision model, audit construction, regulatory design targets — and, critically, <strong>where anyone can verify it</strong>.</p>
+    <p>The format is deliberately trivial: key–value pairs, comments, unknown keys ignored. The discipline is in one rule: <em style="color:var(--text)">a declaration without a verify endpoint is marketing; a declaration with one is accountability.</em> The first ai.txt is live at <span class="mono">sebbi.pro/ai.txt</span>. As agents begin choosing which platforms to transact with, they will read this file before they read anyone's marketing — and whichever chain a domain's ai.txt points at holds that domain's continuity.</p>
+  </div>
+
+  <div class="paper-section" id="capture">
+    <div class="eyebrow">// Section 08</div>
+    <h2>Technical capture: the market thesis.</h2>
+    <p>Lock-in is contractual: exit fees, term commitments, lawyers holding the door. <strong>Technical capture is structural</strong>: the product's own physics make leaving expensive, with no clause compelling anyone to stay. In compliance, four mechanisms compound:</p>
+    <table>
+      <thead><tr><th>Mechanism</th><th>Effect on switching</th></tr></thead>
+      <tbody>
+        <tr><td>Continuity</td><td>Exported records are data; the tamper-evidence regulators demand lives in the unbroken chain, which cannot migrate. Unbroken beats rebuilt, every time a regulator asks.</td></tr>
+        <tr><td>Trust reset</td><td>Per-user trust is earned decision-by-decision inside the engine. A departing platform restarts every user at neutral — detection quality drops on day one of leaving.</td></tr>
+        <tr><td>Public shields</td><td>Customer badges are rendered live against account standing. Leaving is publicly visible on the customer's own site — UNVERIFIED, in grey.</td></tr>
+        <tr><td>Standard-setting</td><td>ai.txt declarations point at a verify endpoint. Whoever's chain the ecosystem's files point at holds the ecosystem's continuity.</td></tr>
+      </tbody>
+    </table>
+    <div class="callout gold"><h3>Roadmap: cross-chain anchoring</h3><p>Self-consistency has a known boundary: a chain rebuilt from scratch is internally valid. The answer is <strong>mutual witnessing</strong> — independent organisations' chains periodically anchor each other's tips, so even a perfect rewrite is caught by records someone else holds. Proposed model: compliance vendors £10k/month, flat fee for industry participants, first ten members free to seed the network. Status: design stage — stated as roadmap, not as a shipped capability.</p></div>
+  </div>
+
+  <div class="paper-section" id="comparison">
+    <div class="eyebrow">// Section 09</div>
+    <h2>Comparison.</h2>
+    <table>
+      <thead><tr><th>Capability</th><th class="hl">AILeash</th><th>GRC platforms</th><th>Cloud AI guardrails</th><th>Consultancies</th></tr></thead>
+      <tbody>
+        <tr><td>Per-decision tamper-evident record</td><td class="hl tick">Yes — SHA-256 chain</td><td class="cross">Editable logs</td><td class="partial">Provider-held logs</td><td class="cross">No runtime</td></tr>
+        <tr><td>Omission detectable</td><td class="hl tick">Gapless receipts</td><td class="cross">No</td><td class="cross">No</td><td class="cross">—</td></tr>
+        <tr><td>Public verification</td><td class="hl tick">Unauthenticated endpoints</td><td class="cross">No</td><td class="cross">No</td><td class="cross">—</td></tr>
+        <tr><td>Decision latency</td><td class="hl tick">28ms median</td><td class="partial">Not in decision path</td><td class="partial">Varies; model-dependent</td><td class="cross">—</td></tr>
+        <tr><td>Data leaves customer?</td><td class="hl tick">Never (sovereign)</td><td class="cross">Vendor cloud</td><td class="cross">Provider cloud</td><td class="partial">Engagement-based</td></tr>
+        <tr><td>Deterministic / explainable</td><td class="hl tick">Immutable weights</td><td class="partial">Policy text</td><td class="cross">ML, drift-prone</td><td class="partial">Human judgement</td></tr>
+        <tr><td>Entry price</td><td class="hl tick">50p / device / month</td><td class="cross">£20k–£100k+ / yr</td><td class="partial">Usage-priced</td><td class="cross">£50k+ engagements</td></tr>
+      </tbody>
+    </table>
+    <p style="font-size:12.5px">Categories characterised in general terms; individual vendors vary. The claim defended here is narrow and checkable: no incumbent category combines per-decision sealing, omission detection, public verification and sovereign deployment at this price point.</p>
+  </div>
+
+  <div class="paper-section" id="regulation">
+    <div class="eyebrow">// Section 10</div>
+    <h2>Regulatory alignment.</h2>
+    <p>Design targets, feature by feature — published, versioned and sealed at <span class="mono">/api/regulation-map</span>. "Built for" is a design claim, not a certification; conformity assessment remains the deploying organisation's obligation.</p>
+    <div class="reg-grid">
+      <div class="reg-card"><h4>EU AI ACT — ART. 9</h4><p>Continuous risk management → per-event scoring across nine signals, velocity windows at three tempos, persistent per-user trust.</p></div>
+      <div class="reg-card"><h4>EU AI ACT — ART. 12</h4><p>Record-keeping → per-decision chain sealing, gapless receipts, public inclusion and coverage verification.</p></div>
+      <div class="reg-card"><h4>EU AI ACT — ART. 13</h4><p>Transparency → plain-language reason codes on every verdict; deterministic weights, publishable in full.</p></div>
+      <div class="reg-card"><h4>EU AI ACT — ART. 14</h4><p>Human oversight → CHALLENGE verdicts with hosted human resolution, sealed as first-class chain events.</p></div>
+      <div class="reg-card"><h4>UK ONLINE SAFETY ACT</h4><p>Evidence-backed moderation → real-time scoring with sealed audit trail; Ofcom ASM consultation submission acknowledged, publication consent granted.</p></div>
+      <div class="reg-card"><h4>ICO CHILDREN'S CODE</h4><p>Child-first design → Guardian: free family tool. One-tap Help, check-ins, and plain-English flagging of known grooming patterns. Never asserts a message is "safe"; message text is never stored, only a sealed fingerprint.</p></div>
+    </div>
+  </div>
+
+  <div class="paper-section" id="economics">
+    <div class="eyebrow">// Section 11</div>
+    <h2>Economics &amp; pricing.</h2>
+    <p><strong>50p per device per month, flat.</strong> Partners and resellers set their own price above it and keep the margin — a partner charging £1.99 retains £1.49 per device monthly. A referral layer pays introducers 10p per device per month, permanently: distribution that funds itself.</p>
+    <p>The structural advantage is cost shape. Sovereign deployment moves decision execution onto customer hardware, so vendor infrastructure cost is <strong>flat with respect to decision volume</strong>. Incumbent per-seat GRC pricing (typically £20k–£100k+ annually) leaves the mid-market unserved; 50p per device is priced for the platforms the incumbents ignore — and August 2026 obligates precisely those platforms.</p>
+    <div class="pricing-strip">
+      <div><strong style="font-size:17px">Free to integrate. 100 decisions included. No card.</strong><br><span style="color:var(--muted);font-size:13px">Guardian is free for families, permanently.</span></div>
+      <a class="btn-primary" href="/#signup">Get an API key →</a>
+    </div>
+  </div>
+
+  <div class="paper-section" id="funding">
+    <div class="eyebrow">// Section 12</div>
+    <h2>Funding.</h2>
+    <p><strong>Position, stated plainly:</strong> the platform is live, the billing loop is verified end-to-end, and the company is pre-revenue. Four years of development were self-funded on infrastructure costing pounds per month. There is no burn to outrun — the engine survives indefinitely at current cost. What capital buys is speed, not survival.</p>
+    <div class="investor-strip">
+      <div class="eyebrow">// The raise</div>
+      <p style="color:var(--text);font-size:15px"><strong>Seeking £500,000</strong> to convert a working engine into a market position ahead of enforcement: incorporation and compliance certifications (ISO 27001, Cyber Essentials Plus); first engineering and partner-support hires to retire the single-founder bottleneck; white-label partner onboarding; and standing up the cross-chain anchoring network while the standard is uncontested.</p>
+      <p style="font-size:13px">Diligence starts at the endpoints: every technical claim in this paper is verifiable against production before a single call is taken.</p>
+      <a class="investor-btn" href="/contact">Open a conversation →</a>
+    </div>
+  </div>
+
+</div>
+
+<footer>
+  <p><strong style="color:var(--text)">AILeash — Monop Content</strong> · Blyth, Northumberland, UK · <a href="https://sebbi.pro">sebbi.pro</a> · <a href="/ai.txt">ai.txt</a></p>
+  <p>Whitepaper v1.2 · Engine v6.4 · This document makes design claims, not certifications; organisations remain responsible for their own conformity assessment and legal advice.</p>
+  <p>© 2026 Justin Antony Dobson. Copyright, Designs and Patents Act 1988.</p>
+</footer>
+</body>
+</html>
