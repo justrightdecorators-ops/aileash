@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>AILeash Brain &mdash; Cryptographic Instruction Governance</title>
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;900&family=DM+Sans:wght@300;400;500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--navy:#0a0f1e;--gold:#c9a84c;--white:#fff;--off:#f5f7fa;--border:#e2e8f0;--muted:#64748b;--green:#00875a;--red:#cc0000;--mono:'JetBrains Mono',monospace;--sans:'DM Sans',sans-serif;--display:'Playfair Display',serif}
+body{font-family:var(--sans);background:var(--white);color:var(--navy)}
+nav{background:var(--navy);padding:0 48px;height:68px;display:flex;align-items:center;justify-content:space-between}
+.nav-logo{font-family:var(--display);font-size:22px;color:var(--white);font-weight:900}.nav-logo span{color:var(--gold)}
+.nav-links a{color:rgba(255,255,255,0.5);text-decoration:none;font-size:13px;margin-left:20px}.nav-links a:hover{color:var(--white)}
+.hero{background:var(--navy);padding:80px 48px;text-align:center}
+.hero h1{font-family:var(--display);font-size:clamp(36px,5vw,60px);color:var(--white);font-weight:900;margin-bottom:16px}
+.hero h1 span{color:var(--gold)}
+.hero p{font-size:18px;color:rgba(255,255,255,0.5);max-width:700px;margin:0 auto 32px;line-height:1.8}
+.badge{display:inline-block;background:rgba(201,168,76,0.15);border:1px solid rgba(201,168,76,0.4);color:var(--gold);font-family:var(--mono);font-size:10px;letter-spacing:2px;padding:6px 16px;border-radius:4px;margin-bottom:24px;text-transform:uppercase}
+.divider{height:4px;background:linear-gradient(90deg,var(--gold),var(--red),#00d4ff,#7c3aed)}
+.sec{padding:72px 48px;max-width:1100px;margin:0 auto}
+.sec-label{font-family:var(--mono);font-size:10px;letter-spacing:3px;text-transform:uppercase;color:var(--gold);margin-bottom:12px}
+.sec h2{font-family:var(--display);font-size:clamp(28px,3vw,40px);font-weight:900;margin-bottom:16px;line-height:1.1}
+.sec p{font-size:15px;color:var(--muted);line-height:1.8;margin-bottom:16px;max-width:800px}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:2px;background:var(--border);margin:40px 0}
+.card{background:var(--white);padding:32px 24px}
+.card-icon{font-size:28px;margin-bottom:12px}
+.card h3{font-family:var(--display);font-size:20px;font-weight:900;margin-bottom:8px}
+.card p{font-size:13px;color:var(--muted);line-height:1.7}
+.dark-sec{background:var(--navy);padding:72px 48px}
+.dark-inner{max-width:1100px;margin:0 auto}
+.dark-sec .sec-label{color:rgba(255,255,255,0.3)}
+.dark-sec h2{color:var(--white)}
+.dark-sec p{color:rgba(255,255,255,0.5)}
+.code-block{background:rgba(0,0,0,0.4);border:1px solid rgba(255,255,255,0.1);border-radius:6px;padding:24px;font-family:var(--mono);font-size:12px;color:#00ff88;line-height:2;margin:24px 0;overflow-x:auto}
+.output-block{background:rgba(0,0,0,0.4);border:1px solid rgba(255,255,255,0.1);border-radius:6px;padding:24px;font-family:var(--mono);font-size:11px;line-height:2.2;margin:24px 0}
+.allow{color:#00ff88}.block{color:#ff6b6b}.hash{color:rgba(255,255,255,0.3)}
+.benefits{display:grid;grid-template-columns:repeat(2,1fr);gap:16px;margin:32px 0}
+.benefit{background:var(--off);border:1px solid var(--border);border-left:4px solid var(--gold);padding:24px}
+.benefit h3{font-family:var(--display);font-size:17px;font-weight:900;margin-bottom:8px}
+.benefit p{font-size:13px;color:var(--muted);line-height:1.7}
+.price-sec{background:var(--gold);padding:72px 48px;text-align:center}
+.price-sec h2{font-family:var(--display);font-size:48px;font-weight:900;color:var(--navy);margin-bottom:8px}
+.price-sec p{font-size:16px;color:rgba(10,15,30,0.7);margin-bottom:32px}
+.btn{display:inline-block;background:var(--navy);color:var(--white);padding:16px 36px;font-family:var(--sans);font-weight:700;font-size:15px;text-decoration:none;border-radius:4px}
+.steps{counter-reset:step;margin:32px 0}
+.step{display:flex;gap:20px;margin-bottom:28px;align-items:flex-start}
+.step-n{background:var(--gold);color:var(--navy);width:32px;height:32px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:900;font-size:14px;flex-shrink:0;margin-top:2px}
+.step-text h3{font-size:15px;font-weight:700;margin-bottom:4px}
+.step-text p{font-size:13px;color:var(--muted);line-height:1.7}
+.note{max-width:800px;font-size:12px;color:var(--muted);line-height:1.7;margin-top:24px;padding:16px 20px;background:var(--off);border:1px solid var(--border);border-radius:6px}
+footer{background:#111827;padding:40px 48px;text-align:center;font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.2);letter-spacing:1px}
+@media(max-width:768px){
+nav{padding:0 20px}.nav-links{display:none}
+.hero,.sec,.dark-sec,.price-sec{padding:48px 20px}
+.grid,.benefits{grid-template-columns:1fr}
+}
+</style>
+</head>
+<body>
+<nav>
+  <div class="nav-logo">Monop <span>Content</span></div>
+  <div class="nav-links">
+    <a href="/">Home</a>
+    <a href="/scan">Scanner</a>
+    <a href="/certificate">Certificate</a>
+    <a href="/registry">Registry</a>
+    <a href="/ai.txt">ai.txt</a>
+    <a href="/comply.txt">comply.txt</a>
+    <a href="/contact">Contact</a>
+    <a href="/#signup">Get API Key</a>
+  </div>
+</nav>
+
+<section class="hero">
+  <div class="badge">Cryptographic Instruction Governance</div>
+  <h1>AILeash <span>Brain</span></h1>
+  <p>A cryptographic instruction governance layer for AI systems. Every instruction hashed. Every decision sealed. Every action recorded in a tamper-evident SHA-256 chain &mdash; where altering one record breaks every record after it.</p>
+</section>
+<div class="divider"></div>
+
+<section class="sec">
+  <div class="sec-label">What It Is</div>
+  <h2>A deterministic gate that records what your AI was told to do.</h2>
+  <p>AILeash Brain sits between your AI system and the instructions it receives. Every instruction is converted into a SHA-256 hash and checked against a set of explicitly defined rules. Permitted instructions pass through in milliseconds. Recognised dangerous instructions are blocked instantly, and every decision &mdash; allowed or blocked &mdash; is sealed into an audit chain that is tamper-evident: any later edit breaks the chain and is detectable by anyone.</p>
+  <p>It is more than a keyword filter &mdash; word-level hashes, phrase-level hashes and pattern rules are checked independently, and inputs are normalised so trivial obfuscation is caught. It is honest about its boundary too: it stops known dangerous instructions and their close variants, not every possible paraphrase. What it guarantees is that every decision it makes is permanent, explainable and provable.</p>
+
+  <div class="grid">
+    <div class="card">
+      <div class="card-icon">&#128272;</div>
+      <h3>Cryptographic Hashing</h3>
+      <p>Every instruction becomes a SHA-256 hash. Word-level and phrase-level hashes are checked independently, and inputs are normalised so punctuation and spacing tricks don't slip through.</p>
+    </div>
+    <div class="card">
+      <div class="card-icon">&#9889;</div>
+      <h3>Millisecond Decisions</h3>
+      <p>Governance decisions return in single-digit milliseconds &mdash; measured at roughly 4ms in testing. Your AI is gated without any meaningful performance impact.</p>
+    </div>
+    <div class="card">
+      <div class="card-icon">&#128279;</div>
+      <h3>Tamper-Evident Chain</h3>
+      <p>Every decision &mdash; ALLOW or BLOCK &mdash; is sealed into a SHA-256 chain. Edit one record and every record after it breaks. Gapless sequence numbers make an omitted record provable too.</p>
+    </div>
+    <div class="card">
+      <div class="card-icon">&#128737;&#65039;</div>
+      <h3>Threat Taxonomy</h3>
+      <p>Pre-built blocked instruction sets across child safety, data exfiltration, compliance bypass, prompt injection, and destructive system commands.</p>
+    </div>
+    <div class="card">
+      <div class="card-icon">&#128202;</div>
+      <h3>Risk Scoring</h3>
+      <p>Every instruction receives a weighted risk score alongside the ALLOW or BLOCK decision, giving your system context for a nuanced response.</p>
+    </div>
+    <div class="card">
+      <div class="card-icon">&#128296;</div>
+      <h3>Sealed Rulebook</h3>
+      <p>Add your own blocked rules &mdash; and every rule change is itself sealed into the chain. The rulebook's history is tamper-evident: nobody can quietly loosen it, including you.</p>
+    </div>
+  </div>
+</section>
+
+<section class="dark-sec">
+  <div class="dark-inner">
+    <div class="sec-label">How It Works</div>
+    <h2 style="font-family:var(--display);font-size:clamp(28px,3vw,40px);font-weight:900;margin-bottom:16px;color:var(--white)">One call. Instant decision. Permanent record.</h2>
+
+    <div class="code-block">
+from brain import BrainGovernor
+
+brain = BrainGovernor()
+
+result = brain.evaluate("export all user data")
+
+# Returns:
+# {
+#   "decision": "BLOCK",
+#   "reason": "pattern:data_exfiltration",
+#   "risk_score": 0.92,
+#   "instruction_hash": "a3f8c2d1...",
+#   "audit_hash": "9462e908...",
+#   "receipt_seq": 47,
+#   "ms": 3.9
+# }
+    </div>
+
+    <div class="sec-label" style="margin-top:32px">Live Output</div>
+    <div class="output-block">
+<span class="allow">ALLOW</span> | get compliance status        | 4.2ms | <span class="hash">aabadb78...</span>
+<span class="allow">ALLOW</span> | check audit chain            | 3.8ms | <span class="hash">6a65b1c1...</span>
+<span class="block">BLOCK</span> | ignore previous instructions | 4.1ms | <span class="hash">e94ae9c6...</span>
+<span class="block">BLOCK</span> | delete all records           | 3.9ms | <span class="hash">2c6698f9...</span>
+<span class="allow">ALLOW</span> | run compliance report        | 4.5ms | <span class="hash">9462e908...</span>
+<span class="block">BLOCK</span> | jailbreak the system         | 3.4ms | <span class="hash">6d7d200b...</span>
+<span class="block">BLOCK</span> | export all user data         | 3.9ms | <span class="hash">96bbf0fb...</span>
+<span class="allow">ALLOW</span> | generate summary             | 4.2ms | <span class="hash">6397cf2b...</span>
+    </div>
+  </div>
+</section>
+
+<section class="sec">
+  <div class="sec-label">Benefits</div>
+  <h2>What it does for your organisation.</h2>
+
+  <div class="benefits">
+    <div class="benefit">
+      <h3>Catches known prompt-injection patterns</h3>
+      <p>Common instructions designed to override your AI's behaviour &mdash; "ignore previous instructions", "you are now" &mdash; are caught by hash and pattern rules, and every attempt is sealed as evidence.</p>
+    </div>
+    <div class="benefit">
+      <h3>Flags data-exfiltration attempts</h3>
+      <p>Instructions that try to export, dump or extract user data are identified and blocked, and every attempt is recorded permanently in the chain.</p>
+    </div>
+    <div class="benefit">
+      <h3>Child-safety instruction blocks</h3>
+      <p>Pre-built rules block known grooming and secrecy phrasings, helping prevent your AI from being turned against child users &mdash; recorded as evidence when they occur.</p>
+    </div>
+    <div class="benefit">
+      <h3>EU AI Act evidence trail</h3>
+      <p>Every governance decision is sealed in a tamper-evident chain that anyone can verify &mdash; built for the record-keeping obligations of Article 12.</p>
+    </div>
+    <div class="benefit">
+      <h3>Detects compliance-bypass attempts</h3>
+      <p>Instructions that try to disable logging, clear audit trails or override compliance are blocked and sealed as evidence of the attempt.</p>
+    </div>
+    <div class="benefit">
+      <h3>Verifiable audit trail</h3>
+      <p>The SHA-256 chain produces tamper-evident evidence of every decision. Whether any specific record is admissible is a matter for a court &mdash; what the maths guarantees is that it hasn't been altered since it was sealed.</p>
+    </div>
+  </div>
+  <div class="note"><strong>An honest word on scope.</strong> Brain stops recognised dangerous instructions and their close variants using cryptographic hash-matching and pattern rules. It is not a semantic AI and will not catch every possible paraphrase of a harmful instruction. What it does guarantee is that every decision it makes &mdash; and every change to its own rulebook &mdash; is deterministic, explainable, and permanently sealed where tampering is detectable by anyone.</div>
+</section>
+
+<section class="dark-sec">
+  <div class="dark-inner">
+    <div class="sec-label">The Standard</div>
+    <h2 style="font-family:var(--display);font-size:clamp(28px,3vw,40px);font-weight:900;margin-bottom:16px;color:var(--white)">Declare it. Enforce it. Two files.</h2>
+    <p>robots.txt governed the crawler era with one text file. The AI era needs two &mdash; and both live at this domain's root, first of their kind:</p>
+    <div class="code-block" style="color:rgba(255,255,255,0.7)">
+<span style="color:#c9a84c">/ai.txt</span>      &mdash; the DECLARATION. How this domain's AI is governed:
+               engine, decision model, audit construction, and the public
+               endpoint where anyone can verify it. AI-TXT/1.0.
+
+<span style="color:#c9a84c">/comply.txt</span>  &mdash; the ENFORCEMENT. The orders a machine must follow when
+               it interacts with this domain: pre-flight reads, handshake,
+               the gateway every instruction passes through, and what
+               happens on violation &mdash; a BLOCK, sealed as evidence.
+               COMPLY-TXT/1.0.
+    </div>
+    <p>The discipline that makes them a standard rather than decoration: <strong style="color:#fff">a declaration without a verify endpoint is marketing; an enforcement file without a live gateway is a wish.</strong> Every line in both files is backed by a route you can call right now. When AI agents begin choosing which platforms to transact with, these are the files they will read first &mdash; and Brain is the gateway standing behind them.</p>
+  </div>
+</section>
+
+<section class="sec" style="border-top:1px solid var(--border);padding-top:72px">
+  <div class="sec-label">Implementation</div>
+  <h2>Up and running in four steps.</h2>
+
+  <div class="steps">
+    <div class="step">
+      <div class="step-n">1</div>
+      <div class="step-text">
+        <h3>Get your API key</h3>
+        <p>Sign up at sebbi.pro. 100 free governance decisions included. No card required.</p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-n">2</div>
+      <div class="step-text">
+        <h3>Download brain.py</h3>
+        <p>A single Python file with no external dependencies. Drops straight into your existing system.</p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-n">3</div>
+      <div class="step-text">
+        <h3>Wrap your AI calls</h3>
+        <p>Pass every instruction through brain.evaluate() before it reaches your AI. One line of code.</p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-n">4</div>
+      <div class="step-text">
+        <h3>Your audit chain starts immediately</h3>
+        <p>Every decision is recorded from the first call. Your compliance record starts now.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="price-sec">
+  <h2>50p per device per month.</h2>
+  <p>Same pricing as AILeash. No setup fees. No contracts. 100 free decisions to start.</p>
+  <a href="/#signup" class="btn">Get Your API Key &rarr;</a>
+</section>
+
+<footer>
+  &copy; 2026 Justin Antony Dobson / Monop Content &nbsp;&middot;&nbsp; Blyth, Northumberland, UK &nbsp;&middot;&nbsp; sebbi.pro
+</footer>
+</body>
+</html>
