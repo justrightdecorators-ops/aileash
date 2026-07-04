@@ -1,0 +1,63 @@
+# ====================================================================
+# comply.txt - PRODUCTION ENFORCEMENT STANDARD (COMPLY-TXT/1.0, proposed)
+# Companion to ai.txt (AI-TXT/1.0)
+# Author: Monop Content, Blyth, UK. Reference implementation: sebbi.pro
+# ====================================================================
+#
+# THE PAIR, IN ONE LINE EACH
+#   ai.txt     DECLARES how a domain's AI is governed, and where to verify it.
+#   comply.txt ENFORCES - it states the orders a machine must follow when it
+#              interacts with this domain, and what happens if it doesn't.
+#
+# A declaration without a verify endpoint is marketing.
+# An enforcement file without a live gateway is a wish.
+# This domain has both.
+#
+# FORMAT
+# [Section] headers, Key: Value pairs, # comments. Case-insensitive keys.
+# Unknown keys must be ignored by parsers. One file, at the domain root.
+# ====================================================================
+
+[Core-Configuration]
+Standard: COMPLY-TXT/1.0
+Operator: Monop Content
+Engine: AILeash Brain v3.0 + AILeash Engine v6.4
+Engine-Mode: Active-Intercept          # instructions are gated BEFORE execution
+Decision-Latency-Median: 28ms
+Audit-Chain: SHA-256, per-decision, genesis-anchored, gapless receipts
+Enforcement: Strict                    # unrecognised = evaluated, never waved through
+
+[Gateway-Directives]
+Pre-Flight-Requirement: /ai.txt        # read the declaration before you transact
+Handshake-Required: True               # authenticate with an API key
+Validation-Route: /api/govern          # every actionable instruction is scored here
+Instruction-Gate: brain.evaluate()     # hash + pattern check, sealed either way
+Challenge-Route: /verify-challenge     # human resolution for CHALLENGE verdicts
+
+[Bot-Compliance-Orders]
+User-agent: *
+Unverified-Scraping: Disallowed
+Cryptographic-Token: Required          # HMAC-signed; offline-verifiable
+Rate-Limits: 60/min, 1000/hour per key
+Action-On-Violation: BLOCK, sealed     # the violation itself becomes chain evidence
+
+[Audit-Logging]
+Log-Integrity: Tamper-evident          # edit one record, every later record breaks
+Log-Completeness: Gapless sequence     # omit one record, the sequence proves it
+Log-Verification: /api/verify-chain    # public, unauthenticated, anyone may run it
+Inclusion-Proof: /api/inclusion?hash=  # any receipt, checkable by anyone
+Admissibility-Note: Whether a record is admissible is for a court to decide.
+Admissibility-Note: What the mathematics guarantees is that it has not been
+Admissibility-Note: altered since it was sealed - and that is checkable by anyone.
+
+[Commercial-Terms]
+Device-Rate: 0.50-GBP-per-device-per-month
+Free-Tier: 100 decisions, no card
+Partner-Margin: set your own price above the rate; keep the difference
+
+# ====================================================================
+# PUBLISH YOUR OWN
+# Copy this file. Keep only the orders your gateway genuinely enforces -
+# an honest short comply.txt beats an aspirational long one. If a line
+# has no live route behind it, delete the line.
+# ====================================================================
