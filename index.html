@@ -1,0 +1,760 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<meta name="google-site-verification" content="mM_hYELAWL0vrzIvAnKRBlUnN1kM-H656cmjMrFT-3U">
+<title>AILeash &mdash; Every AI decision, sealed.</title>
+<meta name="description" content="AI governance, fraud alerting and honest child-safety tools on one tamper-evident engine. Free to integrate, 50p per device per month. Guardian is free for families.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,900;1,9..144,600;1,9..144,900&family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --ink:#0a0f1e;          /* deep navy - the vault */
+  --ink2:#10182e;
+  --paper:#f6f3ec;        /* ledger paper */
+  --line:#e3ddcf;         /* ledger rule */
+  --gold:#c9a84c;         /* the seal */
+  --allow:#1a9e6e;        /* decision colours - used ONLY for decisions */
+  --challenge:#c07a1d;
+  --block:#c8362b;
+  --mutei:rgba(255,255,255,0.45);
+  --mutep:#6b6353;
+  --disp:'Fraunces',Georgia,serif;
+  --body:'Space Grotesk',system-ui,sans-serif;
+  --mono:'IBM Plex Mono',monospace;
+}
+html{scroll-behavior:smooth}
+body{background:var(--paper);color:var(--ink);font-family:var(--body);overflow-x:hidden}
+::selection{background:var(--gold);color:var(--ink)}
+
+/* ---------- nav ---------- */
+nav{position:fixed;top:0;left:0;right:0;z-index:200;background:var(--ink);height:64px;display:flex;align-items:center;justify-content:space-between;padding:0 28px;border-bottom:1px solid rgba(201,168,76,0.25)}
+.logo{font-family:var(--disp);font-weight:900;font-size:20px;color:#fff;letter-spacing:-0.02em}
+.logo b{color:var(--gold);font-weight:900}
+.nvl{display:flex;gap:22px;align-items:center}
+.nvl a{color:var(--mutei);text-decoration:none;font-size:13px;font-weight:500;transition:color .2s}
+.nvl a:hover{color:#fff}
+.ncta{background:var(--gold);color:var(--ink)!important;padding:9px 16px;border-radius:3px;font-weight:700!important}
+
+/* ---------- the visit ledger rail (signature) ---------- */
+#rail{position:fixed;left:0;top:64px;bottom:0;width:210px;background:var(--ink);z-index:150;padding:22px 16px;border-right:1px solid rgba(201,168,76,0.2);display:flex;flex-direction:column;overflow:hidden}
+.rail-t{font-family:var(--mono);font-size:9px;letter-spacing:2.5px;text-transform:uppercase;color:var(--gold);margin-bottom:4px}
+.rail-s{font-family:var(--mono);font-size:8.5px;color:var(--mutei);line-height:1.6;margin-bottom:14px}
+#chain{flex:1;overflow:hidden;position:relative}
+#chain::before{content:'';position:absolute;left:7px;top:0;bottom:0;width:1px;background:rgba(201,168,76,0.25)}
+.blk{position:relative;padding:0 0 14px 22px;opacity:0;transform:translateY(6px);transition:opacity .5s,transform .5s}
+.blk.on{opacity:1;transform:none}
+.blk::before{content:'';position:absolute;left:3px;top:3px;width:9px;height:9px;border-radius:50%;background:var(--ink);border:2px solid var(--gold)}
+.blk.on::before{background:var(--gold)}
+.blk-n{font-family:var(--mono);font-size:9px;color:#fff;font-weight:600}
+.blk-h{font-family:var(--mono);font-size:8.5px;color:var(--gold);word-break:break-all;line-height:1.5}
+.rail-foot{font-family:var(--mono);font-size:8.5px;color:var(--mutei);line-height:1.6;padding-top:10px;border-top:1px solid rgba(255,255,255,0.08)}
+.rail-foot b{color:#7fe3b0;font-weight:600}
+/* mobile: rail collapses to a live chip */
+#chip{display:none;position:fixed;bottom:14px;left:14px;right:14px;z-index:150;background:var(--ink);border:1px solid rgba(201,168,76,0.4);border-radius:6px;padding:9px 13px;font-family:var(--mono);font-size:9.5px;color:var(--gold);box-shadow:0 6px 24px rgba(10,15,30,0.35)}
+#chip .ch{color:#7fe3b0;word-break:break-all}
+
+/* ---------- page shell ---------- */
+main{margin-left:210px;padding-top:64px}
+section{position:relative;border-bottom:1px solid var(--line)}
+.wrap{max-width:1040px;margin:0 auto;padding:84px 48px}
+/* ledger entry header on every section */
+.entry{display:flex;align-items:baseline;gap:14px;margin-bottom:8px;font-family:var(--mono);font-size:10px;letter-spacing:2px;text-transform:uppercase}
+.entry .no{color:var(--ink);font-weight:600}
+.entry .rule{flex:1;height:1px;background:var(--line);align-self:center}
+.entry .sealed{color:var(--mutep);letter-spacing:0;text-transform:none;font-size:9.5px}
+.entry .sealed b{color:var(--gold);font-weight:600}
+
+h1{font-family:var(--disp);font-weight:900;font-size:clamp(44px,5.4vw,76px);line-height:0.98;letter-spacing:-0.025em}
+h1 i{font-style:italic;color:var(--gold)}
+h2{font-family:var(--disp);font-weight:900;font-size:clamp(30px,3.4vw,46px);line-height:1.02;letter-spacing:-0.02em;margin-bottom:14px}
+h2 i{font-style:italic;color:var(--gold)}
+.lead{font-size:16px;line-height:1.75;color:var(--mutep);max-width:640px}
+.lead b{color:var(--ink);font-weight:700}
+
+/* ---------- hero (dark) ---------- */
+#hero{background:var(--ink);color:#fff;border-bottom:none}
+#hero .wrap{padding:96px 48px 72px}
+#hero .lead{color:var(--mutei)}
+#hero .lead b{color:#fff}
+.deadline{display:inline-flex;gap:10px;align-items:center;font-family:var(--mono);font-size:10px;letter-spacing:1.5px;text-transform:uppercase;color:#ffb4ad;border:1px solid rgba(200,54,43,0.5);padding:7px 13px;border-radius:3px;margin-bottom:28px}
+.deadline b{color:#fff}
+.hseal{margin-top:22px;font-family:var(--mono);font-size:11px;color:var(--gold);min-height:18px}
+.hseal .hh{color:#7fe3b0;word-break:break-all}
+.hbtns{display:flex;gap:12px;flex-wrap:wrap;margin-top:34px}
+.bgold{background:var(--gold);color:var(--ink);padding:15px 26px;border:none;border-radius:3px;font-family:var(--body);font-weight:700;font-size:14px;text-decoration:none;display:inline-block;transition:transform .15s,background .15s;cursor:pointer}
+.bgold:hover{background:#dbbd63;transform:translateY(-2px)}
+.bghost{background:transparent;color:var(--mutei);padding:15px 26px;border:1px solid rgba(255,255,255,0.2);border-radius:3px;font-weight:600;font-size:14px;text-decoration:none;display:inline-block;transition:all .15s}
+.bghost:hover{color:#fff;border-color:rgba(255,255,255,0.55)}
+/* live decision strip */
+.ticker{background:var(--ink2);border-top:1px solid rgba(201,168,76,0.2);overflow:hidden;padding:11px 0;white-space:nowrap}
+.tk{display:inline-block;animation:tk 38s linear infinite;font-family:var(--mono);font-size:10.5px}
+.tk span{margin:0 26px;color:var(--mutei)}
+.tk .A{color:var(--allow)}.tk .C{color:var(--challenge)}.tk .B{color:var(--block)}
+@keyframes tk{from{transform:translateX(0)}to{transform:translateX(-50%)}}
+
+/* ---------- how ---------- */
+.steps{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--line);border:1px solid var(--line);margin-top:40px}
+.st{background:var(--paper);padding:30px 26px}
+.st .k{font-family:var(--mono);font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--gold);font-weight:600;margin-bottom:12px}
+.st h3{font-family:var(--disp);font-weight:900;font-size:21px;margin-bottom:10px;letter-spacing:-0.01em}
+.st p{font-size:13.5px;color:var(--mutep);line-height:1.7}
+.st p b{color:var(--ink)}
+
+/* ---------- products (ledger rows, not cards) ---------- */
+.prod{display:grid;grid-template-columns:200px 1fr 200px;gap:36px;padding:38px 0;border-top:1px solid var(--line);align-items:start}
+.prod:first-of-type{border-top:none}
+.pn{font-family:var(--disp);font-weight:900;font-size:26px;letter-spacing:-0.015em;line-height:1.05}
+.pn small{display:block;font-family:var(--mono);font-weight:400;font-size:9.5px;letter-spacing:2px;text-transform:uppercase;color:var(--mutep);margin-top:8px}
+.pd{font-size:14px;line-height:1.75;color:var(--mutep)}
+.pd b{color:var(--ink)}
+.pf{margin-top:14px;font-family:var(--mono);font-size:11px;line-height:2.1;color:var(--ink)}
+.pf em{font-style:normal;color:var(--gold);margin-right:8px}
+.pp{text-align:right}
+.pp .amt{font-family:var(--disp);font-weight:900;font-size:40px;line-height:1}
+.pp .per{font-family:var(--mono);font-size:9px;letter-spacing:1px;text-transform:uppercase;color:var(--mutep);margin:6px 0 16px}
+.pbtn{display:inline-block;background:var(--ink);color:#fff;padding:11px 18px;border-radius:3px;font-size:13px;font-weight:700;text-decoration:none;transition:background .15s}
+.pbtn:hover{background:#232c47}
+.pbtn.free{background:var(--allow)}
+.guardian-note{font-family:var(--mono);font-size:9.5px;color:var(--allow);margin-top:8px}
+
+/* ---------- calculator (dark) ---------- */
+#margin{background:var(--ink);color:#fff}
+#margin .entry .no{color:#fff}
+#margin .entry .rule{background:rgba(255,255,255,0.12)}
+#margin .lead{color:var(--mutei)}
+.cwrap{margin-top:36px;border:1px solid rgba(201,168,76,0.3);border-radius:6px;padding:34px;background:var(--ink2)}
+.crow{display:grid;grid-template-columns:1fr 1fr;gap:24px;margin-bottom:26px}
+.clab{font-family:var(--mono);font-size:9.5px;letter-spacing:2px;text-transform:uppercase;color:var(--mutei);margin-bottom:10px}
+.cin{display:flex;align-items:center;gap:10px}
+.cin .pd2{font-family:var(--disp);font-size:26px;color:var(--gold);font-weight:900}
+input.ci,select.ci{background:rgba(255,255,255,0.07);border:1px solid rgba(201,168,76,0.35);color:#fff;font-family:var(--mono);font-size:17px;padding:12px 15px;border-radius:4px;outline:none;width:100%}
+input.ci:focus,select.ci:focus{border-color:var(--gold)}
+select.ci option{background:var(--ink)}
+.cres{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:rgba(255,255,255,0.08);border-radius:4px;overflow:hidden}
+.cr2{background:rgba(255,255,255,0.03);padding:22px;text-align:center}
+.cr2 .l{font-family:var(--mono);font-size:9px;letter-spacing:2px;text-transform:uppercase;color:var(--mutei);margin-bottom:10px}
+.cr2 .v{font-family:var(--disp);font-weight:900;font-size:30px}
+.v-you{color:#7fe3b0}.v-user{color:var(--gold)}.v-we{color:rgba(255,255,255,0.35)}
+.cr2 .s{font-family:var(--mono);font-size:8.5px;color:var(--mutei);margin-top:6px}
+
+/* ---------- referral ---------- */
+.refrow{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--line);border:1px solid var(--line);margin-top:36px}
+.rf{background:var(--paper);padding:28px 24px}
+.rf h3{font-family:var(--disp);font-weight:900;font-size:19px;margin-bottom:8px}
+.rf p{font-size:13px;color:var(--mutep);line-height:1.7}
+.rf .big{font-family:var(--disp);font-weight:900;font-size:34px;color:var(--gold);margin-top:12px}
+.rf .bl{font-family:var(--mono);font-size:8.5px;letter-spacing:1.5px;text-transform:uppercase;color:var(--mutep)}
+
+/* ---------- law ---------- */
+.laws{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:36px}
+.law{border:1px solid var(--line);border-left:3px solid var(--ink);padding:24px;background:#fbf9f4}
+.law .act{font-family:var(--mono);font-size:9px;letter-spacing:2px;text-transform:uppercase;color:var(--mutep);margin-bottom:10px}
+.law .plain{font-family:var(--disp);font-weight:600;font-style:italic;font-size:17px;line-height:1.45;margin-bottom:10px}
+.law p{font-size:13px;color:var(--mutep);line-height:1.7}
+.law ul{list-style:none;margin-top:12px}
+.law li{font-family:var(--mono);font-size:11px;line-height:2;color:var(--ink)}
+.law li::before{content:'\2713\00a0\00a0';color:var(--allow);font-weight:700}
+
+/* ---------- verify moment ---------- */
+#verify{background:var(--ink);color:#fff;text-align:center}
+#verify .wrap{padding:76px 48px}
+#verify .lead{margin:0 auto;color:var(--mutei)}
+#vbtn{margin-top:30px}
+#vout{margin-top:26px;font-family:var(--mono);font-size:11px;line-height:2;color:var(--mutei);min-height:24px;max-width:620px;margin-left:auto;margin-right:auto;text-align:left;word-break:break-all}
+#vout .ok{color:#7fe3b0}#vout .h{color:var(--gold)}
+
+/* ---------- signup ---------- */
+#signup .wrap{max-width:640px}
+.tabs{display:grid;grid-template-columns:repeat(4,1fr);border:1px solid var(--ink);border-radius:4px;overflow:hidden;margin:28px 0 22px}
+.tab{padding:11px 4px;font-family:var(--mono);font-size:9.5px;letter-spacing:1.5px;text-transform:uppercase;font-weight:600;background:var(--paper);color:var(--mutep);border:none;cursor:pointer;transition:all .15s}
+.tab.on{background:var(--ink);color:var(--gold)}
+.fr{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.f{margin-bottom:14px}
+.f label{display:block;font-family:var(--mono);font-size:9.5px;letter-spacing:2px;text-transform:uppercase;color:var(--mutep);margin-bottom:7px}
+.f input,.f select{width:100%;background:#fff;border:1px solid var(--line);color:var(--ink);padding:13px 14px;font-size:14px;font-family:var(--body);border-radius:4px;outline:none;transition:border-color .15s}
+.f input:focus,.f select:focus{border-color:var(--ink)}
+.refin{width:100%;background:#fff;border:1px dashed var(--gold);border-radius:4px;padding:13px 14px;font-family:var(--mono);font-size:13px;color:var(--ink);outline:none;margin-bottom:14px}
+.gobtn{width:100%;background:var(--gold);color:var(--ink);border:none;border-radius:4px;padding:16px;font-family:var(--body);font-size:15px;font-weight:700;cursor:pointer;transition:background .15s}
+.gobtn:hover{background:#dbbd63}
+.gobtn:disabled{opacity:0.6;cursor:default}
+.merr,.mok{display:none;margin-top:12px;font-family:var(--mono);font-size:11px;padding:11px 13px;border-radius:4px}
+.merr{color:var(--block);background:#fdeeec;border:1px solid #f3cbc6}
+.mok{color:var(--allow);background:#e9f7f0;border:1px solid #bfe6d4}
+.merr.show,.mok.show{display:block}
+.keybox{display:none;margin-top:20px;background:var(--ink);border-radius:6px;padding:24px}
+.keybox.show{display:block}
+.kl{font-family:var(--mono);font-size:9px;letter-spacing:2px;text-transform:uppercase;color:var(--gold);margin-bottom:8px}
+.kv{font-family:var(--mono);font-size:11.5px;color:#7fe3b0;word-break:break-all;background:rgba(0,0,0,0.35);padding:12px;border-radius:4px}
+.refbox{margin-top:14px;border:1px dashed rgba(201,168,76,0.5);border-radius:4px;padding:14px}
+.refbox .c{font-family:var(--mono);font-size:18px;color:var(--gold);font-weight:600}
+.refbox p{font-size:12px;color:var(--mutei);margin-top:6px;line-height:1.6}
+.usage{margin-top:14px;font-family:var(--mono);font-size:10.5px;line-height:2;color:rgba(255,255,255,0.35);background:rgba(0,0,0,0.25);padding:12px;border-radius:4px}
+.usage em{font-style:normal;color:#8fbcff}
+
+/* ---------- footer ---------- */
+footer{background:var(--ink);color:var(--mutei);padding:52px 48px 40px;margin-left:0}
+.fin{max-width:1040px;margin:0 auto;display:grid;grid-template-columns:2fr 1fr 1fr 1fr;gap:40px}
+.fin h4{font-family:var(--mono);font-size:9px;letter-spacing:2px;text-transform:uppercase;color:var(--gold);margin-bottom:12px}
+.fin a{display:block;color:var(--mutei);text-decoration:none;font-size:12.5px;margin-bottom:7px;transition:color .15s}
+.fin a:hover{color:#fff}
+.fdesc{font-size:12.5px;line-height:1.8}
+.fbot{max-width:1040px;margin:32px auto 0;padding-top:18px;border-top:1px solid rgba(255,255,255,0.08);display:flex;justify-content:space-between;font-family:var(--mono);font-size:9.5px;color:rgba(255,255,255,0.25)}
+
+@media(prefers-reduced-motion:reduce){
+  .tk{animation:none}
+  .blk{transition:none}
+  html{scroll-behavior:auto}
+  .rise{animation:none!important;opacity:1!important;transform:none!important}
+}
+
+/* ---------- the patrol: robot walks its robot dog on a leash ---------- */
+#patrol-strip{position:relative;height:118px;overflow:hidden;border-top:1px solid rgba(201,168,76,0.15)}
+#patrol-strip::after{content:'';position:absolute;left:0;right:0;bottom:26px;height:1px;background:linear-gradient(90deg,transparent,rgba(201,168,76,0.35) 12%,rgba(201,168,76,0.35) 88%,transparent)}
+.patrol{position:absolute;bottom:24px;left:0;animation:patrolmove 34s linear infinite}
+.patrol-flip{animation:patrolflip 34s steps(1) infinite;transform-origin:center}
+@keyframes patrolmove{0%{transform:translateX(-170px)}50%{transform:translateX(100vw)}100%{transform:translateX(-170px)}}
+@keyframes patrolflip{0%{transform:scaleX(1)}50%{transform:scaleX(-1)}100%{transform:scaleX(1)}}
+.leg{transform-origin:top center;animation:step .62s ease-in-out infinite alternate}
+.leg.b{animation-delay:.31s}
+@keyframes step{from{transform:rotate(14deg)}to{transform:rotate(-14deg)}}
+.dogleg{transform-origin:top center;animation:step .38s ease-in-out infinite alternate}
+.dogleg.b{animation-delay:.19s}
+.tailwag{transform-origin:bottom left;animation:wag .5s ease-in-out infinite alternate}
+@keyframes wag{from{transform:rotate(-12deg)}to{transform:rotate(16deg)}}
+.bob{animation:bob .62s ease-in-out infinite alternate}
+@keyframes bob{from{transform:translateY(0)}to{transform:translateY(-1.6px)}}
+.blinky{animation:blink 3.4s steps(1) infinite}
+@keyframes blink{0%,92%{opacity:1}93%,97%{opacity:0.15}98%{opacity:1}}
+.patrol-cap{position:absolute;bottom:6px;width:100%;text-align:center;font-family:var(--mono);font-size:9px;letter-spacing:2.5px;text-transform:uppercase;color:rgba(255,255,255,0.3)}
+@media(prefers-reduced-motion:reduce){
+  .patrol{animation:none;left:50%;transform:translateX(-50%)}
+  .patrol-flip,.leg,.dogleg,.tailwag,.bob,.blinky{animation:none}
+}
+/* ---------- visitor seal stamp ---------- */
+.vstamp{display:inline-flex;align-items:center;gap:12px;margin-top:20px;border:1px dashed rgba(201,168,76,0.5);border-radius:5px;padding:11px 16px;background:rgba(201,168,76,0.06)}
+.vstamp svg{flex-shrink:0}
+.vstamp .vn{font-family:var(--disp);font-weight:900;font-size:20px;color:var(--gold);line-height:1}
+.vstamp .vl{font-family:var(--mono);font-size:8.5px;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,0.4);margin-top:3px}
+.vstamp .vh{font-family:var(--mono);font-size:9px;color:#7fe3b0;margin-top:3px;word-break:break-all}
+/* orchestrated hero entrance */
+.rise{opacity:0;transform:translateY(14px);animation:rise .7s cubic-bezier(.2,.7,.2,1) forwards}
+.d1{animation-delay:.05s}.d2{animation-delay:.22s}.d3{animation-delay:.4s}.d4{animation-delay:.58s}
+@keyframes rise{to{opacity:1;transform:none}}
+@media(max-width:1120px){
+  .prod{grid-template-columns:1fr;gap:16px}
+  .pp{text-align:left}
+}
+@media(max-width:900px){
+  #rail{display:none}
+  #chip{display:block}
+  main{margin-left:0}
+  .wrap,#hero .wrap,#verify .wrap{padding:56px 20px}
+  .nvl a:not(.ncta){display:none}
+  .steps,.refrow,.laws,.crow,.cres,.fr,.tabs{grid-template-columns:1fr}
+  footer{padding:40px 20px}
+  .fin{grid-template-columns:1fr}
+  .fbot{flex-direction:column;gap:6px}
+}
+</style>
+</head>
+<body>
+<nav>
+  <a class="logo" href="/" style="text-decoration:none;display:flex;align-items:center;gap:10px">
+    <svg width="30" height="30" viewBox="0 0 32 32" aria-hidden="true">
+      <circle cx="16" cy="16" r="13.5" fill="none" stroke="#c9a84c" stroke-width="2.6" stroke-dasharray="66 20" stroke-linecap="round" transform="rotate(-50 16 16)"/>
+      <circle cx="26.5" cy="7" r="3.1" fill="#c9a84c"/>
+      <circle cx="16" cy="16" r="3.4" fill="#f6f3ec"/>
+    </svg>
+    <span style="display:flex;flex-direction:column;line-height:1">
+      <span style="font-family:var(--disp);font-weight:900;font-size:19px;color:#fff;letter-spacing:-0.02em">AI<b style="color:var(--gold)">Leash</b></span>
+      <span style="font-family:var(--mono);font-size:7.5px;letter-spacing:2.5px;text-transform:uppercase;color:rgba(255,255,255,0.4);margin-top:3px">by Monop Content</span>
+    </span>
+  </a>
+  <div class="nvl">
+    <a href="#products">Products</a>
+    <a href="#how">How it works</a>
+    <a href="#law">The law</a>
+    <a href="/scan">Free scanner</a>
+    <a href="/developers">Developers</a>
+    <a href="/contact">Contact</a>
+    <a href="#signup" class="ncta">Get free API key</a>
+  </div>
+</nav>
+
+<!-- SIGNATURE: the visit ledger. Real SHA-256, runs only in this browser. -->
+<aside id="rail" aria-label="Live demo: this visit as an audit chain">
+  <div class="rail-t">This visit, sealed</div>
+  <div class="rail-s">A live demo of our engine. Each section you read becomes a real SHA-256 block, chained in your browser. Nothing is sent anywhere.</div>
+  <div id="chain"></div>
+  <div class="rail-foot">tip <b id="tip">GENESIS</b></div>
+</aside>
+<div id="chip">Visit chain &middot; <span id="chipn">0 blocks</span> &middot; tip <span class="ch" id="chiptip">GENESIS</span></div>
+
+<main>
+
+<section id="hero">
+  <div class="wrap">
+    <div class="deadline rise d1">EU AI Act enforcement &middot; <b>August 2026</b> &middot; fines up to 3% of global turnover</div>
+    <p class="rise d1" style="font-family:var(--mono);font-size:11px;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,0.45);margin-bottom:18px"><b style="color:var(--gold);font-weight:600">Monop Content</b> presents AILeash &mdash; a compliance API for platforms running AI. Governance, child safety and fraud alerts on one tamper-evident engine</p>
+    <h1 class="rise d2">Every AI decision.<br><i>Sealed. Provable. Yours.</i></h1>
+    <p class="lead rise d3" style="margin-top:26px">One engine scores every action on your platform in under 30ms &mdash; <b>ALLOW, CHALLENGE or BLOCK</b> &mdash; and seals it into a SHA-256 chain nobody can quietly edit. Not a hacker. Not an employee. <b>Not even us.</b> When a regulator asks what your AI decided and why, you answer in one API call.</p>
+    <div class="hseal" id="hseal" aria-live="polite"></div>
+    <div class="vstamp" id="vstamp" style="display:none">
+      <svg width="34" height="34" viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="13.5" fill="none" stroke="#c9a84c" stroke-width="2.6" stroke-dasharray="66 20" stroke-linecap="round" transform="rotate(-50 16 16)"/><circle cx="26.5" cy="7" r="3.1" fill="#c9a84c"/><circle cx="16" cy="16" r="3.4" fill="#0a0f1e"/></svg>
+      <span><span class="vn" id="vnum"></span><span class="vl" style="display:block">Sealed visitor of sebbi.pro</span><span class="vh" id="vhash" style="display:block"></span></span>
+    </div>
+    <div class="hbtns rise d4">
+      <a href="#how" class="bgold">See how it works &darr;</a>
+      <a href="#signup" class="bghost">Get a free API key</a>
+      <a href="/scan" class="bghost">Free AI Act scanner</a>
+    </div>
+  </div>
+  <div id="patrol-strip" aria-hidden="true">
+    <div class="patrol"><div class="patrol-flip">
+    <svg width="150" height="86" viewBox="0 0 150 86">
+      <!-- ===== the handler: a robot ===== -->
+      <g class="bob">
+        <!-- antenna -->
+        <line x1="26" y1="8" x2="26" y2="16" stroke="#c9a84c" stroke-width="2"/>
+        <circle cx="26" cy="6" r="2.6" fill="#c9a84c" class="blinky"/>
+        <!-- head -->
+        <rect x="15" y="15" width="22" height="17" rx="4" fill="#1c2742" stroke="#c9a84c" stroke-width="1.6"/>
+        <rect x="19" y="21" width="14" height="5" rx="2.5" fill="#7fe3b0" class="blinky"/>
+        <!-- body -->
+        <rect x="12" y="34" width="28" height="26" rx="5" fill="#141d36" stroke="#c9a84c" stroke-width="1.6"/>
+        <circle cx="26" cy="44" r="3.6" fill="none" stroke="#c9a84c" stroke-width="1.4"/>
+        <circle cx="26" cy="44" r="1.3" fill="#c9a84c"/>
+        <!-- leash arm, extended toward the dog -->
+        <path d="M40 40 Q50 42 56 46" stroke="#c9a84c" stroke-width="3.4" fill="none" stroke-linecap="round"/>
+        <circle cx="57" cy="46.5" r="2.6" fill="#c9a84c"/>
+      </g>
+      <!-- legs -->
+      <g class="leg"><rect x="17" y="59" width="6.5" height="17" rx="3" fill="#1c2742" stroke="#c9a84c" stroke-width="1.3"/><rect x="14.5" y="73" width="11" height="4.5" rx="2" fill="#c9a84c"/></g>
+      <g class="leg b"><rect x="28.5" y="59" width="6.5" height="17" rx="3" fill="#1c2742" stroke="#c9a84c" stroke-width="1.3"/><rect x="26" y="73" width="11" height="4.5" rx="2" fill="#c9a84c"/></g>
+      <!-- ===== the leash ===== -->
+      <path d="M57 47 Q78 62 100 53" stroke="#c9a84c" stroke-width="1.8" fill="none" stroke-dasharray="4 3" stroke-linecap="round"/>
+      <!-- ===== the good boy: a robot dog ===== -->
+      <g class="bob" style="animation-delay:.2s">
+        <!-- collar clip -->
+        <circle cx="100" cy="53" r="2.2" fill="#c9a84c"/>
+        <!-- body -->
+        <rect x="98" y="55" width="30" height="14" rx="5" fill="#141d36" stroke="#c9a84c" stroke-width="1.5"/>
+        <!-- head -->
+        <rect x="122" y="45" width="15" height="13" rx="4" fill="#1c2742" stroke="#c9a84c" stroke-width="1.5"/>
+        <rect x="126" y="49" width="7" height="3.4" rx="1.7" fill="#7fe3b0" class="blinky"/>
+        <!-- snout + ear -->
+        <rect x="136" y="51" width="6" height="5" rx="2" fill="#c9a84c"/>
+        <path d="M124 45 L121 38 L128 43 Z" fill="#c9a84c"/>
+        <!-- tail -->
+        <g class="tailwag"><path d="M98 57 Q90 50 88 43" stroke="#c9a84c" stroke-width="2.6" fill="none" stroke-linecap="round"/><circle cx="88" cy="42" r="2" fill="#7fe3b0" class="blinky"/></g>
+      </g>
+      <!-- dog legs -->
+      <g class="dogleg"><rect x="101" y="68" width="5" height="10" rx="2.4" fill="#1c2742" stroke="#c9a84c" stroke-width="1.2"/></g>
+      <g class="dogleg b"><rect x="109" y="68" width="5" height="10" rx="2.4" fill="#1c2742" stroke="#c9a84c" stroke-width="1.2"/></g>
+      <g class="dogleg b"><rect x="117" y="68" width="5" height="10" rx="2.4" fill="#1c2742" stroke="#c9a84c" stroke-width="1.2"/></g>
+      <g class="dogleg"><rect x="124" y="68" width="5" height="10" rx="2.4" fill="#1c2742" stroke="#c9a84c" stroke-width="1.2"/></g>
+    </svg>
+    </div></div>
+    <div class="patrol-cap">Your AI. On a lead. &mdash; Monop Content, Blyth</div>
+  </div>
+  <div class="ticker" aria-hidden="true"><div class="tk" id="tk"></div></div>
+</section>
+
+<section id="how">
+  <div class="wrap">
+    <div class="entry"><span class="no">Block 001 &middot; How it works</span><span class="rule"></span><span class="sealed" data-seal></span></div>
+    <h2>Three steps. <i>That is it.</i></h2>
+    <p class="lead">What normally costs &pound;50,000 a year in compliance tooling, priced at 50p per device.</p>
+    <div class="steps">
+      <div class="st"><div class="k">Step one</div><h3>Get a free key</h3><p>Sign up below. No card, no contract. <b>100 free decisions</b> to test everything against your real traffic.</p></div>
+      <div class="st"><div class="k">Step two</div><h3>Send us the event</h3><p>Each time a user acts, your platform posts the details. We score it across 9 signals in <b>under 30ms</b> and return ALLOW, CHALLENGE or BLOCK &mdash; sealed into the chain before you get the reply.</p></div>
+      <div class="st"><div class="k">Step three</div><h3>You set the price</h3><p>Charge your users what you like. <b>We take 50p per device per month.</b> Everything above it is yours, every month.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="products">
+  <div class="wrap">
+    <div class="entry"><span class="no">Block 002 &middot; Products</span><span class="rule"></span><span class="sealed" data-seal></span></div>
+    <h2>Four products. <i>One engine.</i></h2>
+    <p class="lead" style="margin-bottom:14px">The same 9-signal engine and audit chain underneath all of them. Pick one or take all four.</p>
+
+    <div class="prod">
+      <div class="pn">AILeash<small>AI governance</small></div>
+      <div>
+        <p class="pd">Every decision your AI makes about a person gets scored, explained in plain reasons, and sealed into a chain that can't be quietly altered. When a regulator asks for proof, <b>you have it &mdash; block by block.</b></p>
+        <div class="pf"><em>&#10003;</em>9 signals scored per event, verdict in under 30ms<br><em>&#10003;</em>Tamper-evident SHA-256 chain &mdash; alterations are detectable, by anyone<br><em>&#10003;</em>Built for EU AI Act Articles 9, 12, 13 and 14<br><em>&#10003;</em>100 free decisions, no card to start</div>
+      </div>
+      <div class="pp"><div class="amt">50p</div><div class="per">our share &middot; per device &middot; per month</div><a class="pbtn" href="#signup" onclick="setProduct('aileash')">Get AILeash key &rarr;</a></div>
+    </div>
+
+    <div class="prod">
+      <div class="pn">SonicBoom<small>Compliance layer</small></div>
+      <div>
+        <p class="pd">Already running AI on AWS, Azure, Google Cloud, OpenAI or Anthropic? SonicBoom is one line of code that adds a full compliance audit chain to every call &mdash; scoring at a <b>28ms median, without adding meaningful latency</b> to your stack.</p>
+        <div class="pf"><em>&#10003;</em>One line of code &mdash; nothing else in your stack changes<br><em>&#10003;</em>Works alongside AWS, Azure, Google Cloud, OpenAI, Anthropic<br><em>&#10003;</em>SHA-256 audit chain on every call, automatically<br><em>&#10003;</em>28ms median decision time, independently timed</div>
+      </div>
+      <div class="pp"><div class="amt">50p</div><div class="per">our share &middot; per device &middot; per month</div><a class="pbtn" href="/sonicboom">About SonicBoom &rarr;</a></div>
+    </div>
+
+    <div class="prod">
+      <div class="pn">Sentinel<small>Fraud &amp; anomaly alerts</small></div>
+      <div>
+        <p class="pd">When something unusual hits your platform &mdash; 500 messages in a minute, a login from a new country, a pattern that looks like fraud &mdash; Sentinel scores it and <b>sends you an alert with the sealed evidence attached.</b> Velocity, trust and anomaly signals on every event.</p>
+        <div class="pf"><em>&#10003;</em>Real-time scoring, alerts the moment thresholds trip<br><em>&#10003;</em>Velocity signals catch burst attacks, takeovers and bots<br><em>&#10003;</em>Every alert backed by its own tamper-evident chain entry<br><em>&#10003;</em>Same one API call, same 50p model</div>
+      </div>
+      <div class="pp"><div class="amt">50p</div><div class="per">our share &middot; per device &middot; per month</div><a class="pbtn" href="#signup" onclick="setProduct('sentinel')">Get Sentinel key &rarr;</a></div>
+    </div>
+
+    <div class="prod">
+      <div class="pn">Guardian<small>Child safety &middot; free</small></div>
+      <div>
+        <p class="pd">An honest safety net for families. Your child gets a one-tap <b>Help</b> button, a check-in, and a way to flag any message that feels off &mdash; and Guardian tells them plainly what it recognises. <b>It never tells a child a message is "safe"</b>, because no tool can promise that. If it doesn't recognise something, it says so and points them to a trusted adult.</p>
+        <div class="pf"><em>&#10003;</em>One-tap Help alerts you instantly, with location if the child shares it<br><em>&#10003;</em>Flags known grooming and manipulation patterns in plain English<br><em>&#10003;</em>You get a tamper-evident timeline &mdash; message text is never stored, only a fingerprint<br><em>&#10003;</em>CEOP, Childline and 999 one tap away, always</div>
+        <div class="guardian-note">Free for every family, always. No card, no trial, no catch. It cannot secretly read a phone &mdash; and that is deliberate.</div>
+      </div>
+      <div class="pp"><div class="amt" style="color:var(--allow)">Free</div><div class="per">every child &middot; every family &middot; forever</div><a class="pbtn free" href="/guardian-parent">Open Guardian &rarr;</a></div>
+    </div>
+  </div>
+</section>
+
+<section id="margin">
+  <div class="wrap">
+    <div class="entry"><span class="no" style="color:#fff">Block 003 &middot; Your margin</span><span class="rule"></span><span class="sealed" data-seal style="color:rgba(255,255,255,0.4)"></span></div>
+    <h2 style="color:#fff">You set the price. <i>You keep the rest.</i></h2>
+    <p class="lead">We take 50p per device per month. Everything above it is yours &mdash; every month, for as long as they stay.</p>
+    <div class="cwrap">
+      <div class="crow">
+        <div><div class="clab">You charge per device per month</div><div class="cin"><span class="pd2">&pound;</span><input class="ci" type="number" id="charge" value="1.99" min="0.51" step="0.01" oninput="calc()"></div></div>
+        <div><div class="clab">Number of devices</div><select class="ci" id="devices" onchange="calc()">
+          <option value="100">100 devices</option><option value="500">500 devices</option>
+          <option value="1000" selected>1,000 devices</option><option value="5000">5,000 devices</option>
+          <option value="10000">10,000 devices</option><option value="50000">50,000 devices</option>
+          <option value="100000">100,000 devices</option></select></div>
+      </div>
+      <div class="cres">
+        <div class="cr2"><div class="l">User pays</div><div class="v v-user" id="r-user">&pound;1.99</div><div class="s">per device per month</div></div>
+        <div class="cr2"><div class="l">You keep</div><div class="v v-you" id="r-you">&pound;1,490</div><div class="s">per month</div></div>
+        <div class="cr2"><div class="l">We take</div><div class="v v-we" id="r-we">&pound;500</div><div class="s">per month</div></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="referral">
+  <div class="wrap">
+    <div class="entry"><span class="no">Block 004 &middot; Referrals</span><span class="rule"></span><span class="sealed" data-seal></span></div>
+    <h2>Tell a friend. <i>Earn forever.</i></h2>
+    <p class="lead">Your signup comes with a referral code. Every device that signs up with it pays you 10p a month, for as long as it stays. No cap, no expiry.</p>
+    <div class="refrow">
+      <div class="rf"><h3>Get your code</h3><p>Issued the moment you sign up. It looks like REF-JOHN-1234 and it's yours permanently.</p></div>
+      <div class="rf"><h3>Share it anywhere</h3><p>A colleague, a dev group, a call centre. Anyone who signs up with your code is linked to you for good.</p><div class="big">10p</div><div class="bl">per device &middot; per month &middot; forever</div></div>
+      <div class="rf"><h3>Collect monthly</h3><p>Ten referrals running 1,000 devices each is &pound;1,000 a month &mdash; and it renews itself.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="law">
+  <div class="wrap">
+    <div class="entry"><span class="no">Block 005 &middot; The law</span><span class="rule"></span><span class="sealed" data-seal></span></div>
+    <h2>What the law <i>actually requires.</i></h2>
+    <p class="lead">Most compliance advice tells you what the text says. This is what it means for your platform in practice.</p>
+    <div class="laws">
+      <div class="law"><div class="act">EU AI Act 2024/1689 &middot; enforcement Aug 2026</div>
+        <div class="plain">&ldquo;If your AI makes decisions that affect people, you need permanent, tamper-evident proof of every one.&rdquo;</div>
+        <p>Fines reach 3% of global annual turnover or &euro;15m &mdash; whichever is higher, per violation.</p>
+        <ul><li>Art. 9 &mdash; continuous risk management</li><li>Art. 12 &mdash; tamper-evident record keeping</li><li>Art. 13 &mdash; plain-language explanations</li><li>Art. 14 &mdash; human override pathway</li></ul></div>
+      <div class="law"><div class="act">Online Safety Act 2023 &middot; UK &middot; in force now</div>
+        <div class="plain">&ldquo;If users can talk to each other on your platform, you are legally responsible for protecting them &mdash; today.&rdquo;</div>
+        <p>Ofcom is already investigating platforms. The ICO fined TikTok &pound;12.7m for Children's Code violations.</p>
+        <ul><li>Documented risk assessment on demand</li><li>Moderation with an evidence trail</li><li>Age-appropriate design for child users</li><li>Ofcom-ready audit trails</li></ul></div>
+      <div class="law"><div class="act">ICO Children's Code &middot; UK &middot; in force now</div>
+        <div class="plain">&ldquo;If under-18s can reach your platform &mdash; even unintentionally &mdash; the Children's Code applies to you.&rdquo;</div>
+        <p>The ICO can and will fine platforms that expose children to harmful automated decisions without protection.</p>
+        <ul><li>Best interests of the child by default</li><li>Data minimisation for child users</li><li>No profiling of children</li><li>Human oversight of automated decisions</li></ul></div>
+      <div class="law"><div class="act">Digital Services Act &middot; EU 2022/2065</div>
+        <div class="plain">&ldquo;Show how your algorithmic systems work &mdash; and prove you've mitigated the risks they create.&rdquo;</div>
+        <p>Very Large Online Platforms carry the heaviest duties, but systemic risk assessment reaches smaller platforms too.</p>
+        <ul><li>Systemic risk assessment with evidence</li><li>Algorithmic transparency reports</li><li>Minor-protection evidence packages</li><li>Regulator-ready submissions</li></ul></div>
+    </div>
+  </div>
+</section>
+
+<section id="verify">
+  <div class="wrap">
+    <div class="entry" style="justify-content:center"><span class="no" style="color:#fff">Block 006 &middot; Prove it</span></div>
+    <h2 style="color:#fff">You just watched it work.</h2>
+    <p class="lead">Everything you read became a block in the chain on the left &mdash; hashed with real SHA-256, in your browser, linked back to genesis. This is exactly what our engine does to your platform's decisions. Verify it yourself:</p>
+    <div style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap;margin-top:30px">
+      <button class="bgold" id="vbtn" onclick="verifyVisit()">Verify this visit's chain</button>
+      <button class="bghost" id="tbtn" onclick="tamperDemo()" style="cursor:pointer;font-family:var(--body)">Try to tamper with it</button>
+    </div>
+    <div id="vout" aria-live="polite"></div>
+  </div>
+</section>
+
+<section id="signup">
+  <div class="wrap">
+    <div class="entry"><span class="no">Block 007 &middot; Start</span><span class="rule"></span><span class="sealed" data-seal></span></div>
+    <h2>Free API key. <i>Right now.</i></h2>
+    <p class="lead">Pick a product, add your name and email. Key and referral code arrive instantly &mdash; 100 free decisions, no card.</p>
+    <div class="tabs">
+      <button class="tab on" id="tab-aileash" onclick="setProduct('aileash')">AILeash</button>
+      <button class="tab" id="tab-sonicboom" onclick="setProduct('sonicboom')">SonicBoom</button>
+      <button class="tab" id="tab-sentinel" onclick="setProduct('sentinel')">Sentinel</button>
+      <button class="tab" id="tab-guardian" onclick="setProduct('guardian')">Guardian</button>
+    </div>
+    <div class="fr">
+      <div class="f"><label>First name</label><input type="text" id="fn" placeholder="Justin"></div>
+      <div class="f"><label>Last name</label><input type="text" id="ln" placeholder="Smith"></div>
+    </div>
+    <div class="f"><label>Email address</label><input type="email" id="em" placeholder="you@company.com"></div>
+    <div class="f"><label>Phone number</label><input type="tel" id="ph" placeholder="+44 7700 000000"></div>
+    <div class="f"><label>Platform or company name</label><input type="text" id="org" placeholder="e.g. GameZone / My Platform"></div>
+    <div class="f"><label>Estimated devices</label><select id="dv">
+      <option value="100">Under 100</option><option value="500">100 to 500</option>
+      <option value="1000">500 to 1,000</option><option value="5000">1,000 to 5,000</option>
+      <option value="10000">5,000 to 10,000</option><option value="50000">10,000 plus</option></select></div>
+    <input class="refin" type="text" id="ref-code" placeholder="Referral code (optional) &mdash; e.g. REF-JOHN-1234">
+    <button class="gobtn" id="go-btn" onclick="doSignup()">Get free AILeash API key &rarr;</button>
+    <div class="merr" id="msg-err"></div>
+    <div class="mok" id="msg-ok"></div>
+    <div class="keybox" id="key-box">
+      <div class="kl">Your API key &mdash; save it now</div>
+      <div class="kv" id="key-val"></div>
+      <div class="refbox" id="ref-box"><div class="kl">Your referral code</div><div class="c" id="ref-code-display"></div><p>Share it with anyone. Every device they sign up pays you 10p a month, for as long as it stays.</p></div>
+      <div class="usage"><em>POST</em> https://sebbi.pro/api/govern<br>Authorization: Bearer <em id="key-prev">YOUR_KEY</em><br><span style="color:rgba(255,255,255,0.22)">100 free decisions &middot; 50p per device after trial &middot; billed via Stripe</span></div>
+      <div id="shieldbox" style="display:none;margin-top:14px;border:1px dashed rgba(201,168,76,0.5);border-radius:4px;padding:14px">
+        <div class="kl">Your shield &mdash; live-verified, put it on your site</div>
+        <div style="display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap;margin-top:8px">
+          <img id="shieldimg" src="" alt="AILeash shield" width="95" style="flex-shrink:0">
+          <div style="flex:1;min-width:200px">
+            <p style="font-size:12px;color:rgba(255,255,255,0.45);line-height:1.6;margin-bottom:8px">This badge is drawn live by our server. It shows gold and your company name only while your account is active &mdash; copied or faked, it renders grey UNVERIFIED.</p>
+            <div class="kv" id="shieldcode" style="font-size:9.5px"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <div class="fin">
+    <div>
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
+        <svg width="26" height="26" viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="13.5" fill="none" stroke="#c9a84c" stroke-width="2.6" stroke-dasharray="66 20" stroke-linecap="round" transform="rotate(-50 16 16)"/><circle cx="26.5" cy="7" r="3.1" fill="#c9a84c"/><circle cx="16" cy="16" r="3.4" fill="#0a0f1e"/></svg>
+        <span style="font-family:var(--disp);font-weight:900;font-size:19px;color:#fff">AI<b style="color:var(--gold)">Leash</b></span>
+      </div>
+      <div style="font-family:var(--mono);font-size:9px;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,0.25);margin-bottom:12px">Monop Content &middot; Blyth, Northumberland, UK</div>
+      <p class="fdesc">Four AI compliance and safety products on one tamper-evident engine. Free to integrate, 50p per device per month. You keep the rest.</p>
+    </div>
+    <div><h4>Products</h4><a href="#products">AILeash</a><a href="/sonicboom">SonicBoom</a><a href="#products">Sentinel</a><a href="/guardian-parent">Guardian</a></div>
+    <div><h4>Tools</h4><a href="/scan">AI Act scanner</a><a href="/reseller">Partner programme</a><a href="/report-threat">Report a threat</a><a href="/compliance-assistant">AI assistant</a></div>
+    <div><h4>Resources</h4><a href="/developers">Developers</a><a href="/whitepaper">Whitepaper</a><a href="/contact">Contact</a><a href="#signup">Get API key</a><a href="/referrals">My referrals</a></div>
+  </div>
+  <div class="fbot"><span>&copy; 2026 Monop Content &middot; Justin Antony Dobson &middot; Blyth, UK</span><span>EU AI Act &middot; Online Safety Act &middot; ICO Children's Code &middot; DSA</span></div>
+</footer>
+
+<script>
+/* ================= existing platform JS (same endpoints) ================= */
+var AP='aileash';
+function setProduct(p){
+  AP=p;
+  ['aileash','sonicboom','sentinel','guardian'].forEach(function(t){var el=document.getElementById('tab-'+t);if(el)el.className='tab';});
+  var el=document.getElementById('tab-'+p);if(el)el.className='tab on';
+  var btn=document.getElementById('go-btn');
+  var labels={aileash:'Get free AILeash API key \u2192',sonicboom:'Get free SonicBoom plugin \u2192',sentinel:'Get free Sentinel API key \u2192',guardian:'Get free Guardian key \u2192'};
+  btn.textContent=labels[p];
+}
+function calc(){
+  var charge=parseFloat(document.getElementById('charge').value)||0;
+  var devices=parseInt(document.getElementById('devices').value)||0;
+  document.getElementById('r-user').textContent='\u00a3'+charge.toFixed(2);
+  document.getElementById('r-you').textContent='\u00a3'+Math.max(0,(charge-0.50)*devices).toLocaleString('en-GB',{maximumFractionDigits:0});
+  document.getElementById('r-we').textContent='\u00a3'+(0.50*devices).toLocaleString('en-GB',{maximumFractionDigits:0});
+}
+calc();
+async function doSignup(){
+  var fn=document.getElementById('fn').value.trim(),ln=document.getElementById('ln').value.trim();
+  var em=document.getElementById('em').value.trim(),ph=document.getElementById('ph').value.trim();
+  var org=document.getElementById('org').value.trim();
+  var dv=parseInt(document.getElementById('dv').value)||1;
+  var rc=document.getElementById('ref-code').value.trim();
+  var err=document.getElementById('msg-err'),ok=document.getElementById('msg-ok'),kb=document.getElementById('key-box'),btn=document.getElementById('go-btn');
+  err.classList.remove('show');ok.classList.remove('show');kb.classList.remove('show');
+  if(!em||!em.includes('@')){err.textContent='Enter a valid email address to get your key.';err.classList.add('show');return;}
+  if(!org){err.textContent='Enter your platform or company name.';err.classList.add('show');return;}
+  var orig=btn.textContent;btn.textContent='Creating key\u2026';btn.disabled=true;
+  try{
+    var r=await fetch('/signup',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({email:em,phone:ph,name:fn+' '+ln,org:org,org_type:AP,product:AP,devices:dv,ref_code:rc})});
+    var d=await r.json();
+    if(d.api_key){
+      document.getElementById('key-val').textContent=d.api_key;
+      document.getElementById('key-prev').textContent=d.api_key.slice(0,20)+'...';
+      if(d.ref_code){document.getElementById('ref-code-display').textContent=d.ref_code;}
+      if(d.badge_url){
+        document.getElementById('shieldimg').src=d.badge_url;
+        document.getElementById('shieldcode').textContent='<a href="https://sebbi.pro"><img src="'+d.badge_url+'" alt="AI governance sealed by AILeash" width="95"></a>';
+        document.getElementById('shieldbox').style.display='block';
+      }
+      kb.classList.add('show');
+      ok.textContent='Key created. 100 free decisions. Setting up billing\u2026';ok.classList.add('show');
+      btn.textContent='Key created \u2713';
+      sealBlock('signup completed');
+      setTimeout(function(){
+        fetch('/create-checkout',{method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({email:em,product:AP,devices:dv})
+        }).then(function(r2){return r2.json();}).then(function(d2){
+          if(d2.checkout_url){window.location.href=d2.checkout_url;}
+          else{ok.textContent='Key ready. Justin will be in touch. justrightdecorators@gmail.com';}
+        }).catch(function(){ok.textContent='Key ready. Justin will be in touch. justrightdecorators@gmail.com';});
+      },2000);
+    }else{err.textContent=d.error||'Something went wrong. Email justrightdecorators@gmail.com';err.classList.add('show');btn.textContent=orig;btn.disabled=false;}
+  }catch(e){err.textContent='Cannot reach the server. Email justrightdecorators@gmail.com';err.classList.add('show');btn.textContent=orig;btn.disabled=false;}
+}
+
+/* ================= SIGNATURE: the visit ledger =================
+   Real SHA-256 via Web Crypto. Chained exactly like the platform:
+   hash(prev_hash + timestamp + event). Client-side only - no network. */
+var visitChain=[];           // {n, event, ts, prev, hash}
+var chainTip='GENESIS';
+var sealedSections={};
+var CRYPTO_OK=!!(window.crypto&&crypto.subtle&&window.TextEncoder);
+if(!CRYPTO_OK){
+  var _r=document.getElementById('rail'),_c=document.getElementById('chip');
+  if(_r)_r.style.display='none';if(_c)_c.style.display='none';
+  var _v=document.getElementById('verify');if(_v)_v.style.display='none';
+  document.querySelectorAll('main').forEach(function(m){m.style.marginLeft='0';});
+}
+async function sha256hex(s){
+  var buf=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(s));
+  return Array.from(new Uint8Array(buf)).map(function(b){return b.toString(16).padStart(2,'0');}).join('');
+}
+async function sealBlock(eventName){
+  if(!CRYPTO_OK)return 'unavailable';
+  var ts=Date.now();
+  var prev=chainTip;
+  var hash=await sha256hex(prev+'|'+ts+'|'+eventName);
+  chainTip=hash;
+  var n=visitChain.length+1;
+  visitChain.push({n:n,event:eventName,ts:ts,prev:prev,hash:hash});
+  renderBlock(n,eventName,hash);
+  return hash;
+}
+function renderBlock(n,eventName,hash){
+  var chain=document.getElementById('chain');
+  var d=document.createElement('div');d.className='blk';
+  d.innerHTML='<div class="blk-n">'+String(n).padStart(3,'0')+' &middot; '+eventName+'</div><div class="blk-h">'+hash.slice(0,16)+'&hellip;</div>';
+  chain.appendChild(d);
+  requestAnimationFrame(function(){requestAnimationFrame(function(){d.classList.add('on');});});
+  while(chain.children.length>9){chain.removeChild(chain.firstChild);}
+  document.getElementById('tip').textContent=hash.slice(0,12)+'\u2026';
+  var chipn=document.getElementById('chipn'),chiptip=document.getElementById('chiptip');
+  if(chipn){chipn.textContent=visitChain.length+' block'+(visitChain.length===1?'':'s');chiptip.textContent=hash.slice(0,12)+'\u2026';}
+}
+async function verifyVisit(){
+  var out=document.getElementById('vout');
+  out.innerHTML='verifying '+visitChain.length+' blocks\u2026';
+  var prev='GENESIS';
+  for(var i=0;i<visitChain.length;i++){
+    var b=visitChain[i];
+    var re=await sha256hex(b.prev+'|'+b.ts+'|'+b.event);
+    if(re!==b.hash||b.prev!==prev){
+      out.innerHTML='CHAIN BROKEN at block '+b.n+' \u2014 tampering detected.';return;
+    }
+    prev=b.hash;
+  }
+  var lines=['<span class="ok">\u2713 CHAIN INTACT \u2014 '+visitChain.length+' blocks re-hashed and verified, genesis to tip.</span>'];
+  visitChain.slice(-4).forEach(function(b){lines.push(String(b.n).padStart(3,'0')+' '+b.event+' <span class="h">'+b.hash.slice(0,20)+'\u2026</span>');});
+  lines.push('tip <span class="h">'+chainTip.slice(0,32)+'\u2026</span>');
+  lines.push('<span style="color:rgba(255,255,255,0.3)">Computed entirely in your browser. This is the same verification your auditors run against sebbi.pro/api/verify-chain.</span>');
+  out.innerHTML=lines.join('<br>');
+  sealBlock('chain verified by visitor');
+}
+
+async function tamperDemo(){
+  var out=document.getElementById('vout');
+  if(visitChain.length<2){out.innerHTML='Read a little more of the page first \u2014 you need at least two blocks to tamper with.';return;}
+  var target=visitChain[1];
+  var original=target.event;
+  out.innerHTML='You just changed block 002 from <span class="h">\u201c'+original+'\u201d</span> to <span class="h">\u201cnothing happened here\u201d</span>\u2026<br>re-verifying the chain\u2026';
+  target.event='nothing happened here';
+  await new Promise(function(r){setTimeout(r,900);});
+  var prev='GENESIS',broken=-1;
+  for(var i=0;i<visitChain.length;i++){
+    var b=visitChain[i];
+    var re=await sha256hex(b.prev+'|'+b.ts+'|'+b.event);
+    if(re!==b.hash||b.prev!==prev){broken=b.n;break;}
+    prev=b.hash;
+  }
+  target.event=original;
+  out.innerHTML='You just changed block 002 to <span class="h">\u201cnothing happened here\u201d</span> and re-verified.<br>'
+    +'<span style="color:#ff9d94">\u2717 CHAIN BROKEN at block '+String(broken).padStart(3,'0')+' \u2014 the stored hash no longer matches the content. Tampering detected instantly.</span><br>'
+    +'<span class="ok">Block restored. \u2713 Chain intact again.</span><br>'
+    +'<span style="color:rgba(255,255,255,0.3)">That is the whole product. Edit one record \u2014 even one character \u2014 and every verification from that block forward fails. There is no quiet way to rewrite history.</span>';
+  sealBlock('tampering attempt detected');
+}
+
+/* seal the hero headline on load */
+(async function(){
+  if(!CRYPTO_OK)return;
+  var vn=null;
+  try{
+    var r=await fetch('/api/visits');var d=await r.json();
+    if(d&&d.visits)vn=d.visits;
+  }catch(e){}
+  var ev=vn?('visitor \u2116 '+vn.toLocaleString('en-GB')+' arrived'):'visit opened';
+  var h=await sealBlock(ev);
+  var el=document.getElementById('hseal');
+  el.innerHTML='This headline was just sealed: <span class="hh">'+h.slice(0,24)+'\u2026</span> \u2014 watch the chain grow as you read \u2192';
+  if(vn){
+    document.getElementById('vnum').textContent='\u2116 '+vn.toLocaleString('en-GB');
+    document.getElementById('vhash').textContent='seal '+h.slice(0,24)+'\u2026';
+    document.getElementById('vstamp').style.display='inline-flex';
+  }
+})();
+
+/* seal each section when it enters view */
+var names={how:'read: how it works',products:'read: products',margin:'used: margin section',referral:'read: referrals',law:'read: the law',verify:'reached: prove it',signup:'reached: signup'};
+var io=new IntersectionObserver(function(entries){
+  entries.forEach(function(e){
+    if(e.isIntersecting&&!sealedSections[e.target.id]){
+      sealedSections[e.target.id]=true;
+      sealBlock(names[e.target.id]||('read: '+e.target.id)).then(function(h){
+        var s=e.target.querySelector('[data-seal]');
+        if(s)s.innerHTML='sealed <b>'+h.slice(0,10)+'\u2026</b>';
+      });
+    }
+  });
+},{threshold:0.25});
+Object.keys(names).forEach(function(id){var el=document.getElementById(id);if(el)io.observe(el);});
+
+/* calculator interaction gets its own block, once */
+var calcSealed=false;
+document.getElementById('charge').addEventListener('input',function(){
+  if(!calcSealed){calcSealed=true;sealBlock('calculated a margin');}
+});
+
+/* decision ticker - demo data, labelled by the engine's real reason codes */
+(function(){
+  var users=['u_7f2','u_c19','u_a04','u_e88','u_31b','u_9d5','u_f47','u_206'];
+  var acts=['payment','login','message','transfer','api_call','checkout'];
+  var outs=[['ALLOW','A',0.12,0.34],['ALLOW','A',0.05,0.3],['CHALLENGE','C',0.38,0.65],['ALLOW','A',0.1,0.33],['BLOCK','B',0.72,0.94],['ALLOW','A',0.08,0.3],['CHALLENGE','C',0.4,0.68]];
+  var items=[];
+  for(var i=0;i<18;i++){
+    var o=outs[Math.floor(Math.random()*outs.length)];
+    var sc=(o[2]+Math.random()*(o[3]-o[2])).toFixed(2);
+    items.push('<span>'+users[i%users.length]+' &middot; '+acts[i%acts.length]+' &rarr; <b class="'+o[1]+'">'+o[0]+'</b> '+sc+' &middot; sealed</span>');
+  }
+  var half=items.join('');
+  document.getElementById('tk').innerHTML=half+half;
+})();
+</script>
+</body>
+</html>
