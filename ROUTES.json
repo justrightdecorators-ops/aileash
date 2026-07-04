@@ -1,88 +1,163 @@
 {
+  "engine": "AILeash v6.4.2",
+  "platform": "Monop Content, Blyth, UK",
   "routes": [
     {
       "path": "/",
       "method": "GET",
       "auth": "none",
-      "description": "Homepage",
+      "description": "Homepage. Product overview, pricing, signup.",
       "returns": "HTML"
     },
     {
       "path": "/api/govern",
       "method": "POST",
       "auth": "Bearer API key",
-      "description": "Core decision endpoint",
-      "returns": "{decision, score, trust, reasons, audit_hash, receipt_seq}"
+      "description": "Core decision endpoint. Score the action. Seal the result.",
+      "returns": "{decision, score, trust, reasons, audit_hash, receipt_seq, challenge_url}",
+      "latency_ms": "<30"
     },
     {
       "path": "/api/keys",
       "method": "POST",
       "auth": "none",
-      "description": "Create API key (signup)",
-      "returns": "{api_key, quota, ref_code, badge_id}"
+      "description": "Create API key. Instant. 100 free decisions.",
+      "returns": "{api_key, product, quota, ref_code, badge_id}"
     },
     {
       "path": "/signup",
       "method": "POST",
       "auth": "none",
-      "description": "Create API key (alternative endpoint)",
-      "returns": "{api_key, quota, ref_code, badge_id}"
+      "description": "Alternative endpoint for creating API key.",
+      "returns": "{api_key, product, quota, ref_code, badge_id}"
     },
     {
       "path": "/api/spec",
       "method": "GET",
       "auth": "none",
-      "description": "Engine specification",
-      "returns": "{engine, version, features, signals}"
+      "description": "Engine specification. Public. No auth.",
+      "returns": "{engine, version, signals, decision_latency_ms, thresholds, features}"
     },
     {
       "path": "/api/verify-chain",
       "method": "GET",
       "auth": "none",
-      "description": "Audit chain integrity",
-      "returns": "{valid, blocks, tip, message}"
+      "description": "Audit chain integrity proof. Public. No auth.",
+      "returns": "{valid, blocks, genesis, tip, message}"
     },
     {
       "path": "/api/health",
       "method": "GET",
       "auth": "none",
-      "description": "Server health",
-      "returns": "{status, version, rps}"
+      "description": "Server health and load. Public. No auth.",
+      "returns": "{status, version, uptime_seconds, rps, timestamp}"
+    },
+    {
+      "path": "/api/pulse",
+      "method": "GET",
+      "auth": "Bearer API key",
+      "description": "Live risk posture. Last-hour decisions, recent events, chain tip.",
+      "returns": "{last_hour, recent, chain_tip, message}"
+    },
+    {
+      "path": "/api/visits",
+      "method": "GET",
+      "auth": "none",
+      "description": "Visitor count for this platform (for homepage seal).",
+      "returns": "{visits}"
     },
     {
       "path": "/stripe-webhook",
       "method": "POST",
       "auth": "Stripe signature verification",
-      "description": "Stripe webhook receiver",
+      "description": "Stripe webhook receiver. Handles subscription lifecycle.",
       "returns": "{ok: true}"
+    },
+    {
+      "path": "/create-checkout",
+      "method": "POST",
+      "auth": "none",
+      "description": "Create Stripe checkout session for upgrade.",
+      "returns": "{checkout_url}"
     },
     {
       "path": "/admin/auth",
       "method": "POST",
-      "auth": "Admin password",
-      "description": "Admin login (rate limited)",
+      "auth": "Admin password (rate limited)",
+      "description": "Admin login. Rate limited to prevent brute force.",
       "returns": "{token, expires_in}"
     },
     {
-      "path": "/api/forensic/{audit_id}",
+      "path": "/developers",
       "method": "GET",
-      "auth": "Bearer API key",
-      "description": "Full forensic evidence (v6.4.2)",
-      "returns": "{request_context, timing_phases, signal_derivation, decision_trace, geoip, chain_continuity}"
+      "auth": "none",
+      "description": "Developer documentation.",
+      "returns": "HTML"
     },
     {
-      "path": "/api/guardian/pattern-detect",
-      "method": "POST",
-      "auth": "Bearer Guardian key",
-      "description": "Detect predatory patterns (v6.4.2)",
-      "returns": "{pattern_detected, pattern_type, severity, confidence, behavioral_timeline}"
+      "path": "/scan",
+      "method": "GET",
+      "auth": "none",
+      "description": "Free AI Act compliance scanner.",
+      "returns": "HTML"
     },
     {
-      "path": "/api/guardian/report-ceop",
-      "method": "POST",
-      "auth": "Bearer Guardian key",
-      "description": "Report to CEOP (v6.4.2)",
-      "returns": "{report_ref, status, message}"
+      "path": "/contact",
+      "method": "GET",
+      "auth": "none",
+      "description": "Contact page.",
+      "returns": "HTML"
+    },
+    {
+      "path": "/whitepaper",
+      "method": "GET",
+      "auth": "none",
+      "description": "Technical whitepaper v6.4.2.",
+      "returns": "HTML"
+    },
+    {
+      "path": "/guardian-app",
+      "method": "GET",
+      "auth": "none",
+      "description": "Guardian: free message checker for families.",
+      "returns": "HTML"
+    },
+    {
+      "path": "/sonicboom",
+      "method": "GET",
+      "auth": "none",
+      "description": "SonicBoom: compliance layer for cloud AI.",
+      "returns": "HTML"
+    },
+    {
+      "path": "/reseller",
+      "method": "GET",
+      "auth": "none",
+      "description": "Partner and reseller programme.",
+      "returns": "HTML"
+    },
+    {
+      "path": "/report-threat",
+      "method": "GET",
+      "auth": "none",
+      "description": "Threat reporting page.",
+      "returns": "HTML"
     }
-  ]
+  ],
+  "pricing": {
+    "aileash": "50p per device per month + your margin",
+    "guardian": "Free forever",
+    "sonicboom": "50p per device per month + your margin",
+    "sentinel": "50p per device per month + your margin",
+    "free_tier": "100 decisions per month, no card",
+    "referral_bonus": "10p per referred device per month"
+  },
+  "regulatory": {
+    "eu_ai_act": "Articles 9, 12, 13, 14 (enforcement August 2026)",
+    "online_safety_act": "UK, in force now",
+    "ico_childrens_code": "UK, in force now",
+    "digital_services_act": "EU 2022/2065, systemic risk assessment"
+  },
+  "contact": "justrightdecorators@gmail.com",
+  "homepage": "https://sebbi.pro"
 }

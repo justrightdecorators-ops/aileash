@@ -5,118 +5,232 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Whitepaper v6.4.2 — AILeash by Monop Content</title>
 <style>
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Inter:wght@300;400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,900;1,9..144,600;1,9..144,900&family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400&display=swap');
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-:root{--bg:#0a0f1e;--surface:#111a30;--border:#1e2a45;--gold:#c9a84c;--gold-dim:#8a6f2e;--green:#00e5a0;--green-dim:#00b87d;--amber:#ffb020;--text:#e8e8f0;--muted:#7d849a;--red:#ff4757}
+:root{--ink:#0a0f1e;--paper:#f6f3ec;--line:#e3ddcf;--gold:#c9a84c;--mutep:#6b6353;--disp:'Fraunces',Georgia,serif;--body:'Space Grotesk',system-ui,sans-serif;--mono:'IBM Plex Mono',monospace}
 html{scroll-behavior:smooth}
-body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;font-size:16px;line-height:1.6}
+body{background:var(--paper);color:var(--ink);font-family:var(--body)}
+nav{position:fixed;top:0;left:0;right:0;z-index:100;background:var(--ink);height:64px;display:flex;align-items:center;justify-content:space-between;padding:0 28px;border-bottom:1px solid rgba(201,168,76,0.2)}
+.logo{font-family:var(--disp);font-weight:900;font-size:20px;color:#fff}
+.logo b{color:var(--gold)}
+.nav-links{display:flex;gap:24px;list-style:none}
+.nav-links a{color:rgba(255,255,255,0.6);text-decoration:none;font-size:13px;font-weight:500;transition:color .2s}
+.nav-links a:hover{color:#fff}
+.nav-cta{background:var(--gold);color:var(--ink);padding:9px 16px;border-radius:3px;font-weight:700;text-decoration:none;font-size:13px}
+.wrap{max-width:1040px;margin:0 auto;padding:84px 48px}
+.entry{display:flex;align-items:baseline;gap:14px;margin-bottom:8px;font-family:var(--mono);font-size:10px;letter-spacing:2px;text-transform:uppercase}
+.entry .no{color:var(--ink);font-weight:600}
+.entry .rule{flex:1;height:1px;background:var(--line)}
+.entry .sealed{color:var(--mutep);letter-spacing:0;text-transform:none;font-size:9.5px}
+.entry .sealed b{color:var(--gold);font-weight:600}
+h1{font-family:var(--disp);font-weight:900;font-size:clamp(36px,5vw,52px);line-height:1.1;letter-spacing:-0.02em}
+h1 i{font-style:italic;color:var(--gold)}
+h2{font-family:var(--disp);font-weight:900;font-size:clamp(28px,3.5vw,40px);line-height:1.1;letter-spacing:-0.015em;margin-bottom:14px}
+h2 i{font-style:italic;color:var(--gold)}
+p{color:var(--mutep);font-size:15px;line-height:1.75;margin-bottom:14px}
+p b{color:var(--ink);font-weight:700}
+section{border-bottom:1px solid var(--line);padding-top:64px}
+main{margin-top:64px}
+.spec{background:var(--paper);border:1px solid var(--line);border-radius:6px;padding:24px;margin:18px 0;font-family:var(--mono);font-size:12px;line-height:1.9;color:var(--mutep);overflow-x:auto}
+.spec b{color:var(--gold);font-weight:600}
+table{width:100%;border-collapse:collapse;font-size:13px;margin:18px 0}
+thead tr{background:var(--paper)}
+th{padding:12px 14px;text-align:left;font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:0.08em;color:var(--mutep);border-bottom:2px solid var(--line)}
+th.hl{color:var(--gold);background:rgba(201,168,76,0.06)}
+td{padding:13px 14px;border-bottom:1px solid var(--line);vertical-align:middle}
+td.hl{background:rgba(201,168,76,0.04)}
+td:first-child{color:var(--ink);font-weight:500}
+tr:last-child td{border-bottom:none}
+.callout{border-radius:6px;padding:22px;margin:22px 0}
+.callout.gold{background:linear-gradient(135deg,rgba(201,168,76,0.08),rgba(201,168,76,0.02));border:1px solid rgba(201,168,76,0.3)}
+.callout h3{margin-top:0;margin-bottom:8px;color:var(--gold);font-family:var(--disp);font-weight:900;font-size:16px}
+.callout p{margin-bottom:0;font-size:14px}
+footer{background:var(--ink);color:rgba(255,255,255,0.45);padding:52px 48px;text-align:center;font-size:12px}
+footer a{color:var(--gold);text-decoration:none}
+@media(max-width:900px){.wrap{padding:56px 20px}}
 </style>
 </head>
 <body>
-<nav style="position:fixed;top:0;left:0;right:0;z-index:100;background:rgba(10,15,30,0.92);backdrop-filter:blur(12px);border-bottom:1px solid var(--border);padding:0 24px;height:56px;display:flex;align-items:center;justify-content:space-between">
-<a href="/" style="font-family:'JetBrains Mono',monospace;font-size:13px;color:#c9a84c;text-decoration:none">AILeash</a>
-<div style="display:flex;gap:24px;list-style:none"><a href="/developers" style="color:#7d849a;text-decoration:none;font-size:13px">Developers</a><a href="/ai.txt" style="color:#7d849a;text-decoration:none;font-size:13px">ai.txt</a><a href="/scan" style="color:#7d849a;text-decoration:none;font-size:13px">Scanner</a></div>
-<a href="/#signup" style="background:#c9a84c;color:#000;padding:8px 16px;border-radius:4px;font-size:13px;font-weight:600;text-decoration:none">Get API Key</a>
+<nav>
+<a href="/" style="text-decoration:none;display:flex;align-items:center;gap:10px;color:#fff">
+<svg width="26" height="26" viewBox="0 0 32 32"><circle cx="16" cy="16" r="13.5" fill="none" stroke="#c9a84c" stroke-width="2.6" stroke-dasharray="66 20" stroke-linecap="round" transform="rotate(-50 16 16)"/><circle cx="26.5" cy="7" r="3.1" fill="#c9a84c"/><circle cx="16" cy="16" r="3.4" fill="#f6f3ec"/></svg>
+<span><span style="font-family:var(--disp);font-weight:900;font-size:18px;color:#fff">AI<b style="color:var(--gold)">Leash</b></span></span>
+</a>
+<div class="nav-links">
+<a href="/">Home</a>
+<a href="/developers">Developers</a>
+<a href="/scan">Scanner</a>
+<a href="/contact">Contact</a>
+<a href="#signup" class="nav-cta">Get API Key</a>
+</div>
 </nav>
-<div style="padding:110px 24px 50px;max-width:880px;margin:0 auto">
-<div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:#c9a84c;letter-spacing:0.15em;text-transform:uppercase;margin-bottom:14px">// Technical Whitepaper &middot; v6.4.2 Forensic Capture</div>
-<h1 style="font-size:clamp(28px,4vw,44px);font-weight:700;line-height:1.15;letter-spacing:-0.02em;margin-bottom:16px">AILeash v6.4.2: Forensic-Grade Technical Capture + Guardian Network Safeguarding</h1>
-<div style="display:flex;gap:22px;flex-wrap:wrap;margin-bottom:28px;font-size:13px;color:#7d849a">
-<div><b style="color:#e8e8f0">Publisher:</b> Monop Content, Blyth, UK</div>
-<div><b style="color:#e8e8f0">Engine:</b> v6.4.2 (production)</div>
-<div><b style="color:#e8e8f0">Capture:</b> Forensic-grade with timing precision</div>
+
+<main>
+<section style="border-bottom:1px solid var(--line)">
+<div class="wrap">
+<div class="entry"><span class="no">Whitepaper · v6.4.2</span><span class="rule"></span></div>
+<h1>Every AI decision.<br><i>Sealed. Provable. Yours.</i></h1>
+<p style="font-size:16px;line-height:1.8;max-width:720px;margin-top:20px">One engine. Four products. <b>50p per device per month.</b> AILeash scores every action in under 30ms — ALLOW, CHALLENGE, or BLOCK — and seals it into a tamper-evident chain. When a regulator asks for proof, you have it. When your users need protection, it's there. When you charge for the layer, you keep the margin.</p>
 </div>
-<div style="background:#111a30;border-left:3px solid #c9a84c;padding:20px 24px;border-radius:0 6px 6px 0;color:#7d849a;font-size:15px;line-height:1.8;margin-bottom:20px">
-<strong style="color:#e8e8f0">Abstract.</strong> AILeash v6.4.2 extends deterministic AI governance with forensic-grade event reconstruction: microsecond timing, full request context (IP, user-agent, device fingerprint, TLS), signal derivation paths, GeoIP+ASN, entropy logging, and chain continuity proof. Guardian network safeguarding detects predatory patterns with behavioral timelines and CEOP/NCA reporting integration. All decisions sealed into tamper-evident chain.
+</section>
+
+<section>
+<div class="wrap">
+<div class="entry"><span class="no">Block 001 · The Engine</span><span class="rule"></span></div>
+<h2>How it works.</h2>
+<p>Deterministic weighted scoring across nine signals. No machine learning. No drift. No re-training. Weights are immutable in code.</p>
+<div class="spec">
+score = clamp( Σ , 0, 1 ) where Σ =<br>
+(1 − trust) × <b>0.30</b><br>
++ min(velocity_60s / 20, 1) × <b>0.15</b><br>
++ min(velocity_5m / 50, 1) × <b>0.10</b><br>
++ min(velocity_1h / 200, 1) × <b>0.10</b><br>
++ min(ln(1+amount) / ln(1+10000), 1) × <b>0.15</b><br>
++ device_risk × <b>0.10</b><br>
++ behavioural_anomaly × <b>0.10</b><br>
++ country_shift × <b>0.10</b><br>
++ unsafe_country × <b>0.10</b><br><br>
+<b>decision</b> = ALLOW if score &lt; 0.35<br>
+= CHALLENGE if score &lt; 0.70<br>
+= BLOCK otherwise
 </div>
-<div style="background:rgba(255,176,32,0.07);border:1px solid rgba(255,176,32,0.3);border-radius:6px;padding:16px 20px;margin-bottom:28px;font-size:13.5px;color:#7d849a;line-height:1.7">
-<strong style="color:#ffb020">New in v6.4.2:</strong> Microsecond-precision timing across all phases (auth → signals → decision → seal). Request context captured (IP, user-agent, device fingerprint, TLS version/cipher). Signal derivation fully logged (raw → normalized → weighted). GeoIP lookup + ASN for geographic routing analysis. Velocity windows sealed into audit chain. Guardian patterns with behavioral timeline + confidence scoring. Complete chain continuity proof (genesis + previous 3 blocks).
+<p>Trust is per-user and persistent. It takes roughly 70 clean events to climb from neutral to 0.75, and three blocks to fall below it. This asymmetry is institutional memory.</p>
+<p>Three velocity windows (60 seconds, 5 minutes, 1 hour) catch the three canonical attack tempos: burst (bot), sustained (scripted abuse), and slow compromise.</p>
 </div>
+</section>
+
+<section>
+<div class="wrap">
+<div class="entry"><span class="no">Block 002 · The Chain</span><span class="rule"></span></div>
+<h2>Tamper-evident record keeping.</h2>
+<p>Every decision is sealed before the API response returns. The construction is simple: canonical JSON of the previous hash, timestamp, event, and result, hashed with SHA-256.</p>
+<div class="callout gold">
+<h3>What the chain proves</h3>
+<p>A valid chain proves the record has not been altered since genesis: change one character and every subsequent hash breaks, detectably, by anyone recomputing forward. It does not prove the system worked correctly; it proves the system's own word didn't change.</p>
 </div>
-<div style="max-width:880px;margin:0 auto;padding:0 24px 80px">
-<h2 style="font-size:22px;font-weight:600;margin:46px 0 16px;border-top:1px solid #1e2a45;padding-top:46px">Technical Capture: Complete Event Reconstruction</h2>
-<p style="color:#7d849a;font-size:15px;line-height:1.8;margin-bottom:14px">Every decision now includes:</p>
-<ul style="color:#7d849a;font-size:15px;line-height:1.8;margin-bottom:14px;margin-left:20px">
-<li><b style="color:#e8e8f0">Timing phases:</b> Microsecond deltas for auth, signal computation, decision, context extraction, seal</li>
-<li><b style="color:#e8e8f0">Request context:</b> IP, port, protocol, TLS version, TLS cipher, user-agent, accept-language, referer, device fingerprint</li>
-<li><b style="color:#e8e8f0">Signal derivation:</b> Raw values → normalized → weighted contributions to final score</li>
-<li><b style="color:#e8e8f0">Decision trace:</b> Score, decision (ALLOW/CHALLENGE/BLOCK), all reason codes</li>
-<li><b style="color:#e8e8f0">Velocity snapshot:</b> Window sizes (60s, 5m, 1h) at decision time</li>
-<li><b style="color:#e8e8f0">GeoIP context:</b> Country, ASN, city (for routing analysis)</li>
-<li><b style="color:#e8e8f0">Chain continuity:</b> Previous 3 blocks + genesis link (tampering detection)</li>
-</ul>
-<h2 style="font-size:22px;font-weight:600;margin:46px 0 16px;border-top:1px solid #1e2a45;padding-top:46px">Guardian: Network Safeguarding</h2>
-<p style="color:#7d849a;font-size:15px;line-height:1.8;margin-bottom:14px">Guardian detects predatory patterns in network traffic. <b style="color:#e8e8f0">Business/safeguarding teams only — not parental control.</b> Features:</p>
-<ul style="color:#7d849a;font-size:15px;line-height:1.8;margin-bottom:14px;margin-left:20px">
-<li>Pattern vocabulary: sustained_contact, escalation, isolation tactics</li>
-<li>Behavioral timeline: temporal sequence of suspicious events</li>
-<li>Confidence scoring: 0.0–1.0 on detected patterns</li>
-<li>CEOP/NCA reporting: Evidence package generation (placeholder for API integration)</li>
-<li>Free for safeguarding teams, permanently</li>
-</ul>
-<h2 style="font-size:22px;font-weight:600;margin:46px 0 16px;border-top:1px solid #1e2a45;padding-top:46px">API Routes (v6.4.2)</h2>
-<div style="background:#0b1226;border:1px solid #1e2a45;border-radius:8px;padding:20px 24px;margin:18px 0;font-family:'JetBrains Mono',monospace;font-size:12.5px;line-height:1.9;color:#7d849a">
-<div style="margin-bottom:8px"><b style="color:#00ff88">POST /api/govern</b> — Core decision endpoint. Returns: {decision, score, trust, reasons, audit_hash, receipt_seq, challenge_url if CHALLENGE}</div>
-<div style="margin-bottom:8px"><b style="color:#00ff88">POST /api/keys or /signup</b> — Create API key. Returns: {api_key, product, quota, ref_code, badge_id}</div>
-<div style="margin-bottom:8px"><b style="color:#00ff88">GET /api/spec</b> — Engine specification (signals, weights, thresholds)</div>
-<div style="margin-bottom:8px"><b style="color:#00ff88">GET /api/verify-chain</b> — Full chain integrity proof</div>
-<div style="margin-bottom:8px"><b style="color:#00ff88">GET /api/health</b> — Server health + RPS</div>
-<div style="margin-bottom:8px"><b style="color:#00ff88">POST /stripe-webhook</b> — Stripe subscription lifecycle</div>
-<div><b style="color:#00ff88">GET /api/forensic/{audit_id}</b> — Full forensic evidence (timing, context, derivation, chain continuity)</div>
+<p>Each block carries the API key that produced it, stored alongside the block, never inside it. When a regulator asks "did you issue this decision?", you can answer with proof that you did, and what it said, and when.</p>
 </div>
-<h2 style="font-size:22px;font-weight:600;margin:46px 0 16px;border-top:1px solid #1e2a45;padding-top:46px">Regulatory Alignment (v6.4.2)</h2>
-<table style="width:100%;border-collapse:collapse;font-size:13.5px;margin:18px 0">
-<thead>
-<tr style="background:#111a30">
-<th style="padding:12px 14px;text-align:left;font-weight:600;font-size:11.5px;text-transform:uppercase;letter-spacing:0.08em;color:#7d849a;border-bottom:2px solid #1e2a45">Regulation</th>
-<th style="padding:12px 14px;text-align:left;font-weight:600;font-size:11.5px;text-transform:uppercase;letter-spacing:0.08em;color:#c9a84c;border-bottom:2px solid #1e2a45;background:rgba(201,168,76,0.06)">v6.4.2 Support</th>
-</tr>
-</thead>
+</section>
+
+<section>
+<div class="wrap">
+<div class="entry"><span class="no">Block 003 · Real-time Visibility</span><span class="rule"></span></div>
+<h2>Live dashboards and sealed evidence.</h2>
+<p>The moment the engine returns BLOCK on your platform, the account holder is emailed the evidence: the user, action, score, plain-language reasons, and the audit hash under which the event was sealed. Compliance stops being a quarterly report. It becomes an instrument reading.</p>
+<p><b>GET /api/pulse</b> returns your last-hour decision distribution (ALLOW/CHALLENGE/BLOCK), the 10 most recent events with full context, and the chain tip — proof your evidence is sealed.</p>
+</div>
+</section>
+
+<section>
+<div class="wrap">
+<div class="entry"><span class="no">Block 004 · Four Products</span><span class="rule"></span></div>
+<h2>One engine. Pick your layer.</h2>
+<p>All four run the same 9-signal scoring engine and audit chain underneath. You charge what you like above 50p. You keep the rest, every month.</p>
+<table>
+<thead><tr><th>Product</th><th class="hl">What it does</th><th>Price (your share)</th></tr></thead>
 <tbody>
-<tr>
-<td style="padding:13px 14px;border-bottom:1px solid #1e2a45;color:#e8e8f0;font-weight:500">EU AI Act Art. 9 (Risk Management)</td>
-<td style="padding:13px 14px;border-bottom:1px solid #1e2a45;background:rgba(201,168,76,0.04)">Per-event scoring (9 signals), velocity windows (3 tempos), persistent trust, complete derivation audit</td>
-</tr>
-<tr>
-<td style="padding:13px 14px;border-bottom:1px solid #1e2a45;color:#e8e8f0;font-weight:500">EU AI Act Art. 12 (Record-Keeping)</td>
-<td style="padding:13px 14px;border-bottom:1px solid #1e2a45;background:rgba(201,168,76,0.04)">Per-decision SHA-256 chain, gapless receipts, forensic evidence seal, raw signals capture</td>
-</tr>
-<tr>
-<td style="padding:13px 14px;border-bottom:1px solid #1e2a45;color:#e8e8f0;font-weight:500">EU AI Act Art. 13 (Transparency)</td>
-<td style="padding:13px 14px;border-bottom:1px solid #1e2a45;background:rgba(201,168,76,0.04)">Plain-language reason codes, deterministic weights, derivation path exposed</td>
-</tr>
-<tr>
-<td style="padding:13px 14px;border-bottom:1px solid #1e2a45;color:#e8e8f0;font-weight:500">UK Online Safety Act 2023</td>
-<td style="padding:13px 14px;border-bottom:1px solid #1e2a45;background:rgba(201,168,76,0.04)">Real-time moderation evidence, sealed audit trail, network-level pattern detection</td>
-</tr>
-<tr>
-<td style="padding:13px 14px;color:#e8e8f0;font-weight:500">ICO Children's Code</td>
-<td style="padding:13px 14px;background:rgba(201,168,76,0.04)">Guardian: network safeguarding, pattern detection, CEOP/NCA integration ready</td>
-</tr>
+<tr><td><b>AILeash</b></td><td class="hl">AI governance layer. Every decision your platform makes about a person gets scored, explained, and sealed.</td><td>50p + margin</td></tr>
+<tr><td><b>Guardian</b></td><td>Free message checker for families. Child pastes a message in, gets instant plain-English assessment against grooming patterns.</td><td>Free forever</td></tr>
+<tr><td><b>SonicBoom</b></td><td class="hl">One line of code on AWS / Azure / GCP / OpenAI / Anthropic. Adds full compliance audit chain to every call.</td><td>50p + margin</td></tr>
+<tr><td><b>Sentinel</b></td><td>Fraud and anomaly alerting. Scores unusual patterns (500 messages in a minute, login from new country, velocity spikes) in real-time.</td><td>50p + margin</td></tr>
 </tbody>
 </table>
-<h2 style="font-size:22px;font-weight:600;margin:46px 0 16px;border-top:1px solid #1e2a45;padding-top:46px">Scoring Engine (Immutable)</h2>
-<div style="background:#0b1226;border:1px solid #1e2a45;border-radius:8px;padding:20px 24px;margin:18px 0;font-family:'JetBrains Mono',monospace;font-size:12.5px;line-height:1.9;color:#7d849a">
-scope = clamp( Σ , 0, 1 ) where Σ =<br>
-(1 − trust) × <b style="color:#00ff88">0.30</b><br>
-+ min(velocity_60s / 20, 1) × <b style="color:#00ff88">0.15</b><br>
-+ min(velocity_5m / 50, 1) × <b style="color:#00ff88">0.10</b><br>
-+ min(velocity_1h / 200, 1) × <b style="color:#00ff88">0.10</b><br>
-+ min(ln(1+amount) / ln(1+10000), 1) × <b style="color:#00ff88">0.15</b><br>
-+ device_risk × <b style="color:#00ff88">0.10</b><br>
-+ anomaly × <b style="color:#00ff88">0.10</b><br>
-+ country_shift × <b style="color:#00ff88">0.10</b><br>
-+ unsafe_country × <b style="color:#00ff88">0.10</b><br>
-<br>
-decision = <b style="color:#e8e8f0">ALLOW</b> if score < 0.35<br>
-         = <b style="color:#e8e8f0">CHALLENGE</b> if score < 0.70<br>
-         = <b style="color:#e8e8f0">BLOCK</b> otherwise
 </div>
-<footer style="border-top:1px solid #1e2a45;padding:32px 24px;text-align:center;color:#7d849a;font-size:13px;max-width:880px;margin:0 auto">
-<p style="margin-bottom:6px"><b style="color:#e8e8f0">AILeash — Monop Content</b> · Blyth, Northumberland, UK · <a href="https://sebbi.pro" style="color:#c9a84c;text-decoration:none">sebbi.pro</a></p>
-<p style="margin-bottom:6px">Whitepaper v6.4.2 · Engine v6.4.2 · All claims verifiable against production /api/spec and /api/verify-chain endpoints</p>
-<p>© 2026 Justin Antony Dobson. Copyright, Designs and Patents Act 1988.</p>
+</section>
+
+<section>
+<div class="wrap">
+<div class="entry"><span class="no">Block 005 · Regulatory Alignment</span><span class="rule"></span></div>
+<h2>Built for enforcement, not aspiration.</h2>
+<p>Design targets, feature by feature:</p>
+<table>
+<thead><tr><th>Regulation</th><th class="hl">AILeash Support</th></tr></thead>
+<tbody>
+<tr><td><b>EU AI Act Art. 9</b><br>Continuous risk management</td><td class="hl">Per-event scoring across 9 signals, velocity windows at three tempos, persistent per-user trust</td></tr>
+<tr><td><b>EU AI Act Art. 12</b><br>Record-keeping</td><td class="hl">Per-decision SHA-256 chain, gapless receipts, public inclusion and coverage verification</td></tr>
+<tr><td><b>EU AI Act Art. 13</b><br>Transparency</td><td class="hl">Plain-language reason codes on every verdict; deterministic weights, publishable in full</td></tr>
+<tr><td><b>EU AI Act Art. 14</b><br>Human oversight</td><td class="hl">CHALLENGE verdicts with hosted human resolution, sealed as first-class chain events</td></tr>
+<tr><td><b>UK Online Safety Act</b><br>Evidence-backed moderation</td><td class="hl">Real-time scoring with sealed audit trail, ready for Ofcom submission</td></tr>
+<tr><td><b>ICO Children's Code</b><br>Child-first design</td><td class="hl">Guardian: free message checker, pattern detection, Childline/CEOP ready</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<div class="wrap">
+<div class="entry"><span class="no">Block 006 · Verification</span><span class="rule"></span></div>
+<h2>Every claim is checkable.</h2>
+<p>Live endpoints prove what the engine actually does:</p>
+<table>
+<thead><tr><th>Endpoint</th><th class="hl">Proves</th></tr></thead>
+<tbody>
+<tr><td class="mono"><b>GET /api/spec</b></td><td class="hl">Engine specification, live</td></tr>
+<tr><td class="mono"><b>GET /api/verify-chain</b></td><td class="hl">Full chain integrity, genesis to tip</td></tr>
+<tr><td class="mono"><b>GET /api/health</b></td><td class="hl">Server health and requests per second</td></tr>
+<tr><td class="mono"><b>POST /api/govern</b></td><td class="hl">Core decision endpoint, under 30ms</td></tr>
+<tr><td class="mono"><b>GET /api/pulse</b></td><td class="hl">Live posture: last-hour decisions, recent events, chain tip</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<div class="wrap">
+<div class="entry"><span class="no">Block 007 · Economics</span><span class="rule"></span></div>
+<h2>50p per device per month. You set the price.</h2>
+<p><b>You charge per device per month. We take 50p. Everything above it is yours, every month.</b></p>
+<p>A reseller charging £1.99 per device on 1,000 devices keeps £1,490 a month. 10 referrals at that scale is £1,000 a month recurring — and it renews itself.</p>
+<p>The structural advantage is cost shape. Sovereign deployment moves decision execution onto customer hardware, so vendor infrastructure cost is flat with respect to decision volume. As your customers grow, your margin doesn't compress.</p>
+<p><b>Free tier:</b> 100 decisions per month, no credit card required. Full access to all endpoints, full chain, full audit trail.</p>
+</div>
+</section>
+
+<section>
+<div class="wrap">
+<div class="entry"><span class="no">Block 008 · The Thesis</span><span class="rule"></span></div>
+<h2>Technical capture as market position.</h2>
+<p>Lock-in is contractual: exit fees, term commitments, lawyers holding the door. Technical capture is structural: the product's own physics make leaving expensive, with no contractual penalty at all.</p>
+<p><b>Exported records are data; the tamper-evidence regulators demand lives in the unbroken chain, which cannot migrate.</b> Unbroken beats rebuilt, every time a regulator asks the question.</p>
+<p>Per-user trust is earned decision-by-decision inside the engine. A departing platform restarts every user at neutral — detection quality drops on day one of the next vendor.</p>
+<p>Customer badges are rendered live against account standing. Leaving is publicly visible on your own site — UNVERIFIED, in grey.</p>
+</div>
+</section>
+
+<section>
+<div class="wrap">
+<div class="entry"><span class="no">Block 009 · Comparison</span><span class="rule"></span></div>
+<h2>Why AILeash is different.</h2>
+<table>
+<thead><tr><th>Capability</th><th class="hl">AILeash</th><th>GRC platforms</th><th>Cloud AI guardrails</th></tr></thead>
+<tbody>
+<tr><td>Per-decision tamper-evident record</td><td class="hl"><b>✓</b> SHA-256 chain</td><td>Editable logs</td><td>Provider-held logs</td></tr>
+<tr><td>Omission detectable</td><td class="hl"><b>✓</b> Gapless receipts</td><td>No</td><td>No</td></tr>
+<tr><td>Public verification</td><td class="hl"><b>✓</b> Unauthenticated</td><td>No</td><td>No</td></tr>
+<tr><td>Decision latency</td><td class="hl"><b>✓</b> 28ms median</td><td>Not in path</td><td>Model-dependent</td></tr>
+<tr><td>Data leaves your network?</td><td class="hl"><b>✓</b> Never (sovereign)</td><td>Vendor cloud</td><td>Provider cloud</td></tr>
+<tr><td>Deterministic / explainable</td><td class="hl"><b>✓</b> Immutable weights</td><td>Policy text</td><td>ML, drift-prone</td></tr>
+<tr><td>Entry price</td><td class="hl"><b>✓</b> 50p/device/month</td><td>£20k–£100k+/yr</td><td>Usage-priced</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<div class="wrap">
+<div class="entry"><span class="no">Block 010 · Contact</span><span class="rule"></span></div>
+<h2>Start now.</h2>
+<p><b>Get a free API key on the homepage.</b> 100 free decisions, no card required. Full access to all endpoints, all signals, all verification surfaces.</p>
+<p>Read the developer docs at /developers. Verify the chain at /api/verify-chain. Run the free AI Act scanner at /scan.</p>
+<p>Questions? Contact Justin at sebbi.pro or email justrightdecorators@gmail.com.</p>
+</div>
+</section>
+</main>
+
+<footer>
+<p><b>AILeash — Monop Content</b> · Blyth, Northumberland, UK · <a href="https://sebbi.pro">sebbi.pro</a></p>
+<p>Whitepaper v6.4.2 · Engine v6.4.2 · All claims verifiable at /api/spec and /api/verify-chain</p>
+<p style="margin-top:12px">© 2026 Justin Antony Dobson. Copyright, Designs and Patents Act 1988.</p>
 </footer>
-</div>
 </body>
 </html>
