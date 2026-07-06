@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#0a0f1e">
+<title>Guardian &mdash; Parent Dashboard</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0a0f1e;color:#fff;min-height:100vh;padding:20px}
+.wrap{max-width:640px;margin:0 auto}
+.logo{display:flex;align-items:center;gap:10px;margin:8px 0 4px}
+h1{font-size:24px;font-weight:800}h1 span{color:#c9a84c}
+.sub{color:#8a90a6;font-size:13.5px;margin:6px 0 20px;line-height:1.6}
+.card{background:#111a30;border:1px solid #232d4a;border-radius:14px;padding:18px;margin-bottom:14px}
+.card h2{font-size:13px;font-weight:700;color:#c9a84c;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:12px}
+input{width:100%;border-radius:10px;border:1px solid #2a3350;background:#0b1226;color:#fff;padding:13px;font-size:15px;margin-bottom:10px;font-family:inherit}
+input::placeholder{color:#4a5170}
+button{background:#c9a84c;color:#0a0f1e;border:none;border-radius:10px;padding:13px 22px;font-weight:800;cursor:pointer;font-size:14.5px;font-family:inherit}
+button.ghost{background:transparent;border:1px solid #2a3350;color:#8a90a6;font-weight:600}
+.kidrow{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:12px 0;border-bottom:1px solid #1a2340;flex-wrap:wrap}
+.kidrow:last-child{border-bottom:none}
+.kn{font-weight:700;font-size:15px}
+.kc{font-family:monospace;font-size:12px;color:#c9a84c}
+.kt{font-size:12px;color:#8a90a6}
+.ev{border-left:3px solid #2a3350;padding:10px 14px;margin:10px 0;font-size:14px;background:#0d1428;border-radius:0 10px 10px 0}
+.ev.panic{border-color:#d43a2e}.ev.flag{border-color:#c9a84c}.ev.checkin{border-color:#1fae79}
+.k{font-weight:800;text-transform:uppercase;font-size:11px;letter-spacing:1px}
+.panic .k{color:#ff7b6e}.flag .k{color:#c9a84c}.checkin .k{color:#7fe3b0}
+.t{color:#8a90a6;font-size:12px;margin-left:8px}
+.n{display:block;margin-top:3px;color:#c2c8dc;font-size:13px}
+a.map{color:#8fbcff;font-size:12.5px;text-decoration:none}
+.seal{display:block;font-family:monospace;font-size:10px;color:#4a5170;margin-top:4px}
+.share{background:#0d2018;border:1px solid #1fae79;border-radius:10px;padding:12px 14px;margin-top:10px;font-size:13px;line-height:1.6;word-break:break-all;display:none}
+.share b{color:#7fe3b0}
+.tiny{color:#4a5170;font-size:11.5px;margin-top:18px;line-height:1.7}
+.err{color:#ff7b6e;font-size:13px;margin-top:6px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="logo">
+    <svg width="26" height="26" viewBox="0 0 32 32"><circle cx="16" cy="16" r="13.5" fill="none" stroke="#c9a84c" stroke-width="2.6" stroke-dasharray="66 20" stroke-linecap="round" transform="rotate(-50 16 16)"/><circle cx="26.5" cy="7" r="3.1" fill="#c9a84c"/></svg>
+    <h1>Guard<span>ian</span> &mdash; Parent</h1>
+  </div>
+  <div class="sub">Set up a safety link for your child in two minutes. Just your email &mdash; no account, no card. Free for every family, always.</div>
+
+  <div class="card">
+    <h2>Sign in</h2>
+    <input id="key" type="email" placeholder="Your email address" autocomplete="email">
+    <button onclick="loadKids()">Open dashboard</button>
+    <span style="margin-left:8px;font-size:12.5px;color:#8a90a6">First time? Just enter your email and add your child below.</span>
+    <div class="err" id="keyerr"></div>
+  </div>
+
+  <div class="card" id="kids" style="display:none">
+    <h2>Your children</h2>
+    <div id="kidlist"></div>
+    <div style="margin-top:14px">
+      <input id="newname" placeholder="Child's first name" style="margin-bottom:8px">
+      <button onclick="pair()">Add child &rarr; get their link</button>
+    </div>
+    <div class="share" id="share"></div>
+  </div>
+
+  <div class="card" id="report" style="display:none">
+    <h2 id="rtitle">Timeline</h2>
+    <div id="events"></div>
+  </div>
+
+  <div class="tiny">Guardian shows only what your child chooses to share: check-ins, help requests, and messages they flag. It cannot secretly read their phone &mdash; that is deliberate, and any product promising otherwise is either lying or spyware. Message text is never stored, only a fingerprint. Every event is sealed into a tamper-evident audit chain: edit one record and every record after it visibly breaks.</div>
+</div>
+<script>
+var KEY='';
+function esc(s){return String(s).replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
+async function api(u,opts){opts=opts||{};opts.headers={'Content-Type':'application/json'};try{var r=await fetch(u,opts);return await r.json()}catch(e){return{error:'network'}}}
+async function loadKids(){
+  KEY=document.getElementById('key').value.trim();
+  document.getElementById('keyerr').textContent='';
+  if(!KEY||KEY.indexOf('@')<0){document.getElementById('keyerr').textContent='Enter your email address.';return}
+  var d=await api('/api/guardian/children?email='+encodeURIComponent(KEY));
+  if(d.error){document.getElementById('keyerr').textContent='Could not load: '+d.error;return}
+  document.getElementById('kids').style.display='block';
+  var h='';
+  (d.children||[]).forEach(function(c){
+    var last=c.last_checkin?new Date(c.last_checkin*1000).toLocaleString():'never';
+    h+='<div class="kidrow"><div><div class="kn">'+esc(c.name)+'</div><div class="kc">'+esc(c.code)+'</div><div class="kt">Last check-in: '+last+'</div></div>'
+      +'<div><button class="ghost" onclick="report(\''+esc(c.code)+'\',\''+esc(c.name)+'\')">View timeline</button> '
+      +'<button class="ghost" onclick="shareLink(\''+esc(c.code)+'\',\''+esc(c.name)+'\')">Child link</button></div></div>';
+  });
+  document.getElementById('kidlist').innerHTML=h||'<div class="kt">No children paired yet. Add one below.</div>';
+}
+async function pair(){
+  var nm=document.getElementById('newname').value.trim();
+  if(!nm)return;
+  var d=await api('/api/guardian/pair',{method:'POST',body:JSON.stringify({child_name:nm,parent_email:KEY})});
+  if(d.error){document.getElementById('keyerr').textContent=d.error;return}
+  document.getElementById('newname').value='';
+  shareShow(d.child_url,nm);
+  loadKids();
+}
+function shareLink(code,name){shareShow(location.origin+'/guardian-child?code='+code,name)}
+function shareShow(url,name){
+  var s=document.getElementById('share');
+  s.style.display='block';
+  s.innerHTML='<b>'+esc(name)+"'s link</b> &mdash; open this on their phone, then Add to Home Screen so the Help button is always one tap away:<br>"+esc(url);
+}
+async function report(code,name){
+  var d=await api('/api/guardian/report?code='+encodeURIComponent(code)+'&email='+encodeURIComponent(KEY));
+  if(d.error){document.getElementById('keyerr').textContent=d.error;return}
+  document.getElementById('report').style.display='block';
+  document.getElementById('rtitle').textContent=name+"'s timeline";
+  var h='';
+  (d.events||[]).forEach(function(e){
+    var when=new Date(e.ts*1000).toLocaleString();
+    var head={panic:'Help requested',flag:'Message checked',checkin:'Checked in'}[e.kind]||e.kind;
+    h+='<div class="ev '+esc(e.kind)+'"><span class="k">'+head+'</span><span class="t">'+when+'</span>';
+    if(e.lat&&e.lon)h+=' <a class="map" target="_blank" rel="noopener" href="https://maps.google.com/?q='+e.lat+','+e.lon+'">view location</a>';
+    if(e.note)h+='<span class="n">'+esc(e.note)+'</span>';
+    h+='<span class="seal">sealed '+esc(e.sealed)+'</span></div>';
+  });
+  document.getElementById('events').innerHTML=h||'<div class="kt">Nothing yet. Events appear here the moment your child checks in, asks for help, or flags a message.</div>';
+  document.getElementById('report').scrollIntoView({behavior:'smooth'});
+}
+</script>
+</body>
+</html>
