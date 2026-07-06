@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<meta name="theme-color" content="#0a0f1e">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Guardian</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0a0f1e;color:#fff;min-height:100vh;padding:18px;display:flex;flex-direction:column}
+.wrap{max-width:430px;margin:0 auto;width:100%;flex:1;display:flex;flex-direction:column}
+.logo{display:flex;align-items:center;justify-content:center;gap:10px;margin:10px 0 2px}
+.logo svg{flex-shrink:0}
+h1{font-size:26px;font-weight:800;letter-spacing:-0.02em}
+h1 span{color:#c9a84c}
+.sub{text-align:center;color:#8a90a6;font-size:13px;margin:6px 0 22px;line-height:1.5}
+.big{display:flex;align-items:center;justify-content:center;gap:10px;width:100%;border:none;border-radius:18px;padding:22px;font-size:19px;font-weight:800;margin-bottom:12px;cursor:pointer;color:#fff;font-family:inherit;transition:transform .08s}
+.big:active{transform:scale(0.98)}
+.help{background:linear-gradient(135deg,#d43a2e,#b02318);box-shadow:0 4px 20px rgba(212,58,46,0.35)}
+.check{background:linear-gradient(135deg,#1fae79,#158a5e)}
+.card{background:#111a30;border:1px solid #232d4a;border-radius:16px;padding:16px;margin-bottom:12px}
+.card label{display:block;font-size:12px;font-weight:700;color:#c9a84c;letter-spacing:1px;text-transform:uppercase;margin-bottom:8px}
+textarea{width:100%;border-radius:12px;border:1px solid #2a3350;background:#0b1226;color:#fff;padding:13px;font-size:15px;min-height:88px;font-family:inherit;resize:vertical}
+textarea::placeholder{color:#4a5170}
+.flag{background:linear-gradient(135deg,#c9a84c,#a8873a);color:#0a0f1e;margin-top:10px;margin-bottom:0;padding:16px;font-size:16px;border-radius:12px}
+.out{border-radius:14px;padding:16px;margin-bottom:12px;font-size:15px;line-height:1.65;display:none;animation:pop .25s ease}
+@keyframes pop{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.out.bad{background:#2a0f0d;border:1px solid #d43a2e;display:block}
+.out.mid{background:#221c0c;border:1px solid #c9a84c;display:block}
+.out.ok{background:#0d2018;border:1px solid #1fae79;display:block}
+.out b{display:block;margin-bottom:6px;font-size:13px;letter-spacing:1px;text-transform:uppercase}
+.bad b{color:#ff7b6e}.mid b{color:#c9a84c}.ok b{color:#7fe3b0}
+.row{display:flex;gap:8px;margin-top:auto;padding-top:16px}
+.row a{flex:1;text-align:center;background:#111a30;border:1px solid #232d4a;border-radius:12px;padding:13px 6px;color:#fff;text-decoration:none;font-size:12.5px;font-weight:700}
+.row a.sos{border-color:#d43a2e;color:#ff7b6e}
+.tiny{text-align:center;color:#4a5170;font-size:10.5px;margin-top:14px;line-height:1.6}
+.who{text-align:center;font-size:12px;color:#7fe3b0;margin-bottom:16px;font-weight:600}
+.who.no{color:#ff7b6e}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="logo">
+    <svg width="30" height="30" viewBox="0 0 32 32"><circle cx="16" cy="16" r="13.5" fill="none" stroke="#c9a84c" stroke-width="2.6" stroke-dasharray="66 20" stroke-linecap="round" transform="rotate(-50 16 16)"/><circle cx="26.5" cy="7" r="3.1" fill="#c9a84c"/></svg>
+    <h1>Guard<span>ian</span></h1>
+  </div>
+  <div class="sub">Your safety button. Always here.</div>
+  <div class="who" id="who">Checking your link...</div>
+
+  <button class="big help" onclick="panic()">&#128721;&nbsp; I need help now</button>
+  <button class="big check" onclick="checkin()">&#9989;&nbsp; Check in &mdash; I'm OK</button>
+
+  <div class="card">
+    <label>Got a message that feels off?</label>
+    <textarea id="msg" placeholder="Paste the message here. It is never saved anywhere - Guardian only looks at it, then forgets it."></textarea>
+    <button class="big flag" onclick="flag()">Check this message</button>
+  </div>
+
+  <div class="out" id="out"></div>
+
+  <div class="row">
+    <a href="tel:999" class="sos">Call 999</a>
+    <a href="tel:08001111">Childline<br>0800 1111</a>
+    <a href="https://www.ceop.police.uk/safety-centre/" target="_blank" rel="noopener">CEOP<br>Report</a>
+  </div>
+  <div class="tiny">Guardian never says a message is "safe" &mdash; no tool honestly can. It tells you what it recognises. If something feels wrong, trust that feeling and tell an adult you trust. Your messages are checked, never stored.</div>
+</div>
+<script>
+var code=new URLSearchParams(location.search).get('code')||'';
+var who=document.getElementById('who');
+if(code){who.textContent='Linked to your grown-up \u2713';}
+else{who.textContent='No link code \u2014 ask your parent to send you your Guardian link.';who.className='who no';}
+function loc(cb){
+  if(!navigator.geolocation){cb(null,null);return;}
+  navigator.geolocation.getCurrentPosition(
+    function(p){cb(p.coords.latitude,p.coords.longitude)},
+    function(){cb(null,null)},
+    {timeout:6000,maximumAge:60000});
+}
+async function post(u,b){
+  try{var r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});return await r.json();}
+  catch(e){return{error:'offline'};}
+}
+function show(cls,head,txt){var o=document.getElementById('out');o.className='out '+cls;o.innerHTML='<b>'+head+'</b>'+txt;o.scrollIntoView({behavior:'smooth',block:'nearest'});}
+function panic(){
+  show('mid','One moment','Telling your grown-up now...');
+  loc(function(la,lo){
+    post('/api/guardian/panic',{code:code,lat:la,lon:lo}).then(function(d){
+      if(d.error){show('mid','Could not reach Guardian','Check your internet. If you are in danger, call 999 right now.');return;}
+      show('bad','Help is coming','Your grown-up has been told'+(la?' and can see where you are':'')+'. If you are in danger right now, call 999. You did the right thing.');
+    });
+  });
+}
+function checkin(){
+  loc(function(la,lo){
+    post('/api/guardian/checkin',{code:code,lat:la,lon:lo}).then(function(d){
+      if(d.error){show('mid','Could not check in','Check your internet and try again.');return;}
+      show('ok','Checked in','Nice one. Your grown-up can see you are OK.');
+    });
+  });
+}
+function flag(){
+  var m=document.getElementById('msg').value.trim();
+  if(!m){show('mid','Nothing to check','Paste the message into the box first.');return;}
+  post('/api/guardian/flag',{code:code,message:m}).then(function(d){
+    document.getElementById('msg').value='';
+    if(d.error){show('mid','Could not check','Check your internet and try again.');return;}
+    if(d.result==='FLAGGED'){
+      show('bad','This message is not OK',d.advice);
+    }else{
+      show('mid','Guardian does not recognise this',d.advice);
+    }
+  });
+}
+</script>
+</body>
+</html>
