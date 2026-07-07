@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>sebbi.pro - Admin</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0a0f1e;color:#fff;line-height:1.5}
+.wrap{max-width:1000px;margin:0 auto;padding:20px}
+h1{font-size:22px;font-weight:800;margin-bottom:4px}h1 span{color:#c9a84c}
+.sub{color:#8a90a6;font-size:13px;margin-bottom:20px}
+/* login */
+#login{max-width:360px;margin:80px auto;text-align:center}
+#login input{width:100%;padding:14px;border-radius:10px;border:1px solid #2a3350;background:#0b1226;color:#fff;font-size:16px;margin:12px 0}
+button{background:#c9a84c;color:#0a0f1e;border:none;border-radius:10px;padding:13px 22px;font-weight:800;cursor:pointer;font-size:15px;width:100%}
+button.small{width:auto;padding:8px 16px;font-size:13px}
+.err{color:#ff7b6e;font-size:13px;margin-top:8px;min-height:18px}
+/* dashboard */
+#dash{display:none}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:20px}
+.stat{background:#111a30;border:1px solid #232d4a;border-radius:12px;padding:16px}
+.stat .big{font-size:26px;font-weight:800;color:#c9a84c}
+.stat .lab{font-size:11px;color:#8a90a6;text-transform:uppercase;letter-spacing:1px;margin-top:4px}
+.stat.good .big{color:#7fe3b0}.stat.bad .big{color:#ff7b6e}
+.tabs{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap}
+.tab{background:#111a30;border:1px solid #232d4a;color:#8a90a6;padding:9px 16px;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600}
+.tab.on{background:#c9a84c;color:#0a0f1e;border-color:#c9a84c}
+.panel{display:none}.panel.on{display:block}
+.card{background:#111a30;border:1px solid #232d4a;border-radius:12px;padding:14px;margin-bottom:10px;font-size:14px}
+.card .top{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:6px}
+.card .nm{font-weight:700}
+.card .meta{color:#8a90a6;font-size:12px}
+.badge{font-size:10px;padding:2px 8px;border-radius:10px;font-weight:700;text-transform:uppercase}
+.badge.paid{background:#0d2018;color:#7fe3b0;border:1px solid #1fae79}
+.badge.free{background:#1a1206;color:#c9a84c;border:1px solid #c9a84c}
+.stripe-link{color:#7fe3b0;font-size:12px;text-decoration:none;font-family:monospace}
+.bar{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}
+.mono{font-family:monospace;font-size:12px;color:#8a90a6;word-break:break-all}
+.empty{color:#5a6178;text-align:center;padding:30px;font-size:14px}
+a.ext{display:inline-block;background:#0d2018;border:1px solid #1fae79;color:#7fe3b0;padding:10px 16px;border-radius:8px;text-decoration:none;font-size:13px;font-weight:600;margin-bottom:16px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div id="login">
+    <h1>sebbi<span>.pro</span> admin</h1>
+    <div class="sub">Private control panel</div>
+    <input id="pw" type="password" placeholder="Admin password" onkeydown="if(event.key==='Enter')doLogin()">
+    <button onclick="doLogin()">Log in</button>
+    <div class="err" id="loginerr"></div>
+  </div>
+
+  <div id="dash">
+    <div class="bar">
+      <div><h1>sebbi<span>.pro</span> admin</h1><div class="sub">Everything Stripe doesn't show you</div></div>
+      <button class="small" onclick="logout()">Log out</button>
+    </div>
+
+    <a class="ext" href="https://dashboard.stripe.com" target="_blank" rel="noopener">Open Stripe dashboard for payments, revenue &amp; billing addresses &rarr;</a>
+
+    <div class="stats" id="statgrid"></div>
+
+    <div class="tabs">
+      <div class="tab on" onclick="show('customers',this)">Customers &amp; leads</div>
+      <div class="tab" onclick="show('contacts',this)">Contact messages</div>
+      <div class="tab" onclick="show('referrals',this)">Referrals</div>
+    </div>
+
+    <div class="panel on" id="p-customers"><div class="empty">Loading...</div></div>
+    <div class="panel" id="p-contacts"><div class="empty">Loading...</div></div>
+    <div class="panel" id="p-referrals"><div class="empty">Loading...</div></div>
+  </div>
+
+</div>
+<script>
+var TOKEN="";
+function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]})}
+function when(ts){if(!ts)return"";try{return new Date(ts*1000).toLocaleString()}catch(e){return""}}
+
+async function doLogin(){
+  var pw=document.getElementById("pw").value;
+  document.getElementById("loginerr").textContent="";
+  try{
+    var r=await fetch("/admin/auth",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password:pw})});
+    var d=await r.json();
+    if(d.token){TOKEN=d.token;document.getElementById("login").style.display="none";document.getElementById("dash").style.display="block";loadAll();}
+    else if(d.error==="admin_disabled"){document.getElementById("loginerr").textContent="Admin password not set. Add ADMIN_PASSWORD in Railway variables.";}
+    else if(d.error==="too_many_attempts"){document.getElementById("loginerr").textContent="Too many attempts. Wait a minute.";}
+    else{document.getElementById("loginerr").textContent="Wrong password.";}
+  }catch(e){document.getElementById("loginerr").textContent="Connection error.";}
+}
+function logout(){TOKEN="";document.getElementById("dash").style.display="none";document.getElementById("login").style.display="block";document.getElementById("pw").value="";}
+
+async function api(path){
+  var r=await fetch(path,{method:"POST",headers:{"Authorization":"Bearer "+TOKEN,"Content-Type":"application/json"},body:"{}"});
+  return await r.json();
+}
+
+async function loadAll(){
+  // stats
+  try{
+    var s=await api("/admin/stats");
+    document.getElementById("statgrid").innerHTML=
+      stat(s.total_keys,"Total signups")+
+      stat(s.paid_keys,"Paying",  "good")+
+      stat((s.total_keys||0)-(s.paid_keys||0),"Free / leads")+
+      stat(s.audit_blocks,"Audit blocks")+
+      stat(s.chain_valid?"OK":"BROKEN","Chain",s.chain_valid?"good":"bad");
+  }catch(e){}
+  loadCustomers();loadContacts();loadReferrals();
+}
+function stat(v,l,cls){return '<div class="stat '+(cls||"")+'"><div class="big">'+esc(v)+'</div><div class="lab">'+esc(l)+'</div></div>';}
+
+async function loadCustomers(){
+  try{
+    var d=await api("/admin/keys");var ks=d.keys||[];
+    if(!ks.length){document.getElementById("p-customers").innerHTML='<div class="empty">No signups yet.</div>';return;}
+    var h="";
+    ks.forEach(function(k){
+      var paid=k.is_paid==1;
+      h+='<div class="card"><div class="top"><span class="nm">'+esc(k.name||"(no name)")+' <span class="meta">'+esc(k.org||"")+'</span></span>'
+        +'<span class="badge '+(paid?"paid":"free")+'">'+(paid?"paying":"free")+'</span></div>'
+        +'<div class="meta">'+esc(k.email||"")+' &middot; '+esc(k.product||"")+' &middot; '+esc(k.devices||0)+' devices &middot; used '+esc(k.actions_used||0)+'/'+esc(k.free_quota||0)+'</div>'
+        +'<div class="meta">Joined '+when(k.created)+'</div>'
+        +(k.key?'<div class="mono">'+esc(k.key)+'</div>':'')
+        +'</div>';
+    });
+    document.getElementById("p-customers").innerHTML=h;
+  }catch(e){document.getElementById("p-customers").innerHTML='<div class="empty">Could not load.</div>';}
+}
+
+async function loadContacts(){
+  try{
+    var d=await api("/admin/contacts");var cs=d.contacts||[];
+    if(!cs.length){document.getElementById("p-contacts").innerHTML='<div class="empty">No messages yet.</div>';return;}
+    var h="";
+    cs.forEach(function(c){
+      h+='<div class="card"><div class="top"><span class="nm">'+esc(c.name||"(no name)")+'</span><span class="meta">'+when(c.ts)+'</span></div>'
+        +'<div class="meta">'+esc(c.email||"")+(c.phone?' &middot; '+esc(c.phone):'')+(c.org?' &middot; '+esc(c.org):'')+'</div>'
+        +'<div style="margin-top:6px">'+esc(c.message||"")+'</div></div>';
+    });
+    document.getElementById("p-contacts").innerHTML=h;
+  }catch(e){document.getElementById("p-contacts").innerHTML='<div class="empty">Could not load.</div>';}
+}
+
+async function loadReferrals(){
+  try{
+    var d=await api("/admin/referrals");var rs=d.referrals||[];
+    if(!rs.length){document.getElementById("p-referrals").innerHTML='<div class="empty">No referrals yet.</div>';return;}
+    var h="";
+    rs.forEach(function(r){
+      h+='<div class="card"><div class="top"><span class="nm">'+esc(r.referrer_name||"(no name)")+' <span class="meta">'+esc(r.code||"")+'</span></span>'
+        +'<span class="badge paid">&pound;'+((r.earnings_pence||0)/100).toFixed(2)+'</span></div>'
+        +'<div class="meta">'+esc(r.referrer_email||"")+' &middot; '+esc(r.devices_referred||0)+' devices referred</div></div>';
+    });
+    document.getElementById("p-referrals").innerHTML=h;
+  }catch(e){document.getElementById("p-referrals").innerHTML='<div class="empty">Could not load.</div>';}
+}
+
+function show(name,el){
+  document.querySelectorAll(".tab").forEach(function(t){t.className="tab";});el.className="tab on";
+  document.querySelectorAll(".panel").forEach(function(p){p.className="panel";});
+  document.getElementById("p-"+name).className="panel on";
+}
+</script>
+</body>
+</html>
