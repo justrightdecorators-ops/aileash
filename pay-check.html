@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Payment Notary — verify before you pay — sebbi.pro</title>
+<style>
+  :root{--ink:#0a0f1e;--ink2:#10182e;--input:#131e36;--gold:#c9a84c;--ok:#7fe3b0;--err:#ff8a80;--muted:#94a3b8;}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--ink);color:#f8fafc;font-family:system-ui,sans-serif;min-height:100vh;padding:26px 16px}
+  .container{max-width:1100px;margin:0 auto;display:grid;grid-template-columns:1fr 1fr;gap:28px}
+  @media(max-width:850px){.container{grid-template-columns:1fr}}
+  header{grid-column:1/-1;border-bottom:1px solid rgba(201,168,76,0.2);padding-bottom:16px}
+  .brand{font-family:monospace;font-size:10px;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,0.35)}
+  h1{font-family:Georgia,serif;font-size:28px;color:var(--gold);margin:8px 0 6px}
+  .tagline{color:var(--muted);font-size:13.5px;line-height:1.6;max-width:660px}
+  .panel{background:var(--ink2);border:1px solid rgba(201,168,76,0.25);border-radius:12px;padding:24px;display:flex;flex-direction:column;gap:14px}
+  h2{font-size:12px;font-family:monospace;text-transform:uppercase;letter-spacing:2px;color:var(--gold);border-bottom:1px dashed rgba(201,168,76,0.2);padding-bottom:8px}
+  label{display:block;font-size:10px;font-family:monospace;text-transform:uppercase;letter-spacing:2px;color:var(--muted);margin-bottom:5px}
+  input{width:100%;background:var(--input);border:1px solid rgba(201,168,76,0.3);color:#fff;border-radius:8px;padding:12px;font-size:15px;outline:none;font-family:inherit}
+  input:focus{border-color:var(--gold);box-shadow:0 0 8px rgba(201,168,76,0.2)}
+  button{width:100%;background:var(--gold);color:var(--ink);border:none;border-radius:8px;padding:15px;font-size:14px;font-weight:800;cursor:pointer;text-transform:uppercase;letter-spacing:1px}
+  button:disabled{opacity:0.5}
+  #sealres{display:none;margin-top:6px;padding:14px;border-radius:8px;background:rgba(127,227,176,0.08);border:1px solid rgba(127,227,176,0.4);font-family:monospace;font-size:11.5px;line-height:1.9;word-break:break-all}
+  #sealres b{color:var(--ok)}
+  #sealres .code{font-size:17px;color:var(--gold);font-weight:700}
+  #checkres{display:none;margin-top:6px;padding:18px;border-radius:10px;font-size:13.5px;line-height:1.8}
+  #checkres.good{display:block;background:rgba(127,227,176,0.08);border:2px solid var(--ok)}
+  #checkres.bad{display:block;background:rgba(255,138,128,0.1);border:3px solid var(--err)}
+  #checkres .big{font-weight:900;font-size:17px;margin-bottom:6px}
+  #checkres.good .big{color:var(--ok)}
+  #checkres.bad .big{color:var(--err)}
+  #checkres .mono{font-family:monospace;font-size:11px;color:var(--muted);word-break:break-all;line-height:1.9}
+  .note{font-size:11px;color:rgba(255,255,255,0.35);line-height:1.7}
+  .warnbox{background:rgba(255,138,128,0.06);border:1px solid rgba(255,138,128,0.3);border-radius:8px;padding:12px;font-size:12px;color:#f1b9b3;line-height:1.7}
+  a{color:var(--gold)}
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <div class="brand">sebbi.pro &middot; payment notary</div>
+    <h1>Never pay a switched invoice again.</h1>
+    <div class="tagline">Invoice fraud costs the UK &pound;450m a year: criminals intercept a real invoice and switch the bank details. Since October 2024, UK banks must reimburse victims up to &pound;85,000 &mdash; <b>unless the payer failed to take reasonable care.</b> The Payment Notary is how both sides prove care: the business seals its true details once, every invoice carries a short code, and every check you run is itself sealed into the chain &mdash; a timestamped <b style="color:var(--gold)">Verification Receipt</b> proving you checked before you paid. If the details don't match the sealed original &mdash; <b style="color:var(--err)">you don't pay, and your receipt proves you caught it.</b></div>
+  </header>
+
+  <!-- LEFT: business seals details -->
+  <div class="panel">
+    <h2>For businesses &middot; seal your payment details</h2>
+    <div><label>Business name</label><input id="biz" placeholder="JustRight Decorators Ltd"></div>
+    <div><label>Sort code</label><input id="sort" inputmode="numeric" placeholder="12-34-56"></div>
+    <div><label>Account number</label><input id="acct" inputmode="numeric" placeholder="12345678"></div>
+    <button id="go" onclick="sealPay()">Seal these details &mdash; free &rarr;</button>
+    <div id="sealres"></div>
+    <div class="note">Fingerprinted with SHA-256 in your own browser. Your full sort code and account number are <b style="color:var(--gold)">never sent to us and never stored</b> &mdash; only the fingerprint plus a masked display (last digits) so customers can eyeball a match. Print the code on every invoice, email footer and quote.</div>
+  </div>
+
+  <!-- RIGHT: customer checks before paying -->
+  <div class="panel">
+    <h2>Before you pay &middot; check the invoice</h2>
+    <div><label>Verification code from the invoice</label><input id="q" placeholder="e.g. 7be4d1c29a03"></div>
+    <div><label>Sort code shown on the invoice</label><input id="csort" inputmode="numeric" placeholder="12-34-56"></div>
+    <div><label>Account number shown on the invoice</label><input id="cacct" inputmode="numeric" placeholder="12345678"></div>
+    <div><label>Business name on the invoice</label><input id="cbiz" placeholder="JustRight Decorators Ltd"></div>
+    <button onclick="checkPay()">Check before I pay &rarr;</button>
+    <div id="checkres"></div>
+    <div class="warnbox">If the check fails, <b>do not send the payment.</b> Phone the business on a number you already know &mdash; not one from the invoice &mdash; and confirm the details by voice. Report suspected fraud to Action Fraud on 0300 123 2040.</div>
+  </div>
+</div>
+
+<script>
+async function sha256hex(s){
+  var buf=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(s));
+  return Array.from(new Uint8Array(buf)).map(function(b){return b.toString(16).padStart(2,"0");}).join("");
+}
+function receiptHtml(rc){
+  if(!rc)return "";
+  var when=new Date(rc.checked_at*1000).toLocaleString("en-GB");
+  return "<div style='margin-top:14px;padding:12px;border:1px dashed rgba(201,168,76,0.5);border-radius:8px;background:rgba(201,168,76,0.06)'>"
+    +"<b style='color:var(--gold)'>\u26D3 YOUR VERIFICATION RECEIPT \u2014 keep this</b><br>"
+    +"<span class='mono'>Checked: "+when+" \u00b7 result: "+rc.result+"<br>Sealed in block #"+rc.block_index+"<br>Receipt seal: "+rc.seal+"<br>Verify any time: sebbi.pro/api/inclusion?hash="+rc.seal+"</span><br>"
+    +"<span style='font-size:11px;color:var(--muted);line-height:1.6'>This receipt is tamper-evident proof that you verified the payee\u2019s details before paying \u2014 the kind of evidence banks consider when assessing reimbursement claims under the 2024 mandatory reimbursement rules. Screenshot it or save the seal.</span></div>";
+}
+function normSort(s){return (s||"").replace(/[^0-9]/g,"");}
+function normAcct(s){return (s||"").replace(/[^0-9]/g,"");}
+function canonicalPay(biz,sort,acct){
+  return "payment:v1|"+biz.trim().toLowerCase()+"|"+normSort(sort)+"|"+normAcct(acct);
+}
+async function sealPay(){
+  var biz=document.getElementById("biz").value.trim();
+  var sort=document.getElementById("sort").value;
+  var acct=document.getElementById("acct").value;
+  var res=document.getElementById("sealres");
+  if(!biz||normSort(sort).length!==6||normAcct(acct).length<7){
+    res.style.display="block";res.innerHTML="<span style='color:var(--err)'>Business name, 6-digit sort code and account number required.</span>";return;
+  }
+  var btn=document.getElementById("go");btn.disabled=true;btn.textContent="Sealing\u2026";
+  try{
+    var fp=await sha256hex(canonicalPay(biz,sort,acct));
+    var ns=normSort(sort),na=normAcct(acct);
+    var display={business:biz,sort_masked:"**-**-"+ns.slice(4),account_masked:"****"+na.slice(-4)};
+    var r=await fetch("/api/payment/seal",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({fingerprint:fp,display:display})});
+    var d=await r.json();
+    if(!d.sealed){res.style.display="block";res.innerHTML="<span style='color:var(--err)'>"+(d.error||"Sealing failed")+"</span>";btn.disabled=false;btn.textContent="Seal these details \u2014 free \u2192";return;}
+    var when=new Date(d.sealed_at*1000).toLocaleString("en-GB");
+    res.style.display="block";
+    res.innerHTML=(d.already_registered?"<b>Already sealed.</b> These exact details were registered earlier.<br>":"<b>\u2713 SEALED.</b> Your true payment details are now locked in the chain.<br>")
+      +"Registered: "+when+" \u00b7 block #"+d.block_index+"<br><br>"
+      +"<b>Print this on every invoice:</b><br>"
+      +"\u26D3 Verify our bank details before paying:<br>sebbi.pro/pay-check \u00b7 code <span class='code'>"+d.code+"</span>";
+    btn.textContent="Sealed \u2713";
+  }catch(e){res.style.display="block";res.innerHTML="<span style='color:var(--err)'>Network error: "+e+"</span>";btn.disabled=false;btn.textContent="Seal these details \u2014 free \u2192";}
+}
+async function checkPay(){
+  var code=document.getElementById("q").value.trim().toLowerCase().replace(/[^0-9a-f]/g,"");
+  var biz=document.getElementById("cbiz").value.trim();
+  var sort=document.getElementById("csort").value;
+  var acct=document.getElementById("cacct").value;
+  var out=document.getElementById("checkres");
+  if(code.length<12){out.className="bad";out.innerHTML="<div class='big'>Enter the 12-character code from the invoice.</div>";return;}
+  if(!biz||normSort(sort).length!==6||normAcct(acct).length<7){
+    out.className="bad";out.innerHTML="<div class='big'>Enter the business name, sort code and account number exactly as shown on the invoice.</div>";return;
+  }
+  out.className="";out.style.display="block";out.innerHTML="Checking the chain\u2026";
+  try{
+    var fp=await sha256hex(canonicalPay(biz,sort,acct));
+    var r=await fetch("/api/payment/check?code="+code+"&fp="+fp);
+    var d=await r.json();
+    if(!d.found){
+      out.className="bad";
+      out.innerHTML="<div class='big'>\u2717 NO SEAL FOUND \u2014 DO NOT PAY</div>No business has sealed payment details under this code. Either the code is mistyped \u2014 or the invoice is fraudulent. Phone the business on a number you already know before sending anything."
+        +receiptHtml(d.receipt);
+      return;
+    }
+    if(d.match){
+      var when=new Date(d.registered_at*1000).toLocaleString("en-GB");
+      var disp=d.display||{};
+      out.className="good";
+      out.innerHTML="<div class='big'>\u2713 DETAILS MATCH THE SEALED ORIGINAL</div>"
+        +"The details on this invoice are identical to the ones <b>"+(disp.business||"this business")+"</b> sealed on "+when+" (block #"+d.block_index+").<br>"
+        +"<span class='mono'>Sealed record: "+(disp.business||"")+" \u00b7 "+(disp.sort_masked||"")+" \u00b7 "+(disp.account_masked||"")+"</span><br>"
+        +"Safe to proceed \u2014 nothing has been switched."
+        +receiptHtml(d.receipt);
+    }else{
+      var disp2=d.display||{};
+      out.className="bad";
+      out.innerHTML="<div class='big'>\u26A0\uFE0F DETAILS DO NOT MATCH \u2014 DO NOT PAY</div>"
+        +"A seal exists under this code, but the details on your invoice are <b>different from the sealed original</b>. This is exactly what invoice fraud looks like \u2014 the bank details may have been switched.<br>"
+        +"<span class='mono'>Sealed original: "+(disp2.business||"")+" \u00b7 "+(disp2.sort_masked||"")+" \u00b7 "+(disp2.account_masked||"")+"</span><br>"
+        +"Phone the business on a number you already know. Report to Action Fraud: 0300 123 2040."
+        +receiptHtml(d.receipt);
+    }
+  }catch(e){out.className="bad";out.innerHTML="<div class='big'>Network error</div>"+e;}
+}
+</script>
+</body>
+</html>
