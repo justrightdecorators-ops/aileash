@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Verify a post — sebbi.pro</title>
+<style>
+  :root{--ink:#0a0f1e;--ink2:#10182e;--gold:#c9a84c;--ok:#1a9e6e;--err:#c8362b;}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--ink);color:#fff;font-family:system-ui,sans-serif;min-height:100vh;padding:24px}
+  .wrap{max-width:620px;margin:0 auto}
+  h1{font-family:Georgia,serif;font-size:26px;color:var(--gold);margin:14px 0 6px}
+  .sub{font-size:13.5px;color:rgba(255,255,255,0.5);line-height:1.7;margin-bottom:22px}
+  textarea{width:100%;min-height:200px;background:var(--ink2);border:1px solid rgba(201,168,76,0.35);color:#fff;border-radius:8px;padding:14px;font-size:14px;font-family:inherit;line-height:1.6;outline:none;resize:vertical}
+  textarea:focus{border-color:var(--gold)}
+  button{width:100%;margin-top:14px;background:var(--gold);color:var(--ink);border:none;border-radius:8px;padding:16px;font-size:16px;font-weight:800;cursor:pointer}
+  button:disabled{opacity:0.5}
+  #result{display:none;margin-top:20px;border-radius:10px;padding:26px;text-align:center}
+  #result.ok{display:block;background:rgba(26,158,110,0.12);border:2px solid var(--ok)}
+  #result.err{display:block;background:rgba(200,54,43,0.12);border:2px solid var(--err)}
+  #result .big{font-size:30px;font-weight:900;font-family:Georgia,serif;margin-bottom:8px}
+  #result.ok .big{color:#7fe3b0}
+  #result.err .big{color:#ff9d94}
+  #result .detail{font-family:monospace;font-size:12px;color:rgba(255,255,255,0.6);line-height:1.9;word-break:break-all}
+  .note{margin-top:22px;font-size:12px;color:rgba(255,255,255,0.35);line-height:1.8}
+  .note b{color:var(--gold);font-weight:600}
+  a{color:var(--gold)}
+  .brand{font-family:monospace;font-size:10px;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,0.35)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="brand">sebbi.pro &middot; live chain verification</div>
+  <h1>Is it really sealed?</h1>
+  <div class="sub">Paste the exact text of any hash-chained post below. This page fingerprints it (SHA-256, computed in your own browser) and checks the live audit chain for that fingerprint. Change even one letter and it will fail.</div>
+
+  <textarea id="txt" placeholder="Paste the post text here — exactly as published, without the footer lines..."></textarea>
+  <button id="go" onclick="verify()">Check the chain &rarr;</button>
+
+  <div id="result"></div>
+
+  <div class="note"><b>How this works:</b> your text never leaves your browser — only its fingerprint is checked. A match means these exact words were sealed into the chain at the recorded moment and cannot have been altered since. No match means these words were never sealed, or have been changed.<br><br>This is the same engine that seals AI decisions for platforms. <a href="/">Free for 90 days &rarr;</a></div>
+</div>
+
+<script>
+async function sha256hex(s){
+  var buf=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(s));
+  return Array.from(new Uint8Array(buf)).map(function(b){return b.toString(16).padStart(2,"0");}).join("");
+}
+async function lookup(h){
+  var r=await fetch("/api/verify-post?content="+h);
+  return await r.json();
+}
+async function verify(){
+  var raw=document.getElementById("txt").value;
+  var res=document.getElementById("result");
+  var btn=document.getElementById("go");
+  if(!raw.trim()){res.className="err";res.innerHTML="<div class='big'>Paste some text first</div>";return;}
+  btn.disabled=true;btn.textContent="Checking the chain\u2026";
+  try{
+    /* try exact text, then trimmed - copy/paste often adds stray whitespace */
+    var candidates=[raw,raw.trim(),raw.replace(/\r\n/g,"\n"),raw.replace(/\r\n/g,"\n").trim()];
+    var seen={},hit=null,lastHash="";
+    for(var i=0;i<candidates.length;i++){
+      var h=await sha256hex(candidates[i]);
+      if(seen[h])continue;seen[h]=1;lastHash=h;
+      var d=await lookup(h);
+      if(d.verified){hit=d;break;}
+    }
+    if(hit){
+      var when=new Date(hit.sealed_at*1000);
+      res.className="ok";
+      res.innerHTML="<div class='big'>\u2713 SEALED &amp; UNCHANGED</div>"
+        +"<div class='detail'>These exact words are in the chain.<br>Block #"+hit.block_index
+        +"<br>Sealed "+when.toLocaleString("en-GB")
+        +"<br>Seal "+hit.seal.slice(0,32)+"\u2026</div>";
+    }else{
+      res.className="err";
+      res.innerHTML="<div class='big'>\u2717 NOT IN THE CHAIN</div>"
+        +"<div class='detail'>No seal exists for these exact words.<br>Either the text has been altered \u2014 even one character breaks it \u2014 or it was never sealed.<br>Fingerprint checked: "+lastHash.slice(0,32)+"\u2026</div>";
+    }
+  }catch(e){
+    res.className="err";
+    res.innerHTML="<div class='big'>Network error</div><div class='detail'>"+e+"</div>";
+  }
+  btn.disabled=false;btn.textContent="Check the chain \u2192";
+}
+</script>
+</body>
+</html>
