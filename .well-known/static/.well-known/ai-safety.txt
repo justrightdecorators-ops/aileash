@@ -1,0 +1,7 @@
+# ai-safety.txt for sebbi.pro
+AI-Safe: true
+Injection-Protected: true
+Consistent-Rendering: true
+Contact: mailto:justrightdecorators@gmail.com
+Attestation: https://sebbi.pro/notary
+Last-Verified: 2026-07-15
