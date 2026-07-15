@@ -1085,6 +1085,15 @@ class Handler(BaseHTTPRequestHandler):
         elif path=="/.well-known/ai-manifest.json":
             c=load_file("static/.well-known/ai-manifest.json")
             send_text(self,c,"application/json") if c else send_json(self,{"error":"not found"},404)
+        elif path=="/.well-known/ai-safety.txt":
+            c=load_file("static/.well-known/ai-safety.txt")
+            send_text(self,c,"text/plain") if c else send_json(self,{"error":"not found"},404)
+        elif path=="/.well-known/security.txt":
+            c=load_file("static/.well-known/security.txt")
+            send_text(self,c,"text/plain") if c else send_json(self,{"error":"not found"},404)
+        elif path=="/.well-known/comply.txt":
+            c=load_file("static/.well-known/comply.txt")
+            send_text(self,c,"text/plain") if c else send_json(self,{"error":"not found"},404)
         elif path=="/spec/ai-txt":
             c=load_file("docs/spec/ai-txt.md")
             send_text(self,c,"text/markdown") if c else send_json(self,{"error":"not found"},404)
