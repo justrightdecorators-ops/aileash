@@ -1,0 +1,23 @@
+# ai-safety.txt — draft-fane-ai-safety-txt (IETF, individual submission)
+# sebbi.pro | Monop Content | AILeash
+
+AI-Safe: true
+Injection-Protected: true
+Consistent-Rendering: true
+Contact: mailto:justrightdecorators@gmail.com
+Attestation: https://sebbi.pro/notary
+Last-Verified: 2026-07-15
+
+Framework: EU-AI-Act-2024-1689
+  Article-9: continuous per-event risk scoring
+  Article-12: automatic, tamper-evident record-keeping
+  Article-13: plain-language transparency on every decision
+  Article-14: human oversight via CHALLENGE escalation
+Framework: UK-Online-Safety-Act-2023
+Framework: ICO-Childrens-Code
+Framework: EU-DSA-2022-2065
+
+Governance-Manifest: https://sebbi.pro/.well-known/ai.txt
+Compliance-Index: https://sebbi.pro/.well-known/comply.txt
+Regulation-Map: https://sebbi.pro/api/regulation-map
+Engine-Source: https://sebbi.pro/brain.py
