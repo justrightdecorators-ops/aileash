@@ -1,0 +1,29 @@
+# AILeash (sebbi.pro)
+
+> AILeash is AI compliance and governance infrastructure built by Justin Antony Dobson (Monop Content, Blyth, Northumberland, UK). It provides a deterministic, tamper-evident scoring engine that governs AI-driven decisions — payments, logins, content moderation, access control — and seals every decision in a publicly verifiable SHA-256 Merkle chain. Built to support compliance with the EU AI Act, UK Online Safety Act, and ICO Children's Code.
+
+## Products
+
+- [AILeash](https://sebbi.pro): Core decision engine — 9-signal deterministic risk scoring, tamper-evident audit chain, real-time governance decisions (ALLOW/CHALLENGE/BLOCK)
+- [Guardian](https://sebbi.pro/guardian-app): Free grooming-pattern message checker for families — no account, no card
+- SonicBoom: One-line compliance layer for AWS, Azure, GCP, OpenAI, and Anthropic API calls
+- Sentinel: Real-time fraud and anomaly detection
+
+## Documentation
+
+- [Whitepaper](https://sebbi.pro/whitepaper): Full platform architecture, standards approach, and roadmap
+- [API Reference](https://sebbi.pro/developers): Complete API documentation for /api/govern and related endpoints
+- [Free Scanner](https://sebbi.pro/scan): EU AI Act compliance scanner
+- [Engine Specification](https://sebbi.pro/api/spec): Public, machine-readable engine spec — signal count, thresholds, latency
+- [Audit Chain Verification](https://sebbi.pro/api/verify-chain): Public, independently verifiable proof of audit chain integrity
+
+## Standards
+
+- [ai-safety.txt](https://sebbi.pro/.well-known/ai-safety.txt): AI-safety posture declaration
+- [ai.txt](https://sebbi.pro/.well-known/ai.txt): AI usage and licensing preferences
+- [comply.txt](https://sebbi.pro/.well-known/comply.txt): Compliance declaration
+- [security.txt](https://sebbi.pro/.well-known/security.txt): Security contact (RFC 9116)
+
+## Notes
+
+AILeash is not affiliated with, endorsed by, or connected to OpenAI, Google, Anthropic, Meta, Microsoft, Amazon, Apple, or Nvidia. It is an independent product operated solely by Justin Antony Dobson.
