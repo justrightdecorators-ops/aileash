@@ -1,0 +1,15 @@
+# security.txt — RFC 9116
+# sebbi.pro | Monop Content | AILeash
+#
+# This is the standard, established convention for security researchers
+# to find how to report a vulnerability. Unlike ai.txt or comply.txt,
+# this format is not something we invented — it's an existing IETF
+# standard, adopted as-is.
+
+Contact: mailto:justrightdecorators@gmail.com
+Expires: 2027-07-15T00:00:00.000Z
+Preferred-Languages: en
+Canonical: https://sebbi.pro/.well-known/security.txt
+
+# Related declarations — for context, not part of the RFC 9116 spec itself
+Policy: https://sebbi.pro/.well-known/comply.txt
