@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Verify &amp; seal — sebbi.pro</title>
+<style>
+  :root{--ink:#0a0f1e;--ink2:#10182e;--gold:#c9a84c;--ok:#7fe3b0;--err:#ff8a80;--muted:#94a3b8;}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--ink);color:#fff;font-family:system-ui,sans-serif;min-height:100vh;padding:24px 18px;line-height:1.6}
+  .wrap{max-width:640px;margin:0 auto}
+  .brand{font-family:monospace;font-size:10px;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,0.35)}
+  h1{font-family:Georgia,serif;font-size:27px;color:var(--gold);margin:12px 0 6px}
+  h2{font-family:Georgia,serif;font-size:20px;color:#fff;margin:36px 0 10px;border-top:1px solid rgba(201,168,76,0.18);padding-top:26px}
+  .sub{font-size:13.5px;color:rgba(255,255,255,0.5);line-height:1.7;margin-bottom:20px}
+  textarea{width:100%;min-height:150px;background:var(--ink2);border:1px solid rgba(201,168,76,0.35);color:#fff;border-radius:8px;padding:14px;font-size:14px;font-family:inherit;line-height:1.6;outline:none;resize:vertical}
+  textarea:focus{border-color:var(--gold)}
+  button{width:100%;margin-top:12px;background:var(--gold);color:var(--ink);border:none;border-radius:8px;padding:15px;font-size:15px;font-weight:800;cursor:pointer}
+  button:disabled{opacity:0.5}
+  #result{display:none;margin-top:18px;border-radius:10px;padding:22px;text-align:left}
+  #result.ok{display:block;background:rgba(127,227,176,0.08);border:2px solid var(--ok)}
+  #result.err{display:block;background:rgba(255,138,128,0.08);border:2px solid var(--err)}
+  #result .big{font-size:20px;font-weight:900;font-family:Georgia,serif;margin-bottom:8px;text-align:center}
+  #result.ok .big{color:var(--ok)}
+  #result.err .big{color:var(--err)}
+  #result .detail{font-family:monospace;font-size:12px;color:rgba(255,255,255,0.72);line-height:1.9;word-break:break-all}
+  p.body{font-size:14px;color:rgba(255,255,255,0.72);margin-bottom:12px}
+  p.body b{color:#fff}
+  .step{display:flex;gap:12px;margin:12px 0;font-size:14px;color:rgba(255,255,255,0.75)}
+  .step .n{flex:none;width:26px;height:26px;border-radius:50%;background:rgba(201,168,76,0.15);border:1px solid var(--gold);color:var(--gold);font-family:monospace;font-size:12px;font-weight:700;display:flex;align-items:center;justify-content:center}
+  .tools{display:flex;flex-direction:column;gap:10px;margin:18px 0}
+  .tool{display:block;text-decoration:none;background:var(--ink2);border:1px solid rgba(201,168,76,0.3);border-radius:9px;padding:15px 16px;transition:border-color .15s}
+  .tool:hover,.tool:focus{border-color:var(--gold)}
+  .tool .t{font-size:15px;font-weight:700;color:var(--gold)}
+  .tool .d{font-size:12.5px;color:rgba(255,255,255,0.5);margin-top:2px}
+  .note{margin-top:14px;font-size:12px;color:rgba(255,255,255,0.35);line-height:1.7}
+  .note b{color:var(--gold);font-weight:600}
+  a.inline{color:var(--gold)}
+  footer{margin-top:40px;border-top:1px solid rgba(201,168,76,0.18);padding-top:18px;font-size:12px;color:rgba(255,255,255,0.4);text-align:center}
+  footer a{color:var(--gold);text-decoration:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="brand">sebbi.pro &middot; live chain verification</div>
+  <h1>Verify a sealed post</h1>
+  <div class="sub">Paste the exact text of any hash-chained post below. This page fingerprints it (SHA-256, in your own browser) and checks the live chain. Change even one letter and it will fail.</div>
+
+  <textarea id="txt" placeholder="Paste the post text here — exactly as published, without the footer line..."></textarea>
+  <button id="go" onclick="verify()">Check the chain &rarr;</button>
+  <div id="result"></div>
+
+  <h2>What is this?</h2>
+  <p class="body">Sealing takes any text — a post, a letter, a contract, your profile — and locks a fingerprint of it into a permanent, tamper-evident chain with an exact timestamp. From that moment, anyone can prove the words haven't been changed since. No account, no trust required: it's maths you can check yourself.</p>
+  <p class="body">The point isn't secrecy. The text can be completely public. The point is that <b>nobody can quietly change it after the fact, and nobody has to take your word that they didn't.</b></p>
+
+  <h2>How to seal something</h2>
+  <div class="step"><div class="n">1</div><div>Pick the right tool below for what you're sealing.</div></div>
+  <div class="step"><div class="n">2</div><div>Paste your text (or fill in your details) and hit seal. It fingerprints everything in your own browser.</div></div>
+  <div class="step"><div class="n">3</div><div>You get a verification code and a timestamp. Share the code, or keep it — your choice.</div></div>
+  <div class="step"><div class="n">4</div><div>Anyone can then check it against the chain, right here or on the matching page.</div></div>
+
+  <h2>The tools</h2>
+  <div class="tools">
+    <a class="tool" href="/seal">
+      <div class="t">Seal a post &rarr;</div>
+      <div class="d">Lock the exact words of a post or announcement before you publish. sebbi.pro/seal</div>
+    </a>
+    <a class="tool" href="/identity">
+      <div class="t">Seal your profile &rarr;</div>
+      <div class="d">Register your name, bio and links so nobody can clone your identity. Put the code in your bio. sebbi.pro/identity</div>
+    </a>
+    <a class="tool" href="/pay-check">
+      <div class="t">Seal &amp; check payment details &rarr;</div>
+      <div class="d">Businesses seal their real bank details; customers check an invoice before paying. sebbi.pro/pay-check</div>
+    </a>
+  </div>
+
+  <h2>Public or private — your choice</h2>
+  <p class="body"><b>Public seal:</b> the details are stored and anyone can see them when they check. Right for things you want verifiable — your identity, a published notice, a price list.</p>
+  <p class="body"><b>Private seal:</b> only the fingerprint is sealed. The content never leaves your device and is never stored. The chain just proves that a document with that exact fingerprint existed at that moment. You keep the original, and reveal it only if you ever need it as evidence — a contract, a sensitive letter. On the profile page, this is the "publish to public registry" tick box: untick it to seal privately.</p>
+
+  <div class="note"><b>What a seal proves:</b> that this exact text existed in this form at this time and hasn't changed since. It does <b>not</b> prove the contents are true, that anyone agreed to them, or that a letter was delivered. It's tamper-evidence and proof of who was first — strong, honest, and yours to hold.</div>
+
+  <footer>
+    <a href="/">Home</a> &nbsp;&middot;&nbsp; <a href="/seal">Seal a post</a> &nbsp;&middot;&nbsp; <a href="/identity">Seal your profile</a> &nbsp;&middot;&nbsp; <a href="/pay-check">Payment check</a>
+    <div style="margin-top:12px;color:rgba(255,255,255,0.3)">sebbi.pro &middot; the same engine that seals AI decisions for platforms</div>
+  </footer>
+</div>
+
+<script>
+async function sha256hex(s){
+  var buf=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(s));
+  return Array.from(new Uint8Array(buf)).map(function(b){return b.toString(16).padStart(2,"0");}).join("");
+}
+async function lookup(h){
+  var r=await fetch("/api/verify-post?content="+h);
+  return await r.json();
+}
+async function verify(){
+  var raw=document.getElementById("txt").value;
+  var res=document.getElementById("result");
+  var btn=document.getElementById("go");
+  if(!raw.trim()){res.className="err";res.innerHTML="<div class='big'>Paste some text first</div>";return;}
+  btn.disabled=true;btn.textContent="Checking the chain\u2026";
+  try{
+    var candidates=[raw,raw.trim(),raw.replace(/\r\n/g,"\n"),raw.replace(/\r\n/g,"\n").trim()];
+    var seen={},hit=null,lastHash="";
+    for(var i=0;i<candidates.length;i++){
+      var h=await sha256hex(candidates[i]);
+      if(seen[h])continue;seen[h]=1;lastHash=h;
+      var d=await lookup(h);
+      if(d.verified){hit=d;break;}
+    }
+    if(hit){
+      var when=new Date(hit.sealed_at*1000);
+      res.className="ok";
+      res.innerHTML="<div class='big'>\u2713 SEALED &amp; UNCHANGED</div>"
+        +"<div class='detail'>These exact words are in the chain.<br>Block #"+hit.block_index
+        +"<br>Sealed "+when.toLocaleString("en-GB")
+        +"<br>Seal "+hit.seal.slice(0,32)+"\u2026</div>";
+    }else{
+      res.className="err";
+      res.innerHTML="<div class='big'>\u2717 NOT IN THE CHAIN</div>"
+        +"<div class='detail'>No seal exists for these exact words. Either the text was changed \u2014 even one character breaks it \u2014 or it was never sealed.<br><br>Want to seal it? <a class='inline' href='/seal'>sebbi.pro/seal &rarr;</a><br>Fingerprint checked: "+lastHash.slice(0,32)+"\u2026</div>";
+    }
+  }catch(e){
+    res.className="err";
+    res.innerHTML="<div class='big'>Network error</div><div class='detail'>"+e+"</div>";
+  }
+  btn.disabled=false;btn.textContent="Check the chain \u2192";
+}
+</script>
+</body>
+</html>
