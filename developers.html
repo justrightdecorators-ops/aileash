@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Developers — AILeash API</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Inter:wght@400;500;600;700&display=swap');
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#0a0f1e;--surface:#111a30;--border:#1e2a45;--gold:#c9a84c;--green:#7fe3b0;--amber:#ffb020;--red:#ff6b5e;--text:#e8e8f0;--muted:#7d849a}
+body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;font-size:15px;line-height:1.6}
+nav{position:sticky;top:0;z-index:50;background:rgba(10,15,30,0.94);backdrop-filter:blur(10px);border-bottom:1px solid var(--border);padding:0 24px;height:54px;display:flex;align-items:center;justify-content:space-between}
+.nav-logo{font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--gold);text-decoration:none;display:flex;align-items:center;gap:8px}
+nav .links{display:flex;gap:18px}
+nav .links a{color:var(--muted);text-decoration:none;font-size:13px}nav .links a:hover{color:#fff}
+.wrap{max-width:840px;margin:0 auto;padding:44px 24px 90px}
+h1{font-size:34px;font-weight:700;margin-bottom:10px;letter-spacing:-0.02em}
+.sub{color:var(--muted);font-size:15px;margin-bottom:34px;line-height:1.7}
+.sub b{color:var(--text)}
+h2{font-size:20px;font-weight:600;margin:44px 0 12px;padding-top:18px;border-top:1px solid var(--border)}
+h3{font-size:14px;color:var(--gold);margin:20px 0 8px;font-family:'JetBrains Mono',monospace;letter-spacing:0.05em}
+p{color:var(--muted);margin-bottom:12px}
+p b,li b{color:var(--text)}
+li{color:var(--muted);margin-left:20px;margin-bottom:6px}
+code{font-family:'JetBrains Mono',monospace;font-size:12.5px;color:var(--green);background:#0b1226;padding:2px 6px;border-radius:4px}
+pre{background:#0b1226;border:1px solid var(--border);border-radius:8px;padding:16px 18px;margin:12px 0;font-family:'JetBrains Mono',monospace;font-size:12px;line-height:1.75;color:var(--muted);overflow-x:auto}
+pre b{color:var(--green);font-weight:400}pre i{color:var(--gold);font-style:normal}pre em{color:#8fbcff;font-style:normal}
+.badge{display:inline-block;font-family:'JetBrains Mono',monospace;font-size:10px;padding:2px 8px;border-radius:3px;margin-right:8px;vertical-align:middle}
+.b-post{background:rgba(127,227,176,0.12);color:var(--green);border:1px solid rgba(127,227,176,0.3)}
+.b-get{background:rgba(201,168,76,0.12);color:var(--gold);border:1px solid rgba(201,168,76,0.3)}
+.b-auth{background:rgba(255,176,32,0.1);color:var(--amber);border:1px solid rgba(255,176,32,0.3)}
+.b-open{background:rgba(125,132,166,0.12);color:var(--muted);border:1px solid var(--border)}
+table{width:100%;border-collapse:collapse;font-size:13px;margin:12px 0}
+th{padding:9px 12px;text-align:left;font-size:10.5px;text-transform:uppercase;letter-spacing:0.08em;color:var(--muted);border-bottom:2px solid var(--border)}
+td{padding:10px 12px;border-bottom:1px solid var(--border);vertical-align:top}
+td:first-child{font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text);white-space:nowrap}
+.note{border:1px solid rgba(201,168,76,0.35);background:rgba(201,168,76,0.05);border-radius:8px;padding:14px 18px;margin:14px 0;font-size:13.5px;color:var(--muted)}
+.note b{color:var(--gold)}
+.privacy{border:1px solid rgba(127,227,176,0.3);background:rgba(127,227,176,0.05);border-radius:8px;padding:14px 18px;margin:14px 0;font-size:13.5px;color:var(--muted)}
+.privacy b{color:var(--green)}
+.toc{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:18px 22px;margin-bottom:8px;font-size:13.5px}
+.toc a{color:var(--muted);text-decoration:none;margin-right:18px;line-height:2}
+.toc a:hover{color:var(--gold)}
+footer{border-top:1px solid var(--border);padding:26px 24px;text-align:center;color:var(--muted);font-size:12.5px}
+footer a{color:var(--gold);text-decoration:none}
+</style>
+</head>
+<body>
+<nav>
+  <a href="/" class="nav-logo"><svg width="18" height="18" viewBox="0 0 32 32"><circle cx="16" cy="16" r="13.5" fill="none" stroke="#c9a84c" stroke-width="2.6" stroke-dasharray="66 20" stroke-linecap="round" transform="rotate(-50 16 16)"/><circle cx="26.5" cy="7" r="3.1" fill="#c9a84c"/></svg>AILeash / developers</a>
+  <div class="links"><a href="/whitepaper">Whitepaper</a><a href="/brain">Brain</a><a href="/#signup">Get API key</a></div>
+</nav>
+<div class="wrap">
+  <h1>One chain. Every proof.</h1>
+  <p class="sub">Two families of endpoints, one tamper-evident SHA-256 chain underneath. <b>Govern</b> scores and seals AI decisions (needs a key). <b>Notary</b> seals a fingerprint of anything — a post, an identity, payment details — with no key and no content ever leaving your system. Base URL: <code>https://sebbi.pro</code></p>
+
+  <div class="toc">
+    <a href="#quickstart">Quickstart</a><a href="#notary">Notary API</a><a href="#link">Link your stack</a><a href="#govern">/api/govern</a><a href="#receipts">Receipts</a><a href="#challenge">Challenges</a><a href="#verify">Verification</a><a href="#monitor">Monitoring</a><a href="#sovereign">Sovereign</a><a href="#errors">Errors</a>
+  </div>
+
+  <h2 id="quickstart">Quickstart — seal something in one call</h2>
+  <p>No account needed for the Notary. Fingerprint your content locally, send the hash, get a sealed receipt back:</p>
+  <pre><b>curl</b> -X POST https://sebbi.pro/api/post/seal \
+  -H "Content-Type: application/json" \
+  -d '{"fingerprint":"<i>&lt;64-char sha-256 of your content&gt;</i>"}'</pre>
+  <pre>{
+  <em>"sealed"</em>:      true,
+  <em>"seal"</em>:        <b>"43ac8582…"</b>,   <span style="color:#5a6178">// the chain block hash</span>
+  <em>"block_index"</em>: 1042,
+  <em>"sealed_at"</em>:   1789420000.12,
+  <em>"code"</em>:        <b>"43ac85820f19"</b>   <span style="color:#5a6178">// 12-char public verify code</span>
+}</pre>
+  <div class="privacy"><b>Your content never leaves your machine.</b> You hash it locally; only the 64-character fingerprint is sent. The chain proves a document with that exact fingerprint existed at that moment — it never sees the document itself.</div>
+
+  <h2 id="notary">Notary API — seal a fingerprint of anything <span class="badge b-open">no key</span></h2>
+  <p>Three notaries, one pattern: <b>POST a fingerprint to seal, GET to verify.</b> All public, all free. The seal is permanent and tamper-evident; re-sealing the same fingerprint returns the original receipt with <code>already_registered: true</code>.</p>
+
+  <h3>Post notary — prove exact text existed</h3>
+  <p><span class="badge b-post">POST</span> <code>/api/post/seal</code> — body <code>{"fingerprint":"&lt;sha256&gt;"}</code>. Seals the fingerprint of a post, article, or document.</p>
+  <p><span class="badge b-get">GET</span> <code>/api/verify-post?content=&lt;sha256&gt;</code> — returns <code>{"verified":true,"block_index":…,"sealed_at":…,"seal":…}</code> if that exact fingerprint is sealed, else <code>{"verified":false}</code>.</p>
+
+  <h3>Identity notary — prove a profile is the original</h3>
+  <p><span class="badge b-post">POST</span> <code>/api/identity/seal</code> — body <code>{"fingerprint":"&lt;sha256&gt;", "public":true, "profile":{…}}</code>. If <code>public</code> is set, a limited set of display fields (name, title, bio, linkedin, facebook, org) is stored so a checker can show them; otherwise only the fingerprint is sealed. Returns <code>{sealed, seal, block_index, sealed_at, code}</code>.</p>
+  <p><span class="badge b-get">GET</span> <code>/api/identity/check?code=&lt;12+ chars&gt;</code> — accepts the short code or full fingerprint. Returns <code>{found, fingerprint, registered_at, seal, block_index}</code>, plus <code>profile</code> if it was sealed public.</p>
+
+  <h3>Payment notary — stop invoice fraud</h3>
+  <p><span class="badge b-post">POST</span> <code>/api/payment/seal</code> — body <code>{"fingerprint":"&lt;sha256 of the real bank details&gt;", "display":{"business":…, "sort_masked":…, "account_masked":…}}</code>. Only masked display fields are stored; the true details never are. Returns <code>{sealed, seal, block_index, sealed_at, code}</code>.</p>
+  <p><span class="badge b-get">GET</span> <code>/api/payment/check?code=&lt;12+ chars&gt;&amp;fp=&lt;optional full sha256&gt;</code> — looks up the seal. If you also pass <code>fp</code>, it returns <code>match: true/false</code> — <b>MATCH</b>, <b>MISMATCH</b>, or <b>NO_SEAL</b>. Either way the verification itself is sealed and returned as a <code>receipt</code>, giving provable evidence of the check under PSR reimbursement rules.</p>
+
+  <h2 id="link">Link your stack to it</h2>
+  <p>Integration is a few lines wherever your system creates the thing worth proving. The shape is always the same:</p>
+  <pre><span style="color:#5a6178"># 1. fingerprint locally — content stays with you</span>
+<b>import</b> hashlib, requests
+fp = hashlib.sha256(content.encode()).hexdigest()
+
+<span style="color:#5a6178"># 2. seal the fingerprint</span>
+r = requests.post("https://sebbi.pro/api/post/seal",
+                  json={<i>"fingerprint"</i>: fp}).json()
+code = r["code"]        <span style="color:#5a6178"># store this next to your record</span>
+
+<span style="color:#5a6178"># 3. anyone verifies later — no account</span>
+v = requests.get("https://sebbi.pro/api/verify-post",
+                 params={<i>"content"</i>: fp}).json()
+<span style="color:#5a6178"># v["verified"] == True</span></pre>
+  <p>Wire that into the moment a post is published, an invoice is issued, or a profile is created, and every record from then on carries provable, tamper-evident proof — automatically. That is the whole integration.</p>
+
+  <h2 id="govern">POST /api/govern <span class="badge b-post">POST</span><span class="badge b-auth">Bearer key</span></h2>
+  <p>The decision engine: score an event, get a verdict in <b>~28ms</b>, sealed before the response returns. All seven fields required. Deterministic — identical inputs always produce identical outputs.</p>
+  <pre><b>curl</b> -X POST https://sebbi.pro/api/govern \
+  -H <i>"Authorization: Bearer YOUR_KEY"</i> \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_id":    "user_123",
+    "action":     "payment",
+    "amount":     49.99,
+    "country":    "UK",
+    "device_id":  "dev_abc",
+    "anomaly":    0.1,
+    "device_risk":0.05
+  }'</pre>
+  <table>
+    <thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td>user_id</td><td>string</td><td>Your stable identifier for the acting user. Trust is learned per user_id.</td></tr>
+      <tr><td>action</td><td>string</td><td>What they're doing — <code>payment</code>, <code>login</code>, <code>message</code>, anything.</td></tr>
+      <tr><td>amount</td><td>number</td><td>Monetary value if relevant, else 0. Log-scaled internally.</td></tr>
+      <tr><td>country</td><td>string</td><td>ISO-style code. Country changes and off-allowlist jurisdictions raise score.</td></tr>
+      <tr><td>device_id</td><td>string</td><td>Device identifier for velocity correlation.</td></tr>
+      <tr><td>anomaly</td><td>0–1</td><td>Your behavioural-anomaly signal, if you have one. 0 if not.</td></tr>
+      <tr><td>device_risk</td><td>0–1</td><td>Your device-risk signal, if you have one. 0 if not.</td></tr>
+    </tbody>
+  </table>
+  <p><b>Verdicts:</b> score &lt; 0.35 → <code>ALLOW</code> · &lt; 0.70 → <code>CHALLENGE</code> · else <code>BLOCK</code>. Every verdict carries plain-language <code>reasons</code>. Trust moves per decision: earned slowly on ALLOW, lost 8× faster on BLOCK — burst attacks self-amplify.</p>
+
+  <h2 id="receipts">Receipts — omission is countable</h2>
+  <p>Every govern response includes <code>receipt_seq</code>: a per-key sequence issued <b>in the same transaction</b> as the chain write. Sequences are gapless by construction. Store them: if you ever hold receipts 46 and 48 with no 47, a record has been omitted — provable by arithmetic. <b>Edited records break the chain. Missing records break the sequence.</b></p>
+
+  <h2 id="challenge">Challenges — the workflow's built in</h2>
+  <p>When the verdict is <code>CHALLENGE</code>, the response includes a hosted resolution flow — you don't build exception UX:</p>
+  <pre>{
+  <em>"decision"</em>: <i>"CHALLENGE"</i>,
+  <em>"challenge_url"</em>:        "https://sebbi.pro/verify-challenge?token=…",
+  <em>"challenge_status_url"</em>: "https://sebbi.pro/api/challenge/status?token=…",
+  <em>"challenge_expires_in"</em>: 900
+}</pre>
+  <p>Show <code>challenge_url</code> to your user (link, redirect, or iframe). They confirm or deny on our hosted page; the resolution is <b>sealed into the chain as its own block</b>; you poll <code>challenge_status_url</code> until <code>resolved: true</code>. Tokens are stateless and HMAC-signed.</p>
+  <div class="note"><b>Three-line integration:</b> if decision == CHALLENGE → surface challenge_url → poll status. That's the whole exception workflow.</div>
+
+  <h2 id="verify">Verification — public, unauthenticated</h2>
+  <table>
+    <thead><tr><th>Endpoint</th><th>Returns</th></tr></thead>
+    <tbody>
+      <tr><td>GET /api/verify-chain</td><td>Whole-chain integrity: <code>{"valid":true,"blocks":N,"tip":…}</code>. Anyone can run it — auditors, regulators, your customers.</td></tr>
+      <tr><td>GET /api/inclusion?hash=</td><td>Whether a full 64-char receipt hash is sealed, with its block index and sequence.</td></tr>
+      <tr><td>GET /api/regulation-map</td><td>Versioned, hash-sealed mapping of engine features → legal obligations (EU AI Act Arts. 9/12/13/14, OSA, Children's Code).</td></tr>
+      <tr><td>GET /api/partner/status?badge=</td><td>Partner account standing and platform status as separate fields — independently attributable.</td></tr>
+      <tr><td>GET /api/spec</td><td>This API, describing itself — machine-readable.</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="monitor">Monitoring — see it while it happens</h2>
+  <p><span class="badge b-get">GET</span><span class="badge b-auth">Bearer key</span> <code>/api/pulse</code> — your last hour at a glance:</p>
+  <pre>{ <em>"last_hour"</em>: { "ALLOW": 412, "CHALLENGE": 9, "BLOCK": 3 },
+  <em>"recent"</em>: [ { "ts":…, "action":"transfer", "decision":"BLOCK",
+               "score":0.87, "reasons":["velocity_spike","low_trust"],
+               "sealed":"8db26b04…" }, … ],
+  <em>"chain_tip"</em>: "bf9257ab…" }</pre>
+  <p><span class="badge b-get">GET</span><span class="badge b-auth">Bearer key</span> <code>/api/coverage</code> — reconciliation in one call: receipts issued vs blocks sealed, <code>complete: true/false</code>.</p>
+  <p><b>Real-time alerts:</b> the moment the engine BLOCKs on your traffic, the account email receives the sealed evidence — user, action, score, reasons, audit hash. Throttled to one per hour so a burst can't flood your inbox.</p>
+
+  <h2 id="sovereign">Sovereign deployment</h2>
+  <p>The engine runs entirely inside your network — decisions, chain and database on your hardware; nothing leaves your building. Licensing is offline: HMAC-signed 365-day tokens validated with pure cryptography, no phone-home. Ask via <a href="/contact" style="color:var(--gold)">/contact</a>. Paid plans can mint air-gap tokens at <code>POST /api/generate-airgap-token</code>.</p>
+
+  <h2 id="errors">Errors</h2>
+  <table>
+    <thead><tr><th>Status</th><th>Body</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td>400</td><td><code>valid sha-256 fingerprint required</code></td><td>Notary needs a 64-char hex fingerprint. Govern needs all seven fields.</td></tr>
+      <tr><td>401</td><td><code>api_key_required</code> / <code>invalid_api_key</code></td><td>Govern only — send <code>Authorization: Bearer YOUR_KEY</code>. Notary needs no key.</td></tr>
+      <tr><td>403</td><td><code>account_inactive</code></td><td>Account disabled — contact us.</td></tr>
+      <tr><td>429</td><td><code>quota_exceeded</code> / <code>rate_limit_minute</code> / <code>rate_limit_hour</code></td><td>Free tier spent, or per-key limits: 60/min, 1000/hr.</td></tr>
+      <tr><td>500</td><td><code>internal</code></td><td>Logged server-side; detail is never leaked to callers.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="note" style="margin-top:34px"><b>Kick the tyres without writing code:</b> seal a post at <a href="/seal" style="color:var(--gold)">sebbi.pro/seal</a>, verify it at <a href="/verify" style="color:var(--gold)">sebbi.pro/verify</a>, or watch Brain judge a live instruction at <a href="/brain" style="color:var(--gold)">sebbi.pro/brain</a>. Same maths, same catch.</div>
+</div>
+<footer>
+  <p>AILeash · Monop Content · Blyth, UK · <a href="/whitepaper">Whitepaper</a> · <a href="/brain">Brain</a> · <a href="/#signup">Get an API key</a></p>
+</footer>
+</body>
+</html>
