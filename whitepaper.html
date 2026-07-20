@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The sebbi.pro System — how every piece works, and how they fit together</title>
+<meta name="description" content="A plain-English systems whitepaper: the tamper-evident chain, the basis record, SonicBoom, Sentinel, Guardian, the Notaries, Brain, delegated authority, jurisdiction tagging, ai.txt and comply.txt — one evidence layer.">
+<style>
+  :root{
+    --ink:#0a0f1e;--ink2:#111a30;--line:#232d4a;--line2:#2a3350;
+    --gold:#c9a84c;--gold-dim:#8a7838;--ok:#7fe3b0;--block:#ff8a80;--cyan:#7cc8ff;
+    --text:#e8e8f0;--muted:#c2c8dc;--faint:#5a6178;--code-bg:#0b1226;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--ink);color:#fff;line-height:1.7;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:720px;margin:0 auto;padding:26px 20px 90px}
+  a.back{color:var(--gold);text-decoration:none;font-size:13px;font-family:ui-monospace,Menlo,monospace;letter-spacing:.5px}
+  .eyebrow{font-family:ui-monospace,Menlo,monospace;font-size:10.5px;letter-spacing:2px;text-transform:uppercase;color:var(--gold-dim);margin:22px 0 10px}
+  h1{font-size:32px;font-weight:800;letter-spacing:-1px;margin-bottom:10px;line-height:1.15}
+  h1 span{color:var(--gold)}
+  .lead{font-size:16.5px;color:var(--text);margin-bottom:6px}
+  .sub{font-size:14px;color:var(--faint);margin-bottom:26px}
+
+  h2{font-size:20px;font-weight:800;margin:44px 0 6px;letter-spacing:-.3px}
+  h2 .n{color:var(--gold);font-family:ui-monospace,Menlo,monospace;font-size:14px;margin-right:8px}
+  h3{font-size:15px;font-weight:700;color:var(--gold);margin:24px 0 8px}
+  p{font-size:15px;color:var(--muted);margin-bottom:14px}
+  p b{color:#fff}
+  ul{margin:0 0 14px 0;list-style:none}
+  li{position:relative;padding-left:20px;margin-bottom:9px;font-size:14.5px;color:var(--muted)}
+  li::before{content:'';position:absolute;left:0;top:9px;width:6px;height:6px;border-radius:50%;background:var(--gold)}
+  li b{color:#fff}
+  code{background:var(--code-bg);border:1px solid var(--line2);border-radius:5px;padding:2px 7px;font-size:13px;color:var(--ok);font-family:ui-monospace,Menlo,monospace}
+  pre{background:var(--code-bg);border:1px solid var(--line2);border-radius:10px;padding:15px;font-size:12.5px;color:var(--muted);overflow-x:auto;margin:14px 0;font-family:ui-monospace,Menlo,monospace;line-height:1.8}
+  pre b{color:var(--ok);font-weight:400}pre i{color:var(--gold);font-style:normal}
+
+  .box{background:var(--ink2);border:1px solid var(--line);border-radius:14px;padding:20px;margin:16px 0}
+  .box .t{font-family:ui-monospace,Menlo,monospace;font-size:10.5px;letter-spacing:1.5px;text-transform:uppercase;color:var(--gold);margin-bottom:12px}
+  .honest{border:1px solid rgba(201,168,76,.35);background:rgba(201,168,76,.05);border-radius:12px;padding:16px 20px;margin:16px 0;font-size:13.5px;color:var(--muted);line-height:1.75}
+  .honest b{color:var(--gold)}
+  .proves{background:rgba(127,227,176,.05);border:1px solid rgba(127,227,176,.3);border-radius:12px;padding:16px 20px;margin:16px 0}
+  .proves .t{font-family:ui-monospace,Menlo,monospace;font-size:10px;letter-spacing:1.5px;text-transform:uppercase;color:var(--ok);margin-bottom:10px}
+  .proves p{font-size:13.5px;margin-bottom:8px}
+  .stack{font-family:ui-monospace,Menlo,monospace;font-size:12.5px;line-height:2;color:var(--muted);background:var(--code-bg);border:1px solid var(--line2);border-radius:10px;padding:16px;margin:14px 0;overflow-x:auto;white-space:pre}
+  .stack em{color:var(--gold);font-style:normal}
+  .stack s{color:var(--ok);text-decoration:none}
+  .toc{background:var(--ink2);border:1px solid var(--line);border-radius:12px;padding:18px 22px;margin:20px 0;font-size:13.5px}
+  .toc a{display:block;color:var(--muted);text-decoration:none;padding:3px 0}
+  .toc a:hover{color:var(--gold)}
+  .toc .n{color:var(--gold);font-family:ui-monospace,Menlo,monospace;margin-right:8px;font-size:12px}
+  hr{border:none;height:1px;background:linear-gradient(90deg,transparent,rgba(201,168,76,.25),transparent);margin:40px 0 0}
+  footer{margin-top:40px;text-align:center;font-size:12px;color:var(--faint);font-family:ui-monospace,Menlo,monospace}
+  footer a{color:var(--gold);text-decoration:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <a class="back" href="/">&larr; sebbi.pro</a>
+
+  <div class="eyebrow">sebbi.pro · systems whitepaper · engine + products · plain english</div>
+  <h1>One chain. Every proof.<br><span>How the whole system works.</span></h1>
+  <p class="lead">This document explains every piece of sebbi.pro the way a systems engineer would explain it to a colleague: what each part does, why it is built that way, and how they fit together into one evidence layer.</p>
+  <p class="sub">No marketing language. Where something has a limit, the limit is stated. That is the point of the whole system.</p>
+
+  <div class="toc">
+    <a href="#s1"><span class="n">1</span>The problem: records you can edit are not evidence</a>
+    <a href="#s2"><span class="n">2</span>The core: the hash chain</a>
+    <a href="#s3"><span class="n">3</span>Gapless receipts: omission is countable</a>
+    <a href="#s4"><span class="n">4</span>The second record: basis sealing</a>
+    <a href="#s5"><span class="n">5</span>SonicBoom — the decision engine</a>
+    <a href="#s6"><span class="n">6</span>Authority, identity &amp; jurisdiction — the delegation layer</a>
+    <a href="#s7"><span class="n">7</span>Sentinel — pattern and velocity detection</a>
+    <a href="#s8"><span class="n">8</span>Guardian — child safety flags</a>
+    <a href="#s9"><span class="n">9</span>The Notaries — public sealing for anyone</a>
+    <a href="#s10"><span class="n">10</span>Brain — the instruction gate</a>
+    <a href="#s11"><span class="n">11</span>ai.txt and comply.txt — the declaration layer</a>
+    <a href="#s12"><span class="n">12</span>How it all fits together</a>
+    <a href="#s13"><span class="n">13</span>Regulation: what this evidences</a>
+    <a href="#s14"><span class="n">14</span>Deployment and pricing</a>
+    <a href="#s15"><span class="n">15</span>For investors</a>
+    <a href="#s16"><span class="n">16</span>Honest limits — read this</a>
+    <a href="#s17"><span class="n">17</span>Verify everything yourself</a>
+  </div>
+
+  <h2 id="s1"><span class="n">1.</span>The problem: records you can edit are not evidence</h2>
+  <p>Nearly every system keeps logs. Logs live in databases. Databases can be edited by anyone with the right access — an attacker, an insider, or the operator itself. That means an ordinary log can only ever say <b>"this is what we currently claim happened."</b> It cannot say "and nobody has changed it since."</p>
+  <p>Most of the time nobody notices the difference. The difference appears the day someone with authority — a regulator, a court, an insurer, a customer in dispute — stops accepting your word and asks for proof. At that moment, "our system recorded it" and "here is proof it was not changed" are two different sentences, and only the second one carries weight.</p>
+  <p>Everything at sebbi.pro exists to produce the second sentence, cheaply, automatically, as a by-product of systems doing their normal work.</p>
+
+  <h2 id="s2"><span class="n">2.</span>The core: the hash chain</h2>
+  <p>At the centre of the whole platform is one data structure: an append-only chain of sealed records. Every product described below — the decision engine, the fraud detectors, the notaries, Brain — writes into a chain built the same way.</p>
+  <p>Each record is sealed at the moment it is created. The seal is a SHA-256 hash computed over the record's content <b>together with the seal of the record before it</b>. Because each seal contains its predecessor, every block's integrity depends on the entire history beneath it:</p>
+  <pre>seal(n) = SHA-256( seal(n−1) · timestamp · event · result · <i>basis</i> )
+
+verify:  recompute every seal from genesis;
+         any mismatch localises tampering to an exact block index</pre>
+  <p>Alter one character of one historic record and every seal after it fails verification. There is no way to fix the chain after an edit without recomputing every subsequent seal — and the current tip is <b>anchored</b> separately (updated in the same transaction as every write), so even chopping records off the end of the chain is detected. The operator cannot rewrite its own records. Neither can we.</p>
+  <p>Engineering properties, stated plainly:</p>
+  <ul>
+    <li><b>Concurrency-safe:</b> the tip read, hash computation and insert happen inside a single lock hold and a single transaction. There is no race window in which two writers can fork the chain.</li>
+    <li><b>Crash-safe:</b> write-ahead journaling with full synchronous commits. A power cut mid-write rolls back cleanly; the chain cannot be left with a torn, half-sealed block.</li>
+    <li><b>Truncation-evident:</b> the chain tip and last sequence number are anchored in the same transaction as each seal. Deleting blocks from the end breaks the anchor and is reported as tampering.</li>
+    <li><b>Fast:</b> score + decide + seal + respond runs inline in under 30ms; the engine's median is 28ms. Sealing is not a batch job that happens later — it happens before the response returns.</li>
+    <li><b>Resilient:</b> automatic daily database backups; the chain survives restarts intact.</li>
+  </ul>
+  <p>One sentence captures the design philosophy: <b>a system that does not trust its own creator is the only kind whose records qualify as evidence.</b></p>
+
+  <h2 id="s3"><span class="n">3.</span>Gapless receipts: omission is countable</h2>
+  <p>A tamper-evident chain proves records were not <b>edited</b>. It does not by itself prove records were not <b>omitted</b> — an operator could simply fail to write an inconvenient event. The receipt system closes that hole.</p>
+  <p>Every sealed decision is issued a sequence number, generated <b>in the same transaction</b> as the chain write. Sequences are gapless by construction: 46, 47, 48. The caller stores their receipts. If you ever hold receipts 46 and 48 with no 47, a record has been omitted — and you can prove it by arithmetic, not argument.</p>
+  <p><b>Edited records break the chain. Missing records break the sequence.</b> Between the two, both ways of quietly rewriting history are detectable by anyone, from outside, without trusting the operator.</p>
+
+  <h2 id="s4"><span class="n">4.</span>The second record: basis sealing</h2>
+  <p>There are two different records hiding inside "what a system did." The first is the <b>action</b>: this decision, this result, this timestamp, sealed. The second is the <b>basis</b>: what the decision was permitted to rely on when it acted — which sources, which versions of them, which ruleset it was checked against.</p>
+  <p>A seal on the action alone proves the action happened exactly as recorded. It cannot show what the action rested on — and a decision made on the wrong source, sealed, is just a tamper-proof error. So the engine seals both, in the same block:</p>
+  <pre>basis = { sources:         [<b>"invoice_4471.pdf"</b>, <b>"supplier_record_88"</b>],
+          source_versions: [<b>"sha256:ab12…"</b>, <b>"sha256:cd34…"</b>],
+          ruleset:         <b>"AI-TXT/1.0 + EU-AI-Act-2024/1689"</b>,
+          ruleset_version: <b>"regmap-v7"</b> }</pre>
+  <p>The basis is canonicalised, hashed, and folded into the block seal. Edit the recorded basis later and the chain breaks exactly as if the action had been edited. Even "no basis was supplied" is itself sealed as a fixed sentinel — so the absence of a basis is a provable fact, not a blank that can be filled in later.</p>
+  <div class="honest"><b>The honest boundary, stated once and repeated everywhere it matters:</b> basis sealing proves <b>what</b> a decision relied on and that the record of it is unaltered. It does <b>not</b> prove the basis was <b>correct</b> — that a source was genuine or the ruleset was the right one. Integrity is provable by mathematics; correctness is a separate discipline involving people and process. Any product that claims to cryptographically prove correctness is misdescribing what cryptography can do.</div>
+
+  <h2 id="s5"><span class="n">5.</span>SonicBoom — the decision engine</h2>
+  <p>SonicBoom is the scoring engine at the heart of the paid platform — the component that looks at an event and answers, in a fraction of a second: allow it, challenge it, or block it.</p>
+  <h3>What it takes in</h3>
+  <p>Seven fields per event: who is acting (<code>user_id</code>), what they are doing (<code>action</code>), the value involved (<code>amount</code>), where from (<code>country</code>), on what (<code>device_id</code>), plus two optional risk signals your own systems may already produce (<code>anomaly</code>, <code>device_risk</code>). If you do not have those signals, send zero — the engine works from its own analysis. An optional eighth field, <code>authority_token</code>, carries delegated authority — covered in the next section.</p>
+  <h3>What it does with them</h3>
+  <p>The engine combines several independent signals: how fast events are arriving for this user and device (velocity), whether the country has changed or is off the expected list, how large the amount is on a log scale, and a <b>per-user trust score that is learned over time</b>. Trust is earned slowly with every allowed action and lost roughly eight times faster on every block — so an account behaving normally builds standing, and a burst attack destroys its own standing as it runs, making each successive attempt score worse. The design is deterministic: identical inputs always produce identical outputs, which matters when a decision is later examined.</p>
+  <h3>What comes back</h3>
+  <ul>
+    <li><b>ALLOW</b> (score below 0.35) — proceed.</li>
+    <li><b>CHALLENGE</b> (below 0.70) — borderline; verify further before proceeding.</li>
+    <li><b>BLOCK</b> — refuse, with the reasons stated in plain English (for example: "velocity spike", "new country", "low trust").</li>
+  </ul>
+  <p>Every verdict is sealed into the chain <b>before the response returns</b>, with its reasons, its jurisdiction tag (next section), and — where supplied — its basis. The caller receives the verdict, the plain-English reasons, the sealed hash, and the gapless receipt number, all in one response, in about 28 milliseconds.</p>
+  <h3>The challenge flow — human oversight built in</h3>
+  <p>When the verdict is CHALLENGE, the response includes a hosted resolution flow: a signed link your user can open to confirm or deny the action, a status endpoint you poll for the outcome, and an expiry. The tokens are stateless and HMAC-signed; the resolution itself is sealed into the chain as its own block. This means the exception path — the moment a human steps in — is part of the evidence trail, not a gap in it. Integration is three lines: if the verdict is CHALLENGE, show the link, poll the status.</p>
+  <h3>Monitoring</h3>
+  <p>Two authenticated endpoints give the operator live sight of their own traffic: a pulse view (last hour's verdicts, recent decisions with reasons and seals, current chain tip) and a coverage view that reconciles receipts issued against blocks sealed — one call that answers "is my evidence complete?" with a yes or no. When the engine blocks on your traffic, the sealed evidence is emailed to the account address, throttled to once per hour so a burst cannot flood you.</p>
+
+  <h2 id="s6"><span class="n">6.</span>Authority, identity &amp; jurisdiction — the delegation layer</h2>
+  <p>Three questions sit around every automated decision that the decision itself cannot answer: <b>who authorised this person to act</b>, <b>who is this person in the legal sense</b>, and <b>which rules governed the moment it happened</b>. The delegation layer answers all three with the same machinery — sealed, deterministic, verifiable.</p>
+  <h3>Delegated authority — Article 14 done as engineering</h3>
+  <p>Human oversight only means something if the human doing the overseeing was actually authorised to. The engine issues <b>signed authority tokens</b>: a single call binds a user to a role, a spending limit, and an expiry, HMAC-signed server-side. The grant itself is sealed into the chain as its own block — so "who gave this person this power, and when" is a permanent record, not an HR email.</p>
+  <p>Events can then carry the token. The engine verifies it deterministically: wrong user, expired grant, tampered token, or an amount above the granted limit each escalates the verdict and seals the reason — <code>authority_expired</code>, <code>authority_exceeds_limit</code> — into the record. An approval made outside granted authority is no longer a quiet judgement call; it is a flagged, sealed, examinable event.</p>
+  <h3>Identity — KYC results, sealed without the data</h3>
+  <p>The platform does not verify passports — specialist providers do that, and pretending otherwise would be theatre. What the engine does is make the <b>outcome</b> provable: a single call seals a verification result — provider, verified or not, and the SHA-256 fingerprint of the provider's reference — into the chain. The document itself, and even the raw reference number, are never stored. Later, "this user was KYC-verified by provider X on date Y" is a sealed fact any auditor can check, with zero personal data held to leak.</p>
+  <h3>Jurisdiction — which rules applied, sealed at decision time</h3>
+  <p>Every governed decision is tagged with the regulatory frameworks that applied to it at the moment it was made — EU AI Act, GDPR and DSA for EU-origin events, the Online Safety Act, UK GDPR and Children's Code for the UK, and so on — using a versioned mapping. The tag is sealed inside the decision block, so a multinational can answer "show every decision and which regulator's rules governed it" from the chain alone.</p>
+  <div class="honest"><b>Honest scope, because this is where competitors overclaim:</b> the jurisdiction layer records <b>which obligations applied</b> — it does not and cannot <b>decide</b> legal authority. No software can; courts do that. Any product claiming to "determine which jurisdiction controls" is describing a lookup table in grander language. This one is a lookup table too — versioned, sealed, and honest about it.</div>
+
+  <h2 id="s7"><span class="n">7.</span>Sentinel — pattern and velocity detection</h2>
+  <p>Sentinel is the fraud-watching layer: it looks at the <b>speed and shape</b> of activity rather than the content of any single event. The patterns it recognises are the classic signatures of attack: a flood of login attempts against one account (credential stuffing), a burst of transactions in seconds (card testing, automated abuse), an account appearing in a new country moments after its last action (takeover).</p>
+  <p>Sentinel and SonicBoom work together: Sentinel's velocity analysis is one of the signals that drives SonicBoom's score, and when a pattern crosses the line, the flag — what fired, when, on what evidence — is sealed into the same chain. The result for a fraud team is not just an alert, but an alert with a tamper-evident record behind it that survives scrutiny later: exactly what happened, in what order, provably unaltered.</p>
+
+  <h2 id="s8"><span class="n">8.</span>Guardian — child safety flags</h2>
+  <p>Guardian applies the same machinery to a different and more serious problem: platforms where children are present. It watches for the recognised behavioural warning signs that precede grooming — pressure toward secrecy, attempts to isolate, moves toward private channels — and flags them.</p>
+  <p>Two design decisions matter here. First, <b>message content is never stored</b> — only a fingerprint of it. Privacy is preserved; what is kept is proof that the flagged exchange existed in the exact form it had. Second, every flag is sealed into the chain, so the evidence trail handed to a parent, a platform's safety team, or the authorities is tamper-evident from the moment of detection. A safeguarding report backed by a sealed chain is a fundamentally stronger document than one backed by an editable log.</p>
+  <div class="honest"><b>Honest scope:</b> Guardian is a detection and evidence aid. It supports a platform's duty of care; it does not discharge it. Child-safety decisions must always involve trained people and, where warranted, the proper authorities.</div>
+
+  <h2 id="s9"><span class="n">9.</span>The Notaries — public sealing for anyone</h2>
+  <p>The three notaries expose the chain directly to the public, free, with no account and no code. They exist because most people and small businesses do not have a "system" to integrate — but they still have things worth proving.</p>
+  <p>All three share one privacy-preserving design: <b>your content never leaves your device.</b> Your browser computes a SHA-256 fingerprint locally; only that 64-character fingerprint is sent and sealed. The chain proves a document with exactly that fingerprint existed at that moment. You reveal the original only if and when you ever need to.</p>
+  <h3>Post notary</h3>
+  <p>Seal the exact words of anything before you send or publish it — a quote, a contract, an announcement. Later, anyone can verify those exact words existed on that date and have not been edited. A tradesman who sealed a £2,400 quote the day he sent it ends a "you said £1,800" dispute with mathematics.</p>
+  <h3>Identity notary</h3>
+  <p>Seal your name, role and links; receive a short verification code for your public profile. If a fraudster clones the profile, the clone fails the check — the genuine one was sealed first, and the chain proves which came first.</p>
+  <h3>Payment notary</h3>
+  <p>A business seals its genuine bank details once; every invoice carries a short code; the payer checks the code before releasing funds. If an intercepted invoice's details were swapped — the classic authorised-push-payment fraud — the check returns MISMATCH and the payment stops. The verification itself is sealed and returned as a receipt, so both sides hold provable evidence that care was taken before money moved.</p>
+  <p>Every seal returns a unique 12-character code — the holder's permanent claim to that specific record. One shared chain underneath; one private, verifiable receipt each.</p>
+
+  <h2 id="s10"><span class="n">10.</span>Brain — the instruction gate</h2>
+  <p>Brain applies the evidence layer to a newer problem: the instructions fed to AI systems. An AI does what it is told — so the question becomes who checks what it is being told. A poisoned instruction ("ignore your rules", "export the customer data", "delete the logs") walks straight in unless something stands in front.</p>
+  <p>Brain is that something: a gate that every instruction passes through before the AI acts. It checks against five categories of known-dangerous patterns — child safety, data exfiltration, compliance bypass, prompt injection, system destruction — with normalisation defences so unicode look-alikes, zero-width characters and spacing tricks resolve to the same fingerprint as the plain form. Dangerous instructions are blocked with the reason stated. And every decision, allowed or blocked, is sealed — with its basis, where supplied — into a chain with all the properties described above: gapless, anchored, truncation-evident.</p>
+  <p>Brain is deliberately distributed differently from the rest of the platform: it is a single pure-Python file, free to download, standard library only, no cloud, no API key. It runs entirely on your own machine and your instructions never leave your system. It is meant to be read before it is run — every line of it — because a governance tool you cannot inspect is itself an ungoverned claim.</p>
+  <div class="honest"><b>Honest scope:</b> Brain blocks known-dangerous patterns. It does not catch every possible paraphrase of a bad instruction — no filter honestly can, and any vendor claiming complete coverage of natural language is overclaiming. What Brain guarantees is the record: every instruction, every decision, every basis, sealed and tamper-evident. The filter is the first line; the evidence is the product.</div>
+
+  <h2 id="s11"><span class="n">11.</span>ai.txt and comply.txt — the declaration layer</h2>
+  <p>The final layer is not code but a convention, modelled on robots.txt and security.txt: two small public text files at well-known paths that let any organisation declare, in a machine-readable way, how its AI is governed.</p>
+  <ul>
+    <li><b>ai.txt</b> — the public declaration: what AI the organisation operates, what decision model governs it, what audit method backs it, what regulations it is designed toward, and where a human override sits. "Here is how our AI is governed," stated where anyone — a customer, a journalist, a regulator, another machine — can read it.</li>
+    <li><b>comply.txt</b> — the rulebook: the specific rules every instruction and decision is subject to. "Every instruction passes through a governance gate; here are the gate's rules."</li>
+  </ul>
+  <p>On their own, these files are declarations — claims, not proof. Anyone can write "tamper-evident audit" in a text file. Their force comes from the third step: sealing the declarations themselves into the chain, so the claim "this is our governance, as declared on this date" becomes provable and its history becomes tamper-evident. Declaration → rulebook → enforcement: words, backed by rules, backed by working code.</p>
+
+  <h2 id="s12"><span class="n">12.</span>How it all fits together</h2>
+  <p>Every piece above is one layer of a single stack. Reading from the bottom up:</p>
+  <div class="stack"><em>DECLARATION</em>   ai.txt · comply.txt      what we claim, publicly, machine-readably
+<em>GATE</em>          Brain                    instructions checked before the AI acts
+<em>DELEGATION</em>    authority · identity ·   who may act, who they legally are,
+              jurisdiction             and which rules governed the moment
+<em>DECISION</em>      SonicBoom                every event scored: allow / challenge / block
+<em>DETECTION</em>     Sentinel · Guardian      attack patterns · child-safety patterns
+<em>PUBLIC ACCESS</em> the Notaries             the same chain, free, for anyone
+<em>EVIDENCE</em>      <s>the hash chain</s>           every layer above seals into here:
+                                       action + basis + receipt, gapless,
+                                       anchored, publicly verifiable</div>
+  <p>The flow of a single event through the stack: an instruction or action arrives → Brain checks it against the declared rules → the delegation layer establishes authority, identity and applicable jurisdiction → SonicBoom scores it, informed by Sentinel's pattern analysis → the verdict, its reasons, its jurisdiction tag and its basis are sealed into the chain in the same transaction, with a gapless receipt → and anyone, at any time, can verify the whole chain from outside without an account.</p>
+  <p>The design principle tying it together: <b>evidence accrues as a by-product of the system working.</b> Nobody remembers to log anything. Nobody compiles an audit file before an inspection. The proof exists because the system ran — and it is exactly as trustworthy whether the operator is honest or not, which is the only kind of trustworthy that counts.</p>
+
+  <h2 id="s13"><span class="n">13.</span>Regulation: what this evidences</h2>
+  <p>The platform maintains a versioned <b>regulation map</b> — itself hash-sealed, itself served at a public endpoint — that links each engine capability to the legal obligations it helps evidence: the EU AI Act's record-keeping, transparency and human-oversight expectations (Articles 9, 12, 13 and 14 — with the delegated-authority tokens directly supporting Article 14's requirement for effective, attributable human oversight), the UK Online Safety Act's duty-of-care documentation, and the ICO Children's Code. Jurisdiction tagging extends the map to the per-decision level: every sealed block records which frameworks applied at the moment of decision. The map is versioned so that when regulations change, the history of what was mapped when is itself tamper-evident.</p>
+  <div class="honest"><b>Stated precisely, because precision is the product:</b> these tools help an organisation <b>evidence</b> its obligations — they produce tamper-evident, explainable, independently verifiable records of what its systems decided and why. They do not, on their own, make an organisation compliant, and no software does. Compliance is an organisational discipline; this is the evidence layer underneath it.</div>
+
+  <h2 id="s14"><span class="n">14.</span>Deployment and pricing</h2>
+  <p>The platform runs two ways. <b>Cloud:</b> integrate against the hosted API — a few lines of code at the point where your system makes decisions, an API key for the paid engine, nothing for the notaries. <b>Sovereign:</b> for organisations whose data cannot leave the building, the engine runs entirely inside your own network — decisions, chain and database on your hardware. Licensing for sovereign deployments is offline by design: HMAC-signed 365-day tokens validated with pure cryptography, no phone-home, suitable for air-gapped environments.</p>
+  <p>Pricing is deliberately simple: <b>50p per active device per month</b> for the paid engine. Partners embedding the platform set their own customer pricing and keep their margin above the platform fee. The notaries and Brain are free — they are the public proof that the machinery works, and the standard (ai.txt) is open because standards only matter if anyone can adopt them.</p>
+
+  <h2 id="s15"><span class="n">15.</span>For investors</h2>
+  <p>This section is written with the same rule as the rest of the document: no claims that cannot be checked, and limits stated plainly.</p>
+  <h3>The market moment</h3>
+  <p>The EU AI Act's next wave of obligations applies from <b>August 2026</b>, with penalties measured in percentages of global turnover. The UK Online Safety Act and the 2024 Payment Services reimbursement rules are already in force. Every one of these regimes shares a single practical demand: <b>records that survive scrutiny</b>. Most organisations currently meet that demand with editable database logs — which is to say, they do not meet it. The gap between what regulation now requires and what ordinary logging can prove is the market.</p>
+  <h3>What exists today — checkable, not claimed</h3>
+  <p>A deployed, running platform: the decision engine (~28ms, deterministic), the tamper-evident chain with gapless receipts and public verification endpoints, delegated-authority tokens, KYC result sealing, per-decision jurisdiction tagging, three free public notaries, the Brain instruction gate, the Guardian child-safety suite, Stripe-metered per-device billing with automatic quantity sync, and a partner/white-label programme. All of it verifiable right now at sebbi.pro — including by recomputing the chain yourself. Built and operated by a solo founder, from a phone, at near-zero fixed cost.</p>
+  <h3>The economics</h3>
+  <p>The model is infrastructure, not consultancy: <b>50p per active device per month</b>, metered on real usage, billed automatically. Marginal cost per additional device is effectively zero; the same engine serves one customer or ten thousand. Partners and white-label operators build their own margin on top and bring their own customers — distribution that scales without headcount. The notaries and Brain are free by design: they are the demonstration layer that converts scrutiny into signups.</p>
+  <h3>The moat</h3>
+  <p>Three parts. First, <b>the chain itself</b>: switching costs rise every day a customer's evidence accrues, because a compliance history cannot be migrated mid-stream without breaking its own continuity. Second, <b>the ai.txt / comply.txt standard</b>: an open convention this platform originated and practises — standards accrue value to their reference implementation. Third, and least copyable: <b>the honesty position</b>. Every competitor overclaims; this platform's documented refusal to (stated limits on every page, in this document, and sealed into its own chain) is precisely the property a buyer of evidence infrastructure is buying.</p>
+  <h3>Stage, honestly stated</h3>
+  <p>Pre-revenue. The platform is live with a 90-day free trial converting to metered billing; the pipeline is founder-led outreach and inbound from the free tools. The raise is a seed round with one purpose: to move the founder full-time onto the platform and fund the first sales and partnership cycle into the August 2026 enforcement window — the moment demand stops being theoretical.</p>
+  <p><b>Contact:</b> justin@monopcontent.com — the technical demonstration takes fifteen minutes and every claim above can be verified during it.</p>
+
+  <h2 id="s16"><span class="n">16.</span>Honest limits — read this</h2>
+  <p>A whitepaper that only lists strengths is marketing. These are the limits, stated as plainly as the capabilities:</p>
+  <ul>
+    <li><b>Sealing proves integrity, not truth.</b> A sealed record proves the exact content existed at the exact time and has not changed since. It does not prove the contents were true, that anyone agreed to them, or that a document was delivered.</li>
+    <li><b>Basis sealing proves what was relied on, not that it was right.</b> The chain shows a decision rested on invoice X, version Y, ruleset Z — unalterably. Whether X was genuine is a matter for process, not cryptography.</li>
+    <li><b>Authority tokens prove the grant, not the wisdom.</b> A sealed authority token proves who was empowered, to what limit, until when — not that granting it was a good idea.</li>
+    <li><b>Jurisdiction tagging records applicable frameworks; it does not decide law.</b> Courts decide legal authority. The tag is a versioned, sealed mapping — nothing grander, deliberately.</li>
+    <li><b>Brain's filter is a first line, not a wall.</b> Known-dangerous patterns are caught, including obfuscated forms. Novel phrasings can pass. The guarantee is the sealed record of every decision, not perfect detection.</li>
+    <li><b>Fingerprint matching is exact.</b> The notaries prove an identical file or text. A re-encoded copy, a paraphrase, or a re-saved image produces a different fingerprint and will not match.</li>
+    <li><b>The tools evidence compliance; they do not confer it.</b> Regulators assess organisations, not endpoints. This platform makes your records provable; your obligations remain yours.</li>
+  </ul>
+  <p>Every one of these limits is stated on the product pages as well. A system whose whole value is honesty cannot afford a single overclaim — and a vendor who tells you their limits is giving you the strongest evidence available about how they will behave when it matters.</p>
+
+  <h2 id="s17"><span class="n">17.</span>Verify everything yourself</h2>
+  <p>Nothing in this document asks to be believed. Every claim about the chain is checkable from outside, now, without an account:</p>
+  <ul>
+    <li><b>Verify the whole chain</b> — the public verification endpoint recomputes every seal from genesis and reports either integrity or the exact block where tampering begins.</li>
+    <li><b>Check any receipt</b> — the inclusion endpoint confirms whether a given sealed hash is in the chain, with its block index and sequence.</li>
+    <li><b>Seal something yourself</b> — use the notaries with no account: seal a post, verify it, then change one character and watch verification fail.</li>
+    <li><b>Read the gate's code</b> — download Brain and read every line before running it.</li>
+    <li><b>Read the declarations</b> — the platform's own ai.txt and comply.txt are published at their well-known paths, and practise what this document preaches.</li>
+  </ul>
+  <p><b>Check us. Don't trust us.</b> That is not a slogan; it is the system's design requirement, and the only standard by which an evidence layer should ever be judged.</p>
+
+  <hr>
+  <footer>
+    <p style="margin-top:20px"><a href="/">sebbi.pro</a> · <a href="/brain">Brain</a> · <a href="/seal">Seal</a> · <a href="/verify">Verify</a> · <a href="/developers">Developers</a> · <a href="/contact">Contact</a></p>
+    <p style="margin-top:8px;color:var(--faint)">Monop Content · Blyth, Northumberland, UK</p>
+  </footer>
+</div>
+</body>
+</html>
