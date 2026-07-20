@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Risk Management Policy — Monop Content / AILeash</title>
+<meta name="description" content="The AI risk management policy for the AILeash platform, aligned to EU AI Act Article 9: how risks are identified, mitigated, tested, monitored and reviewed.">
+<style>
+  :root{--ink:#0a0f1e;--ink2:#111a30;--line:#232d4a;--gold:#c9a84c;--gold-dim:#8a7838;--ok:#7fe3b0;--text:#e8e8f0;--muted:#c2c8dc;--faint:#5a6178;--code-bg:#0b1226}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--ink);color:#fff;line-height:1.7;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:720px;margin:0 auto;padding:26px 20px 90px}
+  a.back{color:var(--gold);text-decoration:none;font-size:13px;font-family:ui-monospace,Menlo,monospace;letter-spacing:.5px}
+  .eyebrow{font-family:ui-monospace,Menlo,monospace;font-size:10.5px;letter-spacing:2px;text-transform:uppercase;color:var(--gold-dim);margin:22px 0 10px}
+  h1{font-size:28px;font-weight:800;letter-spacing:-.5px;margin-bottom:10px;line-height:1.2}
+  h1 span{color:var(--gold)}
+  .meta{font-family:ui-monospace,Menlo,monospace;font-size:12px;color:var(--faint);margin-bottom:26px;line-height:1.9}
+  h2{font-size:19px;font-weight:800;margin:40px 0 8px;letter-spacing:-.3px}
+  h2 .n{color:var(--gold);font-family:ui-monospace,Menlo,monospace;font-size:13px;margin-right:8px}
+  p{font-size:14.5px;color:var(--muted);margin-bottom:13px}
+  p b{color:#fff}
+  ul{margin:0 0 14px 0;list-style:none}
+  li{position:relative;padding-left:20px;margin-bottom:9px;font-size:14px;color:var(--muted)}
+  li::before{content:'';position:absolute;left:0;top:9px;width:6px;height:6px;border-radius:50%;background:var(--gold)}
+  li b{color:#fff}
+  .honest{border:1px solid rgba(201,168,76,.35);background:rgba(201,168,76,.05);border-radius:12px;padding:16px 20px;margin:16px 0;font-size:13.5px;color:var(--muted);line-height:1.75}
+  .honest b{color:var(--gold)}
+  table{width:100%;border-collapse:collapse;font-size:13px;margin:14px 0}
+  th{padding:9px 10px;text-align:left;font-size:10.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--faint);border-bottom:2px solid var(--line)}
+  td{padding:10px;border-bottom:1px solid var(--line);vertical-align:top;color:var(--muted)}
+  td:first-child{color:#fff;font-weight:600}
+  hr{border:none;height:1px;background:linear-gradient(90deg,transparent,rgba(201,168,76,.25),transparent);margin:40px 0 0}
+  footer{margin-top:30px;text-align:center;font-size:12px;color:var(--faint);font-family:ui-monospace,Menlo,monospace}
+  footer a{color:var(--gold);text-decoration:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <a class="back" href="/">&larr; sebbi.pro</a>
+  <div class="eyebrow">monop content · policy document · public</div>
+  <h1>AI Risk Management Policy<br><span>AILeash Platform</span></h1>
+  <div class="meta">
+    Document: MC-POL-001 · Version 1.0 · Effective 20 July 2026<br>
+    Owner: Justin Dobson, Founder, Monop Content · Review cycle: quarterly, and on any material platform change<br>
+    Alignment: EU AI Act (Regulation 2024/1689) Article 9 · published at sebbi.pro/risk-policy
+  </div>
+
+  <h2><span class="n">1.</span>Purpose and scope</h2>
+  <p>This policy describes how Monop Content identifies, analyses, mitigates, tests and monitors risk across the lifecycle of the AILeash platform — the decision engine, the tamper-evident audit chain, the delegation layer (authority, KYC sealing, jurisdiction tagging), the public notaries, Brain, and the hosted infrastructure they run on.</p>
+  <p>It applies to all platform components, all releases, and all environments (the hosted cloud service and the sovereign on-premise engine). It is written to align with the risk-management system expectations of Article 9 of the EU AI Act, and it is published because a governance vendor's own risk posture should be inspectable.</p>
+  <div class="honest"><b>Classification, stated honestly:</b> AILeash is a governance and evidence tool that sits alongside customers' AI systems; it is not itself a high-risk AI system under Annex III of the Act, and it makes no automated decisions about natural persons' rights. We maintain this policy to the Article 9 standard anyway — because our customers' compliance rests partly on our reliability, and because we should be held to the standard we help others evidence.</div>
+
+  <h2><span class="n">2.</span>Roles and responsibility</h2>
+  <p>Monop Content is at present a single-operator company. Accountability is therefore simple and total: <b>the Founder is the risk owner</b> for every item in this policy — identification, mitigation, testing, monitoring, incident response and review. There is no diffusion of responsibility. As the company grows, this section will be revised to assign named owners per risk area, and that revision will be sealed (see §8).</p>
+
+  <h2><span class="n">3.</span>Risk identification and analysis</h2>
+  <p>Risks are identified continuously through four channels: design review before any change ships; automated verification of the chain after every deployment; monitoring of live traffic, error rates and blocked-event patterns; and external input (customer reports, security disclosures to justin@monopcontent.com, and the public verifiability of the chain itself — anyone can attempt to falsify our records at any time).</p>
+  <p>The principal risk register:</p>
+  <table>
+    <thead><tr><th>Risk</th><th>Potential impact</th><th>Mitigation (see §4)</th></tr></thead>
+    <tbody>
+      <tr><td>Chain integrity failure</td><td>Evidence loses probative value</td><td>Single-lock sealed writes; WAL journaling; anchored tip; public verification endpoint; daily backups</td></tr>
+      <tr><td>Incorrect verdicts (false ALLOW / false BLOCK)</td><td>Customer harm; missed threats or blocked legitimate activity</td><td>Deterministic scoring; plain-English reasons on every verdict; CHALLENGE band for borderline cases; human-oversight flow</td></tr>
+      <tr><td>Availability loss</td><td>Customers cannot govern events</td><td>Stateless integration pattern; automatic restart; daily database backups; customer-side fail-safe guidance in developer docs</td></tr>
+      <tr><td>Unauthorised access / key compromise</td><td>Records written under a stolen key</td><td>Bearer-key auth; per-key rate limits; HMAC-signed tokens; no key material in the chain; secrets held in environment, never in code</td></tr>
+      <tr><td>Data protection failure</td><td>Personal data exposure</td><td>Data-minimising design throughout — fingerprints not content, hashes not references; see the Data Protection Statement (MC-POL-002)</td></tr>
+      <tr><td>Overclaim / misdescription of capability</td><td>Customers rely on protections that do not exist</td><td>Honest-limits statements on every product page, in the whitepaper, and sealed into our own chain; deliberate refusal to claim correctness-proving or compliance-conferring capability</td></tr>
+      <tr><td>Single-operator continuity</td><td>Maintenance interruption</td><td>Self-contained stdlib architecture; sovereign engine option gives customers independence; documented codebase; daily backups; see §7</td></tr>
+    </tbody>
+  </table>
+
+  <h2><span class="n">4.</span>Risk mitigation by design</h2>
+  <p>The platform's primary risk controls are architectural rather than procedural — chosen so that safety does not depend on anyone remembering to follow a process:</p>
+  <ul>
+    <li><b>Determinism.</b> The scoring engine contains no model-layer randomness: identical inputs produce identical verdicts, always. Behaviour is therefore testable, reproducible and explainable — the precondition for every other control.</li>
+    <li><b>Tamper-evidence over trust.</b> Every decision, grant and verification is sealed into an append-only SHA-256 chain whose integrity anyone can verify externally. The operator (including the Founder) cannot rewrite history undetected. Risk of internal falsification is engineered out rather than policied away.</li>
+    <li><b>Gapless receipts.</b> Sequence numbers issued in the same transaction as each seal make record omission detectable — closing the gap that tamper-evidence alone leaves open.</li>
+    <li><b>Human oversight built in.</b> Borderline verdicts return CHALLENGE with a hosted resolution flow; delegated-authority tokens make the overseeing human's mandate itself a sealed, checkable record (Article 14 alignment).</li>
+    <li><b>Data minimisation.</b> Content is fingerprinted client-side; KYC references are stored only as hashes; Guardian never stores message content. The lowest-risk data is the data never held.</li>
+    <li><b>Stated limits.</b> Every capability is published alongside what it does not do. Overclaim is treated as a platform risk equal in severity to a technical failure, because customers make decisions based on our descriptions.</li>
+  </ul>
+
+  <h2><span class="n">5.</span>Testing and release management</h2>
+  <p>Every release passes, in order: compilation and unit checks on changed components (including, for the delegation layer, explicit negative tests — expired, tampered, wrong-user and over-limit tokens must all escalate correctly); deployment to the production environment via version-controlled GitHub-to-Railway pipeline, so every deployed state is attributable to a commit; and post-deployment verification, including chain-integrity confirmation via the public endpoint and a live governed event to confirm end-to-end behaviour. A release is not considered complete until the chain verifies green after it.</p>
+
+  <h2><span class="n">6.</span>Monitoring and incident response</h2>
+  <p>Live monitoring includes platform-level request/error metrics (hosting dashboard), per-customer visibility via the authenticated pulse and coverage endpoints, and automatic e-mail alerts to account holders when the engine blocks on their traffic. The public verification endpoint acts as a standing, continuous integrity test that anyone may run.</p>
+  <p>On any suspected integrity, security or availability incident: the affected component is isolated or the platform paused; the chain is verified to establish the exact boundary of any impact (tampering localises to a block index by design); affected customers are informed with the sealed evidence of what occurred; the fix is deployed through the standard release path; and the incident and remedy are recorded. The chain itself makes honest incident disclosure enforceable — we could not quietly rewrite an incident out of history even if we wished to.</p>
+
+  <h2><span class="n">7.</span>Continuity</h2>
+  <p>The platform is deliberately built as a self-contained, dependency-light system (Python standard library, single-file server) to minimise supply-chain and bus-factor risk. Databases are backed up daily. Customers requiring full independence from Monop Content's continuity can deploy the sovereign engine inside their own network with offline licence validation — their governance does not stop if we do.</p>
+
+  <h2><span class="n">8.</span>Review and change control</h2>
+  <p>This policy is reviewed quarterly, and immediately upon any material change to the platform's architecture, data handling or product claims. Each revision is fingerprinted and sealed into the AILeash chain, making the policy's own history tamper-evident — the same standard the platform applies to everything else. The current version is always published at this address.</p>
+
+  <div class="honest"><b>Honest maturity statement:</b> Monop Content is an early-stage company. This policy reflects controls that genuinely exist and operate today; it does not claim certifications we do not hold (we are not ISO 27001 or SOC 2 certified at this stage) or processes we do not run. As the company grows, this document will grow with it — verifiably, because its history is sealed.</div>
+
+  <hr>
+  <footer>
+    <p style="margin-top:20px"><a href="/">sebbi.pro</a> · <a href="/whitepaper">Whitepaper</a> · <a href="/data-protection">Data Protection Statement</a> · <a href="/human-oversight">Human Oversight Policy</a> · <a href="/contact">Contact</a></p>
+    <p style="margin-top:8px;color:var(--faint)">Monop Content · Blyth, Northumberland, UK · justin@monopcontent.com</p>
+  </footer>
+</div>
+</body>
+</html>
