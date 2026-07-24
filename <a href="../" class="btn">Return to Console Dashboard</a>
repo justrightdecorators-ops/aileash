@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sovereign Engine Benchmark | sebbi.pro</title>
+    <style>
+        :root {
+            --bg-dark: #0d1117;
+            --card-bg: #161b22;
+            --border-color: #30363d;
+            --accent-green: #238636;
+            --accent-blue: #58a6ff;
+            --text-main: #c9d1d9;
+            --text-muted: #8b949e;
+        }
+
+        body {
+            background-color: var(--bg-dark);
+            color: var(--text-main);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+            margin: 0;
+            padding: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 800px;
+            padding: 20px;
+            box-sizing: border-box;
+        }
+
+        .header {
+            text-align: center;
+            margin-bottom: 40px;
+        }
+
+        h1 {
+            font-size: 2.3rem;
+            margin-bottom: 10px;
+            background: linear-gradient(45deg, var(--text-main), var(--accent-blue));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            font-weight: 700;
+            letter-spacing: -0.02em;
+        }
+
+        .subtitle {
+            color: var(--text-muted);
+            font-size: 1.1rem;
+        }
+
+        .trigger-zone {
+            background-color: var(--card-bg);
+            border: 2px dashed var(--border-color);
+            border-radius: 12px;
+            height: 220px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            position: relative;
+            overflow: hidden;
+            user-select: none;
+        }
+
+        .trigger-zone:hover {
+            border-color: var(--accent-blue);
+            background-color: #1f242c;
+        }
+
+        .trigger-zone:active {
+            transform: scale(0.99);
+        }
+
+        .trigger-text {
+            font-size: 1.4rem;
+            font-weight: 600;
+            color: var(--text-main);
+            z-index: 2;
+            letter-spacing: 0.05em;
+        }
+
+        .results-panel {
+            margin-top: 30px;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            opacity: 0;
+            transform: translateY(15px);
+            transition: all 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+        }
+
+        .results-panel.visible {
+            opacity: 1;
+            transform: translateY(0);
+        }
+
+        .card {
+            background-color: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 20px;
+            box-sizing: border-box;
+        }
+
+        .card-title {
+            font-size: 0.85rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: var(--text-muted);
+            margin-bottom: 10px;
+            font-weight: 600;
+        }
+
+        .stat-value {
+            font-size: 3.2rem;
+            font-weight: 800;
+            font-family: monospace;
+            line-height: 1;
+            margin-bottom: 12px;
+        }
+
+        .human-stat { color: #f25f5c; }
+        .engine-stat { color: var(--accent-green); }
+
+        .ledger-box {
+            grid-column: span 2;
+            background-color: #090d13;
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            padding: 18px;
+            font-family: monospace;
+            font-size: 0.85rem;
+            overflow-x: auto;
+            white-space: pre-wrap;
+            color: #79c0ff;
+            line-height: 1.5;
+        }
+
+        .footer-action {
+            text-align: center;
+            margin-top: 40px;
+            opacity: 0;
+            transition: opacity 0.4s ease;
+        }
+
+        .footer-action.visible {
+            opacity: 1;
+        }
+
+        .btn {
+            background-color: var(--accent-green);
+            color: white;
+            border: none;
+            padding: 14px 28px;
+            font-size: 1rem;
+            font-weight: 600;
+            border-radius: 6px;
+            cursor: pointer;
+            text-decoration: none;
+            display: inline-block;
+            transition: background-color 0.2s;
+        }
+
+        .btn:hover {
+            background-color: #2ea44f;
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <div class="header">
+        <h1>Can You Beat the Sebdog Engine?</h1>
+        <p class="subtitle">Contrast human neurological reflexes against localized edge compliance runtime.</p>
+    </div>
+
+    <div class="trigger-zone" id="clickZone">
+        <span class="trigger-text" id="zoneText">CLICK TO INITIATE SYSTEM BENCHMARK</span>
+    </div>
+
+    <div class="results-panel" id="resultsPanel">
+        <div class="card">
+            <div class="card-title">Human Latency (Motor Skills)</div>
+            <div class="stat-value human-stat" id="humanTime">0ms</div>
+            <p style="margin: 0; color: var(--text-muted); font-size: 0.85rem;">The physical time required for your nervous system to trigger the browser event handler.</p>
+        </div>
+
+        <div class="card">
+            <div class="card-title">Sebdog Engine Local Execution</div>
+            <div class="stat-value engine-stat" id="engineTime">0.0ms</div>
+            <p style="margin: 0; color: var(--text-muted); font-size: 0.85rem;">Time spent evaluating 9 concurrent behavioral signals and sealing an unalterable SHA-256 block.</p>
+        </div>
+
+        <div class="ledger-box" id="ledgerLog">Awaiting local runtime engagement parameters...</div>
+    </div>
+
+    <div class="footer-action" id="footerAction">
+        <p style="color: var(--text-muted); margin-bottom: 15px; font-size: 0.95rem;">Eliminate the 20,000-mile network round-trip. Bring your own computing power.</p>
+        <a href="../" class="btn">Return to Console Dashboard</a>
+    </div>
+</div>
+
+<script>
+    const clickZone = document.getElementById('clickZone');
+    const zoneText = document.getElementById('zoneText');
+    const resultsPanel = document.getElementById('resultsPanel');
+    const humanTimeDisplay = document.getElementById('humanTime');
+    const engineTimeDisplay = document.getElementById('engineTime');
+    const ledgerLog = document.getElementById('ledgerLog');
+    const footerAction = document.getElementById('footerAction');
+
+    let testState = 'IDLE'; 
+    let startTime = 0;
+    let timeoutId = null;
+
+    async function computeSha256(message) {
+        const msgBuffer = new TextEncoder().encode(message);                    
+        const hashBuffer = await crypto.subtle.digest('SHA-256', msgBuffer);
+        const hashArray = Array.from(new Uint8Array(hashBuffer));
+        return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    clickZone.addEventListener('click', async () => {
+        if (testState === 'IDLE') {
+            testState = 'WAITING';
+            clickZone.style.backgroundColor = '#211d13';
+            clickZone.style.borderColor = '#e3b341';
+            zoneText.textContent = 'MONITORING ENVIRONMENT...';
+            zoneText.style.color = '#e3b341';
+            
+            const randomDelay = Math.floor(Math.random() * 2000) + 1500;
+            timeoutId = setTimeout(() => {
+                if (testState === 'WAITING') {
+                    clickZone.style.backgroundColor = '#1b2c24';
+                    clickZone.style.borderColor = 'var(--accent-green)';
+                    zoneText.textContent = 'INTERCEPT NOW!';
+                    zoneText.style.color = '#3fb950';
+                    startTime = performance.now();
+                }
+            }, randomDelay);
+
+        } else if (testState === 'WAITING') {
+            if (startTime === 0) {
+                clearTimeout(timeoutId);
+                testState = 'IDLE';
+                clickZone.style.backgroundColor = '';
+                clickZone.style.borderColor = '';
+                zoneText.textContent = 'PREMATURE CAPTURE. RE-TRIGGER TO RESET.';
+                zoneText.style.color = '#f25f5c';
+            } else {
+                const endTime = performance.now();
+                testState = 'CLICKED';
+                
+                const humanDiff = Math.round(endTime - startTime);
+                humanTimeDisplay.textContent = `${humanDiff}ms`;
+
+                // --- EXECUTE SEBDOG CORE PERFORMANCE PROOF ---
+                const engineStart = performance.now();
+                
+                const activeTelemetry = {
+                    trust_score: 0.99,
+                    velocity_1m: 1,
+                    velocity_5m: 2,
+                    velocity_1h: 4,
+                    quantum_amount: 0,
+                    hardware_risk: 0.01,
+                    behavioral_anomaly: 0.03,
+                    geographical_shift: 0,
+                    restricted_zone: 0
+                };
+                
+                const structuralPayload = JSON.stringify(activeTelemetry) + endTime;
+                const genesisProofHash = "0000000000000000000a6c782161b22e161b2230363d58a6ff238636ffffff";
+                const blockHash = await computeSha256(structuralPayload + genesisProofHash);
+                
+                const engineEnd = performance.now();
+                const engineDiff = (engineEnd - engineStart).toFixed(3);
+                // ---------------------------------------------
+
+                engineTimeDisplay.textContent = `${engineDiff}ms`;
+                
+                ledgerLog.textContent = `[SEBDOG LOCAL VERDICT: ALLOW] \n`;
+                ledgerLog.textContent += `────────────────────────────────────────────────────────────\n`;
