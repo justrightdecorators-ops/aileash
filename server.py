@@ -1264,10 +1264,7 @@ class Handler(BaseHTTPRequestHandler):
             c=load_file("human-oversight.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
         elif path=="/scan":
             c=load_file("scan.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
-        elif path.startswith("/x/"):
-            from modules import router as _r
-            p,s=_r.route(self,path,data)
-            send_json(self,p,s)
+        
         elif path=="/contact":
             c=load_file("contact.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
         elif path=="/sonicboom":
