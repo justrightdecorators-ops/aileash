@@ -1809,6 +1809,10 @@ class Handler(BaseHTTPRequestHandler):
             signup_msg="Free for "+str(TRIAL_DAYS)+" days - full engine, no card. After the trial: 50p per unique device per month via Stripe, metered on real usage. Your installation guide is on its way to your inbox."
             bid=badge_id_for_key(key)
             send_json(self,{"api_key":key,"email":email,"product":product,"devices":devices,"monthly":monthly,"trial_days":TRIAL_DAYS,"ref_code":new_ref_code,"badge_id":bid,"badge_url":HOST+"/api/badge/shield?badge="+bid,"endpoint":HOST+"/api/govern","message":signup_msg})
+        elif path.startswith("/x/"):
+            from modules import router as _r
+            p,s=_r.route(self,path,data)
+            send_json(self,p,s)
         elif path=="/contact":
             name=str(data.get("name","")).strip()
             email=str(data.get("email","")).strip().lower()
