@@ -1201,4 +1201,272 @@ prev=b.hash;
 var lines=['<span class="ok">\u2713 CHAIN INTACT \u2014 '+visitChain.length+' blocks re-hashed and verified, genesis to tip.</span>'];
 visitChain.slice(-4).forEach(function(b){lines.push(String(b.n).padStart(3,'0')+' '+b.event+' <span class="h">'+b.hash.slice(0,20)+'\u2026</span>');});
 lines.push('tip <span class="h">'+chainTip.slice(0,32)+'\u2026</span>');
-lines.push('<span style="color:rgba(255,255,255,0.3)">Computed entirely in your brows
+lines.push('<span style="color:rgba(255,255,255,0.3)">Computed entirely in your browser. This is the same verification your auditors run against sebbi.pro/api/verify-chain.</span>');
+out.innerHTML=lines.join('<br>');
+sealBlock('chain verified by visitor');
+}
+
+async function tamperDemo(){
+var out=document.getElementById('vout');
+if(visitChain.length<2){out.innerHTML='Read a little more of the page first \u2014 you need at least two blocks to tamper with.';return;}
+var target=visitChain[1];
+var original=target.event;
+out.innerHTML='You just changed block 002 from <span class="h">\u201c'+original+'\u201d</span> to <span class="h">\u201cnothing happened here\u201d</span>\u2026<br>re-verifying the chain\u2026';
+target.event='nothing happened here';
+await new Promise(function(r){setTimeout(r,900);});
+var prev='GENESIS',broken=-1;
+for(var i=0;i<visitChain.length;i++){
+var b=visitChain[i];
+var re=await sha256hex(b.prev+'|'+b.ts+'|'+b.event);
+if(re!==b.hash||b.prev!==prev){broken=b.n;break;}
+prev=b.hash;
+}
+target.event=original;
+out.innerHTML='You just changed block 002 to <span class="h">\u201cnothing happened here\u201d</span> and re-verified.<br>'
++'<span style="color:#ff9d94">\u2717 CHAIN BROKEN at block '+String(broken).padStart(3,'0')+' \u2014 the stored hash no longer matches the content. Tampering detected instantly.</span><br>'
++'<span class="ok">Block restored. \u2713 Chain intact again.</span><br>'
++'<span style="color:rgba(255,255,255,0.3)">That is the whole product. Edit one record \u2014 even one character \u2014 and every verification from that block forward fails. There is no quiet way to rewrite history.</span>';
+sealBlock('tampering attempt detected');
+}
+
+/* seal the hero headline on load */
+(async function(){
+if(!CRYPTO_OK)return;
+var vn=null;
+try{
+var r=await fetch('/api/visits');var d=await r.json();
+if(d&&d.visits)vn=d.visits;
+}catch(e){}
+var ev=vn?('visitor \u2116 '+vn.toLocaleString('en-GB')+' arrived'):'visit opened';
+var h=await sealBlock(ev);
+var el=document.getElementById('hseal');
+el.innerHTML='This headline was just sealed: <span class="hh">'+h.slice(0,24)+'\u2026</span> \u2014 watch the chain grow as you read \u2192';
+if(vn){
+document.getElementById('vnum').textContent='\u2116 '+vn.toLocaleString('en-GB');
+document.getElementById('vhash').textContent='seal '+h.slice(0,24)+'\u2026';
+document.getElementById('vstamp').style.display='inline-flex';
+}
+})();
+
+/* seal each section when it enters view */
+var names={how:'read: how it works',products:'read: products',packs:'read: signal packs',margin:'used: margin section',referral:'read: referrals','notary-promo':'read: profile notary',law:'read: the law',coverage:'read: coverage map',oversight:'read: human oversight',anchor:'read: external anchoring',network:'read: witness network',notaries:'read: the notaries',conformance:'read: conformance testing',verify:'reached: the proving ground',signup:'reached: signup'};
+var io=new IntersectionObserver(function(entries){
+entries.forEach(function(e){
+if(e.isIntersecting&&!sealedSections[e.target.id]){
+sealedSections[e.target.id]=true;
+sealBlock(names[e.target.id]||('read: '+e.target.id)).then(function(h){
+var s=e.target.querySelector('[data-seal]');
+if(s)s.innerHTML='sealed <b>'+h.slice(0,10)+'\u2026</b>';
+});
+}
+});
+},{threshold:0.25});
+Object.keys(names).forEach(function(id){var el=document.getElementById(id);if(el)io.observe(el);});
+
+/* calculator interaction gets its own block, once */
+var calcSealed=false;
+document.getElementById('charge').addEventListener('input',function(){
+if(!calcSealed){calcSealed=true;sealBlock('calculated a margin');}
+});
+
+/* decision ticker - demo data, labelled by the engine's real reason codes */
+(function(){
+var users=['u_7f2','u_c19','u_a04','u_e88','u_31b','u_9d5','u_f47','u_206'];
+var acts=['payment','login','message','transfer','api_call','checkout'];
+var outs=[['ALLOW','A',0.12,0.34],['ALLOW','A',0.05,0.3],['CHALLENGE','C',0.38,0.65],['ALLOW','A',0.1,0.33],['BLOCK','B',0.72,0.94],['ALLOW','A',0.08,0.3],['CHALLENGE','C',0.4,0.68]];
+var items=[];
+for(var i=0;i<18;i++){
+var o=outs[Math.floor(Math.random()*outs.length)];
+var sc=(o[2]+Math.random()*(o[3]-o[2])).toFixed(2);
+items.push('<span>'+users[i%users.length]+' &middot; '+acts[i%acts.length]+' &rarr; <b class="'+o[1]+'">'+o[0]+'</b> '+sc+' &middot; sealed</span>');
+}
+var half=items.join('');
+document.getElementById('tk').innerHTML=half+half;
+})();
+
+</script>
+
+<script>
+/* Proving Ground - its own block, so a failure here cannot take the page
+   script with it, and a failure there cannot stop this running. */
+function pgTab(which){
+  var run=which==='run';
+  document.getElementById('pgt-run').className='pgtab'+(run?' on':'');
+  document.getElementById('pgt-rev').className='pgtab'+(run?'':' on');
+  document.getElementById('pgp-run').className='pgpanel'+(run?'':' hide');
+  document.getElementById('pgp-rev').className='pgpanel'+(run?' hide':'');
+}
+
+function pgSync(){
+  document.getElementById('pg-trust-v').textContent=parseFloat(document.getElementById('pg-trust').value).toFixed(2);
+  document.getElementById('pg-amount-v').textContent=parseInt(document.getElementById('pg-amount').value).toLocaleString('en-GB');
+  document.getElementById('pg-v60-v').textContent=document.getElementById('pg-v60').value;
+  document.getElementById('pg-dev-v').textContent=parseFloat(document.getElementById('pg-dev').value).toFixed(2);
+  document.getElementById('pg-anom-v').textContent=parseFloat(document.getElementById('pg-anom').value).toFixed(2);
+}
+
+function pgReveal(el){
+  try{ if(el&&el.scrollIntoView){el.scrollIntoView({behavior:'smooth',block:'start'});} }catch(e){}
+}
+
+function pgEsc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+
+function pgFail(el,msg){
+  var box=document.getElementById(el);
+  if(box){box.innerHTML='<div class="pgerr">'+pgEsc(msg)+'</div>';pgReveal(box);}
+}
+
+async function pgPost(path,body){
+  var r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  var d=await r.json();
+  return {status:r.status,data:d};
+}
+
+/* ---- 1. run a decision ---- */
+async function pgRun(){
+  var btn=document.getElementById('pg-run-btn');
+  var out=document.getElementById('pg-result');
+  var label=btn.textContent;
+  btn.disabled=true;btn.textContent='Scoring and sealing\u2026';
+  out.innerHTML='';
+  var payload={
+    trust:parseFloat(document.getElementById('pg-trust').value),
+    amount:parseFloat(document.getElementById('pg-amount').value),
+    v60:parseFloat(document.getElementById('pg-v60').value),
+    v5m:Math.round(parseFloat(document.getElementById('pg-v60').value)*1.6),
+    v1h:Math.round(parseFloat(document.getElementById('pg-v60').value)*4.3),
+    device_risk:parseFloat(document.getElementById('pg-dev').value),
+    anomaly:parseFloat(document.getElementById('pg-anom').value),
+    country:document.getElementById('pg-country').value,
+    country_shift:document.getElementById('pg-shift').checked,
+    action:'payment'
+  };
+  try{
+    var res=await pgPost('/x/demo/govern',payload);
+    if(res.status===429){pgFail('pg-result','That is the rate limit doing its job \u2014 public endpoints are capped per visitor. Give it a minute and try again.');btn.disabled=false;btn.textContent=label;return;}
+    var d=res.data;
+    if(!d||!d.decision){pgFail('pg-result','The engine did not return a decision. '+(d&&d.error?d.error:'Try again shortly.'));btn.disabled=false;btn.textContent=label;return;}
+
+    var reasons=(d.reasons||[]).map(function(x){return '<span>'+pgEsc(x)+'</span>';}).join('');
+    var cf=d.counterfactual_statement||'';
+    var steps=(d.what_just_happened||[]).map(function(x){return '<li>'+pgEsc(x)+'</li>';}).join('');
+    var v=d.verify||{};
+
+    out.innerHTML=
+      '<div class="pgverdictcard">'
+      +'<div class="pgvhead">'
+        +'<span class="pgvword '+pgEsc(d.decision)+'">'+pgEsc(d.decision)+'</span>'
+        +'<span class="pgvscore">score <b>'+pgEsc(d.score)+'</b> &middot; thresholds 0.35 / 0.70</span>'
+        +'<span class="pgvreasons">'+(reasons||'<span>no risk signals tripped</span>')+'</span>'
+      +'</div>'
+      +'<div class="pgrow"><div class="pgrlbl">What would have changed it</div>'
+        +'<div class="pgcf"><div class="big">'+pgEsc(cf.charAt(0).toUpperCase()+cf.slice(1))+'</div>'
+        +'<div class="pgrbody" style="margin-top:10px">Computed by running the scoring function backwards, not estimated. Change that one slider to the stated value and run it again \u2014 you will get the verdict it promises.</div></div></div>'
+      +'<div class="pgrow"><div class="pgrlbl">Sealed into the live chain</div>'
+        +'<div class="pgmono">'
+        +'<em>block</em>'+pgEsc(d.block_index)+'<br>'
+        +'<em>hash</em>'+pgEsc(d.audit_hash)+'<br>'
+        +'<em>check this block</em><a href="'+pgEsc(v.this_block||'#')+'" target="_blank" rel="noopener">'+pgEsc(v.this_block||'')+'</a><br>'
+        +'<em>check the chain</em><a href="'+pgEsc(v.whole_chain||'/api/verify-chain')+'" target="_blank" rel="noopener">/api/verify-chain</a><br>'
+        +'<em>check the clock</em><a href="'+pgEsc(v.external_anchor||'/api/anchor-status')+'" target="_blank" rel="noopener">/api/anchor-status</a>'
+        +'</div></div>'
+      +'<div class="pgrow"><div class="pgrlbl">What just happened</div><ul class="pgsteps">'+steps+'</ul></div>'
+      +'</div>';
+    pgReveal(out);
+    if(typeof sealBlock==='function'){sealBlock('ran a live decision');}
+  }catch(e){
+    pgFail('pg-result','Could not reach the engine. That is a real failure, not a staged one \u2014 try again in a moment.');
+  }
+  btn.disabled=false;btn.textContent=label;
+}
+
+/* ---- 2. take the review ---- */
+var pgCase=null,pgTimer=null,pgStart=0;
+
+function pgTick(){
+  var s=(Date.now()-pgStart)/1000;
+  document.getElementById('pg-clock').textContent=s.toFixed(1)+'s';
+}
+
+async function pgReview(){
+  var out=document.getElementById('pg-rev-result');
+  out.innerHTML='';
+  var seeds=[
+    {amount:9400,v60:18,v5m:29,v1h:77,trust:0.25,device_risk:0.4,anomaly:0.55,country:'XX',country_shift:true},
+    {amount:180,v60:3,v5m:5,v1h:14,trust:0.62,device_risk:0.15,anomaly:0.2,country:'UK',country_shift:false},
+    {amount:2600,v60:11,v5m:19,v1h:52,trust:0.41,device_risk:0.55,anomaly:0.35,country:'DE',country_shift:true},
+    {amount:640,v60:6,v5m:9,v1h:24,trust:0.34,device_risk:0.25,anomaly:0.62,country:'US',country_shift:false}
+  ];
+  var seed=seeds[Math.floor(Math.random()*seeds.length)];
+  try{
+    var res=await pgPost('/x/demo/review',seed);
+    if(res.status===429){pgFail('pg-rev-result','Rate limit reached \u2014 public endpoints are capped per visitor. A minute will clear it.');return;}
+    var d=res.data;
+    if(!d||!d.case_id){pgFail('pg-rev-result','Could not open a case. '+(d&&d.error?d.error:''));return;}
+    pgCase=d.case_id;
+    var m=d.material||{};
+    var pretty={action:'Action',amount:'Amount',country:'Country','60_second_velocity':'Actions in last 60s','5_minute_velocity':'Actions in last 5 min',device_risk:'Device risk',behavioural_anomaly:'Behavioural anomaly',country_changed:'Country changed',trust_history:'Trust history'};
+    var rows='';
+    Object.keys(m).forEach(function(k){
+      var val=m[k];
+      if(k==='amount'){val='\u00a3'+Number(val).toLocaleString('en-GB');}
+      if(typeof val==='boolean'){val=val?'yes':'no';}
+      rows+='<div class="pgmrow"><span class="pgmk">'+pgEsc(pretty[k]||k)+'</span><span class="pgmv">'+pgEsc(val)+'</span></div>';
+    });
+    document.getElementById('pg-material').innerHTML=rows;
+    document.getElementById('pg-case').className='pgcase';
+    document.getElementById('pg-rev-start').style.display='none';
+    pgReveal(document.getElementById('pg-case'));
+    pgStart=Date.now();
+    document.getElementById('pg-clock').textContent='0.0s';
+    if(pgTimer){clearInterval(pgTimer);}
+    pgTimer=setInterval(pgTick,100);
+  }catch(e){
+    pgFail('pg-rev-result','Could not reach the engine. Try again in a moment.');
+  }
+}
+
+async function pgCommit(v){
+  if(!pgCase){return;}
+  if(pgTimer){clearInterval(pgTimer);pgTimer=null;}
+  var out=document.getElementById('pg-rev-result');
+  document.getElementById('pg-case').className='pgcase hide';
+  out.innerHTML='<div class="pgmono" style="text-align:center">sealing your verdict\u2026</div>';
+  try{
+    var res=await pgPost('/x/demo/commit',{case_id:pgCase,verdict:v});
+    var d=res.data;
+    if(!d||!d.your_verdict){pgFail('pg-rev-result','Could not seal that. '+(d&&d.error?d.error:''));return;}
+    var agree=d.agreed;
+    var flag=d.flag?'<div class="pgflag"><b>Flagged:</b> '+pgEsc(d.flag)+'</div>':'';
+    var steps=(d.what_just_happened||[]).map(function(x){return '<li>'+pgEsc(x)+'</li>';}).join('');
+    out.innerHTML=
+      '<div class="pgcompare">'
+       +'<div class="pgc"><div class="pgclbl">You said</div><div class="pgcval '+pgEsc(d.your_verdict)+'" style="color:'+(d.your_verdict==='ALLOW'?'var(--allow)':d.your_verdict==='BLOCK'?'var(--block)':'var(--challenge)')+'">'+pgEsc(d.your_verdict)+'</div></div>'
+       +'<div class="pgc"><div class="pgclbl">The engine said</div><div class="pgcval" style="color:'+(d.machine_verdict==='ALLOW'?'var(--allow)':d.machine_verdict==='BLOCK'?'var(--block)':'var(--challenge)')+'">'+pgEsc(d.machine_verdict)+'</div><div class="pgmono" style="margin-top:8px">score '+pgEsc(d.machine_score)+'</div></div>'
+      +'</div>'
+      +'<div class="pgverdictcard" style="margin-top:18px">'
+      +'<div class="pgrow"><div class="pgrlbl">'+(agree?'You agreed':'You diverged')+'</div><div class="pgrbody">'+pgEsc(d.note||'')+'</div></div>'
+      +'<div class="pgrow"><div class="pgrlbl">Time on the case</div><div class="pgrbody"><b>'+pgEsc(d.dwell_seconds)+' seconds</b>, sealed with your verdict. On a live deployment this sits in the reviewer\u2019s record permanently, and a pattern of very fast decisions is visible to an auditor whether or not anyone is watching at the time.</div>'+flag+'</div>'
+      +'<div class="pgrow"><div class="pgrlbl">The order, fixed</div><ul class="pgsteps">'+steps+'</ul>'
+        +'<div class="pgmono" style="margin-top:10px"><em>your block</em>'+pgEsc(d.block_index)+'<br><em>hash</em>'+pgEsc(d.audit_hash)+'<br><em>verify</em><a href="/api/verify-chain" target="_blank" rel="noopener">/api/verify-chain</a></div></div>'
+      +'</div>'
+      +'<div class="pgactions"><button class="bghost" onclick="pgAgain()">Take another case</button></div>';
+    pgReveal(out);
+    if(typeof sealBlock==='function'){sealBlock('took the review challenge');}
+  }catch(e){
+    pgFail('pg-rev-result','Could not reach the engine. Try again in a moment.');
+  }
+  pgCase=null;
+}
+
+function pgAgain(){
+  document.getElementById('pg-rev-result').innerHTML='';
+  document.getElementById('pg-rev-start').style.display='';
+  pgReview();
+}
+
+try{pgSync();}catch(e){if(window.console)console.error('proving ground init:',e);}
+</script>
+
+</body>
+</html>
