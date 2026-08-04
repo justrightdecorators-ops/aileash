@@ -8,20 +8,20 @@ Generated automatically on every push. Do not edit by hand.
 
 ## [CODEBASE-02.md](CODEBASE-02.md)
 
-- `modules/Fingerprint.py`
 - `modules/_ _ i n i t _ _ . p y`
 - `modules/capture.py`
 - `modules/codebase.py`
 - `modules/complete.py`
 - `modules/conformance.py`
+- `modules/consistency.py`
 
 ## [CODEBASE-03.md](CODEBASE-03.md)
 
-- `modules/consistency.py`
 - `modules/counterfactual.py`
 - `modules/declare.py`
 - `modules/demo.py`
 - `modules/dsr.py`
+- `modules/fingerprint.py`
 - `modules/lineage.py`
 
 ## [CODEBASE-04.md](CODEBASE-04.md)

@@ -1,481 +1,12 @@
 # Codebase — part 3 of 15
 
 Contains:
-- `modules/consistency.py`
 - `modules/counterfactual.py`
 - `modules/declare.py`
 - `modules/demo.py`
 - `modules/dsr.py`
+- `modules/fingerprint.py`
 - `modules/lineage.py`
-
-
-## `modules/consistency.py`
-
-461 lines, 19146 bytes
-
-```python
-#!/usr/bin/env python3
-"""
-modules/consistency.py  -  proving we have never run two histories
-==================================================================
-
-THE ATTACK NOTHING ELSE HERE STOPS
-----------------------------------
-Mutual witnessing means several parties hold hashes of our chain. What
-none of them can currently check is whether they are all holding hashes of
-the SAME chain.
-
-Nothing in the design so far stops an operator running two histories in
-parallel. Serve chain A to one witness, chain B to an auditor. Both get a
-valid-looking tip. Both anchor it. Both verify perfectly against the copy
-they were given. Neither can tell, because there is no way to ask the
-question that would expose it:
-
-    is the tip you are holding actually an ancestor of my current head?
-
-That is the split-view attack. Witnessing does not stop it. Anchoring does
-not stop it - two forks can both be anchored. It is the last place an
-operator can lie, and it is the one nobody in compliance has closed,
-because the defence came out of Certificate Transparency and has not
-crossed over.
-
-WHAT THIS DOES
---------------
-Builds an ordered Merkle tree over the audit chain and answers one
-question for anybody, forever, without our cooperation:
-
-    GET /x/consistency/ancestor?tip=<any tip we ever served>
-
-If that tip is on our chain, we return its position and a proof, against
-our current head, that it is still there and still in the same place. If
-it is not on our chain, we say so - and the party holding it knows they
-were served a history we no longer stand behind.
-
-Every witness can check every tip they have ever held, automatically, on a
-timer, for as long as they keep the tips. Which means we cannot show two
-faces to the network: the moment any holder of any old tip checks it, a
-fork stops being hidden and becomes provable arithmetic.
-
-APPEND-ONLY, PROVED RATHER THAN ASSERTED
-----------------------------------------
-    GET /x/consistency/proof?first=21&second=48
-
-Proves the log at size 21 is a PREFIX of the log at size 48. Not that both
-exist - that the second was reached from the first by appending only, with
-nothing inserted, removed or reordered in between. That is the actual
-meaning of "append-only", and until now it has been a claim rather than
-something a stranger could check.
-
-WHY THE MATHS IS BORROWED, NOT INVENTED
----------------------------------------
-The tree here follows RFC 6962 - Certificate Transparency - deliberately,
-including its leaf and node prefixes and its split at the largest power of
-two. Anyone who has implemented a CT verifier can point it at this and it
-will work. Inventing a bespoke tree would mean nobody could check us
-without writing new code first, which is the opposite of the point.
-
-Note this tree is ORDERED, unlike the sorted tree in modules/complete.py.
-The two answer different questions. Sorted proves what is absent. Ordered
-proves nothing was reordered. They are not interchangeable and both are
-needed.
-
-HONEST LIMITS
--------------
-  - This proves our published chain is internally append-only and that a
-    given tip belongs to it. It says nothing about whether an entry should
-    have been written in the first place.
-  - A fork is only DETECTED if someone actually checks a tip they were
-    given. The network has to do its half. That is why the route is public
-    and needs no account - so checking costs nothing and can be automated.
-  - If nobody ever holds an old tip of ours, there is nothing to check us
-    against. Detection scales with how many witnesses keep history, which
-    is another reason breadth matters more than depth.
-  - Recomputation is O(n) hashing over the chain. Cached per size. On a
-    very large log a checkpoint-based approach would be better; that is
-    written down rather than hidden.
-
-    GET  /x/consistency/root         current size and root      (public)
-    GET  /x/consistency/ancestor     is this tip on our chain    (public)
-    GET  /x/consistency/proof        prefix proof between sizes  (public)
-    GET  /x/consistency/spec         the exact hashing rules     (public)
-    POST /x/consistency/verify       check a proof we gave out   (public)
-    POST /x/consistency/checkpoint   seal the current root       (keyed)
-"""
-
-import hashlib
-import re
-import threading
-import time
-from datetime import datetime, timezone
-
-VERSION = "1.0"
-HEX64 = re.compile(r"^[0-9a-f]{64}$")
-
-# All the read routes are open. A consistency check you need an account to
-# run is worthless - the party most likely to want it is the one who has
-# stopped trusting us.
-PUBLIC = {("GET", "root"), ("GET", "ancestor"), ("GET", "proof"),
-          ("GET", "spec"), ("POST", "verify")}
-
-# RFC 6962 domain separation. Leaf and internal hashes must never be
-# confusable or an internal node can be passed off as a leaf.
-LEAF_BYTE = b"\x00"
-NODE_BYTE = b"\x01"
-
-MAX_LEAVES = 500000
-
-_ready = False
-_cache = {"size": -1, "leaves": [], "root": None, "built": 0}
-_cache_lock = threading.Lock()
-
-
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        c = ctx["conn"]
-        c.execute("CREATE TABLE IF NOT EXISTS consistency_checkpoint("
-                  "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,tree_size INTEGER,"
-                  "root TEXT,taken REAL,audit_hash TEXT,block_index INTEGER)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_cons_size "
-                  "ON consistency_checkpoint(tree_size)")
-        c.commit()
-    _ready = True
-
-
-def _iso(ts):
-    if not ts:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
-
-# ----------------------------------------------------------------------
-# RFC 6962 tree
-# ----------------------------------------------------------------------
-
-def _leaf(value):
-    return hashlib.sha256(LEAF_BYTE + value.encode("utf-8")).digest()
-
-
-def _node(left, right):
-    return hashlib.sha256(NODE_BYTE + left + right).digest()
-
-
-def _split(n):
-    """Largest power of two strictly less than n. RFC 6962 splits here."""
-    k = 1
-    while k * 2 < n:
-        k *= 2
-    return k
-
-
-def _mth(leaves):
-    """Merkle Tree Hash over an ordered slice. Returns raw bytes."""
-    n = len(leaves)
-    if n == 0:
-        return hashlib.sha256(b"").digest()
-    if n == 1:
-        return _leaf(leaves[0])
-    k = _split(n)
-    return _node(_mth(leaves[:k]), _mth(leaves[k:]))
-
-
-def _inclusion(index, leaves):
-    """Audit path for leaf at index within this slice. Raw bytes list."""
-    n = len(leaves)
-    if n <= 1:
-        return []
-    k = _split(n)
-    if index < k:
-        return _inclusion(index, leaves[:k]) + [_mth(leaves[k:])]
-    return _inclusion(index - k, leaves[k:]) + [_mth(leaves[:k])]
-
-
-def _subproof(m, leaves, is_root):
-    n = len(leaves)
-    if m == n:
-        return [] if is_root else [_mth(leaves)]
-    k = _split(n)
-    if m <= k:
-        return _subproof(m, leaves[:k], is_root) + [_mth(leaves[k:])]
-    return _subproof(m - k, leaves[k:], False) + [_mth(leaves[:k])]
-
-
-def _consistency(m, leaves):
-    """Proof that the tree of the first m leaves is a prefix of this one."""
-    if m <= 0 or m > len(leaves):
-        return None
-    if m == len(leaves):
-        return []
-    return _subproof(m, leaves, True)
-
-
-def _hexed(nodes):
-    return [n.hex() for n in nodes]
-
-
-# ----------------------------------------------------------------------
-# reading the chain
-# ----------------------------------------------------------------------
-
-def _load(ctx):
-    """Every audit hash in order, cached until the chain grows.
-
-    Order is the point here - this is not the sorted tree from
-    modules/complete.py and the two must never be confused.
-    """
-    with ctx["lock"]:
-        row = ctx["conn"].execute("SELECT COUNT(*) FROM audit_log").fetchone()
-    size = int(row[0]) if row else 0
-
-    with _cache_lock:
-        if _cache["size"] == size and _cache["root"] is not None:
-            return _cache["leaves"], _cache["root"], size, None
-
-    if size > MAX_LEAVES:
-        return None, None, size, "chain holds %d entries, above the %d cap for live recomputation" % (size, MAX_LEAVES)
-
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT audit_hash FROM audit_log ORDER BY id ASC").fetchall()
-    leaves = [str(r[0]) for r in rows if r[0]]
-    root = _mth(leaves)
-
-    with _cache_lock:
-        _cache["size"] = len(leaves)
-        _cache["leaves"] = leaves
-        _cache["root"] = root
-        _cache["built"] = time.time()
-
-    return leaves, root, len(leaves), None
-
-
-# ----------------------------------------------------------------------
-# routes
-# ----------------------------------------------------------------------
-
-def _root(ctx):
-    leaves, root, size, why = _load(ctx)
-    if why:
-        return {"error": "too_large", "message": why, "tree_size": size}, 503
-    return {"tree_size": size, "root": root.hex(), "consistency_version": VERSION,
-            "algorithm": "RFC 6962 Merkle Tree Hash over audit hashes in write order",
-            "note": "Record this alongside any tip you hold. Later you can ask us to prove the "
-                    "log you saw is a prefix of the log we serve today.",
-            "check": "/x/consistency/proof?first=<your size>&second=%d" % size,
-            "spec": "/x/consistency/spec"}, 200
-
-
-def _ancestor(ctx, data):
-    tip = str(data.get("tip", "")).strip().lower()
-    if not tip:
-        return {"error": "tip_required",
-                "message": "Any tip we ever served you. We will prove whether it is still on "
-                           "the chain we serve now."}, 400
-
-    leaves, root, size, why = _load(ctx)
-    if why:
-        return {"error": "too_large", "message": why, "tree_size": size}, 503
-
-    try:
-        index = leaves.index(tip)
-    except ValueError:
-        return {"on_chain": False, "tip": tip, "tree_size": size, "root": root.hex(),
-                "what_this_means": "This tip is not in the chain we serve. Either it was never "
-                                   "ours, or it belongs to a history we are no longer publishing. "
-                                   "If we gave you this tip, that is a fork and you now have "
-                                   "evidence of it.",
-                "keep_this": "This response, the tip, and whatever we originally sent you with "
-                             "it. Together they are the record of the discrepancy.",
-                "consistency_version": VERSION}, 409
-
-    path = _inclusion(index, leaves)
-    return {"on_chain": True, "tip": tip, "leaf_index": index, "height": index + 1,
-            "tree_size": size, "root": root.hex(),
-            "inclusion_proof": _hexed(path),
-            "consistency_version": VERSION,
-            "what_this_proves": "This tip sits at position %d of a chain of %d, and the current "
-                                "root recomputes from it. It has not been moved, removed or "
-                                "reordered since we gave it to you." % (index, size),
-            "verify_yourself": "/x/consistency/spec has the rules. Recompute upward from the "
-                               "leaf and compare with the root above.",
-            "prefix_proof": "/x/consistency/proof?first=%d&second=%d" % (index + 1, size)}, 200
-
-
-def _proof(ctx, data):
-    try:
-        first = int(data.get("first", 0))
-        second = int(data.get("second", 0) or 0)
-    except (TypeError, ValueError):
-        return {"error": "bad_sizes", "message": "first and second are tree sizes, as integers"}, 400
-
-    leaves, root, size, why = _load(ctx)
-    if why:
-        return {"error": "too_large", "message": why, "tree_size": size}, 503
-    if not second:
-        second = size
-    if first < 1 or first > second or second > size:
-        return {"error": "bad_range",
-                "message": "Need 1 <= first <= second <= %d" % size,
-                "tree_size": size}, 400
-
-    older = leaves[:first]
-    newer = leaves[:second]
-    proof = _consistency(first, newer)
-    if proof is None:
-        return {"error": "no_proof", "message": "could not build a proof for that range"}, 400
-
-    return {"first": first, "second": second,
-            "first_root": _mth(older).hex(),
-            "second_root": _mth(newer).hex(),
-            "consistency_proof": _hexed(proof),
-            "consistency_version": VERSION,
-            "what_this_proves": "The log at size %d is a prefix of the log at size %d. Nothing "
-                                "was inserted, removed or reordered between them - only "
-                                "appended. That is what append-only actually means, and this is "
-                                "it demonstrated rather than asserted." % (first, second),
-            "algorithm": "RFC 6962 section 2.1.2",
-            "spec": "/x/consistency/spec"}, 200
-
-
-def _verify(data):
-    """Recompute an inclusion proof. Convenience only - anyone relying on
-    us to check our own proof has not checked anything."""
-    leaf_value = str(data.get("leaf", data.get("tip", ""))).strip().lower()
-    index = data.get("index", data.get("leaf_index"))
-    size = data.get("tree_size")
-    root = str(data.get("root", "")).strip().lower()
-    proof = data.get("inclusion_proof", data.get("proof"))
-
-    if not leaf_value or not HEX64.match(root) or not isinstance(proof, list):
-        return {"error": "leaf_root_and_proof_required"}, 400
-    try:
-        index = int(index)
-        size = int(size)
-    except (TypeError, ValueError):
-        return {"error": "index_and_tree_size_required"}, 400
-    if index < 0 or size <= 0 or index >= size:
-        return {"error": "index_out_of_range"}, 400
-
-    current = _leaf(leaf_value)
-    node_index, last_index = index, size - 1
-    try:
-        for step in proof:
-            sibling = bytes.fromhex(str(step))
-            if node_index % 2 == 1 or node_index == last_index:
-                if node_index % 2 == 1:
-                    current = _node(sibling, current)
-                else:
-                    current = _node(sibling, current)
-                while node_index % 2 == 0 and node_index != 0:
-                    node_index //= 2
-                    last_index //= 2
-            else:
-                current = _node(current, sibling)
-            node_index //= 2
-            last_index //= 2
-    except Exception as exc:
-        return {"error": "bad_proof", "message": str(exc)[:200]}, 400
-
-    return {"valid": current.hex() == root,
-            "computed_root": current.hex(), "given_root": root,
-            "note": "Recomputed from the leaf upward using RFC 6962 audit path rules."}, 200
-
-
-def _checkpoint(ctx, api_key):
-    """Seal the current size and root into the chain itself.
-
-    A checkpoint is our own signature on 'this is what the log looked like
-    at this moment'. Once anchored, publishing a different history for that
-    size contradicts something we already sealed and externally timestamped.
-    """
-    leaves, root, size, why = _load(ctx)
-    if why:
-        return {"error": "too_large", "message": why, "tree_size": size}, 503
-
-    now = time.time()
-    root_hex = root.hex()
-    ev = {"user_id": "cons:%d" % size, "action": "consistency_checkpoint", "amount": 0,
-          "country": "UK", "device_id": "consistency", "anomaly": 0, "device_risk": 0}
-    res = {"decision": "CHECKPOINT_SEALED", "score": 0, "consistency_version": VERSION,
-           "tree_size": size, "root": root_hex,
-           "detail": "size=%d;root=%s" % (size, root_hex)}
-    audit_hash, block_index, seq = ctx["seal"](ev, res, now, api_key)
-
-    with ctx["lock"]:
-        ctx["conn"].execute("INSERT INTO consistency_checkpoint(api_key,tree_size,root,taken,"
-                            "audit_hash,block_index) VALUES(?,?,?,?,?,?)",
-                            (api_key, size, root_hex, now, audit_hash, block_index))
-        ctx["conn"].commit()
-
-    return {"tree_size": size, "root": root_hex, "taken_at": _iso(now),
-            "sealed_in_chain": audit_hash, "block_index": block_index, "receipt_seq": seq,
-            "what_this_does": "Commits our own view of the log at this size, inside the log, "
-                              "where it gets anchored with everything else. Serving a different "
-                              "history for this size now contradicts a sealed, timestamped "
-                              "record of our own making.",
-            "note": "The checkpoint itself becomes an entry, so the next size is larger. That is "
-                    "expected and does not affect the proof for this one."}, 200
-
-
-def _spec():
-    return {
-        "consistency_version": VERSION,
-        "based_on": "RFC 6962 (Certificate Transparency), deliberately unmodified so existing "
-                    "verifiers work against this without new code",
-        "leaves": "the audit_hash of every chain entry, in write order (id ascending), as "
-                  "lowercase hex strings encoded UTF-8",
-        "empty_root": hashlib.sha256(b"").hexdigest(),
-        "leaf_hash": "sha256(0x00 || leaf_value_utf8)",
-        "node_hash": "sha256(0x01 || left || right)",
-        "split": "for n > 1 leaves, split at k = the largest power of two strictly less than n",
-        "inclusion": "RFC 6962 section 2.1.1 audit path",
-        "consistency": "RFC 6962 section 2.1.2 - proves the tree at size m is a prefix of the "
-                       "tree at size n",
-        "ordered_not_sorted": "This tree is in write order. /x/complete uses a SORTED tree, "
-                              "which answers a different question (absence). Do not confuse the "
-                              "two - the roots will not match and are not meant to.",
-        "how_to_catch_us": "Keep every tip and root we ever hand you. Ask /x/consistency/ancestor "
-                           "about the old ones on a timer. If one ever comes back on_chain false, "
-                           "or a prefix proof fails to verify, we have served two histories and "
-                           "you can prove it without our help.",
-        "why_published": "Because a log nobody can check is a log you are being asked to trust.",
-    }, 200
-
-
-# ----------------------------------------------------------------------
-# router entry point
-# ----------------------------------------------------------------------
-
-def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-    action = (action or "").strip("/").lower()
-    data = data or {}
-
-    if method == "GET":
-        if action == "spec":
-            return _spec()
-        if action == "root":
-            return _root(ctx)
-        if action == "ancestor":
-            return _ancestor(ctx, data)
-        if action == "proof":
-            return _proof(ctx, data)
-
-    if method == "POST":
-        if action == "verify":
-            return _verify(data)
-        if not api_key:
-            return {"error": "invalid_api_key"}, 401
-        if action == "checkpoint":
-            return _checkpoint(ctx, api_key)
-
-    return {"error": "unknown_action", "action": action,
-            "GET": ["spec", "root", "ancestor", "proof"],
-            "POST": ["verify", "checkpoint"]}, 404
-
-```
 
 
 ## `modules/counterfactual.py`
@@ -1845,6 +1376,564 @@ def handle(method, action, data, api_key, ctx):
                 return {"error": "id_required"}, 400
             return _timeline(ctx, api_key, rid)
     return {"error": "unknown_action", "action": action}, 404
+
+```
+
+
+## `modules/fingerprint.py`
+
+550 lines, 22358 bytes
+
+```python
+"""
+modules/fingerprint.py  -  is somebody else running my scoring function?
+
+THE IDEA
+--------
+The scoring engine is deterministic. Identical inputs give an identical score,
+every time, forever. That is a compliance property - and it is also a
+signature.
+
+So: fire a fixed battery of carefully chosen inputs at any scoring endpoint,
+fire the same battery at our own, and compare the two sets of numbers.
+
+  identical across 24 varied vectors        it is this function
+  identical shape, different scale          it is this function, reweighted
+  same ordering, different curve            similar design, not this code
+  unrelated                                 unrelated
+
+WHY THE VECTORS ARE CHOSEN THE WAY THEY ARE
+-------------------------------------------
+Random inputs would only catch a straight copy. These are picked to probe the
+specific design decisions in the function, because those are what survive
+someone renaming things or nudging a weight:
+
+  saturation points   velocity terms saturate at different counts per window,
+                      so a burst and a grind separate. Vectors sit either side
+                      of each saturation point.
+  curve shape         amount is log-scaled, so small sums move the score far
+                      more than large ones. Vectors walk that curve.
+  normalisation       the continuous weights sum to 1.00 and the boolean
+                      geography terms sit outside it. Vectors isolate that.
+  asymmetry           trust contributes inversely and dominates. Vectors sweep
+                      trust alone with everything else held flat.
+
+A copy that renamed every field and changed nothing else matches exactly. A
+copy that shifted the weights still tracks the shape, because the saturation
+points and the log curve are structural rather than parametric.
+
+WHAT IT CANNOT DO
+-----------------
+It only sees endpoints it can reach. A private product behind a key with no
+free tier is invisible to this, and no amount of cleverness changes that.
+
+It also proves similarity, never theft. Two people can converge on similar
+weights honestly. What this produces is a dated, sealed measurement - which is
+evidence, not a verdict, and the distinction matters if it is ever put in
+front of anyone.
+
+EVERY RUN IS SEALED
+-------------------
+The probe, the target, the vectors and the result all go into the chain. So a
+comparison run today is provable as having been run today, rather than
+assembled afterwards to fit an argument.
+
+ROUTES  (all keyed - this is not a public toy)
+----------------------------------------------
+  POST /x/fingerprint/self      score the battery on our own engine
+  POST /x/fingerprint/probe     url, plus optional field mapping. Compare.
+  GET  /x/fingerprint/history   previous probes and their verdicts
+  GET  /x/fingerprint/vectors   the battery itself
+  GET  /x/fingerprint/spec      what a verdict means and does not mean
+"""
+
+import ipaddress
+import json
+import math
+import socket
+import sys
+import time
+import urllib.error
+import urllib.request
+from urllib.parse import urlparse
+
+VERSION = "1.0"
+
+PUBLIC = set()          # nothing public. deliberately.
+
+FETCH_TIMEOUT = 10
+MAX_BYTES = 200000
+POLITE_DELAY = 0.4      # do not hammer somebody else's server
+ALLOWED_SCHEMES = ("http", "https")
+ALLOWED_PORTS = (80, 443)
+
+# Where the live scorer might be found. Same approach as replay.py - look it
+# up at runtime, never import server.py.
+SCORER_NAMES = ["score_event", "score", "_score_event"]
+
+_ready = False
+
+
+# ----------------------------------------------------------------------
+# the battery
+# ----------------------------------------------------------------------
+# Each vector is (label, signals). Signals use the engine's own internal
+# names; the probe maps them to whatever the target calls things.
+
+def _v(trust=0.5, v60=0, v5m=0, v1h=0, amount=0.0,
+       device_risk=0.0, anomaly=0.0, country_shift=False, unsafe_country=False):
+    return {"trust": trust, "v60": v60, "v5m": v5m, "v1h": v1h,
+            "amount": amount, "device_risk": device_risk, "anomaly": anomaly,
+            "country_shift": country_shift, "unsafe_country": unsafe_country}
+
+
+VECTORS = [
+    # --- trust sweep, everything else flat. Isolates the dominant term.
+    ("trust-000", _v(trust=0.00)),
+    ("trust-025", _v(trust=0.25)),
+    ("trust-050", _v(trust=0.50)),
+    ("trust-075", _v(trust=0.75)),
+    ("trust-100", _v(trust=1.00)),
+
+    # --- velocity: either side of each window's saturation point.
+    ("v60-under",   _v(v60=10)),
+    ("v60-at",      _v(v60=20)),
+    ("v60-over",    _v(v60=40)),      # saturated: must equal v60-at
+    ("v5m-under",   _v(v5m=25)),
+    ("v5m-at",      _v(v5m=50)),
+    ("v5m-over",    _v(v5m=100)),     # saturated
+    ("v1h-under",   _v(v1h=100)),
+    ("v1h-at",      _v(v1h=200)),
+    ("v1h-over",    _v(v1h=400)),     # saturated
+
+    # --- burst vs grind: same total actions, different distribution.
+    ("burst",       _v(v60=20, v5m=20, v1h=20)),
+    ("grind",       _v(v60=1,  v5m=8,  v1h=200)),
+
+    # --- amount: walks the log curve. Small steps low, big steps high.
+    ("amt-10",      _v(amount=10.0)),
+    ("amt-100",     _v(amount=100.0)),
+    ("amt-1000",    _v(amount=1000.0)),
+    ("amt-10000",   _v(amount=10000.0)),
+    ("amt-50000",   _v(amount=50000.0)),   # saturated
+
+    # --- the boolean geography terms, isolated.
+    ("geo-shift",   _v(country_shift=True)),
+    ("geo-unsafe",  _v(unsafe_country=True)),
+    ("geo-both",    _v(country_shift=True, unsafe_country=True)),
+
+    # --- the other two continuous signals.
+    ("dev-risk",    _v(device_risk=1.0)),
+    ("anomaly",     _v(anomaly=1.0)),
+
+    # --- everything at once. Tests the clamp and the normalisation.
+    ("max-all",     _v(trust=0.0, v60=40, v5m=100, v1h=400, amount=50000.0,
+                       device_risk=1.0, anomaly=1.0,
+                       country_shift=True, unsafe_country=True)),
+    ("min-all",     _v(trust=1.0)),
+]
+
+# Default mapping from our internal signal names to a target's request body.
+DEFAULT_FIELDS = {
+    "trust": "trust", "v60": "v60", "v5m": "v5m", "v1h": "v1h",
+    "amount": "amount", "device_risk": "device_risk", "anomaly": "anomaly",
+    "country_shift": "country_shift", "unsafe_country": "unsafe_country",
+}
+SCORE_KEYS = ["score", "risk_score", "value", "result", "rating", "confidence"]
+
+
+def _setup(ctx):
+    global _ready
+    if _ready:
+        return
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "CREATE TABLE IF NOT EXISTS fingerprint_probe("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,target TEXT,"
+            "ran REAL,vectors INTEGER,answered INTEGER,exact INTEGER,"
+            "verdict TEXT,correlation REAL,detail TEXT,audit_hash TEXT,"
+            "block_index INTEGER)")
+        ctx["conn"].execute(
+            "CREATE INDEX IF NOT EXISTS idx_fp_target ON fingerprint_probe(target)")
+        ctx["conn"].commit()
+    _ready = True
+
+
+# ----------------------------------------------------------------------
+# our own engine
+# ----------------------------------------------------------------------
+
+def _find_scorer():
+    for modname in ("__main__", "server"):
+        mod = sys.modules.get(modname)
+        if not mod:
+            continue
+        for name in SCORER_NAMES:
+            fn = getattr(mod, name, None)
+            if callable(fn):
+                return fn, modname + "." + name
+    return None, None
+
+
+def _score_locally():
+    """Run the battery through the live engine. Returns (scores, source, error)."""
+    fn, where = _find_scorer()
+    if not fn:
+        return None, None, ("could not find the scoring function at runtime - "
+                            "add its name to SCORER_NAMES")
+    out = []
+    for label, signals in VECTORS:
+        try:
+            result = fn(dict(signals))
+            score = result[0] if isinstance(result, (tuple, list)) else result
+            out.append((label, round(float(score), 6)))
+        except Exception as exc:
+            return None, where, "scorer raised on %s: %s" % (label, exc)
+    return out, where, None
+
+
+# ----------------------------------------------------------------------
+# reaching a target - same guards as witness.py
+# ----------------------------------------------------------------------
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_opener = urllib.request.build_opener(_NoRedirect)
+
+
+def _url_allowed(url):
+    if not url or not isinstance(url, str) or len(url) > 500:
+        return False, "no usable url"
+    try:
+        parts = urlparse(url.strip())
+    except Exception:
+        return False, "unparseable url"
+    if parts.scheme not in ALLOWED_SCHEMES:
+        return False, "scheme not allowed"
+    host = parts.hostname
+    if not host:
+        return False, "no host in url"
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    if port not in ALLOWED_PORTS:
+        return False, "port not allowed"
+    try:
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+    except Exception as exc:
+        return False, "could not resolve host (%s)" % type(exc).__name__
+    for info in infos:
+        try:
+            addr = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return False, "unreadable address"
+        if (addr.is_private or addr.is_loopback or addr.is_link_local
+                or addr.is_reserved or addr.is_multicast or addr.is_unspecified):
+            return False, "address is not publicly routable"
+    return True, None
+
+
+def _post(url, body, headers=None):
+    data = json.dumps(body).encode("utf-8")
+    h = {"Content-Type": "application/json", "Accept": "application/json",
+         "User-Agent": "aileash-fingerprint/%s" % VERSION}
+    if headers:
+        h.update(headers)
+    request = urllib.request.Request(url, data=data, headers=h, method="POST")
+    try:
+        with _opener.open(request, timeout=FETCH_TIMEOUT) as response:
+            raw = response.read(MAX_BYTES)
+            status = response.getcode()
+    except urllib.error.HTTPError as exc:
+        try:
+            raw = exc.read(MAX_BYTES)
+        except Exception:
+            raw = b""
+        status = exc.code
+    except Exception as exc:
+        return 0, "unreachable (%s)" % type(exc).__name__
+    try:
+        return status, json.loads(raw.decode("utf-8", "replace"))
+    except Exception:
+        return status, raw.decode("utf-8", "replace")[:300]
+
+
+def _extract_score(payload, key_hint=None):
+    """Pull a 0..1 style number out of whatever came back."""
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    if not isinstance(payload, dict):
+        return None
+    keys = ([key_hint] if key_hint else []) + SCORE_KEYS
+    for k in keys:
+        if k and k in payload:
+            v = payload[k]
+            if isinstance(v, (int, float)):
+                return float(v)
+            try:
+                return float(str(v).strip())
+            except (TypeError, ValueError):
+                pass
+    # one level down
+    for v in payload.values():
+        if isinstance(v, dict):
+            found = _extract_score(v, key_hint)
+            if found is not None:
+                return found
+    return None
+
+
+# ----------------------------------------------------------------------
+# comparison
+# ----------------------------------------------------------------------
+
+def _pearson(a, b):
+    n = len(a)
+    if n < 3:
+        return None
+    ma = sum(a) / n
+    mb = sum(b) / n
+    va = sum((x - ma) ** 2 for x in a)
+    vb = sum((y - mb) ** 2 for y in b)
+    if va <= 0 or vb <= 0:
+        return None
+    cov = sum((a[i] - ma) * (b[i] - mb) for i in range(n))
+    return cov / math.sqrt(va * vb)
+
+
+def _rank(values):
+    order = sorted(range(len(values)), key=lambda i: values[i])
+    ranks = [0.0] * len(values)
+    for position, index in enumerate(order):
+        ranks[index] = float(position)
+    return ranks
+
+
+def _compare(ours, theirs):
+    """ours/theirs are lists of (label, score). theirs may contain None."""
+    paired = [(l, o, t) for (l, o), (_, t) in zip(ours, theirs) if t is not None]
+    answered = len(paired)
+    if answered < 3:
+        return {"verdict": "INCONCLUSIVE", "answered": answered,
+                "why": "too few vectors came back to compare anything"}
+
+    a = [p[1] for p in paired]
+    b = [p[2] for p in paired]
+    exact = sum(1 for i in range(answered) if abs(a[i] - b[i]) < 1e-6)
+    close = sum(1 for i in range(answered) if abs(a[i] - b[i]) < 0.01)
+    pearson = _pearson(a, b)
+    spearman = _pearson(_rank(a), _rank(b))
+
+    # a linear fit: are they our scores, scaled and shifted?
+    ma, mb = sum(a) / answered, sum(b) / answered
+    va = sum((x - ma) ** 2 for x in a)
+    slope = (sum((a[i] - ma) * (b[i] - mb) for i in range(answered)) / va) if va > 0 else None
+    intercept = (mb - slope * ma) if slope is not None else None
+    residual = None
+    if slope is not None:
+        residual = max(abs(b[i] - (slope * a[i] + intercept)) for i in range(answered))
+
+    if exact == answered:
+        verdict = "IDENTICAL"
+        why = ("Every vector matched to six decimal places. Two independently "
+               "written scoring functions do not do this.")
+    elif exact >= answered * 0.8:
+        verdict = "IDENTICAL"
+        why = ("%d of %d vectors matched exactly. The rest are consistent with "
+               "a small local change on top of the same function." % (exact, answered))
+    elif residual is not None and residual < 0.02 and pearson and pearson > 0.99:
+        verdict = "DERIVED"
+        why = ("Not identical, but every score fits ours scaled by %.3f and "
+               "shifted by %.3f, within %.4f. That is this function reweighted, "
+               "not a different one." % (slope, intercept, residual))
+    elif spearman is not None and spearman > 0.95:
+        verdict = "SAME SHAPE"
+        why = ("Different numbers, but the same ordering across the battery "
+               "(rank correlation %.3f). Consistent with the same design - the "
+               "same saturation points and the same curve - rather than the "
+               "same code." % spearman)
+    elif pearson is not None and pearson > 0.8:
+        verdict = "SIMILAR"
+        why = ("Correlated (%.3f) but not tightly. Risk scorers tend to agree "
+               "roughly on what looks risky, so this is weak on its own." % pearson)
+    else:
+        verdict = "UNRELATED"
+        why = "No meaningful relationship to our scoring."
+
+    return {
+        "verdict": verdict, "why": why,
+        "vectors": len(ours), "answered": answered,
+        "exact_matches": exact, "within_0.01": close,
+        "correlation": round(pearson, 4) if pearson is not None else None,
+        "rank_correlation": round(spearman, 4) if spearman is not None else None,
+        "best_fit": ({"scale": round(slope, 4), "shift": round(intercept, 4),
+                      "worst_residual": round(residual, 5)}
+                     if slope is not None else None),
+        "per_vector": [{"vector": p[0], "ours": p[1], "theirs": p[2],
+                        "delta": round(p[2] - p[1], 6)} for p in paired],
+    }
+
+
+# ----------------------------------------------------------------------
+# routes
+# ----------------------------------------------------------------------
+
+def _self(ctx, api_key):
+    scores, where, error = _score_locally()
+    if error:
+        return {"error": "scorer_unavailable", "message": error}, 503
+    return {"source": where, "vectors": len(scores),
+            "scores": [{"vector": l, "score": s} for l, s in scores],
+            "note": ("This is the baseline every probe is compared against. It "
+                     "reveals outputs, never weights.")}, 200
+
+
+def _probe(ctx, api_key, data):
+    url = str(data.get("url", "")).strip()
+    ok, why = _url_allowed(url)
+    if not ok:
+        return {"error": "bad_target", "message": why}, 400
+
+    fields = data.get("fields") if isinstance(data.get("fields"), dict) else {}
+    mapping = dict(DEFAULT_FIELDS)
+    mapping.update({k: str(v) for k, v in fields.items() if isinstance(v, str)})
+    score_key = data.get("score_key")
+    extra = data.get("body") if isinstance(data.get("body"), dict) else {}
+    headers = data.get("headers") if isinstance(data.get("headers"), dict) else {}
+    headers = {str(k)[:60]: str(v)[:300] for k, v in list(headers.items())[:8]}
+
+    ours, where, error = _score_locally()
+    if error:
+        return {"error": "scorer_unavailable", "message": error}, 503
+
+    theirs = []
+    failures = []
+    for label, signals in VECTORS:
+        body = dict(extra)
+        for internal, external in mapping.items():
+            body[external] = signals[internal]
+        status, payload = _post(url, body, headers)
+        if status < 200 or status >= 300:
+            theirs.append((label, None))
+            if len(failures) < 5:
+                failures.append({"vector": label, "http": status,
+                                 "response": payload if isinstance(payload, (dict, list))
+                                 else str(payload)[:200]})
+        else:
+            theirs.append((label, _extract_score(payload, score_key)))
+        time.sleep(POLITE_DELAY)
+
+    result = _compare(ours, theirs)
+    ts = time.time()
+
+    detail = ("target=" + url + ";verdict=" + result["verdict"] +
+              ";exact=" + str(result.get("exact_matches", 0)) +
+              "/" + str(result.get("answered", 0)))
+    ev = {"user_id": "fp:" + urlparse(url).hostname, "action": "fingerprint_probe",
+          "amount": 0, "country": "UK", "device_id": "fingerprint",
+          "anomaly": 0, "device_risk": 0}
+    res = {"decision": "FINGERPRINT_" + result["verdict"].replace(" ", "_"),
+           "score": 0, "fingerprint_version": VERSION, "target": url,
+           "timestamp": ts, "detail": detail}
+    h, idx, seq = ctx["seal"](ev, res, ts, api_key)
+
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "INSERT INTO fingerprint_probe(api_key,target,ran,vectors,answered,"
+            "exact,verdict,correlation,detail,audit_hash,block_index)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (api_key, url, ts, result.get("vectors"), result.get("answered"),
+             result.get("exact_matches"), result["verdict"],
+             result.get("correlation"), detail, h, idx))
+        ctx["conn"].commit()
+
+    out = dict(result)
+    out.update({
+        "target": url,
+        "ran_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts)),
+        "sealed": {"receipt": h, "block_index": idx, "receipt_seq": seq},
+        "what_this_is": ("A dated, sealed measurement of similarity. It is "
+                         "evidence, not an accusation, and it does not "
+                         "establish that anything was copied."),
+    })
+    if failures:
+        out["failures"] = failures
+        out["failure_note"] = ("Some vectors were rejected. If the target wants "
+                               "different field names, pass a \"fields\" map and "
+                               "run it again.")
+    return out, 200
+
+
+def _history(ctx, api_key):
+    with ctx["lock"]:
+        rows = ctx["conn"].execute(
+            "SELECT target,ran,verdict,exact,answered,correlation,audit_hash,block_index"
+            " FROM fingerprint_probe WHERE api_key=? ORDER BY id DESC LIMIT 100",
+            (api_key,)).fetchall()
+    return {"probes": [{
+        "target": r[0],
+        "ran_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(r[1])),
+        "verdict": r[2], "exact_matches": r[3], "answered": r[4],
+        "correlation": r[5], "receipt": r[6], "block_index": r[7],
+    } for r in rows], "count": len(rows)}, 200
+
+
+def _vectors():
+    return {"count": len(VECTORS),
+            "vectors": [{"label": l, "signals": s} for l, s in VECTORS],
+            "why_these": ("Chosen to sit either side of each saturation point, "
+                          "to walk the amount curve, and to isolate each term. "
+                          "Random inputs would only catch a straight copy.")}, 200
+
+
+def _spec():
+    return {
+        "module": "fingerprint", "version": VERSION,
+        "question_it_answers": "Is this endpoint running my scoring function?",
+        "verdicts": {
+            "IDENTICAL": "Every vector matches. Independently written functions do not do this.",
+            "DERIVED": "Not identical, but every score is ours scaled and shifted. Reweighted, not rewritten.",
+            "SAME SHAPE": "Different numbers, same ordering. Same design decisions, probably not the same code.",
+            "SIMILAR": "Loosely correlated. Weak - risk scorers broadly agree on what looks risky.",
+            "UNRELATED": "No meaningful relationship.",
+            "INCONCLUSIVE": "Too few vectors came back.",
+        },
+        "limits": [
+            "Only reaches endpoints it can reach. A private product with no free tier is invisible to this.",
+            "Proves similarity, never theft. Two people can converge honestly.",
+            "A target that rate limits, randomises or rounds heavily will read as INCONCLUSIVE rather than clean.",
+        ],
+        "every_run_is_sealed": ("The probe, the target and the result go into the "
+                                "chain, so a comparison run today is provable as "
+                                "having been run today."),
+        "manners": "One request per vector with a %.1fs gap. It is a measurement, not a load test." % POLITE_DELAY,
+    }, 200
+
+
+def handle(method, action, data, api_key, ctx):
+    # key first, before anything touches the database
+    if not api_key:
+        return {"error": "invalid_api_key"}, 401
+    _setup(ctx)
+    action = (action or "").strip("/").lower()
+
+    if method == "POST":
+        if action == "self":
+            return _self(ctx, api_key)
+        if action == "probe":
+            return _probe(ctx, api_key, data)
+        return {"error": "unknown_action", "action": action,
+                "POST": ["self", "probe"]}, 404
+
+    if action in ("", "spec"):
+        return _spec()
+    if action == "history":
+        return _history(ctx, api_key)
+    if action == "vectors":
+        return _vectors()
+    return {"error": "unknown_action", "action": action,
+            "GET": ["spec", "history", "vectors"]}, 404
 
 ```
 
