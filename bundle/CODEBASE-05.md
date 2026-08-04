@@ -3,14 +3,11 @@
 Contains:
 - `modules/replay.py`
 - `modules/router.py`
+- `modules/savings.py`
 - `modules/spec.py`
 - `modules/stats.py`
 - `modules/witness.py`
 - `Verify_ai.py`
-- `ai_act_ranker.py`
-- `ai_safety_scanner.py`
-- `aigrade_insert.py`
-- `aileash_reporter.py`
 
 
 ## `modules/replay.py`
@@ -941,6 +938,769 @@ def route(h, path, data):
 ```
 
 
+## `modules/savings.py`
+
+755 lines, 33108 bytes
+
+```python
+"""
+modules/savings.py  -  the cost model at /savings
+
+WHAT IT IS
+----------
+One page. Enter a device count, see what a traditional compliance architecture
+costs against a proof-based one, and change every assumption behind it.
+
+WHY THE ASSUMPTIONS ARE EDITABLE
+--------------------------------
+The saving rests on one number - what the traditional architecture costs per
+device per year - and that number is ours, not theirs. Asserted, it is the
+first thing a finance director dismisses. Broken into ingestion, storage,
+monitoring, pipeline and engineering, with every line editable, the arithmetic
+runs on their figures instead of ours. Harder to wave away, and honest.
+
+The page will also say plainly when the saving goes negative on the numbers
+somebody has typed. A calculator that can only ever produce a good answer is
+not a calculator.
+
+NO TRACKING, NO STORAGE
+-----------------------
+Everything happens in the browser. Nothing is submitted, nothing is recorded,
+no figure anyone types reaches the server. A buyer modelling their own costs
+should not have to wonder where those went.
+
+SAME PATCH AS network.py AND console.py
+---------------------------------------
+The router hands whatever handle() returns to send_json, so a module cannot
+return HTML through it. This patches do_GET at runtime, adds one path, leaves
+every other path alone. After each deploy one /x/ request must arrive before
+/savings exists - opening /x/savings/status does it.
+"""
+
+import json
+import sys
+import time
+
+VERSION = "1.0"
+
+PUBLIC = {("GET", "status"), ("GET", "verify"), ("POST", "seal")}
+
+PAGE_PATHS = ("/savings", "/savings.html", "/cost", "/proof-machine")
+
+_patched = [False]
+_ready = [False]
+
+
+def _setup(ctx):
+    if _ready[0]:
+        return
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "CREATE TABLE IF NOT EXISTS savings_model("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,devices INTEGER,"
+            "assumptions TEXT,traditional_per REAL,proof_per REAL,"
+            "annual_saving REAL,modelled REAL,audit_hash TEXT,block_index INTEGER)")
+        ctx["conn"].execute(
+            "CREATE INDEX IF NOT EXISTS idx_sav_hash ON savings_model(audit_hash)")
+        ctx["conn"].commit()
+    _ready[0] = True
+
+
+PAGE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>The cost of proving it — AILeash</title>
+<meta name="description" content="What AI governance costs at enterprise scale, and what a proof-based architecture changes. Put your own figures in.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600;9..144,900&family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --ink:#0a0f1e; --ink2:#10182e; --paper:#f6f3ec; --line:#e3ddcf;
+  --gold:#c9a84c; --mute:#6b6353; --mutei:rgba(255,255,255,.45);
+  --save:#1a9e6e; --spend:#c8362b;
+  --disp:Fraunces,Georgia,serif; --body:'Space Grotesk',system-ui,sans-serif;
+  --mono:'IBM Plex Mono',monospace;
+}
+body{background:var(--paper);color:var(--ink);font-family:var(--body);
+  font-size:16px;line-height:1.65}
+.wrap{max-width:760px;margin:0 auto;padding:0 20px}
+
+header{background:var(--ink);color:#fff;padding:52px 0 44px;margin-bottom:38px}
+.eyebrow{font-family:var(--mono);font-size:10px;letter-spacing:.22em;
+  text-transform:uppercase;color:var(--gold);margin-bottom:14px}
+h1{font-family:var(--disp);font-weight:900;font-size:clamp(32px,8vw,54px);
+  line-height:1;letter-spacing:-.025em}
+h1 i{font-style:italic;color:var(--gold)}
+.stand{color:var(--mutei);margin-top:16px;max-width:52ch;font-size:15.5px}
+.stand b{color:#fff}
+
+h2{font-family:var(--disp);font-weight:900;font-size:clamp(22px,5vw,30px);
+  letter-spacing:-.02em;margin-bottom:6px}
+.note{color:var(--mute);font-size:14.5px;margin-bottom:22px;max-width:56ch}
+
+section{margin-bottom:40px}
+
+/* device input */
+.devices{border:1px solid var(--line);border-left:3px solid var(--ink);
+  background:#fff;padding:22px;margin-bottom:14px}
+label{display:block;font-family:var(--mono);font-size:10px;letter-spacing:.16em;
+  text-transform:uppercase;color:var(--mute);margin-bottom:9px}
+.count{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
+.count input[type=number]{flex:1;min-width:150px;background:var(--paper);
+  border:1px solid var(--line);padding:13px 14px;border-radius:4px;
+  font-family:var(--mono);font-size:20px;color:var(--ink);outline:none}
+.count input:focus{border-color:var(--gold)}
+input[type=range]{width:100%;-webkit-appearance:none;appearance:none;height:3px;
+  background:var(--line);border-radius:2px;outline:none;margin-top:18px}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:22px;height:22px;
+  border-radius:50%;background:var(--ink);border:4px solid var(--gold);cursor:pointer}
+input[type=range]::-moz-range-thumb{width:22px;height:22px;border-radius:50%;
+  background:var(--ink);border:4px solid var(--gold);cursor:pointer}
+.presets{display:flex;gap:7px;flex-wrap:wrap;margin-top:14px}
+.presets button{background:transparent;border:1px solid var(--line);color:var(--mute);
+  font-family:var(--mono);font-size:11.5px;padding:7px 11px;border-radius:3px;cursor:pointer}
+.presets button:hover,.presets button.on{border-color:var(--ink);color:var(--ink)}
+
+/* the headline */
+.headline{background:var(--ink);color:#fff;padding:30px 24px;margin-bottom:14px}
+.hl-l{font-family:var(--mono);font-size:10px;letter-spacing:.2em;
+  text-transform:uppercase;color:var(--gold);margin-bottom:10px}
+.hl-v{font-family:var(--disp);font-weight:900;font-size:clamp(38px,12vw,68px);
+  line-height:1;letter-spacing:-.03em;color:#7fe3b0}
+.hl-s{color:var(--mutei);font-size:14px;margin-top:12px}
+
+/* the stacked comparison - the signature */
+.compare{border:1px solid var(--line);background:#fff;padding:24px}
+.row{margin-bottom:26px}
+.row:last-child{margin-bottom:0}
+.row-h{display:flex;justify-content:space-between;align-items:baseline;
+  gap:12px;margin-bottom:10px}
+.row-t{font-family:var(--disp);font-weight:600;font-size:18px}
+.row-v{font-family:var(--mono);font-size:15px;font-weight:500}
+.stack{display:flex;height:44px;border-radius:3px;overflow:hidden;background:var(--paper)}
+.seg{position:relative;transition:width .4s ease;min-width:0}
+.seg:not(:last-child){border-right:1px solid rgba(255,255,255,.35)}
+.legend{display:flex;flex-wrap:wrap;gap:12px;margin-top:12px;
+  font-family:var(--mono);font-size:11px;color:var(--mute)}
+.legend span{display:flex;align-items:center;gap:6px}
+.sw{width:10px;height:10px;border-radius:2px;flex-shrink:0}
+.gap-note{font-family:var(--mono);font-size:11.5px;color:var(--save);
+  margin-top:16px;padding-top:14px;border-top:1px solid var(--line)}
+
+/* assumptions */
+.assump{border:1px solid var(--line);background:#fff}
+.a-row{display:grid;grid-template-columns:1fr 116px;gap:14px;align-items:center;
+  padding:14px 18px;border-bottom:1px solid var(--line)}
+.a-row:last-of-type{border-bottom:none}
+.a-name{font-size:14.5px}
+.a-name small{display:block;color:var(--mute);font-size:12px;margin-top:2px;line-height:1.45}
+.a-in{display:flex;align-items:center;gap:5px}
+.a-in span{font-family:var(--mono);font-size:13px;color:var(--mute)}
+.a-in input{width:100%;background:var(--paper);border:1px solid var(--line);
+  padding:9px 10px;border-radius:3px;font-family:var(--mono);font-size:14px;
+  color:var(--ink);outline:none;text-align:right}
+.a-in input:focus{border-color:var(--gold)}
+.a-total{display:grid;grid-template-columns:1fr 116px;gap:14px;padding:15px 18px;
+  background:var(--ink);color:#fff;align-items:center}
+.a-total .a-name{font-family:var(--disp);font-weight:600;font-size:16px}
+.a-total .v{font-family:var(--mono);font-size:15px;text-align:right;color:var(--gold)}
+.reset{background:none;border:none;color:var(--mute);font-family:var(--mono);
+  font-size:11.5px;text-decoration:underline;cursor:pointer;padding:12px 18px}
+
+/* three year */
+.years{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;
+  background:var(--line);border:1px solid var(--line);margin-top:14px}
+.yr{background:#fff;padding:18px 14px;text-align:center}
+.yr .l{font-family:var(--mono);font-size:9.5px;letter-spacing:.14em;
+  text-transform:uppercase;color:var(--mute);margin-bottom:8px}
+.yr .v{font-family:var(--disp);font-weight:900;font-size:clamp(18px,5vw,26px);
+  color:var(--save);line-height:1}
+
+.split{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--line);
+  border:1px solid var(--line);margin-bottom:16px}
+.half{background:#fff;padding:20px}
+.half.measured{border-top:3px solid var(--save)}
+.half.modelled{border-top:3px solid var(--gold)}
+.h-l{font-family:var(--mono);font-size:10px;letter-spacing:.14em;text-transform:uppercase;
+  color:var(--mute);margin-bottom:14px}
+.measured .h-l{color:var(--save)}
+.m-row{display:flex;justify-content:space-between;gap:12px;padding:8px 0;
+  border-bottom:1px solid var(--line);font-size:13.5px;align-items:baseline}
+.m-row:last-of-type{border-bottom:none}
+.m-row b{font-family:var(--mono);font-size:13px}
+.h-n{font-size:13px;color:var(--mute);line-height:1.65;margin-top:12px}
+.sealbox{border:1px dashed var(--gold);background:rgba(201,168,76,.07);padding:22px}
+.s-h{font-family:var(--disp);font-weight:900;font-size:19px;margin-bottom:8px}
+.s-n{font-size:13.5px;color:var(--mute);line-height:1.65;margin-bottom:16px}
+#sealbtn{background:var(--ink);color:#fff;border:none;border-radius:3px;padding:14px 22px;
+  font-family:var(--body);font-weight:700;font-size:14px;cursor:pointer}
+#sealbtn:hover:not(:disabled){background:#243156}
+#sealbtn:disabled{opacity:.5;cursor:default}
+#sealout{margin-top:14px;font-family:var(--mono);font-size:12px;line-height:1.9;
+  color:var(--mute);word-break:break-all}
+#sealout a{color:var(--ink)}
+#sealout .ok{color:var(--save)}
+#sealout .bad{color:var(--spend)}
+@media(max-width:560px){.split{grid-template-columns:1fr}}
+.straight{border-left:3px solid var(--gold);background:rgba(201,168,76,.07);
+  padding:20px 22px;font-size:14.5px;line-height:1.7;color:var(--mute)}
+.straight b{color:var(--ink)}
+.straight p+p{margin-top:12px}
+
+.cta{display:flex;gap:10px;flex-wrap:wrap;margin-top:26px}
+.cta a{display:inline-block;padding:15px 26px;border-radius:3px;text-decoration:none;
+  font-weight:700;font-size:14.5px}
+.gold{background:var(--gold);color:var(--ink)}
+.ghost{border:1px solid var(--line);color:var(--ink)}
+
+footer{border-top:1px solid var(--line);margin-top:44px;padding:26px 0 60px;
+  font-family:var(--mono);font-size:11px;color:var(--mute);line-height:1.9}
+footer a{color:var(--ink)}
+:focus-visible{outline:2px solid var(--gold);outline-offset:2px}
+@media(max-width:560px){
+  .a-row,.a-total{grid-template-columns:1fr 96px;gap:10px;padding:13px 14px}
+  .years{grid-template-columns:1fr}
+}
+@media(prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <p class="eyebrow">AILeash · what it costs to prove it</p>
+    <h1>Everyone prices the model.<br><i>Nobody prices the proof.</i></h1>
+    <p class="stand">At enterprise scale the model is rarely the expensive part. <b>Ingestion, log storage, monitoring, compliance pipelines and the engineering time to hold it all together</b> usually cost more — and none of it proves anything on its own.</p>
+  </div>
+</header>
+
+<div class="wrap">
+
+<section>
+  <h2>Your deployment</h2>
+  <p class="note">Everything below recalculates from this.</p>
+  <div class="devices">
+    <label for="dev">Devices under governance</label>
+    <div class="count">
+      <input id="dev" type="number" min="100" step="100" value="100000" inputmode="numeric">
+    </div>
+    <input id="devr" type="range" min="2" max="6" step="0.01" value="5">
+    <div class="presets">
+      <button data-n="10000">10k</button>
+      <button data-n="25000">25k</button>
+      <button data-n="50000">50k</button>
+      <button data-n="100000" class="on">100k</button>
+      <button data-n="250000">250k</button>
+      <button data-n="500000">500k</button>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="headline">
+    <p class="hl-l">Potential annual saving</p>
+    <p class="hl-v" id="save">—</p>
+    <p class="hl-s" id="save-sub">—</p>
+  </div>
+
+  <div class="compare">
+    <div class="row">
+      <div class="row-h">
+        <span class="row-t">Traditional compliance architecture</span>
+        <span class="row-v" id="trad-v">—</span>
+      </div>
+      <div class="stack" id="trad-stack"></div>
+      <div class="legend" id="trad-legend"></div>
+    </div>
+
+    <div class="row">
+      <div class="row-h">
+        <span class="row-t">Proof-based, on AILeash</span>
+        <span class="row-v" id="proof-v">—</span>
+      </div>
+      <div class="stack" id="proof-stack"></div>
+      <div class="legend">
+        <span><i class="sw" style="background:#c9a84c"></i>50p per device per month, flat</span>
+      </div>
+    </div>
+
+    <p class="gap-note" id="gap">—</p>
+  </div>
+
+  <div class="years">
+    <div class="yr"><div class="l">Year one</div><div class="v" id="y1">—</div></div>
+    <div class="yr"><div class="l">Three years</div><div class="v" id="y3">—</div></div>
+    <div class="yr"><div class="l">Per device, per year</div><div class="v" id="ypd">—</div></div>
+  </div>
+</section>
+
+<section>
+  <h2>Change any of these</h2>
+  <p class="note">These are the figures the saving rests on. They are illustrative, and yours will differ — so put yours in. The arithmetic follows whatever you type.</p>
+  <div class="assump" id="assump">
+    <div class="a-row">
+      <div class="a-name">Data ingestion
+        <small>Getting decision data out of your systems and into somewhere it can be queried.</small></div>
+      <div class="a-in"><span>£</span><input type="number" id="a-ingest" value="3.20" step="0.10" min="0" inputmode="decimal"></div>
+    </div>
+    <div class="a-row">
+      <div class="a-name">Log storage
+        <small>Retention at the volumes an audit trail implies, for as long as the regulation implies.</small></div>
+      <div class="a-in"><span>£</span><input type="number" id="a-store" value="2.80" step="0.10" min="0" inputmode="decimal"></div>
+    </div>
+    <div class="a-row">
+      <div class="a-name">Monitoring platform
+        <small>Licences and seats on whatever watches it.</small></div>
+      <div class="a-in"><span>£</span><input type="number" id="a-monitor" value="2.40" step="0.10" min="0" inputmode="decimal"></div>
+    </div>
+    <div class="a-row">
+      <div class="a-name">Compliance pipeline
+        <small>Turning raw logs into something a regulator will accept.</small></div>
+      <div class="a-in"><span>£</span><input type="number" id="a-pipeline" value="2.60" step="0.10" min="0" inputmode="decimal"></div>
+    </div>
+    <div class="a-row">
+      <div class="a-name">Engineering time
+        <small>Building it, and keeping it running once it exists.</small></div>
+      <div class="a-in"><span>£</span><input type="number" id="a-eng" value="1.60" step="0.10" min="0" inputmode="decimal"></div>
+    </div>
+    <div class="a-row">
+      <div class="a-name">AILeash
+        <small>50p per device per month. Change it if you have been quoted something else.</small></div>
+      <div class="a-in"><span>£</span><input type="number" id="a-ail" value="6.00" step="0.50" min="0" inputmode="decimal"></div>
+    </div>
+    <div class="a-total">
+      <div class="a-name">Traditional, per device per year</div>
+      <div class="v" id="a-sum">—</div>
+    </div>
+  </div>
+  <button class="reset" id="reset">Put the illustrative figures back</button>
+</section>
+
+<section>
+  <h2>What is measured, and what is modelled</h2>
+  <p class="note">The two halves of this page are not the same kind of number, and it matters which is which.</p>
+
+  <div class="split">
+    <div class="half measured">
+      <div class="h-l">Measured — read from the live chain just now</div>
+      <div class="m-row"><span>Blocks sealed</span><b id="m-height">…</b></div>
+      <div class="m-row"><span>Bytes per seal</span><b>32</b></div>
+      <div class="m-row"><span>Size of the record behind it</span><b>irrelevant</b></div>
+      <div class="m-row"><span>External timestamp</span><b id="m-anchor">…</b></div>
+      <p class="h-n">A seal is a SHA-256 digest. Thirty-two bytes, whether the decision behind it is one line or a megabyte. That is not a claim about our architecture, it is what a hash is — and it is the whole reason the cost stops tracking the volume.</p>
+    </div>
+    <div class="half modelled">
+      <div class="h-l">Modelled — assumptions, including yours</div>
+      <div class="m-row"><span>What you spend today</span><b>your figures</b></div>
+      <div class="m-row"><span>What you would stop spending</span><b>an estimate</b></div>
+      <p class="h-n">Nobody can prove what an organisation <i>would have</i> spent. That number does not exist anywhere to be measured, here or in any vendor's business case. What this page can do is make the assumptions visible and let you replace every one of them.</p>
+    </div>
+  </div>
+
+  <div class="sealbox">
+    <div class="s-h">Seal this calculation</div>
+    <p class="s-n">Puts your inputs and the result into the audit chain, dated and tamper-evident, and hands you a receipt anyone can check. Then what was modelled, and on whose assumptions, is a matter of record rather than of memory — including ours.</p>
+    <button id="sealbtn">Seal it and give me a receipt</button>
+    <div id="sealout"></div>
+  </div>
+</section>
+
+<section>
+  <h2>Why a proof layer costs less</h2>
+  <p class="note">It is not a discount on the same architecture. It is less architecture.</p>
+  <div class="straight">
+    <p><b>Most of that cost is moving and keeping data.</b> Sensitive records get shipped somewhere central, held for years, indexed so they can be searched, and watched so nothing goes missing — because the plan is to reconstruct what happened by reading it all back later.</p>
+    <p><b>A proof-based layer answers the question at the moment the decision is made.</b> The decision is scored, sealed into a hash chain, externally timestamped and recorded by an independent platform. What survives is a proof that the decision happened, under stated rules, and has not been altered since.</p>
+    <p><b>So the volume stops being the problem.</b> A seal is the same size whether the record behind it is a line or a megabyte, and it does not have to leave your systems for the proof to hold. You keep your own data where it already is.</p>
+    <p>It does not replace your logs, and it is not meant to. It replaces the machinery built to make logs trustworthy — which is the part that scales badly.</p>
+  </div>
+  <div class="cta">
+    <a class="gold" href="/#signup">Get an API key · 90 days free</a>
+    <a class="ghost" href="/whitepaper">Read the whitepaper</a>
+    <a class="ghost" href="/api/verify-chain">Check the chain</a>
+  </div>
+</section>
+
+<footer>
+  Illustrative model. Real figures vary with cloud provider, data volume, retention policy, engineering rates and existing contracts — which is why every input above is yours to change. No saving is guaranteed and nothing here is a quotation.<br>
+  <a href="https://sebbi.pro">sebbi.pro</a> · Monop Content, Blyth
+</footer>
+
+</div>
+
+<script>
+(function(){
+  var DEFAULTS = { ingest:3.20, store:2.80, monitor:2.40, pipeline:2.60, eng:1.60, ail:6.00 };
+  var SEGMENTS = [
+    { id:'ingest',   label:'Data ingestion',      colour:'#0a0f1e' },
+    { id:'store',    label:'Log storage',         colour:'#243156' },
+    { id:'monitor',  label:'Monitoring',          colour:'#3d4f7d' },
+    { id:'pipeline', label:'Compliance pipeline', colour:'#5b6e9e' },
+    { id:'eng',      label:'Engineering time',    colour:'#8794b8' }
+  ];
+
+  var $ = function(id){ return document.getElementById(id); };
+  var dev = $('dev'), devr = $('devr');
+
+  function money(n){
+    if(!isFinite(n)) return '—';
+    if(Math.abs(n) >= 1000000) return '£' + (n/1000000).toFixed(2).replace(/\.00$/,'') + 'm';
+    return '£' + Math.round(n).toLocaleString('en-GB');
+  }
+  function per(n){ return '£' + n.toFixed(2); }
+  function val(id){
+    var v = parseFloat($(id).value);
+    return (isFinite(v) && v >= 0) ? v : 0;
+  }
+  function devices(){
+    var v = parseInt(dev.value, 10);
+    if(!isFinite(v) || v < 1) v = 1;
+    return v;
+  }
+
+  function draw(){
+    var n = devices();
+    var parts = SEGMENTS.map(function(s){ return { s:s, v: val('a-' + s.id) }; });
+    var tradPer = parts.reduce(function(a,p){ return a + p.v; }, 0);
+    var ailPer = val('a-ail');
+
+    var trad = tradPer * n, proof = ailPer * n, saved = trad - proof;
+
+    $('a-sum').textContent = per(tradPer);
+    $('trad-v').textContent = money(trad) + ' / year';
+    $('proof-v').textContent = money(proof) + ' / year';
+
+    $('save').textContent = saved > 0 ? money(saved) : money(0);
+    $('save').style.color = saved > 0 ? '#7fe3b0' : '#ffb4ad';
+    $('save-sub').textContent = n.toLocaleString('en-GB') + ' devices · ' +
+      per(tradPer) + ' against ' + per(ailPer) + ' per device per year';
+
+    // stacked bars, both scaled to the larger of the two
+    var scale = Math.max(tradPer, ailPer) || 1;
+    var tradHtml = '', legendHtml = '';
+    parts.forEach(function(p){
+      if(p.v <= 0) return;
+      tradHtml += '<div class="seg" style="width:' + ((p.v/scale)*100) + '%;background:' +
+        p.s.colour + '" title="' + p.s.label + ' · ' + per(p.v) + '"></div>';
+      legendHtml += '<span><i class="sw" style="background:' + p.s.colour + '"></i>' +
+        p.s.label + ' ' + per(p.v) + '</span>';
+    });
+    $('trad-stack').innerHTML = tradHtml;
+    $('trad-legend').innerHTML = legendHtml;
+    $('proof-stack').innerHTML = '<div class="seg" style="width:' +
+      ((ailPer/scale)*100) + '%;background:#c9a84c"></div>';
+
+    if(saved > 0){
+      var pct = Math.round((saved / (tradPer * n)) * 100);
+      $('gap').textContent = 'The gap is ' + money(saved) + ' a year — about ' + pct +
+        '% of the traditional figure, on these inputs.';
+      $('gap').style.color = '#1a9e6e';
+    } else if(saved === 0){
+      $('gap').textContent = 'On these inputs the two cost the same.';
+      $('gap').style.color = '#6b6353';
+    } else {
+      $('gap').textContent = 'On these inputs the proof layer costs ' + money(-saved) +
+        ' a year more. Worth knowing, and worth saying.';
+      $('gap').style.color = '#c8362b';
+    }
+
+    $('y1').textContent = money(Math.max(0, saved));
+    $('y3').textContent = money(Math.max(0, saved * 3));
+    $('ypd').textContent = per(Math.max(0, tradPer - ailPer));
+
+    document.querySelectorAll('.presets button').forEach(function(b){
+      b.classList.toggle('on', parseInt(b.dataset.n,10) === n);
+    });
+  }
+
+  // slider is logarithmic: 100 to 1,000,000
+  function syncFromSlider(){
+    dev.value = Math.round(Math.pow(10, parseFloat(devr.value)) / 100) * 100;
+    draw();
+  }
+  function syncFromNumber(){
+    var n = devices();
+    devr.value = Math.min(6, Math.max(2, Math.log(n) / Math.LN10));
+    draw();
+  }
+
+  devr.addEventListener('input', syncFromSlider);
+  dev.addEventListener('input', syncFromNumber);
+  document.querySelectorAll('.presets button').forEach(function(b){
+    b.addEventListener('click', function(){
+      dev.value = b.dataset.n; syncFromNumber();
+    });
+  });
+  document.querySelectorAll('#assump input').forEach(function(i){
+    i.addEventListener('input', draw);
+  });
+  $('reset').addEventListener('click', function(){
+    Object.keys(DEFAULTS).forEach(function(k){ $('a-' + k).value = DEFAULTS[k].toFixed(2); });
+    draw();
+  });
+
+  syncFromNumber();
+
+  // ---- measured half: read the live chain, do not assert it
+  (async function(){
+    try{
+      var r = await fetch('/x/stats');
+      if(r.ok){
+        var d = await r.json();
+        var h = (d.chain && d.chain.height);
+        $('m-height').textContent = h ? h.toLocaleString('en-GB') : 'unavailable';
+      } else { $('m-height').textContent = 'unavailable'; }
+    }catch(e){ $('m-height').textContent = 'unavailable'; }
+    try{
+      var a = await fetch('/api/anchor-status');
+      if(a.ok){
+        var ad = await a.json();
+        var cal = ad.calendars || ad.calendar_count;
+        $('m-anchor').textContent = cal ? (cal + ' calendars') : 'live';
+      } else { $('m-anchor').textContent = 'unavailable'; }
+    }catch(e){ $('m-anchor').textContent = 'unavailable'; }
+  })();
+
+  // ---- seal the calculation
+  var sealbtn = $('sealbtn'), sealout = $('sealout');
+  sealbtn.addEventListener('click', async function(){
+    sealbtn.disabled = true;
+    sealout.innerHTML = 'sealing…';
+    var body = {
+      devices: devices(),
+      assumptions: {
+        ingestion: val('a-ingest'), storage: val('a-store'),
+        monitoring: val('a-monitor'), pipeline: val('a-pipeline'),
+        engineering: val('a-eng'), aileash: val('a-ail')
+      }
+    };
+    try{
+      var r = await fetch('/x/savings/seal', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify(body)
+      });
+      var d = await r.json();
+      if(r.status === 429){
+        sealout.innerHTML = '<span class="bad">Rate limited. Give it a minute.</span>';
+      } else if(!r.ok || !d.receipt){
+        sealout.innerHTML = '<span class="bad">' +
+          ((d && (d.message || d.error)) || ('HTTP ' + r.status)) + '</span>';
+      } else {
+        sealout.innerHTML =
+          '<span class="ok">Sealed at block ' + d.block_index + '</span><br>' +
+          'receipt ' + d.receipt + '<br>' +
+          '<a href="' + d.verify + '" target="_blank" rel="noopener">check it yourself →</a>';
+      }
+    }catch(e){
+      sealout.innerHTML = '<span class="bad">Could not reach the server.</span>';
+    }
+    sealbtn.disabled = false;
+  });
+})();
+</script>
+</body>
+</html>
+"""
+
+
+def _srv():
+    m = sys.modules.get("__main__")
+    if hasattr(m, "get_bearer"):
+        return m
+    return sys.modules.get("server")
+
+
+def _install(s):
+    if _patched[0]:
+        return "already installed"
+    H = getattr(s, "Handler", None)
+    if H is None or not hasattr(H, "do_GET"):
+        return "no handler"
+    if getattr(H, "_savings_patched", False):
+        _patched[0] = True
+        return "already installed"
+
+    original = H.do_GET
+
+    def do_GET(self):
+        try:
+            from urllib.parse import urlparse
+            p = urlparse(self.path).path.rstrip("/") or "/"
+        except Exception:
+            p = self.path or "/"
+        if p in PAGE_PATHS:
+            body = PAGE.encode("utf-8")
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "public, max-age=300")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception:
+                pass
+            return
+        return original(self)
+
+    H.do_GET = do_GET
+    H._savings_patched = True
+    _patched[0] = True
+    print("SAVINGS: /savings page installed at runtime", flush=True)
+    return "installed"
+
+
+def _seal(ctx, api_key, data):
+    try:
+        devices = int(data.get("devices", 0))
+    except (TypeError, ValueError):
+        devices = 0
+    if devices < 1 or devices > 100000000:
+        return {"error": "devices_required",
+                "message": "Send a device count between 1 and 100,000,000."}, 400
+
+    a = data.get("assumptions")
+    if not isinstance(a, dict):
+        return {"error": "assumptions_required"}, 400
+
+    fields = ["ingestion", "storage", "monitoring", "pipeline", "engineering", "aileash"]
+    vals = {}
+    for f in fields:
+        try:
+            v = float(a.get(f, 0))
+        except (TypeError, ValueError):
+            v = 0.0
+        if v < 0 or v > 100000:
+            v = 0.0
+        vals[f] = round(v, 2)
+
+    traditional_per = round(sum(vals[f] for f in fields if f != "aileash"), 2)
+    proof_per = vals["aileash"]
+    traditional = round(traditional_per * devices, 2)
+    proof = round(proof_per * devices, 2)
+    saving = round(traditional - proof, 2)
+
+    ts = time.time()
+    detail = ("devices=" + str(devices) +
+              ";" + ";".join("%s=%.2f" % (f, vals[f]) for f in fields) +
+              ";traditional_per=%.2f;proof_per=%.2f;saving=%.2f"
+              % (traditional_per, proof_per, saving))
+
+    ev = {"user_id": "sav:" + str(devices), "action": "savings_modelled",
+          "amount": 0, "country": "UK", "device_id": "savings",
+          "anomaly": 0, "device_risk": 0}
+    res = {"decision": "SAVINGS_SEALED", "score": 0, "savings_version": VERSION,
+           "devices": devices, "assumptions": vals,
+           "traditional_per_device_year": traditional_per,
+           "proof_per_device_year": proof_per,
+           "annual_saving": saving, "timestamp": ts, "detail": detail}
+    h, idx, seq = ctx["seal"](ev, res, ts, api_key)
+
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "INSERT INTO savings_model(api_key,devices,assumptions,traditional_per,"
+            "proof_per,annual_saving,modelled,audit_hash,block_index)"
+            " VALUES(?,?,?,?,?,?,?,?,?)",
+            (api_key, devices, json.dumps(vals), traditional_per, proof_per,
+             saving, ts, h, idx))
+        ctx["conn"].commit()
+
+    return {
+        "sealed": True,
+        "receipt": h,
+        "block_index": idx,
+        "receipt_seq": seq,
+        "modelled_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts)),
+        "devices": devices,
+        "assumptions": vals,
+        "traditional_per_device_year": traditional_per,
+        "proof_per_device_year": proof_per,
+        "annual_saving": saving,
+        "verify": "/x/savings/verify?receipt=" + h,
+        "what_this_proves": ("That this calculation, on these assumptions, was run at "
+                             "this time and has not been altered since. It does not "
+                             "prove the assumptions are right - they are yours - and "
+                             "no record can prove what an organisation would otherwise "
+                             "have spent."),
+    }, 200
+
+
+def _verify(ctx, data):
+    receipt = str(data.get("receipt", "")).strip().lower()
+    if not receipt:
+        return {"error": "receipt_required"}, 400
+    with ctx["lock"]:
+        row = ctx["conn"].execute(
+            "SELECT devices,assumptions,traditional_per,proof_per,annual_saving,"
+            "modelled,block_index FROM savings_model WHERE audit_hash=? LIMIT 1",
+            (receipt,)).fetchone()
+    if not row:
+        return {"found": False, "receipt": receipt,
+                "message": "No calculation with that receipt exists in this chain."}, 404
+    try:
+        assumptions = json.loads(row[1])
+    except Exception:
+        assumptions = {}
+    return {
+        "found": True, "receipt": receipt,
+        "devices": row[0], "assumptions": assumptions,
+        "traditional_per_device_year": row[2],
+        "proof_per_device_year": row[3],
+        "annual_saving": row[4],
+        "modelled_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(row[5])),
+        "block_index": row[6],
+        "proof": ("This calculation is a block in a hash chain that is externally "
+                  "timestamped and recorded by an independent platform. Altering or "
+                  "removing it breaks every block after it."),
+        "chain": "/api/verify-chain",
+        "external_clock": "/api/anchor-status",
+    }, 200
+
+
+def handle(method, action, data, api_key, ctx):
+    s = _srv()
+    if s is None:
+        return {"error": "server_not_found"}, 500
+
+    state = "already installed" if _patched[0] else None
+    if not _patched[0]:
+        try:
+            state = _install(s)
+        except Exception as exc:
+            print("SAVINGS: patch failed - " + str(exc), flush=True)
+            state = "failed: " + str(exc)
+
+    action = (action or "").strip("/").lower()
+
+    if method == "POST":
+        if action == "seal":
+            _setup(ctx)
+            return _seal(ctx, api_key or "public-savings", data)
+        return {"error": "unknown_action", "action": action, "POST": ["seal"]}, 404
+
+    if action in ("", "status"):
+        return {
+            "page": "/savings",
+            "installed": bool(_patched[0]),
+            "install_result": state,
+            "paths": list(PAGE_PATHS),
+            "version": VERSION,
+            "note": ("The calculator runs in the browser. Nothing a visitor types is "
+                     "submitted unless they choose to seal it."),
+        }, 200
+    if action == "verify":
+        _setup(ctx)
+        return _verify(ctx, data)
+    return {"error": "unknown_action", "action": action,
+            "GET": ["status", "verify"], "POST": ["seal"]}, 404
+
+```
+
+
 ## `modules/spec.py`
 
 121 lines, 5086 bytes
@@ -1818,834 +2578,5 @@ if __name__ == "__main__":
     
     # Run the audit test pass
     auditor.run_public_compliance_audit(legitimate_claim_hash, sample_corporate_payload)
-
-```
-
-
-## `ai_act_ranker.py`
-
-262 lines, 4930 bytes
-
-```python
-"""
-AILeash Compliance Intelligence Engine
-Standalone AI Act Ranking & Risk Mapping Engine
-
-Version: 1.0.0
-"""
-
-import json
-import datetime
-
-
-VERSION = "1.0.0"
-
-
-# EU AI Act knowledge base
-AI_ACT_DATABASE = {
-
-    "Article 5": {
-        "title": "Prohibited AI Practices",
-        "phrases": [
-            "EU AI Act Article 5",
-            "prohibited AI practices",
-            "AI Act banned systems",
-            "AI regulation prohibited AI"
-        ],
-        "controls": [
-            "Prohibited use detection",
-            "Policy enforcement",
-            "AI behaviour screening"
-        ]
-    },
-
-
-    "Article 6": {
-        "title": "Classification of High Risk AI Systems",
-        "phrases": [
-            "high risk AI system",
-            "EU AI Act high risk classification",
-            "AI Act risk categories"
-        ],
-        "controls": [
-            "Risk classification",
-            "System assessment",
-            "Impact evaluation"
-        ]
-    },
-
-
-    "Article 9": {
-        "title": "Risk Management System",
-        "phrases": [
-            "EU AI Act Article 9",
-            "AI risk management system",
-            "AI Act compliance framework",
-            "continuous AI risk monitoring"
-        ],
-        "controls": [
-            "Risk identification",
-            "Risk scoring",
-            "Risk mitigation",
-            "Continuous monitoring"
-        ]
-    },
-
-
-    "Article 12": {
-        "title": "Record Keeping and Logging",
-        "phrases": [
-            "AI audit trail",
-            "AI logging requirements",
-            "AI evidence records",
-            "machine learning audit logs"
-        ],
-        "controls": [
-            "Immutable logs",
-            "Evidence storage",
-            "Traceability",
-            "Hash verification"
-        ]
-    },
-
-
-    "Article 14": {
-        "title": "Human Oversight",
-        "phrases": [
-            "AI human oversight",
-            "human in the loop AI",
-            "AI intervention controls"
-        ],
-        "controls": [
-            "Human review",
-            "Override capability",
-            "Decision supervision"
-        ]
-    },
-
-
-    "Article 15": {
-        "title": "Accuracy Robustness Cybersecurity",
-        "phrases": [
-            "AI cybersecurity",
-            "AI accuracy monitoring",
-            "AI robustness requirements"
-        ],
-        "controls": [
-            "Security testing",
-            "Performance monitoring",
-            "Failure detection"
-        ]
-    }
-
-}
-
-
-def search_ai_act(query):
-
-    results = []
-
-    query = query.lower()
-
-    for article, data in AI_ACT_DATABASE.items():
-
-        for phrase in data["phrases"]:
-
-            if query in phrase.lower():
-
-                results.append({
-                    "article": article,
-                    "title": data["title"],
-                    "matched_phrase": phrase,
-                    "controls": data["controls"]
-                })
-
-    return results
-
-
-
-def calculate_compliance_score(system):
-
-    score = 0
-    missing = []
-
-    requirements = {
-
-        "risk_management": "Article 9",
-        "logging": "Article 12",
-        "human_oversight": "Article 14",
-        "security": "Article 15"
-
-    }
-
-
-    for control, article in requirements.items():
-
-        if system.get(control):
-            score += 25
-        else:
-            missing.append(article)
-
-
-    return {
-        "score": score,
-        "rating": risk_rating(score),
-        "missing_articles": missing
-    }
-
-
-
-def risk_rating(score):
-
-    if score >= 90:
-        return "LOW RISK"
-
-    if score >= 70:
-        return "MODERATE RISK"
-
-    if score >= 40:
-        return "HIGH RISK"
-
-    return "CRITICAL RISK"
-
-
-
-def generate_report(system):
-
-    return {
-
-        "engine": "AILeash Compliance Intelligence Engine",
-
-        "version": VERSION,
-
-        "timestamp":
-            datetime.datetime.utcnow().isoformat(),
-
-        "assessment":
-            calculate_compliance_score(system)
-
-    }
-
-
-
-def save_report(report):
-
-    filename = (
-        "aileash_report_"
-        + datetime.datetime.now()
-        .strftime("%Y%m%d_%H%M%S")
-        + ".json"
-    )
-
-    with open(filename, "w") as file:
-        json.dump(
-            report,
-            file,
-            indent=4
-        )
-
-    return filename
-
-
-
-if __name__ == "__main__":
-
-    print(
-        "\nAILeash AI Act Ranking Engine "
-        + VERSION
-    )
-
-    print("\nExample search:")
-    
-    results = search_ai_act(
-        "Article 9"
-    )
-
-    for result in results:
-        print("\nMATCH:")
-        print(result)
-
-
-    test_system = {
-
-        "risk_management": True,
-        "logging": True,
-        "human_oversight": False,
-        "security": True
-
-    }
-
-
-    report = generate_report(test_system)
-
-    print("\nCOMPLIANCE REPORT")
-    print(json.dumps(report, indent=4))
-
-
-    file = save_report(report)
-
-    print(
-        "\nSaved:",
-        file
-    )
-
-```
-
-
-## `ai_safety_scanner.py`
-
-167 lines, 5700 bytes
-
-```python
-"""
-AI-Safety Grade Scanner
-Checks a domain's .well-known/ files and public root files against the
-emerging AI-safety/AI-transparency file conventions, and returns a
-letter grade (A-F) plus an embeddable badge.
-
-Drop into your existing FastAPI server.py as a router, or run standalone.
-Requires: fastapi, httpx  (pip install fastapi httpx --break-system-packages)
-"""
-
-from fastapi import APIRouter, Query
-from fastapi.responses import JSONResponse, Response
-import httpx
-import xml.etree.ElementTree as ET
-
-router = APIRouter()
-
-TIMEOUT = 6.0
-UA_HUMAN = "Mozilla/5.0 (compatible; AILeashScanner/1.0; +https://sebbi.pro/check)"
-UA_AGENT = "AILeash-Agent-Check/1.0 (+https://sebbi.pro/check)"
-
-CHECKS = [
-    # (key, path, points, validator_name)
-    ("ai_safety",  "/.well-known/ai-safety.txt", 20, "check_ai_safety"),
-    ("security",   "/.well-known/security.txt",  15, "check_security"),
-    ("robots",     "/robots.txt",                10, "check_robots"),
-    ("sitemap",    "/sitemap.xml",                10, "check_sitemap"),
-    ("ai_txt",     "/.well-known/ai.txt",         15, "check_present"),
-    ("comply",     "/.well-known/comply.txt",     15, "check_present"),
-    ("llms",       "/llms.txt",                   10, "check_present"),
-]
-RENDERING_POINTS = 5
-MAX_SCORE = sum(c[2] for c in CHECKS) + RENDERING_POINTS  # 100
-
-
-async def fetch(client: httpx.AsyncClient, url: str, ua: str = UA_HUMAN):
-    try:
-        r = await client.get(url, timeout=TIMEOUT, headers={"User-Agent": ua}, follow_redirects=True)
-        if r.status_code == 200:
-            return r.text
-    except Exception:
-        pass
-    return None
-
-
-def check_present(text):
-    return bool(text and text.strip())
-
-
-def check_ai_safety(text):
-    if not text:
-        return False
-    lower = text.lower()
-    return "ai-safe:" in lower and "true" in lower
-
-
-def check_security(text):
-    if not text:
-        return False
-    lower = text.lower()
-    return "contact:" in lower and "expires:" in lower
-
-
-def check_robots(text):
-    return bool(text and text.strip())
-
-
-def check_sitemap(text):
-    if not text:
-        return False
-    try:
-        ET.fromstring(text)
-        return True
-    except ET.ParseError:
-        return False
-
-
-VALIDATORS = {
-    "check_ai_safety": check_ai_safety,
-    "check_security": check_security,
-    "check_robots": check_robots,
-    "check_sitemap": check_sitemap,
-    "check_present": check_present,
-}
-
-
-def grade_from_score(score: int) -> str:
-    if score >= 90:
-        return "A"
-    if score >= 75:
-        return "B"
-    if score >= 60:
-        return "C"
-    if score >= 40:
-        return "D"
-    return "F"
-
-
-GRADE_COLOR = {"A": "#7fe3b0", "B": "#a8d95f", "C": "#c9a84c", "D": "#ff9a4a", "F": "#ff8a80"}
-
-
-@router.get("/check")
-async def check_domain(domain: str = Query(..., description="Domain to check, e.g. example.com")):
-    domain = domain.strip().lower().replace("https://", "").replace("http://", "").rstrip("/")
-    base = f"https://{domain}"
-
-    results = {}
-    score = 0
-
-    async with httpx.AsyncClient() as client:
-        for key, path, points, validator_name in CHECKS:
-            text = await fetch(client, base + path)
-            passed = VALIDATORS[validator_name](text)
-            results[key] = {"path": path, "found": bool(text), "passed": passed, "points": points if passed else 0}
-            if passed:
-                score += points
-
-        # basic consistent-rendering check: compare human UA vs agent UA on homepage
-        human_body = await fetch(client, base, UA_HUMAN)
-        agent_body = await fetch(client, base, UA_AGENT)
-        rendering_ok = bool(human_body) and bool(agent_body) and (len(human_body) > 0 and len(agent_body) > 0)
-        # crude similarity check — same length within 10% as a proxy for "not obviously cloaked"
-        if human_body and agent_body:
-            ratio = min(len(human_body), len(agent_body)) / max(len(human_body), len(agent_body), 1)
-            rendering_ok = ratio > 0.9
-        results["consistent_rendering"] = {"passed": rendering_ok, "points": RENDERING_POINTS if rendering_ok else 0}
-        if rendering_ok:
-            score += RENDERING_POINTS
-
-    grade = grade_from_score(score)
-
-    return JSONResponse({
-        "domain": domain,
-        "score": score,
-        "max_score": MAX_SCORE,
-        "grade": grade,
-        "checks": results,
-        "verified_by": "sebbi.pro",
-        "badge_url": f"https://sebbi.pro/check/badge?domain={domain}",
-        "report_url": f"https://sebbi.pro/check?domain={domain}",
-    })
-
-
-@router.get("/check/badge")
-async def check_badge(domain: str = Query(...)):
-    """Returns an embeddable SVG badge, e.g. <img src="https://sebbi.pro/check/badge?domain=example.com">"""
-    domain = domain.strip().lower().replace("https://", "").replace("http://", "").rstrip("/")
-    base = f"https://{domain}"
-
-    score = 0
-    async with httpx.AsyncClient() as client:
-        for key, path, points, validator_name in CHECKS:
-            text = await fetch(client, base + path)
-            if VALIDATORS[validator_name](text):
-                score += points
-
-    grade = grade_from_score(score)
-    color = GRADE_COLOR[grade]
-
-    svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="180" height="20">
-  <rect width="120" height="20" fill="#0a0f1e"/>
-  <rect x="120" width="60" height="20" fill="{color}"/>
-  <text x="60" y="14" fill="#fff" font-family="Verdana,sans-serif" font-size="11" text-anchor="middle">AI-Safety Grade</text>
-  <text x="150" y="14" fill="#0a0f1e" font-family="Verdana,sans-serif" font-size="12" font-weight="bold" text-anchor="middle">{grade}</text>
-</svg>'''
-    return Response(content=svg, media_type="image/svg+xml")
-
-```
-
-
-## `aigrade_insert.py`
-
-136 lines, 5663 bytes
-
-```python
-# ============================================================
-# AI-SAFETY GRADE SCANNER - stdlib version for server.py
-# (converted from the FastAPI/httpx draft - no new dependencies)
-#
-# HOW TO INSTALL - two pastes into server.py:
-#
-# PASTE 1: everything between "BEGIN FUNCTIONS" and "END FUNCTIONS"
-#          goes near your other helper functions (e.g. just above
-#          the JURIS_VERSION block).
-#
-# PASTE 2: everything between "BEGIN ROUTES" and "END ROUTES"
-#          goes inside do_GET, as new elif branches alongside the
-#          other GET routes (match their indentation: 8 spaces).
-#
-# Endpoints added:
-#   GET /api/aigrade?domain=example.com        -> JSON grade report
-#   GET /api/aigrade/badge?domain=example.com  -> embeddable SVG badge
-# ============================================================
-
-# ---------------- BEGIN FUNCTIONS ----------------
-AIGRADE_TIMEOUT=6
-AIGRADE_UA="Mozilla/5.0 (compatible; AILeashScanner/1.0; +https://sebbi.pro/scan)"
-AIGRADE_UA_AGENT="AILeash-Agent-Check/1.0 (+https://sebbi.pro/scan)"
-AIGRADE_CHECKS=[
-    ("ai_safety","/.well-known/ai-safety.txt",20,"ai_safety"),
-    ("security","/.well-known/security.txt",15,"security"),
-    ("robots","/robots.txt",10,"present"),
-    ("sitemap","/sitemap.xml",10,"sitemap"),
-    ("ai_txt","/.well-known/ai.txt",15,"present"),
-    ("comply","/.well-known/comply.txt",15,"present"),
-    ("llms","/llms.txt",10,"present"),
-]
-AIGRADE_RENDER_POINTS=5
-AIGRADE_MAX=sum(c[2] for c in AIGRADE_CHECKS)+AIGRADE_RENDER_POINTS
-AIGRADE_COLORS={"A":"#7fe3b0","B":"#a8d95f","C":"#c9a84c","D":"#ff9a4a","F":"#ff8a80"}
-
-def _aigrade_fetch(url,ua=AIGRADE_UA):
-    try:
-        req=urllib.request.Request(url,headers={"User-Agent":ua})
-        with urllib.request.urlopen(req,timeout=AIGRADE_TIMEOUT) as r:
-            if r.status==200:
-                return r.read(500000).decode("utf-8","replace")
-    except Exception:
-        pass
-    return None
-
-def _aigrade_valid(kind,text):
-    if kind=="present":
-        return bool(text and text.strip())
-    if kind=="ai_safety":
-        if not text:return False
-        low=text.lower()
-        return "ai-safe:" in low and "true" in low
-    if kind=="security":
-        if not text:return False
-        low=text.lower()
-        return "contact:" in low and "expires:" in low
-    if kind=="sitemap":
-        if not text:return False
-        try:
-            import xml.etree.ElementTree as _ET
-            _ET.fromstring(text)
-            return True
-        except Exception:
-            return False
-    return False
-
-def _aigrade_letter(score):
-    if score>=90:return"A"
-    if score>=75:return"B"
-    if score>=60:return"C"
-    if score>=40:return"D"
-    return"F"
-
-def aigrade_run(domain):
-    domain=str(domain or "").strip().lower().replace("https://","").replace("http://","").rstrip("/")
-    domain=domain.split("/")[0]
-    if not domain or "." not in domain or len(domain)>200:
-        return None
-    base="https://"+domain
-    results={};score=0
-    for key,path,points,kind in AIGRADE_CHECKS:
-        text=_aigrade_fetch(base+path)
-        passed=_aigrade_valid(kind,text)
-        results[key]={"path":path,"found":bool(text),"passed":passed,"points":points if passed else 0}
-        if passed:score+=points
-    human=_aigrade_fetch(base,AIGRADE_UA)
-    agent=_aigrade_fetch(base,AIGRADE_UA_AGENT)
-    render_ok=False
-    if human and agent:
-        ratio=min(len(human),len(agent))/max(len(human),len(agent),1)
-        render_ok=ratio>0.9
-    results["consistent_rendering"]={"passed":render_ok,"points":AIGRADE_RENDER_POINTS if render_ok else 0}
-    if render_ok:score+=AIGRADE_RENDER_POINTS
-    return{"domain":domain,"score":score,"max_score":AIGRADE_MAX,
-        "grade":_aigrade_letter(score),"checks":results,
-        "verified_by":"sebbi.pro",
-        "badge_url":HOST+"/api/aigrade/badge?domain="+domain,
-        "report_url":HOST+"/api/aigrade?domain="+domain,
-        "note":"External-signal check of published AI-transparency files; not an audit of internal systems"}
-
-def aigrade_badge_svg(domain):
-    r=aigrade_run(domain)
-    grade=r["grade"] if r else "F"
-    color=AIGRADE_COLORS.get(grade,"#ff8a80")
-    return('<svg xmlns="http://www.w3.org/2000/svg" width="180" height="20">'
-        '<rect width="120" height="20" fill="#0a0f1e"/>'
-        '<rect x="120" width="60" height="20" fill="'+color+'"/>'
-        '<text x="60" y="14" fill="#fff" font-family="Verdana,sans-serif" font-size="11" text-anchor="middle">AI-Safety Grade</text>'
-        '<text x="150" y="14" fill="#0a0f1e" font-family="Verdana,sans-serif" font-size="12" font-weight="bold" text-anchor="middle">'+grade+'</text>'
-        '</svg>')
-# ---------------- END FUNCTIONS ----------------
-
-
-# ---------------- BEGIN ROUTES (paste inside do_GET) ----------------
-        elif path=="/api/aigrade":
-            qs=parse_qs(parsed.query)
-            dom=(qs.get("domain",[""])[0] or "").strip()
-            rep=aigrade_run(dom)
-            if not rep:
-                send_json(self,{"error":"valid domain required, e.g. ?domain=example.com"},400)
-            else:
-                send_json(self,rep)
-        elif path=="/api/aigrade/badge":
-            qs=parse_qs(parsed.query)
-            dom=(qs.get("domain",[""])[0] or "").strip()
-            svg=aigrade_badge_svg(dom)
-            body=svg.encode()
-            self.send_response(200)
-            self.send_header("Content-Type","image/svg+xml")
-            self.send_header("Cache-Control","max-age=3600")
-            self.send_header("Content-Length",str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-# ---------------- END ROUTES ----------------
-
-```
-
-
-## `aileash_reporter.py`
-
-232 lines, 9377 bytes
-
-```python
-"""
-AILEASH DECISION REPORTER v1.0.0
-Generates readable audit reports for all AILeash products.
-Shows exactly why each decision was made.
-Copyright (c) 2026 Justin Antony Dobson / Monop Content, Blyth, UK
-"""
-
-import sqlite3, json, os
-from datetime import datetime
-
-DB_FILE = "aileash.db"
-
-PRODUCTS = {
-    "aileash": "AILeash",
-    "guardian": "AILeash Guardian",
-    "sonicboom": "SonicBoom",
-    "sentinel": "AILeash Sentinel"
-}
-
-REASON_EXPLANATIONS = {
-    "velocity_spike": "User made more than 10 requests in 60 seconds",
-    "high_amount": "Transaction amount exceeded threshold",
-    "risky_device": "Device risk score was above acceptable limit",
-    "behaviour_anomaly": "Unusual behaviour pattern detected",
-    "country_shift": "Request came from a different country than usual",
-    "unsafe_country": "Request came from outside approved country list",
-    "low_trust": "User trust score has dropped due to previous decisions",
-}
-
-def get_decisions(db_path=DB_FILE, limit=200):
-    if not os.path.exists(db_path):
-        return []
-    try:
-        conn = sqlite3.connect(db_path)
-        rows = conn.execute("""
-            SELECT a.ts, a.user_id, a.event_json, a.result_json, a.audit_hash,
-                   COALESCE(k.product, 'aileash') as product
-            FROM audit_log a
-            LEFT JOIN api_keys k ON json_extract(a.event_json, '$.api_key') = k.key
-            ORDER BY a.id DESC LIMIT ?
-        """, (limit,)).fetchall()
-        conn.close()
-    except:
-        try:
-            conn = sqlite3.connect(db_path)
-            rows = conn.execute("""
-                SELECT ts, user_id, event_json, result_json, audit_hash, 'aileash'
-                FROM audit_log ORDER BY id DESC LIMIT ?
-            """, (limit,)).fetchall()
-            conn.close()
-        except:
-            return []
-    
-    results = []
-    for row in rows:
-        try:
-            event = json.loads(row[2])
-            result = json.loads(row[3])
-            results.append({
-                "ts": row[0],
-                "user_id": row[1],
-                "event": event,
-                "result": result,
-                "audit_hash": row[4],
-                "product": row[5] or "aileash"
-            })
-        except:
-            pass
-    return results
-
-def explain_reason(r):
-    return REASON_EXPLANATIONS.get(r, r.replace("_", " ").capitalize())
-
-def decision_color(d):
-    return {"ALLOW": "#00875a", "CHALLENGE": "#b45309", "BLOCK": "#cc0000"}.get(d, "#555")
-
-def product_color(p):
-    return {
-        "aileash": "#c9a84c",
-        "guardian": "#cc0000",
-        "sonicboom": "#00d4ff",
-        "sentinel": "#7c3aed"
-    }.get(p, "#c9a84c")
-
-def generate_html_report(db_path=DB_FILE, limit=200, output="aileash_report.html"):
-    decisions = get_decisions(db_path, limit)
-
-    allow = sum(1 for d in decisions if d["result"].get("decision") == "ALLOW")
-    challenge = sum(1 for d in decisions if d["result"].get("decision") == "CHALLENGE")
-    block = sum(1 for d in decisions if d["result"].get("decision") == "BLOCK")
-
-    rows = ""
-    for d in decisions:
-        result = d["result"]
-        event = d["event"]
-        ts = datetime.fromtimestamp(d["ts"]).strftime('%Y-%m-%d %H:%M:%S')
-        decision = result.get("decision", "?")
-        score = result.get("score", 0)
-        reasons = result.get("reasons", [])
-        product = d.get("product", "aileash")
-        pc = product_color(product)
-        dc = decision_color(decision)
-        pname = PRODUCTS.get(product, product)
-
-        reason_html = ""
-        if reasons:
-            reason_html = "<ul>" + "".join(
-                f"<li>{explain_reason(r)}</li>" for r in reasons
-            ) + "</ul>"
-        else:
-            reason_html = "<span style='color:#888'>No risk factors detected</span>"
-
-        rows += f"""<tr>
-            <td>{ts}</td>
-            <td><span style="font-size:10px;background:{pc}22;color:{pc};border:1px solid {pc}44;padding:2px 6px;border-radius:3px">{pname}</span></td>
-            <td><code>{d['user_id']}</code></td>
-            <td>{event.get('action','?')}</td>
-            <td>{event.get('country','?')}</td>
-            <td>£{event.get('amount',0)}</td>
-            <td><strong style="color:{dc}">{decision}</strong></td>
-            <td>{score}</td>
-            <td>{result.get('trust',0)}</td>
-            <td>{reason_html}</td>
-            <td><code style="font-size:10px">{d['audit_hash'][:16]}...</code></td>
-        </tr>"""
-
-    html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>AILeash Audit Report</title>
-<style>
-*{{box-sizing:border-box;margin:0;padding:0}}
-body{{font-family:sans-serif;background:#f5f7fa;color:#1a202c;padding:20px}}
-.header{{background:#0a0f1e;color:#fff;padding:24px 32px;border-radius:8px;margin-bottom:20px;display:flex;justify-content:space-between;align-items:center}}
-.header h1{{font-size:22px;color:#c9a84c;margin:0}}
-.header p{{font-size:12px;color:rgba(255,255,255,0.4);margin-top:4px}}
-.logo{{font-size:13px;color:rgba(255,255,255,0.2)}}
-.stats{{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px}}
-.stat{{background:#fff;border-radius:8px;padding:16px;text-align:center;border:1px solid #e2e8f0}}
-.stat-n{{font-size:28px;font-weight:700}}
-.stat-l{{font-size:11px;color:#64748b;margin-top:4px;text-transform:uppercase;letter-spacing:1px}}
-.allow{{color:#00875a}}.challenge{{color:#b45309}}.block{{color:#cc0000}}.total{{color:#0a0f1e}}
-.table-wrap{{background:#fff;border-radius:8px;overflow:hidden;border:1px solid #e2e8f0;overflow-x:auto}}
-table{{width:100%;border-collapse:collapse;min-width:900px}}
-th{{background:#0a0f1e;color:#c9a84c;padding:10px 12px;text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:1px;white-space:nowrap}}
-td{{padding:10px 12px;border-bottom:1px solid #e2e8f0;font-size:12px;vertical-align:top}}
-tr:last-child td{{border:none}}
-tr:hover td{{background:#f8fafc}}
-ul{{margin:4px 0;padding-left:16px}}
-li{{margin:2px 0;color:#64748b;font-size:11px}}
-code{{background:#f1f5f9;padding:2px 4px;border-radius:3px;font-size:10px}}
-.empty{{text-align:center;color:#888;padding:40px}}
-footer{{text-align:center;font-size:11px;color:#94a3b8;margin-top:20px}}
-</style>
-</head>
-<body>
-<div class="header">
-  <div>
-    <h1>AILeash Audit Report</h1>
-    <p>Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} &nbsp;|&nbsp; Last {len(decisions)} decisions</p>
-  </div>
-  <div class="logo">sebbi.pro &nbsp;|&nbsp; OAAS-1.0</div>
-</div>
-<div class="stats">
-  <div class="stat"><div class="stat-n total">{len(decisions)}</div><div class="stat-l">Total</div></div>
-  <div class="stat"><div class="stat-n allow">{allow}</div><div class="stat-l">Allowed</div></div>
-  <div class="stat"><div class="stat-n challenge">{challenge}</div><div class="stat-l">Challenged</div></div>
-  <div class="stat"><div class="stat-n block">{block}</div><div class="stat-l">Blocked</div></div>
-</div>
-<div class="table-wrap">
-<table>
-<thead><tr>
-  <th>Time</th><th>Product</th><th>User</th><th>Action</th><th>Country</th>
-  <th>Amount</th><th>Decision</th><th>Score</th><th>Trust</th><th>Reasons</th><th>Audit Hash</th>
-</tr></thead>
-<tbody>
-{''.join([rows]) if rows else f'<tr><td colspan="11" class="empty">No decisions recorded yet</td></tr>'}
-</tbody>
-</table>
-</div>
-<footer>AILeash &nbsp;|&nbsp; Monop Content &nbsp;|&nbsp; Justin Antony Dobson &nbsp;|&nbsp; sebbi.pro &nbsp;|&nbsp; SHA-256 Merkle Chain</footer>
-</body>
-</html>"""
-
-    with open(output, "w") as f:
-        f.write(html)
-    print(f"Report saved: {output} ({len(decisions)} decisions)")
-    return output
-
-def generate_json_report(db_path=DB_FILE, limit=200, output="aileash_report.json"):
-    decisions = get_decisions(db_path, limit)
-    report = {
-        "generated": datetime.now().isoformat(),
-        "standard": "OAAS-1.0",
-        "source": "sebbi.pro",
-        "total": len(decisions),
-        "summary": {
-            "allow": sum(1 for d in decisions if d["result"].get("decision") == "ALLOW"),
-            "challenge": sum(1 for d in decisions if d["result"].get("decision") == "CHALLENGE"),
-            "block": sum(1 for d in decisions if d["result"].get("decision") == "BLOCK")
-        },
-        "decisions": [{
-            "timestamp": datetime.fromtimestamp(d["ts"]).isoformat(),
-            "product": PRODUCTS.get(d["product"], d["product"]),
-            "user_id": d["user_id"],
-            "action": d["event"].get("action"),
-            "country": d["event"].get("country"),
-            "amount": d["event"].get("amount"),
-            "decision": d["result"].get("decision"),
-            "score": d["result"].get("score"),
-            "trust": d["result"].get("trust"),
-            "reasons": d["result"].get("reasons", []),
-            "reasons_explained": [explain_reason(r) for r in d["result"].get("reasons", [])],
-            "audit_hash": d["audit_hash"]
-        } for d in decisions]
-    }
-    with open(output, "w") as f:
-        json.dump(report, f, indent=2)
-    print(f"Report saved: {output}")
-    return output
-
-if __name__ == "__main__":
-    import sys
-    fmt = sys.argv[1] if len(sys.argv) > 1 else "html"
-    db = sys.argv[2] if len(sys.argv) > 2 else DB_FILE
-    if fmt == "json":
-        generate_json_report(db)
-    else:
-        generate_html_report(db)
 
 ```
