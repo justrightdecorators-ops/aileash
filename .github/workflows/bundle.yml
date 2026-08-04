@@ -1,0 +1,149 @@
+name: Bundle codebase
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bundle-codebase
+  cancel-in-progress: false
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build the bundle
+        run: |
+          python3 - <<'ENDPY'
+          import os, sys
+
+          ROOT = "."
+          OUT = "bundle"
+          MAX_BYTES = 110000          # keeps every part openable on a phone
+
+          SKIP_DIRS = {".git", ".github", "bundle", "node_modules", "__pycache__",
+                       ".obsidian", "venv", ".venv", "AILeash"}
+          SKIP_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".svg",
+                      ".zip", ".pdf", ".db", ".sqlite", ".pyc", ".woff", ".woff2",
+                      ".ttf", ".mp4", ".mp3"}
+          SKIP_FILES = {"aileash.db"}
+
+          LANG = {".py": "python", ".js": "javascript", ".html": "html", ".css": "css",
+                  ".json": "json", ".md": "markdown", ".yml": "yaml", ".yaml": "yaml",
+                  ".txt": "text", ".sh": "bash", ".toml": "toml"}
+
+
+          def collect():
+              found = []
+              for base, dirs, files in os.walk(ROOT):
+                  dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and not d.startswith("."))
+                  for name in sorted(files):
+                      if name in SKIP_FILES or name.startswith("."):
+                          continue
+                      ext = os.path.splitext(name)[1].lower()
+                      if ext in SKIP_EXT:
+                          continue
+                      path = os.path.join(base, name)
+                      rel = os.path.relpath(path, ROOT).replace("\\", "/")
+                      try:
+                          size = os.path.getsize(path)
+                      except OSError:
+                          continue
+                      found.append((rel, size, ext))
+              # server first, then modules, then everything else
+              def rank(item):
+                  rel = item[0]
+                  if rel == "server.py":
+                      return (0, rel)
+                  if rel.startswith("modules/"):
+                      return (1, rel)
+                  if rel.endswith(".py"):
+                      return (2, rel)
+                  return (3, rel)
+              return sorted(found, key=rank)
+
+
+          def main():
+              files = collect()
+              if not os.path.isdir(OUT):
+                  os.makedirs(OUT)
+              for old in os.listdir(OUT):
+                  if old.startswith("CODEBASE"):
+                      os.remove(os.path.join(OUT, old))
+
+              parts, current, size = [], [], 0
+              for rel, fsize, ext in files:
+                  try:
+                      with open(rel, "r", encoding="utf-8", errors="replace") as f:
+                          text = f.read()
+                  except Exception as exc:
+                      text = "[could not read: %s]" % exc
+                  block = ("\n\n## `%s`\n\n%d lines, %d bytes\n\n```%s\n%s\n```\n"
+                           % (rel, text.count("\n") + 1, fsize, LANG.get(ext, ""), text))
+                  if current and size + len(block) > MAX_BYTES:
+                      parts.append(current)
+                      current, size = [], 0
+                  current.append((rel, block))
+                  size += len(block)
+              if current:
+                  parts.append(current)
+
+              total = len(parts)
+              index = ["# Codebase\n",
+                       "Generated automatically on every push. Do not edit by hand.\n",
+                       "%d files across %d parts.\n" % (len(files), total), "\n"]
+
+              for i, part in enumerate(parts, 1):
+                  name = "CODEBASE-%02d.md" % i
+                  head = ["# Codebase — part %d of %d\n" % (i, total),
+                          "\nContains:\n"]
+                  for rel, _ in part:
+                      head.append("- `%s`\n" % rel)
+                  body = "".join(head) + "".join(b for _, b in part)
+                  with open(os.path.join(OUT, name), "w", encoding="utf-8") as f:
+                      f.write(body)
+                  index.append("## [%s](%s)\n\n" % (name, name))
+                  for rel, _ in part:
+                      index.append("- `%s`\n" % rel)
+                  index.append("\n")
+                  print("%s  %d files  %d KB" % (name, len(part), len(body) // 1024))
+
+              with open(os.path.join(OUT, "CODEBASE.md"), "w", encoding="utf-8") as f:
+                  f.write("".join(index))
+              print("wrote bundle/CODEBASE.md index + %d parts" % total)
+
+
+          main()
+
+          ENDPY
+
+      - name: Commit it back
+        run: |
+          git config user.name "codebase-bundler"
+          git config user.email "actions@github.com"
+          BRANCH="${GITHUB_REF_NAME:-main}"
+          git add bundle
+          if git diff --staged --quiet; then
+            echo "Nothing changed - bundle is already up to date."
+            exit 0
+          fi
+          git commit -m "Bundle codebase [skip ci]"
+          for attempt in 1 2 3 4 5; do
+            echo "push attempt $attempt"
+            git pull --rebase origin "$BRANCH" || true
+            if git push origin "HEAD:$BRANCH"; then
+              echo "Pushed."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Could not push after 5 attempts."
+          exit 1
