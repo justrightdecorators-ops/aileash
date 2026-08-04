@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-82 files across 15 parts.
+81 files across 15 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -37,18 +37,17 @@ Generated automatically on every push. Do not edit by hand.
 
 - `modules/replay.py`
 - `modules/router.py`
-- `modules/savings.py`
 - `modules/spec.py`
 - `modules/stats.py`
 - `modules/witness.py`
 - `Verify_ai.py`
 - `ai_act_ranker.py`
 - `ai_safety_scanner.py`
+- `aigrade_insert.py`
+- `aileash_reporter.py`
 
 ## [CODEBASE-06.md](CODEBASE-06.md)
 
-- `aigrade_insert.py`
-- `aileash_reporter.py`
 - `aileash_verify.py`
 - `anchor.py`
 - `board_auditor.py`
@@ -57,10 +56,10 @@ Generated automatically on every push. Do not edit by hand.
 - `build_sebbi_ecosystem.py`
 - `gateway_proxy.py`
 - `sebbi_orchestrator.py`
+- `sebdog_engine.py`
 
 ## [CODEBASE-07.md](CODEBASE-07.md)
 
-- `sebdog_engine.py`
 - `sebdog_licence.py`
 - `sebdog_reporter.py`
 - `AILeash-API-Reference-v6.4.2.md`
