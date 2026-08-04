@@ -1,12 +1,481 @@
 # Codebase — part 3 of 15
 
 Contains:
+- `modules/consistency.py`
 - `modules/counterfactual.py`
 - `modules/declare.py`
 - `modules/demo.py`
 - `modules/dsr.py`
 - `modules/lineage.py`
-- `modules/mutual.py`
+
+
+## `modules/consistency.py`
+
+461 lines, 19146 bytes
+
+```python
+#!/usr/bin/env python3
+"""
+modules/consistency.py  -  proving we have never run two histories
+==================================================================
+
+THE ATTACK NOTHING ELSE HERE STOPS
+----------------------------------
+Mutual witnessing means several parties hold hashes of our chain. What
+none of them can currently check is whether they are all holding hashes of
+the SAME chain.
+
+Nothing in the design so far stops an operator running two histories in
+parallel. Serve chain A to one witness, chain B to an auditor. Both get a
+valid-looking tip. Both anchor it. Both verify perfectly against the copy
+they were given. Neither can tell, because there is no way to ask the
+question that would expose it:
+
+    is the tip you are holding actually an ancestor of my current head?
+
+That is the split-view attack. Witnessing does not stop it. Anchoring does
+not stop it - two forks can both be anchored. It is the last place an
+operator can lie, and it is the one nobody in compliance has closed,
+because the defence came out of Certificate Transparency and has not
+crossed over.
+
+WHAT THIS DOES
+--------------
+Builds an ordered Merkle tree over the audit chain and answers one
+question for anybody, forever, without our cooperation:
+
+    GET /x/consistency/ancestor?tip=<any tip we ever served>
+
+If that tip is on our chain, we return its position and a proof, against
+our current head, that it is still there and still in the same place. If
+it is not on our chain, we say so - and the party holding it knows they
+were served a history we no longer stand behind.
+
+Every witness can check every tip they have ever held, automatically, on a
+timer, for as long as they keep the tips. Which means we cannot show two
+faces to the network: the moment any holder of any old tip checks it, a
+fork stops being hidden and becomes provable arithmetic.
+
+APPEND-ONLY, PROVED RATHER THAN ASSERTED
+----------------------------------------
+    GET /x/consistency/proof?first=21&second=48
+
+Proves the log at size 21 is a PREFIX of the log at size 48. Not that both
+exist - that the second was reached from the first by appending only, with
+nothing inserted, removed or reordered in between. That is the actual
+meaning of "append-only", and until now it has been a claim rather than
+something a stranger could check.
+
+WHY THE MATHS IS BORROWED, NOT INVENTED
+---------------------------------------
+The tree here follows RFC 6962 - Certificate Transparency - deliberately,
+including its leaf and node prefixes and its split at the largest power of
+two. Anyone who has implemented a CT verifier can point it at this and it
+will work. Inventing a bespoke tree would mean nobody could check us
+without writing new code first, which is the opposite of the point.
+
+Note this tree is ORDERED, unlike the sorted tree in modules/complete.py.
+The two answer different questions. Sorted proves what is absent. Ordered
+proves nothing was reordered. They are not interchangeable and both are
+needed.
+
+HONEST LIMITS
+-------------
+  - This proves our published chain is internally append-only and that a
+    given tip belongs to it. It says nothing about whether an entry should
+    have been written in the first place.
+  - A fork is only DETECTED if someone actually checks a tip they were
+    given. The network has to do its half. That is why the route is public
+    and needs no account - so checking costs nothing and can be automated.
+  - If nobody ever holds an old tip of ours, there is nothing to check us
+    against. Detection scales with how many witnesses keep history, which
+    is another reason breadth matters more than depth.
+  - Recomputation is O(n) hashing over the chain. Cached per size. On a
+    very large log a checkpoint-based approach would be better; that is
+    written down rather than hidden.
+
+    GET  /x/consistency/root         current size and root      (public)
+    GET  /x/consistency/ancestor     is this tip on our chain    (public)
+    GET  /x/consistency/proof        prefix proof between sizes  (public)
+    GET  /x/consistency/spec         the exact hashing rules     (public)
+    POST /x/consistency/verify       check a proof we gave out   (public)
+    POST /x/consistency/checkpoint   seal the current root       (keyed)
+"""
+
+import hashlib
+import re
+import threading
+import time
+from datetime import datetime, timezone
+
+VERSION = "1.0"
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
+
+# All the read routes are open. A consistency check you need an account to
+# run is worthless - the party most likely to want it is the one who has
+# stopped trusting us.
+PUBLIC = {("GET", "root"), ("GET", "ancestor"), ("GET", "proof"),
+          ("GET", "spec"), ("POST", "verify")}
+
+# RFC 6962 domain separation. Leaf and internal hashes must never be
+# confusable or an internal node can be passed off as a leaf.
+LEAF_BYTE = b"\x00"
+NODE_BYTE = b"\x01"
+
+MAX_LEAVES = 500000
+
+_ready = False
+_cache = {"size": -1, "leaves": [], "root": None, "built": 0}
+_cache_lock = threading.Lock()
+
+
+def _setup(ctx):
+    global _ready
+    if _ready:
+        return
+    with ctx["lock"]:
+        c = ctx["conn"]
+        c.execute("CREATE TABLE IF NOT EXISTS consistency_checkpoint("
+                  "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,tree_size INTEGER,"
+                  "root TEXT,taken REAL,audit_hash TEXT,block_index INTEGER)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_cons_size "
+                  "ON consistency_checkpoint(tree_size)")
+        c.commit()
+    _ready = True
+
+
+def _iso(ts):
+    if not ts:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+# ----------------------------------------------------------------------
+# RFC 6962 tree
+# ----------------------------------------------------------------------
+
+def _leaf(value):
+    return hashlib.sha256(LEAF_BYTE + value.encode("utf-8")).digest()
+
+
+def _node(left, right):
+    return hashlib.sha256(NODE_BYTE + left + right).digest()
+
+
+def _split(n):
+    """Largest power of two strictly less than n. RFC 6962 splits here."""
+    k = 1
+    while k * 2 < n:
+        k *= 2
+    return k
+
+
+def _mth(leaves):
+    """Merkle Tree Hash over an ordered slice. Returns raw bytes."""
+    n = len(leaves)
+    if n == 0:
+        return hashlib.sha256(b"").digest()
+    if n == 1:
+        return _leaf(leaves[0])
+    k = _split(n)
+    return _node(_mth(leaves[:k]), _mth(leaves[k:]))
+
+
+def _inclusion(index, leaves):
+    """Audit path for leaf at index within this slice. Raw bytes list."""
+    n = len(leaves)
+    if n <= 1:
+        return []
+    k = _split(n)
+    if index < k:
+        return _inclusion(index, leaves[:k]) + [_mth(leaves[k:])]
+    return _inclusion(index - k, leaves[k:]) + [_mth(leaves[:k])]
+
+
+def _subproof(m, leaves, is_root):
+    n = len(leaves)
+    if m == n:
+        return [] if is_root else [_mth(leaves)]
+    k = _split(n)
+    if m <= k:
+        return _subproof(m, leaves[:k], is_root) + [_mth(leaves[k:])]
+    return _subproof(m - k, leaves[k:], False) + [_mth(leaves[:k])]
+
+
+def _consistency(m, leaves):
+    """Proof that the tree of the first m leaves is a prefix of this one."""
+    if m <= 0 or m > len(leaves):
+        return None
+    if m == len(leaves):
+        return []
+    return _subproof(m, leaves, True)
+
+
+def _hexed(nodes):
+    return [n.hex() for n in nodes]
+
+
+# ----------------------------------------------------------------------
+# reading the chain
+# ----------------------------------------------------------------------
+
+def _load(ctx):
+    """Every audit hash in order, cached until the chain grows.
+
+    Order is the point here - this is not the sorted tree from
+    modules/complete.py and the two must never be confused.
+    """
+    with ctx["lock"]:
+        row = ctx["conn"].execute("SELECT COUNT(*) FROM audit_log").fetchone()
+    size = int(row[0]) if row else 0
+
+    with _cache_lock:
+        if _cache["size"] == size and _cache["root"] is not None:
+            return _cache["leaves"], _cache["root"], size, None
+
+    if size > MAX_LEAVES:
+        return None, None, size, "chain holds %d entries, above the %d cap for live recomputation" % (size, MAX_LEAVES)
+
+    with ctx["lock"]:
+        rows = ctx["conn"].execute(
+            "SELECT audit_hash FROM audit_log ORDER BY id ASC").fetchall()
+    leaves = [str(r[0]) for r in rows if r[0]]
+    root = _mth(leaves)
+
+    with _cache_lock:
+        _cache["size"] = len(leaves)
+        _cache["leaves"] = leaves
+        _cache["root"] = root
+        _cache["built"] = time.time()
+
+    return leaves, root, len(leaves), None
+
+
+# ----------------------------------------------------------------------
+# routes
+# ----------------------------------------------------------------------
+
+def _root(ctx):
+    leaves, root, size, why = _load(ctx)
+    if why:
+        return {"error": "too_large", "message": why, "tree_size": size}, 503
+    return {"tree_size": size, "root": root.hex(), "consistency_version": VERSION,
+            "algorithm": "RFC 6962 Merkle Tree Hash over audit hashes in write order",
+            "note": "Record this alongside any tip you hold. Later you can ask us to prove the "
+                    "log you saw is a prefix of the log we serve today.",
+            "check": "/x/consistency/proof?first=<your size>&second=%d" % size,
+            "spec": "/x/consistency/spec"}, 200
+
+
+def _ancestor(ctx, data):
+    tip = str(data.get("tip", "")).strip().lower()
+    if not tip:
+        return {"error": "tip_required",
+                "message": "Any tip we ever served you. We will prove whether it is still on "
+                           "the chain we serve now."}, 400
+
+    leaves, root, size, why = _load(ctx)
+    if why:
+        return {"error": "too_large", "message": why, "tree_size": size}, 503
+
+    try:
+        index = leaves.index(tip)
+    except ValueError:
+        return {"on_chain": False, "tip": tip, "tree_size": size, "root": root.hex(),
+                "what_this_means": "This tip is not in the chain we serve. Either it was never "
+                                   "ours, or it belongs to a history we are no longer publishing. "
+                                   "If we gave you this tip, that is a fork and you now have "
+                                   "evidence of it.",
+                "keep_this": "This response, the tip, and whatever we originally sent you with "
+                             "it. Together they are the record of the discrepancy.",
+                "consistency_version": VERSION}, 409
+
+    path = _inclusion(index, leaves)
+    return {"on_chain": True, "tip": tip, "leaf_index": index, "height": index + 1,
+            "tree_size": size, "root": root.hex(),
+            "inclusion_proof": _hexed(path),
+            "consistency_version": VERSION,
+            "what_this_proves": "This tip sits at position %d of a chain of %d, and the current "
+                                "root recomputes from it. It has not been moved, removed or "
+                                "reordered since we gave it to you." % (index, size),
+            "verify_yourself": "/x/consistency/spec has the rules. Recompute upward from the "
+                               "leaf and compare with the root above.",
+            "prefix_proof": "/x/consistency/proof?first=%d&second=%d" % (index + 1, size)}, 200
+
+
+def _proof(ctx, data):
+    try:
+        first = int(data.get("first", 0))
+        second = int(data.get("second", 0) or 0)
+    except (TypeError, ValueError):
+        return {"error": "bad_sizes", "message": "first and second are tree sizes, as integers"}, 400
+
+    leaves, root, size, why = _load(ctx)
+    if why:
+        return {"error": "too_large", "message": why, "tree_size": size}, 503
+    if not second:
+        second = size
+    if first < 1 or first > second or second > size:
+        return {"error": "bad_range",
+                "message": "Need 1 <= first <= second <= %d" % size,
+                "tree_size": size}, 400
+
+    older = leaves[:first]
+    newer = leaves[:second]
+    proof = _consistency(first, newer)
+    if proof is None:
+        return {"error": "no_proof", "message": "could not build a proof for that range"}, 400
+
+    return {"first": first, "second": second,
+            "first_root": _mth(older).hex(),
+            "second_root": _mth(newer).hex(),
+            "consistency_proof": _hexed(proof),
+            "consistency_version": VERSION,
+            "what_this_proves": "The log at size %d is a prefix of the log at size %d. Nothing "
+                                "was inserted, removed or reordered between them - only "
+                                "appended. That is what append-only actually means, and this is "
+                                "it demonstrated rather than asserted." % (first, second),
+            "algorithm": "RFC 6962 section 2.1.2",
+            "spec": "/x/consistency/spec"}, 200
+
+
+def _verify(data):
+    """Recompute an inclusion proof. Convenience only - anyone relying on
+    us to check our own proof has not checked anything."""
+    leaf_value = str(data.get("leaf", data.get("tip", ""))).strip().lower()
+    index = data.get("index", data.get("leaf_index"))
+    size = data.get("tree_size")
+    root = str(data.get("root", "")).strip().lower()
+    proof = data.get("inclusion_proof", data.get("proof"))
+
+    if not leaf_value or not HEX64.match(root) or not isinstance(proof, list):
+        return {"error": "leaf_root_and_proof_required"}, 400
+    try:
+        index = int(index)
+        size = int(size)
+    except (TypeError, ValueError):
+        return {"error": "index_and_tree_size_required"}, 400
+    if index < 0 or size <= 0 or index >= size:
+        return {"error": "index_out_of_range"}, 400
+
+    current = _leaf(leaf_value)
+    node_index, last_index = index, size - 1
+    try:
+        for step in proof:
+            sibling = bytes.fromhex(str(step))
+            if node_index % 2 == 1 or node_index == last_index:
+                if node_index % 2 == 1:
+                    current = _node(sibling, current)
+                else:
+                    current = _node(sibling, current)
+                while node_index % 2 == 0 and node_index != 0:
+                    node_index //= 2
+                    last_index //= 2
+            else:
+                current = _node(current, sibling)
+            node_index //= 2
+            last_index //= 2
+    except Exception as exc:
+        return {"error": "bad_proof", "message": str(exc)[:200]}, 400
+
+    return {"valid": current.hex() == root,
+            "computed_root": current.hex(), "given_root": root,
+            "note": "Recomputed from the leaf upward using RFC 6962 audit path rules."}, 200
+
+
+def _checkpoint(ctx, api_key):
+    """Seal the current size and root into the chain itself.
+
+    A checkpoint is our own signature on 'this is what the log looked like
+    at this moment'. Once anchored, publishing a different history for that
+    size contradicts something we already sealed and externally timestamped.
+    """
+    leaves, root, size, why = _load(ctx)
+    if why:
+        return {"error": "too_large", "message": why, "tree_size": size}, 503
+
+    now = time.time()
+    root_hex = root.hex()
+    ev = {"user_id": "cons:%d" % size, "action": "consistency_checkpoint", "amount": 0,
+          "country": "UK", "device_id": "consistency", "anomaly": 0, "device_risk": 0}
+    res = {"decision": "CHECKPOINT_SEALED", "score": 0, "consistency_version": VERSION,
+           "tree_size": size, "root": root_hex,
+           "detail": "size=%d;root=%s" % (size, root_hex)}
+    audit_hash, block_index, seq = ctx["seal"](ev, res, now, api_key)
+
+    with ctx["lock"]:
+        ctx["conn"].execute("INSERT INTO consistency_checkpoint(api_key,tree_size,root,taken,"
+                            "audit_hash,block_index) VALUES(?,?,?,?,?,?)",
+                            (api_key, size, root_hex, now, audit_hash, block_index))
+        ctx["conn"].commit()
+
+    return {"tree_size": size, "root": root_hex, "taken_at": _iso(now),
+            "sealed_in_chain": audit_hash, "block_index": block_index, "receipt_seq": seq,
+            "what_this_does": "Commits our own view of the log at this size, inside the log, "
+                              "where it gets anchored with everything else. Serving a different "
+                              "history for this size now contradicts a sealed, timestamped "
+                              "record of our own making.",
+            "note": "The checkpoint itself becomes an entry, so the next size is larger. That is "
+                    "expected and does not affect the proof for this one."}, 200
+
+
+def _spec():
+    return {
+        "consistency_version": VERSION,
+        "based_on": "RFC 6962 (Certificate Transparency), deliberately unmodified so existing "
+                    "verifiers work against this without new code",
+        "leaves": "the audit_hash of every chain entry, in write order (id ascending), as "
+                  "lowercase hex strings encoded UTF-8",
+        "empty_root": hashlib.sha256(b"").hexdigest(),
+        "leaf_hash": "sha256(0x00 || leaf_value_utf8)",
+        "node_hash": "sha256(0x01 || left || right)",
+        "split": "for n > 1 leaves, split at k = the largest power of two strictly less than n",
+        "inclusion": "RFC 6962 section 2.1.1 audit path",
+        "consistency": "RFC 6962 section 2.1.2 - proves the tree at size m is a prefix of the "
+                       "tree at size n",
+        "ordered_not_sorted": "This tree is in write order. /x/complete uses a SORTED tree, "
+                              "which answers a different question (absence). Do not confuse the "
+                              "two - the roots will not match and are not meant to.",
+        "how_to_catch_us": "Keep every tip and root we ever hand you. Ask /x/consistency/ancestor "
+                           "about the old ones on a timer. If one ever comes back on_chain false, "
+                           "or a prefix proof fails to verify, we have served two histories and "
+                           "you can prove it without our help.",
+        "why_published": "Because a log nobody can check is a log you are being asked to trust.",
+    }, 200
+
+
+# ----------------------------------------------------------------------
+# router entry point
+# ----------------------------------------------------------------------
+
+def handle(method, action, data, api_key, ctx):
+    _setup(ctx)
+    action = (action or "").strip("/").lower()
+    data = data or {}
+
+    if method == "GET":
+        if action == "spec":
+            return _spec()
+        if action == "root":
+            return _root(ctx)
+        if action == "ancestor":
+            return _ancestor(ctx, data)
+        if action == "proof":
+            return _proof(ctx, data)
+
+    if method == "POST":
+        if action == "verify":
+            return _verify(data)
+        if not api_key:
+            return {"error": "invalid_api_key"}, 401
+        if action == "checkpoint":
+            return _checkpoint(ctx, api_key)
+
+    return {"error": "unknown_action", "action": action,
+            "GET": ["spec", "root", "ancestor", "proof"],
+            "POST": ["verify", "checkpoint"]}, 404
+
+```
 
 
 ## `modules/counterfactual.py`
@@ -1912,460 +2381,5 @@ def handle(method, action, data, api_key, ctx):
     return {"error": "unknown_action", "action": action,
             "GET": ["spec", "trace", "impact", "receipt"],
             "POST": ["declare (keyed)"]}, 404
-
-```
-
-
-## `modules/mutual.py`
-
-447 lines, 15467 bytes
-
-```python
-#!/usr/bin/env python3
-"""
-modules/mutual.py  -  the outbound half of mutual witnessing
-============================================================
-
-Why this exists
----------------
-modules/witness.py RECEIVES. Other chains hand us their tips and we seal
-them. Nothing in the platform currently SENDS our tip anywhere, so right
-now we witness other people and nobody witnesses us. This module is the
-missing direction.
-
-Drop it in as modules/mutual.py. The router picks it up automatically -
-no edits to server.py.
-
-Routes
-------
-  POST /x/mutual/push      send our current tip to every configured peer
-  POST /x/mutual/pull      fetch every peer's tip and seal it into our chain
-  POST /x/mutual/sync      pull then push (this is the one to schedule)
-  GET  /x/mutual/peers     the configured peers and what happened last time
-  GET  /x/mutual/status    last run, next run, whether the timer is alive
-
-Important design note
----------------------
-This module does not touch the database or import anything from server.py.
-It talks HTTP to routes that are already public - ours and theirs. That
-means it cannot corrupt anything, it works no matter how seal() changes,
-and every action it takes is one an outsider could audit for themselves.
-
-To read our own tip it calls our own public /x/witness/tip.
-To seal a peer's tip it calls our own public /x/witness/observe, which is
-already built to record exactly that. So a peer tip we pull is recorded by
-the same code path as a peer tip that was pushed to us.
-
-CONCURRENCY - read this before changing it
-------------------------------------------
-A sync cycle makes two kinds of call, and they are treated differently on
-purpose.
-
-  OUTBOUND to other people's hosts (reading their tip, pushing ours) runs
-  in parallel. These are the slow ones - we are waiting on somebody else's
-  server, and there is no reason to wait on them one at a time. Fifty peers
-  now costs roughly what the slowest single peer costs, instead of the sum
-  of all fifty.
-
-  INBOUND to our own server (sealing what we pulled) stays sequential. Our
-  own process is handling those requests, and firing a burst of them at
-  ourselves while we are mid-cycle is asking for trouble - a queue behind a
-  single replica at best. The sealing is fast and local anyway, so there is
-  nothing to gain by parallelising it and a real risk in doing so.
-
-So: fetch everything at once, then seal one at a time.
-
-BEFORE THIS WORKS
------------------
-1. "observe" must be in the PUBLIC set of modules/witness.py. If it is not,
-   this module gets a 401 from our own server, same as Red Flag AI Pro did.
-2. After every deploy, the first /x/ request must be a GET - that is what
-   installs the POST branch. Opening /x/mutual/peers in a browser does it.
-"""
-
-import json
-import threading
-import time
-import urllib.error
-import urllib.request
-from concurrent.futures import ThreadPoolExecutor
-
-# ----------------------------------------------------------------------
-# ROUTER
-# ----------------------------------------------------------------------
-
-# The router reads a set of (METHOD, action) tuples. Anything not listed
-# here needs an API key - default is closed.
-#
-# peers and status are read-only. An outsider being able to see who we
-# witness with, and whether it is actually running, is the entire point.
-#
-# push, pull and sync stay keyed - they cause outbound traffic and are not
-# left open to anonymous callers.
-PUBLIC = {("GET", "peers"), ("GET", "status")}
-
-
-# ----------------------------------------------------------------------
-# CONFIG
-# ----------------------------------------------------------------------
-
-# Our own public witness routes. Left as full URLs on purpose so this
-# module never has to guess its own host.
-OUR_TIP_URL = "https://sebbi.pro/x/witness/tip"
-OUR_OBSERVE_URL = "https://sebbi.pro/x/witness/observe"
-
-# The name we go by when we hand our tip to someone else.
-OUR_CHAIN_NAME = "aileash"
-
-# Everyone we witness with. Add a dict per chain.
-#   name         what we file their tips under
-#   tip_url      where we GET their current tip
-#   observe_url  where we POST ours so they record it
-PEERS = [
-    {
-        "name": "red-flag-ai-pro",
-        "tip_url": "https://www.redflagaipro.com/api/witness/tip",
-        "observe_url": "https://www.redflagaipro.com/api/witness/anchor",
-    },
-]
-
-# Field names to send when pushing our tip. If a peer wants different
-# names, give that peer its own "keys" dict and it will be used instead.
-DEFAULT_PUSH_KEYS = {
-    "chain": "chain",
-    "tip": "tip",
-    "count": "count",
-    "ts": "ts",
-    "url": "url",
-}
-
-# Where peers can read our tip, included in what we push.
-OUR_PUBLIC_URL = "https://sebbi.pro/x/witness/tip"
-
-# Background timer. Set ENABLED to False if you would rather drive it
-# yourself by hitting /x/mutual/sync.
-AUTO_SYNC_ENABLED = True
-AUTO_SYNC_SECONDS = 3600
-
-TIMEOUT_SECONDS = 20
-
-# How many peers we talk to at once. Above this they queue, which is fine -
-# it stops a large network spawning a thread per peer. Eight slow peers at
-# 20s each still finishes in 20s; forty finishes in about a minute worst
-# case, and only if every one of them times out.
-MAX_PARALLEL_PEERS = 8
-
-# ----------------------------------------------------------------------
-# state - deliberately in memory only, this is not evidence
-# ----------------------------------------------------------------------
-
-_state = {
-    "last_run": None,
-    "last_result": None,
-    "runs": 0,
-    "timer_started": False,
-}
-_lock = threading.Lock()
-
-
-def _now():
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-
-def _reply(payload, status=200):
-    """The router expects (payload, status) back from handle()."""
-    return payload, status
-
-
-def _in_parallel(function, items):
-    """Run function over items concurrently, preserving input order.
-
-    Used only for calls that leave our server. Anything hitting our own
-    process goes through a plain loop instead - see the note at the top.
-    """
-    if not items:
-        return []
-    if len(items) == 1:
-        return [function(items[0])]
-    workers = min(len(items), MAX_PARALLEL_PEERS)
-    with ThreadPoolExecutor(max_workers=workers,
-                            thread_name_prefix="mutual-peer") as pool:
-        return list(pool.map(function, items))
-
-
-# ----------------------------------------------------------------------
-# http
-# ----------------------------------------------------------------------
-
-def _http(url, payload=None):
-    """POST if payload given, else GET. Returns (status, parsed_or_text)."""
-    data = None
-    headers = {"Accept": "application/json", "User-Agent": "aileash-mutual/1.1"}
-    if payload is not None:
-        data = json.dumps(payload).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    request = urllib.request.Request(url, data=data, headers=headers)
-    try:
-        with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
-            body = response.read().decode("utf-8", "replace")
-            status = response.getcode()
-    except urllib.error.HTTPError as exc:
-        try:
-            body = exc.read().decode("utf-8", "replace")
-        except Exception:
-            body = ""
-        status = exc.code
-    except urllib.error.URLError as exc:
-        return 0, "unreachable: %s" % exc.reason
-    except Exception as exc:
-        return 0, "failed: %s" % exc
-    try:
-        return status, json.loads(body)
-    except ValueError:
-        return status, body
-
-
-def _extract_tip(body):
-    """Pull (tip, height) out of whatever shape a tip route returns."""
-    if not isinstance(body, dict):
-        return None, None
-    tip = body.get("tip") or body.get("hash") or body.get("head")
-    height = body.get("height", body.get("count", body.get("entries")))
-    return tip, height
-
-
-# ----------------------------------------------------------------------
-# the two directions
-# ----------------------------------------------------------------------
-
-def our_tip():
-    status, body = _http(OUR_TIP_URL)
-    if status != 200:
-        return None, None, "our own tip route answered %s: %s" % (status, str(body)[:200])
-    tip, height = _extract_tip(body)
-    if not tip:
-        return None, None, "no tip field in our own reply: %s" % str(body)[:200]
-    return tip, height, None
-
-
-def push_one(peer, tip, height):
-    """Hand our tip to one peer so they record it. Outbound only."""
-    keys = peer.get("keys", DEFAULT_PUSH_KEYS)
-    values = {
-        "chain": OUR_CHAIN_NAME,
-        "tip": tip,
-        "count": height,
-        "ts": _now(),
-        "url": OUR_PUBLIC_URL,
-    }
-    payload = {keys.get(k, k): v for k, v in values.items()}
-    status, body = _http(peer["observe_url"], payload)
-    result = {
-        "peer": peer["name"],
-        "direction": "push",
-        "url": peer["observe_url"],
-        "http": status,
-        "ok": 200 <= status < 300,
-        "response": body if isinstance(body, (dict, list)) else str(body)[:300],
-    }
-    if status == 401 or status == 403:
-        result["hint"] = "they want auth on that route, or it is not in their public set"
-    elif status == 404:
-        result["hint"] = "wrong path - check observe_url for this peer"
-    elif status == 0:
-        result["hint"] = "could not reach them at all"
-    return result
-
-
-def fetch_one(peer):
-    """Read one peer's current tip. Outbound only - no sealing here.
-
-    Returns a dict that either carries a tip ready to seal, or an error
-    already shaped like a result so it can be returned to the caller as is.
-    """
-    status, body = _http(peer["tip_url"])
-    if status != 200:
-        return {
-            "peer": peer["name"], "direction": "pull", "url": peer["tip_url"],
-            "http": status, "ok": False, "_failed": True,
-            "response": body if isinstance(body, (dict, list)) else str(body)[:300],
-            "hint": "could not read their tip",
-        }
-
-    tip, height = _extract_tip(body)
-    if not tip:
-        return {
-            "peer": peer["name"], "direction": "pull", "url": peer["tip_url"],
-            "http": status, "ok": False, "_failed": True,
-            "response": str(body)[:300],
-            "hint": "no tip field in their reply - add the field name to _extract_tip",
-        }
-
-    return {
-        "peer": peer["name"], "url": peer["tip_url"],
-        "tip": tip, "height": height, "_failed": False,
-        "fetched_at": time.time(),
-    }
-
-
-def seal_one(fetched):
-    """Seal one already-fetched peer tip into our chain.
-
-    Goes through our own public observe route so a tip we pulled is
-    recorded by exactly the same code path as a tip somebody pushed to us.
-    Called in a plain loop, never in parallel - this hits our own server.
-
-    Field names must match what modules/witness.py reads out of the body:
-    chain, tip, peer_ts, url. The url is what makes the observation
-    checkable by a third party rather than taken on our word - it is the
-    address we just fetched this tip from.
-    """
-    seal_status, seal_body = _http(OUR_OBSERVE_URL, {
-        "chain": fetched["peer"],
-        "tip": fetched["tip"],
-        "peer_ts": fetched["fetched_at"],
-        "url": fetched["url"],
-    })
-
-    out = {
-        "peer": fetched["peer"],
-        "direction": "pull",
-        "their_tip": fetched["tip"],
-        "their_height": fetched["height"],
-        "sealed_http": seal_status,
-        "ok": 200 <= seal_status < 300,
-        "response": seal_body if isinstance(seal_body, (dict, list)) else str(seal_body)[:300],
-    }
-    if seal_status in (401, 403):
-        out["hint"] = "our own observe route rejected us - check PUBLIC in modules/witness.py"
-    return out
-
-
-def do_push():
-    tip, height, error = our_tip()
-    if error:
-        return {"ok": False, "error": error}
-
-    # Outbound to everyone at once.
-    results = _in_parallel(lambda peer: push_one(peer, tip, height), PEERS)
-
-    return {
-        "ok": True,
-        "our_tip": tip,
-        "our_height": height,
-        "results": results,
-    }
-
-
-def do_pull():
-    # Phase one: read every peer's tip at the same time. This is the slow
-    # part and none of it touches us.
-    fetched = _in_parallel(fetch_one, PEERS)
-
-    # Phase two: seal what came back, one at a time, into our own chain.
-    results = []
-    for item in fetched:
-        if item.get("_failed"):
-            item.pop("_failed", None)
-            results.append(item)
-            continue
-        results.append(seal_one(item))
-
-    return {"ok": True, "results": results}
-
-
-def do_sync():
-    """Pull first, then push. That order matters: the tip we hand out then
-    already contains the tips we just took in, so the two chains interlock
-    rather than merely sitting alongside each other."""
-    started = time.time()
-    pulled = do_pull()
-    pushed = do_push()
-    result = {
-        "ran_at": _now(),
-        "took_seconds": round(time.time() - started, 2),
-        "peers": len(PEERS),
-        "pull": pulled,
-        "push": pushed,
-        "ok": bool(pulled.get("ok")) and bool(pushed.get("ok")),
-    }
-    with _lock:
-        _state["last_run"] = result["ran_at"]
-        _state["last_result"] = result
-        _state["runs"] += 1
-    return result
-
-
-# ----------------------------------------------------------------------
-# background timer
-# ----------------------------------------------------------------------
-
-def _loop():
-    # Let the server finish coming up before the first run.
-    time.sleep(45)
-    while True:
-        try:
-            do_sync()
-        except Exception:
-            pass
-        time.sleep(AUTO_SYNC_SECONDS)
-
-
-def _start_timer():
-    with _lock:
-        if _state["timer_started"] or not AUTO_SYNC_ENABLED:
-            return
-        _state["timer_started"] = True
-    thread = threading.Thread(target=_loop, name="mutual-sync", daemon=True)
-    thread.start()
-
-
-_start_timer()
-
-
-# ----------------------------------------------------------------------
-# router entry point
-# ----------------------------------------------------------------------
-
-def handle(method, action, data, api_key, ctx):
-    action = (action or "").strip("/").lower()
-
-    if method == "GET":
-        if action == "peers":
-            return _reply({
-                "chain": OUR_CHAIN_NAME,
-                "peers": [
-                    {"name": p["name"], "tip_url": p["tip_url"],
-                     "observe_url": p["observe_url"]}
-                    for p in PEERS
-                ],
-                "parallel_fetch": MAX_PARALLEL_PEERS,
-                "note": "Witnessing is only mutual if both columns are live.",
-            })
-        if action == "status":
-            with _lock:
-                return _reply({
-                    "auto_sync": AUTO_SYNC_ENABLED,
-                    "interval_seconds": AUTO_SYNC_SECONDS,
-                    "timer_running": _state["timer_started"],
-                    "parallel_fetch": MAX_PARALLEL_PEERS,
-                    "runs": _state["runs"],
-                    "last_run": _state["last_run"],
-                    "last_result": _state["last_result"],
-                })
-
-    if method == "POST":
-        if action == "push":
-            return _reply(do_push())
-        if action == "pull":
-            return _reply(do_pull())
-        if action == "sync":
-            return _reply(do_sync())
-
-    return _reply({
-        "error": "unknown action",
-        "GET": ["peers", "status"],
-        "POST": ["push", "pull", "sync"],
-    }, 404)
 
 ```
