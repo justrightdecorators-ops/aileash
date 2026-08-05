@@ -1,14 +1,746 @@
 # Codebase — part 7 of 16
 
 Contains:
+- `broadcaster.py`
+- `build_sebbi_ecosystem.py`
+- `gateway_proxy.py`
 - `ordering_test.py`
 - `sebbi_orchestrator.py`
 - `sebdog_engine.py`
 - `sebdog_licence.py`
 - `sebdog_reporter.py`
-- `AILeash-API-Reference-v6.4.2.md`
-- `LICENCE`
-- `README.md`
+
+
+## `broadcaster.py`
+
+158 lines, 6412 bytes
+
+```python
+import asyncio
+import json
+import logging
+import socket
+import hmac
+import hashlib
+import ipaddress
+
+# --- HARDENED ARCHITECTURE DECLARATION ---
+AI_TXT_PAYLOAD = """Standard: AI-TXT/1.0
+Standard-Licence: free and open - publish your own at no cost, no key required
+Operator: Monop Content
+Operator-Location: Blyth, Northumberland, United Kingdom
+Contact: justrightdecorators@gmail.com
+Last-Updated: 2026-07-05
+
+Governance-Engine: AILeash v6.4
+Decision-Model: deterministic weighted scoring (no ML drift; weights immutable)
+Decision-Outcomes: ALLOW, CHALLENGE, BLOCK
+Decision-Signals: 9
+Decision-Latency-Median: 28ms
+
+Verify-Endpoint: https://sebbi.pro
+Companion-Standard: https://sebbi.pro
+Whitepaper: https://sebbi.pro"""
+
+HUMAN_MESSAGE = (
+    "SYSTEM NOTICE: AI Governance Compliance Update for sebbi.pro.\n"
+    "The updated compliance targets are now active under Standard: AI-TXT/1.0.\n"
+    "Verify live audit status at: https://sebbi.pro"
+)
+
+# Operational Configuration
+UDP_BROADCAST_PORT = 5001
+TCP_GATEWAY_PORT = 8080
+CONCURRENT_LIMIT = 2000  # Lowered slightly to manage OS file descriptor ceilings safely
+TIMEOUT = 1.5           # Tightened timeout for faster failover
+
+# Secret key used to sign messages (In production, load this securely via environment variables)
+SYSTEM_SIGNING_KEY = b"SECURE_GOVERNANCE_SECRET_PASSPHRASE_KEY"
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+def get_network_topology():
+    """
+    Safely resolves the local IP address and computes the network boundary 
+    using proper subnet masks instead of naive string manipulation.
+    """
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # Does not send actual data; used to determine local routing interface
+        s.connect(("8.8.8.8", 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+        
+        # In a production environment, dynamically pull the actual netmask.
+        # Fallback here assumes a standard /24 corporate subnet slice for demonstration.
+        interface = ipaddress.IPv4Interface(f"{local_ip}/255.255.255.0")
+        return interface.network.broadcast_address.with_prefixlen.split('/')[0], interface.network
+    except Exception as e:
+        logging.error(f"Failed to automatically resolve local network topology: {e}")
+        return "255.255.255.255", ipaddress.IPv4Network("192.168.1.0/24")
+
+def generate_signed_payload(message_text, declaration_text, key):
+    """
+    Packages the governance telemetry data and appends an immutable 
+    HMAC-SHA256 signature to guarantee authenticity at the destination node.
+    """
+    base_data = {
+        "alert_text": message_text,
+        "raw_declaration": declaration_text
+    }
+    serialized_json = json.dumps(base_data, sort_keys=True)
+    
+    # Compute cryptographic signature
+    signature = hmac.new(key, serialized_json.encode('utf-8'), hashlib.sha256).hexdigest()
+    
+    # Enclose both the verified data and signature in a final unified wrapper
+    final_package = {
+        "payload": base_data,
+        "signature": signature,
+        "algorithm": "HMAC-SHA256"
+    }
+    return json.dumps(final_package)
+
+def send_secure_udp_broadcast(compiled_payload, broadcast_target):
+    """Broadcasts the cryptographically signed data packet to the subnet."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            s.sendto(compiled_payload.encode('utf-8'), (broadcast_target, UDP_BROADCAST_PORT))
+            logging.info(f"Signed UDP broadcast successfully dispatched to {broadcast_target}:{UDP_BROADCAST_PORT}")
+    except socket.error as e:
+        logging.error(f"UDP broadcast failure: {e}")
+
+async def push_to_secure_gateway(target_ip, compiled_payload):
+    """Injects the signed payload directly into downstream destination gateways."""
+    writer = None
+    try:
+        connect = asyncio.open_connection(target_ip, TCP_GATEWAY_PORT)
+        _, writer = await asyncio.wait_for(connect, timeout=TIMEOUT)
+        
+        http_request = (
+            f"POST /api/compliance/broadcast HTTP/1.1\r\n"
+            f"Host: {target_ip}\r\n"
+            f"Content-Type: application/json\r\n"
+            f"Content-Length: {len(compiled_payload)}\r\n"
+            f"X-Signature-Auth: True\r\n"
+            f"Connection: close\r\n\r\n"
+            f"{compiled_payload}"
+        ).encode('utf-8')
+        
+        writer.write(http_request)
+        await writer.drain()
+        logging.info(f"[DISPATCHED] Verified telemetry pushed to infrastructure host: {target_ip}")
+        return True
+    except (asyncio.TimeoutError, ConnectionRefusedError, OSError):
+        # Gracefully filter common network timeouts or offline endpoints
+        return False
+    finally:
+        if writer:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+async def secure_network_orchestrator():
+    broadcast_ip, network_obj = get_network_topology()
+    
+    # Generate the single signed package used for all downstream nodes
+    signed_data_stream = generate_signed_payload(HUMAN_MESSAGE, AI_TXT_PAYLOAD, SYSTEM_SIGNING_KEY)
+    
+    # 1. Fire authenticated network-wide baseline blast
+    send_secure_udp_broadcast(signed_data_stream, broadcast_ip)
+    
+    # 2. Asynchronously target explicit topological gateways (.1 and .254)
+    tasks = []
+    logging.info(f"Initiating asynchronous gateway verification loop across subnet: {network_obj.with_prefixlen}")
+    
+    # Safely isolate subnets by targeting typical routing infrastructure points
+    for host in network_obj.hosts():
+        host_str = str(host)
+        if host_str.endswith(".1") or host_str.endswith(".254"):
+            tasks.append(asyncio.create_task(push_to_secure_gateway(host_str, signed_data_stream)))
+            
+            # Handle task scheduling dynamically to respect system resource bounds
+            if len(tasks) >= CONCURRENT_LIMIT:
+                await asyncio.gather(*tasks, return_exceptions=True)
+                tasks = []
+                
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    logging.info("Network compliance orchestration sequence finalized completed.")
+
+if __name__ == "__main__":
+    asyncio.run(secure_network_orchestrator())
+
+```
+
+
+## `build_sebbi_ecosystem.py`
+
+270 lines, 9812 bytes
+
+```python
+import os
+import sys
+
+# --- CODE CONTAINERS FOR AUTOMATED INJECTION ---
+
+BROADCASTER_CODE = """import asyncio
+import json
+import logging
+import socket
+import hmac
+import hashlib
+import ipaddress
+import os
+
+# --- HARDENED ARCHITECTURE DECLARATION ---
+AI_TXT_PAYLOAD = \"\"\"Standard: AI-TXT/1.0
+Standard-Licence: free and open - publish your own at no cost, no key required
+Operator: Monop Content
+Operator-Location: Blyth, Northumberland, United Kingdom
+Contact: justrightdecorators@gmail.com
+Last-Updated: 2026-07-05
+
+Governance-Engine: AILeash v6.4
+Decision-Model: deterministic weighted scoring (no ML drift; weights immutable)
+Decision-Outcomes: ALLOW, CHALLENGE, BLOCK
+Decision-Signals: 9
+Decision-Latency-Median: 28ms
+
+Verify-Endpoint: https://sebbi.pro
+Companion-Standard: https://sebbi.pro
+Whitepaper: https://sebbi.pro\"\"\"
+
+HUMAN_MESSAGE = (
+    "SYSTEM NOTICE: AI Governance Compliance Update for sebbi.pro.\\n"
+    "The updated compliance targets are now active under Standard: AI-TXT/1.0.\\n"
+    "Verify live audit status at: https://sebbi.pro"
+)
+
+UDP_BROADCAST_PORT = 5001
+TCP_GATEWAY_PORT = 8080
+CONCURRENT_LIMIT = 2000  
+TIMEOUT = 1.5           
+
+# Dynamic environment lookup to protect the secret signature key
+SYSTEM_SIGNING_KEY = os.environ.get("SEBBI_BROADCAST_SECRET", "LOCAL_DEV_FALLBACK_KEY").encode('utf-8')
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+def get_network_topology():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+        interface = ipaddress.IPv4Interface(f"{local_ip}/255.255.255.0")
+        return str(interface.network.broadcast_address), interface.network
+    except Exception as e:
+        logging.error(f"Failed to automatically resolve local network topology: {e}")
+        return "255.255.255.255", ipaddress.IPv4Network("192.168.1.0/24")
+
+def generate_signed_payload(message_text, declaration_text, key):
+    base_data = {
+        "alert_text": message_text,
+        "raw_declaration": declaration_text
+    }
+    serialized_json = json.dumps(base_data, sort_keys=True)
+    signature = hmac.new(key, serialized_json.encode('utf-8'), hashlib.sha256).hexdigest()
+    
+    final_package = {
+        "payload": base_data,
+        "signature": signature,
+        "algorithm": "HMAC-SHA256"
+    }
+    return json.dumps(final_package)
+
+def send_secure_udp_broadcast(compiled_payload, broadcast_target):
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            s.sendto(compiled_payload.encode('utf-8'), (broadcast_target, UDP_BROADCAST_PORT))
+            logging.info(f"Signed UDP broadcast dispatched to {broadcast_target}:{UDP_BROADCAST_PORT}")
+    except socket.error as e:
+        logging.error(f"UDP broadcast failure: {e}")
+
+async def push_to_secure_gateway(target_ip, compiled_payload):
+    writer = None
+    try:
+        connect = asyncio.open_connection(target_ip, TCP_GATEWAY_PORT)
+        _, writer = await asyncio.wait_for(connect, timeout=TIMEOUT)
+        
+        http_request = (
+            f"POST /api/compliance/broadcast HTTP/1.1\\r\\n"
+            f"Host: {target_ip}\\r\\n"
+            f"Content-Type: application/json\\r\\n"
+            f"Content-Length: {len(compiled_payload)}\\r\\n"
+            f"X-Signature-Auth: True\\r\\n"
+            f"Connection: close\\r\\n\\r\\n"
+            f"{compiled_payload}"
+        ).encode('utf-8')
+        
+        writer.write(http_request)
+        await writer.drain()
+        logging.info(f"[DISPATCHED] Verified telemetry pushed to infrastructure host: {target_ip}")
+        return True
+    except (asyncio.TimeoutError, ConnectionRefusedError, OSError):
+        return False
+    finally:
+        if writer:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+async def secure_network_orchestrator():
+    broadcast_ip, network_obj = get_network_topology()
+    signed_data_stream = generate_signed_payload(HUMAN_MESSAGE, AI_TXT_PAYLOAD, SYSTEM_SIGNING_KEY)
+    
+    send_secure_udp_broadcast(signed_data_stream, broadcast_ip)
+    
+    tasks = []
+    logging.info(f"Initiating asynchronous gateway loop across subnet: {network_obj.with_prefixlen}")
+    
+    for host in network_obj.hosts():
+        host_str = str(host)
+        if host_str.endswith(".1") or host_str.endswith(".254"):
+            tasks.append(asyncio.create_task(push_to_secure_gateway(host_str, signed_data_stream)))
+            if len(tasks) >= CONCURRENT_LIMIT:
+                await asyncio.gather(*tasks, return_exceptions=True)
+                tasks = []
+                
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    logging.info("Network compliance orchestration sequence finalized.")
+
+if __name__ == "__main__":
+    asyncio.run(secure_network_orchestrator())
+"""
+
+GREEN_CODE = """import time
+import os
+import sys
+import json
+import socket
+import logging
+import hashlib
+import hmac
+
+if sys.platform != "win32":
+    import resource
+else:
+    resource = None
+
+# --- ECOSYSTEM METADATA ENGINE ---
+GREEN_AI_STANDARD = \"\"\"Standard: GREEN-AI/1.0
+Framework-Licence: open-access / standard-registry
+Metrics-Engine: GreenLeash v1.2 (System Resource Auditor)
+Target-SLA: Sub-2ms Internal Latency Overhead
+Verification-Hub: https://sebbi.pro\"\"\"
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [GREEN-TELEMETRY] %(message)s")
+
+# Dynamic environment lookup to protect the secret signature key
+SYSTEM_SIGNING_KEY = os.environ.get("SEBBI_GREEN_SECRET", "LOCAL_DEV_FALLBACK_KEY").encode('utf-8')
+
+class ProductionGreenNotary:
+    def __init__(self):
+        self.node_id = hashlib.sha256(socket.gethostname().encode()).hexdigest()[:12]
+
+    def _get_system_usage(self):
+        if resource:
+            usage = resource.getrusage(resource.RUSAGE_SELF)
+            cpu_time = usage.ru_utime + usage.ru_stime
+            memory_mb = usage.ru_maxrss / (1024.0 if sys.platform == "darwin" else 1.0)
+        else:
+            cpu_time = time.process_time()
+            memory_mb = 0.0
+        return cpu_time, memory_mb
+
+    def profile_process(self, process_func, *args, **kwargs):
+        start_wall = time.perf_counter()
+        start_cpu, start_mem = self._get_system_usage()
+
+        result = process_func(*args, **kwargs)
+
+        end_cpu, end_mem = self._get_system_usage()
+        end_wall = time.perf_counter()
+
+        wall_latency_ms = (end_wall - start_wall) * 1000
+        cpu_time_delta_ms = (end_cpu - start_cpu) * 1000
+        peak_memory_mb = max(start_mem, end_mem)
+
+        self._package_and_sign_metrics(wall_latency_ms, cpu_time_delta_ms, peak_memory_mb)
+        return result
+
+    def _package_and_sign_metrics(self, wall_ms, cpu_ms, memory_mb):
+        telemetry_data = {
+            "node_id": self.node_id,
+            "wall_latency_ms": round(wall_ms, 3),
+            "kernel_cpu_time_ms": round(cpu_ms, 3),
+            "allocated_memory_mb": round(memory_mb, 2),
+            "meta_declaration": GREEN_AI_STANDARD
+        }
+
+        serialized_payload = json.dumps(telemetry_data, sort_keys=True)
+        signature = hmac.new(SYSTEM_SIGNING_KEY, serialized_payload.encode('utf-8'), hashlib.sha256).hexdigest()
+
+        final_packet = {
+            "payload": telemetry_data,
+            "signature": signature,
+            "algorithm": "HMAC-SHA256"
+        }
+
+        logging.info(f"[AUDIT LOGGED] Wall: {round(wall_ms, 1)}ms | CPU: {round(cpu_ms, 1)}ms | RAM: {round(memory_mb, 1)}MB")
+        logging.info(f"[LEDGER SEAL] HMAC: {signature[:16]}...")
+        return json.dumps(final_packet)
+
+def mock_computational_work():
+    dummy_data = [x for x in range(1000000)]
+    time.sleep(0.015)
+    return "SUCCESS"
+
+if __name__ == "__main__":
+    logging.info("Starting GreenLeash Kernel Auditing Pipeline...")
+    auditor = ProductionGreenNotary()
+    auditor.profile_process(mock_computational_work)
+"""
+
+# --- BLUEPRINT DICTIONARY ---
+REPO_STRUCTURE = {
+    "server": {
+        "server.py": "# Core production database and cryptographic Merkle chain engine\n# (Keep your proprietary server logic safely deployed here)\n"
+    },
+    "public-utilities": {
+        "broadcaster.py": BROADCASTER_CODE,
+        "green.py": GREEN_CODE
+    }
+}
+
+def execute_automated_compilation():
+    """Builds the folder paths and populates the production files in bulk."""
+    base_path = os.getcwd()
+    print(f"[*] Starting compilation blueprint in root: {base_path}")
+    
+    for folder, files in REPO_STRUCTURE.items():
+        folder_path = os.path.join(base_path, folder)
+        
+        # Build missing folders securely
+        if not os.path.exists(folder_path):
+            os.makedirs(folder_path)
+            print(f"[+] Directory established: /{folder}")
+            
+        # Write .gitkeep so Git registers the paths even if empty
+        with open(os.path.join(folder_path, ".gitkeep"), "w", encoding="utf-8") as f:
+            f.write("# Forces Git tracking for this structural directory block\n")
+            
+        # Compile each individual file
+        for file_name, code_content in files.items():
+            file_path = os.path.join(folder_path, file_name)
+            
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(code_content)
+            print(f"    └── [COMPILED SUCCESS] Written: /{folder}/{file_name}")
+
+    print("\n[!] SUCCESS: All files have been safely sorted into their proper paths.")
+    print("[!] Run: 'git add . && git commit -m \"Add client utilities\" && git push'")
+
+if __name__ == "__main__":
+    execute_automated_compilation()
+
+```
+
+
+## `gateway_proxy.py`
+
+280 lines, 10922 bytes
+
+```python
+import asyncio
+import ssl
+import json
+import hmac
+import hashlib
+import os
+import time
+import logging
+import urllib.request
+import urllib.error
+
+# ============================================================
+# AILEASH GATEWAY PROXY - real enforcement version
+#
+# How it's meant to be used:
+#   Customer changes their AI SDK's base URL from
+#     https://api.openai.com/v1
+#   to
+#     https://your-gateway-domain/openai/v1
+#   (same for Anthropic under /anthropic/)
+#
+# Every request that arrives:
+#   1. Gets scored by your real /api/govern endpoint (same
+#      scoring + sealing logic as server.py - nothing duplicated).
+#   2. If the decision is BLOCK, the request is rejected here.
+#      The real OpenAI/Anthropic call is NEVER made. That's the
+#      actual gate - not an email sent after the fact.
+#   3. If ALLOW or CHALLENGE, the request is forwarded to the
+#      real provider over a real TLS connection, and the real
+#      response is streamed back untouched.
+#
+# This does NOT intercept traffic the customer sends directly
+# to openai.com without going through this gateway. No proxy
+# that doesn't install certificates on every device can do that
+# for HTTPS traffic - that's a much bigger, separate product.
+# This is the same integration pattern used by every commercial
+# AI gateway (Cloudflare AI Gateway, Portkey, LiteLLM proxy, etc).
+# ============================================================
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [GATEWAY] %(message)s")
+
+PROXY_PORT = int(os.environ.get("GATEWAY_PORT", 8888))
+
+# No fallback key. If this isn't set, refuse to start rather than
+# run with a guessable signing key in production.
+PROXY_SIGNING_KEY = os.environ.get("SEBBI_PROXY_SECRET", "").strip()
+if not PROXY_SIGNING_KEY:
+    raise SystemExit(
+        "SEBBI_PROXY_SECRET is not set. Refusing to start - "
+        "running with a default/fallback signing key is not safe. "
+        "Set SEBBI_PROXY_SECRET in your environment (Railway variables) and restart."
+    )
+PROXY_SIGNING_KEY = PROXY_SIGNING_KEY.encode("utf-8")
+
+# Where your real scoring/sealing engine lives. Point this at your
+# own deployment - defaults to the live sebbi.pro API.
+GOVERN_URL = os.environ.get("AILEASH_GOVERN_URL", "https://sebbi.pro/api/govern")
+
+# Which real AI providers this gateway can forward to, and their
+# real hostnames. Add more here if you support more providers.
+PROVIDERS = {
+    "openai": "api.openai.com",
+    "anthropic": "api.anthropic.com",
+}
+
+
+def call_govern(ailleash_key: str, event: dict):
+    """Call the real /api/govern endpoint and return (decision_json, http_status).
+    This is a blocking network call - run it in a thread executor so it
+    doesn't stall the async event loop."""
+    body = json.dumps(event).encode("utf-8")
+    req = urllib.request.Request(
+        GOVERN_URL,
+        data=body,
+        headers={
+            "Authorization": "Bearer " + ailleash_key,
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return json.loads(r.read()), r.status
+    except urllib.error.HTTPError as e:
+        try:
+            return json.loads(e.read()), e.code
+        except Exception:
+            return {"decision": "BLOCK", "error": "govern_returned_unreadable_error"}, e.code
+    except Exception as e:
+        # Network failure, timeout, DNS issue, etc. Fail closed - if we
+        # can't reach the compliance engine, we don't guess ALLOW.
+        return {"decision": "BLOCK", "error": "govern_unreachable: " + str(e)}, 503
+
+
+def parse_request(raw_head: bytes):
+    """Parse the request line + headers from the raw bytes read up to \\r\\n\\r\\n."""
+    text = raw_head.decode("utf-8", errors="ignore")
+    lines = text.split("\r\n")
+    request_line = lines[0]
+    parts = request_line.split(" ")
+    method = parts[0] if len(parts) > 0 else "GET"
+    path = parts[1] if len(parts) > 1 else "/"
+    headers = {}
+    for line in lines[1:]:
+        if not line or ":" not in line:
+            continue
+        k, _, v = line.partition(":")
+        headers[k.strip().lower()] = v.strip()
+    return method, path, headers
+
+
+def build_forward_request(method, upstream_path, headers, body: bytes, upstream_host):
+    """Rebuild the HTTP request to send to the real provider. Strips our
+    own gateway-only headers and sets the correct Host."""
+    drop = {"host", "x-sebbi-key", "x-sebbi-event", "content-length"}
+    lines = [method + " " + upstream_path + " HTTP/1.1", "Host: " + upstream_host]
+    for k, v in headers.items():
+        if k in drop:
+            continue
+        lines.append(k + ": " + v)
+    lines.append("Content-Length: " + str(len(body)))
+    lines.append("Connection: close")
+    head = ("\r\n".join(lines) + "\r\n\r\n").encode("utf-8")
+    return head + body
+
+
+async def read_full_request(reader):
+    """Read headers, then read exactly Content-Length bytes of body if present."""
+    head = await reader.readuntil(b"\r\n\r\n")
+    method, path, headers = parse_request(head)
+    length = int(headers.get("content-length", "0") or "0")
+    body = b""
+    if length:
+        body = await reader.readexactly(length)
+    return method, path, headers, body
+
+
+async def forward_to_provider(upstream_host, request_bytes: bytes):
+    """Open a real TLS connection to the real provider and return the raw
+    response bytes, unmodified."""
+    ctx = ssl.create_default_context()
+    reader, writer = await asyncio.open_connection(upstream_host, 443, ssl=ctx)
+    try:
+        writer.write(request_bytes)
+        await writer.drain()
+        response = await reader.read(-1)
+        return response
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
+def default_event(headers, device_id_fallback):
+    """Build a sensible /api/govern event from what the customer sent,
+    falling back to safe defaults for anything they didn't specify.
+    Customers can override any field by sending an X-Sebbi-Event JSON header."""
+    override = headers.get("x-sebbi-event")
+    if override:
+        try:
+            ev = json.loads(override)
+        except Exception:
+            ev = {}
+    else:
+        ev = {}
+    ev.setdefault("user_id", headers.get("x-sebbi-user", "gateway_anonymous"))
+    ev.setdefault("action", "ai_request")
+    ev.setdefault("amount", 0)
+    ev.setdefault("country", headers.get("x-sebbi-country", "UK"))
+    ev.setdefault("device_id", headers.get("x-sebbi-device", device_id_fallback))
+    ev.setdefault("anomaly", 0)
+    ev.setdefault("device_risk", 0)
+    return ev
+
+
+class ComplianceGatewayProxy:
+    def __init__(self, host="0.0.0.0", port=PROXY_PORT):
+        self.host = host
+        self.port = port
+
+    async def start(self):
+        server = await asyncio.start_server(self.handle_client_traffic, self.host, self.port)
+        logging.info("AILeash Gateway operational on :%s (real enforcement, real forwarding)", self.port)
+        async with server:
+            await server.serve_forever()
+
+    async def handle_client_traffic(self, reader, writer):
+        peer = writer.get_extra_info("peername")
+        try:
+            method, path, headers, body = await read_full_request(reader)
+        except Exception as e:
+            logging.warning("Bad request from %s: %s", peer, e)
+            writer.close()
+            return
+
+        try:
+            # Route: /openai/... or /anthropic/... selects the real provider.
+            segments = path.strip("/").split("/", 1)
+            provider_key = segments[0] if segments else ""
+            upstream_path = "/" + segments[1] if len(segments) > 1 else "/"
+
+            if provider_key not in PROVIDERS:
+                self._reject(writer, 404, "unknown_provider",
+                              "Path must start with /openai/ or /anthropic/")
+                return
+
+            ailleash_key = headers.get("x-sebbi-key", "")
+            if not ailleash_key:
+                self._reject(writer, 401, "missing_compliance_key",
+                              "Include your AILeash API key in the X-Sebbi-Key header.")
+                return
+
+            device_id_fallback = str(peer[0]) if peer else "unknown_device"
+            event = default_event(headers, device_id_fallback)
+
+            loop = asyncio.get_event_loop()
+            decision_json, status = await loop.run_in_executor(
+                None, call_govern, ailleash_key, event
+            )
+            decision = decision_json.get("decision", "BLOCK")
+
+            if status != 200 or decision == "BLOCK":
+                logging.warning("[BLOCKED] %s -> %s (%s)", peer, provider_key, decision_json.get("reasons", decision_json.get("error", "")))
+                self._reject(writer, 403, "compliance_block", None, decision_json)
+                return
+
+            # ALLOW or CHALLENGE both proceed - CHALLENGE just means the
+            # customer's own code should show the user the verification
+            # link included in decision_json. We don't invent enforcement
+            # server.py doesn't have.
+            upstream_host = PROVIDERS[provider_key]
+            forward_bytes = build_forward_request(method, upstream_path, headers, body, upstream_host)
+
+            real_response = await forward_to_provider(upstream_host, forward_bytes)
+
+            tx_seal = hmac.new(PROXY_SIGNING_KEY, real_response[:2048], hashlib.sha256).hexdigest()
+            logging.info("[ROUTED] %s -> %s decision=%s seal=%s", peer, provider_key, decision, tx_seal[:16])
+
+            writer.write(real_response)
+            await writer.drain()
+
+        except Exception as e:
+            logging.error("Proxy error for %s: %s", peer, e)
+            try:
+                self._reject(writer, 502, "gateway_error", str(e))
+            except Exception:
+                pass
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    def _reject(self, writer, code, reason, message=None, extra=None):
+        payload = {"error": reason}
+        if message:
+            payload["message"] = message
+        if extra:
+            payload["compliance_decision"] = extra
+        body = json.dumps(payload).encode("utf-8")
+        status_text = {401: "Unauthorized", 403: "Forbidden", 404: "Not Found", 502: "Bad Gateway"}.get(code, "Error")
+        resp = (
+            "HTTP/1.1 " + str(code) + " " + status_text + "\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: " + str(len(body)) + "\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode("utf-8") + body
+        writer.write(resp)
+
+
+if __name__ == "__main__":
+    gateway = ComplianceGatewayProxy()
+    try:
+        asyncio.run(gateway.start())
+    except KeyboardInterrupt:
+        logging.info("Gateway offline.")
+
+```
 
 
 ## `ordering_test.py`
@@ -1990,584 +2722,5 @@ if __name__ == "__main__":
         with open(out, "w") as f:
             f.write(report)
         print(f"Report saved to {out}")
-
-```
-
-
-## `AILeash-API-Reference-v6.4.2.md`
-
-256 lines, 6799 bytes
-
-```markdown
-# AILeash v6.4.2 — Complete API Reference
-
-## Core Decision Endpoint
-
-### POST /api/govern
-**The engine. Every action scores here.**
-
-Auth: `Bearer YOUR_API_KEY`
-
-**Request:**
-```json
-{
-  "user_id": "string (required)",
-  "action": "string (required) — payment/login/message/transfer/checkout/api_call",
-  "amount": "number (optional, default 0) — monetary value in GBP",
-  "country": "string (required) — ISO 3166-1 alpha-2 code",
-  "device_id": "string (required) — unique device identifier",
-  "anomaly": "number 0..1 (optional) — behavioural anomaly score",
-  "device_risk": "number 0..1 (optional) — device risk score"
-}
-```
-
-**Response (200 OK):**
-```json
-{
-  "decision": "ALLOW|CHALLENGE|BLOCK",
-  "score": 0.0..1.0,
-  "trust": 0.05..1.0,
-  "reasons": ["velocity_spike", "high_amount", "country_shift"],
-  "audit_hash": "sha256_hex_string",
-  "block_index": 12345,
-  "receipt_seq": 42,
-  "timestamp": 1719072000.0,
-  "challenge_url": "https://sebbi.pro/verify-challenge?token=...",
-  "challenge_expires_in": 900
-}
-```
-
-**Error responses:**
-- `401 Unauthorized` — Missing or invalid API key
-- `403 Forbidden` — Account inactive or over quota
-- `429 Too Many Requests` — Rate limited
-- `503 Service Unavailable` — Server overloaded
-
----
-
-## Account Management
-
-### POST /api/keys or /signup
-**Create a new API key. Instant. No card. No humans in the loop.**
-
-No auth required.
-
-**Request:**
-```json
-{
-  "email": "user@example.com (required)",
-  "name": "John Doe (optional)",
-  "phone": "+441234567890 (optional)",
-  "org": "Acme Corp (optional)",
-  "product": "aileash|guardian|sonicboom|sentinel (default: aileash)",
-  "devices": 1..1000000 (default: 1),
-  "ref_code": "REF-XXXX-1234 (optional)"
-}
-```
-
-**Response (200 OK):**
-```json
-{
-  "api_key": "al_live_...",
-  "email": "user@example.com",
-  "product": "aileash",
-  "devices": 1,
-  "monthly_cost": 0.50,
-  "quota": 100,
-  "ref_code": "REF-JOHN-5678",
-  "badge_id": "abc123def456",
-  "message": "100 free decisions. Then 50p per device per month via Stripe."
-}
-```
-
----
-
-## Verification & Public Endpoints
-
-### GET /api/spec
-**Engine specification. Public. No auth.**
-
-**Response (200 OK):**
-```json
-{
-  "engine": "AILeash v6.4.2",
-  "version": "6.4.2",
-  "signals": 9,
-  "decision_latency_ms": 28,
-  "threshold_allow": 0.35,
-  "threshold_challenge": 0.70,
-  "threshold_block": 1.0,
-  "features": ["deterministic scoring", "tamper-evident chain", "real-time alerts", "gapless receipts", "sovereign deployment"]
-}
-```
-
-### GET /api/verify-chain
-**Full audit chain integrity proof. Public. No auth.**
-
-**Response (200 OK):**
-```json
-{
-  "valid": true,
-  "blocks": 45678,
-  "genesis": "GENESIS",
-  "tip": "abc123...",
-  "message": "Chain intact. No tampering detected.",
-  "verifiable_by": "anyone, anywhere"
-}
-```
-
-### GET /api/health
-**Server health and load. Public. No auth.**
-
-**Response (200 OK):**
-```json
-{
-  "status": "ok",
-  "version": "6.4.2",
-  "uptime_seconds": 864000,
-  "rps": 42,
-  "timestamp": 1719072000.0
-}
-```
-
----
-
-## Real-time Dashboards
-
-### GET /api/pulse
-**Live risk posture. Your current state.**
-
-Auth: `Bearer YOUR_API_KEY`
-
-**Response (200 OK):**
-```json
-{
-  "last_hour": {
-    "ALLOW": 486,
-    "CHALLENGE": 23,
-    "BLOCK": 4
-  },
-  "recent": [
-    {
-      "ts": 1719072000,
-      "user_id": "u_7f2",
-      "action": "payment",
-      "decision": "ALLOW",
-      "score": 0.12,
-      "reasons": [],
-      "audit_hash": "abc123..."
-    }
-  ],
-  "chain_tip": "abc123...",
-  "message": "All green. Chain tip sealed."
-}
-```
-
----
-
-## Billing & Webhooks
-
-### POST /stripe-webhook
-**Stripe webhook receiver. Signature verified automatically.**
-
-Supports events:
-- `checkout.session.completed` — User upgraded
-- `invoice.paid` — Monthly subscription paid
-- `customer.subscription.deleted` — User cancelled
-- `invoice.payment_failed` — Payment failed
-
----
-
-## Four Products. One Engine.
-
-### AILeash
-- **What:** Every AI decision your platform makes about a person gets scored, explained, and sealed.
-- **Who:** Platforms using AI for any regulated decision (lending, hiring, content moderation, fraud, access control).
-- **Price:** 50p per device per month + your margin.
-- **Free tier:** 100 decisions/month, no card.
-
-### Guardian
-- **What:** Free message checker for families. Child pastes a message in, gets instant plain-English assessment against grooming patterns.
-- **Who:** Families. Free forever. No card. No catch.
-- **Price:** Free. Always.
-- **Built for:** ICO Children's Code, Online Safety Act, child safety.
-
-### SonicBoom
-- **What:** One line of code. Drops into AWS, Azure, GCP, OpenAI, Anthropic. Adds full compliance audit chain to every call.
-- **Who:** Platforms already running AI in the cloud.
-- **Price:** 50p per device per month + your margin.
-- **Latency:** No impact. Chain sealing is asynchronous.
-
-### Sentinel
-- **What:** Fraud and anomaly alerting. Scores unusual patterns (500 messages in a minute, login from new country, velocity spikes) in real-time.
-- **Who:** Platforms managing fraud, abuse, takeovers.
-- **Price:** 50p per device per month + your margin.
-- **Real-time:** Alerts the moment thresholds trip.
-
----
-
-## The Score Formula (Immutable)
-
-**Raw weighted sum (Σ_raw):**
-```
-Σ_raw =
-  (1 − trust) × 0.30
-  + min(velocity_60s / 20, 1) × 0.15
-  + min(velocity_5m / 50, 1) × 0.10
-  + min(velocity_1h / 200, 1) × 0.10
-  + min(ln(1+amount) / ln(1+10000), 1) × 0.15
-  + device_risk × 0.10
-  + behavioural_anomaly × 0.10
-  + country_shift × 0.10
-  + unsafe_country × 0.10
-```
-
-**Normalization:** the nine weights above sum to 1.20, not 1.0. To keep every signal's *relative* importance exactly as designed while guaranteeing the score behaves as a true 0–1 weighted average (not one that can reach BLOCK-level values from fewer combined signals than intended), divide by the actual weight total before clamping:
-
-```
-WEIGHT_TOTAL = 0.30 + 0.15 + 0.10 + 0.10 + 0.15 + 0.10 + 0.10 + 0.10 + 0.10   # = 1.20
-
-score = clamp( Σ_raw / WEIGHT_TOTAL , 0, 1 )
-
-decision = ALLOW if score < 0.35
-         = CHALLENGE if score < 0.70
-         = BLOCK otherwise
-```
-
-No machine learning. No drift. No retraining. Weights are written in code and cannot change without a new release. `WEIGHT_TOTAL` is a fixed constant (1.20) recomputed only if a signal is added, removed, or reweighted in a future release — never at runtime.
-
----
-
-## Rate Limits
-
-- **Free tier:** 100 decisions/month
-- **Paid:** Unlimited (or by plan)
-- **Public endpoints:** No rate limit
-
----
-
-## Documentation
-
-- **Homepage:** https://sebbi.pro
-- **Whitepaper:** https://sebbi.pro/whitepaper
-- **Developers:** https://sebbi.pro/developers
-- **Scanner (free):** https://sebbi.pro/scan
-- **Guardian:** https://sebbi.pro/guardian-app
-- **Contact:** justrightdecorators@gmail.com
-
-```
-
-
-## `LICENCE`
-
-22 lines, 1074 bytes
-
-```
-MIT License
-
-Copyright (c) 2026 Monop (Blyth, UK)
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-```
-
-
-## `README.md`
-
-277 lines, 15728 bytes
-
-```markdown
-<div align="center">
-
-```
-        ┌─────────────────────────────────────────────────┐
-        │   s e b b i . p r o                              │
-        │                                                  │
-        │   O N E   C H A I N .   E V E R Y   P R O O F .   │
-        └─────────────────────────────────────────────────┘
-```
-
-### The tamper-evident evidence layer for AI decisions, payments, and records.
-
-*Every event sealed into a hash chain at the moment it happens —*
-*the decision, **and the basis it rested on** — unalterable by anyone. Including us.*
-
-<br>
-
-[![live](https://img.shields.io/badge/live-sebbi.pro-c9a84c?style=for-the-badge)](https://sebbi.pro)
-[![verify the chain](https://img.shields.io/badge/verify_the_chain-open_endpoint-7fe3b0?style=for-the-badge)](https://sebbi.pro/api/verify-chain)
-[![seal something free](https://img.shields.io/badge/seal_something-free,_no_account-7cc8ff?style=for-the-badge)](https://sebbi.pro/seal)
-
-**[Try it](https://sebbi.pro/seal)** · **[Verify it](https://sebbi.pro/verify)** · **[Read the code](https://sebbi.pro/brain)** · **[Developer docs](https://sebbi.pro/developers)** · **[Whitepaper](https://sebbi.pro/whitepaper)**
-
-</div>
-
----
-
-> ### *A system that does not trust its own creator*
-> ### *is the only kind whose records qualify as evidence.*
-
----
-
-## Don't read about it. Watch it work.
-
-Here is a **real** four-block chain. Every hash below is reproducible — same inputs, same seals, forever. Copy the recipe at the bottom and compute them yourself.
-
-```
-  #   EVENT                             RESULT      SEAL (SHA-256, truncated)
-  ─────────────────────────────────────────────────────────────────────────
-  1   system_regmap                     ALLOW       411ffd9a31a3d9f4…
-  2   seal_post: quarterly_report.pdf   NOTARISED   c7309616a9e92bc7…
-  3   govern: payment 9000 GBP          BLOCK       293181a2bc2dab88…
-  4   brain: approve supplier 88        ALLOW       6abba40eb964959e…
-  ─────────────────────────────────────────────────────────────────────────
-  genesis  9fd06d6fdc19761d…                         tip  6abba40eb964959e…
-```
-
-Now watch someone try to cover up that blocked £9,000 payment by flipping block 3 from **BLOCK** to **ALLOW**:
-
-```
-  block 3 altered  →  tip becomes  5e15bc5710426088…   ❌  ≠ 6abba40eb964959e…
-```
-
-**The tip changed. The forgery is exposed instantly, by arithmetic, to anyone — no account, no trust required.** That is the entire product in six lines. Everything below is detail.
-
-<details>
-<summary><b>▸ Reproduce every hash yourself (10 lines of Python)</b></summary>
-
-```python
-import hashlib, json
-seal = lambda prev, ts, ev, res, basis: hashlib.sha256(
-    json.dumps({"prev":prev,"ts":ts,"event":ev,"result":res,"basis":basis},
-               sort_keys=True).encode()).hexdigest()
-
-prev = hashlib.sha256(b"AILEASH_BRAIN_GENESIS|sebbi.pro|v5").hexdigest()
-chain = [("system_regmap","ALLOW","regmap-v7"),
-         ("seal_post: quarterly_report.pdf","NOTARISED","NO_BASIS"),
-         ("govern: payment 9000 GBP","BLOCK","invoice_4471|regmap-v7"),
-         ("brain: approve supplier 88","ALLOW","invoice_4471|regmap-v7")]
-ts = 1752940000
-for ev,res,basis in chain:
-    prev = seal(prev, ts, ev, res, basis); ts += 3600
-    print(prev[:16], "…", ev)
-# final line prints the tip: 6abba40eb964959e …
-```
-Change one character of one event and every seal after it changes. That's the whole idea.
-</details>
-
----
-
-## Why this exists
-
-Every system keeps logs. Logs live in databases. Databases can be edited — by an attacker, an insider, or the operator itself. So an ordinary log only ever says *"this is what we currently claim happened."* It can never say *"and nobody changed it since."*
-
-Nobody notices the difference — until a regulator, a court, an insurer, or a customer asks for **proof**. Then *"our system recorded it"* and *"here is proof it wasn't changed"* become two very different sentences. Only the second carries weight.
-
-**sebbi.pro produces the second sentence — automatically, as a by-product of your system doing its normal work.**
-
----
-
-## The chain, in one formula
-
-```
-seal(n) = SHA-256( seal(n−1) · timestamp · event · result · basis )
-```
-
-| Property | What it means |
-|---|---|
-| **Tamper-evident** | Each seal contains its predecessor. Alter history → every later seal fails, publicly. |
-| **Gapless receipts** | Every decision gets a sequence number in the same transaction. Edited records break the chain; **missing** records break the sequence. |
-| **Truncation-evident** | The tip is anchored per-write. Chop blocks off the end → the anchor breaks. |
-| **Basis-sealed** | Not just *what* was decided — *what it rested on*: sources, versions, ruleset. Same block. |
-| **Jurisdiction-tagged** | Every decision sealed with the regulatory frameworks that applied to it at that moment. |
-| **Fast** | Score + decide + seal + respond inline, **~28 ms** median. |
-| **Crash-safe** | WAL journaling, full-sync commits, single-lock seal path, no race window, daily backups. |
-
-> **The one honest boundary, stated up front:** basis-sealing proves **what** a decision relied on — not that it was **correct**. Cryptography verifies integrity, never truth. Any product claiming to prove correctness is misdescribing what maths can do. We won't.
-
----
-
-## The products — one chain underneath all of them
-
-| | Product | What it does | Access |
-|---|---|---|---|
-| 🧠 | **Brain** | Instruction gate for AI. Blocks prompt injection, exfiltration, compliance-bypass, child-safety and destruction patterns — with unicode/obfuscation defences — and seals every decision + basis. Pure Python, runs on your machine. | **Free download** |
-| ⚡ | **SonicBoom** | Decision engine. Any event scored in ~28ms: ALLOW / CHALLENGE / BLOCK, plain-English reasons, sealed before it replies. Per-user trust learned over time — lost 8× faster than earned, so burst attacks destroy their own standing. Hosted human-oversight challenge flow, itself sealed. | API key |
-| 🔐 | **Delegation layer** | Signed authority tokens (who may approve, to what limit, until when — the grant itself sealed), provider-agnostic KYC result sealing (outcome provable, zero personal data held), and per-decision jurisdiction tagging. Article 14 human oversight as engineering. | API key |
-| 🛡️ | **Sentinel** | Fraud pattern + velocity detection: credential stuffing, card testing, country-jump takeovers. Flags sealed as evidence. | API key |
-| 👁️ | **Guardian** | Child-safety flags: grooming patterns (secrecy, isolation, channel-moving). Content never stored — only fingerprints. Every flag sealed for parents, platforms, authorities. | Platform |
-| 📝 | **Post Notary** | Prove exact text existed on a date, unchanged. | **Free, no account** |
-| 🆔 | **Identity Notary** | Prove a profile is the genuine original — kills impersonation. | **Free, no account** |
-| 💷 | **Payment Notary** | Stop invoice/APP fraud. Seal real bank details once; payers verify a code before funds move. MISMATCH → payment stops. The check itself is sealed. | **Free, no account** |
-
-**Privacy by design:** the notaries fingerprint content *locally*. Your content never leaves your device — only the 64-character hash is sealed. The KYC sealer keeps only the SHA-256 of the provider reference — never the document.
-
----
-
-## The open standard — `ai.txt`
-
-Like `robots.txt` for crawlers and `security.txt` for researchers — **`ai.txt`** is a public, machine-readable declaration of how your AI is governed: decision model, audit method, regulations designed toward, human override. Its companion **`comply.txt`** declares the rulebook every instruction is subject to.
-
-Declarations are claims. **Sealing them into the chain makes them provable** — and their history tamper-evident.
-
-```
-  declaration  →  rulebook  →  enforcement
-     ai.txt        comply.txt      brain.py
-     "we claim"    "the rules"     "the code that proves it"
-```
-
-Publish yours at `/.well-known/ai.txt`. Read [ours](https://sebbi.pro/.well-known/ai.txt).
-
----
-
-## The stack — how it all fits
-
-```
-  DECLARATION    ai.txt · comply.txt     what we claim, publicly
-       │
-  GATE           Brain                   instructions checked before the AI acts
-       │
-  DELEGATION     authority · identity ·  who may act, who they legally are,
-                 jurisdiction            which rules governed the moment
-       │
-  DECISION       SonicBoom               every event: allow / challenge / block
-       │
-  DETECTION      Sentinel · Guardian     attack patterns · child-safety patterns
-       │
-  PUBLIC ACCESS  the Notaries            the same chain, free, for anyone
-       │
-       ▼
-  ╔══════════════════════════════════════════════════════════════════╗
-  ║  EVIDENCE     the hash chain                                      ║
-  ║               everything above seals into here —                 ║
-  ║               action + basis + receipt · gapless · anchored ·    ║
-  ║               publicly verifiable · unalterable by anyone        ║
-  ╚══════════════════════════════════════════════════════════════════╝
-```
-
-**Evidence accrues as a by-product of the system working.** Nobody remembers to log anything. Nobody compiles an audit file before an inspection. The proof exists because the system ran — equally trustworthy whether the operator is honest or not. Which is the only kind of trustworthy that counts.
-
----
-
-## Integrate in minutes
-
-```python
-# ── Notary: seal anything, free, no key. Content stays on your machine. ──
-import hashlib, requests
-fp = hashlib.sha256(content.encode()).hexdigest()
-requests.post("https://sebbi.pro/api/post/seal", json={"fingerprint": fp})
-#   → { sealed, seal, block_index, code }   ← keep the code; anyone can verify it
-
-# ── Decision engine: score + seal an event (API key) ──
-requests.post("https://sebbi.pro/api/govern",
-  headers={"Authorization":"Bearer YOUR_KEY"},
-  json={"user_id":"u1","action":"payment","amount":9000,
-        "country":"UK","device_id":"d1","anomaly":0,"device_risk":0})
-#   → ALLOW / CHALLENGE / BLOCK · reasons · jurisdiction tag · sealed hash · receipt_seq
-
-# ── Delegated authority: grant sealed, enforcement deterministic ──
-tok = requests.post("https://sebbi.pro/api/authority/issue",
-  headers={"Authorization":"Bearer YOUR_KEY"},
-  json={"user_id":"u1","role":"payments_approver",
-        "max_amount":5000,"ttl_hours":24}).json()["authority_token"]
-#   include as "authority_token" in govern events — over-limit or expired
-#   authority escalates the verdict with the reason sealed
-
-# ── KYC result: outcome provable, zero personal data held ──
-requests.post("https://sebbi.pro/api/identity/kyc-seal",
-  headers={"Authorization":"Bearer YOUR_KEY"},
-  json={"user_id":"u1","provider":"onfido","verified":True,
-        "reference":"chk_9f2"})
-#   → only the SHA-256 of the reference is stored — never the document
-
-# ── Brain: gate an instruction and seal its basis (free, local) ──
-from brain import BrainGovernor
-BrainGovernor().evaluate("approve payment to supplier 88", basis={
-  "sources":["invoice_4471.pdf"], "source_versions":["sha256:ab12…"],
-  "ruleset":"AI-TXT/1.0 + EU-AI-Act-2024/1689", "ruleset_version":"regmap-v7"})
-```
-
-Full reference → **[sebbi.pro/developers](https://sebbi.pro/developers)**
-
----
-
-## What this evidences — stated precisely
-
-A versioned, hash-sealed **regulation map** links each capability to the obligations it helps evidence: EU AI Act record-keeping, transparency & human-oversight (Articles 9, 12, 13, 14 — delegated-authority tokens directly supporting Article 14's attributable human oversight), UK Online Safety Act duty-of-care documentation, ICO Children's Code. Jurisdiction tagging extends this to the per-decision level: every sealed block records which frameworks applied at the moment of decision.
-
-These tools help you **evidence** your obligations — tamper-evident, explainable, independently verifiable records of what your systems decided and why. **They do not, on their own, make you compliant. No software does. Anyone who says otherwise is selling you something.**
-
----
-
-## Honest limits — because the whole product is honesty
-
-- **Sealing proves integrity, not truth** — exact content, exact time, unchanged. Not that it was true or agreed to.
-- **Basis-sealing proves what was relied on, not that it was right** — cryptography can't verify the real world.
-- **Authority tokens prove the grant, not the wisdom** — who was empowered, to what limit, until when. Not that granting it was a good idea.
-- **Jurisdiction tagging records applicable frameworks; it does not decide law** — courts do that. It is a versioned, sealed lookup — nothing grander, deliberately.
-- **Brain's filter is a first line, not a wall** — known patterns caught; novel phrasing can pass. The guarantee is the sealed record.
-- **Fingerprints match exact content** — a re-encoded copy or paraphrase won't match.
-- **We evidence compliance; we don't confer it.**
-
-*A vendor who states their limits is giving you the strongest available evidence of how they'll behave when it matters.*
-
----
-
-## Deployment & pricing
-
-- **Cloud** — a few lines against the hosted API. Notaries and Brain free forever.
-- **Sovereign** — the whole engine inside your own network. Offline HMAC-signed 365-day licences, no phone-home, air-gap ready.
-- **50p per active device / month.** Partners set their own pricing above the platform fee.
-
-## Investors
-
-The whitepaper carries a dedicated investor section — market timing (EU AI Act, August 2026), the metered per-device model, the moat, and the stage stated honestly: **[sebbi.pro/whitepaper](https://sebbi.pro/whitepaper)** · justin@monopcontent.com
-
----
-
-<div align="center">
-
-## Check us. Don't trust us.
-
-*That's not a slogan. It's the design requirement — and the only standard by which an evidence layer should ever be judged.*
-
-**[Verify the chain now →](https://sebbi.pro/api/verify-chain)**
-
-<br>
-
-```
-  Built by Justin Dobson · Monop Content · Blyth, Northumberland, UK
-  Solo-built, from scratch, on a phone —
-  because the evidence layer wasn't going to build itself.
-```
-
-[LinkedIn](https://www.linkedin.com/in/justin-dobson-037721217) · [sebbi.pro](https://sebbi.pro)
-
-</div>
-
-<!--
-Keywords: tamper-evident audit trail · AI governance · AI compliance evidence ·
-EU AI Act record keeping · hash chain audit log · APP fraud prevention ·
-invoice verification · prompt injection defence · AI decision audit ·
-delegated authority tokens · KYC evidence sealing · jurisdiction tagging ·
-ai.txt standard · comply.txt · cryptographic proof of action · immutable audit log ·
-agentic AI governance · sovereign AI deployment · SonicBoom · Brain · Sentinel · Guardian
--->
 
 ```
