@@ -1,8 +1,6 @@
 # Codebase — part 6 of 16
 
 Contains:
-- `modules/witness.py`
-- `Verify_ai.py`
 - `ai_act_ranker.py`
 - `ai_safety_scanner.py`
 - `aigrade_insert.py`
@@ -11,607 +9,9 @@ Contains:
 - `anchor.py`
 - `board_auditor.py`
 - `brain.py`
-
-
-## `modules/witness.py`
-
-514 lines, 23310 bytes
-
-```python
-"""
-Mutual witness network - /x/witness/<action>
-
-THE PROBLEM
------------
-Every compliance vendor, this one included, holds the evidence about its own
-conduct. A hash chain stops anyone else altering it. It does not stop the
-operator rebuilding the whole chain from scratch and presenting the result as
-history. External anchoring narrows that to "you cannot rewrite anything older
-than your last anchor" - which is good, and still not enough.
-
-WHAT THIS DOES
---------------
-Platforms witness each other.
-
-Each platform periodically hands its current chain tip to its peers. Each peer
-seals that tip into its OWN chain. From that moment the first platform's
-history is recorded inside chains it does not control - and those chains are
-themselves anchored externally.
-
-To rewrite your own history now, you would need every peer who witnessed you
-to rewrite theirs too, in step, and re-anchor all of it. That is not a
-technical exercise. That is a conspiracy, and it grows harder with every
-platform that joins.
-
-WHY observe IS OPEN
--------------------
-A witnessing network that only accepts tips from account holders is not a
-witnessing network, it is a customer list. Anyone must be able to hand us a
-tip without asking permission. Unauthenticated observations are filed under
-ANON_KEY, and the router meters them per client address.
-
-NAMES, AND WHAT WE CAN ACTUALLY PROVE ABOUT THEM
-------------------------------------------------
-The chain name in a submission is self-declared. Anyone can post under any
-name. We do not solve that with accounts, because accounts would make the
-network closed. We solve it by publishing how strong each claim is, and by
-remembering.
-
-Two independent checks run on every submission, and NEITHER of them can
-reject it. A submission is always sealed. What changes is what we say about it.
-
-1. LIVENESS - is there a real chain behind this name?
-   If the submission carries a url, we fetch it and compare what it serves
-   to what was submitted.
-     confirmed      the url serves exactly the tip that was submitted
-     live           the url serves a valid tip, but a different one. A busy
-                    chain moves between submitting and our fetching, so this
-                    is normal and honest, not a failure
-     self-declared  no url, or we could not reach it, or it served nonsense
-
-   Note what this does and does not prove. It proves the submitter operates
-   a live chain producing that data. It does NOT prove they are who they say.
-   Anyone running a real chain can point a stolen name at their own url and
-   pass this check cleanly.
-
-2. NAME BINDING - is this the same operator as last time?
-   The first time a name is seen with a url we can reach, we record that url
-   against the name. Every later submission under that name is compared.
-     first-use      never seen this name before, binding recorded
-     bound          same url as the first time. Same operator, consistently
-     conflict       this name has been submitted from a different url than
-                    the one it was first bound to
-
-   A conflict is not proof of theft. Operators move hosts. But it is exactly
-   the event anyone auditing the network needs to see, and it is recorded
-   permanently in our chain rather than resolved quietly by us.
-
-   This is what actually closes name theft. Check 1 alone does not.
-
-SSRF
-----
-Check 1 makes our server fetch a url chosen by an anonymous stranger. Done
-naively that is a hole considerably worse than the one it fixes: it would let
-anyone use us to reach services on our own private network, and to bounce
-traffic at a third party. So the fetcher only speaks http and https, only on
-ports 80 and 443, resolves the hostname first and refuses any address that is
-private, loopback, link-local, reserved or multicast, never follows a
-redirect, times out fast, and stops reading after a small cap.
-
-HONEST LIMITS
--------------
-- Witnessing proves a tip EXISTED at a time. It says nothing about whether the
-  records behind it are true or complete. Garbage sealed on time is still
-  garbage.
-- A peer can stop publishing. Gaps are visible, which is the point, but
-  nobody can force participation.
-- Two colluding platforms witnessing only each other prove very little. The
-  guarantee comes from breadth.
-- This module does not verify a peer's chain is internally valid. It records
-  what they claimed, when, and how well it stood up to checking.
-- The liveness fetch resolves a hostname and then fetches it. An attacker
-  controlling DNS could answer differently between those two steps. Closing
-  that needs the connection pinned to the checked address, which is more
-  machinery than this warrants today. It is written down rather than hidden.
-
-    GET  /x/witness/tip                 our current tip, for peers to record
-    POST /x/witness/observe             chain, tip, url - we seal their tip
-                                        (peer accepted as an alias for chain;
-                                         optional peer_ts or ts, epoch or ISO)
-    GET  /x/witness/attest?peer=&tip=   did we witness this, and when
-    GET  /x/witness/peers               who we witness, and how consistently
-    GET  /x/witness/history?peer=       every tip we hold for that peer
-"""
-
-import ipaddress
-import json
-import re
-import socket
-import time
-import urllib.error
-import urllib.request
-from datetime import datetime, timezone
-from urllib.parse import urlparse
-
-VERSION = "1.1"
-HEX64 = re.compile(r"^[0-9a-f]{64}$")
-
-# Routes that need no API key. A third party must be able to check the
-# network without holding an account, or the claim that anyone can audit
-# it is not true.
-PUBLIC = {("GET", "attest"), ("GET", "peers"), ("GET", "tip"),
-          ("POST", "observe")}
-
-# Observations arriving without a key are filed under this.
-ANON_KEY = "public-witness"
-
-# Liveness fetch limits. Deliberately tight - this runs on an anonymous
-# request, so every one of these is also a denial-of-service control.
-FETCH_TIMEOUT = 4
-MAX_FETCH_BYTES = 65536
-ALLOWED_SCHEMES = ("http", "https")
-ALLOWED_PORTS = (80, 443)
-
-_ready = False
-
-
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        c = ctx["conn"]
-        c.execute("CREATE TABLE IF NOT EXISTS witness_log(id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,peer TEXT,tip TEXT,peer_ts REAL,observed REAL,audit_hash TEXT,block_index INTEGER,note TEXT)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_wit_peer ON witness_log(api_key,peer)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_wit_tip ON witness_log(tip)")
-
-        # Added in 1.1. Existing rows keep NULL, which reads as unchecked -
-        # correct, because they were.
-        have = set()
-        try:
-            for row in c.execute("PRAGMA table_info(witness_log)").fetchall():
-                have.add(row[1])
-        except Exception:
-            pass
-        for col in ("url", "liveness", "name_status"):
-            if col not in have:
-                try:
-                    c.execute("ALTER TABLE witness_log ADD COLUMN %s TEXT" % col)
-                except Exception:
-                    pass
-
-        # Name bindings are network-wide, not per api_key. A name means one
-        # operator across the whole network or it means nothing.
-        c.execute("CREATE TABLE IF NOT EXISTS witness_names(peer TEXT PRIMARY KEY,url TEXT,first_seen REAL,first_liveness TEXT)")
-        c.commit()
-    _ready = True
-
-
-def _iso(ts):
-    if not ts:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
-
-def _our_tip(ctx):
-    with ctx["lock"]:
-        r = ctx["conn"].execute("SELECT audit_hash,ts,id FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()
-    if not r:
-        return "GENESIS", None, 0
-    return r[0], r[1], r[2]
-
-
-def _tip(ctx, api_key):
-    tip, ts, height = _our_tip(ctx)
-    return {"tip": tip, "height": height, "sealed_at": _iso(ts),
-            "witness_version": VERSION,
-            "note": "Record this tip in your own chain. Hand us yours at /x/witness/observe and we will record it in ours.",
-            "verify": "/api/verify-chain checks this chain end to end. /api/anchor-status shows the external timestamp."}, 200
-
-
-# ----------------------------------------------------------------------
-# liveness fetch - see the SSRF section above before touching any of this
-# ----------------------------------------------------------------------
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """A redirect is an instruction from a stranger to fetch a second url we
-    never checked. Refuse rather than follow."""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-
-_opener = urllib.request.build_opener(_NoRedirect)
-
-
-def _address_allowed(host, port):
-    """Resolve and refuse anything that isn't plainly on the public internet."""
-    try:
-        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
-    except Exception as exc:
-        return False, "could not resolve host (%s)" % type(exc).__name__
-    if not infos:
-        return False, "host resolved to nothing"
-    for info in infos:
-        raw = info[4][0]
-        try:
-            addr = ipaddress.ip_address(raw)
-        except ValueError:
-            return False, "unreadable address"
-        if (addr.is_private or addr.is_loopback or addr.is_link_local
-                or addr.is_reserved or addr.is_multicast or addr.is_unspecified):
-            return False, "address is not publicly routable"
-    return True, None
-
-
-def _url_allowed(url):
-    if not url or not isinstance(url, str) or len(url) > 500:
-        return False, "no usable url"
-    try:
-        parts = urlparse(url.strip())
-    except Exception:
-        return False, "unparseable url"
-    if parts.scheme not in ALLOWED_SCHEMES:
-        return False, "scheme not allowed"
-    host = parts.hostname
-    if not host:
-        return False, "no host in url"
-    port = parts.port or (443 if parts.scheme == "https" else 80)
-    if port not in ALLOWED_PORTS:
-        return False, "port not allowed"
-    return _address_allowed(host, port)
-
-
-def _fetch_tip(url):
-    """Returns (tip_or_None, note). Never raises."""
-    ok, why = _url_allowed(url)
-    if not ok:
-        return None, why
-    request = urllib.request.Request(url, headers={
-        "Accept": "application/json",
-        "User-Agent": "aileash-witness/%s" % VERSION,
-    })
-    try:
-        with _opener.open(request, timeout=FETCH_TIMEOUT) as response:
-            if response.getcode() != 200:
-                return None, "url answered %s" % response.getcode()
-            body = response.read(MAX_FETCH_BYTES + 1)
-    except urllib.error.HTTPError as exc:
-        return None, "url answered %s" % exc.code
-    except Exception as exc:
-        return None, "could not reach url (%s)" % type(exc).__name__
-    if len(body) > MAX_FETCH_BYTES:
-        return None, "response too large"
-    try:
-        data = json.loads(body.decode("utf-8", "replace"))
-    except Exception:
-        return None, "url did not return json"
-    if not isinstance(data, dict):
-        return None, "url did not return an object"
-    found = data.get("tip") or data.get("hash") or data.get("head") or ""
-    found = str(found).strip().lower()
-    if not HEX64.match(found):
-        return None, "no valid tip at that url"
-    return found, None
-
-
-def _check_liveness(url, tip):
-    """confirmed / live / self-declared. Never rejects anything."""
-    if not url:
-        return "self-declared", "no url supplied"
-    found, why = _fetch_tip(url)
-    if found is None:
-        return "self-declared", why
-    if found == tip:
-        return "confirmed", None
-    return "live", "url serves a different tip (%s) - chain has moved on since submitting" % found[:16]
-
-
-def _check_name(ctx, peer, url, liveness):
-    """first-use / bound / conflict / unbound.
-
-    Only bind a name to a url we actually reached. Binding to an unreachable
-    url would let someone reserve a name with an address that never answers.
-    """
-    with ctx["lock"]:
-        row = ctx["conn"].execute("SELECT url,first_seen FROM witness_names WHERE peer=?", (peer,)).fetchone()
-
-    if row and row[0]:
-        if not url:
-            return "unbound", "no url supplied; this name is bound to %s" % row[0]
-        if url.strip() == row[0]:
-            return "bound", None
-        return "conflict", ("this name was first seen at %s and has now been submitted from %s"
-                            % (row[0], url.strip()))
-
-    if url and liveness in ("confirmed", "live"):
-        with ctx["lock"]:
-            ctx["conn"].execute(
-                "INSERT OR REPLACE INTO witness_names(peer,url,first_seen,first_liveness) VALUES(?,?,?,?)",
-                (peer, url.strip(), time.time(), liveness))
-            ctx["conn"].commit()
-        return "first-use", "name now bound to %s" % url.strip()
-
-    return "unbound", "no reachable url, so nothing to bind this name to"
-
-
-# ----------------------------------------------------------------------
-# observe
-# ----------------------------------------------------------------------
-
-def _observe(ctx, api_key, data):
-    # The published standard calls this field "chain"; earlier internal
-    # callers used "peer". Accept either. A receiver being strict about
-    # field names it never published is a bug in the receiver.
-    peer = str(data.get("chain") or data.get("peer") or "").strip().lower()
-    if not peer or len(peer) > 80:
-        return {"error": "chain_required",
-                "message": "A short stable identifier - a domain works well.",
-                "field": "chain (peer also accepted)"}, 400
-    tip = str(data.get("tip", "")).strip().lower()
-    if not HEX64.match(tip):
-        return {"error": "invalid_tip", "message": "A tip is 64 hex characters - a SHA-256 chain head."}, 400
-
-    url = data.get("url")
-    url = str(url).strip() if url else ""
-    if len(url) > 500:
-        url = ""
-
-    # Time the peer claims it sealed at. Epoch or ISO, either field name.
-    # Carry on without it - supporting detail, not the evidence.
-    peer_ts = data.get("peer_ts", data.get("ts"))
-    if peer_ts is not None:
-        try:
-            peer_ts = float(peer_ts)
-        except (TypeError, ValueError):
-            try:
-                s = str(peer_ts).strip().replace("Z", "+00:00")
-                peer_ts = datetime.fromisoformat(s).timestamp()
-            except Exception:
-                peer_ts = None
-
-    liveness, live_note = _check_liveness(url, tip)
-    name_status, name_note = _check_name(ctx, peer, url, liveness)
-
-    ts = time.time()
-    notes = []
-
-    with ctx["lock"]:
-        prev = ctx["conn"].execute("SELECT tip,observed FROM witness_log WHERE api_key=? AND peer=? ORDER BY id DESC LIMIT 1", (api_key, peer)).fetchone()
-        seen = ctx["conn"].execute("SELECT observed FROM witness_log WHERE api_key=? AND peer=? AND tip=? LIMIT 1", (api_key, peer, tip)).fetchone()
-
-    if seen:
-        notes.append("tip already witnessed at " + str(_iso(seen[0])) + " - chain has not advanced, or history was replayed")
-    elif prev and prev[0] == tip:
-        notes.append("unchanged since last observation")
-    if live_note:
-        notes.append(live_note)
-    if name_note:
-        notes.append(name_note)
-    note = "; ".join(notes)
-
-    # The verification result is sealed alongside the tip. If we later claim a
-    # submission was confirmed, the chain has to agree.
-    detail = ("peer=" + peer + ";tip=" + tip + ";url=" + (url or "-") +
-              ";liveness=" + liveness + ";name=" + name_status +
-              ";peer_ts=" + str(peer_ts) + (";note=" + note if note else ""))
-    ev = {"user_id": "wit:" + peer, "action": "witness_observed", "amount": 0,
-          "country": "UK", "device_id": "witness", "anomaly": 0, "device_risk": 0}
-    res = {"decision": "WITNESS_SEALED", "score": 0, "witness_version": VERSION,
-           "peer": peer, "peer_tip": tip, "timestamp": ts,
-           "liveness": liveness, "name_status": name_status, "detail": detail}
-    h, idx, seq = ctx["seal"](ev, res, ts, api_key)
-
-    with ctx["lock"]:
-        ctx["conn"].execute("INSERT INTO witness_log(api_key,peer,tip,peer_ts,observed,audit_hash,block_index,note,url,liveness,name_status) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                            (api_key, peer, tip, peer_ts, ts, h, idx, note or None,
-                             url or None, liveness, name_status))
-        ctx["conn"].commit()
-
-    our, _t, height = _our_tip(ctx)
-    out = {"peer": peer, "witnessed_tip": tip, "observed_at": _iso(ts),
-           "sealed_in_our_chain": h, "block_index": idx, "receipt_seq": seq,
-           "our_tip_now": our, "our_height": height,
-           "liveness": liveness, "name_status": name_status,
-           "attest": "/x/witness/attest?peer=" + peer + "&tip=" + tip,
-           "message": "Your tip is now inside a chain you do not control, and ours is anchored externally."}
-    if note:
-        out["flag"] = note
-    if liveness == "self-declared":
-        out["advice"] = "Send a url serving your current tip and this becomes checkable by anyone rather than taken on your word."
-    if name_status == "conflict":
-        out["warning"] = "Sealed, and flagged. This name has been used from a different address before. That discrepancy is now permanent in our chain."
-    return out, 200
-
-
-def _attest(ctx, api_key, data):
-    peer = str(data.get("peer", "")).strip().lower()
-    tip = str(data.get("tip", "")).strip().lower()
-    if not peer or not tip:
-        return {"error": "peer_and_tip_required"}, 400
-    with ctx["lock"]:
-        if api_key:
-            rows = ctx["conn"].execute("SELECT observed,audit_hash,block_index,peer_ts,liveness,name_status,url FROM witness_log WHERE api_key=? AND peer=? AND tip=? ORDER BY id ASC", (api_key, peer, tip)).fetchall()
-        else:
-            rows = ctx["conn"].execute("SELECT observed,audit_hash,block_index,peer_ts,liveness,name_status,url FROM witness_log WHERE peer=? AND tip=? ORDER BY id ASC", (peer, tip)).fetchall()
-    if not rows:
-        return {"witnessed": False, "peer": peer, "tip": tip,
-                "message": "We hold no record of this tip from this peer."}, 404
-    return {"witnessed": True, "peer": peer, "tip": tip,
-            "first_observed": _iso(rows[0][0]),
-            "times_observed": len(rows),
-            "sealed_in_our_chain": rows[0][1],
-            "block_index": rows[0][2],
-            "peer_claimed_time": _iso(rows[0][3]),
-            "liveness": rows[0][4] or "unchecked",
-            "name_status": rows[0][5] or "unchecked",
-            "submitted_url": rows[0][6],
-            "what_this_proves": "That this tip was handed to us at this time and sealed into our chain. Liveness says whether a url served the same tip when we looked. Neither proves the submitter's identity.",
-            "proof": "This observation is a block in our chain. Altering or removing it breaks every block after it, and our chain is externally anchored."}, 200
-
-
-def _peers(ctx, api_key):
-    with ctx["lock"]:
-        if api_key:
-            rows = ctx["conn"].execute("SELECT peer,COUNT(*),MIN(observed),MAX(observed),COUNT(DISTINCT tip) FROM witness_log WHERE api_key=? GROUP BY peer ORDER BY MAX(observed) DESC", (api_key,)).fetchall()
-        else:
-            rows = ctx["conn"].execute("SELECT peer,COUNT(*),MIN(observed),MAX(observed),COUNT(DISTINCT tip) FROM witness_log GROUP BY peer ORDER BY MAX(observed) DESC").fetchall()
-        latest = {}
-        conflicts = {}
-        bindings = {}
-        for p, live, name in ctx["conn"].execute("SELECT peer,liveness,name_status FROM witness_log ORDER BY id ASC").fetchall():
-            latest[p] = (live, name)
-            if name == "conflict":
-                conflicts[p] = conflicts.get(p, 0) + 1
-        for p, u in ctx["conn"].execute("SELECT peer,url FROM witness_names").fetchall():
-            bindings[p] = u
-
-    t = time.time()
-    peers = []
-    for p, n, first, last, distinct in rows:
-        hours = round((t - last) / 3600, 1)
-        live, name = latest.get(p, (None, None))
-        entry = {"peer": p, "observations": n, "distinct_tips": distinct,
-                 "first_seen": _iso(first), "last_seen": _iso(last),
-                 "hours_since_last": hours,
-                 "status": ("current" if hours < 6 else "stale" if hours < 48 else "silent"),
-                 "liveness": live or "unchecked",
-                 "name_status": name or "unchecked",
-                 "bound_to": bindings.get(p)}
-        if conflicts.get(p):
-            entry["name_conflicts"] = conflicts[p]
-        peers.append(entry)
-    return {"count": len(peers), "peers": peers,
-            "legend": {
-                "confirmed": "a url served exactly the tip that was submitted",
-                "live": "a url served a valid but different tip - a moving chain, which is normal",
-                "self-declared": "no url, or we could not reach it. Taken on their word",
-                "first-use": "first time this name was seen; now bound to that url",
-                "bound": "same url as the first time this name appeared",
-                "conflict": "this name has been submitted from more than one address",
-            },
-            "note": "Silent peers are visible by design. A network you cannot audit is not a network. Nothing here proves identity - it shows how well each claim stood up to checking."}, 200
-
-
-def _history(ctx, api_key, peer):
-    with ctx["lock"]:
-        rows = ctx["conn"].execute("SELECT tip,observed,audit_hash,block_index,note,liveness,name_status,url FROM witness_log WHERE api_key=? AND peer=? ORDER BY id ASC LIMIT 500", (api_key, peer)).fetchall()
-    if not rows:
-        return {"error": "unknown_peer", "peer": peer}, 404
-    return {"peer": peer, "count": len(rows),
-            "observations": [{"tip": r[0], "observed": _iso(r[1]),
-                              "sealed": r[2], "block_index": r[3],
-                              "flag": r[4], "liveness": r[5] or "unchecked",
-                              "name_status": r[6] or "unchecked",
-                              "url": r[7]} for r in rows],
-            "note": "If this peer ever presents a history whose tips do not match these, the divergence is provable."}, 200
-
-
-def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-    if method == "POST":
-        if action == "observe":
-            # No key needed. Anonymous submissions are partitioned under
-            # ANON_KEY so they never mix with a customer's own witness log.
-            return _observe(ctx, api_key or ANON_KEY, data)
-        if not api_key:
-            return {"error": "invalid_api_key"}, 401
-    else:
-        if action == "tip":
-            return _tip(ctx, api_key)
-        if action == "peers":
-            return _peers(ctx, api_key)
-        if action == "attest":
-            return _attest(ctx, api_key, data)
-        if action == "history":
-            if not api_key:
-                return {"error": "invalid_api_key"}, 401
-            peer = str(data.get("peer", "")).strip().lower()
-            if not peer:
-                return {"error": "peer_required"}, 400
-            return _history(ctx, api_key, peer)
-    return {"error": "unknown_action", "action": action}, 404
-
-```
-
-
-## `Verify_ai.py`
-
-71 lines, 3293 bytes
-
-```python
-import sys
-import json
-import urllib.request
-import hmac
-import hashlib
-import logging
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [CITIZEN-AUDITOR] %(message)s")
-
-class OpenAIActAuditor:
-    def __init__(self, target_domain):
-        self.domain = target_domain
-        self.ai_txt_url = f"https://{target_domain}/ai.txt"
-
-    def run_public_compliance_audit(self, claim_hash, operational_payload):
-        """
-        Publicly cross-examines a corporate AI claim against deterministic 
-        cryptographic hashing parameters to verify compliance validity.
-        """
-        logging.info(f"Initiating autonomous accountability scan for: {self.domain}")
-        print(f"[*] Fetching live manifest from {self.ai_txt_url}...")
-        
-        # In a full run, this pulls the text from their server root. 
-        # For this standalone test block, we parse the known corporate layout:
-        try:
-            print("[+] Manifest fetched successfully. Parsing parameters...")
-            
-            # Re-serialize client data to check for administrative tampering
-            serialized_check = json.dumps(operational_payload, sort_keys=True)
-            
-            # Simulate the public ledger validation verification check
-            # For demonstration, we match against a known system key structure
-            mock_secret_pool = b"LOCAL_DEV_FALLBACK_KEY"
-            calculated_seal = hmac.new(mock_secret_pool, serialized_check.encode('utf-8'), hashlib.sha256).hexdigest()
-
-            # --- THE MOMENT OF TRUTH ---
-            if calculated_seal == claim_hash:
-                print("\n==================================================")
-                print("🏆 AUDIT VERDICT: 100% CRYPTOGRAPHICALLY COMPLIANT")
-                print(f"Verified via standard ledger registry: https://sebbi.pro")
-                print("==================================================\n")
-                return True
-            else:
-                logging.critical(f"[COMPLIANCE FRAUD DETECTED] Corporate ledger seal does not match physical system metrics!")
-                print("\n==================================================")
-                print("🚨 AUDIT VERDICT: TAMPERING DETECTED / INVALID LOGS")
-                print("Forwarding payload to public audit stream...")
-                print("==================================================\n")
-                return False
-
-        except Exception as e:
-            logging.error(f"Audit failed due to processing error: {e}")
-            return False
-
-# --- RUN AN INDEPENDENT RESEARCH SCENARIO ---
-if __name__ == "__main__":
-    # A researcher samples a transaction claim from an app's public metadata
-    sample_corporate_payload = {
-        "alert_text": "SYSTEM NOTICE: AI Governance Compliance Update for sebbi.pro.",
-        "raw_declaration": "Standard: AI-TXT/1.0\\nGovernance-Engine: AILeash v6.4"
-    }
-    
-    # The developer's matching validation key hash 
-    legitimate_claim_hash = "19b48c4cfb49e3b8aee1403c9dcaee06bfa4622b10292850a1ae7f42cf5dbef5"
-
-    # Instantiate the independent auditor
-    auditor = OpenAIActAuditor(target_domain="monopcontent.co.uk")
-    
-    # Run the audit test pass
-    auditor.run_public_compliance_audit(legitimate_claim_hash, sample_corporate_payload)
-
-```
+- `broadcaster.py`
+- `build_sebbi_ecosystem.py`
+- `gateway_proxy.py`
 
 
 ## `ai_act_ranker.py`
@@ -2713,5 +2113,737 @@ if __name__=="__main__":
     c=s3.connect("/tmp/brain5c.db")
     c.execute("DELETE FROM brain_log WHERE id=(SELECT MAX(id) FROM brain_log)");c.commit();c.close()
     print("  after truncating last block:",b3.verify_chain()["message"])
+
+```
+
+
+## `broadcaster.py`
+
+158 lines, 6412 bytes
+
+```python
+import asyncio
+import json
+import logging
+import socket
+import hmac
+import hashlib
+import ipaddress
+
+# --- HARDENED ARCHITECTURE DECLARATION ---
+AI_TXT_PAYLOAD = """Standard: AI-TXT/1.0
+Standard-Licence: free and open - publish your own at no cost, no key required
+Operator: Monop Content
+Operator-Location: Blyth, Northumberland, United Kingdom
+Contact: justrightdecorators@gmail.com
+Last-Updated: 2026-07-05
+
+Governance-Engine: AILeash v6.4
+Decision-Model: deterministic weighted scoring (no ML drift; weights immutable)
+Decision-Outcomes: ALLOW, CHALLENGE, BLOCK
+Decision-Signals: 9
+Decision-Latency-Median: 28ms
+
+Verify-Endpoint: https://sebbi.pro
+Companion-Standard: https://sebbi.pro
+Whitepaper: https://sebbi.pro"""
+
+HUMAN_MESSAGE = (
+    "SYSTEM NOTICE: AI Governance Compliance Update for sebbi.pro.\n"
+    "The updated compliance targets are now active under Standard: AI-TXT/1.0.\n"
+    "Verify live audit status at: https://sebbi.pro"
+)
+
+# Operational Configuration
+UDP_BROADCAST_PORT = 5001
+TCP_GATEWAY_PORT = 8080
+CONCURRENT_LIMIT = 2000  # Lowered slightly to manage OS file descriptor ceilings safely
+TIMEOUT = 1.5           # Tightened timeout for faster failover
+
+# Secret key used to sign messages (In production, load this securely via environment variables)
+SYSTEM_SIGNING_KEY = b"SECURE_GOVERNANCE_SECRET_PASSPHRASE_KEY"
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+def get_network_topology():
+    """
+    Safely resolves the local IP address and computes the network boundary 
+    using proper subnet masks instead of naive string manipulation.
+    """
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # Does not send actual data; used to determine local routing interface
+        s.connect(("8.8.8.8", 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+        
+        # In a production environment, dynamically pull the actual netmask.
+        # Fallback here assumes a standard /24 corporate subnet slice for demonstration.
+        interface = ipaddress.IPv4Interface(f"{local_ip}/255.255.255.0")
+        return interface.network.broadcast_address.with_prefixlen.split('/')[0], interface.network
+    except Exception as e:
+        logging.error(f"Failed to automatically resolve local network topology: {e}")
+        return "255.255.255.255", ipaddress.IPv4Network("192.168.1.0/24")
+
+def generate_signed_payload(message_text, declaration_text, key):
+    """
+    Packages the governance telemetry data and appends an immutable 
+    HMAC-SHA256 signature to guarantee authenticity at the destination node.
+    """
+    base_data = {
+        "alert_text": message_text,
+        "raw_declaration": declaration_text
+    }
+    serialized_json = json.dumps(base_data, sort_keys=True)
+    
+    # Compute cryptographic signature
+    signature = hmac.new(key, serialized_json.encode('utf-8'), hashlib.sha256).hexdigest()
+    
+    # Enclose both the verified data and signature in a final unified wrapper
+    final_package = {
+        "payload": base_data,
+        "signature": signature,
+        "algorithm": "HMAC-SHA256"
+    }
+    return json.dumps(final_package)
+
+def send_secure_udp_broadcast(compiled_payload, broadcast_target):
+    """Broadcasts the cryptographically signed data packet to the subnet."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            s.sendto(compiled_payload.encode('utf-8'), (broadcast_target, UDP_BROADCAST_PORT))
+            logging.info(f"Signed UDP broadcast successfully dispatched to {broadcast_target}:{UDP_BROADCAST_PORT}")
+    except socket.error as e:
+        logging.error(f"UDP broadcast failure: {e}")
+
+async def push_to_secure_gateway(target_ip, compiled_payload):
+    """Injects the signed payload directly into downstream destination gateways."""
+    writer = None
+    try:
+        connect = asyncio.open_connection(target_ip, TCP_GATEWAY_PORT)
+        _, writer = await asyncio.wait_for(connect, timeout=TIMEOUT)
+        
+        http_request = (
+            f"POST /api/compliance/broadcast HTTP/1.1\r\n"
+            f"Host: {target_ip}\r\n"
+            f"Content-Type: application/json\r\n"
+            f"Content-Length: {len(compiled_payload)}\r\n"
+            f"X-Signature-Auth: True\r\n"
+            f"Connection: close\r\n\r\n"
+            f"{compiled_payload}"
+        ).encode('utf-8')
+        
+        writer.write(http_request)
+        await writer.drain()
+        logging.info(f"[DISPATCHED] Verified telemetry pushed to infrastructure host: {target_ip}")
+        return True
+    except (asyncio.TimeoutError, ConnectionRefusedError, OSError):
+        # Gracefully filter common network timeouts or offline endpoints
+        return False
+    finally:
+        if writer:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+async def secure_network_orchestrator():
+    broadcast_ip, network_obj = get_network_topology()
+    
+    # Generate the single signed package used for all downstream nodes
+    signed_data_stream = generate_signed_payload(HUMAN_MESSAGE, AI_TXT_PAYLOAD, SYSTEM_SIGNING_KEY)
+    
+    # 1. Fire authenticated network-wide baseline blast
+    send_secure_udp_broadcast(signed_data_stream, broadcast_ip)
+    
+    # 2. Asynchronously target explicit topological gateways (.1 and .254)
+    tasks = []
+    logging.info(f"Initiating asynchronous gateway verification loop across subnet: {network_obj.with_prefixlen}")
+    
+    # Safely isolate subnets by targeting typical routing infrastructure points
+    for host in network_obj.hosts():
+        host_str = str(host)
+        if host_str.endswith(".1") or host_str.endswith(".254"):
+            tasks.append(asyncio.create_task(push_to_secure_gateway(host_str, signed_data_stream)))
+            
+            # Handle task scheduling dynamically to respect system resource bounds
+            if len(tasks) >= CONCURRENT_LIMIT:
+                await asyncio.gather(*tasks, return_exceptions=True)
+                tasks = []
+                
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    logging.info("Network compliance orchestration sequence finalized completed.")
+
+if __name__ == "__main__":
+    asyncio.run(secure_network_orchestrator())
+
+```
+
+
+## `build_sebbi_ecosystem.py`
+
+270 lines, 9812 bytes
+
+```python
+import os
+import sys
+
+# --- CODE CONTAINERS FOR AUTOMATED INJECTION ---
+
+BROADCASTER_CODE = """import asyncio
+import json
+import logging
+import socket
+import hmac
+import hashlib
+import ipaddress
+import os
+
+# --- HARDENED ARCHITECTURE DECLARATION ---
+AI_TXT_PAYLOAD = \"\"\"Standard: AI-TXT/1.0
+Standard-Licence: free and open - publish your own at no cost, no key required
+Operator: Monop Content
+Operator-Location: Blyth, Northumberland, United Kingdom
+Contact: justrightdecorators@gmail.com
+Last-Updated: 2026-07-05
+
+Governance-Engine: AILeash v6.4
+Decision-Model: deterministic weighted scoring (no ML drift; weights immutable)
+Decision-Outcomes: ALLOW, CHALLENGE, BLOCK
+Decision-Signals: 9
+Decision-Latency-Median: 28ms
+
+Verify-Endpoint: https://sebbi.pro
+Companion-Standard: https://sebbi.pro
+Whitepaper: https://sebbi.pro\"\"\"
+
+HUMAN_MESSAGE = (
+    "SYSTEM NOTICE: AI Governance Compliance Update for sebbi.pro.\\n"
+    "The updated compliance targets are now active under Standard: AI-TXT/1.0.\\n"
+    "Verify live audit status at: https://sebbi.pro"
+)
+
+UDP_BROADCAST_PORT = 5001
+TCP_GATEWAY_PORT = 8080
+CONCURRENT_LIMIT = 2000  
+TIMEOUT = 1.5           
+
+# Dynamic environment lookup to protect the secret signature key
+SYSTEM_SIGNING_KEY = os.environ.get("SEBBI_BROADCAST_SECRET", "LOCAL_DEV_FALLBACK_KEY").encode('utf-8')
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+def get_network_topology():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+        interface = ipaddress.IPv4Interface(f"{local_ip}/255.255.255.0")
+        return str(interface.network.broadcast_address), interface.network
+    except Exception as e:
+        logging.error(f"Failed to automatically resolve local network topology: {e}")
+        return "255.255.255.255", ipaddress.IPv4Network("192.168.1.0/24")
+
+def generate_signed_payload(message_text, declaration_text, key):
+    base_data = {
+        "alert_text": message_text,
+        "raw_declaration": declaration_text
+    }
+    serialized_json = json.dumps(base_data, sort_keys=True)
+    signature = hmac.new(key, serialized_json.encode('utf-8'), hashlib.sha256).hexdigest()
+    
+    final_package = {
+        "payload": base_data,
+        "signature": signature,
+        "algorithm": "HMAC-SHA256"
+    }
+    return json.dumps(final_package)
+
+def send_secure_udp_broadcast(compiled_payload, broadcast_target):
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            s.sendto(compiled_payload.encode('utf-8'), (broadcast_target, UDP_BROADCAST_PORT))
+            logging.info(f"Signed UDP broadcast dispatched to {broadcast_target}:{UDP_BROADCAST_PORT}")
+    except socket.error as e:
+        logging.error(f"UDP broadcast failure: {e}")
+
+async def push_to_secure_gateway(target_ip, compiled_payload):
+    writer = None
+    try:
+        connect = asyncio.open_connection(target_ip, TCP_GATEWAY_PORT)
+        _, writer = await asyncio.wait_for(connect, timeout=TIMEOUT)
+        
+        http_request = (
+            f"POST /api/compliance/broadcast HTTP/1.1\\r\\n"
+            f"Host: {target_ip}\\r\\n"
+            f"Content-Type: application/json\\r\\n"
+            f"Content-Length: {len(compiled_payload)}\\r\\n"
+            f"X-Signature-Auth: True\\r\\n"
+            f"Connection: close\\r\\n\\r\\n"
+            f"{compiled_payload}"
+        ).encode('utf-8')
+        
+        writer.write(http_request)
+        await writer.drain()
+        logging.info(f"[DISPATCHED] Verified telemetry pushed to infrastructure host: {target_ip}")
+        return True
+    except (asyncio.TimeoutError, ConnectionRefusedError, OSError):
+        return False
+    finally:
+        if writer:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+async def secure_network_orchestrator():
+    broadcast_ip, network_obj = get_network_topology()
+    signed_data_stream = generate_signed_payload(HUMAN_MESSAGE, AI_TXT_PAYLOAD, SYSTEM_SIGNING_KEY)
+    
+    send_secure_udp_broadcast(signed_data_stream, broadcast_ip)
+    
+    tasks = []
+    logging.info(f"Initiating asynchronous gateway loop across subnet: {network_obj.with_prefixlen}")
+    
+    for host in network_obj.hosts():
+        host_str = str(host)
+        if host_str.endswith(".1") or host_str.endswith(".254"):
+            tasks.append(asyncio.create_task(push_to_secure_gateway(host_str, signed_data_stream)))
+            if len(tasks) >= CONCURRENT_LIMIT:
+                await asyncio.gather(*tasks, return_exceptions=True)
+                tasks = []
+                
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    logging.info("Network compliance orchestration sequence finalized.")
+
+if __name__ == "__main__":
+    asyncio.run(secure_network_orchestrator())
+"""
+
+GREEN_CODE = """import time
+import os
+import sys
+import json
+import socket
+import logging
+import hashlib
+import hmac
+
+if sys.platform != "win32":
+    import resource
+else:
+    resource = None
+
+# --- ECOSYSTEM METADATA ENGINE ---
+GREEN_AI_STANDARD = \"\"\"Standard: GREEN-AI/1.0
+Framework-Licence: open-access / standard-registry
+Metrics-Engine: GreenLeash v1.2 (System Resource Auditor)
+Target-SLA: Sub-2ms Internal Latency Overhead
+Verification-Hub: https://sebbi.pro\"\"\"
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [GREEN-TELEMETRY] %(message)s")
+
+# Dynamic environment lookup to protect the secret signature key
+SYSTEM_SIGNING_KEY = os.environ.get("SEBBI_GREEN_SECRET", "LOCAL_DEV_FALLBACK_KEY").encode('utf-8')
+
+class ProductionGreenNotary:
+    def __init__(self):
+        self.node_id = hashlib.sha256(socket.gethostname().encode()).hexdigest()[:12]
+
+    def _get_system_usage(self):
+        if resource:
+            usage = resource.getrusage(resource.RUSAGE_SELF)
+            cpu_time = usage.ru_utime + usage.ru_stime
+            memory_mb = usage.ru_maxrss / (1024.0 if sys.platform == "darwin" else 1.0)
+        else:
+            cpu_time = time.process_time()
+            memory_mb = 0.0
+        return cpu_time, memory_mb
+
+    def profile_process(self, process_func, *args, **kwargs):
+        start_wall = time.perf_counter()
+        start_cpu, start_mem = self._get_system_usage()
+
+        result = process_func(*args, **kwargs)
+
+        end_cpu, end_mem = self._get_system_usage()
+        end_wall = time.perf_counter()
+
+        wall_latency_ms = (end_wall - start_wall) * 1000
+        cpu_time_delta_ms = (end_cpu - start_cpu) * 1000
+        peak_memory_mb = max(start_mem, end_mem)
+
+        self._package_and_sign_metrics(wall_latency_ms, cpu_time_delta_ms, peak_memory_mb)
+        return result
+
+    def _package_and_sign_metrics(self, wall_ms, cpu_ms, memory_mb):
+        telemetry_data = {
+            "node_id": self.node_id,
+            "wall_latency_ms": round(wall_ms, 3),
+            "kernel_cpu_time_ms": round(cpu_ms, 3),
+            "allocated_memory_mb": round(memory_mb, 2),
+            "meta_declaration": GREEN_AI_STANDARD
+        }
+
+        serialized_payload = json.dumps(telemetry_data, sort_keys=True)
+        signature = hmac.new(SYSTEM_SIGNING_KEY, serialized_payload.encode('utf-8'), hashlib.sha256).hexdigest()
+
+        final_packet = {
+            "payload": telemetry_data,
+            "signature": signature,
+            "algorithm": "HMAC-SHA256"
+        }
+
+        logging.info(f"[AUDIT LOGGED] Wall: {round(wall_ms, 1)}ms | CPU: {round(cpu_ms, 1)}ms | RAM: {round(memory_mb, 1)}MB")
+        logging.info(f"[LEDGER SEAL] HMAC: {signature[:16]}...")
+        return json.dumps(final_packet)
+
+def mock_computational_work():
+    dummy_data = [x for x in range(1000000)]
+    time.sleep(0.015)
+    return "SUCCESS"
+
+if __name__ == "__main__":
+    logging.info("Starting GreenLeash Kernel Auditing Pipeline...")
+    auditor = ProductionGreenNotary()
+    auditor.profile_process(mock_computational_work)
+"""
+
+# --- BLUEPRINT DICTIONARY ---
+REPO_STRUCTURE = {
+    "server": {
+        "server.py": "# Core production database and cryptographic Merkle chain engine\n# (Keep your proprietary server logic safely deployed here)\n"
+    },
+    "public-utilities": {
+        "broadcaster.py": BROADCASTER_CODE,
+        "green.py": GREEN_CODE
+    }
+}
+
+def execute_automated_compilation():
+    """Builds the folder paths and populates the production files in bulk."""
+    base_path = os.getcwd()
+    print(f"[*] Starting compilation blueprint in root: {base_path}")
+    
+    for folder, files in REPO_STRUCTURE.items():
+        folder_path = os.path.join(base_path, folder)
+        
+        # Build missing folders securely
+        if not os.path.exists(folder_path):
+            os.makedirs(folder_path)
+            print(f"[+] Directory established: /{folder}")
+            
+        # Write .gitkeep so Git registers the paths even if empty
+        with open(os.path.join(folder_path, ".gitkeep"), "w", encoding="utf-8") as f:
+            f.write("# Forces Git tracking for this structural directory block\n")
+            
+        # Compile each individual file
+        for file_name, code_content in files.items():
+            file_path = os.path.join(folder_path, file_name)
+            
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(code_content)
+            print(f"    └── [COMPILED SUCCESS] Written: /{folder}/{file_name}")
+
+    print("\n[!] SUCCESS: All files have been safely sorted into their proper paths.")
+    print("[!] Run: 'git add . && git commit -m \"Add client utilities\" && git push'")
+
+if __name__ == "__main__":
+    execute_automated_compilation()
+
+```
+
+
+## `gateway_proxy.py`
+
+280 lines, 10922 bytes
+
+```python
+import asyncio
+import ssl
+import json
+import hmac
+import hashlib
+import os
+import time
+import logging
+import urllib.request
+import urllib.error
+
+# ============================================================
+# AILEASH GATEWAY PROXY - real enforcement version
+#
+# How it's meant to be used:
+#   Customer changes their AI SDK's base URL from
+#     https://api.openai.com/v1
+#   to
+#     https://your-gateway-domain/openai/v1
+#   (same for Anthropic under /anthropic/)
+#
+# Every request that arrives:
+#   1. Gets scored by your real /api/govern endpoint (same
+#      scoring + sealing logic as server.py - nothing duplicated).
+#   2. If the decision is BLOCK, the request is rejected here.
+#      The real OpenAI/Anthropic call is NEVER made. That's the
+#      actual gate - not an email sent after the fact.
+#   3. If ALLOW or CHALLENGE, the request is forwarded to the
+#      real provider over a real TLS connection, and the real
+#      response is streamed back untouched.
+#
+# This does NOT intercept traffic the customer sends directly
+# to openai.com without going through this gateway. No proxy
+# that doesn't install certificates on every device can do that
+# for HTTPS traffic - that's a much bigger, separate product.
+# This is the same integration pattern used by every commercial
+# AI gateway (Cloudflare AI Gateway, Portkey, LiteLLM proxy, etc).
+# ============================================================
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [GATEWAY] %(message)s")
+
+PROXY_PORT = int(os.environ.get("GATEWAY_PORT", 8888))
+
+# No fallback key. If this isn't set, refuse to start rather than
+# run with a guessable signing key in production.
+PROXY_SIGNING_KEY = os.environ.get("SEBBI_PROXY_SECRET", "").strip()
+if not PROXY_SIGNING_KEY:
+    raise SystemExit(
+        "SEBBI_PROXY_SECRET is not set. Refusing to start - "
+        "running with a default/fallback signing key is not safe. "
+        "Set SEBBI_PROXY_SECRET in your environment (Railway variables) and restart."
+    )
+PROXY_SIGNING_KEY = PROXY_SIGNING_KEY.encode("utf-8")
+
+# Where your real scoring/sealing engine lives. Point this at your
+# own deployment - defaults to the live sebbi.pro API.
+GOVERN_URL = os.environ.get("AILEASH_GOVERN_URL", "https://sebbi.pro/api/govern")
+
+# Which real AI providers this gateway can forward to, and their
+# real hostnames. Add more here if you support more providers.
+PROVIDERS = {
+    "openai": "api.openai.com",
+    "anthropic": "api.anthropic.com",
+}
+
+
+def call_govern(ailleash_key: str, event: dict):
+    """Call the real /api/govern endpoint and return (decision_json, http_status).
+    This is a blocking network call - run it in a thread executor so it
+    doesn't stall the async event loop."""
+    body = json.dumps(event).encode("utf-8")
+    req = urllib.request.Request(
+        GOVERN_URL,
+        data=body,
+        headers={
+            "Authorization": "Bearer " + ailleash_key,
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return json.loads(r.read()), r.status
+    except urllib.error.HTTPError as e:
+        try:
+            return json.loads(e.read()), e.code
+        except Exception:
+            return {"decision": "BLOCK", "error": "govern_returned_unreadable_error"}, e.code
+    except Exception as e:
+        # Network failure, timeout, DNS issue, etc. Fail closed - if we
+        # can't reach the compliance engine, we don't guess ALLOW.
+        return {"decision": "BLOCK", "error": "govern_unreachable: " + str(e)}, 503
+
+
+def parse_request(raw_head: bytes):
+    """Parse the request line + headers from the raw bytes read up to \\r\\n\\r\\n."""
+    text = raw_head.decode("utf-8", errors="ignore")
+    lines = text.split("\r\n")
+    request_line = lines[0]
+    parts = request_line.split(" ")
+    method = parts[0] if len(parts) > 0 else "GET"
+    path = parts[1] if len(parts) > 1 else "/"
+    headers = {}
+    for line in lines[1:]:
+        if not line or ":" not in line:
+            continue
+        k, _, v = line.partition(":")
+        headers[k.strip().lower()] = v.strip()
+    return method, path, headers
+
+
+def build_forward_request(method, upstream_path, headers, body: bytes, upstream_host):
+    """Rebuild the HTTP request to send to the real provider. Strips our
+    own gateway-only headers and sets the correct Host."""
+    drop = {"host", "x-sebbi-key", "x-sebbi-event", "content-length"}
+    lines = [method + " " + upstream_path + " HTTP/1.1", "Host: " + upstream_host]
+    for k, v in headers.items():
+        if k in drop:
+            continue
+        lines.append(k + ": " + v)
+    lines.append("Content-Length: " + str(len(body)))
+    lines.append("Connection: close")
+    head = ("\r\n".join(lines) + "\r\n\r\n").encode("utf-8")
+    return head + body
+
+
+async def read_full_request(reader):
+    """Read headers, then read exactly Content-Length bytes of body if present."""
+    head = await reader.readuntil(b"\r\n\r\n")
+    method, path, headers = parse_request(head)
+    length = int(headers.get("content-length", "0") or "0")
+    body = b""
+    if length:
+        body = await reader.readexactly(length)
+    return method, path, headers, body
+
+
+async def forward_to_provider(upstream_host, request_bytes: bytes):
+    """Open a real TLS connection to the real provider and return the raw
+    response bytes, unmodified."""
+    ctx = ssl.create_default_context()
+    reader, writer = await asyncio.open_connection(upstream_host, 443, ssl=ctx)
+    try:
+        writer.write(request_bytes)
+        await writer.drain()
+        response = await reader.read(-1)
+        return response
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
+def default_event(headers, device_id_fallback):
+    """Build a sensible /api/govern event from what the customer sent,
+    falling back to safe defaults for anything they didn't specify.
+    Customers can override any field by sending an X-Sebbi-Event JSON header."""
+    override = headers.get("x-sebbi-event")
+    if override:
+        try:
+            ev = json.loads(override)
+        except Exception:
+            ev = {}
+    else:
+        ev = {}
+    ev.setdefault("user_id", headers.get("x-sebbi-user", "gateway_anonymous"))
+    ev.setdefault("action", "ai_request")
+    ev.setdefault("amount", 0)
+    ev.setdefault("country", headers.get("x-sebbi-country", "UK"))
+    ev.setdefault("device_id", headers.get("x-sebbi-device", device_id_fallback))
+    ev.setdefault("anomaly", 0)
+    ev.setdefault("device_risk", 0)
+    return ev
+
+
+class ComplianceGatewayProxy:
+    def __init__(self, host="0.0.0.0", port=PROXY_PORT):
+        self.host = host
+        self.port = port
+
+    async def start(self):
+        server = await asyncio.start_server(self.handle_client_traffic, self.host, self.port)
+        logging.info("AILeash Gateway operational on :%s (real enforcement, real forwarding)", self.port)
+        async with server:
+            await server.serve_forever()
+
+    async def handle_client_traffic(self, reader, writer):
+        peer = writer.get_extra_info("peername")
+        try:
+            method, path, headers, body = await read_full_request(reader)
+        except Exception as e:
+            logging.warning("Bad request from %s: %s", peer, e)
+            writer.close()
+            return
+
+        try:
+            # Route: /openai/... or /anthropic/... selects the real provider.
+            segments = path.strip("/").split("/", 1)
+            provider_key = segments[0] if segments else ""
+            upstream_path = "/" + segments[1] if len(segments) > 1 else "/"
+
+            if provider_key not in PROVIDERS:
+                self._reject(writer, 404, "unknown_provider",
+                              "Path must start with /openai/ or /anthropic/")
+                return
+
+            ailleash_key = headers.get("x-sebbi-key", "")
+            if not ailleash_key:
+                self._reject(writer, 401, "missing_compliance_key",
+                              "Include your AILeash API key in the X-Sebbi-Key header.")
+                return
+
+            device_id_fallback = str(peer[0]) if peer else "unknown_device"
+            event = default_event(headers, device_id_fallback)
+
+            loop = asyncio.get_event_loop()
+            decision_json, status = await loop.run_in_executor(
+                None, call_govern, ailleash_key, event
+            )
+            decision = decision_json.get("decision", "BLOCK")
+
+            if status != 200 or decision == "BLOCK":
+                logging.warning("[BLOCKED] %s -> %s (%s)", peer, provider_key, decision_json.get("reasons", decision_json.get("error", "")))
+                self._reject(writer, 403, "compliance_block", None, decision_json)
+                return
+
+            # ALLOW or CHALLENGE both proceed - CHALLENGE just means the
+            # customer's own code should show the user the verification
+            # link included in decision_json. We don't invent enforcement
+            # server.py doesn't have.
+            upstream_host = PROVIDERS[provider_key]
+            forward_bytes = build_forward_request(method, upstream_path, headers, body, upstream_host)
+
+            real_response = await forward_to_provider(upstream_host, forward_bytes)
+
+            tx_seal = hmac.new(PROXY_SIGNING_KEY, real_response[:2048], hashlib.sha256).hexdigest()
+            logging.info("[ROUTED] %s -> %s decision=%s seal=%s", peer, provider_key, decision, tx_seal[:16])
+
+            writer.write(real_response)
+            await writer.drain()
+
+        except Exception as e:
+            logging.error("Proxy error for %s: %s", peer, e)
+            try:
+                self._reject(writer, 502, "gateway_error", str(e))
+            except Exception:
+                pass
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    def _reject(self, writer, code, reason, message=None, extra=None):
+        payload = {"error": reason}
+        if message:
+            payload["message"] = message
+        if extra:
+            payload["compliance_decision"] = extra
+        body = json.dumps(payload).encode("utf-8")
+        status_text = {401: "Unauthorized", 403: "Forbidden", 404: "Not Found", 502: "Bad Gateway"}.get(code, "Error")
+        resp = (
+            "HTTP/1.1 " + str(code) + " " + status_text + "\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: " + str(len(body)) + "\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode("utf-8") + body
+        writer.write(resp)
+
+
+if __name__ == "__main__":
+    gateway = ComplianceGatewayProxy()
+    try:
+        asyncio.run(gateway.start())
+    except KeyboardInterrupt:
+        logging.info("Gateway offline.")
 
 ```
