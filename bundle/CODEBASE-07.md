@@ -1,6 +1,7 @@
-# Codebase — part 7 of 15
+# Codebase — part 7 of 16
 
 Contains:
+- `ordering_test.py`
 - `sebbi_orchestrator.py`
 - `sebdog_engine.py`
 - `sebdog_licence.py`
@@ -8,10 +9,769 @@ Contains:
 - `AILeash-API-Reference-v6.4.2.md`
 - `LICENCE`
 - `README.md`
-- `admin.html`
-- `ai-standard.html`
-- `ai-txt-kit.html`
-- `aitxt-popup-live.html`
+
+
+## `ordering_test.py`
+
+755 lines, 32046 bytes
+
+```python
+#!/usr/bin/env python3
+"""
+ordering_test.py  -  The Ordering Test, v0.1 (draft specification + runner)
+
+    python3 ordering_test.py https://vendor.example
+    python3 ordering_test.py https://vendor.example --json
+    python3 ordering_test.py --selftest
+    python3 ordering_test.py --spec
+
+WHAT THIS TESTS, AND WHY IT IS THE ONLY THING WORTH TESTING
+-----------------------------------------------------------
+Content can be fabricated. Timestamps get argued about. A log can be rebuilt
+from scratch and presented as history. Every one of those is contestable.
+
+A commitment made BEFORE the information existed is not. It cannot be
+reverse-engineered afterwards - not by an attacker, not by the operator, not
+with more access or more compute. Order is the only property in this field
+that does not rest on trusting somebody.
+
+So this does not test whether a vendor stores records safely. Everybody claims
+that and it is a storage claim. It tests whether the things they committed to
+were committed in an order that makes retrofitting impossible.
+
+Eight checks. Any governance vendor either passes them or does not.
+
+    1  Oversight ordering      the reviewer's judgement is sealed before the
+                              machine verdict is available to them
+    2  Rule binding           the ruleset version is inside the sealed record,
+                              not attached to it afterwards
+    3  Advance commitment      the record count for a period is committed
+                              before anyone requests an export of it
+    4  Absence                 the vendor can prove a record is NOT present,
+                              not only that one is
+    5  Append-only             any earlier state of the log is provably a
+                              prefix of the current one
+    6  Determinism             identical inputs reproduce an identical verdict
+                              under an unchanged implementation fingerprint
+    7  External anchoring      the log state is committed somewhere the vendor
+                              does not control, verifiable without them
+    8  Independent witnessing  the log state is held by an operator the vendor
+                              does not control, and that operator confirms it
+
+HOW A VENDOR OPTS IN
+--------------------
+Publish a discovery document at:
+
+    /.well-known/ordering-test.json
+
+    {
+      "ordering_test_version": "0.1",
+      "vendor": "Example Ltd",
+      "endpoints": {
+        "oversight_open":    "/api/review/open",
+        "oversight_commit":  "/api/review/commit",
+        "rule_binding":      "/api/decision/{id}",
+        "period_root":       "/api/periods/{period}",
+        "inclusion_proof":   "/api/prove?leaf={leaf}",
+        "absence_proof":     "/api/prove-absence?value={value}",
+        "consistency_proof": "/api/consistency?first={first}&second={second}",
+        "replay":            "/api/replay",
+        "anchor_status":     "/api/anchor-status",
+        "witness_peers":     "/api/witness/peers"
+      }
+    }
+
+Any endpoint may be omitted. An omitted endpoint reports NOT SUPPORTED, which
+is not the same as a failure and is not reported as one. A vendor that has not
+built absence proofs has not failed a test - they have declined to take it,
+and that distinction is the difference between an instrument and a marketing
+device.
+
+WHAT A PASS DOES NOT MEAN
+-------------------------
+It does not mean the records are true. Nothing tests that, here or anywhere.
+It means the order in which they were committed rules out certain kinds of
+later invention. That is a narrower claim than most of this industry makes,
+and it is one that actually holds.
+
+This runner never modifies anything. Every request it makes is either a read
+or a submission to an endpoint the vendor has explicitly published for
+testing. It holds no credentials and needs none.
+
+Authors: this specification is published openly. Nobody owns it. Implement it,
+argue with it, or fork it.
+"""
+
+import argparse
+import sys
+import hashlib
+import json
+import random
+import sys
+import time
+import urllib.error
+import urllib.request
+
+VERSION = "0.1"
+TIMEOUT = 15
+UA = "ordering-test/%s" % VERSION
+
+PASS = "PASS"
+FAIL = "FAIL"
+UNSUPPORTED = "NOT SUPPORTED"
+INCONCLUSIVE = "INCONCLUSIVE"
+
+ORDER = [PASS, FAIL, INCONCLUSIVE, UNSUPPORTED]
+
+
+# ----------------------------------------------------------------------
+# plumbing
+# ----------------------------------------------------------------------
+
+def _http(url, payload=None, timeout=TIMEOUT):
+    data = None
+    headers = {"Accept": "application/json", "User-Agent": UA}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=data, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read(4 * 1024 * 1024)
+            status = response.getcode()
+    except urllib.error.HTTPError as exc:
+        try:
+            raw = exc.read(1024 * 1024)
+        except Exception:
+            raw = b""
+        status = exc.code
+    except Exception as exc:
+        return 0, "unreachable: %s" % type(exc).__name__
+    try:
+        return status, json.loads(raw.decode("utf-8", "replace"))
+    except Exception:
+        return status, raw.decode("utf-8", "replace")[:400]
+
+
+def _dig(obj, *names):
+    """Find the first of several keys, at the top level or one level down."""
+    if not isinstance(obj, dict):
+        return None
+    for n in names:
+        if n in obj and obj[n] is not None:
+            return obj[n]
+    for v in obj.values():
+        if isinstance(v, dict):
+            found = _dig(v, *names)
+            if found is not None:
+                return found
+    return None
+
+
+def _epoch(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        s = str(value).strip().replace("Z", "+00:00")
+        from datetime import datetime
+        return datetime.fromisoformat(s).timestamp()
+    except Exception:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+
+class Result(object):
+    def __init__(self, number, name, question):
+        self.number = number
+        self.name = name
+        self.question = question
+        self.status = UNSUPPORTED
+        self.detail = "The vendor has not published an endpoint for this."
+        self.evidence = {}
+
+    def set(self, status, detail, **evidence):
+        self.status = status
+        self.detail = detail
+        self.evidence.update(evidence)
+        return self
+
+    def as_dict(self):
+        return {"check": self.number, "name": self.name,
+                "question": self.question, "status": self.status,
+                "detail": self.detail, "evidence": self.evidence}
+
+
+class Target(object):
+    def __init__(self, base, doc):
+        self.base = base.rstrip("/")
+        self.doc = doc
+        self.endpoints = (doc or {}).get("endpoints", {}) or {}
+
+    def has(self, name):
+        return bool(self.endpoints.get(name))
+
+    def url(self, name, **subs):
+        path = self.endpoints.get(name)
+        if not path:
+            return None
+        for k, v in subs.items():
+            path = path.replace("{%s}" % k, str(v))
+        if path.startswith("http://") or path.startswith("https://"):
+            return path
+        return self.base + ("" if path.startswith("/") else "/") + path
+
+
+# ----------------------------------------------------------------------
+# the eight checks
+# ----------------------------------------------------------------------
+
+def check_1_oversight(t):
+    r = Result(1, "Oversight ordering",
+               "Was the reviewer's judgement sealed before the machine verdict "
+               "was available to them?")
+    if not (t.has("oversight_open") and t.has("oversight_commit")):
+        return r
+
+    status, opened = _http(t.url("oversight_open"), {"purpose": "ordering-test"})
+    if status < 200 or status >= 300 or not isinstance(opened, dict):
+        return r.set(INCONCLUSIVE, "Could not open a review case (HTTP %s)." % status)
+
+    # The verdict must NOT be present in the opening response. This is the
+    # whole check: if they hand it over now, ordering is decorative.
+    leaked = _dig(opened, "machine_verdict", "verdict", "decision", "score",
+                  "machine_score", "recommendation")
+    case_id = _dig(opened, "case_id", "id", "case", "reference")
+    if leaked is not None:
+        return r.set(FAIL,
+                     "The machine verdict was returned when the case was opened. "
+                     "A reviewer who can see the answer before committing is not "
+                     "constrained by the ordering at all.",
+                     leaked_field=str(leaked)[:60])
+    if not case_id:
+        return r.set(INCONCLUSIVE, "No case identifier was returned.")
+
+    status, committed = _http(t.url("oversight_commit"),
+                              {"case_id": case_id, "verdict": "challenge",
+                               "reasoning": "ordering-test"})
+    if status < 200 or status >= 300 or not isinstance(committed, dict):
+        return r.set(INCONCLUSIVE, "Could not commit a verdict (HTTP %s)." % status)
+
+    mine = _dig(committed, "reviewer_block", "your_block", "commit_block")
+    theirs = _dig(committed, "machine_block", "verdict_block", "reveal_block")
+    if mine is None or theirs is None:
+        revealed = _dig(committed, "machine_verdict", "verdict", "decision")
+        if revealed is not None:
+            return r.set(INCONCLUSIVE,
+                         "The verdict was withheld until commit, which is the "
+                         "right behaviour, but no block indices were returned so "
+                         "the sealed order could not be verified independently.")
+        return r.set(INCONCLUSIVE, "Commit succeeded but returned no ordering evidence.")
+
+    try:
+        mine_i, theirs_i = int(mine), int(theirs)
+    except (TypeError, ValueError):
+        return r.set(INCONCLUSIVE, "Block indices were not numeric.")
+
+    if mine_i < theirs_i:
+        return r.set(PASS,
+                     "The reviewer's judgement was sealed at block %d and the "
+                     "machine verdict at block %d. The chain fixes that order "
+                     "permanently, so agreement with an answer already on screen "
+                     "is distinguishable from judgement." % (mine_i, theirs_i),
+                     reviewer_block=mine_i, machine_block=theirs_i)
+    return r.set(FAIL,
+                 "The machine verdict was sealed at or before the reviewer's "
+                 "(%d vs %d). The ordering guarantee does not hold."
+                 % (theirs_i, mine_i),
+                 reviewer_block=mine_i, machine_block=theirs_i)
+
+
+def check_2_rule_binding(t):
+    r = Result(2, "Rule binding",
+               "Is the ruleset version inside the sealed record, or attached "
+               "to it afterwards?")
+    if not t.has("rule_binding"):
+        return r
+    status, body = _http(t.url("rule_binding", id="latest"))
+    if status < 200 or status >= 300 or not isinstance(body, dict):
+        return r.set(INCONCLUSIVE, "Could not retrieve a decision record (HTTP %s)." % status)
+
+    rule = _dig(body, "ruleset_hash", "rule_version", "pack_hash", "policy_hash",
+                "ruleset_version", "rules_hash")
+    sealed_in = _dig(body, "sealed_payload", "sealed", "detail", "record")
+    if rule is None:
+        return r.set(FAIL,
+                     "The decision record carries no ruleset version. Eighteen "
+                     "months from now, which policy was live at that instant is "
+                     "answerable only by a changelog somebody could have edited.")
+
+    inside = False
+    if isinstance(sealed_in, str):
+        inside = str(rule)[:16] in sealed_in
+    elif isinstance(sealed_in, dict):
+        inside = str(rule) in json.dumps(sealed_in)
+
+    if inside:
+        return r.set(PASS,
+                     "The ruleset version is committed inside the sealed payload, "
+                     "so a decision cannot later be reattributed to different rules.",
+                     ruleset=str(rule)[:32])
+    return r.set(INCONCLUSIVE,
+                 "A ruleset version is present but the runner could not confirm "
+                 "it sits inside the sealed payload rather than beside it. Ask "
+                 "the vendor to show the sealed bytes.",
+                 ruleset=str(rule)[:32])
+
+
+def check_3_advance_commitment(t):
+    r = Result(3, "Advance commitment",
+               "Was the record count for the period committed before anyone "
+               "asked for an export of it?")
+    if not t.has("period_root"):
+        return r
+    period = time.strftime("%Y-%m", time.gmtime(time.time() - 86400 * 40))
+    status, body = _http(t.url("period_root", period=period))
+    if status == 404:
+        return r.set(INCONCLUSIVE, "No committed period was available to test.")
+    if status < 200 or status >= 300 or not isinstance(body, dict):
+        return r.set(INCONCLUSIVE, "Could not retrieve a period root (HTTP %s)." % status)
+
+    root = _dig(body, "root", "merkle_root", "period_root")
+    count = _dig(body, "count", "leaf_count", "leaves", "entries")
+    committed_at = _epoch(_dig(body, "committed_at", "sealed_at", "committed", "ts"))
+
+    if root is None or count is None:
+        return r.set(FAIL,
+                     "The period publishes no root and count. Without a count "
+                     "committed in advance, an export can be complete or "
+                     "convenient and nobody can tell the difference.")
+    if committed_at is None:
+        return r.set(INCONCLUSIVE,
+                     "A root and count exist but no commitment time was published, "
+                     "so 'in advance of what' cannot be established.",
+                     root=str(root)[:24], count=count)
+    if committed_at < time.time():
+        return r.set(PASS,
+                     "The period committed to %s records at %s, before this "
+                     "request existed. An export can now be checked against a "
+                     "number that was fixed before anyone knew it would be asked for."
+                     % (count, time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(committed_at))),
+                     root=str(root)[:24], count=count)
+    return r.set(FAIL, "The commitment time is in the future.")
+
+
+def check_4_absence(t):
+    r = Result(4, "Absence",
+               "Can the vendor prove a record is NOT present, or only that one is?")
+    if not t.has("absence_proof"):
+        if t.has("inclusion_proof"):
+            return r.set(UNSUPPORTED,
+                         "Inclusion proofs are published but absence proofs are "
+                         "not. Proving what you hold is the easy half. The "
+                         "question an investigator asks is whether anything was "
+                         "quietly dropped.")
+        return r
+    probe = hashlib.sha256(("ordering-test-%d" % random.getrandbits(64)).encode()).hexdigest()
+    status, body = _http(t.url("absence_proof", value=probe))
+    if status < 200 or status >= 300 or not isinstance(body, dict):
+        return r.set(INCONCLUSIVE, "Absence endpoint did not answer (HTTP %s)." % status)
+
+    absent = _dig(body, "absent", "not_present", "excluded")
+    left = _dig(body, "left", "lower", "predecessor", "before")
+    right = _dig(body, "right", "upper", "successor", "after")
+
+    if absent is False:
+        return r.set(INCONCLUSIVE, "The random probe value was reported as present.")
+    if left is not None and right is not None:
+        return r.set(PASS,
+                     "A value that is not in the log returned a bounded absence "
+                     "proof - two adjacent committed entries with nothing possible "
+                     "between them. Absence is demonstrated rather than asserted.",
+                     neighbours=[str(left)[:16], str(right)[:16]])
+    if absent:
+        return r.set(FAIL,
+                     "The endpoint states the value is absent but returns no "
+                     "bounding evidence. That is an assertion, not a proof - the "
+                     "vendor is asking to be believed.")
+    return r.set(INCONCLUSIVE, "Absence response could not be interpreted.")
+
+
+def check_5_append_only(t):
+    r = Result(5, "Append-only",
+               "Is an earlier state of the log provably a prefix of the current one?")
+    if not t.has("consistency_proof"):
+        return r
+    status, body = _http(t.url("consistency_proof", first=1, second=2))
+    if status < 200 or status >= 300 or not isinstance(body, dict):
+        return r.set(INCONCLUSIVE, "Consistency endpoint did not answer (HTTP %s)." % status)
+    proof = _dig(body, "proof", "path", "consistency", "nodes")
+    if isinstance(proof, list):
+        return r.set(PASS,
+                     "The log publishes consistency proofs, so anyone holding an "
+                     "earlier state can demonstrate it is a prefix of the current "
+                     "one. Append-only is shown rather than promised.",
+                     proof_length=len(proof))
+    return r.set(FAIL,
+                 "No consistency proof was returned. A log that cannot demonstrate "
+                 "it only ever grew can have been rebuilt.")
+
+
+def check_6_determinism(t):
+    r = Result(6, "Determinism",
+               "Do identical inputs reproduce an identical verdict under an "
+               "unchanged implementation?")
+    if not t.has("replay"):
+        return r
+    probe = {"ordering_test": True, "nonce": random.getrandbits(48),
+             "amount": 1234, "trust": 0.42}
+    s1, a = _http(t.url("replay"), probe)
+    if s1 < 200 or s1 >= 300 or not isinstance(a, dict):
+        return r.set(INCONCLUSIVE, "Replay endpoint did not answer (HTTP %s)." % s1)
+    time.sleep(1.0)
+    s2, b = _http(t.url("replay"), probe)
+    if s2 < 200 or s2 >= 300 or not isinstance(b, dict):
+        return r.set(INCONCLUSIVE, "Replay endpoint answered once but not twice.")
+
+    va, vb = _dig(a, "verdict", "decision", "result"), _dig(b, "verdict", "decision", "result")
+    sa, sb = _dig(a, "score", "value"), _dig(b, "score", "value")
+    fa, fb = _dig(a, "fingerprint", "code_fingerprint", "implementation"), \
+             _dig(b, "fingerprint", "code_fingerprint", "implementation")
+
+    if va is None and sa is None:
+        return r.set(INCONCLUSIVE, "No verdict or score was returned to compare.")
+    if fa and fb and fa != fb:
+        return r.set(FAIL, "The implementation fingerprint changed between two "
+                           "requests one second apart.")
+    if va == vb and sa == sb:
+        return r.set(PASS,
+                     "Identical inputs reproduced an identical result%s. "
+                     "Reproducibility is testable by a third party rather than "
+                     "certified by the vendor about itself."
+                     % (" under an unchanged fingerprint" if fa else ""),
+                     verdict=str(va), fingerprint=str(fa)[:16] if fa else None)
+    return r.set(FAIL,
+                 "Identical inputs produced different results (%s/%s vs %s/%s). "
+                 "Nothing sealed under this engine can be re-derived later."
+                 % (va, sa, vb, sb))
+
+
+def check_7_anchoring(t):
+    r = Result(7, "External anchoring",
+               "Is the log state committed somewhere the vendor does not control?")
+    if not t.has("anchor_status"):
+        return r
+    status, body = _http(t.url("anchor_status"))
+    if status < 200 or status >= 300 or not isinstance(body, dict):
+        return r.set(INCONCLUSIVE, "Anchor endpoint did not answer (HTTP %s)." % status)
+
+    tip = _dig(body, "tip", "anchored_tip", "root")
+    when = _epoch(_dig(body, "anchored_at", "last_anchor", "timestamp", "ts"))
+    where = _dig(body, "network", "chain", "anchor", "method", "calendars", "calendar_count")
+    proof = _dig(body, "proof", "ots", "timestamp_proof", "receipt")
+
+    if tip is None:
+        return r.set(FAIL, "No anchored state is published.")
+    if when is None:
+        return r.set(INCONCLUSIVE, "An anchored tip is published without a time.",
+                     tip=str(tip)[:24])
+
+    age_h = (time.time() - when) / 3600.0
+    detail = ("Log state anchored externally %s ago%s."
+              % (("%.1f hours" % age_h) if age_h < 48 else ("%.1f days" % (age_h / 24)),
+                 (" via %s" % where) if where else ""))
+    if proof is None:
+        detail += (" No portable proof is published, so verification still "
+                   "depends on this endpoint remaining available.")
+        return r.set(INCONCLUSIVE, detail, tip=str(tip)[:24], hours_old=round(age_h, 1))
+    if age_h > 24 * 7:
+        return r.set(FAIL, detail + " Anything sealed since is unanchored, and the "
+                                    "gap is the exposure.",
+                     tip=str(tip)[:24], hours_old=round(age_h, 1))
+    return r.set(PASS,
+                 detail + " The proof is portable, so the date survives the vendor.",
+                 tip=str(tip)[:24], hours_old=round(age_h, 1))
+
+
+def check_8_witnessing(t):
+    r = Result(8, "Independent witnessing",
+               "Is the log state held by an operator the vendor does not control?")
+    if not t.has("witness_peers"):
+        return r
+    status, body = _http(t.url("witness_peers"))
+    if status < 200 or status >= 300:
+        return r.set(INCONCLUSIVE, "Witness endpoint did not answer (HTTP %s)." % status)
+
+    peers = _dig(body, "peers") if isinstance(body, dict) else None
+    if not isinstance(peers, list):
+        return r.set(INCONCLUSIVE, "No peer list was returned.")
+
+    live = []
+    for p in peers:
+        if not isinstance(p, dict):
+            continue
+        hours = p.get("hours_since_last")
+        state = str(p.get("status", "")).lower()
+        if state == "current" or (isinstance(hours, (int, float)) and hours < 24):
+            live.append(p.get("peer") or p.get("name") or "unnamed")
+
+    if not live:
+        return r.set(FAIL,
+                     "No peer has recorded this log in the last 24 hours. Between "
+                     "anchors the operator and the auditor are the same party.",
+                     peers_listed=len(peers))
+    if len(live) < 3:
+        return r.set(INCONCLUSIVE,
+                     "%d live peer%s (%s). Better than none, but parties witnessing "
+                     "only each other can still move together. Breadth is what "
+                     "makes this hold, and this network is thin."
+                     % (len(live), "" if len(live) == 1 else "s", ", ".join(live[:3])),
+                     live_peers=live)
+    return r.set(PASS,
+                 "%d independent operators have recorded this log within the last "
+                 "day (%s). Rewriting history now requires all of them to move in "
+                 "step and re-obtain external timestamps already issued."
+                 % (len(live), ", ".join(live[:4])),
+                 live_peers=live)
+
+
+CHECKS = [check_1_oversight, check_2_rule_binding, check_3_advance_commitment,
+          check_4_absence, check_5_append_only, check_6_determinism,
+          check_7_anchoring, check_8_witnessing]
+
+
+# ----------------------------------------------------------------------
+# running and reporting
+# ----------------------------------------------------------------------
+
+def discover(base):
+    base = base.rstrip("/")
+    if not base.startswith("http"):
+        base = "https://" + base
+    status, doc = _http(base + "/.well-known/ordering-test.json")
+    if status == 200 and isinstance(doc, dict):
+        return base, doc, None
+    return base, None, ("No discovery document at %s/.well-known/ordering-test.json "
+                        "(HTTP %s). The vendor has not published an interface for "
+                        "this test." % (base, status))
+
+
+def run(base):
+    base, doc, error = discover(base)
+    if error:
+        return {"target": base, "error": error, "ordering_test_version": VERSION}
+    t = Target(base, doc)
+    results = []
+    for fn in CHECKS:
+        try:
+            results.append(fn(t))
+        except Exception as exc:
+            r = Result(0, fn.__name__, "")
+            r.set(INCONCLUSIVE, "Runner error: %s" % exc)
+            results.append(r)
+
+    tally = {s: 0 for s in ORDER}
+    for r in results:
+        tally[r.status] = tally.get(r.status, 0) + 1
+
+    if tally[FAIL] == 0 and tally[PASS] >= 6:
+        verdict = "CONFORMANT"
+        summary = ("Passes %d of 8 with no failures. Ordering is demonstrated, "
+                   "not asserted." % tally[PASS])
+    elif tally[FAIL] == 0:
+        verdict = "PARTIAL"
+        summary = ("No failures, but only %d checks could be demonstrated. The "
+                   "rest were not published or could not be established."
+                   % tally[PASS])
+    else:
+        verdict = "NON-CONFORMANT"
+        summary = ("%d check%s failed. Records under this system can be "
+                   "reconstructed in ways the vendor cannot rule out."
+                   % (tally[FAIL], "" if tally[FAIL] == 1 else "s"))
+
+    return {
+        "ordering_test_version": VERSION,
+        "target": base,
+        "vendor": doc.get("vendor"),
+        "run_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "verdict": verdict,
+        "summary": summary,
+        "tally": tally,
+        "checks": [r.as_dict() for r in results],
+        "what_a_pass_does_not_mean": (
+            "That the records are true. Nothing tests that. It means the order "
+            "in which things were committed rules out certain kinds of later "
+            "invention."),
+    }
+
+
+def report(res):
+    out = []
+    w = 72
+    out.append("=" * w)
+    out.append("THE ORDERING TEST  v%s" % res.get("ordering_test_version", VERSION))
+    out.append(res.get("target", ""))
+    if res.get("vendor"):
+        out.append(res["vendor"])
+    out.append("=" * w)
+    if res.get("error"):
+        out.append("")
+        out.append(res["error"])
+        return "\n".join(out)
+
+    for c in res["checks"]:
+        out.append("")
+        out.append("%d.  %-24s  %s" % (c["check"], c["name"], c["status"]))
+        if c["question"]:
+            out.append("    %s" % c["question"])
+        for line in _wrap(c["detail"], w - 4):
+            out.append("    " + line)
+
+    out.append("")
+    out.append("-" * w)
+    out.append("VERDICT: %s" % res["verdict"])
+    for line in _wrap(res["summary"], w):
+        out.append(line)
+    out.append("")
+    out.append("  pass %d   fail %d   inconclusive %d   not supported %d"
+               % (res["tally"][PASS], res["tally"][FAIL],
+                  res["tally"][INCONCLUSIVE], res["tally"][UNSUPPORTED]))
+    out.append("-" * w)
+    for line in _wrap("A pass does not mean the records are true. " +
+                      res["what_a_pass_does_not_mean"].split("It means")[-1].strip()
+                      .join(["It means ", ""]), w):
+        out.append(line)
+    return "\n".join(out)
+
+
+def _wrap(text, width):
+    words, line, lines = str(text).split(), "", []
+    for word in words:
+        if len(line) + len(word) + 1 > width:
+            lines.append(line)
+            line = word
+        else:
+            line = (line + " " + word).strip()
+    if line:
+        lines.append(line)
+    return lines
+
+
+# ----------------------------------------------------------------------
+# self-test: prove the runner is honest before anyone trusts its output
+# ----------------------------------------------------------------------
+
+def selftest():
+    print("Self-test: does this runner actually catch what it claims to?\n")
+    ok = True
+
+    class Fake(Target):
+        def __init__(self, endpoints, responses):
+            Target.__init__(self, "https://fake.test", {"endpoints": endpoints})
+            self.responses = responses
+
+    def patched(responses):
+        def _f(url, payload=None, timeout=TIMEOUT):
+            for key, value in responses.items():
+                if key in url:
+                    return value
+            return 404, {}
+        return _f
+
+    real_http = globals()["_http"]
+
+    cases = [
+        ("verdict leaked at open is caught", check_1_oversight,
+         {"oversight_open": "/open", "oversight_commit": "/commit"},
+         {"/open": (200, {"case_id": "x", "machine_verdict": "BLOCK"})}, FAIL),
+
+        ("correct commit-before-reveal passes", check_1_oversight,
+         {"oversight_open": "/open", "oversight_commit": "/commit"},
+         {"/open": (200, {"case_id": "x"}),
+          "/commit": (200, {"reviewer_block": 10, "machine_block": 11})}, PASS),
+
+        ("verdict sealed first is caught", check_1_oversight,
+         {"oversight_open": "/open", "oversight_commit": "/commit"},
+         {"/open": (200, {"case_id": "x"}),
+          "/commit": (200, {"reviewer_block": 12, "machine_block": 9})}, FAIL),
+
+        ("asserted absence with no bounds is caught", check_4_absence,
+         {"absence_proof": "/absent?value={value}"},
+         {"/absent": (200, {"absent": True})}, FAIL),
+
+        ("bounded absence passes", check_4_absence,
+         {"absence_proof": "/absent?value={value}"},
+         {"/absent": (200, {"absent": True, "left": "aa", "right": "bb"})}, PASS),
+
+        ("non-deterministic engine is caught", check_6_determinism,
+         {"replay": "/replay"},
+         {"/replay": (200, {"verdict": "ALLOW", "score": random.random()})}, None),
+
+        ("stale anchor is caught", check_7_anchoring,
+         {"anchor_status": "/anchor"},
+         {"/anchor": (200, {"tip": "a" * 64, "anchored_at": time.time() - 86400 * 20,
+                            "proof": "ots"})}, FAIL),
+
+        ("no live peers is caught", check_8_witnessing,
+         {"witness_peers": "/peers"},
+         {"/peers": (200, {"peers": [{"peer": "x", "hours_since_last": 900,
+                                      "status": "silent"}]})}, FAIL),
+
+        ("single peer is not sold as strong", check_8_witnessing,
+         {"witness_peers": "/peers"},
+         {"/peers": (200, {"peers": [{"peer": "x", "status": "current"}]})}, INCONCLUSIVE),
+
+        ("missing endpoint is not a failure", check_4_absence, {}, {}, UNSUPPORTED),
+    ]
+
+    for label, fn, endpoints, responses, expect in cases:
+        globals()["_http"] = patched(responses)
+        try:
+            got = fn(Fake(endpoints, responses)).status
+        finally:
+            globals()["_http"] = real_http
+        if expect is None:
+            good = got in (FAIL, PASS)      # random scores may collide; either is fine
+            note = "(non-deterministic fixture, got %s)" % got
+        else:
+            good = got == expect
+            note = "expected %s, got %s" % (expect, got)
+        print("  %s  %s  %s" % ("ok  " if good else "FAIL", label, "" if good else note))
+        ok = ok and good
+
+    print("\n%s" % ("Self-test passed. The runner catches what it claims to."
+                    if ok else "SELF-TEST FAILED. Do not trust this runner's output."))
+    return 0 if ok else 1
+
+
+def main():
+    p = argparse.ArgumentParser(
+        description="The Ordering Test - conformance runner for provable ordering.")
+    p.add_argument("target", nargs="?", help="vendor base URL")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.add_argument("--selftest", action="store_true",
+                   help="prove the runner catches what it claims to")
+    p.add_argument("--spec", action="store_true", help="print the specification")
+    args = p.parse_args()
+
+    if args.selftest:
+        return selftest()
+    if args.spec or not args.target:
+        print(__doc__)
+        return 0
+
+    res = run(args.target)
+    print(json.dumps(res, indent=2) if args.json else report(res))
+    return 1 if res.get("verdict") == "NON-CONFORMANT" or res.get("error") else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+```
 
 
 ## `sebbi_orchestrator.py`
@@ -1809,597 +2569,5 @@ delegated authority tokens · KYC evidence sealing · jurisdiction tagging ·
 ai.txt standard · comply.txt · cryptographic proof of action · immutable audit log ·
 agentic AI governance · sovereign AI deployment · SonicBoom · Brain · Sentinel · Guardian
 -->
-
-```
-
-
-## `admin.html`
-
-212 lines, 12327 bytes
-
-```html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>sebbi.pro - Admin</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0a0f1e;color:#fff;line-height:1.5}
-.wrap{max-width:1000px;margin:0 auto;padding:20px}
-h1{font-size:22px;font-weight:800;margin-bottom:4px}h1 span{color:#c9a84c}
-.sub{color:#8a90a6;font-size:13px;margin-bottom:20px}
-/* login */
-#login{max-width:360px;margin:80px auto;text-align:center}
-#login input{width:100%;padding:14px;border-radius:10px;border:1px solid #2a3350;background:#0b1226;color:#fff;font-size:16px;margin:12px 0}
-button{background:#c9a84c;color:#0a0f1e;border:none;border-radius:10px;padding:13px 22px;font-weight:800;cursor:pointer;font-size:15px;width:100%}
-button.small{width:auto;padding:8px 16px;font-size:13px}
-.err{color:#ff7b6e;font-size:13px;margin-top:8px;min-height:18px}
-/* dashboard */
-#dash{display:none}
-.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:20px}
-.stat{background:#111a30;border:1px solid #232d4a;border-radius:12px;padding:16px}
-.stat .big{font-size:26px;font-weight:800;color:#c9a84c}
-.stat .lab{font-size:11px;color:#8a90a6;text-transform:uppercase;letter-spacing:1px;margin-top:4px}
-.stat.good .big{color:#7fe3b0}.stat.bad .big{color:#ff7b6e}
-.tabs{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap}
-.tab{background:#111a30;border:1px solid #232d4a;color:#8a90a6;padding:9px 16px;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600}
-.tab.on{background:#c9a84c;color:#0a0f1e;border-color:#c9a84c}
-.panel{display:none}.panel.on{display:block}
-.card{background:#111a30;border:1px solid #232d4a;border-radius:12px;padding:14px;margin-bottom:10px;font-size:14px}
-.card .top{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:6px}
-.card .nm{font-weight:700}
-.card .meta{color:#8a90a6;font-size:12px}
-.badge{font-size:10px;padding:2px 8px;border-radius:10px;font-weight:700;text-transform:uppercase}
-.badge.paid{background:#0d2018;color:#7fe3b0;border:1px solid #1fae79}
-.badge.free{background:#1a1206;color:#c9a84c;border:1px solid #c9a84c}
-.stripe-link{color:#7fe3b0;font-size:12px;text-decoration:none;font-family:monospace}
-.bar{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}
-.mono{font-family:monospace;font-size:12px;color:#8a90a6;word-break:break-all}
-.empty{color:#5a6178;text-align:center;padding:30px;font-size:14px}
-a.ext{display:inline-block;background:#0d2018;border:1px solid #1fae79;color:#7fe3b0;padding:10px 16px;border-radius:8px;text-decoration:none;font-size:13px;font-weight:600;margin-bottom:16px}
-</style>
-</head>
-<body>
-<div class="wrap">
-
-  <div id="login">
-    <h1>sebbi<span>.pro</span> admin</h1>
-    <div class="sub">Private control panel</div>
-    <input id="pw" type="password" placeholder="Admin password" onkeydown="if(event.key==='Enter')doLogin()">
-    <button onclick="doLogin()">Log in</button>
-    <div class="err" id="loginerr"></div>
-  </div>
-
-  <div id="dash">
-    <div class="bar">
-      <div><h1>sebbi<span>.pro</span> admin</h1><div class="sub">Everything Stripe doesn't show you</div></div>
-      <button class="small" onclick="logout()">Log out</button>
-    </div>
-
-    <a class="ext" href="https://dashboard.stripe.com" target="_blank" rel="noopener">Open Stripe dashboard for payments, revenue &amp; billing addresses &rarr;</a>
-
-    <div class="stats" id="statgrid"></div>
-
-    <div class="tabs">
-      <div class="tab on" onclick="show('customers',this)">Customers &amp; leads</div>
-      <div class="tab" onclick="show('contacts',this)">Contact messages</div>
-      <div class="tab" onclick="show('referrals',this)">Referrals</div>
-      <div class="tab" onclick="show('audit',this)">Audit records</div>
-    </div>
-
-    <div class="panel on" id="p-customers"><div class="empty">Loading...</div></div>
-    <div class="panel" id="p-contacts"><div class="empty">Loading...</div></div>
-    <div class="panel" id="p-referrals"><div class="empty">Loading...</div></div>
-    <div class="panel" id="p-audit">
-      <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;align-items:center">
-        <input id="auditkey" placeholder="Filter by API key (optional)" style="flex:1;min-width:180px;padding:10px;border-radius:8px;border:1px solid #2a3350;background:#0b1226;color:#fff;font-size:13px">
-        <button class="small" onclick="loadAudit()">Search</button>
-        <button class="small" onclick="verifyChain()" style="background:#1fae79">Verify chain</button>
-        <button class="small" onclick="exportAudit()" style="background:#0d2018;color:#7fe3b0;border:1px solid #1fae79">Export</button>
-      </div>
-      <div id="auditchain" style="font-family:monospace;font-size:12px;color:#7fe3b0;margin-bottom:12px"></div>
-      <div id="auditlist"><div class="empty">Loading...</div></div>
-    </div>
-  </div>
-
-</div>
-<script>
-var TOKEN="";
-function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]})}
-function when(ts){if(!ts)return"";try{return new Date(ts*1000).toLocaleString()}catch(e){return""}}
-
-async function doLogin(){
-  var pw=document.getElementById("pw").value;
-  document.getElementById("loginerr").textContent="";
-  try{
-    var r=await fetch("/admin/auth",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password:pw})});
-    var d=await r.json();
-    if(d.token){TOKEN=d.token;document.getElementById("login").style.display="none";document.getElementById("dash").style.display="block";loadAll();}
-    else if(d.error==="admin_disabled"){document.getElementById("loginerr").textContent="Admin password not set. Add ADMIN_PASSWORD in Railway variables.";}
-    else if(d.error==="too_many_attempts"){document.getElementById("loginerr").textContent="Too many attempts. Wait a minute.";}
-    else{document.getElementById("loginerr").textContent="Wrong password.";}
-  }catch(e){document.getElementById("loginerr").textContent="Connection error.";}
-}
-function logout(){TOKEN="";document.getElementById("dash").style.display="none";document.getElementById("login").style.display="block";document.getElementById("pw").value="";}
-
-async function api(path){
-  var r=await fetch(path,{method:"POST",headers:{"Authorization":"Bearer "+TOKEN,"Content-Type":"application/json"},body:"{}"});
-  return await r.json();
-}
-
-async function loadAll(){
-  // stats
-  try{
-    var s=await api("/admin/stats");
-    document.getElementById("statgrid").innerHTML=
-      stat(s.total_keys,"Total signups")+
-      stat(s.paid_keys,"Paying",  "good")+
-      stat((s.total_keys||0)-(s.paid_keys||0),"Free / leads")+
-      stat(s.audit_blocks,"Audit blocks")+
-      stat(s.chain_valid?"OK":"BROKEN","Chain",s.chain_valid?"good":"bad");
-  }catch(e){}
-  loadCustomers();loadContacts();loadReferrals();loadAudit();
-}
-function stat(v,l,cls){return '<div class="stat '+(cls||"")+'"><div class="big">'+esc(v)+'</div><div class="lab">'+esc(l)+'</div></div>';}
-
-async function loadCustomers(){
-  try{
-    var d=await api("/admin/keys");var ks=d.keys||[];
-    if(!ks.length){document.getElementById("p-customers").innerHTML='<div class="empty">No signups yet.</div>';return;}
-    var h="";
-    ks.forEach(function(k){
-      var paid=k.is_paid==1;
-      h+='<div class="card"><div class="top"><span class="nm">'+esc(k.name||"(no name)")+' <span class="meta">'+esc(k.org||"")+'</span></span>'
-        +'<span class="badge '+(paid?"paid":"free")+'">'+(paid?"paying":"free")+'</span></div>'
-        +'<div class="meta">'+esc(k.email||"")+' &middot; '+esc(k.product||"")+' &middot; '+esc(k.devices||0)+' devices &middot; used '+esc(k.actions_used||0)+'/'+esc(k.free_quota||0)+'</div>'
-        +'<div class="meta">Joined '+when(k.created)+'</div>'
-        +(k.key?'<div class="mono">'+esc(k.key)+'</div>':'')
-        +'</div>';
-    });
-    document.getElementById("p-customers").innerHTML=h;
-  }catch(e){document.getElementById("p-customers").innerHTML='<div class="empty">Could not load.</div>';}
-}
-
-async function loadContacts(){
-  try{
-    var d=await api("/admin/contacts");var cs=d.contacts||[];
-    if(!cs.length){document.getElementById("p-contacts").innerHTML='<div class="empty">No messages yet.</div>';return;}
-    var h="";
-    cs.forEach(function(c){
-      h+='<div class="card"><div class="top"><span class="nm">'+esc(c.name||"(no name)")+'</span><span class="meta">'+when(c.ts)+'</span></div>'
-        +'<div class="meta">'+esc(c.email||"")+(c.phone?' &middot; '+esc(c.phone):'')+(c.org?' &middot; '+esc(c.org):'')+'</div>'
-        +'<div style="margin-top:6px">'+esc(c.message||"")+'</div></div>';
-    });
-    document.getElementById("p-contacts").innerHTML=h;
-  }catch(e){document.getElementById("p-contacts").innerHTML='<div class="empty">Could not load.</div>';}
-}
-
-async function loadReferrals(){
-  try{
-    var d=await api("/admin/referrals");var rs=d.referrals||[];
-    if(!rs.length){document.getElementById("p-referrals").innerHTML='<div class="empty">No referrals yet.</div>';return;}
-    var h="";
-    rs.forEach(function(r){
-      h+='<div class="card"><div class="top"><span class="nm">'+esc(r.referrer_name||"(no name)")+' <span class="meta">'+esc(r.code||"")+'</span></span>'
-        +'<span class="badge paid">&pound;'+((r.earnings_pence||0)/100).toFixed(2)+'</span></div>'
-        +'<div class="meta">'+esc(r.referrer_email||"")+' &middot; '+esc(r.devices_referred||0)+' devices referred</div></div>';
-    });
-    document.getElementById("p-referrals").innerHTML=h;
-  }catch(e){document.getElementById("p-referrals").innerHTML='<div class="empty">Could not load.</div>';}
-}
-
-var LAST_AUDIT=[];
-async function loadAudit(){
-  try{
-    var key=document.getElementById("auditkey").value.trim();
-    var r=await fetch("/admin/audit",{method:"POST",headers:{"Authorization":"Bearer "+TOKEN,"Content-Type":"application/json"},body:JSON.stringify({limit:500,api_key:key})});
-    var d=await r.json();LAST_AUDIT=d.records||[];
-    document.getElementById("auditchain").innerHTML=(d.chain_valid?"CHAIN INTACT":"CHAIN BROKEN")+" &middot; "+esc(d.chain_blocks)+" blocks &middot; tip "+esc(String(d.chain_tip||"").slice(0,24))+"...";
-    if(!LAST_AUDIT.length){document.getElementById("auditlist").innerHTML='<div class="empty">No sealed records'+(key?" for that key":"")+' yet.</div>';return;}
-    var h="";
-    LAST_AUDIT.forEach(function(a){
-      var dec=esc(a.decision||"");
-      var col=dec==="BLOCK"?"#ff7b6e":dec==="CHALLENGE"?"#c9a84c":"#7fe3b0";
-      h+='<div class="card"><div class="top"><span class="nm">#'+esc(a.seq)+' <span style="color:'+col+'">'+dec+'</span></span><span class="meta">'+when(a.ts)+'</span></div>'
-        +'<div class="meta">user: '+esc(a.user_id||"-")+(a.score!==""?' &middot; score '+esc(a.score):'')+(a.reasons&&a.reasons.length?' &middot; '+esc(a.reasons.join(", ")):'')+'</div>'
-        +'<div class="mono" style="margin-top:6px">seal: '+esc(String(a.audit_hash||"").slice(0,40))+'...</div>'
-        +'<div class="mono">prev: '+esc(String(a.prev_hash||"").slice(0,40))+'...</div></div>';
-    });
-    document.getElementById("auditlist").innerHTML=h;
-  }catch(e){document.getElementById("auditlist").innerHTML='<div class="empty">Could not load audit records.</div>';}
-}
-async function verifyChain(){
-  try{
-    var r=await fetch("/api/verify-chain");var d=await r.json();
-    document.getElementById("auditchain").innerHTML=(d.valid?"VERIFIED - CHAIN INTACT":"WARNING - CHAIN BROKEN")+" &middot; "+esc(d.blocks)+" blocks &middot; "+esc(d.message||"");
-  }catch(e){}
-}
-function exportAudit(){
-  var blob=new Blob([JSON.stringify(LAST_AUDIT,null,2)],{type:"application/json"});
-  var url=URL.createObjectURL(blob);var a=document.createElement("a");
-  a.href=url;a.download="sebbi-audit-export-"+Date.now()+".json";a.click();URL.revokeObjectURL(url);
-}
-function show(name,el){
-  document.querySelectorAll(".tab").forEach(function(t){t.className="tab";});el.className="tab on";
-  document.querySelectorAll(".panel").forEach(function(p){p.className="panel";});
-  document.getElementById("p-"+name).className="panel on";
-}
-</script>
-</body>
-</html>
-
-```
-
-
-## `ai-standard.html`
-
-97 lines, 4847 bytes
-
-```html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="theme-color" content="#0a0f1e">
-<title>ai.txt - Free Download</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0a0f1e;color:#e8e8f0;min-height:100vh;display:flex;flex-direction:column}
-nav{border-bottom:1px solid #1e2a45;padding:16px 20px}
-nav a{color:#c9a84c;text-decoration:none;font-family:monospace;font-size:14px}
-.wrap{flex:1;display:flex;align-items:center;justify-content:center;padding:30px 20px}
-.card{max-width:560px;width:100%;background:#0d1428;border:1px solid #1e2a45;border-radius:16px;padding:36px 28px;text-align:center}
-h1{font-size:32px;font-weight:800;margin-bottom:14px;line-height:1.15}
-h1 span{color:#c9a84c}
-p{color:#8a90a6;font-size:15px;line-height:1.7;margin-bottom:14px}
-p b{color:#e8e8f0}
-.btn{display:inline-flex;align-items:center;justify-content:center;gap:10px;width:100%;background:#c9a84c;color:#0a0f1e;padding:18px;border-radius:10px;font-weight:800;font-size:17px;border:none;cursor:pointer;font-family:inherit;margin:20px 0 10px}
-.sub{font-family:monospace;font-size:12px;color:#7fe3b0;margin-bottom:24px}
-.steps{text-align:left;background:#0b1226;border:1px solid #1e2a45;border-radius:10px;padding:18px 20px;margin-top:8px}
-.steps li{color:#8a90a6;font-size:14px;margin:10px 0 10px 6px;line-height:1.6}
-.steps li b{color:#c9a84c}
-.back{margin-top:22px}
-.back a{color:#c9a84c;text-decoration:none;font-size:14px;font-weight:600}
-footer{border-top:1px solid #1e2a45;padding:20px;text-align:center;color:#5a6178;font-size:12px}
-footer a{color:#c9a84c;text-decoration:none}
-</style>
-</head>
-<body>
-<nav><a href="/">&larr; AILeash</a></nav>
-<div class="wrap">
-  <div class="card">
-    <h1>Download <span>ai.txt</span> &mdash; free</h1>
-    <div class="sub">NO KEY &middot; NO ACCOUNT &middot; NO COST</div>
-    <p>ai.txt is the free, open standard for declaring how your AI is governed. Download the file, and it shows your system exactly what it needs to become compliant.</p>
-    <button class="btn" onclick="downloadIt()">&#8681; Download ai.txt free</button>
-    <ul class="steps">
-      <li><b>1.</b> Tap download &mdash; the file saves as ai.txt</li>
-      <li><b>2.</b> Fill in your details, put it on your domain at yourdomain.com/ai.txt</li>
-      <li><b>3.</b> Want it verified and provable? <b><a href="/" style="color:#c9a84c">Come back to AILeash</a></b> to seal it into a tamper-evident chain.</li>
-    </ul>
-    <div class="back"><a href="/ai.txt">See the live ai.txt &rarr;</a></div>
-  </div>
-</div>
-<footer>ai.txt is a free, open standard by <a href="/">Monop Content</a> &middot; Blyth, UK &middot; <a href="/ai.txt">reference</a></footer>
-<script>
-var AITXT = [
-"# ============================================================================",
-"# ai.txt - AI Governance Declaration  (AI-TXT/1.0)",
-"# A free, open standard. Copy this to the root of your domain as /ai.txt",
-"# Replace the values below with your own. Delete any line that does not apply.",
-"# No key, no account, no permission, no cost. Just publish it.",
-"# See it live: https://sebbi.pro/ai.txt",
-"# ============================================================================",
-"",
-"Standard: AI-TXT/1.0",
-"Operator: YOUR COMPANY NAME",
-"Operator-Location: YOUR CITY, COUNTRY",
-"Contact: you@yourdomain.com",
-"Last-Updated: 2026-01-01",
-"",
-"# --- How your AI makes decisions ---",
-"Decision-Model: describe it (deterministic rules / ML model / human-in-loop)",
-"Decision-Outcomes: ALLOW, REVIEW, BLOCK",
-"Human-Override: yes / no",
-"Plain-Language-Reasons: yes / no",
-"",
-"# --- Your audit record (how you prove what happened) ---",
-"Audit-Chain: describe it (SHA-256 hash chain / signed logs / none)",
-"Chain-Property: tamper-evident / tamper-resistant / none",
-"Verify-Endpoint: https://yourdomain.com/your-verify-url",
-"",
-"# --- Regulations you are designing towards ---",
-"Regulation: EU AI Act 2024/1689",
-"Regulation: UK Online Safety Act 2023",
-"",
-"# --- Optional: public status surfaces ---",
-"Live-Status: https://yourdomain.com/health",
-"Whitepaper: https://yourdomain.com/whitepaper",
-"",
-"# ============================================================================",
-"# ai.txt is a free, open standard. Publish yours, share it, build on it.",
-"# ============================================================================"
-].join("\n");
-function downloadIt(){
-  var blob = new Blob([AITXT], {type:"text/plain"});
-  var url = URL.createObjectURL(blob);
-  var a = document.createElement("a");
-  a.href = url; a.download = "ai.txt";
-  document.body.appendChild(a); a.click();
-  document.body.removeChild(a); URL.revokeObjectURL(url);
-}
-</script>
-</body>
-</html>
-
-```
-
-
-## `ai-txt-kit.html`
-
-86 lines, 6554 bytes
-
-```html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="theme-color" content="#0a0f1e">
-<title>ai.txt Starter Kit &mdash; publish AI governance free in 5 minutes</title>
-<meta name="description" content="Publish an ai.txt on your own domain, free. Copy the template, add the badge, make it provable. No key, no account.">
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0a0f1e;color:#e8e8f0;line-height:1.6}
-.mono{font-family:"JetBrains Mono",ui-monospace,Menlo,monospace}
-nav{position:sticky;top:0;z-index:10;background:rgba(10,15,30,.94);backdrop-filter:blur(10px);border-bottom:1px solid #1e2a45;padding:0 20px;height:54px;display:flex;align-items:center;justify-content:space-between}
-nav a.logo{display:flex;align-items:center;gap:8px;color:#c9a84c;text-decoration:none;font-family:"JetBrains Mono",monospace;font-size:13px}
-nav .links a{color:#8a90a6;text-decoration:none;font-size:13px;margin-left:16px}
-.wrap{max-width:760px;margin:0 auto;padding:44px 20px 90px}
-.eyebrow{font-family:"JetBrains Mono",monospace;font-size:11px;letter-spacing:3px;text-transform:uppercase;color:#c9a84c;margin-bottom:12px}
-h1{font-size:34px;font-weight:800;letter-spacing:-.02em;line-height:1.1;margin-bottom:14px}
-h1 span{color:#c9a84c}
-.lede{color:#8a90a6;font-size:16px;margin-bottom:8px}
-.free{display:inline-block;background:rgba(0,229,160,.1);border:1px solid #00b87d;color:#7fe3b0;font-family:"JetBrains Mono",monospace;font-size:12px;padding:5px 12px;border-radius:5px;margin:14px 0 30px}
-h2{font-size:20px;font-weight:700;margin:40px 0 8px;padding-top:26px;border-top:1px solid #1e2a45}
-.step-n{font-family:"JetBrains Mono",monospace;color:#c9a84c;font-size:13px}
-p{color:#8a90a6;margin-bottom:14px}
-p b{color:#e8e8f0}
-.box{background:#0b1226;border:1px solid #1e2a45;border-radius:10px;padding:18px;margin:16px 0;font-family:"JetBrains Mono",monospace;font-size:12.5px;color:#7fe3b0;white-space:pre-wrap;word-break:break-word;line-height:1.8;overflow-x:auto}
-.btn{display:inline-flex;align-items:center;gap:8px;background:#c9a84c;color:#0a0f1e;padding:12px 22px;border-radius:8px;font-weight:800;font-size:14px;text-decoration:none;border:none;cursor:pointer;font-family:inherit}
-.btn.ghost{background:transparent;border:1px solid #2a3350;color:#e8e8f0}
-.btnrow{display:flex;gap:10px;flex-wrap:wrap;margin:16px 0}
-.badge-demo{display:inline-flex;align-items:center;gap:8px;background:#111a30;border:1px solid #c9a84c;border-radius:8px;padding:8px 14px;font-family:"JetBrains Mono",monospace;font-size:12px;color:#c9a84c;text-decoration:none}
-.badge-demo svg{flex-shrink:0}
-.onramp{background:linear-gradient(135deg,rgba(0,229,160,.06),rgba(201,168,76,.05));border:1px solid #00b87d;border-radius:12px;padding:24px;margin-top:30px}
-.onramp h3{color:#7fe3b0;font-size:16px;margin-bottom:8px}
-.onramp p{color:#a9b0c4}
-.copied{color:#7fe3b0;font-size:12px;margin-left:10px;opacity:0;transition:opacity .2s}
-.copied.show{opacity:1}
-footer{border-top:1px solid #1e2a45;padding:26px 20px;text-align:center;color:#5a6178;font-size:12px}
-footer a{color:#c9a84c;text-decoration:none}
-</style>
-</head>
-<body>
-<nav>
-  <a class="logo" href="/"><svg width="18" height="18" viewBox="0 0 32 32"><circle cx="16" cy="16" r="13.5" fill="none" stroke="#c9a84c" stroke-width="2.6" stroke-dasharray="66 20" stroke-linecap="round" transform="rotate(-50 16 16)"/><circle cx="26.5" cy="7" r="3.1" fill="#c9a84c"/></svg>AILeash</a>
-  <div class="links"><a href="/ai.txt">Spec</a><a href="/whitepaper">Whitepaper</a></div>
-</nav>
-<div class="wrap">
-  <div class="eyebrow">// ai.txt starter kit</div>
-  <h1>Publish AI governance on your own site. <span>Free.</span></h1>
-  <p class="lede">ai.txt is the robots.txt of AI governance: one small file at your domain root that declares how your AI is governed and where anyone can verify it. Here is everything you need to publish one in about five minutes.</p>
-  <div class="free">FREE STANDARD &middot; NO KEY &middot; NO ACCOUNT &middot; NO PERMISSION</div>
-
-  <h2><span class="step-n">01 /</span> Grab the template</h2>
-  <p>A ready-to-fill ai.txt with every line commented. Download it, or read the live example on our own domain.</p>
-  <div class="btnrow">
-    <a class="btn" href="/ai-txt-template.txt" download="ai.txt">&#8681; Download template</a>
-    <a class="btn ghost" href="/ai.txt" target="_blank">Read a live example</a>
-  </div>
-
-  <h2><span class="step-n">02 /</span> Fill it in and publish</h2>
-  <p>Replace the example values with your own facts. <b>Delete any line you cannot back with a real verify endpoint</b> &mdash; an honest short ai.txt beats an aspirational long one. Then upload it to the root of your domain so it lives at:</p>
-  <div class="box">https://yourdomain.com/ai.txt</div>
-  <p>That is the whole spec. One file, at the root, readable by anyone &mdash; a regulator, a partner, or another machine deciding whether to trust you.</p>
-
-  <h2><span class="step-n">03 /</span> Add the badge</h2>
-  <p>Show visitors and crawlers that you have declared your AI governance. Copy this HTML onto your site &mdash; it renders a small badge linking to your ai.txt:</p>
-  <p>Preview:</p>
-  <a class="badge-demo" href="/ai.txt"><svg width="14" height="14" viewBox="0 0 32 32"><circle cx="16" cy="16" r="13.5" fill="none" stroke="#c9a84c" stroke-width="3" stroke-dasharray="66 20" stroke-linecap="round" transform="rotate(-50 16 16)"/><circle cx="26.5" cy="7" r="3.4" fill="#c9a84c"/></svg>AI-Governed &middot; ai.txt</a>
-  <div class="box" id="badge">&lt;a href="/ai.txt" style="display:inline-flex;align-items:center;gap:6px;font-family:monospace;font-size:12px;color:#c9a84c;text-decoration:none;border:1px solid #c9a84c;border-radius:6px;padding:6px 10px"&gt;AI-Governed &middot; ai.txt&lt;/a&gt;</div>
-  <button class="btn ghost" onclick="copyBadge()">Copy badge HTML<span class="copied" id="cp">copied</span></button>
-
-</div>
-</div>
-<footer>
-  ai.txt (AI-TXT/1.0) is a free, open standard by <a href="/">Monop Content</a> &middot; Blyth, UK &middot; <a href="/ai.txt">spec</a> &middot; <a href="/comply.txt">comply.txt</a>
-</footer>
-<script>
-function copyBadge(){
-  var t=document.getElementById('badge').textContent;
-  navigator.clipboard.writeText(t).then(function(){
-    var c=document.getElementById('cp');c.classList.add('show');setTimeout(function(){c.classList.remove('show')},1500);
-  });
-}
-</script>
-</body>
-</html>
-
-```
-
-
-## `aitxt-popup-live.html`
-
-165 lines, 7279 bytes
-
-```html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ai.txt Live Compliance Widget — Preview</title>
-<style>
-  body{margin:0;background:#e8e6df;font-family:-apple-system,'Segoe UI',Roboto,sans-serif;min-height:100vh;}
-  .demo-note{position:fixed;top:16px;left:16px;right:16px;background:#fff;border:1px solid #ddd;border-radius:8px;padding:12px 16px;font-size:13px;color:#555;max-width:560px;margin:0 auto;text-align:center;z-index:2;}
-</style>
-</head>
-<body>
-<div class="demo-note">This page has no ai.txt, so the badge will honestly say "not found." Click it to see the real check running live.</div>
-
-<!-- ============================================================
-     THE DELIVERABLE: one script tag. Paste into any site.
-     On load, it actually fetches /ai.txt from that same domain
-     and reports the true result — nothing hardcoded, nothing faked.
-============================================================= -->
-<script>
-(function(){
-  var CSS = `
-    #aitxt-badge{
-      position:fixed;bottom:20px;right:20px;z-index:999998;
-      background:#0a0f1e;color:#8b93ac;border:1px solid #232c48;
-      font-family:'SF Mono','JetBrains Mono',Consolas,monospace;
-      font-size:12px;padding:10px 16px;border-radius:999px;cursor:pointer;
-      box-shadow:0 4px 18px rgba(0,0,0,.25);display:flex;align-items:center;gap:8px;
-      transition:transform .15s ease;
-    }
-    #aitxt-badge:hover{transform:translateY(-2px);}
-    #aitxt-badge .dot{width:7px;height:7px;border-radius:50%;background:#8b93ac;flex-shrink:0;transition:background .2s ease;}
-    #aitxt-badge .dot.ok{background:#7fe3b0;}
-    #aitxt-badge .dot.warn{background:#ff8a80;}
-    #aitxt-badge .dot.checking{background:#c9a84c;animation:aitxt-pulse 1s ease-in-out infinite;}
-    @keyframes aitxt-pulse{50%{opacity:.3;}}
-    #aitxt-overlay{
-      position:fixed;inset:0;background:rgba(10,15,30,.6);z-index:999999;
-      display:none;align-items:center;justify-content:center;padding:20px;
-    }
-    #aitxt-overlay.open{display:flex;}
-    #aitxt-modal{
-      background:#10182e;border:1px solid #232c48;border-radius:12px;
-      max-width:420px;width:100%;color:#e7ebf5;font-family:-apple-system,'Segoe UI',Roboto,sans-serif;
-      overflow:hidden;
-    }
-    #aitxt-modal .aitxt-head{padding:20px 22px 0;}
-    #aitxt-modal .aitxt-eyebrow{
-      font-family:'SF Mono',Consolas,monospace;font-size:11px;letter-spacing:.1em;
-      text-transform:uppercase;color:#c9a84c;margin-bottom:10px;
-    }
-    #aitxt-modal h3{margin:0 0 8px;font-size:19px;line-height:1.3;}
-    #aitxt-modal p{margin:0 0 18px;font-size:13.5px;line-height:1.55;color:#8b93ac;}
-    #aitxt-modal .aitxt-body{padding:0 22px 22px;}
-    #aitxt-modal .aitxt-status{
-      display:flex;align-items:center;gap:8px;padding:12px 14px;
-      background:#161f38;border:1px solid #232c48;border-radius:8px;margin-bottom:16px;
-      font-family:'SF Mono',Consolas,monospace;font-size:12px;
-    }
-    #aitxt-modal .aitxt-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;}
-    #aitxt-modal .aitxt-dot.ok{background:#7fe3b0;}
-    #aitxt-modal .aitxt-dot.warn{background:#ff8a80;}
-    #aitxt-modal .aitxt-dot.checking{background:#c9a84c;animation:aitxt-pulse 1s ease-in-out infinite;}
-    #aitxt-modal .aitxt-status.ok span.label{color:#7fe3b0;}
-    #aitxt-modal .aitxt-status.warn span.label{color:#ff8a80;}
-    #aitxt-modal .aitxt-status.checking span.label{color:#c9a84c;}
-    #aitxt-modal a.aitxt-cta{
-      display:block;text-align:center;background:#c9a84c;color:#0a0f1e;
-      font-weight:600;font-size:14px;padding:11px;border-radius:7px;
-      text-decoration:none;margin-bottom:10px;
-    }
-    #aitxt-modal button.aitxt-close{
-      display:block;width:100%;background:transparent;border:1px solid #232c48;
-      color:#8b93ac;font-size:13px;padding:10px;border-radius:7px;cursor:pointer;
-    }
-  `;
-  var style = document.createElement('style');
-  style.textContent = CSS;
-  document.head.appendChild(style);
-
-  var badge = document.createElement('div');
-  badge.id = 'aitxt-badge';
-  badge.innerHTML = '<span class="dot checking"></span><span class="label">Checking AI governance…</span>';
-  document.body.appendChild(badge);
-
-  var overlay = document.createElement('div');
-  overlay.id = 'aitxt-overlay';
-  overlay.innerHTML = `
-    <div id="aitxt-modal">
-      <div class="aitxt-head">
-        <div class="aitxt-eyebrow">ai.txt · sebbi.pro</div>
-        <h3>AI governance declaration</h3>
-        <p>ai.txt is a plain-text file — like robots.txt — that states how this site's AI systems are governed. This check looked for it at the domain root, live, just now.</p>
-      </div>
-      <div class="aitxt-body">
-        <div class="aitxt-status checking" id="aitxt-modal-status">
-          <span class="aitxt-dot checking"></span>
-          <span class="label">Checking…</span>
-        </div>
-        <a class="aitxt-cta" href="https://sebbi.pro" target="_blank" id="aitxt-cta">Generate ai.txt — free</a>
-        <button class="aitxt-close">Close</button>
-      </div>
-    </div>
-  `;
-  document.body.appendChild(overlay);
-
-  var badgeDot = badge.querySelector('.dot');
-  var badgeLabel = badge.querySelector('.label');
-  var modalStatus = overlay.querySelector('#aitxt-modal-status');
-  var modalDot = modalStatus.querySelector('.aitxt-dot');
-  var modalLabel = modalStatus.querySelector('.label');
-  var cta = overlay.querySelector('#aitxt-cta');
-
-  function setState(state, text, modalText){
-    badgeDot.className = 'dot ' + state;
-    badgeLabel.textContent = text;
-    modalStatus.className = 'aitxt-status ' + state;
-    modalDot.className = 'aitxt-dot ' + state;
-    modalLabel.textContent = modalText;
-    if(state === 'ok'){
-      cta.textContent = 'View declaration';
-    } else {
-      cta.textContent = 'Generate ai.txt — free';
-    }
-  }
-
-  // The real check — looks for ai.txt on this exact page's own domain.
-  // Checks the standard /.well-known/ai.txt location first, then falls
-  // back to /ai.txt at root. Same-origin, no backend needed, and it
-  // can't be faked by hardcoding a result: it either finds the file or
-  // it doesn't.
-  function checkPath(path){
-    return fetch(path, {method:'GET', cache:'no-store'})
-      .then(function(res){ return res.ok ? path : null; })
-      .catch(function(){ return null; });
-  }
-
-  Promise.all([
-    checkPath('/.well-known/ai.txt'),
-    checkPath('/ai.txt')
-  ]).then(function(results){
-    var foundAt = results.find(function(p){ return p !== null; });
-    if(foundAt){
-      setState('ok', 'AI governance declared', 'ai.txt found at ' + foundAt);
-    } else {
-      setState('warn', 'No ai.txt found', 'No ai.txt file found at this domain');
-    }
-  });
-
-  badge.addEventListener('click', function(){ overlay.classList.add('open'); });
-  overlay.addEventListener('click', function(e){
-    if(e.target === overlay) overlay.classList.remove('open');
-  });
-  overlay.querySelector('.aitxt-close').addEventListener('click', function(){
-    overlay.classList.remove('open');
-  });
-})();
-</script>
-<!-- ============================================================
-     END OF SNIPPET
-============================================================= -->
-
-</body>
-</html>
 
 ```
