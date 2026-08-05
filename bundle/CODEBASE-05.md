@@ -3,10 +3,10 @@
 Contains:
 - `modules/replay.py`
 - `modules/router.py`
+- `modules/rulebind.py`
 - `modules/savings.py`
 - `modules/spec.py`
 - `modules/standard.py`
-- `modules/stats.py`
 
 
 ## `modules/replay.py`
@@ -933,6 +933,385 @@ def route(h, path, data):
     except Exception as e:
         print("ROUTER ERR: " + str(e), flush=True)
         return {"error": "router_failed", "detail": str(e)}, 500
+
+```
+
+
+## `modules/rulebind.py`
+
+371 lines, 15359 bytes
+
+```python
+"""
+modules/rulebind.py  -  rule binding, provable without an account
+
+THE QUESTION THIS ANSWERS
+-------------------------
+Eighteen months after a decision, nobody asks what was decided. They ask which
+rules were live at that instant. Most systems answer with a changelog somebody
+could have edited, or with a version number sitting beside the record rather
+than inside it - which proves nothing, because anything beside a record can be
+changed afterwards to suit.
+
+The claim worth making is narrower and harder: the ruleset version was
+committed at the moment of the decision, in the same sealed object, and a
+verdict cannot later be reattributed to different rules.
+
+HOW IT IS PROVED WITHOUT TRUSTING US
+------------------------------------
+Every decision here produces a binding digest:
+
+    AILEASH-RULEBIND-v1|<pack_id>|<pack_hash>|<inputs_digest>|<verdict>|<score>|<sealed_at>
+
+SHA-256 of that string is what gets sealed into the chain. Every component is
+published. So anyone can take the components we return, rebuild the string
+themselves, hash it, and check it equals the binding in the sealed record.
+
+That is the whole proof, and it works in both directions:
+
+  - change the pack hash after the fact and the binding no longer recomputes
+  - change the binding and the chain breaks from that block onwards
+  - change the chain and it stops matching the external anchor and the peer
+    chain that recorded our tip an hour later
+
+None of those require taking our word for anything, and none require us to
+disclose the scoring logic - the inputs are published as a digest, not as
+values, and the weights are never exposed at any point.
+
+WHAT IT DOES NOT PROVE
+----------------------
+That the rules were good ones. That the verdict was correct. That the pack
+does what its description says. It proves which ruleset produced which verdict
+and that the pairing was fixed at the time rather than asserted later. Narrow,
+and the only part that is actually provable.
+
+ROUTES  (all public - the point is that no account is needed)
+------------------------------------------------------------
+  POST /x/rulebind/prove       run a decision, get every component back
+  GET  /x/rulebind/verify?receipt=   recompute the binding for a sealed record
+  GET  /x/rulebind/packs       ruleset versions and when each was first sealed
+  GET  /x/rulebind/spec        what this proves and what it does not
+"""
+
+import hashlib
+import json
+import re
+import sys
+import time
+
+VERSION = "1.0"
+BINDING_PREFIX = "AILEASH-RULEBIND-v1"
+
+PUBLIC = {("POST", "prove"), ("GET", "verify"), ("GET", "packs"),
+          ("GET", "spec"), ("GET", "")}
+
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
+MAX_INPUT_KEYS = 40
+
+# Same runtime lookup replay.py uses - never import server.py.
+SCORER_NAMES = ["score_event", "score", "_score_event"]
+DECIDER_NAMES = ["decide", "verdict_for", "_decide"]
+
+_ready = False
+
+
+def _setup(ctx):
+    global _ready
+    if _ready:
+        return
+    with ctx["lock"]:
+        c = ctx["conn"]
+        c.execute(
+            "CREATE TABLE IF NOT EXISTS rulebind_log("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,pack_id TEXT,"
+            "pack_hash TEXT,inputs_digest TEXT,verdict TEXT,score REAL,"
+            "sealed_at REAL,binding TEXT,audit_hash TEXT,block_index INTEGER)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_rb_hash ON rulebind_log(audit_hash)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_rb_pack ON rulebind_log(pack_hash)")
+        c.commit()
+    _ready = True
+
+
+def _sha(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _iso(ts):
+    if not ts:
+        return None
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+
+
+# ----------------------------------------------------------------------
+# the engine, found at runtime
+# ----------------------------------------------------------------------
+
+def _find(names):
+    for modname in ("__main__", "server"):
+        mod = sys.modules.get(modname)
+        if not mod:
+            continue
+        for name in names:
+            fn = getattr(mod, name, None)
+            if callable(fn):
+                return fn, modname + "." + name
+    return None, None
+
+
+def _active_pack(ctx):
+    """The ruleset in force. Read from signal_packs if the table is there,
+    otherwise fall back to a hash of the core engine's own identity - either
+    way the value is stable and published."""
+    try:
+        with ctx["lock"]:
+            row = ctx["conn"].execute(
+                "SELECT pack_id,version,pack_hash FROM signal_packs "
+                "ORDER BY id DESC LIMIT 1").fetchone()
+        if row and row[2]:
+            return str(row[0] or "core"), str(row[2])
+        if row:
+            return str(row[0] or "core"), _sha("pack:%s:v%s" % (row[0], row[1]))
+    except Exception:
+        pass
+
+    # No pack table, or a different schema. Fall back to the core nine, whose
+    # identity is fixed by the deployed decision function itself.
+    fn, where = _find(SCORER_NAMES)
+    if fn:
+        try:
+            import inspect
+            return "core-nine", _sha(inspect.getsource(fn))
+        except Exception:
+            return "core-nine", _sha("core-nine|" + str(where))
+    return "unknown", _sha("unknown")
+
+
+def _canonical_inputs(data):
+    """Inputs are published as a digest, never as values. Somebody testing this
+    knows what they sent; nobody else learns anything from the record."""
+    clean = {}
+    for k, v in list(data.items())[:MAX_INPUT_KEYS]:
+        if k in ("api_key", "token", "key"):
+            continue
+        if isinstance(v, (int, float, bool)) or v is None:
+            clean[str(k)[:40]] = v
+        else:
+            clean[str(k)[:40]] = str(v)[:120]
+    return json.dumps(clean, sort_keys=True, separators=(",", ":"))
+
+
+def _binding(pack_id, pack_hash, inputs_digest, verdict, score, sealed_at):
+    material = "|".join([BINDING_PREFIX, str(pack_id), str(pack_hash),
+                         str(inputs_digest), str(verdict), ("%.6f" % float(score)),
+                         ("%.3f" % float(sealed_at))])
+    return material, _sha(material)
+
+
+# ----------------------------------------------------------------------
+# routes
+# ----------------------------------------------------------------------
+
+def _prove(ctx, api_key, data):
+    if not isinstance(data, dict) or not data:
+        return {"error": "inputs_required",
+                "message": ("POST any decision inputs as JSON. They are hashed, "
+                            "never stored as values.")}, 400
+
+    scorer, scorer_where = _find(SCORER_NAMES)
+    if not scorer:
+        return {"error": "engine_unavailable",
+                "message": "The scoring function could not be found at runtime."}, 503
+
+    try:
+        result = scorer(dict(data))
+        score = float(result[0] if isinstance(result, (tuple, list)) else result)
+    except Exception as exc:
+        return {"error": "scoring_failed", "message": str(exc)[:200]}, 400
+
+    decider, _ = _find(DECIDER_NAMES)
+    verdict = None
+    if decider:
+        try:
+            v = decider(score)
+            verdict = v[0] if isinstance(v, (tuple, list)) else v
+        except Exception:
+            verdict = None
+    if verdict is None:
+        verdict = "ALLOW" if score < 0.35 else ("CHALLENGE" if score < 0.70 else "BLOCK")
+
+    pack_id, pack_hash = _active_pack(ctx)
+    inputs_digest = _sha(_canonical_inputs(data))
+    sealed_at = time.time()
+    material, binding = _binding(pack_id, pack_hash, inputs_digest,
+                                 verdict, score, sealed_at)
+
+    detail = ("rulebind=" + binding + ";pack=" + pack_id + ";pack_hash=" + pack_hash +
+              ";inputs=" + inputs_digest + ";verdict=" + str(verdict) +
+              ";score=%.6f" % score)
+    ev = {"user_id": "rb:" + pack_id, "action": "rule_binding_sealed", "amount": 0,
+          "country": "UK", "device_id": "rulebind", "anomaly": 0, "device_risk": 0}
+    res = {"decision": "RULEBIND_" + str(verdict), "score": round(score, 6),
+           "rulebind_version": VERSION, "pack_id": pack_id, "pack_hash": pack_hash,
+           "binding": binding, "timestamp": sealed_at, "detail": detail}
+    h, idx, seq = ctx["seal"](ev, res, sealed_at, api_key)
+
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "INSERT INTO rulebind_log(api_key,pack_id,pack_hash,inputs_digest,"
+            "verdict,score,sealed_at,binding,audit_hash,block_index)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (api_key, pack_id, pack_hash, inputs_digest, str(verdict),
+             round(score, 6), sealed_at, binding, h, idx))
+        ctx["conn"].commit()
+
+    return {
+        "verdict": verdict,
+        "score": round(score, 6),
+        "ruleset": {"pack_id": pack_id, "pack_hash": pack_hash},
+        "inputs_digest": inputs_digest,
+        "sealed_at": sealed_at,
+        "sealed_at_iso": _iso(sealed_at),
+        "binding": binding,
+        "binding_material": material,
+        "sealed": {"receipt": h, "block_index": idx, "receipt_seq": seq},
+        "recompute_it_yourself": {
+            "step_1": ("Take binding_material exactly as returned - it is the "
+                       "string that was hashed, printed in full."),
+            "step_2": "SHA-256 it. You should get the value in binding.",
+            "step_3": ("Confirm the ruleset hash appears inside that string. It "
+                       "is a component of the digest, not a field beside it - "
+                       "change it and the digest no longer recomputes."),
+            "step_4": ("Check the block is in the chain at /api/verify-chain, "
+                       "externally timestamped at /api/anchor-status, and that "
+                       "our tip was recorded by an independent operator at "
+                       "/x/witness/peers."),
+            "shell": ("printf '%s' \"$MATERIAL\" | shasum -a 256"),
+        },
+        "what_this_proves": (
+            "That this verdict and this ruleset version were committed together, "
+            "at this time, in one object. The pairing cannot be altered afterwards "
+            "without breaking the digest, and the digest cannot be altered without "
+            "breaking the chain."),
+        "what_it_does_not_prove": (
+            "That the rules were good, or the verdict correct. Only which ruleset "
+            "produced it and that the pairing was fixed at the time."),
+        "verify": "/x/rulebind/verify?receipt=" + h,
+    }, 200
+
+
+def _verify(ctx, data):
+    receipt = str(data.get("receipt", "")).strip().lower()
+    if not receipt:
+        return {"error": "receipt_required"}, 400
+    with ctx["lock"]:
+        row = ctx["conn"].execute(
+            "SELECT pack_id,pack_hash,inputs_digest,verdict,score,sealed_at,"
+            "binding,block_index FROM rulebind_log WHERE audit_hash=? LIMIT 1",
+            (receipt,)).fetchone()
+    if not row:
+        return {"found": False, "receipt": receipt,
+                "message": "No rule-binding record with that receipt."}, 404
+
+    pack_id, pack_hash, inputs_digest, verdict, score, sealed_at, stored, block = row
+    material, recomputed = _binding(pack_id, pack_hash, inputs_digest,
+                                    verdict, score, sealed_at)
+    matches = (recomputed == stored)
+
+    return {
+        "found": True,
+        "receipt": receipt,
+        "block_index": block,
+        "ruleset": {"pack_id": pack_id, "pack_hash": pack_hash},
+        "verdict": verdict,
+        "score": score,
+        "inputs_digest": inputs_digest,
+        "sealed_at": sealed_at,
+        "sealed_at_iso": _iso(sealed_at),
+        "binding_stored": stored,
+        "binding_material": material,
+        "binding_recomputed": recomputed,
+        "binding_matches": matches,
+        "result": ("The ruleset version recomputes into the binding that was "
+                   "sealed with this decision. It was bound at the time, not "
+                   "attached afterwards."
+                   if matches else
+                   "MISMATCH. The stored binding does not recompute from the "
+                   "stored components. Something has been altered and this "
+                   "record should not be relied upon."),
+        "chain": "/api/verify-chain",
+        "external_clock": "/api/anchor-status",
+        "witnessed_by": "/x/witness/peers",
+    }, 200
+
+
+def _packs(ctx):
+    with ctx["lock"]:
+        rows = ctx["conn"].execute(
+            "SELECT pack_id,pack_hash,COUNT(*),MIN(sealed_at),MAX(sealed_at)"
+            " FROM rulebind_log GROUP BY pack_id,pack_hash ORDER BY MAX(sealed_at) DESC"
+        ).fetchall()
+    current_id, current_hash = _active_pack(ctx)
+    return {
+        "current": {"pack_id": current_id, "pack_hash": current_hash},
+        "history": [{
+            "pack_id": r[0], "pack_hash": r[1], "decisions_bound": r[2],
+            "first_sealed": _iso(r[3]), "last_sealed": _iso(r[4]),
+            "current": (r[1] == current_hash),
+        } for r in rows],
+        "note": ("Each ruleset version has its own hash. Changing a weight, a "
+                 "threshold or a signal produces a new hash and a new dated "
+                 "entry here, so a change to the rules is an event in the "
+                 "record rather than a silent edit. Decisions stay bound to the "
+                 "version that produced them."),
+    }, 200
+
+
+def _spec():
+    return {
+        "module": "rulebind", "version": VERSION,
+        "check": "rule_binding",
+        "question": ("Was the ruleset version bound at decision time, or "
+                     "attached to the record afterwards?"),
+        "binding_format": (BINDING_PREFIX +
+                           "|<pack_id>|<pack_hash>|<inputs_digest>|<verdict>|"
+                           "<score:.6f>|<sealed_at:.3f>"),
+        "digest": "SHA-256 of that string, UTF-8, no trailing newline",
+        "how_to_test_it": [
+            "POST any inputs to /x/rulebind/prove. No account needed.",
+            "Take binding_material from the response and SHA-256 it yourself.",
+            "Confirm it equals binding.",
+            "GET /x/rulebind/verify?receipt=... and confirm it still recomputes.",
+            "Confirm the block is in the chain, anchored, and witnessed.",
+        ],
+        "what_is_never_disclosed": (
+            "Weights, thresholds, signal names and intermediate values. Inputs "
+            "are published as a digest, not as values. Nothing here requires the "
+            "scoring logic to be revealed, and none of it is."),
+        "what_it_does_not_prove": (
+            "That the rules were good or the verdict correct. Only which ruleset "
+            "produced which verdict, and that the pairing was fixed at the time."),
+        "cost": "Free. No account, no key.",
+    }, 200
+
+
+def handle(method, action, data, api_key, ctx):
+    _setup(ctx)
+    action = (action or "").strip("/").lower()
+    key = api_key or "public-rulebind"
+
+    if method == "POST":
+        if action == "prove":
+            return _prove(ctx, key, data)
+        return {"error": "unknown_action", "action": action, "POST": ["prove"]}, 404
+
+    if action in ("", "spec"):
+        return _spec()
+    if action == "verify":
+        return _verify(ctx, data)
+    if action == "packs":
+        return _packs(ctx)
+    return {"error": "unknown_action", "action": action,
+            "GET": ["spec", "verify", "packs"]}, 404
 
 ```
 
@@ -2175,156 +2554,5 @@ def handle(method, action, data, api_key, ctx):
 
     return {"error": "unknown_action", "action": action,
             "GET": ["status", "hash", "document"]}, 404
-
-```
-
-
-## `modules/stats.py`
-
-143 lines, 5540 bytes
-
-```python
-"""
-Live figures for the Proving Ground - /x/stats
-
-Charts on a compliance site are usually decoration. These are not, provided
-they show something a visitor could otherwise only take on trust: that the
-chain is genuinely growing, that decisions really are distributed across the
-thresholds rather than hand-picked, and that people who click through a
-review case behave exactly as the oversight argument predicts.
-
-WHAT IS PUBLISHED, AND WHAT IS NOT
-----------------------------------
-Public and no key, because a figure nobody can see proves nothing.
-
-Published: total chain height, hourly block counts, the verdict mix and score
-distribution of PUBLIC DEMO decisions only, and dwell times from public review
-cases.
-
-Never published: anything scoped to a customer key. No customer verdict mix,
-no customer volumes, no per-key anything. A visitor learns how the engine
-behaves, not how any operator's business is going. That distinction is the
-whole reason this endpoint can be open.
-
-    GET /x/stats        everything below
-    GET /x/stats/chain  chain height and hourly growth only
-"""
-
-import json, time
-from datetime import datetime, timezone
-
-VERSION = "1.0"
-PUBLIC = {("GET", ""), ("GET", "stats"), ("GET", "chain")}
-
-DEMO_KEY = "public_demo"
-
-
-def _iso(ts):
-    if not ts:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
-
-def _chain(ctx):
-    t = time.time()
-    with ctx["lock"]:
-        row = ctx["conn"].execute("SELECT COUNT(*),MIN(ts),MAX(ts) FROM audit_log").fetchone()
-        recent = ctx["conn"].execute("SELECT ts FROM audit_log WHERE ts>? ORDER BY ts ASC", (t - 86400,)).fetchall()
-    height = row[0] if row else 0
-    buckets = [0] * 24
-    for (ts,) in recent:
-        h = int((t - ts) // 3600)
-        if 0 <= h < 24:
-            buckets[23 - h] += 1
-    return {"height": height,
-            "first_block": _iso(row[1] if row else None),
-            "latest_block": _iso(row[2] if row else None),
-            "last_24h": buckets,
-            "blocks_last_24h": sum(buckets),
-            "note": "Every block, from every source. The chain is one sequence."}
-
-
-def _demo(ctx):
-    with ctx["lock"]:
-        rows = ctx["conn"].execute("SELECT result_json,ts FROM audit_log WHERE api_key=? ORDER BY id DESC LIMIT 2000", (DEMO_KEY,)).fetchall()
-    verdicts = {"ALLOW": 0, "CHALLENGE": 0, "BLOCK": 0}
-    # ten buckets of 0.1 across the score range
-    hist = [0] * 10
-    scores = []
-    for res, _ts in rows:
-        try:
-            r = json.loads(res)
-        except Exception:
-            continue
-        d = r.get("decision")
-        if d in verdicts:
-            verdicts[d] += 1
-            s = r.get("score")
-            if isinstance(s, (int, float)):
-                scores.append(s)
-                b = min(int(float(s) * 10), 9)
-                hist[b] += 1
-    total = sum(verdicts.values())
-    out = {"decisions": total, "verdicts": verdicts,
-           "score_histogram": hist,
-           "buckets": ["0.0-0.1", "0.1-0.2", "0.2-0.3", "0.3-0.4", "0.4-0.5",
-                       "0.5-0.6", "0.6-0.7", "0.7-0.8", "0.8-0.9", "0.9-1.0"],
-           "thresholds": {"allow_below": 0.35, "block_at_or_above": 0.70}}
-    if scores:
-        scores.sort()
-        out["median_score"] = round(scores[len(scores) // 2], 4)
-    return out
-
-
-def _oversight(ctx):
-    try:
-        with ctx["lock"]:
-            rows = ctx["conn"].execute("SELECT dwell,human_verdict,machine_verdict FROM demo_cases WHERE committed IS NOT NULL").fetchall()
-    except Exception:
-        rows = []
-    if not rows:
-        return {"reviews": 0,
-                "note": "Nobody has taken a review case yet."}
-    dwells = sorted(r[0] for r in rows if r[0] is not None)
-    agreed = len([r for r in rows if (r[1] or "").upper() == (r[2] or "").upper()])
-    # dwell buckets in seconds
-    edges = [2, 5, 10, 20, 45, 90]
-    labels = ["under 2s", "2-5s", "5-10s", "10-20s", "20-45s", "45-90s", "over 90s"]
-    hist = [0] * 7
-    for d in dwells:
-        placed = False
-        for i, e in enumerate(edges):
-            if d < e:
-                hist[i] += 1
-                placed = True
-                break
-        if not placed:
-            hist[6] += 1
-    n = len(dwells)
-    return {"reviews": len(rows),
-            "agreed_with_engine": agreed,
-            "agreement_rate_pct": round(100 * agreed / len(rows), 1),
-            "median_dwell_seconds": (dwells[n // 2] if n else None),
-            "under_2_seconds": hist[0],
-            "under_2_seconds_pct": (round(100 * hist[0] / n, 1) if n else 0),
-            "dwell_histogram": hist,
-            "dwell_labels": labels,
-            "note": "Visitors who committed in under two seconds did not read the case. That is the pattern the oversight record is designed to make visible."}
-
-
-def handle(method, action, data, api_key, ctx):
-    if method != "GET":
-        return {"error": "unknown_action", "action": action}, 404
-    if action == "chain":
-        return {"stats_version": VERSION, "chain": _chain(ctx)}, 200
-    if action in ("", "stats"):
-        return {"stats_version": VERSION,
-                "generated": _iso(time.time()),
-                "chain": _chain(ctx),
-                "public_decisions": _demo(ctx),
-                "public_reviews": _oversight(ctx),
-                "scope": "Public demonstration activity and total chain height only. Nothing scoped to a customer key is published here."}, 200
-    return {"error": "unknown_action", "action": action,
-            "available": ["GET stats", "GET chain"]}, 404
 
 ```

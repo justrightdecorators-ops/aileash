@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-83 files across 16 parts.
+84 files across 16 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -37,13 +37,14 @@ Generated automatically on every push. Do not edit by hand.
 
 - `modules/replay.py`
 - `modules/router.py`
+- `modules/rulebind.py`
 - `modules/savings.py`
 - `modules/spec.py`
 - `modules/standard.py`
-- `modules/stats.py`
 
 ## [CODEBASE-06.md](CODEBASE-06.md)
 
+- `modules/stats.py`
 - `modules/witness.py`
 - `Verify_ai.py`
 - `ai_act_ranker.py`
@@ -53,10 +54,10 @@ Generated automatically on every push. Do not edit by hand.
 - `aileash_verify.py`
 - `anchor.py`
 - `board_auditor.py`
-- `brain.py`
 
 ## [CODEBASE-07.md](CODEBASE-07.md)
 
+- `brain.py`
 - `broadcaster.py`
 - `build_sebbi_ecosystem.py`
 - `gateway_proxy.py`
@@ -66,31 +67,31 @@ Generated automatically on every push. Do not edit by hand.
 - `sebdog_reporter.py`
 - `AILeash-API-Reference-v6.4.2.md`
 - `LICENCE`
-- `README.md`
-- `admin.html`
 
 ## [CODEBASE-08.md](CODEBASE-08.md)
 
+- `README.md`
+- `admin.html`
 - `ai-standard.html`
 - `ai-txt-kit.html`
 - `aitxt-popup-live.html`
 - `brain.html`
 - `certificate.html`
-- `compliance-assistant.html`
-- `contact.html`
 
 ## [CODEBASE-09.md](CODEBASE-09.md)
 
+- `compliance-assistant.html`
+- `contact.html`
 - `copyright.txt`
 - `data-protection.html`
+
+## [CODEBASE-10.md](CODEBASE-10.md)
+
 - `developers.html`
 - `dis.txt`
 - `docs/spec/ai-txt.md`
 - `green.html`
 - `guardian-parent.html`
-
-## [CODEBASE-10.md](CODEBASE-10.md)
-
 - `human-oversight.html`
 - `identity.html`
 
