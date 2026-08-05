@@ -1,9 +1,6 @@
-# Codebase — part 7 of 16
+# Codebase — part 7 of 15
 
 Contains:
-- `broadcaster.py`
-- `build_sebbi_ecosystem.py`
-- `gateway_proxy.py`
 - `sebbi_orchestrator.py`
 - `sebdog_engine.py`
 - `sebdog_licence.py`
@@ -12,738 +9,9 @@ Contains:
 - `LICENCE`
 - `README.md`
 - `admin.html`
-
-
-## `broadcaster.py`
-
-158 lines, 6412 bytes
-
-```python
-import asyncio
-import json
-import logging
-import socket
-import hmac
-import hashlib
-import ipaddress
-
-# --- HARDENED ARCHITECTURE DECLARATION ---
-AI_TXT_PAYLOAD = """Standard: AI-TXT/1.0
-Standard-Licence: free and open - publish your own at no cost, no key required
-Operator: Monop Content
-Operator-Location: Blyth, Northumberland, United Kingdom
-Contact: justrightdecorators@gmail.com
-Last-Updated: 2026-07-05
-
-Governance-Engine: AILeash v6.4
-Decision-Model: deterministic weighted scoring (no ML drift; weights immutable)
-Decision-Outcomes: ALLOW, CHALLENGE, BLOCK
-Decision-Signals: 9
-Decision-Latency-Median: 28ms
-
-Verify-Endpoint: https://sebbi.pro
-Companion-Standard: https://sebbi.pro
-Whitepaper: https://sebbi.pro"""
-
-HUMAN_MESSAGE = (
-    "SYSTEM NOTICE: AI Governance Compliance Update for sebbi.pro.\n"
-    "The updated compliance targets are now active under Standard: AI-TXT/1.0.\n"
-    "Verify live audit status at: https://sebbi.pro"
-)
-
-# Operational Configuration
-UDP_BROADCAST_PORT = 5001
-TCP_GATEWAY_PORT = 8080
-CONCURRENT_LIMIT = 2000  # Lowered slightly to manage OS file descriptor ceilings safely
-TIMEOUT = 1.5           # Tightened timeout for faster failover
-
-# Secret key used to sign messages (In production, load this securely via environment variables)
-SYSTEM_SIGNING_KEY = b"SECURE_GOVERNANCE_SECRET_PASSPHRASE_KEY"
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-
-def get_network_topology():
-    """
-    Safely resolves the local IP address and computes the network boundary 
-    using proper subnet masks instead of naive string manipulation.
-    """
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        # Does not send actual data; used to determine local routing interface
-        s.connect(("8.8.8.8", 80))
-        local_ip = s.getsockname()[0]
-        s.close()
-        
-        # In a production environment, dynamically pull the actual netmask.
-        # Fallback here assumes a standard /24 corporate subnet slice for demonstration.
-        interface = ipaddress.IPv4Interface(f"{local_ip}/255.255.255.0")
-        return interface.network.broadcast_address.with_prefixlen.split('/')[0], interface.network
-    except Exception as e:
-        logging.error(f"Failed to automatically resolve local network topology: {e}")
-        return "255.255.255.255", ipaddress.IPv4Network("192.168.1.0/24")
-
-def generate_signed_payload(message_text, declaration_text, key):
-    """
-    Packages the governance telemetry data and appends an immutable 
-    HMAC-SHA256 signature to guarantee authenticity at the destination node.
-    """
-    base_data = {
-        "alert_text": message_text,
-        "raw_declaration": declaration_text
-    }
-    serialized_json = json.dumps(base_data, sort_keys=True)
-    
-    # Compute cryptographic signature
-    signature = hmac.new(key, serialized_json.encode('utf-8'), hashlib.sha256).hexdigest()
-    
-    # Enclose both the verified data and signature in a final unified wrapper
-    final_package = {
-        "payload": base_data,
-        "signature": signature,
-        "algorithm": "HMAC-SHA256"
-    }
-    return json.dumps(final_package)
-
-def send_secure_udp_broadcast(compiled_payload, broadcast_target):
-    """Broadcasts the cryptographically signed data packet to the subnet."""
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            s.sendto(compiled_payload.encode('utf-8'), (broadcast_target, UDP_BROADCAST_PORT))
-            logging.info(f"Signed UDP broadcast successfully dispatched to {broadcast_target}:{UDP_BROADCAST_PORT}")
-    except socket.error as e:
-        logging.error(f"UDP broadcast failure: {e}")
-
-async def push_to_secure_gateway(target_ip, compiled_payload):
-    """Injects the signed payload directly into downstream destination gateways."""
-    writer = None
-    try:
-        connect = asyncio.open_connection(target_ip, TCP_GATEWAY_PORT)
-        _, writer = await asyncio.wait_for(connect, timeout=TIMEOUT)
-        
-        http_request = (
-            f"POST /api/compliance/broadcast HTTP/1.1\r\n"
-            f"Host: {target_ip}\r\n"
-            f"Content-Type: application/json\r\n"
-            f"Content-Length: {len(compiled_payload)}\r\n"
-            f"X-Signature-Auth: True\r\n"
-            f"Connection: close\r\n\r\n"
-            f"{compiled_payload}"
-        ).encode('utf-8')
-        
-        writer.write(http_request)
-        await writer.drain()
-        logging.info(f"[DISPATCHED] Verified telemetry pushed to infrastructure host: {target_ip}")
-        return True
-    except (asyncio.TimeoutError, ConnectionRefusedError, OSError):
-        # Gracefully filter common network timeouts or offline endpoints
-        return False
-    finally:
-        if writer:
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception:
-                pass
-
-async def secure_network_orchestrator():
-    broadcast_ip, network_obj = get_network_topology()
-    
-    # Generate the single signed package used for all downstream nodes
-    signed_data_stream = generate_signed_payload(HUMAN_MESSAGE, AI_TXT_PAYLOAD, SYSTEM_SIGNING_KEY)
-    
-    # 1. Fire authenticated network-wide baseline blast
-    send_secure_udp_broadcast(signed_data_stream, broadcast_ip)
-    
-    # 2. Asynchronously target explicit topological gateways (.1 and .254)
-    tasks = []
-    logging.info(f"Initiating asynchronous gateway verification loop across subnet: {network_obj.with_prefixlen}")
-    
-    # Safely isolate subnets by targeting typical routing infrastructure points
-    for host in network_obj.hosts():
-        host_str = str(host)
-        if host_str.endswith(".1") or host_str.endswith(".254"):
-            tasks.append(asyncio.create_task(push_to_secure_gateway(host_str, signed_data_stream)))
-            
-            # Handle task scheduling dynamically to respect system resource bounds
-            if len(tasks) >= CONCURRENT_LIMIT:
-                await asyncio.gather(*tasks, return_exceptions=True)
-                tasks = []
-                
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
-    logging.info("Network compliance orchestration sequence finalized completed.")
-
-if __name__ == "__main__":
-    asyncio.run(secure_network_orchestrator())
-
-```
-
-
-## `build_sebbi_ecosystem.py`
-
-270 lines, 9812 bytes
-
-```python
-import os
-import sys
-
-# --- CODE CONTAINERS FOR AUTOMATED INJECTION ---
-
-BROADCASTER_CODE = """import asyncio
-import json
-import logging
-import socket
-import hmac
-import hashlib
-import ipaddress
-import os
-
-# --- HARDENED ARCHITECTURE DECLARATION ---
-AI_TXT_PAYLOAD = \"\"\"Standard: AI-TXT/1.0
-Standard-Licence: free and open - publish your own at no cost, no key required
-Operator: Monop Content
-Operator-Location: Blyth, Northumberland, United Kingdom
-Contact: justrightdecorators@gmail.com
-Last-Updated: 2026-07-05
-
-Governance-Engine: AILeash v6.4
-Decision-Model: deterministic weighted scoring (no ML drift; weights immutable)
-Decision-Outcomes: ALLOW, CHALLENGE, BLOCK
-Decision-Signals: 9
-Decision-Latency-Median: 28ms
-
-Verify-Endpoint: https://sebbi.pro
-Companion-Standard: https://sebbi.pro
-Whitepaper: https://sebbi.pro\"\"\"
-
-HUMAN_MESSAGE = (
-    "SYSTEM NOTICE: AI Governance Compliance Update for sebbi.pro.\\n"
-    "The updated compliance targets are now active under Standard: AI-TXT/1.0.\\n"
-    "Verify live audit status at: https://sebbi.pro"
-)
-
-UDP_BROADCAST_PORT = 5001
-TCP_GATEWAY_PORT = 8080
-CONCURRENT_LIMIT = 2000  
-TIMEOUT = 1.5           
-
-# Dynamic environment lookup to protect the secret signature key
-SYSTEM_SIGNING_KEY = os.environ.get("SEBBI_BROADCAST_SECRET", "LOCAL_DEV_FALLBACK_KEY").encode('utf-8')
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-
-def get_network_topology():
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        local_ip = s.getsockname()[0]
-        s.close()
-        interface = ipaddress.IPv4Interface(f"{local_ip}/255.255.255.0")
-        return str(interface.network.broadcast_address), interface.network
-    except Exception as e:
-        logging.error(f"Failed to automatically resolve local network topology: {e}")
-        return "255.255.255.255", ipaddress.IPv4Network("192.168.1.0/24")
-
-def generate_signed_payload(message_text, declaration_text, key):
-    base_data = {
-        "alert_text": message_text,
-        "raw_declaration": declaration_text
-    }
-    serialized_json = json.dumps(base_data, sort_keys=True)
-    signature = hmac.new(key, serialized_json.encode('utf-8'), hashlib.sha256).hexdigest()
-    
-    final_package = {
-        "payload": base_data,
-        "signature": signature,
-        "algorithm": "HMAC-SHA256"
-    }
-    return json.dumps(final_package)
-
-def send_secure_udp_broadcast(compiled_payload, broadcast_target):
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            s.sendto(compiled_payload.encode('utf-8'), (broadcast_target, UDP_BROADCAST_PORT))
-            logging.info(f"Signed UDP broadcast dispatched to {broadcast_target}:{UDP_BROADCAST_PORT}")
-    except socket.error as e:
-        logging.error(f"UDP broadcast failure: {e}")
-
-async def push_to_secure_gateway(target_ip, compiled_payload):
-    writer = None
-    try:
-        connect = asyncio.open_connection(target_ip, TCP_GATEWAY_PORT)
-        _, writer = await asyncio.wait_for(connect, timeout=TIMEOUT)
-        
-        http_request = (
-            f"POST /api/compliance/broadcast HTTP/1.1\\r\\n"
-            f"Host: {target_ip}\\r\\n"
-            f"Content-Type: application/json\\r\\n"
-            f"Content-Length: {len(compiled_payload)}\\r\\n"
-            f"X-Signature-Auth: True\\r\\n"
-            f"Connection: close\\r\\n\\r\\n"
-            f"{compiled_payload}"
-        ).encode('utf-8')
-        
-        writer.write(http_request)
-        await writer.drain()
-        logging.info(f"[DISPATCHED] Verified telemetry pushed to infrastructure host: {target_ip}")
-        return True
-    except (asyncio.TimeoutError, ConnectionRefusedError, OSError):
-        return False
-    finally:
-        if writer:
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception:
-                pass
-
-async def secure_network_orchestrator():
-    broadcast_ip, network_obj = get_network_topology()
-    signed_data_stream = generate_signed_payload(HUMAN_MESSAGE, AI_TXT_PAYLOAD, SYSTEM_SIGNING_KEY)
-    
-    send_secure_udp_broadcast(signed_data_stream, broadcast_ip)
-    
-    tasks = []
-    logging.info(f"Initiating asynchronous gateway loop across subnet: {network_obj.with_prefixlen}")
-    
-    for host in network_obj.hosts():
-        host_str = str(host)
-        if host_str.endswith(".1") or host_str.endswith(".254"):
-            tasks.append(asyncio.create_task(push_to_secure_gateway(host_str, signed_data_stream)))
-            if len(tasks) >= CONCURRENT_LIMIT:
-                await asyncio.gather(*tasks, return_exceptions=True)
-                tasks = []
-                
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
-    logging.info("Network compliance orchestration sequence finalized.")
-
-if __name__ == "__main__":
-    asyncio.run(secure_network_orchestrator())
-"""
-
-GREEN_CODE = """import time
-import os
-import sys
-import json
-import socket
-import logging
-import hashlib
-import hmac
-
-if sys.platform != "win32":
-    import resource
-else:
-    resource = None
-
-# --- ECOSYSTEM METADATA ENGINE ---
-GREEN_AI_STANDARD = \"\"\"Standard: GREEN-AI/1.0
-Framework-Licence: open-access / standard-registry
-Metrics-Engine: GreenLeash v1.2 (System Resource Auditor)
-Target-SLA: Sub-2ms Internal Latency Overhead
-Verification-Hub: https://sebbi.pro\"\"\"
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [GREEN-TELEMETRY] %(message)s")
-
-# Dynamic environment lookup to protect the secret signature key
-SYSTEM_SIGNING_KEY = os.environ.get("SEBBI_GREEN_SECRET", "LOCAL_DEV_FALLBACK_KEY").encode('utf-8')
-
-class ProductionGreenNotary:
-    def __init__(self):
-        self.node_id = hashlib.sha256(socket.gethostname().encode()).hexdigest()[:12]
-
-    def _get_system_usage(self):
-        if resource:
-            usage = resource.getrusage(resource.RUSAGE_SELF)
-            cpu_time = usage.ru_utime + usage.ru_stime
-            memory_mb = usage.ru_maxrss / (1024.0 if sys.platform == "darwin" else 1.0)
-        else:
-            cpu_time = time.process_time()
-            memory_mb = 0.0
-        return cpu_time, memory_mb
-
-    def profile_process(self, process_func, *args, **kwargs):
-        start_wall = time.perf_counter()
-        start_cpu, start_mem = self._get_system_usage()
-
-        result = process_func(*args, **kwargs)
-
-        end_cpu, end_mem = self._get_system_usage()
-        end_wall = time.perf_counter()
-
-        wall_latency_ms = (end_wall - start_wall) * 1000
-        cpu_time_delta_ms = (end_cpu - start_cpu) * 1000
-        peak_memory_mb = max(start_mem, end_mem)
-
-        self._package_and_sign_metrics(wall_latency_ms, cpu_time_delta_ms, peak_memory_mb)
-        return result
-
-    def _package_and_sign_metrics(self, wall_ms, cpu_ms, memory_mb):
-        telemetry_data = {
-            "node_id": self.node_id,
-            "wall_latency_ms": round(wall_ms, 3),
-            "kernel_cpu_time_ms": round(cpu_ms, 3),
-            "allocated_memory_mb": round(memory_mb, 2),
-            "meta_declaration": GREEN_AI_STANDARD
-        }
-
-        serialized_payload = json.dumps(telemetry_data, sort_keys=True)
-        signature = hmac.new(SYSTEM_SIGNING_KEY, serialized_payload.encode('utf-8'), hashlib.sha256).hexdigest()
-
-        final_packet = {
-            "payload": telemetry_data,
-            "signature": signature,
-            "algorithm": "HMAC-SHA256"
-        }
-
-        logging.info(f"[AUDIT LOGGED] Wall: {round(wall_ms, 1)}ms | CPU: {round(cpu_ms, 1)}ms | RAM: {round(memory_mb, 1)}MB")
-        logging.info(f"[LEDGER SEAL] HMAC: {signature[:16]}...")
-        return json.dumps(final_packet)
-
-def mock_computational_work():
-    dummy_data = [x for x in range(1000000)]
-    time.sleep(0.015)
-    return "SUCCESS"
-
-if __name__ == "__main__":
-    logging.info("Starting GreenLeash Kernel Auditing Pipeline...")
-    auditor = ProductionGreenNotary()
-    auditor.profile_process(mock_computational_work)
-"""
-
-# --- BLUEPRINT DICTIONARY ---
-REPO_STRUCTURE = {
-    "server": {
-        "server.py": "# Core production database and cryptographic Merkle chain engine\n# (Keep your proprietary server logic safely deployed here)\n"
-    },
-    "public-utilities": {
-        "broadcaster.py": BROADCASTER_CODE,
-        "green.py": GREEN_CODE
-    }
-}
-
-def execute_automated_compilation():
-    """Builds the folder paths and populates the production files in bulk."""
-    base_path = os.getcwd()
-    print(f"[*] Starting compilation blueprint in root: {base_path}")
-    
-    for folder, files in REPO_STRUCTURE.items():
-        folder_path = os.path.join(base_path, folder)
-        
-        # Build missing folders securely
-        if not os.path.exists(folder_path):
-            os.makedirs(folder_path)
-            print(f"[+] Directory established: /{folder}")
-            
-        # Write .gitkeep so Git registers the paths even if empty
-        with open(os.path.join(folder_path, ".gitkeep"), "w", encoding="utf-8") as f:
-            f.write("# Forces Git tracking for this structural directory block\n")
-            
-        # Compile each individual file
-        for file_name, code_content in files.items():
-            file_path = os.path.join(folder_path, file_name)
-            
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(code_content)
-            print(f"    └── [COMPILED SUCCESS] Written: /{folder}/{file_name}")
-
-    print("\n[!] SUCCESS: All files have been safely sorted into their proper paths.")
-    print("[!] Run: 'git add . && git commit -m \"Add client utilities\" && git push'")
-
-if __name__ == "__main__":
-    execute_automated_compilation()
-
-```
-
-
-## `gateway_proxy.py`
-
-280 lines, 10922 bytes
-
-```python
-import asyncio
-import ssl
-import json
-import hmac
-import hashlib
-import os
-import time
-import logging
-import urllib.request
-import urllib.error
-
-# ============================================================
-# AILEASH GATEWAY PROXY - real enforcement version
-#
-# How it's meant to be used:
-#   Customer changes their AI SDK's base URL from
-#     https://api.openai.com/v1
-#   to
-#     https://your-gateway-domain/openai/v1
-#   (same for Anthropic under /anthropic/)
-#
-# Every request that arrives:
-#   1. Gets scored by your real /api/govern endpoint (same
-#      scoring + sealing logic as server.py - nothing duplicated).
-#   2. If the decision is BLOCK, the request is rejected here.
-#      The real OpenAI/Anthropic call is NEVER made. That's the
-#      actual gate - not an email sent after the fact.
-#   3. If ALLOW or CHALLENGE, the request is forwarded to the
-#      real provider over a real TLS connection, and the real
-#      response is streamed back untouched.
-#
-# This does NOT intercept traffic the customer sends directly
-# to openai.com without going through this gateway. No proxy
-# that doesn't install certificates on every device can do that
-# for HTTPS traffic - that's a much bigger, separate product.
-# This is the same integration pattern used by every commercial
-# AI gateway (Cloudflare AI Gateway, Portkey, LiteLLM proxy, etc).
-# ============================================================
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [GATEWAY] %(message)s")
-
-PROXY_PORT = int(os.environ.get("GATEWAY_PORT", 8888))
-
-# No fallback key. If this isn't set, refuse to start rather than
-# run with a guessable signing key in production.
-PROXY_SIGNING_KEY = os.environ.get("SEBBI_PROXY_SECRET", "").strip()
-if not PROXY_SIGNING_KEY:
-    raise SystemExit(
-        "SEBBI_PROXY_SECRET is not set. Refusing to start - "
-        "running with a default/fallback signing key is not safe. "
-        "Set SEBBI_PROXY_SECRET in your environment (Railway variables) and restart."
-    )
-PROXY_SIGNING_KEY = PROXY_SIGNING_KEY.encode("utf-8")
-
-# Where your real scoring/sealing engine lives. Point this at your
-# own deployment - defaults to the live sebbi.pro API.
-GOVERN_URL = os.environ.get("AILEASH_GOVERN_URL", "https://sebbi.pro/api/govern")
-
-# Which real AI providers this gateway can forward to, and their
-# real hostnames. Add more here if you support more providers.
-PROVIDERS = {
-    "openai": "api.openai.com",
-    "anthropic": "api.anthropic.com",
-}
-
-
-def call_govern(ailleash_key: str, event: dict):
-    """Call the real /api/govern endpoint and return (decision_json, http_status).
-    This is a blocking network call - run it in a thread executor so it
-    doesn't stall the async event loop."""
-    body = json.dumps(event).encode("utf-8")
-    req = urllib.request.Request(
-        GOVERN_URL,
-        data=body,
-        headers={
-            "Authorization": "Bearer " + ailleash_key,
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=5) as r:
-            return json.loads(r.read()), r.status
-    except urllib.error.HTTPError as e:
-        try:
-            return json.loads(e.read()), e.code
-        except Exception:
-            return {"decision": "BLOCK", "error": "govern_returned_unreadable_error"}, e.code
-    except Exception as e:
-        # Network failure, timeout, DNS issue, etc. Fail closed - if we
-        # can't reach the compliance engine, we don't guess ALLOW.
-        return {"decision": "BLOCK", "error": "govern_unreachable: " + str(e)}, 503
-
-
-def parse_request(raw_head: bytes):
-    """Parse the request line + headers from the raw bytes read up to \\r\\n\\r\\n."""
-    text = raw_head.decode("utf-8", errors="ignore")
-    lines = text.split("\r\n")
-    request_line = lines[0]
-    parts = request_line.split(" ")
-    method = parts[0] if len(parts) > 0 else "GET"
-    path = parts[1] if len(parts) > 1 else "/"
-    headers = {}
-    for line in lines[1:]:
-        if not line or ":" not in line:
-            continue
-        k, _, v = line.partition(":")
-        headers[k.strip().lower()] = v.strip()
-    return method, path, headers
-
-
-def build_forward_request(method, upstream_path, headers, body: bytes, upstream_host):
-    """Rebuild the HTTP request to send to the real provider. Strips our
-    own gateway-only headers and sets the correct Host."""
-    drop = {"host", "x-sebbi-key", "x-sebbi-event", "content-length"}
-    lines = [method + " " + upstream_path + " HTTP/1.1", "Host: " + upstream_host]
-    for k, v in headers.items():
-        if k in drop:
-            continue
-        lines.append(k + ": " + v)
-    lines.append("Content-Length: " + str(len(body)))
-    lines.append("Connection: close")
-    head = ("\r\n".join(lines) + "\r\n\r\n").encode("utf-8")
-    return head + body
-
-
-async def read_full_request(reader):
-    """Read headers, then read exactly Content-Length bytes of body if present."""
-    head = await reader.readuntil(b"\r\n\r\n")
-    method, path, headers = parse_request(head)
-    length = int(headers.get("content-length", "0") or "0")
-    body = b""
-    if length:
-        body = await reader.readexactly(length)
-    return method, path, headers, body
-
-
-async def forward_to_provider(upstream_host, request_bytes: bytes):
-    """Open a real TLS connection to the real provider and return the raw
-    response bytes, unmodified."""
-    ctx = ssl.create_default_context()
-    reader, writer = await asyncio.open_connection(upstream_host, 443, ssl=ctx)
-    try:
-        writer.write(request_bytes)
-        await writer.drain()
-        response = await reader.read(-1)
-        return response
-    finally:
-        writer.close()
-        try:
-            await writer.wait_closed()
-        except Exception:
-            pass
-
-
-def default_event(headers, device_id_fallback):
-    """Build a sensible /api/govern event from what the customer sent,
-    falling back to safe defaults for anything they didn't specify.
-    Customers can override any field by sending an X-Sebbi-Event JSON header."""
-    override = headers.get("x-sebbi-event")
-    if override:
-        try:
-            ev = json.loads(override)
-        except Exception:
-            ev = {}
-    else:
-        ev = {}
-    ev.setdefault("user_id", headers.get("x-sebbi-user", "gateway_anonymous"))
-    ev.setdefault("action", "ai_request")
-    ev.setdefault("amount", 0)
-    ev.setdefault("country", headers.get("x-sebbi-country", "UK"))
-    ev.setdefault("device_id", headers.get("x-sebbi-device", device_id_fallback))
-    ev.setdefault("anomaly", 0)
-    ev.setdefault("device_risk", 0)
-    return ev
-
-
-class ComplianceGatewayProxy:
-    def __init__(self, host="0.0.0.0", port=PROXY_PORT):
-        self.host = host
-        self.port = port
-
-    async def start(self):
-        server = await asyncio.start_server(self.handle_client_traffic, self.host, self.port)
-        logging.info("AILeash Gateway operational on :%s (real enforcement, real forwarding)", self.port)
-        async with server:
-            await server.serve_forever()
-
-    async def handle_client_traffic(self, reader, writer):
-        peer = writer.get_extra_info("peername")
-        try:
-            method, path, headers, body = await read_full_request(reader)
-        except Exception as e:
-            logging.warning("Bad request from %s: %s", peer, e)
-            writer.close()
-            return
-
-        try:
-            # Route: /openai/... or /anthropic/... selects the real provider.
-            segments = path.strip("/").split("/", 1)
-            provider_key = segments[0] if segments else ""
-            upstream_path = "/" + segments[1] if len(segments) > 1 else "/"
-
-            if provider_key not in PROVIDERS:
-                self._reject(writer, 404, "unknown_provider",
-                              "Path must start with /openai/ or /anthropic/")
-                return
-
-            ailleash_key = headers.get("x-sebbi-key", "")
-            if not ailleash_key:
-                self._reject(writer, 401, "missing_compliance_key",
-                              "Include your AILeash API key in the X-Sebbi-Key header.")
-                return
-
-            device_id_fallback = str(peer[0]) if peer else "unknown_device"
-            event = default_event(headers, device_id_fallback)
-
-            loop = asyncio.get_event_loop()
-            decision_json, status = await loop.run_in_executor(
-                None, call_govern, ailleash_key, event
-            )
-            decision = decision_json.get("decision", "BLOCK")
-
-            if status != 200 or decision == "BLOCK":
-                logging.warning("[BLOCKED] %s -> %s (%s)", peer, provider_key, decision_json.get("reasons", decision_json.get("error", "")))
-                self._reject(writer, 403, "compliance_block", None, decision_json)
-                return
-
-            # ALLOW or CHALLENGE both proceed - CHALLENGE just means the
-            # customer's own code should show the user the verification
-            # link included in decision_json. We don't invent enforcement
-            # server.py doesn't have.
-            upstream_host = PROVIDERS[provider_key]
-            forward_bytes = build_forward_request(method, upstream_path, headers, body, upstream_host)
-
-            real_response = await forward_to_provider(upstream_host, forward_bytes)
-
-            tx_seal = hmac.new(PROXY_SIGNING_KEY, real_response[:2048], hashlib.sha256).hexdigest()
-            logging.info("[ROUTED] %s -> %s decision=%s seal=%s", peer, provider_key, decision, tx_seal[:16])
-
-            writer.write(real_response)
-            await writer.drain()
-
-        except Exception as e:
-            logging.error("Proxy error for %s: %s", peer, e)
-            try:
-                self._reject(writer, 502, "gateway_error", str(e))
-            except Exception:
-                pass
-        finally:
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except Exception:
-                pass
-
-    def _reject(self, writer, code, reason, message=None, extra=None):
-        payload = {"error": reason}
-        if message:
-            payload["message"] = message
-        if extra:
-            payload["compliance_decision"] = extra
-        body = json.dumps(payload).encode("utf-8")
-        status_text = {401: "Unauthorized", 403: "Forbidden", 404: "Not Found", 502: "Bad Gateway"}.get(code, "Error")
-        resp = (
-            "HTTP/1.1 " + str(code) + " " + status_text + "\r\n"
-            "Content-Type: application/json\r\n"
-            "Content-Length: " + str(len(body)) + "\r\n"
-            "Connection: close\r\n\r\n"
-        ).encode("utf-8") + body
-        writer.write(resp)
-
-
-if __name__ == "__main__":
-    gateway = ComplianceGatewayProxy()
-    try:
-        asyncio.run(gateway.start())
-    except KeyboardInterrupt:
-        logging.info("Gateway offline.")
-
-```
+- `ai-standard.html`
+- `ai-txt-kit.html`
+- `aitxt-popup-live.html`
 
 
 ## `sebbi_orchestrator.py`
@@ -2759,6 +2027,378 @@ function show(name,el){
   document.getElementById("p-"+name).className="panel on";
 }
 </script>
+</body>
+</html>
+
+```
+
+
+## `ai-standard.html`
+
+97 lines, 4847 bytes
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#0a0f1e">
+<title>ai.txt - Free Download</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0a0f1e;color:#e8e8f0;min-height:100vh;display:flex;flex-direction:column}
+nav{border-bottom:1px solid #1e2a45;padding:16px 20px}
+nav a{color:#c9a84c;text-decoration:none;font-family:monospace;font-size:14px}
+.wrap{flex:1;display:flex;align-items:center;justify-content:center;padding:30px 20px}
+.card{max-width:560px;width:100%;background:#0d1428;border:1px solid #1e2a45;border-radius:16px;padding:36px 28px;text-align:center}
+h1{font-size:32px;font-weight:800;margin-bottom:14px;line-height:1.15}
+h1 span{color:#c9a84c}
+p{color:#8a90a6;font-size:15px;line-height:1.7;margin-bottom:14px}
+p b{color:#e8e8f0}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:10px;width:100%;background:#c9a84c;color:#0a0f1e;padding:18px;border-radius:10px;font-weight:800;font-size:17px;border:none;cursor:pointer;font-family:inherit;margin:20px 0 10px}
+.sub{font-family:monospace;font-size:12px;color:#7fe3b0;margin-bottom:24px}
+.steps{text-align:left;background:#0b1226;border:1px solid #1e2a45;border-radius:10px;padding:18px 20px;margin-top:8px}
+.steps li{color:#8a90a6;font-size:14px;margin:10px 0 10px 6px;line-height:1.6}
+.steps li b{color:#c9a84c}
+.back{margin-top:22px}
+.back a{color:#c9a84c;text-decoration:none;font-size:14px;font-weight:600}
+footer{border-top:1px solid #1e2a45;padding:20px;text-align:center;color:#5a6178;font-size:12px}
+footer a{color:#c9a84c;text-decoration:none}
+</style>
+</head>
+<body>
+<nav><a href="/">&larr; AILeash</a></nav>
+<div class="wrap">
+  <div class="card">
+    <h1>Download <span>ai.txt</span> &mdash; free</h1>
+    <div class="sub">NO KEY &middot; NO ACCOUNT &middot; NO COST</div>
+    <p>ai.txt is the free, open standard for declaring how your AI is governed. Download the file, and it shows your system exactly what it needs to become compliant.</p>
+    <button class="btn" onclick="downloadIt()">&#8681; Download ai.txt free</button>
+    <ul class="steps">
+      <li><b>1.</b> Tap download &mdash; the file saves as ai.txt</li>
+      <li><b>2.</b> Fill in your details, put it on your domain at yourdomain.com/ai.txt</li>
+      <li><b>3.</b> Want it verified and provable? <b><a href="/" style="color:#c9a84c">Come back to AILeash</a></b> to seal it into a tamper-evident chain.</li>
+    </ul>
+    <div class="back"><a href="/ai.txt">See the live ai.txt &rarr;</a></div>
+  </div>
+</div>
+<footer>ai.txt is a free, open standard by <a href="/">Monop Content</a> &middot; Blyth, UK &middot; <a href="/ai.txt">reference</a></footer>
+<script>
+var AITXT = [
+"# ============================================================================",
+"# ai.txt - AI Governance Declaration  (AI-TXT/1.0)",
+"# A free, open standard. Copy this to the root of your domain as /ai.txt",
+"# Replace the values below with your own. Delete any line that does not apply.",
+"# No key, no account, no permission, no cost. Just publish it.",
+"# See it live: https://sebbi.pro/ai.txt",
+"# ============================================================================",
+"",
+"Standard: AI-TXT/1.0",
+"Operator: YOUR COMPANY NAME",
+"Operator-Location: YOUR CITY, COUNTRY",
+"Contact: you@yourdomain.com",
+"Last-Updated: 2026-01-01",
+"",
+"# --- How your AI makes decisions ---",
+"Decision-Model: describe it (deterministic rules / ML model / human-in-loop)",
+"Decision-Outcomes: ALLOW, REVIEW, BLOCK",
+"Human-Override: yes / no",
+"Plain-Language-Reasons: yes / no",
+"",
+"# --- Your audit record (how you prove what happened) ---",
+"Audit-Chain: describe it (SHA-256 hash chain / signed logs / none)",
+"Chain-Property: tamper-evident / tamper-resistant / none",
+"Verify-Endpoint: https://yourdomain.com/your-verify-url",
+"",
+"# --- Regulations you are designing towards ---",
+"Regulation: EU AI Act 2024/1689",
+"Regulation: UK Online Safety Act 2023",
+"",
+"# --- Optional: public status surfaces ---",
+"Live-Status: https://yourdomain.com/health",
+"Whitepaper: https://yourdomain.com/whitepaper",
+"",
+"# ============================================================================",
+"# ai.txt is a free, open standard. Publish yours, share it, build on it.",
+"# ============================================================================"
+].join("\n");
+function downloadIt(){
+  var blob = new Blob([AITXT], {type:"text/plain"});
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement("a");
+  a.href = url; a.download = "ai.txt";
+  document.body.appendChild(a); a.click();
+  document.body.removeChild(a); URL.revokeObjectURL(url);
+}
+</script>
+</body>
+</html>
+
+```
+
+
+## `ai-txt-kit.html`
+
+86 lines, 6554 bytes
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#0a0f1e">
+<title>ai.txt Starter Kit &mdash; publish AI governance free in 5 minutes</title>
+<meta name="description" content="Publish an ai.txt on your own domain, free. Copy the template, add the badge, make it provable. No key, no account.">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0a0f1e;color:#e8e8f0;line-height:1.6}
+.mono{font-family:"JetBrains Mono",ui-monospace,Menlo,monospace}
+nav{position:sticky;top:0;z-index:10;background:rgba(10,15,30,.94);backdrop-filter:blur(10px);border-bottom:1px solid #1e2a45;padding:0 20px;height:54px;display:flex;align-items:center;justify-content:space-between}
+nav a.logo{display:flex;align-items:center;gap:8px;color:#c9a84c;text-decoration:none;font-family:"JetBrains Mono",monospace;font-size:13px}
+nav .links a{color:#8a90a6;text-decoration:none;font-size:13px;margin-left:16px}
+.wrap{max-width:760px;margin:0 auto;padding:44px 20px 90px}
+.eyebrow{font-family:"JetBrains Mono",monospace;font-size:11px;letter-spacing:3px;text-transform:uppercase;color:#c9a84c;margin-bottom:12px}
+h1{font-size:34px;font-weight:800;letter-spacing:-.02em;line-height:1.1;margin-bottom:14px}
+h1 span{color:#c9a84c}
+.lede{color:#8a90a6;font-size:16px;margin-bottom:8px}
+.free{display:inline-block;background:rgba(0,229,160,.1);border:1px solid #00b87d;color:#7fe3b0;font-family:"JetBrains Mono",monospace;font-size:12px;padding:5px 12px;border-radius:5px;margin:14px 0 30px}
+h2{font-size:20px;font-weight:700;margin:40px 0 8px;padding-top:26px;border-top:1px solid #1e2a45}
+.step-n{font-family:"JetBrains Mono",monospace;color:#c9a84c;font-size:13px}
+p{color:#8a90a6;margin-bottom:14px}
+p b{color:#e8e8f0}
+.box{background:#0b1226;border:1px solid #1e2a45;border-radius:10px;padding:18px;margin:16px 0;font-family:"JetBrains Mono",monospace;font-size:12.5px;color:#7fe3b0;white-space:pre-wrap;word-break:break-word;line-height:1.8;overflow-x:auto}
+.btn{display:inline-flex;align-items:center;gap:8px;background:#c9a84c;color:#0a0f1e;padding:12px 22px;border-radius:8px;font-weight:800;font-size:14px;text-decoration:none;border:none;cursor:pointer;font-family:inherit}
+.btn.ghost{background:transparent;border:1px solid #2a3350;color:#e8e8f0}
+.btnrow{display:flex;gap:10px;flex-wrap:wrap;margin:16px 0}
+.badge-demo{display:inline-flex;align-items:center;gap:8px;background:#111a30;border:1px solid #c9a84c;border-radius:8px;padding:8px 14px;font-family:"JetBrains Mono",monospace;font-size:12px;color:#c9a84c;text-decoration:none}
+.badge-demo svg{flex-shrink:0}
+.onramp{background:linear-gradient(135deg,rgba(0,229,160,.06),rgba(201,168,76,.05));border:1px solid #00b87d;border-radius:12px;padding:24px;margin-top:30px}
+.onramp h3{color:#7fe3b0;font-size:16px;margin-bottom:8px}
+.onramp p{color:#a9b0c4}
+.copied{color:#7fe3b0;font-size:12px;margin-left:10px;opacity:0;transition:opacity .2s}
+.copied.show{opacity:1}
+footer{border-top:1px solid #1e2a45;padding:26px 20px;text-align:center;color:#5a6178;font-size:12px}
+footer a{color:#c9a84c;text-decoration:none}
+</style>
+</head>
+<body>
+<nav>
+  <a class="logo" href="/"><svg width="18" height="18" viewBox="0 0 32 32"><circle cx="16" cy="16" r="13.5" fill="none" stroke="#c9a84c" stroke-width="2.6" stroke-dasharray="66 20" stroke-linecap="round" transform="rotate(-50 16 16)"/><circle cx="26.5" cy="7" r="3.1" fill="#c9a84c"/></svg>AILeash</a>
+  <div class="links"><a href="/ai.txt">Spec</a><a href="/whitepaper">Whitepaper</a></div>
+</nav>
+<div class="wrap">
+  <div class="eyebrow">// ai.txt starter kit</div>
+  <h1>Publish AI governance on your own site. <span>Free.</span></h1>
+  <p class="lede">ai.txt is the robots.txt of AI governance: one small file at your domain root that declares how your AI is governed and where anyone can verify it. Here is everything you need to publish one in about five minutes.</p>
+  <div class="free">FREE STANDARD &middot; NO KEY &middot; NO ACCOUNT &middot; NO PERMISSION</div>
+
+  <h2><span class="step-n">01 /</span> Grab the template</h2>
+  <p>A ready-to-fill ai.txt with every line commented. Download it, or read the live example on our own domain.</p>
+  <div class="btnrow">
+    <a class="btn" href="/ai-txt-template.txt" download="ai.txt">&#8681; Download template</a>
+    <a class="btn ghost" href="/ai.txt" target="_blank">Read a live example</a>
+  </div>
+
+  <h2><span class="step-n">02 /</span> Fill it in and publish</h2>
+  <p>Replace the example values with your own facts. <b>Delete any line you cannot back with a real verify endpoint</b> &mdash; an honest short ai.txt beats an aspirational long one. Then upload it to the root of your domain so it lives at:</p>
+  <div class="box">https://yourdomain.com/ai.txt</div>
+  <p>That is the whole spec. One file, at the root, readable by anyone &mdash; a regulator, a partner, or another machine deciding whether to trust you.</p>
+
+  <h2><span class="step-n">03 /</span> Add the badge</h2>
+  <p>Show visitors and crawlers that you have declared your AI governance. Copy this HTML onto your site &mdash; it renders a small badge linking to your ai.txt:</p>
+  <p>Preview:</p>
+  <a class="badge-demo" href="/ai.txt"><svg width="14" height="14" viewBox="0 0 32 32"><circle cx="16" cy="16" r="13.5" fill="none" stroke="#c9a84c" stroke-width="3" stroke-dasharray="66 20" stroke-linecap="round" transform="rotate(-50 16 16)"/><circle cx="26.5" cy="7" r="3.4" fill="#c9a84c"/></svg>AI-Governed &middot; ai.txt</a>
+  <div class="box" id="badge">&lt;a href="/ai.txt" style="display:inline-flex;align-items:center;gap:6px;font-family:monospace;font-size:12px;color:#c9a84c;text-decoration:none;border:1px solid #c9a84c;border-radius:6px;padding:6px 10px"&gt;AI-Governed &middot; ai.txt&lt;/a&gt;</div>
+  <button class="btn ghost" onclick="copyBadge()">Copy badge HTML<span class="copied" id="cp">copied</span></button>
+
+</div>
+</div>
+<footer>
+  ai.txt (AI-TXT/1.0) is a free, open standard by <a href="/">Monop Content</a> &middot; Blyth, UK &middot; <a href="/ai.txt">spec</a> &middot; <a href="/comply.txt">comply.txt</a>
+</footer>
+<script>
+function copyBadge(){
+  var t=document.getElementById('badge').textContent;
+  navigator.clipboard.writeText(t).then(function(){
+    var c=document.getElementById('cp');c.classList.add('show');setTimeout(function(){c.classList.remove('show')},1500);
+  });
+}
+</script>
+</body>
+</html>
+
+```
+
+
+## `aitxt-popup-live.html`
+
+165 lines, 7279 bytes
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ai.txt Live Compliance Widget — Preview</title>
+<style>
+  body{margin:0;background:#e8e6df;font-family:-apple-system,'Segoe UI',Roboto,sans-serif;min-height:100vh;}
+  .demo-note{position:fixed;top:16px;left:16px;right:16px;background:#fff;border:1px solid #ddd;border-radius:8px;padding:12px 16px;font-size:13px;color:#555;max-width:560px;margin:0 auto;text-align:center;z-index:2;}
+</style>
+</head>
+<body>
+<div class="demo-note">This page has no ai.txt, so the badge will honestly say "not found." Click it to see the real check running live.</div>
+
+<!-- ============================================================
+     THE DELIVERABLE: one script tag. Paste into any site.
+     On load, it actually fetches /ai.txt from that same domain
+     and reports the true result — nothing hardcoded, nothing faked.
+============================================================= -->
+<script>
+(function(){
+  var CSS = `
+    #aitxt-badge{
+      position:fixed;bottom:20px;right:20px;z-index:999998;
+      background:#0a0f1e;color:#8b93ac;border:1px solid #232c48;
+      font-family:'SF Mono','JetBrains Mono',Consolas,monospace;
+      font-size:12px;padding:10px 16px;border-radius:999px;cursor:pointer;
+      box-shadow:0 4px 18px rgba(0,0,0,.25);display:flex;align-items:center;gap:8px;
+      transition:transform .15s ease;
+    }
+    #aitxt-badge:hover{transform:translateY(-2px);}
+    #aitxt-badge .dot{width:7px;height:7px;border-radius:50%;background:#8b93ac;flex-shrink:0;transition:background .2s ease;}
+    #aitxt-badge .dot.ok{background:#7fe3b0;}
+    #aitxt-badge .dot.warn{background:#ff8a80;}
+    #aitxt-badge .dot.checking{background:#c9a84c;animation:aitxt-pulse 1s ease-in-out infinite;}
+    @keyframes aitxt-pulse{50%{opacity:.3;}}
+    #aitxt-overlay{
+      position:fixed;inset:0;background:rgba(10,15,30,.6);z-index:999999;
+      display:none;align-items:center;justify-content:center;padding:20px;
+    }
+    #aitxt-overlay.open{display:flex;}
+    #aitxt-modal{
+      background:#10182e;border:1px solid #232c48;border-radius:12px;
+      max-width:420px;width:100%;color:#e7ebf5;font-family:-apple-system,'Segoe UI',Roboto,sans-serif;
+      overflow:hidden;
+    }
+    #aitxt-modal .aitxt-head{padding:20px 22px 0;}
+    #aitxt-modal .aitxt-eyebrow{
+      font-family:'SF Mono',Consolas,monospace;font-size:11px;letter-spacing:.1em;
+      text-transform:uppercase;color:#c9a84c;margin-bottom:10px;
+    }
+    #aitxt-modal h3{margin:0 0 8px;font-size:19px;line-height:1.3;}
+    #aitxt-modal p{margin:0 0 18px;font-size:13.5px;line-height:1.55;color:#8b93ac;}
+    #aitxt-modal .aitxt-body{padding:0 22px 22px;}
+    #aitxt-modal .aitxt-status{
+      display:flex;align-items:center;gap:8px;padding:12px 14px;
+      background:#161f38;border:1px solid #232c48;border-radius:8px;margin-bottom:16px;
+      font-family:'SF Mono',Consolas,monospace;font-size:12px;
+    }
+    #aitxt-modal .aitxt-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;}
+    #aitxt-modal .aitxt-dot.ok{background:#7fe3b0;}
+    #aitxt-modal .aitxt-dot.warn{background:#ff8a80;}
+    #aitxt-modal .aitxt-dot.checking{background:#c9a84c;animation:aitxt-pulse 1s ease-in-out infinite;}
+    #aitxt-modal .aitxt-status.ok span.label{color:#7fe3b0;}
+    #aitxt-modal .aitxt-status.warn span.label{color:#ff8a80;}
+    #aitxt-modal .aitxt-status.checking span.label{color:#c9a84c;}
+    #aitxt-modal a.aitxt-cta{
+      display:block;text-align:center;background:#c9a84c;color:#0a0f1e;
+      font-weight:600;font-size:14px;padding:11px;border-radius:7px;
+      text-decoration:none;margin-bottom:10px;
+    }
+    #aitxt-modal button.aitxt-close{
+      display:block;width:100%;background:transparent;border:1px solid #232c48;
+      color:#8b93ac;font-size:13px;padding:10px;border-radius:7px;cursor:pointer;
+    }
+  `;
+  var style = document.createElement('style');
+  style.textContent = CSS;
+  document.head.appendChild(style);
+
+  var badge = document.createElement('div');
+  badge.id = 'aitxt-badge';
+  badge.innerHTML = '<span class="dot checking"></span><span class="label">Checking AI governance…</span>';
+  document.body.appendChild(badge);
+
+  var overlay = document.createElement('div');
+  overlay.id = 'aitxt-overlay';
+  overlay.innerHTML = `
+    <div id="aitxt-modal">
+      <div class="aitxt-head">
+        <div class="aitxt-eyebrow">ai.txt · sebbi.pro</div>
+        <h3>AI governance declaration</h3>
+        <p>ai.txt is a plain-text file — like robots.txt — that states how this site's AI systems are governed. This check looked for it at the domain root, live, just now.</p>
+      </div>
+      <div class="aitxt-body">
+        <div class="aitxt-status checking" id="aitxt-modal-status">
+          <span class="aitxt-dot checking"></span>
+          <span class="label">Checking…</span>
+        </div>
+        <a class="aitxt-cta" href="https://sebbi.pro" target="_blank" id="aitxt-cta">Generate ai.txt — free</a>
+        <button class="aitxt-close">Close</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+
+  var badgeDot = badge.querySelector('.dot');
+  var badgeLabel = badge.querySelector('.label');
+  var modalStatus = overlay.querySelector('#aitxt-modal-status');
+  var modalDot = modalStatus.querySelector('.aitxt-dot');
+  var modalLabel = modalStatus.querySelector('.label');
+  var cta = overlay.querySelector('#aitxt-cta');
+
+  function setState(state, text, modalText){
+    badgeDot.className = 'dot ' + state;
+    badgeLabel.textContent = text;
+    modalStatus.className = 'aitxt-status ' + state;
+    modalDot.className = 'aitxt-dot ' + state;
+    modalLabel.textContent = modalText;
+    if(state === 'ok'){
+      cta.textContent = 'View declaration';
+    } else {
+      cta.textContent = 'Generate ai.txt — free';
+    }
+  }
+
+  // The real check — looks for ai.txt on this exact page's own domain.
+  // Checks the standard /.well-known/ai.txt location first, then falls
+  // back to /ai.txt at root. Same-origin, no backend needed, and it
+  // can't be faked by hardcoding a result: it either finds the file or
+  // it doesn't.
+  function checkPath(path){
+    return fetch(path, {method:'GET', cache:'no-store'})
+      .then(function(res){ return res.ok ? path : null; })
+      .catch(function(){ return null; });
+  }
+
+  Promise.all([
+    checkPath('/.well-known/ai.txt'),
+    checkPath('/ai.txt')
+  ]).then(function(results){
+    var foundAt = results.find(function(p){ return p !== null; });
+    if(foundAt){
+      setState('ok', 'AI governance declared', 'ai.txt found at ' + foundAt);
+    } else {
+      setState('warn', 'No ai.txt found', 'No ai.txt file found at this domain');
+    }
+  });
+
+  badge.addEventListener('click', function(){ overlay.classList.add('open'); });
+  overlay.addEventListener('click', function(e){
+    if(e.target === overlay) overlay.classList.remove('open');
+  });
+  overlay.querySelector('.aitxt-close').addEventListener('click', function(){
+    overlay.classList.remove('open');
+  });
+})();
+</script>
+<!-- ============================================================
+     END OF SNIPPET
+============================================================= -->
+
 </body>
 </html>
 
