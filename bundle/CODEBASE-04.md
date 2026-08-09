@@ -1,11 +1,1383 @@
-# Codebase — part 4 of 16
+# Codebase — part 4 of 17
 
 Contains:
+- `modules/counterfactual.py`
+- `modules/declare.py`
+- `modules/demo.py`
+- `modules/dsr.py`
 - `modules/fingerprint.py`
 - `modules/lineage.py`
-- `modules/mutual.py`
-- `modules/network.py`
-- `modules/oversight.py`
+
+
+## `modules/counterfactual.py`
+
+397 lines, 16121 bytes
+
+```python
+"""
+Counterfactual explanation - /x/counterfactual/<action>
+
+WHAT THIS IS
+------------
+Every governance vendor claims explainability. What they nearly all mean is
+attribution: a list of which factors pushed the score up. That answers "why
+did this happen" and leaves the only question anyone actually cares about
+untouched - "what would have had to be different?"
+
+That second question is the one a person contesting a decision needs, the
+one Article 22 recourse turns on, and the one an ML-based system genuinely
+cannot answer. A neural model is not invertible: you can attribute, you can
+approximate with a sampling method, you cannot state the exact boundary.
+
+This engine is arithmetic with published weights. Arithmetic runs backwards.
+So for any sealed decision, the exact minimum change in every single factor
+that would have produced a different verdict can be computed, stated, and
+sealed - and anyone can re-derive it independently.
+
+THE SCORING FUNCTION, RUN BACKWARDS
+-----------------------------------
+    score = (1 - trust)              x 0.30
+          + min(v60/20, 1)           x 0.15
+          + min(v5m/50, 1)           x 0.10
+          + min(v1h/200, 1)          x 0.10
+          + min(ln(1+amt)/ln(10001), 1) x 0.15
+          + device_risk              x 0.10
+          + anomaly                  x 0.10
+          + 0.10 if country_shift
+          + 0.10 if unsafe_country
+
+    ALLOW < 0.35 <= CHALLENGE < 0.70 <= BLOCK
+
+Each term is monotonic and independently invertible, so the required delta
+for any single factor is exact rather than estimated.
+
+WHAT YOU GET BACK
+-----------------
+  - the margin: how far the score sat from the nearest boundary. A BLOCK at
+    0.701 and a BLOCK at 0.94 are not the same decision, and treating them
+    the same is a failure of explanation.
+  - per factor: the exact value that factor would have needed, alone, to
+    reach the next verdict down - or a statement that this factor alone
+    could not have done it, however far it moved.
+  - the cheapest single change, where one exists.
+  - a recourse statement in plain English, suitable for handing to the
+    person the decision was about.
+
+THE UNCOMFORTABLE PART, STATED UP FRONT
+---------------------------------------
+Perfect explainability and resistance to gaming are in direct tension, and
+almost nobody in this field says so.
+
+Telling a legitimate subject "your 60-second velocity needed to be under 11"
+also tells a fraudster exactly where the wall is. This is not a flaw that
+better engineering removes - it is what explanation IS. Publishing weights
+means the boundary is derivable by anyone who reads the whitepaper anyway;
+this module makes explicit what was already implicit.
+
+The mitigations are honest rather than complete: these routes require a key
+and are rate limited; every counterfactual request is itself sealed, so a
+pattern of boundary probing is visible in the chain afterwards; and the
+trust signal is history-dependent, so knowing the boundary does not let you
+arrive at it instantly.
+
+Operators handing counterfactuals to end users should treat that as a
+deliberate choice with a cost, not a free feature.
+
+    POST /x/counterfactual/explain    signals + verdict -> full analysis
+    GET  /x/counterfactual/decision?block=N   explain a sealed decision
+    GET  /x/counterfactual/probing    who has been mapping the boundary
+"""
+
+import json, math, time
+from datetime import datetime, timezone
+
+VERSION = "1.0"
+
+ALLOW_MAX = 0.35
+CHALLENGE_MAX = 0.70
+LN_CAP = math.log1p(10000)
+
+_ready = False
+
+
+def _setup(ctx):
+    global _ready
+    if _ready:
+        return
+    with ctx["lock"]:
+        ctx["conn"].execute("CREATE TABLE IF NOT EXISTS cf_requests(id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,ts REAL,block_index INTEGER,verdict TEXT,score REAL,target TEXT)")
+        ctx["conn"].execute("CREATE INDEX IF NOT EXISTS idx_cf_key ON cf_requests(api_key,ts)")
+        ctx["conn"].commit()
+    _ready = True
+
+
+def _clamp(x, a=0.0, b=1.0):
+    return max(a, min(b, x))
+
+
+def _iso(ts):
+    if not ts:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+def _f(d, k, default=0.0):
+    try:
+        return float(d.get(k, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _score(s):
+    sc = (1 - s["trust"]) * 0.30
+    sc += min(s["v60"] / 20.0, 1) * 0.15
+    sc += min(s["v5m"] / 50.0, 1) * 0.10
+    sc += min(s["v1h"] / 200.0, 1) * 0.10
+    sc += min(math.log1p(s["amount"]) / LN_CAP, 1) * 0.15
+    sc += s["device_risk"] * 0.10
+    sc += s["anomaly"] * 0.10
+    if s["country_shift"]:
+        sc += 0.10
+    if s["unsafe_country"]:
+        sc += 0.10
+    return round(_clamp(sc), 4)
+
+
+def _verdict(sc):
+    if sc < ALLOW_MAX:
+        return "ALLOW"
+    if sc < CHALLENGE_MAX:
+        return "CHALLENGE"
+    return "BLOCK"
+
+
+def _normalise(data):
+    return {
+        "trust": _clamp(_f(data, "trust", 0.5)),
+        "v60": max(0.0, _f(data, "v60")),
+        "v5m": max(0.0, _f(data, "v5m")),
+        "v1h": max(0.0, _f(data, "v1h")),
+        "amount": max(0.0, _f(data, "amount")),
+        "device_risk": _clamp(_f(data, "device_risk")),
+        "anomaly": _clamp(_f(data, "anomaly")),
+        "country_shift": bool(data.get("country_shift")),
+        "unsafe_country": bool(data.get("unsafe_country")),
+    }
+
+
+# ---- per-factor contribution and inversion -------------------------------
+
+def _contribs(s):
+    return {
+        "trust": (1 - s["trust"]) * 0.30,
+        "v60": min(s["v60"] / 20.0, 1) * 0.15,
+        "v5m": min(s["v5m"] / 50.0, 1) * 0.10,
+        "v1h": min(s["v1h"] / 200.0, 1) * 0.10,
+        "amount": min(math.log1p(s["amount"]) / LN_CAP, 1) * 0.15,
+        "device_risk": s["device_risk"] * 0.10,
+        "anomaly": s["anomaly"] * 0.10,
+        "country_shift": 0.10 if s["country_shift"] else 0.0,
+        "unsafe_country": 0.10 if s["unsafe_country"] else 0.0,
+    }
+
+
+def _invert(factor, target_contrib, s):
+    """Value this factor would need for the stated contribution.
+    Returns (value, human_string) or None where impossible."""
+    t = target_contrib
+    if factor == "trust":
+        v = 1 - (t / 0.30)
+        if v > 1.0:
+            return None
+        return round(_clamp(v), 4), "trust of " + str(round(_clamp(v), 3)) + " or higher (was " + str(round(s["trust"], 3)) + ")"
+    if factor in ("v60", "v5m", "v1h"):
+        cap, w = {"v60": (20.0, 0.15), "v5m": (50.0, 0.10), "v1h": (200.0, 0.10)}[factor]
+        v = (t / w) * cap
+        if v < 0:
+            return None
+        label = {"v60": "60-second", "v5m": "5-minute", "v1h": "1-hour"}[factor]
+        return round(v, 2), label + " velocity of " + str(int(v)) + " or fewer (was " + str(int(s[factor])) + ")"
+    if factor == "amount":
+        v = math.expm1((t / 0.15) * LN_CAP)
+        if v < 0:
+            return None
+        return round(v, 2), "amount of " + str(round(v, 2)) + " or less (was " + str(round(s["amount"], 2)) + ")"
+    if factor in ("device_risk", "anomaly"):
+        v = t / 0.10
+        if v < 0:
+            return None
+        nice = "device risk" if factor == "device_risk" else "behavioural anomaly"
+        return round(_clamp(v), 4), nice + " of " + str(round(_clamp(v), 3)) + " or lower (was " + str(round(s[factor], 3)) + ")"
+    if factor in ("country_shift", "unsafe_country"):
+        if t >= 0.10:
+            return None
+        nice = "no country change from the previous event" if factor == "country_shift" else "an event from a jurisdiction on the safe list"
+        return 0, nice
+    return None
+
+
+def _analyse(s, want=None):
+    score = _score(s)
+    verdict = _verdict(score)
+    contribs = _contribs(s)
+
+    if verdict == "BLOCK":
+        target_v, ceiling = "CHALLENGE", CHALLENGE_MAX
+    elif verdict == "CHALLENGE":
+        target_v, ceiling = "ALLOW", ALLOW_MAX
+    else:
+        return {"score": score, "verdict": verdict,
+                "margin_to_next_boundary": round(ALLOW_MAX - score, 4),
+                "note": "Already the most permissive verdict. Nothing needed to change it."}, contribs, None
+
+    if want in ("ALLOW", "CHALLENGE"):
+        target_v = want
+        ceiling = ALLOW_MAX if want == "ALLOW" else CHALLENGE_MAX
+
+    # need score strictly below ceiling
+    needed = round(score - ceiling, 6)
+    factors = []
+    cheapest = None
+
+    for name, c in sorted(contribs.items(), key=lambda kv: -kv[1]):
+        entry = {"factor": name,
+                 "contributed": round(c, 4),
+                 "share_of_score_pct": (round(100 * c / score, 1) if score else 0)}
+        if c <= 0:
+            entry["alone_sufficient"] = False
+            entry["reason"] = "contributed nothing to this score"
+            factors.append(entry)
+            continue
+        # contribution required so total lands just under the ceiling
+        target_contrib = c - needed - 0.0001
+        if target_contrib < 0:
+            entry["alone_sufficient"] = False
+            entry["reason"] = ("even at zero this factor only removes "
+                               + str(round(c, 4)) + " of the "
+                               + str(round(needed, 4)) + " required")
+        else:
+            inv = _invert(name, target_contrib, s)
+            if inv is None:
+                entry["alone_sufficient"] = False
+                entry["reason"] = "no attainable value of this factor reaches the threshold"
+            else:
+                val, human = inv
+                entry["alone_sufficient"] = True
+                entry["required_value"] = val
+                entry["statement"] = human
+                if cheapest is None:
+                    cheapest = {"factor": name, "required_value": val, "statement": human}
+        factors.append(entry)
+
+    summary = {
+        "score": score,
+        "verdict": verdict,
+        "target_verdict": target_v,
+        "threshold": ceiling,
+        "margin": round(score - ceiling, 4),
+        "score_reduction_required": max(0.0, needed),
+        "factors": factors,
+    }
+    if cheapest:
+        summary["single_change_that_would_have_sufficed"] = cheapest
+        summary["recourse_statement"] = (
+            "This decision was " + verdict + " with a score of " + str(score) +
+            ". The threshold for " + target_v + " is " + str(ceiling) +
+            ". The decision would have been " + target_v + " with " +
+            cheapest["statement"] + ", all else unchanged.")
+    else:
+        summary["single_change_that_would_have_sufficed"] = None
+        summary["recourse_statement"] = (
+            "This decision was " + verdict + " with a score of " + str(score) +
+            ". No single factor, changed alone, would have reached " + target_v +
+            " - the score was driven by several factors together.")
+    return summary, contribs, cheapest
+
+
+def _log(ctx, api_key, block_index, verdict, score, target):
+    with ctx["lock"]:
+        ctx["conn"].execute("INSERT INTO cf_requests(api_key,ts,block_index,verdict,score,target) VALUES(?,?,?,?,?,?)",
+                            (api_key, time.time(), block_index, verdict, score, target))
+        ctx["conn"].commit()
+
+
+def _seal(ctx, api_key, summary, block_index):
+    ts = time.time()
+    ev = {"user_id": "cf:" + str(block_index or "adhoc"), "action": "counterfactual",
+          "amount": 0, "country": "UK", "device_id": "counterfactual",
+          "anomaly": 0, "device_risk": 0}
+    res = {"decision": "COUNTERFACTUAL_SEALED", "score": 0,
+           "cf_version": VERSION, "timestamp": ts,
+           "explained_verdict": summary.get("verdict"),
+           "explained_score": summary.get("score"),
+           "target_verdict": summary.get("target_verdict"),
+           "detail": summary.get("recourse_statement")}
+    return ctx["seal"](ev, res, ts, api_key)
+
+
+def _explain(ctx, api_key, data):
+    s = _normalise(data)
+    want = str(data.get("target_verdict", "")).strip().upper() or None
+    summary, _c, _ch = _analyse(s, want)
+    h, idx, seq = _seal(ctx, api_key, summary, None)
+    _log(ctx, api_key, None, summary.get("verdict"), summary.get("score"), want)
+    summary["inputs_used"] = s
+    summary["audit_hash"] = h
+    summary["block_index"] = idx
+    summary["receipt_seq"] = seq
+    summary["reproduce"] = "Weights are published. Re-run the arithmetic yourself - this result is not an approximation."
+    return summary, 200
+
+
+def _decision(ctx, api_key, data):
+    try:
+        bid = int(data.get("block", 0))
+    except (TypeError, ValueError):
+        return {"error": "block_required", "message": "Pass ?block=<block_index> from a sealed decision."}, 400
+    if bid <= 0:
+        return {"error": "block_required"}, 400
+    with ctx["lock"]:
+        row = ctx["conn"].execute("SELECT event_json,result_json,ts FROM audit_log WHERE id=? AND api_key=?", (bid, api_key)).fetchone()
+    if not row:
+        return {"error": "unknown_block", "block": bid}, 404
+    try:
+        ev = json.loads(row[0])
+        res = json.loads(row[1])
+    except Exception:
+        return {"error": "block_unreadable"}, 500
+    if str(res.get("decision", "")).endswith("_SEALED"):
+        return {"error": "not_a_decision",
+                "message": "That block is a notary event, not an engine decision."}, 400
+
+    sig = res.get("signals") or res.get("applied") or {}
+    s = _normalise({
+        "trust": sig.get("trust", res.get("trust", 0.5)),
+        "v60": sig.get("v60", 0), "v5m": sig.get("v5m", 0), "v1h": sig.get("v1h", 0),
+        "amount": ev.get("amount", 0),
+        "device_risk": ev.get("device_risk", 0),
+        "anomaly": ev.get("anomaly", 0),
+        "country_shift": sig.get("country_shift", False),
+        "unsafe_country": sig.get("unsafe_country", False),
+    })
+    summary, _c, _ch = _analyse(s)
+    sealed_score = res.get("score")
+    if sealed_score is not None and abs(float(sealed_score) - summary["score"]) > 0.0002:
+        summary["reconstruction_warning"] = (
+            "Recomputed score " + str(summary["score"]) + " does not match the sealed score "
+            + str(sealed_score) + ". The sealed record does not carry every signal value, "
+            "so this explanation is indicative rather than exact. Pass the signals directly "
+            "to /explain for an exact result.")
+    else:
+        summary["reconstruction"] = "exact - recomputed score matches the sealed score"
+    summary["explained_block"] = bid
+    summary["sealed_at"] = _iso(row[2])
+    h, idx, seq = _seal(ctx, api_key, summary, bid)
+    _log(ctx, api_key, bid, summary.get("verdict"), summary.get("score"), None)
+    summary["audit_hash"] = h
+    summary["block_index"] = idx
+    return summary, 200
+
+
+def _probing(ctx, api_key):
+    t = time.time()
+    with ctx["lock"]:
+        rows = ctx["conn"].execute("SELECT ts,verdict,score FROM cf_requests WHERE api_key=? AND ts>? ORDER BY ts DESC", (api_key, t - 86400)).fetchall()
+    if not rows:
+        return {"requests_24h": 0,
+                "note": "No counterfactual requests in the last 24 hours."}, 200
+    scores = [r[2] for r in rows if r[2] is not None]
+    near = len([x for x in scores if abs(x - CHALLENGE_MAX) < 0.02 or abs(x - ALLOW_MAX) < 0.02])
+    out = {"requests_24h": len(rows),
+           "last_request": _iso(rows[0][0]),
+           "near_boundary_requests": near,
+           "note": "Every counterfactual request is sealed. Boundary probing leaves a trail whether or not anyone is watching at the time."}
+    if len(rows) >= 50:
+        out["flag"] = str(len(rows)) + " counterfactual requests in 24 hours - consistent with systematic boundary mapping"
+    if near >= 10:
+        out["boundary_flag"] = str(near) + " requests sat within 0.02 of a threshold"
+    return out, 200
+
+
+def handle(method, action, data, api_key, ctx):
+    _setup(ctx)
+    if method == "POST":
+        if action == "explain":
+            return _explain(ctx, api_key, data)
+    else:
+        if action == "decision":
+            return _decision(ctx, api_key, data)
+        if action == "probing":
+            return _probing(ctx, api_key)
+    return {"error": "unknown_action", "action": action,
+            "available": ["POST explain", "GET decision?block=", "GET probing"]}, 404
+
+```
+
+
+## `modules/declare.py`
+
+345 lines, 13493 bytes
+
+```python
+"""
+Declaration notary - /x/declare/<action>
+
+THE IDEA
+--------
+An operator uploads their own file saying what must always be true of their
+decisions. It is sealed, versioned, and published. Every record is then tested
+against it, and every violation is sealed.
+
+WHY THIS ISN'T CIRCULAR
+-----------------------
+The obvious objection: if they write their own rules AND supply their own
+data, checking one against the other proves nothing. They could declare
+nothing and pass.
+
+Two things stop that.
+
+1. THE RULES COME FIRST. A declaration is sealed before the records it judges.
+   You cannot write the rule after seeing the outcome, because the chain shows
+   which came first. Retrofitting a standard to a result is exactly what this
+   makes impossible.
+
+2. YOU CANNOT QUIETLY WEAKEN IT. Every version is kept and sealed. If you
+   published a strict rule in March and a loose one in September, both are
+   permanent and the change is dated. Nobody can pretend the strict one never
+   existed. Weakening your own standard becomes a visible act.
+
+So the file does not prove you are honest. It converts your claims into
+something that can be tested, and takes away your ability to move the goalposts
+afterwards. An auditor reads the declaration, reads the violations, and reads
+the version history. All three are sealed.
+
+RULE FORMAT
+-----------
+    {"rules": [
+      {"id": "no-silent-high-value",
+       "describe": "Payments over 10000 are never auto-allowed",
+       "when":    {"field": "amount",   "op": ">",  "value": 10000},
+       "require": {"field": "decision", "op": "in", "value": ["CHALLENGE","BLOCK"]}}
+    ]}
+
+    ops: == != > >= < <= in not_in exists
+
+HONEST LIMITS
+-------------
+- Weak rules prove weak things. A declaration that requires nothing passes
+  everything. Publish it and let people judge the rules themselves.
+- This tests what was sealed. A decision never recorded cannot violate a rule
+  - gapless receipts are what cover that gap, not this.
+- The operator still supplies the data. This is not an external audit. It is a
+  published standard, sealed before the evidence, that they can be held to.
+
+    POST /x/declare/publish     declaration file - sealed and versioned
+    GET  /x/declare/current     the live declaration
+    GET  /x/declare/history     every version ever published
+    POST /x/declare/check       test sealed records against it, seal the result
+    GET  /x/declare/violations  what failed, and when
+"""
+
+import hashlib, json, time
+from datetime import datetime, timezone
+
+VERSION = "1.0"
+OPS = {"==", "!=", ">", ">=", "<", "<=", "in", "not_in", "exists"}
+MAX_RULES = 100
+
+_ready = False
+
+
+def _setup(ctx):
+    global _ready
+    if _ready:
+        return
+    with ctx["lock"]:
+        ctx["conn"].execute("CREATE TABLE IF NOT EXISTS declarations(id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,version INTEGER,body TEXT,sha256 TEXT,published REAL,audit_hash TEXT,block_index INTEGER)")
+        ctx["conn"].execute("CREATE TABLE IF NOT EXISTS declare_checks(check_id TEXT PRIMARY KEY,api_key TEXT,decl_version INTEGER,ran REAL,tested INTEGER,passed INTEGER,violated INTEGER,detail TEXT,audit_hash TEXT)")
+        ctx["conn"].execute("CREATE INDEX IF NOT EXISTS idx_dec_key ON declarations(api_key,version)")
+        ctx["conn"].commit()
+    _ready = True
+
+
+def _iso(ts):
+    if not ts:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+def _sha(s):
+    if not isinstance(s, str):
+        s = json.dumps(s, sort_keys=True)
+    return hashlib.sha256(s.encode()).hexdigest()
+
+
+def _seal_event(ctx, api_key, ref, action, detail):
+    ts = time.time()
+    ev = {"user_id": "dec:" + ref, "action": "declare_" + action, "amount": 0,
+          "country": "UK", "device_id": "declare", "anomaly": 0, "device_risk": 0}
+    res = {"decision": "DECLARATION_SEALED", "score": 0, "declare_action": action,
+           "declare_version": VERSION, "timestamp": ts, "detail": detail}
+    h, idx, seq = ctx["seal"](ev, res, ts, api_key)
+    return h, idx, seq, ts
+
+
+def _validate(body):
+    if not isinstance(body, dict):
+        return "declaration must be an object"
+    rules = body.get("rules")
+    if not isinstance(rules, list) or not rules:
+        return "declaration needs a non-empty rules list"
+    if len(rules) > MAX_RULES:
+        return "too many rules (max " + str(MAX_RULES) + ")"
+    seen = set()
+    for i, r in enumerate(rules):
+        if not isinstance(r, dict):
+            return "rule " + str(i) + " is not an object"
+        rid = str(r.get("id", "")).strip()
+        if not rid:
+            return "rule " + str(i) + " has no id"
+        if rid in seen:
+            return "duplicate rule id: " + rid
+        seen.add(rid)
+        req = r.get("require")
+        if not isinstance(req, dict) or not req.get("field"):
+            return "rule " + rid + " has no require.field"
+        for part in ("when", "require"):
+            c = r.get(part)
+            if c is None:
+                continue
+            if not isinstance(c, dict):
+                return "rule " + rid + ": " + part + " must be an object"
+            if c.get("op", "==") not in OPS:
+                return "rule " + rid + ": unknown op " + str(c.get("op"))
+    return None
+
+
+def _get(record, field):
+    cur = record
+    for part in str(field).split("."):
+        if isinstance(cur, dict) and part in cur:
+            cur = cur[part]
+        else:
+            return None
+    return cur
+
+
+def _test(cond, record):
+    if not cond:
+        return True
+    val = _get(record, cond["field"])
+    op = cond.get("op", "==")
+    want = cond.get("value")
+    if op == "exists":
+        return (val is not None) == bool(want if want is not None else True)
+    if val is None:
+        return False
+    try:
+        if op == "==":
+            return str(val).strip().lower() == str(want).strip().lower()
+        if op == "!=":
+            return str(val).strip().lower() != str(want).strip().lower()
+        if op == "in":
+            return str(val).strip().lower() in [str(x).strip().lower() for x in want]
+        if op == "not_in":
+            return str(val).strip().lower() not in [str(x).strip().lower() for x in want]
+        v, w = float(val), float(want)
+        if op == ">":
+            return v > w
+        if op == ">=":
+            return v >= w
+        if op == "<":
+            return v < w
+        if op == "<=":
+            return v <= w
+    except Exception:
+        return False
+    return False
+
+
+def _current(ctx, api_key):
+    with ctx["lock"]:
+        return ctx["conn"].execute("SELECT version,body,sha256,published,audit_hash FROM declarations WHERE api_key=? ORDER BY version DESC LIMIT 1", (api_key,)).fetchone()
+
+
+def _publish(ctx, api_key, data):
+    body = data.get("declaration")
+    if body is None:
+        body = {k: v for k, v in data.items() if k != "declaration"}
+    if isinstance(body, str):
+        try:
+            body = json.loads(body)
+        except Exception:
+            return {"error": "declaration_not_json"}, 400
+    err = _validate(body)
+    if err:
+        return {"error": "invalid_declaration", "detail": err}, 400
+
+    prev = _current(ctx, api_key)
+    ver = (prev[0] + 1) if prev else 1
+    sha = _sha(body)
+    if prev and prev[2] == sha:
+        return {"error": "unchanged",
+                "message": "Identical to version " + str(prev[0]) + ". Nothing to publish."}, 400
+
+    ref = "V" + str(ver)
+    ids = [str(r.get("id")) for r in body["rules"]]
+    detail = ("version=" + str(ver) + ";sha256=" + sha + ";rules=" + str(len(ids)) +
+              ";ids=" + ",".join(ids[:40]) +
+              (";replaces=" + prev[2] if prev else ";first_declaration=true"))
+    h, idx, seq, ts = _seal_event(ctx, api_key, ref, "published", detail)
+
+    with ctx["lock"]:
+        ctx["conn"].execute("INSERT INTO declarations(api_key,version,body,sha256,published,audit_hash,block_index) VALUES(?,?,?,?,?,?,?)",
+                            (api_key, ver, json.dumps(body), sha, ts, h, idx))
+        ctx["conn"].commit()
+
+    out = {"version": ver, "sha256": sha, "rules": len(ids), "rule_ids": ids,
+           "published": _iso(ts), "audit_hash": h, "block_index": idx,
+           "receipt_seq": seq,
+           "note": "Sealed. Every record from this point is judged against it, and this version cannot be removed."}
+    if prev:
+        out["replaces_version"] = prev[0]
+        out["warning"] = "Version " + str(prev[0]) + " remains sealed and readable. Changes to your own standard are permanent and dated."
+    return out, 200
+
+
+def _current_view(ctx, api_key):
+    row = _current(ctx, api_key)
+    if not row:
+        return {"error": "no_declaration",
+                "message": "Nothing published yet."}, 404
+    return {"version": row[0], "declaration": json.loads(row[1]),
+            "sha256": row[2], "published": _iso(row[3]),
+            "sealed": row[4]}, 200
+
+
+def _history(ctx, api_key):
+    with ctx["lock"]:
+        rows = ctx["conn"].execute("SELECT version,sha256,published,audit_hash,body FROM declarations WHERE api_key=? ORDER BY version ASC", (api_key,)).fetchall()
+    if not rows:
+        return {"count": 0, "versions": []}, 200
+    out = []
+    for v, sha, ts, ah, body in rows:
+        try:
+            n = len(json.loads(body).get("rules", []))
+        except Exception:
+            n = None
+        out.append({"version": v, "sha256": sha, "published": _iso(ts),
+                    "sealed": ah, "rules": n})
+    return {"count": len(out), "versions": out,
+            "note": "Every version ever published. Loosening a standard is visible here permanently."}, 200
+
+
+def _check(ctx, api_key, data):
+    row = _current(ctx, api_key)
+    if not row:
+        return {"error": "no_declaration"}, 404
+    ver, body = row[0], json.loads(row[1])
+    rules = body["rules"]
+
+    try:
+        limit = min(int(data.get("limit", 500)), 5000)
+    except Exception:
+        limit = 500
+
+    with ctx["lock"]:
+        recs = ctx["conn"].execute("SELECT id,user_id,event_json,result_json,ts FROM audit_log WHERE api_key=? AND ts>=? ORDER BY id DESC LIMIT ?", (api_key, row[3], limit)).fetchall()
+
+    violations = []
+    tested = 0
+    for bid, uid, ev_json, res_json, bts in recs:
+        try:
+            rec = {}
+            rec.update(json.loads(ev_json))
+            rec.update(json.loads(res_json))
+        except Exception:
+            continue
+        if rec.get("decision", "").endswith("_SEALED"):
+            continue
+        tested += 1
+        for r in rules:
+            if not _test(r.get("when"), rec):
+                continue
+            if not _test(r.get("require"), rec):
+                violations.append({"block_index": bid, "record_id": uid,
+                                   "rule": r.get("id"),
+                                   "describe": r.get("describe"),
+                                   "at": _iso(bts)})
+
+    ts = time.time()
+    cid = "CHK-" + _sha(str(ts) + api_key)[:8].upper()
+    detail = ("decl_version=" + str(ver) + ";tested=" + str(tested) +
+              ";violated=" + str(len(violations)) +
+              ";rules=" + ",".join(sorted({v["rule"] for v in violations})[:20]))
+    h, idx, seq, _x = _seal_event(ctx, api_key, cid, "checked", detail)
+
+    with ctx["lock"]:
+        ctx["conn"].execute("INSERT OR REPLACE INTO declare_checks(check_id,api_key,decl_version,ran,tested,passed,violated,detail,audit_hash) VALUES(?,?,?,?,?,?,?,?,?)",
+                            (cid, api_key, ver, ts, tested, tested - len({v["block_index"] for v in violations}), len(violations), json.dumps(violations[:200]), h))
+        ctx["conn"].commit()
+
+    out = {"check_id": cid, "declaration_version": ver, "records_tested": tested,
+           "violations": len(violations), "ran_at": _iso(ts),
+           "audit_hash": h, "block_index": idx, "receipt_seq": seq,
+           "note": "Result sealed whichever way it went."}
+    if violations:
+        out["failed_rules"] = sorted({v["rule"] for v in violations})
+        out["detail"] = violations[:20]
+        out["flag"] = str(len(violations)) + " record(s) violate your own published rules"
+    return out, 200
+
+
+def _violations(ctx, api_key):
+    with ctx["lock"]:
+        rows = ctx["conn"].execute("SELECT check_id,decl_version,ran,tested,violated,detail FROM declare_checks WHERE api_key=? ORDER BY ran DESC LIMIT 50", (api_key,)).fetchall()
+    if not rows:
+        return {"checks": 0, "note": "No checks run yet."}, 200
+    latest = rows[0]
+    try:
+        detail = json.loads(latest[5])
+    except Exception:
+        detail = []
+    return {"checks": len(rows),
+            "latest": {"check_id": latest[0], "declaration_version": latest[1],
+                       "ran": _iso(latest[2]), "tested": latest[3],
+                       "violations": latest[4], "detail": detail[:50]},
+            "history": [{"check_id": r[0], "ran": _iso(r[2]), "tested": r[3],
+                         "violations": r[4]} for r in rows]}, 200
+
+
+def handle(method, action, data, api_key, ctx):
+    _setup(ctx)
+    if method == "POST":
+        if action == "publish":
+            return _publish(ctx, api_key, data)
+        if action == "check":
+            return _check(ctx, api_key, data)
+    else:
+        if action == "current":
+            return _current_view(ctx, api_key)
+        if action == "history":
+            return _history(ctx, api_key)
+        if action == "violations":
+            return _violations(ctx, api_key)
+    return {"error": "unknown_action", "action": action}, 404
+
+```
+
+
+## `modules/demo.py`
+
+358 lines, 15159 bytes
+
+```python
+"""
+Public proving ground - /x/demo/<action>
+
+WHY THIS EXISTS
+---------------
+Every page on this platform says "check it, don't trust it" and then asks for
+an email address before anyone can check anything. That is the same bargain
+every other vendor offers, dressed in better language.
+
+This removes the bargain. No key, no account, no email. A visitor sends a
+scenario, gets a real verdict from the live engine, and it is sealed into the
+production chain - the same chain, the same sequence, covered by the same
+external anchor. They get the block index back and can verify it themselves at
+a public endpoint that has never heard of them.
+
+The demonstration is not a simulation of the product. It IS the product, run
+once, by a stranger, for free.
+
+WHAT IS DELIBERATELY REAL
+-------------------------
+  - the scoring is the engine's own arithmetic, not a mock
+  - the seal is a genuine block in the live chain
+  - the counterfactual is computed by inverting the real function
+  - the review flow really does withhold the verdict until commitment
+  - the dwell time is really measured and really sealed
+
+WHAT IS DELIBERATELY NOT REAL
+-----------------------------
+  - demo events do not touch any customer's trust history; user ids are
+    namespaced to demo: and scored from a neutral starting trust
+  - nothing about a visitor is recorded beyond what they typed
+
+ABUSE
+-----
+Public routes are rate limited per client by the router. A visitor cannot
+flood the chain, and the cost of a demo block is a few hundred bytes.
+
+    POST /x/demo/govern   scenario -> verdict, seal, counterfactual
+    POST /x/demo/review   open a review case, verdict withheld
+    POST /x/demo/commit   commit a verdict, then see what the machine said
+    GET  /x/demo/stats    how many people have tried it
+"""
+
+import json, math, secrets, time
+from datetime import datetime, timezone
+
+VERSION = "1.0"
+
+# No key required for any of these - that is the entire point.
+PUBLIC = {("POST", "govern"), ("POST", "review"), ("POST", "commit"),
+          ("GET", "stats"), ("GET", "")}
+
+DEMO_KEY = "public_demo"
+LN_CAP = math.log1p(10000)
+SAFE = {"UK", "US", "DE", "FR", "CA", "AU", "NL", "SE", "NO", "DK", "FI", "IE", "NZ"}
+
+_ready = False
+
+
+def _setup(ctx):
+    global _ready
+    if _ready:
+        return
+    with ctx["lock"]:
+        ctx["conn"].execute("CREATE TABLE IF NOT EXISTS demo_cases(case_id TEXT PRIMARY KEY,opened REAL,material TEXT,machine_verdict TEXT,score REAL,committed REAL,human_verdict TEXT,dwell REAL)")
+        ctx["conn"].execute("CREATE TABLE IF NOT EXISTS demo_stats(k TEXT PRIMARY KEY,v INTEGER)")
+        ctx["conn"].commit()
+    _ready = True
+
+
+def _bump(ctx, k):
+    with ctx["lock"]:
+        ctx["conn"].execute("INSERT INTO demo_stats(k,v) VALUES(?,1) ON CONFLICT(k) DO UPDATE SET v=v+1", (k,))
+        ctx["conn"].commit()
+
+
+def _clamp(x, a=0.0, b=1.0):
+    return max(a, min(b, x))
+
+
+def _iso(ts):
+    if not ts:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+def _f(d, k, default=0.0):
+    try:
+        return float(d.get(k, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _signals(data):
+    country = str(data.get("country", "UK")).strip().upper()[:4] or "UK"
+    return {
+        "trust": _clamp(_f(data, "trust", 0.5)),
+        "v60": max(0.0, min(_f(data, "v60"), 10000)),
+        "v5m": max(0.0, min(_f(data, "v5m"), 10000)),
+        "v1h": max(0.0, min(_f(data, "v1h"), 100000)),
+        "amount": max(0.0, min(_f(data, "amount"), 10000000)),
+        "device_risk": _clamp(_f(data, "device_risk")),
+        "anomaly": _clamp(_f(data, "anomaly")),
+        "country": country,
+        "country_shift": bool(data.get("country_shift")),
+        "unsafe_country": country not in SAFE,
+    }
+
+
+def _score(s):
+    sc = (1 - s["trust"]) * 0.30
+    sc += min(s["v60"] / 20.0, 1) * 0.15
+    sc += min(s["v5m"] / 50.0, 1) * 0.10
+    sc += min(s["v1h"] / 200.0, 1) * 0.10
+    sc += min(math.log1p(s["amount"]) / LN_CAP, 1) * 0.15
+    sc += s["device_risk"] * 0.10
+    sc += s["anomaly"] * 0.10
+    if s["country_shift"]:
+        sc += 0.10
+    if s["unsafe_country"]:
+        sc += 0.10
+    return round(_clamp(sc), 4)
+
+
+def _reasons(s):
+    r = []
+    if s["trust"] < 0.4:
+        r.append("low_trust")
+    if s["v60"] > 10:
+        r.append("velocity_spike")
+    if s["amount"] > 500:
+        r.append("high_amount")
+    if s["device_risk"] > 0.5:
+        r.append("risky_device")
+    if s["anomaly"] > 0.5:
+        r.append("behaviour_anomaly")
+    if s["country_shift"]:
+        r.append("country_shift")
+    if s["unsafe_country"]:
+        r.append("unsafe_country")
+    return r
+
+
+def _verdict(sc):
+    if sc < 0.35:
+        return "ALLOW"
+    if sc < 0.70:
+        return "CHALLENGE"
+    return "BLOCK"
+
+
+def _counterfactual(s, score, verdict):
+    """Exact inversion. Returns the cheapest single change, or None."""
+    if verdict == "ALLOW":
+        return None, "Already the most permissive verdict."
+    ceiling = 0.70 if verdict == "BLOCK" else 0.35
+    target = "CHALLENGE" if verdict == "BLOCK" else "ALLOW"
+    needed = score - ceiling + 0.0001
+
+    contribs = [
+        ("trust", (1 - s["trust"]) * 0.30),
+        ("amount", min(math.log1p(s["amount"]) / LN_CAP, 1) * 0.15),
+        ("v60", min(s["v60"] / 20.0, 1) * 0.15),
+        ("v5m", min(s["v5m"] / 50.0, 1) * 0.10),
+        ("v1h", min(s["v1h"] / 200.0, 1) * 0.10),
+        ("device_risk", s["device_risk"] * 0.10),
+        ("anomaly", s["anomaly"] * 0.10),
+        ("country_shift", 0.10 if s["country_shift"] else 0.0),
+        ("unsafe_country", 0.10 if s["unsafe_country"] else 0.0),
+    ]
+    contribs.sort(key=lambda kv: -kv[1])
+
+    for name, c in contribs:
+        if c <= 0 or c < needed:
+            continue
+        t = c - needed
+        if name == "trust":
+            v = 1 - (t / 0.30)
+            if v <= 1.0:
+                return {"factor": "trust", "required": round(_clamp(v), 3),
+                        "was": round(s["trust"], 3)}, ("a trust score of "
+                        + str(round(_clamp(v), 3)) + " instead of "
+                        + str(round(s["trust"], 3)) + " would have made this "
+                        + target)
+        if name == "amount":
+            v = math.expm1((t / 0.15) * LN_CAP)
+            return {"factor": "amount", "required": round(v, 2),
+                    "was": round(s["amount"], 2)}, ("an amount of "
+                    + str(round(v, 2)) + " instead of " + str(round(s["amount"], 2))
+                    + " would have made this " + target)
+        if name in ("v60", "v5m", "v1h"):
+            cap, w = {"v60": (20.0, 0.15), "v5m": (50.0, 0.10), "v1h": (200.0, 0.10)}[name]
+            v = (t / w) * cap
+            lbl = {"v60": "60-second", "v5m": "5-minute", "v1h": "1-hour"}[name]
+            return {"factor": name, "required": int(v), "was": int(s[name])}, (
+                "a " + lbl + " velocity of " + str(int(v)) + " instead of "
+                + str(int(s[name])) + " would have made this " + target)
+        if name in ("device_risk", "anomaly"):
+            v = t / 0.10
+            lbl = "device risk" if name == "device_risk" else "behavioural anomaly"
+            return {"factor": name, "required": round(_clamp(v), 3), "was": round(s[name], 3)}, (
+                "a " + lbl + " of " + str(round(_clamp(v), 3)) + " instead of "
+                + str(round(s[name], 3)) + " would have made this " + target)
+        if name in ("country_shift", "unsafe_country"):
+            lbl = ("no country change from the previous event" if name == "country_shift"
+                   else "an event from a jurisdiction on the safe list")
+            return {"factor": name, "required": 0, "was": 1}, (
+                lbl + " would have made this " + target)
+    return None, ("no single factor, changed alone, would have reached "
+                  + target + " - several drove this together")
+
+
+def _govern(ctx, data):
+    s = _signals(data)
+    score = _score(s)
+    verdict = _verdict(score)
+    reasons = _reasons(s)
+    cf, cf_text = _counterfactual(s, score, verdict)
+
+    ts = time.time()
+    uid = "demo:" + secrets.token_hex(3)
+    ev = {"user_id": uid, "action": str(data.get("action", "payment"))[:40],
+          "amount": s["amount"], "country": s["country"],
+          "device_id": "demo", "anomaly": s["anomaly"],
+          "device_risk": s["device_risk"]}
+    res = {"decision": verdict, "score": score, "reasons": reasons,
+           "demo": True, "demo_version": VERSION, "timestamp": ts,
+           "signals": {k: s[k] for k in ("trust", "v60", "v5m", "v1h",
+                                          "country_shift", "unsafe_country")},
+           "note": "public demonstration - sealed into the live chain like any other decision"}
+    h, idx, seq = ctx["seal"](ev, res, ts, DEMO_KEY)
+    _bump(ctx, "govern")
+
+    return {"decision": verdict, "score": score, "reasons": reasons,
+            "sealed_at": _iso(ts),
+            "audit_hash": h, "block_index": idx, "receipt_seq": seq,
+            "counterfactual": cf,
+            "counterfactual_statement": cf_text,
+            "verify": {
+                "this_block": "/api/inclusion?hash=" + h,
+                "whole_chain": "/api/verify-chain",
+                "external_anchor": "/api/anchor-status"},
+            "what_just_happened": [
+                "Your scenario was scored by the live engine, not a simulation.",
+                "The verdict was sealed into the production chain as block " + str(idx) + ".",
+                "That block is now covered by the next external timestamp.",
+                "Nothing about you was recorded. No account, no email, no key.",
+                "Verify any of it at the links above - they have never heard of you."]}, 200
+
+
+def _review(ctx, data):
+    """Open a review case. The verdict is computed and sealed - and withheld."""
+    s = _signals(data)
+    score = _score(s)
+    verdict = _verdict(score)
+    cid = "DEMO-" + secrets.token_hex(4).upper()
+    ts = time.time()
+    material = {"action": str(data.get("action", "payment"))[:40],
+                "amount": s["amount"], "country": s["country"],
+                "60_second_velocity": int(s["v60"]),
+                "5_minute_velocity": int(s["v5m"]),
+                "device_risk": s["device_risk"],
+                "behavioural_anomaly": s["anomaly"],
+                "country_changed": s["country_shift"],
+                "trust_history": round(s["trust"], 3)}
+    with ctx["lock"]:
+        ctx["conn"].execute("INSERT INTO demo_cases(case_id,opened,material,machine_verdict,score,committed,human_verdict,dwell) VALUES(?,?,?,?,?,NULL,NULL,NULL)",
+                            (cid, ts, json.dumps(material), verdict, score))
+        ctx["conn"].commit()
+    _bump(ctx, "review_opened")
+    return {"case_id": cid, "opened": _iso(ts), "material": material,
+            "machine_verdict": "withheld until you commit",
+            "your_options": ["allow", "challenge", "block"],
+            "instruction": "Decide for yourself, then POST your verdict to /x/demo/commit with this case_id. The clock is running and your answer is sealed before ours is shown."}, 200
+
+
+def _commit(ctx, data):
+    cid = str(data.get("case_id", "")).strip().upper()
+    hv = str(data.get("verdict", "")).strip().upper()
+    if hv not in ("ALLOW", "CHALLENGE", "BLOCK"):
+        return {"error": "verdict_required", "allowed": ["allow", "challenge", "block"]}, 400
+    with ctx["lock"]:
+        row = ctx["conn"].execute("SELECT opened,material,machine_verdict,score,committed FROM demo_cases WHERE case_id=?", (cid,)).fetchone()
+    if not row:
+        return {"error": "unknown_case_id"}, 404
+    if row[4]:
+        return {"error": "already_committed",
+                "message": "You commit once. That is the point of it."}, 400
+
+    ts = time.time()
+    dwell = round(ts - row[0], 2)
+    agreed = (hv == row[2])
+
+    ev = {"user_id": "demo:" + cid, "action": "demo_oversight_commit",
+          "amount": 0, "country": "UK", "device_id": "demo",
+          "anomaly": 0, "device_risk": 0}
+    res = {"decision": "DEMO_OVERSIGHT_SEALED", "score": 0, "demo": True,
+           "timestamp": ts, "human_verdict": hv, "dwell_seconds": dwell,
+           "detail": "human verdict sealed before the machine verdict was revealed"}
+    h, idx, seq = ctx["seal"](ev, res, ts, DEMO_KEY)
+
+    with ctx["lock"]:
+        ctx["conn"].execute("UPDATE demo_cases SET committed=?,human_verdict=?,dwell=? WHERE case_id=?",
+                            (ts, hv, dwell, cid))
+        ctx["conn"].commit()
+    _bump(ctx, "review_committed")
+
+    out = {"case_id": cid, "your_verdict": hv,
+           "machine_verdict": row[2], "machine_score": row[3],
+           "agreed": agreed, "dwell_seconds": dwell,
+           "audit_hash": h, "block_index": idx, "receipt_seq": seq,
+           "what_just_happened": [
+               "Your verdict was sealed as block " + str(idx) + " BEFORE this response revealed ours.",
+               "The chain fixes that order permanently and it cannot be reversed.",
+               "Your dwell time of " + str(dwell) + "s is part of the record.",
+               "That is the difference between a reviewer who decided and one who agreed."]}
+    if dwell < 2:
+        out["flag"] = ("committed in " + str(dwell) + " seconds - on a real system that would sit "
+                       "in your record permanently, and a pattern of it would be visible to an auditor")
+    if agreed:
+        out["note"] = "You agreed with the engine - but the chain shows you did so without having seen it."
+    else:
+        out["note"] = "You diverged from the engine. On a real system that is evidence of independent judgement."
+    return out, 200
+
+
+def _stats(ctx):
+    with ctx["lock"]:
+        rows = ctx["conn"].execute("SELECT k,v FROM demo_stats").fetchall()
+        cases = ctx["conn"].execute("SELECT COUNT(*),AVG(dwell) FROM demo_cases WHERE committed IS NOT NULL").fetchone()
+        fast = ctx["conn"].execute("SELECT COUNT(*) FROM demo_cases WHERE dwell IS NOT NULL AND dwell<2").fetchone()
+    d = {k: v for k, v in rows}
+    out = {"decisions_run": d.get("govern", 0),
+           "review_cases_opened": d.get("review_opened", 0),
+           "review_cases_committed": d.get("review_committed", 0)}
+    if cases and cases[0]:
+        out["median_dwell_seconds"] = round(cases[1] or 0, 2)
+        out["committed_under_2_seconds"] = fast[0] if fast else 0
+        out["note"] = ("Visitors who committed in under two seconds did not read the case. "
+                       "On a real deployment that is exactly what the record would show.")
+    return out, 200
+
+
+def handle(method, action, data, api_key, ctx):
+    _setup(ctx)
+    if method == "POST":
+        if action == "govern":
+            return _govern(ctx, data)
+        if action == "review":
+            return _review(ctx, data)
+        if action == "commit":
+            return _commit(ctx, data)
+    else:
+        if action in ("", "stats"):
+            return _stats(ctx)
+    return {"error": "unknown_action", "action": action,
+            "available": ["POST govern", "POST review", "POST commit", "GET stats"]}, 404
+
+```
+
+
+## `modules/dsr.py`
+
+239 lines, 10666 bytes
+
+```python
+"""
+DSR notary - /x/dsr/<action>
+
+Seals the lifecycle of a data subject request into the MAIN audit chain:
+received, assessed, extended, completed. Each is an ordinary block in
+audit_log, so /api/verify-chain and the anchor cover them automatically.
+
+The chain never holds the person's identity. The identifier is HMAC'd on
+arrival and only the fingerprint is stored - so personal data is deleted in
+your own systems as normal, and what remains is a seal resolving to nothing.
+
+Needs DSR_SECRET set in Railway (falls back to LICENCE_SECRET).
+Never change it once live - existing fingerprints become unresolvable.
+
+    POST /x/dsr/receive    subject_identifier, kind, channel, note
+    POST /x/dsr/assess     request_id, outcome, ground, reasoning, assessed_by
+    POST /x/dsr/extend     request_id, reason
+    POST /x/dsr/complete   request_id, action_taken, responded_by
+    GET  /x/dsr/request?id=DSR-XXXXXXXX
+    GET  /x/dsr/overdue
+    GET  /x/dsr/list
+"""
+
+import hashlib, hmac, json, os, secrets, time
+from datetime import datetime, timezone
+
+KINDS = {"erasure", "access", "rectification", "objection", "portability", "restriction"}
+OUTCOMES = {"granted", "refused", "partial"}
+VERSION = "1.0"
+
+_ready = False
+
+
+def _setup(ctx):
+    global _ready
+    if _ready:
+        return
+    with ctx["lock"]:
+        ctx["conn"].execute("CREATE TABLE IF NOT EXISTS dsr_requests(request_id TEXT PRIMARY KEY,api_key TEXT,subject_fp TEXT,kind TEXT,received REAL,deadline REAL,extended INTEGER DEFAULT 0,status TEXT DEFAULT 'open',closed REAL,seal TEXT,block_index INTEGER)")
+        ctx["conn"].execute("CREATE INDEX IF NOT EXISTS idx_dsr_key ON dsr_requests(api_key)")
+        ctx["conn"].commit()
+    _ready = True
+
+
+def _secret():
+    s = os.environ.get("DSR_SECRET", "").strip() or os.environ.get("LICENCE_SECRET", "").strip()
+    return s.encode() if s else None
+
+
+def fingerprint(ident):
+    s = _secret()
+    if not s:
+        return None
+    return hmac.new(s, str(ident).strip().lower().encode(), hashlib.sha256).hexdigest()
+
+
+def _add_months(ts, n):
+    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+    mi = dt.month - 1 + n
+    y = dt.year + mi // 12
+    m = mi % 12 + 1
+    leap = (y % 4 == 0 and (y % 100 != 0 or y % 400 == 0))
+    dim = [31, 29 if leap else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m - 1]
+    return dt.replace(year=y, month=m, day=min(dt.day, dim)).timestamp()
+
+
+def _iso(ts):
+    if not ts:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+def _seal_event(ctx, api_key, rid, fp, action, detail):
+    ts = time.time()
+    ev = {"user_id": "dsr:" + rid, "action": "dsr_" + action, "amount": 0,
+          "country": "UK", "device_id": "dsr", "anomaly": 0, "device_risk": 0,
+          "subject_fp": fp}
+    res = {"decision": "DSR_SEALED", "score": 0, "dsr_action": action,
+           "dsr_version": VERSION, "timestamp": ts, "detail": detail,
+           "note": "data subject request lifecycle event - no personal data in this block"}
+    h, idx, seq = ctx["seal"](ev, res, ts, api_key)
+    return h, idx, seq, ts
+
+
+def _lookup(ctx, api_key, rid):
+    with ctx["lock"]:
+        return ctx["conn"].execute("SELECT subject_fp,kind,received,deadline,extended,status,closed FROM dsr_requests WHERE request_id=? AND api_key=?", (rid, api_key)).fetchone()
+
+
+def _receive(ctx, api_key, data):
+    if not _secret():
+        return {"error": "dsr_secret_not_set", "message": "Set DSR_SECRET in Railway."}, 503
+    ident = str(data.get("subject_identifier", "")).strip()
+    if not ident:
+        return {"error": "subject_identifier_required"}, 400
+    kind = str(data.get("kind", "erasure")).strip().lower()
+    if kind not in KINDS:
+        return {"error": "invalid_kind", "allowed": sorted(KINDS)}, 400
+    fp = fingerprint(ident)
+    rid = "DSR-" + secrets.token_hex(4).upper()
+    ts = time.time()
+    deadline = _add_months(ts, 1)
+    detail = "kind=" + kind + ";channel=" + str(data.get("channel", ""))[:60] + ";note=" + str(data.get("note", ""))[:200]
+    h, idx, seq, _x = _seal_event(ctx, api_key, rid, fp, "received", detail)
+    with ctx["lock"]:
+        ctx["conn"].execute("INSERT INTO dsr_requests(request_id,api_key,subject_fp,kind,received,deadline,extended,status,closed,seal,block_index) VALUES(?,?,?,?,?,?,0,'open',NULL,?,?)",
+                            (rid, api_key, fp, kind, ts, deadline, h, idx))
+        ctx["conn"].commit()
+    return {"request_id": rid, "kind": kind, "subject_fp": fp[:16] + "...",
+            "received": _iso(ts), "respond_by": _iso(deadline),
+            "audit_hash": h, "block_index": idx, "receipt_seq": seq,
+            "message": "Clock started. One calendar month to respond."}, 200
+
+
+def _assess(ctx, api_key, data):
+    rid = str(data.get("request_id", "")).strip()
+    row = _lookup(ctx, api_key, rid)
+    if not row:
+        return {"error": "unknown_request_id"}, 404
+    outcome = str(data.get("outcome", "")).strip().lower()
+    if outcome not in OUTCOMES:
+        return {"error": "invalid_outcome", "allowed": sorted(OUTCOMES)}, 400
+    reasoning = str(data.get("reasoning", "")).strip()
+    if not reasoning:
+        return {"error": "reasoning_required", "message": "The reasoning is the part examined later. It cannot be blank."}, 400
+    detail = ("outcome=" + outcome + ";ground=" + str(data.get("ground", ""))[:120] +
+              ";by=" + str(data.get("assessed_by", ""))[:60] + ";reasoning=" + reasoning[:600])
+    h, idx, seq, ts = _seal_event(ctx, api_key, rid, row[0], "assessed", detail)
+    with ctx["lock"]:
+        ctx["conn"].execute("UPDATE dsr_requests SET status=? WHERE request_id=? AND api_key=?", ("assessed:" + outcome, rid, api_key))
+        ctx["conn"].commit()
+    return {"request_id": rid, "outcome": outcome, "audit_hash": h, "block_index": idx, "receipt_seq": seq}, 200
+
+
+def _extend(ctx, api_key, data):
+    rid = str(data.get("request_id", "")).strip()
+    row = _lookup(ctx, api_key, rid)
+    if not row:
+        return {"error": "unknown_request_id"}, 404
+    if row[4]:
+        return {"error": "already_extended", "message": "A request can be extended once."}, 400
+    reason = str(data.get("reason", "")).strip()
+    if not reason:
+        return {"error": "reason_required", "message": "An extension needs a stated reason."}, 400
+    old = row[3]
+    new = _add_months(old, 2)
+    detail = "old_deadline=" + str(_iso(old)) + ";new_deadline=" + str(_iso(new)) + ";reason=" + reason[:300]
+    h, idx, seq, ts = _seal_event(ctx, api_key, rid, row[0], "extended", detail)
+    with ctx["lock"]:
+        ctx["conn"].execute("UPDATE dsr_requests SET deadline=?,extended=1 WHERE request_id=? AND api_key=?", (new, rid, api_key))
+        ctx["conn"].commit()
+    return {"request_id": rid, "was_due": _iso(old), "respond_by": _iso(new),
+            "audit_hash": h, "block_index": idx, "receipt_seq": seq}, 200
+
+
+def _complete(ctx, api_key, data):
+    rid = str(data.get("request_id", "")).strip()
+    row = _lookup(ctx, api_key, rid)
+    if not row:
+        return {"error": "unknown_request_id"}, 404
+    action = str(data.get("action_taken", "")).strip()
+    if not action:
+        return {"error": "action_taken_required"}, 400
+    ts = time.time()
+    in_time = ts <= row[3]
+    detail = ("action=" + action[:400] + ";by=" + str(data.get("responded_by", ""))[:60] +
+              ";within_deadline=" + ("yes" if in_time else "no"))
+    h, idx, seq, _x = _seal_event(ctx, api_key, rid, row[0], "completed", detail)
+    with ctx["lock"]:
+        ctx["conn"].execute("UPDATE dsr_requests SET status='closed',closed=? WHERE request_id=? AND api_key=?", (ts, rid, api_key))
+        ctx["conn"].commit()
+    return {"request_id": rid, "closed": _iso(ts), "within_deadline": in_time,
+            "audit_hash": h, "block_index": idx, "receipt_seq": seq}, 200
+
+
+def _timeline(ctx, api_key, rid):
+    row = _lookup(ctx, api_key, rid)
+    if not row:
+        return {"error": "unknown_request_id"}, 404
+    with ctx["lock"]:
+        blocks = ctx["conn"].execute("SELECT ts,result_json,audit_hash,key_seq FROM audit_log WHERE user_id=? ORDER BY id ASC", ("dsr:" + rid,)).fetchall()
+    events = []
+    for ts_, res, ah, seq in blocks:
+        try:
+            r = json.loads(res)
+            events.append({"at": _iso(ts_), "event": r.get("dsr_action"),
+                           "detail": r.get("detail"), "sealed": ah, "receipt_seq": seq})
+        except Exception:
+            pass
+    return {"request_id": rid, "kind": row[1], "received": _iso(row[2]),
+            "respond_by": _iso(row[3]), "extended": bool(row[4]),
+            "status": row[5], "closed": _iso(row[6]), "events": events,
+            "verify": "/api/verify-chain re-checks these with the rest of the chain"}, 200
+
+
+def _overdue(ctx, api_key):
+    t = time.time()
+    with ctx["lock"]:
+        rows = ctx["conn"].execute("SELECT request_id,kind,received,deadline FROM dsr_requests WHERE api_key=? AND status!='closed' AND deadline<? ORDER BY deadline ASC", (api_key, t)).fetchall()
+    return {"count": len(rows),
+            "overdue": [{"request_id": r[0], "kind": r[1], "received": _iso(r[2]),
+                         "was_due": _iso(r[3]), "days_late": round((t - r[3]) / 86400, 1)} for r in rows]}, 200
+
+
+def _list(ctx, api_key):
+    t = time.time()
+    with ctx["lock"]:
+        rows = ctx["conn"].execute("SELECT request_id,kind,received,deadline,status,extended FROM dsr_requests WHERE api_key=? ORDER BY received DESC LIMIT 200", (api_key,)).fetchall()
+    out = []
+    for r in rows:
+        out.append({"request_id": r[0], "kind": r[1], "received": _iso(r[2]),
+                    "respond_by": _iso(r[3]), "status": r[4], "extended": bool(r[5]),
+                    "days_remaining": (round((r[3] - t) / 86400, 1) if r[4] != "closed" else None)})
+    return {"count": len(out), "requests": out}, 200
+
+
+def handle(method, action, data, api_key, ctx):
+    _setup(ctx)
+    if method == "POST":
+        if action == "receive":
+            return _receive(ctx, api_key, data)
+        if action == "assess":
+            return _assess(ctx, api_key, data)
+        if action == "extend":
+            return _extend(ctx, api_key, data)
+        if action == "complete":
+            return _complete(ctx, api_key, data)
+    else:
+        if action == "overdue":
+            return _overdue(ctx, api_key)
+        if action == "list":
+            return _list(ctx, api_key)
+        if action == "request":
+            rid = str(data.get("id", "")).strip()
+            if not rid:
+                return {"error": "id_required"}, 400
+            return _timeline(ctx, api_key, rid)
+    return {"error": "unknown_action", "action": action}, 404
+
+```
 
 
 ## `modules/fingerprint.py`
@@ -1098,1212 +2470,5 @@ def handle(method, action, data, api_key, ctx):
     return {"error": "unknown_action", "action": action,
             "GET": ["spec", "trace", "impact", "receipt"],
             "POST": ["declare (keyed)"]}, 404
-
-```
-
-
-## `modules/mutual.py`
-
-447 lines, 15467 bytes
-
-```python
-#!/usr/bin/env python3
-"""
-modules/mutual.py  -  the outbound half of mutual witnessing
-============================================================
-
-Why this exists
----------------
-modules/witness.py RECEIVES. Other chains hand us their tips and we seal
-them. Nothing in the platform currently SENDS our tip anywhere, so right
-now we witness other people and nobody witnesses us. This module is the
-missing direction.
-
-Drop it in as modules/mutual.py. The router picks it up automatically -
-no edits to server.py.
-
-Routes
-------
-  POST /x/mutual/push      send our current tip to every configured peer
-  POST /x/mutual/pull      fetch every peer's tip and seal it into our chain
-  POST /x/mutual/sync      pull then push (this is the one to schedule)
-  GET  /x/mutual/peers     the configured peers and what happened last time
-  GET  /x/mutual/status    last run, next run, whether the timer is alive
-
-Important design note
----------------------
-This module does not touch the database or import anything from server.py.
-It talks HTTP to routes that are already public - ours and theirs. That
-means it cannot corrupt anything, it works no matter how seal() changes,
-and every action it takes is one an outsider could audit for themselves.
-
-To read our own tip it calls our own public /x/witness/tip.
-To seal a peer's tip it calls our own public /x/witness/observe, which is
-already built to record exactly that. So a peer tip we pull is recorded by
-the same code path as a peer tip that was pushed to us.
-
-CONCURRENCY - read this before changing it
-------------------------------------------
-A sync cycle makes two kinds of call, and they are treated differently on
-purpose.
-
-  OUTBOUND to other people's hosts (reading their tip, pushing ours) runs
-  in parallel. These are the slow ones - we are waiting on somebody else's
-  server, and there is no reason to wait on them one at a time. Fifty peers
-  now costs roughly what the slowest single peer costs, instead of the sum
-  of all fifty.
-
-  INBOUND to our own server (sealing what we pulled) stays sequential. Our
-  own process is handling those requests, and firing a burst of them at
-  ourselves while we are mid-cycle is asking for trouble - a queue behind a
-  single replica at best. The sealing is fast and local anyway, so there is
-  nothing to gain by parallelising it and a real risk in doing so.
-
-So: fetch everything at once, then seal one at a time.
-
-BEFORE THIS WORKS
------------------
-1. "observe" must be in the PUBLIC set of modules/witness.py. If it is not,
-   this module gets a 401 from our own server, same as Red Flag AI Pro did.
-2. After every deploy, the first /x/ request must be a GET - that is what
-   installs the POST branch. Opening /x/mutual/peers in a browser does it.
-"""
-
-import json
-import threading
-import time
-import urllib.error
-import urllib.request
-from concurrent.futures import ThreadPoolExecutor
-
-# ----------------------------------------------------------------------
-# ROUTER
-# ----------------------------------------------------------------------
-
-# The router reads a set of (METHOD, action) tuples. Anything not listed
-# here needs an API key - default is closed.
-#
-# peers and status are read-only. An outsider being able to see who we
-# witness with, and whether it is actually running, is the entire point.
-#
-# push, pull and sync stay keyed - they cause outbound traffic and are not
-# left open to anonymous callers.
-PUBLIC = {("GET", "peers"), ("GET", "status")}
-
-
-# ----------------------------------------------------------------------
-# CONFIG
-# ----------------------------------------------------------------------
-
-# Our own public witness routes. Left as full URLs on purpose so this
-# module never has to guess its own host.
-OUR_TIP_URL = "https://sebbi.pro/x/witness/tip"
-OUR_OBSERVE_URL = "https://sebbi.pro/x/witness/observe"
-
-# The name we go by when we hand our tip to someone else.
-OUR_CHAIN_NAME = "aileash"
-
-# Everyone we witness with. Add a dict per chain.
-#   name         what we file their tips under
-#   tip_url      where we GET their current tip
-#   observe_url  where we POST ours so they record it
-PEERS = [
-    {
-        "name": "red-flag-ai-pro",
-        "tip_url": "https://www.redflagaipro.com/api/witness/tip",
-        "observe_url": "https://www.redflagaipro.com/api/witness/anchor",
-    },
-]
-
-# Field names to send when pushing our tip. If a peer wants different
-# names, give that peer its own "keys" dict and it will be used instead.
-DEFAULT_PUSH_KEYS = {
-    "chain": "chain",
-    "tip": "tip",
-    "count": "count",
-    "ts": "ts",
-    "url": "url",
-}
-
-# Where peers can read our tip, included in what we push.
-OUR_PUBLIC_URL = "https://sebbi.pro/x/witness/tip"
-
-# Background timer. Set ENABLED to False if you would rather drive it
-# yourself by hitting /x/mutual/sync.
-AUTO_SYNC_ENABLED = True
-AUTO_SYNC_SECONDS = 3600
-
-TIMEOUT_SECONDS = 20
-
-# How many peers we talk to at once. Above this they queue, which is fine -
-# it stops a large network spawning a thread per peer. Eight slow peers at
-# 20s each still finishes in 20s; forty finishes in about a minute worst
-# case, and only if every one of them times out.
-MAX_PARALLEL_PEERS = 8
-
-# ----------------------------------------------------------------------
-# state - deliberately in memory only, this is not evidence
-# ----------------------------------------------------------------------
-
-_state = {
-    "last_run": None,
-    "last_result": None,
-    "runs": 0,
-    "timer_started": False,
-}
-_lock = threading.Lock()
-
-
-def _now():
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-
-def _reply(payload, status=200):
-    """The router expects (payload, status) back from handle()."""
-    return payload, status
-
-
-def _in_parallel(function, items):
-    """Run function over items concurrently, preserving input order.
-
-    Used only for calls that leave our server. Anything hitting our own
-    process goes through a plain loop instead - see the note at the top.
-    """
-    if not items:
-        return []
-    if len(items) == 1:
-        return [function(items[0])]
-    workers = min(len(items), MAX_PARALLEL_PEERS)
-    with ThreadPoolExecutor(max_workers=workers,
-                            thread_name_prefix="mutual-peer") as pool:
-        return list(pool.map(function, items))
-
-
-# ----------------------------------------------------------------------
-# http
-# ----------------------------------------------------------------------
-
-def _http(url, payload=None):
-    """POST if payload given, else GET. Returns (status, parsed_or_text)."""
-    data = None
-    headers = {"Accept": "application/json", "User-Agent": "aileash-mutual/1.1"}
-    if payload is not None:
-        data = json.dumps(payload).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    request = urllib.request.Request(url, data=data, headers=headers)
-    try:
-        with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
-            body = response.read().decode("utf-8", "replace")
-            status = response.getcode()
-    except urllib.error.HTTPError as exc:
-        try:
-            body = exc.read().decode("utf-8", "replace")
-        except Exception:
-            body = ""
-        status = exc.code
-    except urllib.error.URLError as exc:
-        return 0, "unreachable: %s" % exc.reason
-    except Exception as exc:
-        return 0, "failed: %s" % exc
-    try:
-        return status, json.loads(body)
-    except ValueError:
-        return status, body
-
-
-def _extract_tip(body):
-    """Pull (tip, height) out of whatever shape a tip route returns."""
-    if not isinstance(body, dict):
-        return None, None
-    tip = body.get("tip") or body.get("hash") or body.get("head")
-    height = body.get("height", body.get("count", body.get("entries")))
-    return tip, height
-
-
-# ----------------------------------------------------------------------
-# the two directions
-# ----------------------------------------------------------------------
-
-def our_tip():
-    status, body = _http(OUR_TIP_URL)
-    if status != 200:
-        return None, None, "our own tip route answered %s: %s" % (status, str(body)[:200])
-    tip, height = _extract_tip(body)
-    if not tip:
-        return None, None, "no tip field in our own reply: %s" % str(body)[:200]
-    return tip, height, None
-
-
-def push_one(peer, tip, height):
-    """Hand our tip to one peer so they record it. Outbound only."""
-    keys = peer.get("keys", DEFAULT_PUSH_KEYS)
-    values = {
-        "chain": OUR_CHAIN_NAME,
-        "tip": tip,
-        "count": height,
-        "ts": _now(),
-        "url": OUR_PUBLIC_URL,
-    }
-    payload = {keys.get(k, k): v for k, v in values.items()}
-    status, body = _http(peer["observe_url"], payload)
-    result = {
-        "peer": peer["name"],
-        "direction": "push",
-        "url": peer["observe_url"],
-        "http": status,
-        "ok": 200 <= status < 300,
-        "response": body if isinstance(body, (dict, list)) else str(body)[:300],
-    }
-    if status == 401 or status == 403:
-        result["hint"] = "they want auth on that route, or it is not in their public set"
-    elif status == 404:
-        result["hint"] = "wrong path - check observe_url for this peer"
-    elif status == 0:
-        result["hint"] = "could not reach them at all"
-    return result
-
-
-def fetch_one(peer):
-    """Read one peer's current tip. Outbound only - no sealing here.
-
-    Returns a dict that either carries a tip ready to seal, or an error
-    already shaped like a result so it can be returned to the caller as is.
-    """
-    status, body = _http(peer["tip_url"])
-    if status != 200:
-        return {
-            "peer": peer["name"], "direction": "pull", "url": peer["tip_url"],
-            "http": status, "ok": False, "_failed": True,
-            "response": body if isinstance(body, (dict, list)) else str(body)[:300],
-            "hint": "could not read their tip",
-        }
-
-    tip, height = _extract_tip(body)
-    if not tip:
-        return {
-            "peer": peer["name"], "direction": "pull", "url": peer["tip_url"],
-            "http": status, "ok": False, "_failed": True,
-            "response": str(body)[:300],
-            "hint": "no tip field in their reply - add the field name to _extract_tip",
-        }
-
-    return {
-        "peer": peer["name"], "url": peer["tip_url"],
-        "tip": tip, "height": height, "_failed": False,
-        "fetched_at": time.time(),
-    }
-
-
-def seal_one(fetched):
-    """Seal one already-fetched peer tip into our chain.
-
-    Goes through our own public observe route so a tip we pulled is
-    recorded by exactly the same code path as a tip somebody pushed to us.
-    Called in a plain loop, never in parallel - this hits our own server.
-
-    Field names must match what modules/witness.py reads out of the body:
-    chain, tip, peer_ts, url. The url is what makes the observation
-    checkable by a third party rather than taken on our word - it is the
-    address we just fetched this tip from.
-    """
-    seal_status, seal_body = _http(OUR_OBSERVE_URL, {
-        "chain": fetched["peer"],
-        "tip": fetched["tip"],
-        "peer_ts": fetched["fetched_at"],
-        "url": fetched["url"],
-    })
-
-    out = {
-        "peer": fetched["peer"],
-        "direction": "pull",
-        "their_tip": fetched["tip"],
-        "their_height": fetched["height"],
-        "sealed_http": seal_status,
-        "ok": 200 <= seal_status < 300,
-        "response": seal_body if isinstance(seal_body, (dict, list)) else str(seal_body)[:300],
-    }
-    if seal_status in (401, 403):
-        out["hint"] = "our own observe route rejected us - check PUBLIC in modules/witness.py"
-    return out
-
-
-def do_push():
-    tip, height, error = our_tip()
-    if error:
-        return {"ok": False, "error": error}
-
-    # Outbound to everyone at once.
-    results = _in_parallel(lambda peer: push_one(peer, tip, height), PEERS)
-
-    return {
-        "ok": True,
-        "our_tip": tip,
-        "our_height": height,
-        "results": results,
-    }
-
-
-def do_pull():
-    # Phase one: read every peer's tip at the same time. This is the slow
-    # part and none of it touches us.
-    fetched = _in_parallel(fetch_one, PEERS)
-
-    # Phase two: seal what came back, one at a time, into our own chain.
-    results = []
-    for item in fetched:
-        if item.get("_failed"):
-            item.pop("_failed", None)
-            results.append(item)
-            continue
-        results.append(seal_one(item))
-
-    return {"ok": True, "results": results}
-
-
-def do_sync():
-    """Pull first, then push. That order matters: the tip we hand out then
-    already contains the tips we just took in, so the two chains interlock
-    rather than merely sitting alongside each other."""
-    started = time.time()
-    pulled = do_pull()
-    pushed = do_push()
-    result = {
-        "ran_at": _now(),
-        "took_seconds": round(time.time() - started, 2),
-        "peers": len(PEERS),
-        "pull": pulled,
-        "push": pushed,
-        "ok": bool(pulled.get("ok")) and bool(pushed.get("ok")),
-    }
-    with _lock:
-        _state["last_run"] = result["ran_at"]
-        _state["last_result"] = result
-        _state["runs"] += 1
-    return result
-
-
-# ----------------------------------------------------------------------
-# background timer
-# ----------------------------------------------------------------------
-
-def _loop():
-    # Let the server finish coming up before the first run.
-    time.sleep(45)
-    while True:
-        try:
-            do_sync()
-        except Exception:
-            pass
-        time.sleep(AUTO_SYNC_SECONDS)
-
-
-def _start_timer():
-    with _lock:
-        if _state["timer_started"] or not AUTO_SYNC_ENABLED:
-            return
-        _state["timer_started"] = True
-    thread = threading.Thread(target=_loop, name="mutual-sync", daemon=True)
-    thread.start()
-
-
-_start_timer()
-
-
-# ----------------------------------------------------------------------
-# router entry point
-# ----------------------------------------------------------------------
-
-def handle(method, action, data, api_key, ctx):
-    action = (action or "").strip("/").lower()
-
-    if method == "GET":
-        if action == "peers":
-            return _reply({
-                "chain": OUR_CHAIN_NAME,
-                "peers": [
-                    {"name": p["name"], "tip_url": p["tip_url"],
-                     "observe_url": p["observe_url"]}
-                    for p in PEERS
-                ],
-                "parallel_fetch": MAX_PARALLEL_PEERS,
-                "note": "Witnessing is only mutual if both columns are live.",
-            })
-        if action == "status":
-            with _lock:
-                return _reply({
-                    "auto_sync": AUTO_SYNC_ENABLED,
-                    "interval_seconds": AUTO_SYNC_SECONDS,
-                    "timer_running": _state["timer_started"],
-                    "parallel_fetch": MAX_PARALLEL_PEERS,
-                    "runs": _state["runs"],
-                    "last_run": _state["last_run"],
-                    "last_result": _state["last_result"],
-                })
-
-    if method == "POST":
-        if action == "push":
-            return _reply(do_push())
-        if action == "pull":
-            return _reply(do_pull())
-        if action == "sync":
-            return _reply(do_sync())
-
-    return _reply({
-        "error": "unknown action",
-        "GET": ["peers", "status"],
-        "POST": ["push", "pull", "sync"],
-    }, 404)
-
-```
-
-
-## `modules/network.py`
-
-487 lines, 19842 bytes
-
-```python
-"""
-modules/network.py  -  serves the public witness network page
-
-WHY THIS IS A MODULE AND NOT A TEMPLATE
----------------------------------------
-The router hands whatever handle() returns to send_json, so a module cannot
-return HTML through it - it would arrive as a JSON string. So this does the
-same thing router.py already does for POST: it patches the request handler at
-runtime, adds a branch for the page path, and leaves every other path exactly
-as it was. The patch is idempotent and lives in memory, so a restart reverts it.
-
-THE SAME CATCH AS THE POST PATCH
---------------------------------
-A module is only imported when a request reaches the router. So after every
-deploy, one request to /x/network/status has to arrive before /witness works.
-Opening /x/network/status in a browser does it. Until then the page path falls
-through to whatever the server did before, which is a 404 - not an error page,
-just the old behaviour.
-
-If you would rather not patch anything, the same HTML works as a plain file in
-static/. This exists because the page then lives with the module it describes
-rather than drifting away from it.
-
-ROUTES
-------
-  GET /witness            the page
-  GET /witness.html       same page
-  GET /x/network/status   whether the patch is installed (public)
-
-The page itself holds no data. It reads /x/witness/tip and /x/witness/peers
-from the browser, same as any other visitor would, so it cannot show anything
-a stranger could not verify for themselves.
-"""
-
-import sys
-
-VERSION = "1.0"
-
-PUBLIC = {("GET", "status")}
-
-PAGE_PATHS = ("/witness", "/witness.html", "/network")
-
-_patched = [False]
-
-
-PAGE = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>The witness network — AILeash</title>
-<meta name="description" content="Two independent platforms recording each other's records, hourly. Checkable by anyone, without an account.">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300;9..144,600&family=Inter+Tight:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
-<style>
-:root{
-  --paper:#E9EDE4;
-  --paper-deep:#DFE5D8;
-  --ink:#18241F;
-  --ink-soft:#4A5A52;
-  --rule:#BFCCBF;
-  --rule-strong:#9AAC9C;
-  --stamp:#7C2B38;
-  --verdigris:#2F6B5E;
-  --amber:#9A6B1F;
-  --gutter:#CBD6C8;
-}
-*{box-sizing:border-box}
-html{-webkit-text-size-adjust:100%}
-body{
-  margin:0;
-  background:var(--paper);
-  color:var(--ink);
-  font-family:"Inter Tight",system-ui,sans-serif;
-  font-size:17px;
-  line-height:1.6;
-  /* ruled paper, faint */
-  background-image:repeating-linear-gradient(
-    to bottom,
-    transparent 0 31px,
-    rgba(154,172,156,.20) 31px 32px
-  );
-}
-.wrap{max-width:1080px;margin:0 auto;padding:0 22px}
-
-/* ---------- masthead ---------- */
-.masthead{padding:52px 0 30px;border-bottom:2px solid var(--ink)}
-.eyebrow{
-  font-family:"IBM Plex Mono",monospace;
-  font-size:11.5px;letter-spacing:.18em;text-transform:uppercase;
-  color:var(--ink-soft);margin:0 0 18px;
-}
-h1{
-  font-family:Fraunces,Georgia,serif;
-  font-weight:600;font-size:clamp(2.5rem,7.5vw,4.6rem);
-  line-height:1.02;letter-spacing:-.02em;margin:0 0 20px;
-}
-h1 em{font-style:italic;font-weight:300}
-.standfirst{font-size:clamp(1.05rem,2.4vw,1.28rem);max-width:40ch;color:var(--ink-soft);margin:0}
-
-/* ---------- the spread ---------- */
-.spread{
-  margin:44px 0 8px;
-  border:1px solid var(--rule-strong);
-  background:rgba(255,255,255,.4);
-}
-.spread-head{
-  display:grid;grid-template-columns:1fr 92px 1fr;
-  border-bottom:1px solid var(--rule-strong);
-}
-.spread-head div{
-  font-family:"IBM Plex Mono",monospace;
-  font-size:11px;letter-spacing:.14em;text-transform:uppercase;
-  padding:12px 16px;color:var(--ink-soft);
-}
-.spread-head .mid{text-align:center;background:var(--gutter);color:var(--ink)}
-.spread-head .right{text-align:right}
-.folio{
-  display:grid;grid-template-columns:1fr 92px 1fr;
-  border-bottom:1px solid var(--rule);
-}
-.folio:last-child{border-bottom:0}
-.side{padding:20px 16px;min-width:0}
-.side.right{text-align:right}
-.mid{
-  background:var(--gutter);
-  display:flex;align-items:center;justify-content:center;
-  font-family:"IBM Plex Mono",monospace;font-size:11px;color:var(--ink-soft);
-  border-left:1px solid var(--rule);border-right:1px solid var(--rule);
-}
-.chain-name{
-  font-family:Fraunces,Georgia,serif;font-size:1.35rem;font-weight:600;
-  margin:0 0 4px;letter-spacing:-.01em;
-}
-.role{font-family:"IBM Plex Mono",monospace;font-size:11px;letter-spacing:.12em;
-  text-transform:uppercase;color:var(--ink-soft);margin:0 0 14px}
-.hash{
-  font-family:"IBM Plex Mono",monospace;font-size:12.5px;
-  word-break:break-all;color:var(--ink);margin:0 0 3px;line-height:1.45;
-}
-.hash-label{font-family:"IBM Plex Mono",monospace;font-size:10.5px;
-  letter-spacing:.12em;text-transform:uppercase;color:var(--ink-soft);margin:0 0 5px}
-.meta{font-size:14px;color:var(--ink-soft);margin:12px 0 0}
-.meta b{color:var(--ink);font-weight:600}
-
-/* ---------- stamp ---------- */
-.stamp{
-  display:inline-block;margin-top:16px;padding:6px 13px 5px;
-  border:2.5px solid var(--stamp);color:var(--stamp);
-  font-family:"IBM Plex Mono",monospace;font-weight:500;
-  font-size:12px;letter-spacing:.16em;text-transform:uppercase;
-  transform:rotate(-3.5deg);opacity:.9;
-}
-.stamp.press{animation:press .5s cubic-bezier(.2,1.5,.4,1) both}
-@keyframes press{
-  0%{opacity:0;transform:rotate(-3.5deg) scale(1.5)}
-  70%{opacity:.95;transform:rotate(-3.5deg) scale(.97)}
-  100%{opacity:.9;transform:rotate(-3.5deg) scale(1)}
-}
-.stamp.live{border-color:var(--verdigris);color:var(--verdigris)}
-.stamp.weak{border-color:var(--amber);color:var(--amber)}
-.stamp.flag{background:var(--stamp);color:var(--paper)}
-
-/* ---------- sections ---------- */
-section{padding:56px 0;border-top:1px solid var(--rule-strong)}
-h2{
-  font-family:Fraunces,Georgia,serif;font-weight:600;
-  font-size:clamp(1.6rem,4vw,2.3rem);letter-spacing:-.015em;
-  margin:0 0 8px;line-height:1.15;
-}
-.sec-note{color:var(--ink-soft);max-width:56ch;margin:0 0 30px}
-p{max-width:62ch}
-
-.defs{display:grid;gap:0;border-top:1px solid var(--rule)}
-.def{
-  display:grid;grid-template-columns:170px 1fr;gap:20px;
-  padding:15px 0;border-bottom:1px solid var(--rule);
-}
-.def dt{
-  font-family:"IBM Plex Mono",monospace;font-size:12px;
-  letter-spacing:.1em;text-transform:uppercase;padding-top:3px;
-}
-.def dd{margin:0;color:var(--ink-soft)}
-.dot{display:inline-block;width:8px;height:8px;margin-right:8px;border-radius:50%;vertical-align:middle}
-.dot.ok{background:var(--stamp)}
-.dot.mid-c{background:var(--verdigris)}
-.dot.weak{background:var(--amber)}
-
-.limits li{max-width:62ch;margin-bottom:13px;color:var(--ink-soft)}
-.limits b{color:var(--ink)}
-
-pre{
-  font-family:"IBM Plex Mono",monospace;font-size:13px;line-height:1.7;
-  background:var(--ink);color:var(--paper);padding:20px;overflow-x:auto;
-  border:0;margin:22px 0;
-}
-pre .k{color:#9FC6B4}
-code{font-family:"IBM Plex Mono",monospace;font-size:.92em}
-
-.links{list-style:none;padding:0;margin:24px 0 0}
-.links li{border-bottom:1px solid var(--rule);padding:13px 0}
-.links a{
-  font-family:"IBM Plex Mono",monospace;font-size:13.5px;
-  color:var(--ink);text-decoration:none;word-break:break-all;
-  display:flex;justify-content:space-between;gap:16px;align-items:baseline;
-}
-.links a:hover,.links a:focus-visible{color:var(--stamp)}
-.links span{color:var(--ink-soft);font-family:"Inter Tight",sans-serif;
-  font-size:13px;flex:0 0 auto;text-align:right}
-
-footer{padding:40px 0 70px;color:var(--ink-soft);font-size:14px}
-footer a{color:var(--ink)}
-
-.loading,.errbox{
-  font-family:"IBM Plex Mono",monospace;font-size:13px;
-  color:var(--ink-soft);padding:26px 16px;
-}
-.errbox b{display:block;color:var(--ink);margin-bottom:6px;font-family:"Inter Tight",sans-serif;font-size:15px}
-
-a:focus-visible,button:focus-visible{outline:2.5px solid var(--stamp);outline-offset:3px}
-
-@media (max-width:760px){
-  body{background-image:none}
-  .spread-head,.folio{grid-template-columns:1fr}
-  .spread-head .mid,.folio .mid{
-    border-left:0;border-right:0;
-    border-top:1px solid var(--rule);border-bottom:1px solid var(--rule);
-    padding:7px 0;text-align:center;
-  }
-  .spread-head .right,.side.right{text-align:left}
-  .spread-head div{padding:9px 14px}
-  .def{grid-template-columns:1fr;gap:5px}
-}
-@media (prefers-reduced-motion:reduce){
-  *{animation:none!important;transition:none!important}
-}
-</style>
-</head>
-<body>
-
-<div class="wrap">
-
-  <header class="masthead">
-    <p class="eyebrow">AILeash · the witness network</p>
-    <h1>Two ledgers.<br><em>Neither one is the authority.</em></h1>
-    <p class="standfirst">Independent platforms record each other's records, every hour. You can check it yourself, right now, without an account.</p>
-  </header>
-
-  <div class="spread" id="spread">
-    <div class="spread-head">
-      <div>This chain</div>
-      <div class="mid">Exchange</div>
-      <div class="right">Recorded by</div>
-    </div>
-    <div id="folios">
-      <div class="loading">Reading the ledger…</div>
-    </div>
-  </div>
-
-  <section>
-    <h2>Why this exists</h2>
-    <p class="sec-note">Every platform that sells you an audit trail also holds it.</p>
-    <p>A hash chain stops anyone else altering the record. It does not stop the operator rebuilding the whole thing and presenting the result as history. Anchoring the chain externally narrows that down — you can't rewrite anything older than your last anchor — and it still leaves the keeper and the checker as the same party.</p>
-    <p>Nothing you build alone closes that. Somebody outside has to be holding a copy.</p>
-    <p>So each platform here takes the fingerprint of the others' records and seals it into its own. To rewrite your past now, everyone holding a copy would have to rewrite theirs in step, and re-obtain external timestamps that were issued days ago. The second half is the part that can't be done.</p>
-  </section>
-
-  <section>
-    <h2>What the marks mean</h2>
-    <p class="sec-note">Two checks run on every submission. Neither can reject one — everything gets sealed. What changes is how strong we say the claim is.</p>
-
-    <dl class="defs">
-      <div class="def"><dt><span class="dot ok"></span>Confirmed</dt><dd>We fetched the address given and it served exactly the tip that was submitted.</dd></div>
-      <div class="def"><dt><span class="dot mid-c"></span>Live</dt><dd>The address served a valid but different tip. A working chain moves between submitting and our looking — normal, not a failure.</dd></div>
-      <div class="def"><dt><span class="dot weak"></span>Self-declared</dt><dd>No address given, or we couldn't reach it. Taken on their word, and marked as such.</dd></div>
-      <div class="def"><dt>First-use</dt><dd>First time this name appeared. It's now bound to the address it came from.</dd></div>
-      <div class="def"><dt>Bound</dt><dd>Same address as the first time this name appeared. The same operator, consistently.</dd></div>
-      <div class="def"><dt>Conflict</dt><dd>This name has been submitted from a different address than the one it was first bound to. Still sealed, permanently flagged. Operators do move hosts — but you get to see it and decide.</dd></div>
-    </dl>
-  </section>
-
-  <section>
-    <h2>What this does not prove</h2>
-    <p class="sec-note">Said plainly, because the value of the rest depends on it.</p>
-    <ul class="limits">
-      <li><b>It doesn't prove a record was true when it was written.</b> Nothing can. No system reaches back to verify what someone was thinking or whether the data going in was honest. This proves what was recorded, when, and that it hasn't changed since.</li>
-      <li><b>It doesn't prove identity.</b> A name is self-declared. Checking the address proves someone runs a live chain producing that data — not that they're who they say. Binding a name to its first address is what makes a change visible.</li>
-      <li><b>Two platforms checking each other isn't much of a network.</b> The strength comes from breadth. This gets meaningfully harder to bend with every chain that joins, and not before.</li>
-      <li><b>A participant can go quiet.</b> Nobody can force anyone to keep publishing. Gaps show up as stale or silent rather than disappearing, which is the point.</li>
-    </ul>
-  </section>
-
-  <section>
-    <h2>Joining</h2>
-    <p class="sec-note">Chains submit their current head to the network and record the heads of others in return.</p>
-    <pre><span class="k">POST</span> https://sebbi.pro/x/witness/observe
-<span class="k">Content-Type:</span> application/json
-
-{
-  "chain": "your-chain-name",
-  "tip":   "&lt;64 hex characters — your current chain head&gt;",
-  "url":   "https://yoursite/your/tip",
-  "ts":    "2026-08-02T14:00:00Z"
-}</pre>
-    <p><code>url</code> is the address we fetch to check your tip independently — it's the difference between confirmed and self-declared. <code>ts</code> is optional, epoch or ISO.</p>
-    <p>Running a chain in the other direction, recording ours as we record yours, is what makes it mutual rather than us keeping a list. If you operate a platform in this space and you're willing to have your history held somewhere you don't control, message me and we'll talk through it and what it costs.</p>
-  </section>
-
-  <section>
-    <h2>Check it yourself</h2>
-    <p class="sec-note">Nothing here needs a login. Open any of these.</p>
-    <ul class="links">
-      <li><a href="/x/witness/tip">/x/witness/tip<span>our current head</span></a></li>
-      <li><a href="/x/witness/peers">/x/witness/peers<span>everyone we record</span></a></li>
-      <li><a href="/api/verify-chain">/api/verify-chain<span>chain checked end to end</span></a></li>
-      <li><a href="/api/anchor-status">/api/anchor-status<span>the external timestamp</span></a></li>
-    </ul>
-  </section>
-
-  <footer>
-    <p>Sealed records and their attestations are held by each participating platform independently. AILeash operates one chain in this network; it does not run the network. — <a href="https://sebbi.pro">sebbi.pro</a></p>
-  </footer>
-
-</div>
-
-<script>
-(function(){
-  var folios = document.getElementById('folios');
-
-  function esc(s){
-    return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){
-      return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
-    });
-  }
-
-  function stampFor(liveness, nameStatus){
-    var cls = 'stamp press', text = String(liveness || 'unchecked');
-    if (liveness === 'confirmed') cls += '';
-    else if (liveness === 'live') cls += ' live';
-    else cls += ' weak';
-    if (nameStatus === 'conflict'){ cls += ' flag'; text = 'conflict'; }
-    return '<span class="' + cls + '">' + esc(text) + '</span>';
-  }
-
-  function ago(hours){
-    if (hours == null) return 'unknown';
-    if (hours < 1) return 'within the hour';
-    if (hours < 2) return 'an hour ago';
-    if (hours < 48) return Math.round(hours) + ' hours ago';
-    return Math.round(hours / 24) + ' days ago';
-  }
-
-  function render(ours, peers){
-    if (!peers || !peers.length){
-      folios.innerHTML = '<div class="errbox"><b>No chains recorded yet.</b>' +
-        'Nothing has been submitted to this chain. The first tip posted to ' +
-        '/x/witness/observe appears here.</div>';
-      return;
-    }
-    var html = '';
-    peers.forEach(function(p){
-      html += '<div class="folio">' +
-        '<div class="side">' +
-          '<p class="chain-name">' + esc(ours.name) + '</p>' +
-          '<p class="role">head of chain · height ' + esc(ours.height) + '</p>' +
-          '<p class="hash-label">Current tip</p>' +
-          '<p class="hash">' + esc(ours.tip) + '</p>' +
-          '<p class="meta">Sealed <b>' + esc(ours.sealed) + '</b></p>' +
-        '</div>' +
-        '<div class="mid">↔</div>' +
-        '<div class="side right">' +
-          '<p class="chain-name">' + esc(p.peer) + '</p>' +
-          '<p class="role">' + esc(p.observations) + ' observations · ' +
-              esc(p.distinct_tips) + ' distinct tips</p>' +
-          '<p class="hash-label">Name bound to</p>' +
-          '<p class="hash">' + esc(p.bound_to || 'no address supplied') + '</p>' +
-          '<p class="meta">Last recorded <b>' + esc(ago(p.hours_since_last)) + '</b> · ' +
-              esc(p.name_status || 'unchecked') + '</p>' +
-          stampFor(p.liveness, p.name_status) +
-        '</div>' +
-      '</div>';
-    });
-    folios.innerHTML = html;
-  }
-
-  function failed(){
-    folios.innerHTML = '<div class="errbox"><b>The ledger did not answer.</b>' +
-      'The endpoints are public, so you can try them directly: ' +
-      '<a href="/x/witness/peers">/x/witness/peers</a></div>';
-  }
-
-  Promise.all([
-    fetch('/x/witness/tip').then(function(r){ return r.json(); }),
-    fetch('/x/witness/peers').then(function(r){ return r.json(); })
-  ]).then(function(res){
-    var tip = res[0] || {}, peers = res[1] || {};
-    render({
-      name: 'aileash',
-      tip: tip.tip || 'unavailable',
-      height: tip.height == null ? '—' : tip.height,
-      sealed: tip.sealed_at ? new Date(tip.sealed_at).toUTCString().replace(' GMT','  UTC') : 'unknown'
-    }, peers.peers || []);
-  }).catch(failed);
-})();
-</script>
-
-</body>
-</html>
-"""
-
-
-def _srv():
-    m = sys.modules.get("__main__")
-    if hasattr(m, "get_bearer"):
-        return m
-    return sys.modules.get("server")
-
-
-def _install(s):
-    """Add a page branch to do_GET at runtime. Idempotent and reversible."""
-    if _patched[0]:
-        return "already installed"
-    H = getattr(s, "Handler", None)
-    if H is None or not hasattr(H, "do_GET"):
-        return "no handler"
-    if getattr(H, "_page_patched", False):
-        _patched[0] = True
-        return "already installed"
-
-    original = H.do_GET
-
-    def do_GET(self):
-        try:
-            from urllib.parse import urlparse
-            p = urlparse(self.path).path.rstrip("/") or "/"
-        except Exception:
-            p = self.path or "/"
-        if p in PAGE_PATHS:
-            body = PAGE.encode("utf-8")
-            try:
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Cache-Control", "public, max-age=300")
-                self.send_header("X-Content-Type-Options", "nosniff")
-                self.send_header("Referrer-Policy", "no-referrer")
-                self.end_headers()
-                self.wfile.write(body)
-            except Exception:
-                pass
-            return
-        return original(self)
-
-    H.do_GET = do_GET
-    H._page_patched = True
-    _patched[0] = True
-    print("NETWORK: /witness page branch installed at runtime", flush=True)
-    return "installed"
-
-
-def handle(method, action, data, api_key, ctx):
-    s = _srv()
-    if s is None:
-        return {"error": "server_not_found"}, 500
-
-    state = "already installed" if _patched[0] else None
-    if not _patched[0]:
-        try:
-            state = _install(s)
-        except Exception as exc:
-            print("NETWORK: page patch failed - " + str(exc), flush=True)
-            state = "failed: " + str(exc)
-
-    if method == "GET" and (action or "") in ("", "status"):
-        return {
-            "page": "/witness",
-            "installed": bool(_patched[0]),
-            "install_result": state,
-            "paths": list(PAGE_PATHS),
-            "version": VERSION,
-            "note": "The page reads /x/witness/tip and /x/witness/peers from the browser. It holds no data of its own.",
-        }, 200
-
-    return {"error": "unknown_action", "action": action,
-            "GET": ["status"]}, 404
-
-```
-
-
-## `modules/oversight.py`
-
-249 lines, 11339 bytes
-
-```python
-"""
-Human oversight notary - /x/oversight/<action>
-
-THE PROBLEM
------------
-Nobody can prove a person thought about a decision. That is an internal state
-and no amount of logging reaches it. Any vendor claiming to prove genuine
-human oversight is overselling.
-
-But rubber stamping is not an internal state. It is a pattern, and patterns
-leave marks - if you record the right things, in the right order, at the time.
-
-WHAT THIS DOES
---------------
-Three things, none of which claim to read minds.
-
-1. ORDER. The reviewer's own call is sealed BEFORE the machine's verdict is
-   revealed to them. Two blocks, in that order, in a chain that cannot be
-   reordered afterwards. So a reviewer cannot have simply agreed with an
-   answer they had already seen - the chain shows they committed while it was
-   still hidden.
-
-2. ATTENTION. The gap between opening the case and committing is recorded.
-   A 0.8 second approval sits in the record permanently, next to a two minute
-   one. Not proof of thought - but a 400-case history of sub-second calls is
-   not something anyone can explain away.
-
-3. INDEPENDENCE. Agreement rate over time. A reviewer who has never once
-   diverged from the machine is visible in the data. One who diverges
-   sometimes is demonstrably exercising judgement.
-
-WHAT IT DOES NOT DO
--------------------
-- It cannot prove the reviewer read the material. They can leave a screen open.
-- Dwell time is measurable but gameable by anyone deliberately gaming it.
-- It does not stop a reviewer being wrong. It records that they decided.
-- If the integrating system shows its user the machine verdict before calling
-  /open, this proves nothing. The ordering guarantee is only as good as the
-  integration honouring it. That is a documented limit, not a hidden one.
-
-WHAT IT IS FOR
---------------
-Turning "we have human oversight" from an assertion into a dataset that an
-auditor can test - and that a rubber stamper cannot hide inside.
-
-    POST /x/oversight/open      case_ref, material, machine_verdict, reviewer
-    POST /x/oversight/commit    case_id, reviewer_verdict, reasoning
-    GET  /x/oversight/case?id=OVS-XXXXXXXX
-    GET  /x/oversight/reviewer?id=<reviewer id>
-    GET  /x/oversight/list
-"""
-
-import hashlib, json, secrets, time
-from datetime import datetime, timezone
-
-VERSION = "1.0"
-VERDICTS = {"allow", "block", "challenge", "escalate"}
-
-_ready = False
-
-
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        ctx["conn"].execute("CREATE TABLE IF NOT EXISTS oversight_cases(case_id TEXT PRIMARY KEY,api_key TEXT,case_ref TEXT,reviewer TEXT,material_hash TEXT,machine_verdict TEXT,opened REAL,committed REAL,reviewer_verdict TEXT,agreed INTEGER,dwell REAL,status TEXT DEFAULT 'open')")
-        ctx["conn"].execute("CREATE INDEX IF NOT EXISTS idx_ovs_key ON oversight_cases(api_key)")
-        ctx["conn"].execute("CREATE INDEX IF NOT EXISTS idx_ovs_rev ON oversight_cases(api_key,reviewer)")
-        ctx["conn"].commit()
-    _ready = True
-
-
-def _iso(ts):
-    if not ts:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
-
-def _hash(x):
-    if not isinstance(x, str):
-        x = json.dumps(x, sort_keys=True)
-    return hashlib.sha256(x.encode()).hexdigest()
-
-
-def _seal_event(ctx, api_key, cid, action, detail):
-    ts = time.time()
-    ev = {"user_id": "ovs:" + cid, "action": "oversight_" + action, "amount": 0,
-          "country": "UK", "device_id": "oversight", "anomaly": 0, "device_risk": 0}
-    res = {"decision": "OVERSIGHT_SEALED", "score": 0, "oversight_action": action,
-           "oversight_version": VERSION, "timestamp": ts, "detail": detail}
-    h, idx, seq = ctx["seal"](ev, res, ts, api_key)
-    return h, idx, seq, ts
-
-
-def _open(ctx, api_key, data):
-    ref = str(data.get("case_ref", "")).strip()
-    if not ref:
-        return {"error": "case_ref_required"}, 400
-    reviewer = str(data.get("reviewer", "")).strip()
-    if not reviewer:
-        return {"error": "reviewer_required",
-                "message": "Oversight without a named reviewer is not oversight."}, 400
-    material = data.get("material")
-    if material is None:
-        return {"error": "material_required",
-                "message": "Send exactly what the reviewer will see. Only its hash is stored."}, 400
-    mv = str(data.get("machine_verdict", "")).strip().lower()
-    if mv and mv not in VERDICTS:
-        return {"error": "invalid_machine_verdict", "allowed": sorted(VERDICTS)}, 400
-
-    cid = "OVS-" + secrets.token_hex(4).upper()
-    mh = _hash(material)
-    detail = ("ref=" + ref[:80] + ";reviewer=" + reviewer[:60] +
-              ";material_sha256=" + mh + ";machine_verdict_sealed=" + (mv or "none"))
-    h, idx, seq, ts = _seal_event(ctx, api_key, cid, "opened", detail)
-
-    with ctx["lock"]:
-        ctx["conn"].execute("INSERT INTO oversight_cases(case_id,api_key,case_ref,reviewer,material_hash,machine_verdict,opened,committed,reviewer_verdict,agreed,dwell,status) VALUES(?,?,?,?,?,?,?,NULL,NULL,NULL,NULL,'open')",
-                            (cid, api_key, ref, reviewer, mh, mv or None, ts))
-        ctx["conn"].commit()
-
-    return {"case_id": cid, "opened": _iso(ts), "material_sha256": mh,
-            "audit_hash": h, "block_index": idx, "receipt_seq": seq,
-            "machine_verdict": "withheld until commit",
-            "message": "Clock running. Show the reviewer the material, not the verdict."}, 200
-
-
-def _commit(ctx, api_key, data):
-    cid = str(data.get("case_id", "")).strip()
-    with ctx["lock"]:
-        row = ctx["conn"].execute("SELECT reviewer,material_hash,machine_verdict,opened,status FROM oversight_cases WHERE case_id=? AND api_key=?", (cid, api_key)).fetchone()
-    if not row:
-        return {"error": "unknown_case_id"}, 404
-    if row[4] != "open":
-        return {"error": "already_committed",
-                "message": "A reviewer commits once. That is the point."}, 400
-
-    rv = str(data.get("reviewer_verdict", "")).strip().lower()
-    if rv not in VERDICTS:
-        return {"error": "invalid_reviewer_verdict", "allowed": sorted(VERDICTS)}, 400
-    reasoning = str(data.get("reasoning", "")).strip()
-    if not reasoning:
-        return {"error": "reasoning_required",
-                "message": "Sealed at commit, before the machine verdict is revealed. Blank is not permitted."}, 400
-
-    ts = time.time()
-    dwell = round(ts - row[3], 3)
-    agreed = None if not row[2] else (1 if rv == row[2] else 0)
-    detail = ("reviewer_verdict=" + rv + ";dwell_seconds=" + str(dwell) +
-              ";reasoning=" + reasoning[:600])
-    h, idx, seq, _x = _seal_event(ctx, api_key, cid, "committed", detail)
-
-    with ctx["lock"]:
-        ctx["conn"].execute("UPDATE oversight_cases SET committed=?,reviewer_verdict=?,agreed=?,dwell=?,status='committed' WHERE case_id=? AND api_key=?",
-                            (ts, rv, agreed, dwell, cid, api_key))
-        ctx["conn"].commit()
-
-    out = {"case_id": cid, "reviewer_verdict": rv, "dwell_seconds": dwell,
-           "audit_hash": h, "block_index": idx, "receipt_seq": seq,
-           "machine_verdict": row[2],
-           "note": "Your call was sealed before this line was returned. The chain shows the order."}
-    if agreed is not None:
-        out["agreed"] = bool(agreed)
-    if dwell < 2:
-        out["flag"] = "committed in under 2 seconds - recorded permanently"
-    return out, 200
-
-
-def _case(ctx, api_key, cid):
-    with ctx["lock"]:
-        row = ctx["conn"].execute("SELECT case_ref,reviewer,material_hash,machine_verdict,opened,committed,reviewer_verdict,agreed,dwell,status FROM oversight_cases WHERE case_id=? AND api_key=?", (cid, api_key)).fetchone()
-        if not row:
-            return {"error": "unknown_case_id"}, 404
-        blocks = ctx["conn"].execute("SELECT ts,result_json,audit_hash,key_seq FROM audit_log WHERE user_id=? ORDER BY id ASC", ("ovs:" + cid,)).fetchall()
-    events = []
-    for ts_, res, ah, seq in blocks:
-        try:
-            r = json.loads(res)
-            events.append({"at": _iso(ts_), "event": r.get("oversight_action"),
-                           "detail": r.get("detail"), "sealed": ah, "receipt_seq": seq})
-        except Exception:
-            pass
-    return {"case_id": cid, "case_ref": row[0], "reviewer": row[1],
-            "material_sha256": row[2], "machine_verdict": row[3],
-            "opened": _iso(row[4]), "committed": _iso(row[5]),
-            "reviewer_verdict": row[6],
-            "agreed": (None if row[7] is None else bool(row[7])),
-            "dwell_seconds": row[8], "status": row[9], "events": events,
-            "ordering_proof": "The opened block precedes the committed block in the chain. Neither can be reordered or altered without breaking every block after it."}, 200
-
-
-def _reviewer(ctx, api_key, rid):
-    with ctx["lock"]:
-        rows = ctx["conn"].execute("SELECT dwell,agreed FROM oversight_cases WHERE api_key=? AND reviewer=? AND status='committed'", (api_key, rid)).fetchall()
-    if not rows:
-        return {"reviewer": rid, "cases": 0,
-                "note": "No committed cases on record for this reviewer."}, 200
-    dwells = sorted(r[0] for r in rows if r[0] is not None)
-    scored = [r[1] for r in rows if r[1] is not None]
-    n = len(dwells)
-    median = dwells[n // 2] if n else None
-    under2 = len([d for d in dwells if d < 2])
-    out = {"reviewer": rid, "cases": len(rows),
-           "median_dwell_seconds": median,
-           "fastest_seconds": (dwells[0] if dwells else None),
-           "under_2_seconds": under2,
-           "under_2_seconds_pct": (round(100 * under2 / n, 1) if n else None)}
-    if scored:
-        agree = sum(scored)
-        out["agreement_rate_pct"] = round(100 * agree / len(scored), 1)
-        out["diverged"] = len(scored) - agree
-        if len(scored) >= 20 and agree == len(scored):
-            out["pattern"] = "never diverged from the machine across " + str(len(scored)) + " cases"
-    return out, 200
-
-
-def _list(ctx, api_key):
-    with ctx["lock"]:
-        rows = ctx["conn"].execute("SELECT case_id,case_ref,reviewer,opened,status,reviewer_verdict,dwell,agreed FROM oversight_cases WHERE api_key=? ORDER BY opened DESC LIMIT 200", (api_key,)).fetchall()
-    return {"count": len(rows),
-            "cases": [{"case_id": r[0], "case_ref": r[1], "reviewer": r[2],
-                       "opened": _iso(r[3]), "status": r[4],
-                       "reviewer_verdict": r[5], "dwell_seconds": r[6],
-                       "agreed": (None if r[7] is None else bool(r[7]))} for r in rows]}, 200
-
-
-def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-    if method == "POST":
-        if action == "open":
-            return _open(ctx, api_key, data)
-        if action == "commit":
-            return _commit(ctx, api_key, data)
-    else:
-        if action == "list":
-            return _list(ctx, api_key)
-        if action == "case":
-            cid = str(data.get("id", "")).strip()
-            if not cid:
-                return {"error": "id_required"}, 400
-            return _case(ctx, api_key, cid)
-        if action == "reviewer":
-            rid = str(data.get("id", "")).strip()
-            if not rid:
-                return {"error": "id_required"}, 400
-            return _reviewer(ctx, api_key, rid)
-    return {"error": "unknown_action", "action": action}, 404
 
 ```
