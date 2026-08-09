@@ -6,7 +6,7 @@ Contains:
 - `modules/rulebind.py`
 - `modules/savings.py`
 - `modules/spec.py`
-- `modules/stats.py`
+- `modules/standard.py`
 
 
 ## `modules/replay.py`
@@ -2208,152 +2208,410 @@ def handle(method, action, data, api_key, ctx):
 ```
 
 
-## `modules/stats.py`
+## `modules/standard.py`
 
-143 lines, 5540 bytes
+401 lines, 17637 bytes
 
 ```python
 """
-Live figures for the Proving Ground - /x/stats
+modules/standard.py  -  the Ordering Test discovery document for this domain
 
-Charts on a compliance site are usually decoration. These are not, provided
-they show something a visitor could otherwise only take on trust: that the
-chain is genuinely growing, that decisions really are distributed across the
-thresholds rather than hand-picked, and that people who click through a
-review case behave exactly as the oversight argument predicts.
+WHAT IT SERVES
+--------------
+  GET /.well-known/ordering-test.json   this operator's discovery document
+  GET /x/standard/hash                  sha256 of that document
+  GET /x/standard/status                what is installed, and honest counts
 
-WHAT IS PUBLISHED, AND WHAT IS NOT
+SHAPE
+-----
+Deliberately identical to the shape Red Flag AI Pro published first:
+
+    checks: { <name>: { supported, demonstrable_publicly, endpoint, note } }
+
+Two fields, not one, and the second is the better idea. "We built it" and
+"you can verify it without an account" are different claims, and most of this
+market blurs them. Separating them lets a vendor be honest about having
+something real that an outsider still has to take on trust.
+
+WHAT THE HOST HEADER IS DOING HERE
 ----------------------------------
-Public and no key, because a figure nobody can see proves nothing.
+base_url is derived from the request rather than written into the file. An
+earlier draft had the domain hardcoded, which meant any operator running it
+would publish somebody else's domain as the source - the opposite of a mirror.
+Deriving it means this file can be lifted to any domain and tells the truth
+about wherever it is actually running.
 
-Published: total chain height, hourly block counts, the verdict mix and score
-distribution of PUBLIC DEMO decisions only, and dwell times from public review
-cases.
+EVERY PUBLISHED ENDPOINT MUST WORK AS WRITTEN
+---------------------------------------------
+An endpoint marked demonstrable_publicly is a promise that a stranger can copy
+it out of this document and get an answer. If the route needs a parameter, the
+document names that parameter. If a value has to be discovered first, the
+document says where to discover it. An endpoint that errors when followed
+literally is a failed check, not a documentation detail.
 
-Never published: anything scoped to a customer key. No customer verdict mix,
-no customer volumes, no per-key anything. A visitor learns how the engine
-behaves, not how any operator's business is going. That distinction is the
-whole reason this endpoint can be open.
+HONESTY RULES THIS FILE FOLLOWS
+-------------------------------
+  - A check we have not built says supported: false. It does not quietly go
+    missing from the document.
+  - A check that exists but needs an account says demonstrable_publicly:
+    false, however much we would like the tick.
+  - runner is null. A runner exists in draft, but the checks have not been
+    jointly agreed with the other mirror, so publishing one as though it were
+    a settled standard would claim something neither operator has earned yet.
 
-    GET /x/stats        everything below
-    GET /x/stats/chain  chain height and hourly growth only
+None of that is modesty. A conformance document whose author scores full marks
+on the day they publish it is a marketing page.
 """
 
-import json, time
-from datetime import datetime, timezone
+import hashlib
+import json
+import sys
 
-VERSION = "1.0"
-PUBLIC = {("GET", ""), ("GET", "stats"), ("GET", "chain")}
+VERSION = "1.1"
+ORDERING_TEST_VERSION = "0.1"
 
-DEMO_KEY = "public_demo"
+PUBLIC = {("GET", "status"), ("GET", "hash"), ("GET", "spec"),
+          ("GET", "document")}
+
+# Several paths on purpose. /.well-known/ is where the standard says to look,
+# but some platforms and static handlers reserve that prefix, so a plain root
+# path is served as well. /x/standard/document goes through the normal router
+# and cannot be intercepted by anything, which makes it the diagnostic.
+DISCOVERY_PATHS = ("/.well-known/ordering-test.json",
+                   "/ordering-test.json",
+                   "/well-known/ordering-test.json")
+
+VENDOR = "AILeash"
+FALLBACK_BASE = "https://sebbi.pro"
+
+RUNNER = None
+RUNNER_NOTE = (
+    "No shared runner file is published here yet. The checks themselves have "
+    "not been jointly agreed with the other mirrors as of this document's "
+    "publication. This describes AILeash's own side only, not a settled "
+    "cross-vendor standard.")
+
+# Order follows the other mirror's document so the two read side by side.
+CHECKS = {
+    "rule_binding": {
+        "supported": True,
+        "demonstrable_publicly": True,
+        "endpoint": "/x/rulebind/prove",
+        "note": ("The ruleset version is a component of a digest sealed with the "
+                 "decision, not a field beside it. POST any inputs without an "
+                 "account and the response returns the exact string that was "
+                 "hashed - SHA-256 it yourself and confirm it matches. Alter the "
+                 "ruleset hash and the digest stops recomputing; alter the digest "
+                 "and the chain breaks. Verify a past record at "
+                 "/x/rulebind/verify?receipt=... and see ruleset history at "
+                 "/x/rulebind/packs. No scoring logic is disclosed at any point - "
+                 "inputs are published as a digest, never as values."),
+    },
+    "commit_before_reveal": {
+        "supported": True,
+        "demonstrable_publicly": True,
+        "endpoint": "/x/demo/review",
+        "note": ("The reviewer receives the case with the machine verdict "
+                 "withheld. Their own call and dwell time are sealed first, "
+                 "then the verdict is revealed, and the chain fixes that order "
+                 "permanently. No account needed - open a case, commit a "
+                 "verdict, and check the block indices yourself. Commit "
+                 "endpoint is /x/demo/commit."),
+    },
+    "authority_tokens": {
+        "supported": True,
+        "demonstrable_publicly": False,
+        "endpoint": None,
+        "note": ("Signed authority tokens with scope and expiry. A decision "
+                 "beyond delegated authority escalates rather than executes, "
+                 "and the delegation itself is sealed. Built and live, "
+                 "key-gated, no public proof."),
+    },
+    "mutual_witnessing": {
+        "supported": True,
+        "demonstrable_publicly": True,
+        "endpoint": "/x/witness/peers",
+        "note": ("Live, running both directions with an external peer chain "
+                 "hourly since 1 August 2026. No account needed, run it "
+                 "yourself. Our current tip is at /x/witness/tip and any party "
+                 "can submit theirs at /x/witness/observe without an account."),
+    },
+    "completeness_proof": {
+        "supported": True,
+        "demonstrable_publicly": True,
+        "endpoint": "/x/complete/root?period={period}&kind=receipts",
+        "note": ("Per-period sorted Merkle root and exact leaf count, committed "
+                 "before any export is requested. An export can then be checked "
+                 "against a number fixed before anyone knew it would be asked "
+                 "for. Committed periods are listed at /x/complete/periods - "
+                 "take a period identifier from there and substitute it. Only "
+                 "closed periods can be committed, so the current period will "
+                 "not appear until it ends. A period listed nowhere is a period "
+                 "nobody committed, which is itself the finding."),
+    },
+    "absence_proof": {
+        "supported": True,
+        "demonstrable_publicly": True,
+        "endpoint": "/x/complete/prove?period={period}&value={value}",
+        "note": ("Two adjacent leaves with consecutive indices demonstrate that "
+                 "nothing sits between them, so absence is proved rather than "
+                 "asserted. Both parameters are required: take a period from "
+                 "/x/complete/periods and supply any value you like. Try a "
+                 "value that is not there."),
+    },
+    "reconciliation": {
+        "supported": True,
+        "demonstrable_publicly": False,
+        "endpoint": None,
+        "note": ("Sample selected from the live chain tip and sealed before any "
+                 "data is requested, so flattering records cannot be "
+                 "cherry-picked. Mismatches sealed as permanently as matches. "
+                 "Built and live, key-gated, no public proof."),
+    },
+    "reproducibility": {
+        "supported": True,
+        "demonstrable_publicly": True,
+        "endpoint": "/x/replay/challenge",
+        "note": ("Determinism proved by public challenge without disclosing any "
+                 "scoring logic. Submit inputs, the run is sealed, resubmit the "
+                 "same inputs later and the verdict must be identical under an "
+                 "unchanged code fingerprint at /x/replay/fingerprint."),
+    },
+    "consistency_proof": {
+        "supported": True,
+        "demonstrable_publicly": True,
+        "endpoint": "/x/consistency/proof?first={first}&second={second}",
+        "note": ("RFC 6962 consistency proofs, deliberately unmodified so "
+                 "existing Certificate Transparency verifiers work against them "
+                 "directly. first and second are tree sizes - read the current "
+                 "size from /x/consistency/root and pick any earlier one. "
+                 "Anyone holding any earlier tip we served can show it is a "
+                 "prefix of the current log at /x/consistency/ancestor."),
+    },
+
+    # ---- proposed addition, flagged as a proposal rather than assumed ----
+    "external_anchoring": {
+        "supported": True,
+        "demonstrable_publicly": True,
+        "endpoint": "/api/anchor-status",
+        "note": ("PROPOSED AS A SEPARATE CHECK, not settled. The other mirror "
+                 "currently folds anchoring into consistency_proof, but they "
+                 "answer different questions: consistency shows the log only "
+                 "ever grew, anchoring shows the time was fixed somewhere the "
+                 "operator cannot reach. A log can be perfectly append-only and "
+                 "still have been built last week. Here the tip is submitted to "
+                 "OpenTimestamps and committed into Bitcoin; the other mirror "
+                 "uses an RFC 3161 timestamp. The spec should permit any "
+                 "external authority the operator does not control and require "
+                 "it to be named - not mandate one. Offered for the joint "
+                 "session."),
+    },
+}
+
+DOCUMENT_NOTE = (
+    "Every endpoint marked demonstrable_publicly is unauthenticated by design - "
+    "run it yourself without asking us. Where an endpoint carries a {parameter}, "
+    "the note for that check says where to get a valid value; every published "
+    "endpoint is meant to work when followed literally, and one that does not is "
+    "a failed check on our side, not a quibble. Checks marked supported but not "
+    "demonstrable_publicly are real and built, but currently need a key to see, "
+    "and say so plainly rather than passing on the day this was published. "
+    "Nothing here proves the records are true. It describes the order things "
+    "were committed in, which is a narrower claim and the only one that holds.")
+
+_patched = [False]
 
 
-def _iso(ts):
-    if not ts:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
-
-def _chain(ctx):
-    t = time.time()
-    with ctx["lock"]:
-        row = ctx["conn"].execute("SELECT COUNT(*),MIN(ts),MAX(ts) FROM audit_log").fetchone()
-        recent = ctx["conn"].execute("SELECT ts FROM audit_log WHERE ts>? ORDER BY ts ASC", (t - 86400,)).fetchall()
-    height = row[0] if row else 0
-    buckets = [0] * 24
-    for (ts,) in recent:
-        h = int((t - ts) // 3600)
-        if 0 <= h < 24:
-            buckets[23 - h] += 1
-    return {"height": height,
-            "first_block": _iso(row[1] if row else None),
-            "latest_block": _iso(row[2] if row else None),
-            "last_24h": buckets,
-            "blocks_last_24h": sum(buckets),
-            "note": "Every block, from every source. The chain is one sequence."}
-
-
-def _demo(ctx):
-    with ctx["lock"]:
-        rows = ctx["conn"].execute("SELECT result_json,ts FROM audit_log WHERE api_key=? ORDER BY id DESC LIMIT 2000", (DEMO_KEY,)).fetchall()
-    verdicts = {"ALLOW": 0, "CHALLENGE": 0, "BLOCK": 0}
-    # ten buckets of 0.1 across the score range
-    hist = [0] * 10
-    scores = []
-    for res, _ts in rows:
-        try:
-            r = json.loads(res)
-        except Exception:
-            continue
-        d = r.get("decision")
-        if d in verdicts:
-            verdicts[d] += 1
-            s = r.get("score")
-            if isinstance(s, (int, float)):
-                scores.append(s)
-                b = min(int(float(s) * 10), 9)
-                hist[b] += 1
-    total = sum(verdicts.values())
-    out = {"decisions": total, "verdicts": verdicts,
-           "score_histogram": hist,
-           "buckets": ["0.0-0.1", "0.1-0.2", "0.2-0.3", "0.3-0.4", "0.4-0.5",
-                       "0.5-0.6", "0.6-0.7", "0.7-0.8", "0.8-0.9", "0.9-1.0"],
-           "thresholds": {"allow_below": 0.35, "block_at_or_above": 0.70}}
-    if scores:
-        scores.sort()
-        out["median_score"] = round(scores[len(scores) // 2], 4)
-    return out
-
-
-def _oversight(ctx):
+def _base_from(handler):
+    """Derive our own base URL from the request. An operator running this file
+    on their own domain publishes their domain, not whoever wrote it."""
     try:
-        with ctx["lock"]:
-            rows = ctx["conn"].execute("SELECT dwell,human_verdict,machine_verdict FROM demo_cases WHERE committed IS NOT NULL").fetchall()
+        host = handler.headers.get("X-Forwarded-Host") or handler.headers.get("Host")
+        if not host:
+            return FALLBACK_BASE
+        host = host.split(",")[0].strip()[:200]
+        proto = (handler.headers.get("X-Forwarded-Proto") or "https").split(",")[0].strip()
+        if proto not in ("http", "https"):
+            proto = "https"
+        return proto + "://" + host
     except Exception:
-        rows = []
-    if not rows:
-        return {"reviews": 0,
-                "note": "Nobody has taken a review case yet."}
-    dwells = sorted(r[0] for r in rows if r[0] is not None)
-    agreed = len([r for r in rows if (r[1] or "").upper() == (r[2] or "").upper()])
-    # dwell buckets in seconds
-    edges = [2, 5, 10, 20, 45, 90]
-    labels = ["under 2s", "2-5s", "5-10s", "10-20s", "20-45s", "45-90s", "over 90s"]
-    hist = [0] * 7
-    for d in dwells:
-        placed = False
-        for i, e in enumerate(edges):
-            if d < e:
-                hist[i] += 1
-                placed = True
-                break
-        if not placed:
-            hist[6] += 1
-    n = len(dwells)
-    return {"reviews": len(rows),
-            "agreed_with_engine": agreed,
-            "agreement_rate_pct": round(100 * agreed / len(rows), 1),
-            "median_dwell_seconds": (dwells[n // 2] if n else None),
-            "under_2_seconds": hist[0],
-            "under_2_seconds_pct": (round(100 * hist[0] / n, 1) if n else 0),
-            "dwell_histogram": hist,
-            "dwell_labels": labels,
-            "note": "Visitors who committed in under two seconds did not read the case. That is the pattern the oversight record is designed to make visible."}
+        return FALLBACK_BASE
+
+
+def _base_from_ctx(ctx):
+    """Same derivation for the routed /x/standard/document call.
+
+    The router's ctx may or may not carry the request handler. If it does, the
+    document served through the router names the same domain as the one served
+    at /.well-known/ - which matters on a mirror, where hardcoding would make
+    this file publish somebody else's domain again."""
+    try:
+        if isinstance(ctx, dict):
+            for key in ("handler", "h", "request", "req", "self"):
+                obj = ctx.get(key)
+                if obj is not None and hasattr(obj, "headers"):
+                    return _base_from(obj)
+            headers = ctx.get("headers")
+            if headers is not None:
+                class _Shim(object):
+                    pass
+                shim = _Shim()
+                shim.headers = headers
+                return _base_from(shim)
+        elif ctx is not None and hasattr(ctx, "headers"):
+            return _base_from(ctx)
+    except Exception:
+        pass
+    return FALLBACK_BASE
+
+
+def _document(base):
+    checks = {}
+    for name, c in CHECKS.items():
+        checks[name] = {
+            "supported": c["supported"],
+            "demonstrable_publicly": c["demonstrable_publicly"],
+            "endpoint": c["endpoint"],
+            "note": c["note"],
+        }
+    return {
+        "ordering_test_version": ORDERING_TEST_VERSION,
+        "vendor": VENDOR,
+        "base_url": base,
+        "runner": RUNNER,
+        "runner_note": RUNNER_NOTE,
+        "checks": checks,
+        "witness_peers": base + "/x/witness/peers",
+        "witness_tip": base + "/x/witness/tip",
+        "committed_periods": base + "/x/complete/periods",
+        "note": DOCUMENT_NOTE,
+    }
+
+
+def _digest(doc):
+    return hashlib.sha256(
+        json.dumps(doc, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _srv():
+    m = sys.modules.get("__main__")
+    if hasattr(m, "get_bearer"):
+        return m
+    return sys.modules.get("server")
+
+
+def _install(s):
+    if _patched[0]:
+        return "already installed"
+    H = getattr(s, "Handler", None)
+    if H is None or not hasattr(H, "do_GET"):
+        return "no handler"
+    if getattr(H, "_standard_patched", False):
+        _patched[0] = True
+        return "already installed"
+
+    original = H.do_GET
+
+    def do_GET(self):
+        try:
+            from urllib.parse import urlparse
+            p = urlparse(self.path).path.rstrip("/") or "/"
+        except Exception:
+            p = self.path or "/"
+
+        if p in DISCOVERY_PATHS:
+            body = json.dumps(_document(_base_from(self)), indent=2).encode("utf-8")
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "public, max-age=300")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception:
+                pass
+            return
+
+        return original(self)
+
+    H.do_GET = do_GET
+    H._standard_patched = True
+    _patched[0] = True
+    print("STANDARD: /.well-known/ordering-test.json installed", flush=True)
+    return "installed"
 
 
 def handle(method, action, data, api_key, ctx):
-    if method != "GET":
-        return {"error": "unknown_action", "action": action}, 404
-    if action == "chain":
-        return {"stats_version": VERSION, "chain": _chain(ctx)}, 200
-    if action in ("", "stats"):
-        return {"stats_version": VERSION,
-                "generated": _iso(time.time()),
-                "chain": _chain(ctx),
-                "public_decisions": _demo(ctx),
-                "public_reviews": _oversight(ctx),
-                "scope": "Public demonstration activity and total chain height only. Nothing scoped to a customer key is published here."}, 200
+    s = _srv()
+    if s is None:
+        return {"error": "server_not_found"}, 500
+
+    state = "already installed" if _patched[0] else None
+    if not _patched[0]:
+        try:
+            state = _install(s)
+        except Exception as exc:
+            print("STANDARD: patch failed - " + str(exc), flush=True)
+            state = "failed: " + str(exc)
+
+    action = (action or "").strip("/").lower()
+    base = _base_from_ctx(ctx)
+    doc = _document(base)
+
+    if method == "GET" and action == "document":
+        return doc, 200
+
+    if method == "GET" and action == "hash":
+        canonical = _document(FALLBACK_BASE)
+        return {
+            "sha256": _digest(canonical),
+            "of": "this operator's discovery document",
+            "canonicalisation": ("JSON, keys sorted, no whitespace, UTF-8, "
+                                 "base_url fixed to " + FALLBACK_BASE +
+                                 " so the digest does not move with the "
+                                 "requesting host"),
+            "what_this_is_for": (
+                "Confirming our own document has not changed. It is NOT the "
+                "cross-mirror check - two operators publish different documents "
+                "by design, because they list different endpoints, so their "
+                "digests should differ and a mismatch would prove nothing. The "
+                "cross-mirror comparison only means something once every mirror "
+                "serves a byte-identical runner file and hashes that instead. "
+                "No runner is agreed yet."),
+            "document": canonical,
+        }, 200
+
+    if method == "GET" and action in ("", "status", "spec"):
+        supported = [k for k, c in CHECKS.items() if c["supported"]]
+        public = [k for k, c in CHECKS.items() if c["demonstrable_publicly"]]
+        parameterised = [k for k, c in CHECKS.items()
+                         if c["endpoint"] and "{" in c["endpoint"]]
+        return {
+            "installed": bool(_patched[0]),
+            "install_result": state,
+            "module_version": VERSION,
+            "ordering_test_version": ORDERING_TEST_VERSION,
+            "serving": list(DISCOVERY_PATHS),
+            "always_available": "/x/standard/document",
+            "checks_total": len(CHECKS),
+            "checks_supported": len(supported),
+            "checks_publicly_demonstrable": len(public),
+            "publicly_demonstrable": public,
+            "supported_but_not_public": [k for k in supported if k not in public],
+            "endpoints_needing_a_parameter": parameterised,
+            "runner": RUNNER,
+            "note": ("base_url is derived from the Host header, so this file "
+                     "publishes whichever domain is actually serving it. Checks "
+                     "listed under endpoints_needing_a_parameter cannot be "
+                     "demonstrated until a real value exists to substitute - "
+                     "for the completeness and absence checks that means at "
+                     "least one committed period at /x/complete/periods."),
+        }, 200
+
     return {"error": "unknown_action", "action": action,
-            "available": ["GET stats", "GET chain"]}, 404
+            "GET": ["status", "hash", "document"]}, 404
 
 ```
