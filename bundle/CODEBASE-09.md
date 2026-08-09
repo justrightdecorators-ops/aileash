@@ -1,8 +1,6 @@
 # Codebase — part 9 of 18
 
 Contains:
-- `sebdog_licence.py`
-- `sebdog_reporter.py`
 - `tests/attack_continuity_1.py`
 - `tests/attack_continuity_2.py`
 - `tests/attack_continuity_3.py`
@@ -12,571 +10,8 @@ Contains:
 - `README.md`
 - `admin.html`
 - `ai-standard.html`
-
-
-## `sebdog_licence.py`
-
-332 lines, 12401 bytes
-
-```python
-"""
-SEBDOG LICENCE SYSTEM v1.0.0
-Air-gapped cryptographic licence tokens for the Sebdog Engine.
-Copyright (c) 2026 Justin Antony Dobson / Monop Content, Blyth, UK
-
-HOW IT WORKS:
-- sebbi.pro generates a signed annual licence token on signup
-- The token is validated entirely locally — no phone-home required
-- Any tampering with the token is cryptographically detected
-- Tokens expire after 12 months and must be renewed
-- The signing secret never leaves sebbi.pro's servers
-
-SECURITY MODEL:
-- HMAC-SHA256 signatures — industry standard, same as used by AWS, Stripe
-- Constant-time comparison prevents timing attacks
-- Base64url encoding for safe transmission
-- JSON payload is deterministically serialised (sort_keys=True)
-- Every validation attempt is logged to the local audit chain
-"""
-
-import hashlib, hmac, json, time, base64, secrets, sqlite3, threading
-from typing import Tuple, Optional, Dict
-
-# ==============================================================================
-# CONSTANTS
-# ==============================================================================
-
-TOKEN_VERSION = "1"
-GRACE_SECONDS = 86400 * 7  # 7-day grace period after expiry before hard block
-AUDIT_DB = "sebdog_audit.db"
-
-# ==============================================================================
-# TOKEN GENERATION (runs on sebbi.pro server only)
-# The signing secret is an environment variable on Railway.
-# It never appears in any file that gets shipped to customers.
-# ==============================================================================
-
-def generate_token(api_key: str, devices: int, plan: str,
-                   email: str, secret: bytes,
-                   validity_days: int = 365) -> str:
-    """
-    Generate a cryptographically signed annual licence token.
-    Called by sebbi.pro when a customer requests an air-gapped licence.
-
-    Args:
-        api_key:       The customer's AILeash API key
-        devices:       Licensed device count
-        plan:          'free' or 'paid'
-        email:         Customer email
-        secret:        HMAC signing secret (from Railway env var)
-        validity_days: Token validity in days (default 365)
-
-    Returns:
-        Base64url-encoded signed token string
-    """
-    issued = int(time.time())
-    expires = issued + (validity_days * 86400)
-
-    payload = json.dumps({
-        "v": TOKEN_VERSION,
-        "key": api_key,
-        "devices": devices,
-        "plan": plan,
-        "email": email,
-        "issued": issued,
-        "expires": expires
-    }, sort_keys=True, separators=(',', ':'))
-
-    sig = hmac.new(secret, payload.encode('utf-8'), hashlib.sha256).hexdigest()
-
-    token_data = json.dumps({
-        "payload": payload,
-        "sig": sig
-    }, separators=(',', ':'))
-
-    return base64.urlsafe_b64encode(token_data.encode('utf-8')).decode('utf-8')
-
-
-# ==============================================================================
-# TOKEN VALIDATION (runs on customer hardware — no network required)
-# ==============================================================================
-
-def validate_token(token: str, secret: bytes) -> Tuple[Optional[Dict], Optional[str]]:
-    """
-    Validate a licence token entirely locally.
-    No network connection required.
-
-    Returns:
-        (licence_data, None) on success
-        (None, error_code) on failure
-
-    Error codes:
-        invalid_format      — token cannot be decoded
-        invalid_signature   — token has been tampered with
-        token_expired       — token is past expiry + grace period
-        version_mismatch    — token version not supported
-    """
-    try:
-        raw = json.loads(base64.urlsafe_b64decode(token.encode('utf-8')))
-        payload_str = raw.get("payload", "")
-        sig = raw.get("sig", "")
-    except Exception:
-        return None, "invalid_format"
-
-    # Constant-time HMAC comparison — prevents timing attacks
-    expected = hmac.new(secret, payload_str.encode('utf-8'), hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(sig, expected):
-        return None, "invalid_signature"
-
-    try:
-        data = json.loads(payload_str)
-    except Exception:
-        return None, "invalid_format"
-
-    if data.get("v") != TOKEN_VERSION:
-        return None, "version_mismatch"
-
-    # Apply grace period — token runs for 7 days past expiry
-    if data.get("expires", 0) + GRACE_SECONDS < time.time():
-        return None, "token_expired"
-
-    return data, None
-
-
-def is_in_grace_period(token_data: Dict) -> bool:
-    """Returns True if token is past expiry but within grace period."""
-    return token_data.get("expires", 0) < time.time()
-
-
-def days_until_expiry(token_data: Dict) -> int:
-    """Returns days remaining until token expiry (negative if expired)."""
-    return int((token_data.get("expires", 0) - time.time()) / 86400)
-
-
-# ==============================================================================
-# LOCAL LICENCE STORE
-# Caches the validated token locally so validation survives restarts.
-# Everything stays on the customer's own hardware.
-# ==============================================================================
-
-_lock = threading.Lock()
-
-
-def save_licence_locally(db_path: str, token: str, licence_data: Dict):
-    """Cache the validated licence in the local audit database."""
-    with _lock:
-        conn = sqlite3.connect(db_path)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS licence_cache (
-                id INTEGER PRIMARY KEY,
-                token TEXT,
-                api_key TEXT,
-                devices INTEGER,
-                plan TEXT,
-                email TEXT,
-                issued INTEGER,
-                expires INTEGER,
-                cached_at REAL
-            )
-        """)
-        conn.execute("DELETE FROM licence_cache")  # Only one licence at a time
-        conn.execute("""
-            INSERT INTO licence_cache
-            (token, api_key, devices, plan, email, issued, expires, cached_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            token,
-            licence_data.get("key", ""),
-            licence_data.get("devices", 1),
-            licence_data.get("plan", "free"),
-            licence_data.get("email", ""),
-            licence_data.get("issued", 0),
-            licence_data.get("expires", 0),
-            time.time()
-        ))
-        conn.commit()
-        conn.close()
-
-
-def load_licence_locally(db_path: str) -> Optional[Tuple[str, Dict]]:
-    """Load a cached licence from the local database."""
-    try:
-        with _lock:
-            conn = sqlite3.connect(db_path)
-            row = conn.execute(
-                "SELECT token, api_key, devices, plan, email, issued, expires "
-                "FROM licence_cache LIMIT 1"
-            ).fetchone()
-            conn.close()
-        if not row:
-            return None
-        token, api_key, devices, plan, email, issued, expires = row
-        data = {
-            "v": TOKEN_VERSION,
-            "key": api_key,
-            "devices": devices,
-            "plan": plan,
-            "email": email,
-            "issued": issued,
-            "expires": expires
-        }
-        return token, data
-    except Exception:
-        return None
-
-
-# ==============================================================================
-# STRESS TEST
-# Run with: python sebdog_licence.py
-# ==============================================================================
-
-if __name__ == "__main__":
-    import sys
-
-    print("SEBDOG LICENCE SYSTEM — Stress Test")
-    print("=" * 60)
-
-    # Generate a test secret (on sebbi.pro this comes from Railway env vars)
-    SECRET = secrets.token_bytes(32)
-    TEST_KEY = "al_live_" + secrets.token_hex(24)
-    PASSES = 0
-    FAILURES = 0
-
-    def check(name, condition, detail=""):
-        global PASSES, FAILURES
-        if condition:
-            print(f"  PASS  {name}")
-            PASSES += 1
-        else:
-            print(f"  FAIL  {name} {detail}")
-            FAILURES += 1
-
-    # --- Basic validity ---
-    print("\n[1] Basic token generation and validation")
-    token = generate_token(TEST_KEY, 10000, "paid", "test@example.com", SECRET)
-    data, err = validate_token(token, SECRET)
-    check("Valid token accepted", err is None)
-    check("API key preserved", data and data.get("key") == TEST_KEY)
-    check("Device count preserved", data and data.get("devices") == 10000)
-    check("Plan preserved", data and data.get("plan") == "paid")
-    check("Not in grace period", data and not is_in_grace_period(data))
-    check("Days until expiry > 360", data and days_until_expiry(data) > 360)
-
-    # --- Tamper detection ---
-    print("\n[2] Tamper detection")
-    raw = json.loads(base64.urlsafe_b64decode(token))
-    raw["payload"] = raw["payload"].replace("10000", "99999")
-    bad_token = base64.urlsafe_b64encode(json.dumps(raw, separators=(',',':')).encode()).decode()
-    _, err = validate_token(bad_token, SECRET)
-    check("Tampered device count rejected", err == "invalid_signature")
-
-    raw2 = json.loads(base64.urlsafe_b64decode(token))
-    raw2["payload"] = raw2["payload"].replace("paid", "enterprise")
-    bad_token2 = base64.urlsafe_b64encode(json.dumps(raw2, separators=(',',':')).encode()).decode()
-    _, err = validate_token(bad_token2, SECRET)
-    check("Tampered plan rejected", err == "invalid_signature")
-
-    raw3 = json.loads(base64.urlsafe_b64decode(token))
-    raw3["sig"] = "0" * 64
-    bad_token3 = base64.urlsafe_b64encode(json.dumps(raw3, separators=(',',':')).encode()).decode()
-    _, err = validate_token(bad_token3, SECRET)
-    check("Zeroed signature rejected", err == "invalid_signature")
-
-    # --- Expiry ---
-    print("\n[3] Expiry handling")
-    expired = generate_token(TEST_KEY, 100, "paid", "test@example.com", SECRET, validity_days=-1)
-    data_exp, err = validate_token(expired, SECRET)
-    check("Recently expired token in grace period", err is None and data_exp is not None)
-    check("Grace period detected", data_exp and is_in_grace_period(data_exp))
-
-    hard_expired = generate_token(TEST_KEY, 100, "paid", "test@example.com", SECRET, validity_days=-9)
-    _, err = validate_token(hard_expired, SECRET)
-    check("Hard expired token rejected", err == "token_expired")
-
-    # --- Wrong secret ---
-    print("\n[4] Secret validation")
-    wrong = secrets.token_bytes(32)
-    _, err = validate_token(token, wrong)
-    check("Wrong secret rejected", err == "invalid_signature")
-
-    almost_right = bytearray(SECRET)
-    almost_right[0] ^= 1
-    _, err = validate_token(token, bytes(almost_right))
-    check("One-bit-flipped secret rejected", err == "invalid_signature")
-
-    # --- Malformed tokens ---
-    print("\n[5] Malformed input handling")
-    _, err = validate_token("notbase64!!!", SECRET)
-    check("Garbage input rejected", err is not None)
-    _, err = validate_token("", SECRET)
-    check("Empty token rejected", err is not None)
-    _, err = validate_token(base64.urlsafe_b64encode(b"{}").decode(), SECRET)
-    check("Empty JSON rejected", err is not None)
-
-    # --- Local caching ---
-    print("\n[6] Local licence caching")
-    import tempfile, os
-    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
-        test_db = f.name
-    try:
-        data_valid, _ = validate_token(token, SECRET)
-        save_licence_locally(test_db, token, data_valid)
-        cached = load_licence_locally(test_db)
-        check("Licence saved and retrieved", cached is not None)
-        check("Cached key matches", cached and cached[1].get("key") == TEST_KEY)
-        check("Cached devices match", cached and cached[1].get("devices") == 10000)
-    finally:
-        os.unlink(test_db)
-
-    # --- Performance ---
-    print("\n[7] Performance")
-    import timeit
-    gen_time = timeit.timeit(
-        lambda: generate_token(TEST_KEY, 10000, "paid", "test@example.com", SECRET),
-        number=1000
-    )
-    val_time = timeit.timeit(
-        lambda: validate_token(token, SECRET),
-        number=1000
-    )
-    check(f"Generation: {gen_time*1:.1f}ms avg per token", gen_time < 5)
-    check(f"Validation: {val_time*1:.1f}ms avg per validation", val_time < 5)
-
-    # --- Summary ---
-    print(f"\n{'='*60}")
-    print(f"Results: {PASSES} passed, {FAILURES} failed")
-    if FAILURES == 0:
-        print("ALL TESTS PASSED. System is production ready.")
-    else:
-        print("FAILURES DETECTED. Do not ship.")
-    sys.exit(0 if FAILURES == 0 else 1)
-
-```
-
-
-## `sebdog_reporter.py`
-
-217 lines, 8364 bytes
-
-```python
-"""
-SEBDOG DECISION REPORTER v1.0.0
-Generates readable reports from the sebdog audit chain.
-Shows exactly why each decision was made.
-Copyright (c) 2026 Justin Antony Dobson / Monop Content
-"""
-
-import sqlite3, json, time, os
-from datetime import datetime
-
-DB_FILE = "sebdog_audit.db"
-
-REASON_EXPLANATIONS = {
-    "velocity_spike": "User made more than 10 requests in 60 seconds",
-    "high_amount": "Transaction amount exceeded £500",
-    "risky_device": "Device risk score above 0.5",
-    "behaviour_anomaly": "Behavioural anomaly score above 0.5",
-    "country_shift": "Request came from a different country than usual",
-    "unsafe_country": "Request came from outside approved country list",
-    "low_trust": "User trust score has dropped below 0.4 due to previous decisions",
-}
-
-def get_decisions(db_path=DB_FILE, limit=100):
-    if not os.path.exists(db_path):
-        return []
-    conn = sqlite3.connect(db_path)
-    rows = conn.execute("""
-        SELECT ts, user_id, event_json, result_json, audit_hash
-        FROM audit_log
-        ORDER BY id DESC
-        LIMIT ?
-    """, (limit,)).fetchall()
-    conn.close()
-    results = []
-    for row in rows:
-        try:
-            event = json.loads(row[2])
-            result = json.loads(row[3])
-            results.append({
-                "ts": row[0],
-                "user_id": row[1],
-                "event": event,
-                "result": result,
-                "audit_hash": row[4]
-            })
-        except:
-            pass
-    return results
-
-def format_reason(reason):
-    return REASON_EXPLANATIONS.get(reason, reason.replace("_", " ").capitalize())
-
-def decision_color(decision):
-    return {"ALLOW": "#00875a", "CHALLENGE": "#b45309", "BLOCK": "#cc0000"}.get(decision, "#555")
-
-def generate_text_report(db_path=DB_FILE, limit=100):
-    decisions = get_decisions(db_path, limit)
-    if not decisions:
-        return "No decisions recorded yet."
-    
-    lines = [
-        "SEBDOG DECISION REPORT",
-        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        f"Total decisions shown: {len(decisions)}",
-        "=" * 60
-    ]
-    
-    for d in decisions:
-        result = d["result"]
-        event = d["event"]
-        ts = datetime.fromtimestamp(d["ts"]).strftime('%Y-%m-%d %H:%M:%S')
-        decision = result.get("decision", "?")
-        score = result.get("score", 0)
-        reasons = result.get("reasons", [])
-        
-        lines.append(f"\n[{ts}] User: {d['user_id']}")
-        lines.append(f"Action: {event.get('action','?')} | Country: {event.get('country','?')} | Amount: £{event.get('amount',0)}")
-        lines.append(f"Decision: {decision} | Score: {score} | Trust: {result.get('trust',0)}")
-        
-        if reasons:
-            lines.append("Reasons:")
-            for r in reasons:
-                lines.append(f"  - {format_reason(r)}")
-        else:
-            lines.append("Reasons: No risk factors detected")
-        
-        lines.append(f"Audit hash: {d['audit_hash'][:32]}...")
-        lines.append("-" * 60)
-    
-    return "\n".join(lines)
-
-def generate_json_report(db_path=DB_FILE, limit=100):
-    decisions = get_decisions(db_path, limit)
-    report = {
-        "generated": datetime.now().isoformat(),
-        "total": len(decisions),
-        "decisions": []
-    }
-    for d in decisions:
-        result = d["result"]
-        event = d["event"]
-        reasons = result.get("reasons", [])
-        report["decisions"].append({
-            "timestamp": datetime.fromtimestamp(d["ts"]).isoformat(),
-            "user_id": d["user_id"],
-            "action": event.get("action"),
-            "country": event.get("country"),
-            "amount": event.get("amount"),
-            "decision": result.get("decision"),
-            "score": result.get("score"),
-            "trust": result.get("trust"),
-            "reasons": reasons,
-            "reasons_explained": [format_reason(r) for r in reasons],
-            "audit_hash": d["audit_hash"]
-        })
-    return json.dumps(report, indent=2)
-
-def generate_html_report(db_path=DB_FILE, limit=100):
-    decisions = get_decisions(db_path, limit)
-    
-    rows = ""
-    for d in decisions:
-        result = d["result"]
-        event = d["event"]
-        ts = datetime.fromtimestamp(d["ts"]).strftime('%Y-%m-%d %H:%M:%S')
-        decision = result.get("decision", "?")
-        score = result.get("score", 0)
-        reasons = result.get("reasons", [])
-        color = decision_color(decision)
-        
-        reason_html = ""
-        if reasons:
-            reason_html = "<ul>" + "".join(f"<li>{format_reason(r)}</li>" for r in reasons) + "</ul>"
-        else:
-            reason_html = "<span style='color:#888'>No risk factors detected</span>"
-        
-        rows += f"""
-        <tr>
-            <td>{ts}</td>
-            <td><code>{d['user_id']}</code></td>
-            <td>{event.get('action','?')}</td>
-            <td>{event.get('country','?')}</td>
-            <td>£{event.get('amount',0)}</td>
-            <td><strong style="color:{color}">{decision}</strong></td>
-            <td>{score}</td>
-            <td>{result.get('trust',0)}</td>
-            <td>{reason_html}</td>
-            <td><code style="font-size:10px">{d['audit_hash'][:16]}...</code></td>
-        </tr>"""
-    
-    allow = sum(1 for d in decisions if d["result"].get("decision") == "ALLOW")
-    challenge = sum(1 for d in decisions if d["result"].get("decision") == "CHALLENGE")
-    block = sum(1 for d in decisions if d["result"].get("decision") == "BLOCK")
-    
-    html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Sebdog Decision Report</title>
-<style>
-body{{font-family:sans-serif;background:#f5f7fa;color:#1a202c;margin:0;padding:20px}}
-.header{{background:#0a0f1e;color:#fff;padding:24px 32px;border-radius:8px;margin-bottom:24px}}
-.header h1{{margin:0;font-size:24px;color:#c9a84c}}
-.header p{{margin:4px 0 0;color:rgba(255,255,255,0.5);font-size:13px}}
-.stats{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:24px}}
-.stat{{background:#fff;border-radius:8px;padding:16px;text-align:center;border:1px solid #e2e8f0}}
-.stat-n{{font-size:32px;font-weight:700}}
-.stat-l{{font-size:11px;color:#64748b;margin-top:4px}}
-.allow{{color:#00875a}}.challenge{{color:#b45309}}.block{{color:#cc0000}}
-table{{width:100%;border-collapse:collapse;background:#fff;border-radius:8px;overflow:hidden;border:1px solid #e2e8f0}}
-th{{background:#0a0f1e;color:#c9a84c;padding:10px 12px;text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:1px}}
-td{{padding:10px 12px;border-bottom:1px solid #e2e8f0;font-size:12px;vertical-align:top}}
-tr:last-child td{{border:none}}
-tr:hover td{{background:#f8fafc}}
-ul{{margin:4px 0;padding-left:16px}}
-li{{margin:2px 0;color:#64748b}}
-code{{background:#f1f5f9;padding:2px 4px;border-radius:3px;font-size:11px}}
-</style>
-</head>
-<body>
-<div class="header">
-  <h1>Sebdog Decision Report</h1>
-  <p>Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} &nbsp;|&nbsp; Showing last {len(decisions)} decisions &nbsp;|&nbsp; Powered by sebbi.pro</p>
-</div>
-<div class="stats">
-  <div class="stat"><div class="stat-n allow">{allow}</div><div class="stat-l">ALLOWED</div></div>
-  <div class="stat"><div class="stat-n challenge">{challenge}</div><div class="stat-l">CHALLENGED</div></div>
-  <div class="stat"><div class="stat-n block">{block}</div><div class="stat-l">BLOCKED</div></div>
-</div>
-<table>
-<thead><tr>
-  <th>Time</th><th>User</th><th>Action</th><th>Country</th><th>Amount</th>
-  <th>Decision</th><th>Score</th><th>Trust</th><th>Reasons</th><th>Audit Hash</th>
-</tr></thead>
-<tbody>{rows if rows else '<tr><td colspan="10" style="text-align:center;color:#888;padding:32px">No decisions recorded yet</td></tr>'}</tbody>
-</table>
-</body>
-</html>"""
-    return html
-
-if __name__ == "__main__":
-    import sys
-    fmt = sys.argv[1] if len(sys.argv) > 1 else "html"
-    db = sys.argv[2] if len(sys.argv) > 2 else DB_FILE
-    
-    if fmt == "text":
-        print(generate_text_report(db))
-    elif fmt == "json":
-        print(generate_json_report(db))
-    else:
-        report = generate_html_report(db)
-        out = "sebdog_report.html"
-        with open(out, "w") as f:
-            f.write(report)
-        print(f"Report saved to {out}")
-
-```
+- `ai-txt-kit.html`
+- `aitxt-popup-live.html`
 
 
 ## `tests/attack_continuity_1.py`
@@ -2391,6 +1826,273 @@ function downloadIt(){
   document.body.removeChild(a); URL.revokeObjectURL(url);
 }
 </script>
+</body>
+</html>
+
+```
+
+
+## `ai-txt-kit.html`
+
+86 lines, 6554 bytes
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#0a0f1e">
+<title>ai.txt Starter Kit &mdash; publish AI governance free in 5 minutes</title>
+<meta name="description" content="Publish an ai.txt on your own domain, free. Copy the template, add the badge, make it provable. No key, no account.">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0a0f1e;color:#e8e8f0;line-height:1.6}
+.mono{font-family:"JetBrains Mono",ui-monospace,Menlo,monospace}
+nav{position:sticky;top:0;z-index:10;background:rgba(10,15,30,.94);backdrop-filter:blur(10px);border-bottom:1px solid #1e2a45;padding:0 20px;height:54px;display:flex;align-items:center;justify-content:space-between}
+nav a.logo{display:flex;align-items:center;gap:8px;color:#c9a84c;text-decoration:none;font-family:"JetBrains Mono",monospace;font-size:13px}
+nav .links a{color:#8a90a6;text-decoration:none;font-size:13px;margin-left:16px}
+.wrap{max-width:760px;margin:0 auto;padding:44px 20px 90px}
+.eyebrow{font-family:"JetBrains Mono",monospace;font-size:11px;letter-spacing:3px;text-transform:uppercase;color:#c9a84c;margin-bottom:12px}
+h1{font-size:34px;font-weight:800;letter-spacing:-.02em;line-height:1.1;margin-bottom:14px}
+h1 span{color:#c9a84c}
+.lede{color:#8a90a6;font-size:16px;margin-bottom:8px}
+.free{display:inline-block;background:rgba(0,229,160,.1);border:1px solid #00b87d;color:#7fe3b0;font-family:"JetBrains Mono",monospace;font-size:12px;padding:5px 12px;border-radius:5px;margin:14px 0 30px}
+h2{font-size:20px;font-weight:700;margin:40px 0 8px;padding-top:26px;border-top:1px solid #1e2a45}
+.step-n{font-family:"JetBrains Mono",monospace;color:#c9a84c;font-size:13px}
+p{color:#8a90a6;margin-bottom:14px}
+p b{color:#e8e8f0}
+.box{background:#0b1226;border:1px solid #1e2a45;border-radius:10px;padding:18px;margin:16px 0;font-family:"JetBrains Mono",monospace;font-size:12.5px;color:#7fe3b0;white-space:pre-wrap;word-break:break-word;line-height:1.8;overflow-x:auto}
+.btn{display:inline-flex;align-items:center;gap:8px;background:#c9a84c;color:#0a0f1e;padding:12px 22px;border-radius:8px;font-weight:800;font-size:14px;text-decoration:none;border:none;cursor:pointer;font-family:inherit}
+.btn.ghost{background:transparent;border:1px solid #2a3350;color:#e8e8f0}
+.btnrow{display:flex;gap:10px;flex-wrap:wrap;margin:16px 0}
+.badge-demo{display:inline-flex;align-items:center;gap:8px;background:#111a30;border:1px solid #c9a84c;border-radius:8px;padding:8px 14px;font-family:"JetBrains Mono",monospace;font-size:12px;color:#c9a84c;text-decoration:none}
+.badge-demo svg{flex-shrink:0}
+.onramp{background:linear-gradient(135deg,rgba(0,229,160,.06),rgba(201,168,76,.05));border:1px solid #00b87d;border-radius:12px;padding:24px;margin-top:30px}
+.onramp h3{color:#7fe3b0;font-size:16px;margin-bottom:8px}
+.onramp p{color:#a9b0c4}
+.copied{color:#7fe3b0;font-size:12px;margin-left:10px;opacity:0;transition:opacity .2s}
+.copied.show{opacity:1}
+footer{border-top:1px solid #1e2a45;padding:26px 20px;text-align:center;color:#5a6178;font-size:12px}
+footer a{color:#c9a84c;text-decoration:none}
+</style>
+</head>
+<body>
+<nav>
+  <a class="logo" href="/"><svg width="18" height="18" viewBox="0 0 32 32"><circle cx="16" cy="16" r="13.5" fill="none" stroke="#c9a84c" stroke-width="2.6" stroke-dasharray="66 20" stroke-linecap="round" transform="rotate(-50 16 16)"/><circle cx="26.5" cy="7" r="3.1" fill="#c9a84c"/></svg>AILeash</a>
+  <div class="links"><a href="/ai.txt">Spec</a><a href="/whitepaper">Whitepaper</a></div>
+</nav>
+<div class="wrap">
+  <div class="eyebrow">// ai.txt starter kit</div>
+  <h1>Publish AI governance on your own site. <span>Free.</span></h1>
+  <p class="lede">ai.txt is the robots.txt of AI governance: one small file at your domain root that declares how your AI is governed and where anyone can verify it. Here is everything you need to publish one in about five minutes.</p>
+  <div class="free">FREE STANDARD &middot; NO KEY &middot; NO ACCOUNT &middot; NO PERMISSION</div>
+
+  <h2><span class="step-n">01 /</span> Grab the template</h2>
+  <p>A ready-to-fill ai.txt with every line commented. Download it, or read the live example on our own domain.</p>
+  <div class="btnrow">
+    <a class="btn" href="/ai-txt-template.txt" download="ai.txt">&#8681; Download template</a>
+    <a class="btn ghost" href="/ai.txt" target="_blank">Read a live example</a>
+  </div>
+
+  <h2><span class="step-n">02 /</span> Fill it in and publish</h2>
+  <p>Replace the example values with your own facts. <b>Delete any line you cannot back with a real verify endpoint</b> &mdash; an honest short ai.txt beats an aspirational long one. Then upload it to the root of your domain so it lives at:</p>
+  <div class="box">https://yourdomain.com/ai.txt</div>
+  <p>That is the whole spec. One file, at the root, readable by anyone &mdash; a regulator, a partner, or another machine deciding whether to trust you.</p>
+
+  <h2><span class="step-n">03 /</span> Add the badge</h2>
+  <p>Show visitors and crawlers that you have declared your AI governance. Copy this HTML onto your site &mdash; it renders a small badge linking to your ai.txt:</p>
+  <p>Preview:</p>
+  <a class="badge-demo" href="/ai.txt"><svg width="14" height="14" viewBox="0 0 32 32"><circle cx="16" cy="16" r="13.5" fill="none" stroke="#c9a84c" stroke-width="3" stroke-dasharray="66 20" stroke-linecap="round" transform="rotate(-50 16 16)"/><circle cx="26.5" cy="7" r="3.4" fill="#c9a84c"/></svg>AI-Governed &middot; ai.txt</a>
+  <div class="box" id="badge">&lt;a href="/ai.txt" style="display:inline-flex;align-items:center;gap:6px;font-family:monospace;font-size:12px;color:#c9a84c;text-decoration:none;border:1px solid #c9a84c;border-radius:6px;padding:6px 10px"&gt;AI-Governed &middot; ai.txt&lt;/a&gt;</div>
+  <button class="btn ghost" onclick="copyBadge()">Copy badge HTML<span class="copied" id="cp">copied</span></button>
+
+</div>
+</div>
+<footer>
+  ai.txt (AI-TXT/1.0) is a free, open standard by <a href="/">Monop Content</a> &middot; Blyth, UK &middot; <a href="/ai.txt">spec</a> &middot; <a href="/comply.txt">comply.txt</a>
+</footer>
+<script>
+function copyBadge(){
+  var t=document.getElementById('badge').textContent;
+  navigator.clipboard.writeText(t).then(function(){
+    var c=document.getElementById('cp');c.classList.add('show');setTimeout(function(){c.classList.remove('show')},1500);
+  });
+}
+</script>
+</body>
+</html>
+
+```
+
+
+## `aitxt-popup-live.html`
+
+165 lines, 7279 bytes
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ai.txt Live Compliance Widget — Preview</title>
+<style>
+  body{margin:0;background:#e8e6df;font-family:-apple-system,'Segoe UI',Roboto,sans-serif;min-height:100vh;}
+  .demo-note{position:fixed;top:16px;left:16px;right:16px;background:#fff;border:1px solid #ddd;border-radius:8px;padding:12px 16px;font-size:13px;color:#555;max-width:560px;margin:0 auto;text-align:center;z-index:2;}
+</style>
+</head>
+<body>
+<div class="demo-note">This page has no ai.txt, so the badge will honestly say "not found." Click it to see the real check running live.</div>
+
+<!-- ============================================================
+     THE DELIVERABLE: one script tag. Paste into any site.
+     On load, it actually fetches /ai.txt from that same domain
+     and reports the true result — nothing hardcoded, nothing faked.
+============================================================= -->
+<script>
+(function(){
+  var CSS = `
+    #aitxt-badge{
+      position:fixed;bottom:20px;right:20px;z-index:999998;
+      background:#0a0f1e;color:#8b93ac;border:1px solid #232c48;
+      font-family:'SF Mono','JetBrains Mono',Consolas,monospace;
+      font-size:12px;padding:10px 16px;border-radius:999px;cursor:pointer;
+      box-shadow:0 4px 18px rgba(0,0,0,.25);display:flex;align-items:center;gap:8px;
+      transition:transform .15s ease;
+    }
+    #aitxt-badge:hover{transform:translateY(-2px);}
+    #aitxt-badge .dot{width:7px;height:7px;border-radius:50%;background:#8b93ac;flex-shrink:0;transition:background .2s ease;}
+    #aitxt-badge .dot.ok{background:#7fe3b0;}
+    #aitxt-badge .dot.warn{background:#ff8a80;}
+    #aitxt-badge .dot.checking{background:#c9a84c;animation:aitxt-pulse 1s ease-in-out infinite;}
+    @keyframes aitxt-pulse{50%{opacity:.3;}}
+    #aitxt-overlay{
+      position:fixed;inset:0;background:rgba(10,15,30,.6);z-index:999999;
+      display:none;align-items:center;justify-content:center;padding:20px;
+    }
+    #aitxt-overlay.open{display:flex;}
+    #aitxt-modal{
+      background:#10182e;border:1px solid #232c48;border-radius:12px;
+      max-width:420px;width:100%;color:#e7ebf5;font-family:-apple-system,'Segoe UI',Roboto,sans-serif;
+      overflow:hidden;
+    }
+    #aitxt-modal .aitxt-head{padding:20px 22px 0;}
+    #aitxt-modal .aitxt-eyebrow{
+      font-family:'SF Mono',Consolas,monospace;font-size:11px;letter-spacing:.1em;
+      text-transform:uppercase;color:#c9a84c;margin-bottom:10px;
+    }
+    #aitxt-modal h3{margin:0 0 8px;font-size:19px;line-height:1.3;}
+    #aitxt-modal p{margin:0 0 18px;font-size:13.5px;line-height:1.55;color:#8b93ac;}
+    #aitxt-modal .aitxt-body{padding:0 22px 22px;}
+    #aitxt-modal .aitxt-status{
+      display:flex;align-items:center;gap:8px;padding:12px 14px;
+      background:#161f38;border:1px solid #232c48;border-radius:8px;margin-bottom:16px;
+      font-family:'SF Mono',Consolas,monospace;font-size:12px;
+    }
+    #aitxt-modal .aitxt-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;}
+    #aitxt-modal .aitxt-dot.ok{background:#7fe3b0;}
+    #aitxt-modal .aitxt-dot.warn{background:#ff8a80;}
+    #aitxt-modal .aitxt-dot.checking{background:#c9a84c;animation:aitxt-pulse 1s ease-in-out infinite;}
+    #aitxt-modal .aitxt-status.ok span.label{color:#7fe3b0;}
+    #aitxt-modal .aitxt-status.warn span.label{color:#ff8a80;}
+    #aitxt-modal .aitxt-status.checking span.label{color:#c9a84c;}
+    #aitxt-modal a.aitxt-cta{
+      display:block;text-align:center;background:#c9a84c;color:#0a0f1e;
+      font-weight:600;font-size:14px;padding:11px;border-radius:7px;
+      text-decoration:none;margin-bottom:10px;
+    }
+    #aitxt-modal button.aitxt-close{
+      display:block;width:100%;background:transparent;border:1px solid #232c48;
+      color:#8b93ac;font-size:13px;padding:10px;border-radius:7px;cursor:pointer;
+    }
+  `;
+  var style = document.createElement('style');
+  style.textContent = CSS;
+  document.head.appendChild(style);
+
+  var badge = document.createElement('div');
+  badge.id = 'aitxt-badge';
+  badge.innerHTML = '<span class="dot checking"></span><span class="label">Checking AI governance…</span>';
+  document.body.appendChild(badge);
+
+  var overlay = document.createElement('div');
+  overlay.id = 'aitxt-overlay';
+  overlay.innerHTML = `
+    <div id="aitxt-modal">
+      <div class="aitxt-head">
+        <div class="aitxt-eyebrow">ai.txt · sebbi.pro</div>
+        <h3>AI governance declaration</h3>
+        <p>ai.txt is a plain-text file — like robots.txt — that states how this site's AI systems are governed. This check looked for it at the domain root, live, just now.</p>
+      </div>
+      <div class="aitxt-body">
+        <div class="aitxt-status checking" id="aitxt-modal-status">
+          <span class="aitxt-dot checking"></span>
+          <span class="label">Checking…</span>
+        </div>
+        <a class="aitxt-cta" href="https://sebbi.pro" target="_blank" id="aitxt-cta">Generate ai.txt — free</a>
+        <button class="aitxt-close">Close</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+
+  var badgeDot = badge.querySelector('.dot');
+  var badgeLabel = badge.querySelector('.label');
+  var modalStatus = overlay.querySelector('#aitxt-modal-status');
+  var modalDot = modalStatus.querySelector('.aitxt-dot');
+  var modalLabel = modalStatus.querySelector('.label');
+  var cta = overlay.querySelector('#aitxt-cta');
+
+  function setState(state, text, modalText){
+    badgeDot.className = 'dot ' + state;
+    badgeLabel.textContent = text;
+    modalStatus.className = 'aitxt-status ' + state;
+    modalDot.className = 'aitxt-dot ' + state;
+    modalLabel.textContent = modalText;
+    if(state === 'ok'){
+      cta.textContent = 'View declaration';
+    } else {
+      cta.textContent = 'Generate ai.txt — free';
+    }
+  }
+
+  // The real check — looks for ai.txt on this exact page's own domain.
+  // Checks the standard /.well-known/ai.txt location first, then falls
+  // back to /ai.txt at root. Same-origin, no backend needed, and it
+  // can't be faked by hardcoding a result: it either finds the file or
+  // it doesn't.
+  function checkPath(path){
+    return fetch(path, {method:'GET', cache:'no-store'})
+      .then(function(res){ return res.ok ? path : null; })
+      .catch(function(){ return null; });
+  }
+
+  Promise.all([
+    checkPath('/.well-known/ai.txt'),
+    checkPath('/ai.txt')
+  ]).then(function(results){
+    var foundAt = results.find(function(p){ return p !== null; });
+    if(foundAt){
+      setState('ok', 'AI governance declared', 'ai.txt found at ' + foundAt);
+    } else {
+      setState('warn', 'No ai.txt found', 'No ai.txt file found at this domain');
+    }
+  });
+
+  badge.addEventListener('click', function(){ overlay.classList.add('open'); });
+  overlay.addEventListener('click', function(e){
+    if(e.target === overlay) overlay.classList.remove('open');
+  });
+  overlay.querySelector('.aitxt-close').addEventListener('click', function(){
+    overlay.classList.remove('open');
+  });
+})();
+</script>
+<!-- ============================================================
+     END OF SNIPPET
+============================================================= -->
+
 </body>
 </html>
 
