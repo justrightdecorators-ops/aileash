@@ -1,6 +1,9 @@
 # Codebase — part 7 of 18
 
 Contains:
+- `modules/selfcheck.py`
+- `modules/spec.py`
+- `modules/standard.py`
 - `modules/stats.py`
 - `modules/witness.py`
 - `Verify_ai.py`
@@ -8,9 +11,1236 @@ Contains:
 - `ai_safety_scanner.py`
 - `aigrade_insert.py`
 - `aileash_reporter.py`
-- `aileash_verify.py`
-- `anchor.py`
-- `board_auditor.py`
+
+
+## `modules/selfcheck.py`
+
+684 lines, 26871 bytes
+
+```python
+#!/usr/bin/env python3
+"""
+modules/selfcheck.py  -  the conformance runner, served as a page
+
+WHY THIS IS A MODULE AND NOT A FILE IN ROOT
+-------------------------------------------
+A plain .html in the repo root does not get served on this deployment, so
+the page ships inside the module and is served by the same runtime do_GET
+patch that console.py uses for /console and network.py uses for /witness.
+It also means the page cannot drift from the module that serves it.
+
+WHAT THE PAGE DOES
+------------------
+Reads /.well-known/ordering-test.json, then runs every check the document
+declares, in the order the document declares them. It discovers what it
+needs as it goes: a committed period from /x/complete/periods, a tree size
+from /x/consistency/root, a probe value that is not in the log.
+
+It reports four outcomes and is deliberately mean about which is which:
+
+  VERIFIED       the response was checked for what the claim requires -
+                 consecutive leaf indices for absence, a proof path for
+                 consistency, identical verdicts for reproducibility
+  INCONCLUSIVE   the endpoint answered but the semantics were not checked,
+                 or the route is POST-only, or the check is key-gated
+  FAILED         published as publicly demonstrable and the endpoint is
+                 not there. This is the number that matters
+  NOT SUPPORTED  the document does not claim it
+
+Reachable is not the same as verified, and this page never counts one as
+the other. A runner that only ever passes has not been tested.
+
+NOT A SHARED RUNNER
+-------------------
+It tests one side. The discovery document's runner field stays null until
+the checks are jointly agreed with the other mirror, and publishing this as
+though it were the agreed conformance test would claim something neither
+operator has earned. Served unlinked and noindex for that reason.
+
+    GET /self-check          the page
+    GET /x/selfcheck/status  what is installed
+"""
+
+import sys
+
+VERSION = "1.1"
+
+PUBLIC = {("GET", "status")}
+
+PAGE_PATHS = ("/self-check", "/self-check.html")
+
+_patched = [False]
+
+
+PAGE = r'''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Ordering test — self check</title>
+<style>
+  :root{
+    --ink:#0a0f1e;
+    --ink2:#10182e;
+    --line:#1e2942;
+    --gold:#c9a84c;
+    --ok:#7fe3b0;
+    --err:#ff8a80;
+    --warn:#e8c06a;
+    --mute:#6b7894;
+    --text:#dbe3f4;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    background:var(--ink);
+    color:var(--text);
+    font-family:var(--mono);
+    font-size:14px;
+    line-height:1.5;
+    -webkit-text-size-adjust:100%;
+  }
+  .wrap{max-width:760px;margin:0 auto;padding:20px 16px 80px}
+
+  header{border-bottom:1px solid var(--line);padding-bottom:18px;margin-bottom:22px}
+  .eyebrow{
+    font-size:11px;letter-spacing:.18em;text-transform:uppercase;
+    color:var(--gold);margin:0 0 8px
+  }
+  h1{font-size:22px;line-height:1.25;margin:0 0 10px;font-weight:600;letter-spacing:-.01em}
+  .sub{color:var(--mute);font-size:13px;margin:0}
+  .sub b{color:var(--text);font-weight:600}
+
+  .bar{display:flex;gap:10px;flex-wrap:wrap;margin:18px 0 0}
+  button{
+    font-family:var(--mono);font-size:13px;
+    background:var(--gold);color:#10121a;border:0;border-radius:2px;
+    padding:11px 18px;font-weight:700;letter-spacing:.02em;cursor:pointer;
+  }
+  button.ghost{background:transparent;color:var(--text);border:1px solid var(--line);font-weight:400}
+  button:disabled{opacity:.4;cursor:default}
+  button:focus-visible{outline:2px solid var(--gold);outline-offset:2px}
+
+  .tally{
+    display:flex;gap:14px;flex-wrap:wrap;margin:20px 0 0;
+    font-size:12px;color:var(--mute)
+  }
+  .tally b{font-size:20px;display:block;font-weight:600;letter-spacing:-.02em}
+  .t-pass b{color:var(--ok)} .t-fail b{color:var(--err)}
+  .t-inc b{color:var(--warn)} .t-ns b{color:var(--mute)}
+
+  /* the spine: checks hold the order the document declares */
+  ol.spine{list-style:none;margin:26px 0 0;padding:0;position:relative}
+  ol.spine:before{
+    content:"";position:absolute;left:19px;top:6px;bottom:6px;width:1px;
+    background:var(--line)
+  }
+  li.check{position:relative;padding:0 0 2px 52px;margin:0 0 2px}
+  .slot{
+    position:absolute;left:0;top:12px;width:39px;height:22px;
+    display:flex;align-items:center;justify-content:center;
+    background:var(--ink);color:var(--mute);
+    font-size:11px;letter-spacing:.08em;z-index:1
+  }
+  .row{
+    border-bottom:1px solid var(--line);
+    padding:12px 0 13px;
+    display:flex;align-items:baseline;gap:10px;flex-wrap:wrap
+  }
+  .name{font-size:14px;font-weight:600;letter-spacing:-.01em}
+  .verdict{
+    font-size:10px;letter-spacing:.14em;text-transform:uppercase;
+    padding:3px 7px;border:1px solid currentColor;border-radius:2px;white-space:nowrap
+  }
+  .v-pass{color:var(--ok)} .v-fail{color:var(--err)}
+  .v-inc{color:var(--warn)} .v-ns{color:var(--mute)}
+  .v-run{color:var(--gold)}
+  .v-wait{color:var(--line)}
+  .why{flex-basis:100%;color:var(--mute);font-size:12.5px;margin-top:2px}
+  .why b{color:var(--text);font-weight:600}
+  .ep{
+    flex-basis:100%;font-size:11.5px;color:var(--mute);
+    margin-top:5px;word-break:break-all
+  }
+  .ep a{color:var(--gold);text-decoration:none;border-bottom:1px solid rgba(201,168,76,.35)}
+  details{flex-basis:100%;margin-top:8px}
+  summary{
+    font-size:11px;letter-spacing:.1em;text-transform:uppercase;
+    color:var(--mute);cursor:pointer;list-style:none
+  }
+  summary::-webkit-details-marker{display:none}
+  summary:before{content:"▸ ";}
+  details[open] summary:before{content:"▾ ";}
+  pre{
+    background:var(--ink2);border:1px solid var(--line);border-radius:2px;
+    margin:8px 0 0;padding:10px;font-size:11.5px;line-height:1.45;
+    white-space:pre-wrap;word-break:break-word;max-height:280px;overflow:auto
+  }
+  li.check.done .slot{color:var(--text)}
+
+  footer{
+    margin-top:34px;border-top:1px solid var(--line);padding-top:16px;
+    color:var(--mute);font-size:12px
+  }
+  footer p{margin:0 0 9px}
+  .flash{
+    border:1px solid var(--err);color:var(--err);
+    padding:11px;border-radius:2px;margin:16px 0 0;font-size:12.5px
+  }
+  @media (prefers-reduced-motion: no-preference){
+    li.check.done .row{animation:in .22s ease-out}
+    @keyframes in{from{opacity:.35}to{opacity:1}}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <p class="eyebrow">Ordering test · self check</p>
+  <h1>Run every check this domain publishes about itself.</h1>
+  <p class="sub">Reads <b>/.well-known/ordering-test.json</b>, then tests each check in the order the document declares it. Nothing here is a shared runner — it only tests this side.</p>
+  <div class="bar">
+    <button id="run">Run all checks</button>
+    <button id="reload" class="ghost">Reload document</button>
+  </div>
+  <div class="tally" id="tally" hidden>
+    <div class="t-pass"><b id="n-pass">0</b>verified</div>
+    <div class="t-fail"><b id="n-fail">0</b>failed</div>
+    <div class="t-inc"><b id="n-inc">0</b>inconclusive</div>
+    <div class="t-ns"><b id="n-ns">0</b>not public</div>
+  </div>
+  <div id="flash"></div>
+</header>
+
+<ol class="spine" id="spine"></ol>
+
+<footer>
+  <p><b>Verified</b> means the response was checked for what the claim actually requires. <b>Reachable</b> means the endpoint answered but this runner did not confirm the semantics — reported as inconclusive, not as a pass.</p>
+  <p>A check marked not publicly demonstrable is reported as such and never counted as a pass. This page cannot see behind a key and does not pretend to.</p>
+</footer>
+
+</div>
+
+<script>
+(function(){
+  "use strict";
+
+  var DOC = "/.well-known/ordering-test.json";
+  var doc = null;
+  var ctx = {};
+
+  var el = function(id){ return document.getElementById(id); };
+  var spine = el("spine");
+
+  function flash(msg){
+    el("flash").innerHTML = msg ? '<div class="flash">' + msg + '</div>' : '';
+  }
+
+  function pad(n){ return (n < 10 ? "0" : "") + n; }
+
+  function jget(path){
+    return fetch(path, {headers:{"Accept":"application/json"}}).then(function(r){
+      return r.text().then(function(t){
+        var body;
+        try { body = JSON.parse(t); } catch(e){ body = t; }
+        return {status:r.status, ok:r.ok, body:body};
+      });
+    });
+  }
+
+  function jpost(path, payload){
+    return fetch(path, {
+      method:"POST",
+      headers:{"Content-Type":"application/json","Accept":"application/json"},
+      body:JSON.stringify(payload)
+    }).then(function(r){
+      return r.text().then(function(t){
+        var body;
+        try { body = JSON.parse(t); } catch(e){ body = t; }
+        return {status:r.status, ok:r.ok, body:body};
+      });
+    });
+  }
+
+  function show(v){
+    try { return JSON.stringify(v, null, 2); } catch(e){ return String(v); }
+  }
+
+  // ---- document ---------------------------------------------------------
+
+  function loadDoc(){
+    flash("");
+    spine.innerHTML = "";
+    el("tally").hidden = true;
+    return jget(DOC).then(function(r){
+      if (!r.ok || typeof r.body !== "object"){
+        flash("Could not read " + DOC + " — status " + r.status +
+              ". If this is a fresh deploy, open /x/standard/status once to install the route, then reload.");
+        doc = null;
+        return null;
+      }
+      doc = r.body;
+      draw();
+      return doc;
+    }).catch(function(e){
+      flash("Request failed: " + e.message + ". Serve this page from the same domain as the document.");
+    });
+  }
+
+  function draw(){
+    var names = Object.keys(doc.checks || {});
+    spine.innerHTML = "";
+    names.forEach(function(name, i){
+      var c = doc.checks[name];
+      var li = document.createElement("li");
+      li.className = "check";
+      li.id = "chk-" + name;
+      li.innerHTML =
+        '<span class="slot">' + pad(i+1) + '</span>' +
+        '<div class="row">' +
+          '<span class="name">' + name.replace(/_/g," ") + '</span>' +
+          '<span class="verdict v-wait" data-v>waiting</span>' +
+          '<div class="why" data-why>' +
+            (c.supported ? "declared supported" : "declared not supported") +
+            (c.demonstrable_publicly ? ", publicly demonstrable" : ", not publicly demonstrable") +
+          '</div>' +
+          (c.endpoint ? '<div class="ep">' + c.endpoint + '</div>' : '') +
+        '</div>';
+      spine.appendChild(li);
+    });
+    var t = doc.vendor ? doc.vendor : "this domain";
+    document.querySelector(".sub").innerHTML =
+      'Document loaded from <b>' + (doc.base_url || location.origin) + '</b> · vendor <b>' + t +
+      '</b> · version <b>' + (doc.ordering_test_version || "?") + '</b> · ' +
+      names.length + ' checks declared.';
+  }
+
+  function setResult(name, verdict, why, detail){
+    var li = el("chk-" + name);
+    if (!li) return;
+    li.classList.add("done");
+    var v = li.querySelector("[data-v]");
+    var map = {PASS:"v-pass", FAIL:"v-fail", INCONCLUSIVE:"v-inc", "NOT SUPPORTED":"v-ns", RUNNING:"v-run"};
+    v.className = "verdict " + (map[verdict] || "v-wait");
+    v.textContent = verdict;
+    li.querySelector("[data-why]").innerHTML = why;
+    if (detail !== undefined){
+      var old = li.querySelector("details");
+      if (old) old.remove();
+      var d = document.createElement("details");
+      d.innerHTML = "<summary>response</summary><pre>" +
+        show(detail).replace(/</g,"&lt;") + "</pre>";
+      li.querySelector(".row").appendChild(d);
+    }
+  }
+
+  function running(name){
+    var li = el("chk-" + name);
+    if (!li) return;
+    var v = li.querySelector("[data-v]");
+    v.className = "verdict v-run";
+    v.textContent = "running";
+  }
+
+  // ---- context the checks need before they can run ----------------------
+
+  function buildContext(){
+    ctx = {};
+    var jobs = [];
+
+    jobs.push(jget("/x/complete/periods").then(function(r){
+      if (!r.ok || typeof r.body !== "object") return;
+      var list = r.body.periods || r.body.committed || r.body;
+      if (!Array.isArray(list)) return;
+      for (var i = list.length - 1; i >= 0; i--){
+        var p = list[i];
+        var id = (typeof p === "string") ? p : (p.period || p.id);
+        var committed = (typeof p === "string") ? true :
+          (p.committed === undefined ? true : !!p.committed);
+        if (id && committed){ ctx.period = id; break; }
+      }
+    }).catch(function(){}));
+
+    jobs.push(jget("/x/consistency/root").then(function(r){
+      if (!r.ok || typeof r.body !== "object") return;
+      ctx.size = r.body.size || r.body.tree_size || r.body.count;
+    }).catch(function(){}));
+
+    var hex = "0123456789abcdef";
+    ctx.absent = "";
+    for (var i = 0; i < 64; i++) ctx.absent += hex[Math.floor(Math.random() * 16)];
+
+    return Promise.all(jobs);
+  }
+
+  function fill(endpoint){
+    if (!endpoint) return null;
+    return endpoint
+      .replace("{period}", ctx.period || "")
+      .replace("{value}", ctx.absent)
+      .replace("{first}", "1")
+      .replace("{second}", ctx.size ? String(ctx.size) : "");
+  }
+
+  // ---- the checks -------------------------------------------------------
+  // Each returns {verdict, why, detail}.
+
+  var runners = {
+
+    mutual_witnessing: function(c){
+      return jget("/x/witness/peers").then(function(p){
+        return jget("/x/witness/tip").then(function(t){
+          if (!p.ok) return {verdict:"FAIL", why:"peers endpoint returned " + p.status, detail:p.body};
+          if (!t.ok) return {verdict:"FAIL", why:"tip endpoint returned " + t.status, detail:t.body};
+          var peers = p.body.peers || p.body;
+          var n = Array.isArray(peers) ? peers.length : 0;
+          if (n === 0){
+            return {verdict:"FAIL", why:"no peer chains listed — witnessing claims an external party and there isn't one", detail:p.body};
+          }
+          return {verdict:"PASS",
+                  why:"<b>" + n + " peer chain" + (n>1?"s":"") + "</b> listed and a current tip served, both without an account",
+                  detail:{peers:p.body, tip:t.body}};
+        });
+      });
+    },
+
+    completeness_proof: function(c){
+      if (!ctx.period){
+        return Promise.resolve({verdict:"INCONCLUSIVE",
+          why:"no closed committed period found at /x/complete/periods, so there is nothing to ask for a root of"});
+      }
+      var url = fill(c.endpoint) || ("/x/complete/root?period=" + ctx.period);
+      return jget(url).then(function(r){
+        if (r.status === 409) return {verdict:"INCONCLUSIVE", why:"period " + ctx.period + " is still live — only closed periods commit", detail:r.body};
+        if (!r.ok) return {verdict:"FAIL", why:"returned " + r.status, detail:r.body};
+        var root = r.body.root || r.body.merkle_root;
+        var count = r.body.count !== undefined ? r.body.count : r.body.leaf_count;
+        if (!root || count === undefined){
+          return {verdict:"INCONCLUSIVE", why:"reachable, but no root and exact leaf count in the response", detail:r.body};
+        }
+        return {verdict:"PASS",
+                why:"root and an exact count of <b>" + count + "</b> leaves, committed for " + ctx.period + " before any export was asked for",
+                detail:r.body};
+      });
+    },
+
+    absence_proof: function(c){
+      if (!ctx.period){
+        return Promise.resolve({verdict:"INCONCLUSIVE",
+          why:"no committed period, so there is nothing to prove absence against"});
+      }
+      var url = fill(c.endpoint) ||
+        ("/x/complete/prove?period=" + ctx.period + "&value=" + ctx.absent);
+      return jget(url).then(function(r){
+        if (!r.ok) return {verdict:"FAIL", why:"returned " + r.status, detail:r.body};
+        var n = (r.body && r.body.neighbours) || (r.body && r.body.neighbors) || {};
+        if (n.lower && n.upper &&
+            n.lower.index !== undefined && n.upper.index !== undefined){
+          if (n.upper.index - n.lower.index === 1){
+            return {verdict:"PASS",
+                    why:"neighbours at indices <b>" + n.lower.index + "</b> and <b>" +
+                        n.upper.index + "</b> \u2014 consecutive, so nothing can sit between " +
+                        "them. Absence proved, not asserted",
+                    detail:r.body};
+          }
+          return {verdict:"FAIL",
+                  why:"neighbour indices " + n.lower.index + " and " + n.upper.index +
+                      " are not consecutive \u2014 that proves nothing",
+                  detail:r.body};
+        }
+        if (n.lower || n.upper){
+          return {verdict:"INCONCLUSIVE",
+                  why:"boundary case \u2014 the probe sorted outside the whole set, so only one " +
+                      "neighbour came back. Valid, but it does not exercise the adjacency argument",
+                  detail:r.body};
+        }
+        return {verdict:"INCONCLUSIVE", why:"no neighbours in the response", detail:r.body};
+      });
+    },
+
+    consistency_proof: function(c){
+      if (!ctx.size){
+        return Promise.resolve({verdict:"INCONCLUSIVE", why:"could not read a tree size from /x/consistency/root"});
+      }
+      var first = Math.max(1, Math.floor(ctx.size / 2));
+      var url = "/x/consistency/proof?first=" + first + "&second=" + ctx.size;
+      return jget(url).then(function(r){
+        if (!r.ok) return {verdict:"FAIL", why:"returned " + r.status + " for first=" + first + " second=" + ctx.size, detail:r.body};
+        var path = r.body.proof || r.body.path || r.body.consistency;
+        if (!Array.isArray(path)){
+          return {verdict:"INCONCLUSIVE", why:"reachable, but no proof path in the response", detail:r.body};
+        }
+        return {verdict:"PASS",
+                why:"RFC 6962 proof of <b>" + path.length + " nodes</b> that the log at " + first +
+                    " is a prefix of the log at " + ctx.size + " — append-only shown, not claimed",
+                detail:r.body};
+      });
+    },
+
+    reproducibility: function(c){
+      var probe = {amount: 4200, velocity_1h: 3, velocity_24h: 11, country: "GB"};
+      return jget("/x/replay/fingerprint").then(function(f){
+        return jpost("/x/replay/challenge", probe).then(function(a){
+          if (a.status === 400 || a.status === 422){
+            return {verdict:"INCONCLUSIVE",
+                    why:"endpoint live but rejected this runner's payload shape — read the message and adjust the probe",
+                    detail:{fingerprint:f.body, rejected:a.body}};
+          }
+          if (!a.ok) return {verdict:"FAIL", why:"challenge returned " + a.status, detail:a.body};
+          return jpost("/x/replay/challenge", probe).then(function(b){
+            var va = (a.body && (a.body.verdict || a.body.decision));
+            var vb = (b.body && (b.body.verdict || b.body.decision));
+            if (!va || !vb){
+              return {verdict:"INCONCLUSIVE", why:"both runs sealed but no verdict field to compare", detail:{first:a.body, second:b.body}};
+            }
+            if (va === vb){
+              return {verdict:"PASS",
+                      why:"identical inputs submitted twice both returned <b>" + va +
+                          "</b> under one code fingerprint — determinism shown without disclosing any scoring logic",
+                      detail:{fingerprint:f.body, first:a.body, second:b.body}};
+            }
+            return {verdict:"FAIL",
+                    why:"identical inputs gave <b>" + va + "</b> then <b>" + vb + "</b> — not deterministic",
+                    detail:{first:a.body, second:b.body}};
+          });
+        });
+      });
+    },
+
+    external_anchoring: function(c){
+      var url = c.endpoint || "/api/anchor-status";
+      return jget(url).then(function(r){
+        if (!r.ok){
+          return {verdict:"FAIL",
+                  why:"<b>" + url + " returned " + r.status + "</b> — this check is published as publicly demonstrable and the endpoint under it is not there",
+                  detail:r.body};
+        }
+        return {verdict:"INCONCLUSIVE",
+                why:"endpoint answers, but this runner does not verify the external authority itself — check the named timestamp by hand",
+                detail:r.body};
+      });
+    }
+  };
+
+  // generic fallback: liveness only, reported honestly as inconclusive
+  function genericRunner(name, c){
+    var url = fill(c.endpoint);
+    if (!url) return Promise.resolve({verdict:"INCONCLUSIVE", why:"declared publicly demonstrable but no endpoint given"});
+    if (url.indexOf("{") !== -1){
+      return Promise.resolve({verdict:"INCONCLUSIVE", why:"endpoint has a placeholder this runner could not fill: " + url});
+    }
+    return jget(url).then(function(r){
+      var b = r.body || {};
+      // This router answers a method mismatch with 404 unknown_action and
+      // lists the methods it does accept. A POST-only route is present, not
+      // missing, and calling it missing would be a false failure.
+      var postOnly = (b.error === "unknown_action") && Array.isArray(b.POST) &&
+                     (b.POST.indexOf(url.split("?")[0].split("/").pop()) !== -1 ||
+                      (Array.isArray(b.GET) && b.GET.length === 0));
+      if (r.status === 405 || r.status === 501 || postOnly){
+        return {verdict:"INCONCLUSIVE",
+                why:"POST-only endpoint \u2014 present and listed by the router, but it cannot " +
+                    "be exercised from a plain page",
+                detail:r.body};
+      }
+      if (b.error === "unknown_action"){
+        return {verdict:"INCONCLUSIVE",
+                why:"the route answered but does not accept GET. Reachable, semantics not checked",
+                detail:r.body};
+      }
+      if (!r.ok){
+        return {verdict:"FAIL", why:"<b>" + url + " returned " + r.status + "</b>", detail:r.body};
+      }
+      return {verdict:"INCONCLUSIVE", why:"reachable — semantics not checked by this runner", detail:r.body};
+    });
+  }
+
+  // ---- run --------------------------------------------------------------
+
+  function runAll(){
+    if (!doc){ flash("No document loaded."); return; }
+    el("run").disabled = true;
+    var tally = {PASS:0, FAIL:0, INCONCLUSIVE:0, "NOT SUPPORTED":0};
+    el("tally").hidden = false;
+
+    buildContext().then(function(){
+      var names = Object.keys(doc.checks);
+      var chain = Promise.resolve();
+
+      names.forEach(function(name){
+        chain = chain.then(function(){
+          var c = doc.checks[name];
+
+          if (!c.supported){
+            setResult(name, "NOT SUPPORTED", "the document does not claim this check");
+            tally["NOT SUPPORTED"]++;
+            return;
+          }
+          if (!c.demonstrable_publicly){
+            setResult(name, "INCONCLUSIVE",
+              "built and claimed, but key-gated — nothing here can confirm it, which is what the document says");
+            tally.INCONCLUSIVE++;
+            return;
+          }
+
+          running(name);
+          var fn = runners[name] ? runners[name].bind(null, c) : genericRunner.bind(null, name, c);
+          return fn().catch(function(e){
+            return {verdict:"FAIL", why:"request threw: " + e.message};
+          }).then(function(res){
+            setResult(name, res.verdict, res.why, res.detail);
+            tally[res.verdict] = (tally[res.verdict] || 0) + 1;
+            el("n-pass").textContent = tally.PASS;
+            el("n-fail").textContent = tally.FAIL;
+            el("n-inc").textContent = tally.INCONCLUSIVE;
+            el("n-ns").textContent = tally["NOT SUPPORTED"];
+          });
+        });
+      });
+
+      chain.then(function(){
+        el("run").disabled = false;
+        el("n-pass").textContent = tally.PASS;
+        el("n-fail").textContent = tally.FAIL;
+        el("n-inc").textContent = tally.INCONCLUSIVE;
+        el("n-ns").textContent = tally["NOT SUPPORTED"];
+        if (tally.FAIL > 0){
+          flash(tally.FAIL + " check" + (tally.FAIL>1?"s":"") +
+                " published as publicly demonstrable did not hold up. Fix the endpoint or change the document — the two have to agree.");
+        }
+      });
+    });
+  }
+
+  el("run").addEventListener("click", runAll);
+  el("reload").addEventListener("click", loadDoc);
+  loadDoc();
+})();
+</script>
+</body>
+</html>
+'''
+
+
+def _srv():
+    m = sys.modules.get("__main__")
+    if m is not None and hasattr(m, "get_bearer"):
+        return m
+    return sys.modules.get("server")
+
+
+def _install(s):
+    if _patched[0]:
+        return "already installed"
+    H = getattr(s, "Handler", None)
+    if H is None or not hasattr(H, "do_GET"):
+        return "no handler"
+    if getattr(H, "_selfcheck_patched", False):
+        _patched[0] = True
+        return "already installed"
+
+    original = H.do_GET
+
+    def do_GET(self):
+        try:
+            from urllib.parse import urlparse
+            p = urlparse(self.path).path.rstrip("/") or "/"
+        except Exception:
+            p = self.path or "/"
+
+        if p in PAGE_PATHS:
+            body = PAGE.encode("utf-8")
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Robots-Tag", "noindex, nofollow")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception:
+                pass
+            return
+
+        return original(self)
+
+    H.do_GET = do_GET
+    H._selfcheck_patched = True
+    _patched[0] = True
+    print("SELFCHECK: /self-check installed", flush=True)
+    return "installed"
+
+
+def handle(method, action, data, api_key, ctx):
+    s = _srv()
+    if s is None:
+        return {"error": "server_not_found"}, 500
+
+    state = "already installed" if _patched[0] else None
+    if not _patched[0]:
+        try:
+            state = _install(s)
+        except Exception as exc:
+            print("SELFCHECK: patch failed - " + str(exc), flush=True)
+            state = "failed: " + str(exc)
+
+    action = (action or "").strip("/").lower()
+
+    if method == "GET" and action in ("", "status"):
+        return {"installed": bool(_patched[0]),
+                "install_result": state,
+                "module_version": VERSION,
+                "serving": list(PAGE_PATHS),
+                "page_bytes": len(PAGE),
+                "note": "Runs against whichever host serves it. Same origin, so the browser "
+                        "does not block the requests. Unlinked and noindex on purpose - it "
+                        "tests one operator's own document and is not a joint runner."}, 200
+
+    return {"error": "unknown_action", "action": action, "GET": ["status"]}, 404
+
+```
+
+
+## `modules/spec.py`
+
+121 lines, 5086 bytes
+
+```python
+"""
+Live API specification - /x/spec
+
+/api/spec is a hardcoded constant. It describes the API as it was when
+somebody last remembered to update it, which is a documentation problem
+pretending to be a feature.
+
+This discovers what is actually loaded, right now, by reading the modules
+directory and each module's own docstring. Add a module and the spec
+updates itself. Delete one and it disappears. There is no separate list to
+maintain and therefore no list that can drift.
+
+That matters here more than it would elsewhere: a platform whose pitch is
+"check it, don't trust it" should not ship a self-description that is
+quietly out of date.
+
+    GET /x/spec           everything currently live
+    GET /x/spec/modules   just the module list
+"""
+
+import importlib, os, pkgutil, re
+
+VERSION = "1.0"
+
+_EP = re.compile(r"^\s*(GET|POST|PUT|DELETE)\s+(/\S+)\s*(.*)$")
+
+
+def _describe(name):
+    """Pull a module's summary and endpoint list out of its own docstring."""
+    try:
+        m = importlib.import_module("modules." + name)
+    except Exception as e:
+        return {"module": name, "loaded": False, "error": str(e)}
+    doc = (m.__doc__ or "").strip()
+    lines = doc.splitlines()
+    summary = ""
+    for ln in lines:
+        t = ln.strip()
+        if t and not t.startswith("-") and not _EP.match(ln):
+            summary = t
+            break
+    endpoints = []
+    for ln in lines:
+        mm = _EP.match(ln)
+        if mm:
+            endpoints.append({"method": mm.group(1),
+                              "path": mm.group(2),
+                              "takes": mm.group(3).strip() or None})
+    out = {"module": name, "loaded": True, "summary": summary,
+           "endpoints": endpoints,
+           "version": getattr(m, "VERSION", None)}
+    if not hasattr(m, "handle"):
+        out["warning"] = "module has no handle() - it will not route"
+    return out
+
+
+def _modules():
+    d = os.path.dirname(__file__)
+    names = sorted(x.name for x in pkgutil.iter_modules([d])
+                   if x.name not in ("router", "spec"))
+    return [_describe(n) for n in names]
+
+
+def handle(method, action, data, api_key, ctx):
+    if method != "GET":
+        return {"error": "unknown_action", "action": action}, 404
+
+    mods = _modules()
+
+    if action == "modules":
+        return {"count": len(mods), "modules": mods}, 200
+
+    if action in ("", "all"):
+        return {
+            "spec_version": VERSION,
+            "generated": "live - discovered at request time, not a stored list",
+            "core": {
+                "decision_engine": {
+                    "path": "/api/govern",
+                    "method": "POST",
+                    "auth": "Bearer key",
+                    "note": "deterministic scoring, verdict sealed before the response returns"
+                },
+                "notaries_public": [
+                    {"method": "POST", "path": "/api/post/seal", "auth": "none"},
+                    {"method": "GET", "path": "/api/verify-post", "auth": "none"},
+                    {"method": "POST", "path": "/api/identity/seal", "auth": "none"},
+                    {"method": "GET", "path": "/api/identity/check", "auth": "none"},
+                    {"method": "POST", "path": "/api/payment/seal", "auth": "none"},
+                    {"method": "GET", "path": "/api/payment/check", "auth": "none"}
+                ],
+                "verification_public": [
+                    {"method": "GET", "path": "/api/verify-chain",
+                     "returns": "whole-chain integrity, recomputed"},
+                    {"method": "GET", "path": "/api/inclusion",
+                     "returns": "whether a given 64-char hash is sealed"},
+                    {"method": "GET", "path": "/api/anchor-status",
+                     "returns": "current tip, OpenTimestamps proof, calendar count"},
+                    {"method": "GET", "path": "/api/regulation-map",
+                     "returns": "engine features mapped to legal obligations"}
+                ]
+            },
+            "modules": {
+                "prefix": "/x/<module>/<action>",
+                "auth": "Bearer key on every module route",
+                "count": len(mods),
+                "loaded": mods
+            },
+            "chain": {
+                "algorithm": "SHA-256 hash chain",
+                "scope": "one chain - every module seals into the same sequence as /api/govern",
+                "anchoring": "chain tip submitted to OpenTimestamps, aggregated into a Merkle root, root committed to Bitcoin by several independent calendars",
+                "receipts": "gapless per-key sequence issued in the same transaction as the chain write",
+                "verify": "/api/verify-chain and /api/anchor-status, both without a key"
+            },
+            "honest_note": "This spec is generated by reading the modules directory at request time rather than from a stored list, so it cannot describe capabilities that are not actually loaded."
+        }, 200
+
+    return {"error": "unknown_action", "action": action,
+            "available": ["", "modules"]}, 404
+
+```
+
+
+## `modules/standard.py`
+
+401 lines, 17637 bytes
+
+```python
+"""
+modules/standard.py  -  the Ordering Test discovery document for this domain
+
+WHAT IT SERVES
+--------------
+  GET /.well-known/ordering-test.json   this operator's discovery document
+  GET /x/standard/hash                  sha256 of that document
+  GET /x/standard/status                what is installed, and honest counts
+
+SHAPE
+-----
+Deliberately identical to the shape Red Flag AI Pro published first:
+
+    checks: { <name>: { supported, demonstrable_publicly, endpoint, note } }
+
+Two fields, not one, and the second is the better idea. "We built it" and
+"you can verify it without an account" are different claims, and most of this
+market blurs them. Separating them lets a vendor be honest about having
+something real that an outsider still has to take on trust.
+
+WHAT THE HOST HEADER IS DOING HERE
+----------------------------------
+base_url is derived from the request rather than written into the file. An
+earlier draft had the domain hardcoded, which meant any operator running it
+would publish somebody else's domain as the source - the opposite of a mirror.
+Deriving it means this file can be lifted to any domain and tells the truth
+about wherever it is actually running.
+
+EVERY PUBLISHED ENDPOINT MUST WORK AS WRITTEN
+---------------------------------------------
+An endpoint marked demonstrable_publicly is a promise that a stranger can copy
+it out of this document and get an answer. If the route needs a parameter, the
+document names that parameter. If a value has to be discovered first, the
+document says where to discover it. An endpoint that errors when followed
+literally is a failed check, not a documentation detail.
+
+HONESTY RULES THIS FILE FOLLOWS
+-------------------------------
+  - A check we have not built says supported: false. It does not quietly go
+    missing from the document.
+  - A check that exists but needs an account says demonstrable_publicly:
+    false, however much we would like the tick.
+  - runner is null. A runner exists in draft, but the checks have not been
+    jointly agreed with the other mirror, so publishing one as though it were
+    a settled standard would claim something neither operator has earned yet.
+
+None of that is modesty. A conformance document whose author scores full marks
+on the day they publish it is a marketing page.
+"""
+
+import hashlib
+import json
+import sys
+
+VERSION = "1.1"
+ORDERING_TEST_VERSION = "0.1"
+
+PUBLIC = {("GET", "status"), ("GET", "hash"), ("GET", "spec"),
+          ("GET", "document")}
+
+# Several paths on purpose. /.well-known/ is where the standard says to look,
+# but some platforms and static handlers reserve that prefix, so a plain root
+# path is served as well. /x/standard/document goes through the normal router
+# and cannot be intercepted by anything, which makes it the diagnostic.
+DISCOVERY_PATHS = ("/.well-known/ordering-test.json",
+                   "/ordering-test.json",
+                   "/well-known/ordering-test.json")
+
+VENDOR = "AILeash"
+FALLBACK_BASE = "https://sebbi.pro"
+
+RUNNER = None
+RUNNER_NOTE = (
+    "No shared runner file is published here yet. The checks themselves have "
+    "not been jointly agreed with the other mirrors as of this document's "
+    "publication. This describes AILeash's own side only, not a settled "
+    "cross-vendor standard.")
+
+# Order follows the other mirror's document so the two read side by side.
+CHECKS = {
+    "rule_binding": {
+        "supported": True,
+        "demonstrable_publicly": True,
+        "endpoint": "/x/rulebind/prove",
+        "note": ("The ruleset version is a component of a digest sealed with the "
+                 "decision, not a field beside it. POST any inputs without an "
+                 "account and the response returns the exact string that was "
+                 "hashed - SHA-256 it yourself and confirm it matches. Alter the "
+                 "ruleset hash and the digest stops recomputing; alter the digest "
+                 "and the chain breaks. Verify a past record at "
+                 "/x/rulebind/verify?receipt=... and see ruleset history at "
+                 "/x/rulebind/packs. No scoring logic is disclosed at any point - "
+                 "inputs are published as a digest, never as values."),
+    },
+    "commit_before_reveal": {
+        "supported": True,
+        "demonstrable_publicly": True,
+        "endpoint": "/x/demo/review",
+        "note": ("The reviewer receives the case with the machine verdict "
+                 "withheld. Their own call and dwell time are sealed first, "
+                 "then the verdict is revealed, and the chain fixes that order "
+                 "permanently. No account needed - open a case, commit a "
+                 "verdict, and check the block indices yourself. Commit "
+                 "endpoint is /x/demo/commit."),
+    },
+    "authority_tokens": {
+        "supported": True,
+        "demonstrable_publicly": False,
+        "endpoint": None,
+        "note": ("Signed authority tokens with scope and expiry. A decision "
+                 "beyond delegated authority escalates rather than executes, "
+                 "and the delegation itself is sealed. Built and live, "
+                 "key-gated, no public proof."),
+    },
+    "mutual_witnessing": {
+        "supported": True,
+        "demonstrable_publicly": True,
+        "endpoint": "/x/witness/peers",
+        "note": ("Live, running both directions with an external peer chain "
+                 "hourly since 1 August 2026. No account needed, run it "
+                 "yourself. Our current tip is at /x/witness/tip and any party "
+                 "can submit theirs at /x/witness/observe without an account."),
+    },
+    "completeness_proof": {
+        "supported": True,
+        "demonstrable_publicly": True,
+        "endpoint": "/x/complete/root?period={period}&kind=receipts",
+        "note": ("Per-period sorted Merkle root and exact leaf count, committed "
+                 "before any export is requested. An export can then be checked "
+                 "against a number fixed before anyone knew it would be asked "
+                 "for. Committed periods are listed at /x/complete/periods - "
+                 "take a period identifier from there and substitute it. Only "
+                 "closed periods can be committed, so the current period will "
+                 "not appear until it ends. A period listed nowhere is a period "
+                 "nobody committed, which is itself the finding."),
+    },
+    "absence_proof": {
+        "supported": True,
+        "demonstrable_publicly": True,
+        "endpoint": "/x/complete/prove?period={period}&value={value}",
+        "note": ("Two adjacent leaves with consecutive indices demonstrate that "
+                 "nothing sits between them, so absence is proved rather than "
+                 "asserted. Both parameters are required: take a period from "
+                 "/x/complete/periods and supply any value you like. Try a "
+                 "value that is not there."),
+    },
+    "reconciliation": {
+        "supported": True,
+        "demonstrable_publicly": False,
+        "endpoint": None,
+        "note": ("Sample selected from the live chain tip and sealed before any "
+                 "data is requested, so flattering records cannot be "
+                 "cherry-picked. Mismatches sealed as permanently as matches. "
+                 "Built and live, key-gated, no public proof."),
+    },
+    "reproducibility": {
+        "supported": True,
+        "demonstrable_publicly": True,
+        "endpoint": "/x/replay/challenge",
+        "note": ("Determinism proved by public challenge without disclosing any "
+                 "scoring logic. Submit inputs, the run is sealed, resubmit the "
+                 "same inputs later and the verdict must be identical under an "
+                 "unchanged code fingerprint at /x/replay/fingerprint."),
+    },
+    "consistency_proof": {
+        "supported": True,
+        "demonstrable_publicly": True,
+        "endpoint": "/x/consistency/proof?first={first}&second={second}",
+        "note": ("RFC 6962 consistency proofs, deliberately unmodified so "
+                 "existing Certificate Transparency verifiers work against them "
+                 "directly. first and second are tree sizes - read the current "
+                 "size from /x/consistency/root and pick any earlier one. "
+                 "Anyone holding any earlier tip we served can show it is a "
+                 "prefix of the current log at /x/consistency/ancestor."),
+    },
+
+    # ---- proposed addition, flagged as a proposal rather than assumed ----
+    "external_anchoring": {
+        "supported": True,
+        "demonstrable_publicly": True,
+        "endpoint": "/api/anchor-status",
+        "note": ("PROPOSED AS A SEPARATE CHECK, not settled. The other mirror "
+                 "currently folds anchoring into consistency_proof, but they "
+                 "answer different questions: consistency shows the log only "
+                 "ever grew, anchoring shows the time was fixed somewhere the "
+                 "operator cannot reach. A log can be perfectly append-only and "
+                 "still have been built last week. Here the tip is submitted to "
+                 "OpenTimestamps and committed into Bitcoin; the other mirror "
+                 "uses an RFC 3161 timestamp. The spec should permit any "
+                 "external authority the operator does not control and require "
+                 "it to be named - not mandate one. Offered for the joint "
+                 "session."),
+    },
+}
+
+DOCUMENT_NOTE = (
+    "Every endpoint marked demonstrable_publicly is unauthenticated by design - "
+    "run it yourself without asking us. Where an endpoint carries a {parameter}, "
+    "the note for that check says where to get a valid value; every published "
+    "endpoint is meant to work when followed literally, and one that does not is "
+    "a failed check on our side, not a quibble. Checks marked supported but not "
+    "demonstrable_publicly are real and built, but currently need a key to see, "
+    "and say so plainly rather than passing on the day this was published. "
+    "Nothing here proves the records are true. It describes the order things "
+    "were committed in, which is a narrower claim and the only one that holds.")
+
+_patched = [False]
+
+
+def _base_from(handler):
+    """Derive our own base URL from the request. An operator running this file
+    on their own domain publishes their domain, not whoever wrote it."""
+    try:
+        host = handler.headers.get("X-Forwarded-Host") or handler.headers.get("Host")
+        if not host:
+            return FALLBACK_BASE
+        host = host.split(",")[0].strip()[:200]
+        proto = (handler.headers.get("X-Forwarded-Proto") or "https").split(",")[0].strip()
+        if proto not in ("http", "https"):
+            proto = "https"
+        return proto + "://" + host
+    except Exception:
+        return FALLBACK_BASE
+
+
+def _base_from_ctx(ctx):
+    """Same derivation for the routed /x/standard/document call.
+
+    The router's ctx may or may not carry the request handler. If it does, the
+    document served through the router names the same domain as the one served
+    at /.well-known/ - which matters on a mirror, where hardcoding would make
+    this file publish somebody else's domain again."""
+    try:
+        if isinstance(ctx, dict):
+            for key in ("handler", "h", "request", "req", "self"):
+                obj = ctx.get(key)
+                if obj is not None and hasattr(obj, "headers"):
+                    return _base_from(obj)
+            headers = ctx.get("headers")
+            if headers is not None:
+                class _Shim(object):
+                    pass
+                shim = _Shim()
+                shim.headers = headers
+                return _base_from(shim)
+        elif ctx is not None and hasattr(ctx, "headers"):
+            return _base_from(ctx)
+    except Exception:
+        pass
+    return FALLBACK_BASE
+
+
+def _document(base):
+    checks = {}
+    for name, c in CHECKS.items():
+        checks[name] = {
+            "supported": c["supported"],
+            "demonstrable_publicly": c["demonstrable_publicly"],
+            "endpoint": c["endpoint"],
+            "note": c["note"],
+        }
+    return {
+        "ordering_test_version": ORDERING_TEST_VERSION,
+        "vendor": VENDOR,
+        "base_url": base,
+        "runner": RUNNER,
+        "runner_note": RUNNER_NOTE,
+        "checks": checks,
+        "witness_peers": base + "/x/witness/peers",
+        "witness_tip": base + "/x/witness/tip",
+        "committed_periods": base + "/x/complete/periods",
+        "note": DOCUMENT_NOTE,
+    }
+
+
+def _digest(doc):
+    return hashlib.sha256(
+        json.dumps(doc, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _srv():
+    m = sys.modules.get("__main__")
+    if hasattr(m, "get_bearer"):
+        return m
+    return sys.modules.get("server")
+
+
+def _install(s):
+    if _patched[0]:
+        return "already installed"
+    H = getattr(s, "Handler", None)
+    if H is None or not hasattr(H, "do_GET"):
+        return "no handler"
+    if getattr(H, "_standard_patched", False):
+        _patched[0] = True
+        return "already installed"
+
+    original = H.do_GET
+
+    def do_GET(self):
+        try:
+            from urllib.parse import urlparse
+            p = urlparse(self.path).path.rstrip("/") or "/"
+        except Exception:
+            p = self.path or "/"
+
+        if p in DISCOVERY_PATHS:
+            body = json.dumps(_document(_base_from(self)), indent=2).encode("utf-8")
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "public, max-age=300")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception:
+                pass
+            return
+
+        return original(self)
+
+    H.do_GET = do_GET
+    H._standard_patched = True
+    _patched[0] = True
+    print("STANDARD: /.well-known/ordering-test.json installed", flush=True)
+    return "installed"
+
+
+def handle(method, action, data, api_key, ctx):
+    s = _srv()
+    if s is None:
+        return {"error": "server_not_found"}, 500
+
+    state = "already installed" if _patched[0] else None
+    if not _patched[0]:
+        try:
+            state = _install(s)
+        except Exception as exc:
+            print("STANDARD: patch failed - " + str(exc), flush=True)
+            state = "failed: " + str(exc)
+
+    action = (action or "").strip("/").lower()
+    base = _base_from_ctx(ctx)
+    doc = _document(base)
+
+    if method == "GET" and action == "document":
+        return doc, 200
+
+    if method == "GET" and action == "hash":
+        canonical = _document(FALLBACK_BASE)
+        return {
+            "sha256": _digest(canonical),
+            "of": "this operator's discovery document",
+            "canonicalisation": ("JSON, keys sorted, no whitespace, UTF-8, "
+                                 "base_url fixed to " + FALLBACK_BASE +
+                                 " so the digest does not move with the "
+                                 "requesting host"),
+            "what_this_is_for": (
+                "Confirming our own document has not changed. It is NOT the "
+                "cross-mirror check - two operators publish different documents "
+                "by design, because they list different endpoints, so their "
+                "digests should differ and a mismatch would prove nothing. The "
+                "cross-mirror comparison only means something once every mirror "
+                "serves a byte-identical runner file and hashes that instead. "
+                "No runner is agreed yet."),
+            "document": canonical,
+        }, 200
+
+    if method == "GET" and action in ("", "status", "spec"):
+        supported = [k for k, c in CHECKS.items() if c["supported"]]
+        public = [k for k, c in CHECKS.items() if c["demonstrable_publicly"]]
+        parameterised = [k for k, c in CHECKS.items()
+                         if c["endpoint"] and "{" in c["endpoint"]]
+        return {
+            "installed": bool(_patched[0]),
+            "install_result": state,
+            "module_version": VERSION,
+            "ordering_test_version": ORDERING_TEST_VERSION,
+            "serving": list(DISCOVERY_PATHS),
+            "always_available": "/x/standard/document",
+            "checks_total": len(CHECKS),
+            "checks_supported": len(supported),
+            "checks_publicly_demonstrable": len(public),
+            "publicly_demonstrable": public,
+            "supported_but_not_public": [k for k in supported if k not in public],
+            "endpoints_needing_a_parameter": parameterised,
+            "runner": RUNNER,
+            "note": ("base_url is derived from the Host header, so this file "
+                     "publishes whichever domain is actually serving it. Checks "
+                     "listed under endpoints_needing_a_parameter cannot be "
+                     "demonstrated until a real value exists to substitute - "
+                     "for the completeness and absence checks that means at "
+                     "least one committed period at /x/complete/periods."),
+        }, 200
+
+    return {"error": "unknown_action", "action": action,
+            "GET": ["status", "hash", "document"]}, 404
+
+```
 
 
 ## `modules/stats.py`
@@ -1590,836 +2820,5 @@ if __name__ == "__main__":
         generate_json_report(db)
     else:
         generate_html_report(db)
-
-```
-
-
-## `aileash_verify.py`
-
-580 lines, 21445 bytes
-
-```python
-#!/usr/bin/env python3
-"""
-aileash_verify.py  -  an independent verifier for AILeash proofs
-================================================================
-
-WHAT THIS IS
-------------
-A single file that checks AILeash's proofs without AILeash.
-
-No dependencies. No network calls. It never contacts sebbi.pro or anything
-else - it takes proof documents you already hold and does the arithmetic
-locally. Run it on a laptop with the wifi off and it works exactly the same.
-
-That is deliberate. A proof you can only check with the prover's own online
-tool is not a proof, it is a reassurance. If this file cannot confirm a
-claim from the numbers alone, the claim does not hold, and the honest thing
-is for you to find that out from your own machine rather than from us.
-
-WHAT IT CHECKS
---------------
-  Inclusion    a record is inside a sealed period, against the sealed root
-  Absence      a record is NOT there - the two neighbouring leaves are
-               verified and shown to be adjacent, leaving nowhere for it
-  Ancestry     a tip you were handed is still on the chain being served,
-               at the same position, under the current root
-  Prefix       the log at one size is contained in the log at a later size,
-               with nothing inserted, removed or reordered in between
-  Stability    across a set of replay runs, identical inputs produced
-               identical verdicts under an unchanged code fingerprint
-
-USAGE
------
-    python3 aileash_verify.py proof.json [another.json ...]
-    cat proof.json | python3 aileash_verify.py
-    python3 aileash_verify.py --selftest
-
-Exit code 0 if everything checked passed, 1 if anything failed, 2 on bad
-input. Suitable for dropping into an audit script or a CI job.
-
-Each proof document is whatever the relevant AILeash route returned. Save
-the JSON, keep it, and check it whenever you like - next week, or in four
-years when the original system is long gone.
-
-HOW TO GET PROOFS
------------------
-    /x/complete/prove?period=&value=       inclusion or absence
-    /x/consistency/ancestor?tip=           ancestry
-    /x/consistency/proof?first=&second=    prefix
-    /x/replay/history?input_hash=          stability
-
-WHAT IT DOES NOT CHECK
-----------------------
-  - That a sealed record is TRUE. Cryptography proves a record existed at a
-    time and has not moved since. It says nothing about whether the record
-    was honest when it was written. Nothing can.
-  - That a root was anchored. That is a separate check against the
-    OpenTimestamps proof and a Bitcoin node - out of scope for a file with
-    no dependencies, and it should be done independently anyway.
-  - Whether a decision was correct or fair. Determinism is not fairness.
-
-The two hash schemes below are different on purpose and must not be mixed.
-The completeness tree is SORTED, which is what makes absence provable. The
-consistency tree is in WRITE ORDER, which is what makes reordering
-detectable. Their roots will never match and are not meant to.
-
-Public domain / MIT - copy it, fork it, audit it, ship it inside your own
-tooling. The more independent copies of this exist, the less any of it
-depends on us.
-"""
-
-import hashlib
-import json
-import sys
-
-VERSION = "1.0"
-
-# --- completeness tree (sorted) -------------------------------------------
-CMP_LEAF = b"AILEASH-LEAF-v1:"
-CMP_NODE = b"AILEASH-NODE-v1:"
-
-# --- consistency tree (write order, RFC 6962) -----------------------------
-CT_LEAF = b"\x00"
-CT_NODE = b"\x01"
-
-
-# ==========================================================================
-# completeness: sorted tree
-# ==========================================================================
-
-def cmp_leaf(value):
-    return hashlib.sha256(CMP_LEAF + value.encode("utf-8")).hexdigest()
-
-
-def cmp_node(left_hex, right_hex):
-    return hashlib.sha256(CMP_NODE + left_hex.encode() + right_hex.encode()).hexdigest()
-
-
-def cmp_replay(value, proof):
-    """Recompute a root from a leaf value and its sibling path.
-
-    Each step carries the side its sibling sits on. Five lines, so that
-    reimplementing this in another language is an afternoon rather than a
-    project.
-    """
-    current = cmp_leaf(value)
-    for step in proof:
-        side = (step or {}).get("side")
-        sibling = (step or {}).get("hash")
-        if not sibling:
-            raise ValueError("proof step missing a hash")
-        if side == "left":
-            current = cmp_node(sibling, current)
-        elif side == "right":
-            current = cmp_node(current, sibling)
-        else:
-            raise ValueError("proof step missing a side")
-    return current
-
-
-# ==========================================================================
-# consistency: RFC 6962 write-order tree
-# ==========================================================================
-
-def ct_leaf(value):
-    return hashlib.sha256(CT_LEAF + value.encode("utf-8")).digest()
-
-
-def ct_node(left, right):
-    return hashlib.sha256(CT_NODE + left + right).digest()
-
-
-def _decompose(index, size):
-    """Split an inclusion proof into its inner and border parts.
-
-    This is the standard decomposition used by every RFC 6962
-    implementation. inner is the number of steps where the path is still
-    inside a complete subtree; border is the number of right-hand
-    stragglers above it.
-    """
-    inner = (index ^ (size - 1)).bit_length()
-    border = bin(index >> inner).count("1")
-    return inner, border
-
-
-def _chain_inner(seed, proof, index):
-    for i, step in enumerate(proof):
-        if (index >> i) & 1 == 0:
-            seed = ct_node(seed, step)
-        else:
-            seed = ct_node(step, seed)
-    return seed
-
-
-def _chain_inner_right(seed, proof, index):
-    for i, step in enumerate(proof):
-        if (index >> i) & 1 == 1:
-            seed = ct_node(step, seed)
-    return seed
-
-
-def _chain_border_right(seed, proof):
-    for step in proof:
-        seed = ct_node(step, seed)
-    return seed
-
-
-def ct_verify_inclusion(index, size, leaf_value, proof_hex, root_hex):
-    """Is leaf_value at position index of a tree of this size and root?"""
-    if index < 0 or size <= 0 or index >= size:
-        return False, "index outside the tree"
-    try:
-        proof = [bytes.fromhex(h) for h in proof_hex]
-        root = bytes.fromhex(root_hex)
-    except (ValueError, TypeError):
-        return False, "proof or root is not hex"
-
-    inner, border = _decompose(index, size)
-    if len(proof) != inner + border:
-        return False, ("proof has %d nodes, a tree of size %d needs %d for index %d"
-                       % (len(proof), size, inner + border, index))
-
-    result = _chain_inner(ct_leaf(leaf_value), proof[:inner], index)
-    result = _chain_border_right(result, proof[inner:])
-    if result != root:
-        return False, "recomputed root does not match (%s)" % result.hex()
-    return True, None
-
-
-def ct_verify_consistency(size1, size2, proof_hex, root1_hex, root2_hex):
-    """Is the tree of size1 a prefix of the tree of size2?"""
-    if size1 < 0 or size2 < 0 or size1 > size2:
-        return False, "sizes must satisfy 0 <= first <= second"
-    try:
-        proof = [bytes.fromhex(h) for h in proof_hex]
-        root1 = bytes.fromhex(root1_hex)
-        root2 = bytes.fromhex(root2_hex)
-    except (ValueError, TypeError):
-        return False, "proof or roots are not hex"
-
-    if size1 == size2:
-        if proof:
-            return False, "no proof nodes expected when the sizes are equal"
-        return (root1 == root2), (None if root1 == root2 else "roots differ at equal size")
-    if size1 == 0:
-        return True, None
-    if not proof:
-        return False, "a proof is required for these sizes"
-
-    inner, border = _decompose(size1 - 1, size2)
-    shift = (size1 & -size1).bit_length() - 1
-    inner -= shift
-
-    if size1 == (1 << shift):
-        seed, start = root1, 0
-    else:
-        seed, start = proof[0], 1
-
-    if len(proof) != start + inner + border:
-        return False, ("proof has %d nodes, expected %d" % (len(proof), start + inner + border))
-
-    body = proof[start:]
-    mask = (size1 - 1) >> shift
-
-    hash1 = _chain_inner_right(seed, body[:inner], mask)
-    hash1 = _chain_border_right(hash1, body[inner:])
-    if hash1 != root1:
-        return False, "the earlier root does not recompute (%s)" % hash1.hex()
-
-    hash2 = _chain_inner(seed, body[:inner], mask)
-    hash2 = _chain_border_right(hash2, body[inner:])
-    if hash2 != root2:
-        return False, "the later root does not recompute (%s)" % hash2.hex()
-    return True, None
-
-
-# ==========================================================================
-# document checkers
-# ==========================================================================
-
-class Check(object):
-    def __init__(self, kind):
-        self.kind = kind
-        self.lines = []
-        self.ok = True
-
-    def add(self, passed, text):
-        self.lines.append((passed, text))
-        if not passed:
-            self.ok = False
-        return passed
-
-
-def check_inclusion(doc):
-    c = Check("inclusion (completeness)")
-    value = doc.get("value")
-    root = doc.get("root")
-    proof = doc.get("proof")
-    if not (value and root and isinstance(proof, list)):
-        c.add(False, "document is missing value, root or proof")
-        return c
-    try:
-        computed = cmp_replay(value, proof)
-    except ValueError as exc:
-        c.add(False, "malformed proof: %s" % exc)
-        return c
-    c.add(computed == root, "leaf recomputes to the sealed root")
-    if doc.get("leaf_count") is not None:
-        c.add(True, "period sealed %s records, committed before any export was requested"
-                    % doc["leaf_count"])
-    if doc.get("index") is not None:
-        c.add(True, "record sits at index %s" % doc["index"])
-    return c
-
-
-def check_absence(doc):
-    c = Check("absence (completeness)")
-    value = doc.get("value")
-    root = doc.get("root")
-    neighbours = doc.get("neighbours") or {}
-    count = doc.get("leaf_count")
-    if not (value and root):
-        c.add(False, "document is missing value or root")
-        return c
-
-    lower = neighbours.get("lower")
-    upper = neighbours.get("upper")
-
-    if not lower and not upper:
-        c.add(count == 0, "period is committed and empty, so nothing can be in it")
-        return c
-
-    if lower:
-        try:
-            computed = cmp_replay(lower["value"], lower["proof"])
-        except (ValueError, KeyError, TypeError) as exc:
-            c.add(False, "lower neighbour proof is malformed: %s" % exc)
-            return c
-        c.add(computed == root, "lower neighbour verifies against the sealed root")
-        c.add(str(lower["value"]) < str(value), "lower neighbour sorts before the queried value")
-
-    if upper:
-        try:
-            computed = cmp_replay(upper["value"], upper["proof"])
-        except (ValueError, KeyError, TypeError) as exc:
-            c.add(False, "upper neighbour proof is malformed: %s" % exc)
-            return c
-        c.add(computed == root, "upper neighbour verifies against the sealed root")
-        c.add(str(upper["value"]) > str(value), "upper neighbour sorts after the queried value")
-
-    if lower and upper:
-        adjacent = int(upper["index"]) == int(lower["index"]) + 1
-        c.add(adjacent, "neighbours are adjacent (index %s then %s) - nothing can sit between"
-                        % (lower["index"], upper["index"]))
-    elif upper:
-        c.add(int(upper["index"]) == 0, "value sorts before the first leaf, and nothing precedes index 0")
-    elif lower:
-        if count is None:
-            c.add(True, "value sorts after the last leaf (leaf_count not supplied to confirm)")
-        else:
-            c.add(int(lower["index"]) == int(count) - 1,
-                  "value sorts after the final leaf of %s" % count)
-    return c
-
-
-def check_ancestry(doc):
-    c = Check("ancestry (consistency)")
-    if doc.get("on_chain") is False:
-        c.add(False, "THIS TIP IS NOT ON THE CHAIN BEING SERVED - if it was issued to you, "
-                     "that is evidence of a fork. Keep this document.")
-        return c
-    tip = doc.get("tip")
-    index = doc.get("leaf_index")
-    size = doc.get("tree_size")
-    root = doc.get("root")
-    proof = doc.get("inclusion_proof")
-    if tip is None or index is None or size is None or not root or not isinstance(proof, list):
-        c.add(False, "document is missing tip, leaf_index, tree_size, root or inclusion_proof")
-        return c
-    ok, why = ct_verify_inclusion(int(index), int(size), tip, proof, root)
-    c.add(ok, why or "tip verifies at position %s of a chain of %s" % (index, size))
-    return c
-
-
-def check_prefix(doc):
-    c = Check("prefix (consistency)")
-    first = doc.get("first")
-    second = doc.get("second")
-    proof = doc.get("consistency_proof")
-    root1 = doc.get("first_root")
-    root2 = doc.get("second_root")
-    if first is None or second is None or not isinstance(proof, list) or not root1 or not root2:
-        c.add(False, "document is missing first, second, consistency_proof or the roots")
-        return c
-    ok, why = ct_verify_consistency(int(first), int(second), proof, root1, root2)
-    c.add(ok, why or ("the log at size %s is contained in the log at size %s - append only, "
-                      "nothing inserted, removed or reordered" % (first, second)))
-    return c
-
-
-def check_stability(doc):
-    c = Check("stability (replay)")
-    history = doc.get("history")
-    if not isinstance(history, list) or not history:
-        c.add(False, "document has no replay history")
-        return c
-
-    by_code = {}
-    for run in history:
-        by_code.setdefault(run.get("code_fingerprint"), set()).add(
-            (str(run.get("verdict")), str(run.get("score"))))
-
-    stable = True
-    for fingerprint, outcomes in by_code.items():
-        short = (fingerprint or "unknown")[:12]
-        if len(outcomes) > 1:
-            stable = False
-            c.add(False, "code %s produced %d different verdicts for identical inputs - "
-                         "the engine is not deterministic under that version"
-                         % (short, len(outcomes)))
-        else:
-            c.add(True, "code %s produced one verdict across every run" % short)
-
-    c.add(True, "%d runs recorded, %d distinct code versions"
-                % (len(history), len(by_code)))
-    if stable and len(by_code) > 1:
-        c.add(True, "verdicts changed only alongside a changed code fingerprint, which is "
-                    "a policy change rather than nondeterminism")
-    c.add(True, "each run carries its own audit hash - check them independently with "
-                "an ancestry proof")
-    return c
-
-
-def identify(doc):
-    if not isinstance(doc, dict):
-        return None
-    if "consistency_proof" in doc:
-        return check_prefix
-    if "inclusion_proof" in doc or doc.get("on_chain") is not None:
-        return check_ancestry
-    if doc.get("result") == "absent" or "neighbours" in doc:
-        return check_absence
-    if doc.get("result") == "present" or ("proof" in doc and "value" in doc):
-        return check_inclusion
-    if "history" in doc and "input_hash" in doc:
-        return check_stability
-    return None
-
-
-# ==========================================================================
-# self test - known vectors built here, so the verifier checks itself
-# ==========================================================================
-
-def _selftest():
-    """Builds small trees in this file and confirms the verifier agrees.
-
-    Run this before trusting a result. If it fails, the fault is in this
-    file rather than in anything it was checking.
-    """
-    failures = []
-
-    # sorted tree, five leaves
-    values = sorted(["alpha", "bravo", "charlie", "delta", "echo"])
-
-    def build(vals):
-        level = [cmp_leaf(v) for v in vals]
-        levels = [level]
-        while len(level) > 1:
-            nxt = [cmp_node(level[i], level[i + 1]) for i in range(0, len(level) - 1, 2)]
-            if len(level) % 2 == 1:
-                nxt.append(level[-1])
-            levels.append(nxt)
-            level = nxt
-        return level[0], levels
-
-    def path(levels, index):
-        out, idx = [], index
-        for level in levels[:-1]:
-            if idx % 2 == 0:
-                if idx + 1 < len(level):
-                    out.append({"side": "right", "hash": level[idx + 1]})
-            else:
-                out.append({"side": "left", "hash": level[idx - 1]})
-            idx //= 2
-        return out
-
-    root, levels = build(values)
-    for i, value in enumerate(values):
-        if cmp_replay(value, path(levels, i)) != root:
-            failures.append("sorted inclusion failed for leaf %d" % i)
-    if cmp_replay("not-a-leaf", path(levels, 0)) == root:
-        failures.append("sorted tree accepted a wrong leaf")
-
-    # RFC 6962 tree, sizes 1..17
-    def mth(leaves):
-        n = len(leaves)
-        if n == 0:
-            return hashlib.sha256(b"").digest()
-        if n == 1:
-            return ct_leaf(leaves[0])
-        k = 1
-        while k * 2 < n:
-            k *= 2
-        return ct_node(mth(leaves[:k]), mth(leaves[k:]))
-
-    def incl(index, leaves):
-        n = len(leaves)
-        if n <= 1:
-            return []
-        k = 1
-        while k * 2 < n:
-            k *= 2
-        if index < k:
-            return incl(index, leaves[:k]) + [mth(leaves[k:])]
-        return incl(index - k, leaves[k:]) + [mth(leaves[:k])]
-
-    def subproof(m, leaves, is_root):
-        n = len(leaves)
-        if m == n:
-            return [] if is_root else [mth(leaves)]
-        k = 1
-        while k * 2 < n:
-            k *= 2
-        if m <= k:
-            return subproof(m, leaves[:k], is_root) + [mth(leaves[k:])]
-        return subproof(m - k, leaves[k:], False) + [mth(leaves[:k])]
-
-    for size in range(1, 18):
-        leaves = ["entry-%03d" % i for i in range(size)]
-        root_hex = mth(leaves).hex()
-        for index in range(size):
-            proof = [h.hex() for h in incl(index, leaves)]
-            ok, why = ct_verify_inclusion(index, size, leaves[index], proof, root_hex)
-            if not ok:
-                failures.append("ct inclusion failed size=%d index=%d (%s)" % (size, index, why))
-            bad, _ = ct_verify_inclusion(index, size, "tampered", proof, root_hex)
-            if bad:
-                failures.append("ct inclusion accepted a wrong leaf size=%d index=%d" % (size, index))
-        for first in range(1, size + 1):
-            proof = [h.hex() for h in (subproof(first, leaves, True) if first != size else [])]
-            ok, why = ct_verify_consistency(first, size, proof,
-                                            mth(leaves[:first]).hex(), root_hex)
-            if not ok:
-                failures.append("ct consistency failed %d -> %d (%s)" % (first, size, why))
-
-    # a fabricated prefix must be rejected
-    leaves = ["entry-%03d" % i for i in range(8)]
-    forged = leaves[:4] + ["swapped"] + leaves[5:]
-    proof = [h.hex() for h in subproof(4, forged, True)]
-    ok, _ = ct_verify_consistency(4, 8, proof, mth(leaves[:4]).hex(), mth(leaves).hex())
-    if ok:
-        failures.append("ct consistency accepted a forged prefix")
-
-    if failures:
-        print("SELF TEST FAILED")
-        for line in failures:
-            print("   " + line)
-        return 1
-    print("Self test passed. Sorted-tree and RFC 6962 verification both behave correctly,")
-    print("and tampered proofs were rejected in every case.")
-    return 0
-
-
-# ==========================================================================
-# cli
-# ==========================================================================
-
-def _run(doc, label):
-    checker = identify(doc)
-    if checker is None:
-        print("%s\n   UNRECOGNISED - not an AILeash proof document this version knows about\n" % label)
-        return False
-    result = checker(doc)
-    print("%s\n   type: %s" % (label, result.kind))
-    for passed, text in result.lines:
-        print("   %s %s" % ("PASS" if passed else "FAIL", text))
-    print("   => %s\n" % ("VERIFIED" if result.ok else "NOT VERIFIED"))
-    return result.ok
-
-
-def main(argv):
-    args = [a for a in argv[1:] if not a.startswith("--")]
-    flags = set(a for a in argv[1:] if a.startswith("--"))
-
-    if "--selftest" in flags:
-        return _selftest()
-    if "--version" in flags:
-        print("aileash_verify %s" % VERSION)
-        return 0
-
-    print("aileash_verify %s - offline, no network calls made\n" % VERSION)
-
-    documents = []
-    if args:
-        for path in args:
-            try:
-                with open(path, "r", encoding="utf-8") as handle:
-                    documents.append((path, json.load(handle)))
-            except (OSError, ValueError) as exc:
-                print("%s\n   COULD NOT READ: %s\n" % (path, exc))
-                return 2
-    else:
-        try:
-            documents.append(("(stdin)", json.load(sys.stdin)))
-        except ValueError as exc:
-            print("Could not read JSON from stdin: %s" % exc)
-            return 2
-
-    results = [_run(doc, label) for label, doc in documents]
-    passed = sum(1 for r in results if r)
-    print("%d of %d documents verified." % (passed, len(results)))
-    if passed != len(results):
-        print("Something did not check out. That is what this file is for - keep the "
-              "document and the response that produced it.")
-        return 1
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main(sys.argv))
-
-```
-
-
-## `anchor.py`
-
-166 lines, 6009 bytes
-
-```python
-"""
-anchor.py  -  External anchoring for the AILeash chain.
-
-WHAT IT DOES (plain words):
-  Every ANCHOR_INTERVAL seconds it takes the current chain tip (one hash) and
-  timestamps it against an external source you do NOT control - so anyone can
-  prove your chain's timestamps are real without trusting sebbi.pro.
-
-  It tries OpenTimestamps first (commits the hash into Bitcoin, free, gold
-  standard). It ALSO records the tip + time to a local append-only anchor log
-  on your persistent volume as a second record. If OTS is unavailable for any
-  reason, the server keeps running normally - anchoring never blocks or
-  crashes your live engine.
-
-SAFETY:
-  - Only READS the chain tip. Never writes to the chain, never touches scoring.
-  - Runs on a background daemon thread.
-  - Every failure is caught and logged; your govern path is never affected.
-
-SETUP ON RAILWAY:
-  - requirements.txt:  opentimestamps-client
-  - Variable ANCHOR_DIR = /data/anchors   (on your persistent volume)
-  - Variable ANCHOR_INTERVAL = 3600       (once an hour; optional)
-  - Variable ANCHOR_ENABLED = 1           (set 0 to switch off)
-"""
-
-import os
-import time
-import json
-import hashlib
-import threading
-
-ANCHOR_INTERVAL = int(os.environ.get("ANCHOR_INTERVAL", "3600"))
-ANCHOR_DIR      = os.environ.get("ANCHOR_DIR", "/data/anchors")
-ANCHOR_ENABLED  = os.environ.get("ANCHOR_ENABLED", "1") == "1"
-
-_last = {"ts": None, "tip": None, "ots_file": None, "ots_ok": False, "status": "not_started"}
-_lock = threading.Lock()
-
-
-def _ensure_dir():
-    try:
-        os.makedirs(ANCHOR_DIR, exist_ok=True)
-        return True
-    except Exception as e:
-        print("ANCHOR: cannot create " + ANCHOR_DIR + " : " + str(e), flush=True)
-        return False
-
-
-def _ots_stamp(tip_hash):
-    """Timestamp the tip hash with OpenTimestamps (-> Bitcoin). Returns
-    (ok, proof_path, message). Uses the opentimestamps library directly, so
-    there is no command-line tool to find on PATH."""
-    try:
-        from opentimestamps.calendar import RemoteCalendar
-        from opentimestamps.core.timestamp import Timestamp, DetachedTimestampFile
-        from opentimestamps.core.op import OpSHA256
-        from opentimestamps.core.serialize import BytesSerializationContext
-    except Exception as e:
-        return False, None, "opentimestamps library not available: " + str(e)
-
-    try:
-        # The digest we anchor is the tip hash (hex -> bytes).
-        digest = bytes.fromhex(tip_hash)
-        ts = Timestamp(digest)
-
-        # Ask public (free) calendar servers to commit this digest.
-        calendars = [
-            "https://a.pool.opentimestamps.org",
-            "https://b.pool.opentimestamps.org",
-            "https://alice.btc.calendar.opentimestamps.org",
-        ]
-        got = 0
-        for url in calendars:
-            try:
-                cal = RemoteCalendar(url)
-                result = cal.submit(digest)
-                ts.merge(result)
-                got += 1
-            except Exception as ce:
-                print("ANCHOR: calendar " + url + " failed: " + str(ce), flush=True)
-        if got == 0:
-            return False, None, "no calendar server accepted the stamp"
-
-        # Save the .ots proof next to a record of the tip.
-        stamp_id = str(int(time.time()))
-        base = os.path.join(ANCHOR_DIR, "tip_" + stamp_id)
-        with open(base + ".txt", "w") as f:
-            f.write(tip_hash + "\n")
-        detached = DetachedTimestampFile(OpSHA256(), ts)
-        ctx = BytesSerializationContext()
-        detached.serialize(ctx)
-        with open(base + ".ots", "wb") as f:
-            f.write(ctx.getbytes())
-        return True, base + ".ots", "stamped by " + str(got) + " calendar(s)"
-    except Exception as e:
-        return False, None, "ots stamp error: " + str(e)
-
-
-def _record_local(tip_hash, ots_ok, ots_file, msg):
-    """Append-only local record of every anchor attempt, on the volume."""
-    try:
-        idx = os.path.join(ANCHOR_DIR, "anchors.jsonl")
-        with open(idx, "a") as f:
-            f.write(json.dumps({
-                "ts": time.time(),
-                "tip": tip_hash,
-                "ots": ots_ok,
-                "ots_file": ots_file,
-                "note": msg
-            }) + "\n")
-    except Exception as e:
-        print("ANCHOR: local record failed: " + str(e), flush=True)
-
-
-def anchor_once(get_tip):
-    if not _ensure_dir():
-        return
-    try:
-        tip = get_tip()
-    except Exception as e:
-        print("ANCHOR: cannot read tip: " + str(e), flush=True)
-        return
-    if not tip or tip == "GENESIS":
-        print("ANCHOR: chain empty, nothing to anchor", flush=True)
-        return
-
-    ok, proof, msg = _ots_stamp(tip)
-    _record_local(tip, ok, proof, msg)
-    with _lock:
-        _last["ts"] = time.time()
-        _last["tip"] = tip
-        _last["ots_file"] = proof
-        _last["ots_ok"] = ok
-        _last["status"] = ("anchored: " + msg) if ok else ("ots_unavailable: " + msg)
-    if ok:
-        print("ANCHOR: tip " + tip[:16] + "... -> " + msg + " -> " + str(proof), flush=True)
-    else:
-        print("ANCHOR: OTS not available (" + msg + ") - local record written, will retry", flush=True)
-
-
-def _loop(get_tip):
-    time.sleep(30)  # let the server finish booting
-    while True:
-        try:
-            anchor_once(get_tip)
-        except Exception as e:
-            print("ANCHOR loop error: " + str(e), flush=True)
-        time.sleep(ANCHOR_INTERVAL)
-
-
-def start_anchoring(get_tip):
-    """Call ONCE at startup, passing your chain_tip function. Spawns a daemon
-    thread that anchors forever. Safe: only logs on failure, never affects the
-    live engine."""
-    if not ANCHOR_ENABLED:
-        print("ANCHOR: disabled (ANCHOR_ENABLED=0)", flush=True)
-        return
-    threading.Thread(target=_loop, args=(get_tip,), daemon=True).start()
-    print("ANCHOR: started - external anchoring every " + str(ANCHOR_INTERVAL) + "s to " + ANCHOR_DIR, flush=True)
-
-
-def anchor_status():
-    with _lock:
-        return dict(_last)
-
-```
-
-
-## `board_auditor.py`
-
-61 lines, 2889 bytes
-
-```python
-import time
-import json
-import urllib.request
-import logging
-import os
-
-# --- THE WATCHDOG STANDARD ---
-AUDITOR_MANIFEST = """Standard: SEBBI-WATCHDOG/1.0
-Engine: AILeash-Hunter v1.0
-Operation: Automated Public Compliance Verification
-Status: ENFORCING"""
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [WATCHDOG-SCAN] %(message)s")
-
-class RegulatoryWatchdog:
-    def __init__(self, target_list):
-        self.targets = target_list
-        self.report_file = "VIOLATION_REPORT.md"
-
-    def scan_market_sectors(self):
-        """Scans corporate perimeters to verify live legal compliance states."""
-        logging.info("Commencing global compliance audit sweep...")
-        violations_found = []
-
-        for domain in self.targets:
-            print(f"[*] Auditing domain: {domain}")
-            
-            # Simulate an automated request to the site's root directory
-            # In production, this checks if https://domain/ai.txt exists and is signed
-            is_compliant = False  # Simulated failure for demonstration
-            
-            if not is_compliant:
-                logging.warning(f"[VIOLATION DETECTED] {domain} has failed mandatory compliance parameters.")
-                violations_found.append(domain)
-
-        if violations_found:
-            self._compile_public_violation_ledger(violations_found)
-
-    def _compile_public_violation_ledger(self, failed_domains):
-        """Generates a public, standardized report file for the repository root."""
-        with open(self.report_file, "w", encoding="utf-8") as f:
-            f.write("# 🚨 AUTOMATED REAL-TIME AI COMPLIANCE VIOLATION REPORT\n\n")
-            f.write(f"**Audit Timestamp:** {time.strftime('%Y-%m-%d %H:%M:%S')} UTC\n")
-            f.write(f"**Verification Engine:** {AUDITOR_MANIFEST.splitlines()[2]}\n\n")
-            f.write("The following enterprise networks were scanned and failed to present a verifiable, cryptographically sealed `ai.txt` manifest under current transparency mandates. These nodes face potential regulatory scrutiny under statutory liability thresholds.\n\n")
-            f.write("| Target Domain Domain | Compliance Status | Liability Risk Level |\n")
-            f.write("| :--- | :--- | :--- |\n")
-            
-            for domain in failed_domains:
-                f.write(f"| `{domain}` | ❌ NON-COMPLIANT / NO VALID LEDGER | HIGH RISK (Up to 7% Turnover fine) |\n")
-                
-        print(f"\n[CHECKMATE] Public audit report successfully generated: '{self.report_file}'")
-        print("[!] Ready to push to GitHub to alert public sector regulators.")
-
-if __name__ == "__main__":
-    # High-value targets that should be operating transparently
-    target_enterprise_pool = ["enterprise-ai-vendor-example.com", "shadow-data-processor.co.uk"]
-    
-    hunter = RegulatoryWatchdog(target_enterprise_pool)
-    hunter.scan_market_sectors()
 
 ```
