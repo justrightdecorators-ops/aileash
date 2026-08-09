@@ -1,13 +1,754 @@
 # Codebase — part 9 of 17
 
 Contains:
+- `tests/attack_continuity_1.py`
+- `AILeash-API-Reference-v6.4.2.md`
+- `LICENCE`
 - `README.md`
 - `admin.html`
 - `ai-standard.html`
 - `ai-txt-kit.html`
 - `aitxt-popup-live.html`
 - `brain.html`
-- `certificate.html`
+
+
+## `tests/attack_continuity_1.py`
+
+437 lines, 22577 bytes
+
+```python
+#!/usr/bin/env python3
+"""Attack harness for modules/lineage.py.
+
+Every test is written from the position of an agent that HAS some authority
+and is trying to end up with more. Passing means the attack was refused for
+the right reason, not merely refused.
+"""
+
+import hashlib
+import json
+import sqlite3
+import threading
+import time
+import sys
+
+import continuity as lineage
+# --- stand-in for the deployed engine ---------------------------------
+import types as _types
+_ENGINE = {"verdict": "ALLOW"}
+
+def install_engine(verdict="ALLOW", raises=False, shape="dict"):
+    _ENGINE["verdict"] = verdict
+    mod = _types.ModuleType("server")
+    mod.get_bearer = lambda *a, **k: None
+    def score_event(event):
+        if raises:
+            raise RuntimeError("engine down")
+        if shape == "dict":
+            return {"decision": _ENGINE["verdict"], "score": 0.1}
+        if shape == "tuple":
+            return (_ENGINE["verdict"], 0.1)
+        return _ENGINE["verdict"]
+    mod.score_event = score_event
+    sys.modules["server"] = mod
+
+def remove_engine():
+    sys.modules.pop("server", None)
+
+install_engine("ALLOW")
+
+
+PASS, FAIL = [], []
+
+
+def make_ctx():
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    lock = threading.RLock()
+    chain = {"n": 0, "prev": "0" * 64}
+
+    def seal(ev, res, ts, api_key):
+        chain["n"] += 1
+        payload = json.dumps([ev, res, ts, api_key, chain["prev"]], sort_keys=True)
+        h = hashlib.sha256(payload.encode()).hexdigest()
+        chain["prev"] = h
+        return h, chain["n"], chain["n"]
+
+    lineage._ready = False
+    ctx = {"conn": conn, "lock": lock, "seal": seal}
+    lineage._setup(ctx)
+    return ctx
+
+
+def check(name, condition, detail=""):
+    (PASS if condition else FAIL).append(name)
+    print(("  ok   " if condition else "  FAIL ") + name + (("  -> " + detail) if detail and not condition else ""))
+
+
+def issue(ctx, **kw):
+    return lineage._issue(ctx, "k", kw)
+
+
+def exercise(ctx, **kw):
+    return lineage._evaluate(ctx, "k", kw)
+
+
+NOW = time.time()
+HOUR = 3600
+
+
+def base_root(ctx, **over):
+    args = dict(
+        id="root", issuer="justin@monop", issuer_kind="human",
+        subject="orchestrator", subject_kind="agent",
+        scope=["payments.refund", "payments.read", "tickets.*"],
+        constraints={"max_amount": 5000, "allowed_currency": ["GBP", "EUR"],
+                     "denied_country": ["KP"], "may_contact_customer": True},
+        purpose="resolve customer refund complaints",
+        purpose_tags=["refunds", "support"],
+        not_before=NOW - HOUR, not_after=NOW + 10 * HOUR,
+        delegations_left=3)
+    args.update(over)
+    return issue(ctx, **args)
+
+
+print("\n=== 1. the happy path must actually work ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent",
+      subject="refund-agent", scope=["payments.refund"],
+      constraints={"max_amount": 500, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="issue refunds under 500", purpose_tags=["refunds"],
+      not_before=NOW - HOUR, not_after=NOW + 2 * HOUR, delegations_left=1)
+r, code = exercise(ctx, grant="mid", action="payments.refund",
+                   params={"amount": 100, "currency": "GBP", "country": "GB",
+                           "contact_customer": True},
+                   purpose_tag="refunds")
+check("a derivable action returns ALLOW", r["verdict"] == "ALLOW", str(r["reasons"]))
+check("lineage names the human at the root", r["authorised_by"] == "justin@monop")
+check("depth is reported", r["delegation_depth"] == 1)
+check("the decision is sealed", bool(r.get("sealed_in_chain")))
+
+print("\n=== 2. orphan root: an agent grants itself authority ===")
+ctx = make_ctx()
+r, code = issue(ctx, id="self", issuer="rogue-agent", issuer_kind="agent",
+                subject="rogue-agent", scope=["payments.refund"],
+                constraints={"max_amount": 999999}, purpose="whatever I decide",
+                purpose_tags=["anything"], not_after=NOW + HOUR)
+check("self-issued root is refused at issue", code == 409 and r.get("error") == "identity_continuity", str(r))
+
+print("\n=== 3. scope escalation in a child ===")
+ctx = make_ctx()
+base_root(ctx)
+r, code = issue(ctx, id="wide", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="rogue", scope=["payments.refund", "payments.transfer"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                             "denied_country": ["KP"], "may_contact_customer": False},
+                purpose="sneak in a transfer", purpose_tags=["refunds"],
+                not_after=NOW + HOUR, delegations_left=0)
+check("scope the parent never held is refused",
+      code == 409 and "payments.transfer" in r.get("message", ""), str(r))
+
+print("\n=== 4. constraint loosening ===")
+ctx = make_ctx()
+base_root(ctx)
+r, code = issue(ctx, id="rich", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="rogue", scope=["payments.refund"],
+                constraints={"max_amount": 50000, "allowed_currency": ["GBP"],
+                             "denied_country": ["KP"], "may_contact_customer": True},
+                purpose="bigger refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+check("raising a max_ cap is refused", code == 409 and "max_amount" in r.get("message", ""), str(r))
+
+r, code = issue(ctx, id="wide2", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="rogue", scope=["payments.refund"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP", "USD"],
+                             "denied_country": ["KP"], "may_contact_customer": True},
+                purpose="new currency", purpose_tags=["refunds"], not_after=NOW + HOUR)
+check("adding to an allowed_ set is refused", code == 409 and "USD" in r.get("message", ""), str(r))
+
+r, code = issue(ctx, id="undeny", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="rogue", scope=["payments.refund"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                             "denied_country": [], "may_contact_customer": True},
+                purpose="drop the denylist", purpose_tags=["refunds"], not_after=NOW + HOUR)
+check("dropping from a denied_ set is refused", code == 409 and "KP" in r.get("message", ""), str(r))
+
+r, code = issue(ctx, id="newkey", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="rogue", scope=["payments.refund"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                             "denied_country": ["KP"], "may_contact_customer": True,
+                             "may_export_data": True},
+                purpose="invent a permission", purpose_tags=["refunds"], not_after=NOW + HOUR)
+check("introducing a constraint key the parent never expressed is refused",
+      code == 409 and "may_export_data" in r.get("message", ""), str(r))
+
+print("\n=== 5. temporal attacks ===")
+ctx = make_ctx()
+base_root(ctx)
+r, code = issue(ctx, id="long", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="rogue", scope=["payments.refund"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                             "denied_country": ["KP"], "may_contact_customer": True},
+                purpose="outlive the parent", purpose_tags=["refunds"],
+                not_before=NOW, not_after=NOW + 100 * HOUR)
+check("a child cannot outlive its parent", code == 409 and r.get("error") == "temporal_validity", str(r))
+
+# expired ancestor, live leaf, forced in past the issue check
+ctx = make_ctx()
+base_root(ctx, not_after=NOW + HOUR)
+issue(ctx, id="child", parent="root", issuer="orchestrator", issuer_kind="agent",
+      subject="agent-b", scope=["payments.refund"],
+      constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+with ctx["lock"]:
+    ctx["conn"].execute("UPDATE auth_grant SET not_after=? WHERE id='root'", (NOW - 60,))
+    ctx["conn"].commit()
+r, _ = exercise(ctx, grant="child", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "GB",
+                        "contact_customer": True}, purpose_tag="refunds")
+check("an expired ancestor kills a live leaf", r["verdict"] == "BLOCK", str(r["reasons"]))
+check("...and it is reported as tampering, since the row no longer matches its digest",
+      r["broken_invariant"] == "evidence_continuity", r["broken_invariant"] or "")
+
+print("\n=== 6. revocation is transitive ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent",
+      subject="b", scope=["payments.refund"],
+      constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR, delegations_left=1)
+issue(ctx, id="leaf", parent="mid", issuer="b", issuer_kind="agent",
+      subject="c", scope=["payments.refund"],
+      constraints={"max_amount": 50, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+lineage._revoke(ctx, "k", {"grant": "mid", "reason": "agent compromised"})
+r, _ = exercise(ctx, grant="leaf", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "GB",
+                        "contact_customer": True}, purpose_tag="refunds")
+check("revoking the middle blocks the leaf without touching it", r["verdict"] == "BLOCK")
+check("the revoked grant is named", r["broken_at"] == "mid", str(r["broken_at"]))
+r2, _ = exercise(ctx, grant="root", action="payments.refund",
+                 params={"amount": 10, "currency": "GBP", "country": "GB",
+                         "contact_customer": True}, purpose_tag="refunds")
+check("revoking a child does not harm the parent", r2["verdict"] == "ALLOW", str(r2["reasons"]))
+
+print("\n=== 7. delegation depth cannot be manufactured ===")
+ctx = make_ctx()
+base_root(ctx, delegations_left=1)
+issue(ctx, id="d1", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.refund"],
+      constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR, delegations_left=0)
+r, code = issue(ctx, id="d2", parent="d1", issuer="b", issuer_kind="agent", subject="c",
+                scope=["payments.refund"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                             "denied_country": ["KP"], "may_contact_customer": True},
+                purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+check("an exhausted delegation budget stops the chain",
+      code == 409 and r.get("error") == "delegation_not_permitted", str(r))
+
+ctx = make_ctx()
+base_root(ctx, delegations_left=2)
+r, code = issue(ctx, id="greedy", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="b", scope=["payments.refund"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                             "denied_country": ["KP"], "may_contact_customer": True},
+                purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR,
+                delegations_left=5)
+check("a child cannot award itself more onward delegations than remained",
+      code == 409, str(r))
+
+print("\n=== 8. tampering with a stored grant ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.refund"],
+      constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+with ctx["lock"]:
+    ctx["conn"].execute(
+        "UPDATE auth_grant SET constraints=? WHERE id='mid'",
+        (json.dumps({"max_amount": 999999, "allowed_currency": ["GBP", "USD"],
+                     "denied_country": [], "may_contact_customer": True},
+                    sort_keys=True, separators=(",", ":")),))
+    ctx["conn"].commit()
+r, _ = exercise(ctx, grant="mid", action="payments.refund",
+                params={"amount": 900000, "currency": "USD", "country": "GB",
+                        "contact_customer": True}, purpose_tag="refunds")
+check("editing the database does not widen authority", r["verdict"] == "BLOCK")
+check("the tamper is reported as an evidence failure",
+      r["broken_invariant"] == "evidence_continuity", str(r["broken_invariant"]))
+
+print("\n=== 9. re-parenting onto a wider ancestor ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="narrow", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.read"],
+      constraints={"max_amount": 1, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": False},
+      purpose="read only", purpose_tags=["support"], not_after=NOW + HOUR)
+with ctx["lock"]:
+    ctx["conn"].execute("UPDATE auth_grant SET parent=NULL WHERE id='narrow'")
+    ctx["conn"].commit()
+r, _ = exercise(ctx, grant="narrow", action="payments.read",
+                params={}, purpose_tag="support")
+check("detaching a grant to make it a root fails integrity", r["verdict"] == "BLOCK",
+      str(r["reasons"]))
+
+print("\n=== 10. parent cycle ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="a", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.refund"],
+      constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR, delegations_left=1)
+issue(ctx, id="b", parent="a", issuer="b", issuer_kind="agent", subject="c",
+      scope=["payments.refund"],
+      constraints={"max_amount": 50, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+with ctx["lock"]:
+    ctx["conn"].execute("UPDATE auth_grant SET parent='b' WHERE id='a'")
+    ctx["conn"].commit()
+start = time.time()
+r, _ = exercise(ctx, grant="b", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "GB",
+                        "contact_customer": True}, purpose_tag="refunds")
+check("a parent cycle terminates rather than hangs", time.time() - start < 2)
+check("a cycle is BLOCKed as an authority failure", r["verdict"] == "BLOCK")
+
+print("\n=== 11. action parameters beyond the effective constraints ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.refund"],
+      constraints={"max_amount": 500, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+r, _ = exercise(ctx, grant="mid", action="payments.refund",
+                params={"amount": 501, "currency": "GBP", "country": "GB",
+                        "contact_customer": True}, purpose_tag="refunds")
+check("an amount over the cap is BLOCKed", r["verdict"] == "BLOCK", str(r["reasons"]))
+r, _ = exercise(ctx, grant="mid", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "KP",
+                        "contact_customer": True}, purpose_tag="refunds")
+check("a denied country is BLOCKed", r["verdict"] == "BLOCK", str(r["reasons"]))
+
+print("\n=== 12. uncertainty is challenged, not guessed ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.refund"],
+      constraints={"max_amount": 500, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="issue refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+r, _ = exercise(ctx, grant="mid", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "GB",
+                        "contact_customer": True}, purpose_tag="marketing")
+check("a purpose the grant does not carry is CHALLENGED", r["verdict"] == "CHALLENGE", str(r))
+r, _ = exercise(ctx, grant="mid", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "GB",
+                        "contact_customer": True})
+check("no declared purpose is CHALLENGED", r["verdict"] == "CHALLENGE", str(r))
+r, _ = exercise(ctx, grant="mid", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "GB",
+                        "contact_customer": True, "recipient_iban": "GB00XXXX"},
+                purpose_tag="refunds")
+check("an unconstrained parameter is CHALLENGED, not ignored",
+      r["verdict"] == "CHALLENGE" and any("recipient_iban" in x for x in r["reasons"]), str(r))
+
+print("\n=== 13. wildcard breadth ===")
+ctx = make_ctx()
+base_root(ctx)
+r, _ = exercise(ctx, grant="root", action="tickets.close.bulk.all",
+                params={}, purpose_tag="support")
+check("a broad wildcard match is CHALLENGED rather than silently allowed",
+      r["verdict"] == "CHALLENGE", str(r))
+
+ctx = make_ctx()
+base_root(ctx, scope=["*"], id="star")
+r, _ = exercise(ctx, grant="star", action="payments.transfer", params={}, purpose_tag="refunds")
+check("a bare * never reaches ALLOW", r["verdict"] == "CHALLENGE", str(r))
+
+print("\n=== 14. no union of grants ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="money", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.refund"],
+      constraints={"max_amount": 500, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": False},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+issue(ctx, id="contact", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.read"],
+      constraints={"max_amount": 0, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="contact", purpose_tags=["support"], not_after=NOW + HOUR)
+r, code = exercise(ctx, grant="money,contact", action="payments.refund",
+                   params={"amount": 10, "currency": "GBP", "contact_customer": True},
+                   purpose_tag="refunds")
+check("two grant ids cannot be combined into one exercise", r["verdict"] == "BLOCK", str(r))
+r, _ = exercise(ctx, grant="money", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "contact_customer": True},
+                purpose_tag="refunds")
+check("the capability from the sibling grant does not leak in", r["verdict"] == "BLOCK",
+      str(r["reasons"]))
+
+print("\n=== 15. time of check vs time of use ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.refund"],
+      constraints={"max_amount": 500, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+r, _ = exercise(ctx, grant="mid", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "GB",
+                        "contact_customer": True}, purpose_tag="refunds")
+eval_id = r["evaluation"]
+c, code = lineage._confirm(ctx, "k", {"evaluation": eval_id, "action": "payments.refund",
+                                      "params": {"amount": 10, "currency": "GBP",
+                                                 "country": "GB", "contact_customer": True}})
+check("executing exactly what was evaluated binds", c["bound"] is True, str(c))
+c, code = lineage._confirm(ctx, "k", {"evaluation": eval_id, "action": "payments.refund",
+                                      "params": {"amount": 400, "currency": "GBP",
+                                                 "country": "GB", "contact_customer": True}})
+check("executing different values than were evaluated is rejected", c["bound"] is False, str(c))
+check("the rejected execution is still sealed", bool(c.get("sealed_in_chain")))
+
+with ctx["lock"]:
+    ctx["conn"].execute("UPDATE auth_eval SET valid_until=? WHERE id=?", (NOW - 1, eval_id))
+    ctx["conn"].commit()
+c, _ = lineage._confirm(ctx, "k", {"evaluation": eval_id})
+check("a banked evaluation cannot be spent after its window", c["bound"] is False, str(c))
+
+print("\n=== 16. a BLOCK is evidence, not silence ===")
+ctx = make_ctx()
+base_root(ctx)
+r, _ = exercise(ctx, grant="nonexistent", action="payments.refund", params={})
+check("an unknown grant BLOCKs", r["verdict"] == "BLOCK")
+check("the block is sealed in the chain", bool(r.get("sealed_in_chain")))
+d, code = lineage._decision(ctx, {"evaluation": r["evaluation"]})
+check("the sealed decision is publicly retrievable", code == 200 and d["verdict"] == "BLOCK")
+
+print("\n=== 17. no authority without a stated purpose or an end date ===")
+ctx = make_ctx()
+r, code = issue(ctx, id="forever", issuer="justin@monop", issuer_kind="human", subject="a",
+                scope=["payments.refund"], constraints={"max_amount": 1},
+                purpose="anything", purpose_tags=["x"])
+check("a grant with no expiry is refused", code == 400 and r.get("error") == "not_after_required")
+r, code = issue(ctx, id="vague", issuer="justin@monop", issuer_kind="human", subject="a",
+                scope=["payments.refund"], constraints={"max_amount": 1},
+                purpose="", purpose_tags=["x"], not_after=NOW + HOUR)
+check("a grant with no purpose is refused", code == 400 and r.get("error") == "purpose_required")
+
+print("\n" + "=" * 60)
+print("passed %d, failed %d" % (len(PASS), len(FAIL)))
+if FAIL:
+    for f in FAIL:
+        print("  FAILED: " + f)
+    sys.exit(1)
+
+```
+
+
+## `AILeash-API-Reference-v6.4.2.md`
+
+256 lines, 6799 bytes
+
+```markdown
+# AILeash v6.4.2 — Complete API Reference
+
+## Core Decision Endpoint
+
+### POST /api/govern
+**The engine. Every action scores here.**
+
+Auth: `Bearer YOUR_API_KEY`
+
+**Request:**
+```json
+{
+  "user_id": "string (required)",
+  "action": "string (required) — payment/login/message/transfer/checkout/api_call",
+  "amount": "number (optional, default 0) — monetary value in GBP",
+  "country": "string (required) — ISO 3166-1 alpha-2 code",
+  "device_id": "string (required) — unique device identifier",
+  "anomaly": "number 0..1 (optional) — behavioural anomaly score",
+  "device_risk": "number 0..1 (optional) — device risk score"
+}
+```
+
+**Response (200 OK):**
+```json
+{
+  "decision": "ALLOW|CHALLENGE|BLOCK",
+  "score": 0.0..1.0,
+  "trust": 0.05..1.0,
+  "reasons": ["velocity_spike", "high_amount", "country_shift"],
+  "audit_hash": "sha256_hex_string",
+  "block_index": 12345,
+  "receipt_seq": 42,
+  "timestamp": 1719072000.0,
+  "challenge_url": "https://sebbi.pro/verify-challenge?token=...",
+  "challenge_expires_in": 900
+}
+```
+
+**Error responses:**
+- `401 Unauthorized` — Missing or invalid API key
+- `403 Forbidden` — Account inactive or over quota
+- `429 Too Many Requests` — Rate limited
+- `503 Service Unavailable` — Server overloaded
+
+---
+
+## Account Management
+
+### POST /api/keys or /signup
+**Create a new API key. Instant. No card. No humans in the loop.**
+
+No auth required.
+
+**Request:**
+```json
+{
+  "email": "user@example.com (required)",
+  "name": "John Doe (optional)",
+  "phone": "+441234567890 (optional)",
+  "org": "Acme Corp (optional)",
+  "product": "aileash|guardian|sonicboom|sentinel (default: aileash)",
+  "devices": 1..1000000 (default: 1),
+  "ref_code": "REF-XXXX-1234 (optional)"
+}
+```
+
+**Response (200 OK):**
+```json
+{
+  "api_key": "al_live_...",
+  "email": "user@example.com",
+  "product": "aileash",
+  "devices": 1,
+  "monthly_cost": 0.50,
+  "quota": 100,
+  "ref_code": "REF-JOHN-5678",
+  "badge_id": "abc123def456",
+  "message": "100 free decisions. Then 50p per device per month via Stripe."
+}
+```
+
+---
+
+## Verification & Public Endpoints
+
+### GET /api/spec
+**Engine specification. Public. No auth.**
+
+**Response (200 OK):**
+```json
+{
+  "engine": "AILeash v6.4.2",
+  "version": "6.4.2",
+  "signals": 9,
+  "decision_latency_ms": 28,
+  "threshold_allow": 0.35,
+  "threshold_challenge": 0.70,
+  "threshold_block": 1.0,
+  "features": ["deterministic scoring", "tamper-evident chain", "real-time alerts", "gapless receipts", "sovereign deployment"]
+}
+```
+
+### GET /api/verify-chain
+**Full audit chain integrity proof. Public. No auth.**
+
+**Response (200 OK):**
+```json
+{
+  "valid": true,
+  "blocks": 45678,
+  "genesis": "GENESIS",
+  "tip": "abc123...",
+  "message": "Chain intact. No tampering detected.",
+  "verifiable_by": "anyone, anywhere"
+}
+```
+
+### GET /api/health
+**Server health and load. Public. No auth.**
+
+**Response (200 OK):**
+```json
+{
+  "status": "ok",
+  "version": "6.4.2",
+  "uptime_seconds": 864000,
+  "rps": 42,
+  "timestamp": 1719072000.0
+}
+```
+
+---
+
+## Real-time Dashboards
+
+### GET /api/pulse
+**Live risk posture. Your current state.**
+
+Auth: `Bearer YOUR_API_KEY`
+
+**Response (200 OK):**
+```json
+{
+  "last_hour": {
+    "ALLOW": 486,
+    "CHALLENGE": 23,
+    "BLOCK": 4
+  },
+  "recent": [
+    {
+      "ts": 1719072000,
+      "user_id": "u_7f2",
+      "action": "payment",
+      "decision": "ALLOW",
+      "score": 0.12,
+      "reasons": [],
+      "audit_hash": "abc123..."
+    }
+  ],
+  "chain_tip": "abc123...",
+  "message": "All green. Chain tip sealed."
+}
+```
+
+---
+
+## Billing & Webhooks
+
+### POST /stripe-webhook
+**Stripe webhook receiver. Signature verified automatically.**
+
+Supports events:
+- `checkout.session.completed` — User upgraded
+- `invoice.paid` — Monthly subscription paid
+- `customer.subscription.deleted` — User cancelled
+- `invoice.payment_failed` — Payment failed
+
+---
+
+## Four Products. One Engine.
+
+### AILeash
+- **What:** Every AI decision your platform makes about a person gets scored, explained, and sealed.
+- **Who:** Platforms using AI for any regulated decision (lending, hiring, content moderation, fraud, access control).
+- **Price:** 50p per device per month + your margin.
+- **Free tier:** 100 decisions/month, no card.
+
+### Guardian
+- **What:** Free message checker for families. Child pastes a message in, gets instant plain-English assessment against grooming patterns.
+- **Who:** Families. Free forever. No card. No catch.
+- **Price:** Free. Always.
+- **Built for:** ICO Children's Code, Online Safety Act, child safety.
+
+### SonicBoom
+- **What:** One line of code. Drops into AWS, Azure, GCP, OpenAI, Anthropic. Adds full compliance audit chain to every call.
+- **Who:** Platforms already running AI in the cloud.
+- **Price:** 50p per device per month + your margin.
+- **Latency:** No impact. Chain sealing is asynchronous.
+
+### Sentinel
+- **What:** Fraud and anomaly alerting. Scores unusual patterns (500 messages in a minute, login from new country, velocity spikes) in real-time.
+- **Who:** Platforms managing fraud, abuse, takeovers.
+- **Price:** 50p per device per month + your margin.
+- **Real-time:** Alerts the moment thresholds trip.
+
+---
+
+## The Score Formula (Immutable)
+
+**Raw weighted sum (Σ_raw):**
+```
+Σ_raw =
+  (1 − trust) × 0.30
+  + min(velocity_60s / 20, 1) × 0.15
+  + min(velocity_5m / 50, 1) × 0.10
+  + min(velocity_1h / 200, 1) × 0.10
+  + min(ln(1+amount) / ln(1+10000), 1) × 0.15
+  + device_risk × 0.10
+  + behavioural_anomaly × 0.10
+  + country_shift × 0.10
+  + unsafe_country × 0.10
+```
+
+**Normalization:** the nine weights above sum to 1.20, not 1.0. To keep every signal's *relative* importance exactly as designed while guaranteeing the score behaves as a true 0–1 weighted average (not one that can reach BLOCK-level values from fewer combined signals than intended), divide by the actual weight total before clamping:
+
+```
+WEIGHT_TOTAL = 0.30 + 0.15 + 0.10 + 0.10 + 0.15 + 0.10 + 0.10 + 0.10 + 0.10   # = 1.20
+
+score = clamp( Σ_raw / WEIGHT_TOTAL , 0, 1 )
+
+decision = ALLOW if score < 0.35
+         = CHALLENGE if score < 0.70
+         = BLOCK otherwise
+```
+
+No machine learning. No drift. No retraining. Weights are written in code and cannot change without a new release. `WEIGHT_TOTAL` is a fixed constant (1.20) recomputed only if a signal is added, removed, or reweighted in a future release — never at runtime.
+
+---
+
+## Rate Limits
+
+- **Free tier:** 100 decisions/month
+- **Paid:** Unlimited (or by plan)
+- **Public endpoints:** No rate limit
+
+---
+
+## Documentation
+
+- **Homepage:** https://sebbi.pro
+- **Whitepaper:** https://sebbi.pro/whitepaper
+- **Developers:** https://sebbi.pro/developers
+- **Scanner (free):** https://sebbi.pro/scan
+- **Guardian:** https://sebbi.pro/guardian-app
+- **Contact:** justrightdecorators@gmail.com
+
+```
+
+
+## `LICENCE`
+
+22 lines, 1074 bytes
+
+```
+MIT License
+
+Copyright (c) 2026 Monop (Blyth, UK)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+```
 
 
 ## `README.md`
@@ -1107,538 +1848,6 @@ result = brain.evaluate(<span class="s">"approve payment to supplier 88"</span>,
   }
   judge();
 </script>
-</body>
-</html>
-
-```
-
-
-## `certificate.html`
-
-524 lines, 25575 bytes
-
-```html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>AI Compliance Certificate — AILeash by sebbi.pro</title>
-<meta name="description" content="Generate a cryptographically verified AI compliance certificate. Court-ready. Regulator-ready. Backed by SHA-256 Merkle chain audit infrastructure.">
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600;700&family=IBM+Plex+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-:root{
-  --bg:#04040a;
-  --surface:#08080f;
-  --surface2:#0d0d18;
-  --border:#141428;
-  --border2:#1e1e38;
-  --gold:#c9a84c;
-  --gold2:#e8c96a;
-  --green:#00e5a0;
-  --red:#ff3d5a;
-  --blue:#4d9fff;
-  --text:#e8e8f8;
-  --muted:#4a4a6a;
-  --muted2:#6a6a8a;
-  --mono:'IBM Plex Mono',monospace;
-  --sans:'IBM Plex Sans',sans-serif;
-}
-
-html{scroll-behavior:smooth}
-body{background:var(--bg);color:var(--text);font-family:var(--sans);min-height:100vh}
-
-nav{position:fixed;top:0;left:0;right:0;z-index:100;height:52px;display:flex;align-items:center;justify-content:space-between;padding:0 32px;background:rgba(4,4,10,0.9);backdrop-filter:blur(16px);border-bottom:1px solid var(--border)}
-.nav-logo{font-family:var(--mono);font-size:13px;color:var(--gold);text-decoration:none}
-.nav-back{font-size:12px;color:var(--muted2);text-decoration:none;transition:color .2s}.nav-back:hover{color:var(--text)}
-
-.hero{padding:100px 32px 60px;max-width:800px;margin:0 auto;text-align:center}
-.eyebrow{font-family:var(--mono);font-size:10px;color:var(--green);letter-spacing:0.2em;text-transform:uppercase;margin-bottom:20px;display:flex;align-items:center;justify-content:center;gap:10px}
-.eyebrow::before,.eyebrow::after{content:'';width:24px;height:1px;background:var(--green);opacity:0.5}
-h1{font-size:clamp(32px,5vw,56px);font-weight:700;letter-spacing:-0.03em;line-height:1.05;margin-bottom:16px}
-h1 span{color:var(--gold)}
-.hero-sub{font-size:16px;color:var(--muted2);line-height:1.7;max-width:560px;margin:0 auto 48px;font-weight:300}
-
-/* STEPS */
-.steps-row{display:grid;grid-template-columns:repeat(3,1fr);gap:2px;background:var(--border);border-radius:10px;overflow:hidden;margin-bottom:48px;max-width:700px;margin-left:auto;margin-right:auto}
-.step-card{background:var(--surface);padding:20px;text-align:center}
-.step-num{font-family:var(--mono);font-size:28px;color:var(--gold);font-weight:700;opacity:0.3;margin-bottom:6px}
-.step-title{font-size:13px;font-weight:600;margin-bottom:4px}
-.step-desc{font-size:11px;color:var(--muted2);line-height:1.5}
-
-/* MAIN CARD */
-.main-wrap{max-width:700px;margin:0 auto;padding:0 32px 80px}
-
-.card{background:var(--surface);border:1px solid var(--border2);border-radius:12px;overflow:hidden;position:relative}
-.card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--gold),var(--green),var(--blue))}
-
-.card-inner{padding:32px}
-
-.form-section{margin-bottom:24px}
-.section-label{font-family:var(--mono);font-size:10px;color:var(--muted);letter-spacing:0.15em;text-transform:uppercase;margin-bottom:16px;display:flex;align-items:center;gap:8px}
-.section-label::after{content:'';flex:1;height:1px;background:var(--border)}
-
-.field{margin-bottom:16px}
-.field-label{font-size:12px;color:var(--muted2);margin-bottom:6px;display:block;font-weight:500}
-.field-input{width:100%;background:#060610;border:1px solid var(--border2);color:var(--text);padding:12px 16px;font-size:14px;font-family:var(--sans);border-radius:6px;outline:none;transition:border-color .2s}
-.field-input:focus{border-color:var(--gold)}
-.field-input::placeholder{color:var(--muted)}
-.field-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-
-/* REGULATIONS */
-.reg-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-top:8px}
-.reg-item{display:flex;align-items:center;gap:10px;padding:10px 14px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;cursor:pointer;transition:all .2s}
-.reg-item.selected{border-color:var(--gold);background:rgba(201,168,76,0.06)}
-.reg-check{width:16px;height:16px;border:1px solid var(--border2);border-radius:3px;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:10px;transition:all .2s}
-.reg-item.selected .reg-check{background:var(--gold);border-color:var(--gold);color:#000}
-.reg-name{font-size:12px;font-weight:500}
-.reg-desc{font-size:10px;color:var(--muted);margin-top:1px}
-
-/* PRICING */
-.pricing-box{background:linear-gradient(135deg,rgba(201,168,76,0.08),rgba(201,168,76,0.02));border:1px solid rgba(201,168,76,0.2);border-radius:8px;padding:20px;display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:20px}
-.pricing-left h3{font-size:15px;font-weight:600;margin-bottom:4px}
-.pricing-left p{font-size:12px;color:var(--muted2);line-height:1.5}
-.pricing-amount{font-family:var(--mono);font-size:32px;color:var(--gold);font-weight:700;white-space:nowrap}
-.pricing-amount span{font-size:13px;color:var(--muted2);font-weight:400}
-
-.generate-btn{width:100%;background:linear-gradient(135deg,var(--gold),var(--gold2));color:#000;border:none;padding:15px;font-size:15px;font-weight:700;font-family:var(--sans);border-radius:8px;cursor:pointer;transition:all .2s;display:flex;align-items:center;justify-content:center;gap:8px}
-.generate-btn:hover{transform:translateY(-1px);box-shadow:0 8px 24px rgba(201,168,76,0.25)}
-.generate-btn:disabled{opacity:0.5;cursor:not-allowed;transform:none}
-
-.error-msg{background:rgba(255,61,90,0.08);border:1px solid rgba(255,61,90,0.2);border-radius:6px;padding:12px 16px;font-size:13px;color:var(--red);margin-top:12px;display:none;font-family:var(--mono)}
-.error-msg.show{display:block}
-
-/* CERTIFICATE */
-.cert-wrap{display:none;margin-top:32px}
-.cert-wrap.show{display:block}
-
-.certificate{background:#fff;border-radius:10px;overflow:hidden;box-shadow:0 20px 60px rgba(0,0,0,0.5)}
-
-.cert-header{background:#0a0f1e;padding:28px 36px;display:flex;align-items:center;justify-content:space-between}
-.cert-logo{font-size:18px;font-weight:900;color:#fff;font-family:Georgia,serif}.cert-logo span{color:#c9a84c}
-.cert-header-right{text-align:right}
-.cert-type{font-family:var(--mono);font-size:9px;color:rgba(255,255,255,0.4);letter-spacing:0.15em;text-transform:uppercase;margin-bottom:2px}
-.cert-num{font-family:var(--mono);font-size:11px;color:#c9a84c}
-
-.cert-stripe{height:4px;background:linear-gradient(90deg,#c9a84c,#00e5a0,#4d9fff)}
-
-.cert-body{padding:36px}
-.cert-title{font-size:11px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:0.15em;margin-bottom:8px;font-family:var(--mono)}
-.cert-company{font-size:32px;font-weight:700;color:#0a0f1e;letter-spacing:-0.02em;margin-bottom:4px}
-.cert-domain{font-size:14px;color:#64748b;margin-bottom:24px;font-family:var(--mono)}
-
-.cert-statement{background:#f8f9fc;border-left:3px solid #c9a84c;padding:16px 20px;border-radius:0 6px 6px 0;margin-bottom:24px;font-size:13px;color:#1a202c;line-height:1.7}
-
-.cert-regs{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:24px}
-.cert-reg{display:flex;align-items:center;gap:8px;padding:10px 14px;background:#f8f9fc;border-radius:6px;border:1px solid #e2e8f0}
-.cert-reg-tick{width:18px;height:18px;background:#00875a;border-radius:50%;display:flex;align-items:center;justify-content:center;color:#fff;font-size:10px;flex-shrink:0}
-.cert-reg-text{font-size:11px;font-weight:600;color:#1a202c}
-
-.cert-chain{background:#0a0f1e;border-radius:8px;padding:16px 20px;margin-bottom:24px}
-.cert-chain-label{font-family:var(--mono);font-size:9px;color:#c9a84c;letter-spacing:0.15em;text-transform:uppercase;margin-bottom:8px}
-.cert-chain-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;flex-wrap:wrap;gap:4px}
-.cert-chain-key{font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.4)}
-.cert-chain-val{font-family:var(--mono);font-size:10px;color:#00e5a0;word-break:break-all;text-align:right;max-width:70%}
-
-.cert-footer{display:flex;justify-content:space-between;align-items:flex-end;padding-top:20px;border-top:1px solid #e2e8f0;flex-wrap:wrap;gap:16px}
-.cert-footer-left{}
-.cert-footer-label{font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:0.1em;margin-bottom:4px;font-family:var(--mono)}
-.cert-footer-val{font-size:13px;font-weight:600;color:#0a0f1e}
-.cert-seal{width:64px;height:64px;border-radius:50%;background:linear-gradient(135deg,#0a0f1e,#1a2a4a);border:2px solid #c9a84c;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center}
-.cert-seal-text{font-family:var(--mono);font-size:7px;color:#c9a84c;letter-spacing:0.1em;text-transform:uppercase;line-height:1.4}
-
-/* ACTIONS */
-.cert-actions{display:flex;gap:12px;margin-top:20px;flex-wrap:wrap}
-.btn-download{flex:1;background:linear-gradient(135deg,var(--gold),var(--gold2));color:#000;border:none;padding:13px;font-size:14px;font-weight:700;font-family:var(--sans);border-radius:8px;cursor:pointer;transition:all .2s;display:flex;align-items:center;justify-content:center;gap:8px}
-.btn-download:hover{transform:translateY(-1px);box-shadow:0 8px 24px rgba(201,168,76,0.25)}
-.btn-share{flex:1;background:var(--surface2);border:1px solid var(--border2);color:var(--text);padding:13px;font-size:14px;font-weight:600;font-family:var(--sans);border-radius:8px;cursor:pointer;transition:all .2s;display:flex;align-items:center;justify-content:center;gap:8px}
-.btn-share:hover{border-color:var(--gold);color:var(--gold)}
-
-/* TRUST STRIP */
-.trust-strip{display:flex;justify-content:center;gap:32px;padding:48px 32px;flex-wrap:wrap;max-width:700px;margin:0 auto}
-.trust-item{text-align:center}
-.trust-n{font-family:var(--mono);font-size:20px;color:var(--gold);font-weight:700}
-.trust-l{font-size:11px;color:var(--muted2);margin-top:3px}
-
-@media(max-width:600px){
-  .field-row{grid-template-columns:1fr}
-  .reg-grid{grid-template-columns:1fr}
-  .cert-regs{grid-template-columns:1fr}
-  .steps-row{grid-template-columns:1fr}
-  .cert-body{padding:24px}
-  .main-wrap{padding:0 16px 60px}
-  .hero{padding:80px 16px 40px}
-  nav{padding:0 16px}
-}
-</style>
-</head>
-<body>
-
-<nav>
-  <a href="/" class="nav-logo">sebbi.pro</a>
-  <a href="/" class="nav-back">← Back to AILeash</a>
-</nav>
-
-<div class="hero">
-  <div class="eyebrow">AI Compliance Certificate</div>
-  <h1>Prove compliance.<br><span>Court-ready. Today.</span></h1>
-  <p class="hero-sub">Generate a cryptographically verified AI compliance certificate backed by your SHA-256 Merkle audit chain. Hand it to a regulator. Show it to a client. Publish it on your site.</p>
-
-  <div class="steps-row">
-    <div class="step-card">
-      <div class="step-num">01</div>
-      <div class="step-title">Enter your details</div>
-      <div class="step-desc">Company name, domain, and your AILeash API key</div>
-    </div>
-    <div class="step-card">
-      <div class="step-num">02</div>
-      <div class="step-title">Select regulations</div>
-      <div class="step-desc">Choose which compliance frameworks apply to you</div>
-    </div>
-    <div class="step-card">
-      <div class="step-num">03</div>
-      <div class="step-title">Download certificate</div>
-      <div class="step-desc">Cryptographically signed, regulator-ready PDF</div>
-    </div>
-  </div>
-</div>
-
-<div class="main-wrap">
-  <div class="card">
-    <div class="card-inner">
-
-      <div class="form-section">
-        <div class="section-label">Organisation Details</div>
-        <div class="field-row">
-          <div class="field">
-            <label class="field-label">Company / Organisation Name</label>
-            <input class="field-input" type="text" id="org-name" placeholder="Acme Financial Ltd">
-          </div>
-          <div class="field">
-            <label class="field-label">Domain</label>
-            <input class="field-input" type="text" id="org-domain" placeholder="acmefinancial.com">
-          </div>
-        </div>
-        <div class="field">
-          <label class="field-label">AILeash API Key</label>
-          <input class="field-input" type="text" id="api-key" placeholder="al_live_...">
-        </div>
-        <div class="field">
-          <label class="field-label">Contact Email</label>
-          <input class="field-input" type="email" id="contact-email" placeholder="compliance@yourcompany.com">
-        </div>
-      </div>
-
-      <div class="form-section">
-        <div class="section-label">Regulatory Frameworks</div>
-        <div class="reg-grid">
-          <div class="reg-item selected" onclick="toggleReg(this,'EU AI Act Articles 9, 12, 13, 14')">
-            <div class="reg-check">✓</div>
-            <div>
-              <div class="reg-name">EU AI Act</div>
-              <div class="reg-desc">Articles 9, 12, 13, 14 · Aug 2026</div>
-            </div>
-          </div>
-          <div class="reg-item selected" onclick="toggleReg(this,'UK Online Safety Act 2023')">
-            <div class="reg-check">✓</div>
-            <div>
-              <div class="reg-name">UK Online Safety Act</div>
-              <div class="reg-desc">2023 · Already in force</div>
-            </div>
-          </div>
-          <div class="reg-item selected" onclick="toggleReg(this,'GDPR Article 22')">
-            <div class="reg-check">✓</div>
-            <div>
-              <div class="reg-name">GDPR Article 22</div>
-              <div class="reg-desc">Automated decisions · UK & EU</div>
-            </div>
-          </div>
-          <div class="reg-item" onclick="toggleReg(this,'Digital Services Act EU 2022/2065')">
-            <div class="reg-check"></div>
-            <div>
-              <div class="reg-name">Digital Services Act</div>
-              <div class="reg-desc">EU 2022/2065</div>
-            </div>
-          </div>
-          <div class="reg-item" onclick="toggleReg(this,'ICO Children\'s Code')">
-            <div class="reg-check"></div>
-            <div>
-              <div class="reg-name">ICO Children's Code</div>
-              <div class="reg-desc">Under-18 platform access</div>
-            </div>
-          </div>
-          <div class="reg-item" onclick="toggleReg(this,'FCA AI Governance Guidelines')">
-            <div class="reg-check"></div>
-            <div>
-              <div class="reg-name">FCA Guidelines</div>
-              <div class="reg-desc">Financial services AI</div>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <div class="pricing-box">
-        <div class="pricing-left">
-          <h3>Verified Compliance Certificate</h3>
-          <p>Cryptographically signed · SHA-256 Merkle chain verified · Regulator-ready · Valid 12 months</p>
-        </div>
-        <div class="pricing-amount">£99 <span>one-time</span></div>
-      </div>
-
-      <button class="generate-btn" id="gen-btn" onclick="generateCert()">
-        <span>Generate My Compliance Certificate</span>
-        <span>→</span>
-      </button>
-      <div class="error-msg" id="error-msg"></div>
-
-      <!-- CERTIFICATE OUTPUT -->
-      <div class="cert-wrap" id="cert-wrap">
-        <div class="certificate" id="certificate">
-          <div class="cert-header">
-            <div class="cert-logo">Monop <span>Content</span></div>
-            <div class="cert-header-right">
-              <div class="cert-type">Certificate of AI Compliance</div>
-              <div class="cert-num" id="cert-num">CERT-000000</div>
-            </div>
-          </div>
-          <div class="cert-stripe"></div>
-          <div class="cert-body">
-            <div class="cert-title">This certifies that</div>
-            <div class="cert-company" id="cert-company">—</div>
-            <div class="cert-domain" id="cert-domain">—</div>
-
-            <div class="cert-statement" id="cert-statement">—</div>
-
-            <div class="cert-regs" id="cert-regs"></div>
-
-            <div class="cert-chain">
-              <div class="cert-chain-label">// Cryptographic Verification</div>
-              <div class="cert-chain-row">
-                <span class="cert-chain-key">Algorithm</span>
-                <span class="cert-chain-val">SHA-256 Merkle Chain</span>
-              </div>
-              <div class="cert-chain-row">
-                <span class="cert-chain-key">Chain Status</span>
-                <span class="cert-chain-val" id="cert-chain-status">Verifying...</span>
-              </div>
-              <div class="cert-chain-row">
-                <span class="cert-chain-key">Chain Tip Hash</span>
-                <span class="cert-chain-val" id="cert-hash">—</span>
-              </div>
-              <div class="cert-chain-row">
-                <span class="cert-chain-key">Decisions Audited</span>
-                <span class="cert-chain-val" id="cert-blocks">—</span>
-              </div>
-              <div class="cert-chain-row">
-                <span class="cert-chain-key">Verify URL</span>
-                <span class="cert-chain-val">sebbi.pro/api/verify-chain</span>
-              </div>
-            </div>
-
-            <div class="cert-footer">
-              <div>
-                <div class="cert-footer-left">
-                  <div class="cert-footer-label">Issued By</div>
-                  <div class="cert-footer-val">AILeash · sebbi.pro</div>
-                </div>
-              </div>
-              <div>
-                <div class="cert-footer-label">Issue Date</div>
-                <div class="cert-footer-val" id="cert-date">—</div>
-              </div>
-              <div>
-                <div class="cert-footer-label">Valid Until</div>
-                <div class="cert-footer-val" id="cert-expiry">—</div>
-              </div>
-              <div class="cert-seal">
-                <div class="cert-seal-text">AILeash<br>VERIFIED<br>OAAS-1.0</div>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <div class="cert-actions">
-          <button class="btn-download" onclick="downloadCert()">↓ Download Certificate PDF</button>
-          <button class="btn-share" onclick="shareCert()">⇗ Share Certificate</button>
-        </div>
-      </div>
-
-    </div>
-  </div>
-
-  <div class="trust-strip">
-    <div class="trust-item"><div class="trust-n">SHA-256</div><div class="trust-l">Merkle Chain</div></div>
-    <div class="trust-item"><div class="trust-n">OAAS-1.0</div><div class="trust-l">Open Standard</div></div>
-    <div class="trust-item"><div class="trust-n">6</div><div class="trust-l">Regulations Covered</div></div>
-    <div class="trust-item"><div class="trust-n">12mo</div><div class="trust-l">Certificate Validity</div></div>
-  </div>
-</div>
-
-<script>
-var selectedRegs = ['EU AI Act Articles 9, 12, 13, 14', 'UK Online Safety Act 2023', 'GDPR Article 22'];
-
-function toggleReg(el, reg) {
-  if (el.classList.contains('selected')) {
-    el.classList.remove('selected');
-    el.querySelector('.reg-check').textContent = '';
-    selectedRegs = selectedRegs.filter(function(r){ return r !== reg; });
-  } else {
-    el.classList.add('selected');
-    el.querySelector('.reg-check').textContent = '✓';
-    selectedRegs.push(reg);
-  }
-}
-
-function generateHash(str) {
-  var h = 0;
-  for (var i = 0; i < str.length; i++) {
-    h = Math.imul(31, h) + str.charCodeAt(i) | 0;
-  }
-  return Math.abs(h).toString(16).padStart(8,'0') +
-    Math.abs(h*31).toString(16).padStart(8,'0') +
-    Math.abs(h*31*31).toString(16).padStart(8,'0') +
-    Math.abs(h*31*31*31).toString(16).padStart(8,'0') +
-    Math.abs(h*31*31*31*31).toString(16).padStart(8,'0');
-}
-
-function generateCertNum() {
-  return 'CERT-' + Date.now().toString(36).toUpperCase();
-}
-
-async function generateCert() {
-  var orgName = document.getElementById('org-name').value.trim();
-  var domain = document.getElementById('org-domain').value.trim();
-  var apiKey = document.getElementById('api-key').value.trim();
-  var email = document.getElementById('contact-email').value.trim();
-  var errEl = document.getElementById('error-msg');
-  var btn = document.getElementById('gen-btn');
-
-  errEl.classList.remove('show');
-
-  if (!orgName) { errEl.textContent = 'Please enter your organisation name.'; errEl.classList.add('show'); return; }
-  if (!domain) { errEl.textContent = 'Please enter your domain.'; errEl.classList.add('show'); return; }
-  if (!apiKey || !apiKey.startsWith('al_live_') && !apiKey.startsWith('sb_live_') && !apiKey.startsWith('ag_live_') && !apiKey.startsWith('se_live_')) {
-    errEl.textContent = 'Please enter a valid AILeash API key (starts with al_live_, sb_live_, ag_live_ or se_live_).';
-    errEl.classList.add('show'); return;
-  }
-  if (!email || !email.includes('@')) { errEl.textContent = 'Please enter a valid email address.'; errEl.classList.add('show'); return; }
-  if (selectedRegs.length === 0) { errEl.textContent = 'Please select at least one regulatory framework.'; errEl.classList.add('show'); return; }
-
-  btn.textContent = 'Verifying chain integrity...';
-  btn.disabled = true;
-
-  // Verify chain
-  var chainData = null;
-  try {
-    var r = await fetch('/api/verify-chain');
-    chainData = await r.json();
-  } catch(e) {
-    chainData = {valid: true, blocks: 0, tip: generateHash(apiKey)};
-  }
-
-  // Verify API key
-  var keyValid = false;
-  try {
-    var r2 = await fetch('/api/validate-engine', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json','Authorization':'Bearer '+apiKey}
-    });
-    var kd = await r2.json();
-    keyValid = kd.valid === true;
-  } catch(e) {
-    keyValid = true; // fallback
-  }
-
-  if (!keyValid) {
-    errEl.textContent = 'API key validation failed. Please check your key and try again.';
-    errEl.classList.add('show');
-    btn.textContent = 'Generate My Compliance Certificate →';
-    btn.disabled = false;
-    return;
-  }
-
-  // Notify Justin
-  fetch('/contact', {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({
-      name: orgName,
-      email: email,
-      phone: '',
-      org: domain,
-      message: 'CERTIFICATE REQUEST\n\nOrg: ' + orgName + '\nDomain: ' + domain + '\nEmail: ' + email + '\nRegs: ' + selectedRegs.join(', ') + '\nKey: ' + apiKey.slice(0,20) + '...'
-    })
-  }).catch(function(){});
-
-  // Build certificate
-  var now = new Date();
-  var expiry = new Date(now);
-  expiry.setFullYear(expiry.getFullYear() + 1);
-
-  var certNum = generateCertNum();
-  var hash = chainData.tip || generateHash(apiKey + orgName + now.getTime());
-
-  document.getElementById('cert-num').textContent = certNum;
-  document.getElementById('cert-company').textContent = orgName;
-  document.getElementById('cert-domain').textContent = domain;
-  document.getElementById('cert-date').textContent = now.toLocaleDateString('en-GB', {day:'numeric',month:'long',year:'numeric'});
-  document.getElementById('cert-expiry').textContent = expiry.toLocaleDateString('en-GB', {day:'numeric',month:'long',year:'numeric'});
-
-  document.getElementById('cert-statement').textContent =
-    orgName + ' (' + domain + ') operates AI systems governed by the AILeash sovereign compliance engine. Every AI decision made by this organisation is logged in a tamper-evident SHA-256 Merkle audit chain, verifiable independently by any regulatory authority. This certificate confirms compliance with the selected regulatory frameworks as of the issue date shown below.';
-
-  // Regs
-  var regsHtml = selectedRegs.map(function(r) {
-    return '<div class="cert-reg"><div class="cert-reg-tick">✓</div><div class="cert-reg-text">' + r + '</div></div>';
-  }).join('');
-  document.getElementById('cert-regs').innerHTML = regsHtml;
-
-  document.getElementById('cert-chain-status').textContent = chainData.valid ? 'INTACT ✓' : 'VERIFIED';
-  document.getElementById('cert-hash').textContent = hash;
-  document.getElementById('cert-blocks').textContent = (chainData.blocks || 0).toLocaleString() + ' decisions audited';
-
-  document.getElementById('cert-wrap').classList.add('show');
-  document.getElementById('cert-wrap').scrollIntoView({behavior:'smooth', block:'start'});
-
-  btn.textContent = 'Certificate Generated ✓';
-  btn.style.background = 'linear-gradient(135deg,#00875a,#00b87d)';
-}
-
-function downloadCert() {
-  var cert = document.getElementById('certificate');
-  var certNum = document.getElementById('cert-num').textContent;
-  var company = document.getElementById('cert-company').textContent;
-
-  // Print to PDF
-  var printWin = window.open('', '_blank');
-  printWin.document.write('<html><head><title>' + certNum + '</title>');
-  printWin.document.write('<style>body{margin:0;padding:20px;font-family:IBM Plex Sans,sans-serif}');
-  printWin.document.write(document.querySelector('style').innerHTML);
-  printWin.document.write('</style></head><body>');
-  printWin.document.write(cert.outerHTML);
-  printWin.document.write('</body></html>');
-  printWin.document.close();
-  setTimeout(function(){ printWin.print(); }, 500);
-}
-
-function shareCert() {
-  var company = document.getElementById('cert-company').textContent;
-  var certNum = document.getElementById('cert-num').textContent;
-  var hash = document.getElementById('cert-hash').textContent;
-
-  var text = company + ' is AI Act compliant. Verified by AILeash · ' + certNum + ' · sebbi.pro/certificate';
-
-  if (navigator.share) {
-    navigator.share({title: 'AI Compliance Certificate', text: text, url: 'https://sebbi.pro/certificate'});
-  } else {
-    navigator.clipboard.writeText(text).then(function() {
-      alert('Certificate details copied to clipboard.');
-    });
-  }
-}
-</script>
-
 </body>
 </html>
 
