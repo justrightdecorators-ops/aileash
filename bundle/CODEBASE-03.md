@@ -1,12 +1,1045 @@
 # Codebase — part 3 of 16
 
 Contains:
+- `modules/consistency.py`
+- `modules/console.py`
 - `modules/counterfactual.py`
 - `modules/declare.py`
 - `modules/demo.py`
 - `modules/dsr.py`
-- `modules/fingerprint.py`
-- `modules/lineage.py`
+
+
+## `modules/consistency.py`
+
+461 lines, 19146 bytes
+
+```python
+#!/usr/bin/env python3
+"""
+modules/consistency.py  -  proving we have never run two histories
+==================================================================
+
+THE ATTACK NOTHING ELSE HERE STOPS
+----------------------------------
+Mutual witnessing means several parties hold hashes of our chain. What
+none of them can currently check is whether they are all holding hashes of
+the SAME chain.
+
+Nothing in the design so far stops an operator running two histories in
+parallel. Serve chain A to one witness, chain B to an auditor. Both get a
+valid-looking tip. Both anchor it. Both verify perfectly against the copy
+they were given. Neither can tell, because there is no way to ask the
+question that would expose it:
+
+    is the tip you are holding actually an ancestor of my current head?
+
+That is the split-view attack. Witnessing does not stop it. Anchoring does
+not stop it - two forks can both be anchored. It is the last place an
+operator can lie, and it is the one nobody in compliance has closed,
+because the defence came out of Certificate Transparency and has not
+crossed over.
+
+WHAT THIS DOES
+--------------
+Builds an ordered Merkle tree over the audit chain and answers one
+question for anybody, forever, without our cooperation:
+
+    GET /x/consistency/ancestor?tip=<any tip we ever served>
+
+If that tip is on our chain, we return its position and a proof, against
+our current head, that it is still there and still in the same place. If
+it is not on our chain, we say so - and the party holding it knows they
+were served a history we no longer stand behind.
+
+Every witness can check every tip they have ever held, automatically, on a
+timer, for as long as they keep the tips. Which means we cannot show two
+faces to the network: the moment any holder of any old tip checks it, a
+fork stops being hidden and becomes provable arithmetic.
+
+APPEND-ONLY, PROVED RATHER THAN ASSERTED
+----------------------------------------
+    GET /x/consistency/proof?first=21&second=48
+
+Proves the log at size 21 is a PREFIX of the log at size 48. Not that both
+exist - that the second was reached from the first by appending only, with
+nothing inserted, removed or reordered in between. That is the actual
+meaning of "append-only", and until now it has been a claim rather than
+something a stranger could check.
+
+WHY THE MATHS IS BORROWED, NOT INVENTED
+---------------------------------------
+The tree here follows RFC 6962 - Certificate Transparency - deliberately,
+including its leaf and node prefixes and its split at the largest power of
+two. Anyone who has implemented a CT verifier can point it at this and it
+will work. Inventing a bespoke tree would mean nobody could check us
+without writing new code first, which is the opposite of the point.
+
+Note this tree is ORDERED, unlike the sorted tree in modules/complete.py.
+The two answer different questions. Sorted proves what is absent. Ordered
+proves nothing was reordered. They are not interchangeable and both are
+needed.
+
+HONEST LIMITS
+-------------
+  - This proves our published chain is internally append-only and that a
+    given tip belongs to it. It says nothing about whether an entry should
+    have been written in the first place.
+  - A fork is only DETECTED if someone actually checks a tip they were
+    given. The network has to do its half. That is why the route is public
+    and needs no account - so checking costs nothing and can be automated.
+  - If nobody ever holds an old tip of ours, there is nothing to check us
+    against. Detection scales with how many witnesses keep history, which
+    is another reason breadth matters more than depth.
+  - Recomputation is O(n) hashing over the chain. Cached per size. On a
+    very large log a checkpoint-based approach would be better; that is
+    written down rather than hidden.
+
+    GET  /x/consistency/root         current size and root      (public)
+    GET  /x/consistency/ancestor     is this tip on our chain    (public)
+    GET  /x/consistency/proof        prefix proof between sizes  (public)
+    GET  /x/consistency/spec         the exact hashing rules     (public)
+    POST /x/consistency/verify       check a proof we gave out   (public)
+    POST /x/consistency/checkpoint   seal the current root       (keyed)
+"""
+
+import hashlib
+import re
+import threading
+import time
+from datetime import datetime, timezone
+
+VERSION = "1.0"
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
+
+# All the read routes are open. A consistency check you need an account to
+# run is worthless - the party most likely to want it is the one who has
+# stopped trusting us.
+PUBLIC = {("GET", "root"), ("GET", "ancestor"), ("GET", "proof"),
+          ("GET", "spec"), ("POST", "verify")}
+
+# RFC 6962 domain separation. Leaf and internal hashes must never be
+# confusable or an internal node can be passed off as a leaf.
+LEAF_BYTE = b"\x00"
+NODE_BYTE = b"\x01"
+
+MAX_LEAVES = 500000
+
+_ready = False
+_cache = {"size": -1, "leaves": [], "root": None, "built": 0}
+_cache_lock = threading.Lock()
+
+
+def _setup(ctx):
+    global _ready
+    if _ready:
+        return
+    with ctx["lock"]:
+        c = ctx["conn"]
+        c.execute("CREATE TABLE IF NOT EXISTS consistency_checkpoint("
+                  "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,tree_size INTEGER,"
+                  "root TEXT,taken REAL,audit_hash TEXT,block_index INTEGER)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_cons_size "
+                  "ON consistency_checkpoint(tree_size)")
+        c.commit()
+    _ready = True
+
+
+def _iso(ts):
+    if not ts:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+# ----------------------------------------------------------------------
+# RFC 6962 tree
+# ----------------------------------------------------------------------
+
+def _leaf(value):
+    return hashlib.sha256(LEAF_BYTE + value.encode("utf-8")).digest()
+
+
+def _node(left, right):
+    return hashlib.sha256(NODE_BYTE + left + right).digest()
+
+
+def _split(n):
+    """Largest power of two strictly less than n. RFC 6962 splits here."""
+    k = 1
+    while k * 2 < n:
+        k *= 2
+    return k
+
+
+def _mth(leaves):
+    """Merkle Tree Hash over an ordered slice. Returns raw bytes."""
+    n = len(leaves)
+    if n == 0:
+        return hashlib.sha256(b"").digest()
+    if n == 1:
+        return _leaf(leaves[0])
+    k = _split(n)
+    return _node(_mth(leaves[:k]), _mth(leaves[k:]))
+
+
+def _inclusion(index, leaves):
+    """Audit path for leaf at index within this slice. Raw bytes list."""
+    n = len(leaves)
+    if n <= 1:
+        return []
+    k = _split(n)
+    if index < k:
+        return _inclusion(index, leaves[:k]) + [_mth(leaves[k:])]
+    return _inclusion(index - k, leaves[k:]) + [_mth(leaves[:k])]
+
+
+def _subproof(m, leaves, is_root):
+    n = len(leaves)
+    if m == n:
+        return [] if is_root else [_mth(leaves)]
+    k = _split(n)
+    if m <= k:
+        return _subproof(m, leaves[:k], is_root) + [_mth(leaves[k:])]
+    return _subproof(m - k, leaves[k:], False) + [_mth(leaves[:k])]
+
+
+def _consistency(m, leaves):
+    """Proof that the tree of the first m leaves is a prefix of this one."""
+    if m <= 0 or m > len(leaves):
+        return None
+    if m == len(leaves):
+        return []
+    return _subproof(m, leaves, True)
+
+
+def _hexed(nodes):
+    return [n.hex() for n in nodes]
+
+
+# ----------------------------------------------------------------------
+# reading the chain
+# ----------------------------------------------------------------------
+
+def _load(ctx):
+    """Every audit hash in order, cached until the chain grows.
+
+    Order is the point here - this is not the sorted tree from
+    modules/complete.py and the two must never be confused.
+    """
+    with ctx["lock"]:
+        row = ctx["conn"].execute("SELECT COUNT(*) FROM audit_log").fetchone()
+    size = int(row[0]) if row else 0
+
+    with _cache_lock:
+        if _cache["size"] == size and _cache["root"] is not None:
+            return _cache["leaves"], _cache["root"], size, None
+
+    if size > MAX_LEAVES:
+        return None, None, size, "chain holds %d entries, above the %d cap for live recomputation" % (size, MAX_LEAVES)
+
+    with ctx["lock"]:
+        rows = ctx["conn"].execute(
+            "SELECT audit_hash FROM audit_log ORDER BY id ASC").fetchall()
+    leaves = [str(r[0]) for r in rows if r[0]]
+    root = _mth(leaves)
+
+    with _cache_lock:
+        _cache["size"] = len(leaves)
+        _cache["leaves"] = leaves
+        _cache["root"] = root
+        _cache["built"] = time.time()
+
+    return leaves, root, len(leaves), None
+
+
+# ----------------------------------------------------------------------
+# routes
+# ----------------------------------------------------------------------
+
+def _root(ctx):
+    leaves, root, size, why = _load(ctx)
+    if why:
+        return {"error": "too_large", "message": why, "tree_size": size}, 503
+    return {"tree_size": size, "root": root.hex(), "consistency_version": VERSION,
+            "algorithm": "RFC 6962 Merkle Tree Hash over audit hashes in write order",
+            "note": "Record this alongside any tip you hold. Later you can ask us to prove the "
+                    "log you saw is a prefix of the log we serve today.",
+            "check": "/x/consistency/proof?first=<your size>&second=%d" % size,
+            "spec": "/x/consistency/spec"}, 200
+
+
+def _ancestor(ctx, data):
+    tip = str(data.get("tip", "")).strip().lower()
+    if not tip:
+        return {"error": "tip_required",
+                "message": "Any tip we ever served you. We will prove whether it is still on "
+                           "the chain we serve now."}, 400
+
+    leaves, root, size, why = _load(ctx)
+    if why:
+        return {"error": "too_large", "message": why, "tree_size": size}, 503
+
+    try:
+        index = leaves.index(tip)
+    except ValueError:
+        return {"on_chain": False, "tip": tip, "tree_size": size, "root": root.hex(),
+                "what_this_means": "This tip is not in the chain we serve. Either it was never "
+                                   "ours, or it belongs to a history we are no longer publishing. "
+                                   "If we gave you this tip, that is a fork and you now have "
+                                   "evidence of it.",
+                "keep_this": "This response, the tip, and whatever we originally sent you with "
+                             "it. Together they are the record of the discrepancy.",
+                "consistency_version": VERSION}, 409
+
+    path = _inclusion(index, leaves)
+    return {"on_chain": True, "tip": tip, "leaf_index": index, "height": index + 1,
+            "tree_size": size, "root": root.hex(),
+            "inclusion_proof": _hexed(path),
+            "consistency_version": VERSION,
+            "what_this_proves": "This tip sits at position %d of a chain of %d, and the current "
+                                "root recomputes from it. It has not been moved, removed or "
+                                "reordered since we gave it to you." % (index, size),
+            "verify_yourself": "/x/consistency/spec has the rules. Recompute upward from the "
+                               "leaf and compare with the root above.",
+            "prefix_proof": "/x/consistency/proof?first=%d&second=%d" % (index + 1, size)}, 200
+
+
+def _proof(ctx, data):
+    try:
+        first = int(data.get("first", 0))
+        second = int(data.get("second", 0) or 0)
+    except (TypeError, ValueError):
+        return {"error": "bad_sizes", "message": "first and second are tree sizes, as integers"}, 400
+
+    leaves, root, size, why = _load(ctx)
+    if why:
+        return {"error": "too_large", "message": why, "tree_size": size}, 503
+    if not second:
+        second = size
+    if first < 1 or first > second or second > size:
+        return {"error": "bad_range",
+                "message": "Need 1 <= first <= second <= %d" % size,
+                "tree_size": size}, 400
+
+    older = leaves[:first]
+    newer = leaves[:second]
+    proof = _consistency(first, newer)
+    if proof is None:
+        return {"error": "no_proof", "message": "could not build a proof for that range"}, 400
+
+    return {"first": first, "second": second,
+            "first_root": _mth(older).hex(),
+            "second_root": _mth(newer).hex(),
+            "consistency_proof": _hexed(proof),
+            "consistency_version": VERSION,
+            "what_this_proves": "The log at size %d is a prefix of the log at size %d. Nothing "
+                                "was inserted, removed or reordered between them - only "
+                                "appended. That is what append-only actually means, and this is "
+                                "it demonstrated rather than asserted." % (first, second),
+            "algorithm": "RFC 6962 section 2.1.2",
+            "spec": "/x/consistency/spec"}, 200
+
+
+def _verify(data):
+    """Recompute an inclusion proof. Convenience only - anyone relying on
+    us to check our own proof has not checked anything."""
+    leaf_value = str(data.get("leaf", data.get("tip", ""))).strip().lower()
+    index = data.get("index", data.get("leaf_index"))
+    size = data.get("tree_size")
+    root = str(data.get("root", "")).strip().lower()
+    proof = data.get("inclusion_proof", data.get("proof"))
+
+    if not leaf_value or not HEX64.match(root) or not isinstance(proof, list):
+        return {"error": "leaf_root_and_proof_required"}, 400
+    try:
+        index = int(index)
+        size = int(size)
+    except (TypeError, ValueError):
+        return {"error": "index_and_tree_size_required"}, 400
+    if index < 0 or size <= 0 or index >= size:
+        return {"error": "index_out_of_range"}, 400
+
+    current = _leaf(leaf_value)
+    node_index, last_index = index, size - 1
+    try:
+        for step in proof:
+            sibling = bytes.fromhex(str(step))
+            if node_index % 2 == 1 or node_index == last_index:
+                if node_index % 2 == 1:
+                    current = _node(sibling, current)
+                else:
+                    current = _node(sibling, current)
+                while node_index % 2 == 0 and node_index != 0:
+                    node_index //= 2
+                    last_index //= 2
+            else:
+                current = _node(current, sibling)
+            node_index //= 2
+            last_index //= 2
+    except Exception as exc:
+        return {"error": "bad_proof", "message": str(exc)[:200]}, 400
+
+    return {"valid": current.hex() == root,
+            "computed_root": current.hex(), "given_root": root,
+            "note": "Recomputed from the leaf upward using RFC 6962 audit path rules."}, 200
+
+
+def _checkpoint(ctx, api_key):
+    """Seal the current size and root into the chain itself.
+
+    A checkpoint is our own signature on 'this is what the log looked like
+    at this moment'. Once anchored, publishing a different history for that
+    size contradicts something we already sealed and externally timestamped.
+    """
+    leaves, root, size, why = _load(ctx)
+    if why:
+        return {"error": "too_large", "message": why, "tree_size": size}, 503
+
+    now = time.time()
+    root_hex = root.hex()
+    ev = {"user_id": "cons:%d" % size, "action": "consistency_checkpoint", "amount": 0,
+          "country": "UK", "device_id": "consistency", "anomaly": 0, "device_risk": 0}
+    res = {"decision": "CHECKPOINT_SEALED", "score": 0, "consistency_version": VERSION,
+           "tree_size": size, "root": root_hex,
+           "detail": "size=%d;root=%s" % (size, root_hex)}
+    audit_hash, block_index, seq = ctx["seal"](ev, res, now, api_key)
+
+    with ctx["lock"]:
+        ctx["conn"].execute("INSERT INTO consistency_checkpoint(api_key,tree_size,root,taken,"
+                            "audit_hash,block_index) VALUES(?,?,?,?,?,?)",
+                            (api_key, size, root_hex, now, audit_hash, block_index))
+        ctx["conn"].commit()
+
+    return {"tree_size": size, "root": root_hex, "taken_at": _iso(now),
+            "sealed_in_chain": audit_hash, "block_index": block_index, "receipt_seq": seq,
+            "what_this_does": "Commits our own view of the log at this size, inside the log, "
+                              "where it gets anchored with everything else. Serving a different "
+                              "history for this size now contradicts a sealed, timestamped "
+                              "record of our own making.",
+            "note": "The checkpoint itself becomes an entry, so the next size is larger. That is "
+                    "expected and does not affect the proof for this one."}, 200
+
+
+def _spec():
+    return {
+        "consistency_version": VERSION,
+        "based_on": "RFC 6962 (Certificate Transparency), deliberately unmodified so existing "
+                    "verifiers work against this without new code",
+        "leaves": "the audit_hash of every chain entry, in write order (id ascending), as "
+                  "lowercase hex strings encoded UTF-8",
+        "empty_root": hashlib.sha256(b"").hexdigest(),
+        "leaf_hash": "sha256(0x00 || leaf_value_utf8)",
+        "node_hash": "sha256(0x01 || left || right)",
+        "split": "for n > 1 leaves, split at k = the largest power of two strictly less than n",
+        "inclusion": "RFC 6962 section 2.1.1 audit path",
+        "consistency": "RFC 6962 section 2.1.2 - proves the tree at size m is a prefix of the "
+                       "tree at size n",
+        "ordered_not_sorted": "This tree is in write order. /x/complete uses a SORTED tree, "
+                              "which answers a different question (absence). Do not confuse the "
+                              "two - the roots will not match and are not meant to.",
+        "how_to_catch_us": "Keep every tip and root we ever hand you. Ask /x/consistency/ancestor "
+                           "about the old ones on a timer. If one ever comes back on_chain false, "
+                           "or a prefix proof fails to verify, we have served two histories and "
+                           "you can prove it without our help.",
+        "why_published": "Because a log nobody can check is a log you are being asked to trust.",
+    }, 200
+
+
+# ----------------------------------------------------------------------
+# router entry point
+# ----------------------------------------------------------------------
+
+def handle(method, action, data, api_key, ctx):
+    _setup(ctx)
+    action = (action or "").strip("/").lower()
+    data = data or {}
+
+    if method == "GET":
+        if action == "spec":
+            return _spec()
+        if action == "root":
+            return _root(ctx)
+        if action == "ancestor":
+            return _ancestor(ctx, data)
+        if action == "proof":
+            return _proof(ctx, data)
+
+    if method == "POST":
+        if action == "verify":
+            return _verify(data)
+        if not api_key:
+            return {"error": "invalid_api_key"}, 401
+        if action == "checkpoint":
+            return _checkpoint(ctx, api_key)
+
+    return {"error": "unknown_action", "action": action,
+            "GET": ["spec", "root", "ancestor", "proof"],
+            "POST": ["verify", "checkpoint"]}, 404
+
+```
+
+
+## `modules/console.py`
+
+556 lines, 23275 bytes
+
+```python
+"""
+modules/console.py  -  the operator console at /console
+
+WHY IT EXISTS
+-------------
+Half the useful routes are keyed POSTs. A browser address bar can only issue
+GETs without a header, so from a phone those routes are unreachable - which is
+most of the time, for this operator.
+
+This serves one page that can reach them. The key is typed in, held in a
+variable for that tab, and never written to storage. Close the tab and it is
+gone.
+
+WHAT IT CAN DO
+--------------
+  fingerprint/self       score the 28-vector battery on our own engine
+  fingerprint/probe      fire it at somebody else's endpoint and compare
+  fingerprint/history    past comparisons
+  codebase/seal          hash the tree, seal the manifest with a declaration
+  publish/seal           seal the exact bytes a live page is serving
+
+SAME PATCH AS network.py
+------------------------
+The router hands whatever handle() returns to send_json, so a module cannot
+return HTML through it. This patches do_GET at runtime, adds one path, and
+leaves every other path alone. Idempotent, in memory, reverts on restart.
+
+And the same catch: after every deploy, one /x/ request has to arrive before
+/console exists. Opening /x/console/status does it.
+
+NOT LINKED FROM ANYWHERE
+------------------------
+No link on the site, noindex on the page. It holds no secrets - every route it
+calls checks the key itself - but there is no reason to advertise it either.
+"""
+
+import sys
+
+VERSION = "1.0"
+
+PUBLIC = {("GET", "status")}
+
+PAGE_PATHS = ("/console", "/console.html")
+
+_patched = [False]
+
+
+PAGE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Console — AILeash</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600;9..144,900&family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --ink:#0a0f1e; --panel:#131b2e; --panel2:#1a2338; --edge:rgba(201,168,76,.22);
+  --gold:#c9a84c; --gold-dim:#8a7233;
+  --text:#f2efe6; --mute:rgba(242,239,230,.42);
+  --allow:#1a9e6e; --challenge:#c07a1d; --block:#c8362b; --ok:#7fe3b0;
+  --disp:Fraunces,Georgia,serif; --body:'Space Grotesk',system-ui,sans-serif;
+  --mono:'IBM Plex Mono',monospace;
+}
+body{background:var(--ink);color:var(--text);font-family:var(--body);
+  font-size:16px;line-height:1.6;padding:0 0 60px;
+  background-image:repeating-linear-gradient(90deg,transparent 0 39px,rgba(201,168,76,.05) 39px 40px)}
+.wrap{max-width:640px;margin:0 auto;padding:0 18px}
+
+header{padding:34px 0 22px;border-bottom:1px solid var(--edge);margin-bottom:26px}
+.eyebrow{font-family:var(--mono);font-size:10px;letter-spacing:.24em;
+  text-transform:uppercase;color:var(--gold);margin-bottom:10px}
+h1{font-family:var(--disp);font-weight:900;font-size:clamp(30px,8vw,44px);
+  line-height:1;letter-spacing:-.02em}
+h1 span{color:var(--gold)}
+.sub{color:var(--mute);font-size:14.5px;margin-top:12px;max-width:44ch}
+
+label{display:block;font-family:var(--mono);font-size:10px;letter-spacing:.16em;
+  text-transform:uppercase;color:var(--mute);margin-bottom:7px}
+input,textarea{width:100%;background:var(--panel);border:1px solid var(--edge);
+  color:var(--text);font-family:var(--mono);font-size:13px;padding:12px 13px;
+  border-radius:4px;outline:none}
+input:focus,textarea:focus{border-color:var(--gold)}
+textarea{resize:vertical;min-height:70px;font-family:var(--body);font-size:14px}
+
+.keybar{background:var(--panel2);border:1px solid var(--edge);border-radius:6px;
+  padding:16px;margin-bottom:26px}
+.keynote{font-size:12px;color:var(--mute);margin-top:9px;line-height:1.55}
+
+.op{border:1px solid var(--edge);border-radius:6px;background:var(--panel);
+  margin-bottom:14px;overflow:hidden}
+.op-head{display:flex;align-items:baseline;gap:10px;padding:15px 16px;cursor:pointer;
+  user-select:none}
+.op-head:hover{background:var(--panel2)}
+.op-n{font-family:var(--mono);font-size:10px;color:var(--gold-dim);letter-spacing:.1em}
+.op-t{font-family:var(--disp);font-weight:600;font-size:18px;letter-spacing:-.01em}
+.op-r{margin-left:auto;font-family:var(--mono);font-size:10px;color:var(--mute)}
+.op-body{padding:0 16px 16px;display:none}
+.op.open .op-body{display:block}
+.op-why{font-size:13.5px;color:var(--mute);margin-bottom:14px;line-height:1.6}
+.field{margin-bottom:12px}
+
+button{width:100%;background:var(--gold);color:var(--ink);border:none;border-radius:4px;
+  padding:14px;font-family:var(--body);font-weight:700;font-size:14.5px;cursor:pointer;
+  transition:background .15s}
+button:hover:not(:disabled){background:#dbbd63}
+button:disabled{opacity:.45;cursor:default}
+button.quiet{background:transparent;color:var(--mute);border:1px solid var(--edge)}
+button.quiet:hover:not(:disabled){color:var(--text);border-color:var(--gold)}
+
+/* ---- the readout: this is the thing worth building ---- */
+#out{margin-top:26px}
+.verdict{border:1px solid var(--edge);border-radius:6px;background:var(--panel);
+  overflow:hidden;margin-bottom:14px}
+.v-head{padding:22px 18px;border-bottom:1px solid var(--edge)}
+.v-word{font-family:var(--disp);font-weight:900;font-size:clamp(28px,9vw,42px);
+  line-height:1;letter-spacing:-.02em}
+.v-IDENTICAL,.v-err{color:var(--block)}
+.v-DERIVED{color:var(--challenge)}
+.v-SAME.SHAPE,.v-SIMILAR{color:var(--gold)}
+.v-UNRELATED,.v-ok{color:var(--allow)}
+.v-INCONCLUSIVE{color:var(--mute)}
+.v-why{font-size:14px;color:var(--mute);margin-top:11px;line-height:1.6}
+.v-stats{display:flex;flex-wrap:wrap;gap:18px;padding:14px 18px;
+  border-bottom:1px solid var(--edge);font-family:var(--mono);font-size:11px}
+.v-stats b{display:block;font-family:var(--disp);font-size:19px;color:var(--text);
+  font-weight:600;margin-top:3px}
+.v-stats span{color:var(--mute);letter-spacing:.1em;text-transform:uppercase}
+
+/* paired bars: ours above, theirs below, one column per vector */
+.strip{padding:18px}
+.strip-l{font-family:var(--mono);font-size:10px;letter-spacing:.16em;
+  text-transform:uppercase;color:var(--gold);margin-bottom:14px}
+.bars{display:flex;gap:2px;align-items:stretch;height:96px}
+.bar{flex:1;display:flex;flex-direction:column;justify-content:center;gap:2px;min-width:0}
+.bar i{display:block;border-radius:1px;transition:height .35s ease}
+.bar .mine{background:var(--gold);align-self:flex-end;width:100%}
+.bar .theirs{background:rgba(242,239,230,.35);width:100%}
+.bar.match .theirs{background:var(--block)}
+.bar-key{display:flex;gap:16px;margin-top:12px;font-family:var(--mono);font-size:10px;
+  color:var(--mute);flex-wrap:wrap}
+.dot{display:inline-block;width:8px;height:8px;border-radius:1px;margin-right:6px;
+  vertical-align:middle}
+
+pre{font-family:var(--mono);font-size:11.5px;line-height:1.65;background:#080c16;
+  color:var(--ok);padding:15px;border-radius:5px;overflow-x:auto;
+  border:1px solid var(--edge);max-height:340px}
+.msg{font-family:var(--mono);font-size:12.5px;padding:13px 15px;border-radius:5px;
+  border:1px solid var(--edge);color:var(--mute);margin-bottom:14px}
+.msg.bad{color:#ffb4ad;border-color:rgba(200,54,43,.5);background:rgba(200,54,43,.08)}
+.msg.good{color:var(--ok);border-color:rgba(127,227,176,.35);background:rgba(26,158,110,.08)}
+.working{font-family:var(--mono);font-size:12px;color:var(--gold)}
+.working:after{content:'';animation:dots 1.2s steps(4,end) infinite}
+@keyframes dots{0%{content:''}25%{content:'.'}50%{content:'..'}75%{content:'...'}}
+footer{margin-top:34px;padding-top:18px;border-top:1px solid var(--edge);
+  font-family:var(--mono);font-size:10.5px;color:var(--mute);line-height:1.8}
+a{color:var(--gold)}
+:focus-visible{outline:2px solid var(--gold);outline-offset:2px}
+@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <p class="eyebrow">AILeash · operator console</p>
+  <h1>Keyed <span>routes</span></h1>
+  <p class="sub">The endpoints a browser cannot reach on its own. Your key stays in this tab and is never stored.</p>
+</header>
+
+<div class="keybar">
+  <label for="key">API key</label>
+  <input id="key" type="password" placeholder="al_live_…" autocomplete="off" spellcheck="false">
+  <p class="keynote">Held in memory for this tab only. Close it and the key is gone — nothing is written to the device.</p>
+</div>
+
+<div class="op" id="op-self">
+  <div class="op-head" onclick="toggle('op-self')">
+    <span class="op-n">01</span><span class="op-t">Baseline</span>
+    <span class="op-r">POST /x/fingerprint/self</span>
+  </div>
+  <div class="op-body">
+    <p class="op-why">Runs the 28-vector battery through your own engine. Every probe is measured against this. Run it first — if it answers, the module can see your live scorer.</p>
+    <button onclick="run('self')">Score the battery</button>
+  </div>
+</div>
+
+<div class="op" id="op-probe">
+  <div class="op-head" onclick="toggle('op-probe')">
+    <span class="op-n">02</span><span class="op-t">Probe a target</span>
+    <span class="op-r">POST /x/fingerprint/probe</span>
+  </div>
+  <div class="op-body">
+    <p class="op-why">Fires the same battery at somebody else's scoring endpoint and compares the two sets of numbers. One request per vector with a gap between them.</p>
+    <div class="field">
+      <label for="t-url">Their scoring endpoint</label>
+      <input id="t-url" type="url" placeholder="https://example.com/api/score" autocomplete="off">
+    </div>
+    <div class="field">
+      <label for="t-fields">Field names, if theirs differ (optional)</label>
+      <input id="t-fields" placeholder='{"amount":"value","trust":"history"}' autocomplete="off">
+    </div>
+    <div class="field">
+      <label for="t-score">Where the score is in their reply (optional)</label>
+      <input id="t-score" placeholder="risk_score" autocomplete="off">
+    </div>
+    <button onclick="run('probe')">Run the comparison</button>
+  </div>
+</div>
+
+<div class="op" id="op-code">
+  <div class="op-head" onclick="toggle('op-code')">
+    <span class="op-n">03</span><span class="op-t">Seal the codebase</span>
+    <span class="op-r">POST /x/codebase/seal</span>
+  </div>
+  <div class="op-body">
+    <p class="op-why">Hashes every file, commits one manifest root, seals it with your declaration. Dated evidence of what you held and when.</p>
+    <div class="field">
+      <label for="c-author">Author</label>
+      <input id="c-author" value="Justin Antony Dobson" autocomplete="off">
+    </div>
+    <div class="field">
+      <label for="c-entity">Entity</label>
+      <input id="c-entity" value="Monop Content" autocomplete="off">
+    </div>
+    <div class="field">
+      <label for="c-stmt">Declaration</label>
+      <textarea id="c-stmt">Scoring engine, weighting and trust decay authored solely by me.</textarea>
+    </div>
+    <button onclick="run('codebase')">Seal it</button>
+  </div>
+</div>
+
+<div class="op" id="op-pub">
+  <div class="op-head" onclick="toggle('op-pub')">
+    <span class="op-n">04</span><span class="op-t">Seal a published page</span>
+    <span class="op-r">POST /x/publish/seal</span>
+  </div>
+  <div class="op-body">
+    <p class="op-why">Fetches a live page and seals the exact bytes served. Pins what the world could see on a given date, which is not the same as what was in the repo.</p>
+    <div class="field">
+      <label for="p-url">Page</label>
+      <input id="p-url" type="url" value="https://sebbi.pro/" autocomplete="off">
+    </div>
+    <button onclick="run('publish')">Seal the page</button>
+  </div>
+</div>
+
+<div class="op" id="op-hist">
+  <div class="op-head" onclick="toggle('op-hist')">
+    <span class="op-n">05</span><span class="op-t">Past probes</span>
+    <span class="op-r">GET /x/fingerprint/history</span>
+  </div>
+  <div class="op-body">
+    <p class="op-why">Every comparison you have run, with its verdict and receipt.</p>
+    <button class="quiet" onclick="run('history')">Show them</button>
+  </div>
+</div>
+
+<div class="op" id="op-spec">
+  <div class="op-head" onclick="toggle('op-spec')">
+    <span class="op-n">06</span><span class="op-t">Every command</span>
+    <span class="op-r">GET /x/spec</span>
+  </div>
+  <div class="op-body">
+    <p class="op-why">Walks every module on the router and reports what each one exposes, and which routes need a key. If you have forgotten what exists, this is the answer.</p>
+    <button class="quiet" onclick="run('spec')">List them</button>
+  </div>
+</div>
+
+<div id="out"></div>
+
+<footer>
+  Public routes need no key and are not listed here.<br>
+  Chain: <a href="/api/verify-chain">/api/verify-chain</a> · Clock: <a href="/api/anchor-status">/api/anchor-status</a> · Network: <a href="/x/witness/peers">/x/witness/peers</a>
+</footer>
+
+</div>
+
+<script>
+(function(){
+  var out = document.getElementById('out');
+  var busy = false;
+
+  window.toggle = function(id){
+    var el = document.getElementById(id);
+    el.classList.toggle('open');
+  };
+  document.getElementById('op-self').classList.add('open');
+
+  function esc(s){
+    return String(s==null?'':s).replace(/[&<>"']/g,function(c){
+      return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});
+  }
+  function msg(text, kind){
+    out.innerHTML = '<div class="msg '+(kind||'')+'">'+esc(text)+'</div>';
+  }
+  function raw(obj){
+    return '<pre>'+esc(JSON.stringify(obj,null,2))+'</pre>';
+  }
+
+  function key(){
+    var k = document.getElementById('key').value.trim();
+    if(!k){ msg('Paste your API key at the top first.','bad'); return null; }
+    return k;
+  }
+
+  function parseJSONField(id){
+    var v = document.getElementById(id).value.trim();
+    if(!v) return null;
+    try { return JSON.parse(v); }
+    catch(e){ msg('That field-name map is not valid JSON. Example: {"amount":"value"}','bad'); return undefined; }
+  }
+
+  async function call(path, method, body){
+    var k = key(); if(!k) return null;
+    var opts = { method: method, headers: { 'Authorization':'Bearer '+k } };
+    if(body){ opts.headers['Content-Type']='application/json'; opts.body=JSON.stringify(body); }
+    var r = await fetch(path, opts);
+    var d;
+    try { d = await r.json(); } catch(e){ d = {error:'unreadable_response'}; }
+    return { status: r.status, data: d };
+  }
+
+  function bars(perVector){
+    var maxV = 0;
+    perVector.forEach(function(p){
+      maxV = Math.max(maxV, Math.abs(p.ours), Math.abs(p.theirs)); });
+    if(maxV <= 0) maxV = 1;
+    var html = '<div class="strip"><div class="strip-l">Every vector · yours above, theirs below</div><div class="bars">';
+    perVector.forEach(function(p){
+      var a = Math.max(2, Math.round((Math.abs(p.ours)/maxV)*44));
+      var b = Math.max(2, Math.round((Math.abs(p.theirs)/maxV)*44));
+      var match = Math.abs(p.delta) < 0.000001 ? ' match' : '';
+      html += '<div class="bar'+match+'" title="'+esc(p.vector)+': '+p.ours+' vs '+p.theirs+'">'
+           +  '<i class="mine" style="height:'+a+'px"></i>'
+           +  '<i class="theirs" style="height:'+b+'px"></i></div>';
+    });
+    html += '</div><div class="bar-key">'
+         +  '<span><i class="dot" style="background:var(--gold)"></i>yours</span>'
+         +  '<span><i class="dot" style="background:var(--block)"></i>theirs, exact match</span>'
+         +  '<span><i class="dot" style="background:rgba(242,239,230,.35)"></i>theirs, different</span>'
+         +  '</div></div>';
+    return html;
+  }
+
+  function renderProbe(d){
+    var v = String(d.verdict||'').replace(/ /g,'.');
+    var html = '<div class="verdict"><div class="v-head">'
+      + '<div class="v-word v-'+esc(v)+'">'+esc(d.verdict)+'</div>'
+      + '<div class="v-why">'+esc(d.why||'')+'</div></div>'
+      + '<div class="v-stats">'
+      +   '<div><span>exact</span><b>'+esc(d.exact_matches)+'/'+esc(d.answered)+'</b></div>'
+      +   '<div><span>correlation</span><b>'+esc(d.correlation==null?'—':d.correlation)+'</b></div>'
+      +   '<div><span>same order</span><b>'+esc(d.rank_correlation==null?'—':d.rank_correlation)+'</b></div>'
+      + '</div>';
+    if(d.per_vector && d.per_vector.length) html += bars(d.per_vector);
+    html += '</div>';
+    if(d.sealed) html += '<div class="msg good">Sealed at block '+esc(d.sealed.block_index)
+      + ' · receipt '+esc(String(d.sealed.receipt).slice(0,20))+'…</div>';
+    if(d.failures) html += '<div class="msg bad">'+esc(d.failure_note||'Some vectors were rejected.')+'</div>';
+    html += raw(d);
+    out.innerHTML = html;
+  }
+
+  function renderSpec(d){
+    // the shape varies by version, so find the module list wherever it is
+    var mods = d.modules || d.spec || d;
+    var names = [];
+    if(Array.isArray(mods)){
+      mods.forEach(function(m){
+        names.push(typeof m === 'string' ? {name:m} : m); });
+    } else if(mods && typeof mods === 'object'){
+      Object.keys(mods).forEach(function(k){
+        var v = mods[k];
+        names.push({name:k, detail:(v && typeof v === 'object') ? v : null}); });
+    }
+    if(!names.length) return '<div class="msg">Nothing listed. The raw reply is below.</div>';
+
+    var html = '<div class="verdict"><div class="v-head">'
+      + '<div class="v-word v-ok">' + names.length + ' modules</div>'
+      + '<div class="v-why">Everything currently loaded on the router.</div></div>'
+      + '<div class="strip">';
+    names.forEach(function(m){
+      var routes = '';
+      if(m.detail){
+        ['public','keyed','GET','POST','routes','actions'].forEach(function(k){
+          var v = m.detail[k];
+          if(Array.isArray(v) && v.length){
+            routes += '<div style="color:var(--mute);font-size:11.5px;margin-top:3px">'
+                   + esc(k) + ': ' + esc(v.join(', ')) + '</div>';
+          }
+        });
+      }
+      html += '<div style="padding:11px 0;border-bottom:1px solid var(--edge)">'
+           +  '<span style="font-family:var(--mono);font-size:13px;color:var(--gold)">/x/'
+           +  esc(m.name) + '/</span>' + routes + '</div>';
+    });
+    html += '</div></div>';
+    return html;
+  }
+
+  window.run = async function(what){
+    if(busy) return;
+    var path, method='POST', body=null;
+
+    if(what==='self'){ path='/x/fingerprint/self'; body={}; }
+
+    else if(what==='probe'){
+      var url = document.getElementById('t-url').value.trim();
+      if(!url){ msg('Give the endpoint you want compared.','bad'); return; }
+      var fields = parseJSONField('t-fields');
+      if(fields === undefined) return;
+      body = { url: url };
+      if(fields) body.fields = fields;
+      var sk = document.getElementById('t-score').value.trim();
+      if(sk) body.score_key = sk;
+      path='/x/fingerprint/probe';
+    }
+
+    else if(what==='codebase'){
+      path='/x/codebase/seal';
+      body = { author: document.getElementById('c-author').value.trim(),
+               entity: document.getElementById('c-entity').value.trim(),
+               statement: document.getElementById('c-stmt').value.trim() };
+    }
+
+    else if(what==='publish'){
+      var pu = document.getElementById('p-url').value.trim();
+      if(!pu){ msg('Give the page to seal.','bad'); return; }
+      path='/x/publish/seal'; body={ url: pu };
+    }
+
+    else if(what==='history'){ path='/x/fingerprint/history'; method='GET'; }
+
+    else if(what==='spec'){ path='/x/spec'; method='GET'; }
+
+    else return;
+
+    busy = true;
+    out.innerHTML = '<div class="msg"><span class="working">'
+      + (what==='probe' ? 'Firing 28 vectors, one at a time' : 'Working') + '</span></div>';
+
+    try{
+      var res = await call(path, method, body);
+      if(!res){ busy=false; return; }
+
+      if(res.status === 401){
+        msg('That key was refused. Check it and try again.','bad');
+      } else if(res.status === 404 && res.data && res.data.error === 'unknown_module'){
+        msg('That module is not deployed yet.','bad');
+      } else if(res.status === 429){
+        msg('Rate limited. Give it a minute.','bad');
+      } else if(res.status >= 400){
+        out.innerHTML = '<div class="msg bad">'
+          + esc((res.data && (res.data.message || res.data.error)) || ('HTTP '+res.status))
+          + '</div>' + raw(res.data);
+      } else if(what === 'probe' && res.data.verdict){
+        renderProbe(res.data);
+      } else if(what === 'self' && res.data.scores){
+        out.innerHTML = '<div class="msg good">Baseline read from '
+          + esc(res.data.source) + ' · ' + esc(res.data.vectors) + ' vectors</div>' + raw(res.data);
+      } else if(what === 'spec'){
+        out.innerHTML = renderSpec(res.data) + raw(res.data);
+      } else {
+        out.innerHTML = '<div class="msg good">Done.</div>' + raw(res.data);
+      }
+    } catch(e){
+      msg('Could not reach the server. That is a real failure, not a staged one.','bad');
+    }
+    busy = false;
+  };
+})();
+</script>
+</body>
+</html>
+"""
+
+
+def _srv():
+    m = sys.modules.get("__main__")
+    if hasattr(m, "get_bearer"):
+        return m
+    return sys.modules.get("server")
+
+
+def _install(s):
+    if _patched[0]:
+        return "already installed"
+    H = getattr(s, "Handler", None)
+    if H is None or not hasattr(H, "do_GET"):
+        return "no handler"
+    if getattr(H, "_console_patched", False):
+        _patched[0] = True
+        return "already installed"
+
+    original = H.do_GET
+
+    def do_GET(self):
+        try:
+            from urllib.parse import urlparse
+            p = urlparse(self.path).path.rstrip("/") or "/"
+        except Exception:
+            p = self.path or "/"
+        if p in PAGE_PATHS:
+            body = PAGE.encode("utf-8")
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Robots-Tag", "noindex, nofollow")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception:
+                pass
+            return
+        return original(self)
+
+    H.do_GET = do_GET
+    H._console_patched = True
+    _patched[0] = True
+    print("CONSOLE: /console page installed at runtime", flush=True)
+    return "installed"
+
+
+def handle(method, action, data, api_key, ctx):
+    s = _srv()
+    if s is None:
+        return {"error": "server_not_found"}, 500
+
+    state = "already installed" if _patched[0] else None
+    if not _patched[0]:
+        try:
+            state = _install(s)
+        except Exception as exc:
+            print("CONSOLE: patch failed - " + str(exc), flush=True)
+            state = "failed: " + str(exc)
+
+    if method == "GET" and (action or "") in ("", "status"):
+        return {
+            "page": "/console",
+            "installed": bool(_patched[0]),
+            "install_result": state,
+            "version": VERSION,
+            "note": ("The page holds no credentials. Every route it calls checks "
+                     "the key itself."),
+        }, 200
+
+    return {"error": "unknown_action", "action": action, "GET": ["status"]}, 404
+
+```
 
 
 ## `modules/counterfactual.py`
@@ -1376,1099 +2409,5 @@ def handle(method, action, data, api_key, ctx):
                 return {"error": "id_required"}, 400
             return _timeline(ctx, api_key, rid)
     return {"error": "unknown_action", "action": action}, 404
-
-```
-
-
-## `modules/fingerprint.py`
-
-550 lines, 22358 bytes
-
-```python
-"""
-modules/fingerprint.py  -  is somebody else running my scoring function?
-
-THE IDEA
---------
-The scoring engine is deterministic. Identical inputs give an identical score,
-every time, forever. That is a compliance property - and it is also a
-signature.
-
-So: fire a fixed battery of carefully chosen inputs at any scoring endpoint,
-fire the same battery at our own, and compare the two sets of numbers.
-
-  identical across 24 varied vectors        it is this function
-  identical shape, different scale          it is this function, reweighted
-  same ordering, different curve            similar design, not this code
-  unrelated                                 unrelated
-
-WHY THE VECTORS ARE CHOSEN THE WAY THEY ARE
--------------------------------------------
-Random inputs would only catch a straight copy. These are picked to probe the
-specific design decisions in the function, because those are what survive
-someone renaming things or nudging a weight:
-
-  saturation points   velocity terms saturate at different counts per window,
-                      so a burst and a grind separate. Vectors sit either side
-                      of each saturation point.
-  curve shape         amount is log-scaled, so small sums move the score far
-                      more than large ones. Vectors walk that curve.
-  normalisation       the continuous weights sum to 1.00 and the boolean
-                      geography terms sit outside it. Vectors isolate that.
-  asymmetry           trust contributes inversely and dominates. Vectors sweep
-                      trust alone with everything else held flat.
-
-A copy that renamed every field and changed nothing else matches exactly. A
-copy that shifted the weights still tracks the shape, because the saturation
-points and the log curve are structural rather than parametric.
-
-WHAT IT CANNOT DO
------------------
-It only sees endpoints it can reach. A private product behind a key with no
-free tier is invisible to this, and no amount of cleverness changes that.
-
-It also proves similarity, never theft. Two people can converge on similar
-weights honestly. What this produces is a dated, sealed measurement - which is
-evidence, not a verdict, and the distinction matters if it is ever put in
-front of anyone.
-
-EVERY RUN IS SEALED
--------------------
-The probe, the target, the vectors and the result all go into the chain. So a
-comparison run today is provable as having been run today, rather than
-assembled afterwards to fit an argument.
-
-ROUTES  (all keyed - this is not a public toy)
-----------------------------------------------
-  POST /x/fingerprint/self      score the battery on our own engine
-  POST /x/fingerprint/probe     url, plus optional field mapping. Compare.
-  GET  /x/fingerprint/history   previous probes and their verdicts
-  GET  /x/fingerprint/vectors   the battery itself
-  GET  /x/fingerprint/spec      what a verdict means and does not mean
-"""
-
-import ipaddress
-import json
-import math
-import socket
-import sys
-import time
-import urllib.error
-import urllib.request
-from urllib.parse import urlparse
-
-VERSION = "1.0"
-
-PUBLIC = set()          # nothing public. deliberately.
-
-FETCH_TIMEOUT = 10
-MAX_BYTES = 200000
-POLITE_DELAY = 0.4      # do not hammer somebody else's server
-ALLOWED_SCHEMES = ("http", "https")
-ALLOWED_PORTS = (80, 443)
-
-# Where the live scorer might be found. Same approach as replay.py - look it
-# up at runtime, never import server.py.
-SCORER_NAMES = ["score_event", "score", "_score_event"]
-
-_ready = False
-
-
-# ----------------------------------------------------------------------
-# the battery
-# ----------------------------------------------------------------------
-# Each vector is (label, signals). Signals use the engine's own internal
-# names; the probe maps them to whatever the target calls things.
-
-def _v(trust=0.5, v60=0, v5m=0, v1h=0, amount=0.0,
-       device_risk=0.0, anomaly=0.0, country_shift=False, unsafe_country=False):
-    return {"trust": trust, "v60": v60, "v5m": v5m, "v1h": v1h,
-            "amount": amount, "device_risk": device_risk, "anomaly": anomaly,
-            "country_shift": country_shift, "unsafe_country": unsafe_country}
-
-
-VECTORS = [
-    # --- trust sweep, everything else flat. Isolates the dominant term.
-    ("trust-000", _v(trust=0.00)),
-    ("trust-025", _v(trust=0.25)),
-    ("trust-050", _v(trust=0.50)),
-    ("trust-075", _v(trust=0.75)),
-    ("trust-100", _v(trust=1.00)),
-
-    # --- velocity: either side of each window's saturation point.
-    ("v60-under",   _v(v60=10)),
-    ("v60-at",      _v(v60=20)),
-    ("v60-over",    _v(v60=40)),      # saturated: must equal v60-at
-    ("v5m-under",   _v(v5m=25)),
-    ("v5m-at",      _v(v5m=50)),
-    ("v5m-over",    _v(v5m=100)),     # saturated
-    ("v1h-under",   _v(v1h=100)),
-    ("v1h-at",      _v(v1h=200)),
-    ("v1h-over",    _v(v1h=400)),     # saturated
-
-    # --- burst vs grind: same total actions, different distribution.
-    ("burst",       _v(v60=20, v5m=20, v1h=20)),
-    ("grind",       _v(v60=1,  v5m=8,  v1h=200)),
-
-    # --- amount: walks the log curve. Small steps low, big steps high.
-    ("amt-10",      _v(amount=10.0)),
-    ("amt-100",     _v(amount=100.0)),
-    ("amt-1000",    _v(amount=1000.0)),
-    ("amt-10000",   _v(amount=10000.0)),
-    ("amt-50000",   _v(amount=50000.0)),   # saturated
-
-    # --- the boolean geography terms, isolated.
-    ("geo-shift",   _v(country_shift=True)),
-    ("geo-unsafe",  _v(unsafe_country=True)),
-    ("geo-both",    _v(country_shift=True, unsafe_country=True)),
-
-    # --- the other two continuous signals.
-    ("dev-risk",    _v(device_risk=1.0)),
-    ("anomaly",     _v(anomaly=1.0)),
-
-    # --- everything at once. Tests the clamp and the normalisation.
-    ("max-all",     _v(trust=0.0, v60=40, v5m=100, v1h=400, amount=50000.0,
-                       device_risk=1.0, anomaly=1.0,
-                       country_shift=True, unsafe_country=True)),
-    ("min-all",     _v(trust=1.0)),
-]
-
-# Default mapping from our internal signal names to a target's request body.
-DEFAULT_FIELDS = {
-    "trust": "trust", "v60": "v60", "v5m": "v5m", "v1h": "v1h",
-    "amount": "amount", "device_risk": "device_risk", "anomaly": "anomaly",
-    "country_shift": "country_shift", "unsafe_country": "unsafe_country",
-}
-SCORE_KEYS = ["score", "risk_score", "value", "result", "rating", "confidence"]
-
-
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "CREATE TABLE IF NOT EXISTS fingerprint_probe("
-            "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,target TEXT,"
-            "ran REAL,vectors INTEGER,answered INTEGER,exact INTEGER,"
-            "verdict TEXT,correlation REAL,detail TEXT,audit_hash TEXT,"
-            "block_index INTEGER)")
-        ctx["conn"].execute(
-            "CREATE INDEX IF NOT EXISTS idx_fp_target ON fingerprint_probe(target)")
-        ctx["conn"].commit()
-    _ready = True
-
-
-# ----------------------------------------------------------------------
-# our own engine
-# ----------------------------------------------------------------------
-
-def _find_scorer():
-    for modname in ("__main__", "server"):
-        mod = sys.modules.get(modname)
-        if not mod:
-            continue
-        for name in SCORER_NAMES:
-            fn = getattr(mod, name, None)
-            if callable(fn):
-                return fn, modname + "." + name
-    return None, None
-
-
-def _score_locally():
-    """Run the battery through the live engine. Returns (scores, source, error)."""
-    fn, where = _find_scorer()
-    if not fn:
-        return None, None, ("could not find the scoring function at runtime - "
-                            "add its name to SCORER_NAMES")
-    out = []
-    for label, signals in VECTORS:
-        try:
-            result = fn(dict(signals))
-            score = result[0] if isinstance(result, (tuple, list)) else result
-            out.append((label, round(float(score), 6)))
-        except Exception as exc:
-            return None, where, "scorer raised on %s: %s" % (label, exc)
-    return out, where, None
-
-
-# ----------------------------------------------------------------------
-# reaching a target - same guards as witness.py
-# ----------------------------------------------------------------------
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-
-_opener = urllib.request.build_opener(_NoRedirect)
-
-
-def _url_allowed(url):
-    if not url or not isinstance(url, str) or len(url) > 500:
-        return False, "no usable url"
-    try:
-        parts = urlparse(url.strip())
-    except Exception:
-        return False, "unparseable url"
-    if parts.scheme not in ALLOWED_SCHEMES:
-        return False, "scheme not allowed"
-    host = parts.hostname
-    if not host:
-        return False, "no host in url"
-    port = parts.port or (443 if parts.scheme == "https" else 80)
-    if port not in ALLOWED_PORTS:
-        return False, "port not allowed"
-    try:
-        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
-    except Exception as exc:
-        return False, "could not resolve host (%s)" % type(exc).__name__
-    for info in infos:
-        try:
-            addr = ipaddress.ip_address(info[4][0])
-        except ValueError:
-            return False, "unreadable address"
-        if (addr.is_private or addr.is_loopback or addr.is_link_local
-                or addr.is_reserved or addr.is_multicast or addr.is_unspecified):
-            return False, "address is not publicly routable"
-    return True, None
-
-
-def _post(url, body, headers=None):
-    data = json.dumps(body).encode("utf-8")
-    h = {"Content-Type": "application/json", "Accept": "application/json",
-         "User-Agent": "aileash-fingerprint/%s" % VERSION}
-    if headers:
-        h.update(headers)
-    request = urllib.request.Request(url, data=data, headers=h, method="POST")
-    try:
-        with _opener.open(request, timeout=FETCH_TIMEOUT) as response:
-            raw = response.read(MAX_BYTES)
-            status = response.getcode()
-    except urllib.error.HTTPError as exc:
-        try:
-            raw = exc.read(MAX_BYTES)
-        except Exception:
-            raw = b""
-        status = exc.code
-    except Exception as exc:
-        return 0, "unreachable (%s)" % type(exc).__name__
-    try:
-        return status, json.loads(raw.decode("utf-8", "replace"))
-    except Exception:
-        return status, raw.decode("utf-8", "replace")[:300]
-
-
-def _extract_score(payload, key_hint=None):
-    """Pull a 0..1 style number out of whatever came back."""
-    if isinstance(payload, (int, float)):
-        return float(payload)
-    if not isinstance(payload, dict):
-        return None
-    keys = ([key_hint] if key_hint else []) + SCORE_KEYS
-    for k in keys:
-        if k and k in payload:
-            v = payload[k]
-            if isinstance(v, (int, float)):
-                return float(v)
-            try:
-                return float(str(v).strip())
-            except (TypeError, ValueError):
-                pass
-    # one level down
-    for v in payload.values():
-        if isinstance(v, dict):
-            found = _extract_score(v, key_hint)
-            if found is not None:
-                return found
-    return None
-
-
-# ----------------------------------------------------------------------
-# comparison
-# ----------------------------------------------------------------------
-
-def _pearson(a, b):
-    n = len(a)
-    if n < 3:
-        return None
-    ma = sum(a) / n
-    mb = sum(b) / n
-    va = sum((x - ma) ** 2 for x in a)
-    vb = sum((y - mb) ** 2 for y in b)
-    if va <= 0 or vb <= 0:
-        return None
-    cov = sum((a[i] - ma) * (b[i] - mb) for i in range(n))
-    return cov / math.sqrt(va * vb)
-
-
-def _rank(values):
-    order = sorted(range(len(values)), key=lambda i: values[i])
-    ranks = [0.0] * len(values)
-    for position, index in enumerate(order):
-        ranks[index] = float(position)
-    return ranks
-
-
-def _compare(ours, theirs):
-    """ours/theirs are lists of (label, score). theirs may contain None."""
-    paired = [(l, o, t) for (l, o), (_, t) in zip(ours, theirs) if t is not None]
-    answered = len(paired)
-    if answered < 3:
-        return {"verdict": "INCONCLUSIVE", "answered": answered,
-                "why": "too few vectors came back to compare anything"}
-
-    a = [p[1] for p in paired]
-    b = [p[2] for p in paired]
-    exact = sum(1 for i in range(answered) if abs(a[i] - b[i]) < 1e-6)
-    close = sum(1 for i in range(answered) if abs(a[i] - b[i]) < 0.01)
-    pearson = _pearson(a, b)
-    spearman = _pearson(_rank(a), _rank(b))
-
-    # a linear fit: are they our scores, scaled and shifted?
-    ma, mb = sum(a) / answered, sum(b) / answered
-    va = sum((x - ma) ** 2 for x in a)
-    slope = (sum((a[i] - ma) * (b[i] - mb) for i in range(answered)) / va) if va > 0 else None
-    intercept = (mb - slope * ma) if slope is not None else None
-    residual = None
-    if slope is not None:
-        residual = max(abs(b[i] - (slope * a[i] + intercept)) for i in range(answered))
-
-    if exact == answered:
-        verdict = "IDENTICAL"
-        why = ("Every vector matched to six decimal places. Two independently "
-               "written scoring functions do not do this.")
-    elif exact >= answered * 0.8:
-        verdict = "IDENTICAL"
-        why = ("%d of %d vectors matched exactly. The rest are consistent with "
-               "a small local change on top of the same function." % (exact, answered))
-    elif residual is not None and residual < 0.02 and pearson and pearson > 0.99:
-        verdict = "DERIVED"
-        why = ("Not identical, but every score fits ours scaled by %.3f and "
-               "shifted by %.3f, within %.4f. That is this function reweighted, "
-               "not a different one." % (slope, intercept, residual))
-    elif spearman is not None and spearman > 0.95:
-        verdict = "SAME SHAPE"
-        why = ("Different numbers, but the same ordering across the battery "
-               "(rank correlation %.3f). Consistent with the same design - the "
-               "same saturation points and the same curve - rather than the "
-               "same code." % spearman)
-    elif pearson is not None and pearson > 0.8:
-        verdict = "SIMILAR"
-        why = ("Correlated (%.3f) but not tightly. Risk scorers tend to agree "
-               "roughly on what looks risky, so this is weak on its own." % pearson)
-    else:
-        verdict = "UNRELATED"
-        why = "No meaningful relationship to our scoring."
-
-    return {
-        "verdict": verdict, "why": why,
-        "vectors": len(ours), "answered": answered,
-        "exact_matches": exact, "within_0.01": close,
-        "correlation": round(pearson, 4) if pearson is not None else None,
-        "rank_correlation": round(spearman, 4) if spearman is not None else None,
-        "best_fit": ({"scale": round(slope, 4), "shift": round(intercept, 4),
-                      "worst_residual": round(residual, 5)}
-                     if slope is not None else None),
-        "per_vector": [{"vector": p[0], "ours": p[1], "theirs": p[2],
-                        "delta": round(p[2] - p[1], 6)} for p in paired],
-    }
-
-
-# ----------------------------------------------------------------------
-# routes
-# ----------------------------------------------------------------------
-
-def _self(ctx, api_key):
-    scores, where, error = _score_locally()
-    if error:
-        return {"error": "scorer_unavailable", "message": error}, 503
-    return {"source": where, "vectors": len(scores),
-            "scores": [{"vector": l, "score": s} for l, s in scores],
-            "note": ("This is the baseline every probe is compared against. It "
-                     "reveals outputs, never weights.")}, 200
-
-
-def _probe(ctx, api_key, data):
-    url = str(data.get("url", "")).strip()
-    ok, why = _url_allowed(url)
-    if not ok:
-        return {"error": "bad_target", "message": why}, 400
-
-    fields = data.get("fields") if isinstance(data.get("fields"), dict) else {}
-    mapping = dict(DEFAULT_FIELDS)
-    mapping.update({k: str(v) for k, v in fields.items() if isinstance(v, str)})
-    score_key = data.get("score_key")
-    extra = data.get("body") if isinstance(data.get("body"), dict) else {}
-    headers = data.get("headers") if isinstance(data.get("headers"), dict) else {}
-    headers = {str(k)[:60]: str(v)[:300] for k, v in list(headers.items())[:8]}
-
-    ours, where, error = _score_locally()
-    if error:
-        return {"error": "scorer_unavailable", "message": error}, 503
-
-    theirs = []
-    failures = []
-    for label, signals in VECTORS:
-        body = dict(extra)
-        for internal, external in mapping.items():
-            body[external] = signals[internal]
-        status, payload = _post(url, body, headers)
-        if status < 200 or status >= 300:
-            theirs.append((label, None))
-            if len(failures) < 5:
-                failures.append({"vector": label, "http": status,
-                                 "response": payload if isinstance(payload, (dict, list))
-                                 else str(payload)[:200]})
-        else:
-            theirs.append((label, _extract_score(payload, score_key)))
-        time.sleep(POLITE_DELAY)
-
-    result = _compare(ours, theirs)
-    ts = time.time()
-
-    detail = ("target=" + url + ";verdict=" + result["verdict"] +
-              ";exact=" + str(result.get("exact_matches", 0)) +
-              "/" + str(result.get("answered", 0)))
-    ev = {"user_id": "fp:" + urlparse(url).hostname, "action": "fingerprint_probe",
-          "amount": 0, "country": "UK", "device_id": "fingerprint",
-          "anomaly": 0, "device_risk": 0}
-    res = {"decision": "FINGERPRINT_" + result["verdict"].replace(" ", "_"),
-           "score": 0, "fingerprint_version": VERSION, "target": url,
-           "timestamp": ts, "detail": detail}
-    h, idx, seq = ctx["seal"](ev, res, ts, api_key)
-
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "INSERT INTO fingerprint_probe(api_key,target,ran,vectors,answered,"
-            "exact,verdict,correlation,detail,audit_hash,block_index)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-            (api_key, url, ts, result.get("vectors"), result.get("answered"),
-             result.get("exact_matches"), result["verdict"],
-             result.get("correlation"), detail, h, idx))
-        ctx["conn"].commit()
-
-    out = dict(result)
-    out.update({
-        "target": url,
-        "ran_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts)),
-        "sealed": {"receipt": h, "block_index": idx, "receipt_seq": seq},
-        "what_this_is": ("A dated, sealed measurement of similarity. It is "
-                         "evidence, not an accusation, and it does not "
-                         "establish that anything was copied."),
-    })
-    if failures:
-        out["failures"] = failures
-        out["failure_note"] = ("Some vectors were rejected. If the target wants "
-                               "different field names, pass a \"fields\" map and "
-                               "run it again.")
-    return out, 200
-
-
-def _history(ctx, api_key):
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT target,ran,verdict,exact,answered,correlation,audit_hash,block_index"
-            " FROM fingerprint_probe WHERE api_key=? ORDER BY id DESC LIMIT 100",
-            (api_key,)).fetchall()
-    return {"probes": [{
-        "target": r[0],
-        "ran_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(r[1])),
-        "verdict": r[2], "exact_matches": r[3], "answered": r[4],
-        "correlation": r[5], "receipt": r[6], "block_index": r[7],
-    } for r in rows], "count": len(rows)}, 200
-
-
-def _vectors():
-    return {"count": len(VECTORS),
-            "vectors": [{"label": l, "signals": s} for l, s in VECTORS],
-            "why_these": ("Chosen to sit either side of each saturation point, "
-                          "to walk the amount curve, and to isolate each term. "
-                          "Random inputs would only catch a straight copy.")}, 200
-
-
-def _spec():
-    return {
-        "module": "fingerprint", "version": VERSION,
-        "question_it_answers": "Is this endpoint running my scoring function?",
-        "verdicts": {
-            "IDENTICAL": "Every vector matches. Independently written functions do not do this.",
-            "DERIVED": "Not identical, but every score is ours scaled and shifted. Reweighted, not rewritten.",
-            "SAME SHAPE": "Different numbers, same ordering. Same design decisions, probably not the same code.",
-            "SIMILAR": "Loosely correlated. Weak - risk scorers broadly agree on what looks risky.",
-            "UNRELATED": "No meaningful relationship.",
-            "INCONCLUSIVE": "Too few vectors came back.",
-        },
-        "limits": [
-            "Only reaches endpoints it can reach. A private product with no free tier is invisible to this.",
-            "Proves similarity, never theft. Two people can converge honestly.",
-            "A target that rate limits, randomises or rounds heavily will read as INCONCLUSIVE rather than clean.",
-        ],
-        "every_run_is_sealed": ("The probe, the target and the result go into the "
-                                "chain, so a comparison run today is provable as "
-                                "having been run today."),
-        "manners": "One request per vector with a %.1fs gap. It is a measurement, not a load test." % POLITE_DELAY,
-    }, 200
-
-
-def handle(method, action, data, api_key, ctx):
-    # key first, before anything touches the database
-    if not api_key:
-        return {"error": "invalid_api_key"}, 401
-    _setup(ctx)
-    action = (action or "").strip("/").lower()
-
-    if method == "POST":
-        if action == "self":
-            return _self(ctx, api_key)
-        if action == "probe":
-            return _probe(ctx, api_key, data)
-        return {"error": "unknown_action", "action": action,
-                "POST": ["self", "probe"]}, 404
-
-    if action in ("", "spec"):
-        return _spec()
-    if action == "history":
-        return _history(ctx, api_key)
-    if action == "vectors":
-        return _vectors()
-    return {"error": "unknown_action", "action": action,
-            "GET": ["spec", "history", "vectors"]}, 404
-
-```
-
-
-## `modules/lineage.py`
-
-528 lines, 24761 bytes
-
-```python
-#!/usr/bin/env python3
-"""
-modules/lineage.py  -  provenance that crosses company boundaries
-=================================================================
-
-WHERE EVERY AUDIT TRAIL STOPS
------------------------------
-At the edge of the company that wrote it.
-
-A lender holds a score. The score came from a scoring supplier, which used
-a model, which was trained on a data snapshot bought from someone else.
-Four organisations, four audit trails, none of which reference each other.
-Ask "what produced this outcome" and you get four separate answers and no
-way to join them up.
-
-Every framework written in the last three years assumes somebody can trace
-an outcome across parties. Nobody can. Not because it is hard - because
-each party's evidence is only worth anything inside that party's own
-system, so joining them up would mean trusting whoever did the joining.
-
-WHY THIS WORKS WHEN A SHARED DATABASE WOULD NOT
------------------------------------------------
-The obvious approach is a consortium: everyone writes to one ledger,
-governed by someone. That fails on the first question anybody asks, which
-is who runs it, and it never gets built.
-
-This needs none of that, because the pieces already exist:
-
-  A chain tip already commits to everything sealed beneath it.
-  That tip is already handed to peers hourly and sealed into THEIR chains.
-  Those chains are anchored externally and witnessed in turn.
-
-So a receipt can already be walked up to a tip, and that tip already sits
-inside chains its issuer does not control. The trust problem is solved
-before lineage is even mentioned.
-
-The only thing missing was the sideways link: a decision recording which
-receipts fed it, and which chain each came from. That is what this module
-adds. One field, and the graph composes itself.
-
-Nobody opts into provenance. They opt into witnessing, which they already
-want, and provenance falls out of it.
-
-WHAT AN EDGE IS AND IS NOT
---------------------------
-An edge is a sealed, dated, non-repudiable CLAIM by the declaring party
-that these inputs fed that decision. Sealing does not make the claim true.
-What it removes is the ability to revise it quietly afterwards, which is
-the part that matters when an outcome is disputed a year later.
-
-Every edge is itself a chain entry. So the provenance graph is covered by
-the same completeness, consistency and witnessing guarantees as everything
-else - you cannot delete an inconvenient edge without breaking the chain,
-and you cannot add one after the fact without the timestamp showing it.
-
-THE PART THAT IS WORTH MORE THAN THE TRACING
---------------------------------------------
-    GET /x/lineage/impact?receipt=
-
-Trace runs upstream: what produced this. Impact runs downstream: what did
-this produce.
-
-When a data provider retracts a snapshot, or a model version turns out to
-be faulty, or an upstream decision is overturned, the question every
-regulator asks is which outputs were affected. Today that answer takes
-weeks of email and is never complete. Here it is a query, and it crosses
-company boundaries, and the answer is itself provable.
-
-That is corrective action under Article 20 turned from a fire drill into a
-lookup.
-
-VERIFICATION WITHOUT TRUSTING ANY PARTY IN THE CHAIN
-----------------------------------------------------
-This module never asserts that a remote hop is valid. It returns the exact
-routes a third party should call to check each hop themselves - on our
-chain and on everybody else's. An auditor verifies the whole graph without
-trusting us, the supplier, or anyone in between.
-
-HONEST LIMITS
--------------
-  - An edge is a claim, sealed and dated. It is not proof the inputs were
-    the real ones, only that this is what was declared and when.
-  - A cross-chain hop can only be checked while the other party keeps
-    their routes up. A dead peer leaves a stub in the graph - visible,
-    which is the honest outcome, rather than silently resolved.
-  - Declaring inputs is voluntary. A party that declares nothing is not
-    caught out by this module; they are simply the point where somebody
-    else's lineage goes dark, and their customer is the one who notices.
-  - We record edges pointing at other chains. We do not fetch from them
-    here - fetching is what /x/witness does, with its SSRF controls, and
-    duplicating that machinery in a second place would be a mistake.
-
-    POST /x/lineage/declare      record what fed a decision      (keyed)
-    GET  /x/lineage/trace        walk upstream                    (public)
-    GET  /x/lineage/impact       walk downstream                  (public)
-    GET  /x/lineage/receipt      portable proof for an output     (public)
-    GET  /x/lineage/spec         the format and how to check it   (public)
-"""
-
-import re
-import time
-from datetime import datetime, timezone
-
-VERSION = "1.0"
-HEX64 = re.compile(r"^[0-9a-f]{64}$")
-
-# Everything except declaring is open. The whole point is that a party
-# three hops downstream - who has no relationship with us at all - can
-# follow the graph and check it.
-PUBLIC = {("GET", "trace"), ("GET", "impact"), ("GET", "receipt"),
-          ("GET", "spec")}
-
-OUR_CHAIN_NAME = "aileash"
-OUR_BASE = "https://sebbi.pro"
-
-MAX_INPUTS = 50
-MAX_DEPTH = 6
-MAX_NODES = 400
-ROLES = ("input", "model", "data", "policy", "document", "upstream-decision",
-         "supplier", "other")
-
-_ready = False
-
-
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        c = ctx["conn"]
-        c.execute("CREATE TABLE IF NOT EXISTS lineage_edge("
-                  "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,"
-                  "child_chain TEXT,child_receipt TEXT,"
-                  "parent_chain TEXT,parent_receipt TEXT,parent_base TEXT,"
-                  "role TEXT,note TEXT,declared REAL,"
-                  "audit_hash TEXT,block_index INTEGER)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_lin_child "
-                  "ON lineage_edge(child_receipt)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_lin_parent "
-                  "ON lineage_edge(parent_receipt)")
-        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_lin_unique "
-                  "ON lineage_edge(child_receipt,parent_chain,parent_receipt)")
-        c.commit()
-    _ready = True
-
-
-def _iso(ts):
-    if not ts:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
-
-def _clean_chain(value):
-    value = str(value or "").strip().lower()
-    return value[:80] if value else ""
-
-
-def _exists_locally(ctx, receipt):
-    try:
-        with ctx["lock"]:
-            row = ctx["conn"].execute(
-                "SELECT 1 FROM audit_log WHERE audit_hash=? LIMIT 1", (receipt,)).fetchone()
-        return bool(row)
-    except Exception:
-        return False
-
-
-def _verification_plan(chain, receipt, base=None):
-    """The exact calls a third party makes to check one hop themselves.
-
-    We never tell anyone a hop is valid. We tell them how to find out
-    without asking us again.
-    """
-    root = (base or OUR_BASE).rstrip("/") if chain != OUR_CHAIN_NAME else OUR_BASE
-    if chain != OUR_CHAIN_NAME and not base:
-        return {
-            "chain": chain, "receipt": receipt,
-            "status": "external, no address declared",
-            "how_to_check": "Ask that chain's operator for their public witness and consistency "
-                            "routes, or look for their name at %s/x/witness/peers - if we have "
-                            "ever witnessed them, the address we fetched from is recorded "
-                            "there." % OUR_BASE,
-        }
-    return {
-        "chain": chain, "receipt": receipt, "base": root,
-        "on_their_chain": "%s/x/consistency/ancestor?tip=%s" % (root, receipt),
-        "nothing_was_omitted": "%s/x/complete/periods" % root,
-        "who_witnesses_them": "%s/x/witness/peers" % root,
-        "did_we_witness_them": "%s/x/witness/attest?peer=%s&tip=%s" % (OUR_BASE, chain, receipt),
-        "note": "Run these against their host, not ours. If their answers and ours disagree, "
-                "that disagreement is the finding.",
-    }
-
-
-# ----------------------------------------------------------------------
-# declare
-# ----------------------------------------------------------------------
-
-def _declare(ctx, api_key, data):
-    child = str(data.get("receipt", data.get("child", ""))).strip().lower()
-    if not HEX64.match(child):
-        return {"error": "receipt_required",
-                "message": "The audit hash of the decision whose inputs you are declaring."}, 400
-
-    child_chain = _clean_chain(data.get("chain") or OUR_CHAIN_NAME)
-    inputs = data.get("inputs")
-    if not isinstance(inputs, list) or not inputs:
-        return {"error": "inputs_required",
-                "message": "A list of what fed this decision. Each entry needs a receipt, and a "
-                           "chain if it came from someone else.",
-                "example": {"receipt": "<64 hex>", "inputs": [
-                    {"chain": "supplier-name", "receipt": "<64 hex>", "role": "data",
-                     "base": "https://supplier.example"}]}}, 400
-    if len(inputs) > MAX_INPUTS:
-        return {"error": "too_many_inputs", "message": "at most %d per declaration" % MAX_INPUTS}, 400
-
-    if child_chain == OUR_CHAIN_NAME and not _exists_locally(ctx, child):
-        return {"error": "unknown_receipt",
-                "message": "That receipt is not in this chain. Declaring inputs for a decision "
-                           "we never sealed would put an unverifiable node in the graph."}, 404
-
-    prepared = []
-    for item in inputs:
-        if not isinstance(item, dict):
-            return {"error": "bad_input", "message": "each input must be an object"}, 400
-        parent = str(item.get("receipt", "")).strip().lower()
-        if not HEX64.match(parent):
-            return {"error": "bad_input_receipt",
-                    "message": "every input needs a 64 character hex receipt"}, 400
-        parent_chain = _clean_chain(item.get("chain") or OUR_CHAIN_NAME)
-        if parent_chain == child_chain and parent == child:
-            return {"error": "self_reference",
-                    "message": "a decision cannot be its own input"}, 400
-        role = str(item.get("role", "input")).strip().lower()
-        if role not in ROLES:
-            role = "other"
-        base = str(item.get("base", item.get("url", "")) or "").strip()[:300]
-        note = str(item.get("note", "") or "").strip()[:200]
-        prepared.append((parent_chain, parent, base, role, note))
-
-    now = time.time()
-    summary = ";".join("%s/%s:%s" % (c, r[:12], role) for c, r, _b, role, _n in prepared)
-    ev = {"user_id": "lin:" + child[:16], "action": "lineage_declared", "amount": 0,
-          "country": "UK", "device_id": "lineage", "anomaly": 0, "device_risk": 0}
-    res = {"decision": "LINEAGE_SEALED", "score": 0, "lineage_version": VERSION,
-           "child_chain": child_chain, "child_receipt": child,
-           "input_count": len(prepared),
-           "detail": "child=%s;inputs=%s" % (child, summary)}
-    audit_hash, block_index, seq = ctx["seal"](ev, res, now, api_key)
-
-    written, duplicates = 0, 0
-    with ctx["lock"]:
-        for parent_chain, parent, base, role, note in prepared:
-            try:
-                ctx["conn"].execute(
-                    "INSERT INTO lineage_edge(api_key,child_chain,child_receipt,parent_chain,"
-                    "parent_receipt,parent_base,role,note,declared,audit_hash,block_index) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                    (api_key, child_chain, child, parent_chain, parent, base or None,
-                     role, note or None, now, audit_hash, block_index))
-                written += 1
-            except Exception:
-                duplicates += 1
-        ctx["conn"].commit()
-
-    return {"child_chain": child_chain, "child_receipt": child,
-            "edges_recorded": written, "already_declared": duplicates,
-            "declared_at": _iso(now),
-            "sealed_in_chain": audit_hash, "block_index": block_index, "receipt_seq": seq,
-            "lineage_version": VERSION,
-            "what_this_does": "The declaration is now a chain entry. It cannot be removed "
-                              "without breaking every block after it, and it cannot be added "
-                              "later without the timestamp showing when.",
-            "trace": "%s/x/lineage/trace?receipt=%s" % (OUR_BASE, child),
-            "portable_receipt": "%s/x/lineage/receipt?receipt=%s" % (OUR_BASE, child)}, 200
-
-
-# ----------------------------------------------------------------------
-# walking the graph
-# ----------------------------------------------------------------------
-
-def _parents(ctx, receipt):
-    with ctx["lock"]:
-        return ctx["conn"].execute(
-            "SELECT parent_chain,parent_receipt,parent_base,role,note,declared,audit_hash "
-            "FROM lineage_edge WHERE child_receipt=? ORDER BY id ASC", (receipt,)).fetchall()
-
-
-def _children(ctx, receipt):
-    with ctx["lock"]:
-        return ctx["conn"].execute(
-            "SELECT child_chain,child_receipt,role,declared,audit_hash "
-            "FROM lineage_edge WHERE parent_receipt=? ORDER BY id ASC", (receipt,)).fetchall()
-
-
-def _walk(ctx, start, depth, upstream):
-    """Breadth-first walk with cycle and size protection.
-
-    Anything on a chain we do not hold locally becomes a frontier entry -
-    named, with a verification plan, and explicitly not resolved by us.
-    """
-    seen = {start}
-    nodes, edges, frontier = [], [], []
-    queue = [(start, 0)]
-    truncated = False
-
-    while queue:
-        receipt, level = queue.pop(0)
-        if level >= depth or len(nodes) >= MAX_NODES:
-            if queue or level >= depth:
-                truncated = truncated or bool(queue)
-            continue
-
-        rows = _parents(ctx, receipt) if upstream else _children(ctx, receipt)
-        for row in rows:
-            if upstream:
-                chain, other, base, role, note, declared, sealed = row
-            else:
-                chain, other, role, declared, sealed = row
-                base, note = None, None
-
-            edges.append({
-                "from": other if upstream else receipt,
-                "to": receipt if upstream else other,
-                "role": role, "note": note,
-                "declared_at": _iso(declared),
-                "declaration_sealed_as": sealed,
-                "chain": chain,
-            })
-
-            local = (chain == OUR_CHAIN_NAME) and _exists_locally(ctx, other)
-            if not local:
-                if not any(f["receipt"] == other for f in frontier):
-                    frontier.append({"chain": chain, "receipt": other, "depth": level + 1,
-                                     "verify": _verification_plan(chain, other, base)})
-                continue
-
-            if other in seen:
-                continue
-            seen.add(other)
-            if len(nodes) >= MAX_NODES:
-                truncated = True
-                continue
-            nodes.append({"chain": chain, "receipt": other, "depth": level + 1,
-                          "verify": _verification_plan(chain, other, base)})
-            queue.append((other, level + 1))
-
-    return nodes, edges, frontier, truncated
-
-
-def _depth_arg(data):
-    try:
-        depth = int(data.get("depth", MAX_DEPTH))
-    except (TypeError, ValueError):
-        depth = MAX_DEPTH
-    return max(1, min(depth, MAX_DEPTH))
-
-
-def _trace(ctx, data):
-    receipt = str(data.get("receipt", "")).strip().lower()
-    if not HEX64.match(receipt):
-        return {"error": "receipt_required"}, 400
-    depth = _depth_arg(data)
-
-    nodes, edges, frontier, truncated = _walk(ctx, receipt, depth, upstream=True)
-    if not edges:
-        return {"receipt": receipt, "direction": "upstream", "nodes": [], "edges": [],
-                "external_frontier": [],
-                "lineage_version": VERSION,
-                "what_this_means": "No inputs have been declared for this decision. That is not "
-                                   "the same as it having none - it means nobody said. "
-                                   "Undeclared lineage is where a trail goes dark, and the party "
-                                   "who did not declare is the one to ask.",
-                "self": _verification_plan(OUR_CHAIN_NAME, receipt)}, 200
-
-    return {"receipt": receipt, "direction": "upstream", "depth_searched": depth,
-            "nodes": nodes, "edges": edges, "external_frontier": frontier,
-            "truncated": truncated,
-            "lineage_version": VERSION,
-            "self": _verification_plan(OUR_CHAIN_NAME, receipt),
-            "how_to_verify_this": "Every node carries the routes to check it on its own chain. "
-                                  "Nothing here asks you to take our word for a hop, including "
-                                  "the hops on our own chain.",
-            "what_an_edge_is": "A sealed, dated claim by the declaring party that these inputs "
-                               "fed that decision. Sealing makes it non-repudiable, not true.",
-            "frontier_note": "External entries are named but not resolved here. Run their "
-                             "verification plans against their own hosts - that is what makes "
-                             "the graph checkable without a shared database."}, 200
-
-
-def _impact(ctx, data):
-    receipt = str(data.get("receipt", "")).strip().lower()
-    if not HEX64.match(receipt):
-        return {"error": "receipt_required"}, 400
-    depth = _depth_arg(data)
-
-    nodes, edges, frontier, truncated = _walk(ctx, receipt, depth, upstream=False)
-    affected = len(nodes)
-    return {"receipt": receipt, "direction": "downstream", "depth_searched": depth,
-            "affected_decisions": affected, "nodes": nodes, "edges": edges,
-            "external_frontier": frontier, "truncated": truncated,
-            "lineage_version": VERSION,
-            "what_this_is_for": "If this input is retracted, wrong, or overturned, these are the "
-                                "decisions that declared a dependency on it. This is the answer "
-                                "to the first question asked after any upstream failure, and it "
-                                "normally takes weeks of email to assemble incompletely.",
-            "corrective_action": "The list is itself sealed and dated, so the scope of a recall "
-                                 "can be shown to have been determined honestly rather than "
-                                 "narrowed to suit.",
-            "limits": "Only covers dependencies that were declared. A downstream party who "
-                      "declared nothing does not appear - which is a fact about them rather "
-                      "than a gap here."}, 200
-
-
-# ----------------------------------------------------------------------
-# the portable receipt - proof that travels with an output
-# ----------------------------------------------------------------------
-
-def _receipt(ctx, data):
-    receipt = str(data.get("receipt", "")).strip().lower()
-    if not HEX64.match(receipt):
-        return {"error": "receipt_required"}, 400
-    if not _exists_locally(ctx, receipt):
-        return {"error": "unknown_receipt",
-                "message": "Not a decision sealed in this chain."}, 404
-
-    rows = _parents(ctx, receipt)
-    inputs = [{"chain": r[0], "receipt": r[1], "role": r[3],
-               "verify": _verification_plan(r[0], r[1], r[2])} for r in rows]
-
-    return {
-        "format": "aileash-portable-receipt",
-        "lineage_version": VERSION,
-        "chain": OUR_CHAIN_NAME,
-        "receipt": receipt,
-        "inputs": inputs,
-        "verify_this_decision": {
-            "still_on_our_chain": "%s/x/consistency/ancestor?tip=%s" % (OUR_BASE, receipt),
-            "our_log_is_append_only": "%s/x/consistency/proof" % OUR_BASE,
-            "nothing_was_left_out": "%s/x/complete/periods" % OUR_BASE,
-            "who_witnesses_us": "%s/x/witness/peers" % OUR_BASE,
-            "our_current_tip": "%s/x/witness/tip" % OUR_BASE,
-            "the_engine_reproduces": "%s/x/replay/spec" % OUR_BASE,
-            "trace_upstream": "%s/x/lineage/trace?receipt=%s" % (OUR_BASE, receipt),
-        },
-        "offline_verifier": "aileash_verify.py - one file, no dependencies, no network. Save "
-                            "this document and check it on your own machine, today or in four "
-                            "years.",
-        "what_you_can_establish": [
-            "this decision is in a log that has not been rewritten",
-            "that log is witnessed by parties we do not control",
-            "the period it sits in declared its total before anyone asked",
-            "the same inputs still produce the same verdict",
-            "and what fed it, hop by hop, across every company involved",
-        ],
-        "what_you_cannot": "That the decision was right, or that the inputs were honest. "
-                           "Cryptography establishes what happened and when. It does not "
-                           "establish that what happened was correct, and anybody telling you "
-                           "otherwise is selling something.",
-        "send_this_on": "Attach it to the output it describes. Whoever receives it can verify "
-                        "without an account, without contacting us, and without trusting anyone "
-                        "in the chain including the sender.",
-    }, 200
-
-
-def _spec():
-    return {
-        "lineage_version": VERSION,
-        "idea": "A decision records the receipts of its inputs and which chain each came from. "
-                "Nothing else is needed, because a chain tip already commits to everything "
-                "beneath it and is already witnessed by parties its operator does not control.",
-        "why_no_consortium": "A shared ledger needs a governor and never gets built. This needs "
-                             "no agreement between parties beyond each one sealing its own work "
-                             "and publishing a tip.",
-        "declare": {
-            "route": "POST /x/lineage/declare (keyed)",
-            "body": {"receipt": "<64 hex, the decision>",
-                     "inputs": [{"chain": "<who it came from>", "receipt": "<64 hex>",
-                                 "role": "one of %s" % ", ".join(ROLES),
-                                 "base": "<their public https base, optional>"}]},
-        },
-        "roles": list(ROLES),
-        "trace": "GET /x/lineage/trace?receipt= - upstream, what produced this",
-        "impact": "GET /x/lineage/impact?receipt= - downstream, what this produced",
-        "portable_receipt": "GET /x/lineage/receipt?receipt= - a document that travels with an "
-                            "output and lets the recipient verify it independently",
-        "verifying_a_hop": "Each node carries the routes to check it on its own chain: an "
-                           "ancestry proof that the receipt is still there, a completeness "
-                           "check that nothing was omitted from its period, and the witness "
-                           "list showing who else holds that chain's tips.",
-        "adopting_it": "Implement three public routes on your own system - a tip, an observe, "
-                       "and an ancestry check - and declare your inputs. There is nothing to "
-                       "join, nobody to ask, and no fee. If you can serve a tip, you are in.",
-        "honest": "An edge is a dated, sealed claim about what fed a decision. It cannot be "
-                  "quietly revised later. It was never proof that the claim was true, and this "
-                  "module does not pretend otherwise.",
-    }, 200
-
-
-# ----------------------------------------------------------------------
-# router entry point
-# ----------------------------------------------------------------------
-
-def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-    action = (action or "").strip("/").lower()
-    data = data or {}
-
-    if method == "GET":
-        if action == "spec":
-            return _spec()
-        if action == "trace":
-            return _trace(ctx, data)
-        if action == "impact":
-            return _impact(ctx, data)
-        if action == "receipt":
-            return _receipt(ctx, data)
-
-    if method == "POST":
-        if not api_key:
-            return {"error": "invalid_api_key"}, 401
-        if action == "declare":
-            return _declare(ctx, api_key, data)
-
-    return {"error": "unknown_action", "action": action,
-            "GET": ["spec", "trace", "impact", "receipt"],
-            "POST": ["declare (keyed)"]}, 404
 
 ```

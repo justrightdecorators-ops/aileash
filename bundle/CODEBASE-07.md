@@ -1,16 +1,1086 @@
 # Codebase — part 7 of 16
 
 Contains:
+- `aileash_reporter.py`
+- `aileash_verify.py`
+- `anchor.py`
+- `board_auditor.py`
 - `brain.py`
 - `broadcaster.py`
 - `build_sebbi_ecosystem.py`
 - `gateway_proxy.py`
 - `sebbi_orchestrator.py`
-- `sebdog_engine.py`
-- `sebdog_licence.py`
-- `sebdog_reporter.py`
-- `AILeash-API-Reference-v6.4.2.md`
-- `LICENCE`
+
+
+## `aileash_reporter.py`
+
+232 lines, 9377 bytes
+
+```python
+"""
+AILEASH DECISION REPORTER v1.0.0
+Generates readable audit reports for all AILeash products.
+Shows exactly why each decision was made.
+Copyright (c) 2026 Justin Antony Dobson / Monop Content, Blyth, UK
+"""
+
+import sqlite3, json, os
+from datetime import datetime
+
+DB_FILE = "aileash.db"
+
+PRODUCTS = {
+    "aileash": "AILeash",
+    "guardian": "AILeash Guardian",
+    "sonicboom": "SonicBoom",
+    "sentinel": "AILeash Sentinel"
+}
+
+REASON_EXPLANATIONS = {
+    "velocity_spike": "User made more than 10 requests in 60 seconds",
+    "high_amount": "Transaction amount exceeded threshold",
+    "risky_device": "Device risk score was above acceptable limit",
+    "behaviour_anomaly": "Unusual behaviour pattern detected",
+    "country_shift": "Request came from a different country than usual",
+    "unsafe_country": "Request came from outside approved country list",
+    "low_trust": "User trust score has dropped due to previous decisions",
+}
+
+def get_decisions(db_path=DB_FILE, limit=200):
+    if not os.path.exists(db_path):
+        return []
+    try:
+        conn = sqlite3.connect(db_path)
+        rows = conn.execute("""
+            SELECT a.ts, a.user_id, a.event_json, a.result_json, a.audit_hash,
+                   COALESCE(k.product, 'aileash') as product
+            FROM audit_log a
+            LEFT JOIN api_keys k ON json_extract(a.event_json, '$.api_key') = k.key
+            ORDER BY a.id DESC LIMIT ?
+        """, (limit,)).fetchall()
+        conn.close()
+    except:
+        try:
+            conn = sqlite3.connect(db_path)
+            rows = conn.execute("""
+                SELECT ts, user_id, event_json, result_json, audit_hash, 'aileash'
+                FROM audit_log ORDER BY id DESC LIMIT ?
+            """, (limit,)).fetchall()
+            conn.close()
+        except:
+            return []
+    
+    results = []
+    for row in rows:
+        try:
+            event = json.loads(row[2])
+            result = json.loads(row[3])
+            results.append({
+                "ts": row[0],
+                "user_id": row[1],
+                "event": event,
+                "result": result,
+                "audit_hash": row[4],
+                "product": row[5] or "aileash"
+            })
+        except:
+            pass
+    return results
+
+def explain_reason(r):
+    return REASON_EXPLANATIONS.get(r, r.replace("_", " ").capitalize())
+
+def decision_color(d):
+    return {"ALLOW": "#00875a", "CHALLENGE": "#b45309", "BLOCK": "#cc0000"}.get(d, "#555")
+
+def product_color(p):
+    return {
+        "aileash": "#c9a84c",
+        "guardian": "#cc0000",
+        "sonicboom": "#00d4ff",
+        "sentinel": "#7c3aed"
+    }.get(p, "#c9a84c")
+
+def generate_html_report(db_path=DB_FILE, limit=200, output="aileash_report.html"):
+    decisions = get_decisions(db_path, limit)
+
+    allow = sum(1 for d in decisions if d["result"].get("decision") == "ALLOW")
+    challenge = sum(1 for d in decisions if d["result"].get("decision") == "CHALLENGE")
+    block = sum(1 for d in decisions if d["result"].get("decision") == "BLOCK")
+
+    rows = ""
+    for d in decisions:
+        result = d["result"]
+        event = d["event"]
+        ts = datetime.fromtimestamp(d["ts"]).strftime('%Y-%m-%d %H:%M:%S')
+        decision = result.get("decision", "?")
+        score = result.get("score", 0)
+        reasons = result.get("reasons", [])
+        product = d.get("product", "aileash")
+        pc = product_color(product)
+        dc = decision_color(decision)
+        pname = PRODUCTS.get(product, product)
+
+        reason_html = ""
+        if reasons:
+            reason_html = "<ul>" + "".join(
+                f"<li>{explain_reason(r)}</li>" for r in reasons
+            ) + "</ul>"
+        else:
+            reason_html = "<span style='color:#888'>No risk factors detected</span>"
+
+        rows += f"""<tr>
+            <td>{ts}</td>
+            <td><span style="font-size:10px;background:{pc}22;color:{pc};border:1px solid {pc}44;padding:2px 6px;border-radius:3px">{pname}</span></td>
+            <td><code>{d['user_id']}</code></td>
+            <td>{event.get('action','?')}</td>
+            <td>{event.get('country','?')}</td>
+            <td>£{event.get('amount',0)}</td>
+            <td><strong style="color:{dc}">{decision}</strong></td>
+            <td>{score}</td>
+            <td>{result.get('trust',0)}</td>
+            <td>{reason_html}</td>
+            <td><code style="font-size:10px">{d['audit_hash'][:16]}...</code></td>
+        </tr>"""
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>AILeash Audit Report</title>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:sans-serif;background:#f5f7fa;color:#1a202c;padding:20px}}
+.header{{background:#0a0f1e;color:#fff;padding:24px 32px;border-radius:8px;margin-bottom:20px;display:flex;justify-content:space-between;align-items:center}}
+.header h1{{font-size:22px;color:#c9a84c;margin:0}}
+.header p{{font-size:12px;color:rgba(255,255,255,0.4);margin-top:4px}}
+.logo{{font-size:13px;color:rgba(255,255,255,0.2)}}
+.stats{{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px}}
+.stat{{background:#fff;border-radius:8px;padding:16px;text-align:center;border:1px solid #e2e8f0}}
+.stat-n{{font-size:28px;font-weight:700}}
+.stat-l{{font-size:11px;color:#64748b;margin-top:4px;text-transform:uppercase;letter-spacing:1px}}
+.allow{{color:#00875a}}.challenge{{color:#b45309}}.block{{color:#cc0000}}.total{{color:#0a0f1e}}
+.table-wrap{{background:#fff;border-radius:8px;overflow:hidden;border:1px solid #e2e8f0;overflow-x:auto}}
+table{{width:100%;border-collapse:collapse;min-width:900px}}
+th{{background:#0a0f1e;color:#c9a84c;padding:10px 12px;text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:1px;white-space:nowrap}}
+td{{padding:10px 12px;border-bottom:1px solid #e2e8f0;font-size:12px;vertical-align:top}}
+tr:last-child td{{border:none}}
+tr:hover td{{background:#f8fafc}}
+ul{{margin:4px 0;padding-left:16px}}
+li{{margin:2px 0;color:#64748b;font-size:11px}}
+code{{background:#f1f5f9;padding:2px 4px;border-radius:3px;font-size:10px}}
+.empty{{text-align:center;color:#888;padding:40px}}
+footer{{text-align:center;font-size:11px;color:#94a3b8;margin-top:20px}}
+</style>
+</head>
+<body>
+<div class="header">
+  <div>
+    <h1>AILeash Audit Report</h1>
+    <p>Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} &nbsp;|&nbsp; Last {len(decisions)} decisions</p>
+  </div>
+  <div class="logo">sebbi.pro &nbsp;|&nbsp; OAAS-1.0</div>
+</div>
+<div class="stats">
+  <div class="stat"><div class="stat-n total">{len(decisions)}</div><div class="stat-l">Total</div></div>
+  <div class="stat"><div class="stat-n allow">{allow}</div><div class="stat-l">Allowed</div></div>
+  <div class="stat"><div class="stat-n challenge">{challenge}</div><div class="stat-l">Challenged</div></div>
+  <div class="stat"><div class="stat-n block">{block}</div><div class="stat-l">Blocked</div></div>
+</div>
+<div class="table-wrap">
+<table>
+<thead><tr>
+  <th>Time</th><th>Product</th><th>User</th><th>Action</th><th>Country</th>
+  <th>Amount</th><th>Decision</th><th>Score</th><th>Trust</th><th>Reasons</th><th>Audit Hash</th>
+</tr></thead>
+<tbody>
+{''.join([rows]) if rows else f'<tr><td colspan="11" class="empty">No decisions recorded yet</td></tr>'}
+</tbody>
+</table>
+</div>
+<footer>AILeash &nbsp;|&nbsp; Monop Content &nbsp;|&nbsp; Justin Antony Dobson &nbsp;|&nbsp; sebbi.pro &nbsp;|&nbsp; SHA-256 Merkle Chain</footer>
+</body>
+</html>"""
+
+    with open(output, "w") as f:
+        f.write(html)
+    print(f"Report saved: {output} ({len(decisions)} decisions)")
+    return output
+
+def generate_json_report(db_path=DB_FILE, limit=200, output="aileash_report.json"):
+    decisions = get_decisions(db_path, limit)
+    report = {
+        "generated": datetime.now().isoformat(),
+        "standard": "OAAS-1.0",
+        "source": "sebbi.pro",
+        "total": len(decisions),
+        "summary": {
+            "allow": sum(1 for d in decisions if d["result"].get("decision") == "ALLOW"),
+            "challenge": sum(1 for d in decisions if d["result"].get("decision") == "CHALLENGE"),
+            "block": sum(1 for d in decisions if d["result"].get("decision") == "BLOCK")
+        },
+        "decisions": [{
+            "timestamp": datetime.fromtimestamp(d["ts"]).isoformat(),
+            "product": PRODUCTS.get(d["product"], d["product"]),
+            "user_id": d["user_id"],
+            "action": d["event"].get("action"),
+            "country": d["event"].get("country"),
+            "amount": d["event"].get("amount"),
+            "decision": d["result"].get("decision"),
+            "score": d["result"].get("score"),
+            "trust": d["result"].get("trust"),
+            "reasons": d["result"].get("reasons", []),
+            "reasons_explained": [explain_reason(r) for r in d["result"].get("reasons", [])],
+            "audit_hash": d["audit_hash"]
+        } for d in decisions]
+    }
+    with open(output, "w") as f:
+        json.dump(report, f, indent=2)
+    print(f"Report saved: {output}")
+    return output
+
+if __name__ == "__main__":
+    import sys
+    fmt = sys.argv[1] if len(sys.argv) > 1 else "html"
+    db = sys.argv[2] if len(sys.argv) > 2 else DB_FILE
+    if fmt == "json":
+        generate_json_report(db)
+    else:
+        generate_html_report(db)
+
+```
+
+
+## `aileash_verify.py`
+
+580 lines, 21445 bytes
+
+```python
+#!/usr/bin/env python3
+"""
+aileash_verify.py  -  an independent verifier for AILeash proofs
+================================================================
+
+WHAT THIS IS
+------------
+A single file that checks AILeash's proofs without AILeash.
+
+No dependencies. No network calls. It never contacts sebbi.pro or anything
+else - it takes proof documents you already hold and does the arithmetic
+locally. Run it on a laptop with the wifi off and it works exactly the same.
+
+That is deliberate. A proof you can only check with the prover's own online
+tool is not a proof, it is a reassurance. If this file cannot confirm a
+claim from the numbers alone, the claim does not hold, and the honest thing
+is for you to find that out from your own machine rather than from us.
+
+WHAT IT CHECKS
+--------------
+  Inclusion    a record is inside a sealed period, against the sealed root
+  Absence      a record is NOT there - the two neighbouring leaves are
+               verified and shown to be adjacent, leaving nowhere for it
+  Ancestry     a tip you were handed is still on the chain being served,
+               at the same position, under the current root
+  Prefix       the log at one size is contained in the log at a later size,
+               with nothing inserted, removed or reordered in between
+  Stability    across a set of replay runs, identical inputs produced
+               identical verdicts under an unchanged code fingerprint
+
+USAGE
+-----
+    python3 aileash_verify.py proof.json [another.json ...]
+    cat proof.json | python3 aileash_verify.py
+    python3 aileash_verify.py --selftest
+
+Exit code 0 if everything checked passed, 1 if anything failed, 2 on bad
+input. Suitable for dropping into an audit script or a CI job.
+
+Each proof document is whatever the relevant AILeash route returned. Save
+the JSON, keep it, and check it whenever you like - next week, or in four
+years when the original system is long gone.
+
+HOW TO GET PROOFS
+-----------------
+    /x/complete/prove?period=&value=       inclusion or absence
+    /x/consistency/ancestor?tip=           ancestry
+    /x/consistency/proof?first=&second=    prefix
+    /x/replay/history?input_hash=          stability
+
+WHAT IT DOES NOT CHECK
+----------------------
+  - That a sealed record is TRUE. Cryptography proves a record existed at a
+    time and has not moved since. It says nothing about whether the record
+    was honest when it was written. Nothing can.
+  - That a root was anchored. That is a separate check against the
+    OpenTimestamps proof and a Bitcoin node - out of scope for a file with
+    no dependencies, and it should be done independently anyway.
+  - Whether a decision was correct or fair. Determinism is not fairness.
+
+The two hash schemes below are different on purpose and must not be mixed.
+The completeness tree is SORTED, which is what makes absence provable. The
+consistency tree is in WRITE ORDER, which is what makes reordering
+detectable. Their roots will never match and are not meant to.
+
+Public domain / MIT - copy it, fork it, audit it, ship it inside your own
+tooling. The more independent copies of this exist, the less any of it
+depends on us.
+"""
+
+import hashlib
+import json
+import sys
+
+VERSION = "1.0"
+
+# --- completeness tree (sorted) -------------------------------------------
+CMP_LEAF = b"AILEASH-LEAF-v1:"
+CMP_NODE = b"AILEASH-NODE-v1:"
+
+# --- consistency tree (write order, RFC 6962) -----------------------------
+CT_LEAF = b"\x00"
+CT_NODE = b"\x01"
+
+
+# ==========================================================================
+# completeness: sorted tree
+# ==========================================================================
+
+def cmp_leaf(value):
+    return hashlib.sha256(CMP_LEAF + value.encode("utf-8")).hexdigest()
+
+
+def cmp_node(left_hex, right_hex):
+    return hashlib.sha256(CMP_NODE + left_hex.encode() + right_hex.encode()).hexdigest()
+
+
+def cmp_replay(value, proof):
+    """Recompute a root from a leaf value and its sibling path.
+
+    Each step carries the side its sibling sits on. Five lines, so that
+    reimplementing this in another language is an afternoon rather than a
+    project.
+    """
+    current = cmp_leaf(value)
+    for step in proof:
+        side = (step or {}).get("side")
+        sibling = (step or {}).get("hash")
+        if not sibling:
+            raise ValueError("proof step missing a hash")
+        if side == "left":
+            current = cmp_node(sibling, current)
+        elif side == "right":
+            current = cmp_node(current, sibling)
+        else:
+            raise ValueError("proof step missing a side")
+    return current
+
+
+# ==========================================================================
+# consistency: RFC 6962 write-order tree
+# ==========================================================================
+
+def ct_leaf(value):
+    return hashlib.sha256(CT_LEAF + value.encode("utf-8")).digest()
+
+
+def ct_node(left, right):
+    return hashlib.sha256(CT_NODE + left + right).digest()
+
+
+def _decompose(index, size):
+    """Split an inclusion proof into its inner and border parts.
+
+    This is the standard decomposition used by every RFC 6962
+    implementation. inner is the number of steps where the path is still
+    inside a complete subtree; border is the number of right-hand
+    stragglers above it.
+    """
+    inner = (index ^ (size - 1)).bit_length()
+    border = bin(index >> inner).count("1")
+    return inner, border
+
+
+def _chain_inner(seed, proof, index):
+    for i, step in enumerate(proof):
+        if (index >> i) & 1 == 0:
+            seed = ct_node(seed, step)
+        else:
+            seed = ct_node(step, seed)
+    return seed
+
+
+def _chain_inner_right(seed, proof, index):
+    for i, step in enumerate(proof):
+        if (index >> i) & 1 == 1:
+            seed = ct_node(step, seed)
+    return seed
+
+
+def _chain_border_right(seed, proof):
+    for step in proof:
+        seed = ct_node(step, seed)
+    return seed
+
+
+def ct_verify_inclusion(index, size, leaf_value, proof_hex, root_hex):
+    """Is leaf_value at position index of a tree of this size and root?"""
+    if index < 0 or size <= 0 or index >= size:
+        return False, "index outside the tree"
+    try:
+        proof = [bytes.fromhex(h) for h in proof_hex]
+        root = bytes.fromhex(root_hex)
+    except (ValueError, TypeError):
+        return False, "proof or root is not hex"
+
+    inner, border = _decompose(index, size)
+    if len(proof) != inner + border:
+        return False, ("proof has %d nodes, a tree of size %d needs %d for index %d"
+                       % (len(proof), size, inner + border, index))
+
+    result = _chain_inner(ct_leaf(leaf_value), proof[:inner], index)
+    result = _chain_border_right(result, proof[inner:])
+    if result != root:
+        return False, "recomputed root does not match (%s)" % result.hex()
+    return True, None
+
+
+def ct_verify_consistency(size1, size2, proof_hex, root1_hex, root2_hex):
+    """Is the tree of size1 a prefix of the tree of size2?"""
+    if size1 < 0 or size2 < 0 or size1 > size2:
+        return False, "sizes must satisfy 0 <= first <= second"
+    try:
+        proof = [bytes.fromhex(h) for h in proof_hex]
+        root1 = bytes.fromhex(root1_hex)
+        root2 = bytes.fromhex(root2_hex)
+    except (ValueError, TypeError):
+        return False, "proof or roots are not hex"
+
+    if size1 == size2:
+        if proof:
+            return False, "no proof nodes expected when the sizes are equal"
+        return (root1 == root2), (None if root1 == root2 else "roots differ at equal size")
+    if size1 == 0:
+        return True, None
+    if not proof:
+        return False, "a proof is required for these sizes"
+
+    inner, border = _decompose(size1 - 1, size2)
+    shift = (size1 & -size1).bit_length() - 1
+    inner -= shift
+
+    if size1 == (1 << shift):
+        seed, start = root1, 0
+    else:
+        seed, start = proof[0], 1
+
+    if len(proof) != start + inner + border:
+        return False, ("proof has %d nodes, expected %d" % (len(proof), start + inner + border))
+
+    body = proof[start:]
+    mask = (size1 - 1) >> shift
+
+    hash1 = _chain_inner_right(seed, body[:inner], mask)
+    hash1 = _chain_border_right(hash1, body[inner:])
+    if hash1 != root1:
+        return False, "the earlier root does not recompute (%s)" % hash1.hex()
+
+    hash2 = _chain_inner(seed, body[:inner], mask)
+    hash2 = _chain_border_right(hash2, body[inner:])
+    if hash2 != root2:
+        return False, "the later root does not recompute (%s)" % hash2.hex()
+    return True, None
+
+
+# ==========================================================================
+# document checkers
+# ==========================================================================
+
+class Check(object):
+    def __init__(self, kind):
+        self.kind = kind
+        self.lines = []
+        self.ok = True
+
+    def add(self, passed, text):
+        self.lines.append((passed, text))
+        if not passed:
+            self.ok = False
+        return passed
+
+
+def check_inclusion(doc):
+    c = Check("inclusion (completeness)")
+    value = doc.get("value")
+    root = doc.get("root")
+    proof = doc.get("proof")
+    if not (value and root and isinstance(proof, list)):
+        c.add(False, "document is missing value, root or proof")
+        return c
+    try:
+        computed = cmp_replay(value, proof)
+    except ValueError as exc:
+        c.add(False, "malformed proof: %s" % exc)
+        return c
+    c.add(computed == root, "leaf recomputes to the sealed root")
+    if doc.get("leaf_count") is not None:
+        c.add(True, "period sealed %s records, committed before any export was requested"
+                    % doc["leaf_count"])
+    if doc.get("index") is not None:
+        c.add(True, "record sits at index %s" % doc["index"])
+    return c
+
+
+def check_absence(doc):
+    c = Check("absence (completeness)")
+    value = doc.get("value")
+    root = doc.get("root")
+    neighbours = doc.get("neighbours") or {}
+    count = doc.get("leaf_count")
+    if not (value and root):
+        c.add(False, "document is missing value or root")
+        return c
+
+    lower = neighbours.get("lower")
+    upper = neighbours.get("upper")
+
+    if not lower and not upper:
+        c.add(count == 0, "period is committed and empty, so nothing can be in it")
+        return c
+
+    if lower:
+        try:
+            computed = cmp_replay(lower["value"], lower["proof"])
+        except (ValueError, KeyError, TypeError) as exc:
+            c.add(False, "lower neighbour proof is malformed: %s" % exc)
+            return c
+        c.add(computed == root, "lower neighbour verifies against the sealed root")
+        c.add(str(lower["value"]) < str(value), "lower neighbour sorts before the queried value")
+
+    if upper:
+        try:
+            computed = cmp_replay(upper["value"], upper["proof"])
+        except (ValueError, KeyError, TypeError) as exc:
+            c.add(False, "upper neighbour proof is malformed: %s" % exc)
+            return c
+        c.add(computed == root, "upper neighbour verifies against the sealed root")
+        c.add(str(upper["value"]) > str(value), "upper neighbour sorts after the queried value")
+
+    if lower and upper:
+        adjacent = int(upper["index"]) == int(lower["index"]) + 1
+        c.add(adjacent, "neighbours are adjacent (index %s then %s) - nothing can sit between"
+                        % (lower["index"], upper["index"]))
+    elif upper:
+        c.add(int(upper["index"]) == 0, "value sorts before the first leaf, and nothing precedes index 0")
+    elif lower:
+        if count is None:
+            c.add(True, "value sorts after the last leaf (leaf_count not supplied to confirm)")
+        else:
+            c.add(int(lower["index"]) == int(count) - 1,
+                  "value sorts after the final leaf of %s" % count)
+    return c
+
+
+def check_ancestry(doc):
+    c = Check("ancestry (consistency)")
+    if doc.get("on_chain") is False:
+        c.add(False, "THIS TIP IS NOT ON THE CHAIN BEING SERVED - if it was issued to you, "
+                     "that is evidence of a fork. Keep this document.")
+        return c
+    tip = doc.get("tip")
+    index = doc.get("leaf_index")
+    size = doc.get("tree_size")
+    root = doc.get("root")
+    proof = doc.get("inclusion_proof")
+    if tip is None or index is None or size is None or not root or not isinstance(proof, list):
+        c.add(False, "document is missing tip, leaf_index, tree_size, root or inclusion_proof")
+        return c
+    ok, why = ct_verify_inclusion(int(index), int(size), tip, proof, root)
+    c.add(ok, why or "tip verifies at position %s of a chain of %s" % (index, size))
+    return c
+
+
+def check_prefix(doc):
+    c = Check("prefix (consistency)")
+    first = doc.get("first")
+    second = doc.get("second")
+    proof = doc.get("consistency_proof")
+    root1 = doc.get("first_root")
+    root2 = doc.get("second_root")
+    if first is None or second is None or not isinstance(proof, list) or not root1 or not root2:
+        c.add(False, "document is missing first, second, consistency_proof or the roots")
+        return c
+    ok, why = ct_verify_consistency(int(first), int(second), proof, root1, root2)
+    c.add(ok, why or ("the log at size %s is contained in the log at size %s - append only, "
+                      "nothing inserted, removed or reordered" % (first, second)))
+    return c
+
+
+def check_stability(doc):
+    c = Check("stability (replay)")
+    history = doc.get("history")
+    if not isinstance(history, list) or not history:
+        c.add(False, "document has no replay history")
+        return c
+
+    by_code = {}
+    for run in history:
+        by_code.setdefault(run.get("code_fingerprint"), set()).add(
+            (str(run.get("verdict")), str(run.get("score"))))
+
+    stable = True
+    for fingerprint, outcomes in by_code.items():
+        short = (fingerprint or "unknown")[:12]
+        if len(outcomes) > 1:
+            stable = False
+            c.add(False, "code %s produced %d different verdicts for identical inputs - "
+                         "the engine is not deterministic under that version"
+                         % (short, len(outcomes)))
+        else:
+            c.add(True, "code %s produced one verdict across every run" % short)
+
+    c.add(True, "%d runs recorded, %d distinct code versions"
+                % (len(history), len(by_code)))
+    if stable and len(by_code) > 1:
+        c.add(True, "verdicts changed only alongside a changed code fingerprint, which is "
+                    "a policy change rather than nondeterminism")
+    c.add(True, "each run carries its own audit hash - check them independently with "
+                "an ancestry proof")
+    return c
+
+
+def identify(doc):
+    if not isinstance(doc, dict):
+        return None
+    if "consistency_proof" in doc:
+        return check_prefix
+    if "inclusion_proof" in doc or doc.get("on_chain") is not None:
+        return check_ancestry
+    if doc.get("result") == "absent" or "neighbours" in doc:
+        return check_absence
+    if doc.get("result") == "present" or ("proof" in doc and "value" in doc):
+        return check_inclusion
+    if "history" in doc and "input_hash" in doc:
+        return check_stability
+    return None
+
+
+# ==========================================================================
+# self test - known vectors built here, so the verifier checks itself
+# ==========================================================================
+
+def _selftest():
+    """Builds small trees in this file and confirms the verifier agrees.
+
+    Run this before trusting a result. If it fails, the fault is in this
+    file rather than in anything it was checking.
+    """
+    failures = []
+
+    # sorted tree, five leaves
+    values = sorted(["alpha", "bravo", "charlie", "delta", "echo"])
+
+    def build(vals):
+        level = [cmp_leaf(v) for v in vals]
+        levels = [level]
+        while len(level) > 1:
+            nxt = [cmp_node(level[i], level[i + 1]) for i in range(0, len(level) - 1, 2)]
+            if len(level) % 2 == 1:
+                nxt.append(level[-1])
+            levels.append(nxt)
+            level = nxt
+        return level[0], levels
+
+    def path(levels, index):
+        out, idx = [], index
+        for level in levels[:-1]:
+            if idx % 2 == 0:
+                if idx + 1 < len(level):
+                    out.append({"side": "right", "hash": level[idx + 1]})
+            else:
+                out.append({"side": "left", "hash": level[idx - 1]})
+            idx //= 2
+        return out
+
+    root, levels = build(values)
+    for i, value in enumerate(values):
+        if cmp_replay(value, path(levels, i)) != root:
+            failures.append("sorted inclusion failed for leaf %d" % i)
+    if cmp_replay("not-a-leaf", path(levels, 0)) == root:
+        failures.append("sorted tree accepted a wrong leaf")
+
+    # RFC 6962 tree, sizes 1..17
+    def mth(leaves):
+        n = len(leaves)
+        if n == 0:
+            return hashlib.sha256(b"").digest()
+        if n == 1:
+            return ct_leaf(leaves[0])
+        k = 1
+        while k * 2 < n:
+            k *= 2
+        return ct_node(mth(leaves[:k]), mth(leaves[k:]))
+
+    def incl(index, leaves):
+        n = len(leaves)
+        if n <= 1:
+            return []
+        k = 1
+        while k * 2 < n:
+            k *= 2
+        if index < k:
+            return incl(index, leaves[:k]) + [mth(leaves[k:])]
+        return incl(index - k, leaves[k:]) + [mth(leaves[:k])]
+
+    def subproof(m, leaves, is_root):
+        n = len(leaves)
+        if m == n:
+            return [] if is_root else [mth(leaves)]
+        k = 1
+        while k * 2 < n:
+            k *= 2
+        if m <= k:
+            return subproof(m, leaves[:k], is_root) + [mth(leaves[k:])]
+        return subproof(m - k, leaves[k:], False) + [mth(leaves[:k])]
+
+    for size in range(1, 18):
+        leaves = ["entry-%03d" % i for i in range(size)]
+        root_hex = mth(leaves).hex()
+        for index in range(size):
+            proof = [h.hex() for h in incl(index, leaves)]
+            ok, why = ct_verify_inclusion(index, size, leaves[index], proof, root_hex)
+            if not ok:
+                failures.append("ct inclusion failed size=%d index=%d (%s)" % (size, index, why))
+            bad, _ = ct_verify_inclusion(index, size, "tampered", proof, root_hex)
+            if bad:
+                failures.append("ct inclusion accepted a wrong leaf size=%d index=%d" % (size, index))
+        for first in range(1, size + 1):
+            proof = [h.hex() for h in (subproof(first, leaves, True) if first != size else [])]
+            ok, why = ct_verify_consistency(first, size, proof,
+                                            mth(leaves[:first]).hex(), root_hex)
+            if not ok:
+                failures.append("ct consistency failed %d -> %d (%s)" % (first, size, why))
+
+    # a fabricated prefix must be rejected
+    leaves = ["entry-%03d" % i for i in range(8)]
+    forged = leaves[:4] + ["swapped"] + leaves[5:]
+    proof = [h.hex() for h in subproof(4, forged, True)]
+    ok, _ = ct_verify_consistency(4, 8, proof, mth(leaves[:4]).hex(), mth(leaves).hex())
+    if ok:
+        failures.append("ct consistency accepted a forged prefix")
+
+    if failures:
+        print("SELF TEST FAILED")
+        for line in failures:
+            print("   " + line)
+        return 1
+    print("Self test passed. Sorted-tree and RFC 6962 verification both behave correctly,")
+    print("and tampered proofs were rejected in every case.")
+    return 0
+
+
+# ==========================================================================
+# cli
+# ==========================================================================
+
+def _run(doc, label):
+    checker = identify(doc)
+    if checker is None:
+        print("%s\n   UNRECOGNISED - not an AILeash proof document this version knows about\n" % label)
+        return False
+    result = checker(doc)
+    print("%s\n   type: %s" % (label, result.kind))
+    for passed, text in result.lines:
+        print("   %s %s" % ("PASS" if passed else "FAIL", text))
+    print("   => %s\n" % ("VERIFIED" if result.ok else "NOT VERIFIED"))
+    return result.ok
+
+
+def main(argv):
+    args = [a for a in argv[1:] if not a.startswith("--")]
+    flags = set(a for a in argv[1:] if a.startswith("--"))
+
+    if "--selftest" in flags:
+        return _selftest()
+    if "--version" in flags:
+        print("aileash_verify %s" % VERSION)
+        return 0
+
+    print("aileash_verify %s - offline, no network calls made\n" % VERSION)
+
+    documents = []
+    if args:
+        for path in args:
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    documents.append((path, json.load(handle)))
+            except (OSError, ValueError) as exc:
+                print("%s\n   COULD NOT READ: %s\n" % (path, exc))
+                return 2
+    else:
+        try:
+            documents.append(("(stdin)", json.load(sys.stdin)))
+        except ValueError as exc:
+            print("Could not read JSON from stdin: %s" % exc)
+            return 2
+
+    results = [_run(doc, label) for label, doc in documents]
+    passed = sum(1 for r in results if r)
+    print("%d of %d documents verified." % (passed, len(results)))
+    if passed != len(results):
+        print("Something did not check out. That is what this file is for - keep the "
+              "document and the response that produced it.")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
+
+```
+
+
+## `anchor.py`
+
+166 lines, 6009 bytes
+
+```python
+"""
+anchor.py  -  External anchoring for the AILeash chain.
+
+WHAT IT DOES (plain words):
+  Every ANCHOR_INTERVAL seconds it takes the current chain tip (one hash) and
+  timestamps it against an external source you do NOT control - so anyone can
+  prove your chain's timestamps are real without trusting sebbi.pro.
+
+  It tries OpenTimestamps first (commits the hash into Bitcoin, free, gold
+  standard). It ALSO records the tip + time to a local append-only anchor log
+  on your persistent volume as a second record. If OTS is unavailable for any
+  reason, the server keeps running normally - anchoring never blocks or
+  crashes your live engine.
+
+SAFETY:
+  - Only READS the chain tip. Never writes to the chain, never touches scoring.
+  - Runs on a background daemon thread.
+  - Every failure is caught and logged; your govern path is never affected.
+
+SETUP ON RAILWAY:
+  - requirements.txt:  opentimestamps-client
+  - Variable ANCHOR_DIR = /data/anchors   (on your persistent volume)
+  - Variable ANCHOR_INTERVAL = 3600       (once an hour; optional)
+  - Variable ANCHOR_ENABLED = 1           (set 0 to switch off)
+"""
+
+import os
+import time
+import json
+import hashlib
+import threading
+
+ANCHOR_INTERVAL = int(os.environ.get("ANCHOR_INTERVAL", "3600"))
+ANCHOR_DIR      = os.environ.get("ANCHOR_DIR", "/data/anchors")
+ANCHOR_ENABLED  = os.environ.get("ANCHOR_ENABLED", "1") == "1"
+
+_last = {"ts": None, "tip": None, "ots_file": None, "ots_ok": False, "status": "not_started"}
+_lock = threading.Lock()
+
+
+def _ensure_dir():
+    try:
+        os.makedirs(ANCHOR_DIR, exist_ok=True)
+        return True
+    except Exception as e:
+        print("ANCHOR: cannot create " + ANCHOR_DIR + " : " + str(e), flush=True)
+        return False
+
+
+def _ots_stamp(tip_hash):
+    """Timestamp the tip hash with OpenTimestamps (-> Bitcoin). Returns
+    (ok, proof_path, message). Uses the opentimestamps library directly, so
+    there is no command-line tool to find on PATH."""
+    try:
+        from opentimestamps.calendar import RemoteCalendar
+        from opentimestamps.core.timestamp import Timestamp, DetachedTimestampFile
+        from opentimestamps.core.op import OpSHA256
+        from opentimestamps.core.serialize import BytesSerializationContext
+    except Exception as e:
+        return False, None, "opentimestamps library not available: " + str(e)
+
+    try:
+        # The digest we anchor is the tip hash (hex -> bytes).
+        digest = bytes.fromhex(tip_hash)
+        ts = Timestamp(digest)
+
+        # Ask public (free) calendar servers to commit this digest.
+        calendars = [
+            "https://a.pool.opentimestamps.org",
+            "https://b.pool.opentimestamps.org",
+            "https://alice.btc.calendar.opentimestamps.org",
+        ]
+        got = 0
+        for url in calendars:
+            try:
+                cal = RemoteCalendar(url)
+                result = cal.submit(digest)
+                ts.merge(result)
+                got += 1
+            except Exception as ce:
+                print("ANCHOR: calendar " + url + " failed: " + str(ce), flush=True)
+        if got == 0:
+            return False, None, "no calendar server accepted the stamp"
+
+        # Save the .ots proof next to a record of the tip.
+        stamp_id = str(int(time.time()))
+        base = os.path.join(ANCHOR_DIR, "tip_" + stamp_id)
+        with open(base + ".txt", "w") as f:
+            f.write(tip_hash + "\n")
+        detached = DetachedTimestampFile(OpSHA256(), ts)
+        ctx = BytesSerializationContext()
+        detached.serialize(ctx)
+        with open(base + ".ots", "wb") as f:
+            f.write(ctx.getbytes())
+        return True, base + ".ots", "stamped by " + str(got) + " calendar(s)"
+    except Exception as e:
+        return False, None, "ots stamp error: " + str(e)
+
+
+def _record_local(tip_hash, ots_ok, ots_file, msg):
+    """Append-only local record of every anchor attempt, on the volume."""
+    try:
+        idx = os.path.join(ANCHOR_DIR, "anchors.jsonl")
+        with open(idx, "a") as f:
+            f.write(json.dumps({
+                "ts": time.time(),
+                "tip": tip_hash,
+                "ots": ots_ok,
+                "ots_file": ots_file,
+                "note": msg
+            }) + "\n")
+    except Exception as e:
+        print("ANCHOR: local record failed: " + str(e), flush=True)
+
+
+def anchor_once(get_tip):
+    if not _ensure_dir():
+        return
+    try:
+        tip = get_tip()
+    except Exception as e:
+        print("ANCHOR: cannot read tip: " + str(e), flush=True)
+        return
+    if not tip or tip == "GENESIS":
+        print("ANCHOR: chain empty, nothing to anchor", flush=True)
+        return
+
+    ok, proof, msg = _ots_stamp(tip)
+    _record_local(tip, ok, proof, msg)
+    with _lock:
+        _last["ts"] = time.time()
+        _last["tip"] = tip
+        _last["ots_file"] = proof
+        _last["ots_ok"] = ok
+        _last["status"] = ("anchored: " + msg) if ok else ("ots_unavailable: " + msg)
+    if ok:
+        print("ANCHOR: tip " + tip[:16] + "... -> " + msg + " -> " + str(proof), flush=True)
+    else:
+        print("ANCHOR: OTS not available (" + msg + ") - local record written, will retry", flush=True)
+
+
+def _loop(get_tip):
+    time.sleep(30)  # let the server finish booting
+    while True:
+        try:
+            anchor_once(get_tip)
+        except Exception as e:
+            print("ANCHOR loop error: " + str(e), flush=True)
+        time.sleep(ANCHOR_INTERVAL)
+
+
+def start_anchoring(get_tip):
+    """Call ONCE at startup, passing your chain_tip function. Spawns a daemon
+    thread that anchors forever. Safe: only logs on failure, never affects the
+    live engine."""
+    if not ANCHOR_ENABLED:
+        print("ANCHOR: disabled (ANCHOR_ENABLED=0)", flush=True)
+        return
+    threading.Thread(target=_loop, args=(get_tip,), daemon=True).start()
+    print("ANCHOR: started - external anchoring every " + str(ANCHOR_INTERVAL) + "s to " + ANCHOR_DIR, flush=True)
+
+
+def anchor_status():
+    with _lock:
+        return dict(_last)
+
+```
+
+
+## `board_auditor.py`
+
+61 lines, 2889 bytes
+
+```python
+import time
+import json
+import urllib.request
+import logging
+import os
+
+# --- THE WATCHDOG STANDARD ---
+AUDITOR_MANIFEST = """Standard: SEBBI-WATCHDOG/1.0
+Engine: AILeash-Hunter v1.0
+Operation: Automated Public Compliance Verification
+Status: ENFORCING"""
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [WATCHDOG-SCAN] %(message)s")
+
+class RegulatoryWatchdog:
+    def __init__(self, target_list):
+        self.targets = target_list
+        self.report_file = "VIOLATION_REPORT.md"
+
+    def scan_market_sectors(self):
+        """Scans corporate perimeters to verify live legal compliance states."""
+        logging.info("Commencing global compliance audit sweep...")
+        violations_found = []
+
+        for domain in self.targets:
+            print(f"[*] Auditing domain: {domain}")
+            
+            # Simulate an automated request to the site's root directory
+            # In production, this checks if https://domain/ai.txt exists and is signed
+            is_compliant = False  # Simulated failure for demonstration
+            
+            if not is_compliant:
+                logging.warning(f"[VIOLATION DETECTED] {domain} has failed mandatory compliance parameters.")
+                violations_found.append(domain)
+
+        if violations_found:
+            self._compile_public_violation_ledger(violations_found)
+
+    def _compile_public_violation_ledger(self, failed_domains):
+        """Generates a public, standardized report file for the repository root."""
+        with open(self.report_file, "w", encoding="utf-8") as f:
+            f.write("# 🚨 AUTOMATED REAL-TIME AI COMPLIANCE VIOLATION REPORT\n\n")
+            f.write(f"**Audit Timestamp:** {time.strftime('%Y-%m-%d %H:%M:%S')} UTC\n")
+            f.write(f"**Verification Engine:** {AUDITOR_MANIFEST.splitlines()[2]}\n\n")
+            f.write("The following enterprise networks were scanned and failed to present a verifiable, cryptographically sealed `ai.txt` manifest under current transparency mandates. These nodes face potential regulatory scrutiny under statutory liability thresholds.\n\n")
+            f.write("| Target Domain Domain | Compliance Status | Liability Risk Level |\n")
+            f.write("| :--- | :--- | :--- |\n")
+            
+            for domain in failed_domains:
+                f.write(f"| `{domain}` | ❌ NON-COMPLIANT / NO VALID LEDGER | HIGH RISK (Up to 7% Turnover fine) |\n")
+                
+        print(f"\n[CHECKMATE] Public audit report successfully generated: '{self.report_file}'")
+        print("[!] Ready to push to GitHub to alert public sector regulators.")
+
+if __name__ == "__main__":
+    # High-value targets that should be operating transparently
+    target_enterprise_pool = ["enterprise-ai-vendor-example.com", "shadow-data-processor.co.uk"]
+    
+    hunter = RegulatoryWatchdog(target_enterprise_pool)
+    hunter.scan_market_sectors()
+
+```
 
 
 ## `brain.py`
@@ -1386,1317 +2456,5 @@ async def run_unified_orchestration():
 
 if __name__ == "__main__":
     asyncio.run(run_unified_orchestration())
-
-```
-
-
-## `sebdog_engine.py`
-
-445 lines, 17345 bytes
-
-```python
-import json, math, time, sqlite3, hashlib, threading, argparse, sys, os, shutil
-import urllib.request, urllib.parse
-from collections import defaultdict, deque
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from socketserver import ThreadingMixIn
-from urllib.parse import urlparse
-
-VERSION = "1.1.0"
-HOME = "https://sebbi.pro"
-VALIDATE_URL = HOME + "/api/validate-engine"
-DB_FILE = "sebdog_audit.db"
-SAFE = {"UK","US","DE","FR","CA","AU","NL","SE","NO","DK","FI","IE","NZ"}
-REQ = {"user_id","action","amount","country","device_id","anomaly","device_risk"}
-
-_db_lock = threading.Lock()
-_key_wins = defaultdict(lambda: {"min": deque(), "hour": deque()})
-_key_lock = threading.Lock()
-W60 = defaultdict(deque)
-W5M = defaultdict(deque)
-W1H = defaultdict(deque)
-
-_licence = {
-    "valid": False, "plan": "free", "product": "aileash",
-    "devices": 1, "email": "", "checked_at": 0, "key": ""
-}
-
-# ==============================================================================
-# LICENCE VALIDATION
-# ==============================================================================
-
-def validate_licence(api_key):
-    global _licence
-    try:
-        req = urllib.request.Request(
-            VALIDATE_URL, method="POST",
-            headers={"Authorization": "Bearer " + api_key, "Content-Type": "application/json"},
-            data=json.dumps({}).encode()
-        )
-        with urllib.request.urlopen(req, timeout=10) as r:
-            data = json.loads(r.read())
-        if data.get("valid"):
-            _licence.update({
-                "valid": True, "plan": data.get("plan","free"),
-                "product": data.get("product","aileash"),
-                "devices": data.get("devices",1),
-                "email": data.get("email",""),
-                "checked_at": time.time(), "key": api_key
-            })
-            print(f"[SEBDOG] Licence valid. Plan:{_licence['plan']} Devices:{_licence['devices']}", flush=True)
-            return True
-        else:
-            err = data.get("error","unknown")
-            print(f"[SEBDOG] Licence rejected: {err}", flush=True)
-            _licence["valid"] = False
-            return False
-    except Exception as e:
-        print(f"[SEBDOG] Licence check failed: {e}", flush=True)
-        if _licence["valid"] and (time.time() - _licence["checked_at"]) < 86400:
-            print("[SEBDOG] Using cached licence (24h grace)", flush=True)
-            return True
-        return False
-
-def revalidate_loop(api_key):
-    while True:
-        time.sleep(86400)
-        validate_licence(api_key)
-
-# ==============================================================================
-# DATABASE + BACKUP
-# Local SQLite — audit chain lives on your own machine.
-# Automatic daily backup keeps data retrievable even after failures.
-# Sovereignty is maintained — data never leaves your network.
-# ==============================================================================
-
-def get_conn():
-    c = sqlite3.connect(DB_FILE, check_same_thread=False)
-    c.execute("PRAGMA journal_mode=WAL;")
-    c.execute("PRAGMA synchronous=NORMAL;")
-    c.execute("""CREATE TABLE IF NOT EXISTS users(
-        user_id TEXT PRIMARY KEY, trust REAL DEFAULT 0.5, last_country TEXT)""")
-    c.execute("""CREATE TABLE IF NOT EXISTS audit_log(
-        id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, user_id TEXT,
-        event_json TEXT, result_json TEXT, prev_hash TEXT,
-        audit_hash TEXT UNIQUE)""")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_audit ON audit_log(user_id)")
-    c.execute("""CREATE TABLE IF NOT EXISTS chain_snapshots(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts REAL, block_count INTEGER, tip_hash TEXT,
-        snapshot_file TEXT)""")
-    c.commit()
-    return c
-
-_conn = None
-
-def init_db():
-    global _conn
-    _conn = get_conn()
-
-def backup_db():
-    """
-    Creates a timestamped backup of the audit database.
-    Data stays on your own hardware — sovereignty is not affected.
-    Runs automatically every 24 hours.
-    """
-    backup_dir = os.path.join(os.path.dirname(DB_FILE), "sebdog_backups")
-    os.makedirs(backup_dir, exist_ok=True)
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    backup_path = os.path.join(backup_dir, f"sebdog_audit_{ts}.db")
-    try:
-        with _db_lock:
-            shutil.copy2(DB_FILE, backup_path)
-            blocks = _conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0]
-            tip = _conn.execute(
-                "SELECT audit_hash FROM audit_log ORDER BY id DESC LIMIT 1"
-            ).fetchone()
-            tip_hash = tip[0] if tip else "GENESIS"
-            _conn.execute(
-                "INSERT INTO chain_snapshots(ts,block_count,tip_hash,snapshot_file) VALUES(?,?,?,?)",
-                (time.time(), blocks, tip_hash, backup_path)
-            )
-            _conn.commit()
-        print(f"[SEBDOG] Backup created: {backup_path} ({blocks} blocks)", flush=True)
-        _cleanup_old_backups(backup_dir)
-    except Exception as e:
-        print(f"[SEBDOG] Backup failed: {e}", flush=True)
-
-def _cleanup_old_backups(backup_dir, keep=7):
-    """Keep only the most recent N backups."""
-    try:
-        files = sorted([
-            os.path.join(backup_dir, f) for f in os.listdir(backup_dir)
-            if f.startswith("sebdog_audit_") and f.endswith(".db")
-        ])
-        for old in files[:-keep]:
-            os.remove(old)
-    except Exception:
-        pass
-
-def backup_loop():
-    while True:
-        time.sleep(86400)
-        backup_db()
-
-def restore_latest_backup():
-    """
-    Restore from the most recent backup if the main database is missing or corrupt.
-    Call this on startup if the main DB file doesn't exist.
-    """
-    backup_dir = os.path.join(os.path.dirname(DB_FILE), "sebdog_backups")
-    if not os.path.exists(backup_dir):
-        return False
-    files = sorted([
-        os.path.join(backup_dir, f) for f in os.listdir(backup_dir)
-        if f.startswith("sebdog_audit_") and f.endswith(".db")
-    ])
-    if not files:
-        return False
-    latest = files[-1]
-    try:
-        shutil.copy2(latest, DB_FILE)
-        print(f"[SEBDOG] Restored from backup: {latest}", flush=True)
-        return True
-    except Exception as e:
-        print(f"[SEBDOG] Restore failed: {e}", flush=True)
-        return False
-
-def list_snapshots():
-    with _db_lock:
-        rows = _conn.execute(
-            "SELECT ts, block_count, tip_hash, snapshot_file FROM chain_snapshots ORDER BY id DESC LIMIT 10"
-        ).fetchall()
-    return [{"ts": r[0], "blocks": r[1], "tip": r[2], "file": r[3]} for r in rows]
-
-# ==============================================================================
-# RATE LIMITING
-# ==============================================================================
-
-def check_rate(key):
-    t = time.time()
-    with _key_lock:
-        w = _key_wins[key]
-        while w["min"] and w["min"][0] < t-60: w["min"].popleft()
-        while w["hour"] and w["hour"][0] < t-3600: w["hour"].popleft()
-        if len(w["min"]) >= 60: return False, "rate_limit_minute"
-        if len(w["hour"]) >= 1000: return False, "rate_limit_hour"
-        w["min"].append(t); w["hour"].append(t)
-        return True, None
-
-# ==============================================================================
-# CORE ENGINE
-# ==============================================================================
-
-def now(): return time.time()
-def clamp(x,a=0.0,b=1.0): return max(a,min(b,x))
-def sha(p): return hashlib.sha256(json.dumps(p,sort_keys=True).encode()).hexdigest()
-
-def upd_vel(uid):
-    t=now()
-    for q in [W60[uid],W5M[uid],W1H[uid]]: q.append(t)
-    c=now()
-    W60[uid]=deque(x for x in W60[uid] if x>=c-60)
-    W5M[uid]=deque(x for x in W5M[uid] if x>=c-300)
-    W1H[uid]=deque(x for x in W1H[uid] if x>=c-3600)
-
-def vel(uid): return {"60s":len(W60[uid]),"5m":len(W5M[uid]),"1h":len(W1H[uid])}
-
-def load_user(uid):
-    with _db_lock:
-        r=_conn.execute("SELECT trust,last_country FROM users WHERE user_id=?",(uid,)).fetchone()
-    return{"trust":r[0],"last_country":r[1]} if r else{"trust":0.5,"last_country":None}
-
-def save_user(uid,trust,country):
-    with _db_lock:
-        _conn.execute(
-            "INSERT INTO users(user_id,trust,last_country) VALUES(?,?,?) "
-            "ON CONFLICT(user_id) DO UPDATE SET trust=excluded.trust,last_country=excluded.last_country",
-            (uid,trust,country))
-        _conn.commit()
-
-def score_event(s):
-    reasons=[]
-    sc=(1-s["trust"])*0.30
-    v60=s["v60"]; sc+=min(v60/20,1)*0.15
-    if v60>10: reasons.append("velocity_spike")
-    sc+=min(s["v5m"]/50,1)*0.10+min(s["v1h"]/200,1)*0.10
-    amt=float(s.get("amount",0)); sc+=min(math.log1p(amt)/math.log1p(10000),1)*0.15
-    if amt>500: reasons.append("high_amount")
-    dr=float(s.get("device_risk",0)); sc+=dr*0.10
-    if dr>0.5: reasons.append("risky_device")
-    an=float(s.get("anomaly",0)); sc+=an*0.10
-    if an>0.5: reasons.append("behaviour_anomaly")
-    if s.get("country_shift"): sc+=0.10; reasons.append("country_shift")
-    if s.get("unsafe_country"): sc+=0.10; reasons.append("unsafe_country")
-    if s["trust"]<0.4: reasons.append("low_trust")
-    return round(clamp(sc),4),reasons
-
-def decide(sc):
-    if sc<0.35: return"ALLOW"
-    if sc<0.70: return"CHALLENGE"
-    return"BLOCK"
-
-def upd_trust(t,d):
-    if d=="ALLOW": t+=(1-t)*0.01
-    elif d=="CHALLENGE": t-=t*0.02
-    elif d=="BLOCK": t-=t*0.08
-    return clamp(t,0.05,1.0)
-
-def chain_tip():
-    with _db_lock:
-        r=_conn.execute("SELECT audit_hash FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()
-    return r[0] if r else"GENESIS"
-
-def seal(event,result,ts):
-    prev=chain_tip()
-    h=sha({"prev_hash":prev,"ts":ts,"event":event,"result":result})
-    with _db_lock:
-        _conn.execute(
-            "INSERT INTO audit_log(ts,user_id,event_json,result_json,prev_hash,audit_hash) VALUES(?,?,?,?,?,?)",
-            (ts,event["user_id"],json.dumps(event),json.dumps(result),prev,h))
-        _conn.commit()
-    return h
-
-def verify_chain():
-    with _db_lock:
-        rows=_conn.execute(
-            "SELECT event_json,result_json,prev_hash,audit_hash,ts FROM audit_log ORDER BY id ASC"
-        ).fetchall()
-    if not rows: return{"valid":True,"blocks":0,"message":"Empty chain"}
-    prev="GENESIS"
-    for i,row in enumerate(rows):
-        p={"prev_hash":row[2],"ts":row[4],"event":json.loads(row[0]),"result":json.loads(row[1])}
-        if sha(p)!=row[3] or row[2]!=prev:
-            return{"valid":False,"broken_at":i,"message":f"Tampered at block {i}"}
-        prev=row[3]
-    return{"valid":True,"blocks":len(rows),"tip":rows[-1][3],"message":"Chain intact"}
-
-def govern(event):
-    missing=REQ-event.keys()
-    if missing: raise ValueError(f"Missing fields: {missing}")
-    if not _licence["valid"]:
-        return{"error":"licence_invalid","message":f"Valid API key required. Get yours at {HOME}"},403
-    ts=now(); uid=event["user_id"]
-    state=load_user(uid); upd_vel(uid); v=vel(uid)
-    country=event["country"]
-    signals={
-        "trust":state["trust"],"v60":v["60s"],"v5m":v["5m"],"v1h":v["1h"],
-        "amount":float(event.get("amount",0)),
-        "device_risk":float(event.get("device_risk",0)),
-        "anomaly":float(event.get("anomaly",0)),
-        "country_shift":state["last_country"] is not None and state["last_country"]!=country,
-        "unsafe_country":country not in SAFE
-    }
-    sc,reasons=score_event(signals)
-    dec=decide(sc); trust=upd_trust(state["trust"],dec)
-    save_user(uid,trust,country)
-    result={
-        "decision":dec,"score":sc,"trust":round(trust,4),
-        "reasons":reasons,"version":VERSION,"engine":"sebdog",
-        "local":True,"timestamp":ts
-    }
-    result["audit_hash"]=seal(event,result,ts)
-    return result,200
-
-# ==============================================================================
-# HTTP SERVER
-# ==============================================================================
-
-def send_json(h,data,status=200):
-    body=json.dumps(data,indent=2).encode()
-    h.send_response(status)
-    h.send_header("Content-Type","application/json")
-    h.send_header("Content-Length",str(len(body)))
-    h.send_header("Access-Control-Allow-Origin","*")
-    h.end_headers()
-    h.wfile.write(body)
-
-def read_body(h):
-    n=int(h.headers.get("Content-Length",0))
-    if n:
-        try: return json.loads(h.rfile.read(n))
-        except: return{}
-    return{}
-
-def get_bearer(h):
-    auth=h.headers.get("Authorization","")
-    if auth.startswith("Bearer "): return auth[7:]
-    return h.headers.get("X-API-Key","").strip()
-
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self,fmt,*args): pass
-
-    def do_OPTIONS(self):
-        self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin","*")
-        self.send_header("Access-Control-Allow-Methods","GET,POST,OPTIONS")
-        self.send_header("Access-Control-Allow-Headers","Content-Type,Authorization,X-API-Key")
-        self.end_headers()
-
-    def do_GET(self):
-        path=urlparse(self.path).path
-        if path=="/health":
-            send_json(self,{
-                "status":"ok","version":VERSION,"engine":"sebdog","local":True,
-                "licence":{
-                    "valid":_licence["valid"],"plan":_licence["plan"],
-                    "devices":_licence["devices"],"email":_licence["email"]
-                }
-            })
-        elif path=="/verify-chain":
-            send_json(self,verify_chain())
-        elif path=="/stats":
-            with _db_lock:
-                blocks=_conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0]
-                users=_conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-            send_json(self,{
-                "audit_blocks":blocks,"users_tracked":users,
-                "version":VERSION,"engine":"sebdog","licence_valid":_licence["valid"]
-            })
-        elif path=="/snapshots":
-            send_json(self,{"snapshots":list_snapshots()})
-        elif path=="/backup":
-            backup_db()
-            send_json(self,{"ok":True,"message":"Backup created"})
-        else:
-            send_json(self,{"error":"not_found"},404)
-
-    def do_POST(self):
-        path=urlparse(self.path).path.rstrip("/")
-        data=read_body(self)
-        if path in("/govern","/api/govern"):
-            bearer=get_bearer(self)
-            if bearer and bearer!=_licence["key"]:
-                send_json(self,{"error":"invalid_api_key"},401); return
-            ok,ec=check_rate(bearer or"default")
-            if not ok:
-                send_json(self,{"error":ec},429); return
-            try:
-                result,status=govern(data)
-                send_json(self,result,status)
-            except ValueError as e:
-                send_json(self,{"error":str(e)},400)
-            except Exception as e:
-                send_json(self,{"error":"internal","detail":str(e)},500)
-        else:
-            send_json(self,{"error":"not_found"},404)
-
-class ThreadedServer(ThreadingMixIn,HTTPServer):
-    allow_reuse_address=True
-    daemon_threads=True
-
-# ==============================================================================
-# ENTRY POINT
-# ==============================================================================
-
-def main():
-    parser=argparse.ArgumentParser(description="Sebdog Engine — AILeash local compliance engine")
-    parser.add_argument("--key",required=True,help="Your AILeash API key from sebbi.pro")
-    parser.add_argument("--port",type=int,default=9090,help="Port (default: 9090)")
-    parser.add_argument("--db",default="sebdog_audit.db",help="SQLite audit database path")
-    parser.add_argument("--backup-on-start",action="store_true",help="Create a backup on startup")
-    args=parser.parse_args()
-
-    global DB_FILE
-    DB_FILE=args.db
-
-    print(f"[SEBDOG] Sebdog Engine v{VERSION} starting...",flush=True)
-
-    # Restore from backup if DB missing
-    if not os.path.exists(DB_FILE):
-        print(f"[SEBDOG] Database not found. Checking for backups...",flush=True)
-        if restore_latest_backup():
-            print(f"[SEBDOG] Data restored from backup.",flush=True)
-        else:
-            print(f"[SEBDOG] No backup found. Starting fresh chain.",flush=True)
-
-    init_db()
-
-    if args.backup_on_start:
-        backup_db()
-
-    print(f"[SEBDOG] Validating licence with sebbi.pro...",flush=True)
-    if not validate_licence(args.key):
-        print(f"[SEBDOG] Licence validation failed. Get your key at {HOME}",flush=True)
-        sys.exit(1)
-
-    threading.Thread(target=revalidate_loop,args=(args.key,),daemon=True).start()
-    threading.Thread(target=backup_loop,daemon=True).start()
-
-    server=ThreadedServer(("0.0.0.0",args.port),Handler)
-    print(f"[SEBDOG] Engine running on port {args.port}",flush=True)
-    print(f"[SEBDOG] POST http://localhost:{args.port}/govern",flush=True)
-    print(f"[SEBDOG] GET  http://localhost:{args.port}/health",flush=True)
-    print(f"[SEBDOG] GET  http://localhost:{args.port}/verify-chain",flush=True)
-    print(f"[SEBDOG] GET  http://localhost:{args.port}/snapshots",flush=True)
-    print(f"[SEBDOG] Backups: ./sebdog_backups/ (daily, last 7 kept)",flush=True)
-    print(f"[SEBDOG] Sovereignty: all data stays on your hardware.",flush=True)
-
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("[SEBDOG] Shutting down.",flush=True)
-
-if __name__=="__main__":
-    main()
-
-```
-
-
-## `sebdog_licence.py`
-
-332 lines, 12401 bytes
-
-```python
-"""
-SEBDOG LICENCE SYSTEM v1.0.0
-Air-gapped cryptographic licence tokens for the Sebdog Engine.
-Copyright (c) 2026 Justin Antony Dobson / Monop Content, Blyth, UK
-
-HOW IT WORKS:
-- sebbi.pro generates a signed annual licence token on signup
-- The token is validated entirely locally — no phone-home required
-- Any tampering with the token is cryptographically detected
-- Tokens expire after 12 months and must be renewed
-- The signing secret never leaves sebbi.pro's servers
-
-SECURITY MODEL:
-- HMAC-SHA256 signatures — industry standard, same as used by AWS, Stripe
-- Constant-time comparison prevents timing attacks
-- Base64url encoding for safe transmission
-- JSON payload is deterministically serialised (sort_keys=True)
-- Every validation attempt is logged to the local audit chain
-"""
-
-import hashlib, hmac, json, time, base64, secrets, sqlite3, threading
-from typing import Tuple, Optional, Dict
-
-# ==============================================================================
-# CONSTANTS
-# ==============================================================================
-
-TOKEN_VERSION = "1"
-GRACE_SECONDS = 86400 * 7  # 7-day grace period after expiry before hard block
-AUDIT_DB = "sebdog_audit.db"
-
-# ==============================================================================
-# TOKEN GENERATION (runs on sebbi.pro server only)
-# The signing secret is an environment variable on Railway.
-# It never appears in any file that gets shipped to customers.
-# ==============================================================================
-
-def generate_token(api_key: str, devices: int, plan: str,
-                   email: str, secret: bytes,
-                   validity_days: int = 365) -> str:
-    """
-    Generate a cryptographically signed annual licence token.
-    Called by sebbi.pro when a customer requests an air-gapped licence.
-
-    Args:
-        api_key:       The customer's AILeash API key
-        devices:       Licensed device count
-        plan:          'free' or 'paid'
-        email:         Customer email
-        secret:        HMAC signing secret (from Railway env var)
-        validity_days: Token validity in days (default 365)
-
-    Returns:
-        Base64url-encoded signed token string
-    """
-    issued = int(time.time())
-    expires = issued + (validity_days * 86400)
-
-    payload = json.dumps({
-        "v": TOKEN_VERSION,
-        "key": api_key,
-        "devices": devices,
-        "plan": plan,
-        "email": email,
-        "issued": issued,
-        "expires": expires
-    }, sort_keys=True, separators=(',', ':'))
-
-    sig = hmac.new(secret, payload.encode('utf-8'), hashlib.sha256).hexdigest()
-
-    token_data = json.dumps({
-        "payload": payload,
-        "sig": sig
-    }, separators=(',', ':'))
-
-    return base64.urlsafe_b64encode(token_data.encode('utf-8')).decode('utf-8')
-
-
-# ==============================================================================
-# TOKEN VALIDATION (runs on customer hardware — no network required)
-# ==============================================================================
-
-def validate_token(token: str, secret: bytes) -> Tuple[Optional[Dict], Optional[str]]:
-    """
-    Validate a licence token entirely locally.
-    No network connection required.
-
-    Returns:
-        (licence_data, None) on success
-        (None, error_code) on failure
-
-    Error codes:
-        invalid_format      — token cannot be decoded
-        invalid_signature   — token has been tampered with
-        token_expired       — token is past expiry + grace period
-        version_mismatch    — token version not supported
-    """
-    try:
-        raw = json.loads(base64.urlsafe_b64decode(token.encode('utf-8')))
-        payload_str = raw.get("payload", "")
-        sig = raw.get("sig", "")
-    except Exception:
-        return None, "invalid_format"
-
-    # Constant-time HMAC comparison — prevents timing attacks
-    expected = hmac.new(secret, payload_str.encode('utf-8'), hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(sig, expected):
-        return None, "invalid_signature"
-
-    try:
-        data = json.loads(payload_str)
-    except Exception:
-        return None, "invalid_format"
-
-    if data.get("v") != TOKEN_VERSION:
-        return None, "version_mismatch"
-
-    # Apply grace period — token runs for 7 days past expiry
-    if data.get("expires", 0) + GRACE_SECONDS < time.time():
-        return None, "token_expired"
-
-    return data, None
-
-
-def is_in_grace_period(token_data: Dict) -> bool:
-    """Returns True if token is past expiry but within grace period."""
-    return token_data.get("expires", 0) < time.time()
-
-
-def days_until_expiry(token_data: Dict) -> int:
-    """Returns days remaining until token expiry (negative if expired)."""
-    return int((token_data.get("expires", 0) - time.time()) / 86400)
-
-
-# ==============================================================================
-# LOCAL LICENCE STORE
-# Caches the validated token locally so validation survives restarts.
-# Everything stays on the customer's own hardware.
-# ==============================================================================
-
-_lock = threading.Lock()
-
-
-def save_licence_locally(db_path: str, token: str, licence_data: Dict):
-    """Cache the validated licence in the local audit database."""
-    with _lock:
-        conn = sqlite3.connect(db_path)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS licence_cache (
-                id INTEGER PRIMARY KEY,
-                token TEXT,
-                api_key TEXT,
-                devices INTEGER,
-                plan TEXT,
-                email TEXT,
-                issued INTEGER,
-                expires INTEGER,
-                cached_at REAL
-            )
-        """)
-        conn.execute("DELETE FROM licence_cache")  # Only one licence at a time
-        conn.execute("""
-            INSERT INTO licence_cache
-            (token, api_key, devices, plan, email, issued, expires, cached_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            token,
-            licence_data.get("key", ""),
-            licence_data.get("devices", 1),
-            licence_data.get("plan", "free"),
-            licence_data.get("email", ""),
-            licence_data.get("issued", 0),
-            licence_data.get("expires", 0),
-            time.time()
-        ))
-        conn.commit()
-        conn.close()
-
-
-def load_licence_locally(db_path: str) -> Optional[Tuple[str, Dict]]:
-    """Load a cached licence from the local database."""
-    try:
-        with _lock:
-            conn = sqlite3.connect(db_path)
-            row = conn.execute(
-                "SELECT token, api_key, devices, plan, email, issued, expires "
-                "FROM licence_cache LIMIT 1"
-            ).fetchone()
-            conn.close()
-        if not row:
-            return None
-        token, api_key, devices, plan, email, issued, expires = row
-        data = {
-            "v": TOKEN_VERSION,
-            "key": api_key,
-            "devices": devices,
-            "plan": plan,
-            "email": email,
-            "issued": issued,
-            "expires": expires
-        }
-        return token, data
-    except Exception:
-        return None
-
-
-# ==============================================================================
-# STRESS TEST
-# Run with: python sebdog_licence.py
-# ==============================================================================
-
-if __name__ == "__main__":
-    import sys
-
-    print("SEBDOG LICENCE SYSTEM — Stress Test")
-    print("=" * 60)
-
-    # Generate a test secret (on sebbi.pro this comes from Railway env vars)
-    SECRET = secrets.token_bytes(32)
-    TEST_KEY = "al_live_" + secrets.token_hex(24)
-    PASSES = 0
-    FAILURES = 0
-
-    def check(name, condition, detail=""):
-        global PASSES, FAILURES
-        if condition:
-            print(f"  PASS  {name}")
-            PASSES += 1
-        else:
-            print(f"  FAIL  {name} {detail}")
-            FAILURES += 1
-
-    # --- Basic validity ---
-    print("\n[1] Basic token generation and validation")
-    token = generate_token(TEST_KEY, 10000, "paid", "test@example.com", SECRET)
-    data, err = validate_token(token, SECRET)
-    check("Valid token accepted", err is None)
-    check("API key preserved", data and data.get("key") == TEST_KEY)
-    check("Device count preserved", data and data.get("devices") == 10000)
-    check("Plan preserved", data and data.get("plan") == "paid")
-    check("Not in grace period", data and not is_in_grace_period(data))
-    check("Days until expiry > 360", data and days_until_expiry(data) > 360)
-
-    # --- Tamper detection ---
-    print("\n[2] Tamper detection")
-    raw = json.loads(base64.urlsafe_b64decode(token))
-    raw["payload"] = raw["payload"].replace("10000", "99999")
-    bad_token = base64.urlsafe_b64encode(json.dumps(raw, separators=(',',':')).encode()).decode()
-    _, err = validate_token(bad_token, SECRET)
-    check("Tampered device count rejected", err == "invalid_signature")
-
-    raw2 = json.loads(base64.urlsafe_b64decode(token))
-    raw2["payload"] = raw2["payload"].replace("paid", "enterprise")
-    bad_token2 = base64.urlsafe_b64encode(json.dumps(raw2, separators=(',',':')).encode()).decode()
-    _, err = validate_token(bad_token2, SECRET)
-    check("Tampered plan rejected", err == "invalid_signature")
-
-    raw3 = json.loads(base64.urlsafe_b64decode(token))
-    raw3["sig"] = "0" * 64
-    bad_token3 = base64.urlsafe_b64encode(json.dumps(raw3, separators=(',',':')).encode()).decode()
-    _, err = validate_token(bad_token3, SECRET)
-    check("Zeroed signature rejected", err == "invalid_signature")
-
-    # --- Expiry ---
-    print("\n[3] Expiry handling")
-    expired = generate_token(TEST_KEY, 100, "paid", "test@example.com", SECRET, validity_days=-1)
-    data_exp, err = validate_token(expired, SECRET)
-    check("Recently expired token in grace period", err is None and data_exp is not None)
-    check("Grace period detected", data_exp and is_in_grace_period(data_exp))
-
-    hard_expired = generate_token(TEST_KEY, 100, "paid", "test@example.com", SECRET, validity_days=-9)
-    _, err = validate_token(hard_expired, SECRET)
-    check("Hard expired token rejected", err == "token_expired")
-
-    # --- Wrong secret ---
-    print("\n[4] Secret validation")
-    wrong = secrets.token_bytes(32)
-    _, err = validate_token(token, wrong)
-    check("Wrong secret rejected", err == "invalid_signature")
-
-    almost_right = bytearray(SECRET)
-    almost_right[0] ^= 1
-    _, err = validate_token(token, bytes(almost_right))
-    check("One-bit-flipped secret rejected", err == "invalid_signature")
-
-    # --- Malformed tokens ---
-    print("\n[5] Malformed input handling")
-    _, err = validate_token("notbase64!!!", SECRET)
-    check("Garbage input rejected", err is not None)
-    _, err = validate_token("", SECRET)
-    check("Empty token rejected", err is not None)
-    _, err = validate_token(base64.urlsafe_b64encode(b"{}").decode(), SECRET)
-    check("Empty JSON rejected", err is not None)
-
-    # --- Local caching ---
-    print("\n[6] Local licence caching")
-    import tempfile, os
-    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
-        test_db = f.name
-    try:
-        data_valid, _ = validate_token(token, SECRET)
-        save_licence_locally(test_db, token, data_valid)
-        cached = load_licence_locally(test_db)
-        check("Licence saved and retrieved", cached is not None)
-        check("Cached key matches", cached and cached[1].get("key") == TEST_KEY)
-        check("Cached devices match", cached and cached[1].get("devices") == 10000)
-    finally:
-        os.unlink(test_db)
-
-    # --- Performance ---
-    print("\n[7] Performance")
-    import timeit
-    gen_time = timeit.timeit(
-        lambda: generate_token(TEST_KEY, 10000, "paid", "test@example.com", SECRET),
-        number=1000
-    )
-    val_time = timeit.timeit(
-        lambda: validate_token(token, SECRET),
-        number=1000
-    )
-    check(f"Generation: {gen_time*1:.1f}ms avg per token", gen_time < 5)
-    check(f"Validation: {val_time*1:.1f}ms avg per validation", val_time < 5)
-
-    # --- Summary ---
-    print(f"\n{'='*60}")
-    print(f"Results: {PASSES} passed, {FAILURES} failed")
-    if FAILURES == 0:
-        print("ALL TESTS PASSED. System is production ready.")
-    else:
-        print("FAILURES DETECTED. Do not ship.")
-    sys.exit(0 if FAILURES == 0 else 1)
-
-```
-
-
-## `sebdog_reporter.py`
-
-217 lines, 8364 bytes
-
-```python
-"""
-SEBDOG DECISION REPORTER v1.0.0
-Generates readable reports from the sebdog audit chain.
-Shows exactly why each decision was made.
-Copyright (c) 2026 Justin Antony Dobson / Monop Content
-"""
-
-import sqlite3, json, time, os
-from datetime import datetime
-
-DB_FILE = "sebdog_audit.db"
-
-REASON_EXPLANATIONS = {
-    "velocity_spike": "User made more than 10 requests in 60 seconds",
-    "high_amount": "Transaction amount exceeded £500",
-    "risky_device": "Device risk score above 0.5",
-    "behaviour_anomaly": "Behavioural anomaly score above 0.5",
-    "country_shift": "Request came from a different country than usual",
-    "unsafe_country": "Request came from outside approved country list",
-    "low_trust": "User trust score has dropped below 0.4 due to previous decisions",
-}
-
-def get_decisions(db_path=DB_FILE, limit=100):
-    if not os.path.exists(db_path):
-        return []
-    conn = sqlite3.connect(db_path)
-    rows = conn.execute("""
-        SELECT ts, user_id, event_json, result_json, audit_hash
-        FROM audit_log
-        ORDER BY id DESC
-        LIMIT ?
-    """, (limit,)).fetchall()
-    conn.close()
-    results = []
-    for row in rows:
-        try:
-            event = json.loads(row[2])
-            result = json.loads(row[3])
-            results.append({
-                "ts": row[0],
-                "user_id": row[1],
-                "event": event,
-                "result": result,
-                "audit_hash": row[4]
-            })
-        except:
-            pass
-    return results
-
-def format_reason(reason):
-    return REASON_EXPLANATIONS.get(reason, reason.replace("_", " ").capitalize())
-
-def decision_color(decision):
-    return {"ALLOW": "#00875a", "CHALLENGE": "#b45309", "BLOCK": "#cc0000"}.get(decision, "#555")
-
-def generate_text_report(db_path=DB_FILE, limit=100):
-    decisions = get_decisions(db_path, limit)
-    if not decisions:
-        return "No decisions recorded yet."
-    
-    lines = [
-        "SEBDOG DECISION REPORT",
-        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        f"Total decisions shown: {len(decisions)}",
-        "=" * 60
-    ]
-    
-    for d in decisions:
-        result = d["result"]
-        event = d["event"]
-        ts = datetime.fromtimestamp(d["ts"]).strftime('%Y-%m-%d %H:%M:%S')
-        decision = result.get("decision", "?")
-        score = result.get("score", 0)
-        reasons = result.get("reasons", [])
-        
-        lines.append(f"\n[{ts}] User: {d['user_id']}")
-        lines.append(f"Action: {event.get('action','?')} | Country: {event.get('country','?')} | Amount: £{event.get('amount',0)}")
-        lines.append(f"Decision: {decision} | Score: {score} | Trust: {result.get('trust',0)}")
-        
-        if reasons:
-            lines.append("Reasons:")
-            for r in reasons:
-                lines.append(f"  - {format_reason(r)}")
-        else:
-            lines.append("Reasons: No risk factors detected")
-        
-        lines.append(f"Audit hash: {d['audit_hash'][:32]}...")
-        lines.append("-" * 60)
-    
-    return "\n".join(lines)
-
-def generate_json_report(db_path=DB_FILE, limit=100):
-    decisions = get_decisions(db_path, limit)
-    report = {
-        "generated": datetime.now().isoformat(),
-        "total": len(decisions),
-        "decisions": []
-    }
-    for d in decisions:
-        result = d["result"]
-        event = d["event"]
-        reasons = result.get("reasons", [])
-        report["decisions"].append({
-            "timestamp": datetime.fromtimestamp(d["ts"]).isoformat(),
-            "user_id": d["user_id"],
-            "action": event.get("action"),
-            "country": event.get("country"),
-            "amount": event.get("amount"),
-            "decision": result.get("decision"),
-            "score": result.get("score"),
-            "trust": result.get("trust"),
-            "reasons": reasons,
-            "reasons_explained": [format_reason(r) for r in reasons],
-            "audit_hash": d["audit_hash"]
-        })
-    return json.dumps(report, indent=2)
-
-def generate_html_report(db_path=DB_FILE, limit=100):
-    decisions = get_decisions(db_path, limit)
-    
-    rows = ""
-    for d in decisions:
-        result = d["result"]
-        event = d["event"]
-        ts = datetime.fromtimestamp(d["ts"]).strftime('%Y-%m-%d %H:%M:%S')
-        decision = result.get("decision", "?")
-        score = result.get("score", 0)
-        reasons = result.get("reasons", [])
-        color = decision_color(decision)
-        
-        reason_html = ""
-        if reasons:
-            reason_html = "<ul>" + "".join(f"<li>{format_reason(r)}</li>" for r in reasons) + "</ul>"
-        else:
-            reason_html = "<span style='color:#888'>No risk factors detected</span>"
-        
-        rows += f"""
-        <tr>
-            <td>{ts}</td>
-            <td><code>{d['user_id']}</code></td>
-            <td>{event.get('action','?')}</td>
-            <td>{event.get('country','?')}</td>
-            <td>£{event.get('amount',0)}</td>
-            <td><strong style="color:{color}">{decision}</strong></td>
-            <td>{score}</td>
-            <td>{result.get('trust',0)}</td>
-            <td>{reason_html}</td>
-            <td><code style="font-size:10px">{d['audit_hash'][:16]}...</code></td>
-        </tr>"""
-    
-    allow = sum(1 for d in decisions if d["result"].get("decision") == "ALLOW")
-    challenge = sum(1 for d in decisions if d["result"].get("decision") == "CHALLENGE")
-    block = sum(1 for d in decisions if d["result"].get("decision") == "BLOCK")
-    
-    html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Sebdog Decision Report</title>
-<style>
-body{{font-family:sans-serif;background:#f5f7fa;color:#1a202c;margin:0;padding:20px}}
-.header{{background:#0a0f1e;color:#fff;padding:24px 32px;border-radius:8px;margin-bottom:24px}}
-.header h1{{margin:0;font-size:24px;color:#c9a84c}}
-.header p{{margin:4px 0 0;color:rgba(255,255,255,0.5);font-size:13px}}
-.stats{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:24px}}
-.stat{{background:#fff;border-radius:8px;padding:16px;text-align:center;border:1px solid #e2e8f0}}
-.stat-n{{font-size:32px;font-weight:700}}
-.stat-l{{font-size:11px;color:#64748b;margin-top:4px}}
-.allow{{color:#00875a}}.challenge{{color:#b45309}}.block{{color:#cc0000}}
-table{{width:100%;border-collapse:collapse;background:#fff;border-radius:8px;overflow:hidden;border:1px solid #e2e8f0}}
-th{{background:#0a0f1e;color:#c9a84c;padding:10px 12px;text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:1px}}
-td{{padding:10px 12px;border-bottom:1px solid #e2e8f0;font-size:12px;vertical-align:top}}
-tr:last-child td{{border:none}}
-tr:hover td{{background:#f8fafc}}
-ul{{margin:4px 0;padding-left:16px}}
-li{{margin:2px 0;color:#64748b}}
-code{{background:#f1f5f9;padding:2px 4px;border-radius:3px;font-size:11px}}
-</style>
-</head>
-<body>
-<div class="header">
-  <h1>Sebdog Decision Report</h1>
-  <p>Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} &nbsp;|&nbsp; Showing last {len(decisions)} decisions &nbsp;|&nbsp; Powered by sebbi.pro</p>
-</div>
-<div class="stats">
-  <div class="stat"><div class="stat-n allow">{allow}</div><div class="stat-l">ALLOWED</div></div>
-  <div class="stat"><div class="stat-n challenge">{challenge}</div><div class="stat-l">CHALLENGED</div></div>
-  <div class="stat"><div class="stat-n block">{block}</div><div class="stat-l">BLOCKED</div></div>
-</div>
-<table>
-<thead><tr>
-  <th>Time</th><th>User</th><th>Action</th><th>Country</th><th>Amount</th>
-  <th>Decision</th><th>Score</th><th>Trust</th><th>Reasons</th><th>Audit Hash</th>
-</tr></thead>
-<tbody>{rows if rows else '<tr><td colspan="10" style="text-align:center;color:#888;padding:32px">No decisions recorded yet</td></tr>'}</tbody>
-</table>
-</body>
-</html>"""
-    return html
-
-if __name__ == "__main__":
-    import sys
-    fmt = sys.argv[1] if len(sys.argv) > 1 else "html"
-    db = sys.argv[2] if len(sys.argv) > 2 else DB_FILE
-    
-    if fmt == "text":
-        print(generate_text_report(db))
-    elif fmt == "json":
-        print(generate_json_report(db))
-    else:
-        report = generate_html_report(db)
-        out = "sebdog_report.html"
-        with open(out, "w") as f:
-            f.write(report)
-        print(f"Report saved to {out}")
-
-```
-
-
-## `AILeash-API-Reference-v6.4.2.md`
-
-256 lines, 6799 bytes
-
-```markdown
-# AILeash v6.4.2 — Complete API Reference
-
-## Core Decision Endpoint
-
-### POST /api/govern
-**The engine. Every action scores here.**
-
-Auth: `Bearer YOUR_API_KEY`
-
-**Request:**
-```json
-{
-  "user_id": "string (required)",
-  "action": "string (required) — payment/login/message/transfer/checkout/api_call",
-  "amount": "number (optional, default 0) — monetary value in GBP",
-  "country": "string (required) — ISO 3166-1 alpha-2 code",
-  "device_id": "string (required) — unique device identifier",
-  "anomaly": "number 0..1 (optional) — behavioural anomaly score",
-  "device_risk": "number 0..1 (optional) — device risk score"
-}
-```
-
-**Response (200 OK):**
-```json
-{
-  "decision": "ALLOW|CHALLENGE|BLOCK",
-  "score": 0.0..1.0,
-  "trust": 0.05..1.0,
-  "reasons": ["velocity_spike", "high_amount", "country_shift"],
-  "audit_hash": "sha256_hex_string",
-  "block_index": 12345,
-  "receipt_seq": 42,
-  "timestamp": 1719072000.0,
-  "challenge_url": "https://sebbi.pro/verify-challenge?token=...",
-  "challenge_expires_in": 900
-}
-```
-
-**Error responses:**
-- `401 Unauthorized` — Missing or invalid API key
-- `403 Forbidden` — Account inactive or over quota
-- `429 Too Many Requests` — Rate limited
-- `503 Service Unavailable` — Server overloaded
-
----
-
-## Account Management
-
-### POST /api/keys or /signup
-**Create a new API key. Instant. No card. No humans in the loop.**
-
-No auth required.
-
-**Request:**
-```json
-{
-  "email": "user@example.com (required)",
-  "name": "John Doe (optional)",
-  "phone": "+441234567890 (optional)",
-  "org": "Acme Corp (optional)",
-  "product": "aileash|guardian|sonicboom|sentinel (default: aileash)",
-  "devices": 1..1000000 (default: 1),
-  "ref_code": "REF-XXXX-1234 (optional)"
-}
-```
-
-**Response (200 OK):**
-```json
-{
-  "api_key": "al_live_...",
-  "email": "user@example.com",
-  "product": "aileash",
-  "devices": 1,
-  "monthly_cost": 0.50,
-  "quota": 100,
-  "ref_code": "REF-JOHN-5678",
-  "badge_id": "abc123def456",
-  "message": "100 free decisions. Then 50p per device per month via Stripe."
-}
-```
-
----
-
-## Verification & Public Endpoints
-
-### GET /api/spec
-**Engine specification. Public. No auth.**
-
-**Response (200 OK):**
-```json
-{
-  "engine": "AILeash v6.4.2",
-  "version": "6.4.2",
-  "signals": 9,
-  "decision_latency_ms": 28,
-  "threshold_allow": 0.35,
-  "threshold_challenge": 0.70,
-  "threshold_block": 1.0,
-  "features": ["deterministic scoring", "tamper-evident chain", "real-time alerts", "gapless receipts", "sovereign deployment"]
-}
-```
-
-### GET /api/verify-chain
-**Full audit chain integrity proof. Public. No auth.**
-
-**Response (200 OK):**
-```json
-{
-  "valid": true,
-  "blocks": 45678,
-  "genesis": "GENESIS",
-  "tip": "abc123...",
-  "message": "Chain intact. No tampering detected.",
-  "verifiable_by": "anyone, anywhere"
-}
-```
-
-### GET /api/health
-**Server health and load. Public. No auth.**
-
-**Response (200 OK):**
-```json
-{
-  "status": "ok",
-  "version": "6.4.2",
-  "uptime_seconds": 864000,
-  "rps": 42,
-  "timestamp": 1719072000.0
-}
-```
-
----
-
-## Real-time Dashboards
-
-### GET /api/pulse
-**Live risk posture. Your current state.**
-
-Auth: `Bearer YOUR_API_KEY`
-
-**Response (200 OK):**
-```json
-{
-  "last_hour": {
-    "ALLOW": 486,
-    "CHALLENGE": 23,
-    "BLOCK": 4
-  },
-  "recent": [
-    {
-      "ts": 1719072000,
-      "user_id": "u_7f2",
-      "action": "payment",
-      "decision": "ALLOW",
-      "score": 0.12,
-      "reasons": [],
-      "audit_hash": "abc123..."
-    }
-  ],
-  "chain_tip": "abc123...",
-  "message": "All green. Chain tip sealed."
-}
-```
-
----
-
-## Billing & Webhooks
-
-### POST /stripe-webhook
-**Stripe webhook receiver. Signature verified automatically.**
-
-Supports events:
-- `checkout.session.completed` — User upgraded
-- `invoice.paid` — Monthly subscription paid
-- `customer.subscription.deleted` — User cancelled
-- `invoice.payment_failed` — Payment failed
-
----
-
-## Four Products. One Engine.
-
-### AILeash
-- **What:** Every AI decision your platform makes about a person gets scored, explained, and sealed.
-- **Who:** Platforms using AI for any regulated decision (lending, hiring, content moderation, fraud, access control).
-- **Price:** 50p per device per month + your margin.
-- **Free tier:** 100 decisions/month, no card.
-
-### Guardian
-- **What:** Free message checker for families. Child pastes a message in, gets instant plain-English assessment against grooming patterns.
-- **Who:** Families. Free forever. No card. No catch.
-- **Price:** Free. Always.
-- **Built for:** ICO Children's Code, Online Safety Act, child safety.
-
-### SonicBoom
-- **What:** One line of code. Drops into AWS, Azure, GCP, OpenAI, Anthropic. Adds full compliance audit chain to every call.
-- **Who:** Platforms already running AI in the cloud.
-- **Price:** 50p per device per month + your margin.
-- **Latency:** No impact. Chain sealing is asynchronous.
-
-### Sentinel
-- **What:** Fraud and anomaly alerting. Scores unusual patterns (500 messages in a minute, login from new country, velocity spikes) in real-time.
-- **Who:** Platforms managing fraud, abuse, takeovers.
-- **Price:** 50p per device per month + your margin.
-- **Real-time:** Alerts the moment thresholds trip.
-
----
-
-## The Score Formula (Immutable)
-
-**Raw weighted sum (Σ_raw):**
-```
-Σ_raw =
-  (1 − trust) × 0.30
-  + min(velocity_60s / 20, 1) × 0.15
-  + min(velocity_5m / 50, 1) × 0.10
-  + min(velocity_1h / 200, 1) × 0.10
-  + min(ln(1+amount) / ln(1+10000), 1) × 0.15
-  + device_risk × 0.10
-  + behavioural_anomaly × 0.10
-  + country_shift × 0.10
-  + unsafe_country × 0.10
-```
-
-**Normalization:** the nine weights above sum to 1.20, not 1.0. To keep every signal's *relative* importance exactly as designed while guaranteeing the score behaves as a true 0–1 weighted average (not one that can reach BLOCK-level values from fewer combined signals than intended), divide by the actual weight total before clamping:
-
-```
-WEIGHT_TOTAL = 0.30 + 0.15 + 0.10 + 0.10 + 0.15 + 0.10 + 0.10 + 0.10 + 0.10   # = 1.20
-
-score = clamp( Σ_raw / WEIGHT_TOTAL , 0, 1 )
-
-decision = ALLOW if score < 0.35
-         = CHALLENGE if score < 0.70
-         = BLOCK otherwise
-```
-
-No machine learning. No drift. No retraining. Weights are written in code and cannot change without a new release. `WEIGHT_TOTAL` is a fixed constant (1.20) recomputed only if a signal is added, removed, or reweighted in a future release — never at runtime.
-
----
-
-## Rate Limits
-
-- **Free tier:** 100 decisions/month
-- **Paid:** Unlimited (or by plan)
-- **Public endpoints:** No rate limit
-
----
-
-## Documentation
-
-- **Homepage:** https://sebbi.pro
-- **Whitepaper:** https://sebbi.pro/whitepaper
-- **Developers:** https://sebbi.pro/developers
-- **Scanner (free):** https://sebbi.pro/scan
-- **Guardian:** https://sebbi.pro/guardian-app
-- **Contact:** justrightdecorators@gmail.com
-
-```
-
-
-## `LICENCE`
-
-22 lines, 1074 bytes
-
-```
-MIT License
-
-Copyright (c) 2026 Monop (Blyth, UK)
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
 
 ```

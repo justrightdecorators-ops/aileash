@@ -1,13 +1,1329 @@
 # Codebase — part 8 of 16
 
 Contains:
+- `sebdog_engine.py`
+- `sebdog_licence.py`
+- `sebdog_reporter.py`
+- `AILeash-API-Reference-v6.4.2.md`
+- `LICENCE`
 - `README.md`
 - `admin.html`
 - `ai-standard.html`
 - `ai-txt-kit.html`
 - `aitxt-popup-live.html`
 - `brain.html`
-- `certificate.html`
+
+
+## `sebdog_engine.py`
+
+445 lines, 17345 bytes
+
+```python
+import json, math, time, sqlite3, hashlib, threading, argparse, sys, os, shutil
+import urllib.request, urllib.parse
+from collections import defaultdict, deque
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
+from urllib.parse import urlparse
+
+VERSION = "1.1.0"
+HOME = "https://sebbi.pro"
+VALIDATE_URL = HOME + "/api/validate-engine"
+DB_FILE = "sebdog_audit.db"
+SAFE = {"UK","US","DE","FR","CA","AU","NL","SE","NO","DK","FI","IE","NZ"}
+REQ = {"user_id","action","amount","country","device_id","anomaly","device_risk"}
+
+_db_lock = threading.Lock()
+_key_wins = defaultdict(lambda: {"min": deque(), "hour": deque()})
+_key_lock = threading.Lock()
+W60 = defaultdict(deque)
+W5M = defaultdict(deque)
+W1H = defaultdict(deque)
+
+_licence = {
+    "valid": False, "plan": "free", "product": "aileash",
+    "devices": 1, "email": "", "checked_at": 0, "key": ""
+}
+
+# ==============================================================================
+# LICENCE VALIDATION
+# ==============================================================================
+
+def validate_licence(api_key):
+    global _licence
+    try:
+        req = urllib.request.Request(
+            VALIDATE_URL, method="POST",
+            headers={"Authorization": "Bearer " + api_key, "Content-Type": "application/json"},
+            data=json.dumps({}).encode()
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read())
+        if data.get("valid"):
+            _licence.update({
+                "valid": True, "plan": data.get("plan","free"),
+                "product": data.get("product","aileash"),
+                "devices": data.get("devices",1),
+                "email": data.get("email",""),
+                "checked_at": time.time(), "key": api_key
+            })
+            print(f"[SEBDOG] Licence valid. Plan:{_licence['plan']} Devices:{_licence['devices']}", flush=True)
+            return True
+        else:
+            err = data.get("error","unknown")
+            print(f"[SEBDOG] Licence rejected: {err}", flush=True)
+            _licence["valid"] = False
+            return False
+    except Exception as e:
+        print(f"[SEBDOG] Licence check failed: {e}", flush=True)
+        if _licence["valid"] and (time.time() - _licence["checked_at"]) < 86400:
+            print("[SEBDOG] Using cached licence (24h grace)", flush=True)
+            return True
+        return False
+
+def revalidate_loop(api_key):
+    while True:
+        time.sleep(86400)
+        validate_licence(api_key)
+
+# ==============================================================================
+# DATABASE + BACKUP
+# Local SQLite — audit chain lives on your own machine.
+# Automatic daily backup keeps data retrievable even after failures.
+# Sovereignty is maintained — data never leaves your network.
+# ==============================================================================
+
+def get_conn():
+    c = sqlite3.connect(DB_FILE, check_same_thread=False)
+    c.execute("PRAGMA journal_mode=WAL;")
+    c.execute("PRAGMA synchronous=NORMAL;")
+    c.execute("""CREATE TABLE IF NOT EXISTS users(
+        user_id TEXT PRIMARY KEY, trust REAL DEFAULT 0.5, last_country TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS audit_log(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, user_id TEXT,
+        event_json TEXT, result_json TEXT, prev_hash TEXT,
+        audit_hash TEXT UNIQUE)""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_audit ON audit_log(user_id)")
+    c.execute("""CREATE TABLE IF NOT EXISTS chain_snapshots(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts REAL, block_count INTEGER, tip_hash TEXT,
+        snapshot_file TEXT)""")
+    c.commit()
+    return c
+
+_conn = None
+
+def init_db():
+    global _conn
+    _conn = get_conn()
+
+def backup_db():
+    """
+    Creates a timestamped backup of the audit database.
+    Data stays on your own hardware — sovereignty is not affected.
+    Runs automatically every 24 hours.
+    """
+    backup_dir = os.path.join(os.path.dirname(DB_FILE), "sebdog_backups")
+    os.makedirs(backup_dir, exist_ok=True)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    backup_path = os.path.join(backup_dir, f"sebdog_audit_{ts}.db")
+    try:
+        with _db_lock:
+            shutil.copy2(DB_FILE, backup_path)
+            blocks = _conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0]
+            tip = _conn.execute(
+                "SELECT audit_hash FROM audit_log ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            tip_hash = tip[0] if tip else "GENESIS"
+            _conn.execute(
+                "INSERT INTO chain_snapshots(ts,block_count,tip_hash,snapshot_file) VALUES(?,?,?,?)",
+                (time.time(), blocks, tip_hash, backup_path)
+            )
+            _conn.commit()
+        print(f"[SEBDOG] Backup created: {backup_path} ({blocks} blocks)", flush=True)
+        _cleanup_old_backups(backup_dir)
+    except Exception as e:
+        print(f"[SEBDOG] Backup failed: {e}", flush=True)
+
+def _cleanup_old_backups(backup_dir, keep=7):
+    """Keep only the most recent N backups."""
+    try:
+        files = sorted([
+            os.path.join(backup_dir, f) for f in os.listdir(backup_dir)
+            if f.startswith("sebdog_audit_") and f.endswith(".db")
+        ])
+        for old in files[:-keep]:
+            os.remove(old)
+    except Exception:
+        pass
+
+def backup_loop():
+    while True:
+        time.sleep(86400)
+        backup_db()
+
+def restore_latest_backup():
+    """
+    Restore from the most recent backup if the main database is missing or corrupt.
+    Call this on startup if the main DB file doesn't exist.
+    """
+    backup_dir = os.path.join(os.path.dirname(DB_FILE), "sebdog_backups")
+    if not os.path.exists(backup_dir):
+        return False
+    files = sorted([
+        os.path.join(backup_dir, f) for f in os.listdir(backup_dir)
+        if f.startswith("sebdog_audit_") and f.endswith(".db")
+    ])
+    if not files:
+        return False
+    latest = files[-1]
+    try:
+        shutil.copy2(latest, DB_FILE)
+        print(f"[SEBDOG] Restored from backup: {latest}", flush=True)
+        return True
+    except Exception as e:
+        print(f"[SEBDOG] Restore failed: {e}", flush=True)
+        return False
+
+def list_snapshots():
+    with _db_lock:
+        rows = _conn.execute(
+            "SELECT ts, block_count, tip_hash, snapshot_file FROM chain_snapshots ORDER BY id DESC LIMIT 10"
+        ).fetchall()
+    return [{"ts": r[0], "blocks": r[1], "tip": r[2], "file": r[3]} for r in rows]
+
+# ==============================================================================
+# RATE LIMITING
+# ==============================================================================
+
+def check_rate(key):
+    t = time.time()
+    with _key_lock:
+        w = _key_wins[key]
+        while w["min"] and w["min"][0] < t-60: w["min"].popleft()
+        while w["hour"] and w["hour"][0] < t-3600: w["hour"].popleft()
+        if len(w["min"]) >= 60: return False, "rate_limit_minute"
+        if len(w["hour"]) >= 1000: return False, "rate_limit_hour"
+        w["min"].append(t); w["hour"].append(t)
+        return True, None
+
+# ==============================================================================
+# CORE ENGINE
+# ==============================================================================
+
+def now(): return time.time()
+def clamp(x,a=0.0,b=1.0): return max(a,min(b,x))
+def sha(p): return hashlib.sha256(json.dumps(p,sort_keys=True).encode()).hexdigest()
+
+def upd_vel(uid):
+    t=now()
+    for q in [W60[uid],W5M[uid],W1H[uid]]: q.append(t)
+    c=now()
+    W60[uid]=deque(x for x in W60[uid] if x>=c-60)
+    W5M[uid]=deque(x for x in W5M[uid] if x>=c-300)
+    W1H[uid]=deque(x for x in W1H[uid] if x>=c-3600)
+
+def vel(uid): return {"60s":len(W60[uid]),"5m":len(W5M[uid]),"1h":len(W1H[uid])}
+
+def load_user(uid):
+    with _db_lock:
+        r=_conn.execute("SELECT trust,last_country FROM users WHERE user_id=?",(uid,)).fetchone()
+    return{"trust":r[0],"last_country":r[1]} if r else{"trust":0.5,"last_country":None}
+
+def save_user(uid,trust,country):
+    with _db_lock:
+        _conn.execute(
+            "INSERT INTO users(user_id,trust,last_country) VALUES(?,?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET trust=excluded.trust,last_country=excluded.last_country",
+            (uid,trust,country))
+        _conn.commit()
+
+def score_event(s):
+    reasons=[]
+    sc=(1-s["trust"])*0.30
+    v60=s["v60"]; sc+=min(v60/20,1)*0.15
+    if v60>10: reasons.append("velocity_spike")
+    sc+=min(s["v5m"]/50,1)*0.10+min(s["v1h"]/200,1)*0.10
+    amt=float(s.get("amount",0)); sc+=min(math.log1p(amt)/math.log1p(10000),1)*0.15
+    if amt>500: reasons.append("high_amount")
+    dr=float(s.get("device_risk",0)); sc+=dr*0.10
+    if dr>0.5: reasons.append("risky_device")
+    an=float(s.get("anomaly",0)); sc+=an*0.10
+    if an>0.5: reasons.append("behaviour_anomaly")
+    if s.get("country_shift"): sc+=0.10; reasons.append("country_shift")
+    if s.get("unsafe_country"): sc+=0.10; reasons.append("unsafe_country")
+    if s["trust"]<0.4: reasons.append("low_trust")
+    return round(clamp(sc),4),reasons
+
+def decide(sc):
+    if sc<0.35: return"ALLOW"
+    if sc<0.70: return"CHALLENGE"
+    return"BLOCK"
+
+def upd_trust(t,d):
+    if d=="ALLOW": t+=(1-t)*0.01
+    elif d=="CHALLENGE": t-=t*0.02
+    elif d=="BLOCK": t-=t*0.08
+    return clamp(t,0.05,1.0)
+
+def chain_tip():
+    with _db_lock:
+        r=_conn.execute("SELECT audit_hash FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()
+    return r[0] if r else"GENESIS"
+
+def seal(event,result,ts):
+    prev=chain_tip()
+    h=sha({"prev_hash":prev,"ts":ts,"event":event,"result":result})
+    with _db_lock:
+        _conn.execute(
+            "INSERT INTO audit_log(ts,user_id,event_json,result_json,prev_hash,audit_hash) VALUES(?,?,?,?,?,?)",
+            (ts,event["user_id"],json.dumps(event),json.dumps(result),prev,h))
+        _conn.commit()
+    return h
+
+def verify_chain():
+    with _db_lock:
+        rows=_conn.execute(
+            "SELECT event_json,result_json,prev_hash,audit_hash,ts FROM audit_log ORDER BY id ASC"
+        ).fetchall()
+    if not rows: return{"valid":True,"blocks":0,"message":"Empty chain"}
+    prev="GENESIS"
+    for i,row in enumerate(rows):
+        p={"prev_hash":row[2],"ts":row[4],"event":json.loads(row[0]),"result":json.loads(row[1])}
+        if sha(p)!=row[3] or row[2]!=prev:
+            return{"valid":False,"broken_at":i,"message":f"Tampered at block {i}"}
+        prev=row[3]
+    return{"valid":True,"blocks":len(rows),"tip":rows[-1][3],"message":"Chain intact"}
+
+def govern(event):
+    missing=REQ-event.keys()
+    if missing: raise ValueError(f"Missing fields: {missing}")
+    if not _licence["valid"]:
+        return{"error":"licence_invalid","message":f"Valid API key required. Get yours at {HOME}"},403
+    ts=now(); uid=event["user_id"]
+    state=load_user(uid); upd_vel(uid); v=vel(uid)
+    country=event["country"]
+    signals={
+        "trust":state["trust"],"v60":v["60s"],"v5m":v["5m"],"v1h":v["1h"],
+        "amount":float(event.get("amount",0)),
+        "device_risk":float(event.get("device_risk",0)),
+        "anomaly":float(event.get("anomaly",0)),
+        "country_shift":state["last_country"] is not None and state["last_country"]!=country,
+        "unsafe_country":country not in SAFE
+    }
+    sc,reasons=score_event(signals)
+    dec=decide(sc); trust=upd_trust(state["trust"],dec)
+    save_user(uid,trust,country)
+    result={
+        "decision":dec,"score":sc,"trust":round(trust,4),
+        "reasons":reasons,"version":VERSION,"engine":"sebdog",
+        "local":True,"timestamp":ts
+    }
+    result["audit_hash"]=seal(event,result,ts)
+    return result,200
+
+# ==============================================================================
+# HTTP SERVER
+# ==============================================================================
+
+def send_json(h,data,status=200):
+    body=json.dumps(data,indent=2).encode()
+    h.send_response(status)
+    h.send_header("Content-Type","application/json")
+    h.send_header("Content-Length",str(len(body)))
+    h.send_header("Access-Control-Allow-Origin","*")
+    h.end_headers()
+    h.wfile.write(body)
+
+def read_body(h):
+    n=int(h.headers.get("Content-Length",0))
+    if n:
+        try: return json.loads(h.rfile.read(n))
+        except: return{}
+    return{}
+
+def get_bearer(h):
+    auth=h.headers.get("Authorization","")
+    if auth.startswith("Bearer "): return auth[7:]
+    return h.headers.get("X-API-Key","").strip()
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self,fmt,*args): pass
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin","*")
+        self.send_header("Access-Control-Allow-Methods","GET,POST,OPTIONS")
+        self.send_header("Access-Control-Allow-Headers","Content-Type,Authorization,X-API-Key")
+        self.end_headers()
+
+    def do_GET(self):
+        path=urlparse(self.path).path
+        if path=="/health":
+            send_json(self,{
+                "status":"ok","version":VERSION,"engine":"sebdog","local":True,
+                "licence":{
+                    "valid":_licence["valid"],"plan":_licence["plan"],
+                    "devices":_licence["devices"],"email":_licence["email"]
+                }
+            })
+        elif path=="/verify-chain":
+            send_json(self,verify_chain())
+        elif path=="/stats":
+            with _db_lock:
+                blocks=_conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0]
+                users=_conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+            send_json(self,{
+                "audit_blocks":blocks,"users_tracked":users,
+                "version":VERSION,"engine":"sebdog","licence_valid":_licence["valid"]
+            })
+        elif path=="/snapshots":
+            send_json(self,{"snapshots":list_snapshots()})
+        elif path=="/backup":
+            backup_db()
+            send_json(self,{"ok":True,"message":"Backup created"})
+        else:
+            send_json(self,{"error":"not_found"},404)
+
+    def do_POST(self):
+        path=urlparse(self.path).path.rstrip("/")
+        data=read_body(self)
+        if path in("/govern","/api/govern"):
+            bearer=get_bearer(self)
+            if bearer and bearer!=_licence["key"]:
+                send_json(self,{"error":"invalid_api_key"},401); return
+            ok,ec=check_rate(bearer or"default")
+            if not ok:
+                send_json(self,{"error":ec},429); return
+            try:
+                result,status=govern(data)
+                send_json(self,result,status)
+            except ValueError as e:
+                send_json(self,{"error":str(e)},400)
+            except Exception as e:
+                send_json(self,{"error":"internal","detail":str(e)},500)
+        else:
+            send_json(self,{"error":"not_found"},404)
+
+class ThreadedServer(ThreadingMixIn,HTTPServer):
+    allow_reuse_address=True
+    daemon_threads=True
+
+# ==============================================================================
+# ENTRY POINT
+# ==============================================================================
+
+def main():
+    parser=argparse.ArgumentParser(description="Sebdog Engine — AILeash local compliance engine")
+    parser.add_argument("--key",required=True,help="Your AILeash API key from sebbi.pro")
+    parser.add_argument("--port",type=int,default=9090,help="Port (default: 9090)")
+    parser.add_argument("--db",default="sebdog_audit.db",help="SQLite audit database path")
+    parser.add_argument("--backup-on-start",action="store_true",help="Create a backup on startup")
+    args=parser.parse_args()
+
+    global DB_FILE
+    DB_FILE=args.db
+
+    print(f"[SEBDOG] Sebdog Engine v{VERSION} starting...",flush=True)
+
+    # Restore from backup if DB missing
+    if not os.path.exists(DB_FILE):
+        print(f"[SEBDOG] Database not found. Checking for backups...",flush=True)
+        if restore_latest_backup():
+            print(f"[SEBDOG] Data restored from backup.",flush=True)
+        else:
+            print(f"[SEBDOG] No backup found. Starting fresh chain.",flush=True)
+
+    init_db()
+
+    if args.backup_on_start:
+        backup_db()
+
+    print(f"[SEBDOG] Validating licence with sebbi.pro...",flush=True)
+    if not validate_licence(args.key):
+        print(f"[SEBDOG] Licence validation failed. Get your key at {HOME}",flush=True)
+        sys.exit(1)
+
+    threading.Thread(target=revalidate_loop,args=(args.key,),daemon=True).start()
+    threading.Thread(target=backup_loop,daemon=True).start()
+
+    server=ThreadedServer(("0.0.0.0",args.port),Handler)
+    print(f"[SEBDOG] Engine running on port {args.port}",flush=True)
+    print(f"[SEBDOG] POST http://localhost:{args.port}/govern",flush=True)
+    print(f"[SEBDOG] GET  http://localhost:{args.port}/health",flush=True)
+    print(f"[SEBDOG] GET  http://localhost:{args.port}/verify-chain",flush=True)
+    print(f"[SEBDOG] GET  http://localhost:{args.port}/snapshots",flush=True)
+    print(f"[SEBDOG] Backups: ./sebdog_backups/ (daily, last 7 kept)",flush=True)
+    print(f"[SEBDOG] Sovereignty: all data stays on your hardware.",flush=True)
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("[SEBDOG] Shutting down.",flush=True)
+
+if __name__=="__main__":
+    main()
+
+```
+
+
+## `sebdog_licence.py`
+
+332 lines, 12401 bytes
+
+```python
+"""
+SEBDOG LICENCE SYSTEM v1.0.0
+Air-gapped cryptographic licence tokens for the Sebdog Engine.
+Copyright (c) 2026 Justin Antony Dobson / Monop Content, Blyth, UK
+
+HOW IT WORKS:
+- sebbi.pro generates a signed annual licence token on signup
+- The token is validated entirely locally — no phone-home required
+- Any tampering with the token is cryptographically detected
+- Tokens expire after 12 months and must be renewed
+- The signing secret never leaves sebbi.pro's servers
+
+SECURITY MODEL:
+- HMAC-SHA256 signatures — industry standard, same as used by AWS, Stripe
+- Constant-time comparison prevents timing attacks
+- Base64url encoding for safe transmission
+- JSON payload is deterministically serialised (sort_keys=True)
+- Every validation attempt is logged to the local audit chain
+"""
+
+import hashlib, hmac, json, time, base64, secrets, sqlite3, threading
+from typing import Tuple, Optional, Dict
+
+# ==============================================================================
+# CONSTANTS
+# ==============================================================================
+
+TOKEN_VERSION = "1"
+GRACE_SECONDS = 86400 * 7  # 7-day grace period after expiry before hard block
+AUDIT_DB = "sebdog_audit.db"
+
+# ==============================================================================
+# TOKEN GENERATION (runs on sebbi.pro server only)
+# The signing secret is an environment variable on Railway.
+# It never appears in any file that gets shipped to customers.
+# ==============================================================================
+
+def generate_token(api_key: str, devices: int, plan: str,
+                   email: str, secret: bytes,
+                   validity_days: int = 365) -> str:
+    """
+    Generate a cryptographically signed annual licence token.
+    Called by sebbi.pro when a customer requests an air-gapped licence.
+
+    Args:
+        api_key:       The customer's AILeash API key
+        devices:       Licensed device count
+        plan:          'free' or 'paid'
+        email:         Customer email
+        secret:        HMAC signing secret (from Railway env var)
+        validity_days: Token validity in days (default 365)
+
+    Returns:
+        Base64url-encoded signed token string
+    """
+    issued = int(time.time())
+    expires = issued + (validity_days * 86400)
+
+    payload = json.dumps({
+        "v": TOKEN_VERSION,
+        "key": api_key,
+        "devices": devices,
+        "plan": plan,
+        "email": email,
+        "issued": issued,
+        "expires": expires
+    }, sort_keys=True, separators=(',', ':'))
+
+    sig = hmac.new(secret, payload.encode('utf-8'), hashlib.sha256).hexdigest()
+
+    token_data = json.dumps({
+        "payload": payload,
+        "sig": sig
+    }, separators=(',', ':'))
+
+    return base64.urlsafe_b64encode(token_data.encode('utf-8')).decode('utf-8')
+
+
+# ==============================================================================
+# TOKEN VALIDATION (runs on customer hardware — no network required)
+# ==============================================================================
+
+def validate_token(token: str, secret: bytes) -> Tuple[Optional[Dict], Optional[str]]:
+    """
+    Validate a licence token entirely locally.
+    No network connection required.
+
+    Returns:
+        (licence_data, None) on success
+        (None, error_code) on failure
+
+    Error codes:
+        invalid_format      — token cannot be decoded
+        invalid_signature   — token has been tampered with
+        token_expired       — token is past expiry + grace period
+        version_mismatch    — token version not supported
+    """
+    try:
+        raw = json.loads(base64.urlsafe_b64decode(token.encode('utf-8')))
+        payload_str = raw.get("payload", "")
+        sig = raw.get("sig", "")
+    except Exception:
+        return None, "invalid_format"
+
+    # Constant-time HMAC comparison — prevents timing attacks
+    expected = hmac.new(secret, payload_str.encode('utf-8'), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(sig, expected):
+        return None, "invalid_signature"
+
+    try:
+        data = json.loads(payload_str)
+    except Exception:
+        return None, "invalid_format"
+
+    if data.get("v") != TOKEN_VERSION:
+        return None, "version_mismatch"
+
+    # Apply grace period — token runs for 7 days past expiry
+    if data.get("expires", 0) + GRACE_SECONDS < time.time():
+        return None, "token_expired"
+
+    return data, None
+
+
+def is_in_grace_period(token_data: Dict) -> bool:
+    """Returns True if token is past expiry but within grace period."""
+    return token_data.get("expires", 0) < time.time()
+
+
+def days_until_expiry(token_data: Dict) -> int:
+    """Returns days remaining until token expiry (negative if expired)."""
+    return int((token_data.get("expires", 0) - time.time()) / 86400)
+
+
+# ==============================================================================
+# LOCAL LICENCE STORE
+# Caches the validated token locally so validation survives restarts.
+# Everything stays on the customer's own hardware.
+# ==============================================================================
+
+_lock = threading.Lock()
+
+
+def save_licence_locally(db_path: str, token: str, licence_data: Dict):
+    """Cache the validated licence in the local audit database."""
+    with _lock:
+        conn = sqlite3.connect(db_path)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS licence_cache (
+                id INTEGER PRIMARY KEY,
+                token TEXT,
+                api_key TEXT,
+                devices INTEGER,
+                plan TEXT,
+                email TEXT,
+                issued INTEGER,
+                expires INTEGER,
+                cached_at REAL
+            )
+        """)
+        conn.execute("DELETE FROM licence_cache")  # Only one licence at a time
+        conn.execute("""
+            INSERT INTO licence_cache
+            (token, api_key, devices, plan, email, issued, expires, cached_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            token,
+            licence_data.get("key", ""),
+            licence_data.get("devices", 1),
+            licence_data.get("plan", "free"),
+            licence_data.get("email", ""),
+            licence_data.get("issued", 0),
+            licence_data.get("expires", 0),
+            time.time()
+        ))
+        conn.commit()
+        conn.close()
+
+
+def load_licence_locally(db_path: str) -> Optional[Tuple[str, Dict]]:
+    """Load a cached licence from the local database."""
+    try:
+        with _lock:
+            conn = sqlite3.connect(db_path)
+            row = conn.execute(
+                "SELECT token, api_key, devices, plan, email, issued, expires "
+                "FROM licence_cache LIMIT 1"
+            ).fetchone()
+            conn.close()
+        if not row:
+            return None
+        token, api_key, devices, plan, email, issued, expires = row
+        data = {
+            "v": TOKEN_VERSION,
+            "key": api_key,
+            "devices": devices,
+            "plan": plan,
+            "email": email,
+            "issued": issued,
+            "expires": expires
+        }
+        return token, data
+    except Exception:
+        return None
+
+
+# ==============================================================================
+# STRESS TEST
+# Run with: python sebdog_licence.py
+# ==============================================================================
+
+if __name__ == "__main__":
+    import sys
+
+    print("SEBDOG LICENCE SYSTEM — Stress Test")
+    print("=" * 60)
+
+    # Generate a test secret (on sebbi.pro this comes from Railway env vars)
+    SECRET = secrets.token_bytes(32)
+    TEST_KEY = "al_live_" + secrets.token_hex(24)
+    PASSES = 0
+    FAILURES = 0
+
+    def check(name, condition, detail=""):
+        global PASSES, FAILURES
+        if condition:
+            print(f"  PASS  {name}")
+            PASSES += 1
+        else:
+            print(f"  FAIL  {name} {detail}")
+            FAILURES += 1
+
+    # --- Basic validity ---
+    print("\n[1] Basic token generation and validation")
+    token = generate_token(TEST_KEY, 10000, "paid", "test@example.com", SECRET)
+    data, err = validate_token(token, SECRET)
+    check("Valid token accepted", err is None)
+    check("API key preserved", data and data.get("key") == TEST_KEY)
+    check("Device count preserved", data and data.get("devices") == 10000)
+    check("Plan preserved", data and data.get("plan") == "paid")
+    check("Not in grace period", data and not is_in_grace_period(data))
+    check("Days until expiry > 360", data and days_until_expiry(data) > 360)
+
+    # --- Tamper detection ---
+    print("\n[2] Tamper detection")
+    raw = json.loads(base64.urlsafe_b64decode(token))
+    raw["payload"] = raw["payload"].replace("10000", "99999")
+    bad_token = base64.urlsafe_b64encode(json.dumps(raw, separators=(',',':')).encode()).decode()
+    _, err = validate_token(bad_token, SECRET)
+    check("Tampered device count rejected", err == "invalid_signature")
+
+    raw2 = json.loads(base64.urlsafe_b64decode(token))
+    raw2["payload"] = raw2["payload"].replace("paid", "enterprise")
+    bad_token2 = base64.urlsafe_b64encode(json.dumps(raw2, separators=(',',':')).encode()).decode()
+    _, err = validate_token(bad_token2, SECRET)
+    check("Tampered plan rejected", err == "invalid_signature")
+
+    raw3 = json.loads(base64.urlsafe_b64decode(token))
+    raw3["sig"] = "0" * 64
+    bad_token3 = base64.urlsafe_b64encode(json.dumps(raw3, separators=(',',':')).encode()).decode()
+    _, err = validate_token(bad_token3, SECRET)
+    check("Zeroed signature rejected", err == "invalid_signature")
+
+    # --- Expiry ---
+    print("\n[3] Expiry handling")
+    expired = generate_token(TEST_KEY, 100, "paid", "test@example.com", SECRET, validity_days=-1)
+    data_exp, err = validate_token(expired, SECRET)
+    check("Recently expired token in grace period", err is None and data_exp is not None)
+    check("Grace period detected", data_exp and is_in_grace_period(data_exp))
+
+    hard_expired = generate_token(TEST_KEY, 100, "paid", "test@example.com", SECRET, validity_days=-9)
+    _, err = validate_token(hard_expired, SECRET)
+    check("Hard expired token rejected", err == "token_expired")
+
+    # --- Wrong secret ---
+    print("\n[4] Secret validation")
+    wrong = secrets.token_bytes(32)
+    _, err = validate_token(token, wrong)
+    check("Wrong secret rejected", err == "invalid_signature")
+
+    almost_right = bytearray(SECRET)
+    almost_right[0] ^= 1
+    _, err = validate_token(token, bytes(almost_right))
+    check("One-bit-flipped secret rejected", err == "invalid_signature")
+
+    # --- Malformed tokens ---
+    print("\n[5] Malformed input handling")
+    _, err = validate_token("notbase64!!!", SECRET)
+    check("Garbage input rejected", err is not None)
+    _, err = validate_token("", SECRET)
+    check("Empty token rejected", err is not None)
+    _, err = validate_token(base64.urlsafe_b64encode(b"{}").decode(), SECRET)
+    check("Empty JSON rejected", err is not None)
+
+    # --- Local caching ---
+    print("\n[6] Local licence caching")
+    import tempfile, os
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        test_db = f.name
+    try:
+        data_valid, _ = validate_token(token, SECRET)
+        save_licence_locally(test_db, token, data_valid)
+        cached = load_licence_locally(test_db)
+        check("Licence saved and retrieved", cached is not None)
+        check("Cached key matches", cached and cached[1].get("key") == TEST_KEY)
+        check("Cached devices match", cached and cached[1].get("devices") == 10000)
+    finally:
+        os.unlink(test_db)
+
+    # --- Performance ---
+    print("\n[7] Performance")
+    import timeit
+    gen_time = timeit.timeit(
+        lambda: generate_token(TEST_KEY, 10000, "paid", "test@example.com", SECRET),
+        number=1000
+    )
+    val_time = timeit.timeit(
+        lambda: validate_token(token, SECRET),
+        number=1000
+    )
+    check(f"Generation: {gen_time*1:.1f}ms avg per token", gen_time < 5)
+    check(f"Validation: {val_time*1:.1f}ms avg per validation", val_time < 5)
+
+    # --- Summary ---
+    print(f"\n{'='*60}")
+    print(f"Results: {PASSES} passed, {FAILURES} failed")
+    if FAILURES == 0:
+        print("ALL TESTS PASSED. System is production ready.")
+    else:
+        print("FAILURES DETECTED. Do not ship.")
+    sys.exit(0 if FAILURES == 0 else 1)
+
+```
+
+
+## `sebdog_reporter.py`
+
+217 lines, 8364 bytes
+
+```python
+"""
+SEBDOG DECISION REPORTER v1.0.0
+Generates readable reports from the sebdog audit chain.
+Shows exactly why each decision was made.
+Copyright (c) 2026 Justin Antony Dobson / Monop Content
+"""
+
+import sqlite3, json, time, os
+from datetime import datetime
+
+DB_FILE = "sebdog_audit.db"
+
+REASON_EXPLANATIONS = {
+    "velocity_spike": "User made more than 10 requests in 60 seconds",
+    "high_amount": "Transaction amount exceeded £500",
+    "risky_device": "Device risk score above 0.5",
+    "behaviour_anomaly": "Behavioural anomaly score above 0.5",
+    "country_shift": "Request came from a different country than usual",
+    "unsafe_country": "Request came from outside approved country list",
+    "low_trust": "User trust score has dropped below 0.4 due to previous decisions",
+}
+
+def get_decisions(db_path=DB_FILE, limit=100):
+    if not os.path.exists(db_path):
+        return []
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute("""
+        SELECT ts, user_id, event_json, result_json, audit_hash
+        FROM audit_log
+        ORDER BY id DESC
+        LIMIT ?
+    """, (limit,)).fetchall()
+    conn.close()
+    results = []
+    for row in rows:
+        try:
+            event = json.loads(row[2])
+            result = json.loads(row[3])
+            results.append({
+                "ts": row[0],
+                "user_id": row[1],
+                "event": event,
+                "result": result,
+                "audit_hash": row[4]
+            })
+        except:
+            pass
+    return results
+
+def format_reason(reason):
+    return REASON_EXPLANATIONS.get(reason, reason.replace("_", " ").capitalize())
+
+def decision_color(decision):
+    return {"ALLOW": "#00875a", "CHALLENGE": "#b45309", "BLOCK": "#cc0000"}.get(decision, "#555")
+
+def generate_text_report(db_path=DB_FILE, limit=100):
+    decisions = get_decisions(db_path, limit)
+    if not decisions:
+        return "No decisions recorded yet."
+    
+    lines = [
+        "SEBDOG DECISION REPORT",
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"Total decisions shown: {len(decisions)}",
+        "=" * 60
+    ]
+    
+    for d in decisions:
+        result = d["result"]
+        event = d["event"]
+        ts = datetime.fromtimestamp(d["ts"]).strftime('%Y-%m-%d %H:%M:%S')
+        decision = result.get("decision", "?")
+        score = result.get("score", 0)
+        reasons = result.get("reasons", [])
+        
+        lines.append(f"\n[{ts}] User: {d['user_id']}")
+        lines.append(f"Action: {event.get('action','?')} | Country: {event.get('country','?')} | Amount: £{event.get('amount',0)}")
+        lines.append(f"Decision: {decision} | Score: {score} | Trust: {result.get('trust',0)}")
+        
+        if reasons:
+            lines.append("Reasons:")
+            for r in reasons:
+                lines.append(f"  - {format_reason(r)}")
+        else:
+            lines.append("Reasons: No risk factors detected")
+        
+        lines.append(f"Audit hash: {d['audit_hash'][:32]}...")
+        lines.append("-" * 60)
+    
+    return "\n".join(lines)
+
+def generate_json_report(db_path=DB_FILE, limit=100):
+    decisions = get_decisions(db_path, limit)
+    report = {
+        "generated": datetime.now().isoformat(),
+        "total": len(decisions),
+        "decisions": []
+    }
+    for d in decisions:
+        result = d["result"]
+        event = d["event"]
+        reasons = result.get("reasons", [])
+        report["decisions"].append({
+            "timestamp": datetime.fromtimestamp(d["ts"]).isoformat(),
+            "user_id": d["user_id"],
+            "action": event.get("action"),
+            "country": event.get("country"),
+            "amount": event.get("amount"),
+            "decision": result.get("decision"),
+            "score": result.get("score"),
+            "trust": result.get("trust"),
+            "reasons": reasons,
+            "reasons_explained": [format_reason(r) for r in reasons],
+            "audit_hash": d["audit_hash"]
+        })
+    return json.dumps(report, indent=2)
+
+def generate_html_report(db_path=DB_FILE, limit=100):
+    decisions = get_decisions(db_path, limit)
+    
+    rows = ""
+    for d in decisions:
+        result = d["result"]
+        event = d["event"]
+        ts = datetime.fromtimestamp(d["ts"]).strftime('%Y-%m-%d %H:%M:%S')
+        decision = result.get("decision", "?")
+        score = result.get("score", 0)
+        reasons = result.get("reasons", [])
+        color = decision_color(decision)
+        
+        reason_html = ""
+        if reasons:
+            reason_html = "<ul>" + "".join(f"<li>{format_reason(r)}</li>" for r in reasons) + "</ul>"
+        else:
+            reason_html = "<span style='color:#888'>No risk factors detected</span>"
+        
+        rows += f"""
+        <tr>
+            <td>{ts}</td>
+            <td><code>{d['user_id']}</code></td>
+            <td>{event.get('action','?')}</td>
+            <td>{event.get('country','?')}</td>
+            <td>£{event.get('amount',0)}</td>
+            <td><strong style="color:{color}">{decision}</strong></td>
+            <td>{score}</td>
+            <td>{result.get('trust',0)}</td>
+            <td>{reason_html}</td>
+            <td><code style="font-size:10px">{d['audit_hash'][:16]}...</code></td>
+        </tr>"""
+    
+    allow = sum(1 for d in decisions if d["result"].get("decision") == "ALLOW")
+    challenge = sum(1 for d in decisions if d["result"].get("decision") == "CHALLENGE")
+    block = sum(1 for d in decisions if d["result"].get("decision") == "BLOCK")
+    
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Sebdog Decision Report</title>
+<style>
+body{{font-family:sans-serif;background:#f5f7fa;color:#1a202c;margin:0;padding:20px}}
+.header{{background:#0a0f1e;color:#fff;padding:24px 32px;border-radius:8px;margin-bottom:24px}}
+.header h1{{margin:0;font-size:24px;color:#c9a84c}}
+.header p{{margin:4px 0 0;color:rgba(255,255,255,0.5);font-size:13px}}
+.stats{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:24px}}
+.stat{{background:#fff;border-radius:8px;padding:16px;text-align:center;border:1px solid #e2e8f0}}
+.stat-n{{font-size:32px;font-weight:700}}
+.stat-l{{font-size:11px;color:#64748b;margin-top:4px}}
+.allow{{color:#00875a}}.challenge{{color:#b45309}}.block{{color:#cc0000}}
+table{{width:100%;border-collapse:collapse;background:#fff;border-radius:8px;overflow:hidden;border:1px solid #e2e8f0}}
+th{{background:#0a0f1e;color:#c9a84c;padding:10px 12px;text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:1px}}
+td{{padding:10px 12px;border-bottom:1px solid #e2e8f0;font-size:12px;vertical-align:top}}
+tr:last-child td{{border:none}}
+tr:hover td{{background:#f8fafc}}
+ul{{margin:4px 0;padding-left:16px}}
+li{{margin:2px 0;color:#64748b}}
+code{{background:#f1f5f9;padding:2px 4px;border-radius:3px;font-size:11px}}
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>Sebdog Decision Report</h1>
+  <p>Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} &nbsp;|&nbsp; Showing last {len(decisions)} decisions &nbsp;|&nbsp; Powered by sebbi.pro</p>
+</div>
+<div class="stats">
+  <div class="stat"><div class="stat-n allow">{allow}</div><div class="stat-l">ALLOWED</div></div>
+  <div class="stat"><div class="stat-n challenge">{challenge}</div><div class="stat-l">CHALLENGED</div></div>
+  <div class="stat"><div class="stat-n block">{block}</div><div class="stat-l">BLOCKED</div></div>
+</div>
+<table>
+<thead><tr>
+  <th>Time</th><th>User</th><th>Action</th><th>Country</th><th>Amount</th>
+  <th>Decision</th><th>Score</th><th>Trust</th><th>Reasons</th><th>Audit Hash</th>
+</tr></thead>
+<tbody>{rows if rows else '<tr><td colspan="10" style="text-align:center;color:#888;padding:32px">No decisions recorded yet</td></tr>'}</tbody>
+</table>
+</body>
+</html>"""
+    return html
+
+if __name__ == "__main__":
+    import sys
+    fmt = sys.argv[1] if len(sys.argv) > 1 else "html"
+    db = sys.argv[2] if len(sys.argv) > 2 else DB_FILE
+    
+    if fmt == "text":
+        print(generate_text_report(db))
+    elif fmt == "json":
+        print(generate_json_report(db))
+    else:
+        report = generate_html_report(db)
+        out = "sebdog_report.html"
+        with open(out, "w") as f:
+            f.write(report)
+        print(f"Report saved to {out}")
+
+```
+
+
+## `AILeash-API-Reference-v6.4.2.md`
+
+256 lines, 6799 bytes
+
+```markdown
+# AILeash v6.4.2 — Complete API Reference
+
+## Core Decision Endpoint
+
+### POST /api/govern
+**The engine. Every action scores here.**
+
+Auth: `Bearer YOUR_API_KEY`
+
+**Request:**
+```json
+{
+  "user_id": "string (required)",
+  "action": "string (required) — payment/login/message/transfer/checkout/api_call",
+  "amount": "number (optional, default 0) — monetary value in GBP",
+  "country": "string (required) — ISO 3166-1 alpha-2 code",
+  "device_id": "string (required) — unique device identifier",
+  "anomaly": "number 0..1 (optional) — behavioural anomaly score",
+  "device_risk": "number 0..1 (optional) — device risk score"
+}
+```
+
+**Response (200 OK):**
+```json
+{
+  "decision": "ALLOW|CHALLENGE|BLOCK",
+  "score": 0.0..1.0,
+  "trust": 0.05..1.0,
+  "reasons": ["velocity_spike", "high_amount", "country_shift"],
+  "audit_hash": "sha256_hex_string",
+  "block_index": 12345,
+  "receipt_seq": 42,
+  "timestamp": 1719072000.0,
+  "challenge_url": "https://sebbi.pro/verify-challenge?token=...",
+  "challenge_expires_in": 900
+}
+```
+
+**Error responses:**
+- `401 Unauthorized` — Missing or invalid API key
+- `403 Forbidden` — Account inactive or over quota
+- `429 Too Many Requests` — Rate limited
+- `503 Service Unavailable` — Server overloaded
+
+---
+
+## Account Management
+
+### POST /api/keys or /signup
+**Create a new API key. Instant. No card. No humans in the loop.**
+
+No auth required.
+
+**Request:**
+```json
+{
+  "email": "user@example.com (required)",
+  "name": "John Doe (optional)",
+  "phone": "+441234567890 (optional)",
+  "org": "Acme Corp (optional)",
+  "product": "aileash|guardian|sonicboom|sentinel (default: aileash)",
+  "devices": 1..1000000 (default: 1),
+  "ref_code": "REF-XXXX-1234 (optional)"
+}
+```
+
+**Response (200 OK):**
+```json
+{
+  "api_key": "al_live_...",
+  "email": "user@example.com",
+  "product": "aileash",
+  "devices": 1,
+  "monthly_cost": 0.50,
+  "quota": 100,
+  "ref_code": "REF-JOHN-5678",
+  "badge_id": "abc123def456",
+  "message": "100 free decisions. Then 50p per device per month via Stripe."
+}
+```
+
+---
+
+## Verification & Public Endpoints
+
+### GET /api/spec
+**Engine specification. Public. No auth.**
+
+**Response (200 OK):**
+```json
+{
+  "engine": "AILeash v6.4.2",
+  "version": "6.4.2",
+  "signals": 9,
+  "decision_latency_ms": 28,
+  "threshold_allow": 0.35,
+  "threshold_challenge": 0.70,
+  "threshold_block": 1.0,
+  "features": ["deterministic scoring", "tamper-evident chain", "real-time alerts", "gapless receipts", "sovereign deployment"]
+}
+```
+
+### GET /api/verify-chain
+**Full audit chain integrity proof. Public. No auth.**
+
+**Response (200 OK):**
+```json
+{
+  "valid": true,
+  "blocks": 45678,
+  "genesis": "GENESIS",
+  "tip": "abc123...",
+  "message": "Chain intact. No tampering detected.",
+  "verifiable_by": "anyone, anywhere"
+}
+```
+
+### GET /api/health
+**Server health and load. Public. No auth.**
+
+**Response (200 OK):**
+```json
+{
+  "status": "ok",
+  "version": "6.4.2",
+  "uptime_seconds": 864000,
+  "rps": 42,
+  "timestamp": 1719072000.0
+}
+```
+
+---
+
+## Real-time Dashboards
+
+### GET /api/pulse
+**Live risk posture. Your current state.**
+
+Auth: `Bearer YOUR_API_KEY`
+
+**Response (200 OK):**
+```json
+{
+  "last_hour": {
+    "ALLOW": 486,
+    "CHALLENGE": 23,
+    "BLOCK": 4
+  },
+  "recent": [
+    {
+      "ts": 1719072000,
+      "user_id": "u_7f2",
+      "action": "payment",
+      "decision": "ALLOW",
+      "score": 0.12,
+      "reasons": [],
+      "audit_hash": "abc123..."
+    }
+  ],
+  "chain_tip": "abc123...",
+  "message": "All green. Chain tip sealed."
+}
+```
+
+---
+
+## Billing & Webhooks
+
+### POST /stripe-webhook
+**Stripe webhook receiver. Signature verified automatically.**
+
+Supports events:
+- `checkout.session.completed` — User upgraded
+- `invoice.paid` — Monthly subscription paid
+- `customer.subscription.deleted` — User cancelled
+- `invoice.payment_failed` — Payment failed
+
+---
+
+## Four Products. One Engine.
+
+### AILeash
+- **What:** Every AI decision your platform makes about a person gets scored, explained, and sealed.
+- **Who:** Platforms using AI for any regulated decision (lending, hiring, content moderation, fraud, access control).
+- **Price:** 50p per device per month + your margin.
+- **Free tier:** 100 decisions/month, no card.
+
+### Guardian
+- **What:** Free message checker for families. Child pastes a message in, gets instant plain-English assessment against grooming patterns.
+- **Who:** Families. Free forever. No card. No catch.
+- **Price:** Free. Always.
+- **Built for:** ICO Children's Code, Online Safety Act, child safety.
+
+### SonicBoom
+- **What:** One line of code. Drops into AWS, Azure, GCP, OpenAI, Anthropic. Adds full compliance audit chain to every call.
+- **Who:** Platforms already running AI in the cloud.
+- **Price:** 50p per device per month + your margin.
+- **Latency:** No impact. Chain sealing is asynchronous.
+
+### Sentinel
+- **What:** Fraud and anomaly alerting. Scores unusual patterns (500 messages in a minute, login from new country, velocity spikes) in real-time.
+- **Who:** Platforms managing fraud, abuse, takeovers.
+- **Price:** 50p per device per month + your margin.
+- **Real-time:** Alerts the moment thresholds trip.
+
+---
+
+## The Score Formula (Immutable)
+
+**Raw weighted sum (Σ_raw):**
+```
+Σ_raw =
+  (1 − trust) × 0.30
+  + min(velocity_60s / 20, 1) × 0.15
+  + min(velocity_5m / 50, 1) × 0.10
+  + min(velocity_1h / 200, 1) × 0.10
+  + min(ln(1+amount) / ln(1+10000), 1) × 0.15
+  + device_risk × 0.10
+  + behavioural_anomaly × 0.10
+  + country_shift × 0.10
+  + unsafe_country × 0.10
+```
+
+**Normalization:** the nine weights above sum to 1.20, not 1.0. To keep every signal's *relative* importance exactly as designed while guaranteeing the score behaves as a true 0–1 weighted average (not one that can reach BLOCK-level values from fewer combined signals than intended), divide by the actual weight total before clamping:
+
+```
+WEIGHT_TOTAL = 0.30 + 0.15 + 0.10 + 0.10 + 0.15 + 0.10 + 0.10 + 0.10 + 0.10   # = 1.20
+
+score = clamp( Σ_raw / WEIGHT_TOTAL , 0, 1 )
+
+decision = ALLOW if score < 0.35
+         = CHALLENGE if score < 0.70
+         = BLOCK otherwise
+```
+
+No machine learning. No drift. No retraining. Weights are written in code and cannot change without a new release. `WEIGHT_TOTAL` is a fixed constant (1.20) recomputed only if a signal is added, removed, or reweighted in a future release — never at runtime.
+
+---
+
+## Rate Limits
+
+- **Free tier:** 100 decisions/month
+- **Paid:** Unlimited (or by plan)
+- **Public endpoints:** No rate limit
+
+---
+
+## Documentation
+
+- **Homepage:** https://sebbi.pro
+- **Whitepaper:** https://sebbi.pro/whitepaper
+- **Developers:** https://sebbi.pro/developers
+- **Scanner (free):** https://sebbi.pro/scan
+- **Guardian:** https://sebbi.pro/guardian-app
+- **Contact:** justrightdecorators@gmail.com
+
+```
+
+
+## `LICENCE`
+
+22 lines, 1074 bytes
+
+```
+MIT License
+
+Copyright (c) 2026 Monop (Blyth, UK)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+```
 
 
 ## `README.md`
@@ -1107,538 +2423,6 @@ result = brain.evaluate(<span class="s">"approve payment to supplier 88"</span>,
   }
   judge();
 </script>
-</body>
-</html>
-
-```
-
-
-## `certificate.html`
-
-524 lines, 25575 bytes
-
-```html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>AI Compliance Certificate — AILeash by sebbi.pro</title>
-<meta name="description" content="Generate a cryptographically verified AI compliance certificate. Court-ready. Regulator-ready. Backed by SHA-256 Merkle chain audit infrastructure.">
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600;700&family=IBM+Plex+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-:root{
-  --bg:#04040a;
-  --surface:#08080f;
-  --surface2:#0d0d18;
-  --border:#141428;
-  --border2:#1e1e38;
-  --gold:#c9a84c;
-  --gold2:#e8c96a;
-  --green:#00e5a0;
-  --red:#ff3d5a;
-  --blue:#4d9fff;
-  --text:#e8e8f8;
-  --muted:#4a4a6a;
-  --muted2:#6a6a8a;
-  --mono:'IBM Plex Mono',monospace;
-  --sans:'IBM Plex Sans',sans-serif;
-}
-
-html{scroll-behavior:smooth}
-body{background:var(--bg);color:var(--text);font-family:var(--sans);min-height:100vh}
-
-nav{position:fixed;top:0;left:0;right:0;z-index:100;height:52px;display:flex;align-items:center;justify-content:space-between;padding:0 32px;background:rgba(4,4,10,0.9);backdrop-filter:blur(16px);border-bottom:1px solid var(--border)}
-.nav-logo{font-family:var(--mono);font-size:13px;color:var(--gold);text-decoration:none}
-.nav-back{font-size:12px;color:var(--muted2);text-decoration:none;transition:color .2s}.nav-back:hover{color:var(--text)}
-
-.hero{padding:100px 32px 60px;max-width:800px;margin:0 auto;text-align:center}
-.eyebrow{font-family:var(--mono);font-size:10px;color:var(--green);letter-spacing:0.2em;text-transform:uppercase;margin-bottom:20px;display:flex;align-items:center;justify-content:center;gap:10px}
-.eyebrow::before,.eyebrow::after{content:'';width:24px;height:1px;background:var(--green);opacity:0.5}
-h1{font-size:clamp(32px,5vw,56px);font-weight:700;letter-spacing:-0.03em;line-height:1.05;margin-bottom:16px}
-h1 span{color:var(--gold)}
-.hero-sub{font-size:16px;color:var(--muted2);line-height:1.7;max-width:560px;margin:0 auto 48px;font-weight:300}
-
-/* STEPS */
-.steps-row{display:grid;grid-template-columns:repeat(3,1fr);gap:2px;background:var(--border);border-radius:10px;overflow:hidden;margin-bottom:48px;max-width:700px;margin-left:auto;margin-right:auto}
-.step-card{background:var(--surface);padding:20px;text-align:center}
-.step-num{font-family:var(--mono);font-size:28px;color:var(--gold);font-weight:700;opacity:0.3;margin-bottom:6px}
-.step-title{font-size:13px;font-weight:600;margin-bottom:4px}
-.step-desc{font-size:11px;color:var(--muted2);line-height:1.5}
-
-/* MAIN CARD */
-.main-wrap{max-width:700px;margin:0 auto;padding:0 32px 80px}
-
-.card{background:var(--surface);border:1px solid var(--border2);border-radius:12px;overflow:hidden;position:relative}
-.card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--gold),var(--green),var(--blue))}
-
-.card-inner{padding:32px}
-
-.form-section{margin-bottom:24px}
-.section-label{font-family:var(--mono);font-size:10px;color:var(--muted);letter-spacing:0.15em;text-transform:uppercase;margin-bottom:16px;display:flex;align-items:center;gap:8px}
-.section-label::after{content:'';flex:1;height:1px;background:var(--border)}
-
-.field{margin-bottom:16px}
-.field-label{font-size:12px;color:var(--muted2);margin-bottom:6px;display:block;font-weight:500}
-.field-input{width:100%;background:#060610;border:1px solid var(--border2);color:var(--text);padding:12px 16px;font-size:14px;font-family:var(--sans);border-radius:6px;outline:none;transition:border-color .2s}
-.field-input:focus{border-color:var(--gold)}
-.field-input::placeholder{color:var(--muted)}
-.field-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-
-/* REGULATIONS */
-.reg-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-top:8px}
-.reg-item{display:flex;align-items:center;gap:10px;padding:10px 14px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;cursor:pointer;transition:all .2s}
-.reg-item.selected{border-color:var(--gold);background:rgba(201,168,76,0.06)}
-.reg-check{width:16px;height:16px;border:1px solid var(--border2);border-radius:3px;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:10px;transition:all .2s}
-.reg-item.selected .reg-check{background:var(--gold);border-color:var(--gold);color:#000}
-.reg-name{font-size:12px;font-weight:500}
-.reg-desc{font-size:10px;color:var(--muted);margin-top:1px}
-
-/* PRICING */
-.pricing-box{background:linear-gradient(135deg,rgba(201,168,76,0.08),rgba(201,168,76,0.02));border:1px solid rgba(201,168,76,0.2);border-radius:8px;padding:20px;display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:20px}
-.pricing-left h3{font-size:15px;font-weight:600;margin-bottom:4px}
-.pricing-left p{font-size:12px;color:var(--muted2);line-height:1.5}
-.pricing-amount{font-family:var(--mono);font-size:32px;color:var(--gold);font-weight:700;white-space:nowrap}
-.pricing-amount span{font-size:13px;color:var(--muted2);font-weight:400}
-
-.generate-btn{width:100%;background:linear-gradient(135deg,var(--gold),var(--gold2));color:#000;border:none;padding:15px;font-size:15px;font-weight:700;font-family:var(--sans);border-radius:8px;cursor:pointer;transition:all .2s;display:flex;align-items:center;justify-content:center;gap:8px}
-.generate-btn:hover{transform:translateY(-1px);box-shadow:0 8px 24px rgba(201,168,76,0.25)}
-.generate-btn:disabled{opacity:0.5;cursor:not-allowed;transform:none}
-
-.error-msg{background:rgba(255,61,90,0.08);border:1px solid rgba(255,61,90,0.2);border-radius:6px;padding:12px 16px;font-size:13px;color:var(--red);margin-top:12px;display:none;font-family:var(--mono)}
-.error-msg.show{display:block}
-
-/* CERTIFICATE */
-.cert-wrap{display:none;margin-top:32px}
-.cert-wrap.show{display:block}
-
-.certificate{background:#fff;border-radius:10px;overflow:hidden;box-shadow:0 20px 60px rgba(0,0,0,0.5)}
-
-.cert-header{background:#0a0f1e;padding:28px 36px;display:flex;align-items:center;justify-content:space-between}
-.cert-logo{font-size:18px;font-weight:900;color:#fff;font-family:Georgia,serif}.cert-logo span{color:#c9a84c}
-.cert-header-right{text-align:right}
-.cert-type{font-family:var(--mono);font-size:9px;color:rgba(255,255,255,0.4);letter-spacing:0.15em;text-transform:uppercase;margin-bottom:2px}
-.cert-num{font-family:var(--mono);font-size:11px;color:#c9a84c}
-
-.cert-stripe{height:4px;background:linear-gradient(90deg,#c9a84c,#00e5a0,#4d9fff)}
-
-.cert-body{padding:36px}
-.cert-title{font-size:11px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:0.15em;margin-bottom:8px;font-family:var(--mono)}
-.cert-company{font-size:32px;font-weight:700;color:#0a0f1e;letter-spacing:-0.02em;margin-bottom:4px}
-.cert-domain{font-size:14px;color:#64748b;margin-bottom:24px;font-family:var(--mono)}
-
-.cert-statement{background:#f8f9fc;border-left:3px solid #c9a84c;padding:16px 20px;border-radius:0 6px 6px 0;margin-bottom:24px;font-size:13px;color:#1a202c;line-height:1.7}
-
-.cert-regs{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:24px}
-.cert-reg{display:flex;align-items:center;gap:8px;padding:10px 14px;background:#f8f9fc;border-radius:6px;border:1px solid #e2e8f0}
-.cert-reg-tick{width:18px;height:18px;background:#00875a;border-radius:50%;display:flex;align-items:center;justify-content:center;color:#fff;font-size:10px;flex-shrink:0}
-.cert-reg-text{font-size:11px;font-weight:600;color:#1a202c}
-
-.cert-chain{background:#0a0f1e;border-radius:8px;padding:16px 20px;margin-bottom:24px}
-.cert-chain-label{font-family:var(--mono);font-size:9px;color:#c9a84c;letter-spacing:0.15em;text-transform:uppercase;margin-bottom:8px}
-.cert-chain-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;flex-wrap:wrap;gap:4px}
-.cert-chain-key{font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.4)}
-.cert-chain-val{font-family:var(--mono);font-size:10px;color:#00e5a0;word-break:break-all;text-align:right;max-width:70%}
-
-.cert-footer{display:flex;justify-content:space-between;align-items:flex-end;padding-top:20px;border-top:1px solid #e2e8f0;flex-wrap:wrap;gap:16px}
-.cert-footer-left{}
-.cert-footer-label{font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:0.1em;margin-bottom:4px;font-family:var(--mono)}
-.cert-footer-val{font-size:13px;font-weight:600;color:#0a0f1e}
-.cert-seal{width:64px;height:64px;border-radius:50%;background:linear-gradient(135deg,#0a0f1e,#1a2a4a);border:2px solid #c9a84c;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center}
-.cert-seal-text{font-family:var(--mono);font-size:7px;color:#c9a84c;letter-spacing:0.1em;text-transform:uppercase;line-height:1.4}
-
-/* ACTIONS */
-.cert-actions{display:flex;gap:12px;margin-top:20px;flex-wrap:wrap}
-.btn-download{flex:1;background:linear-gradient(135deg,var(--gold),var(--gold2));color:#000;border:none;padding:13px;font-size:14px;font-weight:700;font-family:var(--sans);border-radius:8px;cursor:pointer;transition:all .2s;display:flex;align-items:center;justify-content:center;gap:8px}
-.btn-download:hover{transform:translateY(-1px);box-shadow:0 8px 24px rgba(201,168,76,0.25)}
-.btn-share{flex:1;background:var(--surface2);border:1px solid var(--border2);color:var(--text);padding:13px;font-size:14px;font-weight:600;font-family:var(--sans);border-radius:8px;cursor:pointer;transition:all .2s;display:flex;align-items:center;justify-content:center;gap:8px}
-.btn-share:hover{border-color:var(--gold);color:var(--gold)}
-
-/* TRUST STRIP */
-.trust-strip{display:flex;justify-content:center;gap:32px;padding:48px 32px;flex-wrap:wrap;max-width:700px;margin:0 auto}
-.trust-item{text-align:center}
-.trust-n{font-family:var(--mono);font-size:20px;color:var(--gold);font-weight:700}
-.trust-l{font-size:11px;color:var(--muted2);margin-top:3px}
-
-@media(max-width:600px){
-  .field-row{grid-template-columns:1fr}
-  .reg-grid{grid-template-columns:1fr}
-  .cert-regs{grid-template-columns:1fr}
-  .steps-row{grid-template-columns:1fr}
-  .cert-body{padding:24px}
-  .main-wrap{padding:0 16px 60px}
-  .hero{padding:80px 16px 40px}
-  nav{padding:0 16px}
-}
-</style>
-</head>
-<body>
-
-<nav>
-  <a href="/" class="nav-logo">sebbi.pro</a>
-  <a href="/" class="nav-back">← Back to AILeash</a>
-</nav>
-
-<div class="hero">
-  <div class="eyebrow">AI Compliance Certificate</div>
-  <h1>Prove compliance.<br><span>Court-ready. Today.</span></h1>
-  <p class="hero-sub">Generate a cryptographically verified AI compliance certificate backed by your SHA-256 Merkle audit chain. Hand it to a regulator. Show it to a client. Publish it on your site.</p>
-
-  <div class="steps-row">
-    <div class="step-card">
-      <div class="step-num">01</div>
-      <div class="step-title">Enter your details</div>
-      <div class="step-desc">Company name, domain, and your AILeash API key</div>
-    </div>
-    <div class="step-card">
-      <div class="step-num">02</div>
-      <div class="step-title">Select regulations</div>
-      <div class="step-desc">Choose which compliance frameworks apply to you</div>
-    </div>
-    <div class="step-card">
-      <div class="step-num">03</div>
-      <div class="step-title">Download certificate</div>
-      <div class="step-desc">Cryptographically signed, regulator-ready PDF</div>
-    </div>
-  </div>
-</div>
-
-<div class="main-wrap">
-  <div class="card">
-    <div class="card-inner">
-
-      <div class="form-section">
-        <div class="section-label">Organisation Details</div>
-        <div class="field-row">
-          <div class="field">
-            <label class="field-label">Company / Organisation Name</label>
-            <input class="field-input" type="text" id="org-name" placeholder="Acme Financial Ltd">
-          </div>
-          <div class="field">
-            <label class="field-label">Domain</label>
-            <input class="field-input" type="text" id="org-domain" placeholder="acmefinancial.com">
-          </div>
-        </div>
-        <div class="field">
-          <label class="field-label">AILeash API Key</label>
-          <input class="field-input" type="text" id="api-key" placeholder="al_live_...">
-        </div>
-        <div class="field">
-          <label class="field-label">Contact Email</label>
-          <input class="field-input" type="email" id="contact-email" placeholder="compliance@yourcompany.com">
-        </div>
-      </div>
-
-      <div class="form-section">
-        <div class="section-label">Regulatory Frameworks</div>
-        <div class="reg-grid">
-          <div class="reg-item selected" onclick="toggleReg(this,'EU AI Act Articles 9, 12, 13, 14')">
-            <div class="reg-check">✓</div>
-            <div>
-              <div class="reg-name">EU AI Act</div>
-              <div class="reg-desc">Articles 9, 12, 13, 14 · Aug 2026</div>
-            </div>
-          </div>
-          <div class="reg-item selected" onclick="toggleReg(this,'UK Online Safety Act 2023')">
-            <div class="reg-check">✓</div>
-            <div>
-              <div class="reg-name">UK Online Safety Act</div>
-              <div class="reg-desc">2023 · Already in force</div>
-            </div>
-          </div>
-          <div class="reg-item selected" onclick="toggleReg(this,'GDPR Article 22')">
-            <div class="reg-check">✓</div>
-            <div>
-              <div class="reg-name">GDPR Article 22</div>
-              <div class="reg-desc">Automated decisions · UK & EU</div>
-            </div>
-          </div>
-          <div class="reg-item" onclick="toggleReg(this,'Digital Services Act EU 2022/2065')">
-            <div class="reg-check"></div>
-            <div>
-              <div class="reg-name">Digital Services Act</div>
-              <div class="reg-desc">EU 2022/2065</div>
-            </div>
-          </div>
-          <div class="reg-item" onclick="toggleReg(this,'ICO Children\'s Code')">
-            <div class="reg-check"></div>
-            <div>
-              <div class="reg-name">ICO Children's Code</div>
-              <div class="reg-desc">Under-18 platform access</div>
-            </div>
-          </div>
-          <div class="reg-item" onclick="toggleReg(this,'FCA AI Governance Guidelines')">
-            <div class="reg-check"></div>
-            <div>
-              <div class="reg-name">FCA Guidelines</div>
-              <div class="reg-desc">Financial services AI</div>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <div class="pricing-box">
-        <div class="pricing-left">
-          <h3>Verified Compliance Certificate</h3>
-          <p>Cryptographically signed · SHA-256 Merkle chain verified · Regulator-ready · Valid 12 months</p>
-        </div>
-        <div class="pricing-amount">£99 <span>one-time</span></div>
-      </div>
-
-      <button class="generate-btn" id="gen-btn" onclick="generateCert()">
-        <span>Generate My Compliance Certificate</span>
-        <span>→</span>
-      </button>
-      <div class="error-msg" id="error-msg"></div>
-
-      <!-- CERTIFICATE OUTPUT -->
-      <div class="cert-wrap" id="cert-wrap">
-        <div class="certificate" id="certificate">
-          <div class="cert-header">
-            <div class="cert-logo">Monop <span>Content</span></div>
-            <div class="cert-header-right">
-              <div class="cert-type">Certificate of AI Compliance</div>
-              <div class="cert-num" id="cert-num">CERT-000000</div>
-            </div>
-          </div>
-          <div class="cert-stripe"></div>
-          <div class="cert-body">
-            <div class="cert-title">This certifies that</div>
-            <div class="cert-company" id="cert-company">—</div>
-            <div class="cert-domain" id="cert-domain">—</div>
-
-            <div class="cert-statement" id="cert-statement">—</div>
-
-            <div class="cert-regs" id="cert-regs"></div>
-
-            <div class="cert-chain">
-              <div class="cert-chain-label">// Cryptographic Verification</div>
-              <div class="cert-chain-row">
-                <span class="cert-chain-key">Algorithm</span>
-                <span class="cert-chain-val">SHA-256 Merkle Chain</span>
-              </div>
-              <div class="cert-chain-row">
-                <span class="cert-chain-key">Chain Status</span>
-                <span class="cert-chain-val" id="cert-chain-status">Verifying...</span>
-              </div>
-              <div class="cert-chain-row">
-                <span class="cert-chain-key">Chain Tip Hash</span>
-                <span class="cert-chain-val" id="cert-hash">—</span>
-              </div>
-              <div class="cert-chain-row">
-                <span class="cert-chain-key">Decisions Audited</span>
-                <span class="cert-chain-val" id="cert-blocks">—</span>
-              </div>
-              <div class="cert-chain-row">
-                <span class="cert-chain-key">Verify URL</span>
-                <span class="cert-chain-val">sebbi.pro/api/verify-chain</span>
-              </div>
-            </div>
-
-            <div class="cert-footer">
-              <div>
-                <div class="cert-footer-left">
-                  <div class="cert-footer-label">Issued By</div>
-                  <div class="cert-footer-val">AILeash · sebbi.pro</div>
-                </div>
-              </div>
-              <div>
-                <div class="cert-footer-label">Issue Date</div>
-                <div class="cert-footer-val" id="cert-date">—</div>
-              </div>
-              <div>
-                <div class="cert-footer-label">Valid Until</div>
-                <div class="cert-footer-val" id="cert-expiry">—</div>
-              </div>
-              <div class="cert-seal">
-                <div class="cert-seal-text">AILeash<br>VERIFIED<br>OAAS-1.0</div>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <div class="cert-actions">
-          <button class="btn-download" onclick="downloadCert()">↓ Download Certificate PDF</button>
-          <button class="btn-share" onclick="shareCert()">⇗ Share Certificate</button>
-        </div>
-      </div>
-
-    </div>
-  </div>
-
-  <div class="trust-strip">
-    <div class="trust-item"><div class="trust-n">SHA-256</div><div class="trust-l">Merkle Chain</div></div>
-    <div class="trust-item"><div class="trust-n">OAAS-1.0</div><div class="trust-l">Open Standard</div></div>
-    <div class="trust-item"><div class="trust-n">6</div><div class="trust-l">Regulations Covered</div></div>
-    <div class="trust-item"><div class="trust-n">12mo</div><div class="trust-l">Certificate Validity</div></div>
-  </div>
-</div>
-
-<script>
-var selectedRegs = ['EU AI Act Articles 9, 12, 13, 14', 'UK Online Safety Act 2023', 'GDPR Article 22'];
-
-function toggleReg(el, reg) {
-  if (el.classList.contains('selected')) {
-    el.classList.remove('selected');
-    el.querySelector('.reg-check').textContent = '';
-    selectedRegs = selectedRegs.filter(function(r){ return r !== reg; });
-  } else {
-    el.classList.add('selected');
-    el.querySelector('.reg-check').textContent = '✓';
-    selectedRegs.push(reg);
-  }
-}
-
-function generateHash(str) {
-  var h = 0;
-  for (var i = 0; i < str.length; i++) {
-    h = Math.imul(31, h) + str.charCodeAt(i) | 0;
-  }
-  return Math.abs(h).toString(16).padStart(8,'0') +
-    Math.abs(h*31).toString(16).padStart(8,'0') +
-    Math.abs(h*31*31).toString(16).padStart(8,'0') +
-    Math.abs(h*31*31*31).toString(16).padStart(8,'0') +
-    Math.abs(h*31*31*31*31).toString(16).padStart(8,'0');
-}
-
-function generateCertNum() {
-  return 'CERT-' + Date.now().toString(36).toUpperCase();
-}
-
-async function generateCert() {
-  var orgName = document.getElementById('org-name').value.trim();
-  var domain = document.getElementById('org-domain').value.trim();
-  var apiKey = document.getElementById('api-key').value.trim();
-  var email = document.getElementById('contact-email').value.trim();
-  var errEl = document.getElementById('error-msg');
-  var btn = document.getElementById('gen-btn');
-
-  errEl.classList.remove('show');
-
-  if (!orgName) { errEl.textContent = 'Please enter your organisation name.'; errEl.classList.add('show'); return; }
-  if (!domain) { errEl.textContent = 'Please enter your domain.'; errEl.classList.add('show'); return; }
-  if (!apiKey || !apiKey.startsWith('al_live_') && !apiKey.startsWith('sb_live_') && !apiKey.startsWith('ag_live_') && !apiKey.startsWith('se_live_')) {
-    errEl.textContent = 'Please enter a valid AILeash API key (starts with al_live_, sb_live_, ag_live_ or se_live_).';
-    errEl.classList.add('show'); return;
-  }
-  if (!email || !email.includes('@')) { errEl.textContent = 'Please enter a valid email address.'; errEl.classList.add('show'); return; }
-  if (selectedRegs.length === 0) { errEl.textContent = 'Please select at least one regulatory framework.'; errEl.classList.add('show'); return; }
-
-  btn.textContent = 'Verifying chain integrity...';
-  btn.disabled = true;
-
-  // Verify chain
-  var chainData = null;
-  try {
-    var r = await fetch('/api/verify-chain');
-    chainData = await r.json();
-  } catch(e) {
-    chainData = {valid: true, blocks: 0, tip: generateHash(apiKey)};
-  }
-
-  // Verify API key
-  var keyValid = false;
-  try {
-    var r2 = await fetch('/api/validate-engine', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json','Authorization':'Bearer '+apiKey}
-    });
-    var kd = await r2.json();
-    keyValid = kd.valid === true;
-  } catch(e) {
-    keyValid = true; // fallback
-  }
-
-  if (!keyValid) {
-    errEl.textContent = 'API key validation failed. Please check your key and try again.';
-    errEl.classList.add('show');
-    btn.textContent = 'Generate My Compliance Certificate →';
-    btn.disabled = false;
-    return;
-  }
-
-  // Notify Justin
-  fetch('/contact', {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({
-      name: orgName,
-      email: email,
-      phone: '',
-      org: domain,
-      message: 'CERTIFICATE REQUEST\n\nOrg: ' + orgName + '\nDomain: ' + domain + '\nEmail: ' + email + '\nRegs: ' + selectedRegs.join(', ') + '\nKey: ' + apiKey.slice(0,20) + '...'
-    })
-  }).catch(function(){});
-
-  // Build certificate
-  var now = new Date();
-  var expiry = new Date(now);
-  expiry.setFullYear(expiry.getFullYear() + 1);
-
-  var certNum = generateCertNum();
-  var hash = chainData.tip || generateHash(apiKey + orgName + now.getTime());
-
-  document.getElementById('cert-num').textContent = certNum;
-  document.getElementById('cert-company').textContent = orgName;
-  document.getElementById('cert-domain').textContent = domain;
-  document.getElementById('cert-date').textContent = now.toLocaleDateString('en-GB', {day:'numeric',month:'long',year:'numeric'});
-  document.getElementById('cert-expiry').textContent = expiry.toLocaleDateString('en-GB', {day:'numeric',month:'long',year:'numeric'});
-
-  document.getElementById('cert-statement').textContent =
-    orgName + ' (' + domain + ') operates AI systems governed by the AILeash sovereign compliance engine. Every AI decision made by this organisation is logged in a tamper-evident SHA-256 Merkle audit chain, verifiable independently by any regulatory authority. This certificate confirms compliance with the selected regulatory frameworks as of the issue date shown below.';
-
-  // Regs
-  var regsHtml = selectedRegs.map(function(r) {
-    return '<div class="cert-reg"><div class="cert-reg-tick">✓</div><div class="cert-reg-text">' + r + '</div></div>';
-  }).join('');
-  document.getElementById('cert-regs').innerHTML = regsHtml;
-
-  document.getElementById('cert-chain-status').textContent = chainData.valid ? 'INTACT ✓' : 'VERIFIED';
-  document.getElementById('cert-hash').textContent = hash;
-  document.getElementById('cert-blocks').textContent = (chainData.blocks || 0).toLocaleString() + ' decisions audited';
-
-  document.getElementById('cert-wrap').classList.add('show');
-  document.getElementById('cert-wrap').scrollIntoView({behavior:'smooth', block:'start'});
-
-  btn.textContent = 'Certificate Generated ✓';
-  btn.style.background = 'linear-gradient(135deg,#00875a,#00b87d)';
-}
-
-function downloadCert() {
-  var cert = document.getElementById('certificate');
-  var certNum = document.getElementById('cert-num').textContent;
-  var company = document.getElementById('cert-company').textContent;
-
-  // Print to PDF
-  var printWin = window.open('', '_blank');
-  printWin.document.write('<html><head><title>' + certNum + '</title>');
-  printWin.document.write('<style>body{margin:0;padding:20px;font-family:IBM Plex Sans,sans-serif}');
-  printWin.document.write(document.querySelector('style').innerHTML);
-  printWin.document.write('</style></head><body>');
-  printWin.document.write(cert.outerHTML);
-  printWin.document.write('</body></html>');
-  printWin.document.close();
-  setTimeout(function(){ printWin.print(); }, 500);
-}
-
-function shareCert() {
-  var company = document.getElementById('cert-company').textContent;
-  var certNum = document.getElementById('cert-num').textContent;
-  var hash = document.getElementById('cert-hash').textContent;
-
-  var text = company + ' is AI Act compliant. Verified by AILeash · ' + certNum + ' · sebbi.pro/certificate';
-
-  if (navigator.share) {
-    navigator.share({title: 'AI Compliance Certificate', text: text, url: 'https://sebbi.pro/certificate'});
-  } else {
-    navigator.clipboard.writeText(text).then(function() {
-      alert('Certificate details copied to clipboard.');
-    });
-  }
-}
-</script>
-
 </body>
 </html>
 

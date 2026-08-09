@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-83 files across 16 parts.
+84 files across 16 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -11,74 +11,75 @@ Generated automatically on every push. Do not edit by hand.
 - `modules/_ _ i n i t _ _ . p y`
 - `modules/capture.py`
 - `modules/codebase.py`
+- `modules/complete.py`
 - `modules/conformance.py`
-- `modules/consistency.py`
-- `modules/console.py`
 
 ## [CODEBASE-03.md](CODEBASE-03.md)
 
+- `modules/consistency.py`
+- `modules/console.py`
 - `modules/counterfactual.py`
 - `modules/declare.py`
 - `modules/demo.py`
 - `modules/dsr.py`
-- `modules/fingerprint.py`
-- `modules/lineage.py`
 
 ## [CODEBASE-04.md](CODEBASE-04.md)
 
+- `modules/fingerprint.py`
+- `modules/lineage.py`
 - `modules/mutual.py`
 - `modules/network.py`
 - `modules/oversight.py`
-- `modules/publish.py`
-- `modules/reconcile.py`
 
 ## [CODEBASE-05.md](CODEBASE-05.md)
 
+- `modules/publish.py`
+- `modules/reconcile.py`
 - `modules/replay.py`
 - `modules/router.py`
 - `modules/rulebind.py`
-- `modules/savings.py`
-- `modules/spec.py`
-- `modules/standard.py`
 
 ## [CODEBASE-06.md](CODEBASE-06.md)
 
+- `modules/savings.py`
+- `modules/spec.py`
+- `modules/standard.py`
 - `modules/stats.py`
 - `modules/witness.py`
 - `Verify_ai.py`
 - `ai_act_ranker.py`
 - `ai_safety_scanner.py`
 - `aigrade_insert.py`
+
+## [CODEBASE-07.md](CODEBASE-07.md)
+
 - `aileash_reporter.py`
 - `aileash_verify.py`
 - `anchor.py`
 - `board_auditor.py`
-
-## [CODEBASE-07.md](CODEBASE-07.md)
-
 - `brain.py`
 - `broadcaster.py`
 - `build_sebbi_ecosystem.py`
 - `gateway_proxy.py`
 - `sebbi_orchestrator.py`
+
+## [CODEBASE-08.md](CODEBASE-08.md)
+
 - `sebdog_engine.py`
 - `sebdog_licence.py`
 - `sebdog_reporter.py`
 - `AILeash-API-Reference-v6.4.2.md`
 - `LICENCE`
-
-## [CODEBASE-08.md](CODEBASE-08.md)
-
 - `README.md`
 - `admin.html`
 - `ai-standard.html`
 - `ai-txt-kit.html`
 - `aitxt-popup-live.html`
 - `brain.html`
-- `certificate.html`
 
 ## [CODEBASE-09.md](CODEBASE-09.md)
 
+- `certificate.html`
 - `compliance-assistant.html`
 - `contact.html`
 - `copyright.txt`
