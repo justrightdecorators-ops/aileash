@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-85 files across 17 parts.
+86 files across 17 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -125,6 +125,7 @@ Generated automatically on every push. Do not edit by hand.
 ## [CODEBASE-15.md](CODEBASE-15.md)
 
 - `seal.html`
+- `self-check.html`
 - `sentinel.html`
 - `signal-packs.html`
 - `sitemap.xml`
