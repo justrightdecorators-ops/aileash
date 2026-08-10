@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-91 files across 19 parts.
+90 files across 18 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -73,49 +73,45 @@ Generated automatically on every push. Do not edit by hand.
 - `sebdog_engine.py`
 - `sebdog_licence.py`
 - `sebdog_reporter.py`
-- `tests/attack_continuity_1.py`
 - `tests/attack_continuity_2.py`
 - `tests/attack_continuity_3.py`
 - `tests/attack_continuity_4.py`
 - `AILeash-API-Reference-v6.4.2.md`
 - `LICENCE`
 - `README.md`
-
-## [CODEBASE-10.md](CODEBASE-10.md)
-
 - `admin.html`
 - `ai-standard.html`
 - `ai-txt-kit.html`
+
+## [CODEBASE-10.md](CODEBASE-10.md)
+
 - `aitxt-popup-live.html`
 - `brain.html`
 - `certificate.html`
-
-## [CODEBASE-11.md](CODEBASE-11.md)
-
 - `compliance-assistant.html`
 - `contact.html`
 - `copyright.txt`
+
+## [CODEBASE-11.md](CODEBASE-11.md)
+
 - `data-protection.html`
-
-## [CODEBASE-12.md](CODEBASE-12.md)
-
 - `developers.html`
 - `dis.txt`
 - `docs/evidential-undertaking.md`
 - `docs/spec/ai-txt.md`
 - `green.html`
+
+## [CODEBASE-12.md](CODEBASE-12.md)
+
 - `guardian-parent.html`
-
-## [CODEBASE-13.md](CODEBASE-13.md)
-
 - `human-oversight.html`
 - `identity.html`
 
-## [CODEBASE-14.md](CODEBASE-14.md)
+## [CODEBASE-13.md](CODEBASE-13.md)
 
 - `index.html`
 
-## [CODEBASE-15.md](CODEBASE-15.md)
+## [CODEBASE-14.md](CODEBASE-14.md)
 
 - `investor-prospectus.html`
 - `legal.txt`
@@ -127,26 +123,26 @@ Generated automatically on every push. Do not edit by hand.
 - `report-threat.html`
 - `requirements.txt`
 
-## [CODEBASE-16.md](CODEBASE-16.md)
+## [CODEBASE-15.md](CODEBASE-15.md)
 
 - `reseller.html`
 - `risk-policy.html`
 - `robots.txt`
 - `scan.html`
 
-## [CODEBASE-17.md](CODEBASE-17.md)
+## [CODEBASE-16.md](CODEBASE-16.md)
 
 - `seal.html`
 - `sentinel.html`
 - `signal-packs.html`
 - `sitemap.xml`
 
-## [CODEBASE-18.md](CODEBASE-18.md)
+## [CODEBASE-17.md](CODEBASE-17.md)
 
 - `sonicboom.html`
 - `verify.html`
 
-## [CODEBASE-19.md](CODEBASE-19.md)
+## [CODEBASE-18.md](CODEBASE-18.md)
 
 - `whitepaper.html`
 
