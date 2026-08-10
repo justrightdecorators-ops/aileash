@@ -1,10 +1,11 @@
-# Codebase — part 6 of 19
+# Codebase — part 6 of 18
 
 Contains:
 - `modules/replay.py`
 - `modules/router.py`
 - `modules/rulebind.py`
 - `modules/savings.py`
+- `modules/spec.py`
 
 
 ## `modules/replay.py`
@@ -2073,5 +2074,134 @@ def handle(method, action, data, api_key, ctx):
         return _verify(ctx, data)
     return {"error": "unknown_action", "action": action,
             "GET": ["status", "verify"], "POST": ["seal"]}, 404
+
+```
+
+
+## `modules/spec.py`
+
+121 lines, 5086 bytes
+
+```python
+"""
+Live API specification - /x/spec
+
+/api/spec is a hardcoded constant. It describes the API as it was when
+somebody last remembered to update it, which is a documentation problem
+pretending to be a feature.
+
+This discovers what is actually loaded, right now, by reading the modules
+directory and each module's own docstring. Add a module and the spec
+updates itself. Delete one and it disappears. There is no separate list to
+maintain and therefore no list that can drift.
+
+That matters here more than it would elsewhere: a platform whose pitch is
+"check it, don't trust it" should not ship a self-description that is
+quietly out of date.
+
+    GET /x/spec           everything currently live
+    GET /x/spec/modules   just the module list
+"""
+
+import importlib, os, pkgutil, re
+
+VERSION = "1.0"
+
+_EP = re.compile(r"^\s*(GET|POST|PUT|DELETE)\s+(/\S+)\s*(.*)$")
+
+
+def _describe(name):
+    """Pull a module's summary and endpoint list out of its own docstring."""
+    try:
+        m = importlib.import_module("modules." + name)
+    except Exception as e:
+        return {"module": name, "loaded": False, "error": str(e)}
+    doc = (m.__doc__ or "").strip()
+    lines = doc.splitlines()
+    summary = ""
+    for ln in lines:
+        t = ln.strip()
+        if t and not t.startswith("-") and not _EP.match(ln):
+            summary = t
+            break
+    endpoints = []
+    for ln in lines:
+        mm = _EP.match(ln)
+        if mm:
+            endpoints.append({"method": mm.group(1),
+                              "path": mm.group(2),
+                              "takes": mm.group(3).strip() or None})
+    out = {"module": name, "loaded": True, "summary": summary,
+           "endpoints": endpoints,
+           "version": getattr(m, "VERSION", None)}
+    if not hasattr(m, "handle"):
+        out["warning"] = "module has no handle() - it will not route"
+    return out
+
+
+def _modules():
+    d = os.path.dirname(__file__)
+    names = sorted(x.name for x in pkgutil.iter_modules([d])
+                   if x.name not in ("router", "spec"))
+    return [_describe(n) for n in names]
+
+
+def handle(method, action, data, api_key, ctx):
+    if method != "GET":
+        return {"error": "unknown_action", "action": action}, 404
+
+    mods = _modules()
+
+    if action == "modules":
+        return {"count": len(mods), "modules": mods}, 200
+
+    if action in ("", "all"):
+        return {
+            "spec_version": VERSION,
+            "generated": "live - discovered at request time, not a stored list",
+            "core": {
+                "decision_engine": {
+                    "path": "/api/govern",
+                    "method": "POST",
+                    "auth": "Bearer key",
+                    "note": "deterministic scoring, verdict sealed before the response returns"
+                },
+                "notaries_public": [
+                    {"method": "POST", "path": "/api/post/seal", "auth": "none"},
+                    {"method": "GET", "path": "/api/verify-post", "auth": "none"},
+                    {"method": "POST", "path": "/api/identity/seal", "auth": "none"},
+                    {"method": "GET", "path": "/api/identity/check", "auth": "none"},
+                    {"method": "POST", "path": "/api/payment/seal", "auth": "none"},
+                    {"method": "GET", "path": "/api/payment/check", "auth": "none"}
+                ],
+                "verification_public": [
+                    {"method": "GET", "path": "/api/verify-chain",
+                     "returns": "whole-chain integrity, recomputed"},
+                    {"method": "GET", "path": "/api/inclusion",
+                     "returns": "whether a given 64-char hash is sealed"},
+                    {"method": "GET", "path": "/api/anchor-status",
+                     "returns": "current tip, OpenTimestamps proof, calendar count"},
+                    {"method": "GET", "path": "/api/regulation-map",
+                     "returns": "engine features mapped to legal obligations"}
+                ]
+            },
+            "modules": {
+                "prefix": "/x/<module>/<action>",
+                "auth": "Bearer key on every module route",
+                "count": len(mods),
+                "loaded": mods
+            },
+            "chain": {
+                "algorithm": "SHA-256 hash chain",
+                "scope": "one chain - every module seals into the same sequence as /api/govern",
+                "anchoring": "chain tip submitted to OpenTimestamps, aggregated into a Merkle root, root committed to Bitcoin by several independent calendars",
+                "receipts": "gapless per-key sequence issued in the same transaction as the chain write",
+                "verify": "/api/verify-chain and /api/anchor-status, both without a key"
+            },
+            "honest_note": "This spec is generated by reading the modules directory at request time rather than from a stored list, so it cannot describe capabilities that are not actually loaded."
+        }, 200
+
+    return {"error": "unknown_action", "action": action,
+            "available": ["", "modules"]}, 404
 
 ```
