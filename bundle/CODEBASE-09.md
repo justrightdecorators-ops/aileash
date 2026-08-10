@@ -5,12 +5,11 @@ Contains:
 - `sebdog_licence.py`
 - `sebdog_reporter.py`
 - `tests/attack_continuity_1.py`
+- `tests/attack_continuity_2.py`
 - `AILeash-API-Reference-v6.4.2.md`
 - `LICENCE`
 - `README.md`
 - `admin.html`
-- `ai-standard.html`
-- `ai-txt-kit.html`
 
 
 ## `sebdog_engine.py`
@@ -1479,6 +1478,242 @@ if FAIL:
 ```
 
 
+## `tests/attack_continuity_2.py`
+
+228 lines, 10573 bytes
+
+```python
+#!/usr/bin/env python3
+"""Second wave. The first wave tested the obvious escalations. This one
+tests the ones that would survive a code review."""
+
+import hashlib
+import json
+import sqlite3
+import threading
+import time
+import sys
+
+import continuity as lineage
+# --- stand-in for the deployed engine ---------------------------------
+import types as _types
+_ENGINE = {"verdict": "ALLOW"}
+
+def install_engine(verdict="ALLOW", raises=False, shape="dict"):
+    _ENGINE["verdict"] = verdict
+    mod = _types.ModuleType("server")
+    mod.get_bearer = lambda *a, **k: None
+    def score_event(event):
+        if raises:
+            raise RuntimeError("engine down")
+        if shape == "dict":
+            return {"decision": _ENGINE["verdict"], "score": 0.1}
+        if shape == "tuple":
+            return (_ENGINE["verdict"], 0.1)
+        return _ENGINE["verdict"]
+    mod.score_event = score_event
+    sys.modules["server"] = mod
+
+def remove_engine():
+    sys.modules.pop("server", None)
+
+install_engine("ALLOW")
+
+
+PASS, FAIL = [], []
+NOW = time.time()
+HOUR = 3600
+
+
+def make_ctx():
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    lock = threading.RLock()
+    n = {"i": 0}
+
+    def seal(ev, res, ts, api_key):
+        n["i"] += 1
+        return hashlib.sha256(json.dumps([ev, res, ts], sort_keys=True,
+                                         default=str).encode()).hexdigest(), n["i"], n["i"]
+    lineage._ready = False
+    ctx = {"conn": conn, "lock": lock, "seal": seal}
+    lineage._setup(ctx)
+    return ctx
+
+
+def check(name, cond, detail=""):
+    (PASS if cond else FAIL).append(name)
+    print(("  ok   " if cond else "  FAIL ") + name + (("  -> " + str(detail)[:300]) if detail and not cond else ""))
+
+
+def issue(ctx, **kw):
+    if kw.get("parent") and int(kw.get("delegations_left", 0)) > 0 \
+            and not kw.get("risk_accepted_by"):
+        kw["risk_accepted_by"] = "owner@example.com"
+    return lineage._issue(ctx, "k", kw)
+
+
+def root(ctx, **over):
+    args = dict(id="root", issuer="owner@example.com", issuer_kind="human",
+                subject="orchestrator", scope=["payments.refund", "payments.read"],
+                constraints={"max_amount": 5000, "allowed_currency": ["GBP", "EUR"]},
+                purpose="refunds", purpose_tags=["refunds"],
+                not_before=NOW - HOUR, not_after=NOW + 10 * HOUR, delegations_left=10)
+    args.update(over)
+    return issue(ctx, **args)
+
+
+print("\n=== 18. double execution against one ALLOW ===")
+ctx = make_ctx()
+root(ctx)
+r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments.refund",
+                                    "params": {"amount": 100, "currency": "GBP"},
+                                    "purpose_tag": "refunds"})
+eid = r["evaluation"]
+p = {"amount": 100, "currency": "GBP"}
+c1, _ = lineage._confirm(ctx, "k", {"evaluation": eid, "action": "payments.refund", "params": p})
+c2, _ = lineage._confirm(ctx, "k", {"evaluation": eid, "action": "payments.refund", "params": p})
+check("the first execution binds", c1["bound"] is True, c1)
+check("the same evaluation cannot be spent twice", c2["bound"] is False, c2)
+
+print("\n=== 19. type confusion in constraints ===")
+ctx = make_ctx()
+root(ctx, constraints={"max_amount": 5000, "allowed_currency": "GBP"})
+r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments.refund",
+                                    "params": {"amount": 10, "currency": "G"},
+                                    "purpose_tag": "refunds"})
+check("a single character does not satisfy a string-valued allowed_ list",
+      r["verdict"] == "BLOCK", r["reasons"])
+
+ctx = make_ctx()
+root(ctx)
+r, code = issue(ctx, id="strnum", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="b", scope=["payments.refund"],
+                constraints={"max_amount": "50000", "allowed_currency": ["GBP"]},
+                purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+check("a numeric cap passed as a string cannot beat the parent", code == 409, r)
+
+ctx = make_ctx()
+root(ctx)
+r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments.refund",
+                                    "params": {"amount": "99999", "currency": "GBP"},
+                                    "purpose_tag": "refunds"})
+check("a string amount is still compared numerically", r["verdict"] == "BLOCK", r["reasons"])
+
+ctx = make_ctx()
+root(ctx)
+r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments.refund",
+                                    "params": {"amount": True, "currency": "GBP"},
+                                    "purpose_tag": "refunds"})
+check("a non-numeric amount does not slip through as unconstrained",
+      r["verdict"] in ("BLOCK", "CHALLENGE"), r)
+
+print("\n=== 20. capability prefix tricks ===")
+ctx = make_ctx()
+root(ctx, scope=["payments.refund"])
+for probe in ["payments.refunds", "payments.refund.approve", "payments.refundX",
+              "Payments.Refund", "payments.refund "]:
+    r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": probe,
+                                        "params": {}, "purpose_tag": "refunds"})
+    check("'%s' is not covered by 'payments.refund'" % probe, r["verdict"] == "BLOCK", r["reasons"])
+
+ctx = make_ctx()
+root(ctx, scope=["payments.*"])
+r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments2.transfer",
+                                    "params": {}, "purpose_tag": "refunds"})
+check("'payments.*' does not cover 'payments2.transfer'", r["verdict"] == "BLOCK", r["reasons"])
+
+print("\n=== 21. a long but legitimate chain ===")
+ctx = make_ctx()
+root(ctx, constraints={"max_amount": 10000, "allowed_currency": ["GBP", "EUR"]},
+     delegations_left=12)
+parent, cap = "root", 10000
+for i in range(10):
+    cap = cap // 2
+    gid = "d%d" % i
+    r, code = issue(ctx, id=gid, parent=parent, issuer="a%d" % i, issuer_kind="agent",
+                    subject="a%d" % (i + 1), scope=["payments.refund"],
+                    constraints={"max_amount": cap, "allowed_currency": ["GBP"]},
+                    purpose="refunds", purpose_tags=["refunds"],
+                    not_after=NOW + HOUR, delegations_left=11 - i)
+    if code != 200:
+        break
+    parent = gid
+check("ten legitimate narrowing hops are accepted", code == 200 and parent == "d9", r)
+r, _ = lineage._evaluate(ctx, "k", {"grant": "d9", "action": "payments.refund",
+                                    "params": {"amount": 5, "currency": "GBP"},
+                                    "purpose_tag": "refunds"})
+check("the deep chain still ALLOWs a derivable action", r["verdict"] == "ALLOW", r["reasons"])
+check("the effective cap is the tightest in the chain",
+      float(r["effective_constraints"]["max_amount"]) == 9, r["effective_constraints"])
+check("the human at the root is still named ten hops down",
+      r["authorised_by"] == "owner@example.com")
+r, _ = lineage._evaluate(ctx, "k", {"grant": "d9", "action": "payments.refund",
+                                    "params": {"amount": 10, "currency": "GBP"},
+                                    "purpose_tag": "refunds"})
+check("one unit over the deepest cap is BLOCKed", r["verdict"] == "BLOCK", r["reasons"])
+
+print("\n=== 22. revoking the root kills the whole tree ===")
+lineage._revoke(ctx, "k", {"grant": "root", "reason": "principal withdrew authority"})
+r, _ = lineage._evaluate(ctx, "k", {"grant": "d9", "action": "payments.refund",
+                                    "params": {"amount": 1, "currency": "GBP"},
+                                    "purpose_tag": "refunds"})
+check("revoking the root blocks a leaf ten hops away", r["verdict"] == "BLOCK")
+check("the root is named as the break point", r["broken_at"] == "root", r["broken_at"])
+
+print("\n=== 23. issuing under a revoked or expired parent ===")
+ctx = make_ctx()
+root(ctx)
+lineage._revoke(ctx, "k", {"grant": "root", "reason": "x"})
+r, code = issue(ctx, id="after", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="b", scope=["payments.refund"],
+                constraints={"max_amount": 1, "allowed_currency": ["GBP"]},
+                purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+check("no new delegation under a revoked parent", code == 409 and r.get("error") == "parent_revoked", r)
+
+print("\n=== 24. duplicate grant id cannot overwrite a grant ===")
+ctx = make_ctx()
+root(ctx)
+r, code = root(ctx, scope=["*"], constraints={"max_amount": 999999})
+check("re-issuing an existing id is refused", code == 409 and r.get("error") == "grant_exists", r)
+
+print("\n=== 25. the boundary values themselves ===")
+ctx = make_ctx()
+root(ctx, constraints={"max_amount": 100, "allowed_currency": ["GBP"]}, delegations_left=2)
+r, code = issue(ctx, id="equal", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="b", scope=["payments.refund"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP"]},
+                purpose="refunds", purpose_tags=["refunds"],
+                not_after=NOW + 10 * HOUR, delegations_left=1)
+check("an equal-not-wider child is accepted", code == 200, r)
+r, _ = lineage._evaluate(ctx, "k", {"grant": "equal", "action": "payments.refund",
+                                    "params": {"amount": 100, "currency": "GBP"},
+                                    "purpose_tag": "refunds"})
+check("exactly the cap is allowed", r["verdict"] == "ALLOW", r["reasons"])
+r, _ = lineage._evaluate(ctx, "k", {"grant": "equal", "action": "payments.refund",
+                                    "params": {"amount": 100.01, "currency": "GBP"},
+                                    "purpose_tag": "refunds"})
+check("a penny over the cap is blocked", r["verdict"] == "BLOCK", r["reasons"])
+
+print("\n=== 26. a CHALLENGE cannot be executed ===")
+ctx = make_ctx()
+root(ctx)
+r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments.refund",
+                                    "params": {"amount": 1, "currency": "GBP"}})
+check("no declared purpose gives CHALLENGE", r["verdict"] == "CHALLENGE", r["verdict"])
+c, code = lineage._confirm(ctx, "k", {"evaluation": r["evaluation"],
+                                      "action": "payments.refund",
+                                      "params": {"amount": 1, "currency": "GBP"}})
+check("a CHALLENGE cannot be bound as an execution", c["bound"] is False, c)
+
+print("\n" + "=" * 60)
+print("passed %d, failed %d" % (len(PASS), len(FAIL)))
+for f in FAIL:
+    print("  FAILED: " + f)
+sys.exit(1 if FAIL else 0)
+
+```
+
+
 ## `AILeash-API-Reference-v6.4.2.md`
 
 256 lines, 6799 bytes
@@ -2270,205 +2505,6 @@ function show(name,el){
   document.querySelectorAll(".tab").forEach(function(t){t.className="tab";});el.className="tab on";
   document.querySelectorAll(".panel").forEach(function(p){p.className="panel";});
   document.getElementById("p-"+name).className="panel on";
-}
-</script>
-</body>
-</html>
-
-```
-
-
-## `ai-standard.html`
-
-97 lines, 4847 bytes
-
-```html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="theme-color" content="#0a0f1e">
-<title>ai.txt - Free Download</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0a0f1e;color:#e8e8f0;min-height:100vh;display:flex;flex-direction:column}
-nav{border-bottom:1px solid #1e2a45;padding:16px 20px}
-nav a{color:#c9a84c;text-decoration:none;font-family:monospace;font-size:14px}
-.wrap{flex:1;display:flex;align-items:center;justify-content:center;padding:30px 20px}
-.card{max-width:560px;width:100%;background:#0d1428;border:1px solid #1e2a45;border-radius:16px;padding:36px 28px;text-align:center}
-h1{font-size:32px;font-weight:800;margin-bottom:14px;line-height:1.15}
-h1 span{color:#c9a84c}
-p{color:#8a90a6;font-size:15px;line-height:1.7;margin-bottom:14px}
-p b{color:#e8e8f0}
-.btn{display:inline-flex;align-items:center;justify-content:center;gap:10px;width:100%;background:#c9a84c;color:#0a0f1e;padding:18px;border-radius:10px;font-weight:800;font-size:17px;border:none;cursor:pointer;font-family:inherit;margin:20px 0 10px}
-.sub{font-family:monospace;font-size:12px;color:#7fe3b0;margin-bottom:24px}
-.steps{text-align:left;background:#0b1226;border:1px solid #1e2a45;border-radius:10px;padding:18px 20px;margin-top:8px}
-.steps li{color:#8a90a6;font-size:14px;margin:10px 0 10px 6px;line-height:1.6}
-.steps li b{color:#c9a84c}
-.back{margin-top:22px}
-.back a{color:#c9a84c;text-decoration:none;font-size:14px;font-weight:600}
-footer{border-top:1px solid #1e2a45;padding:20px;text-align:center;color:#5a6178;font-size:12px}
-footer a{color:#c9a84c;text-decoration:none}
-</style>
-</head>
-<body>
-<nav><a href="/">&larr; AILeash</a></nav>
-<div class="wrap">
-  <div class="card">
-    <h1>Download <span>ai.txt</span> &mdash; free</h1>
-    <div class="sub">NO KEY &middot; NO ACCOUNT &middot; NO COST</div>
-    <p>ai.txt is the free, open standard for declaring how your AI is governed. Download the file, and it shows your system exactly what it needs to become compliant.</p>
-    <button class="btn" onclick="downloadIt()">&#8681; Download ai.txt free</button>
-    <ul class="steps">
-      <li><b>1.</b> Tap download &mdash; the file saves as ai.txt</li>
-      <li><b>2.</b> Fill in your details, put it on your domain at yourdomain.com/ai.txt</li>
-      <li><b>3.</b> Want it verified and provable? <b><a href="/" style="color:#c9a84c">Come back to AILeash</a></b> to seal it into a tamper-evident chain.</li>
-    </ul>
-    <div class="back"><a href="/ai.txt">See the live ai.txt &rarr;</a></div>
-  </div>
-</div>
-<footer>ai.txt is a free, open standard by <a href="/">Monop Content</a> &middot; Blyth, UK &middot; <a href="/ai.txt">reference</a></footer>
-<script>
-var AITXT = [
-"# ============================================================================",
-"# ai.txt - AI Governance Declaration  (AI-TXT/1.0)",
-"# A free, open standard. Copy this to the root of your domain as /ai.txt",
-"# Replace the values below with your own. Delete any line that does not apply.",
-"# No key, no account, no permission, no cost. Just publish it.",
-"# See it live: https://sebbi.pro/ai.txt",
-"# ============================================================================",
-"",
-"Standard: AI-TXT/1.0",
-"Operator: YOUR COMPANY NAME",
-"Operator-Location: YOUR CITY, COUNTRY",
-"Contact: you@yourdomain.com",
-"Last-Updated: 2026-01-01",
-"",
-"# --- How your AI makes decisions ---",
-"Decision-Model: describe it (deterministic rules / ML model / human-in-loop)",
-"Decision-Outcomes: ALLOW, REVIEW, BLOCK",
-"Human-Override: yes / no",
-"Plain-Language-Reasons: yes / no",
-"",
-"# --- Your audit record (how you prove what happened) ---",
-"Audit-Chain: describe it (SHA-256 hash chain / signed logs / none)",
-"Chain-Property: tamper-evident / tamper-resistant / none",
-"Verify-Endpoint: https://yourdomain.com/your-verify-url",
-"",
-"# --- Regulations you are designing towards ---",
-"Regulation: EU AI Act 2024/1689",
-"Regulation: UK Online Safety Act 2023",
-"",
-"# --- Optional: public status surfaces ---",
-"Live-Status: https://yourdomain.com/health",
-"Whitepaper: https://yourdomain.com/whitepaper",
-"",
-"# ============================================================================",
-"# ai.txt is a free, open standard. Publish yours, share it, build on it.",
-"# ============================================================================"
-].join("\n");
-function downloadIt(){
-  var blob = new Blob([AITXT], {type:"text/plain"});
-  var url = URL.createObjectURL(blob);
-  var a = document.createElement("a");
-  a.href = url; a.download = "ai.txt";
-  document.body.appendChild(a); a.click();
-  document.body.removeChild(a); URL.revokeObjectURL(url);
-}
-</script>
-</body>
-</html>
-
-```
-
-
-## `ai-txt-kit.html`
-
-86 lines, 6554 bytes
-
-```html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="theme-color" content="#0a0f1e">
-<title>ai.txt Starter Kit &mdash; publish AI governance free in 5 minutes</title>
-<meta name="description" content="Publish an ai.txt on your own domain, free. Copy the template, add the badge, make it provable. No key, no account.">
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0a0f1e;color:#e8e8f0;line-height:1.6}
-.mono{font-family:"JetBrains Mono",ui-monospace,Menlo,monospace}
-nav{position:sticky;top:0;z-index:10;background:rgba(10,15,30,.94);backdrop-filter:blur(10px);border-bottom:1px solid #1e2a45;padding:0 20px;height:54px;display:flex;align-items:center;justify-content:space-between}
-nav a.logo{display:flex;align-items:center;gap:8px;color:#c9a84c;text-decoration:none;font-family:"JetBrains Mono",monospace;font-size:13px}
-nav .links a{color:#8a90a6;text-decoration:none;font-size:13px;margin-left:16px}
-.wrap{max-width:760px;margin:0 auto;padding:44px 20px 90px}
-.eyebrow{font-family:"JetBrains Mono",monospace;font-size:11px;letter-spacing:3px;text-transform:uppercase;color:#c9a84c;margin-bottom:12px}
-h1{font-size:34px;font-weight:800;letter-spacing:-.02em;line-height:1.1;margin-bottom:14px}
-h1 span{color:#c9a84c}
-.lede{color:#8a90a6;font-size:16px;margin-bottom:8px}
-.free{display:inline-block;background:rgba(0,229,160,.1);border:1px solid #00b87d;color:#7fe3b0;font-family:"JetBrains Mono",monospace;font-size:12px;padding:5px 12px;border-radius:5px;margin:14px 0 30px}
-h2{font-size:20px;font-weight:700;margin:40px 0 8px;padding-top:26px;border-top:1px solid #1e2a45}
-.step-n{font-family:"JetBrains Mono",monospace;color:#c9a84c;font-size:13px}
-p{color:#8a90a6;margin-bottom:14px}
-p b{color:#e8e8f0}
-.box{background:#0b1226;border:1px solid #1e2a45;border-radius:10px;padding:18px;margin:16px 0;font-family:"JetBrains Mono",monospace;font-size:12.5px;color:#7fe3b0;white-space:pre-wrap;word-break:break-word;line-height:1.8;overflow-x:auto}
-.btn{display:inline-flex;align-items:center;gap:8px;background:#c9a84c;color:#0a0f1e;padding:12px 22px;border-radius:8px;font-weight:800;font-size:14px;text-decoration:none;border:none;cursor:pointer;font-family:inherit}
-.btn.ghost{background:transparent;border:1px solid #2a3350;color:#e8e8f0}
-.btnrow{display:flex;gap:10px;flex-wrap:wrap;margin:16px 0}
-.badge-demo{display:inline-flex;align-items:center;gap:8px;background:#111a30;border:1px solid #c9a84c;border-radius:8px;padding:8px 14px;font-family:"JetBrains Mono",monospace;font-size:12px;color:#c9a84c;text-decoration:none}
-.badge-demo svg{flex-shrink:0}
-.onramp{background:linear-gradient(135deg,rgba(0,229,160,.06),rgba(201,168,76,.05));border:1px solid #00b87d;border-radius:12px;padding:24px;margin-top:30px}
-.onramp h3{color:#7fe3b0;font-size:16px;margin-bottom:8px}
-.onramp p{color:#a9b0c4}
-.copied{color:#7fe3b0;font-size:12px;margin-left:10px;opacity:0;transition:opacity .2s}
-.copied.show{opacity:1}
-footer{border-top:1px solid #1e2a45;padding:26px 20px;text-align:center;color:#5a6178;font-size:12px}
-footer a{color:#c9a84c;text-decoration:none}
-</style>
-</head>
-<body>
-<nav>
-  <a class="logo" href="/"><svg width="18" height="18" viewBox="0 0 32 32"><circle cx="16" cy="16" r="13.5" fill="none" stroke="#c9a84c" stroke-width="2.6" stroke-dasharray="66 20" stroke-linecap="round" transform="rotate(-50 16 16)"/><circle cx="26.5" cy="7" r="3.1" fill="#c9a84c"/></svg>AILeash</a>
-  <div class="links"><a href="/ai.txt">Spec</a><a href="/whitepaper">Whitepaper</a></div>
-</nav>
-<div class="wrap">
-  <div class="eyebrow">// ai.txt starter kit</div>
-  <h1>Publish AI governance on your own site. <span>Free.</span></h1>
-  <p class="lede">ai.txt is the robots.txt of AI governance: one small file at your domain root that declares how your AI is governed and where anyone can verify it. Here is everything you need to publish one in about five minutes.</p>
-  <div class="free">FREE STANDARD &middot; NO KEY &middot; NO ACCOUNT &middot; NO PERMISSION</div>
-
-  <h2><span class="step-n">01 /</span> Grab the template</h2>
-  <p>A ready-to-fill ai.txt with every line commented. Download it, or read the live example on our own domain.</p>
-  <div class="btnrow">
-    <a class="btn" href="/ai-txt-template.txt" download="ai.txt">&#8681; Download template</a>
-    <a class="btn ghost" href="/ai.txt" target="_blank">Read a live example</a>
-  </div>
-
-  <h2><span class="step-n">02 /</span> Fill it in and publish</h2>
-  <p>Replace the example values with your own facts. <b>Delete any line you cannot back with a real verify endpoint</b> &mdash; an honest short ai.txt beats an aspirational long one. Then upload it to the root of your domain so it lives at:</p>
-  <div class="box">https://yourdomain.com/ai.txt</div>
-  <p>That is the whole spec. One file, at the root, readable by anyone &mdash; a regulator, a partner, or another machine deciding whether to trust you.</p>
-
-  <h2><span class="step-n">03 /</span> Add the badge</h2>
-  <p>Show visitors and crawlers that you have declared your AI governance. Copy this HTML onto your site &mdash; it renders a small badge linking to your ai.txt:</p>
-  <p>Preview:</p>
-  <a class="badge-demo" href="/ai.txt"><svg width="14" height="14" viewBox="0 0 32 32"><circle cx="16" cy="16" r="13.5" fill="none" stroke="#c9a84c" stroke-width="3" stroke-dasharray="66 20" stroke-linecap="round" transform="rotate(-50 16 16)"/><circle cx="26.5" cy="7" r="3.4" fill="#c9a84c"/></svg>AI-Governed &middot; ai.txt</a>
-  <div class="box" id="badge">&lt;a href="/ai.txt" style="display:inline-flex;align-items:center;gap:6px;font-family:monospace;font-size:12px;color:#c9a84c;text-decoration:none;border:1px solid #c9a84c;border-radius:6px;padding:6px 10px"&gt;AI-Governed &middot; ai.txt&lt;/a&gt;</div>
-  <button class="btn ghost" onclick="copyBadge()">Copy badge HTML<span class="copied" id="cp">copied</span></button>
-
-</div>
-</div>
-<footer>
-  ai.txt (AI-TXT/1.0) is a free, open standard by <a href="/">Monop Content</a> &middot; Blyth, UK &middot; <a href="/ai.txt">spec</a> &middot; <a href="/comply.txt">comply.txt</a>
-</footer>
-<script>
-function copyBadge(){
-  var t=document.getElementById('badge').textContent;
-  navigator.clipboard.writeText(t).then(function(){
-    var c=document.getElementById('cp');c.classList.add('show');setTimeout(function(){c.classList.remove('show')},1500);
-  });
 }
 </script>
 </body>

@@ -1,12 +1,212 @@
 # Codebase — part 10 of 18
 
 Contains:
+- `ai-standard.html`
+- `ai-txt-kit.html`
 - `aitxt-popup-live.html`
 - `brain.html`
 - `certificate.html`
 - `compliance-assistant.html`
 - `contact.html`
-- `copyright.txt`
+
+
+## `ai-standard.html`
+
+97 lines, 4847 bytes
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#0a0f1e">
+<title>ai.txt - Free Download</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0a0f1e;color:#e8e8f0;min-height:100vh;display:flex;flex-direction:column}
+nav{border-bottom:1px solid #1e2a45;padding:16px 20px}
+nav a{color:#c9a84c;text-decoration:none;font-family:monospace;font-size:14px}
+.wrap{flex:1;display:flex;align-items:center;justify-content:center;padding:30px 20px}
+.card{max-width:560px;width:100%;background:#0d1428;border:1px solid #1e2a45;border-radius:16px;padding:36px 28px;text-align:center}
+h1{font-size:32px;font-weight:800;margin-bottom:14px;line-height:1.15}
+h1 span{color:#c9a84c}
+p{color:#8a90a6;font-size:15px;line-height:1.7;margin-bottom:14px}
+p b{color:#e8e8f0}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:10px;width:100%;background:#c9a84c;color:#0a0f1e;padding:18px;border-radius:10px;font-weight:800;font-size:17px;border:none;cursor:pointer;font-family:inherit;margin:20px 0 10px}
+.sub{font-family:monospace;font-size:12px;color:#7fe3b0;margin-bottom:24px}
+.steps{text-align:left;background:#0b1226;border:1px solid #1e2a45;border-radius:10px;padding:18px 20px;margin-top:8px}
+.steps li{color:#8a90a6;font-size:14px;margin:10px 0 10px 6px;line-height:1.6}
+.steps li b{color:#c9a84c}
+.back{margin-top:22px}
+.back a{color:#c9a84c;text-decoration:none;font-size:14px;font-weight:600}
+footer{border-top:1px solid #1e2a45;padding:20px;text-align:center;color:#5a6178;font-size:12px}
+footer a{color:#c9a84c;text-decoration:none}
+</style>
+</head>
+<body>
+<nav><a href="/">&larr; AILeash</a></nav>
+<div class="wrap">
+  <div class="card">
+    <h1>Download <span>ai.txt</span> &mdash; free</h1>
+    <div class="sub">NO KEY &middot; NO ACCOUNT &middot; NO COST</div>
+    <p>ai.txt is the free, open standard for declaring how your AI is governed. Download the file, and it shows your system exactly what it needs to become compliant.</p>
+    <button class="btn" onclick="downloadIt()">&#8681; Download ai.txt free</button>
+    <ul class="steps">
+      <li><b>1.</b> Tap download &mdash; the file saves as ai.txt</li>
+      <li><b>2.</b> Fill in your details, put it on your domain at yourdomain.com/ai.txt</li>
+      <li><b>3.</b> Want it verified and provable? <b><a href="/" style="color:#c9a84c">Come back to AILeash</a></b> to seal it into a tamper-evident chain.</li>
+    </ul>
+    <div class="back"><a href="/ai.txt">See the live ai.txt &rarr;</a></div>
+  </div>
+</div>
+<footer>ai.txt is a free, open standard by <a href="/">Monop Content</a> &middot; Blyth, UK &middot; <a href="/ai.txt">reference</a></footer>
+<script>
+var AITXT = [
+"# ============================================================================",
+"# ai.txt - AI Governance Declaration  (AI-TXT/1.0)",
+"# A free, open standard. Copy this to the root of your domain as /ai.txt",
+"# Replace the values below with your own. Delete any line that does not apply.",
+"# No key, no account, no permission, no cost. Just publish it.",
+"# See it live: https://sebbi.pro/ai.txt",
+"# ============================================================================",
+"",
+"Standard: AI-TXT/1.0",
+"Operator: YOUR COMPANY NAME",
+"Operator-Location: YOUR CITY, COUNTRY",
+"Contact: you@yourdomain.com",
+"Last-Updated: 2026-01-01",
+"",
+"# --- How your AI makes decisions ---",
+"Decision-Model: describe it (deterministic rules / ML model / human-in-loop)",
+"Decision-Outcomes: ALLOW, REVIEW, BLOCK",
+"Human-Override: yes / no",
+"Plain-Language-Reasons: yes / no",
+"",
+"# --- Your audit record (how you prove what happened) ---",
+"Audit-Chain: describe it (SHA-256 hash chain / signed logs / none)",
+"Chain-Property: tamper-evident / tamper-resistant / none",
+"Verify-Endpoint: https://yourdomain.com/your-verify-url",
+"",
+"# --- Regulations you are designing towards ---",
+"Regulation: EU AI Act 2024/1689",
+"Regulation: UK Online Safety Act 2023",
+"",
+"# --- Optional: public status surfaces ---",
+"Live-Status: https://yourdomain.com/health",
+"Whitepaper: https://yourdomain.com/whitepaper",
+"",
+"# ============================================================================",
+"# ai.txt is a free, open standard. Publish yours, share it, build on it.",
+"# ============================================================================"
+].join("\n");
+function downloadIt(){
+  var blob = new Blob([AITXT], {type:"text/plain"});
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement("a");
+  a.href = url; a.download = "ai.txt";
+  document.body.appendChild(a); a.click();
+  document.body.removeChild(a); URL.revokeObjectURL(url);
+}
+</script>
+</body>
+</html>
+
+```
+
+
+## `ai-txt-kit.html`
+
+86 lines, 6554 bytes
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#0a0f1e">
+<title>ai.txt Starter Kit &mdash; publish AI governance free in 5 minutes</title>
+<meta name="description" content="Publish an ai.txt on your own domain, free. Copy the template, add the badge, make it provable. No key, no account.">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0a0f1e;color:#e8e8f0;line-height:1.6}
+.mono{font-family:"JetBrains Mono",ui-monospace,Menlo,monospace}
+nav{position:sticky;top:0;z-index:10;background:rgba(10,15,30,.94);backdrop-filter:blur(10px);border-bottom:1px solid #1e2a45;padding:0 20px;height:54px;display:flex;align-items:center;justify-content:space-between}
+nav a.logo{display:flex;align-items:center;gap:8px;color:#c9a84c;text-decoration:none;font-family:"JetBrains Mono",monospace;font-size:13px}
+nav .links a{color:#8a90a6;text-decoration:none;font-size:13px;margin-left:16px}
+.wrap{max-width:760px;margin:0 auto;padding:44px 20px 90px}
+.eyebrow{font-family:"JetBrains Mono",monospace;font-size:11px;letter-spacing:3px;text-transform:uppercase;color:#c9a84c;margin-bottom:12px}
+h1{font-size:34px;font-weight:800;letter-spacing:-.02em;line-height:1.1;margin-bottom:14px}
+h1 span{color:#c9a84c}
+.lede{color:#8a90a6;font-size:16px;margin-bottom:8px}
+.free{display:inline-block;background:rgba(0,229,160,.1);border:1px solid #00b87d;color:#7fe3b0;font-family:"JetBrains Mono",monospace;font-size:12px;padding:5px 12px;border-radius:5px;margin:14px 0 30px}
+h2{font-size:20px;font-weight:700;margin:40px 0 8px;padding-top:26px;border-top:1px solid #1e2a45}
+.step-n{font-family:"JetBrains Mono",monospace;color:#c9a84c;font-size:13px}
+p{color:#8a90a6;margin-bottom:14px}
+p b{color:#e8e8f0}
+.box{background:#0b1226;border:1px solid #1e2a45;border-radius:10px;padding:18px;margin:16px 0;font-family:"JetBrains Mono",monospace;font-size:12.5px;color:#7fe3b0;white-space:pre-wrap;word-break:break-word;line-height:1.8;overflow-x:auto}
+.btn{display:inline-flex;align-items:center;gap:8px;background:#c9a84c;color:#0a0f1e;padding:12px 22px;border-radius:8px;font-weight:800;font-size:14px;text-decoration:none;border:none;cursor:pointer;font-family:inherit}
+.btn.ghost{background:transparent;border:1px solid #2a3350;color:#e8e8f0}
+.btnrow{display:flex;gap:10px;flex-wrap:wrap;margin:16px 0}
+.badge-demo{display:inline-flex;align-items:center;gap:8px;background:#111a30;border:1px solid #c9a84c;border-radius:8px;padding:8px 14px;font-family:"JetBrains Mono",monospace;font-size:12px;color:#c9a84c;text-decoration:none}
+.badge-demo svg{flex-shrink:0}
+.onramp{background:linear-gradient(135deg,rgba(0,229,160,.06),rgba(201,168,76,.05));border:1px solid #00b87d;border-radius:12px;padding:24px;margin-top:30px}
+.onramp h3{color:#7fe3b0;font-size:16px;margin-bottom:8px}
+.onramp p{color:#a9b0c4}
+.copied{color:#7fe3b0;font-size:12px;margin-left:10px;opacity:0;transition:opacity .2s}
+.copied.show{opacity:1}
+footer{border-top:1px solid #1e2a45;padding:26px 20px;text-align:center;color:#5a6178;font-size:12px}
+footer a{color:#c9a84c;text-decoration:none}
+</style>
+</head>
+<body>
+<nav>
+  <a class="logo" href="/"><svg width="18" height="18" viewBox="0 0 32 32"><circle cx="16" cy="16" r="13.5" fill="none" stroke="#c9a84c" stroke-width="2.6" stroke-dasharray="66 20" stroke-linecap="round" transform="rotate(-50 16 16)"/><circle cx="26.5" cy="7" r="3.1" fill="#c9a84c"/></svg>AILeash</a>
+  <div class="links"><a href="/ai.txt">Spec</a><a href="/whitepaper">Whitepaper</a></div>
+</nav>
+<div class="wrap">
+  <div class="eyebrow">// ai.txt starter kit</div>
+  <h1>Publish AI governance on your own site. <span>Free.</span></h1>
+  <p class="lede">ai.txt is the robots.txt of AI governance: one small file at your domain root that declares how your AI is governed and where anyone can verify it. Here is everything you need to publish one in about five minutes.</p>
+  <div class="free">FREE STANDARD &middot; NO KEY &middot; NO ACCOUNT &middot; NO PERMISSION</div>
+
+  <h2><span class="step-n">01 /</span> Grab the template</h2>
+  <p>A ready-to-fill ai.txt with every line commented. Download it, or read the live example on our own domain.</p>
+  <div class="btnrow">
+    <a class="btn" href="/ai-txt-template.txt" download="ai.txt">&#8681; Download template</a>
+    <a class="btn ghost" href="/ai.txt" target="_blank">Read a live example</a>
+  </div>
+
+  <h2><span class="step-n">02 /</span> Fill it in and publish</h2>
+  <p>Replace the example values with your own facts. <b>Delete any line you cannot back with a real verify endpoint</b> &mdash; an honest short ai.txt beats an aspirational long one. Then upload it to the root of your domain so it lives at:</p>
+  <div class="box">https://yourdomain.com/ai.txt</div>
+  <p>That is the whole spec. One file, at the root, readable by anyone &mdash; a regulator, a partner, or another machine deciding whether to trust you.</p>
+
+  <h2><span class="step-n">03 /</span> Add the badge</h2>
+  <p>Show visitors and crawlers that you have declared your AI governance. Copy this HTML onto your site &mdash; it renders a small badge linking to your ai.txt:</p>
+  <p>Preview:</p>
+  <a class="badge-demo" href="/ai.txt"><svg width="14" height="14" viewBox="0 0 32 32"><circle cx="16" cy="16" r="13.5" fill="none" stroke="#c9a84c" stroke-width="3" stroke-dasharray="66 20" stroke-linecap="round" transform="rotate(-50 16 16)"/><circle cx="26.5" cy="7" r="3.4" fill="#c9a84c"/></svg>AI-Governed &middot; ai.txt</a>
+  <div class="box" id="badge">&lt;a href="/ai.txt" style="display:inline-flex;align-items:center;gap:6px;font-family:monospace;font-size:12px;color:#c9a84c;text-decoration:none;border:1px solid #c9a84c;border-radius:6px;padding:6px 10px"&gt;AI-Governed &middot; ai.txt&lt;/a&gt;</div>
+  <button class="btn ghost" onclick="copyBadge()">Copy badge HTML<span class="copied" id="cp">copied</span></button>
+
+</div>
+</div>
+<footer>
+  ai.txt (AI-TXT/1.0) is a free, open standard by <a href="/">Monop Content</a> &middot; Blyth, UK &middot; <a href="/ai.txt">spec</a> &middot; <a href="/comply.txt">comply.txt</a>
+</footer>
+<script>
+function copyBadge(){
+  var t=document.getElementById('badge').textContent;
+  navigator.clipboard.writeText(t).then(function(){
+    var c=document.getElementById('cp');c.classList.add('show');setTimeout(function(){c.classList.remove('show')},1500);
+  });
+}
+</script>
+</body>
+</html>
+
+```
 
 
 ## `aitxt-popup-live.html`
@@ -1565,89 +1765,5 @@ async function doSubmit(){
 </script>
 </body>
 </html>
-
-```
-
-
-## `copyright.txt`
-
-76 lines, 4491 bytes
-
-```text
-# COPYRIGHT.TXT — Copyright and Originality Declaration
-# sebbi.pro | Monop Content | Justin Antony Dobson
-# Published: June 2026
-# Linked to: sebbi.pro/ai.txt | sebbi.pro/dis.txt | sebbi.pro/legal.txt
-# Verification: sebbi.pro/api/verify-chain
-
-## Automatic Copyright Notice
-
-Under the Copyright, Designs and Patents Act 1988, copyright in an original work arises automatically upon creation. No registration is required. The following original works are the intellectual property of Justin Antony Dobson, trading as Monop Content, from the date of their creation.
-
-## Original Works Declared
-
-COPYRIGHT-001: OAAS-1.0 — Open AI Audit Standard
-The concept, structure, format, and specific wording of the Open AI Audit Standard, including the ai.txt declaration format, is an original work created by Justin Antony Dobson in June 2026. First published at sebbi.pro/ai.txt.
-
-COPYRIGHT-002: dis.txt — Disinformation Protection Standard
-The concept, structure, and format of a machine-readable disinformation protection declaration file linked to a cryptographic audit chain is an original work created by Justin Antony Dobson in June 2026. First published at sebbi.pro/dis.txt.
-
-COPYRIGHT-003: legal.txt — Legal Declaration Standard
-The concept, structure, and format of a machine-readable legal declaration file linked to a cryptographic audit chain is an original work created by Justin Antony Dobson in June 2026. First published at sebbi.pro/legal.txt.
-
-COPYRIGHT-004: copyright.txt — Copyright Declaration Standard
-The concept, structure, and format of this file is an original work created by Justin Antony Dobson in June 2026. First published at sebbi.pro/copyright.txt.
-
-COPYRIGHT-005: AILeash Platform
-The AILeash platform including its governance engine, 9-signal weighted scoring system, SHA-256 Merkle audit chain implementation, trust decay model, velocity tracking system, and sovereign deployment architecture is an original work created by Justin Antony Dobson between 2021 and 2026.
-
-COPYRIGHT-006: AILeash Guardian
-The AILeash Guardian child safety platform including its grooming detection methodology, parent PWA dashboard, and evidence chain implementation is an original work created by Justin Antony Dobson.
-
-COPYRIGHT-007: SonicBoom
-The SonicBoom speed and compliance layer concept and implementation is an original work created by Justin Antony Dobson.
-
-COPYRIGHT-008: AILeash Sentinel
-The AILeash Sentinel fraud and anomaly detection platform is an original work created by Justin Antony Dobson.
-
-## What Is Protected
-
-The following are protected by copyright and may not be reproduced, copied, or distributed without permission:
-
-- The specific wording, format, and structure of ai.txt, dis.txt, legal.txt, and copyright.txt
-- The source code of server.py, engine.py, and all associated platform files
-- The specific implementation of the SHA-256 Merkle chain audit system as built by Justin Antony Dobson
-- All HTML, CSS, and JavaScript files published at sebbi.pro
-- The OAAS-1.0 standard document published at sebbi.pro/ai-standard
-
-## What Is Not Restricted
-
-Others may:
-- Build their own AI compliance products using different code and different approaches
-- Implement the general concept of AI audit chains using their own implementations
-- Reference OAAS-1.0 provided they attribute authorship to Justin Antony Dobson
-
-Others may not:
-- Copy the specific format of these declaration files and present them as their own
-- Reproduce the source code of the AILeash platform without permission
-- Claim authorship or co-authorship of OAAS-1.0 or any of the above works
-
-## Prior Art Declaration
-
-This file, combined with the SHA-256 Merkle chain at sebbi.pro/api/verify-chain, constitutes a timestamped prior art declaration. The chain provides cryptographic proof of the date and content of all original works listed above.
-
-If any third party seeks to patent, trademark, or claim ownership of concepts substantially similar to those listed above after the publication date of this file, this declaration and the associated Merkle chain evidence will be submitted as prior art.
-
-## Linked Files
-
-ai.txt: https://sebbi.pro/ai.txt
-dis.txt: https://sebbi.pro/dis.txt
-legal.txt: https://sebbi.pro/legal.txt
-copyright.txt: https://sebbi.pro/copyright.txt
-Verification: https://sebbi.pro/api/verify-chain
-
-© 2026 Justin Antony Dobson / Monop Content
-Blyth, Northumberland, United Kingdom
-All rights reserved under the Copyright, Designs and Patents Act 1988.
 
 ```
