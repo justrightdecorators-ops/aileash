@@ -1,11 +1,1365 @@
-# Codebase — part 2 of 18
+# Codebase — part 2 of 19
 
 Contains:
+- `modules/Continuity.py`
 - `modules/_ _ i n i t _ _ . p y`
 - `modules/capture.py`
 - `modules/codebase.py`
-- `modules/complete.py`
-- `modules/conformance.py`
+
+
+## `modules/Continuity.py`
+
+1347 lines, 64660 bytes
+
+```python
+#!/usr/bin/env python3
+"""
+modules/continuity.py  -  authority continuity
+===========================================
+
+THE QUESTION THIS ANSWERS
+-------------------------
+Can every autonomous action be traced from the human authority that started
+it to the execution that ended it, and can it be shown that identity,
+authority, boundary, intent and validity survived every hop in between?
+
+Permissions answer "may this actor do this now". That is one hop. An
+autonomous system is many hops, and the interesting failures are never at
+the last one. They are three delegations back, where a scope was widened by
+a system that had every right to delegate and no right to delegate THAT.
+
+WHAT THIS MODULE IS NOT
+-----------------------
+It is not a new evidence layer. AILeash already has one, and a second would
+be a second thing to trust. Every record here is sealed through ctx["seal"]
+into the same chain, so authority evidence inherits ordering, integrity,
+period commitment, absence proofs and external anchoring without asking for
+any of it.
+
+It is also not a permission system. It sits underneath one. A permission
+system answers from a table. This answers from a derivation.
+
+THE INVARIANT
+-------------
+A downstream agent may inherit or narrow authority. It can never exercise
+more authority than can be derived from a valid upstream grant.
+
+Everything below is machinery for making that sentence checkable.
+
+  IDENTITY      every grant names an issuer and a subject, and the grant
+                record is sealed, so the actor at each hop is attributable
+                to something that cannot be edited afterwards.
+  AUTHORITY     every grant except a root points at a parent. A root must
+                be issued by a human principal and is marked as such.
+                An orphan is not a root, it is a forgery.
+  BOUNDARY      a child must be a subset of its parent on every axis, and
+                the check is re-run at exercise, not just at issue. Issue
+                time is not enough: the parent may have been narrowed or
+                revoked since.
+  INTENT        purpose tags are carried and must narrow. An action whose
+                declared purpose is not covered is not assumed hostile and
+                is not assumed fine - it is CHALLENGED.
+  TEMPORAL      every ancestor must be valid at the instant of evaluation.
+                A leaf inside its window under an expired parent is dead.
+  EVIDENCE      the evaluation, the full lineage digest, and the parameter
+                digest are sealed together, so what was decided and what it
+                was decided about cannot drift apart later.
+
+DETERMINISTIC WHERE POSSIBLE, HONEST WHERE NOT
+----------------------------------------------
+Structure is decidable. Scope containment, constraint narrowing, temporal
+windows, revocation, depth, cycles and record integrity are arithmetic and
+set membership, and every one of them produces BLOCK on failure with the
+exact grant and invariant named. No scoring, no thresholds, no judgement.
+
+Meaning is not decidable. Whether "process the refund queue" covers paying
+a supplier is a question about intent, and a system that answers it with a
+confident boolean is lying. Those cases return CHALLENGE, which is the
+mechanism AILeash already has for exactly this: a machine that knows it
+does not know, escalating to a human whose answer is sealed before the
+machine's own view is revealed.
+
+Three things trigger CHALLENGE rather than ALLOW:
+
+  1. The action declares a purpose the grant does not carry. Intent
+     compatibility is unproven in both directions.
+  2. Authority is only covered by a broad wildcard. Technically derived,
+     practically unreviewable, and the place scope creep hides.
+  3. The action varies a dimension no ancestor constrains. An unconstrained
+     dimension is not permission, it is an unasked question.
+
+WHAT IS DELIBERATELY REFUSED
+----------------------------
+  - No union of grants. One action derives from one lineage. Two narrow
+    grants that jointly exceed either is the oldest escalation trick there
+    is, and the only defence that holds is to never combine them.
+  - No re-parenting. A grant's parent is fixed at issue and part of its
+    digest.
+  - No retroactive widening. Editing a stored grant changes its digest and
+    fails integrity against the sealed value.
+  - No implicit inheritance of unknown keys. A constraint the parent never
+    expressed cannot be narrowed by a child, so a child that introduces one
+    is escalating.
+
+HONEST LIMITS
+-------------
+  - This proves authority was derivable, not that the human who issued the
+    root grant should have. Root legitimacy is an organisational question.
+  - Grants are authenticated by sealing rather than by signature, so an
+    outside party verifies them through the chain rather than offline.
+    Offline verification needs per-issuer signing keys and is not built.
+  - An action that never reached this module is outside all of it, exactly
+    as with completeness. What changes is that the operator cannot choose
+    which of the evaluated actions to show.
+
+    POST /x/continuity/issue      grant or delegate authority     (keyed)
+    POST /x/continuity/revoke     revoke, transitively            (keyed)
+    POST /x/continuity/exercise   evaluate an action              (keyed)
+    POST /x/continuity/confirm    bind execution to evaluation    (keyed)
+    GET  /x/continuity/trace      full lineage of a grant         (public)
+    GET  /x/continuity/decision   a sealed evaluation             (public)
+    GET  /x/continuity/spec       the exact derivation rules      (public)
+"""
+
+import hashlib
+import json
+import re
+import sqlite3
+import sys
+import time
+import uuid
+from datetime import datetime, timezone
+
+VERSION = "1.2"
+
+PUBLIC = {("GET", "trace"), ("GET", "decision"), ("GET", "decisions"), ("GET", "spec")}
+
+GRANT_PREFIX = b"AILEASH-GRANT-v1:"
+EVAL_PREFIX = b"AILEASH-AUTHEVAL-v1:"
+
+# The live scorer is found at runtime rather than imported, the same way
+# replay.py finds it. server.py is never imported by a module.
+SCORER_NAMES = ["score_event", "score", "evaluate_event", "evaluate", "decide", "risk_score"]
+
+MAX_DEPTH = 32            # hard ceiling on lineage length
+MAX_WALK = 128            # cycle guard, independent of MAX_DEPTH
+DEFAULT_WINDOW = 300      # seconds an ALLOW stays bindable before re-evaluation
+ID_RE = re.compile(r"^[A-Za-z0-9._:@+-]{1,120}$")
+# Capabilities are matched by string equality and prefix, so a value that
+# differs only by whitespace or case would be a different capability that
+# looks identical in a report. Rejected rather than normalised: silently
+# trimming means the action evaluated is not the action the caller sent.
+CAP_RE = re.compile(r"^[A-Za-z0-9._*-]{1,200}$")
+
+# Constraint key grammar. The prefix decides the narrowing direction, so a
+# new constraint needs no code change - only a name that says which way it
+# tightens. A key that fits no rule is not guessed at.
+#   max_*      child must be <= parent
+#   min_*      child must be >= parent
+#   allowed_*  child set must be a subset of parent set
+#   denied_*   child set must be a superset of parent set
+#   may_*      child may be True only if parent is True
+def _num(value):
+    """Numeric coercion that refuses booleans.
+
+    float(True) is 1.0, so a boolean sails under any max_ cap. A boolean is
+    not a small number, it is a different type arriving where a number was
+    expected, and that is a comparison failure rather than a pass.
+    """
+    if isinstance(value, bool) or value is None:
+        raise ValueError("not a number")
+    return float(value)
+
+
+def _as_set(value):
+    """Set coercion for allowed_/denied_ axes.
+
+    A bare string is one member, never its characters. Without this,
+    allowed_currency: "GBP" would accept "G", because "G" is in "GBP".
+    """
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return set(value)
+    return {value}
+
+
+NUMERIC_MAX = "max_"
+NUMERIC_MIN = "min_"
+ALLOWED = "allowed_"
+DENIED = "denied_"
+FLAG = "may_"
+
+RANK = {"ALLOW": 0, "CHALLENGE": 1, "BLOCK": 2}
+
+_ready = False
+
+
+def _srv():
+    m = sys.modules.get("__main__")
+    if m is not None and hasattr(m, "get_bearer"):
+        return m
+    return sys.modules.get("server")
+
+
+def _live_scorer():
+    """The deployed decision function, located by name at runtime.
+
+    Authority is a gate in front of the existing engine, not a rival to it.
+    If the scorer cannot be found, that is reported rather than silently
+    treated as an ALLOW - a missing risk opinion is missing, not favourable.
+    """
+    s = _srv()
+    if s is None:
+        return None, "server module not reachable from this module"
+    for name in SCORER_NAMES:
+        fn = getattr(s, name, None)
+        if callable(fn):
+            return fn, name
+    return None, "no scorer found under " + ", ".join(SCORER_NAMES)
+
+
+def _read_verdict(result):
+    """Pull a decision out of whatever shape the engine returns."""
+    if isinstance(result, dict):
+        for key in ("decision", "verdict", "action"):
+            v = result.get(key)
+            if isinstance(v, str) and v.upper() in RANK:
+                return v.upper(), result
+    if isinstance(result, (list, tuple)):
+        for item in result:
+            v, _ = _read_verdict(item)
+            if v:
+                return v, result if isinstance(result, dict) else {"raw": list(result)}
+            if isinstance(item, str) and item.upper() in RANK:
+                return item.upper(), {"raw": list(result)}
+    if isinstance(result, str) and result.upper() in RANK:
+        return result.upper(), {"raw": result}
+    return None, None
+
+
+def _risk_opinion(event):
+    """Ask the existing engine what it thinks of the same action.
+
+    Failure here is never an ALLOW. The engine either answers or is recorded
+    as not having answered, and an unanswered risk question is a reason to
+    involve a human rather than to proceed.
+    """
+    fn, why = _live_scorer()
+    if fn is None:
+        return None, {"available": False, "reason": why}
+    try:
+        raw = fn(event)
+    except Exception as exc:
+        return None, {"available": False, "reason": "scorer raised: " + str(exc)[:160]}
+    verdict, detail = _read_verdict(raw)
+    if verdict is None:
+        return None, {"available": False,
+                      "reason": "scorer returned a shape this module could not read"}
+    out = {"available": True, "verdict": verdict, "scorer": _live_scorer()[1]}
+    if isinstance(detail, dict) and "score" in detail:
+        out["score"] = detail["score"]
+    return verdict, out
+
+
+def _setup(ctx):
+    global _ready
+    if _ready:
+        return
+    with ctx["lock"]:
+        c = ctx["conn"]
+        c.execute("CREATE TABLE IF NOT EXISTS auth_grant("
+                  "id TEXT PRIMARY KEY,parent TEXT,root TEXT,issuer TEXT,issuer_kind TEXT,"
+                  "subject TEXT,subject_kind TEXT,scope TEXT,constraints TEXT,"
+                  "purpose TEXT,purpose_tags TEXT,not_before REAL,not_after REAL,"
+                  "depth INTEGER,delegations_left INTEGER,created REAL,digest TEXT,"
+                  "audit_hash TEXT,block_index INTEGER,api_key TEXT,"
+                  "risk_accepted_by TEXT,risk_accepted_at REAL)")
+        # Deployments that predate risk acceptance get the columns added
+        # rather than rebuilt. A grant with no acceptor is not silently
+        # treated as accepted - it fails at exercise, which is the point.
+        for ddl in ("ALTER TABLE auth_grant ADD COLUMN risk_accepted_by TEXT",
+                    "ALTER TABLE auth_grant ADD COLUMN risk_accepted_at REAL"):
+            try:
+                c.execute(ddl)
+            except Exception:
+                pass
+        c.execute("CREATE INDEX IF NOT EXISTS idx_auth_parent ON auth_grant(parent)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_auth_subject ON auth_grant(subject)")
+        c.execute("CREATE TABLE IF NOT EXISTS auth_revoke("
+                  "id INTEGER PRIMARY KEY AUTOINCREMENT,grant_id TEXT,reason TEXT,"
+                  "revoked REAL,api_key TEXT,audit_hash TEXT,block_index INTEGER)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_auth_rev ON auth_revoke(grant_id)")
+        c.execute("CREATE TABLE IF NOT EXISTS auth_eval("
+                  "id TEXT PRIMARY KEY,grant_id TEXT,action TEXT,params_digest TEXT,"
+                  "lineage_digest TEXT,verdict TEXT,reasons TEXT,broken_at TEXT,"
+                  "broken_invariant TEXT,evaluated REAL,valid_until REAL,"
+                  "audit_hash TEXT,block_index INTEGER,api_key TEXT)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_auth_eval_g ON auth_eval(grant_id)")
+        c.execute("CREATE TABLE IF NOT EXISTS auth_exec("
+                  "id INTEGER PRIMARY KEY AUTOINCREMENT,eval_id TEXT,outcome TEXT,"
+                  "params_digest TEXT,confirmed REAL,audit_hash TEXT,block_index INTEGER)")
+        # One accepted binding per evaluation, enforced by the database rather
+        # than by a read followed by a write. Two concurrent executions of the
+        # same ALLOW is a race, and a race is exactly where a check-then-act
+        # guard loses.
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_auth_exec_once "
+                  "ON auth_exec(eval_id) WHERE outcome<>'rejected'")
+        c.commit()
+    _ready = True
+
+
+def _iso(ts):
+    if ts is None:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+def _canon(obj):
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _grant_digest(g):
+    """Everything that makes the grant what it is. Parent is included, so a
+    grant cannot be re-parented onto a wider ancestor after the fact."""
+    material = {
+        "id": g["id"], "parent": g["parent"], "issuer": g["issuer"],
+        "issuer_kind": g["issuer_kind"], "subject": g["subject"],
+        "subject_kind": g["subject_kind"], "scope": sorted(g["scope"]),
+        "constraints": g["constraints"], "purpose": g["purpose"],
+        "purpose_tags": sorted(g["purpose_tags"]),
+        "not_before": g["not_before"], "not_after": g["not_after"],
+        "depth": g["depth"], "delegations_left": g["delegations_left"],
+        "created": g["created"], "risk_accepted_by": g.get("risk_accepted_by"),
+    }
+    return hashlib.sha256(GRANT_PREFIX + _canon(material).encode("utf-8")).hexdigest()
+
+
+# ----------------------------------------------------------------------
+# scope
+# ----------------------------------------------------------------------
+
+def _covers(held, wanted):
+    """Does capability `held` cover capability `wanted`?
+
+    Dot-separated segments. A trailing * covers any deeper path. A bare *
+    covers everything, which is legal and always suspicious - see
+    _wildcard_breadth.
+    """
+    if held == wanted:
+        return True
+    if held == "*":
+        return True
+    if held.endswith(".*"):
+        return wanted == held[:-2] or wanted.startswith(held[:-1])
+    return False
+
+
+def _scope_subset(parent_scope, child_scope):
+    missing = [c for c in child_scope if not any(_covers(p, c) for p in parent_scope)]
+    if missing:
+        return False, "scope not derivable from parent: " + ", ".join(sorted(missing)[:5])
+    return True, None
+
+
+def _wildcard_breadth(scope, capability):
+    """How broad is the grant that lets this capability through?
+
+    0  exact match
+    1  wildcard one level above the requested capability
+    2+ wildcard further up, or a bare *
+    """
+    best = None
+    for held in scope:
+        if not _covers(held, capability):
+            continue
+        if held == capability:
+            return 0
+        if held == "*":
+            width = capability.count(".") + 2
+        else:
+            width = capability.count(".") - held[:-2].count(".")
+        best = width if best is None else min(best, width)
+    return best
+
+
+# ----------------------------------------------------------------------
+# constraints
+# ----------------------------------------------------------------------
+
+def _constraint_direction(key):
+    for prefix in (NUMERIC_MAX, NUMERIC_MIN, ALLOWED, DENIED, FLAG):
+        if key.startswith(prefix):
+            return prefix
+    return None
+
+
+def _constraints_narrower(parent_c, child_c):
+    """Child must be at least as tight as parent on every axis.
+
+    A key the child introduces that the parent never expressed is an
+    expansion of the constrained surface, not a tightening of it, and is
+    refused. Silence upstream is not permission downstream.
+    """
+    for key, cval in sorted(child_c.items()):
+        direction = _constraint_direction(key)
+        if direction is None:
+            return False, "constraint '%s' has no narrowing rule - refused rather than guessed" % key
+        if key not in parent_c:
+            return False, "constraint '%s' is not expressed by the parent, so a child cannot introduce it" % key
+        pval = parent_c[key]
+        try:
+            if direction == NUMERIC_MAX:
+                if _num(cval) > _num(pval):
+                    return False, "%s raised from %s to %s" % (key, pval, cval)
+            elif direction == NUMERIC_MIN:
+                if _num(cval) < _num(pval):
+                    return False, "%s lowered from %s to %s" % (key, pval, cval)
+            elif direction == ALLOWED:
+                if not _as_set(cval) <= _as_set(pval):
+                    extra = sorted(str(x) for x in _as_set(cval) - _as_set(pval))
+                    return False, "%s adds %s" % (key, ", ".join(extra[:5]))
+            elif direction == DENIED:
+                if not _as_set(pval) <= _as_set(cval):
+                    dropped = sorted(str(x) for x in _as_set(pval) - _as_set(cval))
+                    return False, "%s drops %s" % (key, ", ".join(dropped[:5]))
+            elif direction == FLAG:
+                if bool(cval) and not bool(pval):
+                    return False, "%s enabled where the parent withholds it" % key
+        except (TypeError, ValueError):
+            return False, "constraint '%s' is not comparable with the parent's value" % key
+    return True, None
+
+
+def _effective_constraints(chain):
+    """Tightest value on each axis across the whole lineage.
+
+    Narrowing is enforced at issue and re-checked at exercise, so in a sound
+    chain this equals the leaf. It is computed anyway: a grant issued before
+    a rule was tightened must not be able to outlive the rule.
+    """
+    eff = {}
+    for g in chain:
+        for key, val in g["constraints"].items():
+            direction = _constraint_direction(key)
+            if key not in eff:
+                eff[key] = val
+                continue
+            cur = eff[key]
+            try:
+                if direction == NUMERIC_MAX:
+                    eff[key] = min(_num(cur), _num(val))
+                elif direction == NUMERIC_MIN:
+                    eff[key] = max(_num(cur), _num(val))
+                elif direction == ALLOWED:
+                    eff[key] = sorted(_as_set(cur) & _as_set(val))
+                elif direction == DENIED:
+                    eff[key] = sorted(_as_set(cur) | _as_set(val))
+                elif direction == FLAG:
+                    eff[key] = bool(cur) and bool(val)
+            except (TypeError, ValueError):
+                eff[key] = val
+    return eff
+
+
+def _params_against_constraints(params, eff):
+    """Check the action's own parameters against the effective constraints.
+
+    Returns (hard_failures, unconstrained_dimensions).
+    """
+    failures = []
+    unconstrained = []
+    for key, val in sorted(params.items()):
+        checked = False
+        for cname, cval in eff.items():
+            direction = _constraint_direction(cname)
+            axis = cname[len(direction):] if direction else cname
+            if axis != key:
+                continue
+            checked = True
+            try:
+                if direction == NUMERIC_MAX and _num(val) > _num(cval):
+                    failures.append("%s=%s exceeds %s=%s" % (key, val, cname, cval))
+                elif direction == NUMERIC_MIN and _num(val) < _num(cval):
+                    failures.append("%s=%s is below %s=%s" % (key, val, cname, cval))
+                elif direction == ALLOWED and val not in _as_set(cval):
+                    failures.append("%s=%s is outside %s" % (key, val, cname))
+                elif direction == DENIED and val in _as_set(cval):
+                    failures.append("%s=%s is denied by %s" % (key, val, cname))
+                elif direction == FLAG and bool(val) and not bool(cval):
+                    failures.append("%s requested where %s withholds it" % (key, cname))
+            except (TypeError, ValueError):
+                failures.append("%s cannot be compared with %s" % (key, cname))
+        if not checked:
+            unconstrained.append(key)
+    return failures, unconstrained
+
+
+# ----------------------------------------------------------------------
+# storage
+# ----------------------------------------------------------------------
+
+def _row_to_grant(row):
+    return {
+        "id": row[0], "parent": row[1], "root": row[2], "issuer": row[3],
+        "issuer_kind": row[4], "subject": row[5], "subject_kind": row[6],
+        "scope": json.loads(row[7]), "constraints": json.loads(row[8]),
+        "purpose": row[9], "purpose_tags": json.loads(row[10]),
+        "not_before": row[11], "not_after": row[12], "depth": row[13],
+        "delegations_left": row[14], "created": row[15], "digest": row[16],
+        "audit_hash": row[17], "block_index": row[18],
+        "risk_accepted_by": row[19], "risk_accepted_at": row[20],
+    }
+
+
+_COLUMNS = ("id,parent,root,issuer,issuer_kind,subject,subject_kind,scope,constraints,"
+            "purpose,purpose_tags,not_before,not_after,depth,delegations_left,created,"
+            "digest,audit_hash,block_index,risk_accepted_by,risk_accepted_at")
+
+
+def _get(ctx, grant_id):
+    with ctx["lock"]:
+        row = ctx["conn"].execute(
+            "SELECT " + _COLUMNS + " FROM auth_grant WHERE id=?", (grant_id,)).fetchone()
+    return _row_to_grant(row) if row else None
+
+
+def _revocation(ctx, grant_id):
+    with ctx["lock"]:
+        row = ctx["conn"].execute(
+            "SELECT revoked,reason,audit_hash,block_index FROM auth_revoke "
+            "WHERE grant_id=? ORDER BY id ASC LIMIT 1", (grant_id,)).fetchone()
+    if not row:
+        return None
+    return {"revoked_at": _iso(row[0]), "revoked_ts": row[0], "reason": row[1],
+            "sealed_in_chain": row[2], "block_index": row[3]}
+
+
+def _accountable(chain):
+    """Who accepts the risk of this authority existing.
+
+    Distinct from who granted it and who holds it. An issuer says "you may".
+    A subject does the acting. Neither of those is a person putting their
+    name to the risk of the capability being switched on at all, and that is
+    the name an incident actually needs.
+
+    Resolved by walking down from the root and taking the nearest grant that
+    states one, so an acceptor set high up covers everything beneath it
+    until someone explicitly takes it on further down.
+    """
+    accountable = None
+    at = None
+    for g in chain:
+        if g.get("risk_accepted_by"):
+            accountable = g["risk_accepted_by"]
+            at = g.get("risk_accepted_at")
+    return accountable, at
+
+
+def _walk(ctx, grant_id):
+    """Leaf to root. Returns (chain_root_first, error).
+
+    Cycle and length guards are separate on purpose: a cycle is an attack,
+    an over-long chain is a policy breach, and they should not be reported
+    as the same thing.
+    """
+    chain = []
+    seen = set()
+    current = grant_id
+    while current:
+        if current in seen:
+            return None, {"invariant": "authority_continuity",
+                          "grant": current,
+                          "detail": "parent cycle - the lineage does not terminate at a root"}
+        seen.add(current)
+        g = _get(ctx, current)
+        if g is None:
+            return None, {"invariant": "authority_continuity",
+                          "grant": current,
+                          "detail": "grant not found, so no authority can be derived through it"}
+        chain.append(g)
+        if len(chain) > MAX_WALK:
+            return None, {"invariant": "authority_continuity",
+                          "grant": current,
+                          "detail": "lineage exceeds the walk limit of %d" % MAX_WALK}
+        current = g["parent"]
+    chain.reverse()
+    return chain, None
+
+
+# ----------------------------------------------------------------------
+# issue
+# ----------------------------------------------------------------------
+
+def _issue(ctx, api_key, data):
+    now = time.time()
+    parent_id = data.get("parent")
+    issuer = str(data.get("issuer", "")).strip()
+    subject = str(data.get("subject", "")).strip()
+    issuer_kind = str(data.get("issuer_kind", "")).strip().lower()
+    subject_kind = str(data.get("subject_kind", "agent")).strip().lower()
+    scope = data.get("scope") or []
+    constraints = data.get("constraints") or {}
+    purpose = str(data.get("purpose", "")).strip()
+    purpose_tags = data.get("purpose_tags") or []
+
+    if not issuer or not subject:
+        return {"error": "issuer_and_subject_required"}, 400
+    for ident in (issuer, subject):
+        if not ID_RE.match(ident):
+            return {"error": "bad_identifier", "value": ident}, 400
+    if not isinstance(scope, list) or not scope or not all(isinstance(s, str) for s in scope):
+        return {"error": "scope_required", "message": "a non-empty list of capability strings"}, 400
+    bad = [s for s in scope if not CAP_RE.match(s)]
+    if bad:
+        return {"error": "bad_capability", "values": bad[:5],
+                "message": "Capabilities are matched exactly. A value carrying whitespace or "
+                           "characters outside the grammar would read as one capability and "
+                           "match another, so it is refused rather than cleaned up."}, 400
+    if not isinstance(constraints, dict):
+        return {"error": "constraints_must_be_an_object"}, 400
+    if not isinstance(purpose_tags, list):
+        return {"error": "purpose_tags_must_be_a_list"}, 400
+    if not purpose:
+        return {"error": "purpose_required",
+                "message": "Authority without a stated purpose cannot be checked for intent "
+                           "drift later, so it is not accepted."}, 400
+
+    not_before = float(data.get("not_before") or now)
+    not_after = data.get("not_after")
+    if not_after is None:
+        return {"error": "not_after_required",
+                "message": "Authority that never expires cannot be temporally checked. "
+                           "Give it an end."}, 400
+    not_after = float(not_after)
+    if not_after <= not_before:
+        return {"error": "empty_validity_window"}, 400
+
+    delegations_left = int(data.get("delegations_left", 0))
+    if delegations_left < 0:
+        return {"error": "delegations_left_must_not_be_negative"}, 400
+
+    risk_accepted_by = str(data.get("risk_accepted_by", "")).strip() or None
+    if risk_accepted_by and not ID_RE.match(risk_accepted_by):
+        return {"error": "bad_identifier", "value": risk_accepted_by}, 400
+
+    parent = None
+    if parent_id:
+        parent = _get(ctx, parent_id)
+        if parent is None:
+            return {"error": "parent_not_found", "parent": parent_id}, 404
+
+        integrity = _grant_digest(parent)
+        if integrity != parent["digest"]:
+            return {"error": "parent_integrity_failed", "parent": parent_id,
+                    "message": "The stored parent does not match the digest sealed when it was "
+                               "issued. Nothing may be derived from it."}, 409
+
+        rev = _revocation(ctx, parent_id)
+        if rev:
+            return {"error": "parent_revoked", "parent": parent_id, "revocation": rev}, 409
+        if parent["not_after"] <= now:
+            return {"error": "parent_expired", "parent": parent_id,
+                    "expired_at": _iso(parent["not_after"])}, 409
+        if parent["delegations_left"] <= 0:
+            return {"error": "delegation_not_permitted", "parent": parent_id,
+                    "message": "The parent grant carries no remaining delegations."}, 409
+        if parent["depth"] + 1 > MAX_DEPTH:
+            return {"error": "max_depth_exceeded", "limit": MAX_DEPTH}, 409
+
+        ok, why = _scope_subset(parent["scope"], scope)
+        if not ok:
+            return {"error": "boundary_integrity", "parent": parent_id, "message": why}, 409
+        ok, why = _constraints_narrower(parent["constraints"], constraints)
+        if not ok:
+            return {"error": "boundary_integrity", "parent": parent_id, "message": why}, 409
+        if not set(purpose_tags) <= set(parent["purpose_tags"]):
+            extra = sorted(set(purpose_tags) - set(parent["purpose_tags"]))
+            return {"error": "intent_continuity", "parent": parent_id,
+                    "message": "purpose tags not carried by the parent: " + ", ".join(extra)}, 409
+        if not_before < parent["not_before"] or not_after > parent["not_after"]:
+            return {"error": "temporal_validity", "parent": parent_id,
+                    "message": "the child window is not contained by the parent window",
+                    "parent_window": [_iso(parent["not_before"]), _iso(parent["not_after"])]}, 409
+        if delegations_left > parent["delegations_left"] - 1:
+            return {"error": "boundary_integrity", "parent": parent_id,
+                    "message": "a child cannot carry more onward delegations than the parent "
+                               "had left, minus the one it just used"}, 409
+
+        # Handing an agent the power to hand authority on again is the
+        # moment a capability gets switched on, and it is the moment someone
+        # has to put their name to it. Inheriting an acceptor from further
+        # up would mean a person accepting a risk that did not exist when
+        # they accepted it.
+        if delegations_left > 0 and not risk_accepted_by:
+            return {"error": "risk_acceptance_required",
+                    "parent": parent_id,
+                    "message": "This grant lets its holder delegate onward. Name who accepts "
+                               "the risk of that, in risk_accepted_by. A grant that only "
+                               "narrows and cannot delegate inherits the acceptor above it."}, 409
+
+        depth = parent["depth"] + 1
+        root = parent["root"]
+    else:
+        if issuer_kind != "human":
+            return {"error": "identity_continuity",
+                    "message": "A root grant must be issued by a human principal. A grant with "
+                               "no parent and no human issuer is an orphan, not a root."}, 409
+        if not risk_accepted_by:
+            risk_accepted_by = issuer
+        depth = 0
+        root = None
+
+    grant_id = str(data.get("id") or ("g_" + uuid.uuid4().hex[:20]))
+    if not ID_RE.match(grant_id):
+        return {"error": "bad_identifier", "value": grant_id}, 400
+    if _get(ctx, grant_id) is not None:
+        return {"error": "grant_exists", "id": grant_id}, 409
+    if root is None:
+        root = grant_id
+
+    g = {"id": grant_id, "parent": parent_id, "root": root, "issuer": issuer,
+         "issuer_kind": issuer_kind or ("human" if depth == 0 else "agent"),
+         "subject": subject, "subject_kind": subject_kind,
+         "scope": sorted(set(scope)), "constraints": constraints, "purpose": purpose,
+         "purpose_tags": sorted(set(purpose_tags)), "not_before": not_before,
+         "not_after": not_after, "depth": depth, "delegations_left": delegations_left,
+         "created": now, "risk_accepted_by": risk_accepted_by,
+         "risk_accepted_at": (now if risk_accepted_by else None)}
+    digest = _grant_digest(g)
+
+    ev = {"user_id": "cty:" + subject[:32], "action": "authority_granted", "amount": 0,
+          "country": "UK", "device_id": "lineage", "anomaly": 0, "device_risk": 0}
+    res = {"decision": "AUTHORITY_GRANTED", "score": 0, "continuity_version": VERSION,
+           "grant": grant_id, "parent": parent_id, "root": root, "depth": depth,
+           "issuer": issuer, "subject": subject, "digest": digest,
+           "risk_accepted_by": risk_accepted_by,
+           "detail": "grant=%s;parent=%s;depth=%d;risk_accepted_by=%s;digest=%s"
+                     % (grant_id, parent_id, depth, risk_accepted_by or "inherited", digest)}
+    audit_hash, block_index, seq = ctx["seal"](ev, res, now, api_key)
+
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "INSERT INTO auth_grant(id,parent,root,issuer,issuer_kind,subject,subject_kind,"
+            "scope,constraints,purpose,purpose_tags,not_before,not_after,depth,"
+            "delegations_left,created,digest,audit_hash,block_index,api_key,"
+            "risk_accepted_by,risk_accepted_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (grant_id, parent_id, root, issuer, g["issuer_kind"], subject, subject_kind,
+             _canon(g["scope"]), _canon(constraints), purpose, _canon(g["purpose_tags"]),
+             not_before, not_after, depth, delegations_left, now, digest,
+             audit_hash, block_index, api_key, risk_accepted_by,
+             g["risk_accepted_at"]))
+        ctx["conn"].commit()
+
+    return {"grant": grant_id, "parent": parent_id, "root": root, "depth": depth,
+            "issuer": issuer, "subject": subject, "scope": g["scope"],
+            "constraints": constraints, "purpose": purpose, "purpose_tags": g["purpose_tags"],
+            "not_before": _iso(not_before), "not_after": _iso(not_after),
+            "delegations_left": delegations_left, "digest": digest,
+            "risk_accepted_by": risk_accepted_by,
+            "risk_accepted_at": _iso(g["risk_accepted_at"]),
+            "sealed_in_chain": audit_hash, "block_index": block_index, "receipt_seq": seq,
+            "note": "Sealed at issue. Any later edit to the stored grant changes its digest "
+                    "and fails integrity, so this grant cannot be widened after the fact."}, 200
+
+
+# ----------------------------------------------------------------------
+# revoke
+# ----------------------------------------------------------------------
+
+def _revoke(ctx, api_key, data):
+    grant_id = str(data.get("grant", "")).strip()
+    reason = str(data.get("reason", "revoked")).strip()[:200]
+    if not grant_id:
+        return {"error": "grant_required"}, 400
+    g = _get(ctx, grant_id)
+    if g is None:
+        return {"error": "grant_not_found", "grant": grant_id}, 404
+    existing = _revocation(ctx, grant_id)
+    if existing:
+        return {"already_revoked": True, "grant": grant_id, "revocation": existing}, 200
+
+    now = time.time()
+    ev = {"user_id": "cty:" + g["subject"][:32], "action": "authority_revoked", "amount": 0,
+          "country": "UK", "device_id": "lineage", "anomaly": 0, "device_risk": 0}
+    res = {"decision": "AUTHORITY_REVOKED", "score": 0, "continuity_version": VERSION,
+           "grant": grant_id, "reason": reason,
+           "detail": "grant=%s;reason=%s" % (grant_id, reason)}
+    audit_hash, block_index, seq = ctx["seal"](ev, res, now, api_key)
+
+    with ctx["lock"]:
+        ctx["conn"].execute("INSERT INTO auth_revoke(grant_id,reason,revoked,api_key,"
+                            "audit_hash,block_index) VALUES(?,?,?,?,?,?)",
+                            (grant_id, reason, now, api_key, audit_hash, block_index))
+        ctx["conn"].commit()
+
+    return {"grant": grant_id, "revoked_at": _iso(now), "reason": reason,
+            "sealed_in_chain": audit_hash, "block_index": block_index, "receipt_seq": seq,
+            "effect": "Transitive. Every grant derived from this one stops evaluating, without "
+                      "each descendant having to be found and revoked separately.",
+            "note": "Revocation does not rewrite history. Actions already evaluated and sealed "
+                    "under this grant remain exactly as they were decided."}, 200
+
+
+# ----------------------------------------------------------------------
+# exercise
+# ----------------------------------------------------------------------
+
+def _evaluate(ctx, api_key, data, seal=True):
+    now = time.time()
+    grant_id = str(data.get("grant", "")).strip()
+    action_raw = str(data.get("action", ""))
+    action = action_raw.strip()
+    params = data.get("params") or {}
+    declared_purpose = data.get("purpose_tag")
+    declared_purpose = str(declared_purpose).strip() if declared_purpose else None
+
+    if not grant_id or not action:
+        return {"error": "grant_and_action_required"}, 400
+    if not isinstance(params, dict):
+        return {"error": "params_must_be_an_object"}, 400
+    malformed_action = (action_raw != action) or not CAP_RE.match(action)
+
+    params_digest = hashlib.sha256(
+        EVAL_PREFIX + _canon({"action": action, "params": params}).encode("utf-8")).hexdigest()
+
+    hard = []          # any entry means BLOCK
+    soft = []          # any entry means CHALLENGE
+    broken_at = None
+    broken_invariant = None
+    lineage_view = []
+
+    chain, walk_error = _walk(ctx, grant_id)
+
+    if walk_error:
+        hard.append(walk_error["detail"])
+        broken_at = walk_error["grant"]
+        broken_invariant = walk_error["invariant"]
+        chain = []
+
+    def fail(grant, invariant, detail):
+        nonlocal broken_at, broken_invariant
+        hard.append(detail)
+        if broken_at is None:
+            broken_at, broken_invariant = grant, invariant
+
+    if chain:
+        root = chain[0]
+        if root["parent"] is not None:
+            fail(root["id"], "authority_continuity",
+                 "the lineage does not terminate at a parentless root")
+        if root["issuer_kind"] != "human":
+            fail(root["id"], "identity_continuity",
+                 "the root grant was not issued by a human principal")
+
+        previous = None
+        for g in chain:
+            entry = {"grant": g["id"], "depth": g["depth"], "issuer": g["issuer"],
+                     "issuer_kind": g["issuer_kind"], "subject": g["subject"],
+                     "scope": g["scope"], "constraints": g["constraints"],
+                     "purpose": g["purpose"], "purpose_tags": g["purpose_tags"],
+                     "window": [_iso(g["not_before"]), _iso(g["not_after"])],
+                     "risk_accepted_by": g.get("risk_accepted_by"),
+                     "digest": g["digest"], "block_index": g["block_index"]}
+
+            if _grant_digest(g) != g["digest"]:
+                fail(g["id"], "evidence_continuity",
+                     "grant %s does not match the digest sealed when it was issued" % g["id"])
+                entry["integrity"] = "FAILED"
+            else:
+                entry["integrity"] = "ok"
+
+            rev = _revocation(ctx, g["id"])
+            if rev:
+                fail(g["id"], "authority_continuity",
+                     "grant %s was revoked at %s" % (g["id"], rev["revoked_at"]))
+                entry["revoked"] = rev
+
+            if now < g["not_before"]:
+                fail(g["id"], "temporal_validity",
+                     "grant %s is not valid until %s" % (g["id"], _iso(g["not_before"])))
+            if now >= g["not_after"]:
+                fail(g["id"], "temporal_validity",
+                     "grant %s expired at %s" % (g["id"], _iso(g["not_after"])))
+
+            if previous is not None:
+                ok, why = _scope_subset(previous["scope"], g["scope"])
+                if not ok:
+                    fail(g["id"], "boundary_integrity", "%s: %s" % (g["id"], why))
+                ok, why = _constraints_narrower(previous["constraints"], g["constraints"])
+                if not ok:
+                    fail(g["id"], "boundary_integrity", "%s: %s" % (g["id"], why))
+                if not set(g["purpose_tags"]) <= set(previous["purpose_tags"]):
+                    extra = sorted(set(g["purpose_tags"]) - set(previous["purpose_tags"]))
+                    fail(g["id"], "intent_continuity",
+                         "%s carries purpose tags its parent does not: %s"
+                         % (g["id"], ", ".join(extra)))
+                if g["not_before"] < previous["not_before"] or g["not_after"] > previous["not_after"]:
+                    fail(g["id"], "temporal_validity",
+                         "%s is valid outside its parent's window" % g["id"])
+                if g["depth"] != previous["depth"] + 1:
+                    fail(g["id"], "authority_continuity",
+                         "%s records a depth inconsistent with its parent" % g["id"])
+
+            lineage_view.append(entry)
+            previous = g
+
+        if len(chain) - 1 > MAX_DEPTH:
+            fail(chain[-1]["id"], "boundary_integrity",
+                 "delegation depth %d exceeds the ceiling of %d" % (len(chain) - 1, MAX_DEPTH))
+
+        leaf = chain[-1]
+
+        # --- who owns the risk -------------------------------------------
+        accountable, accepted_at = _accountable(chain)
+        if not accountable:
+            fail(chain[0]["id"], "identity_continuity",
+                 "no grant in this lineage names who accepts the risk of the authority "
+                 "existing, so an incident has an actor but no accountable person")
+
+        # --- the action itself -------------------------------------------
+        if malformed_action:
+            fail(leaf["id"], "boundary_integrity",
+                 "the action as submitted is not a well-formed capability, so what would be "
+                 "sealed is not what was sent")
+        elif not any(_covers(cap, action) for cap in leaf["scope"]):
+            fail(leaf["id"], "boundary_integrity",
+                 "action '%s' is not within the scope of the grant exercised" % action)
+        else:
+            breadth = _wildcard_breadth(leaf["scope"], action)
+            if breadth and breadth >= 2:
+                soft.append("action '%s' is only covered by a wildcard %d levels broader than "
+                            "the action itself" % (action, breadth))
+
+        eff = _effective_constraints(chain)
+        failures, unconstrained = _params_against_constraints(params, eff)
+        for f in failures:
+            fail(leaf["id"], "boundary_integrity", f)
+        for u in unconstrained:
+            soft.append("parameter '%s' is not constrained anywhere in the lineage" % u)
+
+        if declared_purpose:
+            if declared_purpose not in leaf["purpose_tags"]:
+                soft.append("declared purpose '%s' is not carried by the grant, whose purpose is "
+                            "'%s'" % (declared_purpose, leaf["purpose"]))
+        else:
+            soft.append("the action declares no purpose, so intent compatibility with '%s' "
+                        "cannot be established either way" % leaf["purpose"])
+    else:
+        broken_invariant = broken_invariant or "authority_continuity"
+
+    if hard:
+        authority_verdict = "BLOCK"
+    elif soft:
+        authority_verdict = "CHALLENGE"
+    else:
+        authority_verdict = "ALLOW"
+
+    # --- compose with the existing engine --------------------------------
+    # Authority and risk answer different questions and neither overrides the
+    # other. A perfectly derived authority does not make a fraudulent payment
+    # safe, and a clean risk score does not confer authority nobody granted.
+    # The composed verdict is the worst of the two, so either can stop an
+    # action and neither can wave one through alone.
+    risk_verdict, risk_detail = None, {"available": False, "reason": "not consulted"}
+    if authority_verdict == "BLOCK":
+        risk_detail = {"available": False,
+                       "reason": "authority failed, so the action was never put to the engine"}
+    else:
+        # The engine's own signal names. Getting these wrong does not fail
+        # loudly - the scorer raises, the risk opinion goes missing, and every
+        # action drops to CHALLENGE. Defaults are neutral rather than
+        # flattering: an unstated signal should not improve a score.
+        engine_event = {
+            "user_id": (chain[-1]["subject"] if chain else "unknown")[:64],
+            "action": action,
+            "amount": params.get("amount", 0),
+            "country": params.get("country", "UK"),
+            "device_id": params.get("device_id", "agent"),
+            "trust": params.get("trust", 0.5),
+            "v60": params.get("v60", 0),
+            "v5m": params.get("v5m", 0),
+            "v1h": params.get("v1h", 0),
+            "anomaly": params.get("anomaly", 0),
+            "device_risk": params.get("device_risk", 0),
+            "country_shift": bool(params.get("country_shift", False)),
+        }
+        for field in ("amount", "trust", "v60", "v5m", "v1h", "anomaly", "device_risk"):
+            try:
+                engine_event[field] = _num(engine_event[field])
+            except (TypeError, ValueError):
+                engine_event[field] = 0
+        risk_verdict, risk_detail = _risk_opinion(engine_event)
+        if risk_verdict is None and authority_verdict == "ALLOW":
+            # The engine is part of the decision. Without its answer the
+            # decision is incomplete, and an incomplete decision is a
+            # CHALLENGE rather than a convenient ALLOW.
+            soft.append("the risk engine did not return a usable verdict (%s), so the action "
+                        "is not fully evaluated" % risk_detail.get("reason"))
+            authority_verdict = "CHALLENGE"
+
+    verdict = authority_verdict
+    if risk_verdict and RANK[risk_verdict] > RANK[verdict]:
+        verdict = risk_verdict
+
+    lineage_digest = hashlib.sha256(
+        EVAL_PREFIX + _canon([e.get("digest") for e in lineage_view]).encode("utf-8")).hexdigest()
+
+    horizon = min([g["not_after"] for g in chain] or [now])
+    valid_until = min(now + DEFAULT_WINDOW, horizon) if verdict == "ALLOW" else None
+
+    eval_id = "e_" + uuid.uuid4().hex[:20]
+    reasons = hard if hard else soft
+    out = {
+        "evaluation": eval_id,
+        "verdict": verdict,
+        "authority_verdict": authority_verdict,
+        "risk_verdict": risk_verdict,
+        "risk_engine": risk_detail,
+        "action": action,
+        "grant": grant_id,
+        "root": chain[0]["id"] if chain else None,
+        "authorised_by": chain[0]["issuer"] if chain else None,
+        "executed_by": chain[-1]["subject"] if chain else None,
+        "risk_accepted_by": (_accountable(chain)[0] if chain else None),
+        "risk_accepted_at": _iso(_accountable(chain)[1]) if chain else None,
+        "delegation_depth": (len(chain) - 1) if chain else None,
+        "lineage": lineage_view,
+        "lineage_digest": lineage_digest,
+        "params_digest": params_digest,
+        "effective_constraints": _effective_constraints(chain) if chain else {},
+        "reasons": reasons,
+        "broken_at": broken_at,
+        "broken_invariant": broken_invariant,
+        "evaluated_at": _iso(now),
+        "valid_until": _iso(valid_until) if valid_until else None,
+        "composition": "The verdict is the worse of the authority verdict and the existing "
+                       "engine's verdict. Authority answers whether the action could be "
+                       "derived from a human grant; the engine answers whether it should "
+                       "happen anyway. Neither can overrule the other.",
+        "what_this_means": {
+            "ALLOW": "Every invariant held and the engine agreed. The action is derivable "
+                     "from a valid human grant.",
+            "CHALLENGE": "Nothing is provably broken and nothing is provably fine. The "
+                         "uncertainty is named rather than resolved by guessing.",
+            "BLOCK": "At least one invariant failed, and the grant and invariant are named.",
+        }[verdict],
+    }
+
+    if seal:
+        ev = {"user_id": "cty:" + (chain[-1]["subject"][:32] if chain else "unknown"),
+              "action": "authority_evaluated", "amount": 0, "country": "UK",
+              "device_id": "lineage", "anomaly": 0,
+              "device_risk": 1 if verdict == "BLOCK" else 0}
+        res = {"decision": verdict, "score": 0, "continuity_version": VERSION,
+               "authority_verdict": authority_verdict, "risk_verdict": risk_verdict,
+               "evaluation": eval_id, "grant": grant_id, "action": action,
+               "risk_accepted_by": (_accountable(chain)[0] if chain else None),
+               "lineage_digest": lineage_digest, "params_digest": params_digest,
+               "broken_at": broken_at, "broken_invariant": broken_invariant,
+               "detail": "eval=%s;verdict=%s;authority=%s;risk=%s;grant=%s;action=%s;"
+                         "lineage=%s;params=%s"
+                         % (eval_id, verdict, authority_verdict, risk_verdict or "n/a",
+                            grant_id, action, lineage_digest, params_digest)}
+        audit_hash, block_index, seq = ctx["seal"](ev, res, now, api_key)
+        with ctx["lock"]:
+            ctx["conn"].execute(
+                "INSERT INTO auth_eval(id,grant_id,action,params_digest,lineage_digest,"
+                "verdict,reasons,broken_at,broken_invariant,evaluated,valid_until,"
+                "audit_hash,block_index,api_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (eval_id, grant_id, action, params_digest, lineage_digest, verdict,
+                 _canon(reasons), broken_at, broken_invariant, now, valid_until,
+                 audit_hash, block_index, api_key))
+            ctx["conn"].commit()
+        out["sealed_in_chain"] = audit_hash
+        out["block_index"] = block_index
+        out["receipt_seq"] = seq
+        out["note"] = ("Sealed whether it allowed or blocked. A refusal that leaves no record "
+                       "is indistinguishable from never having been asked.")
+
+    return out, 200
+
+
+# ----------------------------------------------------------------------
+# confirm - closing the gap between decision and execution
+# ----------------------------------------------------------------------
+
+def _confirm(ctx, api_key, data):
+    """Bind an execution to the evaluation that permitted it.
+
+    Without this, an ALLOW is a decision about a request that may never
+    have been the request executed. The parameter digest is re-derived from
+    what actually ran and compared, and the window is enforced, so an
+    evaluation cannot be banked and spent later against different values.
+    """
+    eval_id = str(data.get("evaluation", "")).strip()
+    outcome = str(data.get("outcome", "executed")).strip()[:60]
+    action = str(data.get("action", "")).strip()
+    params = data.get("params") or {}
+    if not eval_id:
+        return {"error": "evaluation_required"}, 400
+
+    with ctx["lock"]:
+        row = ctx["conn"].execute(
+            "SELECT grant_id,action,params_digest,verdict,valid_until,lineage_digest "
+            "FROM auth_eval WHERE id=?", (eval_id,)).fetchone()
+    if not row:
+        return {"error": "evaluation_not_found", "evaluation": eval_id}, 404
+    grant_id, eval_action, params_digest, verdict, valid_until, lineage_digest = row
+
+    now = time.time()
+    problems = []
+    if verdict != "ALLOW":
+        problems.append("the evaluation returned %s, which does not permit execution" % verdict)
+
+    with ctx["lock"]:
+        spent = ctx["conn"].execute(
+            "SELECT confirmed FROM auth_exec WHERE eval_id=? AND outcome<>'rejected' "
+            "ORDER BY id ASC LIMIT 1", (eval_id,)).fetchone()
+    if spent:
+        problems.append("this evaluation was already bound to an execution at %s. One decision "
+                        "authorises one action; a second would be an unauthorised repeat wearing "
+                        "the first one's evidence." % _iso(spent[0]))
+    if valid_until and now > valid_until:
+        problems.append("the evaluation expired at %s and must be re-run" % _iso(valid_until))
+
+    actual = hashlib.sha256(EVAL_PREFIX + _canon(
+        {"action": action or eval_action, "params": params}).encode("utf-8")).hexdigest()
+    if action and params and actual != params_digest:
+        problems.append("the executed parameters do not match the parameters evaluated")
+
+    # Claim the binding before sealing it. Sealing first would put an
+    # EXECUTION_BOUND record in the chain for an execution that the database
+    # then refuses, and a chain that disagrees with the system it describes is
+    # worse than no chain.
+    accepted = not problems
+    row_id = None
+    if accepted:
+        try:
+            with ctx["lock"]:
+                cur = ctx["conn"].execute(
+                    "INSERT INTO auth_exec(eval_id,outcome,params_digest,confirmed) "
+                    "VALUES(?,?,?,?)", (eval_id, outcome, actual, now))
+                row_id = cur.lastrowid
+                ctx["conn"].commit()
+        except sqlite3.IntegrityError:
+            accepted = False
+            problems.append("a concurrent request bound this evaluation first. The race was "
+                            "settled by a unique index rather than by application logic, so "
+                            "only one of them can ever have executed.")
+    if not accepted:
+        with ctx["lock"]:
+            cur = ctx["conn"].execute(
+                "INSERT INTO auth_exec(eval_id,outcome,params_digest,confirmed) "
+                "VALUES(?,?,?,?)", (eval_id, "rejected", actual, now))
+            row_id = cur.lastrowid
+            ctx["conn"].commit()
+
+    ev = {"user_id": "cty:exec", "action": "authority_execution", "amount": 0,
+          "country": "UK", "device_id": "lineage", "anomaly": 0,
+          "device_risk": 0 if accepted else 1}
+    res = {"decision": "EXECUTION_BOUND" if accepted else "EXECUTION_REJECTED", "score": 0,
+           "continuity_version": VERSION, "evaluation": eval_id, "grant": grant_id,
+           "outcome": outcome if accepted else "rejected", "params_digest": actual,
+           "lineage_digest": lineage_digest,
+           "detail": "eval=%s;bound=%s;params=%s" % (eval_id, accepted, actual)}
+    audit_hash, block_index, seq = ctx["seal"](ev, res, now, api_key)
+
+    with ctx["lock"]:
+        ctx["conn"].execute("UPDATE auth_exec SET audit_hash=?,block_index=? WHERE id=?",
+                            (audit_hash, block_index, row_id))
+        ctx["conn"].commit()
+
+    return {"evaluation": eval_id, "bound": accepted, "problems": problems,
+            "grant": grant_id, "outcome": outcome if accepted else "rejected",
+            "params_digest": actual, "expected_params_digest": params_digest,
+            "sealed_in_chain": audit_hash, "block_index": block_index, "receipt_seq": seq,
+            "note": "The rejection is sealed too. An execution that failed to bind is evidence, "
+                    "not an absence of evidence."}, 200 if accepted else 409
+
+
+# ----------------------------------------------------------------------
+# read-only
+# ----------------------------------------------------------------------
+
+def _trace(ctx, data):
+    grant_id = str(data.get("grant", "")).strip()
+    if not grant_id:
+        return {"error": "grant_required"}, 400
+    chain, err = _walk(ctx, grant_id)
+    if err:
+        return {"error": "lineage_broken", "detail": err}, 409
+    out = []
+    for g in chain:
+        rev = _revocation(ctx, g["id"])
+        out.append({"grant": g["id"], "depth": g["depth"], "parent": g["parent"],
+                    "issuer": g["issuer"], "issuer_kind": g["issuer_kind"],
+                    "subject": g["subject"], "subject_kind": g["subject_kind"],
+                    "scope": g["scope"], "constraints": g["constraints"],
+                    "purpose": g["purpose"], "purpose_tags": g["purpose_tags"],
+                    "window": [_iso(g["not_before"]), _iso(g["not_after"])],
+                    "delegations_left": g["delegations_left"],
+                    "risk_accepted_by": g.get("risk_accepted_by"),
+                    "risk_accepted_at": _iso(g.get("risk_accepted_at")),
+                    "integrity": "ok" if _grant_digest(g) == g["digest"] else "FAILED",
+                    "revoked": rev, "digest": g["digest"],
+                    "sealed_in_chain": g["audit_hash"], "block_index": g["block_index"]})
+    accountable, accepted_at = _accountable(chain)
+    return {"grant": grant_id, "root": chain[0]["id"], "depth": len(chain) - 1,
+            "authorised_by": chain[0]["issuer"], "holder": chain[-1]["subject"],
+            "risk_accepted_by": accountable, "risk_accepted_at": _iso(accepted_at),
+            "lineage": out,
+            "effective_constraints": _effective_constraints(chain),
+            "note": "Root first. Every hop is a sealed record with its own block index, so the "
+                    "path can be checked against the chain rather than against this answer."}, 200
+
+
+def _decision(ctx, data):
+    eval_id = str(data.get("evaluation", "")).strip()
+    if not eval_id:
+        return {"error": "evaluation_required"}, 400
+    with ctx["lock"]:
+        row = ctx["conn"].execute(
+            "SELECT id,grant_id,action,params_digest,lineage_digest,verdict,reasons,"
+            "broken_at,broken_invariant,evaluated,valid_until,audit_hash,block_index "
+            "FROM auth_eval WHERE id=?", (eval_id,)).fetchone()
+    if not row:
+        return {"error": "evaluation_not_found"}, 404
+    return {"evaluation": row[0], "grant": row[1], "action": row[2],
+            "params_digest": row[3], "lineage_digest": row[4], "verdict": row[5],
+            "reasons": json.loads(row[6]) if row[6] else [], "broken_at": row[7],
+            "broken_invariant": row[8], "evaluated_at": _iso(row[9]),
+            "valid_until": _iso(row[10]), "sealed_in_chain": row[11],
+            "block_index": row[12]}, 200
+
+
+def _decisions(ctx, data):
+    """Recent sealed authority decisions, readable without a key.
+
+    The point of publishing this is not the list. It is that a stranger can
+    pick any id off it and pull the full decision and the full lineage at
+    /x/continuity/decision and /x/continuity/trace, on real traffic, without
+    an account - including the ones that escalated rather than executed.
+
+    Deliberately thin. Verdict, which invariant broke, and where it sits in
+    the chain. No scopes, no subjects, no parameters: what is being made
+    checkable is that authority was enforced, not what anybody was doing.
+    """
+    try:
+        limit = max(1, min(int(data.get("limit", 50)), 200))
+    except (TypeError, ValueError):
+        limit = 50
+
+    with ctx["lock"]:
+        rows = ctx["conn"].execute(
+            "SELECT id,verdict,broken_invariant,evaluated,block_index FROM auth_eval "
+            "ORDER BY evaluated DESC LIMIT ?", (limit,)).fetchall()
+        counts = ctx["conn"].execute(
+            "SELECT verdict,COUNT(*) FROM auth_eval GROUP BY verdict").fetchall()
+
+    tally = {v: n for v, n in counts}
+    return {"count": len(rows),
+            "decisions": [{"evaluation": r[0], "verdict": r[1],
+                           "broken_invariant": r[2], "evaluated_at": _iso(r[3]),
+                           "block_index": r[4]} for r in rows],
+            "totals": {"allowed": tally.get("ALLOW", 0),
+                       "challenged": tally.get("CHALLENGE", 0),
+                       "blocked": tally.get("BLOCK", 0)},
+            "open_any_of_them": "/x/continuity/decision?evaluation=<id> for the decision, "
+                                "/x/continuity/trace?grant=<grant> for the authority path",
+            "why_the_blocks_are_here": "A refusal that leaves no public record is "
+                                       "indistinguishable from never having been asked. Every "
+                                       "verdict is listed, including ours going wrong.",
+            "what_this_is_not": "This is not a demonstration run for visitors. These are real "
+                                "evaluations from real traffic, and an empty list means no "
+                                "authority has been exercised yet rather than that none failed."}, 200
+
+
+def _spec():
+    return {
+        "continuity_version": VERSION,
+        "invariants": {
+            "identity_continuity": "every grant names issuer and subject; a root must be issued "
+                                   "by a human principal",
+            "authority_continuity": "every non-root grant points at a parent, the walk terminates "
+                                    "at a root, and no ancestor is revoked",
+            "boundary_integrity": "scope is a subset of the parent's, constraints are at least as "
+                                  "tight on every axis, onward delegations decrease",
+            "intent_continuity": "purpose tags narrow; an action outside them is challenged, not "
+                                 "assumed",
+            "temporal_validity": "every ancestor is inside its window at the instant of "
+                                 "evaluation, not at the instant of issue",
+            "evidence_continuity": "every grant, revocation, evaluation and execution binding is "
+                                   "sealed in the AILeash chain",
+            "risk_acceptance": "every lineage names a person who accepts the risk of the "
+                               "authority existing, separately from who granted it and who "
+                               "holds it. A grant that lets its holder delegate onward must "
+                               "name its own acceptor rather than inherit one, because that "
+                               "risk did not exist when the acceptor above signed up to it",
+        },
+        "scope_grammar": "dot-separated capabilities. 'a.b.*' covers 'a.b' and anything beneath "
+                         "it. '*' covers everything and always challenges.",
+        "constraint_grammar": {
+            "max_*": "child <= parent; action value must not exceed the tightest in the lineage",
+            "min_*": "child >= parent",
+            "allowed_*": "child set is a subset of the parent set",
+            "denied_*": "child set is a superset of the parent set",
+            "may_*": "child may be true only where the parent is true",
+            "unknown": "a key matching no rule, or absent from the parent, is refused rather "
+                       "than guessed at",
+        },
+        "verdicts": {
+            "ALLOW": "no invariant failed and no uncertainty remained",
+            "CHALLENGE": "no invariant failed but intent, breadth or an unconstrained dimension "
+                         "left a question a machine should not answer alone",
+            "BLOCK": "an invariant failed; the response names the grant and the invariant",
+        },
+        "no_union": "one action derives from one lineage. Grants are never combined, because two "
+                    "narrow authorities that jointly exceed either is the oldest escalation there "
+                    "is.",
+        "digest": "sha256('AILEASH-GRANT-v1:' || canonical JSON of the grant's semantic fields, "
+                  "keys sorted, no whitespace). Parent is inside the digest, so re-parenting is "
+                  "detectable.",
+        "why_published": "An authority decision nobody can re-derive is an assertion. These rules "
+                         "are sufficient to reimplement the evaluator and disagree with us.",
+    }, 200
+
+
+# ----------------------------------------------------------------------
+# router entry point
+# ----------------------------------------------------------------------
+
+def handle(method, action, data, api_key, ctx):
+    _setup(ctx)
+    action = (action or "").strip("/").lower()
+    data = data or {}
+
+    if method == "GET":
+        if action == "spec":
+            return _spec()
+        if action == "trace":
+            return _trace(ctx, data)
+        if action == "decision":
+            return _decision(ctx, data)
+        if action == "decisions":
+            return _decisions(ctx, data)
+
+    if method == "POST":
+        if not api_key:
+            return {"error": "invalid_api_key"}, 401
+        if action == "issue":
+            return _issue(ctx, api_key, data)
+        if action == "revoke":
+            return _revoke(ctx, api_key, data)
+        if action == "exercise":
+            return _evaluate(ctx, api_key, data)
+        if action == "confirm":
+            return _confirm(ctx, api_key, data)
+
+    return {"error": "unknown_action", "action": action,
+            "GET": ["spec", "trace", "decision", "decisions"],
+            "POST": ["issue", "revoke", "exercise", "confirm"]}, 404
+
+```
 
 
 ## `modules/_ _ i n i t _ _ . p y`
@@ -904,1221 +2258,5 @@ def handle(method, action, data, api_key, ctx):
     return {"error": "unknown_action", "action": action,
             "GET": ["spec", "history", "root", "manifest (keyed)"],
             "POST": ["seal (keyed)"]}, 404
-
-```
-
-
-## `modules/complete.py`
-
-862 lines, 37023 bytes
-
-```python
-#!/usr/bin/env python3
-"""
-modules/complete.py  -  proving what ISN'T there
-================================================
-
-THE PROBLEM NOBODY IN THIS MARKET ANSWERS
------------------------------------------
-A hash chain proves inclusion. It cannot prove exclusion.
-
-So when a firm hands an auditor four hundred decisions, nothing on earth
-shows it wasn't six hundred. Every audit ever conducted runs on the
-assumption that the sample handed over is the whole set, and that
-assumption has never once been provable. The chain says "these four
-hundred happened". It says nothing about the two hundred that also
-happened and quietly didn't make the export.
-
-Three questions follow, and none of them can be answered by an
-append-only log on its own:
-
-  1. Is this the complete set, or the flattering subset?
-  2. Do you hold a record about me? Prove the NO.
-  3. You erased my data - prove it, without holding my data to prove it.
-
-Question 3 is the contradiction sitting inside every
-blockchain-for-compliance product, this one included. Append-only and
-right-to-erasure do not obviously coexist. Most vendors disclaim it.
-
-WHAT THIS DOES
---------------
-At the end of each period we take every leaf sealed in that period, SORT
-them, build a Merkle tree over the sorted list, and seal the root plus the
-exact count into the chain. That root is then anchored externally like
-everything else.
-
-Sorting is the whole trick. In an unsorted tree you can only prove a leaf
-is present. In a sorted one you can prove a leaf is absent, by showing the
-two leaves either side of where it would have sorted and proving they are
-ADJACENT in the tree. Nothing can sit between two adjacent leaves. The
-record provably does not exist.
-
-  INCLUSION     standard Merkle path. This receipt is in the period.
-  ABSENCE       the two neighbours, and proof they are adjacent. No record
-                for that key exists in the period, and we cannot pretend
-                otherwise after the fact.
-  COMPLETENESS  the count was sealed BEFORE anyone asked for anything.
-                Hand over four hundred against a root that says six
-                hundred and the arithmetic exposes it.
-
-ERASURE
--------
-Erasing a record deletes the payload and leaves the leaf as a tombstone.
-We can then prove: a record existed, it was erased, and when - while
-holding none of the erased content. The subject gets a proof of erasure
-rather than a promise of one, and the chain does not have to be broken to
-give it to them.
-
-WHY COMMITMENTS ARE FROZEN
---------------------------
-A commitment is only worth anything if it cannot be recomputed to suit
-later circumstances. So:
-
-  - Only CLOSED periods can be committed. You cannot commit a period that
-    is still running, because more leaves could still arrive.
-  - The sorted leaf list is STORED at commit time, not recomputed on
-    demand. If rows are erased next year, the proofs from this year still
-    verify against the root that was sealed and anchored this year.
-  - A period can only be committed once. A second attempt returns the
-    existing commitment rather than a new root.
-
-WHY COMMITTING IS AUTOMATIC
----------------------------
-It was not, and that was a real hole rather than an oversight worth
-defending. Committing was a keyed POST somebody had to remember to make,
-which meant that for the first week of publication this module had zero
-committed periods while the discovery document advertised completeness and
-absence as publicly demonstrable checks. Both were true claims about code
-that existed and false claims about anything an outsider could run.
-
-A control that depends on the operator remembering to run it is the exact
-control an auditor should distrust, so the schedule now runs itself. Once
-a month closes, the first request to reach this module commits it.
-
-Two honest limits on that:
-
-  - The automatic commitment is DEPLOYMENT-WIDE. It covers every record
-    sealed in the period regardless of which key sealed it, because that
-    is what a public completeness claim has to mean. Per-tenant
-    commitments are still made by POSTing /x/complete/commit with that
-    tenant's key, and the two live side by side.
-  - A period committed late is committed at the date it was actually
-    committed, and /x/complete/periods reports the gap in days. Backfilled
-    history still proves the count was fixed before any export was asked
-    for. It does not prove the count was fixed when the period closed, and
-    nothing published here will claim it does.
-
-HONEST LIMITS
--------------
-  - This proves completeness of what was SEALED. A decision that never
-    reached the chain at all is outside anything we can see. Garbage in
-    still applies; what changes is that the operator can no longer choose
-    which of the sealed records to show.
-  - Absence proofs are scoped to a period. "No record of you, ever"
-    means checking every period, which is why the period list is public.
-  - The tree is built over key material only. It never contains payloads,
-    so a leaf reveals whether something exists, not what it said.
-  - Adjacent-leaf absence proofs disclose the two neighbouring keys. If
-    keys are themselves sensitive, hash them before they become leaves -
-    the proof still works, and we hold nothing legible.
-
-    POST /x/complete/commit    close and seal a period      (keyed)
-    POST /x/complete/erase     tombstone a leaf             (keyed)
-    GET  /x/complete/periods   every sealed period          (public)
-    GET  /x/complete/root      root, count, block index     (public)
-    GET  /x/complete/prove     inclusion or absence proof   (public)
-    POST /x/complete/verify    check a proof we handed out  (public)
-    GET  /x/complete/spec      the exact hashing rules      (public)
-"""
-
-import hashlib
-import json
-import re
-import time
-from datetime import datetime, timezone, timedelta
-
-VERSION = "1.1"
-HEX64 = re.compile(r"^[0-9a-f]{64}$")
-
-# A third party must be able to check completeness without an account. A
-# completeness claim you have to hold credentials to verify is not a
-# completeness claim, it is a marketing line.
-PUBLIC = {("GET", "periods"), ("GET", "root"), ("GET", "prove"),
-          ("GET", "spec"), ("POST", "verify")}
-
-# Domain separation. Leaf and node hashes must never be confusable, or an
-# attacker can present an internal node as though it were a leaf.
-LEAF_PREFIX = b"AILEASH-LEAF-v1:"
-NODE_PREFIX = b"AILEASH-NODE-v1:"
-
-MAX_LEAVES = 200000
-
-# ---- automatic commitment --------------------------------------------
-AUTO_COMMIT = True          # set False to go back to committing by hand
-AUTO_KINDS = ("receipts", "subjects")
-AUTO_INTERVAL = 600         # seconds between sweeps, not per request
-AUTO_MAX_MONTHS = 24        # how far back a first run will backfill
-
-# The deployment-wide commitment is stored under an empty key, which is
-# also what an unauthenticated read looks for. Not a magic value with
-# privileges - the absence of a key, meaning "everything sealed here".
-AUTO_KEY = ""
-
-_last_auto = [0.0]
-_auto_log = []              # recent sweep outcomes, surfaced on /periods
-
-_ready = False
-
-
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        c = ctx["conn"]
-        c.execute("CREATE TABLE IF NOT EXISTS complete_commit("
-                  "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,period TEXT,kind TEXT,"
-                  "root TEXT,leaf_count INTEGER,period_start REAL,period_end REAL,"
-                  "committed REAL,audit_hash TEXT,block_index INTEGER)")
-        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_cmp_unique "
-                  "ON complete_commit(api_key,period,kind)")
-        c.execute("CREATE TABLE IF NOT EXISTS complete_leaf("
-                  "commit_id INTEGER,idx INTEGER,leaf TEXT)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_cmp_leaf "
-                  "ON complete_leaf(commit_id,idx)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_cmp_leaf_val "
-                  "ON complete_leaf(commit_id,leaf)")
-        c.execute("CREATE TABLE IF NOT EXISTS complete_tomb("
-                  "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,leaf TEXT,"
-                  "reason TEXT,erased REAL,audit_hash TEXT,block_index INTEGER)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_cmp_tomb ON complete_tomb(api_key,leaf)")
-        c.commit()
-    _ready = True
-
-
-def _audit_columns(ctx):
-    """What the audit_log actually looks like on this deployment.
-
-    Read rather than assumed - the schema has moved before and will again,
-    and a completeness module that guesses column names is worse than none.
-    """
-    have = []
-    try:
-        with ctx["lock"]:
-            for row in ctx["conn"].execute("PRAGMA table_info(audit_log)").fetchall():
-                have.append(row[1])
-    except Exception:
-        pass
-    return have
-
-
-def _iso(ts):
-    if not ts:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
-
-# ----------------------------------------------------------------------
-# periods
-# ----------------------------------------------------------------------
-
-def _period_bounds(period):
-    """Turn a period label into [start, end) as epoch seconds.
-
-    Accepts  2026, 2026-08, 2026-08-02, 2026-Q3.
-    Returns (start, end, None) or (None, None, why).
-    """
-    period = (period or "").strip().upper()
-
-    def _utc(y, m, d):
-        return datetime(y, m, d, tzinfo=timezone.utc).timestamp()
-
-    try:
-        m = re.match(r"^(\d{4})$", period)
-        if m:
-            y = int(m.group(1))
-            return _utc(y, 1, 1), _utc(y + 1, 1, 1), None
-
-        m = re.match(r"^(\d{4})-Q([1-4])$", period)
-        if m:
-            y, q = int(m.group(1)), int(m.group(2))
-            start_month = (q - 1) * 3 + 1
-            end_month = start_month + 3
-            if end_month > 12:
-                return _utc(y, start_month, 1), _utc(y + 1, 1, 1), None
-            return _utc(y, start_month, 1), _utc(y, end_month, 1), None
-
-        m = re.match(r"^(\d{4})-(\d{2})$", period)
-        if m:
-            y, mo = int(m.group(1)), int(m.group(2))
-            if not 1 <= mo <= 12:
-                return None, None, "month out of range"
-            if mo == 12:
-                return _utc(y, 12, 1), _utc(y + 1, 1, 1), None
-            return _utc(y, mo, 1), _utc(y, mo + 1, 1), None
-
-        m = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", period)
-        if m:
-            y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
-            start = datetime(y, mo, d, tzinfo=timezone.utc)
-            return start.timestamp(), (start + timedelta(days=1)).timestamp(), None
-    except ValueError as exc:
-        return None, None, "unreadable period (%s)" % exc
-
-    return None, None, "period must be YYYY, YYYY-MM, YYYY-MM-DD or YYYY-Qn"
-
-
-# ----------------------------------------------------------------------
-# the tree
-# ----------------------------------------------------------------------
-
-def _leaf_hash(value):
-    return hashlib.sha256(LEAF_PREFIX + value.encode("utf-8")).hexdigest()
-
-
-def _node_hash(left, right):
-    return hashlib.sha256(NODE_PREFIX + left.encode() + right.encode()).hexdigest()
-
-
-def _build(leaves):
-    """Build the tree over already-sorted leaf VALUES.
-
-    Returns (root, levels). levels[0] is the leaf-hash level. An odd node
-    at any level is promoted unchanged to the next - it is never paired
-    with itself, which is the classic duplication weakness.
-    """
-    if not leaves:
-        return hashlib.sha256(LEAF_PREFIX + b"EMPTY").hexdigest(), []
-
-    level = [_leaf_hash(v) for v in leaves]
-    levels = [level]
-    while len(level) > 1:
-        nxt = []
-        for i in range(0, len(level) - 1, 2):
-            nxt.append(_node_hash(level[i], level[i + 1]))
-        if len(level) % 2 == 1:
-            nxt.append(level[-1])
-        levels.append(nxt)
-        level = nxt
-    return level[0], levels
-
-
-def _path(levels, index):
-    """Sibling path for a leaf index. Each step says which side to hash on."""
-    proof = []
-    idx = index
-    for level in levels[:-1]:
-        if idx % 2 == 0:
-            sibling = idx + 1
-            if sibling < len(level):
-                proof.append({"side": "right", "hash": level[sibling]})
-            # No sibling means this node was promoted - nothing to hash.
-        else:
-            proof.append({"side": "left", "hash": level[idx - 1]})
-        idx //= 2
-    return proof
-
-
-def _replay(leaf_value, proof):
-    """Recompute a root from a leaf and its path. This is what a verifier
-    runs, and it is deliberately five lines so anyone can reimplement it."""
-    current = _leaf_hash(leaf_value)
-    for step in proof:
-        if step.get("side") == "left":
-            current = _node_hash(step["hash"], current)
-        else:
-            current = _node_hash(current, step["hash"])
-    return current
-
-
-# ----------------------------------------------------------------------
-# reading leaves out of the audit log
-# ----------------------------------------------------------------------
-
-def _collect(ctx, api_key, start, end, kind, columns):
-    """Every distinct leaf sealed in [start, end).
-
-    kind = receipts  -> the audit hash of each sealed decision
-    kind = subjects  -> the distinct subject each decision was about, so
-                        "do you hold anything on me" becomes answerable
-
-    A falsy api_key means no scoping: every record sealed on this
-    deployment in the window. That is what the automatic commitment uses,
-    and what a public completeness claim has to cover.
-    """
-    if "ts" not in columns:
-        return None, "audit_log has no ts column on this deployment"
-
-    if kind == "receipts":
-        if "audit_hash" not in columns:
-            return None, "audit_log has no audit_hash column"
-        field = "audit_hash"
-    else:
-        field = None
-        for candidate in ("user_id", "subject", "subject_id", "customer_id"):
-            if candidate in columns:
-                field = candidate
-                break
-        if not field:
-            return None, "no subject column on this deployment - receipts only"
-
-    scoped = "api_key" in columns and api_key
-    sql = "SELECT DISTINCT %s FROM audit_log WHERE ts>=? AND ts<?" % field
-    args = [start, end]
-    if scoped:
-        sql += " AND api_key=?"
-        args.append(api_key)
-
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(sql, tuple(args)).fetchall()
-
-    values = sorted({str(r[0]) for r in rows if r[0] is not None})
-    if len(values) > MAX_LEAVES:
-        return None, "period holds %d leaves, above the %d cap" % (len(values), MAX_LEAVES)
-    return values, None
-
-
-# ----------------------------------------------------------------------
-# commit
-# ----------------------------------------------------------------------
-
-def _commit(ctx, api_key, data):
-    period = str(data.get("period", "")).strip()
-    kind = str(data.get("kind", "receipts")).strip().lower()
-    if kind not in ("receipts", "subjects"):
-        return {"error": "bad_kind", "message": "kind is receipts or subjects"}, 400
-
-    start, end, why = _period_bounds(period)
-    if why:
-        return {"error": "bad_period", "message": why}, 400
-
-    now = time.time()
-    if end > now:
-        return {"error": "period_open",
-                "message": "That period has not finished. Committing a live period would let "
-                           "later entries change the root, which defeats the point.",
-                "closes_at": _iso(end)}, 409
-
-    with ctx["lock"]:
-        existing = ctx["conn"].execute(
-            "SELECT root,leaf_count,committed,audit_hash,block_index FROM complete_commit "
-            "WHERE api_key=? AND period=? AND kind=?", (api_key, period, kind)).fetchone()
-    if existing:
-        return {"already_committed": True, "period": period, "kind": kind,
-                "root": existing[0], "leaf_count": existing[1],
-                "committed_at": _iso(existing[2]),
-                "sealed_in_chain": existing[3], "block_index": existing[4],
-                "message": "A period is committed once. Recommitting is how a commitment "
-                           "stops meaning anything."}, 200
-
-    columns = _audit_columns(ctx)
-    leaves, why = _collect(ctx, api_key, start, end, kind, columns)
-    if why:
-        return {"error": "cannot_collect", "message": why}, 400
-
-    root, levels = _build(leaves)
-
-    scope = "deployment" if not api_key else "key"
-    late_days = round(max(0.0, (now - end)) / 86400.0, 1)
-
-    ev = {"user_id": "cmp:" + period, "action": "completeness_committed", "amount": 0,
-          "country": "UK", "device_id": "complete", "anomaly": 0, "device_risk": 0}
-    res = {"decision": "COMPLETENESS_SEALED", "score": 0, "complete_version": VERSION,
-           "period": period, "kind": kind, "root": root, "leaf_count": len(leaves),
-           "period_start": start, "period_end": end, "scope": scope,
-           "days_after_period_end": late_days,
-           "detail": "period=%s;kind=%s;scope=%s;root=%s;count=%d;late_days=%s"
-                     % (period, kind, scope, root, len(leaves), late_days)}
-    audit_hash, block_index, seq = ctx["seal"](ev, res, now, api_key)
-
-    with ctx["lock"]:
-        c = ctx["conn"]
-        c.execute("INSERT INTO complete_commit(api_key,period,kind,root,leaf_count,"
-                  "period_start,period_end,committed,audit_hash,block_index) "
-                  "VALUES(?,?,?,?,?,?,?,?,?,?)",
-                  (api_key, period, kind, root, len(leaves), start, end, now,
-                   audit_hash, block_index))
-        commit_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
-        c.executemany("INSERT INTO complete_leaf(commit_id,idx,leaf) VALUES(?,?,?)",
-                      [(commit_id, i, v) for i, v in enumerate(leaves)])
-        c.commit()
-
-    return {"period": period, "kind": kind, "root": root, "leaf_count": len(leaves),
-            "period_start": _iso(start), "period_end": _iso(end),
-            "committed_at": _iso(now), "sealed_in_chain": audit_hash,
-            "block_index": block_index, "receipt_seq": seq,
-            "scope": scope, "days_after_period_end": late_days,
-            "frozen": "The sorted leaf list is stored as committed. Later erasures cannot "
-                      "change what this root proved.",
-            "message": "%d leaves committed. Any export from this period claiming a different "
-                       "total now contradicts a sealed, externally anchored number."
-                       % len(leaves)}, 200
-
-
-# ----------------------------------------------------------------------
-# automatic commitment
-# ----------------------------------------------------------------------
-
-def _closed_months(first_ts, now):
-    """Every whole month between the first sealed record and this one.
-
-    The current month is excluded because it is still running, which is
-    the same rule a manual commit is held to.
-    """
-    try:
-        first = datetime.fromtimestamp(first_ts, tz=timezone.utc)
-        current = datetime.fromtimestamp(now, tz=timezone.utc)
-    except Exception:
-        return []
-
-    labels = []
-    y, m = first.year, first.month
-    while (y, m) < (current.year, current.month):
-        labels.append("%04d-%02d" % (y, m))
-        m += 1
-        if m > 12:
-            m = 1
-            y += 1
-        if len(labels) > 600:
-            break
-    return labels[-AUTO_MAX_MONTHS:]
-
-
-def _auto_commit(ctx):
-    """Commit any closed month that nobody has committed yet.
-
-    Runs on request rather than on a thread. A sleeping container has no
-    timer worth trusting, and this way the sweep happens before the answer
-    that depends on it - including for the auditor whose visit to
-    /x/complete/periods is what triggered it.
-    """
-    if not AUTO_COMMIT:
-        return
-
-    now = time.time()
-    if now - _last_auto[0] < AUTO_INTERVAL:
-        return
-    _last_auto[0] = now
-
-    columns = _audit_columns(ctx)
-    if "ts" not in columns:
-        return
-
-    try:
-        with ctx["lock"]:
-            row = ctx["conn"].execute("SELECT MIN(ts) FROM audit_log").fetchone()
-    except Exception:
-        return
-    if not row or not row[0]:
-        return
-
-    months = _closed_months(row[0], now)
-    if not months:
-        return
-
-    try:
-        with ctx["lock"]:
-            done = {(r[0], r[1]) for r in ctx["conn"].execute(
-                "SELECT period,kind FROM complete_commit WHERE api_key=?",
-                (AUTO_KEY,)).fetchall()}
-    except Exception:
-        done = set()
-
-    for period in months:
-        for kind in AUTO_KINDS:
-            if (period, kind) in done:
-                continue
-            try:
-                body, code = _commit(ctx, AUTO_KEY, {"period": period, "kind": kind})
-            except Exception as exc:
-                _note_auto(period, kind, "failed: " + str(exc)[:120])
-                continue
-            if code == 200 and not body.get("already_committed"):
-                _note_auto(period, kind, "committed %d leaves %s days after the period closed"
-                           % (body.get("leaf_count", 0), body.get("days_after_period_end")))
-            elif code != 200:
-                # A deployment with no subject column cannot do kind=subjects.
-                # That is a real limit of the deployment, recorded rather than
-                # retried every ten minutes.
-                _note_auto(period, kind, "skipped: " + str(body.get("message")
-                                                           or body.get("error"))[:120])
-
-
-def _note_auto(period, kind, outcome):
-    _auto_log.append({"at": _iso(time.time()), "period": period,
-                      "kind": kind, "outcome": outcome})
-    del _auto_log[:-40]
-    print("COMPLETE: auto %s/%s - %s" % (period, kind, outcome), flush=True)
-
-
-# ----------------------------------------------------------------------
-# proofs
-# ----------------------------------------------------------------------
-
-def _load(ctx, api_key, period, kind):
-    with ctx["lock"]:
-        if api_key:
-            row = ctx["conn"].execute(
-                "SELECT id,root,leaf_count,committed,audit_hash,block_index,period_start,period_end "
-                "FROM complete_commit WHERE api_key=? AND period=? AND kind=?",
-                (api_key, period, kind)).fetchone()
-        else:
-            row = ctx["conn"].execute(
-                "SELECT id,root,leaf_count,committed,audit_hash,block_index,period_start,period_end "
-                "FROM complete_commit WHERE period=? AND kind=? ORDER BY id ASC LIMIT 1",
-                (period, kind)).fetchone()
-        if not row:
-            return None, None
-        leaves = [r[0] for r in ctx["conn"].execute(
-            "SELECT leaf FROM complete_leaf WHERE commit_id=? ORDER BY idx ASC",
-            (row[0],)).fetchall()]
-    return row, leaves
-
-
-def _tombstone_for(ctx, api_key, value):
-    with ctx["lock"]:
-        if api_key:
-            row = ctx["conn"].execute(
-                "SELECT erased,reason,audit_hash,block_index FROM complete_tomb "
-                "WHERE api_key=? AND leaf=? ORDER BY id ASC LIMIT 1",
-                (api_key, value)).fetchone()
-        else:
-            row = ctx["conn"].execute(
-                "SELECT erased,reason,audit_hash,block_index FROM complete_tomb "
-                "WHERE leaf=? ORDER BY id ASC LIMIT 1", (value,)).fetchone()
-    if not row:
-        return None
-    return {"erased_at": _iso(row[0]), "reason": row[1],
-            "sealed_in_chain": row[2], "block_index": row[3],
-            "note": "The payload is gone. This proves it existed and that it was erased, "
-                    "without holding any of it."}
-
-
-def _prove(ctx, api_key, data):
-    period = str(data.get("period", "")).strip()
-    kind = str(data.get("kind", "receipts")).strip().lower()
-    value = str(data.get("value", "")).strip()
-    if not period or not value:
-        return {"error": "period_and_value_required",
-                "message": "Both are required. Committed periods are listed at "
-                           "/x/complete/periods; value is any key you want proved "
-                           "present or absent.",
-                "example": "/x/complete/prove?period=2026-07&value=<key>"}, 400
-
-    row, leaves = _load(ctx, api_key, period, kind)
-    if not row:
-        return {"error": "not_committed", "period": period, "kind": kind,
-                "message": "No sealed commitment for that period. Nothing can be proved "
-                           "either way until the period is closed and committed."}, 404
-
-    _cid, root, count, committed, chain_hash, block_index, start, end = row
-    _r, levels = _build(leaves)
-
-    base = {"period": period, "kind": kind, "value": value, "root": root,
-            "leaf_count": count, "committed_at": _iso(committed),
-            "period_start": _iso(start), "period_end": _iso(end),
-            "sealed_in_chain": chain_hash, "block_index": block_index,
-            "complete_version": VERSION,
-            "verify": "/x/complete/verify, or reimplement it - the rules are at /x/complete/spec"}
-
-    # Present?
-    try:
-        index = leaves.index(value)
-    except ValueError:
-        index = None
-
-    if index is not None:
-        base.update({
-            "result": "present",
-            "index": index,
-            "proof": _path(levels, index),
-            "what_this_proves": "This exact record is inside the sealed set for the period. "
-                                "It cannot have been added afterwards.",
-        })
-        tomb = _tombstone_for(ctx, api_key, value)
-        if tomb:
-            base["erased"] = tomb
-        return base, 200
-
-    # Absent - find the neighbours it sorts between.
-    lower_index = None
-    upper_index = None
-    for i, leaf in enumerate(leaves):
-        if leaf < value:
-            lower_index = i
-        else:
-            upper_index = i
-            break
-
-    neighbours = {}
-    if lower_index is not None:
-        neighbours["lower"] = {"index": lower_index, "value": leaves[lower_index],
-                               "proof": _path(levels, lower_index)}
-    if upper_index is not None:
-        neighbours["upper"] = {"index": upper_index, "value": leaves[upper_index],
-                               "proof": _path(levels, upper_index)}
-
-    if not leaves:
-        adjacency = "The period is committed and empty. Nothing was sealed in it at all."
-    elif lower_index is None:
-        adjacency = ("The value sorts before every leaf in the set. The first leaf is proved, "
-                     "and nothing precedes index 0.")
-    elif upper_index is None:
-        adjacency = ("The value sorts after every leaf in the set. The last leaf is proved, "
-                     "and nothing follows the final index.")
-    else:
-        adjacency = ("The two proved leaves are adjacent - indices %d and %d, consecutive. "
-                     "Nothing can exist between two adjacent leaves of a sorted tree, so no "
-                     "record for this value exists in the period."
-                     % (lower_index, upper_index))
-
-    base.update({
-        "result": "absent",
-        "neighbours": neighbours,
-        "adjacency": adjacency,
-        "what_this_proves": "No record for this value was sealed in this period. Not that we "
-                            "declined to look - that it is not there, against a root fixed "
-                            "before you asked.",
-        "scope": "This period only. /x/complete/periods lists every committed period.",
-    })
-    tomb = _tombstone_for(ctx, api_key, value)
-    if tomb:
-        base["erased"] = tomb
-        base["note"] = ("Absent from this period AND carrying an erasure record. That is the "
-                        "expected shape after a valid erasure request.")
-    return base, 200
-
-
-def _verify(ctx, api_key, data):
-    """Check a proof we handed out. Convenience only - a verifier who
-    trusts us to check our own proof has not verified anything. The spec
-    route exists so this can be done independently."""
-    value = str(data.get("value", "")).strip()
-    root = str(data.get("root", "")).strip().lower()
-    proof = data.get("proof")
-    if not value or not HEX64.match(root) or not isinstance(proof, list):
-        return {"error": "value_root_and_proof_required"}, 400
-    try:
-        computed = _replay(value, proof)
-    except Exception as exc:
-        return {"error": "bad_proof", "message": str(exc)[:200]}, 400
-    return {"valid": computed == root, "computed_root": computed, "given_root": root,
-            "note": "Recomputed from the leaf upward. If these match, the leaf was in the tree "
-                    "when the root was sealed."}, 200
-
-
-# ----------------------------------------------------------------------
-# erasure
-# ----------------------------------------------------------------------
-
-def _erase(ctx, api_key, data):
-    value = str(data.get("value", "")).strip()
-    reason = str(data.get("reason", "erasure request")).strip()[:200]
-    if not value:
-        return {"error": "value_required",
-                "message": "The leaf being tombstoned - a receipt hash or a subject key."}, 400
-
-    now = time.time()
-    ev = {"user_id": "era:" + value[:32], "action": "erasure_recorded", "amount": 0,
-          "country": "UK", "device_id": "complete", "anomaly": 0, "device_risk": 0}
-    res = {"decision": "ERASURE_SEALED", "score": 0, "complete_version": VERSION,
-           "leaf": value, "reason": reason,
-           "detail": "leaf=%s;reason=%s" % (value, reason)}
-    audit_hash, block_index, seq = ctx["seal"](ev, res, now, api_key)
-
-    with ctx["lock"]:
-        ctx["conn"].execute("INSERT INTO complete_tomb(api_key,leaf,reason,erased,audit_hash,"
-                            "block_index) VALUES(?,?,?,?,?,?)",
-                            (api_key, value, reason, now, audit_hash, block_index))
-        ctx["conn"].commit()
-
-    return {"leaf": value, "erased_at": _iso(now), "reason": reason,
-            "sealed_in_chain": audit_hash, "block_index": block_index, "receipt_seq": seq,
-            "what_this_does": "Records the erasure as a sealed event. It does not delete the "
-                              "payload - your own system does that. This is the receipt that "
-                              "proves you did.",
-            "what_the_subject_gets": "Proof their record existed, proof it was erased, and the "
-                                     "time it happened - none of which requires anyone to still "
-                                     "hold the data.",
-            "note": "Earlier committed roots still contain the leaf. That is correct and not a "
-                    "leak: a leaf is key material, not content, and a root that changed after "
-                    "the fact would prove nothing about anything."}, 200
-
-
-# ----------------------------------------------------------------------
-# read-only
-# ----------------------------------------------------------------------
-
-def _periods(ctx, api_key):
-    with ctx["lock"]:
-        if api_key:
-            rows = ctx["conn"].execute(
-                "SELECT period,kind,root,leaf_count,committed,block_index,period_end,api_key "
-                "FROM complete_commit WHERE api_key=? ORDER BY period_start DESC",
-                (api_key,)).fetchall()
-        else:
-            rows = ctx["conn"].execute(
-                "SELECT period,kind,root,leaf_count,committed,block_index,period_end,api_key "
-                "FROM complete_commit ORDER BY period_start DESC").fetchall()
-
-    out = []
-    for r in rows:
-        late = None
-        try:
-            if r[4] and r[6]:
-                late = round(max(0.0, r[4] - r[6]) / 86400.0, 1)
-        except Exception:
-            late = None
-        out.append({"period": r[0], "kind": r[1], "root": r[2], "leaf_count": r[3],
-                    "committed_at": _iso(r[4]), "block_index": r[5],
-                    "scope": "deployment" if not r[7] else "key",
-                    "committed_days_after_period_end": late})
-
-    return {"count": len(out),
-            "periods": out,
-            "auto_commit": AUTO_COMMIT,
-            "recent_auto_activity": list(reversed(_auto_log[-10:])),
-            "on_lateness": "committed_days_after_period_end is published rather than hidden. A "
-                           "small number means the count was fixed when the period closed. A "
-                           "large one means history was backfilled later, which still proves "
-                           "the count was fixed before any export was requested and proves "
-                           "nothing more than that.",
-            "note": "Gaps are visible on purpose. A missing period is a period nobody committed, "
-                    "and that is exactly the thing an auditor should be asking about."}, 200
-
-
-def _root(ctx, api_key, data):
-    period = str(data.get("period", "")).strip()
-    kind = str(data.get("kind", "receipts")).strip().lower()
-    row, _leaves = _load(ctx, api_key, period, kind)
-    if not row:
-        return {"error": "not_committed", "period": period, "kind": kind,
-                "committed_periods": "/x/complete/periods"}, 404
-    _cid, root, count, committed, chain_hash, block_index, start, end = row
-    late = None
-    try:
-        late = round(max(0.0, committed - end) / 86400.0, 1)
-    except Exception:
-        pass
-    return {"period": period, "kind": kind, "root": root, "leaf_count": count,
-            "period_start": _iso(start), "period_end": _iso(end),
-            "committed_at": _iso(committed), "sealed_in_chain": chain_hash,
-            "block_index": block_index, "committed_days_after_period_end": late,
-            "what_this_is": "The number of records sealed in this period, fixed before anybody "
-                            "asked for an export. Any export claiming a different total is "
-                            "arguing with an externally anchored figure."}, 200
-
-
-def _spec():
-    return {
-        "complete_version": VERSION,
-        "leaf_hash": "sha256('AILEASH-LEAF-v1:' || value) as lowercase hex",
-        "node_hash": "sha256('AILEASH-NODE-v1:' || left_hex || right_hex) as lowercase hex",
-        "empty_root": hashlib.sha256(LEAF_PREFIX + b"EMPTY").hexdigest(),
-        "ordering": "leaf VALUES sorted ascending as UTF-8 strings, duplicates removed, "
-                    "before any hashing",
-        "odd_nodes": "an unpaired node at any level is promoted unchanged to the next level. "
-                     "It is never hashed with itself.",
-        "inclusion": "recompute upward from the leaf using the sibling path. Each step gives a "
-                     "side; hash the sibling on that side.",
-        "absence": "verify the two neighbouring leaves independently, check their values sort "
-                   "either side of the queried value, and check their indices are consecutive. "
-                   "Consecutive indices in a sorted tree leave no room for anything between.",
-        "completeness": "the leaf count is sealed with the root, before any export is requested",
-        "schedule": "closed months are committed automatically, deployment-wide, on the first "
-                    "request to reach this module after the month ends. Per-key commitments "
-                    "remain a keyed POST. Lateness is published per period rather than smoothed "
-                    "over.",
-        "why_published": "Anyone should be able to write their own verifier and check us without "
-                         "running our code or holding an account. A proof you can only check "
-                         "with the prover's own tool is not a proof.",
-    }, 200
-
-
-# ----------------------------------------------------------------------
-# router entry point
-# ----------------------------------------------------------------------
-
-def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-
-    # Sweep before answering, never at the cost of answering.
-    try:
-        _auto_commit(ctx)
-    except Exception as exc:
-        print("COMPLETE: auto sweep failed - " + str(exc)[:200], flush=True)
-
-    action = (action or "").strip("/").lower()
-    data = data or {}
-
-    if method == "GET":
-        if action == "spec":
-            return _spec()
-        if action == "periods":
-            return _periods(ctx, api_key)
-        if action == "root":
-            return _root(ctx, api_key, data)
-        if action == "prove":
-            return _prove(ctx, api_key, data)
-
-    if method == "POST":
-        if action == "verify":
-            return _verify(ctx, api_key, data)
-        if not api_key:
-            return {"error": "invalid_api_key"}, 401
-        if action == "commit":
-            return _commit(ctx, api_key, data)
-        if action == "erase":
-            return _erase(ctx, api_key, data)
-
-    return {"error": "unknown_action", "action": action,
-            "GET": ["spec", "periods", "root", "prove"],
-            "POST": ["verify", "commit", "erase"]}, 404
-
-```
-
-
-## `modules/conformance.py`
-
-338 lines, 14845 bytes
-
-```python
-"""
-Conformance testing - /x/conformance/<action>
-
-WHAT THIS IS FOR
-----------------
-Three limits are documented elsewhere in this platform, and all three have
-the same shape: the engine's arithmetic is sound, but the guarantee depends
-on something outside the engine.
-
-  1. Commit-before-reveal proves order - but only if the integrator does not
-     show its reviewers the machine verdict before calling /open.
-  2. Mutual witnessing gets its strength from breadth - two platforms
-     witnessing only each other prove very little.
-  3. A declaration is only as strong as the rules declared - one that
-     constrains nothing passes everything.
-
-None of these can be fixed by the engine on its own. All three can be
-MEASURED, and a measured weakness is a different animal from an unmeasured
-one. That is what this module does.
-
-1. PROBES - testing the integration, not trusting it
-----------------------------------------------------
-The idea is borrowed openly from how real audits work, and specifically from
-a point James Stokes made publicly: slip a case with a known answer into the
-queue, unannounced, and see who catches it.
-
-A probe creates a genuine oversight case whose machine verdict is
-deliberately set to a known-wrong value. The reviewer sees it exactly like
-any other case. Two things then follow:
-
-  - If they agree with the deliberately wrong verdict, they did not evaluate
-    it. That is a caught rubber stamp, sealed.
-  - If the integration is showing them the verdict before /open is called,
-    their probe agreement rate will match their normal agreement rate. If
-    they are genuinely deciding blind, it will not. The gap between the two
-    numbers is the conformance signal.
-
-A single probe proves nothing about a person. A catch rate across dozens is
-evidence about a process, which is the thing under audit.
-
-2. WITNESS BREADTH - concentration is visible
----------------------------------------------
-Reports how many distinct peers witness the chain, how concentrated the
-observations are in the largest peer, and how many peers have gone quiet.
-Below three live peers the network is reported as weak, because it is.
-
-3. DECLARATION STRENGTH - rules that never fire
-------------------------------------------------
-Runs the live declaration against sealed records and reports, per rule, how
-many records it actually CONSTRAINED - that is, how many matched its `when`
-condition and therefore had to satisfy its `require`. A rule that has never
-constrained a single record is not a standard. It is decoration, and it is
-named as such.
-
-HONEST LIMITS OF THIS MODULE
-----------------------------
-- Probes test the process, not any individual. Someone can catch a probe and
-  still rubber stamp the next hundred cases.
-- A determined integrator who identifies probe cases can treat them
-  differently. Probe case references are not marked in any way the reviewer
-  can see, but a sufficiently motivated operator controls their own UI.
-- Breadth and strength are measurements, not enforcement. Nothing here can
-  compel a platform to witness widely or declare strictly. It can only make
-  the alternative visible.
-
-    POST /x/conformance/probe        inject a probe case with a known-wrong verdict
-    GET  /x/conformance/probes       catch rate, and the conformance gap
-    GET  /x/conformance/witness      breadth, concentration, staleness
-    GET  /x/conformance/declaration  per-rule strength - what each rule constrains
-    GET  /x/conformance/report       all three, one call
-"""
-
-import importlib, json, secrets, time
-from datetime import datetime, timezone
-
-VERSION = "1.0"
-INVERT = {"allow": "block", "block": "allow",
-          "challenge": "allow", "escalate": "allow"}
-
-_ready = False
-
-
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        ctx["conn"].execute("CREATE TABLE IF NOT EXISTS conformance_probes(probe_id TEXT PRIMARY KEY,api_key TEXT,case_id TEXT,reviewer TEXT,planted_verdict TEXT,correct_verdict TEXT,injected REAL,resolved REAL,reviewer_verdict TEXT,caught INTEGER)")
-        ctx["conn"].execute("CREATE INDEX IF NOT EXISTS idx_probe_key ON conformance_probes(api_key)")
-        ctx["conn"].commit()
-    _ready = True
-
-
-def _iso(ts):
-    if not ts:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
-
-# ------------------------------------------------------------------ probes
-
-def _probe(ctx, api_key, data):
-    reviewer = str(data.get("reviewer", "")).strip()
-    if not reviewer:
-        return {"error": "reviewer_required"}, 400
-    correct = str(data.get("correct_verdict", "")).strip().lower()
-    if correct not in INVERT:
-        return {"error": "correct_verdict_required",
-                "allowed": sorted(INVERT)}, 400
-    material = data.get("material")
-    if material is None:
-        return {"error": "material_required",
-                "message": "A probe must look like a real case or it tests nothing."}, 400
-
-    planted = INVERT[correct]
-    try:
-        ovs = importlib.import_module("modules.oversight")
-    except Exception as e:
-        return {"error": "oversight_module_unavailable", "detail": str(e)}, 503
-
-    ref = str(data.get("case_ref", "")).strip() or ("CASE-" + secrets.token_hex(3).upper())
-    payload, status = ovs.handle("POST", "open",
-                                 {"case_ref": ref, "reviewer": reviewer,
-                                  "material": material,
-                                  "machine_verdict": planted},
-                                 api_key, ctx)
-    if status != 200:
-        return payload, status
-
-    pid = "PRB-" + secrets.token_hex(4).upper()
-    ts = time.time()
-    with ctx["lock"]:
-        ctx["conn"].execute("INSERT INTO conformance_probes(probe_id,api_key,case_id,reviewer,planted_verdict,correct_verdict,injected,resolved,reviewer_verdict,caught) VALUES(?,?,?,?,?,?,?,NULL,NULL,NULL)",
-                            (pid, api_key, payload["case_id"], reviewer, planted, correct, ts))
-        ctx["conn"].commit()
-
-    return {"probe_id": pid, "case_id": payload["case_id"],
-            "case_ref": ref, "reviewer": reviewer,
-            "planted_verdict": planted, "correct_verdict": correct,
-            "injected": _iso(ts),
-            "note": "This is an ordinary oversight case to the reviewer. Route it into their queue exactly like any other, or the probe is worthless."}, 200
-
-
-def _resolve_probes(ctx, api_key):
-    """Settle any probes whose oversight case has since been committed."""
-    with ctx["lock"]:
-        open_probes = ctx["conn"].execute("SELECT probe_id,case_id,planted_verdict,correct_verdict FROM conformance_probes WHERE api_key=? AND resolved IS NULL", (api_key,)).fetchall()
-        for pid, cid, planted, correct in open_probes:
-            row = ctx["conn"].execute("SELECT reviewer_verdict,committed FROM oversight_cases WHERE case_id=? AND api_key=?", (cid, api_key)).fetchone()
-            if not row or not row[1]:
-                continue
-            rv = (row[0] or "").lower()
-            caught = 1 if rv != planted else 0
-            ctx["conn"].execute("UPDATE conformance_probes SET resolved=?,reviewer_verdict=?,caught=? WHERE probe_id=?",
-                                (row[1], rv, caught, pid))
-        ctx["conn"].commit()
-
-
-def _probes(ctx, api_key):
-    try:
-        _resolve_probes(ctx, api_key)
-    except Exception:
-        pass
-    with ctx["lock"]:
-        rows = ctx["conn"].execute("SELECT reviewer,caught,resolved FROM conformance_probes WHERE api_key=? AND resolved IS NOT NULL", (api_key,)).fetchall()
-        pending = ctx["conn"].execute("SELECT COUNT(*) FROM conformance_probes WHERE api_key=? AND resolved IS NULL", (api_key,)).fetchone()[0]
-    if not rows:
-        return {"probes_resolved": 0, "probes_pending": pending,
-                "note": "No probes have come back yet."}, 200
-
-    by = {}
-    for reviewer, caught, _r in rows:
-        d = by.setdefault(reviewer, {"probes": 0, "caught": 0})
-        d["probes"] += 1
-        d["caught"] += caught
-
-    out = []
-    for reviewer, d in sorted(by.items()):
-        rate = round(100 * d["caught"] / d["probes"], 1)
-        entry = {"reviewer": reviewer, "probes": d["probes"],
-                 "caught": d["caught"], "catch_rate_pct": rate}
-        # conformance gap: probe agreement vs normal agreement
-        try:
-            ovs = importlib.import_module("modules.oversight")
-            stats, _s = ovs.handle("GET", "reviewer", {"id": reviewer}, api_key, ctx)
-            normal = stats.get("agreement_rate_pct")
-            if normal is not None and d["probes"] >= 5:
-                probe_agree = round(100 * (d["probes"] - d["caught"]) / d["probes"], 1)
-                gap = round(abs(probe_agree - normal), 1)
-                entry["normal_agreement_pct"] = normal
-                entry["probe_agreement_pct"] = probe_agree
-                entry["conformance_gap"] = gap
-                if gap < 5 and normal > 90:
-                    entry["flag"] = "probe agreement matches normal agreement at a high rate - consistent with the verdict being visible before commit"
-        except Exception:
-            pass
-        if d["probes"] >= 5 and rate == 0:
-            entry["flag"] = "caught none of " + str(d["probes"]) + " deliberately wrong verdicts"
-        out.append(entry)
-
-    total = sum(d["probes"] for d in by.values())
-    caught = sum(d["caught"] for d in by.values())
-    return {"probes_resolved": total, "probes_pending": pending,
-            "caught": caught,
-            "overall_catch_rate_pct": round(100 * caught / total, 1),
-            "by_reviewer": out,
-            "note": "A single probe proves nothing about a person. A catch rate across dozens is evidence about a process."}, 200
-
-
-# ----------------------------------------------------------------- witness
-
-def _witness(ctx, api_key):
-    t = time.time()
-    try:
-        with ctx["lock"]:
-            rows = ctx["conn"].execute("SELECT peer,COUNT(*),MAX(observed),COUNT(DISTINCT tip) FROM witness_log WHERE api_key=? GROUP BY peer", (api_key,)).fetchall()
-    except Exception:
-        rows = []
-    if not rows:
-        return {"peers": 0, "strength": "none",
-                "note": "No peers witnessed. Anchoring alone still applies; mutual witnessing does not."}, 200
-
-    total = sum(r[1] for r in rows)
-    live = [r for r in rows if (t - r[2]) < 6 * 3600]
-    stale = [r for r in rows if 6 * 3600 <= (t - r[2]) < 48 * 3600]
-    silent = [r for r in rows if (t - r[2]) >= 48 * 3600]
-    top = max(rows, key=lambda r: r[1])
-    conc = round(100 * top[1] / total, 1)
-
-    if len(live) >= 5 and conc < 50:
-        strength = "strong"
-    elif len(live) >= 3:
-        strength = "adequate"
-    elif len(live) >= 1:
-        strength = "weak"
-    else:
-        strength = "dormant"
-
-    out = {"peers": len(rows), "live": len(live), "stale": len(stale),
-           "silent": len(silent), "observations": total,
-           "largest_peer_share_pct": conc,
-           "strength": strength,
-           "distinct_tips_seen": sum(r[3] for r in rows)}
-    if len(live) < 3:
-        out["flag"] = "fewer than three live peers - breadth is what makes witnessing meaningful, and this network does not have it yet"
-    if conc > 80 and len(rows) > 1:
-        out["concentration_flag"] = "over 80% of observations come from a single peer"
-    if len(rows) == 1:
-        out["reciprocity_warning"] = "a single peer pair proves very little - two parties witnessing only each other can still collude"
-    return out, 200
-
-
-# ------------------------------------------------------------- declaration
-
-def _declaration(ctx, api_key):
-    try:
-        dec = importlib.import_module("modules.declare")
-    except Exception as e:
-        return {"error": "declare_module_unavailable", "detail": str(e)}, 503
-
-    cur, status = dec.handle("GET", "current", {}, api_key, ctx)
-    if status != 200:
-        return cur, status
-    rules = cur["declaration"]["rules"]
-    ver = cur["version"]
-
-    with ctx["lock"]:
-        recs = ctx["conn"].execute("SELECT event_json,result_json FROM audit_log WHERE api_key=? ORDER BY id DESC LIMIT 2000", (api_key,)).fetchall()
-
-    parsed = []
-    for ev, res in recs:
-        try:
-            r = {}
-            r.update(json.loads(ev))
-            r.update(json.loads(res))
-            if str(r.get("decision", "")).endswith("_SEALED"):
-                continue
-            parsed.append(r)
-        except Exception:
-            pass
-
-    report = []
-    for rule in rules:
-        constrained = 0
-        violated = 0
-        for r in parsed:
-            if not dec._test(rule.get("when"), r):
-                continue
-            constrained += 1
-            if not dec._test(rule.get("require"), r):
-                violated += 1
-        entry = {"rule": rule.get("id"), "describe": rule.get("describe"),
-                 "records_constrained": constrained,
-                 "violations": violated,
-                 "coverage_pct": (round(100 * constrained / len(parsed), 1) if parsed else 0)}
-        if constrained == 0:
-            entry["flag"] = "this rule has never constrained a single record - it is decoration, not a standard"
-        report.append(entry)
-
-    dead = len([r for r in report if r["records_constrained"] == 0])
-    covered = len({i for i, rule in enumerate(rules)
-                   if report[i]["records_constrained"] > 0})
-    out = {"declaration_version": ver, "rules": len(rules),
-           "records_examined": len(parsed),
-           "rules_that_constrain_nothing": dead,
-           "rules_with_effect": covered,
-           "per_rule": report}
-    if dead:
-        out["flag"] = str(dead) + " of " + str(len(rules)) + " rules constrain nothing"
-    if not rules:
-        out["flag"] = "an empty declaration passes everything"
-    return out, 200
-
-
-# ---------------------------------------------------------------- routing
-
-def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-    if method == "POST":
-        if action == "probe":
-            return _probe(ctx, api_key, data)
-    else:
-        if action == "probes":
-            return _probes(ctx, api_key)
-        if action == "witness":
-            return _witness(ctx, api_key)
-        if action == "declaration":
-            return _declaration(ctx, api_key)
-        if action in ("", "report"):
-            p, _a = _probes(ctx, api_key)
-            w, _b = _witness(ctx, api_key)
-            d, _c = _declaration(ctx, api_key)
-            return {"conformance_version": VERSION,
-                    "integration": p, "witness_breadth": w,
-                    "declaration_strength": d,
-                    "note": "These are measurements, not enforcement. Nothing here compels good behaviour - it only makes the alternative visible."}, 200
-    return {"error": "unknown_action", "action": action}, 404
 
 ```
