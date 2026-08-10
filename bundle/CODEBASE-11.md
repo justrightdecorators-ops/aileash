@@ -1,12 +1,385 @@
 # Codebase — part 11 of 19
 
 Contains:
+- `ai-standard.html`
+- `ai-txt-kit.html`
+- `aitxt-popup-live.html`
 - `brain.html`
 - `certificate.html`
 - `compliance-assistant.html`
 - `contact.html`
-- `copyright.txt`
-- `data-protection.html`
+
+
+## `ai-standard.html`
+
+97 lines, 4847 bytes
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#0a0f1e">
+<title>ai.txt - Free Download</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0a0f1e;color:#e8e8f0;min-height:100vh;display:flex;flex-direction:column}
+nav{border-bottom:1px solid #1e2a45;padding:16px 20px}
+nav a{color:#c9a84c;text-decoration:none;font-family:monospace;font-size:14px}
+.wrap{flex:1;display:flex;align-items:center;justify-content:center;padding:30px 20px}
+.card{max-width:560px;width:100%;background:#0d1428;border:1px solid #1e2a45;border-radius:16px;padding:36px 28px;text-align:center}
+h1{font-size:32px;font-weight:800;margin-bottom:14px;line-height:1.15}
+h1 span{color:#c9a84c}
+p{color:#8a90a6;font-size:15px;line-height:1.7;margin-bottom:14px}
+p b{color:#e8e8f0}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:10px;width:100%;background:#c9a84c;color:#0a0f1e;padding:18px;border-radius:10px;font-weight:800;font-size:17px;border:none;cursor:pointer;font-family:inherit;margin:20px 0 10px}
+.sub{font-family:monospace;font-size:12px;color:#7fe3b0;margin-bottom:24px}
+.steps{text-align:left;background:#0b1226;border:1px solid #1e2a45;border-radius:10px;padding:18px 20px;margin-top:8px}
+.steps li{color:#8a90a6;font-size:14px;margin:10px 0 10px 6px;line-height:1.6}
+.steps li b{color:#c9a84c}
+.back{margin-top:22px}
+.back a{color:#c9a84c;text-decoration:none;font-size:14px;font-weight:600}
+footer{border-top:1px solid #1e2a45;padding:20px;text-align:center;color:#5a6178;font-size:12px}
+footer a{color:#c9a84c;text-decoration:none}
+</style>
+</head>
+<body>
+<nav><a href="/">&larr; AILeash</a></nav>
+<div class="wrap">
+  <div class="card">
+    <h1>Download <span>ai.txt</span> &mdash; free</h1>
+    <div class="sub">NO KEY &middot; NO ACCOUNT &middot; NO COST</div>
+    <p>ai.txt is the free, open standard for declaring how your AI is governed. Download the file, and it shows your system exactly what it needs to become compliant.</p>
+    <button class="btn" onclick="downloadIt()">&#8681; Download ai.txt free</button>
+    <ul class="steps">
+      <li><b>1.</b> Tap download &mdash; the file saves as ai.txt</li>
+      <li><b>2.</b> Fill in your details, put it on your domain at yourdomain.com/ai.txt</li>
+      <li><b>3.</b> Want it verified and provable? <b><a href="/" style="color:#c9a84c">Come back to AILeash</a></b> to seal it into a tamper-evident chain.</li>
+    </ul>
+    <div class="back"><a href="/ai.txt">See the live ai.txt &rarr;</a></div>
+  </div>
+</div>
+<footer>ai.txt is a free, open standard by <a href="/">Monop Content</a> &middot; Blyth, UK &middot; <a href="/ai.txt">reference</a></footer>
+<script>
+var AITXT = [
+"# ============================================================================",
+"# ai.txt - AI Governance Declaration  (AI-TXT/1.0)",
+"# A free, open standard. Copy this to the root of your domain as /ai.txt",
+"# Replace the values below with your own. Delete any line that does not apply.",
+"# No key, no account, no permission, no cost. Just publish it.",
+"# See it live: https://sebbi.pro/ai.txt",
+"# ============================================================================",
+"",
+"Standard: AI-TXT/1.0",
+"Operator: YOUR COMPANY NAME",
+"Operator-Location: YOUR CITY, COUNTRY",
+"Contact: you@yourdomain.com",
+"Last-Updated: 2026-01-01",
+"",
+"# --- How your AI makes decisions ---",
+"Decision-Model: describe it (deterministic rules / ML model / human-in-loop)",
+"Decision-Outcomes: ALLOW, REVIEW, BLOCK",
+"Human-Override: yes / no",
+"Plain-Language-Reasons: yes / no",
+"",
+"# --- Your audit record (how you prove what happened) ---",
+"Audit-Chain: describe it (SHA-256 hash chain / signed logs / none)",
+"Chain-Property: tamper-evident / tamper-resistant / none",
+"Verify-Endpoint: https://yourdomain.com/your-verify-url",
+"",
+"# --- Regulations you are designing towards ---",
+"Regulation: EU AI Act 2024/1689",
+"Regulation: UK Online Safety Act 2023",
+"",
+"# --- Optional: public status surfaces ---",
+"Live-Status: https://yourdomain.com/health",
+"Whitepaper: https://yourdomain.com/whitepaper",
+"",
+"# ============================================================================",
+"# ai.txt is a free, open standard. Publish yours, share it, build on it.",
+"# ============================================================================"
+].join("\n");
+function downloadIt(){
+  var blob = new Blob([AITXT], {type:"text/plain"});
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement("a");
+  a.href = url; a.download = "ai.txt";
+  document.body.appendChild(a); a.click();
+  document.body.removeChild(a); URL.revokeObjectURL(url);
+}
+</script>
+</body>
+</html>
+
+```
+
+
+## `ai-txt-kit.html`
+
+86 lines, 6554 bytes
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#0a0f1e">
+<title>ai.txt Starter Kit &mdash; publish AI governance free in 5 minutes</title>
+<meta name="description" content="Publish an ai.txt on your own domain, free. Copy the template, add the badge, make it provable. No key, no account.">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0a0f1e;color:#e8e8f0;line-height:1.6}
+.mono{font-family:"JetBrains Mono",ui-monospace,Menlo,monospace}
+nav{position:sticky;top:0;z-index:10;background:rgba(10,15,30,.94);backdrop-filter:blur(10px);border-bottom:1px solid #1e2a45;padding:0 20px;height:54px;display:flex;align-items:center;justify-content:space-between}
+nav a.logo{display:flex;align-items:center;gap:8px;color:#c9a84c;text-decoration:none;font-family:"JetBrains Mono",monospace;font-size:13px}
+nav .links a{color:#8a90a6;text-decoration:none;font-size:13px;margin-left:16px}
+.wrap{max-width:760px;margin:0 auto;padding:44px 20px 90px}
+.eyebrow{font-family:"JetBrains Mono",monospace;font-size:11px;letter-spacing:3px;text-transform:uppercase;color:#c9a84c;margin-bottom:12px}
+h1{font-size:34px;font-weight:800;letter-spacing:-.02em;line-height:1.1;margin-bottom:14px}
+h1 span{color:#c9a84c}
+.lede{color:#8a90a6;font-size:16px;margin-bottom:8px}
+.free{display:inline-block;background:rgba(0,229,160,.1);border:1px solid #00b87d;color:#7fe3b0;font-family:"JetBrains Mono",monospace;font-size:12px;padding:5px 12px;border-radius:5px;margin:14px 0 30px}
+h2{font-size:20px;font-weight:700;margin:40px 0 8px;padding-top:26px;border-top:1px solid #1e2a45}
+.step-n{font-family:"JetBrains Mono",monospace;color:#c9a84c;font-size:13px}
+p{color:#8a90a6;margin-bottom:14px}
+p b{color:#e8e8f0}
+.box{background:#0b1226;border:1px solid #1e2a45;border-radius:10px;padding:18px;margin:16px 0;font-family:"JetBrains Mono",monospace;font-size:12.5px;color:#7fe3b0;white-space:pre-wrap;word-break:break-word;line-height:1.8;overflow-x:auto}
+.btn{display:inline-flex;align-items:center;gap:8px;background:#c9a84c;color:#0a0f1e;padding:12px 22px;border-radius:8px;font-weight:800;font-size:14px;text-decoration:none;border:none;cursor:pointer;font-family:inherit}
+.btn.ghost{background:transparent;border:1px solid #2a3350;color:#e8e8f0}
+.btnrow{display:flex;gap:10px;flex-wrap:wrap;margin:16px 0}
+.badge-demo{display:inline-flex;align-items:center;gap:8px;background:#111a30;border:1px solid #c9a84c;border-radius:8px;padding:8px 14px;font-family:"JetBrains Mono",monospace;font-size:12px;color:#c9a84c;text-decoration:none}
+.badge-demo svg{flex-shrink:0}
+.onramp{background:linear-gradient(135deg,rgba(0,229,160,.06),rgba(201,168,76,.05));border:1px solid #00b87d;border-radius:12px;padding:24px;margin-top:30px}
+.onramp h3{color:#7fe3b0;font-size:16px;margin-bottom:8px}
+.onramp p{color:#a9b0c4}
+.copied{color:#7fe3b0;font-size:12px;margin-left:10px;opacity:0;transition:opacity .2s}
+.copied.show{opacity:1}
+footer{border-top:1px solid #1e2a45;padding:26px 20px;text-align:center;color:#5a6178;font-size:12px}
+footer a{color:#c9a84c;text-decoration:none}
+</style>
+</head>
+<body>
+<nav>
+  <a class="logo" href="/"><svg width="18" height="18" viewBox="0 0 32 32"><circle cx="16" cy="16" r="13.5" fill="none" stroke="#c9a84c" stroke-width="2.6" stroke-dasharray="66 20" stroke-linecap="round" transform="rotate(-50 16 16)"/><circle cx="26.5" cy="7" r="3.1" fill="#c9a84c"/></svg>AILeash</a>
+  <div class="links"><a href="/ai.txt">Spec</a><a href="/whitepaper">Whitepaper</a></div>
+</nav>
+<div class="wrap">
+  <div class="eyebrow">// ai.txt starter kit</div>
+  <h1>Publish AI governance on your own site. <span>Free.</span></h1>
+  <p class="lede">ai.txt is the robots.txt of AI governance: one small file at your domain root that declares how your AI is governed and where anyone can verify it. Here is everything you need to publish one in about five minutes.</p>
+  <div class="free">FREE STANDARD &middot; NO KEY &middot; NO ACCOUNT &middot; NO PERMISSION</div>
+
+  <h2><span class="step-n">01 /</span> Grab the template</h2>
+  <p>A ready-to-fill ai.txt with every line commented. Download it, or read the live example on our own domain.</p>
+  <div class="btnrow">
+    <a class="btn" href="/ai-txt-template.txt" download="ai.txt">&#8681; Download template</a>
+    <a class="btn ghost" href="/ai.txt" target="_blank">Read a live example</a>
+  </div>
+
+  <h2><span class="step-n">02 /</span> Fill it in and publish</h2>
+  <p>Replace the example values with your own facts. <b>Delete any line you cannot back with a real verify endpoint</b> &mdash; an honest short ai.txt beats an aspirational long one. Then upload it to the root of your domain so it lives at:</p>
+  <div class="box">https://yourdomain.com/ai.txt</div>
+  <p>That is the whole spec. One file, at the root, readable by anyone &mdash; a regulator, a partner, or another machine deciding whether to trust you.</p>
+
+  <h2><span class="step-n">03 /</span> Add the badge</h2>
+  <p>Show visitors and crawlers that you have declared your AI governance. Copy this HTML onto your site &mdash; it renders a small badge linking to your ai.txt:</p>
+  <p>Preview:</p>
+  <a class="badge-demo" href="/ai.txt"><svg width="14" height="14" viewBox="0 0 32 32"><circle cx="16" cy="16" r="13.5" fill="none" stroke="#c9a84c" stroke-width="3" stroke-dasharray="66 20" stroke-linecap="round" transform="rotate(-50 16 16)"/><circle cx="26.5" cy="7" r="3.4" fill="#c9a84c"/></svg>AI-Governed &middot; ai.txt</a>
+  <div class="box" id="badge">&lt;a href="/ai.txt" style="display:inline-flex;align-items:center;gap:6px;font-family:monospace;font-size:12px;color:#c9a84c;text-decoration:none;border:1px solid #c9a84c;border-radius:6px;padding:6px 10px"&gt;AI-Governed &middot; ai.txt&lt;/a&gt;</div>
+  <button class="btn ghost" onclick="copyBadge()">Copy badge HTML<span class="copied" id="cp">copied</span></button>
+
+</div>
+</div>
+<footer>
+  ai.txt (AI-TXT/1.0) is a free, open standard by <a href="/">Monop Content</a> &middot; Blyth, UK &middot; <a href="/ai.txt">spec</a> &middot; <a href="/comply.txt">comply.txt</a>
+</footer>
+<script>
+function copyBadge(){
+  var t=document.getElementById('badge').textContent;
+  navigator.clipboard.writeText(t).then(function(){
+    var c=document.getElementById('cp');c.classList.add('show');setTimeout(function(){c.classList.remove('show')},1500);
+  });
+}
+</script>
+</body>
+</html>
+
+```
+
+
+## `aitxt-popup-live.html`
+
+165 lines, 7279 bytes
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ai.txt Live Compliance Widget — Preview</title>
+<style>
+  body{margin:0;background:#e8e6df;font-family:-apple-system,'Segoe UI',Roboto,sans-serif;min-height:100vh;}
+  .demo-note{position:fixed;top:16px;left:16px;right:16px;background:#fff;border:1px solid #ddd;border-radius:8px;padding:12px 16px;font-size:13px;color:#555;max-width:560px;margin:0 auto;text-align:center;z-index:2;}
+</style>
+</head>
+<body>
+<div class="demo-note">This page has no ai.txt, so the badge will honestly say "not found." Click it to see the real check running live.</div>
+
+<!-- ============================================================
+     THE DELIVERABLE: one script tag. Paste into any site.
+     On load, it actually fetches /ai.txt from that same domain
+     and reports the true result — nothing hardcoded, nothing faked.
+============================================================= -->
+<script>
+(function(){
+  var CSS = `
+    #aitxt-badge{
+      position:fixed;bottom:20px;right:20px;z-index:999998;
+      background:#0a0f1e;color:#8b93ac;border:1px solid #232c48;
+      font-family:'SF Mono','JetBrains Mono',Consolas,monospace;
+      font-size:12px;padding:10px 16px;border-radius:999px;cursor:pointer;
+      box-shadow:0 4px 18px rgba(0,0,0,.25);display:flex;align-items:center;gap:8px;
+      transition:transform .15s ease;
+    }
+    #aitxt-badge:hover{transform:translateY(-2px);}
+    #aitxt-badge .dot{width:7px;height:7px;border-radius:50%;background:#8b93ac;flex-shrink:0;transition:background .2s ease;}
+    #aitxt-badge .dot.ok{background:#7fe3b0;}
+    #aitxt-badge .dot.warn{background:#ff8a80;}
+    #aitxt-badge .dot.checking{background:#c9a84c;animation:aitxt-pulse 1s ease-in-out infinite;}
+    @keyframes aitxt-pulse{50%{opacity:.3;}}
+    #aitxt-overlay{
+      position:fixed;inset:0;background:rgba(10,15,30,.6);z-index:999999;
+      display:none;align-items:center;justify-content:center;padding:20px;
+    }
+    #aitxt-overlay.open{display:flex;}
+    #aitxt-modal{
+      background:#10182e;border:1px solid #232c48;border-radius:12px;
+      max-width:420px;width:100%;color:#e7ebf5;font-family:-apple-system,'Segoe UI',Roboto,sans-serif;
+      overflow:hidden;
+    }
+    #aitxt-modal .aitxt-head{padding:20px 22px 0;}
+    #aitxt-modal .aitxt-eyebrow{
+      font-family:'SF Mono',Consolas,monospace;font-size:11px;letter-spacing:.1em;
+      text-transform:uppercase;color:#c9a84c;margin-bottom:10px;
+    }
+    #aitxt-modal h3{margin:0 0 8px;font-size:19px;line-height:1.3;}
+    #aitxt-modal p{margin:0 0 18px;font-size:13.5px;line-height:1.55;color:#8b93ac;}
+    #aitxt-modal .aitxt-body{padding:0 22px 22px;}
+    #aitxt-modal .aitxt-status{
+      display:flex;align-items:center;gap:8px;padding:12px 14px;
+      background:#161f38;border:1px solid #232c48;border-radius:8px;margin-bottom:16px;
+      font-family:'SF Mono',Consolas,monospace;font-size:12px;
+    }
+    #aitxt-modal .aitxt-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;}
+    #aitxt-modal .aitxt-dot.ok{background:#7fe3b0;}
+    #aitxt-modal .aitxt-dot.warn{background:#ff8a80;}
+    #aitxt-modal .aitxt-dot.checking{background:#c9a84c;animation:aitxt-pulse 1s ease-in-out infinite;}
+    #aitxt-modal .aitxt-status.ok span.label{color:#7fe3b0;}
+    #aitxt-modal .aitxt-status.warn span.label{color:#ff8a80;}
+    #aitxt-modal .aitxt-status.checking span.label{color:#c9a84c;}
+    #aitxt-modal a.aitxt-cta{
+      display:block;text-align:center;background:#c9a84c;color:#0a0f1e;
+      font-weight:600;font-size:14px;padding:11px;border-radius:7px;
+      text-decoration:none;margin-bottom:10px;
+    }
+    #aitxt-modal button.aitxt-close{
+      display:block;width:100%;background:transparent;border:1px solid #232c48;
+      color:#8b93ac;font-size:13px;padding:10px;border-radius:7px;cursor:pointer;
+    }
+  `;
+  var style = document.createElement('style');
+  style.textContent = CSS;
+  document.head.appendChild(style);
+
+  var badge = document.createElement('div');
+  badge.id = 'aitxt-badge';
+  badge.innerHTML = '<span class="dot checking"></span><span class="label">Checking AI governance…</span>';
+  document.body.appendChild(badge);
+
+  var overlay = document.createElement('div');
+  overlay.id = 'aitxt-overlay';
+  overlay.innerHTML = `
+    <div id="aitxt-modal">
+      <div class="aitxt-head">
+        <div class="aitxt-eyebrow">ai.txt · sebbi.pro</div>
+        <h3>AI governance declaration</h3>
+        <p>ai.txt is a plain-text file — like robots.txt — that states how this site's AI systems are governed. This check looked for it at the domain root, live, just now.</p>
+      </div>
+      <div class="aitxt-body">
+        <div class="aitxt-status checking" id="aitxt-modal-status">
+          <span class="aitxt-dot checking"></span>
+          <span class="label">Checking…</span>
+        </div>
+        <a class="aitxt-cta" href="https://sebbi.pro" target="_blank" id="aitxt-cta">Generate ai.txt — free</a>
+        <button class="aitxt-close">Close</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+
+  var badgeDot = badge.querySelector('.dot');
+  var badgeLabel = badge.querySelector('.label');
+  var modalStatus = overlay.querySelector('#aitxt-modal-status');
+  var modalDot = modalStatus.querySelector('.aitxt-dot');
+  var modalLabel = modalStatus.querySelector('.label');
+  var cta = overlay.querySelector('#aitxt-cta');
+
+  function setState(state, text, modalText){
+    badgeDot.className = 'dot ' + state;
+    badgeLabel.textContent = text;
+    modalStatus.className = 'aitxt-status ' + state;
+    modalDot.className = 'aitxt-dot ' + state;
+    modalLabel.textContent = modalText;
+    if(state === 'ok'){
+      cta.textContent = 'View declaration';
+    } else {
+      cta.textContent = 'Generate ai.txt — free';
+    }
+  }
+
+  // The real check — looks for ai.txt on this exact page's own domain.
+  // Checks the standard /.well-known/ai.txt location first, then falls
+  // back to /ai.txt at root. Same-origin, no backend needed, and it
+  // can't be faked by hardcoding a result: it either finds the file or
+  // it doesn't.
+  function checkPath(path){
+    return fetch(path, {method:'GET', cache:'no-store'})
+      .then(function(res){ return res.ok ? path : null; })
+      .catch(function(){ return null; });
+  }
+
+  Promise.all([
+    checkPath('/.well-known/ai.txt'),
+    checkPath('/ai.txt')
+  ]).then(function(results){
+    var foundAt = results.find(function(p){ return p !== null; });
+    if(foundAt){
+      setState('ok', 'AI governance declared', 'ai.txt found at ' + foundAt);
+    } else {
+      setState('warn', 'No ai.txt found', 'No ai.txt file found at this domain');
+    }
+  });
+
+  badge.addEventListener('click', function(){ overlay.classList.add('open'); });
+  overlay.addEventListener('click', function(e){
+    if(e.target === overlay) overlay.classList.remove('open');
+  });
+  overlay.querySelector('.aitxt-close').addEventListener('click', function(){
+    overlay.classList.remove('open');
+  });
+})();
+</script>
+<!-- ============================================================
+     END OF SNIPPET
+============================================================= -->
+
+</body>
+</html>
+
+```
 
 
 ## `brain.html`
@@ -1390,221 +1763,6 @@ async function doSubmit(){
   }
 }
 </script>
-</body>
-</html>
-
-```
-
-
-## `copyright.txt`
-
-76 lines, 4491 bytes
-
-```text
-# COPYRIGHT.TXT — Copyright and Originality Declaration
-# sebbi.pro | Monop Content | Justin Antony Dobson
-# Published: June 2026
-# Linked to: sebbi.pro/ai.txt | sebbi.pro/dis.txt | sebbi.pro/legal.txt
-# Verification: sebbi.pro/api/verify-chain
-
-## Automatic Copyright Notice
-
-Under the Copyright, Designs and Patents Act 1988, copyright in an original work arises automatically upon creation. No registration is required. The following original works are the intellectual property of Justin Antony Dobson, trading as Monop Content, from the date of their creation.
-
-## Original Works Declared
-
-COPYRIGHT-001: OAAS-1.0 — Open AI Audit Standard
-The concept, structure, format, and specific wording of the Open AI Audit Standard, including the ai.txt declaration format, is an original work created by Justin Antony Dobson in June 2026. First published at sebbi.pro/ai.txt.
-
-COPYRIGHT-002: dis.txt — Disinformation Protection Standard
-The concept, structure, and format of a machine-readable disinformation protection declaration file linked to a cryptographic audit chain is an original work created by Justin Antony Dobson in June 2026. First published at sebbi.pro/dis.txt.
-
-COPYRIGHT-003: legal.txt — Legal Declaration Standard
-The concept, structure, and format of a machine-readable legal declaration file linked to a cryptographic audit chain is an original work created by Justin Antony Dobson in June 2026. First published at sebbi.pro/legal.txt.
-
-COPYRIGHT-004: copyright.txt — Copyright Declaration Standard
-The concept, structure, and format of this file is an original work created by Justin Antony Dobson in June 2026. First published at sebbi.pro/copyright.txt.
-
-COPYRIGHT-005: AILeash Platform
-The AILeash platform including its governance engine, 9-signal weighted scoring system, SHA-256 Merkle audit chain implementation, trust decay model, velocity tracking system, and sovereign deployment architecture is an original work created by Justin Antony Dobson between 2021 and 2026.
-
-COPYRIGHT-006: AILeash Guardian
-The AILeash Guardian child safety platform including its grooming detection methodology, parent PWA dashboard, and evidence chain implementation is an original work created by Justin Antony Dobson.
-
-COPYRIGHT-007: SonicBoom
-The SonicBoom speed and compliance layer concept and implementation is an original work created by Justin Antony Dobson.
-
-COPYRIGHT-008: AILeash Sentinel
-The AILeash Sentinel fraud and anomaly detection platform is an original work created by Justin Antony Dobson.
-
-## What Is Protected
-
-The following are protected by copyright and may not be reproduced, copied, or distributed without permission:
-
-- The specific wording, format, and structure of ai.txt, dis.txt, legal.txt, and copyright.txt
-- The source code of server.py, engine.py, and all associated platform files
-- The specific implementation of the SHA-256 Merkle chain audit system as built by Justin Antony Dobson
-- All HTML, CSS, and JavaScript files published at sebbi.pro
-- The OAAS-1.0 standard document published at sebbi.pro/ai-standard
-
-## What Is Not Restricted
-
-Others may:
-- Build their own AI compliance products using different code and different approaches
-- Implement the general concept of AI audit chains using their own implementations
-- Reference OAAS-1.0 provided they attribute authorship to Justin Antony Dobson
-
-Others may not:
-- Copy the specific format of these declaration files and present them as their own
-- Reproduce the source code of the AILeash platform without permission
-- Claim authorship or co-authorship of OAAS-1.0 or any of the above works
-
-## Prior Art Declaration
-
-This file, combined with the SHA-256 Merkle chain at sebbi.pro/api/verify-chain, constitutes a timestamped prior art declaration. The chain provides cryptographic proof of the date and content of all original works listed above.
-
-If any third party seeks to patent, trademark, or claim ownership of concepts substantially similar to those listed above after the publication date of this file, this declaration and the associated Merkle chain evidence will be submitted as prior art.
-
-## Linked Files
-
-ai.txt: https://sebbi.pro/ai.txt
-dis.txt: https://sebbi.pro/dis.txt
-legal.txt: https://sebbi.pro/legal.txt
-copyright.txt: https://sebbi.pro/copyright.txt
-Verification: https://sebbi.pro/api/verify-chain
-
-© 2026 Justin Antony Dobson / Monop Content
-Blyth, Northumberland, United Kingdom
-All rights reserved under the Copyright, Designs and Patents Act 1988.
-
-```
-
-
-## `data-protection.html`
-
-123 lines, 12310 bytes
-
-```html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Data Protection &amp; Sovereignty Statement — Monop Content / AILeash</title>
-<meta name="description" content="What data the AILeash platform processes, what it deliberately never holds, where data lives, how long it is kept, and how data subject rights are handled.">
-<style>
-  :root{--ink:#0a0f1e;--ink2:#111a30;--line:#232d4a;--gold:#c9a84c;--gold-dim:#8a7838;--ok:#7fe3b0;--text:#e8e8f0;--muted:#c2c8dc;--faint:#5a6178}
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--ink);color:#fff;line-height:1.7;-webkit-font-smoothing:antialiased}
-  .wrap{max-width:720px;margin:0 auto;padding:26px 20px 90px}
-  a.back{color:var(--gold);text-decoration:none;font-size:13px;font-family:ui-monospace,Menlo,monospace;letter-spacing:.5px}
-  .eyebrow{font-family:ui-monospace,Menlo,monospace;font-size:10.5px;letter-spacing:2px;text-transform:uppercase;color:var(--gold-dim);margin:22px 0 10px}
-  h1{font-size:28px;font-weight:800;letter-spacing:-.5px;margin-bottom:10px;line-height:1.2}
-  h1 span{color:var(--gold)}
-  .meta{font-family:ui-monospace,Menlo,monospace;font-size:12px;color:var(--faint);margin-bottom:26px;line-height:1.9}
-  h2{font-size:19px;font-weight:800;margin:40px 0 8px;letter-spacing:-.3px}
-  h2 .n{color:var(--gold);font-family:ui-monospace,Menlo,monospace;font-size:13px;margin-right:8px}
-  p{font-size:14.5px;color:var(--muted);margin-bottom:13px}
-  p b{color:#fff}
-  ul{margin:0 0 14px 0;list-style:none}
-  li{position:relative;padding-left:20px;margin-bottom:9px;font-size:14px;color:var(--muted)}
-  li::before{content:'';position:absolute;left:0;top:9px;width:6px;height:6px;border-radius:50%;background:var(--gold)}
-  li b{color:#fff}
-  .honest{border:1px solid rgba(201,168,76,.35);background:rgba(201,168,76,.05);border-radius:12px;padding:16px 20px;margin:16px 0;font-size:13.5px;color:var(--muted);line-height:1.75}
-  .honest b{color:var(--gold)}
-  .green{border:1px solid rgba(127,227,176,.3);background:rgba(127,227,176,.05);border-radius:12px;padding:16px 20px;margin:16px 0;font-size:13.5px;color:var(--muted);line-height:1.75}
-  .green b{color:var(--ok)}
-  table{width:100%;border-collapse:collapse;font-size:13px;margin:14px 0}
-  th{padding:9px 10px;text-align:left;font-size:10.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--faint);border-bottom:2px solid var(--line)}
-  td{padding:10px;border-bottom:1px solid var(--line);vertical-align:top;color:var(--muted)}
-  td:first-child{color:#fff;font-weight:600}
-  hr{border:none;height:1px;background:linear-gradient(90deg,transparent,rgba(201,168,76,.25),transparent);margin:40px 0 0}
-  footer{margin-top:30px;text-align:center;font-size:12px;color:var(--faint);font-family:ui-monospace,Menlo,monospace}
-  footer a{color:var(--gold);text-decoration:none}
-</style>
-</head>
-<body>
-<div class="wrap">
-  <a class="back" href="/">&larr; sebbi.pro</a>
-  <div class="eyebrow">monop content · policy document · public</div>
-  <h1>Data Protection &amp;<br><span>Sovereignty Statement</span></h1>
-  <div class="meta">
-    Document: MC-POL-002 · Version 1.0 · Effective 20 July 2026<br>
-    Owner: Justin Dobson, Founder, Monop Content · Review cycle: quarterly, and on any material change to data handling<br>
-    Alignment: UK GDPR / EU GDPR · published at sebbi.pro/data-protection
-  </div>
-
-  <h2><span class="n">1.</span>The design principle: the safest data is the data we never hold</h2>
-  <p>AILeash is built on aggressive data minimisation. Wherever the platform can do its job with a cryptographic fingerprint instead of content, it holds only the fingerprint. This is not a bolted-on privacy feature — it is the architecture:</p>
-  <ul>
-    <li><b>The notaries</b> fingerprint content in the user's own browser. The document, post or bank details <b>never leave the user's device</b>; only the 64-character SHA-256 hash is transmitted and sealed. A hash cannot be reversed into the content it fingerprints.</li>
-    <li><b>KYC sealing</b> stores only the SHA-256 of the verification provider's reference — never the identity document, never the raw reference number, never the personal data the provider examined.</li>
-    <li><b>Guardian</b> never stores message content — only fingerprints of flagged exchanges, sufficient to prove later that a specific exchange existed in a specific form.</li>
-    <li><b>The decision engine</b> receives only the seven event fields the customer chooses to send. Customers are instructed (in the developer documentation and below) to send pseudonymous identifiers, not names or contact details.</li>
-  </ul>
-
-  <h2><span class="n">2.</span>What we process, and why</h2>
-  <table>
-    <thead><tr><th>Data</th><th>Content</th><th>Purpose · lawful basis</th></tr></thead>
-    <tbody>
-      <tr><td>Governed events</td><td>user_id (customer-supplied identifier), action label, amount, country code, device_id, two 0–1 risk signals, optional authority token</td><td>Delivering the contracted decision and evidence service · performance of contract</td></tr>
-      <tr><td>Sealed chain records</td><td>Event, verdict, reasons, jurisdiction tag, timestamp, hashes</td><td>The tamper-evident evidence record that is the product itself · performance of contract; customers' legitimate interest in verifiable records</td></tr>
-      <tr><td>Account data</td><td>E-mail address, hashed API key, plan status, device counts</td><td>Account operation, alerts, billing · performance of contract</td></tr>
-      <tr><td>Billing data</td><td>Handled by Stripe; we hold no card numbers</td><td>Payment collection · performance of contract</td></tr>
-      <tr><td>Notary seals</td><td>SHA-256 fingerprints; for identity seals marked public, the limited display fields the user chooses to include; masked payment display fields</td><td>The public notarisation service · consent (the user submits the seal)</td></tr>
-      <tr><td>Contact messages</td><td>What the sender chooses to write</td><td>Responding · legitimate interest</td></tr>
-    </tbody>
-  </table>
-  <div class="honest"><b>Pseudonymisation is a shared responsibility, stated plainly:</b> the <code style="color:#7fe3b0">user_id</code> and <code style="color:#7fe3b0">device_id</code> fields are supplied by the customer. Our documentation instructs customers to send pseudonymous identifiers (e.g. <i>user_4471</i>), never names, e-mail addresses or other direct identifiers. Where a customer follows this, chain records contain no directly identifying personal data. Customers acting as controllers remain responsible for what they choose to transmit; Monop Content acts as processor for event data processed on customers' instructions.</div>
-
-  <h2><span class="n">3.</span>What we deliberately do not hold</h2>
-  <ul>
-    <li>No notarised content — documents, posts, messages and bank details are fingerprinted client-side and never transmitted.</li>
-    <li>No identity documents and no raw KYC references — hashes only.</li>
-    <li>No message content in Guardian — fingerprints only.</li>
-    <li>No card or bank account numbers — payments are processed by Stripe; the Payment Notary stores only user-chosen masked display fields.</li>
-    <li>No behavioural profiles beyond the per-user trust score the customer's own events generate, held against the customer's pseudonymous identifier.</li>
-    <li>No advertising, no analytics resale, no third-party data sharing of any kind. The business model is the platform fee; the data is not the product.</li>
-  </ul>
-
-  <h2><span class="n">4.</span>Where data lives, and the sovereign option</h2>
-  <p>The hosted platform runs on Railway cloud infrastructure with the database on a persistent encrypted volume; connections are TLS-encrypted in transit; backups are taken daily. Sub-processors are listed in §7. Hosting region details and current sub-processor terms are available on request at justin@monopcontent.com.</p>
-  <div class="green"><b>Full data sovereignty is a product option, not a promise:</b> organisations whose data cannot leave their own network can run the sovereign engine entirely on their own hardware — decisions, chain and database inside their building, licence validation fully offline, no phone-home. Under sovereign deployment, Monop Content processes nothing at all.</div>
-
-  <h2><span class="n">5.</span>Retention — and the honest tension with an append-only chain</h2>
-  <p>Account and billing data are retained for the life of the account plus the period required by tax and accounting law. Contact messages are retained only as long as needed to respond.</p>
-  <p>Chain records require an honest explanation rather than a boilerplate one. The chain is append-only by design — its evidential value exists precisely because records cannot be deleted or altered. This is why the platform is architected so that chain records should contain <b>no directly identifying personal data</b>: fingerprints, pseudonymous identifiers and hashes are sealed; content and identities are not. Where a valid erasure request nonetheless touches sealed data (for example, display fields a user chose to make public on an identity seal), we honour it by erasing the stored display data while the cryptographic fingerprint — which identifies no one — remains in the chain. This preserves both the data subject's rights and the integrity of the record for everyone else.</p>
-
-  <h2><span class="n">6.</span>Data subject rights</h2>
-  <p>Requests for access, rectification, erasure, restriction or portability go to <b>justin@monopcontent.com</b> and are answered within one calendar month. For event data processed on a customer's behalf, requests are handled with, and routed via, the customer as controller. UK data subjects may complain to the ICO; EU data subjects to their national supervisory authority.</p>
-
-  <h2><span class="n">7.</span>Sub-processors</h2>
-  <table>
-    <thead><tr><th>Provider</th><th>Purpose</th><th>Data touched</th></tr></thead>
-    <tbody>
-      <tr><td>Railway</td><td>Application hosting and database volume</td><td>All hosted-platform data at rest and in transit</td></tr>
-      <tr><td>Stripe</td><td>Billing and payment processing</td><td>Billing identity and payment card data (held by Stripe, not by us)</td></tr>
-      <tr><td>Brevo</td><td>Transactional e-mail (alerts, receipts, contact)</td><td>E-mail addresses and message content of e-mails sent</td></tr>
-    </tbody>
-  </table>
-  <p>Sub-processors will not be added or changed without this document being updated — and each revision of this document is fingerprinted and sealed into the chain, so its history is tamper-evident.</p>
-
-  <h2><span class="n">8.</span>Security measures, summarised</h2>
-  <ul>
-    <li>TLS for all connections; secrets held in environment variables, never in code or the repository.</li>
-    <li>Bearer-key authentication with per-key rate limits; HMAC-SHA256 signed tokens for challenges, authority and licences.</li>
-    <li>Single-lock, write-ahead-journaled database writes; the sealed chain makes any tampering — including by the operator — externally detectable.</li>
-    <li>Daily automated backups; deployment exclusively through version-controlled pipeline, so every production state is attributable.</li>
-  </ul>
-
-  <div class="honest"><b>Honest maturity statement:</b> Monop Content is an early-stage, single-operator company. This statement describes practices genuinely in operation today. We do not hold ISO 27001 or SOC 2 certification at this stage and will not imply otherwise; what we offer instead, unusually, is a platform whose core integrity claims any prospect can verify from outside before trusting us with anything.</div>
-
-  <hr>
-  <footer>
-    <p style="margin-top:20px"><a href="/">sebbi.pro</a> · <a href="/risk-policy">Risk Management Policy</a> · <a href="/human-oversight">Human Oversight Policy</a> · <a href="/whitepaper">Whitepaper</a> · <a href="/contact">Contact</a></p>
-    <p style="margin-top:8px;color:var(--faint)">Monop Content · Blyth, Northumberland, UK · justin@monopcontent.com</p>
-  </footer>
-</div>
 </body>
 </html>
 
