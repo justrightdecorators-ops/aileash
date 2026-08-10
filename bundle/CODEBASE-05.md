@@ -1,2174 +1,11 @@
-# Codebase — part 5 of 19
+# Codebase — part 5 of 18
 
 Contains:
-- `modules/demo.py`
-- `modules/dsr.py`
-- `modules/fingerprint.py`
-- `modules/lineage.py`
-- `modules/mutual.py`
 - `modules/network.py`
-
-
-## `modules/demo.py`
-
-358 lines, 15159 bytes
-
-```python
-"""
-Public proving ground - /x/demo/<action>
-
-WHY THIS EXISTS
----------------
-Every page on this platform says "check it, don't trust it" and then asks for
-an email address before anyone can check anything. That is the same bargain
-every other vendor offers, dressed in better language.
-
-This removes the bargain. No key, no account, no email. A visitor sends a
-scenario, gets a real verdict from the live engine, and it is sealed into the
-production chain - the same chain, the same sequence, covered by the same
-external anchor. They get the block index back and can verify it themselves at
-a public endpoint that has never heard of them.
-
-The demonstration is not a simulation of the product. It IS the product, run
-once, by a stranger, for free.
-
-WHAT IS DELIBERATELY REAL
--------------------------
-  - the scoring is the engine's own arithmetic, not a mock
-  - the seal is a genuine block in the live chain
-  - the counterfactual is computed by inverting the real function
-  - the review flow really does withhold the verdict until commitment
-  - the dwell time is really measured and really sealed
-
-WHAT IS DELIBERATELY NOT REAL
------------------------------
-  - demo events do not touch any customer's trust history; user ids are
-    namespaced to demo: and scored from a neutral starting trust
-  - nothing about a visitor is recorded beyond what they typed
-
-ABUSE
------
-Public routes are rate limited per client by the router. A visitor cannot
-flood the chain, and the cost of a demo block is a few hundred bytes.
-
-    POST /x/demo/govern   scenario -> verdict, seal, counterfactual
-    POST /x/demo/review   open a review case, verdict withheld
-    POST /x/demo/commit   commit a verdict, then see what the machine said
-    GET  /x/demo/stats    how many people have tried it
-"""
-
-import json, math, secrets, time
-from datetime import datetime, timezone
-
-VERSION = "1.0"
-
-# No key required for any of these - that is the entire point.
-PUBLIC = {("POST", "govern"), ("POST", "review"), ("POST", "commit"),
-          ("GET", "stats"), ("GET", "")}
-
-DEMO_KEY = "public_demo"
-LN_CAP = math.log1p(10000)
-SAFE = {"UK", "US", "DE", "FR", "CA", "AU", "NL", "SE", "NO", "DK", "FI", "IE", "NZ"}
-
-_ready = False
-
-
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        ctx["conn"].execute("CREATE TABLE IF NOT EXISTS demo_cases(case_id TEXT PRIMARY KEY,opened REAL,material TEXT,machine_verdict TEXT,score REAL,committed REAL,human_verdict TEXT,dwell REAL)")
-        ctx["conn"].execute("CREATE TABLE IF NOT EXISTS demo_stats(k TEXT PRIMARY KEY,v INTEGER)")
-        ctx["conn"].commit()
-    _ready = True
-
-
-def _bump(ctx, k):
-    with ctx["lock"]:
-        ctx["conn"].execute("INSERT INTO demo_stats(k,v) VALUES(?,1) ON CONFLICT(k) DO UPDATE SET v=v+1", (k,))
-        ctx["conn"].commit()
-
-
-def _clamp(x, a=0.0, b=1.0):
-    return max(a, min(b, x))
-
-
-def _iso(ts):
-    if not ts:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
-
-def _f(d, k, default=0.0):
-    try:
-        return float(d.get(k, default))
-    except (TypeError, ValueError):
-        return default
-
-
-def _signals(data):
-    country = str(data.get("country", "UK")).strip().upper()[:4] or "UK"
-    return {
-        "trust": _clamp(_f(data, "trust", 0.5)),
-        "v60": max(0.0, min(_f(data, "v60"), 10000)),
-        "v5m": max(0.0, min(_f(data, "v5m"), 10000)),
-        "v1h": max(0.0, min(_f(data, "v1h"), 100000)),
-        "amount": max(0.0, min(_f(data, "amount"), 10000000)),
-        "device_risk": _clamp(_f(data, "device_risk")),
-        "anomaly": _clamp(_f(data, "anomaly")),
-        "country": country,
-        "country_shift": bool(data.get("country_shift")),
-        "unsafe_country": country not in SAFE,
-    }
-
-
-def _score(s):
-    sc = (1 - s["trust"]) * 0.30
-    sc += min(s["v60"] / 20.0, 1) * 0.15
-    sc += min(s["v5m"] / 50.0, 1) * 0.10
-    sc += min(s["v1h"] / 200.0, 1) * 0.10
-    sc += min(math.log1p(s["amount"]) / LN_CAP, 1) * 0.15
-    sc += s["device_risk"] * 0.10
-    sc += s["anomaly"] * 0.10
-    if s["country_shift"]:
-        sc += 0.10
-    if s["unsafe_country"]:
-        sc += 0.10
-    return round(_clamp(sc), 4)
-
-
-def _reasons(s):
-    r = []
-    if s["trust"] < 0.4:
-        r.append("low_trust")
-    if s["v60"] > 10:
-        r.append("velocity_spike")
-    if s["amount"] > 500:
-        r.append("high_amount")
-    if s["device_risk"] > 0.5:
-        r.append("risky_device")
-    if s["anomaly"] > 0.5:
-        r.append("behaviour_anomaly")
-    if s["country_shift"]:
-        r.append("country_shift")
-    if s["unsafe_country"]:
-        r.append("unsafe_country")
-    return r
-
-
-def _verdict(sc):
-    if sc < 0.35:
-        return "ALLOW"
-    if sc < 0.70:
-        return "CHALLENGE"
-    return "BLOCK"
-
-
-def _counterfactual(s, score, verdict):
-    """Exact inversion. Returns the cheapest single change, or None."""
-    if verdict == "ALLOW":
-        return None, "Already the most permissive verdict."
-    ceiling = 0.70 if verdict == "BLOCK" else 0.35
-    target = "CHALLENGE" if verdict == "BLOCK" else "ALLOW"
-    needed = score - ceiling + 0.0001
-
-    contribs = [
-        ("trust", (1 - s["trust"]) * 0.30),
-        ("amount", min(math.log1p(s["amount"]) / LN_CAP, 1) * 0.15),
-        ("v60", min(s["v60"] / 20.0, 1) * 0.15),
-        ("v5m", min(s["v5m"] / 50.0, 1) * 0.10),
-        ("v1h", min(s["v1h"] / 200.0, 1) * 0.10),
-        ("device_risk", s["device_risk"] * 0.10),
-        ("anomaly", s["anomaly"] * 0.10),
-        ("country_shift", 0.10 if s["country_shift"] else 0.0),
-        ("unsafe_country", 0.10 if s["unsafe_country"] else 0.0),
-    ]
-    contribs.sort(key=lambda kv: -kv[1])
-
-    for name, c in contribs:
-        if c <= 0 or c < needed:
-            continue
-        t = c - needed
-        if name == "trust":
-            v = 1 - (t / 0.30)
-            if v <= 1.0:
-                return {"factor": "trust", "required": round(_clamp(v), 3),
-                        "was": round(s["trust"], 3)}, ("a trust score of "
-                        + str(round(_clamp(v), 3)) + " instead of "
-                        + str(round(s["trust"], 3)) + " would have made this "
-                        + target)
-        if name == "amount":
-            v = math.expm1((t / 0.15) * LN_CAP)
-            return {"factor": "amount", "required": round(v, 2),
-                    "was": round(s["amount"], 2)}, ("an amount of "
-                    + str(round(v, 2)) + " instead of " + str(round(s["amount"], 2))
-                    + " would have made this " + target)
-        if name in ("v60", "v5m", "v1h"):
-            cap, w = {"v60": (20.0, 0.15), "v5m": (50.0, 0.10), "v1h": (200.0, 0.10)}[name]
-            v = (t / w) * cap
-            lbl = {"v60": "60-second", "v5m": "5-minute", "v1h": "1-hour"}[name]
-            return {"factor": name, "required": int(v), "was": int(s[name])}, (
-                "a " + lbl + " velocity of " + str(int(v)) + " instead of "
-                + str(int(s[name])) + " would have made this " + target)
-        if name in ("device_risk", "anomaly"):
-            v = t / 0.10
-            lbl = "device risk" if name == "device_risk" else "behavioural anomaly"
-            return {"factor": name, "required": round(_clamp(v), 3), "was": round(s[name], 3)}, (
-                "a " + lbl + " of " + str(round(_clamp(v), 3)) + " instead of "
-                + str(round(s[name], 3)) + " would have made this " + target)
-        if name in ("country_shift", "unsafe_country"):
-            lbl = ("no country change from the previous event" if name == "country_shift"
-                   else "an event from a jurisdiction on the safe list")
-            return {"factor": name, "required": 0, "was": 1}, (
-                lbl + " would have made this " + target)
-    return None, ("no single factor, changed alone, would have reached "
-                  + target + " - several drove this together")
-
-
-def _govern(ctx, data):
-    s = _signals(data)
-    score = _score(s)
-    verdict = _verdict(score)
-    reasons = _reasons(s)
-    cf, cf_text = _counterfactual(s, score, verdict)
-
-    ts = time.time()
-    uid = "demo:" + secrets.token_hex(3)
-    ev = {"user_id": uid, "action": str(data.get("action", "payment"))[:40],
-          "amount": s["amount"], "country": s["country"],
-          "device_id": "demo", "anomaly": s["anomaly"],
-          "device_risk": s["device_risk"]}
-    res = {"decision": verdict, "score": score, "reasons": reasons,
-           "demo": True, "demo_version": VERSION, "timestamp": ts,
-           "signals": {k: s[k] for k in ("trust", "v60", "v5m", "v1h",
-                                          "country_shift", "unsafe_country")},
-           "note": "public demonstration - sealed into the live chain like any other decision"}
-    h, idx, seq = ctx["seal"](ev, res, ts, DEMO_KEY)
-    _bump(ctx, "govern")
-
-    return {"decision": verdict, "score": score, "reasons": reasons,
-            "sealed_at": _iso(ts),
-            "audit_hash": h, "block_index": idx, "receipt_seq": seq,
-            "counterfactual": cf,
-            "counterfactual_statement": cf_text,
-            "verify": {
-                "this_block": "/api/inclusion?hash=" + h,
-                "whole_chain": "/api/verify-chain",
-                "external_anchor": "/api/anchor-status"},
-            "what_just_happened": [
-                "Your scenario was scored by the live engine, not a simulation.",
-                "The verdict was sealed into the production chain as block " + str(idx) + ".",
-                "That block is now covered by the next external timestamp.",
-                "Nothing about you was recorded. No account, no email, no key.",
-                "Verify any of it at the links above - they have never heard of you."]}, 200
-
-
-def _review(ctx, data):
-    """Open a review case. The verdict is computed and sealed - and withheld."""
-    s = _signals(data)
-    score = _score(s)
-    verdict = _verdict(score)
-    cid = "DEMO-" + secrets.token_hex(4).upper()
-    ts = time.time()
-    material = {"action": str(data.get("action", "payment"))[:40],
-                "amount": s["amount"], "country": s["country"],
-                "60_second_velocity": int(s["v60"]),
-                "5_minute_velocity": int(s["v5m"]),
-                "device_risk": s["device_risk"],
-                "behavioural_anomaly": s["anomaly"],
-                "country_changed": s["country_shift"],
-                "trust_history": round(s["trust"], 3)}
-    with ctx["lock"]:
-        ctx["conn"].execute("INSERT INTO demo_cases(case_id,opened,material,machine_verdict,score,committed,human_verdict,dwell) VALUES(?,?,?,?,?,NULL,NULL,NULL)",
-                            (cid, ts, json.dumps(material), verdict, score))
-        ctx["conn"].commit()
-    _bump(ctx, "review_opened")
-    return {"case_id": cid, "opened": _iso(ts), "material": material,
-            "machine_verdict": "withheld until you commit",
-            "your_options": ["allow", "challenge", "block"],
-            "instruction": "Decide for yourself, then POST your verdict to /x/demo/commit with this case_id. The clock is running and your answer is sealed before ours is shown."}, 200
-
-
-def _commit(ctx, data):
-    cid = str(data.get("case_id", "")).strip().upper()
-    hv = str(data.get("verdict", "")).strip().upper()
-    if hv not in ("ALLOW", "CHALLENGE", "BLOCK"):
-        return {"error": "verdict_required", "allowed": ["allow", "challenge", "block"]}, 400
-    with ctx["lock"]:
-        row = ctx["conn"].execute("SELECT opened,material,machine_verdict,score,committed FROM demo_cases WHERE case_id=?", (cid,)).fetchone()
-    if not row:
-        return {"error": "unknown_case_id"}, 404
-    if row[4]:
-        return {"error": "already_committed",
-                "message": "You commit once. That is the point of it."}, 400
-
-    ts = time.time()
-    dwell = round(ts - row[0], 2)
-    agreed = (hv == row[2])
-
-    ev = {"user_id": "demo:" + cid, "action": "demo_oversight_commit",
-          "amount": 0, "country": "UK", "device_id": "demo",
-          "anomaly": 0, "device_risk": 0}
-    res = {"decision": "DEMO_OVERSIGHT_SEALED", "score": 0, "demo": True,
-           "timestamp": ts, "human_verdict": hv, "dwell_seconds": dwell,
-           "detail": "human verdict sealed before the machine verdict was revealed"}
-    h, idx, seq = ctx["seal"](ev, res, ts, DEMO_KEY)
-
-    with ctx["lock"]:
-        ctx["conn"].execute("UPDATE demo_cases SET committed=?,human_verdict=?,dwell=? WHERE case_id=?",
-                            (ts, hv, dwell, cid))
-        ctx["conn"].commit()
-    _bump(ctx, "review_committed")
-
-    out = {"case_id": cid, "your_verdict": hv,
-           "machine_verdict": row[2], "machine_score": row[3],
-           "agreed": agreed, "dwell_seconds": dwell,
-           "audit_hash": h, "block_index": idx, "receipt_seq": seq,
-           "what_just_happened": [
-               "Your verdict was sealed as block " + str(idx) + " BEFORE this response revealed ours.",
-               "The chain fixes that order permanently and it cannot be reversed.",
-               "Your dwell time of " + str(dwell) + "s is part of the record.",
-               "That is the difference between a reviewer who decided and one who agreed."]}
-    if dwell < 2:
-        out["flag"] = ("committed in " + str(dwell) + " seconds - on a real system that would sit "
-                       "in your record permanently, and a pattern of it would be visible to an auditor")
-    if agreed:
-        out["note"] = "You agreed with the engine - but the chain shows you did so without having seen it."
-    else:
-        out["note"] = "You diverged from the engine. On a real system that is evidence of independent judgement."
-    return out, 200
-
-
-def _stats(ctx):
-    with ctx["lock"]:
-        rows = ctx["conn"].execute("SELECT k,v FROM demo_stats").fetchall()
-        cases = ctx["conn"].execute("SELECT COUNT(*),AVG(dwell) FROM demo_cases WHERE committed IS NOT NULL").fetchone()
-        fast = ctx["conn"].execute("SELECT COUNT(*) FROM demo_cases WHERE dwell IS NOT NULL AND dwell<2").fetchone()
-    d = {k: v for k, v in rows}
-    out = {"decisions_run": d.get("govern", 0),
-           "review_cases_opened": d.get("review_opened", 0),
-           "review_cases_committed": d.get("review_committed", 0)}
-    if cases and cases[0]:
-        out["median_dwell_seconds"] = round(cases[1] or 0, 2)
-        out["committed_under_2_seconds"] = fast[0] if fast else 0
-        out["note"] = ("Visitors who committed in under two seconds did not read the case. "
-                       "On a real deployment that is exactly what the record would show.")
-    return out, 200
-
-
-def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-    if method == "POST":
-        if action == "govern":
-            return _govern(ctx, data)
-        if action == "review":
-            return _review(ctx, data)
-        if action == "commit":
-            return _commit(ctx, data)
-    else:
-        if action in ("", "stats"):
-            return _stats(ctx)
-    return {"error": "unknown_action", "action": action,
-            "available": ["POST govern", "POST review", "POST commit", "GET stats"]}, 404
-
-```
-
-
-## `modules/dsr.py`
-
-239 lines, 10666 bytes
-
-```python
-"""
-DSR notary - /x/dsr/<action>
-
-Seals the lifecycle of a data subject request into the MAIN audit chain:
-received, assessed, extended, completed. Each is an ordinary block in
-audit_log, so /api/verify-chain and the anchor cover them automatically.
-
-The chain never holds the person's identity. The identifier is HMAC'd on
-arrival and only the fingerprint is stored - so personal data is deleted in
-your own systems as normal, and what remains is a seal resolving to nothing.
-
-Needs DSR_SECRET set in Railway (falls back to LICENCE_SECRET).
-Never change it once live - existing fingerprints become unresolvable.
-
-    POST /x/dsr/receive    subject_identifier, kind, channel, note
-    POST /x/dsr/assess     request_id, outcome, ground, reasoning, assessed_by
-    POST /x/dsr/extend     request_id, reason
-    POST /x/dsr/complete   request_id, action_taken, responded_by
-    GET  /x/dsr/request?id=DSR-XXXXXXXX
-    GET  /x/dsr/overdue
-    GET  /x/dsr/list
-"""
-
-import hashlib, hmac, json, os, secrets, time
-from datetime import datetime, timezone
-
-KINDS = {"erasure", "access", "rectification", "objection", "portability", "restriction"}
-OUTCOMES = {"granted", "refused", "partial"}
-VERSION = "1.0"
-
-_ready = False
-
-
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        ctx["conn"].execute("CREATE TABLE IF NOT EXISTS dsr_requests(request_id TEXT PRIMARY KEY,api_key TEXT,subject_fp TEXT,kind TEXT,received REAL,deadline REAL,extended INTEGER DEFAULT 0,status TEXT DEFAULT 'open',closed REAL,seal TEXT,block_index INTEGER)")
-        ctx["conn"].execute("CREATE INDEX IF NOT EXISTS idx_dsr_key ON dsr_requests(api_key)")
-        ctx["conn"].commit()
-    _ready = True
-
-
-def _secret():
-    s = os.environ.get("DSR_SECRET", "").strip() or os.environ.get("LICENCE_SECRET", "").strip()
-    return s.encode() if s else None
-
-
-def fingerprint(ident):
-    s = _secret()
-    if not s:
-        return None
-    return hmac.new(s, str(ident).strip().lower().encode(), hashlib.sha256).hexdigest()
-
-
-def _add_months(ts, n):
-    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-    mi = dt.month - 1 + n
-    y = dt.year + mi // 12
-    m = mi % 12 + 1
-    leap = (y % 4 == 0 and (y % 100 != 0 or y % 400 == 0))
-    dim = [31, 29 if leap else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m - 1]
-    return dt.replace(year=y, month=m, day=min(dt.day, dim)).timestamp()
-
-
-def _iso(ts):
-    if not ts:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
-
-def _seal_event(ctx, api_key, rid, fp, action, detail):
-    ts = time.time()
-    ev = {"user_id": "dsr:" + rid, "action": "dsr_" + action, "amount": 0,
-          "country": "UK", "device_id": "dsr", "anomaly": 0, "device_risk": 0,
-          "subject_fp": fp}
-    res = {"decision": "DSR_SEALED", "score": 0, "dsr_action": action,
-           "dsr_version": VERSION, "timestamp": ts, "detail": detail,
-           "note": "data subject request lifecycle event - no personal data in this block"}
-    h, idx, seq = ctx["seal"](ev, res, ts, api_key)
-    return h, idx, seq, ts
-
-
-def _lookup(ctx, api_key, rid):
-    with ctx["lock"]:
-        return ctx["conn"].execute("SELECT subject_fp,kind,received,deadline,extended,status,closed FROM dsr_requests WHERE request_id=? AND api_key=?", (rid, api_key)).fetchone()
-
-
-def _receive(ctx, api_key, data):
-    if not _secret():
-        return {"error": "dsr_secret_not_set", "message": "Set DSR_SECRET in Railway."}, 503
-    ident = str(data.get("subject_identifier", "")).strip()
-    if not ident:
-        return {"error": "subject_identifier_required"}, 400
-    kind = str(data.get("kind", "erasure")).strip().lower()
-    if kind not in KINDS:
-        return {"error": "invalid_kind", "allowed": sorted(KINDS)}, 400
-    fp = fingerprint(ident)
-    rid = "DSR-" + secrets.token_hex(4).upper()
-    ts = time.time()
-    deadline = _add_months(ts, 1)
-    detail = "kind=" + kind + ";channel=" + str(data.get("channel", ""))[:60] + ";note=" + str(data.get("note", ""))[:200]
-    h, idx, seq, _x = _seal_event(ctx, api_key, rid, fp, "received", detail)
-    with ctx["lock"]:
-        ctx["conn"].execute("INSERT INTO dsr_requests(request_id,api_key,subject_fp,kind,received,deadline,extended,status,closed,seal,block_index) VALUES(?,?,?,?,?,?,0,'open',NULL,?,?)",
-                            (rid, api_key, fp, kind, ts, deadline, h, idx))
-        ctx["conn"].commit()
-    return {"request_id": rid, "kind": kind, "subject_fp": fp[:16] + "...",
-            "received": _iso(ts), "respond_by": _iso(deadline),
-            "audit_hash": h, "block_index": idx, "receipt_seq": seq,
-            "message": "Clock started. One calendar month to respond."}, 200
-
-
-def _assess(ctx, api_key, data):
-    rid = str(data.get("request_id", "")).strip()
-    row = _lookup(ctx, api_key, rid)
-    if not row:
-        return {"error": "unknown_request_id"}, 404
-    outcome = str(data.get("outcome", "")).strip().lower()
-    if outcome not in OUTCOMES:
-        return {"error": "invalid_outcome", "allowed": sorted(OUTCOMES)}, 400
-    reasoning = str(data.get("reasoning", "")).strip()
-    if not reasoning:
-        return {"error": "reasoning_required", "message": "The reasoning is the part examined later. It cannot be blank."}, 400
-    detail = ("outcome=" + outcome + ";ground=" + str(data.get("ground", ""))[:120] +
-              ";by=" + str(data.get("assessed_by", ""))[:60] + ";reasoning=" + reasoning[:600])
-    h, idx, seq, ts = _seal_event(ctx, api_key, rid, row[0], "assessed", detail)
-    with ctx["lock"]:
-        ctx["conn"].execute("UPDATE dsr_requests SET status=? WHERE request_id=? AND api_key=?", ("assessed:" + outcome, rid, api_key))
-        ctx["conn"].commit()
-    return {"request_id": rid, "outcome": outcome, "audit_hash": h, "block_index": idx, "receipt_seq": seq}, 200
-
-
-def _extend(ctx, api_key, data):
-    rid = str(data.get("request_id", "")).strip()
-    row = _lookup(ctx, api_key, rid)
-    if not row:
-        return {"error": "unknown_request_id"}, 404
-    if row[4]:
-        return {"error": "already_extended", "message": "A request can be extended once."}, 400
-    reason = str(data.get("reason", "")).strip()
-    if not reason:
-        return {"error": "reason_required", "message": "An extension needs a stated reason."}, 400
-    old = row[3]
-    new = _add_months(old, 2)
-    detail = "old_deadline=" + str(_iso(old)) + ";new_deadline=" + str(_iso(new)) + ";reason=" + reason[:300]
-    h, idx, seq, ts = _seal_event(ctx, api_key, rid, row[0], "extended", detail)
-    with ctx["lock"]:
-        ctx["conn"].execute("UPDATE dsr_requests SET deadline=?,extended=1 WHERE request_id=? AND api_key=?", (new, rid, api_key))
-        ctx["conn"].commit()
-    return {"request_id": rid, "was_due": _iso(old), "respond_by": _iso(new),
-            "audit_hash": h, "block_index": idx, "receipt_seq": seq}, 200
-
-
-def _complete(ctx, api_key, data):
-    rid = str(data.get("request_id", "")).strip()
-    row = _lookup(ctx, api_key, rid)
-    if not row:
-        return {"error": "unknown_request_id"}, 404
-    action = str(data.get("action_taken", "")).strip()
-    if not action:
-        return {"error": "action_taken_required"}, 400
-    ts = time.time()
-    in_time = ts <= row[3]
-    detail = ("action=" + action[:400] + ";by=" + str(data.get("responded_by", ""))[:60] +
-              ";within_deadline=" + ("yes" if in_time else "no"))
-    h, idx, seq, _x = _seal_event(ctx, api_key, rid, row[0], "completed", detail)
-    with ctx["lock"]:
-        ctx["conn"].execute("UPDATE dsr_requests SET status='closed',closed=? WHERE request_id=? AND api_key=?", (ts, rid, api_key))
-        ctx["conn"].commit()
-    return {"request_id": rid, "closed": _iso(ts), "within_deadline": in_time,
-            "audit_hash": h, "block_index": idx, "receipt_seq": seq}, 200
-
-
-def _timeline(ctx, api_key, rid):
-    row = _lookup(ctx, api_key, rid)
-    if not row:
-        return {"error": "unknown_request_id"}, 404
-    with ctx["lock"]:
-        blocks = ctx["conn"].execute("SELECT ts,result_json,audit_hash,key_seq FROM audit_log WHERE user_id=? ORDER BY id ASC", ("dsr:" + rid,)).fetchall()
-    events = []
-    for ts_, res, ah, seq in blocks:
-        try:
-            r = json.loads(res)
-            events.append({"at": _iso(ts_), "event": r.get("dsr_action"),
-                           "detail": r.get("detail"), "sealed": ah, "receipt_seq": seq})
-        except Exception:
-            pass
-    return {"request_id": rid, "kind": row[1], "received": _iso(row[2]),
-            "respond_by": _iso(row[3]), "extended": bool(row[4]),
-            "status": row[5], "closed": _iso(row[6]), "events": events,
-            "verify": "/api/verify-chain re-checks these with the rest of the chain"}, 200
-
-
-def _overdue(ctx, api_key):
-    t = time.time()
-    with ctx["lock"]:
-        rows = ctx["conn"].execute("SELECT request_id,kind,received,deadline FROM dsr_requests WHERE api_key=? AND status!='closed' AND deadline<? ORDER BY deadline ASC", (api_key, t)).fetchall()
-    return {"count": len(rows),
-            "overdue": [{"request_id": r[0], "kind": r[1], "received": _iso(r[2]),
-                         "was_due": _iso(r[3]), "days_late": round((t - r[3]) / 86400, 1)} for r in rows]}, 200
-
-
-def _list(ctx, api_key):
-    t = time.time()
-    with ctx["lock"]:
-        rows = ctx["conn"].execute("SELECT request_id,kind,received,deadline,status,extended FROM dsr_requests WHERE api_key=? ORDER BY received DESC LIMIT 200", (api_key,)).fetchall()
-    out = []
-    for r in rows:
-        out.append({"request_id": r[0], "kind": r[1], "received": _iso(r[2]),
-                    "respond_by": _iso(r[3]), "status": r[4], "extended": bool(r[5]),
-                    "days_remaining": (round((r[3] - t) / 86400, 1) if r[4] != "closed" else None)})
-    return {"count": len(out), "requests": out}, 200
-
-
-def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-    if method == "POST":
-        if action == "receive":
-            return _receive(ctx, api_key, data)
-        if action == "assess":
-            return _assess(ctx, api_key, data)
-        if action == "extend":
-            return _extend(ctx, api_key, data)
-        if action == "complete":
-            return _complete(ctx, api_key, data)
-    else:
-        if action == "overdue":
-            return _overdue(ctx, api_key)
-        if action == "list":
-            return _list(ctx, api_key)
-        if action == "request":
-            rid = str(data.get("id", "")).strip()
-            if not rid:
-                return {"error": "id_required"}, 400
-            return _timeline(ctx, api_key, rid)
-    return {"error": "unknown_action", "action": action}, 404
-
-```
-
-
-## `modules/fingerprint.py`
-
-550 lines, 22358 bytes
-
-```python
-"""
-modules/fingerprint.py  -  is somebody else running my scoring function?
-
-THE IDEA
---------
-The scoring engine is deterministic. Identical inputs give an identical score,
-every time, forever. That is a compliance property - and it is also a
-signature.
-
-So: fire a fixed battery of carefully chosen inputs at any scoring endpoint,
-fire the same battery at our own, and compare the two sets of numbers.
-
-  identical across 24 varied vectors        it is this function
-  identical shape, different scale          it is this function, reweighted
-  same ordering, different curve            similar design, not this code
-  unrelated                                 unrelated
-
-WHY THE VECTORS ARE CHOSEN THE WAY THEY ARE
--------------------------------------------
-Random inputs would only catch a straight copy. These are picked to probe the
-specific design decisions in the function, because those are what survive
-someone renaming things or nudging a weight:
-
-  saturation points   velocity terms saturate at different counts per window,
-                      so a burst and a grind separate. Vectors sit either side
-                      of each saturation point.
-  curve shape         amount is log-scaled, so small sums move the score far
-                      more than large ones. Vectors walk that curve.
-  normalisation       the continuous weights sum to 1.00 and the boolean
-                      geography terms sit outside it. Vectors isolate that.
-  asymmetry           trust contributes inversely and dominates. Vectors sweep
-                      trust alone with everything else held flat.
-
-A copy that renamed every field and changed nothing else matches exactly. A
-copy that shifted the weights still tracks the shape, because the saturation
-points and the log curve are structural rather than parametric.
-
-WHAT IT CANNOT DO
------------------
-It only sees endpoints it can reach. A private product behind a key with no
-free tier is invisible to this, and no amount of cleverness changes that.
-
-It also proves similarity, never theft. Two people can converge on similar
-weights honestly. What this produces is a dated, sealed measurement - which is
-evidence, not a verdict, and the distinction matters if it is ever put in
-front of anyone.
-
-EVERY RUN IS SEALED
--------------------
-The probe, the target, the vectors and the result all go into the chain. So a
-comparison run today is provable as having been run today, rather than
-assembled afterwards to fit an argument.
-
-ROUTES  (all keyed - this is not a public toy)
-----------------------------------------------
-  POST /x/fingerprint/self      score the battery on our own engine
-  POST /x/fingerprint/probe     url, plus optional field mapping. Compare.
-  GET  /x/fingerprint/history   previous probes and their verdicts
-  GET  /x/fingerprint/vectors   the battery itself
-  GET  /x/fingerprint/spec      what a verdict means and does not mean
-"""
-
-import ipaddress
-import json
-import math
-import socket
-import sys
-import time
-import urllib.error
-import urllib.request
-from urllib.parse import urlparse
-
-VERSION = "1.0"
-
-PUBLIC = set()          # nothing public. deliberately.
-
-FETCH_TIMEOUT = 10
-MAX_BYTES = 200000
-POLITE_DELAY = 0.4      # do not hammer somebody else's server
-ALLOWED_SCHEMES = ("http", "https")
-ALLOWED_PORTS = (80, 443)
-
-# Where the live scorer might be found. Same approach as replay.py - look it
-# up at runtime, never import server.py.
-SCORER_NAMES = ["score_event", "score", "_score_event"]
-
-_ready = False
-
-
-# ----------------------------------------------------------------------
-# the battery
-# ----------------------------------------------------------------------
-# Each vector is (label, signals). Signals use the engine's own internal
-# names; the probe maps them to whatever the target calls things.
-
-def _v(trust=0.5, v60=0, v5m=0, v1h=0, amount=0.0,
-       device_risk=0.0, anomaly=0.0, country_shift=False, unsafe_country=False):
-    return {"trust": trust, "v60": v60, "v5m": v5m, "v1h": v1h,
-            "amount": amount, "device_risk": device_risk, "anomaly": anomaly,
-            "country_shift": country_shift, "unsafe_country": unsafe_country}
-
-
-VECTORS = [
-    # --- trust sweep, everything else flat. Isolates the dominant term.
-    ("trust-000", _v(trust=0.00)),
-    ("trust-025", _v(trust=0.25)),
-    ("trust-050", _v(trust=0.50)),
-    ("trust-075", _v(trust=0.75)),
-    ("trust-100", _v(trust=1.00)),
-
-    # --- velocity: either side of each window's saturation point.
-    ("v60-under",   _v(v60=10)),
-    ("v60-at",      _v(v60=20)),
-    ("v60-over",    _v(v60=40)),      # saturated: must equal v60-at
-    ("v5m-under",   _v(v5m=25)),
-    ("v5m-at",      _v(v5m=50)),
-    ("v5m-over",    _v(v5m=100)),     # saturated
-    ("v1h-under",   _v(v1h=100)),
-    ("v1h-at",      _v(v1h=200)),
-    ("v1h-over",    _v(v1h=400)),     # saturated
-
-    # --- burst vs grind: same total actions, different distribution.
-    ("burst",       _v(v60=20, v5m=20, v1h=20)),
-    ("grind",       _v(v60=1,  v5m=8,  v1h=200)),
-
-    # --- amount: walks the log curve. Small steps low, big steps high.
-    ("amt-10",      _v(amount=10.0)),
-    ("amt-100",     _v(amount=100.0)),
-    ("amt-1000",    _v(amount=1000.0)),
-    ("amt-10000",   _v(amount=10000.0)),
-    ("amt-50000",   _v(amount=50000.0)),   # saturated
-
-    # --- the boolean geography terms, isolated.
-    ("geo-shift",   _v(country_shift=True)),
-    ("geo-unsafe",  _v(unsafe_country=True)),
-    ("geo-both",    _v(country_shift=True, unsafe_country=True)),
-
-    # --- the other two continuous signals.
-    ("dev-risk",    _v(device_risk=1.0)),
-    ("anomaly",     _v(anomaly=1.0)),
-
-    # --- everything at once. Tests the clamp and the normalisation.
-    ("max-all",     _v(trust=0.0, v60=40, v5m=100, v1h=400, amount=50000.0,
-                       device_risk=1.0, anomaly=1.0,
-                       country_shift=True, unsafe_country=True)),
-    ("min-all",     _v(trust=1.0)),
-]
-
-# Default mapping from our internal signal names to a target's request body.
-DEFAULT_FIELDS = {
-    "trust": "trust", "v60": "v60", "v5m": "v5m", "v1h": "v1h",
-    "amount": "amount", "device_risk": "device_risk", "anomaly": "anomaly",
-    "country_shift": "country_shift", "unsafe_country": "unsafe_country",
-}
-SCORE_KEYS = ["score", "risk_score", "value", "result", "rating", "confidence"]
-
-
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "CREATE TABLE IF NOT EXISTS fingerprint_probe("
-            "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,target TEXT,"
-            "ran REAL,vectors INTEGER,answered INTEGER,exact INTEGER,"
-            "verdict TEXT,correlation REAL,detail TEXT,audit_hash TEXT,"
-            "block_index INTEGER)")
-        ctx["conn"].execute(
-            "CREATE INDEX IF NOT EXISTS idx_fp_target ON fingerprint_probe(target)")
-        ctx["conn"].commit()
-    _ready = True
-
-
-# ----------------------------------------------------------------------
-# our own engine
-# ----------------------------------------------------------------------
-
-def _find_scorer():
-    for modname in ("__main__", "server"):
-        mod = sys.modules.get(modname)
-        if not mod:
-            continue
-        for name in SCORER_NAMES:
-            fn = getattr(mod, name, None)
-            if callable(fn):
-                return fn, modname + "." + name
-    return None, None
-
-
-def _score_locally():
-    """Run the battery through the live engine. Returns (scores, source, error)."""
-    fn, where = _find_scorer()
-    if not fn:
-        return None, None, ("could not find the scoring function at runtime - "
-                            "add its name to SCORER_NAMES")
-    out = []
-    for label, signals in VECTORS:
-        try:
-            result = fn(dict(signals))
-            score = result[0] if isinstance(result, (tuple, list)) else result
-            out.append((label, round(float(score), 6)))
-        except Exception as exc:
-            return None, where, "scorer raised on %s: %s" % (label, exc)
-    return out, where, None
-
-
-# ----------------------------------------------------------------------
-# reaching a target - same guards as witness.py
-# ----------------------------------------------------------------------
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-
-_opener = urllib.request.build_opener(_NoRedirect)
-
-
-def _url_allowed(url):
-    if not url or not isinstance(url, str) or len(url) > 500:
-        return False, "no usable url"
-    try:
-        parts = urlparse(url.strip())
-    except Exception:
-        return False, "unparseable url"
-    if parts.scheme not in ALLOWED_SCHEMES:
-        return False, "scheme not allowed"
-    host = parts.hostname
-    if not host:
-        return False, "no host in url"
-    port = parts.port or (443 if parts.scheme == "https" else 80)
-    if port not in ALLOWED_PORTS:
-        return False, "port not allowed"
-    try:
-        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
-    except Exception as exc:
-        return False, "could not resolve host (%s)" % type(exc).__name__
-    for info in infos:
-        try:
-            addr = ipaddress.ip_address(info[4][0])
-        except ValueError:
-            return False, "unreadable address"
-        if (addr.is_private or addr.is_loopback or addr.is_link_local
-                or addr.is_reserved or addr.is_multicast or addr.is_unspecified):
-            return False, "address is not publicly routable"
-    return True, None
-
-
-def _post(url, body, headers=None):
-    data = json.dumps(body).encode("utf-8")
-    h = {"Content-Type": "application/json", "Accept": "application/json",
-         "User-Agent": "aileash-fingerprint/%s" % VERSION}
-    if headers:
-        h.update(headers)
-    request = urllib.request.Request(url, data=data, headers=h, method="POST")
-    try:
-        with _opener.open(request, timeout=FETCH_TIMEOUT) as response:
-            raw = response.read(MAX_BYTES)
-            status = response.getcode()
-    except urllib.error.HTTPError as exc:
-        try:
-            raw = exc.read(MAX_BYTES)
-        except Exception:
-            raw = b""
-        status = exc.code
-    except Exception as exc:
-        return 0, "unreachable (%s)" % type(exc).__name__
-    try:
-        return status, json.loads(raw.decode("utf-8", "replace"))
-    except Exception:
-        return status, raw.decode("utf-8", "replace")[:300]
-
-
-def _extract_score(payload, key_hint=None):
-    """Pull a 0..1 style number out of whatever came back."""
-    if isinstance(payload, (int, float)):
-        return float(payload)
-    if not isinstance(payload, dict):
-        return None
-    keys = ([key_hint] if key_hint else []) + SCORE_KEYS
-    for k in keys:
-        if k and k in payload:
-            v = payload[k]
-            if isinstance(v, (int, float)):
-                return float(v)
-            try:
-                return float(str(v).strip())
-            except (TypeError, ValueError):
-                pass
-    # one level down
-    for v in payload.values():
-        if isinstance(v, dict):
-            found = _extract_score(v, key_hint)
-            if found is not None:
-                return found
-    return None
-
-
-# ----------------------------------------------------------------------
-# comparison
-# ----------------------------------------------------------------------
-
-def _pearson(a, b):
-    n = len(a)
-    if n < 3:
-        return None
-    ma = sum(a) / n
-    mb = sum(b) / n
-    va = sum((x - ma) ** 2 for x in a)
-    vb = sum((y - mb) ** 2 for y in b)
-    if va <= 0 or vb <= 0:
-        return None
-    cov = sum((a[i] - ma) * (b[i] - mb) for i in range(n))
-    return cov / math.sqrt(va * vb)
-
-
-def _rank(values):
-    order = sorted(range(len(values)), key=lambda i: values[i])
-    ranks = [0.0] * len(values)
-    for position, index in enumerate(order):
-        ranks[index] = float(position)
-    return ranks
-
-
-def _compare(ours, theirs):
-    """ours/theirs are lists of (label, score). theirs may contain None."""
-    paired = [(l, o, t) for (l, o), (_, t) in zip(ours, theirs) if t is not None]
-    answered = len(paired)
-    if answered < 3:
-        return {"verdict": "INCONCLUSIVE", "answered": answered,
-                "why": "too few vectors came back to compare anything"}
-
-    a = [p[1] for p in paired]
-    b = [p[2] for p in paired]
-    exact = sum(1 for i in range(answered) if abs(a[i] - b[i]) < 1e-6)
-    close = sum(1 for i in range(answered) if abs(a[i] - b[i]) < 0.01)
-    pearson = _pearson(a, b)
-    spearman = _pearson(_rank(a), _rank(b))
-
-    # a linear fit: are they our scores, scaled and shifted?
-    ma, mb = sum(a) / answered, sum(b) / answered
-    va = sum((x - ma) ** 2 for x in a)
-    slope = (sum((a[i] - ma) * (b[i] - mb) for i in range(answered)) / va) if va > 0 else None
-    intercept = (mb - slope * ma) if slope is not None else None
-    residual = None
-    if slope is not None:
-        residual = max(abs(b[i] - (slope * a[i] + intercept)) for i in range(answered))
-
-    if exact == answered:
-        verdict = "IDENTICAL"
-        why = ("Every vector matched to six decimal places. Two independently "
-               "written scoring functions do not do this.")
-    elif exact >= answered * 0.8:
-        verdict = "IDENTICAL"
-        why = ("%d of %d vectors matched exactly. The rest are consistent with "
-               "a small local change on top of the same function." % (exact, answered))
-    elif residual is not None and residual < 0.02 and pearson and pearson > 0.99:
-        verdict = "DERIVED"
-        why = ("Not identical, but every score fits ours scaled by %.3f and "
-               "shifted by %.3f, within %.4f. That is this function reweighted, "
-               "not a different one." % (slope, intercept, residual))
-    elif spearman is not None and spearman > 0.95:
-        verdict = "SAME SHAPE"
-        why = ("Different numbers, but the same ordering across the battery "
-               "(rank correlation %.3f). Consistent with the same design - the "
-               "same saturation points and the same curve - rather than the "
-               "same code." % spearman)
-    elif pearson is not None and pearson > 0.8:
-        verdict = "SIMILAR"
-        why = ("Correlated (%.3f) but not tightly. Risk scorers tend to agree "
-               "roughly on what looks risky, so this is weak on its own." % pearson)
-    else:
-        verdict = "UNRELATED"
-        why = "No meaningful relationship to our scoring."
-
-    return {
-        "verdict": verdict, "why": why,
-        "vectors": len(ours), "answered": answered,
-        "exact_matches": exact, "within_0.01": close,
-        "correlation": round(pearson, 4) if pearson is not None else None,
-        "rank_correlation": round(spearman, 4) if spearman is not None else None,
-        "best_fit": ({"scale": round(slope, 4), "shift": round(intercept, 4),
-                      "worst_residual": round(residual, 5)}
-                     if slope is not None else None),
-        "per_vector": [{"vector": p[0], "ours": p[1], "theirs": p[2],
-                        "delta": round(p[2] - p[1], 6)} for p in paired],
-    }
-
-
-# ----------------------------------------------------------------------
-# routes
-# ----------------------------------------------------------------------
-
-def _self(ctx, api_key):
-    scores, where, error = _score_locally()
-    if error:
-        return {"error": "scorer_unavailable", "message": error}, 503
-    return {"source": where, "vectors": len(scores),
-            "scores": [{"vector": l, "score": s} for l, s in scores],
-            "note": ("This is the baseline every probe is compared against. It "
-                     "reveals outputs, never weights.")}, 200
-
-
-def _probe(ctx, api_key, data):
-    url = str(data.get("url", "")).strip()
-    ok, why = _url_allowed(url)
-    if not ok:
-        return {"error": "bad_target", "message": why}, 400
-
-    fields = data.get("fields") if isinstance(data.get("fields"), dict) else {}
-    mapping = dict(DEFAULT_FIELDS)
-    mapping.update({k: str(v) for k, v in fields.items() if isinstance(v, str)})
-    score_key = data.get("score_key")
-    extra = data.get("body") if isinstance(data.get("body"), dict) else {}
-    headers = data.get("headers") if isinstance(data.get("headers"), dict) else {}
-    headers = {str(k)[:60]: str(v)[:300] for k, v in list(headers.items())[:8]}
-
-    ours, where, error = _score_locally()
-    if error:
-        return {"error": "scorer_unavailable", "message": error}, 503
-
-    theirs = []
-    failures = []
-    for label, signals in VECTORS:
-        body = dict(extra)
-        for internal, external in mapping.items():
-            body[external] = signals[internal]
-        status, payload = _post(url, body, headers)
-        if status < 200 or status >= 300:
-            theirs.append((label, None))
-            if len(failures) < 5:
-                failures.append({"vector": label, "http": status,
-                                 "response": payload if isinstance(payload, (dict, list))
-                                 else str(payload)[:200]})
-        else:
-            theirs.append((label, _extract_score(payload, score_key)))
-        time.sleep(POLITE_DELAY)
-
-    result = _compare(ours, theirs)
-    ts = time.time()
-
-    detail = ("target=" + url + ";verdict=" + result["verdict"] +
-              ";exact=" + str(result.get("exact_matches", 0)) +
-              "/" + str(result.get("answered", 0)))
-    ev = {"user_id": "fp:" + urlparse(url).hostname, "action": "fingerprint_probe",
-          "amount": 0, "country": "UK", "device_id": "fingerprint",
-          "anomaly": 0, "device_risk": 0}
-    res = {"decision": "FINGERPRINT_" + result["verdict"].replace(" ", "_"),
-           "score": 0, "fingerprint_version": VERSION, "target": url,
-           "timestamp": ts, "detail": detail}
-    h, idx, seq = ctx["seal"](ev, res, ts, api_key)
-
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "INSERT INTO fingerprint_probe(api_key,target,ran,vectors,answered,"
-            "exact,verdict,correlation,detail,audit_hash,block_index)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-            (api_key, url, ts, result.get("vectors"), result.get("answered"),
-             result.get("exact_matches"), result["verdict"],
-             result.get("correlation"), detail, h, idx))
-        ctx["conn"].commit()
-
-    out = dict(result)
-    out.update({
-        "target": url,
-        "ran_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts)),
-        "sealed": {"receipt": h, "block_index": idx, "receipt_seq": seq},
-        "what_this_is": ("A dated, sealed measurement of similarity. It is "
-                         "evidence, not an accusation, and it does not "
-                         "establish that anything was copied."),
-    })
-    if failures:
-        out["failures"] = failures
-        out["failure_note"] = ("Some vectors were rejected. If the target wants "
-                               "different field names, pass a \"fields\" map and "
-                               "run it again.")
-    return out, 200
-
-
-def _history(ctx, api_key):
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT target,ran,verdict,exact,answered,correlation,audit_hash,block_index"
-            " FROM fingerprint_probe WHERE api_key=? ORDER BY id DESC LIMIT 100",
-            (api_key,)).fetchall()
-    return {"probes": [{
-        "target": r[0],
-        "ran_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(r[1])),
-        "verdict": r[2], "exact_matches": r[3], "answered": r[4],
-        "correlation": r[5], "receipt": r[6], "block_index": r[7],
-    } for r in rows], "count": len(rows)}, 200
-
-
-def _vectors():
-    return {"count": len(VECTORS),
-            "vectors": [{"label": l, "signals": s} for l, s in VECTORS],
-            "why_these": ("Chosen to sit either side of each saturation point, "
-                          "to walk the amount curve, and to isolate each term. "
-                          "Random inputs would only catch a straight copy.")}, 200
-
-
-def _spec():
-    return {
-        "module": "fingerprint", "version": VERSION,
-        "question_it_answers": "Is this endpoint running my scoring function?",
-        "verdicts": {
-            "IDENTICAL": "Every vector matches. Independently written functions do not do this.",
-            "DERIVED": "Not identical, but every score is ours scaled and shifted. Reweighted, not rewritten.",
-            "SAME SHAPE": "Different numbers, same ordering. Same design decisions, probably not the same code.",
-            "SIMILAR": "Loosely correlated. Weak - risk scorers broadly agree on what looks risky.",
-            "UNRELATED": "No meaningful relationship.",
-            "INCONCLUSIVE": "Too few vectors came back.",
-        },
-        "limits": [
-            "Only reaches endpoints it can reach. A private product with no free tier is invisible to this.",
-            "Proves similarity, never theft. Two people can converge honestly.",
-            "A target that rate limits, randomises or rounds heavily will read as INCONCLUSIVE rather than clean.",
-        ],
-        "every_run_is_sealed": ("The probe, the target and the result go into the "
-                                "chain, so a comparison run today is provable as "
-                                "having been run today."),
-        "manners": "One request per vector with a %.1fs gap. It is a measurement, not a load test." % POLITE_DELAY,
-    }, 200
-
-
-def handle(method, action, data, api_key, ctx):
-    # key first, before anything touches the database
-    if not api_key:
-        return {"error": "invalid_api_key"}, 401
-    _setup(ctx)
-    action = (action or "").strip("/").lower()
-
-    if method == "POST":
-        if action == "self":
-            return _self(ctx, api_key)
-        if action == "probe":
-            return _probe(ctx, api_key, data)
-        return {"error": "unknown_action", "action": action,
-                "POST": ["self", "probe"]}, 404
-
-    if action in ("", "spec"):
-        return _spec()
-    if action == "history":
-        return _history(ctx, api_key)
-    if action == "vectors":
-        return _vectors()
-    return {"error": "unknown_action", "action": action,
-            "GET": ["spec", "history", "vectors"]}, 404
-
-```
-
-
-## `modules/lineage.py`
-
-528 lines, 24761 bytes
-
-```python
-#!/usr/bin/env python3
-"""
-modules/lineage.py  -  provenance that crosses company boundaries
-=================================================================
-
-WHERE EVERY AUDIT TRAIL STOPS
------------------------------
-At the edge of the company that wrote it.
-
-A lender holds a score. The score came from a scoring supplier, which used
-a model, which was trained on a data snapshot bought from someone else.
-Four organisations, four audit trails, none of which reference each other.
-Ask "what produced this outcome" and you get four separate answers and no
-way to join them up.
-
-Every framework written in the last three years assumes somebody can trace
-an outcome across parties. Nobody can. Not because it is hard - because
-each party's evidence is only worth anything inside that party's own
-system, so joining them up would mean trusting whoever did the joining.
-
-WHY THIS WORKS WHEN A SHARED DATABASE WOULD NOT
------------------------------------------------
-The obvious approach is a consortium: everyone writes to one ledger,
-governed by someone. That fails on the first question anybody asks, which
-is who runs it, and it never gets built.
-
-This needs none of that, because the pieces already exist:
-
-  A chain tip already commits to everything sealed beneath it.
-  That tip is already handed to peers hourly and sealed into THEIR chains.
-  Those chains are anchored externally and witnessed in turn.
-
-So a receipt can already be walked up to a tip, and that tip already sits
-inside chains its issuer does not control. The trust problem is solved
-before lineage is even mentioned.
-
-The only thing missing was the sideways link: a decision recording which
-receipts fed it, and which chain each came from. That is what this module
-adds. One field, and the graph composes itself.
-
-Nobody opts into provenance. They opt into witnessing, which they already
-want, and provenance falls out of it.
-
-WHAT AN EDGE IS AND IS NOT
---------------------------
-An edge is a sealed, dated, non-repudiable CLAIM by the declaring party
-that these inputs fed that decision. Sealing does not make the claim true.
-What it removes is the ability to revise it quietly afterwards, which is
-the part that matters when an outcome is disputed a year later.
-
-Every edge is itself a chain entry. So the provenance graph is covered by
-the same completeness, consistency and witnessing guarantees as everything
-else - you cannot delete an inconvenient edge without breaking the chain,
-and you cannot add one after the fact without the timestamp showing it.
-
-THE PART THAT IS WORTH MORE THAN THE TRACING
---------------------------------------------
-    GET /x/lineage/impact?receipt=
-
-Trace runs upstream: what produced this. Impact runs downstream: what did
-this produce.
-
-When a data provider retracts a snapshot, or a model version turns out to
-be faulty, or an upstream decision is overturned, the question every
-regulator asks is which outputs were affected. Today that answer takes
-weeks of email and is never complete. Here it is a query, and it crosses
-company boundaries, and the answer is itself provable.
-
-That is corrective action under Article 20 turned from a fire drill into a
-lookup.
-
-VERIFICATION WITHOUT TRUSTING ANY PARTY IN THE CHAIN
-----------------------------------------------------
-This module never asserts that a remote hop is valid. It returns the exact
-routes a third party should call to check each hop themselves - on our
-chain and on everybody else's. An auditor verifies the whole graph without
-trusting us, the supplier, or anyone in between.
-
-HONEST LIMITS
--------------
-  - An edge is a claim, sealed and dated. It is not proof the inputs were
-    the real ones, only that this is what was declared and when.
-  - A cross-chain hop can only be checked while the other party keeps
-    their routes up. A dead peer leaves a stub in the graph - visible,
-    which is the honest outcome, rather than silently resolved.
-  - Declaring inputs is voluntary. A party that declares nothing is not
-    caught out by this module; they are simply the point where somebody
-    else's lineage goes dark, and their customer is the one who notices.
-  - We record edges pointing at other chains. We do not fetch from them
-    here - fetching is what /x/witness does, with its SSRF controls, and
-    duplicating that machinery in a second place would be a mistake.
-
-    POST /x/lineage/declare      record what fed a decision      (keyed)
-    GET  /x/lineage/trace        walk upstream                    (public)
-    GET  /x/lineage/impact       walk downstream                  (public)
-    GET  /x/lineage/receipt      portable proof for an output     (public)
-    GET  /x/lineage/spec         the format and how to check it   (public)
-"""
-
-import re
-import time
-from datetime import datetime, timezone
-
-VERSION = "1.0"
-HEX64 = re.compile(r"^[0-9a-f]{64}$")
-
-# Everything except declaring is open. The whole point is that a party
-# three hops downstream - who has no relationship with us at all - can
-# follow the graph and check it.
-PUBLIC = {("GET", "trace"), ("GET", "impact"), ("GET", "receipt"),
-          ("GET", "spec")}
-
-OUR_CHAIN_NAME = "aileash"
-OUR_BASE = "https://sebbi.pro"
-
-MAX_INPUTS = 50
-MAX_DEPTH = 6
-MAX_NODES = 400
-ROLES = ("input", "model", "data", "policy", "document", "upstream-decision",
-         "supplier", "other")
-
-_ready = False
-
-
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        c = ctx["conn"]
-        c.execute("CREATE TABLE IF NOT EXISTS lineage_edge("
-                  "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,"
-                  "child_chain TEXT,child_receipt TEXT,"
-                  "parent_chain TEXT,parent_receipt TEXT,parent_base TEXT,"
-                  "role TEXT,note TEXT,declared REAL,"
-                  "audit_hash TEXT,block_index INTEGER)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_lin_child "
-                  "ON lineage_edge(child_receipt)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_lin_parent "
-                  "ON lineage_edge(parent_receipt)")
-        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_lin_unique "
-                  "ON lineage_edge(child_receipt,parent_chain,parent_receipt)")
-        c.commit()
-    _ready = True
-
-
-def _iso(ts):
-    if not ts:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
-
-def _clean_chain(value):
-    value = str(value or "").strip().lower()
-    return value[:80] if value else ""
-
-
-def _exists_locally(ctx, receipt):
-    try:
-        with ctx["lock"]:
-            row = ctx["conn"].execute(
-                "SELECT 1 FROM audit_log WHERE audit_hash=? LIMIT 1", (receipt,)).fetchone()
-        return bool(row)
-    except Exception:
-        return False
-
-
-def _verification_plan(chain, receipt, base=None):
-    """The exact calls a third party makes to check one hop themselves.
-
-    We never tell anyone a hop is valid. We tell them how to find out
-    without asking us again.
-    """
-    root = (base or OUR_BASE).rstrip("/") if chain != OUR_CHAIN_NAME else OUR_BASE
-    if chain != OUR_CHAIN_NAME and not base:
-        return {
-            "chain": chain, "receipt": receipt,
-            "status": "external, no address declared",
-            "how_to_check": "Ask that chain's operator for their public witness and consistency "
-                            "routes, or look for their name at %s/x/witness/peers - if we have "
-                            "ever witnessed them, the address we fetched from is recorded "
-                            "there." % OUR_BASE,
-        }
-    return {
-        "chain": chain, "receipt": receipt, "base": root,
-        "on_their_chain": "%s/x/consistency/ancestor?tip=%s" % (root, receipt),
-        "nothing_was_omitted": "%s/x/complete/periods" % root,
-        "who_witnesses_them": "%s/x/witness/peers" % root,
-        "did_we_witness_them": "%s/x/witness/attest?peer=%s&tip=%s" % (OUR_BASE, chain, receipt),
-        "note": "Run these against their host, not ours. If their answers and ours disagree, "
-                "that disagreement is the finding.",
-    }
-
-
-# ----------------------------------------------------------------------
-# declare
-# ----------------------------------------------------------------------
-
-def _declare(ctx, api_key, data):
-    child = str(data.get("receipt", data.get("child", ""))).strip().lower()
-    if not HEX64.match(child):
-        return {"error": "receipt_required",
-                "message": "The audit hash of the decision whose inputs you are declaring."}, 400
-
-    child_chain = _clean_chain(data.get("chain") or OUR_CHAIN_NAME)
-    inputs = data.get("inputs")
-    if not isinstance(inputs, list) or not inputs:
-        return {"error": "inputs_required",
-                "message": "A list of what fed this decision. Each entry needs a receipt, and a "
-                           "chain if it came from someone else.",
-                "example": {"receipt": "<64 hex>", "inputs": [
-                    {"chain": "supplier-name", "receipt": "<64 hex>", "role": "data",
-                     "base": "https://supplier.example"}]}}, 400
-    if len(inputs) > MAX_INPUTS:
-        return {"error": "too_many_inputs", "message": "at most %d per declaration" % MAX_INPUTS}, 400
-
-    if child_chain == OUR_CHAIN_NAME and not _exists_locally(ctx, child):
-        return {"error": "unknown_receipt",
-                "message": "That receipt is not in this chain. Declaring inputs for a decision "
-                           "we never sealed would put an unverifiable node in the graph."}, 404
-
-    prepared = []
-    for item in inputs:
-        if not isinstance(item, dict):
-            return {"error": "bad_input", "message": "each input must be an object"}, 400
-        parent = str(item.get("receipt", "")).strip().lower()
-        if not HEX64.match(parent):
-            return {"error": "bad_input_receipt",
-                    "message": "every input needs a 64 character hex receipt"}, 400
-        parent_chain = _clean_chain(item.get("chain") or OUR_CHAIN_NAME)
-        if parent_chain == child_chain and parent == child:
-            return {"error": "self_reference",
-                    "message": "a decision cannot be its own input"}, 400
-        role = str(item.get("role", "input")).strip().lower()
-        if role not in ROLES:
-            role = "other"
-        base = str(item.get("base", item.get("url", "")) or "").strip()[:300]
-        note = str(item.get("note", "") or "").strip()[:200]
-        prepared.append((parent_chain, parent, base, role, note))
-
-    now = time.time()
-    summary = ";".join("%s/%s:%s" % (c, r[:12], role) for c, r, _b, role, _n in prepared)
-    ev = {"user_id": "lin:" + child[:16], "action": "lineage_declared", "amount": 0,
-          "country": "UK", "device_id": "lineage", "anomaly": 0, "device_risk": 0}
-    res = {"decision": "LINEAGE_SEALED", "score": 0, "lineage_version": VERSION,
-           "child_chain": child_chain, "child_receipt": child,
-           "input_count": len(prepared),
-           "detail": "child=%s;inputs=%s" % (child, summary)}
-    audit_hash, block_index, seq = ctx["seal"](ev, res, now, api_key)
-
-    written, duplicates = 0, 0
-    with ctx["lock"]:
-        for parent_chain, parent, base, role, note in prepared:
-            try:
-                ctx["conn"].execute(
-                    "INSERT INTO lineage_edge(api_key,child_chain,child_receipt,parent_chain,"
-                    "parent_receipt,parent_base,role,note,declared,audit_hash,block_index) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                    (api_key, child_chain, child, parent_chain, parent, base or None,
-                     role, note or None, now, audit_hash, block_index))
-                written += 1
-            except Exception:
-                duplicates += 1
-        ctx["conn"].commit()
-
-    return {"child_chain": child_chain, "child_receipt": child,
-            "edges_recorded": written, "already_declared": duplicates,
-            "declared_at": _iso(now),
-            "sealed_in_chain": audit_hash, "block_index": block_index, "receipt_seq": seq,
-            "lineage_version": VERSION,
-            "what_this_does": "The declaration is now a chain entry. It cannot be removed "
-                              "without breaking every block after it, and it cannot be added "
-                              "later without the timestamp showing when.",
-            "trace": "%s/x/lineage/trace?receipt=%s" % (OUR_BASE, child),
-            "portable_receipt": "%s/x/lineage/receipt?receipt=%s" % (OUR_BASE, child)}, 200
-
-
-# ----------------------------------------------------------------------
-# walking the graph
-# ----------------------------------------------------------------------
-
-def _parents(ctx, receipt):
-    with ctx["lock"]:
-        return ctx["conn"].execute(
-            "SELECT parent_chain,parent_receipt,parent_base,role,note,declared,audit_hash "
-            "FROM lineage_edge WHERE child_receipt=? ORDER BY id ASC", (receipt,)).fetchall()
-
-
-def _children(ctx, receipt):
-    with ctx["lock"]:
-        return ctx["conn"].execute(
-            "SELECT child_chain,child_receipt,role,declared,audit_hash "
-            "FROM lineage_edge WHERE parent_receipt=? ORDER BY id ASC", (receipt,)).fetchall()
-
-
-def _walk(ctx, start, depth, upstream):
-    """Breadth-first walk with cycle and size protection.
-
-    Anything on a chain we do not hold locally becomes a frontier entry -
-    named, with a verification plan, and explicitly not resolved by us.
-    """
-    seen = {start}
-    nodes, edges, frontier = [], [], []
-    queue = [(start, 0)]
-    truncated = False
-
-    while queue:
-        receipt, level = queue.pop(0)
-        if level >= depth or len(nodes) >= MAX_NODES:
-            if queue or level >= depth:
-                truncated = truncated or bool(queue)
-            continue
-
-        rows = _parents(ctx, receipt) if upstream else _children(ctx, receipt)
-        for row in rows:
-            if upstream:
-                chain, other, base, role, note, declared, sealed = row
-            else:
-                chain, other, role, declared, sealed = row
-                base, note = None, None
-
-            edges.append({
-                "from": other if upstream else receipt,
-                "to": receipt if upstream else other,
-                "role": role, "note": note,
-                "declared_at": _iso(declared),
-                "declaration_sealed_as": sealed,
-                "chain": chain,
-            })
-
-            local = (chain == OUR_CHAIN_NAME) and _exists_locally(ctx, other)
-            if not local:
-                if not any(f["receipt"] == other for f in frontier):
-                    frontier.append({"chain": chain, "receipt": other, "depth": level + 1,
-                                     "verify": _verification_plan(chain, other, base)})
-                continue
-
-            if other in seen:
-                continue
-            seen.add(other)
-            if len(nodes) >= MAX_NODES:
-                truncated = True
-                continue
-            nodes.append({"chain": chain, "receipt": other, "depth": level + 1,
-                          "verify": _verification_plan(chain, other, base)})
-            queue.append((other, level + 1))
-
-    return nodes, edges, frontier, truncated
-
-
-def _depth_arg(data):
-    try:
-        depth = int(data.get("depth", MAX_DEPTH))
-    except (TypeError, ValueError):
-        depth = MAX_DEPTH
-    return max(1, min(depth, MAX_DEPTH))
-
-
-def _trace(ctx, data):
-    receipt = str(data.get("receipt", "")).strip().lower()
-    if not HEX64.match(receipt):
-        return {"error": "receipt_required"}, 400
-    depth = _depth_arg(data)
-
-    nodes, edges, frontier, truncated = _walk(ctx, receipt, depth, upstream=True)
-    if not edges:
-        return {"receipt": receipt, "direction": "upstream", "nodes": [], "edges": [],
-                "external_frontier": [],
-                "lineage_version": VERSION,
-                "what_this_means": "No inputs have been declared for this decision. That is not "
-                                   "the same as it having none - it means nobody said. "
-                                   "Undeclared lineage is where a trail goes dark, and the party "
-                                   "who did not declare is the one to ask.",
-                "self": _verification_plan(OUR_CHAIN_NAME, receipt)}, 200
-
-    return {"receipt": receipt, "direction": "upstream", "depth_searched": depth,
-            "nodes": nodes, "edges": edges, "external_frontier": frontier,
-            "truncated": truncated,
-            "lineage_version": VERSION,
-            "self": _verification_plan(OUR_CHAIN_NAME, receipt),
-            "how_to_verify_this": "Every node carries the routes to check it on its own chain. "
-                                  "Nothing here asks you to take our word for a hop, including "
-                                  "the hops on our own chain.",
-            "what_an_edge_is": "A sealed, dated claim by the declaring party that these inputs "
-                               "fed that decision. Sealing makes it non-repudiable, not true.",
-            "frontier_note": "External entries are named but not resolved here. Run their "
-                             "verification plans against their own hosts - that is what makes "
-                             "the graph checkable without a shared database."}, 200
-
-
-def _impact(ctx, data):
-    receipt = str(data.get("receipt", "")).strip().lower()
-    if not HEX64.match(receipt):
-        return {"error": "receipt_required"}, 400
-    depth = _depth_arg(data)
-
-    nodes, edges, frontier, truncated = _walk(ctx, receipt, depth, upstream=False)
-    affected = len(nodes)
-    return {"receipt": receipt, "direction": "downstream", "depth_searched": depth,
-            "affected_decisions": affected, "nodes": nodes, "edges": edges,
-            "external_frontier": frontier, "truncated": truncated,
-            "lineage_version": VERSION,
-            "what_this_is_for": "If this input is retracted, wrong, or overturned, these are the "
-                                "decisions that declared a dependency on it. This is the answer "
-                                "to the first question asked after any upstream failure, and it "
-                                "normally takes weeks of email to assemble incompletely.",
-            "corrective_action": "The list is itself sealed and dated, so the scope of a recall "
-                                 "can be shown to have been determined honestly rather than "
-                                 "narrowed to suit.",
-            "limits": "Only covers dependencies that were declared. A downstream party who "
-                      "declared nothing does not appear - which is a fact about them rather "
-                      "than a gap here."}, 200
-
-
-# ----------------------------------------------------------------------
-# the portable receipt - proof that travels with an output
-# ----------------------------------------------------------------------
-
-def _receipt(ctx, data):
-    receipt = str(data.get("receipt", "")).strip().lower()
-    if not HEX64.match(receipt):
-        return {"error": "receipt_required"}, 400
-    if not _exists_locally(ctx, receipt):
-        return {"error": "unknown_receipt",
-                "message": "Not a decision sealed in this chain."}, 404
-
-    rows = _parents(ctx, receipt)
-    inputs = [{"chain": r[0], "receipt": r[1], "role": r[3],
-               "verify": _verification_plan(r[0], r[1], r[2])} for r in rows]
-
-    return {
-        "format": "aileash-portable-receipt",
-        "lineage_version": VERSION,
-        "chain": OUR_CHAIN_NAME,
-        "receipt": receipt,
-        "inputs": inputs,
-        "verify_this_decision": {
-            "still_on_our_chain": "%s/x/consistency/ancestor?tip=%s" % (OUR_BASE, receipt),
-            "our_log_is_append_only": "%s/x/consistency/proof" % OUR_BASE,
-            "nothing_was_left_out": "%s/x/complete/periods" % OUR_BASE,
-            "who_witnesses_us": "%s/x/witness/peers" % OUR_BASE,
-            "our_current_tip": "%s/x/witness/tip" % OUR_BASE,
-            "the_engine_reproduces": "%s/x/replay/spec" % OUR_BASE,
-            "trace_upstream": "%s/x/lineage/trace?receipt=%s" % (OUR_BASE, receipt),
-        },
-        "offline_verifier": "aileash_verify.py - one file, no dependencies, no network. Save "
-                            "this document and check it on your own machine, today or in four "
-                            "years.",
-        "what_you_can_establish": [
-            "this decision is in a log that has not been rewritten",
-            "that log is witnessed by parties we do not control",
-            "the period it sits in declared its total before anyone asked",
-            "the same inputs still produce the same verdict",
-            "and what fed it, hop by hop, across every company involved",
-        ],
-        "what_you_cannot": "That the decision was right, or that the inputs were honest. "
-                           "Cryptography establishes what happened and when. It does not "
-                           "establish that what happened was correct, and anybody telling you "
-                           "otherwise is selling something.",
-        "send_this_on": "Attach it to the output it describes. Whoever receives it can verify "
-                        "without an account, without contacting us, and without trusting anyone "
-                        "in the chain including the sender.",
-    }, 200
-
-
-def _spec():
-    return {
-        "lineage_version": VERSION,
-        "idea": "A decision records the receipts of its inputs and which chain each came from. "
-                "Nothing else is needed, because a chain tip already commits to everything "
-                "beneath it and is already witnessed by parties its operator does not control.",
-        "why_no_consortium": "A shared ledger needs a governor and never gets built. This needs "
-                             "no agreement between parties beyond each one sealing its own work "
-                             "and publishing a tip.",
-        "declare": {
-            "route": "POST /x/lineage/declare (keyed)",
-            "body": {"receipt": "<64 hex, the decision>",
-                     "inputs": [{"chain": "<who it came from>", "receipt": "<64 hex>",
-                                 "role": "one of %s" % ", ".join(ROLES),
-                                 "base": "<their public https base, optional>"}]},
-        },
-        "roles": list(ROLES),
-        "trace": "GET /x/lineage/trace?receipt= - upstream, what produced this",
-        "impact": "GET /x/lineage/impact?receipt= - downstream, what this produced",
-        "portable_receipt": "GET /x/lineage/receipt?receipt= - a document that travels with an "
-                            "output and lets the recipient verify it independently",
-        "verifying_a_hop": "Each node carries the routes to check it on its own chain: an "
-                           "ancestry proof that the receipt is still there, a completeness "
-                           "check that nothing was omitted from its period, and the witness "
-                           "list showing who else holds that chain's tips.",
-        "adopting_it": "Implement three public routes on your own system - a tip, an observe, "
-                       "and an ancestry check - and declare your inputs. There is nothing to "
-                       "join, nobody to ask, and no fee. If you can serve a tip, you are in.",
-        "honest": "An edge is a dated, sealed claim about what fed a decision. It cannot be "
-                  "quietly revised later. It was never proof that the claim was true, and this "
-                  "module does not pretend otherwise.",
-    }, 200
-
-
-# ----------------------------------------------------------------------
-# router entry point
-# ----------------------------------------------------------------------
-
-def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-    action = (action or "").strip("/").lower()
-    data = data or {}
-
-    if method == "GET":
-        if action == "spec":
-            return _spec()
-        if action == "trace":
-            return _trace(ctx, data)
-        if action == "impact":
-            return _impact(ctx, data)
-        if action == "receipt":
-            return _receipt(ctx, data)
-
-    if method == "POST":
-        if not api_key:
-            return {"error": "invalid_api_key"}, 401
-        if action == "declare":
-            return _declare(ctx, api_key, data)
-
-    return {"error": "unknown_action", "action": action,
-            "GET": ["spec", "trace", "impact", "receipt"],
-            "POST": ["declare (keyed)"]}, 404
-
-```
-
-
-## `modules/mutual.py`
-
-447 lines, 15467 bytes
-
-```python
-#!/usr/bin/env python3
-"""
-modules/mutual.py  -  the outbound half of mutual witnessing
-============================================================
-
-Why this exists
----------------
-modules/witness.py RECEIVES. Other chains hand us their tips and we seal
-them. Nothing in the platform currently SENDS our tip anywhere, so right
-now we witness other people and nobody witnesses us. This module is the
-missing direction.
-
-Drop it in as modules/mutual.py. The router picks it up automatically -
-no edits to server.py.
-
-Routes
-------
-  POST /x/mutual/push      send our current tip to every configured peer
-  POST /x/mutual/pull      fetch every peer's tip and seal it into our chain
-  POST /x/mutual/sync      pull then push (this is the one to schedule)
-  GET  /x/mutual/peers     the configured peers and what happened last time
-  GET  /x/mutual/status    last run, next run, whether the timer is alive
-
-Important design note
----------------------
-This module does not touch the database or import anything from server.py.
-It talks HTTP to routes that are already public - ours and theirs. That
-means it cannot corrupt anything, it works no matter how seal() changes,
-and every action it takes is one an outsider could audit for themselves.
-
-To read our own tip it calls our own public /x/witness/tip.
-To seal a peer's tip it calls our own public /x/witness/observe, which is
-already built to record exactly that. So a peer tip we pull is recorded by
-the same code path as a peer tip that was pushed to us.
-
-CONCURRENCY - read this before changing it
-------------------------------------------
-A sync cycle makes two kinds of call, and they are treated differently on
-purpose.
-
-  OUTBOUND to other people's hosts (reading their tip, pushing ours) runs
-  in parallel. These are the slow ones - we are waiting on somebody else's
-  server, and there is no reason to wait on them one at a time. Fifty peers
-  now costs roughly what the slowest single peer costs, instead of the sum
-  of all fifty.
-
-  INBOUND to our own server (sealing what we pulled) stays sequential. Our
-  own process is handling those requests, and firing a burst of them at
-  ourselves while we are mid-cycle is asking for trouble - a queue behind a
-  single replica at best. The sealing is fast and local anyway, so there is
-  nothing to gain by parallelising it and a real risk in doing so.
-
-So: fetch everything at once, then seal one at a time.
-
-BEFORE THIS WORKS
------------------
-1. "observe" must be in the PUBLIC set of modules/witness.py. If it is not,
-   this module gets a 401 from our own server, same as Red Flag AI Pro did.
-2. After every deploy, the first /x/ request must be a GET - that is what
-   installs the POST branch. Opening /x/mutual/peers in a browser does it.
-"""
-
-import json
-import threading
-import time
-import urllib.error
-import urllib.request
-from concurrent.futures import ThreadPoolExecutor
-
-# ----------------------------------------------------------------------
-# ROUTER
-# ----------------------------------------------------------------------
-
-# The router reads a set of (METHOD, action) tuples. Anything not listed
-# here needs an API key - default is closed.
-#
-# peers and status are read-only. An outsider being able to see who we
-# witness with, and whether it is actually running, is the entire point.
-#
-# push, pull and sync stay keyed - they cause outbound traffic and are not
-# left open to anonymous callers.
-PUBLIC = {("GET", "peers"), ("GET", "status")}
-
-
-# ----------------------------------------------------------------------
-# CONFIG
-# ----------------------------------------------------------------------
-
-# Our own public witness routes. Left as full URLs on purpose so this
-# module never has to guess its own host.
-OUR_TIP_URL = "https://sebbi.pro/x/witness/tip"
-OUR_OBSERVE_URL = "https://sebbi.pro/x/witness/observe"
-
-# The name we go by when we hand our tip to someone else.
-OUR_CHAIN_NAME = "aileash"
-
-# Everyone we witness with. Add a dict per chain.
-#   name         what we file their tips under
-#   tip_url      where we GET their current tip
-#   observe_url  where we POST ours so they record it
-PEERS = [
-    {
-        "name": "red-flag-ai-pro",
-        "tip_url": "https://www.redflagaipro.com/api/witness/tip",
-        "observe_url": "https://www.redflagaipro.com/api/witness/anchor",
-    },
-]
-
-# Field names to send when pushing our tip. If a peer wants different
-# names, give that peer its own "keys" dict and it will be used instead.
-DEFAULT_PUSH_KEYS = {
-    "chain": "chain",
-    "tip": "tip",
-    "count": "count",
-    "ts": "ts",
-    "url": "url",
-}
-
-# Where peers can read our tip, included in what we push.
-OUR_PUBLIC_URL = "https://sebbi.pro/x/witness/tip"
-
-# Background timer. Set ENABLED to False if you would rather drive it
-# yourself by hitting /x/mutual/sync.
-AUTO_SYNC_ENABLED = True
-AUTO_SYNC_SECONDS = 3600
-
-TIMEOUT_SECONDS = 20
-
-# How many peers we talk to at once. Above this they queue, which is fine -
-# it stops a large network spawning a thread per peer. Eight slow peers at
-# 20s each still finishes in 20s; forty finishes in about a minute worst
-# case, and only if every one of them times out.
-MAX_PARALLEL_PEERS = 8
-
-# ----------------------------------------------------------------------
-# state - deliberately in memory only, this is not evidence
-# ----------------------------------------------------------------------
-
-_state = {
-    "last_run": None,
-    "last_result": None,
-    "runs": 0,
-    "timer_started": False,
-}
-_lock = threading.Lock()
-
-
-def _now():
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-
-def _reply(payload, status=200):
-    """The router expects (payload, status) back from handle()."""
-    return payload, status
-
-
-def _in_parallel(function, items):
-    """Run function over items concurrently, preserving input order.
-
-    Used only for calls that leave our server. Anything hitting our own
-    process goes through a plain loop instead - see the note at the top.
-    """
-    if not items:
-        return []
-    if len(items) == 1:
-        return [function(items[0])]
-    workers = min(len(items), MAX_PARALLEL_PEERS)
-    with ThreadPoolExecutor(max_workers=workers,
-                            thread_name_prefix="mutual-peer") as pool:
-        return list(pool.map(function, items))
-
-
-# ----------------------------------------------------------------------
-# http
-# ----------------------------------------------------------------------
-
-def _http(url, payload=None):
-    """POST if payload given, else GET. Returns (status, parsed_or_text)."""
-    data = None
-    headers = {"Accept": "application/json", "User-Agent": "aileash-mutual/1.1"}
-    if payload is not None:
-        data = json.dumps(payload).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    request = urllib.request.Request(url, data=data, headers=headers)
-    try:
-        with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
-            body = response.read().decode("utf-8", "replace")
-            status = response.getcode()
-    except urllib.error.HTTPError as exc:
-        try:
-            body = exc.read().decode("utf-8", "replace")
-        except Exception:
-            body = ""
-        status = exc.code
-    except urllib.error.URLError as exc:
-        return 0, "unreachable: %s" % exc.reason
-    except Exception as exc:
-        return 0, "failed: %s" % exc
-    try:
-        return status, json.loads(body)
-    except ValueError:
-        return status, body
-
-
-def _extract_tip(body):
-    """Pull (tip, height) out of whatever shape a tip route returns."""
-    if not isinstance(body, dict):
-        return None, None
-    tip = body.get("tip") or body.get("hash") or body.get("head")
-    height = body.get("height", body.get("count", body.get("entries")))
-    return tip, height
-
-
-# ----------------------------------------------------------------------
-# the two directions
-# ----------------------------------------------------------------------
-
-def our_tip():
-    status, body = _http(OUR_TIP_URL)
-    if status != 200:
-        return None, None, "our own tip route answered %s: %s" % (status, str(body)[:200])
-    tip, height = _extract_tip(body)
-    if not tip:
-        return None, None, "no tip field in our own reply: %s" % str(body)[:200]
-    return tip, height, None
-
-
-def push_one(peer, tip, height):
-    """Hand our tip to one peer so they record it. Outbound only."""
-    keys = peer.get("keys", DEFAULT_PUSH_KEYS)
-    values = {
-        "chain": OUR_CHAIN_NAME,
-        "tip": tip,
-        "count": height,
-        "ts": _now(),
-        "url": OUR_PUBLIC_URL,
-    }
-    payload = {keys.get(k, k): v for k, v in values.items()}
-    status, body = _http(peer["observe_url"], payload)
-    result = {
-        "peer": peer["name"],
-        "direction": "push",
-        "url": peer["observe_url"],
-        "http": status,
-        "ok": 200 <= status < 300,
-        "response": body if isinstance(body, (dict, list)) else str(body)[:300],
-    }
-    if status == 401 or status == 403:
-        result["hint"] = "they want auth on that route, or it is not in their public set"
-    elif status == 404:
-        result["hint"] = "wrong path - check observe_url for this peer"
-    elif status == 0:
-        result["hint"] = "could not reach them at all"
-    return result
-
-
-def fetch_one(peer):
-    """Read one peer's current tip. Outbound only - no sealing here.
-
-    Returns a dict that either carries a tip ready to seal, or an error
-    already shaped like a result so it can be returned to the caller as is.
-    """
-    status, body = _http(peer["tip_url"])
-    if status != 200:
-        return {
-            "peer": peer["name"], "direction": "pull", "url": peer["tip_url"],
-            "http": status, "ok": False, "_failed": True,
-            "response": body if isinstance(body, (dict, list)) else str(body)[:300],
-            "hint": "could not read their tip",
-        }
-
-    tip, height = _extract_tip(body)
-    if not tip:
-        return {
-            "peer": peer["name"], "direction": "pull", "url": peer["tip_url"],
-            "http": status, "ok": False, "_failed": True,
-            "response": str(body)[:300],
-            "hint": "no tip field in their reply - add the field name to _extract_tip",
-        }
-
-    return {
-        "peer": peer["name"], "url": peer["tip_url"],
-        "tip": tip, "height": height, "_failed": False,
-        "fetched_at": time.time(),
-    }
-
-
-def seal_one(fetched):
-    """Seal one already-fetched peer tip into our chain.
-
-    Goes through our own public observe route so a tip we pulled is
-    recorded by exactly the same code path as a tip somebody pushed to us.
-    Called in a plain loop, never in parallel - this hits our own server.
-
-    Field names must match what modules/witness.py reads out of the body:
-    chain, tip, peer_ts, url. The url is what makes the observation
-    checkable by a third party rather than taken on our word - it is the
-    address we just fetched this tip from.
-    """
-    seal_status, seal_body = _http(OUR_OBSERVE_URL, {
-        "chain": fetched["peer"],
-        "tip": fetched["tip"],
-        "peer_ts": fetched["fetched_at"],
-        "url": fetched["url"],
-    })
-
-    out = {
-        "peer": fetched["peer"],
-        "direction": "pull",
-        "their_tip": fetched["tip"],
-        "their_height": fetched["height"],
-        "sealed_http": seal_status,
-        "ok": 200 <= seal_status < 300,
-        "response": seal_body if isinstance(seal_body, (dict, list)) else str(seal_body)[:300],
-    }
-    if seal_status in (401, 403):
-        out["hint"] = "our own observe route rejected us - check PUBLIC in modules/witness.py"
-    return out
-
-
-def do_push():
-    tip, height, error = our_tip()
-    if error:
-        return {"ok": False, "error": error}
-
-    # Outbound to everyone at once.
-    results = _in_parallel(lambda peer: push_one(peer, tip, height), PEERS)
-
-    return {
-        "ok": True,
-        "our_tip": tip,
-        "our_height": height,
-        "results": results,
-    }
-
-
-def do_pull():
-    # Phase one: read every peer's tip at the same time. This is the slow
-    # part and none of it touches us.
-    fetched = _in_parallel(fetch_one, PEERS)
-
-    # Phase two: seal what came back, one at a time, into our own chain.
-    results = []
-    for item in fetched:
-        if item.get("_failed"):
-            item.pop("_failed", None)
-            results.append(item)
-            continue
-        results.append(seal_one(item))
-
-    return {"ok": True, "results": results}
-
-
-def do_sync():
-    """Pull first, then push. That order matters: the tip we hand out then
-    already contains the tips we just took in, so the two chains interlock
-    rather than merely sitting alongside each other."""
-    started = time.time()
-    pulled = do_pull()
-    pushed = do_push()
-    result = {
-        "ran_at": _now(),
-        "took_seconds": round(time.time() - started, 2),
-        "peers": len(PEERS),
-        "pull": pulled,
-        "push": pushed,
-        "ok": bool(pulled.get("ok")) and bool(pushed.get("ok")),
-    }
-    with _lock:
-        _state["last_run"] = result["ran_at"]
-        _state["last_result"] = result
-        _state["runs"] += 1
-    return result
-
-
-# ----------------------------------------------------------------------
-# background timer
-# ----------------------------------------------------------------------
-
-def _loop():
-    # Let the server finish coming up before the first run.
-    time.sleep(45)
-    while True:
-        try:
-            do_sync()
-        except Exception:
-            pass
-        time.sleep(AUTO_SYNC_SECONDS)
-
-
-def _start_timer():
-    with _lock:
-        if _state["timer_started"] or not AUTO_SYNC_ENABLED:
-            return
-        _state["timer_started"] = True
-    thread = threading.Thread(target=_loop, name="mutual-sync", daemon=True)
-    thread.start()
-
-
-_start_timer()
-
-
-# ----------------------------------------------------------------------
-# router entry point
-# ----------------------------------------------------------------------
-
-def handle(method, action, data, api_key, ctx):
-    action = (action or "").strip("/").lower()
-
-    if method == "GET":
-        if action == "peers":
-            return _reply({
-                "chain": OUR_CHAIN_NAME,
-                "peers": [
-                    {"name": p["name"], "tip_url": p["tip_url"],
-                     "observe_url": p["observe_url"]}
-                    for p in PEERS
-                ],
-                "parallel_fetch": MAX_PARALLEL_PEERS,
-                "note": "Witnessing is only mutual if both columns are live.",
-            })
-        if action == "status":
-            with _lock:
-                return _reply({
-                    "auto_sync": AUTO_SYNC_ENABLED,
-                    "interval_seconds": AUTO_SYNC_SECONDS,
-                    "timer_running": _state["timer_started"],
-                    "parallel_fetch": MAX_PARALLEL_PEERS,
-                    "runs": _state["runs"],
-                    "last_run": _state["last_run"],
-                    "last_result": _state["last_result"],
-                })
-
-    if method == "POST":
-        if action == "push":
-            return _reply(do_push())
-        if action == "pull":
-            return _reply(do_pull())
-        if action == "sync":
-            return _reply(do_sync())
-
-    return _reply({
-        "error": "unknown action",
-        "GET": ["peers", "status"],
-        "POST": ["push", "pull", "sync"],
-    }, 404)
-
-```
+- `modules/oversight.py`
+- `modules/publish.py`
+- `modules/reconcile.py`
+- `modules/replay.py`
 
 
 ## `modules/network.py`
@@ -2662,5 +499,1895 @@ def handle(method, action, data, api_key, ctx):
 
     return {"error": "unknown_action", "action": action,
             "GET": ["status"]}, 404
+
+```
+
+
+## `modules/oversight.py`
+
+249 lines, 11339 bytes
+
+```python
+"""
+Human oversight notary - /x/oversight/<action>
+
+THE PROBLEM
+-----------
+Nobody can prove a person thought about a decision. That is an internal state
+and no amount of logging reaches it. Any vendor claiming to prove genuine
+human oversight is overselling.
+
+But rubber stamping is not an internal state. It is a pattern, and patterns
+leave marks - if you record the right things, in the right order, at the time.
+
+WHAT THIS DOES
+--------------
+Three things, none of which claim to read minds.
+
+1. ORDER. The reviewer's own call is sealed BEFORE the machine's verdict is
+   revealed to them. Two blocks, in that order, in a chain that cannot be
+   reordered afterwards. So a reviewer cannot have simply agreed with an
+   answer they had already seen - the chain shows they committed while it was
+   still hidden.
+
+2. ATTENTION. The gap between opening the case and committing is recorded.
+   A 0.8 second approval sits in the record permanently, next to a two minute
+   one. Not proof of thought - but a 400-case history of sub-second calls is
+   not something anyone can explain away.
+
+3. INDEPENDENCE. Agreement rate over time. A reviewer who has never once
+   diverged from the machine is visible in the data. One who diverges
+   sometimes is demonstrably exercising judgement.
+
+WHAT IT DOES NOT DO
+-------------------
+- It cannot prove the reviewer read the material. They can leave a screen open.
+- Dwell time is measurable but gameable by anyone deliberately gaming it.
+- It does not stop a reviewer being wrong. It records that they decided.
+- If the integrating system shows its user the machine verdict before calling
+  /open, this proves nothing. The ordering guarantee is only as good as the
+  integration honouring it. That is a documented limit, not a hidden one.
+
+WHAT IT IS FOR
+--------------
+Turning "we have human oversight" from an assertion into a dataset that an
+auditor can test - and that a rubber stamper cannot hide inside.
+
+    POST /x/oversight/open      case_ref, material, machine_verdict, reviewer
+    POST /x/oversight/commit    case_id, reviewer_verdict, reasoning
+    GET  /x/oversight/case?id=OVS-XXXXXXXX
+    GET  /x/oversight/reviewer?id=<reviewer id>
+    GET  /x/oversight/list
+"""
+
+import hashlib, json, secrets, time
+from datetime import datetime, timezone
+
+VERSION = "1.0"
+VERDICTS = {"allow", "block", "challenge", "escalate"}
+
+_ready = False
+
+
+def _setup(ctx):
+    global _ready
+    if _ready:
+        return
+    with ctx["lock"]:
+        ctx["conn"].execute("CREATE TABLE IF NOT EXISTS oversight_cases(case_id TEXT PRIMARY KEY,api_key TEXT,case_ref TEXT,reviewer TEXT,material_hash TEXT,machine_verdict TEXT,opened REAL,committed REAL,reviewer_verdict TEXT,agreed INTEGER,dwell REAL,status TEXT DEFAULT 'open')")
+        ctx["conn"].execute("CREATE INDEX IF NOT EXISTS idx_ovs_key ON oversight_cases(api_key)")
+        ctx["conn"].execute("CREATE INDEX IF NOT EXISTS idx_ovs_rev ON oversight_cases(api_key,reviewer)")
+        ctx["conn"].commit()
+    _ready = True
+
+
+def _iso(ts):
+    if not ts:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+def _hash(x):
+    if not isinstance(x, str):
+        x = json.dumps(x, sort_keys=True)
+    return hashlib.sha256(x.encode()).hexdigest()
+
+
+def _seal_event(ctx, api_key, cid, action, detail):
+    ts = time.time()
+    ev = {"user_id": "ovs:" + cid, "action": "oversight_" + action, "amount": 0,
+          "country": "UK", "device_id": "oversight", "anomaly": 0, "device_risk": 0}
+    res = {"decision": "OVERSIGHT_SEALED", "score": 0, "oversight_action": action,
+           "oversight_version": VERSION, "timestamp": ts, "detail": detail}
+    h, idx, seq = ctx["seal"](ev, res, ts, api_key)
+    return h, idx, seq, ts
+
+
+def _open(ctx, api_key, data):
+    ref = str(data.get("case_ref", "")).strip()
+    if not ref:
+        return {"error": "case_ref_required"}, 400
+    reviewer = str(data.get("reviewer", "")).strip()
+    if not reviewer:
+        return {"error": "reviewer_required",
+                "message": "Oversight without a named reviewer is not oversight."}, 400
+    material = data.get("material")
+    if material is None:
+        return {"error": "material_required",
+                "message": "Send exactly what the reviewer will see. Only its hash is stored."}, 400
+    mv = str(data.get("machine_verdict", "")).strip().lower()
+    if mv and mv not in VERDICTS:
+        return {"error": "invalid_machine_verdict", "allowed": sorted(VERDICTS)}, 400
+
+    cid = "OVS-" + secrets.token_hex(4).upper()
+    mh = _hash(material)
+    detail = ("ref=" + ref[:80] + ";reviewer=" + reviewer[:60] +
+              ";material_sha256=" + mh + ";machine_verdict_sealed=" + (mv or "none"))
+    h, idx, seq, ts = _seal_event(ctx, api_key, cid, "opened", detail)
+
+    with ctx["lock"]:
+        ctx["conn"].execute("INSERT INTO oversight_cases(case_id,api_key,case_ref,reviewer,material_hash,machine_verdict,opened,committed,reviewer_verdict,agreed,dwell,status) VALUES(?,?,?,?,?,?,?,NULL,NULL,NULL,NULL,'open')",
+                            (cid, api_key, ref, reviewer, mh, mv or None, ts))
+        ctx["conn"].commit()
+
+    return {"case_id": cid, "opened": _iso(ts), "material_sha256": mh,
+            "audit_hash": h, "block_index": idx, "receipt_seq": seq,
+            "machine_verdict": "withheld until commit",
+            "message": "Clock running. Show the reviewer the material, not the verdict."}, 200
+
+
+def _commit(ctx, api_key, data):
+    cid = str(data.get("case_id", "")).strip()
+    with ctx["lock"]:
+        row = ctx["conn"].execute("SELECT reviewer,material_hash,machine_verdict,opened,status FROM oversight_cases WHERE case_id=? AND api_key=?", (cid, api_key)).fetchone()
+    if not row:
+        return {"error": "unknown_case_id"}, 404
+    if row[4] != "open":
+        return {"error": "already_committed",
+                "message": "A reviewer commits once. That is the point."}, 400
+
+    rv = str(data.get("reviewer_verdict", "")).strip().lower()
+    if rv not in VERDICTS:
+        return {"error": "invalid_reviewer_verdict", "allowed": sorted(VERDICTS)}, 400
+    reasoning = str(data.get("reasoning", "")).strip()
+    if not reasoning:
+        return {"error": "reasoning_required",
+                "message": "Sealed at commit, before the machine verdict is revealed. Blank is not permitted."}, 400
+
+    ts = time.time()
+    dwell = round(ts - row[3], 3)
+    agreed = None if not row[2] else (1 if rv == row[2] else 0)
+    detail = ("reviewer_verdict=" + rv + ";dwell_seconds=" + str(dwell) +
+              ";reasoning=" + reasoning[:600])
+    h, idx, seq, _x = _seal_event(ctx, api_key, cid, "committed", detail)
+
+    with ctx["lock"]:
+        ctx["conn"].execute("UPDATE oversight_cases SET committed=?,reviewer_verdict=?,agreed=?,dwell=?,status='committed' WHERE case_id=? AND api_key=?",
+                            (ts, rv, agreed, dwell, cid, api_key))
+        ctx["conn"].commit()
+
+    out = {"case_id": cid, "reviewer_verdict": rv, "dwell_seconds": dwell,
+           "audit_hash": h, "block_index": idx, "receipt_seq": seq,
+           "machine_verdict": row[2],
+           "note": "Your call was sealed before this line was returned. The chain shows the order."}
+    if agreed is not None:
+        out["agreed"] = bool(agreed)
+    if dwell < 2:
+        out["flag"] = "committed in under 2 seconds - recorded permanently"
+    return out, 200
+
+
+def _case(ctx, api_key, cid):
+    with ctx["lock"]:
+        row = ctx["conn"].execute("SELECT case_ref,reviewer,material_hash,machine_verdict,opened,committed,reviewer_verdict,agreed,dwell,status FROM oversight_cases WHERE case_id=? AND api_key=?", (cid, api_key)).fetchone()
+        if not row:
+            return {"error": "unknown_case_id"}, 404
+        blocks = ctx["conn"].execute("SELECT ts,result_json,audit_hash,key_seq FROM audit_log WHERE user_id=? ORDER BY id ASC", ("ovs:" + cid,)).fetchall()
+    events = []
+    for ts_, res, ah, seq in blocks:
+        try:
+            r = json.loads(res)
+            events.append({"at": _iso(ts_), "event": r.get("oversight_action"),
+                           "detail": r.get("detail"), "sealed": ah, "receipt_seq": seq})
+        except Exception:
+            pass
+    return {"case_id": cid, "case_ref": row[0], "reviewer": row[1],
+            "material_sha256": row[2], "machine_verdict": row[3],
+            "opened": _iso(row[4]), "committed": _iso(row[5]),
+            "reviewer_verdict": row[6],
+            "agreed": (None if row[7] is None else bool(row[7])),
+            "dwell_seconds": row[8], "status": row[9], "events": events,
+            "ordering_proof": "The opened block precedes the committed block in the chain. Neither can be reordered or altered without breaking every block after it."}, 200
+
+
+def _reviewer(ctx, api_key, rid):
+    with ctx["lock"]:
+        rows = ctx["conn"].execute("SELECT dwell,agreed FROM oversight_cases WHERE api_key=? AND reviewer=? AND status='committed'", (api_key, rid)).fetchall()
+    if not rows:
+        return {"reviewer": rid, "cases": 0,
+                "note": "No committed cases on record for this reviewer."}, 200
+    dwells = sorted(r[0] for r in rows if r[0] is not None)
+    scored = [r[1] for r in rows if r[1] is not None]
+    n = len(dwells)
+    median = dwells[n // 2] if n else None
+    under2 = len([d for d in dwells if d < 2])
+    out = {"reviewer": rid, "cases": len(rows),
+           "median_dwell_seconds": median,
+           "fastest_seconds": (dwells[0] if dwells else None),
+           "under_2_seconds": under2,
+           "under_2_seconds_pct": (round(100 * under2 / n, 1) if n else None)}
+    if scored:
+        agree = sum(scored)
+        out["agreement_rate_pct"] = round(100 * agree / len(scored), 1)
+        out["diverged"] = len(scored) - agree
+        if len(scored) >= 20 and agree == len(scored):
+            out["pattern"] = "never diverged from the machine across " + str(len(scored)) + " cases"
+    return out, 200
+
+
+def _list(ctx, api_key):
+    with ctx["lock"]:
+        rows = ctx["conn"].execute("SELECT case_id,case_ref,reviewer,opened,status,reviewer_verdict,dwell,agreed FROM oversight_cases WHERE api_key=? ORDER BY opened DESC LIMIT 200", (api_key,)).fetchall()
+    return {"count": len(rows),
+            "cases": [{"case_id": r[0], "case_ref": r[1], "reviewer": r[2],
+                       "opened": _iso(r[3]), "status": r[4],
+                       "reviewer_verdict": r[5], "dwell_seconds": r[6],
+                       "agreed": (None if r[7] is None else bool(r[7]))} for r in rows]}, 200
+
+
+def handle(method, action, data, api_key, ctx):
+    _setup(ctx)
+    if method == "POST":
+        if action == "open":
+            return _open(ctx, api_key, data)
+        if action == "commit":
+            return _commit(ctx, api_key, data)
+    else:
+        if action == "list":
+            return _list(ctx, api_key)
+        if action == "case":
+            cid = str(data.get("id", "")).strip()
+            if not cid:
+                return {"error": "id_required"}, 400
+            return _case(ctx, api_key, cid)
+        if action == "reviewer":
+            rid = str(data.get("id", "")).strip()
+            if not rid:
+                return {"error": "id_required"}, 400
+            return _reviewer(ctx, api_key, rid)
+    return {"error": "unknown_action", "action": action}, 404
+
+```
+
+
+## `modules/publish.py`
+
+491 lines, 21976 bytes
+
+```python
+#!/usr/bin/env python3
+"""
+modules/publish.py  -  sealing what you published, at the moment you publish it
+===============================================================================
+
+THE PROBLEM THIS EXISTS TO NEVER HAVE AGAIN
+-------------------------------------------
+Somebody asks when a page was published. You answer from git history. They
+point out - correctly - that git commit dates are fields in the commit
+object which anyone can set to anything with an environment variable before
+committing. Your strongest evidence turns out to be the weakest thing in
+the room, and it drags the credible parts down with it.
+
+The fix is not a better argument. It is sealing the page the moment it goes
+live, so the question never depends on anybody's word again.
+
+WHAT THIS DOES
+--------------
+    POST /x/publish/seal {"url": "https://example.com/spec"}
+
+We fetch the URL ourselves, hash exactly what was served, and seal the hash,
+the URL and the fetch time into the chain - where it is anchored externally
+and handed to peer chains like every other block.
+
+From then on:
+
+  - "this exact content was served at this address no later than T" is
+    arithmetic rather than a claim;
+  - re-sealing the same URL later builds a permanent revision history that
+    the publisher cannot edit, because each version is its own block;
+  - and anyone can check it without an account.
+
+Seal at publication and you never argue about a publication date again. That
+is the entire point, and it takes one call.
+
+WHAT IT HONESTLY CANNOT DO
+--------------------------
+It cannot reach backwards. A seal made today proves the content existed
+today, not that it existed last week. Nothing can prove that - not this, not
+Bitcoin, not a notary. Timestamps are one-directional by nature.
+
+So for anything already published before it was sealed, the module records
+EXTERNAL REFERENCES alongside: a GitHub push event, a Wayback Machine
+snapshot, a DigiCert or OpenTimestamps proof. Those are stored and sealed as
+supplied. We do not verify them and we do not present them as ours - they
+are somebody else's record, named so a third party can check it at source.
+That distinction is stated in every response rather than left to be
+discovered.
+
+Two references are worth knowing about, because they are the ones that
+actually carry an earlier date:
+
+  GitHub push events   api.github.com/repos/<owner>/<repo>/events
+                       The push timestamp is recorded server-side by GitHub
+                       and cannot be set by the pusher, unlike commit dates.
+                       Retained roughly 90 days - so it must be captured
+                       while it still exists.
+
+  Wayback Machine      archive.org/wayback/available?url=...&timestamp=...
+                       An independent party with no stake in the dispute.
+                       If it caught the page, that settles it outright.
+
+FETCHING SAFELY
+---------------
+This module makes the server fetch a URL. Done naively that is a hole worse
+than the one it closes. So the fetcher speaks only http and https, only on
+ports 80 and 443, resolves the hostname first and refuses any address that
+is private, loopback, link-local, reserved or multicast, never follows a
+redirect, times out fast, and stops reading after a cap. Sealing is keyed,
+so this is not an anonymous capability either.
+
+    POST /x/publish/seal      fetch, hash and seal a live URL     (keyed)
+    GET  /x/publish/history   every version ever sealed of a URL  (public)
+    GET  /x/publish/verify    was this exact content served, when (public)
+    GET  /x/publish/list      everything sealed                   (public)
+    GET  /x/publish/spec      how to check any of it              (public)
+"""
+
+import hashlib
+import ipaddress
+import re
+import socket
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from urllib.parse import urlparse
+
+VERSION = "1.0"
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
+
+# Reading is open. A publication record only settles an argument if the
+# other side can check it without going through the publisher.
+PUBLIC = {("GET", "history"), ("GET", "verify"), ("GET", "list"),
+          ("GET", "spec")}
+
+CONTENT_PREFIX = b"AILEASH-PUBLISH-v1:"
+
+FETCH_TIMEOUT = 8
+MAX_FETCH_BYTES = 2 * 1024 * 1024
+ALLOWED_SCHEMES = ("http", "https")
+ALLOWED_PORTS = (80, 443)
+MAX_EXTERNAL = 8
+
+_ready = False
+
+
+def _setup(ctx):
+    global _ready
+    if _ready:
+        return
+    with ctx["lock"]:
+        c = ctx["conn"]
+        c.execute("CREATE TABLE IF NOT EXISTS publish_seal("
+                  "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,url TEXT,"
+                  "content_hash TEXT,byte_length INTEGER,http_status INTEGER,"
+                  "content_type TEXT,note TEXT,external TEXT,"
+                  "fetched REAL,audit_hash TEXT,block_index INTEGER)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_pub_url ON publish_seal(url,id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_pub_hash ON publish_seal(content_hash)")
+        c.commit()
+    _ready = True
+
+
+def _iso(ts):
+    if not ts:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+# ----------------------------------------------------------------------
+# fetching - read the SSRF note above before touching any of this
+# ----------------------------------------------------------------------
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect is an instruction to fetch a second URL we never checked."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_opener = urllib.request.build_opener(_NoRedirect)
+
+
+def _address_allowed(host, port):
+    try:
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+    except Exception as exc:
+        return False, "could not resolve host (%s)" % type(exc).__name__
+    if not infos:
+        return False, "host resolved to nothing"
+    for info in infos:
+        try:
+            addr = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return False, "unreadable address"
+        if (addr.is_private or addr.is_loopback or addr.is_link_local
+                or addr.is_reserved or addr.is_multicast or addr.is_unspecified):
+            return False, "address is not publicly routable"
+    return True, None
+
+
+def _url_allowed(url):
+    if not url or not isinstance(url, str) or len(url) > 500:
+        return False, "no usable url"
+    try:
+        parts = urlparse(url.strip())
+    except Exception:
+        return False, "unparseable url"
+    if parts.scheme not in ALLOWED_SCHEMES:
+        return False, "scheme not allowed"
+    if not parts.hostname:
+        return False, "no host in url"
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    if port not in ALLOWED_PORTS:
+        return False, "port not allowed"
+    return _address_allowed(parts.hostname, port)
+
+
+def _fetch(url):
+    """Returns (body_bytes, status, content_type, error)."""
+    ok, why = _url_allowed(url)
+    if not ok:
+        return None, None, None, why
+    request = urllib.request.Request(url, headers={
+        "Accept": "*/*",
+        "User-Agent": "aileash-publish/%s" % VERSION,
+    })
+    try:
+        with _opener.open(request, timeout=FETCH_TIMEOUT) as response:
+            status = response.getcode()
+            content_type = response.headers.get("Content-Type", "")
+            body = response.read(MAX_FETCH_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        return None, exc.code, None, "url answered %s" % exc.code
+    except Exception as exc:
+        return None, None, None, "could not reach url (%s)" % type(exc).__name__
+    if len(body) > MAX_FETCH_BYTES:
+        return None, status, content_type, "response larger than the %d byte cap" % MAX_FETCH_BYTES
+    return body, status, content_type, None
+
+
+def _content_hash(body):
+    """Hash exactly the bytes served. No normalisation, no cleverness -
+    a whitespace-tolerant hash would be a hash of our opinion of the page
+    rather than of the page."""
+    return hashlib.sha256(CONTENT_PREFIX + body).hexdigest()
+
+
+# ----------------------------------------------------------------------
+# seal
+# ----------------------------------------------------------------------
+
+def _clean_external(value):
+    """External references are recorded verbatim and never verified."""
+    if not isinstance(value, list):
+        return []
+    out = []
+    for item in value[:MAX_EXTERNAL]:
+        if isinstance(item, dict):
+            source = str(item.get("source", "")).strip()[:60]
+            reference = str(item.get("reference", item.get("url", ""))).strip()[:400]
+            claimed = str(item.get("claimed_time", "")).strip()[:60]
+            if source and reference:
+                out.append({"source": source, "reference": reference,
+                            "claimed_time": claimed or None})
+        elif isinstance(item, str) and item.strip():
+            out.append({"source": "unnamed", "reference": item.strip()[:400],
+                        "claimed_time": None})
+    return out
+
+
+def _seal(ctx, api_key, data):
+    url = str(data.get("url", "")).strip()
+    if not url:
+        return {"error": "url_required",
+                "message": "The address of the page you have just published."}, 400
+
+    note = str(data.get("note", "") or "").strip()[:300]
+    external = _clean_external(data.get("external"))
+
+    body, status, content_type, why = _fetch(url)
+    if why:
+        return {"error": "fetch_failed", "url": url, "message": why,
+                "note": "Nothing was sealed. A record of a page we could not read would be "
+                        "worse than no record."}, 502
+
+    digest = _content_hash(body)
+    now = time.time()
+
+    with ctx["lock"]:
+        prior = ctx["conn"].execute(
+            "SELECT content_hash,fetched,audit_hash FROM publish_seal "
+            "WHERE url=? ORDER BY id ASC", (url,)).fetchall()
+
+    unchanged = bool(prior) and prior[-1][0] == digest
+    first_of_this_version = None
+    for row in prior:
+        if row[0] == digest:
+            first_of_this_version = row[1]
+            break
+
+    external_summary = ";".join("%s=%s" % (e["source"], e["reference"][:60]) for e in external)
+    ev = {"user_id": "pub:" + digest[:16], "action": "publication_sealed", "amount": 0,
+          "country": "UK", "device_id": "publish", "anomaly": 0, "device_risk": 0}
+    res = {"decision": "PUBLICATION_SEALED", "score": 0, "publish_version": VERSION,
+           "url": url, "content_hash": digest, "bytes": len(body),
+           "http_status": status,
+           "detail": "url=%s;sha256=%s;bytes=%d%s"
+                     % (url, digest, len(body),
+                        ";external=" + external_summary if external_summary else "")}
+    audit_hash, block_index, seq = ctx["seal"](ev, res, now, api_key)
+
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "INSERT INTO publish_seal(api_key,url,content_hash,byte_length,http_status,"
+            "content_type,note,external,fetched,audit_hash,block_index) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (api_key, url, digest, len(body), status, content_type or None,
+             note or None,
+             "|".join("%s %s %s" % (e["source"], e["reference"], e["claimed_time"] or "")
+                      for e in external) or None,
+             now, audit_hash, block_index))
+        ctx["conn"].commit()
+
+    out = {
+        "url": url, "content_hash": digest, "bytes": len(body),
+        "http_status": status, "content_type": content_type,
+        "sealed_at": _iso(now),
+        "sealed_in_chain": audit_hash, "block_index": block_index, "receipt_seq": seq,
+        "version_number": len(prior) + 1,
+        "publish_version": VERSION,
+        "what_this_proves": "This exact content was served at this address when we fetched it, "
+                            "and the record of that cannot be altered afterwards.",
+        "what_it_does_not": "It does not prove the page existed earlier than this moment. "
+                            "Nothing can prove that after the fact - timestamps only run "
+                            "forwards. Seal at publication and the question never arises.",
+        "history": "/x/publish/history?url=" + url,
+        "verify_this_block": "/x/consistency/ancestor?tip=" + audit_hash,
+    }
+
+    if unchanged:
+        out["unchanged"] = True
+        out["first_sealed_in_this_form"] = _iso(first_of_this_version)
+        out["message"] = ("Identical to the last sealed version. The page has not changed since "
+                          "%s and now has an additional dated witness." % _iso(first_of_this_version))
+    elif prior:
+        out["changed"] = True
+        out["previous_hash"] = prior[-1][0]
+        out["previous_sealed_at"] = _iso(prior[-1][1])
+        out["message"] = ("The content has changed since the last seal. Both versions remain in "
+                          "the chain - a revision history the publisher cannot edit.")
+    else:
+        out["message"] = ("First seal for this address. Every later seal builds a permanent, "
+                          "dated revision history from here.")
+
+    if external:
+        out["external_references"] = external
+        out["external_caveat"] = ("Recorded exactly as supplied and sealed with the block. We do "
+                                  "not verify them and they are not our evidence - they are "
+                                  "somebody else's record, named so you can check them at "
+                                  "source.")
+    else:
+        out["advice"] = ("If this page was published before today, add external references - a "
+                         "GitHub push event, a Wayback snapshot - and they will be sealed "
+                         "alongside. Those carry an earlier date; a seal made now cannot.")
+    return out, 200
+
+
+# ----------------------------------------------------------------------
+# reading
+# ----------------------------------------------------------------------
+
+def _parse_external(blob):
+    if not blob:
+        return []
+    out = []
+    for line in blob.split("|"):
+        parts = line.strip().split(" ", 2)
+        if len(parts) >= 2:
+            out.append({"source": parts[0], "reference": parts[1],
+                        "claimed_time": parts[2] if len(parts) > 2 and parts[2] else None})
+    return out
+
+
+def _history(ctx, data):
+    url = str(data.get("url", "")).strip()
+    if not url:
+        return {"error": "url_required"}, 400
+    with ctx["lock"]:
+        rows = ctx["conn"].execute(
+            "SELECT content_hash,byte_length,fetched,audit_hash,block_index,note,external "
+            "FROM publish_seal WHERE url=? ORDER BY id ASC LIMIT 500", (url,)).fetchall()
+    if not rows:
+        return {"error": "never_sealed", "url": url,
+                "message": "No seal recorded for that address."}, 404
+
+    versions, last_hash = [], None
+    for content_hash, length, fetched, audit_hash, block_index, note, external in rows:
+        versions.append({
+            "content_hash": content_hash, "bytes": length,
+            "sealed_at": _iso(fetched), "sealed_in_chain": audit_hash,
+            "block_index": block_index, "note": note,
+            "changed_from_previous": last_hash is not None and content_hash != last_hash,
+            "external_references": _parse_external(external),
+        })
+        last_hash = content_hash
+
+    distinct = len({v["content_hash"] for v in versions})
+    return {"url": url, "seals": len(versions), "distinct_versions": distinct,
+            "first_sealed": versions[0]["sealed_at"], "latest_sealed": versions[-1]["sealed_at"],
+            "current_hash": versions[-1]["content_hash"],
+            "versions": versions,
+            "publish_version": VERSION,
+            "what_this_is": "A dated revision history the publisher cannot edit. Each version is "
+                            "its own block; altering or removing one breaks every block after it.",
+            "limit": "The first seal fixes an upper bound, not a lower one. Anything published "
+                     "before its first seal rests on external evidence, which is recorded here "
+                     "but not verified by us."}, 200
+
+
+def _verify(ctx, data):
+    url = str(data.get("url", "")).strip()
+    digest = str(data.get("hash", data.get("content_hash", ""))).strip().lower()
+    if not digest or not HEX64.match(digest):
+        return {"error": "hash_required",
+                "message": "sha256 of AILEASH-PUBLISH-v1: followed by the exact bytes served"}, 400
+
+    with ctx["lock"]:
+        if url:
+            rows = ctx["conn"].execute(
+                "SELECT url,fetched,audit_hash,block_index FROM publish_seal "
+                "WHERE url=? AND content_hash=? ORDER BY id ASC", (url, digest)).fetchall()
+        else:
+            rows = ctx["conn"].execute(
+                "SELECT url,fetched,audit_hash,block_index FROM publish_seal "
+                "WHERE content_hash=? ORDER BY id ASC", (digest,)).fetchall()
+
+    if not rows:
+        return {"sealed": False, "content_hash": digest, "url": url or None,
+                "message": "We hold no seal for that exact content. Either it was never sealed, "
+                           "or the content differs from what was - a single byte is enough."}, 404
+
+    return {"sealed": True, "content_hash": digest,
+            "url": rows[0][0], "times_sealed": len(rows),
+            "first_sealed": _iso(rows[0][1]),
+            "latest_sealed": _iso(rows[-1][1]),
+            "sealed_in_chain": rows[0][2], "block_index": rows[0][3],
+            "publish_version": VERSION,
+            "what_this_proves": "Content with exactly this fingerprint was served at that "
+                                "address no later than the first sealing time, and the record "
+                                "of it has not been altered since.",
+            "verify_the_block": "/x/consistency/ancestor?tip=" + rows[0][2]}, 200
+
+
+def _list(ctx):
+    with ctx["lock"]:
+        rows = ctx["conn"].execute(
+            "SELECT url,COUNT(*),MIN(fetched),MAX(fetched),COUNT(DISTINCT content_hash) "
+            "FROM publish_seal GROUP BY url ORDER BY MAX(fetched) DESC LIMIT 500").fetchall()
+    return {"count": len(rows),
+            "pages": [{"url": r[0], "seals": r[1], "first_sealed": _iso(r[2]),
+                       "latest_sealed": _iso(r[3]), "distinct_versions": r[4],
+                       "history": "/x/publish/history?url=" + r[0]} for r in rows],
+            "publish_version": VERSION,
+            "note": "Everything this platform has sealed about its own published pages. Ours is "
+                    "in here too - a publisher who seals everyone's pages but not their own is "
+                    "telling you something."}, 200
+
+
+def _spec():
+    return {
+        "publish_version": VERSION,
+        "content_hash": "sha256('AILEASH-PUBLISH-v1:' || exact_bytes_served) as lowercase hex",
+        "no_normalisation": "The bytes are hashed exactly as served. Nothing is trimmed, "
+                            "reordered or cleaned up first - a whitespace-tolerant hash would "
+                            "be a hash of our opinion of the page rather than of the page.",
+        "reproduce_it": "curl the URL, pipe the raw bytes through sha256 with that prefix, and "
+                        "compare with what we sealed. If your bytes differ, the page changed.",
+        "what_a_seal_proves": "That content with this exact fingerprint was served at this "
+                              "address no later than the sealing time, and that the record has "
+                              "not been altered since - it is a chain block like any other, "
+                              "anchored externally and witnessed by peers.",
+        "what_it_cannot_prove": "That the page existed before the seal. Timestamps run forwards "
+                                "only. Any product implying otherwise is misdescribing what a "
+                                "timestamp is.",
+        "for_earlier_dates": {
+            "github_push": "api.github.com/repos/<owner>/<repo>/events - the push timestamp is "
+                           "recorded by GitHub, not the pusher, unlike commit author and "
+                           "committer dates which are settable fields. Retained around 90 days, "
+                           "so capture it while it exists.",
+            "wayback": "archive.org/wayback/available - an independent party with no stake in "
+                       "the dispute.",
+            "status": "Both are recorded and sealed as supplied, and neither is verified by us. "
+                      "They are somebody else's evidence, named so you can check them at source.",
+        },
+        "the_discipline": "Seal at publication. One call at the moment a page goes live means "
+                          "the publication date never rests on anyone's word, anyone's git "
+                          "history, or anyone's memory again.",
+    }, 200
+
+
+# ----------------------------------------------------------------------
+# router entry point
+# ----------------------------------------------------------------------
+
+def handle(method, action, data, api_key, ctx):
+    _setup(ctx)
+    action = (action or "").strip("/").lower()
+    data = data or {}
+
+    if method == "GET":
+        if action == "spec":
+            return _spec()
+        if action == "history":
+            return _history(ctx, data)
+        if action == "verify":
+            return _verify(ctx, data)
+        if action == "list":
+            return _list(ctx)
+
+    if method == "POST":
+        if not api_key:
+            return {"error": "invalid_api_key"}, 401
+        if action == "seal":
+            return _seal(ctx, api_key, data)
+
+    return {"error": "unknown_action", "action": action,
+            "GET": ["spec", "history", "verify", "list"],
+            "POST": ["seal (keyed)"]}, 404
+
+```
+
+
+## `modules/reconcile.py`
+
+440 lines, 20123 bytes
+
+```python
+"""
+Reconciliation notary - /x/reconcile/<action>
+
+THE PROBLEM THIS ATTACKS
+------------------------
+A sealed chain proves records were not altered after the fact. It does not
+prove they were true when written. An operator who seals fiction on time has
+a tamper-evident chain of fiction. Every honest person in this market knows
+that, and almost nobody says it.
+
+You cannot prove truth from outside a system. What you CAN do is what real
+auditors do: substantive testing. Take the sealed claim, go to the operator's
+own live system, and check whether the two agree - then seal the result of
+that check, including the failures.
+
+WHY THIS ONE IS DIFFERENT
+-------------------------
+The sample is fixed before the operator sees it.
+
+/plan derives a selection seed from the current chain tip - a value the
+operator cannot predict in advance and cannot change afterwards without
+breaking the chain - picks the records to be tested, and seals that selection
+BEFORE any data is requested. Only then are the record identifiers returned.
+
+So the operator cannot choose which records get examined, cannot prepare only
+the flattering ones, and cannot quietly drop a test that came back badly:
+every planned run is sealed at the moment it is planned, and a plan with no
+submitted result is visible forever as an abandoned test.
+
+Mismatches are sealed with the same permanence as matches. That is the whole
+design. A reconciliation system that can bury its own failures is decoration.
+
+WHAT A PASS ACTUALLY MEANS
+--------------------------
+That two systems the operator controls agree with each other, on records the
+operator could not choose, at a time the operator could not pick.
+
+That is not proof of truth. An operator who fabricates consistently across
+every system, in real time, without knowing what will be sampled, will pass.
+What it does is raise the cost of lying from "edit one database" to
+"maintain a coherent parallel reality across independent systems indefinitely,
+under unpredictable sampling, with every failure sealed permanently."
+
+That is the honest claim. It is also, as far as I know, more than anyone else
+in this market is doing.
+
+HONEST LIMITS
+-------------
+- Consistency is not truth. Two agreeing systems can both be wrong.
+- The operator supplies the comparison data. This tests their systems against
+  each other, not against the world.
+- Sampling only covers what has been sealed. It cannot find a decision that
+  was never recorded at all - gapless receipts are what cover that.
+- A high match rate on a badly chosen field proves nothing. Reconcile the
+  fields that would hurt to get wrong.
+
+    POST /x/reconcile/plan     sample_size, field  - seals the selection first
+    POST /x/reconcile/submit   run_id, results     - seals the comparison
+    GET  /x/reconcile/run?id=RUN-XXXXXXXX
+    GET  /x/reconcile/score
+    GET  /x/reconcile/list
+"""
+
+import hashlib, json, time
+from datetime import datetime, timezone
+
+VERSION = "1.1"
+MAX_SAMPLE = 200
+
+# Planning and submitting stay keyed - they touch an operator's own records.
+# What is public is the part that decides whether any of it means anything:
+# that the sample was fixed before the data was asked for, and that failures
+# were sealed as permanently as passes.
+PUBLIC = {("GET", "public"), ("GET", "proof")}
+
+_ready = False
+
+
+def _setup(ctx):
+    global _ready
+    if _ready:
+        return
+    with ctx["lock"]:
+        ctx["conn"].execute("CREATE TABLE IF NOT EXISTS reconcile_runs(run_id TEXT PRIMARY KEY,api_key TEXT,field TEXT,seed TEXT,planned REAL,submitted REAL,sample_size INTEGER,matched INTEGER,mismatched INTEGER,missing INTEGER,status TEXT DEFAULT 'planned',block_ids TEXT,detail TEXT)")
+        ctx["conn"].execute("CREATE INDEX IF NOT EXISTS idx_rec_key ON reconcile_runs(api_key)")
+        ctx["conn"].commit()
+    _ready = True
+
+
+def _iso(ts):
+    if not ts:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+def _sha(s):
+    return hashlib.sha256(s.encode()).hexdigest()
+
+
+def _seal_event(ctx, api_key, rid, action, detail):
+    ts = time.time()
+    ev = {"user_id": "rec:" + rid, "action": "reconcile_" + action, "amount": 0,
+          "country": "UK", "device_id": "reconcile", "anomaly": 0, "device_risk": 0}
+    res = {"decision": "RECONCILE_SEALED", "score": 0, "reconcile_action": action,
+           "reconcile_version": VERSION, "timestamp": ts, "detail": detail}
+    h, idx, seq = ctx["seal"](ev, res, ts, api_key)
+    return h, idx, seq, ts
+
+
+def _plan(ctx, api_key, data):
+    try:
+        n = int(data.get("sample_size", 25))
+    except Exception:
+        return {"error": "invalid_sample_size"}, 400
+    if n < 1 or n > MAX_SAMPLE:
+        return {"error": "sample_size_out_of_range", "max": MAX_SAMPLE}, 400
+    field = str(data.get("field", "decision")).strip()[:60] or "decision"
+
+    with ctx["lock"]:
+        tiprow = ctx["conn"].execute("SELECT audit_hash FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()
+        rows = ctx["conn"].execute("SELECT id,user_id,result_json,ts FROM audit_log WHERE api_key=? ORDER BY id ASC", (api_key,)).fetchall()
+
+    if not rows:
+        return {"error": "nothing_to_reconcile",
+                "message": "No sealed records under this key yet."}, 400
+
+    tip = tiprow[0] if tiprow else "GENESIS"
+    ts = time.time()
+    # Seed is bound to the chain tip. The operator cannot know it before the
+    # records exist, and cannot alter it afterwards without breaking the chain.
+    seed = _sha(tip + ":" + str(int(ts)) + ":" + field + ":" + str(n))
+
+    # Deterministic selection from the seed - reproducible by anyone holding it.
+    scored = sorted(rows, key=lambda r: _sha(seed + ":" + str(r[0])))
+    picked = scored[:min(n, len(scored))]
+
+    rid = "RUN-" + seed[:8].upper()
+    block_ids = [p[0] for p in picked]
+
+    sample = []
+    for bid, uid, res_json, bts in picked:
+        try:
+            r = json.loads(res_json)
+            sealed_val = r.get(field)
+        except Exception:
+            sealed_val = None
+        sample.append({"block_index": bid, "record_id": uid,
+                       "sealed_at": _iso(bts),
+                       "sealed_value_sha256": _sha(str(sealed_val))})
+
+    detail = ("field=" + field + ";sample_size=" + str(len(picked)) +
+              ";seed=" + seed + ";from_tip=" + tip +
+              ";blocks=" + ",".join(str(b) for b in block_ids[:60]))
+    h, idx, seq, _x = _seal_event(ctx, api_key, rid, "planned", detail)
+
+    with ctx["lock"]:
+        ctx["conn"].execute("INSERT OR REPLACE INTO reconcile_runs(run_id,api_key,field,seed,planned,submitted,sample_size,matched,mismatched,missing,status,block_ids,detail) VALUES(?,?,?,?,?,NULL,?,NULL,NULL,NULL,'planned',?,NULL)",
+                            (rid, api_key, field, seed, ts, len(picked), json.dumps(block_ids)))
+        ctx["conn"].commit()
+
+    return {"run_id": rid, "field": field, "sample_size": len(picked),
+            "seed": seed, "derived_from_tip": tip, "planned_at": _iso(ts),
+            "audit_hash": h, "block_index": idx, "receipt_seq": seq,
+            "sample": sample,
+            "next": "Fetch these record_ids from your own live system and POST them to /x/reconcile/submit",
+            "note": "This selection is now sealed. It cannot be changed, and an unsubmitted plan stays visible as an abandoned test."}, 200
+
+
+def _submit(ctx, api_key, data):
+    rid = str(data.get("run_id", "")).strip().upper()
+    with ctx["lock"]:
+        row = ctx["conn"].execute("SELECT field,seed,status,block_ids FROM reconcile_runs WHERE run_id=? AND api_key=?", (rid, api_key)).fetchone()
+    if not row:
+        return {"error": "unknown_run_id"}, 404
+    if row[2] != "planned":
+        return {"error": "already_submitted",
+                "message": "A run is reconciled once. Re-running until it passes is not reconciliation."}, 400
+
+    results = data.get("results")
+    if not isinstance(results, dict) or not results:
+        return {"error": "results_required",
+                "message": "Send {block_index: live_value} from your own system."}, 400
+
+    field = row[0]
+    block_ids = json.loads(row[3])
+
+    with ctx["lock"]:
+        rows = ctx["conn"].execute("SELECT id,user_id,result_json FROM audit_log WHERE id IN (" + ",".join("?" * len(block_ids)) + ")", block_ids).fetchall()
+
+    sealed = {}
+    for bid, uid, res_json in rows:
+        try:
+            sealed[bid] = json.loads(res_json).get(field)
+        except Exception:
+            sealed[bid] = None
+
+    matched, mismatched, missing = [], [], []
+    for bid in block_ids:
+        key = str(bid)
+        if key not in results:
+            missing.append({"block_index": bid})
+            continue
+        live = results[key]
+        want = sealed.get(bid)
+        if str(live).strip().lower() == str(want).strip().lower():
+            matched.append(bid)
+        else:
+            mismatched.append({"block_index": bid,
+                               "sealed_value": want,
+                               "live_value": live})
+
+    ts = time.time()
+    rate = round(100 * len(matched) / len(block_ids), 2) if block_ids else 0
+    detail = ("field=" + field + ";matched=" + str(len(matched)) +
+              ";mismatched=" + str(len(mismatched)) + ";missing=" + str(len(missing)) +
+              ";match_rate=" + str(rate) +
+              ";mismatch_blocks=" + ",".join(str(m["block_index"]) for m in mismatched[:40]))
+    h, idx, seq, _x = _seal_event(ctx, api_key, rid, "reconciled", detail)
+
+    with ctx["lock"]:
+        ctx["conn"].execute("UPDATE reconcile_runs SET submitted=?,matched=?,mismatched=?,missing=?,status='reconciled',detail=? WHERE run_id=? AND api_key=?",
+                            (ts, len(matched), len(mismatched), len(missing), json.dumps({"mismatched": mismatched[:100], "missing": missing[:100]}), rid, api_key))
+        ctx["conn"].commit()
+
+    out = {"run_id": rid, "field": field, "sample_size": len(block_ids),
+           "matched": len(matched), "mismatched": len(mismatched),
+           "missing": len(missing), "match_rate_pct": rate,
+           "reconciled_at": _iso(ts), "audit_hash": h, "block_index": idx,
+           "receipt_seq": seq,
+           "note": "This result is sealed whichever way it went. It cannot be withdrawn."}
+    if mismatched:
+        out["mismatches"] = mismatched[:20]
+        out["flag"] = "sealed records and live system disagree on " + str(len(mismatched)) + " of " + str(len(block_ids))
+    if missing:
+        out["missing_detail"] = "records the live system did not return - a gap, not a match"
+    return out, 200
+
+
+def _run(ctx, api_key, rid):
+    with ctx["lock"]:
+        row = ctx["conn"].execute("SELECT field,seed,planned,submitted,sample_size,matched,mismatched,missing,status,detail FROM reconcile_runs WHERE run_id=? AND api_key=?", (rid.upper(), api_key)).fetchone()
+        if not row:
+            return {"error": "unknown_run_id"}, 404
+        blocks = ctx["conn"].execute("SELECT ts,result_json,audit_hash FROM audit_log WHERE user_id=? ORDER BY id ASC", ("rec:" + rid.upper(),)).fetchall()
+    events = []
+    for bts, res, ah in blocks:
+        try:
+            r = json.loads(res)
+            events.append({"at": _iso(bts), "event": r.get("reconcile_action"),
+                           "detail": r.get("detail"), "sealed": ah})
+        except Exception:
+            pass
+    total = row[4] or 0
+    out = {"run_id": rid.upper(), "field": row[0], "seed": row[1],
+           "planned": _iso(row[2]), "submitted": _iso(row[3]),
+           "sample_size": total, "matched": row[5], "mismatched": row[6],
+           "missing": row[7], "status": row[8], "events": events,
+           "ordering_proof": "The plan block precedes the result block. The sample was fixed before any data was requested."}
+    if row[9]:
+        try:
+            out["detail"] = json.loads(row[9])
+        except Exception:
+            pass
+    if row[8] == "planned":
+        out["flag"] = "planned but never submitted - an abandoned test, visible permanently"
+    return out, 200
+
+
+def _score(ctx, api_key):
+    with ctx["lock"]:
+        rows = ctx["conn"].execute("SELECT sample_size,matched,mismatched,missing,status,planned FROM reconcile_runs WHERE api_key=? ORDER BY planned DESC LIMIT 500", (api_key,)).fetchall()
+    if not rows:
+        return {"runs": 0, "note": "No reconciliation runs on record."}, 200
+    done = [r for r in rows if r[4] == "reconciled"]
+    abandoned = len(rows) - len(done)
+    tested = sum(r[0] or 0 for r in done)
+    ok = sum(r[1] or 0 for r in done)
+    bad = sum(r[2] or 0 for r in done)
+    gone = sum(r[3] or 0 for r in done)
+    out = {"runs": len(rows), "reconciled": len(done), "abandoned": abandoned,
+           "records_tested": tested, "matched": ok, "mismatched": bad,
+           "missing": gone,
+           "match_rate_pct": (round(100 * ok / tested, 2) if tested else None),
+           "last_run": _iso(rows[0][5])}
+    if abandoned:
+        out["flag"] = str(abandoned) + " planned run(s) never submitted"
+    return out, 200
+
+
+def _list(ctx, api_key):
+    with ctx["lock"]:
+        rows = ctx["conn"].execute("SELECT run_id,field,planned,submitted,sample_size,matched,mismatched,missing,status FROM reconcile_runs WHERE api_key=? ORDER BY planned DESC LIMIT 200", (api_key,)).fetchall()
+    return {"count": len(rows),
+            "runs": [{"run_id": r[0], "field": r[1], "planned": _iso(r[2]),
+                      "submitted": _iso(r[3]), "sample_size": r[4],
+                      "matched": r[5], "mismatched": r[6], "missing": r[7],
+                      "status": r[8]} for r in rows]}, 200
+
+
+def _public(ctx):
+    """The reconciliation record, readable without a key.
+
+    Counts only. No record identifiers, no field values, no operator
+    identity. What a stranger gets is the three numbers that cannot be
+    flattered: how many runs were reconciled, how many disagreed, and how
+    many were planned and then quietly abandoned.
+
+    Abandoned runs are the important one. A planned run is sealed at the
+    moment it is planned, so a test that came back badly and was dropped
+    cannot be deleted - it sits here forever as a plan with no result.
+    """
+    with ctx["lock"]:
+        rows = ctx["conn"].execute(
+            "SELECT run_id,field,planned,submitted,sample_size,matched,mismatched,"
+            "missing,status FROM reconcile_runs ORDER BY planned DESC LIMIT 200").fetchall()
+
+    done = [r for r in rows if r[8] == "reconciled"]
+    abandoned = [r for r in rows if r[8] != "reconciled"]
+    tested = sum(r[4] or 0 for r in done)
+    ok = sum(r[5] or 0 for r in done)
+    bad = sum(r[6] or 0 for r in done)
+    gone = sum(r[7] or 0 for r in done)
+
+    out = {
+        "runs": len(rows),
+        "reconciled": len(done),
+        "abandoned": len(abandoned),
+        "records_tested": tested,
+        "matched": ok,
+        "mismatched": bad,
+        "missing": gone,
+        "match_rate_pct": (round(100 * ok / tested, 2) if tested else None),
+        "recent": [{"run_id": r[0], "field": r[1], "planned": _iso(r[2]),
+                    "submitted": _iso(r[3]), "sample_size": r[4],
+                    "matched": r[5], "mismatched": r[6], "missing": r[7],
+                    "status": r[8]} for r in rows[:50]],
+        "check_any_of_them": "/x/reconcile/proof?id=RUN-XXXXXXXX",
+        "what_is_being_shown": "Not that the records are true. That the sample was fixed "
+                               "before the data was requested, and that what came back was "
+                               "sealed either way.",
+        "what_a_mismatch_means": "The sealed record and the operator's own live system "
+                                 "disagreed. It is published because a reconciliation system "
+                                 "that can bury its own failures is decoration.",
+    }
+    if abandoned:
+        out["flag"] = (str(len(abandoned)) + " run(s) planned and never submitted. A sample was "
+                       "fixed, and no result was ever sealed against it.")
+    return out, 200
+
+
+def _proof(ctx, rid):
+    """The ordering, straight out of the chain, without a key.
+
+    Both events are already sealed under a public identifier, so this route
+    reveals nothing the chain does not already carry. It just makes the one
+    claim that matters legible: the plan block comes before the result block.
+    """
+    rid = (rid or "").strip().upper()
+    if not rid:
+        return {"error": "id_required"}, 400
+
+    with ctx["lock"]:
+        row = ctx["conn"].execute(
+            "SELECT field,seed,planned,submitted,sample_size,matched,mismatched,missing,status "
+            "FROM reconcile_runs WHERE run_id=?", (rid,)).fetchone()
+        blocks = ctx["conn"].execute(
+            "SELECT id,ts,result_json,audit_hash FROM audit_log WHERE user_id=? ORDER BY id ASC",
+            ("rec:" + rid,)).fetchall()
+    if not row:
+        return {"error": "unknown_run_id", "list": "/x/reconcile/public"}, 404
+
+    events = []
+    plan_block = result_block = None
+    for bid, bts, res, ah in blocks:
+        try:
+            r = json.loads(res)
+        except Exception:
+            continue
+        what = r.get("reconcile_action")
+        events.append({"event": what, "at": _iso(bts), "block_index": bid,
+                       "sealed_in_chain": ah, "sealed_detail": r.get("detail")})
+        if what == "planned" and plan_block is None:
+            plan_block = bid
+        if what == "reconciled" and result_block is None:
+            result_block = bid
+
+    ordered = (plan_block is not None and result_block is not None
+               and plan_block < result_block)
+
+    out = {"run_id": rid, "field": row[0], "status": row[8],
+           "seed": row[1], "planned_at": _iso(row[2]), "submitted_at": _iso(row[3]),
+           "sample_size": row[4], "matched": row[5], "mismatched": row[6],
+           "missing": row[7],
+           "plan_block_index": plan_block, "result_block_index": result_block,
+           "selection_precedes_result": ordered,
+           "events": events,
+           "how_to_check_this_yourself": [
+               "The seed is derived from the chain tip at planning time, which the operator "
+               "cannot predict in advance or change afterwards without breaking the chain.",
+               "The plan block seals which records were selected, and its detail is above.",
+               "The result block seals what came back. Compare the two block indices.",
+               "A lower plan index than result index means the sample was fixed before any "
+               "data was requested. That is the whole claim, and it is the only one made."],
+           "what_this_does_not_prove": "That the records are true. Two systems the operator "
+                                       "controls agreeing with each other is consistency, not "
+                                       "truth."}
+    if row[8] != "reconciled":
+        out["flag"] = ("planned and never submitted. The selection is sealed and no result "
+                       "was ever put against it.")
+    elif not ordered:
+        out["flag"] = ("the plan block does not precede the result block. That should be "
+                       "impossible and it is the finding.")
+    return out, 200
+
+
+def handle(method, action, data, api_key, ctx):
+    _setup(ctx)
+    if method == "POST":
+        if action == "plan":
+            return _plan(ctx, api_key, data)
+        if action == "submit":
+            return _submit(ctx, api_key, data)
+    else:
+        if action == "public":
+            return _public(ctx)
+        if action == "proof":
+            return _proof(ctx, str((data or {}).get("id", "")))
+        if action == "score":
+            return _score(ctx, api_key)
+        if action == "list":
+            return _list(ctx, api_key)
+        if action == "run":
+            rid = str(data.get("id", "")).strip()
+            if not rid:
+                return {"error": "id_required"}, 400
+            return _run(ctx, api_key, rid)
+    return {"error": "unknown_action", "action": action,
+            "GET": ["public", "proof", "score", "list", "run"],
+            "POST": ["plan", "submit"]}, 404
+
+```
+
+
+## `modules/replay.py`
+
+678 lines, 30538 bytes
+
+```python
+#!/usr/bin/env python3
+"""
+modules/replay.py  -  proving the same inputs still produce the same verdict
+                      WITHOUT ever disclosing how the verdict is reached
+============================================================================
+
+THE QUESTION NOBODY ELSE IN THIS MARKET CAN ANSWER
+--------------------------------------------------
+Every compliance platform can tell you what it decided. Not one of them can
+prove it would decide the same way again.
+
+Ask any of them to re-run decision 4,117 from its sealed inputs and show the
+same verdict falls out. They cannot. Not because they will not - because
+their scoring goes through a model call, and model calls are not
+reproducible. Same inputs, different day, different answer. Their audit
+trail describes a decision that can never be performed twice.
+
+Ours is arithmetic. Deterministic below the model layer, and always has
+been. This module lets anyone establish that for themselves.
+
+THE SCORING LOGIC IS NEVER DISCLOSED
+------------------------------------
+Read this before changing anything in here.
+
+Nothing in this module publishes, returns, echoes or hints at the contents
+of the decision function. Not the source, not the weights, not the
+thresholds, not the signal names, not the intermediate values. The only
+thing that leaves the building is a SHA-256 of the deployed source, which
+is one-way and reveals nothing about what it hashes.
+
+Determinism is proved as a BLACK BOX instead: same inputs in, same verdict
+out, demonstrated repeatedly, by the challenger, on their own schedule,
+with every run sealed into the chain. That is a stronger proof than showing
+the code, because it is behaviour observed over time rather than a claim
+about a listing nobody can confirm is what actually runs in production.
+
+  A competitor who reads every route here learns exactly one thing: that
+  our verdicts are reproducible. Which is the point, and which they cannot
+  copy, because reproducibility is a property of the architecture and not a
+  feature that can be bolted on.
+
+HOW SOMEONE CHECKS US WITHOUT SEEING ANYTHING
+---------------------------------------------
+  POST /x/replay/challenge   send any inputs you like. We run them, seal
+                             the run into the chain, and hand you back the
+                             verdict, the audit hash, and a fingerprint of
+                             your own inputs.
+
+Send the same inputs again - an hour later, a year later, from a different
+address. If the verdict ever moves, you have caught us, and both runs are
+independently sealed and anchored so we cannot revise either one. If it
+never moves, you have established determinism yourself, empirically,
+adversarially, without a line of our code.
+
+We also report how many times that exact input has been challenged, when it
+was first seen, and every audit hash it produced, so the whole history is
+verifiable through routes we do not control the answers to.
+
+THE HONEST COST, WHICH IS REAL
+------------------------------
+An open scoring oracle can be probed. Feed it a thousand variations, watch
+the verdicts move, and a determined party can map the decision boundary
+without ever seeing the code. That is a genuine exposure and it is the
+price of this proof.
+
+It is mitigated, not eliminated: challenges are rate limited per address,
+inputs are fingerprinted so repeat submissions are cheap and novel ones are
+not, and boundary-probing patterns are already logged elsewhere in the
+platform. Anyone systematically mapping the function leaves an obvious,
+sealed trail while doing it.
+
+The trade is deliberate. A closed engine nobody can test is worth less than
+a testable one somebody might partially map, because the first cannot be
+sold to a regulator and the second can.
+
+CONFIGURATION
+-------------
+This module does not import server.py - nothing here does. It finds the
+live decision function at runtime among already-loaded modules, so it can
+only observe the engine, never change it. If your scorer is named something
+not in SCORER_NAMES below, add it there. Everything else is read from the
+audit_log schema at startup rather than assumed.
+
+    POST /x/replay/challenge     run any inputs, sealed          (public)
+    GET  /x/replay/history       every run of a given input       (public)
+    GET  /x/replay/self          reproduction rate over a sample  (public)
+    GET  /x/replay/fingerprint   hash of the deployed code        (public)
+    GET  /x/replay/spec          how to test us                   (public)
+    GET  /x/replay/check         re-run one sealed decision       (keyed)
+    POST /x/replay/attest        seal the current fingerprint     (keyed)
+"""
+
+import hashlib
+import inspect
+import json
+import sys
+import time
+from datetime import datetime, timezone
+
+VERSION = "1.0"
+
+# Challenge, history, self, fingerprint and spec are open - a
+# reproducibility claim you need an account to test is not a claim anyone
+# should accept. check stays keyed: it reads back a specific sealed
+# decision, which belongs to whoever owns it.
+PUBLIC = {("POST", "challenge"), ("GET", "history"), ("GET", "self"),
+          ("GET", "fingerprint"), ("GET", "spec")}
+
+# Names the live decision function might go by. Add yours if it is not
+# here - this is the one thing that has to match your code.
+SCORER_NAMES = (
+    "score_event", "decide", "score", "evaluate", "run_decision",
+    "make_decision", "assess", "score_decision", "engine_decide",
+)
+
+# Columns the sealed inputs might live in. Detected, never assumed.
+INPUT_COLUMNS = ("event", "event_json", "payload", "inputs", "request",
+                 "ev", "data", "event_data")
+RESULT_COLUMNS = ("result", "result_json", "res", "decision_json", "outcome",
+                  "response")
+VERDICT_COLUMNS = ("decision", "verdict", "action_taken")
+SCORE_COLUMNS = ("score", "risk_score", "points")
+
+SELF_SAMPLE_DEFAULT = 50
+SELF_SAMPLE_MAX = 500
+
+# Challenge throttle. Repeat submissions of an input we have already seen
+# are cheap; novel inputs are what a prober needs, so those are what get
+# limited.
+NOVEL_PER_HOUR = 40
+MAX_PAYLOAD_KEYS = 40
+
+_ready = False
+_columns = []
+
+
+def _setup(ctx):
+    global _ready, _columns
+    if _ready:
+        return
+    cols = []
+    try:
+        with ctx["lock"]:
+            for row in ctx["conn"].execute("PRAGMA table_info(audit_log)").fetchall():
+                cols.append(row[1])
+    except Exception:
+        pass
+    _columns = cols
+    with ctx["lock"]:
+        c = ctx["conn"]
+        c.execute("CREATE TABLE IF NOT EXISTS replay_attest("
+                  "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,"
+                  "fingerprint TEXT,function TEXT,taken REAL,"
+                  "audit_hash TEXT,block_index INTEGER)")
+        # One row per challenge run. The input fingerprint is stored, the
+        # input itself is not - we have no reason to keep a stranger's
+        # payload and every reason not to.
+        c.execute("CREATE TABLE IF NOT EXISTS replay_challenge("
+                  "id INTEGER PRIMARY KEY AUTOINCREMENT,input_hash TEXT,"
+                  "verdict TEXT,score TEXT,code_fingerprint TEXT,ran REAL,"
+                  "audit_hash TEXT,block_index INTEGER,client TEXT)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_rep_input "
+                  "ON replay_challenge(input_hash,id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_rep_ran ON replay_challenge(ran)")
+        c.commit()
+    _ready = True
+
+
+def _iso(ts):
+    if not ts:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+def _pick(candidates):
+    for name in candidates:
+        if name in _columns:
+            return name
+    return None
+
+
+def _canonical(payload):
+    """Stable rendering of an input payload, so the same inputs always
+    fingerprint to the same value regardless of key order or spacing."""
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False, default=str)
+
+
+def _input_hash(payload):
+    return hashlib.sha256(("AILEASH-INPUT-v1:" + _canonical(payload)).encode("utf-8")).hexdigest()
+
+
+# ----------------------------------------------------------------------
+# finding the live decision function
+# ----------------------------------------------------------------------
+
+def _find_scorer():
+    """Locate the deployed decision function among loaded modules.
+
+    Deliberately does not import server.py. It looks at what is already
+    running, so this module can observe the engine and never alter it.
+    """
+    for module_name in ("__main__", "server", "app", "main"):
+        module = sys.modules.get(module_name)
+        if module is None:
+            continue
+        for name in SCORER_NAMES:
+            candidate = getattr(module, name, None)
+            if callable(candidate):
+                return candidate, "%s.%s" % (module_name, name), None
+    return None, None, ("no decision function found. Add its real name to SCORER_NAMES at the "
+                        "top of modules/replay.py.")
+
+
+def _fingerprint_of(function):
+    """SHA-256 of the deployed source. One-way: it commits to which code is
+    running without revealing any of it."""
+    try:
+        source = inspect.getsource(function)
+    except (OSError, TypeError):
+        return None, "source not readable for this callable"
+    normalised = "\n".join(line.rstrip() for line in source.splitlines()).strip()
+    return hashlib.sha256(normalised.encode("utf-8")).hexdigest(), None
+
+
+# ----------------------------------------------------------------------
+# running the engine
+# ----------------------------------------------------------------------
+
+def _rerun(function, inputs):
+    """Execute the live decision function against a set of inputs.
+
+    Never raises. On failure it reports that the call failed and nothing
+    about why the engine is shaped the way it is.
+    """
+    if inputs is None:
+        return None, "no inputs"
+    attempts = []
+    if isinstance(inputs, dict):
+        attempts.append(lambda: function(**inputs))
+        attempts.append(lambda: function(inputs))
+    else:
+        attempts.append(lambda: function(inputs))
+    for call in attempts:
+        try:
+            return call(), None
+        except TypeError:
+            continue
+        except Exception:
+            return None, "the decision function could not process those inputs"
+    return None, "those inputs do not match the shape the engine expects"
+
+
+def _extract(output):
+    """Pull (verdict, score) out of whatever the scorer returns. Nothing
+    else from the return value is ever surfaced."""
+    if isinstance(output, dict):
+        return (output.get("decision") or output.get("verdict"), output.get("score"))
+    if isinstance(output, (tuple, list)) and len(output) >= 2:
+        return output[0], output[1]
+    return output, None
+
+
+def _same(a, b):
+    if a is None and b is None:
+        return True
+    if a is None or b is None:
+        return False
+    if isinstance(a, float) or isinstance(b, float):
+        try:
+            return abs(float(a) - float(b)) < 1e-9
+        except (TypeError, ValueError):
+            return False
+    return str(a).strip().upper() == str(b).strip().upper()
+
+
+# ----------------------------------------------------------------------
+# challenge - the public proof
+# ----------------------------------------------------------------------
+
+def _novel_recently(ctx):
+    since = time.time() - 3600
+    with ctx["lock"]:
+        row = ctx["conn"].execute(
+            "SELECT COUNT(DISTINCT input_hash) FROM replay_challenge WHERE ran>=?",
+            (since,)).fetchone()
+    return int(row[0]) if row else 0
+
+
+def _challenge(ctx, api_key, data):
+    inputs = data.get("inputs", data.get("event", data.get("payload")))
+    if not isinstance(inputs, dict) or not inputs:
+        return {"error": "inputs_required",
+                "message": "Send an inputs object. We will run it, seal the run, and hand you "
+                           "back the verdict. Send the same object again whenever you like - "
+                           "if the answer ever moves, you have caught us."}, 400
+    if len(inputs) > MAX_PAYLOAD_KEYS:
+        return {"error": "payload_too_wide", "message": "at most %d keys" % MAX_PAYLOAD_KEYS}, 400
+
+    fingerprint_in = _input_hash(inputs)
+
+    with ctx["lock"]:
+        prior = ctx["conn"].execute(
+            "SELECT verdict,score,ran,audit_hash,block_index,code_fingerprint "
+            "FROM replay_challenge WHERE input_hash=? ORDER BY id ASC",
+            (fingerprint_in,)).fetchall()
+
+    if not prior and _novel_recently(ctx) >= NOVEL_PER_HOUR:
+        return {"error": "rate_limited",
+                "message": "Too many distinct inputs in the last hour. Repeat submissions of "
+                           "inputs already seen are never limited - testing whether the answer "
+                           "moves is the whole point. Mapping the function is not.",
+                "repeat_freely": "any input_hash already in /x/replay/history"}, 429
+
+    function, name, why = _find_scorer()
+    if why:
+        return {"error": "engine_unavailable", "message": "the decision engine is not reachable "
+                                                          "from this route right now"}, 503
+
+    output, problem = _rerun(function, inputs)
+    if problem:
+        return {"error": "not_runnable", "message": problem}, 422
+
+    verdict, score = _extract(output)
+    code_fingerprint, _p = _fingerprint_of(function)
+    now = time.time()
+
+    ev = {"user_id": "chal:" + fingerprint_in[:16], "action": "replay_challenge", "amount": 0,
+          "country": "UK", "device_id": "replay", "anomaly": 0, "device_risk": 0}
+    res = {"decision": str(verdict), "score": score, "replay_version": VERSION,
+           "input_hash": fingerprint_in, "code_fingerprint": code_fingerprint,
+           "detail": "input=%s;verdict=%s;code=%s" % (fingerprint_in, verdict, code_fingerprint)}
+    audit_hash, block_index, seq = ctx["seal"](ev, res, now, api_key or "public-replay")
+
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "INSERT INTO replay_challenge(input_hash,verdict,score,code_fingerprint,ran,"
+            "audit_hash,block_index,client) VALUES(?,?,?,?,?,?,?,?)",
+            (fingerprint_in, str(verdict), str(score), code_fingerprint, now,
+             audit_hash, block_index, "keyed" if api_key else "anonymous"))
+        ctx["conn"].commit()
+
+    out = {
+        "input_hash": fingerprint_in,
+        "verdict": verdict, "score": score,
+        "ran_at": _iso(now),
+        "sealed_in_chain": audit_hash, "block_index": block_index, "receipt_seq": seq,
+        "code_fingerprint": code_fingerprint,
+        "runs_of_this_input": len(prior) + 1,
+        "replay_version": VERSION,
+        "how_to_use_this": "Send the identical inputs again, whenever you like, from wherever "
+                           "you like. Every run is sealed into a chain that is externally "
+                           "anchored and independently witnessed, so neither this answer nor "
+                           "the next one can be revised afterwards.",
+        "history": "/x/replay/history?input_hash=" + fingerprint_in,
+        "verify_this_run": "/x/consistency/ancestor?tip=" + audit_hash,
+    }
+
+    if prior:
+        first_verdict, first_score = prior[0][0], prior[0][1]
+        stable = _same(verdict, first_verdict) and _same(score, first_score)
+        out["first_seen"] = _iso(prior[0][2])
+        out["stable"] = stable
+        out["verdict_moved"] = not stable
+        if stable:
+            out["what_this_shows"] = ("Identical to the first run of these inputs on %s, and to "
+                                      "every run since. Determinism observed rather than "
+                                      "asserted." % _iso(prior[0][2]))
+        else:
+            out["what_this_shows"] = ("These inputs previously produced a different answer. "
+                                      "Either the code changed - compare the code fingerprints "
+                                      "in the history - or the engine is not deterministic. "
+                                      "Both runs are sealed and neither can be withdrawn.")
+    else:
+        out["stable"] = None
+        out["what_this_shows"] = ("First time these inputs have been seen. Send them again to "
+                                  "start building the record.")
+    return out, 200
+
+
+def _history(ctx, data):
+    input_hash = str(data.get("input_hash", data.get("hash", ""))).strip().lower()
+    if not input_hash:
+        return {"error": "input_hash_required"}, 400
+    with ctx["lock"]:
+        rows = ctx["conn"].execute(
+            "SELECT verdict,score,ran,audit_hash,block_index,code_fingerprint,client "
+            "FROM replay_challenge WHERE input_hash=? ORDER BY id ASC LIMIT 500",
+            (input_hash,)).fetchall()
+    if not rows:
+        return {"error": "unknown_input", "input_hash": input_hash,
+                "message": "No run recorded for that input fingerprint."}, 404
+
+    verdicts = {r[0] for r in rows}
+    codes = {r[5] for r in rows if r[5]}
+    return {
+        "input_hash": input_hash,
+        "runs": len(rows),
+        "first_run": _iso(rows[0][2]), "latest_run": _iso(rows[-1][2]),
+        "distinct_verdicts": len(verdicts),
+        "stable": len(verdicts) == 1,
+        "code_versions_seen": len(codes),
+        "history": [{"verdict": r[0], "score": r[1], "ran_at": _iso(r[2]),
+                     "sealed_in_chain": r[3], "block_index": r[4],
+                     "code_fingerprint": r[5], "submitted_by": r[6]} for r in rows],
+        "what_this_is": "Every recorded run of one exact set of inputs, each sealed separately "
+                        "into the chain. Verify any of them independently at "
+                        "/x/consistency/ancestor - we cannot alter one after the fact.",
+        "note": "More than one distinct verdict across a single code fingerprint would mean the "
+                "engine is not deterministic. That is exactly what this is here to expose.",
+    }, 200
+
+
+# ----------------------------------------------------------------------
+# self audit
+# ----------------------------------------------------------------------
+
+def _fetch(ctx, where, args):
+    input_col = _pick(INPUT_COLUMNS)
+    result_col = _pick(RESULT_COLUMNS)
+    verdict_col = _pick(VERDICT_COLUMNS)
+    score_col = _pick(SCORE_COLUMNS)
+    if not input_col:
+        return None, ("audit_log does not store decision inputs on this deployment, so sealed "
+                      "decisions cannot be re-executed. Seal the event payload alongside the "
+                      "verdict and replay becomes available from that point on.")
+    fields = ["id", "audit_hash", "ts", input_col]
+    for extra in (result_col, verdict_col, score_col):
+        if extra and extra not in fields:
+            fields.append(extra)
+    sql = "SELECT %s FROM audit_log WHERE %s" % (", ".join(fields), where)
+    with ctx["lock"]:
+        rows = ctx["conn"].execute(sql, tuple(args)).fetchall()
+    if not rows:
+        return None, "no sealed decision matched"
+    out = []
+    for row in rows:
+        record = dict(zip(fields, row))
+        raw = record.get(input_col)
+        try:
+            parsed = raw if isinstance(raw, (dict, list)) else json.loads(raw)
+        except Exception:
+            parsed = None
+        sealed_result = None
+        if result_col:
+            raw_result = record.get(result_col)
+            try:
+                sealed_result = raw_result if isinstance(raw_result, dict) else json.loads(raw_result)
+            except Exception:
+                sealed_result = None
+        out.append({"id": record.get("id"), "audit_hash": record.get("audit_hash"),
+                    "ts": record.get("ts"), "inputs": parsed,
+                    "sealed_result": sealed_result,
+                    "sealed_verdict": record.get(verdict_col) if verdict_col else None,
+                    "sealed_score": record.get(score_col) if score_col else None})
+    return out, None
+
+
+def _sealed_pair(record):
+    verdict = record.get("sealed_verdict")
+    score = record.get("sealed_score")
+    result = record.get("sealed_result")
+    if isinstance(result, dict):
+        if verdict is None:
+            verdict = result.get("decision") or result.get("verdict")
+        if score is None:
+            score = result.get("score")
+    return verdict, score
+
+
+def _compare(record, function):
+    output, why = _rerun(function, record.get("inputs"))
+    sealed_verdict, sealed_score = _sealed_pair(record)
+    if why:
+        return {"audit_hash": record["audit_hash"], "result": "not_replayable"}
+    verdict, score = _extract(output)
+    identical = _same(verdict, sealed_verdict) and _same(score, sealed_score)
+    return {"audit_hash": record["audit_hash"], "sealed_at": _iso(record.get("ts")),
+            "result": "identical" if identical else "divergent"}
+
+
+def _self(ctx, data):
+    try:
+        sample = int(data.get("sample", SELF_SAMPLE_DEFAULT))
+    except (TypeError, ValueError):
+        sample = SELF_SAMPLE_DEFAULT
+    sample = max(1, min(sample, SELF_SAMPLE_MAX))
+
+    function, name, why = _find_scorer()
+    if why:
+        return {"error": "engine_unavailable"}, 503
+
+    records, fetch_why = _fetch(ctx, "1=1 ORDER BY id DESC LIMIT ?", [sample])
+    if fetch_why:
+        return {"error": "cannot_replay", "message": fetch_why}, 400
+
+    identical = divergent = skipped = 0
+    divergent_hashes = []
+    started = time.time()
+    for record in records:
+        outcome = _compare(record, function)
+        if outcome["result"] == "identical":
+            identical += 1
+        elif outcome["result"] == "divergent":
+            divergent += 1
+            if len(divergent_hashes) < 10:
+                divergent_hashes.append(outcome["audit_hash"])
+        else:
+            skipped += 1
+
+    checked = identical + divergent
+    rate = round((identical / checked) * 100, 4) if checked else None
+    code_fingerprint, _p = _fingerprint_of(function)
+
+    body = {
+        "sampled": len(records), "replayable": checked,
+        "identical": identical, "divergent": divergent, "not_replayable": skipped,
+        "reproduction_rate_percent": rate,
+        "took_seconds": round(time.time() - started, 3),
+        "code_fingerprint": code_fingerprint,
+        "replay_version": VERSION,
+        "headline": ("%d of %d sealed decisions reproduce identically under the code deployed "
+                     "right now." % (identical, checked)) if checked else
+                    "Nothing replayable in this sample.",
+        "why_this_matters": "A platform whose scoring runs through a model call cannot do this "
+                            "at all. Reproducibility is a property of the architecture, not a "
+                            "feature that can be added later.",
+        "honest": "Divergences are counted here, not filtered out. A falling rate is the most "
+                  "useful thing this route can tell you.",
+        "independent_check": "Do not take our word for this - /x/replay/challenge lets you run "
+                             "your own inputs and repeat them whenever you like.",
+    }
+    if divergent_hashes:
+        body["divergent_receipts"] = divergent_hashes
+    return body, 200
+
+
+# ----------------------------------------------------------------------
+# fingerprint, keyed check, attest
+# ----------------------------------------------------------------------
+
+def _fingerprint(ctx):
+    function, name, why = _find_scorer()
+    if why:
+        return {"error": "engine_unavailable"}, 503
+    digest, problem = _fingerprint_of(function)
+    return {"code_fingerprint": digest, "problem": problem, "replay_version": VERSION,
+            "what_this_is": "A SHA-256 of the source of the code currently deciding. It commits "
+                            "to which version is running. It is one-way and discloses nothing "
+                            "about the logic, the weights or the thresholds.",
+            "what_it_is_for": "Sealed alongside verdicts via /x/replay/attest, so a change in "
+                              "behaviour can be attributed to a dated code change rather than "
+                              "looking like a fault - or hidden as one.",
+            "note": "The function name and signature are deliberately not published."}, 200
+
+
+def _check(ctx, data):
+    """Keyed. Re-runs one sealed decision and reports match or divergence."""
+    target = str(data.get("hash", data.get("receipt", ""))).strip().lower()
+    if not target:
+        return {"error": "hash_required"}, 400
+    records, why = _fetch(ctx, "audit_hash=? LIMIT 1", [target])
+    if why:
+        return {"error": "cannot_replay", "message": why}, 400
+    function, name, scorer_why = _find_scorer()
+    if scorer_why:
+        return {"error": "engine_unavailable"}, 503
+    outcome = _compare(records[0], function)
+    digest, _p = _fingerprint_of(function)
+    outcome.update({"code_fingerprint": digest, "replay_version": VERSION,
+                    "what_this_proves": "The sealed inputs were fed back through the live "
+                                        "decision function and the output compared with what "
+                                        "was sealed."})
+    return outcome, 200
+
+
+def _attest(ctx, api_key):
+    function, name, why = _find_scorer()
+    if why:
+        return {"error": "engine_unavailable"}, 503
+    digest, problem = _fingerprint_of(function)
+    if not digest:
+        return {"error": "no_fingerprint", "message": problem}, 503
+
+    now = time.time()
+    ev = {"user_id": "rep:" + digest[:16], "action": "code_fingerprint_sealed", "amount": 0,
+          "country": "UK", "device_id": "replay", "anomaly": 0, "device_risk": 0}
+    res = {"decision": "FINGERPRINT_SEALED", "score": 0, "replay_version": VERSION,
+           "fingerprint": digest, "detail": "fingerprint=%s" % digest}
+    audit_hash, block_index, seq = ctx["seal"](ev, res, now, api_key)
+
+    with ctx["lock"]:
+        ctx["conn"].execute("INSERT INTO replay_attest(api_key,fingerprint,function,taken,"
+                            "audit_hash,block_index) VALUES(?,?,?,?,?,?)",
+                            (api_key, digest, name, now, audit_hash, block_index))
+        ctx["conn"].commit()
+
+    return {"fingerprint": digest, "taken_at": _iso(now),
+            "sealed_in_chain": audit_hash, "block_index": block_index, "receipt_seq": seq,
+            "what_this_does": "Records which code was deciding at this moment, inside the chain "
+                              "the decisions are sealed in. Every verdict after this point is "
+                              "attributable to a known, timestamped version of the logic - "
+                              "without that logic being published.",
+            "do_this": "Attest on every deploy that touches scoring. A later divergence then "
+                       "reads as a dated policy change rather than an unexplained fault."}, 200
+
+
+def _spec():
+    return {
+        "replay_version": VERSION,
+        "claim": "The same inputs produce the same verdict, and you can establish that yourself "
+                 "without an account and without seeing any of our logic.",
+        "the_logic_is_not_published": "No route here returns the scoring source, the weights, "
+                                      "the thresholds, the signal names or any intermediate "
+                                      "value. The only thing published is a SHA-256 of the "
+                                      "deployed source, which is one-way.",
+        "how_to_test_us": [
+            "POST /x/replay/challenge with any inputs object you like.",
+            "Keep the input_hash it returns.",
+            "Send the identical inputs again tomorrow, next month, next year, from anywhere.",
+            "GET /x/replay/history?input_hash=... to see every run, each sealed separately.",
+            "If the verdict ever moves under an unchanged code fingerprint, the engine is not "
+            "deterministic and you have proof of it that we cannot withdraw.",
+        ],
+        "why_black_box_is_stronger": "A published listing only shows what the code says. "
+                                     "Repeated challenge shows what production actually does, "
+                                     "over time, on inputs we did not choose.",
+        "what_breaks_determinism": [
+            "a wall-clock read inside the scoring path",
+            "iteration over an unordered structure",
+            "an unseeded random call",
+            "any model call in the decision path - which is why most platforms cannot do this",
+        ],
+        "what_this_does_not_prove": "That a decision was correct, or that the inputs were "
+                                    "honestly captured. Only that the same inputs still yield "
+                                    "the same output under known code. Determinism is not "
+                                    "fairness.",
+        "rate_limits": "Repeat submissions of inputs already seen are never limited - retesting "
+                       "is the point. Novel inputs are limited, because bulk novel inputs are "
+                       "how a decision boundary gets mapped rather than how a claim gets tested.",
+    }, 200
+
+
+# ----------------------------------------------------------------------
+# router entry point
+# ----------------------------------------------------------------------
+
+def handle(method, action, data, api_key, ctx):
+    _setup(ctx)
+    action = (action or "").strip("/").lower()
+    data = data or {}
+
+    if method == "GET":
+        if action == "spec":
+            return _spec()
+        if action == "fingerprint":
+            return _fingerprint(ctx)
+        if action == "history":
+            return _history(ctx, data)
+        if action == "self":
+            return _self(ctx, data)
+        if action == "check":
+            if not api_key:
+                return {"error": "invalid_api_key"}, 401
+            return _check(ctx, data)
+
+    if method == "POST":
+        if action == "challenge":
+            return _challenge(ctx, api_key, data)
+        if not api_key:
+            return {"error": "invalid_api_key"}, 401
+        if action == "attest":
+            return _attest(ctx, api_key)
+
+    return {"error": "unknown_action", "action": action,
+            "GET": ["spec", "fingerprint", "history", "self", "check (keyed)"],
+            "POST": ["challenge", "attest (keyed)"]}, 404
 
 ```
