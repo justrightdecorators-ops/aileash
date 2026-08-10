@@ -1,4 +1,4 @@
-# Codebase — part 10 of 19
+# Codebase — part 10 of 20
 
 Contains:
 - `tests/attack_continuity_1.py`
@@ -6,11 +6,11 @@ Contains:
 - `tests/attack_continuity_3.py`
 - `tests/attack_continuity_4.py`
 - `tests/attack_continuity_5.py`
+- `tests/attack_continuity_6.py`
 - `verify_authority.py`
 - `AILeash-API-Reference-v6.4.2.md`
 - `LICENCE`
 - `README.md`
-- `admin.html`
 
 
 ## `tests/attack_continuity_1.py`
@@ -1054,6 +1054,106 @@ print("\n" + "="*60)
 print("passed %d, failed %d" % (len(PASS), len(FAIL)))
 for f in FAIL: print("  FAILED: "+f)
 sys.exit(1 if FAIL else 0)
+
+```
+
+
+## `tests/attack_continuity_6.py`
+
+92 lines, 3965 bytes
+
+```python
+"""End to end: issue, delegate, exercise, export a proof, verify it elsewhere,
+then try to forge one."""
+import hashlib, json, sqlite3, threading, time, sys, types, subprocess, copy
+import continuity as C
+
+m = types.ModuleType("server")
+m.get_bearer = lambda *a, **k: None
+m.score_event = lambda e: 0.12          # bare score, like the real engine
+sys.modules["server"] = m
+
+conn = sqlite3.connect(":memory:", check_same_thread=False)
+lock = threading.RLock(); n = {"i": 0}
+def seal(ev, res, ts, k):
+    n["i"] += 1
+    return hashlib.sha256(json.dumps([ev, res, ts], sort_keys=True, default=str).encode()).hexdigest(), n["i"], n["i"]
+ctx = {"conn": conn, "lock": lock, "seal": seal}
+C._ready = False; C._setup(ctx)
+
+NOW, HOUR = time.time(), 3600
+C._issue(ctx, "k", dict(id="root", issuer="justin@monopcontent.com", issuer_kind="human",
+    subject="orchestrator", scope=["payments.refund", "payments.read"],
+    constraints={"max_amount": 5000, "allowed_currency": ["GBP", "EUR"]},
+    purpose="resolve customer refund complaints", purpose_tags=["refunds", "support"],
+    not_after=NOW + 10 * HOUR, delegations_left=2))
+C._issue(ctx, "k", dict(id="mid", parent="root", issuer="orchestrator", issuer_kind="agent",
+    subject="refund-agent", scope=["payments.refund"],
+    constraints={"max_amount": 200, "allowed_currency": ["GBP"]},
+    purpose="issue small refunds", purpose_tags=["refunds"],
+    not_after=NOW + 2 * HOUR, delegations_left=0))
+
+def run(params, tag="refunds", action="payments.refund"):
+    r, _ = C._evaluate(ctx, "k", {"grant": "mid", "action": action,
+                                  "params": params, "purpose_tag": tag})
+    return r
+
+allow = run({"amount": 150, "currency": "GBP"})
+block = run({"amount": 900, "currency": "GBP"})
+print("allow verdict:", allow["verdict"], "| block verdict:", block["verdict"],
+      "->", block["broken_invariant"])
+
+def bundle_for(ev):
+    b, code = C._proof(ctx, {"evaluation": ev})
+    assert code == 200, b
+    return b
+
+for label, ev in (("ALLOW", allow["evaluation"]), ("BLOCK", block["evaluation"])):
+    b = bundle_for(ev)
+    open("/tmp/%s.json" % label, "w").write(json.dumps(b, indent=1))
+    print("\n" + "#" * 66 + "\n# %s bundle\n" % label + "#" * 66)
+    out = subprocess.run([sys.executable, "verify_authority.py", "/tmp/%s.json" % label],
+                         capture_output=True, text=True)
+    print(out.stdout.strip()); print("exit:", out.returncode)
+
+print("\n" + "#" * 66 + "\n# forgeries\n" + "#" * 66)
+good = json.load(open("/tmp/BLOCK.json"))
+
+def forge(name, mutate):
+    b = copy.deepcopy(good)
+    mutate(b)
+    open("/tmp/forged.json", "w").write(json.dumps(b))
+    out = subprocess.run([sys.executable, "verify_authority.py", "/tmp/forged.json"],
+                         capture_output=True, text=True)
+    caught = out.returncode != 0
+    line = [l for l in out.stdout.splitlines() if l.startswith("FAIL")]
+    print(("  ok   " if caught else "  MISS ") + name)
+    for l in line[:2]:
+        print("         " + l.strip())
+
+def flip_verdict(b):
+    b["decision"]["verdict"] = "ALLOW"; b["decision"]["authority_verdict"] = "ALLOW"
+def raise_cap(b):
+    pass_idx = 1
+    b["lineage"][1]["constraints"]["max_amount"] = 100000
+def widen_scope(b):
+    b["lineage"][1]["scope"] = ["payments.refund", "payments.transfer"]
+def swap_human(b):
+    b["lineage"][0]["issuer_kind"] = "agent"
+def change_params(b):
+    b["request"]["params"]["amount"] = 1
+def drop_acceptor(b):
+    for g in b["lineage"]: g["risk_accepted_by"] = None
+def restamp(b):
+    b["decision"]["evaluated_at_epoch"] = NOW + 9 * HOUR
+
+forge("claimed ALLOW on a bundle that blocks", flip_verdict)
+forge("cap raised inside the lineage", raise_cap)
+forge("scope widened inside the lineage", widen_scope)
+forge("root demoted from human", swap_human)
+forge("parameters swapped after the fact", change_params)
+forge("risk acceptor stripped", drop_acceptor)
+forge("timestamp moved past the leaf's expiry", restamp)
 
 ```
 
@@ -2214,225 +2314,5 @@ delegated authority tokens · KYC evidence sealing · jurisdiction tagging ·
 ai.txt standard · comply.txt · cryptographic proof of action · immutable audit log ·
 agentic AI governance · sovereign AI deployment · SonicBoom · Brain · Sentinel · Guardian
 -->
-
-```
-
-
-## `admin.html`
-
-212 lines, 12327 bytes
-
-```html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>sebbi.pro - Admin</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0a0f1e;color:#fff;line-height:1.5}
-.wrap{max-width:1000px;margin:0 auto;padding:20px}
-h1{font-size:22px;font-weight:800;margin-bottom:4px}h1 span{color:#c9a84c}
-.sub{color:#8a90a6;font-size:13px;margin-bottom:20px}
-/* login */
-#login{max-width:360px;margin:80px auto;text-align:center}
-#login input{width:100%;padding:14px;border-radius:10px;border:1px solid #2a3350;background:#0b1226;color:#fff;font-size:16px;margin:12px 0}
-button{background:#c9a84c;color:#0a0f1e;border:none;border-radius:10px;padding:13px 22px;font-weight:800;cursor:pointer;font-size:15px;width:100%}
-button.small{width:auto;padding:8px 16px;font-size:13px}
-.err{color:#ff7b6e;font-size:13px;margin-top:8px;min-height:18px}
-/* dashboard */
-#dash{display:none}
-.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:20px}
-.stat{background:#111a30;border:1px solid #232d4a;border-radius:12px;padding:16px}
-.stat .big{font-size:26px;font-weight:800;color:#c9a84c}
-.stat .lab{font-size:11px;color:#8a90a6;text-transform:uppercase;letter-spacing:1px;margin-top:4px}
-.stat.good .big{color:#7fe3b0}.stat.bad .big{color:#ff7b6e}
-.tabs{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap}
-.tab{background:#111a30;border:1px solid #232d4a;color:#8a90a6;padding:9px 16px;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600}
-.tab.on{background:#c9a84c;color:#0a0f1e;border-color:#c9a84c}
-.panel{display:none}.panel.on{display:block}
-.card{background:#111a30;border:1px solid #232d4a;border-radius:12px;padding:14px;margin-bottom:10px;font-size:14px}
-.card .top{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:6px}
-.card .nm{font-weight:700}
-.card .meta{color:#8a90a6;font-size:12px}
-.badge{font-size:10px;padding:2px 8px;border-radius:10px;font-weight:700;text-transform:uppercase}
-.badge.paid{background:#0d2018;color:#7fe3b0;border:1px solid #1fae79}
-.badge.free{background:#1a1206;color:#c9a84c;border:1px solid #c9a84c}
-.stripe-link{color:#7fe3b0;font-size:12px;text-decoration:none;font-family:monospace}
-.bar{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}
-.mono{font-family:monospace;font-size:12px;color:#8a90a6;word-break:break-all}
-.empty{color:#5a6178;text-align:center;padding:30px;font-size:14px}
-a.ext{display:inline-block;background:#0d2018;border:1px solid #1fae79;color:#7fe3b0;padding:10px 16px;border-radius:8px;text-decoration:none;font-size:13px;font-weight:600;margin-bottom:16px}
-</style>
-</head>
-<body>
-<div class="wrap">
-
-  <div id="login">
-    <h1>sebbi<span>.pro</span> admin</h1>
-    <div class="sub">Private control panel</div>
-    <input id="pw" type="password" placeholder="Admin password" onkeydown="if(event.key==='Enter')doLogin()">
-    <button onclick="doLogin()">Log in</button>
-    <div class="err" id="loginerr"></div>
-  </div>
-
-  <div id="dash">
-    <div class="bar">
-      <div><h1>sebbi<span>.pro</span> admin</h1><div class="sub">Everything Stripe doesn't show you</div></div>
-      <button class="small" onclick="logout()">Log out</button>
-    </div>
-
-    <a class="ext" href="https://dashboard.stripe.com" target="_blank" rel="noopener">Open Stripe dashboard for payments, revenue &amp; billing addresses &rarr;</a>
-
-    <div class="stats" id="statgrid"></div>
-
-    <div class="tabs">
-      <div class="tab on" onclick="show('customers',this)">Customers &amp; leads</div>
-      <div class="tab" onclick="show('contacts',this)">Contact messages</div>
-      <div class="tab" onclick="show('referrals',this)">Referrals</div>
-      <div class="tab" onclick="show('audit',this)">Audit records</div>
-    </div>
-
-    <div class="panel on" id="p-customers"><div class="empty">Loading...</div></div>
-    <div class="panel" id="p-contacts"><div class="empty">Loading...</div></div>
-    <div class="panel" id="p-referrals"><div class="empty">Loading...</div></div>
-    <div class="panel" id="p-audit">
-      <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;align-items:center">
-        <input id="auditkey" placeholder="Filter by API key (optional)" style="flex:1;min-width:180px;padding:10px;border-radius:8px;border:1px solid #2a3350;background:#0b1226;color:#fff;font-size:13px">
-        <button class="small" onclick="loadAudit()">Search</button>
-        <button class="small" onclick="verifyChain()" style="background:#1fae79">Verify chain</button>
-        <button class="small" onclick="exportAudit()" style="background:#0d2018;color:#7fe3b0;border:1px solid #1fae79">Export</button>
-      </div>
-      <div id="auditchain" style="font-family:monospace;font-size:12px;color:#7fe3b0;margin-bottom:12px"></div>
-      <div id="auditlist"><div class="empty">Loading...</div></div>
-    </div>
-  </div>
-
-</div>
-<script>
-var TOKEN="";
-function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]})}
-function when(ts){if(!ts)return"";try{return new Date(ts*1000).toLocaleString()}catch(e){return""}}
-
-async function doLogin(){
-  var pw=document.getElementById("pw").value;
-  document.getElementById("loginerr").textContent="";
-  try{
-    var r=await fetch("/admin/auth",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password:pw})});
-    var d=await r.json();
-    if(d.token){TOKEN=d.token;document.getElementById("login").style.display="none";document.getElementById("dash").style.display="block";loadAll();}
-    else if(d.error==="admin_disabled"){document.getElementById("loginerr").textContent="Admin password not set. Add ADMIN_PASSWORD in Railway variables.";}
-    else if(d.error==="too_many_attempts"){document.getElementById("loginerr").textContent="Too many attempts. Wait a minute.";}
-    else{document.getElementById("loginerr").textContent="Wrong password.";}
-  }catch(e){document.getElementById("loginerr").textContent="Connection error.";}
-}
-function logout(){TOKEN="";document.getElementById("dash").style.display="none";document.getElementById("login").style.display="block";document.getElementById("pw").value="";}
-
-async function api(path){
-  var r=await fetch(path,{method:"POST",headers:{"Authorization":"Bearer "+TOKEN,"Content-Type":"application/json"},body:"{}"});
-  return await r.json();
-}
-
-async function loadAll(){
-  // stats
-  try{
-    var s=await api("/admin/stats");
-    document.getElementById("statgrid").innerHTML=
-      stat(s.total_keys,"Total signups")+
-      stat(s.paid_keys,"Paying",  "good")+
-      stat((s.total_keys||0)-(s.paid_keys||0),"Free / leads")+
-      stat(s.audit_blocks,"Audit blocks")+
-      stat(s.chain_valid?"OK":"BROKEN","Chain",s.chain_valid?"good":"bad");
-  }catch(e){}
-  loadCustomers();loadContacts();loadReferrals();loadAudit();
-}
-function stat(v,l,cls){return '<div class="stat '+(cls||"")+'"><div class="big">'+esc(v)+'</div><div class="lab">'+esc(l)+'</div></div>';}
-
-async function loadCustomers(){
-  try{
-    var d=await api("/admin/keys");var ks=d.keys||[];
-    if(!ks.length){document.getElementById("p-customers").innerHTML='<div class="empty">No signups yet.</div>';return;}
-    var h="";
-    ks.forEach(function(k){
-      var paid=k.is_paid==1;
-      h+='<div class="card"><div class="top"><span class="nm">'+esc(k.name||"(no name)")+' <span class="meta">'+esc(k.org||"")+'</span></span>'
-        +'<span class="badge '+(paid?"paid":"free")+'">'+(paid?"paying":"free")+'</span></div>'
-        +'<div class="meta">'+esc(k.email||"")+' &middot; '+esc(k.product||"")+' &middot; '+esc(k.devices||0)+' devices &middot; used '+esc(k.actions_used||0)+'/'+esc(k.free_quota||0)+'</div>'
-        +'<div class="meta">Joined '+when(k.created)+'</div>'
-        +(k.key?'<div class="mono">'+esc(k.key)+'</div>':'')
-        +'</div>';
-    });
-    document.getElementById("p-customers").innerHTML=h;
-  }catch(e){document.getElementById("p-customers").innerHTML='<div class="empty">Could not load.</div>';}
-}
-
-async function loadContacts(){
-  try{
-    var d=await api("/admin/contacts");var cs=d.contacts||[];
-    if(!cs.length){document.getElementById("p-contacts").innerHTML='<div class="empty">No messages yet.</div>';return;}
-    var h="";
-    cs.forEach(function(c){
-      h+='<div class="card"><div class="top"><span class="nm">'+esc(c.name||"(no name)")+'</span><span class="meta">'+when(c.ts)+'</span></div>'
-        +'<div class="meta">'+esc(c.email||"")+(c.phone?' &middot; '+esc(c.phone):'')+(c.org?' &middot; '+esc(c.org):'')+'</div>'
-        +'<div style="margin-top:6px">'+esc(c.message||"")+'</div></div>';
-    });
-    document.getElementById("p-contacts").innerHTML=h;
-  }catch(e){document.getElementById("p-contacts").innerHTML='<div class="empty">Could not load.</div>';}
-}
-
-async function loadReferrals(){
-  try{
-    var d=await api("/admin/referrals");var rs=d.referrals||[];
-    if(!rs.length){document.getElementById("p-referrals").innerHTML='<div class="empty">No referrals yet.</div>';return;}
-    var h="";
-    rs.forEach(function(r){
-      h+='<div class="card"><div class="top"><span class="nm">'+esc(r.referrer_name||"(no name)")+' <span class="meta">'+esc(r.code||"")+'</span></span>'
-        +'<span class="badge paid">&pound;'+((r.earnings_pence||0)/100).toFixed(2)+'</span></div>'
-        +'<div class="meta">'+esc(r.referrer_email||"")+' &middot; '+esc(r.devices_referred||0)+' devices referred</div></div>';
-    });
-    document.getElementById("p-referrals").innerHTML=h;
-  }catch(e){document.getElementById("p-referrals").innerHTML='<div class="empty">Could not load.</div>';}
-}
-
-var LAST_AUDIT=[];
-async function loadAudit(){
-  try{
-    var key=document.getElementById("auditkey").value.trim();
-    var r=await fetch("/admin/audit",{method:"POST",headers:{"Authorization":"Bearer "+TOKEN,"Content-Type":"application/json"},body:JSON.stringify({limit:500,api_key:key})});
-    var d=await r.json();LAST_AUDIT=d.records||[];
-    document.getElementById("auditchain").innerHTML=(d.chain_valid?"CHAIN INTACT":"CHAIN BROKEN")+" &middot; "+esc(d.chain_blocks)+" blocks &middot; tip "+esc(String(d.chain_tip||"").slice(0,24))+"...";
-    if(!LAST_AUDIT.length){document.getElementById("auditlist").innerHTML='<div class="empty">No sealed records'+(key?" for that key":"")+' yet.</div>';return;}
-    var h="";
-    LAST_AUDIT.forEach(function(a){
-      var dec=esc(a.decision||"");
-      var col=dec==="BLOCK"?"#ff7b6e":dec==="CHALLENGE"?"#c9a84c":"#7fe3b0";
-      h+='<div class="card"><div class="top"><span class="nm">#'+esc(a.seq)+' <span style="color:'+col+'">'+dec+'</span></span><span class="meta">'+when(a.ts)+'</span></div>'
-        +'<div class="meta">user: '+esc(a.user_id||"-")+(a.score!==""?' &middot; score '+esc(a.score):'')+(a.reasons&&a.reasons.length?' &middot; '+esc(a.reasons.join(", ")):'')+'</div>'
-        +'<div class="mono" style="margin-top:6px">seal: '+esc(String(a.audit_hash||"").slice(0,40))+'...</div>'
-        +'<div class="mono">prev: '+esc(String(a.prev_hash||"").slice(0,40))+'...</div></div>';
-    });
-    document.getElementById("auditlist").innerHTML=h;
-  }catch(e){document.getElementById("auditlist").innerHTML='<div class="empty">Could not load audit records.</div>';}
-}
-async function verifyChain(){
-  try{
-    var r=await fetch("/api/verify-chain");var d=await r.json();
-    document.getElementById("auditchain").innerHTML=(d.valid?"VERIFIED - CHAIN INTACT":"WARNING - CHAIN BROKEN")+" &middot; "+esc(d.blocks)+" blocks &middot; "+esc(d.message||"");
-  }catch(e){}
-}
-function exportAudit(){
-  var blob=new Blob([JSON.stringify(LAST_AUDIT,null,2)],{type:"application/json"});
-  var url=URL.createObjectURL(blob);var a=document.createElement("a");
-  a.href=url;a.download="sebbi-audit-export-"+Date.now()+".json";a.click();URL.revokeObjectURL(url);
-}
-function show(name,el){
-  document.querySelectorAll(".tab").forEach(function(t){t.className="tab";});el.className="tab on";
-  document.querySelectorAll(".panel").forEach(function(p){p.className="panel";});
-  document.getElementById("p-"+name).className="panel on";
-}
-</script>
-</body>
-</html>
 
 ```

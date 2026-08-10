@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-93 files across 19 parts.
+94 files across 20 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -81,43 +81,47 @@ Generated automatically on every push. Do not edit by hand.
 - `tests/attack_continuity_3.py`
 - `tests/attack_continuity_4.py`
 - `tests/attack_continuity_5.py`
+- `tests/attack_continuity_6.py`
 - `verify_authority.py`
 - `AILeash-API-Reference-v6.4.2.md`
 - `LICENCE`
 - `README.md`
-- `admin.html`
 
 ## [CODEBASE-11.md](CODEBASE-11.md)
 
+- `admin.html`
 - `ai-standard.html`
 - `ai-txt-kit.html`
 - `aitxt-popup-live.html`
 - `brain.html`
 - `certificate.html`
-- `compliance-assistant.html`
-- `contact.html`
 
 ## [CODEBASE-12.md](CODEBASE-12.md)
 
+- `compliance-assistant.html`
+- `contact.html`
 - `copyright.txt`
 - `data-protection.html`
+
+## [CODEBASE-13.md](CODEBASE-13.md)
+
 - `developers.html`
 - `dis.txt`
 - `docs/evidential-undertaking.md`
 - `docs/spec/ai-txt.md`
 - `green.html`
-
-## [CODEBASE-13.md](CODEBASE-13.md)
-
 - `guardian-parent.html`
-- `human-oversight.html`
-- `identity.html`
 
 ## [CODEBASE-14.md](CODEBASE-14.md)
 
-- `index.html`
+- `human-oversight.html`
+- `identity.html`
 
 ## [CODEBASE-15.md](CODEBASE-15.md)
+
+- `index.html`
+
+## [CODEBASE-16.md](CODEBASE-16.md)
 
 - `investor-prospectus.html`
 - `legal.txt`
@@ -129,26 +133,26 @@ Generated automatically on every push. Do not edit by hand.
 - `report-threat.html`
 - `requirements.txt`
 
-## [CODEBASE-16.md](CODEBASE-16.md)
+## [CODEBASE-17.md](CODEBASE-17.md)
 
 - `reseller.html`
 - `risk-policy.html`
 - `robots.txt`
 - `scan.html`
 
-## [CODEBASE-17.md](CODEBASE-17.md)
+## [CODEBASE-18.md](CODEBASE-18.md)
 
 - `seal.html`
 - `sentinel.html`
 - `signal-packs.html`
 - `sitemap.xml`
 
-## [CODEBASE-18.md](CODEBASE-18.md)
+## [CODEBASE-19.md](CODEBASE-19.md)
 
 - `sonicboom.html`
 - `verify.html`
 
-## [CODEBASE-19.md](CODEBASE-19.md)
+## [CODEBASE-20.md](CODEBASE-20.md)
 
 - `whitepaper.html`
 
