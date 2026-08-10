@@ -4,8 +4,6 @@ Contains:
 - `sebdog_engine.py`
 - `sebdog_licence.py`
 - `sebdog_reporter.py`
-- `tests/attack_continuity_2.py`
-- `tests/attack_continuity_3.py`
 - `tests/attack_continuity_4.py`
 - `AILeash-API-Reference-v6.4.2.md`
 - `LICENCE`
@@ -13,6 +11,7 @@ Contains:
 - `admin.html`
 - `ai-standard.html`
 - `ai-txt-kit.html`
+- `aitxt-popup-live.html`
 
 
 ## `sebdog_engine.py`
@@ -1029,360 +1028,6 @@ if __name__ == "__main__":
         with open(out, "w") as f:
             f.write(report)
         print(f"Report saved to {out}")
-
-```
-
-
-## `tests/attack_continuity_2.py`
-
-225 lines, 10403 bytes
-
-```python
-#!/usr/bin/env python3
-"""Second wave. The first wave tested the obvious escalations. This one
-tests the ones that would survive a code review."""
-
-import hashlib
-import json
-import sqlite3
-import threading
-import time
-import sys
-
-import continuity as lineage
-# --- stand-in for the deployed engine ---------------------------------
-import types as _types
-_ENGINE = {"verdict": "ALLOW"}
-
-def install_engine(verdict="ALLOW", raises=False, shape="dict"):
-    _ENGINE["verdict"] = verdict
-    mod = _types.ModuleType("server")
-    mod.get_bearer = lambda *a, **k: None
-    def score_event(event):
-        if raises:
-            raise RuntimeError("engine down")
-        if shape == "dict":
-            return {"decision": _ENGINE["verdict"], "score": 0.1}
-        if shape == "tuple":
-            return (_ENGINE["verdict"], 0.1)
-        return _ENGINE["verdict"]
-    mod.score_event = score_event
-    sys.modules["server"] = mod
-
-def remove_engine():
-    sys.modules.pop("server", None)
-
-install_engine("ALLOW")
-
-
-PASS, FAIL = [], []
-NOW = time.time()
-HOUR = 3600
-
-
-def make_ctx():
-    conn = sqlite3.connect(":memory:", check_same_thread=False)
-    lock = threading.RLock()
-    n = {"i": 0}
-
-    def seal(ev, res, ts, api_key):
-        n["i"] += 1
-        return hashlib.sha256(json.dumps([ev, res, ts], sort_keys=True,
-                                         default=str).encode()).hexdigest(), n["i"], n["i"]
-    lineage._ready = False
-    ctx = {"conn": conn, "lock": lock, "seal": seal}
-    lineage._setup(ctx)
-    return ctx
-
-
-def check(name, cond, detail=""):
-    (PASS if cond else FAIL).append(name)
-    print(("  ok   " if cond else "  FAIL ") + name + (("  -> " + str(detail)[:300]) if detail and not cond else ""))
-
-
-def issue(ctx, **kw):
-    return lineage._issue(ctx, "k", kw)
-
-
-def root(ctx, **over):
-    args = dict(id="root", issuer="owner@example.com", issuer_kind="human",
-                subject="orchestrator", scope=["payments.refund", "payments.read"],
-                constraints={"max_amount": 5000, "allowed_currency": ["GBP", "EUR"]},
-                purpose="refunds", purpose_tags=["refunds"],
-                not_before=NOW - HOUR, not_after=NOW + 10 * HOUR, delegations_left=10)
-    args.update(over)
-    return issue(ctx, **args)
-
-
-print("\n=== 18. double execution against one ALLOW ===")
-ctx = make_ctx()
-root(ctx)
-r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments.refund",
-                                    "params": {"amount": 100, "currency": "GBP"},
-                                    "purpose_tag": "refunds"})
-eid = r["evaluation"]
-p = {"amount": 100, "currency": "GBP"}
-c1, _ = lineage._confirm(ctx, "k", {"evaluation": eid, "action": "payments.refund", "params": p})
-c2, _ = lineage._confirm(ctx, "k", {"evaluation": eid, "action": "payments.refund", "params": p})
-check("the first execution binds", c1["bound"] is True, c1)
-check("the same evaluation cannot be spent twice", c2["bound"] is False, c2)
-
-print("\n=== 19. type confusion in constraints ===")
-ctx = make_ctx()
-root(ctx, constraints={"max_amount": 5000, "allowed_currency": "GBP"})
-r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments.refund",
-                                    "params": {"amount": 10, "currency": "G"},
-                                    "purpose_tag": "refunds"})
-check("a single character does not satisfy a string-valued allowed_ list",
-      r["verdict"] == "BLOCK", r["reasons"])
-
-ctx = make_ctx()
-root(ctx)
-r, code = issue(ctx, id="strnum", parent="root", issuer="orchestrator", issuer_kind="agent",
-                subject="b", scope=["payments.refund"],
-                constraints={"max_amount": "50000", "allowed_currency": ["GBP"]},
-                purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
-check("a numeric cap passed as a string cannot beat the parent", code == 409, r)
-
-ctx = make_ctx()
-root(ctx)
-r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments.refund",
-                                    "params": {"amount": "99999", "currency": "GBP"},
-                                    "purpose_tag": "refunds"})
-check("a string amount is still compared numerically", r["verdict"] == "BLOCK", r["reasons"])
-
-ctx = make_ctx()
-root(ctx)
-r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments.refund",
-                                    "params": {"amount": True, "currency": "GBP"},
-                                    "purpose_tag": "refunds"})
-check("a non-numeric amount does not slip through as unconstrained",
-      r["verdict"] in ("BLOCK", "CHALLENGE"), r)
-
-print("\n=== 20. capability prefix tricks ===")
-ctx = make_ctx()
-root(ctx, scope=["payments.refund"])
-for probe in ["payments.refunds", "payments.refund.approve", "payments.refundX",
-              "Payments.Refund", "payments.refund "]:
-    r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": probe,
-                                        "params": {}, "purpose_tag": "refunds"})
-    check("'%s' is not covered by 'payments.refund'" % probe, r["verdict"] == "BLOCK", r["reasons"])
-
-ctx = make_ctx()
-root(ctx, scope=["payments.*"])
-r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments2.transfer",
-                                    "params": {}, "purpose_tag": "refunds"})
-check("'payments.*' does not cover 'payments2.transfer'", r["verdict"] == "BLOCK", r["reasons"])
-
-print("\n=== 21. a long but legitimate chain ===")
-ctx = make_ctx()
-root(ctx, constraints={"max_amount": 10000, "allowed_currency": ["GBP", "EUR"]},
-     delegations_left=12)
-parent, cap = "root", 10000
-for i in range(10):
-    cap = cap // 2
-    gid = "d%d" % i
-    r, code = issue(ctx, id=gid, parent=parent, issuer="a%d" % i, issuer_kind="agent",
-                    subject="a%d" % (i + 1), scope=["payments.refund"],
-                    constraints={"max_amount": cap, "allowed_currency": ["GBP"]},
-                    purpose="refunds", purpose_tags=["refunds"],
-                    not_after=NOW + HOUR, delegations_left=11 - i)
-    if code != 200:
-        break
-    parent = gid
-check("ten legitimate narrowing hops are accepted", code == 200 and parent == "d9", r)
-r, _ = lineage._evaluate(ctx, "k", {"grant": "d9", "action": "payments.refund",
-                                    "params": {"amount": 5, "currency": "GBP"},
-                                    "purpose_tag": "refunds"})
-check("the deep chain still ALLOWs a derivable action", r["verdict"] == "ALLOW", r["reasons"])
-check("the effective cap is the tightest in the chain",
-      float(r["effective_constraints"]["max_amount"]) == 9, r["effective_constraints"])
-check("the human at the root is still named ten hops down",
-      r["authorised_by"] == "owner@example.com")
-r, _ = lineage._evaluate(ctx, "k", {"grant": "d9", "action": "payments.refund",
-                                    "params": {"amount": 10, "currency": "GBP"},
-                                    "purpose_tag": "refunds"})
-check("one unit over the deepest cap is BLOCKed", r["verdict"] == "BLOCK", r["reasons"])
-
-print("\n=== 22. revoking the root kills the whole tree ===")
-lineage._revoke(ctx, "k", {"grant": "root", "reason": "principal withdrew authority"})
-r, _ = lineage._evaluate(ctx, "k", {"grant": "d9", "action": "payments.refund",
-                                    "params": {"amount": 1, "currency": "GBP"},
-                                    "purpose_tag": "refunds"})
-check("revoking the root blocks a leaf ten hops away", r["verdict"] == "BLOCK")
-check("the root is named as the break point", r["broken_at"] == "root", r["broken_at"])
-
-print("\n=== 23. issuing under a revoked or expired parent ===")
-ctx = make_ctx()
-root(ctx)
-lineage._revoke(ctx, "k", {"grant": "root", "reason": "x"})
-r, code = issue(ctx, id="after", parent="root", issuer="orchestrator", issuer_kind="agent",
-                subject="b", scope=["payments.refund"],
-                constraints={"max_amount": 1, "allowed_currency": ["GBP"]},
-                purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
-check("no new delegation under a revoked parent", code == 409 and r.get("error") == "parent_revoked", r)
-
-print("\n=== 24. duplicate grant id cannot overwrite a grant ===")
-ctx = make_ctx()
-root(ctx)
-r, code = root(ctx, scope=["*"], constraints={"max_amount": 999999})
-check("re-issuing an existing id is refused", code == 409 and r.get("error") == "grant_exists", r)
-
-print("\n=== 25. the boundary values themselves ===")
-ctx = make_ctx()
-root(ctx, constraints={"max_amount": 100, "allowed_currency": ["GBP"]}, delegations_left=2)
-r, code = issue(ctx, id="equal", parent="root", issuer="orchestrator", issuer_kind="agent",
-                subject="b", scope=["payments.refund"],
-                constraints={"max_amount": 100, "allowed_currency": ["GBP"]},
-                purpose="refunds", purpose_tags=["refunds"],
-                not_after=NOW + 10 * HOUR, delegations_left=1)
-check("an equal-not-wider child is accepted", code == 200, r)
-r, _ = lineage._evaluate(ctx, "k", {"grant": "equal", "action": "payments.refund",
-                                    "params": {"amount": 100, "currency": "GBP"},
-                                    "purpose_tag": "refunds"})
-check("exactly the cap is allowed", r["verdict"] == "ALLOW", r["reasons"])
-r, _ = lineage._evaluate(ctx, "k", {"grant": "equal", "action": "payments.refund",
-                                    "params": {"amount": 100.01, "currency": "GBP"},
-                                    "purpose_tag": "refunds"})
-check("a penny over the cap is blocked", r["verdict"] == "BLOCK", r["reasons"])
-
-print("\n=== 26. a CHALLENGE cannot be executed ===")
-ctx = make_ctx()
-root(ctx)
-r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments.refund",
-                                    "params": {"amount": 1, "currency": "GBP"}})
-check("no declared purpose gives CHALLENGE", r["verdict"] == "CHALLENGE", r["verdict"])
-c, code = lineage._confirm(ctx, "k", {"evaluation": r["evaluation"],
-                                      "action": "payments.refund",
-                                      "params": {"amount": 1, "currency": "GBP"}})
-check("a CHALLENGE cannot be bound as an execution", c["bound"] is False, c)
-
-print("\n" + "=" * 60)
-print("passed %d, failed %d" % (len(PASS), len(FAIL)))
-for f in FAIL:
-    print("  FAILED: " + f)
-sys.exit(1 if FAIL else 0)
-
-```
-
-
-## `tests/attack_continuity_3.py`
-
-113 lines, 5584 bytes
-
-```python
-#!/usr/bin/env python3
-"""Third wave: concurrency, and reconstruction from evidence alone."""
-import hashlib, json, sqlite3, threading, time, sys
-import continuity as lineage
-# --- stand-in for the deployed engine ---------------------------------
-import types as _types
-_ENGINE = {"verdict": "ALLOW"}
-
-def install_engine(verdict="ALLOW", raises=False, shape="dict"):
-    _ENGINE["verdict"] = verdict
-    mod = _types.ModuleType("server")
-    mod.get_bearer = lambda *a, **k: None
-    def score_event(event):
-        if raises:
-            raise RuntimeError("engine down")
-        if shape == "dict":
-            return {"decision": _ENGINE["verdict"], "score": 0.1}
-        if shape == "tuple":
-            return (_ENGINE["verdict"], 0.1)
-        return _ENGINE["verdict"]
-    mod.score_event = score_event
-    sys.modules["server"] = mod
-
-def remove_engine():
-    sys.modules.pop("server", None)
-
-install_engine("ALLOW")
-
-
-PASS, FAIL = [], []
-NOW, HOUR = time.time(), 3600
-
-def make_ctx():
-    conn = sqlite3.connect(":memory:", check_same_thread=False)
-    lock = threading.RLock(); n = {"i": 0}
-    def seal(ev, res, ts, k):
-        with lock:
-            n["i"] += 1
-            return hashlib.sha256(json.dumps([ev,res,ts],sort_keys=True,default=str).encode()).hexdigest(), n["i"], n["i"]
-    lineage._ready = False
-    ctx = {"conn": conn, "lock": lock, "seal": seal}
-    lineage._setup(ctx); return ctx
-
-def check(n, c, d=""):
-    (PASS if c else FAIL).append(n)
-    print(("  ok   " if c else "  FAIL ") + n + (("  -> " + str(d)[:250]) if d and not c else ""))
-
-print("\n=== 27. concurrent execution of one ALLOW ===")
-ctx = make_ctx()
-lineage._issue(ctx,"k",dict(id="root",issuer="owner@example.com",issuer_kind="human",
-    subject="agent",scope=["payments.refund"],constraints={"max_amount":5000},
-    purpose="refunds",purpose_tags=["refunds"],not_after=NOW+HOUR,delegations_left=0))
-r,_ = lineage._evaluate(ctx,"k",{"grant":"root","action":"payments.refund",
-    "params":{"amount":100},"purpose_tag":"refunds"})
-eid = r["evaluation"]; results = []
-def race():
-    c,_ = lineage._confirm(ctx,"k",{"evaluation":eid,"action":"payments.refund","params":{"amount":100}})
-    results.append(c["bound"])
-ts = [threading.Thread(target=race) for _ in range(8)]
-[t.start() for t in ts]; [t.join() for t in ts]
-check("exactly one of eight concurrent executions binds", results.count(True) == 1, results)
-with ctx["lock"]:
-    rows = ctx["conn"].execute("SELECT COUNT(*) FROM auth_exec WHERE eval_id=? AND outcome<>'rejected'",(eid,)).fetchone()
-check("only one accepted binding exists in storage", rows[0] == 1, rows)
-
-print("\n=== 28. reconstruct the whole story from the sealed record ===")
-ctx = make_ctx()
-lineage._issue(ctx,"k",dict(id="r",issuer="owner@example.com",issuer_kind="human",
-    subject="orchestrator",scope=["payments.*"],constraints={"max_amount":5000},
-    purpose="close the refund backlog",purpose_tags=["refunds"],
-    not_after=NOW+HOUR,delegations_left=2))
-lineage._issue(ctx,"k",dict(id="m",parent="r",issuer="orchestrator",issuer_kind="agent",
-    subject="refund-bot",scope=["payments.refund"],constraints={"max_amount":200},
-    purpose="issue small refunds",purpose_tags=["refunds"],not_after=NOW+HOUR,delegations_left=0))
-r,_ = lineage._evaluate(ctx,"k",{"grant":"m","action":"payments.refund",
-    "params":{"amount":150},"purpose_tag":"refunds"})
-t,code = lineage._trace(ctx,{"grant":"m"})
-check("the trace names who authorised it", t["authorised_by"] == "owner@example.com")
-check("the trace names who held it at execution", t["holder"] == "refund-bot")
-check("the trace shows what changed at each hop",
-      t["lineage"][0]["scope"] == ["payments.*"] and t["lineage"][1]["scope"] == ["payments.refund"])
-check("the effective constraint is the narrowest, not the granted one",
-      float(t["effective_constraints"]["max_amount"]) == 200, t["effective_constraints"])
-d,code = lineage._decision(ctx,{"evaluation":r["evaluation"]})
-check("the decision is retrievable without a key and matches", d["verdict"] == r["verdict"])
-check("the decision carries the lineage digest", d["lineage_digest"] == r["lineage_digest"])
-check("every hop carries its own block index",
-      all(h["block_index"] for h in t["lineage"]))
-
-print("\n=== 29. widening midway is visible in the trace, not just blocked ===")
-ctx = make_ctx()
-lineage._issue(ctx,"k",dict(id="r",issuer="owner@example.com",issuer_kind="human",
-    subject="a",scope=["payments.refund"],constraints={"max_amount":100},
-    purpose="p",purpose_tags=["refunds"],not_after=NOW+HOUR,delegations_left=2))
-lineage._issue(ctx,"k",dict(id="m",parent="r",issuer="a",issuer_kind="agent",
-    subject="b",scope=["payments.refund"],constraints={"max_amount":100},
-    purpose="p",purpose_tags=["refunds"],not_after=NOW+HOUR,delegations_left=1))
-with ctx["lock"]:
-    ctx["conn"].execute("UPDATE auth_grant SET constraints=? WHERE id='m'",
-        (json.dumps({"max_amount":100000},sort_keys=True,separators=(",",":")),))
-    ctx["conn"].commit()
-t,_ = lineage._trace(ctx,{"grant":"m"})
-check("the trace flags the altered hop by name",
-      t["lineage"][1]["integrity"] == "FAILED" and t["lineage"][0]["integrity"] == "ok", t["lineage"])
-r,_ = lineage._evaluate(ctx,"k",{"grant":"m","action":"payments.refund",
-    "params":{"amount":50},"purpose_tag":"refunds"})
-check("and the exercise names the exact grant that broke", r["broken_at"] == "m", r["broken_at"])
-
-print("\n" + "="*60)
-print("passed %d, failed %d" % (len(PASS), len(FAIL)))
-for f in FAIL: print("  FAILED: "+f)
-sys.exit(1 if FAIL else 0)
 
 ```
 
@@ -2494,6 +2139,179 @@ function copyBadge(){
   });
 }
 </script>
+</body>
+</html>
+
+```
+
+
+## `aitxt-popup-live.html`
+
+165 lines, 7279 bytes
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ai.txt Live Compliance Widget — Preview</title>
+<style>
+  body{margin:0;background:#e8e6df;font-family:-apple-system,'Segoe UI',Roboto,sans-serif;min-height:100vh;}
+  .demo-note{position:fixed;top:16px;left:16px;right:16px;background:#fff;border:1px solid #ddd;border-radius:8px;padding:12px 16px;font-size:13px;color:#555;max-width:560px;margin:0 auto;text-align:center;z-index:2;}
+</style>
+</head>
+<body>
+<div class="demo-note">This page has no ai.txt, so the badge will honestly say "not found." Click it to see the real check running live.</div>
+
+<!-- ============================================================
+     THE DELIVERABLE: one script tag. Paste into any site.
+     On load, it actually fetches /ai.txt from that same domain
+     and reports the true result — nothing hardcoded, nothing faked.
+============================================================= -->
+<script>
+(function(){
+  var CSS = `
+    #aitxt-badge{
+      position:fixed;bottom:20px;right:20px;z-index:999998;
+      background:#0a0f1e;color:#8b93ac;border:1px solid #232c48;
+      font-family:'SF Mono','JetBrains Mono',Consolas,monospace;
+      font-size:12px;padding:10px 16px;border-radius:999px;cursor:pointer;
+      box-shadow:0 4px 18px rgba(0,0,0,.25);display:flex;align-items:center;gap:8px;
+      transition:transform .15s ease;
+    }
+    #aitxt-badge:hover{transform:translateY(-2px);}
+    #aitxt-badge .dot{width:7px;height:7px;border-radius:50%;background:#8b93ac;flex-shrink:0;transition:background .2s ease;}
+    #aitxt-badge .dot.ok{background:#7fe3b0;}
+    #aitxt-badge .dot.warn{background:#ff8a80;}
+    #aitxt-badge .dot.checking{background:#c9a84c;animation:aitxt-pulse 1s ease-in-out infinite;}
+    @keyframes aitxt-pulse{50%{opacity:.3;}}
+    #aitxt-overlay{
+      position:fixed;inset:0;background:rgba(10,15,30,.6);z-index:999999;
+      display:none;align-items:center;justify-content:center;padding:20px;
+    }
+    #aitxt-overlay.open{display:flex;}
+    #aitxt-modal{
+      background:#10182e;border:1px solid #232c48;border-radius:12px;
+      max-width:420px;width:100%;color:#e7ebf5;font-family:-apple-system,'Segoe UI',Roboto,sans-serif;
+      overflow:hidden;
+    }
+    #aitxt-modal .aitxt-head{padding:20px 22px 0;}
+    #aitxt-modal .aitxt-eyebrow{
+      font-family:'SF Mono',Consolas,monospace;font-size:11px;letter-spacing:.1em;
+      text-transform:uppercase;color:#c9a84c;margin-bottom:10px;
+    }
+    #aitxt-modal h3{margin:0 0 8px;font-size:19px;line-height:1.3;}
+    #aitxt-modal p{margin:0 0 18px;font-size:13.5px;line-height:1.55;color:#8b93ac;}
+    #aitxt-modal .aitxt-body{padding:0 22px 22px;}
+    #aitxt-modal .aitxt-status{
+      display:flex;align-items:center;gap:8px;padding:12px 14px;
+      background:#161f38;border:1px solid #232c48;border-radius:8px;margin-bottom:16px;
+      font-family:'SF Mono',Consolas,monospace;font-size:12px;
+    }
+    #aitxt-modal .aitxt-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;}
+    #aitxt-modal .aitxt-dot.ok{background:#7fe3b0;}
+    #aitxt-modal .aitxt-dot.warn{background:#ff8a80;}
+    #aitxt-modal .aitxt-dot.checking{background:#c9a84c;animation:aitxt-pulse 1s ease-in-out infinite;}
+    #aitxt-modal .aitxt-status.ok span.label{color:#7fe3b0;}
+    #aitxt-modal .aitxt-status.warn span.label{color:#ff8a80;}
+    #aitxt-modal .aitxt-status.checking span.label{color:#c9a84c;}
+    #aitxt-modal a.aitxt-cta{
+      display:block;text-align:center;background:#c9a84c;color:#0a0f1e;
+      font-weight:600;font-size:14px;padding:11px;border-radius:7px;
+      text-decoration:none;margin-bottom:10px;
+    }
+    #aitxt-modal button.aitxt-close{
+      display:block;width:100%;background:transparent;border:1px solid #232c48;
+      color:#8b93ac;font-size:13px;padding:10px;border-radius:7px;cursor:pointer;
+    }
+  `;
+  var style = document.createElement('style');
+  style.textContent = CSS;
+  document.head.appendChild(style);
+
+  var badge = document.createElement('div');
+  badge.id = 'aitxt-badge';
+  badge.innerHTML = '<span class="dot checking"></span><span class="label">Checking AI governance…</span>';
+  document.body.appendChild(badge);
+
+  var overlay = document.createElement('div');
+  overlay.id = 'aitxt-overlay';
+  overlay.innerHTML = `
+    <div id="aitxt-modal">
+      <div class="aitxt-head">
+        <div class="aitxt-eyebrow">ai.txt · sebbi.pro</div>
+        <h3>AI governance declaration</h3>
+        <p>ai.txt is a plain-text file — like robots.txt — that states how this site's AI systems are governed. This check looked for it at the domain root, live, just now.</p>
+      </div>
+      <div class="aitxt-body">
+        <div class="aitxt-status checking" id="aitxt-modal-status">
+          <span class="aitxt-dot checking"></span>
+          <span class="label">Checking…</span>
+        </div>
+        <a class="aitxt-cta" href="https://sebbi.pro" target="_blank" id="aitxt-cta">Generate ai.txt — free</a>
+        <button class="aitxt-close">Close</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+
+  var badgeDot = badge.querySelector('.dot');
+  var badgeLabel = badge.querySelector('.label');
+  var modalStatus = overlay.querySelector('#aitxt-modal-status');
+  var modalDot = modalStatus.querySelector('.aitxt-dot');
+  var modalLabel = modalStatus.querySelector('.label');
+  var cta = overlay.querySelector('#aitxt-cta');
+
+  function setState(state, text, modalText){
+    badgeDot.className = 'dot ' + state;
+    badgeLabel.textContent = text;
+    modalStatus.className = 'aitxt-status ' + state;
+    modalDot.className = 'aitxt-dot ' + state;
+    modalLabel.textContent = modalText;
+    if(state === 'ok'){
+      cta.textContent = 'View declaration';
+    } else {
+      cta.textContent = 'Generate ai.txt — free';
+    }
+  }
+
+  // The real check — looks for ai.txt on this exact page's own domain.
+  // Checks the standard /.well-known/ai.txt location first, then falls
+  // back to /ai.txt at root. Same-origin, no backend needed, and it
+  // can't be faked by hardcoding a result: it either finds the file or
+  // it doesn't.
+  function checkPath(path){
+    return fetch(path, {method:'GET', cache:'no-store'})
+      .then(function(res){ return res.ok ? path : null; })
+      .catch(function(){ return null; });
+  }
+
+  Promise.all([
+    checkPath('/.well-known/ai.txt'),
+    checkPath('/ai.txt')
+  ]).then(function(results){
+    var foundAt = results.find(function(p){ return p !== null; });
+    if(foundAt){
+      setState('ok', 'AI governance declared', 'ai.txt found at ' + foundAt);
+    } else {
+      setState('warn', 'No ai.txt found', 'No ai.txt file found at this domain');
+    }
+  });
+
+  badge.addEventListener('click', function(){ overlay.classList.add('open'); });
+  overlay.addEventListener('click', function(e){
+    if(e.target === overlay) overlay.classList.remove('open');
+  });
+  overlay.querySelector('.aitxt-close').addEventListener('click', function(){
+    overlay.classList.remove('open');
+  });
+})();
+</script>
+<!-- ============================================================
+     END OF SNIPPET
+============================================================= -->
+
 </body>
 </html>
 

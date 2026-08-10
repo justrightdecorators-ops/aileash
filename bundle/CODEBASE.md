@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-90 files across 18 parts.
+88 files across 18 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -73,8 +73,6 @@ Generated automatically on every push. Do not edit by hand.
 - `sebdog_engine.py`
 - `sebdog_licence.py`
 - `sebdog_reporter.py`
-- `tests/attack_continuity_2.py`
-- `tests/attack_continuity_3.py`
 - `tests/attack_continuity_4.py`
 - `AILeash-API-Reference-v6.4.2.md`
 - `LICENCE`
@@ -82,28 +80,28 @@ Generated automatically on every push. Do not edit by hand.
 - `admin.html`
 - `ai-standard.html`
 - `ai-txt-kit.html`
+- `aitxt-popup-live.html`
 
 ## [CODEBASE-10.md](CODEBASE-10.md)
 
-- `aitxt-popup-live.html`
 - `brain.html`
 - `certificate.html`
 - `compliance-assistant.html`
 - `contact.html`
 - `copyright.txt`
+- `data-protection.html`
 
 ## [CODEBASE-11.md](CODEBASE-11.md)
 
-- `data-protection.html`
 - `developers.html`
 - `dis.txt`
 - `docs/evidential-undertaking.md`
 - `docs/spec/ai-txt.md`
 - `green.html`
+- `guardian-parent.html`
 
 ## [CODEBASE-12.md](CODEBASE-12.md)
 
-- `guardian-parent.html`
 - `human-oversight.html`
 - `identity.html`
 
