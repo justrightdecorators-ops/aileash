@@ -1,14 +1,15 @@
-# Codebase — part 7 of 19
+# Codebase — part 7 of 18
 
 Contains:
 - `modules/selfcheck.py`
 - `modules/spec.py`
-- `modules/standard.py`
 - `modules/stats.py`
 - `modules/witness.py`
 - `Verify_ai.py`
 - `ai_act_ranker.py`
 - `ai_safety_scanner.py`
+- `aigrade_insert.py`
+- `aileash_reporter.py`
 
 
 ## `modules/selfcheck.py`
@@ -1133,415 +1134,6 @@ def handle(method, action, data, api_key, ctx):
 
     return {"error": "unknown_action", "action": action,
             "available": ["", "modules"]}, 404
-
-```
-
-
-## `modules/standard.py`
-
-401 lines, 17637 bytes
-
-```python
-"""
-modules/standard.py  -  the Ordering Test discovery document for this domain
-
-WHAT IT SERVES
---------------
-  GET /.well-known/ordering-test.json   this operator's discovery document
-  GET /x/standard/hash                  sha256 of that document
-  GET /x/standard/status                what is installed, and honest counts
-
-SHAPE
------
-Deliberately identical to the shape Red Flag AI Pro published first:
-
-    checks: { <name>: { supported, demonstrable_publicly, endpoint, note } }
-
-Two fields, not one, and the second is the better idea. "We built it" and
-"you can verify it without an account" are different claims, and most of this
-market blurs them. Separating them lets a vendor be honest about having
-something real that an outsider still has to take on trust.
-
-WHAT THE HOST HEADER IS DOING HERE
-----------------------------------
-base_url is derived from the request rather than written into the file. An
-earlier draft had the domain hardcoded, which meant any operator running it
-would publish somebody else's domain as the source - the opposite of a mirror.
-Deriving it means this file can be lifted to any domain and tells the truth
-about wherever it is actually running.
-
-EVERY PUBLISHED ENDPOINT MUST WORK AS WRITTEN
----------------------------------------------
-An endpoint marked demonstrable_publicly is a promise that a stranger can copy
-it out of this document and get an answer. If the route needs a parameter, the
-document names that parameter. If a value has to be discovered first, the
-document says where to discover it. An endpoint that errors when followed
-literally is a failed check, not a documentation detail.
-
-HONESTY RULES THIS FILE FOLLOWS
--------------------------------
-  - A check we have not built says supported: false. It does not quietly go
-    missing from the document.
-  - A check that exists but needs an account says demonstrable_publicly:
-    false, however much we would like the tick.
-  - runner is null. A runner exists in draft, but the checks have not been
-    jointly agreed with the other mirror, so publishing one as though it were
-    a settled standard would claim something neither operator has earned yet.
-
-None of that is modesty. A conformance document whose author scores full marks
-on the day they publish it is a marketing page.
-"""
-
-import hashlib
-import json
-import sys
-
-VERSION = "1.1"
-ORDERING_TEST_VERSION = "0.1"
-
-PUBLIC = {("GET", "status"), ("GET", "hash"), ("GET", "spec"),
-          ("GET", "document")}
-
-# Several paths on purpose. /.well-known/ is where the standard says to look,
-# but some platforms and static handlers reserve that prefix, so a plain root
-# path is served as well. /x/standard/document goes through the normal router
-# and cannot be intercepted by anything, which makes it the diagnostic.
-DISCOVERY_PATHS = ("/.well-known/ordering-test.json",
-                   "/ordering-test.json",
-                   "/well-known/ordering-test.json")
-
-VENDOR = "AILeash"
-FALLBACK_BASE = "https://sebbi.pro"
-
-RUNNER = None
-RUNNER_NOTE = (
-    "No shared runner file is published here yet. The checks themselves have "
-    "not been jointly agreed with the other mirrors as of this document's "
-    "publication. This describes AILeash's own side only, not a settled "
-    "cross-vendor standard.")
-
-# Order follows the other mirror's document so the two read side by side.
-CHECKS = {
-    "rule_binding": {
-        "supported": True,
-        "demonstrable_publicly": True,
-        "endpoint": "/x/rulebind/prove",
-        "note": ("The ruleset version is a component of a digest sealed with the "
-                 "decision, not a field beside it. POST any inputs without an "
-                 "account and the response returns the exact string that was "
-                 "hashed - SHA-256 it yourself and confirm it matches. Alter the "
-                 "ruleset hash and the digest stops recomputing; alter the digest "
-                 "and the chain breaks. Verify a past record at "
-                 "/x/rulebind/verify?receipt=... and see ruleset history at "
-                 "/x/rulebind/packs. No scoring logic is disclosed at any point - "
-                 "inputs are published as a digest, never as values."),
-    },
-    "commit_before_reveal": {
-        "supported": True,
-        "demonstrable_publicly": True,
-        "endpoint": "/x/demo/review",
-        "note": ("The reviewer receives the case with the machine verdict "
-                 "withheld. Their own call and dwell time are sealed first, "
-                 "then the verdict is revealed, and the chain fixes that order "
-                 "permanently. No account needed - open a case, commit a "
-                 "verdict, and check the block indices yourself. Commit "
-                 "endpoint is /x/demo/commit."),
-    },
-    "authority_tokens": {
-        "supported": True,
-        "demonstrable_publicly": False,
-        "endpoint": None,
-        "note": ("Signed authority tokens with scope and expiry. A decision "
-                 "beyond delegated authority escalates rather than executes, "
-                 "and the delegation itself is sealed. Built and live, "
-                 "key-gated, no public proof."),
-    },
-    "mutual_witnessing": {
-        "supported": True,
-        "demonstrable_publicly": True,
-        "endpoint": "/x/witness/peers",
-        "note": ("Live, running both directions with an external peer chain "
-                 "hourly since 1 August 2026. No account needed, run it "
-                 "yourself. Our current tip is at /x/witness/tip and any party "
-                 "can submit theirs at /x/witness/observe without an account."),
-    },
-    "completeness_proof": {
-        "supported": True,
-        "demonstrable_publicly": True,
-        "endpoint": "/x/complete/root?period={period}&kind=receipts",
-        "note": ("Per-period sorted Merkle root and exact leaf count, committed "
-                 "before any export is requested. An export can then be checked "
-                 "against a number fixed before anyone knew it would be asked "
-                 "for. Committed periods are listed at /x/complete/periods - "
-                 "take a period identifier from there and substitute it. Only "
-                 "closed periods can be committed, so the current period will "
-                 "not appear until it ends. A period listed nowhere is a period "
-                 "nobody committed, which is itself the finding."),
-    },
-    "absence_proof": {
-        "supported": True,
-        "demonstrable_publicly": True,
-        "endpoint": "/x/complete/prove?period={period}&value={value}",
-        "note": ("Two adjacent leaves with consecutive indices demonstrate that "
-                 "nothing sits between them, so absence is proved rather than "
-                 "asserted. Both parameters are required: take a period from "
-                 "/x/complete/periods and supply any value you like. Try a "
-                 "value that is not there."),
-    },
-    "reconciliation": {
-        "supported": True,
-        "demonstrable_publicly": False,
-        "endpoint": None,
-        "note": ("Sample selected from the live chain tip and sealed before any "
-                 "data is requested, so flattering records cannot be "
-                 "cherry-picked. Mismatches sealed as permanently as matches. "
-                 "Built and live, key-gated, no public proof."),
-    },
-    "reproducibility": {
-        "supported": True,
-        "demonstrable_publicly": True,
-        "endpoint": "/x/replay/challenge",
-        "note": ("Determinism proved by public challenge without disclosing any "
-                 "scoring logic. Submit inputs, the run is sealed, resubmit the "
-                 "same inputs later and the verdict must be identical under an "
-                 "unchanged code fingerprint at /x/replay/fingerprint."),
-    },
-    "consistency_proof": {
-        "supported": True,
-        "demonstrable_publicly": True,
-        "endpoint": "/x/consistency/proof?first={first}&second={second}",
-        "note": ("RFC 6962 consistency proofs, deliberately unmodified so "
-                 "existing Certificate Transparency verifiers work against them "
-                 "directly. first and second are tree sizes - read the current "
-                 "size from /x/consistency/root and pick any earlier one. "
-                 "Anyone holding any earlier tip we served can show it is a "
-                 "prefix of the current log at /x/consistency/ancestor."),
-    },
-
-    # ---- proposed addition, flagged as a proposal rather than assumed ----
-    "external_anchoring": {
-        "supported": True,
-        "demonstrable_publicly": True,
-        "endpoint": "/api/anchor-status",
-        "note": ("PROPOSED AS A SEPARATE CHECK, not settled. The other mirror "
-                 "currently folds anchoring into consistency_proof, but they "
-                 "answer different questions: consistency shows the log only "
-                 "ever grew, anchoring shows the time was fixed somewhere the "
-                 "operator cannot reach. A log can be perfectly append-only and "
-                 "still have been built last week. Here the tip is submitted to "
-                 "OpenTimestamps and committed into Bitcoin; the other mirror "
-                 "uses an RFC 3161 timestamp. The spec should permit any "
-                 "external authority the operator does not control and require "
-                 "it to be named - not mandate one. Offered for the joint "
-                 "session."),
-    },
-}
-
-DOCUMENT_NOTE = (
-    "Every endpoint marked demonstrable_publicly is unauthenticated by design - "
-    "run it yourself without asking us. Where an endpoint carries a {parameter}, "
-    "the note for that check says where to get a valid value; every published "
-    "endpoint is meant to work when followed literally, and one that does not is "
-    "a failed check on our side, not a quibble. Checks marked supported but not "
-    "demonstrable_publicly are real and built, but currently need a key to see, "
-    "and say so plainly rather than passing on the day this was published. "
-    "Nothing here proves the records are true. It describes the order things "
-    "were committed in, which is a narrower claim and the only one that holds.")
-
-_patched = [False]
-
-
-def _base_from(handler):
-    """Derive our own base URL from the request. An operator running this file
-    on their own domain publishes their domain, not whoever wrote it."""
-    try:
-        host = handler.headers.get("X-Forwarded-Host") or handler.headers.get("Host")
-        if not host:
-            return FALLBACK_BASE
-        host = host.split(",")[0].strip()[:200]
-        proto = (handler.headers.get("X-Forwarded-Proto") or "https").split(",")[0].strip()
-        if proto not in ("http", "https"):
-            proto = "https"
-        return proto + "://" + host
-    except Exception:
-        return FALLBACK_BASE
-
-
-def _base_from_ctx(ctx):
-    """Same derivation for the routed /x/standard/document call.
-
-    The router's ctx may or may not carry the request handler. If it does, the
-    document served through the router names the same domain as the one served
-    at /.well-known/ - which matters on a mirror, where hardcoding would make
-    this file publish somebody else's domain again."""
-    try:
-        if isinstance(ctx, dict):
-            for key in ("handler", "h", "request", "req", "self"):
-                obj = ctx.get(key)
-                if obj is not None and hasattr(obj, "headers"):
-                    return _base_from(obj)
-            headers = ctx.get("headers")
-            if headers is not None:
-                class _Shim(object):
-                    pass
-                shim = _Shim()
-                shim.headers = headers
-                return _base_from(shim)
-        elif ctx is not None and hasattr(ctx, "headers"):
-            return _base_from(ctx)
-    except Exception:
-        pass
-    return FALLBACK_BASE
-
-
-def _document(base):
-    checks = {}
-    for name, c in CHECKS.items():
-        checks[name] = {
-            "supported": c["supported"],
-            "demonstrable_publicly": c["demonstrable_publicly"],
-            "endpoint": c["endpoint"],
-            "note": c["note"],
-        }
-    return {
-        "ordering_test_version": ORDERING_TEST_VERSION,
-        "vendor": VENDOR,
-        "base_url": base,
-        "runner": RUNNER,
-        "runner_note": RUNNER_NOTE,
-        "checks": checks,
-        "witness_peers": base + "/x/witness/peers",
-        "witness_tip": base + "/x/witness/tip",
-        "committed_periods": base + "/x/complete/periods",
-        "note": DOCUMENT_NOTE,
-    }
-
-
-def _digest(doc):
-    return hashlib.sha256(
-        json.dumps(doc, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-
-
-def _srv():
-    m = sys.modules.get("__main__")
-    if hasattr(m, "get_bearer"):
-        return m
-    return sys.modules.get("server")
-
-
-def _install(s):
-    if _patched[0]:
-        return "already installed"
-    H = getattr(s, "Handler", None)
-    if H is None or not hasattr(H, "do_GET"):
-        return "no handler"
-    if getattr(H, "_standard_patched", False):
-        _patched[0] = True
-        return "already installed"
-
-    original = H.do_GET
-
-    def do_GET(self):
-        try:
-            from urllib.parse import urlparse
-            p = urlparse(self.path).path.rstrip("/") or "/"
-        except Exception:
-            p = self.path or "/"
-
-        if p in DISCOVERY_PATHS:
-            body = json.dumps(_document(_base_from(self)), indent=2).encode("utf-8")
-            try:
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Cache-Control", "public, max-age=300")
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.send_header("X-Content-Type-Options", "nosniff")
-                self.end_headers()
-                self.wfile.write(body)
-            except Exception:
-                pass
-            return
-
-        return original(self)
-
-    H.do_GET = do_GET
-    H._standard_patched = True
-    _patched[0] = True
-    print("STANDARD: /.well-known/ordering-test.json installed", flush=True)
-    return "installed"
-
-
-def handle(method, action, data, api_key, ctx):
-    s = _srv()
-    if s is None:
-        return {"error": "server_not_found"}, 500
-
-    state = "already installed" if _patched[0] else None
-    if not _patched[0]:
-        try:
-            state = _install(s)
-        except Exception as exc:
-            print("STANDARD: patch failed - " + str(exc), flush=True)
-            state = "failed: " + str(exc)
-
-    action = (action or "").strip("/").lower()
-    base = _base_from_ctx(ctx)
-    doc = _document(base)
-
-    if method == "GET" and action == "document":
-        return doc, 200
-
-    if method == "GET" and action == "hash":
-        canonical = _document(FALLBACK_BASE)
-        return {
-            "sha256": _digest(canonical),
-            "of": "this operator's discovery document",
-            "canonicalisation": ("JSON, keys sorted, no whitespace, UTF-8, "
-                                 "base_url fixed to " + FALLBACK_BASE +
-                                 " so the digest does not move with the "
-                                 "requesting host"),
-            "what_this_is_for": (
-                "Confirming our own document has not changed. It is NOT the "
-                "cross-mirror check - two operators publish different documents "
-                "by design, because they list different endpoints, so their "
-                "digests should differ and a mismatch would prove nothing. The "
-                "cross-mirror comparison only means something once every mirror "
-                "serves a byte-identical runner file and hashes that instead. "
-                "No runner is agreed yet."),
-            "document": canonical,
-        }, 200
-
-    if method == "GET" and action in ("", "status", "spec"):
-        supported = [k for k, c in CHECKS.items() if c["supported"]]
-        public = [k for k, c in CHECKS.items() if c["demonstrable_publicly"]]
-        parameterised = [k for k, c in CHECKS.items()
-                         if c["endpoint"] and "{" in c["endpoint"]]
-        return {
-            "installed": bool(_patched[0]),
-            "install_result": state,
-            "module_version": VERSION,
-            "ordering_test_version": ORDERING_TEST_VERSION,
-            "serving": list(DISCOVERY_PATHS),
-            "always_available": "/x/standard/document",
-            "checks_total": len(CHECKS),
-            "checks_supported": len(supported),
-            "checks_publicly_demonstrable": len(public),
-            "publicly_demonstrable": public,
-            "supported_but_not_public": [k for k in supported if k not in public],
-            "endpoints_needing_a_parameter": parameterised,
-            "runner": RUNNER,
-            "note": ("base_url is derived from the Host header, so this file "
-                     "publishes whichever domain is actually serving it. Checks "
-                     "listed under endpoints_needing_a_parameter cannot be "
-                     "demonstrated until a real value exists to substitute - "
-                     "for the completeness and absence checks that means at "
-                     "least one committed period at /x/complete/periods."),
-        }, 200
-
-    return {"error": "unknown_action", "action": action,
-            "GET": ["status", "hash", "document"]}, 404
 
 ```
 
@@ -2739,5 +2331,389 @@ async def check_badge(domain: str = Query(...)):
   <text x="150" y="14" fill="#0a0f1e" font-family="Verdana,sans-serif" font-size="12" font-weight="bold" text-anchor="middle">{grade}</text>
 </svg>'''
     return Response(content=svg, media_type="image/svg+xml")
+
+```
+
+
+## `aigrade_insert.py`
+
+136 lines, 5663 bytes
+
+```python
+# ============================================================
+# AI-SAFETY GRADE SCANNER - stdlib version for server.py
+# (converted from the FastAPI/httpx draft - no new dependencies)
+#
+# HOW TO INSTALL - two pastes into server.py:
+#
+# PASTE 1: everything between "BEGIN FUNCTIONS" and "END FUNCTIONS"
+#          goes near your other helper functions (e.g. just above
+#          the JURIS_VERSION block).
+#
+# PASTE 2: everything between "BEGIN ROUTES" and "END ROUTES"
+#          goes inside do_GET, as new elif branches alongside the
+#          other GET routes (match their indentation: 8 spaces).
+#
+# Endpoints added:
+#   GET /api/aigrade?domain=example.com        -> JSON grade report
+#   GET /api/aigrade/badge?domain=example.com  -> embeddable SVG badge
+# ============================================================
+
+# ---------------- BEGIN FUNCTIONS ----------------
+AIGRADE_TIMEOUT=6
+AIGRADE_UA="Mozilla/5.0 (compatible; AILeashScanner/1.0; +https://sebbi.pro/scan)"
+AIGRADE_UA_AGENT="AILeash-Agent-Check/1.0 (+https://sebbi.pro/scan)"
+AIGRADE_CHECKS=[
+    ("ai_safety","/.well-known/ai-safety.txt",20,"ai_safety"),
+    ("security","/.well-known/security.txt",15,"security"),
+    ("robots","/robots.txt",10,"present"),
+    ("sitemap","/sitemap.xml",10,"sitemap"),
+    ("ai_txt","/.well-known/ai.txt",15,"present"),
+    ("comply","/.well-known/comply.txt",15,"present"),
+    ("llms","/llms.txt",10,"present"),
+]
+AIGRADE_RENDER_POINTS=5
+AIGRADE_MAX=sum(c[2] for c in AIGRADE_CHECKS)+AIGRADE_RENDER_POINTS
+AIGRADE_COLORS={"A":"#7fe3b0","B":"#a8d95f","C":"#c9a84c","D":"#ff9a4a","F":"#ff8a80"}
+
+def _aigrade_fetch(url,ua=AIGRADE_UA):
+    try:
+        req=urllib.request.Request(url,headers={"User-Agent":ua})
+        with urllib.request.urlopen(req,timeout=AIGRADE_TIMEOUT) as r:
+            if r.status==200:
+                return r.read(500000).decode("utf-8","replace")
+    except Exception:
+        pass
+    return None
+
+def _aigrade_valid(kind,text):
+    if kind=="present":
+        return bool(text and text.strip())
+    if kind=="ai_safety":
+        if not text:return False
+        low=text.lower()
+        return "ai-safe:" in low and "true" in low
+    if kind=="security":
+        if not text:return False
+        low=text.lower()
+        return "contact:" in low and "expires:" in low
+    if kind=="sitemap":
+        if not text:return False
+        try:
+            import xml.etree.ElementTree as _ET
+            _ET.fromstring(text)
+            return True
+        except Exception:
+            return False
+    return False
+
+def _aigrade_letter(score):
+    if score>=90:return"A"
+    if score>=75:return"B"
+    if score>=60:return"C"
+    if score>=40:return"D"
+    return"F"
+
+def aigrade_run(domain):
+    domain=str(domain or "").strip().lower().replace("https://","").replace("http://","").rstrip("/")
+    domain=domain.split("/")[0]
+    if not domain or "." not in domain or len(domain)>200:
+        return None
+    base="https://"+domain
+    results={};score=0
+    for key,path,points,kind in AIGRADE_CHECKS:
+        text=_aigrade_fetch(base+path)
+        passed=_aigrade_valid(kind,text)
+        results[key]={"path":path,"found":bool(text),"passed":passed,"points":points if passed else 0}
+        if passed:score+=points
+    human=_aigrade_fetch(base,AIGRADE_UA)
+    agent=_aigrade_fetch(base,AIGRADE_UA_AGENT)
+    render_ok=False
+    if human and agent:
+        ratio=min(len(human),len(agent))/max(len(human),len(agent),1)
+        render_ok=ratio>0.9
+    results["consistent_rendering"]={"passed":render_ok,"points":AIGRADE_RENDER_POINTS if render_ok else 0}
+    if render_ok:score+=AIGRADE_RENDER_POINTS
+    return{"domain":domain,"score":score,"max_score":AIGRADE_MAX,
+        "grade":_aigrade_letter(score),"checks":results,
+        "verified_by":"sebbi.pro",
+        "badge_url":HOST+"/api/aigrade/badge?domain="+domain,
+        "report_url":HOST+"/api/aigrade?domain="+domain,
+        "note":"External-signal check of published AI-transparency files; not an audit of internal systems"}
+
+def aigrade_badge_svg(domain):
+    r=aigrade_run(domain)
+    grade=r["grade"] if r else "F"
+    color=AIGRADE_COLORS.get(grade,"#ff8a80")
+    return('<svg xmlns="http://www.w3.org/2000/svg" width="180" height="20">'
+        '<rect width="120" height="20" fill="#0a0f1e"/>'
+        '<rect x="120" width="60" height="20" fill="'+color+'"/>'
+        '<text x="60" y="14" fill="#fff" font-family="Verdana,sans-serif" font-size="11" text-anchor="middle">AI-Safety Grade</text>'
+        '<text x="150" y="14" fill="#0a0f1e" font-family="Verdana,sans-serif" font-size="12" font-weight="bold" text-anchor="middle">'+grade+'</text>'
+        '</svg>')
+# ---------------- END FUNCTIONS ----------------
+
+
+# ---------------- BEGIN ROUTES (paste inside do_GET) ----------------
+        elif path=="/api/aigrade":
+            qs=parse_qs(parsed.query)
+            dom=(qs.get("domain",[""])[0] or "").strip()
+            rep=aigrade_run(dom)
+            if not rep:
+                send_json(self,{"error":"valid domain required, e.g. ?domain=example.com"},400)
+            else:
+                send_json(self,rep)
+        elif path=="/api/aigrade/badge":
+            qs=parse_qs(parsed.query)
+            dom=(qs.get("domain",[""])[0] or "").strip()
+            svg=aigrade_badge_svg(dom)
+            body=svg.encode()
+            self.send_response(200)
+            self.send_header("Content-Type","image/svg+xml")
+            self.send_header("Cache-Control","max-age=3600")
+            self.send_header("Content-Length",str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+# ---------------- END ROUTES ----------------
+
+```
+
+
+## `aileash_reporter.py`
+
+232 lines, 9377 bytes
+
+```python
+"""
+AILEASH DECISION REPORTER v1.0.0
+Generates readable audit reports for all AILeash products.
+Shows exactly why each decision was made.
+Copyright (c) 2026 Justin Antony Dobson / Monop Content, Blyth, UK
+"""
+
+import sqlite3, json, os
+from datetime import datetime
+
+DB_FILE = "aileash.db"
+
+PRODUCTS = {
+    "aileash": "AILeash",
+    "guardian": "AILeash Guardian",
+    "sonicboom": "SonicBoom",
+    "sentinel": "AILeash Sentinel"
+}
+
+REASON_EXPLANATIONS = {
+    "velocity_spike": "User made more than 10 requests in 60 seconds",
+    "high_amount": "Transaction amount exceeded threshold",
+    "risky_device": "Device risk score was above acceptable limit",
+    "behaviour_anomaly": "Unusual behaviour pattern detected",
+    "country_shift": "Request came from a different country than usual",
+    "unsafe_country": "Request came from outside approved country list",
+    "low_trust": "User trust score has dropped due to previous decisions",
+}
+
+def get_decisions(db_path=DB_FILE, limit=200):
+    if not os.path.exists(db_path):
+        return []
+    try:
+        conn = sqlite3.connect(db_path)
+        rows = conn.execute("""
+            SELECT a.ts, a.user_id, a.event_json, a.result_json, a.audit_hash,
+                   COALESCE(k.product, 'aileash') as product
+            FROM audit_log a
+            LEFT JOIN api_keys k ON json_extract(a.event_json, '$.api_key') = k.key
+            ORDER BY a.id DESC LIMIT ?
+        """, (limit,)).fetchall()
+        conn.close()
+    except:
+        try:
+            conn = sqlite3.connect(db_path)
+            rows = conn.execute("""
+                SELECT ts, user_id, event_json, result_json, audit_hash, 'aileash'
+                FROM audit_log ORDER BY id DESC LIMIT ?
+            """, (limit,)).fetchall()
+            conn.close()
+        except:
+            return []
+    
+    results = []
+    for row in rows:
+        try:
+            event = json.loads(row[2])
+            result = json.loads(row[3])
+            results.append({
+                "ts": row[0],
+                "user_id": row[1],
+                "event": event,
+                "result": result,
+                "audit_hash": row[4],
+                "product": row[5] or "aileash"
+            })
+        except:
+            pass
+    return results
+
+def explain_reason(r):
+    return REASON_EXPLANATIONS.get(r, r.replace("_", " ").capitalize())
+
+def decision_color(d):
+    return {"ALLOW": "#00875a", "CHALLENGE": "#b45309", "BLOCK": "#cc0000"}.get(d, "#555")
+
+def product_color(p):
+    return {
+        "aileash": "#c9a84c",
+        "guardian": "#cc0000",
+        "sonicboom": "#00d4ff",
+        "sentinel": "#7c3aed"
+    }.get(p, "#c9a84c")
+
+def generate_html_report(db_path=DB_FILE, limit=200, output="aileash_report.html"):
+    decisions = get_decisions(db_path, limit)
+
+    allow = sum(1 for d in decisions if d["result"].get("decision") == "ALLOW")
+    challenge = sum(1 for d in decisions if d["result"].get("decision") == "CHALLENGE")
+    block = sum(1 for d in decisions if d["result"].get("decision") == "BLOCK")
+
+    rows = ""
+    for d in decisions:
+        result = d["result"]
+        event = d["event"]
+        ts = datetime.fromtimestamp(d["ts"]).strftime('%Y-%m-%d %H:%M:%S')
+        decision = result.get("decision", "?")
+        score = result.get("score", 0)
+        reasons = result.get("reasons", [])
+        product = d.get("product", "aileash")
+        pc = product_color(product)
+        dc = decision_color(decision)
+        pname = PRODUCTS.get(product, product)
+
+        reason_html = ""
+        if reasons:
+            reason_html = "<ul>" + "".join(
+                f"<li>{explain_reason(r)}</li>" for r in reasons
+            ) + "</ul>"
+        else:
+            reason_html = "<span style='color:#888'>No risk factors detected</span>"
+
+        rows += f"""<tr>
+            <td>{ts}</td>
+            <td><span style="font-size:10px;background:{pc}22;color:{pc};border:1px solid {pc}44;padding:2px 6px;border-radius:3px">{pname}</span></td>
+            <td><code>{d['user_id']}</code></td>
+            <td>{event.get('action','?')}</td>
+            <td>{event.get('country','?')}</td>
+            <td>£{event.get('amount',0)}</td>
+            <td><strong style="color:{dc}">{decision}</strong></td>
+            <td>{score}</td>
+            <td>{result.get('trust',0)}</td>
+            <td>{reason_html}</td>
+            <td><code style="font-size:10px">{d['audit_hash'][:16]}...</code></td>
+        </tr>"""
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>AILeash Audit Report</title>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:sans-serif;background:#f5f7fa;color:#1a202c;padding:20px}}
+.header{{background:#0a0f1e;color:#fff;padding:24px 32px;border-radius:8px;margin-bottom:20px;display:flex;justify-content:space-between;align-items:center}}
+.header h1{{font-size:22px;color:#c9a84c;margin:0}}
+.header p{{font-size:12px;color:rgba(255,255,255,0.4);margin-top:4px}}
+.logo{{font-size:13px;color:rgba(255,255,255,0.2)}}
+.stats{{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px}}
+.stat{{background:#fff;border-radius:8px;padding:16px;text-align:center;border:1px solid #e2e8f0}}
+.stat-n{{font-size:28px;font-weight:700}}
+.stat-l{{font-size:11px;color:#64748b;margin-top:4px;text-transform:uppercase;letter-spacing:1px}}
+.allow{{color:#00875a}}.challenge{{color:#b45309}}.block{{color:#cc0000}}.total{{color:#0a0f1e}}
+.table-wrap{{background:#fff;border-radius:8px;overflow:hidden;border:1px solid #e2e8f0;overflow-x:auto}}
+table{{width:100%;border-collapse:collapse;min-width:900px}}
+th{{background:#0a0f1e;color:#c9a84c;padding:10px 12px;text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:1px;white-space:nowrap}}
+td{{padding:10px 12px;border-bottom:1px solid #e2e8f0;font-size:12px;vertical-align:top}}
+tr:last-child td{{border:none}}
+tr:hover td{{background:#f8fafc}}
+ul{{margin:4px 0;padding-left:16px}}
+li{{margin:2px 0;color:#64748b;font-size:11px}}
+code{{background:#f1f5f9;padding:2px 4px;border-radius:3px;font-size:10px}}
+.empty{{text-align:center;color:#888;padding:40px}}
+footer{{text-align:center;font-size:11px;color:#94a3b8;margin-top:20px}}
+</style>
+</head>
+<body>
+<div class="header">
+  <div>
+    <h1>AILeash Audit Report</h1>
+    <p>Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} &nbsp;|&nbsp; Last {len(decisions)} decisions</p>
+  </div>
+  <div class="logo">sebbi.pro &nbsp;|&nbsp; OAAS-1.0</div>
+</div>
+<div class="stats">
+  <div class="stat"><div class="stat-n total">{len(decisions)}</div><div class="stat-l">Total</div></div>
+  <div class="stat"><div class="stat-n allow">{allow}</div><div class="stat-l">Allowed</div></div>
+  <div class="stat"><div class="stat-n challenge">{challenge}</div><div class="stat-l">Challenged</div></div>
+  <div class="stat"><div class="stat-n block">{block}</div><div class="stat-l">Blocked</div></div>
+</div>
+<div class="table-wrap">
+<table>
+<thead><tr>
+  <th>Time</th><th>Product</th><th>User</th><th>Action</th><th>Country</th>
+  <th>Amount</th><th>Decision</th><th>Score</th><th>Trust</th><th>Reasons</th><th>Audit Hash</th>
+</tr></thead>
+<tbody>
+{''.join([rows]) if rows else f'<tr><td colspan="11" class="empty">No decisions recorded yet</td></tr>'}
+</tbody>
+</table>
+</div>
+<footer>AILeash &nbsp;|&nbsp; Monop Content &nbsp;|&nbsp; Justin Antony Dobson &nbsp;|&nbsp; sebbi.pro &nbsp;|&nbsp; SHA-256 Merkle Chain</footer>
+</body>
+</html>"""
+
+    with open(output, "w") as f:
+        f.write(html)
+    print(f"Report saved: {output} ({len(decisions)} decisions)")
+    return output
+
+def generate_json_report(db_path=DB_FILE, limit=200, output="aileash_report.json"):
+    decisions = get_decisions(db_path, limit)
+    report = {
+        "generated": datetime.now().isoformat(),
+        "standard": "OAAS-1.0",
+        "source": "sebbi.pro",
+        "total": len(decisions),
+        "summary": {
+            "allow": sum(1 for d in decisions if d["result"].get("decision") == "ALLOW"),
+            "challenge": sum(1 for d in decisions if d["result"].get("decision") == "CHALLENGE"),
+            "block": sum(1 for d in decisions if d["result"].get("decision") == "BLOCK")
+        },
+        "decisions": [{
+            "timestamp": datetime.fromtimestamp(d["ts"]).isoformat(),
+            "product": PRODUCTS.get(d["product"], d["product"]),
+            "user_id": d["user_id"],
+            "action": d["event"].get("action"),
+            "country": d["event"].get("country"),
+            "amount": d["event"].get("amount"),
+            "decision": d["result"].get("decision"),
+            "score": d["result"].get("score"),
+            "trust": d["result"].get("trust"),
+            "reasons": d["result"].get("reasons", []),
+            "reasons_explained": [explain_reason(r) for r in d["result"].get("reasons", [])],
+            "audit_hash": d["audit_hash"]
+        } for d in decisions]
+    }
+    with open(output, "w") as f:
+        json.dump(report, f, indent=2)
+    print(f"Report saved: {output}")
+    return output
+
+if __name__ == "__main__":
+    import sys
+    fmt = sys.argv[1] if len(sys.argv) > 1 else "html"
+    db = sys.argv[2] if len(sys.argv) > 2 else DB_FILE
+    if fmt == "json":
+        generate_json_report(db)
+    else:
+        generate_html_report(db)
 
 ```
