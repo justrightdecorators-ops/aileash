@@ -1,8 +1,6 @@
 # Codebase — part 10 of 20
 
 Contains:
-- `sebdog_licence.py`
-- `sebdog_reporter.py`
 - `tests/attack_continuity_1.py`
 - `tests/attack_continuity_2.py`
 - `tests/attack_continuity_3.py`
@@ -12,571 +10,7 @@ Contains:
 - `verify_authority.py`
 - `AILeash-API-Reference-v6.4.2.md`
 - `LICENCE`
-
-
-## `sebdog_licence.py`
-
-332 lines, 12401 bytes
-
-```python
-"""
-SEBDOG LICENCE SYSTEM v1.0.0
-Air-gapped cryptographic licence tokens for the Sebdog Engine.
-Copyright (c) 2026 Justin Antony Dobson / Monop Content, Blyth, UK
-
-HOW IT WORKS:
-- sebbi.pro generates a signed annual licence token on signup
-- The token is validated entirely locally — no phone-home required
-- Any tampering with the token is cryptographically detected
-- Tokens expire after 12 months and must be renewed
-- The signing secret never leaves sebbi.pro's servers
-
-SECURITY MODEL:
-- HMAC-SHA256 signatures — industry standard, same as used by AWS, Stripe
-- Constant-time comparison prevents timing attacks
-- Base64url encoding for safe transmission
-- JSON payload is deterministically serialised (sort_keys=True)
-- Every validation attempt is logged to the local audit chain
-"""
-
-import hashlib, hmac, json, time, base64, secrets, sqlite3, threading
-from typing import Tuple, Optional, Dict
-
-# ==============================================================================
-# CONSTANTS
-# ==============================================================================
-
-TOKEN_VERSION = "1"
-GRACE_SECONDS = 86400 * 7  # 7-day grace period after expiry before hard block
-AUDIT_DB = "sebdog_audit.db"
-
-# ==============================================================================
-# TOKEN GENERATION (runs on sebbi.pro server only)
-# The signing secret is an environment variable on Railway.
-# It never appears in any file that gets shipped to customers.
-# ==============================================================================
-
-def generate_token(api_key: str, devices: int, plan: str,
-                   email: str, secret: bytes,
-                   validity_days: int = 365) -> str:
-    """
-    Generate a cryptographically signed annual licence token.
-    Called by sebbi.pro when a customer requests an air-gapped licence.
-
-    Args:
-        api_key:       The customer's AILeash API key
-        devices:       Licensed device count
-        plan:          'free' or 'paid'
-        email:         Customer email
-        secret:        HMAC signing secret (from Railway env var)
-        validity_days: Token validity in days (default 365)
-
-    Returns:
-        Base64url-encoded signed token string
-    """
-    issued = int(time.time())
-    expires = issued + (validity_days * 86400)
-
-    payload = json.dumps({
-        "v": TOKEN_VERSION,
-        "key": api_key,
-        "devices": devices,
-        "plan": plan,
-        "email": email,
-        "issued": issued,
-        "expires": expires
-    }, sort_keys=True, separators=(',', ':'))
-
-    sig = hmac.new(secret, payload.encode('utf-8'), hashlib.sha256).hexdigest()
-
-    token_data = json.dumps({
-        "payload": payload,
-        "sig": sig
-    }, separators=(',', ':'))
-
-    return base64.urlsafe_b64encode(token_data.encode('utf-8')).decode('utf-8')
-
-
-# ==============================================================================
-# TOKEN VALIDATION (runs on customer hardware — no network required)
-# ==============================================================================
-
-def validate_token(token: str, secret: bytes) -> Tuple[Optional[Dict], Optional[str]]:
-    """
-    Validate a licence token entirely locally.
-    No network connection required.
-
-    Returns:
-        (licence_data, None) on success
-        (None, error_code) on failure
-
-    Error codes:
-        invalid_format      — token cannot be decoded
-        invalid_signature   — token has been tampered with
-        token_expired       — token is past expiry + grace period
-        version_mismatch    — token version not supported
-    """
-    try:
-        raw = json.loads(base64.urlsafe_b64decode(token.encode('utf-8')))
-        payload_str = raw.get("payload", "")
-        sig = raw.get("sig", "")
-    except Exception:
-        return None, "invalid_format"
-
-    # Constant-time HMAC comparison — prevents timing attacks
-    expected = hmac.new(secret, payload_str.encode('utf-8'), hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(sig, expected):
-        return None, "invalid_signature"
-
-    try:
-        data = json.loads(payload_str)
-    except Exception:
-        return None, "invalid_format"
-
-    if data.get("v") != TOKEN_VERSION:
-        return None, "version_mismatch"
-
-    # Apply grace period — token runs for 7 days past expiry
-    if data.get("expires", 0) + GRACE_SECONDS < time.time():
-        return None, "token_expired"
-
-    return data, None
-
-
-def is_in_grace_period(token_data: Dict) -> bool:
-    """Returns True if token is past expiry but within grace period."""
-    return token_data.get("expires", 0) < time.time()
-
-
-def days_until_expiry(token_data: Dict) -> int:
-    """Returns days remaining until token expiry (negative if expired)."""
-    return int((token_data.get("expires", 0) - time.time()) / 86400)
-
-
-# ==============================================================================
-# LOCAL LICENCE STORE
-# Caches the validated token locally so validation survives restarts.
-# Everything stays on the customer's own hardware.
-# ==============================================================================
-
-_lock = threading.Lock()
-
-
-def save_licence_locally(db_path: str, token: str, licence_data: Dict):
-    """Cache the validated licence in the local audit database."""
-    with _lock:
-        conn = sqlite3.connect(db_path)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS licence_cache (
-                id INTEGER PRIMARY KEY,
-                token TEXT,
-                api_key TEXT,
-                devices INTEGER,
-                plan TEXT,
-                email TEXT,
-                issued INTEGER,
-                expires INTEGER,
-                cached_at REAL
-            )
-        """)
-        conn.execute("DELETE FROM licence_cache")  # Only one licence at a time
-        conn.execute("""
-            INSERT INTO licence_cache
-            (token, api_key, devices, plan, email, issued, expires, cached_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            token,
-            licence_data.get("key", ""),
-            licence_data.get("devices", 1),
-            licence_data.get("plan", "free"),
-            licence_data.get("email", ""),
-            licence_data.get("issued", 0),
-            licence_data.get("expires", 0),
-            time.time()
-        ))
-        conn.commit()
-        conn.close()
-
-
-def load_licence_locally(db_path: str) -> Optional[Tuple[str, Dict]]:
-    """Load a cached licence from the local database."""
-    try:
-        with _lock:
-            conn = sqlite3.connect(db_path)
-            row = conn.execute(
-                "SELECT token, api_key, devices, plan, email, issued, expires "
-                "FROM licence_cache LIMIT 1"
-            ).fetchone()
-            conn.close()
-        if not row:
-            return None
-        token, api_key, devices, plan, email, issued, expires = row
-        data = {
-            "v": TOKEN_VERSION,
-            "key": api_key,
-            "devices": devices,
-            "plan": plan,
-            "email": email,
-            "issued": issued,
-            "expires": expires
-        }
-        return token, data
-    except Exception:
-        return None
-
-
-# ==============================================================================
-# STRESS TEST
-# Run with: python sebdog_licence.py
-# ==============================================================================
-
-if __name__ == "__main__":
-    import sys
-
-    print("SEBDOG LICENCE SYSTEM — Stress Test")
-    print("=" * 60)
-
-    # Generate a test secret (on sebbi.pro this comes from Railway env vars)
-    SECRET = secrets.token_bytes(32)
-    TEST_KEY = "al_live_" + secrets.token_hex(24)
-    PASSES = 0
-    FAILURES = 0
-
-    def check(name, condition, detail=""):
-        global PASSES, FAILURES
-        if condition:
-            print(f"  PASS  {name}")
-            PASSES += 1
-        else:
-            print(f"  FAIL  {name} {detail}")
-            FAILURES += 1
-
-    # --- Basic validity ---
-    print("\n[1] Basic token generation and validation")
-    token = generate_token(TEST_KEY, 10000, "paid", "test@example.com", SECRET)
-    data, err = validate_token(token, SECRET)
-    check("Valid token accepted", err is None)
-    check("API key preserved", data and data.get("key") == TEST_KEY)
-    check("Device count preserved", data and data.get("devices") == 10000)
-    check("Plan preserved", data and data.get("plan") == "paid")
-    check("Not in grace period", data and not is_in_grace_period(data))
-    check("Days until expiry > 360", data and days_until_expiry(data) > 360)
-
-    # --- Tamper detection ---
-    print("\n[2] Tamper detection")
-    raw = json.loads(base64.urlsafe_b64decode(token))
-    raw["payload"] = raw["payload"].replace("10000", "99999")
-    bad_token = base64.urlsafe_b64encode(json.dumps(raw, separators=(',',':')).encode()).decode()
-    _, err = validate_token(bad_token, SECRET)
-    check("Tampered device count rejected", err == "invalid_signature")
-
-    raw2 = json.loads(base64.urlsafe_b64decode(token))
-    raw2["payload"] = raw2["payload"].replace("paid", "enterprise")
-    bad_token2 = base64.urlsafe_b64encode(json.dumps(raw2, separators=(',',':')).encode()).decode()
-    _, err = validate_token(bad_token2, SECRET)
-    check("Tampered plan rejected", err == "invalid_signature")
-
-    raw3 = json.loads(base64.urlsafe_b64decode(token))
-    raw3["sig"] = "0" * 64
-    bad_token3 = base64.urlsafe_b64encode(json.dumps(raw3, separators=(',',':')).encode()).decode()
-    _, err = validate_token(bad_token3, SECRET)
-    check("Zeroed signature rejected", err == "invalid_signature")
-
-    # --- Expiry ---
-    print("\n[3] Expiry handling")
-    expired = generate_token(TEST_KEY, 100, "paid", "test@example.com", SECRET, validity_days=-1)
-    data_exp, err = validate_token(expired, SECRET)
-    check("Recently expired token in grace period", err is None and data_exp is not None)
-    check("Grace period detected", data_exp and is_in_grace_period(data_exp))
-
-    hard_expired = generate_token(TEST_KEY, 100, "paid", "test@example.com", SECRET, validity_days=-9)
-    _, err = validate_token(hard_expired, SECRET)
-    check("Hard expired token rejected", err == "token_expired")
-
-    # --- Wrong secret ---
-    print("\n[4] Secret validation")
-    wrong = secrets.token_bytes(32)
-    _, err = validate_token(token, wrong)
-    check("Wrong secret rejected", err == "invalid_signature")
-
-    almost_right = bytearray(SECRET)
-    almost_right[0] ^= 1
-    _, err = validate_token(token, bytes(almost_right))
-    check("One-bit-flipped secret rejected", err == "invalid_signature")
-
-    # --- Malformed tokens ---
-    print("\n[5] Malformed input handling")
-    _, err = validate_token("notbase64!!!", SECRET)
-    check("Garbage input rejected", err is not None)
-    _, err = validate_token("", SECRET)
-    check("Empty token rejected", err is not None)
-    _, err = validate_token(base64.urlsafe_b64encode(b"{}").decode(), SECRET)
-    check("Empty JSON rejected", err is not None)
-
-    # --- Local caching ---
-    print("\n[6] Local licence caching")
-    import tempfile, os
-    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
-        test_db = f.name
-    try:
-        data_valid, _ = validate_token(token, SECRET)
-        save_licence_locally(test_db, token, data_valid)
-        cached = load_licence_locally(test_db)
-        check("Licence saved and retrieved", cached is not None)
-        check("Cached key matches", cached and cached[1].get("key") == TEST_KEY)
-        check("Cached devices match", cached and cached[1].get("devices") == 10000)
-    finally:
-        os.unlink(test_db)
-
-    # --- Performance ---
-    print("\n[7] Performance")
-    import timeit
-    gen_time = timeit.timeit(
-        lambda: generate_token(TEST_KEY, 10000, "paid", "test@example.com", SECRET),
-        number=1000
-    )
-    val_time = timeit.timeit(
-        lambda: validate_token(token, SECRET),
-        number=1000
-    )
-    check(f"Generation: {gen_time*1:.1f}ms avg per token", gen_time < 5)
-    check(f"Validation: {val_time*1:.1f}ms avg per validation", val_time < 5)
-
-    # --- Summary ---
-    print(f"\n{'='*60}")
-    print(f"Results: {PASSES} passed, {FAILURES} failed")
-    if FAILURES == 0:
-        print("ALL TESTS PASSED. System is production ready.")
-    else:
-        print("FAILURES DETECTED. Do not ship.")
-    sys.exit(0 if FAILURES == 0 else 1)
-
-```
-
-
-## `sebdog_reporter.py`
-
-217 lines, 8364 bytes
-
-```python
-"""
-SEBDOG DECISION REPORTER v1.0.0
-Generates readable reports from the sebdog audit chain.
-Shows exactly why each decision was made.
-Copyright (c) 2026 Justin Antony Dobson / Monop Content
-"""
-
-import sqlite3, json, time, os
-from datetime import datetime
-
-DB_FILE = "sebdog_audit.db"
-
-REASON_EXPLANATIONS = {
-    "velocity_spike": "User made more than 10 requests in 60 seconds",
-    "high_amount": "Transaction amount exceeded £500",
-    "risky_device": "Device risk score above 0.5",
-    "behaviour_anomaly": "Behavioural anomaly score above 0.5",
-    "country_shift": "Request came from a different country than usual",
-    "unsafe_country": "Request came from outside approved country list",
-    "low_trust": "User trust score has dropped below 0.4 due to previous decisions",
-}
-
-def get_decisions(db_path=DB_FILE, limit=100):
-    if not os.path.exists(db_path):
-        return []
-    conn = sqlite3.connect(db_path)
-    rows = conn.execute("""
-        SELECT ts, user_id, event_json, result_json, audit_hash
-        FROM audit_log
-        ORDER BY id DESC
-        LIMIT ?
-    """, (limit,)).fetchall()
-    conn.close()
-    results = []
-    for row in rows:
-        try:
-            event = json.loads(row[2])
-            result = json.loads(row[3])
-            results.append({
-                "ts": row[0],
-                "user_id": row[1],
-                "event": event,
-                "result": result,
-                "audit_hash": row[4]
-            })
-        except:
-            pass
-    return results
-
-def format_reason(reason):
-    return REASON_EXPLANATIONS.get(reason, reason.replace("_", " ").capitalize())
-
-def decision_color(decision):
-    return {"ALLOW": "#00875a", "CHALLENGE": "#b45309", "BLOCK": "#cc0000"}.get(decision, "#555")
-
-def generate_text_report(db_path=DB_FILE, limit=100):
-    decisions = get_decisions(db_path, limit)
-    if not decisions:
-        return "No decisions recorded yet."
-    
-    lines = [
-        "SEBDOG DECISION REPORT",
-        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        f"Total decisions shown: {len(decisions)}",
-        "=" * 60
-    ]
-    
-    for d in decisions:
-        result = d["result"]
-        event = d["event"]
-        ts = datetime.fromtimestamp(d["ts"]).strftime('%Y-%m-%d %H:%M:%S')
-        decision = result.get("decision", "?")
-        score = result.get("score", 0)
-        reasons = result.get("reasons", [])
-        
-        lines.append(f"\n[{ts}] User: {d['user_id']}")
-        lines.append(f"Action: {event.get('action','?')} | Country: {event.get('country','?')} | Amount: £{event.get('amount',0)}")
-        lines.append(f"Decision: {decision} | Score: {score} | Trust: {result.get('trust',0)}")
-        
-        if reasons:
-            lines.append("Reasons:")
-            for r in reasons:
-                lines.append(f"  - {format_reason(r)}")
-        else:
-            lines.append("Reasons: No risk factors detected")
-        
-        lines.append(f"Audit hash: {d['audit_hash'][:32]}...")
-        lines.append("-" * 60)
-    
-    return "\n".join(lines)
-
-def generate_json_report(db_path=DB_FILE, limit=100):
-    decisions = get_decisions(db_path, limit)
-    report = {
-        "generated": datetime.now().isoformat(),
-        "total": len(decisions),
-        "decisions": []
-    }
-    for d in decisions:
-        result = d["result"]
-        event = d["event"]
-        reasons = result.get("reasons", [])
-        report["decisions"].append({
-            "timestamp": datetime.fromtimestamp(d["ts"]).isoformat(),
-            "user_id": d["user_id"],
-            "action": event.get("action"),
-            "country": event.get("country"),
-            "amount": event.get("amount"),
-            "decision": result.get("decision"),
-            "score": result.get("score"),
-            "trust": result.get("trust"),
-            "reasons": reasons,
-            "reasons_explained": [format_reason(r) for r in reasons],
-            "audit_hash": d["audit_hash"]
-        })
-    return json.dumps(report, indent=2)
-
-def generate_html_report(db_path=DB_FILE, limit=100):
-    decisions = get_decisions(db_path, limit)
-    
-    rows = ""
-    for d in decisions:
-        result = d["result"]
-        event = d["event"]
-        ts = datetime.fromtimestamp(d["ts"]).strftime('%Y-%m-%d %H:%M:%S')
-        decision = result.get("decision", "?")
-        score = result.get("score", 0)
-        reasons = result.get("reasons", [])
-        color = decision_color(decision)
-        
-        reason_html = ""
-        if reasons:
-            reason_html = "<ul>" + "".join(f"<li>{format_reason(r)}</li>" for r in reasons) + "</ul>"
-        else:
-            reason_html = "<span style='color:#888'>No risk factors detected</span>"
-        
-        rows += f"""
-        <tr>
-            <td>{ts}</td>
-            <td><code>{d['user_id']}</code></td>
-            <td>{event.get('action','?')}</td>
-            <td>{event.get('country','?')}</td>
-            <td>£{event.get('amount',0)}</td>
-            <td><strong style="color:{color}">{decision}</strong></td>
-            <td>{score}</td>
-            <td>{result.get('trust',0)}</td>
-            <td>{reason_html}</td>
-            <td><code style="font-size:10px">{d['audit_hash'][:16]}...</code></td>
-        </tr>"""
-    
-    allow = sum(1 for d in decisions if d["result"].get("decision") == "ALLOW")
-    challenge = sum(1 for d in decisions if d["result"].get("decision") == "CHALLENGE")
-    block = sum(1 for d in decisions if d["result"].get("decision") == "BLOCK")
-    
-    html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Sebdog Decision Report</title>
-<style>
-body{{font-family:sans-serif;background:#f5f7fa;color:#1a202c;margin:0;padding:20px}}
-.header{{background:#0a0f1e;color:#fff;padding:24px 32px;border-radius:8px;margin-bottom:24px}}
-.header h1{{margin:0;font-size:24px;color:#c9a84c}}
-.header p{{margin:4px 0 0;color:rgba(255,255,255,0.5);font-size:13px}}
-.stats{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:24px}}
-.stat{{background:#fff;border-radius:8px;padding:16px;text-align:center;border:1px solid #e2e8f0}}
-.stat-n{{font-size:32px;font-weight:700}}
-.stat-l{{font-size:11px;color:#64748b;margin-top:4px}}
-.allow{{color:#00875a}}.challenge{{color:#b45309}}.block{{color:#cc0000}}
-table{{width:100%;border-collapse:collapse;background:#fff;border-radius:8px;overflow:hidden;border:1px solid #e2e8f0}}
-th{{background:#0a0f1e;color:#c9a84c;padding:10px 12px;text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:1px}}
-td{{padding:10px 12px;border-bottom:1px solid #e2e8f0;font-size:12px;vertical-align:top}}
-tr:last-child td{{border:none}}
-tr:hover td{{background:#f8fafc}}
-ul{{margin:4px 0;padding-left:16px}}
-li{{margin:2px 0;color:#64748b}}
-code{{background:#f1f5f9;padding:2px 4px;border-radius:3px;font-size:11px}}
-</style>
-</head>
-<body>
-<div class="header">
-  <h1>Sebdog Decision Report</h1>
-  <p>Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} &nbsp;|&nbsp; Showing last {len(decisions)} decisions &nbsp;|&nbsp; Powered by sebbi.pro</p>
-</div>
-<div class="stats">
-  <div class="stat"><div class="stat-n allow">{allow}</div><div class="stat-l">ALLOWED</div></div>
-  <div class="stat"><div class="stat-n challenge">{challenge}</div><div class="stat-l">CHALLENGED</div></div>
-  <div class="stat"><div class="stat-n block">{block}</div><div class="stat-l">BLOCKED</div></div>
-</div>
-<table>
-<thead><tr>
-  <th>Time</th><th>User</th><th>Action</th><th>Country</th><th>Amount</th>
-  <th>Decision</th><th>Score</th><th>Trust</th><th>Reasons</th><th>Audit Hash</th>
-</tr></thead>
-<tbody>{rows if rows else '<tr><td colspan="10" style="text-align:center;color:#888;padding:32px">No decisions recorded yet</td></tr>'}</tbody>
-</table>
-</body>
-</html>"""
-    return html
-
-if __name__ == "__main__":
-    import sys
-    fmt = sys.argv[1] if len(sys.argv) > 1 else "html"
-    db = sys.argv[2] if len(sys.argv) > 2 else DB_FILE
-    
-    if fmt == "text":
-        print(generate_text_report(db))
-    elif fmt == "json":
-        print(generate_json_report(db))
-    else:
-        report = generate_html_report(db)
-        out = "sebdog_report.html"
-        with open(out, "w") as f:
-            f.write(report)
-        print(f"Report saved to {out}")
-
-```
+- `README.md`
 
 
 ## `tests/attack_continuity_1.py`
@@ -2595,5 +2029,290 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+```
+
+
+## `README.md`
+
+277 lines, 15728 bytes
+
+```markdown
+<div align="center">
+
+```
+        ┌─────────────────────────────────────────────────┐
+        │   s e b b i . p r o                              │
+        │                                                  │
+        │   O N E   C H A I N .   E V E R Y   P R O O F .   │
+        └─────────────────────────────────────────────────┘
+```
+
+### The tamper-evident evidence layer for AI decisions, payments, and records.
+
+*Every event sealed into a hash chain at the moment it happens —*
+*the decision, **and the basis it rested on** — unalterable by anyone. Including us.*
+
+<br>
+
+[![live](https://img.shields.io/badge/live-sebbi.pro-c9a84c?style=for-the-badge)](https://sebbi.pro)
+[![verify the chain](https://img.shields.io/badge/verify_the_chain-open_endpoint-7fe3b0?style=for-the-badge)](https://sebbi.pro/api/verify-chain)
+[![seal something free](https://img.shields.io/badge/seal_something-free,_no_account-7cc8ff?style=for-the-badge)](https://sebbi.pro/seal)
+
+**[Try it](https://sebbi.pro/seal)** · **[Verify it](https://sebbi.pro/verify)** · **[Read the code](https://sebbi.pro/brain)** · **[Developer docs](https://sebbi.pro/developers)** · **[Whitepaper](https://sebbi.pro/whitepaper)**
+
+</div>
+
+---
+
+> ### *A system that does not trust its own creator*
+> ### *is the only kind whose records qualify as evidence.*
+
+---
+
+## Don't read about it. Watch it work.
+
+Here is a **real** four-block chain. Every hash below is reproducible — same inputs, same seals, forever. Copy the recipe at the bottom and compute them yourself.
+
+```
+  #   EVENT                             RESULT      SEAL (SHA-256, truncated)
+  ─────────────────────────────────────────────────────────────────────────
+  1   system_regmap                     ALLOW       411ffd9a31a3d9f4…
+  2   seal_post: quarterly_report.pdf   NOTARISED   c7309616a9e92bc7…
+  3   govern: payment 9000 GBP          BLOCK       293181a2bc2dab88…
+  4   brain: approve supplier 88        ALLOW       6abba40eb964959e…
+  ─────────────────────────────────────────────────────────────────────────
+  genesis  9fd06d6fdc19761d…                         tip  6abba40eb964959e…
+```
+
+Now watch someone try to cover up that blocked £9,000 payment by flipping block 3 from **BLOCK** to **ALLOW**:
+
+```
+  block 3 altered  →  tip becomes  5e15bc5710426088…   ❌  ≠ 6abba40eb964959e…
+```
+
+**The tip changed. The forgery is exposed instantly, by arithmetic, to anyone — no account, no trust required.** That is the entire product in six lines. Everything below is detail.
+
+<details>
+<summary><b>▸ Reproduce every hash yourself (10 lines of Python)</b></summary>
+
+```python
+import hashlib, json
+seal = lambda prev, ts, ev, res, basis: hashlib.sha256(
+    json.dumps({"prev":prev,"ts":ts,"event":ev,"result":res,"basis":basis},
+               sort_keys=True).encode()).hexdigest()
+
+prev = hashlib.sha256(b"AILEASH_BRAIN_GENESIS|sebbi.pro|v5").hexdigest()
+chain = [("system_regmap","ALLOW","regmap-v7"),
+         ("seal_post: quarterly_report.pdf","NOTARISED","NO_BASIS"),
+         ("govern: payment 9000 GBP","BLOCK","invoice_4471|regmap-v7"),
+         ("brain: approve supplier 88","ALLOW","invoice_4471|regmap-v7")]
+ts = 1752940000
+for ev,res,basis in chain:
+    prev = seal(prev, ts, ev, res, basis); ts += 3600
+    print(prev[:16], "…", ev)
+# final line prints the tip: 6abba40eb964959e …
+```
+Change one character of one event and every seal after it changes. That's the whole idea.
+</details>
+
+---
+
+## Why this exists
+
+Every system keeps logs. Logs live in databases. Databases can be edited — by an attacker, an insider, or the operator itself. So an ordinary log only ever says *"this is what we currently claim happened."* It can never say *"and nobody changed it since."*
+
+Nobody notices the difference — until a regulator, a court, an insurer, or a customer asks for **proof**. Then *"our system recorded it"* and *"here is proof it wasn't changed"* become two very different sentences. Only the second carries weight.
+
+**sebbi.pro produces the second sentence — automatically, as a by-product of your system doing its normal work.**
+
+---
+
+## The chain, in one formula
+
+```
+seal(n) = SHA-256( seal(n−1) · timestamp · event · result · basis )
+```
+
+| Property | What it means |
+|---|---|
+| **Tamper-evident** | Each seal contains its predecessor. Alter history → every later seal fails, publicly. |
+| **Gapless receipts** | Every decision gets a sequence number in the same transaction. Edited records break the chain; **missing** records break the sequence. |
+| **Truncation-evident** | The tip is anchored per-write. Chop blocks off the end → the anchor breaks. |
+| **Basis-sealed** | Not just *what* was decided — *what it rested on*: sources, versions, ruleset. Same block. |
+| **Jurisdiction-tagged** | Every decision sealed with the regulatory frameworks that applied to it at that moment. |
+| **Fast** | Score + decide + seal + respond inline, **~28 ms** median. |
+| **Crash-safe** | WAL journaling, full-sync commits, single-lock seal path, no race window, daily backups. |
+
+> **The one honest boundary, stated up front:** basis-sealing proves **what** a decision relied on — not that it was **correct**. Cryptography verifies integrity, never truth. Any product claiming to prove correctness is misdescribing what maths can do. We won't.
+
+---
+
+## The products — one chain underneath all of them
+
+| | Product | What it does | Access |
+|---|---|---|---|
+| 🧠 | **Brain** | Instruction gate for AI. Blocks prompt injection, exfiltration, compliance-bypass, child-safety and destruction patterns — with unicode/obfuscation defences — and seals every decision + basis. Pure Python, runs on your machine. | **Free download** |
+| ⚡ | **SonicBoom** | Decision engine. Any event scored in ~28ms: ALLOW / CHALLENGE / BLOCK, plain-English reasons, sealed before it replies. Per-user trust learned over time — lost 8× faster than earned, so burst attacks destroy their own standing. Hosted human-oversight challenge flow, itself sealed. | API key |
+| 🔐 | **Delegation layer** | Signed authority tokens (who may approve, to what limit, until when — the grant itself sealed), provider-agnostic KYC result sealing (outcome provable, zero personal data held), and per-decision jurisdiction tagging. Article 14 human oversight as engineering. | API key |
+| 🛡️ | **Sentinel** | Fraud pattern + velocity detection: credential stuffing, card testing, country-jump takeovers. Flags sealed as evidence. | API key |
+| 👁️ | **Guardian** | Child-safety flags: grooming patterns (secrecy, isolation, channel-moving). Content never stored — only fingerprints. Every flag sealed for parents, platforms, authorities. | Platform |
+| 📝 | **Post Notary** | Prove exact text existed on a date, unchanged. | **Free, no account** |
+| 🆔 | **Identity Notary** | Prove a profile is the genuine original — kills impersonation. | **Free, no account** |
+| 💷 | **Payment Notary** | Stop invoice/APP fraud. Seal real bank details once; payers verify a code before funds move. MISMATCH → payment stops. The check itself is sealed. | **Free, no account** |
+
+**Privacy by design:** the notaries fingerprint content *locally*. Your content never leaves your device — only the 64-character hash is sealed. The KYC sealer keeps only the SHA-256 of the provider reference — never the document.
+
+---
+
+## The open standard — `ai.txt`
+
+Like `robots.txt` for crawlers and `security.txt` for researchers — **`ai.txt`** is a public, machine-readable declaration of how your AI is governed: decision model, audit method, regulations designed toward, human override. Its companion **`comply.txt`** declares the rulebook every instruction is subject to.
+
+Declarations are claims. **Sealing them into the chain makes them provable** — and their history tamper-evident.
+
+```
+  declaration  →  rulebook  →  enforcement
+     ai.txt        comply.txt      brain.py
+     "we claim"    "the rules"     "the code that proves it"
+```
+
+Publish yours at `/.well-known/ai.txt`. Read [ours](https://sebbi.pro/.well-known/ai.txt).
+
+---
+
+## The stack — how it all fits
+
+```
+  DECLARATION    ai.txt · comply.txt     what we claim, publicly
+       │
+  GATE           Brain                   instructions checked before the AI acts
+       │
+  DELEGATION     authority · identity ·  who may act, who they legally are,
+                 jurisdiction            which rules governed the moment
+       │
+  DECISION       SonicBoom               every event: allow / challenge / block
+       │
+  DETECTION      Sentinel · Guardian     attack patterns · child-safety patterns
+       │
+  PUBLIC ACCESS  the Notaries            the same chain, free, for anyone
+       │
+       ▼
+  ╔══════════════════════════════════════════════════════════════════╗
+  ║  EVIDENCE     the hash chain                                      ║
+  ║               everything above seals into here —                 ║
+  ║               action + basis + receipt · gapless · anchored ·    ║
+  ║               publicly verifiable · unalterable by anyone        ║
+  ╚══════════════════════════════════════════════════════════════════╝
+```
+
+**Evidence accrues as a by-product of the system working.** Nobody remembers to log anything. Nobody compiles an audit file before an inspection. The proof exists because the system ran — equally trustworthy whether the operator is honest or not. Which is the only kind of trustworthy that counts.
+
+---
+
+## Integrate in minutes
+
+```python
+# ── Notary: seal anything, free, no key. Content stays on your machine. ──
+import hashlib, requests
+fp = hashlib.sha256(content.encode()).hexdigest()
+requests.post("https://sebbi.pro/api/post/seal", json={"fingerprint": fp})
+#   → { sealed, seal, block_index, code }   ← keep the code; anyone can verify it
+
+# ── Decision engine: score + seal an event (API key) ──
+requests.post("https://sebbi.pro/api/govern",
+  headers={"Authorization":"Bearer YOUR_KEY"},
+  json={"user_id":"u1","action":"payment","amount":9000,
+        "country":"UK","device_id":"d1","anomaly":0,"device_risk":0})
+#   → ALLOW / CHALLENGE / BLOCK · reasons · jurisdiction tag · sealed hash · receipt_seq
+
+# ── Delegated authority: grant sealed, enforcement deterministic ──
+tok = requests.post("https://sebbi.pro/api/authority/issue",
+  headers={"Authorization":"Bearer YOUR_KEY"},
+  json={"user_id":"u1","role":"payments_approver",
+        "max_amount":5000,"ttl_hours":24}).json()["authority_token"]
+#   include as "authority_token" in govern events — over-limit or expired
+#   authority escalates the verdict with the reason sealed
+
+# ── KYC result: outcome provable, zero personal data held ──
+requests.post("https://sebbi.pro/api/identity/kyc-seal",
+  headers={"Authorization":"Bearer YOUR_KEY"},
+  json={"user_id":"u1","provider":"onfido","verified":True,
+        "reference":"chk_9f2"})
+#   → only the SHA-256 of the reference is stored — never the document
+
+# ── Brain: gate an instruction and seal its basis (free, local) ──
+from brain import BrainGovernor
+BrainGovernor().evaluate("approve payment to supplier 88", basis={
+  "sources":["invoice_4471.pdf"], "source_versions":["sha256:ab12…"],
+  "ruleset":"AI-TXT/1.0 + EU-AI-Act-2024/1689", "ruleset_version":"regmap-v7"})
+```
+
+Full reference → **[sebbi.pro/developers](https://sebbi.pro/developers)**
+
+---
+
+## What this evidences — stated precisely
+
+A versioned, hash-sealed **regulation map** links each capability to the obligations it helps evidence: EU AI Act record-keeping, transparency & human-oversight (Articles 9, 12, 13, 14 — delegated-authority tokens directly supporting Article 14's attributable human oversight), UK Online Safety Act duty-of-care documentation, ICO Children's Code. Jurisdiction tagging extends this to the per-decision level: every sealed block records which frameworks applied at the moment of decision.
+
+These tools help you **evidence** your obligations — tamper-evident, explainable, independently verifiable records of what your systems decided and why. **They do not, on their own, make you compliant. No software does. Anyone who says otherwise is selling you something.**
+
+---
+
+## Honest limits — because the whole product is honesty
+
+- **Sealing proves integrity, not truth** — exact content, exact time, unchanged. Not that it was true or agreed to.
+- **Basis-sealing proves what was relied on, not that it was right** — cryptography can't verify the real world.
+- **Authority tokens prove the grant, not the wisdom** — who was empowered, to what limit, until when. Not that granting it was a good idea.
+- **Jurisdiction tagging records applicable frameworks; it does not decide law** — courts do that. It is a versioned, sealed lookup — nothing grander, deliberately.
+- **Brain's filter is a first line, not a wall** — known patterns caught; novel phrasing can pass. The guarantee is the sealed record.
+- **Fingerprints match exact content** — a re-encoded copy or paraphrase won't match.
+- **We evidence compliance; we don't confer it.**
+
+*A vendor who states their limits is giving you the strongest available evidence of how they'll behave when it matters.*
+
+---
+
+## Deployment & pricing
+
+- **Cloud** — a few lines against the hosted API. Notaries and Brain free forever.
+- **Sovereign** — the whole engine inside your own network. Offline HMAC-signed 365-day licences, no phone-home, air-gap ready.
+- **50p per active device / month.** Partners set their own pricing above the platform fee.
+
+## Investors
+
+The whitepaper carries a dedicated investor section — market timing (EU AI Act, August 2026), the metered per-device model, the moat, and the stage stated honestly: **[sebbi.pro/whitepaper](https://sebbi.pro/whitepaper)** · justin@monopcontent.com
+
+---
+
+<div align="center">
+
+## Check us. Don't trust us.
+
+*That's not a slogan. It's the design requirement — and the only standard by which an evidence layer should ever be judged.*
+
+**[Verify the chain now →](https://sebbi.pro/api/verify-chain)**
+
+<br>
+
+```
+  Built by Justin Dobson · Monop Content · Blyth, Northumberland, UK
+  Solo-built, from scratch, on a phone —
+  because the evidence layer wasn't going to build itself.
+```
+
+[LinkedIn](https://www.linkedin.com/in/justin-dobson-037721217) · [sebbi.pro](https://sebbi.pro)
+
+</div>
+
+<!--
+Keywords: tamper-evident audit trail · AI governance · AI compliance evidence ·
+EU AI Act record keeping · hash chain audit log · APP fraud prevention ·
+invoice verification · prompt injection defence · AI decision audit ·
+delegated authority tokens · KYC evidence sealing · jurisdiction tagging ·
+ai.txt standard · comply.txt · cryptographic proof of action · immutable audit log ·
+agentic AI governance · sovereign AI deployment · SonicBoom · Brain · Sentinel · Guardian
+-->
 
 ```

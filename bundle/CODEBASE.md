@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-95 files across 20 parts.
+94 files across 20 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -53,30 +53,29 @@ Generated automatically on every push. Do not edit by hand.
 
 - `modules/standard.py`
 - `modules/stats.py`
-- `modules/verifier.py`
 - `modules/witness.py`
 - `Verify_ai.py`
 - `ai_act_ranker.py`
 - `ai_safety_scanner.py`
 - `aigrade_insert.py`
 - `aileash_reporter.py`
-
-## [CODEBASE-09.md](CODEBASE-09.md)
-
 - `aileash_verify.py`
 - `anchor.py`
 - `board_auditor.py`
+
+## [CODEBASE-09.md](CODEBASE-09.md)
+
 - `brain.py`
 - `broadcaster.py`
 - `build_sebbi_ecosystem.py`
 - `gateway_proxy.py`
 - `sebbi_orchestrator.py`
 - `sebdog_engine.py`
+- `sebdog_licence.py`
+- `sebdog_reporter.py`
 
 ## [CODEBASE-10.md](CODEBASE-10.md)
 
-- `sebdog_licence.py`
-- `sebdog_reporter.py`
 - `tests/attack_continuity_1.py`
 - `tests/attack_continuity_2.py`
 - `tests/attack_continuity_3.py`
@@ -86,10 +85,10 @@ Generated automatically on every push. Do not edit by hand.
 - `verify_authority.py`
 - `AILeash-API-Reference-v6.4.2.md`
 - `LICENCE`
+- `README.md`
 
 ## [CODEBASE-11.md](CODEBASE-11.md)
 
-- `README.md`
 - `admin.html`
 - `ai-standard.html`
 - `ai-txt-kit.html`
