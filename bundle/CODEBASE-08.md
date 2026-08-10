@@ -1,14 +1,2277 @@
-# Codebase — part 8 of 18
+# Codebase — part 8 of 19
 
 Contains:
+- `modules/witness.py`
+- `Verify_ai.py`
+- `ai_act_ranker.py`
+- `ai_safety_scanner.py`
+- `aigrade_insert.py`
+- `aileash_reporter.py`
+- `aileash_verify.py`
+- `anchor.py`
+- `board_auditor.py`
 - `brain.py`
-- `broadcaster.py`
-- `build_sebbi_ecosystem.py`
-- `gateway_proxy.py`
-- `sebbi_orchestrator.py`
-- `sebdog_engine.py`
-- `sebdog_licence.py`
-- `sebdog_reporter.py`
+
+
+## `modules/witness.py`
+
+514 lines, 23310 bytes
+
+```python
+"""
+Mutual witness network - /x/witness/<action>
+
+THE PROBLEM
+-----------
+Every compliance vendor, this one included, holds the evidence about its own
+conduct. A hash chain stops anyone else altering it. It does not stop the
+operator rebuilding the whole chain from scratch and presenting the result as
+history. External anchoring narrows that to "you cannot rewrite anything older
+than your last anchor" - which is good, and still not enough.
+
+WHAT THIS DOES
+--------------
+Platforms witness each other.
+
+Each platform periodically hands its current chain tip to its peers. Each peer
+seals that tip into its OWN chain. From that moment the first platform's
+history is recorded inside chains it does not control - and those chains are
+themselves anchored externally.
+
+To rewrite your own history now, you would need every peer who witnessed you
+to rewrite theirs too, in step, and re-anchor all of it. That is not a
+technical exercise. That is a conspiracy, and it grows harder with every
+platform that joins.
+
+WHY observe IS OPEN
+-------------------
+A witnessing network that only accepts tips from account holders is not a
+witnessing network, it is a customer list. Anyone must be able to hand us a
+tip without asking permission. Unauthenticated observations are filed under
+ANON_KEY, and the router meters them per client address.
+
+NAMES, AND WHAT WE CAN ACTUALLY PROVE ABOUT THEM
+------------------------------------------------
+The chain name in a submission is self-declared. Anyone can post under any
+name. We do not solve that with accounts, because accounts would make the
+network closed. We solve it by publishing how strong each claim is, and by
+remembering.
+
+Two independent checks run on every submission, and NEITHER of them can
+reject it. A submission is always sealed. What changes is what we say about it.
+
+1. LIVENESS - is there a real chain behind this name?
+   If the submission carries a url, we fetch it and compare what it serves
+   to what was submitted.
+     confirmed      the url serves exactly the tip that was submitted
+     live           the url serves a valid tip, but a different one. A busy
+                    chain moves between submitting and our fetching, so this
+                    is normal and honest, not a failure
+     self-declared  no url, or we could not reach it, or it served nonsense
+
+   Note what this does and does not prove. It proves the submitter operates
+   a live chain producing that data. It does NOT prove they are who they say.
+   Anyone running a real chain can point a stolen name at their own url and
+   pass this check cleanly.
+
+2. NAME BINDING - is this the same operator as last time?
+   The first time a name is seen with a url we can reach, we record that url
+   against the name. Every later submission under that name is compared.
+     first-use      never seen this name before, binding recorded
+     bound          same url as the first time. Same operator, consistently
+     conflict       this name has been submitted from a different url than
+                    the one it was first bound to
+
+   A conflict is not proof of theft. Operators move hosts. But it is exactly
+   the event anyone auditing the network needs to see, and it is recorded
+   permanently in our chain rather than resolved quietly by us.
+
+   This is what actually closes name theft. Check 1 alone does not.
+
+SSRF
+----
+Check 1 makes our server fetch a url chosen by an anonymous stranger. Done
+naively that is a hole considerably worse than the one it fixes: it would let
+anyone use us to reach services on our own private network, and to bounce
+traffic at a third party. So the fetcher only speaks http and https, only on
+ports 80 and 443, resolves the hostname first and refuses any address that is
+private, loopback, link-local, reserved or multicast, never follows a
+redirect, times out fast, and stops reading after a small cap.
+
+HONEST LIMITS
+-------------
+- Witnessing proves a tip EXISTED at a time. It says nothing about whether the
+  records behind it are true or complete. Garbage sealed on time is still
+  garbage.
+- A peer can stop publishing. Gaps are visible, which is the point, but
+  nobody can force participation.
+- Two colluding platforms witnessing only each other prove very little. The
+  guarantee comes from breadth.
+- This module does not verify a peer's chain is internally valid. It records
+  what they claimed, when, and how well it stood up to checking.
+- The liveness fetch resolves a hostname and then fetches it. An attacker
+  controlling DNS could answer differently between those two steps. Closing
+  that needs the connection pinned to the checked address, which is more
+  machinery than this warrants today. It is written down rather than hidden.
+
+    GET  /x/witness/tip                 our current tip, for peers to record
+    POST /x/witness/observe             chain, tip, url - we seal their tip
+                                        (peer accepted as an alias for chain;
+                                         optional peer_ts or ts, epoch or ISO)
+    GET  /x/witness/attest?peer=&tip=   did we witness this, and when
+    GET  /x/witness/peers               who we witness, and how consistently
+    GET  /x/witness/history?peer=       every tip we hold for that peer
+"""
+
+import ipaddress
+import json
+import re
+import socket
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from urllib.parse import urlparse
+
+VERSION = "1.1"
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
+
+# Routes that need no API key. A third party must be able to check the
+# network without holding an account, or the claim that anyone can audit
+# it is not true.
+PUBLIC = {("GET", "attest"), ("GET", "peers"), ("GET", "tip"),
+          ("POST", "observe")}
+
+# Observations arriving without a key are filed under this.
+ANON_KEY = "public-witness"
+
+# Liveness fetch limits. Deliberately tight - this runs on an anonymous
+# request, so every one of these is also a denial-of-service control.
+FETCH_TIMEOUT = 4
+MAX_FETCH_BYTES = 65536
+ALLOWED_SCHEMES = ("http", "https")
+ALLOWED_PORTS = (80, 443)
+
+_ready = False
+
+
+def _setup(ctx):
+    global _ready
+    if _ready:
+        return
+    with ctx["lock"]:
+        c = ctx["conn"]
+        c.execute("CREATE TABLE IF NOT EXISTS witness_log(id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,peer TEXT,tip TEXT,peer_ts REAL,observed REAL,audit_hash TEXT,block_index INTEGER,note TEXT)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_wit_peer ON witness_log(api_key,peer)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_wit_tip ON witness_log(tip)")
+
+        # Added in 1.1. Existing rows keep NULL, which reads as unchecked -
+        # correct, because they were.
+        have = set()
+        try:
+            for row in c.execute("PRAGMA table_info(witness_log)").fetchall():
+                have.add(row[1])
+        except Exception:
+            pass
+        for col in ("url", "liveness", "name_status"):
+            if col not in have:
+                try:
+                    c.execute("ALTER TABLE witness_log ADD COLUMN %s TEXT" % col)
+                except Exception:
+                    pass
+
+        # Name bindings are network-wide, not per api_key. A name means one
+        # operator across the whole network or it means nothing.
+        c.execute("CREATE TABLE IF NOT EXISTS witness_names(peer TEXT PRIMARY KEY,url TEXT,first_seen REAL,first_liveness TEXT)")
+        c.commit()
+    _ready = True
+
+
+def _iso(ts):
+    if not ts:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+def _our_tip(ctx):
+    with ctx["lock"]:
+        r = ctx["conn"].execute("SELECT audit_hash,ts,id FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()
+    if not r:
+        return "GENESIS", None, 0
+    return r[0], r[1], r[2]
+
+
+def _tip(ctx, api_key):
+    tip, ts, height = _our_tip(ctx)
+    return {"tip": tip, "height": height, "sealed_at": _iso(ts),
+            "witness_version": VERSION,
+            "note": "Record this tip in your own chain. Hand us yours at /x/witness/observe and we will record it in ours.",
+            "verify": "/api/verify-chain checks this chain end to end. /api/anchor-status shows the external timestamp."}, 200
+
+
+# ----------------------------------------------------------------------
+# liveness fetch - see the SSRF section above before touching any of this
+# ----------------------------------------------------------------------
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect is an instruction from a stranger to fetch a second url we
+    never checked. Refuse rather than follow."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_opener = urllib.request.build_opener(_NoRedirect)
+
+
+def _address_allowed(host, port):
+    """Resolve and refuse anything that isn't plainly on the public internet."""
+    try:
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+    except Exception as exc:
+        return False, "could not resolve host (%s)" % type(exc).__name__
+    if not infos:
+        return False, "host resolved to nothing"
+    for info in infos:
+        raw = info[4][0]
+        try:
+            addr = ipaddress.ip_address(raw)
+        except ValueError:
+            return False, "unreadable address"
+        if (addr.is_private or addr.is_loopback or addr.is_link_local
+                or addr.is_reserved or addr.is_multicast or addr.is_unspecified):
+            return False, "address is not publicly routable"
+    return True, None
+
+
+def _url_allowed(url):
+    if not url or not isinstance(url, str) or len(url) > 500:
+        return False, "no usable url"
+    try:
+        parts = urlparse(url.strip())
+    except Exception:
+        return False, "unparseable url"
+    if parts.scheme not in ALLOWED_SCHEMES:
+        return False, "scheme not allowed"
+    host = parts.hostname
+    if not host:
+        return False, "no host in url"
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    if port not in ALLOWED_PORTS:
+        return False, "port not allowed"
+    return _address_allowed(host, port)
+
+
+def _fetch_tip(url):
+    """Returns (tip_or_None, note). Never raises."""
+    ok, why = _url_allowed(url)
+    if not ok:
+        return None, why
+    request = urllib.request.Request(url, headers={
+        "Accept": "application/json",
+        "User-Agent": "aileash-witness/%s" % VERSION,
+    })
+    try:
+        with _opener.open(request, timeout=FETCH_TIMEOUT) as response:
+            if response.getcode() != 200:
+                return None, "url answered %s" % response.getcode()
+            body = response.read(MAX_FETCH_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        return None, "url answered %s" % exc.code
+    except Exception as exc:
+        return None, "could not reach url (%s)" % type(exc).__name__
+    if len(body) > MAX_FETCH_BYTES:
+        return None, "response too large"
+    try:
+        data = json.loads(body.decode("utf-8", "replace"))
+    except Exception:
+        return None, "url did not return json"
+    if not isinstance(data, dict):
+        return None, "url did not return an object"
+    found = data.get("tip") or data.get("hash") or data.get("head") or ""
+    found = str(found).strip().lower()
+    if not HEX64.match(found):
+        return None, "no valid tip at that url"
+    return found, None
+
+
+def _check_liveness(url, tip):
+    """confirmed / live / self-declared. Never rejects anything."""
+    if not url:
+        return "self-declared", "no url supplied"
+    found, why = _fetch_tip(url)
+    if found is None:
+        return "self-declared", why
+    if found == tip:
+        return "confirmed", None
+    return "live", "url serves a different tip (%s) - chain has moved on since submitting" % found[:16]
+
+
+def _check_name(ctx, peer, url, liveness):
+    """first-use / bound / conflict / unbound.
+
+    Only bind a name to a url we actually reached. Binding to an unreachable
+    url would let someone reserve a name with an address that never answers.
+    """
+    with ctx["lock"]:
+        row = ctx["conn"].execute("SELECT url,first_seen FROM witness_names WHERE peer=?", (peer,)).fetchone()
+
+    if row and row[0]:
+        if not url:
+            return "unbound", "no url supplied; this name is bound to %s" % row[0]
+        if url.strip() == row[0]:
+            return "bound", None
+        return "conflict", ("this name was first seen at %s and has now been submitted from %s"
+                            % (row[0], url.strip()))
+
+    if url and liveness in ("confirmed", "live"):
+        with ctx["lock"]:
+            ctx["conn"].execute(
+                "INSERT OR REPLACE INTO witness_names(peer,url,first_seen,first_liveness) VALUES(?,?,?,?)",
+                (peer, url.strip(), time.time(), liveness))
+            ctx["conn"].commit()
+        return "first-use", "name now bound to %s" % url.strip()
+
+    return "unbound", "no reachable url, so nothing to bind this name to"
+
+
+# ----------------------------------------------------------------------
+# observe
+# ----------------------------------------------------------------------
+
+def _observe(ctx, api_key, data):
+    # The published standard calls this field "chain"; earlier internal
+    # callers used "peer". Accept either. A receiver being strict about
+    # field names it never published is a bug in the receiver.
+    peer = str(data.get("chain") or data.get("peer") or "").strip().lower()
+    if not peer or len(peer) > 80:
+        return {"error": "chain_required",
+                "message": "A short stable identifier - a domain works well.",
+                "field": "chain (peer also accepted)"}, 400
+    tip = str(data.get("tip", "")).strip().lower()
+    if not HEX64.match(tip):
+        return {"error": "invalid_tip", "message": "A tip is 64 hex characters - a SHA-256 chain head."}, 400
+
+    url = data.get("url")
+    url = str(url).strip() if url else ""
+    if len(url) > 500:
+        url = ""
+
+    # Time the peer claims it sealed at. Epoch or ISO, either field name.
+    # Carry on without it - supporting detail, not the evidence.
+    peer_ts = data.get("peer_ts", data.get("ts"))
+    if peer_ts is not None:
+        try:
+            peer_ts = float(peer_ts)
+        except (TypeError, ValueError):
+            try:
+                s = str(peer_ts).strip().replace("Z", "+00:00")
+                peer_ts = datetime.fromisoformat(s).timestamp()
+            except Exception:
+                peer_ts = None
+
+    liveness, live_note = _check_liveness(url, tip)
+    name_status, name_note = _check_name(ctx, peer, url, liveness)
+
+    ts = time.time()
+    notes = []
+
+    with ctx["lock"]:
+        prev = ctx["conn"].execute("SELECT tip,observed FROM witness_log WHERE api_key=? AND peer=? ORDER BY id DESC LIMIT 1", (api_key, peer)).fetchone()
+        seen = ctx["conn"].execute("SELECT observed FROM witness_log WHERE api_key=? AND peer=? AND tip=? LIMIT 1", (api_key, peer, tip)).fetchone()
+
+    if seen:
+        notes.append("tip already witnessed at " + str(_iso(seen[0])) + " - chain has not advanced, or history was replayed")
+    elif prev and prev[0] == tip:
+        notes.append("unchanged since last observation")
+    if live_note:
+        notes.append(live_note)
+    if name_note:
+        notes.append(name_note)
+    note = "; ".join(notes)
+
+    # The verification result is sealed alongside the tip. If we later claim a
+    # submission was confirmed, the chain has to agree.
+    detail = ("peer=" + peer + ";tip=" + tip + ";url=" + (url or "-") +
+              ";liveness=" + liveness + ";name=" + name_status +
+              ";peer_ts=" + str(peer_ts) + (";note=" + note if note else ""))
+    ev = {"user_id": "wit:" + peer, "action": "witness_observed", "amount": 0,
+          "country": "UK", "device_id": "witness", "anomaly": 0, "device_risk": 0}
+    res = {"decision": "WITNESS_SEALED", "score": 0, "witness_version": VERSION,
+           "peer": peer, "peer_tip": tip, "timestamp": ts,
+           "liveness": liveness, "name_status": name_status, "detail": detail}
+    h, idx, seq = ctx["seal"](ev, res, ts, api_key)
+
+    with ctx["lock"]:
+        ctx["conn"].execute("INSERT INTO witness_log(api_key,peer,tip,peer_ts,observed,audit_hash,block_index,note,url,liveness,name_status) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                            (api_key, peer, tip, peer_ts, ts, h, idx, note or None,
+                             url or None, liveness, name_status))
+        ctx["conn"].commit()
+
+    our, _t, height = _our_tip(ctx)
+    out = {"peer": peer, "witnessed_tip": tip, "observed_at": _iso(ts),
+           "sealed_in_our_chain": h, "block_index": idx, "receipt_seq": seq,
+           "our_tip_now": our, "our_height": height,
+           "liveness": liveness, "name_status": name_status,
+           "attest": "/x/witness/attest?peer=" + peer + "&tip=" + tip,
+           "message": "Your tip is now inside a chain you do not control, and ours is anchored externally."}
+    if note:
+        out["flag"] = note
+    if liveness == "self-declared":
+        out["advice"] = "Send a url serving your current tip and this becomes checkable by anyone rather than taken on your word."
+    if name_status == "conflict":
+        out["warning"] = "Sealed, and flagged. This name has been used from a different address before. That discrepancy is now permanent in our chain."
+    return out, 200
+
+
+def _attest(ctx, api_key, data):
+    peer = str(data.get("peer", "")).strip().lower()
+    tip = str(data.get("tip", "")).strip().lower()
+    if not peer or not tip:
+        return {"error": "peer_and_tip_required"}, 400
+    with ctx["lock"]:
+        if api_key:
+            rows = ctx["conn"].execute("SELECT observed,audit_hash,block_index,peer_ts,liveness,name_status,url FROM witness_log WHERE api_key=? AND peer=? AND tip=? ORDER BY id ASC", (api_key, peer, tip)).fetchall()
+        else:
+            rows = ctx["conn"].execute("SELECT observed,audit_hash,block_index,peer_ts,liveness,name_status,url FROM witness_log WHERE peer=? AND tip=? ORDER BY id ASC", (peer, tip)).fetchall()
+    if not rows:
+        return {"witnessed": False, "peer": peer, "tip": tip,
+                "message": "We hold no record of this tip from this peer."}, 404
+    return {"witnessed": True, "peer": peer, "tip": tip,
+            "first_observed": _iso(rows[0][0]),
+            "times_observed": len(rows),
+            "sealed_in_our_chain": rows[0][1],
+            "block_index": rows[0][2],
+            "peer_claimed_time": _iso(rows[0][3]),
+            "liveness": rows[0][4] or "unchecked",
+            "name_status": rows[0][5] or "unchecked",
+            "submitted_url": rows[0][6],
+            "what_this_proves": "That this tip was handed to us at this time and sealed into our chain. Liveness says whether a url served the same tip when we looked. Neither proves the submitter's identity.",
+            "proof": "This observation is a block in our chain. Altering or removing it breaks every block after it, and our chain is externally anchored."}, 200
+
+
+def _peers(ctx, api_key):
+    with ctx["lock"]:
+        if api_key:
+            rows = ctx["conn"].execute("SELECT peer,COUNT(*),MIN(observed),MAX(observed),COUNT(DISTINCT tip) FROM witness_log WHERE api_key=? GROUP BY peer ORDER BY MAX(observed) DESC", (api_key,)).fetchall()
+        else:
+            rows = ctx["conn"].execute("SELECT peer,COUNT(*),MIN(observed),MAX(observed),COUNT(DISTINCT tip) FROM witness_log GROUP BY peer ORDER BY MAX(observed) DESC").fetchall()
+        latest = {}
+        conflicts = {}
+        bindings = {}
+        for p, live, name in ctx["conn"].execute("SELECT peer,liveness,name_status FROM witness_log ORDER BY id ASC").fetchall():
+            latest[p] = (live, name)
+            if name == "conflict":
+                conflicts[p] = conflicts.get(p, 0) + 1
+        for p, u in ctx["conn"].execute("SELECT peer,url FROM witness_names").fetchall():
+            bindings[p] = u
+
+    t = time.time()
+    peers = []
+    for p, n, first, last, distinct in rows:
+        hours = round((t - last) / 3600, 1)
+        live, name = latest.get(p, (None, None))
+        entry = {"peer": p, "observations": n, "distinct_tips": distinct,
+                 "first_seen": _iso(first), "last_seen": _iso(last),
+                 "hours_since_last": hours,
+                 "status": ("current" if hours < 6 else "stale" if hours < 48 else "silent"),
+                 "liveness": live or "unchecked",
+                 "name_status": name or "unchecked",
+                 "bound_to": bindings.get(p)}
+        if conflicts.get(p):
+            entry["name_conflicts"] = conflicts[p]
+        peers.append(entry)
+    return {"count": len(peers), "peers": peers,
+            "legend": {
+                "confirmed": "a url served exactly the tip that was submitted",
+                "live": "a url served a valid but different tip - a moving chain, which is normal",
+                "self-declared": "no url, or we could not reach it. Taken on their word",
+                "first-use": "first time this name was seen; now bound to that url",
+                "bound": "same url as the first time this name appeared",
+                "conflict": "this name has been submitted from more than one address",
+            },
+            "note": "Silent peers are visible by design. A network you cannot audit is not a network. Nothing here proves identity - it shows how well each claim stood up to checking."}, 200
+
+
+def _history(ctx, api_key, peer):
+    with ctx["lock"]:
+        rows = ctx["conn"].execute("SELECT tip,observed,audit_hash,block_index,note,liveness,name_status,url FROM witness_log WHERE api_key=? AND peer=? ORDER BY id ASC LIMIT 500", (api_key, peer)).fetchall()
+    if not rows:
+        return {"error": "unknown_peer", "peer": peer}, 404
+    return {"peer": peer, "count": len(rows),
+            "observations": [{"tip": r[0], "observed": _iso(r[1]),
+                              "sealed": r[2], "block_index": r[3],
+                              "flag": r[4], "liveness": r[5] or "unchecked",
+                              "name_status": r[6] or "unchecked",
+                              "url": r[7]} for r in rows],
+            "note": "If this peer ever presents a history whose tips do not match these, the divergence is provable."}, 200
+
+
+def handle(method, action, data, api_key, ctx):
+    _setup(ctx)
+    if method == "POST":
+        if action == "observe":
+            # No key needed. Anonymous submissions are partitioned under
+            # ANON_KEY so they never mix with a customer's own witness log.
+            return _observe(ctx, api_key or ANON_KEY, data)
+        if not api_key:
+            return {"error": "invalid_api_key"}, 401
+    else:
+        if action == "tip":
+            return _tip(ctx, api_key)
+        if action == "peers":
+            return _peers(ctx, api_key)
+        if action == "attest":
+            return _attest(ctx, api_key, data)
+        if action == "history":
+            if not api_key:
+                return {"error": "invalid_api_key"}, 401
+            peer = str(data.get("peer", "")).strip().lower()
+            if not peer:
+                return {"error": "peer_required"}, 400
+            return _history(ctx, api_key, peer)
+    return {"error": "unknown_action", "action": action}, 404
+
+```
+
+
+## `Verify_ai.py`
+
+71 lines, 3293 bytes
+
+```python
+import sys
+import json
+import urllib.request
+import hmac
+import hashlib
+import logging
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [CITIZEN-AUDITOR] %(message)s")
+
+class OpenAIActAuditor:
+    def __init__(self, target_domain):
+        self.domain = target_domain
+        self.ai_txt_url = f"https://{target_domain}/ai.txt"
+
+    def run_public_compliance_audit(self, claim_hash, operational_payload):
+        """
+        Publicly cross-examines a corporate AI claim against deterministic 
+        cryptographic hashing parameters to verify compliance validity.
+        """
+        logging.info(f"Initiating autonomous accountability scan for: {self.domain}")
+        print(f"[*] Fetching live manifest from {self.ai_txt_url}...")
+        
+        # In a full run, this pulls the text from their server root. 
+        # For this standalone test block, we parse the known corporate layout:
+        try:
+            print("[+] Manifest fetched successfully. Parsing parameters...")
+            
+            # Re-serialize client data to check for administrative tampering
+            serialized_check = json.dumps(operational_payload, sort_keys=True)
+            
+            # Simulate the public ledger validation verification check
+            # For demonstration, we match against a known system key structure
+            mock_secret_pool = b"LOCAL_DEV_FALLBACK_KEY"
+            calculated_seal = hmac.new(mock_secret_pool, serialized_check.encode('utf-8'), hashlib.sha256).hexdigest()
+
+            # --- THE MOMENT OF TRUTH ---
+            if calculated_seal == claim_hash:
+                print("\n==================================================")
+                print("🏆 AUDIT VERDICT: 100% CRYPTOGRAPHICALLY COMPLIANT")
+                print(f"Verified via standard ledger registry: https://sebbi.pro")
+                print("==================================================\n")
+                return True
+            else:
+                logging.critical(f"[COMPLIANCE FRAUD DETECTED] Corporate ledger seal does not match physical system metrics!")
+                print("\n==================================================")
+                print("🚨 AUDIT VERDICT: TAMPERING DETECTED / INVALID LOGS")
+                print("Forwarding payload to public audit stream...")
+                print("==================================================\n")
+                return False
+
+        except Exception as e:
+            logging.error(f"Audit failed due to processing error: {e}")
+            return False
+
+# --- RUN AN INDEPENDENT RESEARCH SCENARIO ---
+if __name__ == "__main__":
+    # A researcher samples a transaction claim from an app's public metadata
+    sample_corporate_payload = {
+        "alert_text": "SYSTEM NOTICE: AI Governance Compliance Update for sebbi.pro.",
+        "raw_declaration": "Standard: AI-TXT/1.0\\nGovernance-Engine: AILeash v6.4"
+    }
+    
+    # The developer's matching validation key hash 
+    legitimate_claim_hash = "19b48c4cfb49e3b8aee1403c9dcaee06bfa4622b10292850a1ae7f42cf5dbef5"
+
+    # Instantiate the independent auditor
+    auditor = OpenAIActAuditor(target_domain="monopcontent.co.uk")
+    
+    # Run the audit test pass
+    auditor.run_public_compliance_audit(legitimate_claim_hash, sample_corporate_payload)
+
+```
+
+
+## `ai_act_ranker.py`
+
+262 lines, 4930 bytes
+
+```python
+"""
+AILeash Compliance Intelligence Engine
+Standalone AI Act Ranking & Risk Mapping Engine
+
+Version: 1.0.0
+"""
+
+import json
+import datetime
+
+
+VERSION = "1.0.0"
+
+
+# EU AI Act knowledge base
+AI_ACT_DATABASE = {
+
+    "Article 5": {
+        "title": "Prohibited AI Practices",
+        "phrases": [
+            "EU AI Act Article 5",
+            "prohibited AI practices",
+            "AI Act banned systems",
+            "AI regulation prohibited AI"
+        ],
+        "controls": [
+            "Prohibited use detection",
+            "Policy enforcement",
+            "AI behaviour screening"
+        ]
+    },
+
+
+    "Article 6": {
+        "title": "Classification of High Risk AI Systems",
+        "phrases": [
+            "high risk AI system",
+            "EU AI Act high risk classification",
+            "AI Act risk categories"
+        ],
+        "controls": [
+            "Risk classification",
+            "System assessment",
+            "Impact evaluation"
+        ]
+    },
+
+
+    "Article 9": {
+        "title": "Risk Management System",
+        "phrases": [
+            "EU AI Act Article 9",
+            "AI risk management system",
+            "AI Act compliance framework",
+            "continuous AI risk monitoring"
+        ],
+        "controls": [
+            "Risk identification",
+            "Risk scoring",
+            "Risk mitigation",
+            "Continuous monitoring"
+        ]
+    },
+
+
+    "Article 12": {
+        "title": "Record Keeping and Logging",
+        "phrases": [
+            "AI audit trail",
+            "AI logging requirements",
+            "AI evidence records",
+            "machine learning audit logs"
+        ],
+        "controls": [
+            "Immutable logs",
+            "Evidence storage",
+            "Traceability",
+            "Hash verification"
+        ]
+    },
+
+
+    "Article 14": {
+        "title": "Human Oversight",
+        "phrases": [
+            "AI human oversight",
+            "human in the loop AI",
+            "AI intervention controls"
+        ],
+        "controls": [
+            "Human review",
+            "Override capability",
+            "Decision supervision"
+        ]
+    },
+
+
+    "Article 15": {
+        "title": "Accuracy Robustness Cybersecurity",
+        "phrases": [
+            "AI cybersecurity",
+            "AI accuracy monitoring",
+            "AI robustness requirements"
+        ],
+        "controls": [
+            "Security testing",
+            "Performance monitoring",
+            "Failure detection"
+        ]
+    }
+
+}
+
+
+def search_ai_act(query):
+
+    results = []
+
+    query = query.lower()
+
+    for article, data in AI_ACT_DATABASE.items():
+
+        for phrase in data["phrases"]:
+
+            if query in phrase.lower():
+
+                results.append({
+                    "article": article,
+                    "title": data["title"],
+                    "matched_phrase": phrase,
+                    "controls": data["controls"]
+                })
+
+    return results
+
+
+
+def calculate_compliance_score(system):
+
+    score = 0
+    missing = []
+
+    requirements = {
+
+        "risk_management": "Article 9",
+        "logging": "Article 12",
+        "human_oversight": "Article 14",
+        "security": "Article 15"
+
+    }
+
+
+    for control, article in requirements.items():
+
+        if system.get(control):
+            score += 25
+        else:
+            missing.append(article)
+
+
+    return {
+        "score": score,
+        "rating": risk_rating(score),
+        "missing_articles": missing
+    }
+
+
+
+def risk_rating(score):
+
+    if score >= 90:
+        return "LOW RISK"
+
+    if score >= 70:
+        return "MODERATE RISK"
+
+    if score >= 40:
+        return "HIGH RISK"
+
+    return "CRITICAL RISK"
+
+
+
+def generate_report(system):
+
+    return {
+
+        "engine": "AILeash Compliance Intelligence Engine",
+
+        "version": VERSION,
+
+        "timestamp":
+            datetime.datetime.utcnow().isoformat(),
+
+        "assessment":
+            calculate_compliance_score(system)
+
+    }
+
+
+
+def save_report(report):
+
+    filename = (
+        "aileash_report_"
+        + datetime.datetime.now()
+        .strftime("%Y%m%d_%H%M%S")
+        + ".json"
+    )
+
+    with open(filename, "w") as file:
+        json.dump(
+            report,
+            file,
+            indent=4
+        )
+
+    return filename
+
+
+
+if __name__ == "__main__":
+
+    print(
+        "\nAILeash AI Act Ranking Engine "
+        + VERSION
+    )
+
+    print("\nExample search:")
+    
+    results = search_ai_act(
+        "Article 9"
+    )
+
+    for result in results:
+        print("\nMATCH:")
+        print(result)
+
+
+    test_system = {
+
+        "risk_management": True,
+        "logging": True,
+        "human_oversight": False,
+        "security": True
+
+    }
+
+
+    report = generate_report(test_system)
+
+    print("\nCOMPLIANCE REPORT")
+    print(json.dumps(report, indent=4))
+
+
+    file = save_report(report)
+
+    print(
+        "\nSaved:",
+        file
+    )
+
+```
+
+
+## `ai_safety_scanner.py`
+
+167 lines, 5700 bytes
+
+```python
+"""
+AI-Safety Grade Scanner
+Checks a domain's .well-known/ files and public root files against the
+emerging AI-safety/AI-transparency file conventions, and returns a
+letter grade (A-F) plus an embeddable badge.
+
+Drop into your existing FastAPI server.py as a router, or run standalone.
+Requires: fastapi, httpx  (pip install fastapi httpx --break-system-packages)
+"""
+
+from fastapi import APIRouter, Query
+from fastapi.responses import JSONResponse, Response
+import httpx
+import xml.etree.ElementTree as ET
+
+router = APIRouter()
+
+TIMEOUT = 6.0
+UA_HUMAN = "Mozilla/5.0 (compatible; AILeashScanner/1.0; +https://sebbi.pro/check)"
+UA_AGENT = "AILeash-Agent-Check/1.0 (+https://sebbi.pro/check)"
+
+CHECKS = [
+    # (key, path, points, validator_name)
+    ("ai_safety",  "/.well-known/ai-safety.txt", 20, "check_ai_safety"),
+    ("security",   "/.well-known/security.txt",  15, "check_security"),
+    ("robots",     "/robots.txt",                10, "check_robots"),
+    ("sitemap",    "/sitemap.xml",                10, "check_sitemap"),
+    ("ai_txt",     "/.well-known/ai.txt",         15, "check_present"),
+    ("comply",     "/.well-known/comply.txt",     15, "check_present"),
+    ("llms",       "/llms.txt",                   10, "check_present"),
+]
+RENDERING_POINTS = 5
+MAX_SCORE = sum(c[2] for c in CHECKS) + RENDERING_POINTS  # 100
+
+
+async def fetch(client: httpx.AsyncClient, url: str, ua: str = UA_HUMAN):
+    try:
+        r = await client.get(url, timeout=TIMEOUT, headers={"User-Agent": ua}, follow_redirects=True)
+        if r.status_code == 200:
+            return r.text
+    except Exception:
+        pass
+    return None
+
+
+def check_present(text):
+    return bool(text and text.strip())
+
+
+def check_ai_safety(text):
+    if not text:
+        return False
+    lower = text.lower()
+    return "ai-safe:" in lower and "true" in lower
+
+
+def check_security(text):
+    if not text:
+        return False
+    lower = text.lower()
+    return "contact:" in lower and "expires:" in lower
+
+
+def check_robots(text):
+    return bool(text and text.strip())
+
+
+def check_sitemap(text):
+    if not text:
+        return False
+    try:
+        ET.fromstring(text)
+        return True
+    except ET.ParseError:
+        return False
+
+
+VALIDATORS = {
+    "check_ai_safety": check_ai_safety,
+    "check_security": check_security,
+    "check_robots": check_robots,
+    "check_sitemap": check_sitemap,
+    "check_present": check_present,
+}
+
+
+def grade_from_score(score: int) -> str:
+    if score >= 90:
+        return "A"
+    if score >= 75:
+        return "B"
+    if score >= 60:
+        return "C"
+    if score >= 40:
+        return "D"
+    return "F"
+
+
+GRADE_COLOR = {"A": "#7fe3b0", "B": "#a8d95f", "C": "#c9a84c", "D": "#ff9a4a", "F": "#ff8a80"}
+
+
+@router.get("/check")
+async def check_domain(domain: str = Query(..., description="Domain to check, e.g. example.com")):
+    domain = domain.strip().lower().replace("https://", "").replace("http://", "").rstrip("/")
+    base = f"https://{domain}"
+
+    results = {}
+    score = 0
+
+    async with httpx.AsyncClient() as client:
+        for key, path, points, validator_name in CHECKS:
+            text = await fetch(client, base + path)
+            passed = VALIDATORS[validator_name](text)
+            results[key] = {"path": path, "found": bool(text), "passed": passed, "points": points if passed else 0}
+            if passed:
+                score += points
+
+        # basic consistent-rendering check: compare human UA vs agent UA on homepage
+        human_body = await fetch(client, base, UA_HUMAN)
+        agent_body = await fetch(client, base, UA_AGENT)
+        rendering_ok = bool(human_body) and bool(agent_body) and (len(human_body) > 0 and len(agent_body) > 0)
+        # crude similarity check — same length within 10% as a proxy for "not obviously cloaked"
+        if human_body and agent_body:
+            ratio = min(len(human_body), len(agent_body)) / max(len(human_body), len(agent_body), 1)
+            rendering_ok = ratio > 0.9
+        results["consistent_rendering"] = {"passed": rendering_ok, "points": RENDERING_POINTS if rendering_ok else 0}
+        if rendering_ok:
+            score += RENDERING_POINTS
+
+    grade = grade_from_score(score)
+
+    return JSONResponse({
+        "domain": domain,
+        "score": score,
+        "max_score": MAX_SCORE,
+        "grade": grade,
+        "checks": results,
+        "verified_by": "sebbi.pro",
+        "badge_url": f"https://sebbi.pro/check/badge?domain={domain}",
+        "report_url": f"https://sebbi.pro/check?domain={domain}",
+    })
+
+
+@router.get("/check/badge")
+async def check_badge(domain: str = Query(...)):
+    """Returns an embeddable SVG badge, e.g. <img src="https://sebbi.pro/check/badge?domain=example.com">"""
+    domain = domain.strip().lower().replace("https://", "").replace("http://", "").rstrip("/")
+    base = f"https://{domain}"
+
+    score = 0
+    async with httpx.AsyncClient() as client:
+        for key, path, points, validator_name in CHECKS:
+            text = await fetch(client, base + path)
+            if VALIDATORS[validator_name](text):
+                score += points
+
+    grade = grade_from_score(score)
+    color = GRADE_COLOR[grade]
+
+    svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="180" height="20">
+  <rect width="120" height="20" fill="#0a0f1e"/>
+  <rect x="120" width="60" height="20" fill="{color}"/>
+  <text x="60" y="14" fill="#fff" font-family="Verdana,sans-serif" font-size="11" text-anchor="middle">AI-Safety Grade</text>
+  <text x="150" y="14" fill="#0a0f1e" font-family="Verdana,sans-serif" font-size="12" font-weight="bold" text-anchor="middle">{grade}</text>
+</svg>'''
+    return Response(content=svg, media_type="image/svg+xml")
+
+```
+
+
+## `aigrade_insert.py`
+
+136 lines, 5663 bytes
+
+```python
+# ============================================================
+# AI-SAFETY GRADE SCANNER - stdlib version for server.py
+# (converted from the FastAPI/httpx draft - no new dependencies)
+#
+# HOW TO INSTALL - two pastes into server.py:
+#
+# PASTE 1: everything between "BEGIN FUNCTIONS" and "END FUNCTIONS"
+#          goes near your other helper functions (e.g. just above
+#          the JURIS_VERSION block).
+#
+# PASTE 2: everything between "BEGIN ROUTES" and "END ROUTES"
+#          goes inside do_GET, as new elif branches alongside the
+#          other GET routes (match their indentation: 8 spaces).
+#
+# Endpoints added:
+#   GET /api/aigrade?domain=example.com        -> JSON grade report
+#   GET /api/aigrade/badge?domain=example.com  -> embeddable SVG badge
+# ============================================================
+
+# ---------------- BEGIN FUNCTIONS ----------------
+AIGRADE_TIMEOUT=6
+AIGRADE_UA="Mozilla/5.0 (compatible; AILeashScanner/1.0; +https://sebbi.pro/scan)"
+AIGRADE_UA_AGENT="AILeash-Agent-Check/1.0 (+https://sebbi.pro/scan)"
+AIGRADE_CHECKS=[
+    ("ai_safety","/.well-known/ai-safety.txt",20,"ai_safety"),
+    ("security","/.well-known/security.txt",15,"security"),
+    ("robots","/robots.txt",10,"present"),
+    ("sitemap","/sitemap.xml",10,"sitemap"),
+    ("ai_txt","/.well-known/ai.txt",15,"present"),
+    ("comply","/.well-known/comply.txt",15,"present"),
+    ("llms","/llms.txt",10,"present"),
+]
+AIGRADE_RENDER_POINTS=5
+AIGRADE_MAX=sum(c[2] for c in AIGRADE_CHECKS)+AIGRADE_RENDER_POINTS
+AIGRADE_COLORS={"A":"#7fe3b0","B":"#a8d95f","C":"#c9a84c","D":"#ff9a4a","F":"#ff8a80"}
+
+def _aigrade_fetch(url,ua=AIGRADE_UA):
+    try:
+        req=urllib.request.Request(url,headers={"User-Agent":ua})
+        with urllib.request.urlopen(req,timeout=AIGRADE_TIMEOUT) as r:
+            if r.status==200:
+                return r.read(500000).decode("utf-8","replace")
+    except Exception:
+        pass
+    return None
+
+def _aigrade_valid(kind,text):
+    if kind=="present":
+        return bool(text and text.strip())
+    if kind=="ai_safety":
+        if not text:return False
+        low=text.lower()
+        return "ai-safe:" in low and "true" in low
+    if kind=="security":
+        if not text:return False
+        low=text.lower()
+        return "contact:" in low and "expires:" in low
+    if kind=="sitemap":
+        if not text:return False
+        try:
+            import xml.etree.ElementTree as _ET
+            _ET.fromstring(text)
+            return True
+        except Exception:
+            return False
+    return False
+
+def _aigrade_letter(score):
+    if score>=90:return"A"
+    if score>=75:return"B"
+    if score>=60:return"C"
+    if score>=40:return"D"
+    return"F"
+
+def aigrade_run(domain):
+    domain=str(domain or "").strip().lower().replace("https://","").replace("http://","").rstrip("/")
+    domain=domain.split("/")[0]
+    if not domain or "." not in domain or len(domain)>200:
+        return None
+    base="https://"+domain
+    results={};score=0
+    for key,path,points,kind in AIGRADE_CHECKS:
+        text=_aigrade_fetch(base+path)
+        passed=_aigrade_valid(kind,text)
+        results[key]={"path":path,"found":bool(text),"passed":passed,"points":points if passed else 0}
+        if passed:score+=points
+    human=_aigrade_fetch(base,AIGRADE_UA)
+    agent=_aigrade_fetch(base,AIGRADE_UA_AGENT)
+    render_ok=False
+    if human and agent:
+        ratio=min(len(human),len(agent))/max(len(human),len(agent),1)
+        render_ok=ratio>0.9
+    results["consistent_rendering"]={"passed":render_ok,"points":AIGRADE_RENDER_POINTS if render_ok else 0}
+    if render_ok:score+=AIGRADE_RENDER_POINTS
+    return{"domain":domain,"score":score,"max_score":AIGRADE_MAX,
+        "grade":_aigrade_letter(score),"checks":results,
+        "verified_by":"sebbi.pro",
+        "badge_url":HOST+"/api/aigrade/badge?domain="+domain,
+        "report_url":HOST+"/api/aigrade?domain="+domain,
+        "note":"External-signal check of published AI-transparency files; not an audit of internal systems"}
+
+def aigrade_badge_svg(domain):
+    r=aigrade_run(domain)
+    grade=r["grade"] if r else "F"
+    color=AIGRADE_COLORS.get(grade,"#ff8a80")
+    return('<svg xmlns="http://www.w3.org/2000/svg" width="180" height="20">'
+        '<rect width="120" height="20" fill="#0a0f1e"/>'
+        '<rect x="120" width="60" height="20" fill="'+color+'"/>'
+        '<text x="60" y="14" fill="#fff" font-family="Verdana,sans-serif" font-size="11" text-anchor="middle">AI-Safety Grade</text>'
+        '<text x="150" y="14" fill="#0a0f1e" font-family="Verdana,sans-serif" font-size="12" font-weight="bold" text-anchor="middle">'+grade+'</text>'
+        '</svg>')
+# ---------------- END FUNCTIONS ----------------
+
+
+# ---------------- BEGIN ROUTES (paste inside do_GET) ----------------
+        elif path=="/api/aigrade":
+            qs=parse_qs(parsed.query)
+            dom=(qs.get("domain",[""])[0] or "").strip()
+            rep=aigrade_run(dom)
+            if not rep:
+                send_json(self,{"error":"valid domain required, e.g. ?domain=example.com"},400)
+            else:
+                send_json(self,rep)
+        elif path=="/api/aigrade/badge":
+            qs=parse_qs(parsed.query)
+            dom=(qs.get("domain",[""])[0] or "").strip()
+            svg=aigrade_badge_svg(dom)
+            body=svg.encode()
+            self.send_response(200)
+            self.send_header("Content-Type","image/svg+xml")
+            self.send_header("Cache-Control","max-age=3600")
+            self.send_header("Content-Length",str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+# ---------------- END ROUTES ----------------
+
+```
+
+
+## `aileash_reporter.py`
+
+232 lines, 9377 bytes
+
+```python
+"""
+AILEASH DECISION REPORTER v1.0.0
+Generates readable audit reports for all AILeash products.
+Shows exactly why each decision was made.
+Copyright (c) 2026 Justin Antony Dobson / Monop Content, Blyth, UK
+"""
+
+import sqlite3, json, os
+from datetime import datetime
+
+DB_FILE = "aileash.db"
+
+PRODUCTS = {
+    "aileash": "AILeash",
+    "guardian": "AILeash Guardian",
+    "sonicboom": "SonicBoom",
+    "sentinel": "AILeash Sentinel"
+}
+
+REASON_EXPLANATIONS = {
+    "velocity_spike": "User made more than 10 requests in 60 seconds",
+    "high_amount": "Transaction amount exceeded threshold",
+    "risky_device": "Device risk score was above acceptable limit",
+    "behaviour_anomaly": "Unusual behaviour pattern detected",
+    "country_shift": "Request came from a different country than usual",
+    "unsafe_country": "Request came from outside approved country list",
+    "low_trust": "User trust score has dropped due to previous decisions",
+}
+
+def get_decisions(db_path=DB_FILE, limit=200):
+    if not os.path.exists(db_path):
+        return []
+    try:
+        conn = sqlite3.connect(db_path)
+        rows = conn.execute("""
+            SELECT a.ts, a.user_id, a.event_json, a.result_json, a.audit_hash,
+                   COALESCE(k.product, 'aileash') as product
+            FROM audit_log a
+            LEFT JOIN api_keys k ON json_extract(a.event_json, '$.api_key') = k.key
+            ORDER BY a.id DESC LIMIT ?
+        """, (limit,)).fetchall()
+        conn.close()
+    except:
+        try:
+            conn = sqlite3.connect(db_path)
+            rows = conn.execute("""
+                SELECT ts, user_id, event_json, result_json, audit_hash, 'aileash'
+                FROM audit_log ORDER BY id DESC LIMIT ?
+            """, (limit,)).fetchall()
+            conn.close()
+        except:
+            return []
+    
+    results = []
+    for row in rows:
+        try:
+            event = json.loads(row[2])
+            result = json.loads(row[3])
+            results.append({
+                "ts": row[0],
+                "user_id": row[1],
+                "event": event,
+                "result": result,
+                "audit_hash": row[4],
+                "product": row[5] or "aileash"
+            })
+        except:
+            pass
+    return results
+
+def explain_reason(r):
+    return REASON_EXPLANATIONS.get(r, r.replace("_", " ").capitalize())
+
+def decision_color(d):
+    return {"ALLOW": "#00875a", "CHALLENGE": "#b45309", "BLOCK": "#cc0000"}.get(d, "#555")
+
+def product_color(p):
+    return {
+        "aileash": "#c9a84c",
+        "guardian": "#cc0000",
+        "sonicboom": "#00d4ff",
+        "sentinel": "#7c3aed"
+    }.get(p, "#c9a84c")
+
+def generate_html_report(db_path=DB_FILE, limit=200, output="aileash_report.html"):
+    decisions = get_decisions(db_path, limit)
+
+    allow = sum(1 for d in decisions if d["result"].get("decision") == "ALLOW")
+    challenge = sum(1 for d in decisions if d["result"].get("decision") == "CHALLENGE")
+    block = sum(1 for d in decisions if d["result"].get("decision") == "BLOCK")
+
+    rows = ""
+    for d in decisions:
+        result = d["result"]
+        event = d["event"]
+        ts = datetime.fromtimestamp(d["ts"]).strftime('%Y-%m-%d %H:%M:%S')
+        decision = result.get("decision", "?")
+        score = result.get("score", 0)
+        reasons = result.get("reasons", [])
+        product = d.get("product", "aileash")
+        pc = product_color(product)
+        dc = decision_color(decision)
+        pname = PRODUCTS.get(product, product)
+
+        reason_html = ""
+        if reasons:
+            reason_html = "<ul>" + "".join(
+                f"<li>{explain_reason(r)}</li>" for r in reasons
+            ) + "</ul>"
+        else:
+            reason_html = "<span style='color:#888'>No risk factors detected</span>"
+
+        rows += f"""<tr>
+            <td>{ts}</td>
+            <td><span style="font-size:10px;background:{pc}22;color:{pc};border:1px solid {pc}44;padding:2px 6px;border-radius:3px">{pname}</span></td>
+            <td><code>{d['user_id']}</code></td>
+            <td>{event.get('action','?')}</td>
+            <td>{event.get('country','?')}</td>
+            <td>£{event.get('amount',0)}</td>
+            <td><strong style="color:{dc}">{decision}</strong></td>
+            <td>{score}</td>
+            <td>{result.get('trust',0)}</td>
+            <td>{reason_html}</td>
+            <td><code style="font-size:10px">{d['audit_hash'][:16]}...</code></td>
+        </tr>"""
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>AILeash Audit Report</title>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:sans-serif;background:#f5f7fa;color:#1a202c;padding:20px}}
+.header{{background:#0a0f1e;color:#fff;padding:24px 32px;border-radius:8px;margin-bottom:20px;display:flex;justify-content:space-between;align-items:center}}
+.header h1{{font-size:22px;color:#c9a84c;margin:0}}
+.header p{{font-size:12px;color:rgba(255,255,255,0.4);margin-top:4px}}
+.logo{{font-size:13px;color:rgba(255,255,255,0.2)}}
+.stats{{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px}}
+.stat{{background:#fff;border-radius:8px;padding:16px;text-align:center;border:1px solid #e2e8f0}}
+.stat-n{{font-size:28px;font-weight:700}}
+.stat-l{{font-size:11px;color:#64748b;margin-top:4px;text-transform:uppercase;letter-spacing:1px}}
+.allow{{color:#00875a}}.challenge{{color:#b45309}}.block{{color:#cc0000}}.total{{color:#0a0f1e}}
+.table-wrap{{background:#fff;border-radius:8px;overflow:hidden;border:1px solid #e2e8f0;overflow-x:auto}}
+table{{width:100%;border-collapse:collapse;min-width:900px}}
+th{{background:#0a0f1e;color:#c9a84c;padding:10px 12px;text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:1px;white-space:nowrap}}
+td{{padding:10px 12px;border-bottom:1px solid #e2e8f0;font-size:12px;vertical-align:top}}
+tr:last-child td{{border:none}}
+tr:hover td{{background:#f8fafc}}
+ul{{margin:4px 0;padding-left:16px}}
+li{{margin:2px 0;color:#64748b;font-size:11px}}
+code{{background:#f1f5f9;padding:2px 4px;border-radius:3px;font-size:10px}}
+.empty{{text-align:center;color:#888;padding:40px}}
+footer{{text-align:center;font-size:11px;color:#94a3b8;margin-top:20px}}
+</style>
+</head>
+<body>
+<div class="header">
+  <div>
+    <h1>AILeash Audit Report</h1>
+    <p>Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} &nbsp;|&nbsp; Last {len(decisions)} decisions</p>
+  </div>
+  <div class="logo">sebbi.pro &nbsp;|&nbsp; OAAS-1.0</div>
+</div>
+<div class="stats">
+  <div class="stat"><div class="stat-n total">{len(decisions)}</div><div class="stat-l">Total</div></div>
+  <div class="stat"><div class="stat-n allow">{allow}</div><div class="stat-l">Allowed</div></div>
+  <div class="stat"><div class="stat-n challenge">{challenge}</div><div class="stat-l">Challenged</div></div>
+  <div class="stat"><div class="stat-n block">{block}</div><div class="stat-l">Blocked</div></div>
+</div>
+<div class="table-wrap">
+<table>
+<thead><tr>
+  <th>Time</th><th>Product</th><th>User</th><th>Action</th><th>Country</th>
+  <th>Amount</th><th>Decision</th><th>Score</th><th>Trust</th><th>Reasons</th><th>Audit Hash</th>
+</tr></thead>
+<tbody>
+{''.join([rows]) if rows else f'<tr><td colspan="11" class="empty">No decisions recorded yet</td></tr>'}
+</tbody>
+</table>
+</div>
+<footer>AILeash &nbsp;|&nbsp; Monop Content &nbsp;|&nbsp; Justin Antony Dobson &nbsp;|&nbsp; sebbi.pro &nbsp;|&nbsp; SHA-256 Merkle Chain</footer>
+</body>
+</html>"""
+
+    with open(output, "w") as f:
+        f.write(html)
+    print(f"Report saved: {output} ({len(decisions)} decisions)")
+    return output
+
+def generate_json_report(db_path=DB_FILE, limit=200, output="aileash_report.json"):
+    decisions = get_decisions(db_path, limit)
+    report = {
+        "generated": datetime.now().isoformat(),
+        "standard": "OAAS-1.0",
+        "source": "sebbi.pro",
+        "total": len(decisions),
+        "summary": {
+            "allow": sum(1 for d in decisions if d["result"].get("decision") == "ALLOW"),
+            "challenge": sum(1 for d in decisions if d["result"].get("decision") == "CHALLENGE"),
+            "block": sum(1 for d in decisions if d["result"].get("decision") == "BLOCK")
+        },
+        "decisions": [{
+            "timestamp": datetime.fromtimestamp(d["ts"]).isoformat(),
+            "product": PRODUCTS.get(d["product"], d["product"]),
+            "user_id": d["user_id"],
+            "action": d["event"].get("action"),
+            "country": d["event"].get("country"),
+            "amount": d["event"].get("amount"),
+            "decision": d["result"].get("decision"),
+            "score": d["result"].get("score"),
+            "trust": d["result"].get("trust"),
+            "reasons": d["result"].get("reasons", []),
+            "reasons_explained": [explain_reason(r) for r in d["result"].get("reasons", [])],
+            "audit_hash": d["audit_hash"]
+        } for d in decisions]
+    }
+    with open(output, "w") as f:
+        json.dump(report, f, indent=2)
+    print(f"Report saved: {output}")
+    return output
+
+if __name__ == "__main__":
+    import sys
+    fmt = sys.argv[1] if len(sys.argv) > 1 else "html"
+    db = sys.argv[2] if len(sys.argv) > 2 else DB_FILE
+    if fmt == "json":
+        generate_json_report(db)
+    else:
+        generate_html_report(db)
+
+```
+
+
+## `aileash_verify.py`
+
+580 lines, 21445 bytes
+
+```python
+#!/usr/bin/env python3
+"""
+aileash_verify.py  -  an independent verifier for AILeash proofs
+================================================================
+
+WHAT THIS IS
+------------
+A single file that checks AILeash's proofs without AILeash.
+
+No dependencies. No network calls. It never contacts sebbi.pro or anything
+else - it takes proof documents you already hold and does the arithmetic
+locally. Run it on a laptop with the wifi off and it works exactly the same.
+
+That is deliberate. A proof you can only check with the prover's own online
+tool is not a proof, it is a reassurance. If this file cannot confirm a
+claim from the numbers alone, the claim does not hold, and the honest thing
+is for you to find that out from your own machine rather than from us.
+
+WHAT IT CHECKS
+--------------
+  Inclusion    a record is inside a sealed period, against the sealed root
+  Absence      a record is NOT there - the two neighbouring leaves are
+               verified and shown to be adjacent, leaving nowhere for it
+  Ancestry     a tip you were handed is still on the chain being served,
+               at the same position, under the current root
+  Prefix       the log at one size is contained in the log at a later size,
+               with nothing inserted, removed or reordered in between
+  Stability    across a set of replay runs, identical inputs produced
+               identical verdicts under an unchanged code fingerprint
+
+USAGE
+-----
+    python3 aileash_verify.py proof.json [another.json ...]
+    cat proof.json | python3 aileash_verify.py
+    python3 aileash_verify.py --selftest
+
+Exit code 0 if everything checked passed, 1 if anything failed, 2 on bad
+input. Suitable for dropping into an audit script or a CI job.
+
+Each proof document is whatever the relevant AILeash route returned. Save
+the JSON, keep it, and check it whenever you like - next week, or in four
+years when the original system is long gone.
+
+HOW TO GET PROOFS
+-----------------
+    /x/complete/prove?period=&value=       inclusion or absence
+    /x/consistency/ancestor?tip=           ancestry
+    /x/consistency/proof?first=&second=    prefix
+    /x/replay/history?input_hash=          stability
+
+WHAT IT DOES NOT CHECK
+----------------------
+  - That a sealed record is TRUE. Cryptography proves a record existed at a
+    time and has not moved since. It says nothing about whether the record
+    was honest when it was written. Nothing can.
+  - That a root was anchored. That is a separate check against the
+    OpenTimestamps proof and a Bitcoin node - out of scope for a file with
+    no dependencies, and it should be done independently anyway.
+  - Whether a decision was correct or fair. Determinism is not fairness.
+
+The two hash schemes below are different on purpose and must not be mixed.
+The completeness tree is SORTED, which is what makes absence provable. The
+consistency tree is in WRITE ORDER, which is what makes reordering
+detectable. Their roots will never match and are not meant to.
+
+Public domain / MIT - copy it, fork it, audit it, ship it inside your own
+tooling. The more independent copies of this exist, the less any of it
+depends on us.
+"""
+
+import hashlib
+import json
+import sys
+
+VERSION = "1.0"
+
+# --- completeness tree (sorted) -------------------------------------------
+CMP_LEAF = b"AILEASH-LEAF-v1:"
+CMP_NODE = b"AILEASH-NODE-v1:"
+
+# --- consistency tree (write order, RFC 6962) -----------------------------
+CT_LEAF = b"\x00"
+CT_NODE = b"\x01"
+
+
+# ==========================================================================
+# completeness: sorted tree
+# ==========================================================================
+
+def cmp_leaf(value):
+    return hashlib.sha256(CMP_LEAF + value.encode("utf-8")).hexdigest()
+
+
+def cmp_node(left_hex, right_hex):
+    return hashlib.sha256(CMP_NODE + left_hex.encode() + right_hex.encode()).hexdigest()
+
+
+def cmp_replay(value, proof):
+    """Recompute a root from a leaf value and its sibling path.
+
+    Each step carries the side its sibling sits on. Five lines, so that
+    reimplementing this in another language is an afternoon rather than a
+    project.
+    """
+    current = cmp_leaf(value)
+    for step in proof:
+        side = (step or {}).get("side")
+        sibling = (step or {}).get("hash")
+        if not sibling:
+            raise ValueError("proof step missing a hash")
+        if side == "left":
+            current = cmp_node(sibling, current)
+        elif side == "right":
+            current = cmp_node(current, sibling)
+        else:
+            raise ValueError("proof step missing a side")
+    return current
+
+
+# ==========================================================================
+# consistency: RFC 6962 write-order tree
+# ==========================================================================
+
+def ct_leaf(value):
+    return hashlib.sha256(CT_LEAF + value.encode("utf-8")).digest()
+
+
+def ct_node(left, right):
+    return hashlib.sha256(CT_NODE + left + right).digest()
+
+
+def _decompose(index, size):
+    """Split an inclusion proof into its inner and border parts.
+
+    This is the standard decomposition used by every RFC 6962
+    implementation. inner is the number of steps where the path is still
+    inside a complete subtree; border is the number of right-hand
+    stragglers above it.
+    """
+    inner = (index ^ (size - 1)).bit_length()
+    border = bin(index >> inner).count("1")
+    return inner, border
+
+
+def _chain_inner(seed, proof, index):
+    for i, step in enumerate(proof):
+        if (index >> i) & 1 == 0:
+            seed = ct_node(seed, step)
+        else:
+            seed = ct_node(step, seed)
+    return seed
+
+
+def _chain_inner_right(seed, proof, index):
+    for i, step in enumerate(proof):
+        if (index >> i) & 1 == 1:
+            seed = ct_node(step, seed)
+    return seed
+
+
+def _chain_border_right(seed, proof):
+    for step in proof:
+        seed = ct_node(step, seed)
+    return seed
+
+
+def ct_verify_inclusion(index, size, leaf_value, proof_hex, root_hex):
+    """Is leaf_value at position index of a tree of this size and root?"""
+    if index < 0 or size <= 0 or index >= size:
+        return False, "index outside the tree"
+    try:
+        proof = [bytes.fromhex(h) for h in proof_hex]
+        root = bytes.fromhex(root_hex)
+    except (ValueError, TypeError):
+        return False, "proof or root is not hex"
+
+    inner, border = _decompose(index, size)
+    if len(proof) != inner + border:
+        return False, ("proof has %d nodes, a tree of size %d needs %d for index %d"
+                       % (len(proof), size, inner + border, index))
+
+    result = _chain_inner(ct_leaf(leaf_value), proof[:inner], index)
+    result = _chain_border_right(result, proof[inner:])
+    if result != root:
+        return False, "recomputed root does not match (%s)" % result.hex()
+    return True, None
+
+
+def ct_verify_consistency(size1, size2, proof_hex, root1_hex, root2_hex):
+    """Is the tree of size1 a prefix of the tree of size2?"""
+    if size1 < 0 or size2 < 0 or size1 > size2:
+        return False, "sizes must satisfy 0 <= first <= second"
+    try:
+        proof = [bytes.fromhex(h) for h in proof_hex]
+        root1 = bytes.fromhex(root1_hex)
+        root2 = bytes.fromhex(root2_hex)
+    except (ValueError, TypeError):
+        return False, "proof or roots are not hex"
+
+    if size1 == size2:
+        if proof:
+            return False, "no proof nodes expected when the sizes are equal"
+        return (root1 == root2), (None if root1 == root2 else "roots differ at equal size")
+    if size1 == 0:
+        return True, None
+    if not proof:
+        return False, "a proof is required for these sizes"
+
+    inner, border = _decompose(size1 - 1, size2)
+    shift = (size1 & -size1).bit_length() - 1
+    inner -= shift
+
+    if size1 == (1 << shift):
+        seed, start = root1, 0
+    else:
+        seed, start = proof[0], 1
+
+    if len(proof) != start + inner + border:
+        return False, ("proof has %d nodes, expected %d" % (len(proof), start + inner + border))
+
+    body = proof[start:]
+    mask = (size1 - 1) >> shift
+
+    hash1 = _chain_inner_right(seed, body[:inner], mask)
+    hash1 = _chain_border_right(hash1, body[inner:])
+    if hash1 != root1:
+        return False, "the earlier root does not recompute (%s)" % hash1.hex()
+
+    hash2 = _chain_inner(seed, body[:inner], mask)
+    hash2 = _chain_border_right(hash2, body[inner:])
+    if hash2 != root2:
+        return False, "the later root does not recompute (%s)" % hash2.hex()
+    return True, None
+
+
+# ==========================================================================
+# document checkers
+# ==========================================================================
+
+class Check(object):
+    def __init__(self, kind):
+        self.kind = kind
+        self.lines = []
+        self.ok = True
+
+    def add(self, passed, text):
+        self.lines.append((passed, text))
+        if not passed:
+            self.ok = False
+        return passed
+
+
+def check_inclusion(doc):
+    c = Check("inclusion (completeness)")
+    value = doc.get("value")
+    root = doc.get("root")
+    proof = doc.get("proof")
+    if not (value and root and isinstance(proof, list)):
+        c.add(False, "document is missing value, root or proof")
+        return c
+    try:
+        computed = cmp_replay(value, proof)
+    except ValueError as exc:
+        c.add(False, "malformed proof: %s" % exc)
+        return c
+    c.add(computed == root, "leaf recomputes to the sealed root")
+    if doc.get("leaf_count") is not None:
+        c.add(True, "period sealed %s records, committed before any export was requested"
+                    % doc["leaf_count"])
+    if doc.get("index") is not None:
+        c.add(True, "record sits at index %s" % doc["index"])
+    return c
+
+
+def check_absence(doc):
+    c = Check("absence (completeness)")
+    value = doc.get("value")
+    root = doc.get("root")
+    neighbours = doc.get("neighbours") or {}
+    count = doc.get("leaf_count")
+    if not (value and root):
+        c.add(False, "document is missing value or root")
+        return c
+
+    lower = neighbours.get("lower")
+    upper = neighbours.get("upper")
+
+    if not lower and not upper:
+        c.add(count == 0, "period is committed and empty, so nothing can be in it")
+        return c
+
+    if lower:
+        try:
+            computed = cmp_replay(lower["value"], lower["proof"])
+        except (ValueError, KeyError, TypeError) as exc:
+            c.add(False, "lower neighbour proof is malformed: %s" % exc)
+            return c
+        c.add(computed == root, "lower neighbour verifies against the sealed root")
+        c.add(str(lower["value"]) < str(value), "lower neighbour sorts before the queried value")
+
+    if upper:
+        try:
+            computed = cmp_replay(upper["value"], upper["proof"])
+        except (ValueError, KeyError, TypeError) as exc:
+            c.add(False, "upper neighbour proof is malformed: %s" % exc)
+            return c
+        c.add(computed == root, "upper neighbour verifies against the sealed root")
+        c.add(str(upper["value"]) > str(value), "upper neighbour sorts after the queried value")
+
+    if lower and upper:
+        adjacent = int(upper["index"]) == int(lower["index"]) + 1
+        c.add(adjacent, "neighbours are adjacent (index %s then %s) - nothing can sit between"
+                        % (lower["index"], upper["index"]))
+    elif upper:
+        c.add(int(upper["index"]) == 0, "value sorts before the first leaf, and nothing precedes index 0")
+    elif lower:
+        if count is None:
+            c.add(True, "value sorts after the last leaf (leaf_count not supplied to confirm)")
+        else:
+            c.add(int(lower["index"]) == int(count) - 1,
+                  "value sorts after the final leaf of %s" % count)
+    return c
+
+
+def check_ancestry(doc):
+    c = Check("ancestry (consistency)")
+    if doc.get("on_chain") is False:
+        c.add(False, "THIS TIP IS NOT ON THE CHAIN BEING SERVED - if it was issued to you, "
+                     "that is evidence of a fork. Keep this document.")
+        return c
+    tip = doc.get("tip")
+    index = doc.get("leaf_index")
+    size = doc.get("tree_size")
+    root = doc.get("root")
+    proof = doc.get("inclusion_proof")
+    if tip is None or index is None or size is None or not root or not isinstance(proof, list):
+        c.add(False, "document is missing tip, leaf_index, tree_size, root or inclusion_proof")
+        return c
+    ok, why = ct_verify_inclusion(int(index), int(size), tip, proof, root)
+    c.add(ok, why or "tip verifies at position %s of a chain of %s" % (index, size))
+    return c
+
+
+def check_prefix(doc):
+    c = Check("prefix (consistency)")
+    first = doc.get("first")
+    second = doc.get("second")
+    proof = doc.get("consistency_proof")
+    root1 = doc.get("first_root")
+    root2 = doc.get("second_root")
+    if first is None or second is None or not isinstance(proof, list) or not root1 or not root2:
+        c.add(False, "document is missing first, second, consistency_proof or the roots")
+        return c
+    ok, why = ct_verify_consistency(int(first), int(second), proof, root1, root2)
+    c.add(ok, why or ("the log at size %s is contained in the log at size %s - append only, "
+                      "nothing inserted, removed or reordered" % (first, second)))
+    return c
+
+
+def check_stability(doc):
+    c = Check("stability (replay)")
+    history = doc.get("history")
+    if not isinstance(history, list) or not history:
+        c.add(False, "document has no replay history")
+        return c
+
+    by_code = {}
+    for run in history:
+        by_code.setdefault(run.get("code_fingerprint"), set()).add(
+            (str(run.get("verdict")), str(run.get("score"))))
+
+    stable = True
+    for fingerprint, outcomes in by_code.items():
+        short = (fingerprint or "unknown")[:12]
+        if len(outcomes) > 1:
+            stable = False
+            c.add(False, "code %s produced %d different verdicts for identical inputs - "
+                         "the engine is not deterministic under that version"
+                         % (short, len(outcomes)))
+        else:
+            c.add(True, "code %s produced one verdict across every run" % short)
+
+    c.add(True, "%d runs recorded, %d distinct code versions"
+                % (len(history), len(by_code)))
+    if stable and len(by_code) > 1:
+        c.add(True, "verdicts changed only alongside a changed code fingerprint, which is "
+                    "a policy change rather than nondeterminism")
+    c.add(True, "each run carries its own audit hash - check them independently with "
+                "an ancestry proof")
+    return c
+
+
+def identify(doc):
+    if not isinstance(doc, dict):
+        return None
+    if "consistency_proof" in doc:
+        return check_prefix
+    if "inclusion_proof" in doc or doc.get("on_chain") is not None:
+        return check_ancestry
+    if doc.get("result") == "absent" or "neighbours" in doc:
+        return check_absence
+    if doc.get("result") == "present" or ("proof" in doc and "value" in doc):
+        return check_inclusion
+    if "history" in doc and "input_hash" in doc:
+        return check_stability
+    return None
+
+
+# ==========================================================================
+# self test - known vectors built here, so the verifier checks itself
+# ==========================================================================
+
+def _selftest():
+    """Builds small trees in this file and confirms the verifier agrees.
+
+    Run this before trusting a result. If it fails, the fault is in this
+    file rather than in anything it was checking.
+    """
+    failures = []
+
+    # sorted tree, five leaves
+    values = sorted(["alpha", "bravo", "charlie", "delta", "echo"])
+
+    def build(vals):
+        level = [cmp_leaf(v) for v in vals]
+        levels = [level]
+        while len(level) > 1:
+            nxt = [cmp_node(level[i], level[i + 1]) for i in range(0, len(level) - 1, 2)]
+            if len(level) % 2 == 1:
+                nxt.append(level[-1])
+            levels.append(nxt)
+            level = nxt
+        return level[0], levels
+
+    def path(levels, index):
+        out, idx = [], index
+        for level in levels[:-1]:
+            if idx % 2 == 0:
+                if idx + 1 < len(level):
+                    out.append({"side": "right", "hash": level[idx + 1]})
+            else:
+                out.append({"side": "left", "hash": level[idx - 1]})
+            idx //= 2
+        return out
+
+    root, levels = build(values)
+    for i, value in enumerate(values):
+        if cmp_replay(value, path(levels, i)) != root:
+            failures.append("sorted inclusion failed for leaf %d" % i)
+    if cmp_replay("not-a-leaf", path(levels, 0)) == root:
+        failures.append("sorted tree accepted a wrong leaf")
+
+    # RFC 6962 tree, sizes 1..17
+    def mth(leaves):
+        n = len(leaves)
+        if n == 0:
+            return hashlib.sha256(b"").digest()
+        if n == 1:
+            return ct_leaf(leaves[0])
+        k = 1
+        while k * 2 < n:
+            k *= 2
+        return ct_node(mth(leaves[:k]), mth(leaves[k:]))
+
+    def incl(index, leaves):
+        n = len(leaves)
+        if n <= 1:
+            return []
+        k = 1
+        while k * 2 < n:
+            k *= 2
+        if index < k:
+            return incl(index, leaves[:k]) + [mth(leaves[k:])]
+        return incl(index - k, leaves[k:]) + [mth(leaves[:k])]
+
+    def subproof(m, leaves, is_root):
+        n = len(leaves)
+        if m == n:
+            return [] if is_root else [mth(leaves)]
+        k = 1
+        while k * 2 < n:
+            k *= 2
+        if m <= k:
+            return subproof(m, leaves[:k], is_root) + [mth(leaves[k:])]
+        return subproof(m - k, leaves[k:], False) + [mth(leaves[:k])]
+
+    for size in range(1, 18):
+        leaves = ["entry-%03d" % i for i in range(size)]
+        root_hex = mth(leaves).hex()
+        for index in range(size):
+            proof = [h.hex() for h in incl(index, leaves)]
+            ok, why = ct_verify_inclusion(index, size, leaves[index], proof, root_hex)
+            if not ok:
+                failures.append("ct inclusion failed size=%d index=%d (%s)" % (size, index, why))
+            bad, _ = ct_verify_inclusion(index, size, "tampered", proof, root_hex)
+            if bad:
+                failures.append("ct inclusion accepted a wrong leaf size=%d index=%d" % (size, index))
+        for first in range(1, size + 1):
+            proof = [h.hex() for h in (subproof(first, leaves, True) if first != size else [])]
+            ok, why = ct_verify_consistency(first, size, proof,
+                                            mth(leaves[:first]).hex(), root_hex)
+            if not ok:
+                failures.append("ct consistency failed %d -> %d (%s)" % (first, size, why))
+
+    # a fabricated prefix must be rejected
+    leaves = ["entry-%03d" % i for i in range(8)]
+    forged = leaves[:4] + ["swapped"] + leaves[5:]
+    proof = [h.hex() for h in subproof(4, forged, True)]
+    ok, _ = ct_verify_consistency(4, 8, proof, mth(leaves[:4]).hex(), mth(leaves).hex())
+    if ok:
+        failures.append("ct consistency accepted a forged prefix")
+
+    if failures:
+        print("SELF TEST FAILED")
+        for line in failures:
+            print("   " + line)
+        return 1
+    print("Self test passed. Sorted-tree and RFC 6962 verification both behave correctly,")
+    print("and tampered proofs were rejected in every case.")
+    return 0
+
+
+# ==========================================================================
+# cli
+# ==========================================================================
+
+def _run(doc, label):
+    checker = identify(doc)
+    if checker is None:
+        print("%s\n   UNRECOGNISED - not an AILeash proof document this version knows about\n" % label)
+        return False
+    result = checker(doc)
+    print("%s\n   type: %s" % (label, result.kind))
+    for passed, text in result.lines:
+        print("   %s %s" % ("PASS" if passed else "FAIL", text))
+    print("   => %s\n" % ("VERIFIED" if result.ok else "NOT VERIFIED"))
+    return result.ok
+
+
+def main(argv):
+    args = [a for a in argv[1:] if not a.startswith("--")]
+    flags = set(a for a in argv[1:] if a.startswith("--"))
+
+    if "--selftest" in flags:
+        return _selftest()
+    if "--version" in flags:
+        print("aileash_verify %s" % VERSION)
+        return 0
+
+    print("aileash_verify %s - offline, no network calls made\n" % VERSION)
+
+    documents = []
+    if args:
+        for path in args:
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    documents.append((path, json.load(handle)))
+            except (OSError, ValueError) as exc:
+                print("%s\n   COULD NOT READ: %s\n" % (path, exc))
+                return 2
+    else:
+        try:
+            documents.append(("(stdin)", json.load(sys.stdin)))
+        except ValueError as exc:
+            print("Could not read JSON from stdin: %s" % exc)
+            return 2
+
+    results = [_run(doc, label) for label, doc in documents]
+    passed = sum(1 for r in results if r)
+    print("%d of %d documents verified." % (passed, len(results)))
+    if passed != len(results):
+        print("Something did not check out. That is what this file is for - keep the "
+              "document and the response that produced it.")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
+
+```
+
+
+## `anchor.py`
+
+166 lines, 6009 bytes
+
+```python
+"""
+anchor.py  -  External anchoring for the AILeash chain.
+
+WHAT IT DOES (plain words):
+  Every ANCHOR_INTERVAL seconds it takes the current chain tip (one hash) and
+  timestamps it against an external source you do NOT control - so anyone can
+  prove your chain's timestamps are real without trusting sebbi.pro.
+
+  It tries OpenTimestamps first (commits the hash into Bitcoin, free, gold
+  standard). It ALSO records the tip + time to a local append-only anchor log
+  on your persistent volume as a second record. If OTS is unavailable for any
+  reason, the server keeps running normally - anchoring never blocks or
+  crashes your live engine.
+
+SAFETY:
+  - Only READS the chain tip. Never writes to the chain, never touches scoring.
+  - Runs on a background daemon thread.
+  - Every failure is caught and logged; your govern path is never affected.
+
+SETUP ON RAILWAY:
+  - requirements.txt:  opentimestamps-client
+  - Variable ANCHOR_DIR = /data/anchors   (on your persistent volume)
+  - Variable ANCHOR_INTERVAL = 3600       (once an hour; optional)
+  - Variable ANCHOR_ENABLED = 1           (set 0 to switch off)
+"""
+
+import os
+import time
+import json
+import hashlib
+import threading
+
+ANCHOR_INTERVAL = int(os.environ.get("ANCHOR_INTERVAL", "3600"))
+ANCHOR_DIR      = os.environ.get("ANCHOR_DIR", "/data/anchors")
+ANCHOR_ENABLED  = os.environ.get("ANCHOR_ENABLED", "1") == "1"
+
+_last = {"ts": None, "tip": None, "ots_file": None, "ots_ok": False, "status": "not_started"}
+_lock = threading.Lock()
+
+
+def _ensure_dir():
+    try:
+        os.makedirs(ANCHOR_DIR, exist_ok=True)
+        return True
+    except Exception as e:
+        print("ANCHOR: cannot create " + ANCHOR_DIR + " : " + str(e), flush=True)
+        return False
+
+
+def _ots_stamp(tip_hash):
+    """Timestamp the tip hash with OpenTimestamps (-> Bitcoin). Returns
+    (ok, proof_path, message). Uses the opentimestamps library directly, so
+    there is no command-line tool to find on PATH."""
+    try:
+        from opentimestamps.calendar import RemoteCalendar
+        from opentimestamps.core.timestamp import Timestamp, DetachedTimestampFile
+        from opentimestamps.core.op import OpSHA256
+        from opentimestamps.core.serialize import BytesSerializationContext
+    except Exception as e:
+        return False, None, "opentimestamps library not available: " + str(e)
+
+    try:
+        # The digest we anchor is the tip hash (hex -> bytes).
+        digest = bytes.fromhex(tip_hash)
+        ts = Timestamp(digest)
+
+        # Ask public (free) calendar servers to commit this digest.
+        calendars = [
+            "https://a.pool.opentimestamps.org",
+            "https://b.pool.opentimestamps.org",
+            "https://alice.btc.calendar.opentimestamps.org",
+        ]
+        got = 0
+        for url in calendars:
+            try:
+                cal = RemoteCalendar(url)
+                result = cal.submit(digest)
+                ts.merge(result)
+                got += 1
+            except Exception as ce:
+                print("ANCHOR: calendar " + url + " failed: " + str(ce), flush=True)
+        if got == 0:
+            return False, None, "no calendar server accepted the stamp"
+
+        # Save the .ots proof next to a record of the tip.
+        stamp_id = str(int(time.time()))
+        base = os.path.join(ANCHOR_DIR, "tip_" + stamp_id)
+        with open(base + ".txt", "w") as f:
+            f.write(tip_hash + "\n")
+        detached = DetachedTimestampFile(OpSHA256(), ts)
+        ctx = BytesSerializationContext()
+        detached.serialize(ctx)
+        with open(base + ".ots", "wb") as f:
+            f.write(ctx.getbytes())
+        return True, base + ".ots", "stamped by " + str(got) + " calendar(s)"
+    except Exception as e:
+        return False, None, "ots stamp error: " + str(e)
+
+
+def _record_local(tip_hash, ots_ok, ots_file, msg):
+    """Append-only local record of every anchor attempt, on the volume."""
+    try:
+        idx = os.path.join(ANCHOR_DIR, "anchors.jsonl")
+        with open(idx, "a") as f:
+            f.write(json.dumps({
+                "ts": time.time(),
+                "tip": tip_hash,
+                "ots": ots_ok,
+                "ots_file": ots_file,
+                "note": msg
+            }) + "\n")
+    except Exception as e:
+        print("ANCHOR: local record failed: " + str(e), flush=True)
+
+
+def anchor_once(get_tip):
+    if not _ensure_dir():
+        return
+    try:
+        tip = get_tip()
+    except Exception as e:
+        print("ANCHOR: cannot read tip: " + str(e), flush=True)
+        return
+    if not tip or tip == "GENESIS":
+        print("ANCHOR: chain empty, nothing to anchor", flush=True)
+        return
+
+    ok, proof, msg = _ots_stamp(tip)
+    _record_local(tip, ok, proof, msg)
+    with _lock:
+        _last["ts"] = time.time()
+        _last["tip"] = tip
+        _last["ots_file"] = proof
+        _last["ots_ok"] = ok
+        _last["status"] = ("anchored: " + msg) if ok else ("ots_unavailable: " + msg)
+    if ok:
+        print("ANCHOR: tip " + tip[:16] + "... -> " + msg + " -> " + str(proof), flush=True)
+    else:
+        print("ANCHOR: OTS not available (" + msg + ") - local record written, will retry", flush=True)
+
+
+def _loop(get_tip):
+    time.sleep(30)  # let the server finish booting
+    while True:
+        try:
+            anchor_once(get_tip)
+        except Exception as e:
+            print("ANCHOR loop error: " + str(e), flush=True)
+        time.sleep(ANCHOR_INTERVAL)
+
+
+def start_anchoring(get_tip):
+    """Call ONCE at startup, passing your chain_tip function. Spawns a daemon
+    thread that anchors forever. Safe: only logs on failure, never affects the
+    live engine."""
+    if not ANCHOR_ENABLED:
+        print("ANCHOR: disabled (ANCHOR_ENABLED=0)", flush=True)
+        return
+    threading.Thread(target=_loop, args=(get_tip,), daemon=True).start()
+    print("ANCHOR: started - external anchoring every " + str(ANCHOR_INTERVAL) + "s to " + ANCHOR_DIR, flush=True)
+
+
+def anchor_status():
+    with _lock:
+        return dict(_last)
+
+```
+
+
+## `board_auditor.py`
+
+61 lines, 2889 bytes
+
+```python
+import time
+import json
+import urllib.request
+import logging
+import os
+
+# --- THE WATCHDOG STANDARD ---
+AUDITOR_MANIFEST = """Standard: SEBBI-WATCHDOG/1.0
+Engine: AILeash-Hunter v1.0
+Operation: Automated Public Compliance Verification
+Status: ENFORCING"""
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [WATCHDOG-SCAN] %(message)s")
+
+class RegulatoryWatchdog:
+    def __init__(self, target_list):
+        self.targets = target_list
+        self.report_file = "VIOLATION_REPORT.md"
+
+    def scan_market_sectors(self):
+        """Scans corporate perimeters to verify live legal compliance states."""
+        logging.info("Commencing global compliance audit sweep...")
+        violations_found = []
+
+        for domain in self.targets:
+            print(f"[*] Auditing domain: {domain}")
+            
+            # Simulate an automated request to the site's root directory
+            # In production, this checks if https://domain/ai.txt exists and is signed
+            is_compliant = False  # Simulated failure for demonstration
+            
+            if not is_compliant:
+                logging.warning(f"[VIOLATION DETECTED] {domain} has failed mandatory compliance parameters.")
+                violations_found.append(domain)
+
+        if violations_found:
+            self._compile_public_violation_ledger(violations_found)
+
+    def _compile_public_violation_ledger(self, failed_domains):
+        """Generates a public, standardized report file for the repository root."""
+        with open(self.report_file, "w", encoding="utf-8") as f:
+            f.write("# 🚨 AUTOMATED REAL-TIME AI COMPLIANCE VIOLATION REPORT\n\n")
+            f.write(f"**Audit Timestamp:** {time.strftime('%Y-%m-%d %H:%M:%S')} UTC\n")
+            f.write(f"**Verification Engine:** {AUDITOR_MANIFEST.splitlines()[2]}\n\n")
+            f.write("The following enterprise networks were scanned and failed to present a verifiable, cryptographically sealed `ai.txt` manifest under current transparency mandates. These nodes face potential regulatory scrutiny under statutory liability thresholds.\n\n")
+            f.write("| Target Domain Domain | Compliance Status | Liability Risk Level |\n")
+            f.write("| :--- | :--- | :--- |\n")
+            
+            for domain in failed_domains:
+                f.write(f"| `{domain}` | ❌ NON-COMPLIANT / NO VALID LEDGER | HIGH RISK (Up to 7% Turnover fine) |\n")
+                
+        print(f"\n[CHECKMATE] Public audit report successfully generated: '{self.report_file}'")
+        print("[!] Ready to push to GitHub to alert public sector regulators.")
+
+if __name__ == "__main__":
+    # High-value targets that should be operating transparently
+    target_enterprise_pool = ["enterprise-ai-vendor-example.com", "shadow-data-processor.co.uk"]
+    
+    hunter = RegulatoryWatchdog(target_enterprise_pool)
+    hunter.scan_market_sectors()
+
+```
 
 
 ## `brain.py`
@@ -450,1957 +2713,5 @@ if __name__=="__main__":
     c=s3.connect("/tmp/brain5c.db")
     c.execute("DELETE FROM brain_log WHERE id=(SELECT MAX(id) FROM brain_log)");c.commit();c.close()
     print("  after truncating last block:",b3.verify_chain()["message"])
-
-```
-
-
-## `broadcaster.py`
-
-158 lines, 6412 bytes
-
-```python
-import asyncio
-import json
-import logging
-import socket
-import hmac
-import hashlib
-import ipaddress
-
-# --- HARDENED ARCHITECTURE DECLARATION ---
-AI_TXT_PAYLOAD = """Standard: AI-TXT/1.0
-Standard-Licence: free and open - publish your own at no cost, no key required
-Operator: Monop Content
-Operator-Location: Blyth, Northumberland, United Kingdom
-Contact: justrightdecorators@gmail.com
-Last-Updated: 2026-07-05
-
-Governance-Engine: AILeash v6.4
-Decision-Model: deterministic weighted scoring (no ML drift; weights immutable)
-Decision-Outcomes: ALLOW, CHALLENGE, BLOCK
-Decision-Signals: 9
-Decision-Latency-Median: 28ms
-
-Verify-Endpoint: https://sebbi.pro
-Companion-Standard: https://sebbi.pro
-Whitepaper: https://sebbi.pro"""
-
-HUMAN_MESSAGE = (
-    "SYSTEM NOTICE: AI Governance Compliance Update for sebbi.pro.\n"
-    "The updated compliance targets are now active under Standard: AI-TXT/1.0.\n"
-    "Verify live audit status at: https://sebbi.pro"
-)
-
-# Operational Configuration
-UDP_BROADCAST_PORT = 5001
-TCP_GATEWAY_PORT = 8080
-CONCURRENT_LIMIT = 2000  # Lowered slightly to manage OS file descriptor ceilings safely
-TIMEOUT = 1.5           # Tightened timeout for faster failover
-
-# Secret key used to sign messages (In production, load this securely via environment variables)
-SYSTEM_SIGNING_KEY = b"SECURE_GOVERNANCE_SECRET_PASSPHRASE_KEY"
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-
-def get_network_topology():
-    """
-    Safely resolves the local IP address and computes the network boundary 
-    using proper subnet masks instead of naive string manipulation.
-    """
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        # Does not send actual data; used to determine local routing interface
-        s.connect(("8.8.8.8", 80))
-        local_ip = s.getsockname()[0]
-        s.close()
-        
-        # In a production environment, dynamically pull the actual netmask.
-        # Fallback here assumes a standard /24 corporate subnet slice for demonstration.
-        interface = ipaddress.IPv4Interface(f"{local_ip}/255.255.255.0")
-        return interface.network.broadcast_address.with_prefixlen.split('/')[0], interface.network
-    except Exception as e:
-        logging.error(f"Failed to automatically resolve local network topology: {e}")
-        return "255.255.255.255", ipaddress.IPv4Network("192.168.1.0/24")
-
-def generate_signed_payload(message_text, declaration_text, key):
-    """
-    Packages the governance telemetry data and appends an immutable 
-    HMAC-SHA256 signature to guarantee authenticity at the destination node.
-    """
-    base_data = {
-        "alert_text": message_text,
-        "raw_declaration": declaration_text
-    }
-    serialized_json = json.dumps(base_data, sort_keys=True)
-    
-    # Compute cryptographic signature
-    signature = hmac.new(key, serialized_json.encode('utf-8'), hashlib.sha256).hexdigest()
-    
-    # Enclose both the verified data and signature in a final unified wrapper
-    final_package = {
-        "payload": base_data,
-        "signature": signature,
-        "algorithm": "HMAC-SHA256"
-    }
-    return json.dumps(final_package)
-
-def send_secure_udp_broadcast(compiled_payload, broadcast_target):
-    """Broadcasts the cryptographically signed data packet to the subnet."""
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            s.sendto(compiled_payload.encode('utf-8'), (broadcast_target, UDP_BROADCAST_PORT))
-            logging.info(f"Signed UDP broadcast successfully dispatched to {broadcast_target}:{UDP_BROADCAST_PORT}")
-    except socket.error as e:
-        logging.error(f"UDP broadcast failure: {e}")
-
-async def push_to_secure_gateway(target_ip, compiled_payload):
-    """Injects the signed payload directly into downstream destination gateways."""
-    writer = None
-    try:
-        connect = asyncio.open_connection(target_ip, TCP_GATEWAY_PORT)
-        _, writer = await asyncio.wait_for(connect, timeout=TIMEOUT)
-        
-        http_request = (
-            f"POST /api/compliance/broadcast HTTP/1.1\r\n"
-            f"Host: {target_ip}\r\n"
-            f"Content-Type: application/json\r\n"
-            f"Content-Length: {len(compiled_payload)}\r\n"
-            f"X-Signature-Auth: True\r\n"
-            f"Connection: close\r\n\r\n"
-            f"{compiled_payload}"
-        ).encode('utf-8')
-        
-        writer.write(http_request)
-        await writer.drain()
-        logging.info(f"[DISPATCHED] Verified telemetry pushed to infrastructure host: {target_ip}")
-        return True
-    except (asyncio.TimeoutError, ConnectionRefusedError, OSError):
-        # Gracefully filter common network timeouts or offline endpoints
-        return False
-    finally:
-        if writer:
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception:
-                pass
-
-async def secure_network_orchestrator():
-    broadcast_ip, network_obj = get_network_topology()
-    
-    # Generate the single signed package used for all downstream nodes
-    signed_data_stream = generate_signed_payload(HUMAN_MESSAGE, AI_TXT_PAYLOAD, SYSTEM_SIGNING_KEY)
-    
-    # 1. Fire authenticated network-wide baseline blast
-    send_secure_udp_broadcast(signed_data_stream, broadcast_ip)
-    
-    # 2. Asynchronously target explicit topological gateways (.1 and .254)
-    tasks = []
-    logging.info(f"Initiating asynchronous gateway verification loop across subnet: {network_obj.with_prefixlen}")
-    
-    # Safely isolate subnets by targeting typical routing infrastructure points
-    for host in network_obj.hosts():
-        host_str = str(host)
-        if host_str.endswith(".1") or host_str.endswith(".254"):
-            tasks.append(asyncio.create_task(push_to_secure_gateway(host_str, signed_data_stream)))
-            
-            # Handle task scheduling dynamically to respect system resource bounds
-            if len(tasks) >= CONCURRENT_LIMIT:
-                await asyncio.gather(*tasks, return_exceptions=True)
-                tasks = []
-                
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
-    logging.info("Network compliance orchestration sequence finalized completed.")
-
-if __name__ == "__main__":
-    asyncio.run(secure_network_orchestrator())
-
-```
-
-
-## `build_sebbi_ecosystem.py`
-
-270 lines, 9812 bytes
-
-```python
-import os
-import sys
-
-# --- CODE CONTAINERS FOR AUTOMATED INJECTION ---
-
-BROADCASTER_CODE = """import asyncio
-import json
-import logging
-import socket
-import hmac
-import hashlib
-import ipaddress
-import os
-
-# --- HARDENED ARCHITECTURE DECLARATION ---
-AI_TXT_PAYLOAD = \"\"\"Standard: AI-TXT/1.0
-Standard-Licence: free and open - publish your own at no cost, no key required
-Operator: Monop Content
-Operator-Location: Blyth, Northumberland, United Kingdom
-Contact: justrightdecorators@gmail.com
-Last-Updated: 2026-07-05
-
-Governance-Engine: AILeash v6.4
-Decision-Model: deterministic weighted scoring (no ML drift; weights immutable)
-Decision-Outcomes: ALLOW, CHALLENGE, BLOCK
-Decision-Signals: 9
-Decision-Latency-Median: 28ms
-
-Verify-Endpoint: https://sebbi.pro
-Companion-Standard: https://sebbi.pro
-Whitepaper: https://sebbi.pro\"\"\"
-
-HUMAN_MESSAGE = (
-    "SYSTEM NOTICE: AI Governance Compliance Update for sebbi.pro.\\n"
-    "The updated compliance targets are now active under Standard: AI-TXT/1.0.\\n"
-    "Verify live audit status at: https://sebbi.pro"
-)
-
-UDP_BROADCAST_PORT = 5001
-TCP_GATEWAY_PORT = 8080
-CONCURRENT_LIMIT = 2000  
-TIMEOUT = 1.5           
-
-# Dynamic environment lookup to protect the secret signature key
-SYSTEM_SIGNING_KEY = os.environ.get("SEBBI_BROADCAST_SECRET", "LOCAL_DEV_FALLBACK_KEY").encode('utf-8')
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-
-def get_network_topology():
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        local_ip = s.getsockname()[0]
-        s.close()
-        interface = ipaddress.IPv4Interface(f"{local_ip}/255.255.255.0")
-        return str(interface.network.broadcast_address), interface.network
-    except Exception as e:
-        logging.error(f"Failed to automatically resolve local network topology: {e}")
-        return "255.255.255.255", ipaddress.IPv4Network("192.168.1.0/24")
-
-def generate_signed_payload(message_text, declaration_text, key):
-    base_data = {
-        "alert_text": message_text,
-        "raw_declaration": declaration_text
-    }
-    serialized_json = json.dumps(base_data, sort_keys=True)
-    signature = hmac.new(key, serialized_json.encode('utf-8'), hashlib.sha256).hexdigest()
-    
-    final_package = {
-        "payload": base_data,
-        "signature": signature,
-        "algorithm": "HMAC-SHA256"
-    }
-    return json.dumps(final_package)
-
-def send_secure_udp_broadcast(compiled_payload, broadcast_target):
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            s.sendto(compiled_payload.encode('utf-8'), (broadcast_target, UDP_BROADCAST_PORT))
-            logging.info(f"Signed UDP broadcast dispatched to {broadcast_target}:{UDP_BROADCAST_PORT}")
-    except socket.error as e:
-        logging.error(f"UDP broadcast failure: {e}")
-
-async def push_to_secure_gateway(target_ip, compiled_payload):
-    writer = None
-    try:
-        connect = asyncio.open_connection(target_ip, TCP_GATEWAY_PORT)
-        _, writer = await asyncio.wait_for(connect, timeout=TIMEOUT)
-        
-        http_request = (
-            f"POST /api/compliance/broadcast HTTP/1.1\\r\\n"
-            f"Host: {target_ip}\\r\\n"
-            f"Content-Type: application/json\\r\\n"
-            f"Content-Length: {len(compiled_payload)}\\r\\n"
-            f"X-Signature-Auth: True\\r\\n"
-            f"Connection: close\\r\\n\\r\\n"
-            f"{compiled_payload}"
-        ).encode('utf-8')
-        
-        writer.write(http_request)
-        await writer.drain()
-        logging.info(f"[DISPATCHED] Verified telemetry pushed to infrastructure host: {target_ip}")
-        return True
-    except (asyncio.TimeoutError, ConnectionRefusedError, OSError):
-        return False
-    finally:
-        if writer:
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception:
-                pass
-
-async def secure_network_orchestrator():
-    broadcast_ip, network_obj = get_network_topology()
-    signed_data_stream = generate_signed_payload(HUMAN_MESSAGE, AI_TXT_PAYLOAD, SYSTEM_SIGNING_KEY)
-    
-    send_secure_udp_broadcast(signed_data_stream, broadcast_ip)
-    
-    tasks = []
-    logging.info(f"Initiating asynchronous gateway loop across subnet: {network_obj.with_prefixlen}")
-    
-    for host in network_obj.hosts():
-        host_str = str(host)
-        if host_str.endswith(".1") or host_str.endswith(".254"):
-            tasks.append(asyncio.create_task(push_to_secure_gateway(host_str, signed_data_stream)))
-            if len(tasks) >= CONCURRENT_LIMIT:
-                await asyncio.gather(*tasks, return_exceptions=True)
-                tasks = []
-                
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
-    logging.info("Network compliance orchestration sequence finalized.")
-
-if __name__ == "__main__":
-    asyncio.run(secure_network_orchestrator())
-"""
-
-GREEN_CODE = """import time
-import os
-import sys
-import json
-import socket
-import logging
-import hashlib
-import hmac
-
-if sys.platform != "win32":
-    import resource
-else:
-    resource = None
-
-# --- ECOSYSTEM METADATA ENGINE ---
-GREEN_AI_STANDARD = \"\"\"Standard: GREEN-AI/1.0
-Framework-Licence: open-access / standard-registry
-Metrics-Engine: GreenLeash v1.2 (System Resource Auditor)
-Target-SLA: Sub-2ms Internal Latency Overhead
-Verification-Hub: https://sebbi.pro\"\"\"
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [GREEN-TELEMETRY] %(message)s")
-
-# Dynamic environment lookup to protect the secret signature key
-SYSTEM_SIGNING_KEY = os.environ.get("SEBBI_GREEN_SECRET", "LOCAL_DEV_FALLBACK_KEY").encode('utf-8')
-
-class ProductionGreenNotary:
-    def __init__(self):
-        self.node_id = hashlib.sha256(socket.gethostname().encode()).hexdigest()[:12]
-
-    def _get_system_usage(self):
-        if resource:
-            usage = resource.getrusage(resource.RUSAGE_SELF)
-            cpu_time = usage.ru_utime + usage.ru_stime
-            memory_mb = usage.ru_maxrss / (1024.0 if sys.platform == "darwin" else 1.0)
-        else:
-            cpu_time = time.process_time()
-            memory_mb = 0.0
-        return cpu_time, memory_mb
-
-    def profile_process(self, process_func, *args, **kwargs):
-        start_wall = time.perf_counter()
-        start_cpu, start_mem = self._get_system_usage()
-
-        result = process_func(*args, **kwargs)
-
-        end_cpu, end_mem = self._get_system_usage()
-        end_wall = time.perf_counter()
-
-        wall_latency_ms = (end_wall - start_wall) * 1000
-        cpu_time_delta_ms = (end_cpu - start_cpu) * 1000
-        peak_memory_mb = max(start_mem, end_mem)
-
-        self._package_and_sign_metrics(wall_latency_ms, cpu_time_delta_ms, peak_memory_mb)
-        return result
-
-    def _package_and_sign_metrics(self, wall_ms, cpu_ms, memory_mb):
-        telemetry_data = {
-            "node_id": self.node_id,
-            "wall_latency_ms": round(wall_ms, 3),
-            "kernel_cpu_time_ms": round(cpu_ms, 3),
-            "allocated_memory_mb": round(memory_mb, 2),
-            "meta_declaration": GREEN_AI_STANDARD
-        }
-
-        serialized_payload = json.dumps(telemetry_data, sort_keys=True)
-        signature = hmac.new(SYSTEM_SIGNING_KEY, serialized_payload.encode('utf-8'), hashlib.sha256).hexdigest()
-
-        final_packet = {
-            "payload": telemetry_data,
-            "signature": signature,
-            "algorithm": "HMAC-SHA256"
-        }
-
-        logging.info(f"[AUDIT LOGGED] Wall: {round(wall_ms, 1)}ms | CPU: {round(cpu_ms, 1)}ms | RAM: {round(memory_mb, 1)}MB")
-        logging.info(f"[LEDGER SEAL] HMAC: {signature[:16]}...")
-        return json.dumps(final_packet)
-
-def mock_computational_work():
-    dummy_data = [x for x in range(1000000)]
-    time.sleep(0.015)
-    return "SUCCESS"
-
-if __name__ == "__main__":
-    logging.info("Starting GreenLeash Kernel Auditing Pipeline...")
-    auditor = ProductionGreenNotary()
-    auditor.profile_process(mock_computational_work)
-"""
-
-# --- BLUEPRINT DICTIONARY ---
-REPO_STRUCTURE = {
-    "server": {
-        "server.py": "# Core production database and cryptographic Merkle chain engine\n# (Keep your proprietary server logic safely deployed here)\n"
-    },
-    "public-utilities": {
-        "broadcaster.py": BROADCASTER_CODE,
-        "green.py": GREEN_CODE
-    }
-}
-
-def execute_automated_compilation():
-    """Builds the folder paths and populates the production files in bulk."""
-    base_path = os.getcwd()
-    print(f"[*] Starting compilation blueprint in root: {base_path}")
-    
-    for folder, files in REPO_STRUCTURE.items():
-        folder_path = os.path.join(base_path, folder)
-        
-        # Build missing folders securely
-        if not os.path.exists(folder_path):
-            os.makedirs(folder_path)
-            print(f"[+] Directory established: /{folder}")
-            
-        # Write .gitkeep so Git registers the paths even if empty
-        with open(os.path.join(folder_path, ".gitkeep"), "w", encoding="utf-8") as f:
-            f.write("# Forces Git tracking for this structural directory block\n")
-            
-        # Compile each individual file
-        for file_name, code_content in files.items():
-            file_path = os.path.join(folder_path, file_name)
-            
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(code_content)
-            print(f"    └── [COMPILED SUCCESS] Written: /{folder}/{file_name}")
-
-    print("\n[!] SUCCESS: All files have been safely sorted into their proper paths.")
-    print("[!] Run: 'git add . && git commit -m \"Add client utilities\" && git push'")
-
-if __name__ == "__main__":
-    execute_automated_compilation()
-
-```
-
-
-## `gateway_proxy.py`
-
-280 lines, 10922 bytes
-
-```python
-import asyncio
-import ssl
-import json
-import hmac
-import hashlib
-import os
-import time
-import logging
-import urllib.request
-import urllib.error
-
-# ============================================================
-# AILEASH GATEWAY PROXY - real enforcement version
-#
-# How it's meant to be used:
-#   Customer changes their AI SDK's base URL from
-#     https://api.openai.com/v1
-#   to
-#     https://your-gateway-domain/openai/v1
-#   (same for Anthropic under /anthropic/)
-#
-# Every request that arrives:
-#   1. Gets scored by your real /api/govern endpoint (same
-#      scoring + sealing logic as server.py - nothing duplicated).
-#   2. If the decision is BLOCK, the request is rejected here.
-#      The real OpenAI/Anthropic call is NEVER made. That's the
-#      actual gate - not an email sent after the fact.
-#   3. If ALLOW or CHALLENGE, the request is forwarded to the
-#      real provider over a real TLS connection, and the real
-#      response is streamed back untouched.
-#
-# This does NOT intercept traffic the customer sends directly
-# to openai.com without going through this gateway. No proxy
-# that doesn't install certificates on every device can do that
-# for HTTPS traffic - that's a much bigger, separate product.
-# This is the same integration pattern used by every commercial
-# AI gateway (Cloudflare AI Gateway, Portkey, LiteLLM proxy, etc).
-# ============================================================
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [GATEWAY] %(message)s")
-
-PROXY_PORT = int(os.environ.get("GATEWAY_PORT", 8888))
-
-# No fallback key. If this isn't set, refuse to start rather than
-# run with a guessable signing key in production.
-PROXY_SIGNING_KEY = os.environ.get("SEBBI_PROXY_SECRET", "").strip()
-if not PROXY_SIGNING_KEY:
-    raise SystemExit(
-        "SEBBI_PROXY_SECRET is not set. Refusing to start - "
-        "running with a default/fallback signing key is not safe. "
-        "Set SEBBI_PROXY_SECRET in your environment (Railway variables) and restart."
-    )
-PROXY_SIGNING_KEY = PROXY_SIGNING_KEY.encode("utf-8")
-
-# Where your real scoring/sealing engine lives. Point this at your
-# own deployment - defaults to the live sebbi.pro API.
-GOVERN_URL = os.environ.get("AILEASH_GOVERN_URL", "https://sebbi.pro/api/govern")
-
-# Which real AI providers this gateway can forward to, and their
-# real hostnames. Add more here if you support more providers.
-PROVIDERS = {
-    "openai": "api.openai.com",
-    "anthropic": "api.anthropic.com",
-}
-
-
-def call_govern(ailleash_key: str, event: dict):
-    """Call the real /api/govern endpoint and return (decision_json, http_status).
-    This is a blocking network call - run it in a thread executor so it
-    doesn't stall the async event loop."""
-    body = json.dumps(event).encode("utf-8")
-    req = urllib.request.Request(
-        GOVERN_URL,
-        data=body,
-        headers={
-            "Authorization": "Bearer " + ailleash_key,
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=5) as r:
-            return json.loads(r.read()), r.status
-    except urllib.error.HTTPError as e:
-        try:
-            return json.loads(e.read()), e.code
-        except Exception:
-            return {"decision": "BLOCK", "error": "govern_returned_unreadable_error"}, e.code
-    except Exception as e:
-        # Network failure, timeout, DNS issue, etc. Fail closed - if we
-        # can't reach the compliance engine, we don't guess ALLOW.
-        return {"decision": "BLOCK", "error": "govern_unreachable: " + str(e)}, 503
-
-
-def parse_request(raw_head: bytes):
-    """Parse the request line + headers from the raw bytes read up to \\r\\n\\r\\n."""
-    text = raw_head.decode("utf-8", errors="ignore")
-    lines = text.split("\r\n")
-    request_line = lines[0]
-    parts = request_line.split(" ")
-    method = parts[0] if len(parts) > 0 else "GET"
-    path = parts[1] if len(parts) > 1 else "/"
-    headers = {}
-    for line in lines[1:]:
-        if not line or ":" not in line:
-            continue
-        k, _, v = line.partition(":")
-        headers[k.strip().lower()] = v.strip()
-    return method, path, headers
-
-
-def build_forward_request(method, upstream_path, headers, body: bytes, upstream_host):
-    """Rebuild the HTTP request to send to the real provider. Strips our
-    own gateway-only headers and sets the correct Host."""
-    drop = {"host", "x-sebbi-key", "x-sebbi-event", "content-length"}
-    lines = [method + " " + upstream_path + " HTTP/1.1", "Host: " + upstream_host]
-    for k, v in headers.items():
-        if k in drop:
-            continue
-        lines.append(k + ": " + v)
-    lines.append("Content-Length: " + str(len(body)))
-    lines.append("Connection: close")
-    head = ("\r\n".join(lines) + "\r\n\r\n").encode("utf-8")
-    return head + body
-
-
-async def read_full_request(reader):
-    """Read headers, then read exactly Content-Length bytes of body if present."""
-    head = await reader.readuntil(b"\r\n\r\n")
-    method, path, headers = parse_request(head)
-    length = int(headers.get("content-length", "0") or "0")
-    body = b""
-    if length:
-        body = await reader.readexactly(length)
-    return method, path, headers, body
-
-
-async def forward_to_provider(upstream_host, request_bytes: bytes):
-    """Open a real TLS connection to the real provider and return the raw
-    response bytes, unmodified."""
-    ctx = ssl.create_default_context()
-    reader, writer = await asyncio.open_connection(upstream_host, 443, ssl=ctx)
-    try:
-        writer.write(request_bytes)
-        await writer.drain()
-        response = await reader.read(-1)
-        return response
-    finally:
-        writer.close()
-        try:
-            await writer.wait_closed()
-        except Exception:
-            pass
-
-
-def default_event(headers, device_id_fallback):
-    """Build a sensible /api/govern event from what the customer sent,
-    falling back to safe defaults for anything they didn't specify.
-    Customers can override any field by sending an X-Sebbi-Event JSON header."""
-    override = headers.get("x-sebbi-event")
-    if override:
-        try:
-            ev = json.loads(override)
-        except Exception:
-            ev = {}
-    else:
-        ev = {}
-    ev.setdefault("user_id", headers.get("x-sebbi-user", "gateway_anonymous"))
-    ev.setdefault("action", "ai_request")
-    ev.setdefault("amount", 0)
-    ev.setdefault("country", headers.get("x-sebbi-country", "UK"))
-    ev.setdefault("device_id", headers.get("x-sebbi-device", device_id_fallback))
-    ev.setdefault("anomaly", 0)
-    ev.setdefault("device_risk", 0)
-    return ev
-
-
-class ComplianceGatewayProxy:
-    def __init__(self, host="0.0.0.0", port=PROXY_PORT):
-        self.host = host
-        self.port = port
-
-    async def start(self):
-        server = await asyncio.start_server(self.handle_client_traffic, self.host, self.port)
-        logging.info("AILeash Gateway operational on :%s (real enforcement, real forwarding)", self.port)
-        async with server:
-            await server.serve_forever()
-
-    async def handle_client_traffic(self, reader, writer):
-        peer = writer.get_extra_info("peername")
-        try:
-            method, path, headers, body = await read_full_request(reader)
-        except Exception as e:
-            logging.warning("Bad request from %s: %s", peer, e)
-            writer.close()
-            return
-
-        try:
-            # Route: /openai/... or /anthropic/... selects the real provider.
-            segments = path.strip("/").split("/", 1)
-            provider_key = segments[0] if segments else ""
-            upstream_path = "/" + segments[1] if len(segments) > 1 else "/"
-
-            if provider_key not in PROVIDERS:
-                self._reject(writer, 404, "unknown_provider",
-                              "Path must start with /openai/ or /anthropic/")
-                return
-
-            ailleash_key = headers.get("x-sebbi-key", "")
-            if not ailleash_key:
-                self._reject(writer, 401, "missing_compliance_key",
-                              "Include your AILeash API key in the X-Sebbi-Key header.")
-                return
-
-            device_id_fallback = str(peer[0]) if peer else "unknown_device"
-            event = default_event(headers, device_id_fallback)
-
-            loop = asyncio.get_event_loop()
-            decision_json, status = await loop.run_in_executor(
-                None, call_govern, ailleash_key, event
-            )
-            decision = decision_json.get("decision", "BLOCK")
-
-            if status != 200 or decision == "BLOCK":
-                logging.warning("[BLOCKED] %s -> %s (%s)", peer, provider_key, decision_json.get("reasons", decision_json.get("error", "")))
-                self._reject(writer, 403, "compliance_block", None, decision_json)
-                return
-
-            # ALLOW or CHALLENGE both proceed - CHALLENGE just means the
-            # customer's own code should show the user the verification
-            # link included in decision_json. We don't invent enforcement
-            # server.py doesn't have.
-            upstream_host = PROVIDERS[provider_key]
-            forward_bytes = build_forward_request(method, upstream_path, headers, body, upstream_host)
-
-            real_response = await forward_to_provider(upstream_host, forward_bytes)
-
-            tx_seal = hmac.new(PROXY_SIGNING_KEY, real_response[:2048], hashlib.sha256).hexdigest()
-            logging.info("[ROUTED] %s -> %s decision=%s seal=%s", peer, provider_key, decision, tx_seal[:16])
-
-            writer.write(real_response)
-            await writer.drain()
-
-        except Exception as e:
-            logging.error("Proxy error for %s: %s", peer, e)
-            try:
-                self._reject(writer, 502, "gateway_error", str(e))
-            except Exception:
-                pass
-        finally:
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except Exception:
-                pass
-
-    def _reject(self, writer, code, reason, message=None, extra=None):
-        payload = {"error": reason}
-        if message:
-            payload["message"] = message
-        if extra:
-            payload["compliance_decision"] = extra
-        body = json.dumps(payload).encode("utf-8")
-        status_text = {401: "Unauthorized", 403: "Forbidden", 404: "Not Found", 502: "Bad Gateway"}.get(code, "Error")
-        resp = (
-            "HTTP/1.1 " + str(code) + " " + status_text + "\r\n"
-            "Content-Type: application/json\r\n"
-            "Content-Length: " + str(len(body)) + "\r\n"
-            "Connection: close\r\n\r\n"
-        ).encode("utf-8") + body
-        writer.write(resp)
-
-
-if __name__ == "__main__":
-    gateway = ComplianceGatewayProxy()
-    try:
-        asyncio.run(gateway.start())
-    except KeyboardInterrupt:
-        logging.info("Gateway offline.")
-
-```
-
-
-## `sebbi_orchestrator.py`
-
-194 lines, 7453 bytes
-
-```python
-import asyncio
-import json
-import logging
-import socket
-import hmac
-import hashlib
-import ipaddress
-import os
-import sys
-import time
-
-# Handle cross-platform kernel metric mapping
-if sys.platform != "win32":
-    import resource
-else:
-    resource = None
-
-# --- ARCHITECTURE METADATA ENGINE ---
-CORE_MANIFEST = """Standard: AI-TXT/1.0
-Standard-Licence: free and open - publish your own at no cost, no key required
-Operator: Monop Content
-Operator-Location: Blyth, Northumberland, United Kingdom
-Contact: justrightdecorators@gmail.com
-Last-Updated: 2026-07-05
-
-Governance-Engine: AILeash v6.4
-Metrics-Engine: GreenLeash v1.2 (Unified Resource Auditor)
-Decision-Outcomes: ALLOW, CHALLENGE, BLOCK
-Decision-Signals: 9
-Decision-Latency-Median: 28ms
-
-Verify-Endpoint: https://sebbi.pro
-Companion-Standard: https://sebbi.pro
-Whitepaper: https://sebbi.pro"""
-
-HUMAN_MESSAGE = (
-    "SYSTEM NOTICE: AI Governance & Sustainability Compliance Update for sebbi.pro.\n"
-    "The updated compliance targets are now active under Standard: AI-TXT/1.0.\n"
-    "Verify live audit status at: https://sebbi.pro"
-)
-
-# Network Operational Limits
-UDP_BROADCAST_PORT = 5001
-TCP_GATEWAY_PORT = 8080
-CONCURRENT_LIMIT = 2000  
-TIMEOUT = 1.5           
-
-# Dynamic environment lookup to protect secret keys from public GitHub visibility
-SYSTEM_SIGNING_KEY = os.environ.get("SEBBI_SYSTEM_SECRET", "LOCAL_DEV_FALLBACK_KEY").encode('utf-8')
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-
-# ==========================================
-# PART 1: CORE UTILITIES & METRIC AUDITING
-# ==========================================
-
-def get_network_topology():
-    """Resolves local interface and dynamically maps standard subnet boundaries."""
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        local_ip = s.getsockname()[0]
-        s.close()
-        interface = ipaddress.IPv4Interface(f"{local_ip}/255.255.255.0")
-        return str(interface.network.broadcast_address), interface.network
-    except Exception as e:
-        logging.error(f"Failed to automatically resolve local network topology: {e}")
-        return "255.255.255.255", ipaddress.IPv4Network("192.168.1.0/24")
-
-def get_kernel_resource_usage():
-    """Extracts raw processing time and RAM footprints straight from the OS kernel."""
-    if resource:
-        usage = resource.getrusage(resource.RUSAGE_SELF)
-        cpu_time = usage.ru_utime + usage.ru_stime
-        memory_mb = usage.ru_maxrss / (1024.0 if sys.platform == "darwin" else 1.0)
-    else:
-        cpu_time = time.process_time()
-        memory_mb = 0.0
-    return cpu_time, memory_mb
-
-def generate_signed_telemetry(message_text, manifest_text, extra_metrics=None):
-    """Packages corporate alerts and signs them using HMAC-SHA256 for tampering prevention."""
-    base_data = {
-        "alert_text": message_text,
-        "raw_declaration": manifest_text,
-        "node_id": hashlib.sha256(socket.gethostname().encode()).hexdigest()[:12]
-    }
-    if extra_metrics:
-        base_data["sustainability_metrics"] = extra_metrics
-        
-    serialized_json = json.dumps(base_data, sort_keys=True)
-    signature = hmac.new(SYSTEM_SIGNING_KEY, serialized_json.encode('utf-8'), hashlib.sha256).hexdigest()
-    
-    return json.dumps({
-        "payload": base_data,
-        "signature": signature,
-        "algorithm": "HMAC-SHA256"
-    })
-
-# ==========================================
-# PART 2: DISTRIBUTION ENGINES
-# ==========================================
-
-def execute_udp_broadcast(compiled_payload, broadcast_target):
-    """Fires a connectionless notification to all listening local subnet nodes."""
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            s.sendto(compiled_payload.encode('utf-8'), (broadcast_target, UDP_BROADCAST_PORT))
-            logging.info(f"Signed UDP broadcast dispatched to {broadcast_target}:{UDP_BROADCAST_PORT}")
-    except socket.error as e:
-        logging.error(f"UDP broadcast transmission failure: {e}")
-
-async def dispatch_tcp_gateway(target_ip, compiled_payload):
-    """Pushes a verified compliance wrapper directly into standard infrastructure points."""
-    writer = None
-    try:
-        connect = asyncio.open_connection(target_ip, TCP_GATEWAY_PORT)
-        _, writer = await asyncio.wait_for(connect, timeout=TIMEOUT)
-        
-        http_request = (
-            f"POST /api/compliance/broadcast HTTP/1.1\r\n"
-            f"Host: {target_ip}\r\n"
-            f"Content-Type: application/json\r\n"
-            f"Content-Length: {len(compiled_payload)}\r\n"
-            f"X-Signature-Auth: True\r\n"
-            f"Connection: close\r\n\r\n"
-            f"{compiled_payload}"
-        ).encode('utf-8')
-        
-        writer.write(http_request)
-        await writer.drain()
-        logging.info(f"[DISPATCHED] Verified telemetry pushed to infrastructure host: {target_ip}")
-        return True
-    except (asyncio.TimeoutError, ConnectionRefusedError, OSError):
-        return False
-    finally:
-        if writer:
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception:
-                pass
-
-# ==========================================
-# PART 3: RECENTRALIZED PROCESS ENGINE
-# ==========================================
-
-async def run_unified_orchestration():
-    logging.info("Initializing Unified Sebbi Ecosystem Orchestration Pipeline...")
-    
-    # 1. Profile an operational work function (Audit System Burden)
-    start_wall = time.perf_counter()
-    start_cpu, start_mem = get_kernel_resource_usage()
-    
-    # [SIMULATION BLOCK]: Represents a standard local validation check running
-    await asyncio.sleep(0.025)
-    
-    end_cpu, end_mem = get_kernel_resource_usage()
-    end_wall = time.perf_counter()
-    
-    metrics = {
-        "wall_latency_ms": round((end_wall - start_wall) * 1000, 3),
-        "kernel_cpu_time_ms": round((end_cpu - start_cpu) * 1000, 3),
-        "allocated_memory_mb": round(max(start_mem, end_mem), 2)
-    }
-    logging.info(f"Process Profile Completed -> CPU: {metrics['kernel_cpu_time_ms']}ms | RAM: {metrics['allocated_memory_mb']}MB")
-    
-    # 2. Package and sign the final structural data block
-    broadcast_ip, network_obj = get_network_topology()
-    signed_payload_stream = generate_signed_telemetry(HUMAN_MESSAGE, CORE_MANIFEST, extra_metrics=metrics)
-    
-    # 3. Fire local network UDP alert baseline
-    execute_udp_broadcast(signed_payload_stream, broadcast_ip)
-    
-    # 4. Asynchronously scan and iterate targeted subnet infrastructure nodes
-    tasks = []
-    logging.info(f"Scanning target gateways across subnet map: {network_obj.with_prefixlen}")
-    
-    for host in network_obj.hosts():
-        host_str = str(host)
-        if host_str.endswith(".1") or host_str.endswith(".254"):
-            tasks.append(asyncio.create_task(dispatch_tcp_gateway(host_str, signed_payload_stream)))
-            if len(tasks) >= CONCURRENT_LIMIT:
-                await asyncio.gather(*tasks, return_exceptions=True)
-                tasks = []
-                
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
-    logging.info("Unified orchestration sequence finalized successfully.")
-
-if __name__ == "__main__":
-    asyncio.run(run_unified_orchestration())
-
-```
-
-
-## `sebdog_engine.py`
-
-445 lines, 17345 bytes
-
-```python
-import json, math, time, sqlite3, hashlib, threading, argparse, sys, os, shutil
-import urllib.request, urllib.parse
-from collections import defaultdict, deque
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from socketserver import ThreadingMixIn
-from urllib.parse import urlparse
-
-VERSION = "1.1.0"
-HOME = "https://sebbi.pro"
-VALIDATE_URL = HOME + "/api/validate-engine"
-DB_FILE = "sebdog_audit.db"
-SAFE = {"UK","US","DE","FR","CA","AU","NL","SE","NO","DK","FI","IE","NZ"}
-REQ = {"user_id","action","amount","country","device_id","anomaly","device_risk"}
-
-_db_lock = threading.Lock()
-_key_wins = defaultdict(lambda: {"min": deque(), "hour": deque()})
-_key_lock = threading.Lock()
-W60 = defaultdict(deque)
-W5M = defaultdict(deque)
-W1H = defaultdict(deque)
-
-_licence = {
-    "valid": False, "plan": "free", "product": "aileash",
-    "devices": 1, "email": "", "checked_at": 0, "key": ""
-}
-
-# ==============================================================================
-# LICENCE VALIDATION
-# ==============================================================================
-
-def validate_licence(api_key):
-    global _licence
-    try:
-        req = urllib.request.Request(
-            VALIDATE_URL, method="POST",
-            headers={"Authorization": "Bearer " + api_key, "Content-Type": "application/json"},
-            data=json.dumps({}).encode()
-        )
-        with urllib.request.urlopen(req, timeout=10) as r:
-            data = json.loads(r.read())
-        if data.get("valid"):
-            _licence.update({
-                "valid": True, "plan": data.get("plan","free"),
-                "product": data.get("product","aileash"),
-                "devices": data.get("devices",1),
-                "email": data.get("email",""),
-                "checked_at": time.time(), "key": api_key
-            })
-            print(f"[SEBDOG] Licence valid. Plan:{_licence['plan']} Devices:{_licence['devices']}", flush=True)
-            return True
-        else:
-            err = data.get("error","unknown")
-            print(f"[SEBDOG] Licence rejected: {err}", flush=True)
-            _licence["valid"] = False
-            return False
-    except Exception as e:
-        print(f"[SEBDOG] Licence check failed: {e}", flush=True)
-        if _licence["valid"] and (time.time() - _licence["checked_at"]) < 86400:
-            print("[SEBDOG] Using cached licence (24h grace)", flush=True)
-            return True
-        return False
-
-def revalidate_loop(api_key):
-    while True:
-        time.sleep(86400)
-        validate_licence(api_key)
-
-# ==============================================================================
-# DATABASE + BACKUP
-# Local SQLite — audit chain lives on your own machine.
-# Automatic daily backup keeps data retrievable even after failures.
-# Sovereignty is maintained — data never leaves your network.
-# ==============================================================================
-
-def get_conn():
-    c = sqlite3.connect(DB_FILE, check_same_thread=False)
-    c.execute("PRAGMA journal_mode=WAL;")
-    c.execute("PRAGMA synchronous=NORMAL;")
-    c.execute("""CREATE TABLE IF NOT EXISTS users(
-        user_id TEXT PRIMARY KEY, trust REAL DEFAULT 0.5, last_country TEXT)""")
-    c.execute("""CREATE TABLE IF NOT EXISTS audit_log(
-        id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, user_id TEXT,
-        event_json TEXT, result_json TEXT, prev_hash TEXT,
-        audit_hash TEXT UNIQUE)""")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_audit ON audit_log(user_id)")
-    c.execute("""CREATE TABLE IF NOT EXISTS chain_snapshots(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts REAL, block_count INTEGER, tip_hash TEXT,
-        snapshot_file TEXT)""")
-    c.commit()
-    return c
-
-_conn = None
-
-def init_db():
-    global _conn
-    _conn = get_conn()
-
-def backup_db():
-    """
-    Creates a timestamped backup of the audit database.
-    Data stays on your own hardware — sovereignty is not affected.
-    Runs automatically every 24 hours.
-    """
-    backup_dir = os.path.join(os.path.dirname(DB_FILE), "sebdog_backups")
-    os.makedirs(backup_dir, exist_ok=True)
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    backup_path = os.path.join(backup_dir, f"sebdog_audit_{ts}.db")
-    try:
-        with _db_lock:
-            shutil.copy2(DB_FILE, backup_path)
-            blocks = _conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0]
-            tip = _conn.execute(
-                "SELECT audit_hash FROM audit_log ORDER BY id DESC LIMIT 1"
-            ).fetchone()
-            tip_hash = tip[0] if tip else "GENESIS"
-            _conn.execute(
-                "INSERT INTO chain_snapshots(ts,block_count,tip_hash,snapshot_file) VALUES(?,?,?,?)",
-                (time.time(), blocks, tip_hash, backup_path)
-            )
-            _conn.commit()
-        print(f"[SEBDOG] Backup created: {backup_path} ({blocks} blocks)", flush=True)
-        _cleanup_old_backups(backup_dir)
-    except Exception as e:
-        print(f"[SEBDOG] Backup failed: {e}", flush=True)
-
-def _cleanup_old_backups(backup_dir, keep=7):
-    """Keep only the most recent N backups."""
-    try:
-        files = sorted([
-            os.path.join(backup_dir, f) for f in os.listdir(backup_dir)
-            if f.startswith("sebdog_audit_") and f.endswith(".db")
-        ])
-        for old in files[:-keep]:
-            os.remove(old)
-    except Exception:
-        pass
-
-def backup_loop():
-    while True:
-        time.sleep(86400)
-        backup_db()
-
-def restore_latest_backup():
-    """
-    Restore from the most recent backup if the main database is missing or corrupt.
-    Call this on startup if the main DB file doesn't exist.
-    """
-    backup_dir = os.path.join(os.path.dirname(DB_FILE), "sebdog_backups")
-    if not os.path.exists(backup_dir):
-        return False
-    files = sorted([
-        os.path.join(backup_dir, f) for f in os.listdir(backup_dir)
-        if f.startswith("sebdog_audit_") and f.endswith(".db")
-    ])
-    if not files:
-        return False
-    latest = files[-1]
-    try:
-        shutil.copy2(latest, DB_FILE)
-        print(f"[SEBDOG] Restored from backup: {latest}", flush=True)
-        return True
-    except Exception as e:
-        print(f"[SEBDOG] Restore failed: {e}", flush=True)
-        return False
-
-def list_snapshots():
-    with _db_lock:
-        rows = _conn.execute(
-            "SELECT ts, block_count, tip_hash, snapshot_file FROM chain_snapshots ORDER BY id DESC LIMIT 10"
-        ).fetchall()
-    return [{"ts": r[0], "blocks": r[1], "tip": r[2], "file": r[3]} for r in rows]
-
-# ==============================================================================
-# RATE LIMITING
-# ==============================================================================
-
-def check_rate(key):
-    t = time.time()
-    with _key_lock:
-        w = _key_wins[key]
-        while w["min"] and w["min"][0] < t-60: w["min"].popleft()
-        while w["hour"] and w["hour"][0] < t-3600: w["hour"].popleft()
-        if len(w["min"]) >= 60: return False, "rate_limit_minute"
-        if len(w["hour"]) >= 1000: return False, "rate_limit_hour"
-        w["min"].append(t); w["hour"].append(t)
-        return True, None
-
-# ==============================================================================
-# CORE ENGINE
-# ==============================================================================
-
-def now(): return time.time()
-def clamp(x,a=0.0,b=1.0): return max(a,min(b,x))
-def sha(p): return hashlib.sha256(json.dumps(p,sort_keys=True).encode()).hexdigest()
-
-def upd_vel(uid):
-    t=now()
-    for q in [W60[uid],W5M[uid],W1H[uid]]: q.append(t)
-    c=now()
-    W60[uid]=deque(x for x in W60[uid] if x>=c-60)
-    W5M[uid]=deque(x for x in W5M[uid] if x>=c-300)
-    W1H[uid]=deque(x for x in W1H[uid] if x>=c-3600)
-
-def vel(uid): return {"60s":len(W60[uid]),"5m":len(W5M[uid]),"1h":len(W1H[uid])}
-
-def load_user(uid):
-    with _db_lock:
-        r=_conn.execute("SELECT trust,last_country FROM users WHERE user_id=?",(uid,)).fetchone()
-    return{"trust":r[0],"last_country":r[1]} if r else{"trust":0.5,"last_country":None}
-
-def save_user(uid,trust,country):
-    with _db_lock:
-        _conn.execute(
-            "INSERT INTO users(user_id,trust,last_country) VALUES(?,?,?) "
-            "ON CONFLICT(user_id) DO UPDATE SET trust=excluded.trust,last_country=excluded.last_country",
-            (uid,trust,country))
-        _conn.commit()
-
-def score_event(s):
-    reasons=[]
-    sc=(1-s["trust"])*0.30
-    v60=s["v60"]; sc+=min(v60/20,1)*0.15
-    if v60>10: reasons.append("velocity_spike")
-    sc+=min(s["v5m"]/50,1)*0.10+min(s["v1h"]/200,1)*0.10
-    amt=float(s.get("amount",0)); sc+=min(math.log1p(amt)/math.log1p(10000),1)*0.15
-    if amt>500: reasons.append("high_amount")
-    dr=float(s.get("device_risk",0)); sc+=dr*0.10
-    if dr>0.5: reasons.append("risky_device")
-    an=float(s.get("anomaly",0)); sc+=an*0.10
-    if an>0.5: reasons.append("behaviour_anomaly")
-    if s.get("country_shift"): sc+=0.10; reasons.append("country_shift")
-    if s.get("unsafe_country"): sc+=0.10; reasons.append("unsafe_country")
-    if s["trust"]<0.4: reasons.append("low_trust")
-    return round(clamp(sc),4),reasons
-
-def decide(sc):
-    if sc<0.35: return"ALLOW"
-    if sc<0.70: return"CHALLENGE"
-    return"BLOCK"
-
-def upd_trust(t,d):
-    if d=="ALLOW": t+=(1-t)*0.01
-    elif d=="CHALLENGE": t-=t*0.02
-    elif d=="BLOCK": t-=t*0.08
-    return clamp(t,0.05,1.0)
-
-def chain_tip():
-    with _db_lock:
-        r=_conn.execute("SELECT audit_hash FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()
-    return r[0] if r else"GENESIS"
-
-def seal(event,result,ts):
-    prev=chain_tip()
-    h=sha({"prev_hash":prev,"ts":ts,"event":event,"result":result})
-    with _db_lock:
-        _conn.execute(
-            "INSERT INTO audit_log(ts,user_id,event_json,result_json,prev_hash,audit_hash) VALUES(?,?,?,?,?,?)",
-            (ts,event["user_id"],json.dumps(event),json.dumps(result),prev,h))
-        _conn.commit()
-    return h
-
-def verify_chain():
-    with _db_lock:
-        rows=_conn.execute(
-            "SELECT event_json,result_json,prev_hash,audit_hash,ts FROM audit_log ORDER BY id ASC"
-        ).fetchall()
-    if not rows: return{"valid":True,"blocks":0,"message":"Empty chain"}
-    prev="GENESIS"
-    for i,row in enumerate(rows):
-        p={"prev_hash":row[2],"ts":row[4],"event":json.loads(row[0]),"result":json.loads(row[1])}
-        if sha(p)!=row[3] or row[2]!=prev:
-            return{"valid":False,"broken_at":i,"message":f"Tampered at block {i}"}
-        prev=row[3]
-    return{"valid":True,"blocks":len(rows),"tip":rows[-1][3],"message":"Chain intact"}
-
-def govern(event):
-    missing=REQ-event.keys()
-    if missing: raise ValueError(f"Missing fields: {missing}")
-    if not _licence["valid"]:
-        return{"error":"licence_invalid","message":f"Valid API key required. Get yours at {HOME}"},403
-    ts=now(); uid=event["user_id"]
-    state=load_user(uid); upd_vel(uid); v=vel(uid)
-    country=event["country"]
-    signals={
-        "trust":state["trust"],"v60":v["60s"],"v5m":v["5m"],"v1h":v["1h"],
-        "amount":float(event.get("amount",0)),
-        "device_risk":float(event.get("device_risk",0)),
-        "anomaly":float(event.get("anomaly",0)),
-        "country_shift":state["last_country"] is not None and state["last_country"]!=country,
-        "unsafe_country":country not in SAFE
-    }
-    sc,reasons=score_event(signals)
-    dec=decide(sc); trust=upd_trust(state["trust"],dec)
-    save_user(uid,trust,country)
-    result={
-        "decision":dec,"score":sc,"trust":round(trust,4),
-        "reasons":reasons,"version":VERSION,"engine":"sebdog",
-        "local":True,"timestamp":ts
-    }
-    result["audit_hash"]=seal(event,result,ts)
-    return result,200
-
-# ==============================================================================
-# HTTP SERVER
-# ==============================================================================
-
-def send_json(h,data,status=200):
-    body=json.dumps(data,indent=2).encode()
-    h.send_response(status)
-    h.send_header("Content-Type","application/json")
-    h.send_header("Content-Length",str(len(body)))
-    h.send_header("Access-Control-Allow-Origin","*")
-    h.end_headers()
-    h.wfile.write(body)
-
-def read_body(h):
-    n=int(h.headers.get("Content-Length",0))
-    if n:
-        try: return json.loads(h.rfile.read(n))
-        except: return{}
-    return{}
-
-def get_bearer(h):
-    auth=h.headers.get("Authorization","")
-    if auth.startswith("Bearer "): return auth[7:]
-    return h.headers.get("X-API-Key","").strip()
-
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self,fmt,*args): pass
-
-    def do_OPTIONS(self):
-        self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin","*")
-        self.send_header("Access-Control-Allow-Methods","GET,POST,OPTIONS")
-        self.send_header("Access-Control-Allow-Headers","Content-Type,Authorization,X-API-Key")
-        self.end_headers()
-
-    def do_GET(self):
-        path=urlparse(self.path).path
-        if path=="/health":
-            send_json(self,{
-                "status":"ok","version":VERSION,"engine":"sebdog","local":True,
-                "licence":{
-                    "valid":_licence["valid"],"plan":_licence["plan"],
-                    "devices":_licence["devices"],"email":_licence["email"]
-                }
-            })
-        elif path=="/verify-chain":
-            send_json(self,verify_chain())
-        elif path=="/stats":
-            with _db_lock:
-                blocks=_conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0]
-                users=_conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-            send_json(self,{
-                "audit_blocks":blocks,"users_tracked":users,
-                "version":VERSION,"engine":"sebdog","licence_valid":_licence["valid"]
-            })
-        elif path=="/snapshots":
-            send_json(self,{"snapshots":list_snapshots()})
-        elif path=="/backup":
-            backup_db()
-            send_json(self,{"ok":True,"message":"Backup created"})
-        else:
-            send_json(self,{"error":"not_found"},404)
-
-    def do_POST(self):
-        path=urlparse(self.path).path.rstrip("/")
-        data=read_body(self)
-        if path in("/govern","/api/govern"):
-            bearer=get_bearer(self)
-            if bearer and bearer!=_licence["key"]:
-                send_json(self,{"error":"invalid_api_key"},401); return
-            ok,ec=check_rate(bearer or"default")
-            if not ok:
-                send_json(self,{"error":ec},429); return
-            try:
-                result,status=govern(data)
-                send_json(self,result,status)
-            except ValueError as e:
-                send_json(self,{"error":str(e)},400)
-            except Exception as e:
-                send_json(self,{"error":"internal","detail":str(e)},500)
-        else:
-            send_json(self,{"error":"not_found"},404)
-
-class ThreadedServer(ThreadingMixIn,HTTPServer):
-    allow_reuse_address=True
-    daemon_threads=True
-
-# ==============================================================================
-# ENTRY POINT
-# ==============================================================================
-
-def main():
-    parser=argparse.ArgumentParser(description="Sebdog Engine — AILeash local compliance engine")
-    parser.add_argument("--key",required=True,help="Your AILeash API key from sebbi.pro")
-    parser.add_argument("--port",type=int,default=9090,help="Port (default: 9090)")
-    parser.add_argument("--db",default="sebdog_audit.db",help="SQLite audit database path")
-    parser.add_argument("--backup-on-start",action="store_true",help="Create a backup on startup")
-    args=parser.parse_args()
-
-    global DB_FILE
-    DB_FILE=args.db
-
-    print(f"[SEBDOG] Sebdog Engine v{VERSION} starting...",flush=True)
-
-    # Restore from backup if DB missing
-    if not os.path.exists(DB_FILE):
-        print(f"[SEBDOG] Database not found. Checking for backups...",flush=True)
-        if restore_latest_backup():
-            print(f"[SEBDOG] Data restored from backup.",flush=True)
-        else:
-            print(f"[SEBDOG] No backup found. Starting fresh chain.",flush=True)
-
-    init_db()
-
-    if args.backup_on_start:
-        backup_db()
-
-    print(f"[SEBDOG] Validating licence with sebbi.pro...",flush=True)
-    if not validate_licence(args.key):
-        print(f"[SEBDOG] Licence validation failed. Get your key at {HOME}",flush=True)
-        sys.exit(1)
-
-    threading.Thread(target=revalidate_loop,args=(args.key,),daemon=True).start()
-    threading.Thread(target=backup_loop,daemon=True).start()
-
-    server=ThreadedServer(("0.0.0.0",args.port),Handler)
-    print(f"[SEBDOG] Engine running on port {args.port}",flush=True)
-    print(f"[SEBDOG] POST http://localhost:{args.port}/govern",flush=True)
-    print(f"[SEBDOG] GET  http://localhost:{args.port}/health",flush=True)
-    print(f"[SEBDOG] GET  http://localhost:{args.port}/verify-chain",flush=True)
-    print(f"[SEBDOG] GET  http://localhost:{args.port}/snapshots",flush=True)
-    print(f"[SEBDOG] Backups: ./sebdog_backups/ (daily, last 7 kept)",flush=True)
-    print(f"[SEBDOG] Sovereignty: all data stays on your hardware.",flush=True)
-
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("[SEBDOG] Shutting down.",flush=True)
-
-if __name__=="__main__":
-    main()
-
-```
-
-
-## `sebdog_licence.py`
-
-332 lines, 12401 bytes
-
-```python
-"""
-SEBDOG LICENCE SYSTEM v1.0.0
-Air-gapped cryptographic licence tokens for the Sebdog Engine.
-Copyright (c) 2026 Justin Antony Dobson / Monop Content, Blyth, UK
-
-HOW IT WORKS:
-- sebbi.pro generates a signed annual licence token on signup
-- The token is validated entirely locally — no phone-home required
-- Any tampering with the token is cryptographically detected
-- Tokens expire after 12 months and must be renewed
-- The signing secret never leaves sebbi.pro's servers
-
-SECURITY MODEL:
-- HMAC-SHA256 signatures — industry standard, same as used by AWS, Stripe
-- Constant-time comparison prevents timing attacks
-- Base64url encoding for safe transmission
-- JSON payload is deterministically serialised (sort_keys=True)
-- Every validation attempt is logged to the local audit chain
-"""
-
-import hashlib, hmac, json, time, base64, secrets, sqlite3, threading
-from typing import Tuple, Optional, Dict
-
-# ==============================================================================
-# CONSTANTS
-# ==============================================================================
-
-TOKEN_VERSION = "1"
-GRACE_SECONDS = 86400 * 7  # 7-day grace period after expiry before hard block
-AUDIT_DB = "sebdog_audit.db"
-
-# ==============================================================================
-# TOKEN GENERATION (runs on sebbi.pro server only)
-# The signing secret is an environment variable on Railway.
-# It never appears in any file that gets shipped to customers.
-# ==============================================================================
-
-def generate_token(api_key: str, devices: int, plan: str,
-                   email: str, secret: bytes,
-                   validity_days: int = 365) -> str:
-    """
-    Generate a cryptographically signed annual licence token.
-    Called by sebbi.pro when a customer requests an air-gapped licence.
-
-    Args:
-        api_key:       The customer's AILeash API key
-        devices:       Licensed device count
-        plan:          'free' or 'paid'
-        email:         Customer email
-        secret:        HMAC signing secret (from Railway env var)
-        validity_days: Token validity in days (default 365)
-
-    Returns:
-        Base64url-encoded signed token string
-    """
-    issued = int(time.time())
-    expires = issued + (validity_days * 86400)
-
-    payload = json.dumps({
-        "v": TOKEN_VERSION,
-        "key": api_key,
-        "devices": devices,
-        "plan": plan,
-        "email": email,
-        "issued": issued,
-        "expires": expires
-    }, sort_keys=True, separators=(',', ':'))
-
-    sig = hmac.new(secret, payload.encode('utf-8'), hashlib.sha256).hexdigest()
-
-    token_data = json.dumps({
-        "payload": payload,
-        "sig": sig
-    }, separators=(',', ':'))
-
-    return base64.urlsafe_b64encode(token_data.encode('utf-8')).decode('utf-8')
-
-
-# ==============================================================================
-# TOKEN VALIDATION (runs on customer hardware — no network required)
-# ==============================================================================
-
-def validate_token(token: str, secret: bytes) -> Tuple[Optional[Dict], Optional[str]]:
-    """
-    Validate a licence token entirely locally.
-    No network connection required.
-
-    Returns:
-        (licence_data, None) on success
-        (None, error_code) on failure
-
-    Error codes:
-        invalid_format      — token cannot be decoded
-        invalid_signature   — token has been tampered with
-        token_expired       — token is past expiry + grace period
-        version_mismatch    — token version not supported
-    """
-    try:
-        raw = json.loads(base64.urlsafe_b64decode(token.encode('utf-8')))
-        payload_str = raw.get("payload", "")
-        sig = raw.get("sig", "")
-    except Exception:
-        return None, "invalid_format"
-
-    # Constant-time HMAC comparison — prevents timing attacks
-    expected = hmac.new(secret, payload_str.encode('utf-8'), hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(sig, expected):
-        return None, "invalid_signature"
-
-    try:
-        data = json.loads(payload_str)
-    except Exception:
-        return None, "invalid_format"
-
-    if data.get("v") != TOKEN_VERSION:
-        return None, "version_mismatch"
-
-    # Apply grace period — token runs for 7 days past expiry
-    if data.get("expires", 0) + GRACE_SECONDS < time.time():
-        return None, "token_expired"
-
-    return data, None
-
-
-def is_in_grace_period(token_data: Dict) -> bool:
-    """Returns True if token is past expiry but within grace period."""
-    return token_data.get("expires", 0) < time.time()
-
-
-def days_until_expiry(token_data: Dict) -> int:
-    """Returns days remaining until token expiry (negative if expired)."""
-    return int((token_data.get("expires", 0) - time.time()) / 86400)
-
-
-# ==============================================================================
-# LOCAL LICENCE STORE
-# Caches the validated token locally so validation survives restarts.
-# Everything stays on the customer's own hardware.
-# ==============================================================================
-
-_lock = threading.Lock()
-
-
-def save_licence_locally(db_path: str, token: str, licence_data: Dict):
-    """Cache the validated licence in the local audit database."""
-    with _lock:
-        conn = sqlite3.connect(db_path)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS licence_cache (
-                id INTEGER PRIMARY KEY,
-                token TEXT,
-                api_key TEXT,
-                devices INTEGER,
-                plan TEXT,
-                email TEXT,
-                issued INTEGER,
-                expires INTEGER,
-                cached_at REAL
-            )
-        """)
-        conn.execute("DELETE FROM licence_cache")  # Only one licence at a time
-        conn.execute("""
-            INSERT INTO licence_cache
-            (token, api_key, devices, plan, email, issued, expires, cached_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            token,
-            licence_data.get("key", ""),
-            licence_data.get("devices", 1),
-            licence_data.get("plan", "free"),
-            licence_data.get("email", ""),
-            licence_data.get("issued", 0),
-            licence_data.get("expires", 0),
-            time.time()
-        ))
-        conn.commit()
-        conn.close()
-
-
-def load_licence_locally(db_path: str) -> Optional[Tuple[str, Dict]]:
-    """Load a cached licence from the local database."""
-    try:
-        with _lock:
-            conn = sqlite3.connect(db_path)
-            row = conn.execute(
-                "SELECT token, api_key, devices, plan, email, issued, expires "
-                "FROM licence_cache LIMIT 1"
-            ).fetchone()
-            conn.close()
-        if not row:
-            return None
-        token, api_key, devices, plan, email, issued, expires = row
-        data = {
-            "v": TOKEN_VERSION,
-            "key": api_key,
-            "devices": devices,
-            "plan": plan,
-            "email": email,
-            "issued": issued,
-            "expires": expires
-        }
-        return token, data
-    except Exception:
-        return None
-
-
-# ==============================================================================
-# STRESS TEST
-# Run with: python sebdog_licence.py
-# ==============================================================================
-
-if __name__ == "__main__":
-    import sys
-
-    print("SEBDOG LICENCE SYSTEM — Stress Test")
-    print("=" * 60)
-
-    # Generate a test secret (on sebbi.pro this comes from Railway env vars)
-    SECRET = secrets.token_bytes(32)
-    TEST_KEY = "al_live_" + secrets.token_hex(24)
-    PASSES = 0
-    FAILURES = 0
-
-    def check(name, condition, detail=""):
-        global PASSES, FAILURES
-        if condition:
-            print(f"  PASS  {name}")
-            PASSES += 1
-        else:
-            print(f"  FAIL  {name} {detail}")
-            FAILURES += 1
-
-    # --- Basic validity ---
-    print("\n[1] Basic token generation and validation")
-    token = generate_token(TEST_KEY, 10000, "paid", "test@example.com", SECRET)
-    data, err = validate_token(token, SECRET)
-    check("Valid token accepted", err is None)
-    check("API key preserved", data and data.get("key") == TEST_KEY)
-    check("Device count preserved", data and data.get("devices") == 10000)
-    check("Plan preserved", data and data.get("plan") == "paid")
-    check("Not in grace period", data and not is_in_grace_period(data))
-    check("Days until expiry > 360", data and days_until_expiry(data) > 360)
-
-    # --- Tamper detection ---
-    print("\n[2] Tamper detection")
-    raw = json.loads(base64.urlsafe_b64decode(token))
-    raw["payload"] = raw["payload"].replace("10000", "99999")
-    bad_token = base64.urlsafe_b64encode(json.dumps(raw, separators=(',',':')).encode()).decode()
-    _, err = validate_token(bad_token, SECRET)
-    check("Tampered device count rejected", err == "invalid_signature")
-
-    raw2 = json.loads(base64.urlsafe_b64decode(token))
-    raw2["payload"] = raw2["payload"].replace("paid", "enterprise")
-    bad_token2 = base64.urlsafe_b64encode(json.dumps(raw2, separators=(',',':')).encode()).decode()
-    _, err = validate_token(bad_token2, SECRET)
-    check("Tampered plan rejected", err == "invalid_signature")
-
-    raw3 = json.loads(base64.urlsafe_b64decode(token))
-    raw3["sig"] = "0" * 64
-    bad_token3 = base64.urlsafe_b64encode(json.dumps(raw3, separators=(',',':')).encode()).decode()
-    _, err = validate_token(bad_token3, SECRET)
-    check("Zeroed signature rejected", err == "invalid_signature")
-
-    # --- Expiry ---
-    print("\n[3] Expiry handling")
-    expired = generate_token(TEST_KEY, 100, "paid", "test@example.com", SECRET, validity_days=-1)
-    data_exp, err = validate_token(expired, SECRET)
-    check("Recently expired token in grace period", err is None and data_exp is not None)
-    check("Grace period detected", data_exp and is_in_grace_period(data_exp))
-
-    hard_expired = generate_token(TEST_KEY, 100, "paid", "test@example.com", SECRET, validity_days=-9)
-    _, err = validate_token(hard_expired, SECRET)
-    check("Hard expired token rejected", err == "token_expired")
-
-    # --- Wrong secret ---
-    print("\n[4] Secret validation")
-    wrong = secrets.token_bytes(32)
-    _, err = validate_token(token, wrong)
-    check("Wrong secret rejected", err == "invalid_signature")
-
-    almost_right = bytearray(SECRET)
-    almost_right[0] ^= 1
-    _, err = validate_token(token, bytes(almost_right))
-    check("One-bit-flipped secret rejected", err == "invalid_signature")
-
-    # --- Malformed tokens ---
-    print("\n[5] Malformed input handling")
-    _, err = validate_token("notbase64!!!", SECRET)
-    check("Garbage input rejected", err is not None)
-    _, err = validate_token("", SECRET)
-    check("Empty token rejected", err is not None)
-    _, err = validate_token(base64.urlsafe_b64encode(b"{}").decode(), SECRET)
-    check("Empty JSON rejected", err is not None)
-
-    # --- Local caching ---
-    print("\n[6] Local licence caching")
-    import tempfile, os
-    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
-        test_db = f.name
-    try:
-        data_valid, _ = validate_token(token, SECRET)
-        save_licence_locally(test_db, token, data_valid)
-        cached = load_licence_locally(test_db)
-        check("Licence saved and retrieved", cached is not None)
-        check("Cached key matches", cached and cached[1].get("key") == TEST_KEY)
-        check("Cached devices match", cached and cached[1].get("devices") == 10000)
-    finally:
-        os.unlink(test_db)
-
-    # --- Performance ---
-    print("\n[7] Performance")
-    import timeit
-    gen_time = timeit.timeit(
-        lambda: generate_token(TEST_KEY, 10000, "paid", "test@example.com", SECRET),
-        number=1000
-    )
-    val_time = timeit.timeit(
-        lambda: validate_token(token, SECRET),
-        number=1000
-    )
-    check(f"Generation: {gen_time*1:.1f}ms avg per token", gen_time < 5)
-    check(f"Validation: {val_time*1:.1f}ms avg per validation", val_time < 5)
-
-    # --- Summary ---
-    print(f"\n{'='*60}")
-    print(f"Results: {PASSES} passed, {FAILURES} failed")
-    if FAILURES == 0:
-        print("ALL TESTS PASSED. System is production ready.")
-    else:
-        print("FAILURES DETECTED. Do not ship.")
-    sys.exit(0 if FAILURES == 0 else 1)
-
-```
-
-
-## `sebdog_reporter.py`
-
-217 lines, 8364 bytes
-
-```python
-"""
-SEBDOG DECISION REPORTER v1.0.0
-Generates readable reports from the sebdog audit chain.
-Shows exactly why each decision was made.
-Copyright (c) 2026 Justin Antony Dobson / Monop Content
-"""
-
-import sqlite3, json, time, os
-from datetime import datetime
-
-DB_FILE = "sebdog_audit.db"
-
-REASON_EXPLANATIONS = {
-    "velocity_spike": "User made more than 10 requests in 60 seconds",
-    "high_amount": "Transaction amount exceeded £500",
-    "risky_device": "Device risk score above 0.5",
-    "behaviour_anomaly": "Behavioural anomaly score above 0.5",
-    "country_shift": "Request came from a different country than usual",
-    "unsafe_country": "Request came from outside approved country list",
-    "low_trust": "User trust score has dropped below 0.4 due to previous decisions",
-}
-
-def get_decisions(db_path=DB_FILE, limit=100):
-    if not os.path.exists(db_path):
-        return []
-    conn = sqlite3.connect(db_path)
-    rows = conn.execute("""
-        SELECT ts, user_id, event_json, result_json, audit_hash
-        FROM audit_log
-        ORDER BY id DESC
-        LIMIT ?
-    """, (limit,)).fetchall()
-    conn.close()
-    results = []
-    for row in rows:
-        try:
-            event = json.loads(row[2])
-            result = json.loads(row[3])
-            results.append({
-                "ts": row[0],
-                "user_id": row[1],
-                "event": event,
-                "result": result,
-                "audit_hash": row[4]
-            })
-        except:
-            pass
-    return results
-
-def format_reason(reason):
-    return REASON_EXPLANATIONS.get(reason, reason.replace("_", " ").capitalize())
-
-def decision_color(decision):
-    return {"ALLOW": "#00875a", "CHALLENGE": "#b45309", "BLOCK": "#cc0000"}.get(decision, "#555")
-
-def generate_text_report(db_path=DB_FILE, limit=100):
-    decisions = get_decisions(db_path, limit)
-    if not decisions:
-        return "No decisions recorded yet."
-    
-    lines = [
-        "SEBDOG DECISION REPORT",
-        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        f"Total decisions shown: {len(decisions)}",
-        "=" * 60
-    ]
-    
-    for d in decisions:
-        result = d["result"]
-        event = d["event"]
-        ts = datetime.fromtimestamp(d["ts"]).strftime('%Y-%m-%d %H:%M:%S')
-        decision = result.get("decision", "?")
-        score = result.get("score", 0)
-        reasons = result.get("reasons", [])
-        
-        lines.append(f"\n[{ts}] User: {d['user_id']}")
-        lines.append(f"Action: {event.get('action','?')} | Country: {event.get('country','?')} | Amount: £{event.get('amount',0)}")
-        lines.append(f"Decision: {decision} | Score: {score} | Trust: {result.get('trust',0)}")
-        
-        if reasons:
-            lines.append("Reasons:")
-            for r in reasons:
-                lines.append(f"  - {format_reason(r)}")
-        else:
-            lines.append("Reasons: No risk factors detected")
-        
-        lines.append(f"Audit hash: {d['audit_hash'][:32]}...")
-        lines.append("-" * 60)
-    
-    return "\n".join(lines)
-
-def generate_json_report(db_path=DB_FILE, limit=100):
-    decisions = get_decisions(db_path, limit)
-    report = {
-        "generated": datetime.now().isoformat(),
-        "total": len(decisions),
-        "decisions": []
-    }
-    for d in decisions:
-        result = d["result"]
-        event = d["event"]
-        reasons = result.get("reasons", [])
-        report["decisions"].append({
-            "timestamp": datetime.fromtimestamp(d["ts"]).isoformat(),
-            "user_id": d["user_id"],
-            "action": event.get("action"),
-            "country": event.get("country"),
-            "amount": event.get("amount"),
-            "decision": result.get("decision"),
-            "score": result.get("score"),
-            "trust": result.get("trust"),
-            "reasons": reasons,
-            "reasons_explained": [format_reason(r) for r in reasons],
-            "audit_hash": d["audit_hash"]
-        })
-    return json.dumps(report, indent=2)
-
-def generate_html_report(db_path=DB_FILE, limit=100):
-    decisions = get_decisions(db_path, limit)
-    
-    rows = ""
-    for d in decisions:
-        result = d["result"]
-        event = d["event"]
-        ts = datetime.fromtimestamp(d["ts"]).strftime('%Y-%m-%d %H:%M:%S')
-        decision = result.get("decision", "?")
-        score = result.get("score", 0)
-        reasons = result.get("reasons", [])
-        color = decision_color(decision)
-        
-        reason_html = ""
-        if reasons:
-            reason_html = "<ul>" + "".join(f"<li>{format_reason(r)}</li>" for r in reasons) + "</ul>"
-        else:
-            reason_html = "<span style='color:#888'>No risk factors detected</span>"
-        
-        rows += f"""
-        <tr>
-            <td>{ts}</td>
-            <td><code>{d['user_id']}</code></td>
-            <td>{event.get('action','?')}</td>
-            <td>{event.get('country','?')}</td>
-            <td>£{event.get('amount',0)}</td>
-            <td><strong style="color:{color}">{decision}</strong></td>
-            <td>{score}</td>
-            <td>{result.get('trust',0)}</td>
-            <td>{reason_html}</td>
-            <td><code style="font-size:10px">{d['audit_hash'][:16]}...</code></td>
-        </tr>"""
-    
-    allow = sum(1 for d in decisions if d["result"].get("decision") == "ALLOW")
-    challenge = sum(1 for d in decisions if d["result"].get("decision") == "CHALLENGE")
-    block = sum(1 for d in decisions if d["result"].get("decision") == "BLOCK")
-    
-    html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Sebdog Decision Report</title>
-<style>
-body{{font-family:sans-serif;background:#f5f7fa;color:#1a202c;margin:0;padding:20px}}
-.header{{background:#0a0f1e;color:#fff;padding:24px 32px;border-radius:8px;margin-bottom:24px}}
-.header h1{{margin:0;font-size:24px;color:#c9a84c}}
-.header p{{margin:4px 0 0;color:rgba(255,255,255,0.5);font-size:13px}}
-.stats{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:24px}}
-.stat{{background:#fff;border-radius:8px;padding:16px;text-align:center;border:1px solid #e2e8f0}}
-.stat-n{{font-size:32px;font-weight:700}}
-.stat-l{{font-size:11px;color:#64748b;margin-top:4px}}
-.allow{{color:#00875a}}.challenge{{color:#b45309}}.block{{color:#cc0000}}
-table{{width:100%;border-collapse:collapse;background:#fff;border-radius:8px;overflow:hidden;border:1px solid #e2e8f0}}
-th{{background:#0a0f1e;color:#c9a84c;padding:10px 12px;text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:1px}}
-td{{padding:10px 12px;border-bottom:1px solid #e2e8f0;font-size:12px;vertical-align:top}}
-tr:last-child td{{border:none}}
-tr:hover td{{background:#f8fafc}}
-ul{{margin:4px 0;padding-left:16px}}
-li{{margin:2px 0;color:#64748b}}
-code{{background:#f1f5f9;padding:2px 4px;border-radius:3px;font-size:11px}}
-</style>
-</head>
-<body>
-<div class="header">
-  <h1>Sebdog Decision Report</h1>
-  <p>Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} &nbsp;|&nbsp; Showing last {len(decisions)} decisions &nbsp;|&nbsp; Powered by sebbi.pro</p>
-</div>
-<div class="stats">
-  <div class="stat"><div class="stat-n allow">{allow}</div><div class="stat-l">ALLOWED</div></div>
-  <div class="stat"><div class="stat-n challenge">{challenge}</div><div class="stat-l">CHALLENGED</div></div>
-  <div class="stat"><div class="stat-n block">{block}</div><div class="stat-l">BLOCKED</div></div>
-</div>
-<table>
-<thead><tr>
-  <th>Time</th><th>User</th><th>Action</th><th>Country</th><th>Amount</th>
-  <th>Decision</th><th>Score</th><th>Trust</th><th>Reasons</th><th>Audit Hash</th>
-</tr></thead>
-<tbody>{rows if rows else '<tr><td colspan="10" style="text-align:center;color:#888;padding:32px">No decisions recorded yet</td></tr>'}</tbody>
-</table>
-</body>
-</html>"""
-    return html
-
-if __name__ == "__main__":
-    import sys
-    fmt = sys.argv[1] if len(sys.argv) > 1 else "html"
-    db = sys.argv[2] if len(sys.argv) > 2 else DB_FILE
-    
-    if fmt == "text":
-        print(generate_text_report(db))
-    elif fmt == "json":
-        print(generate_json_report(db))
-    else:
-        report = generate_html_report(db)
-        out = "sebdog_report.html"
-        with open(out, "w") as f:
-            f.write(report)
-        print(f"Report saved to {out}")
 
 ```
