@@ -1,4 +1,4 @@
-# Codebase — part 16 of 19
+# Codebase — part 16 of 18
 
 Contains:
 - `reseller.html`
