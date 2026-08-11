@@ -1,4 +1,4 @@
-# Codebase — part 13 of 19
+# Codebase — part 13 of 18
 
 Contains:
 - `docs/spec/ai-txt.md`
