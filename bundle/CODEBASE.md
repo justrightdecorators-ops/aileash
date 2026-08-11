@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-96 files across 19 parts.
+97 files across 19 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -84,6 +84,7 @@ Generated automatically on every push. Do not edit by hand.
 - `tests/attack_continuity_4.py`
 - `tests/attack_continuity_5.py`
 - `tests/attack_continuity_6.py`
+- `tests/attack_witnessed.py`
 
 ## [CODEBASE-11.md](CODEBASE-11.md)
 
