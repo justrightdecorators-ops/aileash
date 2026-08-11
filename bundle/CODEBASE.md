@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-95 files across 19 parts.
+94 files across 17 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -114,43 +114,36 @@ Generated automatically on every push. Do not edit by hand.
 - `guardian-parent.html`
 - `human-oversight.html`
 - `identity.html`
-
-## [CODEBASE-14.md](CODEBASE-14.md)
-
-- `index.html`
-
-## [CODEBASE-15.md](CODEBASE-15.md)
-
 - `investor-prospectus.html`
 - `legal.txt`
 - `liability.txt`
 - `llms.txt`
 - `notary.html`
 - `pay-check.html`
+
+## [CODEBASE-14.md](CODEBASE-14.md)
+
 - `registry.html`
 - `report-threat.html`
 - `requirements.txt`
-
-## [CODEBASE-16.md](CODEBASE-16.md)
-
 - `reseller.html`
+
+## [CODEBASE-15.md](CODEBASE-15.md)
+
 - `risk-policy.html`
 - `robots.txt`
-
-## [CODEBASE-17.md](CODEBASE-17.md)
-
 - `scan.html`
 - `seal.html`
 - `sentinel.html`
+
+## [CODEBASE-16.md](CODEBASE-16.md)
+
 - `signal-packs.html`
 - `sitemap.xml`
-
-## [CODEBASE-18.md](CODEBASE-18.md)
-
 - `sonicboom.html`
 - `verify.html`
 
-## [CODEBASE-19.md](CODEBASE-19.md)
+## [CODEBASE-17.md](CODEBASE-17.md)
 
 - `whitepaper.html`
 
