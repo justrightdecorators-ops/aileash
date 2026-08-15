@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-97 files across 19 parts.
+98 files across 19 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -55,12 +55,13 @@ Generated automatically on every push. Do not edit by hand.
 - `modules/stats.py`
 - `modules/verifier.py`
 - `modules/witness.py`
+- `modules/witness_guard.py`
 - `modules/witnessed.py`
 - `Verify_ai.py`
-- `ai_act_ranker.py`
 
 ## [CODEBASE-09.md](CODEBASE-09.md)
 
+- `ai_act_ranker.py`
 - `ai_safety_scanner.py`
 - `aigrade_insert.py`
 - `aileash_reporter.py`
@@ -71,10 +72,10 @@ Generated automatically on every push. Do not edit by hand.
 - `broadcaster.py`
 - `build_sebbi_ecosystem.py`
 - `gateway_proxy.py`
-- `sebbi_orchestrator.py`
 
 ## [CODEBASE-10.md](CODEBASE-10.md)
 
+- `sebbi_orchestrator.py`
 - `sebdog_engine.py`
 - `sebdog_licence.py`
 - `sebdog_reporter.py`

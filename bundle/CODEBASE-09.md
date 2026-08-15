@@ -1,6 +1,7 @@
 # Codebase — part 9 of 19
 
 Contains:
+- `ai_act_ranker.py`
 - `ai_safety_scanner.py`
 - `aigrade_insert.py`
 - `aileash_reporter.py`
@@ -11,7 +12,276 @@ Contains:
 - `broadcaster.py`
 - `build_sebbi_ecosystem.py`
 - `gateway_proxy.py`
-- `sebbi_orchestrator.py`
+
+
+## `ai_act_ranker.py`
+
+262 lines, 4930 bytes
+
+```python
+"""
+AILeash Compliance Intelligence Engine
+Standalone AI Act Ranking & Risk Mapping Engine
+
+Version: 1.0.0
+"""
+
+import json
+import datetime
+
+
+VERSION = "1.0.0"
+
+
+# EU AI Act knowledge base
+AI_ACT_DATABASE = {
+
+    "Article 5": {
+        "title": "Prohibited AI Practices",
+        "phrases": [
+            "EU AI Act Article 5",
+            "prohibited AI practices",
+            "AI Act banned systems",
+            "AI regulation prohibited AI"
+        ],
+        "controls": [
+            "Prohibited use detection",
+            "Policy enforcement",
+            "AI behaviour screening"
+        ]
+    },
+
+
+    "Article 6": {
+        "title": "Classification of High Risk AI Systems",
+        "phrases": [
+            "high risk AI system",
+            "EU AI Act high risk classification",
+            "AI Act risk categories"
+        ],
+        "controls": [
+            "Risk classification",
+            "System assessment",
+            "Impact evaluation"
+        ]
+    },
+
+
+    "Article 9": {
+        "title": "Risk Management System",
+        "phrases": [
+            "EU AI Act Article 9",
+            "AI risk management system",
+            "AI Act compliance framework",
+            "continuous AI risk monitoring"
+        ],
+        "controls": [
+            "Risk identification",
+            "Risk scoring",
+            "Risk mitigation",
+            "Continuous monitoring"
+        ]
+    },
+
+
+    "Article 12": {
+        "title": "Record Keeping and Logging",
+        "phrases": [
+            "AI audit trail",
+            "AI logging requirements",
+            "AI evidence records",
+            "machine learning audit logs"
+        ],
+        "controls": [
+            "Immutable logs",
+            "Evidence storage",
+            "Traceability",
+            "Hash verification"
+        ]
+    },
+
+
+    "Article 14": {
+        "title": "Human Oversight",
+        "phrases": [
+            "AI human oversight",
+            "human in the loop AI",
+            "AI intervention controls"
+        ],
+        "controls": [
+            "Human review",
+            "Override capability",
+            "Decision supervision"
+        ]
+    },
+
+
+    "Article 15": {
+        "title": "Accuracy Robustness Cybersecurity",
+        "phrases": [
+            "AI cybersecurity",
+            "AI accuracy monitoring",
+            "AI robustness requirements"
+        ],
+        "controls": [
+            "Security testing",
+            "Performance monitoring",
+            "Failure detection"
+        ]
+    }
+
+}
+
+
+def search_ai_act(query):
+
+    results = []
+
+    query = query.lower()
+
+    for article, data in AI_ACT_DATABASE.items():
+
+        for phrase in data["phrases"]:
+
+            if query in phrase.lower():
+
+                results.append({
+                    "article": article,
+                    "title": data["title"],
+                    "matched_phrase": phrase,
+                    "controls": data["controls"]
+                })
+
+    return results
+
+
+
+def calculate_compliance_score(system):
+
+    score = 0
+    missing = []
+
+    requirements = {
+
+        "risk_management": "Article 9",
+        "logging": "Article 12",
+        "human_oversight": "Article 14",
+        "security": "Article 15"
+
+    }
+
+
+    for control, article in requirements.items():
+
+        if system.get(control):
+            score += 25
+        else:
+            missing.append(article)
+
+
+    return {
+        "score": score,
+        "rating": risk_rating(score),
+        "missing_articles": missing
+    }
+
+
+
+def risk_rating(score):
+
+    if score >= 90:
+        return "LOW RISK"
+
+    if score >= 70:
+        return "MODERATE RISK"
+
+    if score >= 40:
+        return "HIGH RISK"
+
+    return "CRITICAL RISK"
+
+
+
+def generate_report(system):
+
+    return {
+
+        "engine": "AILeash Compliance Intelligence Engine",
+
+        "version": VERSION,
+
+        "timestamp":
+            datetime.datetime.utcnow().isoformat(),
+
+        "assessment":
+            calculate_compliance_score(system)
+
+    }
+
+
+
+def save_report(report):
+
+    filename = (
+        "aileash_report_"
+        + datetime.datetime.now()
+        .strftime("%Y%m%d_%H%M%S")
+        + ".json"
+    )
+
+    with open(filename, "w") as file:
+        json.dump(
+            report,
+            file,
+            indent=4
+        )
+
+    return filename
+
+
+
+if __name__ == "__main__":
+
+    print(
+        "\nAILeash AI Act Ranking Engine "
+        + VERSION
+    )
+
+    print("\nExample search:")
+    
+    results = search_ai_act(
+        "Article 9"
+    )
+
+    for result in results:
+        print("\nMATCH:")
+        print(result)
+
+
+    test_system = {
+
+        "risk_management": True,
+        "logging": True,
+        "human_oversight": False,
+        "security": True
+
+    }
+
+
+    report = generate_report(test_system)
+
+    print("\nCOMPLIANCE REPORT")
+    print(json.dumps(report, indent=4))
+
+
+    file = save_report(report)
+
+    print(
+        "\nSaved:",
+        file
+    )
+
+```
 
 
 ## `ai_safety_scanner.py`
@@ -2575,207 +2845,5 @@ if __name__ == "__main__":
         asyncio.run(gateway.start())
     except KeyboardInterrupt:
         logging.info("Gateway offline.")
-
-```
-
-
-## `sebbi_orchestrator.py`
-
-194 lines, 7453 bytes
-
-```python
-import asyncio
-import json
-import logging
-import socket
-import hmac
-import hashlib
-import ipaddress
-import os
-import sys
-import time
-
-# Handle cross-platform kernel metric mapping
-if sys.platform != "win32":
-    import resource
-else:
-    resource = None
-
-# --- ARCHITECTURE METADATA ENGINE ---
-CORE_MANIFEST = """Standard: AI-TXT/1.0
-Standard-Licence: free and open - publish your own at no cost, no key required
-Operator: Monop Content
-Operator-Location: Blyth, Northumberland, United Kingdom
-Contact: justrightdecorators@gmail.com
-Last-Updated: 2026-07-05
-
-Governance-Engine: AILeash v6.4
-Metrics-Engine: GreenLeash v1.2 (Unified Resource Auditor)
-Decision-Outcomes: ALLOW, CHALLENGE, BLOCK
-Decision-Signals: 9
-Decision-Latency-Median: 28ms
-
-Verify-Endpoint: https://sebbi.pro
-Companion-Standard: https://sebbi.pro
-Whitepaper: https://sebbi.pro"""
-
-HUMAN_MESSAGE = (
-    "SYSTEM NOTICE: AI Governance & Sustainability Compliance Update for sebbi.pro.\n"
-    "The updated compliance targets are now active under Standard: AI-TXT/1.0.\n"
-    "Verify live audit status at: https://sebbi.pro"
-)
-
-# Network Operational Limits
-UDP_BROADCAST_PORT = 5001
-TCP_GATEWAY_PORT = 8080
-CONCURRENT_LIMIT = 2000  
-TIMEOUT = 1.5           
-
-# Dynamic environment lookup to protect secret keys from public GitHub visibility
-SYSTEM_SIGNING_KEY = os.environ.get("SEBBI_SYSTEM_SECRET", "LOCAL_DEV_FALLBACK_KEY").encode('utf-8')
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-
-# ==========================================
-# PART 1: CORE UTILITIES & METRIC AUDITING
-# ==========================================
-
-def get_network_topology():
-    """Resolves local interface and dynamically maps standard subnet boundaries."""
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        local_ip = s.getsockname()[0]
-        s.close()
-        interface = ipaddress.IPv4Interface(f"{local_ip}/255.255.255.0")
-        return str(interface.network.broadcast_address), interface.network
-    except Exception as e:
-        logging.error(f"Failed to automatically resolve local network topology: {e}")
-        return "255.255.255.255", ipaddress.IPv4Network("192.168.1.0/24")
-
-def get_kernel_resource_usage():
-    """Extracts raw processing time and RAM footprints straight from the OS kernel."""
-    if resource:
-        usage = resource.getrusage(resource.RUSAGE_SELF)
-        cpu_time = usage.ru_utime + usage.ru_stime
-        memory_mb = usage.ru_maxrss / (1024.0 if sys.platform == "darwin" else 1.0)
-    else:
-        cpu_time = time.process_time()
-        memory_mb = 0.0
-    return cpu_time, memory_mb
-
-def generate_signed_telemetry(message_text, manifest_text, extra_metrics=None):
-    """Packages corporate alerts and signs them using HMAC-SHA256 for tampering prevention."""
-    base_data = {
-        "alert_text": message_text,
-        "raw_declaration": manifest_text,
-        "node_id": hashlib.sha256(socket.gethostname().encode()).hexdigest()[:12]
-    }
-    if extra_metrics:
-        base_data["sustainability_metrics"] = extra_metrics
-        
-    serialized_json = json.dumps(base_data, sort_keys=True)
-    signature = hmac.new(SYSTEM_SIGNING_KEY, serialized_json.encode('utf-8'), hashlib.sha256).hexdigest()
-    
-    return json.dumps({
-        "payload": base_data,
-        "signature": signature,
-        "algorithm": "HMAC-SHA256"
-    })
-
-# ==========================================
-# PART 2: DISTRIBUTION ENGINES
-# ==========================================
-
-def execute_udp_broadcast(compiled_payload, broadcast_target):
-    """Fires a connectionless notification to all listening local subnet nodes."""
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            s.sendto(compiled_payload.encode('utf-8'), (broadcast_target, UDP_BROADCAST_PORT))
-            logging.info(f"Signed UDP broadcast dispatched to {broadcast_target}:{UDP_BROADCAST_PORT}")
-    except socket.error as e:
-        logging.error(f"UDP broadcast transmission failure: {e}")
-
-async def dispatch_tcp_gateway(target_ip, compiled_payload):
-    """Pushes a verified compliance wrapper directly into standard infrastructure points."""
-    writer = None
-    try:
-        connect = asyncio.open_connection(target_ip, TCP_GATEWAY_PORT)
-        _, writer = await asyncio.wait_for(connect, timeout=TIMEOUT)
-        
-        http_request = (
-            f"POST /api/compliance/broadcast HTTP/1.1\r\n"
-            f"Host: {target_ip}\r\n"
-            f"Content-Type: application/json\r\n"
-            f"Content-Length: {len(compiled_payload)}\r\n"
-            f"X-Signature-Auth: True\r\n"
-            f"Connection: close\r\n\r\n"
-            f"{compiled_payload}"
-        ).encode('utf-8')
-        
-        writer.write(http_request)
-        await writer.drain()
-        logging.info(f"[DISPATCHED] Verified telemetry pushed to infrastructure host: {target_ip}")
-        return True
-    except (asyncio.TimeoutError, ConnectionRefusedError, OSError):
-        return False
-    finally:
-        if writer:
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception:
-                pass
-
-# ==========================================
-# PART 3: RECENTRALIZED PROCESS ENGINE
-# ==========================================
-
-async def run_unified_orchestration():
-    logging.info("Initializing Unified Sebbi Ecosystem Orchestration Pipeline...")
-    
-    # 1. Profile an operational work function (Audit System Burden)
-    start_wall = time.perf_counter()
-    start_cpu, start_mem = get_kernel_resource_usage()
-    
-    # [SIMULATION BLOCK]: Represents a standard local validation check running
-    await asyncio.sleep(0.025)
-    
-    end_cpu, end_mem = get_kernel_resource_usage()
-    end_wall = time.perf_counter()
-    
-    metrics = {
-        "wall_latency_ms": round((end_wall - start_wall) * 1000, 3),
-        "kernel_cpu_time_ms": round((end_cpu - start_cpu) * 1000, 3),
-        "allocated_memory_mb": round(max(start_mem, end_mem), 2)
-    }
-    logging.info(f"Process Profile Completed -> CPU: {metrics['kernel_cpu_time_ms']}ms | RAM: {metrics['allocated_memory_mb']}MB")
-    
-    # 2. Package and sign the final structural data block
-    broadcast_ip, network_obj = get_network_topology()
-    signed_payload_stream = generate_signed_telemetry(HUMAN_MESSAGE, CORE_MANIFEST, extra_metrics=metrics)
-    
-    # 3. Fire local network UDP alert baseline
-    execute_udp_broadcast(signed_payload_stream, broadcast_ip)
-    
-    # 4. Asynchronously scan and iterate targeted subnet infrastructure nodes
-    tasks = []
-    logging.info(f"Scanning target gateways across subnet map: {network_obj.with_prefixlen}")
-    
-    for host in network_obj.hosts():
-        host_str = str(host)
-        if host_str.endswith(".1") or host_str.endswith(".254"):
-            tasks.append(asyncio.create_task(dispatch_tcp_gateway(host_str, signed_payload_stream)))
-            if len(tasks) >= CONCURRENT_LIMIT:
-                await asyncio.gather(*tasks, return_exceptions=True)
-                tasks = []
-                
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
-    logging.info("Unified orchestration sequence finalized successfully.")
-
-if __name__ == "__main__":
-    asyncio.run(run_unified_orchestration())
 
 ```

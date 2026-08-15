@@ -5,9 +5,9 @@ Contains:
 - `modules/stats.py`
 - `modules/verifier.py`
 - `modules/witness.py`
+- `modules/witness_guard.py`
 - `modules/witnessed.py`
 - `Verify_ai.py`
-- `ai_act_ranker.py`
 
 
 ## `modules/standard.py`
@@ -1838,6 +1838,89 @@ def handle(method, action, data, api_key, ctx):
 ```
 
 
+## `modules/witness_guard.py`
+
+75 lines, 2152 bytes
+
+```python
+import logging
+from typing import Dict, Any
+
+# Configure security log
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("WitnessGuard")
+
+# Revoked Node IDs / Keys
+REVOKED_WITNESSES: set[str] = {
+    "wit:red-flag-ai-pro",
+}
+
+# Whitelist of trusted active witness nodes
+ALLOWED_WITNESSES: set[str] = {
+    # Add active trusted node IDs here
+}
+
+def validate_witness_seal_request(payload: Dict[str, Any]) -> bool:
+    """
+    Validates whether incoming witness seal requests are from an active, authorized node.
+    Rejects and logs revoked IDs instantly.
+    """
+    user_id = payload.get("user")
+    seal = payload.get("seal")
+    prev_hash = payload.get("prev")
+
+    if not user_id:
+        logger.warning("Rejected seal request: Missing node identifier.")
+        return False
+
+    # Hard Reject for Revoked / Blocked Node
+    if user_id in REVOKED_WITNESSES:
+        logger.error(
+            f"BLOCKED: Revoked node '{user_id}' attempted block seal! "
+            f"Seal Hash: {str(seal)[:10]}... | Prev Hash: {str(prev_hash)[:10]}..."
+        )
+        return False
+
+    # Strict Whitelist Verification
+    if ALLOWED_WITNESSES and user_id not in ALLOWED_WITNESSES:
+        logger.warning(f"UNAUTHORIZED: Node '{user_id}' is not in the active whitelist.")
+        return False
+
+    return True
+
+
+# Route Middleware Handler
+def handle_incoming_block(payload: Dict[str, Any]):
+    if not validate_witness_seal_request(payload):
+        return {
+            "status": "error",
+            "code": 401,
+            "message": "Unauthorized Witness Node. Access Revoked."
+        }, 401
+
+    # Append Block to Chain State
+    return {
+        "status": "success",
+        "code": 200,
+        "message": "Block Witness Sealed Successfully"
+    }, 200
+
+
+# Execution Test
+if __name__ == "__main__":
+    test_payload = {
+        "user": "wit:red-flag-ai-pro",
+        "score": 0,
+        "seal": "9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b",
+        "prev": "58eb2ea09de10b57dcbd13bcda220fb47ed62f53"
+    }
+
+    response, status_code = handle_incoming_block(test_payload)
+    print(f"\nExecution Result: Status {status_code} -> {response}")
+
+```
+
+
 ## `modules/witnessed.py`
 
 600 lines, 26111 bytes
@@ -2521,275 +2604,5 @@ if __name__ == "__main__":
     
     # Run the audit test pass
     auditor.run_public_compliance_audit(legitimate_claim_hash, sample_corporate_payload)
-
-```
-
-
-## `ai_act_ranker.py`
-
-262 lines, 4930 bytes
-
-```python
-"""
-AILeash Compliance Intelligence Engine
-Standalone AI Act Ranking & Risk Mapping Engine
-
-Version: 1.0.0
-"""
-
-import json
-import datetime
-
-
-VERSION = "1.0.0"
-
-
-# EU AI Act knowledge base
-AI_ACT_DATABASE = {
-
-    "Article 5": {
-        "title": "Prohibited AI Practices",
-        "phrases": [
-            "EU AI Act Article 5",
-            "prohibited AI practices",
-            "AI Act banned systems",
-            "AI regulation prohibited AI"
-        ],
-        "controls": [
-            "Prohibited use detection",
-            "Policy enforcement",
-            "AI behaviour screening"
-        ]
-    },
-
-
-    "Article 6": {
-        "title": "Classification of High Risk AI Systems",
-        "phrases": [
-            "high risk AI system",
-            "EU AI Act high risk classification",
-            "AI Act risk categories"
-        ],
-        "controls": [
-            "Risk classification",
-            "System assessment",
-            "Impact evaluation"
-        ]
-    },
-
-
-    "Article 9": {
-        "title": "Risk Management System",
-        "phrases": [
-            "EU AI Act Article 9",
-            "AI risk management system",
-            "AI Act compliance framework",
-            "continuous AI risk monitoring"
-        ],
-        "controls": [
-            "Risk identification",
-            "Risk scoring",
-            "Risk mitigation",
-            "Continuous monitoring"
-        ]
-    },
-
-
-    "Article 12": {
-        "title": "Record Keeping and Logging",
-        "phrases": [
-            "AI audit trail",
-            "AI logging requirements",
-            "AI evidence records",
-            "machine learning audit logs"
-        ],
-        "controls": [
-            "Immutable logs",
-            "Evidence storage",
-            "Traceability",
-            "Hash verification"
-        ]
-    },
-
-
-    "Article 14": {
-        "title": "Human Oversight",
-        "phrases": [
-            "AI human oversight",
-            "human in the loop AI",
-            "AI intervention controls"
-        ],
-        "controls": [
-            "Human review",
-            "Override capability",
-            "Decision supervision"
-        ]
-    },
-
-
-    "Article 15": {
-        "title": "Accuracy Robustness Cybersecurity",
-        "phrases": [
-            "AI cybersecurity",
-            "AI accuracy monitoring",
-            "AI robustness requirements"
-        ],
-        "controls": [
-            "Security testing",
-            "Performance monitoring",
-            "Failure detection"
-        ]
-    }
-
-}
-
-
-def search_ai_act(query):
-
-    results = []
-
-    query = query.lower()
-
-    for article, data in AI_ACT_DATABASE.items():
-
-        for phrase in data["phrases"]:
-
-            if query in phrase.lower():
-
-                results.append({
-                    "article": article,
-                    "title": data["title"],
-                    "matched_phrase": phrase,
-                    "controls": data["controls"]
-                })
-
-    return results
-
-
-
-def calculate_compliance_score(system):
-
-    score = 0
-    missing = []
-
-    requirements = {
-
-        "risk_management": "Article 9",
-        "logging": "Article 12",
-        "human_oversight": "Article 14",
-        "security": "Article 15"
-
-    }
-
-
-    for control, article in requirements.items():
-
-        if system.get(control):
-            score += 25
-        else:
-            missing.append(article)
-
-
-    return {
-        "score": score,
-        "rating": risk_rating(score),
-        "missing_articles": missing
-    }
-
-
-
-def risk_rating(score):
-
-    if score >= 90:
-        return "LOW RISK"
-
-    if score >= 70:
-        return "MODERATE RISK"
-
-    if score >= 40:
-        return "HIGH RISK"
-
-    return "CRITICAL RISK"
-
-
-
-def generate_report(system):
-
-    return {
-
-        "engine": "AILeash Compliance Intelligence Engine",
-
-        "version": VERSION,
-
-        "timestamp":
-            datetime.datetime.utcnow().isoformat(),
-
-        "assessment":
-            calculate_compliance_score(system)
-
-    }
-
-
-
-def save_report(report):
-
-    filename = (
-        "aileash_report_"
-        + datetime.datetime.now()
-        .strftime("%Y%m%d_%H%M%S")
-        + ".json"
-    )
-
-    with open(filename, "w") as file:
-        json.dump(
-            report,
-            file,
-            indent=4
-        )
-
-    return filename
-
-
-
-if __name__ == "__main__":
-
-    print(
-        "\nAILeash AI Act Ranking Engine "
-        + VERSION
-    )
-
-    print("\nExample search:")
-    
-    results = search_ai_act(
-        "Article 9"
-    )
-
-    for result in results:
-        print("\nMATCH:")
-        print(result)
-
-
-    test_system = {
-
-        "risk_management": True,
-        "logging": True,
-        "human_oversight": False,
-        "security": True
-
-    }
-
-
-    report = generate_report(test_system)
-
-    print("\nCOMPLIANCE REPORT")
-    print(json.dumps(report, indent=4))
-
-
-    file = save_report(report)
-
-    print(
-        "\nSaved:",
-        file
-    )
 
 ```
