@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-98 files across 20 parts.
+99 files across 20 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -38,11 +38,12 @@ Generated automatically on every push. Do not edit by hand.
 - `modules/network.py`
 - `modules/oversight.py`
 - `modules/pack.py`
+- `modules/packconsole.py`
 - `modules/publish.py`
-- `modules/reconcile.py`
 
 ## [CODEBASE-07.md](CODEBASE-07.md)
 
+- `modules/reconcile.py`
 - `modules/replay.py`
 - `modules/router.py`
 - `modules/rulebind.py`
