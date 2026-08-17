@@ -8,8 +8,8 @@ Contains:
 - `broadcaster.py`
 - `build_sebbi_ecosystem.py`
 - `gateway_proxy.py`
+- `peerconsole.py`
 - `sebbi_orchestrator.py`
-- `sebdog_engine.py`
 
 
 ## `aileash_verify.py`
@@ -2018,6 +2018,390 @@ if __name__ == "__main__":
 ```
 
 
+## `peerconsole.py`
+
+376 lines, 15478 bytes
+
+```python
+"""
+modules/peerconsole.py  v1.0  -  the peer credential page at /peers
+
+Register a peer, rotate their secret, suspend them, see who is on.
+Keyed POSTs a browser address bar cannot reach.
+
+Own patch attribute so it composes with console.py and packconsole.py.
+After a deploy, one /x/ request arms it: /x/peerconsole/status
+"""
+
+import sys
+from urllib.parse import urlparse
+
+VERSION = "1.0"
+PUBLIC = {("GET", "status")}
+PAGE_PATHS = ("/peers", "/peers.html", "/peer-console")
+
+_patched = [False]
+
+PAGE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Peers — AILeash</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--ink:#0a0f1e;--panel:#131b2e;--panel2:#1a2338;--edge:rgba(201,168,76,.22);
+--gold:#c9a84c;--text:#f2efe6;--mute:rgba(242,239,230,.42);--ok:#7fe3b0;--err:#ff8a80;
+--mono:'IBM Plex Mono',ui-monospace,monospace;--body:system-ui,-apple-system,sans-serif}
+body{background:var(--ink);color:var(--text);font-family:var(--body);font-size:16px;
+line-height:1.6;padding:0 0 60px}
+.wrap{max-width:640px;margin:0 auto;padding:0 18px}
+header{padding:30px 0 20px;border-bottom:1px solid var(--edge);margin-bottom:24px}
+.eyebrow{font-family:var(--mono);font-size:10px;letter-spacing:.24em;
+text-transform:uppercase;color:var(--gold);margin-bottom:8px}
+h1{font-size:34px;line-height:1;font-weight:800;letter-spacing:-.02em}
+h1 span{color:var(--gold)}
+.sub{color:var(--mute);font-size:14px;margin-top:10px}
+label{display:block;font-family:var(--mono);font-size:10px;letter-spacing:.16em;
+text-transform:uppercase;color:var(--mute);margin-bottom:6px}
+input{width:100%;background:var(--panel);border:1px solid var(--edge);color:var(--text);
+font-family:var(--mono);font-size:13px;padding:12px;border-radius:4px;outline:none}
+input:focus{border-color:var(--gold)}
+.keybar{background:var(--panel2);border:1px solid var(--edge);border-radius:6px;
+padding:16px;margin-bottom:24px}
+.keynote{font-size:12px;color:var(--mute);margin-top:8px}
+.op{border:1px solid var(--edge);border-radius:6px;background:var(--panel);
+margin-bottom:12px;overflow:hidden}
+.op-head{display:flex;align-items:baseline;gap:10px;padding:15px 16px;cursor:pointer}
+.op-head:hover{background:var(--panel2)}
+.op-n{font-family:var(--mono);font-size:10px;color:var(--gold);opacity:.6}
+.op-t{font-size:17px;font-weight:700}
+.op-r{margin-left:auto;font-family:var(--mono);font-size:10px;color:var(--mute)}
+.op-body{padding:0 16px 16px;display:none}
+.op.open .op-body{display:block}
+.op-why{font-size:13.5px;color:var(--mute);margin-bottom:14px}
+.field{margin-bottom:12px}
+button{width:100%;background:var(--gold);color:var(--ink);border:none;border-radius:4px;
+padding:14px;font-weight:700;font-size:14.5px;cursor:pointer}
+button:hover:not(:disabled){background:#dbbd63}
+button.quiet{background:transparent;color:var(--mute);border:1px solid var(--edge)}
+.two{display:flex;gap:10px}
+.two button{flex:1}
+#out{margin-top:24px}
+pre{font-family:var(--mono);font-size:11.5px;line-height:1.6;background:#080c16;
+color:var(--ok);padding:14px;border-radius:5px;overflow-x:auto;
+border:1px solid var(--edge);max-height:320px}
+.msg{font-family:var(--mono);font-size:12.5px;padding:13px 15px;border-radius:5px;
+border:1px solid var(--edge);color:var(--mute);margin-bottom:12px}
+.msg.bad{color:var(--err);border-color:rgba(200,54,43,.5);background:rgba(200,54,43,.08)}
+.msg.good{color:var(--ok);border-color:rgba(127,227,176,.35);background:rgba(26,158,110,.08)}
+.secret{background:#080c16;border:2px solid var(--gold);border-radius:6px;padding:18px;
+margin-bottom:14px}
+.secret .lbl{font-family:var(--mono);font-size:10px;letter-spacing:.16em;
+text-transform:uppercase;color:var(--gold);margin-bottom:10px}
+.secret .val{font-family:var(--mono);font-size:13px;color:var(--text);word-break:break-all;
+line-height:1.7;background:var(--panel);padding:12px;border-radius:4px}
+.secret .warn{color:var(--err);font-size:13px;margin-top:12px}
+.peer{padding:12px 0;border-bottom:1px solid var(--edge)}
+.peer:last-child{border-bottom:none}
+.peer .id{font-family:var(--mono);font-size:13.5px;color:var(--gold)}
+.peer .meta{font-size:12.5px;color:var(--mute);margin-top:3px}
+.pill{display:inline-block;font-family:var(--mono);font-size:10px;padding:2px 7px;
+border-radius:3px;letter-spacing:.1em;text-transform:uppercase}
+.pill.active{background:rgba(26,158,110,.18);color:var(--ok)}
+.pill.suspended{background:rgba(200,54,43,.15);color:var(--err)}
+footer{margin-top:30px;padding-top:16px;border-top:1px solid var(--edge);
+font-family:var(--mono);font-size:10.5px;color:var(--mute);line-height:1.8}
+a{color:var(--gold)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <p class="eyebrow">AILeash · peer credentials</p>
+  <h1>Signed <span>peers</span></h1>
+  <p class="sub">The open endpoint stays open. This issues credentials to peers who need a guarantee that only they can submit as their chain.</p>
+</header>
+
+<div class="keybar">
+  <label for="key">API key</label>
+  <input id="key" type="password" placeholder="al_live_…" autocomplete="off" spellcheck="false">
+  <p class="keynote">Held in this tab only. Close it and the key is gone.</p>
+</div>
+
+<div class="op open" id="op-reg">
+  <div class="op-head" onclick="tog('op-reg')">
+    <span class="op-n">01</span><span class="op-t">Register a peer</span>
+    <span class="op-r">POST /x/peer/register</span>
+  </div>
+  <div class="op-body">
+    <p class="op-why">Issues their secret. It is shown once here and never again — send it to them over a channel you trust, not the same email as everything else.</p>
+    <div class="field">
+      <label for="r-id">Peer id (lowercase, no spaces)</label>
+      <input id="r-id" placeholder="praesidium" autocomplete="off">
+    </div>
+    <div class="field">
+      <label for="r-name">Chain name</label>
+      <input id="r-name" placeholder="PRAXIS" autocomplete="off">
+    </div>
+    <div class="field">
+      <label for="r-url">Their public tip URL</label>
+      <input id="r-url" placeholder="https://example.com/api/tip" autocomplete="off">
+    </div>
+    <button onclick="run('register')">Issue the credential</button>
+  </div>
+</div>
+
+<div class="op" id="op-rot">
+  <div class="op-head" onclick="tog('op-rot')">
+    <span class="op-n">02</span><span class="op-t">Rotate a secret</span>
+    <span class="op-r">POST /x/peer/rotate</span>
+  </div>
+  <div class="op-body">
+    <p class="op-why">New secret now, old one keeps working for 24 hours so they can roll over without downtime.</p>
+    <div class="field">
+      <label for="o-id">Peer id</label>
+      <input id="o-id" placeholder="praesidium" autocomplete="off">
+    </div>
+    <button onclick="run('rotate')">Rotate</button>
+  </div>
+</div>
+
+<div class="op" id="op-sus">
+  <div class="op-head" onclick="tog('op-sus')">
+    <span class="op-n">03</span><span class="op-t">Suspend or resume</span>
+    <span class="op-r">POST /x/peer/suspend</span>
+  </div>
+  <div class="op-body">
+    <p class="op-why">Suspending refuses new submissions. Nothing is deleted and their sealed history stands.</p>
+    <div class="field">
+      <label for="s-id">Peer id</label>
+      <input id="s-id" placeholder="praesidium" autocomplete="off">
+    </div>
+    <div class="two">
+      <button onclick="run('suspend')">Suspend</button>
+      <button class="quiet" onclick="run('resume')">Resume</button>
+    </div>
+  </div>
+</div>
+
+<div class="op" id="op-list">
+  <div class="op-head" onclick="tog('op-list')">
+    <span class="op-n">04</span><span class="op-t">Who is registered</span>
+    <span class="op-r">GET /x/peer/peers</span>
+  </div>
+  <div class="op-body">
+    <p class="op-why">Public route. Secrets are never returned by anything.</p>
+    <button class="quiet" onclick="run('peers')">List them</button>
+  </div>
+</div>
+
+<div class="op" id="op-hist">
+  <div class="op-head" onclick="tog('op-hist')">
+    <span class="op-n">05</span><span class="op-t">Submissions</span>
+    <span class="op-r">GET /x/peer/history</span>
+  </div>
+  <div class="op-body">
+    <p class="op-why">What has come in, with the receipt for each. Leave the id blank for everything.</p>
+    <div class="field">
+      <label for="h-id">Peer id (optional)</label>
+      <input id="h-id" placeholder="leave blank for all" autocomplete="off">
+    </div>
+    <button class="quiet" onclick="run('history')">Show them</button>
+  </div>
+</div>
+
+<div id="out"></div>
+
+<footer>
+  Spec for peers to implement: <a href="/x/peer/spec">/x/peer/spec</a><br>
+  Open endpoint, unchanged: <a href="/x/witness/peers">/x/witness/peers</a><br>
+  Other consoles: <a href="/console">/console</a> · <a href="/pack">/pack</a>
+</footer>
+
+</div>
+
+<script>
+(function(){
+  var out=document.getElementById('out'), busy=false;
+  window.tog=function(id){document.getElementById(id).classList.toggle('open');};
+  function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+  function msg(t,k){out.innerHTML='<div class="msg '+(k||'')+'">'+esc(t)+'</div>';}
+  function raw(o){return '<pre>'+esc(JSON.stringify(o,null,2))+'</pre>';}
+  function val(id){return document.getElementById(id).value.trim();}
+  function key(){var k=val('key');if(!k){msg('Paste your API key at the top first.','bad');return null;}return k;}
+
+  async function call(path,method,body){
+    var k=key(); if(!k) return null;
+    var o={method:method,headers:{'Authorization':'Bearer '+k}};
+    if(body){o.headers['Content-Type']='application/json';o.body=JSON.stringify(body);}
+    var r=await fetch(path,o); var d;
+    try{d=await r.json();}catch(e){d={error:'unreadable_response'};}
+    return {status:r.status,data:d};
+  }
+
+  function showSecret(d,title,extra){
+    return '<div class="secret"><div class="lbl">'+esc(title)+' — '+esc(d.peer_id)+'</div>'
+      +'<div class="val">'+esc(d.secret)+'</div>'
+      +'<div class="warn">Shown once. Not recoverable. Copy it now and send it to them '
+      +'separately from anything else.</div>'
+      +(extra?'<div class="warn" style="color:var(--mute)">'+esc(extra)+'</div>':'')
+      +'</div>';
+  }
+
+  function showPeers(d){
+    if(!d.peers||!d.peers.length) return '<div class="msg">No peers registered yet.</div>';
+    var h='<div class="msg good">'+d.count+' registered</div><div class="op open"><div class="op-body" style="padding:16px">';
+    d.peers.forEach(function(p){
+      h+='<div class="peer"><span class="id">'+esc(p.peer_id)+'</span> '
+        +'<span class="pill '+esc(p.status)+'">'+esc(p.status)+'</span>'
+        +'<div class="meta">'+esc(p.chain_name||'')
+        +' · '+esc(p.submissions)+' submissions'
+        +(p.last_seen?' · last '+esc(p.last_seen):' · never submitted')
+        +(p.rotation_overlap_active?' · rotating':'')
+        +'</div>'
+        +(p.url?'<div class="meta">'+esc(p.url)+'</div>':'')
+        +'</div>';
+    });
+    return h+'</div></div>';
+  }
+
+  window.run=async function(what){
+    if(busy) return;
+    var path,method='POST',body=null;
+
+    if(what==='register'){
+      var id=val('r-id');
+      if(!id){msg('Give the peer an id.','bad');return;}
+      path='/x/peer/register';
+      body={peer_id:id.toLowerCase(),chain_name:val('r-name')||id,url:val('r-url')};
+    }
+    else if(what==='rotate'){
+      var oid=val('o-id');
+      if(!oid){msg('Which peer?','bad');return;}
+      path='/x/peer/rotate'; body={peer_id:oid.toLowerCase()};
+    }
+    else if(what==='suspend'||what==='resume'){
+      var sid=val('s-id');
+      if(!sid){msg('Which peer?','bad');return;}
+      path='/x/peer/'+what; body={peer_id:sid.toLowerCase()};
+    }
+    else if(what==='peers'){path='/x/peer/peers';method='GET';}
+    else if(what==='history'){
+      var hid=val('h-id');
+      path='/x/peer/history'+(hid?'?peer_id='+encodeURIComponent(hid.toLowerCase()):'');
+      method='GET';
+    }
+    else return;
+
+    busy=true;
+    out.innerHTML='<div class="msg">Working…</div>';
+    try{
+      var res=await call(path,method,body);
+      if(!res){busy=false;return;}
+      var d=res.data;
+      if(res.status===401){msg('That key was refused.','bad');}
+      else if(res.status===404&&d&&d.error==='unknown_module'){
+        msg('modules/peer.py is not deployed yet.','bad');}
+      else if(res.status>=400){
+        out.innerHTML='<div class="msg bad">'+esc((d&&(d.detail||d.error))||('HTTP '+res.status))+'</div>'+raw(d);}
+      else if(what==='register'&&d.secret){
+        out.innerHTML=showSecret(d,'Peer secret')
+          +'<div class="msg good">Registered. Send them /x/peer/spec so they can implement the signing.</div>'+raw(d);}
+      else if(what==='rotate'&&d.secret){
+        out.innerHTML=showSecret(d,'New secret','Previous secret valid until '+(d.previous_valid_until||''))+raw(d);}
+      else if(what==='peers'){out.innerHTML=showPeers(d)+raw(d);}
+      else{out.innerHTML='<div class="msg good">Done.</div>'+raw(d);}
+    }catch(e){msg('Could not reach the server.','bad');}
+    busy=false;
+  };
+})();
+</script>
+</body>
+</html>
+"""
+
+
+def _srv():
+    m = sys.modules.get("__main__")
+    if hasattr(m, "get_bearer"):
+        return m
+    return sys.modules.get("server")
+
+
+def _install(s):
+    if _patched[0]:
+        return "already installed"
+    H = getattr(s, "Handler", None)
+    if H is None or not hasattr(H, "do_GET"):
+        return "no handler"
+    if getattr(H, "_peerconsole_patched", False):
+        _patched[0] = True
+        return "already installed"
+
+    original = H.do_GET
+
+    def do_GET(self):
+        try:
+            p = urlparse(self.path).path.rstrip("/") or "/"
+        except Exception:
+            p = self.path or "/"
+        if p in PAGE_PATHS:
+            body = PAGE.encode("utf-8")
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Robots-Tag", "noindex, nofollow")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception:
+                pass
+            return
+        return original(self)
+
+    H.do_GET = do_GET
+    H._peerconsole_patched = True
+    _patched[0] = True
+    print("PEERCONSOLE: /peers page installed at runtime", flush=True)
+    return "installed"
+
+
+def handle(method, action, data, api_key, ctx):
+    s = _srv()
+    if s is None:
+        return {"error": "server_not_found"}, 500
+
+    state = "already installed" if _patched[0] else None
+    if not _patched[0]:
+        try:
+            state = _install(s)
+        except Exception as exc:
+            print("PEERCONSOLE: patch failed - " + str(exc), flush=True)
+            state = "failed: " + str(exc)
+
+    if method == "GET" and (action or "") in ("", "status"):
+        return {
+            "page": "/peers",
+            "installed": bool(_patched[0]),
+            "install_result": state,
+            "version": VERSION,
+            "paths": list(PAGE_PATHS),
+            "note": "The page holds no credentials. Every route it calls "
+                    "checks the key itself.",
+        }, 200
+
+    return {"error": "unknown_action", "action": action, "GET": ["status"]}, 404
+
+```
+
+
 ## `sebbi_orchestrator.py`
 
 194 lines, 7453 bytes
@@ -2216,458 +2600,5 @@ async def run_unified_orchestration():
 
 if __name__ == "__main__":
     asyncio.run(run_unified_orchestration())
-
-```
-
-
-## `sebdog_engine.py`
-
-445 lines, 17345 bytes
-
-```python
-import json, math, time, sqlite3, hashlib, threading, argparse, sys, os, shutil
-import urllib.request, urllib.parse
-from collections import defaultdict, deque
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from socketserver import ThreadingMixIn
-from urllib.parse import urlparse
-
-VERSION = "1.1.0"
-HOME = "https://sebbi.pro"
-VALIDATE_URL = HOME + "/api/validate-engine"
-DB_FILE = "sebdog_audit.db"
-SAFE = {"UK","US","DE","FR","CA","AU","NL","SE","NO","DK","FI","IE","NZ"}
-REQ = {"user_id","action","amount","country","device_id","anomaly","device_risk"}
-
-_db_lock = threading.Lock()
-_key_wins = defaultdict(lambda: {"min": deque(), "hour": deque()})
-_key_lock = threading.Lock()
-W60 = defaultdict(deque)
-W5M = defaultdict(deque)
-W1H = defaultdict(deque)
-
-_licence = {
-    "valid": False, "plan": "free", "product": "aileash",
-    "devices": 1, "email": "", "checked_at": 0, "key": ""
-}
-
-# ==============================================================================
-# LICENCE VALIDATION
-# ==============================================================================
-
-def validate_licence(api_key):
-    global _licence
-    try:
-        req = urllib.request.Request(
-            VALIDATE_URL, method="POST",
-            headers={"Authorization": "Bearer " + api_key, "Content-Type": "application/json"},
-            data=json.dumps({}).encode()
-        )
-        with urllib.request.urlopen(req, timeout=10) as r:
-            data = json.loads(r.read())
-        if data.get("valid"):
-            _licence.update({
-                "valid": True, "plan": data.get("plan","free"),
-                "product": data.get("product","aileash"),
-                "devices": data.get("devices",1),
-                "email": data.get("email",""),
-                "checked_at": time.time(), "key": api_key
-            })
-            print(f"[SEBDOG] Licence valid. Plan:{_licence['plan']} Devices:{_licence['devices']}", flush=True)
-            return True
-        else:
-            err = data.get("error","unknown")
-            print(f"[SEBDOG] Licence rejected: {err}", flush=True)
-            _licence["valid"] = False
-            return False
-    except Exception as e:
-        print(f"[SEBDOG] Licence check failed: {e}", flush=True)
-        if _licence["valid"] and (time.time() - _licence["checked_at"]) < 86400:
-            print("[SEBDOG] Using cached licence (24h grace)", flush=True)
-            return True
-        return False
-
-def revalidate_loop(api_key):
-    while True:
-        time.sleep(86400)
-        validate_licence(api_key)
-
-# ==============================================================================
-# DATABASE + BACKUP
-# Local SQLite — audit chain lives on your own machine.
-# Automatic daily backup keeps data retrievable even after failures.
-# Sovereignty is maintained — data never leaves your network.
-# ==============================================================================
-
-def get_conn():
-    c = sqlite3.connect(DB_FILE, check_same_thread=False)
-    c.execute("PRAGMA journal_mode=WAL;")
-    c.execute("PRAGMA synchronous=NORMAL;")
-    c.execute("""CREATE TABLE IF NOT EXISTS users(
-        user_id TEXT PRIMARY KEY, trust REAL DEFAULT 0.5, last_country TEXT)""")
-    c.execute("""CREATE TABLE IF NOT EXISTS audit_log(
-        id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, user_id TEXT,
-        event_json TEXT, result_json TEXT, prev_hash TEXT,
-        audit_hash TEXT UNIQUE)""")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_audit ON audit_log(user_id)")
-    c.execute("""CREATE TABLE IF NOT EXISTS chain_snapshots(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts REAL, block_count INTEGER, tip_hash TEXT,
-        snapshot_file TEXT)""")
-    c.commit()
-    return c
-
-_conn = None
-
-def init_db():
-    global _conn
-    _conn = get_conn()
-
-def backup_db():
-    """
-    Creates a timestamped backup of the audit database.
-    Data stays on your own hardware — sovereignty is not affected.
-    Runs automatically every 24 hours.
-    """
-    backup_dir = os.path.join(os.path.dirname(DB_FILE), "sebdog_backups")
-    os.makedirs(backup_dir, exist_ok=True)
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    backup_path = os.path.join(backup_dir, f"sebdog_audit_{ts}.db")
-    try:
-        with _db_lock:
-            shutil.copy2(DB_FILE, backup_path)
-            blocks = _conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0]
-            tip = _conn.execute(
-                "SELECT audit_hash FROM audit_log ORDER BY id DESC LIMIT 1"
-            ).fetchone()
-            tip_hash = tip[0] if tip else "GENESIS"
-            _conn.execute(
-                "INSERT INTO chain_snapshots(ts,block_count,tip_hash,snapshot_file) VALUES(?,?,?,?)",
-                (time.time(), blocks, tip_hash, backup_path)
-            )
-            _conn.commit()
-        print(f"[SEBDOG] Backup created: {backup_path} ({blocks} blocks)", flush=True)
-        _cleanup_old_backups(backup_dir)
-    except Exception as e:
-        print(f"[SEBDOG] Backup failed: {e}", flush=True)
-
-def _cleanup_old_backups(backup_dir, keep=7):
-    """Keep only the most recent N backups."""
-    try:
-        files = sorted([
-            os.path.join(backup_dir, f) for f in os.listdir(backup_dir)
-            if f.startswith("sebdog_audit_") and f.endswith(".db")
-        ])
-        for old in files[:-keep]:
-            os.remove(old)
-    except Exception:
-        pass
-
-def backup_loop():
-    while True:
-        time.sleep(86400)
-        backup_db()
-
-def restore_latest_backup():
-    """
-    Restore from the most recent backup if the main database is missing or corrupt.
-    Call this on startup if the main DB file doesn't exist.
-    """
-    backup_dir = os.path.join(os.path.dirname(DB_FILE), "sebdog_backups")
-    if not os.path.exists(backup_dir):
-        return False
-    files = sorted([
-        os.path.join(backup_dir, f) for f in os.listdir(backup_dir)
-        if f.startswith("sebdog_audit_") and f.endswith(".db")
-    ])
-    if not files:
-        return False
-    latest = files[-1]
-    try:
-        shutil.copy2(latest, DB_FILE)
-        print(f"[SEBDOG] Restored from backup: {latest}", flush=True)
-        return True
-    except Exception as e:
-        print(f"[SEBDOG] Restore failed: {e}", flush=True)
-        return False
-
-def list_snapshots():
-    with _db_lock:
-        rows = _conn.execute(
-            "SELECT ts, block_count, tip_hash, snapshot_file FROM chain_snapshots ORDER BY id DESC LIMIT 10"
-        ).fetchall()
-    return [{"ts": r[0], "blocks": r[1], "tip": r[2], "file": r[3]} for r in rows]
-
-# ==============================================================================
-# RATE LIMITING
-# ==============================================================================
-
-def check_rate(key):
-    t = time.time()
-    with _key_lock:
-        w = _key_wins[key]
-        while w["min"] and w["min"][0] < t-60: w["min"].popleft()
-        while w["hour"] and w["hour"][0] < t-3600: w["hour"].popleft()
-        if len(w["min"]) >= 60: return False, "rate_limit_minute"
-        if len(w["hour"]) >= 1000: return False, "rate_limit_hour"
-        w["min"].append(t); w["hour"].append(t)
-        return True, None
-
-# ==============================================================================
-# CORE ENGINE
-# ==============================================================================
-
-def now(): return time.time()
-def clamp(x,a=0.0,b=1.0): return max(a,min(b,x))
-def sha(p): return hashlib.sha256(json.dumps(p,sort_keys=True).encode()).hexdigest()
-
-def upd_vel(uid):
-    t=now()
-    for q in [W60[uid],W5M[uid],W1H[uid]]: q.append(t)
-    c=now()
-    W60[uid]=deque(x for x in W60[uid] if x>=c-60)
-    W5M[uid]=deque(x for x in W5M[uid] if x>=c-300)
-    W1H[uid]=deque(x for x in W1H[uid] if x>=c-3600)
-
-def vel(uid): return {"60s":len(W60[uid]),"5m":len(W5M[uid]),"1h":len(W1H[uid])}
-
-def load_user(uid):
-    with _db_lock:
-        r=_conn.execute("SELECT trust,last_country FROM users WHERE user_id=?",(uid,)).fetchone()
-    return{"trust":r[0],"last_country":r[1]} if r else{"trust":0.5,"last_country":None}
-
-def save_user(uid,trust,country):
-    with _db_lock:
-        _conn.execute(
-            "INSERT INTO users(user_id,trust,last_country) VALUES(?,?,?) "
-            "ON CONFLICT(user_id) DO UPDATE SET trust=excluded.trust,last_country=excluded.last_country",
-            (uid,trust,country))
-        _conn.commit()
-
-def score_event(s):
-    reasons=[]
-    sc=(1-s["trust"])*0.30
-    v60=s["v60"]; sc+=min(v60/20,1)*0.15
-    if v60>10: reasons.append("velocity_spike")
-    sc+=min(s["v5m"]/50,1)*0.10+min(s["v1h"]/200,1)*0.10
-    amt=float(s.get("amount",0)); sc+=min(math.log1p(amt)/math.log1p(10000),1)*0.15
-    if amt>500: reasons.append("high_amount")
-    dr=float(s.get("device_risk",0)); sc+=dr*0.10
-    if dr>0.5: reasons.append("risky_device")
-    an=float(s.get("anomaly",0)); sc+=an*0.10
-    if an>0.5: reasons.append("behaviour_anomaly")
-    if s.get("country_shift"): sc+=0.10; reasons.append("country_shift")
-    if s.get("unsafe_country"): sc+=0.10; reasons.append("unsafe_country")
-    if s["trust"]<0.4: reasons.append("low_trust")
-    return round(clamp(sc),4),reasons
-
-def decide(sc):
-    if sc<0.35: return"ALLOW"
-    if sc<0.70: return"CHALLENGE"
-    return"BLOCK"
-
-def upd_trust(t,d):
-    if d=="ALLOW": t+=(1-t)*0.01
-    elif d=="CHALLENGE": t-=t*0.02
-    elif d=="BLOCK": t-=t*0.08
-    return clamp(t,0.05,1.0)
-
-def chain_tip():
-    with _db_lock:
-        r=_conn.execute("SELECT audit_hash FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()
-    return r[0] if r else"GENESIS"
-
-def seal(event,result,ts):
-    prev=chain_tip()
-    h=sha({"prev_hash":prev,"ts":ts,"event":event,"result":result})
-    with _db_lock:
-        _conn.execute(
-            "INSERT INTO audit_log(ts,user_id,event_json,result_json,prev_hash,audit_hash) VALUES(?,?,?,?,?,?)",
-            (ts,event["user_id"],json.dumps(event),json.dumps(result),prev,h))
-        _conn.commit()
-    return h
-
-def verify_chain():
-    with _db_lock:
-        rows=_conn.execute(
-            "SELECT event_json,result_json,prev_hash,audit_hash,ts FROM audit_log ORDER BY id ASC"
-        ).fetchall()
-    if not rows: return{"valid":True,"blocks":0,"message":"Empty chain"}
-    prev="GENESIS"
-    for i,row in enumerate(rows):
-        p={"prev_hash":row[2],"ts":row[4],"event":json.loads(row[0]),"result":json.loads(row[1])}
-        if sha(p)!=row[3] or row[2]!=prev:
-            return{"valid":False,"broken_at":i,"message":f"Tampered at block {i}"}
-        prev=row[3]
-    return{"valid":True,"blocks":len(rows),"tip":rows[-1][3],"message":"Chain intact"}
-
-def govern(event):
-    missing=REQ-event.keys()
-    if missing: raise ValueError(f"Missing fields: {missing}")
-    if not _licence["valid"]:
-        return{"error":"licence_invalid","message":f"Valid API key required. Get yours at {HOME}"},403
-    ts=now(); uid=event["user_id"]
-    state=load_user(uid); upd_vel(uid); v=vel(uid)
-    country=event["country"]
-    signals={
-        "trust":state["trust"],"v60":v["60s"],"v5m":v["5m"],"v1h":v["1h"],
-        "amount":float(event.get("amount",0)),
-        "device_risk":float(event.get("device_risk",0)),
-        "anomaly":float(event.get("anomaly",0)),
-        "country_shift":state["last_country"] is not None and state["last_country"]!=country,
-        "unsafe_country":country not in SAFE
-    }
-    sc,reasons=score_event(signals)
-    dec=decide(sc); trust=upd_trust(state["trust"],dec)
-    save_user(uid,trust,country)
-    result={
-        "decision":dec,"score":sc,"trust":round(trust,4),
-        "reasons":reasons,"version":VERSION,"engine":"sebdog",
-        "local":True,"timestamp":ts
-    }
-    result["audit_hash"]=seal(event,result,ts)
-    return result,200
-
-# ==============================================================================
-# HTTP SERVER
-# ==============================================================================
-
-def send_json(h,data,status=200):
-    body=json.dumps(data,indent=2).encode()
-    h.send_response(status)
-    h.send_header("Content-Type","application/json")
-    h.send_header("Content-Length",str(len(body)))
-    h.send_header("Access-Control-Allow-Origin","*")
-    h.end_headers()
-    h.wfile.write(body)
-
-def read_body(h):
-    n=int(h.headers.get("Content-Length",0))
-    if n:
-        try: return json.loads(h.rfile.read(n))
-        except: return{}
-    return{}
-
-def get_bearer(h):
-    auth=h.headers.get("Authorization","")
-    if auth.startswith("Bearer "): return auth[7:]
-    return h.headers.get("X-API-Key","").strip()
-
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self,fmt,*args): pass
-
-    def do_OPTIONS(self):
-        self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin","*")
-        self.send_header("Access-Control-Allow-Methods","GET,POST,OPTIONS")
-        self.send_header("Access-Control-Allow-Headers","Content-Type,Authorization,X-API-Key")
-        self.end_headers()
-
-    def do_GET(self):
-        path=urlparse(self.path).path
-        if path=="/health":
-            send_json(self,{
-                "status":"ok","version":VERSION,"engine":"sebdog","local":True,
-                "licence":{
-                    "valid":_licence["valid"],"plan":_licence["plan"],
-                    "devices":_licence["devices"],"email":_licence["email"]
-                }
-            })
-        elif path=="/verify-chain":
-            send_json(self,verify_chain())
-        elif path=="/stats":
-            with _db_lock:
-                blocks=_conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0]
-                users=_conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-            send_json(self,{
-                "audit_blocks":blocks,"users_tracked":users,
-                "version":VERSION,"engine":"sebdog","licence_valid":_licence["valid"]
-            })
-        elif path=="/snapshots":
-            send_json(self,{"snapshots":list_snapshots()})
-        elif path=="/backup":
-            backup_db()
-            send_json(self,{"ok":True,"message":"Backup created"})
-        else:
-            send_json(self,{"error":"not_found"},404)
-
-    def do_POST(self):
-        path=urlparse(self.path).path.rstrip("/")
-        data=read_body(self)
-        if path in("/govern","/api/govern"):
-            bearer=get_bearer(self)
-            if bearer and bearer!=_licence["key"]:
-                send_json(self,{"error":"invalid_api_key"},401); return
-            ok,ec=check_rate(bearer or"default")
-            if not ok:
-                send_json(self,{"error":ec},429); return
-            try:
-                result,status=govern(data)
-                send_json(self,result,status)
-            except ValueError as e:
-                send_json(self,{"error":str(e)},400)
-            except Exception as e:
-                send_json(self,{"error":"internal","detail":str(e)},500)
-        else:
-            send_json(self,{"error":"not_found"},404)
-
-class ThreadedServer(ThreadingMixIn,HTTPServer):
-    allow_reuse_address=True
-    daemon_threads=True
-
-# ==============================================================================
-# ENTRY POINT
-# ==============================================================================
-
-def main():
-    parser=argparse.ArgumentParser(description="Sebdog Engine — AILeash local compliance engine")
-    parser.add_argument("--key",required=True,help="Your AILeash API key from sebbi.pro")
-    parser.add_argument("--port",type=int,default=9090,help="Port (default: 9090)")
-    parser.add_argument("--db",default="sebdog_audit.db",help="SQLite audit database path")
-    parser.add_argument("--backup-on-start",action="store_true",help="Create a backup on startup")
-    args=parser.parse_args()
-
-    global DB_FILE
-    DB_FILE=args.db
-
-    print(f"[SEBDOG] Sebdog Engine v{VERSION} starting...",flush=True)
-
-    # Restore from backup if DB missing
-    if not os.path.exists(DB_FILE):
-        print(f"[SEBDOG] Database not found. Checking for backups...",flush=True)
-        if restore_latest_backup():
-            print(f"[SEBDOG] Data restored from backup.",flush=True)
-        else:
-            print(f"[SEBDOG] No backup found. Starting fresh chain.",flush=True)
-
-    init_db()
-
-    if args.backup_on_start:
-        backup_db()
-
-    print(f"[SEBDOG] Validating licence with sebbi.pro...",flush=True)
-    if not validate_licence(args.key):
-        print(f"[SEBDOG] Licence validation failed. Get your key at {HOME}",flush=True)
-        sys.exit(1)
-
-    threading.Thread(target=revalidate_loop,args=(args.key,),daemon=True).start()
-    threading.Thread(target=backup_loop,daemon=True).start()
-
-    server=ThreadedServer(("0.0.0.0",args.port),Handler)
-    print(f"[SEBDOG] Engine running on port {args.port}",flush=True)
-    print(f"[SEBDOG] POST http://localhost:{args.port}/govern",flush=True)
-    print(f"[SEBDOG] GET  http://localhost:{args.port}/health",flush=True)
-    print(f"[SEBDOG] GET  http://localhost:{args.port}/verify-chain",flush=True)
-    print(f"[SEBDOG] GET  http://localhost:{args.port}/snapshots",flush=True)
-    print(f"[SEBDOG] Backups: ./sebdog_backups/ (daily, last 7 kept)",flush=True)
-    print(f"[SEBDOG] Sovereignty: all data stays on your hardware.",flush=True)
-
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("[SEBDOG] Shutting down.",flush=True)
-
-if __name__=="__main__":
-    main()
 
 ```

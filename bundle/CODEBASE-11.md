@@ -1,6 +1,7 @@
 # Codebase — part 11 of 20
 
 Contains:
+- `sebdog_engine.py`
 - `sebdog_licence.py`
 - `sebdog_reporter.py`
 - `tests/attack_continuity_1.py`
@@ -10,7 +11,459 @@ Contains:
 - `tests/attack_continuity_5.py`
 - `tests/attack_continuity_6.py`
 - `tests/attack_witnessed.py`
-- `verify_authority.py`
+
+
+## `sebdog_engine.py`
+
+445 lines, 17345 bytes
+
+```python
+import json, math, time, sqlite3, hashlib, threading, argparse, sys, os, shutil
+import urllib.request, urllib.parse
+from collections import defaultdict, deque
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
+from urllib.parse import urlparse
+
+VERSION = "1.1.0"
+HOME = "https://sebbi.pro"
+VALIDATE_URL = HOME + "/api/validate-engine"
+DB_FILE = "sebdog_audit.db"
+SAFE = {"UK","US","DE","FR","CA","AU","NL","SE","NO","DK","FI","IE","NZ"}
+REQ = {"user_id","action","amount","country","device_id","anomaly","device_risk"}
+
+_db_lock = threading.Lock()
+_key_wins = defaultdict(lambda: {"min": deque(), "hour": deque()})
+_key_lock = threading.Lock()
+W60 = defaultdict(deque)
+W5M = defaultdict(deque)
+W1H = defaultdict(deque)
+
+_licence = {
+    "valid": False, "plan": "free", "product": "aileash",
+    "devices": 1, "email": "", "checked_at": 0, "key": ""
+}
+
+# ==============================================================================
+# LICENCE VALIDATION
+# ==============================================================================
+
+def validate_licence(api_key):
+    global _licence
+    try:
+        req = urllib.request.Request(
+            VALIDATE_URL, method="POST",
+            headers={"Authorization": "Bearer " + api_key, "Content-Type": "application/json"},
+            data=json.dumps({}).encode()
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read())
+        if data.get("valid"):
+            _licence.update({
+                "valid": True, "plan": data.get("plan","free"),
+                "product": data.get("product","aileash"),
+                "devices": data.get("devices",1),
+                "email": data.get("email",""),
+                "checked_at": time.time(), "key": api_key
+            })
+            print(f"[SEBDOG] Licence valid. Plan:{_licence['plan']} Devices:{_licence['devices']}", flush=True)
+            return True
+        else:
+            err = data.get("error","unknown")
+            print(f"[SEBDOG] Licence rejected: {err}", flush=True)
+            _licence["valid"] = False
+            return False
+    except Exception as e:
+        print(f"[SEBDOG] Licence check failed: {e}", flush=True)
+        if _licence["valid"] and (time.time() - _licence["checked_at"]) < 86400:
+            print("[SEBDOG] Using cached licence (24h grace)", flush=True)
+            return True
+        return False
+
+def revalidate_loop(api_key):
+    while True:
+        time.sleep(86400)
+        validate_licence(api_key)
+
+# ==============================================================================
+# DATABASE + BACKUP
+# Local SQLite — audit chain lives on your own machine.
+# Automatic daily backup keeps data retrievable even after failures.
+# Sovereignty is maintained — data never leaves your network.
+# ==============================================================================
+
+def get_conn():
+    c = sqlite3.connect(DB_FILE, check_same_thread=False)
+    c.execute("PRAGMA journal_mode=WAL;")
+    c.execute("PRAGMA synchronous=NORMAL;")
+    c.execute("""CREATE TABLE IF NOT EXISTS users(
+        user_id TEXT PRIMARY KEY, trust REAL DEFAULT 0.5, last_country TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS audit_log(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, user_id TEXT,
+        event_json TEXT, result_json TEXT, prev_hash TEXT,
+        audit_hash TEXT UNIQUE)""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_audit ON audit_log(user_id)")
+    c.execute("""CREATE TABLE IF NOT EXISTS chain_snapshots(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts REAL, block_count INTEGER, tip_hash TEXT,
+        snapshot_file TEXT)""")
+    c.commit()
+    return c
+
+_conn = None
+
+def init_db():
+    global _conn
+    _conn = get_conn()
+
+def backup_db():
+    """
+    Creates a timestamped backup of the audit database.
+    Data stays on your own hardware — sovereignty is not affected.
+    Runs automatically every 24 hours.
+    """
+    backup_dir = os.path.join(os.path.dirname(DB_FILE), "sebdog_backups")
+    os.makedirs(backup_dir, exist_ok=True)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    backup_path = os.path.join(backup_dir, f"sebdog_audit_{ts}.db")
+    try:
+        with _db_lock:
+            shutil.copy2(DB_FILE, backup_path)
+            blocks = _conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0]
+            tip = _conn.execute(
+                "SELECT audit_hash FROM audit_log ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            tip_hash = tip[0] if tip else "GENESIS"
+            _conn.execute(
+                "INSERT INTO chain_snapshots(ts,block_count,tip_hash,snapshot_file) VALUES(?,?,?,?)",
+                (time.time(), blocks, tip_hash, backup_path)
+            )
+            _conn.commit()
+        print(f"[SEBDOG] Backup created: {backup_path} ({blocks} blocks)", flush=True)
+        _cleanup_old_backups(backup_dir)
+    except Exception as e:
+        print(f"[SEBDOG] Backup failed: {e}", flush=True)
+
+def _cleanup_old_backups(backup_dir, keep=7):
+    """Keep only the most recent N backups."""
+    try:
+        files = sorted([
+            os.path.join(backup_dir, f) for f in os.listdir(backup_dir)
+            if f.startswith("sebdog_audit_") and f.endswith(".db")
+        ])
+        for old in files[:-keep]:
+            os.remove(old)
+    except Exception:
+        pass
+
+def backup_loop():
+    while True:
+        time.sleep(86400)
+        backup_db()
+
+def restore_latest_backup():
+    """
+    Restore from the most recent backup if the main database is missing or corrupt.
+    Call this on startup if the main DB file doesn't exist.
+    """
+    backup_dir = os.path.join(os.path.dirname(DB_FILE), "sebdog_backups")
+    if not os.path.exists(backup_dir):
+        return False
+    files = sorted([
+        os.path.join(backup_dir, f) for f in os.listdir(backup_dir)
+        if f.startswith("sebdog_audit_") and f.endswith(".db")
+    ])
+    if not files:
+        return False
+    latest = files[-1]
+    try:
+        shutil.copy2(latest, DB_FILE)
+        print(f"[SEBDOG] Restored from backup: {latest}", flush=True)
+        return True
+    except Exception as e:
+        print(f"[SEBDOG] Restore failed: {e}", flush=True)
+        return False
+
+def list_snapshots():
+    with _db_lock:
+        rows = _conn.execute(
+            "SELECT ts, block_count, tip_hash, snapshot_file FROM chain_snapshots ORDER BY id DESC LIMIT 10"
+        ).fetchall()
+    return [{"ts": r[0], "blocks": r[1], "tip": r[2], "file": r[3]} for r in rows]
+
+# ==============================================================================
+# RATE LIMITING
+# ==============================================================================
+
+def check_rate(key):
+    t = time.time()
+    with _key_lock:
+        w = _key_wins[key]
+        while w["min"] and w["min"][0] < t-60: w["min"].popleft()
+        while w["hour"] and w["hour"][0] < t-3600: w["hour"].popleft()
+        if len(w["min"]) >= 60: return False, "rate_limit_minute"
+        if len(w["hour"]) >= 1000: return False, "rate_limit_hour"
+        w["min"].append(t); w["hour"].append(t)
+        return True, None
+
+# ==============================================================================
+# CORE ENGINE
+# ==============================================================================
+
+def now(): return time.time()
+def clamp(x,a=0.0,b=1.0): return max(a,min(b,x))
+def sha(p): return hashlib.sha256(json.dumps(p,sort_keys=True).encode()).hexdigest()
+
+def upd_vel(uid):
+    t=now()
+    for q in [W60[uid],W5M[uid],W1H[uid]]: q.append(t)
+    c=now()
+    W60[uid]=deque(x for x in W60[uid] if x>=c-60)
+    W5M[uid]=deque(x for x in W5M[uid] if x>=c-300)
+    W1H[uid]=deque(x for x in W1H[uid] if x>=c-3600)
+
+def vel(uid): return {"60s":len(W60[uid]),"5m":len(W5M[uid]),"1h":len(W1H[uid])}
+
+def load_user(uid):
+    with _db_lock:
+        r=_conn.execute("SELECT trust,last_country FROM users WHERE user_id=?",(uid,)).fetchone()
+    return{"trust":r[0],"last_country":r[1]} if r else{"trust":0.5,"last_country":None}
+
+def save_user(uid,trust,country):
+    with _db_lock:
+        _conn.execute(
+            "INSERT INTO users(user_id,trust,last_country) VALUES(?,?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET trust=excluded.trust,last_country=excluded.last_country",
+            (uid,trust,country))
+        _conn.commit()
+
+def score_event(s):
+    reasons=[]
+    sc=(1-s["trust"])*0.30
+    v60=s["v60"]; sc+=min(v60/20,1)*0.15
+    if v60>10: reasons.append("velocity_spike")
+    sc+=min(s["v5m"]/50,1)*0.10+min(s["v1h"]/200,1)*0.10
+    amt=float(s.get("amount",0)); sc+=min(math.log1p(amt)/math.log1p(10000),1)*0.15
+    if amt>500: reasons.append("high_amount")
+    dr=float(s.get("device_risk",0)); sc+=dr*0.10
+    if dr>0.5: reasons.append("risky_device")
+    an=float(s.get("anomaly",0)); sc+=an*0.10
+    if an>0.5: reasons.append("behaviour_anomaly")
+    if s.get("country_shift"): sc+=0.10; reasons.append("country_shift")
+    if s.get("unsafe_country"): sc+=0.10; reasons.append("unsafe_country")
+    if s["trust"]<0.4: reasons.append("low_trust")
+    return round(clamp(sc),4),reasons
+
+def decide(sc):
+    if sc<0.35: return"ALLOW"
+    if sc<0.70: return"CHALLENGE"
+    return"BLOCK"
+
+def upd_trust(t,d):
+    if d=="ALLOW": t+=(1-t)*0.01
+    elif d=="CHALLENGE": t-=t*0.02
+    elif d=="BLOCK": t-=t*0.08
+    return clamp(t,0.05,1.0)
+
+def chain_tip():
+    with _db_lock:
+        r=_conn.execute("SELECT audit_hash FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()
+    return r[0] if r else"GENESIS"
+
+def seal(event,result,ts):
+    prev=chain_tip()
+    h=sha({"prev_hash":prev,"ts":ts,"event":event,"result":result})
+    with _db_lock:
+        _conn.execute(
+            "INSERT INTO audit_log(ts,user_id,event_json,result_json,prev_hash,audit_hash) VALUES(?,?,?,?,?,?)",
+            (ts,event["user_id"],json.dumps(event),json.dumps(result),prev,h))
+        _conn.commit()
+    return h
+
+def verify_chain():
+    with _db_lock:
+        rows=_conn.execute(
+            "SELECT event_json,result_json,prev_hash,audit_hash,ts FROM audit_log ORDER BY id ASC"
+        ).fetchall()
+    if not rows: return{"valid":True,"blocks":0,"message":"Empty chain"}
+    prev="GENESIS"
+    for i,row in enumerate(rows):
+        p={"prev_hash":row[2],"ts":row[4],"event":json.loads(row[0]),"result":json.loads(row[1])}
+        if sha(p)!=row[3] or row[2]!=prev:
+            return{"valid":False,"broken_at":i,"message":f"Tampered at block {i}"}
+        prev=row[3]
+    return{"valid":True,"blocks":len(rows),"tip":rows[-1][3],"message":"Chain intact"}
+
+def govern(event):
+    missing=REQ-event.keys()
+    if missing: raise ValueError(f"Missing fields: {missing}")
+    if not _licence["valid"]:
+        return{"error":"licence_invalid","message":f"Valid API key required. Get yours at {HOME}"},403
+    ts=now(); uid=event["user_id"]
+    state=load_user(uid); upd_vel(uid); v=vel(uid)
+    country=event["country"]
+    signals={
+        "trust":state["trust"],"v60":v["60s"],"v5m":v["5m"],"v1h":v["1h"],
+        "amount":float(event.get("amount",0)),
+        "device_risk":float(event.get("device_risk",0)),
+        "anomaly":float(event.get("anomaly",0)),
+        "country_shift":state["last_country"] is not None and state["last_country"]!=country,
+        "unsafe_country":country not in SAFE
+    }
+    sc,reasons=score_event(signals)
+    dec=decide(sc); trust=upd_trust(state["trust"],dec)
+    save_user(uid,trust,country)
+    result={
+        "decision":dec,"score":sc,"trust":round(trust,4),
+        "reasons":reasons,"version":VERSION,"engine":"sebdog",
+        "local":True,"timestamp":ts
+    }
+    result["audit_hash"]=seal(event,result,ts)
+    return result,200
+
+# ==============================================================================
+# HTTP SERVER
+# ==============================================================================
+
+def send_json(h,data,status=200):
+    body=json.dumps(data,indent=2).encode()
+    h.send_response(status)
+    h.send_header("Content-Type","application/json")
+    h.send_header("Content-Length",str(len(body)))
+    h.send_header("Access-Control-Allow-Origin","*")
+    h.end_headers()
+    h.wfile.write(body)
+
+def read_body(h):
+    n=int(h.headers.get("Content-Length",0))
+    if n:
+        try: return json.loads(h.rfile.read(n))
+        except: return{}
+    return{}
+
+def get_bearer(h):
+    auth=h.headers.get("Authorization","")
+    if auth.startswith("Bearer "): return auth[7:]
+    return h.headers.get("X-API-Key","").strip()
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self,fmt,*args): pass
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin","*")
+        self.send_header("Access-Control-Allow-Methods","GET,POST,OPTIONS")
+        self.send_header("Access-Control-Allow-Headers","Content-Type,Authorization,X-API-Key")
+        self.end_headers()
+
+    def do_GET(self):
+        path=urlparse(self.path).path
+        if path=="/health":
+            send_json(self,{
+                "status":"ok","version":VERSION,"engine":"sebdog","local":True,
+                "licence":{
+                    "valid":_licence["valid"],"plan":_licence["plan"],
+                    "devices":_licence["devices"],"email":_licence["email"]
+                }
+            })
+        elif path=="/verify-chain":
+            send_json(self,verify_chain())
+        elif path=="/stats":
+            with _db_lock:
+                blocks=_conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0]
+                users=_conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+            send_json(self,{
+                "audit_blocks":blocks,"users_tracked":users,
+                "version":VERSION,"engine":"sebdog","licence_valid":_licence["valid"]
+            })
+        elif path=="/snapshots":
+            send_json(self,{"snapshots":list_snapshots()})
+        elif path=="/backup":
+            backup_db()
+            send_json(self,{"ok":True,"message":"Backup created"})
+        else:
+            send_json(self,{"error":"not_found"},404)
+
+    def do_POST(self):
+        path=urlparse(self.path).path.rstrip("/")
+        data=read_body(self)
+        if path in("/govern","/api/govern"):
+            bearer=get_bearer(self)
+            if bearer and bearer!=_licence["key"]:
+                send_json(self,{"error":"invalid_api_key"},401); return
+            ok,ec=check_rate(bearer or"default")
+            if not ok:
+                send_json(self,{"error":ec},429); return
+            try:
+                result,status=govern(data)
+                send_json(self,result,status)
+            except ValueError as e:
+                send_json(self,{"error":str(e)},400)
+            except Exception as e:
+                send_json(self,{"error":"internal","detail":str(e)},500)
+        else:
+            send_json(self,{"error":"not_found"},404)
+
+class ThreadedServer(ThreadingMixIn,HTTPServer):
+    allow_reuse_address=True
+    daemon_threads=True
+
+# ==============================================================================
+# ENTRY POINT
+# ==============================================================================
+
+def main():
+    parser=argparse.ArgumentParser(description="Sebdog Engine — AILeash local compliance engine")
+    parser.add_argument("--key",required=True,help="Your AILeash API key from sebbi.pro")
+    parser.add_argument("--port",type=int,default=9090,help="Port (default: 9090)")
+    parser.add_argument("--db",default="sebdog_audit.db",help="SQLite audit database path")
+    parser.add_argument("--backup-on-start",action="store_true",help="Create a backup on startup")
+    args=parser.parse_args()
+
+    global DB_FILE
+    DB_FILE=args.db
+
+    print(f"[SEBDOG] Sebdog Engine v{VERSION} starting...",flush=True)
+
+    # Restore from backup if DB missing
+    if not os.path.exists(DB_FILE):
+        print(f"[SEBDOG] Database not found. Checking for backups...",flush=True)
+        if restore_latest_backup():
+            print(f"[SEBDOG] Data restored from backup.",flush=True)
+        else:
+            print(f"[SEBDOG] No backup found. Starting fresh chain.",flush=True)
+
+    init_db()
+
+    if args.backup_on_start:
+        backup_db()
+
+    print(f"[SEBDOG] Validating licence with sebbi.pro...",flush=True)
+    if not validate_licence(args.key):
+        print(f"[SEBDOG] Licence validation failed. Get your key at {HOME}",flush=True)
+        sys.exit(1)
+
+    threading.Thread(target=revalidate_loop,args=(args.key,),daemon=True).start()
+    threading.Thread(target=backup_loop,daemon=True).start()
+
+    server=ThreadedServer(("0.0.0.0",args.port),Handler)
+    print(f"[SEBDOG] Engine running on port {args.port}",flush=True)
+    print(f"[SEBDOG] POST http://localhost:{args.port}/govern",flush=True)
+    print(f"[SEBDOG] GET  http://localhost:{args.port}/health",flush=True)
+    print(f"[SEBDOG] GET  http://localhost:{args.port}/verify-chain",flush=True)
+    print(f"[SEBDOG] GET  http://localhost:{args.port}/snapshots",flush=True)
+    print(f"[SEBDOG] Backups: ./sebdog_backups/ (daily, last 7 kept)",flush=True)
+    print(f"[SEBDOG] Sovereignty: all data stays on your hardware.",flush=True)
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("[SEBDOG] Shutting down.",flush=True)
+
+if __name__=="__main__":
+    main()
+
+```
 
 
 ## `sebdog_licence.py`
@@ -1887,586 +2340,5 @@ print("\n" + "="*62)
 print("passed %d, failed %d" % (len(P), len(F)))
 for f in F: print("  FAILED: " + f)
 sys.exit(1 if F else 0)
-
-```
-
-
-## `verify_authority.py`
-
-573 lines, 21333 bytes
-
-```python
-#!/usr/bin/env python3
-"""
-verify_authority.py  -  check an AILeash authority proof without AILeash
-
-    python3 verify_authority.py proof.json
-    curl -s "https://sebbi.pro/x/continuity/proof?evaluation=e_..." \\
-        | python3 verify_authority.py -
-
-WHAT THIS IS FOR
-----------------
-A proof that can only be checked by the party who issued it is not a proof.
-This script takes a bundle and reaches its own conclusion using nothing but
-the Python standard library. It does not call the issuing system, it does not
-import anything you have to install, and it does not take a single field of
-the bundle at face value.
-
-It does four separate things, and each one can fail on its own:
-
-  1. SIGNATURE   Ed25519 over the canonical bundle. Confirms the bundle came
-                 from the holder of the named key and has not been edited by
-                 anybody since.
-
-  2. INTEGRITY   Recomputes every grant digest, the lineage digest and the
-                 parameter digest from the fields in front of it. Confirms
-                 the bundle is internally consistent with its own contents.
-
-  3. DERIVATION  Re-runs the authority rules from scratch: root issued by a
-                 human, an unbroken parent chain, scope covered at every hop,
-                 constraints narrowing on every axis, purpose narrowing,
-                 validity windows contained, nothing revoked, and the action
-                 itself inside the effective limits of the whole lineage.
-
-  4. AGREEMENT   Compares the verdict this script reached with the verdict the
-                 bundle claims. Disagreement is reported as a failure of the
-                 issuer, not of this script.
-
-WHAT A PASS MEANS
------------------
-That the authority for this action was derivable, at that time, from that
-human grant - or, for a refusal, that it genuinely was not, and that the named
-grant and invariant really are where it broke.
-
-WHAT A PASS DOES NOT MEAN
--------------------------
-That the root grant should ever have been issued. That the parameters describe
-something that really happened. That the risk engine was right. Derivation is
-not merit and it is not truth.
-
-The risk half of a composed verdict cannot be re-derived here, because that
-needs the issuer's scoring engine. Where the bundle's authority verdict is
-BLOCK, the composed verdict stands regardless, because the composition takes
-the worse of the two.
-"""
-
-import binascii
-import hashlib
-import json
-import sys
-
-GRANT_PREFIX = b"AILEASH-GRANT-v1:"
-EVAL_PREFIX = b"AILEASH-AUTHEVAL-v1:"
-BUNDLE_PREFIX = b"AILEASH-AUTHORITY-PROOF-v1:"
-
-MAX_DEPTH = 32
-RANK = {"ALLOW": 0, "CHALLENGE": 1, "BLOCK": 2}
-
-
-# ======================================================================
-# Ed25519, RFC 8032, standard library only
-# ======================================================================
-
-_Q = 2 ** 255 - 19
-_L = 2 ** 252 + 27742317777372353535851937790883648493
-_D = -121665 * pow(121666, _Q - 2, _Q) % _Q
-_I = pow(2, (_Q - 1) // 4, _Q)
-
-
-def _h(m):
-    return hashlib.sha512(m).digest()
-
-
-def _inv(x):
-    return pow(x, _Q - 2, _Q)
-
-
-def _xrecover(y):
-    xx = (y * y - 1) * _inv(_D * y * y + 1)
-    x = pow(xx, (_Q + 3) // 8, _Q)
-    if (x * x - xx) % _Q != 0:
-        x = (x * _I) % _Q
-    if x % 2 != 0:
-        x = _Q - x
-    return x
-
-
-_BY = 4 * _inv(5) % _Q
-_BX = _xrecover(_BY)
-_B = (_BX % _Q, _BY % _Q, 1, (_BX * _BY) % _Q)
-_IDENT = (0, 1, 1, 0)
-
-
-def _add(p, q):
-    x1, y1, z1, t1 = p
-    x2, y2, z2, t2 = q
-    a = (y1 - x1) * (y2 - x2) % _Q
-    b = (y1 + x1) * (y2 + x2) % _Q
-    c = t1 * 2 * _D * t2 % _Q
-    dd = z1 * 2 * z2 % _Q
-    e, f, g, hh = b - a, dd - c, dd + c, b + a
-    return (e * f % _Q, g * hh % _Q, f * g % _Q, e * hh % _Q)
-
-
-def _scalarmult(p, e):
-    if e == 0:
-        return _IDENT
-    q = _scalarmult(p, e // 2)
-    q = _add(q, q)
-    if e & 1:
-        q = _add(q, p)
-    return q
-
-
-def _encodepoint(p):
-    x, y, z, _t = p
-    zi = _inv(z)
-    x, y = x * zi % _Q, y * zi % _Q
-    bits = [(y >> i) & 1 for i in range(255)] + [x & 1]
-    return bytes(sum(bits[i * 8 + j] << j for j in range(8)) for i in range(32))
-
-
-def _bit(h, i):
-    return (h[i // 8] >> (i % 8)) & 1
-
-
-def _hint(m):
-    h = _h(m)
-    return sum(2 ** i * _bit(h, i) for i in range(512))
-
-
-def _isoncurve(p):
-    x, y, z, t = p
-    return (z % _Q != 0 and x * y % _Q == z * t % _Q
-            and (y * y - x * x - z * z - _D * t * t) % _Q == 0)
-
-
-def _decodepoint(s):
-    y = int.from_bytes(s, "little") & ((1 << 255) - 1)
-    x = _xrecover(y)
-    if x & 1 != _bit(s, 255):
-        x = _Q - x
-    p = (x, y, 1, (x * y) % _Q)
-    if not _isoncurve(p):
-        raise ValueError("point off curve")
-    return p
-
-
-def ed25519_verify(sig, msg, pk):
-    if len(sig) != 64 or len(pk) != 32:
-        return False
-    try:
-        rr = _decodepoint(sig[:32])
-        a = _decodepoint(pk)
-    except Exception:
-        return False
-    s = int.from_bytes(sig[32:64], "little")
-    if s >= _L:
-        return False
-    hh = _hint(sig[:32] + pk + msg)
-    return _encodepoint(_scalarmult(_B, s)) == _encodepoint(_add(rr, _scalarmult(a, hh)))
-
-
-# ======================================================================
-# the rules, reimplemented from the published spec
-# ======================================================================
-
-def canon(obj):
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
-
-
-def sha(prefix, text):
-    return hashlib.sha256(prefix + text.encode("utf-8")).hexdigest()
-
-
-def grant_digest(g):
-    material = {
-        "id": g["id"], "parent": g["parent"], "issuer": g["issuer"],
-        "issuer_kind": g["issuer_kind"], "subject": g["subject"],
-        "subject_kind": g["subject_kind"], "scope": sorted(g["scope"]),
-        "constraints": g["constraints"], "purpose": g["purpose"],
-        "purpose_tags": sorted(g["purpose_tags"]),
-        "not_before": g["not_before"], "not_after": g["not_after"],
-        "depth": g["depth"], "delegations_left": g["delegations_left"],
-        "created": g["created"], "risk_accepted_by": g.get("risk_accepted_by"),
-    }
-    return sha(GRANT_PREFIX, canon(material))
-
-
-def covers(held, wanted):
-    if held == wanted or held == "*":
-        return True
-    if held.endswith(".*"):
-        return wanted == held[:-2] or wanted.startswith(held[:-1])
-    return False
-
-
-def wildcard_breadth(scope, capability):
-    best = None
-    for held in scope:
-        if not covers(held, capability):
-            continue
-        if held == capability:
-            return 0
-        width = (capability.count(".") + 2 if held == "*"
-                 else capability.count(".") - held[:-2].count("."))
-        best = width if best is None else min(best, width)
-    return best
-
-
-def direction(key):
-    for p in ("max_", "min_", "allowed_", "denied_", "may_"):
-        if key.startswith(p):
-            return p
-    return None
-
-
-def num(v):
-    if isinstance(v, bool) or v is None:
-        raise ValueError("not a number")
-    return float(v)
-
-
-def as_set(v):
-    if isinstance(v, (list, tuple, set)):
-        return set(v)
-    return {v}
-
-
-def narrower(parent_c, child_c):
-    for key in sorted(child_c):
-        d = direction(key)
-        cval = child_c[key]
-        if d is None:
-            return False, "constraint '%s' has no narrowing rule" % key
-        if key not in parent_c:
-            return False, "constraint '%s' is not expressed by the parent" % key
-        pval = parent_c[key]
-        try:
-            if d == "max_" and num(cval) > num(pval):
-                return False, "%s raised from %s to %s" % (key, pval, cval)
-            if d == "min_" and num(cval) < num(pval):
-                return False, "%s lowered from %s to %s" % (key, pval, cval)
-            if d == "allowed_" and not as_set(cval) <= as_set(pval):
-                return False, "%s adds values the parent does not hold" % key
-            if d == "denied_" and not as_set(pval) <= as_set(cval):
-                return False, "%s drops values the parent denies" % key
-            if d == "may_" and bool(cval) and not bool(pval):
-                return False, "%s enabled where the parent withholds it" % key
-        except (TypeError, ValueError):
-            return False, "constraint '%s' is not comparable" % key
-    return True, None
-
-
-def effective(chain):
-    eff = {}
-    for g in chain:
-        for k, v in g["constraints"].items():
-            d = direction(k)
-            if k not in eff:
-                eff[k] = v
-                continue
-            cur = eff[k]
-            try:
-                if d == "max_":
-                    eff[k] = min(num(cur), num(v))
-                elif d == "min_":
-                    eff[k] = max(num(cur), num(v))
-                elif d == "allowed_":
-                    eff[k] = sorted(as_set(cur) & as_set(v))
-                elif d == "denied_":
-                    eff[k] = sorted(as_set(cur) | as_set(v))
-                elif d == "may_":
-                    eff[k] = bool(cur) and bool(v)
-            except (TypeError, ValueError):
-                eff[k] = v
-    return eff
-
-
-def params_against(params, eff):
-    hard, unconstrained = [], []
-    for key in sorted(params):
-        val = params[key]
-        checked = False
-        for cname, cval in eff.items():
-            d = direction(cname)
-            if not d or cname[len(d):] != key:
-                continue
-            checked = True
-            try:
-                if d == "max_" and num(val) > num(cval):
-                    hard.append("%s=%s exceeds %s=%s" % (key, val, cname, cval))
-                elif d == "min_" and num(val) < num(cval):
-                    hard.append("%s=%s is below %s=%s" % (key, val, cname, cval))
-                elif d == "allowed_" and val not in as_set(cval):
-                    hard.append("%s=%s is outside %s" % (key, val, cname))
-                elif d == "denied_" and val in as_set(cval):
-                    hard.append("%s=%s is denied by %s" % (key, val, cname))
-                elif d == "may_" and bool(val) and not bool(cval):
-                    hard.append("%s requested where %s withholds it" % (key, cname))
-            except (TypeError, ValueError):
-                hard.append("%s cannot be compared with %s" % (key, cname))
-        if not checked:
-            unconstrained.append(key)
-    return hard, unconstrained
-
-
-# ======================================================================
-# the four checks
-# ======================================================================
-
-class Report(object):
-    def __init__(self):
-        self.rows = []
-        self.failed = False
-
-    def add(self, ok, name, detail=""):
-        self.rows.append((ok, name, detail))
-        if not ok:
-            self.failed = True
-
-    def note(self, name, detail=""):
-        self.rows.append((None, name, detail))
-
-    def render(self):
-        out = []
-        for ok, name, detail in self.rows:
-            mark = "  ok  " if ok else ("FAIL  " if ok is False else "  --  ")
-            out.append(mark + name + (("\n        " + detail) if detail else ""))
-        return "\n".join(out)
-
-
-def check_signature(bundle, rep):
-    sig_hex = bundle.get("signature")
-    pk_hex = (bundle.get("issued_by") or {}).get("public_key")
-    if not sig_hex or not pk_hex:
-        rep.add(False, "Signature present", "the bundle carries no signature or no key")
-        return
-    body = dict(bundle)
-    body.pop("signature", None)
-    body.pop("verify_with", None)
-    try:
-        sig = binascii.unhexlify(sig_hex)
-        pk = binascii.unhexlify(pk_hex)
-    except Exception:
-        rep.add(False, "Signature is readable hex")
-        return
-    ok = ed25519_verify(sig, BUNDLE_PREFIX + canon(body).encode("utf-8"), pk)
-    rep.add(ok, "Ed25519 signature over the canonical bundle",
-            "key " + pk_hex[:16] + "…  Verify this key independently at the issuer's "
-            "published address before trusting who signed." if ok else
-            "the bundle was altered after signing, or it was not signed by this key")
-
-
-def check_integrity(bundle, rep):
-    lineage = bundle.get("lineage") or []
-    bad = []
-    for g in lineage:
-        try:
-            if grant_digest(g) != g.get("digest"):
-                bad.append(g.get("id"))
-        except Exception:
-            bad.append(g.get("id"))
-    rep.add(not bad, "Every grant digest recomputes from its own fields",
-            "" if not bad else "mismatched: " + ", ".join(str(b) for b in bad))
-
-    claimed = (bundle.get("decision") or {}).get("lineage_digest")
-    mine = sha(EVAL_PREFIX, canon([g.get("digest") for g in lineage]))
-    rep.add(mine == claimed, "Lineage digest matches the ordered path",
-            "" if mine == claimed else "computed " + mine[:20] + "… claimed " + str(claimed)[:20] + "…")
-
-    req = bundle.get("request") or {}
-    claimed_p = (bundle.get("decision") or {}).get("params_digest")
-    mine_p = sha(EVAL_PREFIX, canon({"action": req.get("action"),
-                                     "params": req.get("params") or {}}))
-    rep.add(mine_p == claimed_p, "Parameter digest matches the request as stated",
-            "" if mine_p == claimed_p else "the parameters shown are not the "
-            "parameters that were judged")
-
-
-def rederive(bundle, rep):
-    """Run the published rules from scratch and reach an independent verdict."""
-    lineage = bundle.get("lineage") or []
-    decision = bundle.get("decision") or {}
-    req = bundle.get("request") or {}
-    at = decision.get("evaluated_at_epoch")
-
-    hard, soft = [], []
-    broken_at = broken_invariant = None
-
-    def fail(grant, invariant, detail):
-        nonlocal broken_at, broken_invariant
-        hard.append(detail)
-        if broken_at is None:
-            broken_at, broken_invariant = grant, invariant
-
-    if not lineage:
-        fail(None, "authority_continuity", "the bundle carries no authority path")
-    else:
-        root = lineage[0]
-        if root.get("parent") is not None:
-            fail(root["id"], "authority_continuity",
-                 "the path does not begin at a parentless root")
-        if root.get("issuer_kind") != "human":
-            fail(root["id"], "identity_continuity",
-                 "the root grant was not issued by a human principal")
-
-        previous = None
-        for g in lineage:
-            if g.get("revoked_at") is not None:
-                fail(g["id"], "authority_continuity",
-                     "grant %s was revoked" % g["id"])
-            if at is not None:
-                if at < g["not_before"]:
-                    fail(g["id"], "temporal_validity",
-                         "grant %s was not yet valid at the time of the decision" % g["id"])
-                if at >= g["not_after"]:
-                    fail(g["id"], "temporal_validity",
-                         "grant %s had expired at the time of the decision" % g["id"])
-            if previous is not None:
-                if g.get("parent") != previous.get("id"):
-                    fail(g["id"], "authority_continuity",
-                         "grant %s does not point at the grant above it" % g["id"])
-                missing = [c for c in g["scope"]
-                           if not any(covers(p, c) for p in previous["scope"])]
-                if missing:
-                    fail(g["id"], "boundary_integrity",
-                         "%s holds scope its parent does not: %s"
-                         % (g["id"], ", ".join(sorted(missing))))
-                ok, why = narrower(previous["constraints"], g["constraints"])
-                if not ok:
-                    fail(g["id"], "boundary_integrity", "%s: %s" % (g["id"], why))
-                if not set(g["purpose_tags"]) <= set(previous["purpose_tags"]):
-                    fail(g["id"], "intent_continuity",
-                         "%s carries purpose tags its parent does not" % g["id"])
-                if (g["not_before"] < previous["not_before"]
-                        or g["not_after"] > previous["not_after"]):
-                    fail(g["id"], "temporal_validity",
-                         "%s is valid outside its parent's window" % g["id"])
-                if g["depth"] != previous["depth"] + 1:
-                    fail(g["id"], "authority_continuity",
-                         "%s records a depth inconsistent with its parent" % g["id"])
-            previous = g
-
-        if len(lineage) - 1 > MAX_DEPTH:
-            fail(lineage[-1]["id"], "boundary_integrity", "delegation depth exceeds the ceiling")
-
-        if not any(g.get("risk_accepted_by") for g in lineage):
-            fail(lineage[0]["id"], "identity_continuity",
-                 "no grant in this path names who accepted the risk")
-
-        leaf = lineage[-1]
-        action = req.get("action")
-        params = req.get("params") or {}
-
-        if action and not any(covers(c, action) for c in leaf["scope"]):
-            fail(leaf["id"], "boundary_integrity",
-                 "action '%s' is outside the scope of the grant exercised" % action)
-        elif action:
-            breadth = wildcard_breadth(leaf["scope"], action)
-            if breadth and breadth >= 2:
-                soft.append("action '%s' is only covered by a broad wildcard" % action)
-
-        eff = effective(lineage)
-        failures, unconstrained = params_against(params, eff)
-        for f in failures:
-            fail(leaf["id"], "boundary_integrity", f)
-        for u in unconstrained:
-            soft.append("parameter '%s' is not constrained anywhere in the path" % u)
-
-        tag = req.get("purpose_tag")
-        if tag:
-            if tag not in leaf["purpose_tags"]:
-                soft.append("declared purpose '%s' is not carried by the grant" % tag)
-        else:
-            soft.append("the action declared no purpose")
-
-    verdict = "BLOCK" if hard else ("CHALLENGE" if soft else "ALLOW")
-    return verdict, hard, soft, broken_at, broken_invariant
-
-
-def check_agreement(bundle, rep, mine, hard, soft, broken_at, broken_invariant):
-    decision = bundle.get("decision") or {}
-    claimed = decision.get("authority_verdict") or decision.get("verdict")
-
-    rep.add(mine == claimed,
-            "Independently re-derived authority verdict: " + mine,
-            "" if mine == claimed else
-            "the issuer claims " + str(claimed) + " and this script reaches " + mine +
-            " from the same path. One of us is wrong and the rules are published.")
-
-    if mine == "BLOCK":
-        same_grant = (broken_at == decision.get("broken_at"))
-        same_inv = (broken_invariant == decision.get("broken_invariant"))
-        rep.add(same_grant and same_inv,
-                "Refusal reproduces at the same grant and invariant",
-                ("grant %s, invariant %s" % (broken_at, broken_invariant))
-                if same_grant and same_inv else
-                "this script breaks at grant %s / %s, the issuer says %s / %s"
-                % (broken_at, broken_invariant,
-                   decision.get("broken_at"), decision.get("broken_invariant")))
-        rep.note("Why authority could not be derived")
-        for h in hard:
-            rep.note("  " + h)
-    elif soft:
-        rep.note("Why this could not be settled without a person")
-        for x in soft:
-            rep.note("  " + x)
-
-    risk = decision.get("risk_verdict")
-    if risk and mine != "BLOCK":
-        rep.note("Risk verdict reported as " + str(risk) + ", not re-derivable here",
-                 "the composed verdict is the worse of the two; the scoring engine "
-                 "is not part of this bundle and is not checked by this script")
-
-
-def main():
-    if len(sys.argv) < 2:
-        print(__doc__)
-        return 2
-    src = sys.argv[1]
-    raw = sys.stdin.read() if src == "-" else open(src, "r").read()
-    try:
-        bundle = json.loads(raw)
-    except Exception as exc:
-        print("Not readable JSON: " + str(exc))
-        return 2
-
-    rep = Report()
-    print("=" * 66)
-    print("AUTHORITY PROOF  ·  independent verification")
-    print("=" * 66)
-    d = bundle.get("decision") or {}
-    print("evaluation   " + str(d.get("evaluation")))
-    print("action       " + str((bundle.get("request") or {}).get("action")))
-    print("at           " + str(d.get("evaluated_at")))
-    print("hops         " + str(max(0, len(bundle.get("lineage") or []) - 1)))
-    if bundle.get("lineage"):
-        print("authorised   " + str(bundle["lineage"][0].get("issuer")))
-        print("executed     " + str(bundle["lineage"][-1].get("subject")))
-        acc = [g.get("risk_accepted_by") for g in bundle["lineage"] if g.get("risk_accepted_by")]
-        print("risk owner   " + str(acc[-1] if acc else None))
-    print("-" * 66)
-
-    check_signature(bundle, rep)
-    check_integrity(bundle, rep)
-    mine, hard, soft, ba, bi = rederive(bundle, rep)
-    check_agreement(bundle, rep, mine, hard, soft, ba, bi)
-
-    print(rep.render())
-    print("-" * 66)
-    if rep.failed:
-        print("RESULT: NOT VERIFIED. Something above did not hold.")
-        return 1
-    print("RESULT: VERIFIED - " + mine)
-    if mine == "BLOCK":
-        print("This is a proof that the action was NOT authorised, and where it failed.")
-    print("Checked with no network access, no dependencies, and nothing taken on")
-    print("the issuer's word except the meaning of their public key.")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
 
 ```

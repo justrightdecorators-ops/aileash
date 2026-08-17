@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-100 files across 20 parts.
+101 files across 20 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -77,11 +77,12 @@ Generated automatically on every push. Do not edit by hand.
 - `broadcaster.py`
 - `build_sebbi_ecosystem.py`
 - `gateway_proxy.py`
+- `peerconsole.py`
 - `sebbi_orchestrator.py`
-- `sebdog_engine.py`
 
 ## [CODEBASE-11.md](CODEBASE-11.md)
 
+- `sebdog_engine.py`
 - `sebdog_licence.py`
 - `sebdog_reporter.py`
 - `tests/attack_continuity_1.py`
@@ -91,10 +92,10 @@ Generated automatically on every push. Do not edit by hand.
 - `tests/attack_continuity_5.py`
 - `tests/attack_continuity_6.py`
 - `tests/attack_witnessed.py`
-- `verify_authority.py`
 
 ## [CODEBASE-12.md](CODEBASE-12.md)
 
+- `verify_authority.py`
 - `AILeash-API-Reference-v6.4.2.md`
 - `LICENCE`
 - `README.md`
@@ -103,20 +104,20 @@ Generated automatically on every push. Do not edit by hand.
 - `ai-txt-kit.html`
 - `aitxt-popup-live.html`
 - `brain.html`
-- `certificate.html`
 
 ## [CODEBASE-13.md](CODEBASE-13.md)
 
+- `certificate.html`
 - `compliance-assistant.html`
 - `contact.html`
 - `copyright.txt`
 - `data-protection.html`
-- `developers.html`
-- `dis.txt`
-- `docs/evidential-undertaking.md`
 
 ## [CODEBASE-14.md](CODEBASE-14.md)
 
+- `developers.html`
+- `dis.txt`
+- `docs/evidential-undertaking.md`
 - `docs/spec/ai-txt.md`
 - `green.html`
 - `guardian-parent.html`
