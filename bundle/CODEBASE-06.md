@@ -1,11 +1,12 @@
-# Codebase — part 6 of 21
+# Codebase — part 6 of 20
 
 Contains:
 - `modules/network.py`
-- `modules/ots.py`
 - `modules/oversight.py`
 - `modules/pack.py`
 - `modules/packconsole.py`
+- `modules/peer.py`
+- `modules/peerconsole.py`
 
 
 ## `modules/network.py`
@@ -499,494 +500,6 @@ def handle(method, action, data, api_key, ctx):
 
     return {"error": "unknown_action", "action": action,
             "GET": ["status"]}, 404
-
-```
-
-
-## `modules/ots.py`
-
-480 lines, 18792 bytes
-
-```python
-"""
-modules/ots.py  v1.0  -  serve the OpenTimestamps proofs, and upgrade them
-
-anchor.py stamps the chain tip hourly and writes the .ots proof to the
-anchor volume. Nothing served those files, so "anchored to Bitcoin" was a
-claim a third party had to take on trust.
-
-PENDING IS NOT CONFIRMED. A proof written at stamping time holds a PENDING
-attestation - a calendar's promise to commit the digest to Bitcoin. It is
-not evidence of anything on chain until it is UPGRADED, after the
-calendar's transaction lands. anchor.py never upgraded, so every proof
-written before this module is pending. Said plainly because an auditor's
-own verifier says it first.
-
-Routes: spec, status, list, proof public. upgrade keyed.
-Proofs live at ANCHOR_DIR (default /data/anchors) - only durable on Railway
-if a volume is mounted there. /x/ots/status reports what is really present.
-"""
-
-import base64
-import hashlib
-import json
-import os
-import time
-
-VERSION = "1.0"
-
-PUBLIC = {("GET", "spec"), ("GET", "status"), ("GET", "list"),
-          ("GET", "proof")}
-
-ANCHOR_DIR = os.environ.get("ANCHOR_DIR", "/data/anchors")
-MAX_PROOF_BYTES = 262144
-
-CALENDARS = [
-    "https://a.pool.opentimestamps.org",
-    "https://b.pool.opentimestamps.org",
-    "https://alice.btc.calendar.opentimestamps.org",
-]
-
-
-def _read_index():
-    path = os.path.join(ANCHOR_DIR, "anchors.jsonl")
-    rows = []
-    if not os.path.exists(path):
-        return rows
-    try:
-        with open(path, "r") as handle:
-            for line in handle:
-                line = line.strip()
-                if line:
-                    try:
-                        rows.append(json.loads(line))
-                    except ValueError:
-                        continue
-    except Exception:
-        pass
-    return rows
-
-
-def _iso(ts):
-    try:
-        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(ts)))
-    except Exception:
-        return None
-
-
-def _stamp_id(path):
-    if not path:
-        return None
-    name = os.path.basename(path)
-    if name.startswith("tip_") and name.endswith(".ots"):
-        return name[4:-4]
-    return None
-
-
-def _describe(raw):
-    """What is actually inside this proof. Never guesses."""
-    out = {"pending_calendars": [], "bitcoin_block_heights": [],
-           "state": "unknown", "read_error": None}
-    try:
-        from opentimestamps.core.serialize import BytesDeserializationContext
-        from opentimestamps.core.timestamp import DetachedTimestampFile
-        from opentimestamps.core.notary import (PendingAttestation,
-                                                BitcoinBlockHeaderAttestation)
-    except Exception as exc:
-        out["read_error"] = "opentimestamps library not available: %s" % exc
-        return out
-
-    try:
-        detached = DetachedTimestampFile.deserialize(
-            BytesDeserializationContext(raw))
-    except Exception as exc:
-        out["read_error"] = "could not parse proof: %s" % exc
-        out["state"] = "unreadable"
-        return out
-
-    def walk(timestamp):
-        for att in timestamp.attestations:
-            if isinstance(att, PendingAttestation):
-                uri = att.uri
-                if isinstance(uri, bytes):
-                    uri = uri.decode("utf-8", "replace")
-                if uri not in out["pending_calendars"]:
-                    out["pending_calendars"].append(uri)
-            elif isinstance(att, BitcoinBlockHeaderAttestation):
-                h = getattr(att, "height", None)
-                if h is not None and h not in out["bitcoin_block_heights"]:
-                    out["bitcoin_block_heights"].append(h)
-        for _, sub in timestamp.ops.items():
-            walk(sub)
-
-    try:
-        walk(detached.timestamp)
-    except Exception as exc:
-        out["read_error"] = "could not walk proof: %s" % exc
-        return out
-
-    if out["bitcoin_block_heights"]:
-        out["state"] = "confirmed"
-        out["means"] = ("Committed in Bitcoin block %s. Verifiable against "
-                        "the blockchain by anyone, with nothing from us."
-                        % ", ".join(str(h) for h in out["bitcoin_block_heights"]))
-    elif out["pending_calendars"]:
-        out["state"] = "pending"
-        out["means"] = ("A calendar has accepted this digest and promised to "
-                        "commit it to Bitcoin. NOT yet evidence of anything "
-                        "on chain. Upgrade it once the transaction confirms.")
-    else:
-        out["state"] = "empty"
-        out["means"] = "No attestations found in this proof."
-    return out
-
-
-def _proof_bytes(stamp_id):
-    path = os.path.join(ANCHOR_DIR, "tip_%s.ots" % stamp_id)
-    if not os.path.exists(path):
-        return None, path, "no proof file at %s" % path
-    try:
-        if os.path.getsize(path) > MAX_PROOF_BYTES:
-            return None, path, "proof unexpectedly large"
-        with open(path, "rb") as handle:
-            return handle.read(), path, None
-    except Exception as exc:
-        return None, path, "could not read proof: %s" % exc
-
-
-def _tip_for(stamp_id):
-    try:
-        with open(os.path.join(ANCHOR_DIR, "tip_%s.txt" % stamp_id)) as h:
-            return h.read().strip()
-    except Exception:
-        return None
-
-
-def _status():
-    rows = _read_index()
-    exists = os.path.isdir(ANCHOR_DIR)
-    files = []
-    if exists:
-        try:
-            files = [f for f in os.listdir(ANCHOR_DIR) if f.endswith(".ots")]
-        except Exception:
-            files = []
-
-    stamped = [r for r in rows if r.get("ots")]
-    out = {
-        "ok": True, "module": "ots", "version": VERSION,
-        "anchor_dir": ANCHOR_DIR,
-        "storage_present": exists,
-        "proof_files_on_disk": len(files),
-        "anchor_attempts_recorded": len(rows),
-        "stamped": len(stamped),
-        "failed": len(rows) - len(stamped),
-        "first_attempt": _iso(rows[0].get("ts")) if rows else None,
-        "last_attempt": _iso(rows[-1].get("ts")) if rows else None,
-    }
-
-    if not exists:
-        out["warning"] = (
-            "The anchor directory does not exist on this container. Either "
-            "no anchor has run, or no persistent volume is mounted at %s - "
-            "in which case every proof is lost on redeploy and the history "
-            "restarts silently. Check before calling this durable."
-            % ANCHOR_DIR)
-    elif len(files) < len(stamped):
-        out["warning"] = (
-            "%d successful stamps recorded but only %d proof files on disk. "
-            "Files have been lost, most likely to a redeploy without a "
-            "persistent volume." % (len(stamped), len(files)))
-
-    if stamped:
-        sid = _stamp_id(stamped[-1].get("ots_file"))
-        if sid:
-            raw, _p, err = _proof_bytes(sid)
-            if raw:
-                d = _describe(raw)
-                out["latest_proof"] = {
-                    "stamp_id": sid, "tip": stamped[-1].get("tip"),
-                    "stamped_at": _iso(stamped[-1].get("ts")),
-                    "state": d["state"],
-                    "bitcoin_block_heights": d["bitcoin_block_heights"],
-                    "pending_calendars": d["pending_calendars"],
-                    "means": d.get("means"),
-                    "read_error": d.get("read_error"),
-                }
-            else:
-                out["latest_proof"] = {"stamp_id": sid, "error": err}
-
-    out["honest_note"] = (
-        "A proof written at stamping time is PENDING - a promise to commit "
-        "the digest to Bitcoin, not evidence that it has been. It becomes "
-        "confirmed only after being upgraded. anchor.py never upgraded; "
-        "POST /x/ots/upgrade does. Until then, pending is what these are.")
-    return out, 200
-
-
-def _list(data):
-    rows = _read_index()
-    try:
-        limit = min(int(data.get("limit", 50)), 500)
-    except (TypeError, ValueError):
-        limit = 50
-
-    out = []
-    for row in list(reversed(rows))[:limit]:
-        sid = _stamp_id(row.get("ots_file"))
-        entry = {"stamp_id": sid, "tip": row.get("tip"),
-                 "stamped_at": _iso(row.get("ts")),
-                 "ots_written": bool(row.get("ots")),
-                 "note": row.get("note")}
-        if sid:
-            entry["proof_on_disk"] = os.path.exists(
-                os.path.join(ANCHOR_DIR, "tip_%s.ots" % sid))
-            entry["proof"] = "/x/ots/proof?ts=%s" % sid
-        out.append(entry)
-
-    return {"ok": True, "count": len(out), "anchors": out,
-            "note": "Newest first. ots_written false is a recorded failure, "
-                    "kept rather than hidden - a gap in anchoring is exactly "
-                    "what an auditor needs to see."}, 200
-
-
-def _proof(data):
-    stamp_id = str(data.get("ts") or data.get("stamp_id") or "").strip()
-    tip = str(data.get("tip") or "").strip().lower()
-
-    if not stamp_id and tip:
-        for row in reversed(_read_index()):
-            if str(row.get("tip", "")).lower() == tip and row.get("ots_file"):
-                stamp_id = _stamp_id(row.get("ots_file"))
-                break
-        if not stamp_id:
-            return {"ok": False, "error": "no_proof_for_tip", "tip": tip,
-                    "detail": "No successful stamp recorded for that tip. "
-                              "/x/ots/list shows every attempt."}, 404
-
-    if not stamp_id:
-        return {"ok": False, "error": "ts_or_tip_required",
-                "detail": "?ts=<stamp_id> or ?tip=<64 hex>. Ids at "
-                          "/x/ots/list."}, 400
-    if not stamp_id.isdigit():
-        return {"ok": False, "error": "bad_stamp_id"}, 400
-
-    raw, _path, err = _proof_bytes(stamp_id)
-    if raw is None:
-        return {"ok": False, "error": "proof_unavailable",
-                "detail": err, "stamp_id": stamp_id}, 404
-
-    d = _describe(raw)
-    recorded_tip = _tip_for(stamp_id)
-    return {
-        "ok": True, "stamp_id": stamp_id, "stamped_at": _iso(stamp_id),
-        "tip": recorded_tip, "digest_sha256": recorded_tip,
-        "proof_bytes": len(raw),
-        "proof_sha256": hashlib.sha256(raw).hexdigest(),
-        "ots_base64": base64.b64encode(raw).decode("ascii"),
-        "state": d["state"],
-        "bitcoin_block_heights": d["bitcoin_block_heights"],
-        "pending_calendars": d["pending_calendars"],
-        "means": d.get("means"), "read_error": d.get("read_error"),
-        "how_to_verify": {
-            "1": "base64 -d the ots_base64 field into tip.ots",
-            "2": "printf '%s' <tip> | xxd -r -p > tip.bin",
-            "3": "ots verify -f tip.bin tip.ots",
-            "4": "if pending: ots upgrade tip.ots",
-            "needs": "pip install opentimestamps-client. Nothing of ours.",
-        },
-        "note": "These are the bytes as written at stamping time. Nothing "
-                "regenerated or normalised.",
-    }, 200
-
-
-def _upgrade(data):
-    """Ask the calendars to complete pending proofs.
-
-    Upgrading only ADDS the path from the digest to a Bitcoin block. It
-    cannot change what was committed or when, which is why the standard
-    client overwrites the file too.
-    """
-    try:
-        from opentimestamps.calendar import RemoteCalendar
-        from opentimestamps.core.serialize import (BytesDeserializationContext,
-                                                   BytesSerializationContext)
-        from opentimestamps.core.timestamp import DetachedTimestampFile
-        from opentimestamps.core.notary import PendingAttestation
-    except Exception as exc:
-        return {"ok": False, "error": "library_unavailable", "detail": str(exc),
-                "fix": "add opentimestamps-client to requirements.txt"}, 501
-
-    try:
-        limit = min(int(data.get("limit", 25)), 200)
-    except (TypeError, ValueError):
-        limit = 25
-    only = str(data.get("ts") or "").strip()
-
-    rows = [r for r in _read_index() if r.get("ots")]
-    if only:
-        rows = [r for r in rows if _stamp_id(r.get("ots_file")) == only]
-
-    results = []
-    upgraded = confirmed = still_pending = errors = 0
-
-    for row in list(reversed(rows))[:limit]:
-        sid = _stamp_id(row.get("ots_file"))
-        if not sid:
-            continue
-        raw, path, err = _proof_bytes(sid)
-        if raw is None:
-            results.append({"stamp_id": sid, "ok": False, "detail": err})
-            errors += 1
-            continue
-
-        before = _describe(raw)
-        if before["state"] == "confirmed":
-            confirmed += 1
-            results.append({"stamp_id": sid, "ok": True, "state": "confirmed",
-                            "bitcoin_block_heights": before["bitcoin_block_heights"],
-                            "action": "already complete, left alone"})
-            continue
-
-        try:
-            detached = DetachedTimestampFile.deserialize(
-                BytesDeserializationContext(raw))
-        except Exception as exc:
-            results.append({"stamp_id": sid, "ok": False,
-                            "detail": "could not parse: %s" % exc})
-            errors += 1
-            continue
-
-        merged = [0]
-
-        def attempt(timestamp):
-            for att in list(timestamp.attestations):
-                if not isinstance(att, PendingAttestation):
-                    continue
-                uri = att.uri
-                if isinstance(uri, bytes):
-                    uri = uri.decode("utf-8", "replace")
-                if uri not in CALENDARS:
-                    continue
-                try:
-                    completed = RemoteCalendar(uri).get_timestamp(timestamp.msg)
-                    timestamp.merge(completed)
-                    merged[0] += 1
-                except Exception:
-                    pass
-            for _, sub in list(timestamp.ops.items()):
-                attempt(sub)
-
-        try:
-            attempt(detached.timestamp)
-        except Exception as exc:
-            results.append({"stamp_id": sid, "ok": False,
-                            "detail": "upgrade walk failed: %s" % exc})
-            errors += 1
-            continue
-
-        if merged[0] == 0:
-            still_pending += 1
-            results.append({"stamp_id": sid, "ok": True, "state": "pending",
-                            "action": "no calendar had it ready yet",
-                            "detail": "Normal. A Bitcoin confirmation takes "
-                                      "hours. Run again later."})
-            continue
-
-        try:
-            ctx = BytesSerializationContext()
-            detached.serialize(ctx)
-            new_bytes = ctx.getbytes()
-            with open(path, "wb") as handle:
-                handle.write(new_bytes)
-        except Exception as exc:
-            results.append({"stamp_id": sid, "ok": False,
-                            "detail": "upgraded but could not write: %s" % exc})
-            errors += 1
-            continue
-
-        after = _describe(new_bytes)
-        upgraded += 1
-        if after["state"] == "confirmed":
-            confirmed += 1
-        results.append({"stamp_id": sid, "ok": True, "state": after["state"],
-                        "bitcoin_block_heights": after["bitcoin_block_heights"],
-                        "action": "upgraded, %d calendar response(s) merged"
-                                  % merged[0],
-                        "proof_bytes": len(new_bytes)})
-
-    return {"ok": True, "examined": len(results), "upgraded": upgraded,
-            "now_confirmed": confirmed, "still_pending": still_pending,
-            "errors": errors, "results": results,
-            "note": "Upgrading only adds the path from digest to Bitcoin "
-                    "block. It cannot alter what was committed or when. "
-                    "Proofs not yet ready stay pending; nothing is lost by "
-                    "trying early."}, 200
-
-
-def _spec():
-    return {
-        "module": "ots", "version": VERSION,
-        "what": "Serves the OpenTimestamps proofs for the chain tip, and "
-                "upgrades pending ones to confirmed.",
-        "why": "anchor.py has stamped the tip hourly since July and nothing "
-               "served the proofs, so external anchoring was a claim rather "
-               "than something a third party could check.",
-        "pending_vs_confirmed": {
-            "pending": "Written when a calendar accepts the digest. A promise "
-                       "to commit it to Bitcoin. NOT evidence of anything on "
-                       "chain yet.",
-            "confirmed": "Carries the full path from digest to a Bitcoin "
-                         "block header. Verifiable by anyone against the "
-                         "blockchain, with nothing from us.",
-            "the_gap": "A proof does not become confirmed on its own. It must "
-                       "be upgraded - fetched again from the calendar after "
-                       "its transaction lands. anchor.py never did that, so "
-                       "every proof written before this module is pending.",
-        },
-        "routes": {
-            "GET spec": "public. this document.",
-            "GET status": "public. anchor state, storage health, latest proof.",
-            "GET list": "public. every attempt, newest first, failures kept.",
-            "GET proof": "public. ?ts= or ?tip= -> the .ots, base64.",
-            "POST upgrade": "keyed. asks the calendars to complete pending proofs.",
-        },
-        "verifying_without_us": [
-            "base64 -d the ots_base64 field into tip.ots",
-            "printf '%s' <tip> | xxd -r -p > tip.bin",
-            "ots verify -f tip.bin tip.ots",
-            "pip install opentimestamps-client - no code of ours involved",
-        ],
-        "what_this_does_not_prove": [
-            "That the records under the tip are true. It fixes when a hash "
-            "existed, nothing else.",
-            "Anything about blocks sealed since the last anchor. Anchoring is "
-            "hourly, so the most recent hour rests on peer witnessing.",
-            "That a pending proof will confirm. Calendars are free public "
-            "infrastructure and can fail.",
-        ],
-        "storage_warning": "Proofs live at %s. On Railway that is only "
-                           "durable with a persistent volume mounted there. "
-                           "/x/ots/status reports what is present."
-                           % ANCHOR_DIR,
-    }
-
-
-def handle(method, action, data, api_key, ctx):
-    data = data or {}
-    if action == "spec":
-        return _spec(), 200
-    if action in ("status", ""):
-        return _status()
-    if action == "list":
-        return _list(data)
-    if action == "proof":
-        return _proof(data)
-    if action == "upgrade":
-        if not api_key:
-            return {"ok": False, "error": "api_key_required"}, 401
-        return _upgrade(data)
-    return {"ok": False, "error": "unknown_action", "action": action}, 404
 
 ```
 
@@ -2187,5 +1700,1061 @@ def handle(method, action, data, api_key, ctx):
 
     return {"error": "unknown_action", "action": action,
             "GET": ["status"]}, 404
+
+```
+
+
+## `modules/peer.py`
+
+664 lines, 25236 bytes
+
+```python
+"""
+modules/peer.py  v1.0  --  signed peer submission
+
+WHY THIS EXISTS
+    /x/witness/observe is unauthenticated on purpose. Anyone can submit a
+    tip without an account, and that openness is what answers the
+    collusion objection -- nobody has to trust us to audit the network.
+
+    The cost of that openness is that anyone can submit a tip under any
+    name. Name binding catches most of it; it does not prevent it.
+
+    A named peer exchanging period roots wants a stronger guarantee: that
+    only they can submit as their chain. This module gives them that
+    WITHOUT changing the open endpoint. Both run side by side. A peer
+    picks whichever suits their risk posture.
+
+WHAT IT COVERS
+    canonicalization, HMAC-SHA256 signing, nonce, replay window, clock
+    skew, idempotency, retry semantics, suspension, key rotation with
+    overlap.
+
+AUTH LIVES IN THE BODY, NOT IN HEADERS
+    The module router hands modules a parsed body, not the raw headers,
+    so every authentication field travels in the JSON body. This also
+    makes the scheme trivial to implement from any language and easy to
+    replay in a test.
+
+THE SCHEME, IN FULL
+    Envelope:
+        {
+          "peer_id":         "prae-001",
+          "ts":              1755432000,          integer unix seconds
+          "nonce":           "<>=16 chars, unique per peer>",
+          "idempotency_key": "<optional, <=128 chars>",
+          "payload":         { ... the thing being submitted ... },
+          "signature":       "<hex hmac-sha256>"
+        }
+
+    String to sign:
+        "AILEASH-PEER-v1\\n" + canonical(envelope_without_signature)
+
+    canonical() is exactly:
+        json.dumps(obj, sort_keys=True, separators=(",",":"),
+                   ensure_ascii=True)
+
+    signature = hmac_sha256(secret, string_to_sign).hexdigest()
+
+    POST /x/peer/canonical returns the exact string to sign for a given
+    envelope, so an implementer can debug canonicalization without
+    holding or revealing a secret.
+
+RULES
+    clock skew      +/- 300s. Outside that: 401 clock_skew.
+    nonce           unique per peer for 900s. Reused: 409 replay.
+    idempotency     same key + same payload digest returns the FIRST
+                    response verbatim, sealed once. Same key + different
+                    payload: 409 idempotency_conflict.
+    retry           safe. Retry the identical envelope; idempotency makes
+                    it a no-op that returns the original receipt.
+    suspension      403 peer_suspended. Submissions refused, nothing
+                    deleted, the peer's history stands.
+    rotation        two secrets live at once. A new secret is issued and
+                    the previous one stays valid for ROTATION_OVERLAP
+                    (default 24h) so a peer can roll without downtime.
+
+ROUTES
+    GET  spec       public   full implementation guide
+    POST canonical  public   the exact string to sign. no secret needed.
+    GET  peers      public   peer ids, status, rotation state. no secrets.
+    POST submit     public route, SIGNATURE authenticated
+    POST register   keyed    operator issues a peer credential
+    POST rotate     keyed    issue a new secret, overlap the old
+    POST suspend    keyed
+    POST resume     keyed
+    GET  history    keyed    submissions by peer
+
+TABLES OWNED
+    peer_registry, peer_nonce, peer_submission
+"""
+
+import hashlib
+import hmac
+import json
+import os
+import re
+import time
+
+VERSION = "1.0"
+
+PUBLIC = {
+    ("GET", "spec"),
+    ("POST", "canonical"),
+    ("GET", "peers"),
+    ("POST", "submit"),
+}
+
+SIGN_PREFIX = "AILEASH-PEER-v1\n"
+
+CLOCK_SKEW_SECONDS = 300
+NONCE_TTL_SECONDS = 900
+NONCE_MIN_LENGTH = 16
+ROTATION_OVERLAP_SECONDS = 86400
+MAX_PAYLOAD_BYTES = 65536
+MAX_IDEMPOTENCY_KEY = 128
+
+_PEER_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,62}$")
+
+_ready = False
+
+
+# ---------------------------------------------------------------- storage
+
+def _setup(ctx):
+    global _ready
+    if _ready:
+        return
+    conn = ctx["conn"]
+    with ctx["lock"]:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS peer_registry (
+                peer_id          TEXT PRIMARY KEY,
+                chain_name       TEXT,
+                url              TEXT,
+                secret_current   TEXT,
+                secret_previous  TEXT,
+                rotated_at       REAL,
+                status           TEXT DEFAULT 'active',
+                created          REAL,
+                submissions      INTEGER DEFAULT 0,
+                last_seen        REAL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS peer_nonce (
+                peer_id   TEXT,
+                nonce     TEXT,
+                seen_at   REAL,
+                PRIMARY KEY (peer_id, nonce)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS peer_submission (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                peer_id          TEXT,
+                ts               REAL,
+                idempotency_key  TEXT,
+                payload_digest   TEXT,
+                response_json    TEXT,
+                audit_hash       TEXT
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_peer_sub_idem "
+            "ON peer_submission(peer_id, idempotency_key)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_peer_nonce_time "
+            "ON peer_nonce(seen_at)")
+        conn.commit()
+    _ready = True
+
+
+# ------------------------------------------------------------ primitives
+
+def canonical(obj):
+    """
+    THE canonicalization. Any implementation in any language must produce
+    this byte-for-byte. Sorted keys, no whitespace, ASCII-escaped.
+    """
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=True)
+
+
+def string_to_sign(envelope):
+    """Envelope WITHOUT the signature field, prefixed and canonicalized."""
+    unsigned = {k: v for k, v in envelope.items() if k != "signature"}
+    return SIGN_PREFIX + canonical(unsigned)
+
+
+def sign(secret, envelope):
+    return hmac.new(secret.encode("utf-8"),
+                    string_to_sign(envelope).encode("utf-8"),
+                    hashlib.sha256).hexdigest()
+
+
+def _digest(payload):
+    return hashlib.sha256(canonical(payload).encode("utf-8")).hexdigest()
+
+
+def _new_secret():
+    return os.urandom(32).hex()
+
+
+def _now():
+    return time.time()
+
+
+def _iso(ts):
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(ts)))
+    except Exception:
+        return None
+
+
+def _sweep_nonces(ctx):
+    cutoff = _now() - NONCE_TTL_SECONDS
+    with ctx["lock"]:
+        ctx["conn"].execute("DELETE FROM peer_nonce WHERE seen_at < ?",
+                            (cutoff,))
+        ctx["conn"].commit()
+
+
+# ------------------------------------------------------------ the submit
+
+def _submit(ctx, data):
+    """
+    Signature-authenticated. No API key. Every rule on the list is
+    enforced here, in a fixed order, and each failure names itself.
+    """
+    _setup(ctx)
+
+    # ---- shape
+    peer_id = (data.get("peer_id") or "").strip()
+    signature = (data.get("signature") or "").strip()
+    nonce = (data.get("nonce") or "").strip()
+    payload = data.get("payload")
+    idem = (data.get("idempotency_key") or "").strip()[:MAX_IDEMPOTENCY_KEY]
+
+    if not peer_id or not signature or not nonce or payload is None:
+        return {"ok": False, "error": "malformed_envelope",
+                "required": ["peer_id", "ts", "nonce", "payload",
+                             "signature"]}, 400
+
+    try:
+        ts = int(data.get("ts"))
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "malformed_ts",
+                "detail": "ts must be an integer of unix seconds"}, 400
+
+    if len(nonce) < NONCE_MIN_LENGTH:
+        return {"ok": False, "error": "nonce_too_short",
+                "minimum": NONCE_MIN_LENGTH}, 400
+
+    if len(canonical(payload).encode("utf-8")) > MAX_PAYLOAD_BYTES:
+        return {"ok": False, "error": "payload_too_large",
+                "max_bytes": MAX_PAYLOAD_BYTES}, 413
+
+    # ---- peer known and active
+    row = ctx["conn"].execute(
+        "SELECT peer_id, chain_name, secret_current, secret_previous, "
+        "rotated_at, status FROM peer_registry WHERE peer_id = ?",
+        (peer_id,)).fetchone()
+    if not row:
+        return {"ok": False, "error": "unknown_peer", "peer_id": peer_id}, 401
+    if row[5] == "suspended":
+        return {"ok": False, "error": "peer_suspended",
+                "detail": "Submissions refused. Existing history stands "
+                          "and nothing has been removed."}, 403
+
+    # ---- clock skew, before any expensive work
+    skew = abs(_now() - ts)
+    if skew > CLOCK_SKEW_SECONDS:
+        return {"ok": False, "error": "clock_skew",
+                "detail": "Timestamp is %.0fs from server time; the window "
+                          "is +/-%ds." % (skew, CLOCK_SKEW_SECONDS),
+                "server_time": int(_now())}, 401
+
+    # ---- signature, against current then previous secret
+    envelope = {"peer_id": peer_id, "ts": ts, "nonce": nonce,
+                "payload": payload}
+    if idem:
+        envelope["idempotency_key"] = idem
+
+    accepted_with = None
+    if row[2] and hmac.compare_digest(sign(row[2], envelope), signature):
+        accepted_with = "current"
+    elif row[3] and (row[4] or 0) + ROTATION_OVERLAP_SECONDS > _now():
+        if hmac.compare_digest(sign(row[3], envelope), signature):
+            accepted_with = "previous"
+
+    if not accepted_with:
+        return {"ok": False, "error": "bad_signature",
+                "detail": "HMAC did not match. POST the same envelope to "
+                          "/x/peer/canonical to see the exact string this "
+                          "server signs.",
+                "string_to_sign_sha256":
+                    hashlib.sha256(
+                        string_to_sign(envelope).encode()).hexdigest(),
+                }, 401
+
+    payload_digest = _digest(payload)
+
+    # ---- idempotency, before the nonce check so a retry is a clean no-op
+    if idem:
+        prior = ctx["conn"].execute(
+            "SELECT payload_digest, response_json FROM peer_submission "
+            "WHERE peer_id = ? AND idempotency_key = ?",
+            (peer_id, idem)).fetchone()
+        if prior:
+            if prior[0] != payload_digest:
+                return {"ok": False, "error": "idempotency_conflict",
+                        "detail": "That idempotency key was used with a "
+                                  "different payload."}, 409
+            out = json.loads(prior[1])
+            out["replayed"] = True
+            out["note"] = ("Idempotent retry. This is the original receipt; "
+                           "nothing was sealed twice.")
+            return out, 200
+
+    # ---- replay
+    _sweep_nonces(ctx)
+    seen = ctx["conn"].execute(
+        "SELECT seen_at FROM peer_nonce WHERE peer_id = ? AND nonce = ?",
+        (peer_id, nonce)).fetchone()
+    if seen:
+        return {"ok": False, "error": "replay",
+                "detail": "That nonce has already been used by this peer "
+                          "within the %ds window. Use a fresh nonce, or "
+                          "send an idempotency_key if you meant to retry."
+                          % NONCE_TTL_SECONDS}, 409
+
+    # ---- accept: seal it
+    now = _now()
+    event = {"module": "peer", "action": "submit", "peer_id": peer_id,
+             "chain_name": row[1], "payload_digest": payload_digest,
+             "payload": payload}
+    result = {"accepted": True, "signed_with": accepted_with}
+    audit_hash = block_index = receipt_seq = None
+    try:
+        audit_hash, block_index, receipt_seq = ctx["seal"](
+            event, result, now, None)
+    except Exception:
+        pass
+
+    out = {
+        "ok": True,
+        "accepted": True,
+        "peer_id": peer_id,
+        "chain_name": row[1],
+        "payload_digest": payload_digest,
+        "signed_with": accepted_with,
+        "received_at": _iso(now),
+        "receipt": {"audit_hash": audit_hash,
+                    "block_index": block_index,
+                    "receipt_seq": receipt_seq},
+        "verify": {
+            "inclusion": "/x/complete/prove",
+            "ancestry": "/x/consistency/ancestor?tip=<any tip we served>",
+            "append_only": "/x/consistency/proof?first=&second=",
+        },
+    }
+
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "INSERT OR IGNORE INTO peer_nonce (peer_id, nonce, seen_at) "
+            "VALUES (?,?,?)", (peer_id, nonce, now))
+        ctx["conn"].execute(
+            "INSERT INTO peer_submission (peer_id, ts, idempotency_key, "
+            "payload_digest, response_json, audit_hash) VALUES (?,?,?,?,?,?)",
+            (peer_id, now, idem or None, payload_digest,
+             json.dumps(out), audit_hash))
+        ctx["conn"].execute(
+            "UPDATE peer_registry SET submissions = submissions + 1, "
+            "last_seen = ? WHERE peer_id = ?", (now, peer_id))
+        ctx["conn"].commit()
+
+    if accepted_with == "previous":
+        out["warning"] = ("Accepted with the previous secret. The overlap "
+                          "window ends %s." % _iso((row[4] or 0) +
+                                                   ROTATION_OVERLAP_SECONDS))
+    return out, 200
+
+
+# ------------------------------------------------------------- operator
+
+def _register(ctx, data):
+    _setup(ctx)
+    peer_id = (data.get("peer_id") or "").strip().lower()
+    if not _PEER_ID_RE.match(peer_id):
+        return {"ok": False, "error": "bad_peer_id",
+                "detail": "lowercase letters, digits, dot, dash, "
+                          "underscore; 2-63 chars"}, 400
+    if ctx["conn"].execute("SELECT 1 FROM peer_registry WHERE peer_id = ?",
+                           (peer_id,)).fetchone():
+        return {"ok": False, "error": "peer_exists",
+                "detail": "Use /x/peer/rotate to issue a new secret."}, 409
+
+    secret = _new_secret()
+    now = _now()
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "INSERT INTO peer_registry (peer_id, chain_name, url, "
+            "secret_current, secret_previous, rotated_at, status, created) "
+            "VALUES (?,?,?,?,NULL,NULL,'active',?)",
+            (peer_id, (data.get("chain_name") or peer_id).strip()[:120],
+             (data.get("url") or "").strip()[:400], secret, now))
+        ctx["conn"].commit()
+    try:
+        ctx["seal"]({"module": "peer", "action": "register",
+                     "peer_id": peer_id},
+                    {"registered": True}, now, None)
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "peer_id": peer_id,
+        "secret": secret,
+        "warning": "This secret is shown once and is not recoverable. "
+                   "Send it to the peer over a channel you trust.",
+        "endpoint": "/x/peer/submit",
+        "spec": "/x/peer/spec",
+    }, 200
+
+
+def _rotate(ctx, data):
+    _setup(ctx)
+    peer_id = (data.get("peer_id") or "").strip().lower()
+    row = ctx["conn"].execute(
+        "SELECT secret_current FROM peer_registry WHERE peer_id = ?",
+        (peer_id,)).fetchone()
+    if not row:
+        return {"ok": False, "error": "unknown_peer"}, 404
+
+    new = _new_secret()
+    now = _now()
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "UPDATE peer_registry SET secret_previous = secret_current, "
+            "secret_current = ?, rotated_at = ? WHERE peer_id = ?",
+            (new, now, peer_id))
+        ctx["conn"].commit()
+    try:
+        ctx["seal"]({"module": "peer", "action": "rotate",
+                     "peer_id": peer_id}, {"rotated": True}, now, None)
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "peer_id": peer_id,
+        "secret": new,
+        "previous_valid_until": _iso(now + ROTATION_OVERLAP_SECONDS),
+        "detail": "Both secrets are accepted until then, so the peer can "
+                  "roll over without downtime. Submissions signed with the "
+                  "old one come back marked.",
+    }, 200
+
+
+def _set_status(ctx, data, status):
+    _setup(ctx)
+    peer_id = (data.get("peer_id") or "").strip().lower()
+    if not ctx["conn"].execute("SELECT 1 FROM peer_registry WHERE peer_id = ?",
+                               (peer_id,)).fetchone():
+        return {"ok": False, "error": "unknown_peer"}, 404
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "UPDATE peer_registry SET status = ? WHERE peer_id = ?",
+            (status, peer_id))
+        ctx["conn"].commit()
+    try:
+        ctx["seal"]({"module": "peer", "action": status,
+                     "peer_id": peer_id}, {"status": status}, _now(), None)
+    except Exception:
+        pass
+    return {"ok": True, "peer_id": peer_id, "status": status}, 200
+
+
+def _peers(ctx):
+    _setup(ctx)
+    now = _now()
+    rows = ctx["conn"].execute(
+        "SELECT peer_id, chain_name, url, status, created, submissions, "
+        "last_seen, rotated_at FROM peer_registry ORDER BY created"
+    ).fetchall()
+    return {
+        "ok": True,
+        "count": len(rows),
+        "peers": [{
+            "peer_id": r[0], "chain_name": r[1], "url": r[2] or None,
+            "status": r[3], "registered": _iso(r[4]),
+            "submissions": r[5], "last_seen": _iso(r[6]) if r[6] else None,
+            "rotation_overlap_active":
+                bool(r[7] and r[7] + ROTATION_OVERLAP_SECONDS > now),
+        } for r in rows],
+        "note": "Secrets are never returned by any route.",
+    }, 200
+
+
+def _history(ctx, data):
+    _setup(ctx)
+    peer_id = (data.get("peer_id") or "").strip().lower()
+    try:
+        limit = min(int(data.get("limit", 50)), 500)
+    except (TypeError, ValueError):
+        limit = 50
+    q = ("SELECT peer_id, ts, idempotency_key, payload_digest, audit_hash "
+         "FROM peer_submission")
+    args = []
+    if peer_id:
+        q += " WHERE peer_id = ?"
+        args.append(peer_id)
+    q += " ORDER BY id DESC LIMIT ?"
+    args.append(limit)
+    rows = ctx["conn"].execute(q, args).fetchall()
+    return {
+        "ok": True, "count": len(rows),
+        "submissions": [{
+            "peer_id": r[0], "at": _iso(r[1]), "idempotency_key": r[2],
+            "payload_digest": r[3], "audit_hash": r[4],
+        } for r in rows],
+    }, 200
+
+
+def _canonical_route(data):
+    """
+    Debugging aid. Give it an envelope, get back the exact string this
+    server will sign. Reveals nothing -- the secret is not involved.
+    """
+    env = dict(data or {})
+    env.pop("signature", None)
+    if "ts" in env:
+        try:
+            env["ts"] = int(env["ts"])
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "malformed_ts"}, 400
+    s = string_to_sign(env)
+    return {
+        "ok": True,
+        "string_to_sign": s,
+        "sha256": hashlib.sha256(s.encode("utf-8")).hexdigest(),
+        "byte_length": len(s.encode("utf-8")),
+        "recipe": "\"AILEASH-PEER-v1\\n\" + json.dumps(envelope_without_"
+                  "signature, sort_keys=True, separators=(\",\",\":\"), "
+                  "ensure_ascii=True)",
+        "then": "signature = hmac_sha256(secret, string_to_sign).hexdigest()",
+    }, 200
+
+
+# ------------------------------------------------------------------ spec
+
+def _spec():
+    return {
+        "module": "peer",
+        "version": VERSION,
+        "purpose":
+            "Signed submission for named peers. Sits beside the open "
+            "/x/witness/observe endpoint rather than replacing it. The "
+            "open endpoint stays unauthenticated so anyone can audit the "
+            "network without an account; this one guarantees that only "
+            "the holder of a peer secret can submit as that chain.",
+        "envelope": {
+            "peer_id": "string, issued at registration",
+            "ts": "integer unix seconds",
+            "nonce": "string, at least %d chars, unique per peer for %ds"
+                     % (NONCE_MIN_LENGTH, NONCE_TTL_SECONDS),
+            "idempotency_key": "optional string, max %d chars"
+                               % MAX_IDEMPOTENCY_KEY,
+            "payload": "object. period roots, tips, whatever is agreed. "
+                       "max %d bytes canonicalized." % MAX_PAYLOAD_BYTES,
+            "signature": "hex hmac-sha256",
+        },
+        "canonicalization": {
+            "recipe": "json.dumps(obj, sort_keys=True, "
+                      "separators=(\",\",\":\"), ensure_ascii=True)",
+            "string_to_sign": "\"AILEASH-PEER-v1\\n\" + canonical(envelope "
+                              "with the signature field removed)",
+            "signature": "hmac_sha256(secret, string_to_sign).hexdigest()",
+            "debug": "POST the envelope to /x/peer/canonical to get the "
+                     "exact string back. No secret required.",
+        },
+        "rules": {
+            "clock_skew": "+/-%ds. Outside: 401 clock_skew, with the "
+                          "server's time in the body."
+                          % CLOCK_SKEW_SECONDS,
+            "replay": "A nonce is single-use per peer for %ds. Reused: "
+                      "409 replay." % NONCE_TTL_SECONDS,
+            "idempotency": "Same idempotency_key and same payload returns "
+                           "the original receipt verbatim with "
+                           "replayed=true; nothing is sealed twice. Same "
+                           "key with a different payload: 409 "
+                           "idempotency_conflict.",
+            "retry": "Retry the identical envelope. With an "
+                     "idempotency_key that is a safe no-op. Without one, "
+                     "a retry inside the nonce window returns 409 replay "
+                     "-- so send an idempotency_key if you intend to "
+                     "retry at all.",
+            "suspension": "403 peer_suspended. Nothing is deleted and the "
+                          "peer's sealed history stands.",
+            "rotation": "A new secret is issued and the previous one stays "
+                        "valid for %ds. Submissions accepted on the old "
+                        "secret come back with signed_with=previous and a "
+                        "warning naming the cutoff."
+                        % ROTATION_OVERLAP_SECONDS,
+        },
+        "on_acceptance":
+            "The payload is sealed into the audit chain and you get "
+            "audit_hash, block_index and receipt_seq. Verify "
+            "independently: inclusion at /x/complete/prove, ancestry at "
+            "/x/consistency/ancestor, append-only at "
+            "/x/consistency/proof. Both offline verifiers "
+            "(aileash_verify.py, verify_authority.py) are stdlib only and "
+            "touch no network.",
+        "routes": {
+            "GET spec": "public. this document.",
+            "POST canonical": "public. the exact string to sign.",
+            "GET peers": "public. peer ids and status. never secrets.",
+            "POST submit": "signature authenticated. no API key.",
+            "POST register": "keyed. operator issues a credential.",
+            "POST rotate": "keyed. new secret, old one overlaps.",
+            "POST suspend / POST resume": "keyed.",
+            "GET history": "keyed. submissions, optionally by peer.",
+        },
+        "what_this_does_not_do": [
+            "It does not make a submitted root true. It proves who "
+            "submitted it and when, and that it has not changed since.",
+            "It does not replace /x/witness/observe. Peers who prefer the "
+            "open path keep using it and lose nothing.",
+            "A shared secret authenticates a channel, not a person. If "
+            "the secret leaks, rotate it.",
+        ],
+        "worked_example": {
+            "envelope_before_signing": {
+                "peer_id": "example-001",
+                "ts": 1755432000,
+                "nonce": "0123456789abcdef",
+                "payload": {"period": "2026-Q3", "root": "ab12...", "count": 4096},
+            },
+            "note": "POST exactly that to /x/peer/canonical and you will "
+                    "get the string to sign, so you can confirm your "
+                    "implementation before you hold a secret.",
+        },
+    }
+
+
+# ---------------------------------------------------------------- router
+
+def handle(method, action, data, api_key, ctx):
+    data = data or {}
+
+    if action == "spec":
+        return _spec(), 200
+    if action == "canonical":
+        return _canonical_route(data)
+    if action == "peers":
+        return _peers(ctx)
+    if action == "submit":
+        return _submit(ctx, data)
+
+    if not api_key:
+        return {"ok": False, "error": "api_key_required"}, 401
+
+    if action == "register":
+        return _register(ctx, data)
+    if action == "rotate":
+        return _rotate(ctx, data)
+    if action == "suspend":
+        return _set_status(ctx, data, "suspended")
+    if action == "resume":
+        return _set_status(ctx, data, "active")
+    if action == "history":
+        return _history(ctx, data)
+
+    return {"ok": False, "error": "unknown_action", "action": action}, 404
+
+```
+
+
+## `modules/peerconsole.py`
+
+376 lines, 15478 bytes
+
+```python
+"""
+modules/peerconsole.py  v1.0  -  the peer credential page at /peers
+
+Register a peer, rotate their secret, suspend them, see who is on.
+Keyed POSTs a browser address bar cannot reach.
+
+Own patch attribute so it composes with console.py and packconsole.py.
+After a deploy, one /x/ request arms it: /x/peerconsole/status
+"""
+
+import sys
+from urllib.parse import urlparse
+
+VERSION = "1.0"
+PUBLIC = {("GET", "status")}
+PAGE_PATHS = ("/peers", "/peers.html", "/peer-console")
+
+_patched = [False]
+
+PAGE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Peers — AILeash</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--ink:#0a0f1e;--panel:#131b2e;--panel2:#1a2338;--edge:rgba(201,168,76,.22);
+--gold:#c9a84c;--text:#f2efe6;--mute:rgba(242,239,230,.42);--ok:#7fe3b0;--err:#ff8a80;
+--mono:'IBM Plex Mono',ui-monospace,monospace;--body:system-ui,-apple-system,sans-serif}
+body{background:var(--ink);color:var(--text);font-family:var(--body);font-size:16px;
+line-height:1.6;padding:0 0 60px}
+.wrap{max-width:640px;margin:0 auto;padding:0 18px}
+header{padding:30px 0 20px;border-bottom:1px solid var(--edge);margin-bottom:24px}
+.eyebrow{font-family:var(--mono);font-size:10px;letter-spacing:.24em;
+text-transform:uppercase;color:var(--gold);margin-bottom:8px}
+h1{font-size:34px;line-height:1;font-weight:800;letter-spacing:-.02em}
+h1 span{color:var(--gold)}
+.sub{color:var(--mute);font-size:14px;margin-top:10px}
+label{display:block;font-family:var(--mono);font-size:10px;letter-spacing:.16em;
+text-transform:uppercase;color:var(--mute);margin-bottom:6px}
+input{width:100%;background:var(--panel);border:1px solid var(--edge);color:var(--text);
+font-family:var(--mono);font-size:13px;padding:12px;border-radius:4px;outline:none}
+input:focus{border-color:var(--gold)}
+.keybar{background:var(--panel2);border:1px solid var(--edge);border-radius:6px;
+padding:16px;margin-bottom:24px}
+.keynote{font-size:12px;color:var(--mute);margin-top:8px}
+.op{border:1px solid var(--edge);border-radius:6px;background:var(--panel);
+margin-bottom:12px;overflow:hidden}
+.op-head{display:flex;align-items:baseline;gap:10px;padding:15px 16px;cursor:pointer}
+.op-head:hover{background:var(--panel2)}
+.op-n{font-family:var(--mono);font-size:10px;color:var(--gold);opacity:.6}
+.op-t{font-size:17px;font-weight:700}
+.op-r{margin-left:auto;font-family:var(--mono);font-size:10px;color:var(--mute)}
+.op-body{padding:0 16px 16px;display:none}
+.op.open .op-body{display:block}
+.op-why{font-size:13.5px;color:var(--mute);margin-bottom:14px}
+.field{margin-bottom:12px}
+button{width:100%;background:var(--gold);color:var(--ink);border:none;border-radius:4px;
+padding:14px;font-weight:700;font-size:14.5px;cursor:pointer}
+button:hover:not(:disabled){background:#dbbd63}
+button.quiet{background:transparent;color:var(--mute);border:1px solid var(--edge)}
+.two{display:flex;gap:10px}
+.two button{flex:1}
+#out{margin-top:24px}
+pre{font-family:var(--mono);font-size:11.5px;line-height:1.6;background:#080c16;
+color:var(--ok);padding:14px;border-radius:5px;overflow-x:auto;
+border:1px solid var(--edge);max-height:320px}
+.msg{font-family:var(--mono);font-size:12.5px;padding:13px 15px;border-radius:5px;
+border:1px solid var(--edge);color:var(--mute);margin-bottom:12px}
+.msg.bad{color:var(--err);border-color:rgba(200,54,43,.5);background:rgba(200,54,43,.08)}
+.msg.good{color:var(--ok);border-color:rgba(127,227,176,.35);background:rgba(26,158,110,.08)}
+.secret{background:#080c16;border:2px solid var(--gold);border-radius:6px;padding:18px;
+margin-bottom:14px}
+.secret .lbl{font-family:var(--mono);font-size:10px;letter-spacing:.16em;
+text-transform:uppercase;color:var(--gold);margin-bottom:10px}
+.secret .val{font-family:var(--mono);font-size:13px;color:var(--text);word-break:break-all;
+line-height:1.7;background:var(--panel);padding:12px;border-radius:4px}
+.secret .warn{color:var(--err);font-size:13px;margin-top:12px}
+.peer{padding:12px 0;border-bottom:1px solid var(--edge)}
+.peer:last-child{border-bottom:none}
+.peer .id{font-family:var(--mono);font-size:13.5px;color:var(--gold)}
+.peer .meta{font-size:12.5px;color:var(--mute);margin-top:3px}
+.pill{display:inline-block;font-family:var(--mono);font-size:10px;padding:2px 7px;
+border-radius:3px;letter-spacing:.1em;text-transform:uppercase}
+.pill.active{background:rgba(26,158,110,.18);color:var(--ok)}
+.pill.suspended{background:rgba(200,54,43,.15);color:var(--err)}
+footer{margin-top:30px;padding-top:16px;border-top:1px solid var(--edge);
+font-family:var(--mono);font-size:10.5px;color:var(--mute);line-height:1.8}
+a{color:var(--gold)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <p class="eyebrow">AILeash · peer credentials</p>
+  <h1>Signed <span>peers</span></h1>
+  <p class="sub">The open endpoint stays open. This issues credentials to peers who need a guarantee that only they can submit as their chain.</p>
+</header>
+
+<div class="keybar">
+  <label for="key">API key</label>
+  <input id="key" type="password" placeholder="al_live_…" autocomplete="off" spellcheck="false">
+  <p class="keynote">Held in this tab only. Close it and the key is gone.</p>
+</div>
+
+<div class="op open" id="op-reg">
+  <div class="op-head" onclick="tog('op-reg')">
+    <span class="op-n">01</span><span class="op-t">Register a peer</span>
+    <span class="op-r">POST /x/peer/register</span>
+  </div>
+  <div class="op-body">
+    <p class="op-why">Issues their secret. It is shown once here and never again — send it to them over a channel you trust, not the same email as everything else.</p>
+    <div class="field">
+      <label for="r-id">Peer id (lowercase, no spaces)</label>
+      <input id="r-id" placeholder="praesidium" autocomplete="off">
+    </div>
+    <div class="field">
+      <label for="r-name">Chain name</label>
+      <input id="r-name" placeholder="PRAXIS" autocomplete="off">
+    </div>
+    <div class="field">
+      <label for="r-url">Their public tip URL</label>
+      <input id="r-url" placeholder="https://example.com/api/tip" autocomplete="off">
+    </div>
+    <button onclick="run('register')">Issue the credential</button>
+  </div>
+</div>
+
+<div class="op" id="op-rot">
+  <div class="op-head" onclick="tog('op-rot')">
+    <span class="op-n">02</span><span class="op-t">Rotate a secret</span>
+    <span class="op-r">POST /x/peer/rotate</span>
+  </div>
+  <div class="op-body">
+    <p class="op-why">New secret now, old one keeps working for 24 hours so they can roll over without downtime.</p>
+    <div class="field">
+      <label for="o-id">Peer id</label>
+      <input id="o-id" placeholder="praesidium" autocomplete="off">
+    </div>
+    <button onclick="run('rotate')">Rotate</button>
+  </div>
+</div>
+
+<div class="op" id="op-sus">
+  <div class="op-head" onclick="tog('op-sus')">
+    <span class="op-n">03</span><span class="op-t">Suspend or resume</span>
+    <span class="op-r">POST /x/peer/suspend</span>
+  </div>
+  <div class="op-body">
+    <p class="op-why">Suspending refuses new submissions. Nothing is deleted and their sealed history stands.</p>
+    <div class="field">
+      <label for="s-id">Peer id</label>
+      <input id="s-id" placeholder="praesidium" autocomplete="off">
+    </div>
+    <div class="two">
+      <button onclick="run('suspend')">Suspend</button>
+      <button class="quiet" onclick="run('resume')">Resume</button>
+    </div>
+  </div>
+</div>
+
+<div class="op" id="op-list">
+  <div class="op-head" onclick="tog('op-list')">
+    <span class="op-n">04</span><span class="op-t">Who is registered</span>
+    <span class="op-r">GET /x/peer/peers</span>
+  </div>
+  <div class="op-body">
+    <p class="op-why">Public route. Secrets are never returned by anything.</p>
+    <button class="quiet" onclick="run('peers')">List them</button>
+  </div>
+</div>
+
+<div class="op" id="op-hist">
+  <div class="op-head" onclick="tog('op-hist')">
+    <span class="op-n">05</span><span class="op-t">Submissions</span>
+    <span class="op-r">GET /x/peer/history</span>
+  </div>
+  <div class="op-body">
+    <p class="op-why">What has come in, with the receipt for each. Leave the id blank for everything.</p>
+    <div class="field">
+      <label for="h-id">Peer id (optional)</label>
+      <input id="h-id" placeholder="leave blank for all" autocomplete="off">
+    </div>
+    <button class="quiet" onclick="run('history')">Show them</button>
+  </div>
+</div>
+
+<div id="out"></div>
+
+<footer>
+  Spec for peers to implement: <a href="/x/peer/spec">/x/peer/spec</a><br>
+  Open endpoint, unchanged: <a href="/x/witness/peers">/x/witness/peers</a><br>
+  Other consoles: <a href="/console">/console</a> · <a href="/pack">/pack</a>
+</footer>
+
+</div>
+
+<script>
+(function(){
+  var out=document.getElementById('out'), busy=false;
+  window.tog=function(id){document.getElementById(id).classList.toggle('open');};
+  function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+  function msg(t,k){out.innerHTML='<div class="msg '+(k||'')+'">'+esc(t)+'</div>';}
+  function raw(o){return '<pre>'+esc(JSON.stringify(o,null,2))+'</pre>';}
+  function val(id){return document.getElementById(id).value.trim();}
+  function key(){var k=val('key');if(!k){msg('Paste your API key at the top first.','bad');return null;}return k;}
+
+  async function call(path,method,body){
+    var k=key(); if(!k) return null;
+    var o={method:method,headers:{'Authorization':'Bearer '+k}};
+    if(body){o.headers['Content-Type']='application/json';o.body=JSON.stringify(body);}
+    var r=await fetch(path,o); var d;
+    try{d=await r.json();}catch(e){d={error:'unreadable_response'};}
+    return {status:r.status,data:d};
+  }
+
+  function showSecret(d,title,extra){
+    return '<div class="secret"><div class="lbl">'+esc(title)+' — '+esc(d.peer_id)+'</div>'
+      +'<div class="val">'+esc(d.secret)+'</div>'
+      +'<div class="warn">Shown once. Not recoverable. Copy it now and send it to them '
+      +'separately from anything else.</div>'
+      +(extra?'<div class="warn" style="color:var(--mute)">'+esc(extra)+'</div>':'')
+      +'</div>';
+  }
+
+  function showPeers(d){
+    if(!d.peers||!d.peers.length) return '<div class="msg">No peers registered yet.</div>';
+    var h='<div class="msg good">'+d.count+' registered</div><div class="op open"><div class="op-body" style="padding:16px">';
+    d.peers.forEach(function(p){
+      h+='<div class="peer"><span class="id">'+esc(p.peer_id)+'</span> '
+        +'<span class="pill '+esc(p.status)+'">'+esc(p.status)+'</span>'
+        +'<div class="meta">'+esc(p.chain_name||'')
+        +' · '+esc(p.submissions)+' submissions'
+        +(p.last_seen?' · last '+esc(p.last_seen):' · never submitted')
+        +(p.rotation_overlap_active?' · rotating':'')
+        +'</div>'
+        +(p.url?'<div class="meta">'+esc(p.url)+'</div>':'')
+        +'</div>';
+    });
+    return h+'</div></div>';
+  }
+
+  window.run=async function(what){
+    if(busy) return;
+    var path,method='POST',body=null;
+
+    if(what==='register'){
+      var id=val('r-id');
+      if(!id){msg('Give the peer an id.','bad');return;}
+      path='/x/peer/register';
+      body={peer_id:id.toLowerCase(),chain_name:val('r-name')||id,url:val('r-url')};
+    }
+    else if(what==='rotate'){
+      var oid=val('o-id');
+      if(!oid){msg('Which peer?','bad');return;}
+      path='/x/peer/rotate'; body={peer_id:oid.toLowerCase()};
+    }
+    else if(what==='suspend'||what==='resume'){
+      var sid=val('s-id');
+      if(!sid){msg('Which peer?','bad');return;}
+      path='/x/peer/'+what; body={peer_id:sid.toLowerCase()};
+    }
+    else if(what==='peers'){path='/x/peer/peers';method='GET';}
+    else if(what==='history'){
+      var hid=val('h-id');
+      path='/x/peer/history'+(hid?'?peer_id='+encodeURIComponent(hid.toLowerCase()):'');
+      method='GET';
+    }
+    else return;
+
+    busy=true;
+    out.innerHTML='<div class="msg">Working…</div>';
+    try{
+      var res=await call(path,method,body);
+      if(!res){busy=false;return;}
+      var d=res.data;
+      if(res.status===401){msg('That key was refused.','bad');}
+      else if(res.status===404&&d&&d.error==='unknown_module'){
+        msg('modules/peer.py is not deployed yet.','bad');}
+      else if(res.status>=400){
+        out.innerHTML='<div class="msg bad">'+esc((d&&(d.detail||d.error))||('HTTP '+res.status))+'</div>'+raw(d);}
+      else if(what==='register'&&d.secret){
+        out.innerHTML=showSecret(d,'Peer secret')
+          +'<div class="msg good">Registered. Send them /x/peer/spec so they can implement the signing.</div>'+raw(d);}
+      else if(what==='rotate'&&d.secret){
+        out.innerHTML=showSecret(d,'New secret','Previous secret valid until '+(d.previous_valid_until||''))+raw(d);}
+      else if(what==='peers'){out.innerHTML=showPeers(d)+raw(d);}
+      else{out.innerHTML='<div class="msg good">Done.</div>'+raw(d);}
+    }catch(e){msg('Could not reach the server.','bad');}
+    busy=false;
+  };
+})();
+</script>
+</body>
+</html>
+"""
+
+
+def _srv():
+    m = sys.modules.get("__main__")
+    if hasattr(m, "get_bearer"):
+        return m
+    return sys.modules.get("server")
+
+
+def _install(s):
+    if _patched[0]:
+        return "already installed"
+    H = getattr(s, "Handler", None)
+    if H is None or not hasattr(H, "do_GET"):
+        return "no handler"
+    if getattr(H, "_peerconsole_patched", False):
+        _patched[0] = True
+        return "already installed"
+
+    original = H.do_GET
+
+    def do_GET(self):
+        try:
+            p = urlparse(self.path).path.rstrip("/") or "/"
+        except Exception:
+            p = self.path or "/"
+        if p in PAGE_PATHS:
+            body = PAGE.encode("utf-8")
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Robots-Tag", "noindex, nofollow")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception:
+                pass
+            return
+        return original(self)
+
+    H.do_GET = do_GET
+    H._peerconsole_patched = True
+    _patched[0] = True
+    print("PEERCONSOLE: /peers page installed at runtime", flush=True)
+    return "installed"
+
+
+def handle(method, action, data, api_key, ctx):
+    s = _srv()
+    if s is None:
+        return {"error": "server_not_found"}, 500
+
+    state = "already installed" if _patched[0] else None
+    if not _patched[0]:
+        try:
+            state = _install(s)
+        except Exception as exc:
+            print("PEERCONSOLE: patch failed - " + str(exc), flush=True)
+            state = "failed: " + str(exc)
+
+    if method == "GET" and (action or "") in ("", "status"):
+        return {
+            "page": "/peers",
+            "installed": bool(_patched[0]),
+            "install_result": state,
+            "version": VERSION,
+            "paths": list(PAGE_PATHS),
+            "note": "The page holds no credentials. Every route it calls "
+                    "checks the key itself.",
+        }, 200
+
+    return {"error": "unknown_action", "action": action, "GET": ["status"]}, 404
 
 ```
