@@ -4,6 +4,7 @@ Contains:
 - `modules/publish.py`
 - `modules/reconcile.py`
 - `modules/replay.py`
+- `modules/roster.py`
 - `modules/router.py`
 - `modules/rulebind.py`
 
@@ -1637,6 +1638,347 @@ def handle(method, action, data, api_key, ctx):
     return {"error": "unknown_action", "action": action,
             "GET": ["spec", "fingerprint", "history", "self", "check (keyed)"],
             "POST": ["challenge", "attest (keyed)"]}, 404
+
+```
+
+
+## `modules/roster.py`
+
+333 lines, 12280 bytes
+
+```python
+"""
+modules/roster.py  v1.0  -  the canonical network list
+
+WHY
+    Witnessing runs on each operator's own machine. A new chain can join
+    the network and nobody else's server knows it exists, because nobody
+    told it. The result is a star with one operator in the middle, which
+    is the shape a witnessed log is supposed to avoid.
+
+    This publishes the list. Every peer, every tip URL, one public route.
+    A peer's sync reads it and witnesses everyone on it, including
+    whoever joined this morning.
+
+    It does not witness anything itself. It is a phone book.
+
+WHERE THE DATA COMES FROM
+    witness_log and witness_names, which witness.py already maintains.
+    Nothing new is recorded and no existing module changes. A chain
+    appears here because it submitted a tip with a url, which is the
+    same thing that binds its name today.
+
+WHAT MAKES THE LIST HONEST
+    Every entry carries its own evidence: when it was first and last
+    seen, how many observations, whether its name is bound to a host,
+    and whether it has gone quiet. Nothing is filtered out for looking
+    bad. A silent chain stays listed and is marked silent, because
+    hiding it would make the list a claim rather than a record.
+
+ROUTES
+    GET  list      public   the roster. this is the one peers poll.
+    GET  spec      public   what this is and how to consume it
+    GET  health    public   one-line network summary
+"""
+
+import json
+import time
+
+VERSION = "1.1"
+
+PUBLIC = {("GET", "list"), ("GET", "spec"), ("GET", "health")}
+
+# A chain that has not submitted within this window is marked silent.
+# It stays on the list. Silence is information, not a reason to hide it.
+SILENT_AFTER_HOURS = 6
+
+# Our own entry, so a consumer of the roster does not have to be told
+# separately who publishes it.
+SELF_CHAIN = "sebbi.pro"
+SELF_TIP = "https://sebbi.pro/x/witness/tip"
+SELF_OBSERVE = "https://sebbi.pro/x/witness/observe"
+
+
+def _epoch(ts):
+    """
+    Accept either a unix number or an ISO-8601 string. witness.py stores
+    ISO strings; other tables store floats. Guessing wrong here silently
+    turned every peer's status into 'unknown', so it takes both.
+    """
+    if ts is None:
+        return None
+    if isinstance(ts, (int, float)):
+        return float(ts)
+    s = str(ts).strip()
+    if not s:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    try:
+        import datetime
+        t = s.replace("Z", "+00:00")
+        return datetime.datetime.fromisoformat(t).timestamp()
+    except Exception:
+        return None
+
+
+def _iso(ts):
+    e = _epoch(ts)
+    if e is None:
+        return None
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(e))
+    except Exception:
+        return None
+
+
+def _cols(conn, table):
+    try:
+        return [r[1] for r in conn.execute(
+            "PRAGMA table_info(%s)" % table).fetchall()]
+    except Exception:
+        return []
+
+
+def _gather(ctx):
+    """
+    Read whatever witness.py has. Written defensively: this module must
+    never be the reason a deploy breaks, so a missing table or column
+    degrades to a shorter list rather than a 500.
+    """
+    conn = ctx["conn"]
+    now = time.time()
+    out = {}
+
+    cols = _cols(conn, "witness_log")
+    if not cols:
+        return out
+
+    chain_col = None
+    for c in ("chain", "peer", "chain_name", "name"):
+        if c in cols:
+            chain_col = c
+            break
+    if not chain_col:
+        return out
+
+    # witness.py calls this "observed" and stores an epoch float.
+    # Other tables have used "ts". Try the real names in order.
+    ts_col = None
+    for c in ("observed", "ts", "seen", "peer_ts"):
+        if c in cols:
+            ts_col = c
+            break
+    url_col = "url" if "url" in cols else None
+    live_col = "liveness" if "liveness" in cols else None
+    name_col = "name_status" if "name_status" in cols else None
+
+    sel = [chain_col]
+    for c in (ts_col, url_col, live_col, name_col):
+        sel.append(c if c else "NULL")
+
+    try:
+        rows = conn.execute(
+            "SELECT %s FROM witness_log ORDER BY rowid" % ", ".join(sel)
+        ).fetchall()
+    except Exception:
+        return out
+
+    for r in rows:
+        chain = (r[0] or "").strip()
+        if not chain:
+            continue
+        e = out.setdefault(chain, {
+            "chain": chain, "observations": 0, "first_seen": None,
+            "last_seen": None, "url": None, "liveness": None,
+            "name_status": None,
+        })
+        e["observations"] += 1
+        ts = _epoch(r[1])
+        if ts is not None:
+            if e["first_seen"] is None or ts < e["first_seen"]:
+                e["first_seen"] = ts
+            if e["last_seen"] is None or ts > e["last_seen"]:
+                e["last_seen"] = ts
+        if r[2]:
+            e["url"] = r[2]
+        if r[3]:
+            e["liveness"] = r[3]
+        if r[4]:
+            e["name_status"] = r[4]
+
+    for e in out.values():
+        last = e["last_seen"]
+        hours = ((now - last) / 3600.0) if last else None
+        e["hours_since"] = round(hours, 1) if hours is not None else None
+        e["status"] = ("unknown" if hours is None
+                       else ("current" if hours <= SILENT_AFTER_HOURS
+                             else "silent"))
+    return out
+
+
+def _entries(ctx):
+    peers = _gather(ctx)
+    now = time.time()
+
+    listed = []
+    for chain, e in sorted(peers.items(), key=lambda kv: kv[0]):
+        listed.append({
+            "chain": e["chain"],
+            "tip_url": e["url"],
+            "observations": e["observations"],
+            "first_seen": _iso(e["first_seen"]),
+            "last_seen": _iso(e["last_seen"]),
+            "hours_since": e["hours_since"],
+            "status": e["status"],
+            "liveness": e["liveness"],
+            "name_status": e["name_status"],
+            "witnessable": bool(e["url"]),
+        })
+
+    listed.insert(0, {
+        "chain": SELF_CHAIN,
+        "tip_url": SELF_TIP,
+        "observations": None,
+        "first_seen": None,
+        "last_seen": _iso(now),
+        "hours_since": 0,
+        "status": "current",
+        "liveness": "self",
+        "name_status": "publisher",
+        "witnessable": True,
+        "note": "The publisher of this roster. Listed so a consumer does "
+                "not have to be told separately who to witness.",
+    })
+    return listed
+
+
+def _list(ctx):
+    entries = _entries(ctx)
+    usable = [e for e in entries if e["witnessable"]]
+    return {
+        "ok": True,
+        "roster_version": VERSION,
+        "generated": _iso(time.time()),
+        "submit_to": SELF_OBSERVE,
+        "count": len(entries),
+        "witnessable": len(usable),
+        "silent": len([e for e in entries if e["status"] == "silent"]),
+        "peers": entries,
+        "what_this_list_is":
+            "Parties that have submitted a tip to this deployment. That is "
+            "all it records. It is not a membership list, not a set of "
+            "partners, and not participants in anything AILeash is building. "
+            "Being listed implies no relationship beyond having sent a hash, "
+            "and no endorsement of anything sealed in anyone else's chain "
+            "including ours. A party appears here because they posted to an "
+            "open endpoint; they did not join anything and were not asked to "
+            "agree to anything.",
+        "how_to_use":
+            "Poll this route on your own schedule. For every entry with "
+            "witnessable=true, fetch tip_url, seal the tip in your own "
+            "chain, and POST your tip to their submit endpoint. A chain "
+            "that joins tomorrow appears here and gets picked up on your "
+            "next cycle with nothing to configure.",
+        "note":
+            "Chains that have gone quiet stay listed and are marked "
+            "silent. Removing them would make this a claim rather than a "
+            "record. An entry with witnessable=false has never bound a "
+            "url and cannot be fetched from.",
+    }, 200
+
+
+def _health(ctx):
+    entries = _entries(ctx)
+    others = [e for e in entries if e["chain"] != SELF_CHAIN]
+    current = [e for e in others if e["status"] == "current"]
+    return {
+        "ok": True,
+        "chains_listed": len(entries),
+        "submitting_currently": len(current),
+        "silent": len([e for e in others if e["status"] == "silent"]),
+        "what_this_counts":
+            "Parties that have submitted a tip to this deployment, and how "
+            "recently. Nothing more.",
+        "what_this_does_not_tell_you": [
+            "Whether any of these parties witness each other. They may not. "
+            "Ask them, or read their own rosters.",
+            "Whether any of them has agreed to anything, with us or with "
+            "each other.",
+            "Whether the records behind any of these tips are true.",
+        ],
+    }, 200
+
+
+def _spec():
+    return {
+        "module": "roster",
+        "version": VERSION,
+        "what": "A list of parties that have submitted a tip to this "
+                "deployment, with the tip URL each supplied.",
+        "what_it_is_not":
+            "Not a membership list. Not a set of partners, adopters, "
+            "validators or participants in anything AILeash is building. "
+            "Appearing here means a party posted a hash to an open endpoint. "
+            "It implies no agreement, no relationship and no endorsement in "
+            "any direction. Two surfaces, two separate things: being sealed "
+            "in the chain, and being named on this list. Neither is consent "
+            "to the other.",
+        "why":
+            "Witnessing runs on each operator's own machine, so a server "
+            "only witnesses chains it has been told about. Without a "
+            "shared list, every new joiner connects to whoever invited "
+            "them and the network becomes a star with one operator in "
+            "the middle. This route is the list, so a peer's sync can "
+            "witness everybody instead of just its introducer.",
+        "routes": {
+            "GET list": "public. the roster. poll this.",
+            "GET health": "public. one-line network summary.",
+            "GET spec": "public. this document.",
+        },
+        "entry_fields": {
+            "chain": "the chain's name as it submitted it",
+            "tip_url": "where to fetch their current tip. null if they "
+                       "have never bound one.",
+            "witnessable": "true when tip_url is present",
+            "status": "current, silent (no submission in %dh), or unknown"
+                      % SILENT_AFTER_HOURS,
+            "observations": "how many tips they have submitted to us",
+            "liveness": "confirmed / live / self-declared, as recorded at "
+                        "submission",
+            "name_status": "first-use / bound / conflict / unbound",
+        },
+        "joining":
+            "POST a tip to %s with {\"chain\", \"tip\", \"url\"}. No "
+            "account, no key. The url field is what makes you "
+            "witnessable by everyone else, so do not omit it." % SELF_OBSERVE,
+        "what_this_does_not_do": [
+            "It does not witness anything. It is a phone book.",
+            "It does not establish that anyone listed is a peer of anyone "
+            "else listed, or of us.",
+            "It does not prove a listed chain is honest, only that it "
+            "submitted to us and when.",
+            "It cannot make another operator witness you. Their server "
+            "decides that. This only makes sure they know you exist.",
+            "It reflects submissions to this deployment. Another node "
+            "publishing its own roster may list a different set.",
+        ],
+        "drop_in":
+            "meshwitness.py reads this route and witnesses every entry on "
+            "it. Standard library, one file, one cron line.",
+    }
+
+
+def handle(method, action, data, api_key, ctx):
+    if action == "spec":
+        return _spec(), 200
+    if action == "health":
+        return _health(ctx)
+    if action in ("list", "", "status"):
+        return _list(ctx)
+    return {"ok": False, "error": "unknown_action", "action": action}, 404
 
 ```
 
