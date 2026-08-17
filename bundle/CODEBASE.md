@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-100 files across 20 parts.
+101 files across 20 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -40,6 +40,7 @@ Generated automatically on every push. Do not edit by hand.
 - `modules/pack.py`
 - `modules/packconsole.py`
 - `modules/peer.py`
+- `modules/peerconsole.py`
 
 ## [CODEBASE-07.md](CODEBASE-07.md)
 
