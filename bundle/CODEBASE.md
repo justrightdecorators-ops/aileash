@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-99 files across 20 parts.
+100 files across 20 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -39,26 +39,27 @@ Generated automatically on every push. Do not edit by hand.
 - `modules/oversight.py`
 - `modules/pack.py`
 - `modules/packconsole.py`
-- `modules/publish.py`
+- `modules/peer.py`
 
 ## [CODEBASE-07.md](CODEBASE-07.md)
 
+- `modules/publish.py`
 - `modules/reconcile.py`
 - `modules/replay.py`
 - `modules/router.py`
 - `modules/rulebind.py`
-- `modules/savings.py`
 
 ## [CODEBASE-08.md](CODEBASE-08.md)
 
+- `modules/savings.py`
 - `modules/selfcheck.py`
 - `modules/spec.py`
 - `modules/standard.py`
 - `modules/stats.py`
-- `modules/verifier.py`
 
 ## [CODEBASE-09.md](CODEBASE-09.md)
 
+- `modules/verifier.py`
 - `modules/witness.py`
 - `modules/witnessed.py`
 - `Verify_ai.py`
@@ -66,23 +67,23 @@ Generated automatically on every push. Do not edit by hand.
 - `ai_safety_scanner.py`
 - `aigrade_insert.py`
 - `aileash_reporter.py`
-- `aileash_verify.py`
-- `anchor.py`
-- `board_auditor.py`
 
 ## [CODEBASE-10.md](CODEBASE-10.md)
 
+- `aileash_verify.py`
+- `anchor.py`
+- `board_auditor.py`
 - `brain.py`
 - `broadcaster.py`
 - `build_sebbi_ecosystem.py`
 - `gateway_proxy.py`
 - `sebbi_orchestrator.py`
 - `sebdog_engine.py`
-- `sebdog_licence.py`
-- `sebdog_reporter.py`
 
 ## [CODEBASE-11.md](CODEBASE-11.md)
 
+- `sebdog_licence.py`
+- `sebdog_reporter.py`
 - `tests/attack_continuity_1.py`
 - `tests/attack_continuity_2.py`
 - `tests/attack_continuity_3.py`
@@ -91,12 +92,12 @@ Generated automatically on every push. Do not edit by hand.
 - `tests/attack_continuity_6.py`
 - `tests/attack_witnessed.py`
 - `verify_authority.py`
-- `AILeash-API-Reference-v6.4.2.md`
-- `LICENCE`
-- `README.md`
 
 ## [CODEBASE-12.md](CODEBASE-12.md)
 
+- `AILeash-API-Reference-v6.4.2.md`
+- `LICENCE`
+- `README.md`
 - `admin.html`
 - `ai-standard.html`
 - `ai-txt-kit.html`
