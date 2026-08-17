@@ -6,7 +6,7 @@ Contains:
 - `modules/dsr.py`
 - `modules/fingerprint.py`
 - `modules/lineage.py`
-- `modules/network.py`
+- `modules/mutual.py`
 
 
 ## `modules/declare.py`
@@ -2069,496 +2069,552 @@ def handle(method, action, data, api_key, ctx):
 ```
 
 
-## `modules/network.py`
+## `modules/mutual.py`
 
-487 lines, 19842 bytes
+543 lines, 19704 bytes
 
 ```python
+#!/usr/bin/env python3
 """
-modules/network.py  -  serves the public witness network page
+modules/mutual.py  -  the outbound half of mutual witnessing
+============================================================
 
-WHY THIS IS A MODULE AND NOT A TEMPLATE
----------------------------------------
-The router hands whatever handle() returns to send_json, so a module cannot
-return HTML through it - it would arrive as a JSON string. So this does the
-same thing router.py already does for POST: it patches the request handler at
-runtime, adds a branch for the page path, and leaves every other path exactly
-as it was. The patch is idempotent and lives in memory, so a restart reverts it.
+Why this exists
+---------------
+modules/witness.py RECEIVES. Other chains hand us their tips and we seal
+them. Nothing in the platform currently SENDS our tip anywhere, so right
+now we witness other people and nobody witnesses us. This module is the
+missing direction.
 
-THE SAME CATCH AS THE POST PATCH
---------------------------------
-A module is only imported when a request reaches the router. So after every
-deploy, one request to /x/network/status has to arrive before /witness works.
-Opening /x/network/status in a browser does it. Until then the page path falls
-through to whatever the server did before, which is a 404 - not an error page,
-just the old behaviour.
+Drop it in as modules/mutual.py. The router picks it up automatically -
+no edits to server.py.
 
-If you would rather not patch anything, the same HTML works as a plain file in
-static/. This exists because the page then lives with the module it describes
-rather than drifting away from it.
-
-ROUTES
+Routes
 ------
-  GET /witness            the page
-  GET /witness.html       same page
-  GET /x/network/status   whether the patch is installed (public)
+  POST /x/mutual/push      send our current tip to every configured peer
+  POST /x/mutual/pull      fetch every peer's tip and seal it into our chain
+  POST /x/mutual/sync      pull then push (this is the one to schedule)
+  GET  /x/mutual/peers     the configured peers and what happened last time
+  GET  /x/mutual/status    last run, next run, whether the timer is alive
 
-The page itself holds no data. It reads /x/witness/tip and /x/witness/peers
-from the browser, same as any other visitor would, so it cannot show anything
-a stranger could not verify for themselves.
+Important design note
+---------------------
+This module does not touch the database or import anything from server.py.
+It talks HTTP to routes that are already public - ours and theirs. That
+means it cannot corrupt anything, it works no matter how seal() changes,
+and every action it takes is one an outsider could audit for themselves.
+
+To read our own tip it calls our own public /x/witness/tip.
+To seal a peer's tip it calls our own public /x/witness/observe, which is
+already built to record exactly that. So a peer tip we pull is recorded by
+the same code path as a peer tip that was pushed to us.
+
+FETCH-ONLY PEERS (added 1.2)
+----------------------------
+observe_url is now OPTIONAL. A peer with a tip_url and no observe_url is
+fetch-only: we read and seal their tip, and we do not try to push ours.
+
+That is a real configuration, not a broken one. Two current cases:
+
+  A peer whose outbound submission lane is deliberately closed during
+  staging. They serve a tip for us to read; their recorder never reaches
+  out. Serving a file is not outbound submission.
+
+  A peer whose tip is a static JSON file with no server behind it. They
+  push to us on their own schedule and there is nothing on their side to
+  POST to. Perfectly valid node.
+
+Before 1.2 push_one read peer["observe_url"] unconditionally, so adding a
+fetch-only peer would have raised KeyError on every cycle - inside a
+background thread with a bare except, so it would have failed silently and
+taken the whole sync with it.
+
+CONCURRENCY - read this before changing it
+------------------------------------------
+A sync cycle makes two kinds of call, and they are treated differently on
+purpose.
+
+  OUTBOUND to other people's hosts (reading their tip, pushing ours) runs
+  in parallel. These are the slow ones - we are waiting on somebody else's
+  server, and there is no reason to wait on them one at a time. Fifty peers
+  now costs roughly what the slowest single peer costs, instead of the sum
+  of all fifty.
+
+  INBOUND to our own server (sealing what we pulled) stays sequential. Our
+  own process is handling those requests, and firing a burst of them at
+  ourselves while we are mid-cycle is asking for trouble - a queue behind a
+  single replica at best. The sealing is fast and local anyway, so there is
+  nothing to gain by parallelising it and a real risk in doing so.
+
+So: fetch everything at once, then seal one at a time.
+
+BEFORE THIS WORKS
+-----------------
+1. "observe" must be in the PUBLIC set of modules/witness.py. If it is not,
+   this module gets a 401 from our own server, same as Red Flag AI Pro did.
+2. After every deploy, the first /x/ request must be a GET - that is what
+   installs the POST branch. Opening /x/mutual/peers in a browser does it.
 """
 
-import sys
+import json
+import threading
+import time
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "1.0"
+VERSION = "1.2"
 
-PUBLIC = {("GET", "status")}
+# ----------------------------------------------------------------------
+# ROUTER
+# ----------------------------------------------------------------------
 
-PAGE_PATHS = ("/witness", "/witness.html", "/network")
+# The router reads a set of (METHOD, action) tuples. Anything not listed
+# here needs an API key - default is closed.
+#
+# peers and status are read-only. An outsider being able to see who we
+# witness with, and whether it is actually running, is the entire point.
+#
+# push, pull and sync stay keyed - they cause outbound traffic and are not
+# left open to anonymous callers.
+PUBLIC = {("GET", "peers"), ("GET", "status")}
 
-_patched = [False]
 
+# ----------------------------------------------------------------------
+# CONFIG
+# ----------------------------------------------------------------------
 
-PAGE = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>The witness network — AILeash</title>
-<meta name="description" content="Two independent platforms recording each other's records, hourly. Checkable by anyone, without an account.">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300;9..144,600&family=Inter+Tight:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
-<style>
-:root{
-  --paper:#E9EDE4;
-  --paper-deep:#DFE5D8;
-  --ink:#18241F;
-  --ink-soft:#4A5A52;
-  --rule:#BFCCBF;
-  --rule-strong:#9AAC9C;
-  --stamp:#7C2B38;
-  --verdigris:#2F6B5E;
-  --amber:#9A6B1F;
-  --gutter:#CBD6C8;
+# Our own public witness routes. Left as full URLs on purpose so this
+# module never has to guess its own host.
+OUR_TIP_URL = "https://sebbi.pro/x/witness/tip"
+OUR_OBSERVE_URL = "https://sebbi.pro/x/witness/observe"
+
+# The name we go by when we hand our tip to someone else.
+OUR_CHAIN_NAME = "aileash"
+
+# Everyone we witness with. Add a dict per chain.
+#   name         what we file their tips under
+#   tip_url      where we GET their current tip          REQUIRED
+#   observe_url  where we POST ours so they record it    OPTIONAL
+#
+# Omit observe_url for a fetch-only peer - see the note at the top. It is
+# not an oversight and the module will not complain about it; /x/mutual/peers
+# reports the direction for each so it is visible rather than assumed.
+PEERS = [
+    {
+        "name": "red-flag-ai-pro",
+        "tip_url": "https://www.redflagaipro.com/api/witness/tip",
+        "observe_url": "https://www.redflagaipro.com/api/witness/anchor",
+    },
+    {
+        # Simon. Serves a static JSON file regenerated on his side, and
+        # pushes to us on his own systemd timer at :23. Nothing to POST to.
+        "name": "flavorflowstrategy.uk",
+        "tip_url": "https://www.flavorflowstrategy.uk/witness.json",
+    },
+    {
+        # PRAXIS / Praesidium, chain 4. Read-only, hash-only, currently
+        # SYNTHETIC_STAGING and regenerating every ten minutes, so expect
+        # liveness "live" rather than "self-consistent" - the tip moves
+        # between their generating it and our fetching it. That is the
+        # normal case for a working chain, not a failure.
+        #
+        # Their outbound submission lane is deliberately closed through
+        # staging, so no observe_url. They also run a signed lane at
+        # /x/peer/submit under peer_id praesidium when they are ready.
+        "name": "praesidium",
+        "tip_url": "https://chain4.thepraesidium.ai/api/witness/tip",
+    },
+]
+
+# Field names to send when pushing our tip. If a peer wants different
+# names, give that peer its own "keys" dict and it will be used instead.
+DEFAULT_PUSH_KEYS = {
+    "chain": "chain",
+    "tip": "tip",
+    "count": "count",
+    "ts": "ts",
+    "url": "url",
 }
-*{box-sizing:border-box}
-html{-webkit-text-size-adjust:100%}
-body{
-  margin:0;
-  background:var(--paper);
-  color:var(--ink);
-  font-family:"Inter Tight",system-ui,sans-serif;
-  font-size:17px;
-  line-height:1.6;
-  /* ruled paper, faint */
-  background-image:repeating-linear-gradient(
-    to bottom,
-    transparent 0 31px,
-    rgba(154,172,156,.20) 31px 32px
-  );
+
+# Where peers can read our tip, included in what we push.
+OUR_PUBLIC_URL = "https://sebbi.pro/x/witness/tip"
+
+# Background timer. Set ENABLED to False if you would rather drive it
+# yourself by hitting /x/mutual/sync.
+AUTO_SYNC_ENABLED = True
+AUTO_SYNC_SECONDS = 3600
+
+TIMEOUT_SECONDS = 20
+
+# How many peers we talk to at once. Above this they queue, which is fine -
+# it stops a large network spawning a thread per peer. Eight slow peers at
+# 20s each still finishes in 20s; forty finishes in about a minute worst
+# case, and only if every one of them times out.
+MAX_PARALLEL_PEERS = 8
+
+# ----------------------------------------------------------------------
+# state - deliberately in memory only, this is not evidence
+# ----------------------------------------------------------------------
+
+_state = {
+    "last_run": None,
+    "last_result": None,
+    "runs": 0,
+    "timer_started": False,
 }
-.wrap{max-width:1080px;margin:0 auto;padding:0 22px}
-
-/* ---------- masthead ---------- */
-.masthead{padding:52px 0 30px;border-bottom:2px solid var(--ink)}
-.eyebrow{
-  font-family:"IBM Plex Mono",monospace;
-  font-size:11.5px;letter-spacing:.18em;text-transform:uppercase;
-  color:var(--ink-soft);margin:0 0 18px;
-}
-h1{
-  font-family:Fraunces,Georgia,serif;
-  font-weight:600;font-size:clamp(2.5rem,7.5vw,4.6rem);
-  line-height:1.02;letter-spacing:-.02em;margin:0 0 20px;
-}
-h1 em{font-style:italic;font-weight:300}
-.standfirst{font-size:clamp(1.05rem,2.4vw,1.28rem);max-width:40ch;color:var(--ink-soft);margin:0}
-
-/* ---------- the spread ---------- */
-.spread{
-  margin:44px 0 8px;
-  border:1px solid var(--rule-strong);
-  background:rgba(255,255,255,.4);
-}
-.spread-head{
-  display:grid;grid-template-columns:1fr 92px 1fr;
-  border-bottom:1px solid var(--rule-strong);
-}
-.spread-head div{
-  font-family:"IBM Plex Mono",monospace;
-  font-size:11px;letter-spacing:.14em;text-transform:uppercase;
-  padding:12px 16px;color:var(--ink-soft);
-}
-.spread-head .mid{text-align:center;background:var(--gutter);color:var(--ink)}
-.spread-head .right{text-align:right}
-.folio{
-  display:grid;grid-template-columns:1fr 92px 1fr;
-  border-bottom:1px solid var(--rule);
-}
-.folio:last-child{border-bottom:0}
-.side{padding:20px 16px;min-width:0}
-.side.right{text-align:right}
-.mid{
-  background:var(--gutter);
-  display:flex;align-items:center;justify-content:center;
-  font-family:"IBM Plex Mono",monospace;font-size:11px;color:var(--ink-soft);
-  border-left:1px solid var(--rule);border-right:1px solid var(--rule);
-}
-.chain-name{
-  font-family:Fraunces,Georgia,serif;font-size:1.35rem;font-weight:600;
-  margin:0 0 4px;letter-spacing:-.01em;
-}
-.role{font-family:"IBM Plex Mono",monospace;font-size:11px;letter-spacing:.12em;
-  text-transform:uppercase;color:var(--ink-soft);margin:0 0 14px}
-.hash{
-  font-family:"IBM Plex Mono",monospace;font-size:12.5px;
-  word-break:break-all;color:var(--ink);margin:0 0 3px;line-height:1.45;
-}
-.hash-label{font-family:"IBM Plex Mono",monospace;font-size:10.5px;
-  letter-spacing:.12em;text-transform:uppercase;color:var(--ink-soft);margin:0 0 5px}
-.meta{font-size:14px;color:var(--ink-soft);margin:12px 0 0}
-.meta b{color:var(--ink);font-weight:600}
-
-/* ---------- stamp ---------- */
-.stamp{
-  display:inline-block;margin-top:16px;padding:6px 13px 5px;
-  border:2.5px solid var(--stamp);color:var(--stamp);
-  font-family:"IBM Plex Mono",monospace;font-weight:500;
-  font-size:12px;letter-spacing:.16em;text-transform:uppercase;
-  transform:rotate(-3.5deg);opacity:.9;
-}
-.stamp.press{animation:press .5s cubic-bezier(.2,1.5,.4,1) both}
-@keyframes press{
-  0%{opacity:0;transform:rotate(-3.5deg) scale(1.5)}
-  70%{opacity:.95;transform:rotate(-3.5deg) scale(.97)}
-  100%{opacity:.9;transform:rotate(-3.5deg) scale(1)}
-}
-.stamp.live{border-color:var(--verdigris);color:var(--verdigris)}
-.stamp.weak{border-color:var(--amber);color:var(--amber)}
-.stamp.flag{background:var(--stamp);color:var(--paper)}
-
-/* ---------- sections ---------- */
-section{padding:56px 0;border-top:1px solid var(--rule-strong)}
-h2{
-  font-family:Fraunces,Georgia,serif;font-weight:600;
-  font-size:clamp(1.6rem,4vw,2.3rem);letter-spacing:-.015em;
-  margin:0 0 8px;line-height:1.15;
-}
-.sec-note{color:var(--ink-soft);max-width:56ch;margin:0 0 30px}
-p{max-width:62ch}
-
-.defs{display:grid;gap:0;border-top:1px solid var(--rule)}
-.def{
-  display:grid;grid-template-columns:170px 1fr;gap:20px;
-  padding:15px 0;border-bottom:1px solid var(--rule);
-}
-.def dt{
-  font-family:"IBM Plex Mono",monospace;font-size:12px;
-  letter-spacing:.1em;text-transform:uppercase;padding-top:3px;
-}
-.def dd{margin:0;color:var(--ink-soft)}
-.dot{display:inline-block;width:8px;height:8px;margin-right:8px;border-radius:50%;vertical-align:middle}
-.dot.ok{background:var(--stamp)}
-.dot.mid-c{background:var(--verdigris)}
-.dot.weak{background:var(--amber)}
-
-.limits li{max-width:62ch;margin-bottom:13px;color:var(--ink-soft)}
-.limits b{color:var(--ink)}
-
-pre{
-  font-family:"IBM Plex Mono",monospace;font-size:13px;line-height:1.7;
-  background:var(--ink);color:var(--paper);padding:20px;overflow-x:auto;
-  border:0;margin:22px 0;
-}
-pre .k{color:#9FC6B4}
-code{font-family:"IBM Plex Mono",monospace;font-size:.92em}
-
-.links{list-style:none;padding:0;margin:24px 0 0}
-.links li{border-bottom:1px solid var(--rule);padding:13px 0}
-.links a{
-  font-family:"IBM Plex Mono",monospace;font-size:13.5px;
-  color:var(--ink);text-decoration:none;word-break:break-all;
-  display:flex;justify-content:space-between;gap:16px;align-items:baseline;
-}
-.links a:hover,.links a:focus-visible{color:var(--stamp)}
-.links span{color:var(--ink-soft);font-family:"Inter Tight",sans-serif;
-  font-size:13px;flex:0 0 auto;text-align:right}
-
-footer{padding:40px 0 70px;color:var(--ink-soft);font-size:14px}
-footer a{color:var(--ink)}
-
-.loading,.errbox{
-  font-family:"IBM Plex Mono",monospace;font-size:13px;
-  color:var(--ink-soft);padding:26px 16px;
-}
-.errbox b{display:block;color:var(--ink);margin-bottom:6px;font-family:"Inter Tight",sans-serif;font-size:15px}
-
-a:focus-visible,button:focus-visible{outline:2.5px solid var(--stamp);outline-offset:3px}
-
-@media (max-width:760px){
-  body{background-image:none}
-  .spread-head,.folio{grid-template-columns:1fr}
-  .spread-head .mid,.folio .mid{
-    border-left:0;border-right:0;
-    border-top:1px solid var(--rule);border-bottom:1px solid var(--rule);
-    padding:7px 0;text-align:center;
-  }
-  .spread-head .right,.side.right{text-align:left}
-  .spread-head div{padding:9px 14px}
-  .def{grid-template-columns:1fr;gap:5px}
-}
-@media (prefers-reduced-motion:reduce){
-  *{animation:none!important;transition:none!important}
-}
-</style>
-</head>
-<body>
-
-<div class="wrap">
-
-  <header class="masthead">
-    <p class="eyebrow">AILeash · the witness network</p>
-    <h1>Two ledgers.<br><em>Neither one is the authority.</em></h1>
-    <p class="standfirst">Independent platforms record each other's records, every hour. You can check it yourself, right now, without an account.</p>
-  </header>
-
-  <div class="spread" id="spread">
-    <div class="spread-head">
-      <div>This chain</div>
-      <div class="mid">Exchange</div>
-      <div class="right">Recorded by</div>
-    </div>
-    <div id="folios">
-      <div class="loading">Reading the ledger…</div>
-    </div>
-  </div>
-
-  <section>
-    <h2>Why this exists</h2>
-    <p class="sec-note">Every platform that sells you an audit trail also holds it.</p>
-    <p>A hash chain stops anyone else altering the record. It does not stop the operator rebuilding the whole thing and presenting the result as history. Anchoring the chain externally narrows that down — you can't rewrite anything older than your last anchor — and it still leaves the keeper and the checker as the same party.</p>
-    <p>Nothing you build alone closes that. Somebody outside has to be holding a copy.</p>
-    <p>So each platform here takes the fingerprint of the others' records and seals it into its own. To rewrite your past now, everyone holding a copy would have to rewrite theirs in step, and re-obtain external timestamps that were issued days ago. The second half is the part that can't be done.</p>
-  </section>
-
-  <section>
-    <h2>What the marks mean</h2>
-    <p class="sec-note">Two checks run on every submission. Neither can reject one — everything gets sealed. What changes is how strong we say the claim is.</p>
-
-    <dl class="defs">
-      <div class="def"><dt><span class="dot ok"></span>Confirmed</dt><dd>We fetched the address given and it served exactly the tip that was submitted.</dd></div>
-      <div class="def"><dt><span class="dot mid-c"></span>Live</dt><dd>The address served a valid but different tip. A working chain moves between submitting and our looking — normal, not a failure.</dd></div>
-      <div class="def"><dt><span class="dot weak"></span>Self-declared</dt><dd>No address given, or we couldn't reach it. Taken on their word, and marked as such.</dd></div>
-      <div class="def"><dt>First-use</dt><dd>First time this name appeared. It's now bound to the address it came from.</dd></div>
-      <div class="def"><dt>Bound</dt><dd>Same address as the first time this name appeared. The same operator, consistently.</dd></div>
-      <div class="def"><dt>Conflict</dt><dd>This name has been submitted from a different address than the one it was first bound to. Still sealed, permanently flagged. Operators do move hosts — but you get to see it and decide.</dd></div>
-    </dl>
-  </section>
-
-  <section>
-    <h2>What this does not prove</h2>
-    <p class="sec-note">Said plainly, because the value of the rest depends on it.</p>
-    <ul class="limits">
-      <li><b>It doesn't prove a record was true when it was written.</b> Nothing can. No system reaches back to verify what someone was thinking or whether the data going in was honest. This proves what was recorded, when, and that it hasn't changed since.</li>
-      <li><b>It doesn't prove identity.</b> A name is self-declared. Checking the address proves someone runs a live chain producing that data — not that they're who they say. Binding a name to its first address is what makes a change visible.</li>
-      <li><b>Two platforms checking each other isn't much of a network.</b> The strength comes from breadth. This gets meaningfully harder to bend with every chain that joins, and not before.</li>
-      <li><b>A participant can go quiet.</b> Nobody can force anyone to keep publishing. Gaps show up as stale or silent rather than disappearing, which is the point.</li>
-    </ul>
-  </section>
-
-  <section>
-    <h2>Joining</h2>
-    <p class="sec-note">Chains submit their current head to the network and record the heads of others in return.</p>
-    <pre><span class="k">POST</span> https://sebbi.pro/x/witness/observe
-<span class="k">Content-Type:</span> application/json
-
-{
-  "chain": "your-chain-name",
-  "tip":   "&lt;64 hex characters — your current chain head&gt;",
-  "url":   "https://yoursite/your/tip",
-  "ts":    "2026-08-02T14:00:00Z"
-}</pre>
-    <p><code>url</code> is the address we fetch to check your tip independently — it's the difference between confirmed and self-declared. <code>ts</code> is optional, epoch or ISO.</p>
-    <p>Running a chain in the other direction, recording ours as we record yours, is what makes it mutual rather than us keeping a list. If you operate a platform in this space and you're willing to have your history held somewhere you don't control, message me and we'll talk through it and what it costs.</p>
-  </section>
-
-  <section>
-    <h2>Check it yourself</h2>
-    <p class="sec-note">Nothing here needs a login. Open any of these.</p>
-    <ul class="links">
-      <li><a href="/x/witness/tip">/x/witness/tip<span>our current head</span></a></li>
-      <li><a href="/x/witness/peers">/x/witness/peers<span>everyone we record</span></a></li>
-      <li><a href="/api/verify-chain">/api/verify-chain<span>chain checked end to end</span></a></li>
-      <li><a href="/api/anchor-status">/api/anchor-status<span>the external timestamp</span></a></li>
-    </ul>
-  </section>
-
-  <footer>
-    <p>Sealed records and their attestations are held by each participating platform independently. AILeash operates one chain in this network; it does not run the network. — <a href="https://sebbi.pro">sebbi.pro</a></p>
-  </footer>
-
-</div>
-
-<script>
-(function(){
-  var folios = document.getElementById('folios');
-
-  function esc(s){
-    return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){
-      return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
-    });
-  }
-
-  function stampFor(liveness, nameStatus){
-    var cls = 'stamp press', text = String(liveness || 'unchecked');
-    if (liveness === 'confirmed') cls += '';
-    else if (liveness === 'live') cls += ' live';
-    else cls += ' weak';
-    if (nameStatus === 'conflict'){ cls += ' flag'; text = 'conflict'; }
-    return '<span class="' + cls + '">' + esc(text) + '</span>';
-  }
-
-  function ago(hours){
-    if (hours == null) return 'unknown';
-    if (hours < 1) return 'within the hour';
-    if (hours < 2) return 'an hour ago';
-    if (hours < 48) return Math.round(hours) + ' hours ago';
-    return Math.round(hours / 24) + ' days ago';
-  }
-
-  function render(ours, peers){
-    if (!peers || !peers.length){
-      folios.innerHTML = '<div class="errbox"><b>No chains recorded yet.</b>' +
-        'Nothing has been submitted to this chain. The first tip posted to ' +
-        '/x/witness/observe appears here.</div>';
-      return;
-    }
-    var html = '';
-    peers.forEach(function(p){
-      html += '<div class="folio">' +
-        '<div class="side">' +
-          '<p class="chain-name">' + esc(ours.name) + '</p>' +
-          '<p class="role">head of chain · height ' + esc(ours.height) + '</p>' +
-          '<p class="hash-label">Current tip</p>' +
-          '<p class="hash">' + esc(ours.tip) + '</p>' +
-          '<p class="meta">Sealed <b>' + esc(ours.sealed) + '</b></p>' +
-        '</div>' +
-        '<div class="mid">↔</div>' +
-        '<div class="side right">' +
-          '<p class="chain-name">' + esc(p.peer) + '</p>' +
-          '<p class="role">' + esc(p.observations) + ' observations · ' +
-              esc(p.distinct_tips) + ' distinct tips</p>' +
-          '<p class="hash-label">Name bound to</p>' +
-          '<p class="hash">' + esc(p.bound_to || 'no address supplied') + '</p>' +
-          '<p class="meta">Last recorded <b>' + esc(ago(p.hours_since_last)) + '</b> · ' +
-              esc(p.name_status || 'unchecked') + '</p>' +
-          stampFor(p.liveness, p.name_status) +
-        '</div>' +
-      '</div>';
-    });
-    folios.innerHTML = html;
-  }
-
-  function failed(){
-    folios.innerHTML = '<div class="errbox"><b>The ledger did not answer.</b>' +
-      'The endpoints are public, so you can try them directly: ' +
-      '<a href="/x/witness/peers">/x/witness/peers</a></div>';
-  }
-
-  Promise.all([
-    fetch('/x/witness/tip').then(function(r){ return r.json(); }),
-    fetch('/x/witness/peers').then(function(r){ return r.json(); })
-  ]).then(function(res){
-    var tip = res[0] || {}, peers = res[1] || {};
-    render({
-      name: 'aileash',
-      tip: tip.tip || 'unavailable',
-      height: tip.height == null ? '—' : tip.height,
-      sealed: tip.sealed_at ? new Date(tip.sealed_at).toUTCString().replace(' GMT','  UTC') : 'unknown'
-    }, peers.peers || []);
-  }).catch(failed);
-})();
-</script>
-
-</body>
-</html>
-"""
+_lock = threading.Lock()
 
 
-def _srv():
-    m = sys.modules.get("__main__")
-    if hasattr(m, "get_bearer"):
-        return m
-    return sys.modules.get("server")
+def _now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def _install(s):
-    """Add a page branch to do_GET at runtime. Idempotent and reversible."""
-    if _patched[0]:
-        return "already installed"
-    H = getattr(s, "Handler", None)
-    if H is None or not hasattr(H, "do_GET"):
-        return "no handler"
-    if getattr(H, "_page_patched", False):
-        _patched[0] = True
-        return "already installed"
+def _reply(payload, status=200):
+    """The router expects (payload, status) back from handle()."""
+    return payload, status
 
-    original = H.do_GET
 
-    def do_GET(self):
+def _in_parallel(function, items):
+    """Run function over items concurrently, preserving input order.
+
+    Used only for calls that leave our server. Anything hitting our own
+    process goes through a plain loop instead - see the note at the top.
+    """
+    if not items:
+        return []
+    if len(items) == 1:
+        return [function(items[0])]
+    workers = min(len(items), MAX_PARALLEL_PEERS)
+    with ThreadPoolExecutor(max_workers=workers,
+                            thread_name_prefix="mutual-peer") as pool:
+        return list(pool.map(function, items))
+
+
+# ----------------------------------------------------------------------
+# http
+# ----------------------------------------------------------------------
+
+def _http(url, payload=None):
+    """POST if payload given, else GET. Returns (status, parsed_or_text)."""
+    data = None
+    headers = {"Accept": "application/json",
+               "User-Agent": "aileash-mutual/%s" % VERSION}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=data, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
+            body = response.read().decode("utf-8", "replace")
+            status = response.getcode()
+    except urllib.error.HTTPError as exc:
         try:
-            from urllib.parse import urlparse
-            p = urlparse(self.path).path.rstrip("/") or "/"
+            body = exc.read().decode("utf-8", "replace")
         except Exception:
-            p = self.path or "/"
-        if p in PAGE_PATHS:
-            body = PAGE.encode("utf-8")
-            try:
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Cache-Control", "public, max-age=300")
-                self.send_header("X-Content-Type-Options", "nosniff")
-                self.send_header("Referrer-Policy", "no-referrer")
-                self.end_headers()
-                self.wfile.write(body)
-            except Exception:
-                pass
+            body = ""
+        status = exc.code
+    except urllib.error.URLError as exc:
+        return 0, "unreachable: %s" % exc.reason
+    except Exception as exc:
+        return 0, "failed: %s" % exc
+    try:
+        return status, json.loads(body)
+    except ValueError:
+        return status, body
+
+
+# Field names a tip can arrive under. Different implementations name it
+# differently and being strict about a name we never published is a bug in
+# the receiver, not in the peer. Order is preference, not importance.
+TIP_FIELDS = ("tip", "hash", "head", "tip_sha256", "root", "current_tip",
+              "chain_tip", "latest")
+
+HEIGHT_FIELDS = ("height", "count", "entries", "tree_size", "size")
+
+
+def _extract_tip(body):
+    """Pull (tip, height) out of whatever shape a tip route returns."""
+    if not isinstance(body, dict):
+        return None, None
+    tip = None
+    for field in TIP_FIELDS:
+        value = body.get(field)
+        if isinstance(value, str) and value.strip():
+            tip = value.strip()
+            break
+    height = None
+    for field in HEIGHT_FIELDS:
+        if field in body:
+            height = body.get(field)
+            break
+    return tip, height
+
+
+# ----------------------------------------------------------------------
+# the two directions
+# ----------------------------------------------------------------------
+
+def our_tip():
+    status, body = _http(OUR_TIP_URL)
+    if status != 200:
+        return None, None, "our own tip route answered %s: %s" % (status, str(body)[:200])
+    tip, height = _extract_tip(body)
+    if not tip:
+        return None, None, "no tip field in our own reply: %s" % str(body)[:200]
+    return tip, height, None
+
+
+def push_one(peer, tip, height):
+    """Hand our tip to one peer so they record it. Outbound only.
+
+    A peer with no observe_url is fetch-only by configuration. Say so and
+    move on rather than treating it as a failure - and never index the key
+    blindly, which is what 1.1 did.
+    """
+    observe_url = peer.get("observe_url")
+    if not observe_url:
+        return {
+            "peer": peer["name"],
+            "direction": "push",
+            "skipped": True,
+            "ok": True,
+            "reason": "fetch-only peer - no observe_url configured",
+            "note": ("We read and seal their tip. They do not accept a push, "
+                     "either because their outbound lane is closed or because "
+                     "their tip is a static file. Not an error."),
+        }
+
+    keys = peer.get("keys", DEFAULT_PUSH_KEYS)
+    values = {
+        "chain": OUR_CHAIN_NAME,
+        "tip": tip,
+        "count": height,
+        "ts": _now(),
+        "url": OUR_PUBLIC_URL,
+    }
+    payload = {keys.get(k, k): v for k, v in values.items()}
+    status, body = _http(observe_url, payload)
+    result = {
+        "peer": peer["name"],
+        "direction": "push",
+        "url": observe_url,
+        "http": status,
+        "ok": 200 <= status < 300,
+        "response": body if isinstance(body, (dict, list)) else str(body)[:300],
+    }
+    if status == 401 or status == 403:
+        result["hint"] = "they want auth on that route, or it is not in their public set"
+    elif status == 404:
+        result["hint"] = "wrong path - check observe_url for this peer"
+    elif status == 0:
+        result["hint"] = "could not reach them at all"
+    return result
+
+
+def fetch_one(peer):
+    """Read one peer's current tip. Outbound only - no sealing here.
+
+    Returns a dict that either carries a tip ready to seal, or an error
+    already shaped like a result so it can be returned to the caller as is.
+    """
+    status, body = _http(peer["tip_url"])
+    if status != 200:
+        return {
+            "peer": peer["name"], "direction": "pull", "url": peer["tip_url"],
+            "http": status, "ok": False, "_failed": True,
+            "response": body if isinstance(body, (dict, list)) else str(body)[:300],
+            "hint": "could not read their tip",
+        }
+
+    tip, height = _extract_tip(body)
+    if not tip:
+        return {
+            "peer": peer["name"], "direction": "pull", "url": peer["tip_url"],
+            "http": status, "ok": False, "_failed": True,
+            "response": str(body)[:300],
+            "hint": ("no tip field in their reply - add the field name to "
+                     "TIP_FIELDS. Currently accepted: " + ", ".join(TIP_FIELDS)),
+        }
+
+    return {
+        "peer": peer["name"], "url": peer["tip_url"],
+        "tip": tip, "height": height, "_failed": False,
+        "fetched_at": time.time(),
+    }
+
+
+def seal_one(fetched):
+    """Seal one already-fetched peer tip into our chain.
+
+    Goes through our own public observe route so a tip we pulled is
+    recorded by exactly the same code path as a tip somebody pushed to us.
+    Called in a plain loop, never in parallel - this hits our own server.
+
+    Field names must match what modules/witness.py reads out of the body:
+    chain, tip, peer_ts, url. The url is what makes the observation
+    checkable by a third party rather than taken on our word - it is the
+    address we just fetched this tip from.
+    """
+    seal_status, seal_body = _http(OUR_OBSERVE_URL, {
+        "chain": fetched["peer"],
+        "tip": fetched["tip"],
+        "peer_ts": fetched["fetched_at"],
+        "url": fetched["url"],
+    })
+
+    out = {
+        "peer": fetched["peer"],
+        "direction": "pull",
+        "their_tip": fetched["tip"],
+        "their_height": fetched["height"],
+        "sealed_http": seal_status,
+        "ok": 200 <= seal_status < 300,
+        "response": seal_body if isinstance(seal_body, (dict, list)) else str(seal_body)[:300],
+    }
+    if seal_status in (401, 403):
+        out["hint"] = "our own observe route rejected us - check PUBLIC in modules/witness.py"
+    return out
+
+
+def do_push():
+    tip, height, error = our_tip()
+    if error:
+        return {"ok": False, "error": error}
+
+    # Outbound to everyone at once.
+    results = _in_parallel(lambda peer: push_one(peer, tip, height), PEERS)
+
+    return {
+        "ok": True,
+        "our_tip": tip,
+        "our_height": height,
+        "pushed_to": len([r for r in results if not r.get("skipped")]),
+        "fetch_only": len([r for r in results if r.get("skipped")]),
+        "results": results,
+    }
+
+
+def do_pull():
+    # Phase one: read every peer's tip at the same time. This is the slow
+    # part and none of it touches us.
+    fetched = _in_parallel(fetch_one, PEERS)
+
+    # Phase two: seal what came back, one at a time, into our own chain.
+    results = []
+    for item in fetched:
+        if item.get("_failed"):
+            item.pop("_failed", None)
+            results.append(item)
+            continue
+        results.append(seal_one(item))
+
+    return {"ok": True, "results": results}
+
+
+def do_sync():
+    """Pull first, then push. That order matters: the tip we hand out then
+    already contains the tips we just took in, so the two chains interlock
+    rather than merely sitting alongside each other."""
+    started = time.time()
+    pulled = do_pull()
+    pushed = do_push()
+    result = {
+        "ran_at": _now(),
+        "took_seconds": round(time.time() - started, 2),
+        "peers": len(PEERS),
+        "pull": pulled,
+        "push": pushed,
+        "ok": bool(pulled.get("ok")) and bool(pushed.get("ok")),
+    }
+    with _lock:
+        _state["last_run"] = result["ran_at"]
+        _state["last_result"] = result
+        _state["runs"] += 1
+    return result
+
+
+# ----------------------------------------------------------------------
+# background timer
+# ----------------------------------------------------------------------
+
+def _loop():
+    # Let the server finish coming up before the first run.
+    time.sleep(45)
+    while True:
+        try:
+            do_sync()
+        except Exception:
+            pass
+        time.sleep(AUTO_SYNC_SECONDS)
+
+
+def _start_timer():
+    with _lock:
+        if _state["timer_started"] or not AUTO_SYNC_ENABLED:
             return
-        return original(self)
+        _state["timer_started"] = True
+    thread = threading.Thread(target=_loop, name="mutual-sync", daemon=True)
+    thread.start()
 
-    H.do_GET = do_GET
-    H._page_patched = True
-    _patched[0] = True
-    print("NETWORK: /witness page branch installed at runtime", flush=True)
-    return "installed"
 
+_start_timer()
+
+
+# ----------------------------------------------------------------------
+# router entry point
+# ----------------------------------------------------------------------
 
 def handle(method, action, data, api_key, ctx):
-    s = _srv()
-    if s is None:
-        return {"error": "server_not_found"}, 500
+    action = (action or "").strip("/").lower()
 
-    state = "already installed" if _patched[0] else None
-    if not _patched[0]:
-        try:
-            state = _install(s)
-        except Exception as exc:
-            print("NETWORK: page patch failed - " + str(exc), flush=True)
-            state = "failed: " + str(exc)
+    if method == "GET":
+        if action == "peers":
+            return _reply({
+                "chain": OUR_CHAIN_NAME,
+                "version": VERSION,
+                "peers": [
+                    {"name": p["name"],
+                     "tip_url": p["tip_url"],
+                     "observe_url": p.get("observe_url"),
+                     "direction": ("both" if p.get("observe_url")
+                                   else "fetch-only")}
+                    for p in PEERS
+                ],
+                "parallel_fetch": MAX_PARALLEL_PEERS,
+                "tip_fields_accepted": list(TIP_FIELDS),
+                "note": ("Witnessing is only mutual if both columns are live. "
+                         "A fetch-only peer is one we read and seal but who "
+                         "does not accept a push - either their outbound lane "
+                         "is closed or their tip is a static file. Both are "
+                         "valid; the direction is published rather than "
+                         "implied."),
+            })
+        if action == "status":
+            with _lock:
+                return _reply({
+                    "version": VERSION,
+                    "auto_sync": AUTO_SYNC_ENABLED,
+                    "interval_seconds": AUTO_SYNC_SECONDS,
+                    "timer_running": _state["timer_started"],
+                    "parallel_fetch": MAX_PARALLEL_PEERS,
+                    "runs": _state["runs"],
+                    "last_run": _state["last_run"],
+                    "last_result": _state["last_result"],
+                })
 
-    if method == "GET" and (action or "") in ("", "status"):
-        return {
-            "page": "/witness",
-            "installed": bool(_patched[0]),
-            "install_result": state,
-            "paths": list(PAGE_PATHS),
-            "version": VERSION,
-            "note": "The page reads /x/witness/tip and /x/witness/peers from the browser. It holds no data of its own.",
-        }, 200
+    if method == "POST":
+        if action == "push":
+            return _reply(do_push())
+        if action == "pull":
+            return _reply(do_pull())
+        if action == "sync":
+            return _reply(do_sync())
 
-    return {"error": "unknown_action", "action": action,
-            "GET": ["status"]}, 404
+    return _reply({
+        "error": "unknown action",
+        "GET": ["peers", "status"],
+        "POST": ["push", "pull", "sync"],
+    }, 404)
 
 ```
