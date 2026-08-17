@@ -2,7 +2,6 @@
 
 Contains:
 - `modules/network.py`
-- `modules/ots.py`
 - `modules/oversight.py`
 - `modules/pack.py`
 - `modules/packconsole.py`
@@ -501,16 +500,6 @@ def handle(method, action, data, api_key, ctx):
 
     return {"error": "unknown_action", "action": action,
             "GET": ["status"]}, 404
-
-```
-
-
-## `modules/ots.py`
-
-2 lines, 1 bytes
-
-```python
-
 
 ```
 
