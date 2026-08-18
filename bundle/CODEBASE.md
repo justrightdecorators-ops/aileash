@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-106 files across 21 parts.
+105 files across 21 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -91,13 +91,12 @@ Generated automatically on every push. Do not edit by hand.
 - `meshwitness.py`
 - `sebbi_orchestrator.py`
 - `sebdog_engine.py`
-- `sebdog_licence.py`
 - `sebdog_reporter.py`
 - `tests/attack_continuity_1.py`
+- `tests/attack_continuity_2.py`
 
 ## [CODEBASE-13.md](CODEBASE-13.md)
 
-- `tests/attack_continuity_2.py`
 - `tests/attack_continuity_3.py`
 - `tests/attack_continuity_4.py`
 - `tests/attack_continuity_5.py`
@@ -110,19 +109,19 @@ Generated automatically on every push. Do not edit by hand.
 - `admin.html`
 - `ai-standard.html`
 - `ai-txt-kit.html`
+- `aitxt-popup-live.html`
 
 ## [CODEBASE-14.md](CODEBASE-14.md)
 
-- `aitxt-popup-live.html`
 - `brain.html`
 - `certificate.html`
 - `compliance-assistant.html`
 - `contact.html`
 - `copyright.txt`
+- `data-protection.html`
 
 ## [CODEBASE-15.md](CODEBASE-15.md)
 
-- `data-protection.html`
 - `developers.html`
 - `dis.txt`
 - `docs/evidential-undertaking.md`
