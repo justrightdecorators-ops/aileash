@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-104 files across 21 parts.
+105 files across 21 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -51,6 +51,7 @@ Generated automatically on every push. Do not edit by hand.
 ## [CODEBASE-08.md](CODEBASE-08.md)
 
 - `modules/replay.py`
+- `modules/roster.py`
 - `modules/router.py`
 - `modules/rulebind.py`
 - `modules/savings.py`
