@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-104 files across 21 parts.
+105 files across 21 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -59,23 +59,24 @@ Generated automatically on every push. Do not edit by hand.
 ## [CODEBASE-09.md](CODEBASE-09.md)
 
 - `modules/selfcheck.py`
+- `modules/signed.py`
 - `modules/spec.py`
 - `modules/standard.py`
 - `modules/stats.py`
-- `modules/verifier.py`
 
 ## [CODEBASE-10.md](CODEBASE-10.md)
 
+- `modules/verifier.py`
 - `modules/witness.py`
 - `modules/witnessed.py`
 - `Verify_ai.py`
 - `ai_act_ranker.py`
-- `ai_safety_scanner.py`
-- `aigrade_insert.py`
-- `aileash_reporter.py`
 
 ## [CODEBASE-11.md](CODEBASE-11.md)
 
+- `ai_safety_scanner.py`
+- `aigrade_insert.py`
+- `aileash_reporter.py`
 - `aileash_verify.py`
 - `anchor.py`
 - `board_auditor.py`
@@ -83,11 +84,11 @@ Generated automatically on every push. Do not edit by hand.
 - `broadcaster.py`
 - `build_sebbi_ecosystem.py`
 - `gateway_proxy.py`
-- `meshwitness.py`
-- `sebbi_orchestrator.py`
 
 ## [CODEBASE-12.md](CODEBASE-12.md)
 
+- `meshwitness.py`
+- `sebbi_orchestrator.py`
 - `sebdog_engine.py`
 - `sebdog_licence.py`
 - `sebdog_reporter.py`
@@ -96,11 +97,11 @@ Generated automatically on every push. Do not edit by hand.
 - `tests/attack_continuity_3.py`
 - `tests/attack_continuity_4.py`
 - `tests/attack_continuity_5.py`
-- `tests/attack_continuity_6.py`
-- `tests/attack_witnessed.py`
 
 ## [CODEBASE-13.md](CODEBASE-13.md)
 
+- `tests/attack_continuity_6.py`
+- `tests/attack_witnessed.py`
 - `verify_authority.py`
 - `AILeash-API-Reference-v6.4.2.md`
 - `LICENCE`
