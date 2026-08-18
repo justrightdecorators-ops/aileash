@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-105 files across 21 parts.
+106 files across 21 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -77,16 +77,17 @@ Generated automatically on every push. Do not edit by hand.
 - `ai_safety_scanner.py`
 - `aigrade_insert.py`
 - `aileash_reporter.py`
+- `aileash_signed_client.py`
 - `aileash_verify.py`
 - `anchor.py`
 - `board_auditor.py`
 - `brain.py`
 - `broadcaster.py`
 - `build_sebbi_ecosystem.py`
-- `gateway_proxy.py`
 
 ## [CODEBASE-12.md](CODEBASE-12.md)
 
+- `gateway_proxy.py`
 - `meshwitness.py`
 - `sebbi_orchestrator.py`
 - `sebdog_engine.py`
@@ -95,11 +96,11 @@ Generated automatically on every push. Do not edit by hand.
 - `tests/attack_continuity_1.py`
 - `tests/attack_continuity_2.py`
 - `tests/attack_continuity_3.py`
-- `tests/attack_continuity_4.py`
-- `tests/attack_continuity_5.py`
 
 ## [CODEBASE-13.md](CODEBASE-13.md)
 
+- `tests/attack_continuity_4.py`
+- `tests/attack_continuity_5.py`
 - `tests/attack_continuity_6.py`
 - `tests/attack_witnessed.py`
 - `verify_authority.py`
@@ -110,10 +111,10 @@ Generated automatically on every push. Do not edit by hand.
 - `ai-standard.html`
 - `ai-txt-kit.html`
 - `aitxt-popup-live.html`
-- `brain.html`
 
 ## [CODEBASE-14.md](CODEBASE-14.md)
 
+- `brain.html`
 - `certificate.html`
 - `compliance-assistant.html`
 - `contact.html`

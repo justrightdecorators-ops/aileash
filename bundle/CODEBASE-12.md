@@ -1,6 +1,7 @@
 # Codebase — part 12 of 21
 
 Contains:
+- `gateway_proxy.py`
 - `meshwitness.py`
 - `sebbi_orchestrator.py`
 - `sebdog_engine.py`
@@ -9,8 +10,294 @@ Contains:
 - `tests/attack_continuity_1.py`
 - `tests/attack_continuity_2.py`
 - `tests/attack_continuity_3.py`
-- `tests/attack_continuity_4.py`
-- `tests/attack_continuity_5.py`
+
+
+## `gateway_proxy.py`
+
+280 lines, 10922 bytes
+
+```python
+import asyncio
+import ssl
+import json
+import hmac
+import hashlib
+import os
+import time
+import logging
+import urllib.request
+import urllib.error
+
+# ============================================================
+# AILEASH GATEWAY PROXY - real enforcement version
+#
+# How it's meant to be used:
+#   Customer changes their AI SDK's base URL from
+#     https://api.openai.com/v1
+#   to
+#     https://your-gateway-domain/openai/v1
+#   (same for Anthropic under /anthropic/)
+#
+# Every request that arrives:
+#   1. Gets scored by your real /api/govern endpoint (same
+#      scoring + sealing logic as server.py - nothing duplicated).
+#   2. If the decision is BLOCK, the request is rejected here.
+#      The real OpenAI/Anthropic call is NEVER made. That's the
+#      actual gate - not an email sent after the fact.
+#   3. If ALLOW or CHALLENGE, the request is forwarded to the
+#      real provider over a real TLS connection, and the real
+#      response is streamed back untouched.
+#
+# This does NOT intercept traffic the customer sends directly
+# to openai.com without going through this gateway. No proxy
+# that doesn't install certificates on every device can do that
+# for HTTPS traffic - that's a much bigger, separate product.
+# This is the same integration pattern used by every commercial
+# AI gateway (Cloudflare AI Gateway, Portkey, LiteLLM proxy, etc).
+# ============================================================
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [GATEWAY] %(message)s")
+
+PROXY_PORT = int(os.environ.get("GATEWAY_PORT", 8888))
+
+# No fallback key. If this isn't set, refuse to start rather than
+# run with a guessable signing key in production.
+PROXY_SIGNING_KEY = os.environ.get("SEBBI_PROXY_SECRET", "").strip()
+if not PROXY_SIGNING_KEY:
+    raise SystemExit(
+        "SEBBI_PROXY_SECRET is not set. Refusing to start - "
+        "running with a default/fallback signing key is not safe. "
+        "Set SEBBI_PROXY_SECRET in your environment (Railway variables) and restart."
+    )
+PROXY_SIGNING_KEY = PROXY_SIGNING_KEY.encode("utf-8")
+
+# Where your real scoring/sealing engine lives. Point this at your
+# own deployment - defaults to the live sebbi.pro API.
+GOVERN_URL = os.environ.get("AILEASH_GOVERN_URL", "https://sebbi.pro/api/govern")
+
+# Which real AI providers this gateway can forward to, and their
+# real hostnames. Add more here if you support more providers.
+PROVIDERS = {
+    "openai": "api.openai.com",
+    "anthropic": "api.anthropic.com",
+}
+
+
+def call_govern(ailleash_key: str, event: dict):
+    """Call the real /api/govern endpoint and return (decision_json, http_status).
+    This is a blocking network call - run it in a thread executor so it
+    doesn't stall the async event loop."""
+    body = json.dumps(event).encode("utf-8")
+    req = urllib.request.Request(
+        GOVERN_URL,
+        data=body,
+        headers={
+            "Authorization": "Bearer " + ailleash_key,
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return json.loads(r.read()), r.status
+    except urllib.error.HTTPError as e:
+        try:
+            return json.loads(e.read()), e.code
+        except Exception:
+            return {"decision": "BLOCK", "error": "govern_returned_unreadable_error"}, e.code
+    except Exception as e:
+        # Network failure, timeout, DNS issue, etc. Fail closed - if we
+        # can't reach the compliance engine, we don't guess ALLOW.
+        return {"decision": "BLOCK", "error": "govern_unreachable: " + str(e)}, 503
+
+
+def parse_request(raw_head: bytes):
+    """Parse the request line + headers from the raw bytes read up to \\r\\n\\r\\n."""
+    text = raw_head.decode("utf-8", errors="ignore")
+    lines = text.split("\r\n")
+    request_line = lines[0]
+    parts = request_line.split(" ")
+    method = parts[0] if len(parts) > 0 else "GET"
+    path = parts[1] if len(parts) > 1 else "/"
+    headers = {}
+    for line in lines[1:]:
+        if not line or ":" not in line:
+            continue
+        k, _, v = line.partition(":")
+        headers[k.strip().lower()] = v.strip()
+    return method, path, headers
+
+
+def build_forward_request(method, upstream_path, headers, body: bytes, upstream_host):
+    """Rebuild the HTTP request to send to the real provider. Strips our
+    own gateway-only headers and sets the correct Host."""
+    drop = {"host", "x-sebbi-key", "x-sebbi-event", "content-length"}
+    lines = [method + " " + upstream_path + " HTTP/1.1", "Host: " + upstream_host]
+    for k, v in headers.items():
+        if k in drop:
+            continue
+        lines.append(k + ": " + v)
+    lines.append("Content-Length: " + str(len(body)))
+    lines.append("Connection: close")
+    head = ("\r\n".join(lines) + "\r\n\r\n").encode("utf-8")
+    return head + body
+
+
+async def read_full_request(reader):
+    """Read headers, then read exactly Content-Length bytes of body if present."""
+    head = await reader.readuntil(b"\r\n\r\n")
+    method, path, headers = parse_request(head)
+    length = int(headers.get("content-length", "0") or "0")
+    body = b""
+    if length:
+        body = await reader.readexactly(length)
+    return method, path, headers, body
+
+
+async def forward_to_provider(upstream_host, request_bytes: bytes):
+    """Open a real TLS connection to the real provider and return the raw
+    response bytes, unmodified."""
+    ctx = ssl.create_default_context()
+    reader, writer = await asyncio.open_connection(upstream_host, 443, ssl=ctx)
+    try:
+        writer.write(request_bytes)
+        await writer.drain()
+        response = await reader.read(-1)
+        return response
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
+def default_event(headers, device_id_fallback):
+    """Build a sensible /api/govern event from what the customer sent,
+    falling back to safe defaults for anything they didn't specify.
+    Customers can override any field by sending an X-Sebbi-Event JSON header."""
+    override = headers.get("x-sebbi-event")
+    if override:
+        try:
+            ev = json.loads(override)
+        except Exception:
+            ev = {}
+    else:
+        ev = {}
+    ev.setdefault("user_id", headers.get("x-sebbi-user", "gateway_anonymous"))
+    ev.setdefault("action", "ai_request")
+    ev.setdefault("amount", 0)
+    ev.setdefault("country", headers.get("x-sebbi-country", "UK"))
+    ev.setdefault("device_id", headers.get("x-sebbi-device", device_id_fallback))
+    ev.setdefault("anomaly", 0)
+    ev.setdefault("device_risk", 0)
+    return ev
+
+
+class ComplianceGatewayProxy:
+    def __init__(self, host="0.0.0.0", port=PROXY_PORT):
+        self.host = host
+        self.port = port
+
+    async def start(self):
+        server = await asyncio.start_server(self.handle_client_traffic, self.host, self.port)
+        logging.info("AILeash Gateway operational on :%s (real enforcement, real forwarding)", self.port)
+        async with server:
+            await server.serve_forever()
+
+    async def handle_client_traffic(self, reader, writer):
+        peer = writer.get_extra_info("peername")
+        try:
+            method, path, headers, body = await read_full_request(reader)
+        except Exception as e:
+            logging.warning("Bad request from %s: %s", peer, e)
+            writer.close()
+            return
+
+        try:
+            # Route: /openai/... or /anthropic/... selects the real provider.
+            segments = path.strip("/").split("/", 1)
+            provider_key = segments[0] if segments else ""
+            upstream_path = "/" + segments[1] if len(segments) > 1 else "/"
+
+            if provider_key not in PROVIDERS:
+                self._reject(writer, 404, "unknown_provider",
+                              "Path must start with /openai/ or /anthropic/")
+                return
+
+            ailleash_key = headers.get("x-sebbi-key", "")
+            if not ailleash_key:
+                self._reject(writer, 401, "missing_compliance_key",
+                              "Include your AILeash API key in the X-Sebbi-Key header.")
+                return
+
+            device_id_fallback = str(peer[0]) if peer else "unknown_device"
+            event = default_event(headers, device_id_fallback)
+
+            loop = asyncio.get_event_loop()
+            decision_json, status = await loop.run_in_executor(
+                None, call_govern, ailleash_key, event
+            )
+            decision = decision_json.get("decision", "BLOCK")
+
+            if status != 200 or decision == "BLOCK":
+                logging.warning("[BLOCKED] %s -> %s (%s)", peer, provider_key, decision_json.get("reasons", decision_json.get("error", "")))
+                self._reject(writer, 403, "compliance_block", None, decision_json)
+                return
+
+            # ALLOW or CHALLENGE both proceed - CHALLENGE just means the
+            # customer's own code should show the user the verification
+            # link included in decision_json. We don't invent enforcement
+            # server.py doesn't have.
+            upstream_host = PROVIDERS[provider_key]
+            forward_bytes = build_forward_request(method, upstream_path, headers, body, upstream_host)
+
+            real_response = await forward_to_provider(upstream_host, forward_bytes)
+
+            tx_seal = hmac.new(PROXY_SIGNING_KEY, real_response[:2048], hashlib.sha256).hexdigest()
+            logging.info("[ROUTED] %s -> %s decision=%s seal=%s", peer, provider_key, decision, tx_seal[:16])
+
+            writer.write(real_response)
+            await writer.drain()
+
+        except Exception as e:
+            logging.error("Proxy error for %s: %s", peer, e)
+            try:
+                self._reject(writer, 502, "gateway_error", str(e))
+            except Exception:
+                pass
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    def _reject(self, writer, code, reason, message=None, extra=None):
+        payload = {"error": reason}
+        if message:
+            payload["message"] = message
+        if extra:
+            payload["compliance_decision"] = extra
+        body = json.dumps(payload).encode("utf-8")
+        status_text = {401: "Unauthorized", 403: "Forbidden", 404: "Not Found", 502: "Bad Gateway"}.get(code, "Error")
+        resp = (
+            "HTTP/1.1 " + str(code) + " " + status_text + "\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: " + str(len(body)) + "\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode("utf-8") + body
+        writer.write(resp)
+
+
+if __name__ == "__main__":
+    gateway = ComplianceGatewayProxy()
+    try:
+        asyncio.run(gateway.start())
+    except KeyboardInterrupt:
+        logging.info("Gateway offline.")
+
+```
 
 
 ## `meshwitness.py`
@@ -2366,245 +2653,6 @@ check("the trace flags the altered hop by name",
 r,_ = lineage._evaluate(ctx,"k",{"grant":"m","action":"payments.refund",
     "params":{"amount":50},"purpose_tag":"refunds"})
 check("and the exercise names the exact grant that broke", r["broken_at"] == "m", r["broken_at"])
-
-print("\n" + "="*60)
-print("passed %d, failed %d" % (len(PASS), len(FAIL)))
-for f in FAIL: print("  FAILED: "+f)
-sys.exit(1 if FAIL else 0)
-
-```
-
-
-## `tests/attack_continuity_4.py`
-
-107 lines, 4723 bytes
-
-```python
-#!/usr/bin/env python3
-"""Fourth wave: does it actually compose with the existing engine, and can
-either side be bypassed by the other?"""
-import hashlib, json, sqlite3, threading, time, sys, types
-import continuity as C
-
-PASS, FAIL = [], []
-NOW, HOUR = time.time(), 3600
-STATE = {"verdict": "ALLOW", "raises": False, "shape": "dict", "seen": []}
-
-def install(verdict="ALLOW", raises=False, shape="dict"):
-    STATE.update(verdict=verdict, raises=raises, shape=shape)
-    m = types.ModuleType("server")
-    m.get_bearer = lambda *a, **k: None
-    def score_event(event):
-        STATE["seen"].append(event)
-        if STATE["raises"]: raise RuntimeError("engine down")
-        if STATE["shape"] == "dict": return {"decision": STATE["verdict"], "score": 0.42}
-        if STATE["shape"] == "tuple": return (STATE["verdict"], 0.42)
-        if STATE["shape"] == "junk": return {"nothing": "useful"}
-        return STATE["verdict"]
-    m.score_event = score_event
-    sys.modules["server"] = m
-
-def make_ctx():
-    conn = sqlite3.connect(":memory:", check_same_thread=False)
-    lock = threading.RLock(); n = {"i":0}
-    def seal(ev,res,ts,k):
-        n["i"] += 1
-        return hashlib.sha256(json.dumps([ev,res,ts],sort_keys=True,default=str).encode()).hexdigest(), n["i"], n["i"]
-    C._ready = False
-    ctx = {"conn":conn,"lock":lock,"seal":seal}; C._setup(ctx); return ctx
-
-def check(n,c,d=""):
-    (PASS if c else FAIL).append(n)
-    print(("  ok   " if c else "  FAIL ")+n+(("  -> "+str(d)[:250]) if d and not c else ""))
-
-def setup():
-    ctx = make_ctx()
-    C._issue(ctx,"k",dict(id="root",issuer="owner@example.com",issuer_kind="human",
-        subject="agent",scope=["payments.refund"],
-        constraints={"max_amount":5000,"allowed_currency":["GBP"]},
-        purpose="refunds",purpose_tags=["refunds"],not_after=NOW+HOUR,delegations_left=0))
-    return ctx
-
-def run(ctx, amount=100):
-    return C._evaluate(ctx,"k",{"grant":"root","action":"payments.refund",
-        "params":{"amount":amount,"currency":"GBP"},"purpose_tag":"refunds"})[0]
-
-print("\n=== 30. the engine is actually consulted ===")
-install("ALLOW"); STATE["seen"] = []
-r = run(setup())
-check("a clean authority plus a clean engine is ALLOW", r["verdict"]=="ALLOW", r)
-check("the engine was called with the real action and amount",
-      STATE["seen"] and STATE["seen"][-1]["action"]=="payments.refund"
-      and STATE["seen"][-1]["amount"]==100, STATE["seen"][-1] if STATE["seen"] else None)
-check("both components are reported separately",
-      r["authority_verdict"]=="ALLOW" and r["risk_verdict"]=="ALLOW", r)
-
-print("\n=== 31. neither side can wave the other through ===")
-install("BLOCK")
-r = run(setup())
-check("perfect authority does not survive an engine BLOCK", r["verdict"]=="BLOCK", r)
-check("the authority component still reads ALLOW underneath it",
-      r["authority_verdict"]=="ALLOW", r)
-install("CHALLENGE")
-r = run(setup())
-check("an engine CHALLENGE lifts a clean authority to CHALLENGE", r["verdict"]=="CHALLENGE", r)
-install("ALLOW")
-ctx = setup()
-r = C._evaluate(ctx,"k",{"grant":"root","action":"payments.transfer",
-    "params":{"amount":1},"purpose_tag":"refunds"})[0]
-check("a clean engine does not confer authority nobody granted", r["verdict"]=="BLOCK", r)
-check("and the engine is not even asked once authority has failed",
-      r["risk_engine"]["available"] is False, r["risk_engine"])
-
-print("\n=== 32. a missing or broken engine is not an ALLOW ===")
-install("ALLOW", raises=True)
-r = run(setup())
-check("an engine that throws downgrades ALLOW to CHALLENGE", r["verdict"]=="CHALLENGE", r)
-install("ALLOW", shape="junk")
-r = run(setup())
-check("an unreadable engine response downgrades to CHALLENGE", r["verdict"]=="CHALLENGE", r)
-sys.modules.pop("server", None); sys.modules.pop("__main__", None)
-r = run(setup())
-check("no engine present downgrades to CHALLENGE", r["verdict"]=="CHALLENGE", r)
-check("the reason names the missing engine",
-      any("risk engine" in x for x in r["reasons"]), r["reasons"])
-
-print("\n=== 33. it reads the engine's other return shapes ===")
-for shape in ("dict","tuple","str"):
-    install("BLOCK", shape=shape)
-    r = run(setup())
-    check("a %s return shape is understood" % shape, r["verdict"]=="BLOCK", r["risk_engine"])
-
-print("\n=== 34. an engine BLOCK cannot be executed ===")
-install("BLOCK")
-ctx = setup(); r = run(ctx)
-c,_ = C._confirm(ctx,"k",{"evaluation":r["evaluation"],"action":"payments.refund",
-    "params":{"amount":100,"currency":"GBP"}})
-check("execution is refused when the engine blocked", c["bound"] is False, c)
-
-print("\n" + "="*60)
-print("passed %d, failed %d" % (len(PASS), len(FAIL)))
-for f in FAIL: print("  FAILED: "+f)
-sys.exit(1 if FAIL else 0)
-
-```
-
-
-## `tests/attack_continuity_5.py`
-
-116 lines, 5639 bytes
-
-```python
-#!/usr/bin/env python3
-"""Fifth wave: risk acceptance. Who put their name to this capability
-existing at all - separately from who granted it and who holds it."""
-import hashlib, json, sqlite3, threading, time, sys, types
-import continuity as C
-
-PASS, FAIL = [], []
-NOW, HOUR = time.time(), 3600
-
-def install():
-    m = types.ModuleType("server")
-    m.get_bearer = lambda *a, **k: None
-    m.score_event = lambda e: {"decision": "ALLOW", "score": 0.1}
-    sys.modules["server"] = m
-install()
-
-def make_ctx():
-    conn = sqlite3.connect(":memory:", check_same_thread=False)
-    lock = threading.RLock(); n = {"i":0}
-    def seal(ev,res,ts,k):
-        n["i"] += 1
-        return hashlib.sha256(json.dumps([ev,res,ts],sort_keys=True,default=str).encode()).hexdigest(), n["i"], n["i"]
-    C._ready = False
-    ctx = {"conn":conn,"lock":lock,"seal":seal}; C._setup(ctx); return ctx
-
-def check(n,c,d=""):
-    (PASS if c else FAIL).append(n)
-    print(("  ok   " if c else "  FAIL ")+n+(("  -> "+str(d)[:250]) if d and not c else ""))
-
-def root(ctx, **over):
-    args = dict(id="root", issuer="owner@example.com", issuer_kind="human",
-                subject="orchestrator", scope=["payments.refund"],
-                constraints={"max_amount":5000}, purpose="refunds",
-                purpose_tags=["refunds"], not_after=NOW+HOUR, delegations_left=3)
-    args.update(over)
-    return C._issue(ctx,"k",args)
-
-print("\n=== 35. a root accepts its own risk by default ===")
-ctx = make_ctx()
-r, code = root(ctx)
-check("a root grant records an acceptor without being asked",
-      code == 200 and r["risk_accepted_by"] == "owner@example.com", r)
-r2, _ = root(ctx, id="root2", risk_accepted_by="risk.officer@example.com")
-check("a root can name someone other than the issuer",
-      r2["risk_accepted_by"] == "risk.officer@example.com", r2)
-
-print("\n=== 36. switching on onward delegation needs a name ===")
-ctx = make_ctx(); root(ctx)
-r, code = C._issue(ctx,"k",dict(id="deleg", parent="root", issuer="orchestrator",
-    issuer_kind="agent", subject="b", scope=["payments.refund"],
-    constraints={"max_amount":100}, purpose="refunds", purpose_tags=["refunds"],
-    not_after=NOW+HOUR, delegations_left=1))
-check("a delegable child with no acceptor is refused",
-      code == 409 and r.get("error") == "risk_acceptance_required", r)
-
-r, code = C._issue(ctx,"k",dict(id="leaf", parent="root", issuer="orchestrator",
-    issuer_kind="agent", subject="b", scope=["payments.refund"],
-    constraints={"max_amount":100}, purpose="refunds", purpose_tags=["refunds"],
-    not_after=NOW+HOUR, delegations_left=0))
-check("a non-delegable child inherits the acceptor above it", code == 200, r)
-
-r, code = C._issue(ctx,"k",dict(id="deleg2", parent="root", issuer="orchestrator",
-    issuer_kind="agent", subject="b", scope=["payments.refund"],
-    constraints={"max_amount":100}, purpose="refunds", purpose_tags=["refunds"],
-    not_after=NOW+HOUR, delegations_left=1, risk_accepted_by="head.of.ops@example.com"))
-check("a delegable child with a named acceptor is accepted", code == 200, r)
-
-print("\n=== 37. the decision names the accountable person ===")
-e, _ = C._evaluate(ctx,"k",{"grant":"leaf","action":"payments.refund",
-    "params":{"amount":10},"purpose_tag":"refunds"})
-check("an evaluation reports who accepts the risk",
-      e["risk_accepted_by"] == "owner@example.com", e.get("risk_accepted_by"))
-check("...separately from who authorised it and who executed it",
-      e["authorised_by"] == "owner@example.com" and e["executed_by"] == "b", e)
-
-e2, _ = C._evaluate(ctx,"k",{"grant":"deleg2","action":"payments.refund",
-    "params":{"amount":10},"purpose_tag":"refunds"})
-check("the nearest acceptor wins, not the root one",
-      e2["risk_accepted_by"] == "head.of.ops@example.com", e2.get("risk_accepted_by"))
-
-t, _ = C._trace(ctx,{"grant":"deleg2"})
-check("the trace shows the acceptor at each hop",
-      t["risk_accepted_by"] == "head.of.ops@example.com" and
-      t["lineage"][0]["risk_accepted_by"] == "owner@example.com", t)
-
-print("\n=== 38. an unaccepted lineage cannot act ===")
-ctx = make_ctx(); root(ctx)
-C._issue(ctx,"k",dict(id="leaf", parent="root", issuer="orchestrator",
-    issuer_kind="agent", subject="b", scope=["payments.refund"],
-    constraints={"max_amount":100}, purpose="refunds", purpose_tags=["refunds"],
-    not_after=NOW+HOUR, delegations_left=0))
-with ctx["lock"]:
-    ctx["conn"].execute("UPDATE auth_grant SET risk_accepted_by=NULL")
-    ctx["conn"].commit()
-e, _ = C._evaluate(ctx,"k",{"grant":"leaf","action":"payments.refund",
-    "params":{"amount":10},"purpose_tag":"refunds"})
-check("stripping every acceptor blocks the action", e["verdict"] == "BLOCK", e["reasons"])
-check("...and says an incident would have no accountable person",
-      any("accountable" in x for x in e["reasons"]), e["reasons"])
-
-print("\n=== 39. the acceptor cannot be swapped after the fact ===")
-ctx = make_ctx(); root(ctx, risk_accepted_by="risk.officer@example.com")
-with ctx["lock"]:
-    ctx["conn"].execute("UPDATE auth_grant SET risk_accepted_by='someone.else@example.com' WHERE id='root'")
-    ctx["conn"].commit()
-e, _ = C._evaluate(ctx,"k",{"grant":"root","action":"payments.refund",
-    "params":{"amount":10},"purpose_tag":"refunds"})
-check("editing who accepted the risk fails the digest", e["verdict"] == "BLOCK", e["reasons"])
-check("...reported as an evidence failure, naming the grant",
-      e["broken_invariant"] == "evidence_continuity" and e["broken_at"] == "root", e)
 
 print("\n" + "="*60)
 print("passed %d, failed %d" % (len(PASS), len(FAIL)))
