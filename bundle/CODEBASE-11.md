@@ -1,6 +1,9 @@
 # Codebase — part 11 of 21
 
 Contains:
+- `ai_safety_scanner.py`
+- `aigrade_insert.py`
+- `aileash_reporter.py`
 - `aileash_verify.py`
 - `anchor.py`
 - `board_auditor.py`
@@ -8,8 +11,565 @@ Contains:
 - `broadcaster.py`
 - `build_sebbi_ecosystem.py`
 - `gateway_proxy.py`
-- `meshwitness.py`
-- `sebbi_orchestrator.py`
+
+
+## `ai_safety_scanner.py`
+
+167 lines, 5700 bytes
+
+```python
+"""
+AI-Safety Grade Scanner
+Checks a domain's .well-known/ files and public root files against the
+emerging AI-safety/AI-transparency file conventions, and returns a
+letter grade (A-F) plus an embeddable badge.
+
+Drop into your existing FastAPI server.py as a router, or run standalone.
+Requires: fastapi, httpx  (pip install fastapi httpx --break-system-packages)
+"""
+
+from fastapi import APIRouter, Query
+from fastapi.responses import JSONResponse, Response
+import httpx
+import xml.etree.ElementTree as ET
+
+router = APIRouter()
+
+TIMEOUT = 6.0
+UA_HUMAN = "Mozilla/5.0 (compatible; AILeashScanner/1.0; +https://sebbi.pro/check)"
+UA_AGENT = "AILeash-Agent-Check/1.0 (+https://sebbi.pro/check)"
+
+CHECKS = [
+    # (key, path, points, validator_name)
+    ("ai_safety",  "/.well-known/ai-safety.txt", 20, "check_ai_safety"),
+    ("security",   "/.well-known/security.txt",  15, "check_security"),
+    ("robots",     "/robots.txt",                10, "check_robots"),
+    ("sitemap",    "/sitemap.xml",                10, "check_sitemap"),
+    ("ai_txt",     "/.well-known/ai.txt",         15, "check_present"),
+    ("comply",     "/.well-known/comply.txt",     15, "check_present"),
+    ("llms",       "/llms.txt",                   10, "check_present"),
+]
+RENDERING_POINTS = 5
+MAX_SCORE = sum(c[2] for c in CHECKS) + RENDERING_POINTS  # 100
+
+
+async def fetch(client: httpx.AsyncClient, url: str, ua: str = UA_HUMAN):
+    try:
+        r = await client.get(url, timeout=TIMEOUT, headers={"User-Agent": ua}, follow_redirects=True)
+        if r.status_code == 200:
+            return r.text
+    except Exception:
+        pass
+    return None
+
+
+def check_present(text):
+    return bool(text and text.strip())
+
+
+def check_ai_safety(text):
+    if not text:
+        return False
+    lower = text.lower()
+    return "ai-safe:" in lower and "true" in lower
+
+
+def check_security(text):
+    if not text:
+        return False
+    lower = text.lower()
+    return "contact:" in lower and "expires:" in lower
+
+
+def check_robots(text):
+    return bool(text and text.strip())
+
+
+def check_sitemap(text):
+    if not text:
+        return False
+    try:
+        ET.fromstring(text)
+        return True
+    except ET.ParseError:
+        return False
+
+
+VALIDATORS = {
+    "check_ai_safety": check_ai_safety,
+    "check_security": check_security,
+    "check_robots": check_robots,
+    "check_sitemap": check_sitemap,
+    "check_present": check_present,
+}
+
+
+def grade_from_score(score: int) -> str:
+    if score >= 90:
+        return "A"
+    if score >= 75:
+        return "B"
+    if score >= 60:
+        return "C"
+    if score >= 40:
+        return "D"
+    return "F"
+
+
+GRADE_COLOR = {"A": "#7fe3b0", "B": "#a8d95f", "C": "#c9a84c", "D": "#ff9a4a", "F": "#ff8a80"}
+
+
+@router.get("/check")
+async def check_domain(domain: str = Query(..., description="Domain to check, e.g. example.com")):
+    domain = domain.strip().lower().replace("https://", "").replace("http://", "").rstrip("/")
+    base = f"https://{domain}"
+
+    results = {}
+    score = 0
+
+    async with httpx.AsyncClient() as client:
+        for key, path, points, validator_name in CHECKS:
+            text = await fetch(client, base + path)
+            passed = VALIDATORS[validator_name](text)
+            results[key] = {"path": path, "found": bool(text), "passed": passed, "points": points if passed else 0}
+            if passed:
+                score += points
+
+        # basic consistent-rendering check: compare human UA vs agent UA on homepage
+        human_body = await fetch(client, base, UA_HUMAN)
+        agent_body = await fetch(client, base, UA_AGENT)
+        rendering_ok = bool(human_body) and bool(agent_body) and (len(human_body) > 0 and len(agent_body) > 0)
+        # crude similarity check — same length within 10% as a proxy for "not obviously cloaked"
+        if human_body and agent_body:
+            ratio = min(len(human_body), len(agent_body)) / max(len(human_body), len(agent_body), 1)
+            rendering_ok = ratio > 0.9
+        results["consistent_rendering"] = {"passed": rendering_ok, "points": RENDERING_POINTS if rendering_ok else 0}
+        if rendering_ok:
+            score += RENDERING_POINTS
+
+    grade = grade_from_score(score)
+
+    return JSONResponse({
+        "domain": domain,
+        "score": score,
+        "max_score": MAX_SCORE,
+        "grade": grade,
+        "checks": results,
+        "verified_by": "sebbi.pro",
+        "badge_url": f"https://sebbi.pro/check/badge?domain={domain}",
+        "report_url": f"https://sebbi.pro/check?domain={domain}",
+    })
+
+
+@router.get("/check/badge")
+async def check_badge(domain: str = Query(...)):
+    """Returns an embeddable SVG badge, e.g. <img src="https://sebbi.pro/check/badge?domain=example.com">"""
+    domain = domain.strip().lower().replace("https://", "").replace("http://", "").rstrip("/")
+    base = f"https://{domain}"
+
+    score = 0
+    async with httpx.AsyncClient() as client:
+        for key, path, points, validator_name in CHECKS:
+            text = await fetch(client, base + path)
+            if VALIDATORS[validator_name](text):
+                score += points
+
+    grade = grade_from_score(score)
+    color = GRADE_COLOR[grade]
+
+    svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="180" height="20">
+  <rect width="120" height="20" fill="#0a0f1e"/>
+  <rect x="120" width="60" height="20" fill="{color}"/>
+  <text x="60" y="14" fill="#fff" font-family="Verdana,sans-serif" font-size="11" text-anchor="middle">AI-Safety Grade</text>
+  <text x="150" y="14" fill="#0a0f1e" font-family="Verdana,sans-serif" font-size="12" font-weight="bold" text-anchor="middle">{grade}</text>
+</svg>'''
+    return Response(content=svg, media_type="image/svg+xml")
+
+```
+
+
+## `aigrade_insert.py`
+
+136 lines, 5663 bytes
+
+```python
+# ============================================================
+# AI-SAFETY GRADE SCANNER - stdlib version for server.py
+# (converted from the FastAPI/httpx draft - no new dependencies)
+#
+# HOW TO INSTALL - two pastes into server.py:
+#
+# PASTE 1: everything between "BEGIN FUNCTIONS" and "END FUNCTIONS"
+#          goes near your other helper functions (e.g. just above
+#          the JURIS_VERSION block).
+#
+# PASTE 2: everything between "BEGIN ROUTES" and "END ROUTES"
+#          goes inside do_GET, as new elif branches alongside the
+#          other GET routes (match their indentation: 8 spaces).
+#
+# Endpoints added:
+#   GET /api/aigrade?domain=example.com        -> JSON grade report
+#   GET /api/aigrade/badge?domain=example.com  -> embeddable SVG badge
+# ============================================================
+
+# ---------------- BEGIN FUNCTIONS ----------------
+AIGRADE_TIMEOUT=6
+AIGRADE_UA="Mozilla/5.0 (compatible; AILeashScanner/1.0; +https://sebbi.pro/scan)"
+AIGRADE_UA_AGENT="AILeash-Agent-Check/1.0 (+https://sebbi.pro/scan)"
+AIGRADE_CHECKS=[
+    ("ai_safety","/.well-known/ai-safety.txt",20,"ai_safety"),
+    ("security","/.well-known/security.txt",15,"security"),
+    ("robots","/robots.txt",10,"present"),
+    ("sitemap","/sitemap.xml",10,"sitemap"),
+    ("ai_txt","/.well-known/ai.txt",15,"present"),
+    ("comply","/.well-known/comply.txt",15,"present"),
+    ("llms","/llms.txt",10,"present"),
+]
+AIGRADE_RENDER_POINTS=5
+AIGRADE_MAX=sum(c[2] for c in AIGRADE_CHECKS)+AIGRADE_RENDER_POINTS
+AIGRADE_COLORS={"A":"#7fe3b0","B":"#a8d95f","C":"#c9a84c","D":"#ff9a4a","F":"#ff8a80"}
+
+def _aigrade_fetch(url,ua=AIGRADE_UA):
+    try:
+        req=urllib.request.Request(url,headers={"User-Agent":ua})
+        with urllib.request.urlopen(req,timeout=AIGRADE_TIMEOUT) as r:
+            if r.status==200:
+                return r.read(500000).decode("utf-8","replace")
+    except Exception:
+        pass
+    return None
+
+def _aigrade_valid(kind,text):
+    if kind=="present":
+        return bool(text and text.strip())
+    if kind=="ai_safety":
+        if not text:return False
+        low=text.lower()
+        return "ai-safe:" in low and "true" in low
+    if kind=="security":
+        if not text:return False
+        low=text.lower()
+        return "contact:" in low and "expires:" in low
+    if kind=="sitemap":
+        if not text:return False
+        try:
+            import xml.etree.ElementTree as _ET
+            _ET.fromstring(text)
+            return True
+        except Exception:
+            return False
+    return False
+
+def _aigrade_letter(score):
+    if score>=90:return"A"
+    if score>=75:return"B"
+    if score>=60:return"C"
+    if score>=40:return"D"
+    return"F"
+
+def aigrade_run(domain):
+    domain=str(domain or "").strip().lower().replace("https://","").replace("http://","").rstrip("/")
+    domain=domain.split("/")[0]
+    if not domain or "." not in domain or len(domain)>200:
+        return None
+    base="https://"+domain
+    results={};score=0
+    for key,path,points,kind in AIGRADE_CHECKS:
+        text=_aigrade_fetch(base+path)
+        passed=_aigrade_valid(kind,text)
+        results[key]={"path":path,"found":bool(text),"passed":passed,"points":points if passed else 0}
+        if passed:score+=points
+    human=_aigrade_fetch(base,AIGRADE_UA)
+    agent=_aigrade_fetch(base,AIGRADE_UA_AGENT)
+    render_ok=False
+    if human and agent:
+        ratio=min(len(human),len(agent))/max(len(human),len(agent),1)
+        render_ok=ratio>0.9
+    results["consistent_rendering"]={"passed":render_ok,"points":AIGRADE_RENDER_POINTS if render_ok else 0}
+    if render_ok:score+=AIGRADE_RENDER_POINTS
+    return{"domain":domain,"score":score,"max_score":AIGRADE_MAX,
+        "grade":_aigrade_letter(score),"checks":results,
+        "verified_by":"sebbi.pro",
+        "badge_url":HOST+"/api/aigrade/badge?domain="+domain,
+        "report_url":HOST+"/api/aigrade?domain="+domain,
+        "note":"External-signal check of published AI-transparency files; not an audit of internal systems"}
+
+def aigrade_badge_svg(domain):
+    r=aigrade_run(domain)
+    grade=r["grade"] if r else "F"
+    color=AIGRADE_COLORS.get(grade,"#ff8a80")
+    return('<svg xmlns="http://www.w3.org/2000/svg" width="180" height="20">'
+        '<rect width="120" height="20" fill="#0a0f1e"/>'
+        '<rect x="120" width="60" height="20" fill="'+color+'"/>'
+        '<text x="60" y="14" fill="#fff" font-family="Verdana,sans-serif" font-size="11" text-anchor="middle">AI-Safety Grade</text>'
+        '<text x="150" y="14" fill="#0a0f1e" font-family="Verdana,sans-serif" font-size="12" font-weight="bold" text-anchor="middle">'+grade+'</text>'
+        '</svg>')
+# ---------------- END FUNCTIONS ----------------
+
+
+# ---------------- BEGIN ROUTES (paste inside do_GET) ----------------
+        elif path=="/api/aigrade":
+            qs=parse_qs(parsed.query)
+            dom=(qs.get("domain",[""])[0] or "").strip()
+            rep=aigrade_run(dom)
+            if not rep:
+                send_json(self,{"error":"valid domain required, e.g. ?domain=example.com"},400)
+            else:
+                send_json(self,rep)
+        elif path=="/api/aigrade/badge":
+            qs=parse_qs(parsed.query)
+            dom=(qs.get("domain",[""])[0] or "").strip()
+            svg=aigrade_badge_svg(dom)
+            body=svg.encode()
+            self.send_response(200)
+            self.send_header("Content-Type","image/svg+xml")
+            self.send_header("Cache-Control","max-age=3600")
+            self.send_header("Content-Length",str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+# ---------------- END ROUTES ----------------
+
+```
+
+
+## `aileash_reporter.py`
+
+232 lines, 9377 bytes
+
+```python
+"""
+AILEASH DECISION REPORTER v1.0.0
+Generates readable audit reports for all AILeash products.
+Shows exactly why each decision was made.
+Copyright (c) 2026 Justin Antony Dobson / Monop Content, Blyth, UK
+"""
+
+import sqlite3, json, os
+from datetime import datetime
+
+DB_FILE = "aileash.db"
+
+PRODUCTS = {
+    "aileash": "AILeash",
+    "guardian": "AILeash Guardian",
+    "sonicboom": "SonicBoom",
+    "sentinel": "AILeash Sentinel"
+}
+
+REASON_EXPLANATIONS = {
+    "velocity_spike": "User made more than 10 requests in 60 seconds",
+    "high_amount": "Transaction amount exceeded threshold",
+    "risky_device": "Device risk score was above acceptable limit",
+    "behaviour_anomaly": "Unusual behaviour pattern detected",
+    "country_shift": "Request came from a different country than usual",
+    "unsafe_country": "Request came from outside approved country list",
+    "low_trust": "User trust score has dropped due to previous decisions",
+}
+
+def get_decisions(db_path=DB_FILE, limit=200):
+    if not os.path.exists(db_path):
+        return []
+    try:
+        conn = sqlite3.connect(db_path)
+        rows = conn.execute("""
+            SELECT a.ts, a.user_id, a.event_json, a.result_json, a.audit_hash,
+                   COALESCE(k.product, 'aileash') as product
+            FROM audit_log a
+            LEFT JOIN api_keys k ON json_extract(a.event_json, '$.api_key') = k.key
+            ORDER BY a.id DESC LIMIT ?
+        """, (limit,)).fetchall()
+        conn.close()
+    except:
+        try:
+            conn = sqlite3.connect(db_path)
+            rows = conn.execute("""
+                SELECT ts, user_id, event_json, result_json, audit_hash, 'aileash'
+                FROM audit_log ORDER BY id DESC LIMIT ?
+            """, (limit,)).fetchall()
+            conn.close()
+        except:
+            return []
+    
+    results = []
+    for row in rows:
+        try:
+            event = json.loads(row[2])
+            result = json.loads(row[3])
+            results.append({
+                "ts": row[0],
+                "user_id": row[1],
+                "event": event,
+                "result": result,
+                "audit_hash": row[4],
+                "product": row[5] or "aileash"
+            })
+        except:
+            pass
+    return results
+
+def explain_reason(r):
+    return REASON_EXPLANATIONS.get(r, r.replace("_", " ").capitalize())
+
+def decision_color(d):
+    return {"ALLOW": "#00875a", "CHALLENGE": "#b45309", "BLOCK": "#cc0000"}.get(d, "#555")
+
+def product_color(p):
+    return {
+        "aileash": "#c9a84c",
+        "guardian": "#cc0000",
+        "sonicboom": "#00d4ff",
+        "sentinel": "#7c3aed"
+    }.get(p, "#c9a84c")
+
+def generate_html_report(db_path=DB_FILE, limit=200, output="aileash_report.html"):
+    decisions = get_decisions(db_path, limit)
+
+    allow = sum(1 for d in decisions if d["result"].get("decision") == "ALLOW")
+    challenge = sum(1 for d in decisions if d["result"].get("decision") == "CHALLENGE")
+    block = sum(1 for d in decisions if d["result"].get("decision") == "BLOCK")
+
+    rows = ""
+    for d in decisions:
+        result = d["result"]
+        event = d["event"]
+        ts = datetime.fromtimestamp(d["ts"]).strftime('%Y-%m-%d %H:%M:%S')
+        decision = result.get("decision", "?")
+        score = result.get("score", 0)
+        reasons = result.get("reasons", [])
+        product = d.get("product", "aileash")
+        pc = product_color(product)
+        dc = decision_color(decision)
+        pname = PRODUCTS.get(product, product)
+
+        reason_html = ""
+        if reasons:
+            reason_html = "<ul>" + "".join(
+                f"<li>{explain_reason(r)}</li>" for r in reasons
+            ) + "</ul>"
+        else:
+            reason_html = "<span style='color:#888'>No risk factors detected</span>"
+
+        rows += f"""<tr>
+            <td>{ts}</td>
+            <td><span style="font-size:10px;background:{pc}22;color:{pc};border:1px solid {pc}44;padding:2px 6px;border-radius:3px">{pname}</span></td>
+            <td><code>{d['user_id']}</code></td>
+            <td>{event.get('action','?')}</td>
+            <td>{event.get('country','?')}</td>
+            <td>£{event.get('amount',0)}</td>
+            <td><strong style="color:{dc}">{decision}</strong></td>
+            <td>{score}</td>
+            <td>{result.get('trust',0)}</td>
+            <td>{reason_html}</td>
+            <td><code style="font-size:10px">{d['audit_hash'][:16]}...</code></td>
+        </tr>"""
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>AILeash Audit Report</title>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:sans-serif;background:#f5f7fa;color:#1a202c;padding:20px}}
+.header{{background:#0a0f1e;color:#fff;padding:24px 32px;border-radius:8px;margin-bottom:20px;display:flex;justify-content:space-between;align-items:center}}
+.header h1{{font-size:22px;color:#c9a84c;margin:0}}
+.header p{{font-size:12px;color:rgba(255,255,255,0.4);margin-top:4px}}
+.logo{{font-size:13px;color:rgba(255,255,255,0.2)}}
+.stats{{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px}}
+.stat{{background:#fff;border-radius:8px;padding:16px;text-align:center;border:1px solid #e2e8f0}}
+.stat-n{{font-size:28px;font-weight:700}}
+.stat-l{{font-size:11px;color:#64748b;margin-top:4px;text-transform:uppercase;letter-spacing:1px}}
+.allow{{color:#00875a}}.challenge{{color:#b45309}}.block{{color:#cc0000}}.total{{color:#0a0f1e}}
+.table-wrap{{background:#fff;border-radius:8px;overflow:hidden;border:1px solid #e2e8f0;overflow-x:auto}}
+table{{width:100%;border-collapse:collapse;min-width:900px}}
+th{{background:#0a0f1e;color:#c9a84c;padding:10px 12px;text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:1px;white-space:nowrap}}
+td{{padding:10px 12px;border-bottom:1px solid #e2e8f0;font-size:12px;vertical-align:top}}
+tr:last-child td{{border:none}}
+tr:hover td{{background:#f8fafc}}
+ul{{margin:4px 0;padding-left:16px}}
+li{{margin:2px 0;color:#64748b;font-size:11px}}
+code{{background:#f1f5f9;padding:2px 4px;border-radius:3px;font-size:10px}}
+.empty{{text-align:center;color:#888;padding:40px}}
+footer{{text-align:center;font-size:11px;color:#94a3b8;margin-top:20px}}
+</style>
+</head>
+<body>
+<div class="header">
+  <div>
+    <h1>AILeash Audit Report</h1>
+    <p>Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} &nbsp;|&nbsp; Last {len(decisions)} decisions</p>
+  </div>
+  <div class="logo">sebbi.pro &nbsp;|&nbsp; OAAS-1.0</div>
+</div>
+<div class="stats">
+  <div class="stat"><div class="stat-n total">{len(decisions)}</div><div class="stat-l">Total</div></div>
+  <div class="stat"><div class="stat-n allow">{allow}</div><div class="stat-l">Allowed</div></div>
+  <div class="stat"><div class="stat-n challenge">{challenge}</div><div class="stat-l">Challenged</div></div>
+  <div class="stat"><div class="stat-n block">{block}</div><div class="stat-l">Blocked</div></div>
+</div>
+<div class="table-wrap">
+<table>
+<thead><tr>
+  <th>Time</th><th>Product</th><th>User</th><th>Action</th><th>Country</th>
+  <th>Amount</th><th>Decision</th><th>Score</th><th>Trust</th><th>Reasons</th><th>Audit Hash</th>
+</tr></thead>
+<tbody>
+{''.join([rows]) if rows else f'<tr><td colspan="11" class="empty">No decisions recorded yet</td></tr>'}
+</tbody>
+</table>
+</div>
+<footer>AILeash &nbsp;|&nbsp; Monop Content &nbsp;|&nbsp; Justin Antony Dobson &nbsp;|&nbsp; sebbi.pro &nbsp;|&nbsp; SHA-256 Merkle Chain</footer>
+</body>
+</html>"""
+
+    with open(output, "w") as f:
+        f.write(html)
+    print(f"Report saved: {output} ({len(decisions)} decisions)")
+    return output
+
+def generate_json_report(db_path=DB_FILE, limit=200, output="aileash_report.json"):
+    decisions = get_decisions(db_path, limit)
+    report = {
+        "generated": datetime.now().isoformat(),
+        "standard": "OAAS-1.0",
+        "source": "sebbi.pro",
+        "total": len(decisions),
+        "summary": {
+            "allow": sum(1 for d in decisions if d["result"].get("decision") == "ALLOW"),
+            "challenge": sum(1 for d in decisions if d["result"].get("decision") == "CHALLENGE"),
+            "block": sum(1 for d in decisions if d["result"].get("decision") == "BLOCK")
+        },
+        "decisions": [{
+            "timestamp": datetime.fromtimestamp(d["ts"]).isoformat(),
+            "product": PRODUCTS.get(d["product"], d["product"]),
+            "user_id": d["user_id"],
+            "action": d["event"].get("action"),
+            "country": d["event"].get("country"),
+            "amount": d["event"].get("amount"),
+            "decision": d["result"].get("decision"),
+            "score": d["result"].get("score"),
+            "trust": d["result"].get("trust"),
+            "reasons": d["result"].get("reasons", []),
+            "reasons_explained": [explain_reason(r) for r in d["result"].get("reasons", [])],
+            "audit_hash": d["audit_hash"]
+        } for d in decisions]
+    }
+    with open(output, "w") as f:
+        json.dump(report, f, indent=2)
+    print(f"Report saved: {output}")
+    return output
+
+if __name__ == "__main__":
+    import sys
+    fmt = sys.argv[1] if len(sys.argv) > 1 else "html"
+    db = sys.argv[2] if len(sys.argv) > 2 else DB_FILE
+    if fmt == "json":
+        generate_json_report(db)
+    else:
+        generate_html_report(db)
+
+```
 
 
 ## `aileash_verify.py`
@@ -2014,543 +2574,5 @@ if __name__ == "__main__":
         asyncio.run(gateway.start())
     except KeyboardInterrupt:
         logging.info("Gateway offline.")
-
-```
-
-
-## `meshwitness.py`
-
-328 lines, 11605 bytes
-
-```python
-#!/usr/bin/env python3
-"""
-meshwitness.py  v1.0  -  witness everybody, not just whoever invited you
-
-    Standard library only. One file. One cron line. No install.
-
-WHAT PROBLEM THIS SOLVES
-    Witnessing runs on your own machine, so your server only witnesses
-    chains you have told it about. Most operators point at whoever
-    introduced them and stop there. The result is a star: everybody
-    connected to one node in the middle, and if that node goes down
-    every chain loses its witness at the same moment.
-
-    This reads the published roster and witnesses EVERY chain on it. A
-    chain that joins tomorrow gets picked up on your next run with
-    nothing to configure and no email from anyone.
-
-WHAT IT DOES, EACH RUN
-    1. Fetches the roster.
-    2. For every chain with a tip URL, fetches their current tip.
-    3. Seals that tip into YOUR chain, via your own seal endpoint.
-    4. Pushes YOUR tip to their submit endpoint, so the witnessing is
-       mutual rather than one-way.
-    5. Prints a line per peer and exits non-zero if nothing worked.
-
-    It never sends your data anywhere. A tip is a hash. That is the
-    whole payload.
-
-RUN IT
-    export MESH_TIP_URL=https://yoursite.example/witness.json
-    export MESH_SEAL_URL=https://yoursite.example/api/witness/seal
-    export MESH_CHAIN=your-chain-name
-
-    python3 meshwitness.py
-
-    Cron, hourly, on a minute nobody else is using:
-        23 * * * * /usr/bin/python3 /path/meshwitness.py >> /var/log/mesh.log 2>&1
-
-    Check what it would do without doing it:
-        python3 meshwitness.py --dry-run
-
-CONFIGURATION
-    MESH_TIP_URL    where YOUR current tip is served. required.
-    MESH_SEAL_URL   your own endpoint that seals an observed tip.
-                    optional -- omit it and this only pushes, which is
-                    still useful but only half the exchange.
-    MESH_CHAIN      your chain name as other nodes should record it.
-    MESH_ROSTER     roster to read. defaults to sebbi.pro.
-    MESH_SKIP       comma separated chain names to ignore.
-    MESH_TIMEOUT    seconds per request. default 15.
-
-IF YOUR STACK IS NOT PYTHON
-    The whole protocol is four HTTP calls and no cryptography beyond a
-    hash you already have. Read --explain for the exact requests and
-    write it in whatever you use. Nothing here is privileged.
-"""
-
-import json
-import os
-import sys
-import time
-import urllib.error
-import urllib.request
-
-VERSION = "1.0"
-
-DEFAULT_ROSTER = "https://sebbi.pro/x/roster/list"
-DEFAULT_TIMEOUT = 15.0
-USER_AGENT = "meshwitness/%s" % VERSION
-
-
-# ------------------------------------------------------------------ http
-
-def _get(url, timeout):
-    req = urllib.request.Request(url, headers={
-        "Accept": "application/json", "User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        raw = r.read().decode("utf-8", "replace")
-    try:
-        return json.loads(raw)
-    except ValueError:
-        return {"_raw": raw.strip()}
-
-
-def _post(url, payload, timeout):
-    body = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=body, headers={
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "User-Agent": USER_AGENT,
-    }, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.status, json.loads(r.read().decode("utf-8", "replace"))
-    except urllib.error.HTTPError as e:
-        try:
-            return e.code, json.loads(e.read().decode("utf-8", "replace"))
-        except Exception:
-            return e.code, {"error": "http_%d" % e.code}
-
-
-def _extract_tip(doc):
-    """
-    Find the tip hash in whatever shape a peer serves. Different nodes
-    name it differently and that is not worth an argument.
-    """
-    if isinstance(doc, str):
-        return doc.strip() or None
-    if not isinstance(doc, dict):
-        return None
-    for k in ("tip", "head", "current_tip", "chain_tip", "root",
-              "latest", "hash", "audit_hash", "seal"):
-        v = doc.get(k)
-        if isinstance(v, str) and len(v) >= 32:
-            return v.strip()
-        if isinstance(v, dict):
-            inner = _extract_tip(v)
-            if inner:
-                return inner
-    for k in ("chain", "witness", "data", "result"):
-        v = doc.get(k)
-        if isinstance(v, dict):
-            inner = _extract_tip(v)
-            if inner:
-                return inner
-    return None
-
-
-# ------------------------------------------------------------------ core
-
-class Mesh(object):
-
-    def __init__(self, tip_url=None, seal_url=None, chain=None,
-                 roster=None, skip=None, timeout=None, dry_run=False):
-        self.tip_url = tip_url or os.environ.get("MESH_TIP_URL")
-        self.seal_url = seal_url or os.environ.get("MESH_SEAL_URL")
-        self.chain = chain or os.environ.get("MESH_CHAIN")
-        self.roster = roster or os.environ.get("MESH_ROSTER", DEFAULT_ROSTER)
-        self.timeout = float(timeout or os.environ.get("MESH_TIMEOUT",
-                                                       DEFAULT_TIMEOUT))
-        self.dry_run = dry_run
-        raw_skip = skip or os.environ.get("MESH_SKIP", "")
-        self.skip = set(s.strip().lower() for s in raw_skip.split(",") if s.strip())
-
-    def check(self):
-        problems = []
-        if not self.tip_url:
-            problems.append("MESH_TIP_URL is not set. Other nodes need "
-                            "somewhere to fetch your tip from.")
-        if not self.chain:
-            problems.append("MESH_CHAIN is not set. Your submissions would "
-                            "arrive unnamed.")
-        if not self.seal_url:
-            problems.append("MESH_SEAL_URL is not set, so this will push "
-                            "your tip out but not seal theirs. That is "
-                            "half the exchange. Not fatal.")
-        return problems
-
-    def my_tip(self):
-        try:
-            return _extract_tip(_get(self.tip_url, self.timeout))
-        except Exception as e:
-            print("  ! could not read own tip from %s: %s"
-                  % (self.tip_url, str(e)[:90]))
-            return None
-
-    def fetch_roster(self):
-        doc = _get(self.roster, self.timeout)
-        peers = doc.get("peers") or []
-        out = []
-        for p in peers:
-            name = (p.get("chain") or "").strip()
-            url = p.get("tip_url")
-            if not name or not url:
-                continue
-            if name.lower() == (self.chain or "").lower():
-                continue                       # never witness yourself
-            if name.lower() in self.skip:
-                continue
-            out.append({"chain": name, "tip_url": url,
-                        "status": p.get("status"),
-                        "submit": p.get("submit_to")})
-        return out, doc
-
-    def run(self):
-        started = time.time()
-        print("meshwitness %s  %s" % (VERSION, time.strftime("%Y-%m-%d %H:%M:%S")))
-
-        for p in self.check():
-            print("  ! " + p)
-
-        mine = self.my_tip()
-        if mine:
-            print("  my tip: %s…" % mine[:16])
-        else:
-            print("  ! no tip of my own to push; will still seal theirs")
-
-        try:
-            peers, doc = self.fetch_roster()
-        except Exception as e:
-            print("  ! roster unreachable (%s): %s" % (self.roster, str(e)[:90]))
-            return 1
-
-        submit_to = doc.get("submit_to")
-        print("  roster: %d chains, %d witnessable"
-              % (doc.get("count", 0), doc.get("witnessable", 0)))
-
-        if not peers:
-            print("  nothing to witness yet.")
-            return 0
-
-        sealed = pushed = failed = 0
-
-        for p in peers:
-            name = p["chain"]
-            line = "  %-28s" % name[:28]
-
-            try:
-                theirs = _extract_tip(_get(p["tip_url"], self.timeout))
-            except Exception as e:
-                print(line + "unreachable (%s)" % str(e)[:40])
-                failed += 1
-                continue
-
-            if not theirs:
-                print(line + "served no readable tip")
-                failed += 1
-                continue
-
-            bits = ["tip %s…" % theirs[:12]]
-
-            # seal theirs into mine
-            if self.seal_url and not self.dry_run:
-                try:
-                    st, _ = _post(self.seal_url,
-                                  {"chain": name, "tip": theirs,
-                                   "url": p["tip_url"]}, self.timeout)
-                    if 200 <= st < 300:
-                        bits.append("sealed")
-                        sealed += 1
-                    else:
-                        bits.append("seal HTTP %d" % st)
-                except Exception as e:
-                    bits.append("seal failed: %s" % str(e)[:30])
-            elif self.dry_run:
-                bits.append("would seal")
-
-            # push mine to them
-            target = p.get("submit") or submit_to
-            if mine and target and not self.dry_run:
-                try:
-                    st, _ = _post(target,
-                                  {"chain": self.chain, "tip": mine,
-                                   "url": self.tip_url}, self.timeout)
-                    if 200 <= st < 300:
-                        bits.append("pushed")
-                        pushed += 1
-                    else:
-                        bits.append("push HTTP %d" % st)
-                except Exception as e:
-                    bits.append("push failed: %s" % str(e)[:30])
-            elif self.dry_run and mine:
-                bits.append("would push")
-
-            print(line + " · ".join(bits))
-
-        print("  %d sealed, %d pushed, %d unreachable, %.1fs"
-              % (sealed, pushed, failed, time.time() - started))
-
-        if self.dry_run:
-            return 0
-        return 0 if (sealed or pushed) else 1
-
-
-EXPLAIN = """
-The protocol, so you can implement it in any language.
-
-1. Read the roster
-     GET https://sebbi.pro/x/roster/list
-   -> {"peers":[{"chain":"...","tip_url":"...","witnessable":true}, ...],
-       "submit_to":"https://sebbi.pro/x/witness/observe"}
-
-2. For each peer with witnessable=true, read their tip
-     GET <tip_url>
-   The hash may be under "tip", "head", "root" or similar. It is a hex
-   string, usually 64 characters. Nothing else in the document matters.
-
-3. Seal it in your own chain
-   Whatever your system does to record an observation. The point is that
-   their tip is now inside your history at a time you did not choose,
-   which is what makes your later statements about them checkable.
-
-4. Push your own tip back
-     POST <their submit endpoint>
-     {"chain": "<your name>", "tip": "<your hex tip>",
-      "url": "<where your tip is served>"}
-
-   The url field is what binds your name to a host. Leave it out and
-   your chain is listed but nobody can fetch from you.
-
-Run it hourly. Pick a minute nobody else is on so the network is not
-all talking at once.
-
-No keys. No accounts. No payload but a hash. If your tip endpoint is a
-static JSON file regenerated by a cron, that is a completely valid node.
-"""
-
-
-def main(argv=None):
-    argv = list(argv if argv is not None else sys.argv[1:])
-
-    if "--explain" in argv:
-        print(EXPLAIN.strip())
-        return 0
-    if "--version" in argv:
-        print("meshwitness %s" % VERSION)
-        return 0
-    if "-h" in argv or "--help" in argv:
-        print(__doc__.strip())
-        return 0
-
-    dry = "--dry-run" in argv
-    return Mesh(dry_run=dry).run()
-
-
-if __name__ == "__main__":
-    sys.exit(main())
-
-```
-
-
-## `sebbi_orchestrator.py`
-
-194 lines, 7453 bytes
-
-```python
-import asyncio
-import json
-import logging
-import socket
-import hmac
-import hashlib
-import ipaddress
-import os
-import sys
-import time
-
-# Handle cross-platform kernel metric mapping
-if sys.platform != "win32":
-    import resource
-else:
-    resource = None
-
-# --- ARCHITECTURE METADATA ENGINE ---
-CORE_MANIFEST = """Standard: AI-TXT/1.0
-Standard-Licence: free and open - publish your own at no cost, no key required
-Operator: Monop Content
-Operator-Location: Blyth, Northumberland, United Kingdom
-Contact: justrightdecorators@gmail.com
-Last-Updated: 2026-07-05
-
-Governance-Engine: AILeash v6.4
-Metrics-Engine: GreenLeash v1.2 (Unified Resource Auditor)
-Decision-Outcomes: ALLOW, CHALLENGE, BLOCK
-Decision-Signals: 9
-Decision-Latency-Median: 28ms
-
-Verify-Endpoint: https://sebbi.pro
-Companion-Standard: https://sebbi.pro
-Whitepaper: https://sebbi.pro"""
-
-HUMAN_MESSAGE = (
-    "SYSTEM NOTICE: AI Governance & Sustainability Compliance Update for sebbi.pro.\n"
-    "The updated compliance targets are now active under Standard: AI-TXT/1.0.\n"
-    "Verify live audit status at: https://sebbi.pro"
-)
-
-# Network Operational Limits
-UDP_BROADCAST_PORT = 5001
-TCP_GATEWAY_PORT = 8080
-CONCURRENT_LIMIT = 2000  
-TIMEOUT = 1.5           
-
-# Dynamic environment lookup to protect secret keys from public GitHub visibility
-SYSTEM_SIGNING_KEY = os.environ.get("SEBBI_SYSTEM_SECRET", "LOCAL_DEV_FALLBACK_KEY").encode('utf-8')
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-
-# ==========================================
-# PART 1: CORE UTILITIES & METRIC AUDITING
-# ==========================================
-
-def get_network_topology():
-    """Resolves local interface and dynamically maps standard subnet boundaries."""
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        local_ip = s.getsockname()[0]
-        s.close()
-        interface = ipaddress.IPv4Interface(f"{local_ip}/255.255.255.0")
-        return str(interface.network.broadcast_address), interface.network
-    except Exception as e:
-        logging.error(f"Failed to automatically resolve local network topology: {e}")
-        return "255.255.255.255", ipaddress.IPv4Network("192.168.1.0/24")
-
-def get_kernel_resource_usage():
-    """Extracts raw processing time and RAM footprints straight from the OS kernel."""
-    if resource:
-        usage = resource.getrusage(resource.RUSAGE_SELF)
-        cpu_time = usage.ru_utime + usage.ru_stime
-        memory_mb = usage.ru_maxrss / (1024.0 if sys.platform == "darwin" else 1.0)
-    else:
-        cpu_time = time.process_time()
-        memory_mb = 0.0
-    return cpu_time, memory_mb
-
-def generate_signed_telemetry(message_text, manifest_text, extra_metrics=None):
-    """Packages corporate alerts and signs them using HMAC-SHA256 for tampering prevention."""
-    base_data = {
-        "alert_text": message_text,
-        "raw_declaration": manifest_text,
-        "node_id": hashlib.sha256(socket.gethostname().encode()).hexdigest()[:12]
-    }
-    if extra_metrics:
-        base_data["sustainability_metrics"] = extra_metrics
-        
-    serialized_json = json.dumps(base_data, sort_keys=True)
-    signature = hmac.new(SYSTEM_SIGNING_KEY, serialized_json.encode('utf-8'), hashlib.sha256).hexdigest()
-    
-    return json.dumps({
-        "payload": base_data,
-        "signature": signature,
-        "algorithm": "HMAC-SHA256"
-    })
-
-# ==========================================
-# PART 2: DISTRIBUTION ENGINES
-# ==========================================
-
-def execute_udp_broadcast(compiled_payload, broadcast_target):
-    """Fires a connectionless notification to all listening local subnet nodes."""
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            s.sendto(compiled_payload.encode('utf-8'), (broadcast_target, UDP_BROADCAST_PORT))
-            logging.info(f"Signed UDP broadcast dispatched to {broadcast_target}:{UDP_BROADCAST_PORT}")
-    except socket.error as e:
-        logging.error(f"UDP broadcast transmission failure: {e}")
-
-async def dispatch_tcp_gateway(target_ip, compiled_payload):
-    """Pushes a verified compliance wrapper directly into standard infrastructure points."""
-    writer = None
-    try:
-        connect = asyncio.open_connection(target_ip, TCP_GATEWAY_PORT)
-        _, writer = await asyncio.wait_for(connect, timeout=TIMEOUT)
-        
-        http_request = (
-            f"POST /api/compliance/broadcast HTTP/1.1\r\n"
-            f"Host: {target_ip}\r\n"
-            f"Content-Type: application/json\r\n"
-            f"Content-Length: {len(compiled_payload)}\r\n"
-            f"X-Signature-Auth: True\r\n"
-            f"Connection: close\r\n\r\n"
-            f"{compiled_payload}"
-        ).encode('utf-8')
-        
-        writer.write(http_request)
-        await writer.drain()
-        logging.info(f"[DISPATCHED] Verified telemetry pushed to infrastructure host: {target_ip}")
-        return True
-    except (asyncio.TimeoutError, ConnectionRefusedError, OSError):
-        return False
-    finally:
-        if writer:
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception:
-                pass
-
-# ==========================================
-# PART 3: RECENTRALIZED PROCESS ENGINE
-# ==========================================
-
-async def run_unified_orchestration():
-    logging.info("Initializing Unified Sebbi Ecosystem Orchestration Pipeline...")
-    
-    # 1. Profile an operational work function (Audit System Burden)
-    start_wall = time.perf_counter()
-    start_cpu, start_mem = get_kernel_resource_usage()
-    
-    # [SIMULATION BLOCK]: Represents a standard local validation check running
-    await asyncio.sleep(0.025)
-    
-    end_cpu, end_mem = get_kernel_resource_usage()
-    end_wall = time.perf_counter()
-    
-    metrics = {
-        "wall_latency_ms": round((end_wall - start_wall) * 1000, 3),
-        "kernel_cpu_time_ms": round((end_cpu - start_cpu) * 1000, 3),
-        "allocated_memory_mb": round(max(start_mem, end_mem), 2)
-    }
-    logging.info(f"Process Profile Completed -> CPU: {metrics['kernel_cpu_time_ms']}ms | RAM: {metrics['allocated_memory_mb']}MB")
-    
-    # 2. Package and sign the final structural data block
-    broadcast_ip, network_obj = get_network_topology()
-    signed_payload_stream = generate_signed_telemetry(HUMAN_MESSAGE, CORE_MANIFEST, extra_metrics=metrics)
-    
-    # 3. Fire local network UDP alert baseline
-    execute_udp_broadcast(signed_payload_stream, broadcast_ip)
-    
-    # 4. Asynchronously scan and iterate targeted subnet infrastructure nodes
-    tasks = []
-    logging.info(f"Scanning target gateways across subnet map: {network_obj.with_prefixlen}")
-    
-    for host in network_obj.hosts():
-        host_str = str(host)
-        if host_str.endswith(".1") or host_str.endswith(".254"):
-            tasks.append(asyncio.create_task(dispatch_tcp_gateway(host_str, signed_payload_stream)))
-            if len(tasks) >= CONCURRENT_LIMIT:
-                await asyncio.gather(*tasks, return_exceptions=True)
-                tasks = []
-                
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
-    logging.info("Unified orchestration sequence finalized successfully.")
-
-if __name__ == "__main__":
-    asyncio.run(run_unified_orchestration())
 
 ```
