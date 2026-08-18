@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-105 files across 21 parts.
+106 files across 22 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -91,12 +91,13 @@ Generated automatically on every push. Do not edit by hand.
 - `meshwitness.py`
 - `sebbi_orchestrator.py`
 - `sebdog_engine.py`
+- `sebdog_licence.py`
 - `sebdog_reporter.py`
-- `tests/attack_continuity_1.py`
-- `tests/attack_continuity_2.py`
 
 ## [CODEBASE-13.md](CODEBASE-13.md)
 
+- `tests/attack_continuity_1.py`
+- `tests/attack_continuity_2.py`
 - `tests/attack_continuity_3.py`
 - `tests/attack_continuity_4.py`
 - `tests/attack_continuity_5.py`
@@ -106,36 +107,39 @@ Generated automatically on every push. Do not edit by hand.
 - `AILeash-API-Reference-v6.4.2.md`
 - `LICENCE`
 - `README.md`
+
+## [CODEBASE-14.md](CODEBASE-14.md)
+
 - `admin.html`
 - `ai-standard.html`
 - `ai-txt-kit.html`
 - `aitxt-popup-live.html`
-
-## [CODEBASE-14.md](CODEBASE-14.md)
-
 - `brain.html`
 - `certificate.html`
+
+## [CODEBASE-15.md](CODEBASE-15.md)
+
 - `compliance-assistant.html`
 - `contact.html`
 - `copyright.txt`
 - `data-protection.html`
-
-## [CODEBASE-15.md](CODEBASE-15.md)
-
 - `developers.html`
 - `dis.txt`
 - `docs/evidential-undertaking.md`
+
+## [CODEBASE-16.md](CODEBASE-16.md)
+
 - `docs/spec/ai-txt.md`
 - `green.html`
 - `guardian-parent.html`
 - `human-oversight.html`
 - `identity.html`
 
-## [CODEBASE-16.md](CODEBASE-16.md)
+## [CODEBASE-17.md](CODEBASE-17.md)
 
 - `index.html`
 
-## [CODEBASE-17.md](CODEBASE-17.md)
+## [CODEBASE-18.md](CODEBASE-18.md)
 
 - `investor-prospectus.html`
 - `legal.txt`
@@ -147,13 +151,13 @@ Generated automatically on every push. Do not edit by hand.
 - `report-threat.html`
 - `requirements.txt`
 
-## [CODEBASE-18.md](CODEBASE-18.md)
+## [CODEBASE-19.md](CODEBASE-19.md)
 
 - `reseller.html`
 - `risk-policy.html`
 - `robots.txt`
 
-## [CODEBASE-19.md](CODEBASE-19.md)
+## [CODEBASE-20.md](CODEBASE-20.md)
 
 - `scan.html`
 - `seal.html`
@@ -161,12 +165,12 @@ Generated automatically on every push. Do not edit by hand.
 - `signal-packs.html`
 - `sitemap.xml`
 
-## [CODEBASE-20.md](CODEBASE-20.md)
+## [CODEBASE-21.md](CODEBASE-21.md)
 
 - `sonicboom.html`
 - `verify.html`
 
-## [CODEBASE-21.md](CODEBASE-21.md)
+## [CODEBASE-22.md](CODEBASE-22.md)
 
 - `whitepaper.html`
 

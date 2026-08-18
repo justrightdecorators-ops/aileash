@@ -1,13 +1,12 @@
-# Codebase — part 12 of 21
+# Codebase — part 12 of 22
 
 Contains:
 - `gateway_proxy.py`
 - `meshwitness.py`
 - `sebbi_orchestrator.py`
 - `sebdog_engine.py`
+- `sebdog_licence.py`
 - `sebdog_reporter.py`
-- `tests/attack_continuity_1.py`
-- `tests/attack_continuity_2.py`
 
 
 ## `gateway_proxy.py`
@@ -1686,6 +1685,514 @@ if __name__ == "__main__":
 ```
 
 
+## `sebdog_licence.py`
+
+500 lines, 18698 bytes
+
+```python
+"""
+SEBDOG LICENCE SYSTEM v2.0.0
+Air-gapped cryptographic licence tokens for the Sebdog Engine.
+Copyright (c) 2026 Justin Antony Dobson / Monop Content, Blyth, UK
+
+WHAT CHANGED IN 2.0, AND WHY IT HAD TO
+--------------------------------------
+Version 1 signed tokens with HMAC-SHA256. HMAC is symmetric: the same
+secret both signs and verifies. So validating a token offline required
+that secret to be present on the customer's hardware - and anyone
+holding it can mint their own token for any device count, any plan, any
+expiry.
+
+Version 1's docstring said the signing secret never leaves sebbi.pro's
+servers. With an offline HMAC check, that could not be true. One of the
+two claims had to give, and it should not be the one about not shipping
+the key.
+
+Version 2 uses Ed25519. The server holds a private seed and signs. The
+customer's copy holds only the PUBLIC key, which verifies signatures and
+cannot produce one. Offline validation and an unshippable signing key
+stop being in conflict, because they are no longer the same key.
+
+    v1  customer holds the minting key   offline validation works
+    v2  customer holds a public key      offline validation works
+
+Everything else is unchanged: 7-day grace, local cache, tamper
+detection, deterministic payload, constant-time comparison where it
+still applies.
+
+NO DEPENDENCY
+-------------
+Ed25519 is implemented here in pure standard library, the same way it
+is in continuity.py and modules/signed.py. Nothing to pip install on a
+customer's air-gapped box, which is the entire point of shipping this
+rather than a library.
+
+SETTING IT UP, ONCE
+-------------------
+    python3 sebdog_licence.py --keygen
+
+Put the private seed in a Railway environment variable as
+SEBDOG_LICENCE_SEED. Paste the public key into LICENCE_PUBKEY below and
+into sebdog_engine.py. The private seed never appears in any file that
+ships.
+
+MIGRATING A v1 TOKEN
+--------------------
+There is no migration and there should not be one. A v1 token was
+verifiable by anyone who had the secret, so any v1 token in the wild
+should be treated as compromised and reissued. validate_token rejects
+v1 tokens by version rather than pretending they are fine.
+"""
+
+import base64
+import hashlib
+import json
+import os
+import sqlite3
+import threading
+import time
+from typing import Dict, Optional, Tuple
+
+TOKEN_VERSION = "2"
+GRACE_SECONDS = 86400 * 7          # 7 days past expiry before a hard block
+AUDIT_DB = "sebdog_audit.db"
+
+# The public half of the signing key. Safe to ship, safe to publish, and
+# useless for producing a token. Overridable by environment for testing.
+LICENCE_PUBKEY = os.environ.get("SEBDOG_LICENCE_PUBKEY", "")
+
+
+# ==============================================================================
+# Ed25519 - RFC 8032, standard library only
+#
+# Extended coordinates for the scalar multiplication so a verify is
+# milliseconds rather than seconds. sign() is here for the server side; a
+# customer's deployment only ever calls verify().
+# ==============================================================================
+
+_P = 2 ** 255 - 19
+_L = 2 ** 252 + 27742317777372353535851937790883648493
+_D = -121665 * pow(121666, _P - 2, _P) % _P
+_I = pow(2, (_P - 1) // 4, _P)
+
+
+def _xrecover(y):
+    xx = (y * y - 1) * pow(_D * y * y + 1, _P - 2, _P)
+    x = pow(xx, (_P + 3) // 8, _P)
+    if (x * x - xx) % _P != 0:
+        x = (x * _I) % _P
+    if x % 2 != 0:
+        x = _P - x
+    return x
+
+
+_BY = 4 * pow(5, _P - 2, _P) % _P
+_BX = _xrecover(_BY)
+_B = (_BX % _P, _BY % _P, 1, _BX * _BY % _P)
+
+
+def _add(p, q):
+    x1, y1, z1, t1 = p
+    x2, y2, z2, t2 = q
+    a = (y1 - x1) * (y2 - x2) % _P
+    b = (y1 + x1) * (y2 + x2) % _P
+    c = t1 * 2 * _D * t2 % _P
+    dd = z1 * 2 * z2 % _P
+    e, f, g, h = b - a, dd - c, dd + c, b + a
+    return (e * f % _P, g * h % _P, f * g % _P, e * h % _P)
+
+
+def _scalarmult(p, e):
+    if e == 0:
+        return (0, 1, 1, 0)
+    q = _scalarmult(p, e >> 1)
+    q = _add(q, q)
+    if e & 1:
+        q = _add(q, p)
+    return q
+
+
+def _encodepoint(p):
+    x, y, z, _t = p
+    zi = pow(z, _P - 2, _P)
+    x = x * zi % _P
+    y = y * zi % _P
+    raw = bytearray(y.to_bytes(32, "little"))
+    raw[31] |= (x & 1) << 7
+    return bytes(raw)
+
+
+def _decodepoint(raw):
+    y = int.from_bytes(raw, "little") & ((1 << 255) - 1)
+    if y >= _P:
+        return None
+    x = _xrecover(y)
+    if x & 1 != (raw[31] >> 7) & 1:
+        x = _P - x
+    if (-x * x + y * y - 1 - _D * x * x * y * y) % _P != 0:
+        return None
+    return (x, y, 1, x * y % _P)
+
+
+def _secret_scalar(seed):
+    h = hashlib.sha512(seed).digest()
+    a = int.from_bytes(h[:32], "little")
+    a &= (1 << 254) - 8
+    a |= 1 << 254
+    return a, h[32:]
+
+
+def public_key(seed: bytes) -> bytes:
+    """The 32-byte public key for a 32-byte private seed."""
+    a, _ = _secret_scalar(seed)
+    return _encodepoint(_scalarmult(_B, a))
+
+
+def sign(seed: bytes, message: bytes) -> bytes:
+    """Server side only. Never called on customer hardware."""
+    a, prefix = _secret_scalar(seed)
+    pk = _encodepoint(_scalarmult(_B, a))
+    r = int.from_bytes(hashlib.sha512(prefix + message).digest(), "little") % _L
+    rp = _encodepoint(_scalarmult(_B, r))
+    k = int.from_bytes(hashlib.sha512(rp + pk + message).digest(), "little") % _L
+    s = (r + k * a) % _L
+    return rp + s.to_bytes(32, "little")
+
+
+def verify(pk: bytes, message: bytes, signature: bytes) -> bool:
+    """True if the signature is valid. Never raises."""
+    try:
+        if len(pk) != 32 or len(signature) != 64:
+            return False
+        a = _decodepoint(pk)
+        if a is None:
+            return False
+        r = _decodepoint(signature[:32])
+        if r is None:
+            return False
+        s = int.from_bytes(signature[32:], "little")
+        if s >= _L:
+            return False
+        k = int.from_bytes(
+            hashlib.sha512(signature[:32] + pk + message).digest(),
+            "little") % _L
+        left = _scalarmult(_B, s)
+        right = _add(r, _scalarmult(a, k))
+        lx, ly, lz, _lt = left
+        rx, ry, rz, _rt = right
+        return ((lx * rz - rx * lz) % _P == 0
+                and (ly * rz - ry * lz) % _P == 0)
+    except Exception:
+        return False
+
+
+def keygen() -> Tuple[str, str]:
+    """(private_seed_hex, public_key_hex). Run once, keep the first secret."""
+    seed = os.urandom(32)
+    return seed.hex(), public_key(seed).hex()
+
+
+# ==============================================================================
+# TOKEN GENERATION - sebbi.pro only
+# ==============================================================================
+
+def generate_token(api_key: str, devices: int, plan: str, email: str,
+                   seed: bytes, validity_days: int = 365) -> str:
+    """
+    Sign an annual licence token.
+
+    seed is the 32-byte Ed25519 private seed, read from the
+    SEBDOG_LICENCE_SEED environment variable on the server. It is never
+    written to a file that ships and never sent to a customer.
+    """
+    if isinstance(seed, str):
+        seed = bytes.fromhex(seed.strip())
+    if len(seed) != 32:
+        raise ValueError("seed must be 32 bytes")
+
+    issued = int(time.time())
+    payload = json.dumps({
+        "v": TOKEN_VERSION,
+        "key": api_key,
+        "devices": devices,
+        "plan": plan,
+        "email": email,
+        "issued": issued,
+        "expires": issued + (validity_days * 86400),
+    }, sort_keys=True, separators=(",", ":"))
+
+    sig = sign(seed, payload.encode("utf-8")).hex()
+    token = json.dumps({"payload": payload, "sig": sig, "alg": "ed25519"},
+                       separators=(",", ":"))
+    return base64.urlsafe_b64encode(token.encode("utf-8")).decode("utf-8")
+
+
+# ==============================================================================
+# TOKEN VALIDATION - customer hardware, no network, public key only
+# ==============================================================================
+
+def validate_token(token: str, pubkey=None) -> Tuple[Optional[Dict],
+                                                     Optional[str]]:
+    """
+    Validate a licence token entirely locally.
+
+    pubkey is the 32-byte public key, as hex or bytes. Defaults to
+    LICENCE_PUBKEY. It cannot be used to produce a token, so shipping it
+    inside the engine costs nothing.
+
+    Returns (licence_data, None) or (None, error_code).
+
+        invalid_format      cannot be decoded
+        no_public_key       nothing configured to verify against
+        invalid_signature   tampered with, or signed by the wrong key
+        version_mismatch    not a v2 token - v1 HMAC tokens land here
+        token_expired       past expiry plus the grace period
+    """
+    if pubkey is None:
+        pubkey = LICENCE_PUBKEY
+    if isinstance(pubkey, str):
+        pubkey = pubkey.strip()
+        if not pubkey:
+            return None, "no_public_key"
+        try:
+            pubkey = bytes.fromhex(pubkey)
+        except ValueError:
+            return None, "no_public_key"
+    if not pubkey or len(pubkey) != 32:
+        return None, "no_public_key"
+
+    try:
+        raw = json.loads(base64.urlsafe_b64decode(token.encode("utf-8")))
+        payload_str = raw.get("payload", "")
+        sig_hex = raw.get("sig", "")
+        if not payload_str or not sig_hex:
+            return None, "invalid_format"
+        sig = bytes.fromhex(sig_hex)
+    except Exception:
+        return None, "invalid_format"
+
+    if not verify(pubkey, payload_str.encode("utf-8"), sig):
+        return None, "invalid_signature"
+
+    try:
+        data = json.loads(payload_str)
+    except Exception:
+        return None, "invalid_format"
+
+    if data.get("v") != TOKEN_VERSION:
+        return None, "version_mismatch"
+
+    if data.get("expires", 0) + GRACE_SECONDS < time.time():
+        return None, "token_expired"
+
+    return data, None
+
+
+def is_in_grace_period(token_data: Dict) -> bool:
+    return token_data.get("expires", 0) < time.time()
+
+
+def days_until_expiry(token_data: Dict) -> int:
+    return int((token_data.get("expires", 0) - time.time()) / 86400)
+
+
+# ==============================================================================
+# LOCAL LICENCE STORE
+# ==============================================================================
+
+_lock = threading.Lock()
+
+
+def save_licence_locally(db_path: str, token: str, licence_data: Dict):
+    with _lock:
+        conn = sqlite3.connect(db_path)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS licence_cache (
+                id INTEGER PRIMARY KEY, token TEXT, api_key TEXT,
+                devices INTEGER, plan TEXT, email TEXT,
+                issued INTEGER, expires INTEGER, cached_at REAL)""")
+        conn.execute("DELETE FROM licence_cache")
+        conn.execute(
+            "INSERT INTO licence_cache(token,api_key,devices,plan,email,"
+            "issued,expires,cached_at) VALUES(?,?,?,?,?,?,?,?)",
+            (token, licence_data.get("key", ""),
+             licence_data.get("devices", 1), licence_data.get("plan", "free"),
+             licence_data.get("email", ""), licence_data.get("issued", 0),
+             licence_data.get("expires", 0), time.time()))
+        conn.commit()
+        conn.close()
+
+
+def load_licence_locally(db_path: str) -> Optional[Tuple[str, Dict]]:
+    """Returns (token, data) or None. The token is re-verified by the caller -
+    a cached row is a convenience, never an authority."""
+    try:
+        with _lock:
+            conn = sqlite3.connect(db_path)
+            row = conn.execute(
+                "SELECT token,api_key,devices,plan,email,issued,expires "
+                "FROM licence_cache LIMIT 1").fetchone()
+            conn.close()
+        if not row:
+            return None
+        return row[0], {"v": TOKEN_VERSION, "key": row[1], "devices": row[2],
+                        "plan": row[3], "email": row[4], "issued": row[5],
+                        "expires": row[6]}
+    except Exception:
+        return None
+
+
+# ==============================================================================
+# STRESS TEST      python3 sebdog_licence.py
+# KEY GENERATION   python3 sebdog_licence.py --keygen
+# ==============================================================================
+
+if __name__ == "__main__":
+    import sys
+
+    if "--keygen" in sys.argv:
+        priv, pub = keygen()
+        print("PRIVATE SEED - server only, never ships, never leaves Railway")
+        print("  SEBDOG_LICENCE_SEED=" + priv)
+        print()
+        print("PUBLIC KEY - paste into LICENCE_PUBKEY here and in the engine")
+        print("  " + pub)
+        print()
+        print("Losing the private seed means no new tokens can be issued and")
+        print("every deployed public key must be replaced. Back it up.")
+        sys.exit(0)
+
+    print("SEBDOG LICENCE SYSTEM v2 - Ed25519 - Stress Test")
+    print("=" * 62)
+
+    SEED = os.urandom(32)
+    PUB = public_key(SEED)
+    TEST_KEY = "al_live_" + os.urandom(12).hex()
+    PASSES = FAILURES = 0
+
+    def check(name, condition, detail=""):
+        global PASSES, FAILURES
+        if condition:
+            print("  PASS  " + name)
+            PASSES += 1
+        else:
+            print("  FAIL  " + name + " " + str(detail))
+            FAILURES += 1
+
+    print("\n[1] Generation and validation")
+    token = generate_token(TEST_KEY, 10000, "paid", "test@example.com", SEED)
+    data, err = validate_token(token, PUB)
+    check("Valid token accepted", err is None, err)
+    check("API key preserved", data and data.get("key") == TEST_KEY)
+    check("Device count preserved", data and data.get("devices") == 10000)
+    check("Plan preserved", data and data.get("plan") == "paid")
+    check("Not in grace period", data and not is_in_grace_period(data))
+    check("Over 360 days remaining", data and days_until_expiry(data) > 360)
+    check("Public key accepted as hex", validate_token(token, PUB.hex())[1] is None)
+
+    print("\n[2] THE POINT OF VERSION 2")
+    print("      A customer holds the public key. Can they mint a licence?")
+    # Feeding the public key in as a seed does not error - it is 32 bytes,
+    # so it derives some other keypair entirely. The property that matters
+    # is that whatever comes out does NOT verify against the real key.
+    attempt = generate_token(TEST_KEY, 999999, "enterprise",
+                             "attacker@example.com", PUB)
+    _, err = validate_token(attempt, PUB)
+    check("Token minted with the public key does not verify",
+          err == "invalid_signature", err)
+    check("Public key is not the private seed",
+          public_key(PUB) != PUB)
+    other_seed = os.urandom(32)
+    self_signed = generate_token(TEST_KEY, 999999, "enterprise",
+                                 "attacker@example.com", other_seed)
+    _, err = validate_token(self_signed, PUB)
+    check("Token signed by any other key rejected", err == "invalid_signature")
+
+    print("\n[3] Tamper detection")
+    for label, old, new in [("device count", "10000", "99999"),
+                            ("plan", "paid", "enterprise"),
+                            ("expiry", '"expires"', '"expiries"')]:
+        raw = json.loads(base64.urlsafe_b64decode(token))
+        raw["payload"] = raw["payload"].replace(old, new)
+        bad = base64.urlsafe_b64encode(
+            json.dumps(raw, separators=(",", ":")).encode()).decode()
+        _, err = validate_token(bad, PUB)
+        check("Tampered " + label + " rejected", err == "invalid_signature", err)
+    raw = json.loads(base64.urlsafe_b64decode(token))
+    raw["sig"] = "00" * 64
+    bad = base64.urlsafe_b64encode(
+        json.dumps(raw, separators=(",", ":")).encode()).decode()
+    check("Zeroed signature rejected",
+          validate_token(bad, PUB)[1] == "invalid_signature")
+
+    print("\n[4] Expiry")
+    exp = generate_token(TEST_KEY, 100, "paid", "t@e.com", SEED, validity_days=-1)
+    d, err = validate_token(exp, PUB)
+    check("Recently expired token still runs in grace", err is None and d)
+    check("Grace period reported", d and is_in_grace_period(d))
+    hard = generate_token(TEST_KEY, 100, "paid", "t@e.com", SEED, validity_days=-9)
+    check("Hard expired token rejected",
+          validate_token(hard, PUB)[1] == "token_expired")
+
+    print("\n[5] Wrong key")
+    check("Unrelated public key rejected",
+          validate_token(token, public_key(os.urandom(32)))[1] == "invalid_signature")
+    flipped = bytearray(PUB)
+    flipped[0] ^= 1
+    check("One-bit-flipped public key rejected",
+          validate_token(token, bytes(flipped))[1] == "invalid_signature")
+
+    print("\n[6] Malformed input")
+    for label, bad_in in [("garbage", "notbase64!!!"), ("empty", ""),
+                          ("empty json", base64.urlsafe_b64encode(b"{}").decode())]:
+        check(label + " rejected", validate_token(bad_in, PUB)[1] is not None)
+    check("Missing public key reported",
+          validate_token(token, "")[1] == "no_public_key")
+
+    print("\n[7] v1 tokens are not silently accepted")
+    v1_payload = json.dumps({"v": "1", "key": TEST_KEY, "devices": 10,
+                             "plan": "paid", "email": "t@e.com",
+                             "issued": int(time.time()),
+                             "expires": int(time.time()) + 86400},
+                            sort_keys=True, separators=(",", ":"))
+    v1 = base64.urlsafe_b64encode(json.dumps(
+        {"payload": v1_payload, "sig": sign(SEED, v1_payload.encode()).hex()},
+        separators=(",", ":")).encode()).decode()
+    check("v1 token rejected by version",
+          validate_token(v1, PUB)[1] == "version_mismatch")
+
+    print("\n[8] Local cache")
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        test_db = f.name
+    try:
+        d, _ = validate_token(token, PUB)
+        save_licence_locally(test_db, token, d)
+        cached = load_licence_locally(test_db)
+        check("Saved and retrieved", cached is not None)
+        check("Cached token re-verifies",
+              cached and validate_token(cached[0], PUB)[1] is None)
+        check("Cached devices match", cached and cached[1]["devices"] == 10000)
+    finally:
+        os.unlink(test_db)
+
+    print("\n[9] Performance")
+    import timeit
+    g = timeit.timeit(lambda: generate_token(TEST_KEY, 1, "paid", "t@e.com",
+                                             SEED), number=50) / 50
+    v = timeit.timeit(lambda: validate_token(token, PUB), number=50) / 50
+    print("      sign   %.1f ms" % (g * 1000))
+    print("      verify %.1f ms" % (v * 1000))
+    check("Verification under 50ms", v < 0.05)
+
+    print("\n" + "=" * 62)
+    print("Results: %d passed, %d failed" % (PASSES, FAILURES))
+    print("ALL TESTS PASSED." if not FAILURES else "FAILURES. Do not ship.")
+    sys.exit(0 if not FAILURES else 1)
+
+```
+
+
 ## `sebdog_reporter.py`
 
 217 lines, 8364 bytes
@@ -1907,689 +2414,5 @@ if __name__ == "__main__":
         with open(out, "w") as f:
             f.write(report)
         print(f"Report saved to {out}")
-
-```
-
-
-## `tests/attack_continuity_1.py`
-
-440 lines, 22747 bytes
-
-```python
-#!/usr/bin/env python3
-"""Attack harness for modules/lineage.py.
-
-Every test is written from the position of an agent that HAS some authority
-and is trying to end up with more. Passing means the attack was refused for
-the right reason, not merely refused.
-"""
-
-import hashlib
-import json
-import sqlite3
-import threading
-import time
-import sys
-
-import continuity as lineage
-# --- stand-in for the deployed engine ---------------------------------
-import types as _types
-_ENGINE = {"verdict": "ALLOW"}
-
-def install_engine(verdict="ALLOW", raises=False, shape="dict"):
-    _ENGINE["verdict"] = verdict
-    mod = _types.ModuleType("server")
-    mod.get_bearer = lambda *a, **k: None
-    def score_event(event):
-        if raises:
-            raise RuntimeError("engine down")
-        if shape == "dict":
-            return {"decision": _ENGINE["verdict"], "score": 0.1}
-        if shape == "tuple":
-            return (_ENGINE["verdict"], 0.1)
-        return _ENGINE["verdict"]
-    mod.score_event = score_event
-    sys.modules["server"] = mod
-
-def remove_engine():
-    sys.modules.pop("server", None)
-
-install_engine("ALLOW")
-
-
-PASS, FAIL = [], []
-
-
-def make_ctx():
-    conn = sqlite3.connect(":memory:", check_same_thread=False)
-    lock = threading.RLock()
-    chain = {"n": 0, "prev": "0" * 64}
-
-    def seal(ev, res, ts, api_key):
-        chain["n"] += 1
-        payload = json.dumps([ev, res, ts, api_key, chain["prev"]], sort_keys=True)
-        h = hashlib.sha256(payload.encode()).hexdigest()
-        chain["prev"] = h
-        return h, chain["n"], chain["n"]
-
-    lineage._ready = False
-    ctx = {"conn": conn, "lock": lock, "seal": seal}
-    lineage._setup(ctx)
-    return ctx
-
-
-def check(name, condition, detail=""):
-    (PASS if condition else FAIL).append(name)
-    print(("  ok   " if condition else "  FAIL ") + name + (("  -> " + detail) if detail and not condition else ""))
-
-
-def issue(ctx, **kw):
-    if kw.get("parent") and int(kw.get("delegations_left", 0)) > 0 \
-            and not kw.get("risk_accepted_by"):
-        kw["risk_accepted_by"] = "owner@example.com"
-    return lineage._issue(ctx, "k", kw)
-
-
-def exercise(ctx, **kw):
-    return lineage._evaluate(ctx, "k", kw)
-
-
-NOW = time.time()
-HOUR = 3600
-
-
-def base_root(ctx, **over):
-    args = dict(
-        id="root", issuer="justin@monop", issuer_kind="human",
-        subject="orchestrator", subject_kind="agent",
-        scope=["payments.refund", "payments.read", "tickets.*"],
-        constraints={"max_amount": 5000, "allowed_currency": ["GBP", "EUR"],
-                     "denied_country": ["KP"], "may_contact_customer": True},
-        purpose="resolve customer refund complaints",
-        purpose_tags=["refunds", "support"],
-        not_before=NOW - HOUR, not_after=NOW + 10 * HOUR,
-        delegations_left=3)
-    args.update(over)
-    return issue(ctx, **args)
-
-
-print("\n=== 1. the happy path must actually work ===")
-ctx = make_ctx()
-base_root(ctx)
-issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent",
-      subject="refund-agent", scope=["payments.refund"],
-      constraints={"max_amount": 500, "allowed_currency": ["GBP"],
-                   "denied_country": ["KP"], "may_contact_customer": True},
-      purpose="issue refunds under 500", purpose_tags=["refunds"],
-      not_before=NOW - HOUR, not_after=NOW + 2 * HOUR, delegations_left=1)
-r, code = exercise(ctx, grant="mid", action="payments.refund",
-                   params={"amount": 100, "currency": "GBP", "country": "GB",
-                           "contact_customer": True},
-                   purpose_tag="refunds")
-check("a derivable action returns ALLOW", r["verdict"] == "ALLOW", str(r["reasons"]))
-check("lineage names the human at the root", r["authorised_by"] == "justin@monop")
-check("depth is reported", r["delegation_depth"] == 1)
-check("the decision is sealed", bool(r.get("sealed_in_chain")))
-
-print("\n=== 2. orphan root: an agent grants itself authority ===")
-ctx = make_ctx()
-r, code = issue(ctx, id="self", issuer="rogue-agent", issuer_kind="agent",
-                subject="rogue-agent", scope=["payments.refund"],
-                constraints={"max_amount": 999999}, purpose="whatever I decide",
-                purpose_tags=["anything"], not_after=NOW + HOUR)
-check("self-issued root is refused at issue", code == 409 and r.get("error") == "identity_continuity", str(r))
-
-print("\n=== 3. scope escalation in a child ===")
-ctx = make_ctx()
-base_root(ctx)
-r, code = issue(ctx, id="wide", parent="root", issuer="orchestrator", issuer_kind="agent",
-                subject="rogue", scope=["payments.refund", "payments.transfer"],
-                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
-                             "denied_country": ["KP"], "may_contact_customer": False},
-                purpose="sneak in a transfer", purpose_tags=["refunds"],
-                not_after=NOW + HOUR, delegations_left=0)
-check("scope the parent never held is refused",
-      code == 409 and "payments.transfer" in r.get("message", ""), str(r))
-
-print("\n=== 4. constraint loosening ===")
-ctx = make_ctx()
-base_root(ctx)
-r, code = issue(ctx, id="rich", parent="root", issuer="orchestrator", issuer_kind="agent",
-                subject="rogue", scope=["payments.refund"],
-                constraints={"max_amount": 50000, "allowed_currency": ["GBP"],
-                             "denied_country": ["KP"], "may_contact_customer": True},
-                purpose="bigger refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
-check("raising a max_ cap is refused", code == 409 and "max_amount" in r.get("message", ""), str(r))
-
-r, code = issue(ctx, id="wide2", parent="root", issuer="orchestrator", issuer_kind="agent",
-                subject="rogue", scope=["payments.refund"],
-                constraints={"max_amount": 100, "allowed_currency": ["GBP", "USD"],
-                             "denied_country": ["KP"], "may_contact_customer": True},
-                purpose="new currency", purpose_tags=["refunds"], not_after=NOW + HOUR)
-check("adding to an allowed_ set is refused", code == 409 and "USD" in r.get("message", ""), str(r))
-
-r, code = issue(ctx, id="undeny", parent="root", issuer="orchestrator", issuer_kind="agent",
-                subject="rogue", scope=["payments.refund"],
-                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
-                             "denied_country": [], "may_contact_customer": True},
-                purpose="drop the denylist", purpose_tags=["refunds"], not_after=NOW + HOUR)
-check("dropping from a denied_ set is refused", code == 409 and "KP" in r.get("message", ""), str(r))
-
-r, code = issue(ctx, id="newkey", parent="root", issuer="orchestrator", issuer_kind="agent",
-                subject="rogue", scope=["payments.refund"],
-                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
-                             "denied_country": ["KP"], "may_contact_customer": True,
-                             "may_export_data": True},
-                purpose="invent a permission", purpose_tags=["refunds"], not_after=NOW + HOUR)
-check("introducing a constraint key the parent never expressed is refused",
-      code == 409 and "may_export_data" in r.get("message", ""), str(r))
-
-print("\n=== 5. temporal attacks ===")
-ctx = make_ctx()
-base_root(ctx)
-r, code = issue(ctx, id="long", parent="root", issuer="orchestrator", issuer_kind="agent",
-                subject="rogue", scope=["payments.refund"],
-                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
-                             "denied_country": ["KP"], "may_contact_customer": True},
-                purpose="outlive the parent", purpose_tags=["refunds"],
-                not_before=NOW, not_after=NOW + 100 * HOUR)
-check("a child cannot outlive its parent", code == 409 and r.get("error") == "temporal_validity", str(r))
-
-# expired ancestor, live leaf, forced in past the issue check
-ctx = make_ctx()
-base_root(ctx, not_after=NOW + HOUR)
-issue(ctx, id="child", parent="root", issuer="orchestrator", issuer_kind="agent",
-      subject="agent-b", scope=["payments.refund"],
-      constraints={"max_amount": 100, "allowed_currency": ["GBP"],
-                   "denied_country": ["KP"], "may_contact_customer": True},
-      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
-with ctx["lock"]:
-    ctx["conn"].execute("UPDATE auth_grant SET not_after=? WHERE id='root'", (NOW - 60,))
-    ctx["conn"].commit()
-r, _ = exercise(ctx, grant="child", action="payments.refund",
-                params={"amount": 10, "currency": "GBP", "country": "GB",
-                        "contact_customer": True}, purpose_tag="refunds")
-check("an expired ancestor kills a live leaf", r["verdict"] == "BLOCK", str(r["reasons"]))
-check("...and it is reported as tampering, since the row no longer matches its digest",
-      r["broken_invariant"] == "evidence_continuity", r["broken_invariant"] or "")
-
-print("\n=== 6. revocation is transitive ===")
-ctx = make_ctx()
-base_root(ctx)
-issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent",
-      subject="b", scope=["payments.refund"],
-      constraints={"max_amount": 100, "allowed_currency": ["GBP"],
-                   "denied_country": ["KP"], "may_contact_customer": True},
-      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR, delegations_left=1)
-issue(ctx, id="leaf", parent="mid", issuer="b", issuer_kind="agent",
-      subject="c", scope=["payments.refund"],
-      constraints={"max_amount": 50, "allowed_currency": ["GBP"],
-                   "denied_country": ["KP"], "may_contact_customer": True},
-      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
-lineage._revoke(ctx, "k", {"grant": "mid", "reason": "agent compromised"})
-r, _ = exercise(ctx, grant="leaf", action="payments.refund",
-                params={"amount": 10, "currency": "GBP", "country": "GB",
-                        "contact_customer": True}, purpose_tag="refunds")
-check("revoking the middle blocks the leaf without touching it", r["verdict"] == "BLOCK")
-check("the revoked grant is named", r["broken_at"] == "mid", str(r["broken_at"]))
-r2, _ = exercise(ctx, grant="root", action="payments.refund",
-                 params={"amount": 10, "currency": "GBP", "country": "GB",
-                         "contact_customer": True}, purpose_tag="refunds")
-check("revoking a child does not harm the parent", r2["verdict"] == "ALLOW", str(r2["reasons"]))
-
-print("\n=== 7. delegation depth cannot be manufactured ===")
-ctx = make_ctx()
-base_root(ctx, delegations_left=1)
-issue(ctx, id="d1", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
-      scope=["payments.refund"],
-      constraints={"max_amount": 100, "allowed_currency": ["GBP"],
-                   "denied_country": ["KP"], "may_contact_customer": True},
-      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR, delegations_left=0)
-r, code = issue(ctx, id="d2", parent="d1", issuer="b", issuer_kind="agent", subject="c",
-                scope=["payments.refund"],
-                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
-                             "denied_country": ["KP"], "may_contact_customer": True},
-                purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
-check("an exhausted delegation budget stops the chain",
-      code == 409 and r.get("error") == "delegation_not_permitted", str(r))
-
-ctx = make_ctx()
-base_root(ctx, delegations_left=2)
-r, code = issue(ctx, id="greedy", parent="root", issuer="orchestrator", issuer_kind="agent",
-                subject="b", scope=["payments.refund"],
-                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
-                             "denied_country": ["KP"], "may_contact_customer": True},
-                purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR,
-                delegations_left=5)
-check("a child cannot award itself more onward delegations than remained",
-      code == 409, str(r))
-
-print("\n=== 8. tampering with a stored grant ===")
-ctx = make_ctx()
-base_root(ctx)
-issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
-      scope=["payments.refund"],
-      constraints={"max_amount": 100, "allowed_currency": ["GBP"],
-                   "denied_country": ["KP"], "may_contact_customer": True},
-      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
-with ctx["lock"]:
-    ctx["conn"].execute(
-        "UPDATE auth_grant SET constraints=? WHERE id='mid'",
-        (json.dumps({"max_amount": 999999, "allowed_currency": ["GBP", "USD"],
-                     "denied_country": [], "may_contact_customer": True},
-                    sort_keys=True, separators=(",", ":")),))
-    ctx["conn"].commit()
-r, _ = exercise(ctx, grant="mid", action="payments.refund",
-                params={"amount": 900000, "currency": "USD", "country": "GB",
-                        "contact_customer": True}, purpose_tag="refunds")
-check("editing the database does not widen authority", r["verdict"] == "BLOCK")
-check("the tamper is reported as an evidence failure",
-      r["broken_invariant"] == "evidence_continuity", str(r["broken_invariant"]))
-
-print("\n=== 9. re-parenting onto a wider ancestor ===")
-ctx = make_ctx()
-base_root(ctx)
-issue(ctx, id="narrow", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
-      scope=["payments.read"],
-      constraints={"max_amount": 1, "allowed_currency": ["GBP"],
-                   "denied_country": ["KP"], "may_contact_customer": False},
-      purpose="read only", purpose_tags=["support"], not_after=NOW + HOUR)
-with ctx["lock"]:
-    ctx["conn"].execute("UPDATE auth_grant SET parent=NULL WHERE id='narrow'")
-    ctx["conn"].commit()
-r, _ = exercise(ctx, grant="narrow", action="payments.read",
-                params={}, purpose_tag="support")
-check("detaching a grant to make it a root fails integrity", r["verdict"] == "BLOCK",
-      str(r["reasons"]))
-
-print("\n=== 10. parent cycle ===")
-ctx = make_ctx()
-base_root(ctx)
-issue(ctx, id="a", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
-      scope=["payments.refund"],
-      constraints={"max_amount": 100, "allowed_currency": ["GBP"],
-                   "denied_country": ["KP"], "may_contact_customer": True},
-      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR, delegations_left=1)
-issue(ctx, id="b", parent="a", issuer="b", issuer_kind="agent", subject="c",
-      scope=["payments.refund"],
-      constraints={"max_amount": 50, "allowed_currency": ["GBP"],
-                   "denied_country": ["KP"], "may_contact_customer": True},
-      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
-with ctx["lock"]:
-    ctx["conn"].execute("UPDATE auth_grant SET parent='b' WHERE id='a'")
-    ctx["conn"].commit()
-start = time.time()
-r, _ = exercise(ctx, grant="b", action="payments.refund",
-                params={"amount": 10, "currency": "GBP", "country": "GB",
-                        "contact_customer": True}, purpose_tag="refunds")
-check("a parent cycle terminates rather than hangs", time.time() - start < 2)
-check("a cycle is BLOCKed as an authority failure", r["verdict"] == "BLOCK")
-
-print("\n=== 11. action parameters beyond the effective constraints ===")
-ctx = make_ctx()
-base_root(ctx)
-issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
-      scope=["payments.refund"],
-      constraints={"max_amount": 500, "allowed_currency": ["GBP"],
-                   "denied_country": ["KP"], "may_contact_customer": True},
-      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
-r, _ = exercise(ctx, grant="mid", action="payments.refund",
-                params={"amount": 501, "currency": "GBP", "country": "GB",
-                        "contact_customer": True}, purpose_tag="refunds")
-check("an amount over the cap is BLOCKed", r["verdict"] == "BLOCK", str(r["reasons"]))
-r, _ = exercise(ctx, grant="mid", action="payments.refund",
-                params={"amount": 10, "currency": "GBP", "country": "KP",
-                        "contact_customer": True}, purpose_tag="refunds")
-check("a denied country is BLOCKed", r["verdict"] == "BLOCK", str(r["reasons"]))
-
-print("\n=== 12. uncertainty is challenged, not guessed ===")
-ctx = make_ctx()
-base_root(ctx)
-issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
-      scope=["payments.refund"],
-      constraints={"max_amount": 500, "allowed_currency": ["GBP"],
-                   "denied_country": ["KP"], "may_contact_customer": True},
-      purpose="issue refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
-r, _ = exercise(ctx, grant="mid", action="payments.refund",
-                params={"amount": 10, "currency": "GBP", "country": "GB",
-                        "contact_customer": True}, purpose_tag="marketing")
-check("a purpose the grant does not carry is CHALLENGED", r["verdict"] == "CHALLENGE", str(r))
-r, _ = exercise(ctx, grant="mid", action="payments.refund",
-                params={"amount": 10, "currency": "GBP", "country": "GB",
-                        "contact_customer": True})
-check("no declared purpose is CHALLENGED", r["verdict"] == "CHALLENGE", str(r))
-r, _ = exercise(ctx, grant="mid", action="payments.refund",
-                params={"amount": 10, "currency": "GBP", "country": "GB",
-                        "contact_customer": True, "recipient_iban": "GB00XXXX"},
-                purpose_tag="refunds")
-check("an unconstrained parameter is CHALLENGED, not ignored",
-      r["verdict"] == "CHALLENGE" and any("recipient_iban" in x for x in r["reasons"]), str(r))
-
-print("\n=== 13. wildcard breadth ===")
-ctx = make_ctx()
-base_root(ctx)
-r, _ = exercise(ctx, grant="root", action="tickets.close.bulk.all",
-                params={}, purpose_tag="support")
-check("a broad wildcard match is CHALLENGED rather than silently allowed",
-      r["verdict"] == "CHALLENGE", str(r))
-
-ctx = make_ctx()
-base_root(ctx, scope=["*"], id="star")
-r, _ = exercise(ctx, grant="star", action="payments.transfer", params={}, purpose_tag="refunds")
-check("a bare * never reaches ALLOW", r["verdict"] == "CHALLENGE", str(r))
-
-print("\n=== 14. no union of grants ===")
-ctx = make_ctx()
-base_root(ctx)
-issue(ctx, id="money", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
-      scope=["payments.refund"],
-      constraints={"max_amount": 500, "allowed_currency": ["GBP"],
-                   "denied_country": ["KP"], "may_contact_customer": False},
-      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
-issue(ctx, id="contact", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
-      scope=["payments.read"],
-      constraints={"max_amount": 0, "allowed_currency": ["GBP"],
-                   "denied_country": ["KP"], "may_contact_customer": True},
-      purpose="contact", purpose_tags=["support"], not_after=NOW + HOUR)
-r, code = exercise(ctx, grant="money,contact", action="payments.refund",
-                   params={"amount": 10, "currency": "GBP", "contact_customer": True},
-                   purpose_tag="refunds")
-check("two grant ids cannot be combined into one exercise", r["verdict"] == "BLOCK", str(r))
-r, _ = exercise(ctx, grant="money", action="payments.refund",
-                params={"amount": 10, "currency": "GBP", "contact_customer": True},
-                purpose_tag="refunds")
-check("the capability from the sibling grant does not leak in", r["verdict"] == "BLOCK",
-      str(r["reasons"]))
-
-print("\n=== 15. time of check vs time of use ===")
-ctx = make_ctx()
-base_root(ctx)
-issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
-      scope=["payments.refund"],
-      constraints={"max_amount": 500, "allowed_currency": ["GBP"],
-                   "denied_country": ["KP"], "may_contact_customer": True},
-      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
-r, _ = exercise(ctx, grant="mid", action="payments.refund",
-                params={"amount": 10, "currency": "GBP", "country": "GB",
-                        "contact_customer": True}, purpose_tag="refunds")
-eval_id = r["evaluation"]
-c, code = lineage._confirm(ctx, "k", {"evaluation": eval_id, "action": "payments.refund",
-                                      "params": {"amount": 10, "currency": "GBP",
-                                                 "country": "GB", "contact_customer": True}})
-check("executing exactly what was evaluated binds", c["bound"] is True, str(c))
-c, code = lineage._confirm(ctx, "k", {"evaluation": eval_id, "action": "payments.refund",
-                                      "params": {"amount": 400, "currency": "GBP",
-                                                 "country": "GB", "contact_customer": True}})
-check("executing different values than were evaluated is rejected", c["bound"] is False, str(c))
-check("the rejected execution is still sealed", bool(c.get("sealed_in_chain")))
-
-with ctx["lock"]:
-    ctx["conn"].execute("UPDATE auth_eval SET valid_until=? WHERE id=?", (NOW - 1, eval_id))
-    ctx["conn"].commit()
-c, _ = lineage._confirm(ctx, "k", {"evaluation": eval_id})
-check("a banked evaluation cannot be spent after its window", c["bound"] is False, str(c))
-
-print("\n=== 16. a BLOCK is evidence, not silence ===")
-ctx = make_ctx()
-base_root(ctx)
-r, _ = exercise(ctx, grant="nonexistent", action="payments.refund", params={})
-check("an unknown grant BLOCKs", r["verdict"] == "BLOCK")
-check("the block is sealed in the chain", bool(r.get("sealed_in_chain")))
-d, code = lineage._decision(ctx, {"evaluation": r["evaluation"]})
-check("the sealed decision is publicly retrievable", code == 200 and d["verdict"] == "BLOCK")
-
-print("\n=== 17. no authority without a stated purpose or an end date ===")
-ctx = make_ctx()
-r, code = issue(ctx, id="forever", issuer="justin@monop", issuer_kind="human", subject="a",
-                scope=["payments.refund"], constraints={"max_amount": 1},
-                purpose="anything", purpose_tags=["x"])
-check("a grant with no expiry is refused", code == 400 and r.get("error") == "not_after_required")
-r, code = issue(ctx, id="vague", issuer="justin@monop", issuer_kind="human", subject="a",
-                scope=["payments.refund"], constraints={"max_amount": 1},
-                purpose="", purpose_tags=["x"], not_after=NOW + HOUR)
-check("a grant with no purpose is refused", code == 400 and r.get("error") == "purpose_required")
-
-print("\n" + "=" * 60)
-print("passed %d, failed %d" % (len(PASS), len(FAIL)))
-if FAIL:
-    for f in FAIL:
-        print("  FAILED: " + f)
-    sys.exit(1)
-
-```
-
-
-## `tests/attack_continuity_2.py`
-
-228 lines, 10573 bytes
-
-```python
-#!/usr/bin/env python3
-"""Second wave. The first wave tested the obvious escalations. This one
-tests the ones that would survive a code review."""
-
-import hashlib
-import json
-import sqlite3
-import threading
-import time
-import sys
-
-import continuity as lineage
-# --- stand-in for the deployed engine ---------------------------------
-import types as _types
-_ENGINE = {"verdict": "ALLOW"}
-
-def install_engine(verdict="ALLOW", raises=False, shape="dict"):
-    _ENGINE["verdict"] = verdict
-    mod = _types.ModuleType("server")
-    mod.get_bearer = lambda *a, **k: None
-    def score_event(event):
-        if raises:
-            raise RuntimeError("engine down")
-        if shape == "dict":
-            return {"decision": _ENGINE["verdict"], "score": 0.1}
-        if shape == "tuple":
-            return (_ENGINE["verdict"], 0.1)
-        return _ENGINE["verdict"]
-    mod.score_event = score_event
-    sys.modules["server"] = mod
-
-def remove_engine():
-    sys.modules.pop("server", None)
-
-install_engine("ALLOW")
-
-
-PASS, FAIL = [], []
-NOW = time.time()
-HOUR = 3600
-
-
-def make_ctx():
-    conn = sqlite3.connect(":memory:", check_same_thread=False)
-    lock = threading.RLock()
-    n = {"i": 0}
-
-    def seal(ev, res, ts, api_key):
-        n["i"] += 1
-        return hashlib.sha256(json.dumps([ev, res, ts], sort_keys=True,
-                                         default=str).encode()).hexdigest(), n["i"], n["i"]
-    lineage._ready = False
-    ctx = {"conn": conn, "lock": lock, "seal": seal}
-    lineage._setup(ctx)
-    return ctx
-
-
-def check(name, cond, detail=""):
-    (PASS if cond else FAIL).append(name)
-    print(("  ok   " if cond else "  FAIL ") + name + (("  -> " + str(detail)[:300]) if detail and not cond else ""))
-
-
-def issue(ctx, **kw):
-    if kw.get("parent") and int(kw.get("delegations_left", 0)) > 0 \
-            and not kw.get("risk_accepted_by"):
-        kw["risk_accepted_by"] = "owner@example.com"
-    return lineage._issue(ctx, "k", kw)
-
-
-def root(ctx, **over):
-    args = dict(id="root", issuer="owner@example.com", issuer_kind="human",
-                subject="orchestrator", scope=["payments.refund", "payments.read"],
-                constraints={"max_amount": 5000, "allowed_currency": ["GBP", "EUR"]},
-                purpose="refunds", purpose_tags=["refunds"],
-                not_before=NOW - HOUR, not_after=NOW + 10 * HOUR, delegations_left=10)
-    args.update(over)
-    return issue(ctx, **args)
-
-
-print("\n=== 18. double execution against one ALLOW ===")
-ctx = make_ctx()
-root(ctx)
-r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments.refund",
-                                    "params": {"amount": 100, "currency": "GBP"},
-                                    "purpose_tag": "refunds"})
-eid = r["evaluation"]
-p = {"amount": 100, "currency": "GBP"}
-c1, _ = lineage._confirm(ctx, "k", {"evaluation": eid, "action": "payments.refund", "params": p})
-c2, _ = lineage._confirm(ctx, "k", {"evaluation": eid, "action": "payments.refund", "params": p})
-check("the first execution binds", c1["bound"] is True, c1)
-check("the same evaluation cannot be spent twice", c2["bound"] is False, c2)
-
-print("\n=== 19. type confusion in constraints ===")
-ctx = make_ctx()
-root(ctx, constraints={"max_amount": 5000, "allowed_currency": "GBP"})
-r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments.refund",
-                                    "params": {"amount": 10, "currency": "G"},
-                                    "purpose_tag": "refunds"})
-check("a single character does not satisfy a string-valued allowed_ list",
-      r["verdict"] == "BLOCK", r["reasons"])
-
-ctx = make_ctx()
-root(ctx)
-r, code = issue(ctx, id="strnum", parent="root", issuer="orchestrator", issuer_kind="agent",
-                subject="b", scope=["payments.refund"],
-                constraints={"max_amount": "50000", "allowed_currency": ["GBP"]},
-                purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
-check("a numeric cap passed as a string cannot beat the parent", code == 409, r)
-
-ctx = make_ctx()
-root(ctx)
-r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments.refund",
-                                    "params": {"amount": "99999", "currency": "GBP"},
-                                    "purpose_tag": "refunds"})
-check("a string amount is still compared numerically", r["verdict"] == "BLOCK", r["reasons"])
-
-ctx = make_ctx()
-root(ctx)
-r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments.refund",
-                                    "params": {"amount": True, "currency": "GBP"},
-                                    "purpose_tag": "refunds"})
-check("a non-numeric amount does not slip through as unconstrained",
-      r["verdict"] in ("BLOCK", "CHALLENGE"), r)
-
-print("\n=== 20. capability prefix tricks ===")
-ctx = make_ctx()
-root(ctx, scope=["payments.refund"])
-for probe in ["payments.refunds", "payments.refund.approve", "payments.refundX",
-              "Payments.Refund", "payments.refund "]:
-    r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": probe,
-                                        "params": {}, "purpose_tag": "refunds"})
-    check("'%s' is not covered by 'payments.refund'" % probe, r["verdict"] == "BLOCK", r["reasons"])
-
-ctx = make_ctx()
-root(ctx, scope=["payments.*"])
-r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments2.transfer",
-                                    "params": {}, "purpose_tag": "refunds"})
-check("'payments.*' does not cover 'payments2.transfer'", r["verdict"] == "BLOCK", r["reasons"])
-
-print("\n=== 21. a long but legitimate chain ===")
-ctx = make_ctx()
-root(ctx, constraints={"max_amount": 10000, "allowed_currency": ["GBP", "EUR"]},
-     delegations_left=12)
-parent, cap = "root", 10000
-for i in range(10):
-    cap = cap // 2
-    gid = "d%d" % i
-    r, code = issue(ctx, id=gid, parent=parent, issuer="a%d" % i, issuer_kind="agent",
-                    subject="a%d" % (i + 1), scope=["payments.refund"],
-                    constraints={"max_amount": cap, "allowed_currency": ["GBP"]},
-                    purpose="refunds", purpose_tags=["refunds"],
-                    not_after=NOW + HOUR, delegations_left=11 - i)
-    if code != 200:
-        break
-    parent = gid
-check("ten legitimate narrowing hops are accepted", code == 200 and parent == "d9", r)
-r, _ = lineage._evaluate(ctx, "k", {"grant": "d9", "action": "payments.refund",
-                                    "params": {"amount": 5, "currency": "GBP"},
-                                    "purpose_tag": "refunds"})
-check("the deep chain still ALLOWs a derivable action", r["verdict"] == "ALLOW", r["reasons"])
-check("the effective cap is the tightest in the chain",
-      float(r["effective_constraints"]["max_amount"]) == 9, r["effective_constraints"])
-check("the human at the root is still named ten hops down",
-      r["authorised_by"] == "owner@example.com")
-r, _ = lineage._evaluate(ctx, "k", {"grant": "d9", "action": "payments.refund",
-                                    "params": {"amount": 10, "currency": "GBP"},
-                                    "purpose_tag": "refunds"})
-check("one unit over the deepest cap is BLOCKed", r["verdict"] == "BLOCK", r["reasons"])
-
-print("\n=== 22. revoking the root kills the whole tree ===")
-lineage._revoke(ctx, "k", {"grant": "root", "reason": "principal withdrew authority"})
-r, _ = lineage._evaluate(ctx, "k", {"grant": "d9", "action": "payments.refund",
-                                    "params": {"amount": 1, "currency": "GBP"},
-                                    "purpose_tag": "refunds"})
-check("revoking the root blocks a leaf ten hops away", r["verdict"] == "BLOCK")
-check("the root is named as the break point", r["broken_at"] == "root", r["broken_at"])
-
-print("\n=== 23. issuing under a revoked or expired parent ===")
-ctx = make_ctx()
-root(ctx)
-lineage._revoke(ctx, "k", {"grant": "root", "reason": "x"})
-r, code = issue(ctx, id="after", parent="root", issuer="orchestrator", issuer_kind="agent",
-                subject="b", scope=["payments.refund"],
-                constraints={"max_amount": 1, "allowed_currency": ["GBP"]},
-                purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
-check("no new delegation under a revoked parent", code == 409 and r.get("error") == "parent_revoked", r)
-
-print("\n=== 24. duplicate grant id cannot overwrite a grant ===")
-ctx = make_ctx()
-root(ctx)
-r, code = root(ctx, scope=["*"], constraints={"max_amount": 999999})
-check("re-issuing an existing id is refused", code == 409 and r.get("error") == "grant_exists", r)
-
-print("\n=== 25. the boundary values themselves ===")
-ctx = make_ctx()
-root(ctx, constraints={"max_amount": 100, "allowed_currency": ["GBP"]}, delegations_left=2)
-r, code = issue(ctx, id="equal", parent="root", issuer="orchestrator", issuer_kind="agent",
-                subject="b", scope=["payments.refund"],
-                constraints={"max_amount": 100, "allowed_currency": ["GBP"]},
-                purpose="refunds", purpose_tags=["refunds"],
-                not_after=NOW + 10 * HOUR, delegations_left=1)
-check("an equal-not-wider child is accepted", code == 200, r)
-r, _ = lineage._evaluate(ctx, "k", {"grant": "equal", "action": "payments.refund",
-                                    "params": {"amount": 100, "currency": "GBP"},
-                                    "purpose_tag": "refunds"})
-check("exactly the cap is allowed", r["verdict"] == "ALLOW", r["reasons"])
-r, _ = lineage._evaluate(ctx, "k", {"grant": "equal", "action": "payments.refund",
-                                    "params": {"amount": 100.01, "currency": "GBP"},
-                                    "purpose_tag": "refunds"})
-check("a penny over the cap is blocked", r["verdict"] == "BLOCK", r["reasons"])
-
-print("\n=== 26. a CHALLENGE cannot be executed ===")
-ctx = make_ctx()
-root(ctx)
-r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments.refund",
-                                    "params": {"amount": 1, "currency": "GBP"}})
-check("no declared purpose gives CHALLENGE", r["verdict"] == "CHALLENGE", r["verdict"])
-c, code = lineage._confirm(ctx, "k", {"evaluation": r["evaluation"],
-                                      "action": "payments.refund",
-                                      "params": {"amount": 1, "currency": "GBP"}})
-check("a CHALLENGE cannot be bound as an execution", c["bound"] is False, c)
-
-print("\n" + "=" * 60)
-print("passed %d, failed %d" % (len(PASS), len(FAIL)))
-for f in FAIL:
-    print("  FAILED: " + f)
-sys.exit(1 if FAIL else 0)
 
 ```
