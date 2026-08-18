@@ -1,8 +1,6 @@
 # Codebase — part 12 of 21
 
 Contains:
-- `meshwitness.py`
-- `sebbi_orchestrator.py`
 - `sebdog_engine.py`
 - `sebdog_licence.py`
 - `sebdog_reporter.py`
@@ -11,544 +9,8 @@ Contains:
 - `tests/attack_continuity_3.py`
 - `tests/attack_continuity_4.py`
 - `tests/attack_continuity_5.py`
-
-
-## `meshwitness.py`
-
-328 lines, 11605 bytes
-
-```python
-#!/usr/bin/env python3
-"""
-meshwitness.py  v1.0  -  witness everybody, not just whoever invited you
-
-    Standard library only. One file. One cron line. No install.
-
-WHAT PROBLEM THIS SOLVES
-    Witnessing runs on your own machine, so your server only witnesses
-    chains you have told it about. Most operators point at whoever
-    introduced them and stop there. The result is a star: everybody
-    connected to one node in the middle, and if that node goes down
-    every chain loses its witness at the same moment.
-
-    This reads the published roster and witnesses EVERY chain on it. A
-    chain that joins tomorrow gets picked up on your next run with
-    nothing to configure and no email from anyone.
-
-WHAT IT DOES, EACH RUN
-    1. Fetches the roster.
-    2. For every chain with a tip URL, fetches their current tip.
-    3. Seals that tip into YOUR chain, via your own seal endpoint.
-    4. Pushes YOUR tip to their submit endpoint, so the witnessing is
-       mutual rather than one-way.
-    5. Prints a line per peer and exits non-zero if nothing worked.
-
-    It never sends your data anywhere. A tip is a hash. That is the
-    whole payload.
-
-RUN IT
-    export MESH_TIP_URL=https://yoursite.example/witness.json
-    export MESH_SEAL_URL=https://yoursite.example/api/witness/seal
-    export MESH_CHAIN=your-chain-name
-
-    python3 meshwitness.py
-
-    Cron, hourly, on a minute nobody else is using:
-        23 * * * * /usr/bin/python3 /path/meshwitness.py >> /var/log/mesh.log 2>&1
-
-    Check what it would do without doing it:
-        python3 meshwitness.py --dry-run
-
-CONFIGURATION
-    MESH_TIP_URL    where YOUR current tip is served. required.
-    MESH_SEAL_URL   your own endpoint that seals an observed tip.
-                    optional -- omit it and this only pushes, which is
-                    still useful but only half the exchange.
-    MESH_CHAIN      your chain name as other nodes should record it.
-    MESH_ROSTER     roster to read. defaults to sebbi.pro.
-    MESH_SKIP       comma separated chain names to ignore.
-    MESH_TIMEOUT    seconds per request. default 15.
-
-IF YOUR STACK IS NOT PYTHON
-    The whole protocol is four HTTP calls and no cryptography beyond a
-    hash you already have. Read --explain for the exact requests and
-    write it in whatever you use. Nothing here is privileged.
-"""
-
-import json
-import os
-import sys
-import time
-import urllib.error
-import urllib.request
-
-VERSION = "1.0"
-
-DEFAULT_ROSTER = "https://sebbi.pro/x/roster/list"
-DEFAULT_TIMEOUT = 15.0
-USER_AGENT = "meshwitness/%s" % VERSION
-
-
-# ------------------------------------------------------------------ http
-
-def _get(url, timeout):
-    req = urllib.request.Request(url, headers={
-        "Accept": "application/json", "User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        raw = r.read().decode("utf-8", "replace")
-    try:
-        return json.loads(raw)
-    except ValueError:
-        return {"_raw": raw.strip()}
-
-
-def _post(url, payload, timeout):
-    body = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=body, headers={
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "User-Agent": USER_AGENT,
-    }, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.status, json.loads(r.read().decode("utf-8", "replace"))
-    except urllib.error.HTTPError as e:
-        try:
-            return e.code, json.loads(e.read().decode("utf-8", "replace"))
-        except Exception:
-            return e.code, {"error": "http_%d" % e.code}
-
-
-def _extract_tip(doc):
-    """
-    Find the tip hash in whatever shape a peer serves. Different nodes
-    name it differently and that is not worth an argument.
-    """
-    if isinstance(doc, str):
-        return doc.strip() or None
-    if not isinstance(doc, dict):
-        return None
-    for k in ("tip", "head", "current_tip", "chain_tip", "root",
-              "latest", "hash", "audit_hash", "seal"):
-        v = doc.get(k)
-        if isinstance(v, str) and len(v) >= 32:
-            return v.strip()
-        if isinstance(v, dict):
-            inner = _extract_tip(v)
-            if inner:
-                return inner
-    for k in ("chain", "witness", "data", "result"):
-        v = doc.get(k)
-        if isinstance(v, dict):
-            inner = _extract_tip(v)
-            if inner:
-                return inner
-    return None
-
-
-# ------------------------------------------------------------------ core
-
-class Mesh(object):
-
-    def __init__(self, tip_url=None, seal_url=None, chain=None,
-                 roster=None, skip=None, timeout=None, dry_run=False):
-        self.tip_url = tip_url or os.environ.get("MESH_TIP_URL")
-        self.seal_url = seal_url or os.environ.get("MESH_SEAL_URL")
-        self.chain = chain or os.environ.get("MESH_CHAIN")
-        self.roster = roster or os.environ.get("MESH_ROSTER", DEFAULT_ROSTER)
-        self.timeout = float(timeout or os.environ.get("MESH_TIMEOUT",
-                                                       DEFAULT_TIMEOUT))
-        self.dry_run = dry_run
-        raw_skip = skip or os.environ.get("MESH_SKIP", "")
-        self.skip = set(s.strip().lower() for s in raw_skip.split(",") if s.strip())
-
-    def check(self):
-        problems = []
-        if not self.tip_url:
-            problems.append("MESH_TIP_URL is not set. Other nodes need "
-                            "somewhere to fetch your tip from.")
-        if not self.chain:
-            problems.append("MESH_CHAIN is not set. Your submissions would "
-                            "arrive unnamed.")
-        if not self.seal_url:
-            problems.append("MESH_SEAL_URL is not set, so this will push "
-                            "your tip out but not seal theirs. That is "
-                            "half the exchange. Not fatal.")
-        return problems
-
-    def my_tip(self):
-        try:
-            return _extract_tip(_get(self.tip_url, self.timeout))
-        except Exception as e:
-            print("  ! could not read own tip from %s: %s"
-                  % (self.tip_url, str(e)[:90]))
-            return None
-
-    def fetch_roster(self):
-        doc = _get(self.roster, self.timeout)
-        peers = doc.get("peers") or []
-        out = []
-        for p in peers:
-            name = (p.get("chain") or "").strip()
-            url = p.get("tip_url")
-            if not name or not url:
-                continue
-            if name.lower() == (self.chain or "").lower():
-                continue                       # never witness yourself
-            if name.lower() in self.skip:
-                continue
-            out.append({"chain": name, "tip_url": url,
-                        "status": p.get("status"),
-                        "submit": p.get("submit_to")})
-        return out, doc
-
-    def run(self):
-        started = time.time()
-        print("meshwitness %s  %s" % (VERSION, time.strftime("%Y-%m-%d %H:%M:%S")))
-
-        for p in self.check():
-            print("  ! " + p)
-
-        mine = self.my_tip()
-        if mine:
-            print("  my tip: %s…" % mine[:16])
-        else:
-            print("  ! no tip of my own to push; will still seal theirs")
-
-        try:
-            peers, doc = self.fetch_roster()
-        except Exception as e:
-            print("  ! roster unreachable (%s): %s" % (self.roster, str(e)[:90]))
-            return 1
-
-        submit_to = doc.get("submit_to")
-        print("  roster: %d chains, %d witnessable"
-              % (doc.get("count", 0), doc.get("witnessable", 0)))
-
-        if not peers:
-            print("  nothing to witness yet.")
-            return 0
-
-        sealed = pushed = failed = 0
-
-        for p in peers:
-            name = p["chain"]
-            line = "  %-28s" % name[:28]
-
-            try:
-                theirs = _extract_tip(_get(p["tip_url"], self.timeout))
-            except Exception as e:
-                print(line + "unreachable (%s)" % str(e)[:40])
-                failed += 1
-                continue
-
-            if not theirs:
-                print(line + "served no readable tip")
-                failed += 1
-                continue
-
-            bits = ["tip %s…" % theirs[:12]]
-
-            # seal theirs into mine
-            if self.seal_url and not self.dry_run:
-                try:
-                    st, _ = _post(self.seal_url,
-                                  {"chain": name, "tip": theirs,
-                                   "url": p["tip_url"]}, self.timeout)
-                    if 200 <= st < 300:
-                        bits.append("sealed")
-                        sealed += 1
-                    else:
-                        bits.append("seal HTTP %d" % st)
-                except Exception as e:
-                    bits.append("seal failed: %s" % str(e)[:30])
-            elif self.dry_run:
-                bits.append("would seal")
-
-            # push mine to them
-            target = p.get("submit") or submit_to
-            if mine and target and not self.dry_run:
-                try:
-                    st, _ = _post(target,
-                                  {"chain": self.chain, "tip": mine,
-                                   "url": self.tip_url}, self.timeout)
-                    if 200 <= st < 300:
-                        bits.append("pushed")
-                        pushed += 1
-                    else:
-                        bits.append("push HTTP %d" % st)
-                except Exception as e:
-                    bits.append("push failed: %s" % str(e)[:30])
-            elif self.dry_run and mine:
-                bits.append("would push")
-
-            print(line + " · ".join(bits))
-
-        print("  %d sealed, %d pushed, %d unreachable, %.1fs"
-              % (sealed, pushed, failed, time.time() - started))
-
-        if self.dry_run:
-            return 0
-        return 0 if (sealed or pushed) else 1
-
-
-EXPLAIN = """
-The protocol, so you can implement it in any language.
-
-1. Read the roster
-     GET https://sebbi.pro/x/roster/list
-   -> {"peers":[{"chain":"...","tip_url":"...","witnessable":true}, ...],
-       "submit_to":"https://sebbi.pro/x/witness/observe"}
-
-2. For each peer with witnessable=true, read their tip
-     GET <tip_url>
-   The hash may be under "tip", "head", "root" or similar. It is a hex
-   string, usually 64 characters. Nothing else in the document matters.
-
-3. Seal it in your own chain
-   Whatever your system does to record an observation. The point is that
-   their tip is now inside your history at a time you did not choose,
-   which is what makes your later statements about them checkable.
-
-4. Push your own tip back
-     POST <their submit endpoint>
-     {"chain": "<your name>", "tip": "<your hex tip>",
-      "url": "<where your tip is served>"}
-
-   The url field is what binds your name to a host. Leave it out and
-   your chain is listed but nobody can fetch from you.
-
-Run it hourly. Pick a minute nobody else is on so the network is not
-all talking at once.
-
-No keys. No accounts. No payload but a hash. If your tip endpoint is a
-static JSON file regenerated by a cron, that is a completely valid node.
-"""
-
-
-def main(argv=None):
-    argv = list(argv if argv is not None else sys.argv[1:])
-
-    if "--explain" in argv:
-        print(EXPLAIN.strip())
-        return 0
-    if "--version" in argv:
-        print("meshwitness %s" % VERSION)
-        return 0
-    if "-h" in argv or "--help" in argv:
-        print(__doc__.strip())
-        return 0
-
-    dry = "--dry-run" in argv
-    return Mesh(dry_run=dry).run()
-
-
-if __name__ == "__main__":
-    sys.exit(main())
-
-```
-
-
-## `sebbi_orchestrator.py`
-
-194 lines, 7453 bytes
-
-```python
-import asyncio
-import json
-import logging
-import socket
-import hmac
-import hashlib
-import ipaddress
-import os
-import sys
-import time
-
-# Handle cross-platform kernel metric mapping
-if sys.platform != "win32":
-    import resource
-else:
-    resource = None
-
-# --- ARCHITECTURE METADATA ENGINE ---
-CORE_MANIFEST = """Standard: AI-TXT/1.0
-Standard-Licence: free and open - publish your own at no cost, no key required
-Operator: Monop Content
-Operator-Location: Blyth, Northumberland, United Kingdom
-Contact: justrightdecorators@gmail.com
-Last-Updated: 2026-07-05
-
-Governance-Engine: AILeash v6.4
-Metrics-Engine: GreenLeash v1.2 (Unified Resource Auditor)
-Decision-Outcomes: ALLOW, CHALLENGE, BLOCK
-Decision-Signals: 9
-Decision-Latency-Median: 28ms
-
-Verify-Endpoint: https://sebbi.pro
-Companion-Standard: https://sebbi.pro
-Whitepaper: https://sebbi.pro"""
-
-HUMAN_MESSAGE = (
-    "SYSTEM NOTICE: AI Governance & Sustainability Compliance Update for sebbi.pro.\n"
-    "The updated compliance targets are now active under Standard: AI-TXT/1.0.\n"
-    "Verify live audit status at: https://sebbi.pro"
-)
-
-# Network Operational Limits
-UDP_BROADCAST_PORT = 5001
-TCP_GATEWAY_PORT = 8080
-CONCURRENT_LIMIT = 2000  
-TIMEOUT = 1.5           
-
-# Dynamic environment lookup to protect secret keys from public GitHub visibility
-SYSTEM_SIGNING_KEY = os.environ.get("SEBBI_SYSTEM_SECRET", "LOCAL_DEV_FALLBACK_KEY").encode('utf-8')
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-
-# ==========================================
-# PART 1: CORE UTILITIES & METRIC AUDITING
-# ==========================================
-
-def get_network_topology():
-    """Resolves local interface and dynamically maps standard subnet boundaries."""
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        local_ip = s.getsockname()[0]
-        s.close()
-        interface = ipaddress.IPv4Interface(f"{local_ip}/255.255.255.0")
-        return str(interface.network.broadcast_address), interface.network
-    except Exception as e:
-        logging.error(f"Failed to automatically resolve local network topology: {e}")
-        return "255.255.255.255", ipaddress.IPv4Network("192.168.1.0/24")
-
-def get_kernel_resource_usage():
-    """Extracts raw processing time and RAM footprints straight from the OS kernel."""
-    if resource:
-        usage = resource.getrusage(resource.RUSAGE_SELF)
-        cpu_time = usage.ru_utime + usage.ru_stime
-        memory_mb = usage.ru_maxrss / (1024.0 if sys.platform == "darwin" else 1.0)
-    else:
-        cpu_time = time.process_time()
-        memory_mb = 0.0
-    return cpu_time, memory_mb
-
-def generate_signed_telemetry(message_text, manifest_text, extra_metrics=None):
-    """Packages corporate alerts and signs them using HMAC-SHA256 for tampering prevention."""
-    base_data = {
-        "alert_text": message_text,
-        "raw_declaration": manifest_text,
-        "node_id": hashlib.sha256(socket.gethostname().encode()).hexdigest()[:12]
-    }
-    if extra_metrics:
-        base_data["sustainability_metrics"] = extra_metrics
-        
-    serialized_json = json.dumps(base_data, sort_keys=True)
-    signature = hmac.new(SYSTEM_SIGNING_KEY, serialized_json.encode('utf-8'), hashlib.sha256).hexdigest()
-    
-    return json.dumps({
-        "payload": base_data,
-        "signature": signature,
-        "algorithm": "HMAC-SHA256"
-    })
-
-# ==========================================
-# PART 2: DISTRIBUTION ENGINES
-# ==========================================
-
-def execute_udp_broadcast(compiled_payload, broadcast_target):
-    """Fires a connectionless notification to all listening local subnet nodes."""
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            s.sendto(compiled_payload.encode('utf-8'), (broadcast_target, UDP_BROADCAST_PORT))
-            logging.info(f"Signed UDP broadcast dispatched to {broadcast_target}:{UDP_BROADCAST_PORT}")
-    except socket.error as e:
-        logging.error(f"UDP broadcast transmission failure: {e}")
-
-async def dispatch_tcp_gateway(target_ip, compiled_payload):
-    """Pushes a verified compliance wrapper directly into standard infrastructure points."""
-    writer = None
-    try:
-        connect = asyncio.open_connection(target_ip, TCP_GATEWAY_PORT)
-        _, writer = await asyncio.wait_for(connect, timeout=TIMEOUT)
-        
-        http_request = (
-            f"POST /api/compliance/broadcast HTTP/1.1\r\n"
-            f"Host: {target_ip}\r\n"
-            f"Content-Type: application/json\r\n"
-            f"Content-Length: {len(compiled_payload)}\r\n"
-            f"X-Signature-Auth: True\r\n"
-            f"Connection: close\r\n\r\n"
-            f"{compiled_payload}"
-        ).encode('utf-8')
-        
-        writer.write(http_request)
-        await writer.drain()
-        logging.info(f"[DISPATCHED] Verified telemetry pushed to infrastructure host: {target_ip}")
-        return True
-    except (asyncio.TimeoutError, ConnectionRefusedError, OSError):
-        return False
-    finally:
-        if writer:
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception:
-                pass
-
-# ==========================================
-# PART 3: RECENTRALIZED PROCESS ENGINE
-# ==========================================
-
-async def run_unified_orchestration():
-    logging.info("Initializing Unified Sebbi Ecosystem Orchestration Pipeline...")
-    
-    # 1. Profile an operational work function (Audit System Burden)
-    start_wall = time.perf_counter()
-    start_cpu, start_mem = get_kernel_resource_usage()
-    
-    # [SIMULATION BLOCK]: Represents a standard local validation check running
-    await asyncio.sleep(0.025)
-    
-    end_cpu, end_mem = get_kernel_resource_usage()
-    end_wall = time.perf_counter()
-    
-    metrics = {
-        "wall_latency_ms": round((end_wall - start_wall) * 1000, 3),
-        "kernel_cpu_time_ms": round((end_cpu - start_cpu) * 1000, 3),
-        "allocated_memory_mb": round(max(start_mem, end_mem), 2)
-    }
-    logging.info(f"Process Profile Completed -> CPU: {metrics['kernel_cpu_time_ms']}ms | RAM: {metrics['allocated_memory_mb']}MB")
-    
-    # 2. Package and sign the final structural data block
-    broadcast_ip, network_obj = get_network_topology()
-    signed_payload_stream = generate_signed_telemetry(HUMAN_MESSAGE, CORE_MANIFEST, extra_metrics=metrics)
-    
-    # 3. Fire local network UDP alert baseline
-    execute_udp_broadcast(signed_payload_stream, broadcast_ip)
-    
-    # 4. Asynchronously scan and iterate targeted subnet infrastructure nodes
-    tasks = []
-    logging.info(f"Scanning target gateways across subnet map: {network_obj.with_prefixlen}")
-    
-    for host in network_obj.hosts():
-        host_str = str(host)
-        if host_str.endswith(".1") or host_str.endswith(".254"):
-            tasks.append(asyncio.create_task(dispatch_tcp_gateway(host_str, signed_payload_stream)))
-            if len(tasks) >= CONCURRENT_LIMIT:
-                await asyncio.gather(*tasks, return_exceptions=True)
-                tasks = []
-                
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
-    logging.info("Unified orchestration sequence finalized successfully.")
-
-if __name__ == "__main__":
-    asyncio.run(run_unified_orchestration())
-
-```
+- `tests/attack_continuity_6.py`
+- `tests/attack_witnessed.py`
 
 
 ## `sebdog_engine.py`
@@ -2610,5 +2072,273 @@ print("\n" + "="*60)
 print("passed %d, failed %d" % (len(PASS), len(FAIL)))
 for f in FAIL: print("  FAILED: "+f)
 sys.exit(1 if FAIL else 0)
+
+```
+
+
+## `tests/attack_continuity_6.py`
+
+92 lines, 3965 bytes
+
+```python
+"""End to end: issue, delegate, exercise, export a proof, verify it elsewhere,
+then try to forge one."""
+import hashlib, json, sqlite3, threading, time, sys, types, subprocess, copy
+import continuity as C
+
+m = types.ModuleType("server")
+m.get_bearer = lambda *a, **k: None
+m.score_event = lambda e: 0.12          # bare score, like the real engine
+sys.modules["server"] = m
+
+conn = sqlite3.connect(":memory:", check_same_thread=False)
+lock = threading.RLock(); n = {"i": 0}
+def seal(ev, res, ts, k):
+    n["i"] += 1
+    return hashlib.sha256(json.dumps([ev, res, ts], sort_keys=True, default=str).encode()).hexdigest(), n["i"], n["i"]
+ctx = {"conn": conn, "lock": lock, "seal": seal}
+C._ready = False; C._setup(ctx)
+
+NOW, HOUR = time.time(), 3600
+C._issue(ctx, "k", dict(id="root", issuer="justin@monopcontent.com", issuer_kind="human",
+    subject="orchestrator", scope=["payments.refund", "payments.read"],
+    constraints={"max_amount": 5000, "allowed_currency": ["GBP", "EUR"]},
+    purpose="resolve customer refund complaints", purpose_tags=["refunds", "support"],
+    not_after=NOW + 10 * HOUR, delegations_left=2))
+C._issue(ctx, "k", dict(id="mid", parent="root", issuer="orchestrator", issuer_kind="agent",
+    subject="refund-agent", scope=["payments.refund"],
+    constraints={"max_amount": 200, "allowed_currency": ["GBP"]},
+    purpose="issue small refunds", purpose_tags=["refunds"],
+    not_after=NOW + 2 * HOUR, delegations_left=0))
+
+def run(params, tag="refunds", action="payments.refund"):
+    r, _ = C._evaluate(ctx, "k", {"grant": "mid", "action": action,
+                                  "params": params, "purpose_tag": tag})
+    return r
+
+allow = run({"amount": 150, "currency": "GBP"})
+block = run({"amount": 900, "currency": "GBP"})
+print("allow verdict:", allow["verdict"], "| block verdict:", block["verdict"],
+      "->", block["broken_invariant"])
+
+def bundle_for(ev):
+    b, code = C._proof(ctx, {"evaluation": ev})
+    assert code == 200, b
+    return b
+
+for label, ev in (("ALLOW", allow["evaluation"]), ("BLOCK", block["evaluation"])):
+    b = bundle_for(ev)
+    open("/tmp/%s.json" % label, "w").write(json.dumps(b, indent=1))
+    print("\n" + "#" * 66 + "\n# %s bundle\n" % label + "#" * 66)
+    out = subprocess.run([sys.executable, "verify_authority.py", "/tmp/%s.json" % label],
+                         capture_output=True, text=True)
+    print(out.stdout.strip()); print("exit:", out.returncode)
+
+print("\n" + "#" * 66 + "\n# forgeries\n" + "#" * 66)
+good = json.load(open("/tmp/BLOCK.json"))
+
+def forge(name, mutate):
+    b = copy.deepcopy(good)
+    mutate(b)
+    open("/tmp/forged.json", "w").write(json.dumps(b))
+    out = subprocess.run([sys.executable, "verify_authority.py", "/tmp/forged.json"],
+                         capture_output=True, text=True)
+    caught = out.returncode != 0
+    line = [l for l in out.stdout.splitlines() if l.startswith("FAIL")]
+    print(("  ok   " if caught else "  MISS ") + name)
+    for l in line[:2]:
+        print("         " + l.strip())
+
+def flip_verdict(b):
+    b["decision"]["verdict"] = "ALLOW"; b["decision"]["authority_verdict"] = "ALLOW"
+def raise_cap(b):
+    pass_idx = 1
+    b["lineage"][1]["constraints"]["max_amount"] = 100000
+def widen_scope(b):
+    b["lineage"][1]["scope"] = ["payments.refund", "payments.transfer"]
+def swap_human(b):
+    b["lineage"][0]["issuer_kind"] = "agent"
+def change_params(b):
+    b["request"]["params"]["amount"] = 1
+def drop_acceptor(b):
+    for g in b["lineage"]: g["risk_accepted_by"] = None
+def restamp(b):
+    b["decision"]["evaluated_at_epoch"] = NOW + 9 * HOUR
+
+forge("claimed ALLOW on a bundle that blocks", flip_verdict)
+forge("cap raised inside the lineage", raise_cap)
+forge("scope widened inside the lineage", widen_scope)
+forge("root demoted from human", swap_human)
+forge("parameters swapped after the fact", change_params)
+forge("risk acceptor stripped", drop_acceptor)
+forge("timestamp moved past the leaf's expiry", restamp)
+
+```
+
+
+## `tests/attack_witnessed.py`
+
+160 lines, 7875 bytes
+
+```python
+"""Attack it the same way as everything else: from the position of an operator
+trying to make a grant look older than it is."""
+import hashlib, json, sqlite3, threading, time, sys, types
+import witnessed as W
+
+P, F = [], []
+def check(n, c, d=""):
+    (P if c else F).append(n)
+    print(("  ok   " if c else "  FAIL ") + n + (("  -> " + str(d)[:200]) if d and not c else ""))
+
+def make():
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    lock = threading.RLock(); n = {"i": 0}
+    conn.execute("CREATE TABLE audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                 "ts REAL,user_id TEXT,api_key TEXT,result_json TEXT,audit_hash TEXT)")
+    # the real grant table shape, including columns added later
+    conn.execute("CREATE TABLE auth_grant(id TEXT PRIMARY KEY,parent TEXT,root TEXT,"
+                 "issuer TEXT,subject TEXT,created REAL,digest TEXT,audit_hash TEXT,"
+                 "block_index INTEGER,risk_accepted_by TEXT)")
+    def seal(ev, res, ts, key):
+        n["i"] += 1
+        h = hashlib.sha256(json.dumps([ev,res,ts,n["i"]],sort_keys=True,default=str).encode()).hexdigest()
+        conn.execute("INSERT INTO audit_log(ts,user_id,api_key,result_json,audit_hash) "
+                     "VALUES(?,?,?,?,?)", (ts, ev.get("user_id"), key, json.dumps(res), h))
+        conn.commit()
+        return h, n["i"], n["i"]
+    W._ready = False
+    ctx = {"conn": conn, "lock": lock, "seal": seal}
+    W._setup(ctx)
+    return ctx
+
+def seal_grant(ctx, gid, created):
+    h, idx, _ = ctx["seal"]({"user_id": "lin:"+gid}, {"decision":"AUTHORITY_GRANTED","grant":gid}, created, "k")
+    with ctx["lock"]:
+        ctx["conn"].execute("INSERT INTO auth_grant(id,issuer,subject,created,audit_hash,block_index) "
+                            "VALUES(?,?,?,?,?,?)", (gid,"owner@example.com","agent",created,h,idx))
+        ctx["conn"].commit()
+    return h
+
+def noise(ctx, k=5):
+    for i in range(k):
+        ctx["seal"]({"user_id":"n%d"%i},{"decision":"ALLOW"},time.time(),"k")
+
+def record_head(ctx, peer, accepted=1, when=None, size=None, tip=None):
+    """Insert an attestation directly, standing in for a live peer."""
+    s, t = W._head(ctx)
+    when = when or time.time()
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "INSERT INTO witnessed_head(peer,peer_url,tree_size,tip,head_digest,"
+            "submitted,accepted,peer_response,peer_block,audit_hash,block_index,api_key)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (peer,"https://%s"%peer, size or s, tip or t,"d",when,accepted,"{}","b1","ah",1,"k"))
+        ctx["conn"].commit()
+
+NOW = time.time()
+
+print("\n=== 1. a grant witnessed after issue ===")
+ctx = make()
+noise(ctx, 3)
+g = seal_grant(ctx, "root", NOW - 3600)
+noise(ctx, 4)
+record_head(ctx, "redflagai.pro", when=NOW - 1800)
+r, code = W._grant(ctx, {"id": "root"})
+check("witnessed grant reports externally_witnessed", code==200 and r["externally_witnessed"], r)
+check("names the peer and the time", r["earliest_external_witness"]["peer"]=="redflagai.pro", r)
+check("gives a four-step plan pointed at the peer",
+      len(r["verification_plan"])==4 and "attest" in r["verification_plan"][0]["run"], r["verification_plan"][0])
+check("states what it does not prove", "should ever have been issued" in r["what_this_does_not_prove"])
+check("reports how long it sat unwitnessed", r["minutes_unwitnessed"] is not None, r.get("minutes_unwitnessed"))
+
+print("\n=== 2. THE ATTACK: a grant back-dated after the fact ===")
+# operator invents a root grant now, and writes created= last week
+ctx = make()
+noise(ctx, 3)
+record_head(ctx, "redflagai.pro", when=NOW - 86400)      # peer saw the log yesterday
+forged = seal_grant(ctx, "forged", NOW - 7*86400)        # grant CLAIMS to be a week old
+r, code = W._grant(ctx, {"id": "forged"})
+check("a grant sealed after the last witness is NOT covered", not r["externally_witnessed"], r)
+check("and says so plainly rather than staying quiet", "rests on this operator's own record" in r.get("flag",""), r.get("flag"))
+# now a peer witnesses; from here it is covered, but only from here
+record_head(ctx, "redflagai.pro", when=NOW)
+r2, _ = W._grant(ctx, {"id": "forged"})
+check("after a later witness it becomes covered", r2["externally_witnessed"])
+gapdays = round(r2["minutes_unwitnessed"]/1440.0, 1)
+check("the seven-day claim-to-witness gap is published, not hidden",
+      r2.get("flag") and "days" in r2["flag"] and gapdays >= 6.9, {"gap_days":gapdays,"flag":r2.get("flag")})
+
+print("\n=== 3. coverage counts only what a peer accepted ===")
+ctx = make()
+noise(ctx, 2); g = seal_grant(ctx, "g1", NOW); noise(ctx, 2)
+record_head(ctx, "peer-that-refused", accepted=0)
+r, _ = W._grant(ctx, {"id": "g1"})
+check("a refused submission gives no coverage", not r["externally_witnessed"], r.get("earliest_external_witness"))
+h, _ = W._heads(ctx, {})
+check("but the refusal is still on the public record", h["count"]==1 and h["heads"][0]["accepted"] is False, h)
+
+print("\n=== 4. a head that predates the grant does not cover it ===")
+ctx = make()
+record_head(ctx, "early-peer", when=NOW-9999)   # size 0
+noise(ctx, 3)
+seal_grant(ctx, "later", NOW)
+r, _ = W._grant(ctx, {"id": "later"})
+check("an earlier, smaller head cannot reach a later record", not r["externally_witnessed"], r)
+
+print("\n=== 5. the earliest witness wins, not the most convenient ===")
+ctx = make()
+noise(ctx, 2); seal_grant(ctx, "g", NOW - 600); noise(ctx, 2)
+record_head(ctx, "second-peer", when=NOW - 100)
+record_head(ctx, "first-peer",  when=NOW - 400)
+r, _ = W._grant(ctx, {"id": "g"})
+check("earliest accepted attestation is the one reported",
+      r["earliest_external_witness"]["peer"]=="first-peer", r["earliest_external_witness"])
+check("the others are listed too", any(c["peer"]=="second-peer" for c in r["also_witnessed_by"]), r["also_witnessed_by"])
+
+print("\n=== 6. status is honest about thin networks ===")
+ctx = make(); noise(ctx, 3)
+s, _ = W._status(ctx)
+check("no peers at all reports strength none", s["strength"]=="none" and "rests on our own record" in s["flag"], s)
+record_head(ctx, "only-peer")
+s, _ = W._status(ctx)
+check("one peer reports weak and names collusion", s["strength"]=="weak" and "collude" in s["flag"], s)
+for p in ("p2","p3"): record_head(ctx, p)
+s, _ = W._status(ctx)
+check("three peers reports reasonable", s["strength"]=="reasonable", s)
+noise(ctx, 6)
+s, _ = W._status(ctx)
+check("records sealed since the last head are counted as unwitnessed",
+      s["records_not_yet_witnessed"]==6, s)
+
+print("\n=== 7. tampering with the grant row ===")
+ctx = make(); noise(ctx,2); seal_grant(ctx,"t",NOW); record_head(ctx,"peer")
+with ctx["lock"]:
+    ctx["conn"].execute("UPDATE auth_grant SET audit_hash='0'*64 WHERE id='t'")
+    ctx["conn"].commit()
+r, code = W._grant(ctx, {"id":"t"})
+check("a grant whose seal is not in the log is a finding, not a 404",
+      code==409 and "finding" in r.get("message",""), (code, r))
+
+print("\n=== 8. url safety on submit ===")
+ctx = make(); noise(ctx,2)
+for bad, why in [("http://127.0.0.1/x","loopback"),("http://10.0.0.5/x","private"),
+                 ("ftp://example.com","scheme"),("https://example.com:8443/x","port")]:
+    r, code = W._submit(ctx, "k", {"peer":"p","url":bad})
+    check("refuses %s" % why, code==400 and r.get("error")=="url_refused", (bad,code,r))
+
+print("\n=== 9. any sealed record, not just grants ===")
+ctx = make(); noise(ctx,2)
+h,_ ,_ = ctx["seal"]({"user_id":"x"},{"decision":"ALLOW"},NOW,"k")
+noise(ctx,1); record_head(ctx,"peer")
+r, code = W._record(ctx, {"hash": h})
+check("a decision receipt gets the same treatment", code==200 and r["externally_witnessed"], r)
+r, code = W._record(ctx, {"hash": "zz"})
+check("a malformed hash is refused", code==400, (code,r))
+
+print("\n" + "="*62)
+print("passed %d, failed %d" % (len(P), len(F)))
+for f in F: print("  FAILED: " + f)
+sys.exit(1 if F else 0)
 
 ```
