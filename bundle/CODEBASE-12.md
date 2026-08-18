@@ -1,19 +1,1482 @@
-# Codebase — part 12 of 20
+# Codebase — part 12 of 21
 
 Contains:
+- `sebdog_engine.py`
+- `sebdog_licence.py`
+- `sebdog_reporter.py`
+- `tests/attack_continuity_1.py`
 - `tests/attack_continuity_2.py`
 - `tests/attack_continuity_3.py`
 - `tests/attack_continuity_4.py`
 - `tests/attack_continuity_5.py`
 - `tests/attack_continuity_6.py`
 - `tests/attack_witnessed.py`
-- `verify_authority.py`
-- `AILeash-API-Reference-v6.4.2.md`
-- `LICENCE`
-- `README.md`
-- `admin.html`
-- `ai-standard.html`
-- `ai-txt-kit.html`
+
+
+## `sebdog_engine.py`
+
+445 lines, 17345 bytes
+
+```python
+import json, math, time, sqlite3, hashlib, threading, argparse, sys, os, shutil
+import urllib.request, urllib.parse
+from collections import defaultdict, deque
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
+from urllib.parse import urlparse
+
+VERSION = "1.1.0"
+HOME = "https://sebbi.pro"
+VALIDATE_URL = HOME + "/api/validate-engine"
+DB_FILE = "sebdog_audit.db"
+SAFE = {"UK","US","DE","FR","CA","AU","NL","SE","NO","DK","FI","IE","NZ"}
+REQ = {"user_id","action","amount","country","device_id","anomaly","device_risk"}
+
+_db_lock = threading.Lock()
+_key_wins = defaultdict(lambda: {"min": deque(), "hour": deque()})
+_key_lock = threading.Lock()
+W60 = defaultdict(deque)
+W5M = defaultdict(deque)
+W1H = defaultdict(deque)
+
+_licence = {
+    "valid": False, "plan": "free", "product": "aileash",
+    "devices": 1, "email": "", "checked_at": 0, "key": ""
+}
+
+# ==============================================================================
+# LICENCE VALIDATION
+# ==============================================================================
+
+def validate_licence(api_key):
+    global _licence
+    try:
+        req = urllib.request.Request(
+            VALIDATE_URL, method="POST",
+            headers={"Authorization": "Bearer " + api_key, "Content-Type": "application/json"},
+            data=json.dumps({}).encode()
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read())
+        if data.get("valid"):
+            _licence.update({
+                "valid": True, "plan": data.get("plan","free"),
+                "product": data.get("product","aileash"),
+                "devices": data.get("devices",1),
+                "email": data.get("email",""),
+                "checked_at": time.time(), "key": api_key
+            })
+            print(f"[SEBDOG] Licence valid. Plan:{_licence['plan']} Devices:{_licence['devices']}", flush=True)
+            return True
+        else:
+            err = data.get("error","unknown")
+            print(f"[SEBDOG] Licence rejected: {err}", flush=True)
+            _licence["valid"] = False
+            return False
+    except Exception as e:
+        print(f"[SEBDOG] Licence check failed: {e}", flush=True)
+        if _licence["valid"] and (time.time() - _licence["checked_at"]) < 86400:
+            print("[SEBDOG] Using cached licence (24h grace)", flush=True)
+            return True
+        return False
+
+def revalidate_loop(api_key):
+    while True:
+        time.sleep(86400)
+        validate_licence(api_key)
+
+# ==============================================================================
+# DATABASE + BACKUP
+# Local SQLite — audit chain lives on your own machine.
+# Automatic daily backup keeps data retrievable even after failures.
+# Sovereignty is maintained — data never leaves your network.
+# ==============================================================================
+
+def get_conn():
+    c = sqlite3.connect(DB_FILE, check_same_thread=False)
+    c.execute("PRAGMA journal_mode=WAL;")
+    c.execute("PRAGMA synchronous=NORMAL;")
+    c.execute("""CREATE TABLE IF NOT EXISTS users(
+        user_id TEXT PRIMARY KEY, trust REAL DEFAULT 0.5, last_country TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS audit_log(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, user_id TEXT,
+        event_json TEXT, result_json TEXT, prev_hash TEXT,
+        audit_hash TEXT UNIQUE)""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_audit ON audit_log(user_id)")
+    c.execute("""CREATE TABLE IF NOT EXISTS chain_snapshots(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts REAL, block_count INTEGER, tip_hash TEXT,
+        snapshot_file TEXT)""")
+    c.commit()
+    return c
+
+_conn = None
+
+def init_db():
+    global _conn
+    _conn = get_conn()
+
+def backup_db():
+    """
+    Creates a timestamped backup of the audit database.
+    Data stays on your own hardware — sovereignty is not affected.
+    Runs automatically every 24 hours.
+    """
+    backup_dir = os.path.join(os.path.dirname(DB_FILE), "sebdog_backups")
+    os.makedirs(backup_dir, exist_ok=True)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    backup_path = os.path.join(backup_dir, f"sebdog_audit_{ts}.db")
+    try:
+        with _db_lock:
+            shutil.copy2(DB_FILE, backup_path)
+            blocks = _conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0]
+            tip = _conn.execute(
+                "SELECT audit_hash FROM audit_log ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            tip_hash = tip[0] if tip else "GENESIS"
+            _conn.execute(
+                "INSERT INTO chain_snapshots(ts,block_count,tip_hash,snapshot_file) VALUES(?,?,?,?)",
+                (time.time(), blocks, tip_hash, backup_path)
+            )
+            _conn.commit()
+        print(f"[SEBDOG] Backup created: {backup_path} ({blocks} blocks)", flush=True)
+        _cleanup_old_backups(backup_dir)
+    except Exception as e:
+        print(f"[SEBDOG] Backup failed: {e}", flush=True)
+
+def _cleanup_old_backups(backup_dir, keep=7):
+    """Keep only the most recent N backups."""
+    try:
+        files = sorted([
+            os.path.join(backup_dir, f) for f in os.listdir(backup_dir)
+            if f.startswith("sebdog_audit_") and f.endswith(".db")
+        ])
+        for old in files[:-keep]:
+            os.remove(old)
+    except Exception:
+        pass
+
+def backup_loop():
+    while True:
+        time.sleep(86400)
+        backup_db()
+
+def restore_latest_backup():
+    """
+    Restore from the most recent backup if the main database is missing or corrupt.
+    Call this on startup if the main DB file doesn't exist.
+    """
+    backup_dir = os.path.join(os.path.dirname(DB_FILE), "sebdog_backups")
+    if not os.path.exists(backup_dir):
+        return False
+    files = sorted([
+        os.path.join(backup_dir, f) for f in os.listdir(backup_dir)
+        if f.startswith("sebdog_audit_") and f.endswith(".db")
+    ])
+    if not files:
+        return False
+    latest = files[-1]
+    try:
+        shutil.copy2(latest, DB_FILE)
+        print(f"[SEBDOG] Restored from backup: {latest}", flush=True)
+        return True
+    except Exception as e:
+        print(f"[SEBDOG] Restore failed: {e}", flush=True)
+        return False
+
+def list_snapshots():
+    with _db_lock:
+        rows = _conn.execute(
+            "SELECT ts, block_count, tip_hash, snapshot_file FROM chain_snapshots ORDER BY id DESC LIMIT 10"
+        ).fetchall()
+    return [{"ts": r[0], "blocks": r[1], "tip": r[2], "file": r[3]} for r in rows]
+
+# ==============================================================================
+# RATE LIMITING
+# ==============================================================================
+
+def check_rate(key):
+    t = time.time()
+    with _key_lock:
+        w = _key_wins[key]
+        while w["min"] and w["min"][0] < t-60: w["min"].popleft()
+        while w["hour"] and w["hour"][0] < t-3600: w["hour"].popleft()
+        if len(w["min"]) >= 60: return False, "rate_limit_minute"
+        if len(w["hour"]) >= 1000: return False, "rate_limit_hour"
+        w["min"].append(t); w["hour"].append(t)
+        return True, None
+
+# ==============================================================================
+# CORE ENGINE
+# ==============================================================================
+
+def now(): return time.time()
+def clamp(x,a=0.0,b=1.0): return max(a,min(b,x))
+def sha(p): return hashlib.sha256(json.dumps(p,sort_keys=True).encode()).hexdigest()
+
+def upd_vel(uid):
+    t=now()
+    for q in [W60[uid],W5M[uid],W1H[uid]]: q.append(t)
+    c=now()
+    W60[uid]=deque(x for x in W60[uid] if x>=c-60)
+    W5M[uid]=deque(x for x in W5M[uid] if x>=c-300)
+    W1H[uid]=deque(x for x in W1H[uid] if x>=c-3600)
+
+def vel(uid): return {"60s":len(W60[uid]),"5m":len(W5M[uid]),"1h":len(W1H[uid])}
+
+def load_user(uid):
+    with _db_lock:
+        r=_conn.execute("SELECT trust,last_country FROM users WHERE user_id=?",(uid,)).fetchone()
+    return{"trust":r[0],"last_country":r[1]} if r else{"trust":0.5,"last_country":None}
+
+def save_user(uid,trust,country):
+    with _db_lock:
+        _conn.execute(
+            "INSERT INTO users(user_id,trust,last_country) VALUES(?,?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET trust=excluded.trust,last_country=excluded.last_country",
+            (uid,trust,country))
+        _conn.commit()
+
+def score_event(s):
+    reasons=[]
+    sc=(1-s["trust"])*0.30
+    v60=s["v60"]; sc+=min(v60/20,1)*0.15
+    if v60>10: reasons.append("velocity_spike")
+    sc+=min(s["v5m"]/50,1)*0.10+min(s["v1h"]/200,1)*0.10
+    amt=float(s.get("amount",0)); sc+=min(math.log1p(amt)/math.log1p(10000),1)*0.15
+    if amt>500: reasons.append("high_amount")
+    dr=float(s.get("device_risk",0)); sc+=dr*0.10
+    if dr>0.5: reasons.append("risky_device")
+    an=float(s.get("anomaly",0)); sc+=an*0.10
+    if an>0.5: reasons.append("behaviour_anomaly")
+    if s.get("country_shift"): sc+=0.10; reasons.append("country_shift")
+    if s.get("unsafe_country"): sc+=0.10; reasons.append("unsafe_country")
+    if s["trust"]<0.4: reasons.append("low_trust")
+    return round(clamp(sc),4),reasons
+
+def decide(sc):
+    if sc<0.35: return"ALLOW"
+    if sc<0.70: return"CHALLENGE"
+    return"BLOCK"
+
+def upd_trust(t,d):
+    if d=="ALLOW": t+=(1-t)*0.01
+    elif d=="CHALLENGE": t-=t*0.02
+    elif d=="BLOCK": t-=t*0.08
+    return clamp(t,0.05,1.0)
+
+def chain_tip():
+    with _db_lock:
+        r=_conn.execute("SELECT audit_hash FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()
+    return r[0] if r else"GENESIS"
+
+def seal(event,result,ts):
+    prev=chain_tip()
+    h=sha({"prev_hash":prev,"ts":ts,"event":event,"result":result})
+    with _db_lock:
+        _conn.execute(
+            "INSERT INTO audit_log(ts,user_id,event_json,result_json,prev_hash,audit_hash) VALUES(?,?,?,?,?,?)",
+            (ts,event["user_id"],json.dumps(event),json.dumps(result),prev,h))
+        _conn.commit()
+    return h
+
+def verify_chain():
+    with _db_lock:
+        rows=_conn.execute(
+            "SELECT event_json,result_json,prev_hash,audit_hash,ts FROM audit_log ORDER BY id ASC"
+        ).fetchall()
+    if not rows: return{"valid":True,"blocks":0,"message":"Empty chain"}
+    prev="GENESIS"
+    for i,row in enumerate(rows):
+        p={"prev_hash":row[2],"ts":row[4],"event":json.loads(row[0]),"result":json.loads(row[1])}
+        if sha(p)!=row[3] or row[2]!=prev:
+            return{"valid":False,"broken_at":i,"message":f"Tampered at block {i}"}
+        prev=row[3]
+    return{"valid":True,"blocks":len(rows),"tip":rows[-1][3],"message":"Chain intact"}
+
+def govern(event):
+    missing=REQ-event.keys()
+    if missing: raise ValueError(f"Missing fields: {missing}")
+    if not _licence["valid"]:
+        return{"error":"licence_invalid","message":f"Valid API key required. Get yours at {HOME}"},403
+    ts=now(); uid=event["user_id"]
+    state=load_user(uid); upd_vel(uid); v=vel(uid)
+    country=event["country"]
+    signals={
+        "trust":state["trust"],"v60":v["60s"],"v5m":v["5m"],"v1h":v["1h"],
+        "amount":float(event.get("amount",0)),
+        "device_risk":float(event.get("device_risk",0)),
+        "anomaly":float(event.get("anomaly",0)),
+        "country_shift":state["last_country"] is not None and state["last_country"]!=country,
+        "unsafe_country":country not in SAFE
+    }
+    sc,reasons=score_event(signals)
+    dec=decide(sc); trust=upd_trust(state["trust"],dec)
+    save_user(uid,trust,country)
+    result={
+        "decision":dec,"score":sc,"trust":round(trust,4),
+        "reasons":reasons,"version":VERSION,"engine":"sebdog",
+        "local":True,"timestamp":ts
+    }
+    result["audit_hash"]=seal(event,result,ts)
+    return result,200
+
+# ==============================================================================
+# HTTP SERVER
+# ==============================================================================
+
+def send_json(h,data,status=200):
+    body=json.dumps(data,indent=2).encode()
+    h.send_response(status)
+    h.send_header("Content-Type","application/json")
+    h.send_header("Content-Length",str(len(body)))
+    h.send_header("Access-Control-Allow-Origin","*")
+    h.end_headers()
+    h.wfile.write(body)
+
+def read_body(h):
+    n=int(h.headers.get("Content-Length",0))
+    if n:
+        try: return json.loads(h.rfile.read(n))
+        except: return{}
+    return{}
+
+def get_bearer(h):
+    auth=h.headers.get("Authorization","")
+    if auth.startswith("Bearer "): return auth[7:]
+    return h.headers.get("X-API-Key","").strip()
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self,fmt,*args): pass
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin","*")
+        self.send_header("Access-Control-Allow-Methods","GET,POST,OPTIONS")
+        self.send_header("Access-Control-Allow-Headers","Content-Type,Authorization,X-API-Key")
+        self.end_headers()
+
+    def do_GET(self):
+        path=urlparse(self.path).path
+        if path=="/health":
+            send_json(self,{
+                "status":"ok","version":VERSION,"engine":"sebdog","local":True,
+                "licence":{
+                    "valid":_licence["valid"],"plan":_licence["plan"],
+                    "devices":_licence["devices"],"email":_licence["email"]
+                }
+            })
+        elif path=="/verify-chain":
+            send_json(self,verify_chain())
+        elif path=="/stats":
+            with _db_lock:
+                blocks=_conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0]
+                users=_conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+            send_json(self,{
+                "audit_blocks":blocks,"users_tracked":users,
+                "version":VERSION,"engine":"sebdog","licence_valid":_licence["valid"]
+            })
+        elif path=="/snapshots":
+            send_json(self,{"snapshots":list_snapshots()})
+        elif path=="/backup":
+            backup_db()
+            send_json(self,{"ok":True,"message":"Backup created"})
+        else:
+            send_json(self,{"error":"not_found"},404)
+
+    def do_POST(self):
+        path=urlparse(self.path).path.rstrip("/")
+        data=read_body(self)
+        if path in("/govern","/api/govern"):
+            bearer=get_bearer(self)
+            if bearer and bearer!=_licence["key"]:
+                send_json(self,{"error":"invalid_api_key"},401); return
+            ok,ec=check_rate(bearer or"default")
+            if not ok:
+                send_json(self,{"error":ec},429); return
+            try:
+                result,status=govern(data)
+                send_json(self,result,status)
+            except ValueError as e:
+                send_json(self,{"error":str(e)},400)
+            except Exception as e:
+                send_json(self,{"error":"internal","detail":str(e)},500)
+        else:
+            send_json(self,{"error":"not_found"},404)
+
+class ThreadedServer(ThreadingMixIn,HTTPServer):
+    allow_reuse_address=True
+    daemon_threads=True
+
+# ==============================================================================
+# ENTRY POINT
+# ==============================================================================
+
+def main():
+    parser=argparse.ArgumentParser(description="Sebdog Engine — AILeash local compliance engine")
+    parser.add_argument("--key",required=True,help="Your AILeash API key from sebbi.pro")
+    parser.add_argument("--port",type=int,default=9090,help="Port (default: 9090)")
+    parser.add_argument("--db",default="sebdog_audit.db",help="SQLite audit database path")
+    parser.add_argument("--backup-on-start",action="store_true",help="Create a backup on startup")
+    args=parser.parse_args()
+
+    global DB_FILE
+    DB_FILE=args.db
+
+    print(f"[SEBDOG] Sebdog Engine v{VERSION} starting...",flush=True)
+
+    # Restore from backup if DB missing
+    if not os.path.exists(DB_FILE):
+        print(f"[SEBDOG] Database not found. Checking for backups...",flush=True)
+        if restore_latest_backup():
+            print(f"[SEBDOG] Data restored from backup.",flush=True)
+        else:
+            print(f"[SEBDOG] No backup found. Starting fresh chain.",flush=True)
+
+    init_db()
+
+    if args.backup_on_start:
+        backup_db()
+
+    print(f"[SEBDOG] Validating licence with sebbi.pro...",flush=True)
+    if not validate_licence(args.key):
+        print(f"[SEBDOG] Licence validation failed. Get your key at {HOME}",flush=True)
+        sys.exit(1)
+
+    threading.Thread(target=revalidate_loop,args=(args.key,),daemon=True).start()
+    threading.Thread(target=backup_loop,daemon=True).start()
+
+    server=ThreadedServer(("0.0.0.0",args.port),Handler)
+    print(f"[SEBDOG] Engine running on port {args.port}",flush=True)
+    print(f"[SEBDOG] POST http://localhost:{args.port}/govern",flush=True)
+    print(f"[SEBDOG] GET  http://localhost:{args.port}/health",flush=True)
+    print(f"[SEBDOG] GET  http://localhost:{args.port}/verify-chain",flush=True)
+    print(f"[SEBDOG] GET  http://localhost:{args.port}/snapshots",flush=True)
+    print(f"[SEBDOG] Backups: ./sebdog_backups/ (daily, last 7 kept)",flush=True)
+    print(f"[SEBDOG] Sovereignty: all data stays on your hardware.",flush=True)
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("[SEBDOG] Shutting down.",flush=True)
+
+if __name__=="__main__":
+    main()
+
+```
+
+
+## `sebdog_licence.py`
+
+332 lines, 12401 bytes
+
+```python
+"""
+SEBDOG LICENCE SYSTEM v1.0.0
+Air-gapped cryptographic licence tokens for the Sebdog Engine.
+Copyright (c) 2026 Justin Antony Dobson / Monop Content, Blyth, UK
+
+HOW IT WORKS:
+- sebbi.pro generates a signed annual licence token on signup
+- The token is validated entirely locally — no phone-home required
+- Any tampering with the token is cryptographically detected
+- Tokens expire after 12 months and must be renewed
+- The signing secret never leaves sebbi.pro's servers
+
+SECURITY MODEL:
+- HMAC-SHA256 signatures — industry standard, same as used by AWS, Stripe
+- Constant-time comparison prevents timing attacks
+- Base64url encoding for safe transmission
+- JSON payload is deterministically serialised (sort_keys=True)
+- Every validation attempt is logged to the local audit chain
+"""
+
+import hashlib, hmac, json, time, base64, secrets, sqlite3, threading
+from typing import Tuple, Optional, Dict
+
+# ==============================================================================
+# CONSTANTS
+# ==============================================================================
+
+TOKEN_VERSION = "1"
+GRACE_SECONDS = 86400 * 7  # 7-day grace period after expiry before hard block
+AUDIT_DB = "sebdog_audit.db"
+
+# ==============================================================================
+# TOKEN GENERATION (runs on sebbi.pro server only)
+# The signing secret is an environment variable on Railway.
+# It never appears in any file that gets shipped to customers.
+# ==============================================================================
+
+def generate_token(api_key: str, devices: int, plan: str,
+                   email: str, secret: bytes,
+                   validity_days: int = 365) -> str:
+    """
+    Generate a cryptographically signed annual licence token.
+    Called by sebbi.pro when a customer requests an air-gapped licence.
+
+    Args:
+        api_key:       The customer's AILeash API key
+        devices:       Licensed device count
+        plan:          'free' or 'paid'
+        email:         Customer email
+        secret:        HMAC signing secret (from Railway env var)
+        validity_days: Token validity in days (default 365)
+
+    Returns:
+        Base64url-encoded signed token string
+    """
+    issued = int(time.time())
+    expires = issued + (validity_days * 86400)
+
+    payload = json.dumps({
+        "v": TOKEN_VERSION,
+        "key": api_key,
+        "devices": devices,
+        "plan": plan,
+        "email": email,
+        "issued": issued,
+        "expires": expires
+    }, sort_keys=True, separators=(',', ':'))
+
+    sig = hmac.new(secret, payload.encode('utf-8'), hashlib.sha256).hexdigest()
+
+    token_data = json.dumps({
+        "payload": payload,
+        "sig": sig
+    }, separators=(',', ':'))
+
+    return base64.urlsafe_b64encode(token_data.encode('utf-8')).decode('utf-8')
+
+
+# ==============================================================================
+# TOKEN VALIDATION (runs on customer hardware — no network required)
+# ==============================================================================
+
+def validate_token(token: str, secret: bytes) -> Tuple[Optional[Dict], Optional[str]]:
+    """
+    Validate a licence token entirely locally.
+    No network connection required.
+
+    Returns:
+        (licence_data, None) on success
+        (None, error_code) on failure
+
+    Error codes:
+        invalid_format      — token cannot be decoded
+        invalid_signature   — token has been tampered with
+        token_expired       — token is past expiry + grace period
+        version_mismatch    — token version not supported
+    """
+    try:
+        raw = json.loads(base64.urlsafe_b64decode(token.encode('utf-8')))
+        payload_str = raw.get("payload", "")
+        sig = raw.get("sig", "")
+    except Exception:
+        return None, "invalid_format"
+
+    # Constant-time HMAC comparison — prevents timing attacks
+    expected = hmac.new(secret, payload_str.encode('utf-8'), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(sig, expected):
+        return None, "invalid_signature"
+
+    try:
+        data = json.loads(payload_str)
+    except Exception:
+        return None, "invalid_format"
+
+    if data.get("v") != TOKEN_VERSION:
+        return None, "version_mismatch"
+
+    # Apply grace period — token runs for 7 days past expiry
+    if data.get("expires", 0) + GRACE_SECONDS < time.time():
+        return None, "token_expired"
+
+    return data, None
+
+
+def is_in_grace_period(token_data: Dict) -> bool:
+    """Returns True if token is past expiry but within grace period."""
+    return token_data.get("expires", 0) < time.time()
+
+
+def days_until_expiry(token_data: Dict) -> int:
+    """Returns days remaining until token expiry (negative if expired)."""
+    return int((token_data.get("expires", 0) - time.time()) / 86400)
+
+
+# ==============================================================================
+# LOCAL LICENCE STORE
+# Caches the validated token locally so validation survives restarts.
+# Everything stays on the customer's own hardware.
+# ==============================================================================
+
+_lock = threading.Lock()
+
+
+def save_licence_locally(db_path: str, token: str, licence_data: Dict):
+    """Cache the validated licence in the local audit database."""
+    with _lock:
+        conn = sqlite3.connect(db_path)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS licence_cache (
+                id INTEGER PRIMARY KEY,
+                token TEXT,
+                api_key TEXT,
+                devices INTEGER,
+                plan TEXT,
+                email TEXT,
+                issued INTEGER,
+                expires INTEGER,
+                cached_at REAL
+            )
+        """)
+        conn.execute("DELETE FROM licence_cache")  # Only one licence at a time
+        conn.execute("""
+            INSERT INTO licence_cache
+            (token, api_key, devices, plan, email, issued, expires, cached_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            token,
+            licence_data.get("key", ""),
+            licence_data.get("devices", 1),
+            licence_data.get("plan", "free"),
+            licence_data.get("email", ""),
+            licence_data.get("issued", 0),
+            licence_data.get("expires", 0),
+            time.time()
+        ))
+        conn.commit()
+        conn.close()
+
+
+def load_licence_locally(db_path: str) -> Optional[Tuple[str, Dict]]:
+    """Load a cached licence from the local database."""
+    try:
+        with _lock:
+            conn = sqlite3.connect(db_path)
+            row = conn.execute(
+                "SELECT token, api_key, devices, plan, email, issued, expires "
+                "FROM licence_cache LIMIT 1"
+            ).fetchone()
+            conn.close()
+        if not row:
+            return None
+        token, api_key, devices, plan, email, issued, expires = row
+        data = {
+            "v": TOKEN_VERSION,
+            "key": api_key,
+            "devices": devices,
+            "plan": plan,
+            "email": email,
+            "issued": issued,
+            "expires": expires
+        }
+        return token, data
+    except Exception:
+        return None
+
+
+# ==============================================================================
+# STRESS TEST
+# Run with: python sebdog_licence.py
+# ==============================================================================
+
+if __name__ == "__main__":
+    import sys
+
+    print("SEBDOG LICENCE SYSTEM — Stress Test")
+    print("=" * 60)
+
+    # Generate a test secret (on sebbi.pro this comes from Railway env vars)
+    SECRET = secrets.token_bytes(32)
+    TEST_KEY = "al_live_" + secrets.token_hex(24)
+    PASSES = 0
+    FAILURES = 0
+
+    def check(name, condition, detail=""):
+        global PASSES, FAILURES
+        if condition:
+            print(f"  PASS  {name}")
+            PASSES += 1
+        else:
+            print(f"  FAIL  {name} {detail}")
+            FAILURES += 1
+
+    # --- Basic validity ---
+    print("\n[1] Basic token generation and validation")
+    token = generate_token(TEST_KEY, 10000, "paid", "test@example.com", SECRET)
+    data, err = validate_token(token, SECRET)
+    check("Valid token accepted", err is None)
+    check("API key preserved", data and data.get("key") == TEST_KEY)
+    check("Device count preserved", data and data.get("devices") == 10000)
+    check("Plan preserved", data and data.get("plan") == "paid")
+    check("Not in grace period", data and not is_in_grace_period(data))
+    check("Days until expiry > 360", data and days_until_expiry(data) > 360)
+
+    # --- Tamper detection ---
+    print("\n[2] Tamper detection")
+    raw = json.loads(base64.urlsafe_b64decode(token))
+    raw["payload"] = raw["payload"].replace("10000", "99999")
+    bad_token = base64.urlsafe_b64encode(json.dumps(raw, separators=(',',':')).encode()).decode()
+    _, err = validate_token(bad_token, SECRET)
+    check("Tampered device count rejected", err == "invalid_signature")
+
+    raw2 = json.loads(base64.urlsafe_b64decode(token))
+    raw2["payload"] = raw2["payload"].replace("paid", "enterprise")
+    bad_token2 = base64.urlsafe_b64encode(json.dumps(raw2, separators=(',',':')).encode()).decode()
+    _, err = validate_token(bad_token2, SECRET)
+    check("Tampered plan rejected", err == "invalid_signature")
+
+    raw3 = json.loads(base64.urlsafe_b64decode(token))
+    raw3["sig"] = "0" * 64
+    bad_token3 = base64.urlsafe_b64encode(json.dumps(raw3, separators=(',',':')).encode()).decode()
+    _, err = validate_token(bad_token3, SECRET)
+    check("Zeroed signature rejected", err == "invalid_signature")
+
+    # --- Expiry ---
+    print("\n[3] Expiry handling")
+    expired = generate_token(TEST_KEY, 100, "paid", "test@example.com", SECRET, validity_days=-1)
+    data_exp, err = validate_token(expired, SECRET)
+    check("Recently expired token in grace period", err is None and data_exp is not None)
+    check("Grace period detected", data_exp and is_in_grace_period(data_exp))
+
+    hard_expired = generate_token(TEST_KEY, 100, "paid", "test@example.com", SECRET, validity_days=-9)
+    _, err = validate_token(hard_expired, SECRET)
+    check("Hard expired token rejected", err == "token_expired")
+
+    # --- Wrong secret ---
+    print("\n[4] Secret validation")
+    wrong = secrets.token_bytes(32)
+    _, err = validate_token(token, wrong)
+    check("Wrong secret rejected", err == "invalid_signature")
+
+    almost_right = bytearray(SECRET)
+    almost_right[0] ^= 1
+    _, err = validate_token(token, bytes(almost_right))
+    check("One-bit-flipped secret rejected", err == "invalid_signature")
+
+    # --- Malformed tokens ---
+    print("\n[5] Malformed input handling")
+    _, err = validate_token("notbase64!!!", SECRET)
+    check("Garbage input rejected", err is not None)
+    _, err = validate_token("", SECRET)
+    check("Empty token rejected", err is not None)
+    _, err = validate_token(base64.urlsafe_b64encode(b"{}").decode(), SECRET)
+    check("Empty JSON rejected", err is not None)
+
+    # --- Local caching ---
+    print("\n[6] Local licence caching")
+    import tempfile, os
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        test_db = f.name
+    try:
+        data_valid, _ = validate_token(token, SECRET)
+        save_licence_locally(test_db, token, data_valid)
+        cached = load_licence_locally(test_db)
+        check("Licence saved and retrieved", cached is not None)
+        check("Cached key matches", cached and cached[1].get("key") == TEST_KEY)
+        check("Cached devices match", cached and cached[1].get("devices") == 10000)
+    finally:
+        os.unlink(test_db)
+
+    # --- Performance ---
+    print("\n[7] Performance")
+    import timeit
+    gen_time = timeit.timeit(
+        lambda: generate_token(TEST_KEY, 10000, "paid", "test@example.com", SECRET),
+        number=1000
+    )
+    val_time = timeit.timeit(
+        lambda: validate_token(token, SECRET),
+        number=1000
+    )
+    check(f"Generation: {gen_time*1:.1f}ms avg per token", gen_time < 5)
+    check(f"Validation: {val_time*1:.1f}ms avg per validation", val_time < 5)
+
+    # --- Summary ---
+    print(f"\n{'='*60}")
+    print(f"Results: {PASSES} passed, {FAILURES} failed")
+    if FAILURES == 0:
+        print("ALL TESTS PASSED. System is production ready.")
+    else:
+        print("FAILURES DETECTED. Do not ship.")
+    sys.exit(0 if FAILURES == 0 else 1)
+
+```
+
+
+## `sebdog_reporter.py`
+
+217 lines, 8364 bytes
+
+```python
+"""
+SEBDOG DECISION REPORTER v1.0.0
+Generates readable reports from the sebdog audit chain.
+Shows exactly why each decision was made.
+Copyright (c) 2026 Justin Antony Dobson / Monop Content
+"""
+
+import sqlite3, json, time, os
+from datetime import datetime
+
+DB_FILE = "sebdog_audit.db"
+
+REASON_EXPLANATIONS = {
+    "velocity_spike": "User made more than 10 requests in 60 seconds",
+    "high_amount": "Transaction amount exceeded £500",
+    "risky_device": "Device risk score above 0.5",
+    "behaviour_anomaly": "Behavioural anomaly score above 0.5",
+    "country_shift": "Request came from a different country than usual",
+    "unsafe_country": "Request came from outside approved country list",
+    "low_trust": "User trust score has dropped below 0.4 due to previous decisions",
+}
+
+def get_decisions(db_path=DB_FILE, limit=100):
+    if not os.path.exists(db_path):
+        return []
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute("""
+        SELECT ts, user_id, event_json, result_json, audit_hash
+        FROM audit_log
+        ORDER BY id DESC
+        LIMIT ?
+    """, (limit,)).fetchall()
+    conn.close()
+    results = []
+    for row in rows:
+        try:
+            event = json.loads(row[2])
+            result = json.loads(row[3])
+            results.append({
+                "ts": row[0],
+                "user_id": row[1],
+                "event": event,
+                "result": result,
+                "audit_hash": row[4]
+            })
+        except:
+            pass
+    return results
+
+def format_reason(reason):
+    return REASON_EXPLANATIONS.get(reason, reason.replace("_", " ").capitalize())
+
+def decision_color(decision):
+    return {"ALLOW": "#00875a", "CHALLENGE": "#b45309", "BLOCK": "#cc0000"}.get(decision, "#555")
+
+def generate_text_report(db_path=DB_FILE, limit=100):
+    decisions = get_decisions(db_path, limit)
+    if not decisions:
+        return "No decisions recorded yet."
+    
+    lines = [
+        "SEBDOG DECISION REPORT",
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"Total decisions shown: {len(decisions)}",
+        "=" * 60
+    ]
+    
+    for d in decisions:
+        result = d["result"]
+        event = d["event"]
+        ts = datetime.fromtimestamp(d["ts"]).strftime('%Y-%m-%d %H:%M:%S')
+        decision = result.get("decision", "?")
+        score = result.get("score", 0)
+        reasons = result.get("reasons", [])
+        
+        lines.append(f"\n[{ts}] User: {d['user_id']}")
+        lines.append(f"Action: {event.get('action','?')} | Country: {event.get('country','?')} | Amount: £{event.get('amount',0)}")
+        lines.append(f"Decision: {decision} | Score: {score} | Trust: {result.get('trust',0)}")
+        
+        if reasons:
+            lines.append("Reasons:")
+            for r in reasons:
+                lines.append(f"  - {format_reason(r)}")
+        else:
+            lines.append("Reasons: No risk factors detected")
+        
+        lines.append(f"Audit hash: {d['audit_hash'][:32]}...")
+        lines.append("-" * 60)
+    
+    return "\n".join(lines)
+
+def generate_json_report(db_path=DB_FILE, limit=100):
+    decisions = get_decisions(db_path, limit)
+    report = {
+        "generated": datetime.now().isoformat(),
+        "total": len(decisions),
+        "decisions": []
+    }
+    for d in decisions:
+        result = d["result"]
+        event = d["event"]
+        reasons = result.get("reasons", [])
+        report["decisions"].append({
+            "timestamp": datetime.fromtimestamp(d["ts"]).isoformat(),
+            "user_id": d["user_id"],
+            "action": event.get("action"),
+            "country": event.get("country"),
+            "amount": event.get("amount"),
+            "decision": result.get("decision"),
+            "score": result.get("score"),
+            "trust": result.get("trust"),
+            "reasons": reasons,
+            "reasons_explained": [format_reason(r) for r in reasons],
+            "audit_hash": d["audit_hash"]
+        })
+    return json.dumps(report, indent=2)
+
+def generate_html_report(db_path=DB_FILE, limit=100):
+    decisions = get_decisions(db_path, limit)
+    
+    rows = ""
+    for d in decisions:
+        result = d["result"]
+        event = d["event"]
+        ts = datetime.fromtimestamp(d["ts"]).strftime('%Y-%m-%d %H:%M:%S')
+        decision = result.get("decision", "?")
+        score = result.get("score", 0)
+        reasons = result.get("reasons", [])
+        color = decision_color(decision)
+        
+        reason_html = ""
+        if reasons:
+            reason_html = "<ul>" + "".join(f"<li>{format_reason(r)}</li>" for r in reasons) + "</ul>"
+        else:
+            reason_html = "<span style='color:#888'>No risk factors detected</span>"
+        
+        rows += f"""
+        <tr>
+            <td>{ts}</td>
+            <td><code>{d['user_id']}</code></td>
+            <td>{event.get('action','?')}</td>
+            <td>{event.get('country','?')}</td>
+            <td>£{event.get('amount',0)}</td>
+            <td><strong style="color:{color}">{decision}</strong></td>
+            <td>{score}</td>
+            <td>{result.get('trust',0)}</td>
+            <td>{reason_html}</td>
+            <td><code style="font-size:10px">{d['audit_hash'][:16]}...</code></td>
+        </tr>"""
+    
+    allow = sum(1 for d in decisions if d["result"].get("decision") == "ALLOW")
+    challenge = sum(1 for d in decisions if d["result"].get("decision") == "CHALLENGE")
+    block = sum(1 for d in decisions if d["result"].get("decision") == "BLOCK")
+    
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Sebdog Decision Report</title>
+<style>
+body{{font-family:sans-serif;background:#f5f7fa;color:#1a202c;margin:0;padding:20px}}
+.header{{background:#0a0f1e;color:#fff;padding:24px 32px;border-radius:8px;margin-bottom:24px}}
+.header h1{{margin:0;font-size:24px;color:#c9a84c}}
+.header p{{margin:4px 0 0;color:rgba(255,255,255,0.5);font-size:13px}}
+.stats{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:24px}}
+.stat{{background:#fff;border-radius:8px;padding:16px;text-align:center;border:1px solid #e2e8f0}}
+.stat-n{{font-size:32px;font-weight:700}}
+.stat-l{{font-size:11px;color:#64748b;margin-top:4px}}
+.allow{{color:#00875a}}.challenge{{color:#b45309}}.block{{color:#cc0000}}
+table{{width:100%;border-collapse:collapse;background:#fff;border-radius:8px;overflow:hidden;border:1px solid #e2e8f0}}
+th{{background:#0a0f1e;color:#c9a84c;padding:10px 12px;text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:1px}}
+td{{padding:10px 12px;border-bottom:1px solid #e2e8f0;font-size:12px;vertical-align:top}}
+tr:last-child td{{border:none}}
+tr:hover td{{background:#f8fafc}}
+ul{{margin:4px 0;padding-left:16px}}
+li{{margin:2px 0;color:#64748b}}
+code{{background:#f1f5f9;padding:2px 4px;border-radius:3px;font-size:11px}}
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>Sebdog Decision Report</h1>
+  <p>Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} &nbsp;|&nbsp; Showing last {len(decisions)} decisions &nbsp;|&nbsp; Powered by sebbi.pro</p>
+</div>
+<div class="stats">
+  <div class="stat"><div class="stat-n allow">{allow}</div><div class="stat-l">ALLOWED</div></div>
+  <div class="stat"><div class="stat-n challenge">{challenge}</div><div class="stat-l">CHALLENGED</div></div>
+  <div class="stat"><div class="stat-n block">{block}</div><div class="stat-l">BLOCKED</div></div>
+</div>
+<table>
+<thead><tr>
+  <th>Time</th><th>User</th><th>Action</th><th>Country</th><th>Amount</th>
+  <th>Decision</th><th>Score</th><th>Trust</th><th>Reasons</th><th>Audit Hash</th>
+</tr></thead>
+<tbody>{rows if rows else '<tr><td colspan="10" style="text-align:center;color:#888;padding:32px">No decisions recorded yet</td></tr>'}</tbody>
+</table>
+</body>
+</html>"""
+    return html
+
+if __name__ == "__main__":
+    import sys
+    fmt = sys.argv[1] if len(sys.argv) > 1 else "html"
+    db = sys.argv[2] if len(sys.argv) > 2 else DB_FILE
+    
+    if fmt == "text":
+        print(generate_text_report(db))
+    elif fmt == "json":
+        print(generate_json_report(db))
+    else:
+        report = generate_html_report(db)
+        out = "sebdog_report.html"
+        with open(out, "w") as f:
+            f.write(report)
+        print(f"Report saved to {out}")
+
+```
+
+
+## `tests/attack_continuity_1.py`
+
+440 lines, 22747 bytes
+
+```python
+#!/usr/bin/env python3
+"""Attack harness for modules/lineage.py.
+
+Every test is written from the position of an agent that HAS some authority
+and is trying to end up with more. Passing means the attack was refused for
+the right reason, not merely refused.
+"""
+
+import hashlib
+import json
+import sqlite3
+import threading
+import time
+import sys
+
+import continuity as lineage
+# --- stand-in for the deployed engine ---------------------------------
+import types as _types
+_ENGINE = {"verdict": "ALLOW"}
+
+def install_engine(verdict="ALLOW", raises=False, shape="dict"):
+    _ENGINE["verdict"] = verdict
+    mod = _types.ModuleType("server")
+    mod.get_bearer = lambda *a, **k: None
+    def score_event(event):
+        if raises:
+            raise RuntimeError("engine down")
+        if shape == "dict":
+            return {"decision": _ENGINE["verdict"], "score": 0.1}
+        if shape == "tuple":
+            return (_ENGINE["verdict"], 0.1)
+        return _ENGINE["verdict"]
+    mod.score_event = score_event
+    sys.modules["server"] = mod
+
+def remove_engine():
+    sys.modules.pop("server", None)
+
+install_engine("ALLOW")
+
+
+PASS, FAIL = [], []
+
+
+def make_ctx():
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    lock = threading.RLock()
+    chain = {"n": 0, "prev": "0" * 64}
+
+    def seal(ev, res, ts, api_key):
+        chain["n"] += 1
+        payload = json.dumps([ev, res, ts, api_key, chain["prev"]], sort_keys=True)
+        h = hashlib.sha256(payload.encode()).hexdigest()
+        chain["prev"] = h
+        return h, chain["n"], chain["n"]
+
+    lineage._ready = False
+    ctx = {"conn": conn, "lock": lock, "seal": seal}
+    lineage._setup(ctx)
+    return ctx
+
+
+def check(name, condition, detail=""):
+    (PASS if condition else FAIL).append(name)
+    print(("  ok   " if condition else "  FAIL ") + name + (("  -> " + detail) if detail and not condition else ""))
+
+
+def issue(ctx, **kw):
+    if kw.get("parent") and int(kw.get("delegations_left", 0)) > 0 \
+            and not kw.get("risk_accepted_by"):
+        kw["risk_accepted_by"] = "owner@example.com"
+    return lineage._issue(ctx, "k", kw)
+
+
+def exercise(ctx, **kw):
+    return lineage._evaluate(ctx, "k", kw)
+
+
+NOW = time.time()
+HOUR = 3600
+
+
+def base_root(ctx, **over):
+    args = dict(
+        id="root", issuer="justin@monop", issuer_kind="human",
+        subject="orchestrator", subject_kind="agent",
+        scope=["payments.refund", "payments.read", "tickets.*"],
+        constraints={"max_amount": 5000, "allowed_currency": ["GBP", "EUR"],
+                     "denied_country": ["KP"], "may_contact_customer": True},
+        purpose="resolve customer refund complaints",
+        purpose_tags=["refunds", "support"],
+        not_before=NOW - HOUR, not_after=NOW + 10 * HOUR,
+        delegations_left=3)
+    args.update(over)
+    return issue(ctx, **args)
+
+
+print("\n=== 1. the happy path must actually work ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent",
+      subject="refund-agent", scope=["payments.refund"],
+      constraints={"max_amount": 500, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="issue refunds under 500", purpose_tags=["refunds"],
+      not_before=NOW - HOUR, not_after=NOW + 2 * HOUR, delegations_left=1)
+r, code = exercise(ctx, grant="mid", action="payments.refund",
+                   params={"amount": 100, "currency": "GBP", "country": "GB",
+                           "contact_customer": True},
+                   purpose_tag="refunds")
+check("a derivable action returns ALLOW", r["verdict"] == "ALLOW", str(r["reasons"]))
+check("lineage names the human at the root", r["authorised_by"] == "justin@monop")
+check("depth is reported", r["delegation_depth"] == 1)
+check("the decision is sealed", bool(r.get("sealed_in_chain")))
+
+print("\n=== 2. orphan root: an agent grants itself authority ===")
+ctx = make_ctx()
+r, code = issue(ctx, id="self", issuer="rogue-agent", issuer_kind="agent",
+                subject="rogue-agent", scope=["payments.refund"],
+                constraints={"max_amount": 999999}, purpose="whatever I decide",
+                purpose_tags=["anything"], not_after=NOW + HOUR)
+check("self-issued root is refused at issue", code == 409 and r.get("error") == "identity_continuity", str(r))
+
+print("\n=== 3. scope escalation in a child ===")
+ctx = make_ctx()
+base_root(ctx)
+r, code = issue(ctx, id="wide", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="rogue", scope=["payments.refund", "payments.transfer"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                             "denied_country": ["KP"], "may_contact_customer": False},
+                purpose="sneak in a transfer", purpose_tags=["refunds"],
+                not_after=NOW + HOUR, delegations_left=0)
+check("scope the parent never held is refused",
+      code == 409 and "payments.transfer" in r.get("message", ""), str(r))
+
+print("\n=== 4. constraint loosening ===")
+ctx = make_ctx()
+base_root(ctx)
+r, code = issue(ctx, id="rich", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="rogue", scope=["payments.refund"],
+                constraints={"max_amount": 50000, "allowed_currency": ["GBP"],
+                             "denied_country": ["KP"], "may_contact_customer": True},
+                purpose="bigger refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+check("raising a max_ cap is refused", code == 409 and "max_amount" in r.get("message", ""), str(r))
+
+r, code = issue(ctx, id="wide2", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="rogue", scope=["payments.refund"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP", "USD"],
+                             "denied_country": ["KP"], "may_contact_customer": True},
+                purpose="new currency", purpose_tags=["refunds"], not_after=NOW + HOUR)
+check("adding to an allowed_ set is refused", code == 409 and "USD" in r.get("message", ""), str(r))
+
+r, code = issue(ctx, id="undeny", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="rogue", scope=["payments.refund"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                             "denied_country": [], "may_contact_customer": True},
+                purpose="drop the denylist", purpose_tags=["refunds"], not_after=NOW + HOUR)
+check("dropping from a denied_ set is refused", code == 409 and "KP" in r.get("message", ""), str(r))
+
+r, code = issue(ctx, id="newkey", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="rogue", scope=["payments.refund"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                             "denied_country": ["KP"], "may_contact_customer": True,
+                             "may_export_data": True},
+                purpose="invent a permission", purpose_tags=["refunds"], not_after=NOW + HOUR)
+check("introducing a constraint key the parent never expressed is refused",
+      code == 409 and "may_export_data" in r.get("message", ""), str(r))
+
+print("\n=== 5. temporal attacks ===")
+ctx = make_ctx()
+base_root(ctx)
+r, code = issue(ctx, id="long", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="rogue", scope=["payments.refund"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                             "denied_country": ["KP"], "may_contact_customer": True},
+                purpose="outlive the parent", purpose_tags=["refunds"],
+                not_before=NOW, not_after=NOW + 100 * HOUR)
+check("a child cannot outlive its parent", code == 409 and r.get("error") == "temporal_validity", str(r))
+
+# expired ancestor, live leaf, forced in past the issue check
+ctx = make_ctx()
+base_root(ctx, not_after=NOW + HOUR)
+issue(ctx, id="child", parent="root", issuer="orchestrator", issuer_kind="agent",
+      subject="agent-b", scope=["payments.refund"],
+      constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+with ctx["lock"]:
+    ctx["conn"].execute("UPDATE auth_grant SET not_after=? WHERE id='root'", (NOW - 60,))
+    ctx["conn"].commit()
+r, _ = exercise(ctx, grant="child", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "GB",
+                        "contact_customer": True}, purpose_tag="refunds")
+check("an expired ancestor kills a live leaf", r["verdict"] == "BLOCK", str(r["reasons"]))
+check("...and it is reported as tampering, since the row no longer matches its digest",
+      r["broken_invariant"] == "evidence_continuity", r["broken_invariant"] or "")
+
+print("\n=== 6. revocation is transitive ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent",
+      subject="b", scope=["payments.refund"],
+      constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR, delegations_left=1)
+issue(ctx, id="leaf", parent="mid", issuer="b", issuer_kind="agent",
+      subject="c", scope=["payments.refund"],
+      constraints={"max_amount": 50, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+lineage._revoke(ctx, "k", {"grant": "mid", "reason": "agent compromised"})
+r, _ = exercise(ctx, grant="leaf", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "GB",
+                        "contact_customer": True}, purpose_tag="refunds")
+check("revoking the middle blocks the leaf without touching it", r["verdict"] == "BLOCK")
+check("the revoked grant is named", r["broken_at"] == "mid", str(r["broken_at"]))
+r2, _ = exercise(ctx, grant="root", action="payments.refund",
+                 params={"amount": 10, "currency": "GBP", "country": "GB",
+                         "contact_customer": True}, purpose_tag="refunds")
+check("revoking a child does not harm the parent", r2["verdict"] == "ALLOW", str(r2["reasons"]))
+
+print("\n=== 7. delegation depth cannot be manufactured ===")
+ctx = make_ctx()
+base_root(ctx, delegations_left=1)
+issue(ctx, id="d1", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.refund"],
+      constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR, delegations_left=0)
+r, code = issue(ctx, id="d2", parent="d1", issuer="b", issuer_kind="agent", subject="c",
+                scope=["payments.refund"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                             "denied_country": ["KP"], "may_contact_customer": True},
+                purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+check("an exhausted delegation budget stops the chain",
+      code == 409 and r.get("error") == "delegation_not_permitted", str(r))
+
+ctx = make_ctx()
+base_root(ctx, delegations_left=2)
+r, code = issue(ctx, id="greedy", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="b", scope=["payments.refund"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                             "denied_country": ["KP"], "may_contact_customer": True},
+                purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR,
+                delegations_left=5)
+check("a child cannot award itself more onward delegations than remained",
+      code == 409, str(r))
+
+print("\n=== 8. tampering with a stored grant ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.refund"],
+      constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+with ctx["lock"]:
+    ctx["conn"].execute(
+        "UPDATE auth_grant SET constraints=? WHERE id='mid'",
+        (json.dumps({"max_amount": 999999, "allowed_currency": ["GBP", "USD"],
+                     "denied_country": [], "may_contact_customer": True},
+                    sort_keys=True, separators=(",", ":")),))
+    ctx["conn"].commit()
+r, _ = exercise(ctx, grant="mid", action="payments.refund",
+                params={"amount": 900000, "currency": "USD", "country": "GB",
+                        "contact_customer": True}, purpose_tag="refunds")
+check("editing the database does not widen authority", r["verdict"] == "BLOCK")
+check("the tamper is reported as an evidence failure",
+      r["broken_invariant"] == "evidence_continuity", str(r["broken_invariant"]))
+
+print("\n=== 9. re-parenting onto a wider ancestor ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="narrow", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.read"],
+      constraints={"max_amount": 1, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": False},
+      purpose="read only", purpose_tags=["support"], not_after=NOW + HOUR)
+with ctx["lock"]:
+    ctx["conn"].execute("UPDATE auth_grant SET parent=NULL WHERE id='narrow'")
+    ctx["conn"].commit()
+r, _ = exercise(ctx, grant="narrow", action="payments.read",
+                params={}, purpose_tag="support")
+check("detaching a grant to make it a root fails integrity", r["verdict"] == "BLOCK",
+      str(r["reasons"]))
+
+print("\n=== 10. parent cycle ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="a", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.refund"],
+      constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR, delegations_left=1)
+issue(ctx, id="b", parent="a", issuer="b", issuer_kind="agent", subject="c",
+      scope=["payments.refund"],
+      constraints={"max_amount": 50, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+with ctx["lock"]:
+    ctx["conn"].execute("UPDATE auth_grant SET parent='b' WHERE id='a'")
+    ctx["conn"].commit()
+start = time.time()
+r, _ = exercise(ctx, grant="b", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "GB",
+                        "contact_customer": True}, purpose_tag="refunds")
+check("a parent cycle terminates rather than hangs", time.time() - start < 2)
+check("a cycle is BLOCKed as an authority failure", r["verdict"] == "BLOCK")
+
+print("\n=== 11. action parameters beyond the effective constraints ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.refund"],
+      constraints={"max_amount": 500, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+r, _ = exercise(ctx, grant="mid", action="payments.refund",
+                params={"amount": 501, "currency": "GBP", "country": "GB",
+                        "contact_customer": True}, purpose_tag="refunds")
+check("an amount over the cap is BLOCKed", r["verdict"] == "BLOCK", str(r["reasons"]))
+r, _ = exercise(ctx, grant="mid", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "KP",
+                        "contact_customer": True}, purpose_tag="refunds")
+check("a denied country is BLOCKed", r["verdict"] == "BLOCK", str(r["reasons"]))
+
+print("\n=== 12. uncertainty is challenged, not guessed ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.refund"],
+      constraints={"max_amount": 500, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="issue refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+r, _ = exercise(ctx, grant="mid", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "GB",
+                        "contact_customer": True}, purpose_tag="marketing")
+check("a purpose the grant does not carry is CHALLENGED", r["verdict"] == "CHALLENGE", str(r))
+r, _ = exercise(ctx, grant="mid", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "GB",
+                        "contact_customer": True})
+check("no declared purpose is CHALLENGED", r["verdict"] == "CHALLENGE", str(r))
+r, _ = exercise(ctx, grant="mid", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "GB",
+                        "contact_customer": True, "recipient_iban": "GB00XXXX"},
+                purpose_tag="refunds")
+check("an unconstrained parameter is CHALLENGED, not ignored",
+      r["verdict"] == "CHALLENGE" and any("recipient_iban" in x for x in r["reasons"]), str(r))
+
+print("\n=== 13. wildcard breadth ===")
+ctx = make_ctx()
+base_root(ctx)
+r, _ = exercise(ctx, grant="root", action="tickets.close.bulk.all",
+                params={}, purpose_tag="support")
+check("a broad wildcard match is CHALLENGED rather than silently allowed",
+      r["verdict"] == "CHALLENGE", str(r))
+
+ctx = make_ctx()
+base_root(ctx, scope=["*"], id="star")
+r, _ = exercise(ctx, grant="star", action="payments.transfer", params={}, purpose_tag="refunds")
+check("a bare * never reaches ALLOW", r["verdict"] == "CHALLENGE", str(r))
+
+print("\n=== 14. no union of grants ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="money", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.refund"],
+      constraints={"max_amount": 500, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": False},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+issue(ctx, id="contact", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.read"],
+      constraints={"max_amount": 0, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="contact", purpose_tags=["support"], not_after=NOW + HOUR)
+r, code = exercise(ctx, grant="money,contact", action="payments.refund",
+                   params={"amount": 10, "currency": "GBP", "contact_customer": True},
+                   purpose_tag="refunds")
+check("two grant ids cannot be combined into one exercise", r["verdict"] == "BLOCK", str(r))
+r, _ = exercise(ctx, grant="money", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "contact_customer": True},
+                purpose_tag="refunds")
+check("the capability from the sibling grant does not leak in", r["verdict"] == "BLOCK",
+      str(r["reasons"]))
+
+print("\n=== 15. time of check vs time of use ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.refund"],
+      constraints={"max_amount": 500, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+r, _ = exercise(ctx, grant="mid", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "GB",
+                        "contact_customer": True}, purpose_tag="refunds")
+eval_id = r["evaluation"]
+c, code = lineage._confirm(ctx, "k", {"evaluation": eval_id, "action": "payments.refund",
+                                      "params": {"amount": 10, "currency": "GBP",
+                                                 "country": "GB", "contact_customer": True}})
+check("executing exactly what was evaluated binds", c["bound"] is True, str(c))
+c, code = lineage._confirm(ctx, "k", {"evaluation": eval_id, "action": "payments.refund",
+                                      "params": {"amount": 400, "currency": "GBP",
+                                                 "country": "GB", "contact_customer": True}})
+check("executing different values than were evaluated is rejected", c["bound"] is False, str(c))
+check("the rejected execution is still sealed", bool(c.get("sealed_in_chain")))
+
+with ctx["lock"]:
+    ctx["conn"].execute("UPDATE auth_eval SET valid_until=? WHERE id=?", (NOW - 1, eval_id))
+    ctx["conn"].commit()
+c, _ = lineage._confirm(ctx, "k", {"evaluation": eval_id})
+check("a banked evaluation cannot be spent after its window", c["bound"] is False, str(c))
+
+print("\n=== 16. a BLOCK is evidence, not silence ===")
+ctx = make_ctx()
+base_root(ctx)
+r, _ = exercise(ctx, grant="nonexistent", action="payments.refund", params={})
+check("an unknown grant BLOCKs", r["verdict"] == "BLOCK")
+check("the block is sealed in the chain", bool(r.get("sealed_in_chain")))
+d, code = lineage._decision(ctx, {"evaluation": r["evaluation"]})
+check("the sealed decision is publicly retrievable", code == 200 and d["verdict"] == "BLOCK")
+
+print("\n=== 17. no authority without a stated purpose or an end date ===")
+ctx = make_ctx()
+r, code = issue(ctx, id="forever", issuer="justin@monop", issuer_kind="human", subject="a",
+                scope=["payments.refund"], constraints={"max_amount": 1},
+                purpose="anything", purpose_tags=["x"])
+check("a grant with no expiry is refused", code == 400 and r.get("error") == "not_after_required")
+r, code = issue(ctx, id="vague", issuer="justin@monop", issuer_kind="human", subject="a",
+                scope=["payments.refund"], constraints={"max_amount": 1},
+                purpose="", purpose_tags=["x"], not_after=NOW + HOUR)
+check("a grant with no purpose is refused", code == 400 and r.get("error") == "purpose_required")
+
+print("\n" + "=" * 60)
+print("passed %d, failed %d" % (len(PASS), len(FAIL)))
+if FAIL:
+    for f in FAIL:
+        print("  FAILED: " + f)
+    sys.exit(1)
+
+```
 
 
 ## `tests/attack_continuity_2.py`
@@ -877,1584 +2340,5 @@ print("\n" + "="*62)
 print("passed %d, failed %d" % (len(P), len(F)))
 for f in F: print("  FAILED: " + f)
 sys.exit(1 if F else 0)
-
-```
-
-
-## `verify_authority.py`
-
-573 lines, 21333 bytes
-
-```python
-#!/usr/bin/env python3
-"""
-verify_authority.py  -  check an AILeash authority proof without AILeash
-
-    python3 verify_authority.py proof.json
-    curl -s "https://sebbi.pro/x/continuity/proof?evaluation=e_..." \\
-        | python3 verify_authority.py -
-
-WHAT THIS IS FOR
-----------------
-A proof that can only be checked by the party who issued it is not a proof.
-This script takes a bundle and reaches its own conclusion using nothing but
-the Python standard library. It does not call the issuing system, it does not
-import anything you have to install, and it does not take a single field of
-the bundle at face value.
-
-It does four separate things, and each one can fail on its own:
-
-  1. SIGNATURE   Ed25519 over the canonical bundle. Confirms the bundle came
-                 from the holder of the named key and has not been edited by
-                 anybody since.
-
-  2. INTEGRITY   Recomputes every grant digest, the lineage digest and the
-                 parameter digest from the fields in front of it. Confirms
-                 the bundle is internally consistent with its own contents.
-
-  3. DERIVATION  Re-runs the authority rules from scratch: root issued by a
-                 human, an unbroken parent chain, scope covered at every hop,
-                 constraints narrowing on every axis, purpose narrowing,
-                 validity windows contained, nothing revoked, and the action
-                 itself inside the effective limits of the whole lineage.
-
-  4. AGREEMENT   Compares the verdict this script reached with the verdict the
-                 bundle claims. Disagreement is reported as a failure of the
-                 issuer, not of this script.
-
-WHAT A PASS MEANS
------------------
-That the authority for this action was derivable, at that time, from that
-human grant - or, for a refusal, that it genuinely was not, and that the named
-grant and invariant really are where it broke.
-
-WHAT A PASS DOES NOT MEAN
--------------------------
-That the root grant should ever have been issued. That the parameters describe
-something that really happened. That the risk engine was right. Derivation is
-not merit and it is not truth.
-
-The risk half of a composed verdict cannot be re-derived here, because that
-needs the issuer's scoring engine. Where the bundle's authority verdict is
-BLOCK, the composed verdict stands regardless, because the composition takes
-the worse of the two.
-"""
-
-import binascii
-import hashlib
-import json
-import sys
-
-GRANT_PREFIX = b"AILEASH-GRANT-v1:"
-EVAL_PREFIX = b"AILEASH-AUTHEVAL-v1:"
-BUNDLE_PREFIX = b"AILEASH-AUTHORITY-PROOF-v1:"
-
-MAX_DEPTH = 32
-RANK = {"ALLOW": 0, "CHALLENGE": 1, "BLOCK": 2}
-
-
-# ======================================================================
-# Ed25519, RFC 8032, standard library only
-# ======================================================================
-
-_Q = 2 ** 255 - 19
-_L = 2 ** 252 + 27742317777372353535851937790883648493
-_D = -121665 * pow(121666, _Q - 2, _Q) % _Q
-_I = pow(2, (_Q - 1) // 4, _Q)
-
-
-def _h(m):
-    return hashlib.sha512(m).digest()
-
-
-def _inv(x):
-    return pow(x, _Q - 2, _Q)
-
-
-def _xrecover(y):
-    xx = (y * y - 1) * _inv(_D * y * y + 1)
-    x = pow(xx, (_Q + 3) // 8, _Q)
-    if (x * x - xx) % _Q != 0:
-        x = (x * _I) % _Q
-    if x % 2 != 0:
-        x = _Q - x
-    return x
-
-
-_BY = 4 * _inv(5) % _Q
-_BX = _xrecover(_BY)
-_B = (_BX % _Q, _BY % _Q, 1, (_BX * _BY) % _Q)
-_IDENT = (0, 1, 1, 0)
-
-
-def _add(p, q):
-    x1, y1, z1, t1 = p
-    x2, y2, z2, t2 = q
-    a = (y1 - x1) * (y2 - x2) % _Q
-    b = (y1 + x1) * (y2 + x2) % _Q
-    c = t1 * 2 * _D * t2 % _Q
-    dd = z1 * 2 * z2 % _Q
-    e, f, g, hh = b - a, dd - c, dd + c, b + a
-    return (e * f % _Q, g * hh % _Q, f * g % _Q, e * hh % _Q)
-
-
-def _scalarmult(p, e):
-    if e == 0:
-        return _IDENT
-    q = _scalarmult(p, e // 2)
-    q = _add(q, q)
-    if e & 1:
-        q = _add(q, p)
-    return q
-
-
-def _encodepoint(p):
-    x, y, z, _t = p
-    zi = _inv(z)
-    x, y = x * zi % _Q, y * zi % _Q
-    bits = [(y >> i) & 1 for i in range(255)] + [x & 1]
-    return bytes(sum(bits[i * 8 + j] << j for j in range(8)) for i in range(32))
-
-
-def _bit(h, i):
-    return (h[i // 8] >> (i % 8)) & 1
-
-
-def _hint(m):
-    h = _h(m)
-    return sum(2 ** i * _bit(h, i) for i in range(512))
-
-
-def _isoncurve(p):
-    x, y, z, t = p
-    return (z % _Q != 0 and x * y % _Q == z * t % _Q
-            and (y * y - x * x - z * z - _D * t * t) % _Q == 0)
-
-
-def _decodepoint(s):
-    y = int.from_bytes(s, "little") & ((1 << 255) - 1)
-    x = _xrecover(y)
-    if x & 1 != _bit(s, 255):
-        x = _Q - x
-    p = (x, y, 1, (x * y) % _Q)
-    if not _isoncurve(p):
-        raise ValueError("point off curve")
-    return p
-
-
-def ed25519_verify(sig, msg, pk):
-    if len(sig) != 64 or len(pk) != 32:
-        return False
-    try:
-        rr = _decodepoint(sig[:32])
-        a = _decodepoint(pk)
-    except Exception:
-        return False
-    s = int.from_bytes(sig[32:64], "little")
-    if s >= _L:
-        return False
-    hh = _hint(sig[:32] + pk + msg)
-    return _encodepoint(_scalarmult(_B, s)) == _encodepoint(_add(rr, _scalarmult(a, hh)))
-
-
-# ======================================================================
-# the rules, reimplemented from the published spec
-# ======================================================================
-
-def canon(obj):
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
-
-
-def sha(prefix, text):
-    return hashlib.sha256(prefix + text.encode("utf-8")).hexdigest()
-
-
-def grant_digest(g):
-    material = {
-        "id": g["id"], "parent": g["parent"], "issuer": g["issuer"],
-        "issuer_kind": g["issuer_kind"], "subject": g["subject"],
-        "subject_kind": g["subject_kind"], "scope": sorted(g["scope"]),
-        "constraints": g["constraints"], "purpose": g["purpose"],
-        "purpose_tags": sorted(g["purpose_tags"]),
-        "not_before": g["not_before"], "not_after": g["not_after"],
-        "depth": g["depth"], "delegations_left": g["delegations_left"],
-        "created": g["created"], "risk_accepted_by": g.get("risk_accepted_by"),
-    }
-    return sha(GRANT_PREFIX, canon(material))
-
-
-def covers(held, wanted):
-    if held == wanted or held == "*":
-        return True
-    if held.endswith(".*"):
-        return wanted == held[:-2] or wanted.startswith(held[:-1])
-    return False
-
-
-def wildcard_breadth(scope, capability):
-    best = None
-    for held in scope:
-        if not covers(held, capability):
-            continue
-        if held == capability:
-            return 0
-        width = (capability.count(".") + 2 if held == "*"
-                 else capability.count(".") - held[:-2].count("."))
-        best = width if best is None else min(best, width)
-    return best
-
-
-def direction(key):
-    for p in ("max_", "min_", "allowed_", "denied_", "may_"):
-        if key.startswith(p):
-            return p
-    return None
-
-
-def num(v):
-    if isinstance(v, bool) or v is None:
-        raise ValueError("not a number")
-    return float(v)
-
-
-def as_set(v):
-    if isinstance(v, (list, tuple, set)):
-        return set(v)
-    return {v}
-
-
-def narrower(parent_c, child_c):
-    for key in sorted(child_c):
-        d = direction(key)
-        cval = child_c[key]
-        if d is None:
-            return False, "constraint '%s' has no narrowing rule" % key
-        if key not in parent_c:
-            return False, "constraint '%s' is not expressed by the parent" % key
-        pval = parent_c[key]
-        try:
-            if d == "max_" and num(cval) > num(pval):
-                return False, "%s raised from %s to %s" % (key, pval, cval)
-            if d == "min_" and num(cval) < num(pval):
-                return False, "%s lowered from %s to %s" % (key, pval, cval)
-            if d == "allowed_" and not as_set(cval) <= as_set(pval):
-                return False, "%s adds values the parent does not hold" % key
-            if d == "denied_" and not as_set(pval) <= as_set(cval):
-                return False, "%s drops values the parent denies" % key
-            if d == "may_" and bool(cval) and not bool(pval):
-                return False, "%s enabled where the parent withholds it" % key
-        except (TypeError, ValueError):
-            return False, "constraint '%s' is not comparable" % key
-    return True, None
-
-
-def effective(chain):
-    eff = {}
-    for g in chain:
-        for k, v in g["constraints"].items():
-            d = direction(k)
-            if k not in eff:
-                eff[k] = v
-                continue
-            cur = eff[k]
-            try:
-                if d == "max_":
-                    eff[k] = min(num(cur), num(v))
-                elif d == "min_":
-                    eff[k] = max(num(cur), num(v))
-                elif d == "allowed_":
-                    eff[k] = sorted(as_set(cur) & as_set(v))
-                elif d == "denied_":
-                    eff[k] = sorted(as_set(cur) | as_set(v))
-                elif d == "may_":
-                    eff[k] = bool(cur) and bool(v)
-            except (TypeError, ValueError):
-                eff[k] = v
-    return eff
-
-
-def params_against(params, eff):
-    hard, unconstrained = [], []
-    for key in sorted(params):
-        val = params[key]
-        checked = False
-        for cname, cval in eff.items():
-            d = direction(cname)
-            if not d or cname[len(d):] != key:
-                continue
-            checked = True
-            try:
-                if d == "max_" and num(val) > num(cval):
-                    hard.append("%s=%s exceeds %s=%s" % (key, val, cname, cval))
-                elif d == "min_" and num(val) < num(cval):
-                    hard.append("%s=%s is below %s=%s" % (key, val, cname, cval))
-                elif d == "allowed_" and val not in as_set(cval):
-                    hard.append("%s=%s is outside %s" % (key, val, cname))
-                elif d == "denied_" and val in as_set(cval):
-                    hard.append("%s=%s is denied by %s" % (key, val, cname))
-                elif d == "may_" and bool(val) and not bool(cval):
-                    hard.append("%s requested where %s withholds it" % (key, cname))
-            except (TypeError, ValueError):
-                hard.append("%s cannot be compared with %s" % (key, cname))
-        if not checked:
-            unconstrained.append(key)
-    return hard, unconstrained
-
-
-# ======================================================================
-# the four checks
-# ======================================================================
-
-class Report(object):
-    def __init__(self):
-        self.rows = []
-        self.failed = False
-
-    def add(self, ok, name, detail=""):
-        self.rows.append((ok, name, detail))
-        if not ok:
-            self.failed = True
-
-    def note(self, name, detail=""):
-        self.rows.append((None, name, detail))
-
-    def render(self):
-        out = []
-        for ok, name, detail in self.rows:
-            mark = "  ok  " if ok else ("FAIL  " if ok is False else "  --  ")
-            out.append(mark + name + (("\n        " + detail) if detail else ""))
-        return "\n".join(out)
-
-
-def check_signature(bundle, rep):
-    sig_hex = bundle.get("signature")
-    pk_hex = (bundle.get("issued_by") or {}).get("public_key")
-    if not sig_hex or not pk_hex:
-        rep.add(False, "Signature present", "the bundle carries no signature or no key")
-        return
-    body = dict(bundle)
-    body.pop("signature", None)
-    body.pop("verify_with", None)
-    try:
-        sig = binascii.unhexlify(sig_hex)
-        pk = binascii.unhexlify(pk_hex)
-    except Exception:
-        rep.add(False, "Signature is readable hex")
-        return
-    ok = ed25519_verify(sig, BUNDLE_PREFIX + canon(body).encode("utf-8"), pk)
-    rep.add(ok, "Ed25519 signature over the canonical bundle",
-            "key " + pk_hex[:16] + "…  Verify this key independently at the issuer's "
-            "published address before trusting who signed." if ok else
-            "the bundle was altered after signing, or it was not signed by this key")
-
-
-def check_integrity(bundle, rep):
-    lineage = bundle.get("lineage") or []
-    bad = []
-    for g in lineage:
-        try:
-            if grant_digest(g) != g.get("digest"):
-                bad.append(g.get("id"))
-        except Exception:
-            bad.append(g.get("id"))
-    rep.add(not bad, "Every grant digest recomputes from its own fields",
-            "" if not bad else "mismatched: " + ", ".join(str(b) for b in bad))
-
-    claimed = (bundle.get("decision") or {}).get("lineage_digest")
-    mine = sha(EVAL_PREFIX, canon([g.get("digest") for g in lineage]))
-    rep.add(mine == claimed, "Lineage digest matches the ordered path",
-            "" if mine == claimed else "computed " + mine[:20] + "… claimed " + str(claimed)[:20] + "…")
-
-    req = bundle.get("request") or {}
-    claimed_p = (bundle.get("decision") or {}).get("params_digest")
-    mine_p = sha(EVAL_PREFIX, canon({"action": req.get("action"),
-                                     "params": req.get("params") or {}}))
-    rep.add(mine_p == claimed_p, "Parameter digest matches the request as stated",
-            "" if mine_p == claimed_p else "the parameters shown are not the "
-            "parameters that were judged")
-
-
-def rederive(bundle, rep):
-    """Run the published rules from scratch and reach an independent verdict."""
-    lineage = bundle.get("lineage") or []
-    decision = bundle.get("decision") or {}
-    req = bundle.get("request") or {}
-    at = decision.get("evaluated_at_epoch")
-
-    hard, soft = [], []
-    broken_at = broken_invariant = None
-
-    def fail(grant, invariant, detail):
-        nonlocal broken_at, broken_invariant
-        hard.append(detail)
-        if broken_at is None:
-            broken_at, broken_invariant = grant, invariant
-
-    if not lineage:
-        fail(None, "authority_continuity", "the bundle carries no authority path")
-    else:
-        root = lineage[0]
-        if root.get("parent") is not None:
-            fail(root["id"], "authority_continuity",
-                 "the path does not begin at a parentless root")
-        if root.get("issuer_kind") != "human":
-            fail(root["id"], "identity_continuity",
-                 "the root grant was not issued by a human principal")
-
-        previous = None
-        for g in lineage:
-            if g.get("revoked_at") is not None:
-                fail(g["id"], "authority_continuity",
-                     "grant %s was revoked" % g["id"])
-            if at is not None:
-                if at < g["not_before"]:
-                    fail(g["id"], "temporal_validity",
-                         "grant %s was not yet valid at the time of the decision" % g["id"])
-                if at >= g["not_after"]:
-                    fail(g["id"], "temporal_validity",
-                         "grant %s had expired at the time of the decision" % g["id"])
-            if previous is not None:
-                if g.get("parent") != previous.get("id"):
-                    fail(g["id"], "authority_continuity",
-                         "grant %s does not point at the grant above it" % g["id"])
-                missing = [c for c in g["scope"]
-                           if not any(covers(p, c) for p in previous["scope"])]
-                if missing:
-                    fail(g["id"], "boundary_integrity",
-                         "%s holds scope its parent does not: %s"
-                         % (g["id"], ", ".join(sorted(missing))))
-                ok, why = narrower(previous["constraints"], g["constraints"])
-                if not ok:
-                    fail(g["id"], "boundary_integrity", "%s: %s" % (g["id"], why))
-                if not set(g["purpose_tags"]) <= set(previous["purpose_tags"]):
-                    fail(g["id"], "intent_continuity",
-                         "%s carries purpose tags its parent does not" % g["id"])
-                if (g["not_before"] < previous["not_before"]
-                        or g["not_after"] > previous["not_after"]):
-                    fail(g["id"], "temporal_validity",
-                         "%s is valid outside its parent's window" % g["id"])
-                if g["depth"] != previous["depth"] + 1:
-                    fail(g["id"], "authority_continuity",
-                         "%s records a depth inconsistent with its parent" % g["id"])
-            previous = g
-
-        if len(lineage) - 1 > MAX_DEPTH:
-            fail(lineage[-1]["id"], "boundary_integrity", "delegation depth exceeds the ceiling")
-
-        if not any(g.get("risk_accepted_by") for g in lineage):
-            fail(lineage[0]["id"], "identity_continuity",
-                 "no grant in this path names who accepted the risk")
-
-        leaf = lineage[-1]
-        action = req.get("action")
-        params = req.get("params") or {}
-
-        if action and not any(covers(c, action) for c in leaf["scope"]):
-            fail(leaf["id"], "boundary_integrity",
-                 "action '%s' is outside the scope of the grant exercised" % action)
-        elif action:
-            breadth = wildcard_breadth(leaf["scope"], action)
-            if breadth and breadth >= 2:
-                soft.append("action '%s' is only covered by a broad wildcard" % action)
-
-        eff = effective(lineage)
-        failures, unconstrained = params_against(params, eff)
-        for f in failures:
-            fail(leaf["id"], "boundary_integrity", f)
-        for u in unconstrained:
-            soft.append("parameter '%s' is not constrained anywhere in the path" % u)
-
-        tag = req.get("purpose_tag")
-        if tag:
-            if tag not in leaf["purpose_tags"]:
-                soft.append("declared purpose '%s' is not carried by the grant" % tag)
-        else:
-            soft.append("the action declared no purpose")
-
-    verdict = "BLOCK" if hard else ("CHALLENGE" if soft else "ALLOW")
-    return verdict, hard, soft, broken_at, broken_invariant
-
-
-def check_agreement(bundle, rep, mine, hard, soft, broken_at, broken_invariant):
-    decision = bundle.get("decision") or {}
-    claimed = decision.get("authority_verdict") or decision.get("verdict")
-
-    rep.add(mine == claimed,
-            "Independently re-derived authority verdict: " + mine,
-            "" if mine == claimed else
-            "the issuer claims " + str(claimed) + " and this script reaches " + mine +
-            " from the same path. One of us is wrong and the rules are published.")
-
-    if mine == "BLOCK":
-        same_grant = (broken_at == decision.get("broken_at"))
-        same_inv = (broken_invariant == decision.get("broken_invariant"))
-        rep.add(same_grant and same_inv,
-                "Refusal reproduces at the same grant and invariant",
-                ("grant %s, invariant %s" % (broken_at, broken_invariant))
-                if same_grant and same_inv else
-                "this script breaks at grant %s / %s, the issuer says %s / %s"
-                % (broken_at, broken_invariant,
-                   decision.get("broken_at"), decision.get("broken_invariant")))
-        rep.note("Why authority could not be derived")
-        for h in hard:
-            rep.note("  " + h)
-    elif soft:
-        rep.note("Why this could not be settled without a person")
-        for x in soft:
-            rep.note("  " + x)
-
-    risk = decision.get("risk_verdict")
-    if risk and mine != "BLOCK":
-        rep.note("Risk verdict reported as " + str(risk) + ", not re-derivable here",
-                 "the composed verdict is the worse of the two; the scoring engine "
-                 "is not part of this bundle and is not checked by this script")
-
-
-def main():
-    if len(sys.argv) < 2:
-        print(__doc__)
-        return 2
-    src = sys.argv[1]
-    raw = sys.stdin.read() if src == "-" else open(src, "r").read()
-    try:
-        bundle = json.loads(raw)
-    except Exception as exc:
-        print("Not readable JSON: " + str(exc))
-        return 2
-
-    rep = Report()
-    print("=" * 66)
-    print("AUTHORITY PROOF  ·  independent verification")
-    print("=" * 66)
-    d = bundle.get("decision") or {}
-    print("evaluation   " + str(d.get("evaluation")))
-    print("action       " + str((bundle.get("request") or {}).get("action")))
-    print("at           " + str(d.get("evaluated_at")))
-    print("hops         " + str(max(0, len(bundle.get("lineage") or []) - 1)))
-    if bundle.get("lineage"):
-        print("authorised   " + str(bundle["lineage"][0].get("issuer")))
-        print("executed     " + str(bundle["lineage"][-1].get("subject")))
-        acc = [g.get("risk_accepted_by") for g in bundle["lineage"] if g.get("risk_accepted_by")]
-        print("risk owner   " + str(acc[-1] if acc else None))
-    print("-" * 66)
-
-    check_signature(bundle, rep)
-    check_integrity(bundle, rep)
-    mine, hard, soft, ba, bi = rederive(bundle, rep)
-    check_agreement(bundle, rep, mine, hard, soft, ba, bi)
-
-    print(rep.render())
-    print("-" * 66)
-    if rep.failed:
-        print("RESULT: NOT VERIFIED. Something above did not hold.")
-        return 1
-    print("RESULT: VERIFIED - " + mine)
-    if mine == "BLOCK":
-        print("This is a proof that the action was NOT authorised, and where it failed.")
-    print("Checked with no network access, no dependencies, and nothing taken on")
-    print("the issuer's word except the meaning of their public key.")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
-
-```
-
-
-## `AILeash-API-Reference-v6.4.2.md`
-
-256 lines, 6799 bytes
-
-```markdown
-# AILeash v6.4.2 — Complete API Reference
-
-## Core Decision Endpoint
-
-### POST /api/govern
-**The engine. Every action scores here.**
-
-Auth: `Bearer YOUR_API_KEY`
-
-**Request:**
-```json
-{
-  "user_id": "string (required)",
-  "action": "string (required) — payment/login/message/transfer/checkout/api_call",
-  "amount": "number (optional, default 0) — monetary value in GBP",
-  "country": "string (required) — ISO 3166-1 alpha-2 code",
-  "device_id": "string (required) — unique device identifier",
-  "anomaly": "number 0..1 (optional) — behavioural anomaly score",
-  "device_risk": "number 0..1 (optional) — device risk score"
-}
-```
-
-**Response (200 OK):**
-```json
-{
-  "decision": "ALLOW|CHALLENGE|BLOCK",
-  "score": 0.0..1.0,
-  "trust": 0.05..1.0,
-  "reasons": ["velocity_spike", "high_amount", "country_shift"],
-  "audit_hash": "sha256_hex_string",
-  "block_index": 12345,
-  "receipt_seq": 42,
-  "timestamp": 1719072000.0,
-  "challenge_url": "https://sebbi.pro/verify-challenge?token=...",
-  "challenge_expires_in": 900
-}
-```
-
-**Error responses:**
-- `401 Unauthorized` — Missing or invalid API key
-- `403 Forbidden` — Account inactive or over quota
-- `429 Too Many Requests` — Rate limited
-- `503 Service Unavailable` — Server overloaded
-
----
-
-## Account Management
-
-### POST /api/keys or /signup
-**Create a new API key. Instant. No card. No humans in the loop.**
-
-No auth required.
-
-**Request:**
-```json
-{
-  "email": "user@example.com (required)",
-  "name": "John Doe (optional)",
-  "phone": "+441234567890 (optional)",
-  "org": "Acme Corp (optional)",
-  "product": "aileash|guardian|sonicboom|sentinel (default: aileash)",
-  "devices": 1..1000000 (default: 1),
-  "ref_code": "REF-XXXX-1234 (optional)"
-}
-```
-
-**Response (200 OK):**
-```json
-{
-  "api_key": "al_live_...",
-  "email": "user@example.com",
-  "product": "aileash",
-  "devices": 1,
-  "monthly_cost": 0.50,
-  "quota": 100,
-  "ref_code": "REF-JOHN-5678",
-  "badge_id": "abc123def456",
-  "message": "100 free decisions. Then 50p per device per month via Stripe."
-}
-```
-
----
-
-## Verification & Public Endpoints
-
-### GET /api/spec
-**Engine specification. Public. No auth.**
-
-**Response (200 OK):**
-```json
-{
-  "engine": "AILeash v6.4.2",
-  "version": "6.4.2",
-  "signals": 9,
-  "decision_latency_ms": 28,
-  "threshold_allow": 0.35,
-  "threshold_challenge": 0.70,
-  "threshold_block": 1.0,
-  "features": ["deterministic scoring", "tamper-evident chain", "real-time alerts", "gapless receipts", "sovereign deployment"]
-}
-```
-
-### GET /api/verify-chain
-**Full audit chain integrity proof. Public. No auth.**
-
-**Response (200 OK):**
-```json
-{
-  "valid": true,
-  "blocks": 45678,
-  "genesis": "GENESIS",
-  "tip": "abc123...",
-  "message": "Chain intact. No tampering detected.",
-  "verifiable_by": "anyone, anywhere"
-}
-```
-
-### GET /api/health
-**Server health and load. Public. No auth.**
-
-**Response (200 OK):**
-```json
-{
-  "status": "ok",
-  "version": "6.4.2",
-  "uptime_seconds": 864000,
-  "rps": 42,
-  "timestamp": 1719072000.0
-}
-```
-
----
-
-## Real-time Dashboards
-
-### GET /api/pulse
-**Live risk posture. Your current state.**
-
-Auth: `Bearer YOUR_API_KEY`
-
-**Response (200 OK):**
-```json
-{
-  "last_hour": {
-    "ALLOW": 486,
-    "CHALLENGE": 23,
-    "BLOCK": 4
-  },
-  "recent": [
-    {
-      "ts": 1719072000,
-      "user_id": "u_7f2",
-      "action": "payment",
-      "decision": "ALLOW",
-      "score": 0.12,
-      "reasons": [],
-      "audit_hash": "abc123..."
-    }
-  ],
-  "chain_tip": "abc123...",
-  "message": "All green. Chain tip sealed."
-}
-```
-
----
-
-## Billing & Webhooks
-
-### POST /stripe-webhook
-**Stripe webhook receiver. Signature verified automatically.**
-
-Supports events:
-- `checkout.session.completed` — User upgraded
-- `invoice.paid` — Monthly subscription paid
-- `customer.subscription.deleted` — User cancelled
-- `invoice.payment_failed` — Payment failed
-
----
-
-## Four Products. One Engine.
-
-### AILeash
-- **What:** Every AI decision your platform makes about a person gets scored, explained, and sealed.
-- **Who:** Platforms using AI for any regulated decision (lending, hiring, content moderation, fraud, access control).
-- **Price:** 50p per device per month + your margin.
-- **Free tier:** 100 decisions/month, no card.
-
-### Guardian
-- **What:** Free message checker for families. Child pastes a message in, gets instant plain-English assessment against grooming patterns.
-- **Who:** Families. Free forever. No card. No catch.
-- **Price:** Free. Always.
-- **Built for:** ICO Children's Code, Online Safety Act, child safety.
-
-### SonicBoom
-- **What:** One line of code. Drops into AWS, Azure, GCP, OpenAI, Anthropic. Adds full compliance audit chain to every call.
-- **Who:** Platforms already running AI in the cloud.
-- **Price:** 50p per device per month + your margin.
-- **Latency:** No impact. Chain sealing is asynchronous.
-
-### Sentinel
-- **What:** Fraud and anomaly alerting. Scores unusual patterns (500 messages in a minute, login from new country, velocity spikes) in real-time.
-- **Who:** Platforms managing fraud, abuse, takeovers.
-- **Price:** 50p per device per month + your margin.
-- **Real-time:** Alerts the moment thresholds trip.
-
----
-
-## The Score Formula (Immutable)
-
-**Raw weighted sum (Σ_raw):**
-```
-Σ_raw =
-  (1 − trust) × 0.30
-  + min(velocity_60s / 20, 1) × 0.15
-  + min(velocity_5m / 50, 1) × 0.10
-  + min(velocity_1h / 200, 1) × 0.10
-  + min(ln(1+amount) / ln(1+10000), 1) × 0.15
-  + device_risk × 0.10
-  + behavioural_anomaly × 0.10
-  + country_shift × 0.10
-  + unsafe_country × 0.10
-```
-
-**Normalization:** the nine weights above sum to 1.20, not 1.0. To keep every signal's *relative* importance exactly as designed while guaranteeing the score behaves as a true 0–1 weighted average (not one that can reach BLOCK-level values from fewer combined signals than intended), divide by the actual weight total before clamping:
-
-```
-WEIGHT_TOTAL = 0.30 + 0.15 + 0.10 + 0.10 + 0.15 + 0.10 + 0.10 + 0.10 + 0.10   # = 1.20
-
-score = clamp( Σ_raw / WEIGHT_TOTAL , 0, 1 )
-
-decision = ALLOW if score < 0.35
-         = CHALLENGE if score < 0.70
-         = BLOCK otherwise
-```
-
-No machine learning. No drift. No retraining. Weights are written in code and cannot change without a new release. `WEIGHT_TOTAL` is a fixed constant (1.20) recomputed only if a signal is added, removed, or reweighted in a future release — never at runtime.
-
----
-
-## Rate Limits
-
-- **Free tier:** 100 decisions/month
-- **Paid:** Unlimited (or by plan)
-- **Public endpoints:** No rate limit
-
----
-
-## Documentation
-
-- **Homepage:** https://sebbi.pro
-- **Whitepaper:** https://sebbi.pro/whitepaper
-- **Developers:** https://sebbi.pro/developers
-- **Scanner (free):** https://sebbi.pro/scan
-- **Guardian:** https://sebbi.pro/guardian-app
-- **Contact:** justrightdecorators@gmail.com
-
-```
-
-
-## `LICENCE`
-
-22 lines, 1074 bytes
-
-```
-MIT License
-
-Copyright (c) 2026 Monop (Blyth, UK)
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-```
-
-
-## `README.md`
-
-277 lines, 15728 bytes
-
-```markdown
-<div align="center">
-
-```
-        ┌─────────────────────────────────────────────────┐
-        │   s e b b i . p r o                              │
-        │                                                  │
-        │   O N E   C H A I N .   E V E R Y   P R O O F .   │
-        └─────────────────────────────────────────────────┘
-```
-
-### The tamper-evident evidence layer for AI decisions, payments, and records.
-
-*Every event sealed into a hash chain at the moment it happens —*
-*the decision, **and the basis it rested on** — unalterable by anyone. Including us.*
-
-<br>
-
-[![live](https://img.shields.io/badge/live-sebbi.pro-c9a84c?style=for-the-badge)](https://sebbi.pro)
-[![verify the chain](https://img.shields.io/badge/verify_the_chain-open_endpoint-7fe3b0?style=for-the-badge)](https://sebbi.pro/api/verify-chain)
-[![seal something free](https://img.shields.io/badge/seal_something-free,_no_account-7cc8ff?style=for-the-badge)](https://sebbi.pro/seal)
-
-**[Try it](https://sebbi.pro/seal)** · **[Verify it](https://sebbi.pro/verify)** · **[Read the code](https://sebbi.pro/brain)** · **[Developer docs](https://sebbi.pro/developers)** · **[Whitepaper](https://sebbi.pro/whitepaper)**
-
-</div>
-
----
-
-> ### *A system that does not trust its own creator*
-> ### *is the only kind whose records qualify as evidence.*
-
----
-
-## Don't read about it. Watch it work.
-
-Here is a **real** four-block chain. Every hash below is reproducible — same inputs, same seals, forever. Copy the recipe at the bottom and compute them yourself.
-
-```
-  #   EVENT                             RESULT      SEAL (SHA-256, truncated)
-  ─────────────────────────────────────────────────────────────────────────
-  1   system_regmap                     ALLOW       411ffd9a31a3d9f4…
-  2   seal_post: quarterly_report.pdf   NOTARISED   c7309616a9e92bc7…
-  3   govern: payment 9000 GBP          BLOCK       293181a2bc2dab88…
-  4   brain: approve supplier 88        ALLOW       6abba40eb964959e…
-  ─────────────────────────────────────────────────────────────────────────
-  genesis  9fd06d6fdc19761d…                         tip  6abba40eb964959e…
-```
-
-Now watch someone try to cover up that blocked £9,000 payment by flipping block 3 from **BLOCK** to **ALLOW**:
-
-```
-  block 3 altered  →  tip becomes  5e15bc5710426088…   ❌  ≠ 6abba40eb964959e…
-```
-
-**The tip changed. The forgery is exposed instantly, by arithmetic, to anyone — no account, no trust required.** That is the entire product in six lines. Everything below is detail.
-
-<details>
-<summary><b>▸ Reproduce every hash yourself (10 lines of Python)</b></summary>
-
-```python
-import hashlib, json
-seal = lambda prev, ts, ev, res, basis: hashlib.sha256(
-    json.dumps({"prev":prev,"ts":ts,"event":ev,"result":res,"basis":basis},
-               sort_keys=True).encode()).hexdigest()
-
-prev = hashlib.sha256(b"AILEASH_BRAIN_GENESIS|sebbi.pro|v5").hexdigest()
-chain = [("system_regmap","ALLOW","regmap-v7"),
-         ("seal_post: quarterly_report.pdf","NOTARISED","NO_BASIS"),
-         ("govern: payment 9000 GBP","BLOCK","invoice_4471|regmap-v7"),
-         ("brain: approve supplier 88","ALLOW","invoice_4471|regmap-v7")]
-ts = 1752940000
-for ev,res,basis in chain:
-    prev = seal(prev, ts, ev, res, basis); ts += 3600
-    print(prev[:16], "…", ev)
-# final line prints the tip: 6abba40eb964959e …
-```
-Change one character of one event and every seal after it changes. That's the whole idea.
-</details>
-
----
-
-## Why this exists
-
-Every system keeps logs. Logs live in databases. Databases can be edited — by an attacker, an insider, or the operator itself. So an ordinary log only ever says *"this is what we currently claim happened."* It can never say *"and nobody changed it since."*
-
-Nobody notices the difference — until a regulator, a court, an insurer, or a customer asks for **proof**. Then *"our system recorded it"* and *"here is proof it wasn't changed"* become two very different sentences. Only the second carries weight.
-
-**sebbi.pro produces the second sentence — automatically, as a by-product of your system doing its normal work.**
-
----
-
-## The chain, in one formula
-
-```
-seal(n) = SHA-256( seal(n−1) · timestamp · event · result · basis )
-```
-
-| Property | What it means |
-|---|---|
-| **Tamper-evident** | Each seal contains its predecessor. Alter history → every later seal fails, publicly. |
-| **Gapless receipts** | Every decision gets a sequence number in the same transaction. Edited records break the chain; **missing** records break the sequence. |
-| **Truncation-evident** | The tip is anchored per-write. Chop blocks off the end → the anchor breaks. |
-| **Basis-sealed** | Not just *what* was decided — *what it rested on*: sources, versions, ruleset. Same block. |
-| **Jurisdiction-tagged** | Every decision sealed with the regulatory frameworks that applied to it at that moment. |
-| **Fast** | Score + decide + seal + respond inline, **~28 ms** median. |
-| **Crash-safe** | WAL journaling, full-sync commits, single-lock seal path, no race window, daily backups. |
-
-> **The one honest boundary, stated up front:** basis-sealing proves **what** a decision relied on — not that it was **correct**. Cryptography verifies integrity, never truth. Any product claiming to prove correctness is misdescribing what maths can do. We won't.
-
----
-
-## The products — one chain underneath all of them
-
-| | Product | What it does | Access |
-|---|---|---|---|
-| 🧠 | **Brain** | Instruction gate for AI. Blocks prompt injection, exfiltration, compliance-bypass, child-safety and destruction patterns — with unicode/obfuscation defences — and seals every decision + basis. Pure Python, runs on your machine. | **Free download** |
-| ⚡ | **SonicBoom** | Decision engine. Any event scored in ~28ms: ALLOW / CHALLENGE / BLOCK, plain-English reasons, sealed before it replies. Per-user trust learned over time — lost 8× faster than earned, so burst attacks destroy their own standing. Hosted human-oversight challenge flow, itself sealed. | API key |
-| 🔐 | **Delegation layer** | Signed authority tokens (who may approve, to what limit, until when — the grant itself sealed), provider-agnostic KYC result sealing (outcome provable, zero personal data held), and per-decision jurisdiction tagging. Article 14 human oversight as engineering. | API key |
-| 🛡️ | **Sentinel** | Fraud pattern + velocity detection: credential stuffing, card testing, country-jump takeovers. Flags sealed as evidence. | API key |
-| 👁️ | **Guardian** | Child-safety flags: grooming patterns (secrecy, isolation, channel-moving). Content never stored — only fingerprints. Every flag sealed for parents, platforms, authorities. | Platform |
-| 📝 | **Post Notary** | Prove exact text existed on a date, unchanged. | **Free, no account** |
-| 🆔 | **Identity Notary** | Prove a profile is the genuine original — kills impersonation. | **Free, no account** |
-| 💷 | **Payment Notary** | Stop invoice/APP fraud. Seal real bank details once; payers verify a code before funds move. MISMATCH → payment stops. The check itself is sealed. | **Free, no account** |
-
-**Privacy by design:** the notaries fingerprint content *locally*. Your content never leaves your device — only the 64-character hash is sealed. The KYC sealer keeps only the SHA-256 of the provider reference — never the document.
-
----
-
-## The open standard — `ai.txt`
-
-Like `robots.txt` for crawlers and `security.txt` for researchers — **`ai.txt`** is a public, machine-readable declaration of how your AI is governed: decision model, audit method, regulations designed toward, human override. Its companion **`comply.txt`** declares the rulebook every instruction is subject to.
-
-Declarations are claims. **Sealing them into the chain makes them provable** — and their history tamper-evident.
-
-```
-  declaration  →  rulebook  →  enforcement
-     ai.txt        comply.txt      brain.py
-     "we claim"    "the rules"     "the code that proves it"
-```
-
-Publish yours at `/.well-known/ai.txt`. Read [ours](https://sebbi.pro/.well-known/ai.txt).
-
----
-
-## The stack — how it all fits
-
-```
-  DECLARATION    ai.txt · comply.txt     what we claim, publicly
-       │
-  GATE           Brain                   instructions checked before the AI acts
-       │
-  DELEGATION     authority · identity ·  who may act, who they legally are,
-                 jurisdiction            which rules governed the moment
-       │
-  DECISION       SonicBoom               every event: allow / challenge / block
-       │
-  DETECTION      Sentinel · Guardian     attack patterns · child-safety patterns
-       │
-  PUBLIC ACCESS  the Notaries            the same chain, free, for anyone
-       │
-       ▼
-  ╔══════════════════════════════════════════════════════════════════╗
-  ║  EVIDENCE     the hash chain                                      ║
-  ║               everything above seals into here —                 ║
-  ║               action + basis + receipt · gapless · anchored ·    ║
-  ║               publicly verifiable · unalterable by anyone        ║
-  ╚══════════════════════════════════════════════════════════════════╝
-```
-
-**Evidence accrues as a by-product of the system working.** Nobody remembers to log anything. Nobody compiles an audit file before an inspection. The proof exists because the system ran — equally trustworthy whether the operator is honest or not. Which is the only kind of trustworthy that counts.
-
----
-
-## Integrate in minutes
-
-```python
-# ── Notary: seal anything, free, no key. Content stays on your machine. ──
-import hashlib, requests
-fp = hashlib.sha256(content.encode()).hexdigest()
-requests.post("https://sebbi.pro/api/post/seal", json={"fingerprint": fp})
-#   → { sealed, seal, block_index, code }   ← keep the code; anyone can verify it
-
-# ── Decision engine: score + seal an event (API key) ──
-requests.post("https://sebbi.pro/api/govern",
-  headers={"Authorization":"Bearer YOUR_KEY"},
-  json={"user_id":"u1","action":"payment","amount":9000,
-        "country":"UK","device_id":"d1","anomaly":0,"device_risk":0})
-#   → ALLOW / CHALLENGE / BLOCK · reasons · jurisdiction tag · sealed hash · receipt_seq
-
-# ── Delegated authority: grant sealed, enforcement deterministic ──
-tok = requests.post("https://sebbi.pro/api/authority/issue",
-  headers={"Authorization":"Bearer YOUR_KEY"},
-  json={"user_id":"u1","role":"payments_approver",
-        "max_amount":5000,"ttl_hours":24}).json()["authority_token"]
-#   include as "authority_token" in govern events — over-limit or expired
-#   authority escalates the verdict with the reason sealed
-
-# ── KYC result: outcome provable, zero personal data held ──
-requests.post("https://sebbi.pro/api/identity/kyc-seal",
-  headers={"Authorization":"Bearer YOUR_KEY"},
-  json={"user_id":"u1","provider":"onfido","verified":True,
-        "reference":"chk_9f2"})
-#   → only the SHA-256 of the reference is stored — never the document
-
-# ── Brain: gate an instruction and seal its basis (free, local) ──
-from brain import BrainGovernor
-BrainGovernor().evaluate("approve payment to supplier 88", basis={
-  "sources":["invoice_4471.pdf"], "source_versions":["sha256:ab12…"],
-  "ruleset":"AI-TXT/1.0 + EU-AI-Act-2024/1689", "ruleset_version":"regmap-v7"})
-```
-
-Full reference → **[sebbi.pro/developers](https://sebbi.pro/developers)**
-
----
-
-## What this evidences — stated precisely
-
-A versioned, hash-sealed **regulation map** links each capability to the obligations it helps evidence: EU AI Act record-keeping, transparency & human-oversight (Articles 9, 12, 13, 14 — delegated-authority tokens directly supporting Article 14's attributable human oversight), UK Online Safety Act duty-of-care documentation, ICO Children's Code. Jurisdiction tagging extends this to the per-decision level: every sealed block records which frameworks applied at the moment of decision.
-
-These tools help you **evidence** your obligations — tamper-evident, explainable, independently verifiable records of what your systems decided and why. **They do not, on their own, make you compliant. No software does. Anyone who says otherwise is selling you something.**
-
----
-
-## Honest limits — because the whole product is honesty
-
-- **Sealing proves integrity, not truth** — exact content, exact time, unchanged. Not that it was true or agreed to.
-- **Basis-sealing proves what was relied on, not that it was right** — cryptography can't verify the real world.
-- **Authority tokens prove the grant, not the wisdom** — who was empowered, to what limit, until when. Not that granting it was a good idea.
-- **Jurisdiction tagging records applicable frameworks; it does not decide law** — courts do that. It is a versioned, sealed lookup — nothing grander, deliberately.
-- **Brain's filter is a first line, not a wall** — known patterns caught; novel phrasing can pass. The guarantee is the sealed record.
-- **Fingerprints match exact content** — a re-encoded copy or paraphrase won't match.
-- **We evidence compliance; we don't confer it.**
-
-*A vendor who states their limits is giving you the strongest available evidence of how they'll behave when it matters.*
-
----
-
-## Deployment & pricing
-
-- **Cloud** — a few lines against the hosted API. Notaries and Brain free forever.
-- **Sovereign** — the whole engine inside your own network. Offline HMAC-signed 365-day licences, no phone-home, air-gap ready.
-- **50p per active device / month.** Partners set their own pricing above the platform fee.
-
-## Investors
-
-The whitepaper carries a dedicated investor section — market timing (EU AI Act, August 2026), the metered per-device model, the moat, and the stage stated honestly: **[sebbi.pro/whitepaper](https://sebbi.pro/whitepaper)** · justin@monopcontent.com
-
----
-
-<div align="center">
-
-## Check us. Don't trust us.
-
-*That's not a slogan. It's the design requirement — and the only standard by which an evidence layer should ever be judged.*
-
-**[Verify the chain now →](https://sebbi.pro/api/verify-chain)**
-
-<br>
-
-```
-  Built by Justin Dobson · Monop Content · Blyth, Northumberland, UK
-  Solo-built, from scratch, on a phone —
-  because the evidence layer wasn't going to build itself.
-```
-
-[LinkedIn](https://www.linkedin.com/in/justin-dobson-037721217) · [sebbi.pro](https://sebbi.pro)
-
-</div>
-
-<!--
-Keywords: tamper-evident audit trail · AI governance · AI compliance evidence ·
-EU AI Act record keeping · hash chain audit log · APP fraud prevention ·
-invoice verification · prompt injection defence · AI decision audit ·
-delegated authority tokens · KYC evidence sealing · jurisdiction tagging ·
-ai.txt standard · comply.txt · cryptographic proof of action · immutable audit log ·
-agentic AI governance · sovereign AI deployment · SonicBoom · Brain · Sentinel · Guardian
--->
-
-```
-
-
-## `admin.html`
-
-212 lines, 12327 bytes
-
-```html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>sebbi.pro - Admin</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0a0f1e;color:#fff;line-height:1.5}
-.wrap{max-width:1000px;margin:0 auto;padding:20px}
-h1{font-size:22px;font-weight:800;margin-bottom:4px}h1 span{color:#c9a84c}
-.sub{color:#8a90a6;font-size:13px;margin-bottom:20px}
-/* login */
-#login{max-width:360px;margin:80px auto;text-align:center}
-#login input{width:100%;padding:14px;border-radius:10px;border:1px solid #2a3350;background:#0b1226;color:#fff;font-size:16px;margin:12px 0}
-button{background:#c9a84c;color:#0a0f1e;border:none;border-radius:10px;padding:13px 22px;font-weight:800;cursor:pointer;font-size:15px;width:100%}
-button.small{width:auto;padding:8px 16px;font-size:13px}
-.err{color:#ff7b6e;font-size:13px;margin-top:8px;min-height:18px}
-/* dashboard */
-#dash{display:none}
-.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:20px}
-.stat{background:#111a30;border:1px solid #232d4a;border-radius:12px;padding:16px}
-.stat .big{font-size:26px;font-weight:800;color:#c9a84c}
-.stat .lab{font-size:11px;color:#8a90a6;text-transform:uppercase;letter-spacing:1px;margin-top:4px}
-.stat.good .big{color:#7fe3b0}.stat.bad .big{color:#ff7b6e}
-.tabs{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap}
-.tab{background:#111a30;border:1px solid #232d4a;color:#8a90a6;padding:9px 16px;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600}
-.tab.on{background:#c9a84c;color:#0a0f1e;border-color:#c9a84c}
-.panel{display:none}.panel.on{display:block}
-.card{background:#111a30;border:1px solid #232d4a;border-radius:12px;padding:14px;margin-bottom:10px;font-size:14px}
-.card .top{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:6px}
-.card .nm{font-weight:700}
-.card .meta{color:#8a90a6;font-size:12px}
-.badge{font-size:10px;padding:2px 8px;border-radius:10px;font-weight:700;text-transform:uppercase}
-.badge.paid{background:#0d2018;color:#7fe3b0;border:1px solid #1fae79}
-.badge.free{background:#1a1206;color:#c9a84c;border:1px solid #c9a84c}
-.stripe-link{color:#7fe3b0;font-size:12px;text-decoration:none;font-family:monospace}
-.bar{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}
-.mono{font-family:monospace;font-size:12px;color:#8a90a6;word-break:break-all}
-.empty{color:#5a6178;text-align:center;padding:30px;font-size:14px}
-a.ext{display:inline-block;background:#0d2018;border:1px solid #1fae79;color:#7fe3b0;padding:10px 16px;border-radius:8px;text-decoration:none;font-size:13px;font-weight:600;margin-bottom:16px}
-</style>
-</head>
-<body>
-<div class="wrap">
-
-  <div id="login">
-    <h1>sebbi<span>.pro</span> admin</h1>
-    <div class="sub">Private control panel</div>
-    <input id="pw" type="password" placeholder="Admin password" onkeydown="if(event.key==='Enter')doLogin()">
-    <button onclick="doLogin()">Log in</button>
-    <div class="err" id="loginerr"></div>
-  </div>
-
-  <div id="dash">
-    <div class="bar">
-      <div><h1>sebbi<span>.pro</span> admin</h1><div class="sub">Everything Stripe doesn't show you</div></div>
-      <button class="small" onclick="logout()">Log out</button>
-    </div>
-
-    <a class="ext" href="https://dashboard.stripe.com" target="_blank" rel="noopener">Open Stripe dashboard for payments, revenue &amp; billing addresses &rarr;</a>
-
-    <div class="stats" id="statgrid"></div>
-
-    <div class="tabs">
-      <div class="tab on" onclick="show('customers',this)">Customers &amp; leads</div>
-      <div class="tab" onclick="show('contacts',this)">Contact messages</div>
-      <div class="tab" onclick="show('referrals',this)">Referrals</div>
-      <div class="tab" onclick="show('audit',this)">Audit records</div>
-    </div>
-
-    <div class="panel on" id="p-customers"><div class="empty">Loading...</div></div>
-    <div class="panel" id="p-contacts"><div class="empty">Loading...</div></div>
-    <div class="panel" id="p-referrals"><div class="empty">Loading...</div></div>
-    <div class="panel" id="p-audit">
-      <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;align-items:center">
-        <input id="auditkey" placeholder="Filter by API key (optional)" style="flex:1;min-width:180px;padding:10px;border-radius:8px;border:1px solid #2a3350;background:#0b1226;color:#fff;font-size:13px">
-        <button class="small" onclick="loadAudit()">Search</button>
-        <button class="small" onclick="verifyChain()" style="background:#1fae79">Verify chain</button>
-        <button class="small" onclick="exportAudit()" style="background:#0d2018;color:#7fe3b0;border:1px solid #1fae79">Export</button>
-      </div>
-      <div id="auditchain" style="font-family:monospace;font-size:12px;color:#7fe3b0;margin-bottom:12px"></div>
-      <div id="auditlist"><div class="empty">Loading...</div></div>
-    </div>
-  </div>
-
-</div>
-<script>
-var TOKEN="";
-function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]})}
-function when(ts){if(!ts)return"";try{return new Date(ts*1000).toLocaleString()}catch(e){return""}}
-
-async function doLogin(){
-  var pw=document.getElementById("pw").value;
-  document.getElementById("loginerr").textContent="";
-  try{
-    var r=await fetch("/admin/auth",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password:pw})});
-    var d=await r.json();
-    if(d.token){TOKEN=d.token;document.getElementById("login").style.display="none";document.getElementById("dash").style.display="block";loadAll();}
-    else if(d.error==="admin_disabled"){document.getElementById("loginerr").textContent="Admin password not set. Add ADMIN_PASSWORD in Railway variables.";}
-    else if(d.error==="too_many_attempts"){document.getElementById("loginerr").textContent="Too many attempts. Wait a minute.";}
-    else{document.getElementById("loginerr").textContent="Wrong password.";}
-  }catch(e){document.getElementById("loginerr").textContent="Connection error.";}
-}
-function logout(){TOKEN="";document.getElementById("dash").style.display="none";document.getElementById("login").style.display="block";document.getElementById("pw").value="";}
-
-async function api(path){
-  var r=await fetch(path,{method:"POST",headers:{"Authorization":"Bearer "+TOKEN,"Content-Type":"application/json"},body:"{}"});
-  return await r.json();
-}
-
-async function loadAll(){
-  // stats
-  try{
-    var s=await api("/admin/stats");
-    document.getElementById("statgrid").innerHTML=
-      stat(s.total_keys,"Total signups")+
-      stat(s.paid_keys,"Paying",  "good")+
-      stat((s.total_keys||0)-(s.paid_keys||0),"Free / leads")+
-      stat(s.audit_blocks,"Audit blocks")+
-      stat(s.chain_valid?"OK":"BROKEN","Chain",s.chain_valid?"good":"bad");
-  }catch(e){}
-  loadCustomers();loadContacts();loadReferrals();loadAudit();
-}
-function stat(v,l,cls){return '<div class="stat '+(cls||"")+'"><div class="big">'+esc(v)+'</div><div class="lab">'+esc(l)+'</div></div>';}
-
-async function loadCustomers(){
-  try{
-    var d=await api("/admin/keys");var ks=d.keys||[];
-    if(!ks.length){document.getElementById("p-customers").innerHTML='<div class="empty">No signups yet.</div>';return;}
-    var h="";
-    ks.forEach(function(k){
-      var paid=k.is_paid==1;
-      h+='<div class="card"><div class="top"><span class="nm">'+esc(k.name||"(no name)")+' <span class="meta">'+esc(k.org||"")+'</span></span>'
-        +'<span class="badge '+(paid?"paid":"free")+'">'+(paid?"paying":"free")+'</span></div>'
-        +'<div class="meta">'+esc(k.email||"")+' &middot; '+esc(k.product||"")+' &middot; '+esc(k.devices||0)+' devices &middot; used '+esc(k.actions_used||0)+'/'+esc(k.free_quota||0)+'</div>'
-        +'<div class="meta">Joined '+when(k.created)+'</div>'
-        +(k.key?'<div class="mono">'+esc(k.key)+'</div>':'')
-        +'</div>';
-    });
-    document.getElementById("p-customers").innerHTML=h;
-  }catch(e){document.getElementById("p-customers").innerHTML='<div class="empty">Could not load.</div>';}
-}
-
-async function loadContacts(){
-  try{
-    var d=await api("/admin/contacts");var cs=d.contacts||[];
-    if(!cs.length){document.getElementById("p-contacts").innerHTML='<div class="empty">No messages yet.</div>';return;}
-    var h="";
-    cs.forEach(function(c){
-      h+='<div class="card"><div class="top"><span class="nm">'+esc(c.name||"(no name)")+'</span><span class="meta">'+when(c.ts)+'</span></div>'
-        +'<div class="meta">'+esc(c.email||"")+(c.phone?' &middot; '+esc(c.phone):'')+(c.org?' &middot; '+esc(c.org):'')+'</div>'
-        +'<div style="margin-top:6px">'+esc(c.message||"")+'</div></div>';
-    });
-    document.getElementById("p-contacts").innerHTML=h;
-  }catch(e){document.getElementById("p-contacts").innerHTML='<div class="empty">Could not load.</div>';}
-}
-
-async function loadReferrals(){
-  try{
-    var d=await api("/admin/referrals");var rs=d.referrals||[];
-    if(!rs.length){document.getElementById("p-referrals").innerHTML='<div class="empty">No referrals yet.</div>';return;}
-    var h="";
-    rs.forEach(function(r){
-      h+='<div class="card"><div class="top"><span class="nm">'+esc(r.referrer_name||"(no name)")+' <span class="meta">'+esc(r.code||"")+'</span></span>'
-        +'<span class="badge paid">&pound;'+((r.earnings_pence||0)/100).toFixed(2)+'</span></div>'
-        +'<div class="meta">'+esc(r.referrer_email||"")+' &middot; '+esc(r.devices_referred||0)+' devices referred</div></div>';
-    });
-    document.getElementById("p-referrals").innerHTML=h;
-  }catch(e){document.getElementById("p-referrals").innerHTML='<div class="empty">Could not load.</div>';}
-}
-
-var LAST_AUDIT=[];
-async function loadAudit(){
-  try{
-    var key=document.getElementById("auditkey").value.trim();
-    var r=await fetch("/admin/audit",{method:"POST",headers:{"Authorization":"Bearer "+TOKEN,"Content-Type":"application/json"},body:JSON.stringify({limit:500,api_key:key})});
-    var d=await r.json();LAST_AUDIT=d.records||[];
-    document.getElementById("auditchain").innerHTML=(d.chain_valid?"CHAIN INTACT":"CHAIN BROKEN")+" &middot; "+esc(d.chain_blocks)+" blocks &middot; tip "+esc(String(d.chain_tip||"").slice(0,24))+"...";
-    if(!LAST_AUDIT.length){document.getElementById("auditlist").innerHTML='<div class="empty">No sealed records'+(key?" for that key":"")+' yet.</div>';return;}
-    var h="";
-    LAST_AUDIT.forEach(function(a){
-      var dec=esc(a.decision||"");
-      var col=dec==="BLOCK"?"#ff7b6e":dec==="CHALLENGE"?"#c9a84c":"#7fe3b0";
-      h+='<div class="card"><div class="top"><span class="nm">#'+esc(a.seq)+' <span style="color:'+col+'">'+dec+'</span></span><span class="meta">'+when(a.ts)+'</span></div>'
-        +'<div class="meta">user: '+esc(a.user_id||"-")+(a.score!==""?' &middot; score '+esc(a.score):'')+(a.reasons&&a.reasons.length?' &middot; '+esc(a.reasons.join(", ")):'')+'</div>'
-        +'<div class="mono" style="margin-top:6px">seal: '+esc(String(a.audit_hash||"").slice(0,40))+'...</div>'
-        +'<div class="mono">prev: '+esc(String(a.prev_hash||"").slice(0,40))+'...</div></div>';
-    });
-    document.getElementById("auditlist").innerHTML=h;
-  }catch(e){document.getElementById("auditlist").innerHTML='<div class="empty">Could not load audit records.</div>';}
-}
-async function verifyChain(){
-  try{
-    var r=await fetch("/api/verify-chain");var d=await r.json();
-    document.getElementById("auditchain").innerHTML=(d.valid?"VERIFIED - CHAIN INTACT":"WARNING - CHAIN BROKEN")+" &middot; "+esc(d.blocks)+" blocks &middot; "+esc(d.message||"");
-  }catch(e){}
-}
-function exportAudit(){
-  var blob=new Blob([JSON.stringify(LAST_AUDIT,null,2)],{type:"application/json"});
-  var url=URL.createObjectURL(blob);var a=document.createElement("a");
-  a.href=url;a.download="sebbi-audit-export-"+Date.now()+".json";a.click();URL.revokeObjectURL(url);
-}
-function show(name,el){
-  document.querySelectorAll(".tab").forEach(function(t){t.className="tab";});el.className="tab on";
-  document.querySelectorAll(".panel").forEach(function(p){p.className="panel";});
-  document.getElementById("p-"+name).className="panel on";
-}
-</script>
-</body>
-</html>
-
-```
-
-
-## `ai-standard.html`
-
-97 lines, 4847 bytes
-
-```html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="theme-color" content="#0a0f1e">
-<title>ai.txt - Free Download</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0a0f1e;color:#e8e8f0;min-height:100vh;display:flex;flex-direction:column}
-nav{border-bottom:1px solid #1e2a45;padding:16px 20px}
-nav a{color:#c9a84c;text-decoration:none;font-family:monospace;font-size:14px}
-.wrap{flex:1;display:flex;align-items:center;justify-content:center;padding:30px 20px}
-.card{max-width:560px;width:100%;background:#0d1428;border:1px solid #1e2a45;border-radius:16px;padding:36px 28px;text-align:center}
-h1{font-size:32px;font-weight:800;margin-bottom:14px;line-height:1.15}
-h1 span{color:#c9a84c}
-p{color:#8a90a6;font-size:15px;line-height:1.7;margin-bottom:14px}
-p b{color:#e8e8f0}
-.btn{display:inline-flex;align-items:center;justify-content:center;gap:10px;width:100%;background:#c9a84c;color:#0a0f1e;padding:18px;border-radius:10px;font-weight:800;font-size:17px;border:none;cursor:pointer;font-family:inherit;margin:20px 0 10px}
-.sub{font-family:monospace;font-size:12px;color:#7fe3b0;margin-bottom:24px}
-.steps{text-align:left;background:#0b1226;border:1px solid #1e2a45;border-radius:10px;padding:18px 20px;margin-top:8px}
-.steps li{color:#8a90a6;font-size:14px;margin:10px 0 10px 6px;line-height:1.6}
-.steps li b{color:#c9a84c}
-.back{margin-top:22px}
-.back a{color:#c9a84c;text-decoration:none;font-size:14px;font-weight:600}
-footer{border-top:1px solid #1e2a45;padding:20px;text-align:center;color:#5a6178;font-size:12px}
-footer a{color:#c9a84c;text-decoration:none}
-</style>
-</head>
-<body>
-<nav><a href="/">&larr; AILeash</a></nav>
-<div class="wrap">
-  <div class="card">
-    <h1>Download <span>ai.txt</span> &mdash; free</h1>
-    <div class="sub">NO KEY &middot; NO ACCOUNT &middot; NO COST</div>
-    <p>ai.txt is the free, open standard for declaring how your AI is governed. Download the file, and it shows your system exactly what it needs to become compliant.</p>
-    <button class="btn" onclick="downloadIt()">&#8681; Download ai.txt free</button>
-    <ul class="steps">
-      <li><b>1.</b> Tap download &mdash; the file saves as ai.txt</li>
-      <li><b>2.</b> Fill in your details, put it on your domain at yourdomain.com/ai.txt</li>
-      <li><b>3.</b> Want it verified and provable? <b><a href="/" style="color:#c9a84c">Come back to AILeash</a></b> to seal it into a tamper-evident chain.</li>
-    </ul>
-    <div class="back"><a href="/ai.txt">See the live ai.txt &rarr;</a></div>
-  </div>
-</div>
-<footer>ai.txt is a free, open standard by <a href="/">Monop Content</a> &middot; Blyth, UK &middot; <a href="/ai.txt">reference</a></footer>
-<script>
-var AITXT = [
-"# ============================================================================",
-"# ai.txt - AI Governance Declaration  (AI-TXT/1.0)",
-"# A free, open standard. Copy this to the root of your domain as /ai.txt",
-"# Replace the values below with your own. Delete any line that does not apply.",
-"# No key, no account, no permission, no cost. Just publish it.",
-"# See it live: https://sebbi.pro/ai.txt",
-"# ============================================================================",
-"",
-"Standard: AI-TXT/1.0",
-"Operator: YOUR COMPANY NAME",
-"Operator-Location: YOUR CITY, COUNTRY",
-"Contact: you@yourdomain.com",
-"Last-Updated: 2026-01-01",
-"",
-"# --- How your AI makes decisions ---",
-"Decision-Model: describe it (deterministic rules / ML model / human-in-loop)",
-"Decision-Outcomes: ALLOW, REVIEW, BLOCK",
-"Human-Override: yes / no",
-"Plain-Language-Reasons: yes / no",
-"",
-"# --- Your audit record (how you prove what happened) ---",
-"Audit-Chain: describe it (SHA-256 hash chain / signed logs / none)",
-"Chain-Property: tamper-evident / tamper-resistant / none",
-"Verify-Endpoint: https://yourdomain.com/your-verify-url",
-"",
-"# --- Regulations you are designing towards ---",
-"Regulation: EU AI Act 2024/1689",
-"Regulation: UK Online Safety Act 2023",
-"",
-"# --- Optional: public status surfaces ---",
-"Live-Status: https://yourdomain.com/health",
-"Whitepaper: https://yourdomain.com/whitepaper",
-"",
-"# ============================================================================",
-"# ai.txt is a free, open standard. Publish yours, share it, build on it.",
-"# ============================================================================"
-].join("\n");
-function downloadIt(){
-  var blob = new Blob([AITXT], {type:"text/plain"});
-  var url = URL.createObjectURL(blob);
-  var a = document.createElement("a");
-  a.href = url; a.download = "ai.txt";
-  document.body.appendChild(a); a.click();
-  document.body.removeChild(a); URL.revokeObjectURL(url);
-}
-</script>
-</body>
-</html>
-
-```
-
-
-## `ai-txt-kit.html`
-
-86 lines, 6554 bytes
-
-```html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="theme-color" content="#0a0f1e">
-<title>ai.txt Starter Kit &mdash; publish AI governance free in 5 minutes</title>
-<meta name="description" content="Publish an ai.txt on your own domain, free. Copy the template, add the badge, make it provable. No key, no account.">
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0a0f1e;color:#e8e8f0;line-height:1.6}
-.mono{font-family:"JetBrains Mono",ui-monospace,Menlo,monospace}
-nav{position:sticky;top:0;z-index:10;background:rgba(10,15,30,.94);backdrop-filter:blur(10px);border-bottom:1px solid #1e2a45;padding:0 20px;height:54px;display:flex;align-items:center;justify-content:space-between}
-nav a.logo{display:flex;align-items:center;gap:8px;color:#c9a84c;text-decoration:none;font-family:"JetBrains Mono",monospace;font-size:13px}
-nav .links a{color:#8a90a6;text-decoration:none;font-size:13px;margin-left:16px}
-.wrap{max-width:760px;margin:0 auto;padding:44px 20px 90px}
-.eyebrow{font-family:"JetBrains Mono",monospace;font-size:11px;letter-spacing:3px;text-transform:uppercase;color:#c9a84c;margin-bottom:12px}
-h1{font-size:34px;font-weight:800;letter-spacing:-.02em;line-height:1.1;margin-bottom:14px}
-h1 span{color:#c9a84c}
-.lede{color:#8a90a6;font-size:16px;margin-bottom:8px}
-.free{display:inline-block;background:rgba(0,229,160,.1);border:1px solid #00b87d;color:#7fe3b0;font-family:"JetBrains Mono",monospace;font-size:12px;padding:5px 12px;border-radius:5px;margin:14px 0 30px}
-h2{font-size:20px;font-weight:700;margin:40px 0 8px;padding-top:26px;border-top:1px solid #1e2a45}
-.step-n{font-family:"JetBrains Mono",monospace;color:#c9a84c;font-size:13px}
-p{color:#8a90a6;margin-bottom:14px}
-p b{color:#e8e8f0}
-.box{background:#0b1226;border:1px solid #1e2a45;border-radius:10px;padding:18px;margin:16px 0;font-family:"JetBrains Mono",monospace;font-size:12.5px;color:#7fe3b0;white-space:pre-wrap;word-break:break-word;line-height:1.8;overflow-x:auto}
-.btn{display:inline-flex;align-items:center;gap:8px;background:#c9a84c;color:#0a0f1e;padding:12px 22px;border-radius:8px;font-weight:800;font-size:14px;text-decoration:none;border:none;cursor:pointer;font-family:inherit}
-.btn.ghost{background:transparent;border:1px solid #2a3350;color:#e8e8f0}
-.btnrow{display:flex;gap:10px;flex-wrap:wrap;margin:16px 0}
-.badge-demo{display:inline-flex;align-items:center;gap:8px;background:#111a30;border:1px solid #c9a84c;border-radius:8px;padding:8px 14px;font-family:"JetBrains Mono",monospace;font-size:12px;color:#c9a84c;text-decoration:none}
-.badge-demo svg{flex-shrink:0}
-.onramp{background:linear-gradient(135deg,rgba(0,229,160,.06),rgba(201,168,76,.05));border:1px solid #00b87d;border-radius:12px;padding:24px;margin-top:30px}
-.onramp h3{color:#7fe3b0;font-size:16px;margin-bottom:8px}
-.onramp p{color:#a9b0c4}
-.copied{color:#7fe3b0;font-size:12px;margin-left:10px;opacity:0;transition:opacity .2s}
-.copied.show{opacity:1}
-footer{border-top:1px solid #1e2a45;padding:26px 20px;text-align:center;color:#5a6178;font-size:12px}
-footer a{color:#c9a84c;text-decoration:none}
-</style>
-</head>
-<body>
-<nav>
-  <a class="logo" href="/"><svg width="18" height="18" viewBox="0 0 32 32"><circle cx="16" cy="16" r="13.5" fill="none" stroke="#c9a84c" stroke-width="2.6" stroke-dasharray="66 20" stroke-linecap="round" transform="rotate(-50 16 16)"/><circle cx="26.5" cy="7" r="3.1" fill="#c9a84c"/></svg>AILeash</a>
-  <div class="links"><a href="/ai.txt">Spec</a><a href="/whitepaper">Whitepaper</a></div>
-</nav>
-<div class="wrap">
-  <div class="eyebrow">// ai.txt starter kit</div>
-  <h1>Publish AI governance on your own site. <span>Free.</span></h1>
-  <p class="lede">ai.txt is the robots.txt of AI governance: one small file at your domain root that declares how your AI is governed and where anyone can verify it. Here is everything you need to publish one in about five minutes.</p>
-  <div class="free">FREE STANDARD &middot; NO KEY &middot; NO ACCOUNT &middot; NO PERMISSION</div>
-
-  <h2><span class="step-n">01 /</span> Grab the template</h2>
-  <p>A ready-to-fill ai.txt with every line commented. Download it, or read the live example on our own domain.</p>
-  <div class="btnrow">
-    <a class="btn" href="/ai-txt-template.txt" download="ai.txt">&#8681; Download template</a>
-    <a class="btn ghost" href="/ai.txt" target="_blank">Read a live example</a>
-  </div>
-
-  <h2><span class="step-n">02 /</span> Fill it in and publish</h2>
-  <p>Replace the example values with your own facts. <b>Delete any line you cannot back with a real verify endpoint</b> &mdash; an honest short ai.txt beats an aspirational long one. Then upload it to the root of your domain so it lives at:</p>
-  <div class="box">https://yourdomain.com/ai.txt</div>
-  <p>That is the whole spec. One file, at the root, readable by anyone &mdash; a regulator, a partner, or another machine deciding whether to trust you.</p>
-
-  <h2><span class="step-n">03 /</span> Add the badge</h2>
-  <p>Show visitors and crawlers that you have declared your AI governance. Copy this HTML onto your site &mdash; it renders a small badge linking to your ai.txt:</p>
-  <p>Preview:</p>
-  <a class="badge-demo" href="/ai.txt"><svg width="14" height="14" viewBox="0 0 32 32"><circle cx="16" cy="16" r="13.5" fill="none" stroke="#c9a84c" stroke-width="3" stroke-dasharray="66 20" stroke-linecap="round" transform="rotate(-50 16 16)"/><circle cx="26.5" cy="7" r="3.4" fill="#c9a84c"/></svg>AI-Governed &middot; ai.txt</a>
-  <div class="box" id="badge">&lt;a href="/ai.txt" style="display:inline-flex;align-items:center;gap:6px;font-family:monospace;font-size:12px;color:#c9a84c;text-decoration:none;border:1px solid #c9a84c;border-radius:6px;padding:6px 10px"&gt;AI-Governed &middot; ai.txt&lt;/a&gt;</div>
-  <button class="btn ghost" onclick="copyBadge()">Copy badge HTML<span class="copied" id="cp">copied</span></button>
-
-</div>
-</div>
-<footer>
-  ai.txt (AI-TXT/1.0) is a free, open standard by <a href="/">Monop Content</a> &middot; Blyth, UK &middot; <a href="/ai.txt">spec</a> &middot; <a href="/comply.txt">comply.txt</a>
-</footer>
-<script>
-function copyBadge(){
-  var t=document.getElementById('badge').textContent;
-  navigator.clipboard.writeText(t).then(function(){
-    var c=document.getElementById('cp');c.classList.add('show');setTimeout(function(){c.classList.remove('show')},1500);
-  });
-}
-</script>
-</body>
-</html>
 
 ```
