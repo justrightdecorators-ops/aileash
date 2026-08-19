@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-110 files across 23 parts.
+109 files across 22 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -30,55 +30,51 @@ Generated automatically on every push. Do not edit by hand.
 - `modules/demo.py`
 - `modules/dsr.py`
 - `modules/fingerprint.py`
-- `modules/heartbeat.py`
+- `modules/lineage.py`
+- `modules/mutual.py`
 
 ## [CODEBASE-06.md](CODEBASE-06.md)
 
-- `modules/lineage.py`
-- `modules/mutual.py`
 - `modules/network.py`
 - `modules/ots.py`
 - `modules/oversight.py`
+- `modules/pack.py`
+- `modules/packconsole.py`
 
 ## [CODEBASE-07.md](CODEBASE-07.md)
 
-- `modules/pack.py`
-- `modules/packconsole.py`
 - `modules/peer.py`
 - `modules/peerconsole.py`
 - `modules/publish.py`
+- `modules/reconcile.py`
 
 ## [CODEBASE-08.md](CODEBASE-08.md)
 
-- `modules/reconcile.py`
 - `modules/replay.py`
 - `modules/roster.py`
 - `modules/router.py`
 - `modules/rulebind.py`
+- `modules/savings.py`
 
 ## [CODEBASE-09.md](CODEBASE-09.md)
 
-- `modules/savings.py`
 - `modules/selfcheck.py`
+- `modules/signed.py`
+- `modules/sortition.py`
 
 ## [CODEBASE-10.md](CODEBASE-10.md)
 
-- `modules/signed.py`
-- `modules/sortition.py`
 - `modules/spec.py`
 - `modules/standard.py`
 - `modules/stats.py`
-
-## [CODEBASE-11.md](CODEBASE-11.md)
-
 - `modules/verifier.py`
 - `modules/warmup.py`
 - `modules/witness.py`
+
+## [CODEBASE-11.md](CODEBASE-11.md)
+
 - `modules/witnessed.py`
 - `Verify_ai.py`
-
-## [CODEBASE-12.md](CODEBASE-12.md)
-
 - `ai_act_ranker.py`
 - `ai_safety_scanner.py`
 - `aigrade_insert.py`
@@ -87,20 +83,20 @@ Generated automatically on every push. Do not edit by hand.
 - `aileash_verify.py`
 - `anchor.py`
 - `board_auditor.py`
+
+## [CODEBASE-12.md](CODEBASE-12.md)
+
 - `brain.py`
 - `broadcaster.py`
 - `build_sebbi_ecosystem.py`
-
-## [CODEBASE-13.md](CODEBASE-13.md)
-
 - `gateway_proxy.py`
 - `meshwitness.py`
 - `sebbi_orchestrator.py`
 - `sebbi_sdk.py`
+
+## [CODEBASE-13.md](CODEBASE-13.md)
+
 - `sebdog_engine.py`
-
-## [CODEBASE-14.md](CODEBASE-14.md)
-
 - `sebdog_licence.py`
 - `sebdog_reporter.py`
 - `tests/attack_continuity_1.py`
@@ -108,11 +104,11 @@ Generated automatically on every push. Do not edit by hand.
 - `tests/attack_continuity_3.py`
 - `tests/attack_continuity_4.py`
 - `tests/attack_continuity_5.py`
+
+## [CODEBASE-14.md](CODEBASE-14.md)
+
 - `tests/attack_continuity_6.py`
 - `tests/attack_witnessed.py`
-
-## [CODEBASE-15.md](CODEBASE-15.md)
-
 - `verify_authority.py`
 - `AILeash-API-Reference-v6.4.2.md`
 - `LICENCE`
@@ -123,7 +119,7 @@ Generated automatically on every push. Do not edit by hand.
 - `aitxt-popup-live.html`
 - `brain.html`
 
-## [CODEBASE-16.md](CODEBASE-16.md)
+## [CODEBASE-15.md](CODEBASE-15.md)
 
 - `certificate.html`
 - `compliance-assistant.html`
@@ -131,7 +127,7 @@ Generated automatically on every push. Do not edit by hand.
 - `copyright.txt`
 - `data-protection.html`
 
-## [CODEBASE-17.md](CODEBASE-17.md)
+## [CODEBASE-16.md](CODEBASE-16.md)
 
 - `developers.html`
 - `dis.txt`
@@ -142,11 +138,11 @@ Generated automatically on every push. Do not edit by hand.
 - `human-oversight.html`
 - `identity.html`
 
-## [CODEBASE-18.md](CODEBASE-18.md)
+## [CODEBASE-17.md](CODEBASE-17.md)
 
 - `index.html`
 
-## [CODEBASE-19.md](CODEBASE-19.md)
+## [CODEBASE-18.md](CODEBASE-18.md)
 
 - `investor-prospectus.html`
 - `legal.txt`
@@ -158,13 +154,13 @@ Generated automatically on every push. Do not edit by hand.
 - `report-threat.html`
 - `requirements.txt`
 
-## [CODEBASE-20.md](CODEBASE-20.md)
+## [CODEBASE-19.md](CODEBASE-19.md)
 
 - `reseller.html`
 - `risk-policy.html`
 - `robots.txt`
 
-## [CODEBASE-21.md](CODEBASE-21.md)
+## [CODEBASE-20.md](CODEBASE-20.md)
 
 - `scan.html`
 - `seal.html`
@@ -172,12 +168,12 @@ Generated automatically on every push. Do not edit by hand.
 - `signal-packs.html`
 - `sitemap.xml`
 
-## [CODEBASE-22.md](CODEBASE-22.md)
+## [CODEBASE-21.md](CODEBASE-21.md)
 
 - `sonicboom.html`
 - `verify.html`
 
-## [CODEBASE-23.md](CODEBASE-23.md)
+## [CODEBASE-22.md](CODEBASE-22.md)
 
 - `whitepaper.html`
 

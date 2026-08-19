@@ -1,771 +1,9 @@
-# Codebase — part 9 of 23
+# Codebase — part 9 of 22
 
 Contains:
-- `modules/savings.py`
 - `modules/selfcheck.py`
-
-
-## `modules/savings.py`
-
-755 lines, 33108 bytes
-
-```python
-"""
-modules/savings.py  -  the cost model at /savings
-
-WHAT IT IS
-----------
-One page. Enter a device count, see what a traditional compliance architecture
-costs against a proof-based one, and change every assumption behind it.
-
-WHY THE ASSUMPTIONS ARE EDITABLE
---------------------------------
-The saving rests on one number - what the traditional architecture costs per
-device per year - and that number is ours, not theirs. Asserted, it is the
-first thing a finance director dismisses. Broken into ingestion, storage,
-monitoring, pipeline and engineering, with every line editable, the arithmetic
-runs on their figures instead of ours. Harder to wave away, and honest.
-
-The page will also say plainly when the saving goes negative on the numbers
-somebody has typed. A calculator that can only ever produce a good answer is
-not a calculator.
-
-NO TRACKING, NO STORAGE
------------------------
-Everything happens in the browser. Nothing is submitted, nothing is recorded,
-no figure anyone types reaches the server. A buyer modelling their own costs
-should not have to wonder where those went.
-
-SAME PATCH AS network.py AND console.py
----------------------------------------
-The router hands whatever handle() returns to send_json, so a module cannot
-return HTML through it. This patches do_GET at runtime, adds one path, leaves
-every other path alone. After each deploy one /x/ request must arrive before
-/savings exists - opening /x/savings/status does it.
-"""
-
-import json
-import sys
-import time
-
-VERSION = "1.0"
-
-PUBLIC = {("GET", "status"), ("GET", "verify"), ("POST", "seal")}
-
-PAGE_PATHS = ("/savings", "/savings.html", "/cost", "/proof-machine")
-
-_patched = [False]
-_ready = [False]
-
-
-def _setup(ctx):
-    if _ready[0]:
-        return
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "CREATE TABLE IF NOT EXISTS savings_model("
-            "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,devices INTEGER,"
-            "assumptions TEXT,traditional_per REAL,proof_per REAL,"
-            "annual_saving REAL,modelled REAL,audit_hash TEXT,block_index INTEGER)")
-        ctx["conn"].execute(
-            "CREATE INDEX IF NOT EXISTS idx_sav_hash ON savings_model(audit_hash)")
-        ctx["conn"].commit()
-    _ready[0] = True
-
-
-PAGE = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>The cost of proving it — AILeash</title>
-<meta name="description" content="What AI governance costs at enterprise scale, and what a proof-based architecture changes. Put your own figures in.">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600;9..144,900&family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-:root{
-  --ink:#0a0f1e; --ink2:#10182e; --paper:#f6f3ec; --line:#e3ddcf;
-  --gold:#c9a84c; --mute:#6b6353; --mutei:rgba(255,255,255,.45);
-  --save:#1a9e6e; --spend:#c8362b;
-  --disp:Fraunces,Georgia,serif; --body:'Space Grotesk',system-ui,sans-serif;
-  --mono:'IBM Plex Mono',monospace;
-}
-body{background:var(--paper);color:var(--ink);font-family:var(--body);
-  font-size:16px;line-height:1.65}
-.wrap{max-width:760px;margin:0 auto;padding:0 20px}
-
-header{background:var(--ink);color:#fff;padding:52px 0 44px;margin-bottom:38px}
-.eyebrow{font-family:var(--mono);font-size:10px;letter-spacing:.22em;
-  text-transform:uppercase;color:var(--gold);margin-bottom:14px}
-h1{font-family:var(--disp);font-weight:900;font-size:clamp(32px,8vw,54px);
-  line-height:1;letter-spacing:-.025em}
-h1 i{font-style:italic;color:var(--gold)}
-.stand{color:var(--mutei);margin-top:16px;max-width:52ch;font-size:15.5px}
-.stand b{color:#fff}
-
-h2{font-family:var(--disp);font-weight:900;font-size:clamp(22px,5vw,30px);
-  letter-spacing:-.02em;margin-bottom:6px}
-.note{color:var(--mute);font-size:14.5px;margin-bottom:22px;max-width:56ch}
-
-section{margin-bottom:40px}
-
-/* device input */
-.devices{border:1px solid var(--line);border-left:3px solid var(--ink);
-  background:#fff;padding:22px;margin-bottom:14px}
-label{display:block;font-family:var(--mono);font-size:10px;letter-spacing:.16em;
-  text-transform:uppercase;color:var(--mute);margin-bottom:9px}
-.count{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
-.count input[type=number]{flex:1;min-width:150px;background:var(--paper);
-  border:1px solid var(--line);padding:13px 14px;border-radius:4px;
-  font-family:var(--mono);font-size:20px;color:var(--ink);outline:none}
-.count input:focus{border-color:var(--gold)}
-input[type=range]{width:100%;-webkit-appearance:none;appearance:none;height:3px;
-  background:var(--line);border-radius:2px;outline:none;margin-top:18px}
-input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:22px;height:22px;
-  border-radius:50%;background:var(--ink);border:4px solid var(--gold);cursor:pointer}
-input[type=range]::-moz-range-thumb{width:22px;height:22px;border-radius:50%;
-  background:var(--ink);border:4px solid var(--gold);cursor:pointer}
-.presets{display:flex;gap:7px;flex-wrap:wrap;margin-top:14px}
-.presets button{background:transparent;border:1px solid var(--line);color:var(--mute);
-  font-family:var(--mono);font-size:11.5px;padding:7px 11px;border-radius:3px;cursor:pointer}
-.presets button:hover,.presets button.on{border-color:var(--ink);color:var(--ink)}
-
-/* the headline */
-.headline{background:var(--ink);color:#fff;padding:30px 24px;margin-bottom:14px}
-.hl-l{font-family:var(--mono);font-size:10px;letter-spacing:.2em;
-  text-transform:uppercase;color:var(--gold);margin-bottom:10px}
-.hl-v{font-family:var(--disp);font-weight:900;font-size:clamp(38px,12vw,68px);
-  line-height:1;letter-spacing:-.03em;color:#7fe3b0}
-.hl-s{color:var(--mutei);font-size:14px;margin-top:12px}
-
-/* the stacked comparison - the signature */
-.compare{border:1px solid var(--line);background:#fff;padding:24px}
-.row{margin-bottom:26px}
-.row:last-child{margin-bottom:0}
-.row-h{display:flex;justify-content:space-between;align-items:baseline;
-  gap:12px;margin-bottom:10px}
-.row-t{font-family:var(--disp);font-weight:600;font-size:18px}
-.row-v{font-family:var(--mono);font-size:15px;font-weight:500}
-.stack{display:flex;height:44px;border-radius:3px;overflow:hidden;background:var(--paper)}
-.seg{position:relative;transition:width .4s ease;min-width:0}
-.seg:not(:last-child){border-right:1px solid rgba(255,255,255,.35)}
-.legend{display:flex;flex-wrap:wrap;gap:12px;margin-top:12px;
-  font-family:var(--mono);font-size:11px;color:var(--mute)}
-.legend span{display:flex;align-items:center;gap:6px}
-.sw{width:10px;height:10px;border-radius:2px;flex-shrink:0}
-.gap-note{font-family:var(--mono);font-size:11.5px;color:var(--save);
-  margin-top:16px;padding-top:14px;border-top:1px solid var(--line)}
-
-/* assumptions */
-.assump{border:1px solid var(--line);background:#fff}
-.a-row{display:grid;grid-template-columns:1fr 116px;gap:14px;align-items:center;
-  padding:14px 18px;border-bottom:1px solid var(--line)}
-.a-row:last-of-type{border-bottom:none}
-.a-name{font-size:14.5px}
-.a-name small{display:block;color:var(--mute);font-size:12px;margin-top:2px;line-height:1.45}
-.a-in{display:flex;align-items:center;gap:5px}
-.a-in span{font-family:var(--mono);font-size:13px;color:var(--mute)}
-.a-in input{width:100%;background:var(--paper);border:1px solid var(--line);
-  padding:9px 10px;border-radius:3px;font-family:var(--mono);font-size:14px;
-  color:var(--ink);outline:none;text-align:right}
-.a-in input:focus{border-color:var(--gold)}
-.a-total{display:grid;grid-template-columns:1fr 116px;gap:14px;padding:15px 18px;
-  background:var(--ink);color:#fff;align-items:center}
-.a-total .a-name{font-family:var(--disp);font-weight:600;font-size:16px}
-.a-total .v{font-family:var(--mono);font-size:15px;text-align:right;color:var(--gold)}
-.reset{background:none;border:none;color:var(--mute);font-family:var(--mono);
-  font-size:11.5px;text-decoration:underline;cursor:pointer;padding:12px 18px}
-
-/* three year */
-.years{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;
-  background:var(--line);border:1px solid var(--line);margin-top:14px}
-.yr{background:#fff;padding:18px 14px;text-align:center}
-.yr .l{font-family:var(--mono);font-size:9.5px;letter-spacing:.14em;
-  text-transform:uppercase;color:var(--mute);margin-bottom:8px}
-.yr .v{font-family:var(--disp);font-weight:900;font-size:clamp(18px,5vw,26px);
-  color:var(--save);line-height:1}
-
-.split{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--line);
-  border:1px solid var(--line);margin-bottom:16px}
-.half{background:#fff;padding:20px}
-.half.measured{border-top:3px solid var(--save)}
-.half.modelled{border-top:3px solid var(--gold)}
-.h-l{font-family:var(--mono);font-size:10px;letter-spacing:.14em;text-transform:uppercase;
-  color:var(--mute);margin-bottom:14px}
-.measured .h-l{color:var(--save)}
-.m-row{display:flex;justify-content:space-between;gap:12px;padding:8px 0;
-  border-bottom:1px solid var(--line);font-size:13.5px;align-items:baseline}
-.m-row:last-of-type{border-bottom:none}
-.m-row b{font-family:var(--mono);font-size:13px}
-.h-n{font-size:13px;color:var(--mute);line-height:1.65;margin-top:12px}
-.sealbox{border:1px dashed var(--gold);background:rgba(201,168,76,.07);padding:22px}
-.s-h{font-family:var(--disp);font-weight:900;font-size:19px;margin-bottom:8px}
-.s-n{font-size:13.5px;color:var(--mute);line-height:1.65;margin-bottom:16px}
-#sealbtn{background:var(--ink);color:#fff;border:none;border-radius:3px;padding:14px 22px;
-  font-family:var(--body);font-weight:700;font-size:14px;cursor:pointer}
-#sealbtn:hover:not(:disabled){background:#243156}
-#sealbtn:disabled{opacity:.5;cursor:default}
-#sealout{margin-top:14px;font-family:var(--mono);font-size:12px;line-height:1.9;
-  color:var(--mute);word-break:break-all}
-#sealout a{color:var(--ink)}
-#sealout .ok{color:var(--save)}
-#sealout .bad{color:var(--spend)}
-@media(max-width:560px){.split{grid-template-columns:1fr}}
-.straight{border-left:3px solid var(--gold);background:rgba(201,168,76,.07);
-  padding:20px 22px;font-size:14.5px;line-height:1.7;color:var(--mute)}
-.straight b{color:var(--ink)}
-.straight p+p{margin-top:12px}
-
-.cta{display:flex;gap:10px;flex-wrap:wrap;margin-top:26px}
-.cta a{display:inline-block;padding:15px 26px;border-radius:3px;text-decoration:none;
-  font-weight:700;font-size:14.5px}
-.gold{background:var(--gold);color:var(--ink)}
-.ghost{border:1px solid var(--line);color:var(--ink)}
-
-footer{border-top:1px solid var(--line);margin-top:44px;padding:26px 0 60px;
-  font-family:var(--mono);font-size:11px;color:var(--mute);line-height:1.9}
-footer a{color:var(--ink)}
-:focus-visible{outline:2px solid var(--gold);outline-offset:2px}
-@media(max-width:560px){
-  .a-row,.a-total{grid-template-columns:1fr 96px;gap:10px;padding:13px 14px}
-  .years{grid-template-columns:1fr}
-}
-@media(prefers-reduced-motion:reduce){*{transition:none!important}}
-</style>
-</head>
-<body>
-
-<header>
-  <div class="wrap">
-    <p class="eyebrow">AILeash · what it costs to prove it</p>
-    <h1>Everyone prices the model.<br><i>Nobody prices the proof.</i></h1>
-    <p class="stand">At enterprise scale the model is rarely the expensive part. <b>Ingestion, log storage, monitoring, compliance pipelines and the engineering time to hold it all together</b> usually cost more — and none of it proves anything on its own.</p>
-  </div>
-</header>
-
-<div class="wrap">
-
-<section>
-  <h2>Your deployment</h2>
-  <p class="note">Everything below recalculates from this.</p>
-  <div class="devices">
-    <label for="dev">Devices under governance</label>
-    <div class="count">
-      <input id="dev" type="number" min="100" step="100" value="100000" inputmode="numeric">
-    </div>
-    <input id="devr" type="range" min="2" max="6" step="0.01" value="5">
-    <div class="presets">
-      <button data-n="10000">10k</button>
-      <button data-n="25000">25k</button>
-      <button data-n="50000">50k</button>
-      <button data-n="100000" class="on">100k</button>
-      <button data-n="250000">250k</button>
-      <button data-n="500000">500k</button>
-    </div>
-  </div>
-</section>
-
-<section>
-  <div class="headline">
-    <p class="hl-l">Potential annual saving</p>
-    <p class="hl-v" id="save">—</p>
-    <p class="hl-s" id="save-sub">—</p>
-  </div>
-
-  <div class="compare">
-    <div class="row">
-      <div class="row-h">
-        <span class="row-t">Traditional compliance architecture</span>
-        <span class="row-v" id="trad-v">—</span>
-      </div>
-      <div class="stack" id="trad-stack"></div>
-      <div class="legend" id="trad-legend"></div>
-    </div>
-
-    <div class="row">
-      <div class="row-h">
-        <span class="row-t">Proof-based, on AILeash</span>
-        <span class="row-v" id="proof-v">—</span>
-      </div>
-      <div class="stack" id="proof-stack"></div>
-      <div class="legend">
-        <span><i class="sw" style="background:#c9a84c"></i>50p per device per month, flat</span>
-      </div>
-    </div>
-
-    <p class="gap-note" id="gap">—</p>
-  </div>
-
-  <div class="years">
-    <div class="yr"><div class="l">Year one</div><div class="v" id="y1">—</div></div>
-    <div class="yr"><div class="l">Three years</div><div class="v" id="y3">—</div></div>
-    <div class="yr"><div class="l">Per device, per year</div><div class="v" id="ypd">—</div></div>
-  </div>
-</section>
-
-<section>
-  <h2>Change any of these</h2>
-  <p class="note">These are the figures the saving rests on. They are illustrative, and yours will differ — so put yours in. The arithmetic follows whatever you type.</p>
-  <div class="assump" id="assump">
-    <div class="a-row">
-      <div class="a-name">Data ingestion
-        <small>Getting decision data out of your systems and into somewhere it can be queried.</small></div>
-      <div class="a-in"><span>£</span><input type="number" id="a-ingest" value="3.20" step="0.10" min="0" inputmode="decimal"></div>
-    </div>
-    <div class="a-row">
-      <div class="a-name">Log storage
-        <small>Retention at the volumes an audit trail implies, for as long as the regulation implies.</small></div>
-      <div class="a-in"><span>£</span><input type="number" id="a-store" value="2.80" step="0.10" min="0" inputmode="decimal"></div>
-    </div>
-    <div class="a-row">
-      <div class="a-name">Monitoring platform
-        <small>Licences and seats on whatever watches it.</small></div>
-      <div class="a-in"><span>£</span><input type="number" id="a-monitor" value="2.40" step="0.10" min="0" inputmode="decimal"></div>
-    </div>
-    <div class="a-row">
-      <div class="a-name">Compliance pipeline
-        <small>Turning raw logs into something a regulator will accept.</small></div>
-      <div class="a-in"><span>£</span><input type="number" id="a-pipeline" value="2.60" step="0.10" min="0" inputmode="decimal"></div>
-    </div>
-    <div class="a-row">
-      <div class="a-name">Engineering time
-        <small>Building it, and keeping it running once it exists.</small></div>
-      <div class="a-in"><span>£</span><input type="number" id="a-eng" value="1.60" step="0.10" min="0" inputmode="decimal"></div>
-    </div>
-    <div class="a-row">
-      <div class="a-name">AILeash
-        <small>50p per device per month. Change it if you have been quoted something else.</small></div>
-      <div class="a-in"><span>£</span><input type="number" id="a-ail" value="6.00" step="0.50" min="0" inputmode="decimal"></div>
-    </div>
-    <div class="a-total">
-      <div class="a-name">Traditional, per device per year</div>
-      <div class="v" id="a-sum">—</div>
-    </div>
-  </div>
-  <button class="reset" id="reset">Put the illustrative figures back</button>
-</section>
-
-<section>
-  <h2>What is measured, and what is modelled</h2>
-  <p class="note">The two halves of this page are not the same kind of number, and it matters which is which.</p>
-
-  <div class="split">
-    <div class="half measured">
-      <div class="h-l">Measured — read from the live chain just now</div>
-      <div class="m-row"><span>Blocks sealed</span><b id="m-height">…</b></div>
-      <div class="m-row"><span>Bytes per seal</span><b>32</b></div>
-      <div class="m-row"><span>Size of the record behind it</span><b>irrelevant</b></div>
-      <div class="m-row"><span>External timestamp</span><b id="m-anchor">…</b></div>
-      <p class="h-n">A seal is a SHA-256 digest. Thirty-two bytes, whether the decision behind it is one line or a megabyte. That is not a claim about our architecture, it is what a hash is — and it is the whole reason the cost stops tracking the volume.</p>
-    </div>
-    <div class="half modelled">
-      <div class="h-l">Modelled — assumptions, including yours</div>
-      <div class="m-row"><span>What you spend today</span><b>your figures</b></div>
-      <div class="m-row"><span>What you would stop spending</span><b>an estimate</b></div>
-      <p class="h-n">Nobody can prove what an organisation <i>would have</i> spent. That number does not exist anywhere to be measured, here or in any vendor's business case. What this page can do is make the assumptions visible and let you replace every one of them.</p>
-    </div>
-  </div>
-
-  <div class="sealbox">
-    <div class="s-h">Seal this calculation</div>
-    <p class="s-n">Puts your inputs and the result into the audit chain, dated and tamper-evident, and hands you a receipt anyone can check. Then what was modelled, and on whose assumptions, is a matter of record rather than of memory — including ours.</p>
-    <button id="sealbtn">Seal it and give me a receipt</button>
-    <div id="sealout"></div>
-  </div>
-</section>
-
-<section>
-  <h2>Why a proof layer costs less</h2>
-  <p class="note">It is not a discount on the same architecture. It is less architecture.</p>
-  <div class="straight">
-    <p><b>Most of that cost is moving and keeping data.</b> Sensitive records get shipped somewhere central, held for years, indexed so they can be searched, and watched so nothing goes missing — because the plan is to reconstruct what happened by reading it all back later.</p>
-    <p><b>A proof-based layer answers the question at the moment the decision is made.</b> The decision is scored, sealed into a hash chain, externally timestamped and recorded by an independent platform. What survives is a proof that the decision happened, under stated rules, and has not been altered since.</p>
-    <p><b>So the volume stops being the problem.</b> A seal is the same size whether the record behind it is a line or a megabyte, and it does not have to leave your systems for the proof to hold. You keep your own data where it already is.</p>
-    <p>It does not replace your logs, and it is not meant to. It replaces the machinery built to make logs trustworthy — which is the part that scales badly.</p>
-  </div>
-  <div class="cta">
-    <a class="gold" href="/#signup">Get an API key · 90 days free</a>
-    <a class="ghost" href="/whitepaper">Read the whitepaper</a>
-    <a class="ghost" href="/api/verify-chain">Check the chain</a>
-  </div>
-</section>
-
-<footer>
-  Illustrative model. Real figures vary with cloud provider, data volume, retention policy, engineering rates and existing contracts — which is why every input above is yours to change. No saving is guaranteed and nothing here is a quotation.<br>
-  <a href="https://sebbi.pro">sebbi.pro</a> · Monop Content, Blyth
-</footer>
-
-</div>
-
-<script>
-(function(){
-  var DEFAULTS = { ingest:3.20, store:2.80, monitor:2.40, pipeline:2.60, eng:1.60, ail:6.00 };
-  var SEGMENTS = [
-    { id:'ingest',   label:'Data ingestion',      colour:'#0a0f1e' },
-    { id:'store',    label:'Log storage',         colour:'#243156' },
-    { id:'monitor',  label:'Monitoring',          colour:'#3d4f7d' },
-    { id:'pipeline', label:'Compliance pipeline', colour:'#5b6e9e' },
-    { id:'eng',      label:'Engineering time',    colour:'#8794b8' }
-  ];
-
-  var $ = function(id){ return document.getElementById(id); };
-  var dev = $('dev'), devr = $('devr');
-
-  function money(n){
-    if(!isFinite(n)) return '—';
-    if(Math.abs(n) >= 1000000) return '£' + (n/1000000).toFixed(2).replace(/\.00$/,'') + 'm';
-    return '£' + Math.round(n).toLocaleString('en-GB');
-  }
-  function per(n){ return '£' + n.toFixed(2); }
-  function val(id){
-    var v = parseFloat($(id).value);
-    return (isFinite(v) && v >= 0) ? v : 0;
-  }
-  function devices(){
-    var v = parseInt(dev.value, 10);
-    if(!isFinite(v) || v < 1) v = 1;
-    return v;
-  }
-
-  function draw(){
-    var n = devices();
-    var parts = SEGMENTS.map(function(s){ return { s:s, v: val('a-' + s.id) }; });
-    var tradPer = parts.reduce(function(a,p){ return a + p.v; }, 0);
-    var ailPer = val('a-ail');
-
-    var trad = tradPer * n, proof = ailPer * n, saved = trad - proof;
-
-    $('a-sum').textContent = per(tradPer);
-    $('trad-v').textContent = money(trad) + ' / year';
-    $('proof-v').textContent = money(proof) + ' / year';
-
-    $('save').textContent = saved > 0 ? money(saved) : money(0);
-    $('save').style.color = saved > 0 ? '#7fe3b0' : '#ffb4ad';
-    $('save-sub').textContent = n.toLocaleString('en-GB') + ' devices · ' +
-      per(tradPer) + ' against ' + per(ailPer) + ' per device per year';
-
-    // stacked bars, both scaled to the larger of the two
-    var scale = Math.max(tradPer, ailPer) || 1;
-    var tradHtml = '', legendHtml = '';
-    parts.forEach(function(p){
-      if(p.v <= 0) return;
-      tradHtml += '<div class="seg" style="width:' + ((p.v/scale)*100) + '%;background:' +
-        p.s.colour + '" title="' + p.s.label + ' · ' + per(p.v) + '"></div>';
-      legendHtml += '<span><i class="sw" style="background:' + p.s.colour + '"></i>' +
-        p.s.label + ' ' + per(p.v) + '</span>';
-    });
-    $('trad-stack').innerHTML = tradHtml;
-    $('trad-legend').innerHTML = legendHtml;
-    $('proof-stack').innerHTML = '<div class="seg" style="width:' +
-      ((ailPer/scale)*100) + '%;background:#c9a84c"></div>';
-
-    if(saved > 0){
-      var pct = Math.round((saved / (tradPer * n)) * 100);
-      $('gap').textContent = 'The gap is ' + money(saved) + ' a year — about ' + pct +
-        '% of the traditional figure, on these inputs.';
-      $('gap').style.color = '#1a9e6e';
-    } else if(saved === 0){
-      $('gap').textContent = 'On these inputs the two cost the same.';
-      $('gap').style.color = '#6b6353';
-    } else {
-      $('gap').textContent = 'On these inputs the proof layer costs ' + money(-saved) +
-        ' a year more. Worth knowing, and worth saying.';
-      $('gap').style.color = '#c8362b';
-    }
-
-    $('y1').textContent = money(Math.max(0, saved));
-    $('y3').textContent = money(Math.max(0, saved * 3));
-    $('ypd').textContent = per(Math.max(0, tradPer - ailPer));
-
-    document.querySelectorAll('.presets button').forEach(function(b){
-      b.classList.toggle('on', parseInt(b.dataset.n,10) === n);
-    });
-  }
-
-  // slider is logarithmic: 100 to 1,000,000
-  function syncFromSlider(){
-    dev.value = Math.round(Math.pow(10, parseFloat(devr.value)) / 100) * 100;
-    draw();
-  }
-  function syncFromNumber(){
-    var n = devices();
-    devr.value = Math.min(6, Math.max(2, Math.log(n) / Math.LN10));
-    draw();
-  }
-
-  devr.addEventListener('input', syncFromSlider);
-  dev.addEventListener('input', syncFromNumber);
-  document.querySelectorAll('.presets button').forEach(function(b){
-    b.addEventListener('click', function(){
-      dev.value = b.dataset.n; syncFromNumber();
-    });
-  });
-  document.querySelectorAll('#assump input').forEach(function(i){
-    i.addEventListener('input', draw);
-  });
-  $('reset').addEventListener('click', function(){
-    Object.keys(DEFAULTS).forEach(function(k){ $('a-' + k).value = DEFAULTS[k].toFixed(2); });
-    draw();
-  });
-
-  syncFromNumber();
-
-  // ---- measured half: read the live chain, do not assert it
-  (async function(){
-    try{
-      var r = await fetch('/x/stats');
-      if(r.ok){
-        var d = await r.json();
-        var h = (d.chain && d.chain.height);
-        $('m-height').textContent = h ? h.toLocaleString('en-GB') : 'unavailable';
-      } else { $('m-height').textContent = 'unavailable'; }
-    }catch(e){ $('m-height').textContent = 'unavailable'; }
-    try{
-      var a = await fetch('/api/anchor-status');
-      if(a.ok){
-        var ad = await a.json();
-        var cal = ad.calendars || ad.calendar_count;
-        $('m-anchor').textContent = cal ? (cal + ' calendars') : 'live';
-      } else { $('m-anchor').textContent = 'unavailable'; }
-    }catch(e){ $('m-anchor').textContent = 'unavailable'; }
-  })();
-
-  // ---- seal the calculation
-  var sealbtn = $('sealbtn'), sealout = $('sealout');
-  sealbtn.addEventListener('click', async function(){
-    sealbtn.disabled = true;
-    sealout.innerHTML = 'sealing…';
-    var body = {
-      devices: devices(),
-      assumptions: {
-        ingestion: val('a-ingest'), storage: val('a-store'),
-        monitoring: val('a-monitor'), pipeline: val('a-pipeline'),
-        engineering: val('a-eng'), aileash: val('a-ail')
-      }
-    };
-    try{
-      var r = await fetch('/x/savings/seal', {
-        method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify(body)
-      });
-      var d = await r.json();
-      if(r.status === 429){
-        sealout.innerHTML = '<span class="bad">Rate limited. Give it a minute.</span>';
-      } else if(!r.ok || !d.receipt){
-        sealout.innerHTML = '<span class="bad">' +
-          ((d && (d.message || d.error)) || ('HTTP ' + r.status)) + '</span>';
-      } else {
-        sealout.innerHTML =
-          '<span class="ok">Sealed at block ' + d.block_index + '</span><br>' +
-          'receipt ' + d.receipt + '<br>' +
-          '<a href="' + d.verify + '" target="_blank" rel="noopener">check it yourself →</a>';
-      }
-    }catch(e){
-      sealout.innerHTML = '<span class="bad">Could not reach the server.</span>';
-    }
-    sealbtn.disabled = false;
-  });
-})();
-</script>
-</body>
-</html>
-"""
-
-
-def _srv():
-    m = sys.modules.get("__main__")
-    if hasattr(m, "get_bearer"):
-        return m
-    return sys.modules.get("server")
-
-
-def _install(s):
-    if _patched[0]:
-        return "already installed"
-    H = getattr(s, "Handler", None)
-    if H is None or not hasattr(H, "do_GET"):
-        return "no handler"
-    if getattr(H, "_savings_patched", False):
-        _patched[0] = True
-        return "already installed"
-
-    original = H.do_GET
-
-    def do_GET(self):
-        try:
-            from urllib.parse import urlparse
-            p = urlparse(self.path).path.rstrip("/") or "/"
-        except Exception:
-            p = self.path or "/"
-        if p in PAGE_PATHS:
-            body = PAGE.encode("utf-8")
-            try:
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Cache-Control", "public, max-age=300")
-                self.send_header("X-Content-Type-Options", "nosniff")
-                self.end_headers()
-                self.wfile.write(body)
-            except Exception:
-                pass
-            return
-        return original(self)
-
-    H.do_GET = do_GET
-    H._savings_patched = True
-    _patched[0] = True
-    print("SAVINGS: /savings page installed at runtime", flush=True)
-    return "installed"
-
-
-def _seal(ctx, api_key, data):
-    try:
-        devices = int(data.get("devices", 0))
-    except (TypeError, ValueError):
-        devices = 0
-    if devices < 1 or devices > 100000000:
-        return {"error": "devices_required",
-                "message": "Send a device count between 1 and 100,000,000."}, 400
-
-    a = data.get("assumptions")
-    if not isinstance(a, dict):
-        return {"error": "assumptions_required"}, 400
-
-    fields = ["ingestion", "storage", "monitoring", "pipeline", "engineering", "aileash"]
-    vals = {}
-    for f in fields:
-        try:
-            v = float(a.get(f, 0))
-        except (TypeError, ValueError):
-            v = 0.0
-        if v < 0 or v > 100000:
-            v = 0.0
-        vals[f] = round(v, 2)
-
-    traditional_per = round(sum(vals[f] for f in fields if f != "aileash"), 2)
-    proof_per = vals["aileash"]
-    traditional = round(traditional_per * devices, 2)
-    proof = round(proof_per * devices, 2)
-    saving = round(traditional - proof, 2)
-
-    ts = time.time()
-    detail = ("devices=" + str(devices) +
-              ";" + ";".join("%s=%.2f" % (f, vals[f]) for f in fields) +
-              ";traditional_per=%.2f;proof_per=%.2f;saving=%.2f"
-              % (traditional_per, proof_per, saving))
-
-    ev = {"user_id": "sav:" + str(devices), "action": "savings_modelled",
-          "amount": 0, "country": "UK", "device_id": "savings",
-          "anomaly": 0, "device_risk": 0}
-    res = {"decision": "SAVINGS_SEALED", "score": 0, "savings_version": VERSION,
-           "devices": devices, "assumptions": vals,
-           "traditional_per_device_year": traditional_per,
-           "proof_per_device_year": proof_per,
-           "annual_saving": saving, "timestamp": ts, "detail": detail}
-    h, idx, seq = ctx["seal"](ev, res, ts, api_key)
-
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "INSERT INTO savings_model(api_key,devices,assumptions,traditional_per,"
-            "proof_per,annual_saving,modelled,audit_hash,block_index)"
-            " VALUES(?,?,?,?,?,?,?,?,?)",
-            (api_key, devices, json.dumps(vals), traditional_per, proof_per,
-             saving, ts, h, idx))
-        ctx["conn"].commit()
-
-    return {
-        "sealed": True,
-        "receipt": h,
-        "block_index": idx,
-        "receipt_seq": seq,
-        "modelled_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts)),
-        "devices": devices,
-        "assumptions": vals,
-        "traditional_per_device_year": traditional_per,
-        "proof_per_device_year": proof_per,
-        "annual_saving": saving,
-        "verify": "/x/savings/verify?receipt=" + h,
-        "what_this_proves": ("That this calculation, on these assumptions, was run at "
-                             "this time and has not been altered since. It does not "
-                             "prove the assumptions are right - they are yours - and "
-                             "no record can prove what an organisation would otherwise "
-                             "have spent."),
-    }, 200
-
-
-def _verify(ctx, data):
-    receipt = str(data.get("receipt", "")).strip().lower()
-    if not receipt:
-        return {"error": "receipt_required"}, 400
-    with ctx["lock"]:
-        row = ctx["conn"].execute(
-            "SELECT devices,assumptions,traditional_per,proof_per,annual_saving,"
-            "modelled,block_index FROM savings_model WHERE audit_hash=? LIMIT 1",
-            (receipt,)).fetchone()
-    if not row:
-        return {"found": False, "receipt": receipt,
-                "message": "No calculation with that receipt exists in this chain."}, 404
-    try:
-        assumptions = json.loads(row[1])
-    except Exception:
-        assumptions = {}
-    return {
-        "found": True, "receipt": receipt,
-        "devices": row[0], "assumptions": assumptions,
-        "traditional_per_device_year": row[2],
-        "proof_per_device_year": row[3],
-        "annual_saving": row[4],
-        "modelled_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(row[5])),
-        "block_index": row[6],
-        "proof": ("This calculation is a block in a hash chain that is externally "
-                  "timestamped and recorded by an independent platform. Altering or "
-                  "removing it breaks every block after it."),
-        "chain": "/api/verify-chain",
-        "external_clock": "/api/anchor-status",
-    }, 200
-
-
-def handle(method, action, data, api_key, ctx):
-    s = _srv()
-    if s is None:
-        return {"error": "server_not_found"}, 500
-
-    state = "already installed" if _patched[0] else None
-    if not _patched[0]:
-        try:
-            state = _install(s)
-        except Exception as exc:
-            print("SAVINGS: patch failed - " + str(exc), flush=True)
-            state = "failed: " + str(exc)
-
-    action = (action or "").strip("/").lower()
-
-    if method == "POST":
-        if action == "seal":
-            _setup(ctx)
-            return _seal(ctx, api_key or "public-savings", data)
-        return {"error": "unknown_action", "action": action, "POST": ["seal"]}, 404
-
-    if action in ("", "status"):
-        return {
-            "page": "/savings",
-            "installed": bool(_patched[0]),
-            "install_result": state,
-            "paths": list(PAGE_PATHS),
-            "version": VERSION,
-            "note": ("The calculator runs in the browser. Nothing a visitor types is "
-                     "submitted unless they choose to seal it."),
-        }, 200
-    if action == "verify":
-        _setup(ctx)
-        return _verify(ctx, data)
-    return {"error": "unknown_action", "action": action,
-            "GET": ["status", "verify"], "POST": ["seal"]}, 404
-
-```
+- `modules/signed.py`
+- `modules/sortition.py`
 
 
 ## `modules/selfcheck.py`
@@ -1863,5 +1101,1510 @@ def handle(method, action, data, api_key, ctx):
                         "tests one operator's own document and is not a joint runner."}, 200
 
     return {"error": "unknown_action", "action": action, "GET": ["status"]}, 404
+
+```
+
+
+## `modules/signed.py`
+
+744 lines, 32363 bytes
+
+```python
+"""
+Peer-signed submissions - /x/signed/<action>
+
+THE GAP THIS CLOSES
+-------------------
+Two people arrived at the same missing piece from opposite directions on the
+same day.
+
+Ishaan (Shango MID) read the existing signed lane and said, correctly, that
+"binds a name to a secret rather than to an address" reads stronger than it
+is. An HMAC uses a shared secret. A shared secret is held by both parties. So
+it proves the submission came from SOMEONE HOLDING THE SECRET - which is the
+peer and also the operator of this deployment. It closes third-party
+submission under a peer's name. It does not close operator submission under a
+peer's name.
+
+Chidi (ViriSIM) came at it from the regulator's side: for the evidence to mean
+anything to a third party, the customer has to sign, not the platform holding
+the customer's records.
+
+Same gap. This module closes it.
+
+HOW
+---
+The peer generates an Ed25519 keypair and keeps the private half. This
+deployment is given ONLY the public half. A public key is not a secret and
+grants nothing: it verifies a signature and cannot produce one.
+
+From then on, a submission under that name is accepted only if it carries a
+signature this deployment can verify against that public key - and this
+deployment CANNOT create such a signature, because it does not hold the
+private key and never has. The property is not a promise about our conduct.
+It is arithmetic.
+
+WHAT THIS MEANS FOR THE RECORD
+------------------------------
+The other lanes answer "did somebody hand us this tip". This lane answers
+"did the holder of this key hand us this tip", and the difference matters
+precisely when the operator is the party you are worried about.
+
+A regulator or auditor reading a signed observation does not have to trust
+this deployment about who submitted it. They can take the public key from
+/x/signed/keys, take the canonical message and the signature from the record,
+and check it themselves with any Ed25519 library in any language.
+
+WHAT IT STILL DOES NOT DO
+-------------------------
+- It does not prove the records behind the tip are true. Nothing here does.
+- It does not prove completeness. A signed chain can still omit records.
+  Catching that needs an audit protocol, not cryptography - see Chidi's
+  incognito-user test, which is the only thing anyone has proposed that
+  attacks it.
+- It does not prove who the keyholder IS. It proves the same party signed
+  each time. Identity is a separate problem and this does not solve it.
+- Enrolment is open, so the first party to enrol a name gets it. Same as
+  everywhere else in this standard, that is detection rather than
+  prevention: an enrolment is sealed, permanent and public, and an enrolment
+  placed over a name already seen in the witness log is flagged as such.
+
+WHY THE OPERATOR CANNOT QUIETLY SWAP A KEY
+------------------------------------------
+The obvious attack on the whole idea: the operator replaces the peer's public
+key with one of their own, then signs freely. So there is no route that
+overwrites a key. Rotation exists, and a rotation must itself be signed by
+the key being replaced. An operator who does not hold the current private key
+cannot rotate it, and every rotation is sealed into the chain with both keys
+recorded. A peer who has lost their key cannot rotate either - they enrol a
+new name, and the abandoned one stays visible.
+
+CANONICAL MESSAGE
+-----------------
+Exactly this, UTF-8, no trailing newline, four lines joined by \\n:
+
+    aileash-signed-v1
+    <chain>
+    <tip>
+    <ts>
+
+  chain  the peer name, lowercase, as enrolled
+  tip    64 lowercase hex characters
+  ts     integer epoch seconds, no decimal point
+
+Sign those bytes with the Ed25519 private key. Send the 64-byte signature as
+128 lowercase hex characters. The message is deliberately short, positional
+and free of JSON so that two implementations cannot disagree about how to
+build it.
+
+Rotation signs a different message with the SAME shape:
+
+    aileash-rotate-v1
+    <chain>
+    <new public key, 64 hex>
+    <ts>
+
+REPLAY
+------
+A signature is a bearer token for the statement it signs. Anyone who sees one
+can send it again. So: ts must be within SKEW_PAST seconds behind and
+SKEW_FUTURE ahead of our clock, ts must be strictly greater than the last ts
+we accepted for that name, and an exact repeat of a signature already stored
+is refused. None of that is exotic - it is the ordinary set, written down so
+nobody has to guess which of them we do.
+
+WHY THIS LANE REJECTS, WHEN THE OPEN LANE NEVER DOES
+----------------------------------------------------
+/x/witness/observe sea1s everything and describes what it sealed, because
+refusing an anonymous submission would mean deciding who is allowed to be
+recorded. This lane is the opposite case. A submission whose signature does
+not verify has no business being written into a name's history at all - the
+harm is exactly that it would sit in the record looking like an event
+involving that peer. So this lane refuses, says why, and seals nothing.
+
+    GET  /x/signed/spec                  the protocol
+    GET  /x/signed/keys                  every enrolled name and public key
+    POST /x/signed/enroll                chain, pubkey
+    POST /x/signed/submit                chain, tip, ts, signature
+    POST /x/signed/rotate                chain, new_pubkey, ts, signature
+    GET  /x/signed/verify?peer=&tip=     the receipt, with everything a third
+                                         party needs to check it themselves
+"""
+
+import hashlib
+import re
+import time
+from datetime import datetime, timezone
+
+VERSION = "1.0"
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
+HEX128 = re.compile(r"^[0-9a-f]{128}$")
+
+MSG_PREFIX = "aileash-signed-v1"
+ROTATE_PREFIX = "aileash-rotate-v1"
+
+# Replay window. Generous enough for a batch job on a slow link, tight enough
+# that a captured signature is not useful for long.
+SKEW_PAST = 900
+SKEW_FUTURE = 120
+
+# Everything here is readable and usable without an account. A verification
+# lane that only account holders can check is not a verification lane.
+PUBLIC = {("GET", "spec"), ("GET", "keys"), ("GET", "verify"),
+          ("POST", "enroll"), ("POST", "submit"), ("POST", "rotate")}
+
+MAX_LIST = 500
+
+MESSAGES = {
+    "what_this_proves": (
+        "That the holder of the enrolled private key produced this exact "
+        "statement - name, tip and timestamp - and that we sealed it at the "
+        "recorded time. This deployment holds only the public key and cannot "
+        "produce such a signature, so it is not a claim you have to take on "
+        "our word. Recheck it yourself with any Ed25519 library."),
+    "what_this_does_not_prove": (
+        "Nothing about whether the records behind the tip are true, nothing "
+        "about whether the chain is complete, and nothing about who the "
+        "keyholder is in the world. It proves the same party signed each "
+        "time."),
+    "enrolled": (
+        "This name is now bound to this public key permanently. We cannot "
+        "change it - rotation requires a signature from the key being "
+        "replaced, which we do not hold."),
+    "keys_note": (
+        "Public keys are not secrets. They are published so that anyone can "
+        "verify a signed observation without asking us for anything."),
+}
+
+_ready = False
+
+
+# ----------------------------------------------------------------------
+# Ed25519 verification, RFC 8032, pure standard library
+#
+# Deliberately no third-party dependency. This deployment runs on a small
+# box and a verification routine that needs a native extension is a
+# verification routine that stops working on a platform migration. Extended
+# homogeneous coordinates so a verify is milliseconds rather than seconds.
+#
+# Verify only. There is no signing function in this file, and that is not an
+# oversight - there is nothing here that could be turned into a way for this
+# deployment to produce a peer's signature.
+# ----------------------------------------------------------------------
+
+_P = 2 ** 255 - 19
+_L = 2 ** 252 + 27742317777372353535851937790883648493
+_D = -121665 * pow(121666, _P - 2, _P) % _P
+_I = pow(2, (_P - 1) // 4, _P)
+
+
+def _xrecover(y):
+    xx = (y * y - 1) * pow(_D * y * y + 1, _P - 2, _P)
+    x = pow(xx, (_P + 3) // 8, _P)
+    if (x * x - xx) % _P != 0:
+        x = (x * _I) % _P
+    if x % 2 != 0:
+        x = _P - x
+    return x
+
+
+_BY = 4 * pow(5, _P - 2, _P) % _P
+_BX = _xrecover(_BY)
+_B = (_BX % _P, _BY % _P, 1, _BX * _BY % _P)
+
+
+def _add(p, q):
+    x1, y1, z1, t1 = p
+    x2, y2, z2, t2 = q
+    a = (y1 - x1) * (y2 - x2) % _P
+    b = (y1 + x1) * (y2 + x2) % _P
+    c = t1 * 2 * _D * t2 % _P
+    dd = z1 * 2 * z2 % _P
+    e = b - a
+    f = dd - c
+    g = dd + c
+    h = b + a
+    return (e * f % _P, g * h % _P, f * g % _P, e * h % _P)
+
+
+def _double(p):
+    return _add(p, p)
+
+
+def _scalarmult(p, e):
+    if e == 0:
+        return (0, 1, 1, 0)
+    q = _scalarmult(p, e >> 1)
+    q = _double(q)
+    if e & 1:
+        q = _add(q, p)
+    return q
+
+
+def _decodepoint(raw):
+    y = int.from_bytes(raw, "little") & ((1 << 255) - 1)
+    if y >= _P:
+        return None
+    x = _xrecover(y)
+    if x & 1 != (raw[31] >> 7) & 1:
+        x = _P - x
+    point = (x, y, 1, x * y % _P)
+    # on-curve check: -x^2 + y^2 = 1 + d x^2 y^2
+    if (-x * x + y * y - 1 - _D * x * x * y * y) % _P != 0:
+        return None
+    return point
+
+
+def _equal(p, q):
+    x1, y1, z1, _t1 = p
+    x2, y2, z2, _t2 = q
+    if (x1 * z2 - x2 * z1) % _P != 0:
+        return False
+    if (y1 * z2 - y2 * z1) % _P != 0:
+        return False
+    return True
+
+
+def ed25519_verify(public_key, message, signature):
+    """True if signature is a valid Ed25519 signature of message under
+    public_key. Bytes in, bool out, never raises."""
+    try:
+        if len(public_key) != 32 or len(signature) != 64:
+            return False
+        a = _decodepoint(public_key)
+        if a is None:
+            return False
+        r_raw = signature[:32]
+        r = _decodepoint(r_raw)
+        if r is None:
+            return False
+        s = int.from_bytes(signature[32:], "little")
+        if s >= _L:
+            return False
+        h = int.from_bytes(
+            hashlib.sha512(r_raw + public_key + message).digest(), "little") % _L
+        left = _scalarmult(_B, s)
+        right = _add(r, _scalarmult(a, h))
+        return _equal(left, right)
+    except Exception:
+        return False
+
+
+# ----------------------------------------------------------------------
+# storage
+# ----------------------------------------------------------------------
+
+def _setup(ctx):
+    global _ready
+    if _ready:
+        return
+    with ctx["lock"]:
+        c = ctx["conn"]
+        c.execute("CREATE TABLE IF NOT EXISTS signed_keys("
+                  "peer TEXT PRIMARY KEY,pubkey TEXT,enrolled REAL,"
+                  "audit_hash TEXT,block_index INTEGER,"
+                  "rotations INTEGER DEFAULT 0,last_ts REAL,note TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS signed_log("
+                  "id INTEGER PRIMARY KEY AUTOINCREMENT,peer TEXT,tip TEXT,"
+                  "peer_ts REAL,observed REAL,signature TEXT,pubkey TEXT,"
+                  "audit_hash TEXT,block_index INTEGER)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_sig_peer ON signed_log(peer,id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_sig_tip ON signed_log(tip)")
+        c.commit()
+    _ready = True
+
+
+def _iso(ts):
+    if not ts:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+def _peer_name(data):
+    return str(data.get("chain") or data.get("peer") or "").strip().lower()
+
+
+def _key_row(ctx, peer):
+    with ctx["lock"]:
+        return ctx["conn"].execute(
+            "SELECT pubkey,enrolled,audit_hash,block_index,rotations,last_ts "
+            "FROM signed_keys WHERE peer=?", (peer,)).fetchone()
+
+
+def _seen_in_open_lane(ctx, peer):
+    """Has this name already appeared in the open witness log?
+
+    An enrolment over a name somebody else has been using is the same shape as
+    the url squat, and gets the same treatment: we cannot prevent it, so we
+    record it permanently at the moment it happens.
+    """
+    try:
+        with ctx["lock"]:
+            row = ctx["conn"].execute(
+                "SELECT COUNT(*) FROM witness_log WHERE peer=?", (peer,)).fetchone()
+        return int(row[0]) if row else 0
+    except Exception:
+        return 0
+
+
+def _check_ts(ts, last_ts):
+    now = time.time()
+    if ts > now + SKEW_FUTURE:
+        return False, ("timestamp is %d seconds in the future; limit is %d"
+                       % (int(ts - now), SKEW_FUTURE))
+    if ts < now - SKEW_PAST:
+        return False, ("timestamp is %d seconds old; limit is %d"
+                       % (int(now - ts), SKEW_PAST))
+    if last_ts is not None and ts <= last_ts:
+        return False, ("timestamp %d is not later than the last one accepted "
+                       "for this name (%d) - a signature cannot be replayed "
+                       "and submissions must move forward"
+                       % (int(ts), int(last_ts)))
+    return True, None
+
+
+# ----------------------------------------------------------------------
+# routes
+# ----------------------------------------------------------------------
+
+def _enroll(ctx, data):
+    peer = _peer_name(data)
+    if not peer or len(peer) > 80:
+        return {"error": "chain_required",
+                "message": "A short stable identifier - a domain works well."}, 400
+    pubkey = str(data.get("pubkey") or data.get("public_key") or "").strip().lower()
+    if not HEX64.match(pubkey):
+        return {"error": "invalid_pubkey",
+                "message": "An Ed25519 public key is 32 bytes - 64 lowercase "
+                           "hex characters. Send the public half only. Never "
+                           "send us a private key; we have no use for one and "
+                           "no route that accepts one."}, 400
+    if _decodepoint(bytes.fromhex(pubkey)) is None:
+        return {"error": "invalid_pubkey",
+                "message": "That value is 64 hex characters but is not a "
+                           "point on the curve, so it is not an Ed25519 "
+                           "public key."}, 400
+
+    existing = _key_row(ctx, peer)
+    if existing:
+        if existing[0] == pubkey:
+            return {"already_enrolled": True, "chain": peer, "pubkey": pubkey,
+                    "enrolled_at": _iso(existing[1]),
+                    "block_index": existing[3],
+                    "message": "This name is already bound to this key. "
+                               "Nothing changed."}, 200
+        return {"error": "name_already_enrolled", "chain": peer,
+                "enrolled_pubkey": existing[0],
+                "enrolled_at": _iso(existing[1]),
+                "message": "This name is bound to a different key. We do not "
+                           "overwrite a binding. If you hold the enrolled "
+                           "private key, use /x/signed/rotate. If you do not, "
+                           "this name is not available to you and this "
+                           "attempt is not sealed."}, 409
+
+    prior = _seen_in_open_lane(ctx, peer)
+    ts = time.time()
+    note = "enrolled"
+    if prior:
+        note = ("WARNING: this name had already been submitted %d time(s) to "
+                "the open witness lane before this key was enrolled, so it "
+                "was not a fresh name when it was claimed" % prior)
+
+    ev = {"user_id": "sig:" + peer, "action": "signed_key_enrolled", "amount": 0,
+          "country": "UK", "device_id": "signed", "anomaly": 0, "device_risk": 0}
+    res = {"decision": "KEY_ENROLLED", "score": 0, "signed_version": VERSION,
+           "peer": peer, "pubkey": pubkey, "timestamp": ts, "detail": note}
+    h, idx, _seq = ctx["seal"](ev, res, ts, "public-signed")
+
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "INSERT INTO signed_keys(peer,pubkey,enrolled,audit_hash,"
+            "block_index,rotations,last_ts,note) VALUES(?,?,?,?,?,0,NULL,?)",
+            (peer, pubkey, ts, h, idx, note))
+        ctx["conn"].commit()
+
+    out = {"enrolled": True, "chain": peer, "pubkey": pubkey,
+           "enrolled_at": _iso(ts), "sealed_in_our_chain": h,
+           "block_index": idx, "signed_version": VERSION,
+           "message": MESSAGES["enrolled"],
+           "canonical_message": _canonical_help(peer),
+           "submit": "/x/signed/submit"}
+    if prior:
+        out["flag"] = note
+    return out, 200
+
+
+def _canonical_help(peer):
+    return {"format": MSG_PREFIX + "\\n<chain>\\n<tip>\\n<ts>",
+            "example_for_this_name": MSG_PREFIX + "\\n" + peer +
+                                     "\\n<64 hex tip>\\n<integer epoch seconds>",
+            "encoding": "UTF-8, no trailing newline, lines joined with a "
+                        "single \\n",
+            "signature": "Ed25519 over those bytes, sent as 128 lowercase hex"}
+
+
+def _submit(ctx, data):
+    peer = _peer_name(data)
+    if not peer:
+        return {"error": "chain_required"}, 400
+    row = _key_row(ctx, peer)
+    if not row:
+        return {"error": "not_enrolled", "chain": peer,
+                "message": "No public key is enrolled for this name. Enrol at "
+                           "/x/signed/enroll, or use the open lane at "
+                           "/x/witness/observe which needs nothing."}, 404
+    pubkey, _enrolled, _h, _idx, _rot, last_ts = row
+
+    tip = str(data.get("tip", "")).strip().lower()
+    if not HEX64.match(tip):
+        return {"error": "invalid_tip",
+                "message": "A tip is 64 hex characters - a SHA-256 chain head."}, 400
+    signature = str(data.get("signature") or data.get("sig") or "").strip().lower()
+    if not HEX128.match(signature):
+        return {"error": "invalid_signature_format",
+                "message": "An Ed25519 signature is 64 bytes - 128 lowercase "
+                           "hex characters."}, 400
+    raw_ts = data.get("ts", data.get("peer_ts"))
+    try:
+        ts_int = int(raw_ts)
+    except (TypeError, ValueError):
+        return {"error": "invalid_ts",
+                "message": "ts must be integer epoch seconds, and must be the "
+                           "same value you signed."}, 400
+
+    ok, why = _check_ts(ts_int, last_ts)
+    if not ok:
+        return {"error": "timestamp_rejected", "message": why,
+                "our_time": int(time.time())}, 400
+
+    with ctx["lock"]:
+        dup = ctx["conn"].execute(
+            "SELECT observed FROM signed_log WHERE peer=? AND signature=? LIMIT 1",
+            (peer, signature)).fetchone()
+    if dup:
+        return {"error": "replayed_signature",
+                "message": "This exact signature was already accepted at %s."
+                           % _iso(dup[0])}, 409
+
+    message = "\n".join([MSG_PREFIX, peer, tip, str(ts_int)]).encode("utf-8")
+    if not ed25519_verify(bytes.fromhex(pubkey), message, bytes.fromhex(signature)):
+        return {"error": "signature_did_not_verify",
+                "chain": peer,
+                "message": "Nothing has been sealed. The signature does not "
+                           "verify against the key enrolled for this name. "
+                           "The usual cause is a canonical message built "
+                           "differently - check it byte for byte below.",
+                "we_verified_against": _canonical_help(peer),
+                "the_exact_bytes_we_hashed":
+                    "\n".join([MSG_PREFIX, peer, tip, str(ts_int)]),
+                "enrolled_pubkey": pubkey}, 400
+
+    observed = time.time()
+    detail = ("peer=" + peer + ";tip=" + tip + ";ts=" + str(ts_int) +
+              ";pubkey=" + pubkey + ";sig=" + signature)
+    ev = {"user_id": "sig:" + peer, "action": "signed_tip_observed", "amount": 0,
+          "country": "UK", "device_id": "signed", "anomaly": 0, "device_risk": 0}
+    res = {"decision": "SIGNED_TIP_SEALED", "score": 0, "signed_version": VERSION,
+           "peer": peer, "peer_tip": tip, "timestamp": observed,
+           "verification": "peer-signed", "detail": detail}
+    h, idx, seq = ctx["seal"](ev, res, observed, "public-signed")
+
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "INSERT INTO signed_log(peer,tip,peer_ts,observed,signature,"
+            "pubkey,audit_hash,block_index) VALUES(?,?,?,?,?,?,?,?)",
+            (peer, tip, float(ts_int), observed, signature, pubkey, h, idx))
+        ctx["conn"].execute("UPDATE signed_keys SET last_ts=? WHERE peer=?",
+                            (float(ts_int), peer))
+        ctx["conn"].commit()
+
+    # Mirror into the open witness log so the peer appears on the public
+    # roster alongside everyone else. Guarded: the roster is a convenience
+    # and the seal above is the evidence, so a failure here must not turn a
+    # good submission into an error.
+    mirrored = False
+    try:
+        with ctx["lock"]:
+            ctx["conn"].execute(
+                "INSERT INTO witness_log(api_key,peer,tip,peer_ts,observed,"
+                "audit_hash,block_index,note,url,liveness,name_status) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                ("public-signed", peer, tip, float(ts_int), observed, h, idx,
+                 "signed submission - verified against enrolled Ed25519 key",
+                 None, "peer-signed", "key-bound"))
+            ctx["conn"].commit()
+        mirrored = True
+    except Exception:
+        pass
+
+    return {"chain": peer, "witnessed_tip": tip, "observed_at": _iso(observed),
+            "peer_claimed_time": _iso(ts_int),
+            "sealed_in_our_chain": h, "block_index": idx, "receipt_seq": seq,
+            "verification": "peer-signed",
+            "verified_against_pubkey": pubkey,
+            "on_public_roster": mirrored,
+            "signed_version": VERSION,
+            "verify": "/x/signed/verify?peer=" + peer + "&tip=" + tip,
+            "what_this_proves": MESSAGES["what_this_proves"],
+            "what_this_does_not_prove": MESSAGES["what_this_does_not_prove"]}, 200
+
+
+def _rotate(ctx, data):
+    peer = _peer_name(data)
+    row = _key_row(ctx, peer)
+    if not row:
+        return {"error": "not_enrolled", "chain": peer}, 404
+    current, _enrolled, _h, _idx, rotations, last_ts = row
+
+    new_pubkey = str(data.get("new_pubkey") or data.get("pubkey") or "").strip().lower()
+    if not HEX64.match(new_pubkey) or _decodepoint(bytes.fromhex(new_pubkey)) is None:
+        return {"error": "invalid_pubkey",
+                "message": "new_pubkey must be an Ed25519 public key - 64 "
+                           "lowercase hex characters."}, 400
+    if new_pubkey == current:
+        return {"error": "no_change",
+                "message": "That is already the enrolled key."}, 400
+    signature = str(data.get("signature") or data.get("sig") or "").strip().lower()
+    if not HEX128.match(signature):
+        return {"error": "invalid_signature_format"}, 400
+    try:
+        ts_int = int(data.get("ts"))
+    except (TypeError, ValueError):
+        return {"error": "invalid_ts"}, 400
+    ok, why = _check_ts(ts_int, last_ts)
+    if not ok:
+        return {"error": "timestamp_rejected", "message": why,
+                "our_time": int(time.time())}, 400
+
+    message = "\n".join([ROTATE_PREFIX, peer, new_pubkey, str(ts_int)]).encode("utf-8")
+    if not ed25519_verify(bytes.fromhex(current), message, bytes.fromhex(signature)):
+        return {"error": "signature_did_not_verify",
+                "message": "Nothing has been changed. A rotation must be "
+                           "signed by the key being replaced. This is what "
+                           "stops anyone - including the operator of this "
+                           "deployment - swapping a peer's key.",
+                "we_verified_against": {
+                    "format": ROTATE_PREFIX + "\\n<chain>\\n<new pubkey>\\n<ts>",
+                    "the_exact_bytes_we_hashed":
+                        "\n".join([ROTATE_PREFIX, peer, new_pubkey,
+                                   str(ts_int)])},
+                "signed_by_key_expected": current}, 400
+
+    ts = time.time()
+    ev = {"user_id": "sig:" + peer, "action": "signed_key_rotated", "amount": 0,
+          "country": "UK", "device_id": "signed", "anomaly": 0, "device_risk": 0}
+    res = {"decision": "KEY_ROTATED", "score": 0, "signed_version": VERSION,
+           "peer": peer, "timestamp": ts,
+           "detail": "from=" + current + ";to=" + new_pubkey +
+                     ";authorised_by=" + current}
+    h, idx, _seq = ctx["seal"](ev, res, ts, "public-signed")
+
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "UPDATE signed_keys SET pubkey=?,rotations=?,last_ts=? WHERE peer=?",
+            (new_pubkey, (rotations or 0) + 1, float(ts_int), peer))
+        ctx["conn"].commit()
+
+    return {"rotated": True, "chain": peer, "previous_pubkey": current,
+            "pubkey": new_pubkey, "rotations": (rotations or 0) + 1,
+            "sealed_in_our_chain": h, "block_index": idx,
+            "signed_version": VERSION,
+            "message": "Rotation sealed. Both keys are permanently in the "
+                       "chain, so the history of this name's keys is public "
+                       "and cannot be tidied up later."}, 200
+
+
+def _keys(ctx):
+    with ctx["lock"]:
+        rows = ctx["conn"].execute(
+            "SELECT peer,pubkey,enrolled,block_index,rotations,note "
+            "FROM signed_keys ORDER BY enrolled ASC LIMIT ?", (MAX_LIST,)).fetchall()
+    out = []
+    for peer, pubkey, enrolled, idx, rotations, note in rows:
+        entry = {"chain": peer, "pubkey": pubkey, "algorithm": "ed25519",
+                 "enrolled_at": _iso(enrolled), "enrolment_block": idx,
+                 "rotations": rotations or 0}
+        if note and note.startswith("WARNING"):
+            entry["flag"] = note
+        out.append(entry)
+    return {"count": len(out), "keys": out, "signed_version": VERSION,
+            "note": MESSAGES["keys_note"],
+            "how_to_check_a_record": (
+                "Take the pubkey from here, rebuild the canonical message "
+                "from the record at /x/signed/verify, and check the signature "
+                "with any Ed25519 implementation. You do not need anything "
+                "from us to do it and you do not have to believe us.")}, 200
+
+
+def _verify(ctx, data):
+    peer = str(data.get("peer", "")).strip().lower()
+    tip = str(data.get("tip", "")).strip().lower()
+    if not peer or not tip:
+        return {"error": "peer_and_tip_required",
+                "usage": "/x/signed/verify?peer=<name>&tip=<64 hex>"}, 400
+    with ctx["lock"]:
+        rows = ctx["conn"].execute(
+            "SELECT observed,peer_ts,signature,pubkey,audit_hash,block_index "
+            "FROM signed_log WHERE peer=? AND tip=? ORDER BY id ASC",
+            (peer, tip)).fetchall()
+    if not rows:
+        return {"signed_observation": False, "peer": peer, "tip": tip,
+                "message": "We hold no signed observation of this tip from "
+                           "this name. It may still be in the open lane - "
+                           "check /x/witness/attest."}, 404
+    observed, peer_ts, signature, pubkey, h, idx = rows[0]
+    ts_int = int(peer_ts)
+    return {"signed_observation": True, "chain": peer, "tip": tip,
+            "observed_at": _iso(observed), "peer_claimed_time": _iso(peer_ts),
+            "sealed_in_our_chain": h, "block_index": idx,
+            "times_observed": len(rows),
+            "signature": signature, "pubkey": pubkey, "algorithm": "ed25519",
+            "canonical_message": "\n".join([MSG_PREFIX, peer, tip, str(ts_int)]),
+            "canonical_message_bytes_note": (
+                "Those four lines joined by a single newline, UTF-8, no "
+                "trailing newline. Hash nothing yourself - Ed25519 takes the "
+                "message, not a digest of it."),
+            "signed_version": VERSION,
+            "what_this_proves": MESSAGES["what_this_proves"],
+            "what_this_does_not_prove": MESSAGES["what_this_does_not_prove"],
+            "recheck_it_yourself": (
+                "python: pip install pynacl, then "
+                "nacl.signing.VerifyKey(bytes.fromhex(pubkey))"
+                ".verify(canonical_message.encode(), bytes.fromhex(signature))")}, 200
+
+
+def _spec():
+    return {"signed_version": VERSION,
+            "what_this_lane_is": (
+                "Submissions signed by a key this deployment does not hold. "
+                "The open lane at /x/witness/observe proves somebody handed "
+                "us a tip. This lane proves the holder of a specific private "
+                "key did - including against us, because we only ever hold "
+                "the public half."),
+            "why_it_exists": (
+                "The HMAC lane binds a name to a shared secret, and a shared "
+                "secret is held by both parties. It closes third-party "
+                "submission under your name and does not close operator "
+                "submission under your name. This lane closes both, and it "
+                "does so by arithmetic rather than by our promise."),
+            "steps": [
+                "1. Generate an Ed25519 keypair. Keep the private half. It "
+                "never leaves your side and we have no route that accepts one.",
+                "2. POST /x/signed/enroll with {\"chain\":\"<name>\","
+                "\"pubkey\":\"<64 hex>\"}.",
+                "3. Build the canonical message, sign it, and POST "
+                "/x/signed/submit with {\"chain\",\"tip\",\"ts\",\"signature\"}.",
+                "4. GET /x/signed/verify?peer=&tip= for the receipt, which "
+                "carries everything a third party needs to recheck it "
+                "without us.",
+            ],
+            "canonical_message": {
+                "submit": MSG_PREFIX + "\\n<chain>\\n<tip>\\n<ts>",
+                "rotate": ROTATE_PREFIX + "\\n<chain>\\n<new pubkey>\\n<ts>",
+                "encoding": "UTF-8, single \\n between lines, no trailing "
+                            "newline. ts is integer epoch seconds.",
+            },
+            "replay_controls": {
+                "max_age_seconds": SKEW_PAST,
+                "max_future_seconds": SKEW_FUTURE,
+                "monotonic": "ts must be strictly greater than the last ts "
+                             "accepted for the name",
+                "duplicate_signatures": "refused",
+            },
+            "this_lane_rejects": (
+                "Unlike the open lane, a submission that does not verify is "
+                "refused and nothing is sealed. Writing an unverifiable "
+                "signature into a name's history is the harm, not the "
+                "protection."),
+            "key_rotation": (
+                "A rotation must be signed by the key being replaced. Nobody "
+                "who lacks the current private key can rotate it, this "
+                "deployment included, and every rotation is sealed with both "
+                "keys recorded."),
+            "honest_limits": [
+                "Does not prove the records behind the tip are true.",
+                "Does not prove the chain is complete. Catching an omission "
+                "needs an audit protocol, not cryptography.",
+                "Does not prove who the keyholder is in the world - only that "
+                "the same party signed each time.",
+                "Enrolment is open, so the first party to enrol a name gets "
+                "it. An enrolment over a name already seen in the open lane "
+                "is flagged permanently, which is detection and not "
+                "prevention.",
+            ],
+            "what_this_proves": MESSAGES["what_this_proves"],
+            "what_this_does_not_prove": MESSAGES["what_this_does_not_prove"]}, 200
+
+
+def handle(method, action, data, api_key, ctx):
+    _setup(ctx)
+    if method == "POST":
+        if action == "enroll":
+            return _enroll(ctx, data)
+        if action == "submit":
+            return _submit(ctx, data)
+        if action == "rotate":
+            return _rotate(ctx, data)
+    else:
+        if action == "spec":
+            return _spec()
+        if action == "keys":
+            return _keys(ctx)
+        if action == "verify":
+            return _verify(ctx, data)
+    return {"error": "unknown_action", "action": action}, 404
+
+```
+
+
+## `modules/sortition.py`
+
+745 lines, 31288 bytes
+
+```python
+"""
+sortition.py - selection by lot. The operator stops choosing who gets audited.
+
+THE HOLE THIS FILLS
+-------------------
+Every system claiming human oversight reviews a sample of decisions. In
+every one of them, the operator picks the sample. So the sample proves
+nothing: you can review the easy ones, or the ones you already know are
+clean, and nobody outside can tell the difference. It is the softest spot
+in every Article 14 claim in the industry, and it has stayed soft because
+there was no alternative.
+
+There is one now. heartbeat.py seals a public beacon value on a cadence -
+a number nobody, including the operator, can know before its tick. That is
+a dice roll no one owns.
+
+THE THREE LOCKS, IN ORDER. THE ORDER IS THE WHOLE POINT.
+--------------------------------------------------------
+1. COMMIT THE POOL. Every record eligible for review in a period is
+   listed, hashed into one pool digest, and sealed. The pool is now fixed.
+2. WAIT FOR A TICK. The draw may only use a beacon value sealed AFTER the
+   pool commit. This module refuses otherwise. So the pool was fixed
+   before the dice existed, and cannot be edited once they do.
+3. DRAW. The beacon value deterministically ranks the pool. The lowest k
+   ranks are selected. Anyone can recompute it from public values.
+
+Break any one and the sample is choosable again. Enforced here, not
+promised.
+
+WHAT IT CATCHES
+---------------
+A selected record with no review sealed against it is a permanent, visible
+hole with a name on it. You cannot quietly skip an awkward case, because
+the case was chosen for you in public, and its absence is the evidence.
+
+Refusal is allowed and is not hidden - it is sealed as a refusal with a
+reason. An honest refusal on the record is worth more than a silent gap.
+
+THE SELECTION FUNCTION, PUBLISHED SO IT IS NOT OURS
+---------------------------------------------------
+  seed = SHA256("AILEASH-SORTITION-v1" | period | pool_digest | beacon_value)
+  rank(i) = SHA256(seed | ":" | record_hash_i)
+  selected = the k records with the lowest rank, ties by record hash
+
+No random number generator, no language-specific behaviour, no library.
+Ten lines in any language. A stranger recomputes it and either gets our
+list or catches us.
+
+WHAT THIS DOES NOT DO
+---------------------
+- It does not prove the reviews were any good. It proves nobody chose
+  which ones happened.
+- It does not stop an operator declining to draw at all. A period with no
+  draw is a period with no sample, and /outstanding says so.
+- Pool membership is asserted by this server. What stops a record being
+  left out of the pool is complete.py, which commits the period's record
+  count in advance - separate module, separate check.
+- Selection is uniform. Risk-weighted sampling is deliberately not offered:
+  a weighting the operator sets is a choice the operator made.
+
+Contract: handle(method, action, data, api_key, ctx) -> (dict, status)
+Routes:
+  GET  spec         public  what this is and the exact selection function
+  GET  draws        public  every draw ever made
+  GET  draw         public  ?id= - one draw, its beacon value, its selection
+  GET  verify       public  ?id= - recompute the draw from scratch, here
+  GET  outstanding  public  selected records with no review yet, and how late
+  GET  status       public  coverage, response rate, oldest unanswered
+  POST pool         keyed   commit the pool for a period
+  POST draw         keyed   draw a sample against a sealed beacon tick
+  POST review       keyed   record a review, or a refusal with a reason
+"""
+
+import json
+import time
+import hashlib
+
+VERSION = "1.0.0"
+
+PUBLIC = {
+    ("GET", "spec"),
+    ("GET", "draws"),
+    ("GET", "draw"),
+    ("GET", "verify"),
+    ("GET", "outstanding"),
+    ("GET", "status"),
+}
+
+DOMAIN_SEED = b"AILEASH-SORTITION-v1"
+DOMAIN_POOL = b"AILEASH-POOL-v1"
+
+DEFAULT_RATE = 0.05          # 5 percent
+MIN_SELECT = 1
+MAX_SELECT = 500
+MAX_POOL = 200000
+REVIEW_DUE_HOURS = 72
+
+DDL = [
+    """CREATE TABLE IF NOT EXISTS sortition_pool (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        period       TEXT NOT NULL,
+        pool_digest  TEXT NOT NULL,
+        pool_size    INTEGER NOT NULL,
+        members      TEXT NOT NULL,
+        committed_at REAL NOT NULL,
+        chain_rowid  INTEGER,
+        audit_hash   TEXT
+    )""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_sort_pool ON sortition_pool(period)",
+    """CREATE TABLE IF NOT EXISTS sortition_draw (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        period        TEXT NOT NULL,
+        pool_id       INTEGER NOT NULL,
+        pool_digest   TEXT NOT NULL,
+        pool_size     INTEGER NOT NULL,
+        rate          REAL NOT NULL,
+        select_count  INTEGER NOT NULL,
+        beacon_source TEXT,
+        beacon_round  INTEGER,
+        beacon_value  TEXT NOT NULL,
+        beacon_rowid  INTEGER,
+        seed          TEXT NOT NULL,
+        selected      TEXT NOT NULL,
+        drawn_at      REAL NOT NULL,
+        chain_rowid   INTEGER,
+        audit_hash    TEXT
+    )""",
+    """CREATE TABLE IF NOT EXISTS sortition_review (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        draw_id      INTEGER NOT NULL,
+        record_hash  TEXT NOT NULL,
+        outcome      TEXT NOT NULL,
+        reviewer     TEXT,
+        reason       TEXT,
+        recorded_at  REAL NOT NULL,
+        chain_rowid  INTEGER,
+        audit_hash   TEXT
+    )""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_sort_rev ON sortition_review(draw_id, record_hash)",
+]
+
+OUTCOMES = ("agreed", "disagreed", "escalated", "refused")
+
+VOCABULARY = {
+    "pool": "Every record eligible for review in a period, fixed and sealed before any dice exist.",
+    "draw": "The selection, computed from a beacon value that did not exist when the pool was sealed.",
+    "selected": "Chosen by the beacon, not by us. We could not have known which.",
+    "outstanding": "Selected and not yet answered. Visible, named, and counting.",
+    "refused": "Declined on the record with a reason. Not a gap - a decision that is now permanent.",
+    "gap": "Selected, past due, and never answered. The thing this module exists to make impossible to hide.",
+}
+
+WHAT_THIS_PROVES = (
+    "That nobody chose which records were reviewed. It does not prove the "
+    "reviews were competent, honest or useful. Those are different problems "
+    "and this module does not touch them."
+)
+
+
+# ---------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------
+
+def _ensure(conn, lock):
+    with lock:
+        cur = conn.cursor()
+        for stmt in DDL:
+            cur.execute(stmt)
+        conn.commit()
+
+
+def _cols(conn, table):
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(%s)" % table)
+    return [r[1] for r in cur.fetchall()]
+
+
+def _hash_col(conn):
+    c = _cols(conn, "audit_log")
+    for n in ("audit_hash", "hash", "block_hash"):
+        if n in c:
+            return n
+    return None
+
+
+def _ts_col(conn):
+    c = _cols(conn, "audit_log")
+    for n in ("ts", "timestamp", "created", "observed"):
+        if n in c:
+            return n
+    return None
+
+
+def _period_bounds(period):
+    """YYYY, YYYY-MM, YYYY-MM-DD -> (start_epoch, end_epoch) UTC."""
+    p = str(period).strip()
+    try:
+        if len(p) == 4:
+            s = time.strptime(p + "-01-01", "%Y-%m-%d")
+            e = time.strptime(str(int(p) + 1) + "-01-01", "%Y-%m-%d")
+        elif len(p) == 7:
+            s = time.strptime(p + "-01", "%Y-%m-%d")
+            y, m = int(p[:4]), int(p[5:7])
+            y2, m2 = (y + 1, 1) if m == 12 else (y, m + 1)
+            e = time.strptime("%04d-%02d-01" % (y2, m2), "%Y-%m-%d")
+        elif len(p) == 10:
+            s = time.strptime(p, "%Y-%m-%d")
+            e = time.gmtime(_cal(s) + 86400)
+        else:
+            return None
+    except ValueError:
+        return None
+    return _cal(s), _cal(e)
+
+
+def _cal(st):
+    import calendar
+    return calendar.timegm(st)
+
+
+def _iso(t):
+    if t is None:
+        return None
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+
+
+def _human(seconds):
+    if seconds is None:
+        return None
+    s = int(round(seconds))
+    if s < 60:
+        return "%d seconds" % s
+    if s < 3600:
+        return "%d minutes" % (s // 60)
+    if s < 86400:
+        return "%d hours %d minutes" % (s // 3600, (s % 3600) // 60)
+    return "%d days %d hours" % (s // 86400, (s % 86400) // 3600)
+
+
+def _pool_digest(members):
+    h = hashlib.sha256()
+    h.update(DOMAIN_POOL + b"\n")
+    for m in members:
+        h.update(m.encode() + b"\n")
+    return h.hexdigest()
+
+
+def _seed(period, pool_digest, beacon_value):
+    h = hashlib.sha256()
+    h.update(DOMAIN_SEED + b"|")
+    h.update(str(period).encode() + b"|")
+    h.update(pool_digest.encode() + b"|")
+    h.update(str(beacon_value).encode())
+    return h.hexdigest()
+
+
+def select(members, seed, k):
+    """The published selection function. Deterministic, no RNG."""
+    ranked = []
+    for m in members:
+        r = hashlib.sha256((seed + ":" + m).encode()).hexdigest()
+        ranked.append((r, m))
+    ranked.sort()
+    return [m for _, m in ranked[:k]]
+
+
+def _seal(ctx, event, result):
+    fn = ctx.get("seal")
+    payload = result if isinstance(result, str) else json.dumps(result, sort_keys=True)
+    try:
+        fn(event, payload)
+    except TypeError:
+        fn(event, result)
+
+
+def _backfill(conn, lock, table, rowid_field, pk):
+    hcol = _hash_col(conn)
+    with lock:
+        cur = conn.cursor()
+        cur.execute("SELECT MAX(rowid) FROM audit_log")
+        r = cur.fetchone()
+        rid = r[0] if r and r[0] is not None else None
+        h = None
+        if rid is not None and hcol:
+            cur.execute("SELECT %s FROM audit_log WHERE rowid=?" % hcol, (rid,))
+            r2 = cur.fetchone()
+            h = r2[0] if r2 else None
+        cur.execute("UPDATE %s SET chain_rowid=?, audit_hash=? WHERE id=?" % table,
+                    (rid, h, pk))
+        conn.commit()
+    return rid, h
+
+
+def _latest_beat_after(conn, rowid):
+    """The first heartbeat sealed strictly after a given chain row."""
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT source, beacon_round, value, chain_rowid, fetched_at"
+            " FROM heartbeat_tick WHERE chain_rowid IS NOT NULL AND chain_rowid>?"
+            " ORDER BY chain_rowid DESC LIMIT 1", (rowid,))
+        return cur.fetchone()
+    except Exception:
+        return None
+
+
+def _beats_available(conn):
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM heartbeat_tick")
+        return cur.fetchone()[0]
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------
+# handle
+# ---------------------------------------------------------------------
+
+def handle(method, action, data, api_key, ctx):
+    conn, lock = ctx["conn"], ctx["lock"]
+    _ensure(conn, lock)
+
+    if method == "GET" and action == "spec":
+        return _spec(), 200
+
+    # -------------------------------------------------- pool
+    if method == "POST" and action == "pool":
+        period = data.get("period")
+        bounds = _period_bounds(period) if period else None
+        if not bounds:
+            return {"error": "period_required",
+                    "formats": ["YYYY", "YYYY-MM", "YYYY-MM-DD"]}, 400
+        start, end = bounds
+        if end > time.time():
+            return {"error": "period_not_closed",
+                    "note": ("A pool can only be committed for a period that "
+                             "has ended. Committing a live period would let "
+                             "records arrive after the pool was fixed."),
+                    "period_ends": _iso(end)}, 409
+
+        hcol, tcol = _hash_col(conn), _ts_col(conn)
+        if not hcol or not tcol:
+            return {"error": "audit_log_schema_unrecognised"}, 500
+
+        cur = conn.cursor()
+        kind = data.get("event")
+        if kind:
+            cur.execute(
+                "SELECT %s FROM audit_log WHERE %s>=? AND %s<? AND event=?"
+                " ORDER BY rowid" % (hcol, tcol, tcol), (start, end, kind))
+        else:
+            cur.execute(
+                "SELECT %s FROM audit_log WHERE %s>=? AND %s<? ORDER BY rowid"
+                % (hcol, tcol, tcol), (start, end))
+        members = sorted({r[0] for r in cur.fetchall() if r[0]})
+        if not members:
+            return {"error": "empty_period", "period": period}, 404
+        if len(members) > MAX_POOL:
+            return {"error": "pool_too_large", "size": len(members),
+                    "max": MAX_POOL}, 413
+
+        digest = _pool_digest(members)
+        now = time.time()
+        with lock:
+            cur = conn.cursor()
+            cur.execute("SELECT id, pool_digest FROM sortition_pool WHERE period=?",
+                        (period,))
+            prior = cur.fetchone()
+            if prior:
+                return {"error": "pool_already_committed", "period": period,
+                        "pool_digest": prior[1],
+                        "note": "A pool commits once. That is what makes it a pool."}, 409
+            cur.execute(
+                "INSERT INTO sortition_pool (period, pool_digest, pool_size,"
+                " members, committed_at) VALUES (?,?,?,?,?)",
+                (period, digest, len(members), json.dumps(members), now))
+            pid = cur.lastrowid
+            conn.commit()
+
+        _seal(ctx, "sortition_pool", {
+            "period": period, "pool_digest": digest, "pool_size": len(members),
+            "event_filter": kind,
+            "note": ("Pool fixed. Any draw against it must use a beacon value "
+                     "sealed after this block."),
+        })
+        rid, h = _backfill(conn, lock, "sortition_pool", "chain_rowid", pid)
+
+        return {"pool_id": pid, "period": period, "pool_digest": digest,
+                "pool_size": len(members), "sealed_at_chain_rowid": rid,
+                "audit_hash": h,
+                "next": ("Wait for a heartbeat sealed after block %s, then "
+                         "POST /x/sortition/draw." % rid)}, 200
+
+    # -------------------------------------------------- draw
+    if method == "POST" and action == "draw":
+        period = data.get("period")
+        cur = conn.cursor()
+        cur.execute("SELECT id, pool_digest, pool_size, members, chain_rowid"
+                    " FROM sortition_pool WHERE period=?", (period,))
+        pool = cur.fetchone()
+        if not pool:
+            return {"error": "no_pool_for_period", "period": period,
+                    "next": "POST /x/sortition/pool first"}, 404
+        pid, digest, size, members_json, pool_rowid = pool
+
+        cur.execute("SELECT id FROM sortition_draw WHERE period=?", (period,))
+        if cur.fetchone():
+            return {"error": "already_drawn", "period": period,
+                    "note": "One draw per pool. A second draw is a second chance."}, 409
+
+        if pool_rowid is None:
+            return {"error": "pool_not_located_in_chain"}, 500
+
+        beat = _latest_beat_after(conn, pool_rowid)
+        if not beat:
+            n = _beats_available(conn)
+            return {"error": "no_beacon_since_pool_commit",
+                    "beats_in_system": n,
+                    "why": ("The draw must use a value that did not exist when "
+                            "the pool was sealed. Wait for the next heartbeat."),
+                    "check": "/x/heartbeat/latest"}, 409
+
+        b_source, b_round, b_value, b_rowid, b_at = beat
+        members = json.loads(members_json)
+
+        try:
+            rate = float(data.get("rate", DEFAULT_RATE))
+        except (TypeError, ValueError):
+            rate = DEFAULT_RATE
+        rate = max(0.0001, min(1.0, rate))
+        k = int(round(size * rate))
+        k = max(MIN_SELECT, min(k, MAX_SELECT, size))
+
+        seed = _seed(period, digest, b_value)
+        chosen = select(members, seed, k)
+        now = time.time()
+
+        with lock:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO sortition_draw (period, pool_id, pool_digest,"
+                " pool_size, rate, select_count, beacon_source, beacon_round,"
+                " beacon_value, beacon_rowid, seed, selected, drawn_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (period, pid, digest, size, rate, k, b_source, b_round,
+                 b_value, b_rowid, seed, json.dumps(chosen), now))
+            did = cur.lastrowid
+            conn.commit()
+
+        _seal(ctx, "sortition_draw", {
+            "draw_id": did, "period": period, "pool_digest": digest,
+            "pool_size": size, "rate": rate, "selected_count": k,
+            "beacon": {"source": b_source, "round": b_round, "value": b_value,
+                       "sealed_at_block": b_rowid},
+            "seed": seed, "selected": chosen,
+            "note": ("Selection is recomputable by anyone from pool_digest and "
+                     "the beacon value. See /x/sortition/spec."),
+        })
+        rid, h = _backfill(conn, lock, "sortition_draw", "chain_rowid", did)
+
+        return {"draw_id": did, "period": period, "pool_size": size,
+                "rate": rate, "selected_count": k, "selected": chosen,
+                "beacon": {"source": b_source, "round": b_round,
+                           "value": b_value, "sealed_at_block": b_rowid,
+                           "sealed_at": _iso(b_at)},
+                "seed": seed, "sealed_at_chain_rowid": rid, "audit_hash": h,
+                "review_due": _iso(now + REVIEW_DUE_HOURS * 3600),
+                "recompute_this_yourself": "/x/sortition/verify?id=%d" % did}, 200
+
+    # -------------------------------------------------- review
+    if method == "POST" and action == "review":
+        did = data.get("draw_id")
+        rec = data.get("record")
+        outcome = str(data.get("outcome", "")).lower()
+        if not did or not rec:
+            return {"error": "draw_id_and_record_required"}, 400
+        if outcome not in OUTCOMES:
+            return {"error": "outcome_invalid", "allowed": list(OUTCOMES)}, 400
+        if outcome == "refused" and not data.get("reason"):
+            return {"error": "reason_required_to_refuse",
+                    "why": ("A refusal without a reason is a gap wearing a "
+                            "label. The reason is sealed and permanent.")}, 400
+
+        cur = conn.cursor()
+        cur.execute("SELECT selected FROM sortition_draw WHERE id=?", (did,))
+        row = cur.fetchone()
+        if not row:
+            return {"error": "unknown_draw", "draw_id": did}, 404
+        if rec not in json.loads(row[0]):
+            return {"error": "record_not_selected",
+                    "note": ("Reviews can only be filed against records the "
+                             "beacon chose. Volunteering extra reviews does "
+                             "not count toward the sample.")}, 409
+
+        now = time.time()
+        with lock:
+            cur = conn.cursor()
+            cur.execute("SELECT id FROM sortition_review WHERE draw_id=? AND record_hash=?",
+                        (did, rec))
+            if cur.fetchone():
+                return {"error": "already_reviewed",
+                        "note": "A review is filed once and cannot be replaced."}, 409
+            cur.execute(
+                "INSERT INTO sortition_review (draw_id, record_hash, outcome,"
+                " reviewer, reason, recorded_at) VALUES (?,?,?,?,?,?)",
+                (did, rec, outcome, data.get("reviewer"), data.get("reason"), now))
+            rvid = cur.lastrowid
+            conn.commit()
+
+        _seal(ctx, "sortition_review", {
+            "draw_id": did, "record": rec, "outcome": outcome,
+            "reviewer": data.get("reviewer"), "reason": data.get("reason"),
+        })
+        rid, h = _backfill(conn, lock, "sortition_review", "chain_rowid", rvid)
+        return {"recorded": True, "review_id": rvid, "outcome": outcome,
+                "sealed_at_chain_rowid": rid, "audit_hash": h}, 200
+
+    # -------------------------------------------------- draws
+    if method == "GET" and action == "draws":
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, period, pool_size, rate, select_count, beacon_source,"
+            " beacon_round, drawn_at, audit_hash FROM sortition_draw"
+            " ORDER BY id DESC LIMIT 100")
+        out = []
+        for r in cur.fetchall():
+            cur2 = conn.cursor()
+            cur2.execute("SELECT COUNT(*) FROM sortition_review WHERE draw_id=?", (r[0],))
+            done = cur2.fetchone()[0]
+            out.append({"draw_id": r[0], "period": r[1], "pool_size": r[2],
+                        "rate": r[3], "selected": r[4], "reviewed": done,
+                        "outstanding": r[4] - done,
+                        "beacon": {"source": r[5], "round": r[6]},
+                        "drawn_at": _iso(r[7]), "audit_hash": r[8]})
+        return {"count": len(out), "draws": out, "vocabulary": VOCABULARY}, 200
+
+    # -------------------------------------------------- one draw
+    if method == "GET" and action == "draw":
+        did = data.get("id")
+        if not did:
+            return {"error": "id_required"}, 400
+        d = _draw_row(conn, did)
+        if not d:
+            return {"error": "unknown_draw"}, 404
+        cur = conn.cursor()
+        cur.execute("SELECT record_hash, outcome, reviewer, reason, recorded_at"
+                    " FROM sortition_review WHERE draw_id=?", (did,))
+        revs = {r[0]: {"outcome": r[1], "reviewer": r[2], "reason": r[3],
+                       "at": _iso(r[4])} for r in cur.fetchall()}
+        items = []
+        for m in json.loads(d["selected_json"]):
+            items.append({"record": m, "review": revs.get(m),
+                          "state": "answered" if m in revs else "outstanding"})
+        return {"draw_id": did, "period": d["period"],
+                "pool_digest": d["pool_digest"], "pool_size": d["pool_size"],
+                "rate": d["rate"], "selected_count": d["select_count"],
+                "beacon": {"source": d["beacon_source"], "round": d["beacon_round"],
+                           "value": d["beacon_value"],
+                           "sealed_at_block": d["beacon_rowid"]},
+                "seed": d["seed"], "drawn_at": _iso(d["drawn_at"]),
+                "items": items,
+                "what_this_proves": WHAT_THIS_PROVES,
+                "recompute": "/x/sortition/verify?id=%s" % did}, 200
+
+    # -------------------------------------------------- verify
+    if method == "GET" and action == "verify":
+        did = data.get("id")
+        if not did:
+            return {"error": "id_required"}, 400
+        d = _draw_row(conn, did)
+        if not d:
+            return {"error": "unknown_draw"}, 404
+        cur = conn.cursor()
+        cur.execute("SELECT members FROM sortition_pool WHERE id=?", (d["pool_id"],))
+        row = cur.fetchone()
+        members = json.loads(row[0]) if row else []
+        recomputed_digest = _pool_digest(members)
+        recomputed_seed = _seed(d["period"], d["pool_digest"], d["beacon_value"])
+        recomputed = select(members, recomputed_seed, d["select_count"])
+        stored = json.loads(d["selected_json"])
+        ok = (recomputed_digest == d["pool_digest"]
+              and recomputed_seed == d["seed"]
+              and sorted(recomputed) == sorted(stored))
+        return {
+            "draw_id": did,
+            "matches": ok,
+            "pool_digest_recomputed": recomputed_digest,
+            "pool_digest_sealed": d["pool_digest"],
+            "seed_recomputed": recomputed_seed,
+            "seed_sealed": d["seed"],
+            "selection_matches": sorted(recomputed) == sorted(stored),
+            "beacon_value": d["beacon_value"],
+            "beacon_check": ("Confirm this value independently at "
+                             "/x/heartbeat/verify?round=%s, then at the beacon "
+                             "operator's own endpoint." % d["beacon_round"]),
+            "do_it_without_us": {
+                "seed": 'SHA256("AILEASH-SORTITION-v1|" + period + "|" + pool_digest + "|" + beacon_value)',
+                "rank": 'SHA256(seed + ":" + record_hash)',
+                "select": "lowest k ranks, ascending",
+                "note": ("This route runs the same function on our server, so "
+                         "it is a convenience, not the proof. The proof is you "
+                         "running those three lines yourself."),
+            },
+        }, 200
+
+    # -------------------------------------------------- outstanding
+    if method == "GET" and action == "outstanding":
+        now = time.time()
+        cur = conn.cursor()
+        cur.execute("SELECT id, period, selected, drawn_at FROM sortition_draw"
+                    " ORDER BY id DESC")
+        items = []
+        for did, period, sel, drawn in cur.fetchall():
+            cur2 = conn.cursor()
+            cur2.execute("SELECT record_hash FROM sortition_review WHERE draw_id=?", (did,))
+            done = {r[0] for r in cur2.fetchall()}
+            due = drawn + REVIEW_DUE_HOURS * 3600
+            for m in json.loads(sel):
+                if m in done:
+                    continue
+                items.append({
+                    "draw_id": did, "period": period, "record": m,
+                    "drawn_at": _iso(drawn), "due": _iso(due),
+                    "state": "gap" if now > due else "outstanding",
+                    "late_by": _human(now - due) if now > due else None,
+                })
+        gaps = [i for i in items if i["state"] == "gap"]
+        return {"outstanding_count": len(items), "gap_count": len(gaps),
+                "due_after_hours": REVIEW_DUE_HOURS,
+                "items": items[:500],
+                "meaning": VOCABULARY["gap"]}, 200
+
+    # -------------------------------------------------- status
+    if method == "GET" and action == "status":
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*), SUM(select_count) FROM sortition_draw")
+        ndraws, nsel = cur.fetchone()
+        nsel = nsel or 0
+        cur.execute("SELECT COUNT(*) FROM sortition_review")
+        nrev = cur.fetchone()[0]
+        cur.execute("SELECT outcome, COUNT(*) FROM sortition_review GROUP BY outcome")
+        mix = {r[0]: r[1] for r in cur.fetchall()}
+        cur.execute("SELECT COUNT(*) FROM sortition_pool")
+        npool = cur.fetchone()[0]
+        beats = _beats_available(conn)
+        return {
+            "version": VERSION,
+            "pools_committed": npool,
+            "draws": ndraws,
+            "records_selected": nsel,
+            "reviews_recorded": nrev,
+            "response_rate": round(nrev / nsel, 4) if nsel else None,
+            "outcome_mix": mix,
+            "beacon_available": beats is not None,
+            "beats_in_system": beats,
+            "depends_on": {
+                "heartbeat": ("supplies the dice. Without a beacon sealed "
+                              "after the pool, no draw is possible."),
+                "complete": ("commits the period's record count in advance. "
+                             "Without it, a record could be kept out of the "
+                             "pool. Separate module, separate check: "
+                             "/x/complete/periods"),
+            },
+            "what_this_proves": WHAT_THIS_PROVES,
+        }, 200
+
+    return {"error": "unknown_action", "action": action,
+            "actions": ["spec", "draws", "draw", "verify", "outstanding",
+                        "status", "pool", "review"]}, 404
+
+
+def _draw_row(conn, did):
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, period, pool_id, pool_digest, pool_size, rate, select_count,"
+        " beacon_source, beacon_round, beacon_value, beacon_rowid, seed,"
+        " selected, drawn_at FROM sortition_draw WHERE id=?", (did,))
+    r = cur.fetchone()
+    if not r:
+        return None
+    keys = ["id", "period", "pool_id", "pool_digest", "pool_size", "rate",
+            "select_count", "beacon_source", "beacon_round", "beacon_value",
+            "beacon_rowid", "seed", "selected_json", "drawn_at"]
+    return dict(zip(keys, r))
+
+
+def _spec():
+    return {
+        "module": "sortition",
+        "version": VERSION,
+        "name_means": "selection by lot - the ancient method for stopping the powerful choosing who gets scrutinised",
+        "the_hole": (
+            "Every system claiming human oversight reviews a sample. In every "
+            "one, the operator picks the sample, so the sample proves nothing."
+        ),
+        "the_three_locks": [
+            "1. The pool of eligible records is fixed and sealed first.",
+            "2. The draw may only use a beacon value sealed AFTER the pool. "
+            "Refused otherwise. So the pool was fixed before the dice existed.",
+            "3. The beacon value ranks the pool. Lowest k are selected. "
+            "Anyone recomputes it from public values.",
+        ],
+        "selection_function": {
+            "seed": 'SHA256("AILEASH-SORTITION-v1|" + period + "|" + pool_digest + "|" + beacon_value)',
+            "rank": 'SHA256(seed + ":" + record_hash)',
+            "select": "the k lowest ranks in ascending order",
+            "why_no_rng": ("A random number generator is a library, a version "
+                           "and a seed we control. Two SHA-256 calls are none "
+                           "of those and run in any language."),
+        },
+        "uniform_only": (
+            "Risk-weighted sampling is deliberately not offered. A weighting "
+            "the operator sets is a choice the operator made, which is the "
+            "thing this module exists to remove."
+        ),
+        "refusal": (
+            "A reviewer may refuse a selected case, with a reason, sealed. "
+            "An honest refusal on the record beats a silent gap. A selection "
+            "left unanswered past the due window is published as a gap with "
+            "the record named."
+        ),
+        "vocabulary": VOCABULARY,
+        "what_this_proves": WHAT_THIS_PROVES,
+        "limits": [
+            "It does not prove the reviews were any good.",
+            "It does not force anyone to draw at all. A period with no draw "
+            "is a period with no sample and status says so.",
+            "Pool membership is asserted by this server; completeness of the "
+            "pool is complete.py's job, not this module's.",
+            "The beacon is a third party. If drand and Bitcoin both vanish, "
+            "new draws stop. Old draws stay verifiable.",
+        ],
+        "routes": {
+            "POST /x/sortition/pool": "keyed - commit the pool for a closed period",
+            "POST /x/sortition/draw": "keyed - draw against a beacon sealed after the pool",
+            "POST /x/sortition/review": "keyed - file a review or a refusal with a reason",
+            "GET /x/sortition/draws": "every draw",
+            "GET /x/sortition/draw?id=": "one draw and its answers",
+            "GET /x/sortition/verify?id=": "recompute the draw",
+            "GET /x/sortition/outstanding": "selected and unanswered, with gaps named",
+            "GET /x/sortition/status": "coverage and response rate",
+        },
+    }
 
 ```
