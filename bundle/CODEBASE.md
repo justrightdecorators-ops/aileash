@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-108 files across 22 parts.
+109 files across 23 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -30,54 +30,58 @@ Generated automatically on every push. Do not edit by hand.
 - `modules/demo.py`
 - `modules/dsr.py`
 - `modules/fingerprint.py`
-- `modules/lineage.py`
-- `modules/mutual.py`
+- `modules/heartbeat.py`
 
 ## [CODEBASE-06.md](CODEBASE-06.md)
 
+- `modules/lineage.py`
+- `modules/mutual.py`
 - `modules/network.py`
 - `modules/ots.py`
 - `modules/oversight.py`
-- `modules/pack.py`
-- `modules/packconsole.py`
 
 ## [CODEBASE-07.md](CODEBASE-07.md)
 
+- `modules/pack.py`
+- `modules/packconsole.py`
 - `modules/peer.py`
 - `modules/peerconsole.py`
 - `modules/publish.py`
-- `modules/reconcile.py`
 
 ## [CODEBASE-08.md](CODEBASE-08.md)
 
+- `modules/reconcile.py`
 - `modules/replay.py`
 - `modules/roster.py`
 - `modules/router.py`
 - `modules/rulebind.py`
-- `modules/savings.py`
 
 ## [CODEBASE-09.md](CODEBASE-09.md)
 
+- `modules/savings.py`
 - `modules/selfcheck.py`
+
+## [CODEBASE-10.md](CODEBASE-10.md)
+
 - `modules/signed.py`
 - `modules/spec.py`
 - `modules/standard.py`
 - `modules/stats.py`
-
-## [CODEBASE-10.md](CODEBASE-10.md)
-
 - `modules/verifier.py`
 - `modules/warmup.py`
-- `modules/witness.py`
-- `modules/witnessed.py`
-- `Verify_ai.py`
 
 ## [CODEBASE-11.md](CODEBASE-11.md)
 
+- `modules/witness.py`
+- `modules/witnessed.py`
+- `Verify_ai.py`
 - `ai_act_ranker.py`
 - `ai_safety_scanner.py`
 - `aigrade_insert.py`
 - `aileash_reporter.py`
+
+## [CODEBASE-12.md](CODEBASE-12.md)
+
 - `aileash_signed_client.py`
 - `aileash_verify.py`
 - `anchor.py`
@@ -85,19 +89,19 @@ Generated automatically on every push. Do not edit by hand.
 - `brain.py`
 - `broadcaster.py`
 - `build_sebbi_ecosystem.py`
-
-## [CODEBASE-12.md](CODEBASE-12.md)
-
 - `gateway_proxy.py`
 - `meshwitness.py`
-- `sebbi_orchestrator.py`
-- `sebbi_sdk.py`
-- `sebdog_engine.py`
 
 ## [CODEBASE-13.md](CODEBASE-13.md)
 
+- `sebbi_orchestrator.py`
+- `sebbi_sdk.py`
+- `sebdog_engine.py`
 - `sebdog_licence.py`
 - `sebdog_reporter.py`
+
+## [CODEBASE-14.md](CODEBASE-14.md)
+
 - `tests/attack_continuity_1.py`
 - `tests/attack_continuity_2.py`
 - `tests/attack_continuity_3.py`
@@ -105,43 +109,43 @@ Generated automatically on every push. Do not edit by hand.
 - `tests/attack_continuity_5.py`
 - `tests/attack_continuity_6.py`
 - `tests/attack_witnessed.py`
-
-## [CODEBASE-14.md](CODEBASE-14.md)
-
 - `verify_authority.py`
 - `AILeash-API-Reference-v6.4.2.md`
 - `LICENCE`
 - `README.md`
+
+## [CODEBASE-15.md](CODEBASE-15.md)
+
 - `admin.html`
 - `ai-standard.html`
 - `ai-txt-kit.html`
 - `aitxt-popup-live.html`
 - `brain.html`
-
-## [CODEBASE-15.md](CODEBASE-15.md)
-
 - `certificate.html`
+
+## [CODEBASE-16.md](CODEBASE-16.md)
+
 - `compliance-assistant.html`
 - `contact.html`
 - `copyright.txt`
 - `data-protection.html`
-
-## [CODEBASE-16.md](CODEBASE-16.md)
-
 - `developers.html`
 - `dis.txt`
 - `docs/evidential-undertaking.md`
+
+## [CODEBASE-17.md](CODEBASE-17.md)
+
 - `docs/spec/ai-txt.md`
 - `green.html`
 - `guardian-parent.html`
 - `human-oversight.html`
 - `identity.html`
 
-## [CODEBASE-17.md](CODEBASE-17.md)
+## [CODEBASE-18.md](CODEBASE-18.md)
 
 - `index.html`
 
-## [CODEBASE-18.md](CODEBASE-18.md)
+## [CODEBASE-19.md](CODEBASE-19.md)
 
 - `investor-prospectus.html`
 - `legal.txt`
@@ -153,13 +157,13 @@ Generated automatically on every push. Do not edit by hand.
 - `report-threat.html`
 - `requirements.txt`
 
-## [CODEBASE-19.md](CODEBASE-19.md)
+## [CODEBASE-20.md](CODEBASE-20.md)
 
 - `reseller.html`
 - `risk-policy.html`
 - `robots.txt`
 
-## [CODEBASE-20.md](CODEBASE-20.md)
+## [CODEBASE-21.md](CODEBASE-21.md)
 
 - `scan.html`
 - `seal.html`
@@ -167,12 +171,12 @@ Generated automatically on every push. Do not edit by hand.
 - `signal-packs.html`
 - `sitemap.xml`
 
-## [CODEBASE-21.md](CODEBASE-21.md)
+## [CODEBASE-22.md](CODEBASE-22.md)
 
 - `sonicboom.html`
 - `verify.html`
 
-## [CODEBASE-22.md](CODEBASE-22.md)
+## [CODEBASE-23.md](CODEBASE-23.md)
 
 - `whitepaper.html`
 
