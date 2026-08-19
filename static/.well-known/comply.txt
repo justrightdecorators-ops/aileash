@@ -1,0 +1,122 @@
+# comply.txt — Legal & Regulatory Compliance Index v2.0
+# sebbi.pro | Monop Content | AILeash
+#
+# This file is an INDEX, not a certification. It declares which legal
+# frameworks this platform is built to support, and links to every other
+# declaration this domain publishes. The detail lives in those files;
+# this one exists so you can find them all from a single place.
+#
+# WHAT CHANGED IN v2.0
+# v1.0 repeated "Audit-Mutability: none" and
+# "Audit-Editable-By-Operator: false" from ai.txt v1.0. Both were removed
+# there for being untrue, so both are removed here. The audit mechanism
+# is now described in one place — ai.txt — and this file points at it
+# rather than restating it, because two files stating the same thing is
+# two files to keep honest.
+#
+# v1.0 also carried a different contact address to ai.txt. Fixed.
+
+Domain: sebbi.pro
+Operator: Monop Content
+Jurisdiction: GB
+Contact: mailto:justrightdecorators@gmail.com
+Manifest-Version: 2.0
+Manifest-Updated: 2026-08-19
+
+# ---------------------------------------------------------------------
+# WHAT THIS FILE IS NOT
+# ---------------------------------------------------------------------
+Certified: false
+Assessed-By-Third-Party: false
+Audited-By-Third-Party: false
+# No certification body has assessed this platform. Nothing below is a
+# certification, an accreditation, or a legal opinion. A self-published
+# file cannot be any of those, and a file that implies otherwise is the
+# problem it claims to solve. What CAN be checked is listed under
+# VERIFICATION, and every route there works without our involvement.
+
+# ---------------------------------------------------------------------
+# LINKED DECLARATIONS — each carries its own checkable detail
+# ---------------------------------------------------------------------
+Governance-Manifest: https://sebbi.pro/.well-known/ai.txt
+Safety-Declaration: https://sebbi.pro/.well-known/ai-safety.txt
+Security-Contact: https://sebbi.pro/.well-known/security.txt
+Conformance-Document: https://sebbi.pro/.well-known/ordering-test.json
+Full-Standard: https://sebbi.pro/ai-standard
+Regulation-Map: https://sebbi.pro/api/regulation-map
+Engine-Source: https://sebbi.pro/brain.py
+Client-SDK: https://sebbi.pro/sebbi_sdk.py
+
+# ---------------------------------------------------------------------
+# VERIFICATION — public, no key, no permission
+# ---------------------------------------------------------------------
+Audit-Chain: https://sebbi.pro/api/verify-chain
+Chain-Head: https://sebbi.pro/x/witness/tip
+Consistency-Proof: https://sebbi.pro/x/consistency/proof
+Completeness-Proof: https://sebbi.pro/x/complete/periods
+Anchor-Status: https://sebbi.pro/x/ots/status
+Witness-Roster: https://sebbi.pro/x/roster/list
+Self-Check: https://sebbi.pro/self-check
+Evidence-Pack: https://sebbi.pro/pack
+# Audit mechanism, its limits and what prevents rewriting: see ai.txt.
+# It is described once, there, on purpose.
+
+# ---------------------------------------------------------------------
+# AI & DATA REGULATION — built to support
+# Matches the live map at https://sebbi.pro/api/regulation-map
+# ---------------------------------------------------------------------
+Framework: EU-AI-Act-2024-1689
+  Article-9: continuous per-event risk scoring
+  Article-12: automatic record-keeping over system lifetime
+  Article-13: transparency and provision of information
+  Article-14: human oversight
+Framework: UK-Online-Safety-Act-2023
+Framework: ICO-Childrens-Code
+Framework: EU-DSA-2022-2065
+Framework: UK-GDPR
+Framework: Data-Protection-Act-2018
+Framework: NIST-AI-RMF
+
+# ---------------------------------------------------------------------
+# DATA SUBJECT RIGHTS — how an append-only chain coexists with erasure
+# ---------------------------------------------------------------------
+Erasure-Compatible: true
+Erasure-Method: identifiers are fingerprinted on arrival, so the chain
+  never holds a person's identity. Personal data is deleted in the
+  operator's own systems as normal; what remains sealed is a hash that
+  resolves to nothing.
+DSR-Lifecycle-Sealed: received, assessed with reasoning, extended,
+  completed
+DSR-Deadline: fixed at the moment of receipt. An extension is its own
+  sealed block, so it cannot be applied retrospectively to cover a date
+  already missed.
+
+# ---------------------------------------------------------------------
+# GENERAL UK OBLIGATIONS
+# Listed for transparency as the standard duties of a UK operator.
+# Not a certification and not evidence of adherence.
+# ---------------------------------------------------------------------
+Framework: Companies-Act-2006
+Framework: Equality-Act-2010
+Framework: Consumer-Rights-Act-2015
+Framework: Bribery-Act-2010
+Framework: Modern-Slavery-Act-2015
+Framework: Copyright-Designs-and-Patents-Act-1988
+
+# ---------------------------------------------------------------------
+# HOW TO READ A COMPLIANCE MANIFEST, INCLUDING THIS ONE
+# ---------------------------------------------------------------------
+# A framework named in a file like this means the operator built toward
+# it. It does not mean a regulator agrees, and no self-published file
+# can make it mean that.
+#
+# The parts of this index worth anything are the routes under
+# VERIFICATION. They return live values, they are open to anyone, and
+# several of them are capable of contradicting this file. That is why
+# they are published.
+#
+# If you are assessing this platform: start at Self-Check. It runs every
+# claim the domain makes about itself against the live endpoints and
+# reports what it could not verify as well as what it could.
+
+# Published by AILeash — sebbi.pro
