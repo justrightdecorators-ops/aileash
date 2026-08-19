@@ -2,10 +2,11 @@
 
 Contains:
 - `modules/signed.py`
-- `modules/sortition.py`
 - `modules/spec.py`
 - `modules/standard.py`
 - `modules/stats.py`
+- `modules/verifier.py`
+- `modules/warmup.py`
 
 
 ## `modules/signed.py`
@@ -760,759 +761,6 @@ def handle(method, action, data, api_key, ctx):
 ```
 
 
-## `modules/sortition.py`
-
-745 lines, 31288 bytes
-
-```python
-"""
-sortition.py - selection by lot. The operator stops choosing who gets audited.
-
-THE HOLE THIS FILLS
--------------------
-Every system claiming human oversight reviews a sample of decisions. In
-every one of them, the operator picks the sample. So the sample proves
-nothing: you can review the easy ones, or the ones you already know are
-clean, and nobody outside can tell the difference. It is the softest spot
-in every Article 14 claim in the industry, and it has stayed soft because
-there was no alternative.
-
-There is one now. heartbeat.py seals a public beacon value on a cadence -
-a number nobody, including the operator, can know before its tick. That is
-a dice roll no one owns.
-
-THE THREE LOCKS, IN ORDER. THE ORDER IS THE WHOLE POINT.
---------------------------------------------------------
-1. COMMIT THE POOL. Every record eligible for review in a period is
-   listed, hashed into one pool digest, and sealed. The pool is now fixed.
-2. WAIT FOR A TICK. The draw may only use a beacon value sealed AFTER the
-   pool commit. This module refuses otherwise. So the pool was fixed
-   before the dice existed, and cannot be edited once they do.
-3. DRAW. The beacon value deterministically ranks the pool. The lowest k
-   ranks are selected. Anyone can recompute it from public values.
-
-Break any one and the sample is choosable again. Enforced here, not
-promised.
-
-WHAT IT CATCHES
----------------
-A selected record with no review sealed against it is a permanent, visible
-hole with a name on it. You cannot quietly skip an awkward case, because
-the case was chosen for you in public, and its absence is the evidence.
-
-Refusal is allowed and is not hidden - it is sealed as a refusal with a
-reason. An honest refusal on the record is worth more than a silent gap.
-
-THE SELECTION FUNCTION, PUBLISHED SO IT IS NOT OURS
----------------------------------------------------
-  seed = SHA256("AILEASH-SORTITION-v1" | period | pool_digest | beacon_value)
-  rank(i) = SHA256(seed | ":" | record_hash_i)
-  selected = the k records with the lowest rank, ties by record hash
-
-No random number generator, no language-specific behaviour, no library.
-Ten lines in any language. A stranger recomputes it and either gets our
-list or catches us.
-
-WHAT THIS DOES NOT DO
----------------------
-- It does not prove the reviews were any good. It proves nobody chose
-  which ones happened.
-- It does not stop an operator declining to draw at all. A period with no
-  draw is a period with no sample, and /outstanding says so.
-- Pool membership is asserted by this server. What stops a record being
-  left out of the pool is complete.py, which commits the period's record
-  count in advance - separate module, separate check.
-- Selection is uniform. Risk-weighted sampling is deliberately not offered:
-  a weighting the operator sets is a choice the operator made.
-
-Contract: handle(method, action, data, api_key, ctx) -> (dict, status)
-Routes:
-  GET  spec         public  what this is and the exact selection function
-  GET  draws        public  every draw ever made
-  GET  draw         public  ?id= - one draw, its beacon value, its selection
-  GET  verify       public  ?id= - recompute the draw from scratch, here
-  GET  outstanding  public  selected records with no review yet, and how late
-  GET  status       public  coverage, response rate, oldest unanswered
-  POST pool         keyed   commit the pool for a period
-  POST draw         keyed   draw a sample against a sealed beacon tick
-  POST review       keyed   record a review, or a refusal with a reason
-"""
-
-import json
-import time
-import hashlib
-
-VERSION = "1.0.0"
-
-PUBLIC = {
-    ("GET", "spec"),
-    ("GET", "draws"),
-    ("GET", "draw"),
-    ("GET", "verify"),
-    ("GET", "outstanding"),
-    ("GET", "status"),
-}
-
-DOMAIN_SEED = b"AILEASH-SORTITION-v1"
-DOMAIN_POOL = b"AILEASH-POOL-v1"
-
-DEFAULT_RATE = 0.05          # 5 percent
-MIN_SELECT = 1
-MAX_SELECT = 500
-MAX_POOL = 200000
-REVIEW_DUE_HOURS = 72
-
-DDL = [
-    """CREATE TABLE IF NOT EXISTS sortition_pool (
-        id           INTEGER PRIMARY KEY AUTOINCREMENT,
-        period       TEXT NOT NULL,
-        pool_digest  TEXT NOT NULL,
-        pool_size    INTEGER NOT NULL,
-        members      TEXT NOT NULL,
-        committed_at REAL NOT NULL,
-        chain_rowid  INTEGER,
-        audit_hash   TEXT
-    )""",
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_sort_pool ON sortition_pool(period)",
-    """CREATE TABLE IF NOT EXISTS sortition_draw (
-        id            INTEGER PRIMARY KEY AUTOINCREMENT,
-        period        TEXT NOT NULL,
-        pool_id       INTEGER NOT NULL,
-        pool_digest   TEXT NOT NULL,
-        pool_size     INTEGER NOT NULL,
-        rate          REAL NOT NULL,
-        select_count  INTEGER NOT NULL,
-        beacon_source TEXT,
-        beacon_round  INTEGER,
-        beacon_value  TEXT NOT NULL,
-        beacon_rowid  INTEGER,
-        seed          TEXT NOT NULL,
-        selected      TEXT NOT NULL,
-        drawn_at      REAL NOT NULL,
-        chain_rowid   INTEGER,
-        audit_hash    TEXT
-    )""",
-    """CREATE TABLE IF NOT EXISTS sortition_review (
-        id           INTEGER PRIMARY KEY AUTOINCREMENT,
-        draw_id      INTEGER NOT NULL,
-        record_hash  TEXT NOT NULL,
-        outcome      TEXT NOT NULL,
-        reviewer     TEXT,
-        reason       TEXT,
-        recorded_at  REAL NOT NULL,
-        chain_rowid  INTEGER,
-        audit_hash   TEXT
-    )""",
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_sort_rev ON sortition_review(draw_id, record_hash)",
-]
-
-OUTCOMES = ("agreed", "disagreed", "escalated", "refused")
-
-VOCABULARY = {
-    "pool": "Every record eligible for review in a period, fixed and sealed before any dice exist.",
-    "draw": "The selection, computed from a beacon value that did not exist when the pool was sealed.",
-    "selected": "Chosen by the beacon, not by us. We could not have known which.",
-    "outstanding": "Selected and not yet answered. Visible, named, and counting.",
-    "refused": "Declined on the record with a reason. Not a gap - a decision that is now permanent.",
-    "gap": "Selected, past due, and never answered. The thing this module exists to make impossible to hide.",
-}
-
-WHAT_THIS_PROVES = (
-    "That nobody chose which records were reviewed. It does not prove the "
-    "reviews were competent, honest or useful. Those are different problems "
-    "and this module does not touch them."
-)
-
-
-# ---------------------------------------------------------------------
-# helpers
-# ---------------------------------------------------------------------
-
-def _ensure(conn, lock):
-    with lock:
-        cur = conn.cursor()
-        for stmt in DDL:
-            cur.execute(stmt)
-        conn.commit()
-
-
-def _cols(conn, table):
-    cur = conn.cursor()
-    cur.execute("PRAGMA table_info(%s)" % table)
-    return [r[1] for r in cur.fetchall()]
-
-
-def _hash_col(conn):
-    c = _cols(conn, "audit_log")
-    for n in ("audit_hash", "hash", "block_hash"):
-        if n in c:
-            return n
-    return None
-
-
-def _ts_col(conn):
-    c = _cols(conn, "audit_log")
-    for n in ("ts", "timestamp", "created", "observed"):
-        if n in c:
-            return n
-    return None
-
-
-def _period_bounds(period):
-    """YYYY, YYYY-MM, YYYY-MM-DD -> (start_epoch, end_epoch) UTC."""
-    p = str(period).strip()
-    try:
-        if len(p) == 4:
-            s = time.strptime(p + "-01-01", "%Y-%m-%d")
-            e = time.strptime(str(int(p) + 1) + "-01-01", "%Y-%m-%d")
-        elif len(p) == 7:
-            s = time.strptime(p + "-01", "%Y-%m-%d")
-            y, m = int(p[:4]), int(p[5:7])
-            y2, m2 = (y + 1, 1) if m == 12 else (y, m + 1)
-            e = time.strptime("%04d-%02d-01" % (y2, m2), "%Y-%m-%d")
-        elif len(p) == 10:
-            s = time.strptime(p, "%Y-%m-%d")
-            e = time.gmtime(_cal(s) + 86400)
-        else:
-            return None
-    except ValueError:
-        return None
-    return _cal(s), _cal(e)
-
-
-def _cal(st):
-    import calendar
-    return calendar.timegm(st)
-
-
-def _iso(t):
-    if t is None:
-        return None
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
-
-
-def _human(seconds):
-    if seconds is None:
-        return None
-    s = int(round(seconds))
-    if s < 60:
-        return "%d seconds" % s
-    if s < 3600:
-        return "%d minutes" % (s // 60)
-    if s < 86400:
-        return "%d hours %d minutes" % (s // 3600, (s % 3600) // 60)
-    return "%d days %d hours" % (s // 86400, (s % 86400) // 3600)
-
-
-def _pool_digest(members):
-    h = hashlib.sha256()
-    h.update(DOMAIN_POOL + b"\n")
-    for m in members:
-        h.update(m.encode() + b"\n")
-    return h.hexdigest()
-
-
-def _seed(period, pool_digest, beacon_value):
-    h = hashlib.sha256()
-    h.update(DOMAIN_SEED + b"|")
-    h.update(str(period).encode() + b"|")
-    h.update(pool_digest.encode() + b"|")
-    h.update(str(beacon_value).encode())
-    return h.hexdigest()
-
-
-def select(members, seed, k):
-    """The published selection function. Deterministic, no RNG."""
-    ranked = []
-    for m in members:
-        r = hashlib.sha256((seed + ":" + m).encode()).hexdigest()
-        ranked.append((r, m))
-    ranked.sort()
-    return [m for _, m in ranked[:k]]
-
-
-def _seal(ctx, event, result):
-    fn = ctx.get("seal")
-    payload = result if isinstance(result, str) else json.dumps(result, sort_keys=True)
-    try:
-        fn(event, payload)
-    except TypeError:
-        fn(event, result)
-
-
-def _backfill(conn, lock, table, rowid_field, pk):
-    hcol = _hash_col(conn)
-    with lock:
-        cur = conn.cursor()
-        cur.execute("SELECT MAX(rowid) FROM audit_log")
-        r = cur.fetchone()
-        rid = r[0] if r and r[0] is not None else None
-        h = None
-        if rid is not None and hcol:
-            cur.execute("SELECT %s FROM audit_log WHERE rowid=?" % hcol, (rid,))
-            r2 = cur.fetchone()
-            h = r2[0] if r2 else None
-        cur.execute("UPDATE %s SET chain_rowid=?, audit_hash=? WHERE id=?" % table,
-                    (rid, h, pk))
-        conn.commit()
-    return rid, h
-
-
-def _latest_beat_after(conn, rowid):
-    """The first heartbeat sealed strictly after a given chain row."""
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT source, beacon_round, value, chain_rowid, fetched_at"
-            " FROM heartbeat_tick WHERE chain_rowid IS NOT NULL AND chain_rowid>?"
-            " ORDER BY chain_rowid DESC LIMIT 1", (rowid,))
-        return cur.fetchone()
-    except Exception:
-        return None
-
-
-def _beats_available(conn):
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM heartbeat_tick")
-        return cur.fetchone()[0]
-    except Exception:
-        return None
-
-
-# ---------------------------------------------------------------------
-# handle
-# ---------------------------------------------------------------------
-
-def handle(method, action, data, api_key, ctx):
-    conn, lock = ctx["conn"], ctx["lock"]
-    _ensure(conn, lock)
-
-    if method == "GET" and action == "spec":
-        return _spec(), 200
-
-    # -------------------------------------------------- pool
-    if method == "POST" and action == "pool":
-        period = data.get("period")
-        bounds = _period_bounds(period) if period else None
-        if not bounds:
-            return {"error": "period_required",
-                    "formats": ["YYYY", "YYYY-MM", "YYYY-MM-DD"]}, 400
-        start, end = bounds
-        if end > time.time():
-            return {"error": "period_not_closed",
-                    "note": ("A pool can only be committed for a period that "
-                             "has ended. Committing a live period would let "
-                             "records arrive after the pool was fixed."),
-                    "period_ends": _iso(end)}, 409
-
-        hcol, tcol = _hash_col(conn), _ts_col(conn)
-        if not hcol or not tcol:
-            return {"error": "audit_log_schema_unrecognised"}, 500
-
-        cur = conn.cursor()
-        kind = data.get("event")
-        if kind:
-            cur.execute(
-                "SELECT %s FROM audit_log WHERE %s>=? AND %s<? AND event=?"
-                " ORDER BY rowid" % (hcol, tcol, tcol), (start, end, kind))
-        else:
-            cur.execute(
-                "SELECT %s FROM audit_log WHERE %s>=? AND %s<? ORDER BY rowid"
-                % (hcol, tcol, tcol), (start, end))
-        members = sorted({r[0] for r in cur.fetchall() if r[0]})
-        if not members:
-            return {"error": "empty_period", "period": period}, 404
-        if len(members) > MAX_POOL:
-            return {"error": "pool_too_large", "size": len(members),
-                    "max": MAX_POOL}, 413
-
-        digest = _pool_digest(members)
-        now = time.time()
-        with lock:
-            cur = conn.cursor()
-            cur.execute("SELECT id, pool_digest FROM sortition_pool WHERE period=?",
-                        (period,))
-            prior = cur.fetchone()
-            if prior:
-                return {"error": "pool_already_committed", "period": period,
-                        "pool_digest": prior[1],
-                        "note": "A pool commits once. That is what makes it a pool."}, 409
-            cur.execute(
-                "INSERT INTO sortition_pool (period, pool_digest, pool_size,"
-                " members, committed_at) VALUES (?,?,?,?,?)",
-                (period, digest, len(members), json.dumps(members), now))
-            pid = cur.lastrowid
-            conn.commit()
-
-        _seal(ctx, "sortition_pool", {
-            "period": period, "pool_digest": digest, "pool_size": len(members),
-            "event_filter": kind,
-            "note": ("Pool fixed. Any draw against it must use a beacon value "
-                     "sealed after this block."),
-        })
-        rid, h = _backfill(conn, lock, "sortition_pool", "chain_rowid", pid)
-
-        return {"pool_id": pid, "period": period, "pool_digest": digest,
-                "pool_size": len(members), "sealed_at_chain_rowid": rid,
-                "audit_hash": h,
-                "next": ("Wait for a heartbeat sealed after block %s, then "
-                         "POST /x/sortition/draw." % rid)}, 200
-
-    # -------------------------------------------------- draw
-    if method == "POST" and action == "draw":
-        period = data.get("period")
-        cur = conn.cursor()
-        cur.execute("SELECT id, pool_digest, pool_size, members, chain_rowid"
-                    " FROM sortition_pool WHERE period=?", (period,))
-        pool = cur.fetchone()
-        if not pool:
-            return {"error": "no_pool_for_period", "period": period,
-                    "next": "POST /x/sortition/pool first"}, 404
-        pid, digest, size, members_json, pool_rowid = pool
-
-        cur.execute("SELECT id FROM sortition_draw WHERE period=?", (period,))
-        if cur.fetchone():
-            return {"error": "already_drawn", "period": period,
-                    "note": "One draw per pool. A second draw is a second chance."}, 409
-
-        if pool_rowid is None:
-            return {"error": "pool_not_located_in_chain"}, 500
-
-        beat = _latest_beat_after(conn, pool_rowid)
-        if not beat:
-            n = _beats_available(conn)
-            return {"error": "no_beacon_since_pool_commit",
-                    "beats_in_system": n,
-                    "why": ("The draw must use a value that did not exist when "
-                            "the pool was sealed. Wait for the next heartbeat."),
-                    "check": "/x/heartbeat/latest"}, 409
-
-        b_source, b_round, b_value, b_rowid, b_at = beat
-        members = json.loads(members_json)
-
-        try:
-            rate = float(data.get("rate", DEFAULT_RATE))
-        except (TypeError, ValueError):
-            rate = DEFAULT_RATE
-        rate = max(0.0001, min(1.0, rate))
-        k = int(round(size * rate))
-        k = max(MIN_SELECT, min(k, MAX_SELECT, size))
-
-        seed = _seed(period, digest, b_value)
-        chosen = select(members, seed, k)
-        now = time.time()
-
-        with lock:
-            cur = conn.cursor()
-            cur.execute(
-                "INSERT INTO sortition_draw (period, pool_id, pool_digest,"
-                " pool_size, rate, select_count, beacon_source, beacon_round,"
-                " beacon_value, beacon_rowid, seed, selected, drawn_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (period, pid, digest, size, rate, k, b_source, b_round,
-                 b_value, b_rowid, seed, json.dumps(chosen), now))
-            did = cur.lastrowid
-            conn.commit()
-
-        _seal(ctx, "sortition_draw", {
-            "draw_id": did, "period": period, "pool_digest": digest,
-            "pool_size": size, "rate": rate, "selected_count": k,
-            "beacon": {"source": b_source, "round": b_round, "value": b_value,
-                       "sealed_at_block": b_rowid},
-            "seed": seed, "selected": chosen,
-            "note": ("Selection is recomputable by anyone from pool_digest and "
-                     "the beacon value. See /x/sortition/spec."),
-        })
-        rid, h = _backfill(conn, lock, "sortition_draw", "chain_rowid", did)
-
-        return {"draw_id": did, "period": period, "pool_size": size,
-                "rate": rate, "selected_count": k, "selected": chosen,
-                "beacon": {"source": b_source, "round": b_round,
-                           "value": b_value, "sealed_at_block": b_rowid,
-                           "sealed_at": _iso(b_at)},
-                "seed": seed, "sealed_at_chain_rowid": rid, "audit_hash": h,
-                "review_due": _iso(now + REVIEW_DUE_HOURS * 3600),
-                "recompute_this_yourself": "/x/sortition/verify?id=%d" % did}, 200
-
-    # -------------------------------------------------- review
-    if method == "POST" and action == "review":
-        did = data.get("draw_id")
-        rec = data.get("record")
-        outcome = str(data.get("outcome", "")).lower()
-        if not did or not rec:
-            return {"error": "draw_id_and_record_required"}, 400
-        if outcome not in OUTCOMES:
-            return {"error": "outcome_invalid", "allowed": list(OUTCOMES)}, 400
-        if outcome == "refused" and not data.get("reason"):
-            return {"error": "reason_required_to_refuse",
-                    "why": ("A refusal without a reason is a gap wearing a "
-                            "label. The reason is sealed and permanent.")}, 400
-
-        cur = conn.cursor()
-        cur.execute("SELECT selected FROM sortition_draw WHERE id=?", (did,))
-        row = cur.fetchone()
-        if not row:
-            return {"error": "unknown_draw", "draw_id": did}, 404
-        if rec not in json.loads(row[0]):
-            return {"error": "record_not_selected",
-                    "note": ("Reviews can only be filed against records the "
-                             "beacon chose. Volunteering extra reviews does "
-                             "not count toward the sample.")}, 409
-
-        now = time.time()
-        with lock:
-            cur = conn.cursor()
-            cur.execute("SELECT id FROM sortition_review WHERE draw_id=? AND record_hash=?",
-                        (did, rec))
-            if cur.fetchone():
-                return {"error": "already_reviewed",
-                        "note": "A review is filed once and cannot be replaced."}, 409
-            cur.execute(
-                "INSERT INTO sortition_review (draw_id, record_hash, outcome,"
-                " reviewer, reason, recorded_at) VALUES (?,?,?,?,?,?)",
-                (did, rec, outcome, data.get("reviewer"), data.get("reason"), now))
-            rvid = cur.lastrowid
-            conn.commit()
-
-        _seal(ctx, "sortition_review", {
-            "draw_id": did, "record": rec, "outcome": outcome,
-            "reviewer": data.get("reviewer"), "reason": data.get("reason"),
-        })
-        rid, h = _backfill(conn, lock, "sortition_review", "chain_rowid", rvid)
-        return {"recorded": True, "review_id": rvid, "outcome": outcome,
-                "sealed_at_chain_rowid": rid, "audit_hash": h}, 200
-
-    # -------------------------------------------------- draws
-    if method == "GET" and action == "draws":
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT id, period, pool_size, rate, select_count, beacon_source,"
-            " beacon_round, drawn_at, audit_hash FROM sortition_draw"
-            " ORDER BY id DESC LIMIT 100")
-        out = []
-        for r in cur.fetchall():
-            cur2 = conn.cursor()
-            cur2.execute("SELECT COUNT(*) FROM sortition_review WHERE draw_id=?", (r[0],))
-            done = cur2.fetchone()[0]
-            out.append({"draw_id": r[0], "period": r[1], "pool_size": r[2],
-                        "rate": r[3], "selected": r[4], "reviewed": done,
-                        "outstanding": r[4] - done,
-                        "beacon": {"source": r[5], "round": r[6]},
-                        "drawn_at": _iso(r[7]), "audit_hash": r[8]})
-        return {"count": len(out), "draws": out, "vocabulary": VOCABULARY}, 200
-
-    # -------------------------------------------------- one draw
-    if method == "GET" and action == "draw":
-        did = data.get("id")
-        if not did:
-            return {"error": "id_required"}, 400
-        d = _draw_row(conn, did)
-        if not d:
-            return {"error": "unknown_draw"}, 404
-        cur = conn.cursor()
-        cur.execute("SELECT record_hash, outcome, reviewer, reason, recorded_at"
-                    " FROM sortition_review WHERE draw_id=?", (did,))
-        revs = {r[0]: {"outcome": r[1], "reviewer": r[2], "reason": r[3],
-                       "at": _iso(r[4])} for r in cur.fetchall()}
-        items = []
-        for m in json.loads(d["selected_json"]):
-            items.append({"record": m, "review": revs.get(m),
-                          "state": "answered" if m in revs else "outstanding"})
-        return {"draw_id": did, "period": d["period"],
-                "pool_digest": d["pool_digest"], "pool_size": d["pool_size"],
-                "rate": d["rate"], "selected_count": d["select_count"],
-                "beacon": {"source": d["beacon_source"], "round": d["beacon_round"],
-                           "value": d["beacon_value"],
-                           "sealed_at_block": d["beacon_rowid"]},
-                "seed": d["seed"], "drawn_at": _iso(d["drawn_at"]),
-                "items": items,
-                "what_this_proves": WHAT_THIS_PROVES,
-                "recompute": "/x/sortition/verify?id=%s" % did}, 200
-
-    # -------------------------------------------------- verify
-    if method == "GET" and action == "verify":
-        did = data.get("id")
-        if not did:
-            return {"error": "id_required"}, 400
-        d = _draw_row(conn, did)
-        if not d:
-            return {"error": "unknown_draw"}, 404
-        cur = conn.cursor()
-        cur.execute("SELECT members FROM sortition_pool WHERE id=?", (d["pool_id"],))
-        row = cur.fetchone()
-        members = json.loads(row[0]) if row else []
-        recomputed_digest = _pool_digest(members)
-        recomputed_seed = _seed(d["period"], d["pool_digest"], d["beacon_value"])
-        recomputed = select(members, recomputed_seed, d["select_count"])
-        stored = json.loads(d["selected_json"])
-        ok = (recomputed_digest == d["pool_digest"]
-              and recomputed_seed == d["seed"]
-              and sorted(recomputed) == sorted(stored))
-        return {
-            "draw_id": did,
-            "matches": ok,
-            "pool_digest_recomputed": recomputed_digest,
-            "pool_digest_sealed": d["pool_digest"],
-            "seed_recomputed": recomputed_seed,
-            "seed_sealed": d["seed"],
-            "selection_matches": sorted(recomputed) == sorted(stored),
-            "beacon_value": d["beacon_value"],
-            "beacon_check": ("Confirm this value independently at "
-                             "/x/heartbeat/verify?round=%s, then at the beacon "
-                             "operator's own endpoint." % d["beacon_round"]),
-            "do_it_without_us": {
-                "seed": 'SHA256("AILEASH-SORTITION-v1|" + period + "|" + pool_digest + "|" + beacon_value)',
-                "rank": 'SHA256(seed + ":" + record_hash)',
-                "select": "lowest k ranks, ascending",
-                "note": ("This route runs the same function on our server, so "
-                         "it is a convenience, not the proof. The proof is you "
-                         "running those three lines yourself."),
-            },
-        }, 200
-
-    # -------------------------------------------------- outstanding
-    if method == "GET" and action == "outstanding":
-        now = time.time()
-        cur = conn.cursor()
-        cur.execute("SELECT id, period, selected, drawn_at FROM sortition_draw"
-                    " ORDER BY id DESC")
-        items = []
-        for did, period, sel, drawn in cur.fetchall():
-            cur2 = conn.cursor()
-            cur2.execute("SELECT record_hash FROM sortition_review WHERE draw_id=?", (did,))
-            done = {r[0] for r in cur2.fetchall()}
-            due = drawn + REVIEW_DUE_HOURS * 3600
-            for m in json.loads(sel):
-                if m in done:
-                    continue
-                items.append({
-                    "draw_id": did, "period": period, "record": m,
-                    "drawn_at": _iso(drawn), "due": _iso(due),
-                    "state": "gap" if now > due else "outstanding",
-                    "late_by": _human(now - due) if now > due else None,
-                })
-        gaps = [i for i in items if i["state"] == "gap"]
-        return {"outstanding_count": len(items), "gap_count": len(gaps),
-                "due_after_hours": REVIEW_DUE_HOURS,
-                "items": items[:500],
-                "meaning": VOCABULARY["gap"]}, 200
-
-    # -------------------------------------------------- status
-    if method == "GET" and action == "status":
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*), SUM(select_count) FROM sortition_draw")
-        ndraws, nsel = cur.fetchone()
-        nsel = nsel or 0
-        cur.execute("SELECT COUNT(*) FROM sortition_review")
-        nrev = cur.fetchone()[0]
-        cur.execute("SELECT outcome, COUNT(*) FROM sortition_review GROUP BY outcome")
-        mix = {r[0]: r[1] for r in cur.fetchall()}
-        cur.execute("SELECT COUNT(*) FROM sortition_pool")
-        npool = cur.fetchone()[0]
-        beats = _beats_available(conn)
-        return {
-            "version": VERSION,
-            "pools_committed": npool,
-            "draws": ndraws,
-            "records_selected": nsel,
-            "reviews_recorded": nrev,
-            "response_rate": round(nrev / nsel, 4) if nsel else None,
-            "outcome_mix": mix,
-            "beacon_available": beats is not None,
-            "beats_in_system": beats,
-            "depends_on": {
-                "heartbeat": ("supplies the dice. Without a beacon sealed "
-                              "after the pool, no draw is possible."),
-                "complete": ("commits the period's record count in advance. "
-                             "Without it, a record could be kept out of the "
-                             "pool. Separate module, separate check: "
-                             "/x/complete/periods"),
-            },
-            "what_this_proves": WHAT_THIS_PROVES,
-        }, 200
-
-    return {"error": "unknown_action", "action": action,
-            "actions": ["spec", "draws", "draw", "verify", "outstanding",
-                        "status", "pool", "review"]}, 404
-
-
-def _draw_row(conn, did):
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT id, period, pool_id, pool_digest, pool_size, rate, select_count,"
-        " beacon_source, beacon_round, beacon_value, beacon_rowid, seed,"
-        " selected, drawn_at FROM sortition_draw WHERE id=?", (did,))
-    r = cur.fetchone()
-    if not r:
-        return None
-    keys = ["id", "period", "pool_id", "pool_digest", "pool_size", "rate",
-            "select_count", "beacon_source", "beacon_round", "beacon_value",
-            "beacon_rowid", "seed", "selected_json", "drawn_at"]
-    return dict(zip(keys, r))
-
-
-def _spec():
-    return {
-        "module": "sortition",
-        "version": VERSION,
-        "name_means": "selection by lot - the ancient method for stopping the powerful choosing who gets scrutinised",
-        "the_hole": (
-            "Every system claiming human oversight reviews a sample. In every "
-            "one, the operator picks the sample, so the sample proves nothing."
-        ),
-        "the_three_locks": [
-            "1. The pool of eligible records is fixed and sealed first.",
-            "2. The draw may only use a beacon value sealed AFTER the pool. "
-            "Refused otherwise. So the pool was fixed before the dice existed.",
-            "3. The beacon value ranks the pool. Lowest k are selected. "
-            "Anyone recomputes it from public values.",
-        ],
-        "selection_function": {
-            "seed": 'SHA256("AILEASH-SORTITION-v1|" + period + "|" + pool_digest + "|" + beacon_value)',
-            "rank": 'SHA256(seed + ":" + record_hash)',
-            "select": "the k lowest ranks in ascending order",
-            "why_no_rng": ("A random number generator is a library, a version "
-                           "and a seed we control. Two SHA-256 calls are none "
-                           "of those and run in any language."),
-        },
-        "uniform_only": (
-            "Risk-weighted sampling is deliberately not offered. A weighting "
-            "the operator sets is a choice the operator made, which is the "
-            "thing this module exists to remove."
-        ),
-        "refusal": (
-            "A reviewer may refuse a selected case, with a reason, sealed. "
-            "An honest refusal on the record beats a silent gap. A selection "
-            "left unanswered past the due window is published as a gap with "
-            "the record named."
-        ),
-        "vocabulary": VOCABULARY,
-        "what_this_proves": WHAT_THIS_PROVES,
-        "limits": [
-            "It does not prove the reviews were any good.",
-            "It does not force anyone to draw at all. A period with no draw "
-            "is a period with no sample and status says so.",
-            "Pool membership is asserted by this server; completeness of the "
-            "pool is complete.py's job, not this module's.",
-            "The beacon is a third party. If drand and Bitcoin both vanish, "
-            "new draws stop. Old draws stay verifiable.",
-        ],
-        "routes": {
-            "POST /x/sortition/pool": "keyed - commit the pool for a closed period",
-            "POST /x/sortition/draw": "keyed - draw against a beacon sealed after the pool",
-            "POST /x/sortition/review": "keyed - file a review or a refusal with a reason",
-            "GET /x/sortition/draws": "every draw",
-            "GET /x/sortition/draw?id=": "one draw and its answers",
-            "GET /x/sortition/verify?id=": "recompute the draw",
-            "GET /x/sortition/outstanding": "selected and unanswered, with gaps named",
-            "GET /x/sortition/status": "coverage and response rate",
-        },
-    }
-
-```
-
-
 ## `modules/spec.py`
 
 121 lines, 5086 bytes
@@ -2219,5 +1467,949 @@ def handle(method, action, data, api_key, ctx):
                 "scope": "Public demonstration activity and total chain height only. Nothing scoped to a customer key is published here."}, 200
     return {"error": "unknown_action", "action": action,
             "available": ["GET stats", "GET chain"]}, 404
+
+```
+
+
+## `modules/verifier.py`
+
+717 lines, 26299 bytes
+
+```python
+#!/usr/bin/env python3
+"""
+modules/verifier.py  -  hand the verifier out at a URL
+
+WHY THIS EXISTS
+---------------
+A proof that can only be checked by the party who issued it is not a proof.
+So the proof bundles at /x/continuity/proof are useless unless somebody can
+easily get hold of something that checks them, and telling people to clone a
+repository is a gate.
+
+This serves the standalone verifier as a plain file:
+
+    curl -sO https://sebbi.pro/verify-authority.py
+    curl -s "https://sebbi.pro/x/continuity/proof?evaluation=e_..." \\
+        | python3 verify-authority.py -
+
+The script it hands out has no dependencies and makes no network calls. It
+checks the Ed25519 signature, recomputes every digest, re-runs the whole
+derivation from the published rules, and reaches its own verdict - then says
+so if that verdict disagrees with ours.
+
+WHAT IT DELIBERATELY DOES NOT DO
+--------------------------------
+It does not phone home, and this module records nothing about who downloaded
+it. A verification tool that reports back to the party being verified is not
+a verification tool.
+
+    GET /verify-authority.py   the script
+    GET /x/verifier/status     what is installed, and the script's digest
+"""
+
+import hashlib
+import sys
+
+VERSION = "1.1"
+
+PUBLIC = {("GET", "status")}
+
+# Deliberately NOT "/verify" - that is the sealed-post verification page and
+# this module would silently hijack it, handing a visitor a Python download
+# where they expected a page. A route grab is a bug even when the code works.
+FILE_PATHS = ("/verify-authority.py", "/verify_authority.py")
+
+_patched = [False]
+
+
+SCRIPT = r'''#!/usr/bin/env python3
+"""
+verify_authority.py  -  check an AILeash authority proof without AILeash
+
+    python3 verify_authority.py proof.json
+    curl -s "https://sebbi.pro/x/continuity/proof?evaluation=e_..." \\
+        | python3 verify_authority.py -
+
+WHAT THIS IS FOR
+----------------
+A proof that can only be checked by the party who issued it is not a proof.
+This script takes a bundle and reaches its own conclusion using nothing but
+the Python standard library. It does not call the issuing system, it does not
+import anything you have to install, and it does not take a single field of
+the bundle at face value.
+
+It does four separate things, and each one can fail on its own:
+
+  1. SIGNATURE   Ed25519 over the canonical bundle. Confirms the bundle came
+                 from the holder of the named key and has not been edited by
+                 anybody since.
+
+  2. INTEGRITY   Recomputes every grant digest, the lineage digest and the
+                 parameter digest from the fields in front of it. Confirms
+                 the bundle is internally consistent with its own contents.
+
+  3. DERIVATION  Re-runs the authority rules from scratch: root issued by a
+                 human, an unbroken parent chain, scope covered at every hop,
+                 constraints narrowing on every axis, purpose narrowing,
+                 validity windows contained, nothing revoked, and the action
+                 itself inside the effective limits of the whole lineage.
+
+  4. AGREEMENT   Compares the verdict this script reached with the verdict the
+                 bundle claims. Disagreement is reported as a failure of the
+                 issuer, not of this script.
+
+WHAT A PASS MEANS
+-----------------
+That the authority for this action was derivable, at that time, from that
+human grant - or, for a refusal, that it genuinely was not, and that the named
+grant and invariant really are where it broke.
+
+WHAT A PASS DOES NOT MEAN
+-------------------------
+That the root grant should ever have been issued. That the parameters describe
+something that really happened. That the risk engine was right. Derivation is
+not merit and it is not truth.
+
+The risk half of a composed verdict cannot be re-derived here, because that
+needs the issuer's scoring engine. Where the bundle's authority verdict is
+BLOCK, the composed verdict stands regardless, because the composition takes
+the worse of the two.
+"""
+
+import binascii
+import hashlib
+import json
+import sys
+
+GRANT_PREFIX = b"AILEASH-GRANT-v1:"
+EVAL_PREFIX = b"AILEASH-AUTHEVAL-v1:"
+BUNDLE_PREFIX = b"AILEASH-AUTHORITY-PROOF-v1:"
+
+MAX_DEPTH = 32
+RANK = {"ALLOW": 0, "CHALLENGE": 1, "BLOCK": 2}
+
+
+# ======================================================================
+# Ed25519, RFC 8032, standard library only
+# ======================================================================
+
+_Q = 2 ** 255 - 19
+_L = 2 ** 252 + 27742317777372353535851937790883648493
+_D = -121665 * pow(121666, _Q - 2, _Q) % _Q
+_I = pow(2, (_Q - 1) // 4, _Q)
+
+
+def _h(m):
+    return hashlib.sha512(m).digest()
+
+
+def _inv(x):
+    return pow(x, _Q - 2, _Q)
+
+
+def _xrecover(y):
+    xx = (y * y - 1) * _inv(_D * y * y + 1)
+    x = pow(xx, (_Q + 3) // 8, _Q)
+    if (x * x - xx) % _Q != 0:
+        x = (x * _I) % _Q
+    if x % 2 != 0:
+        x = _Q - x
+    return x
+
+
+_BY = 4 * _inv(5) % _Q
+_BX = _xrecover(_BY)
+_B = (_BX % _Q, _BY % _Q, 1, (_BX * _BY) % _Q)
+_IDENT = (0, 1, 1, 0)
+
+
+def _add(p, q):
+    x1, y1, z1, t1 = p
+    x2, y2, z2, t2 = q
+    a = (y1 - x1) * (y2 - x2) % _Q
+    b = (y1 + x1) * (y2 + x2) % _Q
+    c = t1 * 2 * _D * t2 % _Q
+    dd = z1 * 2 * z2 % _Q
+    e, f, g, hh = b - a, dd - c, dd + c, b + a
+    return (e * f % _Q, g * hh % _Q, f * g % _Q, e * hh % _Q)
+
+
+def _scalarmult(p, e):
+    if e == 0:
+        return _IDENT
+    q = _scalarmult(p, e // 2)
+    q = _add(q, q)
+    if e & 1:
+        q = _add(q, p)
+    return q
+
+
+def _encodepoint(p):
+    x, y, z, _t = p
+    zi = _inv(z)
+    x, y = x * zi % _Q, y * zi % _Q
+    bits = [(y >> i) & 1 for i in range(255)] + [x & 1]
+    return bytes(sum(bits[i * 8 + j] << j for j in range(8)) for i in range(32))
+
+
+def _bit(h, i):
+    return (h[i // 8] >> (i % 8)) & 1
+
+
+def _hint(m):
+    h = _h(m)
+    return sum(2 ** i * _bit(h, i) for i in range(512))
+
+
+def _isoncurve(p):
+    x, y, z, t = p
+    return (z % _Q != 0 and x * y % _Q == z * t % _Q
+            and (y * y - x * x - z * z - _D * t * t) % _Q == 0)
+
+
+def _decodepoint(s):
+    y = int.from_bytes(s, "little") & ((1 << 255) - 1)
+    x = _xrecover(y)
+    if x & 1 != _bit(s, 255):
+        x = _Q - x
+    p = (x, y, 1, (x * y) % _Q)
+    if not _isoncurve(p):
+        raise ValueError("point off curve")
+    return p
+
+
+def ed25519_verify(sig, msg, pk):
+    if len(sig) != 64 or len(pk) != 32:
+        return False
+    try:
+        rr = _decodepoint(sig[:32])
+        a = _decodepoint(pk)
+    except Exception:
+        return False
+    s = int.from_bytes(sig[32:64], "little")
+    if s >= _L:
+        return False
+    hh = _hint(sig[:32] + pk + msg)
+    return _encodepoint(_scalarmult(_B, s)) == _encodepoint(_add(rr, _scalarmult(a, hh)))
+
+
+# ======================================================================
+# the rules, reimplemented from the published spec
+# ======================================================================
+
+def canon(obj):
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def sha(prefix, text):
+    return hashlib.sha256(prefix + text.encode("utf-8")).hexdigest()
+
+
+def grant_digest(g):
+    material = {
+        "id": g["id"], "parent": g["parent"], "issuer": g["issuer"],
+        "issuer_kind": g["issuer_kind"], "subject": g["subject"],
+        "subject_kind": g["subject_kind"], "scope": sorted(g["scope"]),
+        "constraints": g["constraints"], "purpose": g["purpose"],
+        "purpose_tags": sorted(g["purpose_tags"]),
+        "not_before": g["not_before"], "not_after": g["not_after"],
+        "depth": g["depth"], "delegations_left": g["delegations_left"],
+        "created": g["created"], "risk_accepted_by": g.get("risk_accepted_by"),
+    }
+    return sha(GRANT_PREFIX, canon(material))
+
+
+def covers(held, wanted):
+    if held == wanted or held == "*":
+        return True
+    if held.endswith(".*"):
+        return wanted == held[:-2] or wanted.startswith(held[:-1])
+    return False
+
+
+def wildcard_breadth(scope, capability):
+    best = None
+    for held in scope:
+        if not covers(held, capability):
+            continue
+        if held == capability:
+            return 0
+        width = (capability.count(".") + 2 if held == "*"
+                 else capability.count(".") - held[:-2].count("."))
+        best = width if best is None else min(best, width)
+    return best
+
+
+def direction(key):
+    for p in ("max_", "min_", "allowed_", "denied_", "may_"):
+        if key.startswith(p):
+            return p
+    return None
+
+
+def num(v):
+    if isinstance(v, bool) or v is None:
+        raise ValueError("not a number")
+    return float(v)
+
+
+def as_set(v):
+    if isinstance(v, (list, tuple, set)):
+        return set(v)
+    return {v}
+
+
+def narrower(parent_c, child_c):
+    for key in sorted(child_c):
+        d = direction(key)
+        cval = child_c[key]
+        if d is None:
+            return False, "constraint '%s' has no narrowing rule" % key
+        if key not in parent_c:
+            return False, "constraint '%s' is not expressed by the parent" % key
+        pval = parent_c[key]
+        try:
+            if d == "max_" and num(cval) > num(pval):
+                return False, "%s raised from %s to %s" % (key, pval, cval)
+            if d == "min_" and num(cval) < num(pval):
+                return False, "%s lowered from %s to %s" % (key, pval, cval)
+            if d == "allowed_" and not as_set(cval) <= as_set(pval):
+                return False, "%s adds values the parent does not hold" % key
+            if d == "denied_" and not as_set(pval) <= as_set(cval):
+                return False, "%s drops values the parent denies" % key
+            if d == "may_" and bool(cval) and not bool(pval):
+                return False, "%s enabled where the parent withholds it" % key
+        except (TypeError, ValueError):
+            return False, "constraint '%s' is not comparable" % key
+    return True, None
+
+
+def effective(chain):
+    eff = {}
+    for g in chain:
+        for k, v in g["constraints"].items():
+            d = direction(k)
+            if k not in eff:
+                eff[k] = v
+                continue
+            cur = eff[k]
+            try:
+                if d == "max_":
+                    eff[k] = min(num(cur), num(v))
+                elif d == "min_":
+                    eff[k] = max(num(cur), num(v))
+                elif d == "allowed_":
+                    eff[k] = sorted(as_set(cur) & as_set(v))
+                elif d == "denied_":
+                    eff[k] = sorted(as_set(cur) | as_set(v))
+                elif d == "may_":
+                    eff[k] = bool(cur) and bool(v)
+            except (TypeError, ValueError):
+                eff[k] = v
+    return eff
+
+
+def params_against(params, eff):
+    hard, unconstrained = [], []
+    for key in sorted(params):
+        val = params[key]
+        checked = False
+        for cname, cval in eff.items():
+            d = direction(cname)
+            if not d or cname[len(d):] != key:
+                continue
+            checked = True
+            try:
+                if d == "max_" and num(val) > num(cval):
+                    hard.append("%s=%s exceeds %s=%s" % (key, val, cname, cval))
+                elif d == "min_" and num(val) < num(cval):
+                    hard.append("%s=%s is below %s=%s" % (key, val, cname, cval))
+                elif d == "allowed_" and val not in as_set(cval):
+                    hard.append("%s=%s is outside %s" % (key, val, cname))
+                elif d == "denied_" and val in as_set(cval):
+                    hard.append("%s=%s is denied by %s" % (key, val, cname))
+                elif d == "may_" and bool(val) and not bool(cval):
+                    hard.append("%s requested where %s withholds it" % (key, cname))
+            except (TypeError, ValueError):
+                hard.append("%s cannot be compared with %s" % (key, cname))
+        if not checked:
+            unconstrained.append(key)
+    return hard, unconstrained
+
+
+# ======================================================================
+# the four checks
+# ======================================================================
+
+class Report(object):
+    def __init__(self):
+        self.rows = []
+        self.failed = False
+
+    def add(self, ok, name, detail=""):
+        self.rows.append((ok, name, detail))
+        if not ok:
+            self.failed = True
+
+    def note(self, name, detail=""):
+        self.rows.append((None, name, detail))
+
+    def render(self):
+        out = []
+        for ok, name, detail in self.rows:
+            mark = "  ok  " if ok else ("FAIL  " if ok is False else "  --  ")
+            out.append(mark + name + (("\n        " + detail) if detail else ""))
+        return "\n".join(out)
+
+
+def check_signature(bundle, rep):
+    sig_hex = bundle.get("signature")
+    pk_hex = (bundle.get("issued_by") or {}).get("public_key")
+    if not sig_hex or not pk_hex:
+        rep.add(False, "Signature present", "the bundle carries no signature or no key")
+        return
+    body = dict(bundle)
+    body.pop("signature", None)
+    body.pop("verify_with", None)
+    try:
+        sig = binascii.unhexlify(sig_hex)
+        pk = binascii.unhexlify(pk_hex)
+    except Exception:
+        rep.add(False, "Signature is readable hex")
+        return
+    ok = ed25519_verify(sig, BUNDLE_PREFIX + canon(body).encode("utf-8"), pk)
+    rep.add(ok, "Ed25519 signature over the canonical bundle",
+            "key " + pk_hex[:16] + "…  Verify this key independently at the issuer's "
+            "published address before trusting who signed." if ok else
+            "the bundle was altered after signing, or it was not signed by this key")
+
+
+def check_integrity(bundle, rep):
+    lineage = bundle.get("lineage") or []
+    bad = []
+    for g in lineage:
+        try:
+            if grant_digest(g) != g.get("digest"):
+                bad.append(g.get("id"))
+        except Exception:
+            bad.append(g.get("id"))
+    rep.add(not bad, "Every grant digest recomputes from its own fields",
+            "" if not bad else "mismatched: " + ", ".join(str(b) for b in bad))
+
+    claimed = (bundle.get("decision") or {}).get("lineage_digest")
+    mine = sha(EVAL_PREFIX, canon([g.get("digest") for g in lineage]))
+    rep.add(mine == claimed, "Lineage digest matches the ordered path",
+            "" if mine == claimed else "computed " + mine[:20] + "… claimed " + str(claimed)[:20] + "…")
+
+    req = bundle.get("request") or {}
+    claimed_p = (bundle.get("decision") or {}).get("params_digest")
+    mine_p = sha(EVAL_PREFIX, canon({"action": req.get("action"),
+                                     "params": req.get("params") or {}}))
+    rep.add(mine_p == claimed_p, "Parameter digest matches the request as stated",
+            "" if mine_p == claimed_p else "the parameters shown are not the "
+            "parameters that were judged")
+
+
+def rederive(bundle, rep):
+    """Run the published rules from scratch and reach an independent verdict."""
+    lineage = bundle.get("lineage") or []
+    decision = bundle.get("decision") or {}
+    req = bundle.get("request") or {}
+    at = decision.get("evaluated_at_epoch")
+
+    hard, soft = [], []
+    broken_at = broken_invariant = None
+
+    def fail(grant, invariant, detail):
+        nonlocal broken_at, broken_invariant
+        hard.append(detail)
+        if broken_at is None:
+            broken_at, broken_invariant = grant, invariant
+
+    if not lineage:
+        fail(None, "authority_continuity", "the bundle carries no authority path")
+    else:
+        root = lineage[0]
+        if root.get("parent") is not None:
+            fail(root["id"], "authority_continuity",
+                 "the path does not begin at a parentless root")
+        if root.get("issuer_kind") != "human":
+            fail(root["id"], "identity_continuity",
+                 "the root grant was not issued by a human principal")
+
+        previous = None
+        for g in lineage:
+            if g.get("revoked_at") is not None:
+                fail(g["id"], "authority_continuity",
+                     "grant %s was revoked" % g["id"])
+            if at is not None:
+                if at < g["not_before"]:
+                    fail(g["id"], "temporal_validity",
+                         "grant %s was not yet valid at the time of the decision" % g["id"])
+                if at >= g["not_after"]:
+                    fail(g["id"], "temporal_validity",
+                         "grant %s had expired at the time of the decision" % g["id"])
+            if previous is not None:
+                if g.get("parent") != previous.get("id"):
+                    fail(g["id"], "authority_continuity",
+                         "grant %s does not point at the grant above it" % g["id"])
+                missing = [c for c in g["scope"]
+                           if not any(covers(p, c) for p in previous["scope"])]
+                if missing:
+                    fail(g["id"], "boundary_integrity",
+                         "%s holds scope its parent does not: %s"
+                         % (g["id"], ", ".join(sorted(missing))))
+                ok, why = narrower(previous["constraints"], g["constraints"])
+                if not ok:
+                    fail(g["id"], "boundary_integrity", "%s: %s" % (g["id"], why))
+                if not set(g["purpose_tags"]) <= set(previous["purpose_tags"]):
+                    fail(g["id"], "intent_continuity",
+                         "%s carries purpose tags its parent does not" % g["id"])
+                if (g["not_before"] < previous["not_before"]
+                        or g["not_after"] > previous["not_after"]):
+                    fail(g["id"], "temporal_validity",
+                         "%s is valid outside its parent's window" % g["id"])
+                if g["depth"] != previous["depth"] + 1:
+                    fail(g["id"], "authority_continuity",
+                         "%s records a depth inconsistent with its parent" % g["id"])
+            previous = g
+
+        if len(lineage) - 1 > MAX_DEPTH:
+            fail(lineage[-1]["id"], "boundary_integrity", "delegation depth exceeds the ceiling")
+
+        if not any(g.get("risk_accepted_by") for g in lineage):
+            fail(lineage[0]["id"], "identity_continuity",
+                 "no grant in this path names who accepted the risk")
+
+        leaf = lineage[-1]
+        action = req.get("action")
+        params = req.get("params") or {}
+
+        if action and not any(covers(c, action) for c in leaf["scope"]):
+            fail(leaf["id"], "boundary_integrity",
+                 "action '%s' is outside the scope of the grant exercised" % action)
+        elif action:
+            breadth = wildcard_breadth(leaf["scope"], action)
+            if breadth and breadth >= 2:
+                soft.append("action '%s' is only covered by a broad wildcard" % action)
+
+        eff = effective(lineage)
+        failures, unconstrained = params_against(params, eff)
+        for f in failures:
+            fail(leaf["id"], "boundary_integrity", f)
+        for u in unconstrained:
+            soft.append("parameter '%s' is not constrained anywhere in the path" % u)
+
+        tag = req.get("purpose_tag")
+        if tag:
+            if tag not in leaf["purpose_tags"]:
+                soft.append("declared purpose '%s' is not carried by the grant" % tag)
+        else:
+            soft.append("the action declared no purpose")
+
+    verdict = "BLOCK" if hard else ("CHALLENGE" if soft else "ALLOW")
+    return verdict, hard, soft, broken_at, broken_invariant
+
+
+def check_agreement(bundle, rep, mine, hard, soft, broken_at, broken_invariant):
+    decision = bundle.get("decision") or {}
+    claimed = decision.get("authority_verdict") or decision.get("verdict")
+
+    rep.add(mine == claimed,
+            "Independently re-derived authority verdict: " + mine,
+            "" if mine == claimed else
+            "the issuer claims " + str(claimed) + " and this script reaches " + mine +
+            " from the same path. One of us is wrong and the rules are published.")
+
+    if mine == "BLOCK":
+        same_grant = (broken_at == decision.get("broken_at"))
+        same_inv = (broken_invariant == decision.get("broken_invariant"))
+        rep.add(same_grant and same_inv,
+                "Refusal reproduces at the same grant and invariant",
+                ("grant %s, invariant %s" % (broken_at, broken_invariant))
+                if same_grant and same_inv else
+                "this script breaks at grant %s / %s, the issuer says %s / %s"
+                % (broken_at, broken_invariant,
+                   decision.get("broken_at"), decision.get("broken_invariant")))
+        rep.note("Why authority could not be derived")
+        for h in hard:
+            rep.note("  " + h)
+    elif soft:
+        rep.note("Why this could not be settled without a person")
+        for x in soft:
+            rep.note("  " + x)
+
+    risk = decision.get("risk_verdict")
+    if risk and mine != "BLOCK":
+        rep.note("Risk verdict reported as " + str(risk) + ", not re-derivable here",
+                 "the composed verdict is the worse of the two; the scoring engine "
+                 "is not part of this bundle and is not checked by this script")
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        return 2
+    src = sys.argv[1]
+    raw = sys.stdin.read() if src == "-" else open(src, "r").read()
+    try:
+        bundle = json.loads(raw)
+    except Exception as exc:
+        print("Not readable JSON: " + str(exc))
+        return 2
+
+    rep = Report()
+    print("=" * 66)
+    print("AUTHORITY PROOF  ·  independent verification")
+    print("=" * 66)
+    d = bundle.get("decision") or {}
+    print("evaluation   " + str(d.get("evaluation")))
+    print("action       " + str((bundle.get("request") or {}).get("action")))
+    print("at           " + str(d.get("evaluated_at")))
+    print("hops         " + str(max(0, len(bundle.get("lineage") or []) - 1)))
+    if bundle.get("lineage"):
+        print("authorised   " + str(bundle["lineage"][0].get("issuer")))
+        print("executed     " + str(bundle["lineage"][-1].get("subject")))
+        acc = [g.get("risk_accepted_by") for g in bundle["lineage"] if g.get("risk_accepted_by")]
+        print("risk owner   " + str(acc[-1] if acc else None))
+    print("-" * 66)
+
+    check_signature(bundle, rep)
+    check_integrity(bundle, rep)
+    mine, hard, soft, ba, bi = rederive(bundle, rep)
+    check_agreement(bundle, rep, mine, hard, soft, ba, bi)
+
+    print(rep.render())
+    print("-" * 66)
+    if rep.failed:
+        print("RESULT: NOT VERIFIED. Something above did not hold.")
+        return 1
+    print("RESULT: VERIFIED - " + mine)
+    if mine == "BLOCK":
+        print("This is a proof that the action was NOT authorised, and where it failed.")
+    print("Checked with no network access, no dependencies, and nothing taken on")
+    print("the issuer's word except the meaning of their public key.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+
+
+def _digest():
+    return hashlib.sha256(SCRIPT.encode("utf-8")).hexdigest()
+
+
+def _srv():
+    m = sys.modules.get("__main__")
+    if m is not None and hasattr(m, "get_bearer"):
+        return m
+    return sys.modules.get("server")
+
+
+def _install(s):
+    if _patched[0]:
+        return "already installed"
+    H = getattr(s, "Handler", None)
+    if H is None or not hasattr(H, "do_GET"):
+        return "no handler"
+    if getattr(H, "_verifier_patched", False):
+        _patched[0] = True
+        return "already installed"
+
+    original = H.do_GET
+
+    def do_GET(self):
+        try:
+            from urllib.parse import urlparse
+            p = urlparse(self.path).path.rstrip("/") or "/"
+        except Exception:
+            p = self.path or "/"
+
+        if p in FILE_PATHS:
+            body = SCRIPT.encode("utf-8")
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Content-Disposition",
+                                 'attachment; filename="verify-authority.py"')
+                self.send_header("Cache-Control", "public, max-age=300")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception:
+                pass
+            return
+
+        return original(self)
+
+    H.do_GET = do_GET
+    H._verifier_patched = True
+    _patched[0] = True
+    print("VERIFIER: /verify-authority.py installed", flush=True)
+    return "installed"
+
+
+def handle(method, action, data, api_key, ctx):
+    s = _srv()
+    if s is None:
+        return {"error": "server_not_found"}, 500
+
+    state = "already installed" if _patched[0] else None
+    if not _patched[0]:
+        try:
+            state = _install(s)
+        except Exception as exc:
+            print("VERIFIER: patch failed - " + str(exc), flush=True)
+            state = "failed: " + str(exc)
+
+    action = (action or "").strip("/").lower()
+
+    if method == "GET" and action in ("", "status"):
+        return {
+            "installed": bool(_patched[0]),
+            "install_result": state,
+            "module_version": VERSION,
+            "serving": list(FILE_PATHS),
+            "script_bytes": len(SCRIPT),
+            "script_sha256": _digest(),
+            "how_to_use": [
+                "curl -sO https://sebbi.pro/verify-authority.py",
+                "curl -s 'https://sebbi.pro/x/continuity/proof?evaluation=<id>' "
+                "| python3 verify-authority.py -",
+            ],
+            "dependencies": "none - Python standard library only",
+            "network": "the script makes no network calls and reports nothing back. "
+                       "A verification tool that phones home to the party being "
+                       "verified is not a verification tool.",
+            "note": "Check script_sha256 against the file you downloaded. And read it "
+                    "before you run it, as you would with anything else handed to you "
+                    "by the party you are checking.",
+        }, 200
+
+    return {"error": "unknown_action", "action": action, "GET": ["status"]}, 404
+
+```
+
+
+## `modules/warmup.py`
+
+211 lines, 7688 bytes
+
+```python
+"""
+modules/warmup.py  v1.0  -  arm every page module in one request
+
+THE PROBLEM THIS ENDS
+---------------------
+console.py, packconsole.py, peerconsole.py, selfcheck.py and the rest all
+install their page by patching do_GET at runtime, and that only happens the
+first time their handle() runs. So after every deploy the pages 404 until
+somebody happens to hit each module's /x/ route.
+
+Worse, most of those modules only make `status` public. A keyless request to
+/x/console/ is rejected by the router before the module is ever imported, so
+the obvious way of arming them does not work and looks like a broken site
+instead of a cold one.
+
+WHAT THIS DOES
+--------------
+One public route that imports each page module and calls its handle() once,
+which is exactly what installs the patch. Every page comes back in a single
+request, with no key.
+
+    GET /x/warmup/all       arm everything, report what happened
+    GET /x/warmup/status    what is armed right now, arms nothing
+    GET /x/warmup/spec      what this is
+
+POINT RAILWAY AT IT
+-------------------
+Set the healthcheck path to:
+
+    /x/warmup/all
+
+Railway calls it after every deploy, so the site is armed before anyone
+opens it. It always returns 200 as long as the process is up - a module
+that fails to arm is reported in the body rather than failing the
+healthcheck, because one broken page should not roll back a good deploy.
+
+SAFE TO RUN REPEATEDLY
+----------------------
+Every module guards its own patch with a `_patched` flag, so a second call
+is a no-op. Call it every minute if you like.
+
+ADDING A MODULE
+---------------
+Put its name in PAGE_MODULES. Nothing else. If the module is not deployed
+it is reported as missing and the others still arm.
+"""
+
+import importlib
+import sys
+import time
+import traceback
+
+VERSION = "1.0"
+
+PUBLIC = {("GET", "all"), ("GET", "status"), ("GET", "spec"), ("GET", "")}
+
+# Modules that serve an HTML page by patching do_GET at runtime.
+# Name only - no path, no .py.
+PAGE_MODULES = [
+    "console",
+    "packconsole",
+    "peerconsole",
+    "selfcheck",
+    "savings",
+    "standard",
+    "network",
+    "demo",
+]
+
+# Import prefixes tried in order. Different deployments load modules
+# differently and guessing once and failing is how you get a 404 you
+# cannot explain.
+_PREFIXES = ("modules.", "", "aileash.modules.")
+
+_last_run = {"at": None, "results": None}
+
+
+def _find(name):
+    """Return an already-imported module, or import it. (module, how) or (None, why)."""
+    for pre in _PREFIXES:
+        mod = sys.modules.get(pre + name)
+        if mod is not None:
+            return mod, "already imported as " + pre + name
+    errors = []
+    for pre in _PREFIXES:
+        try:
+            return importlib.import_module(pre + name), "imported as " + pre + name
+        except ImportError as exc:
+            errors.append(pre + name + ": " + str(exc))
+        except Exception as exc:
+            # A real error inside the module - a syntax error, a bad import
+            # of its own. Worth reporting properly rather than as "missing",
+            # because those look identical from outside and cost hours.
+            return None, "FAILED TO LOAD (%s): %s" % (
+                type(exc).__name__, str(exc)[:200])
+    return None, "not found (" + "; ".join(errors[:1]) + ")"
+
+
+def _arm(name, ctx):
+    """Import a page module and call handle() once, which installs its patch."""
+    mod, how = _find(name)
+    if mod is None:
+        return {"module": name, "armed": False, "detail": how}
+
+    fn = getattr(mod, "handle", None)
+    if not callable(fn):
+        return {"module": name, "armed": False,
+                "detail": "loaded but has no handle()"}
+
+    try:
+        body, status = fn("GET", "status", {}, None, ctx)
+    except Exception as exc:
+        return {"module": name, "armed": False,
+                "detail": "handle() raised %s: %s" % (
+                    type(exc).__name__, str(exc)[:200]),
+                "traceback": traceback.format_exc(limit=3).splitlines()[-3:]}
+
+    body = body if isinstance(body, dict) else {}
+    armed = bool(body.get("installed", True))
+    out = {"module": name, "armed": armed, "http": status, "load": how}
+    for k in ("page", "install_result", "version"):
+        if k in body:
+            out[k] = body[k]
+    if not armed:
+        out["detail"] = body.get("install_result") or "reported not installed"
+    return out
+
+
+def _status_only(ctx):
+    """What is armed, without arming anything. Read-only."""
+    rows = []
+    for name in PAGE_MODULES:
+        found = None
+        for pre in _PREFIXES:
+            if (pre + name) in sys.modules:
+                found = sys.modules[pre + name]
+                break
+        if found is None:
+            rows.append({"module": name, "loaded": False, "armed": False})
+            continue
+        flag = getattr(found, "_patched", None)
+        armed = bool(flag[0]) if isinstance(flag, list) and flag else None
+        rows.append({"module": name, "loaded": True, "armed": armed,
+                     "page": getattr(found, "PAGE_PATHS", [None])[0]
+                             if hasattr(found, "PAGE_PATHS") else None})
+    return rows
+
+
+def handle(method, action, data, api_key, ctx):
+    action = (action or "").strip().lower()
+
+    if method != "GET":
+        return {"error": "unknown_action", "action": action,
+                "GET": ["all", "status", "spec"]}, 404
+
+    if action == "spec":
+        return {
+            "module": "warmup",
+            "version": VERSION,
+            "what_it_is": (
+                "Page modules install their route by patching do_GET the "
+                "first time they run, so every deploy leaves those pages "
+                "404 until something touches each one. This touches all of "
+                "them in one public request."),
+            "routes": {
+                "/x/warmup/all": "arm every page module, report each",
+                "/x/warmup/status": "what is armed now, arms nothing",
+                "/x/warmup/spec": "this",
+            },
+            "railway_healthcheck_path": "/x/warmup/all",
+            "modules": list(PAGE_MODULES),
+            "safe_to_repeat": True,
+            "note": ("Always returns 200 while the process is up. A module "
+                     "that fails to arm is reported in the body, because one "
+                     "bad page should not roll back a good deploy."),
+        }, 200
+
+    if action == "status":
+        return {"armed_now": _status_only(ctx),
+                "last_warmup": _last_run["at"],
+                "note": "Read-only. Call /x/warmup/all to actually arm."}, 200
+
+    # "" or "all"
+    t0 = time.time()
+    results = [_arm(name, ctx) for name in PAGE_MODULES]
+    _last_run["at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    _last_run["results"] = results
+
+    armed = [r["module"] for r in results if r.get("armed")]
+    failed = [r for r in results if not r.get("armed")]
+
+    for r in failed:
+        print("WARMUP: %s did not arm - %s"
+              % (r["module"], r.get("detail", "?")), flush=True)
+    print("WARMUP: %d/%d armed in %.0fms"
+          % (len(armed), len(results), (time.time() - t0) * 1000), flush=True)
+
+    return {
+        "ok": True,
+        "armed": len(armed),
+        "of": len(results),
+        "took_ms": round((time.time() - t0) * 1000, 1),
+        "pages_ready": [r.get("page") for r in results
+                        if r.get("armed") and r.get("page")],
+        "results": results,
+        "at": _last_run["at"],
+        "note": ("A module listed as not armed is either not deployed or "
+                 "raised on load - the detail says which. The rest still "
+                 "armed."),
+    }, 200
 
 ```

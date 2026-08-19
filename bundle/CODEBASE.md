@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-110 files across 23 parts.
+109 files across 23 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -64,25 +64,24 @@ Generated automatically on every push. Do not edit by hand.
 ## [CODEBASE-10.md](CODEBASE-10.md)
 
 - `modules/signed.py`
-- `modules/sortition.py`
 - `modules/spec.py`
 - `modules/standard.py`
 - `modules/stats.py`
+- `modules/verifier.py`
+- `modules/warmup.py`
 
 ## [CODEBASE-11.md](CODEBASE-11.md)
 
-- `modules/verifier.py`
-- `modules/warmup.py`
 - `modules/witness.py`
 - `modules/witnessed.py`
 - `Verify_ai.py`
-
-## [CODEBASE-12.md](CODEBASE-12.md)
-
 - `ai_act_ranker.py`
 - `ai_safety_scanner.py`
 - `aigrade_insert.py`
 - `aileash_reporter.py`
+
+## [CODEBASE-12.md](CODEBASE-12.md)
+
 - `aileash_signed_client.py`
 - `aileash_verify.py`
 - `anchor.py`
@@ -90,19 +89,19 @@ Generated automatically on every push. Do not edit by hand.
 - `brain.py`
 - `broadcaster.py`
 - `build_sebbi_ecosystem.py`
+- `gateway_proxy.py`
+- `meshwitness.py`
 
 ## [CODEBASE-13.md](CODEBASE-13.md)
 
-- `gateway_proxy.py`
-- `meshwitness.py`
 - `sebbi_orchestrator.py`
 - `sebbi_sdk.py`
 - `sebdog_engine.py`
+- `sebdog_licence.py`
+- `sebdog_reporter.py`
 
 ## [CODEBASE-14.md](CODEBASE-14.md)
 
-- `sebdog_licence.py`
-- `sebdog_reporter.py`
 - `tests/attack_continuity_1.py`
 - `tests/attack_continuity_2.py`
 - `tests/attack_continuity_3.py`
@@ -110,32 +109,32 @@ Generated automatically on every push. Do not edit by hand.
 - `tests/attack_continuity_5.py`
 - `tests/attack_continuity_6.py`
 - `tests/attack_witnessed.py`
-
-## [CODEBASE-15.md](CODEBASE-15.md)
-
 - `verify_authority.py`
 - `AILeash-API-Reference-v6.4.2.md`
 - `LICENCE`
 - `README.md`
+
+## [CODEBASE-15.md](CODEBASE-15.md)
+
 - `admin.html`
 - `ai-standard.html`
 - `ai-txt-kit.html`
 - `aitxt-popup-live.html`
 - `brain.html`
+- `certificate.html`
 
 ## [CODEBASE-16.md](CODEBASE-16.md)
 
-- `certificate.html`
 - `compliance-assistant.html`
 - `contact.html`
 - `copyright.txt`
 - `data-protection.html`
-
-## [CODEBASE-17.md](CODEBASE-17.md)
-
 - `developers.html`
 - `dis.txt`
 - `docs/evidential-undertaking.md`
+
+## [CODEBASE-17.md](CODEBASE-17.md)
+
 - `docs/spec/ai-txt.md`
 - `green.html`
 - `guardian-parent.html`
