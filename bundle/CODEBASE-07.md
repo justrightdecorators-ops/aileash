@@ -1,10 +1,954 @@
-# Codebase — part 7 of 22
+# Codebase — part 7 of 23
 
 Contains:
+- `modules/pack.py`
+- `modules/packconsole.py`
 - `modules/peer.py`
 - `modules/peerconsole.py`
 - `modules/publish.py`
-- `modules/reconcile.py`
+
+
+## `modules/pack.py`
+
+501 lines, 20695 bytes
+
+```python
+"""
+Evidence pack - /x/pack/<action>
+
+WHAT THIS IS
+------------
+The sellable artifact. Everything else in this platform produces evidence;
+this produces the document someone hands an auditor.
+
+For a chosen period it does not summarise the chain, it RE-VERIFIES it:
+every block in the range is rehashed from its stored contents using the
+same function that sealed it, and compared to the hash recorded at the
+time. Then the links between blocks are walked, and for a single key the
+gapless receipt sequence is checked end to end.
+
+A summary is a claim. A re-verification is a check anyone can repeat.
+
+WHAT IT DOES NOT PROVE
+----------------------
+- That any decision recorded here was correct. Wrong answers seal just as
+  cleanly as right ones.
+- That an external peer's own chain is honest. That is checked at the
+  peer's host, not here.
+- Anything about periods outside the range requested.
+
+    GET  /x/pack/spec                        public - what this does
+    GET  /x/pack/preview?period=2026-Q2      keyed  - the pack as JSON
+    GET  /x/pack/render?period=2026-Q2       keyed  - the pack as one page
+    GET  /x/pack/history                     keyed  - packs issued
+    POST /x/pack/issue                       keyed  - seal it into the chain
+
+period accepts YYYY, YYYY-MM, YYYY-Qn. Add scope=me to limit the pack to
+your own key; omit scope for a deployment-wide pack.
+"""
+
+import calendar
+import datetime
+import hashlib
+import json
+import time
+
+VERSION = "1.0"
+
+# (METHOD, action). Only the spec is open - a pack is customer evidence.
+PUBLIC = {("GET", "spec")}
+
+MAX_ROWS = 200000
+
+_ready = False
+
+
+def _setup(ctx):
+    global _ready
+    if _ready:
+        return
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "CREATE TABLE IF NOT EXISTS pack_issued("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,"
+            "period TEXT,scope TEXT,digest TEXT,issued REAL,"
+            "entries INTEGER,verified INTEGER,mismatches INTEGER,"
+            "audit_hash TEXT,block_index INTEGER)")
+        ctx["conn"].execute(
+            "CREATE INDEX IF NOT EXISTS idx_pack_key "
+            "ON pack_issued(api_key)")
+        ctx["conn"].commit()
+    _ready = True
+
+
+def _sha(p):
+    """Identical to the engine's own sha(). Written out here rather than
+    imported so this module depends on no other module's internals."""
+    return hashlib.sha256(
+        json.dumps(p, sort_keys=True).encode()).hexdigest()
+
+
+def _iso(ts):
+    if ts is None:
+        return None
+    return datetime.datetime.utcfromtimestamp(
+        float(ts)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _day(ts):
+    if ts is None:
+        return None
+    return datetime.datetime.utcfromtimestamp(
+        float(ts)).strftime("%Y-%m-%d")
+
+
+def _epoch(y, m, d):
+    return float(calendar.timegm((y, m, d, 0, 0, 0, 0, 0, 0)))
+
+
+def _bounds(period):
+    """YYYY | YYYY-MM | YYYY-Qn -> (start, end, label)."""
+    p = str(period or "").strip().upper()
+    try:
+        if len(p) == 4:
+            y = int(p)
+            return _epoch(y, 1, 1), _epoch(y + 1, 1, 1), p
+        if len(p) == 7 and p[4] == "-" and p[5] == "Q":
+            y, q = int(p[:4]), int(p[6])
+            if q < 1 or q > 4:
+                return None
+            m = (q - 1) * 3 + 1
+            em, ey = m + 3, y
+            if em > 12:
+                em, ey = em - 12, y + 1
+            return _epoch(y, m, 1), _epoch(ey, em, 1), p
+        if len(p) == 7 and p[4] == "-":
+            y, m = int(p[:4]), int(p[5:])
+            em, ey = m + 1, y
+            if em > 12:
+                em, ey = 1, y + 1
+            return _epoch(y, m, 1), _epoch(ey, em, 1), p
+    except (ValueError, IndexError):
+        return None
+    return None
+
+
+# ----------------------------------------------------------------------
+# assembly - the actual re-verification
+# ----------------------------------------------------------------------
+
+def _assemble(ctx, start, end, label, scope):
+    c = ctx["conn"]
+    cols = ("id,ts,event_json,result_json,prev_hash,audit_hash,"
+            "api_key,key_seq")
+
+    with ctx["lock"]:
+        if scope:
+            rows = c.execute(
+                "SELECT " + cols + " FROM audit_log WHERE ts>=? AND ts<? "
+                "AND api_key=? ORDER BY id ASC LIMIT ?",
+                (start, end, scope, MAX_ROWS)).fetchall()
+            began = c.execute(
+                "SELECT MIN(ts) FROM audit_log WHERE api_key=?",
+                (scope,)).fetchone()
+            dev_all = c.execute(
+                "SELECT COUNT(*) FROM device_seen WHERE api_key=?",
+                (scope,)).fetchone()
+            dev_new = c.execute(
+                "SELECT COUNT(*) FROM device_seen WHERE api_key=? "
+                "AND first_seen>=? AND first_seen<?",
+                (scope, start, end)).fetchone()
+        else:
+            rows = c.execute(
+                "SELECT " + cols + " FROM audit_log WHERE ts>=? AND ts<? "
+                "ORDER BY id ASC LIMIT ?",
+                (start, end, MAX_ROWS)).fetchall()
+            began = c.execute("SELECT MIN(ts) FROM audit_log").fetchone()
+            dev_all = c.execute(
+                "SELECT COUNT(*) FROM device_seen").fetchone()
+            dev_new = c.execute(
+                "SELECT COUNT(*) FROM device_seen "
+                "WHERE first_seen>=? AND first_seen<?",
+                (start, end)).fetchone()
+        chain_total = c.execute(
+            "SELECT COUNT(*) FROM audit_log").fetchone()[0]
+
+    verdicts = {}
+    actions = {}
+    seqs = []
+    verified = 0
+    mismatched = []
+    link_breaks = []
+    expect_prev = None
+    per_day = {}
+
+    for rid, ts, ev_j, res_j, prev, ah, akey, kseq in rows:
+        try:
+            ev = json.loads(ev_j)
+            res = json.loads(res_j)
+        except Exception:
+            mismatched.append(rid)
+            expect_prev = ah
+            continue
+
+        if _sha({"prev_hash": prev, "ts": ts,
+                 "event": ev, "result": res}) == ah:
+            verified += 1
+        else:
+            mismatched.append(rid)
+
+        if expect_prev is not None and prev != expect_prev:
+            link_breaks.append(rid)
+        expect_prev = ah
+
+        d = str(res.get("decision", "UNRECORDED"))
+        verdicts[d] = verdicts.get(d, 0) + 1
+        a = str(ev.get("action", "unrecorded"))
+        actions[a] = actions.get(a, 0) + 1
+        if kseq is not None:
+            try:
+                seqs.append(int(kseq))
+            except (TypeError, ValueError):
+                pass
+        k = _day(ts)
+        per_day[k] = per_day.get(k, 0) + 1
+
+    # does the first block in the period chain to the one before it
+    entry_link = "no_entries_in_period"
+    if rows:
+        with ctx["lock"]:
+            before = c.execute(
+                "SELECT audit_hash FROM audit_log WHERE id<? "
+                "ORDER BY id DESC LIMIT 1", (rows[0][0],)).fetchone()
+        if before is None:
+            entry_link = ("intact_from_genesis"
+                          if rows[0][4] == "GENESIS" else "broken")
+        else:
+            entry_link = "intact" if rows[0][4] == before[0] else "broken"
+
+    seq = {"applicable": bool(scope and seqs)}
+    if seq["applicable"]:
+        lo, hi = min(seqs), max(seqs)
+        have = set(seqs)
+        missing = [n for n in range(lo, hi + 1) if n not in have]
+        seq.update({"first": lo, "last": hi, "received": len(seqs),
+                    "expected": hi - lo + 1,
+                    "missing": missing[:200],
+                    "gapless": not missing,
+                    "note": "Receipt numbers are issued with no gaps by "
+                            "construction. A missing number is a record "
+                            "that left this chain."})
+
+    clean = (not mismatched and not link_breaks
+             and entry_link in ("intact", "intact_from_genesis"))
+
+    p = {
+        "pack_version": VERSION,
+        "period": label,
+        "period_start": _iso(start),
+        "period_end": _iso(end),
+        "generated_at": _iso(time.time()),
+        "scope": ("key " + str(scope)[:12] + "\u2026") if scope
+                 else "deployment-wide",
+        "unbroken_since": _day(began[0] if began else None),
+        "entries_in_period": len(rows),
+        "chain_total_entries": chain_total,
+        "first_block": rows[0][0] if rows else None,
+        "first_hash": rows[0][5] if rows else None,
+        "last_block": rows[-1][0] if rows else None,
+        "last_hash": rows[-1][5] if rows else None,
+        "integrity": {
+            "clean": clean,
+            "blocks_recomputed": len(rows),
+            "hashes_verified": verified,
+            "hash_mismatches": mismatched[:50],
+            "link_breaks": link_breaks[:50],
+            "link_into_period": entry_link,
+            "method": "SHA-256 over {prev_hash, ts, event, result}, "
+                      "recomputed from the stored row and compared to "
+                      "the hash sealed at the time",
+        },
+        "receipt_sequence": seq,
+        "verdicts": verdicts,
+        "actions": dict(sorted(actions.items(), key=lambda x: -x[1])[:20]),
+        "devices": {"total_ever": dev_all[0] if dev_all else 0,
+                    "first_seen_in_period": dev_new[0] if dev_new else 0},
+        "busiest_days": [{"day": d, "entries": n} for d, n in
+                         sorted(per_day.items(), key=lambda x: -x[1])[:5]],
+        "check_this_yourself": {
+            "offline": "aileash_verify.py - stdlib only, no network",
+            "still_on_this_chain": "/x/consistency/ancestor?tip=<last_hash>",
+            "append_only": "/x/consistency/proof?first=&second=",
+            "record_included": "/x/complete/prove",
+            "who_witnessed_us": "/x/witness/peers",
+        },
+        "this_does_not_prove": [
+            "That any decision recorded here was correct.",
+            "That an external peer's own chain is honest - that is "
+            "checked at the peer's host, not here.",
+            "Anything about periods outside the dates above.",
+        ],
+    }
+    p["pack_digest"] = hashlib.sha256(
+        b"AILEASH-PACK-v1\x00" + json.dumps(
+            p, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return p
+
+
+# ----------------------------------------------------------------------
+# one page, self contained
+# ----------------------------------------------------------------------
+
+def _html(p):
+    ig = p["integrity"]
+    sq = p["receipt_sequence"]
+    good = "#7fe3b0"
+    bad = "#ff8a80"
+
+    def card(inner):
+        return ("<div style='background:#10182e;border:1px solid #223055;"
+                "border-radius:12px;padding:16px;margin-bottom:14px'>"
+                + inner + "</div>")
+
+    def row(k, v):
+        return ("<tr><td style='padding:7px 0;border-bottom:1px solid "
+                "#1d2a4a'>" + str(k) + "</td><td style='padding:7px 0;"
+                "border-bottom:1px solid #1d2a4a;text-align:right;"
+                "color:#c9a84c;font-weight:600'>" + str(v) + "</td></tr>")
+
+    def mono(v):
+        return ("<code style='font:12px ui-monospace,monospace;"
+                "color:#9fb3d9;word-break:break-all'>" + str(v)
+                + "</code>")
+
+    integ = ("<div style='font-size:26px;font-weight:600;color:"
+             + (good if ig["clean"] else bad) + "'>"
+             + str(ig["hashes_verified"]) + " of "
+             + str(ig["blocks_recomputed"]) + " blocks re-verified</div>"
+             "<div style='color:#93a0bd;font-size:13px;margin-top:6px'>"
+             + ig["method"] + "</div>")
+    if not ig["clean"]:
+        integ += ("<div style='color:" + bad + ";font-size:13px;"
+                  "margin-top:8px'>mismatched blocks "
+                  + str(ig["hash_mismatches"]) + " &middot; link breaks "
+                  + str(ig["link_breaks"]) + " &middot; entry link "
+                  + ig["link_into_period"] + "</div>")
+
+    if sq.get("applicable"):
+        seqbox = ("<div style='font-size:20px;font-weight:600;color:"
+                  + (good if sq["gapless"] else bad) + "'>"
+                  + ("Receipt sequence complete" if sq["gapless"]
+                     else "GAPS IN RECEIPT SEQUENCE") + "</div>"
+                  "<div style='color:#93a0bd;font-size:13px'>"
+                  + str(sq["received"]) + " of " + str(sq["expected"])
+                  + " received, numbers " + str(sq["first"]) + " to "
+                  + str(sq["last"]) + "</div>")
+        if not sq["gapless"]:
+            seqbox += ("<div style='color:" + bad + ";font:12px "
+                       "ui-monospace,monospace;margin-top:6px'>missing "
+                       + str(sq["missing"]) + "</div>")
+    else:
+        seqbox = ("<div style='color:#93a0bd;font-size:13px'>Receipt "
+                  "sequence applies to a single key. This pack is "
+                  "deployment-wide.</div>")
+
+    checks = "".join("<li><b>" + k.replace("_", " ") + "</b> " + mono(v)
+                     + "</li>" for k, v in
+                     p["check_this_yourself"].items())
+    nots = "".join("<li>" + x + "</li>" for x in p["this_does_not_prove"])
+
+    return (
+        "<!doctype html><meta charset=utf-8>"
+        "<meta name=viewport content='width=device-width,initial-scale=1'>"
+        "<title>Evidence Pack " + p["period"] + " - AILeash</title>"
+        "<body style='background:#0a0f1e;color:#e8ecf5;margin:0;"
+        "padding:22px;font:15px/1.55 -apple-system,system-ui,sans-serif'>"
+        "<div style='max-width:760px;margin:0 auto'>"
+        "<h1 style='font-size:21px;margin:0 0 4px;color:#c9a84c'>"
+        "Evidence Pack &mdash; " + p["period"] + "</h1>"
+        "<div style='color:#93a0bd;font-size:13px;margin-bottom:20px'>"
+        + p["scope"] + " &middot; " + str(p["period_start"]) + " to "
+        + str(p["period_end"]) + " &middot; generated "
+        + str(p["generated_at"]) + "</div>"
+        + card("<div style='color:#93a0bd;font-size:13px'>Unbroken since"
+               "</div><div style='font-size:26px;color:" + good
+               + ";font-weight:600'>" + str(p["unbroken_since"])
+               + "</div>")
+        + card(integ)
+        + card(seqbox)
+        + card("<table style='width:100%;border-collapse:collapse;"
+               "font-size:14px'>"
+               + row("Entries in period", p["entries_in_period"])
+               + row("Chain total entries", p["chain_total_entries"])
+               + row("Devices, total ever", p["devices"]["total_ever"])
+               + row("Devices first seen this period",
+                     p["devices"]["first_seen_in_period"])
+               + "".join(row(k, v) for k, v in sorted(
+                   p["verdicts"].items()))
+               + "".join(row(k, v) for k, v in p["actions"].items())
+               + "</table>")
+        + card("<div style='color:#93a0bd;font-size:13px'>First block</div>"
+               + mono("#" + str(p["first_block"]) + " "
+                      + str(p["first_hash"]))
+               + "<div style='color:#93a0bd;font-size:13px;margin-top:10px'>"
+                 "Last block</div>"
+               + mono("#" + str(p["last_block"]) + " "
+                      + str(p["last_hash"]))
+               + "<div style='color:#93a0bd;font-size:13px;margin-top:10px'>"
+                 "Pack digest</div>" + mono(p["pack_digest"]))
+        + card("<div style='color:#93a0bd;font-size:13px'>Check every "
+               "figure above yourself:</div><ul style='margin:6px 0 0 18px;"
+               "padding:0;font-size:13px'>" + checks + "</ul>"
+               "<div style='color:#93a0bd;font-size:13px;margin-top:14px'>"
+               "What this pack does not prove:</div>"
+               "<ul style='margin:6px 0 0 18px;padding:0;color:#93a0bd;"
+               "font-size:13px'>" + nots + "</ul>")
+        + "<div style='color:#6d7b99;font-size:12px;margin-top:18px'>"
+          "AILeash &middot; sebbi.pro</div></div>")
+
+
+# ----------------------------------------------------------------------
+
+def _resolve(data, api_key):
+    b = _bounds(data.get("period"))
+    if not b:
+        return None, ({"error": "period_required",
+                       "accepts": ["YYYY", "YYYY-MM", "YYYY-Qn"],
+                       "example": "/x/pack/preview?period=2026-Q2"}, 400)
+    start, end, label = b
+    if end > time.time():
+        return None, ({"error": "period_not_closed", "period": label,
+                       "message": "A pack can only cover a period that "
+                                  "has finished."}, 409)
+    scope = data.get("scope")
+    if scope == "me":
+        scope = api_key
+    return (start, end, label, scope or None), None
+
+
+def handle(method, action, data, api_key, ctx):
+    if action == "spec":
+        return {"module": "pack", "version": VERSION,
+                "purpose": "Re-verifies every block in a period against "
+                           "the hash sealed at the time, and checks the "
+                           "gapless receipt sequence for a single key.",
+                "periods": ["YYYY", "YYYY-MM", "YYYY-Qn"],
+                "routes": {"GET /x/pack/spec": "public",
+                           "GET /x/pack/preview?period=": "keyed, json",
+                           "GET /x/pack/render?period=": "keyed, one page",
+                           "GET /x/pack/history": "keyed",
+                           "POST /x/pack/issue": "keyed, seals the pack"},
+                "scope": "add scope=me for your key only; omit for "
+                         "deployment-wide",
+                "does_not_prove": [
+                    "That any decision recorded here was correct.",
+                    "That an external peer's chain is honest.",
+                ]}, 200
+
+    if not api_key:
+        return {"error": "invalid_api_key"}, 401
+
+    _setup(ctx)
+
+    if method == "GET":
+        if action == "history":
+            with ctx["lock"]:
+                rows = ctx["conn"].execute(
+                    "SELECT period,scope,digest,issued,entries,verified,"
+                    "mismatches,audit_hash,block_index FROM pack_issued "
+                    "WHERE api_key=? ORDER BY id DESC LIMIT 200",
+                    (api_key,)).fetchall()
+            return {"count": len(rows), "packs": [
+                {"period": r[0], "scope": r[1], "digest": r[2],
+                 "issued": _iso(r[3]), "entries": r[4],
+                 "hashes_verified": r[5], "mismatches": r[6],
+                 "sealed_in_chain": r[7], "block_index": r[8]}
+                for r in rows]}, 200
+
+        if action in ("preview", "render"):
+            got, err = _resolve(data, api_key)
+            if err:
+                return err
+            start, end, label, scope = got
+            p = _assemble(ctx, start, end, label, scope)
+            if action == "preview":
+                return p, 200
+            return {"period": label, "content_type": "text/html",
+                    "html": _html(p)}, 200
+
+    if method == "POST" and action == "issue":
+        got, err = _resolve(data, api_key)
+        if err:
+            return err
+        start, end, label, scope = got
+        p = _assemble(ctx, start, end, label, scope)
+        ig = p["integrity"]
+        ts = time.time()
+        ev = {"user_id": "pack:" + label, "action": "evidence_pack_issued",
+              "amount": 0, "country": "UK", "device_id": "pack",
+              "anomaly": 0, "device_risk": 0}
+        res = {"decision": "PACK_ISSUED", "score": 0, "pack_version": VERSION,
+               "timestamp": ts, "period": label, "scope": p["scope"],
+               "entries": p["entries_in_period"],
+               "blocks_recomputed": ig["blocks_recomputed"],
+               "hashes_verified": ig["hashes_verified"],
+               "clean": ig["clean"], "pack_digest": p["pack_digest"],
+               "note": "evidence pack issued; the pack's own digest is "
+                       "now sealed, so the document cannot be edited "
+                       "after the fact"}
+        h, idx, seq = ctx["seal"](ev, res, ts, api_key)
+        with ctx["lock"]:
+            ctx["conn"].execute(
+                "INSERT INTO pack_issued(api_key,period,scope,digest,"
+                "issued,entries,verified,mismatches,audit_hash,"
+                "block_index) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (api_key, label, p["scope"], p["pack_digest"], ts,
+                 p["entries_in_period"], ig["hashes_verified"],
+                 len(ig["hash_mismatches"]), h, idx))
+            ctx["conn"].commit()
+        p["sealed"] = {"audit_hash": h, "block_index": idx,
+                       "receipt_seq": seq}
+        return p, 200
+
+    return {"error": "unknown_action", "action": action,
+            "GET": ["spec", "preview", "render", "history"],
+            "POST": ["issue"]}, 404
+
+```
+
+
+## `modules/packconsole.py`
+
+426 lines, 16973 bytes
+
+```python
+"""
+modules/packconsole.py  -  the evidence pack page at /pack
+
+WHY IT EXISTS
+-------------
+/x/pack/preview, render, issue and history are all keyed. A browser address
+bar cannot send an Authorization header, so from a phone they are unreachable.
+This serves one page that can.
+
+It is deliberately NOT part of console.py. That file is large and editing it
+on a phone risks the whole thing. This adds a second page and touches nothing
+that already works.
+
+SAME PATCH AS console.py / network.py
+-------------------------------------
+The router hands whatever handle() returns to send_json, so a module cannot
+return HTML through it. This patches do_GET at runtime under its own
+attribute name, adds two paths, and passes everything else straight through
+to whatever was there before - including console.py's patch, whichever
+installs first.
+
+And the same catch: after every deploy one /x/ request must arrive before
+/pack exists. Opening /x/packconsole/status does it, and Railway's
+healthcheck on /x/console/status will arm this too once it is listed in
+console.py's SIBLINGS.
+
+THE KEY
+-------
+Typed in, held in a variable for that tab, never written to storage. Close
+the tab and it is gone.
+"""
+
+import sys
+from urllib.parse import urlparse
+
+VERSION = "1.0"
+
+PUBLIC = {("GET", "status")}
+
+PAGE_PATHS = ("/pack", "/pack.html", "/pack-console")
+
+_patched = [False]
+
+
+PAGE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Evidence pack - AILeash</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--ink:#0a0f1e;--panel:#131b2e;--panel2:#1a2338;
+ --edge:rgba(201,168,76,.22);--gold:#c9a84c;--gold-dim:#8a7233;
+ --text:#f2efe6;--mute:rgba(242,239,230,.42);--ok:#7fe3b0;--bad:#c8362b;
+ --mono:ui-monospace,'IBM Plex Mono',monospace}
+body{background:var(--ink);color:var(--text);font:16px/1.6 system-ui,
+ -apple-system,sans-serif;padding:0 0 60px}
+.wrap{max-width:640px;margin:0 auto;padding:0 18px}
+header{padding:32px 0 20px;border-bottom:1px solid var(--edge);
+ margin-bottom:24px}
+.eyebrow{font-family:var(--mono);font-size:10px;letter-spacing:.24em;
+ text-transform:uppercase;color:var(--gold);margin-bottom:10px}
+h1{font-size:34px;line-height:1;letter-spacing:-.02em;font-weight:800}
+h1 span{color:var(--gold)}
+.sub{color:var(--mute);font-size:14.5px;margin-top:12px;max-width:46ch}
+label{display:block;font-family:var(--mono);font-size:10px;
+ letter-spacing:.16em;text-transform:uppercase;color:var(--mute);
+ margin-bottom:7px}
+input{width:100%;background:var(--panel);border:1px solid var(--edge);
+ color:var(--text);font-family:var(--mono);font-size:13px;padding:12px 13px;
+ border-radius:4px;outline:none}
+input:focus{border-color:var(--gold)}
+.box{background:var(--panel2);border:1px solid var(--edge);border-radius:6px;
+ padding:16px;margin-bottom:16px}
+.note{font-size:12px;color:var(--mute);margin-top:9px;line-height:1.55}
+.field{margin-bottom:12px}
+.seg{display:flex;gap:8px}
+.seg button{flex:1}
+button{width:100%;background:var(--gold);color:var(--ink);border:none;
+ border-radius:4px;padding:13px;font-weight:700;font-size:14.5px;
+ cursor:pointer;font-family:inherit}
+button:hover:not(:disabled){background:#dbbd63}
+button:disabled{opacity:.45;cursor:default}
+button.quiet{background:transparent;color:var(--mute);
+ border:1px solid var(--edge)}
+button.quiet.on{color:var(--ink);background:var(--gold);border-color:var(--gold)}
+button.quiet:hover:not(:disabled):not(.on){color:var(--text);
+ border-color:var(--gold)}
+.row{display:flex;gap:8px;margin-top:10px}
+.row button{flex:1}
+#out{margin-top:24px}
+.verdict{border:1px solid var(--edge);border-radius:6px;background:var(--panel);
+ overflow:hidden;margin-bottom:14px}
+.v-head{padding:22px 18px;border-bottom:1px solid var(--edge)}
+.v-word{font-size:38px;line-height:1;letter-spacing:-.02em;font-weight:800}
+.v-ok{color:var(--ok)}.v-bad{color:var(--bad)}.v-mute{color:var(--mute)}
+.v-why{color:var(--mute);font-size:13.5px;margin-top:10px;line-height:1.6}
+.v-stats{display:flex;flex-wrap:wrap;gap:18px;padding:14px 18px;
+ border-bottom:1px solid var(--edge);font-family:var(--mono);font-size:11px}
+.v-stats b{display:block;font-size:19px;color:var(--text);font-weight:700;
+ margin-top:3px;font-family:inherit}
+.v-stats span{color:var(--mute);letter-spacing:.1em;text-transform:uppercase}
+.lin{padding:14px 18px;border-bottom:1px solid var(--edge)}
+.lin:last-child{border-bottom:none}
+.strip-l{font-family:var(--mono);font-size:10px;letter-spacing:.16em;
+ text-transform:uppercase;color:var(--gold);margin-bottom:10px}
+.kv{display:flex;justify-content:space-between;gap:14px;padding:6px 0;
+ border-bottom:1px solid rgba(201,168,76,.10);font-size:13.5px}
+.kv:last-child{border-bottom:none}
+.kv b{color:var(--gold);font-family:var(--mono);font-size:12.5px}
+pre{font-family:var(--mono);font-size:11.5px;line-height:1.65;
+ background:#080c16;color:var(--ok);padding:15px;border-radius:5px;
+ overflow-x:auto;border:1px solid var(--edge);max-height:320px}
+.msg{font-family:var(--mono);font-size:12.5px;padding:13px 15px;
+ border-radius:5px;border:1px solid var(--edge);color:var(--mute);
+ margin-bottom:14px}
+.msg.bad{color:#ffb4ad;border-color:rgba(200,54,43,.5);
+ background:rgba(200,54,43,.08)}
+.msg.good{color:var(--ok);border-color:rgba(127,227,176,.35);
+ background:rgba(26,158,110,.08)}
+.working:after{content:'';animation:dots 1.2s steps(4,end) infinite}
+@keyframes dots{0%{content:''}25%{content:'.'}50%{content:'..'}
+ 75%{content:'...'}}
+iframe{width:100%;height:70vh;border:1px solid var(--edge);border-radius:6px;
+ background:#0a0f1e;margin-top:12px}
+code{font-family:var(--mono);font-size:12px;color:#9fb3d9;
+ word-break:break-all}
+footer{margin-top:32px;padding-top:18px;border-top:1px solid var(--edge);
+ font-family:var(--mono);font-size:10.5px;color:var(--mute);line-height:1.8}
+a{color:var(--gold)}
+:focus-visible{outline:2px solid var(--gold);outline-offset:2px}
+@media(prefers-reduced-motion:reduce){*{animation:none!important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <p class="eyebrow">AILeash &middot; evidence pack</p>
+  <h1>The <span>document</span></h1>
+  <p class="sub">Re-verifies every block in a period against the hash sealed
+  at the time. Not a summary of the chain &mdash; a check of it.</p>
+</header>
+
+<div class="box">
+  <label for="key">API key</label>
+  <input id="key" type="password" placeholder="al_live_&hellip;"
+   autocomplete="off" spellcheck="false">
+  <p class="note">Held in memory for this tab only. Nothing is written to
+  the device.</p>
+</div>
+
+<div class="box">
+  <div class="field">
+    <label for="period">Period</label>
+    <input id="period" value="2026-Q2" autocomplete="off"
+     placeholder="2026-Q2, 2026-07 or 2026">
+  </div>
+  <label>Scope</label>
+  <div class="seg">
+    <button class="quiet on" id="sc-me" onclick="setScope('me')">My key</button>
+    <button class="quiet" id="sc-all" onclick="setScope('')">Whole deployment</button>
+  </div>
+  <p class="note">Receipt-sequence checking only applies to a single key.
+  A deployment-wide pack still re-verifies every hash.</p>
+  <div class="row">
+    <button onclick="go('preview')">Preview</button>
+    <button onclick="go('render')">View page</button>
+  </div>
+  <div class="row">
+    <button class="quiet" onclick="go('history')">Past packs</button>
+    <button class="quiet" onclick="go('issue')">Issue &amp; seal</button>
+  </div>
+  <p class="note">Issuing seals the pack's own digest into the chain, so the
+  document cannot be edited afterwards. It cannot be withdrawn.</p>
+</div>
+
+<div id="out"></div>
+
+<footer>
+  Spec: <a href="/x/pack/spec">/x/pack/spec</a> &middot;
+  Chain: <a href="/api/verify-chain">/api/verify-chain</a> &middot;
+  Console: <a href="/console">/console</a>
+</footer>
+
+</div>
+
+<script>
+(function(){
+  var out=document.getElementById('out'), busy=false, scope='me';
+
+  window.setScope=function(v){
+    scope=v;
+    document.getElementById('sc-me').classList.toggle('on',v==='me');
+    document.getElementById('sc-all').classList.toggle('on',v==='');
+  };
+
+  function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+  function msg(t,k){out.innerHTML='<div class="msg '+(k||'')+'">'+esc(t)+'</div>';}
+  function raw(o){return '<pre>'+esc(JSON.stringify(o,null,2))+'</pre>';}
+  function key(){var k=document.getElementById('key').value.trim();
+    if(!k){msg('Paste your API key at the top first.','bad');return null;}return k;}
+
+  async function call(path,method,body){
+    var k=key(); if(!k) return null;
+    var o={method:method,headers:{'Authorization':'Bearer '+k}};
+    if(body){o.headers['Content-Type']='application/json';
+      o.body=JSON.stringify(body);}
+    var r=await fetch(path,o), d;
+    try{d=await r.json();}catch(e){d={error:'unreadable_response'};}
+    return {status:r.status,data:d};
+  }
+
+  function qs(){
+    var p=encodeURIComponent(document.getElementById('period').value.trim());
+    return '?period='+p+(scope?'&scope='+scope:'');
+  }
+
+  function renderPack(d){
+    var ig=d.integrity||{}, sq=d.receipt_sequence||{};
+    var clean=!!ig.clean;
+    var h='<div class="verdict"><div class="v-head">'
+      +'<div class="v-word '+(clean?'v-ok':'v-bad')+'">'
+      +esc(ig.hashes_verified)+' of '+esc(ig.blocks_recomputed)
+      +'</div><div class="v-why">blocks re-verified &mdash; '
+      +esc(ig.method||'')+'</div></div>'
+      +'<div class="v-stats">'
+      +'<div><span>period</span><b>'+esc(d.period)+'</b></div>'
+      +'<div><span>entries</span><b>'+esc(d.entries_in_period)+'</b></div>'
+      +'<div><span>unbroken since</span><b style="font-size:14px">'
+      +esc(d.unbroken_since)+'</b></div>'
+      +'<div><span>devices</span><b>'
+      +esc((d.devices||{}).total_ever)+'</b></div></div>';
+
+    if(!clean){
+      h+='<div class="lin"><div class="strip-l">Problems found</div>'
+        +'<div class="kv"><span>mismatched blocks</span><b>'
+        +esc(JSON.stringify(ig.hash_mismatches||[]))+'</b></div>'
+        +'<div class="kv"><span>link breaks</span><b>'
+        +esc(JSON.stringify(ig.link_breaks||[]))+'</b></div>'
+        +'<div class="kv"><span>link into period</span><b>'
+        +esc(ig.link_into_period)+'</b></div></div>';
+    }
+
+    h+='<div class="lin"><div class="strip-l">Receipt sequence</div>';
+    if(sq.applicable){
+      h+='<div class="kv"><span>'+(sq.gapless?'Complete, no gaps'
+         :'GAPS FOUND')+'</span><b>'+esc(sq.received)+' of '
+         +esc(sq.expected)+'</b></div>';
+      if(!sq.gapless){h+='<div class="kv"><span>missing</span><b>'
+         +esc(JSON.stringify(sq.missing))+'</b></div>';}
+    } else {
+      h+='<div class="kv"><span>Not applicable to a deployment-wide pack'
+         +'</span><b>&mdash;</b></div>';
+    }
+    h+='</div>';
+
+    var vs=d.verdicts||{};
+    if(Object.keys(vs).length){
+      h+='<div class="lin"><div class="strip-l">Verdicts in period</div>';
+      Object.keys(vs).sort().forEach(function(k){
+        h+='<div class="kv"><span>'+esc(k)+'</span><b>'+esc(vs[k])
+          +'</b></div>';});
+      h+='</div>';
+    }
+
+    h+='<div class="lin"><div class="strip-l">Chain range</div>'
+      +'<div class="kv"><span>first</span><b>#'+esc(d.first_block)
+      +'</b></div><div class="kv"><span>last</span><b>#'+esc(d.last_block)
+      +'</b></div><div class="kv"><span>pack digest</span></div>'
+      +'<code>'+esc(d.pack_digest)+'</code></div>';
+
+    if(d.sealed){
+      h+='<div class="lin"><div class="strip-l">Sealed into the chain</div>'
+        +'<div class="kv"><span>block</span><b>'+esc(d.sealed.block_index)
+        +'</b></div><code>'+esc(d.sealed.audit_hash)+'</code></div>';
+    }
+    h+='</div>';
+    return h;
+  }
+
+  function renderHistory(d){
+    if(!d.count) return '<div class="msg">No packs issued yet.</div>';
+    var h='<div class="verdict"><div class="v-head">'
+      +'<div class="v-word v-ok">'+esc(d.count)+'</div>'
+      +'<div class="v-why">packs issued and sealed</div></div><div class="lin">';
+    (d.packs||[]).forEach(function(p){
+      h+='<div class="kv"><span>'+esc(p.period)+' &middot; '+esc(p.issued)
+        +'</span><b>'+esc(p.hashes_verified)+' verified'
+        +(p.mismatches?' / '+esc(p.mismatches)+' bad':'')+'</b></div>';});
+    h+='</div></div>';
+    return h;
+  }
+
+  window.go=async function(what){
+    if(busy) return;
+    var period=document.getElementById('period').value.trim();
+    if(what!=='history' && !period){
+      msg('Give a period: 2026-Q2, 2026-07 or 2026.','bad'); return; }
+    busy=true;
+    out.innerHTML='<div class="msg"><span class="working">Re-verifying every '
+      +'block in the period</span></div>';
+    try{
+      var res;
+      if(what==='preview') res=await call('/x/pack/preview'+qs(),'GET');
+      else if(what==='render') res=await call('/x/pack/render'+qs(),'GET');
+      else if(what==='history') res=await call('/x/pack/history','GET');
+      else res=await call('/x/pack/issue','POST',
+        {period:period,scope:scope||undefined});
+      if(!res){busy=false;return;}
+
+      if(res.status===401){
+        msg('That key was refused. Check it and try again.','bad');
+      } else if(res.status===404 && res.data
+                && res.data.error==='unknown_module'){
+        msg('The pack module is not deployed. Open /x/pack/spec first.','bad');
+      } else if(res.status>=400){
+        out.innerHTML='<div class="msg bad">'
+          +esc((res.data&&(res.data.message||res.data.error))
+               ||('HTTP '+res.status))+'</div>'+raw(res.data);
+      } else if(what==='render' && res.data.html){
+        var f=document.createElement('iframe');
+        f.setAttribute('sandbox','');
+        f.srcdoc=res.data.html;
+        out.innerHTML='<div class="msg good">The pack as one page. Long-press '
+          +'to save, or screenshot it.</div>';
+        out.appendChild(f);
+      } else if(what==='history'){
+        out.innerHTML=renderHistory(res.data)+raw(res.data);
+      } else if(res.data.integrity){
+        var pre = (what==='issue')
+          ? '<div class="msg good">Issued and sealed. This cannot be '
+            +'withdrawn.</div>' : '';
+        out.innerHTML=pre+renderPack(res.data)+raw(res.data);
+      } else {
+        out.innerHTML='<div class="msg good">Done.</div>'+raw(res.data);
+      }
+    }catch(e){
+      msg('Could not reach the server.','bad');
+    }
+    busy=false;
+  };
+})();
+</script>
+</body>
+</html>
+"""
+
+
+def _srv():
+    m = sys.modules.get("__main__")
+    if hasattr(m, "get_bearer"):
+        return m
+    return sys.modules.get("server")
+
+
+def _install(s):
+    if _patched[0]:
+        return "already installed"
+    H = getattr(s, "Handler", None)
+    if H is None or not hasattr(H, "do_GET"):
+        return "no handler"
+    if getattr(H, "_packconsole_patched", False):
+        _patched[0] = True
+        return "already installed"
+
+    original = H.do_GET
+
+    def do_GET(self):
+        try:
+            p = urlparse(self.path).path.rstrip("/") or "/"
+        except Exception:
+            p = self.path or "/"
+        if p in PAGE_PATHS:
+            body = PAGE.encode("utf-8")
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Robots-Tag", "noindex, nofollow")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception:
+                pass
+            return
+        return original(self)
+
+    H.do_GET = do_GET
+    H._packconsole_patched = True
+    _patched[0] = True
+    print("PACKCONSOLE: /pack page installed at runtime", flush=True)
+    return "installed"
+
+
+def handle(method, action, data, api_key, ctx):
+    s = _srv()
+    if s is None:
+        return {"error": "server_not_found"}, 500
+
+    state = "already installed" if _patched[0] else None
+    if not _patched[0]:
+        try:
+            state = _install(s)
+        except Exception as exc:
+            print("PACKCONSOLE: patch failed - " + str(exc), flush=True)
+            state = "failed: " + str(exc)
+
+    if method == "GET" and (action or "") in ("", "status"):
+        return {"page": "/pack",
+                "installed": bool(_patched[0]),
+                "install_result": state,
+                "version": VERSION,
+                "calls": ["/x/pack/preview", "/x/pack/render",
+                          "/x/pack/issue", "/x/pack/history"],
+                "note": ("The page holds no credentials. Every route it "
+                         "calls checks the key itself.")}, 200
+
+    return {"error": "unknown_action", "action": action,
+            "GET": ["status"]}, 404
+
+```
 
 
 ## `modules/peer.py`
@@ -1669,453 +2613,5 @@ def handle(method, action, data, api_key, ctx):
     return {"error": "unknown_action", "action": action,
             "GET": ["spec", "history", "verify", "list"],
             "POST": ["seal (keyed)"]}, 404
-
-```
-
-
-## `modules/reconcile.py`
-
-440 lines, 20123 bytes
-
-```python
-"""
-Reconciliation notary - /x/reconcile/<action>
-
-THE PROBLEM THIS ATTACKS
-------------------------
-A sealed chain proves records were not altered after the fact. It does not
-prove they were true when written. An operator who seals fiction on time has
-a tamper-evident chain of fiction. Every honest person in this market knows
-that, and almost nobody says it.
-
-You cannot prove truth from outside a system. What you CAN do is what real
-auditors do: substantive testing. Take the sealed claim, go to the operator's
-own live system, and check whether the two agree - then seal the result of
-that check, including the failures.
-
-WHY THIS ONE IS DIFFERENT
--------------------------
-The sample is fixed before the operator sees it.
-
-/plan derives a selection seed from the current chain tip - a value the
-operator cannot predict in advance and cannot change afterwards without
-breaking the chain - picks the records to be tested, and seals that selection
-BEFORE any data is requested. Only then are the record identifiers returned.
-
-So the operator cannot choose which records get examined, cannot prepare only
-the flattering ones, and cannot quietly drop a test that came back badly:
-every planned run is sealed at the moment it is planned, and a plan with no
-submitted result is visible forever as an abandoned test.
-
-Mismatches are sealed with the same permanence as matches. That is the whole
-design. A reconciliation system that can bury its own failures is decoration.
-
-WHAT A PASS ACTUALLY MEANS
---------------------------
-That two systems the operator controls agree with each other, on records the
-operator could not choose, at a time the operator could not pick.
-
-That is not proof of truth. An operator who fabricates consistently across
-every system, in real time, without knowing what will be sampled, will pass.
-What it does is raise the cost of lying from "edit one database" to
-"maintain a coherent parallel reality across independent systems indefinitely,
-under unpredictable sampling, with every failure sealed permanently."
-
-That is the honest claim. It is also, as far as I know, more than anyone else
-in this market is doing.
-
-HONEST LIMITS
--------------
-- Consistency is not truth. Two agreeing systems can both be wrong.
-- The operator supplies the comparison data. This tests their systems against
-  each other, not against the world.
-- Sampling only covers what has been sealed. It cannot find a decision that
-  was never recorded at all - gapless receipts are what cover that.
-- A high match rate on a badly chosen field proves nothing. Reconcile the
-  fields that would hurt to get wrong.
-
-    POST /x/reconcile/plan     sample_size, field  - seals the selection first
-    POST /x/reconcile/submit   run_id, results     - seals the comparison
-    GET  /x/reconcile/run?id=RUN-XXXXXXXX
-    GET  /x/reconcile/score
-    GET  /x/reconcile/list
-"""
-
-import hashlib, json, time
-from datetime import datetime, timezone
-
-VERSION = "1.1"
-MAX_SAMPLE = 200
-
-# Planning and submitting stay keyed - they touch an operator's own records.
-# What is public is the part that decides whether any of it means anything:
-# that the sample was fixed before the data was asked for, and that failures
-# were sealed as permanently as passes.
-PUBLIC = {("GET", "public"), ("GET", "proof")}
-
-_ready = False
-
-
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        ctx["conn"].execute("CREATE TABLE IF NOT EXISTS reconcile_runs(run_id TEXT PRIMARY KEY,api_key TEXT,field TEXT,seed TEXT,planned REAL,submitted REAL,sample_size INTEGER,matched INTEGER,mismatched INTEGER,missing INTEGER,status TEXT DEFAULT 'planned',block_ids TEXT,detail TEXT)")
-        ctx["conn"].execute("CREATE INDEX IF NOT EXISTS idx_rec_key ON reconcile_runs(api_key)")
-        ctx["conn"].commit()
-    _ready = True
-
-
-def _iso(ts):
-    if not ts:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
-
-def _sha(s):
-    return hashlib.sha256(s.encode()).hexdigest()
-
-
-def _seal_event(ctx, api_key, rid, action, detail):
-    ts = time.time()
-    ev = {"user_id": "rec:" + rid, "action": "reconcile_" + action, "amount": 0,
-          "country": "UK", "device_id": "reconcile", "anomaly": 0, "device_risk": 0}
-    res = {"decision": "RECONCILE_SEALED", "score": 0, "reconcile_action": action,
-           "reconcile_version": VERSION, "timestamp": ts, "detail": detail}
-    h, idx, seq = ctx["seal"](ev, res, ts, api_key)
-    return h, idx, seq, ts
-
-
-def _plan(ctx, api_key, data):
-    try:
-        n = int(data.get("sample_size", 25))
-    except Exception:
-        return {"error": "invalid_sample_size"}, 400
-    if n < 1 or n > MAX_SAMPLE:
-        return {"error": "sample_size_out_of_range", "max": MAX_SAMPLE}, 400
-    field = str(data.get("field", "decision")).strip()[:60] or "decision"
-
-    with ctx["lock"]:
-        tiprow = ctx["conn"].execute("SELECT audit_hash FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()
-        rows = ctx["conn"].execute("SELECT id,user_id,result_json,ts FROM audit_log WHERE api_key=? ORDER BY id ASC", (api_key,)).fetchall()
-
-    if not rows:
-        return {"error": "nothing_to_reconcile",
-                "message": "No sealed records under this key yet."}, 400
-
-    tip = tiprow[0] if tiprow else "GENESIS"
-    ts = time.time()
-    # Seed is bound to the chain tip. The operator cannot know it before the
-    # records exist, and cannot alter it afterwards without breaking the chain.
-    seed = _sha(tip + ":" + str(int(ts)) + ":" + field + ":" + str(n))
-
-    # Deterministic selection from the seed - reproducible by anyone holding it.
-    scored = sorted(rows, key=lambda r: _sha(seed + ":" + str(r[0])))
-    picked = scored[:min(n, len(scored))]
-
-    rid = "RUN-" + seed[:8].upper()
-    block_ids = [p[0] for p in picked]
-
-    sample = []
-    for bid, uid, res_json, bts in picked:
-        try:
-            r = json.loads(res_json)
-            sealed_val = r.get(field)
-        except Exception:
-            sealed_val = None
-        sample.append({"block_index": bid, "record_id": uid,
-                       "sealed_at": _iso(bts),
-                       "sealed_value_sha256": _sha(str(sealed_val))})
-
-    detail = ("field=" + field + ";sample_size=" + str(len(picked)) +
-              ";seed=" + seed + ";from_tip=" + tip +
-              ";blocks=" + ",".join(str(b) for b in block_ids[:60]))
-    h, idx, seq, _x = _seal_event(ctx, api_key, rid, "planned", detail)
-
-    with ctx["lock"]:
-        ctx["conn"].execute("INSERT OR REPLACE INTO reconcile_runs(run_id,api_key,field,seed,planned,submitted,sample_size,matched,mismatched,missing,status,block_ids,detail) VALUES(?,?,?,?,?,NULL,?,NULL,NULL,NULL,'planned',?,NULL)",
-                            (rid, api_key, field, seed, ts, len(picked), json.dumps(block_ids)))
-        ctx["conn"].commit()
-
-    return {"run_id": rid, "field": field, "sample_size": len(picked),
-            "seed": seed, "derived_from_tip": tip, "planned_at": _iso(ts),
-            "audit_hash": h, "block_index": idx, "receipt_seq": seq,
-            "sample": sample,
-            "next": "Fetch these record_ids from your own live system and POST them to /x/reconcile/submit",
-            "note": "This selection is now sealed. It cannot be changed, and an unsubmitted plan stays visible as an abandoned test."}, 200
-
-
-def _submit(ctx, api_key, data):
-    rid = str(data.get("run_id", "")).strip().upper()
-    with ctx["lock"]:
-        row = ctx["conn"].execute("SELECT field,seed,status,block_ids FROM reconcile_runs WHERE run_id=? AND api_key=?", (rid, api_key)).fetchone()
-    if not row:
-        return {"error": "unknown_run_id"}, 404
-    if row[2] != "planned":
-        return {"error": "already_submitted",
-                "message": "A run is reconciled once. Re-running until it passes is not reconciliation."}, 400
-
-    results = data.get("results")
-    if not isinstance(results, dict) or not results:
-        return {"error": "results_required",
-                "message": "Send {block_index: live_value} from your own system."}, 400
-
-    field = row[0]
-    block_ids = json.loads(row[3])
-
-    with ctx["lock"]:
-        rows = ctx["conn"].execute("SELECT id,user_id,result_json FROM audit_log WHERE id IN (" + ",".join("?" * len(block_ids)) + ")", block_ids).fetchall()
-
-    sealed = {}
-    for bid, uid, res_json in rows:
-        try:
-            sealed[bid] = json.loads(res_json).get(field)
-        except Exception:
-            sealed[bid] = None
-
-    matched, mismatched, missing = [], [], []
-    for bid in block_ids:
-        key = str(bid)
-        if key not in results:
-            missing.append({"block_index": bid})
-            continue
-        live = results[key]
-        want = sealed.get(bid)
-        if str(live).strip().lower() == str(want).strip().lower():
-            matched.append(bid)
-        else:
-            mismatched.append({"block_index": bid,
-                               "sealed_value": want,
-                               "live_value": live})
-
-    ts = time.time()
-    rate = round(100 * len(matched) / len(block_ids), 2) if block_ids else 0
-    detail = ("field=" + field + ";matched=" + str(len(matched)) +
-              ";mismatched=" + str(len(mismatched)) + ";missing=" + str(len(missing)) +
-              ";match_rate=" + str(rate) +
-              ";mismatch_blocks=" + ",".join(str(m["block_index"]) for m in mismatched[:40]))
-    h, idx, seq, _x = _seal_event(ctx, api_key, rid, "reconciled", detail)
-
-    with ctx["lock"]:
-        ctx["conn"].execute("UPDATE reconcile_runs SET submitted=?,matched=?,mismatched=?,missing=?,status='reconciled',detail=? WHERE run_id=? AND api_key=?",
-                            (ts, len(matched), len(mismatched), len(missing), json.dumps({"mismatched": mismatched[:100], "missing": missing[:100]}), rid, api_key))
-        ctx["conn"].commit()
-
-    out = {"run_id": rid, "field": field, "sample_size": len(block_ids),
-           "matched": len(matched), "mismatched": len(mismatched),
-           "missing": len(missing), "match_rate_pct": rate,
-           "reconciled_at": _iso(ts), "audit_hash": h, "block_index": idx,
-           "receipt_seq": seq,
-           "note": "This result is sealed whichever way it went. It cannot be withdrawn."}
-    if mismatched:
-        out["mismatches"] = mismatched[:20]
-        out["flag"] = "sealed records and live system disagree on " + str(len(mismatched)) + " of " + str(len(block_ids))
-    if missing:
-        out["missing_detail"] = "records the live system did not return - a gap, not a match"
-    return out, 200
-
-
-def _run(ctx, api_key, rid):
-    with ctx["lock"]:
-        row = ctx["conn"].execute("SELECT field,seed,planned,submitted,sample_size,matched,mismatched,missing,status,detail FROM reconcile_runs WHERE run_id=? AND api_key=?", (rid.upper(), api_key)).fetchone()
-        if not row:
-            return {"error": "unknown_run_id"}, 404
-        blocks = ctx["conn"].execute("SELECT ts,result_json,audit_hash FROM audit_log WHERE user_id=? ORDER BY id ASC", ("rec:" + rid.upper(),)).fetchall()
-    events = []
-    for bts, res, ah in blocks:
-        try:
-            r = json.loads(res)
-            events.append({"at": _iso(bts), "event": r.get("reconcile_action"),
-                           "detail": r.get("detail"), "sealed": ah})
-        except Exception:
-            pass
-    total = row[4] or 0
-    out = {"run_id": rid.upper(), "field": row[0], "seed": row[1],
-           "planned": _iso(row[2]), "submitted": _iso(row[3]),
-           "sample_size": total, "matched": row[5], "mismatched": row[6],
-           "missing": row[7], "status": row[8], "events": events,
-           "ordering_proof": "The plan block precedes the result block. The sample was fixed before any data was requested."}
-    if row[9]:
-        try:
-            out["detail"] = json.loads(row[9])
-        except Exception:
-            pass
-    if row[8] == "planned":
-        out["flag"] = "planned but never submitted - an abandoned test, visible permanently"
-    return out, 200
-
-
-def _score(ctx, api_key):
-    with ctx["lock"]:
-        rows = ctx["conn"].execute("SELECT sample_size,matched,mismatched,missing,status,planned FROM reconcile_runs WHERE api_key=? ORDER BY planned DESC LIMIT 500", (api_key,)).fetchall()
-    if not rows:
-        return {"runs": 0, "note": "No reconciliation runs on record."}, 200
-    done = [r for r in rows if r[4] == "reconciled"]
-    abandoned = len(rows) - len(done)
-    tested = sum(r[0] or 0 for r in done)
-    ok = sum(r[1] or 0 for r in done)
-    bad = sum(r[2] or 0 for r in done)
-    gone = sum(r[3] or 0 for r in done)
-    out = {"runs": len(rows), "reconciled": len(done), "abandoned": abandoned,
-           "records_tested": tested, "matched": ok, "mismatched": bad,
-           "missing": gone,
-           "match_rate_pct": (round(100 * ok / tested, 2) if tested else None),
-           "last_run": _iso(rows[0][5])}
-    if abandoned:
-        out["flag"] = str(abandoned) + " planned run(s) never submitted"
-    return out, 200
-
-
-def _list(ctx, api_key):
-    with ctx["lock"]:
-        rows = ctx["conn"].execute("SELECT run_id,field,planned,submitted,sample_size,matched,mismatched,missing,status FROM reconcile_runs WHERE api_key=? ORDER BY planned DESC LIMIT 200", (api_key,)).fetchall()
-    return {"count": len(rows),
-            "runs": [{"run_id": r[0], "field": r[1], "planned": _iso(r[2]),
-                      "submitted": _iso(r[3]), "sample_size": r[4],
-                      "matched": r[5], "mismatched": r[6], "missing": r[7],
-                      "status": r[8]} for r in rows]}, 200
-
-
-def _public(ctx):
-    """The reconciliation record, readable without a key.
-
-    Counts only. No record identifiers, no field values, no operator
-    identity. What a stranger gets is the three numbers that cannot be
-    flattered: how many runs were reconciled, how many disagreed, and how
-    many were planned and then quietly abandoned.
-
-    Abandoned runs are the important one. A planned run is sealed at the
-    moment it is planned, so a test that came back badly and was dropped
-    cannot be deleted - it sits here forever as a plan with no result.
-    """
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT run_id,field,planned,submitted,sample_size,matched,mismatched,"
-            "missing,status FROM reconcile_runs ORDER BY planned DESC LIMIT 200").fetchall()
-
-    done = [r for r in rows if r[8] == "reconciled"]
-    abandoned = [r for r in rows if r[8] != "reconciled"]
-    tested = sum(r[4] or 0 for r in done)
-    ok = sum(r[5] or 0 for r in done)
-    bad = sum(r[6] or 0 for r in done)
-    gone = sum(r[7] or 0 for r in done)
-
-    out = {
-        "runs": len(rows),
-        "reconciled": len(done),
-        "abandoned": len(abandoned),
-        "records_tested": tested,
-        "matched": ok,
-        "mismatched": bad,
-        "missing": gone,
-        "match_rate_pct": (round(100 * ok / tested, 2) if tested else None),
-        "recent": [{"run_id": r[0], "field": r[1], "planned": _iso(r[2]),
-                    "submitted": _iso(r[3]), "sample_size": r[4],
-                    "matched": r[5], "mismatched": r[6], "missing": r[7],
-                    "status": r[8]} for r in rows[:50]],
-        "check_any_of_them": "/x/reconcile/proof?id=RUN-XXXXXXXX",
-        "what_is_being_shown": "Not that the records are true. That the sample was fixed "
-                               "before the data was requested, and that what came back was "
-                               "sealed either way.",
-        "what_a_mismatch_means": "The sealed record and the operator's own live system "
-                                 "disagreed. It is published because a reconciliation system "
-                                 "that can bury its own failures is decoration.",
-    }
-    if abandoned:
-        out["flag"] = (str(len(abandoned)) + " run(s) planned and never submitted. A sample was "
-                       "fixed, and no result was ever sealed against it.")
-    return out, 200
-
-
-def _proof(ctx, rid):
-    """The ordering, straight out of the chain, without a key.
-
-    Both events are already sealed under a public identifier, so this route
-    reveals nothing the chain does not already carry. It just makes the one
-    claim that matters legible: the plan block comes before the result block.
-    """
-    rid = (rid or "").strip().upper()
-    if not rid:
-        return {"error": "id_required"}, 400
-
-    with ctx["lock"]:
-        row = ctx["conn"].execute(
-            "SELECT field,seed,planned,submitted,sample_size,matched,mismatched,missing,status "
-            "FROM reconcile_runs WHERE run_id=?", (rid,)).fetchone()
-        blocks = ctx["conn"].execute(
-            "SELECT id,ts,result_json,audit_hash FROM audit_log WHERE user_id=? ORDER BY id ASC",
-            ("rec:" + rid,)).fetchall()
-    if not row:
-        return {"error": "unknown_run_id", "list": "/x/reconcile/public"}, 404
-
-    events = []
-    plan_block = result_block = None
-    for bid, bts, res, ah in blocks:
-        try:
-            r = json.loads(res)
-        except Exception:
-            continue
-        what = r.get("reconcile_action")
-        events.append({"event": what, "at": _iso(bts), "block_index": bid,
-                       "sealed_in_chain": ah, "sealed_detail": r.get("detail")})
-        if what == "planned" and plan_block is None:
-            plan_block = bid
-        if what == "reconciled" and result_block is None:
-            result_block = bid
-
-    ordered = (plan_block is not None and result_block is not None
-               and plan_block < result_block)
-
-    out = {"run_id": rid, "field": row[0], "status": row[8],
-           "seed": row[1], "planned_at": _iso(row[2]), "submitted_at": _iso(row[3]),
-           "sample_size": row[4], "matched": row[5], "mismatched": row[6],
-           "missing": row[7],
-           "plan_block_index": plan_block, "result_block_index": result_block,
-           "selection_precedes_result": ordered,
-           "events": events,
-           "how_to_check_this_yourself": [
-               "The seed is derived from the chain tip at planning time, which the operator "
-               "cannot predict in advance or change afterwards without breaking the chain.",
-               "The plan block seals which records were selected, and its detail is above.",
-               "The result block seals what came back. Compare the two block indices.",
-               "A lower plan index than result index means the sample was fixed before any "
-               "data was requested. That is the whole claim, and it is the only one made."],
-           "what_this_does_not_prove": "That the records are true. Two systems the operator "
-                                       "controls agreeing with each other is consistency, not "
-                                       "truth."}
-    if row[8] != "reconciled":
-        out["flag"] = ("planned and never submitted. The selection is sealed and no result "
-                       "was ever put against it.")
-    elif not ordered:
-        out["flag"] = ("the plan block does not precede the result block. That should be "
-                       "impossible and it is the finding.")
-    return out, 200
-
-
-def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-    if method == "POST":
-        if action == "plan":
-            return _plan(ctx, api_key, data)
-        if action == "submit":
-            return _submit(ctx, api_key, data)
-    else:
-        if action == "public":
-            return _public(ctx)
-        if action == "proof":
-            return _proof(ctx, str((data or {}).get("id", "")))
-        if action == "score":
-            return _score(ctx, api_key)
-        if action == "list":
-            return _list(ctx, api_key)
-        if action == "run":
-            rid = str(data.get("id", "")).strip()
-            if not rid:
-                return {"error": "id_required"}, 400
-            return _run(ctx, api_key, rid)
-    return {"error": "unknown_action", "action": action,
-            "GET": ["public", "proof", "score", "list", "run"],
-            "POST": ["plan", "submit"]}, 404
 
 ```

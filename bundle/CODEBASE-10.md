@@ -1,12 +1,1516 @@
-# Codebase — part 10 of 22
+# Codebase — part 10 of 23
 
 Contains:
+- `modules/signed.py`
+- `modules/sortition.py`
 - `modules/spec.py`
 - `modules/standard.py`
 - `modules/stats.py`
-- `modules/verifier.py`
-- `modules/warmup.py`
-- `modules/witness.py`
+
+
+## `modules/signed.py`
+
+744 lines, 32363 bytes
+
+```python
+"""
+Peer-signed submissions - /x/signed/<action>
+
+THE GAP THIS CLOSES
+-------------------
+Two people arrived at the same missing piece from opposite directions on the
+same day.
+
+Ishaan (Shango MID) read the existing signed lane and said, correctly, that
+"binds a name to a secret rather than to an address" reads stronger than it
+is. An HMAC uses a shared secret. A shared secret is held by both parties. So
+it proves the submission came from SOMEONE HOLDING THE SECRET - which is the
+peer and also the operator of this deployment. It closes third-party
+submission under a peer's name. It does not close operator submission under a
+peer's name.
+
+Chidi (ViriSIM) came at it from the regulator's side: for the evidence to mean
+anything to a third party, the customer has to sign, not the platform holding
+the customer's records.
+
+Same gap. This module closes it.
+
+HOW
+---
+The peer generates an Ed25519 keypair and keeps the private half. This
+deployment is given ONLY the public half. A public key is not a secret and
+grants nothing: it verifies a signature and cannot produce one.
+
+From then on, a submission under that name is accepted only if it carries a
+signature this deployment can verify against that public key - and this
+deployment CANNOT create such a signature, because it does not hold the
+private key and never has. The property is not a promise about our conduct.
+It is arithmetic.
+
+WHAT THIS MEANS FOR THE RECORD
+------------------------------
+The other lanes answer "did somebody hand us this tip". This lane answers
+"did the holder of this key hand us this tip", and the difference matters
+precisely when the operator is the party you are worried about.
+
+A regulator or auditor reading a signed observation does not have to trust
+this deployment about who submitted it. They can take the public key from
+/x/signed/keys, take the canonical message and the signature from the record,
+and check it themselves with any Ed25519 library in any language.
+
+WHAT IT STILL DOES NOT DO
+-------------------------
+- It does not prove the records behind the tip are true. Nothing here does.
+- It does not prove completeness. A signed chain can still omit records.
+  Catching that needs an audit protocol, not cryptography - see Chidi's
+  incognito-user test, which is the only thing anyone has proposed that
+  attacks it.
+- It does not prove who the keyholder IS. It proves the same party signed
+  each time. Identity is a separate problem and this does not solve it.
+- Enrolment is open, so the first party to enrol a name gets it. Same as
+  everywhere else in this standard, that is detection rather than
+  prevention: an enrolment is sealed, permanent and public, and an enrolment
+  placed over a name already seen in the witness log is flagged as such.
+
+WHY THE OPERATOR CANNOT QUIETLY SWAP A KEY
+------------------------------------------
+The obvious attack on the whole idea: the operator replaces the peer's public
+key with one of their own, then signs freely. So there is no route that
+overwrites a key. Rotation exists, and a rotation must itself be signed by
+the key being replaced. An operator who does not hold the current private key
+cannot rotate it, and every rotation is sealed into the chain with both keys
+recorded. A peer who has lost their key cannot rotate either - they enrol a
+new name, and the abandoned one stays visible.
+
+CANONICAL MESSAGE
+-----------------
+Exactly this, UTF-8, no trailing newline, four lines joined by \\n:
+
+    aileash-signed-v1
+    <chain>
+    <tip>
+    <ts>
+
+  chain  the peer name, lowercase, as enrolled
+  tip    64 lowercase hex characters
+  ts     integer epoch seconds, no decimal point
+
+Sign those bytes with the Ed25519 private key. Send the 64-byte signature as
+128 lowercase hex characters. The message is deliberately short, positional
+and free of JSON so that two implementations cannot disagree about how to
+build it.
+
+Rotation signs a different message with the SAME shape:
+
+    aileash-rotate-v1
+    <chain>
+    <new public key, 64 hex>
+    <ts>
+
+REPLAY
+------
+A signature is a bearer token for the statement it signs. Anyone who sees one
+can send it again. So: ts must be within SKEW_PAST seconds behind and
+SKEW_FUTURE ahead of our clock, ts must be strictly greater than the last ts
+we accepted for that name, and an exact repeat of a signature already stored
+is refused. None of that is exotic - it is the ordinary set, written down so
+nobody has to guess which of them we do.
+
+WHY THIS LANE REJECTS, WHEN THE OPEN LANE NEVER DOES
+----------------------------------------------------
+/x/witness/observe sea1s everything and describes what it sealed, because
+refusing an anonymous submission would mean deciding who is allowed to be
+recorded. This lane is the opposite case. A submission whose signature does
+not verify has no business being written into a name's history at all - the
+harm is exactly that it would sit in the record looking like an event
+involving that peer. So this lane refuses, says why, and seals nothing.
+
+    GET  /x/signed/spec                  the protocol
+    GET  /x/signed/keys                  every enrolled name and public key
+    POST /x/signed/enroll                chain, pubkey
+    POST /x/signed/submit                chain, tip, ts, signature
+    POST /x/signed/rotate                chain, new_pubkey, ts, signature
+    GET  /x/signed/verify?peer=&tip=     the receipt, with everything a third
+                                         party needs to check it themselves
+"""
+
+import hashlib
+import re
+import time
+from datetime import datetime, timezone
+
+VERSION = "1.0"
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
+HEX128 = re.compile(r"^[0-9a-f]{128}$")
+
+MSG_PREFIX = "aileash-signed-v1"
+ROTATE_PREFIX = "aileash-rotate-v1"
+
+# Replay window. Generous enough for a batch job on a slow link, tight enough
+# that a captured signature is not useful for long.
+SKEW_PAST = 900
+SKEW_FUTURE = 120
+
+# Everything here is readable and usable without an account. A verification
+# lane that only account holders can check is not a verification lane.
+PUBLIC = {("GET", "spec"), ("GET", "keys"), ("GET", "verify"),
+          ("POST", "enroll"), ("POST", "submit"), ("POST", "rotate")}
+
+MAX_LIST = 500
+
+MESSAGES = {
+    "what_this_proves": (
+        "That the holder of the enrolled private key produced this exact "
+        "statement - name, tip and timestamp - and that we sealed it at the "
+        "recorded time. This deployment holds only the public key and cannot "
+        "produce such a signature, so it is not a claim you have to take on "
+        "our word. Recheck it yourself with any Ed25519 library."),
+    "what_this_does_not_prove": (
+        "Nothing about whether the records behind the tip are true, nothing "
+        "about whether the chain is complete, and nothing about who the "
+        "keyholder is in the world. It proves the same party signed each "
+        "time."),
+    "enrolled": (
+        "This name is now bound to this public key permanently. We cannot "
+        "change it - rotation requires a signature from the key being "
+        "replaced, which we do not hold."),
+    "keys_note": (
+        "Public keys are not secrets. They are published so that anyone can "
+        "verify a signed observation without asking us for anything."),
+}
+
+_ready = False
+
+
+# ----------------------------------------------------------------------
+# Ed25519 verification, RFC 8032, pure standard library
+#
+# Deliberately no third-party dependency. This deployment runs on a small
+# box and a verification routine that needs a native extension is a
+# verification routine that stops working on a platform migration. Extended
+# homogeneous coordinates so a verify is milliseconds rather than seconds.
+#
+# Verify only. There is no signing function in this file, and that is not an
+# oversight - there is nothing here that could be turned into a way for this
+# deployment to produce a peer's signature.
+# ----------------------------------------------------------------------
+
+_P = 2 ** 255 - 19
+_L = 2 ** 252 + 27742317777372353535851937790883648493
+_D = -121665 * pow(121666, _P - 2, _P) % _P
+_I = pow(2, (_P - 1) // 4, _P)
+
+
+def _xrecover(y):
+    xx = (y * y - 1) * pow(_D * y * y + 1, _P - 2, _P)
+    x = pow(xx, (_P + 3) // 8, _P)
+    if (x * x - xx) % _P != 0:
+        x = (x * _I) % _P
+    if x % 2 != 0:
+        x = _P - x
+    return x
+
+
+_BY = 4 * pow(5, _P - 2, _P) % _P
+_BX = _xrecover(_BY)
+_B = (_BX % _P, _BY % _P, 1, _BX * _BY % _P)
+
+
+def _add(p, q):
+    x1, y1, z1, t1 = p
+    x2, y2, z2, t2 = q
+    a = (y1 - x1) * (y2 - x2) % _P
+    b = (y1 + x1) * (y2 + x2) % _P
+    c = t1 * 2 * _D * t2 % _P
+    dd = z1 * 2 * z2 % _P
+    e = b - a
+    f = dd - c
+    g = dd + c
+    h = b + a
+    return (e * f % _P, g * h % _P, f * g % _P, e * h % _P)
+
+
+def _double(p):
+    return _add(p, p)
+
+
+def _scalarmult(p, e):
+    if e == 0:
+        return (0, 1, 1, 0)
+    q = _scalarmult(p, e >> 1)
+    q = _double(q)
+    if e & 1:
+        q = _add(q, p)
+    return q
+
+
+def _decodepoint(raw):
+    y = int.from_bytes(raw, "little") & ((1 << 255) - 1)
+    if y >= _P:
+        return None
+    x = _xrecover(y)
+    if x & 1 != (raw[31] >> 7) & 1:
+        x = _P - x
+    point = (x, y, 1, x * y % _P)
+    # on-curve check: -x^2 + y^2 = 1 + d x^2 y^2
+    if (-x * x + y * y - 1 - _D * x * x * y * y) % _P != 0:
+        return None
+    return point
+
+
+def _equal(p, q):
+    x1, y1, z1, _t1 = p
+    x2, y2, z2, _t2 = q
+    if (x1 * z2 - x2 * z1) % _P != 0:
+        return False
+    if (y1 * z2 - y2 * z1) % _P != 0:
+        return False
+    return True
+
+
+def ed25519_verify(public_key, message, signature):
+    """True if signature is a valid Ed25519 signature of message under
+    public_key. Bytes in, bool out, never raises."""
+    try:
+        if len(public_key) != 32 or len(signature) != 64:
+            return False
+        a = _decodepoint(public_key)
+        if a is None:
+            return False
+        r_raw = signature[:32]
+        r = _decodepoint(r_raw)
+        if r is None:
+            return False
+        s = int.from_bytes(signature[32:], "little")
+        if s >= _L:
+            return False
+        h = int.from_bytes(
+            hashlib.sha512(r_raw + public_key + message).digest(), "little") % _L
+        left = _scalarmult(_B, s)
+        right = _add(r, _scalarmult(a, h))
+        return _equal(left, right)
+    except Exception:
+        return False
+
+
+# ----------------------------------------------------------------------
+# storage
+# ----------------------------------------------------------------------
+
+def _setup(ctx):
+    global _ready
+    if _ready:
+        return
+    with ctx["lock"]:
+        c = ctx["conn"]
+        c.execute("CREATE TABLE IF NOT EXISTS signed_keys("
+                  "peer TEXT PRIMARY KEY,pubkey TEXT,enrolled REAL,"
+                  "audit_hash TEXT,block_index INTEGER,"
+                  "rotations INTEGER DEFAULT 0,last_ts REAL,note TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS signed_log("
+                  "id INTEGER PRIMARY KEY AUTOINCREMENT,peer TEXT,tip TEXT,"
+                  "peer_ts REAL,observed REAL,signature TEXT,pubkey TEXT,"
+                  "audit_hash TEXT,block_index INTEGER)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_sig_peer ON signed_log(peer,id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_sig_tip ON signed_log(tip)")
+        c.commit()
+    _ready = True
+
+
+def _iso(ts):
+    if not ts:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+def _peer_name(data):
+    return str(data.get("chain") or data.get("peer") or "").strip().lower()
+
+
+def _key_row(ctx, peer):
+    with ctx["lock"]:
+        return ctx["conn"].execute(
+            "SELECT pubkey,enrolled,audit_hash,block_index,rotations,last_ts "
+            "FROM signed_keys WHERE peer=?", (peer,)).fetchone()
+
+
+def _seen_in_open_lane(ctx, peer):
+    """Has this name already appeared in the open witness log?
+
+    An enrolment over a name somebody else has been using is the same shape as
+    the url squat, and gets the same treatment: we cannot prevent it, so we
+    record it permanently at the moment it happens.
+    """
+    try:
+        with ctx["lock"]:
+            row = ctx["conn"].execute(
+                "SELECT COUNT(*) FROM witness_log WHERE peer=?", (peer,)).fetchone()
+        return int(row[0]) if row else 0
+    except Exception:
+        return 0
+
+
+def _check_ts(ts, last_ts):
+    now = time.time()
+    if ts > now + SKEW_FUTURE:
+        return False, ("timestamp is %d seconds in the future; limit is %d"
+                       % (int(ts - now), SKEW_FUTURE))
+    if ts < now - SKEW_PAST:
+        return False, ("timestamp is %d seconds old; limit is %d"
+                       % (int(now - ts), SKEW_PAST))
+    if last_ts is not None and ts <= last_ts:
+        return False, ("timestamp %d is not later than the last one accepted "
+                       "for this name (%d) - a signature cannot be replayed "
+                       "and submissions must move forward"
+                       % (int(ts), int(last_ts)))
+    return True, None
+
+
+# ----------------------------------------------------------------------
+# routes
+# ----------------------------------------------------------------------
+
+def _enroll(ctx, data):
+    peer = _peer_name(data)
+    if not peer or len(peer) > 80:
+        return {"error": "chain_required",
+                "message": "A short stable identifier - a domain works well."}, 400
+    pubkey = str(data.get("pubkey") or data.get("public_key") or "").strip().lower()
+    if not HEX64.match(pubkey):
+        return {"error": "invalid_pubkey",
+                "message": "An Ed25519 public key is 32 bytes - 64 lowercase "
+                           "hex characters. Send the public half only. Never "
+                           "send us a private key; we have no use for one and "
+                           "no route that accepts one."}, 400
+    if _decodepoint(bytes.fromhex(pubkey)) is None:
+        return {"error": "invalid_pubkey",
+                "message": "That value is 64 hex characters but is not a "
+                           "point on the curve, so it is not an Ed25519 "
+                           "public key."}, 400
+
+    existing = _key_row(ctx, peer)
+    if existing:
+        if existing[0] == pubkey:
+            return {"already_enrolled": True, "chain": peer, "pubkey": pubkey,
+                    "enrolled_at": _iso(existing[1]),
+                    "block_index": existing[3],
+                    "message": "This name is already bound to this key. "
+                               "Nothing changed."}, 200
+        return {"error": "name_already_enrolled", "chain": peer,
+                "enrolled_pubkey": existing[0],
+                "enrolled_at": _iso(existing[1]),
+                "message": "This name is bound to a different key. We do not "
+                           "overwrite a binding. If you hold the enrolled "
+                           "private key, use /x/signed/rotate. If you do not, "
+                           "this name is not available to you and this "
+                           "attempt is not sealed."}, 409
+
+    prior = _seen_in_open_lane(ctx, peer)
+    ts = time.time()
+    note = "enrolled"
+    if prior:
+        note = ("WARNING: this name had already been submitted %d time(s) to "
+                "the open witness lane before this key was enrolled, so it "
+                "was not a fresh name when it was claimed" % prior)
+
+    ev = {"user_id": "sig:" + peer, "action": "signed_key_enrolled", "amount": 0,
+          "country": "UK", "device_id": "signed", "anomaly": 0, "device_risk": 0}
+    res = {"decision": "KEY_ENROLLED", "score": 0, "signed_version": VERSION,
+           "peer": peer, "pubkey": pubkey, "timestamp": ts, "detail": note}
+    h, idx, _seq = ctx["seal"](ev, res, ts, "public-signed")
+
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "INSERT INTO signed_keys(peer,pubkey,enrolled,audit_hash,"
+            "block_index,rotations,last_ts,note) VALUES(?,?,?,?,?,0,NULL,?)",
+            (peer, pubkey, ts, h, idx, note))
+        ctx["conn"].commit()
+
+    out = {"enrolled": True, "chain": peer, "pubkey": pubkey,
+           "enrolled_at": _iso(ts), "sealed_in_our_chain": h,
+           "block_index": idx, "signed_version": VERSION,
+           "message": MESSAGES["enrolled"],
+           "canonical_message": _canonical_help(peer),
+           "submit": "/x/signed/submit"}
+    if prior:
+        out["flag"] = note
+    return out, 200
+
+
+def _canonical_help(peer):
+    return {"format": MSG_PREFIX + "\\n<chain>\\n<tip>\\n<ts>",
+            "example_for_this_name": MSG_PREFIX + "\\n" + peer +
+                                     "\\n<64 hex tip>\\n<integer epoch seconds>",
+            "encoding": "UTF-8, no trailing newline, lines joined with a "
+                        "single \\n",
+            "signature": "Ed25519 over those bytes, sent as 128 lowercase hex"}
+
+
+def _submit(ctx, data):
+    peer = _peer_name(data)
+    if not peer:
+        return {"error": "chain_required"}, 400
+    row = _key_row(ctx, peer)
+    if not row:
+        return {"error": "not_enrolled", "chain": peer,
+                "message": "No public key is enrolled for this name. Enrol at "
+                           "/x/signed/enroll, or use the open lane at "
+                           "/x/witness/observe which needs nothing."}, 404
+    pubkey, _enrolled, _h, _idx, _rot, last_ts = row
+
+    tip = str(data.get("tip", "")).strip().lower()
+    if not HEX64.match(tip):
+        return {"error": "invalid_tip",
+                "message": "A tip is 64 hex characters - a SHA-256 chain head."}, 400
+    signature = str(data.get("signature") or data.get("sig") or "").strip().lower()
+    if not HEX128.match(signature):
+        return {"error": "invalid_signature_format",
+                "message": "An Ed25519 signature is 64 bytes - 128 lowercase "
+                           "hex characters."}, 400
+    raw_ts = data.get("ts", data.get("peer_ts"))
+    try:
+        ts_int = int(raw_ts)
+    except (TypeError, ValueError):
+        return {"error": "invalid_ts",
+                "message": "ts must be integer epoch seconds, and must be the "
+                           "same value you signed."}, 400
+
+    ok, why = _check_ts(ts_int, last_ts)
+    if not ok:
+        return {"error": "timestamp_rejected", "message": why,
+                "our_time": int(time.time())}, 400
+
+    with ctx["lock"]:
+        dup = ctx["conn"].execute(
+            "SELECT observed FROM signed_log WHERE peer=? AND signature=? LIMIT 1",
+            (peer, signature)).fetchone()
+    if dup:
+        return {"error": "replayed_signature",
+                "message": "This exact signature was already accepted at %s."
+                           % _iso(dup[0])}, 409
+
+    message = "\n".join([MSG_PREFIX, peer, tip, str(ts_int)]).encode("utf-8")
+    if not ed25519_verify(bytes.fromhex(pubkey), message, bytes.fromhex(signature)):
+        return {"error": "signature_did_not_verify",
+                "chain": peer,
+                "message": "Nothing has been sealed. The signature does not "
+                           "verify against the key enrolled for this name. "
+                           "The usual cause is a canonical message built "
+                           "differently - check it byte for byte below.",
+                "we_verified_against": _canonical_help(peer),
+                "the_exact_bytes_we_hashed":
+                    "\n".join([MSG_PREFIX, peer, tip, str(ts_int)]),
+                "enrolled_pubkey": pubkey}, 400
+
+    observed = time.time()
+    detail = ("peer=" + peer + ";tip=" + tip + ";ts=" + str(ts_int) +
+              ";pubkey=" + pubkey + ";sig=" + signature)
+    ev = {"user_id": "sig:" + peer, "action": "signed_tip_observed", "amount": 0,
+          "country": "UK", "device_id": "signed", "anomaly": 0, "device_risk": 0}
+    res = {"decision": "SIGNED_TIP_SEALED", "score": 0, "signed_version": VERSION,
+           "peer": peer, "peer_tip": tip, "timestamp": observed,
+           "verification": "peer-signed", "detail": detail}
+    h, idx, seq = ctx["seal"](ev, res, observed, "public-signed")
+
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "INSERT INTO signed_log(peer,tip,peer_ts,observed,signature,"
+            "pubkey,audit_hash,block_index) VALUES(?,?,?,?,?,?,?,?)",
+            (peer, tip, float(ts_int), observed, signature, pubkey, h, idx))
+        ctx["conn"].execute("UPDATE signed_keys SET last_ts=? WHERE peer=?",
+                            (float(ts_int), peer))
+        ctx["conn"].commit()
+
+    # Mirror into the open witness log so the peer appears on the public
+    # roster alongside everyone else. Guarded: the roster is a convenience
+    # and the seal above is the evidence, so a failure here must not turn a
+    # good submission into an error.
+    mirrored = False
+    try:
+        with ctx["lock"]:
+            ctx["conn"].execute(
+                "INSERT INTO witness_log(api_key,peer,tip,peer_ts,observed,"
+                "audit_hash,block_index,note,url,liveness,name_status) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                ("public-signed", peer, tip, float(ts_int), observed, h, idx,
+                 "signed submission - verified against enrolled Ed25519 key",
+                 None, "peer-signed", "key-bound"))
+            ctx["conn"].commit()
+        mirrored = True
+    except Exception:
+        pass
+
+    return {"chain": peer, "witnessed_tip": tip, "observed_at": _iso(observed),
+            "peer_claimed_time": _iso(ts_int),
+            "sealed_in_our_chain": h, "block_index": idx, "receipt_seq": seq,
+            "verification": "peer-signed",
+            "verified_against_pubkey": pubkey,
+            "on_public_roster": mirrored,
+            "signed_version": VERSION,
+            "verify": "/x/signed/verify?peer=" + peer + "&tip=" + tip,
+            "what_this_proves": MESSAGES["what_this_proves"],
+            "what_this_does_not_prove": MESSAGES["what_this_does_not_prove"]}, 200
+
+
+def _rotate(ctx, data):
+    peer = _peer_name(data)
+    row = _key_row(ctx, peer)
+    if not row:
+        return {"error": "not_enrolled", "chain": peer}, 404
+    current, _enrolled, _h, _idx, rotations, last_ts = row
+
+    new_pubkey = str(data.get("new_pubkey") or data.get("pubkey") or "").strip().lower()
+    if not HEX64.match(new_pubkey) or _decodepoint(bytes.fromhex(new_pubkey)) is None:
+        return {"error": "invalid_pubkey",
+                "message": "new_pubkey must be an Ed25519 public key - 64 "
+                           "lowercase hex characters."}, 400
+    if new_pubkey == current:
+        return {"error": "no_change",
+                "message": "That is already the enrolled key."}, 400
+    signature = str(data.get("signature") or data.get("sig") or "").strip().lower()
+    if not HEX128.match(signature):
+        return {"error": "invalid_signature_format"}, 400
+    try:
+        ts_int = int(data.get("ts"))
+    except (TypeError, ValueError):
+        return {"error": "invalid_ts"}, 400
+    ok, why = _check_ts(ts_int, last_ts)
+    if not ok:
+        return {"error": "timestamp_rejected", "message": why,
+                "our_time": int(time.time())}, 400
+
+    message = "\n".join([ROTATE_PREFIX, peer, new_pubkey, str(ts_int)]).encode("utf-8")
+    if not ed25519_verify(bytes.fromhex(current), message, bytes.fromhex(signature)):
+        return {"error": "signature_did_not_verify",
+                "message": "Nothing has been changed. A rotation must be "
+                           "signed by the key being replaced. This is what "
+                           "stops anyone - including the operator of this "
+                           "deployment - swapping a peer's key.",
+                "we_verified_against": {
+                    "format": ROTATE_PREFIX + "\\n<chain>\\n<new pubkey>\\n<ts>",
+                    "the_exact_bytes_we_hashed":
+                        "\n".join([ROTATE_PREFIX, peer, new_pubkey,
+                                   str(ts_int)])},
+                "signed_by_key_expected": current}, 400
+
+    ts = time.time()
+    ev = {"user_id": "sig:" + peer, "action": "signed_key_rotated", "amount": 0,
+          "country": "UK", "device_id": "signed", "anomaly": 0, "device_risk": 0}
+    res = {"decision": "KEY_ROTATED", "score": 0, "signed_version": VERSION,
+           "peer": peer, "timestamp": ts,
+           "detail": "from=" + current + ";to=" + new_pubkey +
+                     ";authorised_by=" + current}
+    h, idx, _seq = ctx["seal"](ev, res, ts, "public-signed")
+
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "UPDATE signed_keys SET pubkey=?,rotations=?,last_ts=? WHERE peer=?",
+            (new_pubkey, (rotations or 0) + 1, float(ts_int), peer))
+        ctx["conn"].commit()
+
+    return {"rotated": True, "chain": peer, "previous_pubkey": current,
+            "pubkey": new_pubkey, "rotations": (rotations or 0) + 1,
+            "sealed_in_our_chain": h, "block_index": idx,
+            "signed_version": VERSION,
+            "message": "Rotation sealed. Both keys are permanently in the "
+                       "chain, so the history of this name's keys is public "
+                       "and cannot be tidied up later."}, 200
+
+
+def _keys(ctx):
+    with ctx["lock"]:
+        rows = ctx["conn"].execute(
+            "SELECT peer,pubkey,enrolled,block_index,rotations,note "
+            "FROM signed_keys ORDER BY enrolled ASC LIMIT ?", (MAX_LIST,)).fetchall()
+    out = []
+    for peer, pubkey, enrolled, idx, rotations, note in rows:
+        entry = {"chain": peer, "pubkey": pubkey, "algorithm": "ed25519",
+                 "enrolled_at": _iso(enrolled), "enrolment_block": idx,
+                 "rotations": rotations or 0}
+        if note and note.startswith("WARNING"):
+            entry["flag"] = note
+        out.append(entry)
+    return {"count": len(out), "keys": out, "signed_version": VERSION,
+            "note": MESSAGES["keys_note"],
+            "how_to_check_a_record": (
+                "Take the pubkey from here, rebuild the canonical message "
+                "from the record at /x/signed/verify, and check the signature "
+                "with any Ed25519 implementation. You do not need anything "
+                "from us to do it and you do not have to believe us.")}, 200
+
+
+def _verify(ctx, data):
+    peer = str(data.get("peer", "")).strip().lower()
+    tip = str(data.get("tip", "")).strip().lower()
+    if not peer or not tip:
+        return {"error": "peer_and_tip_required",
+                "usage": "/x/signed/verify?peer=<name>&tip=<64 hex>"}, 400
+    with ctx["lock"]:
+        rows = ctx["conn"].execute(
+            "SELECT observed,peer_ts,signature,pubkey,audit_hash,block_index "
+            "FROM signed_log WHERE peer=? AND tip=? ORDER BY id ASC",
+            (peer, tip)).fetchall()
+    if not rows:
+        return {"signed_observation": False, "peer": peer, "tip": tip,
+                "message": "We hold no signed observation of this tip from "
+                           "this name. It may still be in the open lane - "
+                           "check /x/witness/attest."}, 404
+    observed, peer_ts, signature, pubkey, h, idx = rows[0]
+    ts_int = int(peer_ts)
+    return {"signed_observation": True, "chain": peer, "tip": tip,
+            "observed_at": _iso(observed), "peer_claimed_time": _iso(peer_ts),
+            "sealed_in_our_chain": h, "block_index": idx,
+            "times_observed": len(rows),
+            "signature": signature, "pubkey": pubkey, "algorithm": "ed25519",
+            "canonical_message": "\n".join([MSG_PREFIX, peer, tip, str(ts_int)]),
+            "canonical_message_bytes_note": (
+                "Those four lines joined by a single newline, UTF-8, no "
+                "trailing newline. Hash nothing yourself - Ed25519 takes the "
+                "message, not a digest of it."),
+            "signed_version": VERSION,
+            "what_this_proves": MESSAGES["what_this_proves"],
+            "what_this_does_not_prove": MESSAGES["what_this_does_not_prove"],
+            "recheck_it_yourself": (
+                "python: pip install pynacl, then "
+                "nacl.signing.VerifyKey(bytes.fromhex(pubkey))"
+                ".verify(canonical_message.encode(), bytes.fromhex(signature))")}, 200
+
+
+def _spec():
+    return {"signed_version": VERSION,
+            "what_this_lane_is": (
+                "Submissions signed by a key this deployment does not hold. "
+                "The open lane at /x/witness/observe proves somebody handed "
+                "us a tip. This lane proves the holder of a specific private "
+                "key did - including against us, because we only ever hold "
+                "the public half."),
+            "why_it_exists": (
+                "The HMAC lane binds a name to a shared secret, and a shared "
+                "secret is held by both parties. It closes third-party "
+                "submission under your name and does not close operator "
+                "submission under your name. This lane closes both, and it "
+                "does so by arithmetic rather than by our promise."),
+            "steps": [
+                "1. Generate an Ed25519 keypair. Keep the private half. It "
+                "never leaves your side and we have no route that accepts one.",
+                "2. POST /x/signed/enroll with {\"chain\":\"<name>\","
+                "\"pubkey\":\"<64 hex>\"}.",
+                "3. Build the canonical message, sign it, and POST "
+                "/x/signed/submit with {\"chain\",\"tip\",\"ts\",\"signature\"}.",
+                "4. GET /x/signed/verify?peer=&tip= for the receipt, which "
+                "carries everything a third party needs to recheck it "
+                "without us.",
+            ],
+            "canonical_message": {
+                "submit": MSG_PREFIX + "\\n<chain>\\n<tip>\\n<ts>",
+                "rotate": ROTATE_PREFIX + "\\n<chain>\\n<new pubkey>\\n<ts>",
+                "encoding": "UTF-8, single \\n between lines, no trailing "
+                            "newline. ts is integer epoch seconds.",
+            },
+            "replay_controls": {
+                "max_age_seconds": SKEW_PAST,
+                "max_future_seconds": SKEW_FUTURE,
+                "monotonic": "ts must be strictly greater than the last ts "
+                             "accepted for the name",
+                "duplicate_signatures": "refused",
+            },
+            "this_lane_rejects": (
+                "Unlike the open lane, a submission that does not verify is "
+                "refused and nothing is sealed. Writing an unverifiable "
+                "signature into a name's history is the harm, not the "
+                "protection."),
+            "key_rotation": (
+                "A rotation must be signed by the key being replaced. Nobody "
+                "who lacks the current private key can rotate it, this "
+                "deployment included, and every rotation is sealed with both "
+                "keys recorded."),
+            "honest_limits": [
+                "Does not prove the records behind the tip are true.",
+                "Does not prove the chain is complete. Catching an omission "
+                "needs an audit protocol, not cryptography.",
+                "Does not prove who the keyholder is in the world - only that "
+                "the same party signed each time.",
+                "Enrolment is open, so the first party to enrol a name gets "
+                "it. An enrolment over a name already seen in the open lane "
+                "is flagged permanently, which is detection and not "
+                "prevention.",
+            ],
+            "what_this_proves": MESSAGES["what_this_proves"],
+            "what_this_does_not_prove": MESSAGES["what_this_does_not_prove"]}, 200
+
+
+def handle(method, action, data, api_key, ctx):
+    _setup(ctx)
+    if method == "POST":
+        if action == "enroll":
+            return _enroll(ctx, data)
+        if action == "submit":
+            return _submit(ctx, data)
+        if action == "rotate":
+            return _rotate(ctx, data)
+    else:
+        if action == "spec":
+            return _spec()
+        if action == "keys":
+            return _keys(ctx)
+        if action == "verify":
+            return _verify(ctx, data)
+    return {"error": "unknown_action", "action": action}, 404
+
+```
+
+
+## `modules/sortition.py`
+
+745 lines, 31288 bytes
+
+```python
+"""
+sortition.py - selection by lot. The operator stops choosing who gets audited.
+
+THE HOLE THIS FILLS
+-------------------
+Every system claiming human oversight reviews a sample of decisions. In
+every one of them, the operator picks the sample. So the sample proves
+nothing: you can review the easy ones, or the ones you already know are
+clean, and nobody outside can tell the difference. It is the softest spot
+in every Article 14 claim in the industry, and it has stayed soft because
+there was no alternative.
+
+There is one now. heartbeat.py seals a public beacon value on a cadence -
+a number nobody, including the operator, can know before its tick. That is
+a dice roll no one owns.
+
+THE THREE LOCKS, IN ORDER. THE ORDER IS THE WHOLE POINT.
+--------------------------------------------------------
+1. COMMIT THE POOL. Every record eligible for review in a period is
+   listed, hashed into one pool digest, and sealed. The pool is now fixed.
+2. WAIT FOR A TICK. The draw may only use a beacon value sealed AFTER the
+   pool commit. This module refuses otherwise. So the pool was fixed
+   before the dice existed, and cannot be edited once they do.
+3. DRAW. The beacon value deterministically ranks the pool. The lowest k
+   ranks are selected. Anyone can recompute it from public values.
+
+Break any one and the sample is choosable again. Enforced here, not
+promised.
+
+WHAT IT CATCHES
+---------------
+A selected record with no review sealed against it is a permanent, visible
+hole with a name on it. You cannot quietly skip an awkward case, because
+the case was chosen for you in public, and its absence is the evidence.
+
+Refusal is allowed and is not hidden - it is sealed as a refusal with a
+reason. An honest refusal on the record is worth more than a silent gap.
+
+THE SELECTION FUNCTION, PUBLISHED SO IT IS NOT OURS
+---------------------------------------------------
+  seed = SHA256("AILEASH-SORTITION-v1" | period | pool_digest | beacon_value)
+  rank(i) = SHA256(seed | ":" | record_hash_i)
+  selected = the k records with the lowest rank, ties by record hash
+
+No random number generator, no language-specific behaviour, no library.
+Ten lines in any language. A stranger recomputes it and either gets our
+list or catches us.
+
+WHAT THIS DOES NOT DO
+---------------------
+- It does not prove the reviews were any good. It proves nobody chose
+  which ones happened.
+- It does not stop an operator declining to draw at all. A period with no
+  draw is a period with no sample, and /outstanding says so.
+- Pool membership is asserted by this server. What stops a record being
+  left out of the pool is complete.py, which commits the period's record
+  count in advance - separate module, separate check.
+- Selection is uniform. Risk-weighted sampling is deliberately not offered:
+  a weighting the operator sets is a choice the operator made.
+
+Contract: handle(method, action, data, api_key, ctx) -> (dict, status)
+Routes:
+  GET  spec         public  what this is and the exact selection function
+  GET  draws        public  every draw ever made
+  GET  draw         public  ?id= - one draw, its beacon value, its selection
+  GET  verify       public  ?id= - recompute the draw from scratch, here
+  GET  outstanding  public  selected records with no review yet, and how late
+  GET  status       public  coverage, response rate, oldest unanswered
+  POST pool         keyed   commit the pool for a period
+  POST draw         keyed   draw a sample against a sealed beacon tick
+  POST review       keyed   record a review, or a refusal with a reason
+"""
+
+import json
+import time
+import hashlib
+
+VERSION = "1.0.0"
+
+PUBLIC = {
+    ("GET", "spec"),
+    ("GET", "draws"),
+    ("GET", "draw"),
+    ("GET", "verify"),
+    ("GET", "outstanding"),
+    ("GET", "status"),
+}
+
+DOMAIN_SEED = b"AILEASH-SORTITION-v1"
+DOMAIN_POOL = b"AILEASH-POOL-v1"
+
+DEFAULT_RATE = 0.05          # 5 percent
+MIN_SELECT = 1
+MAX_SELECT = 500
+MAX_POOL = 200000
+REVIEW_DUE_HOURS = 72
+
+DDL = [
+    """CREATE TABLE IF NOT EXISTS sortition_pool (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        period       TEXT NOT NULL,
+        pool_digest  TEXT NOT NULL,
+        pool_size    INTEGER NOT NULL,
+        members      TEXT NOT NULL,
+        committed_at REAL NOT NULL,
+        chain_rowid  INTEGER,
+        audit_hash   TEXT
+    )""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_sort_pool ON sortition_pool(period)",
+    """CREATE TABLE IF NOT EXISTS sortition_draw (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        period        TEXT NOT NULL,
+        pool_id       INTEGER NOT NULL,
+        pool_digest   TEXT NOT NULL,
+        pool_size     INTEGER NOT NULL,
+        rate          REAL NOT NULL,
+        select_count  INTEGER NOT NULL,
+        beacon_source TEXT,
+        beacon_round  INTEGER,
+        beacon_value  TEXT NOT NULL,
+        beacon_rowid  INTEGER,
+        seed          TEXT NOT NULL,
+        selected      TEXT NOT NULL,
+        drawn_at      REAL NOT NULL,
+        chain_rowid   INTEGER,
+        audit_hash    TEXT
+    )""",
+    """CREATE TABLE IF NOT EXISTS sortition_review (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        draw_id      INTEGER NOT NULL,
+        record_hash  TEXT NOT NULL,
+        outcome      TEXT NOT NULL,
+        reviewer     TEXT,
+        reason       TEXT,
+        recorded_at  REAL NOT NULL,
+        chain_rowid  INTEGER,
+        audit_hash   TEXT
+    )""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_sort_rev ON sortition_review(draw_id, record_hash)",
+]
+
+OUTCOMES = ("agreed", "disagreed", "escalated", "refused")
+
+VOCABULARY = {
+    "pool": "Every record eligible for review in a period, fixed and sealed before any dice exist.",
+    "draw": "The selection, computed from a beacon value that did not exist when the pool was sealed.",
+    "selected": "Chosen by the beacon, not by us. We could not have known which.",
+    "outstanding": "Selected and not yet answered. Visible, named, and counting.",
+    "refused": "Declined on the record with a reason. Not a gap - a decision that is now permanent.",
+    "gap": "Selected, past due, and never answered. The thing this module exists to make impossible to hide.",
+}
+
+WHAT_THIS_PROVES = (
+    "That nobody chose which records were reviewed. It does not prove the "
+    "reviews were competent, honest or useful. Those are different problems "
+    "and this module does not touch them."
+)
+
+
+# ---------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------
+
+def _ensure(conn, lock):
+    with lock:
+        cur = conn.cursor()
+        for stmt in DDL:
+            cur.execute(stmt)
+        conn.commit()
+
+
+def _cols(conn, table):
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(%s)" % table)
+    return [r[1] for r in cur.fetchall()]
+
+
+def _hash_col(conn):
+    c = _cols(conn, "audit_log")
+    for n in ("audit_hash", "hash", "block_hash"):
+        if n in c:
+            return n
+    return None
+
+
+def _ts_col(conn):
+    c = _cols(conn, "audit_log")
+    for n in ("ts", "timestamp", "created", "observed"):
+        if n in c:
+            return n
+    return None
+
+
+def _period_bounds(period):
+    """YYYY, YYYY-MM, YYYY-MM-DD -> (start_epoch, end_epoch) UTC."""
+    p = str(period).strip()
+    try:
+        if len(p) == 4:
+            s = time.strptime(p + "-01-01", "%Y-%m-%d")
+            e = time.strptime(str(int(p) + 1) + "-01-01", "%Y-%m-%d")
+        elif len(p) == 7:
+            s = time.strptime(p + "-01", "%Y-%m-%d")
+            y, m = int(p[:4]), int(p[5:7])
+            y2, m2 = (y + 1, 1) if m == 12 else (y, m + 1)
+            e = time.strptime("%04d-%02d-01" % (y2, m2), "%Y-%m-%d")
+        elif len(p) == 10:
+            s = time.strptime(p, "%Y-%m-%d")
+            e = time.gmtime(_cal(s) + 86400)
+        else:
+            return None
+    except ValueError:
+        return None
+    return _cal(s), _cal(e)
+
+
+def _cal(st):
+    import calendar
+    return calendar.timegm(st)
+
+
+def _iso(t):
+    if t is None:
+        return None
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+
+
+def _human(seconds):
+    if seconds is None:
+        return None
+    s = int(round(seconds))
+    if s < 60:
+        return "%d seconds" % s
+    if s < 3600:
+        return "%d minutes" % (s // 60)
+    if s < 86400:
+        return "%d hours %d minutes" % (s // 3600, (s % 3600) // 60)
+    return "%d days %d hours" % (s // 86400, (s % 86400) // 3600)
+
+
+def _pool_digest(members):
+    h = hashlib.sha256()
+    h.update(DOMAIN_POOL + b"\n")
+    for m in members:
+        h.update(m.encode() + b"\n")
+    return h.hexdigest()
+
+
+def _seed(period, pool_digest, beacon_value):
+    h = hashlib.sha256()
+    h.update(DOMAIN_SEED + b"|")
+    h.update(str(period).encode() + b"|")
+    h.update(pool_digest.encode() + b"|")
+    h.update(str(beacon_value).encode())
+    return h.hexdigest()
+
+
+def select(members, seed, k):
+    """The published selection function. Deterministic, no RNG."""
+    ranked = []
+    for m in members:
+        r = hashlib.sha256((seed + ":" + m).encode()).hexdigest()
+        ranked.append((r, m))
+    ranked.sort()
+    return [m for _, m in ranked[:k]]
+
+
+def _seal(ctx, event, result):
+    fn = ctx.get("seal")
+    payload = result if isinstance(result, str) else json.dumps(result, sort_keys=True)
+    try:
+        fn(event, payload)
+    except TypeError:
+        fn(event, result)
+
+
+def _backfill(conn, lock, table, rowid_field, pk):
+    hcol = _hash_col(conn)
+    with lock:
+        cur = conn.cursor()
+        cur.execute("SELECT MAX(rowid) FROM audit_log")
+        r = cur.fetchone()
+        rid = r[0] if r and r[0] is not None else None
+        h = None
+        if rid is not None and hcol:
+            cur.execute("SELECT %s FROM audit_log WHERE rowid=?" % hcol, (rid,))
+            r2 = cur.fetchone()
+            h = r2[0] if r2 else None
+        cur.execute("UPDATE %s SET chain_rowid=?, audit_hash=? WHERE id=?" % table,
+                    (rid, h, pk))
+        conn.commit()
+    return rid, h
+
+
+def _latest_beat_after(conn, rowid):
+    """The first heartbeat sealed strictly after a given chain row."""
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT source, beacon_round, value, chain_rowid, fetched_at"
+            " FROM heartbeat_tick WHERE chain_rowid IS NOT NULL AND chain_rowid>?"
+            " ORDER BY chain_rowid DESC LIMIT 1", (rowid,))
+        return cur.fetchone()
+    except Exception:
+        return None
+
+
+def _beats_available(conn):
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM heartbeat_tick")
+        return cur.fetchone()[0]
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------
+# handle
+# ---------------------------------------------------------------------
+
+def handle(method, action, data, api_key, ctx):
+    conn, lock = ctx["conn"], ctx["lock"]
+    _ensure(conn, lock)
+
+    if method == "GET" and action == "spec":
+        return _spec(), 200
+
+    # -------------------------------------------------- pool
+    if method == "POST" and action == "pool":
+        period = data.get("period")
+        bounds = _period_bounds(period) if period else None
+        if not bounds:
+            return {"error": "period_required",
+                    "formats": ["YYYY", "YYYY-MM", "YYYY-MM-DD"]}, 400
+        start, end = bounds
+        if end > time.time():
+            return {"error": "period_not_closed",
+                    "note": ("A pool can only be committed for a period that "
+                             "has ended. Committing a live period would let "
+                             "records arrive after the pool was fixed."),
+                    "period_ends": _iso(end)}, 409
+
+        hcol, tcol = _hash_col(conn), _ts_col(conn)
+        if not hcol or not tcol:
+            return {"error": "audit_log_schema_unrecognised"}, 500
+
+        cur = conn.cursor()
+        kind = data.get("event")
+        if kind:
+            cur.execute(
+                "SELECT %s FROM audit_log WHERE %s>=? AND %s<? AND event=?"
+                " ORDER BY rowid" % (hcol, tcol, tcol), (start, end, kind))
+        else:
+            cur.execute(
+                "SELECT %s FROM audit_log WHERE %s>=? AND %s<? ORDER BY rowid"
+                % (hcol, tcol, tcol), (start, end))
+        members = sorted({r[0] for r in cur.fetchall() if r[0]})
+        if not members:
+            return {"error": "empty_period", "period": period}, 404
+        if len(members) > MAX_POOL:
+            return {"error": "pool_too_large", "size": len(members),
+                    "max": MAX_POOL}, 413
+
+        digest = _pool_digest(members)
+        now = time.time()
+        with lock:
+            cur = conn.cursor()
+            cur.execute("SELECT id, pool_digest FROM sortition_pool WHERE period=?",
+                        (period,))
+            prior = cur.fetchone()
+            if prior:
+                return {"error": "pool_already_committed", "period": period,
+                        "pool_digest": prior[1],
+                        "note": "A pool commits once. That is what makes it a pool."}, 409
+            cur.execute(
+                "INSERT INTO sortition_pool (period, pool_digest, pool_size,"
+                " members, committed_at) VALUES (?,?,?,?,?)",
+                (period, digest, len(members), json.dumps(members), now))
+            pid = cur.lastrowid
+            conn.commit()
+
+        _seal(ctx, "sortition_pool", {
+            "period": period, "pool_digest": digest, "pool_size": len(members),
+            "event_filter": kind,
+            "note": ("Pool fixed. Any draw against it must use a beacon value "
+                     "sealed after this block."),
+        })
+        rid, h = _backfill(conn, lock, "sortition_pool", "chain_rowid", pid)
+
+        return {"pool_id": pid, "period": period, "pool_digest": digest,
+                "pool_size": len(members), "sealed_at_chain_rowid": rid,
+                "audit_hash": h,
+                "next": ("Wait for a heartbeat sealed after block %s, then "
+                         "POST /x/sortition/draw." % rid)}, 200
+
+    # -------------------------------------------------- draw
+    if method == "POST" and action == "draw":
+        period = data.get("period")
+        cur = conn.cursor()
+        cur.execute("SELECT id, pool_digest, pool_size, members, chain_rowid"
+                    " FROM sortition_pool WHERE period=?", (period,))
+        pool = cur.fetchone()
+        if not pool:
+            return {"error": "no_pool_for_period", "period": period,
+                    "next": "POST /x/sortition/pool first"}, 404
+        pid, digest, size, members_json, pool_rowid = pool
+
+        cur.execute("SELECT id FROM sortition_draw WHERE period=?", (period,))
+        if cur.fetchone():
+            return {"error": "already_drawn", "period": period,
+                    "note": "One draw per pool. A second draw is a second chance."}, 409
+
+        if pool_rowid is None:
+            return {"error": "pool_not_located_in_chain"}, 500
+
+        beat = _latest_beat_after(conn, pool_rowid)
+        if not beat:
+            n = _beats_available(conn)
+            return {"error": "no_beacon_since_pool_commit",
+                    "beats_in_system": n,
+                    "why": ("The draw must use a value that did not exist when "
+                            "the pool was sealed. Wait for the next heartbeat."),
+                    "check": "/x/heartbeat/latest"}, 409
+
+        b_source, b_round, b_value, b_rowid, b_at = beat
+        members = json.loads(members_json)
+
+        try:
+            rate = float(data.get("rate", DEFAULT_RATE))
+        except (TypeError, ValueError):
+            rate = DEFAULT_RATE
+        rate = max(0.0001, min(1.0, rate))
+        k = int(round(size * rate))
+        k = max(MIN_SELECT, min(k, MAX_SELECT, size))
+
+        seed = _seed(period, digest, b_value)
+        chosen = select(members, seed, k)
+        now = time.time()
+
+        with lock:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO sortition_draw (period, pool_id, pool_digest,"
+                " pool_size, rate, select_count, beacon_source, beacon_round,"
+                " beacon_value, beacon_rowid, seed, selected, drawn_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (period, pid, digest, size, rate, k, b_source, b_round,
+                 b_value, b_rowid, seed, json.dumps(chosen), now))
+            did = cur.lastrowid
+            conn.commit()
+
+        _seal(ctx, "sortition_draw", {
+            "draw_id": did, "period": period, "pool_digest": digest,
+            "pool_size": size, "rate": rate, "selected_count": k,
+            "beacon": {"source": b_source, "round": b_round, "value": b_value,
+                       "sealed_at_block": b_rowid},
+            "seed": seed, "selected": chosen,
+            "note": ("Selection is recomputable by anyone from pool_digest and "
+                     "the beacon value. See /x/sortition/spec."),
+        })
+        rid, h = _backfill(conn, lock, "sortition_draw", "chain_rowid", did)
+
+        return {"draw_id": did, "period": period, "pool_size": size,
+                "rate": rate, "selected_count": k, "selected": chosen,
+                "beacon": {"source": b_source, "round": b_round,
+                           "value": b_value, "sealed_at_block": b_rowid,
+                           "sealed_at": _iso(b_at)},
+                "seed": seed, "sealed_at_chain_rowid": rid, "audit_hash": h,
+                "review_due": _iso(now + REVIEW_DUE_HOURS * 3600),
+                "recompute_this_yourself": "/x/sortition/verify?id=%d" % did}, 200
+
+    # -------------------------------------------------- review
+    if method == "POST" and action == "review":
+        did = data.get("draw_id")
+        rec = data.get("record")
+        outcome = str(data.get("outcome", "")).lower()
+        if not did or not rec:
+            return {"error": "draw_id_and_record_required"}, 400
+        if outcome not in OUTCOMES:
+            return {"error": "outcome_invalid", "allowed": list(OUTCOMES)}, 400
+        if outcome == "refused" and not data.get("reason"):
+            return {"error": "reason_required_to_refuse",
+                    "why": ("A refusal without a reason is a gap wearing a "
+                            "label. The reason is sealed and permanent.")}, 400
+
+        cur = conn.cursor()
+        cur.execute("SELECT selected FROM sortition_draw WHERE id=?", (did,))
+        row = cur.fetchone()
+        if not row:
+            return {"error": "unknown_draw", "draw_id": did}, 404
+        if rec not in json.loads(row[0]):
+            return {"error": "record_not_selected",
+                    "note": ("Reviews can only be filed against records the "
+                             "beacon chose. Volunteering extra reviews does "
+                             "not count toward the sample.")}, 409
+
+        now = time.time()
+        with lock:
+            cur = conn.cursor()
+            cur.execute("SELECT id FROM sortition_review WHERE draw_id=? AND record_hash=?",
+                        (did, rec))
+            if cur.fetchone():
+                return {"error": "already_reviewed",
+                        "note": "A review is filed once and cannot be replaced."}, 409
+            cur.execute(
+                "INSERT INTO sortition_review (draw_id, record_hash, outcome,"
+                " reviewer, reason, recorded_at) VALUES (?,?,?,?,?,?)",
+                (did, rec, outcome, data.get("reviewer"), data.get("reason"), now))
+            rvid = cur.lastrowid
+            conn.commit()
+
+        _seal(ctx, "sortition_review", {
+            "draw_id": did, "record": rec, "outcome": outcome,
+            "reviewer": data.get("reviewer"), "reason": data.get("reason"),
+        })
+        rid, h = _backfill(conn, lock, "sortition_review", "chain_rowid", rvid)
+        return {"recorded": True, "review_id": rvid, "outcome": outcome,
+                "sealed_at_chain_rowid": rid, "audit_hash": h}, 200
+
+    # -------------------------------------------------- draws
+    if method == "GET" and action == "draws":
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, period, pool_size, rate, select_count, beacon_source,"
+            " beacon_round, drawn_at, audit_hash FROM sortition_draw"
+            " ORDER BY id DESC LIMIT 100")
+        out = []
+        for r in cur.fetchall():
+            cur2 = conn.cursor()
+            cur2.execute("SELECT COUNT(*) FROM sortition_review WHERE draw_id=?", (r[0],))
+            done = cur2.fetchone()[0]
+            out.append({"draw_id": r[0], "period": r[1], "pool_size": r[2],
+                        "rate": r[3], "selected": r[4], "reviewed": done,
+                        "outstanding": r[4] - done,
+                        "beacon": {"source": r[5], "round": r[6]},
+                        "drawn_at": _iso(r[7]), "audit_hash": r[8]})
+        return {"count": len(out), "draws": out, "vocabulary": VOCABULARY}, 200
+
+    # -------------------------------------------------- one draw
+    if method == "GET" and action == "draw":
+        did = data.get("id")
+        if not did:
+            return {"error": "id_required"}, 400
+        d = _draw_row(conn, did)
+        if not d:
+            return {"error": "unknown_draw"}, 404
+        cur = conn.cursor()
+        cur.execute("SELECT record_hash, outcome, reviewer, reason, recorded_at"
+                    " FROM sortition_review WHERE draw_id=?", (did,))
+        revs = {r[0]: {"outcome": r[1], "reviewer": r[2], "reason": r[3],
+                       "at": _iso(r[4])} for r in cur.fetchall()}
+        items = []
+        for m in json.loads(d["selected_json"]):
+            items.append({"record": m, "review": revs.get(m),
+                          "state": "answered" if m in revs else "outstanding"})
+        return {"draw_id": did, "period": d["period"],
+                "pool_digest": d["pool_digest"], "pool_size": d["pool_size"],
+                "rate": d["rate"], "selected_count": d["select_count"],
+                "beacon": {"source": d["beacon_source"], "round": d["beacon_round"],
+                           "value": d["beacon_value"],
+                           "sealed_at_block": d["beacon_rowid"]},
+                "seed": d["seed"], "drawn_at": _iso(d["drawn_at"]),
+                "items": items,
+                "what_this_proves": WHAT_THIS_PROVES,
+                "recompute": "/x/sortition/verify?id=%s" % did}, 200
+
+    # -------------------------------------------------- verify
+    if method == "GET" and action == "verify":
+        did = data.get("id")
+        if not did:
+            return {"error": "id_required"}, 400
+        d = _draw_row(conn, did)
+        if not d:
+            return {"error": "unknown_draw"}, 404
+        cur = conn.cursor()
+        cur.execute("SELECT members FROM sortition_pool WHERE id=?", (d["pool_id"],))
+        row = cur.fetchone()
+        members = json.loads(row[0]) if row else []
+        recomputed_digest = _pool_digest(members)
+        recomputed_seed = _seed(d["period"], d["pool_digest"], d["beacon_value"])
+        recomputed = select(members, recomputed_seed, d["select_count"])
+        stored = json.loads(d["selected_json"])
+        ok = (recomputed_digest == d["pool_digest"]
+              and recomputed_seed == d["seed"]
+              and sorted(recomputed) == sorted(stored))
+        return {
+            "draw_id": did,
+            "matches": ok,
+            "pool_digest_recomputed": recomputed_digest,
+            "pool_digest_sealed": d["pool_digest"],
+            "seed_recomputed": recomputed_seed,
+            "seed_sealed": d["seed"],
+            "selection_matches": sorted(recomputed) == sorted(stored),
+            "beacon_value": d["beacon_value"],
+            "beacon_check": ("Confirm this value independently at "
+                             "/x/heartbeat/verify?round=%s, then at the beacon "
+                             "operator's own endpoint." % d["beacon_round"]),
+            "do_it_without_us": {
+                "seed": 'SHA256("AILEASH-SORTITION-v1|" + period + "|" + pool_digest + "|" + beacon_value)',
+                "rank": 'SHA256(seed + ":" + record_hash)',
+                "select": "lowest k ranks, ascending",
+                "note": ("This route runs the same function on our server, so "
+                         "it is a convenience, not the proof. The proof is you "
+                         "running those three lines yourself."),
+            },
+        }, 200
+
+    # -------------------------------------------------- outstanding
+    if method == "GET" and action == "outstanding":
+        now = time.time()
+        cur = conn.cursor()
+        cur.execute("SELECT id, period, selected, drawn_at FROM sortition_draw"
+                    " ORDER BY id DESC")
+        items = []
+        for did, period, sel, drawn in cur.fetchall():
+            cur2 = conn.cursor()
+            cur2.execute("SELECT record_hash FROM sortition_review WHERE draw_id=?", (did,))
+            done = {r[0] for r in cur2.fetchall()}
+            due = drawn + REVIEW_DUE_HOURS * 3600
+            for m in json.loads(sel):
+                if m in done:
+                    continue
+                items.append({
+                    "draw_id": did, "period": period, "record": m,
+                    "drawn_at": _iso(drawn), "due": _iso(due),
+                    "state": "gap" if now > due else "outstanding",
+                    "late_by": _human(now - due) if now > due else None,
+                })
+        gaps = [i for i in items if i["state"] == "gap"]
+        return {"outstanding_count": len(items), "gap_count": len(gaps),
+                "due_after_hours": REVIEW_DUE_HOURS,
+                "items": items[:500],
+                "meaning": VOCABULARY["gap"]}, 200
+
+    # -------------------------------------------------- status
+    if method == "GET" and action == "status":
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*), SUM(select_count) FROM sortition_draw")
+        ndraws, nsel = cur.fetchone()
+        nsel = nsel or 0
+        cur.execute("SELECT COUNT(*) FROM sortition_review")
+        nrev = cur.fetchone()[0]
+        cur.execute("SELECT outcome, COUNT(*) FROM sortition_review GROUP BY outcome")
+        mix = {r[0]: r[1] for r in cur.fetchall()}
+        cur.execute("SELECT COUNT(*) FROM sortition_pool")
+        npool = cur.fetchone()[0]
+        beats = _beats_available(conn)
+        return {
+            "version": VERSION,
+            "pools_committed": npool,
+            "draws": ndraws,
+            "records_selected": nsel,
+            "reviews_recorded": nrev,
+            "response_rate": round(nrev / nsel, 4) if nsel else None,
+            "outcome_mix": mix,
+            "beacon_available": beats is not None,
+            "beats_in_system": beats,
+            "depends_on": {
+                "heartbeat": ("supplies the dice. Without a beacon sealed "
+                              "after the pool, no draw is possible."),
+                "complete": ("commits the period's record count in advance. "
+                             "Without it, a record could be kept out of the "
+                             "pool. Separate module, separate check: "
+                             "/x/complete/periods"),
+            },
+            "what_this_proves": WHAT_THIS_PROVES,
+        }, 200
+
+    return {"error": "unknown_action", "action": action,
+            "actions": ["spec", "draws", "draw", "verify", "outstanding",
+                        "status", "pool", "review"]}, 404
+
+
+def _draw_row(conn, did):
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, period, pool_id, pool_digest, pool_size, rate, select_count,"
+        " beacon_source, beacon_round, beacon_value, beacon_rowid, seed,"
+        " selected, drawn_at FROM sortition_draw WHERE id=?", (did,))
+    r = cur.fetchone()
+    if not r:
+        return None
+    keys = ["id", "period", "pool_id", "pool_digest", "pool_size", "rate",
+            "select_count", "beacon_source", "beacon_round", "beacon_value",
+            "beacon_rowid", "seed", "selected_json", "drawn_at"]
+    return dict(zip(keys, r))
+
+
+def _spec():
+    return {
+        "module": "sortition",
+        "version": VERSION,
+        "name_means": "selection by lot - the ancient method for stopping the powerful choosing who gets scrutinised",
+        "the_hole": (
+            "Every system claiming human oversight reviews a sample. In every "
+            "one, the operator picks the sample, so the sample proves nothing."
+        ),
+        "the_three_locks": [
+            "1. The pool of eligible records is fixed and sealed first.",
+            "2. The draw may only use a beacon value sealed AFTER the pool. "
+            "Refused otherwise. So the pool was fixed before the dice existed.",
+            "3. The beacon value ranks the pool. Lowest k are selected. "
+            "Anyone recomputes it from public values.",
+        ],
+        "selection_function": {
+            "seed": 'SHA256("AILEASH-SORTITION-v1|" + period + "|" + pool_digest + "|" + beacon_value)',
+            "rank": 'SHA256(seed + ":" + record_hash)',
+            "select": "the k lowest ranks in ascending order",
+            "why_no_rng": ("A random number generator is a library, a version "
+                           "and a seed we control. Two SHA-256 calls are none "
+                           "of those and run in any language."),
+        },
+        "uniform_only": (
+            "Risk-weighted sampling is deliberately not offered. A weighting "
+            "the operator sets is a choice the operator made, which is the "
+            "thing this module exists to remove."
+        ),
+        "refusal": (
+            "A reviewer may refuse a selected case, with a reason, sealed. "
+            "An honest refusal on the record beats a silent gap. A selection "
+            "left unanswered past the due window is published as a gap with "
+            "the record named."
+        ),
+        "vocabulary": VOCABULARY,
+        "what_this_proves": WHAT_THIS_PROVES,
+        "limits": [
+            "It does not prove the reviews were any good.",
+            "It does not force anyone to draw at all. A period with no draw "
+            "is a period with no sample and status says so.",
+            "Pool membership is asserted by this server; completeness of the "
+            "pool is complete.py's job, not this module's.",
+            "The beacon is a third party. If drand and Bitcoin both vanish, "
+            "new draws stop. Old draws stay verifiable.",
+        ],
+        "routes": {
+            "POST /x/sortition/pool": "keyed - commit the pool for a closed period",
+            "POST /x/sortition/draw": "keyed - draw against a beacon sealed after the pool",
+            "POST /x/sortition/review": "keyed - file a review or a refusal with a reason",
+            "GET /x/sortition/draws": "every draw",
+            "GET /x/sortition/draw?id=": "one draw and its answers",
+            "GET /x/sortition/verify?id=": "recompute the draw",
+            "GET /x/sortition/outstanding": "selected and unanswered, with gaps named",
+            "GET /x/sortition/status": "coverage and response rate",
+        },
+    }
+
+```
 
 
 ## `modules/spec.py`
@@ -715,1916 +2219,5 @@ def handle(method, action, data, api_key, ctx):
                 "scope": "Public demonstration activity and total chain height only. Nothing scoped to a customer key is published here."}, 200
     return {"error": "unknown_action", "action": action,
             "available": ["GET stats", "GET chain"]}, 404
-
-```
-
-
-## `modules/verifier.py`
-
-717 lines, 26299 bytes
-
-```python
-#!/usr/bin/env python3
-"""
-modules/verifier.py  -  hand the verifier out at a URL
-
-WHY THIS EXISTS
----------------
-A proof that can only be checked by the party who issued it is not a proof.
-So the proof bundles at /x/continuity/proof are useless unless somebody can
-easily get hold of something that checks them, and telling people to clone a
-repository is a gate.
-
-This serves the standalone verifier as a plain file:
-
-    curl -sO https://sebbi.pro/verify-authority.py
-    curl -s "https://sebbi.pro/x/continuity/proof?evaluation=e_..." \\
-        | python3 verify-authority.py -
-
-The script it hands out has no dependencies and makes no network calls. It
-checks the Ed25519 signature, recomputes every digest, re-runs the whole
-derivation from the published rules, and reaches its own verdict - then says
-so if that verdict disagrees with ours.
-
-WHAT IT DELIBERATELY DOES NOT DO
---------------------------------
-It does not phone home, and this module records nothing about who downloaded
-it. A verification tool that reports back to the party being verified is not
-a verification tool.
-
-    GET /verify-authority.py   the script
-    GET /x/verifier/status     what is installed, and the script's digest
-"""
-
-import hashlib
-import sys
-
-VERSION = "1.1"
-
-PUBLIC = {("GET", "status")}
-
-# Deliberately NOT "/verify" - that is the sealed-post verification page and
-# this module would silently hijack it, handing a visitor a Python download
-# where they expected a page. A route grab is a bug even when the code works.
-FILE_PATHS = ("/verify-authority.py", "/verify_authority.py")
-
-_patched = [False]
-
-
-SCRIPT = r'''#!/usr/bin/env python3
-"""
-verify_authority.py  -  check an AILeash authority proof without AILeash
-
-    python3 verify_authority.py proof.json
-    curl -s "https://sebbi.pro/x/continuity/proof?evaluation=e_..." \\
-        | python3 verify_authority.py -
-
-WHAT THIS IS FOR
-----------------
-A proof that can only be checked by the party who issued it is not a proof.
-This script takes a bundle and reaches its own conclusion using nothing but
-the Python standard library. It does not call the issuing system, it does not
-import anything you have to install, and it does not take a single field of
-the bundle at face value.
-
-It does four separate things, and each one can fail on its own:
-
-  1. SIGNATURE   Ed25519 over the canonical bundle. Confirms the bundle came
-                 from the holder of the named key and has not been edited by
-                 anybody since.
-
-  2. INTEGRITY   Recomputes every grant digest, the lineage digest and the
-                 parameter digest from the fields in front of it. Confirms
-                 the bundle is internally consistent with its own contents.
-
-  3. DERIVATION  Re-runs the authority rules from scratch: root issued by a
-                 human, an unbroken parent chain, scope covered at every hop,
-                 constraints narrowing on every axis, purpose narrowing,
-                 validity windows contained, nothing revoked, and the action
-                 itself inside the effective limits of the whole lineage.
-
-  4. AGREEMENT   Compares the verdict this script reached with the verdict the
-                 bundle claims. Disagreement is reported as a failure of the
-                 issuer, not of this script.
-
-WHAT A PASS MEANS
------------------
-That the authority for this action was derivable, at that time, from that
-human grant - or, for a refusal, that it genuinely was not, and that the named
-grant and invariant really are where it broke.
-
-WHAT A PASS DOES NOT MEAN
--------------------------
-That the root grant should ever have been issued. That the parameters describe
-something that really happened. That the risk engine was right. Derivation is
-not merit and it is not truth.
-
-The risk half of a composed verdict cannot be re-derived here, because that
-needs the issuer's scoring engine. Where the bundle's authority verdict is
-BLOCK, the composed verdict stands regardless, because the composition takes
-the worse of the two.
-"""
-
-import binascii
-import hashlib
-import json
-import sys
-
-GRANT_PREFIX = b"AILEASH-GRANT-v1:"
-EVAL_PREFIX = b"AILEASH-AUTHEVAL-v1:"
-BUNDLE_PREFIX = b"AILEASH-AUTHORITY-PROOF-v1:"
-
-MAX_DEPTH = 32
-RANK = {"ALLOW": 0, "CHALLENGE": 1, "BLOCK": 2}
-
-
-# ======================================================================
-# Ed25519, RFC 8032, standard library only
-# ======================================================================
-
-_Q = 2 ** 255 - 19
-_L = 2 ** 252 + 27742317777372353535851937790883648493
-_D = -121665 * pow(121666, _Q - 2, _Q) % _Q
-_I = pow(2, (_Q - 1) // 4, _Q)
-
-
-def _h(m):
-    return hashlib.sha512(m).digest()
-
-
-def _inv(x):
-    return pow(x, _Q - 2, _Q)
-
-
-def _xrecover(y):
-    xx = (y * y - 1) * _inv(_D * y * y + 1)
-    x = pow(xx, (_Q + 3) // 8, _Q)
-    if (x * x - xx) % _Q != 0:
-        x = (x * _I) % _Q
-    if x % 2 != 0:
-        x = _Q - x
-    return x
-
-
-_BY = 4 * _inv(5) % _Q
-_BX = _xrecover(_BY)
-_B = (_BX % _Q, _BY % _Q, 1, (_BX * _BY) % _Q)
-_IDENT = (0, 1, 1, 0)
-
-
-def _add(p, q):
-    x1, y1, z1, t1 = p
-    x2, y2, z2, t2 = q
-    a = (y1 - x1) * (y2 - x2) % _Q
-    b = (y1 + x1) * (y2 + x2) % _Q
-    c = t1 * 2 * _D * t2 % _Q
-    dd = z1 * 2 * z2 % _Q
-    e, f, g, hh = b - a, dd - c, dd + c, b + a
-    return (e * f % _Q, g * hh % _Q, f * g % _Q, e * hh % _Q)
-
-
-def _scalarmult(p, e):
-    if e == 0:
-        return _IDENT
-    q = _scalarmult(p, e // 2)
-    q = _add(q, q)
-    if e & 1:
-        q = _add(q, p)
-    return q
-
-
-def _encodepoint(p):
-    x, y, z, _t = p
-    zi = _inv(z)
-    x, y = x * zi % _Q, y * zi % _Q
-    bits = [(y >> i) & 1 for i in range(255)] + [x & 1]
-    return bytes(sum(bits[i * 8 + j] << j for j in range(8)) for i in range(32))
-
-
-def _bit(h, i):
-    return (h[i // 8] >> (i % 8)) & 1
-
-
-def _hint(m):
-    h = _h(m)
-    return sum(2 ** i * _bit(h, i) for i in range(512))
-
-
-def _isoncurve(p):
-    x, y, z, t = p
-    return (z % _Q != 0 and x * y % _Q == z * t % _Q
-            and (y * y - x * x - z * z - _D * t * t) % _Q == 0)
-
-
-def _decodepoint(s):
-    y = int.from_bytes(s, "little") & ((1 << 255) - 1)
-    x = _xrecover(y)
-    if x & 1 != _bit(s, 255):
-        x = _Q - x
-    p = (x, y, 1, (x * y) % _Q)
-    if not _isoncurve(p):
-        raise ValueError("point off curve")
-    return p
-
-
-def ed25519_verify(sig, msg, pk):
-    if len(sig) != 64 or len(pk) != 32:
-        return False
-    try:
-        rr = _decodepoint(sig[:32])
-        a = _decodepoint(pk)
-    except Exception:
-        return False
-    s = int.from_bytes(sig[32:64], "little")
-    if s >= _L:
-        return False
-    hh = _hint(sig[:32] + pk + msg)
-    return _encodepoint(_scalarmult(_B, s)) == _encodepoint(_add(rr, _scalarmult(a, hh)))
-
-
-# ======================================================================
-# the rules, reimplemented from the published spec
-# ======================================================================
-
-def canon(obj):
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
-
-
-def sha(prefix, text):
-    return hashlib.sha256(prefix + text.encode("utf-8")).hexdigest()
-
-
-def grant_digest(g):
-    material = {
-        "id": g["id"], "parent": g["parent"], "issuer": g["issuer"],
-        "issuer_kind": g["issuer_kind"], "subject": g["subject"],
-        "subject_kind": g["subject_kind"], "scope": sorted(g["scope"]),
-        "constraints": g["constraints"], "purpose": g["purpose"],
-        "purpose_tags": sorted(g["purpose_tags"]),
-        "not_before": g["not_before"], "not_after": g["not_after"],
-        "depth": g["depth"], "delegations_left": g["delegations_left"],
-        "created": g["created"], "risk_accepted_by": g.get("risk_accepted_by"),
-    }
-    return sha(GRANT_PREFIX, canon(material))
-
-
-def covers(held, wanted):
-    if held == wanted or held == "*":
-        return True
-    if held.endswith(".*"):
-        return wanted == held[:-2] or wanted.startswith(held[:-1])
-    return False
-
-
-def wildcard_breadth(scope, capability):
-    best = None
-    for held in scope:
-        if not covers(held, capability):
-            continue
-        if held == capability:
-            return 0
-        width = (capability.count(".") + 2 if held == "*"
-                 else capability.count(".") - held[:-2].count("."))
-        best = width if best is None else min(best, width)
-    return best
-
-
-def direction(key):
-    for p in ("max_", "min_", "allowed_", "denied_", "may_"):
-        if key.startswith(p):
-            return p
-    return None
-
-
-def num(v):
-    if isinstance(v, bool) or v is None:
-        raise ValueError("not a number")
-    return float(v)
-
-
-def as_set(v):
-    if isinstance(v, (list, tuple, set)):
-        return set(v)
-    return {v}
-
-
-def narrower(parent_c, child_c):
-    for key in sorted(child_c):
-        d = direction(key)
-        cval = child_c[key]
-        if d is None:
-            return False, "constraint '%s' has no narrowing rule" % key
-        if key not in parent_c:
-            return False, "constraint '%s' is not expressed by the parent" % key
-        pval = parent_c[key]
-        try:
-            if d == "max_" and num(cval) > num(pval):
-                return False, "%s raised from %s to %s" % (key, pval, cval)
-            if d == "min_" and num(cval) < num(pval):
-                return False, "%s lowered from %s to %s" % (key, pval, cval)
-            if d == "allowed_" and not as_set(cval) <= as_set(pval):
-                return False, "%s adds values the parent does not hold" % key
-            if d == "denied_" and not as_set(pval) <= as_set(cval):
-                return False, "%s drops values the parent denies" % key
-            if d == "may_" and bool(cval) and not bool(pval):
-                return False, "%s enabled where the parent withholds it" % key
-        except (TypeError, ValueError):
-            return False, "constraint '%s' is not comparable" % key
-    return True, None
-
-
-def effective(chain):
-    eff = {}
-    for g in chain:
-        for k, v in g["constraints"].items():
-            d = direction(k)
-            if k not in eff:
-                eff[k] = v
-                continue
-            cur = eff[k]
-            try:
-                if d == "max_":
-                    eff[k] = min(num(cur), num(v))
-                elif d == "min_":
-                    eff[k] = max(num(cur), num(v))
-                elif d == "allowed_":
-                    eff[k] = sorted(as_set(cur) & as_set(v))
-                elif d == "denied_":
-                    eff[k] = sorted(as_set(cur) | as_set(v))
-                elif d == "may_":
-                    eff[k] = bool(cur) and bool(v)
-            except (TypeError, ValueError):
-                eff[k] = v
-    return eff
-
-
-def params_against(params, eff):
-    hard, unconstrained = [], []
-    for key in sorted(params):
-        val = params[key]
-        checked = False
-        for cname, cval in eff.items():
-            d = direction(cname)
-            if not d or cname[len(d):] != key:
-                continue
-            checked = True
-            try:
-                if d == "max_" and num(val) > num(cval):
-                    hard.append("%s=%s exceeds %s=%s" % (key, val, cname, cval))
-                elif d == "min_" and num(val) < num(cval):
-                    hard.append("%s=%s is below %s=%s" % (key, val, cname, cval))
-                elif d == "allowed_" and val not in as_set(cval):
-                    hard.append("%s=%s is outside %s" % (key, val, cname))
-                elif d == "denied_" and val in as_set(cval):
-                    hard.append("%s=%s is denied by %s" % (key, val, cname))
-                elif d == "may_" and bool(val) and not bool(cval):
-                    hard.append("%s requested where %s withholds it" % (key, cname))
-            except (TypeError, ValueError):
-                hard.append("%s cannot be compared with %s" % (key, cname))
-        if not checked:
-            unconstrained.append(key)
-    return hard, unconstrained
-
-
-# ======================================================================
-# the four checks
-# ======================================================================
-
-class Report(object):
-    def __init__(self):
-        self.rows = []
-        self.failed = False
-
-    def add(self, ok, name, detail=""):
-        self.rows.append((ok, name, detail))
-        if not ok:
-            self.failed = True
-
-    def note(self, name, detail=""):
-        self.rows.append((None, name, detail))
-
-    def render(self):
-        out = []
-        for ok, name, detail in self.rows:
-            mark = "  ok  " if ok else ("FAIL  " if ok is False else "  --  ")
-            out.append(mark + name + (("\n        " + detail) if detail else ""))
-        return "\n".join(out)
-
-
-def check_signature(bundle, rep):
-    sig_hex = bundle.get("signature")
-    pk_hex = (bundle.get("issued_by") or {}).get("public_key")
-    if not sig_hex or not pk_hex:
-        rep.add(False, "Signature present", "the bundle carries no signature or no key")
-        return
-    body = dict(bundle)
-    body.pop("signature", None)
-    body.pop("verify_with", None)
-    try:
-        sig = binascii.unhexlify(sig_hex)
-        pk = binascii.unhexlify(pk_hex)
-    except Exception:
-        rep.add(False, "Signature is readable hex")
-        return
-    ok = ed25519_verify(sig, BUNDLE_PREFIX + canon(body).encode("utf-8"), pk)
-    rep.add(ok, "Ed25519 signature over the canonical bundle",
-            "key " + pk_hex[:16] + "…  Verify this key independently at the issuer's "
-            "published address before trusting who signed." if ok else
-            "the bundle was altered after signing, or it was not signed by this key")
-
-
-def check_integrity(bundle, rep):
-    lineage = bundle.get("lineage") or []
-    bad = []
-    for g in lineage:
-        try:
-            if grant_digest(g) != g.get("digest"):
-                bad.append(g.get("id"))
-        except Exception:
-            bad.append(g.get("id"))
-    rep.add(not bad, "Every grant digest recomputes from its own fields",
-            "" if not bad else "mismatched: " + ", ".join(str(b) for b in bad))
-
-    claimed = (bundle.get("decision") or {}).get("lineage_digest")
-    mine = sha(EVAL_PREFIX, canon([g.get("digest") for g in lineage]))
-    rep.add(mine == claimed, "Lineage digest matches the ordered path",
-            "" if mine == claimed else "computed " + mine[:20] + "… claimed " + str(claimed)[:20] + "…")
-
-    req = bundle.get("request") or {}
-    claimed_p = (bundle.get("decision") or {}).get("params_digest")
-    mine_p = sha(EVAL_PREFIX, canon({"action": req.get("action"),
-                                     "params": req.get("params") or {}}))
-    rep.add(mine_p == claimed_p, "Parameter digest matches the request as stated",
-            "" if mine_p == claimed_p else "the parameters shown are not the "
-            "parameters that were judged")
-
-
-def rederive(bundle, rep):
-    """Run the published rules from scratch and reach an independent verdict."""
-    lineage = bundle.get("lineage") or []
-    decision = bundle.get("decision") or {}
-    req = bundle.get("request") or {}
-    at = decision.get("evaluated_at_epoch")
-
-    hard, soft = [], []
-    broken_at = broken_invariant = None
-
-    def fail(grant, invariant, detail):
-        nonlocal broken_at, broken_invariant
-        hard.append(detail)
-        if broken_at is None:
-            broken_at, broken_invariant = grant, invariant
-
-    if not lineage:
-        fail(None, "authority_continuity", "the bundle carries no authority path")
-    else:
-        root = lineage[0]
-        if root.get("parent") is not None:
-            fail(root["id"], "authority_continuity",
-                 "the path does not begin at a parentless root")
-        if root.get("issuer_kind") != "human":
-            fail(root["id"], "identity_continuity",
-                 "the root grant was not issued by a human principal")
-
-        previous = None
-        for g in lineage:
-            if g.get("revoked_at") is not None:
-                fail(g["id"], "authority_continuity",
-                     "grant %s was revoked" % g["id"])
-            if at is not None:
-                if at < g["not_before"]:
-                    fail(g["id"], "temporal_validity",
-                         "grant %s was not yet valid at the time of the decision" % g["id"])
-                if at >= g["not_after"]:
-                    fail(g["id"], "temporal_validity",
-                         "grant %s had expired at the time of the decision" % g["id"])
-            if previous is not None:
-                if g.get("parent") != previous.get("id"):
-                    fail(g["id"], "authority_continuity",
-                         "grant %s does not point at the grant above it" % g["id"])
-                missing = [c for c in g["scope"]
-                           if not any(covers(p, c) for p in previous["scope"])]
-                if missing:
-                    fail(g["id"], "boundary_integrity",
-                         "%s holds scope its parent does not: %s"
-                         % (g["id"], ", ".join(sorted(missing))))
-                ok, why = narrower(previous["constraints"], g["constraints"])
-                if not ok:
-                    fail(g["id"], "boundary_integrity", "%s: %s" % (g["id"], why))
-                if not set(g["purpose_tags"]) <= set(previous["purpose_tags"]):
-                    fail(g["id"], "intent_continuity",
-                         "%s carries purpose tags its parent does not" % g["id"])
-                if (g["not_before"] < previous["not_before"]
-                        or g["not_after"] > previous["not_after"]):
-                    fail(g["id"], "temporal_validity",
-                         "%s is valid outside its parent's window" % g["id"])
-                if g["depth"] != previous["depth"] + 1:
-                    fail(g["id"], "authority_continuity",
-                         "%s records a depth inconsistent with its parent" % g["id"])
-            previous = g
-
-        if len(lineage) - 1 > MAX_DEPTH:
-            fail(lineage[-1]["id"], "boundary_integrity", "delegation depth exceeds the ceiling")
-
-        if not any(g.get("risk_accepted_by") for g in lineage):
-            fail(lineage[0]["id"], "identity_continuity",
-                 "no grant in this path names who accepted the risk")
-
-        leaf = lineage[-1]
-        action = req.get("action")
-        params = req.get("params") or {}
-
-        if action and not any(covers(c, action) for c in leaf["scope"]):
-            fail(leaf["id"], "boundary_integrity",
-                 "action '%s' is outside the scope of the grant exercised" % action)
-        elif action:
-            breadth = wildcard_breadth(leaf["scope"], action)
-            if breadth and breadth >= 2:
-                soft.append("action '%s' is only covered by a broad wildcard" % action)
-
-        eff = effective(lineage)
-        failures, unconstrained = params_against(params, eff)
-        for f in failures:
-            fail(leaf["id"], "boundary_integrity", f)
-        for u in unconstrained:
-            soft.append("parameter '%s' is not constrained anywhere in the path" % u)
-
-        tag = req.get("purpose_tag")
-        if tag:
-            if tag not in leaf["purpose_tags"]:
-                soft.append("declared purpose '%s' is not carried by the grant" % tag)
-        else:
-            soft.append("the action declared no purpose")
-
-    verdict = "BLOCK" if hard else ("CHALLENGE" if soft else "ALLOW")
-    return verdict, hard, soft, broken_at, broken_invariant
-
-
-def check_agreement(bundle, rep, mine, hard, soft, broken_at, broken_invariant):
-    decision = bundle.get("decision") or {}
-    claimed = decision.get("authority_verdict") or decision.get("verdict")
-
-    rep.add(mine == claimed,
-            "Independently re-derived authority verdict: " + mine,
-            "" if mine == claimed else
-            "the issuer claims " + str(claimed) + " and this script reaches " + mine +
-            " from the same path. One of us is wrong and the rules are published.")
-
-    if mine == "BLOCK":
-        same_grant = (broken_at == decision.get("broken_at"))
-        same_inv = (broken_invariant == decision.get("broken_invariant"))
-        rep.add(same_grant and same_inv,
-                "Refusal reproduces at the same grant and invariant",
-                ("grant %s, invariant %s" % (broken_at, broken_invariant))
-                if same_grant and same_inv else
-                "this script breaks at grant %s / %s, the issuer says %s / %s"
-                % (broken_at, broken_invariant,
-                   decision.get("broken_at"), decision.get("broken_invariant")))
-        rep.note("Why authority could not be derived")
-        for h in hard:
-            rep.note("  " + h)
-    elif soft:
-        rep.note("Why this could not be settled without a person")
-        for x in soft:
-            rep.note("  " + x)
-
-    risk = decision.get("risk_verdict")
-    if risk and mine != "BLOCK":
-        rep.note("Risk verdict reported as " + str(risk) + ", not re-derivable here",
-                 "the composed verdict is the worse of the two; the scoring engine "
-                 "is not part of this bundle and is not checked by this script")
-
-
-def main():
-    if len(sys.argv) < 2:
-        print(__doc__)
-        return 2
-    src = sys.argv[1]
-    raw = sys.stdin.read() if src == "-" else open(src, "r").read()
-    try:
-        bundle = json.loads(raw)
-    except Exception as exc:
-        print("Not readable JSON: " + str(exc))
-        return 2
-
-    rep = Report()
-    print("=" * 66)
-    print("AUTHORITY PROOF  ·  independent verification")
-    print("=" * 66)
-    d = bundle.get("decision") or {}
-    print("evaluation   " + str(d.get("evaluation")))
-    print("action       " + str((bundle.get("request") or {}).get("action")))
-    print("at           " + str(d.get("evaluated_at")))
-    print("hops         " + str(max(0, len(bundle.get("lineage") or []) - 1)))
-    if bundle.get("lineage"):
-        print("authorised   " + str(bundle["lineage"][0].get("issuer")))
-        print("executed     " + str(bundle["lineage"][-1].get("subject")))
-        acc = [g.get("risk_accepted_by") for g in bundle["lineage"] if g.get("risk_accepted_by")]
-        print("risk owner   " + str(acc[-1] if acc else None))
-    print("-" * 66)
-
-    check_signature(bundle, rep)
-    check_integrity(bundle, rep)
-    mine, hard, soft, ba, bi = rederive(bundle, rep)
-    check_agreement(bundle, rep, mine, hard, soft, ba, bi)
-
-    print(rep.render())
-    print("-" * 66)
-    if rep.failed:
-        print("RESULT: NOT VERIFIED. Something above did not hold.")
-        return 1
-    print("RESULT: VERIFIED - " + mine)
-    if mine == "BLOCK":
-        print("This is a proof that the action was NOT authorised, and where it failed.")
-    print("Checked with no network access, no dependencies, and nothing taken on")
-    print("the issuer's word except the meaning of their public key.")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
-'''
-
-
-def _digest():
-    return hashlib.sha256(SCRIPT.encode("utf-8")).hexdigest()
-
-
-def _srv():
-    m = sys.modules.get("__main__")
-    if m is not None and hasattr(m, "get_bearer"):
-        return m
-    return sys.modules.get("server")
-
-
-def _install(s):
-    if _patched[0]:
-        return "already installed"
-    H = getattr(s, "Handler", None)
-    if H is None or not hasattr(H, "do_GET"):
-        return "no handler"
-    if getattr(H, "_verifier_patched", False):
-        _patched[0] = True
-        return "already installed"
-
-    original = H.do_GET
-
-    def do_GET(self):
-        try:
-            from urllib.parse import urlparse
-            p = urlparse(self.path).path.rstrip("/") or "/"
-        except Exception:
-            p = self.path or "/"
-
-        if p in FILE_PATHS:
-            body = SCRIPT.encode("utf-8")
-            try:
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Content-Disposition",
-                                 'attachment; filename="verify-authority.py"')
-                self.send_header("Cache-Control", "public, max-age=300")
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.send_header("X-Content-Type-Options", "nosniff")
-                self.end_headers()
-                self.wfile.write(body)
-            except Exception:
-                pass
-            return
-
-        return original(self)
-
-    H.do_GET = do_GET
-    H._verifier_patched = True
-    _patched[0] = True
-    print("VERIFIER: /verify-authority.py installed", flush=True)
-    return "installed"
-
-
-def handle(method, action, data, api_key, ctx):
-    s = _srv()
-    if s is None:
-        return {"error": "server_not_found"}, 500
-
-    state = "already installed" if _patched[0] else None
-    if not _patched[0]:
-        try:
-            state = _install(s)
-        except Exception as exc:
-            print("VERIFIER: patch failed - " + str(exc), flush=True)
-            state = "failed: " + str(exc)
-
-    action = (action or "").strip("/").lower()
-
-    if method == "GET" and action in ("", "status"):
-        return {
-            "installed": bool(_patched[0]),
-            "install_result": state,
-            "module_version": VERSION,
-            "serving": list(FILE_PATHS),
-            "script_bytes": len(SCRIPT),
-            "script_sha256": _digest(),
-            "how_to_use": [
-                "curl -sO https://sebbi.pro/verify-authority.py",
-                "curl -s 'https://sebbi.pro/x/continuity/proof?evaluation=<id>' "
-                "| python3 verify-authority.py -",
-            ],
-            "dependencies": "none - Python standard library only",
-            "network": "the script makes no network calls and reports nothing back. "
-                       "A verification tool that phones home to the party being "
-                       "verified is not a verification tool.",
-            "note": "Check script_sha256 against the file you downloaded. And read it "
-                    "before you run it, as you would with anything else handed to you "
-                    "by the party you are checking.",
-        }, 200
-
-    return {"error": "unknown_action", "action": action, "GET": ["status"]}, 404
-
-```
-
-
-## `modules/warmup.py`
-
-211 lines, 7688 bytes
-
-```python
-"""
-modules/warmup.py  v1.0  -  arm every page module in one request
-
-THE PROBLEM THIS ENDS
----------------------
-console.py, packconsole.py, peerconsole.py, selfcheck.py and the rest all
-install their page by patching do_GET at runtime, and that only happens the
-first time their handle() runs. So after every deploy the pages 404 until
-somebody happens to hit each module's /x/ route.
-
-Worse, most of those modules only make `status` public. A keyless request to
-/x/console/ is rejected by the router before the module is ever imported, so
-the obvious way of arming them does not work and looks like a broken site
-instead of a cold one.
-
-WHAT THIS DOES
---------------
-One public route that imports each page module and calls its handle() once,
-which is exactly what installs the patch. Every page comes back in a single
-request, with no key.
-
-    GET /x/warmup/all       arm everything, report what happened
-    GET /x/warmup/status    what is armed right now, arms nothing
-    GET /x/warmup/spec      what this is
-
-POINT RAILWAY AT IT
--------------------
-Set the healthcheck path to:
-
-    /x/warmup/all
-
-Railway calls it after every deploy, so the site is armed before anyone
-opens it. It always returns 200 as long as the process is up - a module
-that fails to arm is reported in the body rather than failing the
-healthcheck, because one broken page should not roll back a good deploy.
-
-SAFE TO RUN REPEATEDLY
-----------------------
-Every module guards its own patch with a `_patched` flag, so a second call
-is a no-op. Call it every minute if you like.
-
-ADDING A MODULE
----------------
-Put its name in PAGE_MODULES. Nothing else. If the module is not deployed
-it is reported as missing and the others still arm.
-"""
-
-import importlib
-import sys
-import time
-import traceback
-
-VERSION = "1.0"
-
-PUBLIC = {("GET", "all"), ("GET", "status"), ("GET", "spec"), ("GET", "")}
-
-# Modules that serve an HTML page by patching do_GET at runtime.
-# Name only - no path, no .py.
-PAGE_MODULES = [
-    "console",
-    "packconsole",
-    "peerconsole",
-    "selfcheck",
-    "savings",
-    "standard",
-    "network",
-    "demo",
-]
-
-# Import prefixes tried in order. Different deployments load modules
-# differently and guessing once and failing is how you get a 404 you
-# cannot explain.
-_PREFIXES = ("modules.", "", "aileash.modules.")
-
-_last_run = {"at": None, "results": None}
-
-
-def _find(name):
-    """Return an already-imported module, or import it. (module, how) or (None, why)."""
-    for pre in _PREFIXES:
-        mod = sys.modules.get(pre + name)
-        if mod is not None:
-            return mod, "already imported as " + pre + name
-    errors = []
-    for pre in _PREFIXES:
-        try:
-            return importlib.import_module(pre + name), "imported as " + pre + name
-        except ImportError as exc:
-            errors.append(pre + name + ": " + str(exc))
-        except Exception as exc:
-            # A real error inside the module - a syntax error, a bad import
-            # of its own. Worth reporting properly rather than as "missing",
-            # because those look identical from outside and cost hours.
-            return None, "FAILED TO LOAD (%s): %s" % (
-                type(exc).__name__, str(exc)[:200])
-    return None, "not found (" + "; ".join(errors[:1]) + ")"
-
-
-def _arm(name, ctx):
-    """Import a page module and call handle() once, which installs its patch."""
-    mod, how = _find(name)
-    if mod is None:
-        return {"module": name, "armed": False, "detail": how}
-
-    fn = getattr(mod, "handle", None)
-    if not callable(fn):
-        return {"module": name, "armed": False,
-                "detail": "loaded but has no handle()"}
-
-    try:
-        body, status = fn("GET", "status", {}, None, ctx)
-    except Exception as exc:
-        return {"module": name, "armed": False,
-                "detail": "handle() raised %s: %s" % (
-                    type(exc).__name__, str(exc)[:200]),
-                "traceback": traceback.format_exc(limit=3).splitlines()[-3:]}
-
-    body = body if isinstance(body, dict) else {}
-    armed = bool(body.get("installed", True))
-    out = {"module": name, "armed": armed, "http": status, "load": how}
-    for k in ("page", "install_result", "version"):
-        if k in body:
-            out[k] = body[k]
-    if not armed:
-        out["detail"] = body.get("install_result") or "reported not installed"
-    return out
-
-
-def _status_only(ctx):
-    """What is armed, without arming anything. Read-only."""
-    rows = []
-    for name in PAGE_MODULES:
-        found = None
-        for pre in _PREFIXES:
-            if (pre + name) in sys.modules:
-                found = sys.modules[pre + name]
-                break
-        if found is None:
-            rows.append({"module": name, "loaded": False, "armed": False})
-            continue
-        flag = getattr(found, "_patched", None)
-        armed = bool(flag[0]) if isinstance(flag, list) and flag else None
-        rows.append({"module": name, "loaded": True, "armed": armed,
-                     "page": getattr(found, "PAGE_PATHS", [None])[0]
-                             if hasattr(found, "PAGE_PATHS") else None})
-    return rows
-
-
-def handle(method, action, data, api_key, ctx):
-    action = (action or "").strip().lower()
-
-    if method != "GET":
-        return {"error": "unknown_action", "action": action,
-                "GET": ["all", "status", "spec"]}, 404
-
-    if action == "spec":
-        return {
-            "module": "warmup",
-            "version": VERSION,
-            "what_it_is": (
-                "Page modules install their route by patching do_GET the "
-                "first time they run, so every deploy leaves those pages "
-                "404 until something touches each one. This touches all of "
-                "them in one public request."),
-            "routes": {
-                "/x/warmup/all": "arm every page module, report each",
-                "/x/warmup/status": "what is armed now, arms nothing",
-                "/x/warmup/spec": "this",
-            },
-            "railway_healthcheck_path": "/x/warmup/all",
-            "modules": list(PAGE_MODULES),
-            "safe_to_repeat": True,
-            "note": ("Always returns 200 while the process is up. A module "
-                     "that fails to arm is reported in the body, because one "
-                     "bad page should not roll back a good deploy."),
-        }, 200
-
-    if action == "status":
-        return {"armed_now": _status_only(ctx),
-                "last_warmup": _last_run["at"],
-                "note": "Read-only. Call /x/warmup/all to actually arm."}, 200
-
-    # "" or "all"
-    t0 = time.time()
-    results = [_arm(name, ctx) for name in PAGE_MODULES]
-    _last_run["at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    _last_run["results"] = results
-
-    armed = [r["module"] for r in results if r.get("armed")]
-    failed = [r for r in results if not r.get("armed")]
-
-    for r in failed:
-        print("WARMUP: %s did not arm - %s"
-              % (r["module"], r.get("detail", "?")), flush=True)
-    print("WARMUP: %d/%d armed in %.0fms"
-          % (len(armed), len(results), (time.time() - t0) * 1000), flush=True)
-
-    return {
-        "ok": True,
-        "armed": len(armed),
-        "of": len(results),
-        "took_ms": round((time.time() - t0) * 1000, 1),
-        "pages_ready": [r.get("page") for r in results
-                        if r.get("armed") and r.get("page")],
-        "results": results,
-        "at": _last_run["at"],
-        "note": ("A module listed as not armed is either not deployed or "
-                 "raised on load - the detail says which. The rest still "
-                 "armed."),
-    }, 200
-
-```
-
-
-## `modules/witness.py`
-
-959 lines, 43983 bytes
-
-```python
-"""
-Mutual witness network - /x/witness/<action>
-
-THE PROBLEM
------------
-Every compliance vendor, this one included, holds the evidence about its own
-conduct. A hash chain stops anyone else altering it. It does not stop the
-operator rebuilding the whole chain from scratch and presenting the result as
-history. External anchoring narrows that to "you cannot rewrite anything older
-than your last CONFIRMED anchor" - which is good, and still not enough.
-
-WHAT THIS DOES
---------------
-Platforms witness each other.
-
-Each platform periodically hands its current chain tip to its peers. Each peer
-seals that tip into its OWN chain. From that moment the first platform's
-history is recorded inside chains it does not control.
-
-To rewrite your own history now, you would need every peer who witnessed you
-to rewrite theirs too, in step. That is not a technical exercise. That is a
-conspiracy, and it grows harder with every platform that joins.
-
-WHY observe IS OPEN
--------------------
-A witnessing network that only accepts tips from account holders is not a
-witnessing network, it is a customer list. Anyone must be able to hand us a
-tip without asking permission. Unauthenticated observations are filed under
-ANON_KEY, and the router meters them per client address.
-
-NAMES, AND WHAT WE CAN ACTUALLY PROVE ABOUT THEM
-------------------------------------------------
-The chain name in a submission is self-declared. Anyone can post under any
-name. We do not solve that with accounts, because accounts would make the
-network closed. We solve it by publishing how strong each claim is, and by
-remembering.
-
-Two independent checks run on every submission, and NEITHER of them can
-reject it. A submission is always sealed. What changes is what we say about it.
-
-1. LIVENESS - is there a real chain behind this name?
-   If the submission carries a url, we fetch it and compare what it serves
-   to what was submitted.
-     self-consistent  the url serves exactly the tip that was submitted
-     live             the url serves a valid tip, but a different one. A busy
-                      chain moves between submitting and our fetching, so this
-                      is normal and honest, not a failure
-     self-declared    no url, or we could not reach it, or it served nonsense
-
-   WHY "self-consistent" AND NOT "confirmed" (changed in 1.2)
-   ----------------------------------------------------------
-   Both halves of this check come from the same party. The submitter tells us
-   the tip and the submitter tells us where to look. Agreement between them
-   establishes that the submitter's endpoint agrees with the submitter. That
-   is self-consistency, not verification by anyone else.
-
-   Up to v1.1 this value was written as "confirmed", which was the only
-   approving word in a schema deliberately built without adjectives - and the
-   permanent one, since it is sealed. The docstring carried the caveat and the
-   field name contradicted it. Raised by Ishaan (Shango MID), correctly, and
-   changed rather than defended.
-
-   Blocks sealed before 1.2 say "confirmed" and cannot be altered - that is
-   the property working as intended. Both values mean the same check. The
-   legend on /x/witness/peers names both.
-
-   It still proves the submitter operates a live chain producing that data. It
-   does NOT prove they are who they say. Anyone running a real chain can point
-   a stolen name at their own url and pass this check cleanly.
-
-2. NAME BINDING - is this the same operator as last time?
-   The first time a name is seen with a url we can reach, we record that url
-   against the name. Every later submission under that name is compared.
-     first-use      never seen this name before, binding recorded
-     bound          same url as the first time. Same operator, consistently
-     conflict       this name has been submitted from a different url than
-                    the one it was first bound to
-
-   A conflict is not proof of theft. Operators move hosts. But it is exactly
-   the event anyone auditing the network needs to see, and it is recorded
-   permanently in our chain rather than resolved quietly by us.
-
-   This is what actually closes name theft. Check 1 alone does not.
-
-WHY EVERY READER-FACING PHRASE LIVES IN ONE BLOCK (added in 1.3)
------------------------------------------------------------------
-Four separate corrections in one week were all the same job: find the
-sentence, change the sentence, and hope there is not a second copy of it
-somewhere else in the file. There usually was. A word that goes into a sealed
-record, or into a response a peer will quote back at us, is not incidental
-prose - it is part of the interface, and it needs one home.
-
-Everything a reader sees now lives in VOCABULARY and MESSAGES at the top of
-this file. The code below references those keys and never spells a claim out
-inline. The next peer who finds an overstatement costs one line in one place,
-and the wording can be reviewed on its own without reading the logic.
-
-SSRF
-----
-Check 1 makes our server fetch a url chosen by an anonymous stranger. Done
-naively that is a hole considerably worse than the one it fixes: it would let
-anyone use us to reach services on our own private network, and to bounce
-traffic at a third party. So the fetcher only speaks http and https, only on
-ports 80 and 443, resolves the hostname first and refuses any address that is
-private, loopback, link-local, reserved or multicast, never follows a
-redirect, times out fast, and stops reading after a small cap.
-
-HONEST LIMITS
--------------
-- Nobody can be forced to keep publishing. A witness network's guarantee is
-  only as durable as its least persistent member, and that is not a property
-  any amount of design can fix. Listed first because it is the one that
-  actually bites.
-- ANCHORING IS PER-PROOF, NOT A PROPERTY OF THE CHAIN. Up to v1.2 this module
-  told readers "our chain is externally anchored" as a standing fact. It is
-  not. A proof is submitted to the OpenTimestamps calendars immediately, and
-  only becomes Bitcoin-confirmed once it has been upgraded and independently
-  verified. A given block is anchored when a proof covering it has confirmed,
-  and not before. Raised by Philip Pinol (PRAXIS / ThePraesidium.ai) against
-  block 846, correctly. Every route now points at /x/ots/status rather than
-  asserting a state this module cannot see.
-- Witnessing proves a tip EXISTED at a time. It says nothing about whether the
-  records behind it are true or complete. Garbage sealed on time is still
-  garbage.
-- Two colluding platforms witnessing only each other prove very little. The
-  guarantee comes from breadth.
-- This module does not verify a peer's chain is internally valid. It records
-  what they claimed, when, and how well it stood up to checking.
-- The liveness fetch resolves a hostname and then fetches it. An attacker
-  controlling DNS could answer differently between those two steps. Closing
-  that needs the connection pinned to the checked address, which is more
-  machinery than this warrants today. It is written down rather than hidden.
-
-    GET  /x/witness/tip                 our current tip, for peers to record
-    POST /x/witness/observe             chain, tip, url - we seal their tip
-                                        (peer accepted as an alias for chain;
-                                         optional peer_ts or ts, epoch or ISO)
-    GET  /x/witness/attest?peer=&tip=   did we witness this, and when
-    GET  /x/witness/peers               who we witness, and how consistently
-    GET  /x/witness/spec                the protocol, in four calls
-    GET  /x/witness/history?peer=       every tip we hold for that peer (keyed)
-"""
-
-import ipaddress
-import json
-import re
-import socket
-import time
-import urllib.error
-import urllib.request
-from datetime import datetime, timezone
-from urllib.parse import urlparse
-
-VERSION = "1.3"
-HEX64 = re.compile(r"^[0-9a-f]{64}$")
-
-# ----------------------------------------------------------------------
-# values that get sealed
-#
-# Anything in this section is written into a permanent record AND compared
-# against in code. Both roles are invisible to each other from outside, which
-# is exactly how renaming the match value in 1.2 silently broke first-use
-# binding. One constant, one meaning, every comparison through the name.
-# ----------------------------------------------------------------------
-
-# The liveness value written when a submitted url serves exactly the submitted
-# tip. Was "confirmed" up to v1.1 - see the docstring.
-LIVENESS_MATCH = "self-consistent"
-
-# Historical value for the same check, still present in blocks sealed before
-# v1.2. Sealed blocks cannot be altered, so both are accepted wherever a
-# comparison is made.
-LIVENESS_MATCH_LEGACY = "confirmed"
-
-# The url answered with a valid tip, but a different one. A moving chain.
-LIVENESS_MOVED = "live"
-
-# No url, unreachable url, or the url served something that was not a tip.
-LIVENESS_NONE = "self-declared"
-
-# Values that count as "we reached a url and it served a valid tip", for the
-# purpose of binding a name to that url.
-LIVENESS_REACHED = (LIVENESS_MATCH, LIVENESS_MATCH_LEGACY, LIVENESS_MOVED)
-
-NAME_FIRST = "first-use"
-NAME_BOUND = "bound"
-NAME_CONFLICT = "conflict"
-NAME_UNBOUND = "unbound"
-
-# ----------------------------------------------------------------------
-# everything a reader sees
-#
-# Nothing below this block spells out a claim inline. If a phrase needs
-# correcting it is corrected here, once, and every route that returns it
-# changes together.
-# ----------------------------------------------------------------------
-
-# Said wherever this module would previously have asserted that the chain is
-# anchored. It is not this module's fact to assert - anchoring state lives in
-# the OTS proofs and only /x/ots/status can see it.
-ANCHOR_NOTE = (
-    "Separately from the hash chain: this deployment submits its chain to the "
-    "OpenTimestamps calendars for Bitcoin anchoring. Submission is not "
-    "confirmation. A block is Bitcoin-confirmed only once a proof covering it "
-    "has been upgraded and verified with a standard OpenTimestamps client. "
-    "Check /x/ots/status for the state of the proof covering this block. "
-    "Until that proof confirms, the guarantee here is the hash chain and not "
-    "Bitcoin."
-)
-
-VOCABULARY = {
-    LIVENESS_MATCH: (
-        "The submitted url served exactly the submitted tip. Both halves came "
-        "from the submitter, so this records self-consistency - NOT "
-        "verification by us or any third party. Written as '%s' from witness "
-        "v1.2 onward." % LIVENESS_MATCH),
-    LIVENESS_MATCH_LEGACY: (
-        "The same check as '%s', under the name used before witness v1.2. It "
-        "was renamed because the old name implied third-party verification "
-        "that the check does not perform. Sealed blocks cannot be altered, so "
-        "this record keeps the original word." % LIVENESS_MATCH),
-    LIVENESS_MOVED: (
-        "The url served a valid but different tip. A chain that moves between "
-        "submitting and our fetching is the normal case, not a failure."),
-    LIVENESS_NONE: (
-        "No url was supplied, or we could not reach it. Taken on the "
-        "submitter's word and checked by nobody."),
-    None: "Not checked. Recorded before liveness checking existed.",
-}
-
-NAME_VOCABULARY = {
-    NAME_FIRST: (
-        "First time this name was seen with a reachable url, so the name is "
-        "now bound to it network-wide. Any later submission under this name "
-        "from a different address records as conflict, permanently."),
-    NAME_BOUND: (
-        "Submitted from the same url this name was first bound to. Same "
-        "operator, consistently."),
-    NAME_CONFLICT: (
-        "This name has been submitted from a different address than the one "
-        "it was first bound to. Not proof of theft - operators move hosts - "
-        "but it is the event an auditor needs to see, and it is permanent."),
-    NAME_UNBOUND: (
-        "No reachable url, so there is nothing to bind this name to. "
-        "IMPORTANT: an unbound name stays claimable. Whoever submits it next "
-        "WITH a reachable url takes the binding, and your own later "
-        "submission would then read conflict. We cannot prevent that - an "
-        "open endpoint has no way to tell two claimants apart - but a binding "
-        "placed over a name that was submitted before is recorded as such. If "
-        "the name matters, either submit with a url serving your tip, or use "
-        "the signed lane at /x/peer/submit."),
-    None: "Not checked.",
-}
-
-# What the signed lane does and does not bind. Agreed wording, unsoftened:
-# a shared secret is held by both parties, so it excludes third parties and
-# does not exclude the operator. Stated here rather than left for a peer to
-# work out from the word "signed".
-SIGNED_LANE_NOTE = (
-    "The signed lane at /x/peer/submit binds a name to knowledge of a shared "
-    "secret, not to control of an address. Because the operator of this "
-    "deployment holds the same secret, it closes third-party submission under "
-    "your name and does not close operator submission under your name. That "
-    "is a normal property of HMAC and it is stated rather than implied."
-)
-
-MESSAGES = {
-    "tip_note": (
-        "Record this tip in your own chain. Hand us yours at "
-        "/x/witness/observe and we will record it in ours."),
-    "tip_verify": (
-        "/api/verify-chain checks this chain end to end. /x/ots/status shows "
-        "the state of each external timestamp proof."),
-    "observe_ok": (
-        "Your tip is now inside a chain you do not control. What that block "
-        "carries is stated in what_this_proves - it is a record that this "
-        "value was handed to us at this time, and nothing about whether the "
-        "records behind it are true."),
-    "observe_advice": (
-        "Send a url serving your current tip and this becomes checkable by "
-        "anyone rather than taken on your word. Read name_vocabulary first: "
-        "withholding a url also leaves the name claimable."),
-    "observe_conflict": (
-        "Sealed, and flagged. This name has been used from a different "
-        "address before. That discrepancy is now permanent in our chain."),
-    "attest_proves": (
-        "That this tip was handed to us at this time and sealed into our "
-        "chain. Liveness records whether a url the submitter supplied served "
-        "the same tip the submitter sent - self-consistency, not verification "
-        "by us. Neither proves the submitter's identity."),
-    "attest_proof": (
-        "This observation is a block in our chain. Altering or removing it "
-        "breaks every block after it, and that is checkable by anyone at "
-        "/api/verify-chain. " + ANCHOR_NOTE),
-    "list_is": (
-        "Parties that have submitted a tip to this deployment. Being listed "
-        "here is not membership of anything, not endorsement of anything "
-        "sealed in this chain, and implies no relationship beyond having sent "
-        "a hash."),
-    "list_note": (
-        "Silent peers are visible by design. A network you cannot audit is "
-        "not a network. Nothing here proves identity - it shows how well each "
-        "claim stood up to checking."),
-    "history_note": (
-        "If this peer ever presents a history whose tips do not match these, "
-        "the divergence is provable."),
-    "chain_required": "A short stable identifier - a domain works well.",
-    "invalid_tip": "A tip is 64 hex characters - a SHA-256 chain head.",
-    "not_witnessed": "We hold no record of this tip from this peer.",
-}
-
-LEGEND = {
-    LIVENESS_MATCH: VOCABULARY[LIVENESS_MATCH],
-    LIVENESS_MATCH_LEGACY: VOCABULARY[LIVENESS_MATCH_LEGACY],
-    LIVENESS_MOVED: VOCABULARY[LIVENESS_MOVED],
-    LIVENESS_NONE: VOCABULARY[LIVENESS_NONE],
-    NAME_FIRST: VOCABULARY.get(NAME_FIRST) or NAME_VOCABULARY[NAME_FIRST],
-    NAME_BOUND: NAME_VOCABULARY[NAME_BOUND],
-    NAME_CONFLICT: NAME_VOCABULARY[NAME_CONFLICT],
-    NAME_UNBOUND: NAME_VOCABULARY[NAME_UNBOUND],
-    "unbound_costs_you_the_name": (
-        "A submission with no reachable url does not bind the name. Whoever "
-        "submits it next with a url takes the binding. Choosing the accurate "
-        "weaker liveness status therefore leaves the name claimable - a "
-        "coupling worth knowing before it bites."),
-    "signed_lane": SIGNED_LANE_NOTE,
-    "anchoring": ANCHOR_NOTE,
-}
-
-# Routes that need no API key. A third party must be able to check the
-# network without holding an account, or the claim that anyone can audit
-# it is not true.
-PUBLIC = {("GET", "attest"), ("GET", "peers"), ("GET", "tip"),
-          ("GET", "spec"), ("POST", "observe")}
-
-# Observations arriving without a key are filed under this.
-ANON_KEY = "public-witness"
-
-# Liveness fetch limits. Deliberately tight - this runs on an anonymous
-# request, so every one of these is also a denial-of-service control.
-FETCH_TIMEOUT = 4
-MAX_FETCH_BYTES = 65536
-ALLOWED_SCHEMES = ("http", "https")
-ALLOWED_PORTS = (80, 443)
-
-# Field names other implementations serve their tip under. Being strict about
-# a name we never published is a bug in the receiver, not in the peer. Kept
-# identical to the list mutual.py advertises.
-TIP_FIELDS = ("tip", "hash", "head", "tip_sha256", "root", "current_tip",
-              "chain_tip", "latest")
-
-MAX_HISTORY = 500
-
-_ready = False
-
-
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        c = ctx["conn"]
-        c.execute("CREATE TABLE IF NOT EXISTS witness_log(id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,peer TEXT,tip TEXT,peer_ts REAL,observed REAL,audit_hash TEXT,block_index INTEGER,note TEXT)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_wit_peer ON witness_log(api_key,peer)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_wit_tip ON witness_log(tip)")
-
-        # Added in 1.1. Existing rows keep NULL, which reads as unchecked -
-        # correct, because they were.
-        have = set()
-        try:
-            for row in c.execute("PRAGMA table_info(witness_log)").fetchall():
-                have.add(row[1])
-        except Exception:
-            pass
-        for col in ("url", "liveness", "name_status"):
-            if col not in have:
-                try:
-                    c.execute("ALTER TABLE witness_log ADD COLUMN %s TEXT" % col)
-                except Exception:
-                    pass
-
-        # Added in 1.3. /x/witness/peers previously read every row in the
-        # table on every call to work out each peer's latest status. At 700
-        # observations that is wasteful; at 70,000 it is a problem. This index
-        # lets the same answer come from a grouped query.
-        try:
-            c.execute("CREATE INDEX IF NOT EXISTS idx_wit_peer_id ON witness_log(peer,id)")
-        except Exception:
-            pass
-
-        # Name bindings are network-wide, not per api_key. A name means one
-        # operator across the whole network or it means nothing.
-        c.execute("CREATE TABLE IF NOT EXISTS witness_names(peer TEXT PRIMARY KEY,url TEXT,first_seen REAL,first_liveness TEXT)")
-        c.commit()
-    _ready = True
-
-
-def _iso(ts):
-    if not ts:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
-
-def _our_tip(ctx):
-    with ctx["lock"]:
-        r = ctx["conn"].execute("SELECT audit_hash,ts,id FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()
-    if not r:
-        return "GENESIS", None, 0
-    return r[0], r[1], r[2]
-
-
-def _tip(ctx, api_key):
-    tip, ts, height = _our_tip(ctx)
-    return {"tip": tip, "height": height, "sealed_at": _iso(ts),
-            "witness_version": VERSION,
-            "note": MESSAGES["tip_note"],
-            "verify": MESSAGES["tip_verify"],
-            "anchoring": ANCHOR_NOTE}, 200
-
-
-# ----------------------------------------------------------------------
-# liveness fetch - see the SSRF section above before touching any of this
-# ----------------------------------------------------------------------
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """A redirect is an instruction from a stranger to fetch a second url we
-    never checked. Refuse rather than follow."""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-
-_opener = urllib.request.build_opener(_NoRedirect)
-
-
-def _address_allowed(host, port):
-    """Resolve and refuse anything that isn't plainly on the public internet."""
-    try:
-        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
-    except Exception as exc:
-        return False, "could not resolve host (%s)" % type(exc).__name__
-    if not infos:
-        return False, "host resolved to nothing"
-    for info in infos:
-        raw = info[4][0]
-        try:
-            addr = ipaddress.ip_address(raw)
-        except ValueError:
-            return False, "unreadable address"
-        if (addr.is_private or addr.is_loopback or addr.is_link_local
-                or addr.is_reserved or addr.is_multicast or addr.is_unspecified):
-            return False, "address is not publicly routable"
-    return True, None
-
-
-def _url_allowed(url):
-    if not url or not isinstance(url, str) or len(url) > 500:
-        return False, "no usable url"
-    try:
-        parts = urlparse(url.strip())
-    except Exception:
-        return False, "unparseable url"
-    if parts.scheme not in ALLOWED_SCHEMES:
-        return False, "scheme not allowed"
-    host = parts.hostname
-    if not host:
-        return False, "no host in url"
-    port = parts.port or (443 if parts.scheme == "https" else 80)
-    if port not in ALLOWED_PORTS:
-        return False, "port not allowed"
-    return _address_allowed(host, port)
-
-
-def _norm_url(url):
-    """Normalise a url for COMPARISON only. The raw string is what gets stored
-    and shown.
-
-    Added in 1.3. Binding compared raw strings, so the same endpoint submitted
-    as https://x.test/w and https://X.test/w/ recorded a permanent conflict
-    against an operator who had done nothing wrong. A conflict is the loudest
-    thing this module can say about somebody and it cannot be withdrawn, so it
-    should fire on a genuinely different address and not on a trailing slash.
-
-    Deliberately conservative: case on scheme and host, the default port, and
-    one trailing slash. Path case, query order and anything else still count
-    as different, because they can be.
-    """
-    if not url:
-        return ""
-    raw = url.strip()
-    try:
-        p = urlparse(raw)
-    except Exception:
-        return raw.lower()
-    scheme = (p.scheme or "").lower()
-    host = (p.hostname or "").lower()
-    if not scheme or not host:
-        return raw.lower()
-    port = p.port
-    if (scheme == "https" and port == 443) or (scheme == "http" and port == 80):
-        port = None
-    netloc = host + (":%d" % port if port else "")
-    path = p.path or "/"
-    if len(path) > 1 and path.endswith("/"):
-        path = path[:-1]
-    out = scheme + "://" + netloc + path
-    if p.query:
-        out += "?" + p.query
-    return out
-
-
-def _fetch_tip(url):
-    """Returns (tip_or_None, note). Never raises."""
-    ok, why = _url_allowed(url)
-    if not ok:
-        return None, why
-    request = urllib.request.Request(url, headers={
-        "Accept": "application/json",
-        "User-Agent": "aileash-witness/%s" % VERSION,
-    })
-    try:
-        with _opener.open(request, timeout=FETCH_TIMEOUT) as response:
-            if response.getcode() != 200:
-                return None, "url answered %s" % response.getcode()
-            body = response.read(MAX_FETCH_BYTES + 1)
-    except urllib.error.HTTPError as exc:
-        return None, "url answered %s" % exc.code
-    except Exception as exc:
-        return None, "could not reach url (%s)" % type(exc).__name__
-    if len(body) > MAX_FETCH_BYTES:
-        return None, "response too large"
-    try:
-        data = json.loads(body.decode("utf-8", "replace"))
-    except Exception:
-        return None, "url did not return json"
-    if not isinstance(data, dict):
-        return None, "url did not return an object"
-    found = ""
-    for field in TIP_FIELDS:
-        value = data.get(field)
-        if value:
-            found = str(value).strip().lower()
-            break
-    if not HEX64.match(found or ""):
-        return None, "no valid tip at that url"
-    return found, None
-
-
-def _check_liveness(url, tip):
-    """self-consistent / live / self-declared. Never rejects anything.
-
-    Note what self-consistent means: the submitter told us the tip AND told us
-    where to look, and the two agreed. That is the submitter agreeing with
-    themselves. It is worth recording and it is not third-party verification.
-    """
-    if not url:
-        return LIVENESS_NONE, "no url supplied"
-    found, why = _fetch_tip(url)
-    if found is None:
-        return LIVENESS_NONE, why
-    if found == tip:
-        return LIVENESS_MATCH, ("the submitted url served exactly the submitted "
-                                "tip - both sides of this check come from the "
-                                "submitter, so this is self-consistency, not "
-                                "third-party verification")
-    return LIVENESS_MOVED, ("url serves a different tip (%s) - chain has moved "
-                            "on since submitting" % found[:16])
-
-
-def _prior_unbound(ctx, peer):
-    """How many times this name has been submitted with no bindable url.
-
-    Exists because of a gap Ishaan (Shango MID) found: a submission without
-    a url does not bind, so a recognisable name can be used honestly by its
-    owner and then bound by somebody else who supplies a url first. The
-    owner's later submission would read conflict, and they would be the one
-    looking like the impostor.
-
-    An anonymous endpoint cannot tell two claimants apart - there is nothing
-    to bind to - so this does not prevent the squat. What it does is make it
-    visible: a binding over a name that has been submitted before is
-    recorded as such, permanently, in the sealed note. An auditor sees the
-    name was not fresh when it was claimed.
-
-    Detection rather than prevention. Prevention needs a credential, which
-    is what the signed lane at /x/peer/submit is for - within the limit
-    stated in SIGNED_LANE_NOTE.
-    """
-    try:
-        with ctx["lock"]:
-            row = ctx["conn"].execute(
-                "SELECT COUNT(*) FROM witness_log WHERE peer=? AND "
-                "(url IS NULL OR url='')", (peer,)).fetchone()
-        return int(row[0]) if row else 0
-    except Exception:
-        return 0
-
-
-def _check_name(ctx, peer, url, liveness):
-    """first-use / bound / conflict / unbound.
-
-    Only bind a name to a url we actually reached. Binding to an unreachable
-    url would let someone reserve a name with an address that never answers.
-    """
-    with ctx["lock"]:
-        row = ctx["conn"].execute("SELECT url,first_seen FROM witness_names WHERE peer=?", (peer,)).fetchone()
-
-    if row and row[0]:
-        if not url:
-            return NAME_UNBOUND, "no url supplied; this name is bound to %s" % row[0]
-        if _norm_url(url) == _norm_url(row[0]):
-            if url.strip() != row[0]:
-                return NAME_BOUND, ("same address as the binding, written "
-                                    "differently (bound as %s, submitted as "
-                                    "%s)" % (row[0], url.strip()))
-            return NAME_BOUND, None
-        return NAME_CONFLICT, ("this name was first seen at %s and has now been submitted from %s"
-                               % (row[0], url.strip()))
-
-    # LIVENESS_REACHED, not a literal - renaming the match value in 1.2 would
-    # otherwise have silently stopped first-use binding for exact matches.
-    if url and liveness in LIVENESS_REACHED:
-        prior = _prior_unbound(ctx, peer)
-        with ctx["lock"]:
-            ctx["conn"].execute(
-                "INSERT OR REPLACE INTO witness_names(peer,url,first_seen,first_liveness) VALUES(?,?,?,?)",
-                (peer, url.strip(), time.time(), liveness))
-            ctx["conn"].commit()
-        note = "name now bound to %s" % url.strip()
-        if prior:
-            note += ("; WARNING: this name was submitted %d time(s) before "
-                     "this binding with no url, so it was not a fresh name "
-                     "when it was claimed - if that was not you, the earlier "
-                     "submissions are permanently in this chain and so is "
-                     "this warning" % prior)
-        return NAME_FIRST, note
-
-    return NAME_UNBOUND, ("no reachable url, so nothing to bind this name to. "
-                          "This name remains claimable by anyone who submits "
-                          "it with a reachable url - see name_vocabulary")
-
-
-# ----------------------------------------------------------------------
-# observe
-# ----------------------------------------------------------------------
-
-def _observe(ctx, api_key, data):
-    # The published standard calls this field "chain"; earlier internal
-    # callers used "peer". Accept either. A receiver being strict about
-    # field names it never published is a bug in the receiver.
-    peer = str(data.get("chain") or data.get("peer") or "").strip().lower()
-    if not peer or len(peer) > 80:
-        return {"error": "chain_required",
-                "message": MESSAGES["chain_required"],
-                "field": "chain (peer also accepted)"}, 400
-    tip = str(data.get("tip", "")).strip().lower()
-    if not HEX64.match(tip):
-        return {"error": "invalid_tip", "message": MESSAGES["invalid_tip"]}, 400
-
-    url = data.get("url")
-    url = str(url).strip() if url else ""
-    if len(url) > 500:
-        url = ""
-
-    # Time the peer claims it sealed at. Epoch or ISO, either field name.
-    # Carry on without it - supporting detail, not the evidence.
-    peer_ts = data.get("peer_ts", data.get("ts"))
-    if peer_ts is not None:
-        try:
-            peer_ts = float(peer_ts)
-        except (TypeError, ValueError):
-            try:
-                s = str(peer_ts).strip().replace("Z", "+00:00")
-                peer_ts = datetime.fromisoformat(s).timestamp()
-            except Exception:
-                peer_ts = None
-
-    liveness, live_note = _check_liveness(url, tip)
-    name_status, name_note = _check_name(ctx, peer, url, liveness)
-
-    ts = time.time()
-    notes = []
-
-    with ctx["lock"]:
-        prev = ctx["conn"].execute("SELECT tip,observed FROM witness_log WHERE api_key=? AND peer=? ORDER BY id DESC LIMIT 1", (api_key, peer)).fetchone()
-        seen = ctx["conn"].execute("SELECT observed FROM witness_log WHERE api_key=? AND peer=? AND tip=? LIMIT 1", (api_key, peer, tip)).fetchone()
-
-    if seen:
-        notes.append("tip already witnessed at " + str(_iso(seen[0])) + " - chain has not advanced, or history was replayed")
-    elif prev and prev[0] == tip:
-        notes.append("unchanged since last observation")
-    if live_note:
-        notes.append(live_note)
-    if name_note:
-        notes.append(name_note)
-    note = "; ".join(notes)
-
-    # The verification result is sealed alongside the tip. If we later claim a
-    # submission was self-consistent, the chain has to agree.
-    detail = ("peer=" + peer + ";tip=" + tip + ";url=" + (url or "-") +
-              ";liveness=" + liveness + ";name=" + name_status +
-              ";peer_ts=" + str(peer_ts) + (";note=" + note if note else ""))
-    ev = {"user_id": "wit:" + peer, "action": "witness_observed", "amount": 0,
-          "country": "UK", "device_id": "witness", "anomaly": 0, "device_risk": 0}
-    res = {"decision": "WITNESS_SEALED", "score": 0, "witness_version": VERSION,
-           "peer": peer, "peer_tip": tip, "timestamp": ts,
-           "liveness": liveness, "name_status": name_status, "detail": detail}
-    h, idx, seq = ctx["seal"](ev, res, ts, api_key)
-
-    # The seal is the record. If this insert fails the block still exists and
-    # is still valid - the index row is a convenience for lookup, not the
-    # evidence - so a failure here must not be reported as a failed
-    # observation.
-    index_ok = True
-    try:
-        with ctx["lock"]:
-            ctx["conn"].execute("INSERT INTO witness_log(api_key,peer,tip,peer_ts,observed,audit_hash,block_index,note,url,liveness,name_status) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                                (api_key, peer, tip, peer_ts, ts, h, idx, note or None,
-                                 url or None, liveness, name_status))
-            ctx["conn"].commit()
-    except Exception as exc:
-        index_ok = False
-        index_error = type(exc).__name__
-
-    our, _t, height = _our_tip(ctx)
-    out = {"peer": peer, "witnessed_tip": tip, "observed_at": _iso(ts),
-           "sealed_in_our_chain": h, "block_index": idx, "receipt_seq": seq,
-           "our_tip_now": our, "our_height": height,
-           "liveness": liveness, "name_status": name_status,
-           "attest": "/x/witness/attest?peer=" + peer + "&tip=" + tip,
-           "message": MESSAGES["observe_ok"],
-           "anchoring": ANCHOR_NOTE}
-    if note:
-        out["flag"] = note
-    out["witness_version"] = VERSION
-    out["liveness_vocabulary"] = _vocab(liveness)
-    out["name_vocabulary"] = _name_vocab(name_status)
-    if not index_ok:
-        out["index_warning"] = (
-            "Sealed into the chain, but our lookup index did not accept the "
-            "row (%s). The block is valid and permanent; /x/witness/attest "
-            "may not find it until the index is repaired. Reported rather "
-            "than hidden." % index_error)
-    if liveness == LIVENESS_NONE:
-        out["advice"] = MESSAGES["observe_advice"]
-    if name_status == NAME_CONFLICT:
-        out["warning"] = MESSAGES["observe_conflict"]
-    return out, 200
-
-
-def _attest(ctx, api_key, data):
-    peer = str(data.get("peer", "")).strip().lower()
-    tip = str(data.get("tip", "")).strip().lower()
-    if not peer or not tip:
-        return {"error": "peer_and_tip_required",
-                "usage": "/x/witness/attest?peer=<name>&tip=<64 hex>"}, 400
-    with ctx["lock"]:
-        if api_key:
-            rows = ctx["conn"].execute("SELECT observed,audit_hash,block_index,peer_ts,liveness,name_status,url FROM witness_log WHERE api_key=? AND peer=? AND tip=? ORDER BY id ASC", (api_key, peer, tip)).fetchall()
-        else:
-            rows = ctx["conn"].execute("SELECT observed,audit_hash,block_index,peer_ts,liveness,name_status,url FROM witness_log WHERE peer=? AND tip=? ORDER BY id ASC", (peer, tip)).fetchall()
-    if not rows:
-        return {"witnessed": False, "peer": peer, "tip": tip,
-                "message": MESSAGES["not_witnessed"]}, 404
-    return {"witnessed": True, "peer": peer, "tip": tip,
-            "first_observed": _iso(rows[0][0]),
-            "last_observed": _iso(rows[-1][0]),
-            "times_observed": len(rows),
-            "sealed_in_our_chain": rows[0][1],
-            "block_index": rows[0][2],
-            "peer_claimed_time": _iso(rows[0][3]),
-            "liveness": rows[0][4] or "unchecked",
-            "liveness_vocabulary": _vocab(rows[0][4]),
-            "name_status": rows[0][5] or "unchecked",
-            "name_vocabulary": _name_vocab(rows[0][5]),
-            "submitted_url": rows[0][6],
-            "witness_version": VERSION,
-            "what_this_proves": MESSAGES["attest_proves"],
-            "proof": MESSAGES["attest_proof"],
-            "anchoring": ANCHOR_NOTE}, 200
-
-
-def _vocab(liveness):
-    """Make the vocabulary travel with the value.
-
-    The legend on /x/witness/peers reconciles self-consistent and confirmed
-    for whoever reads the legend. Sealed blocks travel and legends do not:
-    anyone quoting a block elsewhere carries the word without the
-    reconciliation attached. Raised by Ishaan (Shango MID) after hitting the
-    same thing on his own register - the correction reached the page and not
-    the metadata that gets shared with the link.
-
-    So any route that returns an observation returns what the word means at
-    the point it is read, rather than pointing at a legend that may not
-    follow it.
-
-    General form worth keeping: a name a reader treats as documentation may
-    be a value the code branches on, and the two roles are invisible to each
-    other from outside.
-    """
-    return VOCABULARY.get(liveness, VOCABULARY[None])
-
-
-def _name_vocab(name_status):
-    """What the name status means, and what it costs.
-
-    Travels with the value for the same reason liveness vocabulary does. The
-    unbound entry states the exposure plainly rather than leaving a submitter
-    to work it out: choosing the accurate weaker liveness status by
-    withholding a url also leaves the name claimable, and nobody should have
-    to discover that coupling by being squatted.
-    """
-    return NAME_VOCABULARY.get(name_status, NAME_VOCABULARY[None])
-
-
-def _peers(ctx, api_key):
-    """Who we witness, and how consistently.
-
-    Rewritten in 1.3. This used to read every row in witness_log to find each
-    peer's most recent liveness and name status. Now the same answer comes
-    from a grouped query against the (peer,id) index, so the cost stops
-    growing with the size of the log.
-    """
-    with ctx["lock"]:
-        c = ctx["conn"]
-        if api_key:
-            rows = c.execute("SELECT peer,COUNT(*),MIN(observed),MAX(observed),COUNT(DISTINCT tip) FROM witness_log WHERE api_key=? GROUP BY peer ORDER BY MAX(observed) DESC", (api_key,)).fetchall()
-        else:
-            rows = c.execute("SELECT peer,COUNT(*),MIN(observed),MAX(observed),COUNT(DISTINCT tip) FROM witness_log GROUP BY peer ORDER BY MAX(observed) DESC").fetchall()
-
-        latest = {}
-        for p, live, name in c.execute(
-                "SELECT w.peer,w.liveness,w.name_status FROM witness_log w "
-                "JOIN (SELECT peer,MAX(id) AS mid FROM witness_log GROUP BY peer) m "
-                "ON w.id=m.mid").fetchall():
-            latest[p] = (live, name)
-
-        conflicts = {}
-        for p, n in c.execute(
-                "SELECT peer,COUNT(*) FROM witness_log WHERE name_status=? "
-                "GROUP BY peer", (NAME_CONFLICT,)).fetchall():
-            conflicts[p] = n
-
-        bindings = {}
-        for p, u in c.execute("SELECT peer,url FROM witness_names").fetchall():
-            bindings[p] = u
-
-    t = time.time()
-    peers = []
-    for p, n, first, last, distinct in rows:
-        hours = round((t - last) / 3600, 1)
-        live, name = latest.get(p, (None, None))
-        entry = {"peer": p, "observations": n, "distinct_tips": distinct,
-                 "first_seen": _iso(first), "last_seen": _iso(last),
-                 "hours_since_last": hours,
-                 "status": ("current" if hours < 6 else "stale" if hours < 48 else "silent"),
-                 "liveness": live or "unchecked",
-                 "name_status": name or "unchecked",
-                 "bound_to": bindings.get(p)}
-        if conflicts.get(p):
-            entry["name_conflicts"] = conflicts[p]
-        peers.append(entry)
-    return {"count": len(peers), "peers": peers,
-            "witness_version": VERSION,
-            "what_this_list_is": MESSAGES["list_is"],
-            "status_vocabulary": {
-                "current": "observed within the last 6 hours",
-                "stale": "last observed between 6 and 48 hours ago",
-                "silent": "not observed for more than 48 hours",
-                "note": ("These describe elapsed time since we last recorded "
-                         "an observation and nothing else. A peer that "
-                         "publishes on a human schedule rather than a timer "
-                         "will read stale between sessions, correctly. It is "
-                         "not a claim that anyone's endpoint was unavailable."),
-            },
-            "legend": LEGEND,
-            "note": MESSAGES["list_note"]}, 200
-
-
-def _history(ctx, api_key, peer):
-    with ctx["lock"]:
-        rows = ctx["conn"].execute("SELECT tip,observed,audit_hash,block_index,note,liveness,name_status,url FROM witness_log WHERE api_key=? AND peer=? ORDER BY id ASC LIMIT ?", (api_key, peer, MAX_HISTORY)).fetchall()
-    if not rows:
-        return {"error": "unknown_peer", "peer": peer}, 404
-    return {"peer": peer, "count": len(rows), "limit": MAX_HISTORY,
-            "witness_version": VERSION,
-            "observations": [{"tip": r[0], "observed": _iso(r[1]),
-                              "sealed": r[2], "block_index": r[3],
-                              "flag": r[4], "liveness": r[5] or "unchecked",
-                              "name_status": r[6] or "unchecked",
-                              "url": r[7]} for r in rows],
-            "note": MESSAGES["history_note"]}, 200
-
-
-def _spec():
-    """The whole protocol, for someone who is not going to run our code.
-
-    Added in 1.3. Every other module publishes a spec route and this one did
-    not, which meant the four calls a new peer needs were only written down
-    in a page they had to be sent a link to.
-    """
-    return {"witness_version": VERSION,
-            "the_protocol_in_four_calls": [
-                "1. GET /x/witness/tip - our current chain head.",
-                "2. Seal that value into your own chain, however your chain works.",
-                "3. POST /x/witness/observe with {\"chain\":\"<your name>\","
-                "\"tip\":\"<your 64 hex head>\",\"url\":\"<where you publish "
-                "your head>\"}. No account, no key.",
-                "4. GET /x/witness/attest?peer=<your name>&tip=<your head> - "
-                "your receipt, readable by anyone.",
-            ],
-            "fields": {
-                "chain": "required. Short stable identifier, 80 chars max. "
-                         "'peer' accepted as an alias.",
-                "tip": "required. 64 lowercase hex characters.",
-                "url": "optional but strongly advised - see name_vocabulary. "
-                       "http or https, port 80 or 443, must resolve to a "
-                       "publicly routable address, no redirects followed.",
-                "peer_ts": "optional. Epoch seconds or ISO 8601. 'ts' accepted "
-                           "as an alias.",
-            },
-            "tip_fields_we_accept_at_your_url": list(TIP_FIELDS),
-            "nothing_is_rejected": (
-                "Both checks are non-rejecting. Every well-formed submission "
-                "is sealed. What varies is what the record says about it."),
-            "liveness_vocabulary": {k: v for k, v in VOCABULARY.items() if k},
-            "name_vocabulary": {k: v for k, v in NAME_VOCABULARY.items() if k},
-            "signed_lane": SIGNED_LANE_NOTE,
-            "anchoring": ANCHOR_NOTE,
-            "what_this_is_not": MESSAGES["list_is"]}, 200
-
-
-def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-    if method == "POST":
-        if action == "observe":
-            # No key needed. Anonymous submissions are partitioned under
-            # ANON_KEY so they never mix with a customer's own witness log.
-            return _observe(ctx, api_key or ANON_KEY, data)
-        if not api_key:
-            return {"error": "invalid_api_key"}, 401
-    else:
-        if action == "tip":
-            return _tip(ctx, api_key)
-        if action == "peers":
-            return _peers(ctx, api_key)
-        if action == "attest":
-            return _attest(ctx, api_key, data)
-        if action == "spec":
-            return _spec()
-        if action == "history":
-            if not api_key:
-                return {"error": "invalid_api_key"}, 401
-            peer = str(data.get("peer", "")).strip().lower()
-            if not peer:
-                return {"error": "peer_required"}, 400
-            return _history(ctx, api_key, peer)
-    return {"error": "unknown_action", "action": action}, 404
 
 ```
