@@ -1,1098 +1,11 @@
-# Codebase — part 6 of 23
+# Codebase — part 6 of 22
 
 Contains:
-- `modules/lineage.py`
-- `modules/mutual.py`
 - `modules/network.py`
 - `modules/ots.py`
 - `modules/oversight.py`
-
-
-## `modules/lineage.py`
-
-528 lines, 24761 bytes
-
-```python
-#!/usr/bin/env python3
-"""
-modules/lineage.py  -  provenance that crosses company boundaries
-=================================================================
-
-WHERE EVERY AUDIT TRAIL STOPS
------------------------------
-At the edge of the company that wrote it.
-
-A lender holds a score. The score came from a scoring supplier, which used
-a model, which was trained on a data snapshot bought from someone else.
-Four organisations, four audit trails, none of which reference each other.
-Ask "what produced this outcome" and you get four separate answers and no
-way to join them up.
-
-Every framework written in the last three years assumes somebody can trace
-an outcome across parties. Nobody can. Not because it is hard - because
-each party's evidence is only worth anything inside that party's own
-system, so joining them up would mean trusting whoever did the joining.
-
-WHY THIS WORKS WHEN A SHARED DATABASE WOULD NOT
------------------------------------------------
-The obvious approach is a consortium: everyone writes to one ledger,
-governed by someone. That fails on the first question anybody asks, which
-is who runs it, and it never gets built.
-
-This needs none of that, because the pieces already exist:
-
-  A chain tip already commits to everything sealed beneath it.
-  That tip is already handed to peers hourly and sealed into THEIR chains.
-  Those chains are anchored externally and witnessed in turn.
-
-So a receipt can already be walked up to a tip, and that tip already sits
-inside chains its issuer does not control. The trust problem is solved
-before lineage is even mentioned.
-
-The only thing missing was the sideways link: a decision recording which
-receipts fed it, and which chain each came from. That is what this module
-adds. One field, and the graph composes itself.
-
-Nobody opts into provenance. They opt into witnessing, which they already
-want, and provenance falls out of it.
-
-WHAT AN EDGE IS AND IS NOT
---------------------------
-An edge is a sealed, dated, non-repudiable CLAIM by the declaring party
-that these inputs fed that decision. Sealing does not make the claim true.
-What it removes is the ability to revise it quietly afterwards, which is
-the part that matters when an outcome is disputed a year later.
-
-Every edge is itself a chain entry. So the provenance graph is covered by
-the same completeness, consistency and witnessing guarantees as everything
-else - you cannot delete an inconvenient edge without breaking the chain,
-and you cannot add one after the fact without the timestamp showing it.
-
-THE PART THAT IS WORTH MORE THAN THE TRACING
---------------------------------------------
-    GET /x/lineage/impact?receipt=
-
-Trace runs upstream: what produced this. Impact runs downstream: what did
-this produce.
-
-When a data provider retracts a snapshot, or a model version turns out to
-be faulty, or an upstream decision is overturned, the question every
-regulator asks is which outputs were affected. Today that answer takes
-weeks of email and is never complete. Here it is a query, and it crosses
-company boundaries, and the answer is itself provable.
-
-That is corrective action under Article 20 turned from a fire drill into a
-lookup.
-
-VERIFICATION WITHOUT TRUSTING ANY PARTY IN THE CHAIN
-----------------------------------------------------
-This module never asserts that a remote hop is valid. It returns the exact
-routes a third party should call to check each hop themselves - on our
-chain and on everybody else's. An auditor verifies the whole graph without
-trusting us, the supplier, or anyone in between.
-
-HONEST LIMITS
--------------
-  - An edge is a claim, sealed and dated. It is not proof the inputs were
-    the real ones, only that this is what was declared and when.
-  - A cross-chain hop can only be checked while the other party keeps
-    their routes up. A dead peer leaves a stub in the graph - visible,
-    which is the honest outcome, rather than silently resolved.
-  - Declaring inputs is voluntary. A party that declares nothing is not
-    caught out by this module; they are simply the point where somebody
-    else's lineage goes dark, and their customer is the one who notices.
-  - We record edges pointing at other chains. We do not fetch from them
-    here - fetching is what /x/witness does, with its SSRF controls, and
-    duplicating that machinery in a second place would be a mistake.
-
-    POST /x/lineage/declare      record what fed a decision      (keyed)
-    GET  /x/lineage/trace        walk upstream                    (public)
-    GET  /x/lineage/impact       walk downstream                  (public)
-    GET  /x/lineage/receipt      portable proof for an output     (public)
-    GET  /x/lineage/spec         the format and how to check it   (public)
-"""
-
-import re
-import time
-from datetime import datetime, timezone
-
-VERSION = "1.0"
-HEX64 = re.compile(r"^[0-9a-f]{64}$")
-
-# Everything except declaring is open. The whole point is that a party
-# three hops downstream - who has no relationship with us at all - can
-# follow the graph and check it.
-PUBLIC = {("GET", "trace"), ("GET", "impact"), ("GET", "receipt"),
-          ("GET", "spec")}
-
-OUR_CHAIN_NAME = "aileash"
-OUR_BASE = "https://sebbi.pro"
-
-MAX_INPUTS = 50
-MAX_DEPTH = 6
-MAX_NODES = 400
-ROLES = ("input", "model", "data", "policy", "document", "upstream-decision",
-         "supplier", "other")
-
-_ready = False
-
-
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        c = ctx["conn"]
-        c.execute("CREATE TABLE IF NOT EXISTS lineage_edge("
-                  "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,"
-                  "child_chain TEXT,child_receipt TEXT,"
-                  "parent_chain TEXT,parent_receipt TEXT,parent_base TEXT,"
-                  "role TEXT,note TEXT,declared REAL,"
-                  "audit_hash TEXT,block_index INTEGER)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_lin_child "
-                  "ON lineage_edge(child_receipt)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_lin_parent "
-                  "ON lineage_edge(parent_receipt)")
-        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_lin_unique "
-                  "ON lineage_edge(child_receipt,parent_chain,parent_receipt)")
-        c.commit()
-    _ready = True
-
-
-def _iso(ts):
-    if not ts:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
-
-def _clean_chain(value):
-    value = str(value or "").strip().lower()
-    return value[:80] if value else ""
-
-
-def _exists_locally(ctx, receipt):
-    try:
-        with ctx["lock"]:
-            row = ctx["conn"].execute(
-                "SELECT 1 FROM audit_log WHERE audit_hash=? LIMIT 1", (receipt,)).fetchone()
-        return bool(row)
-    except Exception:
-        return False
-
-
-def _verification_plan(chain, receipt, base=None):
-    """The exact calls a third party makes to check one hop themselves.
-
-    We never tell anyone a hop is valid. We tell them how to find out
-    without asking us again.
-    """
-    root = (base or OUR_BASE).rstrip("/") if chain != OUR_CHAIN_NAME else OUR_BASE
-    if chain != OUR_CHAIN_NAME and not base:
-        return {
-            "chain": chain, "receipt": receipt,
-            "status": "external, no address declared",
-            "how_to_check": "Ask that chain's operator for their public witness and consistency "
-                            "routes, or look for their name at %s/x/witness/peers - if we have "
-                            "ever witnessed them, the address we fetched from is recorded "
-                            "there." % OUR_BASE,
-        }
-    return {
-        "chain": chain, "receipt": receipt, "base": root,
-        "on_their_chain": "%s/x/consistency/ancestor?tip=%s" % (root, receipt),
-        "nothing_was_omitted": "%s/x/complete/periods" % root,
-        "who_witnesses_them": "%s/x/witness/peers" % root,
-        "did_we_witness_them": "%s/x/witness/attest?peer=%s&tip=%s" % (OUR_BASE, chain, receipt),
-        "note": "Run these against their host, not ours. If their answers and ours disagree, "
-                "that disagreement is the finding.",
-    }
-
-
-# ----------------------------------------------------------------------
-# declare
-# ----------------------------------------------------------------------
-
-def _declare(ctx, api_key, data):
-    child = str(data.get("receipt", data.get("child", ""))).strip().lower()
-    if not HEX64.match(child):
-        return {"error": "receipt_required",
-                "message": "The audit hash of the decision whose inputs you are declaring."}, 400
-
-    child_chain = _clean_chain(data.get("chain") or OUR_CHAIN_NAME)
-    inputs = data.get("inputs")
-    if not isinstance(inputs, list) or not inputs:
-        return {"error": "inputs_required",
-                "message": "A list of what fed this decision. Each entry needs a receipt, and a "
-                           "chain if it came from someone else.",
-                "example": {"receipt": "<64 hex>", "inputs": [
-                    {"chain": "supplier-name", "receipt": "<64 hex>", "role": "data",
-                     "base": "https://supplier.example"}]}}, 400
-    if len(inputs) > MAX_INPUTS:
-        return {"error": "too_many_inputs", "message": "at most %d per declaration" % MAX_INPUTS}, 400
-
-    if child_chain == OUR_CHAIN_NAME and not _exists_locally(ctx, child):
-        return {"error": "unknown_receipt",
-                "message": "That receipt is not in this chain. Declaring inputs for a decision "
-                           "we never sealed would put an unverifiable node in the graph."}, 404
-
-    prepared = []
-    for item in inputs:
-        if not isinstance(item, dict):
-            return {"error": "bad_input", "message": "each input must be an object"}, 400
-        parent = str(item.get("receipt", "")).strip().lower()
-        if not HEX64.match(parent):
-            return {"error": "bad_input_receipt",
-                    "message": "every input needs a 64 character hex receipt"}, 400
-        parent_chain = _clean_chain(item.get("chain") or OUR_CHAIN_NAME)
-        if parent_chain == child_chain and parent == child:
-            return {"error": "self_reference",
-                    "message": "a decision cannot be its own input"}, 400
-        role = str(item.get("role", "input")).strip().lower()
-        if role not in ROLES:
-            role = "other"
-        base = str(item.get("base", item.get("url", "")) or "").strip()[:300]
-        note = str(item.get("note", "") or "").strip()[:200]
-        prepared.append((parent_chain, parent, base, role, note))
-
-    now = time.time()
-    summary = ";".join("%s/%s:%s" % (c, r[:12], role) for c, r, _b, role, _n in prepared)
-    ev = {"user_id": "lin:" + child[:16], "action": "lineage_declared", "amount": 0,
-          "country": "UK", "device_id": "lineage", "anomaly": 0, "device_risk": 0}
-    res = {"decision": "LINEAGE_SEALED", "score": 0, "lineage_version": VERSION,
-           "child_chain": child_chain, "child_receipt": child,
-           "input_count": len(prepared),
-           "detail": "child=%s;inputs=%s" % (child, summary)}
-    audit_hash, block_index, seq = ctx["seal"](ev, res, now, api_key)
-
-    written, duplicates = 0, 0
-    with ctx["lock"]:
-        for parent_chain, parent, base, role, note in prepared:
-            try:
-                ctx["conn"].execute(
-                    "INSERT INTO lineage_edge(api_key,child_chain,child_receipt,parent_chain,"
-                    "parent_receipt,parent_base,role,note,declared,audit_hash,block_index) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                    (api_key, child_chain, child, parent_chain, parent, base or None,
-                     role, note or None, now, audit_hash, block_index))
-                written += 1
-            except Exception:
-                duplicates += 1
-        ctx["conn"].commit()
-
-    return {"child_chain": child_chain, "child_receipt": child,
-            "edges_recorded": written, "already_declared": duplicates,
-            "declared_at": _iso(now),
-            "sealed_in_chain": audit_hash, "block_index": block_index, "receipt_seq": seq,
-            "lineage_version": VERSION,
-            "what_this_does": "The declaration is now a chain entry. It cannot be removed "
-                              "without breaking every block after it, and it cannot be added "
-                              "later without the timestamp showing when.",
-            "trace": "%s/x/lineage/trace?receipt=%s" % (OUR_BASE, child),
-            "portable_receipt": "%s/x/lineage/receipt?receipt=%s" % (OUR_BASE, child)}, 200
-
-
-# ----------------------------------------------------------------------
-# walking the graph
-# ----------------------------------------------------------------------
-
-def _parents(ctx, receipt):
-    with ctx["lock"]:
-        return ctx["conn"].execute(
-            "SELECT parent_chain,parent_receipt,parent_base,role,note,declared,audit_hash "
-            "FROM lineage_edge WHERE child_receipt=? ORDER BY id ASC", (receipt,)).fetchall()
-
-
-def _children(ctx, receipt):
-    with ctx["lock"]:
-        return ctx["conn"].execute(
-            "SELECT child_chain,child_receipt,role,declared,audit_hash "
-            "FROM lineage_edge WHERE parent_receipt=? ORDER BY id ASC", (receipt,)).fetchall()
-
-
-def _walk(ctx, start, depth, upstream):
-    """Breadth-first walk with cycle and size protection.
-
-    Anything on a chain we do not hold locally becomes a frontier entry -
-    named, with a verification plan, and explicitly not resolved by us.
-    """
-    seen = {start}
-    nodes, edges, frontier = [], [], []
-    queue = [(start, 0)]
-    truncated = False
-
-    while queue:
-        receipt, level = queue.pop(0)
-        if level >= depth or len(nodes) >= MAX_NODES:
-            if queue or level >= depth:
-                truncated = truncated or bool(queue)
-            continue
-
-        rows = _parents(ctx, receipt) if upstream else _children(ctx, receipt)
-        for row in rows:
-            if upstream:
-                chain, other, base, role, note, declared, sealed = row
-            else:
-                chain, other, role, declared, sealed = row
-                base, note = None, None
-
-            edges.append({
-                "from": other if upstream else receipt,
-                "to": receipt if upstream else other,
-                "role": role, "note": note,
-                "declared_at": _iso(declared),
-                "declaration_sealed_as": sealed,
-                "chain": chain,
-            })
-
-            local = (chain == OUR_CHAIN_NAME) and _exists_locally(ctx, other)
-            if not local:
-                if not any(f["receipt"] == other for f in frontier):
-                    frontier.append({"chain": chain, "receipt": other, "depth": level + 1,
-                                     "verify": _verification_plan(chain, other, base)})
-                continue
-
-            if other in seen:
-                continue
-            seen.add(other)
-            if len(nodes) >= MAX_NODES:
-                truncated = True
-                continue
-            nodes.append({"chain": chain, "receipt": other, "depth": level + 1,
-                          "verify": _verification_plan(chain, other, base)})
-            queue.append((other, level + 1))
-
-    return nodes, edges, frontier, truncated
-
-
-def _depth_arg(data):
-    try:
-        depth = int(data.get("depth", MAX_DEPTH))
-    except (TypeError, ValueError):
-        depth = MAX_DEPTH
-    return max(1, min(depth, MAX_DEPTH))
-
-
-def _trace(ctx, data):
-    receipt = str(data.get("receipt", "")).strip().lower()
-    if not HEX64.match(receipt):
-        return {"error": "receipt_required"}, 400
-    depth = _depth_arg(data)
-
-    nodes, edges, frontier, truncated = _walk(ctx, receipt, depth, upstream=True)
-    if not edges:
-        return {"receipt": receipt, "direction": "upstream", "nodes": [], "edges": [],
-                "external_frontier": [],
-                "lineage_version": VERSION,
-                "what_this_means": "No inputs have been declared for this decision. That is not "
-                                   "the same as it having none - it means nobody said. "
-                                   "Undeclared lineage is where a trail goes dark, and the party "
-                                   "who did not declare is the one to ask.",
-                "self": _verification_plan(OUR_CHAIN_NAME, receipt)}, 200
-
-    return {"receipt": receipt, "direction": "upstream", "depth_searched": depth,
-            "nodes": nodes, "edges": edges, "external_frontier": frontier,
-            "truncated": truncated,
-            "lineage_version": VERSION,
-            "self": _verification_plan(OUR_CHAIN_NAME, receipt),
-            "how_to_verify_this": "Every node carries the routes to check it on its own chain. "
-                                  "Nothing here asks you to take our word for a hop, including "
-                                  "the hops on our own chain.",
-            "what_an_edge_is": "A sealed, dated claim by the declaring party that these inputs "
-                               "fed that decision. Sealing makes it non-repudiable, not true.",
-            "frontier_note": "External entries are named but not resolved here. Run their "
-                             "verification plans against their own hosts - that is what makes "
-                             "the graph checkable without a shared database."}, 200
-
-
-def _impact(ctx, data):
-    receipt = str(data.get("receipt", "")).strip().lower()
-    if not HEX64.match(receipt):
-        return {"error": "receipt_required"}, 400
-    depth = _depth_arg(data)
-
-    nodes, edges, frontier, truncated = _walk(ctx, receipt, depth, upstream=False)
-    affected = len(nodes)
-    return {"receipt": receipt, "direction": "downstream", "depth_searched": depth,
-            "affected_decisions": affected, "nodes": nodes, "edges": edges,
-            "external_frontier": frontier, "truncated": truncated,
-            "lineage_version": VERSION,
-            "what_this_is_for": "If this input is retracted, wrong, or overturned, these are the "
-                                "decisions that declared a dependency on it. This is the answer "
-                                "to the first question asked after any upstream failure, and it "
-                                "normally takes weeks of email to assemble incompletely.",
-            "corrective_action": "The list is itself sealed and dated, so the scope of a recall "
-                                 "can be shown to have been determined honestly rather than "
-                                 "narrowed to suit.",
-            "limits": "Only covers dependencies that were declared. A downstream party who "
-                      "declared nothing does not appear - which is a fact about them rather "
-                      "than a gap here."}, 200
-
-
-# ----------------------------------------------------------------------
-# the portable receipt - proof that travels with an output
-# ----------------------------------------------------------------------
-
-def _receipt(ctx, data):
-    receipt = str(data.get("receipt", "")).strip().lower()
-    if not HEX64.match(receipt):
-        return {"error": "receipt_required"}, 400
-    if not _exists_locally(ctx, receipt):
-        return {"error": "unknown_receipt",
-                "message": "Not a decision sealed in this chain."}, 404
-
-    rows = _parents(ctx, receipt)
-    inputs = [{"chain": r[0], "receipt": r[1], "role": r[3],
-               "verify": _verification_plan(r[0], r[1], r[2])} for r in rows]
-
-    return {
-        "format": "aileash-portable-receipt",
-        "lineage_version": VERSION,
-        "chain": OUR_CHAIN_NAME,
-        "receipt": receipt,
-        "inputs": inputs,
-        "verify_this_decision": {
-            "still_on_our_chain": "%s/x/consistency/ancestor?tip=%s" % (OUR_BASE, receipt),
-            "our_log_is_append_only": "%s/x/consistency/proof" % OUR_BASE,
-            "nothing_was_left_out": "%s/x/complete/periods" % OUR_BASE,
-            "who_witnesses_us": "%s/x/witness/peers" % OUR_BASE,
-            "our_current_tip": "%s/x/witness/tip" % OUR_BASE,
-            "the_engine_reproduces": "%s/x/replay/spec" % OUR_BASE,
-            "trace_upstream": "%s/x/lineage/trace?receipt=%s" % (OUR_BASE, receipt),
-        },
-        "offline_verifier": "aileash_verify.py - one file, no dependencies, no network. Save "
-                            "this document and check it on your own machine, today or in four "
-                            "years.",
-        "what_you_can_establish": [
-            "this decision is in a log that has not been rewritten",
-            "that log is witnessed by parties we do not control",
-            "the period it sits in declared its total before anyone asked",
-            "the same inputs still produce the same verdict",
-            "and what fed it, hop by hop, across every company involved",
-        ],
-        "what_you_cannot": "That the decision was right, or that the inputs were honest. "
-                           "Cryptography establishes what happened and when. It does not "
-                           "establish that what happened was correct, and anybody telling you "
-                           "otherwise is selling something.",
-        "send_this_on": "Attach it to the output it describes. Whoever receives it can verify "
-                        "without an account, without contacting us, and without trusting anyone "
-                        "in the chain including the sender.",
-    }, 200
-
-
-def _spec():
-    return {
-        "lineage_version": VERSION,
-        "idea": "A decision records the receipts of its inputs and which chain each came from. "
-                "Nothing else is needed, because a chain tip already commits to everything "
-                "beneath it and is already witnessed by parties its operator does not control.",
-        "why_no_consortium": "A shared ledger needs a governor and never gets built. This needs "
-                             "no agreement between parties beyond each one sealing its own work "
-                             "and publishing a tip.",
-        "declare": {
-            "route": "POST /x/lineage/declare (keyed)",
-            "body": {"receipt": "<64 hex, the decision>",
-                     "inputs": [{"chain": "<who it came from>", "receipt": "<64 hex>",
-                                 "role": "one of %s" % ", ".join(ROLES),
-                                 "base": "<their public https base, optional>"}]},
-        },
-        "roles": list(ROLES),
-        "trace": "GET /x/lineage/trace?receipt= - upstream, what produced this",
-        "impact": "GET /x/lineage/impact?receipt= - downstream, what this produced",
-        "portable_receipt": "GET /x/lineage/receipt?receipt= - a document that travels with an "
-                            "output and lets the recipient verify it independently",
-        "verifying_a_hop": "Each node carries the routes to check it on its own chain: an "
-                           "ancestry proof that the receipt is still there, a completeness "
-                           "check that nothing was omitted from its period, and the witness "
-                           "list showing who else holds that chain's tips.",
-        "adopting_it": "Implement three public routes on your own system - a tip, an observe, "
-                       "and an ancestry check - and declare your inputs. There is nothing to "
-                       "join, nobody to ask, and no fee. If you can serve a tip, you are in.",
-        "honest": "An edge is a dated, sealed claim about what fed a decision. It cannot be "
-                  "quietly revised later. It was never proof that the claim was true, and this "
-                  "module does not pretend otherwise.",
-    }, 200
-
-
-# ----------------------------------------------------------------------
-# router entry point
-# ----------------------------------------------------------------------
-
-def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-    action = (action or "").strip("/").lower()
-    data = data or {}
-
-    if method == "GET":
-        if action == "spec":
-            return _spec()
-        if action == "trace":
-            return _trace(ctx, data)
-        if action == "impact":
-            return _impact(ctx, data)
-        if action == "receipt":
-            return _receipt(ctx, data)
-
-    if method == "POST":
-        if not api_key:
-            return {"error": "invalid_api_key"}, 401
-        if action == "declare":
-            return _declare(ctx, api_key, data)
-
-    return {"error": "unknown_action", "action": action,
-            "GET": ["spec", "trace", "impact", "receipt"],
-            "POST": ["declare (keyed)"]}, 404
-
-```
-
-
-## `modules/mutual.py`
-
-543 lines, 19704 bytes
-
-```python
-#!/usr/bin/env python3
-"""
-modules/mutual.py  -  the outbound half of mutual witnessing
-============================================================
-
-Why this exists
----------------
-modules/witness.py RECEIVES. Other chains hand us their tips and we seal
-them. Nothing in the platform currently SENDS our tip anywhere, so right
-now we witness other people and nobody witnesses us. This module is the
-missing direction.
-
-Drop it in as modules/mutual.py. The router picks it up automatically -
-no edits to server.py.
-
-Routes
-------
-  POST /x/mutual/push      send our current tip to every configured peer
-  POST /x/mutual/pull      fetch every peer's tip and seal it into our chain
-  POST /x/mutual/sync      pull then push (this is the one to schedule)
-  GET  /x/mutual/peers     the configured peers and what happened last time
-  GET  /x/mutual/status    last run, next run, whether the timer is alive
-
-Important design note
----------------------
-This module does not touch the database or import anything from server.py.
-It talks HTTP to routes that are already public - ours and theirs. That
-means it cannot corrupt anything, it works no matter how seal() changes,
-and every action it takes is one an outsider could audit for themselves.
-
-To read our own tip it calls our own public /x/witness/tip.
-To seal a peer's tip it calls our own public /x/witness/observe, which is
-already built to record exactly that. So a peer tip we pull is recorded by
-the same code path as a peer tip that was pushed to us.
-
-FETCH-ONLY PEERS (added 1.2)
-----------------------------
-observe_url is now OPTIONAL. A peer with a tip_url and no observe_url is
-fetch-only: we read and seal their tip, and we do not try to push ours.
-
-That is a real configuration, not a broken one. Two current cases:
-
-  A peer whose outbound submission lane is deliberately closed during
-  staging. They serve a tip for us to read; their recorder never reaches
-  out. Serving a file is not outbound submission.
-
-  A peer whose tip is a static JSON file with no server behind it. They
-  push to us on their own schedule and there is nothing on their side to
-  POST to. Perfectly valid node.
-
-Before 1.2 push_one read peer["observe_url"] unconditionally, so adding a
-fetch-only peer would have raised KeyError on every cycle - inside a
-background thread with a bare except, so it would have failed silently and
-taken the whole sync with it.
-
-CONCURRENCY - read this before changing it
-------------------------------------------
-A sync cycle makes two kinds of call, and they are treated differently on
-purpose.
-
-  OUTBOUND to other people's hosts (reading their tip, pushing ours) runs
-  in parallel. These are the slow ones - we are waiting on somebody else's
-  server, and there is no reason to wait on them one at a time. Fifty peers
-  now costs roughly what the slowest single peer costs, instead of the sum
-  of all fifty.
-
-  INBOUND to our own server (sealing what we pulled) stays sequential. Our
-  own process is handling those requests, and firing a burst of them at
-  ourselves while we are mid-cycle is asking for trouble - a queue behind a
-  single replica at best. The sealing is fast and local anyway, so there is
-  nothing to gain by parallelising it and a real risk in doing so.
-
-So: fetch everything at once, then seal one at a time.
-
-BEFORE THIS WORKS
------------------
-1. "observe" must be in the PUBLIC set of modules/witness.py. If it is not,
-   this module gets a 401 from our own server, same as Red Flag AI Pro did.
-2. After every deploy, the first /x/ request must be a GET - that is what
-   installs the POST branch. Opening /x/mutual/peers in a browser does it.
-"""
-
-import json
-import threading
-import time
-import urllib.error
-import urllib.request
-from concurrent.futures import ThreadPoolExecutor
-
-VERSION = "1.2"
-
-# ----------------------------------------------------------------------
-# ROUTER
-# ----------------------------------------------------------------------
-
-# The router reads a set of (METHOD, action) tuples. Anything not listed
-# here needs an API key - default is closed.
-#
-# peers and status are read-only. An outsider being able to see who we
-# witness with, and whether it is actually running, is the entire point.
-#
-# push, pull and sync stay keyed - they cause outbound traffic and are not
-# left open to anonymous callers.
-PUBLIC = {("GET", "peers"), ("GET", "status")}
-
-
-# ----------------------------------------------------------------------
-# CONFIG
-# ----------------------------------------------------------------------
-
-# Our own public witness routes. Left as full URLs on purpose so this
-# module never has to guess its own host.
-OUR_TIP_URL = "https://sebbi.pro/x/witness/tip"
-OUR_OBSERVE_URL = "https://sebbi.pro/x/witness/observe"
-
-# The name we go by when we hand our tip to someone else.
-OUR_CHAIN_NAME = "aileash"
-
-# Everyone we witness with. Add a dict per chain.
-#   name         what we file their tips under
-#   tip_url      where we GET their current tip          REQUIRED
-#   observe_url  where we POST ours so they record it    OPTIONAL
-#
-# Omit observe_url for a fetch-only peer - see the note at the top. It is
-# not an oversight and the module will not complain about it; /x/mutual/peers
-# reports the direction for each so it is visible rather than assumed.
-PEERS = [
-    {
-        "name": "red-flag-ai-pro",
-        "tip_url": "https://www.redflagaipro.com/api/witness/tip",
-        "observe_url": "https://www.redflagaipro.com/api/witness/anchor",
-    },
-    {
-        # Simon. Serves a static JSON file regenerated on his side, and
-        # pushes to us on his own systemd timer at :23. Nothing to POST to.
-        "name": "flavorflowstrategy.uk",
-        "tip_url": "https://www.flavorflowstrategy.uk/witness.json",
-    },
-    {
-        # PRAXIS / Praesidium, chain 4. Read-only, hash-only, currently
-        # SYNTHETIC_STAGING and regenerating every ten minutes, so expect
-        # liveness "live" rather than "self-consistent" - the tip moves
-        # between their generating it and our fetching it. That is the
-        # normal case for a working chain, not a failure.
-        #
-        # Their outbound submission lane is deliberately closed through
-        # staging, so no observe_url. They also run a signed lane at
-        # /x/peer/submit under peer_id praesidium when they are ready.
-        "name": "praesidium",
-        "tip_url": "https://chain4.thepraesidium.ai/api/witness/tip",
-    },
-]
-
-# Field names to send when pushing our tip. If a peer wants different
-# names, give that peer its own "keys" dict and it will be used instead.
-DEFAULT_PUSH_KEYS = {
-    "chain": "chain",
-    "tip": "tip",
-    "count": "count",
-    "ts": "ts",
-    "url": "url",
-}
-
-# Where peers can read our tip, included in what we push.
-OUR_PUBLIC_URL = "https://sebbi.pro/x/witness/tip"
-
-# Background timer. Set ENABLED to False if you would rather drive it
-# yourself by hitting /x/mutual/sync.
-AUTO_SYNC_ENABLED = True
-AUTO_SYNC_SECONDS = 3600
-
-TIMEOUT_SECONDS = 20
-
-# How many peers we talk to at once. Above this they queue, which is fine -
-# it stops a large network spawning a thread per peer. Eight slow peers at
-# 20s each still finishes in 20s; forty finishes in about a minute worst
-# case, and only if every one of them times out.
-MAX_PARALLEL_PEERS = 8
-
-# ----------------------------------------------------------------------
-# state - deliberately in memory only, this is not evidence
-# ----------------------------------------------------------------------
-
-_state = {
-    "last_run": None,
-    "last_result": None,
-    "runs": 0,
-    "timer_started": False,
-}
-_lock = threading.Lock()
-
-
-def _now():
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-
-def _reply(payload, status=200):
-    """The router expects (payload, status) back from handle()."""
-    return payload, status
-
-
-def _in_parallel(function, items):
-    """Run function over items concurrently, preserving input order.
-
-    Used only for calls that leave our server. Anything hitting our own
-    process goes through a plain loop instead - see the note at the top.
-    """
-    if not items:
-        return []
-    if len(items) == 1:
-        return [function(items[0])]
-    workers = min(len(items), MAX_PARALLEL_PEERS)
-    with ThreadPoolExecutor(max_workers=workers,
-                            thread_name_prefix="mutual-peer") as pool:
-        return list(pool.map(function, items))
-
-
-# ----------------------------------------------------------------------
-# http
-# ----------------------------------------------------------------------
-
-def _http(url, payload=None):
-    """POST if payload given, else GET. Returns (status, parsed_or_text)."""
-    data = None
-    headers = {"Accept": "application/json",
-               "User-Agent": "aileash-mutual/%s" % VERSION}
-    if payload is not None:
-        data = json.dumps(payload).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    request = urllib.request.Request(url, data=data, headers=headers)
-    try:
-        with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
-            body = response.read().decode("utf-8", "replace")
-            status = response.getcode()
-    except urllib.error.HTTPError as exc:
-        try:
-            body = exc.read().decode("utf-8", "replace")
-        except Exception:
-            body = ""
-        status = exc.code
-    except urllib.error.URLError as exc:
-        return 0, "unreachable: %s" % exc.reason
-    except Exception as exc:
-        return 0, "failed: %s" % exc
-    try:
-        return status, json.loads(body)
-    except ValueError:
-        return status, body
-
-
-# Field names a tip can arrive under. Different implementations name it
-# differently and being strict about a name we never published is a bug in
-# the receiver, not in the peer. Order is preference, not importance.
-TIP_FIELDS = ("tip", "hash", "head", "tip_sha256", "root", "current_tip",
-              "chain_tip", "latest")
-
-HEIGHT_FIELDS = ("height", "count", "entries", "tree_size", "size")
-
-
-def _extract_tip(body):
-    """Pull (tip, height) out of whatever shape a tip route returns."""
-    if not isinstance(body, dict):
-        return None, None
-    tip = None
-    for field in TIP_FIELDS:
-        value = body.get(field)
-        if isinstance(value, str) and value.strip():
-            tip = value.strip()
-            break
-    height = None
-    for field in HEIGHT_FIELDS:
-        if field in body:
-            height = body.get(field)
-            break
-    return tip, height
-
-
-# ----------------------------------------------------------------------
-# the two directions
-# ----------------------------------------------------------------------
-
-def our_tip():
-    status, body = _http(OUR_TIP_URL)
-    if status != 200:
-        return None, None, "our own tip route answered %s: %s" % (status, str(body)[:200])
-    tip, height = _extract_tip(body)
-    if not tip:
-        return None, None, "no tip field in our own reply: %s" % str(body)[:200]
-    return tip, height, None
-
-
-def push_one(peer, tip, height):
-    """Hand our tip to one peer so they record it. Outbound only.
-
-    A peer with no observe_url is fetch-only by configuration. Say so and
-    move on rather than treating it as a failure - and never index the key
-    blindly, which is what 1.1 did.
-    """
-    observe_url = peer.get("observe_url")
-    if not observe_url:
-        return {
-            "peer": peer["name"],
-            "direction": "push",
-            "skipped": True,
-            "ok": True,
-            "reason": "fetch-only peer - no observe_url configured",
-            "note": ("We read and seal their tip. They do not accept a push, "
-                     "either because their outbound lane is closed or because "
-                     "their tip is a static file. Not an error."),
-        }
-
-    keys = peer.get("keys", DEFAULT_PUSH_KEYS)
-    values = {
-        "chain": OUR_CHAIN_NAME,
-        "tip": tip,
-        "count": height,
-        "ts": _now(),
-        "url": OUR_PUBLIC_URL,
-    }
-    payload = {keys.get(k, k): v for k, v in values.items()}
-    status, body = _http(observe_url, payload)
-    result = {
-        "peer": peer["name"],
-        "direction": "push",
-        "url": observe_url,
-        "http": status,
-        "ok": 200 <= status < 300,
-        "response": body if isinstance(body, (dict, list)) else str(body)[:300],
-    }
-    if status == 401 or status == 403:
-        result["hint"] = "they want auth on that route, or it is not in their public set"
-    elif status == 404:
-        result["hint"] = "wrong path - check observe_url for this peer"
-    elif status == 0:
-        result["hint"] = "could not reach them at all"
-    return result
-
-
-def fetch_one(peer):
-    """Read one peer's current tip. Outbound only - no sealing here.
-
-    Returns a dict that either carries a tip ready to seal, or an error
-    already shaped like a result so it can be returned to the caller as is.
-    """
-    status, body = _http(peer["tip_url"])
-    if status != 200:
-        return {
-            "peer": peer["name"], "direction": "pull", "url": peer["tip_url"],
-            "http": status, "ok": False, "_failed": True,
-            "response": body if isinstance(body, (dict, list)) else str(body)[:300],
-            "hint": "could not read their tip",
-        }
-
-    tip, height = _extract_tip(body)
-    if not tip:
-        return {
-            "peer": peer["name"], "direction": "pull", "url": peer["tip_url"],
-            "http": status, "ok": False, "_failed": True,
-            "response": str(body)[:300],
-            "hint": ("no tip field in their reply - add the field name to "
-                     "TIP_FIELDS. Currently accepted: " + ", ".join(TIP_FIELDS)),
-        }
-
-    return {
-        "peer": peer["name"], "url": peer["tip_url"],
-        "tip": tip, "height": height, "_failed": False,
-        "fetched_at": time.time(),
-    }
-
-
-def seal_one(fetched):
-    """Seal one already-fetched peer tip into our chain.
-
-    Goes through our own public observe route so a tip we pulled is
-    recorded by exactly the same code path as a tip somebody pushed to us.
-    Called in a plain loop, never in parallel - this hits our own server.
-
-    Field names must match what modules/witness.py reads out of the body:
-    chain, tip, peer_ts, url. The url is what makes the observation
-    checkable by a third party rather than taken on our word - it is the
-    address we just fetched this tip from.
-    """
-    seal_status, seal_body = _http(OUR_OBSERVE_URL, {
-        "chain": fetched["peer"],
-        "tip": fetched["tip"],
-        "peer_ts": fetched["fetched_at"],
-        "url": fetched["url"],
-    })
-
-    out = {
-        "peer": fetched["peer"],
-        "direction": "pull",
-        "their_tip": fetched["tip"],
-        "their_height": fetched["height"],
-        "sealed_http": seal_status,
-        "ok": 200 <= seal_status < 300,
-        "response": seal_body if isinstance(seal_body, (dict, list)) else str(seal_body)[:300],
-    }
-    if seal_status in (401, 403):
-        out["hint"] = "our own observe route rejected us - check PUBLIC in modules/witness.py"
-    return out
-
-
-def do_push():
-    tip, height, error = our_tip()
-    if error:
-        return {"ok": False, "error": error}
-
-    # Outbound to everyone at once.
-    results = _in_parallel(lambda peer: push_one(peer, tip, height), PEERS)
-
-    return {
-        "ok": True,
-        "our_tip": tip,
-        "our_height": height,
-        "pushed_to": len([r for r in results if not r.get("skipped")]),
-        "fetch_only": len([r for r in results if r.get("skipped")]),
-        "results": results,
-    }
-
-
-def do_pull():
-    # Phase one: read every peer's tip at the same time. This is the slow
-    # part and none of it touches us.
-    fetched = _in_parallel(fetch_one, PEERS)
-
-    # Phase two: seal what came back, one at a time, into our own chain.
-    results = []
-    for item in fetched:
-        if item.get("_failed"):
-            item.pop("_failed", None)
-            results.append(item)
-            continue
-        results.append(seal_one(item))
-
-    return {"ok": True, "results": results}
-
-
-def do_sync():
-    """Pull first, then push. That order matters: the tip we hand out then
-    already contains the tips we just took in, so the two chains interlock
-    rather than merely sitting alongside each other."""
-    started = time.time()
-    pulled = do_pull()
-    pushed = do_push()
-    result = {
-        "ran_at": _now(),
-        "took_seconds": round(time.time() - started, 2),
-        "peers": len(PEERS),
-        "pull": pulled,
-        "push": pushed,
-        "ok": bool(pulled.get("ok")) and bool(pushed.get("ok")),
-    }
-    with _lock:
-        _state["last_run"] = result["ran_at"]
-        _state["last_result"] = result
-        _state["runs"] += 1
-    return result
-
-
-# ----------------------------------------------------------------------
-# background timer
-# ----------------------------------------------------------------------
-
-def _loop():
-    # Let the server finish coming up before the first run.
-    time.sleep(45)
-    while True:
-        try:
-            do_sync()
-        except Exception:
-            pass
-        time.sleep(AUTO_SYNC_SECONDS)
-
-
-def _start_timer():
-    with _lock:
-        if _state["timer_started"] or not AUTO_SYNC_ENABLED:
-            return
-        _state["timer_started"] = True
-    thread = threading.Thread(target=_loop, name="mutual-sync", daemon=True)
-    thread.start()
-
-
-_start_timer()
-
-
-# ----------------------------------------------------------------------
-# router entry point
-# ----------------------------------------------------------------------
-
-def handle(method, action, data, api_key, ctx):
-    action = (action or "").strip("/").lower()
-
-    if method == "GET":
-        if action == "peers":
-            return _reply({
-                "chain": OUR_CHAIN_NAME,
-                "version": VERSION,
-                "peers": [
-                    {"name": p["name"],
-                     "tip_url": p["tip_url"],
-                     "observe_url": p.get("observe_url"),
-                     "direction": ("both" if p.get("observe_url")
-                                   else "fetch-only")}
-                    for p in PEERS
-                ],
-                "parallel_fetch": MAX_PARALLEL_PEERS,
-                "tip_fields_accepted": list(TIP_FIELDS),
-                "note": ("Witnessing is only mutual if both columns are live. "
-                         "A fetch-only peer is one we read and seal but who "
-                         "does not accept a push - either their outbound lane "
-                         "is closed or their tip is a static file. Both are "
-                         "valid; the direction is published rather than "
-                         "implied."),
-            })
-        if action == "status":
-            with _lock:
-                return _reply({
-                    "version": VERSION,
-                    "auto_sync": AUTO_SYNC_ENABLED,
-                    "interval_seconds": AUTO_SYNC_SECONDS,
-                    "timer_running": _state["timer_started"],
-                    "parallel_fetch": MAX_PARALLEL_PEERS,
-                    "runs": _state["runs"],
-                    "last_run": _state["last_run"],
-                    "last_result": _state["last_result"],
-                })
-
-    if method == "POST":
-        if action == "push":
-            return _reply(do_push())
-        if action == "pull":
-            return _reply(do_pull())
-        if action == "sync":
-            return _reply(do_sync())
-
-    return _reply({
-        "error": "unknown action",
-        "GET": ["peers", "status"],
-        "POST": ["push", "pull", "sync"],
-    }, 404)
-
-```
+- `modules/pack.py`
+- `modules/packconsole.py`
 
 
 ## `modules/network.py`
@@ -2455,5 +1368,948 @@ def handle(method, action, data, api_key, ctx):
                 return {"error": "id_required"}, 400
             return _reviewer(ctx, api_key, rid)
     return {"error": "unknown_action", "action": action}, 404
+
+```
+
+
+## `modules/pack.py`
+
+501 lines, 20695 bytes
+
+```python
+"""
+Evidence pack - /x/pack/<action>
+
+WHAT THIS IS
+------------
+The sellable artifact. Everything else in this platform produces evidence;
+this produces the document someone hands an auditor.
+
+For a chosen period it does not summarise the chain, it RE-VERIFIES it:
+every block in the range is rehashed from its stored contents using the
+same function that sealed it, and compared to the hash recorded at the
+time. Then the links between blocks are walked, and for a single key the
+gapless receipt sequence is checked end to end.
+
+A summary is a claim. A re-verification is a check anyone can repeat.
+
+WHAT IT DOES NOT PROVE
+----------------------
+- That any decision recorded here was correct. Wrong answers seal just as
+  cleanly as right ones.
+- That an external peer's own chain is honest. That is checked at the
+  peer's host, not here.
+- Anything about periods outside the range requested.
+
+    GET  /x/pack/spec                        public - what this does
+    GET  /x/pack/preview?period=2026-Q2      keyed  - the pack as JSON
+    GET  /x/pack/render?period=2026-Q2       keyed  - the pack as one page
+    GET  /x/pack/history                     keyed  - packs issued
+    POST /x/pack/issue                       keyed  - seal it into the chain
+
+period accepts YYYY, YYYY-MM, YYYY-Qn. Add scope=me to limit the pack to
+your own key; omit scope for a deployment-wide pack.
+"""
+
+import calendar
+import datetime
+import hashlib
+import json
+import time
+
+VERSION = "1.0"
+
+# (METHOD, action). Only the spec is open - a pack is customer evidence.
+PUBLIC = {("GET", "spec")}
+
+MAX_ROWS = 200000
+
+_ready = False
+
+
+def _setup(ctx):
+    global _ready
+    if _ready:
+        return
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "CREATE TABLE IF NOT EXISTS pack_issued("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,"
+            "period TEXT,scope TEXT,digest TEXT,issued REAL,"
+            "entries INTEGER,verified INTEGER,mismatches INTEGER,"
+            "audit_hash TEXT,block_index INTEGER)")
+        ctx["conn"].execute(
+            "CREATE INDEX IF NOT EXISTS idx_pack_key "
+            "ON pack_issued(api_key)")
+        ctx["conn"].commit()
+    _ready = True
+
+
+def _sha(p):
+    """Identical to the engine's own sha(). Written out here rather than
+    imported so this module depends on no other module's internals."""
+    return hashlib.sha256(
+        json.dumps(p, sort_keys=True).encode()).hexdigest()
+
+
+def _iso(ts):
+    if ts is None:
+        return None
+    return datetime.datetime.utcfromtimestamp(
+        float(ts)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _day(ts):
+    if ts is None:
+        return None
+    return datetime.datetime.utcfromtimestamp(
+        float(ts)).strftime("%Y-%m-%d")
+
+
+def _epoch(y, m, d):
+    return float(calendar.timegm((y, m, d, 0, 0, 0, 0, 0, 0)))
+
+
+def _bounds(period):
+    """YYYY | YYYY-MM | YYYY-Qn -> (start, end, label)."""
+    p = str(period or "").strip().upper()
+    try:
+        if len(p) == 4:
+            y = int(p)
+            return _epoch(y, 1, 1), _epoch(y + 1, 1, 1), p
+        if len(p) == 7 and p[4] == "-" and p[5] == "Q":
+            y, q = int(p[:4]), int(p[6])
+            if q < 1 or q > 4:
+                return None
+            m = (q - 1) * 3 + 1
+            em, ey = m + 3, y
+            if em > 12:
+                em, ey = em - 12, y + 1
+            return _epoch(y, m, 1), _epoch(ey, em, 1), p
+        if len(p) == 7 and p[4] == "-":
+            y, m = int(p[:4]), int(p[5:])
+            em, ey = m + 1, y
+            if em > 12:
+                em, ey = 1, y + 1
+            return _epoch(y, m, 1), _epoch(ey, em, 1), p
+    except (ValueError, IndexError):
+        return None
+    return None
+
+
+# ----------------------------------------------------------------------
+# assembly - the actual re-verification
+# ----------------------------------------------------------------------
+
+def _assemble(ctx, start, end, label, scope):
+    c = ctx["conn"]
+    cols = ("id,ts,event_json,result_json,prev_hash,audit_hash,"
+            "api_key,key_seq")
+
+    with ctx["lock"]:
+        if scope:
+            rows = c.execute(
+                "SELECT " + cols + " FROM audit_log WHERE ts>=? AND ts<? "
+                "AND api_key=? ORDER BY id ASC LIMIT ?",
+                (start, end, scope, MAX_ROWS)).fetchall()
+            began = c.execute(
+                "SELECT MIN(ts) FROM audit_log WHERE api_key=?",
+                (scope,)).fetchone()
+            dev_all = c.execute(
+                "SELECT COUNT(*) FROM device_seen WHERE api_key=?",
+                (scope,)).fetchone()
+            dev_new = c.execute(
+                "SELECT COUNT(*) FROM device_seen WHERE api_key=? "
+                "AND first_seen>=? AND first_seen<?",
+                (scope, start, end)).fetchone()
+        else:
+            rows = c.execute(
+                "SELECT " + cols + " FROM audit_log WHERE ts>=? AND ts<? "
+                "ORDER BY id ASC LIMIT ?",
+                (start, end, MAX_ROWS)).fetchall()
+            began = c.execute("SELECT MIN(ts) FROM audit_log").fetchone()
+            dev_all = c.execute(
+                "SELECT COUNT(*) FROM device_seen").fetchone()
+            dev_new = c.execute(
+                "SELECT COUNT(*) FROM device_seen "
+                "WHERE first_seen>=? AND first_seen<?",
+                (start, end)).fetchone()
+        chain_total = c.execute(
+            "SELECT COUNT(*) FROM audit_log").fetchone()[0]
+
+    verdicts = {}
+    actions = {}
+    seqs = []
+    verified = 0
+    mismatched = []
+    link_breaks = []
+    expect_prev = None
+    per_day = {}
+
+    for rid, ts, ev_j, res_j, prev, ah, akey, kseq in rows:
+        try:
+            ev = json.loads(ev_j)
+            res = json.loads(res_j)
+        except Exception:
+            mismatched.append(rid)
+            expect_prev = ah
+            continue
+
+        if _sha({"prev_hash": prev, "ts": ts,
+                 "event": ev, "result": res}) == ah:
+            verified += 1
+        else:
+            mismatched.append(rid)
+
+        if expect_prev is not None and prev != expect_prev:
+            link_breaks.append(rid)
+        expect_prev = ah
+
+        d = str(res.get("decision", "UNRECORDED"))
+        verdicts[d] = verdicts.get(d, 0) + 1
+        a = str(ev.get("action", "unrecorded"))
+        actions[a] = actions.get(a, 0) + 1
+        if kseq is not None:
+            try:
+                seqs.append(int(kseq))
+            except (TypeError, ValueError):
+                pass
+        k = _day(ts)
+        per_day[k] = per_day.get(k, 0) + 1
+
+    # does the first block in the period chain to the one before it
+    entry_link = "no_entries_in_period"
+    if rows:
+        with ctx["lock"]:
+            before = c.execute(
+                "SELECT audit_hash FROM audit_log WHERE id<? "
+                "ORDER BY id DESC LIMIT 1", (rows[0][0],)).fetchone()
+        if before is None:
+            entry_link = ("intact_from_genesis"
+                          if rows[0][4] == "GENESIS" else "broken")
+        else:
+            entry_link = "intact" if rows[0][4] == before[0] else "broken"
+
+    seq = {"applicable": bool(scope and seqs)}
+    if seq["applicable"]:
+        lo, hi = min(seqs), max(seqs)
+        have = set(seqs)
+        missing = [n for n in range(lo, hi + 1) if n not in have]
+        seq.update({"first": lo, "last": hi, "received": len(seqs),
+                    "expected": hi - lo + 1,
+                    "missing": missing[:200],
+                    "gapless": not missing,
+                    "note": "Receipt numbers are issued with no gaps by "
+                            "construction. A missing number is a record "
+                            "that left this chain."})
+
+    clean = (not mismatched and not link_breaks
+             and entry_link in ("intact", "intact_from_genesis"))
+
+    p = {
+        "pack_version": VERSION,
+        "period": label,
+        "period_start": _iso(start),
+        "period_end": _iso(end),
+        "generated_at": _iso(time.time()),
+        "scope": ("key " + str(scope)[:12] + "\u2026") if scope
+                 else "deployment-wide",
+        "unbroken_since": _day(began[0] if began else None),
+        "entries_in_period": len(rows),
+        "chain_total_entries": chain_total,
+        "first_block": rows[0][0] if rows else None,
+        "first_hash": rows[0][5] if rows else None,
+        "last_block": rows[-1][0] if rows else None,
+        "last_hash": rows[-1][5] if rows else None,
+        "integrity": {
+            "clean": clean,
+            "blocks_recomputed": len(rows),
+            "hashes_verified": verified,
+            "hash_mismatches": mismatched[:50],
+            "link_breaks": link_breaks[:50],
+            "link_into_period": entry_link,
+            "method": "SHA-256 over {prev_hash, ts, event, result}, "
+                      "recomputed from the stored row and compared to "
+                      "the hash sealed at the time",
+        },
+        "receipt_sequence": seq,
+        "verdicts": verdicts,
+        "actions": dict(sorted(actions.items(), key=lambda x: -x[1])[:20]),
+        "devices": {"total_ever": dev_all[0] if dev_all else 0,
+                    "first_seen_in_period": dev_new[0] if dev_new else 0},
+        "busiest_days": [{"day": d, "entries": n} for d, n in
+                         sorted(per_day.items(), key=lambda x: -x[1])[:5]],
+        "check_this_yourself": {
+            "offline": "aileash_verify.py - stdlib only, no network",
+            "still_on_this_chain": "/x/consistency/ancestor?tip=<last_hash>",
+            "append_only": "/x/consistency/proof?first=&second=",
+            "record_included": "/x/complete/prove",
+            "who_witnessed_us": "/x/witness/peers",
+        },
+        "this_does_not_prove": [
+            "That any decision recorded here was correct.",
+            "That an external peer's own chain is honest - that is "
+            "checked at the peer's host, not here.",
+            "Anything about periods outside the dates above.",
+        ],
+    }
+    p["pack_digest"] = hashlib.sha256(
+        b"AILEASH-PACK-v1\x00" + json.dumps(
+            p, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return p
+
+
+# ----------------------------------------------------------------------
+# one page, self contained
+# ----------------------------------------------------------------------
+
+def _html(p):
+    ig = p["integrity"]
+    sq = p["receipt_sequence"]
+    good = "#7fe3b0"
+    bad = "#ff8a80"
+
+    def card(inner):
+        return ("<div style='background:#10182e;border:1px solid #223055;"
+                "border-radius:12px;padding:16px;margin-bottom:14px'>"
+                + inner + "</div>")
+
+    def row(k, v):
+        return ("<tr><td style='padding:7px 0;border-bottom:1px solid "
+                "#1d2a4a'>" + str(k) + "</td><td style='padding:7px 0;"
+                "border-bottom:1px solid #1d2a4a;text-align:right;"
+                "color:#c9a84c;font-weight:600'>" + str(v) + "</td></tr>")
+
+    def mono(v):
+        return ("<code style='font:12px ui-monospace,monospace;"
+                "color:#9fb3d9;word-break:break-all'>" + str(v)
+                + "</code>")
+
+    integ = ("<div style='font-size:26px;font-weight:600;color:"
+             + (good if ig["clean"] else bad) + "'>"
+             + str(ig["hashes_verified"]) + " of "
+             + str(ig["blocks_recomputed"]) + " blocks re-verified</div>"
+             "<div style='color:#93a0bd;font-size:13px;margin-top:6px'>"
+             + ig["method"] + "</div>")
+    if not ig["clean"]:
+        integ += ("<div style='color:" + bad + ";font-size:13px;"
+                  "margin-top:8px'>mismatched blocks "
+                  + str(ig["hash_mismatches"]) + " &middot; link breaks "
+                  + str(ig["link_breaks"]) + " &middot; entry link "
+                  + ig["link_into_period"] + "</div>")
+
+    if sq.get("applicable"):
+        seqbox = ("<div style='font-size:20px;font-weight:600;color:"
+                  + (good if sq["gapless"] else bad) + "'>"
+                  + ("Receipt sequence complete" if sq["gapless"]
+                     else "GAPS IN RECEIPT SEQUENCE") + "</div>"
+                  "<div style='color:#93a0bd;font-size:13px'>"
+                  + str(sq["received"]) + " of " + str(sq["expected"])
+                  + " received, numbers " + str(sq["first"]) + " to "
+                  + str(sq["last"]) + "</div>")
+        if not sq["gapless"]:
+            seqbox += ("<div style='color:" + bad + ";font:12px "
+                       "ui-monospace,monospace;margin-top:6px'>missing "
+                       + str(sq["missing"]) + "</div>")
+    else:
+        seqbox = ("<div style='color:#93a0bd;font-size:13px'>Receipt "
+                  "sequence applies to a single key. This pack is "
+                  "deployment-wide.</div>")
+
+    checks = "".join("<li><b>" + k.replace("_", " ") + "</b> " + mono(v)
+                     + "</li>" for k, v in
+                     p["check_this_yourself"].items())
+    nots = "".join("<li>" + x + "</li>" for x in p["this_does_not_prove"])
+
+    return (
+        "<!doctype html><meta charset=utf-8>"
+        "<meta name=viewport content='width=device-width,initial-scale=1'>"
+        "<title>Evidence Pack " + p["period"] + " - AILeash</title>"
+        "<body style='background:#0a0f1e;color:#e8ecf5;margin:0;"
+        "padding:22px;font:15px/1.55 -apple-system,system-ui,sans-serif'>"
+        "<div style='max-width:760px;margin:0 auto'>"
+        "<h1 style='font-size:21px;margin:0 0 4px;color:#c9a84c'>"
+        "Evidence Pack &mdash; " + p["period"] + "</h1>"
+        "<div style='color:#93a0bd;font-size:13px;margin-bottom:20px'>"
+        + p["scope"] + " &middot; " + str(p["period_start"]) + " to "
+        + str(p["period_end"]) + " &middot; generated "
+        + str(p["generated_at"]) + "</div>"
+        + card("<div style='color:#93a0bd;font-size:13px'>Unbroken since"
+               "</div><div style='font-size:26px;color:" + good
+               + ";font-weight:600'>" + str(p["unbroken_since"])
+               + "</div>")
+        + card(integ)
+        + card(seqbox)
+        + card("<table style='width:100%;border-collapse:collapse;"
+               "font-size:14px'>"
+               + row("Entries in period", p["entries_in_period"])
+               + row("Chain total entries", p["chain_total_entries"])
+               + row("Devices, total ever", p["devices"]["total_ever"])
+               + row("Devices first seen this period",
+                     p["devices"]["first_seen_in_period"])
+               + "".join(row(k, v) for k, v in sorted(
+                   p["verdicts"].items()))
+               + "".join(row(k, v) for k, v in p["actions"].items())
+               + "</table>")
+        + card("<div style='color:#93a0bd;font-size:13px'>First block</div>"
+               + mono("#" + str(p["first_block"]) + " "
+                      + str(p["first_hash"]))
+               + "<div style='color:#93a0bd;font-size:13px;margin-top:10px'>"
+                 "Last block</div>"
+               + mono("#" + str(p["last_block"]) + " "
+                      + str(p["last_hash"]))
+               + "<div style='color:#93a0bd;font-size:13px;margin-top:10px'>"
+                 "Pack digest</div>" + mono(p["pack_digest"]))
+        + card("<div style='color:#93a0bd;font-size:13px'>Check every "
+               "figure above yourself:</div><ul style='margin:6px 0 0 18px;"
+               "padding:0;font-size:13px'>" + checks + "</ul>"
+               "<div style='color:#93a0bd;font-size:13px;margin-top:14px'>"
+               "What this pack does not prove:</div>"
+               "<ul style='margin:6px 0 0 18px;padding:0;color:#93a0bd;"
+               "font-size:13px'>" + nots + "</ul>")
+        + "<div style='color:#6d7b99;font-size:12px;margin-top:18px'>"
+          "AILeash &middot; sebbi.pro</div></div>")
+
+
+# ----------------------------------------------------------------------
+
+def _resolve(data, api_key):
+    b = _bounds(data.get("period"))
+    if not b:
+        return None, ({"error": "period_required",
+                       "accepts": ["YYYY", "YYYY-MM", "YYYY-Qn"],
+                       "example": "/x/pack/preview?period=2026-Q2"}, 400)
+    start, end, label = b
+    if end > time.time():
+        return None, ({"error": "period_not_closed", "period": label,
+                       "message": "A pack can only cover a period that "
+                                  "has finished."}, 409)
+    scope = data.get("scope")
+    if scope == "me":
+        scope = api_key
+    return (start, end, label, scope or None), None
+
+
+def handle(method, action, data, api_key, ctx):
+    if action == "spec":
+        return {"module": "pack", "version": VERSION,
+                "purpose": "Re-verifies every block in a period against "
+                           "the hash sealed at the time, and checks the "
+                           "gapless receipt sequence for a single key.",
+                "periods": ["YYYY", "YYYY-MM", "YYYY-Qn"],
+                "routes": {"GET /x/pack/spec": "public",
+                           "GET /x/pack/preview?period=": "keyed, json",
+                           "GET /x/pack/render?period=": "keyed, one page",
+                           "GET /x/pack/history": "keyed",
+                           "POST /x/pack/issue": "keyed, seals the pack"},
+                "scope": "add scope=me for your key only; omit for "
+                         "deployment-wide",
+                "does_not_prove": [
+                    "That any decision recorded here was correct.",
+                    "That an external peer's chain is honest.",
+                ]}, 200
+
+    if not api_key:
+        return {"error": "invalid_api_key"}, 401
+
+    _setup(ctx)
+
+    if method == "GET":
+        if action == "history":
+            with ctx["lock"]:
+                rows = ctx["conn"].execute(
+                    "SELECT period,scope,digest,issued,entries,verified,"
+                    "mismatches,audit_hash,block_index FROM pack_issued "
+                    "WHERE api_key=? ORDER BY id DESC LIMIT 200",
+                    (api_key,)).fetchall()
+            return {"count": len(rows), "packs": [
+                {"period": r[0], "scope": r[1], "digest": r[2],
+                 "issued": _iso(r[3]), "entries": r[4],
+                 "hashes_verified": r[5], "mismatches": r[6],
+                 "sealed_in_chain": r[7], "block_index": r[8]}
+                for r in rows]}, 200
+
+        if action in ("preview", "render"):
+            got, err = _resolve(data, api_key)
+            if err:
+                return err
+            start, end, label, scope = got
+            p = _assemble(ctx, start, end, label, scope)
+            if action == "preview":
+                return p, 200
+            return {"period": label, "content_type": "text/html",
+                    "html": _html(p)}, 200
+
+    if method == "POST" and action == "issue":
+        got, err = _resolve(data, api_key)
+        if err:
+            return err
+        start, end, label, scope = got
+        p = _assemble(ctx, start, end, label, scope)
+        ig = p["integrity"]
+        ts = time.time()
+        ev = {"user_id": "pack:" + label, "action": "evidence_pack_issued",
+              "amount": 0, "country": "UK", "device_id": "pack",
+              "anomaly": 0, "device_risk": 0}
+        res = {"decision": "PACK_ISSUED", "score": 0, "pack_version": VERSION,
+               "timestamp": ts, "period": label, "scope": p["scope"],
+               "entries": p["entries_in_period"],
+               "blocks_recomputed": ig["blocks_recomputed"],
+               "hashes_verified": ig["hashes_verified"],
+               "clean": ig["clean"], "pack_digest": p["pack_digest"],
+               "note": "evidence pack issued; the pack's own digest is "
+                       "now sealed, so the document cannot be edited "
+                       "after the fact"}
+        h, idx, seq = ctx["seal"](ev, res, ts, api_key)
+        with ctx["lock"]:
+            ctx["conn"].execute(
+                "INSERT INTO pack_issued(api_key,period,scope,digest,"
+                "issued,entries,verified,mismatches,audit_hash,"
+                "block_index) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (api_key, label, p["scope"], p["pack_digest"], ts,
+                 p["entries_in_period"], ig["hashes_verified"],
+                 len(ig["hash_mismatches"]), h, idx))
+            ctx["conn"].commit()
+        p["sealed"] = {"audit_hash": h, "block_index": idx,
+                       "receipt_seq": seq}
+        return p, 200
+
+    return {"error": "unknown_action", "action": action,
+            "GET": ["spec", "preview", "render", "history"],
+            "POST": ["issue"]}, 404
+
+```
+
+
+## `modules/packconsole.py`
+
+426 lines, 16973 bytes
+
+```python
+"""
+modules/packconsole.py  -  the evidence pack page at /pack
+
+WHY IT EXISTS
+-------------
+/x/pack/preview, render, issue and history are all keyed. A browser address
+bar cannot send an Authorization header, so from a phone they are unreachable.
+This serves one page that can.
+
+It is deliberately NOT part of console.py. That file is large and editing it
+on a phone risks the whole thing. This adds a second page and touches nothing
+that already works.
+
+SAME PATCH AS console.py / network.py
+-------------------------------------
+The router hands whatever handle() returns to send_json, so a module cannot
+return HTML through it. This patches do_GET at runtime under its own
+attribute name, adds two paths, and passes everything else straight through
+to whatever was there before - including console.py's patch, whichever
+installs first.
+
+And the same catch: after every deploy one /x/ request must arrive before
+/pack exists. Opening /x/packconsole/status does it, and Railway's
+healthcheck on /x/console/status will arm this too once it is listed in
+console.py's SIBLINGS.
+
+THE KEY
+-------
+Typed in, held in a variable for that tab, never written to storage. Close
+the tab and it is gone.
+"""
+
+import sys
+from urllib.parse import urlparse
+
+VERSION = "1.0"
+
+PUBLIC = {("GET", "status")}
+
+PAGE_PATHS = ("/pack", "/pack.html", "/pack-console")
+
+_patched = [False]
+
+
+PAGE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Evidence pack - AILeash</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--ink:#0a0f1e;--panel:#131b2e;--panel2:#1a2338;
+ --edge:rgba(201,168,76,.22);--gold:#c9a84c;--gold-dim:#8a7233;
+ --text:#f2efe6;--mute:rgba(242,239,230,.42);--ok:#7fe3b0;--bad:#c8362b;
+ --mono:ui-monospace,'IBM Plex Mono',monospace}
+body{background:var(--ink);color:var(--text);font:16px/1.6 system-ui,
+ -apple-system,sans-serif;padding:0 0 60px}
+.wrap{max-width:640px;margin:0 auto;padding:0 18px}
+header{padding:32px 0 20px;border-bottom:1px solid var(--edge);
+ margin-bottom:24px}
+.eyebrow{font-family:var(--mono);font-size:10px;letter-spacing:.24em;
+ text-transform:uppercase;color:var(--gold);margin-bottom:10px}
+h1{font-size:34px;line-height:1;letter-spacing:-.02em;font-weight:800}
+h1 span{color:var(--gold)}
+.sub{color:var(--mute);font-size:14.5px;margin-top:12px;max-width:46ch}
+label{display:block;font-family:var(--mono);font-size:10px;
+ letter-spacing:.16em;text-transform:uppercase;color:var(--mute);
+ margin-bottom:7px}
+input{width:100%;background:var(--panel);border:1px solid var(--edge);
+ color:var(--text);font-family:var(--mono);font-size:13px;padding:12px 13px;
+ border-radius:4px;outline:none}
+input:focus{border-color:var(--gold)}
+.box{background:var(--panel2);border:1px solid var(--edge);border-radius:6px;
+ padding:16px;margin-bottom:16px}
+.note{font-size:12px;color:var(--mute);margin-top:9px;line-height:1.55}
+.field{margin-bottom:12px}
+.seg{display:flex;gap:8px}
+.seg button{flex:1}
+button{width:100%;background:var(--gold);color:var(--ink);border:none;
+ border-radius:4px;padding:13px;font-weight:700;font-size:14.5px;
+ cursor:pointer;font-family:inherit}
+button:hover:not(:disabled){background:#dbbd63}
+button:disabled{opacity:.45;cursor:default}
+button.quiet{background:transparent;color:var(--mute);
+ border:1px solid var(--edge)}
+button.quiet.on{color:var(--ink);background:var(--gold);border-color:var(--gold)}
+button.quiet:hover:not(:disabled):not(.on){color:var(--text);
+ border-color:var(--gold)}
+.row{display:flex;gap:8px;margin-top:10px}
+.row button{flex:1}
+#out{margin-top:24px}
+.verdict{border:1px solid var(--edge);border-radius:6px;background:var(--panel);
+ overflow:hidden;margin-bottom:14px}
+.v-head{padding:22px 18px;border-bottom:1px solid var(--edge)}
+.v-word{font-size:38px;line-height:1;letter-spacing:-.02em;font-weight:800}
+.v-ok{color:var(--ok)}.v-bad{color:var(--bad)}.v-mute{color:var(--mute)}
+.v-why{color:var(--mute);font-size:13.5px;margin-top:10px;line-height:1.6}
+.v-stats{display:flex;flex-wrap:wrap;gap:18px;padding:14px 18px;
+ border-bottom:1px solid var(--edge);font-family:var(--mono);font-size:11px}
+.v-stats b{display:block;font-size:19px;color:var(--text);font-weight:700;
+ margin-top:3px;font-family:inherit}
+.v-stats span{color:var(--mute);letter-spacing:.1em;text-transform:uppercase}
+.lin{padding:14px 18px;border-bottom:1px solid var(--edge)}
+.lin:last-child{border-bottom:none}
+.strip-l{font-family:var(--mono);font-size:10px;letter-spacing:.16em;
+ text-transform:uppercase;color:var(--gold);margin-bottom:10px}
+.kv{display:flex;justify-content:space-between;gap:14px;padding:6px 0;
+ border-bottom:1px solid rgba(201,168,76,.10);font-size:13.5px}
+.kv:last-child{border-bottom:none}
+.kv b{color:var(--gold);font-family:var(--mono);font-size:12.5px}
+pre{font-family:var(--mono);font-size:11.5px;line-height:1.65;
+ background:#080c16;color:var(--ok);padding:15px;border-radius:5px;
+ overflow-x:auto;border:1px solid var(--edge);max-height:320px}
+.msg{font-family:var(--mono);font-size:12.5px;padding:13px 15px;
+ border-radius:5px;border:1px solid var(--edge);color:var(--mute);
+ margin-bottom:14px}
+.msg.bad{color:#ffb4ad;border-color:rgba(200,54,43,.5);
+ background:rgba(200,54,43,.08)}
+.msg.good{color:var(--ok);border-color:rgba(127,227,176,.35);
+ background:rgba(26,158,110,.08)}
+.working:after{content:'';animation:dots 1.2s steps(4,end) infinite}
+@keyframes dots{0%{content:''}25%{content:'.'}50%{content:'..'}
+ 75%{content:'...'}}
+iframe{width:100%;height:70vh;border:1px solid var(--edge);border-radius:6px;
+ background:#0a0f1e;margin-top:12px}
+code{font-family:var(--mono);font-size:12px;color:#9fb3d9;
+ word-break:break-all}
+footer{margin-top:32px;padding-top:18px;border-top:1px solid var(--edge);
+ font-family:var(--mono);font-size:10.5px;color:var(--mute);line-height:1.8}
+a{color:var(--gold)}
+:focus-visible{outline:2px solid var(--gold);outline-offset:2px}
+@media(prefers-reduced-motion:reduce){*{animation:none!important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <p class="eyebrow">AILeash &middot; evidence pack</p>
+  <h1>The <span>document</span></h1>
+  <p class="sub">Re-verifies every block in a period against the hash sealed
+  at the time. Not a summary of the chain &mdash; a check of it.</p>
+</header>
+
+<div class="box">
+  <label for="key">API key</label>
+  <input id="key" type="password" placeholder="al_live_&hellip;"
+   autocomplete="off" spellcheck="false">
+  <p class="note">Held in memory for this tab only. Nothing is written to
+  the device.</p>
+</div>
+
+<div class="box">
+  <div class="field">
+    <label for="period">Period</label>
+    <input id="period" value="2026-Q2" autocomplete="off"
+     placeholder="2026-Q2, 2026-07 or 2026">
+  </div>
+  <label>Scope</label>
+  <div class="seg">
+    <button class="quiet on" id="sc-me" onclick="setScope('me')">My key</button>
+    <button class="quiet" id="sc-all" onclick="setScope('')">Whole deployment</button>
+  </div>
+  <p class="note">Receipt-sequence checking only applies to a single key.
+  A deployment-wide pack still re-verifies every hash.</p>
+  <div class="row">
+    <button onclick="go('preview')">Preview</button>
+    <button onclick="go('render')">View page</button>
+  </div>
+  <div class="row">
+    <button class="quiet" onclick="go('history')">Past packs</button>
+    <button class="quiet" onclick="go('issue')">Issue &amp; seal</button>
+  </div>
+  <p class="note">Issuing seals the pack's own digest into the chain, so the
+  document cannot be edited afterwards. It cannot be withdrawn.</p>
+</div>
+
+<div id="out"></div>
+
+<footer>
+  Spec: <a href="/x/pack/spec">/x/pack/spec</a> &middot;
+  Chain: <a href="/api/verify-chain">/api/verify-chain</a> &middot;
+  Console: <a href="/console">/console</a>
+</footer>
+
+</div>
+
+<script>
+(function(){
+  var out=document.getElementById('out'), busy=false, scope='me';
+
+  window.setScope=function(v){
+    scope=v;
+    document.getElementById('sc-me').classList.toggle('on',v==='me');
+    document.getElementById('sc-all').classList.toggle('on',v==='');
+  };
+
+  function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+  function msg(t,k){out.innerHTML='<div class="msg '+(k||'')+'">'+esc(t)+'</div>';}
+  function raw(o){return '<pre>'+esc(JSON.stringify(o,null,2))+'</pre>';}
+  function key(){var k=document.getElementById('key').value.trim();
+    if(!k){msg('Paste your API key at the top first.','bad');return null;}return k;}
+
+  async function call(path,method,body){
+    var k=key(); if(!k) return null;
+    var o={method:method,headers:{'Authorization':'Bearer '+k}};
+    if(body){o.headers['Content-Type']='application/json';
+      o.body=JSON.stringify(body);}
+    var r=await fetch(path,o), d;
+    try{d=await r.json();}catch(e){d={error:'unreadable_response'};}
+    return {status:r.status,data:d};
+  }
+
+  function qs(){
+    var p=encodeURIComponent(document.getElementById('period').value.trim());
+    return '?period='+p+(scope?'&scope='+scope:'');
+  }
+
+  function renderPack(d){
+    var ig=d.integrity||{}, sq=d.receipt_sequence||{};
+    var clean=!!ig.clean;
+    var h='<div class="verdict"><div class="v-head">'
+      +'<div class="v-word '+(clean?'v-ok':'v-bad')+'">'
+      +esc(ig.hashes_verified)+' of '+esc(ig.blocks_recomputed)
+      +'</div><div class="v-why">blocks re-verified &mdash; '
+      +esc(ig.method||'')+'</div></div>'
+      +'<div class="v-stats">'
+      +'<div><span>period</span><b>'+esc(d.period)+'</b></div>'
+      +'<div><span>entries</span><b>'+esc(d.entries_in_period)+'</b></div>'
+      +'<div><span>unbroken since</span><b style="font-size:14px">'
+      +esc(d.unbroken_since)+'</b></div>'
+      +'<div><span>devices</span><b>'
+      +esc((d.devices||{}).total_ever)+'</b></div></div>';
+
+    if(!clean){
+      h+='<div class="lin"><div class="strip-l">Problems found</div>'
+        +'<div class="kv"><span>mismatched blocks</span><b>'
+        +esc(JSON.stringify(ig.hash_mismatches||[]))+'</b></div>'
+        +'<div class="kv"><span>link breaks</span><b>'
+        +esc(JSON.stringify(ig.link_breaks||[]))+'</b></div>'
+        +'<div class="kv"><span>link into period</span><b>'
+        +esc(ig.link_into_period)+'</b></div></div>';
+    }
+
+    h+='<div class="lin"><div class="strip-l">Receipt sequence</div>';
+    if(sq.applicable){
+      h+='<div class="kv"><span>'+(sq.gapless?'Complete, no gaps'
+         :'GAPS FOUND')+'</span><b>'+esc(sq.received)+' of '
+         +esc(sq.expected)+'</b></div>';
+      if(!sq.gapless){h+='<div class="kv"><span>missing</span><b>'
+         +esc(JSON.stringify(sq.missing))+'</b></div>';}
+    } else {
+      h+='<div class="kv"><span>Not applicable to a deployment-wide pack'
+         +'</span><b>&mdash;</b></div>';
+    }
+    h+='</div>';
+
+    var vs=d.verdicts||{};
+    if(Object.keys(vs).length){
+      h+='<div class="lin"><div class="strip-l">Verdicts in period</div>';
+      Object.keys(vs).sort().forEach(function(k){
+        h+='<div class="kv"><span>'+esc(k)+'</span><b>'+esc(vs[k])
+          +'</b></div>';});
+      h+='</div>';
+    }
+
+    h+='<div class="lin"><div class="strip-l">Chain range</div>'
+      +'<div class="kv"><span>first</span><b>#'+esc(d.first_block)
+      +'</b></div><div class="kv"><span>last</span><b>#'+esc(d.last_block)
+      +'</b></div><div class="kv"><span>pack digest</span></div>'
+      +'<code>'+esc(d.pack_digest)+'</code></div>';
+
+    if(d.sealed){
+      h+='<div class="lin"><div class="strip-l">Sealed into the chain</div>'
+        +'<div class="kv"><span>block</span><b>'+esc(d.sealed.block_index)
+        +'</b></div><code>'+esc(d.sealed.audit_hash)+'</code></div>';
+    }
+    h+='</div>';
+    return h;
+  }
+
+  function renderHistory(d){
+    if(!d.count) return '<div class="msg">No packs issued yet.</div>';
+    var h='<div class="verdict"><div class="v-head">'
+      +'<div class="v-word v-ok">'+esc(d.count)+'</div>'
+      +'<div class="v-why">packs issued and sealed</div></div><div class="lin">';
+    (d.packs||[]).forEach(function(p){
+      h+='<div class="kv"><span>'+esc(p.period)+' &middot; '+esc(p.issued)
+        +'</span><b>'+esc(p.hashes_verified)+' verified'
+        +(p.mismatches?' / '+esc(p.mismatches)+' bad':'')+'</b></div>';});
+    h+='</div></div>';
+    return h;
+  }
+
+  window.go=async function(what){
+    if(busy) return;
+    var period=document.getElementById('period').value.trim();
+    if(what!=='history' && !period){
+      msg('Give a period: 2026-Q2, 2026-07 or 2026.','bad'); return; }
+    busy=true;
+    out.innerHTML='<div class="msg"><span class="working">Re-verifying every '
+      +'block in the period</span></div>';
+    try{
+      var res;
+      if(what==='preview') res=await call('/x/pack/preview'+qs(),'GET');
+      else if(what==='render') res=await call('/x/pack/render'+qs(),'GET');
+      else if(what==='history') res=await call('/x/pack/history','GET');
+      else res=await call('/x/pack/issue','POST',
+        {period:period,scope:scope||undefined});
+      if(!res){busy=false;return;}
+
+      if(res.status===401){
+        msg('That key was refused. Check it and try again.','bad');
+      } else if(res.status===404 && res.data
+                && res.data.error==='unknown_module'){
+        msg('The pack module is not deployed. Open /x/pack/spec first.','bad');
+      } else if(res.status>=400){
+        out.innerHTML='<div class="msg bad">'
+          +esc((res.data&&(res.data.message||res.data.error))
+               ||('HTTP '+res.status))+'</div>'+raw(res.data);
+      } else if(what==='render' && res.data.html){
+        var f=document.createElement('iframe');
+        f.setAttribute('sandbox','');
+        f.srcdoc=res.data.html;
+        out.innerHTML='<div class="msg good">The pack as one page. Long-press '
+          +'to save, or screenshot it.</div>';
+        out.appendChild(f);
+      } else if(what==='history'){
+        out.innerHTML=renderHistory(res.data)+raw(res.data);
+      } else if(res.data.integrity){
+        var pre = (what==='issue')
+          ? '<div class="msg good">Issued and sealed. This cannot be '
+            +'withdrawn.</div>' : '';
+        out.innerHTML=pre+renderPack(res.data)+raw(res.data);
+      } else {
+        out.innerHTML='<div class="msg good">Done.</div>'+raw(res.data);
+      }
+    }catch(e){
+      msg('Could not reach the server.','bad');
+    }
+    busy=false;
+  };
+})();
+</script>
+</body>
+</html>
+"""
+
+
+def _srv():
+    m = sys.modules.get("__main__")
+    if hasattr(m, "get_bearer"):
+        return m
+    return sys.modules.get("server")
+
+
+def _install(s):
+    if _patched[0]:
+        return "already installed"
+    H = getattr(s, "Handler", None)
+    if H is None or not hasattr(H, "do_GET"):
+        return "no handler"
+    if getattr(H, "_packconsole_patched", False):
+        _patched[0] = True
+        return "already installed"
+
+    original = H.do_GET
+
+    def do_GET(self):
+        try:
+            p = urlparse(self.path).path.rstrip("/") or "/"
+        except Exception:
+            p = self.path or "/"
+        if p in PAGE_PATHS:
+            body = PAGE.encode("utf-8")
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Robots-Tag", "noindex, nofollow")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception:
+                pass
+            return
+        return original(self)
+
+    H.do_GET = do_GET
+    H._packconsole_patched = True
+    _patched[0] = True
+    print("PACKCONSOLE: /pack page installed at runtime", flush=True)
+    return "installed"
+
+
+def handle(method, action, data, api_key, ctx):
+    s = _srv()
+    if s is None:
+        return {"error": "server_not_found"}, 500
+
+    state = "already installed" if _patched[0] else None
+    if not _patched[0]:
+        try:
+            state = _install(s)
+        except Exception as exc:
+            print("PACKCONSOLE: patch failed - " + str(exc), flush=True)
+            state = "failed: " + str(exc)
+
+    if method == "GET" and (action or "") in ("", "status"):
+        return {"page": "/pack",
+                "installed": bool(_patched[0]),
+                "install_result": state,
+                "version": VERSION,
+                "calls": ["/x/pack/preview", "/x/pack/render",
+                          "/x/pack/issue", "/x/pack/history"],
+                "note": ("The page holds no credentials. Every route it "
+                         "calls checks the key itself.")}, 200
+
+    return {"error": "unknown_action", "action": action,
+            "GET": ["status"]}, 404
 
 ```
