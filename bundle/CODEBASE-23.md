@@ -1,552 +1,12 @@
-# Codebase — part 23 of 24
+# Codebase — part 23 of 25
 
 Contains:
-- `tokensaver.html`
-- `verify.html`
+- `sonicboom.html`
 
 
-## `tokensaver.html`
+## `sonicboom.html`
 
-531 lines, 64194 bytes
-
-```html
-<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Token saver — sebbi.pro</title>
-<meta name="description" content="A file you run on your own machine that stops you paying for the same model call twice. 50p per machine per 30 days.">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+Condensed:wght@600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
-<style>
-:root{
-  --paper:#EEF1F0;
-  --paper-2:#E3E8E7;
-  --ink:#16232B;
-  --ink-soft:#5A6E77;
-  --rule:#CBD5D3;
-  --slate:#2E6B72;
-  --ochre:#B4700F;
-  --stop:#8C2F1E;
-  --sans:"IBM Plex Sans",system-ui,-apple-system,sans-serif;
-  --cond:"IBM Plex Sans Condensed","IBM Plex Sans",system-ui,sans-serif;
-  --mono:"IBM Plex Mono",ui-monospace,Menlo,Consolas,monospace;
-}
-*{box-sizing:border-box}
-html{-webkit-text-size-adjust:100%}
-body{
-  margin:0;background:var(--paper);color:var(--ink);
-  font:16px/1.6 var(--sans);
-  font-variant-numeric:tabular-nums;
-}
-.wrap{max-width:themax;margin:0 auto;padding:0 22px}
-.wrap{max-width:860px}
-a{color:var(--slate)}
-:focus-visible{outline:2px solid var(--ochre);outline-offset:3px}
-
-/* ---- masthead ---- */
-.top{border-bottom:1px solid var(--rule);padding:18px 0}
-.top .wrap{display:flex;align-items:baseline;justify-content:space-between;gap:16px}
-.brand{font:600 15px/1 var(--cond);letter-spacing:.14em;text-transform:uppercase}
-.brand span{color:var(--ochre)}
-.top nav{font-size:13.5px;color:var(--ink-soft)}
-.top nav a{margin-left:16px;text-decoration:none}
-.top nav a:hover{text-decoration:underline}
-
-/* ---- hero ---- */
-.hero{padding:56px 0 44px;border-bottom:1px solid var(--rule)}
-.eyebrow{
-  font:600 12px/1 var(--cond);letter-spacing:.2em;text-transform:uppercase;
-  color:var(--slate);margin-bottom:18px;
-}
-h1{
-  font:700 clamp(34px,7.2vw,60px)/1.02 var(--cond);
-  letter-spacing:-.015em;margin:0 0 18px;max-width:15ch;
-}
-.lede{font-size:18.5px;line-height:1.55;max-width:56ch;color:var(--ink);margin:0 0 30px}
-.lede b{font-weight:600}
-
-/* the one-line change: the signature of the whole product */
-.swap{
-  background:#fff;border:1px solid var(--rule);
-  font:500 14.5px/1.9 var(--mono);
-  padding:16px 18px;margin:0 0 26px;overflow-x:auto;
-}
-.swap div{white-space:pre}
-.swap .was{color:var(--ink-soft);text-decoration:line-through;
-  text-decoration-color:var(--stop);text-decoration-thickness:1px}
-.swap .now{color:var(--ink)}
-.swap .now b{color:var(--ochre);font-weight:600}
-.swap .tag{
-  font:600 10.5px/1 var(--cond);letter-spacing:.16em;text-transform:uppercase;
-  color:var(--ink-soft);display:inline-block;width:52px;
-}
-
-.buyrow{display:flex;flex-wrap:wrap;align-items:center;gap:16px}
-.dl{
-  display:inline-block;background:var(--ink);color:var(--paper);
-  font:600 15px/1 var(--sans);letter-spacing:.01em;
-  padding:15px 24px;border:1px solid var(--ink);border-radius:2px;
-  text-decoration:none;cursor:pointer;
-  transition:background .12s ease,color .12s ease;
-}
-.dl:hover{background:var(--ochre);border-color:var(--ochre);color:#fff}
-.price{font-size:14.5px;color:var(--ink-soft)}
-.price b{color:var(--ink);font-weight:600}
-
-/* ---- generic section ---- */
-section{padding:46px 0;border-bottom:1px solid var(--rule)}
-h2{
-  font:700 clamp(22px,3.6vw,30px)/1.15 var(--cond);
-  letter-spacing:-.01em;margin:0 0 8px;
-}
-.sub{color:var(--ink-soft);font-size:15px;margin:0 0 26px;max-width:60ch}
-
-/* ---- the four ways it saves ---- */
-.ways{border-top:1px solid var(--rule)}
-.way{
-  display:grid;grid-template-columns:auto 1fr;gap:0 20px;
-  padding:18px 0;border-bottom:1px solid var(--rule);align-items:start;
-}
-.way .mark{
-  font:600 11px/1.6 var(--cond);letter-spacing:.16em;text-transform:uppercase;
-  color:#fff;background:var(--slate);padding:2px 8px;border-radius:2px;
-  white-space:nowrap;margin-top:3px;
-}
-.way .mark.stop{background:var(--stop)}
-.way .mark.free{background:var(--ochre)}
-.way h3{font:600 17px/1.4 var(--sans);margin:0 0 4px}
-.way p{margin:0;font-size:15px;color:var(--ink-soft)}
-
-/* ---- signature: the live digest ---- */
-.digest{background:var(--paper-2)}
-.calc{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:6px}
-@media (max-width:720px){.calc{grid-template-columns:1fr}}
-.pane{background:#fff;border:1px solid var(--rule);display:flex;flex-direction:column}
-.pane .hd{
-  font:600 11px/1 var(--cond);letter-spacing:.16em;text-transform:uppercase;
-  padding:11px 14px;border-bottom:1px solid var(--rule);color:var(--ink-soft);
-  display:flex;justify-content:space-between;align-items:center;gap:10px;
-}
-.pane .hd .stays{color:var(--stop)}
-.pane .hd .goes{color:var(--slate)}
-textarea{
-  border:0;resize:vertical;width:100%;min-height:210px;padding:14px;
-  font:400 13px/1.65 var(--mono);color:var(--ink);background:#fff;
-}
-textarea:focus{outline:none;box-shadow:inset 0 0 0 2px var(--ochre)}
-.out{padding:14px;font:400 13px/1.75 var(--mono);min-height:210px;
-  overflow-x:auto;white-space:pre-wrap;word-break:break-all}
-.out .k{color:var(--ink-soft)}
-.out .v{color:var(--ink)}
-.out .fp{color:var(--ochre);font-weight:500}
-.out .err{color:var(--stop)}
-.calcnote{margin-top:16px;font-size:14px;color:var(--ink-soft);max-width:62ch}
-.calcnote b{color:var(--ink);font-weight:600}
-
-/* ---- run it ---- */
-pre.cmd{
-  background:#fff;border:1px solid var(--rule);padding:14px 16px;margin:0 0 12px;
-  font:500 13.5px/1.75 var(--mono);overflow-x:auto;
-}
-pre.cmd .c{color:var(--ink-soft)}
-.steps{counter-reset:s;margin:0;padding:0;list-style:none}
-.steps li{margin:0 0 22px}
-.steps li h3{
-  font:600 15px/1.4 var(--sans);margin:0 0 8px;
-  display:flex;align-items:baseline;gap:10px;
-}
-.steps li h3::before{
-  counter-increment:s;content:counter(s);
-  font:600 11px/1 var(--cond);letter-spacing:.1em;
-  color:#fff;background:var(--ink);padding:4px 7px;border-radius:2px;
-}
-
-/* ---- limits ---- */
-.limits{margin:0;padding:0;list-style:none;border-top:1px solid var(--rule)}
-.limits li{
-  padding:14px 0 14px 26px;border-bottom:1px solid var(--rule);
-  font-size:15px;position:relative;color:var(--ink);
-}
-.limits li::before{
-  content:"—";position:absolute;left:0;top:14px;color:var(--stop);
-  font-family:var(--mono);
-}
-
-/* ---- get a key ---- */
-.key{background:var(--ink);color:var(--paper)}
-.key h2{color:var(--paper)}
-.key .sub{color:#9FB2B8}
-.form{display:flex;flex-wrap:wrap;gap:10px;margin-top:20px;max-width:560px}
-.form input{
-  flex:1 1 240px;min-width:0;background:#22323B;border:1px solid #3B4E58;
-  color:var(--paper);padding:14px 14px;border-radius:2px;
-  font:400 15px/1 var(--sans);
-}
-.form input::placeholder{color:#7C929B}
-.form input:focus{outline:none;border-color:var(--ochre)}
-.form button{
-  flex:0 0 auto;background:var(--ochre);color:#fff;border:1px solid var(--ochre);
-  padding:14px 22px;border-radius:2px;cursor:pointer;
-  font:600 15px/1 var(--sans);
-}
-.form button:hover{background:#96600C;border-color:#96600C}
-.form button[disabled]{opacity:.55;cursor:default}
-.keymsg{margin-top:16px;font:400 14.5px/1.7 var(--sans);color:#9FB2B8;max-width:60ch}
-.keymsg .yes{color:#E2B15E}
-.keymsg .no{color:#E8907C}
-.keymsg code{font:500 13.5px var(--mono);color:var(--paper);
-  background:#22323B;padding:2px 6px;border-radius:2px;word-break:break-all}
-.terms{margin-top:18px;font-size:13.5px;color:#7C929B;max-width:62ch}
-
-.foot{padding:34px 0 60px;font-size:14px;color:var(--ink-soft)}
-.foot a{text-decoration:none}
-.foot a:hover{text-decoration:underline}
-.saved{
-  margin-top:14px;font:500 13.5px/1.6 var(--mono);color:var(--ochre);
-  min-height:22px;
-}
-@media (prefers-reduced-motion:reduce){*{transition:none!important}}
-</style>
-</head>
-<body>
-
-<header class="top">
-  <div class="wrap">
-    <div class="brand">sebbi<span>.pro</span></div>
-    <nav>
-      <a href="/x/tokensaver/spec">Read the spec</a>
-      <a href="#run">How to run it</a>
-      <a href="#key">Get a key</a>
-    </nav>
-  </div>
-</header>
-
-<div class="hero">
-  <div class="wrap">
-    <div class="eyebrow">Token saver</div>
-    <h1>Stop paying for the same answer twice.</h1>
-    <p class="lede">A single file you run on your own machine. It sits between your
-    application and your model provider, and it never lets you buy an answer you
-    have already bought. <b>Your integration is one line.</b></p>
-
-    <div class="swap">
-      <div><span class="tag">was</span><span class="was">base_url = "https://api.anthropic.com"</span></div>
-      <div><span class="tag">now</span><span class="now">base_url = "<b>http://127.0.0.1:8788</b>"</span></div>
-    </div>
-
-    <div class="buyrow">
-      <a class="dl" id="dl" href="#" download="sebbi_tokensaver.py">Download sebbi_tokensaver.py</a>
-      <div class="price"><b>Free for 90 days</b>, then 50p per machine per month.
-      Runs with no account at all if you just want the saving.</div>
-    </div>
-    <div class="saved" id="saved"></div>
-  </div>
-</div>
-
-<section>
-  <div class="wrap">
-    <h2>Four ways it takes money off your bill</h2>
-    <p class="sub">None of these involve calling another model. Governance that
-    costs tokens to run is the thing this replaces.</p>
-    <div class="ways">
-      <div class="way">
-        <div class="mark free">Free</div>
-        <div>
-          <h3>An identical request is answered from your own machine</h3>
-          <p>Same model, same messages, same settings — it never reaches your
-          provider. The answer is stored on your disk, not ours, and comes back
-          byte for byte.</p>
-        </div>
-      </div>
-      <div class="way">
-        <div class="mark stop">Stopped</div>
-        <div>
-          <h3>A runaway agent is caught in microseconds</h3>
-          <p>The same call going round eight times in two minutes is a loop, not
-          a workload. It gets refused locally before the money goes. Four times
-          if you have told it no human is watching.</p>
-        </div>
-      </div>
-      <div class="way">
-        <div class="mark stop">Stopped</div>
-        <div>
-          <h3>A spend ceiling that actually holds</h3>
-          <p>Set a token ceiling. When it is reached, requests are refused before
-          they reach the model. A single call that could cost more than the
-          budget left is held before it spends, not reported after.</p>
-        </div>
-      </div>
-      <div class="way">
-        <div class="mark">Named</div>
-        <div>
-          <h3>It tells you what is wasteful in each request</h3>
-          <p>Thirty turns re-sent on every call. Twelve tool definitions nothing
-          has ever used. Temperature above zero on a request that did not need to
-          vary, which is the only reason its answer cannot be reused. This is the
-          part that changes what you send tomorrow.</p>
-        </div>
-      </div>
-    </div>
-  </div>
-</section>
-
-<section class="digest">
-  <div class="wrap">
-    <h2>What leaves your building</h2>
-    <p class="sub">Paste a real request on the left. The right side is computed in
-    your browser, right now, and is exactly what the file would send us. Nothing
-    is uploaded by this page.</p>
-    <div class="calc">
-      <div class="pane">
-        <div class="hd"><span>Your request</span><span class="stays">stays on your machine</span></div>
-        <textarea id="in" spellcheck="false" aria-label="Your request"></textarea>
-      </div>
-      <div class="pane">
-        <div class="hd"><span>The digest</span><span class="goes">all we ever see</span></div>
-        <div class="out" id="out" aria-live="polite"></div>
-      </div>
-    </div>
-    <p class="calcnote">A SHA-256 fingerprint and five counts. There is no way to
-    read a prompt back out of a hash — change one character on the left and watch
-    the whole fingerprint change, with nothing about the change visible in it.
-    <b>Run it with <code>--offline</code> and even the digest stays home.</b></p>
-  </div>
-</section>
-
-<section id="run">
-  <div class="wrap">
-    <h2>Running it</h2>
-    <p class="sub">Python 3.8 or newer. No dependencies to install — it uses only
-    what ships with Python.</p>
-    <ol class="steps">
-      <li>
-        <h3>Start it</h3>
-<pre class="cmd">python3 sebbi_tokensaver.py --key YOUR_KEY --provider anthropic</pre>
-        <p class="sub" style="margin:0">No key yet? Use <code>--offline</code>.
-        It saves you exactly the same money; you just do not get receipts.</p>
-      </li>
-      <li>
-        <h3>Change the one line</h3>
-<pre class="cmd">base_url = "http://127.0.0.1:8788"   <span class="c"># that is the whole integration</span></pre>
-      </li>
-      <li>
-        <h3>Watch it work</h3>
-<pre class="cmd">http://127.0.0.1:8788/saver</pre>
-        <p class="sub" style="margin:0">One number: tokens you did not buy, taken
-        from your provider's own reported counts. Never an estimate, never a
-        percentage.</p>
-      </li>
-    </ol>
-  </div>
-</section>
-
-<section class="key" id="key">
-  <div class="wrap">
-    <h2>Getting a key</h2>
-    <p class="sub">The file is free and always will be. A key is what turns your
-    saving into a receipt: every decision sealed into a chain, a ledger you can
-    hand to your finance team, and spend ceilings that hold across every machine
-    you run.</p>
-    <div class="form">
-      <input id="email" type="email" inputmode="email" autocomplete="email"
-             placeholder="you@yourcompany.com" aria-label="Your email">
-      <input id="org" type="text" autocomplete="organization"
-             placeholder="Company (optional)" aria-label="Your company">
-      <button id="getkey" type="button">Get a key</button>
-    </div>
-    <div class="keymsg" id="keymsg" aria-live="polite"></div>
-    <p class="terms">Free for 90 days — the full thing, no card. After that it is
-    50p per machine per month, billed through Stripe, counted on the machines
-    that actually used your key rather than a number you typed. Stop whenever you
-    like; the file carries on saving you money without us.</p>
-  </div>
-</section>
-
-<section>
-  <div class="wrap">
-    <h2>What it does not do</h2>
-    <p class="sub">Published here rather than discovered later.</p>
-    <ul class="limits">
-      <li>Matching is exact. A reworded prompt is a different prompt and goes to
-      your provider. Catching similar prompts needs an embedding, an embedding is
-      a model call, and a model call is the cost we are here to remove.</li>
-      <li>It does not judge whether a stored answer is still correct. It proves
-      what was asked and what came back.</li>
-      <li>Answers to requests with temperature above zero are not stored, because
-      serving one back would change how your system behaves. You can override
-      that deliberately.</li>
-      <li>A refused request has a worst case cost, not a known cost. It is
-      reported apart from your real savings and never added to them.</li>
-      <li>If our platform is unreachable your traffic keeps flowing. It fails
-      open, always. A cost tool that can take your production down is not worth
-      any saving.</li>
-    </ul>
-  </div>
-</section>
-
-<footer class="foot">
-  <div class="wrap">
-    Every weight, threshold and rule this file uses is published at
-    <a href="/x/tokensaver/spec">/x/tokensaver/spec</a> — no account needed to
-    read it. <br>sebbi.pro
-  </div>
-</footer>
-
-<script>
-const CLIENT_B64 = "IyEvdXNyL2Jpbi9lbnYgcHl0aG9uMwoiIiIKc2ViYmlfdG9rZW5zYXZlci5weSAgdjEuMC4wCnNlYmJpLnBybyAtIHRoZSB0b2tlbiBzYXZlciwgY3VzdG9tZXIgc2lkZQoKV0hBVCBZT1UgQ0hBTkdFCi0tLS0tLS0tLS0tLS0tLQpPbmUgbGluZS4gVGhlIGFkZHJlc3MgeW91ciBjb2RlIGFscmVhZHkgc2VuZHMgbW9kZWwgcmVxdWVzdHMgdG8uCgogICAgYmVmb3JlOiAgYmFzZV91cmwgPSAiaHR0cHM6Ly9hcGkuYW50aHJvcGljLmNvbSIKICAgIGFmdGVyOiAgIGJhc2VfdXJsID0gImh0dHA6Ly8xMjcuMC4wLjE6ODc4OCIKClRoYXQgaXMgdGhlIHdob2xlIGludGVncmF0aW9uLiBOb3RoaW5nIGVsc2UgaW4geW91ciBhcHBsaWNhdGlvbgpjaGFuZ2VzLiBTYW1lIHJlcXVlc3QgZm9ybWF0LCBzYW1lIHJlc3BvbnNlIGZvcm1hdCwgc2FtZSBldmVyeXRoaW5nLgoKUlVOIElUCi0tLS0tLQogICAgcHl0aG9uMyBzZWJiaV90b2tlbnNhdmVyLnB5IC0ta2V5IFlPVVJfU0VCQklfS0VZCgpGaXJzdCBydW4gd3JpdGVzIHNlYmJpX3Rva2Vuc2F2ZXIuanNvbiBuZXh0IHRvIGl0c2VsZiBhbmQgdGVsbHMgeW91CmV4YWN0bHkgd2hhdCB0byBwYXN0ZS4gQWZ0ZXIgdGhhdCwganVzdDoKCiAgICBweXRob24zIHNlYmJpX3Rva2Vuc2F2ZXIucHkKCkNoZWNrIGl0IGlzIHdvcmtpbmc6CiAgICBodHRwOi8vMTI3LjAuMC4xOjg3ODgvc2F2ZXIgICAgICAgICAgYSBwbGFpbiBwYWdlLCB3aGF0IGl0IGhhcyBzYXZlZAogICAgaHR0cDovLzEyNy4wLjAuMTo4Nzg4L3NhdmVyL3N0YXRzICAgIHRoZSBzYW1lIGFzIEpTT04KCldIQVQgTEVBVkVTIFlPVVIgQlVJTERJTkcKLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQpZb3VyIHByb21wdHMgYW5kIHlvdXIgYW5zd2VycyBkbyBub3QuIFRoZXkgYXJlIHN0b3JlZCBpbiBhIFNRTGl0ZSBmaWxlCm9uIHRoaXMgbWFjaGluZSBhbmQgbm93aGVyZSBlbHNlLgoKV2hhdCBnb2VzIHRvIHNlYmJpLnBybyBpcyBhIGRpZ2VzdDogYSBTSEEtMjU2IGZpbmdlcnByaW50LCBhbmQgY291bnRzLgpIb3cgbWFueSBjaGFyYWN0ZXJzLCBob3cgbWFueSB0dXJucywgaG93IG1hbnkgdG9vbHMsIHdoYXQgb3V0cHV0CmNlaWxpbmcgeW91IHNldCwgYW5kIHdoZXRoZXIgdGhlIHJlcXVlc3Qgd2FzIGRldGVybWluaXN0aWMuIFRoZXJlIGlzIG5vCndheSB0byByZWFkIGEgcHJvbXB0IGJhY2sgb3V0IG9mIGEgU0hBLTI1NiBoYXNoLgoKWW91IGNhbiBzZWUgZXZlcnkgYnl0ZSBvZiBpdCBiZWZvcmUgaXQgZ29lczoKICAgIC0tc2hvdy1kaWdlc3QgICAgICAgcHJpbnQgZWFjaCBkaWdlc3QgYXMgaXQgaXMgc2VudAogICAgLS1vZmZsaW5lICAgICAgICAgICBuZXZlciBjb250YWN0IHNlYmJpLnBybyBhdCBhbGwKCldIQVQgSEFQUEVOUyBJRiBTRUJCSS5QUk8gSVMgRE9XTgotLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KWW91ciB0cmFmZmljIGtlZXBzIGZsb3dpbmcuIFRoaXMgaXMgdGhlIG1vc3QgaW1wb3J0YW50IGxpbmUgaW4gdGhpcwpmaWxlLiBJZiBzZWJiaS5wcm8gY2Fubm90IGJlIHJlYWNoZWQsIHRoZSBsb2NhbCBjYWNoZSBzdGlsbCBzZXJ2ZXMKcmVwZWF0cywgbG9jYWwgaGFyZCBydWxlcyBzdGlsbCBzdG9wIHJ1bmF3YXlzLCBhbmQgZXZlcnl0aGluZyBlbHNlIGdvZXMKc3RyYWlnaHQgdG8geW91ciBwcm92aWRlciBhcyBub3JtYWwuIEl0IGZhaWxzIG9wZW4sIGFsd2F5cy4gQSBjb3N0IHRvb2wKdGhhdCBjYW4gdGFrZSB5b3VyIHByb2R1Y3Rpb24gZG93biBpcyBub3Qgd29ydGggYW55IHNhdmluZy4KClJlcXVlc3RzIHRoYXQgd2VyZSBnYXRlZCB3aGlsZSBzZWJiaS5wcm8gd2FzIHVucmVhY2hhYmxlIGFyZSBxdWV1ZWQgYW5kCnNlbnQgd2hlbiBpdCBjb21lcyBiYWNrLCBzbyB0aGUgcmVjb3JkIGNhdGNoZXMgdXAuCgpIT1cgSVQgU0FWRVMgWU9VIE1PTkVZCi0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KMS4gQW4gaWRlbnRpY2FsIHJlcXVlc3QgaXMgYW5zd2VyZWQgZnJvbSB0aGUgbG9jYWwgc3RvcmUuIE5vdGhpbmcgaXMKICAgYm91Z2h0IGFuZCB0aGVyZSBpcyBubyByb3VuZCB0cmlwIHRvIGFueXdoZXJlLgoyLiBBIHJ1bmF3YXkgbG9vcCBpcyBzdG9wcGVkIGxvY2FsbHkgaW4gbWljcm9zZWNvbmRzLCBiZWZvcmUgdGhlIG1vbmV5CiAgIGdvZXMuIFRoaXMgaXMgdGhlIG9uZSB0aGF0IHBheXMgZm9yIGl0c2VsZiBvdmVybmlnaHQuCjMuIEEgc3BlbmQgY2VpbGluZyB0aGF0IGlzIGFjdHVhbGx5IGVuZm9yY2VkLgo0LiBJdCB0ZWxscyB5b3UsIHBlciByZXF1ZXN0LCB3aGF0IGluIHRoYXQgcmVxdWVzdCBpcyBjb3N0aW5nIG1vbmV5IGl0CiAgIGRvZXMgbm90IG5lZWQgdG8gY29zdDogdHVybnMgeW91IGFyZSByZS1zZW5kaW5nLCB0b29sIGRlZmluaXRpb25zCiAgIG5vdGhpbmcgY2FsbHMsIHRlbXBlcmF0dXJlIHNldCBhYm92ZSB6ZXJvIGZvciBubyByZWFzb24uCgpTdGFuZGFyZCBsaWJyYXJ5IG9ubHkuIE5vIGRlcGVuZGVuY2llcy4gUHl0aG9uIDMuOCBvciBuZXdlci4KIiIiCgppbXBvcnQgYXJncGFyc2UKaW1wb3J0IGhhc2hsaWIKaW1wb3J0IGpzb24KaW1wb3J0IG1hdGgKaW1wb3J0IG9zCmltcG9ydCBxdWV1ZQppbXBvcnQgc3FsaXRlMwppbXBvcnQgc3lzCmltcG9ydCB0aHJlYWRpbmcKaW1wb3J0IHRpbWUKaW1wb3J0IHVybGxpYi5lcnJvcgppbXBvcnQgdXJsbGliLnJlcXVlc3QKZnJvbSBodHRwLnNlcnZlciBpbXBvcnQgQmFzZUhUVFBSZXF1ZXN0SGFuZGxlciwgVGhyZWFkaW5nSFRUUFNlcnZlcgoKVkVSU0lPTiA9ICIxLjAuMCIKREVGQVVMVF9QT1JUID0gODc4OApDT05GSUdfTkFNRSA9ICJzZWJiaV90b2tlbnNhdmVyLmpzb24iCkRCX05BTUUgPSAic2ViYmlfdG9rZW5zYXZlci5kYiIKU0VCQklfREVGQVVMVCA9ICJodHRwczovL3NlYmJpLnBybyIKClBST1ZJREVSUyA9IHsKICAgICJhbnRocm9waWMiOiAiaHR0cHM6Ly9hcGkuYW50aHJvcGljLmNvbSIsCiAgICAib3BlbmFpIjogImh0dHBzOi8vYXBpLm9wZW5haS5jb20iLAogICAgImF6dXJlIjogTm9uZSwKICAgICJsb2NhbCI6ICJodHRwOi8vMTI3LjAuMC4xOjExNDM0IiwKfQoKS0VZRURfRklFTERTID0gKAogICAgIm1vZGVsIiwgIm1lc3NhZ2VzIiwgInN5c3RlbSIsICJwcm9tcHQiLCAiaW5wdXQiLAogICAgInRlbXBlcmF0dXJlIiwgInRvcF9wIiwgInRvcF9rIiwKICAgICJtYXhfdG9rZW5zIiwgIm1heF9jb21wbGV0aW9uX3Rva2VucyIsCiAgICAic3RvcCIsICJzdG9wX3NlcXVlbmNlcyIsCiAgICAidG9vbHMiLCAidG9vbF9jaG9pY2UiLCAicmVzcG9uc2VfZm9ybWF0IiwgInNlZWQiLAopCgpGT1JXQVJEX0hFQURFUlMgPSAoImF1dGhvcml6YXRpb24iLCAieC1hcGkta2V5IiwgImFudGhyb3BpYy12ZXJzaW9uIiwKICAgICAgICAgICAgICAgICAgICJhbnRocm9waWMtYmV0YSIsICJvcGVuYWktb3JnYW5pemF0aW9uIiwgIm9wZW5haS1iZXRhIiwKICAgICAgICAgICAgICAgICAgICJjb250ZW50LXR5cGUiLCAiYWNjZXB0IikKCiMgTG9jYWwgaGFyZCBydWxlcy4gSWRlbnRpY2FsIHRvIHRoZSBvbmVzIG9uIHRoZSBwbGF0Zm9ybSwgc28gdGhlCiMgYmVoYXZpb3VyIGRvZXMgbm90IGNoYW5nZSB3aGVuIHRoZSBuZXR3b3JrIGRvZXMuCkxPT1BfV0lORE9XID0gMTIwCkxPT1BfSEFSRCA9IDgKTE9PUF9IQVJEX1VOQVRURU5ERUQgPSA0CkJVUlNUX0hBUkQgPSAxMjAKCkRFRkFVTFRfVFRMID0gMzAgKiAyNCAqIDM2MDAKTUFYX0JPRFkgPSA4ICogMTAyNCAqIDEwMjQKQ0hBUlNfUEVSX1RPS0VOID0gNC4wCkNUWF9GTEFHX1RVUk5TID0gMTIKQ1RYX0tFRVBfVFVSTlMgPSA4CgoKIyAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0gdXRpbAoKZGVmIGNhbm9uaWNhbChvKToKICAgIHJldHVybiBqc29uLmR1bXBzKG8sIHNvcnRfa2V5cz1UcnVlLCBzZXBhcmF0b3JzPSgiLCIsICI6IiksCiAgICAgICAgICAgICAgICAgICAgICBlbnN1cmVfYXNjaWk9VHJ1ZSkuZW5jb2RlKCJ1dGYtOCIpCgoKZGVmIHNoYShkKToKICAgIGlmIGlzaW5zdGFuY2UoZCwgc3RyKToKICAgICAgICBkID0gZC5lbmNvZGUoInV0Zi04IikKICAgIHJldHVybiBoYXNobGliLnNoYTI1NihkKS5oZXhkaWdlc3QoKQoKCmRlZiBmaW5nZXJwcmludChyZXEpOgogICAga2V5ZWQgPSB7azogcmVxW2tdIGZvciBrIGluIEtFWUVEX0ZJRUxEUyBpZiBrIGluIHJlcX0KICAgIHJldHVybiBzaGEoYiJTRUJCSS1UT0tFTlNBVkVSLXYyXG4iICsgY2Fub25pY2FsKGtleWVkKSkKCgpkZWYgY29udGVudF9jaGFycyh2KToKICAgIGlmIHYgaXMgTm9uZToKICAgICAgICByZXR1cm4gMAogICAgaWYgaXNpbnN0YW5jZSh2LCBzdHIpOgogICAgICAgIHJldHVybiBsZW4odikKICAgIHJldHVybiBsZW4oY2Fub25pY2FsKHYpKQoKCmRlZiBwcm9tcHRfY2hhcnMocmVxKToKICAgIHQgPSAwCiAgICBmb3IgayBpbiAoInByb21wdCIsICJpbnB1dCIsICJzeXN0ZW0iKToKICAgICAgICB0ICs9IGNvbnRlbnRfY2hhcnMocmVxLmdldChrKSkKICAgIG1zZ3MgPSByZXEuZ2V0KCJtZXNzYWdlcyIpCiAgICBpZiBpc2luc3RhbmNlKG1zZ3MsIGxpc3QpOgogICAgICAgIGZvciBtIGluIG1zZ3M6CiAgICAgICAgICAgIHQgKz0gY29udGVudF9jaGFycyhtLmdldCgiY29udGVudCIpIGlmIGlzaW5zdGFuY2UobSwgZGljdCkgZWxzZSBtKQogICAgaWYgcmVxLmdldCgidG9vbHMiKSBpcyBub3QgTm9uZToKICAgICAgICB0ICs9IGNvbnRlbnRfY2hhcnMocmVxLmdldCgidG9vbHMiKSkKICAgIHJldHVybiB0CgoKZGVmIGFza19jZWlsaW5nKHJlcSk6CiAgICB2ID0gcmVxLmdldCgibWF4X3Rva2VucyIpCiAgICBpZiB2IGlzIE5vbmU6CiAgICAgICAgdiA9IHJlcS5nZXQoIm1heF9jb21wbGV0aW9uX3Rva2VucyIpCiAgICB0cnk6CiAgICAgICAgcmV0dXJuIGludCh2KSBpZiB2IGlzIG5vdCBOb25lIGVsc2UgMAogICAgZXhjZXB0IChUeXBlRXJyb3IsIFZhbHVlRXJyb3IpOgogICAgICAgIHJldHVybiAwCgoKZGVmIGRldGVybWluaXN0aWMocmVxKToKICAgIHQgPSByZXEuZ2V0KCJ0ZW1wZXJhdHVyZSIpCiAgICBpZiB0IGlzIE5vbmU6CiAgICAgICAgcmV0dXJuIFRydWUKICAgIHRyeToKICAgICAgICByZXR1cm4gZmxvYXQodCkgPT0gMC4wCiAgICBleGNlcHQgKFR5cGVFcnJvciwgVmFsdWVFcnJvcik6CiAgICAgICAgcmV0dXJuIEZhbHNlCgoKZGVmIHVzYWdlX29mKHJlc3ApOgogICAgaWYgbm90IGlzaW5zdGFuY2UocmVzcCwgZGljdCk6CiAgICAgICAgcmV0dXJuIChOb25lLCBOb25lKQogICAgdSA9IHJlc3AuZ2V0KCJ1c2FnZSIpCiAgICBpZiBub3QgaXNpbnN0YW5jZSh1LCBkaWN0KToKICAgICAgICByZXR1cm4gKE5vbmUsIE5vbmUpCiAgICBpID0gdS5nZXQoImlucHV0X3Rva2VucyIsIHUuZ2V0KCJwcm9tcHRfdG9rZW5zIikpCiAgICBvID0gdS5nZXQoIm91dHB1dF90b2tlbnMiLCB1LmdldCgiY29tcGxldGlvbl90b2tlbnMiKSkKICAgIHRyeToKICAgICAgICByZXR1cm4gKGludChpKSBpZiBpIGlzIG5vdCBOb25lIGVsc2UgTm9uZSwKICAgICAgICAgICAgICAgIGludChvKSBpZiBvIGlzIG5vdCBOb25lIGVsc2UgTm9uZSkKICAgIGV4Y2VwdCAoVHlwZUVycm9yLCBWYWx1ZUVycm9yKToKICAgICAgICByZXR1cm4gKE5vbmUsIE5vbmUpCgoKZGVmIGRpZ2VzdF9vZihyZXEpOgogICAgIiIiRXhhY3RseSB3aGF0IGlzIHNlbnQgdG8gc2ViYmkucHJvLiBOb3RoaW5nIGVsc2UsIGV2ZXIuIiIiCiAgICByZXR1cm4gewogICAgICAgICJmaW5nZXJwcmludCI6IGZpbmdlcnByaW50KHJlcSksCiAgICAgICAgIm1vZGVsIjogcmVxLmdldCgibW9kZWwiKSwKICAgICAgICAicHJvbXB0X2NoYXJhY3RlcnMiOiBwcm9tcHRfY2hhcnMocmVxKSwKICAgICAgICAibWF4X3Rva2VucyI6IGFza19jZWlsaW5nKHJlcSksCiAgICAgICAgImNvbnZlcnNhdGlvbl90dXJucyI6IGxlbihyZXEuZ2V0KCJtZXNzYWdlcyIpIG9yIFtdKSwKICAgICAgICAidG9vbF9kZWZpbml0aW9ucyI6IGxlbihyZXEuZ2V0KCJ0b29scyIpIG9yIFtdKSwKICAgICAgICAiZGV0ZXJtaW5pc3RpYyI6IGRldGVybWluaXN0aWMocmVxKSwKICAgIH0KCgpkZWYgZXN0X3Rva2VucyhjaGFycyk6CiAgICByZXR1cm4gaW50KGNoYXJzIC8gQ0hBUlNfUEVSX1RPS0VOKQoKCiMgLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0gc3RvcmUKClNDSEVNQSA9ICIiIgpDUkVBVEUgVEFCTEUgSUYgTk9UIEVYSVNUUyBhbnN3ZXJzICgKICAgIGZwICAgICAgICBURVhUIFBSSU1BUlkgS0VZLAogICAgbW9kZWwgICAgIFRFWFQsCiAgICBib2R5ICAgICAgQkxPQiBOT1QgTlVMTCwKICAgIHRva19pbiAgICBJTlRFR0VSLAogICAgdG9rX291dCAgIElOVEVHRVIsCiAgICBzdG9yZWRfYXQgUkVBTCBOT1QgTlVMTCwKICAgIGV4cGlyZXMgICBSRUFMLAogICAgaGl0cyAgICAgIElOVEVHRVIgTk9UIE5VTEwgREVGQVVMVCAwCik7CkNSRUFURSBUQUJMRSBJRiBOT1QgRVhJU1RTIHNlZW4gKAogICAgZnAgVEVYVCBOT1QgTlVMTCwKICAgIHRzIFJFQUwgTk9UIE5VTEwKKTsKQ1JFQVRFIFRBQkxFIElGIE5PVCBFWElTVFMgdG90YWxzICgKICAgIGsgVEVYVCBQUklNQVJZIEtFWSwKICAgIHYgUkVBTCBOT1QgTlVMTCBERUZBVUxUIDAKKTsKQ1JFQVRFIFRBQkxFIElGIE5PVCBFWElTVFMgb3V0Ym94ICgKICAgIGlkICAgICAgSU5URUdFUiBQUklNQVJZIEtFWSBBVVRPSU5DUkVNRU5ULAogICAgYWN0aW9uICBURVhUIE5PVCBOVUxMLAogICAgcGF5bG9hZCBURVhUIE5PVCBOVUxMLAogICAgdHMgICAgICBSRUFMIE5PVCBOVUxMCik7CkNSRUFURSBJTkRFWCBJRiBOT1QgRVhJU1RTIHNlZW5fdHMgT04gc2Vlbih0cyk7CkNSRUFURSBJTkRFWCBJRiBOT1QgRVhJU1RTIHNlZW5fZnAgT04gc2VlbihmcCwgdHMpOwpDUkVBVEUgSU5ERVggSUYgTk9UIEVYSVNUUyBhbnNfZXhwIE9OIGFuc3dlcnMoZXhwaXJlcyk7CiIiIgoKCmNsYXNzIFN0b3JlOgogICAgZGVmIF9faW5pdF9fKHNlbGYsIHBhdGgpOgogICAgICAgIHNlbGYubG9jayA9IHRocmVhZGluZy5STG9jaygpCiAgICAgICAgc2VsZi5jID0gc3FsaXRlMy5jb25uZWN0KHBhdGgsIGNoZWNrX3NhbWVfdGhyZWFkPUZhbHNlKQogICAgICAgIHNlbGYuYy5leGVjdXRlKCJQUkFHTUEgam91cm5hbF9tb2RlPVdBTCIpCiAgICAgICAgc2VsZi5jLmV4ZWN1dGVzY3JpcHQoU0NIRU1BKQogICAgICAgIHNlbGYuYy5jb21taXQoKQoKICAgIGRlZiBidW1wKHNlbGYsIGtleSwgYnk9MSk6CiAgICAgICAgc2VsZi5jLmV4ZWN1dGUoCiAgICAgICAgICAgICJJTlNFUlQgSU5UTyB0b3RhbHMgKGssIHYpIFZBTFVFUyAoPywgPykgIgogICAgICAgICAgICAiT04gQ09ORkxJQ1QoaykgRE8gVVBEQVRFIFNFVCB2ID0gdiArID8iLCAoa2V5LCBieSwgYnkpKQoKICAgIGRlZiB0b3RhbChzZWxmLCBrZXkpOgogICAgICAgIHIgPSBzZWxmLmMuZXhlY3V0ZSgiU0VMRUNUIHYgRlJPTSB0b3RhbHMgV0hFUkUgaz0/IiwgKGtleSwpKS5mZXRjaG9uZSgpCiAgICAgICAgcmV0dXJuIHJbMF0gaWYgciBlbHNlIDAKCiAgICBkZWYgbm90ZV9zZWVuKHNlbGYsIGZwLCBub3cpOgogICAgICAgIHNlbGYuYy5leGVjdXRlKCJJTlNFUlQgSU5UTyBzZWVuIChmcCwgdHMpIFZBTFVFUyAoPyw/KSIsIChmcCwgbm93KSkKICAgICAgICBzZWxmLmMuZXhlY3V0ZSgiREVMRVRFIEZST00gc2VlbiBXSEVSRSB0cyA8ID8iLCAobm93IC0gMzYwMCwpKQoKICAgIGRlZiBjb3VudHMoc2VsZiwgZnAsIG5vdyk6CiAgICAgICAgbG9vcCA9IHNlbGYuYy5leGVjdXRlKAogICAgICAgICAgICAiU0VMRUNUIENPVU5UKCopIEZST00gc2VlbiBXSEVSRSBmcD0/IEFORCB0cyA+ID8iLAogICAgICAgICAgICAoZnAsIG5vdyAtIExPT1BfV0lORE9XKSkuZmV0Y2hvbmUoKVswXQogICAgICAgIGJ1cnN0ID0gc2VsZi5jLmV4ZWN1dGUoCiAgICAgICAgICAgICJTRUxFQ1QgQ09VTlQoKikgRlJPTSBzZWVuIFdIRVJFIHRzID4gPyIsIChub3cgLSA2MCwpKS5mZXRjaG9uZSgpWzBdCiAgICAgICAgcmV0dXJuIGxvb3AsIGJ1cnN0CgogICAgZGVmIGdldChzZWxmLCBmcCwgbm93KToKICAgICAgICByID0gc2VsZi5jLmV4ZWN1dGUoCiAgICAgICAgICAgICJTRUxFQ1QgYm9keSwgdG9rX2luLCB0b2tfb3V0LCBoaXRzLCBleHBpcmVzIEZST00gYW5zd2VycyAiCiAgICAgICAgICAgICJXSEVSRSBmcD0/IiwgKGZwLCkpLmZldGNob25lKCkKICAgICAgICBpZiBub3QgcjoKICAgICAgICAgICAgcmV0dXJuIE5vbmUKICAgICAgICBpZiByWzRdIGlzIG5vdCBOb25lIGFuZCByWzRdIDwgbm93OgogICAgICAgICAgICBzZWxmLmMuZXhlY3V0ZSgiREVMRVRFIEZST00gYW5zd2VycyBXSEVSRSBmcD0/IiwgKGZwLCkpCiAgICAgICAgICAgIHNlbGYuYy5jb21taXQoKQogICAgICAgICAgICByZXR1cm4gTm9uZQogICAgICAgIHJldHVybiByCgogICAgZGVmIHB1dChzZWxmLCBmcCwgbW9kZWwsIGJvZHksIHRpLCB0bywgbm93LCB0dGwpOgogICAgICAgIHNlbGYuYy5leGVjdXRlKAogICAgICAgICAgICAiSU5TRVJUIE9SIFJFUExBQ0UgSU5UTyBhbnN3ZXJzIChmcCwgbW9kZWwsIGJvZHksIHRva19pbiwgIgogICAgICAgICAgICAidG9rX291dCwgc3RvcmVkX2F0LCBleHBpcmVzLCBoaXRzKSBWQUxVRVMgKD8sPyw/LD8sPyw/LD8sMCkiLAogICAgICAgICAgICAoZnAsIG1vZGVsLCBib2R5LCB0aSwgdG8sIG5vdywgbm93ICsgdHRsIGlmIHR0bCBlbHNlIE5vbmUpKQoKICAgIGRlZiBoaXQoc2VsZiwgZnApOgogICAgICAgIHNlbGYuYy5leGVjdXRlKCJVUERBVEUgYW5zd2VycyBTRVQgaGl0cz1oaXRzKzEgV0hFUkUgZnA9PyIsIChmcCwpKQoKICAgIGRlZiBlbnF1ZXVlKHNlbGYsIGFjdGlvbiwgcGF5bG9hZCwgbm93KToKICAgICAgICBzZWxmLmMuZXhlY3V0ZSgKICAgICAgICAgICAgIklOU0VSVCBJTlRPIG91dGJveCAoYWN0aW9uLCBwYXlsb2FkLCB0cykgVkFMVUVTICg/LD8sPykiLAogICAgICAgICAgICAoYWN0aW9uLCBqc29uLmR1bXBzKHBheWxvYWQpLCBub3cpKQoKICAgIGRlZiB0YWtlX291dGJveChzZWxmLCBuPTI1KToKICAgICAgICByb3dzID0gc2VsZi5jLmV4ZWN1dGUoCiAgICAgICAgICAgICJTRUxFQ1QgaWQsIGFjdGlvbiwgcGF5bG9hZCBGUk9NIG91dGJveCBPUkRFUiBCWSBpZCBMSU1JVCA/IiwKICAgICAgICAgICAgKG4sKSkuZmV0Y2hhbGwoKQogICAgICAgIHJldHVybiByb3dzCgogICAgZGVmIGRyb3Bfb3V0Ym94KHNlbGYsIGlkcyk6CiAgICAgICAgc2VsZi5jLmV4ZWN1dGVtYW55KCJERUxFVEUgRlJPTSBvdXRib3ggV0hFUkUgaWQ9PyIsCiAgICAgICAgICAgICAgICAgICAgICAgICAgIFsoaSwpIGZvciBpIGluIGlkc10pCgoKIyAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLSB1cGxpbmsKCmNsYXNzIFVwbGluazoKICAgICIiIgogICAgVGFsa3MgdG8gc2ViYmkucHJvLiBOZXZlciBibG9ja3MgYSByZXF1ZXN0IGZvciBsb25nIGFuZCBuZXZlciBzdG9wcwogICAgb25lLiBFdmVyeXRoaW5nIGl0IHNlbmRzIGlzIGEgZGlnZXN0LgogICAgIiIiCgogICAgZGVmIF9faW5pdF9fKHNlbGYsIGJhc2UsIGtleSwgc3RvcmUsIHRpbWVvdXQ9Mi4wLCBvZmZsaW5lPUZhbHNlLAogICAgICAgICAgICAgICAgIHNob3c9RmFsc2UpOgogICAgICAgIHNlbGYuYmFzZSA9IChiYXNlIG9yIFNFQkJJX0RFRkFVTFQpLnJzdHJpcCgiLyIpCiAgICAgICAgc2VsZi5rZXkgPSBrZXkKICAgICAgICBzZWxmLnN0b3JlID0gc3RvcmUKICAgICAgICBzZWxmLnRpbWVvdXQgPSB0aW1lb3V0CiAgICAgICAgc2VsZi5vZmZsaW5lID0gb2ZmbGluZQogICAgICAgIHNlbGYuc2hvdyA9IHNob3cKICAgICAgICBzZWxmLnVwID0gTm9uZSBpZiBvZmZsaW5lIGVsc2UgVHJ1ZQogICAgICAgIHNlbGYubGFzdF9mYWlsID0gMC4wCiAgICAgICAgc2VsZi5xID0gcXVldWUuUXVldWUobWF4c2l6ZT01MDAwKQogICAgICAgIHQgPSB0aHJlYWRpbmcuVGhyZWFkKHRhcmdldD1zZWxmLl9kcmFpbiwgZGFlbW9uPVRydWUpCiAgICAgICAgdC5zdGFydCgpCgogICAgZGVmIF9wb3N0KHNlbGYsIGFjdGlvbiwgcGF5bG9hZCk6CiAgICAgICAgdXJsID0gIiVzL3gvdG9rZW5zYXZlci8lcyIgJSAoc2VsZi5iYXNlLCBhY3Rpb24pCiAgICAgICAgZGF0YSA9IGpzb24uZHVtcHMocGF5bG9hZCkuZW5jb2RlKCJ1dGYtOCIpCiAgICAgICAgcmVxID0gdXJsbGliLnJlcXVlc3QuUmVxdWVzdCh1cmwsIGRhdGE9ZGF0YSwgbWV0aG9kPSJQT1NUIikKICAgICAgICByZXEuYWRkX2hlYWRlcigiQ29udGVudC1UeXBlIiwgImFwcGxpY2F0aW9uL2pzb24iKQogICAgICAgIHJlcS5hZGRfaGVhZGVyKCJBdXRob3JpemF0aW9uIiwgIkJlYXJlciAiICsgc2VsZi5rZXkpCiAgICAgICAgd2l0aCB1cmxsaWIucmVxdWVzdC51cmxvcGVuKHJlcSwgdGltZW91dD1zZWxmLnRpbWVvdXQpIGFzIHI6CiAgICAgICAgICAgIHJldHVybiBqc29uLmxvYWRzKHIucmVhZCgpKQoKICAgIGRlZiBnYXRlKHNlbGYsIGRpZywgdW5hdHRlbmRlZCk6CiAgICAgICAgIiIiCiAgICAgICAgQXNrIHRoZSBwbGF0Zm9ybS4gUmV0dXJucyBpdHMgYW5zd2VyLCBvciBOb25lIGlmIGl0IGNvdWxkIG5vdCBiZQogICAgICAgIHJlYWNoZWQuIE5vbmUgbWVhbnMgY2Fycnkgb24gbG9jYWxseSwgbmV2ZXIgbWVhbnMgc3RvcC4KICAgICAgICAiIiIKICAgICAgICBpZiBzZWxmLm9mZmxpbmU6CiAgICAgICAgICAgIHJldHVybiBOb25lCiAgICAgICAgaWYgc2VsZi5zaG93OgogICAgICAgICAgICBzeXMuc3RkZXJyLndyaXRlKCJbZGlnZXN0XSAiICsganNvbi5kdW1wcyhkaWcpICsgIlxuIikKICAgICAgICAjIEJhY2sgb2ZmIGZvciBhIG1pbnV0ZSBhZnRlciBhIGZhaWx1cmUgcmF0aGVyIHRoYW4gYWRkaW5nIHRoZQogICAgICAgICMgdGltZW91dCB0byBldmVyeSBzaW5nbGUgcmVxdWVzdC4KICAgICAgICBpZiBzZWxmLnVwIGlzIEZhbHNlIGFuZCAodGltZS50aW1lKCkgLSBzZWxmLmxhc3RfZmFpbCkgPCA2MDoKICAgICAgICAgICAgcmV0dXJuIE5vbmUKICAgICAgICB0cnk6CiAgICAgICAgICAgIG91dCA9IHNlbGYuX3Bvc3QoImdhdGUiLCB7ImRpZ2VzdCI6IGRpZywgInVuYXR0ZW5kZWQiOiB1bmF0dGVuZGVkfSkKICAgICAgICAgICAgaWYgc2VsZi51cCBpcyBub3QgVHJ1ZToKICAgICAgICAgICAgICAgIHN5cy5zdGRlcnIud3JpdGUoIltzYXZlcl0gc2ViYmkucHJvIHJlYWNoYWJsZSBhZ2FpblxuIikKICAgICAgICAgICAgc2VsZi51cCA9IFRydWUKICAgICAgICAgICAgcmV0dXJuIG91dAogICAgICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMgZTogICMgbm9xYTogQkxFMDAxCiAgICAgICAgICAgIGlmIHNlbGYudXAgaXMgbm90IEZhbHNlOgogICAgICAgICAgICAgICAgc3lzLnN0ZGVyci53cml0ZSgiW3NhdmVyXSBzZWJiaS5wcm8gdW5yZWFjaGFibGUgKCVzKS4gIgogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAiVHJhZmZpYyBjb250aW51ZXM7IHJlY29yZHMgd2lsbCBjYXRjaCB1cC5cbiIKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgJSBlLl9fY2xhc3NfXy5fX25hbWVfXykKICAgICAgICAgICAgc2VsZi51cCA9IEZhbHNlCiAgICAgICAgICAgIHNlbGYubGFzdF9mYWlsID0gdGltZS50aW1lKCkKICAgICAgICAgICAgcmV0dXJuIE5vbmUKCiAgICBkZWYgbGF0ZXIoc2VsZiwgYWN0aW9uLCBwYXlsb2FkKToKICAgICAgICAiIiJGaXJlIGFuZCBmb3JnZXQuIFF1ZXVlZCB0byBkaXNrIGlmIHRoZSBuZXR3b3JrIGlzIGRvd24uIiIiCiAgICAgICAgaWYgc2VsZi5vZmZsaW5lOgogICAgICAgICAgICByZXR1cm4KICAgICAgICB0cnk6CiAgICAgICAgICAgIHNlbGYucS5wdXRfbm93YWl0KChhY3Rpb24sIHBheWxvYWQpKQogICAgICAgIGV4Y2VwdCBxdWV1ZS5GdWxsOgogICAgICAgICAgICBwYXNzCgogICAgZGVmIF9kcmFpbihzZWxmKToKICAgICAgICB3aGlsZSBUcnVlOgogICAgICAgICAgICB0cnk6CiAgICAgICAgICAgICAgICBhY3Rpb24sIHBheWxvYWQgPSBzZWxmLnEuZ2V0KHRpbWVvdXQ9NSkKICAgICAgICAgICAgZXhjZXB0IHF1ZXVlLkVtcHR5OgogICAgICAgICAgICAgICAgc2VsZi5fZmx1c2hfb3V0Ym94KCkKICAgICAgICAgICAgICAgIGNvbnRpbnVlCiAgICAgICAgICAgIHRyeToKICAgICAgICAgICAgICAgIHNlbGYuX3Bvc3QoYWN0aW9uLCBwYXlsb2FkKQogICAgICAgICAgICAgICAgc2VsZi51cCA9IFRydWUKICAgICAgICAgICAgZXhjZXB0IEV4Y2VwdGlvbjogICMgbm9xYTogQkxFMDAxCiAgICAgICAgICAgICAgICBzZWxmLnVwID0gRmFsc2UKICAgICAgICAgICAgICAgIHNlbGYubGFzdF9mYWlsID0gdGltZS50aW1lKCkKICAgICAgICAgICAgICAgIHdpdGggc2VsZi5zdG9yZS5sb2NrOgogICAgICAgICAgICAgICAgICAgIHNlbGYuc3RvcmUuZW5xdWV1ZShhY3Rpb24sIHBheWxvYWQsIHRpbWUudGltZSgpKQogICAgICAgICAgICAgICAgICAgIHNlbGYuc3RvcmUuYy5jb21taXQoKQoKICAgIGRlZiBfZmx1c2hfb3V0Ym94KHNlbGYpOgogICAgICAgIGlmIHNlbGYub2ZmbGluZSBvciBzZWxmLnVwIGlzIEZhbHNlOgogICAgICAgICAgICByZXR1cm4KICAgICAgICB3aXRoIHNlbGYuc3RvcmUubG9jazoKICAgICAgICAgICAgcm93cyA9IHNlbGYuc3RvcmUudGFrZV9vdXRib3goKQogICAgICAgIGlmIG5vdCByb3dzOgogICAgICAgICAgICByZXR1cm4KICAgICAgICBkb25lID0gW10KICAgICAgICBmb3IgcmlkLCBhY3Rpb24sIHBheWxvYWQgaW4gcm93czoKICAgICAgICAgICAgdHJ5OgogICAgICAgICAgICAgICAgc2VsZi5fcG9zdChhY3Rpb24sIGpzb24ubG9hZHMocGF5bG9hZCkpCiAgICAgICAgICAgICAgICBkb25lLmFwcGVuZChyaWQpCiAgICAgICAgICAgIGV4Y2VwdCBFeGNlcHRpb246ICAjIG5vcWE6IEJMRTAwMQogICAgICAgICAgICAgICAgc2VsZi51cCA9IEZhbHNlCiAgICAgICAgICAgICAgICBzZWxmLmxhc3RfZmFpbCA9IHRpbWUudGltZSgpCiAgICAgICAgICAgICAgICBicmVhawogICAgICAgIGlmIGRvbmU6CiAgICAgICAgICAgIHdpdGggc2VsZi5zdG9yZS5sb2NrOgogICAgICAgICAgICAgICAgc2VsZi5zdG9yZS5kcm9wX291dGJveChkb25lKQogICAgICAgICAgICAgICAgc2VsZi5zdG9yZS5jLmNvbW1pdCgpCgoKIyAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0gZmluZGluZ3MKCmRlZiBsb2NhbF9maW5kaW5ncyhyZXEsIGxvb3BfbiwgaGFzX3N0b3JlZCk6CiAgICAiIiIKICAgIENvbXB1dGVkIGhlcmUsIHdoZXJlIHRoZSBjb250ZW50IGlzLiBUaGVzZSBuZXZlciBnbyB0byBzZWJiaS5wcm8uCiAgICAiIiIKICAgIG91dCA9IFtdCiAgICBtc2dzID0gcmVxLmdldCgibWVzc2FnZXMiKSBvciBbXQogICAgZGVwdGggPSBsZW4obXNncykKICAgIHRvb2xzID0gcmVxLmdldCgidG9vbHMiKSBvciBbXQoKICAgIGlmIGxvb3BfbiA+PSAyIGFuZCBub3QgaGFzX3N0b3JlZDoKICAgICAgICBvdXQuYXBwZW5kKCJUaGlzIGV4YWN0IHJlcXVlc3QgaGFzIGdvbmUgb3V0ICVkIHRpbWVzIGluICVkIHNlY29uZHMgIgogICAgICAgICAgICAgICAgICAgImFuZCBubyBhbnN3ZXIgaGFzIGJlZW4gc3RvcmVkIHlldC4iICUgKGxvb3BfbiwgTE9PUF9XSU5ET1cpKQogICAgaWYgbm90IGRldGVybWluaXN0aWMocmVxKToKICAgICAgICBvdXQuYXBwZW5kKCJ0ZW1wZXJhdHVyZSBpcyBhYm92ZSB6ZXJvLCBzbyB0aGlzIGFuc3dlciBjYW5ub3QgYmUgIgogICAgICAgICAgICAgICAgICAgInJldXNlZC4gSWYgaXQgZG9lcyBub3QgbmVlZCB0byB2YXJ5LCBzZXR0aW5nIGl0IHRvIHplcm8gIgogICAgICAgICAgICAgICAgICAgIm1ha2VzIGV2ZXJ5IHJlcGVhdCBmcmVlLiIpCiAgICBpZiBkZXB0aCA+IENUWF9GTEFHX1RVUk5TOgogICAgICAgIGNhcnJpZWQgPSBtc2dzWzotQ1RYX0tFRVBfVFVSTlNdCiAgICAgICAgY2hhcnMgPSBzdW0oY29udGVudF9jaGFycyhtLmdldCgiY29udGVudCIpIGlmIGlzaW5zdGFuY2UobSwgZGljdCkKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIGVsc2UgbSkgZm9yIG0gaW4gY2FycmllZCkKICAgICAgICBvdXQuYXBwZW5kKCIlZCB0dXJucyByZS1zZW50IGV2ZXJ5IGNhbGw7IHRoZSBvbGRlc3QgJWQgYXJlIHJvdWdobHkgIgogICAgICAgICAgICAgICAgICAgIiVkIHRva2VucyAoZXN0aW1hdGVkKSwgcGFpZCBhZ2FpbiBlYWNoIHRpbWUuIgogICAgICAgICAgICAgICAgICAgJSAoZGVwdGgsIGxlbihjYXJyaWVkKSwgZXN0X3Rva2VucyhjaGFycykpKQogICAgaWYgdG9vbHM6CiAgICAgICAgdXNlZCA9IGFueSgidG9vbF91c2UiIGluIGpzb24uZHVtcHMobSwgZGVmYXVsdD1zdHIpCiAgICAgICAgICAgICAgICAgICBvciAidG9vbF9jYWxsIiBpbiBqc29uLmR1bXBzKG0sIGRlZmF1bHQ9c3RyKSBmb3IgbSBpbiBtc2dzKQogICAgICAgIGlmIG5vdCB1c2VkOgogICAgICAgICAgICBvdXQuYXBwZW5kKCIlZCB0b29sIGRlZmluaXRpb25zIGF0dGFjaGVkIGFuZCBub25lIGhhcyBiZWVuICIKICAgICAgICAgICAgICAgICAgICAgICAiY2FsbGVkOyByb3VnaGx5ICVkIHRva2VucyAoZXN0aW1hdGVkKSBvbiBldmVyeSByZXF1ZXN0LiIKICAgICAgICAgICAgICAgICAgICAgICAlIChsZW4odG9vbHMpLCBlc3RfdG9rZW5zKGNvbnRlbnRfY2hhcnModG9vbHMpKSkpCiAgICByZXR1cm4gb3V0CgoKIyAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLSBzZXJ2ZXIKClBBR0UgPSAiIiI8IWRvY3R5cGUgaHRtbD48bWV0YSBjaGFyc2V0PXV0Zi04Pgo8dGl0bGU+c2ViYmkucHJvIHRva2VuIHNhdmVyPC90aXRsZT4KPHN0eWxlPgogYm9keXt7Zm9udDoxNnB4LzEuNSBzeXN0ZW0tdWksLWFwcGxlLXN5c3RlbSxTZWdvZSBVSSxzYW5zLXNlcmlmOwogICAgICBiYWNrZ3JvdW5kOiMxMDFFMjQ7Y29sb3I6I0VDRUVFQzttYXJnaW46MDtwYWRkaW5nOjI4cHh9fQogLnd7e21heC13aWR0aDo2NDBweDttYXJnaW46MCBhdXRvfX0KIGgxe3tmb250LXNpemU6MTlweDtsZXR0ZXItc3BhY2luZzouMDJlbTttYXJnaW46MCAwIDRweH19CiAuc3t7Y29sb3I6IzhmYTZhZTtmb250LXNpemU6MTNweDttYXJnaW4tYm90dG9tOjI2cHh9fQogLmJpZ3t7Zm9udC1zaXplOjQycHg7Zm9udC13ZWlnaHQ6NzAwO2NvbG9yOiNGNUIzMUI7bGluZS1oZWlnaHQ6MS4xfX0KIC5sYmx7e2NvbG9yOiM4ZmE2YWU7Zm9udC1zaXplOjEzcHg7bWFyZ2luLWJvdHRvbToyNnB4fX0KIC5yb3d7e2Rpc3BsYXk6dGFibGU7d2lkdGg6MTAwJTtib3JkZXItdG9wOjFweCBzb2xpZCAjMUMzQTQ0O3BhZGRpbmc6OXB4IDB9fQogLmt7e2Rpc3BsYXk6dGFibGUtY2VsbDtjb2xvcjojOGZhNmFlO2ZvbnQtc2l6ZToxNHB4fX0KIC52e3tkaXNwbGF5OnRhYmxlLWNlbGw7dGV4dC1hbGlnbjpyaWdodDtmb250LXZhcmlhbnQtbnVtZXJpYzp0YWJ1bGFyLW51bXN9fQogLm57e21hcmdpbi10b3A6MjZweDtjb2xvcjojOGZhNmFlO2ZvbnQtc2l6ZToxMi41cHg7Ym9yZGVyLXRvcDoxcHggc29saWQgIzFDM0E0NDsKICAgICBwYWRkaW5nLXRvcDoxNHB4fX0KIC5va3t7Y29sb3I6IzdmZDFhOH19IC5ub3t7Y29sb3I6I2U4YTMzZH19Cjwvc3R5bGU+CjxkaXYgY2xhc3M9dz4KPGgxPnNlYmJpLnBybyB0b2tlbiBzYXZlcjwvaDE+CjxkaXYgY2xhc3M9cz5saXN0ZW5pbmcgb24gMTI3LjAuMC4xOntwb3J0fSAmbWlkZG90OyBmb3J3YXJkaW5nIHRvIHt1cHN0cmVhbX08L2Rpdj4KPGRpdiBjbGFzcz1iaWc+e3NhdmVkfTwvZGl2Pgo8ZGl2IGNsYXNzPWxibD50b2tlbnMgbm90IGJvdWdodCAmbWlkZG90OyBleGFjdCwgZnJvbSB5b3VyIHByb3ZpZGVyJ3Mgb3duIGNvdW50czwvZGl2Pgo8ZGl2IGNsYXNzPXJvdz48ZGl2IGNsYXNzPWs+cmVxdWVzdHMgc2VlbjwvZGl2PjxkaXYgY2xhc3M9dj57c2Vlbn08L2Rpdj48L2Rpdj4KPGRpdiBjbGFzcz1yb3c+PGRpdiBjbGFzcz1rPnNlcnZlZCBmcm9tIHlvdXIgc3RvcmU8L2Rpdj48ZGl2IGNsYXNzPXY+e3NlcnZlZH08L2Rpdj48L2Rpdj4KPGRpdiBjbGFzcz1yb3c+PGRpdiBjbGFzcz1rPnN0b3BwZWQgYmVmb3JlIHRoZSBtb2RlbDwvZGl2PjxkaXYgY2xhc3M9dj57YmxvY2tlZH08L2Rpdj48L2Rpdj4KPGRpdiBjbGFzcz1yb3c+PGRpdiBjbGFzcz1rPmFuc3dlcnMgc3RvcmVkIGhlcmU8L2Rpdj48ZGl2IGNsYXNzPXY+e3N0b3JlZH08L2Rpdj48L2Rpdj4KPGRpdiBjbGFzcz1yb3c+PGRpdiBjbGFzcz1rPnNlYmJpLnBybzwvZGl2PjxkaXYgY2xhc3M9InYge2Nsc30iPntsaW5rfTwvZGl2PjwvZGl2Pgo8ZGl2IGNsYXNzPW4+WW91ciBwcm9tcHRzIGFuZCBhbnN3ZXJzIGFyZSBvbiB0aGlzIG1hY2hpbmUgb25seS4gV2hhdCBnb2VzIHRvCnNlYmJpLnBybyBpcyBhIGZpbmdlcnByaW50IGFuZCBhIHNldCBvZiBjb3VudHMuIElmIGl0IGNhbm5vdCBiZSByZWFjaGVkIHlvdXIKdHJhZmZpYyBjYXJyaWVzIG9uIGFuZCB0aGUgcmVjb3JkcyBjYXRjaCB1cCBhZnRlcndhcmRzLjwvZGl2Pgo8L2Rpdj4iIiIKCgpjbGFzcyBIYW5kbGVyKEJhc2VIVFRQUmVxdWVzdEhhbmRsZXIpOgogICAgcHJvdG9jb2xfdmVyc2lvbiA9ICJIVFRQLzEuMSIKICAgIGNmZyA9IE5vbmUKICAgIHN0b3JlID0gTm9uZQogICAgdXBsaW5rID0gTm9uZQoKICAgIGRlZiBsb2dfbWVzc2FnZShzZWxmLCAqYSk6CiAgICAgICAgcGFzcwoKICAgIGRlZiBfb3V0KHNlbGYsIGNvZGUsIGJvZHksIGN0eXBlPSJhcHBsaWNhdGlvbi9qc29uIiwgZXh0cmE9Tm9uZSk6CiAgICAgICAgaWYgaXNpbnN0YW5jZShib2R5LCAoZGljdCwgbGlzdCkpOgogICAgICAgICAgICBib2R5ID0ganNvbi5kdW1wcyhib2R5KS5lbmNvZGUoInV0Zi04IikKICAgICAgICBlbGlmIGlzaW5zdGFuY2UoYm9keSwgc3RyKToKICAgICAgICAgICAgYm9keSA9IGJvZHkuZW5jb2RlKCJ1dGYtOCIpCiAgICAgICAgc2VsZi5zZW5kX3Jlc3BvbnNlKGNvZGUpCiAgICAgICAgc2VsZi5zZW5kX2hlYWRlcigiQ29udGVudC1UeXBlIiwgY3R5cGUpCiAgICAgICAgc2VsZi5zZW5kX2hlYWRlcigiQ29udGVudC1MZW5ndGgiLCBzdHIobGVuKGJvZHkpKSkKICAgICAgICBmb3IgaywgdiBpbiAoZXh0cmEgb3Ige30pLml0ZW1zKCk6CiAgICAgICAgICAgIHNlbGYuc2VuZF9oZWFkZXIoaywgc3RyKHYpKQogICAgICAgIHNlbGYuZW5kX2hlYWRlcnMoKQogICAgICAgIHNlbGYud2ZpbGUud3JpdGUoYm9keSkKCiAgICAjIC0tLS0gc3RhdHVzIHBhZ2VzIC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KCiAgICBkZWYgZG9fR0VUKHNlbGYpOgogICAgICAgIHAgPSBzZWxmLnBhdGguc3BsaXQoIj8iKVswXS5yc3RyaXAoIi8iKSBvciAiLyIKICAgICAgICBpZiBwIGluICgiL3NhdmVyIiwgIi8iKToKICAgICAgICAgICAgcmV0dXJuIHNlbGYuX291dCgyMDAsIHNlbGYuX3BhZ2UoKSwgInRleHQvaHRtbDsgY2hhcnNldD11dGYtOCIpCiAgICAgICAgaWYgcCA9PSAiL3NhdmVyL3N0YXRzIjoKICAgICAgICAgICAgcmV0dXJuIHNlbGYuX291dCgyMDAsIHNlbGYuX3N0YXRzKCkpCiAgICAgICAgaWYgcCA9PSAiL3NhdmVyL2hlYWx0aCI6CiAgICAgICAgICAgIHJldHVybiBzZWxmLl9vdXQoMjAwLCB7Im9rIjogVHJ1ZSwgInZlcnNpb24iOiBWRVJTSU9OLAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICJzZWJiaSI6IHNlbGYuX2xpbmsoKX0pCiAgICAgICAgcmV0dXJuIHNlbGYuX291dCg0MDQsIHsiZXJyb3IiOiAibm90IGZvdW5kIiwKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICJ0cnkiOiBbIi9zYXZlciIsICIvc2F2ZXIvc3RhdHMiXX0pCgogICAgZGVmIF9saW5rKHNlbGYpOgogICAgICAgIGlmIHNlbGYudXBsaW5rLm9mZmxpbmU6CiAgICAgICAgICAgIHJldHVybiAib2ZmbGluZSBieSBjaG9pY2UiCiAgICAgICAgcmV0dXJuICJjb25uZWN0ZWQiIGlmIHNlbGYudXBsaW5rLnVwIGVsc2UgInVucmVhY2hhYmxlIgoKICAgIGRlZiBfc3RhdHMoc2VsZik6CiAgICAgICAgcyA9IHNlbGYuc3RvcmUKICAgICAgICB3aXRoIHMubG9jazoKICAgICAgICAgICAgc3RvcmVkID0gcy5jLmV4ZWN1dGUoIlNFTEVDVCBDT1VOVCgqKSBGUk9NIGFuc3dlcnMiKS5mZXRjaG9uZSgpWzBdCiAgICAgICAgICAgIHRpID0gcy5jLmV4ZWN1dGUoCiAgICAgICAgICAgICAgICAiU0VMRUNUIENPQUxFU0NFKFNVTSh0b2tfaW4qaGl0cyksMCksICIKICAgICAgICAgICAgICAgICJDT0FMRVNDRShTVU0odG9rX291dCpoaXRzKSwwKSBGUk9NIGFuc3dlcnMiKS5mZXRjaG9uZSgpCiAgICAgICAgICAgIG91dCA9IHsKICAgICAgICAgICAgICAgICJ2ZXJzaW9uIjogVkVSU0lPTiwKICAgICAgICAgICAgICAgICJyZXF1ZXN0c19zZWVuIjogaW50KHMudG90YWwoInNlZW4iKSksCiAgICAgICAgICAgICAgICAic2VydmVkX2Zyb21fc3RvcmUiOiBpbnQocy50b3RhbCgic2VydmVkIikpLAogICAgICAgICAgICAgICAgInN0b3BwZWRfYmVmb3JlX3RoZV9tb2RlbCI6IGludChzLnRvdGFsKCJibG9ja2VkIikpLAogICAgICAgICAgICAgICAgInNlbnRfdG9fdGhlX21vZGVsIjogaW50KHMudG90YWwoImZvcndhcmRlZCIpKSwKICAgICAgICAgICAgICAgICJhbnN3ZXJzX3N0b3JlZF9oZXJlIjogc3RvcmVkLAogICAgICAgICAgICAgICAgInRva2Vuc19ub3RfYm91Z2h0IjogewogICAgICAgICAgICAgICAgICAgICJpbnB1dCI6IGludCh0aVswXSksICJvdXRwdXQiOiBpbnQodGlbMV0pLAogICAgICAgICAgICAgICAgICAgICJ0b3RhbCI6IGludCh0aVswXSArIHRpWzFdKSwKICAgICAgICAgICAgICAgICAgICAiY2VydGFpbnR5IjogImV4YWN0LCBhcyByZXBvcnRlZCBieSB5b3VyIHByb3ZpZGVyIG9uIHRoZSAiCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICJvcmlnaW5hbCBjYWxsIiwKICAgICAgICAgICAgICAgIH0sCiAgICAgICAgICAgICAgICAicXVldWVkX2Zvcl9zZWJiaSI6IHMuYy5leGVjdXRlKAogICAgICAgICAgICAgICAgICAgICJTRUxFQ1QgQ09VTlQoKikgRlJPTSBvdXRib3giKS5mZXRjaG9uZSgpWzBdLAogICAgICAgICAgICAgICAgInNlYmJpX3BybyI6IHNlbGYuX2xpbmsoKSwKICAgICAgICAgICAgICAgICJjb250ZW50X3NlbnRfdG9fc2ViYmlfcHJvIjogIm5vbmUuIEEgZmluZ2VycHJpbnQgYW5kIGNvdW50cyAiCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICJvbmx5LiIsCiAgICAgICAgICAgIH0KICAgICAgICByZXR1cm4gb3V0CgogICAgZGVmIF9wYWdlKHNlbGYpOgogICAgICAgIHN0ID0gc2VsZi5fc3RhdHMoKQogICAgICAgIHJldHVybiBQQUdFLmZvcm1hdCgKICAgICAgICAgICAgcG9ydD1zZWxmLmNmZ1sicG9ydCJdLCB1cHN0cmVhbT1zZWxmLmNmZ1sidXBzdHJlYW0iXSwKICAgICAgICAgICAgc2F2ZWQ9Ins6LH0iLmZvcm1hdChzdFsidG9rZW5zX25vdF9ib3VnaHQiXVsidG90YWwiXSksCiAgICAgICAgICAgIHNlZW49Ins6LH0iLmZvcm1hdChzdFsicmVxdWVzdHNfc2VlbiJdKSwKICAgICAgICAgICAgc2VydmVkPSJ7Oix9Ii5mb3JtYXQoc3RbInNlcnZlZF9mcm9tX3N0b3JlIl0pLAogICAgICAgICAgICBibG9ja2VkPSJ7Oix9Ii5mb3JtYXQoc3RbInN0b3BwZWRfYmVmb3JlX3RoZV9tb2RlbCJdKSwKICAgICAgICAgICAgc3RvcmVkPSJ7Oix9Ii5mb3JtYXQoc3RbImFuc3dlcnNfc3RvcmVkX2hlcmUiXSksCiAgICAgICAgICAgIGxpbms9c3RbInNlYmJpX3BybyJdLAogICAgICAgICAgICBjbHM9Im9rIiBpZiBzdFsic2ViYmlfcHJvIl0gPT0gImNvbm5lY3RlZCIgZWxzZSAibm8iKQoKICAgICMgLS0tLSB0aGUgYWN0dWFsIGdhdGUgLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQoKICAgIGRlZiBkb19QT1NUKHNlbGYpOgogICAgICAgIHRyeToKICAgICAgICAgICAgbiA9IGludChzZWxmLmhlYWRlcnMuZ2V0KCJDb250ZW50LUxlbmd0aCIpIG9yIDApCiAgICAgICAgZXhjZXB0IFZhbHVlRXJyb3I6CiAgICAgICAgICAgIHJldHVybiBzZWxmLl9vdXQoNDAwLCB7ImVycm9yIjogImJhZCBjb250ZW50IGxlbmd0aCJ9KQogICAgICAgIGlmIG4gPiBNQVhfQk9EWToKICAgICAgICAgICAgcmV0dXJuIHNlbGYuX291dCg0MTMsIHsiZXJyb3IiOiAicmVxdWVzdCB0b28gbGFyZ2UifSkKICAgICAgICByYXcgPSBzZWxmLnJmaWxlLnJlYWQobikgaWYgbiBlbHNlIGIie30iCgogICAgICAgIHRyeToKICAgICAgICAgICAgcmVxID0ganNvbi5sb2FkcyhyYXcpCiAgICAgICAgICAgIGlmIG5vdCBpc2luc3RhbmNlKHJlcSwgZGljdCk6CiAgICAgICAgICAgICAgICByYWlzZSBWYWx1ZUVycm9yCiAgICAgICAgZXhjZXB0IFZhbHVlRXJyb3I6CiAgICAgICAgICAgICMgTm90IHNvbWV0aGluZyB3ZSB1bmRlcnN0YW5kLiBQYXNzIGl0IHRocm91Z2ggdW50b3VjaGVkLgogICAgICAgICAgICByZXR1cm4gc2VsZi5fZm9yd2FyZChyYXcsIE5vbmUsICJwYXNzdGhyb3VnaCIpCgogICAgICAgIGlmIHJlcS5nZXQoInN0cmVhbSIpOgogICAgICAgICAgICByZXR1cm4gc2VsZi5fZm9yd2FyZChyYXcsIHJlcSwgInN0cmVhbWluZy1ub3QtY2FjaGVkIikKCiAgICAgICAgbm93ID0gdGltZS50aW1lKCkKICAgICAgICBmcCA9IGZpbmdlcnByaW50KHJlcSkKICAgICAgICBzID0gc2VsZi5zdG9yZQoKICAgICAgICB3aXRoIHMubG9jazoKICAgICAgICAgICAgcm93ID0gcy5nZXQoZnAsIG5vdykKICAgICAgICAgICAgbG9vcF9uLCBidXJzdF9uID0gcy5jb3VudHMoZnAsIG5vdykKICAgICAgICAgICAgcy5idW1wKCJzZWVuIikKICAgICAgICAgICAgcy5ub3RlX3NlZW4oZnAsIG5vdykKICAgICAgICAgICAgcy5jLmNvbW1pdCgpCgogICAgICAgICMgMS4gTG9jYWwgc3RvcmUuIE5vIG5ldHdvcmssIG5vIHByb3ZpZGVyLCBub3RoaW5nIGJvdWdodC4KICAgICAgICBpZiByb3c6CiAgICAgICAgICAgIHdpdGggcy5sb2NrOgogICAgICAgICAgICAgICAgcy5oaXQoZnApCiAgICAgICAgICAgICAgICBzLmJ1bXAoInNlcnZlZCIpCiAgICAgICAgICAgICAgICBzLmMuY29tbWl0KCkKICAgICAgICAgICAgc2VsZi51cGxpbmsubGF0ZXIoImdhdGUiLCB7ImRpZ2VzdCI6IGRpZ2VzdF9vZihyZXEpLAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAidW5hdHRlbmRlZCI6IHNlbGYuY2ZnWyJ1bmF0dGVuZGVkIl19KQogICAgICAgICAgICByZXR1cm4gc2VsZi5fb3V0KDIwMCwgcm93WzBdLCAiYXBwbGljYXRpb24vanNvbiIsIHsKICAgICAgICAgICAgICAgICJYLVNhdmVyIjogInNlcnZlZC1mcm9tLXlvdXItc3RvcmUiLAogICAgICAgICAgICAgICAgIlgtU2F2ZXItVG9rZW5zLU5vdC1Cb3VnaHQiOiAocm93WzFdIG9yIDApICsgKHJvd1syXSBvciAwKSwKICAgICAgICAgICAgfSkKCiAgICAgICAgIyAyLiBMb2NhbCBoYXJkIHJ1bGVzLiBUaGVzZSBydW4gd2l0aCBvciB3aXRob3V0IGEgbmV0d29yay4KICAgICAgICB1bmF0dGVuZGVkID0gc2VsZi5jZmdbInVuYXR0ZW5kZWQiXQogICAgICAgIHJ1bGUgPSBOb25lCiAgICAgICAgaWYgbG9vcF9uID49IExPT1BfSEFSRDoKICAgICAgICAgICAgcnVsZSA9ICJydW5hd2F5X2xvb3AiCiAgICAgICAgZWxpZiB1bmF0dGVuZGVkIGFuZCBsb29wX24gPj0gTE9PUF9IQVJEX1VOQVRURU5ERUQ6CiAgICAgICAgICAgIHJ1bGUgPSAicnVuYXdheV9sb29wX3VuYXR0ZW5kZWQiCiAgICAgICAgZWxpZiBidXJzdF9uID49IEJVUlNUX0hBUkQ6CiAgICAgICAgICAgIHJ1bGUgPSAicnVuYXdheV9idXJzdCIKCiAgICAgICAgaWYgcnVsZToKICAgICAgICAgICAgd2l0aCBzLmxvY2s6CiAgICAgICAgICAgICAgICBzLmJ1bXAoImJsb2NrZWQiKQogICAgICAgICAgICAgICAgcy5jLmNvbW1pdCgpCiAgICAgICAgICAgIHNlbGYudXBsaW5rLmxhdGVyKCJnYXRlIiwgeyJkaWdlc3QiOiBkaWdlc3Rfb2YocmVxKSwKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgInVuYXR0ZW5kZWQiOiB1bmF0dGVuZGVkfSkKICAgICAgICAgICAgcmV0dXJuIHNlbGYuX3JlZnVzZShydWxlLCByZXEsIGxvb3BfbiwgYnVyc3RfbikKCiAgICAgICAgIyAzLiBUaGUgcGxhdGZvcm0uIElmIGl0IGRvZXMgbm90IGFuc3dlciwgd2UgY2Fycnkgb24uCiAgICAgICAgdmVyZGljdCA9IE5vbmUKICAgICAgICByZWNlaXB0ID0gTm9uZQogICAgICAgIGZpbmRpbmdzID0gW10KICAgICAgICBpZiBub3Qgc2VsZi5jZmdbImxvY2FsX29ubHkiXToKICAgICAgICAgICAgYW5zID0gc2VsZi51cGxpbmsuZ2F0ZShkaWdlc3Rfb2YocmVxKSwgdW5hdHRlbmRlZCkKICAgICAgICAgICAgaWYgYW5zOgogICAgICAgICAgICAgICAgdmVyZGljdCA9IGFucy5nZXQoInZlcmRpY3QiKQogICAgICAgICAgICAgICAgcmVjZWlwdCA9IChhbnMuZ2V0KCJyZWNlaXB0Iikgb3Ige30pLmdldCgiaGFzaCIpCiAgICAgICAgICAgICAgICBmaW5kaW5ncyA9IFtmLmdldCgiZGV0YWlsIikgZm9yIGYgaW4gKGFucy5nZXQoImZpbmRpbmdzIikgb3IgW10pXQoKICAgICAgICBpZiB2ZXJkaWN0ID09ICJCTE9DSyI6CiAgICAgICAgICAgIHdpdGggcy5sb2NrOgogICAgICAgICAgICAgICAgcy5idW1wKCJibG9ja2VkIikKICAgICAgICAgICAgICAgIHMuYy5jb21taXQoKQogICAgICAgICAgICByZXR1cm4gc2VsZi5fcmVmdXNlKGFucy5nZXQoInJ1bGUiKSBvciAic2NvcmUiLCByZXEsIGxvb3BfbiwKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBidXJzdF9uLCByZWNlaXB0LCBhbnMuZ2V0KCJzY29yZSIpKQoKICAgICAgICBpZiB2ZXJkaWN0ID09ICJDSEFMTEVOR0UiIGFuZCBzZWxmLmNmZ1sic3RyaWN0Il06CiAgICAgICAgICAgIHdpdGggcy5sb2NrOgogICAgICAgICAgICAgICAgcy5idW1wKCJibG9ja2VkIikKICAgICAgICAgICAgICAgIHMuYy5jb21taXQoKQogICAgICAgICAgICByZXR1cm4gc2VsZi5fcmVmdXNlKCJoZWxkX2Zvcl9hX3BlcnNvbiIsIHJlcSwgbG9vcF9uLCBidXJzdF9uLAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIHJlY2VpcHQsIGFucy5nZXQoInNjb3JlIikpCgogICAgICAgIGlmIG5vdCBmaW5kaW5nczoKICAgICAgICAgICAgd2l0aCBzLmxvY2s6CiAgICAgICAgICAgICAgICBoYXMgPSBzLmdldChmcCwgbm93KSBpcyBub3QgTm9uZQogICAgICAgICAgICBmaW5kaW5ncyA9IGxvY2FsX2ZpbmRpbmdzKHJlcSwgbG9vcF9uLCBoYXMpCgogICAgICAgIHJldHVybiBzZWxmLl9mb3J3YXJkKHJhdywgcmVxLCAic2VudC10by10aGUtbW9kZWwiLCB2ZXJkaWN0LCByZWNlaXB0LAogICAgICAgICAgICAgICAgICAgICAgICAgICAgIGZpbmRpbmdzKQoKICAgIGRlZiBfcmVmdXNlKHNlbGYsIHJ1bGUsIHJlcSwgbG9vcF9uLCBidXJzdF9uLCByZWNlaXB0PU5vbmUsIHNjb3JlPU5vbmUpOgogICAgICAgIGFzayA9IGFza19jZWlsaW5nKHJlcSkKICAgICAgICBib2R5ID0gewogICAgICAgICAgICAiZXJyb3IiOiB7CiAgICAgICAgICAgICAgICAidHlwZSI6ICJzZWJiaV90b2tlbnNhdmVyX3JlZnVzZWQiLAogICAgICAgICAgICAgICAgInJ1bGUiOiBydWxlLAogICAgICAgICAgICAgICAgIm1lc3NhZ2UiOiB7CiAgICAgICAgICAgICAgICAgICAgInJ1bmF3YXlfbG9vcCI6CiAgICAgICAgICAgICAgICAgICAgICAgICJUaGUgc2FtZSByZXF1ZXN0IGhhcyBnb25lIG91dCAlZCB0aW1lcyBpbiAlZCAiCiAgICAgICAgICAgICAgICAgICAgICAgICJzZWNvbmRzLiBJdCB3YXMgc3RvcHBlZCBoZXJlIHJhdGhlciB0aGFuIHBhaWQgZm9yLiIKICAgICAgICAgICAgICAgICAgICAgICAgJSAobG9vcF9uLCBMT09QX1dJTkRPVyksCiAgICAgICAgICAgICAgICAgICAgInJ1bmF3YXlfbG9vcF91bmF0dGVuZGVkIjoKICAgICAgICAgICAgICAgICAgICAgICAgIlRoZSBzYW1lIHJlcXVlc3QgaGFzIGdvbmUgb3V0ICVkIHRpbWVzIGluICVkICIKICAgICAgICAgICAgICAgICAgICAgICAgInNlY29uZHMgd2l0aCBubyBodW1hbiB3YXRjaGluZy4gU3RvcHBlZCBoZXJlLiIKICAgICAgICAgICAgICAgICAgICAgICAgJSAobG9vcF9uLCBMT09QX1dJTkRPVyksCiAgICAgICAgICAgICAgICAgICAgInJ1bmF3YXlfYnVyc3QiOgogICAgICAgICAgICAgICAgICAgICAgICAiJWQgcmVxdWVzdHMgaW4gdGhlIGxhc3QgbWludXRlLiBTdG9wcGVkIGhlcmUuIgogICAgICAgICAgICAgICAgICAgICAgICAlIGJ1cnN0X24sCiAgICAgICAgICAgICAgICAgICAgImJ1ZGdldF9leGhhdXN0ZWQiOgogICAgICAgICAgICAgICAgICAgICAgICAiVGhpcyBrZXkgaGFzIHJlYWNoZWQgaXRzIHRva2VuIGNlaWxpbmcuIiwKICAgICAgICAgICAgICAgICAgICAiZXhjZWVkc19yZW1haW5pbmdfYnVkZ2V0IjoKICAgICAgICAgICAgICAgICAgICAgICAgIlRoaXMgc2luZ2xlIGNhbGwgY291bGQgY29zdCBtb3JlIHRoYW4gdGhlIGJ1ZGdldCAiCiAgICAgICAgICAgICAgICAgICAgICAgICJsZWZ0LiIsCiAgICAgICAgICAgICAgICAgICAgImhlbGRfZm9yX2FfcGVyc29uIjoKICAgICAgICAgICAgICAgICAgICAgICAgIkhlbGQgZm9yIGEgcGVyc29uIHRvIGxvb2sgYXQgYmVmb3JlIHNwZW5kaW5nLiIsCiAgICAgICAgICAgICAgICB9LmdldChydWxlLCAiUmVmdXNlZCBiZWZvcmUgcmVhY2hpbmcgdGhlIG1vZGVsLiIpLAogICAgICAgICAgICAgICAgInRva2Vuc19ub3Rfc3BlbnQiOiAidGhpcyByZXF1ZXN0IG5ldmVyIHJlYWNoZWQgeW91ciBwcm92aWRlciwgIgogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAic28gbm8gY29tcGxldGlvbiB3YXMgcGFpZCBmb3IiLAogICAgICAgICAgICAgICAgIm91dHB1dF9jZWlsaW5nX2l0X3dvdWxkX2hhdmVfYXV0aG9yaXNlZCI6IGFzaywKICAgICAgICAgICAgfQogICAgICAgIH0KICAgICAgICBpZiByZWNlaXB0OgogICAgICAgICAgICBib2R5WyJlcnJvciJdWyJyZWNlaXB0Il0gPSByZWNlaXB0CiAgICAgICAgaWYgc2NvcmUgaXMgbm90IE5vbmU6CiAgICAgICAgICAgIGJvZHlbImVycm9yIl1bInNjb3JlIl0gPSBzY29yZQogICAgICAgIHJldHVybiBzZWxmLl9vdXQoNDI5LCBib2R5LCAiYXBwbGljYXRpb24vanNvbiIsCiAgICAgICAgICAgICAgICAgICAgICAgICB7IlgtU2F2ZXIiOiAicmVmdXNlZCIsICJYLVNhdmVyLVJ1bGUiOiBydWxlfSkKCiAgICBkZWYgX2ZvcndhcmQoc2VsZiwgcmF3LCByZXEsIHdoeSwgdmVyZGljdD1Ob25lLCByZWNlaXB0PU5vbmUsCiAgICAgICAgICAgICAgICAgZmluZGluZ3M9Tm9uZSk6CiAgICAgICAgdXJsID0gc2VsZi5jZmdbInVwc3RyZWFtIl0ucnN0cmlwKCIvIikgKyBzZWxmLnBhdGgKICAgICAgICByID0gdXJsbGliLnJlcXVlc3QuUmVxdWVzdCh1cmwsIGRhdGE9cmF3LCBtZXRob2Q9IlBPU1QiKQogICAgICAgIGZvciBoIGluIEZPUldBUkRfSEVBREVSUzoKICAgICAgICAgICAgdiA9IHNlbGYuaGVhZGVycy5nZXQoaCkKICAgICAgICAgICAgaWYgdjoKICAgICAgICAgICAgICAgIHIuYWRkX2hlYWRlcihoLCB2KQogICAgICAgIGZvciBrLCB2IGluIChzZWxmLmNmZy5nZXQoImhlYWRlcnMiKSBvciB7fSkuaXRlbXMoKToKICAgICAgICAgICAgci5hZGRfaGVhZGVyKGssIHYpCgogICAgICAgIHRyeToKICAgICAgICAgICAgd2l0aCB1cmxsaWIucmVxdWVzdC51cmxvcGVuKHIsIHRpbWVvdXQ9c2VsZi5jZmdbInRpbWVvdXQiXSkgYXMgdXA6CiAgICAgICAgICAgICAgICBib2R5LCBjb2RlID0gdXAucmVhZCgpLCB1cC5nZXRjb2RlKCkKICAgICAgICBleGNlcHQgdXJsbGliLmVycm9yLkhUVFBFcnJvciBhcyBlOgogICAgICAgICAgICBib2R5LCBjb2RlID0gZS5yZWFkKCksIGUuY29kZQogICAgICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMgZTogICMgbm9xYTogQkxFMDAxCiAgICAgICAgICAgIHJldHVybiBzZWxmLl9vdXQoNTAyLCB7ImVycm9yIjogewogICAgICAgICAgICAgICAgInR5cGUiOiAidXBzdHJlYW1fdW5yZWFjaGFibGUiLAogICAgICAgICAgICAgICAgIm1lc3NhZ2UiOiAiWW91ciBwcm92aWRlciBjb3VsZCBub3QgYmUgcmVhY2hlZC4gVGhpcyBpcyAiCiAgICAgICAgICAgICAgICAgICAgICAgICAgICJiZXR3ZWVuIHlvdSBhbmQgdGhlbTsgdGhlIHNhdmVyIG9ubHkgZm9yd2FyZHMuIiwKICAgICAgICAgICAgICAgICJkZXRhaWwiOiBzdHIoZSl9fSkKCiAgICAgICAgd2l0aCBzZWxmLnN0b3JlLmxvY2s6CiAgICAgICAgICAgIHNlbGYuc3RvcmUuYnVtcCgiZm9yd2FyZGVkIikKICAgICAgICAgICAgc2VsZi5zdG9yZS5jLmNvbW1pdCgpCgogICAgICAgIGlmIGNvZGUgPT0gMjAwIGFuZCBpc2luc3RhbmNlKHJlcSwgZGljdCkgYW5kIHdoeSA9PSAic2VudC10by10aGUtbW9kZWwiOgogICAgICAgICAgICBzZWxmLl9rZWVwKHJlcSwgYm9keSkKCiAgICAgICAgZXh0cmEgPSB7IlgtU2F2ZXIiOiB3aHl9CiAgICAgICAgaWYgdmVyZGljdDoKICAgICAgICAgICAgZXh0cmFbIlgtU2F2ZXItVmVyZGljdCJdID0gdmVyZGljdAogICAgICAgIGlmIHJlY2VpcHQ6CiAgICAgICAgICAgIGV4dHJhWyJYLVNhdmVyLVJlY2VpcHQiXSA9IHJlY2VpcHQKICAgICAgICBpZiBmaW5kaW5nczoKICAgICAgICAgICAgZXh0cmFbIlgtU2F2ZXItRmluZGluZ3MiXSA9IHN0cihsZW4oZmluZGluZ3MpKQogICAgICAgICAgICBmb3IgaSwgZiBpbiBlbnVtZXJhdGUoZmluZGluZ3NbOjNdKToKICAgICAgICAgICAgICAgIGV4dHJhWyJYLVNhdmVyLUZpbmRpbmctJWQiICUgKGkgKyAxKV0gPSBmWzoxODBdCiAgICAgICAgcmV0dXJuIHNlbGYuX291dChjb2RlLCBib2R5LCAiYXBwbGljYXRpb24vanNvbiIsIGV4dHJhKQoKICAgIGRlZiBfa2VlcChzZWxmLCByZXEsIGJvZHkpOgogICAgICAgICIiIlN0b3JlIHRoZSBhbnN3ZXIgaGVyZSwgYW5kIHRlbGwgc2ViYmkucHJvIG9ubHkgd2hhdCBpdCBjb3N0LiIiIgogICAgICAgIGlmIG5vdCBkZXRlcm1pbmlzdGljKHJlcSkgYW5kIG5vdCBzZWxmLmNmZ1sic3RvcmVfdmFyaWVkIl06CiAgICAgICAgICAgIHJldHVybgogICAgICAgIHRyeToKICAgICAgICAgICAgcmVzcCA9IGpzb24ubG9hZHMoYm9keSkKICAgICAgICBleGNlcHQgVmFsdWVFcnJvcjoKICAgICAgICAgICAgcmV0dXJuCiAgICAgICAgdGksIHRvID0gdXNhZ2Vfb2YocmVzcCkKICAgICAgICBub3cgPSB0aW1lLnRpbWUoKQogICAgICAgIGZwID0gZmluZ2VycHJpbnQocmVxKQogICAgICAgIHdpdGggc2VsZi5zdG9yZS5sb2NrOgogICAgICAgICAgICBzZWxmLnN0b3JlLnB1dChmcCwgcmVxLmdldCgibW9kZWwiKSwgYm9keSwgdGksIHRvLCBub3csCiAgICAgICAgICAgICAgICAgICAgICAgICAgIHNlbGYuY2ZnWyJ0dGwiXSkKICAgICAgICAgICAgc2VsZi5zdG9yZS5jLmNvbW1pdCgpCiAgICAgICAgc2VsZi51cGxpbmsubGF0ZXIoInJlY29yZCIsIHsKICAgICAgICAgICAgImRpZ2VzdCI6IGRpZ2VzdF9vZihyZXEpLAogICAgICAgICAgICAidXNhZ2UiOiB7ImlucHV0X3Rva2VucyI6IHRpLCAib3V0cHV0X3Rva2VucyI6IHRvfSwKICAgICAgICB9KQoKCiMgLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLSBjbGkKCmRlZiBsb2FkX2NvbmZpZyhwYXRoKToKICAgIGlmIG9zLnBhdGguZXhpc3RzKHBhdGgpOgogICAgICAgIHdpdGggb3BlbihwYXRoKSBhcyBmOgogICAgICAgICAgICByZXR1cm4ganNvbi5sb2FkKGYpCiAgICByZXR1cm4ge30KCgpkZWYgc2F2ZV9jb25maWcocGF0aCwgY2ZnKToKICAgIHNhZmUgPSBkaWN0KGNmZykKICAgIHdpdGggb3BlbihwYXRoLCAidyIpIGFzIGY6CiAgICAgICAganNvbi5kdW1wKHNhZmUsIGYsIGluZGVudD0yKQoKCmRlZiBtYWluKCk6CiAgICBoZXJlID0gb3MucGF0aC5kaXJuYW1lKG9zLnBhdGguYWJzcGF0aChfX2ZpbGVfXykpCiAgICBhcCA9IGFyZ3BhcnNlLkFyZ3VtZW50UGFyc2VyKAogICAgICAgIGRlc2NyaXB0aW9uPSJzZWJiaS5wcm8gdG9rZW4gc2F2ZXIgLSBjaGFuZ2Ugb25lIGxpbmUgaW4geW91ciBhcHAiKQogICAgYXAuYWRkX2FyZ3VtZW50KCItLWtleSIsIGhlbHA9InlvdXIgc2ViYmkucHJvIGtleSIpCiAgICBhcC5hZGRfYXJndW1lbnQoIi0tdXBzdHJlYW0iLCBoZWxwPSJ5b3VyIHByb3ZpZGVyLCBlLmcuICIKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgImh0dHBzOi8vYXBpLmFudGhyb3BpYy5jb20iKQogICAgYXAuYWRkX2FyZ3VtZW50KCItLXByb3ZpZGVyIiwgY2hvaWNlcz1zb3J0ZWQoUFJPVklERVJTKSwKICAgICAgICAgICAgICAgICAgICBoZWxwPSJzaG9ydGhhbmQgZm9yIC0tdXBzdHJlYW0iKQogICAgYXAuYWRkX2FyZ3VtZW50KCItLXBvcnQiLCB0eXBlPWludCwgZGVmYXVsdD1ERUZBVUxUX1BPUlQpCiAgICBhcC5hZGRfYXJndW1lbnQoIi0taG9zdCIsIGRlZmF1bHQ9IjEyNy4wLjAuMSIpCiAgICBhcC5hZGRfYXJndW1lbnQoIi0tc2ViYmkiLCBkZWZhdWx0PU5vbmUsIGhlbHA9InBsYXRmb3JtIGJhc2UgdXJsIikKICAgIGFwLmFkZF9hcmd1bWVudCgiLS10dGwtZGF5cyIsIHR5cGU9ZmxvYXQsIGRlZmF1bHQ9MzAuMCkKICAgIGFwLmFkZF9hcmd1bWVudCgiLS10aW1lb3V0IiwgdHlwZT1mbG9hdCwgZGVmYXVsdD0zMDAuMCwKICAgICAgICAgICAgICAgICAgICBoZWxwPSJob3cgbG9uZyB0byB3YWl0IG9uIHlvdXIgcHJvdmlkZXIiKQogICAgYXAuYWRkX2FyZ3VtZW50KCItLWdhdGUtdGltZW91dCIsIHR5cGU9ZmxvYXQsIGRlZmF1bHQ9Mi4wLAogICAgICAgICAgICAgICAgICAgIGhlbHA9ImhvdyBsb25nIHRvIHdhaXQgb24gc2ViYmkucHJvIGJlZm9yZSBjYXJyeWluZyBvbiIpCiAgICBhcC5hZGRfYXJndW1lbnQoIi0tdW5hdHRlbmRlZCIsIGFjdGlvbj0ic3RvcmVfdHJ1ZSIsCiAgICAgICAgICAgICAgICAgICAgaGVscD0ibm8gaHVtYW4gaXMgd2F0Y2hpbmcgdGhpcyBzeXN0ZW0iKQogICAgYXAuYWRkX2FyZ3VtZW50KCItLXN0cmljdCIsIGFjdGlvbj0ic3RvcmVfdHJ1ZSIsCiAgICAgICAgICAgICAgICAgICAgaGVscD0iYWxzbyByZWZ1c2UgcmVxdWVzdHMgbWFya2VkIGZvciBhIHBlcnNvbiB0byBjaGVjayIpCiAgICBhcC5hZGRfYXJndW1lbnQoIi0tc3RvcmUtdmFyaWVkIiwgYWN0aW9uPSJzdG9yZV90cnVlIiwKICAgICAgICAgICAgICAgICAgICBoZWxwPSJhbHNvIHN0b3JlIGFuc3dlcnMgd2hlcmUgdGVtcGVyYXR1cmUgaXMgYWJvdmUgemVybyIpCiAgICBhcC5hZGRfYXJndW1lbnQoIi0tb2ZmbGluZSIsIGFjdGlvbj0ic3RvcmVfdHJ1ZSIsCiAgICAgICAgICAgICAgICAgICAgaGVscD0ibmV2ZXIgY29udGFjdCBzZWJiaS5wcm87IGxvY2FsIHNhdmluZyBvbmx5IikKICAgIGFwLmFkZF9hcmd1bWVudCgiLS1sb2NhbC1vbmx5IiwgYWN0aW9uPSJzdG9yZV90cnVlIiwKICAgICAgICAgICAgICAgICAgICBoZWxwPSJsb2NhbCBydWxlcyBkZWNpZGU7IHN0aWxsIHNlbmQgcmVjb3JkcyB0byBzZWJiaS5wcm8iKQogICAgYXAuYWRkX2FyZ3VtZW50KCItLXNob3ctZGlnZXN0IiwgYWN0aW9uPSJzdG9yZV90cnVlIiwKICAgICAgICAgICAgICAgICAgICBoZWxwPSJwcmludCBldmVyeSBkaWdlc3QgYmVmb3JlIGl0IGlzIHNlbnQiKQogICAgYXAuYWRkX2FyZ3VtZW50KCItLWRiIiwgZGVmYXVsdD1vcy5wYXRoLmpvaW4oaGVyZSwgREJfTkFNRSkpCiAgICBhcC5hZGRfYXJndW1lbnQoIi0tY29uZmlnIiwgZGVmYXVsdD1vcy5wYXRoLmpvaW4oaGVyZSwgQ09ORklHX05BTUUpKQogICAgYSA9IGFwLnBhcnNlX2FyZ3MoKQoKICAgIHNhdmVkID0gbG9hZF9jb25maWcoYS5jb25maWcpCiAgICBrZXkgPSBhLmtleSBvciBzYXZlZC5nZXQoImtleSIpIG9yIG9zLmVudmlyb24uZ2V0KCJTRUJCSV9LRVkiKQogICAgdXBzdHJlYW0gPSBhLnVwc3RyZWFtIG9yIChQUk9WSURFUlMuZ2V0KGEucHJvdmlkZXIpIGlmIGEucHJvdmlkZXIgZWxzZSBOb25lKSBcCiAgICAgICAgb3Igc2F2ZWQuZ2V0KCJ1cHN0cmVhbSIpCiAgICBzZWJiaSA9IGEuc2ViYmkgb3Igc2F2ZWQuZ2V0KCJzZWJiaSIpIG9yIFNFQkJJX0RFRkFVTFQKCiAgICBpZiBub3QgdXBzdHJlYW06CiAgICAgICAgcHJpbnQoIldoaWNoIHByb3ZpZGVyIGFyZSB5b3UgY2FsbGluZz8gVXNlIG9uZSBvZjoiKQogICAgICAgIHByaW50KCIgIC0tcHJvdmlkZXIgYW50aHJvcGljICAgICAgKGh0dHBzOi8vYXBpLmFudGhyb3BpYy5jb20pIikKICAgICAgICBwcmludCgiICAtLXByb3ZpZGVyIG9wZW5haSAgICAgICAgIChodHRwczovL2FwaS5vcGVuYWkuY29tKSIpCiAgICAgICAgcHJpbnQoIiAgLS11cHN0cmVhbSBodHRwczovLy4uLiAgICAoYW55dGhpbmcgZWxzZSkiKQogICAgICAgIHJldHVybiAyCgogICAgaWYgbm90IGtleSBhbmQgbm90IGEub2ZmbGluZToKICAgICAgICBwcmludCgiTm8gc2ViYmkucHJvIGtleS4gRWl0aGVyOiIpCiAgICAgICAgcHJpbnQoIiAgLS1rZXkgWU9VUl9LRVkgICAgICB0byBzZWFsIHlvdXIgc2F2aW5ncyBhcyByZWNlaXB0cyIpCiAgICAgICAgcHJpbnQoIiAgLS1vZmZsaW5lICAgICAgICAgICB0byBzYXZlIHRva2VucyBsb2NhbGx5IHdpdGggbm8gYWNjb3VudCIpCiAgICAgICAgcmV0dXJuIDIKCiAgICBjZmcgPSB7ImtleSI6IGtleSwgInVwc3RyZWFtIjogdXBzdHJlYW0sICJzZWJiaSI6IHNlYmJpLAogICAgICAgICAgICJwb3J0IjogYS5wb3J0LCAidW5hdHRlbmRlZCI6IGEudW5hdHRlbmRlZCwgInN0cmljdCI6IGEuc3RyaWN0LAogICAgICAgICAgICJzdG9yZV92YXJpZWQiOiBhLnN0b3JlX3ZhcmllZCwgInR0bCI6IGEudHRsX2RheXMgKiA4NjQwMCwKICAgICAgICAgICAidGltZW91dCI6IGEudGltZW91dCwgImxvY2FsX29ubHkiOiBhLmxvY2FsX29ubHksCiAgICAgICAgICAgImhlYWRlcnMiOiBzYXZlZC5nZXQoImhlYWRlcnMiKSBvciB7fX0KICAgIHNhdmVfY29uZmlnKGEuY29uZmlnLCB7ImtleSI6IGtleSwgInVwc3RyZWFtIjogdXBzdHJlYW0sICJzZWJiaSI6IHNlYmJpLAogICAgICAgICAgICAgICAgICAgICAgICAgICAiaGVhZGVycyI6IGNmZ1siaGVhZGVycyJdfSkKCiAgICBzdG9yZSA9IFN0b3JlKGEuZGIpCiAgICB1cGxpbmsgPSBVcGxpbmsoc2ViYmksIGtleSBvciAiIiwgc3RvcmUsIHRpbWVvdXQ9YS5nYXRlX3RpbWVvdXQsCiAgICAgICAgICAgICAgICAgICAgb2ZmbGluZT1hLm9mZmxpbmUsIHNob3c9YS5zaG93X2RpZ2VzdCkKCiAgICBIYW5kbGVyLmNmZyA9IGNmZwogICAgSGFuZGxlci5zdG9yZSA9IHN0b3JlCiAgICBIYW5kbGVyLnVwbGluayA9IHVwbGluawoKICAgIHNydiA9IFRocmVhZGluZ0hUVFBTZXJ2ZXIoKGEuaG9zdCwgYS5wb3J0KSwgSGFuZGxlcikKICAgIHNydi5kYWVtb25fdGhyZWFkcyA9IFRydWUKCiAgICB3aGVyZSA9ICJodHRwOi8vJXM6JWQiICUgKGEuaG9zdCwgYS5wb3J0KQogICAgcHJpbnQoIiIpCiAgICBwcmludCgiICBzZWJiaS5wcm8gdG9rZW4gc2F2ZXIgJXMiICUgVkVSU0lPTikKICAgIHByaW50KCIgIC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLSIpCiAgICBwcmludCgiICBDaGFuZ2UgT05FIGxpbmUgaW4geW91ciBhcHBsaWNhdGlvbjoiKQogICAgcHJpbnQoIiIpCiAgICBwcmludCgiICAgICAgYmFzZV91cmwgPSBcIiVzXCIiICUgd2hlcmUpCiAgICBwcmludCgiIikKICAgIHByaW50KCIgIGZvcndhcmRpbmcgdG8gICAgICAlcyIgJSB1cHN0cmVhbSkKICAgIHByaW50KCIgIHNlYmJpLnBybyAgICAgICAgICAlcyIgJSAoIm9mZmxpbmUgYnkgY2hvaWNlIiBpZiBhLm9mZmxpbmUKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgZWxzZSBzZWJiaSkpCiAgICBwcmludCgiICBhbnN3ZXJzIHN0b3JlZCBhdCAgJXMiICUgYS5kYikKICAgIHByaW50KCIgIHdoYXQgaXQgaGFzIHNhdmVkICAlcy9zYXZlciIgJSB3aGVyZSkKICAgIHByaW50KCIiKQogICAgcHJpbnQoIiAgWW91ciBwcm9tcHRzIHN0YXkgb24gdGhpcyBtYWNoaW5lLiBPbmx5IGEgZmluZ2VycHJpbnQgYW5kIikKICAgIHByaW50KCIgIGNvdW50cyBnbyB0byBzZWJiaS5wcm8uIElmIGl0IGlzIHVucmVhY2hhYmxlIHlvdXIgdHJhZmZpYyIpCiAgICBwcmludCgiICBrZWVwcyBmbG93aW5nIGFuZCB0aGUgcmVjb3JkcyBjYXRjaCB1cC4iKQogICAgcHJpbnQoIiIpCiAgICB0cnk6CiAgICAgICAgc3J2LnNlcnZlX2ZvcmV2ZXIoKQogICAgZXhjZXB0IEtleWJvYXJkSW50ZXJydXB0OgogICAgICAgIHByaW50KCJcbiAgc3RvcHBpbmcuIE5vdGhpbmcgd2FzIGxvc3QuIikKICAgICAgICBzcnYuc2h1dGRvd24oKQogICAgcmV0dXJuIDAKCgppZiBfX25hbWVfXyA9PSAiX19tYWluX18iOgogICAgc3lzLmV4aXQobWFpbigpKQo=";
-
-/* download without a server: the file is already in this page */
-(function(){
-  const bin = atob(CLIENT_B64);
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  const url = URL.createObjectURL(new Blob([bytes], {type:"text/x-python"}));
-  const a = document.getElementById("dl");
-  a.href = url;
-  a.addEventListener("click", function(){
-    document.getElementById("saved").textContent =
-      "Saved sebbi_tokensaver.py — " + bytes.length.toLocaleString() +
-      " bytes. Next: python3 sebbi_tokensaver.py --offline --provider anthropic";
-  });
-})();
-
-/* the digest, computed here, so nobody has to take our word for it */
-const SAMPLE = {
-  model: "claude-sonnet-4-6",
-  temperature: 0,
-  max_tokens: 1024,
-  system: "You are a support agent for an insurance broker.",
-  messages: [
-    {role: "user", content: "What is our excess on a commercial fleet policy?"}
-  ]
-};
-
-const KEYED = ["model","messages","system","prompt","input","temperature",
-  "top_p","top_k","max_tokens","max_completion_tokens","stop","stop_sequences",
-  "tools","tool_choice","response_format","seed"];
-
-function canon(o){
-  if (o === null || typeof o !== "object") return JSON.stringify(o);
-  if (Array.isArray(o)) return "[" + o.map(canon).join(",") + "]";
-  return "{" + Object.keys(o).sort().map(k =>
-    JSON.stringify(k) + ":" + canon(o[k])).join(",") + "}";
-}
-function chars(v){
-  if (v === null || v === undefined) return 0;
-  if (typeof v === "string") return v.length;
-  return canon(v).length;
-}
-function promptChars(r){
-  let t = 0;
-  for (const k of ["prompt","input","system"]) t += chars(r[k]);
-  if (Array.isArray(r.messages))
-    for (const m of r.messages) t += chars(m && m.content !== undefined ? m.content : m);
-  if (r.tools !== undefined) t += chars(r.tools);
-  return t;
-}
-async function digest(r){
-  const keyed = {};
-  for (const k of KEYED) if (k in r) keyed[k] = r[k];
-  const body = "SEBBI-TOKENSAVER-v2\n" + canon(keyed);
-  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(body));
-  const fp = [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2,"0")).join("");
-  const ask = r.max_tokens ?? r.max_completion_tokens ?? 0;
-  const t = r.temperature;
-  return {
-    fingerprint: fp,
-    model: r.model ?? null,
-    prompt_characters: promptChars(r),
-    max_tokens: Number.isFinite(+ask) ? +ask : 0,
-    conversation_turns: Array.isArray(r.messages) ? r.messages.length : 0,
-    tool_definitions: Array.isArray(r.tools) ? r.tools.length : 0,
-    deterministic: t === undefined || +t === 0
-  };
-}
-function render(d){
-  const rows = Object.entries(d).map(([k,v]) => {
-    const cls = k === "fingerprint" ? "fp" : "v";
-    return '<span class="k">' + k + ':</span> <span class="' + cls + '">' +
-      String(JSON.stringify(v)).replace(/[<>&]/g, c =>
-        ({"<":"&lt;",">":"&gt;","&":"&amp;"}[c])) + "</span>";
-  });
-  return rows.join("\n");
-}
-/* get a key: same signup route the other products use */
-(function(){
-  const btn = document.getElementById("getkey");
-  const msg = document.getElementById("keymsg");
-  btn.addEventListener("click", async function(){
-    const email = document.getElementById("email").value.trim();
-    const org = document.getElementById("org").value.trim();
-    if (!email || email.indexOf("@") < 1) {
-      msg.innerHTML = '<span class="no">That email does not look right. ' +
-        'Check it and try again.</span>';
-      return;
-    }
-    btn.disabled = true;
-    msg.textContent = "Making your key\u2026";
-    try {
-      const r = await fetch("/signup", {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({email: email, org: org, product: "tokensaver"})
-      });
-      const d = await r.json();
-      if (d && d.key) {
-        msg.innerHTML = '<span class="yes">Your key is ready.</span> ' +
-          '<code>' + d.key + '</code><br>We have emailed it to you as well. ' +
-          'Start the file with it:<br><code>python3 sebbi_tokensaver.py --key ' +
-          d.key + ' --provider anthropic</code>';
-      } else {
-        msg.innerHTML = '<span class="no">' +
-          ((d && (d.error || d.detail)) || "That did not go through.") +
-          '</span> Try again, or email justrightdecorators@gmail.com and we ' +
-          'will sort it by hand.';
-        btn.disabled = false;
-      }
-    } catch (e) {
-      msg.innerHTML = '<span class="no">Could not reach the server.</span> ' +
-        'The file still works without a key \u2014 run it with ' +
-        '<code>--offline</code> and you save the same money.';
-      btn.disabled = false;
-    }
-  });
-})();
-
-const inEl = document.getElementById("in");
-const outEl = document.getElementById("out");
-let timer;
-async function update(){
-  let r;
-  try { r = JSON.parse(inEl.value); }
-  catch (e) {
-    outEl.innerHTML = '<span class="err">That is not valid JSON yet. ' +
-      'Keep typing — nothing is sent anywhere either way.</span>';
-    return;
-  }
-  if (!r || typeof r !== "object" || Array.isArray(r)) {
-    outEl.innerHTML = '<span class="err">Send an object, the way your ' +
-      'provider expects it.</span>';
-    return;
-  }
-  outEl.innerHTML = render(await digest(r));
-}
-inEl.value = JSON.stringify(SAMPLE, null, 2);
-inEl.addEventListener("input", () => { clearTimeout(timer); timer = setTimeout(update, 120); });
-update();
-</script>
-</body>
-</html>
-
-```
-
-
-## `verify.html`
-
-136 lines, 9022 bytes
+867 lines, 60432 bytes
 
 ```html
 <!DOCTYPE html>
@@ -554,132 +14,863 @@ update();
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Verify &amp; seal — sebbi.pro</title>
+<title>SonicBoom &mdash; Your Own AI Compliance Engine. Runs Local. Sub-20ms.</title>
+<meta name="description" content="SonicBoom gives you your own AILeash compliance engine. Runs inside your infrastructure. Every decision is local. No round trip. Sub-20ms.">
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;800;900&family=DM+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <style>
-  :root{--ink:#0a0f1e;--ink2:#10182e;--gold:#c9a84c;--ok:#7fe3b0;--err:#ff8a80;--muted:#94a3b8;}
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{background:var(--ink);color:#fff;font-family:system-ui,sans-serif;min-height:100vh;padding:24px 18px;line-height:1.6}
-  .wrap{max-width:640px;margin:0 auto}
-  .brand{font-family:monospace;font-size:10px;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,0.35)}
-  h1{font-family:Georgia,serif;font-size:27px;color:var(--gold);margin:12px 0 6px}
-  h2{font-family:Georgia,serif;font-size:20px;color:#fff;margin:36px 0 10px;border-top:1px solid rgba(201,168,76,0.18);padding-top:26px}
-  .sub{font-size:13.5px;color:rgba(255,255,255,0.5);line-height:1.7;margin-bottom:20px}
-  textarea{width:100%;min-height:150px;background:var(--ink2);border:1px solid rgba(201,168,76,0.35);color:#fff;border-radius:8px;padding:14px;font-size:14px;font-family:inherit;line-height:1.6;outline:none;resize:vertical}
-  textarea:focus{border-color:var(--gold)}
-  button{width:100%;margin-top:12px;background:var(--gold);color:var(--ink);border:none;border-radius:8px;padding:15px;font-size:15px;font-weight:800;cursor:pointer}
-  button:disabled{opacity:0.5}
-  #result{display:none;margin-top:18px;border-radius:10px;padding:22px;text-align:left}
-  #result.ok{display:block;background:rgba(127,227,176,0.08);border:2px solid var(--ok)}
-  #result.err{display:block;background:rgba(255,138,128,0.08);border:2px solid var(--err)}
-  #result .big{font-size:20px;font-weight:900;font-family:Georgia,serif;margin-bottom:8px;text-align:center}
-  #result.ok .big{color:var(--ok)}
-  #result.err .big{color:var(--err)}
-  #result .detail{font-family:monospace;font-size:12px;color:rgba(255,255,255,0.72);line-height:1.9;word-break:break-all}
-  p.body{font-size:14px;color:rgba(255,255,255,0.72);margin-bottom:12px}
-  p.body b{color:#fff}
-  .step{display:flex;gap:12px;margin:12px 0;font-size:14px;color:rgba(255,255,255,0.75)}
-  .step .n{flex:none;width:26px;height:26px;border-radius:50%;background:rgba(201,168,76,0.15);border:1px solid var(--gold);color:var(--gold);font-family:monospace;font-size:12px;font-weight:700;display:flex;align-items:center;justify-content:center}
-  .tools{display:flex;flex-direction:column;gap:10px;margin:18px 0}
-  .tool{display:block;text-decoration:none;background:var(--ink2);border:1px solid rgba(201,168,76,0.3);border-radius:9px;padding:15px 16px;transition:border-color .15s}
-  .tool:hover,.tool:focus{border-color:var(--gold)}
-  .tool .t{font-size:15px;font-weight:700;color:var(--gold)}
-  .tool .d{font-size:12.5px;color:rgba(255,255,255,0.5);margin-top:2px}
-  .note{margin-top:14px;font-size:12px;color:rgba(255,255,255,0.35);line-height:1.7}
-  .note b{color:var(--gold);font-weight:600}
-  a.inline{color:var(--gold)}
-  footer{margin-top:40px;border-top:1px solid rgba(201,168,76,0.18);padding-top:18px;font-size:12px;color:rgba(255,255,255,0.4);text-align:center}
-  footer a{color:var(--gold);text-decoration:none}
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --navy:#0a0f1e;--cyan:#00d4ff;--gold:#c9a84c;--white:#fff;
+  --green:#00ff88;--red:#cc0000;--purple:#7c3aed;
+  --mono:'JetBrains Mono',monospace;--sans:'DM Sans',sans-serif;--display:'Playfair Display',serif
+}
+html,body{background:var(--navy);color:var(--white);font-family:var(--sans);overflow-x:hidden}
+html{scroll-behavior:smooth}
+nav{position:fixed;top:0;left:0;right:0;z-index:100;background:rgba(10,15,30,0.97);backdrop-filter:blur(12px);padding:0 48px;height:68px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid rgba(0,212,255,0.1)}
+.nav-logo{font-family:var(--display);font-size:20px;color:var(--white);font-weight:900;text-decoration:none}.nav-logo span{color:var(--cyan)}
+.nav-links{display:flex;gap:16px;align-items:center}
+.nav-links a{color:rgba(255,255,255,0.4);text-decoration:none;font-size:13px;font-weight:500;transition:color .2s}.nav-links a:hover{color:var(--white)}
+.nav-cta{background:var(--cyan)!important;color:var(--navy)!important;padding:9px 18px;font-weight:700!important;border-radius:4px}
+.scan-sec{padding:140px 48px 80px;position:relative;overflow:hidden;text-align:center;border-bottom:1px solid rgba(0,212,255,0.1)}
+.scan-sec::before{content:'';position:absolute;inset:0;background:radial-gradient(ellipse at 50% 40%,rgba(0,212,255,0.06) 0%,transparent 65%)}
+.scan-sec::after{content:'';position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,var(--cyan),transparent)}
+.scan-inner{max-width:820px;margin:0 auto;position:relative;z-index:1}
+.scan-eyebrow{font-family:var(--mono);font-size:11px;letter-spacing:3px;text-transform:uppercase;color:var(--cyan);margin-bottom:20px;display:block}
+.scan-title{font-family:var(--display);font-size:clamp(36px,5vw,64px);line-height:1.05;font-weight:900;margin-bottom:16px}
+.scan-title em{color:var(--cyan);font-style:normal}
+.scan-sub{font-size:16px;color:rgba(255,255,255,0.35);line-height:1.7;margin-bottom:16px}
+.data-note{font-family:var(--mono);font-size:11px;color:rgba(0,255,136,0.55);margin-bottom:32px;line-height:1.7}
+.sound-toggle{display:inline-flex;align-items:center;gap:10px;background:rgba(0,212,255,0.08);border:1px solid rgba(0,212,255,0.2);border-radius:40px;padding:10px 20px;cursor:pointer;margin-bottom:32px;transition:all .2s;font-family:var(--mono);font-size:11px;letter-spacing:1px;text-transform:uppercase;color:var(--cyan)}
+.sound-toggle:hover{background:rgba(0,212,255,0.15)}
+.category-badge{display:none;margin:0 auto 24px;padding:10px 24px;border-radius:40px;font-family:var(--mono);font-size:11px;letter-spacing:2px;text-transform:uppercase;font-weight:700;width:fit-content}
+.category-badge.show{display:block}
+.cat-enterprise{background:rgba(201,168,76,0.1);border:1px solid rgba(201,168,76,0.3);color:var(--gold)}
+.cat-developer{background:rgba(0,212,255,0.1);border:1px solid rgba(0,212,255,0.3);color:var(--cyan)}
+.cat-callcentre{background:rgba(0,135,90,0.1);border:1px solid rgba(0,135,90,0.3);color:#00ff88}
+.cat-lawenforcement{background:rgba(124,58,237,0.1);border:1px solid rgba(124,58,237,0.3);color:#a78bfa}
+.cat-consumer{background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);color:rgba(255,255,255,0.5)}
+.terminal{background:rgba(0,0,0,0.55);border:1px solid rgba(0,212,255,0.2);border-radius:8px;overflow:hidden;text-align:left;margin-bottom:40px;box-shadow:0 0 60px rgba(0,212,255,0.05)}
+.terminal-bar{background:rgba(0,212,255,0.05);padding:12px 20px;border-bottom:1px solid rgba(0,212,255,0.1);display:flex;align-items:center;gap:8px}
+.t-dot{width:10px;height:10px;border-radius:50%}
+.t-dot-r{background:#ff5f57}.t-dot-y{background:#febc2e}.t-dot-g{background:#28c840}
+.t-title{font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.2);letter-spacing:2px;text-transform:uppercase;margin-left:8px}
+.terminal-body{padding:28px 28px 32px;min-height:320px;max-height:70vh;overflow-y:auto}
+.terminal-body::-webkit-scrollbar{width:3px}.terminal-body::-webkit-scrollbar-thumb{background:rgba(0,212,255,0.2);border-radius:2px}
+.t-line{font-family:var(--mono);font-size:13px;line-height:2.1;display:flex;align-items:flex-start;gap:10px;opacity:0;transform:translateY(4px);transition:opacity .25s,transform .25s}
+.t-line.show{opacity:1;transform:none}
+.t-prompt{color:rgba(0,212,255,0.3);flex-shrink:0;user-select:none}
+.t-text{color:rgba(255,255,255,0.75);flex:1}
+.t-cyan{color:var(--cyan)}.t-green{color:var(--green)}.t-gold{color:var(--gold)}.t-red{color:#ff6b6b}.t-dim{color:rgba(255,255,255,0.2)}.t-purple{color:#a78bfa}
+.t-hash{color:var(--green);font-size:11px;word-break:break-all;line-height:1.6}
+.t-section{font-family:var(--mono);font-size:9px;letter-spacing:3px;text-transform:uppercase;color:rgba(0,212,255,0.2);padding:10px 0 4px;border-top:1px solid rgba(255,255,255,0.04);margin-top:6px;opacity:0;transition:opacity .3s}
+.t-section.show{opacity:1}
+.t-sales{font-family:var(--mono);font-size:12px;line-height:1.8;opacity:0;transform:translateY(4px);transition:opacity .3s,transform .3s;padding:12px 16px;border-radius:4px;margin:4px 0}
+.t-sales.show{opacity:1;transform:none}
+.t-sales-enterprise{background:rgba(201,168,76,0.06);border-left:3px solid var(--gold);color:rgba(255,255,255,0.6)}
+.t-sales-developer{background:rgba(0,212,255,0.04);border-left:3px solid var(--cyan);color:rgba(255,255,255,0.6)}
+.t-sales-callcentre{background:rgba(0,255,136,0.04);border-left:3px solid var(--green);color:rgba(255,255,255,0.6)}
+.t-sales-law{background:rgba(124,58,237,0.06);border-left:3px solid #7c3aed;color:rgba(255,255,255,0.6)}
+.t-sales-consumer{background:rgba(255,255,255,0.03);border-left:3px solid rgba(255,255,255,0.15);color:rgba(255,255,255,0.5)}
+.verdict{display:none;padding:28px 28px 32px;border-top:1px solid rgba(0,212,255,0.1);background:rgba(0,0,0,0.3)}
+.verdict.show{display:block}
+.verdict-decision{font-family:var(--display);font-size:56px;font-weight:900;line-height:1;margin-bottom:6px;letter-spacing:2px;color:var(--green)}
+.verdict-score{font-family:var(--mono);font-size:11px;color:rgba(255,255,255,0.25);letter-spacing:1px;margin-bottom:20px}
+.verdict-hash-label{font-family:var(--mono);font-size:9px;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,0.15);margin-bottom:6px}
+.verdict-hash{font-family:var(--mono);font-size:11px;color:var(--green);word-break:break-all;background:rgba(0,0,0,0.3);padding:10px 12px;border-radius:4px;margin-bottom:12px;line-height:1.6}
+.verdict-sealed{font-family:var(--mono);font-size:10px;color:rgba(0,212,255,0.35);letter-spacing:1px}
+.verdict-verify{display:inline-block;margin-top:12px;font-family:var(--mono);font-size:10px;color:var(--cyan);text-decoration:none;border-bottom:1px solid rgba(0,212,255,0.3)}
+.fear-sec{display:none;padding:0 48px 80px;text-align:center}
+.fear-sec.show{display:block}
+.fear-inner{max-width:720px;margin:0 auto}
+.fear-line{font-family:var(--display);font-size:clamp(20px,3vw,34px);font-weight:900;line-height:1.3;margin-bottom:20px;opacity:0;transform:translateY(24px);transition:opacity .7s,transform .7s}
+.fear-line.show{opacity:1;transform:none}
+.fear-line em{color:var(--cyan);font-style:normal}
+.fear-line strong{color:var(--red)}
+.fear-divider{width:60px;height:3px;background:linear-gradient(90deg,var(--cyan),var(--gold));margin:36px auto;opacity:0;transition:opacity .7s;border-radius:2px}
+.fear-divider.show{opacity:1}
+.fear-cta{margin-top:52px;opacity:0;transform:translateY(24px);transition:opacity .7s,transform .7s}
+.fear-cta.show{opacity:1;transform:none}
+.fear-price{font-family:var(--display);font-size:clamp(56px,10vw,110px);font-weight:900;color:var(--cyan);line-height:1;margin-bottom:4px}
+.fear-price-label{font-family:var(--mono);font-size:11px;letter-spacing:2px;color:rgba(255,255,255,0.2);margin-bottom:36px;text-transform:uppercase}
+.btn-cyan{background:var(--cyan);color:var(--navy);padding:16px 36px;border:none;font-family:var(--sans);font-weight:700;font-size:16px;cursor:pointer;text-decoration:none;border-radius:4px;display:inline-block;transition:all .2s}.btn-cyan:hover{background:#33ddff;transform:translateY(-2px)}
+.btn-ghost{background:transparent;color:rgba(255,255,255,0.4);padding:16px 36px;border:1px solid rgba(255,255,255,0.1);font-family:var(--sans);font-weight:600;font-size:16px;cursor:pointer;text-decoration:none;border-radius:4px;display:inline-block;transition:all .2s;margin-left:12px}.btn-ghost:hover{color:var(--white);border-color:rgba(255,255,255,0.3)}
+.divider{height:1px;background:linear-gradient(90deg,transparent,rgba(0,212,255,0.3),transparent)}
+.what-sec{padding:80px 48px;border-bottom:1px solid rgba(255,255,255,0.05)}
+.what-inner,.engine-inner,.how-inner,.pricing-inner{max-width:1100px;margin:0 auto}
+.sec-eyebrow{font-family:var(--mono);font-size:10px;letter-spacing:3px;text-transform:uppercase;color:rgba(0,212,255,0.5);margin-bottom:16px;display:block}
+h2{font-family:var(--display);font-size:clamp(28px,3.5vw,48px);font-weight:900;line-height:1.1;margin-bottom:16px}
+h2 em{color:var(--cyan);font-style:normal}
+.sec-sub{font-size:15px;color:rgba(255,255,255,0.35);line-height:1.8;max-width:580px;margin-bottom:52px}
+.two-col{display:grid;grid-template-columns:1fr 1fr;gap:2px;background:rgba(255,255,255,0.04)}
+.col{background:var(--navy);padding:40px 36px}
+.col-label{font-family:var(--mono);font-size:9px;letter-spacing:2px;text-transform:uppercase;margin-bottom:20px;padding:4px 10px;border-radius:2px;display:inline-block}
+.col-old .col-label{color:rgba(255,255,255,0.2);background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08)}
+.col-new .col-label{color:var(--cyan);background:rgba(0,212,255,0.06);border:1px solid rgba(0,212,255,0.2)}
+.col h3{font-family:var(--display);font-size:22px;font-weight:900;margin-bottom:12px}
+.col-old h3{color:rgba(255,255,255,0.3)}.col-new h3{color:var(--white)}
+.col p{font-size:14px;line-height:1.75;margin-bottom:20px}
+.col-old p{color:rgba(255,255,255,0.2)}.col-new p{color:rgba(255,255,255,0.5)}
+.col-stat{font-family:var(--display);font-size:52px;font-weight:900;line-height:1;margin-bottom:4px}
+.col-old .col-stat{color:rgba(255,255,255,0.1)}.col-new .col-stat{color:var(--cyan)}
+.col-stat-label{font-family:var(--mono);font-size:9px;letter-spacing:2px;color:rgba(255,255,255,0.2);text-transform:uppercase}
+.engine-sec{padding:80px 48px;background:rgba(0,212,255,0.02);border-bottom:1px solid rgba(0,212,255,0.08)}
+.engine-card{background:rgba(255,255,255,0.03);border:1px solid rgba(0,212,255,0.15);border-radius:8px;overflow:hidden;margin-top:40px}
+.engine-card-header{background:rgba(0,212,255,0.06);border-bottom:1px solid rgba(0,212,255,0.1);padding:24px 32px;display:flex;align-items:center;justify-content:space-between}
+.engine-card-title{font-family:var(--display);font-size:24px;font-weight:900;color:var(--white)}.engine-card-title span{color:var(--cyan)}
+.engine-badge{font-family:var(--mono);font-size:9px;letter-spacing:2px;text-transform:uppercase;color:var(--cyan);background:rgba(0,212,255,0.1);border:1px solid rgba(0,212,255,0.2);padding:5px 12px;border-radius:2px}
+.engine-body{padding:32px;display:grid;grid-template-columns:1fr 1fr;gap:40px}
+.engine-features{display:flex;flex-direction:column;gap:16px}
+.ef{display:flex;align-items:flex-start;gap:12px}
+.ef-icon{font-family:var(--mono);font-size:9px;font-weight:700;color:var(--cyan);flex-shrink:0;margin-top:2px}
+.ef-text h4{font-size:14px;font-weight:700;color:var(--white);margin-bottom:3px}
+.ef-text p{font-size:13px;color:rgba(255,255,255,0.35);line-height:1.6}
+.engine-download{background:rgba(0,0,0,0.3);border:1px solid rgba(0,212,255,0.1);border-radius:6px;padding:28px;display:flex;flex-direction:column;gap:16px}
+.dl-label{font-family:var(--mono);font-size:9px;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,0.2);margin-bottom:4px}
+.dl-filename{font-family:var(--mono);font-size:16px;color:var(--cyan);font-weight:600}
+.dl-size{font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.15);margin-top:2px}
+.dl-steps{display:flex;flex-direction:column;gap:8px}
+.dl-step{font-family:var(--mono);font-size:12px;color:rgba(255,255,255,0.4);line-height:1.5}
+.dl-step strong{color:var(--cyan)}
+.code-block{background:rgba(0,0,0,0.4);border:1px solid rgba(0,212,255,0.1);border-radius:6px;padding:20px;font-family:var(--mono);font-size:12px;line-height:1.8;color:rgba(255,255,255,0.5);overflow-x:auto;white-space:pre}
+.code-block .c-cyan{color:var(--cyan)}.code-block .c-green{color:var(--green)}.code-block .c-gold{color:var(--gold)}.code-block .c-dim{color:rgba(255,255,255,0.2)}
+.dl-btn{display:block;text-align:center;background:rgba(0,212,255,0.1);border:1px solid rgba(0,212,255,0.3);color:var(--cyan);padding:12px;border-radius:4px;font-family:var(--mono);font-size:12px;font-weight:600;text-decoration:none;transition:all .2s;cursor:pointer}.dl-btn:hover{background:rgba(0,212,255,0.2)}
+.how-sec{padding:80px 48px;border-bottom:1px solid rgba(255,255,255,0.05)}
+.steps{display:grid;grid-template-columns:repeat(4,1fr);gap:2px;background:rgba(255,255,255,0.04);margin-top:40px}
+.step{background:var(--navy);padding:32px 24px}
+.step-n{font-family:var(--display);font-size:56px;font-weight:900;color:var(--cyan);opacity:0.15;line-height:1;margin-bottom:12px}
+.step h3{font-family:var(--display);font-size:18px;font-weight:900;color:var(--white);margin-bottom:10px}
+.step p{font-size:13px;color:rgba(255,255,255,0.35);line-height:1.7}
+.pricing-sec{padding:80px 48px;border-bottom:1px solid rgba(255,255,255,0.05)}
+.price-card{background:rgba(255,255,255,0.03);border:1px solid rgba(0,212,255,0.15);border-radius:8px;padding:48px;margin-top:40px;text-align:center;max-width:600px;margin-left:auto;margin-right:auto}
+.price-big{font-family:var(--display);font-size:96px;font-weight:900;color:var(--cyan);line-height:1;margin-bottom:4px}
+.price-per{font-family:var(--mono);font-size:11px;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,0.2);margin-bottom:32px}
+.price-includes{display:flex;flex-direction:column;gap:10px;text-align:left;margin-bottom:32px}
+.pi{display:flex;align-items:center;gap:10px;font-size:14px;color:rgba(255,255,255,0.5)}
+.pi::before{content:'OK';font-family:var(--mono);font-size:9px;font-weight:700;color:var(--cyan);flex-shrink:0}
+.signup-sec{padding:80px 48px}
+.signup-inner{max-width:520px;margin:0 auto;text-align:center}
+.signup-inner p{font-size:15px;color:rgba(255,255,255,0.35);line-height:1.7;margin-bottom:32px}
+.fg{margin-bottom:12px;text-align:left}
+.fg label{display:block;font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.25);letter-spacing:2px;text-transform:uppercase;margin-bottom:6px}
+.fg input,.fg select{width:100%;background:rgba(255,255,255,0.05);border:2px solid rgba(255,255,255,0.08);color:var(--white);padding:12px 14px;font-size:14px;font-family:var(--sans);outline:none;border-radius:4px;transition:border-color .2s}
+.fg input:focus,.fg select:focus{border-color:var(--cyan)}
+.fg input::placeholder{color:rgba(255,255,255,0.2)}
+.fg select option{background:var(--navy)}
+.fg-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.btn-full{width:100%;padding:14px;font-size:15px;font-weight:700;border-radius:4px;border:none;cursor:pointer;font-family:var(--sans);transition:all .2s;background:var(--cyan);color:var(--navy);margin-top:8px}
+.btn-full:hover{background:#33ddff}
+.key-box{display:none;margin-top:24px;background:rgba(0,0,0,0.4);border:1px solid rgba(0,212,255,0.2);border-radius:6px;padding:24px;text-align:left}
+.key-box.show{display:block}
+.key-lbl{font-family:var(--mono);font-size:9px;letter-spacing:2px;color:var(--cyan);margin-bottom:8px;text-transform:uppercase}
+.key-val{font-family:var(--mono);font-size:11px;color:var(--green);word-break:break-all;background:rgba(0,0,0,0.3);padding:10px;border-radius:4px;margin-bottom:16px}
+.msg-err{display:none;color:#ff6b6b;font-family:var(--mono);font-size:11px;margin-top:10px;padding:10px;background:rgba(255,0,0,0.08);border-radius:4px;border:1px solid rgba(255,0,0,0.2)}
+.msg-err.show{display:block}
+footer{background:rgba(0,0,0,0.4);padding:48px;border-top:1px solid rgba(255,255,255,0.04)}
+.foot-inner{max-width:1100px;margin:0 auto;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:20px}
+.foot-logo{font-family:var(--display);font-size:18px;color:var(--white);font-weight:900;text-decoration:none}.foot-logo span{color:var(--cyan)}
+.foot-links{display:flex;gap:24px;flex-wrap:wrap}
+.foot-links a{color:rgba(255,255,255,0.2);text-decoration:none;font-size:12px;transition:color .2s}.foot-links a:hover{color:var(--white)}
+.foot-copy{font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.1);width:100%;margin-top:16px;padding-top:16px;border-top:1px solid rgba(255,255,255,0.04)}
+@media(max-width:900px){
+  nav{padding:0 20px}.nav-links a:not(.nav-cta){display:none}
+  .scan-sec,.what-sec,.engine-sec,.how-sec,.pricing-sec,.signup-sec,.fear-sec{padding-left:20px!important;padding-right:20px!important}
+  .two-col,.engine-body,.steps,.fg-row{grid-template-columns:1fr!important}
+  footer{padding:36px 20px}.foot-inner{flex-direction:column;align-items:flex-start}
+  .btn-ghost{margin-left:0;margin-top:12px}
+}
 </style>
 </head>
 <body>
-<div class="wrap">
-  <div class="brand">sebbi.pro &middot; live chain verification</div>
-  <h1>Verify a sealed post</h1>
-  <div class="sub">Paste the exact text of any hash-chained post below. This page fingerprints it (SHA-256, in your own browser) and checks the live chain. Change even one letter and it will fail.</div>
 
-  <textarea id="txt" placeholder="Paste the post text here — exactly as published, without the footer line..."></textarea>
-  <button id="go" onclick="verify()">Check the chain &rarr;</button>
-  <div id="result"></div>
-
-  <h2>What is this?</h2>
-  <p class="body">Sealing takes any text — a post, a letter, a contract, your profile — and locks a fingerprint of it into a permanent, tamper-evident chain with an exact timestamp. From that moment, anyone can prove the words haven't been changed since. No account, no trust required: it's maths you can check yourself.</p>
-  <p class="body">The point isn't secrecy. The text can be completely public. The point is that <b>nobody can quietly change it after the fact, and nobody has to take your word that they didn't.</b></p>
-
-  <h2>How to seal something</h2>
-  <div class="step"><div class="n">1</div><div>Pick the right tool below for what you're sealing.</div></div>
-  <div class="step"><div class="n">2</div><div>Paste your text (or fill in your details) and hit seal. It fingerprints everything in your own browser.</div></div>
-  <div class="step"><div class="n">3</div><div>You get a verification code and a timestamp. Share the code, or keep it — your choice.</div></div>
-  <div class="step"><div class="n">4</div><div>Anyone can then check it against the chain, right here or on the matching page.</div></div>
-
-  <h2>The tools</h2>
-  <div class="tools">
-    <a class="tool" href="/seal">
-      <div class="t">Seal a post &rarr;</div>
-      <div class="d">Lock the exact words of a post or announcement before you publish. sebbi.pro/seal</div>
-    </a>
-    <a class="tool" href="/identity">
-      <div class="t">Seal your profile &rarr;</div>
-      <div class="d">Register your name, bio and links so nobody can clone your identity. Put the code in your bio. sebbi.pro/identity</div>
-    </a>
-    <a class="tool" href="/pay-check">
-      <div class="t">Seal &amp; check payment details &rarr;</div>
-      <div class="d">Businesses seal their real bank details; customers check an invoice before paying. sebbi.pro/pay-check</div>
-    </a>
+<nav>
+  <a href="https://sebbi.pro" class="nav-logo">Monop <span>Content</span></a>
+  <div class="nav-links">
+    <a href="https://sebbi.pro/#products">All Products</a>
+    <a href="https://sebbi.pro/scan">Free Scanner</a>
+    <a href="https://sebbi.pro/contact">Contact</a>
+    <a href="#signup" class="nav-cta">Get SonicBoom Free</a>
   </div>
+</nav>
 
-  <h2>Public or private — your choice</h2>
-  <p class="body"><b>Public seal:</b> the details are stored and anyone can see them when they check. Right for things you want verifiable — your identity, a published notice, a price list.</p>
-  <p class="body"><b>Private seal:</b> only the fingerprint is sealed. The content never leaves your device and is never stored. The chain just proves that a document with that exact fingerprint existed at that moment. You keep the original, and reveal it only if you ever need it as evidence — a contract, a sensitive letter. On the profile page, this is the "publish to public registry" tick box: untick it to seal privately.</p>
+<section class="scan-sec">
+  <div class="scan-inner">
+    <span class="scan-eyebrow">SonicBoom &mdash; sebbi.pro &mdash; Live Engine</span>
+    <h1 class="scan-title" style="font-family:var(--display);font-size:clamp(36px,5vw,64px);line-height:1.05;font-weight:900;margin-bottom:16px">Hello.<br><em>We already know who you are.</em></h1>
+    <p class="scan-sub">Welcome to sebbi.pro. We are Monop Content. This is our AI compliance engine. It has been scanning you since the moment you arrived.</p>
+    <p class="data-note">Everything below is real: your real device, your real approximate location, and a real decision from our live governance engine &mdash; not a simulation.</p>
+    <button class="sound-toggle" id="sound-toggle" onclick="toggleSound()">
+      <span id="sound-icon">&#128266;</span>
+      <span id="sound-label">Sound On &mdash; Tap to mute</span>
+    </button>
+    <div class="category-badge" id="category-badge"></div>
+    <div class="terminal">
+      <div class="terminal-bar">
+        <div class="t-dot t-dot-r"></div><div class="t-dot t-dot-y"></div><div class="t-dot t-dot-g"></div>
+        <span class="t-title">AILeash Engine v5.0.0 &mdash; sebbi.pro &mdash; Live Session Scan</span>
+      </div>
+      <div class="terminal-body" id="terminal-body"></div>
+      <div class="verdict" id="verdict">
+        <div class="verdict-decision" id="v-decision">ALLOW</div>
+        <div class="verdict-score" id="v-score"></div>
+        <div class="verdict-hash-label">Audit Hash &mdash; SHA-256 &mdash; Sealed Into the Real Chain Just Now</div>
+        <div class="verdict-hash" id="v-hash"></div>
+        <div class="verdict-sealed" id="v-sealed"></div>
+        <a href="https://sebbi.pro/api/verify-chain" target="_blank" class="verdict-verify">Verify the chain integrity yourself &rarr;</a>
+      </div>
+    </div>
+  </div>
+</section>
 
-  <div class="note"><b>What a seal proves:</b> that this exact text existed in this form at this time and hasn't changed since. It does <b>not</b> prove the contents are true, that anyone agreed to them, or that a letter was delivered. It's tamper-evidence and proof of who was first — strong, honest, and yours to hold.</div>
+<section class="fear-sec" id="fear-sec">
+  <div class="fear-inner">
+    <div class="fear-line" id="f1">We did that <em>using our real engine, live.</em></div>
+    <div class="fear-line" id="f2">Every single user on your platform<br>could be scored like that. <em>In real time.</em></div>
+    <div class="fear-divider" id="fd1"></div>
+    <div class="fear-line" id="f3">When a regulator knocks on your door and asks you to prove<br>your AI treated someone fairly on a specific date &mdash;</div>
+    <div class="fear-line" id="f4"><strong>what exactly are you going to show them?</strong></div>
+    <div class="fear-divider" id="fd2"></div>
+    <div class="fear-line" id="f5">Your session was just sealed into our real audit chain.<br><em>Tamper-evident. Verifiable. Yours to check.</em></div>
+    <div class="fear-line" id="f6">Most AI has <strong>none of this.</strong></div>
+    <div class="fear-cta" id="fear-cta">
+      <div class="fear-price">50p</div>
+      <div class="fear-price-label">per device per month &mdash; your own engine &mdash; your data never leaves your network</div>
+      <a href="#signup" class="btn-cyan">Get The Engine Free &rarr;</a>
+      <a href="https://sebbi.pro/#products" class="btn-ghost">See All Products</a>
+    </div>
+  </div>
+</section>
 
-  <footer>
-    <a href="/">Home</a> &nbsp;&middot;&nbsp; <a href="/seal">Seal a post</a> &nbsp;&middot;&nbsp; <a href="/identity">Seal your profile</a> &nbsp;&middot;&nbsp; <a href="/pay-check">Payment check</a>
-    <div style="margin-top:12px;color:rgba(255,255,255,0.3)">sebbi.pro &middot; the same engine that seals AI decisions for platforms</div>
-  </footer>
-</div>
+<div class="divider"></div>
+
+<section class="what-sec">
+  <div class="what-inner">
+    <span class="sec-eyebrow">The Problem</span>
+    <h2>Every API call is a<br><em>round trip you pay for.</em></h2>
+    <p class="sec-sub">Standard cloud AI compliance tools make you send every decision to their server and wait for a response. That latency adds up. That data leaves your network. That dependency is their leverage over you.</p>
+    <div class="two-col">
+      <div class="col col-old">
+        <div class="col-label">The old way</div>
+        <h3>Call someone else's server</h3>
+        <p>Your platform makes a decision. You send it to a remote API. You wait. They respond. You act. Every single time. Your data leaves your network on every call.</p>
+        <div class="col-stat">200ms</div>
+        <div class="col-stat-label">typical round trip latency</div>
+      </div>
+      <div class="col col-new">
+        <div class="col-label">SonicBoom</div>
+        <h3>Your engine. Your server. Your speed.</h3>
+        <p>The Sebdog Engine runs inside your own infrastructure. Every compliance decision happens locally. Nothing leaves your network. The audit chain builds on your own machine.</p>
+        <div class="col-stat">&lt;20ms</div>
+        <div class="col-stat-label">local decision &mdash; no network hop</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="engine-sec" id="engine">
+  <div class="engine-inner">
+    <span class="sec-eyebrow">The Engine</span>
+    <h2>Sebdog Engine &mdash;<br><em>everything AILeash does,</em> running on yours.</h2>
+    <p class="sec-sub">One Python file. Runs anywhere Python runs. Licence-validated against sebbi.pro on startup. Every decision after that is yours, local, and instant.</p>
+    <div class="engine-card">
+      <div class="engine-card-header">
+        <div class="engine-card-title">sebdog_engine<span>.py</span></div>
+        <div class="engine-badge">Included with SonicBoom</div>
+      </div>
+      <div class="engine-body">
+        <div class="engine-features">
+          <div class="ef"><div class="ef-icon">OK</div><div class="ef-text"><h4>9-signal weighted scoring engine</h4><p>The full AILeash algorithm running on your machine. EWMA trust decay, velocity windows, anomaly detection.</p></div></div>
+          <div class="ef"><div class="ef-icon">OK</div><div class="ef-text"><h4>SHA-256 Merkle audit chain</h4><p>Every decision sealed into a tamper-evident chain in your own SQLite database. Nobody can alter it.</p></div></div>
+          <div class="ef"><div class="ef-icon">OK</div><div class="ef-text"><h4>Licence validates once, runs forever</h4><p>Phones home on startup and every 24 hours. Between checks every decision is purely local.</p></div></div>
+          <div class="ef"><div class="ef-icon">OK</div><div class="ef-text"><h4>Data sovereignty</h4><p>Your users data never leaves your network. Ever. Regulators love this.</p></div></div>
+          <div class="ef"><div class="ef-icon">OK</div><div class="ef-text"><h4>EU AI Act Articles 9, 12, 13, 14 alignment</h4><p>Full compliance audit trail generated automatically. Regulator-ready from day one.</p></div></div>
+          <div class="ef"><div class="ef-icon">OK</div><div class="ef-text"><h4>Zero external dependencies</h4><p>Pure Python standard library only. No pip install. Runs anywhere.</p></div></div>
+        </div>
+        <div class="engine-download">
+          <div>
+            <div class="dl-label">Engine File</div>
+            <div class="dl-filename">sebdog_engine.py</div>
+            <div class="dl-size">Pure Python &mdash; zero dependencies &mdash; runs anywhere</div>
+          </div>
+          <div class="dl-steps">
+            <div class="dl-step"><strong>1.</strong> Get your free API key below</div>
+            <div class="dl-step"><strong>2.</strong> Download the engine with your key</div>
+            <div class="dl-step"><strong>3.</strong> Run it on your own server</div>
+            <div class="dl-step"><strong>4.</strong> Call localhost instead of sebbi.pro</div>
+          </div>
+          <div class="code-block"><span class="c-dim"># Run the engine on your server</span>
+<span class="c-cyan">python</span> sebdog_engine.py \
+  <span class="c-gold">--key</span> al_live_your_key \
+  <span class="c-gold">--port</span> 9090
+
+<span class="c-dim"># Every decision is now local</span>
+<span class="c-cyan">POST</span> http://localhost:9090/govern
+<span class="c-green">-> ALLOW / CHALLENGE / BLOCK</span>
+<span class="c-green">-> audit_hash sealed locally</span>
+<span class="c-green">-> under 20ms. No network hop.</span></div>
+          <a href="#signup" class="dl-btn">Get API Key and Download Engine</a>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="how-sec" id="how">
+  <div class="how-inner">
+    <span class="sec-eyebrow">How It Works</span>
+    <h2>Four steps.<br><em>Then it runs forever.</em></h2>
+    <p class="sec-sub">From signup to local engine running in under five minutes.</p>
+    <div class="steps">
+      <div class="step"><div class="step-n">01</div><h3>Get your free API key</h3><p>Sign up below. No card. 100 free decisions included. Takes 60 seconds.</p></div>
+      <div class="step"><div class="step-n">02</div><h3>Download the Sebdog Engine</h3><p>One Python file. Download it with your API key. Drop it on your server.</p></div>
+      <div class="step"><div class="step-n">03</div><h3>Run it on your infrastructure</h3><p>One command. Validates your licence and starts listening on any port you choose.</p></div>
+      <div class="step"><div class="step-n">04</div><h3>Point your platform at localhost</h3><p>Change one URL in your code. Sub-20ms local compliance decisions forever.</p></div>
+    </div>
+  </div>
+</section>
+
+<section class="pricing-sec">
+  <div class="pricing-inner">
+    <span class="sec-eyebrow">Pricing</span>
+    <h2>Same model.<br><em>Your own engine included.</em></h2>
+    <div class="price-card">
+      <div class="price-big">50p</div>
+      <div class="price-per">per device per month &mdash; billed via stripe</div>
+      <div class="price-includes">
+        <div class="pi">Sebdog Engine file runs on your own server</div>
+        <div class="pi">Full 9-signal scoring algorithm included</div>
+        <div class="pi">SHA-256 local audit chain your database</div>
+        <div class="pi">EU AI Act Articles 9 12 13 14 alignment</div>
+        <div class="pi">100 free decisions to test before you commit</div>
+        <div class="pi">Zero dependencies pure Python standard library</div>
+        <div class="pi">Referral code included earn 10p per device you refer</div>
+      </div>
+      <a href="#signup" class="btn-cyan" style="display:block;text-align:center;padding:14px">Get Free API Key and Engine</a>
+    </div>
+  </div>
+</section>
+
+<section class="signup-sec" id="signup">
+  <div class="signup-inner">
+    <span class="sec-eyebrow">Get Started</span>
+    <h2>Free API key.<br><em>Engine download. Now.</em></h2>
+    <p>Sign up. Get your key. Download the Sebdog Engine. Running in under five minutes.</p>
+    <div class="fg-row">
+      <div class="fg"><label>First Name</label><input type="text" id="fn" placeholder="Justin"></div>
+      <div class="fg"><label>Last Name</label><input type="text" id="ln" placeholder="Smith"></div>
+    </div>
+    <div class="fg"><label>Email Address</label><input type="email" id="em" placeholder="you@company.com"></div>
+    <div class="fg"><label>Phone Number</label><input type="tel" id="ph" placeholder="+44 7700 000000"></div>
+    <div class="fg"><label>Platform or Company Name</label><input type="text" id="org" placeholder="e.g. MyPlatform Ltd"></div>
+    <div class="fg"><label>Estimated Devices</label>
+      <select id="dv">
+        <option value="100">Under 100</option>
+        <option value="500">100 to 500</option>
+        <option value="1000">500 to 1,000</option>
+        <option value="5000">1,000 to 5,000</option>
+        <option value="10000">5,000 to 10,000</option>
+        <option value="50000">10,000 plus</option>
+      </select>
+    </div>
+    <button class="btn-full" onclick="doSignup()">Get Free API Key and Download Engine</button>
+    <div class="msg-err" id="msg-err"></div>
+    <div class="key-box" id="key-box">
+      <div class="key-lbl">Your API Key &mdash; Save This Now</div>
+      <div class="key-val" id="key-val"></div>
+      <div style="font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.3);margin-top:16px;line-height:1.9;background:rgba(0,212,255,0.05);border:1px solid rgba(0,212,255,0.1);border-radius:4px;padding:12px">
+        Redirecting to Stripe to set up billing&hellip;<br>
+        Engine download unlocks after payment.<br>
+        100 free decisions active now.
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="foot-inner">
+    <a href="https://sebbi.pro" class="foot-logo">Monop <span>Content</span></a>
+    <div class="foot-links">
+      <a href="https://sebbi.pro/#products">All Products</a>
+      <a href="https://sebbi.pro/#signup">AILeash</a>
+      <a href="https://sebbi.pro/#signup">Guardian</a>
+      <a href="https://sebbi.pro/#signup">Sentinel</a>
+      <a href="https://sebbi.pro/scan">Free Scanner</a>
+      <a href="https://sebbi.pro/contact">Contact Justin</a>
+    </div>
+    <div class="foot-copy">&copy; 2026 Monop Content &middot; Justin Antony Dobson &middot; Blyth, Northumberland, UK &middot; justrightdecorators@gmail.com &middot; 07908 269428</div>
+  </div>
+</footer>
 
 <script>
-async function sha256hex(s){
-  var buf=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(s));
-  return Array.from(new Uint8Array(buf)).map(function(b){return b.toString(16).padStart(2,"0");}).join("");
+// ============================================================
+// SOUND ENGINE — smooth deep man's voice with queue
+// ============================================================
+var soundOn = true;
+var synth = window.speechSynthesis;
+var voices = [];
+var speechQueue = [];
+var isSpeaking = false;
+
+function loadVoices() { voices = synth ? synth.getVoices() : []; }
+if (synth) { synth.onvoiceschanged = loadVoices; loadVoices(); }
+
+function toggleSound() {
+  soundOn = !soundOn;
+  document.getElementById('sound-icon').textContent = soundOn ? '\uD83D\uDD0A' : '\uD83D\uDD07';
+  document.getElementById('sound-label').textContent = soundOn ? 'Sound On \u2014 Tap to mute' : 'Sound Off \u2014 Tap to enable';
+  if (!soundOn && synth) { synth.cancel(); speechQueue = []; isSpeaking = false; }
 }
-async function lookup(h){
-  var r=await fetch("/api/verify-post?content="+h);
-  return await r.json();
+
+function getVoice() {
+  if (!voices.length) return null;
+  var deepMale = voices.find(function(v){ return /daniel|george|arthur|oliver|thomas/i.test(v.name) && v.lang.startsWith('en'); });
+  var ukMale = voices.find(function(v){ return v.lang === 'en-GB'; });
+  var enAny = voices.find(function(v){ return v.lang.startsWith('en'); });
+  return deepMale || ukMale || enAny || null;
 }
-async function verify(){
-  var raw=document.getElementById("txt").value;
-  var res=document.getElementById("result");
-  var btn=document.getElementById("go");
-  if(!raw.trim()){res.className="err";res.innerHTML="<div class='big'>Paste some text first</div>";return;}
-  btn.disabled=true;btn.textContent="Checking the chain\u2026";
-  try{
-    var candidates=[raw,raw.trim(),raw.replace(/\r\n/g,"\n"),raw.replace(/\r\n/g,"\n").trim()];
-    var seen={},hit=null,lastHash="";
-    for(var i=0;i<candidates.length;i++){
-      var h=await sha256hex(candidates[i]);
-      if(seen[h])continue;seen[h]=1;lastHash=h;
-      var d=await lookup(h);
-      if(d.verified){hit=d;break;}
+
+function processQueue() {
+  if (!soundOn || !synth || speechQueue.length === 0 || isSpeaking) return;
+  isSpeaking = true;
+  var item = speechQueue.shift();
+  var utt = new SpeechSynthesisUtterance(item.text);
+  utt.pitch = 0.65;
+  utt.rate = 0.90;
+  utt.volume = 1.0;
+  var v = getVoice();
+  if (v) utt.voice = v;
+  utt.onend = function() { isSpeaking = false; setTimeout(processQueue, 150); };
+  utt.onerror = function() { isSpeaking = false; setTimeout(processQueue, 150); };
+  synth.speak(utt);
+}
+
+function speak(text) {
+  if (!soundOn || !synth || !text) return;
+  speechQueue.push({ text: text });
+  processQueue();
+}
+
+function speakNow(text) {
+  if (!soundOn || !synth || !text) return;
+  synth.cancel(); speechQueue = []; isSpeaking = false;
+  speechQueue.push({ text: text });
+  processQueue();
+}
+
+// ============================================================
+// TERMINAL
+// ============================================================
+var tb;
+function addLine(id, prompt, html, spoken, delay, pitch, rate) {
+  return new Promise(function(resolve) {
+    setTimeout(function() {
+      var ex = document.getElementById(id);
+      if (ex) ex.remove();
+      var div = document.createElement('div');
+      div.className = 't-line'; div.id = id;
+      div.innerHTML = '<span class="t-prompt">'+prompt+'</span><span class="t-text">'+html+'</span>';
+      tb.appendChild(div);
+      setTimeout(function(){ div.classList.add('show'); if(spoken) speak(spoken, pitch, rate); tb.scrollTop=tb.scrollHeight; }, 30);
+      resolve();
+    }, delay);
+  });
+}
+
+function addSalesLine(id, html, spoken, cssClass, delay) {
+  return new Promise(function(resolve) {
+    setTimeout(function() {
+      var div = document.createElement('div');
+      div.className = 't-sales ' + (cssClass||'t-sales-consumer'); div.id = id;
+      div.innerHTML = html;
+      tb.appendChild(div);
+      setTimeout(function(){ div.classList.add('show'); if(spoken) speak(spoken); tb.scrollTop=tb.scrollHeight; }, 30);
+      resolve();
+    }, delay);
+  });
+}
+
+function addSection(id, label, delay) {
+  return new Promise(function(resolve) {
+    setTimeout(function() {
+      var div = document.createElement('div');
+      div.className = 't-section'; div.id = id;
+      div.textContent = '--- '+label+' ---';
+      tb.appendChild(div);
+      setTimeout(function(){ div.classList.add('show'); tb.scrollTop=tb.scrollHeight; }, 30);
+      resolve();
+    }, delay);
+  });
+}
+
+// ============================================================
+// GEO
+// ============================================================
+async function getGPS() {
+  return new Promise(function(resolve) {
+    if (!navigator.geolocation) { resolve(null); return; }
+    navigator.geolocation.getCurrentPosition(
+      function(p){ resolve({ lat:p.coords.latitude, lng:p.coords.longitude, accuracy:Math.round(p.coords.accuracy) }); },
+      function(){ resolve(null); },
+      { timeout:6000, maximumAge:60000 }
+    );
+  });
+}
+
+async function reverseGeocode(lat, lng) {
+  try {
+    var r = await fetch('https://nominatim.openstreetmap.org/reverse?lat='+lat+'&lon='+lng+'&format=json');
+    var d = await r.json();
+    if (d && d.address) {
+      var a = d.address;
+      var town = a.town||a.city||a.village||a.hamlet||a.county||'';
+      var county = a.county||a.state_district||'';
+      var country = a.country||'';
+      return { town:town, county:county, country:country, display:[town,county,country].filter(Boolean).join(', ') };
     }
-    if(hit){
-      var when=new Date(hit.sealed_at*1000);
-      res.className="ok";
-      res.innerHTML="<div class='big'>\u2713 SEALED &amp; UNCHANGED</div>"
-        +"<div class='detail'>These exact words are in the chain.<br>Block #"+hit.block_index
-        +"<br>Sealed "+when.toLocaleString("en-GB")
-        +"<br>Seal "+hit.seal.slice(0,32)+"\u2026</div>";
+  } catch(e) {}
+  return null;
+}
+
+async function getIPGeo() {
+  var r = { city:'Unknown', country:'Unknown', countryCode:'??', region:'Unknown', isp:'Unknown', ip:'Unknown' };
+  try {
+    var res = await fetch('https://ipapi.co/json/');
+    var d = await res.json();
+    if (d&&d.ip&&!d.error) { r.ip=d.ip; r.city=d.city||'Unknown'; r.region=d.region||''; r.country=d.country_name||'Unknown'; r.countryCode=d.country_code||'??'; r.isp=d.org||'Unknown'; return r; }
+  } catch(e) {}
+  try {
+    var res2 = await fetch('https://ip-api.com/json/?fields=status,city,country,countryCode,regionName,isp,query');
+    var d2 = await res2.json();
+    if (d2&&d2.status==='success') { r.ip=d2.query; r.city=d2.city||'Unknown'; r.region=d2.regionName||''; r.country=d2.country||'Unknown'; r.countryCode=d2.countryCode||'??'; r.isp=d2.isp||'Unknown'; }
+  } catch(e) {}
+  return r;
+}
+
+// ============================================================
+// CATEGORISE VISITOR
+// ============================================================
+function categorise(ua, isp, hour, isMobile, connType) {
+  var ispL = isp.toLowerCase();
+  var uaL = ua.toLowerCase();
+  if (ispL.includes('police')||ispL.includes('gov')||ispL.includes('nhs')||ispL.includes('council')||ispL.includes('home office')) {
+    return 'lawenforcement';
+  }
+  if (!isMobile && hour>=8 && hour<=18 && (ispL.includes('business')||ispL.includes('enterprise')||ispL.includes('bt')||ispL.includes('virgin')||ispL.includes('vodafone')||ispL.includes('talktalk'))) {
+    return 'callcentre';
+  }
+  if ((uaL.includes('linux')||uaL.includes('x11')) && !isMobile) { return 'developer'; }
+  if (!isMobile && (uaL.includes('firefox')||uaL.includes('chrome')) && hour>=9 && hour<=17) { return 'enterprise'; }
+  return 'consumer';
+}
+
+var SALES = {
+  enterprise: {
+    badge: 'Enterprise — Compliance Officer Detected',
+    badgeClass: 'cat-enterprise',
+    lines: [
+      { html: '<span class="t-gold">We just scanned you. Your AI may not be doing this for your users. Every one without it is a blind spot.</span>', spoken: 'We just scanned you. Your AI may not be doing this for your users. Every one without it is a blind spot.' },
+      { html: 'EU AI Act enforcement is coming for high-risk systems. Article 12 calls for a tamper-evident audit chain for AI decisions that affect a person. <span class="t-gold">A standard log file your own team can edit does not satisfy that. You need a SHA-256 Merkle chain. You need AILeash.</span>', spoken: 'EU AI Act enforcement is coming for high-risk systems. Article 12 calls for a tamper-evident audit chain. A log file your team can edit will not satisfy that. You need AILeash.' },
+      { html: '<span class="t-gold">When a regulator asks, you have two choices. Show them years of cryptographic proof. Or show them nothing.</span> Organisations that build this in now will have that history. The ones that wait will not.', spoken: 'When a regulator asks, you have two choices. Show them years of cryptographic proof. Or show them nothing. Organisations that build this in now will have that history.' },
+      { html: 'EU AI Act Articles 9, 12, 13 and 14. <span class="t-gold">AILeash is built around all four. From 50 pence per device per month. Not fifty thousand pounds a year. Fifty pence per device.</span>', spoken: 'EU AI Act Articles 9, 12, 13 and 14. AILeash is built around all four. From fifty pence per device per month.' }
+    ],
+    css: 't-sales-enterprise'
+  },
+  callcentre: {
+    badge: 'Call Centre — Business Network Detected',
+    badgeClass: 'cat-callcentre',
+    lines: [
+      { html: '<span class="t-green">Before your agent picks up the phone, AILeash can already score the caller. Device. Location signals. Velocity. Behaviour pattern. Trust index.</span>', spoken: 'Before your agent picks up the phone, AILeash can already score the caller. Device. Location signals. Velocity. Behaviour pattern. Trust index.' },
+      { html: 'Your agents can see the risk score the moment the call connects. <span class="t-green">Fraud flagged early. Account takeovers caught faster. Every decision sealed into a tamper-proof audit chain.</span>', spoken: 'Your agents can see the risk score the moment the call connects. Fraud flagged early. Every decision sealed into a tamper-proof audit chain.' },
+      { html: '<span class="t-green">That audit chain is tamper-evident by design. If a caller later disputes a decision, you have a cryptographic record of exactly what the system knew and decided at that moment.</span>', spoken: 'That audit chain is tamper-evident by design. If a caller later disputes a decision, you have a cryptographic record of what the system knew and decided.' },
+      { html: '<span class="t-green">Fifty pence per device per month.</span> Contact Justin at Monop Content for volume pricing.', spoken: 'Fifty pence per device per month. Contact Justin at Monop Content for volume pricing.' }
+    ],
+    css: 't-sales-callcentre'
+  },
+  developer: {
+    badge: 'Developer — Technical User Detected',
+    badgeClass: 'cat-developer',
+    lines: [
+      { html: '<span class="t-cyan">One Python file. Zero dependencies. Pure standard library. Runs anywhere Python runs. No pip install. No framework. No bloat.</span>', spoken: 'One Python file. Zero dependencies. Pure standard library. Runs anywhere Python runs. No pip install. No framework. No bloat.' },
+      { html: 'Drop sebdog underscore engine dot py on your server. Point your platform at localhost. <span class="t-cyan">Sub-20 millisecond compliance decisions. SHA-256 Merkle audit chain built locally. No external calls on the hot path.</span>', spoken: 'Drop the Sebdog engine on your server. Point your platform at localhost. Sub 20 millisecond compliance decisions. SHA-256 Merkle audit chain built locally.' },
+      { html: '<span class="t-cyan">Built around the EU AI Act, the Online Safety Act, and the ICO Childrens Code.</span> One hundred free decisions. No credit card. Get the engine now.', spoken: 'Built around the EU AI Act, the Online Safety Act, and the ICO Childrens Code. Get the engine now.' }
+    ],
+    css: 't-sales-developer'
+  },
+  lawenforcement: {
+    badge: 'Public Sector — Government Network Detected',
+    badgeClass: 'cat-lawenforcement',
+    lines: [
+      { html: '<span class="t-purple">Every interaction. Every decision. Every override. Every timestamp. Sealed into a cryptographic chain nobody can alter without it being detectable. Not even the operator.</span>', spoken: 'Every interaction. Every decision. Every override. Every timestamp. Sealed into a cryptographic chain nobody can alter without it being detectable.' },
+      { html: 'SHA-256 Merkle chain. <span class="t-purple">Each block contains the event, the decision, the timestamp, and the hash of the block before it. Alter any record and the chain visibly breaks.</span>', spoken: 'SHA-256 Merkle chain. Each block contains the event, the decision, the timestamp, and the hash of the block before it. Alter any record and the chain visibly breaks.' },
+      { html: 'Velocity monitoring. Trust decay scoring. <span class="t-purple">Every BLOCK or CHALLENGE comes with a plain-language reason list.</span>', spoken: 'Velocity monitoring. Trust decay scoring. Every block or challenge comes with a plain language reason list.' }
+    ],
+    css: 't-sales-law'
+  },
+  consumer: {
+    badge: 'Visitor — Session Identified',
+    badgeClass: 'cat-consumer',
+    lines: [
+      { html: 'We just scanned you the way your bank or insurer arguably should be. <span class="t-dim">Most platforms making decisions about people are not doing this yet.</span>', spoken: 'We just scanned you the way your bank or insurer arguably should be. Most platforms making decisions about people are not doing this yet.' },
+      { html: 'If you run a platform that uses AI to make decisions about people, <span class="t-cyan">what you just experienced is close to what a regulator will expect. From 50 pence per device per month.</span>', spoken: 'If you run a platform that uses AI to make decisions about people, what you just experienced is close to what a regulator will expect. From fifty pence per device per month.' }
+    ],
+    css: 't-sales-consumer'
+  }
+};
+
+// ============================================================
+// REAL GOVERNANCE CALL — this is the fix.
+// The scan used to invent a score, trust and hash in the browser.
+// It now sends real signals to the real engine and narrates the
+// real response, including the real audit hash actually written
+// to the real chain.
+// ============================================================
+async function callRealEngine(signals){
+  var event = {
+    user_id: 'sonicboom_'+Math.random().toString(36).slice(2,10),
+    action: 'sonicboom_scan',
+    amount: 0,
+    country: signals.countryCode || 'UK',
+    device_id: (signals.deviceType||'device')+'_'+(signals.os||'unknown'),
+    anomaly: signals.anomaly,
+    device_risk: signals.deviceRisk
+  };
+  var res = await fetch('https://sebbi.pro/api/govern', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(event)
+  });
+  var data = await res.json();
+  if (!res.ok || data.error) throw new Error(data.error||'engine_error');
+  return data;
+}
+
+// ============================================================
+// MAIN SCAN
+// ============================================================
+async function runScan() {
+  tb = document.getElementById('terminal-body');
+  var ts = Date.now();
+  var ua = navigator.userAgent;
+  var lang = navigator.language||'en';
+  var langNames = {'en':'English','en-GB':'English','en-US':'English','fr':'French','de':'German','es':'Spanish','pt':'Portuguese','nl':'Dutch','it':'Italian','pl':'Polish','ru':'Russian','zh':'Chinese','ja':'Japanese','ko':'Korean','ar':'Arabic'};
+  var langFull = langNames[lang]||lang;
+  var sw = window.screen.width, sh = window.screen.height;
+  var dpr = window.devicePixelRatio||1;
+  var tz = Intl.DateTimeFormat().resolvedOptions().timeZone||'Unknown';
+  var now = new Date();
+  var localTime = now.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit',hour12:false});
+  var hour = now.getHours();
+  var firstVisit = !localStorage.getItem('sb_visit');
+  if(firstVisit) localStorage.setItem('sb_visit',ts);
+  var visitCount = parseInt(localStorage.getItem('sb_count')||'0')+1;
+  localStorage.setItem('sb_count',visitCount);
+  var isMobile = /Mobile|Android|iPhone|iPad/i.test(ua);
+  var isTablet = /iPad|Tablet/i.test(ua);
+  var deviceType = isTablet?'Tablet':isMobile?'Mobile':'Desktop';
+  var browser='Unknown', bv='';
+  var em=ua.match(/Edg\/([\d]+)/),cm=ua.match(/Chrome\/([\d]+)/),fm=ua.match(/Firefox\/([\d]+)/),sm=ua.match(/Version\/([\d]+).*Safari/);
+  if(em){browser='Edge';bv=em[1];}else if(cm&&!/Edge/i.test(ua)){browser='Chrome';bv=cm[1];}else if(fm){browser='Firefox';bv=fm[1];}else if(sm){browser='Safari';bv=sm[1];}
+  var os='Unknown',ov='';
+  var am=ua.match(/Android ([\d.]+)/),im=ua.match(/OS ([\d_]+)/),wm=ua.match(/Windows NT ([\d.]+)/);
+  var wmap={'10.0':'10 or 11','6.3':'8.1','6.2':'8','6.1':'7'};
+  if(am){os='Android';ov=am[1];}else if(/iPhone|iPad/.test(ua)&&im){os='iOS';ov=im[1].replace(/_/g,'.');}else if(wm){os='Windows';ov=wmap[wm[1]]||wm[1];}else if(/Mac/i.test(ua)){os='macOS';}else if(/Linux/i.test(ua)){os='Linux';}
+  var cpuCores=navigator.hardwareConcurrency||null;
+  var ram=navigator.deviceMemory||null;
+  var touchPoints=navigator.maxTouchPoints||0;
+  var dnt=navigator.doNotTrack==='1'||window.doNotTrack==='1';
+  var referrer=document.referrer, refHost='';
+  if(referrer){try{refHost=new URL(referrer).hostname.replace('www.','');}catch(e){}}
+  var hasAdBlocker=false;
+  try{var at=document.createElement('div');at.className='adsbox pub_300x250';at.style.cssText='width:1px;height:1px;position:absolute;left:-9999px;';document.body.appendChild(at);hasAdBlocker=at.offsetHeight===0;document.body.removeChild(at);}catch(e){}
+  var battery=null,charging=null;
+  try{if(navigator.getBattery){var b=await navigator.getBattery();battery=Math.round(b.level*100);charging=b.charging;}}catch(e){}
+  var connType=null,connSpeed=null;
+  try{var conn=navigator.connection||navigator.mozConnection||navigator.webkitConnection;if(conn){connType=conn.effectiveType||conn.type||null;connSpeed=conn.downlink||null;}}catch(e){}
+
+  var gpsPromise=getGPS();
+  var ipGeoPromise=getIPGeo();
+
+  var delay=0, step=280, P=1.9, R=1.1;
+
+  setTimeout(function(){
+    speakNow('Welcome to sebbi dot pro. This is the AILeash engine, built by Monop Content in Blyth, United Kingdom. I have been scanning your session since the moment you arrived.');
+  }, 600);
+
+  await addLine('tl-intro','>', '<span class="t-dim">Hello. Welcome to sebbi.pro. This is the AILeash Engine, built by Monop Content, Blyth, UK.</span>', null, delay); delay+=step;
+  await addLine('tl-intro2','>', '<span class="t-dim">I have been scanning your session since the moment you arrived. Here is what I found.</span>', null, delay); delay+=step*1.2;
+
+  await addSection('sec-device','Device Intelligence', delay); delay+=200;
+  await addLine('tl-dev','>','Device: <span class="t-cyan">'+deviceType+' &mdash; '+os+(ov?' '+ov:'')+' &mdash; '+browser+(bv?' '+bv:'')+'</span>', deviceType+'. '+os+'. '+browser+'.', delay, P, R); delay+=step;
+  await addLine('tl-screen','>','Display: <span class="t-cyan">'+sw+' by '+sh+(dpr>1?' &mdash; Retina '+dpr+'x':' &mdash; Standard resolution')+'</span>', sw+' by '+sh+' display.', delay, P, R); delay+=step;
+  if(cpuCores){ await addLine('tl-cpu','>','Processor: <span class="t-cyan">'+cpuCores+' CPU core'+(cpuCores>1?'s':'')+' detected</span>', cpuCores+' CPU cores detected.', delay, P, R); delay+=step; }
+  if(ram){ await addLine('tl-ram','>','Memory: <span class="t-cyan">'+ram+' gigabyte'+(ram>1?'s':'')+' RAM</span>', ram+' gigabytes of RAM.', delay, P, R); delay+=step; }
+  await addLine('tl-touch','>',touchPoints>0?'Input: <span class="t-cyan">Touchscreen &mdash; '+touchPoints+' touch points</span>':'Input: <span class="t-dim">Mouse and keyboard &mdash; no touchscreen</span>', touchPoints>0?'Touchscreen. '+touchPoints+' touch points.':'Mouse and keyboard.', delay, P, R); delay+=step;
+  if(battery!==null){
+    var bd=battery+'%'+(charging?' &mdash; charging':battery<20?' &mdash; low battery':'');
+    var bs=battery+' percent battery'+(charging?'. Charging.':battery<20?'. Battery is low.':'.');
+    await addLine('tl-bat','>','Power: <span class="t-cyan">'+bd+'</span>', bs, delay, P, R); delay+=step;
+  }
+  if(connType){
+    var ct=connType.toUpperCase()+(connSpeed?' &mdash; '+connSpeed+' Mbps':'');
+    await addLine('tl-conn','>','Connection: <span class="t-cyan">'+ct+'</span>', connType.toUpperCase()+' connection.', delay, P, R); delay+=step;
+  }
+
+  await addSection('sec-identity','Session Identity', delay); delay+=200;
+  await addLine('tl-time','>','Local time: <span class="t-cyan">'+localTime+' &mdash; '+tz+'</span>', 'Local time '+localTime+'.', delay, P, R); delay+=step;
+  await addLine('tl-lang','>','Language: <span class="t-cyan">'+langFull+'</span>', 'Language: '+langFull+'.', delay, P, R); delay+=step;
+  if(dnt){ await addLine('tl-dnt','>','<span class="t-gold">Do Not Track enabled &mdash; privacy-conscious user</span>','Do Not Track is enabled.',delay,P,R); delay+=step; }
+  if(hasAdBlocker){ await addLine('tl-adb','>','<span class="t-gold">Ad blocker active &mdash; privacy tools detected</span>','Ad blocker detected.',delay,P,R); delay+=step; }
+  if(refHost){ await addLine('tl-ref','>','Arrived from: <span class="t-cyan">'+refHost+'</span>','You arrived from '+refHost+'.',delay,P,R); delay+=step; }
+  await addLine('tl-visit','>',firstVisit?'<span class="t-gold">First visit &mdash; no prior session history on this device</span>':'<span class="t-dim">Visit number '+visitCount+' &mdash; returning visitor</span>', firstVisit?'This is your first visit.':'This is visit number '+visitCount+'. Welcome back.', delay, P, R); delay+=step;
+
+  await addSection('sec-network','Network Location', delay); delay+=200;
+  await addLine('tl-geoload','>','<span class="t-dim">Resolving your approximate location&hellip;</span>','Resolving your approximate location.',delay,P,R); delay+=step;
+
+  var gps=await gpsPromise;
+  var ipGeo=await ipGeoPromise;
+  var locDisplay='', locSpoken='';
+
+  if(gps){
+    var rev=await reverseGeocode(gps.lat,gps.lng);
+    if(rev&&rev.display){ locDisplay=rev.display+' &mdash; GPS accurate to '+gps.accuracy+'m'; locSpoken='You are in '+rev.display+'. GPS accurate to '+gps.accuracy+' metres.'; }
+    else { locDisplay=gps.lat.toFixed(4)+', '+gps.lng.toFixed(4); locSpoken='Location confirmed by G.P.S.'; }
+    await addLine('tl-gps','>','<span class="t-green">GPS confirmed: </span><span class="t-cyan">'+locDisplay+'</span>',locSpoken,delay,P,R); delay+=step;
+  } else {
+    locDisplay=(ipGeo.city!=='Unknown'?ipGeo.city+(ipGeo.region?', '+ipGeo.region:'')+ ' &mdash; ':'')+ipGeo.country;
+    locSpoken='Location: '+(ipGeo.city!=='Unknown'?ipGeo.city+'. ':'')+ipGeo.country+'.';
+    await addLine('tl-loc','>','Location: <span class="t-cyan">'+locDisplay+'</span>',locSpoken,delay,P,R); delay+=step;
+  }
+  await addLine('tl-ip','>','IP address: <span class="t-cyan">'+ipGeo.ip+'</span>','I.P. address: '+ipGeo.ip+'.',delay,P,R); delay+=step;
+  await addLine('tl-isp','>','Network provider: <span class="t-cyan">'+ipGeo.isp+'</span>','Network provider: '+ipGeo.isp+'.',delay,P,R); delay+=step;
+
+  var cat=categorise(ua, ipGeo.isp, hour, isMobile, connType);
+  var salesData=SALES[cat];
+  var badge=document.getElementById('category-badge');
+  badge.textContent=salesData.badge;
+  badge.className='category-badge '+salesData.badgeClass;
+  badge.classList.add('show');
+
+  await addSection('sec-sales','AILeash &mdash; What This Means For You', delay); delay+=200;
+  for(var i=0;i<salesData.lines.length;i++){
+    await addSalesLine('tl-sales'+i, salesData.lines[i].html, salesData.lines[i].spoken, salesData.css, delay);
+    delay+=step*1.4;
+  }
+
+  await addSection('sec-scoring','Live Governance Engine', delay); delay+=200;
+  await addLine('tl-scoring','>','<span class="t-dim">Sending real signals to the live 9-signal governance engine&hellip;</span>','Sending real signals to the live governance engine.',delay,P,R); delay+=step*1.4;
+
+  // Build REAL signals from what was actually detected — no invented values.
+  var anomaly=0.05;
+  if(hasAdBlocker) anomaly+=0.05;
+  if(dnt) anomaly+=0.05;
+  if(visitCount>8) anomaly+=0.10;
+  anomaly=Math.min(anomaly,1);
+  var deviceRisk=(battery!==null && battery<15 && !charging) ? 0.2 : 0.05;
+
+  var engineResult=null, engineError=null;
+  try{
+    engineResult = await callRealEngine({
+      countryCode: ipGeo.countryCode!=='??' ? ipGeo.countryCode : 'UK',
+      deviceType: deviceType,
+      os: os,
+      anomaly: anomaly,
+      deviceRisk: deviceRisk
+    });
+  }catch(e){
+    engineError = e;
+  }
+
+  if(engineError || !engineResult){
+    await addLine('tl-err','>','<span class="t-red">Could not reach the live engine just now &mdash; showing an honest error, not a fallback result.</span>','Could not reach the live engine just now.',delay,P,R); delay+=step;
+    return;
+  }
+
+  await addLine('tl-score','>','Risk score: <span class="t-cyan">'+engineResult.score+'</span> &mdash; Trust index: <span class="t-cyan">'+engineResult.trust+'</span>','Risk score '+engineResult.score+'. Trust index '+engineResult.trust+'.',delay,P,R); delay+=step;
+  if(engineResult.reasons && engineResult.reasons.length>0){
+    await addLine('tl-flags','>','Signals raised: <span class="t-gold">'+engineResult.reasons.join(' &mdash; ')+'</span>','Signals raised: '+engineResult.reasons.join('. ')+'.',delay,P,R); delay+=step;
+  } else {
+    await addLine('tl-flags','>','<span class="t-dim">No risk signals raised on this session</span>','No risk signals raised on this session.',delay,P,R); delay+=step;
+  }
+  var decColour = engineResult.decision==='ALLOW' ? 'var(--green)' : engineResult.decision==='CHALLENGE' ? 'var(--gold)' : '#ff6b6b';
+  await addLine('tl-dec','>','Decision: <span style="color:'+decColour+';font-weight:700;font-size:16px;letter-spacing:3px">'+engineResult.decision+'</span>','Decision. '+engineResult.decision+'.',delay,P,R); delay+=step;
+  await addLine('tl-seal','>','<span class="t-dim">Writing to the real SHA-256 Merkle audit chain&hellip;</span>','Writing to the real audit chain.',delay,P,R); delay+=step;
+  await addLine('tl-hash','>','Audit hash: <span class="t-hash">'+engineResult.audit_hash+'</span>','Audit hash generated and sealed for real.',delay,P,R); delay+=step;
+  await addLine('tl-done','>','<span class="t-green">Sealed &mdash; tamper-evident &mdash; you can verify this chain yourself, right now.</span>','Sealed. Tamper-evident. You can verify this chain yourself, right now.',delay,P,R); delay+=step;
+
+  setTimeout(function(){
+    document.getElementById('v-decision').textContent=engineResult.decision;
+    document.getElementById('v-decision').style.color=decColour;
+    document.getElementById('v-score').textContent='Score: '+engineResult.score+'  —  Trust: '+engineResult.trust+'  —  Version: '+engineResult.version;
+    document.getElementById('v-hash').textContent=engineResult.audit_hash;
+    document.getElementById('v-sealed').textContent='Sealed just now  —  Real chain entry  —  Verifiable  —  Not a simulation';
+    document.getElementById('verdict').classList.add('show');
+  }, delay);
+  delay+=step*2;
+
+  setTimeout(function(){
+    var fs=document.getElementById('fear-sec');
+    fs.classList.add('show');
+    var items=[
+      {id:'f1',spoken:'We did that. Using our real engine, live.'},
+      {id:'f2',spoken:'Every single user on your platform could be scored like that. In real time.'},
+      {id:'fd1',spoken:null},
+      {id:'f3',spoken:'When a regulator asks you to prove your AI treated someone fairly on a specific date.'},
+      {id:'f4',spoken:'What exactly are you going to show them?'},
+      {id:'fd2',spoken:null},
+      {id:'f5',spoken:'Your session was just sealed into our real audit chain. Tamper-evident. Verifiable. Yours to check.'},
+      {id:'f6',spoken:'Most AI has none of this.'},
+      {id:'fear-cta',spoken:'Fifty pence. Per device. Per month. Get the engine free right now.'}
+    ];
+    items.forEach(function(item,i){
+      setTimeout(function(){
+        var el=document.getElementById(item.id);
+        if(el) el.classList.add('show');
+        if(item.spoken) speak(item.spoken);
+      }, i*900);
+    });
+  }, delay);
+}
+
+window.addEventListener('load', function(){ setTimeout(runScan, 1000); });
+
+// ============================================================
+// SIGNUP
+// ============================================================
+async function doSignup(){
+  var fn=document.getElementById('fn').value.trim();
+  var ln=document.getElementById('ln').value.trim();
+  var em=document.getElementById('em').value.trim();
+  var ph=document.getElementById('ph').value.trim();
+  var org=document.getElementById('org').value.trim();
+  var dv=parseInt(document.getElementById('dv').value)||1;
+  var err=document.getElementById('msg-err');
+  var kb=document.getElementById('key-box');
+  var btn=document.querySelector('.btn-full');
+  err.classList.remove('show');kb.classList.remove('show');
+  if(!em||!em.includes('@')){err.textContent='Please enter a valid email address.';err.classList.add('show');return;}
+  if(!org){err.textContent='Please enter your company or platform name.';err.classList.add('show');return;}
+  var orig=btn.textContent;btn.textContent='Creating key\u2026';btn.disabled=true;
+  try{
+    var r=await fetch('https://sebbi.pro/signup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:em,phone:ph,name:fn+' '+ln,org:org,org_type:'sonicboom',product:'aileash',devices:dv})});
+    var d=await r.json();
+    if(d.api_key){
+      document.getElementById('key-val').textContent=d.api_key;
+      kb.classList.add('show');
+      btn.textContent='Key created \u2014 setting up billing\u2026';
+      speak('Key created! Redirecting to billing now.');
+      try{
+        var r2=await fetch('https://sebbi.pro/create-checkout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:em,product:'aileash',devices:dv})});
+        var d2=await r2.json();
+        if(d2.checkout_url){setTimeout(function(){window.location.href=d2.checkout_url;},2500);}
+        else{btn.textContent='Key ready \u2713';}
+      }catch(e2){btn.textContent='Key ready \u2713';}
     }else{
-      res.className="err";
-      res.innerHTML="<div class='big'>\u2717 NOT IN THE CHAIN</div>"
-        +"<div class='detail'>No seal exists for these exact words. Either the text was changed \u2014 even one character breaks it \u2014 or it was never sealed.<br><br>Want to seal it? <a class='inline' href='/seal'>sebbi.pro/seal &rarr;</a><br>Fingerprint checked: "+lastHash.slice(0,32)+"\u2026</div>";
+      err.textContent=d.error||'Something went wrong. Email justrightdecorators@gmail.com';
+      err.classList.add('show');btn.textContent=orig;btn.disabled=false;
     }
   }catch(e){
-    res.className="err";
-    res.innerHTML="<div class='big'>Network error</div><div class='detail'>"+e+"</div>";
+    err.textContent='Cannot reach server. Email justrightdecorators@gmail.com';
+    err.classList.add('show');btn.textContent=orig;btn.disabled=false;
   }
-  btn.disabled=false;btn.textContent="Check the chain \u2192";
 }
 </script>
 </body>
