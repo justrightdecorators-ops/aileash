@@ -1,2198 +1,2639 @@
-# Codebase — part 15 of 26
+# Codebase — part 15 of 25
 
 Contains:
-- `server-42.py`
+- `sebdog_engine.py`
+- `sebdog_licence.py`
+- `sebdog_reporter.py`
+- `tests/attack_continuity_1.py`
+- `tests/attack_continuity_2.py`
+- `tests/attack_continuity_3.py`
+- `tests/attack_continuity_4.py`
+- `tests/attack_continuity_5.py`
 
 
-## `server-42.py`
+## `sebdog_engine.py`
 
-2186 lines, 133163 bytes
+842 lines, 32546 bytes
 
 ```python
-import json,math,time,sqlite3,hashlib,threading,random,string,hmac,base64,zlib,re
-import urllib.request,urllib.parse,os,secrets
-from html import escape as esc
-from collections import defaultdict,deque
-from http.server import BaseHTTPRequestHandler,HTTPServer
+"""
+SEBDOG ENGINE v1.2.0
+Local compliance engine. Runs on your hardware. Data never leaves it.
+Copyright (c) 2026 Justin Antony Dobson / Monop Content, Blyth, UK
+
+WHAT CHANGED IN 1.2
+-------------------
+1. NO PHONE HOME. v1.1 called sebbi.pro on startup and every 24 hours,
+   returned 403 without a valid licence and exited if it could not reach
+   the server. So "sovereign" described the data and not the engine, and
+   an air-gapped box could not run it at all. Licensing is now an
+   Ed25519 token validated locally by sebdog_licence v2. This process
+   makes no outbound call to sebbi.pro, ever. Verify that with a packet
+   capture rather than taking it from a docstring.
+
+2. IT CAN BE WITNESSED. Two new routes:
+       GET  /tip               your current chain head, for peers to seal
+       POST /witness/observe   seal a peer's head into your chain
+   That is the whole witness protocol. Point meshwitness.py at this
+   engine and your on-premise chain is sealed into chains held by
+   operators neither you nor your vendor controls. A local hash chain
+   proves nothing against the party who owns the file - this is what
+   turns it into evidence.
+
+3. THE SEAL RACE IS FIXED. v1.1 read the chain tip under the lock,
+   released it, then took the lock again to insert. Two concurrent
+   requests could read the same prev_hash and both write against it.
+   Tip read, hash and insert now happen inside one lock hold, which is
+   how server.py has done it since the same bug was found there.
+
+4. /govern NO LONGER ACCEPTS AN EMPTY BEARER. v1.1 checked
+   `if bearer and bearer != key`, so a request with no Authorization
+   header passed straight through and was rate-limited under "default".
+   Any process on the host could drive the engine. A matching bearer is
+   now required.
+
+5. BACKUPS CANNOT BE TORN. shutil.copy2 on a live WAL database can copy
+   a half-written file. Backups now use sqlite3's own backup API, which
+   is transactionally safe on a running database, and each backup is
+   sealed into the chain - so restoring an older backup is visible
+   rather than silent.
+
+SOVEREIGNTY, STATED PRECISELY
+-----------------------------
+    The engine makes no outbound connection of any kind.
+    Your decisions, your events and your chain stay on your disk.
+    If you enable witnessing, ONE hash leaves - your chain head. It
+    cannot be reversed into anything and it reveals nothing but the
+    fact that your chain exists and has moved.
+
+WHAT IT DOES NOT DO
+-------------------
+    It does not prove a decision was correct. Wrong answers seal as
+    cleanly as right ones.
+    It does not prove your records are complete. A chain can be intact
+    and simply not contain what matters.
+    Witnessing does not make your log true. It makes it impossible to
+    rewrite quietly after the fact.
+
+RUN IT
+    python3 sebdog_engine.py --token <your licence token>
+    python3 sebdog_engine.py --token-file licence.txt --port 9090
+"""
+
+import argparse
+import hashlib
+import json
+import math
+import os
+import shutil
+import sqlite3
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections import defaultdict, deque
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
-from urllib.parse import urlparse,parse_qs
+from urllib.parse import urlparse
 
-PORT=int(os.environ.get("PORT",8080))
-STRIPE_SECRET=os.environ.get("STRIPE_SECRET","")
-STRIPE_WEBHOOK_SECRET=os.environ.get("STRIPE_WEBHOOK_SECRET","")
-BREVO_API_KEY=os.environ.get("BREVO_API_KEY","")
-HOST=os.environ.get("HOST","https://sebbi.pro")
-def _pick_db_path():
-    """Use a persistent volume if one is mounted, else fall back to the
-    local file so the app never crashes on boot. Set DB_PATH in Railway
-    (e.g. /data/aileash.db) once a volume is mounted at that folder, and
-    the chain will survive redeploys instead of resetting each time."""
-    p=os.environ.get("DB_PATH","").strip()
-    if p:
-        d=os.path.dirname(p) or "."
-        try:
-            os.makedirs(d,exist_ok=True)
-            if os.access(d,os.W_OK):return p
-        except Exception:pass
-        print("DB_PATH set but "+p+" not writable - falling back to local aileash.db",flush=True)
-    return "aileash.db"
-DB=_pick_db_path()
-VERSION="6.5.0"
-OWNER_NAME="Justin Antony Dobson"
-OWNER_EMAIL="justrightdecorators@gmail.com"
-OWNER_PHONE="07908 269428"
-SAFE={"UK","US","DE","FR","CA","AU","NL","SE","NO","DK","FI","IE","NZ"}
-REQ={"user_id","action","amount","country","device_id","anomaly","device_risk"}
-FREE_QUOTA=100
-TRIAL_DAYS=90
-ADMIN_PASSWORD=os.environ.get("ADMIN_PASSWORD","")
-_admin_tokens={}
-_admin_fails=deque()
-_admin_lock=threading.Lock()
-ADMIN_TOKEN_TTL=86400
-STRIPE_PRICE_AL=""
-STRIPE_PRICE_GU=""
-STRIPE_PRICE_SB=""
-STRIPE_PRICE_SE=""
-STRIPE_PRICE_TS=""
-_db_lock=threading.Lock()
-_load_lock=threading.Lock()
-_req_times=deque()
-_overloaded=False
-_key_wins=defaultdict(lambda:{"min":deque(),"hour":deque()})
-_key_lock=threading.Lock()
-_prune_counter=0
-_prune_lock=threading.Lock()
-_trial_checkout_cache={}
-_trial_lock=threading.Lock()
+try:
+    import sebdog_licence as licence
+except ImportError:
+    licence = None
 
-def to_int(v,default=1,lo=1,hi=1000000):
-    try:return max(lo,min(hi,int(v)))
-    except (ValueError,TypeError):return default
+VERSION = "1.2.0"
+HOME = "https://sebbi.pro"
+DB_FILE = "sebdog_audit.db"
+CHAIN_NAME = "sebdog-local"
+SAFE = {"UK", "US", "DE", "FR", "CA", "AU", "NL", "SE", "NO", "DK",
+        "FI", "IE", "NZ"}
+REQ = {"user_id", "action", "amount", "country", "device_id", "anomaly",
+       "device_risk"}
+HEX64 = set("0123456789abcdef")
+
+_db_lock = threading.Lock()
+_key_wins = defaultdict(lambda: {"min": deque(), "hour": deque()})
+_key_lock = threading.Lock()
+W60 = defaultdict(deque)
+W5M = defaultdict(deque)
+W1H = defaultdict(deque)
+
+_licence = {"valid": False, "plan": "free", "product": "aileash",
+            "devices": 1, "email": "", "checked_at": 0, "key": "",
+            "expires": 0, "grace": False}
+
+_conn = None
+
+
+# ==============================================================================
+# LICENCE - validated locally, no network
+# ==============================================================================
+
+def load_licence(token, pubkey=None):
+    """Validate an Ed25519 licence token offline. No outbound call."""
+    global _licence
+    if licence is None:
+        print("[SEBDOG] sebdog_licence.py not found next to this file.",
+              flush=True)
+        return False
+    data, err = licence.validate_token(token, pubkey)
+    if err:
+        explain = {
+            "no_public_key": "No licence public key is configured. Set "
+                             "SEBDOG_LICENCE_PUBKEY or edit LICENCE_PUBKEY "
+                             "in sebdog_licence.py.",
+            "invalid_signature": "This token was not signed by the expected "
+                                 "key, or it has been altered.",
+            "token_expired": "This licence expired more than 7 days ago.",
+            "version_mismatch": "This is an old v1 token. v1 tokens were "
+                                "verifiable by anyone holding the shared "
+                                "secret and have been withdrawn. Request a "
+                                "replacement.",
+            "invalid_format": "This does not decode as a licence token.",
+        }.get(err, err)
+        print("[SEBDOG] Licence rejected: %s\n           %s" % (err, explain),
+              flush=True)
+        return False
+
+    _licence.update({
+        "valid": True, "plan": data.get("plan", "free"),
+        "devices": data.get("devices", 1), "email": data.get("email", ""),
+        "key": data.get("key", ""), "expires": data.get("expires", 0),
+        "checked_at": time.time(),
+        "grace": licence.is_in_grace_period(data),
+    })
+    days = licence.days_until_expiry(data)
+    print("[SEBDOG] Licence valid, checked locally. Plan:%s Devices:%s"
+          % (_licence["plan"], _licence["devices"]), flush=True)
+    if _licence["grace"]:
+        print("[SEBDOG] EXPIRED - running on the 7 day grace period. Renew "
+              "at %s" % HOME, flush=True)
+    elif days < 30:
+        print("[SEBDOG] Licence expires in %d days." % days, flush=True)
+    return True
+
+
+def licence_watch():
+    """Re-check expiry hourly against the local clock. Still no network."""
+    while True:
+        time.sleep(3600)
+        if _licence["expires"] and _licence["expires"] < time.time():
+            if not _licence["grace"]:
+                _licence["grace"] = True
+                print("[SEBDOG] Licence has expired. 7 day grace period "
+                      "started. Renew at %s" % HOME, flush=True)
+            if _licence["expires"] + licence.GRACE_SECONDS < time.time():
+                _licence["valid"] = False
+                print("[SEBDOG] Grace period over. Governing is disabled; "
+                      "your chain and data are untouched.", flush=True)
+
+
+# ==============================================================================
+# DATABASE + BACKUP
+# ==============================================================================
 
 def get_conn():
-    c=sqlite3.connect(DB,check_same_thread=False)
+    c = sqlite3.connect(DB_FILE, check_same_thread=False)
     c.execute("PRAGMA journal_mode=WAL;")
     c.execute("PRAGMA synchronous=NORMAL;")
-    c.execute("CREATE TABLE IF NOT EXISTS users(user_id TEXT PRIMARY KEY,trust REAL DEFAULT 0.5,last_country TEXT)")
-    c.execute("CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT,ts REAL,user_id TEXT,event_json TEXT,result_json TEXT,prev_hash TEXT,audit_hash TEXT UNIQUE)")
-    c.execute("CREATE TABLE IF NOT EXISTS api_keys(key TEXT PRIMARY KEY,email TEXT,phone TEXT,name TEXT,org TEXT,org_type TEXT,product TEXT DEFAULT 'aileash',devices INTEGER DEFAULT 1,stripe_customer TEXT DEFAULT '',stripe_sub TEXT DEFAULT '',actions_used INTEGER DEFAULT 0,created REAL,active INTEGER DEFAULT 1,is_paid INTEGER DEFAULT 0,free_quota INTEGER DEFAULT 100,plan_type TEXT DEFAULT 'free')")
-    c.execute("CREATE TABLE IF NOT EXISTS config(k TEXT PRIMARY KEY,v TEXT)")
-    c.execute("CREATE TABLE IF NOT EXISTS load_log(id INTEGER PRIMARY KEY AUTOINCREMENT,ts REAL,rps REAL,note TEXT)")
-    c.execute("CREATE TABLE IF NOT EXISTS contact_log(id INTEGER PRIMARY KEY AUTOINCREMENT,ts REAL,name TEXT,email TEXT,phone TEXT,org TEXT,message TEXT)")
-    c.execute("CREATE TABLE IF NOT EXISTS referrals(code TEXT PRIMARY KEY,referrer_key TEXT,referrer_email TEXT,referrer_name TEXT,created REAL,devices_referred INTEGER DEFAULT 0,earnings_pence INTEGER DEFAULT 0)")
-    c.execute("CREATE TABLE IF NOT EXISTS threat_log(id INTEGER PRIMARY KEY AUTOINCREMENT,ts REAL,ref TEXT,data_json TEXT)")
-    c.execute("CREATE TABLE IF NOT EXISTS waitlist(id INTEGER PRIMARY KEY AUTOINCREMENT,ts REAL,email TEXT,product TEXT,name TEXT)")
-    c.execute("CREATE TABLE IF NOT EXISTS guardian_family(pair_code TEXT PRIMARY KEY,parent_key TEXT,child_name TEXT,created REAL,last_checkin REAL)")
-    c.execute("CREATE TABLE IF NOT EXISTS guardian_events(id INTEGER PRIMARY KEY AUTOINCREMENT,pair_code TEXT,ts REAL,kind TEXT,lat REAL,lon REAL,note TEXT,content_fp TEXT,audit_hash TEXT)")
+    c.execute("""CREATE TABLE IF NOT EXISTS users(
+        user_id TEXT PRIMARY KEY, trust REAL DEFAULT 0.5,
+        last_country TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS audit_log(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, user_id TEXT,
+        event_json TEXT, result_json TEXT, prev_hash TEXT,
+        audit_hash TEXT UNIQUE)""")
     c.execute("CREATE INDEX IF NOT EXISTS idx_audit ON audit_log(user_id)")
-    try:c.execute("ALTER TABLE audit_log ADD COLUMN api_key TEXT")
-    except sqlite3.OperationalError:pass
-    try:c.execute("ALTER TABLE audit_log ADD COLUMN key_seq INTEGER")
-    except sqlite3.OperationalError:pass
-    try:c.execute("ALTER TABLE api_keys ADD COLUMN seq INTEGER DEFAULT 0")
-    except sqlite3.OperationalError:pass
-    c.execute("CREATE INDEX IF NOT EXISTS idx_audit_key ON audit_log(api_key)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_keys_email ON api_keys(email)")
-    c.execute("CREATE TABLE IF NOT EXISTS device_seen(api_key TEXT,device_id TEXT,first_seen REAL,PRIMARY KEY(api_key,device_id))")
-    c.execute("CREATE TABLE IF NOT EXISTS signal_packs(pack_id TEXT PRIMARY KEY,api_key TEXT,name TEXT,version INTEGER,signals_json TEXT,created REAL,seal TEXT,block_index INTEGER,public INTEGER DEFAULT 0,author TEXT DEFAULT '')")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_packs_key ON signal_packs(api_key)")
-    try:c.execute("ALTER TABLE signal_packs ADD COLUMN public INTEGER DEFAULT 0")
-    except sqlite3.OperationalError:pass
-    try:c.execute("ALTER TABLE signal_packs ADD COLUMN author TEXT DEFAULT ''")
-    except sqlite3.OperationalError:pass
-    c.execute("CREATE TABLE IF NOT EXISTS identity_registry(fp TEXT PRIMARY KEY,ts REAL,seal TEXT,block_index INTEGER,public INTEGER DEFAULT 0,profile_json TEXT DEFAULT '')")
-    c.execute("CREATE TABLE IF NOT EXISTS payment_registry(fp TEXT PRIMARY KEY,ts REAL,seal TEXT,block_index INTEGER,display_json TEXT DEFAULT '')")
-    c.execute("CREATE TABLE IF NOT EXISTS post_registry(fp TEXT PRIMARY KEY,ts REAL,seal TEXT,block_index INTEGER)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_devseen_key ON device_seen(api_key)")
+    c.execute("""CREATE TABLE IF NOT EXISTS chain_snapshots(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL,
+        block_count INTEGER, tip_hash TEXT, snapshot_file TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS witness_seen(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, peer TEXT, tip TEXT,
+        url TEXT, observed REAL, audit_hash TEXT,
+        UNIQUE(peer, tip))""")
     c.commit()
     return c
 
-_conn=get_conn()
 
-def track_request():
-    global _overloaded
-    t=time.time()
-    with _load_lock:
-        _req_times.append(t)
-        while _req_times and _req_times[0]<t-1.0:_req_times.popleft()
-        rps=len(_req_times)
-        if rps>200 and not _overloaded:
-            _overloaded=True
-            try:_conn.execute("INSERT INTO load_log(ts,rps,note) VALUES(?,?,?)",(t,rps,"THROTTLE"));_conn.commit()
-            except:pass
-        elif rps<140 and _overloaded:_overloaded=False
+def init_db():
+    global _conn
+    _conn = get_conn()
 
-def is_over():
-    with _load_lock:return _overloaded
 
-def get_rps():
-    t=time.time()
-    with _load_lock:return sum(1 for x in _req_times if x>=t-1.0)
+def backup_db():
+    """
+    Timestamped backup using sqlite3's own backup API.
 
-def check_rate(key):
-    t=time.time()
-    with _key_lock:
-        w=_key_wins[key]
-        while w["min"] and w["min"][0]<t-60:w["min"].popleft()
-        while w["hour"] and w["hour"][0]<t-3600:w["hour"].popleft()
-        if len(w["min"])>=60:return False,"rate_limit_minute"
-        if len(w["hour"])>=1000:return False,"rate_limit_hour"
-        w["min"].append(t);w["hour"].append(t)
-        return True,None
+    v1.1 used shutil.copy2, which on a live WAL database can copy a file
+    mid-write and produce a backup that will not open. The backup API is
+    transactionally consistent against a running connection.
 
-def prune_memory():
-    """Evict stale entries from in-memory velocity/rate-limit stores.
-    Called every 1000 requests. Fix for unbounded memory growth."""
-    t=time.time()
-    with _key_lock:
-        dead=[k for k,w in _key_wins.items() if (not w["hour"]) or w["hour"][-1]<t-3600]
-        for k in dead:del _key_wins[k]
-    for store,age in ((W60,60),(W5M,300),(W1H,3600)):
-        dead=[u for u,q in store.items() if (not q) or q[-1]<t-age]
-        for u in dead:del store[u]
-    with _admin_lock:
-        expired=[tok for tok,exp in _admin_tokens.items() if exp<t]
-        for tok in expired:del _admin_tokens[tok]
-    with _trial_lock:
-        old=[k for k,v in _trial_checkout_cache.items() if v[0]<t-3600]
-        for k in old:del _trial_checkout_cache[k]
-
-def maybe_prune():
-    global _prune_counter
-    with _prune_lock:
-        _prune_counter+=1
-        if _prune_counter<1000:return
-        _prune_counter=0
-    try:prune_memory()
-    except Exception as e:print("PRUNE ERR:"+str(e),flush=True)
-
-def send_email(to_email,to_name,subject,html):
-    BREVO_KEY=os.environ.get("BREVO_API_KEY","").strip()
-    if not BREVO_KEY:print("EMAIL SKIP:"+to_email,flush=True);return
+    The backup is then SEALED into the chain, so restoring an older
+    database later is detectable rather than silent.
+    """
+    backup_dir = os.path.join(os.path.dirname(os.path.abspath(DB_FILE)),
+                              "sebdog_backups")
+    os.makedirs(backup_dir, exist_ok=True)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(backup_dir, "sebdog_audit_%s.db" % stamp)
     try:
-        payload=json.dumps({"sender":{"name":"AILeash","email":"justrightdecorators@gmail.com"},"to":[{"email":to_email,"name":to_name}],"subject":subject,"htmlContent":html})
-        req=urllib.request.Request("https://api.brevo.com/v3/smtp/email",
-            data=payload.encode("utf-8"),
-            headers={"api-key":str(BREVO_KEY),"Content-Type":"application/json"},method="POST")
-        with urllib.request.urlopen(req,timeout=15):pass
-        print("EMAIL OK:"+to_email,flush=True)
-    except Exception as e:print("EMAIL ERR:"+str(e),flush=True)
+        with _db_lock:
+            dest = sqlite3.connect(path)
+            _conn.backup(dest)
+            dest.close()
+            blocks = _conn.execute(
+                "SELECT COUNT(*) FROM audit_log").fetchone()[0]
+            tip = _conn.execute("SELECT audit_hash FROM audit_log "
+                                "ORDER BY id DESC LIMIT 1").fetchone()
+            tip_hash = tip[0] if tip else "GENESIS"
+            _conn.execute("INSERT INTO chain_snapshots(ts,block_count,"
+                          "tip_hash,snapshot_file) VALUES(?,?,?,?)",
+                          (time.time(), blocks, tip_hash, path))
+            _conn.commit()
 
-def send_referral_welcome(name,email,key,ref_code,product,monthly):
-    pname={"sonicboom":"SonicBoom","sentinel":"AILeash Sentinel","tokensaver":"Token Saver"}.get(product,"AILeash")
-    safe_first=esc(name.split()[0]) if name.strip() else ""
-    pricing_line="Your "+pname+" API key is ready. Everything is free for the first "+str(TRIAL_DAYS)+" days - full engine, unlimited decisions, no card. After the trial it is 50p per unique device per month via Stripe, metered on the real devices that used your key."
-    html=(
-        "<html><body style='font-family:Arial,sans-serif;background:#f5f7fa;padding:20px'>"
-        "<div style='max-width:600px;margin:0 auto;background:#fff;border-radius:8px;overflow:hidden'>"
-        "<div style='background:#0a0f1e;padding:32px;border-bottom:4px solid #c9a84c'>"
-        "<div style='font-size:22px;color:#fff;font-weight:900;font-family:Georgia,serif'>Monop <span style='color:#c9a84c'>Content</span></div>"
-        "</div><div style='padding:36px'>"
-        "<p style='font-size:20px;font-weight:700;color:#0a0f1e;margin-bottom:16px'>Welcome"+(", "+safe_first if safe_first else "")+".</p>"
-        "<p style='font-size:14px;color:#64748b;line-height:1.7'>"+pricing_line+"</p>"
-        "<div style='background:#0a0f1e;border-radius:6px;padding:20px;margin:20px 0'>"
-        "<div style='font-family:monospace;font-size:10px;color:#c9a84c;letter-spacing:2px;text-transform:uppercase;margin-bottom:8px'>Your API Key</div>"
-        "<div style='font-family:monospace;font-size:12px;color:#00ff88;word-break:break-all'>"+esc(key)+"</div>"
-        "</div>"
-        +"<div style='background:#f8f5ee;border:2px solid #c9a84c;border-radius:6px;padding:20px;margin:20px 0'>"
-        "<div style='font-family:monospace;font-size:10px;color:#c9a84c;letter-spacing:2px;text-transform:uppercase;margin-bottom:8px'>Your Referral Code</div>"
-        "<div style='font-family:monospace;font-size:20px;color:#0a0f1e;font-weight:900'>"+esc(ref_code)+"</div>"
-        "<p style='font-size:13px;color:#64748b;margin-top:8px;line-height:1.6'>Share this code. Every device signed up earns you <strong>10p per month forever</strong>.</p>"
-        "</div>"
-        +"<p style='font-size:13px;color:#64748b'>Your step-by-step installation guide is arriving in a separate email.</p>"
-        "<p style='font-size:13px;color:#64748b'>Questions? <a href='mailto:"+OWNER_EMAIL+"' style='color:#c9a84c'>"+OWNER_EMAIL+"</a> &middot; "+OWNER_PHONE+"</p>"
-        "</div></div></body></html>"
-    )
-    send_email(email,name,"Your "+pname+" API Key + Referral Code",html)
+        # sealed outside the lock - seal() takes it itself
+        seal({"user_id": "sebdog", "action": "backup_created",
+              "amount": 0, "country": "UK", "device_id": "sebdog",
+              "anomaly": 0, "device_risk": 0},
+             {"decision": "BACKUP", "score": 0, "version": VERSION,
+              "blocks_at_backup": blocks, "tip_at_backup": tip_hash,
+              "note": "backup sealed so a later restore of an older "
+                      "database is visible in the chain"},
+             time.time())
+        print("[SEBDOG] Backup created and sealed: %s (%d blocks)"
+              % (path, blocks), flush=True)
+        _cleanup_old_backups(backup_dir)
+    except Exception as e:
+        print("[SEBDOG] Backup failed: %s" % e, flush=True)
 
-def _guide_shell(title,inner):
-    return ("<html><body style='font-family:Arial,sans-serif;background:#f5f7fa;padding:20px'>"
-        "<div style='max-width:640px;margin:0 auto;background:#fff;border-radius:8px;overflow:hidden'>"
-        "<div style='background:#0a0f1e;padding:28px;border-bottom:4px solid #c9a84c'>"
-        "<div style='font-size:20px;color:#fff;font-weight:900;font-family:Georgia,serif'>"+esc(title)+"</div>"
-        "<div style='font-family:monospace;font-size:9px;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,0.4);margin-top:6px'>Installation guide &middot; Monop Content</div>"
-        "</div><div style='padding:32px'>"+inner+
-        "<hr style='border:none;border-top:1px solid #eee;margin:26px 0'>"
-        "<p style='font-size:12px;color:#94a3b8;line-height:1.7'>Free for "+str(TRIAL_DAYS)+" days from signup. After that, 50p per unique device per month via Stripe - metered on the real devices that used your key, never a number you typed. When the trial ends you will be directed to a secure Stripe payment page; pay to continue exactly where you left off, or remove the integration - your choice, no lock-in.</p>"
-        "<p style='font-size:12px;color:#94a3b8'>Help: <a href='mailto:"+OWNER_EMAIL+"' style='color:#c9a84c'>"+OWNER_EMAIL+"</a> &middot; "+OWNER_PHONE+" &middot; <a href='"+HOST+"/developers' style='color:#c9a84c'>"+HOST+"/developers</a></p>"
-        "</div></div></body></html>")
 
-def _code_block(code):
-    return "<pre style='background:#0a0f1e;color:#7fe3b0;font-family:monospace;font-size:11px;padding:16px;border-radius:6px;overflow-x:auto;line-height:1.6'>"+esc(code)+"</pre>"
-
-def _h(t):
-    return "<p style='font-size:15px;font-weight:700;color:#0a0f1e;margin:22px 0 8px'>"+esc(t)+"</p>"
-
-def _p(t):
-    return "<p style='font-size:13px;color:#64748b;line-height:1.7;margin-bottom:8px'>"+t+"</p>"
-
-def install_guide(product,key):
-    k=esc(key)
-    govern_curl=("curl -X POST "+HOST+"/api/govern \\\n"
-        "  -H \"Authorization: Bearer "+key+"\" \\\n"
-        "  -H \"Content-Type: application/json\" \\\n"
-        "  -d '{\n"
-        "    \"user_id\": \"user_123\",\n"
-        "    \"action\": \"payment\",\n"
-        "    \"amount\": 49.99,\n"
-        "    \"country\": \"UK\",\n"
-        "    \"device_id\": \"device_abc\",\n"
-        "    \"anomaly\": 0.1,\n"
-        "    \"device_risk\": 0.2\n"
-        "  }'")
-    govern_py=("import requests\n\n"
-        "r = requests.post(\""+HOST+"/api/govern\",\n"
-        "    headers={\"Authorization\": \"Bearer "+key+"\"},\n"
-        "    json={\"user_id\": \"user_123\", \"action\": \"payment\",\n"
-        "          \"amount\": 49.99, \"country\": \"UK\",\n"
-        "          \"device_id\": \"device_abc\", \"anomaly\": 0.1, \"device_risk\": 0.2})\n"
-        "d = r.json()\n"
-        "print(d[\"decision\"], d[\"score\"], d[\"audit_hash\"])")
-    govern_js=("const r = await fetch(\""+HOST+"/api/govern\", {\n"
-        "  method: \"POST\",\n"
-        "  headers: {\"Authorization\": \"Bearer "+key+"\",\n"
-        "            \"Content-Type\": \"application/json\"},\n"
-        "  body: JSON.stringify({user_id: \"user_123\", action: \"payment\",\n"
-        "    amount: 49.99, country: \"UK\", device_id: \"device_abc\",\n"
-        "    anomaly: 0.1, device_risk: 0.2})\n"
-        "});\n"
-        "const d = await r.json();\n"
-        "console.log(d.decision, d.score, d.audit_hash);")
-    eligible=_p("<b>Eligible systems:</b> anything that can send an HTTPS POST with JSON. That covers every modern backend - Python (Django, Flask, FastAPI), Node.js, PHP (Laravel, WordPress plugins), Java/Spring, .NET, Ruby on Rails, Go - plus no-code tools like Zapier and Make, and mobile apps calling through your own server. No SDK to install, no library dependency, nothing added to your stack.")
-    if product=="sonicboom":
-        inner=(
-            _p("SonicBoom adds a sealed compliance record to every AI call you already make, without slowing anything down. It sits <b>alongside</b> your existing provider - AWS, Azure, Google Cloud, OpenAI, Anthropic - it never replaces it.")
-            +_h("How it fits your current system")
-            +_p("You already call your AI provider. Add one call to SonicBoom either just before (to gate the action) or just after (to seal the record). Median decision time is 28ms, so your users never notice it.")
-            +_h("Step 1 - test your key (60 seconds)")
-            +_code_block(govern_curl)
-            +_h("Step 2 - wrap your existing AI call")
-            +_p("Python example - two lines around what you already run:")
-            +_code_block("verdict = requests.post(\""+HOST+"/api/govern\", headers=H, json=event).json()\nif verdict[\"decision\"] != \"BLOCK\":\n    result = openai_client.chat.completions.create(...)  # your existing call, unchanged")
-            +_h("Step 3 - keep the receipt")
-            +_p("Every response includes <b>audit_hash</b>, <b>block_index</b> and <b>receipt_seq</b>. Store them with your own logs - they are your regulator-ready proof. Anyone can verify them at "+HOST+"/api/verify-chain.")
-            +eligible
-            +_h("What the decision means")
-            +_p("<b>ALLOW</b> - proceed. <b>CHALLENGE</b> - the response includes a hosted verification URL to show the user. <b>BLOCK</b> - stop the action; you get an email alert with the sealed evidence.")
-        )
-        return "SonicBoom installation guide - one line of code",_guide_shell("SonicBoom",inner)
-    if product=="sentinel":
-        inner=(
-            _p("Sentinel watches every event on your platform and emails you the moment something looks like fraud - a burst of actions, a strange-country login, a risky device - with the sealed evidence attached.")
-            +_h("How it fits your current system")
-            +_p("Send Sentinel an event whenever money or accounts move: checkout, login, transfer, signup, message. One POST per event. Sentinel scores it in under 30ms and seals it. BLOCK verdicts trigger a real-time email alert (max one per hour so a burst attack can't flood your inbox).")
-            +_h("Step 1 - test your key (60 seconds)")
-            +_code_block(govern_curl)
-            +_h("Step 2 - wire it into your event points")
-            +_code_block(govern_py)
-            +_h("Step 3 - act on the verdict")
-            +_p("<b>ALLOW</b> - let it through. <b>CHALLENGE</b> - show the user the hosted verification link in the response. <b>BLOCK</b> - hold the action; the alert email is already on its way to you with the audit hash.")
-            +_h("Live monitoring")
-            +_p("Watch your last hour in real time: GET "+HOST+"/api/pulse with your key as the Bearer token. Device count and billing: GET "+HOST+"/api/usage.")
-            +eligible
-        )
-        return "Sentinel installation guide - fraud alerts in 3 steps",_guide_shell("Sentinel",inner)
-    if product=="guardian":
-        inner=(
-            _p("Guardian gives platforms with young users a safety layer that flags known grooming and manipulation patterns, gives every child one-tap access to CEOP, Childline and 999, and seals every safety event into a tamper-evident chain - the exact evidence Ofcom asks for under the Online Safety Act.")
-            +_h("How it fits your current system")
-            +_p("You build Guardian into <b>your own app</b> - your design, our engine underneath. Three endpoints do the work; message content is never stored, only a fingerprint.")
-            +_h("Step 1 - pair a family")
-            +_code_block("curl -X POST "+HOST+"/api/guardian/pair \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"parent_email\": \"parent@example.com\", \"child_name\": \"Sam\"}'")
-            +_p("The response includes a <b>pair_code</b> and a ready-made child URL to open on the child's phone.")
-            +_h("Step 2 - check a message")
-            +_code_block("curl -X POST "+HOST+"/api/guardian/flag \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"code\": \"SAM-A1B2\", \"message\": \"<text the child wants checked>\"}'")
-            +_p("Returns <b>FLAGGED</b> (with categories - the parent is emailed automatically) or <b>UNRECOGNISED</b>. Guardian never falsely tells a child a message is \"safe\".")
-            +_h("Step 3 - check-ins and the Help button")
-            +_code_block("POST "+HOST+"/api/guardian/checkin   {\"code\": \"SAM-A1B2\", \"lat\": 55.1, \"lon\": -1.5}\nPOST "+HOST+"/api/guardian/panic     {\"code\": \"SAM-A1B2\", \"lat\": 55.1, \"lon\": -1.5}")
-            +_p("Panic seals the event and emails the parent instantly with a map link. The parent's full sealed timeline: GET "+HOST+"/api/guardian/report?email=parent@example.com&code=SAM-A1B2")
-            +eligible
-            +_p("<b>Families never pay.</b> Platforms pay 50p per device after the "+str(TRIAL_DAYS)+"-day trial.")
-        )
-        return "Guardian installation guide - child safety, sealed",_guide_shell("Guardian",inner)
-    inner=(
-        _p("AILeash scores every decision your AI makes - <b>ALLOW, CHALLENGE or BLOCK</b> in under 30ms - and seals each one into a SHA-256 chain nobody can quietly edit. When a regulator asks what your AI decided and why, you answer in one API call.")
-        +_h("How it fits your current system")
-        +_p("Wherever your AI acts on a user - approving a loan, pricing a policy, blocking a payment, banning an account - send AILeash the event first and act on the verdict. One POST per decision, nothing else in your stack changes.")
-        +_h("Step 1 - test your key (60 seconds)")
-        +_code_block(govern_curl)
-        +_h("Step 2 - integrate (pick your language)")
-        +_p("Python:")+_code_block(govern_py)
-        +_p("JavaScript / Node:")+_code_block(govern_js)
-        +_h("Step 3 - store the receipts")
-        +_p("Every response includes <b>audit_hash</b>, <b>block_index</b> and a gapless <b>receipt_seq</b>. Store them with your own records - together they are your proof under EU AI Act Articles 9, 12, 13 and 14. Verify any time: "+HOST+"/api/verify-chain &middot; reconcile completeness: "+HOST+"/api/coverage.")
-        +_h("The required fields")
-        +_p("<b>user_id</b> (who), <b>action</b> (what), <b>amount</b> (0 if none), <b>country</b> (2-letter), <b>device_id</b> (device fingerprint - this is also the billing meter), <b>anomaly</b> and <b>device_risk</b> (0 to 1 - send 0 if you don't score these yet).")
-        +eligible
-        +_h("What the decision means")
-        +_p("<b>ALLOW</b> - proceed. <b>CHALLENGE</b> - the response carries a hosted verification URL; show it to the user and poll the status URL. <b>BLOCK</b> - stop the action; a real-time alert email with sealed evidence is on its way to you.")
-    )
-    return "AILeash installation guide - live in 3 steps",_guide_shell("AILeash",inner)
-
-def send_install_guide(name,email,key,product):
+def _cleanup_old_backups(backup_dir, keep=7):
     try:
-        subject,html=install_guide(product,key)
-        send_email(email,name,subject,html)
-    except Exception as e:print("GUIDE ERR:"+str(e),flush=True)
-
-def contact_email(name,email,phone,org,message):
-    html=(
-        "<html><body style='font-family:Arial,sans-serif;padding:20px;color:#333'>"
-        "<h2>New Contact: "+esc(name)+"</h2>"
-        "<p><b>Email:</b> "+esc(email)+"</p><p><b>Phone:</b> "+esc(phone)+"</p>"
-        "<p><b>Org:</b> "+esc(org)+"</p><p><b>Message:</b><br>"+esc(message)+"</p>"
-        "</body></html>"
-    )
-    send_email(OWNER_EMAIL,OWNER_NAME,"Contact: "+name,html)
-
-def stripe_call(method,endpoint,data=None):
-    if not STRIPE_SECRET:return None
-    try:
-        req=urllib.request.Request("https://api.stripe.com/v1"+endpoint,
-            data=urllib.parse.urlencode(data).encode() if data else None,
-            headers={"Authorization":"Bearer "+STRIPE_SECRET,"Content-Type":"application/x-www-form-urlencoded"},method=method)
-        with urllib.request.urlopen(req,timeout=10) as r:return json.loads(r.read())
-    except urllib.error.HTTPError as e:
-        try:return json.loads(e.read())
-        except:return None
-    except Exception as e:print("Stripe:"+str(e),flush=True);return None
-
-def verify_stripe_signature(payload,sig_header):
-    """Verify Stripe webhook signature. Fix for unauthenticated webhook.
-    Stripe-Signature header format: t=timestamp,v1=hexsig[,v1=...]"""
-    if not STRIPE_WEBHOOK_SECRET:return False
-    if not sig_header:return False
-    try:
-        t=None;sigs=[]
-        for part in sig_header.split(","):
-            k,_,v=part.strip().partition("=")
-            if k=="t":t=v
-            elif k=="v1":sigs.append(v)
-        if not t or not sigs:return False
-        if abs(time.time()-int(t))>300:return False
-        signed=t.encode()+b"."+payload
-        expected=hmac.new(STRIPE_WEBHOOK_SECRET.encode(),signed,hashlib.sha256).hexdigest()
-        return any(hmac.compare_digest(expected,s) for s in sigs)
+        files = sorted(os.path.join(backup_dir, f)
+                       for f in os.listdir(backup_dir)
+                       if f.startswith("sebdog_audit_") and f.endswith(".db"))
+        for old in files[:-keep]:
+            os.remove(old)
     except Exception:
+        pass
+
+
+def backup_loop():
+    while True:
+        time.sleep(86400)
+        backup_db()
+
+
+def restore_latest_backup():
+    backup_dir = os.path.join(os.path.dirname(os.path.abspath(DB_FILE)),
+                              "sebdog_backups")
+    if not os.path.exists(backup_dir):
+        return False
+    files = sorted(os.path.join(backup_dir, f)
+                   for f in os.listdir(backup_dir)
+                   if f.startswith("sebdog_audit_") and f.endswith(".db"))
+    if not files:
+        return False
+    try:
+        shutil.copy2(files[-1], DB_FILE)
+        print("[SEBDOG] Restored from backup: %s" % files[-1], flush=True)
+        return True
+    except Exception as e:
+        print("[SEBDOG] Restore failed: %s" % e, flush=True)
         return False
 
-def make_price(name,desc):
-    p=stripe_call("POST","/products",{"name":name,"description":desc})
-    if not p or "id" not in p:return None
-    pr=stripe_call("POST","/prices",{"product":p["id"],"currency":"gbp","unit_amount":50,"recurring[interval]":"month"})
-    return pr["id"] if pr and "id" in pr else None
 
-def setup_stripe():
-    global STRIPE_PRICE_AL,STRIPE_PRICE_GU,STRIPE_PRICE_SB,STRIPE_PRICE_SE,STRIPE_PRICE_TS
-    if not STRIPE_SECRET:print("No STRIPE_SECRET",flush=True);return
-    products=[
-        ("price_al","AILeash","AI governance. 50p per device per month."),
-        ("price_sb","SonicBoom","Speed plugin. 50p per device per month."),
-        ("price_se","AILeash Sentinel","Fraud detection. 50p per device per month."),
-        ("price_ts","Token Saver","Cuts your AI token bill. 50p per device per month."),
-    ]
-    for k,name,desc in products:
-        with _db_lock:
-            r=_conn.execute("SELECT v FROM config WHERE k=?",(k,)).fetchone()
-        if r and r[0]:
-            if k=="price_al":STRIPE_PRICE_AL=r[0]
-            elif k=="price_gu":STRIPE_PRICE_GU=r[0]
-            elif k=="price_sb":STRIPE_PRICE_SB=r[0]
-            elif k=="price_se":STRIPE_PRICE_SE=r[0]
-            elif k=="price_ts":STRIPE_PRICE_TS=r[0]
-        else:
-            pid=make_price(name,desc)
-            if pid:
-                with _db_lock:_conn.execute("INSERT OR REPLACE INTO config(k,v) VALUES(?,?)",(k,pid));_conn.commit()
-                if k=="price_al":STRIPE_PRICE_AL=pid
-                elif k=="price_gu":STRIPE_PRICE_GU=pid
-                elif k=="price_sb":STRIPE_PRICE_SB=pid
-                elif k=="price_se":STRIPE_PRICE_SE=pid
-                elif k=="price_ts":STRIPE_PRICE_TS=pid
-    print("Stripe AL:"+str(STRIPE_PRICE_AL)[:12]+" GU:"+str(STRIPE_PRICE_GU)[:12]+" SB:"+str(STRIPE_PRICE_SB)[:12]+" SE:"+str(STRIPE_PRICE_SE)[:12],flush=True)
-    if not STRIPE_WEBHOOK_SECRET:print("WARNING: STRIPE_WEBHOOK_SECRET not set - webhook will reject all events. Set it in Railway variables (Stripe dashboard > Webhooks > Signing secret).",flush=True)
-
-def get_stripe_price(product):
-    return{"aileash":STRIPE_PRICE_AL,"sonicboom":STRIPE_PRICE_SB,"sentinel":STRIPE_PRICE_SE,"tokensaver":STRIPE_PRICE_TS}.get(product,STRIPE_PRICE_AL)
-
-def trial_checkout(key,email,product):
-    """Payment gate at trial end. Builds a Stripe checkout session whose
-    quantity is the REAL unique device count seen on this key - a show of
-    good faith both ways: they had 90 days free, the bill reflects exactly
-    what they used. Cached one hour per key so expired-trial traffic
-    doesn't hammer Stripe."""
-    t=time.time()
-    with _trial_lock:
-        c=_trial_checkout_cache.get(key)
-        if c and t-c[0]<3600:return c[1]
-    n=device_count(key) or 1
-    url=HOST+"/#signup"
-    if STRIPE_SECRET:
-        pid=get_stripe_price(product)
-        if not pid:setup_stripe();pid=get_stripe_price(product)
-        if pid:
-            session=stripe_call("POST","/checkout/sessions",{
-                "mode":"subscription",
-                "customer_email":email,
-                "success_url":HOST+"/?success=true",
-                "cancel_url":HOST+"/?cancel=true",
-                "line_items[0][price]":pid,
-                "line_items[0][quantity]":str(n)})
-            if session and "url" in session:url=session["url"]
-    with _trial_lock:_trial_checkout_cache[key]=(t,url)
-    return url
-
-def trial_state(created,is_paid):
-    """Returns (in_trial, days_left). Paid accounts are never gated."""
-    if is_paid:return True,None
-    age=time.time()-(created or 0)
-    left=TRIAL_DAYS-int(age//86400)
-    return age<=TRIAL_DAYS*86400,max(0,left)
-
-def create_key(email,phone="",name="",org="",org_type="",product="aileash",devices=1):
-    email=str(email).strip().lower()
-    if not email or "@" not in email:return None,"invalid_email"
-    prefix={"sonicboom":"sb_live_","sentinel":"se_live_","tokensaver":"ts_live_"}.get(product,"al_live_")
-    key=prefix+secrets.token_hex(24)
+def list_snapshots():
     with _db_lock:
-        r=_conn.execute("SELECT 1 FROM api_keys WHERE email=? AND product=?",(email,product)).fetchone()
-        if r:return None,"email_exists"
-        try:
-            _conn.execute("INSERT INTO api_keys(key,email,phone,name,org,org_type,product,devices,stripe_customer,stripe_sub,actions_used,created,active,is_paid,free_quota,plan_type) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (key,email,phone,name,org,org_type,product,devices,"","",0,time.time(),1,0,FREE_QUOTA,"trial"))
-            _conn.commit()
-        except sqlite3.IntegrityError:return None,"email_exists"
-    return key,None
+        rows = _conn.execute(
+            "SELECT ts,block_count,tip_hash,snapshot_file FROM "
+            "chain_snapshots ORDER BY id DESC LIMIT 10").fetchall()
+    return [{"ts": r[0], "blocks": r[1], "tip": r[2], "file": r[3]}
+            for r in rows]
 
-def get_key(key):
-    with _db_lock:
-        return _conn.execute("SELECT email,actions_used,active,is_paid,free_quota,plan_type,product,created FROM api_keys WHERE key=?",(key,)).fetchone()
 
-def inc_usage(key):
-    with _db_lock:_conn.execute("UPDATE api_keys SET actions_used=actions_used+1 WHERE key=?",(key,));_conn.commit()
+# ==============================================================================
+# RATE LIMITING
+# ==============================================================================
 
-def gen_ref_code(name):
-    words=name.upper().split()
-    first=words[0] if words else "USER"
-    prefix=("".join(c for c in first if c.isalpha())[:4]).ljust(4,"X")
-    suffix="".join(random.choices(string.digits,k=4))
-    return "REF-"+prefix+"-"+suffix
+def check_rate(key):
+    t = time.time()
+    with _key_lock:
+        w = _key_wins[key]
+        while w["min"] and w["min"][0] < t - 60:
+            w["min"].popleft()
+        while w["hour"] and w["hour"][0] < t - 3600:
+            w["hour"].popleft()
+        if len(w["min"]) >= 60:
+            return False, "rate_limit_minute"
+        if len(w["hour"]) >= 1000:
+            return False, "rate_limit_hour"
+        w["min"].append(t)
+        w["hour"].append(t)
+        return True, None
 
-def create_referral(key,email,name):
-    code=gen_ref_code(name)
-    with _db_lock:
-        try:
-            _conn.execute("INSERT OR IGNORE INTO referrals(code,referrer_key,referrer_email,referrer_name,created) VALUES(?,?,?,?,?)",(code,key,email,name,time.time()))
-            _conn.commit()
-        except:pass
-    return code
 
-def get_referral(code):
-    with _db_lock:
-        try:return _conn.execute("SELECT referrer_key,referrer_email,referrer_name,devices_referred,earnings_pence FROM referrals WHERE code=?",(code,)).fetchone()
-        except:return None
+# ==============================================================================
+# CORE ENGINE
+# ==============================================================================
 
-def credit_referral(code,devices=1):
-    with _db_lock:
-        try:
-            _conn.execute("UPDATE referrals SET devices_referred=devices_referred+?,earnings_pence=earnings_pence+? WHERE code=?",(devices,devices*10,code))
-            _conn.commit()
-        except:pass
+def now():
+    return time.time()
 
-W60=defaultdict(deque);W5M=defaultdict(deque);W1H=defaultdict(deque)
-def now():return time.time()
 
-GUARDIAN_PATTERNS=[
-    (re.compile(r"\b(don'?t|do not)\s+tell\s+(your\s+)?(mum|mom|dad|parents|anyone)\b",re.I),"secrecy"),
-    (re.compile(r"\b(keep\s+(this|it)\s+(a\s+)?secret|between\s+us|our\s+little\s+secret)\b",re.I),"secrecy"),
-    (re.compile(r"\b(send|share|post)\s+(me\s+)?(a\s+)?(pic|pics|picture|photo|photos|image|nude|nudes)\b",re.I),"image_request"),
-    (re.compile(r"\b(meet\s+(up|me)|come\s+over|where\s+do\s+you\s+live|what'?s\s+your\s+address)\b",re.I),"meeting"),
-    (re.compile(r"\b(you'?re\s+so\s+mature|mature\s+for\s+your\s+age|our\s+age\s+gap\s+doesn'?t\s+matter)\b",re.I),"grooming_flattery"),
-    (re.compile(r"\b(sex|sexy|horny|naked|touch\s+yourself)\b",re.I),"sexual"),
-    (re.compile(r"\b(delete\s+(this|our)\s+(chat|messages|conversation)|clear\s+your\s+history)\b",re.I),"evidence_hiding"),
-]
-def guardian_check(text):
-    """Returns FLAGGED (with categories) or UNRECOGNISED. Never 'safe'."""
-    cats=sorted({c for pat,c in GUARDIAN_PATTERNS if pat.search(text or "")})
-    if cats:
-        return {"result":"FLAGGED","categories":cats,
-                "advice":"This message matches patterns used to groom or manipulate. Do not reply. Show a trusted adult now. CEOP, Childline and 999 are one tap away."}
-    return {"result":"UNRECOGNISED",
-            "advice":"Guardian cannot judge this message. That does not mean it is safe. If anything feels wrong, trust that feeling and show an adult you trust."}
-def gen_pair_code(name):
-    base=re.sub(r"[^a-z0-9]","",(name or "child").lower())[:6] or "child"
-    return base.upper()+"-"+secrets.token_hex(2).upper()
-def guardian_seal(pair_code,kind,lat,lon,note,content_fp):
-    """Seal a guardian event into the MAIN audit chain, then store the row."""
-    ts=now()
-    ev={"user_id":"guardian:"+pair_code,"action":"guardian_"+kind}
-    res={"decision":"GUARDIAN","kind":kind,"version":VERSION,"timestamp":ts}
-    h,idx,seq=seal(ev,res,ts,None)
-    with _db_lock:
-        _conn.execute("INSERT INTO guardian_events(pair_code,ts,kind,lat,lon,note,content_fp,audit_hash) VALUES(?,?,?,?,?,?,?,?)",
-            (pair_code,ts,kind,lat,lon,note,content_fp,h))
-        if kind=="checkin":
-            _conn.execute("UPDATE guardian_family SET last_checkin=? WHERE pair_code=?",(ts,pair_code))
-        _conn.commit()
-    return h
-def clamp(x,a=0.0,b=1.0):return max(a,min(b,x))
-def sha(p):return hashlib.sha256(json.dumps(p,sort_keys=True).encode()).hexdigest()
+def clamp(x, a=0.0, b=1.0):
+    return max(a, min(b, x))
+
+
+def sha(p):
+    return hashlib.sha256(json.dumps(p, sort_keys=True).encode()).hexdigest()
+
 
 def upd_vel(uid):
-    t=now()
-    for q in [W60[uid],W5M[uid],W1H[uid]]:q.append(t)
-    c=now()
-    W60[uid]=deque(x for x in W60[uid] if x>=c-60)
-    W5M[uid]=deque(x for x in W5M[uid] if x>=c-300)
-    W1H[uid]=deque(x for x in W1H[uid] if x>=c-3600)
+    t = now()
+    for q in (W60[uid], W5M[uid], W1H[uid]):
+        q.append(t)
+    c = now()
+    W60[uid] = deque(x for x in W60[uid] if x >= c - 60)
+    W5M[uid] = deque(x for x in W5M[uid] if x >= c - 300)
+    W1H[uid] = deque(x for x in W1H[uid] if x >= c - 3600)
 
-def vel(uid):return{"60s":len(W60[uid]),"5m":len(W5M[uid]),"1h":len(W1H[uid])}
+
+def vel(uid):
+    return {"60s": len(W60[uid]), "5m": len(W5M[uid]), "1h": len(W1H[uid])}
+
 
 def load_user(uid):
-    with _db_lock:r=_conn.execute("SELECT trust,last_country FROM users WHERE user_id=?",(uid,)).fetchone()
-    return{"trust":r[0],"last_country":r[1]} if r else{"trust":0.5,"last_country":None}
-
-def save_user(uid,trust,country):
     with _db_lock:
-        _conn.execute("INSERT INTO users(user_id,trust,last_country) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET trust=excluded.trust,last_country=excluded.last_country",(uid,trust,country))
+        r = _conn.execute("SELECT trust,last_country FROM users WHERE "
+                          "user_id=?", (uid,)).fetchone()
+    return ({"trust": r[0], "last_country": r[1]} if r
+            else {"trust": 0.5, "last_country": None})
+
+
+def save_user(uid, trust, country):
+    with _db_lock:
+        _conn.execute(
+            "INSERT INTO users(user_id,trust,last_country) VALUES(?,?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET trust=excluded.trust,"
+            "last_country=excluded.last_country", (uid, trust, country))
         _conn.commit()
 
-def pack_key(api_key,name,version):
-    return hashlib.sha256((str(api_key)+"|"+str(name)+"|v"+str(version)).encode()).hexdigest()[:24]
-
-def create_signal_pack(api_key,name,signals):
-    """Create a named, versioned signal pack for a customer and SEAL its
-    definition into the chain. signals = {"bias":{"weight":0.15}, ...}.
-    Returns (pack, error). The seal is the provenance: a tamper-evident
-    record of exactly which signals+weights this pack defined and when."""
-    name=str(name).strip()[:60]
-    if not name:return None,"name_required"
-    if not isinstance(signals,dict) or not signals:return None,"signals_required"
-    # clean + clamp the signal definitions
-    clean={}
-    for sname,cfg in list(signals.items())[:30]:
-        w=0.10
-        if isinstance(cfg,dict):
-            try:w=clamp(float(cfg.get("weight",0.10)),0.0,0.30)
-            except (ValueError,TypeError):w=0.10
-        else:
-            try:w=clamp(float(cfg),0.0,0.30)
-            except (ValueError,TypeError):w=0.10
-        clean[str(sname)[:40]]={"weight":round(w,4)}
-    if not clean:return None,"no_valid_signals"
-    with _db_lock:
-        r=_conn.execute("SELECT MAX(version) FROM signal_packs WHERE api_key=? AND name=?",(api_key,name)).fetchone()
-        version=(r[0] or 0)+1
-    pid=pack_key(api_key,name,version)
-    ts=time.time()
-    # seal the pack definition into the chain
-    ev={"user_id":"signal_pack:"+str(api_key)[:16],"action":"signal_pack_defined","amount":0,"country":"UK","device_id":"pack_"+pid,"anomaly":0,"device_risk":0,"pack_name":name,"pack_version":version,"signals":clean}
-    res={"decision":"PACK_SEALED","score":0,"version":VERSION,"timestamp":ts,"pack":name,"pack_version":version,"note":"signal pack definition sealed - provenance of which signals and weights this pack declared"}
-    seal_hash,idx,_=seal(ev,res,ts)
-    with _db_lock:
-        _conn.execute("INSERT INTO signal_packs(pack_id,api_key,name,version,signals_json,created,seal,block_index) VALUES(?,?,?,?,?,?,?,?)",
-            (pid,api_key,name,version,json.dumps(clean),ts,seal_hash,idx))
-        _conn.commit()
-    return {"pack_id":pid,"name":name,"version":version,"signals":clean,"seal":seal_hash,"block_index":idx,"created":ts},None
-
-def get_signal_pack(api_key,name,version=None):
-    with _db_lock:
-        if version:
-            r=_conn.execute("SELECT pack_id,name,version,signals_json,seal,block_index,created FROM signal_packs WHERE api_key=? AND name=? AND version=?",(api_key,name,version)).fetchone()
-        else:
-            r=_conn.execute("SELECT pack_id,name,version,signals_json,seal,block_index,created FROM signal_packs WHERE api_key=? AND name=? ORDER BY version DESC LIMIT 1",(api_key,name)).fetchone()
-    if not r:return None
-    try:sig=json.loads(r[3])
-    except:sig={}
-    return {"pack_id":r[0],"name":r[1],"version":r[2],"signals":sig,"seal":r[4],"block_index":r[5],"created":r[6]}
-
-def list_signal_packs(api_key):
-    with _db_lock:
-        rows=_conn.execute("SELECT name,MAX(version),MAX(created) FROM signal_packs WHERE api_key=? GROUP BY name ORDER BY MAX(created) DESC",(api_key,)).fetchall()
-    return [{"name":r[0],"latest_version":r[1],"updated":r[2]} for r in rows]
-
-def publish_signal_pack(api_key,name,author):
-    """Client opts to publish their latest version of a pack to the public
-    library. Publishing is sealed too - a record of who shared what, when."""
-    pk=get_signal_pack(api_key,name)
-    if not pk:return None,"pack_not_found"
-    author=str(author or "anonymous")[:60]
-    ts=time.time()
-    ev={"user_id":"signal_pack:"+str(api_key)[:16],"action":"signal_pack_published","amount":0,"country":"UK","device_id":"pack_"+pk["pack_id"],"anomaly":0,"device_risk":0,"pack_name":name,"pack_version":pk["version"]}
-    res={"decision":"PACK_PUBLISHED","score":0,"version":VERSION,"timestamp":ts,"pack":name,"note":"pack published to public library - community template, unverified"}
-    seal_hash,idx,_=seal(ev,res,ts)
-    with _db_lock:
-        _conn.execute("UPDATE signal_packs SET public=1,author=? WHERE pack_id=?",(author,pk["pack_id"]))
-        _conn.commit()
-    return {"name":name,"version":pk["version"],"author":author,"published_seal":seal_hash},None
-
-def unpublish_signal_pack(api_key,name):
-    with _db_lock:
-        _conn.execute("UPDATE signal_packs SET public=0 WHERE api_key=? AND name=?",(api_key,name))
-        _conn.commit()
-    return True
-
-def public_library():
-    """Browse all published packs. Community-contributed, unverified."""
-    with _db_lock:
-        rows=_conn.execute("SELECT name,MAX(version),author,signals_json,seal,MAX(created) FROM signal_packs WHERE public=1 GROUP BY name,author ORDER BY MAX(created) DESC LIMIT 200").fetchall()
-    out=[]
-    for r in rows:
-        try:sig=json.loads(r[3])
-        except:sig={}
-        out.append({"name":r[0],"version":r[1],"author":r[2] or "anonymous","signals":sig,"seal":r[4]})
-    return out
-
-def score_custom_signals(event):
-    """Article 9 extension: score customer-defined, domain-specific risk signals
-    on top of the 9 fraud signals. Fully optional and additive - if the caller
-    sends no risk_signals, this returns (0.0, []) and behaviour is unchanged.
-    Each signal value is clamped 0..1, each weight clamped 0..0.30. Every signal
-    that materially fires is named in the reasons, and the raw pack is sealed
-    into the chain by govern() so the evaluation is provable per decision."""
-    rs=event.get("risk_signals")
-    if not isinstance(rs,dict) or not rs:return 0.0,[],None
-    weights=event.get("signal_weights") if isinstance(event.get("signal_weights"),dict) else {}
-    total=0.0;reasons=[];applied={}
-    for name,val in list(rs.items())[:20]:
-        try:v=clamp(float(val))
-        except (ValueError,TypeError):continue
-        try:w=clamp(float(weights.get(name,0.10)),0.0,0.30)
-        except (ValueError,TypeError):w=0.10
-        contrib=v*w
-        total+=contrib
-        applied[str(name)[:40]]={"value":round(v,4),"weight":round(w,4)}
-        if v>=0.5:reasons.append(str(name)[:40]+":"+str(round(v,2)))
-    return round(total,4),reasons,(applied or None)
 
 def score_event(s):
-    reasons=[]
-    sc=(1-s["trust"])*0.30
-    v60=s["v60"];sc+=min(v60/20,1)*0.15
-    if v60>10:reasons.append("velocity_spike")
-    sc+=min(s["v5m"]/50,1)*0.10+min(s["v1h"]/200,1)*0.10
-    amt=float(s.get("amount",0));sc+=min(math.log1p(amt)/math.log1p(10000),1)*0.15
-    if amt>500:reasons.append("high_amount")
-    dr=float(s.get("device_risk",0));sc+=dr*0.10
-    if dr>0.5:reasons.append("risky_device")
-    an=float(s.get("anomaly",0));sc+=an*0.10
-    if an>0.5:reasons.append("behaviour_anomaly")
-    if s.get("country_shift"):sc+=0.10;reasons.append("country_shift")
-    if s.get("unsafe_country"):sc+=0.10;reasons.append("unsafe_country")
-    if s["trust"]<0.4:reasons.append("low_trust")
-    return round(clamp(sc),4),reasons
+    reasons = []
+    sc = (1 - s["trust"]) * 0.30
+    v60 = s["v60"]
+    sc += min(v60 / 20, 1) * 0.15
+    if v60 > 10:
+        reasons.append("velocity_spike")
+    sc += min(s["v5m"] / 50, 1) * 0.10 + min(s["v1h"] / 200, 1) * 0.10
+    amt = float(s.get("amount", 0))
+    sc += min(math.log1p(amt) / math.log1p(10000), 1) * 0.15
+    if amt > 500:
+        reasons.append("high_amount")
+    dr = float(s.get("device_risk", 0))
+    sc += dr * 0.10
+    if dr > 0.5:
+        reasons.append("risky_device")
+    an = float(s.get("anomaly", 0))
+    sc += an * 0.10
+    if an > 0.5:
+        reasons.append("behaviour_anomaly")
+    if s.get("country_shift"):
+        sc += 0.10
+        reasons.append("country_shift")
+    if s.get("unsafe_country"):
+        sc += 0.10
+        reasons.append("unsafe_country")
+    if s["trust"] < 0.4:
+        reasons.append("low_trust")
+    return round(clamp(sc), 4), reasons
+
 
 def decide(sc):
-    if sc<0.35:return"ALLOW"
-    if sc<0.70:return"CHALLENGE"
-    return"BLOCK"
+    if sc < 0.35:
+        return "ALLOW"
+    if sc < 0.70:
+        return "CHALLENGE"
+    return "BLOCK"
 
-def upd_trust(t,d):
-    if d=="ALLOW":t+=(1-t)*0.01
-    elif d=="CHALLENGE":t-=t*0.02
-    elif d=="BLOCK":t-=t*0.08
-    return clamp(t,0.05,1.0)
+
+def upd_trust(t, d):
+    if d == "ALLOW":
+        t += (1 - t) * 0.01
+    elif d == "CHALLENGE":
+        t -= t * 0.02
+    elif d == "BLOCK":
+        t -= t * 0.08
+    return clamp(t, 0.05, 1.0)
+
 
 def chain_tip():
-    with _db_lock:r=_conn.execute("SELECT audit_hash FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()
-    return r[0] if r else"GENESIS"
-
-def seal(event,result,ts,api_key=None):
-    """Tip read + hash + insert inside ONE lock hold (race fix).
-    Completeness receipts: every sealed decision gets the chain position
-    (block_index) and a per-key monotonic sequence number (key_seq) issued
-    inside the same lock. Sequence numbers have no gaps by construction -
-    a caller holding receipts N and N+2 can PROVE N+1 is missing.
-    Both live alongside the block, never inside the hash payload, so all
-    existing chain blocks remain valid."""
     with _db_lock:
-        r=_conn.execute("SELECT audit_hash FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()
-        prev=r[0] if r else "GENESIS"
-        h=sha({"prev_hash":prev,"ts":ts,"event":event,"result":result})
-        seq=None
-        if api_key:
-            _conn.execute("UPDATE api_keys SET seq=COALESCE(seq,0)+1 WHERE key=?",(api_key,))
-            sr=_conn.execute("SELECT seq FROM api_keys WHERE key=?",(api_key,)).fetchone()
-            seq=sr[0] if sr else None
-        cur=_conn.execute("INSERT INTO audit_log(ts,user_id,event_json,result_json,prev_hash,audit_hash,api_key,key_seq) VALUES(?,?,?,?,?,?,?,?)",(ts,event["user_id"],json.dumps(event),json.dumps(result),prev,h,api_key or "",seq))
-        idx=cur.lastrowid
+        r = _conn.execute("SELECT audit_hash FROM audit_log ORDER BY id "
+                          "DESC LIMIT 1").fetchone()
+    return r[0] if r else "GENESIS"
+
+
+def chain_head():
+    """Tip plus height, in one lock hold, for /tip."""
+    with _db_lock:
+        r = _conn.execute("SELECT audit_hash,ts,id FROM audit_log "
+                          "ORDER BY id DESC LIMIT 1").fetchone()
+    if not r:
+        return "GENESIS", None, 0
+    return r[0], r[1], r[2]
+
+
+def seal(event, result, ts):
+    """
+    Tip read, hash and insert inside ONE lock hold.
+
+    v1.1 read the tip under the lock, released it, then re-acquired to
+    insert. Between those two points another thread could read the same
+    prev_hash, and both writes would claim the same predecessor. The
+    same bug was found and fixed in server.py; this is that fix.
+    """
+    with _db_lock:
+        r = _conn.execute("SELECT audit_hash FROM audit_log ORDER BY id "
+                          "DESC LIMIT 1").fetchone()
+        prev = r[0] if r else "GENESIS"
+        h = sha({"prev_hash": prev, "ts": ts, "event": event,
+                 "result": result})
+        _conn.execute(
+            "INSERT INTO audit_log(ts,user_id,event_json,result_json,"
+            "prev_hash,audit_hash) VALUES(?,?,?,?,?,?)",
+            (ts, event["user_id"], json.dumps(event), json.dumps(result),
+             prev, h))
         _conn.commit()
-    return h,idx,seq
+    return h
+
 
 def verify_chain():
-    with _db_lock:rows=_conn.execute("SELECT event_json,result_json,prev_hash,audit_hash,ts FROM audit_log ORDER BY id ASC").fetchall()
-    if not rows:return{"valid":True,"blocks":0,"message":"Empty chain"}
-    prev="GENESIS"
-    for i,row in enumerate(rows):
-        p={"prev_hash":row[2],"ts":row[4],"event":json.loads(row[0]),"result":json.loads(row[1])}
-        if sha(p)!=row[3] or row[2]!=prev:return{"valid":False,"broken_at":i,"message":"Tampered at block "+str(i)}
-        prev=row[3]
-    return{"valid":True,"blocks":len(rows),"tip":rows[-1][3],"message":"Chain intact"}
-
-def last_decision():
-    """Read-only: fetch the most recent decision for badge display.
-    Fix: badges no longer write to the audit chain."""
     with _db_lock:
-        r=_conn.execute("SELECT result_json FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()
-    if not r:return None
-    try:
-        res=json.loads(r[0])
-        return res.get("decision"),res.get("score")
-    except:return None
+        rows = _conn.execute(
+            "SELECT event_json,result_json,prev_hash,audit_hash,ts FROM "
+            "audit_log ORDER BY id ASC").fetchall()
+    if not rows:
+        return {"valid": True, "blocks": 0, "message": "Empty chain"}
+    prev = "GENESIS"
+    for i, row in enumerate(rows):
+        p = {"prev_hash": row[2], "ts": row[4],
+             "event": json.loads(row[0]), "result": json.loads(row[1])}
+        if sha(p) != row[3] or row[2] != prev:
+            return {"valid": False, "broken_at": i,
+                    "message": "Tampered at block %d" % i}
+        prev = row[3]
+    return {"valid": True, "blocks": len(rows), "tip": rows[-1][3],
+            "message": "Chain intact"}
 
-_alert_last={}
-_alert_lock=threading.Lock()
-ALERT_COOLDOWN=3600
 
-CHALLENGE_TTL=900
-def _challenge_secret():
-    s=os.environ.get("LICENCE_SECRET","")
-    return s.encode() if s else _EPHEMERAL_SECRET
-_EPHEMERAL_SECRET=secrets.token_bytes(32)
-
-def make_challenge_token(user_id,audit_hash):
-    payload=json.dumps({"u":user_id,"h":audit_hash[:16],"t":int(time.time())},sort_keys=True,separators=(',',':'))
-    sig=hmac.new(_challenge_secret(),payload.encode(),hashlib.sha256).hexdigest()
-    return base64.urlsafe_b64encode(json.dumps({"p":payload,"s":sig},separators=(',',':')).encode()).decode()
-
-def read_challenge_token(token):
-    try:
-        d=json.loads(base64.urlsafe_b64decode(token.encode()))
-        payload=d["p"];sig=d["s"]
-        expected=hmac.new(_challenge_secret(),payload.encode(),hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(expected,sig):return None,"bad_signature"
-        p=json.loads(payload)
-        if time.time()-p["t"]>CHALLENGE_TTL:return None,"expired"
-        return p,None
-    except Exception:
-        return None,"malformed"
-
-def challenge_marker(payload_dict):
-    key=str(payload_dict["u"])+"|"+str(payload_dict["h"])+"|"+str(payload_dict["t"])
-    return "challenge_"+hashlib.sha256(key.encode()).hexdigest()[:24]
-
-def challenge_resolved(payload_dict):
-    uid=challenge_marker(payload_dict)
-    with _db_lock:
-        r=_conn.execute("SELECT audit_hash,ts FROM audit_log WHERE user_id=? ORDER BY id DESC LIMIT 1",(uid,)).fetchone()
-    return r
-
-CHALLENGE_PAGE=("<!DOCTYPE html><html><head><meta charset='UTF-8'>"
- "<meta name='viewport' content='width=device-width,initial-scale=1.0'><title>Verify - AILeash</title>"
- "<style>body{font-family:sans-serif;background:#0a0f1e;color:#fff;display:flex;align-items:center;"
- "justify-content:center;min-height:100vh;margin:0;padding:20px;text-align:center}"
- ".box{max-width:420px;background:rgba(255,255,255,0.04);border:1px solid rgba(201,168,76,0.35);"
- "border-radius:10px;padding:36px}h1{font-family:Georgia,serif;color:#c9a84c;font-size:24px;margin-bottom:10px}"
- "p{color:rgba(255,255,255,0.5);font-size:14px;line-height:1.7;margin-bottom:22px}"
- "button{background:#c9a84c;color:#0a0f1e;border:none;border-radius:5px;padding:14px 30px;"
- "font-size:15px;font-weight:700;cursor:pointer}#out{margin-top:18px;font-family:monospace;font-size:12px}"
- ".ok{color:#7fe3b0}.err{color:#ff8a80}</style></head><body><div class='box'>"
- "<h1>Quick security check</h1><p>This action was flagged for verification. "
- "Confirm it was you and you'll be on your way \u2014 the confirmation is sealed into a tamper-evident record.</p>"
- "<button onclick='go()'>Yes, it was me</button><div id='out'></div>"
- "<script>async function go(){var t=new URLSearchParams(location.search).get('token');"
- "var o=document.getElementById('out');o.textContent='Sealing\u2026';"
- "try{var r=await fetch('/api/challenge/resolve',{method:'POST',headers:{'Content-Type':'application/json'},"
- "body:JSON.stringify({token:t})});var d=await r.json();"
- "if(d.resolved){o.className='ok';o.textContent='Verified and sealed: '+d.sealed.slice(0,20)+'\u2026 You can close this page.';}"
- "else{o.className='err';o.textContent=d.error||'Could not verify.';}}"
- "catch(e){o.className='err';o.textContent='Network error - try again.';}}</script>"
- "</div></body></html>")
-
-def send_block_alert(api_key,event,result):
-    """The moment the engine BLOCKS something on a customer's traffic,
-    tell them - with the sealed evidence attached. Max one email per hour
-    per key so a burst attack doesn't also flood their inbox."""
-    try:
-        now_t=time.time()
-        with _alert_lock:
-            if now_t-_alert_last.get(api_key,0)<ALERT_COOLDOWN:return
-            _alert_last[api_key]=now_t
-        ki=get_key(api_key)
-        if not ki:return
-        email=ki[0]
-        reasons=", ".join(result.get("reasons",[])) or "risk threshold exceeded"
-        html=("<html><body style='font-family:Arial,sans-serif;padding:20px;color:#333'>"
-            "<h2 style='color:#cc0000'>AILeash blocked an event on your platform</h2>"
-            "<p>Caught in real time. Nothing to do unless it looks wrong to you.</p>"
-            "<table style='font-family:monospace;font-size:13px'>"
-            "<tr><td style='padding:3px 12px 3px 0'><b>User</b></td><td>"+esc(str(event.get("user_id","")))+"</td></tr>"
-            "<tr><td style='padding:3px 12px 3px 0'><b>Action</b></td><td>"+esc(str(event.get("action","")))+"</td></tr>"
-            "<tr><td style='padding:3px 12px 3px 0'><b>Score</b></td><td>"+str(result.get("score"))+"</td></tr>"
-            "<tr><td style='padding:3px 12px 3px 0'><b>Reasons</b></td><td>"+esc(reasons)+"</td></tr>"
-            "<tr><td style='padding:3px 12px 3px 0'><b>Sealed</b></td><td>"+str(result.get("audit_hash",""))[:32]+"&hellip;</td></tr>"
-            "</table>"
-            "<p style='color:#888;font-size:12px'>This block is already sealed in your tamper-evident audit chain. "
-            "Live view: <a href='"+HOST+"/api/pulse'>"+HOST+"/api/pulse</a> with your API key. "
-            "Further block alerts are paused for 60 minutes.</p>"
-            "</body></html>")
-        send_email(email,"","AILeash: event BLOCKED - "+esc(str(event.get("action","")))[:40],html)
-    except Exception as e:print("ALERT ERR:"+str(e),flush=True)
-
-def record_device(api_key,device_id):
-    """Log each unique device_id that uses this key. Returns live unique device count.
-    This is the real meter: you are billed for every distinct device you send the key to."""
-    if not api_key or not device_id:return None
-    with _db_lock:
-        try:
-            _conn.execute("INSERT OR IGNORE INTO device_seen(api_key,device_id,first_seen) VALUES(?,?,?)",(api_key,device_id,time.time()))
-            _conn.commit()
-            n=_conn.execute("SELECT COUNT(*) FROM device_seen WHERE api_key=?",(api_key,)).fetchone()[0]
-        except Exception as e:
-            print("record_device err:"+str(e),flush=True);return None
-    return n
-
-def device_count(api_key):
-    with _db_lock:
-        try:return _conn.execute("SELECT COUNT(*) FROM device_seen WHERE api_key=?",(api_key,)).fetchone()[0]
-        except:return 0
-
-# ============================================================
-# JURISDICTION ENGINE - honest version: a sealed rules mapping.
-# Tags every decision with the regulatory frameworks that apply
-# to the event's country. It does not "decide" legal authority -
-# no software can - it records which obligations applied at the
-# moment of decision, sealed into the same chain.
-# ============================================================
-JURIS_VERSION="2026.07"
-_EU={"AT","BE","BG","HR","CY","CZ","DK","EE","FI","FR","DE","GR","HU","IE","IT","LV","LT","LU","MT","NL","PL","PT","RO","SK","SI","ES","SE"}
-def juris_for(country):
-    c=str(country or "").strip().upper()
-    fw=[]
-    if c in _EU:fw+=["EU_AI_Act_2024_1689","GDPR","EU_DSA_2022_2065"]
-    if c=="UK":fw+=["UK_Online_Safety_Act_2023","UK_GDPR","ICO_Childrens_Code"]
-    if c=="US":fw+=["US_state_AI_laws_vary","FTC_Act_S5"]
-    if not fw:fw=["local_law_unmapped"]
-    return{"country":c,"frameworks":fw,"map_version":JURIS_VERSION,
-        "note":"applicable-framework tagging at decision time; not legal advice"}
-
-# ============================================================
-# DELEGATED AUTHORITY - signed role tokens (Art. 14 support).
-# Issue a token binding user_id + role + spend limit + expiry,
-# HMAC-signed server-side. Send it with a govern event as
-# "authority_token"; the engine verifies it deterministically
-# and escalates the decision if authority is missing/exceeded.
-# ============================================================
-def make_authority_token(user_id,role,max_amount,ttl_seconds):
-    exp=int(time.time())+int(ttl_seconds)
-    payload=str(user_id)+"|"+str(role)+"|"+str(float(max_amount))+"|"+str(exp)
-    sig=hmac.new(_challenge_secret(),("AUTH|"+payload).encode(),hashlib.sha256).hexdigest()
-    return base64.urlsafe_b64encode((payload+"|"+sig).encode()).decode()
-
-def read_authority_token(token):
-    try:
-        raw=base64.urlsafe_b64decode(token.encode()).decode()
-        parts=raw.split("|")
-        if len(parts)!=5:return None
-        user_id,role,max_amount,exp,sig=parts
-        expected=hmac.new(_challenge_secret(),("AUTH|"+user_id+"|"+role+"|"+max_amount+"|"+exp).encode(),hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(sig,expected):return None
-        return{"user_id":user_id,"role":role,"max_amount":float(max_amount),"exp":int(exp)}
-    except Exception:
-        return None
-
-def check_authority(event):
-    """Returns (status, detail) - deterministic. Absent token = 'none'."""
-    tok=event.get("authority_token","")
-    if not tok:return"none",None
-    a=read_authority_token(str(tok))
-    if not a:return"invalid",None
-    if a["user_id"]!=str(event.get("user_id","")):return"wrong_user",a
-    if time.time()>a["exp"]:return"expired",a
-    if float(event.get("amount",0))>a["max_amount"]:return"exceeds_limit",a
-    return"verified",a
-
-def govern(event,api_key=None):
-    missing=REQ-event.keys()
-    if missing:raise ValueError("Missing fields: "+str(missing))
-    if api_key:
-        ok,ec=check_rate(api_key)
-        if not ok:return{"error":ec},429
-        ki=get_key(api_key)
-        if not ki:return{"error":"invalid_api_key"},401
-        email,used,active,is_paid,quota,plan,product,created=ki
-        if not active:return{"error":"account_inactive"},403
-        in_trial,days_left=trial_state(created,is_paid)
-        if not in_trial:
-            return{"error":"trial_expired",
-                "message":"Your "+str(TRIAL_DAYS)+"-day free trial has ended. Your keys, chain and devices are untouched - pay to continue exactly where you left off, or remove the integration. The bill reflects only the real devices that used your key.",
-                "billable_devices":device_count(api_key),
-                "rate_per_device_gbp":0.50,
-                "checkout_url":trial_checkout(api_key,email,product)},402
-    ts=now();uid=event["user_id"]
-    state=load_user(uid);upd_vel(uid);v=vel(uid)
-    country=event["country"]
-    signals={
-        "trust":state["trust"],"v60":v["60s"],"v5m":v["5m"],"v1h":v["1h"],
-        "amount":float(event.get("amount",0)),"device_risk":float(event.get("device_risk",0)),
-        "anomaly":float(event.get("anomaly",0)),
-        "country_shift":state["last_country"] is not None and state["last_country"]!=country,
-        "unsafe_country":country not in SAFE
+def govern(event):
+    missing = REQ - event.keys()
+    if missing:
+        raise ValueError("Missing fields: %s" % missing)
+    if not _licence["valid"]:
+        return {"error": "licence_invalid",
+                "message": "A valid licence token is required. Get one at "
+                           "%s. Your chain and data are untouched." % HOME}, 403
+    ts = now()
+    uid = event["user_id"]
+    state = load_user(uid)
+    upd_vel(uid)
+    v = vel(uid)
+    country = event["country"]
+    signals = {
+        "trust": state["trust"], "v60": v["60s"], "v5m": v["5m"],
+        "v1h": v["1h"], "amount": float(event.get("amount", 0)),
+        "device_risk": float(event.get("device_risk", 0)),
+        "anomaly": float(event.get("anomaly", 0)),
+        "country_shift": (state["last_country"] is not None
+                          and state["last_country"] != country),
+        "unsafe_country": country not in SAFE,
     }
-    # Signal pack resolution: if the caller names a pack, load its sealed
-    # weight definitions and apply them to the raw signal values sent.
-    pack_meta=None
-    pname=event.get("pack")
-    if pname and api_key:
-        pk=get_signal_pack(api_key,str(pname))
-        if pk:
-            merged=dict(event.get("signal_weights") or {})
-            for sname,cfg in pk["signals"].items():
-                merged.setdefault(sname,cfg.get("weight",0.10))
-            event=dict(event);event["signal_weights"]=merged
-            pack_meta={"name":pk["name"],"version":pk["version"],"pack_seal":pk["seal"]}
-    sc,reasons=score_event(signals)
-    custom_sc,custom_reasons,custom_applied=score_custom_signals(event)
-    if custom_sc>0:
-        sc=round(clamp(sc+custom_sc),4)
-        reasons=reasons+custom_reasons
-    dec=decide(sc)
-    auth_status,auth_info=check_authority(event)
-    if auth_status in("invalid","wrong_user","expired","exceeds_limit"):
-        reasons.append("authority_"+auth_status)
-        if dec=="ALLOW":dec="CHALLENGE"
-    trust=upd_trust(state["trust"],dec)
-    save_user(uid,trust,country)
-    result={"decision":dec,"score":sc,"trust":round(trust,4),"reasons":reasons,"version":VERSION,"timestamp":ts,
-        "jurisdiction":juris_for(country)}
-    if custom_applied:
-        result["risk_signals"]=custom_applied
-        result["fraud_score"]=round(sc-custom_sc,4)
-        result["custom_risk_score"]=custom_sc
-    if pack_meta:
-        result["signal_pack"]=pack_meta
-    if auth_status!="none":
-        result["authority"]={"status":auth_status}
-        if auth_info:result["authority"]["role"]=auth_info["role"]
-    h,idx,seq=seal(event,result,ts,api_key)
-    result["audit_hash"]=h
-    result["block_index"]=idx
-    if seq is not None:result["receipt_seq"]=seq
-    if dec=="CHALLENGE":
-        ctok=make_challenge_token(uid,h)
-        result["challenge_url"]=HOST+"/verify-challenge?token="+ctok
-        result["challenge_status_url"]=HOST+"/api/challenge/status?token="+ctok
-        result["challenge_expires_in"]=CHALLENGE_TTL
-    if api_key:
-        inc_usage(api_key)
-        dcount=record_device(api_key,str(event.get("device_id","")))
-        if dcount is not None:
-            result["billable_devices"]=dcount
-            result["monthly_charge_gbp"]=round(dcount*0.50,2)
-        if not is_paid and days_left is not None:
-            result["trial_days_left"]=days_left
-        if dec=="BLOCK":
-            threading.Thread(target=send_block_alert,args=(api_key,event,result),daemon=True).start()
-    return result,200
+    sc, reasons = score_event(signals)
+    dec = decide(sc)
+    trust = upd_trust(state["trust"], dec)
+    save_user(uid, trust, country)
+    result = {"decision": dec, "score": sc, "trust": round(trust, 4),
+              "reasons": reasons, "version": VERSION, "engine": "sebdog",
+              "local": True, "timestamp": ts}
+    result["audit_hash"] = seal(event, result, ts)
+    return result, 200
 
-REG_MAP_VERSION="2026.07"
-REG_MAP={
-  "version":REG_MAP_VERSION,
-  "note":"Design mapping of engine capabilities to regulatory obligations. Design intent, not certification.",
-  "eu_ai_act_2024_1689":{
-    "art_9_risk_management":"continuous per-event scoring, 9 signals, deterministic",
-    "art_12_record_keeping":"per-decision SHA-256 chain, gapless receipts, public verification",
-    "art_13_transparency":"plain-language reasons on every decision",
-    "art_14_human_oversight":"CHALLENGE verdict + hosted human verification pathway",
-    "timeline":"general application Aug 2026; high-risk (Annex III) proposed deferral to Dec 2027, pending formal adoption"},
-  "uk_online_safety_act_2023":{"status":"in force","support":"real-time moderation evidence trail, sealed"},
-  "ico_childrens_code":{"status":"in force","support":"deterministic scoring; no profiling of children; full audit trail"},
-  "eu_dsa_2022_2065":{"support":"algorithmic decision evidence for systemic risk assessment"}}
 
-def seal_regmap_if_changed():
-    """Every change to the regulation map is itself sealed into the chain -
-    regulatory updates become auditable events, not silent edits."""
-    try:
-        with _db_lock:
-            r=_conn.execute("SELECT v FROM config WHERE k='regmap_version'").fetchone()
-        if r and r[0]==REG_MAP_VERSION:return
-        ev={"user_id":"system_regmap","action":"regulation_map_updated","amount":0,"country":"UK","device_id":"server","anomaly":0,"device_risk":0}
-        res={"decision":"ALLOW","score":0,"map_version":REG_MAP_VERSION,"map_hash":sha(REG_MAP),"version":VERSION,"note":"regulation map change sealed"}
-        seal(ev,res,time.time())
-        with _db_lock:
-            _conn.execute("INSERT OR REPLACE INTO config(k,v) VALUES('regmap_version',?)",(REG_MAP_VERSION,))
-            _conn.commit()
-        print("REGMAP sealed:"+REG_MAP_VERSION,flush=True)
-    except Exception as e:print("REGMAP ERR:"+str(e),flush=True)
+# ==============================================================================
+# WITNESSING
+#
+# A local hash chain proves nothing against the person who owns the file.
+# These two routes are what let somebody else hold your history.
+# ==============================================================================
 
-ENGINE_SPEC={
-  "engine":"AILeash deterministic scoring","version":VERSION,
-  "signals":{
-    "trust":{"weight":0.30,"formula":"(1 - trust)"},
-    "velocity_60s":{"weight":0.15,"formula":"min(count/20, 1)"},
-    "velocity_5m":{"weight":0.10,"formula":"min(count/50, 1)"},
-    "velocity_1h":{"weight":0.10,"formula":"min(count/200, 1)"},
-    "amount":{"weight":0.15,"formula":"min(ln(1+amount)/ln(1+10000), 1)"},
-    "device_risk":{"weight":0.10,"formula":"raw 0..1"},
-    "anomaly":{"weight":0.10,"formula":"raw 0..1"},
-    "country_shift":{"weight":0.10,"formula":"1 if prior country differs"},
-    "unsafe_country":{"weight":0.10,"formula":"1 if outside allow-list"}},
-  "score":"clamp(sum, 0, 1); weights sum to 1.20 pre-clamp (deliberate saturation headroom)",
-  "thresholds":{"ALLOW":"score < 0.35","CHALLENGE":"0.35 <= score < 0.70","BLOCK":"score >= 0.70"},
-  "trust_dynamics":{"ALLOW":"t += (1-t)*0.01","CHALLENGE":"t -= t*0.02","BLOCK":"t -= t*0.08","clamp":"[0.05, 1.0]"},
-  "chain":{"hash":"SHA-256(canonical_json{prev_hash, ts, event, result})","genesis":"GENESIS",
-    "concurrency":"tip read + hash + insert in one lock hold","receipts":"gapless per-key sequence, same transaction"},
-  "principle":"deterministic and fully specified: identical inputs give identical outputs, forever; any competent engineer can maintain or reimplement this engine from this spec"}
+def observe(data):
+    """Seal a peer's chain head into this chain. Never rejects a
+    well-formed submission - the record says what arrived, not whether
+    we approve of it."""
+    peer = str(data.get("chain") or data.get("peer") or "").strip().lower()
+    if not peer or len(peer) > 80:
+        return {"error": "chain_required",
+                "message": "A short stable identifier - a domain works."}, 400
+    tip = str(data.get("tip", "")).strip().lower()
+    if len(tip) != 64 or not all(c in HEX64 for c in tip):
+        return {"error": "invalid_tip",
+                "message": "A tip is 64 hex characters."}, 400
+    url = str(data.get("url") or "").strip()[:400]
 
-def send_json(h,data,status=200):
-    body=json.dumps(data,indent=2).encode()
+    with _db_lock:
+        seen = _conn.execute("SELECT observed,audit_hash FROM witness_seen "
+                             "WHERE peer=? AND tip=?", (peer, tip)).fetchone()
+    if seen:
+        return {"witnessed": True, "already_seen": True, "peer": peer,
+                "tip": tip, "observed_at": seen[0],
+                "sealed_in_our_chain": seen[1],
+                "message": "Already witnessed. Their chain has not moved, "
+                           "or this is a replay."}, 200
+
+    ts = now()
+    h = seal({"user_id": "witness:" + peer, "action": "peer_tip_observed",
+              "amount": 0, "country": "UK", "device_id": "witness",
+              "anomaly": 0, "device_risk": 0},
+             {"decision": "WITNESS_SEALED", "score": 0, "version": VERSION,
+              "peer": peer, "peer_tip": tip, "peer_url": url or None,
+              "timestamp": ts,
+              "note": "a peer's chain head, sealed here. This records what "
+                      "they handed us and when. It says nothing about "
+                      "whether their chain is honest."}, ts)
+    with _db_lock:
+        _conn.execute("INSERT OR IGNORE INTO witness_seen(peer,tip,url,"
+                      "observed,audit_hash) VALUES(?,?,?,?,?)",
+                      (peer, tip, url or None, ts, h))
+        _conn.commit()
+
+    our, _t, height = chain_head()
+    return {"witnessed": True, "peer": peer, "tip": tip, "observed_at": ts,
+            "sealed_in_our_chain": h, "our_tip_now": our,
+            "our_height": height, "engine": "sebdog",
+            "what_this_proves": "That this value was handed to us at this "
+                                "time and sealed into a chain we control. "
+                                "Nothing about whether it is true."}, 200
+
+
+# ==============================================================================
+# HTTP
+# ==============================================================================
+
+def send_json(h, data, status=200):
+    body = json.dumps(data, indent=2).encode()
     h.send_response(status)
-    h.send_header("Content-Type","application/json")
-    h.send_header("Content-Length",str(len(body)))
-    h.send_header("Access-Control-Allow-Origin","*")
-    h.send_header("X-Content-Type-Options","nosniff")
+    h.send_header("Content-Type", "application/json")
+    h.send_header("Content-Length", str(len(body)))
+    h.send_header("Access-Control-Allow-Origin", "*")
     h.end_headers()
     h.wfile.write(body)
 
-def send_html(h,html,status=200):
-    body=html.encode("utf-8")
-    h.send_response(status)
-    h.send_header("Content-Type","text/html; charset=utf-8")
-    h.send_header("Content-Length",str(len(body)))
-    h.send_header("X-Frame-Options","SAMEORIGIN")
-    h.end_headers()
-    h.wfile.write(body)
-
-def send_text(h,text,content_type="text/plain",status=200):
-    body=text.encode("utf-8")
-    h.send_response(status)
-    h.send_header("Content-Type",content_type)
-    h.send_header("Content-Length",str(len(body)))
-    h.end_headers()
-    h.wfile.write(body)
 
 def read_body(h):
-    n=int(h.headers.get("Content-Length",0))
+    n = int(h.headers.get("Content-Length", 0) or 0)
     if n:
-        try:return json.loads(h.rfile.read(n))
-        except:return{}
-    return{}
+        try:
+            return json.loads(h.rfile.read(n))
+        except Exception:
+            return {}
+    return {}
+
 
 def get_bearer(h):
-    auth=h.headers.get("Authorization","")
-    if auth.startswith("Bearer "):return auth[7:]
-    return h.headers.get("X-API-Key","").strip()
+    auth = h.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        return auth[7:].strip()
+    return h.headers.get("X-API-Key", "").strip()
 
-VISITS_START=2026
-def bump_visits():
-    with _db_lock:
-        r=_conn.execute("SELECT v FROM config WHERE k='visits'").fetchone()
-        n=(int(r[0]) if r and r[0] else VISITS_START)+1
-        _conn.execute("INSERT OR REPLACE INTO config(k,v) VALUES('visits',?)",(str(n),))
-        _conn.commit()
-    return n
-
-def get_visits():
-    with _db_lock:
-        r=_conn.execute("SELECT v FROM config WHERE k='visits'").fetchone()
-    return int(r[0]) if r and r[0] else VISITS_START
-
-def load_file(name):
-    try:
-        with open(name,"r",encoding="utf-8") as f:return f.read()
-    except:return None
-
-def check_admin(h):
-    """Fix: tokens now expire after 24h and are checked under a lock."""
-    tok=get_bearer(h)
-    if not tok:return False
-    t=time.time()
-    with _admin_lock:
-        exp=_admin_tokens.get(tok)
-        if exp is None:return False
-        if exp<t:
-            del _admin_tokens[tok]
-            return False
-        return True
-
-def admin_login_allowed():
-    """Fix: rate limit admin login attempts - max 10 per minute globally."""
-    t=time.time()
-    with _admin_lock:
-        while _admin_fails and _admin_fails[0]<t-60:_admin_fails.popleft()
-        return len(_admin_fails)<10
-
-def admin_login_failed():
-    with _admin_lock:_admin_fails.append(time.time())
-
-def page_404():
-    return (
-        "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>Not Found</title>"
-        "<style>body{font-family:sans-serif;background:#0a0f1e;color:#fff;display:flex;"
-        "align-items:center;justify-content:center;min-height:100vh;margin:0;text-align:center}"
-        "h1{color:#c9a84c;font-size:48px;margin-bottom:8px}"
-        "p{color:rgba(255,255,255,0.4);font-size:14px}"
-        "a{color:#c9a84c;text-decoration:none}</style></head>"
-        "<body><div><h1>404</h1><p>Page not found.</p>"
-        "<p style='margin-top:16px'><a href='/'>Back to AILeash &rarr;</a></p>"
-        "</div></body></html>"
-    )
-
-def badge_id_for_key(key):
-    return hashlib.sha256(("shield:"+key).encode()).hexdigest()[:16]
-
-def lookup_badge(badge_id):
-    """Find the org for a public badge id. Returns (org, active_and_ok) or None."""
-    if not badge_id or len(badge_id)!=16:return None
-    with _db_lock:
-        rows=_conn.execute("SELECT key,org,active,is_paid,actions_used,free_quota,created FROM api_keys").fetchall()
-    for k,org,active,is_paid,used,quota,created in rows:
-        if badge_id_for_key(k)==badge_id:
-            in_trial,_=trial_state(created,is_paid)
-            ok=bool(active) and (bool(is_paid) or in_trial)
-            return (org or "Verified platform",ok)
-    return None
-
-def shield_svg(org,ok):
-    org=esc(str(org))[:28]
-    if ok:
-        fill1="#0a0f1e";edge="#c9a84c";band="#c9a84c";txt="#c9a84c";status="SEALED BY AILEASH";st_fill="#0a0f1e";tick="#7fe3b0"
-    else:
-        fill1="#3a3f4d";edge="#8a8f9c";band="#8a8f9c";txt="#c3c7d1";status="UNVERIFIED";st_fill="#2c303b";tick="#c8362b"
-    return ("<svg xmlns='http://www.w3.org/2000/svg' width='190' height='226' viewBox='0 0 190 226'>"
-        "<defs><filter id='sh' x='-20%' y='-20%' width='140%' height='140%'><feDropShadow dx='0' dy='3' stdDeviation='4' flood-color='#0a0f1e' flood-opacity='0.35'/></filter></defs>"
-        "<path d='M95 6 L172 32 L172 112 Q172 172 95 218 Q18 172 18 112 L18 32 Z' fill='"+fill1+"' stroke='"+edge+"' stroke-width='4' filter='url(#sh)'/>"
-        "<path d='M95 20 L158 41 L158 110 Q158 162 95 202 Q32 162 32 110 L32 41 Z' fill='none' stroke='"+edge+"' stroke-width='1.2' stroke-dasharray='5 4' opacity='0.6'/>"
-        "<g transform='translate(79,44)'><circle cx='16' cy='16' r='13.5' fill='none' stroke='"+edge+"' stroke-width='2.6' stroke-dasharray='66 20' stroke-linecap='round' transform='rotate(-50 16 16)'/><circle cx='26.5' cy='7' r='3.1' fill='"+edge+"'/><circle cx='16' cy='16' r='3.4' fill='"+fill1+"'/></g>"
-        "<text x='95' y='102' text-anchor='middle' font-family='Georgia,serif' font-weight='900' font-size='19' fill='#ffffff'>AI<tspan fill='"+txt+"'>Leash</tspan></text>"
-        "<text x='95' y='119' text-anchor='middle' font-family='monospace' font-size='7.5' letter-spacing='2' fill='"+txt+"'>AI GOVERNANCE</text>"
-        "<rect x='30' y='130' width='130' height='22' rx='3' fill='"+band+"'/>"
-        "<text x='95' y='145' text-anchor='middle' font-family='monospace' font-weight='700' font-size='9' letter-spacing='1' fill='"+st_fill+"'>"+status+"</text>"
-        "<text x='95' y='168' text-anchor='middle' font-family='Verdana,sans-serif' font-size='9.5' font-weight='700' fill='#ffffff'>"+org+"</text>"
-        "<text x='95' y='183' text-anchor='middle' font-family='monospace' font-size='7' letter-spacing='1' fill='"+txt+"'>"+("SHA-256 AUDIT CHAIN \u2713" if ok else "NO VALID ACCOUNT")+"</text>"
-        "<circle cx='95' cy='196' r='4' fill='"+tick+"'/>"
-        "</svg>")
-
-def badge_svg(label,value,colour):
-    lw=len(label)*7+16
-    vw=len(value)*7+16
-    total=lw+vw
-    body=(
-        "<svg xmlns='http://www.w3.org/2000/svg' width='"+str(total)+"' height='20'>"
-        "<linearGradient id='s' x2='0' y2='100%'><stop offset='0' stop-color='#bbb' stop-opacity='.1'/><stop offset='1' stop-opacity='.1'/></linearGradient>"
-        "<rect rx='3' width='"+str(total)+"' height='20' fill='#555'/>"
-        "<rect rx='3' x='"+str(lw)+"' width='"+str(vw)+"' height='20' fill='"+colour+"'/>"
-        "<rect rx='3' width='"+str(total)+"' height='20' fill='url(#s)'/>"
-        "<g fill='#fff' text-anchor='middle' font-family='DejaVu Sans,Verdana,Geneva,sans-serif' font-size='11'>"
-        "<text x='"+str(lw//2)+"' y='15' fill='#010101' fill-opacity='.3'>"+label+"</text>"
-        "<text x='"+str(lw//2)+"' y='14'>"+label+"</text>"
-        "<text x='"+str(lw+vw//2)+"' y='15' fill='#010101' fill-opacity='.3'>"+value+"</text>"
-        "<text x='"+str(lw+vw//2)+"' y='14'>"+value+"</text>"
-        "</g></svg>"
-    )
-    return body
-
-def send_svg(h,svg):
-    body=svg.encode("utf-8")
-    h.send_response(200)
-    h.send_header("Content-Type","image/svg+xml")
-    h.send_header("Content-Length",str(len(body)))
-    h.send_header("Cache-Control","no-cache, no-store, must-revalidate")
-    h.send_header("Access-Control-Allow-Origin","*")
-    h.end_headers()
-    h.wfile.write(body)
-
-def referrals_page(code):
-    ref=get_referral(code) if code else None
-    if ref:
-        _,email,name,devices,earnings=ref
-        first=esc(name.split()[0]) if name and name.split() else "there"
-        return (
-            "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
-            "<meta name='viewport' content='width=device-width,initial-scale=1.0'>"
-            "<title>Your Referrals</title>"
-            "<style>body{font-family:sans-serif;background:#0a0f1e;color:#fff;display:flex;"
-            "align-items:center;justify-content:center;min-height:100vh;margin:0;padding:20px}"
-            ".box{max-width:480px;width:100%;background:rgba(255,255,255,0.04);"
-            "border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:36px;text-align:center}"
-            "h1{font-family:Georgia,serif;font-size:28px;color:#c9a84c;margin-bottom:8px}"
-            ".stat{font-size:48px;font-weight:900;color:#00ff88;margin:20px 0 4px;font-family:Georgia,serif}"
-            ".lbl{font-size:11px;color:rgba(255,255,255,0.3);letter-spacing:2px;text-transform:uppercase;margin-bottom:20px}"
-            ".earn{font-size:36px;font-weight:900;color:#c9a84c;font-family:Georgia,serif}"
-            "p{font-size:14px;color:rgba(255,255,255,0.4);line-height:1.7;margin-top:12px}"
-            "a{color:#c9a84c;text-decoration:none}</style></head>"
-            "<body><div class='box'>"
-            "<h1>Your Referrals</h1><p>Welcome back, "+first+".</p>"
-            "<div class='stat'>"+str(devices)+"</div><div class='lbl'>Devices Referred</div>"
-            "<div class='earn'>&pound;"+"{:.2f}".format(earnings/100)+"</div>"
-            "<div class='lbl'>Earned This Month</div>"
-            "<p>10p per device per month. Keep sharing.<br><br>"
-            "Questions? <a href='mailto:"+OWNER_EMAIL+"'>"+OWNER_EMAIL+"</a></p>"
-            "</div></body></html>"
-        )
-    return (
-        "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
-        "<meta name='viewport' content='width=device-width,initial-scale=1.0'>"
-        "<title>Referrals</title>"
-        "<style>body{font-family:sans-serif;background:#0a0f1e;color:#fff;display:flex;"
-        "align-items:center;justify-content:center;min-height:100vh;margin:0;text-align:center;padding:20px}"
-        "h1{font-size:28px;color:#c9a84c;margin-bottom:12px}"
-        "p{color:rgba(255,255,255,0.4);font-size:14px;line-height:1.7}"
-        "a{color:#c9a84c;text-decoration:none}</style></head><body>"
-        "<div><h1>Check Your Referral Earnings</h1>"
-        "<p>Sign up at <a href='https://sebbi.pro/#signup'>sebbi.pro</a> to get your referral code.<br>"
-        "Then return here: <a href='/referrals?code=YOUR-CODE'>sebbi.pro/referrals?code=YOUR-CODE</a><br><br>"
-        "Questions? <a href='mailto:"+OWNER_EMAIL+"'>"+OWNER_EMAIL+"</a></p>"
-        "</div></body></html>"
-    )
-
-class ThreadedServer(ThreadingMixIn,HTTPServer):
-    allow_reuse_address=True
-    daemon_threads=True
 
 class Handler(BaseHTTPRequestHandler):
-    def log_message(self,fmt,*args):pass
+
+    def log_message(self, fmt, *args):
+        pass
 
     def do_OPTIONS(self):
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin","*")
-        self.send_header("Access-Control-Allow-Methods","GET,POST,OPTIONS")
-        self.send_header("Access-Control-Allow-Headers","Content-Type,Authorization,X-API-Key")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+        self.send_header("Access-Control-Allow-Headers",
+                         "Content-Type,Authorization,X-API-Key")
         self.end_headers()
 
     def do_GET(self):
-        parsed=urlparse(self.path)
-        path=parsed.path
-        if path.endswith("/") and path!="/":path=path.rstrip("/")
-        qs=parse_qs(parsed.query)
-        track_request()
-        maybe_prune()
+        path = urlparse(self.path).path.rstrip("/") or "/"
 
-        if path=="/mM_hYELAWL0vrzIvAnKRBlUnN1kM-H656cmjMrFT-3U.html":
-            send_text(self,"google-site-verification: mM_hYELAWL0vrzIvAnKRBlUnN1kM-H656cmjMrFT-3U","text/html")
-            return
+        if path == "/tip":
+            # The witness protocol's first call. Public on purpose: a peer
+            # cannot seal what it cannot read, and a chain head reveals
+            # nothing but that the chain exists and has moved.
+            tip, ts, height = chain_head()
+            send_json(self, {
+                "chain": CHAIN_NAME, "tip": tip, "height": height,
+                "sealed_at": ts, "engine": "sebdog", "version": VERSION,
+                "note": "Seal this into your own chain. Hand us yours at "
+                        "POST /witness/observe and we will seal it here.",
+                "what_this_is": "The head of a hash chain held on this "
+                                "operator's own hardware. It is a hash and "
+                                "nothing else - no event, no record, no "
+                                "personal data, and it cannot be reversed.",
+            })
 
-        if path=="/":
-            try:bump_visits()
-            except:pass
-            c=load_file("index.html")
-            if c:send_html(self,c)
-            else:send_html(self,page_404(),404)
-        elif path=="/reseller":
-            c=load_file("reseller.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
-        elif path=="/risk-policy":
-            c=load_file("risk-policy.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
-        elif path=="/data-protection":
-            c=load_file("data-protection.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
-        elif path=="/human-oversight":
-            c=load_file("human-oversight.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
-        elif path=="/scan":
-            c=load_file("scan.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
-        
-        elif path=="/contact":
-            c=load_file("contact.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
-        elif path=="/sonicboom":
-            c=load_file("sonicboom.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
-        elif path=="/seal":
-            c=load_file("seal.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
-        elif path in("/reseller","/partners"):
-            c=load_file("reseller.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
-        elif path=="/report-threat":
-            c=load_file("report-threat.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
-        elif path=="/child-safety-guide":
-            c=load_file("child-safety-guide.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
-        elif path=="/compliance-assistant":
-            c=load_file("compliance-assistant.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
-        elif path=="/investors":
-            c=load_file("investor-prospectus.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
-        elif path=="/sentinel":
-            c=load_file("sentinel.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
-        elif path=="/whitepaper":
-            c=load_file("whitepaper.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
-        elif path=="/developers":
-            c=load_file("developers.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
-        elif path in("/tokensaver","/token-saver"):
-            c=load_file("tokensaver.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
-        elif path=="/sebbi_tokensaver.py":
-            c=load_file("sebbi_tokensaver.py")
-            if c:
-                self.send_response(200);self.send_header("Content-Type","text/x-python")
-                self.send_header("Content-Disposition","attachment; filename=\"sebbi_tokensaver.py\"")
-                b=c.encode();self.send_header("Content-Length",str(len(b)));self.end_headers();self.wfile.write(b)
-            else:send_json(self,{"error":"not found"},404)
-        elif path=="/signal-packs":
-            c=load_file("signal-packs.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
-        elif path=="/ai-standard":
-            c=load_file("ai-standard.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
-        elif path=="/.well-known/ai.txt":
-            c=load_file("static/.well-known/ai.txt")
-            send_text(self,c,"text/plain") if c else send_json(self,{"error":"not found"},404)
-        elif path=="/.well-known/ai-manifest.json":
-            c=load_file("static/.well-known/ai-manifest.json")
-            send_text(self,c,"application/json") if c else send_json(self,{"error":"not found"},404)
-        elif path=="/.well-known/ai-safety.txt":
-            c=load_file("static/.well-known/ai-safety.txt")
-            send_text(self,c,"text/plain") if c else send_json(self,{"error":"not found"},404)
-        elif path=="/.well-known/security.txt":
-            c=load_file("static/.well-known/security.txt")
-            send_text(self,c,"text/plain") if c else send_json(self,{"error":"not found"},404)
-        elif path=="/.well-known/comply.txt":
-            c=load_file("static/.well-known/comply.txt")
-            send_text(self,c,"text/plain") if c else send_json(self,{"error":"not found"},404)
-        elif path=="/spec/ai-txt":
-            c=load_file("docs/spec/ai-txt.md")
-            send_text(self,c,"text/markdown") if c else send_json(self,{"error":"not found"},404)
-        elif path=="/api/verify-manifest":
-            dom=qs.get("domain",[""])[0].strip().lower().replace("https://","").replace("http://","").strip("/")
-            chain=verify_chain()
+        elif path == "/health":
+            send_json(self, {
+                "status": "ok", "version": VERSION, "engine": "sebdog",
+                "local": True, "phones_home": False,
+                "licence": {"valid": _licence["valid"],
+                            "plan": _licence["plan"],
+                            "devices": _licence["devices"],
+                            "email": _licence["email"],
+                            "in_grace_period": _licence["grace"],
+                            "validated": "locally, no network"}})
+
+        elif path == "/verify-chain":
+            send_json(self, verify_chain())
+
+        elif path == "/stats":
             with _db_lock:
-                tip=_conn.execute("SELECT audit_hash FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()
-            if dom and dom!="sebbi.pro":
-                send_json(self,{"domain":dom,"manifest_found":False,"verdict":"NO_MANIFEST",
-                    "message":"No verifiable manifest registered for this domain. Publish one: "+HOST+"/spec/ai-txt",
-                    "checked_at":time.time()})
-            else:
-                send_json(self,{"domain":"sebbi.pro","manifest_found":True,
-                    "chain_valid":chain.get("valid"),"sealed_count":chain.get("blocks"),
-                    "chain_tip":(tip[0] if tip else "GENESIS"),
-                    "verdict":"VERIFIED" if chain.get("valid") else "CHAIN_BROKEN",
-                    "verified_by":"AILeash - sebbi.pro","checked_at":time.time()})
-        elif path=="/ai.txt":
-            c=load_file("ai.txt");send_text(self,c,"text/plain") if c else send_json(self,{"error":"not found"},404)
-        elif path=="/brain.py":
-            c=load_file("brain.py")
-            if c:
-                self.send_response(200);self.send_header("Content-Type","text/x-python")
-                self.send_header("Content-Disposition","attachment; filename=\"brain.py\"")
-                b=c.encode();self.send_header("Content-Length",str(len(b)));self.end_headers();self.wfile.write(b)
-            else:send_json(self,{"error":"not found"},404)
-        elif path=="/sebdog_engine.py":
-            c=load_file("sebdog_engine.py")
-            if c:
-                self.send_response(200);self.send_header("Content-Type","text/x-python")
-                self.send_header("Content-Disposition","attachment; filename=\"sebdog_engine.py\"")
-                b=c.encode();self.send_header("Content-Length",str(len(b)));self.end_headers();self.wfile.write(b)
-            else:send_json(self,{"error":"not found"},404)
-        elif path=="/sebdog_licence.py":
-            c=load_file("sebdog_licence.py")
-            if c:
-                self.send_response(200);self.send_header("Content-Type","text/x-python")
-                self.send_header("Content-Disposition","attachment; filename=\"sebdog_licence.py\"")
-                b=c.encode();self.send_header("Content-Length",str(len(b)));self.end_headers();self.wfile.write(b)
-            else:send_json(self,{"error":"not found"},404)
-        elif path=="/sebdog_reporter.py":
-            c=load_file("sebdog_reporter.py")
-            if c:
-                self.send_response(200);self.send_header("Content-Type","text/x-python")
-                self.send_header("Content-Disposition","attachment; filename=\"sebdog_reporter.py\"")
-                b=c.encode();self.send_header("Content-Length",str(len(b)));self.end_headers();self.wfile.write(b)
-            else:send_json(self,{"error":"not found"},404)
-        elif path=="/aileash_reporter.py":
-            c=load_file("aileash_reporter.py")
-            if c:
-                self.send_response(200);self.send_header("Content-Type","text/x-python")
-                self.send_header("Content-Disposition","attachment; filename=\"aileash_reporter.py\"")
-                b=c.encode();self.send_header("Content-Length",str(len(b)));self.end_headers();self.wfile.write(b)
-            else:send_json(self,{"error":"not found"},404)
-        elif path=="/aileash-compliance.zip":
-            import os
-            fp=os.path.join(os.path.dirname(os.path.abspath(__file__)),"aileash-compliance.zip")
-            if os.path.exists(fp):
-                with open(fp,"rb") as zf:data=zf.read()
-                self.send_response(200);self.send_header("Content-Type","application/zip")
-                self.send_header("Content-Disposition","attachment; filename=\"aileash-compliance.zip\"")
-                self.send_header("Content-Length",str(len(data)));self.end_headers();self.wfile.write(data)
-            else:send_json(self,{"error":"not found"},404)
-        elif path=="/api-routes.md" or path=="/api-routes":
-            c=load_file("api-routes.md")
-            if c:send_text(self,c,"text/markdown")
-            else:send_json(self,{"error":"not found"},404)
-        elif path=="/comply.txt":
-            c=load_file("comply.txt");send_text(self,c,"text/plain") if c else send_json(self,{"error":"not found"},404)
-        elif path=="/guardian-child":
-            c=load_file("guardian-child.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
-        elif path=="/guardian":
-            c=load_file("guardian.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
-        elif path=="/guardian-parent":
-            c=load_file("guardian-parent.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
-        elif path=="/certificate":
-            c=load_file("certificate.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
-        elif path=="/registry":
-            c=load_file("registry.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
-        elif path=="/admin":
-            c=load_file("admin.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
-        elif path=="/brain":
-            c=load_file("brain.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
-        elif path=="/green":
-            c=load_file("green.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
-        elif path=="/dis.txt":
-            c=load_file("dis.txt");send_text(self,c,"text/plain") if c else send_json(self,{"error":"not found"},404)
-        elif path=="/legal.txt":
-            c=load_file("legal.txt");send_text(self,c,"text/plain") if c else send_json(self,{"error":"not found"},404)
-        elif path=="/liability.txt":
-            c=load_file("liability.txt");send_text(self,c,"text/plain") if c else send_json(self,{"error":"not found"},404)
-        elif path=="/copyright.txt":
-            c=load_file("copyright.txt");send_text(self,c,"text/plain") if c else send_json(self,{"error":"not found"},404)
-        elif path=="/ai-txt-kit" or path=="/kit":
-            c=load_file("ai-txt-kit.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
-        elif path=="/ai-txt-template.txt":
-            c=load_file("ai-txt-template.txt")
-            if c:
-                self.send_response(200)
-                self.send_header("Content-Type","text/plain; charset=utf-8")
-                self.send_header("Content-Disposition","attachment; filename=\"ai.txt\"")
-                self.end_headers();self.wfile.write(c.encode())
-            else:send_json(self,{"error":"not found"},404)
-        elif path=="/referrals":
-            code=qs.get("code",[""])[0].strip().upper()
-            send_html(self,referrals_page(code))
-        elif path in("/verify","/identity","/notary","/pay-check","/dashboard","/pricing","/docs","/blog","/status","/about","/legal","/privacy","/terms"):
-            name=path.lstrip("/")+".html"
-            c=load_file(name)
-            if c:send_html(self,c)
-            else:send_json(self,{"status":"coming_soon","route":path},200)
-        elif path=="/download/engine":
-            api_key=get_bearer(self)
-            ki=get_key(api_key) if api_key else None
-            if not ki:
-                send_html(self,"<html><body style='font-family:sans-serif;background:#0a0f1e;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh'><div style='text-align:center;padding:40px'><h1 style='color:#c9a84c;margin-bottom:16px'>Engine Download</h1><p style='color:rgba(255,255,255,0.5);margin-bottom:24px'>Valid API key required.</p><a href='https://sebbi.pro/#signup' style='background:#c9a84c;color:#0a0f1e;padding:14px 28px;text-decoration:none;border-radius:4px;font-weight:700'>Get API Key</a></div></body></html>",401)
+                blocks = _conn.execute(
+                    "SELECT COUNT(*) FROM audit_log").fetchone()[0]
+                users = _conn.execute(
+                    "SELECT COUNT(*) FROM users").fetchone()[0]
+                peers = _conn.execute(
+                    "SELECT COUNT(DISTINCT peer) FROM witness_seen"
+                ).fetchone()[0]
+            send_json(self, {"audit_blocks": blocks, "users_tracked": users,
+                             "peers_witnessed": peers, "version": VERSION,
+                             "engine": "sebdog",
+                             "licence_valid": _licence["valid"]})
+
+        elif path == "/peers":
+            with _db_lock:
+                rows = _conn.execute(
+                    "SELECT peer,COUNT(*),MAX(observed),MAX(url) FROM "
+                    "witness_seen GROUP BY peer ORDER BY MAX(observed) DESC"
+                ).fetchall()
+            send_json(self, {
+                "count": len(rows),
+                "peers": [{"chain": r[0], "observations": r[1],
+                           "last_seen": r[2], "tip_url": r[3]}
+                          for r in rows],
+                "note": "Chains whose heads we have sealed here. Being "
+                        "listed is not endorsement of anything in their "
+                        "chain."})
+
+        elif path == "/snapshots":
+            send_json(self, {"snapshots": list_snapshots()})
+
+        elif path == "/backup":
+            # keyed - a backup writes to disk and seals a block
+            if get_bearer(self) != _licence["key"]:
+                send_json(self, {"error": "invalid_api_key"}, 401)
                 return
-            try:
-                with open("engine.py","rb") as f:body=f.read()
-                self.send_response(200)
-                self.send_header("Content-Type","text/x-python")
-                self.send_header("Content-Disposition",'attachment; filename="engine.py"')
-                self.send_header("Content-Length",str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-            except:send_json(self,{"error":"engine_not_found"},404)
-        elif path=="/verify-challenge":
-            send_html(self,CHALLENGE_PAGE)
-        elif path=="/api/challenge/status":
-            tok=qs.get("token",[""])[0].strip()
-            p,err=read_challenge_token(tok)
-            if not p:send_json(self,{"resolved":False,"error":err or "invalid_token"},400);return
-            r=challenge_resolved(p)
-            if r:send_json(self,{"resolved":True,"sealed":r[0],"at":r[1]})
-            else:send_json(self,{"resolved":False,"expired":err=="expired"})
-        elif path=="/api/regulation-map":
-            send_json(self,{"map":REG_MAP,"map_hash":sha(REG_MAP),"changes_sealed":"every version change is sealed into the audit chain as a block"})
-        elif path=="/api/partner/status":
-            bid=qs.get("badge",[""])[0].strip().lower()
-            hit=lookup_badge(bid)
-            with _db_lock:
-                tip=_conn.execute("SELECT audit_hash FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()
-            ct=(tip[0][:16] if tip else "GENESIS")
-            if hit:
-                send_json(self,{"partner":hit[0],"account_standing":"active" if hit[1] else "lapsed","infrastructure":"operational","chain_tip":ct,"note":"account_standing is the partner's status; infrastructure is the AILeash platform status - independently attributable"})
-            else:
-                send_json(self,{"partner":None,"account_standing":"not_found","infrastructure":"operational","chain_tip":ct})
-        elif path=="/api/payment/check":
-            code=qs.get("code",[""])[0].strip().lower()
-            fpq=qs.get("fp",[""])[0].strip().lower()
-            if not code or len(code)<12:send_json(self,{"found":False,"error":"provide the 12-character code"},400);return
-            with _db_lock:
-                if len(code)==64:
-                    r=_conn.execute("SELECT fp,ts,seal,block_index,display_json FROM payment_registry WHERE fp=?",(code,)).fetchone()
-                else:
-                    r=_conn.execute("SELECT fp,ts,seal,block_index,display_json FROM payment_registry WHERE fp LIKE ?",(code+"%",)).fetchone()
-            if not r:
-                ts=time.time()
-                ev={"user_id":"payment_verifier","action":"payment_verification","amount":0,"country":"UK","device_id":"paycheck_"+code[:12],"anomaly":0,"device_risk":0,"checked_code":code[:12],"result":"NO_SEAL"}
-                res={"decision":"VERIFICATION","score":0,"version":VERSION,"timestamp":ts,"result":"NO_SEAL"}
-                h2,idx2,_=seal(ev,res,ts)
-                send_json(self,{"found":False,"receipt":{"seal":h2,"block_index":idx2,"checked_at":ts,"result":"NO_SEAL"}});return
-            out={"found":True,"registered_at":r[1],"seal":r[2],"block_index":r[3]}
-            if r[4]:
-                try:out["display"]=json.loads(r[4])
-                except:pass
-            result="FOUND"
-            if fpq and len(fpq)==64:
-                out["match"]=(fpq==r[0])
-                result="MATCH" if out["match"] else "MISMATCH"
-            ts=time.time()
-            ev={"user_id":"payment_verifier","action":"payment_verification","amount":0,"country":"UK","device_id":"paycheck_"+code[:12],"anomaly":0,"device_risk":0,"checked_code":code[:12],"checked_fp":fpq or "","result":result}
-            res={"decision":"VERIFICATION","score":0,"version":VERSION,"timestamp":ts,"result":result,"note":"payer verification sealed - proof of care under PSR mandatory reimbursement rules"}
-            h2,idx2,_=seal(ev,res,ts)
-            out["receipt"]={"seal":h2,"block_index":idx2,"checked_at":ts,"result":result}
-            send_json(self,out)
-        elif path=="/api/identity/check":
-            q=qs.get("code",[""])[0].strip().lower()
-            if not q or len(q)<12:send_json(self,{"found":False,"error":"provide at least 12 characters"},400);return
-            with _db_lock:
-                if len(q)==64:
-                    r=_conn.execute("SELECT fp,ts,seal,block_index,public,profile_json FROM identity_registry WHERE fp=?",(q,)).fetchone()
-                else:
-                    r=_conn.execute("SELECT fp,ts,seal,block_index,public,profile_json FROM identity_registry WHERE fp LIKE ?",(q+"%",)).fetchone()
-            if not r:send_json(self,{"found":False});return
-            out={"found":True,"fingerprint":r[0],"registered_at":r[1],"seal":r[2],"block_index":r[3]}
-            if r[4] and r[5]:
-                try:out["profile"]=json.loads(r[5])
-                except:pass
-            send_json(self,out)
-        elif path=="/api/verify-post":
-            ch=qs.get("content",[""])[0].strip().lower()
-            if not ch or len(ch)!=64:send_json(self,{"verified":False,"error":"provide a 64-char sha-256"},400);return
-            with _db_lock:
-                r=_conn.execute("SELECT ts,seal,block_index FROM post_registry WHERE fp=?",(ch,)).fetchone()
-            if r:send_json(self,{"verified":True,"block_index":r[2],"sealed_at":r[0],"seal":r[1]})
-            else:send_json(self,{"verified":False})
-        elif path=="/api/spec":
-            send_json(self,ENGINE_SPEC)
-        elif path=="/api/inclusion":
-            h_q=qs.get("hash",[""])[0].strip().lower()
-            if not h_q or len(h_q)!=64:send_json(self,{"included":False,"error":"provide full 64-char audit hash"},400);return
-            with _db_lock:
-                r=_conn.execute("SELECT id,ts,key_seq FROM audit_log WHERE audit_hash=?",(h_q,)).fetchone()
-            if not r:send_json(self,{"included":False,"hash":h_q});return
-            send_json(self,{"included":True,"hash":h_q,"block_index":r[0],"sealed_at":r[1],"receipt_seq":r[2]})
-        elif path=="/api/coverage":
-            auth=get_bearer(self)
-            if not auth:send_json(self,{"error":"api_key_required"},401);return
-            ki=get_key(auth)
-            if not ki:send_json(self,{"error":"invalid_api_key"},401);return
-            with _db_lock:
-                sr=_conn.execute("SELECT COALESCE(seq,0) FROM api_keys WHERE key=?",(auth,)).fetchone()
-                cnt=_conn.execute("SELECT COUNT(*),MIN(key_seq),MAX(key_seq),MIN(ts),MAX(ts) FROM audit_log WHERE api_key=?",(auth,)).fetchone()
-                gaps=_conn.execute("SELECT COUNT(*) FROM audit_log WHERE api_key=? AND key_seq IS NOT NULL",(auth,)).fetchone()
-            issued=sr[0] if sr else 0
-            sealed=gaps[0]
-            send_json(self,{
-                "receipts_issued":issued,
-                "receipts_sealed":sealed,
-                "complete":issued==sealed,
-                "seq_range":[cnt[1],cnt[2]],
-                "period":[cnt[3],cnt[4]],
-                "how_to_reconcile":"Every /api/govern response carries receipt_seq. Sequences are gapless by construction. Compare your stored receipts against seq_range - any number you hold that this chain lacks, or any gap in your own receipt series, is a provable omission."})
-        elif path=="/api/guardian/report":
-            email=qs.get("email",[""])[0].strip().lower()
-            if not email:send_json(self,{"error":"email required"},400);return
-            pc=qs.get("code",[""])[0].strip()
-            with _db_lock:
-                fam=_conn.execute("SELECT child_name,created,last_checkin FROM guardian_family WHERE pair_code=? AND parent_key=?",(pc,email)).fetchone()
-                rows=_conn.execute("SELECT ts,kind,lat,lon,note,audit_hash FROM guardian_events WHERE pair_code=? ORDER BY ts DESC LIMIT 200",(pc,)).fetchall()
-            if not fam:send_json(self,{"error":"not_found_or_not_yours"},404);return
-            events=[{"ts":r[0],"kind":r[1],"lat":r[2],"lon":r[3],"note":r[4],"sealed":r[5][:16]} for r in rows]
-            send_json(self,{"child":fam[0],"paired":fam[1],"last_checkin":fam[2],
-                "events":events,
-                "note":"Every event is sealed in the audit chain. Message content is never stored - only a fingerprint. This timeline is tamper-evident and can be independently verified."})
-        elif path=="/api/guardian/children":
-            email=qs.get("email",[""])[0].strip().lower()
-            if not email:send_json(self,{"error":"email required"},400);return
-            with _db_lock:
-                rows=_conn.execute("SELECT pair_code,child_name,last_checkin FROM guardian_family WHERE parent_key=? ORDER BY created ASC",(email,)).fetchall()
-            send_json(self,{"children":[{"code":r[0],"name":r[1],"last_checkin":r[2]} for r in rows]})
-        elif path=="/api/usage":
-            auth=get_bearer(self)
-            if not auth:send_json(self,{"error":"api_key_required"},401);return
-            n=device_count(auth)
-            ki=get_key(auth)
-            trial_note=""
-            days_left=None
-            if ki:
-                _,_,_,is_paid,_,_,_,created=ki
-                in_trial,days_left=trial_state(created,is_paid)
-                if is_paid:trial_note="Paid account."
-                elif in_trial:trial_note="Free trial: "+str(days_left)+" day(s) remaining. Billing begins only after the trial."
-                else:trial_note="Trial ended. Pay to continue - the charge below reflects the real devices seen on this key."
-            send_json(self,{"billable_devices":n,"rate_per_device_gbp":0.50,"monthly_charge_gbp":round(n*0.50,2),
-                "trial_days_left":days_left,"trial_status":trial_note,
-                "note":"You are billed 50p for every unique device that uses this key. This count is the real number of distinct devices seen, not a figure you set. Send the key to 20 million devices and the bill is for 20 million devices."})
-        elif path=="/api/pulse":
-            auth=get_bearer(self)
-            if not auth:send_json(self,{"error":"api_key_required"},401);return
-            ki=get_key(auth)
-            if not ki:send_json(self,{"error":"invalid_api_key"},401);return
-            cutoff=time.time()-3600
-            with _db_lock:
-                counts=dict(_conn.execute("SELECT json_extract(result_json,'$.decision'),COUNT(*) FROM audit_log WHERE api_key=? AND ts>? GROUP BY 1",(auth,cutoff)).fetchall())
-                recent=_conn.execute("SELECT ts,event_json,result_json,audit_hash FROM audit_log WHERE api_key=? ORDER BY id DESC LIMIT 10",(auth,)).fetchall()
-                tip=_conn.execute("SELECT audit_hash FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()
-            events=[]
-            for ts_,ev,res,ah in recent:
-                try:
-                    e=json.loads(ev);r=json.loads(res)
-                    events.append({"ts":ts_,"action":e.get("action"),"decision":r.get("decision"),"score":r.get("score"),"reasons":r.get("reasons",[]),"sealed":ah[:16]})
-                except:pass
-            send_json(self,{
-                "last_hour":{"ALLOW":counts.get("ALLOW",0),"CHALLENGE":counts.get("CHALLENGE",0),"BLOCK":counts.get("BLOCK",0)},
-                "recent":events,
-                "chain_tip":(tip[0][:16] if tip else "GENESIS"),
-                "alerting":"BLOCK events email you in real time (max 1/hour)"})
-        elif path=="/api/visits":
-            send_json(self,{"visits":get_visits()})
-        elif path=="/api/health":
-            send_json(self,{"status":"ok","version":VERSION,"rps":get_rps()})
-        elif path=="/api/verify-chain":
-            send_json(self,verify_chain())
-        elif path.startswith("/x/"):
-            from modules import router as _r
-            p,s=_r.route(self,path,qs)
-            send_json(self,p,s)
-        elif path=="/api/anchor-status":
-            try:
-                from anchor import anchor_status
-                st=anchor_status()
-            except Exception as e:
-                st={"status":"anchor module unavailable: "+str(e)}
-            st["chain_tip"]=chain_tip()
-            st["note"]="The chain tip is periodically timestamped against Bitcoin via OpenTimestamps - an external source we do not control. ots_ok true means the latest tip is committed to a public timestamp anyone can verify without trusting us."
-            send_json(self,st)
-        elif path=="/api/stats":
-            with _db_lock:
-                keys=_conn.execute("SELECT COUNT(*) FROM api_keys").fetchone()[0]
-                paid=_conn.execute("SELECT COUNT(*) FROM api_keys WHERE is_paid=1").fetchone()[0]
-                audits=_conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0]
-            send_json(self,{"api_keys":keys,"paid_keys":paid,"audit_blocks":audits,"rps":get_rps(),"version":VERSION})
-        elif path=="/api/validate-engine":
-            send_json(self,{"error":"method_not_allowed"},405)
-        elif path=="/api/badge/shield":
-            bid=qs.get("badge",[""])[0].strip().lower()
-            hit=lookup_badge(bid)
-            if hit:send_svg(self,shield_svg(hit[0],hit[1]))
-            else:send_svg(self,shield_svg("No account found",False))
-        elif path=="/api/badge/status":
-            with _db_lock:
-                blocks=_conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0]
-            send_svg(self,badge_svg("AILeash","LIVE "+str(blocks)+" blocks","#00875a"))
-        elif path=="/api/badge/decision":
-            ld=last_decision()
-            if ld and ld[0]:
-                dec,sc=ld
-                colours={"ALLOW":"#00875a","CHALLENGE":"#b45309","BLOCK":"#cc0000"}
-                send_svg(self,badge_svg("Live Decision",str(dec)+" "+str(round(sc or 0,2)),colours.get(dec,"#555")))
-            else:
-                send_svg(self,badge_svg("Live Decision","READY","#00875a"))
-        elif path=="/api/badge/chain":
-            with _db_lock:
-                blocks=_conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0]
-            send_svg(self,badge_svg("SHA-256",str(blocks)+" blocks","#0a0f1e"))
-        elif path=="/robots.txt":
-            send_text(self,"User-agent: *\nAllow: /\nSitemap: https://sebbi.pro/sitemap.xml\n")
-        elif path=="/sitemap.xml":
-            c=load_file("sitemap.xml")
-            if c:
-                body=c.encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type","application/xml")
-                self.send_header("Content-Length",str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-            else:send_json(self,{"error":"not found"},404)
+            backup_db()
+            send_json(self, {"ok": True, "message": "Backup created and "
+                                                    "sealed"})
         else:
-            send_html(self,page_404(),404)
+            send_json(self, {"error": "not_found",
+                             "routes": ["/tip", "/health", "/verify-chain",
+                                        "/stats", "/peers", "/snapshots",
+                                        "/backup (keyed)",
+                                        "POST /govern (keyed)",
+                                        "POST /witness/observe"]}, 404)
 
     def do_POST(self):
-        parsed=urlparse(self.path)
-        path=parsed.path.rstrip("/")
-        track_request()
-        maybe_prune()
-        if is_over() and path not in("/api/govern","/govern"):
-            n=int(self.headers.get("Content-Length",0) or 0)
-            if n:self.rfile.read(n)
-            send_json(self,{"error":"server_busy"},503);return
+        path = urlparse(self.path).path.rstrip("/")
+        data = read_body(self)
 
-        if path=="/stripe-webhook":
-            length=int(self.headers.get("Content-Length",0) or 0)
-            raw=self.rfile.read(length) if length else b""
-            sig=self.headers.get("Stripe-Signature","")
-            if not verify_stripe_signature(raw,sig):
-                print("WEBHOOK REJECTED: bad or missing signature",flush=True)
-                send_json(self,{"error":"invalid_signature"},400);return
+        if path in ("/witness/observe", "/api/witness/observe"):
+            # Open by design. A witnessing endpoint that needs an account
+            # is a customer list, not a witness network.
+            ok, ec = check_rate("witness:" + str(self.client_address[0]))
+            if not ok:
+                send_json(self, {"error": ec}, 429)
+                return
             try:
-                event=json.loads(raw)
-                etype=event.get("type","")
-                obj=event.get("data",{}).get("object",{})
-                if etype in("checkout.session.completed","invoice.paid"):
-                    email=obj.get("customer_email") or obj.get("customer_details",{}).get("email","")
-                    sub_id=str(obj.get("subscription") or "")
-                    cust_id=str(obj.get("customer") or "")
-                    if email:
-                        email=email.strip().lower()
-                        with _db_lock:
-                            _conn.execute("UPDATE api_keys SET is_paid=1,plan_type='paid' WHERE email=?",(email,))
-                            if sub_id:_conn.execute("UPDATE api_keys SET stripe_sub=? WHERE email=? AND stripe_sub=''",(sub_id,email))
-                            if cust_id:_conn.execute("UPDATE api_keys SET stripe_customer=? WHERE email=? AND stripe_customer=''",(cust_id,email))
-                            _conn.commit()
-                        print("PAID:"+email+(" sub:"+sub_id[:14] if sub_id else ""),flush=True)
-                elif etype in("customer.subscription.deleted","invoice.payment_failed"):
-                    email=(obj.get("customer_email") or "").strip().lower()
-                    sub_id=str(obj.get("id") if etype=="customer.subscription.deleted" else obj.get("subscription") or "")
-                    with _db_lock:
-                        if email:
-                            _conn.execute("UPDATE api_keys SET is_paid=0,plan_type='free' WHERE email=?",(email,))
-                        elif sub_id:
-                            _conn.execute("UPDATE api_keys SET is_paid=0,plan_type='free' WHERE stripe_sub=?",(sub_id,))
-                        _conn.commit()
-                    print("UNPAID:"+(email or sub_id),flush=True)
-                send_json(self,{"ok":True})
-            except Exception as e:print("Webhook:"+str(e),flush=True);send_json(self,{"ok":True})
-            return
-
-        data=read_body(self)
-
-        if path=="/api/signal-pack/create":
-            api_key=get_bearer(self)
-            if not api_key:send_json(self,{"error":"api_key_required"},401);return
-            ki=get_key(api_key)
-            if not ki:send_json(self,{"error":"invalid_api_key"},401);return
-            pack,err=create_signal_pack(api_key,data.get("name",""),data.get("signals",{}))
-            if err:send_json(self,{"error":err},400);return
-            send_json(self,{"ok":True,"pack":pack,"note":"This pack definition is now sealed in the audit chain. Every decision that uses it records which pack and version governed it - provenance on your risk assumptions."})
-            return
-        elif path=="/api/signal-pack/list":
-            api_key=get_bearer(self)
-            if not api_key:send_json(self,{"error":"api_key_required"},401);return
-            ki=get_key(api_key)
-            if not ki:send_json(self,{"error":"invalid_api_key"},401);return
-            send_json(self,{"packs":list_signal_packs(api_key)})
-            return
-        elif path=="/api/signal-pack/publish":
-            api_key=get_bearer(self)
-            if not api_key:send_json(self,{"error":"api_key_required"},401);return
-            ki=get_key(api_key)
-            if not ki:send_json(self,{"error":"invalid_api_key"},401);return
-            res,err=publish_signal_pack(api_key,str(data.get("name","")),data.get("author",""))
-            if err:send_json(self,{"error":err},400);return
-            send_json(self,{"ok":True,"published":res,"note":"Your pack is now in the public library, marked community-contributed and unverified. Others can load it as a starting point. You can unpublish any time."})
-            return
-        elif path=="/api/signal-pack/unpublish":
-            api_key=get_bearer(self)
-            if not api_key:send_json(self,{"error":"api_key_required"},401);return
-            unpublish_signal_pack(api_key,str(data.get("name","")))
-            send_json(self,{"ok":True})
-            return
-        elif path=="/api/signal-pack/library":
-            send_json(self,{"library":public_library(),"note":"Community-contributed templates. Unverified. Validate any pack against your own risk assessment before relying on it."})
-            return
-        elif path=="/api/signal-pack/get":
-            api_key=get_bearer(self)
-            if not api_key:send_json(self,{"error":"api_key_required"},401);return
-            ki=get_key(api_key)
-            if not ki:send_json(self,{"error":"invalid_api_key"},401);return
-            pk=get_signal_pack(api_key,str(data.get("name","")),data.get("version"))
-            if not pk:send_json(self,{"error":"pack_not_found"},404);return
-            send_json(self,{"pack":pk})
-            return
-        if path in("/api/govern","/govern"):
-            api_key=get_bearer(self)
-            if not api_key:
-                send_json(self,{"error":"api_key_required","message":"Get a free key at "+HOST+"/#signup"},401);return
-            try:
-                result,status=govern(data,api_key)
-                send_json(self,result,status)
-            except ValueError as e:send_json(self,{"error":str(e)},400)
+                result, status = observe(data)
+                send_json(self, result, status)
             except Exception as e:
-                print("GOVERN ERR:"+repr(e),flush=True)
-                send_json(self,{"error":"internal"},500)
-        elif path=="/api/authority/issue":
-            api_key=get_bearer(self)
-            ki=get_key(api_key) if api_key else None
-            if not ki:send_json(self,{"error":"api_key_required"},401);return
-            uid=str(data.get("user_id","")).strip()
-            role=str(data.get("role","approver")).strip()[:60]
-            max_amount=float(data.get("max_amount",0) or 0)
-            ttl=int(data.get("ttl_hours",24) or 24)*3600
-            if not uid:send_json(self,{"error":"user_id required"},400);return
-            tok=make_authority_token(uid,role,max_amount,ttl)
-            ts=time.time()
-            ev={"user_id":uid,"action":"authority_granted","amount":max_amount,"country":"UK","device_id":"authority_issuer","anomaly":0,"device_risk":0,"role":role,"ttl_hours":ttl//3600}
-            res={"decision":"NOTARISED","score":0,"version":VERSION,"timestamp":ts,"note":"delegated authority issued and sealed; token itself never stored"}
-            h,idx,_=seal(ev,res,ts,api_key)
-            send_json(self,{"authority_token":tok,"role":role,"max_amount":max_amount,"expires_in_hours":ttl//3600,"seal":h,"block_index":idx,
-                "usage":"include as authority_token in govern events for this user_id"})
-        elif path=="/api/identity/kyc-seal":
-            api_key=get_bearer(self)
-            ki=get_key(api_key) if api_key else None
-            if not ki:send_json(self,{"error":"api_key_required"},401);return
-            uid=str(data.get("user_id","")).strip()
-            provider=str(data.get("provider","")).strip()[:60]
-            verified=bool(data.get("verified"))
-            reference=str(data.get("reference","")).strip()
-            if not uid or not provider or not reference:
-                send_json(self,{"error":"user_id, provider and reference required"},400);return
-            ref_fp=hashlib.sha256(reference.encode()).hexdigest()
-            ts=time.time()
-            ev={"user_id":uid,"action":"kyc_result_sealed","amount":0,"country":str(data.get("country","UK")).upper()[:2],"device_id":"kyc_"+ref_fp[:12],"anomaly":0,"device_risk":0,"provider":provider,"reference_fp":ref_fp,"verified":verified}
-            res={"decision":"NOTARISED","score":0,"version":VERSION,"timestamp":ts,"note":"KYC outcome sealed; only the SHA-256 of the provider reference is stored - never the document or raw reference"}
-            h,idx,_=seal(ev,res,ts,api_key)
-            send_json(self,{"sealed":True,"verified":verified,"provider":provider,"reference_fp":ref_fp,"seal":h,"block_index":idx,"sealed_at":ts})
-        elif path in("/signup","/api/keys"):
-            email=str(data.get("email","")).strip().lower()
-            phone=str(data.get("phone","")).strip()
-            name=str(data.get("name","")).strip()
-            org=str(data.get("org","")).strip()
-            org_type=str(data.get("org_type","")).strip()
-            product=str(data.get("product","aileash")).strip().lower()
-            devices=to_int(data.get("devices",1))
-            ref_code_used=str(data.get("ref_code","")).strip().upper()
-            if product not in("aileash","sonicboom","sentinel","guardian","tokensaver"):product="aileash"
-            guide_product=product
-            if product=="guardian":product="aileash"
-            key,err=create_key(email,phone,name,org,org_type,product,devices)
-            if err:
-                msgs={"invalid_email":"Please enter a valid email address.","email_exists":"A key already exists for this email."}
-                send_json(self,{"error":msgs.get(err,err)},400);return
-            monthly=round(devices*0.50,2)
-            if ref_code_used:
-                threading.Thread(target=credit_referral,args=(ref_code_used,devices),daemon=True).start()
-            new_ref_code=create_referral(key,email,name)
-            threading.Thread(target=send_referral_welcome,args=(name,email,key,new_ref_code,product,monthly),daemon=True).start()
-            threading.Thread(target=send_install_guide,args=(name,email,key,guide_product),daemon=True).start()
-            signup_msg="Free for "+str(TRIAL_DAYS)+" days - full engine, no card. After the trial: 50p per unique device per month via Stripe, metered on real usage. Your installation guide is on its way to your inbox."
-            bid=badge_id_for_key(key)
-            send_json(self,{"api_key":key,"email":email,"product":product,"devices":devices,"monthly":monthly,"trial_days":TRIAL_DAYS,"ref_code":new_ref_code,"badge_id":bid,"badge_url":HOST+"/api/badge/shield?badge="+bid,"endpoint":HOST+"/api/govern","message":signup_msg})
-        elif path.startswith("/x/"):
-            from modules import router as _r
-            p,s=_r.route(self,path,data)
-            send_json(self,p,s)
-        elif path=="/contact":
-            name=str(data.get("name","")).strip()
-            email=str(data.get("email","")).strip().lower()
-            phone=str(data.get("phone","")).strip()
-            org=str(data.get("org","")).strip()
-            msg=str(data.get("message","")).strip()
-            if not email or "@" not in email:send_json(self,{"error":"invalid_email"},400);return
-            if not msg:send_json(self,{"error":"no_message"},400);return
-            with _db_lock:
-                _conn.execute("INSERT INTO contact_log(ts,name,email,phone,org,message) VALUES(?,?,?,?,?,?)",(time.time(),name,email,phone,org,msg))
-                _conn.commit()
-            threading.Thread(target=contact_email,args=(name,email,phone,org,msg),daemon=True).start()
-            send_json(self,{"ok":True})
-        elif path=="/create-checkout":
-            email=str(data.get("email","")).strip().lower()
-            product=str(data.get("product","aileash")).strip().lower()
-            devices=to_int(data.get("devices",1))
-            if not email or "@" not in email:send_json(self,{"error":"invalid_email"},400);return
-            if not STRIPE_SECRET:send_json(self,{"error":"stripe_not_configured"},503);return
-            pid=get_stripe_price(product)
-            if not pid:setup_stripe();pid=get_stripe_price(product)
-            if not pid:send_json(self,{"error":"stripe_setup_failed"},503);return
-            session=stripe_call("POST","/checkout/sessions",{
-                "mode":"subscription",
-                "customer_email":email,
-                "success_url":HOST+"/?success=true",
-                "cancel_url":HOST+"/?cancel=true",
-                "line_items[0][price]":pid,
-                "line_items[0][quantity]":str(devices)
-            })
-            if not session or "url" not in session:send_json(self,{"error":"checkout_failed"},500);return
-            send_json(self,{"checkout_url":session["url"]})
-        elif path=="/api/validate-engine":
-            api_key=get_bearer(self)
-            if not api_key:send_json(self,{"valid":False,"error":"no_key"},401);return
-            ki=get_key(api_key)
-            if not ki:send_json(self,{"valid":False,"error":"invalid_api_key"},401);return
-            email,used,active,is_paid,quota,plan,product,created=ki
-            if not active:send_json(self,{"valid":False,"error":"account_inactive"},403);return
-            in_trial,days_left=trial_state(created,is_paid)
-            if not in_trial:
-                send_json(self,{"valid":False,"error":"trial_expired",
-                    "message":"Your "+str(TRIAL_DAYS)+"-day free trial has ended. Pay to continue exactly where you left off.",
-                    "billable_devices":device_count(api_key),
-                    "checkout_url":trial_checkout(api_key,email,product)},402);return
-            with _db_lock:devices=_conn.execute("SELECT devices FROM api_keys WHERE key=?",(api_key,)).fetchone()
-            send_json(self,{"valid":True,"plan":plan,"product":product,"devices":devices[0] if devices else 1,"email":email,"trial_days_left":days_left})
-        elif path=="/api/payment/seal":
-            fp=str(data.get("fingerprint","")).strip().lower()
-            if len(fp)!=64 or not all(c in "0123456789abcdef" for c in fp):
-                send_json(self,{"sealed":False,"error":"valid sha-256 fingerprint required"},400);return
-            with _db_lock:
-                dup=_conn.execute("SELECT ts,seal,block_index FROM payment_registry WHERE fp=?",(fp,)).fetchone()
-            if dup:
-                send_json(self,{"sealed":True,"seal":dup[1],"block_index":dup[2],"sealed_at":dup[0],"code":fp[:12],"already_registered":True});return
-            p=data.get("display",{})
-            display=""
-            if isinstance(p,dict):
-                safe={k:str(p.get(k,""))[:120] for k in ("business","sort_masked","account_masked") if p.get(k)}
-                display=json.dumps(safe)
-            ts=time.time()
-            ev={"user_id":"payment_notary","action":"payment_details_sealed","amount":0,"country":"UK","device_id":"paynotary_"+fp[:12],"anomaly":0,"device_risk":0,"payment_fp":fp}
-            res={"decision":"NOTARISED","score":0,"version":VERSION,"timestamp":ts,"note":"payment details fingerprint sealed; full details never stored - only masked display fields"}
-            h,idx,_=seal(ev,res,ts)
-            with _db_lock:
-                _conn.execute("INSERT OR IGNORE INTO payment_registry(fp,ts,seal,block_index,display_json) VALUES(?,?,?,?,?)",(fp,ts,h,idx,display))
-                _conn.commit()
-            send_json(self,{"sealed":True,"seal":h,"block_index":idx,"sealed_at":ts,"code":fp[:12]})
-        elif path=="/api/identity/seal":
-            fp=str(data.get("fingerprint","")).strip().lower()
-            if len(fp)!=64 or not all(c in "0123456789abcdef" for c in fp):
-                send_json(self,{"sealed":False,"error":"valid sha-256 fingerprint required"},400);return
-            with _db_lock:
-                dup=_conn.execute("SELECT ts,seal,block_index FROM identity_registry WHERE fp=?",(fp,)).fetchone()
-            if dup:
-                send_json(self,{"sealed":True,"seal":dup[1],"block_index":dup[2],"sealed_at":dup[0],"already_registered":True});return
-            is_public=1 if data.get("public") else 0
-            profile=""
-            if is_public:
-                p=data.get("profile",{})
-                if isinstance(p,dict):
-                    safe={k:str(p.get(k,""))[:300] for k in ("name","title","bio","linkedin","facebook","org") if p.get(k)}
-                    profile=json.dumps(safe)
-            ts=time.time()
-            ev={"user_id":"identity_notary","action":"identity_sealed","amount":0,"country":"UK","device_id":"identity_"+fp[:12],"anomaly":0,"device_risk":0,"identity_fp":fp}
-            res={"decision":"NOTARISED","score":0,"version":VERSION,"timestamp":ts,"note":"identity fingerprint sealed; raw identity stored only if user opted to publish"}
-            h,idx,_=seal(ev,res,ts)
-            with _db_lock:
-                _conn.execute("INSERT OR IGNORE INTO identity_registry(fp,ts,seal,block_index,public,profile_json) VALUES(?,?,?,?,?,?)",(fp,ts,h,idx,is_public,profile))
-                _conn.commit()
-            send_json(self,{"sealed":True,"seal":h,"block_index":idx,"sealed_at":ts,"code":fp[:12]})
-        elif path=="/api/post/seal":
-            fp=str(data.get("fingerprint","")).strip().lower()
-            if len(fp)!=64 or not all(c in "0123456789abcdef" for c in fp):
-                send_json(self,{"sealed":False,"error":"valid sha-256 fingerprint required"},400);return
-            with _db_lock:
-                dup=_conn.execute("SELECT ts,seal,block_index FROM post_registry WHERE fp=?",(fp,)).fetchone()
-            if dup:
-                send_json(self,{"sealed":True,"seal":dup[1],"block_index":dup[2],"sealed_at":dup[0],"code":fp[:12],"already_registered":True});return
-            ts=time.time()
-            ev={"user_id":"post_notary","action":"post_sealed","amount":0,"country":"UK","device_id":"post_"+fp[:12],"anomaly":0,"device_risk":0,"post_fp":fp}
-            res={"decision":"NOTARISED","score":0,"version":VERSION,"timestamp":ts,"note":"post content fingerprint sealed; content itself never stored"}
-            h,idx,_=seal(ev,res,ts)
-            with _db_lock:
-                _conn.execute("INSERT OR IGNORE INTO post_registry(fp,ts,seal,block_index) VALUES(?,?,?,?)",(fp,ts,h,idx))
-                _conn.commit()
-            send_json(self,{"sealed":True,"seal":h,"block_index":idx,"sealed_at":ts,"code":fp[:12]})
-        elif path=="/report-threat":
-            ref="AIDX-"+hashlib.sha256(json.dumps(data,sort_keys=True).encode()).hexdigest()[:12].upper()
-            with _db_lock:
-                _conn.execute("INSERT INTO threat_log(ts,ref,data_json) VALUES(?,?,?)",(time.time(),ref,json.dumps(data)))
-                _conn.commit()
-            html="<html><body style='font-family:Arial,sans-serif;padding:20px'><h2 style='color:#cc0000'>THREAT REPORT: "+ref+"</h2><pre style='background:#f5f5f5;padding:16px;border-radius:4px'>"+esc(json.dumps(data,indent=2))+"</pre></body></html>"
-            threading.Thread(target=send_email,args=(OWNER_EMAIL,OWNER_NAME,"THREAT REPORT: "+ref,html),daemon=True).start()
-            send_json(self,{"ok":True,"reference":ref})
-        elif path=="/waitlist":
-            email=str(data.get("email","")).strip().lower()
-            product=str(data.get("product","")).strip()
-            name=str(data.get("name","")).strip()
-            if not email or "@" not in email:send_json(self,{"error":"invalid_email"},400);return
-            with _db_lock:
-                _conn.execute("INSERT INTO waitlist(ts,email,product,name) VALUES(?,?,?,?)",(time.time(),email,product,name))
-                _conn.commit()
-            send_json(self,{"ok":True,"message":"You are on the waitlist. We will be in touch."})
-        elif path=="/api/guardian/pair":
-            email=str(data.get("parent_email","")).strip().lower()[:120]
-            if not email or "@" not in email:send_json(self,{"error":"parent_email required"},400);return
-            nm=str(data.get("child_name","")).strip()[:40]
-            if not nm:send_json(self,{"error":"child_name required"},400);return
-            with _db_lock:
-                n=_conn.execute("SELECT COUNT(*) FROM guardian_family WHERE parent_key=?",(email,)).fetchone()[0]
-            if n>=10:send_json(self,{"error":"max 10 children per account"},400);return
-            pc=gen_pair_code(nm)
-            with _db_lock:
-                _conn.execute("INSERT INTO guardian_family(pair_code,parent_key,child_name,created,last_checkin) VALUES(?,?,?,?,0)",(pc,email,nm,now()))
-                _conn.commit()
-            send_json(self,{"ok":True,"pair_code":pc,"child_name":nm,
-                "child_url":HOST+"/guardian-child?code="+pc,
-                "note":"Open the child link on the child's phone and add it to their home screen. Everything the child shares or flags will appear in your report, sealed and provable."})
-        elif path=="/api/guardian/checkin":
-            pc=str(data.get("code","")).strip()
-            with _db_lock:
-                fam=_conn.execute("SELECT child_name FROM guardian_family WHERE pair_code=?",(pc,)).fetchone()
-            if not fam:send_json(self,{"error":"unknown_code"},404);return
-            lat=data.get("lat");lon=data.get("lon")
-            try:lat=float(lat) if lat is not None else None
-            except:lat=None
-            try:lon=float(lon) if lon is not None else None
-            except:lon=None
-            h=guardian_seal(pc,"checkin",lat,lon,"",None)
-            send_json(self,{"ok":True,"sealed":h[:16]})
-        elif path=="/api/guardian/panic":
-            pc=str(data.get("code","")).strip()
-            with _db_lock:
-                fam=_conn.execute("SELECT parent_key,child_name FROM guardian_family WHERE pair_code=?",(pc,)).fetchone()
-            if not fam:send_json(self,{"error":"unknown_code"},404);return
-            lat=data.get("lat");lon=data.get("lon")
-            try:lat=float(lat) if lat is not None else None
-            except:lat=None
-            try:lon=float(lon) if lon is not None else None
-            except:lon=None
-            h=guardian_seal(pc,"panic",lat,lon,"child requested help",None)
-            pk=get_key(fam[0])
-            if pk:
-                try:send_email(pk[0],pk[2] if len(pk)>2 else "",
-                    "GUARDIAN ALERT: "+fam[1]+" tapped Help",
-                    "<p><b>"+esc(fam[1])+"</b> tapped the Help button in Guardian at "+time.strftime("%H:%M on %d %b")+".</p>"+
-                    ("<p>Location shared: <a href='https://maps.google.com/?q="+str(lat)+","+str(lon)+"'>view on map</a></p>" if lat and lon else "<p>No location was shared.</p>")+
-                    "<p>This event is sealed in the audit chain ("+h[:16]+").</p><p>Check on them now. In an emergency call 999.</p>")
-                except Exception as e:print("GUARDIAN EMAIL ERR:"+str(e),flush=True)
-            send_json(self,{"ok":True,"sealed":h[:16],"help":{"childline":"0800 1111","emergency":"999","ceop":"https://www.ceop.police.uk/safety-centre/"}})
-        elif path=="/api/guardian/flag":
-            pc=str(data.get("code","")).strip()
-            msg=str(data.get("message",""))[:2000]
-            with _db_lock:
-                fam=_conn.execute("SELECT parent_key,child_name FROM guardian_family WHERE pair_code=?",(pc,)).fetchone()
-            if not fam:send_json(self,{"error":"unknown_code"},404);return
-            verdict=guardian_check(msg)
-            fp=hashlib.sha256(msg.encode()).hexdigest()[:16] if msg else None
-            note=verdict["result"]+((":"+",".join(verdict["categories"])) if verdict.get("categories") else "")
-            h=guardian_seal(pc,"flag",None,None,note,fp)
-            if verdict["result"]=="FLAGGED":
-                pk=get_key(fam[0])
-                if pk:
-                    try:send_email(pk[0],pk[2] if len(pk)>2 else "",
-                        "Guardian flagged a message for "+fam[1],
-                        "<p>Guardian flagged a message "+esc(fam[1])+" checked, matching: <b>"+esc(", ".join(verdict["categories"]))+"</b>.</p>"+
-                        "<p>The message text is not stored - only a fingerprint. Talk to your child. CEOP and Childline can help.</p>"+
-                        "<p>Sealed in the audit chain ("+h[:16]+").</p>")
-                    except Exception as e:print("GUARDIAN EMAIL ERR:"+str(e),flush=True)
-            send_json(self,{"result":verdict["result"],"categories":verdict.get("categories",[]),"advice":verdict["advice"],"sealed":h[:16],
-                "help":{"childline":"0800 1111","emergency":"999","ceop":"https://www.ceop.police.uk/safety-centre/"}})
-        elif path=="/api/challenge/resolve":
-            tok=str(data.get("token","")).strip()
-            p,err=read_challenge_token(tok)
-            if not p:send_json(self,{"resolved":False,"error":err or "invalid_token"},400);return
-            prior=challenge_resolved(p)
-            if prior:send_json(self,{"resolved":True,"sealed":prior[0],"note":"already resolved"});return
-            uid=challenge_marker(p)
-            ev={"user_id":uid,"action":"challenge_resolved","amount":0,"country":"UK","device_id":"hosted_verify","anomaly":0,"device_risk":0,"original_user":p["u"],"original_block":p["h"]}
-            res={"decision":"ALLOW","score":0,"reasons":["human_verified"],"version":VERSION,"timestamp":time.time()}
-            h2,_,_=seal(ev,res,res["timestamp"])
-            st=load_user(p["u"])
-            save_user(p["u"],clamp(st["trust"]+(1-st["trust"])*0.05,0.05,1.0),st["last_country"])
-            send_json(self,{"resolved":True,"sealed":h2})
-        elif path=="/admin/auth":
-            if not ADMIN_PASSWORD:
-                send_json(self,{"error":"admin_disabled"},503);return
-            if not admin_login_allowed():
-                send_json(self,{"error":"too_many_attempts"},429);return
-            pw=str(data.get("password","")).strip()
-            if pw and hmac.compare_digest(pw,ADMIN_PASSWORD):
-                tok=secrets.token_hex(32)
-                with _admin_lock:_admin_tokens[tok]=time.time()+ADMIN_TOKEN_TTL
-                send_json(self,{"token":tok,"expires_in":ADMIN_TOKEN_TTL})
-            else:
-                admin_login_failed()
-                send_json(self,{"error":"invalid_password"},401)
-        elif path=="/api/generate-airgap-token":
-            auth=get_bearer(self)
-            ki=get_key(auth) if auth else None
-            if not ki:send_json(self,{"error":"invalid_api_key"},401);return
-            email,used,active,is_paid,quota,plan,product,created=ki
-            if not is_paid:send_json(self,{"error":"paid_plan_required"},403);return
-            with _db_lock:
-                devices=_conn.execute("SELECT devices FROM api_keys WHERE key=?",(auth,)).fetchone()
-            secret=os.environ.get("LICENCE_SECRET","").encode()
-            if not secret:send_json(self,{"error":"licence_secret_not_configured"},503);return
-            issued=int(time.time())
-            expires=issued+(365*86400)
-            payload=json.dumps({"v":"1","key":auth,"devices":devices[0] if devices else 1,"plan":plan,"email":email,"issued":issued,"expires":expires},sort_keys=True,separators=(',',':'))
-            sig=hmac.new(secret,payload.encode(),hashlib.sha256).hexdigest()
-            token_data=json.dumps({"payload":payload,"sig":sig},separators=(',',':'))
-            token=base64.urlsafe_b64encode(token_data.encode()).decode()
-            send_json(self,{"token":token,"expires":expires,"days":365})
-        elif path=="/admin/forgot":
-            email=str(data.get("email","")).strip().lower()
-            if email==OWNER_EMAIL.lower():
-                html=("<html><body style='font-family:Arial,sans-serif;padding:20px'>"
-                    "<h2 style='color:#c9a84c'>AILeash Admin Password Reset</h2>"
-                    "<p>Your admin password is set via the ADMIN_PASSWORD environment variable on Railway.</p>"
-                    "<p>To reset: Railway dashboard &rarr; Variables &rarr; update ADMIN_PASSWORD.</p>"
-                    "</body></html>")
-                threading.Thread(target=send_email,args=(OWNER_EMAIL,OWNER_NAME,"AILeash Admin Password Reset",html),daemon=True).start()
-            send_json(self,{"ok":True})
-        elif path=="/admin/stats":
-            if not check_admin(self):send_json(self,{"error":"unauthorized"},401);return
-            with _db_lock:
-                total=_conn.execute("SELECT COUNT(*) FROM api_keys").fetchone()[0]
-                paid=_conn.execute("SELECT COUNT(*) FROM api_keys WHERE is_paid=1").fetchone()[0]
-                blocks=_conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0]
-            chain=verify_chain()
-            send_json(self,{"total_keys":total,"paid_keys":paid,"audit_blocks":blocks,"chain_valid":chain["valid"]})
-        elif path=="/admin/keys":
-            if not check_admin(self):send_json(self,{"error":"unauthorized"},401);return
-            want=["key","email","name","org","product","devices","actions_used","free_quota","is_paid","plan_type","created"]
-            with _db_lock:
-                have=set(row[1] for row in _conn.execute("PRAGMA table_info(api_keys)").fetchall())
-                cols=[c for c in want if c in have]
-                rows=_conn.execute("SELECT "+",".join(cols)+" FROM api_keys ORDER BY created DESC").fetchall()
-            keys=[dict(zip(cols,r)) for r in rows]
-            send_json(self,{"keys":keys})
-        elif path=="/admin/referrals":
-            if not check_admin(self):send_json(self,{"error":"unauthorized"},401);return
-            with _db_lock:
-                rows=_conn.execute("SELECT code,referrer_email,referrer_name,devices_referred,earnings_pence,created FROM referrals ORDER BY created DESC").fetchall()
-            refs=[{"code":r[0],"referrer_email":r[1],"referrer_name":r[2],"devices_referred":r[3],"earnings_pence":r[4],"created":r[5]} for r in rows]
-            send_json(self,{"referrals":refs})
-        elif path=="/admin/audit":
-            if not check_admin(self):send_json(self,{"error":"unauthorized"},401);return
-            limit=int(data.get("limit",200)) if isinstance(data,dict) else 200
-            if limit>1000:limit=1000
-            filt_key=str(data.get("api_key","")).strip() if isinstance(data,dict) else ""
-            with _db_lock:
-                cols=set(r[1] for r in _conn.execute("PRAGMA table_info(audit_log)").fetchall())
-                has_key="api_key" in cols
-                if filt_key and has_key:
-                    rows=_conn.execute("SELECT id,ts,user_id,event_json,result_json,prev_hash,audit_hash FROM audit_log WHERE api_key=? ORDER BY id DESC LIMIT ?",(filt_key,limit)).fetchall()
-                else:
-                    rows=_conn.execute("SELECT id,ts,user_id,event_json,result_json,prev_hash,audit_hash FROM audit_log ORDER BY id DESC LIMIT ?",(limit,)).fetchall()
-            recs=[]
-            for r in rows:
-                try:res=json.loads(r[4]) if r[4] else {}
-                except:res={}
-                recs.append({"seq":r[0],"ts":r[1],"user_id":r[2],
-                    "decision":res.get("decision",res.get("result","")),
-                    "score":res.get("score",""),
-                    "reasons":res.get("reasons",[]),
-                    "prev_hash":r[5],"audit_hash":r[6]})
-            chain=verify_chain()
-            send_json(self,{"records":recs,"count":len(recs),"chain_valid":chain.get("valid"),"chain_blocks":chain.get("blocks"),"chain_tip":chain.get("tip")})
-        elif path=="/admin/contacts":
-            if not check_admin(self):send_json(self,{"error":"unauthorized"},401);return
-            with _db_lock:
-                rows=_conn.execute("SELECT ts,name,email,phone,org,message FROM contact_log ORDER BY ts DESC").fetchall()
-            contacts=[{"ts":r[0],"name":r[1],"email":r[2],"phone":r[3],"org":r[4],"message":r[5]} for r in rows]
-            send_json(self,{"contacts":contacts})
-        else:
-            send_json(self,{"error":"not_found"},404)
+                send_json(self, {"error": "internal", "detail": str(e)}, 500)
+            return
 
-# ============================================================
-# STRIPE QUANTITY SYNC - keeps billing matched to real devices
-# Every 6 hours: for each paid key, compare live unique device
-# count to the Stripe subscription quantity. If devices grew,
-# raise the quantity so billing follows the meter. Never lowers
-# quantity automatically - lower it manually in Stripe if a
-# client genuinely shrinks.
-# ============================================================
-SYNC_INTERVAL=6*3600
+        if path in ("/govern", "/api/govern"):
+            # v1.1 allowed a missing bearer through. It does not now.
+            bearer = get_bearer(self)
+            if not bearer or bearer != _licence["key"]:
+                send_json(self, {"error": "invalid_api_key",
+                                 "message": "Send your licence key as "
+                                            "Authorization: Bearer <key>."},
+                          401)
+                return
+            ok, ec = check_rate(bearer)
+            if not ok:
+                send_json(self, {"error": ec}, 429)
+                return
+            try:
+                result, status = govern(data)
+                send_json(self, result, status)
+            except ValueError as e:
+                send_json(self, {"error": str(e)}, 400)
+            except Exception as e:
+                send_json(self, {"error": "internal", "detail": str(e)}, 500)
+            return
 
-def sync_stripe_quantities():
-    if not STRIPE_SECRET:
-        print("QSYNC skip: no STRIPE_SECRET",flush=True);return
-    with _db_lock:
-        rows=_conn.execute("SELECT key,email,stripe_sub FROM api_keys WHERE is_paid=1 AND active=1 AND stripe_sub!=''").fetchall()
-    for key,email,sub_id in rows:
+        send_json(self, {"error": "not_found"}, 404)
+
+
+class ThreadedServer(ThreadingMixIn, HTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+# ==============================================================================
+# ENTRY POINT
+# ==============================================================================
+
+def main():
+    p = argparse.ArgumentParser(
+        description="Sebdog Engine - local compliance engine, no phone home")
+    p.add_argument("--token", help="Your licence token from sebbi.pro")
+    p.add_argument("--token-file", help="File containing the licence token")
+    p.add_argument("--pubkey", help="Licence public key hex (overrides the "
+                                    "built-in one; for testing)")
+    p.add_argument("--port", type=int, default=9090)
+    p.add_argument("--db", default="sebdog_audit.db")
+    p.add_argument("--chain", default=None,
+                   help="Chain name other operators record you as")
+    p.add_argument("--backup-on-start", action="store_true")
+    args = p.parse_args()
+
+    global DB_FILE, CHAIN_NAME
+    DB_FILE = args.db
+    if args.chain:
+        CHAIN_NAME = args.chain.strip().lower()
+
+    token = args.token
+    if not token and args.token_file:
         try:
-            n=device_count(key)
-            if not n:continue
-            sub=stripe_call("GET","/subscriptions/"+sub_id)
-            if not sub or "items" not in sub:
-                print("QSYNC no sub for "+email,flush=True);continue
-            items=sub["items"].get("data",[])
-            if not items:continue
-            item=items[0]
-            current=int(item.get("quantity",0) or 0)
-            if n>current:
-                r=stripe_call("POST","/subscription_items/"+item["id"],
-                    {"quantity":str(n),"proration_behavior":"none"})
-                if r and "id" in r:
-                    print("QSYNC "+email+": "+str(current)+" -> "+str(n)+" devices",flush=True)
-                else:
-                    print("QSYNC FAIL "+email,flush=True)
+            with open(args.token_file, "r", encoding="utf-8") as f:
+                token = f.read().strip()
         except Exception as e:
-            print("QSYNC ERR "+email+": "+str(e),flush=True)
+            print("[SEBDOG] Could not read token file: %s" % e, flush=True)
+            sys.exit(1)
+    if not token:
+        token = os.environ.get("SEBDOG_TOKEN", "").strip()
+    if not token:
+        print("[SEBDOG] No licence token. Pass --token, --token-file, or "
+              "set SEBDOG_TOKEN.", flush=True)
+        sys.exit(1)
 
-def _qsync_loop():
-    time.sleep(120)
-    while True:
-        try:sync_stripe_quantities()
-        except Exception as e:print("QSYNC LOOP ERR:"+str(e),flush=True)
-        time.sleep(SYNC_INTERVAL)
+    print("[SEBDOG] Sebdog Engine v%s starting..." % VERSION, flush=True)
 
-if __name__=="__main__":
-    print("AILeash Platform v"+VERSION+" starting on :"+str(PORT),flush=True)
-    seal_regmap_if_changed()
-    setup_stripe()
+    if not os.path.exists(DB_FILE):
+        print("[SEBDOG] Database not found. Checking for backups...",
+              flush=True)
+        if not restore_latest_backup():
+            print("[SEBDOG] No backup found. Starting a fresh chain.",
+                  flush=True)
+
+    init_db()
+
+    print("[SEBDOG] Validating licence locally. No network call is made.",
+          flush=True)
+    if not load_licence(token, args.pubkey):
+        print("[SEBDOG] Licence validation failed. Get a token at %s" % HOME,
+              flush=True)
+        sys.exit(1)
+
+    if licence is not None:
+        try:
+            licence.save_licence_locally(DB_FILE, token, {
+                "key": _licence["key"], "devices": _licence["devices"],
+                "plan": _licence["plan"], "email": _licence["email"],
+                "issued": 0, "expires": _licence["expires"]})
+        except Exception:
+            pass
+
+    if args.backup_on_start:
+        backup_db()
+
+    threading.Thread(target=licence_watch, daemon=True).start()
+    threading.Thread(target=backup_loop, daemon=True).start()
+
+    srv = ThreadedServer(("0.0.0.0", args.port), Handler)
+    base = "http://localhost:%d" % args.port
+    print("[SEBDOG] Engine running on port %d" % args.port, flush=True)
+    print("[SEBDOG] POST %s/govern            (needs your key)" % base,
+          flush=True)
+    print("[SEBDOG] GET  %s/tip               (your chain head)" % base,
+          flush=True)
+    print("[SEBDOG] POST %s/witness/observe   (peers seal their head here)"
+          % base, flush=True)
+    print("[SEBDOG] GET  %s/verify-chain      (rewalks every block)" % base,
+          flush=True)
+    print("[SEBDOG] GET  %s/peers             (who you have witnessed)"
+          % base, flush=True)
+    print("[SEBDOG] Backups: ./sebdog_backups/ daily, last 7 kept, sealed",
+          flush=True)
+    print("[SEBDOG] This process makes no outbound connection. Check it "
+          "with tcpdump if you like.", flush=True)
+    print("[SEBDOG] To be witnessed by others, point meshwitness.py at "
+          "this engine:", flush=True)
+    print("[SEBDOG]   MESH_TIP_URL=<your public url>/tip", flush=True)
+    print("[SEBDOG]   MESH_SEAL_URL=<your public url>/witness/observe",
+          flush=True)
+    print("[SEBDOG]   MESH_CHAIN=%s" % CHAIN_NAME, flush=True)
+
     try:
-        from anchor import start_anchoring
-        start_anchoring(chain_tip)
-    except Exception as _e:
-        print("ANCHOR: could not start (" + str(_e) + ") - server continues normally", flush=True)
-    threading.Thread(target=_qsync_loop,daemon=True).start()
-    print("QSYNC thread started - device/billing sync every 6h",flush=True)
-    server=ThreadedServer(("0.0.0.0",PORT),Handler)
-    print("Ready.",flush=True)
-    server.serve_forever()
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("[SEBDOG] Shutting down.", flush=True)
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+
+## `sebdog_licence.py`
+
+500 lines, 18698 bytes
+
+```python
+"""
+SEBDOG LICENCE SYSTEM v2.0.0
+Air-gapped cryptographic licence tokens for the Sebdog Engine.
+Copyright (c) 2026 Justin Antony Dobson / Monop Content, Blyth, UK
+
+WHAT CHANGED IN 2.0, AND WHY IT HAD TO
+--------------------------------------
+Version 1 signed tokens with HMAC-SHA256. HMAC is symmetric: the same
+secret both signs and verifies. So validating a token offline required
+that secret to be present on the customer's hardware - and anyone
+holding it can mint their own token for any device count, any plan, any
+expiry.
+
+Version 1's docstring said the signing secret never leaves sebbi.pro's
+servers. With an offline HMAC check, that could not be true. One of the
+two claims had to give, and it should not be the one about not shipping
+the key.
+
+Version 2 uses Ed25519. The server holds a private seed and signs. The
+customer's copy holds only the PUBLIC key, which verifies signatures and
+cannot produce one. Offline validation and an unshippable signing key
+stop being in conflict, because they are no longer the same key.
+
+    v1  customer holds the minting key   offline validation works
+    v2  customer holds a public key      offline validation works
+
+Everything else is unchanged: 7-day grace, local cache, tamper
+detection, deterministic payload, constant-time comparison where it
+still applies.
+
+NO DEPENDENCY
+-------------
+Ed25519 is implemented here in pure standard library, the same way it
+is in continuity.py and modules/signed.py. Nothing to pip install on a
+customer's air-gapped box, which is the entire point of shipping this
+rather than a library.
+
+SETTING IT UP, ONCE
+-------------------
+    python3 sebdog_licence.py --keygen
+
+Put the private seed in a Railway environment variable as
+SEBDOG_LICENCE_SEED. Paste the public key into LICENCE_PUBKEY below and
+into sebdog_engine.py. The private seed never appears in any file that
+ships.
+
+MIGRATING A v1 TOKEN
+--------------------
+There is no migration and there should not be one. A v1 token was
+verifiable by anyone who had the secret, so any v1 token in the wild
+should be treated as compromised and reissued. validate_token rejects
+v1 tokens by version rather than pretending they are fine.
+"""
+
+import base64
+import hashlib
+import json
+import os
+import sqlite3
+import threading
+import time
+from typing import Dict, Optional, Tuple
+
+TOKEN_VERSION = "2"
+GRACE_SECONDS = 86400 * 7          # 7 days past expiry before a hard block
+AUDIT_DB = "sebdog_audit.db"
+
+# The public half of the signing key. Safe to ship, safe to publish, and
+# useless for producing a token. Overridable by environment for testing.
+LICENCE_PUBKEY = os.environ.get("SEBDOG_LICENCE_PUBKEY", "")
+
+
+# ==============================================================================
+# Ed25519 - RFC 8032, standard library only
+#
+# Extended coordinates for the scalar multiplication so a verify is
+# milliseconds rather than seconds. sign() is here for the server side; a
+# customer's deployment only ever calls verify().
+# ==============================================================================
+
+_P = 2 ** 255 - 19
+_L = 2 ** 252 + 27742317777372353535851937790883648493
+_D = -121665 * pow(121666, _P - 2, _P) % _P
+_I = pow(2, (_P - 1) // 4, _P)
+
+
+def _xrecover(y):
+    xx = (y * y - 1) * pow(_D * y * y + 1, _P - 2, _P)
+    x = pow(xx, (_P + 3) // 8, _P)
+    if (x * x - xx) % _P != 0:
+        x = (x * _I) % _P
+    if x % 2 != 0:
+        x = _P - x
+    return x
+
+
+_BY = 4 * pow(5, _P - 2, _P) % _P
+_BX = _xrecover(_BY)
+_B = (_BX % _P, _BY % _P, 1, _BX * _BY % _P)
+
+
+def _add(p, q):
+    x1, y1, z1, t1 = p
+    x2, y2, z2, t2 = q
+    a = (y1 - x1) * (y2 - x2) % _P
+    b = (y1 + x1) * (y2 + x2) % _P
+    c = t1 * 2 * _D * t2 % _P
+    dd = z1 * 2 * z2 % _P
+    e, f, g, h = b - a, dd - c, dd + c, b + a
+    return (e * f % _P, g * h % _P, f * g % _P, e * h % _P)
+
+
+def _scalarmult(p, e):
+    if e == 0:
+        return (0, 1, 1, 0)
+    q = _scalarmult(p, e >> 1)
+    q = _add(q, q)
+    if e & 1:
+        q = _add(q, p)
+    return q
+
+
+def _encodepoint(p):
+    x, y, z, _t = p
+    zi = pow(z, _P - 2, _P)
+    x = x * zi % _P
+    y = y * zi % _P
+    raw = bytearray(y.to_bytes(32, "little"))
+    raw[31] |= (x & 1) << 7
+    return bytes(raw)
+
+
+def _decodepoint(raw):
+    y = int.from_bytes(raw, "little") & ((1 << 255) - 1)
+    if y >= _P:
+        return None
+    x = _xrecover(y)
+    if x & 1 != (raw[31] >> 7) & 1:
+        x = _P - x
+    if (-x * x + y * y - 1 - _D * x * x * y * y) % _P != 0:
+        return None
+    return (x, y, 1, x * y % _P)
+
+
+def _secret_scalar(seed):
+    h = hashlib.sha512(seed).digest()
+    a = int.from_bytes(h[:32], "little")
+    a &= (1 << 254) - 8
+    a |= 1 << 254
+    return a, h[32:]
+
+
+def public_key(seed: bytes) -> bytes:
+    """The 32-byte public key for a 32-byte private seed."""
+    a, _ = _secret_scalar(seed)
+    return _encodepoint(_scalarmult(_B, a))
+
+
+def sign(seed: bytes, message: bytes) -> bytes:
+    """Server side only. Never called on customer hardware."""
+    a, prefix = _secret_scalar(seed)
+    pk = _encodepoint(_scalarmult(_B, a))
+    r = int.from_bytes(hashlib.sha512(prefix + message).digest(), "little") % _L
+    rp = _encodepoint(_scalarmult(_B, r))
+    k = int.from_bytes(hashlib.sha512(rp + pk + message).digest(), "little") % _L
+    s = (r + k * a) % _L
+    return rp + s.to_bytes(32, "little")
+
+
+def verify(pk: bytes, message: bytes, signature: bytes) -> bool:
+    """True if the signature is valid. Never raises."""
+    try:
+        if len(pk) != 32 or len(signature) != 64:
+            return False
+        a = _decodepoint(pk)
+        if a is None:
+            return False
+        r = _decodepoint(signature[:32])
+        if r is None:
+            return False
+        s = int.from_bytes(signature[32:], "little")
+        if s >= _L:
+            return False
+        k = int.from_bytes(
+            hashlib.sha512(signature[:32] + pk + message).digest(),
+            "little") % _L
+        left = _scalarmult(_B, s)
+        right = _add(r, _scalarmult(a, k))
+        lx, ly, lz, _lt = left
+        rx, ry, rz, _rt = right
+        return ((lx * rz - rx * lz) % _P == 0
+                and (ly * rz - ry * lz) % _P == 0)
+    except Exception:
+        return False
+
+
+def keygen() -> Tuple[str, str]:
+    """(private_seed_hex, public_key_hex). Run once, keep the first secret."""
+    seed = os.urandom(32)
+    return seed.hex(), public_key(seed).hex()
+
+
+# ==============================================================================
+# TOKEN GENERATION - sebbi.pro only
+# ==============================================================================
+
+def generate_token(api_key: str, devices: int, plan: str, email: str,
+                   seed: bytes, validity_days: int = 365) -> str:
+    """
+    Sign an annual licence token.
+
+    seed is the 32-byte Ed25519 private seed, read from the
+    SEBDOG_LICENCE_SEED environment variable on the server. It is never
+    written to a file that ships and never sent to a customer.
+    """
+    if isinstance(seed, str):
+        seed = bytes.fromhex(seed.strip())
+    if len(seed) != 32:
+        raise ValueError("seed must be 32 bytes")
+
+    issued = int(time.time())
+    payload = json.dumps({
+        "v": TOKEN_VERSION,
+        "key": api_key,
+        "devices": devices,
+        "plan": plan,
+        "email": email,
+        "issued": issued,
+        "expires": issued + (validity_days * 86400),
+    }, sort_keys=True, separators=(",", ":"))
+
+    sig = sign(seed, payload.encode("utf-8")).hex()
+    token = json.dumps({"payload": payload, "sig": sig, "alg": "ed25519"},
+                       separators=(",", ":"))
+    return base64.urlsafe_b64encode(token.encode("utf-8")).decode("utf-8")
+
+
+# ==============================================================================
+# TOKEN VALIDATION - customer hardware, no network, public key only
+# ==============================================================================
+
+def validate_token(token: str, pubkey=None) -> Tuple[Optional[Dict],
+                                                     Optional[str]]:
+    """
+    Validate a licence token entirely locally.
+
+    pubkey is the 32-byte public key, as hex or bytes. Defaults to
+    LICENCE_PUBKEY. It cannot be used to produce a token, so shipping it
+    inside the engine costs nothing.
+
+    Returns (licence_data, None) or (None, error_code).
+
+        invalid_format      cannot be decoded
+        no_public_key       nothing configured to verify against
+        invalid_signature   tampered with, or signed by the wrong key
+        version_mismatch    not a v2 token - v1 HMAC tokens land here
+        token_expired       past expiry plus the grace period
+    """
+    if pubkey is None:
+        pubkey = LICENCE_PUBKEY
+    if isinstance(pubkey, str):
+        pubkey = pubkey.strip()
+        if not pubkey:
+            return None, "no_public_key"
+        try:
+            pubkey = bytes.fromhex(pubkey)
+        except ValueError:
+            return None, "no_public_key"
+    if not pubkey or len(pubkey) != 32:
+        return None, "no_public_key"
+
+    try:
+        raw = json.loads(base64.urlsafe_b64decode(token.encode("utf-8")))
+        payload_str = raw.get("payload", "")
+        sig_hex = raw.get("sig", "")
+        if not payload_str or not sig_hex:
+            return None, "invalid_format"
+        sig = bytes.fromhex(sig_hex)
+    except Exception:
+        return None, "invalid_format"
+
+    if not verify(pubkey, payload_str.encode("utf-8"), sig):
+        return None, "invalid_signature"
+
+    try:
+        data = json.loads(payload_str)
+    except Exception:
+        return None, "invalid_format"
+
+    if data.get("v") != TOKEN_VERSION:
+        return None, "version_mismatch"
+
+    if data.get("expires", 0) + GRACE_SECONDS < time.time():
+        return None, "token_expired"
+
+    return data, None
+
+
+def is_in_grace_period(token_data: Dict) -> bool:
+    return token_data.get("expires", 0) < time.time()
+
+
+def days_until_expiry(token_data: Dict) -> int:
+    return int((token_data.get("expires", 0) - time.time()) / 86400)
+
+
+# ==============================================================================
+# LOCAL LICENCE STORE
+# ==============================================================================
+
+_lock = threading.Lock()
+
+
+def save_licence_locally(db_path: str, token: str, licence_data: Dict):
+    with _lock:
+        conn = sqlite3.connect(db_path)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS licence_cache (
+                id INTEGER PRIMARY KEY, token TEXT, api_key TEXT,
+                devices INTEGER, plan TEXT, email TEXT,
+                issued INTEGER, expires INTEGER, cached_at REAL)""")
+        conn.execute("DELETE FROM licence_cache")
+        conn.execute(
+            "INSERT INTO licence_cache(token,api_key,devices,plan,email,"
+            "issued,expires,cached_at) VALUES(?,?,?,?,?,?,?,?)",
+            (token, licence_data.get("key", ""),
+             licence_data.get("devices", 1), licence_data.get("plan", "free"),
+             licence_data.get("email", ""), licence_data.get("issued", 0),
+             licence_data.get("expires", 0), time.time()))
+        conn.commit()
+        conn.close()
+
+
+def load_licence_locally(db_path: str) -> Optional[Tuple[str, Dict]]:
+    """Returns (token, data) or None. The token is re-verified by the caller -
+    a cached row is a convenience, never an authority."""
+    try:
+        with _lock:
+            conn = sqlite3.connect(db_path)
+            row = conn.execute(
+                "SELECT token,api_key,devices,plan,email,issued,expires "
+                "FROM licence_cache LIMIT 1").fetchone()
+            conn.close()
+        if not row:
+            return None
+        return row[0], {"v": TOKEN_VERSION, "key": row[1], "devices": row[2],
+                        "plan": row[3], "email": row[4], "issued": row[5],
+                        "expires": row[6]}
+    except Exception:
+        return None
+
+
+# ==============================================================================
+# STRESS TEST      python3 sebdog_licence.py
+# KEY GENERATION   python3 sebdog_licence.py --keygen
+# ==============================================================================
+
+if __name__ == "__main__":
+    import sys
+
+    if "--keygen" in sys.argv:
+        priv, pub = keygen()
+        print("PRIVATE SEED - server only, never ships, never leaves Railway")
+        print("  SEBDOG_LICENCE_SEED=" + priv)
+        print()
+        print("PUBLIC KEY - paste into LICENCE_PUBKEY here and in the engine")
+        print("  " + pub)
+        print()
+        print("Losing the private seed means no new tokens can be issued and")
+        print("every deployed public key must be replaced. Back it up.")
+        sys.exit(0)
+
+    print("SEBDOG LICENCE SYSTEM v2 - Ed25519 - Stress Test")
+    print("=" * 62)
+
+    SEED = os.urandom(32)
+    PUB = public_key(SEED)
+    TEST_KEY = "al_live_" + os.urandom(12).hex()
+    PASSES = FAILURES = 0
+
+    def check(name, condition, detail=""):
+        global PASSES, FAILURES
+        if condition:
+            print("  PASS  " + name)
+            PASSES += 1
+        else:
+            print("  FAIL  " + name + " " + str(detail))
+            FAILURES += 1
+
+    print("\n[1] Generation and validation")
+    token = generate_token(TEST_KEY, 10000, "paid", "test@example.com", SEED)
+    data, err = validate_token(token, PUB)
+    check("Valid token accepted", err is None, err)
+    check("API key preserved", data and data.get("key") == TEST_KEY)
+    check("Device count preserved", data and data.get("devices") == 10000)
+    check("Plan preserved", data and data.get("plan") == "paid")
+    check("Not in grace period", data and not is_in_grace_period(data))
+    check("Over 360 days remaining", data and days_until_expiry(data) > 360)
+    check("Public key accepted as hex", validate_token(token, PUB.hex())[1] is None)
+
+    print("\n[2] THE POINT OF VERSION 2")
+    print("      A customer holds the public key. Can they mint a licence?")
+    # Feeding the public key in as a seed does not error - it is 32 bytes,
+    # so it derives some other keypair entirely. The property that matters
+    # is that whatever comes out does NOT verify against the real key.
+    attempt = generate_token(TEST_KEY, 999999, "enterprise",
+                             "attacker@example.com", PUB)
+    _, err = validate_token(attempt, PUB)
+    check("Token minted with the public key does not verify",
+          err == "invalid_signature", err)
+    check("Public key is not the private seed",
+          public_key(PUB) != PUB)
+    other_seed = os.urandom(32)
+    self_signed = generate_token(TEST_KEY, 999999, "enterprise",
+                                 "attacker@example.com", other_seed)
+    _, err = validate_token(self_signed, PUB)
+    check("Token signed by any other key rejected", err == "invalid_signature")
+
+    print("\n[3] Tamper detection")
+    for label, old, new in [("device count", "10000", "99999"),
+                            ("plan", "paid", "enterprise"),
+                            ("expiry", '"expires"', '"expiries"')]:
+        raw = json.loads(base64.urlsafe_b64decode(token))
+        raw["payload"] = raw["payload"].replace(old, new)
+        bad = base64.urlsafe_b64encode(
+            json.dumps(raw, separators=(",", ":")).encode()).decode()
+        _, err = validate_token(bad, PUB)
+        check("Tampered " + label + " rejected", err == "invalid_signature", err)
+    raw = json.loads(base64.urlsafe_b64decode(token))
+    raw["sig"] = "00" * 64
+    bad = base64.urlsafe_b64encode(
+        json.dumps(raw, separators=(",", ":")).encode()).decode()
+    check("Zeroed signature rejected",
+          validate_token(bad, PUB)[1] == "invalid_signature")
+
+    print("\n[4] Expiry")
+    exp = generate_token(TEST_KEY, 100, "paid", "t@e.com", SEED, validity_days=-1)
+    d, err = validate_token(exp, PUB)
+    check("Recently expired token still runs in grace", err is None and d)
+    check("Grace period reported", d and is_in_grace_period(d))
+    hard = generate_token(TEST_KEY, 100, "paid", "t@e.com", SEED, validity_days=-9)
+    check("Hard expired token rejected",
+          validate_token(hard, PUB)[1] == "token_expired")
+
+    print("\n[5] Wrong key")
+    check("Unrelated public key rejected",
+          validate_token(token, public_key(os.urandom(32)))[1] == "invalid_signature")
+    flipped = bytearray(PUB)
+    flipped[0] ^= 1
+    check("One-bit-flipped public key rejected",
+          validate_token(token, bytes(flipped))[1] == "invalid_signature")
+
+    print("\n[6] Malformed input")
+    for label, bad_in in [("garbage", "notbase64!!!"), ("empty", ""),
+                          ("empty json", base64.urlsafe_b64encode(b"{}").decode())]:
+        check(label + " rejected", validate_token(bad_in, PUB)[1] is not None)
+    check("Missing public key reported",
+          validate_token(token, "")[1] == "no_public_key")
+
+    print("\n[7] v1 tokens are not silently accepted")
+    v1_payload = json.dumps({"v": "1", "key": TEST_KEY, "devices": 10,
+                             "plan": "paid", "email": "t@e.com",
+                             "issued": int(time.time()),
+                             "expires": int(time.time()) + 86400},
+                            sort_keys=True, separators=(",", ":"))
+    v1 = base64.urlsafe_b64encode(json.dumps(
+        {"payload": v1_payload, "sig": sign(SEED, v1_payload.encode()).hex()},
+        separators=(",", ":")).encode()).decode()
+    check("v1 token rejected by version",
+          validate_token(v1, PUB)[1] == "version_mismatch")
+
+    print("\n[8] Local cache")
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        test_db = f.name
+    try:
+        d, _ = validate_token(token, PUB)
+        save_licence_locally(test_db, token, d)
+        cached = load_licence_locally(test_db)
+        check("Saved and retrieved", cached is not None)
+        check("Cached token re-verifies",
+              cached and validate_token(cached[0], PUB)[1] is None)
+        check("Cached devices match", cached and cached[1]["devices"] == 10000)
+    finally:
+        os.unlink(test_db)
+
+    print("\n[9] Performance")
+    import timeit
+    g = timeit.timeit(lambda: generate_token(TEST_KEY, 1, "paid", "t@e.com",
+                                             SEED), number=50) / 50
+    v = timeit.timeit(lambda: validate_token(token, PUB), number=50) / 50
+    print("      sign   %.1f ms" % (g * 1000))
+    print("      verify %.1f ms" % (v * 1000))
+    check("Verification under 50ms", v < 0.05)
+
+    print("\n" + "=" * 62)
+    print("Results: %d passed, %d failed" % (PASSES, FAILURES))
+    print("ALL TESTS PASSED." if not FAILURES else "FAILURES. Do not ship.")
+    sys.exit(0 if not FAILURES else 1)
+
+```
+
+
+## `sebdog_reporter.py`
+
+217 lines, 8364 bytes
+
+```python
+"""
+SEBDOG DECISION REPORTER v1.0.0
+Generates readable reports from the sebdog audit chain.
+Shows exactly why each decision was made.
+Copyright (c) 2026 Justin Antony Dobson / Monop Content
+"""
+
+import sqlite3, json, time, os
+from datetime import datetime
+
+DB_FILE = "sebdog_audit.db"
+
+REASON_EXPLANATIONS = {
+    "velocity_spike": "User made more than 10 requests in 60 seconds",
+    "high_amount": "Transaction amount exceeded £500",
+    "risky_device": "Device risk score above 0.5",
+    "behaviour_anomaly": "Behavioural anomaly score above 0.5",
+    "country_shift": "Request came from a different country than usual",
+    "unsafe_country": "Request came from outside approved country list",
+    "low_trust": "User trust score has dropped below 0.4 due to previous decisions",
+}
+
+def get_decisions(db_path=DB_FILE, limit=100):
+    if not os.path.exists(db_path):
+        return []
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute("""
+        SELECT ts, user_id, event_json, result_json, audit_hash
+        FROM audit_log
+        ORDER BY id DESC
+        LIMIT ?
+    """, (limit,)).fetchall()
+    conn.close()
+    results = []
+    for row in rows:
+        try:
+            event = json.loads(row[2])
+            result = json.loads(row[3])
+            results.append({
+                "ts": row[0],
+                "user_id": row[1],
+                "event": event,
+                "result": result,
+                "audit_hash": row[4]
+            })
+        except:
+            pass
+    return results
+
+def format_reason(reason):
+    return REASON_EXPLANATIONS.get(reason, reason.replace("_", " ").capitalize())
+
+def decision_color(decision):
+    return {"ALLOW": "#00875a", "CHALLENGE": "#b45309", "BLOCK": "#cc0000"}.get(decision, "#555")
+
+def generate_text_report(db_path=DB_FILE, limit=100):
+    decisions = get_decisions(db_path, limit)
+    if not decisions:
+        return "No decisions recorded yet."
+    
+    lines = [
+        "SEBDOG DECISION REPORT",
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"Total decisions shown: {len(decisions)}",
+        "=" * 60
+    ]
+    
+    for d in decisions:
+        result = d["result"]
+        event = d["event"]
+        ts = datetime.fromtimestamp(d["ts"]).strftime('%Y-%m-%d %H:%M:%S')
+        decision = result.get("decision", "?")
+        score = result.get("score", 0)
+        reasons = result.get("reasons", [])
+        
+        lines.append(f"\n[{ts}] User: {d['user_id']}")
+        lines.append(f"Action: {event.get('action','?')} | Country: {event.get('country','?')} | Amount: £{event.get('amount',0)}")
+        lines.append(f"Decision: {decision} | Score: {score} | Trust: {result.get('trust',0)}")
+        
+        if reasons:
+            lines.append("Reasons:")
+            for r in reasons:
+                lines.append(f"  - {format_reason(r)}")
+        else:
+            lines.append("Reasons: No risk factors detected")
+        
+        lines.append(f"Audit hash: {d['audit_hash'][:32]}...")
+        lines.append("-" * 60)
+    
+    return "\n".join(lines)
+
+def generate_json_report(db_path=DB_FILE, limit=100):
+    decisions = get_decisions(db_path, limit)
+    report = {
+        "generated": datetime.now().isoformat(),
+        "total": len(decisions),
+        "decisions": []
+    }
+    for d in decisions:
+        result = d["result"]
+        event = d["event"]
+        reasons = result.get("reasons", [])
+        report["decisions"].append({
+            "timestamp": datetime.fromtimestamp(d["ts"]).isoformat(),
+            "user_id": d["user_id"],
+            "action": event.get("action"),
+            "country": event.get("country"),
+            "amount": event.get("amount"),
+            "decision": result.get("decision"),
+            "score": result.get("score"),
+            "trust": result.get("trust"),
+            "reasons": reasons,
+            "reasons_explained": [format_reason(r) for r in reasons],
+            "audit_hash": d["audit_hash"]
+        })
+    return json.dumps(report, indent=2)
+
+def generate_html_report(db_path=DB_FILE, limit=100):
+    decisions = get_decisions(db_path, limit)
+    
+    rows = ""
+    for d in decisions:
+        result = d["result"]
+        event = d["event"]
+        ts = datetime.fromtimestamp(d["ts"]).strftime('%Y-%m-%d %H:%M:%S')
+        decision = result.get("decision", "?")
+        score = result.get("score", 0)
+        reasons = result.get("reasons", [])
+        color = decision_color(decision)
+        
+        reason_html = ""
+        if reasons:
+            reason_html = "<ul>" + "".join(f"<li>{format_reason(r)}</li>" for r in reasons) + "</ul>"
+        else:
+            reason_html = "<span style='color:#888'>No risk factors detected</span>"
+        
+        rows += f"""
+        <tr>
+            <td>{ts}</td>
+            <td><code>{d['user_id']}</code></td>
+            <td>{event.get('action','?')}</td>
+            <td>{event.get('country','?')}</td>
+            <td>£{event.get('amount',0)}</td>
+            <td><strong style="color:{color}">{decision}</strong></td>
+            <td>{score}</td>
+            <td>{result.get('trust',0)}</td>
+            <td>{reason_html}</td>
+            <td><code style="font-size:10px">{d['audit_hash'][:16]}...</code></td>
+        </tr>"""
+    
+    allow = sum(1 for d in decisions if d["result"].get("decision") == "ALLOW")
+    challenge = sum(1 for d in decisions if d["result"].get("decision") == "CHALLENGE")
+    block = sum(1 for d in decisions if d["result"].get("decision") == "BLOCK")
+    
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Sebdog Decision Report</title>
+<style>
+body{{font-family:sans-serif;background:#f5f7fa;color:#1a202c;margin:0;padding:20px}}
+.header{{background:#0a0f1e;color:#fff;padding:24px 32px;border-radius:8px;margin-bottom:24px}}
+.header h1{{margin:0;font-size:24px;color:#c9a84c}}
+.header p{{margin:4px 0 0;color:rgba(255,255,255,0.5);font-size:13px}}
+.stats{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:24px}}
+.stat{{background:#fff;border-radius:8px;padding:16px;text-align:center;border:1px solid #e2e8f0}}
+.stat-n{{font-size:32px;font-weight:700}}
+.stat-l{{font-size:11px;color:#64748b;margin-top:4px}}
+.allow{{color:#00875a}}.challenge{{color:#b45309}}.block{{color:#cc0000}}
+table{{width:100%;border-collapse:collapse;background:#fff;border-radius:8px;overflow:hidden;border:1px solid #e2e8f0}}
+th{{background:#0a0f1e;color:#c9a84c;padding:10px 12px;text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:1px}}
+td{{padding:10px 12px;border-bottom:1px solid #e2e8f0;font-size:12px;vertical-align:top}}
+tr:last-child td{{border:none}}
+tr:hover td{{background:#f8fafc}}
+ul{{margin:4px 0;padding-left:16px}}
+li{{margin:2px 0;color:#64748b}}
+code{{background:#f1f5f9;padding:2px 4px;border-radius:3px;font-size:11px}}
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>Sebdog Decision Report</h1>
+  <p>Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} &nbsp;|&nbsp; Showing last {len(decisions)} decisions &nbsp;|&nbsp; Powered by sebbi.pro</p>
+</div>
+<div class="stats">
+  <div class="stat"><div class="stat-n allow">{allow}</div><div class="stat-l">ALLOWED</div></div>
+  <div class="stat"><div class="stat-n challenge">{challenge}</div><div class="stat-l">CHALLENGED</div></div>
+  <div class="stat"><div class="stat-n block">{block}</div><div class="stat-l">BLOCKED</div></div>
+</div>
+<table>
+<thead><tr>
+  <th>Time</th><th>User</th><th>Action</th><th>Country</th><th>Amount</th>
+  <th>Decision</th><th>Score</th><th>Trust</th><th>Reasons</th><th>Audit Hash</th>
+</tr></thead>
+<tbody>{rows if rows else '<tr><td colspan="10" style="text-align:center;color:#888;padding:32px">No decisions recorded yet</td></tr>'}</tbody>
+</table>
+</body>
+</html>"""
+    return html
+
+if __name__ == "__main__":
+    import sys
+    fmt = sys.argv[1] if len(sys.argv) > 1 else "html"
+    db = sys.argv[2] if len(sys.argv) > 2 else DB_FILE
+    
+    if fmt == "text":
+        print(generate_text_report(db))
+    elif fmt == "json":
+        print(generate_json_report(db))
+    else:
+        report = generate_html_report(db)
+        out = "sebdog_report.html"
+        with open(out, "w") as f:
+            f.write(report)
+        print(f"Report saved to {out}")
+
+```
+
+
+## `tests/attack_continuity_1.py`
+
+440 lines, 22747 bytes
+
+```python
+#!/usr/bin/env python3
+"""Attack harness for modules/lineage.py.
+
+Every test is written from the position of an agent that HAS some authority
+and is trying to end up with more. Passing means the attack was refused for
+the right reason, not merely refused.
+"""
+
+import hashlib
+import json
+import sqlite3
+import threading
+import time
+import sys
+
+import continuity as lineage
+# --- stand-in for the deployed engine ---------------------------------
+import types as _types
+_ENGINE = {"verdict": "ALLOW"}
+
+def install_engine(verdict="ALLOW", raises=False, shape="dict"):
+    _ENGINE["verdict"] = verdict
+    mod = _types.ModuleType("server")
+    mod.get_bearer = lambda *a, **k: None
+    def score_event(event):
+        if raises:
+            raise RuntimeError("engine down")
+        if shape == "dict":
+            return {"decision": _ENGINE["verdict"], "score": 0.1}
+        if shape == "tuple":
+            return (_ENGINE["verdict"], 0.1)
+        return _ENGINE["verdict"]
+    mod.score_event = score_event
+    sys.modules["server"] = mod
+
+def remove_engine():
+    sys.modules.pop("server", None)
+
+install_engine("ALLOW")
+
+
+PASS, FAIL = [], []
+
+
+def make_ctx():
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    lock = threading.RLock()
+    chain = {"n": 0, "prev": "0" * 64}
+
+    def seal(ev, res, ts, api_key):
+        chain["n"] += 1
+        payload = json.dumps([ev, res, ts, api_key, chain["prev"]], sort_keys=True)
+        h = hashlib.sha256(payload.encode()).hexdigest()
+        chain["prev"] = h
+        return h, chain["n"], chain["n"]
+
+    lineage._ready = False
+    ctx = {"conn": conn, "lock": lock, "seal": seal}
+    lineage._setup(ctx)
+    return ctx
+
+
+def check(name, condition, detail=""):
+    (PASS if condition else FAIL).append(name)
+    print(("  ok   " if condition else "  FAIL ") + name + (("  -> " + detail) if detail and not condition else ""))
+
+
+def issue(ctx, **kw):
+    if kw.get("parent") and int(kw.get("delegations_left", 0)) > 0 \
+            and not kw.get("risk_accepted_by"):
+        kw["risk_accepted_by"] = "owner@example.com"
+    return lineage._issue(ctx, "k", kw)
+
+
+def exercise(ctx, **kw):
+    return lineage._evaluate(ctx, "k", kw)
+
+
+NOW = time.time()
+HOUR = 3600
+
+
+def base_root(ctx, **over):
+    args = dict(
+        id="root", issuer="justin@monop", issuer_kind="human",
+        subject="orchestrator", subject_kind="agent",
+        scope=["payments.refund", "payments.read", "tickets.*"],
+        constraints={"max_amount": 5000, "allowed_currency": ["GBP", "EUR"],
+                     "denied_country": ["KP"], "may_contact_customer": True},
+        purpose="resolve customer refund complaints",
+        purpose_tags=["refunds", "support"],
+        not_before=NOW - HOUR, not_after=NOW + 10 * HOUR,
+        delegations_left=3)
+    args.update(over)
+    return issue(ctx, **args)
+
+
+print("\n=== 1. the happy path must actually work ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent",
+      subject="refund-agent", scope=["payments.refund"],
+      constraints={"max_amount": 500, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="issue refunds under 500", purpose_tags=["refunds"],
+      not_before=NOW - HOUR, not_after=NOW + 2 * HOUR, delegations_left=1)
+r, code = exercise(ctx, grant="mid", action="payments.refund",
+                   params={"amount": 100, "currency": "GBP", "country": "GB",
+                           "contact_customer": True},
+                   purpose_tag="refunds")
+check("a derivable action returns ALLOW", r["verdict"] == "ALLOW", str(r["reasons"]))
+check("lineage names the human at the root", r["authorised_by"] == "justin@monop")
+check("depth is reported", r["delegation_depth"] == 1)
+check("the decision is sealed", bool(r.get("sealed_in_chain")))
+
+print("\n=== 2. orphan root: an agent grants itself authority ===")
+ctx = make_ctx()
+r, code = issue(ctx, id="self", issuer="rogue-agent", issuer_kind="agent",
+                subject="rogue-agent", scope=["payments.refund"],
+                constraints={"max_amount": 999999}, purpose="whatever I decide",
+                purpose_tags=["anything"], not_after=NOW + HOUR)
+check("self-issued root is refused at issue", code == 409 and r.get("error") == "identity_continuity", str(r))
+
+print("\n=== 3. scope escalation in a child ===")
+ctx = make_ctx()
+base_root(ctx)
+r, code = issue(ctx, id="wide", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="rogue", scope=["payments.refund", "payments.transfer"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                             "denied_country": ["KP"], "may_contact_customer": False},
+                purpose="sneak in a transfer", purpose_tags=["refunds"],
+                not_after=NOW + HOUR, delegations_left=0)
+check("scope the parent never held is refused",
+      code == 409 and "payments.transfer" in r.get("message", ""), str(r))
+
+print("\n=== 4. constraint loosening ===")
+ctx = make_ctx()
+base_root(ctx)
+r, code = issue(ctx, id="rich", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="rogue", scope=["payments.refund"],
+                constraints={"max_amount": 50000, "allowed_currency": ["GBP"],
+                             "denied_country": ["KP"], "may_contact_customer": True},
+                purpose="bigger refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+check("raising a max_ cap is refused", code == 409 and "max_amount" in r.get("message", ""), str(r))
+
+r, code = issue(ctx, id="wide2", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="rogue", scope=["payments.refund"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP", "USD"],
+                             "denied_country": ["KP"], "may_contact_customer": True},
+                purpose="new currency", purpose_tags=["refunds"], not_after=NOW + HOUR)
+check("adding to an allowed_ set is refused", code == 409 and "USD" in r.get("message", ""), str(r))
+
+r, code = issue(ctx, id="undeny", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="rogue", scope=["payments.refund"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                             "denied_country": [], "may_contact_customer": True},
+                purpose="drop the denylist", purpose_tags=["refunds"], not_after=NOW + HOUR)
+check("dropping from a denied_ set is refused", code == 409 and "KP" in r.get("message", ""), str(r))
+
+r, code = issue(ctx, id="newkey", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="rogue", scope=["payments.refund"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                             "denied_country": ["KP"], "may_contact_customer": True,
+                             "may_export_data": True},
+                purpose="invent a permission", purpose_tags=["refunds"], not_after=NOW + HOUR)
+check("introducing a constraint key the parent never expressed is refused",
+      code == 409 and "may_export_data" in r.get("message", ""), str(r))
+
+print("\n=== 5. temporal attacks ===")
+ctx = make_ctx()
+base_root(ctx)
+r, code = issue(ctx, id="long", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="rogue", scope=["payments.refund"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                             "denied_country": ["KP"], "may_contact_customer": True},
+                purpose="outlive the parent", purpose_tags=["refunds"],
+                not_before=NOW, not_after=NOW + 100 * HOUR)
+check("a child cannot outlive its parent", code == 409 and r.get("error") == "temporal_validity", str(r))
+
+# expired ancestor, live leaf, forced in past the issue check
+ctx = make_ctx()
+base_root(ctx, not_after=NOW + HOUR)
+issue(ctx, id="child", parent="root", issuer="orchestrator", issuer_kind="agent",
+      subject="agent-b", scope=["payments.refund"],
+      constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+with ctx["lock"]:
+    ctx["conn"].execute("UPDATE auth_grant SET not_after=? WHERE id='root'", (NOW - 60,))
+    ctx["conn"].commit()
+r, _ = exercise(ctx, grant="child", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "GB",
+                        "contact_customer": True}, purpose_tag="refunds")
+check("an expired ancestor kills a live leaf", r["verdict"] == "BLOCK", str(r["reasons"]))
+check("...and it is reported as tampering, since the row no longer matches its digest",
+      r["broken_invariant"] == "evidence_continuity", r["broken_invariant"] or "")
+
+print("\n=== 6. revocation is transitive ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent",
+      subject="b", scope=["payments.refund"],
+      constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR, delegations_left=1)
+issue(ctx, id="leaf", parent="mid", issuer="b", issuer_kind="agent",
+      subject="c", scope=["payments.refund"],
+      constraints={"max_amount": 50, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+lineage._revoke(ctx, "k", {"grant": "mid", "reason": "agent compromised"})
+r, _ = exercise(ctx, grant="leaf", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "GB",
+                        "contact_customer": True}, purpose_tag="refunds")
+check("revoking the middle blocks the leaf without touching it", r["verdict"] == "BLOCK")
+check("the revoked grant is named", r["broken_at"] == "mid", str(r["broken_at"]))
+r2, _ = exercise(ctx, grant="root", action="payments.refund",
+                 params={"amount": 10, "currency": "GBP", "country": "GB",
+                         "contact_customer": True}, purpose_tag="refunds")
+check("revoking a child does not harm the parent", r2["verdict"] == "ALLOW", str(r2["reasons"]))
+
+print("\n=== 7. delegation depth cannot be manufactured ===")
+ctx = make_ctx()
+base_root(ctx, delegations_left=1)
+issue(ctx, id="d1", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.refund"],
+      constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR, delegations_left=0)
+r, code = issue(ctx, id="d2", parent="d1", issuer="b", issuer_kind="agent", subject="c",
+                scope=["payments.refund"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                             "denied_country": ["KP"], "may_contact_customer": True},
+                purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+check("an exhausted delegation budget stops the chain",
+      code == 409 and r.get("error") == "delegation_not_permitted", str(r))
+
+ctx = make_ctx()
+base_root(ctx, delegations_left=2)
+r, code = issue(ctx, id="greedy", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="b", scope=["payments.refund"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                             "denied_country": ["KP"], "may_contact_customer": True},
+                purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR,
+                delegations_left=5)
+check("a child cannot award itself more onward delegations than remained",
+      code == 409, str(r))
+
+print("\n=== 8. tampering with a stored grant ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.refund"],
+      constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+with ctx["lock"]:
+    ctx["conn"].execute(
+        "UPDATE auth_grant SET constraints=? WHERE id='mid'",
+        (json.dumps({"max_amount": 999999, "allowed_currency": ["GBP", "USD"],
+                     "denied_country": [], "may_contact_customer": True},
+                    sort_keys=True, separators=(",", ":")),))
+    ctx["conn"].commit()
+r, _ = exercise(ctx, grant="mid", action="payments.refund",
+                params={"amount": 900000, "currency": "USD", "country": "GB",
+                        "contact_customer": True}, purpose_tag="refunds")
+check("editing the database does not widen authority", r["verdict"] == "BLOCK")
+check("the tamper is reported as an evidence failure",
+      r["broken_invariant"] == "evidence_continuity", str(r["broken_invariant"]))
+
+print("\n=== 9. re-parenting onto a wider ancestor ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="narrow", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.read"],
+      constraints={"max_amount": 1, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": False},
+      purpose="read only", purpose_tags=["support"], not_after=NOW + HOUR)
+with ctx["lock"]:
+    ctx["conn"].execute("UPDATE auth_grant SET parent=NULL WHERE id='narrow'")
+    ctx["conn"].commit()
+r, _ = exercise(ctx, grant="narrow", action="payments.read",
+                params={}, purpose_tag="support")
+check("detaching a grant to make it a root fails integrity", r["verdict"] == "BLOCK",
+      str(r["reasons"]))
+
+print("\n=== 10. parent cycle ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="a", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.refund"],
+      constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR, delegations_left=1)
+issue(ctx, id="b", parent="a", issuer="b", issuer_kind="agent", subject="c",
+      scope=["payments.refund"],
+      constraints={"max_amount": 50, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+with ctx["lock"]:
+    ctx["conn"].execute("UPDATE auth_grant SET parent='b' WHERE id='a'")
+    ctx["conn"].commit()
+start = time.time()
+r, _ = exercise(ctx, grant="b", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "GB",
+                        "contact_customer": True}, purpose_tag="refunds")
+check("a parent cycle terminates rather than hangs", time.time() - start < 2)
+check("a cycle is BLOCKed as an authority failure", r["verdict"] == "BLOCK")
+
+print("\n=== 11. action parameters beyond the effective constraints ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.refund"],
+      constraints={"max_amount": 500, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+r, _ = exercise(ctx, grant="mid", action="payments.refund",
+                params={"amount": 501, "currency": "GBP", "country": "GB",
+                        "contact_customer": True}, purpose_tag="refunds")
+check("an amount over the cap is BLOCKed", r["verdict"] == "BLOCK", str(r["reasons"]))
+r, _ = exercise(ctx, grant="mid", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "KP",
+                        "contact_customer": True}, purpose_tag="refunds")
+check("a denied country is BLOCKed", r["verdict"] == "BLOCK", str(r["reasons"]))
+
+print("\n=== 12. uncertainty is challenged, not guessed ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.refund"],
+      constraints={"max_amount": 500, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="issue refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+r, _ = exercise(ctx, grant="mid", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "GB",
+                        "contact_customer": True}, purpose_tag="marketing")
+check("a purpose the grant does not carry is CHALLENGED", r["verdict"] == "CHALLENGE", str(r))
+r, _ = exercise(ctx, grant="mid", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "GB",
+                        "contact_customer": True})
+check("no declared purpose is CHALLENGED", r["verdict"] == "CHALLENGE", str(r))
+r, _ = exercise(ctx, grant="mid", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "GB",
+                        "contact_customer": True, "recipient_iban": "GB00XXXX"},
+                purpose_tag="refunds")
+check("an unconstrained parameter is CHALLENGED, not ignored",
+      r["verdict"] == "CHALLENGE" and any("recipient_iban" in x for x in r["reasons"]), str(r))
+
+print("\n=== 13. wildcard breadth ===")
+ctx = make_ctx()
+base_root(ctx)
+r, _ = exercise(ctx, grant="root", action="tickets.close.bulk.all",
+                params={}, purpose_tag="support")
+check("a broad wildcard match is CHALLENGED rather than silently allowed",
+      r["verdict"] == "CHALLENGE", str(r))
+
+ctx = make_ctx()
+base_root(ctx, scope=["*"], id="star")
+r, _ = exercise(ctx, grant="star", action="payments.transfer", params={}, purpose_tag="refunds")
+check("a bare * never reaches ALLOW", r["verdict"] == "CHALLENGE", str(r))
+
+print("\n=== 14. no union of grants ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="money", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.refund"],
+      constraints={"max_amount": 500, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": False},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+issue(ctx, id="contact", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.read"],
+      constraints={"max_amount": 0, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="contact", purpose_tags=["support"], not_after=NOW + HOUR)
+r, code = exercise(ctx, grant="money,contact", action="payments.refund",
+                   params={"amount": 10, "currency": "GBP", "contact_customer": True},
+                   purpose_tag="refunds")
+check("two grant ids cannot be combined into one exercise", r["verdict"] == "BLOCK", str(r))
+r, _ = exercise(ctx, grant="money", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "contact_customer": True},
+                purpose_tag="refunds")
+check("the capability from the sibling grant does not leak in", r["verdict"] == "BLOCK",
+      str(r["reasons"]))
+
+print("\n=== 15. time of check vs time of use ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.refund"],
+      constraints={"max_amount": 500, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+r, _ = exercise(ctx, grant="mid", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "GB",
+                        "contact_customer": True}, purpose_tag="refunds")
+eval_id = r["evaluation"]
+c, code = lineage._confirm(ctx, "k", {"evaluation": eval_id, "action": "payments.refund",
+                                      "params": {"amount": 10, "currency": "GBP",
+                                                 "country": "GB", "contact_customer": True}})
+check("executing exactly what was evaluated binds", c["bound"] is True, str(c))
+c, code = lineage._confirm(ctx, "k", {"evaluation": eval_id, "action": "payments.refund",
+                                      "params": {"amount": 400, "currency": "GBP",
+                                                 "country": "GB", "contact_customer": True}})
+check("executing different values than were evaluated is rejected", c["bound"] is False, str(c))
+check("the rejected execution is still sealed", bool(c.get("sealed_in_chain")))
+
+with ctx["lock"]:
+    ctx["conn"].execute("UPDATE auth_eval SET valid_until=? WHERE id=?", (NOW - 1, eval_id))
+    ctx["conn"].commit()
+c, _ = lineage._confirm(ctx, "k", {"evaluation": eval_id})
+check("a banked evaluation cannot be spent after its window", c["bound"] is False, str(c))
+
+print("\n=== 16. a BLOCK is evidence, not silence ===")
+ctx = make_ctx()
+base_root(ctx)
+r, _ = exercise(ctx, grant="nonexistent", action="payments.refund", params={})
+check("an unknown grant BLOCKs", r["verdict"] == "BLOCK")
+check("the block is sealed in the chain", bool(r.get("sealed_in_chain")))
+d, code = lineage._decision(ctx, {"evaluation": r["evaluation"]})
+check("the sealed decision is publicly retrievable", code == 200 and d["verdict"] == "BLOCK")
+
+print("\n=== 17. no authority without a stated purpose or an end date ===")
+ctx = make_ctx()
+r, code = issue(ctx, id="forever", issuer="justin@monop", issuer_kind="human", subject="a",
+                scope=["payments.refund"], constraints={"max_amount": 1},
+                purpose="anything", purpose_tags=["x"])
+check("a grant with no expiry is refused", code == 400 and r.get("error") == "not_after_required")
+r, code = issue(ctx, id="vague", issuer="justin@monop", issuer_kind="human", subject="a",
+                scope=["payments.refund"], constraints={"max_amount": 1},
+                purpose="", purpose_tags=["x"], not_after=NOW + HOUR)
+check("a grant with no purpose is refused", code == 400 and r.get("error") == "purpose_required")
+
+print("\n" + "=" * 60)
+print("passed %d, failed %d" % (len(PASS), len(FAIL)))
+if FAIL:
+    for f in FAIL:
+        print("  FAILED: " + f)
+    sys.exit(1)
+
+```
+
+
+## `tests/attack_continuity_2.py`
+
+228 lines, 10573 bytes
+
+```python
+#!/usr/bin/env python3
+"""Second wave. The first wave tested the obvious escalations. This one
+tests the ones that would survive a code review."""
+
+import hashlib
+import json
+import sqlite3
+import threading
+import time
+import sys
+
+import continuity as lineage
+# --- stand-in for the deployed engine ---------------------------------
+import types as _types
+_ENGINE = {"verdict": "ALLOW"}
+
+def install_engine(verdict="ALLOW", raises=False, shape="dict"):
+    _ENGINE["verdict"] = verdict
+    mod = _types.ModuleType("server")
+    mod.get_bearer = lambda *a, **k: None
+    def score_event(event):
+        if raises:
+            raise RuntimeError("engine down")
+        if shape == "dict":
+            return {"decision": _ENGINE["verdict"], "score": 0.1}
+        if shape == "tuple":
+            return (_ENGINE["verdict"], 0.1)
+        return _ENGINE["verdict"]
+    mod.score_event = score_event
+    sys.modules["server"] = mod
+
+def remove_engine():
+    sys.modules.pop("server", None)
+
+install_engine("ALLOW")
+
+
+PASS, FAIL = [], []
+NOW = time.time()
+HOUR = 3600
+
+
+def make_ctx():
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    lock = threading.RLock()
+    n = {"i": 0}
+
+    def seal(ev, res, ts, api_key):
+        n["i"] += 1
+        return hashlib.sha256(json.dumps([ev, res, ts], sort_keys=True,
+                                         default=str).encode()).hexdigest(), n["i"], n["i"]
+    lineage._ready = False
+    ctx = {"conn": conn, "lock": lock, "seal": seal}
+    lineage._setup(ctx)
+    return ctx
+
+
+def check(name, cond, detail=""):
+    (PASS if cond else FAIL).append(name)
+    print(("  ok   " if cond else "  FAIL ") + name + (("  -> " + str(detail)[:300]) if detail and not cond else ""))
+
+
+def issue(ctx, **kw):
+    if kw.get("parent") and int(kw.get("delegations_left", 0)) > 0 \
+            and not kw.get("risk_accepted_by"):
+        kw["risk_accepted_by"] = "owner@example.com"
+    return lineage._issue(ctx, "k", kw)
+
+
+def root(ctx, **over):
+    args = dict(id="root", issuer="owner@example.com", issuer_kind="human",
+                subject="orchestrator", scope=["payments.refund", "payments.read"],
+                constraints={"max_amount": 5000, "allowed_currency": ["GBP", "EUR"]},
+                purpose="refunds", purpose_tags=["refunds"],
+                not_before=NOW - HOUR, not_after=NOW + 10 * HOUR, delegations_left=10)
+    args.update(over)
+    return issue(ctx, **args)
+
+
+print("\n=== 18. double execution against one ALLOW ===")
+ctx = make_ctx()
+root(ctx)
+r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments.refund",
+                                    "params": {"amount": 100, "currency": "GBP"},
+                                    "purpose_tag": "refunds"})
+eid = r["evaluation"]
+p = {"amount": 100, "currency": "GBP"}
+c1, _ = lineage._confirm(ctx, "k", {"evaluation": eid, "action": "payments.refund", "params": p})
+c2, _ = lineage._confirm(ctx, "k", {"evaluation": eid, "action": "payments.refund", "params": p})
+check("the first execution binds", c1["bound"] is True, c1)
+check("the same evaluation cannot be spent twice", c2["bound"] is False, c2)
+
+print("\n=== 19. type confusion in constraints ===")
+ctx = make_ctx()
+root(ctx, constraints={"max_amount": 5000, "allowed_currency": "GBP"})
+r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments.refund",
+                                    "params": {"amount": 10, "currency": "G"},
+                                    "purpose_tag": "refunds"})
+check("a single character does not satisfy a string-valued allowed_ list",
+      r["verdict"] == "BLOCK", r["reasons"])
+
+ctx = make_ctx()
+root(ctx)
+r, code = issue(ctx, id="strnum", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="b", scope=["payments.refund"],
+                constraints={"max_amount": "50000", "allowed_currency": ["GBP"]},
+                purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+check("a numeric cap passed as a string cannot beat the parent", code == 409, r)
+
+ctx = make_ctx()
+root(ctx)
+r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments.refund",
+                                    "params": {"amount": "99999", "currency": "GBP"},
+                                    "purpose_tag": "refunds"})
+check("a string amount is still compared numerically", r["verdict"] == "BLOCK", r["reasons"])
+
+ctx = make_ctx()
+root(ctx)
+r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments.refund",
+                                    "params": {"amount": True, "currency": "GBP"},
+                                    "purpose_tag": "refunds"})
+check("a non-numeric amount does not slip through as unconstrained",
+      r["verdict"] in ("BLOCK", "CHALLENGE"), r)
+
+print("\n=== 20. capability prefix tricks ===")
+ctx = make_ctx()
+root(ctx, scope=["payments.refund"])
+for probe in ["payments.refunds", "payments.refund.approve", "payments.refundX",
+              "Payments.Refund", "payments.refund "]:
+    r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": probe,
+                                        "params": {}, "purpose_tag": "refunds"})
+    check("'%s' is not covered by 'payments.refund'" % probe, r["verdict"] == "BLOCK", r["reasons"])
+
+ctx = make_ctx()
+root(ctx, scope=["payments.*"])
+r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments2.transfer",
+                                    "params": {}, "purpose_tag": "refunds"})
+check("'payments.*' does not cover 'payments2.transfer'", r["verdict"] == "BLOCK", r["reasons"])
+
+print("\n=== 21. a long but legitimate chain ===")
+ctx = make_ctx()
+root(ctx, constraints={"max_amount": 10000, "allowed_currency": ["GBP", "EUR"]},
+     delegations_left=12)
+parent, cap = "root", 10000
+for i in range(10):
+    cap = cap // 2
+    gid = "d%d" % i
+    r, code = issue(ctx, id=gid, parent=parent, issuer="a%d" % i, issuer_kind="agent",
+                    subject="a%d" % (i + 1), scope=["payments.refund"],
+                    constraints={"max_amount": cap, "allowed_currency": ["GBP"]},
+                    purpose="refunds", purpose_tags=["refunds"],
+                    not_after=NOW + HOUR, delegations_left=11 - i)
+    if code != 200:
+        break
+    parent = gid
+check("ten legitimate narrowing hops are accepted", code == 200 and parent == "d9", r)
+r, _ = lineage._evaluate(ctx, "k", {"grant": "d9", "action": "payments.refund",
+                                    "params": {"amount": 5, "currency": "GBP"},
+                                    "purpose_tag": "refunds"})
+check("the deep chain still ALLOWs a derivable action", r["verdict"] == "ALLOW", r["reasons"])
+check("the effective cap is the tightest in the chain",
+      float(r["effective_constraints"]["max_amount"]) == 9, r["effective_constraints"])
+check("the human at the root is still named ten hops down",
+      r["authorised_by"] == "owner@example.com")
+r, _ = lineage._evaluate(ctx, "k", {"grant": "d9", "action": "payments.refund",
+                                    "params": {"amount": 10, "currency": "GBP"},
+                                    "purpose_tag": "refunds"})
+check("one unit over the deepest cap is BLOCKed", r["verdict"] == "BLOCK", r["reasons"])
+
+print("\n=== 22. revoking the root kills the whole tree ===")
+lineage._revoke(ctx, "k", {"grant": "root", "reason": "principal withdrew authority"})
+r, _ = lineage._evaluate(ctx, "k", {"grant": "d9", "action": "payments.refund",
+                                    "params": {"amount": 1, "currency": "GBP"},
+                                    "purpose_tag": "refunds"})
+check("revoking the root blocks a leaf ten hops away", r["verdict"] == "BLOCK")
+check("the root is named as the break point", r["broken_at"] == "root", r["broken_at"])
+
+print("\n=== 23. issuing under a revoked or expired parent ===")
+ctx = make_ctx()
+root(ctx)
+lineage._revoke(ctx, "k", {"grant": "root", "reason": "x"})
+r, code = issue(ctx, id="after", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="b", scope=["payments.refund"],
+                constraints={"max_amount": 1, "allowed_currency": ["GBP"]},
+                purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+check("no new delegation under a revoked parent", code == 409 and r.get("error") == "parent_revoked", r)
+
+print("\n=== 24. duplicate grant id cannot overwrite a grant ===")
+ctx = make_ctx()
+root(ctx)
+r, code = root(ctx, scope=["*"], constraints={"max_amount": 999999})
+check("re-issuing an existing id is refused", code == 409 and r.get("error") == "grant_exists", r)
+
+print("\n=== 25. the boundary values themselves ===")
+ctx = make_ctx()
+root(ctx, constraints={"max_amount": 100, "allowed_currency": ["GBP"]}, delegations_left=2)
+r, code = issue(ctx, id="equal", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="b", scope=["payments.refund"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP"]},
+                purpose="refunds", purpose_tags=["refunds"],
+                not_after=NOW + 10 * HOUR, delegations_left=1)
+check("an equal-not-wider child is accepted", code == 200, r)
+r, _ = lineage._evaluate(ctx, "k", {"grant": "equal", "action": "payments.refund",
+                                    "params": {"amount": 100, "currency": "GBP"},
+                                    "purpose_tag": "refunds"})
+check("exactly the cap is allowed", r["verdict"] == "ALLOW", r["reasons"])
+r, _ = lineage._evaluate(ctx, "k", {"grant": "equal", "action": "payments.refund",
+                                    "params": {"amount": 100.01, "currency": "GBP"},
+                                    "purpose_tag": "refunds"})
+check("a penny over the cap is blocked", r["verdict"] == "BLOCK", r["reasons"])
+
+print("\n=== 26. a CHALLENGE cannot be executed ===")
+ctx = make_ctx()
+root(ctx)
+r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments.refund",
+                                    "params": {"amount": 1, "currency": "GBP"}})
+check("no declared purpose gives CHALLENGE", r["verdict"] == "CHALLENGE", r["verdict"])
+c, code = lineage._confirm(ctx, "k", {"evaluation": r["evaluation"],
+                                      "action": "payments.refund",
+                                      "params": {"amount": 1, "currency": "GBP"}})
+check("a CHALLENGE cannot be bound as an execution", c["bound"] is False, c)
+
+print("\n" + "=" * 60)
+print("passed %d, failed %d" % (len(PASS), len(FAIL)))
+for f in FAIL:
+    print("  FAILED: " + f)
+sys.exit(1 if FAIL else 0)
+
+```
+
+
+## `tests/attack_continuity_3.py`
+
+114 lines, 5626 bytes
+
+```python
+#!/usr/bin/env python3
+"""Third wave: concurrency, and reconstruction from evidence alone."""
+import hashlib, json, sqlite3, threading, time, sys
+import continuity as lineage
+# --- stand-in for the deployed engine ---------------------------------
+import types as _types
+_ENGINE = {"verdict": "ALLOW"}
+
+def install_engine(verdict="ALLOW", raises=False, shape="dict"):
+    _ENGINE["verdict"] = verdict
+    mod = _types.ModuleType("server")
+    mod.get_bearer = lambda *a, **k: None
+    def score_event(event):
+        if raises:
+            raise RuntimeError("engine down")
+        if shape == "dict":
+            return {"decision": _ENGINE["verdict"], "score": 0.1}
+        if shape == "tuple":
+            return (_ENGINE["verdict"], 0.1)
+        return _ENGINE["verdict"]
+    mod.score_event = score_event
+    sys.modules["server"] = mod
+
+def remove_engine():
+    sys.modules.pop("server", None)
+
+install_engine("ALLOW")
+
+
+PASS, FAIL = [], []
+NOW, HOUR = time.time(), 3600
+
+def make_ctx():
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    lock = threading.RLock(); n = {"i": 0}
+    def seal(ev, res, ts, k):
+        with lock:
+            n["i"] += 1
+            return hashlib.sha256(json.dumps([ev,res,ts],sort_keys=True,default=str).encode()).hexdigest(), n["i"], n["i"]
+    lineage._ready = False
+    ctx = {"conn": conn, "lock": lock, "seal": seal}
+    lineage._setup(ctx); return ctx
+
+def check(n, c, d=""):
+    (PASS if c else FAIL).append(n)
+    print(("  ok   " if c else "  FAIL ") + n + (("  -> " + str(d)[:250]) if d and not c else ""))
+
+print("\n=== 27. concurrent execution of one ALLOW ===")
+ctx = make_ctx()
+lineage._issue(ctx,"k",dict(id="root",issuer="owner@example.com",issuer_kind="human",
+    subject="agent",scope=["payments.refund"],constraints={"max_amount":5000},
+    purpose="refunds",purpose_tags=["refunds"],not_after=NOW+HOUR,delegations_left=0))
+r,_ = lineage._evaluate(ctx,"k",{"grant":"root","action":"payments.refund",
+    "params":{"amount":100},"purpose_tag":"refunds"})
+eid = r["evaluation"]; results = []
+def race():
+    c,_ = lineage._confirm(ctx,"k",{"evaluation":eid,"action":"payments.refund","params":{"amount":100}})
+    results.append(c["bound"])
+ts = [threading.Thread(target=race) for _ in range(8)]
+[t.start() for t in ts]; [t.join() for t in ts]
+check("exactly one of eight concurrent executions binds", results.count(True) == 1, results)
+with ctx["lock"]:
+    rows = ctx["conn"].execute("SELECT COUNT(*) FROM auth_exec WHERE eval_id=? AND outcome<>'rejected'",(eid,)).fetchone()
+check("only one accepted binding exists in storage", rows[0] == 1, rows)
+
+print("\n=== 28. reconstruct the whole story from the sealed record ===")
+ctx = make_ctx()
+lineage._issue(ctx,"k",dict(id="r",issuer="owner@example.com",issuer_kind="human",
+    subject="orchestrator",scope=["payments.*"],constraints={"max_amount":5000},
+    purpose="close the refund backlog",purpose_tags=["refunds"],
+    not_after=NOW+HOUR,delegations_left=2))
+lineage._issue(ctx,"k",dict(id="m",parent="r",issuer="orchestrator",issuer_kind="agent",
+    subject="refund-bot",scope=["payments.refund"],constraints={"max_amount":200},
+    purpose="issue small refunds",purpose_tags=["refunds"],not_after=NOW+HOUR,delegations_left=0))
+r,_ = lineage._evaluate(ctx,"k",{"grant":"m","action":"payments.refund",
+    "params":{"amount":150},"purpose_tag":"refunds"})
+t,code = lineage._trace(ctx,{"grant":"m"})
+check("the trace names who authorised it", t["authorised_by"] == "owner@example.com")
+check("the trace names who held it at execution", t["holder"] == "refund-bot")
+check("the trace shows what changed at each hop",
+      t["lineage"][0]["scope"] == ["payments.*"] and t["lineage"][1]["scope"] == ["payments.refund"])
+check("the effective constraint is the narrowest, not the granted one",
+      float(t["effective_constraints"]["max_amount"]) == 200, t["effective_constraints"])
+d,code = lineage._decision(ctx,{"evaluation":r["evaluation"]})
+check("the decision is retrievable without a key and matches", d["verdict"] == r["verdict"])
+check("the decision carries the lineage digest", d["lineage_digest"] == r["lineage_digest"])
+check("every hop carries its own block index",
+      all(h["block_index"] for h in t["lineage"]))
+
+print("\n=== 29. widening midway is visible in the trace, not just blocked ===")
+ctx = make_ctx()
+lineage._issue(ctx,"k",dict(id="r",issuer="owner@example.com",issuer_kind="human",
+    subject="a",scope=["payments.refund"],constraints={"max_amount":100},
+    purpose="p",purpose_tags=["refunds"],not_after=NOW+HOUR,delegations_left=2))
+lineage._issue(ctx,"k",dict(id="m",parent="r",issuer="a",issuer_kind="agent",
+    subject="b",scope=["payments.refund"],constraints={"max_amount":100},
+    purpose="p",purpose_tags=["refunds"],not_after=NOW+HOUR,delegations_left=1,
+    risk_accepted_by="owner@example.com"))
+with ctx["lock"]:
+    ctx["conn"].execute("UPDATE auth_grant SET constraints=? WHERE id='m'",
+        (json.dumps({"max_amount":100000},sort_keys=True,separators=(",",":")),))
+    ctx["conn"].commit()
+t,_ = lineage._trace(ctx,{"grant":"m"})
+check("the trace flags the altered hop by name",
+      t["lineage"][1]["integrity"] == "FAILED" and t["lineage"][0]["integrity"] == "ok", t["lineage"])
+r,_ = lineage._evaluate(ctx,"k",{"grant":"m","action":"payments.refund",
+    "params":{"amount":50},"purpose_tag":"refunds"})
+check("and the exercise names the exact grant that broke", r["broken_at"] == "m", r["broken_at"])
+
+print("\n" + "="*60)
+print("passed %d, failed %d" % (len(PASS), len(FAIL)))
+for f in FAIL: print("  FAILED: "+f)
+sys.exit(1 if FAIL else 0)
+
+```
+
+
+## `tests/attack_continuity_4.py`
+
+107 lines, 4723 bytes
+
+```python
+#!/usr/bin/env python3
+"""Fourth wave: does it actually compose with the existing engine, and can
+either side be bypassed by the other?"""
+import hashlib, json, sqlite3, threading, time, sys, types
+import continuity as C
+
+PASS, FAIL = [], []
+NOW, HOUR = time.time(), 3600
+STATE = {"verdict": "ALLOW", "raises": False, "shape": "dict", "seen": []}
+
+def install(verdict="ALLOW", raises=False, shape="dict"):
+    STATE.update(verdict=verdict, raises=raises, shape=shape)
+    m = types.ModuleType("server")
+    m.get_bearer = lambda *a, **k: None
+    def score_event(event):
+        STATE["seen"].append(event)
+        if STATE["raises"]: raise RuntimeError("engine down")
+        if STATE["shape"] == "dict": return {"decision": STATE["verdict"], "score": 0.42}
+        if STATE["shape"] == "tuple": return (STATE["verdict"], 0.42)
+        if STATE["shape"] == "junk": return {"nothing": "useful"}
+        return STATE["verdict"]
+    m.score_event = score_event
+    sys.modules["server"] = m
+
+def make_ctx():
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    lock = threading.RLock(); n = {"i":0}
+    def seal(ev,res,ts,k):
+        n["i"] += 1
+        return hashlib.sha256(json.dumps([ev,res,ts],sort_keys=True,default=str).encode()).hexdigest(), n["i"], n["i"]
+    C._ready = False
+    ctx = {"conn":conn,"lock":lock,"seal":seal}; C._setup(ctx); return ctx
+
+def check(n,c,d=""):
+    (PASS if c else FAIL).append(n)
+    print(("  ok   " if c else "  FAIL ")+n+(("  -> "+str(d)[:250]) if d and not c else ""))
+
+def setup():
+    ctx = make_ctx()
+    C._issue(ctx,"k",dict(id="root",issuer="owner@example.com",issuer_kind="human",
+        subject="agent",scope=["payments.refund"],
+        constraints={"max_amount":5000,"allowed_currency":["GBP"]},
+        purpose="refunds",purpose_tags=["refunds"],not_after=NOW+HOUR,delegations_left=0))
+    return ctx
+
+def run(ctx, amount=100):
+    return C._evaluate(ctx,"k",{"grant":"root","action":"payments.refund",
+        "params":{"amount":amount,"currency":"GBP"},"purpose_tag":"refunds"})[0]
+
+print("\n=== 30. the engine is actually consulted ===")
+install("ALLOW"); STATE["seen"] = []
+r = run(setup())
+check("a clean authority plus a clean engine is ALLOW", r["verdict"]=="ALLOW", r)
+check("the engine was called with the real action and amount",
+      STATE["seen"] and STATE["seen"][-1]["action"]=="payments.refund"
+      and STATE["seen"][-1]["amount"]==100, STATE["seen"][-1] if STATE["seen"] else None)
+check("both components are reported separately",
+      r["authority_verdict"]=="ALLOW" and r["risk_verdict"]=="ALLOW", r)
+
+print("\n=== 31. neither side can wave the other through ===")
+install("BLOCK")
+r = run(setup())
+check("perfect authority does not survive an engine BLOCK", r["verdict"]=="BLOCK", r)
+check("the authority component still reads ALLOW underneath it",
+      r["authority_verdict"]=="ALLOW", r)
+install("CHALLENGE")
+r = run(setup())
+check("an engine CHALLENGE lifts a clean authority to CHALLENGE", r["verdict"]=="CHALLENGE", r)
+install("ALLOW")
+ctx = setup()
+r = C._evaluate(ctx,"k",{"grant":"root","action":"payments.transfer",
+    "params":{"amount":1},"purpose_tag":"refunds"})[0]
+check("a clean engine does not confer authority nobody granted", r["verdict"]=="BLOCK", r)
+check("and the engine is not even asked once authority has failed",
+      r["risk_engine"]["available"] is False, r["risk_engine"])
+
+print("\n=== 32. a missing or broken engine is not an ALLOW ===")
+install("ALLOW", raises=True)
+r = run(setup())
+check("an engine that throws downgrades ALLOW to CHALLENGE", r["verdict"]=="CHALLENGE", r)
+install("ALLOW", shape="junk")
+r = run(setup())
+check("an unreadable engine response downgrades to CHALLENGE", r["verdict"]=="CHALLENGE", r)
+sys.modules.pop("server", None); sys.modules.pop("__main__", None)
+r = run(setup())
+check("no engine present downgrades to CHALLENGE", r["verdict"]=="CHALLENGE", r)
+check("the reason names the missing engine",
+      any("risk engine" in x for x in r["reasons"]), r["reasons"])
+
+print("\n=== 33. it reads the engine's other return shapes ===")
+for shape in ("dict","tuple","str"):
+    install("BLOCK", shape=shape)
+    r = run(setup())
+    check("a %s return shape is understood" % shape, r["verdict"]=="BLOCK", r["risk_engine"])
+
+print("\n=== 34. an engine BLOCK cannot be executed ===")
+install("BLOCK")
+ctx = setup(); r = run(ctx)
+c,_ = C._confirm(ctx,"k",{"evaluation":r["evaluation"],"action":"payments.refund",
+    "params":{"amount":100,"currency":"GBP"}})
+check("execution is refused when the engine blocked", c["bound"] is False, c)
+
+print("\n" + "="*60)
+print("passed %d, failed %d" % (len(PASS), len(FAIL)))
+for f in FAIL: print("  FAILED: "+f)
+sys.exit(1 if FAIL else 0)
+
+```
+
+
+## `tests/attack_continuity_5.py`
+
+116 lines, 5639 bytes
+
+```python
+#!/usr/bin/env python3
+"""Fifth wave: risk acceptance. Who put their name to this capability
+existing at all - separately from who granted it and who holds it."""
+import hashlib, json, sqlite3, threading, time, sys, types
+import continuity as C
+
+PASS, FAIL = [], []
+NOW, HOUR = time.time(), 3600
+
+def install():
+    m = types.ModuleType("server")
+    m.get_bearer = lambda *a, **k: None
+    m.score_event = lambda e: {"decision": "ALLOW", "score": 0.1}
+    sys.modules["server"] = m
+install()
+
+def make_ctx():
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    lock = threading.RLock(); n = {"i":0}
+    def seal(ev,res,ts,k):
+        n["i"] += 1
+        return hashlib.sha256(json.dumps([ev,res,ts],sort_keys=True,default=str).encode()).hexdigest(), n["i"], n["i"]
+    C._ready = False
+    ctx = {"conn":conn,"lock":lock,"seal":seal}; C._setup(ctx); return ctx
+
+def check(n,c,d=""):
+    (PASS if c else FAIL).append(n)
+    print(("  ok   " if c else "  FAIL ")+n+(("  -> "+str(d)[:250]) if d and not c else ""))
+
+def root(ctx, **over):
+    args = dict(id="root", issuer="owner@example.com", issuer_kind="human",
+                subject="orchestrator", scope=["payments.refund"],
+                constraints={"max_amount":5000}, purpose="refunds",
+                purpose_tags=["refunds"], not_after=NOW+HOUR, delegations_left=3)
+    args.update(over)
+    return C._issue(ctx,"k",args)
+
+print("\n=== 35. a root accepts its own risk by default ===")
+ctx = make_ctx()
+r, code = root(ctx)
+check("a root grant records an acceptor without being asked",
+      code == 200 and r["risk_accepted_by"] == "owner@example.com", r)
+r2, _ = root(ctx, id="root2", risk_accepted_by="risk.officer@example.com")
+check("a root can name someone other than the issuer",
+      r2["risk_accepted_by"] == "risk.officer@example.com", r2)
+
+print("\n=== 36. switching on onward delegation needs a name ===")
+ctx = make_ctx(); root(ctx)
+r, code = C._issue(ctx,"k",dict(id="deleg", parent="root", issuer="orchestrator",
+    issuer_kind="agent", subject="b", scope=["payments.refund"],
+    constraints={"max_amount":100}, purpose="refunds", purpose_tags=["refunds"],
+    not_after=NOW+HOUR, delegations_left=1))
+check("a delegable child with no acceptor is refused",
+      code == 409 and r.get("error") == "risk_acceptance_required", r)
+
+r, code = C._issue(ctx,"k",dict(id="leaf", parent="root", issuer="orchestrator",
+    issuer_kind="agent", subject="b", scope=["payments.refund"],
+    constraints={"max_amount":100}, purpose="refunds", purpose_tags=["refunds"],
+    not_after=NOW+HOUR, delegations_left=0))
+check("a non-delegable child inherits the acceptor above it", code == 200, r)
+
+r, code = C._issue(ctx,"k",dict(id="deleg2", parent="root", issuer="orchestrator",
+    issuer_kind="agent", subject="b", scope=["payments.refund"],
+    constraints={"max_amount":100}, purpose="refunds", purpose_tags=["refunds"],
+    not_after=NOW+HOUR, delegations_left=1, risk_accepted_by="head.of.ops@example.com"))
+check("a delegable child with a named acceptor is accepted", code == 200, r)
+
+print("\n=== 37. the decision names the accountable person ===")
+e, _ = C._evaluate(ctx,"k",{"grant":"leaf","action":"payments.refund",
+    "params":{"amount":10},"purpose_tag":"refunds"})
+check("an evaluation reports who accepts the risk",
+      e["risk_accepted_by"] == "owner@example.com", e.get("risk_accepted_by"))
+check("...separately from who authorised it and who executed it",
+      e["authorised_by"] == "owner@example.com" and e["executed_by"] == "b", e)
+
+e2, _ = C._evaluate(ctx,"k",{"grant":"deleg2","action":"payments.refund",
+    "params":{"amount":10},"purpose_tag":"refunds"})
+check("the nearest acceptor wins, not the root one",
+      e2["risk_accepted_by"] == "head.of.ops@example.com", e2.get("risk_accepted_by"))
+
+t, _ = C._trace(ctx,{"grant":"deleg2"})
+check("the trace shows the acceptor at each hop",
+      t["risk_accepted_by"] == "head.of.ops@example.com" and
+      t["lineage"][0]["risk_accepted_by"] == "owner@example.com", t)
+
+print("\n=== 38. an unaccepted lineage cannot act ===")
+ctx = make_ctx(); root(ctx)
+C._issue(ctx,"k",dict(id="leaf", parent="root", issuer="orchestrator",
+    issuer_kind="agent", subject="b", scope=["payments.refund"],
+    constraints={"max_amount":100}, purpose="refunds", purpose_tags=["refunds"],
+    not_after=NOW+HOUR, delegations_left=0))
+with ctx["lock"]:
+    ctx["conn"].execute("UPDATE auth_grant SET risk_accepted_by=NULL")
+    ctx["conn"].commit()
+e, _ = C._evaluate(ctx,"k",{"grant":"leaf","action":"payments.refund",
+    "params":{"amount":10},"purpose_tag":"refunds"})
+check("stripping every acceptor blocks the action", e["verdict"] == "BLOCK", e["reasons"])
+check("...and says an incident would have no accountable person",
+      any("accountable" in x for x in e["reasons"]), e["reasons"])
+
+print("\n=== 39. the acceptor cannot be swapped after the fact ===")
+ctx = make_ctx(); root(ctx, risk_accepted_by="risk.officer@example.com")
+with ctx["lock"]:
+    ctx["conn"].execute("UPDATE auth_grant SET risk_accepted_by='someone.else@example.com' WHERE id='root'")
+    ctx["conn"].commit()
+e, _ = C._evaluate(ctx,"k",{"grant":"root","action":"payments.refund",
+    "params":{"amount":10},"purpose_tag":"refunds"})
+check("editing who accepted the risk fails the digest", e["verdict"] == "BLOCK", e["reasons"])
+check("...reported as an evidence failure, naming the grant",
+      e["broken_invariant"] == "evidence_continuity" and e["broken_at"] == "root", e)
+
+print("\n" + "="*60)
+print("passed %d, failed %d" % (len(PASS), len(FAIL)))
+for f in FAIL: print("  FAILED: "+f)
+sys.exit(1 if FAIL else 0)
 
 ```
