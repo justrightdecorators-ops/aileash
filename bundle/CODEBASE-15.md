@@ -1,17 +1,1597 @@
 # Codebase — part 15 of 24
 
 Contains:
+- `sebdog_engine.py`
+- `sebdog_licence.py`
+- `sebdog_reporter.py`
 - `tests/attack_continuity_1.py`
 - `tests/attack_continuity_2.py`
 - `tests/attack_continuity_3.py`
 - `tests/attack_continuity_4.py`
 - `tests/attack_continuity_5.py`
-- `tests/attack_continuity_6.py`
-- `tests/attack_witnessed.py`
-- `verify_authority.py`
-- `AILeash-API-Reference-v6.4.2.md`
-- `LICENCE`
-- `README.md`
+
+
+## `sebdog_engine.py`
+
+842 lines, 32546 bytes
+
+```python
+"""
+SEBDOG ENGINE v1.2.0
+Local compliance engine. Runs on your hardware. Data never leaves it.
+Copyright (c) 2026 Justin Antony Dobson / Monop Content, Blyth, UK
+
+WHAT CHANGED IN 1.2
+-------------------
+1. NO PHONE HOME. v1.1 called sebbi.pro on startup and every 24 hours,
+   returned 403 without a valid licence and exited if it could not reach
+   the server. So "sovereign" described the data and not the engine, and
+   an air-gapped box could not run it at all. Licensing is now an
+   Ed25519 token validated locally by sebdog_licence v2. This process
+   makes no outbound call to sebbi.pro, ever. Verify that with a packet
+   capture rather than taking it from a docstring.
+
+2. IT CAN BE WITNESSED. Two new routes:
+       GET  /tip               your current chain head, for peers to seal
+       POST /witness/observe   seal a peer's head into your chain
+   That is the whole witness protocol. Point meshwitness.py at this
+   engine and your on-premise chain is sealed into chains held by
+   operators neither you nor your vendor controls. A local hash chain
+   proves nothing against the party who owns the file - this is what
+   turns it into evidence.
+
+3. THE SEAL RACE IS FIXED. v1.1 read the chain tip under the lock,
+   released it, then took the lock again to insert. Two concurrent
+   requests could read the same prev_hash and both write against it.
+   Tip read, hash and insert now happen inside one lock hold, which is
+   how server.py has done it since the same bug was found there.
+
+4. /govern NO LONGER ACCEPTS AN EMPTY BEARER. v1.1 checked
+   `if bearer and bearer != key`, so a request with no Authorization
+   header passed straight through and was rate-limited under "default".
+   Any process on the host could drive the engine. A matching bearer is
+   now required.
+
+5. BACKUPS CANNOT BE TORN. shutil.copy2 on a live WAL database can copy
+   a half-written file. Backups now use sqlite3's own backup API, which
+   is transactionally safe on a running database, and each backup is
+   sealed into the chain - so restoring an older backup is visible
+   rather than silent.
+
+SOVEREIGNTY, STATED PRECISELY
+-----------------------------
+    The engine makes no outbound connection of any kind.
+    Your decisions, your events and your chain stay on your disk.
+    If you enable witnessing, ONE hash leaves - your chain head. It
+    cannot be reversed into anything and it reveals nothing but the
+    fact that your chain exists and has moved.
+
+WHAT IT DOES NOT DO
+-------------------
+    It does not prove a decision was correct. Wrong answers seal as
+    cleanly as right ones.
+    It does not prove your records are complete. A chain can be intact
+    and simply not contain what matters.
+    Witnessing does not make your log true. It makes it impossible to
+    rewrite quietly after the fact.
+
+RUN IT
+    python3 sebdog_engine.py --token <your licence token>
+    python3 sebdog_engine.py --token-file licence.txt --port 9090
+"""
+
+import argparse
+import hashlib
+import json
+import math
+import os
+import shutil
+import sqlite3
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections import defaultdict, deque
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
+from urllib.parse import urlparse
+
+try:
+    import sebdog_licence as licence
+except ImportError:
+    licence = None
+
+VERSION = "1.2.0"
+HOME = "https://sebbi.pro"
+DB_FILE = "sebdog_audit.db"
+CHAIN_NAME = "sebdog-local"
+SAFE = {"UK", "US", "DE", "FR", "CA", "AU", "NL", "SE", "NO", "DK",
+        "FI", "IE", "NZ"}
+REQ = {"user_id", "action", "amount", "country", "device_id", "anomaly",
+       "device_risk"}
+HEX64 = set("0123456789abcdef")
+
+_db_lock = threading.Lock()
+_key_wins = defaultdict(lambda: {"min": deque(), "hour": deque()})
+_key_lock = threading.Lock()
+W60 = defaultdict(deque)
+W5M = defaultdict(deque)
+W1H = defaultdict(deque)
+
+_licence = {"valid": False, "plan": "free", "product": "aileash",
+            "devices": 1, "email": "", "checked_at": 0, "key": "",
+            "expires": 0, "grace": False}
+
+_conn = None
+
+
+# ==============================================================================
+# LICENCE - validated locally, no network
+# ==============================================================================
+
+def load_licence(token, pubkey=None):
+    """Validate an Ed25519 licence token offline. No outbound call."""
+    global _licence
+    if licence is None:
+        print("[SEBDOG] sebdog_licence.py not found next to this file.",
+              flush=True)
+        return False
+    data, err = licence.validate_token(token, pubkey)
+    if err:
+        explain = {
+            "no_public_key": "No licence public key is configured. Set "
+                             "SEBDOG_LICENCE_PUBKEY or edit LICENCE_PUBKEY "
+                             "in sebdog_licence.py.",
+            "invalid_signature": "This token was not signed by the expected "
+                                 "key, or it has been altered.",
+            "token_expired": "This licence expired more than 7 days ago.",
+            "version_mismatch": "This is an old v1 token. v1 tokens were "
+                                "verifiable by anyone holding the shared "
+                                "secret and have been withdrawn. Request a "
+                                "replacement.",
+            "invalid_format": "This does not decode as a licence token.",
+        }.get(err, err)
+        print("[SEBDOG] Licence rejected: %s\n           %s" % (err, explain),
+              flush=True)
+        return False
+
+    _licence.update({
+        "valid": True, "plan": data.get("plan", "free"),
+        "devices": data.get("devices", 1), "email": data.get("email", ""),
+        "key": data.get("key", ""), "expires": data.get("expires", 0),
+        "checked_at": time.time(),
+        "grace": licence.is_in_grace_period(data),
+    })
+    days = licence.days_until_expiry(data)
+    print("[SEBDOG] Licence valid, checked locally. Plan:%s Devices:%s"
+          % (_licence["plan"], _licence["devices"]), flush=True)
+    if _licence["grace"]:
+        print("[SEBDOG] EXPIRED - running on the 7 day grace period. Renew "
+              "at %s" % HOME, flush=True)
+    elif days < 30:
+        print("[SEBDOG] Licence expires in %d days." % days, flush=True)
+    return True
+
+
+def licence_watch():
+    """Re-check expiry hourly against the local clock. Still no network."""
+    while True:
+        time.sleep(3600)
+        if _licence["expires"] and _licence["expires"] < time.time():
+            if not _licence["grace"]:
+                _licence["grace"] = True
+                print("[SEBDOG] Licence has expired. 7 day grace period "
+                      "started. Renew at %s" % HOME, flush=True)
+            if _licence["expires"] + licence.GRACE_SECONDS < time.time():
+                _licence["valid"] = False
+                print("[SEBDOG] Grace period over. Governing is disabled; "
+                      "your chain and data are untouched.", flush=True)
+
+
+# ==============================================================================
+# DATABASE + BACKUP
+# ==============================================================================
+
+def get_conn():
+    c = sqlite3.connect(DB_FILE, check_same_thread=False)
+    c.execute("PRAGMA journal_mode=WAL;")
+    c.execute("PRAGMA synchronous=NORMAL;")
+    c.execute("""CREATE TABLE IF NOT EXISTS users(
+        user_id TEXT PRIMARY KEY, trust REAL DEFAULT 0.5,
+        last_country TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS audit_log(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, user_id TEXT,
+        event_json TEXT, result_json TEXT, prev_hash TEXT,
+        audit_hash TEXT UNIQUE)""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_audit ON audit_log(user_id)")
+    c.execute("""CREATE TABLE IF NOT EXISTS chain_snapshots(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL,
+        block_count INTEGER, tip_hash TEXT, snapshot_file TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS witness_seen(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, peer TEXT, tip TEXT,
+        url TEXT, observed REAL, audit_hash TEXT,
+        UNIQUE(peer, tip))""")
+    c.commit()
+    return c
+
+
+def init_db():
+    global _conn
+    _conn = get_conn()
+
+
+def backup_db():
+    """
+    Timestamped backup using sqlite3's own backup API.
+
+    v1.1 used shutil.copy2, which on a live WAL database can copy a file
+    mid-write and produce a backup that will not open. The backup API is
+    transactionally consistent against a running connection.
+
+    The backup is then SEALED into the chain, so restoring an older
+    database later is detectable rather than silent.
+    """
+    backup_dir = os.path.join(os.path.dirname(os.path.abspath(DB_FILE)),
+                              "sebdog_backups")
+    os.makedirs(backup_dir, exist_ok=True)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(backup_dir, "sebdog_audit_%s.db" % stamp)
+    try:
+        with _db_lock:
+            dest = sqlite3.connect(path)
+            _conn.backup(dest)
+            dest.close()
+            blocks = _conn.execute(
+                "SELECT COUNT(*) FROM audit_log").fetchone()[0]
+            tip = _conn.execute("SELECT audit_hash FROM audit_log "
+                                "ORDER BY id DESC LIMIT 1").fetchone()
+            tip_hash = tip[0] if tip else "GENESIS"
+            _conn.execute("INSERT INTO chain_snapshots(ts,block_count,"
+                          "tip_hash,snapshot_file) VALUES(?,?,?,?)",
+                          (time.time(), blocks, tip_hash, path))
+            _conn.commit()
+
+        # sealed outside the lock - seal() takes it itself
+        seal({"user_id": "sebdog", "action": "backup_created",
+              "amount": 0, "country": "UK", "device_id": "sebdog",
+              "anomaly": 0, "device_risk": 0},
+             {"decision": "BACKUP", "score": 0, "version": VERSION,
+              "blocks_at_backup": blocks, "tip_at_backup": tip_hash,
+              "note": "backup sealed so a later restore of an older "
+                      "database is visible in the chain"},
+             time.time())
+        print("[SEBDOG] Backup created and sealed: %s (%d blocks)"
+              % (path, blocks), flush=True)
+        _cleanup_old_backups(backup_dir)
+    except Exception as e:
+        print("[SEBDOG] Backup failed: %s" % e, flush=True)
+
+
+def _cleanup_old_backups(backup_dir, keep=7):
+    try:
+        files = sorted(os.path.join(backup_dir, f)
+                       for f in os.listdir(backup_dir)
+                       if f.startswith("sebdog_audit_") and f.endswith(".db"))
+        for old in files[:-keep]:
+            os.remove(old)
+    except Exception:
+        pass
+
+
+def backup_loop():
+    while True:
+        time.sleep(86400)
+        backup_db()
+
+
+def restore_latest_backup():
+    backup_dir = os.path.join(os.path.dirname(os.path.abspath(DB_FILE)),
+                              "sebdog_backups")
+    if not os.path.exists(backup_dir):
+        return False
+    files = sorted(os.path.join(backup_dir, f)
+                   for f in os.listdir(backup_dir)
+                   if f.startswith("sebdog_audit_") and f.endswith(".db"))
+    if not files:
+        return False
+    try:
+        shutil.copy2(files[-1], DB_FILE)
+        print("[SEBDOG] Restored from backup: %s" % files[-1], flush=True)
+        return True
+    except Exception as e:
+        print("[SEBDOG] Restore failed: %s" % e, flush=True)
+        return False
+
+
+def list_snapshots():
+    with _db_lock:
+        rows = _conn.execute(
+            "SELECT ts,block_count,tip_hash,snapshot_file FROM "
+            "chain_snapshots ORDER BY id DESC LIMIT 10").fetchall()
+    return [{"ts": r[0], "blocks": r[1], "tip": r[2], "file": r[3]}
+            for r in rows]
+
+
+# ==============================================================================
+# RATE LIMITING
+# ==============================================================================
+
+def check_rate(key):
+    t = time.time()
+    with _key_lock:
+        w = _key_wins[key]
+        while w["min"] and w["min"][0] < t - 60:
+            w["min"].popleft()
+        while w["hour"] and w["hour"][0] < t - 3600:
+            w["hour"].popleft()
+        if len(w["min"]) >= 60:
+            return False, "rate_limit_minute"
+        if len(w["hour"]) >= 1000:
+            return False, "rate_limit_hour"
+        w["min"].append(t)
+        w["hour"].append(t)
+        return True, None
+
+
+# ==============================================================================
+# CORE ENGINE
+# ==============================================================================
+
+def now():
+    return time.time()
+
+
+def clamp(x, a=0.0, b=1.0):
+    return max(a, min(b, x))
+
+
+def sha(p):
+    return hashlib.sha256(json.dumps(p, sort_keys=True).encode()).hexdigest()
+
+
+def upd_vel(uid):
+    t = now()
+    for q in (W60[uid], W5M[uid], W1H[uid]):
+        q.append(t)
+    c = now()
+    W60[uid] = deque(x for x in W60[uid] if x >= c - 60)
+    W5M[uid] = deque(x for x in W5M[uid] if x >= c - 300)
+    W1H[uid] = deque(x for x in W1H[uid] if x >= c - 3600)
+
+
+def vel(uid):
+    return {"60s": len(W60[uid]), "5m": len(W5M[uid]), "1h": len(W1H[uid])}
+
+
+def load_user(uid):
+    with _db_lock:
+        r = _conn.execute("SELECT trust,last_country FROM users WHERE "
+                          "user_id=?", (uid,)).fetchone()
+    return ({"trust": r[0], "last_country": r[1]} if r
+            else {"trust": 0.5, "last_country": None})
+
+
+def save_user(uid, trust, country):
+    with _db_lock:
+        _conn.execute(
+            "INSERT INTO users(user_id,trust,last_country) VALUES(?,?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET trust=excluded.trust,"
+            "last_country=excluded.last_country", (uid, trust, country))
+        _conn.commit()
+
+
+def score_event(s):
+    reasons = []
+    sc = (1 - s["trust"]) * 0.30
+    v60 = s["v60"]
+    sc += min(v60 / 20, 1) * 0.15
+    if v60 > 10:
+        reasons.append("velocity_spike")
+    sc += min(s["v5m"] / 50, 1) * 0.10 + min(s["v1h"] / 200, 1) * 0.10
+    amt = float(s.get("amount", 0))
+    sc += min(math.log1p(amt) / math.log1p(10000), 1) * 0.15
+    if amt > 500:
+        reasons.append("high_amount")
+    dr = float(s.get("device_risk", 0))
+    sc += dr * 0.10
+    if dr > 0.5:
+        reasons.append("risky_device")
+    an = float(s.get("anomaly", 0))
+    sc += an * 0.10
+    if an > 0.5:
+        reasons.append("behaviour_anomaly")
+    if s.get("country_shift"):
+        sc += 0.10
+        reasons.append("country_shift")
+    if s.get("unsafe_country"):
+        sc += 0.10
+        reasons.append("unsafe_country")
+    if s["trust"] < 0.4:
+        reasons.append("low_trust")
+    return round(clamp(sc), 4), reasons
+
+
+def decide(sc):
+    if sc < 0.35:
+        return "ALLOW"
+    if sc < 0.70:
+        return "CHALLENGE"
+    return "BLOCK"
+
+
+def upd_trust(t, d):
+    if d == "ALLOW":
+        t += (1 - t) * 0.01
+    elif d == "CHALLENGE":
+        t -= t * 0.02
+    elif d == "BLOCK":
+        t -= t * 0.08
+    return clamp(t, 0.05, 1.0)
+
+
+def chain_tip():
+    with _db_lock:
+        r = _conn.execute("SELECT audit_hash FROM audit_log ORDER BY id "
+                          "DESC LIMIT 1").fetchone()
+    return r[0] if r else "GENESIS"
+
+
+def chain_head():
+    """Tip plus height, in one lock hold, for /tip."""
+    with _db_lock:
+        r = _conn.execute("SELECT audit_hash,ts,id FROM audit_log "
+                          "ORDER BY id DESC LIMIT 1").fetchone()
+    if not r:
+        return "GENESIS", None, 0
+    return r[0], r[1], r[2]
+
+
+def seal(event, result, ts):
+    """
+    Tip read, hash and insert inside ONE lock hold.
+
+    v1.1 read the tip under the lock, released it, then re-acquired to
+    insert. Between those two points another thread could read the same
+    prev_hash, and both writes would claim the same predecessor. The
+    same bug was found and fixed in server.py; this is that fix.
+    """
+    with _db_lock:
+        r = _conn.execute("SELECT audit_hash FROM audit_log ORDER BY id "
+                          "DESC LIMIT 1").fetchone()
+        prev = r[0] if r else "GENESIS"
+        h = sha({"prev_hash": prev, "ts": ts, "event": event,
+                 "result": result})
+        _conn.execute(
+            "INSERT INTO audit_log(ts,user_id,event_json,result_json,"
+            "prev_hash,audit_hash) VALUES(?,?,?,?,?,?)",
+            (ts, event["user_id"], json.dumps(event), json.dumps(result),
+             prev, h))
+        _conn.commit()
+    return h
+
+
+def verify_chain():
+    with _db_lock:
+        rows = _conn.execute(
+            "SELECT event_json,result_json,prev_hash,audit_hash,ts FROM "
+            "audit_log ORDER BY id ASC").fetchall()
+    if not rows:
+        return {"valid": True, "blocks": 0, "message": "Empty chain"}
+    prev = "GENESIS"
+    for i, row in enumerate(rows):
+        p = {"prev_hash": row[2], "ts": row[4],
+             "event": json.loads(row[0]), "result": json.loads(row[1])}
+        if sha(p) != row[3] or row[2] != prev:
+            return {"valid": False, "broken_at": i,
+                    "message": "Tampered at block %d" % i}
+        prev = row[3]
+    return {"valid": True, "blocks": len(rows), "tip": rows[-1][3],
+            "message": "Chain intact"}
+
+
+def govern(event):
+    missing = REQ - event.keys()
+    if missing:
+        raise ValueError("Missing fields: %s" % missing)
+    if not _licence["valid"]:
+        return {"error": "licence_invalid",
+                "message": "A valid licence token is required. Get one at "
+                           "%s. Your chain and data are untouched." % HOME}, 403
+    ts = now()
+    uid = event["user_id"]
+    state = load_user(uid)
+    upd_vel(uid)
+    v = vel(uid)
+    country = event["country"]
+    signals = {
+        "trust": state["trust"], "v60": v["60s"], "v5m": v["5m"],
+        "v1h": v["1h"], "amount": float(event.get("amount", 0)),
+        "device_risk": float(event.get("device_risk", 0)),
+        "anomaly": float(event.get("anomaly", 0)),
+        "country_shift": (state["last_country"] is not None
+                          and state["last_country"] != country),
+        "unsafe_country": country not in SAFE,
+    }
+    sc, reasons = score_event(signals)
+    dec = decide(sc)
+    trust = upd_trust(state["trust"], dec)
+    save_user(uid, trust, country)
+    result = {"decision": dec, "score": sc, "trust": round(trust, 4),
+              "reasons": reasons, "version": VERSION, "engine": "sebdog",
+              "local": True, "timestamp": ts}
+    result["audit_hash"] = seal(event, result, ts)
+    return result, 200
+
+
+# ==============================================================================
+# WITNESSING
+#
+# A local hash chain proves nothing against the person who owns the file.
+# These two routes are what let somebody else hold your history.
+# ==============================================================================
+
+def observe(data):
+    """Seal a peer's chain head into this chain. Never rejects a
+    well-formed submission - the record says what arrived, not whether
+    we approve of it."""
+    peer = str(data.get("chain") or data.get("peer") or "").strip().lower()
+    if not peer or len(peer) > 80:
+        return {"error": "chain_required",
+                "message": "A short stable identifier - a domain works."}, 400
+    tip = str(data.get("tip", "")).strip().lower()
+    if len(tip) != 64 or not all(c in HEX64 for c in tip):
+        return {"error": "invalid_tip",
+                "message": "A tip is 64 hex characters."}, 400
+    url = str(data.get("url") or "").strip()[:400]
+
+    with _db_lock:
+        seen = _conn.execute("SELECT observed,audit_hash FROM witness_seen "
+                             "WHERE peer=? AND tip=?", (peer, tip)).fetchone()
+    if seen:
+        return {"witnessed": True, "already_seen": True, "peer": peer,
+                "tip": tip, "observed_at": seen[0],
+                "sealed_in_our_chain": seen[1],
+                "message": "Already witnessed. Their chain has not moved, "
+                           "or this is a replay."}, 200
+
+    ts = now()
+    h = seal({"user_id": "witness:" + peer, "action": "peer_tip_observed",
+              "amount": 0, "country": "UK", "device_id": "witness",
+              "anomaly": 0, "device_risk": 0},
+             {"decision": "WITNESS_SEALED", "score": 0, "version": VERSION,
+              "peer": peer, "peer_tip": tip, "peer_url": url or None,
+              "timestamp": ts,
+              "note": "a peer's chain head, sealed here. This records what "
+                      "they handed us and when. It says nothing about "
+                      "whether their chain is honest."}, ts)
+    with _db_lock:
+        _conn.execute("INSERT OR IGNORE INTO witness_seen(peer,tip,url,"
+                      "observed,audit_hash) VALUES(?,?,?,?,?)",
+                      (peer, tip, url or None, ts, h))
+        _conn.commit()
+
+    our, _t, height = chain_head()
+    return {"witnessed": True, "peer": peer, "tip": tip, "observed_at": ts,
+            "sealed_in_our_chain": h, "our_tip_now": our,
+            "our_height": height, "engine": "sebdog",
+            "what_this_proves": "That this value was handed to us at this "
+                                "time and sealed into a chain we control. "
+                                "Nothing about whether it is true."}, 200
+
+
+# ==============================================================================
+# HTTP
+# ==============================================================================
+
+def send_json(h, data, status=200):
+    body = json.dumps(data, indent=2).encode()
+    h.send_response(status)
+    h.send_header("Content-Type", "application/json")
+    h.send_header("Content-Length", str(len(body)))
+    h.send_header("Access-Control-Allow-Origin", "*")
+    h.end_headers()
+    h.wfile.write(body)
+
+
+def read_body(h):
+    n = int(h.headers.get("Content-Length", 0) or 0)
+    if n:
+        try:
+            return json.loads(h.rfile.read(n))
+        except Exception:
+            return {}
+    return {}
+
+
+def get_bearer(h):
+    auth = h.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        return auth[7:].strip()
+    return h.headers.get("X-API-Key", "").strip()
+
+
+class Handler(BaseHTTPRequestHandler):
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+        self.send_header("Access-Control-Allow-Headers",
+                         "Content-Type,Authorization,X-API-Key")
+        self.end_headers()
+
+    def do_GET(self):
+        path = urlparse(self.path).path.rstrip("/") or "/"
+
+        if path == "/tip":
+            # The witness protocol's first call. Public on purpose: a peer
+            # cannot seal what it cannot read, and a chain head reveals
+            # nothing but that the chain exists and has moved.
+            tip, ts, height = chain_head()
+            send_json(self, {
+                "chain": CHAIN_NAME, "tip": tip, "height": height,
+                "sealed_at": ts, "engine": "sebdog", "version": VERSION,
+                "note": "Seal this into your own chain. Hand us yours at "
+                        "POST /witness/observe and we will seal it here.",
+                "what_this_is": "The head of a hash chain held on this "
+                                "operator's own hardware. It is a hash and "
+                                "nothing else - no event, no record, no "
+                                "personal data, and it cannot be reversed.",
+            })
+
+        elif path == "/health":
+            send_json(self, {
+                "status": "ok", "version": VERSION, "engine": "sebdog",
+                "local": True, "phones_home": False,
+                "licence": {"valid": _licence["valid"],
+                            "plan": _licence["plan"],
+                            "devices": _licence["devices"],
+                            "email": _licence["email"],
+                            "in_grace_period": _licence["grace"],
+                            "validated": "locally, no network"}})
+
+        elif path == "/verify-chain":
+            send_json(self, verify_chain())
+
+        elif path == "/stats":
+            with _db_lock:
+                blocks = _conn.execute(
+                    "SELECT COUNT(*) FROM audit_log").fetchone()[0]
+                users = _conn.execute(
+                    "SELECT COUNT(*) FROM users").fetchone()[0]
+                peers = _conn.execute(
+                    "SELECT COUNT(DISTINCT peer) FROM witness_seen"
+                ).fetchone()[0]
+            send_json(self, {"audit_blocks": blocks, "users_tracked": users,
+                             "peers_witnessed": peers, "version": VERSION,
+                             "engine": "sebdog",
+                             "licence_valid": _licence["valid"]})
+
+        elif path == "/peers":
+            with _db_lock:
+                rows = _conn.execute(
+                    "SELECT peer,COUNT(*),MAX(observed),MAX(url) FROM "
+                    "witness_seen GROUP BY peer ORDER BY MAX(observed) DESC"
+                ).fetchall()
+            send_json(self, {
+                "count": len(rows),
+                "peers": [{"chain": r[0], "observations": r[1],
+                           "last_seen": r[2], "tip_url": r[3]}
+                          for r in rows],
+                "note": "Chains whose heads we have sealed here. Being "
+                        "listed is not endorsement of anything in their "
+                        "chain."})
+
+        elif path == "/snapshots":
+            send_json(self, {"snapshots": list_snapshots()})
+
+        elif path == "/backup":
+            # keyed - a backup writes to disk and seals a block
+            if get_bearer(self) != _licence["key"]:
+                send_json(self, {"error": "invalid_api_key"}, 401)
+                return
+            backup_db()
+            send_json(self, {"ok": True, "message": "Backup created and "
+                                                    "sealed"})
+        else:
+            send_json(self, {"error": "not_found",
+                             "routes": ["/tip", "/health", "/verify-chain",
+                                        "/stats", "/peers", "/snapshots",
+                                        "/backup (keyed)",
+                                        "POST /govern (keyed)",
+                                        "POST /witness/observe"]}, 404)
+
+    def do_POST(self):
+        path = urlparse(self.path).path.rstrip("/")
+        data = read_body(self)
+
+        if path in ("/witness/observe", "/api/witness/observe"):
+            # Open by design. A witnessing endpoint that needs an account
+            # is a customer list, not a witness network.
+            ok, ec = check_rate("witness:" + str(self.client_address[0]))
+            if not ok:
+                send_json(self, {"error": ec}, 429)
+                return
+            try:
+                result, status = observe(data)
+                send_json(self, result, status)
+            except Exception as e:
+                send_json(self, {"error": "internal", "detail": str(e)}, 500)
+            return
+
+        if path in ("/govern", "/api/govern"):
+            # v1.1 allowed a missing bearer through. It does not now.
+            bearer = get_bearer(self)
+            if not bearer or bearer != _licence["key"]:
+                send_json(self, {"error": "invalid_api_key",
+                                 "message": "Send your licence key as "
+                                            "Authorization: Bearer <key>."},
+                          401)
+                return
+            ok, ec = check_rate(bearer)
+            if not ok:
+                send_json(self, {"error": ec}, 429)
+                return
+            try:
+                result, status = govern(data)
+                send_json(self, result, status)
+            except ValueError as e:
+                send_json(self, {"error": str(e)}, 400)
+            except Exception as e:
+                send_json(self, {"error": "internal", "detail": str(e)}, 500)
+            return
+
+        send_json(self, {"error": "not_found"}, 404)
+
+
+class ThreadedServer(ThreadingMixIn, HTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+# ==============================================================================
+# ENTRY POINT
+# ==============================================================================
+
+def main():
+    p = argparse.ArgumentParser(
+        description="Sebdog Engine - local compliance engine, no phone home")
+    p.add_argument("--token", help="Your licence token from sebbi.pro")
+    p.add_argument("--token-file", help="File containing the licence token")
+    p.add_argument("--pubkey", help="Licence public key hex (overrides the "
+                                    "built-in one; for testing)")
+    p.add_argument("--port", type=int, default=9090)
+    p.add_argument("--db", default="sebdog_audit.db")
+    p.add_argument("--chain", default=None,
+                   help="Chain name other operators record you as")
+    p.add_argument("--backup-on-start", action="store_true")
+    args = p.parse_args()
+
+    global DB_FILE, CHAIN_NAME
+    DB_FILE = args.db
+    if args.chain:
+        CHAIN_NAME = args.chain.strip().lower()
+
+    token = args.token
+    if not token and args.token_file:
+        try:
+            with open(args.token_file, "r", encoding="utf-8") as f:
+                token = f.read().strip()
+        except Exception as e:
+            print("[SEBDOG] Could not read token file: %s" % e, flush=True)
+            sys.exit(1)
+    if not token:
+        token = os.environ.get("SEBDOG_TOKEN", "").strip()
+    if not token:
+        print("[SEBDOG] No licence token. Pass --token, --token-file, or "
+              "set SEBDOG_TOKEN.", flush=True)
+        sys.exit(1)
+
+    print("[SEBDOG] Sebdog Engine v%s starting..." % VERSION, flush=True)
+
+    if not os.path.exists(DB_FILE):
+        print("[SEBDOG] Database not found. Checking for backups...",
+              flush=True)
+        if not restore_latest_backup():
+            print("[SEBDOG] No backup found. Starting a fresh chain.",
+                  flush=True)
+
+    init_db()
+
+    print("[SEBDOG] Validating licence locally. No network call is made.",
+          flush=True)
+    if not load_licence(token, args.pubkey):
+        print("[SEBDOG] Licence validation failed. Get a token at %s" % HOME,
+              flush=True)
+        sys.exit(1)
+
+    if licence is not None:
+        try:
+            licence.save_licence_locally(DB_FILE, token, {
+                "key": _licence["key"], "devices": _licence["devices"],
+                "plan": _licence["plan"], "email": _licence["email"],
+                "issued": 0, "expires": _licence["expires"]})
+        except Exception:
+            pass
+
+    if args.backup_on_start:
+        backup_db()
+
+    threading.Thread(target=licence_watch, daemon=True).start()
+    threading.Thread(target=backup_loop, daemon=True).start()
+
+    srv = ThreadedServer(("0.0.0.0", args.port), Handler)
+    base = "http://localhost:%d" % args.port
+    print("[SEBDOG] Engine running on port %d" % args.port, flush=True)
+    print("[SEBDOG] POST %s/govern            (needs your key)" % base,
+          flush=True)
+    print("[SEBDOG] GET  %s/tip               (your chain head)" % base,
+          flush=True)
+    print("[SEBDOG] POST %s/witness/observe   (peers seal their head here)"
+          % base, flush=True)
+    print("[SEBDOG] GET  %s/verify-chain      (rewalks every block)" % base,
+          flush=True)
+    print("[SEBDOG] GET  %s/peers             (who you have witnessed)"
+          % base, flush=True)
+    print("[SEBDOG] Backups: ./sebdog_backups/ daily, last 7 kept, sealed",
+          flush=True)
+    print("[SEBDOG] This process makes no outbound connection. Check it "
+          "with tcpdump if you like.", flush=True)
+    print("[SEBDOG] To be witnessed by others, point meshwitness.py at "
+          "this engine:", flush=True)
+    print("[SEBDOG]   MESH_TIP_URL=<your public url>/tip", flush=True)
+    print("[SEBDOG]   MESH_SEAL_URL=<your public url>/witness/observe",
+          flush=True)
+    print("[SEBDOG]   MESH_CHAIN=%s" % CHAIN_NAME, flush=True)
+
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("[SEBDOG] Shutting down.", flush=True)
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+
+## `sebdog_licence.py`
+
+500 lines, 18698 bytes
+
+```python
+"""
+SEBDOG LICENCE SYSTEM v2.0.0
+Air-gapped cryptographic licence tokens for the Sebdog Engine.
+Copyright (c) 2026 Justin Antony Dobson / Monop Content, Blyth, UK
+
+WHAT CHANGED IN 2.0, AND WHY IT HAD TO
+--------------------------------------
+Version 1 signed tokens with HMAC-SHA256. HMAC is symmetric: the same
+secret both signs and verifies. So validating a token offline required
+that secret to be present on the customer's hardware - and anyone
+holding it can mint their own token for any device count, any plan, any
+expiry.
+
+Version 1's docstring said the signing secret never leaves sebbi.pro's
+servers. With an offline HMAC check, that could not be true. One of the
+two claims had to give, and it should not be the one about not shipping
+the key.
+
+Version 2 uses Ed25519. The server holds a private seed and signs. The
+customer's copy holds only the PUBLIC key, which verifies signatures and
+cannot produce one. Offline validation and an unshippable signing key
+stop being in conflict, because they are no longer the same key.
+
+    v1  customer holds the minting key   offline validation works
+    v2  customer holds a public key      offline validation works
+
+Everything else is unchanged: 7-day grace, local cache, tamper
+detection, deterministic payload, constant-time comparison where it
+still applies.
+
+NO DEPENDENCY
+-------------
+Ed25519 is implemented here in pure standard library, the same way it
+is in continuity.py and modules/signed.py. Nothing to pip install on a
+customer's air-gapped box, which is the entire point of shipping this
+rather than a library.
+
+SETTING IT UP, ONCE
+-------------------
+    python3 sebdog_licence.py --keygen
+
+Put the private seed in a Railway environment variable as
+SEBDOG_LICENCE_SEED. Paste the public key into LICENCE_PUBKEY below and
+into sebdog_engine.py. The private seed never appears in any file that
+ships.
+
+MIGRATING A v1 TOKEN
+--------------------
+There is no migration and there should not be one. A v1 token was
+verifiable by anyone who had the secret, so any v1 token in the wild
+should be treated as compromised and reissued. validate_token rejects
+v1 tokens by version rather than pretending they are fine.
+"""
+
+import base64
+import hashlib
+import json
+import os
+import sqlite3
+import threading
+import time
+from typing import Dict, Optional, Tuple
+
+TOKEN_VERSION = "2"
+GRACE_SECONDS = 86400 * 7          # 7 days past expiry before a hard block
+AUDIT_DB = "sebdog_audit.db"
+
+# The public half of the signing key. Safe to ship, safe to publish, and
+# useless for producing a token. Overridable by environment for testing.
+LICENCE_PUBKEY = os.environ.get("SEBDOG_LICENCE_PUBKEY", "")
+
+
+# ==============================================================================
+# Ed25519 - RFC 8032, standard library only
+#
+# Extended coordinates for the scalar multiplication so a verify is
+# milliseconds rather than seconds. sign() is here for the server side; a
+# customer's deployment only ever calls verify().
+# ==============================================================================
+
+_P = 2 ** 255 - 19
+_L = 2 ** 252 + 27742317777372353535851937790883648493
+_D = -121665 * pow(121666, _P - 2, _P) % _P
+_I = pow(2, (_P - 1) // 4, _P)
+
+
+def _xrecover(y):
+    xx = (y * y - 1) * pow(_D * y * y + 1, _P - 2, _P)
+    x = pow(xx, (_P + 3) // 8, _P)
+    if (x * x - xx) % _P != 0:
+        x = (x * _I) % _P
+    if x % 2 != 0:
+        x = _P - x
+    return x
+
+
+_BY = 4 * pow(5, _P - 2, _P) % _P
+_BX = _xrecover(_BY)
+_B = (_BX % _P, _BY % _P, 1, _BX * _BY % _P)
+
+
+def _add(p, q):
+    x1, y1, z1, t1 = p
+    x2, y2, z2, t2 = q
+    a = (y1 - x1) * (y2 - x2) % _P
+    b = (y1 + x1) * (y2 + x2) % _P
+    c = t1 * 2 * _D * t2 % _P
+    dd = z1 * 2 * z2 % _P
+    e, f, g, h = b - a, dd - c, dd + c, b + a
+    return (e * f % _P, g * h % _P, f * g % _P, e * h % _P)
+
+
+def _scalarmult(p, e):
+    if e == 0:
+        return (0, 1, 1, 0)
+    q = _scalarmult(p, e >> 1)
+    q = _add(q, q)
+    if e & 1:
+        q = _add(q, p)
+    return q
+
+
+def _encodepoint(p):
+    x, y, z, _t = p
+    zi = pow(z, _P - 2, _P)
+    x = x * zi % _P
+    y = y * zi % _P
+    raw = bytearray(y.to_bytes(32, "little"))
+    raw[31] |= (x & 1) << 7
+    return bytes(raw)
+
+
+def _decodepoint(raw):
+    y = int.from_bytes(raw, "little") & ((1 << 255) - 1)
+    if y >= _P:
+        return None
+    x = _xrecover(y)
+    if x & 1 != (raw[31] >> 7) & 1:
+        x = _P - x
+    if (-x * x + y * y - 1 - _D * x * x * y * y) % _P != 0:
+        return None
+    return (x, y, 1, x * y % _P)
+
+
+def _secret_scalar(seed):
+    h = hashlib.sha512(seed).digest()
+    a = int.from_bytes(h[:32], "little")
+    a &= (1 << 254) - 8
+    a |= 1 << 254
+    return a, h[32:]
+
+
+def public_key(seed: bytes) -> bytes:
+    """The 32-byte public key for a 32-byte private seed."""
+    a, _ = _secret_scalar(seed)
+    return _encodepoint(_scalarmult(_B, a))
+
+
+def sign(seed: bytes, message: bytes) -> bytes:
+    """Server side only. Never called on customer hardware."""
+    a, prefix = _secret_scalar(seed)
+    pk = _encodepoint(_scalarmult(_B, a))
+    r = int.from_bytes(hashlib.sha512(prefix + message).digest(), "little") % _L
+    rp = _encodepoint(_scalarmult(_B, r))
+    k = int.from_bytes(hashlib.sha512(rp + pk + message).digest(), "little") % _L
+    s = (r + k * a) % _L
+    return rp + s.to_bytes(32, "little")
+
+
+def verify(pk: bytes, message: bytes, signature: bytes) -> bool:
+    """True if the signature is valid. Never raises."""
+    try:
+        if len(pk) != 32 or len(signature) != 64:
+            return False
+        a = _decodepoint(pk)
+        if a is None:
+            return False
+        r = _decodepoint(signature[:32])
+        if r is None:
+            return False
+        s = int.from_bytes(signature[32:], "little")
+        if s >= _L:
+            return False
+        k = int.from_bytes(
+            hashlib.sha512(signature[:32] + pk + message).digest(),
+            "little") % _L
+        left = _scalarmult(_B, s)
+        right = _add(r, _scalarmult(a, k))
+        lx, ly, lz, _lt = left
+        rx, ry, rz, _rt = right
+        return ((lx * rz - rx * lz) % _P == 0
+                and (ly * rz - ry * lz) % _P == 0)
+    except Exception:
+        return False
+
+
+def keygen() -> Tuple[str, str]:
+    """(private_seed_hex, public_key_hex). Run once, keep the first secret."""
+    seed = os.urandom(32)
+    return seed.hex(), public_key(seed).hex()
+
+
+# ==============================================================================
+# TOKEN GENERATION - sebbi.pro only
+# ==============================================================================
+
+def generate_token(api_key: str, devices: int, plan: str, email: str,
+                   seed: bytes, validity_days: int = 365) -> str:
+    """
+    Sign an annual licence token.
+
+    seed is the 32-byte Ed25519 private seed, read from the
+    SEBDOG_LICENCE_SEED environment variable on the server. It is never
+    written to a file that ships and never sent to a customer.
+    """
+    if isinstance(seed, str):
+        seed = bytes.fromhex(seed.strip())
+    if len(seed) != 32:
+        raise ValueError("seed must be 32 bytes")
+
+    issued = int(time.time())
+    payload = json.dumps({
+        "v": TOKEN_VERSION,
+        "key": api_key,
+        "devices": devices,
+        "plan": plan,
+        "email": email,
+        "issued": issued,
+        "expires": issued + (validity_days * 86400),
+    }, sort_keys=True, separators=(",", ":"))
+
+    sig = sign(seed, payload.encode("utf-8")).hex()
+    token = json.dumps({"payload": payload, "sig": sig, "alg": "ed25519"},
+                       separators=(",", ":"))
+    return base64.urlsafe_b64encode(token.encode("utf-8")).decode("utf-8")
+
+
+# ==============================================================================
+# TOKEN VALIDATION - customer hardware, no network, public key only
+# ==============================================================================
+
+def validate_token(token: str, pubkey=None) -> Tuple[Optional[Dict],
+                                                     Optional[str]]:
+    """
+    Validate a licence token entirely locally.
+
+    pubkey is the 32-byte public key, as hex or bytes. Defaults to
+    LICENCE_PUBKEY. It cannot be used to produce a token, so shipping it
+    inside the engine costs nothing.
+
+    Returns (licence_data, None) or (None, error_code).
+
+        invalid_format      cannot be decoded
+        no_public_key       nothing configured to verify against
+        invalid_signature   tampered with, or signed by the wrong key
+        version_mismatch    not a v2 token - v1 HMAC tokens land here
+        token_expired       past expiry plus the grace period
+    """
+    if pubkey is None:
+        pubkey = LICENCE_PUBKEY
+    if isinstance(pubkey, str):
+        pubkey = pubkey.strip()
+        if not pubkey:
+            return None, "no_public_key"
+        try:
+            pubkey = bytes.fromhex(pubkey)
+        except ValueError:
+            return None, "no_public_key"
+    if not pubkey or len(pubkey) != 32:
+        return None, "no_public_key"
+
+    try:
+        raw = json.loads(base64.urlsafe_b64decode(token.encode("utf-8")))
+        payload_str = raw.get("payload", "")
+        sig_hex = raw.get("sig", "")
+        if not payload_str or not sig_hex:
+            return None, "invalid_format"
+        sig = bytes.fromhex(sig_hex)
+    except Exception:
+        return None, "invalid_format"
+
+    if not verify(pubkey, payload_str.encode("utf-8"), sig):
+        return None, "invalid_signature"
+
+    try:
+        data = json.loads(payload_str)
+    except Exception:
+        return None, "invalid_format"
+
+    if data.get("v") != TOKEN_VERSION:
+        return None, "version_mismatch"
+
+    if data.get("expires", 0) + GRACE_SECONDS < time.time():
+        return None, "token_expired"
+
+    return data, None
+
+
+def is_in_grace_period(token_data: Dict) -> bool:
+    return token_data.get("expires", 0) < time.time()
+
+
+def days_until_expiry(token_data: Dict) -> int:
+    return int((token_data.get("expires", 0) - time.time()) / 86400)
+
+
+# ==============================================================================
+# LOCAL LICENCE STORE
+# ==============================================================================
+
+_lock = threading.Lock()
+
+
+def save_licence_locally(db_path: str, token: str, licence_data: Dict):
+    with _lock:
+        conn = sqlite3.connect(db_path)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS licence_cache (
+                id INTEGER PRIMARY KEY, token TEXT, api_key TEXT,
+                devices INTEGER, plan TEXT, email TEXT,
+                issued INTEGER, expires INTEGER, cached_at REAL)""")
+        conn.execute("DELETE FROM licence_cache")
+        conn.execute(
+            "INSERT INTO licence_cache(token,api_key,devices,plan,email,"
+            "issued,expires,cached_at) VALUES(?,?,?,?,?,?,?,?)",
+            (token, licence_data.get("key", ""),
+             licence_data.get("devices", 1), licence_data.get("plan", "free"),
+             licence_data.get("email", ""), licence_data.get("issued", 0),
+             licence_data.get("expires", 0), time.time()))
+        conn.commit()
+        conn.close()
+
+
+def load_licence_locally(db_path: str) -> Optional[Tuple[str, Dict]]:
+    """Returns (token, data) or None. The token is re-verified by the caller -
+    a cached row is a convenience, never an authority."""
+    try:
+        with _lock:
+            conn = sqlite3.connect(db_path)
+            row = conn.execute(
+                "SELECT token,api_key,devices,plan,email,issued,expires "
+                "FROM licence_cache LIMIT 1").fetchone()
+            conn.close()
+        if not row:
+            return None
+        return row[0], {"v": TOKEN_VERSION, "key": row[1], "devices": row[2],
+                        "plan": row[3], "email": row[4], "issued": row[5],
+                        "expires": row[6]}
+    except Exception:
+        return None
+
+
+# ==============================================================================
+# STRESS TEST      python3 sebdog_licence.py
+# KEY GENERATION   python3 sebdog_licence.py --keygen
+# ==============================================================================
+
+if __name__ == "__main__":
+    import sys
+
+    if "--keygen" in sys.argv:
+        priv, pub = keygen()
+        print("PRIVATE SEED - server only, never ships, never leaves Railway")
+        print("  SEBDOG_LICENCE_SEED=" + priv)
+        print()
+        print("PUBLIC KEY - paste into LICENCE_PUBKEY here and in the engine")
+        print("  " + pub)
+        print()
+        print("Losing the private seed means no new tokens can be issued and")
+        print("every deployed public key must be replaced. Back it up.")
+        sys.exit(0)
+
+    print("SEBDOG LICENCE SYSTEM v2 - Ed25519 - Stress Test")
+    print("=" * 62)
+
+    SEED = os.urandom(32)
+    PUB = public_key(SEED)
+    TEST_KEY = "al_live_" + os.urandom(12).hex()
+    PASSES = FAILURES = 0
+
+    def check(name, condition, detail=""):
+        global PASSES, FAILURES
+        if condition:
+            print("  PASS  " + name)
+            PASSES += 1
+        else:
+            print("  FAIL  " + name + " " + str(detail))
+            FAILURES += 1
+
+    print("\n[1] Generation and validation")
+    token = generate_token(TEST_KEY, 10000, "paid", "test@example.com", SEED)
+    data, err = validate_token(token, PUB)
+    check("Valid token accepted", err is None, err)
+    check("API key preserved", data and data.get("key") == TEST_KEY)
+    check("Device count preserved", data and data.get("devices") == 10000)
+    check("Plan preserved", data and data.get("plan") == "paid")
+    check("Not in grace period", data and not is_in_grace_period(data))
+    check("Over 360 days remaining", data and days_until_expiry(data) > 360)
+    check("Public key accepted as hex", validate_token(token, PUB.hex())[1] is None)
+
+    print("\n[2] THE POINT OF VERSION 2")
+    print("      A customer holds the public key. Can they mint a licence?")
+    # Feeding the public key in as a seed does not error - it is 32 bytes,
+    # so it derives some other keypair entirely. The property that matters
+    # is that whatever comes out does NOT verify against the real key.
+    attempt = generate_token(TEST_KEY, 999999, "enterprise",
+                             "attacker@example.com", PUB)
+    _, err = validate_token(attempt, PUB)
+    check("Token minted with the public key does not verify",
+          err == "invalid_signature", err)
+    check("Public key is not the private seed",
+          public_key(PUB) != PUB)
+    other_seed = os.urandom(32)
+    self_signed = generate_token(TEST_KEY, 999999, "enterprise",
+                                 "attacker@example.com", other_seed)
+    _, err = validate_token(self_signed, PUB)
+    check("Token signed by any other key rejected", err == "invalid_signature")
+
+    print("\n[3] Tamper detection")
+    for label, old, new in [("device count", "10000", "99999"),
+                            ("plan", "paid", "enterprise"),
+                            ("expiry", '"expires"', '"expiries"')]:
+        raw = json.loads(base64.urlsafe_b64decode(token))
+        raw["payload"] = raw["payload"].replace(old, new)
+        bad = base64.urlsafe_b64encode(
+            json.dumps(raw, separators=(",", ":")).encode()).decode()
+        _, err = validate_token(bad, PUB)
+        check("Tampered " + label + " rejected", err == "invalid_signature", err)
+    raw = json.loads(base64.urlsafe_b64decode(token))
+    raw["sig"] = "00" * 64
+    bad = base64.urlsafe_b64encode(
+        json.dumps(raw, separators=(",", ":")).encode()).decode()
+    check("Zeroed signature rejected",
+          validate_token(bad, PUB)[1] == "invalid_signature")
+
+    print("\n[4] Expiry")
+    exp = generate_token(TEST_KEY, 100, "paid", "t@e.com", SEED, validity_days=-1)
+    d, err = validate_token(exp, PUB)
+    check("Recently expired token still runs in grace", err is None and d)
+    check("Grace period reported", d and is_in_grace_period(d))
+    hard = generate_token(TEST_KEY, 100, "paid", "t@e.com", SEED, validity_days=-9)
+    check("Hard expired token rejected",
+          validate_token(hard, PUB)[1] == "token_expired")
+
+    print("\n[5] Wrong key")
+    check("Unrelated public key rejected",
+          validate_token(token, public_key(os.urandom(32)))[1] == "invalid_signature")
+    flipped = bytearray(PUB)
+    flipped[0] ^= 1
+    check("One-bit-flipped public key rejected",
+          validate_token(token, bytes(flipped))[1] == "invalid_signature")
+
+    print("\n[6] Malformed input")
+    for label, bad_in in [("garbage", "notbase64!!!"), ("empty", ""),
+                          ("empty json", base64.urlsafe_b64encode(b"{}").decode())]:
+        check(label + " rejected", validate_token(bad_in, PUB)[1] is not None)
+    check("Missing public key reported",
+          validate_token(token, "")[1] == "no_public_key")
+
+    print("\n[7] v1 tokens are not silently accepted")
+    v1_payload = json.dumps({"v": "1", "key": TEST_KEY, "devices": 10,
+                             "plan": "paid", "email": "t@e.com",
+                             "issued": int(time.time()),
+                             "expires": int(time.time()) + 86400},
+                            sort_keys=True, separators=(",", ":"))
+    v1 = base64.urlsafe_b64encode(json.dumps(
+        {"payload": v1_payload, "sig": sign(SEED, v1_payload.encode()).hex()},
+        separators=(",", ":")).encode()).decode()
+    check("v1 token rejected by version",
+          validate_token(v1, PUB)[1] == "version_mismatch")
+
+    print("\n[8] Local cache")
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        test_db = f.name
+    try:
+        d, _ = validate_token(token, PUB)
+        save_licence_locally(test_db, token, d)
+        cached = load_licence_locally(test_db)
+        check("Saved and retrieved", cached is not None)
+        check("Cached token re-verifies",
+              cached and validate_token(cached[0], PUB)[1] is None)
+        check("Cached devices match", cached and cached[1]["devices"] == 10000)
+    finally:
+        os.unlink(test_db)
+
+    print("\n[9] Performance")
+    import timeit
+    g = timeit.timeit(lambda: generate_token(TEST_KEY, 1, "paid", "t@e.com",
+                                             SEED), number=50) / 50
+    v = timeit.timeit(lambda: validate_token(token, PUB), number=50) / 50
+    print("      sign   %.1f ms" % (g * 1000))
+    print("      verify %.1f ms" % (v * 1000))
+    check("Verification under 50ms", v < 0.05)
+
+    print("\n" + "=" * 62)
+    print("Results: %d passed, %d failed" % (PASSES, FAILURES))
+    print("ALL TESTS PASSED." if not FAILURES else "FAILURES. Do not ship.")
+    sys.exit(0 if not FAILURES else 1)
+
+```
+
+
+## `sebdog_reporter.py`
+
+217 lines, 8364 bytes
+
+```python
+"""
+SEBDOG DECISION REPORTER v1.0.0
+Generates readable reports from the sebdog audit chain.
+Shows exactly why each decision was made.
+Copyright (c) 2026 Justin Antony Dobson / Monop Content
+"""
+
+import sqlite3, json, time, os
+from datetime import datetime
+
+DB_FILE = "sebdog_audit.db"
+
+REASON_EXPLANATIONS = {
+    "velocity_spike": "User made more than 10 requests in 60 seconds",
+    "high_amount": "Transaction amount exceeded £500",
+    "risky_device": "Device risk score above 0.5",
+    "behaviour_anomaly": "Behavioural anomaly score above 0.5",
+    "country_shift": "Request came from a different country than usual",
+    "unsafe_country": "Request came from outside approved country list",
+    "low_trust": "User trust score has dropped below 0.4 due to previous decisions",
+}
+
+def get_decisions(db_path=DB_FILE, limit=100):
+    if not os.path.exists(db_path):
+        return []
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute("""
+        SELECT ts, user_id, event_json, result_json, audit_hash
+        FROM audit_log
+        ORDER BY id DESC
+        LIMIT ?
+    """, (limit,)).fetchall()
+    conn.close()
+    results = []
+    for row in rows:
+        try:
+            event = json.loads(row[2])
+            result = json.loads(row[3])
+            results.append({
+                "ts": row[0],
+                "user_id": row[1],
+                "event": event,
+                "result": result,
+                "audit_hash": row[4]
+            })
+        except:
+            pass
+    return results
+
+def format_reason(reason):
+    return REASON_EXPLANATIONS.get(reason, reason.replace("_", " ").capitalize())
+
+def decision_color(decision):
+    return {"ALLOW": "#00875a", "CHALLENGE": "#b45309", "BLOCK": "#cc0000"}.get(decision, "#555")
+
+def generate_text_report(db_path=DB_FILE, limit=100):
+    decisions = get_decisions(db_path, limit)
+    if not decisions:
+        return "No decisions recorded yet."
+    
+    lines = [
+        "SEBDOG DECISION REPORT",
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"Total decisions shown: {len(decisions)}",
+        "=" * 60
+    ]
+    
+    for d in decisions:
+        result = d["result"]
+        event = d["event"]
+        ts = datetime.fromtimestamp(d["ts"]).strftime('%Y-%m-%d %H:%M:%S')
+        decision = result.get("decision", "?")
+        score = result.get("score", 0)
+        reasons = result.get("reasons", [])
+        
+        lines.append(f"\n[{ts}] User: {d['user_id']}")
+        lines.append(f"Action: {event.get('action','?')} | Country: {event.get('country','?')} | Amount: £{event.get('amount',0)}")
+        lines.append(f"Decision: {decision} | Score: {score} | Trust: {result.get('trust',0)}")
+        
+        if reasons:
+            lines.append("Reasons:")
+            for r in reasons:
+                lines.append(f"  - {format_reason(r)}")
+        else:
+            lines.append("Reasons: No risk factors detected")
+        
+        lines.append(f"Audit hash: {d['audit_hash'][:32]}...")
+        lines.append("-" * 60)
+    
+    return "\n".join(lines)
+
+def generate_json_report(db_path=DB_FILE, limit=100):
+    decisions = get_decisions(db_path, limit)
+    report = {
+        "generated": datetime.now().isoformat(),
+        "total": len(decisions),
+        "decisions": []
+    }
+    for d in decisions:
+        result = d["result"]
+        event = d["event"]
+        reasons = result.get("reasons", [])
+        report["decisions"].append({
+            "timestamp": datetime.fromtimestamp(d["ts"]).isoformat(),
+            "user_id": d["user_id"],
+            "action": event.get("action"),
+            "country": event.get("country"),
+            "amount": event.get("amount"),
+            "decision": result.get("decision"),
+            "score": result.get("score"),
+            "trust": result.get("trust"),
+            "reasons": reasons,
+            "reasons_explained": [format_reason(r) for r in reasons],
+            "audit_hash": d["audit_hash"]
+        })
+    return json.dumps(report, indent=2)
+
+def generate_html_report(db_path=DB_FILE, limit=100):
+    decisions = get_decisions(db_path, limit)
+    
+    rows = ""
+    for d in decisions:
+        result = d["result"]
+        event = d["event"]
+        ts = datetime.fromtimestamp(d["ts"]).strftime('%Y-%m-%d %H:%M:%S')
+        decision = result.get("decision", "?")
+        score = result.get("score", 0)
+        reasons = result.get("reasons", [])
+        color = decision_color(decision)
+        
+        reason_html = ""
+        if reasons:
+            reason_html = "<ul>" + "".join(f"<li>{format_reason(r)}</li>" for r in reasons) + "</ul>"
+        else:
+            reason_html = "<span style='color:#888'>No risk factors detected</span>"
+        
+        rows += f"""
+        <tr>
+            <td>{ts}</td>
+            <td><code>{d['user_id']}</code></td>
+            <td>{event.get('action','?')}</td>
+            <td>{event.get('country','?')}</td>
+            <td>£{event.get('amount',0)}</td>
+            <td><strong style="color:{color}">{decision}</strong></td>
+            <td>{score}</td>
+            <td>{result.get('trust',0)}</td>
+            <td>{reason_html}</td>
+            <td><code style="font-size:10px">{d['audit_hash'][:16]}...</code></td>
+        </tr>"""
+    
+    allow = sum(1 for d in decisions if d["result"].get("decision") == "ALLOW")
+    challenge = sum(1 for d in decisions if d["result"].get("decision") == "CHALLENGE")
+    block = sum(1 for d in decisions if d["result"].get("decision") == "BLOCK")
+    
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Sebdog Decision Report</title>
+<style>
+body{{font-family:sans-serif;background:#f5f7fa;color:#1a202c;margin:0;padding:20px}}
+.header{{background:#0a0f1e;color:#fff;padding:24px 32px;border-radius:8px;margin-bottom:24px}}
+.header h1{{margin:0;font-size:24px;color:#c9a84c}}
+.header p{{margin:4px 0 0;color:rgba(255,255,255,0.5);font-size:13px}}
+.stats{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:24px}}
+.stat{{background:#fff;border-radius:8px;padding:16px;text-align:center;border:1px solid #e2e8f0}}
+.stat-n{{font-size:32px;font-weight:700}}
+.stat-l{{font-size:11px;color:#64748b;margin-top:4px}}
+.allow{{color:#00875a}}.challenge{{color:#b45309}}.block{{color:#cc0000}}
+table{{width:100%;border-collapse:collapse;background:#fff;border-radius:8px;overflow:hidden;border:1px solid #e2e8f0}}
+th{{background:#0a0f1e;color:#c9a84c;padding:10px 12px;text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:1px}}
+td{{padding:10px 12px;border-bottom:1px solid #e2e8f0;font-size:12px;vertical-align:top}}
+tr:last-child td{{border:none}}
+tr:hover td{{background:#f8fafc}}
+ul{{margin:4px 0;padding-left:16px}}
+li{{margin:2px 0;color:#64748b}}
+code{{background:#f1f5f9;padding:2px 4px;border-radius:3px;font-size:11px}}
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>Sebdog Decision Report</h1>
+  <p>Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} &nbsp;|&nbsp; Showing last {len(decisions)} decisions &nbsp;|&nbsp; Powered by sebbi.pro</p>
+</div>
+<div class="stats">
+  <div class="stat"><div class="stat-n allow">{allow}</div><div class="stat-l">ALLOWED</div></div>
+  <div class="stat"><div class="stat-n challenge">{challenge}</div><div class="stat-l">CHALLENGED</div></div>
+  <div class="stat"><div class="stat-n block">{block}</div><div class="stat-l">BLOCKED</div></div>
+</div>
+<table>
+<thead><tr>
+  <th>Time</th><th>User</th><th>Action</th><th>Country</th><th>Amount</th>
+  <th>Decision</th><th>Score</th><th>Trust</th><th>Reasons</th><th>Audit Hash</th>
+</tr></thead>
+<tbody>{rows if rows else '<tr><td colspan="10" style="text-align:center;color:#888;padding:32px">No decisions recorded yet</td></tr>'}</tbody>
+</table>
+</body>
+</html>"""
+    return html
+
+if __name__ == "__main__":
+    import sys
+    fmt = sys.argv[1] if len(sys.argv) > 1 else "html"
+    db = sys.argv[2] if len(sys.argv) > 2 else DB_FILE
+    
+    if fmt == "text":
+        print(generate_text_report(db))
+    elif fmt == "json":
+        print(generate_json_report(db))
+    else:
+        report = generate_html_report(db)
+        out = "sebdog_report.html"
+        with open(out, "w") as f:
+            f.write(report)
+        print(f"Report saved to {out}")
+
+```
 
 
 ## `tests/attack_continuity_1.py`
@@ -1055,1433 +2635,5 @@ print("\n" + "="*60)
 print("passed %d, failed %d" % (len(PASS), len(FAIL)))
 for f in FAIL: print("  FAILED: "+f)
 sys.exit(1 if FAIL else 0)
-
-```
-
-
-## `tests/attack_continuity_6.py`
-
-92 lines, 3965 bytes
-
-```python
-"""End to end: issue, delegate, exercise, export a proof, verify it elsewhere,
-then try to forge one."""
-import hashlib, json, sqlite3, threading, time, sys, types, subprocess, copy
-import continuity as C
-
-m = types.ModuleType("server")
-m.get_bearer = lambda *a, **k: None
-m.score_event = lambda e: 0.12          # bare score, like the real engine
-sys.modules["server"] = m
-
-conn = sqlite3.connect(":memory:", check_same_thread=False)
-lock = threading.RLock(); n = {"i": 0}
-def seal(ev, res, ts, k):
-    n["i"] += 1
-    return hashlib.sha256(json.dumps([ev, res, ts], sort_keys=True, default=str).encode()).hexdigest(), n["i"], n["i"]
-ctx = {"conn": conn, "lock": lock, "seal": seal}
-C._ready = False; C._setup(ctx)
-
-NOW, HOUR = time.time(), 3600
-C._issue(ctx, "k", dict(id="root", issuer="justin@monopcontent.com", issuer_kind="human",
-    subject="orchestrator", scope=["payments.refund", "payments.read"],
-    constraints={"max_amount": 5000, "allowed_currency": ["GBP", "EUR"]},
-    purpose="resolve customer refund complaints", purpose_tags=["refunds", "support"],
-    not_after=NOW + 10 * HOUR, delegations_left=2))
-C._issue(ctx, "k", dict(id="mid", parent="root", issuer="orchestrator", issuer_kind="agent",
-    subject="refund-agent", scope=["payments.refund"],
-    constraints={"max_amount": 200, "allowed_currency": ["GBP"]},
-    purpose="issue small refunds", purpose_tags=["refunds"],
-    not_after=NOW + 2 * HOUR, delegations_left=0))
-
-def run(params, tag="refunds", action="payments.refund"):
-    r, _ = C._evaluate(ctx, "k", {"grant": "mid", "action": action,
-                                  "params": params, "purpose_tag": tag})
-    return r
-
-allow = run({"amount": 150, "currency": "GBP"})
-block = run({"amount": 900, "currency": "GBP"})
-print("allow verdict:", allow["verdict"], "| block verdict:", block["verdict"],
-      "->", block["broken_invariant"])
-
-def bundle_for(ev):
-    b, code = C._proof(ctx, {"evaluation": ev})
-    assert code == 200, b
-    return b
-
-for label, ev in (("ALLOW", allow["evaluation"]), ("BLOCK", block["evaluation"])):
-    b = bundle_for(ev)
-    open("/tmp/%s.json" % label, "w").write(json.dumps(b, indent=1))
-    print("\n" + "#" * 66 + "\n# %s bundle\n" % label + "#" * 66)
-    out = subprocess.run([sys.executable, "verify_authority.py", "/tmp/%s.json" % label],
-                         capture_output=True, text=True)
-    print(out.stdout.strip()); print("exit:", out.returncode)
-
-print("\n" + "#" * 66 + "\n# forgeries\n" + "#" * 66)
-good = json.load(open("/tmp/BLOCK.json"))
-
-def forge(name, mutate):
-    b = copy.deepcopy(good)
-    mutate(b)
-    open("/tmp/forged.json", "w").write(json.dumps(b))
-    out = subprocess.run([sys.executable, "verify_authority.py", "/tmp/forged.json"],
-                         capture_output=True, text=True)
-    caught = out.returncode != 0
-    line = [l for l in out.stdout.splitlines() if l.startswith("FAIL")]
-    print(("  ok   " if caught else "  MISS ") + name)
-    for l in line[:2]:
-        print("         " + l.strip())
-
-def flip_verdict(b):
-    b["decision"]["verdict"] = "ALLOW"; b["decision"]["authority_verdict"] = "ALLOW"
-def raise_cap(b):
-    pass_idx = 1
-    b["lineage"][1]["constraints"]["max_amount"] = 100000
-def widen_scope(b):
-    b["lineage"][1]["scope"] = ["payments.refund", "payments.transfer"]
-def swap_human(b):
-    b["lineage"][0]["issuer_kind"] = "agent"
-def change_params(b):
-    b["request"]["params"]["amount"] = 1
-def drop_acceptor(b):
-    for g in b["lineage"]: g["risk_accepted_by"] = None
-def restamp(b):
-    b["decision"]["evaluated_at_epoch"] = NOW + 9 * HOUR
-
-forge("claimed ALLOW on a bundle that blocks", flip_verdict)
-forge("cap raised inside the lineage", raise_cap)
-forge("scope widened inside the lineage", widen_scope)
-forge("root demoted from human", swap_human)
-forge("parameters swapped after the fact", change_params)
-forge("risk acceptor stripped", drop_acceptor)
-forge("timestamp moved past the leaf's expiry", restamp)
-
-```
-
-
-## `tests/attack_witnessed.py`
-
-160 lines, 7875 bytes
-
-```python
-"""Attack it the same way as everything else: from the position of an operator
-trying to make a grant look older than it is."""
-import hashlib, json, sqlite3, threading, time, sys, types
-import witnessed as W
-
-P, F = [], []
-def check(n, c, d=""):
-    (P if c else F).append(n)
-    print(("  ok   " if c else "  FAIL ") + n + (("  -> " + str(d)[:200]) if d and not c else ""))
-
-def make():
-    conn = sqlite3.connect(":memory:", check_same_thread=False)
-    lock = threading.RLock(); n = {"i": 0}
-    conn.execute("CREATE TABLE audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT,"
-                 "ts REAL,user_id TEXT,api_key TEXT,result_json TEXT,audit_hash TEXT)")
-    # the real grant table shape, including columns added later
-    conn.execute("CREATE TABLE auth_grant(id TEXT PRIMARY KEY,parent TEXT,root TEXT,"
-                 "issuer TEXT,subject TEXT,created REAL,digest TEXT,audit_hash TEXT,"
-                 "block_index INTEGER,risk_accepted_by TEXT)")
-    def seal(ev, res, ts, key):
-        n["i"] += 1
-        h = hashlib.sha256(json.dumps([ev,res,ts,n["i"]],sort_keys=True,default=str).encode()).hexdigest()
-        conn.execute("INSERT INTO audit_log(ts,user_id,api_key,result_json,audit_hash) "
-                     "VALUES(?,?,?,?,?)", (ts, ev.get("user_id"), key, json.dumps(res), h))
-        conn.commit()
-        return h, n["i"], n["i"]
-    W._ready = False
-    ctx = {"conn": conn, "lock": lock, "seal": seal}
-    W._setup(ctx)
-    return ctx
-
-def seal_grant(ctx, gid, created):
-    h, idx, _ = ctx["seal"]({"user_id": "lin:"+gid}, {"decision":"AUTHORITY_GRANTED","grant":gid}, created, "k")
-    with ctx["lock"]:
-        ctx["conn"].execute("INSERT INTO auth_grant(id,issuer,subject,created,audit_hash,block_index) "
-                            "VALUES(?,?,?,?,?,?)", (gid,"owner@example.com","agent",created,h,idx))
-        ctx["conn"].commit()
-    return h
-
-def noise(ctx, k=5):
-    for i in range(k):
-        ctx["seal"]({"user_id":"n%d"%i},{"decision":"ALLOW"},time.time(),"k")
-
-def record_head(ctx, peer, accepted=1, when=None, size=None, tip=None):
-    """Insert an attestation directly, standing in for a live peer."""
-    s, t = W._head(ctx)
-    when = when or time.time()
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "INSERT INTO witnessed_head(peer,peer_url,tree_size,tip,head_digest,"
-            "submitted,accepted,peer_response,peer_block,audit_hash,block_index,api_key)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-            (peer,"https://%s"%peer, size or s, tip or t,"d",when,accepted,"{}","b1","ah",1,"k"))
-        ctx["conn"].commit()
-
-NOW = time.time()
-
-print("\n=== 1. a grant witnessed after issue ===")
-ctx = make()
-noise(ctx, 3)
-g = seal_grant(ctx, "root", NOW - 3600)
-noise(ctx, 4)
-record_head(ctx, "redflagai.pro", when=NOW - 1800)
-r, code = W._grant(ctx, {"id": "root"})
-check("witnessed grant reports externally_witnessed", code==200 and r["externally_witnessed"], r)
-check("names the peer and the time", r["earliest_external_witness"]["peer"]=="redflagai.pro", r)
-check("gives a four-step plan pointed at the peer",
-      len(r["verification_plan"])==4 and "attest" in r["verification_plan"][0]["run"], r["verification_plan"][0])
-check("states what it does not prove", "should ever have been issued" in r["what_this_does_not_prove"])
-check("reports how long it sat unwitnessed", r["minutes_unwitnessed"] is not None, r.get("minutes_unwitnessed"))
-
-print("\n=== 2. THE ATTACK: a grant back-dated after the fact ===")
-# operator invents a root grant now, and writes created= last week
-ctx = make()
-noise(ctx, 3)
-record_head(ctx, "redflagai.pro", when=NOW - 86400)      # peer saw the log yesterday
-forged = seal_grant(ctx, "forged", NOW - 7*86400)        # grant CLAIMS to be a week old
-r, code = W._grant(ctx, {"id": "forged"})
-check("a grant sealed after the last witness is NOT covered", not r["externally_witnessed"], r)
-check("and says so plainly rather than staying quiet", "rests on this operator's own record" in r.get("flag",""), r.get("flag"))
-# now a peer witnesses; from here it is covered, but only from here
-record_head(ctx, "redflagai.pro", when=NOW)
-r2, _ = W._grant(ctx, {"id": "forged"})
-check("after a later witness it becomes covered", r2["externally_witnessed"])
-gapdays = round(r2["minutes_unwitnessed"]/1440.0, 1)
-check("the seven-day claim-to-witness gap is published, not hidden",
-      r2.get("flag") and "days" in r2["flag"] and gapdays >= 6.9, {"gap_days":gapdays,"flag":r2.get("flag")})
-
-print("\n=== 3. coverage counts only what a peer accepted ===")
-ctx = make()
-noise(ctx, 2); g = seal_grant(ctx, "g1", NOW); noise(ctx, 2)
-record_head(ctx, "peer-that-refused", accepted=0)
-r, _ = W._grant(ctx, {"id": "g1"})
-check("a refused submission gives no coverage", not r["externally_witnessed"], r.get("earliest_external_witness"))
-h, _ = W._heads(ctx, {})
-check("but the refusal is still on the public record", h["count"]==1 and h["heads"][0]["accepted"] is False, h)
-
-print("\n=== 4. a head that predates the grant does not cover it ===")
-ctx = make()
-record_head(ctx, "early-peer", when=NOW-9999)   # size 0
-noise(ctx, 3)
-seal_grant(ctx, "later", NOW)
-r, _ = W._grant(ctx, {"id": "later"})
-check("an earlier, smaller head cannot reach a later record", not r["externally_witnessed"], r)
-
-print("\n=== 5. the earliest witness wins, not the most convenient ===")
-ctx = make()
-noise(ctx, 2); seal_grant(ctx, "g", NOW - 600); noise(ctx, 2)
-record_head(ctx, "second-peer", when=NOW - 100)
-record_head(ctx, "first-peer",  when=NOW - 400)
-r, _ = W._grant(ctx, {"id": "g"})
-check("earliest accepted attestation is the one reported",
-      r["earliest_external_witness"]["peer"]=="first-peer", r["earliest_external_witness"])
-check("the others are listed too", any(c["peer"]=="second-peer" for c in r["also_witnessed_by"]), r["also_witnessed_by"])
-
-print("\n=== 6. status is honest about thin networks ===")
-ctx = make(); noise(ctx, 3)
-s, _ = W._status(ctx)
-check("no peers at all reports strength none", s["strength"]=="none" and "rests on our own record" in s["flag"], s)
-record_head(ctx, "only-peer")
-s, _ = W._status(ctx)
-check("one peer reports weak and names collusion", s["strength"]=="weak" and "collude" in s["flag"], s)
-for p in ("p2","p3"): record_head(ctx, p)
-s, _ = W._status(ctx)
-check("three peers reports reasonable", s["strength"]=="reasonable", s)
-noise(ctx, 6)
-s, _ = W._status(ctx)
-check("records sealed since the last head are counted as unwitnessed",
-      s["records_not_yet_witnessed"]==6, s)
-
-print("\n=== 7. tampering with the grant row ===")
-ctx = make(); noise(ctx,2); seal_grant(ctx,"t",NOW); record_head(ctx,"peer")
-with ctx["lock"]:
-    ctx["conn"].execute("UPDATE auth_grant SET audit_hash='0'*64 WHERE id='t'")
-    ctx["conn"].commit()
-r, code = W._grant(ctx, {"id":"t"})
-check("a grant whose seal is not in the log is a finding, not a 404",
-      code==409 and "finding" in r.get("message",""), (code, r))
-
-print("\n=== 8. url safety on submit ===")
-ctx = make(); noise(ctx,2)
-for bad, why in [("http://127.0.0.1/x","loopback"),("http://10.0.0.5/x","private"),
-                 ("ftp://example.com","scheme"),("https://example.com:8443/x","port")]:
-    r, code = W._submit(ctx, "k", {"peer":"p","url":bad})
-    check("refuses %s" % why, code==400 and r.get("error")=="url_refused", (bad,code,r))
-
-print("\n=== 9. any sealed record, not just grants ===")
-ctx = make(); noise(ctx,2)
-h,_ ,_ = ctx["seal"]({"user_id":"x"},{"decision":"ALLOW"},NOW,"k")
-noise(ctx,1); record_head(ctx,"peer")
-r, code = W._record(ctx, {"hash": h})
-check("a decision receipt gets the same treatment", code==200 and r["externally_witnessed"], r)
-r, code = W._record(ctx, {"hash": "zz"})
-check("a malformed hash is refused", code==400, (code,r))
-
-print("\n" + "="*62)
-print("passed %d, failed %d" % (len(P), len(F)))
-for f in F: print("  FAILED: " + f)
-sys.exit(1 if F else 0)
-
-```
-
-
-## `verify_authority.py`
-
-573 lines, 21333 bytes
-
-```python
-#!/usr/bin/env python3
-"""
-verify_authority.py  -  check an AILeash authority proof without AILeash
-
-    python3 verify_authority.py proof.json
-    curl -s "https://sebbi.pro/x/continuity/proof?evaluation=e_..." \\
-        | python3 verify_authority.py -
-
-WHAT THIS IS FOR
-----------------
-A proof that can only be checked by the party who issued it is not a proof.
-This script takes a bundle and reaches its own conclusion using nothing but
-the Python standard library. It does not call the issuing system, it does not
-import anything you have to install, and it does not take a single field of
-the bundle at face value.
-
-It does four separate things, and each one can fail on its own:
-
-  1. SIGNATURE   Ed25519 over the canonical bundle. Confirms the bundle came
-                 from the holder of the named key and has not been edited by
-                 anybody since.
-
-  2. INTEGRITY   Recomputes every grant digest, the lineage digest and the
-                 parameter digest from the fields in front of it. Confirms
-                 the bundle is internally consistent with its own contents.
-
-  3. DERIVATION  Re-runs the authority rules from scratch: root issued by a
-                 human, an unbroken parent chain, scope covered at every hop,
-                 constraints narrowing on every axis, purpose narrowing,
-                 validity windows contained, nothing revoked, and the action
-                 itself inside the effective limits of the whole lineage.
-
-  4. AGREEMENT   Compares the verdict this script reached with the verdict the
-                 bundle claims. Disagreement is reported as a failure of the
-                 issuer, not of this script.
-
-WHAT A PASS MEANS
------------------
-That the authority for this action was derivable, at that time, from that
-human grant - or, for a refusal, that it genuinely was not, and that the named
-grant and invariant really are where it broke.
-
-WHAT A PASS DOES NOT MEAN
--------------------------
-That the root grant should ever have been issued. That the parameters describe
-something that really happened. That the risk engine was right. Derivation is
-not merit and it is not truth.
-
-The risk half of a composed verdict cannot be re-derived here, because that
-needs the issuer's scoring engine. Where the bundle's authority verdict is
-BLOCK, the composed verdict stands regardless, because the composition takes
-the worse of the two.
-"""
-
-import binascii
-import hashlib
-import json
-import sys
-
-GRANT_PREFIX = b"AILEASH-GRANT-v1:"
-EVAL_PREFIX = b"AILEASH-AUTHEVAL-v1:"
-BUNDLE_PREFIX = b"AILEASH-AUTHORITY-PROOF-v1:"
-
-MAX_DEPTH = 32
-RANK = {"ALLOW": 0, "CHALLENGE": 1, "BLOCK": 2}
-
-
-# ======================================================================
-# Ed25519, RFC 8032, standard library only
-# ======================================================================
-
-_Q = 2 ** 255 - 19
-_L = 2 ** 252 + 27742317777372353535851937790883648493
-_D = -121665 * pow(121666, _Q - 2, _Q) % _Q
-_I = pow(2, (_Q - 1) // 4, _Q)
-
-
-def _h(m):
-    return hashlib.sha512(m).digest()
-
-
-def _inv(x):
-    return pow(x, _Q - 2, _Q)
-
-
-def _xrecover(y):
-    xx = (y * y - 1) * _inv(_D * y * y + 1)
-    x = pow(xx, (_Q + 3) // 8, _Q)
-    if (x * x - xx) % _Q != 0:
-        x = (x * _I) % _Q
-    if x % 2 != 0:
-        x = _Q - x
-    return x
-
-
-_BY = 4 * _inv(5) % _Q
-_BX = _xrecover(_BY)
-_B = (_BX % _Q, _BY % _Q, 1, (_BX * _BY) % _Q)
-_IDENT = (0, 1, 1, 0)
-
-
-def _add(p, q):
-    x1, y1, z1, t1 = p
-    x2, y2, z2, t2 = q
-    a = (y1 - x1) * (y2 - x2) % _Q
-    b = (y1 + x1) * (y2 + x2) % _Q
-    c = t1 * 2 * _D * t2 % _Q
-    dd = z1 * 2 * z2 % _Q
-    e, f, g, hh = b - a, dd - c, dd + c, b + a
-    return (e * f % _Q, g * hh % _Q, f * g % _Q, e * hh % _Q)
-
-
-def _scalarmult(p, e):
-    if e == 0:
-        return _IDENT
-    q = _scalarmult(p, e // 2)
-    q = _add(q, q)
-    if e & 1:
-        q = _add(q, p)
-    return q
-
-
-def _encodepoint(p):
-    x, y, z, _t = p
-    zi = _inv(z)
-    x, y = x * zi % _Q, y * zi % _Q
-    bits = [(y >> i) & 1 for i in range(255)] + [x & 1]
-    return bytes(sum(bits[i * 8 + j] << j for j in range(8)) for i in range(32))
-
-
-def _bit(h, i):
-    return (h[i // 8] >> (i % 8)) & 1
-
-
-def _hint(m):
-    h = _h(m)
-    return sum(2 ** i * _bit(h, i) for i in range(512))
-
-
-def _isoncurve(p):
-    x, y, z, t = p
-    return (z % _Q != 0 and x * y % _Q == z * t % _Q
-            and (y * y - x * x - z * z - _D * t * t) % _Q == 0)
-
-
-def _decodepoint(s):
-    y = int.from_bytes(s, "little") & ((1 << 255) - 1)
-    x = _xrecover(y)
-    if x & 1 != _bit(s, 255):
-        x = _Q - x
-    p = (x, y, 1, (x * y) % _Q)
-    if not _isoncurve(p):
-        raise ValueError("point off curve")
-    return p
-
-
-def ed25519_verify(sig, msg, pk):
-    if len(sig) != 64 or len(pk) != 32:
-        return False
-    try:
-        rr = _decodepoint(sig[:32])
-        a = _decodepoint(pk)
-    except Exception:
-        return False
-    s = int.from_bytes(sig[32:64], "little")
-    if s >= _L:
-        return False
-    hh = _hint(sig[:32] + pk + msg)
-    return _encodepoint(_scalarmult(_B, s)) == _encodepoint(_add(rr, _scalarmult(a, hh)))
-
-
-# ======================================================================
-# the rules, reimplemented from the published spec
-# ======================================================================
-
-def canon(obj):
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
-
-
-def sha(prefix, text):
-    return hashlib.sha256(prefix + text.encode("utf-8")).hexdigest()
-
-
-def grant_digest(g):
-    material = {
-        "id": g["id"], "parent": g["parent"], "issuer": g["issuer"],
-        "issuer_kind": g["issuer_kind"], "subject": g["subject"],
-        "subject_kind": g["subject_kind"], "scope": sorted(g["scope"]),
-        "constraints": g["constraints"], "purpose": g["purpose"],
-        "purpose_tags": sorted(g["purpose_tags"]),
-        "not_before": g["not_before"], "not_after": g["not_after"],
-        "depth": g["depth"], "delegations_left": g["delegations_left"],
-        "created": g["created"], "risk_accepted_by": g.get("risk_accepted_by"),
-    }
-    return sha(GRANT_PREFIX, canon(material))
-
-
-def covers(held, wanted):
-    if held == wanted or held == "*":
-        return True
-    if held.endswith(".*"):
-        return wanted == held[:-2] or wanted.startswith(held[:-1])
-    return False
-
-
-def wildcard_breadth(scope, capability):
-    best = None
-    for held in scope:
-        if not covers(held, capability):
-            continue
-        if held == capability:
-            return 0
-        width = (capability.count(".") + 2 if held == "*"
-                 else capability.count(".") - held[:-2].count("."))
-        best = width if best is None else min(best, width)
-    return best
-
-
-def direction(key):
-    for p in ("max_", "min_", "allowed_", "denied_", "may_"):
-        if key.startswith(p):
-            return p
-    return None
-
-
-def num(v):
-    if isinstance(v, bool) or v is None:
-        raise ValueError("not a number")
-    return float(v)
-
-
-def as_set(v):
-    if isinstance(v, (list, tuple, set)):
-        return set(v)
-    return {v}
-
-
-def narrower(parent_c, child_c):
-    for key in sorted(child_c):
-        d = direction(key)
-        cval = child_c[key]
-        if d is None:
-            return False, "constraint '%s' has no narrowing rule" % key
-        if key not in parent_c:
-            return False, "constraint '%s' is not expressed by the parent" % key
-        pval = parent_c[key]
-        try:
-            if d == "max_" and num(cval) > num(pval):
-                return False, "%s raised from %s to %s" % (key, pval, cval)
-            if d == "min_" and num(cval) < num(pval):
-                return False, "%s lowered from %s to %s" % (key, pval, cval)
-            if d == "allowed_" and not as_set(cval) <= as_set(pval):
-                return False, "%s adds values the parent does not hold" % key
-            if d == "denied_" and not as_set(pval) <= as_set(cval):
-                return False, "%s drops values the parent denies" % key
-            if d == "may_" and bool(cval) and not bool(pval):
-                return False, "%s enabled where the parent withholds it" % key
-        except (TypeError, ValueError):
-            return False, "constraint '%s' is not comparable" % key
-    return True, None
-
-
-def effective(chain):
-    eff = {}
-    for g in chain:
-        for k, v in g["constraints"].items():
-            d = direction(k)
-            if k not in eff:
-                eff[k] = v
-                continue
-            cur = eff[k]
-            try:
-                if d == "max_":
-                    eff[k] = min(num(cur), num(v))
-                elif d == "min_":
-                    eff[k] = max(num(cur), num(v))
-                elif d == "allowed_":
-                    eff[k] = sorted(as_set(cur) & as_set(v))
-                elif d == "denied_":
-                    eff[k] = sorted(as_set(cur) | as_set(v))
-                elif d == "may_":
-                    eff[k] = bool(cur) and bool(v)
-            except (TypeError, ValueError):
-                eff[k] = v
-    return eff
-
-
-def params_against(params, eff):
-    hard, unconstrained = [], []
-    for key in sorted(params):
-        val = params[key]
-        checked = False
-        for cname, cval in eff.items():
-            d = direction(cname)
-            if not d or cname[len(d):] != key:
-                continue
-            checked = True
-            try:
-                if d == "max_" and num(val) > num(cval):
-                    hard.append("%s=%s exceeds %s=%s" % (key, val, cname, cval))
-                elif d == "min_" and num(val) < num(cval):
-                    hard.append("%s=%s is below %s=%s" % (key, val, cname, cval))
-                elif d == "allowed_" and val not in as_set(cval):
-                    hard.append("%s=%s is outside %s" % (key, val, cname))
-                elif d == "denied_" and val in as_set(cval):
-                    hard.append("%s=%s is denied by %s" % (key, val, cname))
-                elif d == "may_" and bool(val) and not bool(cval):
-                    hard.append("%s requested where %s withholds it" % (key, cname))
-            except (TypeError, ValueError):
-                hard.append("%s cannot be compared with %s" % (key, cname))
-        if not checked:
-            unconstrained.append(key)
-    return hard, unconstrained
-
-
-# ======================================================================
-# the four checks
-# ======================================================================
-
-class Report(object):
-    def __init__(self):
-        self.rows = []
-        self.failed = False
-
-    def add(self, ok, name, detail=""):
-        self.rows.append((ok, name, detail))
-        if not ok:
-            self.failed = True
-
-    def note(self, name, detail=""):
-        self.rows.append((None, name, detail))
-
-    def render(self):
-        out = []
-        for ok, name, detail in self.rows:
-            mark = "  ok  " if ok else ("FAIL  " if ok is False else "  --  ")
-            out.append(mark + name + (("\n        " + detail) if detail else ""))
-        return "\n".join(out)
-
-
-def check_signature(bundle, rep):
-    sig_hex = bundle.get("signature")
-    pk_hex = (bundle.get("issued_by") or {}).get("public_key")
-    if not sig_hex or not pk_hex:
-        rep.add(False, "Signature present", "the bundle carries no signature or no key")
-        return
-    body = dict(bundle)
-    body.pop("signature", None)
-    body.pop("verify_with", None)
-    try:
-        sig = binascii.unhexlify(sig_hex)
-        pk = binascii.unhexlify(pk_hex)
-    except Exception:
-        rep.add(False, "Signature is readable hex")
-        return
-    ok = ed25519_verify(sig, BUNDLE_PREFIX + canon(body).encode("utf-8"), pk)
-    rep.add(ok, "Ed25519 signature over the canonical bundle",
-            "key " + pk_hex[:16] + "…  Verify this key independently at the issuer's "
-            "published address before trusting who signed." if ok else
-            "the bundle was altered after signing, or it was not signed by this key")
-
-
-def check_integrity(bundle, rep):
-    lineage = bundle.get("lineage") or []
-    bad = []
-    for g in lineage:
-        try:
-            if grant_digest(g) != g.get("digest"):
-                bad.append(g.get("id"))
-        except Exception:
-            bad.append(g.get("id"))
-    rep.add(not bad, "Every grant digest recomputes from its own fields",
-            "" if not bad else "mismatched: " + ", ".join(str(b) for b in bad))
-
-    claimed = (bundle.get("decision") or {}).get("lineage_digest")
-    mine = sha(EVAL_PREFIX, canon([g.get("digest") for g in lineage]))
-    rep.add(mine == claimed, "Lineage digest matches the ordered path",
-            "" if mine == claimed else "computed " + mine[:20] + "… claimed " + str(claimed)[:20] + "…")
-
-    req = bundle.get("request") or {}
-    claimed_p = (bundle.get("decision") or {}).get("params_digest")
-    mine_p = sha(EVAL_PREFIX, canon({"action": req.get("action"),
-                                     "params": req.get("params") or {}}))
-    rep.add(mine_p == claimed_p, "Parameter digest matches the request as stated",
-            "" if mine_p == claimed_p else "the parameters shown are not the "
-            "parameters that were judged")
-
-
-def rederive(bundle, rep):
-    """Run the published rules from scratch and reach an independent verdict."""
-    lineage = bundle.get("lineage") or []
-    decision = bundle.get("decision") or {}
-    req = bundle.get("request") or {}
-    at = decision.get("evaluated_at_epoch")
-
-    hard, soft = [], []
-    broken_at = broken_invariant = None
-
-    def fail(grant, invariant, detail):
-        nonlocal broken_at, broken_invariant
-        hard.append(detail)
-        if broken_at is None:
-            broken_at, broken_invariant = grant, invariant
-
-    if not lineage:
-        fail(None, "authority_continuity", "the bundle carries no authority path")
-    else:
-        root = lineage[0]
-        if root.get("parent") is not None:
-            fail(root["id"], "authority_continuity",
-                 "the path does not begin at a parentless root")
-        if root.get("issuer_kind") != "human":
-            fail(root["id"], "identity_continuity",
-                 "the root grant was not issued by a human principal")
-
-        previous = None
-        for g in lineage:
-            if g.get("revoked_at") is not None:
-                fail(g["id"], "authority_continuity",
-                     "grant %s was revoked" % g["id"])
-            if at is not None:
-                if at < g["not_before"]:
-                    fail(g["id"], "temporal_validity",
-                         "grant %s was not yet valid at the time of the decision" % g["id"])
-                if at >= g["not_after"]:
-                    fail(g["id"], "temporal_validity",
-                         "grant %s had expired at the time of the decision" % g["id"])
-            if previous is not None:
-                if g.get("parent") != previous.get("id"):
-                    fail(g["id"], "authority_continuity",
-                         "grant %s does not point at the grant above it" % g["id"])
-                missing = [c for c in g["scope"]
-                           if not any(covers(p, c) for p in previous["scope"])]
-                if missing:
-                    fail(g["id"], "boundary_integrity",
-                         "%s holds scope its parent does not: %s"
-                         % (g["id"], ", ".join(sorted(missing))))
-                ok, why = narrower(previous["constraints"], g["constraints"])
-                if not ok:
-                    fail(g["id"], "boundary_integrity", "%s: %s" % (g["id"], why))
-                if not set(g["purpose_tags"]) <= set(previous["purpose_tags"]):
-                    fail(g["id"], "intent_continuity",
-                         "%s carries purpose tags its parent does not" % g["id"])
-                if (g["not_before"] < previous["not_before"]
-                        or g["not_after"] > previous["not_after"]):
-                    fail(g["id"], "temporal_validity",
-                         "%s is valid outside its parent's window" % g["id"])
-                if g["depth"] != previous["depth"] + 1:
-                    fail(g["id"], "authority_continuity",
-                         "%s records a depth inconsistent with its parent" % g["id"])
-            previous = g
-
-        if len(lineage) - 1 > MAX_DEPTH:
-            fail(lineage[-1]["id"], "boundary_integrity", "delegation depth exceeds the ceiling")
-
-        if not any(g.get("risk_accepted_by") for g in lineage):
-            fail(lineage[0]["id"], "identity_continuity",
-                 "no grant in this path names who accepted the risk")
-
-        leaf = lineage[-1]
-        action = req.get("action")
-        params = req.get("params") or {}
-
-        if action and not any(covers(c, action) for c in leaf["scope"]):
-            fail(leaf["id"], "boundary_integrity",
-                 "action '%s' is outside the scope of the grant exercised" % action)
-        elif action:
-            breadth = wildcard_breadth(leaf["scope"], action)
-            if breadth and breadth >= 2:
-                soft.append("action '%s' is only covered by a broad wildcard" % action)
-
-        eff = effective(lineage)
-        failures, unconstrained = params_against(params, eff)
-        for f in failures:
-            fail(leaf["id"], "boundary_integrity", f)
-        for u in unconstrained:
-            soft.append("parameter '%s' is not constrained anywhere in the path" % u)
-
-        tag = req.get("purpose_tag")
-        if tag:
-            if tag not in leaf["purpose_tags"]:
-                soft.append("declared purpose '%s' is not carried by the grant" % tag)
-        else:
-            soft.append("the action declared no purpose")
-
-    verdict = "BLOCK" if hard else ("CHALLENGE" if soft else "ALLOW")
-    return verdict, hard, soft, broken_at, broken_invariant
-
-
-def check_agreement(bundle, rep, mine, hard, soft, broken_at, broken_invariant):
-    decision = bundle.get("decision") or {}
-    claimed = decision.get("authority_verdict") or decision.get("verdict")
-
-    rep.add(mine == claimed,
-            "Independently re-derived authority verdict: " + mine,
-            "" if mine == claimed else
-            "the issuer claims " + str(claimed) + " and this script reaches " + mine +
-            " from the same path. One of us is wrong and the rules are published.")
-
-    if mine == "BLOCK":
-        same_grant = (broken_at == decision.get("broken_at"))
-        same_inv = (broken_invariant == decision.get("broken_invariant"))
-        rep.add(same_grant and same_inv,
-                "Refusal reproduces at the same grant and invariant",
-                ("grant %s, invariant %s" % (broken_at, broken_invariant))
-                if same_grant and same_inv else
-                "this script breaks at grant %s / %s, the issuer says %s / %s"
-                % (broken_at, broken_invariant,
-                   decision.get("broken_at"), decision.get("broken_invariant")))
-        rep.note("Why authority could not be derived")
-        for h in hard:
-            rep.note("  " + h)
-    elif soft:
-        rep.note("Why this could not be settled without a person")
-        for x in soft:
-            rep.note("  " + x)
-
-    risk = decision.get("risk_verdict")
-    if risk and mine != "BLOCK":
-        rep.note("Risk verdict reported as " + str(risk) + ", not re-derivable here",
-                 "the composed verdict is the worse of the two; the scoring engine "
-                 "is not part of this bundle and is not checked by this script")
-
-
-def main():
-    if len(sys.argv) < 2:
-        print(__doc__)
-        return 2
-    src = sys.argv[1]
-    raw = sys.stdin.read() if src == "-" else open(src, "r").read()
-    try:
-        bundle = json.loads(raw)
-    except Exception as exc:
-        print("Not readable JSON: " + str(exc))
-        return 2
-
-    rep = Report()
-    print("=" * 66)
-    print("AUTHORITY PROOF  ·  independent verification")
-    print("=" * 66)
-    d = bundle.get("decision") or {}
-    print("evaluation   " + str(d.get("evaluation")))
-    print("action       " + str((bundle.get("request") or {}).get("action")))
-    print("at           " + str(d.get("evaluated_at")))
-    print("hops         " + str(max(0, len(bundle.get("lineage") or []) - 1)))
-    if bundle.get("lineage"):
-        print("authorised   " + str(bundle["lineage"][0].get("issuer")))
-        print("executed     " + str(bundle["lineage"][-1].get("subject")))
-        acc = [g.get("risk_accepted_by") for g in bundle["lineage"] if g.get("risk_accepted_by")]
-        print("risk owner   " + str(acc[-1] if acc else None))
-    print("-" * 66)
-
-    check_signature(bundle, rep)
-    check_integrity(bundle, rep)
-    mine, hard, soft, ba, bi = rederive(bundle, rep)
-    check_agreement(bundle, rep, mine, hard, soft, ba, bi)
-
-    print(rep.render())
-    print("-" * 66)
-    if rep.failed:
-        print("RESULT: NOT VERIFIED. Something above did not hold.")
-        return 1
-    print("RESULT: VERIFIED - " + mine)
-    if mine == "BLOCK":
-        print("This is a proof that the action was NOT authorised, and where it failed.")
-    print("Checked with no network access, no dependencies, and nothing taken on")
-    print("the issuer's word except the meaning of their public key.")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
-
-```
-
-
-## `AILeash-API-Reference-v6.4.2.md`
-
-256 lines, 6799 bytes
-
-```markdown
-# AILeash v6.4.2 — Complete API Reference
-
-## Core Decision Endpoint
-
-### POST /api/govern
-**The engine. Every action scores here.**
-
-Auth: `Bearer YOUR_API_KEY`
-
-**Request:**
-```json
-{
-  "user_id": "string (required)",
-  "action": "string (required) — payment/login/message/transfer/checkout/api_call",
-  "amount": "number (optional, default 0) — monetary value in GBP",
-  "country": "string (required) — ISO 3166-1 alpha-2 code",
-  "device_id": "string (required) — unique device identifier",
-  "anomaly": "number 0..1 (optional) — behavioural anomaly score",
-  "device_risk": "number 0..1 (optional) — device risk score"
-}
-```
-
-**Response (200 OK):**
-```json
-{
-  "decision": "ALLOW|CHALLENGE|BLOCK",
-  "score": 0.0..1.0,
-  "trust": 0.05..1.0,
-  "reasons": ["velocity_spike", "high_amount", "country_shift"],
-  "audit_hash": "sha256_hex_string",
-  "block_index": 12345,
-  "receipt_seq": 42,
-  "timestamp": 1719072000.0,
-  "challenge_url": "https://sebbi.pro/verify-challenge?token=...",
-  "challenge_expires_in": 900
-}
-```
-
-**Error responses:**
-- `401 Unauthorized` — Missing or invalid API key
-- `403 Forbidden` — Account inactive or over quota
-- `429 Too Many Requests` — Rate limited
-- `503 Service Unavailable` — Server overloaded
-
----
-
-## Account Management
-
-### POST /api/keys or /signup
-**Create a new API key. Instant. No card. No humans in the loop.**
-
-No auth required.
-
-**Request:**
-```json
-{
-  "email": "user@example.com (required)",
-  "name": "John Doe (optional)",
-  "phone": "+441234567890 (optional)",
-  "org": "Acme Corp (optional)",
-  "product": "aileash|guardian|sonicboom|sentinel (default: aileash)",
-  "devices": 1..1000000 (default: 1),
-  "ref_code": "REF-XXXX-1234 (optional)"
-}
-```
-
-**Response (200 OK):**
-```json
-{
-  "api_key": "al_live_...",
-  "email": "user@example.com",
-  "product": "aileash",
-  "devices": 1,
-  "monthly_cost": 0.50,
-  "quota": 100,
-  "ref_code": "REF-JOHN-5678",
-  "badge_id": "abc123def456",
-  "message": "100 free decisions. Then 50p per device per month via Stripe."
-}
-```
-
----
-
-## Verification & Public Endpoints
-
-### GET /api/spec
-**Engine specification. Public. No auth.**
-
-**Response (200 OK):**
-```json
-{
-  "engine": "AILeash v6.4.2",
-  "version": "6.4.2",
-  "signals": 9,
-  "decision_latency_ms": 28,
-  "threshold_allow": 0.35,
-  "threshold_challenge": 0.70,
-  "threshold_block": 1.0,
-  "features": ["deterministic scoring", "tamper-evident chain", "real-time alerts", "gapless receipts", "sovereign deployment"]
-}
-```
-
-### GET /api/verify-chain
-**Full audit chain integrity proof. Public. No auth.**
-
-**Response (200 OK):**
-```json
-{
-  "valid": true,
-  "blocks": 45678,
-  "genesis": "GENESIS",
-  "tip": "abc123...",
-  "message": "Chain intact. No tampering detected.",
-  "verifiable_by": "anyone, anywhere"
-}
-```
-
-### GET /api/health
-**Server health and load. Public. No auth.**
-
-**Response (200 OK):**
-```json
-{
-  "status": "ok",
-  "version": "6.4.2",
-  "uptime_seconds": 864000,
-  "rps": 42,
-  "timestamp": 1719072000.0
-}
-```
-
----
-
-## Real-time Dashboards
-
-### GET /api/pulse
-**Live risk posture. Your current state.**
-
-Auth: `Bearer YOUR_API_KEY`
-
-**Response (200 OK):**
-```json
-{
-  "last_hour": {
-    "ALLOW": 486,
-    "CHALLENGE": 23,
-    "BLOCK": 4
-  },
-  "recent": [
-    {
-      "ts": 1719072000,
-      "user_id": "u_7f2",
-      "action": "payment",
-      "decision": "ALLOW",
-      "score": 0.12,
-      "reasons": [],
-      "audit_hash": "abc123..."
-    }
-  ],
-  "chain_tip": "abc123...",
-  "message": "All green. Chain tip sealed."
-}
-```
-
----
-
-## Billing & Webhooks
-
-### POST /stripe-webhook
-**Stripe webhook receiver. Signature verified automatically.**
-
-Supports events:
-- `checkout.session.completed` — User upgraded
-- `invoice.paid` — Monthly subscription paid
-- `customer.subscription.deleted` — User cancelled
-- `invoice.payment_failed` — Payment failed
-
----
-
-## Four Products. One Engine.
-
-### AILeash
-- **What:** Every AI decision your platform makes about a person gets scored, explained, and sealed.
-- **Who:** Platforms using AI for any regulated decision (lending, hiring, content moderation, fraud, access control).
-- **Price:** 50p per device per month + your margin.
-- **Free tier:** 100 decisions/month, no card.
-
-### Guardian
-- **What:** Free message checker for families. Child pastes a message in, gets instant plain-English assessment against grooming patterns.
-- **Who:** Families. Free forever. No card. No catch.
-- **Price:** Free. Always.
-- **Built for:** ICO Children's Code, Online Safety Act, child safety.
-
-### SonicBoom
-- **What:** One line of code. Drops into AWS, Azure, GCP, OpenAI, Anthropic. Adds full compliance audit chain to every call.
-- **Who:** Platforms already running AI in the cloud.
-- **Price:** 50p per device per month + your margin.
-- **Latency:** No impact. Chain sealing is asynchronous.
-
-### Sentinel
-- **What:** Fraud and anomaly alerting. Scores unusual patterns (500 messages in a minute, login from new country, velocity spikes) in real-time.
-- **Who:** Platforms managing fraud, abuse, takeovers.
-- **Price:** 50p per device per month + your margin.
-- **Real-time:** Alerts the moment thresholds trip.
-
----
-
-## The Score Formula (Immutable)
-
-**Raw weighted sum (Σ_raw):**
-```
-Σ_raw =
-  (1 − trust) × 0.30
-  + min(velocity_60s / 20, 1) × 0.15
-  + min(velocity_5m / 50, 1) × 0.10
-  + min(velocity_1h / 200, 1) × 0.10
-  + min(ln(1+amount) / ln(1+10000), 1) × 0.15
-  + device_risk × 0.10
-  + behavioural_anomaly × 0.10
-  + country_shift × 0.10
-  + unsafe_country × 0.10
-```
-
-**Normalization:** the nine weights above sum to 1.20, not 1.0. To keep every signal's *relative* importance exactly as designed while guaranteeing the score behaves as a true 0–1 weighted average (not one that can reach BLOCK-level values from fewer combined signals than intended), divide by the actual weight total before clamping:
-
-```
-WEIGHT_TOTAL = 0.30 + 0.15 + 0.10 + 0.10 + 0.15 + 0.10 + 0.10 + 0.10 + 0.10   # = 1.20
-
-score = clamp( Σ_raw / WEIGHT_TOTAL , 0, 1 )
-
-decision = ALLOW if score < 0.35
-         = CHALLENGE if score < 0.70
-         = BLOCK otherwise
-```
-
-No machine learning. No drift. No retraining. Weights are written in code and cannot change without a new release. `WEIGHT_TOTAL` is a fixed constant (1.20) recomputed only if a signal is added, removed, or reweighted in a future release — never at runtime.
-
----
-
-## Rate Limits
-
-- **Free tier:** 100 decisions/month
-- **Paid:** Unlimited (or by plan)
-- **Public endpoints:** No rate limit
-
----
-
-## Documentation
-
-- **Homepage:** https://sebbi.pro
-- **Whitepaper:** https://sebbi.pro/whitepaper
-- **Developers:** https://sebbi.pro/developers
-- **Scanner (free):** https://sebbi.pro/scan
-- **Guardian:** https://sebbi.pro/guardian-app
-- **Contact:** justrightdecorators@gmail.com
-
-```
-
-
-## `LICENCE`
-
-22 lines, 1074 bytes
-
-```
-MIT License
-
-Copyright (c) 2026 Monop (Blyth, UK)
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-```
-
-
-## `README.md`
-
-277 lines, 15728 bytes
-
-```markdown
-<div align="center">
-
-```
-        ┌─────────────────────────────────────────────────┐
-        │   s e b b i . p r o                              │
-        │                                                  │
-        │   O N E   C H A I N .   E V E R Y   P R O O F .   │
-        └─────────────────────────────────────────────────┘
-```
-
-### The tamper-evident evidence layer for AI decisions, payments, and records.
-
-*Every event sealed into a hash chain at the moment it happens —*
-*the decision, **and the basis it rested on** — unalterable by anyone. Including us.*
-
-<br>
-
-[![live](https://img.shields.io/badge/live-sebbi.pro-c9a84c?style=for-the-badge)](https://sebbi.pro)
-[![verify the chain](https://img.shields.io/badge/verify_the_chain-open_endpoint-7fe3b0?style=for-the-badge)](https://sebbi.pro/api/verify-chain)
-[![seal something free](https://img.shields.io/badge/seal_something-free,_no_account-7cc8ff?style=for-the-badge)](https://sebbi.pro/seal)
-
-**[Try it](https://sebbi.pro/seal)** · **[Verify it](https://sebbi.pro/verify)** · **[Read the code](https://sebbi.pro/brain)** · **[Developer docs](https://sebbi.pro/developers)** · **[Whitepaper](https://sebbi.pro/whitepaper)**
-
-</div>
-
----
-
-> ### *A system that does not trust its own creator*
-> ### *is the only kind whose records qualify as evidence.*
-
----
-
-## Don't read about it. Watch it work.
-
-Here is a **real** four-block chain. Every hash below is reproducible — same inputs, same seals, forever. Copy the recipe at the bottom and compute them yourself.
-
-```
-  #   EVENT                             RESULT      SEAL (SHA-256, truncated)
-  ─────────────────────────────────────────────────────────────────────────
-  1   system_regmap                     ALLOW       411ffd9a31a3d9f4…
-  2   seal_post: quarterly_report.pdf   NOTARISED   c7309616a9e92bc7…
-  3   govern: payment 9000 GBP          BLOCK       293181a2bc2dab88…
-  4   brain: approve supplier 88        ALLOW       6abba40eb964959e…
-  ─────────────────────────────────────────────────────────────────────────
-  genesis  9fd06d6fdc19761d…                         tip  6abba40eb964959e…
-```
-
-Now watch someone try to cover up that blocked £9,000 payment by flipping block 3 from **BLOCK** to **ALLOW**:
-
-```
-  block 3 altered  →  tip becomes  5e15bc5710426088…   ❌  ≠ 6abba40eb964959e…
-```
-
-**The tip changed. The forgery is exposed instantly, by arithmetic, to anyone — no account, no trust required.** That is the entire product in six lines. Everything below is detail.
-
-<details>
-<summary><b>▸ Reproduce every hash yourself (10 lines of Python)</b></summary>
-
-```python
-import hashlib, json
-seal = lambda prev, ts, ev, res, basis: hashlib.sha256(
-    json.dumps({"prev":prev,"ts":ts,"event":ev,"result":res,"basis":basis},
-               sort_keys=True).encode()).hexdigest()
-
-prev = hashlib.sha256(b"AILEASH_BRAIN_GENESIS|sebbi.pro|v5").hexdigest()
-chain = [("system_regmap","ALLOW","regmap-v7"),
-         ("seal_post: quarterly_report.pdf","NOTARISED","NO_BASIS"),
-         ("govern: payment 9000 GBP","BLOCK","invoice_4471|regmap-v7"),
-         ("brain: approve supplier 88","ALLOW","invoice_4471|regmap-v7")]
-ts = 1752940000
-for ev,res,basis in chain:
-    prev = seal(prev, ts, ev, res, basis); ts += 3600
-    print(prev[:16], "…", ev)
-# final line prints the tip: 6abba40eb964959e …
-```
-Change one character of one event and every seal after it changes. That's the whole idea.
-</details>
-
----
-
-## Why this exists
-
-Every system keeps logs. Logs live in databases. Databases can be edited — by an attacker, an insider, or the operator itself. So an ordinary log only ever says *"this is what we currently claim happened."* It can never say *"and nobody changed it since."*
-
-Nobody notices the difference — until a regulator, a court, an insurer, or a customer asks for **proof**. Then *"our system recorded it"* and *"here is proof it wasn't changed"* become two very different sentences. Only the second carries weight.
-
-**sebbi.pro produces the second sentence — automatically, as a by-product of your system doing its normal work.**
-
----
-
-## The chain, in one formula
-
-```
-seal(n) = SHA-256( seal(n−1) · timestamp · event · result · basis )
-```
-
-| Property | What it means |
-|---|---|
-| **Tamper-evident** | Each seal contains its predecessor. Alter history → every later seal fails, publicly. |
-| **Gapless receipts** | Every decision gets a sequence number in the same transaction. Edited records break the chain; **missing** records break the sequence. |
-| **Truncation-evident** | The tip is anchored per-write. Chop blocks off the end → the anchor breaks. |
-| **Basis-sealed** | Not just *what* was decided — *what it rested on*: sources, versions, ruleset. Same block. |
-| **Jurisdiction-tagged** | Every decision sealed with the regulatory frameworks that applied to it at that moment. |
-| **Fast** | Score + decide + seal + respond inline, **~28 ms** median. |
-| **Crash-safe** | WAL journaling, full-sync commits, single-lock seal path, no race window, daily backups. |
-
-> **The one honest boundary, stated up front:** basis-sealing proves **what** a decision relied on — not that it was **correct**. Cryptography verifies integrity, never truth. Any product claiming to prove correctness is misdescribing what maths can do. We won't.
-
----
-
-## The products — one chain underneath all of them
-
-| | Product | What it does | Access |
-|---|---|---|---|
-| 🧠 | **Brain** | Instruction gate for AI. Blocks prompt injection, exfiltration, compliance-bypass, child-safety and destruction patterns — with unicode/obfuscation defences — and seals every decision + basis. Pure Python, runs on your machine. | **Free download** |
-| ⚡ | **SonicBoom** | Decision engine. Any event scored in ~28ms: ALLOW / CHALLENGE / BLOCK, plain-English reasons, sealed before it replies. Per-user trust learned over time — lost 8× faster than earned, so burst attacks destroy their own standing. Hosted human-oversight challenge flow, itself sealed. | API key |
-| 🔐 | **Delegation layer** | Signed authority tokens (who may approve, to what limit, until when — the grant itself sealed), provider-agnostic KYC result sealing (outcome provable, zero personal data held), and per-decision jurisdiction tagging. Article 14 human oversight as engineering. | API key |
-| 🛡️ | **Sentinel** | Fraud pattern + velocity detection: credential stuffing, card testing, country-jump takeovers. Flags sealed as evidence. | API key |
-| 👁️ | **Guardian** | Child-safety flags: grooming patterns (secrecy, isolation, channel-moving). Content never stored — only fingerprints. Every flag sealed for parents, platforms, authorities. | Platform |
-| 📝 | **Post Notary** | Prove exact text existed on a date, unchanged. | **Free, no account** |
-| 🆔 | **Identity Notary** | Prove a profile is the genuine original — kills impersonation. | **Free, no account** |
-| 💷 | **Payment Notary** | Stop invoice/APP fraud. Seal real bank details once; payers verify a code before funds move. MISMATCH → payment stops. The check itself is sealed. | **Free, no account** |
-
-**Privacy by design:** the notaries fingerprint content *locally*. Your content never leaves your device — only the 64-character hash is sealed. The KYC sealer keeps only the SHA-256 of the provider reference — never the document.
-
----
-
-## The open standard — `ai.txt`
-
-Like `robots.txt` for crawlers and `security.txt` for researchers — **`ai.txt`** is a public, machine-readable declaration of how your AI is governed: decision model, audit method, regulations designed toward, human override. Its companion **`comply.txt`** declares the rulebook every instruction is subject to.
-
-Declarations are claims. **Sealing them into the chain makes them provable** — and their history tamper-evident.
-
-```
-  declaration  →  rulebook  →  enforcement
-     ai.txt        comply.txt      brain.py
-     "we claim"    "the rules"     "the code that proves it"
-```
-
-Publish yours at `/.well-known/ai.txt`. Read [ours](https://sebbi.pro/.well-known/ai.txt).
-
----
-
-## The stack — how it all fits
-
-```
-  DECLARATION    ai.txt · comply.txt     what we claim, publicly
-       │
-  GATE           Brain                   instructions checked before the AI acts
-       │
-  DELEGATION     authority · identity ·  who may act, who they legally are,
-                 jurisdiction            which rules governed the moment
-       │
-  DECISION       SonicBoom               every event: allow / challenge / block
-       │
-  DETECTION      Sentinel · Guardian     attack patterns · child-safety patterns
-       │
-  PUBLIC ACCESS  the Notaries            the same chain, free, for anyone
-       │
-       ▼
-  ╔══════════════════════════════════════════════════════════════════╗
-  ║  EVIDENCE     the hash chain                                      ║
-  ║               everything above seals into here —                 ║
-  ║               action + basis + receipt · gapless · anchored ·    ║
-  ║               publicly verifiable · unalterable by anyone        ║
-  ╚══════════════════════════════════════════════════════════════════╝
-```
-
-**Evidence accrues as a by-product of the system working.** Nobody remembers to log anything. Nobody compiles an audit file before an inspection. The proof exists because the system ran — equally trustworthy whether the operator is honest or not. Which is the only kind of trustworthy that counts.
-
----
-
-## Integrate in minutes
-
-```python
-# ── Notary: seal anything, free, no key. Content stays on your machine. ──
-import hashlib, requests
-fp = hashlib.sha256(content.encode()).hexdigest()
-requests.post("https://sebbi.pro/api/post/seal", json={"fingerprint": fp})
-#   → { sealed, seal, block_index, code }   ← keep the code; anyone can verify it
-
-# ── Decision engine: score + seal an event (API key) ──
-requests.post("https://sebbi.pro/api/govern",
-  headers={"Authorization":"Bearer YOUR_KEY"},
-  json={"user_id":"u1","action":"payment","amount":9000,
-        "country":"UK","device_id":"d1","anomaly":0,"device_risk":0})
-#   → ALLOW / CHALLENGE / BLOCK · reasons · jurisdiction tag · sealed hash · receipt_seq
-
-# ── Delegated authority: grant sealed, enforcement deterministic ──
-tok = requests.post("https://sebbi.pro/api/authority/issue",
-  headers={"Authorization":"Bearer YOUR_KEY"},
-  json={"user_id":"u1","role":"payments_approver",
-        "max_amount":5000,"ttl_hours":24}).json()["authority_token"]
-#   include as "authority_token" in govern events — over-limit or expired
-#   authority escalates the verdict with the reason sealed
-
-# ── KYC result: outcome provable, zero personal data held ──
-requests.post("https://sebbi.pro/api/identity/kyc-seal",
-  headers={"Authorization":"Bearer YOUR_KEY"},
-  json={"user_id":"u1","provider":"onfido","verified":True,
-        "reference":"chk_9f2"})
-#   → only the SHA-256 of the reference is stored — never the document
-
-# ── Brain: gate an instruction and seal its basis (free, local) ──
-from brain import BrainGovernor
-BrainGovernor().evaluate("approve payment to supplier 88", basis={
-  "sources":["invoice_4471.pdf"], "source_versions":["sha256:ab12…"],
-  "ruleset":"AI-TXT/1.0 + EU-AI-Act-2024/1689", "ruleset_version":"regmap-v7"})
-```
-
-Full reference → **[sebbi.pro/developers](https://sebbi.pro/developers)**
-
----
-
-## What this evidences — stated precisely
-
-A versioned, hash-sealed **regulation map** links each capability to the obligations it helps evidence: EU AI Act record-keeping, transparency & human-oversight (Articles 9, 12, 13, 14 — delegated-authority tokens directly supporting Article 14's attributable human oversight), UK Online Safety Act duty-of-care documentation, ICO Children's Code. Jurisdiction tagging extends this to the per-decision level: every sealed block records which frameworks applied at the moment of decision.
-
-These tools help you **evidence** your obligations — tamper-evident, explainable, independently verifiable records of what your systems decided and why. **They do not, on their own, make you compliant. No software does. Anyone who says otherwise is selling you something.**
-
----
-
-## Honest limits — because the whole product is honesty
-
-- **Sealing proves integrity, not truth** — exact content, exact time, unchanged. Not that it was true or agreed to.
-- **Basis-sealing proves what was relied on, not that it was right** — cryptography can't verify the real world.
-- **Authority tokens prove the grant, not the wisdom** — who was empowered, to what limit, until when. Not that granting it was a good idea.
-- **Jurisdiction tagging records applicable frameworks; it does not decide law** — courts do that. It is a versioned, sealed lookup — nothing grander, deliberately.
-- **Brain's filter is a first line, not a wall** — known patterns caught; novel phrasing can pass. The guarantee is the sealed record.
-- **Fingerprints match exact content** — a re-encoded copy or paraphrase won't match.
-- **We evidence compliance; we don't confer it.**
-
-*A vendor who states their limits is giving you the strongest available evidence of how they'll behave when it matters.*
-
----
-
-## Deployment & pricing
-
-- **Cloud** — a few lines against the hosted API. Notaries and Brain free forever.
-- **Sovereign** — the whole engine inside your own network. Offline HMAC-signed 365-day licences, no phone-home, air-gap ready.
-- **50p per active device / month.** Partners set their own pricing above the platform fee.
-
-## Investors
-
-The whitepaper carries a dedicated investor section — market timing (EU AI Act, August 2026), the metered per-device model, the moat, and the stage stated honestly: **[sebbi.pro/whitepaper](https://sebbi.pro/whitepaper)** · justin@monopcontent.com
-
----
-
-<div align="center">
-
-## Check us. Don't trust us.
-
-*That's not a slogan. It's the design requirement — and the only standard by which an evidence layer should ever be judged.*
-
-**[Verify the chain now →](https://sebbi.pro/api/verify-chain)**
-
-<br>
-
-```
-  Built by Justin Dobson · Monop Content · Blyth, Northumberland, UK
-  Solo-built, from scratch, on a phone —
-  because the evidence layer wasn't going to build itself.
-```
-
-[LinkedIn](https://www.linkedin.com/in/justin-dobson-037721217) · [sebbi.pro](https://sebbi.pro)
-
-</div>
-
-<!--
-Keywords: tamper-evident audit trail · AI governance · AI compliance evidence ·
-EU AI Act record keeping · hash chain audit log · APP fraud prevention ·
-invoice verification · prompt injection defence · AI decision audit ·
-delegated authority tokens · KYC evidence sealing · jurisdiction tagging ·
-ai.txt standard · comply.txt · cryptographic proof of action · immutable audit log ·
-agentic AI governance · sovereign AI deployment · SonicBoom · Brain · Sentinel · Guardian
--->
 
 ```
