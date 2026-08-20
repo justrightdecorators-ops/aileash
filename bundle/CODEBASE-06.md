@@ -1,4 +1,4 @@
-# Codebase — part 6 of 25
+# Codebase — part 6 of 24
 
 Contains:
 - `modules/lineage.py`
