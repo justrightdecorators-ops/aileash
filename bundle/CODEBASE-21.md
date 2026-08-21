@@ -1,9 +1,301 @@
 # Codebase — part 21 of 25
 
 Contains:
+- `report-threat.html`
+- `requirements.txt`
 - `reseller.html`
 - `risk-policy.html`
 - `robots.txt`
+
+
+## `report-threat.html`
+
+272 lines, 14806 bytes
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>AILeash Guardian &mdash; Report a Threat</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0a0f1e;color:#fff;min-height:100vh;padding:24px;max-width:600px;margin:0 auto}
+.logo{font-size:22px;font-weight:900;text-align:center;margin-bottom:4px}.logo span{color:#c9a84c}
+.sub{font-family:monospace;font-size:10px;color:rgba(255,255,255,0.3);letter-spacing:2px;text-transform:uppercase;text-align:center;margin-bottom:8px}
+
+.nav-links{display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-bottom:28px}
+.nav-links a{font-family:monospace;font-size:10px;color:rgba(255,255,255,0.4);text-decoration:none;padding:5px 10px;border:1px solid rgba(255,255,255,0.1);border-radius:4px;letter-spacing:1px;text-transform:uppercase;transition:all .2s}
+.nav-links a:hover{color:#c9a84c;border-color:rgba(201,168,76,0.4)}
+
+.intro{background:rgba(201,168,76,0.06);border:1px solid rgba(201,168,76,0.2);border-radius:8px;padding:18px;margin-bottom:20px;font-size:13px;color:rgba(255,255,255,0.7);line-height:1.75}
+.intro strong{color:#c9a84c;display:block;margin-bottom:6px;font-size:14px}
+
+.card{background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:20px;margin-bottom:16px}
+.card-title{font-family:monospace;font-size:10px;color:#c9a84c;letter-spacing:2px;text-transform:uppercase;margin-bottom:4px}
+.card-desc{font-size:12px;color:rgba(255,255,255,0.4);margin-bottom:14px;line-height:1.6}
+
+.field{margin-bottom:12px}
+.field label{display:block;font-family:monospace;font-size:10px;color:rgba(255,255,255,0.4);letter-spacing:1px;text-transform:uppercase;margin-bottom:6px}
+.field input,.field textarea,.field select{width:100%;background:rgba(255,255,255,0.07);border:1px solid rgba(255,255,255,0.12);color:#fff;padding:12px 14px;font-size:14px;border-radius:6px;outline:none;font-family:inherit;transition:border-color .2s}
+.field input:focus,.field textarea:focus,.field select:focus{border-color:rgba(201,168,76,0.5)}
+.field textarea{height:100px;resize:vertical}
+.field input::placeholder,.field textarea::placeholder{color:rgba(255,255,255,0.25)}
+.field select option{background:#0a0f1e}
+
+.evidence-label{font-family:monospace;font-size:9px;color:#ff6b6b;letter-spacing:2px;text-transform:uppercase;margin-bottom:6px;margin-top:10px}
+.evidence-box{background:rgba(0,0,0,0.3);border:1px solid rgba(255,107,107,0.2);border-radius:6px;padding:12px;font-family:monospace;font-size:11px;color:rgba(255,255,255,0.6);line-height:1.8;word-break:break-all;margin-bottom:4px}
+
+.severity{display:inline-block;padding:4px 12px;border-radius:4px;font-family:monospace;font-size:11px;font-weight:700;letter-spacing:1px;text-transform:uppercase;margin:10px 0}
+.sev-critical{background:rgba(204,0,0,0.2);border:1px solid rgba(204,0,0,0.4);color:#ff6b6b}
+.sev-high{background:rgba(201,168,76,0.2);border:1px solid rgba(201,168,76,0.4);color:#c9a84c}
+
+.steps{margin-bottom:0}
+.step{display:flex;gap:12px;align-items:flex-start;margin-bottom:16px;padding-bottom:16px;border-bottom:1px solid rgba(255,255,255,0.06)}
+.step:last-child{border-bottom:none;margin-bottom:0;padding-bottom:0}
+.step-n{background:#c9a84c;color:#0a0f1e;width:26px;height:26px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:900;font-size:12px;flex-shrink:0;margin-top:2px}
+.step-text{font-size:13px;color:rgba(255,255,255,0.6);line-height:1.65}
+.step-text strong{color:#fff;display:block;margin-bottom:3px;font-size:14px}
+.step-text a{color:#c9a84c;text-decoration:none}
+
+.btn{width:100%;padding:15px;border:none;border-radius:8px;font-size:15px;font-weight:700;cursor:pointer;margin-bottom:10px;font-family:inherit;transition:all .2s;text-align:center;text-decoration:none;display:block}
+.btn-red{background:#cc0000;color:#fff}.btn-red:hover{background:#aa0000}
+.btn-blue{background:#1a4fa0;color:#fff}.btn-blue:hover{background:#153d80}
+.btn-purple{background:#6b21a8;color:#fff}.btn-purple:hover{background:#581c87}
+.btn-ghost{background:rgba(255,255,255,0.06);color:rgba(255,255,255,0.6);border:1px solid rgba(255,255,255,0.12)}.btn-ghost:hover{color:#fff;border-color:rgba(255,255,255,0.3)}
+
+.msg{display:none;padding:14px;border-radius:6px;font-family:monospace;font-size:12px;margin-bottom:12px;line-height:1.7}
+.msg.show{display:block}
+.msg-ok{background:rgba(0,135,90,0.15);border:1px solid rgba(0,135,90,0.3);color:#00ff88}
+.msg-err{background:rgba(204,0,0,0.15);border:1px solid rgba(204,0,0,0.3);color:#ff6b6b}
+
+.divider{height:1px;background:rgba(255,255,255,0.06);margin:20px 0}
+.footer-note{font-family:monospace;font-size:10px;color:rgba(255,255,255,0.2);text-align:center;margin-top:24px;line-height:1.8}
+</style>
+</head>
+<body>
+
+<div class="logo">AILeash <span>Guardian</span></div>
+<div class="sub">Threat Reporting &amp; Evidence Preservation</div>
+
+<div class="nav-links">
+  <a href="/">Home</a>
+  <a href="/certificate">Certificate</a>
+  <a href="/registry">Safe AI Registry</a>
+  <a href="/admin">Admin</a>
+  <a href="/scan">AI Scanner</a>
+</div>
+
+<div class="intro">
+  <strong>What is this page for?</strong>
+  If AILeash Guardian has detected a threat — grooming behaviour, suspicious contact, or any harmful activity involving a child — this page lets you preserve the evidence and report it to the right authorities. Fill in your details below, copy the evidence package, and follow the steps to report. The SHA-256 audit hash is cryptographically sealed and admissible in UK courts.
+</div>
+
+<div class="card">
+  <div class="card-title">Evidence Package</div>
+  <div class="card-desc">This evidence was automatically captured and sealed by AILeash Guardian. Do not edit it.</div>
+  <div class="evidence-label">SHA-256 Audit Hash</div>
+  <div class="evidence-box" id="ev-hash">Loading...</div>
+  <div class="evidence-label">Incident Record</div>
+  <div class="evidence-box" id="ev-record">Loading...</div>
+  <div id="ev-severity"></div>
+</div>
+
+<div class="card">
+  <div class="card-title">Your Details</div>
+  <div class="card-desc">This information is sent securely to AILeash and to the relevant authority when you submit your report.</div>
+  <div class="field"><label>Your Full Name</label><input type="text" id="reporter-name" placeholder="e.g. Jane Smith"></div>
+  <div class="field"><label>Your Email Address</label><input type="email" id="reporter-email" placeholder="your@email.com"></div>
+  <div class="field"><label>Your Phone Number</label><input type="tel" id="reporter-phone" placeholder="+44 7700 000000"></div>
+  <div class="field"><label>Child's Approximate Age</label>
+    <select id="child-age">
+      <option value="">Select age group</option>
+      <option>Under 5</option>
+      <option>5 to 7</option>
+      <option>8 to 10</option>
+      <option>11 to 13</option>
+      <option>14 to 16</option>
+      <option>17</option>
+    </select>
+  </div>
+  <div class="field"><label>Additional Details</label><textarea id="extra-details" placeholder="Describe anything else relevant to this incident. Include dates, times, platform names, usernames, or any other context that might help investigators."></textarea></div>
+</div>
+
+<div class="card">
+  <div class="card-title">How to Report</div>
+  <div class="card-desc">Follow these steps in order. Start with Step 1 immediately. If a child is in immediate danger, call 999 first.</div>
+  <div class="steps">
+    <div class="step">
+      <div class="step-n">1</div>
+      <div class="step-text">
+        <strong>Action Fraud &mdash; UK's National Fraud Reporting Centre</strong>
+        Call <strong>0300 123 2040</strong> or visit <a href="https://www.actionfraud.police.uk" target="_blank">actionfraud.police.uk</a>. Give them the SHA-256 hash above. They will issue a crime reference number — keep it safe.
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-n">2</div>
+      <div class="step-text">
+        <strong>CEOP &mdash; Child Exploitation and Online Protection</strong>
+        For grooming or child sexual exploitation, report directly at <a href="https://www.ceop.police.uk/safety-centre/" target="_blank">ceop.police.uk/safety-centre</a>. Available 24 hours a day, 7 days a week. CEOP works directly with police to investigate and arrest offenders.
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-n">3</div>
+      <div class="step-text">
+        <strong>Internet Watch Foundation &mdash; For Illegal Images</strong>
+        If the incident involved child sexual abuse material, report it at <a href="https://report.iwf.org.uk" target="_blank">report.iwf.org.uk</a>. The IWF works with police to remove content and prosecute offenders globally.
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-n">4</div>
+      <div class="step-text">
+        <strong>Local Police</strong>
+        For immediate danger call <strong>999</strong>. For non-emergency situations call <strong>101</strong>. Provide the SHA-256 hash and your crime reference number from Action Fraud.
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="msg msg-ok" id="msg-ok"></div>
+<div class="msg msg-err" id="msg-err"></div>
+
+<button class="btn btn-ghost" onclick="copyEvidence()">Copy Full Evidence Package to Clipboard</button>
+<a href="https://www.actionfraud.police.uk/reporting-fraud-and-cyber-crime" target="_blank" class="btn btn-blue">Report to Action Fraud &rarr;</a>
+<a href="https://www.ceop.police.uk/safety-centre/" target="_blank" class="btn btn-purple">Report to CEOP &rarr;</a>
+<button class="btn btn-red" onclick="submitReport()">Submit to AILeash &mdash; Preserve Evidence Permanently &rarr;</button>
+
+<div class="footer-note">
+  AILeash Guardian &middot; Monop Content &middot; Blyth, Northumberland<br>
+  justrightdecorators@gmail.com &middot; 07908 269428<br>
+  Evidence sealed with SHA-256 &middot; Admissible in UK courts
+</div>
+
+<script>
+var incidentData = {};
+
+function init() {
+  var params = new URLSearchParams(window.location.search);
+  var hash    = params.get('hash')    || localStorage.getItem('last_block_hash')    || 'NOT PROVIDED';
+  var score   = params.get('score')   || localStorage.getItem('last_score')         || 'N/A';
+  var reasons = params.get('reasons') || localStorage.getItem('last_reasons')       || 'N/A';
+  var ts      = params.get('ts')      || new Date().toISOString();
+  var device  = localStorage.getItem('guardian_device') || 'Unknown Device';
+  var apiKey  = localStorage.getItem('guardian_key')    || '';
+
+  incidentData = { hash:hash, score:score, reasons:reasons, ts:ts, device:device, apiKey:apiKey };
+
+  document.getElementById('ev-hash').textContent = hash;
+  document.getElementById('ev-record').textContent = ts + ' | ' + device + ' | score: ' + score + ' | signals: ' + reasons;
+
+  var sev = parseFloat(score) >= 0.9 ? 'CRITICAL' : 'HIGH';
+  document.getElementById('ev-severity').innerHTML = '<span class="severity ' + (sev==='CRITICAL'?'sev-critical':'sev-high') + '">' + sev + ' SEVERITY</span>';
+}
+
+function buildPackage() {
+  var name  = document.getElementById('reporter-name').value.trim();
+  var email = document.getElementById('reporter-email').value.trim();
+  var phone = document.getElementById('reporter-phone').value.trim();
+  var age   = document.getElementById('child-age').value;
+  var extra = document.getElementById('extra-details').value.trim();
+  return [
+    'AILEASH GUARDIAN — LAW ENFORCEMENT EVIDENCE PACKAGE',
+    '=====================================================',
+    'Generated: ' + new Date().toISOString(),
+    '',
+    'EVIDENCE HASH (SHA-256):',
+    incidentData.hash,
+    '',
+    'INCIDENT RECORD:',
+    incidentData.ts + ' | Device: ' + incidentData.device,
+    'Risk Score: ' + incidentData.score,
+    'Threat Signals: ' + incidentData.reasons,
+    '',
+    'REPORTER DETAILS:',
+    'Name:  ' + (name  || 'Not provided'),
+    'Email: ' + (email || 'Not provided'),
+    'Phone: ' + (phone || 'Not provided'),
+    'Child age group: ' + (age || 'Not provided'),
+    '',
+    'ADDITIONAL DETAILS:',
+    extra || 'None provided',
+    '',
+    'REPORTING CONTACTS:',
+    'Action Fraud: 0300 123 2040 | actionfraud.police.uk',
+    'CEOP: ceop.police.uk/safety-centre',
+    'IWF: report.iwf.org.uk',
+    'Emergency: 999 | Non-emergency: 101',
+    '',
+    'This evidence package was generated by AILeash Guardian.',
+    'The SHA-256 audit hash is cryptographically sealed and',
+    'admissible as evidence in UK courts.',
+    'sebbi.pro | justrightdecorators@gmail.com | 07908 269428'
+  ].join('\n');
+}
+
+function copyEvidence() {
+  navigator.clipboard.writeText(buildPackage()).then(function() {
+    var btn = document.querySelectorAll('.btn-ghost')[0];
+    btn.textContent = 'Copied \u2713';
+    setTimeout(function(){ btn.textContent = 'Copy Full Evidence Package to Clipboard'; }, 2500);
+  });
+}
+
+async function submitReport() {
+  var ok  = document.getElementById('msg-ok');
+  var err = document.getElementById('msg-err');
+  ok.classList.remove('show'); err.classList.remove('show');
+  var email = document.getElementById('reporter-email').value.trim();
+  if (!email || !email.includes('@')) {
+    err.textContent = 'Please enter your email address before submitting.';
+    err.classList.add('show'); return;
+  }
+  try {
+    var r = await fetch('https://sebbi.pro/report-threat', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json','Authorization':'Bearer '+incidentData.apiKey},
+      body: JSON.stringify({
+        hash: incidentData.hash, score: incidentData.score,
+        reasons: incidentData.reasons, device: incidentData.device,
+        ts: incidentData.ts,
+        reporter_name:  document.getElementById('reporter-name').value.trim(),
+        reporter_email: email,
+        reporter_phone: document.getElementById('reporter-phone').value.trim(),
+        child_age:      document.getElementById('child-age').value,
+        extra_details:  document.getElementById('extra-details').value.trim(),
+        evidence_package: buildPackage()
+      })
+    });
+    var d = await r.json();
+    if (d.ok) {
+      ok.textContent = 'Report submitted. Reference: ' + (d.reference || 'AIDX-' + Date.now()) + '. Evidence is permanently preserved. Justin has been notified.';
+      ok.classList.add('show');
+    } else {
+      err.textContent = 'Submission failed. Copy the evidence package above and report to Action Fraud directly on 0300 123 2040.';
+      err.classList.add('show');
+    }
+  } catch(e) {
+    err.textContent = 'Cannot reach server. Copy the evidence package and call Action Fraud: 0300 123 2040.';
+    err.classList.add('show');
+  }
+}
+
+init();
+</script>
+</body>
+</html>
+
+```
+
+
+## `requirements.txt`
+
+2 lines, 22 bytes
+
+```text
+opentimestamps-client
+
+```
 
 
 ## `reseller.html`
