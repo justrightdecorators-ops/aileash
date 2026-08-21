@@ -1,0 +1,719 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Evidence pack — sebbi.pro</title>
+<meta name="description" content="The document you hand an auditor. It does not summarise your chain, it re-verifies it: every block in the period rehashed and compared to the hash sealed at the time.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+Condensed:wght@600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --paper:#EEF1F0;
+  --paper-2:#E3E8E7;
+  --ink:#16232B;
+  --ink-soft:#5A6E77;
+  --rule:#CBD5D3;
+  --slate:#2E6B72;
+  --ochre:#B4700F;
+  --stop:#8C2F1E;
+  --good:#1E6B4A;
+  --sans:"IBM Plex Sans",system-ui,-apple-system,sans-serif;
+  --cond:"IBM Plex Sans Condensed","IBM Plex Sans",system-ui,sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{
+  margin:0;background:var(--paper);color:var(--ink);
+  font:16px/1.6 var(--sans);
+  font-variant-numeric:tabular-nums;
+}
+.wrap{max-width:860px;margin:0 auto;padding:0 22px}
+a{color:var(--slate)}
+:focus-visible{outline:2px solid var(--ochre);outline-offset:3px}
+code{font:500 13.5px var(--mono);background:#fff;border:1px solid var(--rule);
+  padding:1px 5px;word-break:break-all}
+
+/* ---- masthead ---- */
+.top{border-bottom:1px solid var(--rule);padding:18px 0}
+.top .wrap{display:flex;align-items:baseline;justify-content:space-between;gap:16px}
+.brand{font:600 15px/1 var(--cond);letter-spacing:.14em;text-transform:uppercase;
+  text-decoration:none;color:var(--ink)}
+.brand span{color:var(--ochre)}
+.top nav{font-size:13.5px;color:var(--ink-soft)}
+.top nav a{margin-left:16px;text-decoration:none}
+.top nav a:hover{text-decoration:underline}
+
+/* ---- hero ---- */
+.hero{padding:56px 0 44px;border-bottom:1px solid var(--rule)}
+.eyebrow{
+  font:600 12px/1 var(--cond);letter-spacing:.2em;text-transform:uppercase;
+  color:var(--slate);margin-bottom:18px;
+}
+h1{
+  font:700 clamp(34px,7.2vw,60px)/1.02 var(--cond);
+  letter-spacing:-.015em;margin:0 0 18px;max-width:16ch;
+}
+.lede{font-size:18.5px;line-height:1.55;max-width:56ch;color:var(--ink);margin:0 0 28px}
+.lede b{font-weight:600}
+
+/* the claim/check contrast: the signature line of the product */
+.contrast{
+  background:#fff;border:1px solid var(--rule);margin:0 0 26px;
+  display:grid;grid-template-columns:1fr 1fr;
+}
+@media (max-width:640px){.contrast{grid-template-columns:1fr}}
+.contrast div{padding:16px 18px}
+.contrast div+div{border-left:1px solid var(--rule)}
+@media (max-width:640px){.contrast div+div{border-left:0;border-top:1px solid var(--rule)}}
+.contrast .tag{
+  font:600 10.5px/1 var(--cond);letter-spacing:.16em;text-transform:uppercase;
+  display:block;margin-bottom:7px;
+}
+.contrast .a .tag{color:var(--stop)}
+.contrast .b .tag{color:var(--good)}
+.contrast p{margin:0;font-size:15px;line-height:1.5}
+.contrast .a p{color:var(--ink-soft)}
+
+.buyrow{display:flex;flex-wrap:wrap;align-items:center;gap:16px}
+.dl{
+  display:inline-block;background:var(--ink);color:var(--paper);
+  font:600 15px/1 var(--sans);letter-spacing:.01em;
+  padding:15px 24px;border:1px solid var(--ink);border-radius:2px;
+  text-decoration:none;cursor:pointer;
+  transition:background .12s ease,color .12s ease;
+}
+.dl:hover{background:var(--ochre);border-color:var(--ochre);color:#fff}
+.dl:disabled{opacity:.45;cursor:default}
+.price{font-size:14.5px;color:var(--ink-soft)}
+.price b{color:var(--ink);font-weight:600}
+
+/* ---- generic section ---- */
+section{padding:46px 0;border-bottom:1px solid var(--rule)}
+h2{
+  font:700 clamp(22px,3.6vw,30px)/1.15 var(--cond);
+  letter-spacing:-.01em;margin:0 0 8px;
+}
+.sub{color:var(--ink-soft);font-size:15px;margin:0 0 26px;max-width:60ch}
+
+/* ---- the four checks ---- */
+.checks{border-top:1px solid var(--rule)}
+.chk{
+  display:grid;grid-template-columns:auto 1fr;gap:0 20px;
+  padding:18px 0;border-bottom:1px solid var(--rule);align-items:start;
+}
+.chk .mark{
+  font:600 11px/1.6 var(--cond);letter-spacing:.16em;text-transform:uppercase;
+  color:#fff;background:var(--slate);padding:2px 8px;border-radius:2px;
+  white-space:nowrap;margin-top:3px;
+}
+.chk h3{font:600 17px/1.4 var(--sans);margin:0 0 4px}
+.chk p{margin:0;font-size:15px;color:var(--ink-soft)}
+
+/* ---- build your pack ---- */
+.build{background:var(--paper-2)}
+.form{display:flex;flex-wrap:wrap;gap:10px;margin:0 0 6px}
+.form input,.form select{
+  flex:1 1 200px;min-width:0;background:#fff;border:1px solid var(--rule);
+  padding:14px;font:400 15px var(--sans);color:var(--ink);border-radius:2px;
+}
+.form select{font:500 15px var(--mono)}
+.form input:focus,.form select:focus{outline:none;box-shadow:inset 0 0 0 2px var(--ochre)}
+.form button{
+  flex:0 0 auto;background:var(--ink);color:var(--paper);border:1px solid var(--ink);
+  padding:14px 22px;font:600 15px var(--sans);border-radius:2px;cursor:pointer;
+}
+.form button:hover{background:var(--ochre);border-color:var(--ochre);color:#fff}
+.form button:disabled{opacity:.45;cursor:default}
+.scoperow{display:flex;gap:18px;flex-wrap:wrap;font-size:14px;color:var(--ink-soft);
+  margin:2px 0 16px}
+.scoperow label{display:flex;align-items:center;gap:7px;cursor:pointer}
+.msg{font-size:14.5px;min-height:22px;margin:0 0 14px}
+.msg .yes{color:var(--good);font-weight:600}
+.msg .no{color:var(--stop);font-weight:600}
+
+.result{background:#fff;border:1px solid var(--rule);display:none}
+.result.on{display:block}
+.result .hd{
+  font:600 11px/1 var(--cond);letter-spacing:.16em;text-transform:uppercase;
+  padding:12px 14px;border-bottom:1px solid var(--rule);color:var(--ink-soft);
+  display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;
+}
+.result .hd .acts{display:flex;gap:8px}
+.result .hd button{
+  background:transparent;border:1px solid var(--rule);color:var(--ink);
+  font:600 10.5px/1 var(--cond);letter-spacing:.14em;text-transform:uppercase;
+  padding:7px 10px;border-radius:2px;cursor:pointer;
+}
+.result .hd button:hover{border-color:var(--ochre);color:var(--ochre)}
+.result iframe{display:block;width:100%;height:640px;border:0;background:#0a0f1e}
+.jsonbox{padding:14px;font:400 12.5px/1.7 var(--mono);white-space:pre-wrap;
+  word-break:break-all;max-height:520px;overflow:auto;display:none}
+.jsonbox.on{display:block}
+
+/* ---- headline read ---- */
+.figs{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--rule);
+  border:1px solid var(--rule);margin:0 0 18px}
+@media (max-width:640px){.figs{grid-template-columns:1fr}}
+.figs div{background:#fff;padding:14px 16px}
+.figs .n{font:700 26px/1.1 var(--cond);letter-spacing:-.01em}
+.figs .n.ok{color:var(--good)} .figs .n.bad{color:var(--stop)}
+.figs .l{font-size:12.5px;color:var(--ink-soft);margin-top:4px}
+
+/* ---- routes ---- */
+table.rt{width:100%;border-collapse:collapse;font-size:14px;margin-top:4px}
+table.rt th,table.rt td{text-align:left;padding:10px 12px 10px 0;
+  border-bottom:1px solid var(--rule);vertical-align:top}
+table.rt th{font:600 10.5px/1.6 var(--cond);letter-spacing:.16em;
+  text-transform:uppercase;color:var(--ink-soft)}
+table.rt td.r{font:500 13px var(--mono);white-space:nowrap;padding-right:16px}
+table.rt td.a{color:var(--ink-soft);white-space:nowrap;font-size:13px}
+
+/* ---- limits ---- */
+ul.limits{margin:0;padding:0;list-style:none}
+ul.limits li{
+  padding:14px 0 14px 22px;border-bottom:1px solid var(--rule);
+  font-size:15px;color:var(--ink-soft);position:relative;
+}
+ul.limits li::before{content:"—";position:absolute;left:0;color:var(--stop)}
+ul.limits li:first-child{border-top:1px solid var(--rule)}
+
+/* ---- key ---- */
+.key{background:var(--paper-2)}
+.terms{font-size:13.5px;color:var(--ink-soft);margin:16px 0 0;max-width:62ch}
+
+/* ---- steps ---- */
+.steps{counter-reset:s;margin:0;padding:0;list-style:none}
+.steps li{margin:0 0 22px}
+.steps li h3{
+  font:600 15px/1.4 var(--sans);margin:0 0 8px;
+  display:flex;align-items:baseline;gap:10px;
+}
+.steps li h3::before{
+  counter-increment:s;content:counter(s);
+  font:600 11px/1 var(--cond);letter-spacing:.1em;
+  color:#fff;background:var(--ink);padding:4px 7px;border-radius:2px;
+}
+pre.cmd{
+  background:#fff;border:1px solid var(--rule);padding:14px 16px;margin:0 0 10px;
+  font:500 13.5px/1.75 var(--mono);overflow-x:auto;
+}
+pre.cmd .c{color:var(--ink-soft)}
+
+/* ---- footer ---- */
+.foot{padding:30px 0 44px;font-size:13.5px;color:var(--ink-soft)}
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="wrap">
+    <a class="brand" href="/">sebbi<span>.pro</span></a>
+    <nav>
+      <a href="/x/pack/spec">Read the spec</a>
+      <a href="#build">Build one</a>
+      <a href="#key">Get a key</a>
+    </nav>
+  </div>
+</header>
+
+<div class="hero">
+  <div class="wrap">
+    <div class="eyebrow">Evidence pack</div>
+    <h1>The document you hand the auditor.</h1>
+    <p class="lede">Everything else on this platform produces evidence. This produces
+    the paperwork. Pick a period and it does not summarise your chain — it
+    <b>re-verifies</b> it. Every block in the range is rehashed from its stored
+    contents using the same function that sealed it, and compared to the hash
+    recorded at the time.</p>
+
+    <div class="contrast">
+      <div class="a">
+        <span class="tag">A summary</span>
+        <p>A number your own system printed about itself. The auditor has to take
+        your word for it, and so do you.</p>
+      </div>
+      <div class="b">
+        <span class="tag">A re-verification</span>
+        <p>Every block recomputed and compared. A check anyone can repeat, on
+        their own machine, without asking you.</p>
+      </div>
+    </div>
+
+    <div class="buyrow">
+      <a class="dl" href="#build">Build a pack</a>
+      <span class="price">Included with any <b>sebbi.pro</b> key &middot; free for 90 days</span>
+    </div>
+  </div>
+</div>
+
+<section>
+  <div class="wrap">
+    <h2>What it actually checks</h2>
+    <p class="sub">Four separate checks. Each one can fail on its own, and the pack
+    says so plainly rather than quietly rounding it away.</p>
+
+    <div class="checks">
+      <div class="chk">
+        <span class="mark">Hash</span>
+        <div>
+          <h3>Every block rehashed</h3>
+          <p>SHA-256 over the stored prev_hash, timestamp, event and result —
+          recomputed row by row and compared to the hash sealed at the time. If a
+          single character of a record was edited after the fact, its hash no
+          longer matches and the block is named.</p>
+        </div>
+      </div>
+      <div class="chk">
+        <span class="mark">Links</span>
+        <div>
+          <h3>The links walked end to end</h3>
+          <p>Each block records the hash of the one before it. The pack walks that
+          line through the whole period. A block removed from the middle breaks the
+          link on either side of the hole, and the break is reported with its
+          number.</p>
+        </div>
+      </div>
+      <div class="chk">
+        <span class="mark">Entry</span>
+        <div>
+          <h3>The link into the period</h3>
+          <p>The first block in your period is checked against the last block
+          before it — so a pack cannot be made clean by choosing a start date that
+          skips over the problem. Where the chain starts at the beginning, it says
+          so: intact from genesis.</p>
+        </div>
+      </div>
+      <div class="chk">
+        <span class="mark">Receipts</span>
+        <div>
+          <h3>Gapless receipt numbers</h3>
+          <p>For a single key, receipts are numbered with no gaps by construction.
+          The pack checks the sequence from first to last. A missing number is not
+          a lost record — it is a record that left this chain, and it is listed.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="build" id="build">
+  <div class="wrap">
+    <h2>Build your pack</h2>
+    <p class="sub">Runs against your own chain, right here in the browser. Nothing
+    is sealed and nothing is charged until you press Seal it — preview as many
+    times as you like.</p>
+
+    <div class="form">
+      <input id="key" type="text" autocomplete="off" spellcheck="false"
+             placeholder="Your sebbi.pro key" aria-label="Your sebbi.pro key">
+      <select id="period" aria-label="Period"></select>
+      <button id="go" type="button">Preview</button>
+    </div>
+    <div class="scoperow">
+      <label><input type="radio" name="scope" value="all" checked> Whole deployment</label>
+      <label><input type="radio" name="scope" value="me"> Just my key</label>
+    </div>
+    <div class="msg" id="msg" aria-live="polite"></div>
+
+    <div class="figs" id="figs" style="display:none">
+      <div><div class="n" id="f1">—</div><div class="l" id="l1">blocks re-verified</div></div>
+      <div><div class="n" id="f2">—</div><div class="l" id="l2">receipt sequence</div></div>
+      <div><div class="n" id="f3">—</div><div class="l" id="l3">unbroken since</div></div>
+    </div>
+
+    <div class="result" id="result">
+      <div class="hd">
+        <span id="rhd">Pack</span>
+        <span class="acts">
+          <button type="button" id="tab-doc">Document</button>
+          <button type="button" id="tab-json">JSON</button>
+          <button type="button" id="save">Download</button>
+          <button type="button" id="seal">Seal it</button>
+        </span>
+      </div>
+      <iframe id="doc" title="Evidence pack"></iframe>
+      <div class="jsonbox" id="json"></div>
+    </div>
+
+    <p class="sub" style="margin:18px 0 0">Only closed periods are offered. A pack
+    covering a period that has not finished yet would be a pack that changes after
+    you send it, so the platform refuses to make one.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Sealing it</h2>
+    <p class="sub">A preview is a document. Sealing turns it into a fixed point.</p>
+    <ol class="steps">
+      <li>
+        <h3>The pack gets its own digest</h3>
+        <p class="sub" style="margin:0">SHA-256 over the whole pack, every figure in
+        it included. Change one number in the document afterwards and the digest
+        stops matching.</p>
+      </li>
+      <li>
+        <h3>That digest is sealed into the chain</h3>
+        <p class="sub" style="margin:0">The pack becomes a block in the same chain it
+        just verified, with its own block number and receipt. Now the document
+        cannot be edited after the fact — not by an auditor, not by your staff, and
+        not by us.</p>
+      </li>
+      <li>
+        <h3>Anyone can check it later</h3>
+<pre class="cmd">GET /x/pack/history          <span class="c"># every pack you have ever issued</span>
+GET /x/consistency/ancestor  <span class="c"># is that block still on this chain</span></pre>
+        <p class="sub" style="margin:0">Hand over the pack and its block number. The
+        person checking does not need your permission and does not need to trust
+        you.</p>
+      </li>
+    </ol>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>The routes</h2>
+    <p class="sub">The spec is public — read exactly what this does before you sign
+    up for anything. Everything else needs your key, because a pack is your
+    evidence and nobody else's.</p>
+    <table class="rt">
+      <tr><th>Route</th><th>Access</th><th>What comes back</th></tr>
+      <tr><td class="r">GET /x/pack/spec</td><td class="a">public</td>
+          <td>What this module does, in full</td></tr>
+      <tr><td class="r">GET /x/pack/preview</td><td class="a">keyed</td>
+          <td>The pack as JSON, nothing sealed</td></tr>
+      <tr><td class="r">GET /x/pack/render</td><td class="a">keyed</td>
+          <td>The same pack as one printable page</td></tr>
+      <tr><td class="r">GET /x/pack/history</td><td class="a">keyed</td>
+          <td>Every pack you have issued, with block numbers</td></tr>
+      <tr><td class="r">POST /x/pack/issue</td><td class="a">keyed</td>
+          <td>Seals the pack's digest into the chain</td></tr>
+    </table>
+    <p class="sub" style="margin:22px 0 0">Period accepts <code>2026</code>,
+    <code>2026-07</code> or <code>2026-Q2</code>. Add <code>scope=me</code> to
+    limit the pack to your own key; leave it off for a deployment-wide pack.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>What this does not prove</h2>
+    <p class="sub">Published here rather than discovered by an auditor later. A pack
+    that claimed more than this would be worth less, not more.</p>
+    <ul class="limits">
+      <li>That any decision recorded here was correct. A wrong answer seals just as
+      cleanly as a right one. This proves what was decided and when, not that it
+      was good.</li>
+      <li>That an external peer's own chain is honest. That is checked at the
+      peer's host, not here. What this shows is that other people hold copies of
+      your positions.</li>
+      <li>Anything at all about periods outside the dates on the document.</li>
+      <li>That your staff did the right thing off-system. If a decision never
+      reached the chain, no pack can tell you about it.</li>
+    </ul>
+  </div>
+</section>
+
+<section class="key" id="key-section">
+  <div class="wrap" id="key">
+    <h2>Getting a key</h2>
+    <p class="sub">One key covers every product on this platform, evidence packs
+    included. There is no separate charge for the pack.</p>
+    <div class="form">
+      <input id="email" type="email" inputmode="email" autocomplete="email"
+             placeholder="you@yourcompany.com" aria-label="Your email">
+      <input id="org" type="text" autocomplete="organization"
+             placeholder="Company (optional)" aria-label="Your company">
+      <button id="getkey" type="button">Get a key</button>
+    </div>
+    <div class="msg" id="keymsg" aria-live="polite"></div>
+    <p class="terms">Free for 90 days — the full thing, no card. After that it is
+    50p per machine per month, billed through Stripe, counted on the machines that
+    actually used your key rather than a number you typed. Stop whenever you like.
+    Packs you have already sealed stay sealed and stay checkable, with or without
+    an account.</p>
+  </div>
+</section>
+
+<footer class="foot">
+  <div class="wrap">
+    Every check this module performs is published at
+    <a href="/x/pack/spec">/x/pack/spec</a> — no account needed to read it.
+    <br>sebbi.pro
+  </div>
+</footer>
+
+<script>
+/* ------------------------------------------------------------------ periods
+   Only closed periods. Built from today's date so the list never offers a
+   period the platform will refuse. */
+(function(){
+  var sel = document.getElementById("period");
+  var now = new Date();
+  var y = now.getUTCFullYear(), m = now.getUTCMonth() + 1;
+  var out = [];
+
+  /* completed quarters, newest first */
+  var cq = Math.floor((m - 1) / 3) + 1;
+  var qy = y, q = cq - 1;
+  for (var i = 0; i < 4; i++) {
+    if (q < 1) { q = 4; qy -= 1; }
+    out.push(qy + "-Q" + q);
+    q -= 1;
+  }
+  /* completed months, newest first */
+  var my = y, mm = m - 1;
+  for (var j = 0; j < 6; j++) {
+    if (mm < 1) { mm = 12; my -= 1; }
+    out.push(my + "-" + (mm < 10 ? "0" + mm : mm));
+    mm -= 1;
+  }
+  /* completed years */
+  for (var k = 1; k <= 3; k++) out.push(String(y - k));
+
+  var seen = {};
+  out.forEach(function(p){
+    if (seen[p]) return;
+    seen[p] = 1;
+    var o = document.createElement("option");
+    o.value = p; o.textContent = p;
+    sel.appendChild(o);
+  });
+})();
+
+/* ------------------------------------------------------------------ helpers */
+function esc(s){
+  return String(s).replace(/[<>&]/g, function(c){
+    return {"<":"&lt;", ">":"&gt;", "&":"&amp;"}[c];
+  });
+}
+function scopeNow(){
+  var r = document.querySelector('input[name="scope"]:checked');
+  return r && r.value === "me" ? "me" : "";
+}
+var LAST = null;   /* the pack JSON currently on screen */
+var LASTHTML = ""; /* the rendered document currently on screen */
+
+var msg    = document.getElementById("msg");
+var figs   = document.getElementById("figs");
+var result = document.getElementById("result");
+var docFrame = document.getElementById("doc");
+var jsonBox  = document.getElementById("json");
+
+function say(html){ msg.innerHTML = html; }
+
+function headline(p){
+  var ig = p.integrity || {};
+  var sq = p.receipt_sequence || {};
+  var f1 = document.getElementById("f1");
+  f1.textContent = (ig.hashes_verified || 0) + " of " + (ig.blocks_recomputed || 0);
+  f1.className = "n " + (ig.clean ? "ok" : "bad");
+  document.getElementById("l1").textContent =
+    ig.clean ? "blocks re-verified, all clean" : "blocks re-verified — SOMETHING FAILED";
+
+  var f2 = document.getElementById("f2");
+  if (sq.applicable) {
+    f2.textContent = sq.gapless ? "complete" : "gaps";
+    f2.className = "n " + (sq.gapless ? "ok" : "bad");
+    document.getElementById("l2").textContent =
+      sq.received + " of " + sq.expected + " receipts, " + sq.first + " to " + sq.last;
+  } else {
+    f2.textContent = "n/a";
+    f2.className = "n";
+    document.getElementById("l2").textContent =
+      "receipt sequence applies to a single key";
+  }
+
+  var f3 = document.getElementById("f3");
+  f3.textContent = p.unbroken_since || "—";
+  f3.className = "n";
+  document.getElementById("l3").textContent =
+    "unbroken since \u00b7 " + (p.entries_in_period || 0) + " entries this period";
+
+  figs.style.display = "";
+}
+
+function showDoc(){
+  jsonBox.classList.remove("on");
+  docFrame.style.display = "block";
+}
+function showJson(){
+  docFrame.style.display = "none";
+  jsonBox.classList.add("on");
+}
+document.getElementById("tab-doc").addEventListener("click", showDoc);
+document.getElementById("tab-json").addEventListener("click", showJson);
+
+/* ------------------------------------------------------------------ fetching */
+async function call(path, method){
+  var key = document.getElementById("key").value.trim();
+  var r = await fetch(path, {
+    method: method || "GET",
+    headers: {
+      "Authorization": "Bearer " + key,
+      "X-API-Key": key,
+      "Content-Type": "application/json"
+    }
+  });
+  var d;
+  try { d = await r.json(); }
+  catch (e) { throw new Error("The server did not send back JSON."); }
+  return {status: r.status, body: d};
+}
+
+async function build(){
+  var key = document.getElementById("key").value.trim();
+  var period = document.getElementById("period").value;
+  var scope = scopeNow();
+  var btn = document.getElementById("go");
+
+  if (!key) {
+    say('<span class="no">Put your key in first.</span> Do not have one? ' +
+        'There is a form further down this page.');
+    return;
+  }
+
+  btn.disabled = true;
+  say("Re-verifying every block in " + period + "\u2026");
+  var qs = "?period=" + encodeURIComponent(period) + (scope ? "&scope=me" : "");
+
+  try {
+    var pv = await call("/x/pack/preview" + qs);
+    if (pv.status === 401) {
+      say('<span class="no">That key was not accepted.</span> Check it and try again.');
+      btn.disabled = false; return;
+    }
+    if (pv.status !== 200) {
+      var b = pv.body || {};
+      say('<span class="no">' + esc(b.message || b.error || "That did not work.") +
+          '</span>');
+      btn.disabled = false; return;
+    }
+
+    LAST = pv.body;
+    jsonBox.textContent = JSON.stringify(LAST, null, 2);
+    headline(LAST);
+
+    var rd = await call("/x/pack/render" + qs);
+    LASTHTML = (rd.body && rd.body.html) || "";
+    docFrame.srcdoc = LASTHTML;
+
+    document.getElementById("rhd").textContent =
+      "Evidence pack \u00b7 " + LAST.period + " \u00b7 " + LAST.scope;
+    result.classList.add("on");
+    showDoc();
+
+    var ig = LAST.integrity || {};
+    if (ig.clean) {
+      say('<span class="yes">Clean.</span> ' + ig.blocks_recomputed +
+          ' blocks recomputed and every one matched the hash sealed at the time. ' +
+          'Nothing is sealed yet — this is a preview.');
+    } else {
+      say('<span class="no">This period did not come back clean.</span> ' +
+          'Mismatched blocks ' + JSON.stringify(ig.hash_mismatches) +
+          ', link breaks ' + JSON.stringify(ig.link_breaks) +
+          ', entry link ' + esc(ig.link_into_period) +
+          '. The pack reports it rather than hiding it.');
+    }
+  } catch (e) {
+    say('<span class="no">Could not reach the server.</span> ' + esc(e.message));
+  }
+  btn.disabled = false;
+}
+document.getElementById("go").addEventListener("click", build);
+
+/* ------------------------------------------------------------------ download */
+document.getElementById("save").addEventListener("click", function(){
+  if (!LASTHTML) { say("Build a pack first."); return; }
+  var name = "evidence-pack-" + (LAST.period || "period") + ".html";
+  var url = URL.createObjectURL(new Blob([LASTHTML], {type: "text/html"}));
+  var a = document.createElement("a");
+  a.href = url; a.download = name;
+  document.body.appendChild(a); a.click();
+  document.body.removeChild(a);
+  setTimeout(function(){ URL.revokeObjectURL(url); }, 4000);
+});
+
+/* ------------------------------------------------------------------ seal */
+document.getElementById("seal").addEventListener("click", async function(){
+  if (!LAST) { say("Build a pack first."); return; }
+  var period = LAST.period;
+  var scope = scopeNow();
+  if (!window.confirm(
+      "Seal the " + period + " pack into the chain?\n\n" +
+      "This writes a permanent block. The pack's own digest goes in, so the " +
+      "document can never be edited afterwards. It cannot be undone.")) return;
+
+  var btn = this;
+  btn.disabled = true;
+  say("Sealing\u2026");
+  var qs = "?period=" + encodeURIComponent(period) + (scope ? "&scope=me" : "");
+  try {
+    var r = await call("/x/pack/issue" + qs, "POST");
+    if (r.status !== 200) {
+      var b = r.body || {};
+      say('<span class="no">' + esc(b.message || b.error || "Sealing failed.") +
+          '</span>');
+      btn.disabled = false; return;
+    }
+    LAST = r.body;
+    jsonBox.textContent = JSON.stringify(LAST, null, 2);
+    var s = LAST.sealed || {};
+    say('<span class="yes">Sealed.</span> Block <code>#' + esc(s.block_index) +
+        '</code>, receipt <code>' + esc(s.receipt_seq) + '</code>.<br>' +
+        'Pack digest <code>' + esc(LAST.pack_digest) + '</code><br>' +
+        'Hand that block number over with the document. Anyone can check it ' +
+        'against the chain without asking you.');
+  } catch (e) {
+    say('<span class="no">Could not reach the server.</span> ' + esc(e.message));
+  }
+  btn.disabled = false;
+});
+
+/* ------------------------------------------------------------------ signup */
+(function(){
+  var btn = document.getElementById("getkey");
+  var km = document.getElementById("keymsg");
+  btn.addEventListener("click", async function(){
+    var email = document.getElementById("email").value.trim();
+    var org = document.getElementById("org").value.trim();
+    if (!email || email.indexOf("@") < 1) {
+      km.innerHTML = '<span class="no">That email does not look right. ' +
+        'Check it and try again.</span>';
+      return;
+    }
+    btn.disabled = true;
+    km.textContent = "Making your key\u2026";
+    try {
+      var r = await fetch("/signup", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({email: email, org: org, product: "pack"})
+      });
+      var d = await r.json();
+      if (d && d.key) {
+        km.innerHTML = '<span class="yes">Your key is ready.</span> ' +
+          '<code>' + esc(d.key) + '</code><br>We have emailed it to you as well. ' +
+          'It has been put in the box above \u2014 pick a period and build a pack.';
+        document.getElementById("key").value = d.key;
+      } else {
+        km.innerHTML = '<span class="no">' +
+          esc((d && (d.error || d.detail)) || "That did not go through.") +
+          '</span> Try again, or email justrightdecorators@gmail.com and we ' +
+          'will sort it by hand.';
+        btn.disabled = false;
+      }
+    } catch (e) {
+      km.innerHTML = '<span class="no">Could not reach the server.</span> ' +
+        'Try again in a moment.';
+      btn.disabled = false;
+    }
+  });
+})();
+</script>
+</body>
+</html>
