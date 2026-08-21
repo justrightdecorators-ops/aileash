@@ -1,2124 +1,2221 @@
-# Codebase — part 1 of 26
+# Codebase — part 1 of 25
 
 Contains:
-- `modules/_ _ i n i t _ _ . p y`
-- `modules/capture.py`
-- `modules/codebase.py`
-- `modules/complete.py`
-- `modules/conformance.py`
+- `server.py`
 
 
-## `modules/_ _ i n i t _ _ . p y`
+## `server.py`
 
-2 lines, 37 bytes
-
-```
-# makes this folder a python package
-
-```
-
-
-## `modules/capture.py`
-
-385 lines, 17851 bytes
+2209 lines, 135182 bytes
 
 ```python
-"""
-One-button decision capture - /x/capture/<action>
+import json,math,time,sqlite3,hashlib,threading,random,string,hmac,base64,zlib,re
+import urllib.request,urllib.parse,os,secrets
+from html import escape as esc
+from collections import defaultdict,deque
+from http.server import BaseHTTPRequestHandler,HTTPServer
+from socketserver import ThreadingMixIn
+from urllib.parse import urlparse,parse_qs
 
-WHAT IT IS
-----------
-A drop-in button for an operator's own review screen. A human reviews an AI
-output, clicks once, and the decision is sealed into the chain with who
-reviewed it, on what device, against which inputs, and how long they took.
+PORT=int(os.environ.get("PORT",8080))
+STRIPE_SECRET=os.environ.get("STRIPE_SECRET","")
+STRIPE_WEBHOOK_SECRET=os.environ.get("STRIPE_WEBHOOK_SECRET","")
+BREVO_API_KEY=os.environ.get("BREVO_API_KEY","")
+HOST=os.environ.get("HOST","https://sebbi.pro")
+def _pick_db_path():
+    """Use a persistent volume if one is mounted, else fall back to the
+    local file so the app never crashes on boot. Set DB_PATH in Railway
+    (e.g. /data/aileash.db) once a volume is mounted at that folder, and
+    the chain will survive redeploys instead of resetting each time."""
+    p=os.environ.get("DB_PATH","").strip()
+    if p:
+        d=os.path.dirname(p) or "."
+        try:
+            os.makedirs(d,exist_ok=True)
+            if os.access(d,os.W_OK):return p
+        except Exception:pass
+        print("DB_PATH set but "+p+" not writable - falling back to local aileash.db",flush=True)
+    return "aileash.db"
+DB=_pick_db_path()
+VERSION="6.5.0"
+OWNER_NAME="Justin Antony Dobson"
+OWNER_EMAIL="justrightdecorators@gmail.com"
+OWNER_PHONE="07908 269428"
+SAFE={"UK","US","DE","FR","CA","AU","NL","SE","NO","DK","FI","IE","NZ"}
+REQ={"user_id","action","amount","country","device_id","anomaly","device_risk"}
+FREE_QUOTA=100
+TRIAL_DAYS=90
+ADMIN_PASSWORD=os.environ.get("ADMIN_PASSWORD","")
+_admin_tokens={}
+_admin_fails=deque()
+_admin_lock=threading.Lock()
+ADMIN_TOKEN_TTL=86400
+STRIPE_PRICE_AL=""
+STRIPE_PRICE_GU=""
+STRIPE_PRICE_SB=""
+STRIPE_PRICE_SE=""
+STRIPE_PRICE_TS=""
+_db_lock=threading.Lock()
+_load_lock=threading.Lock()
+_req_times=deque()
+_overloaded=False
+_key_wins=defaultdict(lambda:{"min":deque(),"hour":deque()})
+_key_lock=threading.Lock()
+_prune_counter=0
+_prune_lock=threading.Lock()
+_trial_checkout_cache={}
+_trial_lock=threading.Lock()
 
-WHY IT IS TWO CALLS AND NOT ONE
--------------------------------
-The obvious version is a single POST carrying a dwell time measured in the
-browser. That number is the whole point - it is what makes rubber stamping
-visible - and a number the reviewed party computes for itself is not
-evidence. Anyone can set it to whatever looks diligent.
+def to_int(v,default=1,lo=1,hi=1000000):
+    try:return max(lo,min(hi,int(v)))
+    except (ValueError,TypeError):return default
 
-So the widget opens a case first. The server records the open time. When the
-reviewer commits, the server computes the dwell itself from two timestamps it
-owns. The browser never supplies the figure it is being judged on.
+def get_conn():
+    c=sqlite3.connect(DB,check_same_thread=False)
+    c.execute("PRAGMA journal_mode=WAL;")
+    c.execute("PRAGMA synchronous=NORMAL;")
+    c.execute("CREATE TABLE IF NOT EXISTS users(user_id TEXT PRIMARY KEY,trust REAL DEFAULT 0.5,last_country TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT,ts REAL,user_id TEXT,event_json TEXT,result_json TEXT,prev_hash TEXT,audit_hash TEXT UNIQUE)")
+    c.execute("CREATE TABLE IF NOT EXISTS api_keys(key TEXT PRIMARY KEY,email TEXT,phone TEXT,name TEXT,org TEXT,org_type TEXT,product TEXT DEFAULT 'aileash',devices INTEGER DEFAULT 1,stripe_customer TEXT DEFAULT '',stripe_sub TEXT DEFAULT '',actions_used INTEGER DEFAULT 0,created REAL,active INTEGER DEFAULT 1,is_paid INTEGER DEFAULT 0,free_quota INTEGER DEFAULT 100,plan_type TEXT DEFAULT 'free')")
+    c.execute("CREATE TABLE IF NOT EXISTS config(k TEXT PRIMARY KEY,v TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS load_log(id INTEGER PRIMARY KEY AUTOINCREMENT,ts REAL,rps REAL,note TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS contact_log(id INTEGER PRIMARY KEY AUTOINCREMENT,ts REAL,name TEXT,email TEXT,phone TEXT,org TEXT,message TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS referrals(code TEXT PRIMARY KEY,referrer_key TEXT,referrer_email TEXT,referrer_name TEXT,created REAL,devices_referred INTEGER DEFAULT 0,earnings_pence INTEGER DEFAULT 0)")
+    c.execute("CREATE TABLE IF NOT EXISTS threat_log(id INTEGER PRIMARY KEY AUTOINCREMENT,ts REAL,ref TEXT,data_json TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS waitlist(id INTEGER PRIMARY KEY AUTOINCREMENT,ts REAL,email TEXT,product TEXT,name TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS guardian_family(pair_code TEXT PRIMARY KEY,parent_key TEXT,child_name TEXT,created REAL,last_checkin REAL)")
+    c.execute("CREATE TABLE IF NOT EXISTS guardian_events(id INTEGER PRIMARY KEY AUTOINCREMENT,pair_code TEXT,ts REAL,kind TEXT,lat REAL,lon REAL,note TEXT,content_fp TEXT,audit_hash TEXT)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_audit ON audit_log(user_id)")
+    try:c.execute("ALTER TABLE audit_log ADD COLUMN api_key TEXT")
+    except sqlite3.OperationalError:pass
+    try:c.execute("ALTER TABLE audit_log ADD COLUMN key_seq INTEGER")
+    except sqlite3.OperationalError:pass
+    try:c.execute("ALTER TABLE api_keys ADD COLUMN seq INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:pass
+    c.execute("CREATE INDEX IF NOT EXISTS idx_audit_key ON audit_log(api_key)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_keys_email ON api_keys(email)")
+    c.execute("CREATE TABLE IF NOT EXISTS device_seen(api_key TEXT,device_id TEXT,first_seen REAL,PRIMARY KEY(api_key,device_id))")
+    c.execute("CREATE TABLE IF NOT EXISTS signal_packs(pack_id TEXT PRIMARY KEY,api_key TEXT,name TEXT,version INTEGER,signals_json TEXT,created REAL,seal TEXT,block_index INTEGER,public INTEGER DEFAULT 0,author TEXT DEFAULT '')")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_packs_key ON signal_packs(api_key)")
+    try:c.execute("ALTER TABLE signal_packs ADD COLUMN public INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:pass
+    try:c.execute("ALTER TABLE signal_packs ADD COLUMN author TEXT DEFAULT ''")
+    except sqlite3.OperationalError:pass
+    c.execute("CREATE TABLE IF NOT EXISTS identity_registry(fp TEXT PRIMARY KEY,ts REAL,seal TEXT,block_index INTEGER,public INTEGER DEFAULT 0,profile_json TEXT DEFAULT '')")
+    c.execute("CREATE TABLE IF NOT EXISTS payment_registry(fp TEXT PRIMARY KEY,ts REAL,seal TEXT,block_index INTEGER,display_json TEXT DEFAULT '')")
+    c.execute("CREATE TABLE IF NOT EXISTS post_registry(fp TEXT PRIMARY KEY,ts REAL,seal TEXT,block_index INTEGER)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_devseen_key ON device_seen(api_key)")
+    c.commit()
+    return c
 
-Same reason the verdict is withheld between the two calls: the machine's
-answer is sealed at open and only returned at seal, so the chain shows the
-human committed before they saw it. Ordering is the one thing that separates
-judgement from agreement.
+_conn=get_conn()
 
-KEYS IN BROWSERS
-----------------
-An API key pasted into page JavaScript is public. Anyone reading the source
-can post as that operator, forever.
+def track_request():
+    global _overloaded
+    t=time.time()
+    with _load_lock:
+        _req_times.append(t)
+        while _req_times and _req_times[0]<t-1.0:_req_times.popleft()
+        rps=len(_req_times)
+        if rps>200 and not _overloaded:
+            _overloaded=True
+            try:_conn.execute("INSERT INTO load_log(ts,rps,note) VALUES(?,?,?)",(t,rps,"THROTTLE"));_conn.commit()
+            except:pass
+        elif rps<140 and _overloaded:_overloaded=False
 
-So capture accepts a CAPTURE TOKEN: minted server-side by the operator from
-their real key, bound to one origin, short-lived, and able to do exactly two
-things - open a case and seal it. It cannot read records, cannot see other
-cases, cannot touch any other module. Same idea as a publishable key.
+def is_over():
+    with _load_lock:return _overloaded
 
-The real API key still works for server-to-server calls. It should never
-appear in a page.
+def get_rps():
+    t=time.time()
+    with _load_lock:return sum(1 for x in _req_times if x>=t-1.0)
 
-DEVICES ARE THE BILLING UNIT
-----------------------------
-Every capture carries a device_id, and distinct devices per calendar month is
-what billing is counted on. The registry here is that count: first seen, last
-seen, events, per month. An operator can query their own figure at any time
-and reconcile it against an invoice, rather than being told a number.
+def check_rate(key):
+    t=time.time()
+    with _key_lock:
+        w=_key_wins[key]
+        while w["min"] and w["min"][0]<t-60:w["min"].popleft()
+        while w["hour"] and w["hour"][0]<t-3600:w["hour"].popleft()
+        if len(w["min"])>=60:return False,"rate_limit_minute"
+        if len(w["hour"])>=1000:return False,"rate_limit_hour"
+        w["min"].append(t);w["hour"].append(t)
+        return True,None
 
-Device identifiers are hashed on arrival. The chain and the registry hold a
-fingerprint, never the raw identifier.
+def prune_memory():
+    """Evict stale entries from in-memory velocity/rate-limit stores.
+    Called every 1000 requests. Fix for unbounded memory growth."""
+    t=time.time()
+    with _key_lock:
+        dead=[k for k,w in _key_wins.items() if (not w["hour"]) or w["hour"][-1]<t-3600]
+        for k in dead:del _key_wins[k]
+    for store,age in ((W60,60),(W5M,300),(W1H,3600)):
+        dead=[u for u,q in store.items() if (not q) or q[-1]<t-age]
+        for u in dead:del store[u]
+    with _admin_lock:
+        expired=[tok for tok,exp in _admin_tokens.items() if exp<t]
+        for tok in expired:del _admin_tokens[tok]
+    with _trial_lock:
+        old=[k for k,v in _trial_checkout_cache.items() if v[0]<t-3600]
+        for k in old:del _trial_checkout_cache[k]
 
-    POST /x/capture/token     mint a browser-safe capture token (real key only)
-    POST /x/capture/open      start a case, server records the clock
-    POST /x/capture/seal      commit a verdict, server computes the dwell
-    GET  /x/capture/devices   this month's billable device count
-    GET  /x/capture/case?id=  the sealed record of one capture
-    GET  /x/capture/summary   dwell and divergence across recent captures
-"""
+def maybe_prune():
+    global _prune_counter
+    with _prune_lock:
+        _prune_counter+=1
+        if _prune_counter<1000:return
+        _prune_counter=0
+    try:prune_memory()
+    except Exception as e:print("PRUNE ERR:"+str(e),flush=True)
 
-import hashlib, hmac, json, os, re, secrets, time
-from datetime import datetime, timezone
-
-VERSION = "1.0"
-VERDICTS = {"allow", "block", "challenge", "escalate", "approve", "reject"}
-HEX64 = re.compile(r"^[0-9a-f]{64}$")
-TOKEN_TTL = 3600 * 12
-MAX_OPEN_AGE = 3600 * 6
-
-_ready = False
-
-
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        ctx["conn"].execute("CREATE TABLE IF NOT EXISTS capture_cases(case_id TEXT PRIMARY KEY,api_key TEXT,operator_fp TEXT,device_fp TEXT,input_hash TEXT,output_hash TEXT,machine_verdict TEXT,opened REAL,sealed REAL,human_verdict TEXT,dwell REAL,agreed INTEGER,note TEXT)")
-        ctx["conn"].execute("CREATE TABLE IF NOT EXISTS capture_devices(api_key TEXT,device_fp TEXT,month TEXT,first_seen REAL,last_seen REAL,events INTEGER DEFAULT 0,PRIMARY KEY(api_key,device_fp,month))")
-        ctx["conn"].execute("CREATE INDEX IF NOT EXISTS idx_cap_key ON capture_cases(api_key,opened)")
-        ctx["conn"].execute("CREATE INDEX IF NOT EXISTS idx_cap_dev ON capture_devices(api_key,month)")
-        ctx["conn"].commit()
-    _ready = True
-
-
-def _secret():
-    s = os.environ.get("CAPTURE_SECRET", "").strip() or os.environ.get("LICENCE_SECRET", "").strip()
-    return s.encode() if s else None
-
-
-def _fp(v):
-    s = _secret()
-    if not s:
-        return None
-    return hmac.new(s, str(v).strip().lower().encode(), hashlib.sha256).hexdigest()
-
-
-def _iso(ts):
-    if not ts:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
-
-def _month(ts=None):
-    return datetime.fromtimestamp(ts or time.time(), tz=timezone.utc).strftime("%Y-%m")
-
-
-# ------------------------------------------------------------ capture token
-
-def _mint(ctx, api_key, data):
-    """Real key only. Returns a token safe to put in a page."""
-    s = _secret()
-    if not s:
-        return {"error": "capture_secret_not_set",
-                "message": "Set CAPTURE_SECRET in the environment first."}, 503
-    origin = str(data.get("origin", "")).strip().lower()[:120]
-    if not origin:
-        return {"error": "origin_required",
-                "message": "Bind the token to the site that will use it, e.g. https://app.yourcompany.com"}, 400
+def send_email(to_email,to_name,subject,html):
+    BREVO_KEY=os.environ.get("BREVO_API_KEY","").strip()
+    if not BREVO_KEY:print("EMAIL SKIP:"+to_email,flush=True);return
     try:
-        ttl = min(int(data.get("ttl_seconds", TOKEN_TTL)), TOKEN_TTL)
-    except (TypeError, ValueError):
-        ttl = TOKEN_TTL
-    exp = int(time.time()) + max(60, ttl)
-    body = api_key + "|" + origin + "|" + str(exp)
-    sig = hmac.new(s, body.encode(), hashlib.sha256).hexdigest()[:32]
-    token = "cap_" + str(exp) + "_" + hashlib.sha256(origin.encode()).hexdigest()[:8] + "_" + sig
-    return {"capture_token": token, "origin": origin,
-            "expires": _iso(exp), "expires_in_seconds": exp - int(time.time()),
-            "scope": ["capture:open", "capture:seal"],
-            "note": "Safe to place in a page. It cannot read records, cannot see other cases, and cannot reach any other module. Mint a fresh one from your server as needed - never put your real API key in a browser."}, 200
+        payload=json.dumps({"sender":{"name":"AILeash","email":"justrightdecorators@gmail.com"},"to":[{"email":to_email,"name":to_name}],"subject":subject,"htmlContent":html})
+        req=urllib.request.Request("https://api.brevo.com/v3/smtp/email",
+            data=payload.encode("utf-8"),
+            headers={"api-key":str(BREVO_KEY),"Content-Type":"application/json"},method="POST")
+        with urllib.request.urlopen(req,timeout=15):pass
+        print("EMAIL OK:"+to_email,flush=True)
+    except Exception as e:print("EMAIL ERR:"+str(e),flush=True)
 
+def send_referral_welcome(name,email,key,ref_code,product,monthly):
+    pname={"sonicboom":"SonicBoom","sentinel":"AILeash Sentinel","tokensaver":"Token Saver"}.get(product,"AILeash")
+    safe_first=esc(name.split()[0]) if name.strip() else ""
+    pricing_line="Your "+pname+" API key is ready. Everything is free for the first "+str(TRIAL_DAYS)+" days - full engine, unlimited decisions, no card. After the trial it is 50p per unique device per month via Stripe, metered on the real devices that used your key."
+    html=(
+        "<html><body style='font-family:Arial,sans-serif;background:#f5f7fa;padding:20px'>"
+        "<div style='max-width:600px;margin:0 auto;background:#fff;border-radius:8px;overflow:hidden'>"
+        "<div style='background:#0a0f1e;padding:32px;border-bottom:4px solid #c9a84c'>"
+        "<div style='font-size:22px;color:#fff;font-weight:900;font-family:Georgia,serif'>Monop <span style='color:#c9a84c'>Content</span></div>"
+        "</div><div style='padding:36px'>"
+        "<p style='font-size:20px;font-weight:700;color:#0a0f1e;margin-bottom:16px'>Welcome"+(", "+safe_first if safe_first else "")+".</p>"
+        "<p style='font-size:14px;color:#64748b;line-height:1.7'>"+pricing_line+"</p>"
+        "<div style='background:#0a0f1e;border-radius:6px;padding:20px;margin:20px 0'>"
+        "<div style='font-family:monospace;font-size:10px;color:#c9a84c;letter-spacing:2px;text-transform:uppercase;margin-bottom:8px'>Your API Key</div>"
+        "<div style='font-family:monospace;font-size:12px;color:#00ff88;word-break:break-all'>"+esc(key)+"</div>"
+        "</div>"
+        +"<div style='background:#f8f5ee;border:2px solid #c9a84c;border-radius:6px;padding:20px;margin:20px 0'>"
+        "<div style='font-family:monospace;font-size:10px;color:#c9a84c;letter-spacing:2px;text-transform:uppercase;margin-bottom:8px'>Your Referral Code</div>"
+        "<div style='font-family:monospace;font-size:20px;color:#0a0f1e;font-weight:900'>"+esc(ref_code)+"</div>"
+        "<p style='font-size:13px;color:#64748b;margin-top:8px;line-height:1.6'>Share this code. Every device signed up earns you <strong>10p per month forever</strong>.</p>"
+        "</div>"
+        +"<p style='font-size:13px;color:#64748b'>Your step-by-step installation guide is arriving in a separate email.</p>"
+        "<p style='font-size:13px;color:#64748b'>Questions? <a href='mailto:"+OWNER_EMAIL+"' style='color:#c9a84c'>"+OWNER_EMAIL+"</a> &middot; "+OWNER_PHONE+"</p>"
+        "</div></div></body></html>"
+    )
+    send_email(email,name,"Your "+pname+" API Key + Referral Code",html)
 
-def _verify_token(ctx, token, origin):
-    """Returns the owning api_key, or None."""
-    s = _secret()
-    if not s or not token or not token.startswith("cap_"):
-        return None
-    parts = token.split("_")
-    if len(parts) != 4:
-        return None
+def _guide_shell(title,inner):
+    return ("<html><body style='font-family:Arial,sans-serif;background:#f5f7fa;padding:20px'>"
+        "<div style='max-width:640px;margin:0 auto;background:#fff;border-radius:8px;overflow:hidden'>"
+        "<div style='background:#0a0f1e;padding:28px;border-bottom:4px solid #c9a84c'>"
+        "<div style='font-size:20px;color:#fff;font-weight:900;font-family:Georgia,serif'>"+esc(title)+"</div>"
+        "<div style='font-family:monospace;font-size:9px;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,0.4);margin-top:6px'>Installation guide &middot; Monop Content</div>"
+        "</div><div style='padding:32px'>"+inner+
+        "<hr style='border:none;border-top:1px solid #eee;margin:26px 0'>"
+        "<p style='font-size:12px;color:#94a3b8;line-height:1.7'>Free for "+str(TRIAL_DAYS)+" days from signup. After that, 50p per unique device per month via Stripe - metered on the real devices that used your key, never a number you typed. When the trial ends you will be directed to a secure Stripe payment page; pay to continue exactly where you left off, or remove the integration - your choice, no lock-in.</p>"
+        "<p style='font-size:12px;color:#94a3b8'>Help: <a href='mailto:"+OWNER_EMAIL+"' style='color:#c9a84c'>"+OWNER_EMAIL+"</a> &middot; "+OWNER_PHONE+" &middot; <a href='"+HOST+"/developers' style='color:#c9a84c'>"+HOST+"/developers</a></p>"
+        "</div></div></body></html>")
+
+def _code_block(code):
+    return "<pre style='background:#0a0f1e;color:#7fe3b0;font-family:monospace;font-size:11px;padding:16px;border-radius:6px;overflow-x:auto;line-height:1.6'>"+esc(code)+"</pre>"
+
+def _h(t):
+    return "<p style='font-size:15px;font-weight:700;color:#0a0f1e;margin:22px 0 8px'>"+esc(t)+"</p>"
+
+def _p(t):
+    return "<p style='font-size:13px;color:#64748b;line-height:1.7;margin-bottom:8px'>"+t+"</p>"
+
+def install_guide(product,key):
+    k=esc(key)
+    govern_curl=("curl -X POST "+HOST+"/api/govern \\\n"
+        "  -H \"Authorization: Bearer "+key+"\" \\\n"
+        "  -H \"Content-Type: application/json\" \\\n"
+        "  -d '{\n"
+        "    \"user_id\": \"user_123\",\n"
+        "    \"action\": \"payment\",\n"
+        "    \"amount\": 49.99,\n"
+        "    \"country\": \"UK\",\n"
+        "    \"device_id\": \"device_abc\",\n"
+        "    \"anomaly\": 0.1,\n"
+        "    \"device_risk\": 0.2\n"
+        "  }'")
+    govern_py=("import requests\n\n"
+        "r = requests.post(\""+HOST+"/api/govern\",\n"
+        "    headers={\"Authorization\": \"Bearer "+key+"\"},\n"
+        "    json={\"user_id\": \"user_123\", \"action\": \"payment\",\n"
+        "          \"amount\": 49.99, \"country\": \"UK\",\n"
+        "          \"device_id\": \"device_abc\", \"anomaly\": 0.1, \"device_risk\": 0.2})\n"
+        "d = r.json()\n"
+        "print(d[\"decision\"], d[\"score\"], d[\"audit_hash\"])")
+    govern_js=("const r = await fetch(\""+HOST+"/api/govern\", {\n"
+        "  method: \"POST\",\n"
+        "  headers: {\"Authorization\": \"Bearer "+key+"\",\n"
+        "            \"Content-Type\": \"application/json\"},\n"
+        "  body: JSON.stringify({user_id: \"user_123\", action: \"payment\",\n"
+        "    amount: 49.99, country: \"UK\", device_id: \"device_abc\",\n"
+        "    anomaly: 0.1, device_risk: 0.2})\n"
+        "});\n"
+        "const d = await r.json();\n"
+        "console.log(d.decision, d.score, d.audit_hash);")
+    eligible=_p("<b>Eligible systems:</b> anything that can send an HTTPS POST with JSON. That covers every modern backend - Python (Django, Flask, FastAPI), Node.js, PHP (Laravel, WordPress plugins), Java/Spring, .NET, Ruby on Rails, Go - plus no-code tools like Zapier and Make, and mobile apps calling through your own server. No SDK to install, no library dependency, nothing added to your stack.")
+    if product=="sonicboom":
+        inner=(
+            _p("SonicBoom adds a sealed compliance record to every AI call you already make, without slowing anything down. It sits <b>alongside</b> your existing provider - AWS, Azure, Google Cloud, OpenAI, Anthropic - it never replaces it.")
+            +_h("How it fits your current system")
+            +_p("You already call your AI provider. Add one call to SonicBoom either just before (to gate the action) or just after (to seal the record). Median decision time is 28ms, so your users never notice it.")
+            +_h("Step 1 - test your key (60 seconds)")
+            +_code_block(govern_curl)
+            +_h("Step 2 - wrap your existing AI call")
+            +_p("Python example - two lines around what you already run:")
+            +_code_block("verdict = requests.post(\""+HOST+"/api/govern\", headers=H, json=event).json()\nif verdict[\"decision\"] != \"BLOCK\":\n    result = openai_client.chat.completions.create(...)  # your existing call, unchanged")
+            +_h("Step 3 - keep the receipt")
+            +_p("Every response includes <b>audit_hash</b>, <b>block_index</b> and <b>receipt_seq</b>. Store them with your own logs - they are your regulator-ready proof. Anyone can verify them at "+HOST+"/api/verify-chain.")
+            +eligible
+            +_h("What the decision means")
+            +_p("<b>ALLOW</b> - proceed. <b>CHALLENGE</b> - the response includes a hosted verification URL to show the user. <b>BLOCK</b> - stop the action; you get an email alert with the sealed evidence.")
+        )
+        return "SonicBoom installation guide - one line of code",_guide_shell("SonicBoom",inner)
+    if product=="sentinel":
+        inner=(
+            _p("Sentinel watches every event on your platform and emails you the moment something looks like fraud - a burst of actions, a strange-country login, a risky device - with the sealed evidence attached.")
+            +_h("How it fits your current system")
+            +_p("Send Sentinel an event whenever money or accounts move: checkout, login, transfer, signup, message. One POST per event. Sentinel scores it in under 30ms and seals it. BLOCK verdicts trigger a real-time email alert (max one per hour so a burst attack can't flood your inbox).")
+            +_h("Step 1 - test your key (60 seconds)")
+            +_code_block(govern_curl)
+            +_h("Step 2 - wire it into your event points")
+            +_code_block(govern_py)
+            +_h("Step 3 - act on the verdict")
+            +_p("<b>ALLOW</b> - let it through. <b>CHALLENGE</b> - show the user the hosted verification link in the response. <b>BLOCK</b> - hold the action; the alert email is already on its way to you with the audit hash.")
+            +_h("Live monitoring")
+            +_p("Watch your last hour in real time: GET "+HOST+"/api/pulse with your key as the Bearer token. Device count and billing: GET "+HOST+"/api/usage.")
+            +eligible
+        )
+        return "Sentinel installation guide - fraud alerts in 3 steps",_guide_shell("Sentinel",inner)
+    if product=="guardian":
+        inner=(
+            _p("Guardian gives platforms with young users a safety layer that flags known grooming and manipulation patterns, gives every child one-tap access to CEOP, Childline and 999, and seals every safety event into a tamper-evident chain - the exact evidence Ofcom asks for under the Online Safety Act.")
+            +_h("How it fits your current system")
+            +_p("You build Guardian into <b>your own app</b> - your design, our engine underneath. Three endpoints do the work; message content is never stored, only a fingerprint.")
+            +_h("Step 1 - pair a family")
+            +_code_block("curl -X POST "+HOST+"/api/guardian/pair \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"parent_email\": \"parent@example.com\", \"child_name\": \"Sam\"}'")
+            +_p("The response includes a <b>pair_code</b> and a ready-made child URL to open on the child's phone.")
+            +_h("Step 2 - check a message")
+            +_code_block("curl -X POST "+HOST+"/api/guardian/flag \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"code\": \"SAM-A1B2\", \"message\": \"<text the child wants checked>\"}'")
+            +_p("Returns <b>FLAGGED</b> (with categories - the parent is emailed automatically) or <b>UNRECOGNISED</b>. Guardian never falsely tells a child a message is \"safe\".")
+            +_h("Step 3 - check-ins and the Help button")
+            +_code_block("POST "+HOST+"/api/guardian/checkin   {\"code\": \"SAM-A1B2\", \"lat\": 55.1, \"lon\": -1.5}\nPOST "+HOST+"/api/guardian/panic     {\"code\": \"SAM-A1B2\", \"lat\": 55.1, \"lon\": -1.5}")
+            +_p("Panic seals the event and emails the parent instantly with a map link. The parent's full sealed timeline: GET "+HOST+"/api/guardian/report?email=parent@example.com&code=SAM-A1B2")
+            +eligible
+            +_p("<b>Families never pay.</b> Platforms pay 50p per device after the "+str(TRIAL_DAYS)+"-day trial.")
+        )
+        return "Guardian installation guide - child safety, sealed",_guide_shell("Guardian",inner)
+    inner=(
+        _p("AILeash scores every decision your AI makes - <b>ALLOW, CHALLENGE or BLOCK</b> in under 30ms - and seals each one into a SHA-256 chain nobody can quietly edit. When a regulator asks what your AI decided and why, you answer in one API call.")
+        +_h("How it fits your current system")
+        +_p("Wherever your AI acts on a user - approving a loan, pricing a policy, blocking a payment, banning an account - send AILeash the event first and act on the verdict. One POST per decision, nothing else in your stack changes.")
+        +_h("Step 1 - test your key (60 seconds)")
+        +_code_block(govern_curl)
+        +_h("Step 2 - integrate (pick your language)")
+        +_p("Python:")+_code_block(govern_py)
+        +_p("JavaScript / Node:")+_code_block(govern_js)
+        +_h("Step 3 - store the receipts")
+        +_p("Every response includes <b>audit_hash</b>, <b>block_index</b> and a gapless <b>receipt_seq</b>. Store them with your own records - together they are your proof under EU AI Act Articles 9, 12, 13 and 14. Verify any time: "+HOST+"/api/verify-chain &middot; reconcile completeness: "+HOST+"/api/coverage.")
+        +_h("The required fields")
+        +_p("<b>user_id</b> (who), <b>action</b> (what), <b>amount</b> (0 if none), <b>country</b> (2-letter), <b>device_id</b> (device fingerprint - this is also the billing meter), <b>anomaly</b> and <b>device_risk</b> (0 to 1 - send 0 if you don't score these yet).")
+        +eligible
+        +_h("What the decision means")
+        +_p("<b>ALLOW</b> - proceed. <b>CHALLENGE</b> - the response carries a hosted verification URL; show it to the user and poll the status URL. <b>BLOCK</b> - stop the action; a real-time alert email with sealed evidence is on its way to you.")
+    )
+    return "AILeash installation guide - live in 3 steps",_guide_shell("AILeash",inner)
+
+def send_install_guide(name,email,key,product):
     try:
-        exp = int(parts[1])
-    except ValueError:
+        subject,html=install_guide(product,key)
+        send_email(email,name,subject,html)
+    except Exception as e:print("GUIDE ERR:"+str(e),flush=True)
+
+def contact_email(name,email,phone,org,message):
+    html=(
+        "<html><body style='font-family:Arial,sans-serif;padding:20px;color:#333'>"
+        "<h2>New Contact: "+esc(name)+"</h2>"
+        "<p><b>Email:</b> "+esc(email)+"</p><p><b>Phone:</b> "+esc(phone)+"</p>"
+        "<p><b>Org:</b> "+esc(org)+"</p><p><b>Message:</b><br>"+esc(message)+"</p>"
+        "</body></html>"
+    )
+    send_email(OWNER_EMAIL,OWNER_NAME,"Contact: "+name,html)
+
+def stripe_call(method,endpoint,data=None):
+    if not STRIPE_SECRET:return None
+    try:
+        req=urllib.request.Request("https://api.stripe.com/v1"+endpoint,
+            data=urllib.parse.urlencode(data).encode() if data else None,
+            headers={"Authorization":"Bearer "+STRIPE_SECRET,"Content-Type":"application/x-www-form-urlencoded"},method=method)
+        with urllib.request.urlopen(req,timeout=10) as r:return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        try:return json.loads(e.read())
+        except:return None
+    except Exception as e:print("Stripe:"+str(e),flush=True);return None
+
+def verify_stripe_signature(payload,sig_header):
+    """Verify Stripe webhook signature. Fix for unauthenticated webhook.
+    Stripe-Signature header format: t=timestamp,v1=hexsig[,v1=...]"""
+    if not STRIPE_WEBHOOK_SECRET:return False
+    if not sig_header:return False
+    try:
+        t=None;sigs=[]
+        for part in sig_header.split(","):
+            k,_,v=part.strip().partition("=")
+            if k=="t":t=v
+            elif k=="v1":sigs.append(v)
+        if not t or not sigs:return False
+        if abs(time.time()-int(t))>300:return False
+        signed=t.encode()+b"."+payload
+        expected=hmac.new(STRIPE_WEBHOOK_SECRET.encode(),signed,hashlib.sha256).hexdigest()
+        return any(hmac.compare_digest(expected,s) for s in sigs)
+    except Exception:
+        return False
+
+def make_price(name,desc):
+    p=stripe_call("POST","/products",{"name":name,"description":desc})
+    if not p or "id" not in p:return None
+    pr=stripe_call("POST","/prices",{"product":p["id"],"currency":"gbp","unit_amount":50,"recurring[interval]":"month"})
+    return pr["id"] if pr and "id" in pr else None
+
+def setup_stripe():
+    global STRIPE_PRICE_AL,STRIPE_PRICE_GU,STRIPE_PRICE_SB,STRIPE_PRICE_SE,STRIPE_PRICE_TS
+    if not STRIPE_SECRET:print("No STRIPE_SECRET",flush=True);return
+    products=[
+        ("price_al","AILeash","AI governance. 50p per device per month."),
+        ("price_sb","SonicBoom","Speed plugin. 50p per device per month."),
+        ("price_se","AILeash Sentinel","Fraud detection. 50p per device per month."),
+        ("price_ts","Token Saver","Cuts your AI token bill. 50p per device per month."),
+    ]
+    for k,name,desc in products:
+        with _db_lock:
+            r=_conn.execute("SELECT v FROM config WHERE k=?",(k,)).fetchone()
+        if r and r[0]:
+            if k=="price_al":STRIPE_PRICE_AL=r[0]
+            elif k=="price_gu":STRIPE_PRICE_GU=r[0]
+            elif k=="price_sb":STRIPE_PRICE_SB=r[0]
+            elif k=="price_se":STRIPE_PRICE_SE=r[0]
+            elif k=="price_ts":STRIPE_PRICE_TS=r[0]
+        else:
+            pid=make_price(name,desc)
+            if pid:
+                with _db_lock:_conn.execute("INSERT OR REPLACE INTO config(k,v) VALUES(?,?)",(k,pid));_conn.commit()
+                if k=="price_al":STRIPE_PRICE_AL=pid
+                elif k=="price_gu":STRIPE_PRICE_GU=pid
+                elif k=="price_sb":STRIPE_PRICE_SB=pid
+                elif k=="price_se":STRIPE_PRICE_SE=pid
+                elif k=="price_ts":STRIPE_PRICE_TS=pid
+    print("Stripe AL:"+str(STRIPE_PRICE_AL)[:12]+" GU:"+str(STRIPE_PRICE_GU)[:12]+" SB:"+str(STRIPE_PRICE_SB)[:12]+" SE:"+str(STRIPE_PRICE_SE)[:12],flush=True)
+    if not STRIPE_WEBHOOK_SECRET:print("WARNING: STRIPE_WEBHOOK_SECRET not set - webhook will reject all events. Set it in Railway variables (Stripe dashboard > Webhooks > Signing secret).",flush=True)
+
+def get_stripe_price(product):
+    return{"aileash":STRIPE_PRICE_AL,"sonicboom":STRIPE_PRICE_SB,"sentinel":STRIPE_PRICE_SE,"tokensaver":STRIPE_PRICE_TS}.get(product,STRIPE_PRICE_AL)
+
+def trial_checkout(key,email,product):
+    """Payment gate at trial end. Builds a Stripe checkout session whose
+    quantity is the REAL unique device count seen on this key - a show of
+    good faith both ways: they had 90 days free, the bill reflects exactly
+    what they used. Cached one hour per key so expired-trial traffic
+    doesn't hammer Stripe."""
+    t=time.time()
+    with _trial_lock:
+        c=_trial_checkout_cache.get(key)
+        if c and t-c[0]<3600:return c[1]
+    n=device_count(key) or 1
+    url=HOST+"/#signup"
+    if STRIPE_SECRET:
+        pid=get_stripe_price(product)
+        if not pid:setup_stripe();pid=get_stripe_price(product)
+        if pid:
+            session=stripe_call("POST","/checkout/sessions",{
+                "mode":"subscription",
+                "customer_email":email,
+                "success_url":HOST+"/?success=true",
+                "cancel_url":HOST+"/?cancel=true",
+                "line_items[0][price]":pid,
+                "line_items[0][quantity]":str(n)})
+            if session and "url" in session:url=session["url"]
+    with _trial_lock:_trial_checkout_cache[key]=(t,url)
+    return url
+
+def trial_state(created,is_paid):
+    """Returns (in_trial, days_left). Paid accounts are never gated."""
+    if is_paid:return True,None
+    age=time.time()-(created or 0)
+    left=TRIAL_DAYS-int(age//86400)
+    return age<=TRIAL_DAYS*86400,max(0,left)
+
+def create_key(email,phone="",name="",org="",org_type="",product="aileash",devices=1):
+    email=str(email).strip().lower()
+    if not email or "@" not in email:return None,"invalid_email"
+    prefix={"sonicboom":"sb_live_","sentinel":"se_live_","tokensaver":"ts_live_"}.get(product,"al_live_")
+    key=prefix+secrets.token_hex(24)
+    with _db_lock:
+        r=_conn.execute("SELECT 1 FROM api_keys WHERE email=? AND product=?",(email,product)).fetchone()
+        if r:return None,"email_exists"
+        try:
+            _conn.execute("INSERT INTO api_keys(key,email,phone,name,org,org_type,product,devices,stripe_customer,stripe_sub,actions_used,created,active,is_paid,free_quota,plan_type) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (key,email,phone,name,org,org_type,product,devices,"","",0,time.time(),1,0,FREE_QUOTA,"trial"))
+            _conn.commit()
+        except sqlite3.IntegrityError:return None,"email_exists"
+    return key,None
+
+def get_key(key):
+    with _db_lock:
+        return _conn.execute("SELECT email,actions_used,active,is_paid,free_quota,plan_type,product,created FROM api_keys WHERE key=?",(key,)).fetchone()
+
+def inc_usage(key):
+    with _db_lock:_conn.execute("UPDATE api_keys SET actions_used=actions_used+1 WHERE key=?",(key,));_conn.commit()
+
+def gen_ref_code(name):
+    words=name.upper().split()
+    first=words[0] if words else "USER"
+    prefix=("".join(c for c in first if c.isalpha())[:4]).ljust(4,"X")
+    suffix="".join(random.choices(string.digits,k=4))
+    return "REF-"+prefix+"-"+suffix
+
+def create_referral(key,email,name):
+    code=gen_ref_code(name)
+    with _db_lock:
+        try:
+            _conn.execute("INSERT OR IGNORE INTO referrals(code,referrer_key,referrer_email,referrer_name,created) VALUES(?,?,?,?,?)",(code,key,email,name,time.time()))
+            _conn.commit()
+        except:pass
+    return code
+
+def get_referral(code):
+    with _db_lock:
+        try:return _conn.execute("SELECT referrer_key,referrer_email,referrer_name,devices_referred,earnings_pence FROM referrals WHERE code=?",(code,)).fetchone()
+        except:return None
+
+def credit_referral(code,devices=1):
+    with _db_lock:
+        try:
+            _conn.execute("UPDATE referrals SET devices_referred=devices_referred+?,earnings_pence=earnings_pence+? WHERE code=?",(devices,devices*10,code))
+            _conn.commit()
+        except:pass
+
+W60=defaultdict(deque);W5M=defaultdict(deque);W1H=defaultdict(deque)
+def now():return time.time()
+
+GUARDIAN_PATTERNS=[
+    (re.compile(r"\b(don'?t|do not)\s+tell\s+(your\s+)?(mum|mom|dad|parents|anyone)\b",re.I),"secrecy"),
+    (re.compile(r"\b(keep\s+(this|it)\s+(a\s+)?secret|between\s+us|our\s+little\s+secret)\b",re.I),"secrecy"),
+    (re.compile(r"\b(send|share|post)\s+(me\s+)?(a\s+)?(pic|pics|picture|photo|photos|image|nude|nudes)\b",re.I),"image_request"),
+    (re.compile(r"\b(meet\s+(up|me)|come\s+over|where\s+do\s+you\s+live|what'?s\s+your\s+address)\b",re.I),"meeting"),
+    (re.compile(r"\b(you'?re\s+so\s+mature|mature\s+for\s+your\s+age|our\s+age\s+gap\s+doesn'?t\s+matter)\b",re.I),"grooming_flattery"),
+    (re.compile(r"\b(sex|sexy|horny|naked|touch\s+yourself)\b",re.I),"sexual"),
+    (re.compile(r"\b(delete\s+(this|our)\s+(chat|messages|conversation)|clear\s+your\s+history)\b",re.I),"evidence_hiding"),
+]
+def guardian_check(text):
+    """Returns FLAGGED (with categories) or UNRECOGNISED. Never 'safe'."""
+    cats=sorted({c for pat,c in GUARDIAN_PATTERNS if pat.search(text or "")})
+    if cats:
+        return {"result":"FLAGGED","categories":cats,
+                "advice":"This message matches patterns used to groom or manipulate. Do not reply. Show a trusted adult now. CEOP, Childline and 999 are one tap away."}
+    return {"result":"UNRECOGNISED",
+            "advice":"Guardian cannot judge this message. That does not mean it is safe. If anything feels wrong, trust that feeling and show an adult you trust."}
+def gen_pair_code(name):
+    base=re.sub(r"[^a-z0-9]","",(name or "child").lower())[:6] or "child"
+    return base.upper()+"-"+secrets.token_hex(2).upper()
+def guardian_seal(pair_code,kind,lat,lon,note,content_fp):
+    """Seal a guardian event into the MAIN audit chain, then store the row."""
+    ts=now()
+    ev={"user_id":"guardian:"+pair_code,"action":"guardian_"+kind}
+    res={"decision":"GUARDIAN","kind":kind,"version":VERSION,"timestamp":ts}
+    h,idx,seq=seal(ev,res,ts,None)
+    with _db_lock:
+        _conn.execute("INSERT INTO guardian_events(pair_code,ts,kind,lat,lon,note,content_fp,audit_hash) VALUES(?,?,?,?,?,?,?,?)",
+            (pair_code,ts,kind,lat,lon,note,content_fp,h))
+        if kind=="checkin":
+            _conn.execute("UPDATE guardian_family SET last_checkin=? WHERE pair_code=?",(ts,pair_code))
+        _conn.commit()
+    return h
+def clamp(x,a=0.0,b=1.0):return max(a,min(b,x))
+def sha(p):return hashlib.sha256(json.dumps(p,sort_keys=True).encode()).hexdigest()
+
+def upd_vel(uid):
+    t=now()
+    for q in [W60[uid],W5M[uid],W1H[uid]]:q.append(t)
+    c=now()
+    W60[uid]=deque(x for x in W60[uid] if x>=c-60)
+    W5M[uid]=deque(x for x in W5M[uid] if x>=c-300)
+    W1H[uid]=deque(x for x in W1H[uid] if x>=c-3600)
+
+def vel(uid):return{"60s":len(W60[uid]),"5m":len(W5M[uid]),"1h":len(W1H[uid])}
+
+def load_user(uid):
+    with _db_lock:r=_conn.execute("SELECT trust,last_country FROM users WHERE user_id=?",(uid,)).fetchone()
+    return{"trust":r[0],"last_country":r[1]} if r else{"trust":0.5,"last_country":None}
+
+def save_user(uid,trust,country):
+    with _db_lock:
+        _conn.execute("INSERT INTO users(user_id,trust,last_country) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET trust=excluded.trust,last_country=excluded.last_country",(uid,trust,country))
+        _conn.commit()
+
+def pack_key(api_key,name,version):
+    return hashlib.sha256((str(api_key)+"|"+str(name)+"|v"+str(version)).encode()).hexdigest()[:24]
+
+def create_signal_pack(api_key,name,signals):
+    """Create a named, versioned signal pack for a customer and SEAL its
+    definition into the chain. signals = {"bias":{"weight":0.15}, ...}.
+    Returns (pack, error). The seal is the provenance: a tamper-evident
+    record of exactly which signals+weights this pack defined and when."""
+    name=str(name).strip()[:60]
+    if not name:return None,"name_required"
+    if not isinstance(signals,dict) or not signals:return None,"signals_required"
+    # clean + clamp the signal definitions
+    clean={}
+    for sname,cfg in list(signals.items())[:30]:
+        w=0.10
+        if isinstance(cfg,dict):
+            try:w=clamp(float(cfg.get("weight",0.10)),0.0,0.30)
+            except (ValueError,TypeError):w=0.10
+        else:
+            try:w=clamp(float(cfg),0.0,0.30)
+            except (ValueError,TypeError):w=0.10
+        clean[str(sname)[:40]]={"weight":round(w,4)}
+    if not clean:return None,"no_valid_signals"
+    with _db_lock:
+        r=_conn.execute("SELECT MAX(version) FROM signal_packs WHERE api_key=? AND name=?",(api_key,name)).fetchone()
+        version=(r[0] or 0)+1
+    pid=pack_key(api_key,name,version)
+    ts=time.time()
+    # seal the pack definition into the chain
+    ev={"user_id":"signal_pack:"+str(api_key)[:16],"action":"signal_pack_defined","amount":0,"country":"UK","device_id":"pack_"+pid,"anomaly":0,"device_risk":0,"pack_name":name,"pack_version":version,"signals":clean}
+    res={"decision":"PACK_SEALED","score":0,"version":VERSION,"timestamp":ts,"pack":name,"pack_version":version,"note":"signal pack definition sealed - provenance of which signals and weights this pack declared"}
+    seal_hash,idx,_=seal(ev,res,ts)
+    with _db_lock:
+        _conn.execute("INSERT INTO signal_packs(pack_id,api_key,name,version,signals_json,created,seal,block_index) VALUES(?,?,?,?,?,?,?,?)",
+            (pid,api_key,name,version,json.dumps(clean),ts,seal_hash,idx))
+        _conn.commit()
+    return {"pack_id":pid,"name":name,"version":version,"signals":clean,"seal":seal_hash,"block_index":idx,"created":ts},None
+
+def get_signal_pack(api_key,name,version=None):
+    with _db_lock:
+        if version:
+            r=_conn.execute("SELECT pack_id,name,version,signals_json,seal,block_index,created FROM signal_packs WHERE api_key=? AND name=? AND version=?",(api_key,name,version)).fetchone()
+        else:
+            r=_conn.execute("SELECT pack_id,name,version,signals_json,seal,block_index,created FROM signal_packs WHERE api_key=? AND name=? ORDER BY version DESC LIMIT 1",(api_key,name)).fetchone()
+    if not r:return None
+    try:sig=json.loads(r[3])
+    except:sig={}
+    return {"pack_id":r[0],"name":r[1],"version":r[2],"signals":sig,"seal":r[4],"block_index":r[5],"created":r[6]}
+
+def list_signal_packs(api_key):
+    with _db_lock:
+        rows=_conn.execute("SELECT name,MAX(version),MAX(created) FROM signal_packs WHERE api_key=? GROUP BY name ORDER BY MAX(created) DESC",(api_key,)).fetchall()
+    return [{"name":r[0],"latest_version":r[1],"updated":r[2]} for r in rows]
+
+def publish_signal_pack(api_key,name,author):
+    """Client opts to publish their latest version of a pack to the public
+    library. Publishing is sealed too - a record of who shared what, when."""
+    pk=get_signal_pack(api_key,name)
+    if not pk:return None,"pack_not_found"
+    author=str(author or "anonymous")[:60]
+    ts=time.time()
+    ev={"user_id":"signal_pack:"+str(api_key)[:16],"action":"signal_pack_published","amount":0,"country":"UK","device_id":"pack_"+pk["pack_id"],"anomaly":0,"device_risk":0,"pack_name":name,"pack_version":pk["version"]}
+    res={"decision":"PACK_PUBLISHED","score":0,"version":VERSION,"timestamp":ts,"pack":name,"note":"pack published to public library - community template, unverified"}
+    seal_hash,idx,_=seal(ev,res,ts)
+    with _db_lock:
+        _conn.execute("UPDATE signal_packs SET public=1,author=? WHERE pack_id=?",(author,pk["pack_id"]))
+        _conn.commit()
+    return {"name":name,"version":pk["version"],"author":author,"published_seal":seal_hash},None
+
+def unpublish_signal_pack(api_key,name):
+    with _db_lock:
+        _conn.execute("UPDATE signal_packs SET public=0 WHERE api_key=? AND name=?",(api_key,name))
+        _conn.commit()
+    return True
+
+def public_library():
+    """Browse all published packs. Community-contributed, unverified."""
+    with _db_lock:
+        rows=_conn.execute("SELECT name,MAX(version),author,signals_json,seal,MAX(created) FROM signal_packs WHERE public=1 GROUP BY name,author ORDER BY MAX(created) DESC LIMIT 200").fetchall()
+    out=[]
+    for r in rows:
+        try:sig=json.loads(r[3])
+        except:sig={}
+        out.append({"name":r[0],"version":r[1],"author":r[2] or "anonymous","signals":sig,"seal":r[4]})
+    return out
+
+def score_custom_signals(event):
+    """Article 9 extension: score customer-defined, domain-specific risk signals
+    on top of the 9 fraud signals. Fully optional and additive - if the caller
+    sends no risk_signals, this returns (0.0, []) and behaviour is unchanged.
+    Each signal value is clamped 0..1, each weight clamped 0..0.30. Every signal
+    that materially fires is named in the reasons, and the raw pack is sealed
+    into the chain by govern() so the evaluation is provable per decision."""
+    rs=event.get("risk_signals")
+    if not isinstance(rs,dict) or not rs:return 0.0,[],None
+    weights=event.get("signal_weights") if isinstance(event.get("signal_weights"),dict) else {}
+    total=0.0;reasons=[];applied={}
+    for name,val in list(rs.items())[:20]:
+        try:v=clamp(float(val))
+        except (ValueError,TypeError):continue
+        try:w=clamp(float(weights.get(name,0.10)),0.0,0.30)
+        except (ValueError,TypeError):w=0.10
+        contrib=v*w
+        total+=contrib
+        applied[str(name)[:40]]={"value":round(v,4),"weight":round(w,4)}
+        if v>=0.5:reasons.append(str(name)[:40]+":"+str(round(v,2)))
+    return round(total,4),reasons,(applied or None)
+
+def score_event(s):
+    reasons=[]
+    sc=(1-s["trust"])*0.30
+    v60=s["v60"];sc+=min(v60/20,1)*0.15
+    if v60>10:reasons.append("velocity_spike")
+    sc+=min(s["v5m"]/50,1)*0.10+min(s["v1h"]/200,1)*0.10
+    amt=float(s.get("amount",0));sc+=min(math.log1p(amt)/math.log1p(10000),1)*0.15
+    if amt>500:reasons.append("high_amount")
+    dr=float(s.get("device_risk",0));sc+=dr*0.10
+    if dr>0.5:reasons.append("risky_device")
+    an=float(s.get("anomaly",0));sc+=an*0.10
+    if an>0.5:reasons.append("behaviour_anomaly")
+    if s.get("country_shift"):sc+=0.10;reasons.append("country_shift")
+    if s.get("unsafe_country"):sc+=0.10;reasons.append("unsafe_country")
+    if s["trust"]<0.4:reasons.append("low_trust")
+    return round(clamp(sc),4),reasons
+
+def decide(sc):
+    if sc<0.35:return"ALLOW"
+    if sc<0.70:return"CHALLENGE"
+    return"BLOCK"
+
+def upd_trust(t,d):
+    if d=="ALLOW":t+=(1-t)*0.01
+    elif d=="CHALLENGE":t-=t*0.02
+    elif d=="BLOCK":t-=t*0.08
+    return clamp(t,0.05,1.0)
+
+def chain_tip():
+    with _db_lock:r=_conn.execute("SELECT audit_hash FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()
+    return r[0] if r else"GENESIS"
+
+def seal(event,result,ts,api_key=None):
+    """Tip read + hash + insert inside ONE lock hold (race fix).
+    Completeness receipts: every sealed decision gets the chain position
+    (block_index) and a per-key monotonic sequence number (key_seq) issued
+    inside the same lock. Sequence numbers have no gaps by construction -
+    a caller holding receipts N and N+2 can PROVE N+1 is missing.
+    Both live alongside the block, never inside the hash payload, so all
+    existing chain blocks remain valid."""
+    with _db_lock:
+        r=_conn.execute("SELECT audit_hash FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()
+        prev=r[0] if r else "GENESIS"
+        h=sha({"prev_hash":prev,"ts":ts,"event":event,"result":result})
+        seq=None
+        if api_key:
+            _conn.execute("UPDATE api_keys SET seq=COALESCE(seq,0)+1 WHERE key=?",(api_key,))
+            sr=_conn.execute("SELECT seq FROM api_keys WHERE key=?",(api_key,)).fetchone()
+            seq=sr[0] if sr else None
+        cur=_conn.execute("INSERT INTO audit_log(ts,user_id,event_json,result_json,prev_hash,audit_hash,api_key,key_seq) VALUES(?,?,?,?,?,?,?,?)",(ts,event["user_id"],json.dumps(event),json.dumps(result),prev,h,api_key or "",seq))
+        idx=cur.lastrowid
+        _conn.commit()
+    return h,idx,seq
+
+def verify_chain():
+    with _db_lock:rows=_conn.execute("SELECT event_json,result_json,prev_hash,audit_hash,ts FROM audit_log ORDER BY id ASC").fetchall()
+    if not rows:return{"valid":True,"blocks":0,"message":"Empty chain"}
+    prev="GENESIS"
+    for i,row in enumerate(rows):
+        p={"prev_hash":row[2],"ts":row[4],"event":json.loads(row[0]),"result":json.loads(row[1])}
+        if sha(p)!=row[3] or row[2]!=prev:return{"valid":False,"broken_at":i,"message":"Tampered at block "+str(i)}
+        prev=row[3]
+    return{"valid":True,"blocks":len(rows),"tip":rows[-1][3],"message":"Chain intact"}
+
+def last_decision():
+    """Read-only: fetch the most recent decision for badge display.
+    Fix: badges no longer write to the audit chain."""
+    with _db_lock:
+        r=_conn.execute("SELECT result_json FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()
+    if not r:return None
+    try:
+        res=json.loads(r[0])
+        return res.get("decision"),res.get("score")
+    except:return None
+
+_alert_last={}
+_alert_lock=threading.Lock()
+ALERT_COOLDOWN=3600
+
+CHALLENGE_TTL=900
+def _challenge_secret():
+    s=os.environ.get("LICENCE_SECRET","")
+    return s.encode() if s else _EPHEMERAL_SECRET
+_EPHEMERAL_SECRET=secrets.token_bytes(32)
+
+def make_challenge_token(user_id,audit_hash):
+    payload=json.dumps({"u":user_id,"h":audit_hash[:16],"t":int(time.time())},sort_keys=True,separators=(',',':'))
+    sig=hmac.new(_challenge_secret(),payload.encode(),hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(json.dumps({"p":payload,"s":sig},separators=(',',':')).encode()).decode()
+
+def read_challenge_token(token):
+    try:
+        d=json.loads(base64.urlsafe_b64decode(token.encode()))
+        payload=d["p"];sig=d["s"]
+        expected=hmac.new(_challenge_secret(),payload.encode(),hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected,sig):return None,"bad_signature"
+        p=json.loads(payload)
+        if time.time()-p["t"]>CHALLENGE_TTL:return None,"expired"
+        return p,None
+    except Exception:
+        return None,"malformed"
+
+def challenge_marker(payload_dict):
+    key=str(payload_dict["u"])+"|"+str(payload_dict["h"])+"|"+str(payload_dict["t"])
+    return "challenge_"+hashlib.sha256(key.encode()).hexdigest()[:24]
+
+def challenge_resolved(payload_dict):
+    uid=challenge_marker(payload_dict)
+    with _db_lock:
+        r=_conn.execute("SELECT audit_hash,ts FROM audit_log WHERE user_id=? ORDER BY id DESC LIMIT 1",(uid,)).fetchone()
+    return r
+
+CHALLENGE_PAGE=("<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+ "<meta name='viewport' content='width=device-width,initial-scale=1.0'><title>Verify - AILeash</title>"
+ "<style>body{font-family:sans-serif;background:#0a0f1e;color:#fff;display:flex;align-items:center;"
+ "justify-content:center;min-height:100vh;margin:0;padding:20px;text-align:center}"
+ ".box{max-width:420px;background:rgba(255,255,255,0.04);border:1px solid rgba(201,168,76,0.35);"
+ "border-radius:10px;padding:36px}h1{font-family:Georgia,serif;color:#c9a84c;font-size:24px;margin-bottom:10px}"
+ "p{color:rgba(255,255,255,0.5);font-size:14px;line-height:1.7;margin-bottom:22px}"
+ "button{background:#c9a84c;color:#0a0f1e;border:none;border-radius:5px;padding:14px 30px;"
+ "font-size:15px;font-weight:700;cursor:pointer}#out{margin-top:18px;font-family:monospace;font-size:12px}"
+ ".ok{color:#7fe3b0}.err{color:#ff8a80}</style></head><body><div class='box'>"
+ "<h1>Quick security check</h1><p>This action was flagged for verification. "
+ "Confirm it was you and you'll be on your way \u2014 the confirmation is sealed into a tamper-evident record.</p>"
+ "<button onclick='go()'>Yes, it was me</button><div id='out'></div>"
+ "<script>async function go(){var t=new URLSearchParams(location.search).get('token');"
+ "var o=document.getElementById('out');o.textContent='Sealing\u2026';"
+ "try{var r=await fetch('/api/challenge/resolve',{method:'POST',headers:{'Content-Type':'application/json'},"
+ "body:JSON.stringify({token:t})});var d=await r.json();"
+ "if(d.resolved){o.className='ok';o.textContent='Verified and sealed: '+d.sealed.slice(0,20)+'\u2026 You can close this page.';}"
+ "else{o.className='err';o.textContent=d.error||'Could not verify.';}}"
+ "catch(e){o.className='err';o.textContent='Network error - try again.';}}</script>"
+ "</div></body></html>")
+
+def send_block_alert(api_key,event,result):
+    """The moment the engine BLOCKS something on a customer's traffic,
+    tell them - with the sealed evidence attached. Max one email per hour
+    per key so a burst attack doesn't also flood their inbox."""
+    try:
+        now_t=time.time()
+        with _alert_lock:
+            if now_t-_alert_last.get(api_key,0)<ALERT_COOLDOWN:return
+            _alert_last[api_key]=now_t
+        ki=get_key(api_key)
+        if not ki:return
+        email=ki[0]
+        reasons=", ".join(result.get("reasons",[])) or "risk threshold exceeded"
+        html=("<html><body style='font-family:Arial,sans-serif;padding:20px;color:#333'>"
+            "<h2 style='color:#cc0000'>AILeash blocked an event on your platform</h2>"
+            "<p>Caught in real time. Nothing to do unless it looks wrong to you.</p>"
+            "<table style='font-family:monospace;font-size:13px'>"
+            "<tr><td style='padding:3px 12px 3px 0'><b>User</b></td><td>"+esc(str(event.get("user_id","")))+"</td></tr>"
+            "<tr><td style='padding:3px 12px 3px 0'><b>Action</b></td><td>"+esc(str(event.get("action","")))+"</td></tr>"
+            "<tr><td style='padding:3px 12px 3px 0'><b>Score</b></td><td>"+str(result.get("score"))+"</td></tr>"
+            "<tr><td style='padding:3px 12px 3px 0'><b>Reasons</b></td><td>"+esc(reasons)+"</td></tr>"
+            "<tr><td style='padding:3px 12px 3px 0'><b>Sealed</b></td><td>"+str(result.get("audit_hash",""))[:32]+"&hellip;</td></tr>"
+            "</table>"
+            "<p style='color:#888;font-size:12px'>This block is already sealed in your tamper-evident audit chain. "
+            "Live view: <a href='"+HOST+"/api/pulse'>"+HOST+"/api/pulse</a> with your API key. "
+            "Further block alerts are paused for 60 minutes.</p>"
+            "</body></html>")
+        send_email(email,"","AILeash: event BLOCKED - "+esc(str(event.get("action","")))[:40],html)
+    except Exception as e:print("ALERT ERR:"+str(e),flush=True)
+
+def record_device(api_key,device_id):
+    """Log each unique device_id that uses this key. Returns live unique device count.
+    This is the real meter: you are billed for every distinct device you send the key to."""
+    if not api_key or not device_id:return None
+    with _db_lock:
+        try:
+            _conn.execute("INSERT OR IGNORE INTO device_seen(api_key,device_id,first_seen) VALUES(?,?,?)",(api_key,device_id,time.time()))
+            _conn.commit()
+            n=_conn.execute("SELECT COUNT(*) FROM device_seen WHERE api_key=?",(api_key,)).fetchone()[0]
+        except Exception as e:
+            print("record_device err:"+str(e),flush=True);return None
+    return n
+
+def device_count(api_key):
+    with _db_lock:
+        try:return _conn.execute("SELECT COUNT(*) FROM device_seen WHERE api_key=?",(api_key,)).fetchone()[0]
+        except:return 0
+
+# ============================================================
+# JURISDICTION ENGINE - honest version: a sealed rules mapping.
+# Tags every decision with the regulatory frameworks that apply
+# to the event's country. It does not "decide" legal authority -
+# no software can - it records which obligations applied at the
+# moment of decision, sealed into the same chain.
+# ============================================================
+JURIS_VERSION="2026.07"
+_EU={"AT","BE","BG","HR","CY","CZ","DK","EE","FI","FR","DE","GR","HU","IE","IT","LV","LT","LU","MT","NL","PL","PT","RO","SK","SI","ES","SE"}
+def juris_for(country):
+    c=str(country or "").strip().upper()
+    fw=[]
+    if c in _EU:fw+=["EU_AI_Act_2024_1689","GDPR","EU_DSA_2022_2065"]
+    if c=="UK":fw+=["UK_Online_Safety_Act_2023","UK_GDPR","ICO_Childrens_Code"]
+    if c=="US":fw+=["US_state_AI_laws_vary","FTC_Act_S5"]
+    if not fw:fw=["local_law_unmapped"]
+    return{"country":c,"frameworks":fw,"map_version":JURIS_VERSION,
+        "note":"applicable-framework tagging at decision time; not legal advice"}
+
+# ============================================================
+# DELEGATED AUTHORITY - signed role tokens (Art. 14 support).
+# Issue a token binding user_id + role + spend limit + expiry,
+# HMAC-signed server-side. Send it with a govern event as
+# "authority_token"; the engine verifies it deterministically
+# and escalates the decision if authority is missing/exceeded.
+# ============================================================
+def make_authority_token(user_id,role,max_amount,ttl_seconds):
+    exp=int(time.time())+int(ttl_seconds)
+    payload=str(user_id)+"|"+str(role)+"|"+str(float(max_amount))+"|"+str(exp)
+    sig=hmac.new(_challenge_secret(),("AUTH|"+payload).encode(),hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode((payload+"|"+sig).encode()).decode()
+
+def read_authority_token(token):
+    try:
+        raw=base64.urlsafe_b64decode(token.encode()).decode()
+        parts=raw.split("|")
+        if len(parts)!=5:return None
+        user_id,role,max_amount,exp,sig=parts
+        expected=hmac.new(_challenge_secret(),("AUTH|"+user_id+"|"+role+"|"+max_amount+"|"+exp).encode(),hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig,expected):return None
+        return{"user_id":user_id,"role":role,"max_amount":float(max_amount),"exp":int(exp)}
+    except Exception:
         return None
-    if exp < time.time():
-        return None
-    ohash, sig = parts[2], parts[3]
-    if origin:
-        o = str(origin).strip().lower()[:120]
-        if hashlib.sha256(o.encode()).hexdigest()[:8] != ohash:
-            return None
-    else:
-        o = None
-    with ctx["lock"]:
-        keys = ctx["conn"].execute("SELECT key FROM api_keys WHERE active=1").fetchall()
-    for (k,) in keys:
-        if o is None:
-            continue
-        body = k + "|" + o + "|" + str(exp)
-        if hmac.compare_digest(hmac.new(s, body.encode(), hashlib.sha256).hexdigest()[:32], sig):
-            return k
+
+def check_authority(event):
+    """Returns (status, detail) - deterministic. Absent token = 'none'."""
+    tok=event.get("authority_token","")
+    if not tok:return"none",None
+    a=read_authority_token(str(tok))
+    if not a:return"invalid",None
+    if a["user_id"]!=str(event.get("user_id","")):return"wrong_user",a
+    if time.time()>a["exp"]:return"expired",a
+    if float(event.get("amount",0))>a["max_amount"]:return"exceeds_limit",a
+    return"verified",a
+
+def govern(event,api_key=None):
+    missing=REQ-event.keys()
+    if missing:raise ValueError("Missing fields: "+str(missing))
+    if api_key:
+        ok,ec=check_rate(api_key)
+        if not ok:return{"error":ec},429
+        ki=get_key(api_key)
+        if not ki:return{"error":"invalid_api_key"},401
+        email,used,active,is_paid,quota,plan,product,created=ki
+        if not active:return{"error":"account_inactive"},403
+        in_trial,days_left=trial_state(created,is_paid)
+        if not in_trial:
+            return{"error":"trial_expired",
+                "message":"Your "+str(TRIAL_DAYS)+"-day free trial has ended. Your keys, chain and devices are untouched - pay to continue exactly where you left off, or remove the integration. The bill reflects only the real devices that used your key.",
+                "billable_devices":device_count(api_key),
+                "rate_per_device_gbp":0.50,
+                "checkout_url":trial_checkout(api_key,email,product)},402
+    ts=now();uid=event["user_id"]
+    state=load_user(uid);upd_vel(uid);v=vel(uid)
+    country=event["country"]
+    signals={
+        "trust":state["trust"],"v60":v["60s"],"v5m":v["5m"],"v1h":v["1h"],
+        "amount":float(event.get("amount",0)),"device_risk":float(event.get("device_risk",0)),
+        "anomaly":float(event.get("anomaly",0)),
+        "country_shift":state["last_country"] is not None and state["last_country"]!=country,
+        "unsafe_country":country not in SAFE
+    }
+    # Signal pack resolution: if the caller names a pack, load its sealed
+    # weight definitions and apply them to the raw signal values sent.
+    pack_meta=None
+    pname=event.get("pack")
+    if pname and api_key:
+        pk=get_signal_pack(api_key,str(pname))
+        if pk:
+            merged=dict(event.get("signal_weights") or {})
+            for sname,cfg in pk["signals"].items():
+                merged.setdefault(sname,cfg.get("weight",0.10))
+            event=dict(event);event["signal_weights"]=merged
+            pack_meta={"name":pk["name"],"version":pk["version"],"pack_seal":pk["seal"]}
+    sc,reasons=score_event(signals)
+    custom_sc,custom_reasons,custom_applied=score_custom_signals(event)
+    if custom_sc>0:
+        sc=round(clamp(sc+custom_sc),4)
+        reasons=reasons+custom_reasons
+    dec=decide(sc)
+    auth_status,auth_info=check_authority(event)
+    if auth_status in("invalid","wrong_user","expired","exceeds_limit"):
+        reasons.append("authority_"+auth_status)
+        if dec=="ALLOW":dec="CHALLENGE"
+    trust=upd_trust(state["trust"],dec)
+    save_user(uid,trust,country)
+    result={"decision":dec,"score":sc,"trust":round(trust,4),"reasons":reasons,"version":VERSION,"timestamp":ts,
+        "jurisdiction":juris_for(country)}
+    if custom_applied:
+        result["risk_signals"]=custom_applied
+        result["fraud_score"]=round(sc-custom_sc,4)
+        result["custom_risk_score"]=custom_sc
+    if pack_meta:
+        result["signal_pack"]=pack_meta
+    if auth_status!="none":
+        result["authority"]={"status":auth_status}
+        if auth_info:result["authority"]["role"]=auth_info["role"]
+    h,idx,seq=seal(event,result,ts,api_key)
+    result["audit_hash"]=h
+    result["block_index"]=idx
+    if seq is not None:result["receipt_seq"]=seq
+    if dec=="CHALLENGE":
+        ctok=make_challenge_token(uid,h)
+        result["challenge_url"]=HOST+"/verify-challenge?token="+ctok
+        result["challenge_status_url"]=HOST+"/api/challenge/status?token="+ctok
+        result["challenge_expires_in"]=CHALLENGE_TTL
+    if api_key:
+        inc_usage(api_key)
+        dcount=record_device(api_key,str(event.get("device_id","")))
+        if dcount is not None:
+            result["billable_devices"]=dcount
+            result["monthly_charge_gbp"]=round(dcount*0.50,2)
+        if not is_paid and days_left is not None:
+            result["trial_days_left"]=days_left
+        if dec=="BLOCK":
+            threading.Thread(target=send_block_alert,args=(api_key,event,result),daemon=True).start()
+    return result,200
+
+REG_MAP_VERSION="2026.07"
+REG_MAP={
+  "version":REG_MAP_VERSION,
+  "note":"Design mapping of engine capabilities to regulatory obligations. Design intent, not certification.",
+  "eu_ai_act_2024_1689":{
+    "art_9_risk_management":"continuous per-event scoring, 9 signals, deterministic",
+    "art_12_record_keeping":"per-decision SHA-256 chain, gapless receipts, public verification",
+    "art_13_transparency":"plain-language reasons on every decision",
+    "art_14_human_oversight":"CHALLENGE verdict + hosted human verification pathway",
+    "timeline":"general application Aug 2026; high-risk (Annex III) proposed deferral to Dec 2027, pending formal adoption"},
+  "uk_online_safety_act_2023":{"status":"in force","support":"real-time moderation evidence trail, sealed"},
+  "ico_childrens_code":{"status":"in force","support":"deterministic scoring; no profiling of children; full audit trail"},
+  "eu_dsa_2022_2065":{"support":"algorithmic decision evidence for systemic risk assessment"}}
+
+def seal_regmap_if_changed():
+    """Every change to the regulation map is itself sealed into the chain -
+    regulatory updates become auditable events, not silent edits."""
+    try:
+        with _db_lock:
+            r=_conn.execute("SELECT v FROM config WHERE k='regmap_version'").fetchone()
+        if r and r[0]==REG_MAP_VERSION:return
+        ev={"user_id":"system_regmap","action":"regulation_map_updated","amount":0,"country":"UK","device_id":"server","anomaly":0,"device_risk":0}
+        res={"decision":"ALLOW","score":0,"map_version":REG_MAP_VERSION,"map_hash":sha(REG_MAP),"version":VERSION,"note":"regulation map change sealed"}
+        seal(ev,res,time.time())
+        with _db_lock:
+            _conn.execute("INSERT OR REPLACE INTO config(k,v) VALUES('regmap_version',?)",(REG_MAP_VERSION,))
+            _conn.commit()
+        print("REGMAP sealed:"+REG_MAP_VERSION,flush=True)
+    except Exception as e:print("REGMAP ERR:"+str(e),flush=True)
+
+ENGINE_SPEC={
+  "engine":"AILeash deterministic scoring","version":VERSION,
+  "signals":{
+    "trust":{"weight":0.30,"formula":"(1 - trust)"},
+    "velocity_60s":{"weight":0.15,"formula":"min(count/20, 1)"},
+    "velocity_5m":{"weight":0.10,"formula":"min(count/50, 1)"},
+    "velocity_1h":{"weight":0.10,"formula":"min(count/200, 1)"},
+    "amount":{"weight":0.15,"formula":"min(ln(1+amount)/ln(1+10000), 1)"},
+    "device_risk":{"weight":0.10,"formula":"raw 0..1"},
+    "anomaly":{"weight":0.10,"formula":"raw 0..1"},
+    "country_shift":{"weight":0.10,"formula":"1 if prior country differs"},
+    "unsafe_country":{"weight":0.10,"formula":"1 if outside allow-list"}},
+  "score":"clamp(sum, 0, 1); weights sum to 1.20 pre-clamp (deliberate saturation headroom)",
+  "thresholds":{"ALLOW":"score < 0.35","CHALLENGE":"0.35 <= score < 0.70","BLOCK":"score >= 0.70"},
+  "trust_dynamics":{"ALLOW":"t += (1-t)*0.01","CHALLENGE":"t -= t*0.02","BLOCK":"t -= t*0.08","clamp":"[0.05, 1.0]"},
+  "chain":{"hash":"SHA-256(canonical_json{prev_hash, ts, event, result})","genesis":"GENESIS",
+    "concurrency":"tip read + hash + insert in one lock hold","receipts":"gapless per-key sequence, same transaction"},
+  "principle":"deterministic and fully specified: identical inputs give identical outputs, forever; any competent engineer can maintain or reimplement this engine from this spec"}
+
+def send_json(h,data,status=200):
+    body=json.dumps(data,indent=2).encode()
+    h.send_response(status)
+    h.send_header("Content-Type","application/json")
+    h.send_header("Content-Length",str(len(body)))
+    h.send_header("Access-Control-Allow-Origin","*")
+    h.send_header("X-Content-Type-Options","nosniff")
+    h.end_headers()
+    h.wfile.write(body)
+
+def send_html(h,html,status=200):
+    body=html.encode("utf-8")
+    h.send_response(status)
+    h.send_header("Content-Type","text/html; charset=utf-8")
+    h.send_header("Content-Length",str(len(body)))
+    h.send_header("X-Frame-Options","SAMEORIGIN")
+    h.end_headers()
+    h.wfile.write(body)
+
+def send_text(h,text,content_type="text/plain",status=200):
+    body=text.encode("utf-8")
+    h.send_response(status)
+    h.send_header("Content-Type",content_type)
+    h.send_header("Content-Length",str(len(body)))
+    h.end_headers()
+    h.wfile.write(body)
+
+def read_body(h):
+    n=int(h.headers.get("Content-Length",0))
+    if n:
+        try:return json.loads(h.rfile.read(n))
+        except:return{}
+    return{}
+
+def get_bearer(h):
+    auth=h.headers.get("Authorization","")
+    if auth.startswith("Bearer "):return auth[7:]
+    return h.headers.get("X-API-Key","").strip()
+
+VISITS_START=2026
+def bump_visits():
+    with _db_lock:
+        r=_conn.execute("SELECT v FROM config WHERE k='visits'").fetchone()
+        n=(int(r[0]) if r and r[0] else VISITS_START)+1
+        _conn.execute("INSERT OR REPLACE INTO config(k,v) VALUES('visits',?)",(str(n),))
+        _conn.commit()
+    return n
+
+def get_visits():
+    with _db_lock:
+        r=_conn.execute("SELECT v FROM config WHERE k='visits'").fetchone()
+    return int(r[0]) if r and r[0] else VISITS_START
+
+def load_file(name):
+    try:
+        with open(name,"r",encoding="utf-8") as f:return f.read()
+    except:return None
+
+def check_admin(h):
+    """Fix: tokens now expire after 24h and are checked under a lock."""
+    tok=get_bearer(h)
+    if not tok:return False
+    t=time.time()
+    with _admin_lock:
+        exp=_admin_tokens.get(tok)
+        if exp is None:return False
+        if exp<t:
+            del _admin_tokens[tok]
+            return False
+        return True
+
+def admin_login_allowed():
+    """Fix: rate limit admin login attempts - max 10 per minute globally."""
+    t=time.time()
+    with _admin_lock:
+        while _admin_fails and _admin_fails[0]<t-60:_admin_fails.popleft()
+        return len(_admin_fails)<10
+
+def admin_login_failed():
+    with _admin_lock:_admin_fails.append(time.time())
+
+def page_404():
+    return (
+        "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>Not Found</title>"
+        "<style>body{font-family:sans-serif;background:#0a0f1e;color:#fff;display:flex;"
+        "align-items:center;justify-content:center;min-height:100vh;margin:0;text-align:center}"
+        "h1{color:#c9a84c;font-size:48px;margin-bottom:8px}"
+        "p{color:rgba(255,255,255,0.4);font-size:14px}"
+        "a{color:#c9a84c;text-decoration:none}</style></head>"
+        "<body><div><h1>404</h1><p>Page not found.</p>"
+        "<p style='margin-top:16px'><a href='/'>Back to AILeash &rarr;</a></p>"
+        "</div></body></html>"
+    )
+
+def badge_id_for_key(key):
+    return hashlib.sha256(("shield:"+key).encode()).hexdigest()[:16]
+
+def lookup_badge(badge_id):
+    """Find the org for a public badge id. Returns (org, active_and_ok) or None."""
+    if not badge_id or len(badge_id)!=16:return None
+    with _db_lock:
+        rows=_conn.execute("SELECT key,org,active,is_paid,actions_used,free_quota,created FROM api_keys").fetchall()
+    for k,org,active,is_paid,used,quota,created in rows:
+        if badge_id_for_key(k)==badge_id:
+            in_trial,_=trial_state(created,is_paid)
+            ok=bool(active) and (bool(is_paid) or in_trial)
+            return (org or "Verified platform",ok)
     return None
 
-
-def _resolve(ctx, api_key, data):
-    """A real key wins; otherwise try a capture token bound to an origin."""
-    if api_key:
-        return api_key, "api_key"
-    tok = str(data.get("capture_token", "")).strip()
-    origin = str(data.get("origin", "")).strip()
-    owner = _verify_token(ctx, tok, origin)
-    if owner:
-        return owner, "capture_token"
-    return None, None
-
-
-# ------------------------------------------------------------------ devices
-
-def _touch_device(ctx, api_key, device_fp, ts):
-    m = _month(ts)
-    with ctx["lock"]:
-        row = ctx["conn"].execute("SELECT events FROM capture_devices WHERE api_key=? AND device_fp=? AND month=?", (api_key, device_fp, m)).fetchone()
-        if row:
-            ctx["conn"].execute("UPDATE capture_devices SET last_seen=?,events=events+1 WHERE api_key=? AND device_fp=? AND month=?", (ts, api_key, device_fp, m))
-            new = False
-        else:
-            ctx["conn"].execute("INSERT INTO capture_devices(api_key,device_fp,month,first_seen,last_seen,events) VALUES(?,?,?,?,?,1)", (api_key, device_fp, m, ts, ts))
-            new = True
-        ctx["conn"].commit()
-    return new
-
-
-def _devices(ctx, api_key, data):
-    m = str(data.get("month", "")).strip() or _month()
-    with ctx["lock"]:
-        rows = ctx["conn"].execute("SELECT COUNT(*),SUM(events) FROM capture_devices WHERE api_key=? AND month=?", (api_key, m)).fetchone()
-        months = ctx["conn"].execute("SELECT month,COUNT(*) FROM capture_devices WHERE api_key=? GROUP BY month ORDER BY month DESC LIMIT 12", (api_key,)).fetchall()
-    n = rows[0] or 0
-    return {"month": m, "billable_devices": n, "captures": rows[1] or 0,
-            "rate_per_device": 0.50, "currency": "GBP",
-            "estimated_charge": round(n * 0.50, 2),
-            "history": [{"month": a, "devices": b} for a, b in months],
-            "note": "A device counts once per calendar month however many captures it makes. Distinct devices is the billing unit - this is the same figure the invoice uses, so you can reconcile it yourself rather than being told a number."}, 200
-
-
-# -------------------------------------------------------------------- cases
-
-def _open(ctx, api_key, data):
-    if not _secret():
-        return {"error": "capture_secret_not_set"}, 503
-    operator = str(data.get("operator_id", "")).strip()
-    if not operator:
-        return {"error": "operator_id_required",
-                "message": "A capture with no named reviewer is not oversight."}, 400
-    device = str(data.get("device_id", "")).strip()
-    if not device:
-        return {"error": "device_id_required",
-                "message": "Devices are the billing unit and the record needs to say which one acted."}, 400
-
-    ih = str(data.get("input_hash", "")).strip().lower()
-    oh = str(data.get("output_hash", "")).strip().lower()
-    for name, v in (("input_hash", ih), ("output_hash", oh)):
-        if v and not HEX64.match(v):
-            return {"error": "invalid_" + name,
-                    "message": "Hash the content locally and send 64 hex characters. Never send the content itself."}, 400
-
-    mv = str(data.get("machine_verdict", "")).strip().lower()
-    if mv and mv not in VERDICTS:
-        return {"error": "invalid_machine_verdict", "allowed": sorted(VERDICTS)}, 400
-
-    ts = time.time()
-    ofp, dfp = _fp(operator), _fp(device)
-    cid = "CAP-" + secrets.token_hex(5).upper()
-    new_device = _touch_device(ctx, api_key, dfp, ts)
-
-    detail = ("operator=" + (ofp or "")[:32] + ";device=" + (dfp or "")[:32] +
-              ";input=" + (ih or "none") + ";output=" + (oh or "none") +
-              ";machine_verdict_sealed=" + (mv or "none"))
-    ev = {"user_id": "cap:" + cid, "action": "capture_opened", "amount": 0,
-          "country": "UK", "device_id": "capture", "anomaly": 0, "device_risk": 0}
-    res = {"decision": "CAPTURE_SEALED", "score": 0, "capture_action": "opened",
-           "capture_version": VERSION, "timestamp": ts, "detail": detail,
-           "note": "no personal data and no content in this block - fingerprints and hashes only"}
-    h, idx, seq = ctx["seal"](ev, res, ts, api_key)
-
-    with ctx["lock"]:
-        ctx["conn"].execute("INSERT INTO capture_cases(case_id,api_key,operator_fp,device_fp,input_hash,output_hash,machine_verdict,opened,sealed,human_verdict,dwell,agreed,note) VALUES(?,?,?,?,?,?,?,?,NULL,NULL,NULL,NULL,NULL)",
-                            (cid, api_key, ofp, dfp, ih or None, oh or None, mv or None, ts))
-        ctx["conn"].commit()
-
-    return {"case_id": cid, "opened": _iso(ts),
-            "audit_hash": h, "block_index": idx, "receipt_seq": seq,
-            "machine_verdict": "withheld until seal",
-            "new_device_this_month": new_device,
-            "next": "POST the reviewer's verdict to /x/capture/seal with this case_id",
-            "note": "The clock started here, on the server. The dwell time is not something the browser gets to report."}, 200
-
-
-def _seal(ctx, api_key, data):
-    cid = str(data.get("case_id", "")).strip().upper()
-    with ctx["lock"]:
-        row = ctx["conn"].execute("SELECT operator_fp,device_fp,machine_verdict,opened,sealed FROM capture_cases WHERE case_id=? AND api_key=?", (cid, api_key)).fetchone()
-    if not row:
-        return {"error": "unknown_case_id"}, 404
-    if row[4]:
-        return {"error": "already_sealed",
-                "message": "A capture commits once."}, 400
-
-    hv = str(data.get("verdict", "")).strip().lower()
-    if hv not in VERDICTS:
-        return {"error": "invalid_verdict", "allowed": sorted(VERDICTS)}, 400
-    reasoning = str(data.get("reasoning", "")).strip()
-
-    ts = time.time()
-    dwell = round(ts - row[3], 3)
-    if dwell > MAX_OPEN_AGE:
-        return {"error": "case_expired",
-                "opened": _iso(row[3]),
-                "message": "This case was opened more than six hours ago. Open a fresh one rather than sealing a stale clock."}, 400
-    agreed = None if not row[2] else (1 if hv == row[2] else 0)
-
-    detail = ("verdict=" + hv + ";dwell_seconds=" + str(dwell) +
-              ";server_measured=true;reasoning=" + reasoning[:600])
-    ev = {"user_id": "cap:" + cid, "action": "capture_sealed", "amount": 0,
-          "country": "UK", "device_id": "capture", "anomaly": 0, "device_risk": 0}
-    res = {"decision": "CAPTURE_SEALED", "score": 0, "capture_action": "sealed",
-           "capture_version": VERSION, "timestamp": ts, "detail": detail}
-    h, idx, seq = ctx["seal"](ev, res, ts, api_key)
-
-    with ctx["lock"]:
-        ctx["conn"].execute("UPDATE capture_cases SET sealed=?,human_verdict=?,dwell=?,agreed=? WHERE case_id=? AND api_key=?",
-                            (ts, hv, dwell, agreed, cid, api_key))
-        ctx["conn"].commit()
-
-    out = {"case_id": cid, "verdict": hv, "dwell_seconds": dwell,
-           "machine_verdict": row[2], "sealed": _iso(ts),
-           "audit_hash": h, "block_index": idx, "receipt_seq": seq,
-           "measured_by": "server",
-           "note": "Your verdict was sealed before this response revealed ours. The chain fixes that order."}
-    if agreed is not None:
-        out["agreed"] = bool(agreed)
-    if dwell < 2:
-        out["flag"] = "sealed " + str(dwell) + "s after the case opened - recorded permanently"
-    return out, 200
-
-
-def _case(ctx, api_key, cid):
-    with ctx["lock"]:
-        row = ctx["conn"].execute("SELECT operator_fp,device_fp,input_hash,output_hash,machine_verdict,opened,sealed,human_verdict,dwell,agreed FROM capture_cases WHERE case_id=? AND api_key=?", (cid.upper(), api_key)).fetchone()
-        if not row:
-            return {"error": "unknown_case_id"}, 404
-        blocks = ctx["conn"].execute("SELECT ts,result_json,audit_hash FROM audit_log WHERE user_id=? ORDER BY id ASC", ("cap:" + cid.upper(),)).fetchall()
-    events = []
-    for bts, res, ah in blocks:
-        try:
-            r = json.loads(res)
-            events.append({"at": _iso(bts), "event": r.get("capture_action"),
-                           "detail": r.get("detail"), "sealed": ah})
-        except Exception:
-            pass
-    return {"case_id": cid.upper(),
-            "operator_fingerprint": (row[0] or "")[:16] + "...",
-            "device_fingerprint": (row[1] or "")[:16] + "...",
-            "input_hash": row[2], "output_hash": row[3],
-            "machine_verdict": row[4], "opened": _iso(row[5]),
-            "sealed": _iso(row[6]), "human_verdict": row[7],
-            "dwell_seconds": row[8],
-            "agreed": (None if row[9] is None else bool(row[9])),
-            "events": events,
-            "ordering_proof": "The opened block precedes the sealed block in the chain, and both timestamps are the server's."}, 200
-
-
-def _summary(ctx, api_key):
-    with ctx["lock"]:
-        rows = ctx["conn"].execute("SELECT dwell,agreed FROM capture_cases WHERE api_key=? AND sealed IS NOT NULL", (api_key,)).fetchall()
-        openc = ctx["conn"].execute("SELECT COUNT(*) FROM capture_cases WHERE api_key=? AND sealed IS NULL", (api_key,)).fetchone()[0]
-    if not rows:
-        return {"captures": 0, "open_cases": openc,
-                "note": "No sealed captures yet."}, 200
-    dwells = sorted(r[0] for r in rows if r[0] is not None)
-    scored = [r[1] for r in rows if r[1] is not None]
-    n = len(dwells)
-    under2 = len([d for d in dwells if d < 2])
-    out = {"captures": len(rows), "open_cases": openc,
-           "median_dwell_seconds": (dwells[n // 2] if n else None),
-           "fastest_seconds": (dwells[0] if dwells else None),
-           "under_2_seconds": under2,
-           "under_2_seconds_pct": (round(100 * under2 / n, 1) if n else None)}
-    if scored:
-        agree = sum(scored)
-        out["agreement_rate_pct"] = round(100 * agree / len(scored), 1)
-        out["diverged"] = len(scored) - agree
-        if len(scored) >= 20 and agree == len(scored):
-            out["pattern"] = "never diverged from the machine across " + str(len(scored)) + " captures"
-    return out, 200
-
-
-def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-    if method == "POST":
-        if action == "token":
-            if not api_key:
-                return {"error": "api_key_required",
-                        "message": "Mint capture tokens from your server using your real key."}, 401
-            return _mint(ctx, api_key, data)
-        owner, how = _resolve(ctx, api_key, data)
-        if not owner:
-            return {"error": "invalid_credentials",
-                    "message": "Send a real API key server-side, or a valid capture_token with the origin it was bound to."}, 401
-        if action == "open":
-            return _open(ctx, owner, data)
-        if action == "seal":
-            return _seal(ctx, owner, data)
+def shield_svg(org,ok):
+    org=esc(str(org))[:28]
+    if ok:
+        fill1="#0a0f1e";edge="#c9a84c";band="#c9a84c";txt="#c9a84c";status="SEALED BY AILEASH";st_fill="#0a0f1e";tick="#7fe3b0"
     else:
-        if not api_key:
-            return {"error": "api_key_required",
-                    "message": "Reading capture records needs the real key, not a capture token."}, 401
-        if action == "devices":
-            return _devices(ctx, api_key, data)
-        if action == "summary":
-            return _summary(ctx, api_key)
-        if action == "case":
-            cid = str(data.get("id", "")).strip()
-            if not cid:
-                return {"error": "id_required"}, 400
-            return _case(ctx, api_key, cid)
-    return {"error": "unknown_action", "action": action}, 404
+        fill1="#3a3f4d";edge="#8a8f9c";band="#8a8f9c";txt="#c3c7d1";status="UNVERIFIED";st_fill="#2c303b";tick="#c8362b"
+    return ("<svg xmlns='http://www.w3.org/2000/svg' width='190' height='226' viewBox='0 0 190 226'>"
+        "<defs><filter id='sh' x='-20%' y='-20%' width='140%' height='140%'><feDropShadow dx='0' dy='3' stdDeviation='4' flood-color='#0a0f1e' flood-opacity='0.35'/></filter></defs>"
+        "<path d='M95 6 L172 32 L172 112 Q172 172 95 218 Q18 172 18 112 L18 32 Z' fill='"+fill1+"' stroke='"+edge+"' stroke-width='4' filter='url(#sh)'/>"
+        "<path d='M95 20 L158 41 L158 110 Q158 162 95 202 Q32 162 32 110 L32 41 Z' fill='none' stroke='"+edge+"' stroke-width='1.2' stroke-dasharray='5 4' opacity='0.6'/>"
+        "<g transform='translate(79,44)'><circle cx='16' cy='16' r='13.5' fill='none' stroke='"+edge+"' stroke-width='2.6' stroke-dasharray='66 20' stroke-linecap='round' transform='rotate(-50 16 16)'/><circle cx='26.5' cy='7' r='3.1' fill='"+edge+"'/><circle cx='16' cy='16' r='3.4' fill='"+fill1+"'/></g>"
+        "<text x='95' y='102' text-anchor='middle' font-family='Georgia,serif' font-weight='900' font-size='19' fill='#ffffff'>AI<tspan fill='"+txt+"'>Leash</tspan></text>"
+        "<text x='95' y='119' text-anchor='middle' font-family='monospace' font-size='7.5' letter-spacing='2' fill='"+txt+"'>AI GOVERNANCE</text>"
+        "<rect x='30' y='130' width='130' height='22' rx='3' fill='"+band+"'/>"
+        "<text x='95' y='145' text-anchor='middle' font-family='monospace' font-weight='700' font-size='9' letter-spacing='1' fill='"+st_fill+"'>"+status+"</text>"
+        "<text x='95' y='168' text-anchor='middle' font-family='Verdana,sans-serif' font-size='9.5' font-weight='700' fill='#ffffff'>"+org+"</text>"
+        "<text x='95' y='183' text-anchor='middle' font-family='monospace' font-size='7' letter-spacing='1' fill='"+txt+"'>"+("SHA-256 AUDIT CHAIN \u2713" if ok else "NO VALID ACCOUNT")+"</text>"
+        "<circle cx='95' cy='196' r='4' fill='"+tick+"'/>"
+        "</svg>")
 
-```
+def badge_svg(label,value,colour):
+    lw=len(label)*7+16
+    vw=len(value)*7+16
+    total=lw+vw
+    body=(
+        "<svg xmlns='http://www.w3.org/2000/svg' width='"+str(total)+"' height='20'>"
+        "<linearGradient id='s' x2='0' y2='100%'><stop offset='0' stop-color='#bbb' stop-opacity='.1'/><stop offset='1' stop-opacity='.1'/></linearGradient>"
+        "<rect rx='3' width='"+str(total)+"' height='20' fill='#555'/>"
+        "<rect rx='3' x='"+str(lw)+"' width='"+str(vw)+"' height='20' fill='"+colour+"'/>"
+        "<rect rx='3' width='"+str(total)+"' height='20' fill='url(#s)'/>"
+        "<g fill='#fff' text-anchor='middle' font-family='DejaVu Sans,Verdana,Geneva,sans-serif' font-size='11'>"
+        "<text x='"+str(lw//2)+"' y='15' fill='#010101' fill-opacity='.3'>"+label+"</text>"
+        "<text x='"+str(lw//2)+"' y='14'>"+label+"</text>"
+        "<text x='"+str(lw+vw//2)+"' y='15' fill='#010101' fill-opacity='.3'>"+value+"</text>"
+        "<text x='"+str(lw+vw//2)+"' y='14'>"+value+"</text>"
+        "</g></svg>"
+    )
+    return body
 
+def send_svg(h,svg):
+    body=svg.encode("utf-8")
+    h.send_response(200)
+    h.send_header("Content-Type","image/svg+xml")
+    h.send_header("Content-Length",str(len(body)))
+    h.send_header("Cache-Control","no-cache, no-store, must-revalidate")
+    h.send_header("Access-Control-Allow-Origin","*")
+    h.end_headers()
+    h.wfile.write(body)
 
-## `modules/codebase.py`
+def referrals_page(code):
+    ref=get_referral(code) if code else None
+    if ref:
+        _,email,name,devices,earnings=ref
+        first=esc(name.split()[0]) if name and name.split() else "there"
+        return (
+            "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+            "<meta name='viewport' content='width=device-width,initial-scale=1.0'>"
+            "<title>Your Referrals</title>"
+            "<style>body{font-family:sans-serif;background:#0a0f1e;color:#fff;display:flex;"
+            "align-items:center;justify-content:center;min-height:100vh;margin:0;padding:20px}"
+            ".box{max-width:480px;width:100%;background:rgba(255,255,255,0.04);"
+            "border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:36px;text-align:center}"
+            "h1{font-family:Georgia,serif;font-size:28px;color:#c9a84c;margin-bottom:8px}"
+            ".stat{font-size:48px;font-weight:900;color:#00ff88;margin:20px 0 4px;font-family:Georgia,serif}"
+            ".lbl{font-size:11px;color:rgba(255,255,255,0.3);letter-spacing:2px;text-transform:uppercase;margin-bottom:20px}"
+            ".earn{font-size:36px;font-weight:900;color:#c9a84c;font-family:Georgia,serif}"
+            "p{font-size:14px;color:rgba(255,255,255,0.4);line-height:1.7;margin-top:12px}"
+            "a{color:#c9a84c;text-decoration:none}</style></head>"
+            "<body><div class='box'>"
+            "<h1>Your Referrals</h1><p>Welcome back, "+first+".</p>"
+            "<div class='stat'>"+str(devices)+"</div><div class='lbl'>Devices Referred</div>"
+            "<div class='earn'>&pound;"+"{:.2f}".format(earnings/100)+"</div>"
+            "<div class='lbl'>Earned This Month</div>"
+            "<p>10p per device per month. Keep sharing.<br><br>"
+            "Questions? <a href='mailto:"+OWNER_EMAIL+"'>"+OWNER_EMAIL+"</a></p>"
+            "</div></body></html>"
+        )
+    return (
+        "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1.0'>"
+        "<title>Referrals</title>"
+        "<style>body{font-family:sans-serif;background:#0a0f1e;color:#fff;display:flex;"
+        "align-items:center;justify-content:center;min-height:100vh;margin:0;text-align:center;padding:20px}"
+        "h1{font-size:28px;color:#c9a84c;margin-bottom:12px}"
+        "p{color:rgba(255,255,255,0.4);font-size:14px;line-height:1.7}"
+        "a{color:#c9a84c;text-decoration:none}</style></head><body>"
+        "<div><h1>Check Your Referral Earnings</h1>"
+        "<p>Sign up at <a href='https://sebbi.pro/#signup'>sebbi.pro</a> to get your referral code.<br>"
+        "Then return here: <a href='/referrals?code=YOUR-CODE'>sebbi.pro/referrals?code=YOUR-CODE</a><br><br>"
+        "Questions? <a href='mailto:"+OWNER_EMAIL+"'>"+OWNER_EMAIL+"</a></p>"
+        "</div></body></html>"
+    )
 
-489 lines, 21403 bytes
+class ThreadedServer(ThreadingMixIn,HTTPServer):
+    allow_reuse_address=True
+    daemon_threads=True
 
-```python
-#!/usr/bin/env python3
-"""
-modules/codebase.py  -  dated evidence of what you held, and when
-=================================================================
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self,fmt,*args):pass
 
-WHAT THIS IS, STATED HONESTLY FIRST
------------------------------------
-This does not prove ownership. Nothing cryptographic can. Ownership of
-software is a legal fact established by authorship, company records and
-signed assignment - not by a hash.
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin","*")
+        self.send_header("Access-Control-Allow-Methods","GET,POST,OPTIONS")
+        self.send_header("Access-Control-Allow-Headers","Content-Type,Authorization,X-API-Key")
+        self.end_headers()
 
-What it does produce is the evidence that decides most disputes about
-software in practice: a dated, tamper-evident, externally anchored record
-that a specific person held a specific body of code, in a specific form, at
-a specific moment. When two parties later disagree about who had what
-first, that is the question a court, a mediator or an investor actually
-asks - and it is normally answered with commit dates, which are settable
-fields that prove nothing.
+    def do_GET(self):
+        parsed=urlparse(self.path)
+        path=parsed.path
+        if path.endswith("/") and path!="/":path=path.rstrip("/")
+        qs=parse_qs(parsed.query)
+        track_request()
+        maybe_prune()
 
-This answers it with arithmetic instead.
+        if path=="/mM_hYELAWL0vrzIvAnKRBlUnN1kM-H656cmjMrFT-3U.html":
+            send_text(self,"google-site-verification: mM_hYELAWL0vrzIvAnKRBlUnN1kM-H656cmjMrFT-3U","text/html")
+            return
 
-WHAT IT DOES
-------------
-    POST /x/codebase/seal
-
-Walks the deployed source tree, hashes every file, builds one manifest root
-over all of them, and seals that root - together with a declaration of
-authorship you supply - into the chain. From there it is anchored
-externally and handed to peer chains like every other block.
-
-Run it again next week and you get a second dated point. Run it on every
-deploy and you accumulate a continuous, uneditable record of the codebase
-evolving under your hand, which is a far stronger thing than a single
-snapshot: a body of work with a history is much harder to dispute than a
-file that appeared once.
-
-WHAT THE MANIFEST CONTAINS - AND WHAT IT DOES NOT
--------------------------------------------------
-For each file: its path and the SHA-256 of its exact bytes. Nothing else.
-No contents leave the server, ever, by any route here. The hashes are
-one-way, so the manifest reveals nothing about what the code does; it only
-lets you demonstrate later that a file you hold now is byte-identical to
-the file you held then.
-
-The manifest route is deliberately KEYED rather than public. Only the root,
-the file count and the total byte size are public. A public file listing
-would hand an attacker a map of the deployment for no gain - the root is
-all a third party needs in order to check a manifest you show them.
-
-Excluded by default and never hashed: version control internals, caches,
-databases, and anything that looks like a secret. Sealing a hash of your
-own credentials file would be a poor way to protect them.
-
-HOW YOU USE IT IN A DISPUTE
----------------------------
-  1. You produce the sealed root, its block index, and the chain's
-     external anchor.
-  2. You produce your copy of the code.
-  3. Anyone recomputes the manifest from your copy - the rules are
-     published at /x/codebase/spec - and compares.
-
-If it matches, you demonstrably held exactly that code no later than the
-sealing time, and the record of it has not been altered since, because it
-is a block in an anchored chain that peers also hold.
-
-WHAT STILL HAS TO HAPPEN OUTSIDE THIS FILE
-------------------------------------------
-Stated plainly, because a module that let you believe it had settled your
-legal position would be doing you harm:
-
-  - Copyright arises on authorship. Sealing evidences it; it does not
-    create or register it.
-  - If a company operates the platform, the IP needs to sit with the right
-    entity in writing, or the position is muddier than it looks.
-  - Where two parties have collaborated, the only reliable answer is an
-    agreement saying who owns what, signed before it matters rather than
-    after.
-
-This module makes the factual record unarguable. The legal position is a
-separate job and needs a solicitor, not a hash.
-
-    POST /x/codebase/seal      hash the tree, seal the root      (keyed)
-    GET  /x/codebase/manifest  the full file list for a seal     (keyed)
-    GET  /x/codebase/history   every seal, with root changes     (public)
-    GET  /x/codebase/root      the latest sealed root            (public)
-    GET  /x/codebase/spec      how to recompute it yourself      (public)
-"""
-
-import hashlib
-import json
-import os
-import re
-import time
-from datetime import datetime, timezone
-
-VERSION = "1.0"
-HEX64 = re.compile(r"^[0-9a-f]{64}$")
-
-# Roots and history are public - a dated claim nobody can check is not
-# evidence. The file listing is keyed, because it is a map of the
-# deployment and a third party never needs it to verify a manifest.
-PUBLIC = {("GET", "history"), ("GET", "root"), ("GET", "spec")}
-
-FILE_PREFIX = b"AILEASH-FILE-v1:"
-MANIFEST_PREFIX = b"AILEASH-MANIFEST-v1:"
-
-MAX_FILES = 5000
-MAX_FILE_BYTES = 8 * 1024 * 1024
-
-# Never walked into.
-SKIP_DIRS = {".git", ".hg", ".svn", "__pycache__", "node_modules", ".venv",
-             "venv", ".mypy_cache", ".pytest_cache", ".idea", ".vscode",
-             "dist", "build", ".cache", "backups"}
-
-# Never hashed. Secrets and databases are excluded on purpose - a hash of
-# your credentials file is not evidence of anything you want to prove.
-SKIP_SUFFIXES = (".db", ".sqlite", ".sqlite3", ".db-journal", ".db-wal",
-                 ".db-shm", ".pyc", ".pyo", ".log", ".ots", ".pem", ".key",
-                 ".crt", ".p12", ".pfx")
-SKIP_NAMES = {".env", ".env.local", ".env.production", "secrets.json",
-              "credentials.json", ".netrc", "id_rsa", ".DS_Store"}
-
-_ready = False
-
-
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        c = ctx["conn"]
-        c.execute("CREATE TABLE IF NOT EXISTS codebase_seal("
-                  "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,"
-                  "manifest_root TEXT,file_count INTEGER,total_bytes INTEGER,"
-                  "declaration TEXT,manifest TEXT,sealed REAL,"
-                  "audit_hash TEXT,block_index INTEGER)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_cb_root ON codebase_seal(manifest_root)")
-        c.commit()
-    _ready = True
-
-
-def _iso(ts):
-    if not ts:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
-
-def _app_root():
-    """The directory the application is deployed from.
-
-    This module lives in modules/, so the parent of that directory is the
-    tree we want. Resolved rather than assumed, so it is correct whatever
-    the working directory happens to be when the server starts.
-    """
-    here = os.path.dirname(os.path.abspath(__file__))
-    parent = os.path.dirname(here)
-    return parent if parent else here
-
-
-def _skip(name):
-    if name in SKIP_NAMES:
-        return True
-    lower = name.lower()
-    return any(lower.endswith(suffix) for suffix in SKIP_SUFFIXES)
-
-
-def _file_hash(path):
-    """SHA-256 of the exact bytes, read in chunks so a large file cannot
-    exhaust memory."""
-    digest = hashlib.sha256()
-    digest.update(FILE_PREFIX)
-    size = 0
-    with open(path, "rb") as handle:
-        while True:
-            chunk = handle.read(65536)
-            if not chunk:
-                break
-            size += len(chunk)
-            if size > MAX_FILE_BYTES:
-                return None, size
-            digest.update(chunk)
-    return digest.hexdigest(), size
-
-
-def _walk(root):
-    """Every file under root, sorted by relative path.
-
-    Sorting matters: the manifest must be reproducible by anyone holding
-    the same files, and directory order is not stable across systems.
-    """
-    entries, skipped, total = [], [], 0
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS and not d.startswith("."))
-        for filename in sorted(filenames):
-            if _skip(filename):
-                skipped.append(os.path.relpath(os.path.join(dirpath, filename), root))
-                continue
-            full = os.path.join(dirpath, filename)
-            relative = os.path.relpath(full, root).replace(os.sep, "/")
+        if path=="/":
+            try:bump_visits()
+            except:pass
+            c=load_file("index.html")
+            if c:send_html(self,c)
+            else:send_html(self,page_404(),404)
+        elif path=="/reseller":
+            c=load_file("reseller.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
+        elif path=="/risk-policy":
+            c=load_file("risk-policy.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
+        elif path=="/data-protection":
+            c=load_file("data-protection.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
+        elif path=="/human-oversight":
+            c=load_file("human-oversight.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
+        elif path=="/scan":
+            c=load_file("scan.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
+        
+        elif path=="/contact":
+            c=load_file("contact.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
+        elif path=="/sonicboom":
+            c=load_file("sonicboom.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
+        elif path=="/seal":
+            c=load_file("seal.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
+        elif path in("/reseller","/partners"):
+            c=load_file("reseller.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
+        elif path=="/report-threat":
+            c=load_file("report-threat.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
+        elif path=="/child-safety-guide":
+            c=load_file("child-safety-guide.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
+        elif path=="/compliance-assistant":
+            c=load_file("compliance-assistant.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
+        elif path=="/investors":
+            c=load_file("investor-prospectus.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
+        elif path=="/sentinel":
+            c=load_file("sentinel.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
+        elif path=="/whitepaper":
+            c=load_file("whitepaper.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
+        elif path=="/developers":
+            c=load_file("developers.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
+        elif path in("/pack","/evidence-pack"):
+            c=load_file("pack.html")
+            send_html(self,c) if c else send_json(self,{"error":"page_file_missing","file":"pack.html","detail":"This route is wired. Upload pack.html to the project root and it goes live."},404)
+        elif path=="/savings":
+            c=load_file("savings.html")
+            send_html(self,c) if c else send_json(self,{"error":"page_file_missing","file":"savings.html","detail":"This route is wired. Upload savings.html to the project root and it goes live."},404)
+        elif path=="/witness":
+            c=load_file("witness.html")
+            send_html(self,c) if c else send_json(self,{"error":"page_file_missing","file":"witness.html","detail":"This route is wired. Upload witness.html to the project root and it goes live."},404)
+        elif path=="/self-check":
+            c=load_file("self-check.html")
+            send_html(self,c) if c else send_json(self,{"error":"page_file_missing","file":"self-check.html","detail":"This route is wired. Upload self-check.html to the project root and it goes live."},404)
+        elif path=="/console":
+            c=load_file("console.html")
+            send_html(self,c) if c else send_json(self,{"error":"page_file_missing","file":"console.html","detail":"This route is wired. Upload console.html to the project root and it goes live."},404)
+        elif path=="/verify-authority.py":
+            c=load_file("verify-authority.py")
+            if c:
+                b=c.encode()
+                self.send_response(200);self.send_header("Content-Type","text/x-python; charset=utf-8")
+                self.send_header("Content-Disposition","attachment; filename=\"verify-authority.py\"")
+                self.send_header("Content-Length",str(len(b)));self.end_headers();self.wfile.write(b)
+            else:send_json(self,{"error":"file_missing","file":"verify-authority.py","detail":"This route is wired. Upload verify-authority.py to the project root and it goes live."},404)
+        elif path in("/tokensaver","/token-saver"):
+            c=load_file("tokensaver.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
+        elif path=="/sebbi_tokensaver.py":
+            c=load_file("sebbi_tokensaver.py")
+            if c:
+                self.send_response(200);self.send_header("Content-Type","text/x-python")
+                self.send_header("Content-Disposition","attachment; filename=\"sebbi_tokensaver.py\"")
+                b=c.encode();self.send_header("Content-Length",str(len(b)));self.end_headers();self.wfile.write(b)
+            else:send_json(self,{"error":"not found"},404)
+        elif path=="/signal-packs":
+            c=load_file("signal-packs.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
+        elif path=="/ai-standard":
+            c=load_file("ai-standard.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
+        elif path=="/.well-known/ai.txt":
+            c=load_file("static/.well-known/ai.txt")
+            send_text(self,c,"text/plain") if c else send_json(self,{"error":"not found"},404)
+        elif path=="/.well-known/ai-manifest.json":
+            c=load_file("static/.well-known/ai-manifest.json")
+            send_text(self,c,"application/json") if c else send_json(self,{"error":"not found"},404)
+        elif path=="/.well-known/ai-safety.txt":
+            c=load_file("static/.well-known/ai-safety.txt")
+            send_text(self,c,"text/plain") if c else send_json(self,{"error":"not found"},404)
+        elif path=="/.well-known/security.txt":
+            c=load_file("static/.well-known/security.txt")
+            send_text(self,c,"text/plain") if c else send_json(self,{"error":"not found"},404)
+        elif path=="/.well-known/comply.txt":
+            c=load_file("static/.well-known/comply.txt")
+            send_text(self,c,"text/plain") if c else send_json(self,{"error":"not found"},404)
+        elif path=="/spec/ai-txt":
+            c=load_file("docs/spec/ai-txt.md")
+            send_text(self,c,"text/markdown") if c else send_json(self,{"error":"not found"},404)
+        elif path=="/api/verify-manifest":
+            dom=qs.get("domain",[""])[0].strip().lower().replace("https://","").replace("http://","").strip("/")
+            chain=verify_chain()
+            with _db_lock:
+                tip=_conn.execute("SELECT audit_hash FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()
+            if dom and dom!="sebbi.pro":
+                send_json(self,{"domain":dom,"manifest_found":False,"verdict":"NO_MANIFEST",
+                    "message":"No verifiable manifest registered for this domain. Publish one: "+HOST+"/spec/ai-txt",
+                    "checked_at":time.time()})
+            else:
+                send_json(self,{"domain":"sebbi.pro","manifest_found":True,
+                    "chain_valid":chain.get("valid"),"sealed_count":chain.get("blocks"),
+                    "chain_tip":(tip[0] if tip else "GENESIS"),
+                    "verdict":"VERIFIED" if chain.get("valid") else "CHAIN_BROKEN",
+                    "verified_by":"AILeash - sebbi.pro","checked_at":time.time()})
+        elif path=="/ai.txt":
+            c=load_file("ai.txt");send_text(self,c,"text/plain") if c else send_json(self,{"error":"not found"},404)
+        elif path=="/brain.py":
+            c=load_file("brain.py")
+            if c:
+                self.send_response(200);self.send_header("Content-Type","text/x-python")
+                self.send_header("Content-Disposition","attachment; filename=\"brain.py\"")
+                b=c.encode();self.send_header("Content-Length",str(len(b)));self.end_headers();self.wfile.write(b)
+            else:send_json(self,{"error":"not found"},404)
+        elif path=="/sebdog_engine.py":
+            c=load_file("sebdog_engine.py")
+            if c:
+                self.send_response(200);self.send_header("Content-Type","text/x-python")
+                self.send_header("Content-Disposition","attachment; filename=\"sebdog_engine.py\"")
+                b=c.encode();self.send_header("Content-Length",str(len(b)));self.end_headers();self.wfile.write(b)
+            else:send_json(self,{"error":"not found"},404)
+        elif path=="/sebdog_licence.py":
+            c=load_file("sebdog_licence.py")
+            if c:
+                self.send_response(200);self.send_header("Content-Type","text/x-python")
+                self.send_header("Content-Disposition","attachment; filename=\"sebdog_licence.py\"")
+                b=c.encode();self.send_header("Content-Length",str(len(b)));self.end_headers();self.wfile.write(b)
+            else:send_json(self,{"error":"not found"},404)
+        elif path=="/sebdog_reporter.py":
+            c=load_file("sebdog_reporter.py")
+            if c:
+                self.send_response(200);self.send_header("Content-Type","text/x-python")
+                self.send_header("Content-Disposition","attachment; filename=\"sebdog_reporter.py\"")
+                b=c.encode();self.send_header("Content-Length",str(len(b)));self.end_headers();self.wfile.write(b)
+            else:send_json(self,{"error":"not found"},404)
+        elif path=="/aileash_reporter.py":
+            c=load_file("aileash_reporter.py")
+            if c:
+                self.send_response(200);self.send_header("Content-Type","text/x-python")
+                self.send_header("Content-Disposition","attachment; filename=\"aileash_reporter.py\"")
+                b=c.encode();self.send_header("Content-Length",str(len(b)));self.end_headers();self.wfile.write(b)
+            else:send_json(self,{"error":"not found"},404)
+        elif path=="/aileash-compliance.zip":
+            import os
+            fp=os.path.join(os.path.dirname(os.path.abspath(__file__)),"aileash-compliance.zip")
+            if os.path.exists(fp):
+                with open(fp,"rb") as zf:data=zf.read()
+                self.send_response(200);self.send_header("Content-Type","application/zip")
+                self.send_header("Content-Disposition","attachment; filename=\"aileash-compliance.zip\"")
+                self.send_header("Content-Length",str(len(data)));self.end_headers();self.wfile.write(data)
+            else:send_json(self,{"error":"not found"},404)
+        elif path=="/api-routes.md" or path=="/api-routes":
+            c=load_file("api-routes.md")
+            if c:send_text(self,c,"text/markdown")
+            else:send_json(self,{"error":"not found"},404)
+        elif path=="/comply.txt":
+            c=load_file("comply.txt");send_text(self,c,"text/plain") if c else send_json(self,{"error":"not found"},404)
+        elif path=="/guardian-child":
+            c=load_file("guardian-child.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
+        elif path=="/guardian":
+            c=load_file("guardian.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
+        elif path=="/guardian-parent":
+            c=load_file("guardian-parent.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
+        elif path=="/certificate":
+            c=load_file("certificate.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
+        elif path=="/registry":
+            c=load_file("registry.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
+        elif path=="/admin":
+            c=load_file("admin.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
+        elif path=="/brain":
+            c=load_file("brain.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
+        elif path=="/green":
+            c=load_file("green.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
+        elif path=="/dis.txt":
+            c=load_file("dis.txt");send_text(self,c,"text/plain") if c else send_json(self,{"error":"not found"},404)
+        elif path=="/legal.txt":
+            c=load_file("legal.txt");send_text(self,c,"text/plain") if c else send_json(self,{"error":"not found"},404)
+        elif path=="/liability.txt":
+            c=load_file("liability.txt");send_text(self,c,"text/plain") if c else send_json(self,{"error":"not found"},404)
+        elif path=="/copyright.txt":
+            c=load_file("copyright.txt");send_text(self,c,"text/plain") if c else send_json(self,{"error":"not found"},404)
+        elif path=="/ai-txt-kit" or path=="/kit":
+            c=load_file("ai-txt-kit.html");send_html(self,c) if c else send_json(self,{"error":"not found"},404)
+        elif path=="/ai-txt-template.txt":
+            c=load_file("ai-txt-template.txt")
+            if c:
+                self.send_response(200)
+                self.send_header("Content-Type","text/plain; charset=utf-8")
+                self.send_header("Content-Disposition","attachment; filename=\"ai.txt\"")
+                self.end_headers();self.wfile.write(c.encode())
+            else:send_json(self,{"error":"not found"},404)
+        elif path=="/referrals":
+            code=qs.get("code",[""])[0].strip().upper()
+            send_html(self,referrals_page(code))
+        elif path in("/verify","/identity","/notary","/pay-check","/dashboard","/pricing","/docs","/blog","/status","/about","/legal","/privacy","/terms"):
+            name=path.lstrip("/")+".html"
+            c=load_file(name)
+            if c:send_html(self,c)
+            else:send_json(self,{"status":"coming_soon","route":path},200)
+        elif path=="/download/engine":
+            api_key=get_bearer(self)
+            ki=get_key(api_key) if api_key else None
+            if not ki:
+                send_html(self,"<html><body style='font-family:sans-serif;background:#0a0f1e;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh'><div style='text-align:center;padding:40px'><h1 style='color:#c9a84c;margin-bottom:16px'>Engine Download</h1><p style='color:rgba(255,255,255,0.5);margin-bottom:24px'>Valid API key required.</p><a href='https://sebbi.pro/#signup' style='background:#c9a84c;color:#0a0f1e;padding:14px 28px;text-decoration:none;border-radius:4px;font-weight:700'>Get API Key</a></div></body></html>",401)
+                return
             try:
-                digest, size = _file_hash(full)
-            except OSError:
-                skipped.append(relative)
-                continue
-            if digest is None:
-                skipped.append(relative)
-                continue
-            entries.append({"path": relative, "sha256": digest, "bytes": size})
-            total += size
-            if len(entries) >= MAX_FILES:
-                return entries, skipped, total, True
-    return entries, skipped, total, False
-
-
-def _manifest_root(entries):
-    """One root over the whole tree.
-
-    Deliberately a flat, ordered digest rather than a Merkle tree: there is
-    no need for per-file proofs here, and a rule anyone can reimplement in
-    four lines is worth more than a clever structure nobody checks.
-    """
-    digest = hashlib.sha256()
-    digest.update(MANIFEST_PREFIX)
-    for entry in entries:
-        digest.update(("%s\0%s\n" % (entry["path"], entry["sha256"])).encode("utf-8"))
-    return digest.hexdigest()
-
-
-# ----------------------------------------------------------------------
-# seal
-# ----------------------------------------------------------------------
-
-def _seal(ctx, api_key, data):
-    author = str(data.get("author", "") or "").strip()[:120]
-    entity = str(data.get("entity", "") or "").strip()[:120]
-    statement = str(data.get("statement", "") or "").strip()[:1000]
-
-    if not author:
-        return {"error": "author_required",
-                "message": "The name of the person declaring authorship. This is sealed "
-                           "verbatim and becomes part of the permanent record."}, 400
-
-    root_path = _app_root()
-    started = time.time()
-    entries, skipped, total_bytes, truncated = _walk(root_path)
-    if not entries:
-        return {"error": "nothing_to_seal",
-                "message": "No files found to hash under the application root."}, 500
-
-    manifest_root = _manifest_root(entries)
-    now = time.time()
-
-    declaration = {
-        "author": author,
-        "entity": entity or None,
-        "statement": statement or None,
-        "declared_at": _iso(now),
-    }
-
-    ev = {"user_id": "cb:" + manifest_root[:16], "action": "codebase_sealed", "amount": 0,
-          "country": "UK", "device_id": "codebase", "anomaly": 0, "device_risk": 0}
-    res = {"decision": "CODEBASE_SEALED", "score": 0, "codebase_version": VERSION,
-           "manifest_root": manifest_root, "file_count": len(entries),
-           "total_bytes": total_bytes, "author": author, "entity": entity or None,
-           "statement": statement or None,
-           "detail": "root=%s;files=%d;bytes=%d;author=%s"
-                     % (manifest_root, len(entries), total_bytes, author)}
-    audit_hash, block_index, seq = ctx["seal"](ev, res, now, api_key)
-
-    with ctx["lock"]:
-        prior = ctx["conn"].execute(
-            "SELECT manifest_root,sealed FROM codebase_seal ORDER BY id ASC").fetchall()
-        ctx["conn"].execute(
-            "INSERT INTO codebase_seal(api_key,manifest_root,file_count,total_bytes,"
-            "declaration,manifest,sealed,audit_hash,block_index) VALUES(?,?,?,?,?,?,?,?,?)",
-            (api_key, manifest_root, len(entries), total_bytes,
-             json.dumps(declaration), json.dumps(entries), now, audit_hash, block_index))
-        ctx["conn"].commit()
-
-    out = {
-        "manifest_root": manifest_root,
-        "file_count": len(entries), "total_bytes": total_bytes,
-        "files_skipped": len(skipped),
-        "sealed_at": _iso(now),
-        "took_seconds": round(now - started, 2),
-        "sealed_in_chain": audit_hash, "block_index": block_index, "receipt_seq": seq,
-        "declaration": declaration,
-        "seal_number": len(prior) + 1,
-        "codebase_version": VERSION,
-        "what_this_establishes": ("That the person named above held a body of code producing "
-                                  "exactly this manifest root, no later than this moment, and "
-                                  "that the record cannot be altered afterwards - it is a block "
-                                  "in a chain that is externally anchored and held by peers."),
-        "what_it_does_not": ("It does not establish legal ownership. Ownership comes from "
-                             "authorship, company records and signed assignment. This is the "
-                             "dated factual record those arguments rest on, not a substitute "
-                             "for them."),
-        "how_to_use_it": ("Keep this response. To demonstrate the claim later, produce your copy "
-                          "of the code and let anyone recompute the manifest root from it using "
-                          "the published rules. If it matches, you held exactly that code by "
-                          "this date."),
-        "verify_the_block": "/x/consistency/ancestor?tip=" + audit_hash,
-        "spec": "/x/codebase/spec",
-    }
-
-    if truncated:
-        out["truncated"] = ("Hit the %d file cap. The root covers the files listed and no more - "
-                            "raise MAX_FILES if the tree is genuinely larger." % MAX_FILES)
-    if prior:
-        last_root, last_time = prior[-1]
-        if last_root == manifest_root:
-            out["unchanged_since"] = _iso(last_time)
-            out["message"] = ("Identical to the previous seal. The codebase has not changed "
-                              "since %s and now carries an additional dated witness."
-                              % _iso(last_time))
-        else:
-            out["previous_root"] = last_root
-            out["previous_sealed_at"] = _iso(last_time)
-            out["message"] = ("The codebase has changed since the last seal. Both roots remain "
-                              "in the chain - a dated history of the work, which is stronger "
-                              "evidence than any single snapshot.")
-    else:
-        out["message"] = ("First seal. Run this on every deploy and the history becomes a "
-                          "continuous record of the work developing under one hand.")
-    return out, 200
-
-
-# ----------------------------------------------------------------------
-# reading
-# ----------------------------------------------------------------------
-
-def _manifest(ctx, data):
-    root = str(data.get("root", data.get("manifest_root", ""))).strip().lower()
-    with ctx["lock"]:
-        if root:
-            row = ctx["conn"].execute(
-                "SELECT manifest_root,file_count,total_bytes,declaration,manifest,sealed,"
-                "audit_hash,block_index FROM codebase_seal WHERE manifest_root=? LIMIT 1",
-                (root,)).fetchone()
-        else:
-            row = ctx["conn"].execute(
-                "SELECT manifest_root,file_count,total_bytes,declaration,manifest,sealed,"
-                "audit_hash,block_index FROM codebase_seal ORDER BY id DESC LIMIT 1").fetchone()
-    if not row:
-        return {"error": "not_found", "root": root or None}, 404
-
-    try:
-        files = json.loads(row[4])
-    except Exception:
-        files = []
-    try:
-        declaration = json.loads(row[3])
-    except Exception:
-        declaration = None
-
-    return {"manifest_root": row[0], "file_count": row[1], "total_bytes": row[2],
-            "declaration": declaration, "sealed_at": _iso(row[5]),
-            "sealed_in_chain": row[6], "block_index": row[7],
-            "files": files,
-            "codebase_version": VERSION,
-            "note": "Paths and hashes only. No file contents are held or returned by any route "
-                    "in this module."}, 200
-
-
-def _history(ctx):
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT manifest_root,file_count,total_bytes,declaration,sealed,audit_hash,"
-            "block_index FROM codebase_seal ORDER BY id ASC LIMIT 500").fetchall()
-    if not rows:
-        return {"count": 0, "seals": [],
-                "message": "No codebase seal recorded yet."}, 200
-
-    seals, last = [], None
-    for root, count, total, declaration, sealed, audit_hash, block_index in rows:
-        try:
-            parsed = json.loads(declaration)
-            author = parsed.get("author")
-        except Exception:
-            author = None
-        seals.append({"manifest_root": root, "file_count": count, "total_bytes": total,
-                      "author": author, "sealed_at": _iso(sealed),
-                      "sealed_in_chain": audit_hash, "block_index": block_index,
-                      "changed_from_previous": last is not None and root != last})
-        last = root
-
-    authors = {s["author"] for s in seals if s["author"]}
-    return {"count": len(seals),
-            "first_sealed": seals[0]["sealed_at"], "latest_sealed": seals[-1]["sealed_at"],
-            "distinct_roots": len({s["manifest_root"] for s in seals}),
-            "declared_authors": sorted(authors),
-            "seals": seals,
-            "codebase_version": VERSION,
-            "what_this_is": "A dated, uneditable record of one body of code developing over "
-                            "time under a declared author. A continuous history is materially "
-                            "harder to dispute than a single snapshot.",
-            "file_list": "Keyed - /x/codebase/manifest. The root is all anyone needs to check a "
-                         "manifest you show them."}, 200
-
-
-def _root(ctx):
-    with ctx["lock"]:
-        row = ctx["conn"].execute(
-            "SELECT manifest_root,file_count,total_bytes,sealed,audit_hash,block_index,"
-            "declaration FROM codebase_seal ORDER BY id DESC LIMIT 1").fetchone()
-    if not row:
-        return {"error": "never_sealed"}, 404
-    try:
-        author = json.loads(row[6]).get("author")
-    except Exception:
-        author = None
-    return {"manifest_root": row[0], "file_count": row[1], "total_bytes": row[2],
-            "sealed_at": _iso(row[3]), "sealed_in_chain": row[4], "block_index": row[5],
-            "declared_author": author,
-            "codebase_version": VERSION,
-            "verify_the_block": "/x/consistency/ancestor?tip=" + row[4],
-            "recompute_it": "/x/codebase/spec"}, 200
-
-
-def _spec():
-    return {
-        "codebase_version": VERSION,
-        "purpose": "Dated, tamper-evident evidence that a named person held a specific body of "
-                   "code at a specific moment.",
-        "not_ownership": "This does not establish legal ownership and is not offered as though "
-                         "it does. Ownership comes from authorship, company records and signed "
-                         "assignment. This is the factual record those arguments rest on.",
-        "file_hash": "sha256('AILEASH-FILE-v1:' || exact_file_bytes) as lowercase hex",
-        "manifest_root": "sha256('AILEASH-MANIFEST-v1:' || for each file in path order: "
-                         "path + NUL + file_hash + newline) as lowercase hex",
-        "ordering": "files sorted by relative path, forward slashes, relative to the "
-                    "application root",
-        "excluded": {
-            "directories": sorted(SKIP_DIRS),
-            "suffixes": list(SKIP_SUFFIXES),
-            "names": sorted(SKIP_NAMES),
-            "why": "Version control internals and caches are not the work. Databases and "
-                   "anything resembling a secret are excluded because hashing them proves "
-                   "nothing worth proving and risks something worth protecting.",
-        },
-        "recompute_it_yourself": [
-            "Take your copy of the source tree.",
-            "Drop the excluded directories, suffixes and names above.",
-            "Hash each remaining file with the file rule.",
-            "Sort by relative path and apply the manifest rule.",
-            "Compare with the sealed root. A match means byte-identical code.",
-        ],
-        "privacy": "No file contents are stored or returned by any route. The manifest holds "
-                   "paths and one-way hashes only, and the file list itself is keyed.",
-        "the_discipline": "Seal on every deploy. A single snapshot is a claim about one day; a "
-                          "continuous dated history is a record of the work.",
-        "what_to_do_as_well": "Get the legal position in writing - entity ownership of the IP, "
-                              "and a signed agreement with any collaborator saying who owns "
-                              "what. Do it before it matters. This module makes the facts "
-                              "unarguable; it cannot make the paperwork exist.",
-    }, 200
-
-
-# ----------------------------------------------------------------------
-# router entry point
-# ----------------------------------------------------------------------
-
-def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-    action = (action or "").strip("/").lower()
-    data = data or {}
-
-    if method == "GET":
-        if action == "spec":
-            return _spec()
-        if action == "history":
-            return _history(ctx)
-        if action == "root":
-            return _root(ctx)
-        if action == "manifest":
-            if not api_key:
-                return {"error": "invalid_api_key"}, 401
-            return _manifest(ctx, data)
-
-    if method == "POST":
-        if not api_key:
-            return {"error": "invalid_api_key"}, 401
-        if action == "seal":
-            return _seal(ctx, api_key, data)
-
-    return {"error": "unknown_action", "action": action,
-            "GET": ["spec", "history", "root", "manifest (keyed)"],
-            "POST": ["seal (keyed)"]}, 404
-
-```
-
-
-## `modules/complete.py`
-
-862 lines, 37023 bytes
-
-```python
-#!/usr/bin/env python3
-"""
-modules/complete.py  -  proving what ISN'T there
-================================================
-
-THE PROBLEM NOBODY IN THIS MARKET ANSWERS
------------------------------------------
-A hash chain proves inclusion. It cannot prove exclusion.
-
-So when a firm hands an auditor four hundred decisions, nothing on earth
-shows it wasn't six hundred. Every audit ever conducted runs on the
-assumption that the sample handed over is the whole set, and that
-assumption has never once been provable. The chain says "these four
-hundred happened". It says nothing about the two hundred that also
-happened and quietly didn't make the export.
-
-Three questions follow, and none of them can be answered by an
-append-only log on its own:
-
-  1. Is this the complete set, or the flattering subset?
-  2. Do you hold a record about me? Prove the NO.
-  3. You erased my data - prove it, without holding my data to prove it.
-
-Question 3 is the contradiction sitting inside every
-blockchain-for-compliance product, this one included. Append-only and
-right-to-erasure do not obviously coexist. Most vendors disclaim it.
-
-WHAT THIS DOES
---------------
-At the end of each period we take every leaf sealed in that period, SORT
-them, build a Merkle tree over the sorted list, and seal the root plus the
-exact count into the chain. That root is then anchored externally like
-everything else.
-
-Sorting is the whole trick. In an unsorted tree you can only prove a leaf
-is present. In a sorted one you can prove a leaf is absent, by showing the
-two leaves either side of where it would have sorted and proving they are
-ADJACENT in the tree. Nothing can sit between two adjacent leaves. The
-record provably does not exist.
-
-  INCLUSION     standard Merkle path. This receipt is in the period.
-  ABSENCE       the two neighbours, and proof they are adjacent. No record
-                for that key exists in the period, and we cannot pretend
-                otherwise after the fact.
-  COMPLETENESS  the count was sealed BEFORE anyone asked for anything.
-                Hand over four hundred against a root that says six
-                hundred and the arithmetic exposes it.
-
-ERASURE
--------
-Erasing a record deletes the payload and leaves the leaf as a tombstone.
-We can then prove: a record existed, it was erased, and when - while
-holding none of the erased content. The subject gets a proof of erasure
-rather than a promise of one, and the chain does not have to be broken to
-give it to them.
-
-WHY COMMITMENTS ARE FROZEN
---------------------------
-A commitment is only worth anything if it cannot be recomputed to suit
-later circumstances. So:
-
-  - Only CLOSED periods can be committed. You cannot commit a period that
-    is still running, because more leaves could still arrive.
-  - The sorted leaf list is STORED at commit time, not recomputed on
-    demand. If rows are erased next year, the proofs from this year still
-    verify against the root that was sealed and anchored this year.
-  - A period can only be committed once. A second attempt returns the
-    existing commitment rather than a new root.
-
-WHY COMMITTING IS AUTOMATIC
----------------------------
-It was not, and that was a real hole rather than an oversight worth
-defending. Committing was a keyed POST somebody had to remember to make,
-which meant that for the first week of publication this module had zero
-committed periods while the discovery document advertised completeness and
-absence as publicly demonstrable checks. Both were true claims about code
-that existed and false claims about anything an outsider could run.
-
-A control that depends on the operator remembering to run it is the exact
-control an auditor should distrust, so the schedule now runs itself. Once
-a month closes, the first request to reach this module commits it.
-
-Two honest limits on that:
-
-  - The automatic commitment is DEPLOYMENT-WIDE. It covers every record
-    sealed in the period regardless of which key sealed it, because that
-    is what a public completeness claim has to mean. Per-tenant
-    commitments are still made by POSTing /x/complete/commit with that
-    tenant's key, and the two live side by side.
-  - A period committed late is committed at the date it was actually
-    committed, and /x/complete/periods reports the gap in days. Backfilled
-    history still proves the count was fixed before any export was asked
-    for. It does not prove the count was fixed when the period closed, and
-    nothing published here will claim it does.
-
-HONEST LIMITS
--------------
-  - This proves completeness of what was SEALED. A decision that never
-    reached the chain at all is outside anything we can see. Garbage in
-    still applies; what changes is that the operator can no longer choose
-    which of the sealed records to show.
-  - Absence proofs are scoped to a period. "No record of you, ever"
-    means checking every period, which is why the period list is public.
-  - The tree is built over key material only. It never contains payloads,
-    so a leaf reveals whether something exists, not what it said.
-  - Adjacent-leaf absence proofs disclose the two neighbouring keys. If
-    keys are themselves sensitive, hash them before they become leaves -
-    the proof still works, and we hold nothing legible.
-
-    POST /x/complete/commit    close and seal a period      (keyed)
-    POST /x/complete/erase     tombstone a leaf             (keyed)
-    GET  /x/complete/periods   every sealed period          (public)
-    GET  /x/complete/root      root, count, block index     (public)
-    GET  /x/complete/prove     inclusion or absence proof   (public)
-    POST /x/complete/verify    check a proof we handed out  (public)
-    GET  /x/complete/spec      the exact hashing rules      (public)
-"""
-
-import hashlib
-import json
-import re
-import time
-from datetime import datetime, timezone, timedelta
-
-VERSION = "1.1"
-HEX64 = re.compile(r"^[0-9a-f]{64}$")
-
-# A third party must be able to check completeness without an account. A
-# completeness claim you have to hold credentials to verify is not a
-# completeness claim, it is a marketing line.
-PUBLIC = {("GET", "periods"), ("GET", "root"), ("GET", "prove"),
-          ("GET", "spec"), ("POST", "verify")}
-
-# Domain separation. Leaf and node hashes must never be confusable, or an
-# attacker can present an internal node as though it were a leaf.
-LEAF_PREFIX = b"AILEASH-LEAF-v1:"
-NODE_PREFIX = b"AILEASH-NODE-v1:"
-
-MAX_LEAVES = 200000
-
-# ---- automatic commitment --------------------------------------------
-AUTO_COMMIT = True          # set False to go back to committing by hand
-AUTO_KINDS = ("receipts", "subjects")
-AUTO_INTERVAL = 600         # seconds between sweeps, not per request
-AUTO_MAX_MONTHS = 24        # how far back a first run will backfill
-
-# The deployment-wide commitment is stored under an empty key, which is
-# also what an unauthenticated read looks for. Not a magic value with
-# privileges - the absence of a key, meaning "everything sealed here".
-AUTO_KEY = ""
-
-_last_auto = [0.0]
-_auto_log = []              # recent sweep outcomes, surfaced on /periods
-
-_ready = False
-
-
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        c = ctx["conn"]
-        c.execute("CREATE TABLE IF NOT EXISTS complete_commit("
-                  "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,period TEXT,kind TEXT,"
-                  "root TEXT,leaf_count INTEGER,period_start REAL,period_end REAL,"
-                  "committed REAL,audit_hash TEXT,block_index INTEGER)")
-        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_cmp_unique "
-                  "ON complete_commit(api_key,period,kind)")
-        c.execute("CREATE TABLE IF NOT EXISTS complete_leaf("
-                  "commit_id INTEGER,idx INTEGER,leaf TEXT)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_cmp_leaf "
-                  "ON complete_leaf(commit_id,idx)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_cmp_leaf_val "
-                  "ON complete_leaf(commit_id,leaf)")
-        c.execute("CREATE TABLE IF NOT EXISTS complete_tomb("
-                  "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,leaf TEXT,"
-                  "reason TEXT,erased REAL,audit_hash TEXT,block_index INTEGER)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_cmp_tomb ON complete_tomb(api_key,leaf)")
-        c.commit()
-    _ready = True
-
-
-def _audit_columns(ctx):
-    """What the audit_log actually looks like on this deployment.
-
-    Read rather than assumed - the schema has moved before and will again,
-    and a completeness module that guesses column names is worse than none.
-    """
-    have = []
-    try:
-        with ctx["lock"]:
-            for row in ctx["conn"].execute("PRAGMA table_info(audit_log)").fetchall():
-                have.append(row[1])
-    except Exception:
-        pass
-    return have
-
-
-def _iso(ts):
-    if not ts:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
-
-# ----------------------------------------------------------------------
-# periods
-# ----------------------------------------------------------------------
-
-def _period_bounds(period):
-    """Turn a period label into [start, end) as epoch seconds.
-
-    Accepts  2026, 2026-08, 2026-08-02, 2026-Q3.
-    Returns (start, end, None) or (None, None, why).
-    """
-    period = (period or "").strip().upper()
-
-    def _utc(y, m, d):
-        return datetime(y, m, d, tzinfo=timezone.utc).timestamp()
-
-    try:
-        m = re.match(r"^(\d{4})$", period)
-        if m:
-            y = int(m.group(1))
-            return _utc(y, 1, 1), _utc(y + 1, 1, 1), None
-
-        m = re.match(r"^(\d{4})-Q([1-4])$", period)
-        if m:
-            y, q = int(m.group(1)), int(m.group(2))
-            start_month = (q - 1) * 3 + 1
-            end_month = start_month + 3
-            if end_month > 12:
-                return _utc(y, start_month, 1), _utc(y + 1, 1, 1), None
-            return _utc(y, start_month, 1), _utc(y, end_month, 1), None
-
-        m = re.match(r"^(\d{4})-(\d{2})$", period)
-        if m:
-            y, mo = int(m.group(1)), int(m.group(2))
-            if not 1 <= mo <= 12:
-                return None, None, "month out of range"
-            if mo == 12:
-                return _utc(y, 12, 1), _utc(y + 1, 1, 1), None
-            return _utc(y, mo, 1), _utc(y, mo + 1, 1), None
-
-        m = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", period)
-        if m:
-            y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
-            start = datetime(y, mo, d, tzinfo=timezone.utc)
-            return start.timestamp(), (start + timedelta(days=1)).timestamp(), None
-    except ValueError as exc:
-        return None, None, "unreadable period (%s)" % exc
-
-    return None, None, "period must be YYYY, YYYY-MM, YYYY-MM-DD or YYYY-Qn"
-
-
-# ----------------------------------------------------------------------
-# the tree
-# ----------------------------------------------------------------------
-
-def _leaf_hash(value):
-    return hashlib.sha256(LEAF_PREFIX + value.encode("utf-8")).hexdigest()
-
-
-def _node_hash(left, right):
-    return hashlib.sha256(NODE_PREFIX + left.encode() + right.encode()).hexdigest()
-
-
-def _build(leaves):
-    """Build the tree over already-sorted leaf VALUES.
-
-    Returns (root, levels). levels[0] is the leaf-hash level. An odd node
-    at any level is promoted unchanged to the next - it is never paired
-    with itself, which is the classic duplication weakness.
-    """
-    if not leaves:
-        return hashlib.sha256(LEAF_PREFIX + b"EMPTY").hexdigest(), []
-
-    level = [_leaf_hash(v) for v in leaves]
-    levels = [level]
-    while len(level) > 1:
-        nxt = []
-        for i in range(0, len(level) - 1, 2):
-            nxt.append(_node_hash(level[i], level[i + 1]))
-        if len(level) % 2 == 1:
-            nxt.append(level[-1])
-        levels.append(nxt)
-        level = nxt
-    return level[0], levels
-
-
-def _path(levels, index):
-    """Sibling path for a leaf index. Each step says which side to hash on."""
-    proof = []
-    idx = index
-    for level in levels[:-1]:
-        if idx % 2 == 0:
-            sibling = idx + 1
-            if sibling < len(level):
-                proof.append({"side": "right", "hash": level[sibling]})
-            # No sibling means this node was promoted - nothing to hash.
-        else:
-            proof.append({"side": "left", "hash": level[idx - 1]})
-        idx //= 2
-    return proof
-
-
-def _replay(leaf_value, proof):
-    """Recompute a root from a leaf and its path. This is what a verifier
-    runs, and it is deliberately five lines so anyone can reimplement it."""
-    current = _leaf_hash(leaf_value)
-    for step in proof:
-        if step.get("side") == "left":
-            current = _node_hash(step["hash"], current)
-        else:
-            current = _node_hash(current, step["hash"])
-    return current
-
-
-# ----------------------------------------------------------------------
-# reading leaves out of the audit log
-# ----------------------------------------------------------------------
-
-def _collect(ctx, api_key, start, end, kind, columns):
-    """Every distinct leaf sealed in [start, end).
-
-    kind = receipts  -> the audit hash of each sealed decision
-    kind = subjects  -> the distinct subject each decision was about, so
-                        "do you hold anything on me" becomes answerable
-
-    A falsy api_key means no scoping: every record sealed on this
-    deployment in the window. That is what the automatic commitment uses,
-    and what a public completeness claim has to cover.
-    """
-    if "ts" not in columns:
-        return None, "audit_log has no ts column on this deployment"
-
-    if kind == "receipts":
-        if "audit_hash" not in columns:
-            return None, "audit_log has no audit_hash column"
-        field = "audit_hash"
-    else:
-        field = None
-        for candidate in ("user_id", "subject", "subject_id", "customer_id"):
-            if candidate in columns:
-                field = candidate
-                break
-        if not field:
-            return None, "no subject column on this deployment - receipts only"
-
-    scoped = "api_key" in columns and api_key
-    sql = "SELECT DISTINCT %s FROM audit_log WHERE ts>=? AND ts<?" % field
-    args = [start, end]
-    if scoped:
-        sql += " AND api_key=?"
-        args.append(api_key)
-
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(sql, tuple(args)).fetchall()
-
-    values = sorted({str(r[0]) for r in rows if r[0] is not None})
-    if len(values) > MAX_LEAVES:
-        return None, "period holds %d leaves, above the %d cap" % (len(values), MAX_LEAVES)
-    return values, None
-
-
-# ----------------------------------------------------------------------
-# commit
-# ----------------------------------------------------------------------
-
-def _commit(ctx, api_key, data):
-    period = str(data.get("period", "")).strip()
-    kind = str(data.get("kind", "receipts")).strip().lower()
-    if kind not in ("receipts", "subjects"):
-        return {"error": "bad_kind", "message": "kind is receipts or subjects"}, 400
-
-    start, end, why = _period_bounds(period)
-    if why:
-        return {"error": "bad_period", "message": why}, 400
-
-    now = time.time()
-    if end > now:
-        return {"error": "period_open",
-                "message": "That period has not finished. Committing a live period would let "
-                           "later entries change the root, which defeats the point.",
-                "closes_at": _iso(end)}, 409
-
-    with ctx["lock"]:
-        existing = ctx["conn"].execute(
-            "SELECT root,leaf_count,committed,audit_hash,block_index FROM complete_commit "
-            "WHERE api_key=? AND period=? AND kind=?", (api_key, period, kind)).fetchone()
-    if existing:
-        return {"already_committed": True, "period": period, "kind": kind,
-                "root": existing[0], "leaf_count": existing[1],
-                "committed_at": _iso(existing[2]),
-                "sealed_in_chain": existing[3], "block_index": existing[4],
-                "message": "A period is committed once. Recommitting is how a commitment "
-                           "stops meaning anything."}, 200
-
-    columns = _audit_columns(ctx)
-    leaves, why = _collect(ctx, api_key, start, end, kind, columns)
-    if why:
-        return {"error": "cannot_collect", "message": why}, 400
-
-    root, levels = _build(leaves)
-
-    scope = "deployment" if not api_key else "key"
-    late_days = round(max(0.0, (now - end)) / 86400.0, 1)
-
-    ev = {"user_id": "cmp:" + period, "action": "completeness_committed", "amount": 0,
-          "country": "UK", "device_id": "complete", "anomaly": 0, "device_risk": 0}
-    res = {"decision": "COMPLETENESS_SEALED", "score": 0, "complete_version": VERSION,
-           "period": period, "kind": kind, "root": root, "leaf_count": len(leaves),
-           "period_start": start, "period_end": end, "scope": scope,
-           "days_after_period_end": late_days,
-           "detail": "period=%s;kind=%s;scope=%s;root=%s;count=%d;late_days=%s"
-                     % (period, kind, scope, root, len(leaves), late_days)}
-    audit_hash, block_index, seq = ctx["seal"](ev, res, now, api_key)
-
-    with ctx["lock"]:
-        c = ctx["conn"]
-        c.execute("INSERT INTO complete_commit(api_key,period,kind,root,leaf_count,"
-                  "period_start,period_end,committed,audit_hash,block_index) "
-                  "VALUES(?,?,?,?,?,?,?,?,?,?)",
-                  (api_key, period, kind, root, len(leaves), start, end, now,
-                   audit_hash, block_index))
-        commit_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
-        c.executemany("INSERT INTO complete_leaf(commit_id,idx,leaf) VALUES(?,?,?)",
-                      [(commit_id, i, v) for i, v in enumerate(leaves)])
-        c.commit()
-
-    return {"period": period, "kind": kind, "root": root, "leaf_count": len(leaves),
-            "period_start": _iso(start), "period_end": _iso(end),
-            "committed_at": _iso(now), "sealed_in_chain": audit_hash,
-            "block_index": block_index, "receipt_seq": seq,
-            "scope": scope, "days_after_period_end": late_days,
-            "frozen": "The sorted leaf list is stored as committed. Later erasures cannot "
-                      "change what this root proved.",
-            "message": "%d leaves committed. Any export from this period claiming a different "
-                       "total now contradicts a sealed, externally anchored number."
-                       % len(leaves)}, 200
-
-
-# ----------------------------------------------------------------------
-# automatic commitment
-# ----------------------------------------------------------------------
-
-def _closed_months(first_ts, now):
-    """Every whole month between the first sealed record and this one.
-
-    The current month is excluded because it is still running, which is
-    the same rule a manual commit is held to.
-    """
-    try:
-        first = datetime.fromtimestamp(first_ts, tz=timezone.utc)
-        current = datetime.fromtimestamp(now, tz=timezone.utc)
-    except Exception:
-        return []
-
-    labels = []
-    y, m = first.year, first.month
-    while (y, m) < (current.year, current.month):
-        labels.append("%04d-%02d" % (y, m))
-        m += 1
-        if m > 12:
-            m = 1
-            y += 1
-        if len(labels) > 600:
-            break
-    return labels[-AUTO_MAX_MONTHS:]
-
-
-def _auto_commit(ctx):
-    """Commit any closed month that nobody has committed yet.
-
-    Runs on request rather than on a thread. A sleeping container has no
-    timer worth trusting, and this way the sweep happens before the answer
-    that depends on it - including for the auditor whose visit to
-    /x/complete/periods is what triggered it.
-    """
-    if not AUTO_COMMIT:
-        return
-
-    now = time.time()
-    if now - _last_auto[0] < AUTO_INTERVAL:
-        return
-    _last_auto[0] = now
-
-    columns = _audit_columns(ctx)
-    if "ts" not in columns:
-        return
-
-    try:
-        with ctx["lock"]:
-            row = ctx["conn"].execute("SELECT MIN(ts) FROM audit_log").fetchone()
-    except Exception:
-        return
-    if not row or not row[0]:
-        return
-
-    months = _closed_months(row[0], now)
-    if not months:
-        return
-
-    try:
-        with ctx["lock"]:
-            done = {(r[0], r[1]) for r in ctx["conn"].execute(
-                "SELECT period,kind FROM complete_commit WHERE api_key=?",
-                (AUTO_KEY,)).fetchall()}
-    except Exception:
-        done = set()
-
-    for period in months:
-        for kind in AUTO_KINDS:
-            if (period, kind) in done:
-                continue
+                with open("engine.py","rb") as f:body=f.read()
+                self.send_response(200)
+                self.send_header("Content-Type","text/x-python")
+                self.send_header("Content-Disposition",'attachment; filename="engine.py"')
+                self.send_header("Content-Length",str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except:send_json(self,{"error":"engine_not_found"},404)
+        elif path=="/verify-challenge":
+            send_html(self,CHALLENGE_PAGE)
+        elif path=="/api/challenge/status":
+            tok=qs.get("token",[""])[0].strip()
+            p,err=read_challenge_token(tok)
+            if not p:send_json(self,{"resolved":False,"error":err or "invalid_token"},400);return
+            r=challenge_resolved(p)
+            if r:send_json(self,{"resolved":True,"sealed":r[0],"at":r[1]})
+            else:send_json(self,{"resolved":False,"expired":err=="expired"})
+        elif path=="/api/regulation-map":
+            send_json(self,{"map":REG_MAP,"map_hash":sha(REG_MAP),"changes_sealed":"every version change is sealed into the audit chain as a block"})
+        elif path=="/api/partner/status":
+            bid=qs.get("badge",[""])[0].strip().lower()
+            hit=lookup_badge(bid)
+            with _db_lock:
+                tip=_conn.execute("SELECT audit_hash FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()
+            ct=(tip[0][:16] if tip else "GENESIS")
+            if hit:
+                send_json(self,{"partner":hit[0],"account_standing":"active" if hit[1] else "lapsed","infrastructure":"operational","chain_tip":ct,"note":"account_standing is the partner's status; infrastructure is the AILeash platform status - independently attributable"})
+            else:
+                send_json(self,{"partner":None,"account_standing":"not_found","infrastructure":"operational","chain_tip":ct})
+        elif path=="/api/payment/check":
+            code=qs.get("code",[""])[0].strip().lower()
+            fpq=qs.get("fp",[""])[0].strip().lower()
+            if not code or len(code)<12:send_json(self,{"found":False,"error":"provide the 12-character code"},400);return
+            with _db_lock:
+                if len(code)==64:
+                    r=_conn.execute("SELECT fp,ts,seal,block_index,display_json FROM payment_registry WHERE fp=?",(code,)).fetchone()
+                else:
+                    r=_conn.execute("SELECT fp,ts,seal,block_index,display_json FROM payment_registry WHERE fp LIKE ?",(code+"%",)).fetchone()
+            if not r:
+                ts=time.time()
+                ev={"user_id":"payment_verifier","action":"payment_verification","amount":0,"country":"UK","device_id":"paycheck_"+code[:12],"anomaly":0,"device_risk":0,"checked_code":code[:12],"result":"NO_SEAL"}
+                res={"decision":"VERIFICATION","score":0,"version":VERSION,"timestamp":ts,"result":"NO_SEAL"}
+                h2,idx2,_=seal(ev,res,ts)
+                send_json(self,{"found":False,"receipt":{"seal":h2,"block_index":idx2,"checked_at":ts,"result":"NO_SEAL"}});return
+            out={"found":True,"registered_at":r[1],"seal":r[2],"block_index":r[3]}
+            if r[4]:
+                try:out["display"]=json.loads(r[4])
+                except:pass
+            result="FOUND"
+            if fpq and len(fpq)==64:
+                out["match"]=(fpq==r[0])
+                result="MATCH" if out["match"] else "MISMATCH"
+            ts=time.time()
+            ev={"user_id":"payment_verifier","action":"payment_verification","amount":0,"country":"UK","device_id":"paycheck_"+code[:12],"anomaly":0,"device_risk":0,"checked_code":code[:12],"checked_fp":fpq or "","result":result}
+            res={"decision":"VERIFICATION","score":0,"version":VERSION,"timestamp":ts,"result":result,"note":"payer verification sealed - proof of care under PSR mandatory reimbursement rules"}
+            h2,idx2,_=seal(ev,res,ts)
+            out["receipt"]={"seal":h2,"block_index":idx2,"checked_at":ts,"result":result}
+            send_json(self,out)
+        elif path=="/api/identity/check":
+            q=qs.get("code",[""])[0].strip().lower()
+            if not q or len(q)<12:send_json(self,{"found":False,"error":"provide at least 12 characters"},400);return
+            with _db_lock:
+                if len(q)==64:
+                    r=_conn.execute("SELECT fp,ts,seal,block_index,public,profile_json FROM identity_registry WHERE fp=?",(q,)).fetchone()
+                else:
+                    r=_conn.execute("SELECT fp,ts,seal,block_index,public,profile_json FROM identity_registry WHERE fp LIKE ?",(q+"%",)).fetchone()
+            if not r:send_json(self,{"found":False});return
+            out={"found":True,"fingerprint":r[0],"registered_at":r[1],"seal":r[2],"block_index":r[3]}
+            if r[4] and r[5]:
+                try:out["profile"]=json.loads(r[5])
+                except:pass
+            send_json(self,out)
+        elif path=="/api/verify-post":
+            ch=qs.get("content",[""])[0].strip().lower()
+            if not ch or len(ch)!=64:send_json(self,{"verified":False,"error":"provide a 64-char sha-256"},400);return
+            with _db_lock:
+                r=_conn.execute("SELECT ts,seal,block_index FROM post_registry WHERE fp=?",(ch,)).fetchone()
+            if r:send_json(self,{"verified":True,"block_index":r[2],"sealed_at":r[0],"seal":r[1]})
+            else:send_json(self,{"verified":False})
+        elif path=="/api/spec":
+            send_json(self,ENGINE_SPEC)
+        elif path=="/api/inclusion":
+            h_q=qs.get("hash",[""])[0].strip().lower()
+            if not h_q or len(h_q)!=64:send_json(self,{"included":False,"error":"provide full 64-char audit hash"},400);return
+            with _db_lock:
+                r=_conn.execute("SELECT id,ts,key_seq FROM audit_log WHERE audit_hash=?",(h_q,)).fetchone()
+            if not r:send_json(self,{"included":False,"hash":h_q});return
+            send_json(self,{"included":True,"hash":h_q,"block_index":r[0],"sealed_at":r[1],"receipt_seq":r[2]})
+        elif path=="/api/coverage":
+            auth=get_bearer(self)
+            if not auth:send_json(self,{"error":"api_key_required"},401);return
+            ki=get_key(auth)
+            if not ki:send_json(self,{"error":"invalid_api_key"},401);return
+            with _db_lock:
+                sr=_conn.execute("SELECT COALESCE(seq,0) FROM api_keys WHERE key=?",(auth,)).fetchone()
+                cnt=_conn.execute("SELECT COUNT(*),MIN(key_seq),MAX(key_seq),MIN(ts),MAX(ts) FROM audit_log WHERE api_key=?",(auth,)).fetchone()
+                gaps=_conn.execute("SELECT COUNT(*) FROM audit_log WHERE api_key=? AND key_seq IS NOT NULL",(auth,)).fetchone()
+            issued=sr[0] if sr else 0
+            sealed=gaps[0]
+            send_json(self,{
+                "receipts_issued":issued,
+                "receipts_sealed":sealed,
+                "complete":issued==sealed,
+                "seq_range":[cnt[1],cnt[2]],
+                "period":[cnt[3],cnt[4]],
+                "how_to_reconcile":"Every /api/govern response carries receipt_seq. Sequences are gapless by construction. Compare your stored receipts against seq_range - any number you hold that this chain lacks, or any gap in your own receipt series, is a provable omission."})
+        elif path=="/api/guardian/report":
+            email=qs.get("email",[""])[0].strip().lower()
+            if not email:send_json(self,{"error":"email required"},400);return
+            pc=qs.get("code",[""])[0].strip()
+            with _db_lock:
+                fam=_conn.execute("SELECT child_name,created,last_checkin FROM guardian_family WHERE pair_code=? AND parent_key=?",(pc,email)).fetchone()
+                rows=_conn.execute("SELECT ts,kind,lat,lon,note,audit_hash FROM guardian_events WHERE pair_code=? ORDER BY ts DESC LIMIT 200",(pc,)).fetchall()
+            if not fam:send_json(self,{"error":"not_found_or_not_yours"},404);return
+            events=[{"ts":r[0],"kind":r[1],"lat":r[2],"lon":r[3],"note":r[4],"sealed":r[5][:16]} for r in rows]
+            send_json(self,{"child":fam[0],"paired":fam[1],"last_checkin":fam[2],
+                "events":events,
+                "note":"Every event is sealed in the audit chain. Message content is never stored - only a fingerprint. This timeline is tamper-evident and can be independently verified."})
+        elif path=="/api/guardian/children":
+            email=qs.get("email",[""])[0].strip().lower()
+            if not email:send_json(self,{"error":"email required"},400);return
+            with _db_lock:
+                rows=_conn.execute("SELECT pair_code,child_name,last_checkin FROM guardian_family WHERE parent_key=? ORDER BY created ASC",(email,)).fetchall()
+            send_json(self,{"children":[{"code":r[0],"name":r[1],"last_checkin":r[2]} for r in rows]})
+        elif path=="/api/usage":
+            auth=get_bearer(self)
+            if not auth:send_json(self,{"error":"api_key_required"},401);return
+            n=device_count(auth)
+            ki=get_key(auth)
+            trial_note=""
+            days_left=None
+            if ki:
+                _,_,_,is_paid,_,_,_,created=ki
+                in_trial,days_left=trial_state(created,is_paid)
+                if is_paid:trial_note="Paid account."
+                elif in_trial:trial_note="Free trial: "+str(days_left)+" day(s) remaining. Billing begins only after the trial."
+                else:trial_note="Trial ended. Pay to continue - the charge below reflects the real devices seen on this key."
+            send_json(self,{"billable_devices":n,"rate_per_device_gbp":0.50,"monthly_charge_gbp":round(n*0.50,2),
+                "trial_days_left":days_left,"trial_status":trial_note,
+                "note":"You are billed 50p for every unique device that uses this key. This count is the real number of distinct devices seen, not a figure you set. Send the key to 20 million devices and the bill is for 20 million devices."})
+        elif path=="/api/pulse":
+            auth=get_bearer(self)
+            if not auth:send_json(self,{"error":"api_key_required"},401);return
+            ki=get_key(auth)
+            if not ki:send_json(self,{"error":"invalid_api_key"},401);return
+            cutoff=time.time()-3600
+            with _db_lock:
+                counts=dict(_conn.execute("SELECT json_extract(result_json,'$.decision'),COUNT(*) FROM audit_log WHERE api_key=? AND ts>? GROUP BY 1",(auth,cutoff)).fetchall())
+                recent=_conn.execute("SELECT ts,event_json,result_json,audit_hash FROM audit_log WHERE api_key=? ORDER BY id DESC LIMIT 10",(auth,)).fetchall()
+                tip=_conn.execute("SELECT audit_hash FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()
+            events=[]
+            for ts_,ev,res,ah in recent:
+                try:
+                    e=json.loads(ev);r=json.loads(res)
+                    events.append({"ts":ts_,"action":e.get("action"),"decision":r.get("decision"),"score":r.get("score"),"reasons":r.get("reasons",[]),"sealed":ah[:16]})
+                except:pass
+            send_json(self,{
+                "last_hour":{"ALLOW":counts.get("ALLOW",0),"CHALLENGE":counts.get("CHALLENGE",0),"BLOCK":counts.get("BLOCK",0)},
+                "recent":events,
+                "chain_tip":(tip[0][:16] if tip else "GENESIS"),
+                "alerting":"BLOCK events email you in real time (max 1/hour)"})
+        elif path=="/api/visits":
+            send_json(self,{"visits":get_visits()})
+        elif path=="/api/health":
+            send_json(self,{"status":"ok","version":VERSION,"rps":get_rps()})
+        elif path=="/api/verify-chain":
+            send_json(self,verify_chain())
+        elif path.startswith("/x/"):
+            from modules import router as _r
+            p,s=_r.route(self,path,qs)
+            send_json(self,p,s)
+        elif path=="/api/anchor-status":
             try:
-                body, code = _commit(ctx, AUTO_KEY, {"period": period, "kind": kind})
-            except Exception as exc:
-                _note_auto(period, kind, "failed: " + str(exc)[:120])
-                continue
-            if code == 200 and not body.get("already_committed"):
-                _note_auto(period, kind, "committed %d leaves %s days after the period closed"
-                           % (body.get("leaf_count", 0), body.get("days_after_period_end")))
-            elif code != 200:
-                # A deployment with no subject column cannot do kind=subjects.
-                # That is a real limit of the deployment, recorded rather than
-                # retried every ten minutes.
-                _note_auto(period, kind, "skipped: " + str(body.get("message")
-                                                           or body.get("error"))[:120])
-
-
-def _note_auto(period, kind, outcome):
-    _auto_log.append({"at": _iso(time.time()), "period": period,
-                      "kind": kind, "outcome": outcome})
-    del _auto_log[:-40]
-    print("COMPLETE: auto %s/%s - %s" % (period, kind, outcome), flush=True)
-
-
-# ----------------------------------------------------------------------
-# proofs
-# ----------------------------------------------------------------------
-
-def _load(ctx, api_key, period, kind):
-    with ctx["lock"]:
-        if api_key:
-            row = ctx["conn"].execute(
-                "SELECT id,root,leaf_count,committed,audit_hash,block_index,period_start,period_end "
-                "FROM complete_commit WHERE api_key=? AND period=? AND kind=?",
-                (api_key, period, kind)).fetchone()
+                from anchor import anchor_status
+                st=anchor_status()
+            except Exception as e:
+                st={"status":"anchor module unavailable: "+str(e)}
+            st["chain_tip"]=chain_tip()
+            st["note"]="The chain tip is periodically timestamped against Bitcoin via OpenTimestamps - an external source we do not control. ots_ok true means the latest tip is committed to a public timestamp anyone can verify without trusting us."
+            send_json(self,st)
+        elif path=="/api/stats":
+            with _db_lock:
+                keys=_conn.execute("SELECT COUNT(*) FROM api_keys").fetchone()[0]
+                paid=_conn.execute("SELECT COUNT(*) FROM api_keys WHERE is_paid=1").fetchone()[0]
+                audits=_conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0]
+            send_json(self,{"api_keys":keys,"paid_keys":paid,"audit_blocks":audits,"rps":get_rps(),"version":VERSION})
+        elif path=="/api/validate-engine":
+            send_json(self,{"error":"method_not_allowed"},405)
+        elif path=="/api/badge/shield":
+            bid=qs.get("badge",[""])[0].strip().lower()
+            hit=lookup_badge(bid)
+            if hit:send_svg(self,shield_svg(hit[0],hit[1]))
+            else:send_svg(self,shield_svg("No account found",False))
+        elif path=="/api/badge/status":
+            with _db_lock:
+                blocks=_conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0]
+            send_svg(self,badge_svg("AILeash","LIVE "+str(blocks)+" blocks","#00875a"))
+        elif path=="/api/badge/decision":
+            ld=last_decision()
+            if ld and ld[0]:
+                dec,sc=ld
+                colours={"ALLOW":"#00875a","CHALLENGE":"#b45309","BLOCK":"#cc0000"}
+                send_svg(self,badge_svg("Live Decision",str(dec)+" "+str(round(sc or 0,2)),colours.get(dec,"#555")))
+            else:
+                send_svg(self,badge_svg("Live Decision","READY","#00875a"))
+        elif path=="/api/badge/chain":
+            with _db_lock:
+                blocks=_conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0]
+            send_svg(self,badge_svg("SHA-256",str(blocks)+" blocks","#0a0f1e"))
+        elif path=="/robots.txt":
+            send_text(self,"User-agent: *\nAllow: /\nSitemap: https://sebbi.pro/sitemap.xml\n")
+        elif path=="/sitemap.xml":
+            c=load_file("sitemap.xml")
+            if c:
+                body=c.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type","application/xml")
+                self.send_header("Content-Length",str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            else:send_json(self,{"error":"not found"},404)
         else:
-            row = ctx["conn"].execute(
-                "SELECT id,root,leaf_count,committed,audit_hash,block_index,period_start,period_end "
-                "FROM complete_commit WHERE period=? AND kind=? ORDER BY id ASC LIMIT 1",
-                (period, kind)).fetchone()
-        if not row:
-            return None, None
-        leaves = [r[0] for r in ctx["conn"].execute(
-            "SELECT leaf FROM complete_leaf WHERE commit_id=? ORDER BY idx ASC",
-            (row[0],)).fetchall()]
-    return row, leaves
+            send_html(self,page_404(),404)
 
+    def do_POST(self):
+        parsed=urlparse(self.path)
+        path=parsed.path.rstrip("/")
+        track_request()
+        maybe_prune()
+        if is_over() and path not in("/api/govern","/govern"):
+            n=int(self.headers.get("Content-Length",0) or 0)
+            if n:self.rfile.read(n)
+            send_json(self,{"error":"server_busy"},503);return
 
-def _tombstone_for(ctx, api_key, value):
-    with ctx["lock"]:
-        if api_key:
-            row = ctx["conn"].execute(
-                "SELECT erased,reason,audit_hash,block_index FROM complete_tomb "
-                "WHERE api_key=? AND leaf=? ORDER BY id ASC LIMIT 1",
-                (api_key, value)).fetchone()
+        if path=="/stripe-webhook":
+            length=int(self.headers.get("Content-Length",0) or 0)
+            raw=self.rfile.read(length) if length else b""
+            sig=self.headers.get("Stripe-Signature","")
+            if not verify_stripe_signature(raw,sig):
+                print("WEBHOOK REJECTED: bad or missing signature",flush=True)
+                send_json(self,{"error":"invalid_signature"},400);return
+            try:
+                event=json.loads(raw)
+                etype=event.get("type","")
+                obj=event.get("data",{}).get("object",{})
+                if etype in("checkout.session.completed","invoice.paid"):
+                    email=obj.get("customer_email") or obj.get("customer_details",{}).get("email","")
+                    sub_id=str(obj.get("subscription") or "")
+                    cust_id=str(obj.get("customer") or "")
+                    if email:
+                        email=email.strip().lower()
+                        with _db_lock:
+                            _conn.execute("UPDATE api_keys SET is_paid=1,plan_type='paid' WHERE email=?",(email,))
+                            if sub_id:_conn.execute("UPDATE api_keys SET stripe_sub=? WHERE email=? AND stripe_sub=''",(sub_id,email))
+                            if cust_id:_conn.execute("UPDATE api_keys SET stripe_customer=? WHERE email=? AND stripe_customer=''",(cust_id,email))
+                            _conn.commit()
+                        print("PAID:"+email+(" sub:"+sub_id[:14] if sub_id else ""),flush=True)
+                elif etype in("customer.subscription.deleted","invoice.payment_failed"):
+                    email=(obj.get("customer_email") or "").strip().lower()
+                    sub_id=str(obj.get("id") if etype=="customer.subscription.deleted" else obj.get("subscription") or "")
+                    with _db_lock:
+                        if email:
+                            _conn.execute("UPDATE api_keys SET is_paid=0,plan_type='free' WHERE email=?",(email,))
+                        elif sub_id:
+                            _conn.execute("UPDATE api_keys SET is_paid=0,plan_type='free' WHERE stripe_sub=?",(sub_id,))
+                        _conn.commit()
+                    print("UNPAID:"+(email or sub_id),flush=True)
+                send_json(self,{"ok":True})
+            except Exception as e:print("Webhook:"+str(e),flush=True);send_json(self,{"ok":True})
+            return
+
+        data=read_body(self)
+
+        if path=="/api/signal-pack/create":
+            api_key=get_bearer(self)
+            if not api_key:send_json(self,{"error":"api_key_required"},401);return
+            ki=get_key(api_key)
+            if not ki:send_json(self,{"error":"invalid_api_key"},401);return
+            pack,err=create_signal_pack(api_key,data.get("name",""),data.get("signals",{}))
+            if err:send_json(self,{"error":err},400);return
+            send_json(self,{"ok":True,"pack":pack,"note":"This pack definition is now sealed in the audit chain. Every decision that uses it records which pack and version governed it - provenance on your risk assumptions."})
+            return
+        elif path=="/api/signal-pack/list":
+            api_key=get_bearer(self)
+            if not api_key:send_json(self,{"error":"api_key_required"},401);return
+            ki=get_key(api_key)
+            if not ki:send_json(self,{"error":"invalid_api_key"},401);return
+            send_json(self,{"packs":list_signal_packs(api_key)})
+            return
+        elif path=="/api/signal-pack/publish":
+            api_key=get_bearer(self)
+            if not api_key:send_json(self,{"error":"api_key_required"},401);return
+            ki=get_key(api_key)
+            if not ki:send_json(self,{"error":"invalid_api_key"},401);return
+            res,err=publish_signal_pack(api_key,str(data.get("name","")),data.get("author",""))
+            if err:send_json(self,{"error":err},400);return
+            send_json(self,{"ok":True,"published":res,"note":"Your pack is now in the public library, marked community-contributed and unverified. Others can load it as a starting point. You can unpublish any time."})
+            return
+        elif path=="/api/signal-pack/unpublish":
+            api_key=get_bearer(self)
+            if not api_key:send_json(self,{"error":"api_key_required"},401);return
+            unpublish_signal_pack(api_key,str(data.get("name","")))
+            send_json(self,{"ok":True})
+            return
+        elif path=="/api/signal-pack/library":
+            send_json(self,{"library":public_library(),"note":"Community-contributed templates. Unverified. Validate any pack against your own risk assessment before relying on it."})
+            return
+        elif path=="/api/signal-pack/get":
+            api_key=get_bearer(self)
+            if not api_key:send_json(self,{"error":"api_key_required"},401);return
+            ki=get_key(api_key)
+            if not ki:send_json(self,{"error":"invalid_api_key"},401);return
+            pk=get_signal_pack(api_key,str(data.get("name","")),data.get("version"))
+            if not pk:send_json(self,{"error":"pack_not_found"},404);return
+            send_json(self,{"pack":pk})
+            return
+        if path in("/api/govern","/govern"):
+            api_key=get_bearer(self)
+            if not api_key:
+                send_json(self,{"error":"api_key_required","message":"Get a free key at "+HOST+"/#signup"},401);return
+            try:
+                result,status=govern(data,api_key)
+                send_json(self,result,status)
+            except ValueError as e:send_json(self,{"error":str(e)},400)
+            except Exception as e:
+                print("GOVERN ERR:"+repr(e),flush=True)
+                send_json(self,{"error":"internal"},500)
+        elif path=="/api/authority/issue":
+            api_key=get_bearer(self)
+            ki=get_key(api_key) if api_key else None
+            if not ki:send_json(self,{"error":"api_key_required"},401);return
+            uid=str(data.get("user_id","")).strip()
+            role=str(data.get("role","approver")).strip()[:60]
+            max_amount=float(data.get("max_amount",0) or 0)
+            ttl=int(data.get("ttl_hours",24) or 24)*3600
+            if not uid:send_json(self,{"error":"user_id required"},400);return
+            tok=make_authority_token(uid,role,max_amount,ttl)
+            ts=time.time()
+            ev={"user_id":uid,"action":"authority_granted","amount":max_amount,"country":"UK","device_id":"authority_issuer","anomaly":0,"device_risk":0,"role":role,"ttl_hours":ttl//3600}
+            res={"decision":"NOTARISED","score":0,"version":VERSION,"timestamp":ts,"note":"delegated authority issued and sealed; token itself never stored"}
+            h,idx,_=seal(ev,res,ts,api_key)
+            send_json(self,{"authority_token":tok,"role":role,"max_amount":max_amount,"expires_in_hours":ttl//3600,"seal":h,"block_index":idx,
+                "usage":"include as authority_token in govern events for this user_id"})
+        elif path=="/api/identity/kyc-seal":
+            api_key=get_bearer(self)
+            ki=get_key(api_key) if api_key else None
+            if not ki:send_json(self,{"error":"api_key_required"},401);return
+            uid=str(data.get("user_id","")).strip()
+            provider=str(data.get("provider","")).strip()[:60]
+            verified=bool(data.get("verified"))
+            reference=str(data.get("reference","")).strip()
+            if not uid or not provider or not reference:
+                send_json(self,{"error":"user_id, provider and reference required"},400);return
+            ref_fp=hashlib.sha256(reference.encode()).hexdigest()
+            ts=time.time()
+            ev={"user_id":uid,"action":"kyc_result_sealed","amount":0,"country":str(data.get("country","UK")).upper()[:2],"device_id":"kyc_"+ref_fp[:12],"anomaly":0,"device_risk":0,"provider":provider,"reference_fp":ref_fp,"verified":verified}
+            res={"decision":"NOTARISED","score":0,"version":VERSION,"timestamp":ts,"note":"KYC outcome sealed; only the SHA-256 of the provider reference is stored - never the document or raw reference"}
+            h,idx,_=seal(ev,res,ts,api_key)
+            send_json(self,{"sealed":True,"verified":verified,"provider":provider,"reference_fp":ref_fp,"seal":h,"block_index":idx,"sealed_at":ts})
+        elif path in("/signup","/api/keys"):
+            email=str(data.get("email","")).strip().lower()
+            phone=str(data.get("phone","")).strip()
+            name=str(data.get("name","")).strip()
+            org=str(data.get("org","")).strip()
+            org_type=str(data.get("org_type","")).strip()
+            product=str(data.get("product","aileash")).strip().lower()
+            devices=to_int(data.get("devices",1))
+            ref_code_used=str(data.get("ref_code","")).strip().upper()
+            if product not in("aileash","sonicboom","sentinel","guardian","tokensaver"):product="aileash"
+            guide_product=product
+            if product=="guardian":product="aileash"
+            key,err=create_key(email,phone,name,org,org_type,product,devices)
+            if err:
+                msgs={"invalid_email":"Please enter a valid email address.","email_exists":"A key already exists for this email."}
+                send_json(self,{"error":msgs.get(err,err)},400);return
+            monthly=round(devices*0.50,2)
+            if ref_code_used:
+                threading.Thread(target=credit_referral,args=(ref_code_used,devices),daemon=True).start()
+            new_ref_code=create_referral(key,email,name)
+            threading.Thread(target=send_referral_welcome,args=(name,email,key,new_ref_code,product,monthly),daemon=True).start()
+            threading.Thread(target=send_install_guide,args=(name,email,key,guide_product),daemon=True).start()
+            signup_msg="Free for "+str(TRIAL_DAYS)+" days - full engine, no card. After the trial: 50p per unique device per month via Stripe, metered on real usage. Your installation guide is on its way to your inbox."
+            bid=badge_id_for_key(key)
+            send_json(self,{"api_key":key,"email":email,"product":product,"devices":devices,"monthly":monthly,"trial_days":TRIAL_DAYS,"ref_code":new_ref_code,"badge_id":bid,"badge_url":HOST+"/api/badge/shield?badge="+bid,"endpoint":HOST+"/api/govern","message":signup_msg})
+        elif path.startswith("/x/"):
+            from modules import router as _r
+            p,s=_r.route(self,path,data)
+            send_json(self,p,s)
+        elif path=="/contact":
+            name=str(data.get("name","")).strip()
+            email=str(data.get("email","")).strip().lower()
+            phone=str(data.get("phone","")).strip()
+            org=str(data.get("org","")).strip()
+            msg=str(data.get("message","")).strip()
+            if not email or "@" not in email:send_json(self,{"error":"invalid_email"},400);return
+            if not msg:send_json(self,{"error":"no_message"},400);return
+            with _db_lock:
+                _conn.execute("INSERT INTO contact_log(ts,name,email,phone,org,message) VALUES(?,?,?,?,?,?)",(time.time(),name,email,phone,org,msg))
+                _conn.commit()
+            threading.Thread(target=contact_email,args=(name,email,phone,org,msg),daemon=True).start()
+            send_json(self,{"ok":True})
+        elif path=="/create-checkout":
+            email=str(data.get("email","")).strip().lower()
+            product=str(data.get("product","aileash")).strip().lower()
+            devices=to_int(data.get("devices",1))
+            if not email or "@" not in email:send_json(self,{"error":"invalid_email"},400);return
+            if not STRIPE_SECRET:send_json(self,{"error":"stripe_not_configured"},503);return
+            pid=get_stripe_price(product)
+            if not pid:setup_stripe();pid=get_stripe_price(product)
+            if not pid:send_json(self,{"error":"stripe_setup_failed"},503);return
+            session=stripe_call("POST","/checkout/sessions",{
+                "mode":"subscription",
+                "customer_email":email,
+                "success_url":HOST+"/?success=true",
+                "cancel_url":HOST+"/?cancel=true",
+                "line_items[0][price]":pid,
+                "line_items[0][quantity]":str(devices)
+            })
+            if not session or "url" not in session:send_json(self,{"error":"checkout_failed"},500);return
+            send_json(self,{"checkout_url":session["url"]})
+        elif path=="/api/validate-engine":
+            api_key=get_bearer(self)
+            if not api_key:send_json(self,{"valid":False,"error":"no_key"},401);return
+            ki=get_key(api_key)
+            if not ki:send_json(self,{"valid":False,"error":"invalid_api_key"},401);return
+            email,used,active,is_paid,quota,plan,product,created=ki
+            if not active:send_json(self,{"valid":False,"error":"account_inactive"},403);return
+            in_trial,days_left=trial_state(created,is_paid)
+            if not in_trial:
+                send_json(self,{"valid":False,"error":"trial_expired",
+                    "message":"Your "+str(TRIAL_DAYS)+"-day free trial has ended. Pay to continue exactly where you left off.",
+                    "billable_devices":device_count(api_key),
+                    "checkout_url":trial_checkout(api_key,email,product)},402);return
+            with _db_lock:devices=_conn.execute("SELECT devices FROM api_keys WHERE key=?",(api_key,)).fetchone()
+            send_json(self,{"valid":True,"plan":plan,"product":product,"devices":devices[0] if devices else 1,"email":email,"trial_days_left":days_left})
+        elif path=="/api/payment/seal":
+            fp=str(data.get("fingerprint","")).strip().lower()
+            if len(fp)!=64 or not all(c in "0123456789abcdef" for c in fp):
+                send_json(self,{"sealed":False,"error":"valid sha-256 fingerprint required"},400);return
+            with _db_lock:
+                dup=_conn.execute("SELECT ts,seal,block_index FROM payment_registry WHERE fp=?",(fp,)).fetchone()
+            if dup:
+                send_json(self,{"sealed":True,"seal":dup[1],"block_index":dup[2],"sealed_at":dup[0],"code":fp[:12],"already_registered":True});return
+            p=data.get("display",{})
+            display=""
+            if isinstance(p,dict):
+                safe={k:str(p.get(k,""))[:120] for k in ("business","sort_masked","account_masked") if p.get(k)}
+                display=json.dumps(safe)
+            ts=time.time()
+            ev={"user_id":"payment_notary","action":"payment_details_sealed","amount":0,"country":"UK","device_id":"paynotary_"+fp[:12],"anomaly":0,"device_risk":0,"payment_fp":fp}
+            res={"decision":"NOTARISED","score":0,"version":VERSION,"timestamp":ts,"note":"payment details fingerprint sealed; full details never stored - only masked display fields"}
+            h,idx,_=seal(ev,res,ts)
+            with _db_lock:
+                _conn.execute("INSERT OR IGNORE INTO payment_registry(fp,ts,seal,block_index,display_json) VALUES(?,?,?,?,?)",(fp,ts,h,idx,display))
+                _conn.commit()
+            send_json(self,{"sealed":True,"seal":h,"block_index":idx,"sealed_at":ts,"code":fp[:12]})
+        elif path=="/api/identity/seal":
+            fp=str(data.get("fingerprint","")).strip().lower()
+            if len(fp)!=64 or not all(c in "0123456789abcdef" for c in fp):
+                send_json(self,{"sealed":False,"error":"valid sha-256 fingerprint required"},400);return
+            with _db_lock:
+                dup=_conn.execute("SELECT ts,seal,block_index FROM identity_registry WHERE fp=?",(fp,)).fetchone()
+            if dup:
+                send_json(self,{"sealed":True,"seal":dup[1],"block_index":dup[2],"sealed_at":dup[0],"already_registered":True});return
+            is_public=1 if data.get("public") else 0
+            profile=""
+            if is_public:
+                p=data.get("profile",{})
+                if isinstance(p,dict):
+                    safe={k:str(p.get(k,""))[:300] for k in ("name","title","bio","linkedin","facebook","org") if p.get(k)}
+                    profile=json.dumps(safe)
+            ts=time.time()
+            ev={"user_id":"identity_notary","action":"identity_sealed","amount":0,"country":"UK","device_id":"identity_"+fp[:12],"anomaly":0,"device_risk":0,"identity_fp":fp}
+            res={"decision":"NOTARISED","score":0,"version":VERSION,"timestamp":ts,"note":"identity fingerprint sealed; raw identity stored only if user opted to publish"}
+            h,idx,_=seal(ev,res,ts)
+            with _db_lock:
+                _conn.execute("INSERT OR IGNORE INTO identity_registry(fp,ts,seal,block_index,public,profile_json) VALUES(?,?,?,?,?,?)",(fp,ts,h,idx,is_public,profile))
+                _conn.commit()
+            send_json(self,{"sealed":True,"seal":h,"block_index":idx,"sealed_at":ts,"code":fp[:12]})
+        elif path=="/api/post/seal":
+            fp=str(data.get("fingerprint","")).strip().lower()
+            if len(fp)!=64 or not all(c in "0123456789abcdef" for c in fp):
+                send_json(self,{"sealed":False,"error":"valid sha-256 fingerprint required"},400);return
+            with _db_lock:
+                dup=_conn.execute("SELECT ts,seal,block_index FROM post_registry WHERE fp=?",(fp,)).fetchone()
+            if dup:
+                send_json(self,{"sealed":True,"seal":dup[1],"block_index":dup[2],"sealed_at":dup[0],"code":fp[:12],"already_registered":True});return
+            ts=time.time()
+            ev={"user_id":"post_notary","action":"post_sealed","amount":0,"country":"UK","device_id":"post_"+fp[:12],"anomaly":0,"device_risk":0,"post_fp":fp}
+            res={"decision":"NOTARISED","score":0,"version":VERSION,"timestamp":ts,"note":"post content fingerprint sealed; content itself never stored"}
+            h,idx,_=seal(ev,res,ts)
+            with _db_lock:
+                _conn.execute("INSERT OR IGNORE INTO post_registry(fp,ts,seal,block_index) VALUES(?,?,?,?)",(fp,ts,h,idx))
+                _conn.commit()
+            send_json(self,{"sealed":True,"seal":h,"block_index":idx,"sealed_at":ts,"code":fp[:12]})
+        elif path=="/report-threat":
+            ref="AIDX-"+hashlib.sha256(json.dumps(data,sort_keys=True).encode()).hexdigest()[:12].upper()
+            with _db_lock:
+                _conn.execute("INSERT INTO threat_log(ts,ref,data_json) VALUES(?,?,?)",(time.time(),ref,json.dumps(data)))
+                _conn.commit()
+            html="<html><body style='font-family:Arial,sans-serif;padding:20px'><h2 style='color:#cc0000'>THREAT REPORT: "+ref+"</h2><pre style='background:#f5f5f5;padding:16px;border-radius:4px'>"+esc(json.dumps(data,indent=2))+"</pre></body></html>"
+            threading.Thread(target=send_email,args=(OWNER_EMAIL,OWNER_NAME,"THREAT REPORT: "+ref,html),daemon=True).start()
+            send_json(self,{"ok":True,"reference":ref})
+        elif path=="/waitlist":
+            email=str(data.get("email","")).strip().lower()
+            product=str(data.get("product","")).strip()
+            name=str(data.get("name","")).strip()
+            if not email or "@" not in email:send_json(self,{"error":"invalid_email"},400);return
+            with _db_lock:
+                _conn.execute("INSERT INTO waitlist(ts,email,product,name) VALUES(?,?,?,?)",(time.time(),email,product,name))
+                _conn.commit()
+            send_json(self,{"ok":True,"message":"You are on the waitlist. We will be in touch."})
+        elif path=="/api/guardian/pair":
+            email=str(data.get("parent_email","")).strip().lower()[:120]
+            if not email or "@" not in email:send_json(self,{"error":"parent_email required"},400);return
+            nm=str(data.get("child_name","")).strip()[:40]
+            if not nm:send_json(self,{"error":"child_name required"},400);return
+            with _db_lock:
+                n=_conn.execute("SELECT COUNT(*) FROM guardian_family WHERE parent_key=?",(email,)).fetchone()[0]
+            if n>=10:send_json(self,{"error":"max 10 children per account"},400);return
+            pc=gen_pair_code(nm)
+            with _db_lock:
+                _conn.execute("INSERT INTO guardian_family(pair_code,parent_key,child_name,created,last_checkin) VALUES(?,?,?,?,0)",(pc,email,nm,now()))
+                _conn.commit()
+            send_json(self,{"ok":True,"pair_code":pc,"child_name":nm,
+                "child_url":HOST+"/guardian-child?code="+pc,
+                "note":"Open the child link on the child's phone and add it to their home screen. Everything the child shares or flags will appear in your report, sealed and provable."})
+        elif path=="/api/guardian/checkin":
+            pc=str(data.get("code","")).strip()
+            with _db_lock:
+                fam=_conn.execute("SELECT child_name FROM guardian_family WHERE pair_code=?",(pc,)).fetchone()
+            if not fam:send_json(self,{"error":"unknown_code"},404);return
+            lat=data.get("lat");lon=data.get("lon")
+            try:lat=float(lat) if lat is not None else None
+            except:lat=None
+            try:lon=float(lon) if lon is not None else None
+            except:lon=None
+            h=guardian_seal(pc,"checkin",lat,lon,"",None)
+            send_json(self,{"ok":True,"sealed":h[:16]})
+        elif path=="/api/guardian/panic":
+            pc=str(data.get("code","")).strip()
+            with _db_lock:
+                fam=_conn.execute("SELECT parent_key,child_name FROM guardian_family WHERE pair_code=?",(pc,)).fetchone()
+            if not fam:send_json(self,{"error":"unknown_code"},404);return
+            lat=data.get("lat");lon=data.get("lon")
+            try:lat=float(lat) if lat is not None else None
+            except:lat=None
+            try:lon=float(lon) if lon is not None else None
+            except:lon=None
+            h=guardian_seal(pc,"panic",lat,lon,"child requested help",None)
+            pk=get_key(fam[0])
+            if pk:
+                try:send_email(pk[0],pk[2] if len(pk)>2 else "",
+                    "GUARDIAN ALERT: "+fam[1]+" tapped Help",
+                    "<p><b>"+esc(fam[1])+"</b> tapped the Help button in Guardian at "+time.strftime("%H:%M on %d %b")+".</p>"+
+                    ("<p>Location shared: <a href='https://maps.google.com/?q="+str(lat)+","+str(lon)+"'>view on map</a></p>" if lat and lon else "<p>No location was shared.</p>")+
+                    "<p>This event is sealed in the audit chain ("+h[:16]+").</p><p>Check on them now. In an emergency call 999.</p>")
+                except Exception as e:print("GUARDIAN EMAIL ERR:"+str(e),flush=True)
+            send_json(self,{"ok":True,"sealed":h[:16],"help":{"childline":"0800 1111","emergency":"999","ceop":"https://www.ceop.police.uk/safety-centre/"}})
+        elif path=="/api/guardian/flag":
+            pc=str(data.get("code","")).strip()
+            msg=str(data.get("message",""))[:2000]
+            with _db_lock:
+                fam=_conn.execute("SELECT parent_key,child_name FROM guardian_family WHERE pair_code=?",(pc,)).fetchone()
+            if not fam:send_json(self,{"error":"unknown_code"},404);return
+            verdict=guardian_check(msg)
+            fp=hashlib.sha256(msg.encode()).hexdigest()[:16] if msg else None
+            note=verdict["result"]+((":"+",".join(verdict["categories"])) if verdict.get("categories") else "")
+            h=guardian_seal(pc,"flag",None,None,note,fp)
+            if verdict["result"]=="FLAGGED":
+                pk=get_key(fam[0])
+                if pk:
+                    try:send_email(pk[0],pk[2] if len(pk)>2 else "",
+                        "Guardian flagged a message for "+fam[1],
+                        "<p>Guardian flagged a message "+esc(fam[1])+" checked, matching: <b>"+esc(", ".join(verdict["categories"]))+"</b>.</p>"+
+                        "<p>The message text is not stored - only a fingerprint. Talk to your child. CEOP and Childline can help.</p>"+
+                        "<p>Sealed in the audit chain ("+h[:16]+").</p>")
+                    except Exception as e:print("GUARDIAN EMAIL ERR:"+str(e),flush=True)
+            send_json(self,{"result":verdict["result"],"categories":verdict.get("categories",[]),"advice":verdict["advice"],"sealed":h[:16],
+                "help":{"childline":"0800 1111","emergency":"999","ceop":"https://www.ceop.police.uk/safety-centre/"}})
+        elif path=="/api/challenge/resolve":
+            tok=str(data.get("token","")).strip()
+            p,err=read_challenge_token(tok)
+            if not p:send_json(self,{"resolved":False,"error":err or "invalid_token"},400);return
+            prior=challenge_resolved(p)
+            if prior:send_json(self,{"resolved":True,"sealed":prior[0],"note":"already resolved"});return
+            uid=challenge_marker(p)
+            ev={"user_id":uid,"action":"challenge_resolved","amount":0,"country":"UK","device_id":"hosted_verify","anomaly":0,"device_risk":0,"original_user":p["u"],"original_block":p["h"]}
+            res={"decision":"ALLOW","score":0,"reasons":["human_verified"],"version":VERSION,"timestamp":time.time()}
+            h2,_,_=seal(ev,res,res["timestamp"])
+            st=load_user(p["u"])
+            save_user(p["u"],clamp(st["trust"]+(1-st["trust"])*0.05,0.05,1.0),st["last_country"])
+            send_json(self,{"resolved":True,"sealed":h2})
+        elif path=="/admin/auth":
+            if not ADMIN_PASSWORD:
+                send_json(self,{"error":"admin_disabled"},503);return
+            if not admin_login_allowed():
+                send_json(self,{"error":"too_many_attempts"},429);return
+            pw=str(data.get("password","")).strip()
+            if pw and hmac.compare_digest(pw,ADMIN_PASSWORD):
+                tok=secrets.token_hex(32)
+                with _admin_lock:_admin_tokens[tok]=time.time()+ADMIN_TOKEN_TTL
+                send_json(self,{"token":tok,"expires_in":ADMIN_TOKEN_TTL})
+            else:
+                admin_login_failed()
+                send_json(self,{"error":"invalid_password"},401)
+        elif path=="/api/generate-airgap-token":
+            auth=get_bearer(self)
+            ki=get_key(auth) if auth else None
+            if not ki:send_json(self,{"error":"invalid_api_key"},401);return
+            email,used,active,is_paid,quota,plan,product,created=ki
+            if not is_paid:send_json(self,{"error":"paid_plan_required"},403);return
+            with _db_lock:
+                devices=_conn.execute("SELECT devices FROM api_keys WHERE key=?",(auth,)).fetchone()
+            secret=os.environ.get("LICENCE_SECRET","").encode()
+            if not secret:send_json(self,{"error":"licence_secret_not_configured"},503);return
+            issued=int(time.time())
+            expires=issued+(365*86400)
+            payload=json.dumps({"v":"1","key":auth,"devices":devices[0] if devices else 1,"plan":plan,"email":email,"issued":issued,"expires":expires},sort_keys=True,separators=(',',':'))
+            sig=hmac.new(secret,payload.encode(),hashlib.sha256).hexdigest()
+            token_data=json.dumps({"payload":payload,"sig":sig},separators=(',',':'))
+            token=base64.urlsafe_b64encode(token_data.encode()).decode()
+            send_json(self,{"token":token,"expires":expires,"days":365})
+        elif path=="/admin/forgot":
+            email=str(data.get("email","")).strip().lower()
+            if email==OWNER_EMAIL.lower():
+                html=("<html><body style='font-family:Arial,sans-serif;padding:20px'>"
+                    "<h2 style='color:#c9a84c'>AILeash Admin Password Reset</h2>"
+                    "<p>Your admin password is set via the ADMIN_PASSWORD environment variable on Railway.</p>"
+                    "<p>To reset: Railway dashboard &rarr; Variables &rarr; update ADMIN_PASSWORD.</p>"
+                    "</body></html>")
+                threading.Thread(target=send_email,args=(OWNER_EMAIL,OWNER_NAME,"AILeash Admin Password Reset",html),daemon=True).start()
+            send_json(self,{"ok":True})
+        elif path=="/admin/stats":
+            if not check_admin(self):send_json(self,{"error":"unauthorized"},401);return
+            with _db_lock:
+                total=_conn.execute("SELECT COUNT(*) FROM api_keys").fetchone()[0]
+                paid=_conn.execute("SELECT COUNT(*) FROM api_keys WHERE is_paid=1").fetchone()[0]
+                blocks=_conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0]
+            chain=verify_chain()
+            send_json(self,{"total_keys":total,"paid_keys":paid,"audit_blocks":blocks,"chain_valid":chain["valid"]})
+        elif path=="/admin/keys":
+            if not check_admin(self):send_json(self,{"error":"unauthorized"},401);return
+            want=["key","email","name","org","product","devices","actions_used","free_quota","is_paid","plan_type","created"]
+            with _db_lock:
+                have=set(row[1] for row in _conn.execute("PRAGMA table_info(api_keys)").fetchall())
+                cols=[c for c in want if c in have]
+                rows=_conn.execute("SELECT "+",".join(cols)+" FROM api_keys ORDER BY created DESC").fetchall()
+            keys=[dict(zip(cols,r)) for r in rows]
+            send_json(self,{"keys":keys})
+        elif path=="/admin/referrals":
+            if not check_admin(self):send_json(self,{"error":"unauthorized"},401);return
+            with _db_lock:
+                rows=_conn.execute("SELECT code,referrer_email,referrer_name,devices_referred,earnings_pence,created FROM referrals ORDER BY created DESC").fetchall()
+            refs=[{"code":r[0],"referrer_email":r[1],"referrer_name":r[2],"devices_referred":r[3],"earnings_pence":r[4],"created":r[5]} for r in rows]
+            send_json(self,{"referrals":refs})
+        elif path=="/admin/audit":
+            if not check_admin(self):send_json(self,{"error":"unauthorized"},401);return
+            limit=int(data.get("limit",200)) if isinstance(data,dict) else 200
+            if limit>1000:limit=1000
+            filt_key=str(data.get("api_key","")).strip() if isinstance(data,dict) else ""
+            with _db_lock:
+                cols=set(r[1] for r in _conn.execute("PRAGMA table_info(audit_log)").fetchall())
+                has_key="api_key" in cols
+                if filt_key and has_key:
+                    rows=_conn.execute("SELECT id,ts,user_id,event_json,result_json,prev_hash,audit_hash FROM audit_log WHERE api_key=? ORDER BY id DESC LIMIT ?",(filt_key,limit)).fetchall()
+                else:
+                    rows=_conn.execute("SELECT id,ts,user_id,event_json,result_json,prev_hash,audit_hash FROM audit_log ORDER BY id DESC LIMIT ?",(limit,)).fetchall()
+            recs=[]
+            for r in rows:
+                try:res=json.loads(r[4]) if r[4] else {}
+                except:res={}
+                recs.append({"seq":r[0],"ts":r[1],"user_id":r[2],
+                    "decision":res.get("decision",res.get("result","")),
+                    "score":res.get("score",""),
+                    "reasons":res.get("reasons",[]),
+                    "prev_hash":r[5],"audit_hash":r[6]})
+            chain=verify_chain()
+            send_json(self,{"records":recs,"count":len(recs),"chain_valid":chain.get("valid"),"chain_blocks":chain.get("blocks"),"chain_tip":chain.get("tip")})
+        elif path=="/admin/contacts":
+            if not check_admin(self):send_json(self,{"error":"unauthorized"},401);return
+            with _db_lock:
+                rows=_conn.execute("SELECT ts,name,email,phone,org,message FROM contact_log ORDER BY ts DESC").fetchall()
+            contacts=[{"ts":r[0],"name":r[1],"email":r[2],"phone":r[3],"org":r[4],"message":r[5]} for r in rows]
+            send_json(self,{"contacts":contacts})
         else:
-            row = ctx["conn"].execute(
-                "SELECT erased,reason,audit_hash,block_index FROM complete_tomb "
-                "WHERE leaf=? ORDER BY id ASC LIMIT 1", (value,)).fetchone()
-    if not row:
-        return None
-    return {"erased_at": _iso(row[0]), "reason": row[1],
-            "sealed_in_chain": row[2], "block_index": row[3],
-            "note": "The payload is gone. This proves it existed and that it was erased, "
-                    "without holding any of it."}
+            send_json(self,{"error":"not_found"},404)
 
+# ============================================================
+# STRIPE QUANTITY SYNC - keeps billing matched to real devices
+# Every 6 hours: for each paid key, compare live unique device
+# count to the Stripe subscription quantity. If devices grew,
+# raise the quantity so billing follows the meter. Never lowers
+# quantity automatically - lower it manually in Stripe if a
+# client genuinely shrinks.
+# ============================================================
+SYNC_INTERVAL=6*3600
 
-def _prove(ctx, api_key, data):
-    period = str(data.get("period", "")).strip()
-    kind = str(data.get("kind", "receipts")).strip().lower()
-    value = str(data.get("value", "")).strip()
-    if not period or not value:
-        return {"error": "period_and_value_required",
-                "message": "Both are required. Committed periods are listed at "
-                           "/x/complete/periods; value is any key you want proved "
-                           "present or absent.",
-                "example": "/x/complete/prove?period=2026-07&value=<key>"}, 400
-
-    row, leaves = _load(ctx, api_key, period, kind)
-    if not row:
-        return {"error": "not_committed", "period": period, "kind": kind,
-                "message": "No sealed commitment for that period. Nothing can be proved "
-                           "either way until the period is closed and committed."}, 404
-
-    _cid, root, count, committed, chain_hash, block_index, start, end = row
-    _r, levels = _build(leaves)
-
-    base = {"period": period, "kind": kind, "value": value, "root": root,
-            "leaf_count": count, "committed_at": _iso(committed),
-            "period_start": _iso(start), "period_end": _iso(end),
-            "sealed_in_chain": chain_hash, "block_index": block_index,
-            "complete_version": VERSION,
-            "verify": "/x/complete/verify, or reimplement it - the rules are at /x/complete/spec"}
-
-    # Present?
-    try:
-        index = leaves.index(value)
-    except ValueError:
-        index = None
-
-    if index is not None:
-        base.update({
-            "result": "present",
-            "index": index,
-            "proof": _path(levels, index),
-            "what_this_proves": "This exact record is inside the sealed set for the period. "
-                                "It cannot have been added afterwards.",
-        })
-        tomb = _tombstone_for(ctx, api_key, value)
-        if tomb:
-            base["erased"] = tomb
-        return base, 200
-
-    # Absent - find the neighbours it sorts between.
-    lower_index = None
-    upper_index = None
-    for i, leaf in enumerate(leaves):
-        if leaf < value:
-            lower_index = i
-        else:
-            upper_index = i
-            break
-
-    neighbours = {}
-    if lower_index is not None:
-        neighbours["lower"] = {"index": lower_index, "value": leaves[lower_index],
-                               "proof": _path(levels, lower_index)}
-    if upper_index is not None:
-        neighbours["upper"] = {"index": upper_index, "value": leaves[upper_index],
-                               "proof": _path(levels, upper_index)}
-
-    if not leaves:
-        adjacency = "The period is committed and empty. Nothing was sealed in it at all."
-    elif lower_index is None:
-        adjacency = ("The value sorts before every leaf in the set. The first leaf is proved, "
-                     "and nothing precedes index 0.")
-    elif upper_index is None:
-        adjacency = ("The value sorts after every leaf in the set. The last leaf is proved, "
-                     "and nothing follows the final index.")
-    else:
-        adjacency = ("The two proved leaves are adjacent - indices %d and %d, consecutive. "
-                     "Nothing can exist between two adjacent leaves of a sorted tree, so no "
-                     "record for this value exists in the period."
-                     % (lower_index, upper_index))
-
-    base.update({
-        "result": "absent",
-        "neighbours": neighbours,
-        "adjacency": adjacency,
-        "what_this_proves": "No record for this value was sealed in this period. Not that we "
-                            "declined to look - that it is not there, against a root fixed "
-                            "before you asked.",
-        "scope": "This period only. /x/complete/periods lists every committed period.",
-    })
-    tomb = _tombstone_for(ctx, api_key, value)
-    if tomb:
-        base["erased"] = tomb
-        base["note"] = ("Absent from this period AND carrying an erasure record. That is the "
-                        "expected shape after a valid erasure request.")
-    return base, 200
-
-
-def _verify(ctx, api_key, data):
-    """Check a proof we handed out. Convenience only - a verifier who
-    trusts us to check our own proof has not verified anything. The spec
-    route exists so this can be done independently."""
-    value = str(data.get("value", "")).strip()
-    root = str(data.get("root", "")).strip().lower()
-    proof = data.get("proof")
-    if not value or not HEX64.match(root) or not isinstance(proof, list):
-        return {"error": "value_root_and_proof_required"}, 400
-    try:
-        computed = _replay(value, proof)
-    except Exception as exc:
-        return {"error": "bad_proof", "message": str(exc)[:200]}, 400
-    return {"valid": computed == root, "computed_root": computed, "given_root": root,
-            "note": "Recomputed from the leaf upward. If these match, the leaf was in the tree "
-                    "when the root was sealed."}, 200
-
-
-# ----------------------------------------------------------------------
-# erasure
-# ----------------------------------------------------------------------
-
-def _erase(ctx, api_key, data):
-    value = str(data.get("value", "")).strip()
-    reason = str(data.get("reason", "erasure request")).strip()[:200]
-    if not value:
-        return {"error": "value_required",
-                "message": "The leaf being tombstoned - a receipt hash or a subject key."}, 400
-
-    now = time.time()
-    ev = {"user_id": "era:" + value[:32], "action": "erasure_recorded", "amount": 0,
-          "country": "UK", "device_id": "complete", "anomaly": 0, "device_risk": 0}
-    res = {"decision": "ERASURE_SEALED", "score": 0, "complete_version": VERSION,
-           "leaf": value, "reason": reason,
-           "detail": "leaf=%s;reason=%s" % (value, reason)}
-    audit_hash, block_index, seq = ctx["seal"](ev, res, now, api_key)
-
-    with ctx["lock"]:
-        ctx["conn"].execute("INSERT INTO complete_tomb(api_key,leaf,reason,erased,audit_hash,"
-                            "block_index) VALUES(?,?,?,?,?,?)",
-                            (api_key, value, reason, now, audit_hash, block_index))
-        ctx["conn"].commit()
-
-    return {"leaf": value, "erased_at": _iso(now), "reason": reason,
-            "sealed_in_chain": audit_hash, "block_index": block_index, "receipt_seq": seq,
-            "what_this_does": "Records the erasure as a sealed event. It does not delete the "
-                              "payload - your own system does that. This is the receipt that "
-                              "proves you did.",
-            "what_the_subject_gets": "Proof their record existed, proof it was erased, and the "
-                                     "time it happened - none of which requires anyone to still "
-                                     "hold the data.",
-            "note": "Earlier committed roots still contain the leaf. That is correct and not a "
-                    "leak: a leaf is key material, not content, and a root that changed after "
-                    "the fact would prove nothing about anything."}, 200
-
-
-# ----------------------------------------------------------------------
-# read-only
-# ----------------------------------------------------------------------
-
-def _periods(ctx, api_key):
-    with ctx["lock"]:
-        if api_key:
-            rows = ctx["conn"].execute(
-                "SELECT period,kind,root,leaf_count,committed,block_index,period_end,api_key "
-                "FROM complete_commit WHERE api_key=? ORDER BY period_start DESC",
-                (api_key,)).fetchall()
-        else:
-            rows = ctx["conn"].execute(
-                "SELECT period,kind,root,leaf_count,committed,block_index,period_end,api_key "
-                "FROM complete_commit ORDER BY period_start DESC").fetchall()
-
-    out = []
-    for r in rows:
-        late = None
+def sync_stripe_quantities():
+    if not STRIPE_SECRET:
+        print("QSYNC skip: no STRIPE_SECRET",flush=True);return
+    with _db_lock:
+        rows=_conn.execute("SELECT key,email,stripe_sub FROM api_keys WHERE is_paid=1 AND active=1 AND stripe_sub!=''").fetchall()
+    for key,email,sub_id in rows:
         try:
-            if r[4] and r[6]:
-                late = round(max(0.0, r[4] - r[6]) / 86400.0, 1)
-        except Exception:
-            late = None
-        out.append({"period": r[0], "kind": r[1], "root": r[2], "leaf_count": r[3],
-                    "committed_at": _iso(r[4]), "block_index": r[5],
-                    "scope": "deployment" if not r[7] else "key",
-                    "committed_days_after_period_end": late})
+            n=device_count(key)
+            if not n:continue
+            sub=stripe_call("GET","/subscriptions/"+sub_id)
+            if not sub or "items" not in sub:
+                print("QSYNC no sub for "+email,flush=True);continue
+            items=sub["items"].get("data",[])
+            if not items:continue
+            item=items[0]
+            current=int(item.get("quantity",0) or 0)
+            if n>current:
+                r=stripe_call("POST","/subscription_items/"+item["id"],
+                    {"quantity":str(n),"proration_behavior":"none"})
+                if r and "id" in r:
+                    print("QSYNC "+email+": "+str(current)+" -> "+str(n)+" devices",flush=True)
+                else:
+                    print("QSYNC FAIL "+email,flush=True)
+        except Exception as e:
+            print("QSYNC ERR "+email+": "+str(e),flush=True)
 
-    return {"count": len(out),
-            "periods": out,
-            "auto_commit": AUTO_COMMIT,
-            "recent_auto_activity": list(reversed(_auto_log[-10:])),
-            "on_lateness": "committed_days_after_period_end is published rather than hidden. A "
-                           "small number means the count was fixed when the period closed. A "
-                           "large one means history was backfilled later, which still proves "
-                           "the count was fixed before any export was requested and proves "
-                           "nothing more than that.",
-            "note": "Gaps are visible on purpose. A missing period is a period nobody committed, "
-                    "and that is exactly the thing an auditor should be asking about."}, 200
+def _qsync_loop():
+    time.sleep(120)
+    while True:
+        try:sync_stripe_quantities()
+        except Exception as e:print("QSYNC LOOP ERR:"+str(e),flush=True)
+        time.sleep(SYNC_INTERVAL)
 
-
-def _root(ctx, api_key, data):
-    period = str(data.get("period", "")).strip()
-    kind = str(data.get("kind", "receipts")).strip().lower()
-    row, _leaves = _load(ctx, api_key, period, kind)
-    if not row:
-        return {"error": "not_committed", "period": period, "kind": kind,
-                "committed_periods": "/x/complete/periods"}, 404
-    _cid, root, count, committed, chain_hash, block_index, start, end = row
-    late = None
+if __name__=="__main__":
+    print("AILeash Platform v"+VERSION+" starting on :"+str(PORT),flush=True)
+    seal_regmap_if_changed()
+    setup_stripe()
     try:
-        late = round(max(0.0, committed - end) / 86400.0, 1)
-    except Exception:
-        pass
-    return {"period": period, "kind": kind, "root": root, "leaf_count": count,
-            "period_start": _iso(start), "period_end": _iso(end),
-            "committed_at": _iso(committed), "sealed_in_chain": chain_hash,
-            "block_index": block_index, "committed_days_after_period_end": late,
-            "what_this_is": "The number of records sealed in this period, fixed before anybody "
-                            "asked for an export. Any export claiming a different total is "
-                            "arguing with an externally anchored figure."}, 200
-
-
-def _spec():
-    return {
-        "complete_version": VERSION,
-        "leaf_hash": "sha256('AILEASH-LEAF-v1:' || value) as lowercase hex",
-        "node_hash": "sha256('AILEASH-NODE-v1:' || left_hex || right_hex) as lowercase hex",
-        "empty_root": hashlib.sha256(LEAF_PREFIX + b"EMPTY").hexdigest(),
-        "ordering": "leaf VALUES sorted ascending as UTF-8 strings, duplicates removed, "
-                    "before any hashing",
-        "odd_nodes": "an unpaired node at any level is promoted unchanged to the next level. "
-                     "It is never hashed with itself.",
-        "inclusion": "recompute upward from the leaf using the sibling path. Each step gives a "
-                     "side; hash the sibling on that side.",
-        "absence": "verify the two neighbouring leaves independently, check their values sort "
-                   "either side of the queried value, and check their indices are consecutive. "
-                   "Consecutive indices in a sorted tree leave no room for anything between.",
-        "completeness": "the leaf count is sealed with the root, before any export is requested",
-        "schedule": "closed months are committed automatically, deployment-wide, on the first "
-                    "request to reach this module after the month ends. Per-key commitments "
-                    "remain a keyed POST. Lateness is published per period rather than smoothed "
-                    "over.",
-        "why_published": "Anyone should be able to write their own verifier and check us without "
-                         "running our code or holding an account. A proof you can only check "
-                         "with the prover's own tool is not a proof.",
-    }, 200
-
-
-# ----------------------------------------------------------------------
-# router entry point
-# ----------------------------------------------------------------------
-
-def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-
-    # Sweep before answering, never at the cost of answering.
-    try:
-        _auto_commit(ctx)
-    except Exception as exc:
-        print("COMPLETE: auto sweep failed - " + str(exc)[:200], flush=True)
-
-    action = (action or "").strip("/").lower()
-    data = data or {}
-
-    if method == "GET":
-        if action == "spec":
-            return _spec()
-        if action == "periods":
-            return _periods(ctx, api_key)
-        if action == "root":
-            return _root(ctx, api_key, data)
-        if action == "prove":
-            return _prove(ctx, api_key, data)
-
-    if method == "POST":
-        if action == "verify":
-            return _verify(ctx, api_key, data)
-        if not api_key:
-            return {"error": "invalid_api_key"}, 401
-        if action == "commit":
-            return _commit(ctx, api_key, data)
-        if action == "erase":
-            return _erase(ctx, api_key, data)
-
-    return {"error": "unknown_action", "action": action,
-            "GET": ["spec", "periods", "root", "prove"],
-            "POST": ["verify", "commit", "erase"]}, 404
-
-```
-
-
-## `modules/conformance.py`
-
-338 lines, 14845 bytes
-
-```python
-"""
-Conformance testing - /x/conformance/<action>
-
-WHAT THIS IS FOR
-----------------
-Three limits are documented elsewhere in this platform, and all three have
-the same shape: the engine's arithmetic is sound, but the guarantee depends
-on something outside the engine.
-
-  1. Commit-before-reveal proves order - but only if the integrator does not
-     show its reviewers the machine verdict before calling /open.
-  2. Mutual witnessing gets its strength from breadth - two platforms
-     witnessing only each other prove very little.
-  3. A declaration is only as strong as the rules declared - one that
-     constrains nothing passes everything.
-
-None of these can be fixed by the engine on its own. All three can be
-MEASURED, and a measured weakness is a different animal from an unmeasured
-one. That is what this module does.
-
-1. PROBES - testing the integration, not trusting it
-----------------------------------------------------
-The idea is borrowed openly from how real audits work, and specifically from
-a point James Stokes made publicly: slip a case with a known answer into the
-queue, unannounced, and see who catches it.
-
-A probe creates a genuine oversight case whose machine verdict is
-deliberately set to a known-wrong value. The reviewer sees it exactly like
-any other case. Two things then follow:
-
-  - If they agree with the deliberately wrong verdict, they did not evaluate
-    it. That is a caught rubber stamp, sealed.
-  - If the integration is showing them the verdict before /open is called,
-    their probe agreement rate will match their normal agreement rate. If
-    they are genuinely deciding blind, it will not. The gap between the two
-    numbers is the conformance signal.
-
-A single probe proves nothing about a person. A catch rate across dozens is
-evidence about a process, which is the thing under audit.
-
-2. WITNESS BREADTH - concentration is visible
----------------------------------------------
-Reports how many distinct peers witness the chain, how concentrated the
-observations are in the largest peer, and how many peers have gone quiet.
-Below three live peers the network is reported as weak, because it is.
-
-3. DECLARATION STRENGTH - rules that never fire
-------------------------------------------------
-Runs the live declaration against sealed records and reports, per rule, how
-many records it actually CONSTRAINED - that is, how many matched its `when`
-condition and therefore had to satisfy its `require`. A rule that has never
-constrained a single record is not a standard. It is decoration, and it is
-named as such.
-
-HONEST LIMITS OF THIS MODULE
-----------------------------
-- Probes test the process, not any individual. Someone can catch a probe and
-  still rubber stamp the next hundred cases.
-- A determined integrator who identifies probe cases can treat them
-  differently. Probe case references are not marked in any way the reviewer
-  can see, but a sufficiently motivated operator controls their own UI.
-- Breadth and strength are measurements, not enforcement. Nothing here can
-  compel a platform to witness widely or declare strictly. It can only make
-  the alternative visible.
-
-    POST /x/conformance/probe        inject a probe case with a known-wrong verdict
-    GET  /x/conformance/probes       catch rate, and the conformance gap
-    GET  /x/conformance/witness      breadth, concentration, staleness
-    GET  /x/conformance/declaration  per-rule strength - what each rule constrains
-    GET  /x/conformance/report       all three, one call
-"""
-
-import importlib, json, secrets, time
-from datetime import datetime, timezone
-
-VERSION = "1.0"
-INVERT = {"allow": "block", "block": "allow",
-          "challenge": "allow", "escalate": "allow"}
-
-_ready = False
-
-
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        ctx["conn"].execute("CREATE TABLE IF NOT EXISTS conformance_probes(probe_id TEXT PRIMARY KEY,api_key TEXT,case_id TEXT,reviewer TEXT,planted_verdict TEXT,correct_verdict TEXT,injected REAL,resolved REAL,reviewer_verdict TEXT,caught INTEGER)")
-        ctx["conn"].execute("CREATE INDEX IF NOT EXISTS idx_probe_key ON conformance_probes(api_key)")
-        ctx["conn"].commit()
-    _ready = True
-
-
-def _iso(ts):
-    if not ts:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
-
-# ------------------------------------------------------------------ probes
-
-def _probe(ctx, api_key, data):
-    reviewer = str(data.get("reviewer", "")).strip()
-    if not reviewer:
-        return {"error": "reviewer_required"}, 400
-    correct = str(data.get("correct_verdict", "")).strip().lower()
-    if correct not in INVERT:
-        return {"error": "correct_verdict_required",
-                "allowed": sorted(INVERT)}, 400
-    material = data.get("material")
-    if material is None:
-        return {"error": "material_required",
-                "message": "A probe must look like a real case or it tests nothing."}, 400
-
-    planted = INVERT[correct]
-    try:
-        ovs = importlib.import_module("modules.oversight")
-    except Exception as e:
-        return {"error": "oversight_module_unavailable", "detail": str(e)}, 503
-
-    ref = str(data.get("case_ref", "")).strip() or ("CASE-" + secrets.token_hex(3).upper())
-    payload, status = ovs.handle("POST", "open",
-                                 {"case_ref": ref, "reviewer": reviewer,
-                                  "material": material,
-                                  "machine_verdict": planted},
-                                 api_key, ctx)
-    if status != 200:
-        return payload, status
-
-    pid = "PRB-" + secrets.token_hex(4).upper()
-    ts = time.time()
-    with ctx["lock"]:
-        ctx["conn"].execute("INSERT INTO conformance_probes(probe_id,api_key,case_id,reviewer,planted_verdict,correct_verdict,injected,resolved,reviewer_verdict,caught) VALUES(?,?,?,?,?,?,?,NULL,NULL,NULL)",
-                            (pid, api_key, payload["case_id"], reviewer, planted, correct, ts))
-        ctx["conn"].commit()
-
-    return {"probe_id": pid, "case_id": payload["case_id"],
-            "case_ref": ref, "reviewer": reviewer,
-            "planted_verdict": planted, "correct_verdict": correct,
-            "injected": _iso(ts),
-            "note": "This is an ordinary oversight case to the reviewer. Route it into their queue exactly like any other, or the probe is worthless."}, 200
-
-
-def _resolve_probes(ctx, api_key):
-    """Settle any probes whose oversight case has since been committed."""
-    with ctx["lock"]:
-        open_probes = ctx["conn"].execute("SELECT probe_id,case_id,planted_verdict,correct_verdict FROM conformance_probes WHERE api_key=? AND resolved IS NULL", (api_key,)).fetchall()
-        for pid, cid, planted, correct in open_probes:
-            row = ctx["conn"].execute("SELECT reviewer_verdict,committed FROM oversight_cases WHERE case_id=? AND api_key=?", (cid, api_key)).fetchone()
-            if not row or not row[1]:
-                continue
-            rv = (row[0] or "").lower()
-            caught = 1 if rv != planted else 0
-            ctx["conn"].execute("UPDATE conformance_probes SET resolved=?,reviewer_verdict=?,caught=? WHERE probe_id=?",
-                                (row[1], rv, caught, pid))
-        ctx["conn"].commit()
-
-
-def _probes(ctx, api_key):
-    try:
-        _resolve_probes(ctx, api_key)
-    except Exception:
-        pass
-    with ctx["lock"]:
-        rows = ctx["conn"].execute("SELECT reviewer,caught,resolved FROM conformance_probes WHERE api_key=? AND resolved IS NOT NULL", (api_key,)).fetchall()
-        pending = ctx["conn"].execute("SELECT COUNT(*) FROM conformance_probes WHERE api_key=? AND resolved IS NULL", (api_key,)).fetchone()[0]
-    if not rows:
-        return {"probes_resolved": 0, "probes_pending": pending,
-                "note": "No probes have come back yet."}, 200
-
-    by = {}
-    for reviewer, caught, _r in rows:
-        d = by.setdefault(reviewer, {"probes": 0, "caught": 0})
-        d["probes"] += 1
-        d["caught"] += caught
-
-    out = []
-    for reviewer, d in sorted(by.items()):
-        rate = round(100 * d["caught"] / d["probes"], 1)
-        entry = {"reviewer": reviewer, "probes": d["probes"],
-                 "caught": d["caught"], "catch_rate_pct": rate}
-        # conformance gap: probe agreement vs normal agreement
-        try:
-            ovs = importlib.import_module("modules.oversight")
-            stats, _s = ovs.handle("GET", "reviewer", {"id": reviewer}, api_key, ctx)
-            normal = stats.get("agreement_rate_pct")
-            if normal is not None and d["probes"] >= 5:
-                probe_agree = round(100 * (d["probes"] - d["caught"]) / d["probes"], 1)
-                gap = round(abs(probe_agree - normal), 1)
-                entry["normal_agreement_pct"] = normal
-                entry["probe_agreement_pct"] = probe_agree
-                entry["conformance_gap"] = gap
-                if gap < 5 and normal > 90:
-                    entry["flag"] = "probe agreement matches normal agreement at a high rate - consistent with the verdict being visible before commit"
-        except Exception:
-            pass
-        if d["probes"] >= 5 and rate == 0:
-            entry["flag"] = "caught none of " + str(d["probes"]) + " deliberately wrong verdicts"
-        out.append(entry)
-
-    total = sum(d["probes"] for d in by.values())
-    caught = sum(d["caught"] for d in by.values())
-    return {"probes_resolved": total, "probes_pending": pending,
-            "caught": caught,
-            "overall_catch_rate_pct": round(100 * caught / total, 1),
-            "by_reviewer": out,
-            "note": "A single probe proves nothing about a person. A catch rate across dozens is evidence about a process."}, 200
-
-
-# ----------------------------------------------------------------- witness
-
-def _witness(ctx, api_key):
-    t = time.time()
-    try:
-        with ctx["lock"]:
-            rows = ctx["conn"].execute("SELECT peer,COUNT(*),MAX(observed),COUNT(DISTINCT tip) FROM witness_log WHERE api_key=? GROUP BY peer", (api_key,)).fetchall()
-    except Exception:
-        rows = []
-    if not rows:
-        return {"peers": 0, "strength": "none",
-                "note": "No peers witnessed. Anchoring alone still applies; mutual witnessing does not."}, 200
-
-    total = sum(r[1] for r in rows)
-    live = [r for r in rows if (t - r[2]) < 6 * 3600]
-    stale = [r for r in rows if 6 * 3600 <= (t - r[2]) < 48 * 3600]
-    silent = [r for r in rows if (t - r[2]) >= 48 * 3600]
-    top = max(rows, key=lambda r: r[1])
-    conc = round(100 * top[1] / total, 1)
-
-    if len(live) >= 5 and conc < 50:
-        strength = "strong"
-    elif len(live) >= 3:
-        strength = "adequate"
-    elif len(live) >= 1:
-        strength = "weak"
-    else:
-        strength = "dormant"
-
-    out = {"peers": len(rows), "live": len(live), "stale": len(stale),
-           "silent": len(silent), "observations": total,
-           "largest_peer_share_pct": conc,
-           "strength": strength,
-           "distinct_tips_seen": sum(r[3] for r in rows)}
-    if len(live) < 3:
-        out["flag"] = "fewer than three live peers - breadth is what makes witnessing meaningful, and this network does not have it yet"
-    if conc > 80 and len(rows) > 1:
-        out["concentration_flag"] = "over 80% of observations come from a single peer"
-    if len(rows) == 1:
-        out["reciprocity_warning"] = "a single peer pair proves very little - two parties witnessing only each other can still collude"
-    return out, 200
-
-
-# ------------------------------------------------------------- declaration
-
-def _declaration(ctx, api_key):
-    try:
-        dec = importlib.import_module("modules.declare")
-    except Exception as e:
-        return {"error": "declare_module_unavailable", "detail": str(e)}, 503
-
-    cur, status = dec.handle("GET", "current", {}, api_key, ctx)
-    if status != 200:
-        return cur, status
-    rules = cur["declaration"]["rules"]
-    ver = cur["version"]
-
-    with ctx["lock"]:
-        recs = ctx["conn"].execute("SELECT event_json,result_json FROM audit_log WHERE api_key=? ORDER BY id DESC LIMIT 2000", (api_key,)).fetchall()
-
-    parsed = []
-    for ev, res in recs:
-        try:
-            r = {}
-            r.update(json.loads(ev))
-            r.update(json.loads(res))
-            if str(r.get("decision", "")).endswith("_SEALED"):
-                continue
-            parsed.append(r)
-        except Exception:
-            pass
-
-    report = []
-    for rule in rules:
-        constrained = 0
-        violated = 0
-        for r in parsed:
-            if not dec._test(rule.get("when"), r):
-                continue
-            constrained += 1
-            if not dec._test(rule.get("require"), r):
-                violated += 1
-        entry = {"rule": rule.get("id"), "describe": rule.get("describe"),
-                 "records_constrained": constrained,
-                 "violations": violated,
-                 "coverage_pct": (round(100 * constrained / len(parsed), 1) if parsed else 0)}
-        if constrained == 0:
-            entry["flag"] = "this rule has never constrained a single record - it is decoration, not a standard"
-        report.append(entry)
-
-    dead = len([r for r in report if r["records_constrained"] == 0])
-    covered = len({i for i, rule in enumerate(rules)
-                   if report[i]["records_constrained"] > 0})
-    out = {"declaration_version": ver, "rules": len(rules),
-           "records_examined": len(parsed),
-           "rules_that_constrain_nothing": dead,
-           "rules_with_effect": covered,
-           "per_rule": report}
-    if dead:
-        out["flag"] = str(dead) + " of " + str(len(rules)) + " rules constrain nothing"
-    if not rules:
-        out["flag"] = "an empty declaration passes everything"
-    return out, 200
-
-
-# ---------------------------------------------------------------- routing
-
-def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-    if method == "POST":
-        if action == "probe":
-            return _probe(ctx, api_key, data)
-    else:
-        if action == "probes":
-            return _probes(ctx, api_key)
-        if action == "witness":
-            return _witness(ctx, api_key)
-        if action == "declaration":
-            return _declaration(ctx, api_key)
-        if action in ("", "report"):
-            p, _a = _probes(ctx, api_key)
-            w, _b = _witness(ctx, api_key)
-            d, _c = _declaration(ctx, api_key)
-            return {"conformance_version": VERSION,
-                    "integration": p, "witness_breadth": w,
-                    "declaration_strength": d,
-                    "note": "These are measurements, not enforcement. Nothing here compels good behaviour - it only makes the alternative visible."}, 200
-    return {"error": "unknown_action", "action": action}, 404
+        from anchor import start_anchoring
+        start_anchoring(chain_tip)
+    except Exception as _e:
+        print("ANCHOR: could not start (" + str(_e) + ") - server continues normally", flush=True)
+    threading.Thread(target=_qsync_loop,daemon=True).start()
+    print("QSYNC thread started - device/billing sync every 6h",flush=True)
+    server=ThreadedServer(("0.0.0.0",PORT),Handler)
+    print("Ready.",flush=True)
+    server.serve_forever()
 
 ```
