@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-116 files across 25 parts.
+117 files across 25 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -61,6 +61,7 @@ Generated automatically on every push. Do not edit by hand.
 - `modules/rulebind.py`
 - `modules/run_benchmark.py`
 - `modules/savings.py`
+- `modules/sebbi_core_module.py`
 - `modules/selfcheck.py`
 
 ## [CODEBASE-10.md](CODEBASE-10.md)
