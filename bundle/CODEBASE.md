@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-117 files across 25 parts.
+116 files across 25 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -35,7 +35,6 @@ Generated automatically on every push. Do not edit by hand.
 ## [CODEBASE-06.md](CODEBASE-06.md)
 
 - `modules/lineage.py`
-- `modules/modules`
 - `modules/mutual.py`
 - `modules/network.py`
 - `modules/ots.py`
