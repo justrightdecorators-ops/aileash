@@ -1,9 +1,635 @@
 # Codebase — part 14 of 25
 
 Contains:
+- `gateway_proxy.py`
+- `meshwitness.py`
 - `sebbi_orchestrator.py`
 - `sebbi_sdk.py`
 - `sebbi_tokensaver.py`
+
+
+## `gateway_proxy.py`
+
+280 lines, 10922 bytes
+
+```python
+import asyncio
+import ssl
+import json
+import hmac
+import hashlib
+import os
+import time
+import logging
+import urllib.request
+import urllib.error
+
+# ============================================================
+# AILEASH GATEWAY PROXY - real enforcement version
+#
+# How it's meant to be used:
+#   Customer changes their AI SDK's base URL from
+#     https://api.openai.com/v1
+#   to
+#     https://your-gateway-domain/openai/v1
+#   (same for Anthropic under /anthropic/)
+#
+# Every request that arrives:
+#   1. Gets scored by your real /api/govern endpoint (same
+#      scoring + sealing logic as server.py - nothing duplicated).
+#   2. If the decision is BLOCK, the request is rejected here.
+#      The real OpenAI/Anthropic call is NEVER made. That's the
+#      actual gate - not an email sent after the fact.
+#   3. If ALLOW or CHALLENGE, the request is forwarded to the
+#      real provider over a real TLS connection, and the real
+#      response is streamed back untouched.
+#
+# This does NOT intercept traffic the customer sends directly
+# to openai.com without going through this gateway. No proxy
+# that doesn't install certificates on every device can do that
+# for HTTPS traffic - that's a much bigger, separate product.
+# This is the same integration pattern used by every commercial
+# AI gateway (Cloudflare AI Gateway, Portkey, LiteLLM proxy, etc).
+# ============================================================
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [GATEWAY] %(message)s")
+
+PROXY_PORT = int(os.environ.get("GATEWAY_PORT", 8888))
+
+# No fallback key. If this isn't set, refuse to start rather than
+# run with a guessable signing key in production.
+PROXY_SIGNING_KEY = os.environ.get("SEBBI_PROXY_SECRET", "").strip()
+if not PROXY_SIGNING_KEY:
+    raise SystemExit(
+        "SEBBI_PROXY_SECRET is not set. Refusing to start - "
+        "running with a default/fallback signing key is not safe. "
+        "Set SEBBI_PROXY_SECRET in your environment (Railway variables) and restart."
+    )
+PROXY_SIGNING_KEY = PROXY_SIGNING_KEY.encode("utf-8")
+
+# Where your real scoring/sealing engine lives. Point this at your
+# own deployment - defaults to the live sebbi.pro API.
+GOVERN_URL = os.environ.get("AILEASH_GOVERN_URL", "https://sebbi.pro/api/govern")
+
+# Which real AI providers this gateway can forward to, and their
+# real hostnames. Add more here if you support more providers.
+PROVIDERS = {
+    "openai": "api.openai.com",
+    "anthropic": "api.anthropic.com",
+}
+
+
+def call_govern(ailleash_key: str, event: dict):
+    """Call the real /api/govern endpoint and return (decision_json, http_status).
+    This is a blocking network call - run it in a thread executor so it
+    doesn't stall the async event loop."""
+    body = json.dumps(event).encode("utf-8")
+    req = urllib.request.Request(
+        GOVERN_URL,
+        data=body,
+        headers={
+            "Authorization": "Bearer " + ailleash_key,
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return json.loads(r.read()), r.status
+    except urllib.error.HTTPError as e:
+        try:
+            return json.loads(e.read()), e.code
+        except Exception:
+            return {"decision": "BLOCK", "error": "govern_returned_unreadable_error"}, e.code
+    except Exception as e:
+        # Network failure, timeout, DNS issue, etc. Fail closed - if we
+        # can't reach the compliance engine, we don't guess ALLOW.
+        return {"decision": "BLOCK", "error": "govern_unreachable: " + str(e)}, 503
+
+
+def parse_request(raw_head: bytes):
+    """Parse the request line + headers from the raw bytes read up to \\r\\n\\r\\n."""
+    text = raw_head.decode("utf-8", errors="ignore")
+    lines = text.split("\r\n")
+    request_line = lines[0]
+    parts = request_line.split(" ")
+    method = parts[0] if len(parts) > 0 else "GET"
+    path = parts[1] if len(parts) > 1 else "/"
+    headers = {}
+    for line in lines[1:]:
+        if not line or ":" not in line:
+            continue
+        k, _, v = line.partition(":")
+        headers[k.strip().lower()] = v.strip()
+    return method, path, headers
+
+
+def build_forward_request(method, upstream_path, headers, body: bytes, upstream_host):
+    """Rebuild the HTTP request to send to the real provider. Strips our
+    own gateway-only headers and sets the correct Host."""
+    drop = {"host", "x-sebbi-key", "x-sebbi-event", "content-length"}
+    lines = [method + " " + upstream_path + " HTTP/1.1", "Host: " + upstream_host]
+    for k, v in headers.items():
+        if k in drop:
+            continue
+        lines.append(k + ": " + v)
+    lines.append("Content-Length: " + str(len(body)))
+    lines.append("Connection: close")
+    head = ("\r\n".join(lines) + "\r\n\r\n").encode("utf-8")
+    return head + body
+
+
+async def read_full_request(reader):
+    """Read headers, then read exactly Content-Length bytes of body if present."""
+    head = await reader.readuntil(b"\r\n\r\n")
+    method, path, headers = parse_request(head)
+    length = int(headers.get("content-length", "0") or "0")
+    body = b""
+    if length:
+        body = await reader.readexactly(length)
+    return method, path, headers, body
+
+
+async def forward_to_provider(upstream_host, request_bytes: bytes):
+    """Open a real TLS connection to the real provider and return the raw
+    response bytes, unmodified."""
+    ctx = ssl.create_default_context()
+    reader, writer = await asyncio.open_connection(upstream_host, 443, ssl=ctx)
+    try:
+        writer.write(request_bytes)
+        await writer.drain()
+        response = await reader.read(-1)
+        return response
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
+def default_event(headers, device_id_fallback):
+    """Build a sensible /api/govern event from what the customer sent,
+    falling back to safe defaults for anything they didn't specify.
+    Customers can override any field by sending an X-Sebbi-Event JSON header."""
+    override = headers.get("x-sebbi-event")
+    if override:
+        try:
+            ev = json.loads(override)
+        except Exception:
+            ev = {}
+    else:
+        ev = {}
+    ev.setdefault("user_id", headers.get("x-sebbi-user", "gateway_anonymous"))
+    ev.setdefault("action", "ai_request")
+    ev.setdefault("amount", 0)
+    ev.setdefault("country", headers.get("x-sebbi-country", "UK"))
+    ev.setdefault("device_id", headers.get("x-sebbi-device", device_id_fallback))
+    ev.setdefault("anomaly", 0)
+    ev.setdefault("device_risk", 0)
+    return ev
+
+
+class ComplianceGatewayProxy:
+    def __init__(self, host="0.0.0.0", port=PROXY_PORT):
+        self.host = host
+        self.port = port
+
+    async def start(self):
+        server = await asyncio.start_server(self.handle_client_traffic, self.host, self.port)
+        logging.info("AILeash Gateway operational on :%s (real enforcement, real forwarding)", self.port)
+        async with server:
+            await server.serve_forever()
+
+    async def handle_client_traffic(self, reader, writer):
+        peer = writer.get_extra_info("peername")
+        try:
+            method, path, headers, body = await read_full_request(reader)
+        except Exception as e:
+            logging.warning("Bad request from %s: %s", peer, e)
+            writer.close()
+            return
+
+        try:
+            # Route: /openai/... or /anthropic/... selects the real provider.
+            segments = path.strip("/").split("/", 1)
+            provider_key = segments[0] if segments else ""
+            upstream_path = "/" + segments[1] if len(segments) > 1 else "/"
+
+            if provider_key not in PROVIDERS:
+                self._reject(writer, 404, "unknown_provider",
+                              "Path must start with /openai/ or /anthropic/")
+                return
+
+            ailleash_key = headers.get("x-sebbi-key", "")
+            if not ailleash_key:
+                self._reject(writer, 401, "missing_compliance_key",
+                              "Include your AILeash API key in the X-Sebbi-Key header.")
+                return
+
+            device_id_fallback = str(peer[0]) if peer else "unknown_device"
+            event = default_event(headers, device_id_fallback)
+
+            loop = asyncio.get_event_loop()
+            decision_json, status = await loop.run_in_executor(
+                None, call_govern, ailleash_key, event
+            )
+            decision = decision_json.get("decision", "BLOCK")
+
+            if status != 200 or decision == "BLOCK":
+                logging.warning("[BLOCKED] %s -> %s (%s)", peer, provider_key, decision_json.get("reasons", decision_json.get("error", "")))
+                self._reject(writer, 403, "compliance_block", None, decision_json)
+                return
+
+            # ALLOW or CHALLENGE both proceed - CHALLENGE just means the
+            # customer's own code should show the user the verification
+            # link included in decision_json. We don't invent enforcement
+            # server.py doesn't have.
+            upstream_host = PROVIDERS[provider_key]
+            forward_bytes = build_forward_request(method, upstream_path, headers, body, upstream_host)
+
+            real_response = await forward_to_provider(upstream_host, forward_bytes)
+
+            tx_seal = hmac.new(PROXY_SIGNING_KEY, real_response[:2048], hashlib.sha256).hexdigest()
+            logging.info("[ROUTED] %s -> %s decision=%s seal=%s", peer, provider_key, decision, tx_seal[:16])
+
+            writer.write(real_response)
+            await writer.drain()
+
+        except Exception as e:
+            logging.error("Proxy error for %s: %s", peer, e)
+            try:
+                self._reject(writer, 502, "gateway_error", str(e))
+            except Exception:
+                pass
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    def _reject(self, writer, code, reason, message=None, extra=None):
+        payload = {"error": reason}
+        if message:
+            payload["message"] = message
+        if extra:
+            payload["compliance_decision"] = extra
+        body = json.dumps(payload).encode("utf-8")
+        status_text = {401: "Unauthorized", 403: "Forbidden", 404: "Not Found", 502: "Bad Gateway"}.get(code, "Error")
+        resp = (
+            "HTTP/1.1 " + str(code) + " " + status_text + "\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: " + str(len(body)) + "\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode("utf-8") + body
+        writer.write(resp)
+
+
+if __name__ == "__main__":
+    gateway = ComplianceGatewayProxy()
+    try:
+        asyncio.run(gateway.start())
+    except KeyboardInterrupt:
+        logging.info("Gateway offline.")
+
+```
+
+
+## `meshwitness.py`
+
+328 lines, 11605 bytes
+
+```python
+#!/usr/bin/env python3
+"""
+meshwitness.py  v1.0  -  witness everybody, not just whoever invited you
+
+    Standard library only. One file. One cron line. No install.
+
+WHAT PROBLEM THIS SOLVES
+    Witnessing runs on your own machine, so your server only witnesses
+    chains you have told it about. Most operators point at whoever
+    introduced them and stop there. The result is a star: everybody
+    connected to one node in the middle, and if that node goes down
+    every chain loses its witness at the same moment.
+
+    This reads the published roster and witnesses EVERY chain on it. A
+    chain that joins tomorrow gets picked up on your next run with
+    nothing to configure and no email from anyone.
+
+WHAT IT DOES, EACH RUN
+    1. Fetches the roster.
+    2. For every chain with a tip URL, fetches their current tip.
+    3. Seals that tip into YOUR chain, via your own seal endpoint.
+    4. Pushes YOUR tip to their submit endpoint, so the witnessing is
+       mutual rather than one-way.
+    5. Prints a line per peer and exits non-zero if nothing worked.
+
+    It never sends your data anywhere. A tip is a hash. That is the
+    whole payload.
+
+RUN IT
+    export MESH_TIP_URL=https://yoursite.example/witness.json
+    export MESH_SEAL_URL=https://yoursite.example/api/witness/seal
+    export MESH_CHAIN=your-chain-name
+
+    python3 meshwitness.py
+
+    Cron, hourly, on a minute nobody else is using:
+        23 * * * * /usr/bin/python3 /path/meshwitness.py >> /var/log/mesh.log 2>&1
+
+    Check what it would do without doing it:
+        python3 meshwitness.py --dry-run
+
+CONFIGURATION
+    MESH_TIP_URL    where YOUR current tip is served. required.
+    MESH_SEAL_URL   your own endpoint that seals an observed tip.
+                    optional -- omit it and this only pushes, which is
+                    still useful but only half the exchange.
+    MESH_CHAIN      your chain name as other nodes should record it.
+    MESH_ROSTER     roster to read. defaults to sebbi.pro.
+    MESH_SKIP       comma separated chain names to ignore.
+    MESH_TIMEOUT    seconds per request. default 15.
+
+IF YOUR STACK IS NOT PYTHON
+    The whole protocol is four HTTP calls and no cryptography beyond a
+    hash you already have. Read --explain for the exact requests and
+    write it in whatever you use. Nothing here is privileged.
+"""
+
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+VERSION = "1.0"
+
+DEFAULT_ROSTER = "https://sebbi.pro/x/roster/list"
+DEFAULT_TIMEOUT = 15.0
+USER_AGENT = "meshwitness/%s" % VERSION
+
+
+# ------------------------------------------------------------------ http
+
+def _get(url, timeout):
+    req = urllib.request.Request(url, headers={
+        "Accept": "application/json", "User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        raw = r.read().decode("utf-8", "replace")
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return {"_raw": raw.strip()}
+
+
+def _post(url, payload, timeout):
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=body, headers={
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": USER_AGENT,
+    }, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read().decode("utf-8", "replace"))
+        except Exception:
+            return e.code, {"error": "http_%d" % e.code}
+
+
+def _extract_tip(doc):
+    """
+    Find the tip hash in whatever shape a peer serves. Different nodes
+    name it differently and that is not worth an argument.
+    """
+    if isinstance(doc, str):
+        return doc.strip() or None
+    if not isinstance(doc, dict):
+        return None
+    for k in ("tip", "head", "current_tip", "chain_tip", "root",
+              "latest", "hash", "audit_hash", "seal"):
+        v = doc.get(k)
+        if isinstance(v, str) and len(v) >= 32:
+            return v.strip()
+        if isinstance(v, dict):
+            inner = _extract_tip(v)
+            if inner:
+                return inner
+    for k in ("chain", "witness", "data", "result"):
+        v = doc.get(k)
+        if isinstance(v, dict):
+            inner = _extract_tip(v)
+            if inner:
+                return inner
+    return None
+
+
+# ------------------------------------------------------------------ core
+
+class Mesh(object):
+
+    def __init__(self, tip_url=None, seal_url=None, chain=None,
+                 roster=None, skip=None, timeout=None, dry_run=False):
+        self.tip_url = tip_url or os.environ.get("MESH_TIP_URL")
+        self.seal_url = seal_url or os.environ.get("MESH_SEAL_URL")
+        self.chain = chain or os.environ.get("MESH_CHAIN")
+        self.roster = roster or os.environ.get("MESH_ROSTER", DEFAULT_ROSTER)
+        self.timeout = float(timeout or os.environ.get("MESH_TIMEOUT",
+                                                       DEFAULT_TIMEOUT))
+        self.dry_run = dry_run
+        raw_skip = skip or os.environ.get("MESH_SKIP", "")
+        self.skip = set(s.strip().lower() for s in raw_skip.split(",") if s.strip())
+
+    def check(self):
+        problems = []
+        if not self.tip_url:
+            problems.append("MESH_TIP_URL is not set. Other nodes need "
+                            "somewhere to fetch your tip from.")
+        if not self.chain:
+            problems.append("MESH_CHAIN is not set. Your submissions would "
+                            "arrive unnamed.")
+        if not self.seal_url:
+            problems.append("MESH_SEAL_URL is not set, so this will push "
+                            "your tip out but not seal theirs. That is "
+                            "half the exchange. Not fatal.")
+        return problems
+
+    def my_tip(self):
+        try:
+            return _extract_tip(_get(self.tip_url, self.timeout))
+        except Exception as e:
+            print("  ! could not read own tip from %s: %s"
+                  % (self.tip_url, str(e)[:90]))
+            return None
+
+    def fetch_roster(self):
+        doc = _get(self.roster, self.timeout)
+        peers = doc.get("peers") or []
+        out = []
+        for p in peers:
+            name = (p.get("chain") or "").strip()
+            url = p.get("tip_url")
+            if not name or not url:
+                continue
+            if name.lower() == (self.chain or "").lower():
+                continue                       # never witness yourself
+            if name.lower() in self.skip:
+                continue
+            out.append({"chain": name, "tip_url": url,
+                        "status": p.get("status"),
+                        "submit": p.get("submit_to")})
+        return out, doc
+
+    def run(self):
+        started = time.time()
+        print("meshwitness %s  %s" % (VERSION, time.strftime("%Y-%m-%d %H:%M:%S")))
+
+        for p in self.check():
+            print("  ! " + p)
+
+        mine = self.my_tip()
+        if mine:
+            print("  my tip: %s…" % mine[:16])
+        else:
+            print("  ! no tip of my own to push; will still seal theirs")
+
+        try:
+            peers, doc = self.fetch_roster()
+        except Exception as e:
+            print("  ! roster unreachable (%s): %s" % (self.roster, str(e)[:90]))
+            return 1
+
+        submit_to = doc.get("submit_to")
+        print("  roster: %d chains, %d witnessable"
+              % (doc.get("count", 0), doc.get("witnessable", 0)))
+
+        if not peers:
+            print("  nothing to witness yet.")
+            return 0
+
+        sealed = pushed = failed = 0
+
+        for p in peers:
+            name = p["chain"]
+            line = "  %-28s" % name[:28]
+
+            try:
+                theirs = _extract_tip(_get(p["tip_url"], self.timeout))
+            except Exception as e:
+                print(line + "unreachable (%s)" % str(e)[:40])
+                failed += 1
+                continue
+
+            if not theirs:
+                print(line + "served no readable tip")
+                failed += 1
+                continue
+
+            bits = ["tip %s…" % theirs[:12]]
+
+            # seal theirs into mine
+            if self.seal_url and not self.dry_run:
+                try:
+                    st, _ = _post(self.seal_url,
+                                  {"chain": name, "tip": theirs,
+                                   "url": p["tip_url"]}, self.timeout)
+                    if 200 <= st < 300:
+                        bits.append("sealed")
+                        sealed += 1
+                    else:
+                        bits.append("seal HTTP %d" % st)
+                except Exception as e:
+                    bits.append("seal failed: %s" % str(e)[:30])
+            elif self.dry_run:
+                bits.append("would seal")
+
+            # push mine to them
+            target = p.get("submit") or submit_to
+            if mine and target and not self.dry_run:
+                try:
+                    st, _ = _post(target,
+                                  {"chain": self.chain, "tip": mine,
+                                   "url": self.tip_url}, self.timeout)
+                    if 200 <= st < 300:
+                        bits.append("pushed")
+                        pushed += 1
+                    else:
+                        bits.append("push HTTP %d" % st)
+                except Exception as e:
+                    bits.append("push failed: %s" % str(e)[:30])
+            elif self.dry_run and mine:
+                bits.append("would push")
+
+            print(line + " · ".join(bits))
+
+        print("  %d sealed, %d pushed, %d unreachable, %.1fs"
+              % (sealed, pushed, failed, time.time() - started))
+
+        if self.dry_run:
+            return 0
+        return 0 if (sealed or pushed) else 1
+
+
+EXPLAIN = """
+The protocol, so you can implement it in any language.
+
+1. Read the roster
+     GET https://sebbi.pro/x/roster/list
+   -> {"peers":[{"chain":"...","tip_url":"...","witnessable":true}, ...],
+       "submit_to":"https://sebbi.pro/x/witness/observe"}
+
+2. For each peer with witnessable=true, read their tip
+     GET <tip_url>
+   The hash may be under "tip", "head", "root" or similar. It is a hex
+   string, usually 64 characters. Nothing else in the document matters.
+
+3. Seal it in your own chain
+   Whatever your system does to record an observation. The point is that
+   their tip is now inside your history at a time you did not choose,
+   which is what makes your later statements about them checkable.
+
+4. Push your own tip back
+     POST <their submit endpoint>
+     {"chain": "<your name>", "tip": "<your hex tip>",
+      "url": "<where your tip is served>"}
+
+   The url field is what binds your name to a host. Leave it out and
+   your chain is listed but nobody can fetch from you.
+
+Run it hourly. Pick a minute nobody else is on so the network is not
+all talking at once.
+
+No keys. No accounts. No payload but a hash. If your tip endpoint is a
+static JSON file regenerated by a cron, that is a completely valid node.
+"""
+
+
+def main(argv=None):
+    argv = list(argv if argv is not None else sys.argv[1:])
+
+    if "--explain" in argv:
+        print(EXPLAIN.strip())
+        return 0
+    if "--version" in argv:
+        print("meshwitness %s" % VERSION)
+        return 0
+    if "-h" in argv or "--help" in argv:
+        print(__doc__.strip())
+        return 0
+
+    dry = "--dry-run" in argv
+    return Mesh(dry_run=dry).run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+```
 
 
 ## `sebbi_orchestrator.py`
