@@ -3,6 +3,7 @@
 Contains:
 - `certificate.html`
 - `compliance-assistant.html`
+- `console.html`
 - `contact.html`
 - `copyright.txt`
 - `data-protection.html`
@@ -1021,6 +1022,405 @@ footer{background:rgba(0,0,0,0.4);padding:36px 24px;border-top:1px solid rgba(25
   </div>
   <div class="foot-copy">© 2026 Monop Content · Blyth, Northumberland, UK · sebbi.pro</div>
 </footer>
+</body>
+</html>
+
+```
+
+
+## `console.html`
+
+391 lines, 17987 bytes
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<meta name="robots" content="noindex,nofollow">
+<title>Console — sebbi.pro</title>
+<style>
+  :root{
+    --ink:#0a0f1e; --ink2:#10182e; --gold:#c9a84c;
+    --ok:#7fe3b0; --err:#ff8a80;
+    --line:rgba(201,168,76,0.22);
+    --mute:rgba(255,255,255,0.45);
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--ink);color:#fff;font-family:system-ui,-apple-system,sans-serif;
+       min-height:100vh;padding:18px 16px 60px;-webkit-text-size-adjust:100%}
+  .wrap{max-width:640px;margin:0 auto}
+
+  .brand{font-family:ui-monospace,monospace;font-size:10px;letter-spacing:2.5px;
+         text-transform:uppercase;color:rgba(255,255,255,0.32)}
+  h1{font-family:Georgia,serif;font-size:25px;color:var(--gold);margin:12px 0 4px}
+  .sub{font-size:13px;color:var(--mute);line-height:1.65;margin-bottom:20px}
+
+  .keybar{background:var(--ink2);border:1px solid var(--line);border-radius:10px;
+          padding:14px;margin-bottom:18px}
+  .keybar label{display:block;font-size:11px;letter-spacing:1.2px;text-transform:uppercase;
+                color:var(--mute);margin-bottom:7px}
+  .keystate{margin-top:9px;font-family:ui-monospace,monospace;font-size:11px;color:var(--mute)}
+  .keystate b{color:var(--gold);font-weight:600}
+
+  input,select,textarea{width:100%;background:#0c1424;border:1px solid var(--line);
+    color:#fff;border-radius:7px;padding:11px 12px;font-size:15px;font-family:inherit;outline:none}
+  input:focus,select,textarea:focus{border-color:var(--gold)}
+  textarea{font-family:ui-monospace,monospace;font-size:13px;line-height:1.55;min-height:74px;resize:vertical}
+  select{appearance:none;background-image:linear-gradient(45deg,transparent 50%,var(--gold) 50%),
+         linear-gradient(135deg,var(--gold) 50%,transparent 50%);
+         background-position:calc(100% - 18px) 20px,calc(100% - 13px) 20px;
+         background-size:5px 5px,5px 5px;background-repeat:no-repeat}
+
+  section{border:1px solid var(--line);border-radius:10px;margin-bottom:14px;overflow:hidden}
+  section > h2{font-family:Georgia,serif;font-size:16px;color:var(--gold);
+    padding:14px 15px;background:var(--ink2);cursor:pointer;display:flex;
+    justify-content:space-between;align-items:center;font-weight:400}
+  section > h2 .chev{font-size:12px;color:var(--mute)}
+  .body{padding:15px;display:none;border-top:1px solid var(--line)}
+  section.open .body{display:block}
+  section.open > h2 .chev{transform:rotate(180deg)}
+
+  .op{padding:13px 0;border-bottom:1px solid rgba(255,255,255,0.06)}
+  .op:last-child{border-bottom:none;padding-bottom:0}
+  .op:first-child{padding-top:0}
+  .op .name{font-family:ui-monospace,monospace;font-size:12.5px;color:#fff;margin-bottom:3px}
+  .op .name span{color:var(--mute)}
+  .op .why{font-size:12px;color:var(--mute);line-height:1.6;margin-bottom:9px}
+  .row{display:flex;gap:8px;margin-bottom:8px}
+  .row > *{flex:1;min-width:0}
+
+  button{background:var(--gold);color:var(--ink);border:none;border-radius:7px;
+    padding:12px 14px;font-size:14px;font-weight:800;cursor:pointer;width:100%;
+    font-family:inherit;letter-spacing:0.2px}
+  button:active{opacity:0.8}
+  button:disabled{opacity:0.45}
+  button.quiet{background:transparent;color:var(--gold);border:1px solid var(--line);font-weight:600}
+  button.danger{background:transparent;color:var(--err);border:1px solid rgba(255,138,128,0.4);font-weight:600}
+
+  #out{position:sticky;bottom:0;margin-top:18px;background:#070c18;
+       border:1px solid var(--line);border-radius:10px;overflow:hidden}
+  #out .head{display:flex;justify-content:space-between;align-items:center;
+    padding:10px 13px;background:var(--ink2);font-family:ui-monospace,monospace;font-size:11px}
+  #out .code{font-weight:700;letter-spacing:1px}
+  #out .code.g{color:var(--ok)} #out .code.r{color:var(--err)} #out .code.n{color:var(--mute)}
+  #out .route{color:var(--mute);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+    max-width:62%;text-align:right}
+  #out pre{padding:13px;font-family:ui-monospace,monospace;font-size:11.5px;line-height:1.65;
+    color:rgba(255,255,255,0.85);white-space:pre-wrap;word-break:break-word;
+    max-height:44vh;overflow:auto}
+  .foot{margin-top:22px;font-size:11.5px;color:rgba(255,255,255,0.3);line-height:1.8}
+  .foot b{color:var(--gold);font-weight:600}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="brand">sebbi.pro &middot; operator console</div>
+  <h1>Console</h1>
+  <div class="sub">Keyed routes, run from a phone. The key stays in this tab and is never written to storage — closing the tab forgets it.</div>
+
+  <div class="keybar">
+    <label for="key">API key</label>
+    <input id="key" type="password" autocomplete="off" autocapitalize="off"
+           spellcheck="false" placeholder="Paste your key" oninput="keyState()">
+    <div class="keystate" id="keystate">No key set. Every route below will answer <b>401</b>.</div>
+  </div>
+
+  <!-- ================= WALLET ================= -->
+  <section id="s-wallet" class="open">
+    <h2 onclick="toggle('s-wallet')">Wallet <span class="chev">&#9660;</span></h2>
+    <div class="body">
+
+      <div class="op">
+        <div class="name">GET status <span>· quote · devices · review</span></div>
+        <div class="why">Balance, free window, live devices and any open halt.</div>
+        <div class="row">
+          <button class="quiet" onclick="go('GET','wallet','status')">Status</button>
+          <button class="quiet" onclick="go('GET','wallet','quote')">Prices</button>
+        </div>
+        <div class="row">
+          <button class="quiet" onclick="go('GET','wallet','devices')">Devices</button>
+          <button class="quiet" onclick="go('GET','wallet','review')">Open halts</button>
+        </div>
+      </div>
+
+      <div class="op">
+        <div class="name">POST charge <span>· the gate</span></div>
+        <div class="why">Simulate spends nothing and seals nothing. Charge does both. Send the same receipt twice and the key halts on purpose.</div>
+        <input id="w-device" placeholder="device_id, e.g. test-device-01" value="test-device-01">
+        <div style="height:8px"></div>
+        <input id="w-receipt" placeholder="receipt — 64 hex" autocapitalize="off" spellcheck="false">
+        <div style="height:8px"></div>
+        <div class="row">
+          <button class="quiet" onclick="newReceipt()">New receipt</button>
+          <button class="quiet" onclick="chargeCall('simulate')">Simulate</button>
+        </div>
+        <button onclick="chargeCall('charge')">Charge</button>
+      </div>
+
+      <div class="op">
+        <div class="name">POST subscribe</div>
+        <div class="why">Puts one device on the 30-day plan and takes it off the balance. Renewing early extends the existing expiry.</div>
+        <input id="w-subdev" placeholder="device_id" value="test-device-01">
+        <div style="height:8px"></div>
+        <button onclick="go('POST','wallet','subscribe',{device_id:val('w-subdev')})">Subscribe device</button>
+      </div>
+
+      <div class="op">
+        <div class="name">POST topup <span>· after a payment clears</span></div>
+        <div class="why">1000 millipence = 1 penny, so 50p is 50000. The note is required — put the Stripe payment reference in it so the ledger reconciles.</div>
+        <div class="row">
+          <input id="w-amount" inputmode="numeric" placeholder="millipence" value="50000">
+          <input id="w-note" placeholder="Stripe ref / who authorised">
+        </div>
+        <button onclick="go('POST','wallet','topup',{millipence:num('w-amount'),note:val('w-note')})">Credit balance</button>
+      </div>
+
+      <div class="op">
+        <div class="name">GET ledger</div>
+        <div class="why">Every charge, topup and subscription, newest first.</div>
+        <div class="row">
+          <input id="w-limit" inputmode="numeric" placeholder="limit" value="25">
+          <button class="quiet" onclick="go('GET','wallet','ledger',{limit:num('w-limit')})">Show ledger</button>
+        </div>
+      </div>
+
+      <div class="op">
+        <div class="name">POST clear <span>· human decision</span></div>
+        <div class="why">Releases a halted key. Your name and the reason are sealed into the chain with it.</div>
+        <div class="row">
+          <input id="w-halt" inputmode="numeric" placeholder="halt_id">
+          <input id="w-by" placeholder="cleared_by">
+        </div>
+        <input id="w-cnote" placeholder="Why this halt is safe to clear">
+        <div style="height:8px"></div>
+        <button class="danger" onclick="go('POST','wallet','clear',{halt_id:num('w-halt'),cleared_by:val('w-by'),note:val('w-cnote')})">Clear halt</button>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ================= ANCHORING ================= -->
+  <section id="s-ots">
+    <h2 onclick="toggle('s-ots')">Anchoring <span class="chev">&#9660;</span></h2>
+    <div class="body">
+      <div class="op">
+        <div class="name">GET ots/status</div>
+        <div class="why">Proof count on disk against stamps recorded. Warns if a volume was lost.</div>
+        <button class="quiet" onclick="go('GET','ots','status')">Anchor status</button>
+      </div>
+      <div class="op">
+        <div class="name">POST ots/upgrade</div>
+        <div class="why">Fetches each pending proof again from the calendars. Anything stamped more than a few hours ago should come back confirmed with a Bitcoin block height. Until this runs, pending is all you have.</div>
+        <button onclick="go('POST','ots','upgrade',{})">Upgrade proofs</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= NETWORK ================= -->
+  <section id="s-net">
+    <h2 onclick="toggle('s-net')">Network <span class="chev">&#9660;</span></h2>
+    <div class="body">
+      <div class="op">
+        <div class="name">Witness exchange</div>
+        <div class="why">Peers, last sync result, and the published roster.</div>
+        <div class="row">
+          <button class="quiet" onclick="go('GET','mutual','peers')">Peers</button>
+          <button class="quiet" onclick="go('GET','mutual','status')">Sync status</button>
+        </div>
+        <button class="quiet" onclick="go('GET','roster','list')">Roster</button>
+      </div>
+      <div class="op">
+        <div class="name">POST mutual/sync</div>
+        <div class="why">Runs a cycle now instead of waiting for the hourly timer.</div>
+        <button onclick="go('POST','mutual','sync',{})">Sync now</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= EVIDENCE ================= -->
+  <section id="s-ev">
+    <h2 onclick="toggle('s-ev')">Evidence <span class="chev">&#9660;</span></h2>
+    <div class="body">
+      <div class="op">
+        <div class="name">POST codebase/seal</div>
+        <div class="why">Hashes the deployed source tree into one manifest root and seals it with an authorship declaration. Dated evidence of what you held and when — not proof of ownership.</div>
+        <div class="row">
+          <input id="c-author" placeholder="author">
+          <input id="c-entity" placeholder="entity">
+        </div>
+        <input id="c-stmt" placeholder="statement">
+        <div style="height:8px"></div>
+        <button onclick="go('POST','codebase','seal',{author:val('c-author'),entity:val('c-entity'),statement:val('c-stmt')})">Seal codebase</button>
+      </div>
+      <div class="op">
+        <div class="name">POST publish/seal</div>
+        <div class="why">Fetches a URL, hashes the exact bytes served, and seals it. Re-sealing builds a revision history.</div>
+        <input id="p-url" placeholder="https://sebbi.pro/..." autocapitalize="off" spellcheck="false">
+        <div style="height:8px"></div>
+        <button onclick="go('POST','publish','seal',{url:val('p-url')})">Seal page</button>
+      </div>
+      <div class="op">
+        <div class="name">Evidence pack</div>
+        <div class="why">Preview re-verifies a period without issuing. Issue seals the pack's own digest so the document cannot be edited afterwards.</div>
+        <input id="k-period" placeholder="period — 2026-Q3, 2026-08, 2026-08-23" value="2026-08">
+        <div style="height:8px"></div>
+        <div class="row">
+          <button class="quiet" onclick="go('POST','pack','preview',{period:val('k-period')})">Preview</button>
+          <button onclick="go('POST','pack','issue',{period:val('k-period')})">Issue</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= ANY ROUTE ================= -->
+  <section id="s-raw">
+    <h2 onclick="toggle('s-raw')">Any route <span class="chev">&#9660;</span></h2>
+    <div class="body">
+      <div class="op">
+        <div class="why">Every module is reachable here without waiting for a form to be built for it. GET sends the JSON as query parameters; POST sends it as the body.</div>
+        <div class="row">
+          <select id="r-method"><option>GET</option><option>POST</option></select>
+          <input id="r-module" placeholder="module" autocapitalize="off" spellcheck="false">
+          <input id="r-action" placeholder="action" autocapitalize="off" spellcheck="false">
+        </div>
+        <textarea id="r-body" placeholder='{}' spellcheck="false">{}</textarea>
+        <div style="height:8px"></div>
+        <button onclick="raw()">Send</button>
+      </div>
+    </div>
+  </section>
+
+  <div id="out">
+    <div class="head">
+      <span class="code n" id="out-code">READY</span>
+      <span class="route" id="out-route">Nothing sent yet</span>
+    </div>
+    <pre id="out-body">Set a key, then run a route. Start with Wallet → Status.</pre>
+  </div>
+
+  <div class="foot">
+    <b>Notes.</b> The key is held in a variable in this tab only — not in localStorage, not in the URL, not in a cookie.<br>
+    A 401 means no key or the wrong key. A 404 usually means the router has not been armed since the last deploy — send anything once and try again. A 423 means the wallet has halted the key and a person needs to clear it.
+  </div>
+
+</div>
+
+<script>
+var apiKey = "";
+
+function val(id){ return document.getElementById(id).value.trim(); }
+function num(id){ var n = parseInt(val(id), 10); return isNaN(n) ? null : n; }
+
+function keyState(){
+  apiKey = document.getElementById("key").value.trim();
+  var el = document.getElementById("keystate");
+  if(!apiKey){
+    el.innerHTML = "No key set. Every route below will answer <b>401</b>.";
+  } else {
+    el.innerHTML = "Key set — <b>" + apiKey.length + "</b> characters, ending <b>"
+                 + apiKey.slice(-4) + "</b>. Held in this tab only.";
+  }
+}
+
+function toggle(id){ document.getElementById(id).classList.toggle("open"); }
+
+function newReceipt(){
+  var b = new Uint8Array(32);
+  crypto.getRandomValues(b);
+  var hex = Array.from(b).map(function(x){return x.toString(16).padStart(2,"0");}).join("");
+  document.getElementById("w-receipt").value = hex;
+  show("n", "receipt generated",
+       "A fresh 64-hex value.\n\nCharge it once and it is accepted.\nCharge the same one again and the key halts — that is the replay rule working, not a fault.");
+}
+
+function chargeCall(action){
+  var r = val("w-receipt");
+  if(!r){ newReceipt(); r = val("w-receipt"); }
+  go("POST", "wallet", action, { device_id: val("w-device"), receipt: r });
+}
+
+function show(cls, route, text){
+  document.getElementById("out-code").className = "code " + cls;
+  document.getElementById("out-code").textContent =
+    (cls === "n" ? "NOTE" : document.getElementById("out-code").textContent);
+  document.getElementById("out-route").textContent = route;
+  document.getElementById("out-body").textContent = text;
+}
+
+function raw(){
+  var body = {};
+  var txt = val("r-body");
+  if(txt){
+    try { body = JSON.parse(txt); }
+    catch(e){
+      document.getElementById("out-code").className = "code r";
+      document.getElementById("out-code").textContent = "BAD JSON";
+      document.getElementById("out-route").textContent = "not sent";
+      document.getElementById("out-body").textContent =
+        "The body is not valid JSON, so nothing was sent.\n\n" + e;
+      return;
+    }
+  }
+  go(val("r-method"), val("r-module"), val("r-action"), body);
+}
+
+async function go(method, module, action, body){
+  if(!module || !action) return;
+  keyState();
+
+  var path = "/x/" + module + "/" + action;
+  var opts = { method: method, headers: {} };
+
+  if(apiKey){
+    opts.headers["Authorization"] = "Bearer " + apiKey;
+    opts.headers["X-API-Key"] = apiKey;
+  }
+
+  if(method === "GET"){
+    var qs = [];
+    for(var k in (body || {})){
+      if(body[k] === null || body[k] === undefined || body[k] === "") continue;
+      qs.push(encodeURIComponent(k) + "=" + encodeURIComponent(body[k]));
+    }
+    if(qs.length) path += "?" + qs.join("&");
+  } else {
+    opts.headers["Content-Type"] = "application/json";
+    opts.body = JSON.stringify(body || {});
+  }
+
+  var codeEl = document.getElementById("out-code");
+  codeEl.className = "code n";
+  codeEl.textContent = "···";
+  document.getElementById("out-route").textContent = method + " " + path;
+  document.getElementById("out-body").textContent = "Sending…";
+
+  try {
+    var res = await fetch(path, opts);
+    var text = await res.text();
+    var pretty = text;
+    try { pretty = JSON.stringify(JSON.parse(text), null, 2); } catch(e){}
+
+    codeEl.className = "code " + (res.ok ? "g" : "r");
+    codeEl.textContent = res.status + (res.ok ? " OK" : "");
+    document.getElementById("out-body").textContent = pretty;
+
+    if(res.status === 404){
+      document.getElementById("out-body").textContent =
+        pretty + "\n\n— The router may not have been armed since the last deploy. Send this again.";
+    }
+  } catch(e){
+    codeEl.className = "code r";
+    codeEl.textContent = "NO REPLY";
+    document.getElementById("out-body").textContent =
+      "The request never reached the server.\n\n" + e;
+  }
+}
+
+keyState();
+</script>
 </body>
 </html>
 
