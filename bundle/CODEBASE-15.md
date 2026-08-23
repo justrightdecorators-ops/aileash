@@ -1,14 +1,898 @@
-# Codebase — part 15 of 25
+# Codebase — part 15 of 26
 
 Contains:
+- `sebbi_tokensaver.py`
 - `sebdog_engine.py`
 - `sebdog_licence.py`
 - `sebdog_reporter.py`
-- `tests/attack_continuity_1.py`
-- `tests/attack_continuity_2.py`
-- `tests/attack_continuity_3.py`
-- `tests/attack_continuity_4.py`
-- `tests/attack_continuity_5.py`
+
+
+## `sebbi_tokensaver.py`
+
+880 lines, 32471 bytes
+
+```python
+#!/usr/bin/env python3
+"""
+sebbi_tokensaver.py  v1.0.0
+sebbi.pro - the token saver, customer side
+
+WHAT YOU CHANGE
+---------------
+One line. The address your code already sends model requests to.
+
+    before:  base_url = "https://api.anthropic.com"
+    after:   base_url = "http://127.0.0.1:8788"
+
+That is the whole integration. Nothing else in your application
+changes. Same request format, same response format, same everything.
+
+RUN IT
+------
+    python3 sebbi_tokensaver.py --key YOUR_SEBBI_KEY
+
+First run writes sebbi_tokensaver.json next to itself and tells you
+exactly what to paste. After that, just:
+
+    python3 sebbi_tokensaver.py
+
+Check it is working:
+    http://127.0.0.1:8788/saver          a plain page, what it has saved
+    http://127.0.0.1:8788/saver/stats    the same as JSON
+
+WHAT LEAVES YOUR BUILDING
+-------------------------
+Your prompts and your answers do not. They are stored in a SQLite file
+on this machine and nowhere else.
+
+What goes to sebbi.pro is a digest: a SHA-256 fingerprint, and counts.
+How many characters, how many turns, how many tools, what output
+ceiling you set, and whether the request was deterministic. There is no
+way to read a prompt back out of a SHA-256 hash.
+
+You can see every byte of it before it goes:
+    --show-digest       print each digest as it is sent
+    --offline           never contact sebbi.pro at all
+
+WHAT HAPPENS IF SEBBI.PRO IS DOWN
+---------------------------------
+Your traffic keeps flowing. This is the most important line in this
+file. If sebbi.pro cannot be reached, the local cache still serves
+repeats, local hard rules still stop runaways, and everything else goes
+straight to your provider as normal. It fails open, always. A cost tool
+that can take your production down is not worth any saving.
+
+Requests that were gated while sebbi.pro was unreachable are queued and
+sent when it comes back, so the record catches up.
+
+HOW IT SAVES YOU MONEY
+----------------------
+1. An identical request is answered from the local store. Nothing is
+   bought and there is no round trip to anywhere.
+2. A runaway loop is stopped locally in microseconds, before the money
+   goes. This is the one that pays for itself overnight.
+3. A spend ceiling that is actually enforced.
+4. It tells you, per request, what in that request is costing money it
+   does not need to cost: turns you are re-sending, tool definitions
+   nothing calls, temperature set above zero for no reason.
+
+Standard library only. No dependencies. Python 3.8 or newer.
+"""
+
+import argparse
+import hashlib
+import json
+import math
+import os
+import queue
+import sqlite3
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+VERSION = "1.0.0"
+DEFAULT_PORT = 8788
+CONFIG_NAME = "sebbi_tokensaver.json"
+DB_NAME = "sebbi_tokensaver.db"
+SEBBI_DEFAULT = "https://sebbi.pro"
+
+PROVIDERS = {
+    "anthropic": "https://api.anthropic.com",
+    "openai": "https://api.openai.com",
+    "azure": None,
+    "local": "http://127.0.0.1:11434",
+}
+
+KEYED_FIELDS = (
+    "model", "messages", "system", "prompt", "input",
+    "temperature", "top_p", "top_k",
+    "max_tokens", "max_completion_tokens",
+    "stop", "stop_sequences",
+    "tools", "tool_choice", "response_format", "seed",
+)
+
+FORWARD_HEADERS = ("authorization", "x-api-key", "anthropic-version",
+                   "anthropic-beta", "openai-organization", "openai-beta",
+                   "content-type", "accept")
+
+# Local hard rules. Identical to the ones on the platform, so the
+# behaviour does not change when the network does.
+LOOP_WINDOW = 120
+LOOP_HARD = 8
+LOOP_HARD_UNATTENDED = 4
+BURST_HARD = 120
+
+DEFAULT_TTL = 30 * 24 * 3600
+MAX_BODY = 8 * 1024 * 1024
+CHARS_PER_TOKEN = 4.0
+CTX_FLAG_TURNS = 12
+CTX_KEEP_TURNS = 8
+
+
+# ------------------------------------------------------------------ util
+
+def canonical(o):
+    return json.dumps(o, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=True).encode("utf-8")
+
+
+def sha(d):
+    if isinstance(d, str):
+        d = d.encode("utf-8")
+    return hashlib.sha256(d).hexdigest()
+
+
+def fingerprint(req):
+    keyed = {k: req[k] for k in KEYED_FIELDS if k in req}
+    return sha(b"SEBBI-TOKENSAVER-v2\n" + canonical(keyed))
+
+
+def content_chars(v):
+    if v is None:
+        return 0
+    if isinstance(v, str):
+        return len(v)
+    return len(canonical(v))
+
+
+def prompt_chars(req):
+    t = 0
+    for k in ("prompt", "input", "system"):
+        t += content_chars(req.get(k))
+    msgs = req.get("messages")
+    if isinstance(msgs, list):
+        for m in msgs:
+            t += content_chars(m.get("content") if isinstance(m, dict) else m)
+    if req.get("tools") is not None:
+        t += content_chars(req.get("tools"))
+    return t
+
+
+def ask_ceiling(req):
+    v = req.get("max_tokens")
+    if v is None:
+        v = req.get("max_completion_tokens")
+    try:
+        return int(v) if v is not None else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def deterministic(req):
+    t = req.get("temperature")
+    if t is None:
+        return True
+    try:
+        return float(t) == 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+def usage_of(resp):
+    if not isinstance(resp, dict):
+        return (None, None)
+    u = resp.get("usage")
+    if not isinstance(u, dict):
+        return (None, None)
+    i = u.get("input_tokens", u.get("prompt_tokens"))
+    o = u.get("output_tokens", u.get("completion_tokens"))
+    try:
+        return (int(i) if i is not None else None,
+                int(o) if o is not None else None)
+    except (TypeError, ValueError):
+        return (None, None)
+
+
+def digest_of(req):
+    """Exactly what is sent to sebbi.pro. Nothing else, ever."""
+    return {
+        "fingerprint": fingerprint(req),
+        "model": req.get("model"),
+        "prompt_characters": prompt_chars(req),
+        "max_tokens": ask_ceiling(req),
+        "conversation_turns": len(req.get("messages") or []),
+        "tool_definitions": len(req.get("tools") or []),
+        "deterministic": deterministic(req),
+    }
+
+
+def est_tokens(chars):
+    return int(chars / CHARS_PER_TOKEN)
+
+
+# ----------------------------------------------------------------- store
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS answers (
+    fp        TEXT PRIMARY KEY,
+    model     TEXT,
+    body      BLOB NOT NULL,
+    tok_in    INTEGER,
+    tok_out   INTEGER,
+    stored_at REAL NOT NULL,
+    expires   REAL,
+    hits      INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS seen (
+    fp TEXT NOT NULL,
+    ts REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS totals (
+    k TEXT PRIMARY KEY,
+    v REAL NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS outbox (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    action  TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    ts      REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS seen_ts ON seen(ts);
+CREATE INDEX IF NOT EXISTS seen_fp ON seen(fp, ts);
+CREATE INDEX IF NOT EXISTS ans_exp ON answers(expires);
+"""
+
+
+class Store:
+    def __init__(self, path):
+        self.lock = threading.RLock()
+        self.c = sqlite3.connect(path, check_same_thread=False)
+        self.c.execute("PRAGMA journal_mode=WAL")
+        self.c.executescript(SCHEMA)
+        self.c.commit()
+
+    def bump(self, key, by=1):
+        self.c.execute(
+            "INSERT INTO totals (k, v) VALUES (?, ?) "
+            "ON CONFLICT(k) DO UPDATE SET v = v + ?", (key, by, by))
+
+    def total(self, key):
+        r = self.c.execute("SELECT v FROM totals WHERE k=?", (key,)).fetchone()
+        return r[0] if r else 0
+
+    def note_seen(self, fp, now):
+        self.c.execute("INSERT INTO seen (fp, ts) VALUES (?,?)", (fp, now))
+        self.c.execute("DELETE FROM seen WHERE ts < ?", (now - 3600,))
+
+    def counts(self, fp, now):
+        loop = self.c.execute(
+            "SELECT COUNT(*) FROM seen WHERE fp=? AND ts > ?",
+            (fp, now - LOOP_WINDOW)).fetchone()[0]
+        burst = self.c.execute(
+            "SELECT COUNT(*) FROM seen WHERE ts > ?", (now - 60,)).fetchone()[0]
+        return loop, burst
+
+    def get(self, fp, now):
+        r = self.c.execute(
+            "SELECT body, tok_in, tok_out, hits, expires FROM answers "
+            "WHERE fp=?", (fp,)).fetchone()
+        if not r:
+            return None
+        if r[4] is not None and r[4] < now:
+            self.c.execute("DELETE FROM answers WHERE fp=?", (fp,))
+            self.c.commit()
+            return None
+        return r
+
+    def put(self, fp, model, body, ti, to, now, ttl):
+        self.c.execute(
+            "INSERT OR REPLACE INTO answers (fp, model, body, tok_in, "
+            "tok_out, stored_at, expires, hits) VALUES (?,?,?,?,?,?,?,0)",
+            (fp, model, body, ti, to, now, now + ttl if ttl else None))
+
+    def hit(self, fp):
+        self.c.execute("UPDATE answers SET hits=hits+1 WHERE fp=?", (fp,))
+
+    def enqueue(self, action, payload, now):
+        self.c.execute(
+            "INSERT INTO outbox (action, payload, ts) VALUES (?,?,?)",
+            (action, json.dumps(payload), now))
+
+    def take_outbox(self, n=25):
+        rows = self.c.execute(
+            "SELECT id, action, payload FROM outbox ORDER BY id LIMIT ?",
+            (n,)).fetchall()
+        return rows
+
+    def drop_outbox(self, ids):
+        self.c.executemany("DELETE FROM outbox WHERE id=?",
+                           [(i,) for i in ids])
+
+
+# ----------------------------------------------------------------- uplink
+
+class Uplink:
+    """
+    Talks to sebbi.pro. Never blocks a request for long and never stops
+    one. Everything it sends is a digest.
+    """
+
+    def __init__(self, base, key, store, timeout=2.0, offline=False,
+                 show=False):
+        self.base = (base or SEBBI_DEFAULT).rstrip("/")
+        self.key = key
+        self.store = store
+        self.timeout = timeout
+        self.offline = offline
+        self.show = show
+        self.up = None if offline else True
+        self.last_fail = 0.0
+        self.q = queue.Queue(maxsize=5000)
+        t = threading.Thread(target=self._drain, daemon=True)
+        t.start()
+
+    def _post(self, action, payload):
+        url = "%s/x/tokensaver/%s" % (self.base, action)
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(url, data=data, method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Authorization", "Bearer " + self.key)
+        with urllib.request.urlopen(req, timeout=self.timeout) as r:
+            return json.loads(r.read())
+
+    def gate(self, dig, unattended):
+        """
+        Ask the platform. Returns its answer, or None if it could not be
+        reached. None means carry on locally, never means stop.
+        """
+        if self.offline:
+            return None
+        if self.show:
+            sys.stderr.write("[digest] " + json.dumps(dig) + "\n")
+        # Back off for a minute after a failure rather than adding the
+        # timeout to every single request.
+        if self.up is False and (time.time() - self.last_fail) < 60:
+            return None
+        try:
+            out = self._post("gate", {"digest": dig, "unattended": unattended})
+            if self.up is not True:
+                sys.stderr.write("[saver] sebbi.pro reachable again\n")
+            self.up = True
+            return out
+        except Exception as e:  # noqa: BLE001
+            if self.up is not False:
+                sys.stderr.write("[saver] sebbi.pro unreachable (%s). "
+                                 "Traffic continues; records will catch up.\n"
+                                 % e.__class__.__name__)
+            self.up = False
+            self.last_fail = time.time()
+            return None
+
+    def later(self, action, payload):
+        """Fire and forget. Queued to disk if the network is down."""
+        if self.offline:
+            return
+        try:
+            self.q.put_nowait((action, payload))
+        except queue.Full:
+            pass
+
+    def _drain(self):
+        while True:
+            try:
+                action, payload = self.q.get(timeout=5)
+            except queue.Empty:
+                self._flush_outbox()
+                continue
+            try:
+                self._post(action, payload)
+                self.up = True
+            except Exception:  # noqa: BLE001
+                self.up = False
+                self.last_fail = time.time()
+                with self.store.lock:
+                    self.store.enqueue(action, payload, time.time())
+                    self.store.c.commit()
+
+    def _flush_outbox(self):
+        if self.offline or self.up is False:
+            return
+        with self.store.lock:
+            rows = self.store.take_outbox()
+        if not rows:
+            return
+        done = []
+        for rid, action, payload in rows:
+            try:
+                self._post(action, json.loads(payload))
+                done.append(rid)
+            except Exception:  # noqa: BLE001
+                self.up = False
+                self.last_fail = time.time()
+                break
+        if done:
+            with self.store.lock:
+                self.store.drop_outbox(done)
+                self.store.c.commit()
+
+
+# --------------------------------------------------------------- findings
+
+def local_findings(req, loop_n, has_stored):
+    """
+    Computed here, where the content is. These never go to sebbi.pro.
+    """
+    out = []
+    msgs = req.get("messages") or []
+    depth = len(msgs)
+    tools = req.get("tools") or []
+
+    if loop_n >= 2 and not has_stored:
+        out.append("This exact request has gone out %d times in %d seconds "
+                   "and no answer has been stored yet." % (loop_n, LOOP_WINDOW))
+    if not deterministic(req):
+        out.append("temperature is above zero, so this answer cannot be "
+                   "reused. If it does not need to vary, setting it to zero "
+                   "makes every repeat free.")
+    if depth > CTX_FLAG_TURNS:
+        carried = msgs[:-CTX_KEEP_TURNS]
+        chars = sum(content_chars(m.get("content") if isinstance(m, dict)
+                                  else m) for m in carried)
+        out.append("%d turns re-sent every call; the oldest %d are roughly "
+                   "%d tokens (estimated), paid again each time."
+                   % (depth, len(carried), est_tokens(chars)))
+    if tools:
+        used = any("tool_use" in json.dumps(m, default=str)
+                   or "tool_call" in json.dumps(m, default=str) for m in msgs)
+        if not used:
+            out.append("%d tool definitions attached and none has been "
+                       "called; roughly %d tokens (estimated) on every request."
+                       % (len(tools), est_tokens(content_chars(tools))))
+    return out
+
+
+# ----------------------------------------------------------------- server
+
+PAGE = """<!doctype html><meta charset=utf-8>
+<title>sebbi.pro token saver</title>
+<style>
+ body{{font:16px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;
+      background:#101E24;color:#ECEEEC;margin:0;padding:28px}}
+ .w{{max-width:640px;margin:0 auto}}
+ h1{{font-size:19px;letter-spacing:.02em;margin:0 0 4px}}
+ .s{{color:#8fa6ae;font-size:13px;margin-bottom:26px}}
+ .big{{font-size:42px;font-weight:700;color:#F5B31B;line-height:1.1}}
+ .lbl{{color:#8fa6ae;font-size:13px;margin-bottom:26px}}
+ .row{{display:table;width:100%;border-top:1px solid #1C3A44;padding:9px 0}}
+ .k{{display:table-cell;color:#8fa6ae;font-size:14px}}
+ .v{{display:table-cell;text-align:right;font-variant-numeric:tabular-nums}}
+ .n{{margin-top:26px;color:#8fa6ae;font-size:12.5px;border-top:1px solid #1C3A44;
+     padding-top:14px}}
+ .ok{{color:#7fd1a8}} .no{{color:#e8a33d}}
+</style>
+<div class=w>
+<h1>sebbi.pro token saver</h1>
+<div class=s>listening on 127.0.0.1:{port} &middot; forwarding to {upstream}</div>
+<div class=big>{saved}</div>
+<div class=lbl>tokens not bought &middot; exact, from your provider's own counts</div>
+<div class=row><div class=k>requests seen</div><div class=v>{seen}</div></div>
+<div class=row><div class=k>served from your store</div><div class=v>{served}</div></div>
+<div class=row><div class=k>stopped before the model</div><div class=v>{blocked}</div></div>
+<div class=row><div class=k>answers stored here</div><div class=v>{stored}</div></div>
+<div class=row><div class=k>sebbi.pro</div><div class="v {cls}">{link}</div></div>
+<div class=n>Your prompts and answers are on this machine only. What goes to
+sebbi.pro is a fingerprint and a set of counts. If it cannot be reached your
+traffic carries on and the records catch up afterwards.</div>
+</div>"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    cfg = None
+    store = None
+    uplink = None
+
+    def log_message(self, *a):
+        pass
+
+    def _out(self, code, body, ctype="application/json", extra=None):
+        if isinstance(body, (dict, list)):
+            body = json.dumps(body).encode("utf-8")
+        elif isinstance(body, str):
+            body = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        for k, v in (extra or {}).items():
+            self.send_header(k, str(v))
+        self.end_headers()
+        self.wfile.write(body)
+
+    # ---- status pages -------------------------------------------------
+
+    def do_GET(self):
+        p = self.path.split("?")[0].rstrip("/") or "/"
+        if p in ("/saver", "/"):
+            return self._out(200, self._page(), "text/html; charset=utf-8")
+        if p == "/saver/stats":
+            return self._out(200, self._stats())
+        if p == "/saver/health":
+            return self._out(200, {"ok": True, "version": VERSION,
+                                   "sebbi": self._link()})
+        return self._out(404, {"error": "not found",
+                               "try": ["/saver", "/saver/stats"]})
+
+    def _link(self):
+        if self.uplink.offline:
+            return "offline by choice"
+        return "connected" if self.uplink.up else "unreachable"
+
+    def _stats(self):
+        s = self.store
+        with s.lock:
+            stored = s.c.execute("SELECT COUNT(*) FROM answers").fetchone()[0]
+            ti = s.c.execute(
+                "SELECT COALESCE(SUM(tok_in*hits),0), "
+                "COALESCE(SUM(tok_out*hits),0) FROM answers").fetchone()
+            out = {
+                "version": VERSION,
+                "requests_seen": int(s.total("seen")),
+                "served_from_store": int(s.total("served")),
+                "stopped_before_the_model": int(s.total("blocked")),
+                "sent_to_the_model": int(s.total("forwarded")),
+                "answers_stored_here": stored,
+                "tokens_not_bought": {
+                    "input": int(ti[0]), "output": int(ti[1]),
+                    "total": int(ti[0] + ti[1]),
+                    "certainty": "exact, as reported by your provider on the "
+                                 "original call",
+                },
+                "queued_for_sebbi": s.c.execute(
+                    "SELECT COUNT(*) FROM outbox").fetchone()[0],
+                "sebbi_pro": self._link(),
+                "content_sent_to_sebbi_pro": "none. A fingerprint and counts "
+                                             "only.",
+            }
+        return out
+
+    def _page(self):
+        st = self._stats()
+        return PAGE.format(
+            port=self.cfg["port"], upstream=self.cfg["upstream"],
+            saved="{:,}".format(st["tokens_not_bought"]["total"]),
+            seen="{:,}".format(st["requests_seen"]),
+            served="{:,}".format(st["served_from_store"]),
+            blocked="{:,}".format(st["stopped_before_the_model"]),
+            stored="{:,}".format(st["answers_stored_here"]),
+            link=st["sebbi_pro"],
+            cls="ok" if st["sebbi_pro"] == "connected" else "no")
+
+    # ---- the actual gate ----------------------------------------------
+
+    def do_POST(self):
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return self._out(400, {"error": "bad content length"})
+        if n > MAX_BODY:
+            return self._out(413, {"error": "request too large"})
+        raw = self.rfile.read(n) if n else b"{}"
+
+        try:
+            req = json.loads(raw)
+            if not isinstance(req, dict):
+                raise ValueError
+        except ValueError:
+            # Not something we understand. Pass it through untouched.
+            return self._forward(raw, None, "passthrough")
+
+        if req.get("stream"):
+            return self._forward(raw, req, "streaming-not-cached")
+
+        now = time.time()
+        fp = fingerprint(req)
+        s = self.store
+
+        with s.lock:
+            row = s.get(fp, now)
+            loop_n, burst_n = s.counts(fp, now)
+            s.bump("seen")
+            s.note_seen(fp, now)
+            s.c.commit()
+
+        # 1. Local store. No network, no provider, nothing bought.
+        if row:
+            with s.lock:
+                s.hit(fp)
+                s.bump("served")
+                s.c.commit()
+            self.uplink.later("gate", {"digest": digest_of(req),
+                                       "unattended": self.cfg["unattended"]})
+            return self._out(200, row[0], "application/json", {
+                "X-Saver": "served-from-your-store",
+                "X-Saver-Tokens-Not-Bought": (row[1] or 0) + (row[2] or 0),
+            })
+
+        # 2. Local hard rules. These run with or without a network.
+        unattended = self.cfg["unattended"]
+        rule = None
+        if loop_n >= LOOP_HARD:
+            rule = "runaway_loop"
+        elif unattended and loop_n >= LOOP_HARD_UNATTENDED:
+            rule = "runaway_loop_unattended"
+        elif burst_n >= BURST_HARD:
+            rule = "runaway_burst"
+
+        if rule:
+            with s.lock:
+                s.bump("blocked")
+                s.c.commit()
+            self.uplink.later("gate", {"digest": digest_of(req),
+                                       "unattended": unattended})
+            return self._refuse(rule, req, loop_n, burst_n)
+
+        # 3. The platform. If it does not answer, we carry on.
+        verdict = None
+        receipt = None
+        findings = []
+        if not self.cfg["local_only"]:
+            ans = self.uplink.gate(digest_of(req), unattended)
+            if ans:
+                verdict = ans.get("verdict")
+                receipt = (ans.get("receipt") or {}).get("hash")
+                findings = [f.get("detail") for f in (ans.get("findings") or [])]
+
+        if verdict == "BLOCK":
+            with s.lock:
+                s.bump("blocked")
+                s.c.commit()
+            return self._refuse(ans.get("rule") or "score", req, loop_n,
+                                burst_n, receipt, ans.get("score"))
+
+        if verdict == "CHALLENGE" and self.cfg["strict"]:
+            with s.lock:
+                s.bump("blocked")
+                s.c.commit()
+            return self._refuse("held_for_a_person", req, loop_n, burst_n,
+                                receipt, ans.get("score"))
+
+        if not findings:
+            with s.lock:
+                has = s.get(fp, now) is not None
+            findings = local_findings(req, loop_n, has)
+
+        return self._forward(raw, req, "sent-to-the-model", verdict, receipt,
+                             findings)
+
+    def _refuse(self, rule, req, loop_n, burst_n, receipt=None, score=None):
+        ask = ask_ceiling(req)
+        body = {
+            "error": {
+                "type": "sebbi_tokensaver_refused",
+                "rule": rule,
+                "message": {
+                    "runaway_loop":
+                        "The same request has gone out %d times in %d "
+                        "seconds. It was stopped here rather than paid for."
+                        % (loop_n, LOOP_WINDOW),
+                    "runaway_loop_unattended":
+                        "The same request has gone out %d times in %d "
+                        "seconds with no human watching. Stopped here."
+                        % (loop_n, LOOP_WINDOW),
+                    "runaway_burst":
+                        "%d requests in the last minute. Stopped here."
+                        % burst_n,
+                    "budget_exhausted":
+                        "This key has reached its token ceiling.",
+                    "exceeds_remaining_budget":
+                        "This single call could cost more than the budget "
+                        "left.",
+                    "held_for_a_person":
+                        "Held for a person to look at before spending.",
+                }.get(rule, "Refused before reaching the model."),
+                "tokens_not_spent": "this request never reached your provider, "
+                                    "so no completion was paid for",
+                "output_ceiling_it_would_have_authorised": ask,
+            }
+        }
+        if receipt:
+            body["error"]["receipt"] = receipt
+        if score is not None:
+            body["error"]["score"] = score
+        return self._out(429, body, "application/json",
+                         {"X-Saver": "refused", "X-Saver-Rule": rule})
+
+    def _forward(self, raw, req, why, verdict=None, receipt=None,
+                 findings=None):
+        url = self.cfg["upstream"].rstrip("/") + self.path
+        r = urllib.request.Request(url, data=raw, method="POST")
+        for h in FORWARD_HEADERS:
+            v = self.headers.get(h)
+            if v:
+                r.add_header(h, v)
+        for k, v in (self.cfg.get("headers") or {}).items():
+            r.add_header(k, v)
+
+        try:
+            with urllib.request.urlopen(r, timeout=self.cfg["timeout"]) as up:
+                body, code = up.read(), up.getcode()
+        except urllib.error.HTTPError as e:
+            body, code = e.read(), e.code
+        except Exception as e:  # noqa: BLE001
+            return self._out(502, {"error": {
+                "type": "upstream_unreachable",
+                "message": "Your provider could not be reached. This is "
+                           "between you and them; the saver only forwards.",
+                "detail": str(e)}})
+
+        with self.store.lock:
+            self.store.bump("forwarded")
+            self.store.c.commit()
+
+        if code == 200 and isinstance(req, dict) and why == "sent-to-the-model":
+            self._keep(req, body)
+
+        extra = {"X-Saver": why}
+        if verdict:
+            extra["X-Saver-Verdict"] = verdict
+        if receipt:
+            extra["X-Saver-Receipt"] = receipt
+        if findings:
+            extra["X-Saver-Findings"] = str(len(findings))
+            for i, f in enumerate(findings[:3]):
+                extra["X-Saver-Finding-%d" % (i + 1)] = f[:180]
+        return self._out(code, body, "application/json", extra)
+
+    def _keep(self, req, body):
+        """Store the answer here, and tell sebbi.pro only what it cost."""
+        if not deterministic(req) and not self.cfg["store_varied"]:
+            return
+        try:
+            resp = json.loads(body)
+        except ValueError:
+            return
+        ti, to = usage_of(resp)
+        now = time.time()
+        fp = fingerprint(req)
+        with self.store.lock:
+            self.store.put(fp, req.get("model"), body, ti, to, now,
+                           self.cfg["ttl"])
+            self.store.c.commit()
+        self.uplink.later("record", {
+            "digest": digest_of(req),
+            "usage": {"input_tokens": ti, "output_tokens": to},
+        })
+
+
+# ------------------------------------------------------------------- cli
+
+def load_config(path):
+    if os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+    return {}
+
+
+def save_config(path, cfg):
+    safe = dict(cfg)
+    with open(path, "w") as f:
+        json.dump(safe, f, indent=2)
+
+
+def main():
+    here = os.path.dirname(os.path.abspath(__file__))
+    ap = argparse.ArgumentParser(
+        description="sebbi.pro token saver - change one line in your app")
+    ap.add_argument("--key", help="your sebbi.pro key")
+    ap.add_argument("--upstream", help="your provider, e.g. "
+                                       "https://api.anthropic.com")
+    ap.add_argument("--provider", choices=sorted(PROVIDERS),
+                    help="shorthand for --upstream")
+    ap.add_argument("--port", type=int, default=DEFAULT_PORT)
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--sebbi", default=None, help="platform base url")
+    ap.add_argument("--ttl-days", type=float, default=30.0)
+    ap.add_argument("--timeout", type=float, default=300.0,
+                    help="how long to wait on your provider")
+    ap.add_argument("--gate-timeout", type=float, default=2.0,
+                    help="how long to wait on sebbi.pro before carrying on")
+    ap.add_argument("--unattended", action="store_true",
+                    help="no human is watching this system")
+    ap.add_argument("--strict", action="store_true",
+                    help="also refuse requests marked for a person to check")
+    ap.add_argument("--store-varied", action="store_true",
+                    help="also store answers where temperature is above zero")
+    ap.add_argument("--offline", action="store_true",
+                    help="never contact sebbi.pro; local saving only")
+    ap.add_argument("--local-only", action="store_true",
+                    help="local rules decide; still send records to sebbi.pro")
+    ap.add_argument("--show-digest", action="store_true",
+                    help="print every digest before it is sent")
+    ap.add_argument("--db", default=os.path.join(here, DB_NAME))
+    ap.add_argument("--config", default=os.path.join(here, CONFIG_NAME))
+    a = ap.parse_args()
+
+    saved = load_config(a.config)
+    key = a.key or saved.get("key") or os.environ.get("SEBBI_KEY")
+    upstream = a.upstream or (PROVIDERS.get(a.provider) if a.provider else None) \
+        or saved.get("upstream")
+    sebbi = a.sebbi or saved.get("sebbi") or SEBBI_DEFAULT
+
+    if not upstream:
+        print("Which provider are you calling? Use one of:")
+        print("  --provider anthropic      (https://api.anthropic.com)")
+        print("  --provider openai         (https://api.openai.com)")
+        print("  --upstream https://...    (anything else)")
+        return 2
+
+    if not key and not a.offline:
+        print("No sebbi.pro key. Either:")
+        print("  --key YOUR_KEY      to seal your savings as receipts")
+        print("  --offline           to save tokens locally with no account")
+        return 2
+
+    cfg = {"key": key, "upstream": upstream, "sebbi": sebbi,
+           "port": a.port, "unattended": a.unattended, "strict": a.strict,
+           "store_varied": a.store_varied, "ttl": a.ttl_days * 86400,
+           "timeout": a.timeout, "local_only": a.local_only,
+           "headers": saved.get("headers") or {}}
+    save_config(a.config, {"key": key, "upstream": upstream, "sebbi": sebbi,
+                           "headers": cfg["headers"]})
+
+    store = Store(a.db)
+    uplink = Uplink(sebbi, key or "", store, timeout=a.gate_timeout,
+                    offline=a.offline, show=a.show_digest)
+
+    Handler.cfg = cfg
+    Handler.store = store
+    Handler.uplink = uplink
+
+    srv = ThreadingHTTPServer((a.host, a.port), Handler)
+    srv.daemon_threads = True
+
+    where = "http://%s:%d" % (a.host, a.port)
+    print("")
+    print("  sebbi.pro token saver %s" % VERSION)
+    print("  ---------------------------------------------")
+    print("  Change ONE line in your application:")
+    print("")
+    print("      base_url = \"%s\"" % where)
+    print("")
+    print("  forwarding to      %s" % upstream)
+    print("  sebbi.pro          %s" % ("offline by choice" if a.offline
+                                       else sebbi))
+    print("  answers stored at  %s" % a.db)
+    print("  what it has saved  %s/saver" % where)
+    print("")
+    print("  Your prompts stay on this machine. Only a fingerprint and")
+    print("  counts go to sebbi.pro. If it is unreachable your traffic")
+    print("  keeps flowing and the records catch up.")
+    print("")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\n  stopping. Nothing was lost.")
+        srv.shutdown()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+```
 
 
 ## `sebdog_engine.py`
@@ -1590,1050 +2474,5 @@ if __name__ == "__main__":
         with open(out, "w") as f:
             f.write(report)
         print(f"Report saved to {out}")
-
-```
-
-
-## `tests/attack_continuity_1.py`
-
-440 lines, 22747 bytes
-
-```python
-#!/usr/bin/env python3
-"""Attack harness for modules/lineage.py.
-
-Every test is written from the position of an agent that HAS some authority
-and is trying to end up with more. Passing means the attack was refused for
-the right reason, not merely refused.
-"""
-
-import hashlib
-import json
-import sqlite3
-import threading
-import time
-import sys
-
-import continuity as lineage
-# --- stand-in for the deployed engine ---------------------------------
-import types as _types
-_ENGINE = {"verdict": "ALLOW"}
-
-def install_engine(verdict="ALLOW", raises=False, shape="dict"):
-    _ENGINE["verdict"] = verdict
-    mod = _types.ModuleType("server")
-    mod.get_bearer = lambda *a, **k: None
-    def score_event(event):
-        if raises:
-            raise RuntimeError("engine down")
-        if shape == "dict":
-            return {"decision": _ENGINE["verdict"], "score": 0.1}
-        if shape == "tuple":
-            return (_ENGINE["verdict"], 0.1)
-        return _ENGINE["verdict"]
-    mod.score_event = score_event
-    sys.modules["server"] = mod
-
-def remove_engine():
-    sys.modules.pop("server", None)
-
-install_engine("ALLOW")
-
-
-PASS, FAIL = [], []
-
-
-def make_ctx():
-    conn = sqlite3.connect(":memory:", check_same_thread=False)
-    lock = threading.RLock()
-    chain = {"n": 0, "prev": "0" * 64}
-
-    def seal(ev, res, ts, api_key):
-        chain["n"] += 1
-        payload = json.dumps([ev, res, ts, api_key, chain["prev"]], sort_keys=True)
-        h = hashlib.sha256(payload.encode()).hexdigest()
-        chain["prev"] = h
-        return h, chain["n"], chain["n"]
-
-    lineage._ready = False
-    ctx = {"conn": conn, "lock": lock, "seal": seal}
-    lineage._setup(ctx)
-    return ctx
-
-
-def check(name, condition, detail=""):
-    (PASS if condition else FAIL).append(name)
-    print(("  ok   " if condition else "  FAIL ") + name + (("  -> " + detail) if detail and not condition else ""))
-
-
-def issue(ctx, **kw):
-    if kw.get("parent") and int(kw.get("delegations_left", 0)) > 0 \
-            and not kw.get("risk_accepted_by"):
-        kw["risk_accepted_by"] = "owner@example.com"
-    return lineage._issue(ctx, "k", kw)
-
-
-def exercise(ctx, **kw):
-    return lineage._evaluate(ctx, "k", kw)
-
-
-NOW = time.time()
-HOUR = 3600
-
-
-def base_root(ctx, **over):
-    args = dict(
-        id="root", issuer="justin@monop", issuer_kind="human",
-        subject="orchestrator", subject_kind="agent",
-        scope=["payments.refund", "payments.read", "tickets.*"],
-        constraints={"max_amount": 5000, "allowed_currency": ["GBP", "EUR"],
-                     "denied_country": ["KP"], "may_contact_customer": True},
-        purpose="resolve customer refund complaints",
-        purpose_tags=["refunds", "support"],
-        not_before=NOW - HOUR, not_after=NOW + 10 * HOUR,
-        delegations_left=3)
-    args.update(over)
-    return issue(ctx, **args)
-
-
-print("\n=== 1. the happy path must actually work ===")
-ctx = make_ctx()
-base_root(ctx)
-issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent",
-      subject="refund-agent", scope=["payments.refund"],
-      constraints={"max_amount": 500, "allowed_currency": ["GBP"],
-                   "denied_country": ["KP"], "may_contact_customer": True},
-      purpose="issue refunds under 500", purpose_tags=["refunds"],
-      not_before=NOW - HOUR, not_after=NOW + 2 * HOUR, delegations_left=1)
-r, code = exercise(ctx, grant="mid", action="payments.refund",
-                   params={"amount": 100, "currency": "GBP", "country": "GB",
-                           "contact_customer": True},
-                   purpose_tag="refunds")
-check("a derivable action returns ALLOW", r["verdict"] == "ALLOW", str(r["reasons"]))
-check("lineage names the human at the root", r["authorised_by"] == "justin@monop")
-check("depth is reported", r["delegation_depth"] == 1)
-check("the decision is sealed", bool(r.get("sealed_in_chain")))
-
-print("\n=== 2. orphan root: an agent grants itself authority ===")
-ctx = make_ctx()
-r, code = issue(ctx, id="self", issuer="rogue-agent", issuer_kind="agent",
-                subject="rogue-agent", scope=["payments.refund"],
-                constraints={"max_amount": 999999}, purpose="whatever I decide",
-                purpose_tags=["anything"], not_after=NOW + HOUR)
-check("self-issued root is refused at issue", code == 409 and r.get("error") == "identity_continuity", str(r))
-
-print("\n=== 3. scope escalation in a child ===")
-ctx = make_ctx()
-base_root(ctx)
-r, code = issue(ctx, id="wide", parent="root", issuer="orchestrator", issuer_kind="agent",
-                subject="rogue", scope=["payments.refund", "payments.transfer"],
-                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
-                             "denied_country": ["KP"], "may_contact_customer": False},
-                purpose="sneak in a transfer", purpose_tags=["refunds"],
-                not_after=NOW + HOUR, delegations_left=0)
-check("scope the parent never held is refused",
-      code == 409 and "payments.transfer" in r.get("message", ""), str(r))
-
-print("\n=== 4. constraint loosening ===")
-ctx = make_ctx()
-base_root(ctx)
-r, code = issue(ctx, id="rich", parent="root", issuer="orchestrator", issuer_kind="agent",
-                subject="rogue", scope=["payments.refund"],
-                constraints={"max_amount": 50000, "allowed_currency": ["GBP"],
-                             "denied_country": ["KP"], "may_contact_customer": True},
-                purpose="bigger refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
-check("raising a max_ cap is refused", code == 409 and "max_amount" in r.get("message", ""), str(r))
-
-r, code = issue(ctx, id="wide2", parent="root", issuer="orchestrator", issuer_kind="agent",
-                subject="rogue", scope=["payments.refund"],
-                constraints={"max_amount": 100, "allowed_currency": ["GBP", "USD"],
-                             "denied_country": ["KP"], "may_contact_customer": True},
-                purpose="new currency", purpose_tags=["refunds"], not_after=NOW + HOUR)
-check("adding to an allowed_ set is refused", code == 409 and "USD" in r.get("message", ""), str(r))
-
-r, code = issue(ctx, id="undeny", parent="root", issuer="orchestrator", issuer_kind="agent",
-                subject="rogue", scope=["payments.refund"],
-                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
-                             "denied_country": [], "may_contact_customer": True},
-                purpose="drop the denylist", purpose_tags=["refunds"], not_after=NOW + HOUR)
-check("dropping from a denied_ set is refused", code == 409 and "KP" in r.get("message", ""), str(r))
-
-r, code = issue(ctx, id="newkey", parent="root", issuer="orchestrator", issuer_kind="agent",
-                subject="rogue", scope=["payments.refund"],
-                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
-                             "denied_country": ["KP"], "may_contact_customer": True,
-                             "may_export_data": True},
-                purpose="invent a permission", purpose_tags=["refunds"], not_after=NOW + HOUR)
-check("introducing a constraint key the parent never expressed is refused",
-      code == 409 and "may_export_data" in r.get("message", ""), str(r))
-
-print("\n=== 5. temporal attacks ===")
-ctx = make_ctx()
-base_root(ctx)
-r, code = issue(ctx, id="long", parent="root", issuer="orchestrator", issuer_kind="agent",
-                subject="rogue", scope=["payments.refund"],
-                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
-                             "denied_country": ["KP"], "may_contact_customer": True},
-                purpose="outlive the parent", purpose_tags=["refunds"],
-                not_before=NOW, not_after=NOW + 100 * HOUR)
-check("a child cannot outlive its parent", code == 409 and r.get("error") == "temporal_validity", str(r))
-
-# expired ancestor, live leaf, forced in past the issue check
-ctx = make_ctx()
-base_root(ctx, not_after=NOW + HOUR)
-issue(ctx, id="child", parent="root", issuer="orchestrator", issuer_kind="agent",
-      subject="agent-b", scope=["payments.refund"],
-      constraints={"max_amount": 100, "allowed_currency": ["GBP"],
-                   "denied_country": ["KP"], "may_contact_customer": True},
-      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
-with ctx["lock"]:
-    ctx["conn"].execute("UPDATE auth_grant SET not_after=? WHERE id='root'", (NOW - 60,))
-    ctx["conn"].commit()
-r, _ = exercise(ctx, grant="child", action="payments.refund",
-                params={"amount": 10, "currency": "GBP", "country": "GB",
-                        "contact_customer": True}, purpose_tag="refunds")
-check("an expired ancestor kills a live leaf", r["verdict"] == "BLOCK", str(r["reasons"]))
-check("...and it is reported as tampering, since the row no longer matches its digest",
-      r["broken_invariant"] == "evidence_continuity", r["broken_invariant"] or "")
-
-print("\n=== 6. revocation is transitive ===")
-ctx = make_ctx()
-base_root(ctx)
-issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent",
-      subject="b", scope=["payments.refund"],
-      constraints={"max_amount": 100, "allowed_currency": ["GBP"],
-                   "denied_country": ["KP"], "may_contact_customer": True},
-      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR, delegations_left=1)
-issue(ctx, id="leaf", parent="mid", issuer="b", issuer_kind="agent",
-      subject="c", scope=["payments.refund"],
-      constraints={"max_amount": 50, "allowed_currency": ["GBP"],
-                   "denied_country": ["KP"], "may_contact_customer": True},
-      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
-lineage._revoke(ctx, "k", {"grant": "mid", "reason": "agent compromised"})
-r, _ = exercise(ctx, grant="leaf", action="payments.refund",
-                params={"amount": 10, "currency": "GBP", "country": "GB",
-                        "contact_customer": True}, purpose_tag="refunds")
-check("revoking the middle blocks the leaf without touching it", r["verdict"] == "BLOCK")
-check("the revoked grant is named", r["broken_at"] == "mid", str(r["broken_at"]))
-r2, _ = exercise(ctx, grant="root", action="payments.refund",
-                 params={"amount": 10, "currency": "GBP", "country": "GB",
-                         "contact_customer": True}, purpose_tag="refunds")
-check("revoking a child does not harm the parent", r2["verdict"] == "ALLOW", str(r2["reasons"]))
-
-print("\n=== 7. delegation depth cannot be manufactured ===")
-ctx = make_ctx()
-base_root(ctx, delegations_left=1)
-issue(ctx, id="d1", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
-      scope=["payments.refund"],
-      constraints={"max_amount": 100, "allowed_currency": ["GBP"],
-                   "denied_country": ["KP"], "may_contact_customer": True},
-      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR, delegations_left=0)
-r, code = issue(ctx, id="d2", parent="d1", issuer="b", issuer_kind="agent", subject="c",
-                scope=["payments.refund"],
-                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
-                             "denied_country": ["KP"], "may_contact_customer": True},
-                purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
-check("an exhausted delegation budget stops the chain",
-      code == 409 and r.get("error") == "delegation_not_permitted", str(r))
-
-ctx = make_ctx()
-base_root(ctx, delegations_left=2)
-r, code = issue(ctx, id="greedy", parent="root", issuer="orchestrator", issuer_kind="agent",
-                subject="b", scope=["payments.refund"],
-                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
-                             "denied_country": ["KP"], "may_contact_customer": True},
-                purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR,
-                delegations_left=5)
-check("a child cannot award itself more onward delegations than remained",
-      code == 409, str(r))
-
-print("\n=== 8. tampering with a stored grant ===")
-ctx = make_ctx()
-base_root(ctx)
-issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
-      scope=["payments.refund"],
-      constraints={"max_amount": 100, "allowed_currency": ["GBP"],
-                   "denied_country": ["KP"], "may_contact_customer": True},
-      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
-with ctx["lock"]:
-    ctx["conn"].execute(
-        "UPDATE auth_grant SET constraints=? WHERE id='mid'",
-        (json.dumps({"max_amount": 999999, "allowed_currency": ["GBP", "USD"],
-                     "denied_country": [], "may_contact_customer": True},
-                    sort_keys=True, separators=(",", ":")),))
-    ctx["conn"].commit()
-r, _ = exercise(ctx, grant="mid", action="payments.refund",
-                params={"amount": 900000, "currency": "USD", "country": "GB",
-                        "contact_customer": True}, purpose_tag="refunds")
-check("editing the database does not widen authority", r["verdict"] == "BLOCK")
-check("the tamper is reported as an evidence failure",
-      r["broken_invariant"] == "evidence_continuity", str(r["broken_invariant"]))
-
-print("\n=== 9. re-parenting onto a wider ancestor ===")
-ctx = make_ctx()
-base_root(ctx)
-issue(ctx, id="narrow", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
-      scope=["payments.read"],
-      constraints={"max_amount": 1, "allowed_currency": ["GBP"],
-                   "denied_country": ["KP"], "may_contact_customer": False},
-      purpose="read only", purpose_tags=["support"], not_after=NOW + HOUR)
-with ctx["lock"]:
-    ctx["conn"].execute("UPDATE auth_grant SET parent=NULL WHERE id='narrow'")
-    ctx["conn"].commit()
-r, _ = exercise(ctx, grant="narrow", action="payments.read",
-                params={}, purpose_tag="support")
-check("detaching a grant to make it a root fails integrity", r["verdict"] == "BLOCK",
-      str(r["reasons"]))
-
-print("\n=== 10. parent cycle ===")
-ctx = make_ctx()
-base_root(ctx)
-issue(ctx, id="a", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
-      scope=["payments.refund"],
-      constraints={"max_amount": 100, "allowed_currency": ["GBP"],
-                   "denied_country": ["KP"], "may_contact_customer": True},
-      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR, delegations_left=1)
-issue(ctx, id="b", parent="a", issuer="b", issuer_kind="agent", subject="c",
-      scope=["payments.refund"],
-      constraints={"max_amount": 50, "allowed_currency": ["GBP"],
-                   "denied_country": ["KP"], "may_contact_customer": True},
-      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
-with ctx["lock"]:
-    ctx["conn"].execute("UPDATE auth_grant SET parent='b' WHERE id='a'")
-    ctx["conn"].commit()
-start = time.time()
-r, _ = exercise(ctx, grant="b", action="payments.refund",
-                params={"amount": 10, "currency": "GBP", "country": "GB",
-                        "contact_customer": True}, purpose_tag="refunds")
-check("a parent cycle terminates rather than hangs", time.time() - start < 2)
-check("a cycle is BLOCKed as an authority failure", r["verdict"] == "BLOCK")
-
-print("\n=== 11. action parameters beyond the effective constraints ===")
-ctx = make_ctx()
-base_root(ctx)
-issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
-      scope=["payments.refund"],
-      constraints={"max_amount": 500, "allowed_currency": ["GBP"],
-                   "denied_country": ["KP"], "may_contact_customer": True},
-      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
-r, _ = exercise(ctx, grant="mid", action="payments.refund",
-                params={"amount": 501, "currency": "GBP", "country": "GB",
-                        "contact_customer": True}, purpose_tag="refunds")
-check("an amount over the cap is BLOCKed", r["verdict"] == "BLOCK", str(r["reasons"]))
-r, _ = exercise(ctx, grant="mid", action="payments.refund",
-                params={"amount": 10, "currency": "GBP", "country": "KP",
-                        "contact_customer": True}, purpose_tag="refunds")
-check("a denied country is BLOCKed", r["verdict"] == "BLOCK", str(r["reasons"]))
-
-print("\n=== 12. uncertainty is challenged, not guessed ===")
-ctx = make_ctx()
-base_root(ctx)
-issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
-      scope=["payments.refund"],
-      constraints={"max_amount": 500, "allowed_currency": ["GBP"],
-                   "denied_country": ["KP"], "may_contact_customer": True},
-      purpose="issue refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
-r, _ = exercise(ctx, grant="mid", action="payments.refund",
-                params={"amount": 10, "currency": "GBP", "country": "GB",
-                        "contact_customer": True}, purpose_tag="marketing")
-check("a purpose the grant does not carry is CHALLENGED", r["verdict"] == "CHALLENGE", str(r))
-r, _ = exercise(ctx, grant="mid", action="payments.refund",
-                params={"amount": 10, "currency": "GBP", "country": "GB",
-                        "contact_customer": True})
-check("no declared purpose is CHALLENGED", r["verdict"] == "CHALLENGE", str(r))
-r, _ = exercise(ctx, grant="mid", action="payments.refund",
-                params={"amount": 10, "currency": "GBP", "country": "GB",
-                        "contact_customer": True, "recipient_iban": "GB00XXXX"},
-                purpose_tag="refunds")
-check("an unconstrained parameter is CHALLENGED, not ignored",
-      r["verdict"] == "CHALLENGE" and any("recipient_iban" in x for x in r["reasons"]), str(r))
-
-print("\n=== 13. wildcard breadth ===")
-ctx = make_ctx()
-base_root(ctx)
-r, _ = exercise(ctx, grant="root", action="tickets.close.bulk.all",
-                params={}, purpose_tag="support")
-check("a broad wildcard match is CHALLENGED rather than silently allowed",
-      r["verdict"] == "CHALLENGE", str(r))
-
-ctx = make_ctx()
-base_root(ctx, scope=["*"], id="star")
-r, _ = exercise(ctx, grant="star", action="payments.transfer", params={}, purpose_tag="refunds")
-check("a bare * never reaches ALLOW", r["verdict"] == "CHALLENGE", str(r))
-
-print("\n=== 14. no union of grants ===")
-ctx = make_ctx()
-base_root(ctx)
-issue(ctx, id="money", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
-      scope=["payments.refund"],
-      constraints={"max_amount": 500, "allowed_currency": ["GBP"],
-                   "denied_country": ["KP"], "may_contact_customer": False},
-      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
-issue(ctx, id="contact", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
-      scope=["payments.read"],
-      constraints={"max_amount": 0, "allowed_currency": ["GBP"],
-                   "denied_country": ["KP"], "may_contact_customer": True},
-      purpose="contact", purpose_tags=["support"], not_after=NOW + HOUR)
-r, code = exercise(ctx, grant="money,contact", action="payments.refund",
-                   params={"amount": 10, "currency": "GBP", "contact_customer": True},
-                   purpose_tag="refunds")
-check("two grant ids cannot be combined into one exercise", r["verdict"] == "BLOCK", str(r))
-r, _ = exercise(ctx, grant="money", action="payments.refund",
-                params={"amount": 10, "currency": "GBP", "contact_customer": True},
-                purpose_tag="refunds")
-check("the capability from the sibling grant does not leak in", r["verdict"] == "BLOCK",
-      str(r["reasons"]))
-
-print("\n=== 15. time of check vs time of use ===")
-ctx = make_ctx()
-base_root(ctx)
-issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
-      scope=["payments.refund"],
-      constraints={"max_amount": 500, "allowed_currency": ["GBP"],
-                   "denied_country": ["KP"], "may_contact_customer": True},
-      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
-r, _ = exercise(ctx, grant="mid", action="payments.refund",
-                params={"amount": 10, "currency": "GBP", "country": "GB",
-                        "contact_customer": True}, purpose_tag="refunds")
-eval_id = r["evaluation"]
-c, code = lineage._confirm(ctx, "k", {"evaluation": eval_id, "action": "payments.refund",
-                                      "params": {"amount": 10, "currency": "GBP",
-                                                 "country": "GB", "contact_customer": True}})
-check("executing exactly what was evaluated binds", c["bound"] is True, str(c))
-c, code = lineage._confirm(ctx, "k", {"evaluation": eval_id, "action": "payments.refund",
-                                      "params": {"amount": 400, "currency": "GBP",
-                                                 "country": "GB", "contact_customer": True}})
-check("executing different values than were evaluated is rejected", c["bound"] is False, str(c))
-check("the rejected execution is still sealed", bool(c.get("sealed_in_chain")))
-
-with ctx["lock"]:
-    ctx["conn"].execute("UPDATE auth_eval SET valid_until=? WHERE id=?", (NOW - 1, eval_id))
-    ctx["conn"].commit()
-c, _ = lineage._confirm(ctx, "k", {"evaluation": eval_id})
-check("a banked evaluation cannot be spent after its window", c["bound"] is False, str(c))
-
-print("\n=== 16. a BLOCK is evidence, not silence ===")
-ctx = make_ctx()
-base_root(ctx)
-r, _ = exercise(ctx, grant="nonexistent", action="payments.refund", params={})
-check("an unknown grant BLOCKs", r["verdict"] == "BLOCK")
-check("the block is sealed in the chain", bool(r.get("sealed_in_chain")))
-d, code = lineage._decision(ctx, {"evaluation": r["evaluation"]})
-check("the sealed decision is publicly retrievable", code == 200 and d["verdict"] == "BLOCK")
-
-print("\n=== 17. no authority without a stated purpose or an end date ===")
-ctx = make_ctx()
-r, code = issue(ctx, id="forever", issuer="justin@monop", issuer_kind="human", subject="a",
-                scope=["payments.refund"], constraints={"max_amount": 1},
-                purpose="anything", purpose_tags=["x"])
-check("a grant with no expiry is refused", code == 400 and r.get("error") == "not_after_required")
-r, code = issue(ctx, id="vague", issuer="justin@monop", issuer_kind="human", subject="a",
-                scope=["payments.refund"], constraints={"max_amount": 1},
-                purpose="", purpose_tags=["x"], not_after=NOW + HOUR)
-check("a grant with no purpose is refused", code == 400 and r.get("error") == "purpose_required")
-
-print("\n" + "=" * 60)
-print("passed %d, failed %d" % (len(PASS), len(FAIL)))
-if FAIL:
-    for f in FAIL:
-        print("  FAILED: " + f)
-    sys.exit(1)
-
-```
-
-
-## `tests/attack_continuity_2.py`
-
-228 lines, 10573 bytes
-
-```python
-#!/usr/bin/env python3
-"""Second wave. The first wave tested the obvious escalations. This one
-tests the ones that would survive a code review."""
-
-import hashlib
-import json
-import sqlite3
-import threading
-import time
-import sys
-
-import continuity as lineage
-# --- stand-in for the deployed engine ---------------------------------
-import types as _types
-_ENGINE = {"verdict": "ALLOW"}
-
-def install_engine(verdict="ALLOW", raises=False, shape="dict"):
-    _ENGINE["verdict"] = verdict
-    mod = _types.ModuleType("server")
-    mod.get_bearer = lambda *a, **k: None
-    def score_event(event):
-        if raises:
-            raise RuntimeError("engine down")
-        if shape == "dict":
-            return {"decision": _ENGINE["verdict"], "score": 0.1}
-        if shape == "tuple":
-            return (_ENGINE["verdict"], 0.1)
-        return _ENGINE["verdict"]
-    mod.score_event = score_event
-    sys.modules["server"] = mod
-
-def remove_engine():
-    sys.modules.pop("server", None)
-
-install_engine("ALLOW")
-
-
-PASS, FAIL = [], []
-NOW = time.time()
-HOUR = 3600
-
-
-def make_ctx():
-    conn = sqlite3.connect(":memory:", check_same_thread=False)
-    lock = threading.RLock()
-    n = {"i": 0}
-
-    def seal(ev, res, ts, api_key):
-        n["i"] += 1
-        return hashlib.sha256(json.dumps([ev, res, ts], sort_keys=True,
-                                         default=str).encode()).hexdigest(), n["i"], n["i"]
-    lineage._ready = False
-    ctx = {"conn": conn, "lock": lock, "seal": seal}
-    lineage._setup(ctx)
-    return ctx
-
-
-def check(name, cond, detail=""):
-    (PASS if cond else FAIL).append(name)
-    print(("  ok   " if cond else "  FAIL ") + name + (("  -> " + str(detail)[:300]) if detail and not cond else ""))
-
-
-def issue(ctx, **kw):
-    if kw.get("parent") and int(kw.get("delegations_left", 0)) > 0 \
-            and not kw.get("risk_accepted_by"):
-        kw["risk_accepted_by"] = "owner@example.com"
-    return lineage._issue(ctx, "k", kw)
-
-
-def root(ctx, **over):
-    args = dict(id="root", issuer="owner@example.com", issuer_kind="human",
-                subject="orchestrator", scope=["payments.refund", "payments.read"],
-                constraints={"max_amount": 5000, "allowed_currency": ["GBP", "EUR"]},
-                purpose="refunds", purpose_tags=["refunds"],
-                not_before=NOW - HOUR, not_after=NOW + 10 * HOUR, delegations_left=10)
-    args.update(over)
-    return issue(ctx, **args)
-
-
-print("\n=== 18. double execution against one ALLOW ===")
-ctx = make_ctx()
-root(ctx)
-r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments.refund",
-                                    "params": {"amount": 100, "currency": "GBP"},
-                                    "purpose_tag": "refunds"})
-eid = r["evaluation"]
-p = {"amount": 100, "currency": "GBP"}
-c1, _ = lineage._confirm(ctx, "k", {"evaluation": eid, "action": "payments.refund", "params": p})
-c2, _ = lineage._confirm(ctx, "k", {"evaluation": eid, "action": "payments.refund", "params": p})
-check("the first execution binds", c1["bound"] is True, c1)
-check("the same evaluation cannot be spent twice", c2["bound"] is False, c2)
-
-print("\n=== 19. type confusion in constraints ===")
-ctx = make_ctx()
-root(ctx, constraints={"max_amount": 5000, "allowed_currency": "GBP"})
-r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments.refund",
-                                    "params": {"amount": 10, "currency": "G"},
-                                    "purpose_tag": "refunds"})
-check("a single character does not satisfy a string-valued allowed_ list",
-      r["verdict"] == "BLOCK", r["reasons"])
-
-ctx = make_ctx()
-root(ctx)
-r, code = issue(ctx, id="strnum", parent="root", issuer="orchestrator", issuer_kind="agent",
-                subject="b", scope=["payments.refund"],
-                constraints={"max_amount": "50000", "allowed_currency": ["GBP"]},
-                purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
-check("a numeric cap passed as a string cannot beat the parent", code == 409, r)
-
-ctx = make_ctx()
-root(ctx)
-r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments.refund",
-                                    "params": {"amount": "99999", "currency": "GBP"},
-                                    "purpose_tag": "refunds"})
-check("a string amount is still compared numerically", r["verdict"] == "BLOCK", r["reasons"])
-
-ctx = make_ctx()
-root(ctx)
-r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments.refund",
-                                    "params": {"amount": True, "currency": "GBP"},
-                                    "purpose_tag": "refunds"})
-check("a non-numeric amount does not slip through as unconstrained",
-      r["verdict"] in ("BLOCK", "CHALLENGE"), r)
-
-print("\n=== 20. capability prefix tricks ===")
-ctx = make_ctx()
-root(ctx, scope=["payments.refund"])
-for probe in ["payments.refunds", "payments.refund.approve", "payments.refundX",
-              "Payments.Refund", "payments.refund "]:
-    r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": probe,
-                                        "params": {}, "purpose_tag": "refunds"})
-    check("'%s' is not covered by 'payments.refund'" % probe, r["verdict"] == "BLOCK", r["reasons"])
-
-ctx = make_ctx()
-root(ctx, scope=["payments.*"])
-r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments2.transfer",
-                                    "params": {}, "purpose_tag": "refunds"})
-check("'payments.*' does not cover 'payments2.transfer'", r["verdict"] == "BLOCK", r["reasons"])
-
-print("\n=== 21. a long but legitimate chain ===")
-ctx = make_ctx()
-root(ctx, constraints={"max_amount": 10000, "allowed_currency": ["GBP", "EUR"]},
-     delegations_left=12)
-parent, cap = "root", 10000
-for i in range(10):
-    cap = cap // 2
-    gid = "d%d" % i
-    r, code = issue(ctx, id=gid, parent=parent, issuer="a%d" % i, issuer_kind="agent",
-                    subject="a%d" % (i + 1), scope=["payments.refund"],
-                    constraints={"max_amount": cap, "allowed_currency": ["GBP"]},
-                    purpose="refunds", purpose_tags=["refunds"],
-                    not_after=NOW + HOUR, delegations_left=11 - i)
-    if code != 200:
-        break
-    parent = gid
-check("ten legitimate narrowing hops are accepted", code == 200 and parent == "d9", r)
-r, _ = lineage._evaluate(ctx, "k", {"grant": "d9", "action": "payments.refund",
-                                    "params": {"amount": 5, "currency": "GBP"},
-                                    "purpose_tag": "refunds"})
-check("the deep chain still ALLOWs a derivable action", r["verdict"] == "ALLOW", r["reasons"])
-check("the effective cap is the tightest in the chain",
-      float(r["effective_constraints"]["max_amount"]) == 9, r["effective_constraints"])
-check("the human at the root is still named ten hops down",
-      r["authorised_by"] == "owner@example.com")
-r, _ = lineage._evaluate(ctx, "k", {"grant": "d9", "action": "payments.refund",
-                                    "params": {"amount": 10, "currency": "GBP"},
-                                    "purpose_tag": "refunds"})
-check("one unit over the deepest cap is BLOCKed", r["verdict"] == "BLOCK", r["reasons"])
-
-print("\n=== 22. revoking the root kills the whole tree ===")
-lineage._revoke(ctx, "k", {"grant": "root", "reason": "principal withdrew authority"})
-r, _ = lineage._evaluate(ctx, "k", {"grant": "d9", "action": "payments.refund",
-                                    "params": {"amount": 1, "currency": "GBP"},
-                                    "purpose_tag": "refunds"})
-check("revoking the root blocks a leaf ten hops away", r["verdict"] == "BLOCK")
-check("the root is named as the break point", r["broken_at"] == "root", r["broken_at"])
-
-print("\n=== 23. issuing under a revoked or expired parent ===")
-ctx = make_ctx()
-root(ctx)
-lineage._revoke(ctx, "k", {"grant": "root", "reason": "x"})
-r, code = issue(ctx, id="after", parent="root", issuer="orchestrator", issuer_kind="agent",
-                subject="b", scope=["payments.refund"],
-                constraints={"max_amount": 1, "allowed_currency": ["GBP"]},
-                purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
-check("no new delegation under a revoked parent", code == 409 and r.get("error") == "parent_revoked", r)
-
-print("\n=== 24. duplicate grant id cannot overwrite a grant ===")
-ctx = make_ctx()
-root(ctx)
-r, code = root(ctx, scope=["*"], constraints={"max_amount": 999999})
-check("re-issuing an existing id is refused", code == 409 and r.get("error") == "grant_exists", r)
-
-print("\n=== 25. the boundary values themselves ===")
-ctx = make_ctx()
-root(ctx, constraints={"max_amount": 100, "allowed_currency": ["GBP"]}, delegations_left=2)
-r, code = issue(ctx, id="equal", parent="root", issuer="orchestrator", issuer_kind="agent",
-                subject="b", scope=["payments.refund"],
-                constraints={"max_amount": 100, "allowed_currency": ["GBP"]},
-                purpose="refunds", purpose_tags=["refunds"],
-                not_after=NOW + 10 * HOUR, delegations_left=1)
-check("an equal-not-wider child is accepted", code == 200, r)
-r, _ = lineage._evaluate(ctx, "k", {"grant": "equal", "action": "payments.refund",
-                                    "params": {"amount": 100, "currency": "GBP"},
-                                    "purpose_tag": "refunds"})
-check("exactly the cap is allowed", r["verdict"] == "ALLOW", r["reasons"])
-r, _ = lineage._evaluate(ctx, "k", {"grant": "equal", "action": "payments.refund",
-                                    "params": {"amount": 100.01, "currency": "GBP"},
-                                    "purpose_tag": "refunds"})
-check("a penny over the cap is blocked", r["verdict"] == "BLOCK", r["reasons"])
-
-print("\n=== 26. a CHALLENGE cannot be executed ===")
-ctx = make_ctx()
-root(ctx)
-r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments.refund",
-                                    "params": {"amount": 1, "currency": "GBP"}})
-check("no declared purpose gives CHALLENGE", r["verdict"] == "CHALLENGE", r["verdict"])
-c, code = lineage._confirm(ctx, "k", {"evaluation": r["evaluation"],
-                                      "action": "payments.refund",
-                                      "params": {"amount": 1, "currency": "GBP"}})
-check("a CHALLENGE cannot be bound as an execution", c["bound"] is False, c)
-
-print("\n" + "=" * 60)
-print("passed %d, failed %d" % (len(PASS), len(FAIL)))
-for f in FAIL:
-    print("  FAILED: " + f)
-sys.exit(1 if FAIL else 0)
-
-```
-
-
-## `tests/attack_continuity_3.py`
-
-114 lines, 5626 bytes
-
-```python
-#!/usr/bin/env python3
-"""Third wave: concurrency, and reconstruction from evidence alone."""
-import hashlib, json, sqlite3, threading, time, sys
-import continuity as lineage
-# --- stand-in for the deployed engine ---------------------------------
-import types as _types
-_ENGINE = {"verdict": "ALLOW"}
-
-def install_engine(verdict="ALLOW", raises=False, shape="dict"):
-    _ENGINE["verdict"] = verdict
-    mod = _types.ModuleType("server")
-    mod.get_bearer = lambda *a, **k: None
-    def score_event(event):
-        if raises:
-            raise RuntimeError("engine down")
-        if shape == "dict":
-            return {"decision": _ENGINE["verdict"], "score": 0.1}
-        if shape == "tuple":
-            return (_ENGINE["verdict"], 0.1)
-        return _ENGINE["verdict"]
-    mod.score_event = score_event
-    sys.modules["server"] = mod
-
-def remove_engine():
-    sys.modules.pop("server", None)
-
-install_engine("ALLOW")
-
-
-PASS, FAIL = [], []
-NOW, HOUR = time.time(), 3600
-
-def make_ctx():
-    conn = sqlite3.connect(":memory:", check_same_thread=False)
-    lock = threading.RLock(); n = {"i": 0}
-    def seal(ev, res, ts, k):
-        with lock:
-            n["i"] += 1
-            return hashlib.sha256(json.dumps([ev,res,ts],sort_keys=True,default=str).encode()).hexdigest(), n["i"], n["i"]
-    lineage._ready = False
-    ctx = {"conn": conn, "lock": lock, "seal": seal}
-    lineage._setup(ctx); return ctx
-
-def check(n, c, d=""):
-    (PASS if c else FAIL).append(n)
-    print(("  ok   " if c else "  FAIL ") + n + (("  -> " + str(d)[:250]) if d and not c else ""))
-
-print("\n=== 27. concurrent execution of one ALLOW ===")
-ctx = make_ctx()
-lineage._issue(ctx,"k",dict(id="root",issuer="owner@example.com",issuer_kind="human",
-    subject="agent",scope=["payments.refund"],constraints={"max_amount":5000},
-    purpose="refunds",purpose_tags=["refunds"],not_after=NOW+HOUR,delegations_left=0))
-r,_ = lineage._evaluate(ctx,"k",{"grant":"root","action":"payments.refund",
-    "params":{"amount":100},"purpose_tag":"refunds"})
-eid = r["evaluation"]; results = []
-def race():
-    c,_ = lineage._confirm(ctx,"k",{"evaluation":eid,"action":"payments.refund","params":{"amount":100}})
-    results.append(c["bound"])
-ts = [threading.Thread(target=race) for _ in range(8)]
-[t.start() for t in ts]; [t.join() for t in ts]
-check("exactly one of eight concurrent executions binds", results.count(True) == 1, results)
-with ctx["lock"]:
-    rows = ctx["conn"].execute("SELECT COUNT(*) FROM auth_exec WHERE eval_id=? AND outcome<>'rejected'",(eid,)).fetchone()
-check("only one accepted binding exists in storage", rows[0] == 1, rows)
-
-print("\n=== 28. reconstruct the whole story from the sealed record ===")
-ctx = make_ctx()
-lineage._issue(ctx,"k",dict(id="r",issuer="owner@example.com",issuer_kind="human",
-    subject="orchestrator",scope=["payments.*"],constraints={"max_amount":5000},
-    purpose="close the refund backlog",purpose_tags=["refunds"],
-    not_after=NOW+HOUR,delegations_left=2))
-lineage._issue(ctx,"k",dict(id="m",parent="r",issuer="orchestrator",issuer_kind="agent",
-    subject="refund-bot",scope=["payments.refund"],constraints={"max_amount":200},
-    purpose="issue small refunds",purpose_tags=["refunds"],not_after=NOW+HOUR,delegations_left=0))
-r,_ = lineage._evaluate(ctx,"k",{"grant":"m","action":"payments.refund",
-    "params":{"amount":150},"purpose_tag":"refunds"})
-t,code = lineage._trace(ctx,{"grant":"m"})
-check("the trace names who authorised it", t["authorised_by"] == "owner@example.com")
-check("the trace names who held it at execution", t["holder"] == "refund-bot")
-check("the trace shows what changed at each hop",
-      t["lineage"][0]["scope"] == ["payments.*"] and t["lineage"][1]["scope"] == ["payments.refund"])
-check("the effective constraint is the narrowest, not the granted one",
-      float(t["effective_constraints"]["max_amount"]) == 200, t["effective_constraints"])
-d,code = lineage._decision(ctx,{"evaluation":r["evaluation"]})
-check("the decision is retrievable without a key and matches", d["verdict"] == r["verdict"])
-check("the decision carries the lineage digest", d["lineage_digest"] == r["lineage_digest"])
-check("every hop carries its own block index",
-      all(h["block_index"] for h in t["lineage"]))
-
-print("\n=== 29. widening midway is visible in the trace, not just blocked ===")
-ctx = make_ctx()
-lineage._issue(ctx,"k",dict(id="r",issuer="owner@example.com",issuer_kind="human",
-    subject="a",scope=["payments.refund"],constraints={"max_amount":100},
-    purpose="p",purpose_tags=["refunds"],not_after=NOW+HOUR,delegations_left=2))
-lineage._issue(ctx,"k",dict(id="m",parent="r",issuer="a",issuer_kind="agent",
-    subject="b",scope=["payments.refund"],constraints={"max_amount":100},
-    purpose="p",purpose_tags=["refunds"],not_after=NOW+HOUR,delegations_left=1,
-    risk_accepted_by="owner@example.com"))
-with ctx["lock"]:
-    ctx["conn"].execute("UPDATE auth_grant SET constraints=? WHERE id='m'",
-        (json.dumps({"max_amount":100000},sort_keys=True,separators=(",",":")),))
-    ctx["conn"].commit()
-t,_ = lineage._trace(ctx,{"grant":"m"})
-check("the trace flags the altered hop by name",
-      t["lineage"][1]["integrity"] == "FAILED" and t["lineage"][0]["integrity"] == "ok", t["lineage"])
-r,_ = lineage._evaluate(ctx,"k",{"grant":"m","action":"payments.refund",
-    "params":{"amount":50},"purpose_tag":"refunds"})
-check("and the exercise names the exact grant that broke", r["broken_at"] == "m", r["broken_at"])
-
-print("\n" + "="*60)
-print("passed %d, failed %d" % (len(PASS), len(FAIL)))
-for f in FAIL: print("  FAILED: "+f)
-sys.exit(1 if FAIL else 0)
-
-```
-
-
-## `tests/attack_continuity_4.py`
-
-107 lines, 4723 bytes
-
-```python
-#!/usr/bin/env python3
-"""Fourth wave: does it actually compose with the existing engine, and can
-either side be bypassed by the other?"""
-import hashlib, json, sqlite3, threading, time, sys, types
-import continuity as C
-
-PASS, FAIL = [], []
-NOW, HOUR = time.time(), 3600
-STATE = {"verdict": "ALLOW", "raises": False, "shape": "dict", "seen": []}
-
-def install(verdict="ALLOW", raises=False, shape="dict"):
-    STATE.update(verdict=verdict, raises=raises, shape=shape)
-    m = types.ModuleType("server")
-    m.get_bearer = lambda *a, **k: None
-    def score_event(event):
-        STATE["seen"].append(event)
-        if STATE["raises"]: raise RuntimeError("engine down")
-        if STATE["shape"] == "dict": return {"decision": STATE["verdict"], "score": 0.42}
-        if STATE["shape"] == "tuple": return (STATE["verdict"], 0.42)
-        if STATE["shape"] == "junk": return {"nothing": "useful"}
-        return STATE["verdict"]
-    m.score_event = score_event
-    sys.modules["server"] = m
-
-def make_ctx():
-    conn = sqlite3.connect(":memory:", check_same_thread=False)
-    lock = threading.RLock(); n = {"i":0}
-    def seal(ev,res,ts,k):
-        n["i"] += 1
-        return hashlib.sha256(json.dumps([ev,res,ts],sort_keys=True,default=str).encode()).hexdigest(), n["i"], n["i"]
-    C._ready = False
-    ctx = {"conn":conn,"lock":lock,"seal":seal}; C._setup(ctx); return ctx
-
-def check(n,c,d=""):
-    (PASS if c else FAIL).append(n)
-    print(("  ok   " if c else "  FAIL ")+n+(("  -> "+str(d)[:250]) if d and not c else ""))
-
-def setup():
-    ctx = make_ctx()
-    C._issue(ctx,"k",dict(id="root",issuer="owner@example.com",issuer_kind="human",
-        subject="agent",scope=["payments.refund"],
-        constraints={"max_amount":5000,"allowed_currency":["GBP"]},
-        purpose="refunds",purpose_tags=["refunds"],not_after=NOW+HOUR,delegations_left=0))
-    return ctx
-
-def run(ctx, amount=100):
-    return C._evaluate(ctx,"k",{"grant":"root","action":"payments.refund",
-        "params":{"amount":amount,"currency":"GBP"},"purpose_tag":"refunds"})[0]
-
-print("\n=== 30. the engine is actually consulted ===")
-install("ALLOW"); STATE["seen"] = []
-r = run(setup())
-check("a clean authority plus a clean engine is ALLOW", r["verdict"]=="ALLOW", r)
-check("the engine was called with the real action and amount",
-      STATE["seen"] and STATE["seen"][-1]["action"]=="payments.refund"
-      and STATE["seen"][-1]["amount"]==100, STATE["seen"][-1] if STATE["seen"] else None)
-check("both components are reported separately",
-      r["authority_verdict"]=="ALLOW" and r["risk_verdict"]=="ALLOW", r)
-
-print("\n=== 31. neither side can wave the other through ===")
-install("BLOCK")
-r = run(setup())
-check("perfect authority does not survive an engine BLOCK", r["verdict"]=="BLOCK", r)
-check("the authority component still reads ALLOW underneath it",
-      r["authority_verdict"]=="ALLOW", r)
-install("CHALLENGE")
-r = run(setup())
-check("an engine CHALLENGE lifts a clean authority to CHALLENGE", r["verdict"]=="CHALLENGE", r)
-install("ALLOW")
-ctx = setup()
-r = C._evaluate(ctx,"k",{"grant":"root","action":"payments.transfer",
-    "params":{"amount":1},"purpose_tag":"refunds"})[0]
-check("a clean engine does not confer authority nobody granted", r["verdict"]=="BLOCK", r)
-check("and the engine is not even asked once authority has failed",
-      r["risk_engine"]["available"] is False, r["risk_engine"])
-
-print("\n=== 32. a missing or broken engine is not an ALLOW ===")
-install("ALLOW", raises=True)
-r = run(setup())
-check("an engine that throws downgrades ALLOW to CHALLENGE", r["verdict"]=="CHALLENGE", r)
-install("ALLOW", shape="junk")
-r = run(setup())
-check("an unreadable engine response downgrades to CHALLENGE", r["verdict"]=="CHALLENGE", r)
-sys.modules.pop("server", None); sys.modules.pop("__main__", None)
-r = run(setup())
-check("no engine present downgrades to CHALLENGE", r["verdict"]=="CHALLENGE", r)
-check("the reason names the missing engine",
-      any("risk engine" in x for x in r["reasons"]), r["reasons"])
-
-print("\n=== 33. it reads the engine's other return shapes ===")
-for shape in ("dict","tuple","str"):
-    install("BLOCK", shape=shape)
-    r = run(setup())
-    check("a %s return shape is understood" % shape, r["verdict"]=="BLOCK", r["risk_engine"])
-
-print("\n=== 34. an engine BLOCK cannot be executed ===")
-install("BLOCK")
-ctx = setup(); r = run(ctx)
-c,_ = C._confirm(ctx,"k",{"evaluation":r["evaluation"],"action":"payments.refund",
-    "params":{"amount":100,"currency":"GBP"}})
-check("execution is refused when the engine blocked", c["bound"] is False, c)
-
-print("\n" + "="*60)
-print("passed %d, failed %d" % (len(PASS), len(FAIL)))
-for f in FAIL: print("  FAILED: "+f)
-sys.exit(1 if FAIL else 0)
-
-```
-
-
-## `tests/attack_continuity_5.py`
-
-116 lines, 5639 bytes
-
-```python
-#!/usr/bin/env python3
-"""Fifth wave: risk acceptance. Who put their name to this capability
-existing at all - separately from who granted it and who holds it."""
-import hashlib, json, sqlite3, threading, time, sys, types
-import continuity as C
-
-PASS, FAIL = [], []
-NOW, HOUR = time.time(), 3600
-
-def install():
-    m = types.ModuleType("server")
-    m.get_bearer = lambda *a, **k: None
-    m.score_event = lambda e: {"decision": "ALLOW", "score": 0.1}
-    sys.modules["server"] = m
-install()
-
-def make_ctx():
-    conn = sqlite3.connect(":memory:", check_same_thread=False)
-    lock = threading.RLock(); n = {"i":0}
-    def seal(ev,res,ts,k):
-        n["i"] += 1
-        return hashlib.sha256(json.dumps([ev,res,ts],sort_keys=True,default=str).encode()).hexdigest(), n["i"], n["i"]
-    C._ready = False
-    ctx = {"conn":conn,"lock":lock,"seal":seal}; C._setup(ctx); return ctx
-
-def check(n,c,d=""):
-    (PASS if c else FAIL).append(n)
-    print(("  ok   " if c else "  FAIL ")+n+(("  -> "+str(d)[:250]) if d and not c else ""))
-
-def root(ctx, **over):
-    args = dict(id="root", issuer="owner@example.com", issuer_kind="human",
-                subject="orchestrator", scope=["payments.refund"],
-                constraints={"max_amount":5000}, purpose="refunds",
-                purpose_tags=["refunds"], not_after=NOW+HOUR, delegations_left=3)
-    args.update(over)
-    return C._issue(ctx,"k",args)
-
-print("\n=== 35. a root accepts its own risk by default ===")
-ctx = make_ctx()
-r, code = root(ctx)
-check("a root grant records an acceptor without being asked",
-      code == 200 and r["risk_accepted_by"] == "owner@example.com", r)
-r2, _ = root(ctx, id="root2", risk_accepted_by="risk.officer@example.com")
-check("a root can name someone other than the issuer",
-      r2["risk_accepted_by"] == "risk.officer@example.com", r2)
-
-print("\n=== 36. switching on onward delegation needs a name ===")
-ctx = make_ctx(); root(ctx)
-r, code = C._issue(ctx,"k",dict(id="deleg", parent="root", issuer="orchestrator",
-    issuer_kind="agent", subject="b", scope=["payments.refund"],
-    constraints={"max_amount":100}, purpose="refunds", purpose_tags=["refunds"],
-    not_after=NOW+HOUR, delegations_left=1))
-check("a delegable child with no acceptor is refused",
-      code == 409 and r.get("error") == "risk_acceptance_required", r)
-
-r, code = C._issue(ctx,"k",dict(id="leaf", parent="root", issuer="orchestrator",
-    issuer_kind="agent", subject="b", scope=["payments.refund"],
-    constraints={"max_amount":100}, purpose="refunds", purpose_tags=["refunds"],
-    not_after=NOW+HOUR, delegations_left=0))
-check("a non-delegable child inherits the acceptor above it", code == 200, r)
-
-r, code = C._issue(ctx,"k",dict(id="deleg2", parent="root", issuer="orchestrator",
-    issuer_kind="agent", subject="b", scope=["payments.refund"],
-    constraints={"max_amount":100}, purpose="refunds", purpose_tags=["refunds"],
-    not_after=NOW+HOUR, delegations_left=1, risk_accepted_by="head.of.ops@example.com"))
-check("a delegable child with a named acceptor is accepted", code == 200, r)
-
-print("\n=== 37. the decision names the accountable person ===")
-e, _ = C._evaluate(ctx,"k",{"grant":"leaf","action":"payments.refund",
-    "params":{"amount":10},"purpose_tag":"refunds"})
-check("an evaluation reports who accepts the risk",
-      e["risk_accepted_by"] == "owner@example.com", e.get("risk_accepted_by"))
-check("...separately from who authorised it and who executed it",
-      e["authorised_by"] == "owner@example.com" and e["executed_by"] == "b", e)
-
-e2, _ = C._evaluate(ctx,"k",{"grant":"deleg2","action":"payments.refund",
-    "params":{"amount":10},"purpose_tag":"refunds"})
-check("the nearest acceptor wins, not the root one",
-      e2["risk_accepted_by"] == "head.of.ops@example.com", e2.get("risk_accepted_by"))
-
-t, _ = C._trace(ctx,{"grant":"deleg2"})
-check("the trace shows the acceptor at each hop",
-      t["risk_accepted_by"] == "head.of.ops@example.com" and
-      t["lineage"][0]["risk_accepted_by"] == "owner@example.com", t)
-
-print("\n=== 38. an unaccepted lineage cannot act ===")
-ctx = make_ctx(); root(ctx)
-C._issue(ctx,"k",dict(id="leaf", parent="root", issuer="orchestrator",
-    issuer_kind="agent", subject="b", scope=["payments.refund"],
-    constraints={"max_amount":100}, purpose="refunds", purpose_tags=["refunds"],
-    not_after=NOW+HOUR, delegations_left=0))
-with ctx["lock"]:
-    ctx["conn"].execute("UPDATE auth_grant SET risk_accepted_by=NULL")
-    ctx["conn"].commit()
-e, _ = C._evaluate(ctx,"k",{"grant":"leaf","action":"payments.refund",
-    "params":{"amount":10},"purpose_tag":"refunds"})
-check("stripping every acceptor blocks the action", e["verdict"] == "BLOCK", e["reasons"])
-check("...and says an incident would have no accountable person",
-      any("accountable" in x for x in e["reasons"]), e["reasons"])
-
-print("\n=== 39. the acceptor cannot be swapped after the fact ===")
-ctx = make_ctx(); root(ctx, risk_accepted_by="risk.officer@example.com")
-with ctx["lock"]:
-    ctx["conn"].execute("UPDATE auth_grant SET risk_accepted_by='someone.else@example.com' WHERE id='root'")
-    ctx["conn"].commit()
-e, _ = C._evaluate(ctx,"k",{"grant":"root","action":"payments.refund",
-    "params":{"amount":10},"purpose_tag":"refunds"})
-check("editing who accepted the risk fails the digest", e["verdict"] == "BLOCK", e["reasons"])
-check("...reported as an evidence failure, naming the grant",
-      e["broken_invariant"] == "evidence_continuity" and e["broken_at"] == "root", e)
-
-print("\n" + "="*60)
-print("passed %d, failed %d" % (len(PASS), len(FAIL)))
-for f in FAIL: print("  FAILED: "+f)
-sys.exit(1 if FAIL else 0)
 
 ```
