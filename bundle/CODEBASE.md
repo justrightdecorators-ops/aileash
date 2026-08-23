@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-118 files across 25 parts.
+117 files across 25 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -75,21 +75,20 @@ Generated automatically on every push. Do not edit by hand.
 
 - `modules/tokensaver.py`
 - `modules/verifier.py`
+- `modules/warmup.py`
 
 ## [CODEBASE-12.md](CODEBASE-12.md)
 
-- `modules/wallet.py`
-- `modules/warmup.py`
 - `modules/witness.py`
 - `modules/witnessed.py`
 - `Verify_ai.py`
-
-## [CODEBASE-13.md](CODEBASE-13.md)
-
 - `ai_act_ranker.py`
 - `ai_safety_scanner.py`
 - `aigrade_insert.py`
 - `aileash_reporter.py`
+
+## [CODEBASE-13.md](CODEBASE-13.md)
+
 - `aileash_signed_client.py`
 - `aileash_verify.py`
 - `anchor.py`
@@ -97,11 +96,11 @@ Generated automatically on every push. Do not edit by hand.
 - `brain.py`
 - `broadcaster.py`
 - `build_sebbi_ecosystem.py`
+- `gateway_proxy.py`
+- `meshwitness.py`
 
 ## [CODEBASE-14.md](CODEBASE-14.md)
 
-- `gateway_proxy.py`
-- `meshwitness.py`
 - `sebbi_orchestrator.py`
 - `sebbi_sdk.py`
 - `sebbi_tokensaver.py`

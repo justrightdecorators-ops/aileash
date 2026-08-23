@@ -1,1024 +1,13 @@
 # Codebase — part 12 of 25
 
 Contains:
-- `modules/wallet.py`
-- `modules/warmup.py`
 - `modules/witness.py`
 - `modules/witnessed.py`
 - `Verify_ai.py`
-
-
-## `modules/wallet.py`
-
-786 lines, 27620 bytes
-
-```python
-"""
-wallet.py - metering gate
-=========================
-v1.1.0
-
-WHAT THIS IS
-------------
-The thing that decides whether a decision is allowed to happen, and
-seals that decision into the same chain as the decision itself. Spend
-record and audit record are one record.
-
-Three ways a call is allowed:
-
-  1. FREE WINDOW  - the key is under 90 days old. Nothing is charged.
-  2. SUBSCRIBED   - the device has a live 30-day plan. Nothing is charged.
-  3. METERED      - neither of the above. The balance pays per decision
-                    and the call is refused at zero.
-
-MONEY
------
-Held as integer millipence. No floats anywhere near a balance.
-Settlement is deliberately not implemented. `topup` is a keyed
-operation you run by hand after a payment clears. Nothing in this
-module talks to a payment provider, and it must not be wired to one
-without the duplicate-credit problem being solved first.
-
-THE HALT RULE
--------------
-A receipt presented twice halts the whole key with 423 - subscribed
-devices included. Not "probably a retry", not "probably a collision".
-A person looks at it at /x/wallet/review and clears it. A machine does
-not get to decide whether a repeated hash was a replay.
-
-ROUTES
-------
-  GET  /x/wallet/spec       public
-  GET  /x/wallet/status     keyed
-  GET  /x/wallet/quote      keyed
-  POST /x/wallet/charge     keyed   - the gate
-  POST /x/wallet/topup      keyed   - manual credit
-  GET  /x/wallet/ledger     keyed
-  POST /x/wallet/simulate   keyed   - dry run, spends nothing
-  POST /x/wallet/subscribe  keyed
-  GET  /x/wallet/devices    keyed
-  GET  /x/wallet/review     keyed   - open halts
-  POST /x/wallet/clear      keyed   - a person clears a halt
-"""
-
-import hashlib
-import json
-import re
-import time
-
-VERSION = "1.1.0"
-
-PUBLIC = {("GET", "spec")}
-
-# ---------------------------------------------------------------- pricing
-# 1 penny = 1000 millipence. Change these two lines and nothing else.
-MILLIPENCE_PER_PENNY = 1000
-DEVICE_PLAN_MILLIPENCE = 50 * MILLIPENCE_PER_PENNY      # 50p
-DEVICE_PLAN_DAYS = 30
-DECISION_MILLIPENCE = 100                                # 0.1p per decision
-
-FREE_WINDOW_DAYS = 90
-FREE_WINDOW_SECONDS = FREE_WINDOW_DAYS * 86400
-DAY = 86400
-
-MAX_TOPUP_MILLIPENCE = 500 * 100 * MILLIPENCE_PER_PENNY  # £500 a go
-MAX_LEDGER = 200
-MAX_DEVICE_ID = 80
-
-HEX64 = re.compile(r"^[0-9a-f]{64}$")
-DEVICE_OK = re.compile(r"^[A-Za-z0-9._:-]{1,80}$")
-
-
-# ---------------------------------------------------------------- helpers
-
-def _now():
-    return round(time.time(), 3)
-
-
-def _pence(millipence):
-    """For display only. Never used in arithmetic that decides anything."""
-    return round(millipence / MILLIPENCE_PER_PENNY, 3)
-
-
-def _seal(ctx, event, result):
-    """
-    Write through the server's own seal(). Its signature differs across
-    the stack, so try the shapes it has taken rather than assume one.
-    """
-    fn = ctx.get("seal") if isinstance(ctx, dict) else None
-    if not callable(fn):
-        return None
-    for attempt in (
-        lambda: fn(event, result),
-        lambda: fn(event=event, result=result),
-        lambda: fn(json.dumps({"event": event, "result": result})),
-    ):
-        try:
-            return attempt()
-        except TypeError:
-            continue
-    return None
-
-
-def _seal_ref(sealed):
-    if sealed is None:
-        return None
-    if isinstance(sealed, str):
-        return sealed
-    if isinstance(sealed, dict):
-        for k in ("audit_hash", "hash", "receipt", "block_hash", "id"):
-            if sealed.get(k):
-                return str(sealed[k])
-    if isinstance(sealed, (int, float)):
-        return str(sealed)
-    return None
-
-
-def _ensure_tables(ctx):
-    conn = ctx["conn"]
-    with ctx["lock"]:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS wallet_balance (
-                api_key      TEXT PRIMARY KEY,
-                millipence   INTEGER NOT NULL DEFAULT 0,
-                updated      REAL NOT NULL
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS wallet_ledger (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                api_key      TEXT NOT NULL,
-                kind         TEXT NOT NULL,
-                millipence   INTEGER NOT NULL,
-                balance_after INTEGER NOT NULL,
-                device_id    TEXT,
-                receipt      TEXT,
-                note         TEXT,
-                seal_ref     TEXT,
-                created      REAL NOT NULL
-            )
-        """)
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_wallet_ledger_key "
-            "ON wallet_ledger(api_key, id)"
-        )
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS wallet_device (
-                api_key      TEXT NOT NULL,
-                device_id    TEXT NOT NULL,
-                expires      REAL NOT NULL,
-                first_seen   REAL NOT NULL,
-                PRIMARY KEY (api_key, device_id)
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS wallet_receipt (
-                api_key      TEXT NOT NULL,
-                receipt      TEXT NOT NULL,
-                device_id    TEXT,
-                created      REAL NOT NULL,
-                PRIMARY KEY (api_key, receipt)
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS wallet_halt (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                api_key      TEXT NOT NULL,
-                reason       TEXT NOT NULL,
-                receipt      TEXT,
-                device_id    TEXT,
-                detail       TEXT,
-                cleared      INTEGER NOT NULL DEFAULT 0,
-                cleared_by   TEXT,
-                cleared_note TEXT,
-                cleared_at   REAL,
-                created      REAL NOT NULL
-            )
-        """)
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_wallet_halt_open "
-            "ON wallet_halt(api_key, cleared)"
-        )
-        conn.commit()
-
-
-def _balance(ctx, api_key):
-    with ctx["lock"]:
-        row = ctx["conn"].execute(
-            "SELECT millipence FROM wallet_balance WHERE api_key=?",
-            (api_key,)
-        ).fetchone()
-    return int(row[0]) if row else 0
-
-
-def _write_ledger(ctx, api_key, kind, delta, balance_after,
-                  device_id=None, receipt=None, note=None, seal_ref=None):
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "INSERT INTO wallet_ledger (api_key, kind, millipence, "
-            "balance_after, device_id, receipt, note, seal_ref, created) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
-            (api_key, kind, int(delta), int(balance_after), device_id,
-             receipt, note, seal_ref, _now())
-        )
-        ctx["conn"].commit()
-
-
-def _key_created(ctx, api_key):
-    """
-    When was this key made. Read api_keys' real schema rather than
-    assume a column name. Returns None if it cannot be determined -
-    and None means NO free window, not an unlimited one.
-    """
-    conn = ctx["conn"]
-    try:
-        with ctx["lock"]:
-            cols = [r[1] for r in
-                    conn.execute("PRAGMA table_info(api_keys)").fetchall()]
-    except Exception:
-        return None
-    if not cols:
-        return None
-    for name in ("created", "created_at", "created_ts", "issued", "ts"):
-        if name in cols:
-            try:
-                with ctx["lock"]:
-                    row = conn.execute(
-                        "SELECT %s FROM api_keys WHERE key=?" % name,
-                        (api_key,)
-                    ).fetchone()
-            except Exception:
-                try:
-                    with ctx["lock"]:
-                        row = conn.execute(
-                            "SELECT %s FROM api_keys WHERE api_key=?" % name,
-                            (api_key,)
-                        ).fetchone()
-                except Exception:
-                    return None
-            if row and row[0]:
-                try:
-                    return float(row[0])
-                except (TypeError, ValueError):
-                    return None
-            return None
-    return None
-
-
-def _free_window(ctx, api_key):
-    created = _key_created(ctx, api_key)
-    if created is None:
-        return {"in_free_window": False, "reason": "key age unknown"}
-    ends = created + FREE_WINDOW_SECONDS
-    remaining = ends - time.time()
-    return {
-        "in_free_window": remaining > 0,
-        "key_created": round(created, 3),
-        "free_until": round(ends, 3),
-        "days_remaining": round(remaining / DAY, 2) if remaining > 0 else 0,
-    }
-
-
-def _open_halt(ctx, api_key):
-    with ctx["lock"]:
-        row = ctx["conn"].execute(
-            "SELECT id, reason, receipt, device_id, detail, created "
-            "FROM wallet_halt WHERE api_key=? AND cleared=0 "
-            "ORDER BY id LIMIT 1", (api_key,)
-        ).fetchone()
-    if not row:
-        return None
-    return {
-        "halt_id": row[0], "reason": row[1], "receipt": row[2],
-        "device_id": row[3], "detail": row[4], "since": row[5],
-    }
-
-
-def _halted_response(halt):
-    return {
-        "allowed": False,
-        "halted": True,
-        "halt": halt,
-        "means": (
-            "This key is stopped. A subscribed device does not pass "
-            "either. A person has to look at the halt and clear it at "
-            "/x/wallet/clear before anything runs again."
-        ),
-    }, 423
-
-
-def _device_live(ctx, api_key, device_id):
-    with ctx["lock"]:
-        row = ctx["conn"].execute(
-            "SELECT expires FROM wallet_device WHERE api_key=? AND device_id=?",
-            (api_key, device_id)
-        ).fetchone()
-    if not row:
-        return None
-    expires = float(row[0])
-    return expires if expires > time.time() else None
-
-
-def _check_device(value):
-    device_id = (value or "").strip() if isinstance(value, str) else ""
-    if not device_id:
-        return None, {"error": "device_id required"}
-    if len(device_id) > MAX_DEVICE_ID or not DEVICE_OK.match(device_id):
-        return None, {
-            "error": "device_id must be 1-80 characters, letters, digits, "
-                     "dot, underscore, colon or hyphen"
-        }
-    return device_id, None
-
-
-# ------------------------------------------------------------------ spec
-
-def _spec():
-    return {
-        "module": "wallet",
-        "version": VERSION,
-        "what_this_is": (
-            "A gate. It decides whether a decision may proceed and seals "
-            "that decision into the audit chain, so the spend record and "
-            "the audit record are the same record."
-        ),
-        "allowed_when": [
-            "free_window - key under %d days old, nothing charged"
-                % FREE_WINDOW_DAYS,
-            "subscribed - device has a live %d-day plan, nothing charged"
-                % DEVICE_PLAN_DAYS,
-            "metered - balance pays per decision, refused at zero",
-        ],
-        "pricing": {
-            "device_plan_pence": _pence(DEVICE_PLAN_MILLIPENCE),
-            "device_plan_days": DEVICE_PLAN_DAYS,
-            "per_decision_pence": _pence(DECISION_MILLIPENCE),
-            "unit": "millipence, integer. 1000 millipence = 1 penny.",
-            "renewal": "Subscribing again before expiry extends from the "
-                       "existing expiry. It does not reset it.",
-        },
-        "duplicate_receipts": {
-            "rule": "A receipt presented twice halts the whole key with "
-                    "HTTP 423, subscribed devices included.",
-            "why": "A repeated hash is either a replay or a collision. "
-                   "Neither is a thing a machine should rule on.",
-            "clearing": "A person clears it at POST /x/wallet/clear.",
-        },
-        "settlement": (
-            "Not implemented, on purpose. topup is a keyed operation run "
-            "by hand once a payment has cleared. This module does not "
-            "talk to a payment provider."
-        ),
-        "what_this_does_not_do": [
-            "It does not stop a model saying something false. It records "
-            "what ran, and refuses to let more run than was paid for.",
-            "It does not settle, refund, or invoice.",
-        ],
-        "routes": {
-            "GET  spec": "public",
-            "GET  status": "keyed - balance, window, devices, halts",
-            "GET  quote": "keyed - current prices",
-            "POST charge": "keyed - the gate. device_id, receipt",
-            "POST topup": "keyed - millipence, note",
-            "GET  ledger": "keyed - limit",
-            "POST simulate": "keyed - how far does a runaway loop get",
-            "POST subscribe": "keyed - device_id",
-            "GET  devices": "keyed",
-            "GET  review": "keyed - open halts",
-            "POST clear": "keyed - halt_id, cleared_by, note",
-        },
-    }
-
-
-# ---------------------------------------------------------------- charge
-
-def _charge(data, api_key, ctx, dry_run=False):
-    device_id, err = _check_device((data or {}).get("device_id"))
-    if err:
-        return err, 400
-
-    receipt = (data or {}).get("receipt")
-    receipt = receipt.strip().lower() if isinstance(receipt, str) else ""
-    if not HEX64.match(receipt or ""):
-        return {"error": "receipt must be 64 lowercase hex characters",
-                "note": "This is the digest of the decision being charged "
-                        "for. It is what makes a replay detectable."}, 400
-
-    halt = _open_halt(ctx, api_key)
-    if halt:
-        return _halted_response(halt)
-
-    # ---- replay check
-    with ctx["lock"]:
-        seen = ctx["conn"].execute(
-            "SELECT device_id, created FROM wallet_receipt "
-            "WHERE api_key=? AND receipt=?", (api_key, receipt)
-        ).fetchone()
-
-    if seen:
-        if dry_run:
-            return {
-                "allowed": False,
-                "would_halt": True,
-                "reason": "duplicate_receipt",
-                "first_seen": seen[1],
-                "dry_run": True,
-            }, 200
-        detail = json.dumps({
-            "first_seen_at": seen[1],
-            "first_seen_device": seen[0],
-            "presented_again_by": device_id,
-        })
-        sealed = _seal(ctx, "wallet.halt", {
-            "api_key": api_key, "receipt": receipt,
-            "reason": "duplicate_receipt", "detail": detail,
-        })
-        with ctx["lock"]:
-            ctx["conn"].execute(
-                "INSERT INTO wallet_halt (api_key, reason, receipt, "
-                "device_id, detail, created) VALUES (?,?,?,?,?,?)",
-                (api_key, "duplicate_receipt", receipt, device_id,
-                 detail, _now())
-            )
-            ctx["conn"].commit()
-        out, status = _halted_response(_open_halt(ctx, api_key))
-        out["sealed_as"] = _seal_ref(sealed)
-        return out, status
-
-    # ---- work out who pays
-    window = _free_window(ctx, api_key)
-    expires = _device_live(ctx, api_key, device_id)
-    balance = _balance(ctx, api_key)
-
-    if window["in_free_window"]:
-        basis, cost = "free_window", 0
-    elif expires:
-        basis, cost = "subscribed", 0
-    else:
-        basis, cost = "metered", DECISION_MILLIPENCE
-
-    if cost and balance < cost:
-        out = {
-            "allowed": False,
-            "reason": "insufficient_balance",
-            "basis": "metered",
-            "balance_millipence": balance,
-            "balance_pence": _pence(balance),
-            "needed_millipence": cost,
-            "fix": ["POST /x/wallet/subscribe for this device, or",
-                    "POST /x/wallet/topup once a payment has cleared"],
-        }
-        if dry_run:
-            out["dry_run"] = True
-            return out, 200
-        return out, 402
-
-    if dry_run:
-        return {
-            "allowed": True,
-            "dry_run": True,
-            "basis": basis,
-            "would_cost_millipence": cost,
-            "balance_millipence": balance,
-            "decisions_remaining_at_this_rate": (
-                None if not cost else balance // cost),
-            "note": "Nothing was spent, sealed or recorded.",
-        }, 200
-
-    # ---- commit
-    new_balance = balance - cost
-    if cost:
-        with ctx["lock"]:
-            ctx["conn"].execute(
-                "INSERT INTO wallet_balance (api_key, millipence, updated) "
-                "VALUES (?,?,?) ON CONFLICT(api_key) DO UPDATE SET "
-                "millipence=excluded.millipence, updated=excluded.updated",
-                (api_key, new_balance, _now())
-            )
-            ctx["conn"].commit()
-
-    sealed = _seal(ctx, "wallet.charge", {
-        "receipt": receipt,
-        "device_id": device_id,
-        "basis": basis,
-        "cost_millipence": cost,
-        "balance_after": new_balance,
-    })
-    seal_ref = _seal_ref(sealed)
-
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "INSERT OR IGNORE INTO wallet_receipt "
-            "(api_key, receipt, device_id, created) VALUES (?,?,?,?)",
-            (api_key, receipt, device_id, _now())
-        )
-        ctx["conn"].commit()
-
-    _write_ledger(ctx, api_key, "charge", -cost, new_balance,
-                  device_id=device_id, receipt=receipt, note=basis,
-                  seal_ref=seal_ref)
-
-    return {
-        "allowed": True,
-        "basis": basis,
-        "cost_millipence": cost,
-        "balance_millipence": new_balance,
-        "balance_pence": _pence(new_balance),
-        "receipt": receipt,
-        "sealed_as": seal_ref,
-        "device_plan_expires": expires,
-        "means": "This decision is paid for and recorded in the chain. "
-                 "Nothing here says the decision was correct.",
-    }, 200
-
-
-# -------------------------------------------------------------- the rest
-
-def _topup(data, api_key, ctx):
-    raw = (data or {}).get("millipence")
-    try:
-        amount = int(raw)
-    except (TypeError, ValueError):
-        return {"error": "millipence must be a whole number",
-                "note": "1000 millipence = 1 penny"}, 400
-    if amount <= 0 or amount > MAX_TOPUP_MILLIPENCE:
-        return {"error": "millipence out of range",
-                "max": MAX_TOPUP_MILLIPENCE}, 400
-
-    note = (data or {}).get("note")
-    note = note.strip()[:200] if isinstance(note, str) else None
-    if not note:
-        return {"error": "note required",
-                "why": "Every credit needs a reason recorded - the payment "
-                       "reference, invoice number or who authorised it."}, 400
-
-    balance = _balance(ctx, api_key) + amount
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "INSERT INTO wallet_balance (api_key, millipence, updated) "
-            "VALUES (?,?,?) ON CONFLICT(api_key) DO UPDATE SET "
-            "millipence=excluded.millipence, updated=excluded.updated",
-            (api_key, balance, _now())
-        )
-        ctx["conn"].commit()
-
-    sealed = _seal(ctx, "wallet.topup", {
-        "millipence": amount, "balance_after": balance, "note": note})
-    seal_ref = _seal_ref(sealed)
-    _write_ledger(ctx, api_key, "topup", amount, balance,
-                  note=note, seal_ref=seal_ref)
-
-    return {"ok": True, "credited_millipence": amount,
-            "credited_pence": _pence(amount),
-            "balance_millipence": balance,
-            "balance_pence": _pence(balance),
-            "note": note, "sealed_as": seal_ref}, 200
-
-
-def _subscribe(data, api_key, ctx):
-    device_id, err = _check_device((data or {}).get("device_id"))
-    if err:
-        return err, 400
-
-    halt = _open_halt(ctx, api_key)
-    if halt:
-        return _halted_response(halt)
-
-    balance = _balance(ctx, api_key)
-    if balance < DEVICE_PLAN_MILLIPENCE:
-        return {"error": "insufficient_balance",
-                "needed_millipence": DEVICE_PLAN_MILLIPENCE,
-                "needed_pence": _pence(DEVICE_PLAN_MILLIPENCE),
-                "balance_millipence": balance}, 402
-
-    now = time.time()
-    existing = _device_live(ctx, api_key, device_id)
-    base = existing if existing else now          # early renewal extends
-    expires = base + DEVICE_PLAN_DAYS * DAY
-    new_balance = balance - DEVICE_PLAN_MILLIPENCE
-
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "INSERT INTO wallet_balance (api_key, millipence, updated) "
-            "VALUES (?,?,?) ON CONFLICT(api_key) DO UPDATE SET "
-            "millipence=excluded.millipence, updated=excluded.updated",
-            (api_key, new_balance, _now())
-        )
-        ctx["conn"].execute(
-            "INSERT INTO wallet_device (api_key, device_id, expires, "
-            "first_seen) VALUES (?,?,?,?) "
-            "ON CONFLICT(api_key, device_id) DO UPDATE SET "
-            "expires=excluded.expires",
-            (api_key, device_id, expires, _now())
-        )
-        ctx["conn"].commit()
-
-    sealed = _seal(ctx, "wallet.subscribe", {
-        "device_id": device_id, "expires": expires,
-        "cost_millipence": DEVICE_PLAN_MILLIPENCE})
-    seal_ref = _seal_ref(sealed)
-    _write_ledger(ctx, api_key, "subscribe", -DEVICE_PLAN_MILLIPENCE,
-                  new_balance, device_id=device_id,
-                  note="%d days" % DEVICE_PLAN_DAYS, seal_ref=seal_ref)
-
-    return {"ok": True, "device_id": device_id, "expires": round(expires, 3),
-            "extended_from_existing": bool(existing),
-            "balance_millipence": new_balance,
-            "balance_pence": _pence(new_balance),
-            "sealed_as": seal_ref}, 200
-
-
-def _devices(api_key, ctx):
-    now = time.time()
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT device_id, expires, first_seen FROM wallet_device "
-            "WHERE api_key=? ORDER BY device_id", (api_key,)
-        ).fetchall()
-    devices = [{
-        "device_id": r[0],
-        "expires": r[1],
-        "live": r[1] > now,
-        "days_remaining": round((r[1] - now) / DAY, 2) if r[1] > now else 0,
-        "first_seen": r[2],
-    } for r in rows]
-    return {"count": len(devices),
-            "live": sum(1 for d in devices if d["live"]),
-            "devices": devices}, 200
-
-
-def _ledger(data, api_key, ctx):
-    try:
-        limit = int((data or {}).get("limit", 50))
-    except (TypeError, ValueError):
-        limit = 50
-    limit = max(1, min(limit, MAX_LEDGER))
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT kind, millipence, balance_after, device_id, receipt, "
-            "note, seal_ref, created FROM wallet_ledger WHERE api_key=? "
-            "ORDER BY id DESC LIMIT ?", (api_key, limit)
-        ).fetchall()
-    return {"count": len(rows), "limit": limit, "entries": [{
-        "kind": r[0], "millipence": r[1], "balance_after": r[2],
-        "device_id": r[3], "receipt": r[4], "note": r[5],
-        "sealed_as": r[6], "at": r[7]} for r in rows]}, 200
-
-
-def _review(api_key, ctx):
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT id, reason, receipt, device_id, detail, created "
-            "FROM wallet_halt WHERE api_key=? AND cleared=0 ORDER BY id",
-            (api_key,)
-        ).fetchall()
-    return {
-        "open": len(rows),
-        "halts": [{"halt_id": r[0], "reason": r[1], "receipt": r[2],
-                   "device_id": r[3], "detail": r[4], "since": r[5]}
-                  for r in rows],
-        "note": "While any halt is open this key is stopped. Clearing is a "
-                "human decision and is itself sealed.",
-    }, 200
-
-
-def _clear(data, api_key, ctx):
-    try:
-        halt_id = int((data or {}).get("halt_id"))
-    except (TypeError, ValueError):
-        return {"error": "halt_id required"}, 400
-
-    who = (data or {}).get("cleared_by")
-    who = who.strip()[:120] if isinstance(who, str) else None
-    note = (data or {}).get("note")
-    note = note.strip()[:300] if isinstance(note, str) else None
-    if not who or not note:
-        return {"error": "cleared_by and note both required",
-                "why": "A halt is cleared by a named person giving a "
-                       "reason. Both are sealed."}, 400
-
-    with ctx["lock"]:
-        row = ctx["conn"].execute(
-            "SELECT reason, receipt FROM wallet_halt "
-            "WHERE id=? AND api_key=? AND cleared=0", (halt_id, api_key)
-        ).fetchone()
-    if not row:
-        return {"error": "no open halt with that id for this key"}, 404
-
-    sealed = _seal(ctx, "wallet.halt_cleared", {
-        "halt_id": halt_id, "reason": row[0], "receipt": row[1],
-        "cleared_by": who, "note": note})
-    seal_ref = _seal_ref(sealed)
-
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "UPDATE wallet_halt SET cleared=1, cleared_by=?, "
-            "cleared_note=?, cleared_at=? WHERE id=?",
-            (who, note, _now(), halt_id)
-        )
-        ctx["conn"].commit()
-
-    remaining = _open_halt(ctx, api_key)
-    return {"ok": True, "halt_id": halt_id, "cleared_by": who,
-            "sealed_as": seal_ref,
-            "key_running": remaining is None,
-            "still_open": remaining}, 200
-
-
-def _status(api_key, ctx):
-    balance = _balance(ctx, api_key)
-    window = _free_window(ctx, api_key)
-    halt = _open_halt(ctx, api_key)
-    devices, _ = _devices(api_key, ctx)
-    return {
-        "balance_millipence": balance,
-        "balance_pence": _pence(balance),
-        "free_window": window,
-        "devices_live": devices["live"],
-        "devices_total": devices["count"],
-        "halted": halt is not None,
-        "halt": halt,
-        "decisions_left_if_metered": balance // DECISION_MILLIPENCE,
-        "settlement": "manual - topup is run by hand after payment clears",
-    }, 200
-
-
-def _quote():
-    return {
-        "device_plan": {"pence": _pence(DEVICE_PLAN_MILLIPENCE),
-                        "millipence": DEVICE_PLAN_MILLIPENCE,
-                        "days": DEVICE_PLAN_DAYS},
-        "per_decision": {"pence": _pence(DECISION_MILLIPENCE),
-                         "millipence": DECISION_MILLIPENCE},
-        "free_window_days": FREE_WINDOW_DAYS,
-        "note": "A subscribed device's decisions cost nothing while the "
-                "plan runs. Everything else is metered.",
-    }, 200
-
-
-# ---------------------------------------------------------------- router
-
-def handle(method, action, data, api_key, ctx):
-    try:
-        if method == "GET" and action == "spec":
-            return _spec(), 200
-
-        if not api_key:
-            return {"error": "key required"}, 401
-
-        _ensure_tables(ctx)
-
-        if method == "GET":
-            if action == "status":
-                return _status(api_key, ctx)
-            if action == "quote":
-                return _quote()
-            if action == "ledger":
-                return _ledger(data, api_key, ctx)
-            if action == "devices":
-                return _devices(api_key, ctx)
-            if action == "review":
-                return _review(api_key, ctx)
-
-        if method == "POST":
-            if action == "charge":
-                return _charge(data, api_key, ctx, dry_run=False)
-            if action == "simulate":
-                return _charge(data, api_key, ctx, dry_run=True)
-            if action == "topup":
-                return _topup(data, api_key, ctx)
-            if action == "subscribe":
-                return _subscribe(data, api_key, ctx)
-            if action == "clear":
-                return _clear(data, api_key, ctx)
-
-        return {"error": "unknown action", "module": "wallet",
-                "see": "/x/wallet/spec"}, 404
-
-    except Exception as exc:
-        return {"error": "wallet module error",
-                "detail": str(exc)[:200]}, 500
-
-```
-
-
-## `modules/warmup.py`
-
-211 lines, 7688 bytes
-
-```python
-"""
-modules/warmup.py  v1.0  -  arm every page module in one request
-
-THE PROBLEM THIS ENDS
----------------------
-console.py, packconsole.py, peerconsole.py, selfcheck.py and the rest all
-install their page by patching do_GET at runtime, and that only happens the
-first time their handle() runs. So after every deploy the pages 404 until
-somebody happens to hit each module's /x/ route.
-
-Worse, most of those modules only make `status` public. A keyless request to
-/x/console/ is rejected by the router before the module is ever imported, so
-the obvious way of arming them does not work and looks like a broken site
-instead of a cold one.
-
-WHAT THIS DOES
---------------
-One public route that imports each page module and calls its handle() once,
-which is exactly what installs the patch. Every page comes back in a single
-request, with no key.
-
-    GET /x/warmup/all       arm everything, report what happened
-    GET /x/warmup/status    what is armed right now, arms nothing
-    GET /x/warmup/spec      what this is
-
-POINT RAILWAY AT IT
--------------------
-Set the healthcheck path to:
-
-    /x/warmup/all
-
-Railway calls it after every deploy, so the site is armed before anyone
-opens it. It always returns 200 as long as the process is up - a module
-that fails to arm is reported in the body rather than failing the
-healthcheck, because one broken page should not roll back a good deploy.
-
-SAFE TO RUN REPEATEDLY
-----------------------
-Every module guards its own patch with a `_patched` flag, so a second call
-is a no-op. Call it every minute if you like.
-
-ADDING A MODULE
----------------
-Put its name in PAGE_MODULES. Nothing else. If the module is not deployed
-it is reported as missing and the others still arm.
-"""
-
-import importlib
-import sys
-import time
-import traceback
-
-VERSION = "1.0"
-
-PUBLIC = {("GET", "all"), ("GET", "status"), ("GET", "spec"), ("GET", "")}
-
-# Modules that serve an HTML page by patching do_GET at runtime.
-# Name only - no path, no .py.
-PAGE_MODULES = [
-    "console",
-    "packconsole",
-    "peerconsole",
-    "selfcheck",
-    "savings",
-    "standard",
-    "network",
-    "demo",
-]
-
-# Import prefixes tried in order. Different deployments load modules
-# differently and guessing once and failing is how you get a 404 you
-# cannot explain.
-_PREFIXES = ("modules.", "", "aileash.modules.")
-
-_last_run = {"at": None, "results": None}
-
-
-def _find(name):
-    """Return an already-imported module, or import it. (module, how) or (None, why)."""
-    for pre in _PREFIXES:
-        mod = sys.modules.get(pre + name)
-        if mod is not None:
-            return mod, "already imported as " + pre + name
-    errors = []
-    for pre in _PREFIXES:
-        try:
-            return importlib.import_module(pre + name), "imported as " + pre + name
-        except ImportError as exc:
-            errors.append(pre + name + ": " + str(exc))
-        except Exception as exc:
-            # A real error inside the module - a syntax error, a bad import
-            # of its own. Worth reporting properly rather than as "missing",
-            # because those look identical from outside and cost hours.
-            return None, "FAILED TO LOAD (%s): %s" % (
-                type(exc).__name__, str(exc)[:200])
-    return None, "not found (" + "; ".join(errors[:1]) + ")"
-
-
-def _arm(name, ctx):
-    """Import a page module and call handle() once, which installs its patch."""
-    mod, how = _find(name)
-    if mod is None:
-        return {"module": name, "armed": False, "detail": how}
-
-    fn = getattr(mod, "handle", None)
-    if not callable(fn):
-        return {"module": name, "armed": False,
-                "detail": "loaded but has no handle()"}
-
-    try:
-        body, status = fn("GET", "status", {}, None, ctx)
-    except Exception as exc:
-        return {"module": name, "armed": False,
-                "detail": "handle() raised %s: %s" % (
-                    type(exc).__name__, str(exc)[:200]),
-                "traceback": traceback.format_exc(limit=3).splitlines()[-3:]}
-
-    body = body if isinstance(body, dict) else {}
-    armed = bool(body.get("installed", True))
-    out = {"module": name, "armed": armed, "http": status, "load": how}
-    for k in ("page", "install_result", "version"):
-        if k in body:
-            out[k] = body[k]
-    if not armed:
-        out["detail"] = body.get("install_result") or "reported not installed"
-    return out
-
-
-def _status_only(ctx):
-    """What is armed, without arming anything. Read-only."""
-    rows = []
-    for name in PAGE_MODULES:
-        found = None
-        for pre in _PREFIXES:
-            if (pre + name) in sys.modules:
-                found = sys.modules[pre + name]
-                break
-        if found is None:
-            rows.append({"module": name, "loaded": False, "armed": False})
-            continue
-        flag = getattr(found, "_patched", None)
-        armed = bool(flag[0]) if isinstance(flag, list) and flag else None
-        rows.append({"module": name, "loaded": True, "armed": armed,
-                     "page": getattr(found, "PAGE_PATHS", [None])[0]
-                             if hasattr(found, "PAGE_PATHS") else None})
-    return rows
-
-
-def handle(method, action, data, api_key, ctx):
-    action = (action or "").strip().lower()
-
-    if method != "GET":
-        return {"error": "unknown_action", "action": action,
-                "GET": ["all", "status", "spec"]}, 404
-
-    if action == "spec":
-        return {
-            "module": "warmup",
-            "version": VERSION,
-            "what_it_is": (
-                "Page modules install their route by patching do_GET the "
-                "first time they run, so every deploy leaves those pages "
-                "404 until something touches each one. This touches all of "
-                "them in one public request."),
-            "routes": {
-                "/x/warmup/all": "arm every page module, report each",
-                "/x/warmup/status": "what is armed now, arms nothing",
-                "/x/warmup/spec": "this",
-            },
-            "railway_healthcheck_path": "/x/warmup/all",
-            "modules": list(PAGE_MODULES),
-            "safe_to_repeat": True,
-            "note": ("Always returns 200 while the process is up. A module "
-                     "that fails to arm is reported in the body, because one "
-                     "bad page should not roll back a good deploy."),
-        }, 200
-
-    if action == "status":
-        return {"armed_now": _status_only(ctx),
-                "last_warmup": _last_run["at"],
-                "note": "Read-only. Call /x/warmup/all to actually arm."}, 200
-
-    # "" or "all"
-    t0 = time.time()
-    results = [_arm(name, ctx) for name in PAGE_MODULES]
-    _last_run["at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    _last_run["results"] = results
-
-    armed = [r["module"] for r in results if r.get("armed")]
-    failed = [r for r in results if not r.get("armed")]
-
-    for r in failed:
-        print("WARMUP: %s did not arm - %s"
-              % (r["module"], r.get("detail", "?")), flush=True)
-    print("WARMUP: %d/%d armed in %.0fms"
-          % (len(armed), len(results), (time.time() - t0) * 1000), flush=True)
-
-    return {
-        "ok": True,
-        "armed": len(armed),
-        "of": len(results),
-        "took_ms": round((time.time() - t0) * 1000, 1),
-        "pages_ready": [r.get("page") for r in results
-                        if r.get("armed") and r.get("page")],
-        "results": results,
-        "at": _last_run["at"],
-        "note": ("A module listed as not armed is either not deployed or "
-                 "raised on load - the detail says which. The rest still "
-                 "armed."),
-    }, 200
-
-```
+- `ai_act_ranker.py`
+- `ai_safety_scanner.py`
+- `aigrade_insert.py`
+- `aileash_reporter.py`
 
 
 ## `modules/witness.py`
@@ -2671,5 +1660,834 @@ if __name__ == "__main__":
     
     # Run the audit test pass
     auditor.run_public_compliance_audit(legitimate_claim_hash, sample_corporate_payload)
+
+```
+
+
+## `ai_act_ranker.py`
+
+262 lines, 4930 bytes
+
+```python
+"""
+AILeash Compliance Intelligence Engine
+Standalone AI Act Ranking & Risk Mapping Engine
+
+Version: 1.0.0
+"""
+
+import json
+import datetime
+
+
+VERSION = "1.0.0"
+
+
+# EU AI Act knowledge base
+AI_ACT_DATABASE = {
+
+    "Article 5": {
+        "title": "Prohibited AI Practices",
+        "phrases": [
+            "EU AI Act Article 5",
+            "prohibited AI practices",
+            "AI Act banned systems",
+            "AI regulation prohibited AI"
+        ],
+        "controls": [
+            "Prohibited use detection",
+            "Policy enforcement",
+            "AI behaviour screening"
+        ]
+    },
+
+
+    "Article 6": {
+        "title": "Classification of High Risk AI Systems",
+        "phrases": [
+            "high risk AI system",
+            "EU AI Act high risk classification",
+            "AI Act risk categories"
+        ],
+        "controls": [
+            "Risk classification",
+            "System assessment",
+            "Impact evaluation"
+        ]
+    },
+
+
+    "Article 9": {
+        "title": "Risk Management System",
+        "phrases": [
+            "EU AI Act Article 9",
+            "AI risk management system",
+            "AI Act compliance framework",
+            "continuous AI risk monitoring"
+        ],
+        "controls": [
+            "Risk identification",
+            "Risk scoring",
+            "Risk mitigation",
+            "Continuous monitoring"
+        ]
+    },
+
+
+    "Article 12": {
+        "title": "Record Keeping and Logging",
+        "phrases": [
+            "AI audit trail",
+            "AI logging requirements",
+            "AI evidence records",
+            "machine learning audit logs"
+        ],
+        "controls": [
+            "Immutable logs",
+            "Evidence storage",
+            "Traceability",
+            "Hash verification"
+        ]
+    },
+
+
+    "Article 14": {
+        "title": "Human Oversight",
+        "phrases": [
+            "AI human oversight",
+            "human in the loop AI",
+            "AI intervention controls"
+        ],
+        "controls": [
+            "Human review",
+            "Override capability",
+            "Decision supervision"
+        ]
+    },
+
+
+    "Article 15": {
+        "title": "Accuracy Robustness Cybersecurity",
+        "phrases": [
+            "AI cybersecurity",
+            "AI accuracy monitoring",
+            "AI robustness requirements"
+        ],
+        "controls": [
+            "Security testing",
+            "Performance monitoring",
+            "Failure detection"
+        ]
+    }
+
+}
+
+
+def search_ai_act(query):
+
+    results = []
+
+    query = query.lower()
+
+    for article, data in AI_ACT_DATABASE.items():
+
+        for phrase in data["phrases"]:
+
+            if query in phrase.lower():
+
+                results.append({
+                    "article": article,
+                    "title": data["title"],
+                    "matched_phrase": phrase,
+                    "controls": data["controls"]
+                })
+
+    return results
+
+
+
+def calculate_compliance_score(system):
+
+    score = 0
+    missing = []
+
+    requirements = {
+
+        "risk_management": "Article 9",
+        "logging": "Article 12",
+        "human_oversight": "Article 14",
+        "security": "Article 15"
+
+    }
+
+
+    for control, article in requirements.items():
+
+        if system.get(control):
+            score += 25
+        else:
+            missing.append(article)
+
+
+    return {
+        "score": score,
+        "rating": risk_rating(score),
+        "missing_articles": missing
+    }
+
+
+
+def risk_rating(score):
+
+    if score >= 90:
+        return "LOW RISK"
+
+    if score >= 70:
+        return "MODERATE RISK"
+
+    if score >= 40:
+        return "HIGH RISK"
+
+    return "CRITICAL RISK"
+
+
+
+def generate_report(system):
+
+    return {
+
+        "engine": "AILeash Compliance Intelligence Engine",
+
+        "version": VERSION,
+
+        "timestamp":
+            datetime.datetime.utcnow().isoformat(),
+
+        "assessment":
+            calculate_compliance_score(system)
+
+    }
+
+
+
+def save_report(report):
+
+    filename = (
+        "aileash_report_"
+        + datetime.datetime.now()
+        .strftime("%Y%m%d_%H%M%S")
+        + ".json"
+    )
+
+    with open(filename, "w") as file:
+        json.dump(
+            report,
+            file,
+            indent=4
+        )
+
+    return filename
+
+
+
+if __name__ == "__main__":
+
+    print(
+        "\nAILeash AI Act Ranking Engine "
+        + VERSION
+    )
+
+    print("\nExample search:")
+    
+    results = search_ai_act(
+        "Article 9"
+    )
+
+    for result in results:
+        print("\nMATCH:")
+        print(result)
+
+
+    test_system = {
+
+        "risk_management": True,
+        "logging": True,
+        "human_oversight": False,
+        "security": True
+
+    }
+
+
+    report = generate_report(test_system)
+
+    print("\nCOMPLIANCE REPORT")
+    print(json.dumps(report, indent=4))
+
+
+    file = save_report(report)
+
+    print(
+        "\nSaved:",
+        file
+    )
+
+```
+
+
+## `ai_safety_scanner.py`
+
+167 lines, 5700 bytes
+
+```python
+"""
+AI-Safety Grade Scanner
+Checks a domain's .well-known/ files and public root files against the
+emerging AI-safety/AI-transparency file conventions, and returns a
+letter grade (A-F) plus an embeddable badge.
+
+Drop into your existing FastAPI server.py as a router, or run standalone.
+Requires: fastapi, httpx  (pip install fastapi httpx --break-system-packages)
+"""
+
+from fastapi import APIRouter, Query
+from fastapi.responses import JSONResponse, Response
+import httpx
+import xml.etree.ElementTree as ET
+
+router = APIRouter()
+
+TIMEOUT = 6.0
+UA_HUMAN = "Mozilla/5.0 (compatible; AILeashScanner/1.0; +https://sebbi.pro/check)"
+UA_AGENT = "AILeash-Agent-Check/1.0 (+https://sebbi.pro/check)"
+
+CHECKS = [
+    # (key, path, points, validator_name)
+    ("ai_safety",  "/.well-known/ai-safety.txt", 20, "check_ai_safety"),
+    ("security",   "/.well-known/security.txt",  15, "check_security"),
+    ("robots",     "/robots.txt",                10, "check_robots"),
+    ("sitemap",    "/sitemap.xml",                10, "check_sitemap"),
+    ("ai_txt",     "/.well-known/ai.txt",         15, "check_present"),
+    ("comply",     "/.well-known/comply.txt",     15, "check_present"),
+    ("llms",       "/llms.txt",                   10, "check_present"),
+]
+RENDERING_POINTS = 5
+MAX_SCORE = sum(c[2] for c in CHECKS) + RENDERING_POINTS  # 100
+
+
+async def fetch(client: httpx.AsyncClient, url: str, ua: str = UA_HUMAN):
+    try:
+        r = await client.get(url, timeout=TIMEOUT, headers={"User-Agent": ua}, follow_redirects=True)
+        if r.status_code == 200:
+            return r.text
+    except Exception:
+        pass
+    return None
+
+
+def check_present(text):
+    return bool(text and text.strip())
+
+
+def check_ai_safety(text):
+    if not text:
+        return False
+    lower = text.lower()
+    return "ai-safe:" in lower and "true" in lower
+
+
+def check_security(text):
+    if not text:
+        return False
+    lower = text.lower()
+    return "contact:" in lower and "expires:" in lower
+
+
+def check_robots(text):
+    return bool(text and text.strip())
+
+
+def check_sitemap(text):
+    if not text:
+        return False
+    try:
+        ET.fromstring(text)
+        return True
+    except ET.ParseError:
+        return False
+
+
+VALIDATORS = {
+    "check_ai_safety": check_ai_safety,
+    "check_security": check_security,
+    "check_robots": check_robots,
+    "check_sitemap": check_sitemap,
+    "check_present": check_present,
+}
+
+
+def grade_from_score(score: int) -> str:
+    if score >= 90:
+        return "A"
+    if score >= 75:
+        return "B"
+    if score >= 60:
+        return "C"
+    if score >= 40:
+        return "D"
+    return "F"
+
+
+GRADE_COLOR = {"A": "#7fe3b0", "B": "#a8d95f", "C": "#c9a84c", "D": "#ff9a4a", "F": "#ff8a80"}
+
+
+@router.get("/check")
+async def check_domain(domain: str = Query(..., description="Domain to check, e.g. example.com")):
+    domain = domain.strip().lower().replace("https://", "").replace("http://", "").rstrip("/")
+    base = f"https://{domain}"
+
+    results = {}
+    score = 0
+
+    async with httpx.AsyncClient() as client:
+        for key, path, points, validator_name in CHECKS:
+            text = await fetch(client, base + path)
+            passed = VALIDATORS[validator_name](text)
+            results[key] = {"path": path, "found": bool(text), "passed": passed, "points": points if passed else 0}
+            if passed:
+                score += points
+
+        # basic consistent-rendering check: compare human UA vs agent UA on homepage
+        human_body = await fetch(client, base, UA_HUMAN)
+        agent_body = await fetch(client, base, UA_AGENT)
+        rendering_ok = bool(human_body) and bool(agent_body) and (len(human_body) > 0 and len(agent_body) > 0)
+        # crude similarity check — same length within 10% as a proxy for "not obviously cloaked"
+        if human_body and agent_body:
+            ratio = min(len(human_body), len(agent_body)) / max(len(human_body), len(agent_body), 1)
+            rendering_ok = ratio > 0.9
+        results["consistent_rendering"] = {"passed": rendering_ok, "points": RENDERING_POINTS if rendering_ok else 0}
+        if rendering_ok:
+            score += RENDERING_POINTS
+
+    grade = grade_from_score(score)
+
+    return JSONResponse({
+        "domain": domain,
+        "score": score,
+        "max_score": MAX_SCORE,
+        "grade": grade,
+        "checks": results,
+        "verified_by": "sebbi.pro",
+        "badge_url": f"https://sebbi.pro/check/badge?domain={domain}",
+        "report_url": f"https://sebbi.pro/check?domain={domain}",
+    })
+
+
+@router.get("/check/badge")
+async def check_badge(domain: str = Query(...)):
+    """Returns an embeddable SVG badge, e.g. <img src="https://sebbi.pro/check/badge?domain=example.com">"""
+    domain = domain.strip().lower().replace("https://", "").replace("http://", "").rstrip("/")
+    base = f"https://{domain}"
+
+    score = 0
+    async with httpx.AsyncClient() as client:
+        for key, path, points, validator_name in CHECKS:
+            text = await fetch(client, base + path)
+            if VALIDATORS[validator_name](text):
+                score += points
+
+    grade = grade_from_score(score)
+    color = GRADE_COLOR[grade]
+
+    svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="180" height="20">
+  <rect width="120" height="20" fill="#0a0f1e"/>
+  <rect x="120" width="60" height="20" fill="{color}"/>
+  <text x="60" y="14" fill="#fff" font-family="Verdana,sans-serif" font-size="11" text-anchor="middle">AI-Safety Grade</text>
+  <text x="150" y="14" fill="#0a0f1e" font-family="Verdana,sans-serif" font-size="12" font-weight="bold" text-anchor="middle">{grade}</text>
+</svg>'''
+    return Response(content=svg, media_type="image/svg+xml")
+
+```
+
+
+## `aigrade_insert.py`
+
+136 lines, 5663 bytes
+
+```python
+# ============================================================
+# AI-SAFETY GRADE SCANNER - stdlib version for server.py
+# (converted from the FastAPI/httpx draft - no new dependencies)
+#
+# HOW TO INSTALL - two pastes into server.py:
+#
+# PASTE 1: everything between "BEGIN FUNCTIONS" and "END FUNCTIONS"
+#          goes near your other helper functions (e.g. just above
+#          the JURIS_VERSION block).
+#
+# PASTE 2: everything between "BEGIN ROUTES" and "END ROUTES"
+#          goes inside do_GET, as new elif branches alongside the
+#          other GET routes (match their indentation: 8 spaces).
+#
+# Endpoints added:
+#   GET /api/aigrade?domain=example.com        -> JSON grade report
+#   GET /api/aigrade/badge?domain=example.com  -> embeddable SVG badge
+# ============================================================
+
+# ---------------- BEGIN FUNCTIONS ----------------
+AIGRADE_TIMEOUT=6
+AIGRADE_UA="Mozilla/5.0 (compatible; AILeashScanner/1.0; +https://sebbi.pro/scan)"
+AIGRADE_UA_AGENT="AILeash-Agent-Check/1.0 (+https://sebbi.pro/scan)"
+AIGRADE_CHECKS=[
+    ("ai_safety","/.well-known/ai-safety.txt",20,"ai_safety"),
+    ("security","/.well-known/security.txt",15,"security"),
+    ("robots","/robots.txt",10,"present"),
+    ("sitemap","/sitemap.xml",10,"sitemap"),
+    ("ai_txt","/.well-known/ai.txt",15,"present"),
+    ("comply","/.well-known/comply.txt",15,"present"),
+    ("llms","/llms.txt",10,"present"),
+]
+AIGRADE_RENDER_POINTS=5
+AIGRADE_MAX=sum(c[2] for c in AIGRADE_CHECKS)+AIGRADE_RENDER_POINTS
+AIGRADE_COLORS={"A":"#7fe3b0","B":"#a8d95f","C":"#c9a84c","D":"#ff9a4a","F":"#ff8a80"}
+
+def _aigrade_fetch(url,ua=AIGRADE_UA):
+    try:
+        req=urllib.request.Request(url,headers={"User-Agent":ua})
+        with urllib.request.urlopen(req,timeout=AIGRADE_TIMEOUT) as r:
+            if r.status==200:
+                return r.read(500000).decode("utf-8","replace")
+    except Exception:
+        pass
+    return None
+
+def _aigrade_valid(kind,text):
+    if kind=="present":
+        return bool(text and text.strip())
+    if kind=="ai_safety":
+        if not text:return False
+        low=text.lower()
+        return "ai-safe:" in low and "true" in low
+    if kind=="security":
+        if not text:return False
+        low=text.lower()
+        return "contact:" in low and "expires:" in low
+    if kind=="sitemap":
+        if not text:return False
+        try:
+            import xml.etree.ElementTree as _ET
+            _ET.fromstring(text)
+            return True
+        except Exception:
+            return False
+    return False
+
+def _aigrade_letter(score):
+    if score>=90:return"A"
+    if score>=75:return"B"
+    if score>=60:return"C"
+    if score>=40:return"D"
+    return"F"
+
+def aigrade_run(domain):
+    domain=str(domain or "").strip().lower().replace("https://","").replace("http://","").rstrip("/")
+    domain=domain.split("/")[0]
+    if not domain or "." not in domain or len(domain)>200:
+        return None
+    base="https://"+domain
+    results={};score=0
+    for key,path,points,kind in AIGRADE_CHECKS:
+        text=_aigrade_fetch(base+path)
+        passed=_aigrade_valid(kind,text)
+        results[key]={"path":path,"found":bool(text),"passed":passed,"points":points if passed else 0}
+        if passed:score+=points
+    human=_aigrade_fetch(base,AIGRADE_UA)
+    agent=_aigrade_fetch(base,AIGRADE_UA_AGENT)
+    render_ok=False
+    if human and agent:
+        ratio=min(len(human),len(agent))/max(len(human),len(agent),1)
+        render_ok=ratio>0.9
+    results["consistent_rendering"]={"passed":render_ok,"points":AIGRADE_RENDER_POINTS if render_ok else 0}
+    if render_ok:score+=AIGRADE_RENDER_POINTS
+    return{"domain":domain,"score":score,"max_score":AIGRADE_MAX,
+        "grade":_aigrade_letter(score),"checks":results,
+        "verified_by":"sebbi.pro",
+        "badge_url":HOST+"/api/aigrade/badge?domain="+domain,
+        "report_url":HOST+"/api/aigrade?domain="+domain,
+        "note":"External-signal check of published AI-transparency files; not an audit of internal systems"}
+
+def aigrade_badge_svg(domain):
+    r=aigrade_run(domain)
+    grade=r["grade"] if r else "F"
+    color=AIGRADE_COLORS.get(grade,"#ff8a80")
+    return('<svg xmlns="http://www.w3.org/2000/svg" width="180" height="20">'
+        '<rect width="120" height="20" fill="#0a0f1e"/>'
+        '<rect x="120" width="60" height="20" fill="'+color+'"/>'
+        '<text x="60" y="14" fill="#fff" font-family="Verdana,sans-serif" font-size="11" text-anchor="middle">AI-Safety Grade</text>'
+        '<text x="150" y="14" fill="#0a0f1e" font-family="Verdana,sans-serif" font-size="12" font-weight="bold" text-anchor="middle">'+grade+'</text>'
+        '</svg>')
+# ---------------- END FUNCTIONS ----------------
+
+
+# ---------------- BEGIN ROUTES (paste inside do_GET) ----------------
+        elif path=="/api/aigrade":
+            qs=parse_qs(parsed.query)
+            dom=(qs.get("domain",[""])[0] or "").strip()
+            rep=aigrade_run(dom)
+            if not rep:
+                send_json(self,{"error":"valid domain required, e.g. ?domain=example.com"},400)
+            else:
+                send_json(self,rep)
+        elif path=="/api/aigrade/badge":
+            qs=parse_qs(parsed.query)
+            dom=(qs.get("domain",[""])[0] or "").strip()
+            svg=aigrade_badge_svg(dom)
+            body=svg.encode()
+            self.send_response(200)
+            self.send_header("Content-Type","image/svg+xml")
+            self.send_header("Cache-Control","max-age=3600")
+            self.send_header("Content-Length",str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+# ---------------- END ROUTES ----------------
+
+```
+
+
+## `aileash_reporter.py`
+
+232 lines, 9377 bytes
+
+```python
+"""
+AILEASH DECISION REPORTER v1.0.0
+Generates readable audit reports for all AILeash products.
+Shows exactly why each decision was made.
+Copyright (c) 2026 Justin Antony Dobson / Monop Content, Blyth, UK
+"""
+
+import sqlite3, json, os
+from datetime import datetime
+
+DB_FILE = "aileash.db"
+
+PRODUCTS = {
+    "aileash": "AILeash",
+    "guardian": "AILeash Guardian",
+    "sonicboom": "SonicBoom",
+    "sentinel": "AILeash Sentinel"
+}
+
+REASON_EXPLANATIONS = {
+    "velocity_spike": "User made more than 10 requests in 60 seconds",
+    "high_amount": "Transaction amount exceeded threshold",
+    "risky_device": "Device risk score was above acceptable limit",
+    "behaviour_anomaly": "Unusual behaviour pattern detected",
+    "country_shift": "Request came from a different country than usual",
+    "unsafe_country": "Request came from outside approved country list",
+    "low_trust": "User trust score has dropped due to previous decisions",
+}
+
+def get_decisions(db_path=DB_FILE, limit=200):
+    if not os.path.exists(db_path):
+        return []
+    try:
+        conn = sqlite3.connect(db_path)
+        rows = conn.execute("""
+            SELECT a.ts, a.user_id, a.event_json, a.result_json, a.audit_hash,
+                   COALESCE(k.product, 'aileash') as product
+            FROM audit_log a
+            LEFT JOIN api_keys k ON json_extract(a.event_json, '$.api_key') = k.key
+            ORDER BY a.id DESC LIMIT ?
+        """, (limit,)).fetchall()
+        conn.close()
+    except:
+        try:
+            conn = sqlite3.connect(db_path)
+            rows = conn.execute("""
+                SELECT ts, user_id, event_json, result_json, audit_hash, 'aileash'
+                FROM audit_log ORDER BY id DESC LIMIT ?
+            """, (limit,)).fetchall()
+            conn.close()
+        except:
+            return []
+    
+    results = []
+    for row in rows:
+        try:
+            event = json.loads(row[2])
+            result = json.loads(row[3])
+            results.append({
+                "ts": row[0],
+                "user_id": row[1],
+                "event": event,
+                "result": result,
+                "audit_hash": row[4],
+                "product": row[5] or "aileash"
+            })
+        except:
+            pass
+    return results
+
+def explain_reason(r):
+    return REASON_EXPLANATIONS.get(r, r.replace("_", " ").capitalize())
+
+def decision_color(d):
+    return {"ALLOW": "#00875a", "CHALLENGE": "#b45309", "BLOCK": "#cc0000"}.get(d, "#555")
+
+def product_color(p):
+    return {
+        "aileash": "#c9a84c",
+        "guardian": "#cc0000",
+        "sonicboom": "#00d4ff",
+        "sentinel": "#7c3aed"
+    }.get(p, "#c9a84c")
+
+def generate_html_report(db_path=DB_FILE, limit=200, output="aileash_report.html"):
+    decisions = get_decisions(db_path, limit)
+
+    allow = sum(1 for d in decisions if d["result"].get("decision") == "ALLOW")
+    challenge = sum(1 for d in decisions if d["result"].get("decision") == "CHALLENGE")
+    block = sum(1 for d in decisions if d["result"].get("decision") == "BLOCK")
+
+    rows = ""
+    for d in decisions:
+        result = d["result"]
+        event = d["event"]
+        ts = datetime.fromtimestamp(d["ts"]).strftime('%Y-%m-%d %H:%M:%S')
+        decision = result.get("decision", "?")
+        score = result.get("score", 0)
+        reasons = result.get("reasons", [])
+        product = d.get("product", "aileash")
+        pc = product_color(product)
+        dc = decision_color(decision)
+        pname = PRODUCTS.get(product, product)
+
+        reason_html = ""
+        if reasons:
+            reason_html = "<ul>" + "".join(
+                f"<li>{explain_reason(r)}</li>" for r in reasons
+            ) + "</ul>"
+        else:
+            reason_html = "<span style='color:#888'>No risk factors detected</span>"
+
+        rows += f"""<tr>
+            <td>{ts}</td>
+            <td><span style="font-size:10px;background:{pc}22;color:{pc};border:1px solid {pc}44;padding:2px 6px;border-radius:3px">{pname}</span></td>
+            <td><code>{d['user_id']}</code></td>
+            <td>{event.get('action','?')}</td>
+            <td>{event.get('country','?')}</td>
+            <td>£{event.get('amount',0)}</td>
+            <td><strong style="color:{dc}">{decision}</strong></td>
+            <td>{score}</td>
+            <td>{result.get('trust',0)}</td>
+            <td>{reason_html}</td>
+            <td><code style="font-size:10px">{d['audit_hash'][:16]}...</code></td>
+        </tr>"""
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>AILeash Audit Report</title>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:sans-serif;background:#f5f7fa;color:#1a202c;padding:20px}}
+.header{{background:#0a0f1e;color:#fff;padding:24px 32px;border-radius:8px;margin-bottom:20px;display:flex;justify-content:space-between;align-items:center}}
+.header h1{{font-size:22px;color:#c9a84c;margin:0}}
+.header p{{font-size:12px;color:rgba(255,255,255,0.4);margin-top:4px}}
+.logo{{font-size:13px;color:rgba(255,255,255,0.2)}}
+.stats{{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px}}
+.stat{{background:#fff;border-radius:8px;padding:16px;text-align:center;border:1px solid #e2e8f0}}
+.stat-n{{font-size:28px;font-weight:700}}
+.stat-l{{font-size:11px;color:#64748b;margin-top:4px;text-transform:uppercase;letter-spacing:1px}}
+.allow{{color:#00875a}}.challenge{{color:#b45309}}.block{{color:#cc0000}}.total{{color:#0a0f1e}}
+.table-wrap{{background:#fff;border-radius:8px;overflow:hidden;border:1px solid #e2e8f0;overflow-x:auto}}
+table{{width:100%;border-collapse:collapse;min-width:900px}}
+th{{background:#0a0f1e;color:#c9a84c;padding:10px 12px;text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:1px;white-space:nowrap}}
+td{{padding:10px 12px;border-bottom:1px solid #e2e8f0;font-size:12px;vertical-align:top}}
+tr:last-child td{{border:none}}
+tr:hover td{{background:#f8fafc}}
+ul{{margin:4px 0;padding-left:16px}}
+li{{margin:2px 0;color:#64748b;font-size:11px}}
+code{{background:#f1f5f9;padding:2px 4px;border-radius:3px;font-size:10px}}
+.empty{{text-align:center;color:#888;padding:40px}}
+footer{{text-align:center;font-size:11px;color:#94a3b8;margin-top:20px}}
+</style>
+</head>
+<body>
+<div class="header">
+  <div>
+    <h1>AILeash Audit Report</h1>
+    <p>Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} &nbsp;|&nbsp; Last {len(decisions)} decisions</p>
+  </div>
+  <div class="logo">sebbi.pro &nbsp;|&nbsp; OAAS-1.0</div>
+</div>
+<div class="stats">
+  <div class="stat"><div class="stat-n total">{len(decisions)}</div><div class="stat-l">Total</div></div>
+  <div class="stat"><div class="stat-n allow">{allow}</div><div class="stat-l">Allowed</div></div>
+  <div class="stat"><div class="stat-n challenge">{challenge}</div><div class="stat-l">Challenged</div></div>
+  <div class="stat"><div class="stat-n block">{block}</div><div class="stat-l">Blocked</div></div>
+</div>
+<div class="table-wrap">
+<table>
+<thead><tr>
+  <th>Time</th><th>Product</th><th>User</th><th>Action</th><th>Country</th>
+  <th>Amount</th><th>Decision</th><th>Score</th><th>Trust</th><th>Reasons</th><th>Audit Hash</th>
+</tr></thead>
+<tbody>
+{''.join([rows]) if rows else f'<tr><td colspan="11" class="empty">No decisions recorded yet</td></tr>'}
+</tbody>
+</table>
+</div>
+<footer>AILeash &nbsp;|&nbsp; Monop Content &nbsp;|&nbsp; Justin Antony Dobson &nbsp;|&nbsp; sebbi.pro &nbsp;|&nbsp; SHA-256 Merkle Chain</footer>
+</body>
+</html>"""
+
+    with open(output, "w") as f:
+        f.write(html)
+    print(f"Report saved: {output} ({len(decisions)} decisions)")
+    return output
+
+def generate_json_report(db_path=DB_FILE, limit=200, output="aileash_report.json"):
+    decisions = get_decisions(db_path, limit)
+    report = {
+        "generated": datetime.now().isoformat(),
+        "standard": "OAAS-1.0",
+        "source": "sebbi.pro",
+        "total": len(decisions),
+        "summary": {
+            "allow": sum(1 for d in decisions if d["result"].get("decision") == "ALLOW"),
+            "challenge": sum(1 for d in decisions if d["result"].get("decision") == "CHALLENGE"),
+            "block": sum(1 for d in decisions if d["result"].get("decision") == "BLOCK")
+        },
+        "decisions": [{
+            "timestamp": datetime.fromtimestamp(d["ts"]).isoformat(),
+            "product": PRODUCTS.get(d["product"], d["product"]),
+            "user_id": d["user_id"],
+            "action": d["event"].get("action"),
+            "country": d["event"].get("country"),
+            "amount": d["event"].get("amount"),
+            "decision": d["result"].get("decision"),
+            "score": d["result"].get("score"),
+            "trust": d["result"].get("trust"),
+            "reasons": d["result"].get("reasons", []),
+            "reasons_explained": [explain_reason(r) for r in d["result"].get("reasons", [])],
+            "audit_hash": d["audit_hash"]
+        } for d in decisions]
+    }
+    with open(output, "w") as f:
+        json.dump(report, f, indent=2)
+    print(f"Report saved: {output}")
+    return output
+
+if __name__ == "__main__":
+    import sys
+    fmt = sys.argv[1] if len(sys.argv) > 1 else "html"
+    db = sys.argv[2] if len(sys.argv) > 2 else DB_FILE
+    if fmt == "json":
+        generate_json_report(db)
+    else:
+        generate_html_report(db)
 
 ```
