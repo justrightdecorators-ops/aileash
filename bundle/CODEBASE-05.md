@@ -1,4 +1,4 @@
-# Codebase — part 5 of 27
+# Codebase — part 5 of 26
 
 Contains:
 - `modules/continuity.py`

@@ -1,4 +1,4 @@
-# Codebase — part 6 of 27
+# Codebase — part 6 of 26
 
 Contains:
 - `modules/declare.py`

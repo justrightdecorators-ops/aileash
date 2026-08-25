@@ -1,4 +1,4 @@
-# Codebase — part 10 of 27
+# Codebase — part 10 of 26
 
 Contains:
 - `modules/rulebind.py`

@@ -1,4 +1,4 @@
-# Codebase — part 9 of 27
+# Codebase — part 9 of 26
 
 Contains:
 - `modules/ratchet.py`
