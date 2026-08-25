@@ -1,715 +1,64 @@
-# Codebase — part 8 of 26
+# Codebase — part 8 of 27
 
 Contains:
-- `modules/ratchet.py`
-- `modules/reconcile.py`
-- `modules/replay.py`
-- `modules/roster.py`
-- `modules/router.py`
+- `modules/pack.py`
+- `modules/packconsole.py`
+- `modules/peer.py`
+- `modules/peerconsole.py`
+- `modules/publish.py`
 
 
-## `modules/ratchet.py`
+## `modules/pack.py`
 
-615 lines, 25928 bytes
+501 lines, 20695 bytes
 
 ```python
 """
-ratchet.py - time only runs one way for the machine.
+Evidence pack - /x/pack/<action>
 
-WHAT THIS IS FOR
-----------------
-heartbeat.py proves WHEN a record can have been made. sortition.py proves
-NOBODY CHOSE what got reviewed. This one proves an actor cannot move
-backwards through time.
+WHAT THIS IS
+------------
+The sellable artifact. Everything else in this platform produces evidence;
+this produces the document someone hands an auditor.
 
-Every action an agent takes is bound to the beacon round current at the
-moment it acted. Beacon rounds only ever increase. So an actor's actions
-form a strictly rising ladder, and the rule is one line:
+For a chosen period it does not summarise the chain, it RE-VERIFIES it:
+every block in the range is rehashed from its stored contents using the
+same function that sealed it, and compared to the hash recorded at the
+time. Then the links between blocks are walked, and for a single key the
+gapless receipt sequence is checked end to end.
 
-    an action carrying a beacon round at or below the actor's last
-    recorded round is REFUSED.
+A summary is a claim. A re-verification is a check anyone can repeat.
 
-WHAT THAT KILLS, WITHOUT A POLICY, A PROMPT OR A PROMISE
---------------------------------------------------------
-BACKDATING     An agent cannot produce an action claiming to sit earlier
-               than one it already took. The earlier round is already
-               spent.
-REPLAY         Capture a valid action and fire it again later: the round
-               is stale and the digest is already on the ladder.
-PRE-COMPUTATION
-               An agent cannot prepare a batch of actions in advance,
-               because it cannot know tomorrow's beacon values today. A
-               round that has not been sealed here yet is refused.
-REWIND         Restore an agent from an old snapshot to undo its history
-               and its next action lands below the recorded floor. The
-               ladder is in a chain the agent does not control, so
-               restoring the agent does not restore its position.
+WHAT IT DOES NOT PROVE
+----------------------
+- That any decision recorded here was correct. Wrong answers seal just as
+  cleanly as right ones.
+- That an external peer's own chain is honest. That is checked at the
+  peer's host, not here.
+- Anything about periods outside the range requested.
 
-REFUSALS ARE SEALED, NOT DROPPED
---------------------------------
-This is the part that matters. A refused action is written into the chain
-with the reason. An agent trying to rewind is the single most interesting
-event this system can observe, and throwing it away as a 409 would be
-throwing away the evidence. /x/ratchet/refusals is public.
+    GET  /x/pack/spec                        public - what this does
+    GET  /x/pack/preview?period=2026-Q2      keyed  - the pack as JSON
+    GET  /x/pack/render?period=2026-Q2       keyed  - the pack as one page
+    GET  /x/pack/history                     keyed  - packs issued
+    POST /x/pack/issue                       keyed  - seal it into the chain
 
-HONEST LIMITS
--------------
-- It binds an actor's actions to an order. It says nothing about whether
-  any action was correct, authorised, or wise.
-- An actor that simply stops acting cannot be forced to continue. Silence
-  is visible (last_seen goes stale) but is not prevented.
-- Two different actor ids are two different ladders. Anyone able to mint
-  new actor ids can start a fresh ladder; that is an identity problem,
-  handled by whatever issues the ids, not here.
-- The floor is only as fine-grained as the beat cadence. At a five
-  minute cadence, two actions inside the same beat are ordered by
-  sequence, not by beacon time, and that is reported rather than dressed
-  up.
-- It depends on heartbeat. With no beats sealed, nothing can be admitted,
-  and this module says so rather than waving actions through.
-
-Contract: handle(method, action, data, api_key, ctx) -> (dict, status)
-Routes:
-  GET  spec      public  what this is and the exact admission rules
-  GET  actor     public  ?id= - one actor's current rung and ladder
-  GET  actors    public  every ladder, with staleness
-  GET  refusals  public  every refused attempt, with reason. The good bit.
-  GET  verify    public  ?id= - re-walk a ladder and report any break
-  GET  status    public  coverage, admission and refusal counts
-  POST act       keyed   submit an action. Admitted or refused; both sealed.
+period accepts YYYY, YYYY-MM, YYYY-Qn. Add scope=me to limit the pack to
+your own key; omit scope for a deployment-wide pack.
 """
 
+import calendar
+import datetime
+import hashlib
 import json
 import time
-import hashlib
 
-VERSION = "1.0.0"
+VERSION = "1.0"
 
-PUBLIC = {
-    ("GET", "spec"),
-    ("GET", "actor"),
-    ("GET", "actors"),
-    ("GET", "refusals"),
-    ("GET", "verify"),
-    ("GET", "status"),
-}
+# (METHOD, action). Only the spec is open - a pack is customer evidence.
+PUBLIC = {("GET", "spec")}
 
-MAX_LAG_BEATS = 3          # how far behind the newest beat an action may be
-MAX_ACTOR_LEN = 120
-STALE_SECONDS = 3600
-
-REASONS = {
-    "ok": "Admitted. The round is ahead of this actor's last rung.",
-    "no_beats": (
-        "Refused: no beacon has been sealed on this server, so there is no "
-        "time to bind to. Nothing is admitted on trust."),
-    "round_unknown": (
-        "Refused: that beacon round has not been sealed here. Either it has "
-        "not happened yet - which would mean the actor knew a value before "
-        "it existed - or this server has not observed it."),
-    "round_not_advanced": (
-        "Refused: the round is at or below this actor's last rung. This is "
-        "the ratchet. An actor cannot move backwards through beacon time, "
-        "whether by backdating, by replay, or by being restored from an "
-        "older snapshot."),
-    "round_too_stale": (
-        "Refused: the round is further behind the current beat than the "
-        "permitted lag. An action bound to old time is a replay or a very "
-        "slow actor; both are refused and both are recorded."),
-    "digest_replayed": (
-        "Refused: this exact action digest is already on this actor's "
-        "ladder. Identical work resubmitted is a replay by definition."),
-    "bad_request": "Refused: malformed submission.",
-}
-
-WHAT_THIS_PROVES = (
-    "That an actor's recorded actions only ever moved forward in a public "
-    "time nobody controls. It does not prove any action was correct, "
-    "authorised, or sensible."
-)
-
-DDL = [
-    """CREATE TABLE IF NOT EXISTS ratchet_rung (
-        id            INTEGER PRIMARY KEY AUTOINCREMENT,
-        actor         TEXT NOT NULL,
-        seq           INTEGER NOT NULL,
-        beacon_round  INTEGER NOT NULL,
-        beacon_value  TEXT,
-        digest        TEXT NOT NULL,
-        label         TEXT,
-        at            REAL NOT NULL,
-        chain_rowid   INTEGER,
-        audit_hash    TEXT
-    )""",
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_rat_seq ON ratchet_rung(actor, seq)",
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_rat_dig ON ratchet_rung(actor, digest)",
-    "CREATE INDEX IF NOT EXISTS idx_rat_actor ON ratchet_rung(actor)",
-    """CREATE TABLE IF NOT EXISTS ratchet_refusal (
-        id            INTEGER PRIMARY KEY AUTOINCREMENT,
-        actor         TEXT NOT NULL,
-        claimed_round INTEGER,
-        last_round    INTEGER,
-        digest        TEXT,
-        reason        TEXT NOT NULL,
-        at            REAL NOT NULL,
-        chain_rowid   INTEGER,
-        audit_hash    TEXT
-    )""",
-    "CREATE INDEX IF NOT EXISTS idx_rat_ref ON ratchet_refusal(actor)",
-]
-
-
-# ---------------------------------------------------------------------
-# plumbing
-# ---------------------------------------------------------------------
-
-def _ensure(conn, lock):
-    with lock:
-        cur = conn.cursor()
-        for stmt in DDL:
-            cur.execute(stmt)
-        conn.commit()
-
-
-def _iso(t):
-    if t is None:
-        return None
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
-
-
-def _human(seconds):
-    if seconds is None:
-        return None
-    s = int(round(seconds))
-    if s < 60:
-        return "%d seconds" % s
-    if s < 3600:
-        return "%d minutes" % (s // 60)
-    if s < 86400:
-        return "%d hours" % (s // 3600)
-    return "%d days" % (s // 86400)
-
-
-def _seal(ctx, action, payload):
-    """server.py: seal(event, result, ts, api_key=None); event is a DICT
-    carrying user_id; returns (audit_hash, block_index, key_seq)."""
-    fn = ctx.get("seal")
-    if fn is None:
-        return None, None
-    ts = time.time()
-    event = {"user_id": "ratchet", "action": action, "amount": 0,
-             "country": "UK", "device_id": "ratchet", "anomaly": 0,
-             "device_risk": 0}
-    result = dict(payload)
-    result.setdefault("decision", "RATCHET")
-    result.setdefault("score", 0)
-    result.setdefault("version", VERSION)
-    result.setdefault("timestamp", ts)
-    for call in (lambda: fn(event, result, ts),
-                 lambda: fn(event, result, ts, None),
-                 lambda: fn(event, result)):
-        try:
-            out = call()
-        except TypeError:
-            continue
-        except Exception:
-            return None, None
-        h = idx = None
-        if isinstance(out, (tuple, list)):
-            for item in out:
-                if isinstance(item, str) and len(item) == 64 and h is None:
-                    h = item
-                elif isinstance(item, int) and idx is None:
-                    idx = item
-        elif isinstance(out, str):
-            h = out
-        return h, idx
-    return None, None
-
-
-def _newest_beat(conn):
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT beacon_round, value, fetched_at FROM heartbeat_tick"
-                    " WHERE chain_rowid IS NOT NULL AND beacon_round IS NOT NULL"
-                    " ORDER BY beacon_round DESC LIMIT 1")
-        return cur.fetchone()
-    except Exception:
-        return None
-
-
-def _beat(conn, rnd):
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT beacon_round, value, fetched_at FROM heartbeat_tick"
-                    " WHERE beacon_round=? AND chain_rowid IS NOT NULL LIMIT 1",
-                    (rnd,))
-        return cur.fetchone()
-    except Exception:
-        return None
-
-
-def _beats_between(conn, low, high):
-    """How many sealed beats sit in (low, high]. Used for the lag check."""
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM heartbeat_tick WHERE chain_rowid IS"
-                    " NOT NULL AND beacon_round>? AND beacon_round<=?",
-                    (low, high))
-        return cur.fetchone()[0]
-    except Exception:
-        return 0
-
-
-def _top(conn, actor):
-    cur = conn.cursor()
-    cur.execute("SELECT seq, beacon_round, digest, at FROM ratchet_rung"
-                " WHERE actor=? ORDER BY seq DESC LIMIT 1", (actor,))
-    return cur.fetchone()
-
-
-def _refuse(ctx, conn, lock, actor, rnd, last, digest, reason, extra=None):
-    now = time.time()
-    with lock:
-        cur = conn.cursor()
-        cur.execute("INSERT INTO ratchet_refusal (actor, claimed_round,"
-                    " last_round, digest, reason, at) VALUES (?,?,?,?,?,?)",
-                    (actor, rnd, last, digest, reason, now))
-        rid = cur.lastrowid
-        conn.commit()
-    h, idx = _seal(ctx, "ratchet_refused", {
-        "kind": "ratchet_refusal", "actor": actor, "claimed_round": rnd,
-        "last_admitted_round": last, "digest": digest, "reason": reason,
-        "explanation": REASONS.get(reason, reason),
-        "note": ("A refused action is sealed rather than discarded. An actor "
-                 "attempting to move backwards is the most interesting event "
-                 "this module can observe."),
-    })
-    if h or idx:
-        with lock:
-            conn.execute("UPDATE ratchet_refusal SET chain_rowid=?,"
-                         " audit_hash=? WHERE id=?", (idx, h, rid))
-            conn.commit()
-    out = {
-        "admitted": False,
-        "reason": reason,
-        "explanation": REASONS.get(reason, reason),
-        "actor": actor,
-        "claimed_round": rnd,
-        "last_admitted_round": last,
-        "refusal_sealed_at_block": idx,
-        "refusal_audit_hash": h,
-        "this_refusal_is_permanent": True,
-        "public_record": "/x/ratchet/refusals",
-    }
-    if extra:
-        out.update(extra)
-    return out
-
-
-# ---------------------------------------------------------------------
-# handle
-# ---------------------------------------------------------------------
-
-def handle(method, action, data, api_key, ctx):
-    conn, lock = ctx["conn"], ctx["lock"]
-    _ensure(conn, lock)
-
-    if method == "GET" and action == "spec":
-        return _spec(), 200
-
-    # -------------------------------------------------- act
-    if method == "POST" and action == "act":
-        actor = str(data.get("actor") or "").strip().lower()[:MAX_ACTOR_LEN]
-        digest = str(data.get("digest") or "").strip().lower()
-        label = str(data.get("label") or "")[:200] or None
-        rnd = data.get("round")
-
-        if not actor:
-            return {"error": "actor_required",
-                    "note": "A stable identifier for the acting agent."}, 400
-        if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
-            return {"error": "digest_required",
-                    "note": ("A SHA-256 of the action. The action itself never "
-                             "leaves your system.")}, 400
-
-        newest = _newest_beat(conn)
-        if not newest:
-            top = _top(conn, actor)
-            return _refuse(ctx, conn, lock, actor, rnd,
-                           top[1] if top else None, digest, "no_beats"), 503
-
-        newest_round = newest[0]
-        if rnd is None:
-            rnd = newest_round          # bind to now if the caller does not say
-        try:
-            rnd = int(rnd)
-        except (TypeError, ValueError):
-            return {"error": "round_invalid"}, 400
-
-        top = _top(conn, actor)
-        last_round = top[1] if top else None
-        last_seq = top[0] if top else 0
-
-        if not _beat(conn, rnd):
-            return _refuse(ctx, conn, lock, actor, rnd, last_round, digest,
-                           "round_unknown",
-                           {"newest_sealed_round": newest_round}), 409
-
-        if last_round is not None and rnd <= last_round:
-            return _refuse(ctx, conn, lock, actor, rnd, last_round, digest,
-                           "round_not_advanced",
-                           {"the_rule": ("beacon round must be strictly greater "
-                                         "than the actor's last rung")}), 409
-
-        lag = _beats_between(conn, rnd, newest_round)
-        if lag > MAX_LAG_BEATS:
-            return _refuse(ctx, conn, lock, actor, rnd, last_round, digest,
-                           "round_too_stale",
-                           {"beats_behind": lag,
-                            "max_lag_beats": MAX_LAG_BEATS,
-                            "newest_sealed_round": newest_round}), 409
-
-        cur = conn.cursor()
-        cur.execute("SELECT seq FROM ratchet_rung WHERE actor=? AND digest=?",
-                    (actor, digest))
-        if cur.fetchone():
-            return _refuse(ctx, conn, lock, actor, rnd, last_round, digest,
-                           "digest_replayed"), 409
-
-        beat = _beat(conn, rnd)
-        now = time.time()
-        seq = last_seq + 1
-        with lock:
-            cur = conn.cursor()
-            cur.execute("INSERT INTO ratchet_rung (actor, seq, beacon_round,"
-                        " beacon_value, digest, label, at)"
-                        " VALUES (?,?,?,?,?,?,?)",
-                        (actor, seq, rnd, beat[1], digest, label, now))
-            rid = cur.lastrowid
-            conn.commit()
-
-        h, idx = _seal(ctx, "ratchet_step", {
-            "kind": "ratchet_step", "actor": actor, "seq": seq,
-            "beacon_round": rnd, "beacon_value": beat[1], "digest": digest,
-            "label": label, "previous_round": last_round,
-            "note": ("Bound to a public beacon value the actor could not have "
-                     "known before that round existed."),
-        })
-        if h or idx:
-            with lock:
-                conn.execute("UPDATE ratchet_rung SET chain_rowid=?,"
-                             " audit_hash=? WHERE id=?", (idx, h, rid))
-                conn.commit()
-
-        return {
-            "admitted": True, "actor": actor, "seq": seq,
-            "beacon_round": rnd, "beacon_value": beat[1],
-            "previous_round": last_round, "digest": digest,
-            "sealed_at_block": idx, "audit_hash": h,
-            "floor": ("This action cannot have been created before beacon "
-                      "round %d at %s." % (rnd, _iso(beat[2]))),
-            "ratchet": ("This actor can no longer act at or below round %d. "
-                        "That door is shut permanently." % rnd),
-            "verify_beacon": "/x/heartbeat/verify?round=%d" % rnd,
-        }, 200
-
-    # -------------------------------------------------- actor
-    if method == "GET" and action == "actor":
-        actor = str(data.get("id") or "").strip().lower()
-        if not actor:
-            return {"error": "id_required",
-                    "usage": "/x/ratchet/actor?id=<actor>"}, 400
-        cur = conn.cursor()
-        cur.execute("SELECT seq, beacon_round, digest, label, at, chain_rowid,"
-                    " audit_hash FROM ratchet_rung WHERE actor=? ORDER BY seq",
-                    (actor,))
-        rungs = cur.fetchall()
-        if not rungs:
-            return {"actor": actor, "rungs": 0,
-                    "message": "No ladder for this actor."}, 404
-        cur.execute("SELECT COUNT(*) FROM ratchet_refusal WHERE actor=?", (actor,))
-        refused = cur.fetchone()[0]
-        last = rungs[-1]
-        age = time.time() - last[4]
-        return {
-            "actor": actor,
-            "rungs": len(rungs),
-            "current_round": last[1],
-            "current_seq": last[0],
-            "last_action_at": _iso(last[4]),
-            "seconds_since": round(age, 1),
-            "status": "current" if age < STALE_SECONDS else "silent",
-            "refusals": refused,
-            "ladder": [{"seq": r[0], "round": r[1], "digest": r[2],
-                        "label": r[3], "at": _iso(r[4]), "block": r[5],
-                        "audit_hash": r[6]} for r in rungs[-50:]],
-            "floor_now": ("This actor cannot act at or below round %d."
-                          % last[1]),
-            "what_this_proves": WHAT_THIS_PROVES,
-        }, 200
-
-    # -------------------------------------------------- actors
-    if method == "GET" and action == "actors":
-        now = time.time()
-        cur = conn.cursor()
-        cur.execute("SELECT actor, COUNT(*), MAX(beacon_round), MAX(at)"
-                    " FROM ratchet_rung GROUP BY actor ORDER BY MAX(at) DESC")
-        out = []
-        for a, n, rnd, at in cur.fetchall():
-            cur2 = conn.cursor()
-            cur2.execute("SELECT COUNT(*) FROM ratchet_refusal WHERE actor=?", (a,))
-            out.append({"actor": a, "rungs": n, "current_round": rnd,
-                        "last_action": _iso(at),
-                        "silent_for": _human(now - at) if now - at > STALE_SECONDS else None,
-                        "refusals": cur2.fetchone()[0]})
-        return {"count": len(out), "actors": out,
-                "note": ("Silence is visible but not prevented. An actor that "
-                         "stops acting simply stops, and no design fixes "
-                         "that.")}, 200
-
-    # -------------------------------------------------- refusals
-    if method == "GET" and action == "refusals":
-        try:
-            limit = min(int(data.get("limit", 100)), 500)
-        except (TypeError, ValueError):
-            limit = 100
-        cur = conn.cursor()
-        cur.execute("SELECT actor, claimed_round, last_round, digest, reason,"
-                    " at, chain_rowid, audit_hash FROM ratchet_refusal"
-                    " ORDER BY id DESC LIMIT ?", (limit,))
-        rows = cur.fetchall()
-        mix = {}
-        for r in rows:
-            mix[r[4]] = mix.get(r[4], 0) + 1
-        return {
-            "count": len(rows),
-            "by_reason": mix,
-            "refusals": [{"actor": r[0], "claimed_round": r[1],
-                          "last_admitted_round": r[2], "digest": r[3],
-                          "reason": r[4], "explanation": REASONS.get(r[4], r[4]),
-                          "at": _iso(r[5]), "block": r[6], "audit_hash": r[7]}
-                         for r in rows],
-            "why_this_is_public": (
-                "A refused action is sealed rather than discarded, and the "
-                "list is open. An actor attempting to move backwards through "
-                "time is the single most interesting thing this system can "
-                "see, and hiding it would defeat the point of building it."),
-        }, 200
-
-    # -------------------------------------------------- verify
-    if method == "GET" and action == "verify":
-        actor = str(data.get("id") or "").strip().lower()
-        if not actor:
-            return {"error": "id_required"}, 400
-        cur = conn.cursor()
-        cur.execute("SELECT seq, beacon_round, beacon_value, digest FROM"
-                    " ratchet_rung WHERE actor=? ORDER BY seq", (actor,))
-        rungs = cur.fetchall()
-        if not rungs:
-            return {"error": "unknown_actor", "actor": actor}, 404
-        breaks = []
-        prev_seq = 0
-        prev_round = None
-        seen = set()
-        for seq, rnd, val, dig in rungs:
-            if seq != prev_seq + 1:
-                breaks.append({"at_seq": seq, "fault": "sequence_gap",
-                               "expected": prev_seq + 1})
-            if prev_round is not None and rnd <= prev_round:
-                breaks.append({"at_seq": seq, "fault": "round_did_not_advance",
-                               "round": rnd, "previous": prev_round})
-            if dig in seen:
-                breaks.append({"at_seq": seq, "fault": "duplicate_digest"})
-            b = _beat(conn, rnd)
-            if not b:
-                breaks.append({"at_seq": seq, "fault": "beacon_round_not_sealed",
-                               "round": rnd})
-            elif b[1] != val:
-                breaks.append({"at_seq": seq, "fault": "beacon_value_mismatch",
-                               "round": rnd})
-            seen.add(dig)
-            prev_seq, prev_round = seq, rnd
-        return {
-            "actor": actor, "rungs": len(rungs), "intact": not breaks,
-            "breaks": breaks,
-            "checked": ["sequence has no gaps",
-                        "beacon round strictly increases",
-                        "no digest appears twice",
-                        "each rung's beacon value matches the sealed beat"],
-            "do_it_without_us": (
-                "Every beacon round on the ladder is re-fetchable from the "
-                "beacon operator. Confirm each value there, then confirm each "
-                "audit_hash is in the chain at /api/verify-chain. Neither step "
-                "needs our cooperation."),
-            "what_this_proves": WHAT_THIS_PROVES,
-        }, 200
-
-    # -------------------------------------------------- status
-    if method == "GET" and action == "status":
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*), COUNT(DISTINCT actor) FROM ratchet_rung")
-        rungs, actors = cur.fetchone()
-        cur.execute("SELECT COUNT(*) FROM ratchet_refusal")
-        refused = cur.fetchone()[0]
-        cur.execute("SELECT reason, COUNT(*) FROM ratchet_refusal GROUP BY reason")
-        mix = {r[0]: r[1] for r in cur.fetchall()}
-        newest = _newest_beat(conn)
-        return {
-            "version": VERSION,
-            "actors": actors, "rungs_admitted": rungs,
-            "actions_refused": refused,
-            "refusals_by_reason": mix,
-            "current_beacon_round": newest[0] if newest else None,
-            "beacon_available": newest is not None,
-            "max_lag_beats": MAX_LAG_BEATS,
-            "depends_on": {
-                "heartbeat": ("supplies the time. With no beats sealed, "
-                              "nothing is admitted - actions are refused "
-                              "rather than waved through on trust."),
-            },
-            "what_this_proves": WHAT_THIS_PROVES,
-        }, 200
-
-    return {"error": "unknown_action", "action": action,
-            "actions": ["spec", "actor", "actors", "refusals", "verify",
-                        "status", "act"]}, 404
-
-
-def _spec():
-    return {
-        "module": "ratchet",
-        "version": VERSION,
-        "one_line": "Time only runs one way for the machine.",
-        "the_rule": (
-            "An action carrying a beacon round at or below the actor's last "
-            "recorded round is refused. Beacon rounds only increase, so an "
-            "actor's ladder only rises."),
-        "what_it_kills": {
-            "backdating": "the earlier round is already spent",
-            "replay": "stale round, and the digest is already on the ladder",
-            "pre_computation": ("an unsealed future round is refused, and "
-                                "nobody can know a beacon value early"),
-            "rewind": ("the ladder lives in a chain the actor does not "
-                       "control, so restoring an agent from a snapshot does "
-                       "not restore its position"),
-        },
-        "admission_rules_in_order": [
-            "1. A beat must exist. No beats, nothing admitted.",
-            "2. The claimed round must already be sealed here.",
-            "3. The round must be strictly above the actor's last rung.",
-            "4. The round must be within %d beats of the newest." % MAX_LAG_BEATS,
-            "5. The digest must not already be on this actor's ladder.",
-        ],
-        "refusals_are_sealed": (
-            "A refused action is written into the chain with its reason and "
-            "published at /x/ratchet/refusals. Discarding it would throw away "
-            "the most interesting evidence the system can produce."),
-        "privacy": (
-            "Only a SHA-256 of the action is submitted. The action itself, "
-            "its inputs and its outputs never leave the caller's system."),
-        "what_this_proves": WHAT_THIS_PROVES,
-        "limits": [
-            "It proves order, not correctness, authority or good judgement.",
-            "An actor that stops acting is visible but not prevented.",
-            "New actor ids start new ladders; identity is not this module's "
-            "problem and it does not pretend otherwise.",
-            "Within a single beat, actions are ordered by sequence rather "
-            "than by beacon time. At a five minute cadence that is a five "
-            "minute grain, and it is reported rather than dressed up.",
-        ],
-        "routes": {
-            "POST /x/ratchet/act": "keyed - submit an action digest",
-            "GET /x/ratchet/actor?id=": "one ladder",
-            "GET /x/ratchet/actors": "every ladder",
-            "GET /x/ratchet/refusals": "every refused attempt and why",
-            "GET /x/ratchet/verify?id=": "re-walk a ladder",
-            "GET /x/ratchet/status": "counts and current round",
-        },
-    }
-
-```
-
-
-## `modules/reconcile.py`
-
-440 lines, 20123 bytes
-
-```python
-"""
-Reconciliation notary - /x/reconcile/<action>
-
-THE PROBLEM THIS ATTACKS
-------------------------
-A sealed chain proves records were not altered after the fact. It does not
-prove they were true when written. An operator who seals fiction on time has
-a tamper-evident chain of fiction. Every honest person in this market knows
-that, and almost nobody says it.
-
-You cannot prove truth from outside a system. What you CAN do is what real
-auditors do: substantive testing. Take the sealed claim, go to the operator's
-own live system, and check whether the two agree - then seal the result of
-that check, including the failures.
-
-WHY THIS ONE IS DIFFERENT
--------------------------
-The sample is fixed before the operator sees it.
-
-/plan derives a selection seed from the current chain tip - a value the
-operator cannot predict in advance and cannot change afterwards without
-breaking the chain - picks the records to be tested, and seals that selection
-BEFORE any data is requested. Only then are the record identifiers returned.
-
-So the operator cannot choose which records get examined, cannot prepare only
-the flattering ones, and cannot quietly drop a test that came back badly:
-every planned run is sealed at the moment it is planned, and a plan with no
-submitted result is visible forever as an abandoned test.
-
-Mismatches are sealed with the same permanence as matches. That is the whole
-design. A reconciliation system that can bury its own failures is decoration.
-
-WHAT A PASS ACTUALLY MEANS
---------------------------
-That two systems the operator controls agree with each other, on records the
-operator could not choose, at a time the operator could not pick.
-
-That is not proof of truth. An operator who fabricates consistently across
-every system, in real time, without knowing what will be sampled, will pass.
-What it does is raise the cost of lying from "edit one database" to
-"maintain a coherent parallel reality across independent systems indefinitely,
-under unpredictable sampling, with every failure sealed permanently."
-
-That is the honest claim. It is also, as far as I know, more than anyone else
-in this market is doing.
-
-HONEST LIMITS
--------------
-- Consistency is not truth. Two agreeing systems can both be wrong.
-- The operator supplies the comparison data. This tests their systems against
-  each other, not against the world.
-- Sampling only covers what has been sealed. It cannot find a decision that
-  was never recorded at all - gapless receipts are what cover that.
-- A high match rate on a badly chosen field proves nothing. Reconcile the
-  fields that would hurt to get wrong.
-
-    POST /x/reconcile/plan     sample_size, field  - seals the selection first
-    POST /x/reconcile/submit   run_id, results     - seals the comparison
-    GET  /x/reconcile/run?id=RUN-XXXXXXXX
-    GET  /x/reconcile/score
-    GET  /x/reconcile/list
-"""
-
-import hashlib, json, time
-from datetime import datetime, timezone
-
-VERSION = "1.1"
-MAX_SAMPLE = 200
-
-# Planning and submitting stay keyed - they touch an operator's own records.
-# What is public is the part that decides whether any of it means anything:
-# that the sample was fixed before the data was asked for, and that failures
-# were sealed as permanently as passes.
-PUBLIC = {("GET", "public"), ("GET", "proof")}
+MAX_ROWS = 200000
 
 _ready = False
 
@@ -719,535 +68,2181 @@ def _setup(ctx):
     if _ready:
         return
     with ctx["lock"]:
-        ctx["conn"].execute("CREATE TABLE IF NOT EXISTS reconcile_runs(run_id TEXT PRIMARY KEY,api_key TEXT,field TEXT,seed TEXT,planned REAL,submitted REAL,sample_size INTEGER,matched INTEGER,mismatched INTEGER,missing INTEGER,status TEXT DEFAULT 'planned',block_ids TEXT,detail TEXT)")
-        ctx["conn"].execute("CREATE INDEX IF NOT EXISTS idx_rec_key ON reconcile_runs(api_key)")
+        ctx["conn"].execute(
+            "CREATE TABLE IF NOT EXISTS pack_issued("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,"
+            "period TEXT,scope TEXT,digest TEXT,issued REAL,"
+            "entries INTEGER,verified INTEGER,mismatches INTEGER,"
+            "audit_hash TEXT,block_index INTEGER)")
+        ctx["conn"].execute(
+            "CREATE INDEX IF NOT EXISTS idx_pack_key "
+            "ON pack_issued(api_key)")
         ctx["conn"].commit()
     _ready = True
 
 
+def _sha(p):
+    """Identical to the engine's own sha(). Written out here rather than
+    imported so this module depends on no other module's internals."""
+    return hashlib.sha256(
+        json.dumps(p, sort_keys=True).encode()).hexdigest()
+
+
 def _iso(ts):
-    if not ts:
+    if ts is None:
         return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+    return datetime.datetime.utcfromtimestamp(
+        float(ts)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _sha(s):
-    return hashlib.sha256(s.encode()).hexdigest()
+def _day(ts):
+    if ts is None:
+        return None
+    return datetime.datetime.utcfromtimestamp(
+        float(ts)).strftime("%Y-%m-%d")
 
 
-def _seal_event(ctx, api_key, rid, action, detail):
-    ts = time.time()
-    ev = {"user_id": "rec:" + rid, "action": "reconcile_" + action, "amount": 0,
-          "country": "UK", "device_id": "reconcile", "anomaly": 0, "device_risk": 0}
-    res = {"decision": "RECONCILE_SEALED", "score": 0, "reconcile_action": action,
-           "reconcile_version": VERSION, "timestamp": ts, "detail": detail}
-    h, idx, seq = ctx["seal"](ev, res, ts, api_key)
-    return h, idx, seq, ts
+def _epoch(y, m, d):
+    return float(calendar.timegm((y, m, d, 0, 0, 0, 0, 0, 0)))
 
 
-def _plan(ctx, api_key, data):
+def _bounds(period):
+    """YYYY | YYYY-MM | YYYY-Qn -> (start, end, label)."""
+    p = str(period or "").strip().upper()
     try:
-        n = int(data.get("sample_size", 25))
-    except Exception:
-        return {"error": "invalid_sample_size"}, 400
-    if n < 1 or n > MAX_SAMPLE:
-        return {"error": "sample_size_out_of_range", "max": MAX_SAMPLE}, 400
-    field = str(data.get("field", "decision")).strip()[:60] or "decision"
+        if len(p) == 4:
+            y = int(p)
+            return _epoch(y, 1, 1), _epoch(y + 1, 1, 1), p
+        if len(p) == 7 and p[4] == "-" and p[5] == "Q":
+            y, q = int(p[:4]), int(p[6])
+            if q < 1 or q > 4:
+                return None
+            m = (q - 1) * 3 + 1
+            em, ey = m + 3, y
+            if em > 12:
+                em, ey = em - 12, y + 1
+            return _epoch(y, m, 1), _epoch(ey, em, 1), p
+        if len(p) == 7 and p[4] == "-":
+            y, m = int(p[:4]), int(p[5:])
+            em, ey = m + 1, y
+            if em > 12:
+                em, ey = 1, y + 1
+            return _epoch(y, m, 1), _epoch(ey, em, 1), p
+    except (ValueError, IndexError):
+        return None
+    return None
+
+
+# ----------------------------------------------------------------------
+# assembly - the actual re-verification
+# ----------------------------------------------------------------------
+
+def _assemble(ctx, start, end, label, scope):
+    c = ctx["conn"]
+    cols = ("id,ts,event_json,result_json,prev_hash,audit_hash,"
+            "api_key,key_seq")
 
     with ctx["lock"]:
-        tiprow = ctx["conn"].execute("SELECT audit_hash FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()
-        rows = ctx["conn"].execute("SELECT id,user_id,result_json,ts FROM audit_log WHERE api_key=? ORDER BY id ASC", (api_key,)).fetchall()
-
-    if not rows:
-        return {"error": "nothing_to_reconcile",
-                "message": "No sealed records under this key yet."}, 400
-
-    tip = tiprow[0] if tiprow else "GENESIS"
-    ts = time.time()
-    # Seed is bound to the chain tip. The operator cannot know it before the
-    # records exist, and cannot alter it afterwards without breaking the chain.
-    seed = _sha(tip + ":" + str(int(ts)) + ":" + field + ":" + str(n))
-
-    # Deterministic selection from the seed - reproducible by anyone holding it.
-    scored = sorted(rows, key=lambda r: _sha(seed + ":" + str(r[0])))
-    picked = scored[:min(n, len(scored))]
-
-    rid = "RUN-" + seed[:8].upper()
-    block_ids = [p[0] for p in picked]
-
-    sample = []
-    for bid, uid, res_json, bts in picked:
-        try:
-            r = json.loads(res_json)
-            sealed_val = r.get(field)
-        except Exception:
-            sealed_val = None
-        sample.append({"block_index": bid, "record_id": uid,
-                       "sealed_at": _iso(bts),
-                       "sealed_value_sha256": _sha(str(sealed_val))})
-
-    detail = ("field=" + field + ";sample_size=" + str(len(picked)) +
-              ";seed=" + seed + ";from_tip=" + tip +
-              ";blocks=" + ",".join(str(b) for b in block_ids[:60]))
-    h, idx, seq, _x = _seal_event(ctx, api_key, rid, "planned", detail)
-
-    with ctx["lock"]:
-        ctx["conn"].execute("INSERT OR REPLACE INTO reconcile_runs(run_id,api_key,field,seed,planned,submitted,sample_size,matched,mismatched,missing,status,block_ids,detail) VALUES(?,?,?,?,?,NULL,?,NULL,NULL,NULL,'planned',?,NULL)",
-                            (rid, api_key, field, seed, ts, len(picked), json.dumps(block_ids)))
-        ctx["conn"].commit()
-
-    return {"run_id": rid, "field": field, "sample_size": len(picked),
-            "seed": seed, "derived_from_tip": tip, "planned_at": _iso(ts),
-            "audit_hash": h, "block_index": idx, "receipt_seq": seq,
-            "sample": sample,
-            "next": "Fetch these record_ids from your own live system and POST them to /x/reconcile/submit",
-            "note": "This selection is now sealed. It cannot be changed, and an unsubmitted plan stays visible as an abandoned test."}, 200
-
-
-def _submit(ctx, api_key, data):
-    rid = str(data.get("run_id", "")).strip().upper()
-    with ctx["lock"]:
-        row = ctx["conn"].execute("SELECT field,seed,status,block_ids FROM reconcile_runs WHERE run_id=? AND api_key=?", (rid, api_key)).fetchone()
-    if not row:
-        return {"error": "unknown_run_id"}, 404
-    if row[2] != "planned":
-        return {"error": "already_submitted",
-                "message": "A run is reconciled once. Re-running until it passes is not reconciliation."}, 400
-
-    results = data.get("results")
-    if not isinstance(results, dict) or not results:
-        return {"error": "results_required",
-                "message": "Send {block_index: live_value} from your own system."}, 400
-
-    field = row[0]
-    block_ids = json.loads(row[3])
-
-    with ctx["lock"]:
-        rows = ctx["conn"].execute("SELECT id,user_id,result_json FROM audit_log WHERE id IN (" + ",".join("?" * len(block_ids)) + ")", block_ids).fetchall()
-
-    sealed = {}
-    for bid, uid, res_json in rows:
-        try:
-            sealed[bid] = json.loads(res_json).get(field)
-        except Exception:
-            sealed[bid] = None
-
-    matched, mismatched, missing = [], [], []
-    for bid in block_ids:
-        key = str(bid)
-        if key not in results:
-            missing.append({"block_index": bid})
-            continue
-        live = results[key]
-        want = sealed.get(bid)
-        if str(live).strip().lower() == str(want).strip().lower():
-            matched.append(bid)
+        if scope:
+            rows = c.execute(
+                "SELECT " + cols + " FROM audit_log WHERE ts>=? AND ts<? "
+                "AND api_key=? ORDER BY id ASC LIMIT ?",
+                (start, end, scope, MAX_ROWS)).fetchall()
+            began = c.execute(
+                "SELECT MIN(ts) FROM audit_log WHERE api_key=?",
+                (scope,)).fetchone()
+            dev_all = c.execute(
+                "SELECT COUNT(*) FROM device_seen WHERE api_key=?",
+                (scope,)).fetchone()
+            dev_new = c.execute(
+                "SELECT COUNT(*) FROM device_seen WHERE api_key=? "
+                "AND first_seen>=? AND first_seen<?",
+                (scope, start, end)).fetchone()
         else:
-            mismatched.append({"block_index": bid,
-                               "sealed_value": want,
-                               "live_value": live})
+            rows = c.execute(
+                "SELECT " + cols + " FROM audit_log WHERE ts>=? AND ts<? "
+                "ORDER BY id ASC LIMIT ?",
+                (start, end, MAX_ROWS)).fetchall()
+            began = c.execute("SELECT MIN(ts) FROM audit_log").fetchone()
+            dev_all = c.execute(
+                "SELECT COUNT(*) FROM device_seen").fetchone()
+            dev_new = c.execute(
+                "SELECT COUNT(*) FROM device_seen "
+                "WHERE first_seen>=? AND first_seen<?",
+                (start, end)).fetchone()
+        chain_total = c.execute(
+            "SELECT COUNT(*) FROM audit_log").fetchone()[0]
 
-    ts = time.time()
-    rate = round(100 * len(matched) / len(block_ids), 2) if block_ids else 0
-    detail = ("field=" + field + ";matched=" + str(len(matched)) +
-              ";mismatched=" + str(len(mismatched)) + ";missing=" + str(len(missing)) +
-              ";match_rate=" + str(rate) +
-              ";mismatch_blocks=" + ",".join(str(m["block_index"]) for m in mismatched[:40]))
-    h, idx, seq, _x = _seal_event(ctx, api_key, rid, "reconciled", detail)
+    verdicts = {}
+    actions = {}
+    seqs = []
+    verified = 0
+    mismatched = []
+    link_breaks = []
+    expect_prev = None
+    per_day = {}
 
-    with ctx["lock"]:
-        ctx["conn"].execute("UPDATE reconcile_runs SET submitted=?,matched=?,mismatched=?,missing=?,status='reconciled',detail=? WHERE run_id=? AND api_key=?",
-                            (ts, len(matched), len(mismatched), len(missing), json.dumps({"mismatched": mismatched[:100], "missing": missing[:100]}), rid, api_key))
-        ctx["conn"].commit()
-
-    out = {"run_id": rid, "field": field, "sample_size": len(block_ids),
-           "matched": len(matched), "mismatched": len(mismatched),
-           "missing": len(missing), "match_rate_pct": rate,
-           "reconciled_at": _iso(ts), "audit_hash": h, "block_index": idx,
-           "receipt_seq": seq,
-           "note": "This result is sealed whichever way it went. It cannot be withdrawn."}
-    if mismatched:
-        out["mismatches"] = mismatched[:20]
-        out["flag"] = "sealed records and live system disagree on " + str(len(mismatched)) + " of " + str(len(block_ids))
-    if missing:
-        out["missing_detail"] = "records the live system did not return - a gap, not a match"
-    return out, 200
-
-
-def _run(ctx, api_key, rid):
-    with ctx["lock"]:
-        row = ctx["conn"].execute("SELECT field,seed,planned,submitted,sample_size,matched,mismatched,missing,status,detail FROM reconcile_runs WHERE run_id=? AND api_key=?", (rid.upper(), api_key)).fetchone()
-        if not row:
-            return {"error": "unknown_run_id"}, 404
-        blocks = ctx["conn"].execute("SELECT ts,result_json,audit_hash FROM audit_log WHERE user_id=? ORDER BY id ASC", ("rec:" + rid.upper(),)).fetchall()
-    events = []
-    for bts, res, ah in blocks:
+    for rid, ts, ev_j, res_j, prev, ah, akey, kseq in rows:
         try:
-            r = json.loads(res)
-            events.append({"at": _iso(bts), "event": r.get("reconcile_action"),
-                           "detail": r.get("detail"), "sealed": ah})
+            ev = json.loads(ev_j)
+            res = json.loads(res_j)
         except Exception:
-            pass
-    total = row[4] or 0
-    out = {"run_id": rid.upper(), "field": row[0], "seed": row[1],
-           "planned": _iso(row[2]), "submitted": _iso(row[3]),
-           "sample_size": total, "matched": row[5], "mismatched": row[6],
-           "missing": row[7], "status": row[8], "events": events,
-           "ordering_proof": "The plan block precedes the result block. The sample was fixed before any data was requested."}
-    if row[9]:
-        try:
-            out["detail"] = json.loads(row[9])
-        except Exception:
-            pass
-    if row[8] == "planned":
-        out["flag"] = "planned but never submitted - an abandoned test, visible permanently"
-    return out, 200
-
-
-def _score(ctx, api_key):
-    with ctx["lock"]:
-        rows = ctx["conn"].execute("SELECT sample_size,matched,mismatched,missing,status,planned FROM reconcile_runs WHERE api_key=? ORDER BY planned DESC LIMIT 500", (api_key,)).fetchall()
-    if not rows:
-        return {"runs": 0, "note": "No reconciliation runs on record."}, 200
-    done = [r for r in rows if r[4] == "reconciled"]
-    abandoned = len(rows) - len(done)
-    tested = sum(r[0] or 0 for r in done)
-    ok = sum(r[1] or 0 for r in done)
-    bad = sum(r[2] or 0 for r in done)
-    gone = sum(r[3] or 0 for r in done)
-    out = {"runs": len(rows), "reconciled": len(done), "abandoned": abandoned,
-           "records_tested": tested, "matched": ok, "mismatched": bad,
-           "missing": gone,
-           "match_rate_pct": (round(100 * ok / tested, 2) if tested else None),
-           "last_run": _iso(rows[0][5])}
-    if abandoned:
-        out["flag"] = str(abandoned) + " planned run(s) never submitted"
-    return out, 200
-
-
-def _list(ctx, api_key):
-    with ctx["lock"]:
-        rows = ctx["conn"].execute("SELECT run_id,field,planned,submitted,sample_size,matched,mismatched,missing,status FROM reconcile_runs WHERE api_key=? ORDER BY planned DESC LIMIT 200", (api_key,)).fetchall()
-    return {"count": len(rows),
-            "runs": [{"run_id": r[0], "field": r[1], "planned": _iso(r[2]),
-                      "submitted": _iso(r[3]), "sample_size": r[4],
-                      "matched": r[5], "mismatched": r[6], "missing": r[7],
-                      "status": r[8]} for r in rows]}, 200
-
-
-def _public(ctx):
-    """The reconciliation record, readable without a key.
-
-    Counts only. No record identifiers, no field values, no operator
-    identity. What a stranger gets is the three numbers that cannot be
-    flattered: how many runs were reconciled, how many disagreed, and how
-    many were planned and then quietly abandoned.
-
-    Abandoned runs are the important one. A planned run is sealed at the
-    moment it is planned, so a test that came back badly and was dropped
-    cannot be deleted - it sits here forever as a plan with no result.
-    """
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT run_id,field,planned,submitted,sample_size,matched,mismatched,"
-            "missing,status FROM reconcile_runs ORDER BY planned DESC LIMIT 200").fetchall()
-
-    done = [r for r in rows if r[8] == "reconciled"]
-    abandoned = [r for r in rows if r[8] != "reconciled"]
-    tested = sum(r[4] or 0 for r in done)
-    ok = sum(r[5] or 0 for r in done)
-    bad = sum(r[6] or 0 for r in done)
-    gone = sum(r[7] or 0 for r in done)
-
-    out = {
-        "runs": len(rows),
-        "reconciled": len(done),
-        "abandoned": len(abandoned),
-        "records_tested": tested,
-        "matched": ok,
-        "mismatched": bad,
-        "missing": gone,
-        "match_rate_pct": (round(100 * ok / tested, 2) if tested else None),
-        "recent": [{"run_id": r[0], "field": r[1], "planned": _iso(r[2]),
-                    "submitted": _iso(r[3]), "sample_size": r[4],
-                    "matched": r[5], "mismatched": r[6], "missing": r[7],
-                    "status": r[8]} for r in rows[:50]],
-        "check_any_of_them": "/x/reconcile/proof?id=RUN-XXXXXXXX",
-        "what_is_being_shown": "Not that the records are true. That the sample was fixed "
-                               "before the data was requested, and that what came back was "
-                               "sealed either way.",
-        "what_a_mismatch_means": "The sealed record and the operator's own live system "
-                                 "disagreed. It is published because a reconciliation system "
-                                 "that can bury its own failures is decoration.",
-    }
-    if abandoned:
-        out["flag"] = (str(len(abandoned)) + " run(s) planned and never submitted. A sample was "
-                       "fixed, and no result was ever sealed against it.")
-    return out, 200
-
-
-def _proof(ctx, rid):
-    """The ordering, straight out of the chain, without a key.
-
-    Both events are already sealed under a public identifier, so this route
-    reveals nothing the chain does not already carry. It just makes the one
-    claim that matters legible: the plan block comes before the result block.
-    """
-    rid = (rid or "").strip().upper()
-    if not rid:
-        return {"error": "id_required"}, 400
-
-    with ctx["lock"]:
-        row = ctx["conn"].execute(
-            "SELECT field,seed,planned,submitted,sample_size,matched,mismatched,missing,status "
-            "FROM reconcile_runs WHERE run_id=?", (rid,)).fetchone()
-        blocks = ctx["conn"].execute(
-            "SELECT id,ts,result_json,audit_hash FROM audit_log WHERE user_id=? ORDER BY id ASC",
-            ("rec:" + rid,)).fetchall()
-    if not row:
-        return {"error": "unknown_run_id", "list": "/x/reconcile/public"}, 404
-
-    events = []
-    plan_block = result_block = None
-    for bid, bts, res, ah in blocks:
-        try:
-            r = json.loads(res)
-        except Exception:
+            mismatched.append(rid)
+            expect_prev = ah
             continue
-        what = r.get("reconcile_action")
-        events.append({"event": what, "at": _iso(bts), "block_index": bid,
-                       "sealed_in_chain": ah, "sealed_detail": r.get("detail")})
-        if what == "planned" and plan_block is None:
-            plan_block = bid
-        if what == "reconciled" and result_block is None:
-            result_block = bid
 
-    ordered = (plan_block is not None and result_block is not None
-               and plan_block < result_block)
+        if _sha({"prev_hash": prev, "ts": ts,
+                 "event": ev, "result": res}) == ah:
+            verified += 1
+        else:
+            mismatched.append(rid)
 
-    out = {"run_id": rid, "field": row[0], "status": row[8],
-           "seed": row[1], "planned_at": _iso(row[2]), "submitted_at": _iso(row[3]),
-           "sample_size": row[4], "matched": row[5], "mismatched": row[6],
-           "missing": row[7],
-           "plan_block_index": plan_block, "result_block_index": result_block,
-           "selection_precedes_result": ordered,
-           "events": events,
-           "how_to_check_this_yourself": [
-               "The seed is derived from the chain tip at planning time, which the operator "
-               "cannot predict in advance or change afterwards without breaking the chain.",
-               "The plan block seals which records were selected, and its detail is above.",
-               "The result block seals what came back. Compare the two block indices.",
-               "A lower plan index than result index means the sample was fixed before any "
-               "data was requested. That is the whole claim, and it is the only one made."],
-           "what_this_does_not_prove": "That the records are true. Two systems the operator "
-                                       "controls agreeing with each other is consistency, not "
-                                       "truth."}
-    if row[8] != "reconciled":
-        out["flag"] = ("planned and never submitted. The selection is sealed and no result "
-                       "was ever put against it.")
-    elif not ordered:
-        out["flag"] = ("the plan block does not precede the result block. That should be "
-                       "impossible and it is the finding.")
-    return out, 200
+        if expect_prev is not None and prev != expect_prev:
+            link_breaks.append(rid)
+        expect_prev = ah
+
+        d = str(res.get("decision", "UNRECORDED"))
+        verdicts[d] = verdicts.get(d, 0) + 1
+        a = str(ev.get("action", "unrecorded"))
+        actions[a] = actions.get(a, 0) + 1
+        if kseq is not None:
+            try:
+                seqs.append(int(kseq))
+            except (TypeError, ValueError):
+                pass
+        k = _day(ts)
+        per_day[k] = per_day.get(k, 0) + 1
+
+    # does the first block in the period chain to the one before it
+    entry_link = "no_entries_in_period"
+    if rows:
+        with ctx["lock"]:
+            before = c.execute(
+                "SELECT audit_hash FROM audit_log WHERE id<? "
+                "ORDER BY id DESC LIMIT 1", (rows[0][0],)).fetchone()
+        if before is None:
+            entry_link = ("intact_from_genesis"
+                          if rows[0][4] == "GENESIS" else "broken")
+        else:
+            entry_link = "intact" if rows[0][4] == before[0] else "broken"
+
+    seq = {"applicable": bool(scope and seqs)}
+    if seq["applicable"]:
+        lo, hi = min(seqs), max(seqs)
+        have = set(seqs)
+        missing = [n for n in range(lo, hi + 1) if n not in have]
+        seq.update({"first": lo, "last": hi, "received": len(seqs),
+                    "expected": hi - lo + 1,
+                    "missing": missing[:200],
+                    "gapless": not missing,
+                    "note": "Receipt numbers are issued with no gaps by "
+                            "construction. A missing number is a record "
+                            "that left this chain."})
+
+    clean = (not mismatched and not link_breaks
+             and entry_link in ("intact", "intact_from_genesis"))
+
+    p = {
+        "pack_version": VERSION,
+        "period": label,
+        "period_start": _iso(start),
+        "period_end": _iso(end),
+        "generated_at": _iso(time.time()),
+        "scope": ("key " + str(scope)[:12] + "\u2026") if scope
+                 else "deployment-wide",
+        "unbroken_since": _day(began[0] if began else None),
+        "entries_in_period": len(rows),
+        "chain_total_entries": chain_total,
+        "first_block": rows[0][0] if rows else None,
+        "first_hash": rows[0][5] if rows else None,
+        "last_block": rows[-1][0] if rows else None,
+        "last_hash": rows[-1][5] if rows else None,
+        "integrity": {
+            "clean": clean,
+            "blocks_recomputed": len(rows),
+            "hashes_verified": verified,
+            "hash_mismatches": mismatched[:50],
+            "link_breaks": link_breaks[:50],
+            "link_into_period": entry_link,
+            "method": "SHA-256 over {prev_hash, ts, event, result}, "
+                      "recomputed from the stored row and compared to "
+                      "the hash sealed at the time",
+        },
+        "receipt_sequence": seq,
+        "verdicts": verdicts,
+        "actions": dict(sorted(actions.items(), key=lambda x: -x[1])[:20]),
+        "devices": {"total_ever": dev_all[0] if dev_all else 0,
+                    "first_seen_in_period": dev_new[0] if dev_new else 0},
+        "busiest_days": [{"day": d, "entries": n} for d, n in
+                         sorted(per_day.items(), key=lambda x: -x[1])[:5]],
+        "check_this_yourself": {
+            "offline": "aileash_verify.py - stdlib only, no network",
+            "still_on_this_chain": "/x/consistency/ancestor?tip=<last_hash>",
+            "append_only": "/x/consistency/proof?first=&second=",
+            "record_included": "/x/complete/prove",
+            "who_witnessed_us": "/x/witness/peers",
+        },
+        "this_does_not_prove": [
+            "That any decision recorded here was correct.",
+            "That an external peer's own chain is honest - that is "
+            "checked at the peer's host, not here.",
+            "Anything about periods outside the dates above.",
+        ],
+    }
+    p["pack_digest"] = hashlib.sha256(
+        b"AILEASH-PACK-v1\x00" + json.dumps(
+            p, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return p
+
+
+# ----------------------------------------------------------------------
+# one page, self contained
+# ----------------------------------------------------------------------
+
+def _html(p):
+    ig = p["integrity"]
+    sq = p["receipt_sequence"]
+    good = "#7fe3b0"
+    bad = "#ff8a80"
+
+    def card(inner):
+        return ("<div style='background:#10182e;border:1px solid #223055;"
+                "border-radius:12px;padding:16px;margin-bottom:14px'>"
+                + inner + "</div>")
+
+    def row(k, v):
+        return ("<tr><td style='padding:7px 0;border-bottom:1px solid "
+                "#1d2a4a'>" + str(k) + "</td><td style='padding:7px 0;"
+                "border-bottom:1px solid #1d2a4a;text-align:right;"
+                "color:#c9a84c;font-weight:600'>" + str(v) + "</td></tr>")
+
+    def mono(v):
+        return ("<code style='font:12px ui-monospace,monospace;"
+                "color:#9fb3d9;word-break:break-all'>" + str(v)
+                + "</code>")
+
+    integ = ("<div style='font-size:26px;font-weight:600;color:"
+             + (good if ig["clean"] else bad) + "'>"
+             + str(ig["hashes_verified"]) + " of "
+             + str(ig["blocks_recomputed"]) + " blocks re-verified</div>"
+             "<div style='color:#93a0bd;font-size:13px;margin-top:6px'>"
+             + ig["method"] + "</div>")
+    if not ig["clean"]:
+        integ += ("<div style='color:" + bad + ";font-size:13px;"
+                  "margin-top:8px'>mismatched blocks "
+                  + str(ig["hash_mismatches"]) + " &middot; link breaks "
+                  + str(ig["link_breaks"]) + " &middot; entry link "
+                  + ig["link_into_period"] + "</div>")
+
+    if sq.get("applicable"):
+        seqbox = ("<div style='font-size:20px;font-weight:600;color:"
+                  + (good if sq["gapless"] else bad) + "'>"
+                  + ("Receipt sequence complete" if sq["gapless"]
+                     else "GAPS IN RECEIPT SEQUENCE") + "</div>"
+                  "<div style='color:#93a0bd;font-size:13px'>"
+                  + str(sq["received"]) + " of " + str(sq["expected"])
+                  + " received, numbers " + str(sq["first"]) + " to "
+                  + str(sq["last"]) + "</div>")
+        if not sq["gapless"]:
+            seqbox += ("<div style='color:" + bad + ";font:12px "
+                       "ui-monospace,monospace;margin-top:6px'>missing "
+                       + str(sq["missing"]) + "</div>")
+    else:
+        seqbox = ("<div style='color:#93a0bd;font-size:13px'>Receipt "
+                  "sequence applies to a single key. This pack is "
+                  "deployment-wide.</div>")
+
+    checks = "".join("<li><b>" + k.replace("_", " ") + "</b> " + mono(v)
+                     + "</li>" for k, v in
+                     p["check_this_yourself"].items())
+    nots = "".join("<li>" + x + "</li>" for x in p["this_does_not_prove"])
+
+    return (
+        "<!doctype html><meta charset=utf-8>"
+        "<meta name=viewport content='width=device-width,initial-scale=1'>"
+        "<title>Evidence Pack " + p["period"] + " - AILeash</title>"
+        "<body style='background:#0a0f1e;color:#e8ecf5;margin:0;"
+        "padding:22px;font:15px/1.55 -apple-system,system-ui,sans-serif'>"
+        "<div style='max-width:760px;margin:0 auto'>"
+        "<h1 style='font-size:21px;margin:0 0 4px;color:#c9a84c'>"
+        "Evidence Pack &mdash; " + p["period"] + "</h1>"
+        "<div style='color:#93a0bd;font-size:13px;margin-bottom:20px'>"
+        + p["scope"] + " &middot; " + str(p["period_start"]) + " to "
+        + str(p["period_end"]) + " &middot; generated "
+        + str(p["generated_at"]) + "</div>"
+        + card("<div style='color:#93a0bd;font-size:13px'>Unbroken since"
+               "</div><div style='font-size:26px;color:" + good
+               + ";font-weight:600'>" + str(p["unbroken_since"])
+               + "</div>")
+        + card(integ)
+        + card(seqbox)
+        + card("<table style='width:100%;border-collapse:collapse;"
+               "font-size:14px'>"
+               + row("Entries in period", p["entries_in_period"])
+               + row("Chain total entries", p["chain_total_entries"])
+               + row("Devices, total ever", p["devices"]["total_ever"])
+               + row("Devices first seen this period",
+                     p["devices"]["first_seen_in_period"])
+               + "".join(row(k, v) for k, v in sorted(
+                   p["verdicts"].items()))
+               + "".join(row(k, v) for k, v in p["actions"].items())
+               + "</table>")
+        + card("<div style='color:#93a0bd;font-size:13px'>First block</div>"
+               + mono("#" + str(p["first_block"]) + " "
+                      + str(p["first_hash"]))
+               + "<div style='color:#93a0bd;font-size:13px;margin-top:10px'>"
+                 "Last block</div>"
+               + mono("#" + str(p["last_block"]) + " "
+                      + str(p["last_hash"]))
+               + "<div style='color:#93a0bd;font-size:13px;margin-top:10px'>"
+                 "Pack digest</div>" + mono(p["pack_digest"]))
+        + card("<div style='color:#93a0bd;font-size:13px'>Check every "
+               "figure above yourself:</div><ul style='margin:6px 0 0 18px;"
+               "padding:0;font-size:13px'>" + checks + "</ul>"
+               "<div style='color:#93a0bd;font-size:13px;margin-top:14px'>"
+               "What this pack does not prove:</div>"
+               "<ul style='margin:6px 0 0 18px;padding:0;color:#93a0bd;"
+               "font-size:13px'>" + nots + "</ul>")
+        + "<div style='color:#6d7b99;font-size:12px;margin-top:18px'>"
+          "AILeash &middot; sebbi.pro</div></div>")
+
+
+# ----------------------------------------------------------------------
+
+def _resolve(data, api_key):
+    b = _bounds(data.get("period"))
+    if not b:
+        return None, ({"error": "period_required",
+                       "accepts": ["YYYY", "YYYY-MM", "YYYY-Qn"],
+                       "example": "/x/pack/preview?period=2026-Q2"}, 400)
+    start, end, label = b
+    if end > time.time():
+        return None, ({"error": "period_not_closed", "period": label,
+                       "message": "A pack can only cover a period that "
+                                  "has finished."}, 409)
+    scope = data.get("scope")
+    if scope == "me":
+        scope = api_key
+    return (start, end, label, scope or None), None
 
 
 def handle(method, action, data, api_key, ctx):
+    if action == "spec":
+        return {"module": "pack", "version": VERSION,
+                "purpose": "Re-verifies every block in a period against "
+                           "the hash sealed at the time, and checks the "
+                           "gapless receipt sequence for a single key.",
+                "periods": ["YYYY", "YYYY-MM", "YYYY-Qn"],
+                "routes": {"GET /x/pack/spec": "public",
+                           "GET /x/pack/preview?period=": "keyed, json",
+                           "GET /x/pack/render?period=": "keyed, one page",
+                           "GET /x/pack/history": "keyed",
+                           "POST /x/pack/issue": "keyed, seals the pack"},
+                "scope": "add scope=me for your key only; omit for "
+                         "deployment-wide",
+                "does_not_prove": [
+                    "That any decision recorded here was correct.",
+                    "That an external peer's chain is honest.",
+                ]}, 200
+
+    if not api_key:
+        return {"error": "invalid_api_key"}, 401
+
     _setup(ctx)
-    if method == "POST":
-        if action == "plan":
-            return _plan(ctx, api_key, data)
-        if action == "submit":
-            return _submit(ctx, api_key, data)
-    else:
-        if action == "public":
-            return _public(ctx)
-        if action == "proof":
-            return _proof(ctx, str((data or {}).get("id", "")))
-        if action == "score":
-            return _score(ctx, api_key)
-        if action == "list":
-            return _list(ctx, api_key)
-        if action == "run":
-            rid = str(data.get("id", "")).strip()
-            if not rid:
-                return {"error": "id_required"}, 400
-            return _run(ctx, api_key, rid)
+
+    if method == "GET":
+        if action == "history":
+            with ctx["lock"]:
+                rows = ctx["conn"].execute(
+                    "SELECT period,scope,digest,issued,entries,verified,"
+                    "mismatches,audit_hash,block_index FROM pack_issued "
+                    "WHERE api_key=? ORDER BY id DESC LIMIT 200",
+                    (api_key,)).fetchall()
+            return {"count": len(rows), "packs": [
+                {"period": r[0], "scope": r[1], "digest": r[2],
+                 "issued": _iso(r[3]), "entries": r[4],
+                 "hashes_verified": r[5], "mismatches": r[6],
+                 "sealed_in_chain": r[7], "block_index": r[8]}
+                for r in rows]}, 200
+
+        if action in ("preview", "render"):
+            got, err = _resolve(data, api_key)
+            if err:
+                return err
+            start, end, label, scope = got
+            p = _assemble(ctx, start, end, label, scope)
+            if action == "preview":
+                return p, 200
+            return {"period": label, "content_type": "text/html",
+                    "html": _html(p)}, 200
+
+    if method == "POST" and action == "issue":
+        got, err = _resolve(data, api_key)
+        if err:
+            return err
+        start, end, label, scope = got
+        p = _assemble(ctx, start, end, label, scope)
+        ig = p["integrity"]
+        ts = time.time()
+        ev = {"user_id": "pack:" + label, "action": "evidence_pack_issued",
+              "amount": 0, "country": "UK", "device_id": "pack",
+              "anomaly": 0, "device_risk": 0}
+        res = {"decision": "PACK_ISSUED", "score": 0, "pack_version": VERSION,
+               "timestamp": ts, "period": label, "scope": p["scope"],
+               "entries": p["entries_in_period"],
+               "blocks_recomputed": ig["blocks_recomputed"],
+               "hashes_verified": ig["hashes_verified"],
+               "clean": ig["clean"], "pack_digest": p["pack_digest"],
+               "note": "evidence pack issued; the pack's own digest is "
+                       "now sealed, so the document cannot be edited "
+                       "after the fact"}
+        h, idx, seq = ctx["seal"](ev, res, ts, api_key)
+        with ctx["lock"]:
+            ctx["conn"].execute(
+                "INSERT INTO pack_issued(api_key,period,scope,digest,"
+                "issued,entries,verified,mismatches,audit_hash,"
+                "block_index) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (api_key, label, p["scope"], p["pack_digest"], ts,
+                 p["entries_in_period"], ig["hashes_verified"],
+                 len(ig["hash_mismatches"]), h, idx))
+            ctx["conn"].commit()
+        p["sealed"] = {"audit_hash": h, "block_index": idx,
+                       "receipt_seq": seq}
+        return p, 200
+
     return {"error": "unknown_action", "action": action,
-            "GET": ["public", "proof", "score", "list", "run"],
-            "POST": ["plan", "submit"]}, 404
+            "GET": ["spec", "preview", "render", "history"],
+            "POST": ["issue"]}, 404
 
 ```
 
 
-## `modules/replay.py`
+## `modules/packconsole.py`
 
-678 lines, 30538 bytes
+426 lines, 16973 bytes
+
+```python
+"""
+modules/packconsole.py  -  the evidence pack page at /pack
+
+WHY IT EXISTS
+-------------
+/x/pack/preview, render, issue and history are all keyed. A browser address
+bar cannot send an Authorization header, so from a phone they are unreachable.
+This serves one page that can.
+
+It is deliberately NOT part of console.py. That file is large and editing it
+on a phone risks the whole thing. This adds a second page and touches nothing
+that already works.
+
+SAME PATCH AS console.py / network.py
+-------------------------------------
+The router hands whatever handle() returns to send_json, so a module cannot
+return HTML through it. This patches do_GET at runtime under its own
+attribute name, adds two paths, and passes everything else straight through
+to whatever was there before - including console.py's patch, whichever
+installs first.
+
+And the same catch: after every deploy one /x/ request must arrive before
+/pack exists. Opening /x/packconsole/status does it, and Railway's
+healthcheck on /x/console/status will arm this too once it is listed in
+console.py's SIBLINGS.
+
+THE KEY
+-------
+Typed in, held in a variable for that tab, never written to storage. Close
+the tab and it is gone.
+"""
+
+import sys
+from urllib.parse import urlparse
+
+VERSION = "1.0"
+
+PUBLIC = {("GET", "status")}
+
+PAGE_PATHS = ("/pack", "/pack.html", "/pack-console")
+
+_patched = [False]
+
+
+PAGE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Evidence pack - AILeash</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--ink:#0a0f1e;--panel:#131b2e;--panel2:#1a2338;
+ --edge:rgba(201,168,76,.22);--gold:#c9a84c;--gold-dim:#8a7233;
+ --text:#f2efe6;--mute:rgba(242,239,230,.42);--ok:#7fe3b0;--bad:#c8362b;
+ --mono:ui-monospace,'IBM Plex Mono',monospace}
+body{background:var(--ink);color:var(--text);font:16px/1.6 system-ui,
+ -apple-system,sans-serif;padding:0 0 60px}
+.wrap{max-width:640px;margin:0 auto;padding:0 18px}
+header{padding:32px 0 20px;border-bottom:1px solid var(--edge);
+ margin-bottom:24px}
+.eyebrow{font-family:var(--mono);font-size:10px;letter-spacing:.24em;
+ text-transform:uppercase;color:var(--gold);margin-bottom:10px}
+h1{font-size:34px;line-height:1;letter-spacing:-.02em;font-weight:800}
+h1 span{color:var(--gold)}
+.sub{color:var(--mute);font-size:14.5px;margin-top:12px;max-width:46ch}
+label{display:block;font-family:var(--mono);font-size:10px;
+ letter-spacing:.16em;text-transform:uppercase;color:var(--mute);
+ margin-bottom:7px}
+input{width:100%;background:var(--panel);border:1px solid var(--edge);
+ color:var(--text);font-family:var(--mono);font-size:13px;padding:12px 13px;
+ border-radius:4px;outline:none}
+input:focus{border-color:var(--gold)}
+.box{background:var(--panel2);border:1px solid var(--edge);border-radius:6px;
+ padding:16px;margin-bottom:16px}
+.note{font-size:12px;color:var(--mute);margin-top:9px;line-height:1.55}
+.field{margin-bottom:12px}
+.seg{display:flex;gap:8px}
+.seg button{flex:1}
+button{width:100%;background:var(--gold);color:var(--ink);border:none;
+ border-radius:4px;padding:13px;font-weight:700;font-size:14.5px;
+ cursor:pointer;font-family:inherit}
+button:hover:not(:disabled){background:#dbbd63}
+button:disabled{opacity:.45;cursor:default}
+button.quiet{background:transparent;color:var(--mute);
+ border:1px solid var(--edge)}
+button.quiet.on{color:var(--ink);background:var(--gold);border-color:var(--gold)}
+button.quiet:hover:not(:disabled):not(.on){color:var(--text);
+ border-color:var(--gold)}
+.row{display:flex;gap:8px;margin-top:10px}
+.row button{flex:1}
+#out{margin-top:24px}
+.verdict{border:1px solid var(--edge);border-radius:6px;background:var(--panel);
+ overflow:hidden;margin-bottom:14px}
+.v-head{padding:22px 18px;border-bottom:1px solid var(--edge)}
+.v-word{font-size:38px;line-height:1;letter-spacing:-.02em;font-weight:800}
+.v-ok{color:var(--ok)}.v-bad{color:var(--bad)}.v-mute{color:var(--mute)}
+.v-why{color:var(--mute);font-size:13.5px;margin-top:10px;line-height:1.6}
+.v-stats{display:flex;flex-wrap:wrap;gap:18px;padding:14px 18px;
+ border-bottom:1px solid var(--edge);font-family:var(--mono);font-size:11px}
+.v-stats b{display:block;font-size:19px;color:var(--text);font-weight:700;
+ margin-top:3px;font-family:inherit}
+.v-stats span{color:var(--mute);letter-spacing:.1em;text-transform:uppercase}
+.lin{padding:14px 18px;border-bottom:1px solid var(--edge)}
+.lin:last-child{border-bottom:none}
+.strip-l{font-family:var(--mono);font-size:10px;letter-spacing:.16em;
+ text-transform:uppercase;color:var(--gold);margin-bottom:10px}
+.kv{display:flex;justify-content:space-between;gap:14px;padding:6px 0;
+ border-bottom:1px solid rgba(201,168,76,.10);font-size:13.5px}
+.kv:last-child{border-bottom:none}
+.kv b{color:var(--gold);font-family:var(--mono);font-size:12.5px}
+pre{font-family:var(--mono);font-size:11.5px;line-height:1.65;
+ background:#080c16;color:var(--ok);padding:15px;border-radius:5px;
+ overflow-x:auto;border:1px solid var(--edge);max-height:320px}
+.msg{font-family:var(--mono);font-size:12.5px;padding:13px 15px;
+ border-radius:5px;border:1px solid var(--edge);color:var(--mute);
+ margin-bottom:14px}
+.msg.bad{color:#ffb4ad;border-color:rgba(200,54,43,.5);
+ background:rgba(200,54,43,.08)}
+.msg.good{color:var(--ok);border-color:rgba(127,227,176,.35);
+ background:rgba(26,158,110,.08)}
+.working:after{content:'';animation:dots 1.2s steps(4,end) infinite}
+@keyframes dots{0%{content:''}25%{content:'.'}50%{content:'..'}
+ 75%{content:'...'}}
+iframe{width:100%;height:70vh;border:1px solid var(--edge);border-radius:6px;
+ background:#0a0f1e;margin-top:12px}
+code{font-family:var(--mono);font-size:12px;color:#9fb3d9;
+ word-break:break-all}
+footer{margin-top:32px;padding-top:18px;border-top:1px solid var(--edge);
+ font-family:var(--mono);font-size:10.5px;color:var(--mute);line-height:1.8}
+a{color:var(--gold)}
+:focus-visible{outline:2px solid var(--gold);outline-offset:2px}
+@media(prefers-reduced-motion:reduce){*{animation:none!important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <p class="eyebrow">AILeash &middot; evidence pack</p>
+  <h1>The <span>document</span></h1>
+  <p class="sub">Re-verifies every block in a period against the hash sealed
+  at the time. Not a summary of the chain &mdash; a check of it.</p>
+</header>
+
+<div class="box">
+  <label for="key">API key</label>
+  <input id="key" type="password" placeholder="al_live_&hellip;"
+   autocomplete="off" spellcheck="false">
+  <p class="note">Held in memory for this tab only. Nothing is written to
+  the device.</p>
+</div>
+
+<div class="box">
+  <div class="field">
+    <label for="period">Period</label>
+    <input id="period" value="2026-Q2" autocomplete="off"
+     placeholder="2026-Q2, 2026-07 or 2026">
+  </div>
+  <label>Scope</label>
+  <div class="seg">
+    <button class="quiet on" id="sc-me" onclick="setScope('me')">My key</button>
+    <button class="quiet" id="sc-all" onclick="setScope('')">Whole deployment</button>
+  </div>
+  <p class="note">Receipt-sequence checking only applies to a single key.
+  A deployment-wide pack still re-verifies every hash.</p>
+  <div class="row">
+    <button onclick="go('preview')">Preview</button>
+    <button onclick="go('render')">View page</button>
+  </div>
+  <div class="row">
+    <button class="quiet" onclick="go('history')">Past packs</button>
+    <button class="quiet" onclick="go('issue')">Issue &amp; seal</button>
+  </div>
+  <p class="note">Issuing seals the pack's own digest into the chain, so the
+  document cannot be edited afterwards. It cannot be withdrawn.</p>
+</div>
+
+<div id="out"></div>
+
+<footer>
+  Spec: <a href="/x/pack/spec">/x/pack/spec</a> &middot;
+  Chain: <a href="/api/verify-chain">/api/verify-chain</a> &middot;
+  Console: <a href="/console">/console</a>
+</footer>
+
+</div>
+
+<script>
+(function(){
+  var out=document.getElementById('out'), busy=false, scope='me';
+
+  window.setScope=function(v){
+    scope=v;
+    document.getElementById('sc-me').classList.toggle('on',v==='me');
+    document.getElementById('sc-all').classList.toggle('on',v==='');
+  };
+
+  function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+  function msg(t,k){out.innerHTML='<div class="msg '+(k||'')+'">'+esc(t)+'</div>';}
+  function raw(o){return '<pre>'+esc(JSON.stringify(o,null,2))+'</pre>';}
+  function key(){var k=document.getElementById('key').value.trim();
+    if(!k){msg('Paste your API key at the top first.','bad');return null;}return k;}
+
+  async function call(path,method,body){
+    var k=key(); if(!k) return null;
+    var o={method:method,headers:{'Authorization':'Bearer '+k}};
+    if(body){o.headers['Content-Type']='application/json';
+      o.body=JSON.stringify(body);}
+    var r=await fetch(path,o), d;
+    try{d=await r.json();}catch(e){d={error:'unreadable_response'};}
+    return {status:r.status,data:d};
+  }
+
+  function qs(){
+    var p=encodeURIComponent(document.getElementById('period').value.trim());
+    return '?period='+p+(scope?'&scope='+scope:'');
+  }
+
+  function renderPack(d){
+    var ig=d.integrity||{}, sq=d.receipt_sequence||{};
+    var clean=!!ig.clean;
+    var h='<div class="verdict"><div class="v-head">'
+      +'<div class="v-word '+(clean?'v-ok':'v-bad')+'">'
+      +esc(ig.hashes_verified)+' of '+esc(ig.blocks_recomputed)
+      +'</div><div class="v-why">blocks re-verified &mdash; '
+      +esc(ig.method||'')+'</div></div>'
+      +'<div class="v-stats">'
+      +'<div><span>period</span><b>'+esc(d.period)+'</b></div>'
+      +'<div><span>entries</span><b>'+esc(d.entries_in_period)+'</b></div>'
+      +'<div><span>unbroken since</span><b style="font-size:14px">'
+      +esc(d.unbroken_since)+'</b></div>'
+      +'<div><span>devices</span><b>'
+      +esc((d.devices||{}).total_ever)+'</b></div></div>';
+
+    if(!clean){
+      h+='<div class="lin"><div class="strip-l">Problems found</div>'
+        +'<div class="kv"><span>mismatched blocks</span><b>'
+        +esc(JSON.stringify(ig.hash_mismatches||[]))+'</b></div>'
+        +'<div class="kv"><span>link breaks</span><b>'
+        +esc(JSON.stringify(ig.link_breaks||[]))+'</b></div>'
+        +'<div class="kv"><span>link into period</span><b>'
+        +esc(ig.link_into_period)+'</b></div></div>';
+    }
+
+    h+='<div class="lin"><div class="strip-l">Receipt sequence</div>';
+    if(sq.applicable){
+      h+='<div class="kv"><span>'+(sq.gapless?'Complete, no gaps'
+         :'GAPS FOUND')+'</span><b>'+esc(sq.received)+' of '
+         +esc(sq.expected)+'</b></div>';
+      if(!sq.gapless){h+='<div class="kv"><span>missing</span><b>'
+         +esc(JSON.stringify(sq.missing))+'</b></div>';}
+    } else {
+      h+='<div class="kv"><span>Not applicable to a deployment-wide pack'
+         +'</span><b>&mdash;</b></div>';
+    }
+    h+='</div>';
+
+    var vs=d.verdicts||{};
+    if(Object.keys(vs).length){
+      h+='<div class="lin"><div class="strip-l">Verdicts in period</div>';
+      Object.keys(vs).sort().forEach(function(k){
+        h+='<div class="kv"><span>'+esc(k)+'</span><b>'+esc(vs[k])
+          +'</b></div>';});
+      h+='</div>';
+    }
+
+    h+='<div class="lin"><div class="strip-l">Chain range</div>'
+      +'<div class="kv"><span>first</span><b>#'+esc(d.first_block)
+      +'</b></div><div class="kv"><span>last</span><b>#'+esc(d.last_block)
+      +'</b></div><div class="kv"><span>pack digest</span></div>'
+      +'<code>'+esc(d.pack_digest)+'</code></div>';
+
+    if(d.sealed){
+      h+='<div class="lin"><div class="strip-l">Sealed into the chain</div>'
+        +'<div class="kv"><span>block</span><b>'+esc(d.sealed.block_index)
+        +'</b></div><code>'+esc(d.sealed.audit_hash)+'</code></div>';
+    }
+    h+='</div>';
+    return h;
+  }
+
+  function renderHistory(d){
+    if(!d.count) return '<div class="msg">No packs issued yet.</div>';
+    var h='<div class="verdict"><div class="v-head">'
+      +'<div class="v-word v-ok">'+esc(d.count)+'</div>'
+      +'<div class="v-why">packs issued and sealed</div></div><div class="lin">';
+    (d.packs||[]).forEach(function(p){
+      h+='<div class="kv"><span>'+esc(p.period)+' &middot; '+esc(p.issued)
+        +'</span><b>'+esc(p.hashes_verified)+' verified'
+        +(p.mismatches?' / '+esc(p.mismatches)+' bad':'')+'</b></div>';});
+    h+='</div></div>';
+    return h;
+  }
+
+  window.go=async function(what){
+    if(busy) return;
+    var period=document.getElementById('period').value.trim();
+    if(what!=='history' && !period){
+      msg('Give a period: 2026-Q2, 2026-07 or 2026.','bad'); return; }
+    busy=true;
+    out.innerHTML='<div class="msg"><span class="working">Re-verifying every '
+      +'block in the period</span></div>';
+    try{
+      var res;
+      if(what==='preview') res=await call('/x/pack/preview'+qs(),'GET');
+      else if(what==='render') res=await call('/x/pack/render'+qs(),'GET');
+      else if(what==='history') res=await call('/x/pack/history','GET');
+      else res=await call('/x/pack/issue','POST',
+        {period:period,scope:scope||undefined});
+      if(!res){busy=false;return;}
+
+      if(res.status===401){
+        msg('That key was refused. Check it and try again.','bad');
+      } else if(res.status===404 && res.data
+                && res.data.error==='unknown_module'){
+        msg('The pack module is not deployed. Open /x/pack/spec first.','bad');
+      } else if(res.status>=400){
+        out.innerHTML='<div class="msg bad">'
+          +esc((res.data&&(res.data.message||res.data.error))
+               ||('HTTP '+res.status))+'</div>'+raw(res.data);
+      } else if(what==='render' && res.data.html){
+        var f=document.createElement('iframe');
+        f.setAttribute('sandbox','');
+        f.srcdoc=res.data.html;
+        out.innerHTML='<div class="msg good">The pack as one page. Long-press '
+          +'to save, or screenshot it.</div>';
+        out.appendChild(f);
+      } else if(what==='history'){
+        out.innerHTML=renderHistory(res.data)+raw(res.data);
+      } else if(res.data.integrity){
+        var pre = (what==='issue')
+          ? '<div class="msg good">Issued and sealed. This cannot be '
+            +'withdrawn.</div>' : '';
+        out.innerHTML=pre+renderPack(res.data)+raw(res.data);
+      } else {
+        out.innerHTML='<div class="msg good">Done.</div>'+raw(res.data);
+      }
+    }catch(e){
+      msg('Could not reach the server.','bad');
+    }
+    busy=false;
+  };
+})();
+</script>
+</body>
+</html>
+"""
+
+
+def _srv():
+    m = sys.modules.get("__main__")
+    if hasattr(m, "get_bearer"):
+        return m
+    return sys.modules.get("server")
+
+
+def _install(s):
+    if _patched[0]:
+        return "already installed"
+    H = getattr(s, "Handler", None)
+    if H is None or not hasattr(H, "do_GET"):
+        return "no handler"
+    if getattr(H, "_packconsole_patched", False):
+        _patched[0] = True
+        return "already installed"
+
+    original = H.do_GET
+
+    def do_GET(self):
+        try:
+            p = urlparse(self.path).path.rstrip("/") or "/"
+        except Exception:
+            p = self.path or "/"
+        if p in PAGE_PATHS:
+            body = PAGE.encode("utf-8")
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Robots-Tag", "noindex, nofollow")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception:
+                pass
+            return
+        return original(self)
+
+    H.do_GET = do_GET
+    H._packconsole_patched = True
+    _patched[0] = True
+    print("PACKCONSOLE: /pack page installed at runtime", flush=True)
+    return "installed"
+
+
+def handle(method, action, data, api_key, ctx):
+    s = _srv()
+    if s is None:
+        return {"error": "server_not_found"}, 500
+
+    state = "already installed" if _patched[0] else None
+    if not _patched[0]:
+        try:
+            state = _install(s)
+        except Exception as exc:
+            print("PACKCONSOLE: patch failed - " + str(exc), flush=True)
+            state = "failed: " + str(exc)
+
+    if method == "GET" and (action or "") in ("", "status"):
+        return {"page": "/pack",
+                "installed": bool(_patched[0]),
+                "install_result": state,
+                "version": VERSION,
+                "calls": ["/x/pack/preview", "/x/pack/render",
+                          "/x/pack/issue", "/x/pack/history"],
+                "note": ("The page holds no credentials. Every route it "
+                         "calls checks the key itself.")}, 200
+
+    return {"error": "unknown_action", "action": action,
+            "GET": ["status"]}, 404
+
+```
+
+
+## `modules/peer.py`
+
+775 lines, 31547 bytes
+
+```python
+"""
+modules/peer.py  v1.1  --  signed peer submission (shared secret)
+
+READ THIS FIRST: WHAT THIS LANE BINDS, AND WHAT IT DOES NOT
+    This lane authenticates with HMAC-SHA256 over a shared secret.
+
+    A shared secret is held by BOTH parties. So a valid signature proves
+    the submission came from someone holding that secret -- which is the
+    peer, and also the operator of this deployment.
+
+        It closes third-party submission under your name.
+        It does NOT close operator submission under your name.
+
+    That is a normal property of HMAC and not a defect. It is stated here,
+    at the top, because "signed" reads stronger than it is, and a peer
+    choosing between lanes should not have to work that out for
+    themselves. Raised by Ishaan (Shango MID), who was right.
+
+    If you need the operator excluded as well, use /x/signed/submit
+    instead. There you generate an Ed25519 keypair, keep the private half,
+    and this deployment holds only the public half -- so it can verify a
+    signature and can never produce one. That property is arithmetic
+    rather than a promise about our conduct.
+
+    Both lanes stay open. This one is simpler to implement and costs the
+    peer no key custody, which is a real advantage if a long-lived private
+    key is a liability you would rather not carry. The other is stronger.
+    Pick deliberately.
+
+WHY THIS EXISTS
+    /x/witness/observe is unauthenticated on purpose. Anyone can submit a
+    tip without an account, and that openness is what answers the
+    collusion objection -- nobody has to trust us to audit the network.
+
+    The cost of that openness is that anyone can submit a tip under any
+    name. Name binding catches most of it; it does not prevent it.
+
+    A named peer exchanging period roots wants a stronger guarantee than
+    the open endpoint gives. This module provides one WITHOUT changing the
+    open endpoint. All three run side by side.
+
+WHAT IT COVERS
+    canonicalization, HMAC-SHA256 signing, nonce, replay window, clock
+    skew, idempotency, retry semantics, suspension, key rotation with
+    overlap.
+
+AUTH LIVES IN THE BODY, NOT IN HEADERS
+    The module router hands modules a parsed body, not the raw headers,
+    so every authentication field travels in the JSON body. This also
+    makes the scheme trivial to implement from any language and easy to
+    replay in a test.
+
+THE SCHEME, IN FULL
+    Envelope:
+        {
+          "peer_id":         "prae-001",
+          "ts":              1755432000,          integer unix seconds
+          "nonce":           "<>=16 chars, unique per peer>",
+          "idempotency_key": "<optional, <=128 chars>",
+          "payload":         { ... the thing being submitted ... },
+          "signature":       "<hex hmac-sha256>"
+        }
+
+    THOSE FIELDS AND NO OTHERS. The server rebuilds the envelope from the
+    known field names before checking the signature, so any extra
+    top-level field you signed will not be part of what we verify and the
+    signature will not match. Put anything of your own inside payload.
+    This trips people up and now it is written down.
+
+    String to sign:
+        "AILEASH-PEER-v1\\n" + canonical(envelope_without_signature)
+
+    canonical() is exactly:
+        json.dumps(obj, sort_keys=True, separators=(",",":"),
+                   ensure_ascii=True)
+
+    signature = hmac_sha256(secret, string_to_sign).hexdigest()
+
+    POST /x/peer/canonical returns the exact string to sign for a given
+    envelope, so an implementer can debug canonicalization without
+    holding or revealing a secret.
+
+RULES
+    clock skew      +/- 300s. Outside that: 401 clock_skew.
+    nonce           unique per peer for 900s. Reused: 409 replay.
+    idempotency     same key + same payload digest returns the FIRST
+                    response verbatim, sealed once. Same key + different
+                    payload: 409 idempotency_conflict.
+    retry           safe. Retry the identical envelope; idempotency makes
+                    it a no-op that returns the original receipt.
+    suspension      403 peer_suspended. Submissions refused, nothing
+                    deleted, the peer's history stands.
+    rotation        two secrets live at once. A new secret is issued and
+                    the previous one stays valid for ROTATION_OVERLAP
+                    (default 24h) so a peer can roll without downtime.
+
+                    Note the asymmetry with the other lane: here the
+                    OPERATOR issues and rotates the secret, because the
+                    operator holds it too. At /x/signed/rotate the peer
+                    rotates their own key and the operator cannot, because
+                    a rotation must be signed by the key being replaced.
+
+ROUTES
+    GET  spec       public   full implementation guide
+    POST canonical  public   the exact string to sign. no secret needed.
+    GET  peers      public   peer ids, status, rotation state. no secrets.
+    POST submit     public route, SIGNATURE authenticated
+    POST register   keyed    operator issues a peer credential
+    POST rotate     keyed    issue a new secret, overlap the old
+    POST suspend    keyed
+    POST resume     keyed
+    GET  history    keyed    submissions by peer
+
+TABLES OWNED
+    peer_registry, peer_nonce, peer_submission
+"""
+
+import hashlib
+import hmac
+import json
+import os
+import re
+import time
+
+VERSION = "1.1"
+
+PUBLIC = {
+    ("GET", "spec"),
+    ("POST", "canonical"),
+    ("GET", "peers"),
+    ("POST", "submit"),
+}
+
+SIGN_PREFIX = "AILEASH-PEER-v1\n"
+
+CLOCK_SKEW_SECONDS = 300
+NONCE_TTL_SECONDS = 900
+NONCE_MIN_LENGTH = 16
+ROTATION_OVERLAP_SECONDS = 86400
+MAX_PAYLOAD_BYTES = 65536
+MAX_IDEMPOTENCY_KEY = 128
+
+# The one paragraph that must appear anywhere this lane describes itself.
+# Kept as a constant so it cannot drift between the spec route, the
+# register response and the peers listing.
+SHARED_SECRET_SCOPE = (
+    "This lane authenticates with a shared secret, held by both the peer "
+    "and the operator of this deployment. A valid signature proves the "
+    "submission came from a holder of that secret. It closes third-party "
+    "submission under your name and it does not close operator submission "
+    "under your name. That is a normal property of HMAC, stated rather "
+    "than implied. For a lane where the operator is excluded too, use "
+    "/x/signed/submit - you keep the private key and we hold only the "
+    "public half, so we can verify a signature and can never produce one."
+)
+
+_PEER_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,62}$")
+
+_ready = False
+
+
+# ---------------------------------------------------------------- storage
+
+def _setup(ctx):
+    global _ready
+    if _ready:
+        return
+    conn = ctx["conn"]
+    with ctx["lock"]:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS peer_registry (
+                peer_id          TEXT PRIMARY KEY,
+                chain_name       TEXT,
+                url              TEXT,
+                secret_current   TEXT,
+                secret_previous  TEXT,
+                rotated_at       REAL,
+                status           TEXT DEFAULT 'active',
+                created          REAL,
+                submissions      INTEGER DEFAULT 0,
+                last_seen        REAL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS peer_nonce (
+                peer_id   TEXT,
+                nonce     TEXT,
+                seen_at   REAL,
+                PRIMARY KEY (peer_id, nonce)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS peer_submission (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                peer_id          TEXT,
+                ts               REAL,
+                idempotency_key  TEXT,
+                payload_digest   TEXT,
+                response_json    TEXT,
+                audit_hash       TEXT
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_peer_sub_idem "
+            "ON peer_submission(peer_id, idempotency_key)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_peer_nonce_time "
+            "ON peer_nonce(seen_at)")
+        conn.commit()
+    _ready = True
+
+
+# ------------------------------------------------------------ primitives
+
+def canonical(obj):
+    """
+    THE canonicalization. Any implementation in any language must produce
+    this byte-for-byte. Sorted keys, no whitespace, ASCII-escaped.
+    """
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=True)
+
+
+def string_to_sign(envelope):
+    """Envelope WITHOUT the signature field, prefixed and canonicalized."""
+    unsigned = {k: v for k, v in envelope.items() if k != "signature"}
+    return SIGN_PREFIX + canonical(unsigned)
+
+
+def sign(secret, envelope):
+    return hmac.new(secret.encode("utf-8"),
+                    string_to_sign(envelope).encode("utf-8"),
+                    hashlib.sha256).hexdigest()
+
+
+def _digest(payload):
+    return hashlib.sha256(canonical(payload).encode("utf-8")).hexdigest()
+
+
+def _new_secret():
+    return os.urandom(32).hex()
+
+
+def _now():
+    return time.time()
+
+
+def _iso(ts):
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(ts)))
+    except Exception:
+        return None
+
+
+def _sweep_nonces(ctx):
+    cutoff = _now() - NONCE_TTL_SECONDS
+    with ctx["lock"]:
+        ctx["conn"].execute("DELETE FROM peer_nonce WHERE seen_at < ?",
+                            (cutoff,))
+        ctx["conn"].commit()
+
+
+# ------------------------------------------------------------ the submit
+
+def _submit(ctx, data):
+    """
+    Signature-authenticated. No API key. Every rule on the list is
+    enforced here, in a fixed order, and each failure names itself.
+    """
+    _setup(ctx)
+
+    # ---- shape
+    peer_id = (data.get("peer_id") or "").strip()
+    signature = (data.get("signature") or "").strip()
+    nonce = (data.get("nonce") or "").strip()
+    payload = data.get("payload")
+    idem = (data.get("idempotency_key") or "").strip()[:MAX_IDEMPOTENCY_KEY]
+
+    if not peer_id or not signature or not nonce or payload is None:
+        return {"ok": False, "error": "malformed_envelope",
+                "required": ["peer_id", "ts", "nonce", "payload",
+                             "signature"]}, 400
+
+    try:
+        ts = int(data.get("ts"))
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "malformed_ts",
+                "detail": "ts must be an integer of unix seconds"}, 400
+
+    if len(nonce) < NONCE_MIN_LENGTH:
+        return {"ok": False, "error": "nonce_too_short",
+                "minimum": NONCE_MIN_LENGTH}, 400
+
+    if len(canonical(payload).encode("utf-8")) > MAX_PAYLOAD_BYTES:
+        return {"ok": False, "error": "payload_too_large",
+                "max_bytes": MAX_PAYLOAD_BYTES}, 413
+
+    # ---- peer known and active
+    row = ctx["conn"].execute(
+        "SELECT peer_id, chain_name, secret_current, secret_previous, "
+        "rotated_at, status FROM peer_registry WHERE peer_id = ?",
+        (peer_id,)).fetchone()
+    if not row:
+        return {"ok": False, "error": "unknown_peer", "peer_id": peer_id}, 401
+    if row[5] == "suspended":
+        return {"ok": False, "error": "peer_suspended",
+                "detail": "Submissions refused. Existing history stands "
+                          "and nothing has been removed."}, 403
+
+    # ---- clock skew, before any expensive work
+    skew = abs(_now() - ts)
+    if skew > CLOCK_SKEW_SECONDS:
+        return {"ok": False, "error": "clock_skew",
+                "detail": "Timestamp is %.0fs from server time; the window "
+                          "is +/-%ds." % (skew, CLOCK_SKEW_SECONDS),
+                "server_time": int(_now())}, 401
+
+    # ---- signature, against current then previous secret
+    #
+    # Note the envelope is rebuilt from KNOWN field names only. Any extra
+    # top-level field the caller signed is not part of what we verify, so
+    # the signature will not match. Documented in the spec; the failure
+    # response points at /x/peer/canonical, which is the fastest way for
+    # an implementer to see the difference.
+    envelope = {"peer_id": peer_id, "ts": ts, "nonce": nonce,
+                "payload": payload}
+    if idem:
+        envelope["idempotency_key"] = idem
+
+    accepted_with = None
+    if row[2] and hmac.compare_digest(sign(row[2], envelope), signature):
+        accepted_with = "current"
+    elif row[3] and (row[4] or 0) + ROTATION_OVERLAP_SECONDS > _now():
+        if hmac.compare_digest(sign(row[3], envelope), signature):
+            accepted_with = "previous"
+
+    if not accepted_with:
+        return {"ok": False, "error": "bad_signature",
+                "detail": "HMAC did not match. POST the same envelope to "
+                          "/x/peer/canonical to see the exact string this "
+                          "server signs.",
+                "common_cause": "An extra top-level field in your envelope. "
+                                "Only peer_id, ts, nonce, payload and "
+                                "idempotency_key are signed; anything else "
+                                "belongs inside payload.",
+                "string_to_sign_sha256":
+                    hashlib.sha256(
+                        string_to_sign(envelope).encode()).hexdigest(),
+                }, 401
+
+    payload_digest = _digest(payload)
+
+    # ---- idempotency, before the nonce check so a retry is a clean no-op
+    if idem:
+        prior = ctx["conn"].execute(
+            "SELECT payload_digest, response_json FROM peer_submission "
+            "WHERE peer_id = ? AND idempotency_key = ?",
+            (peer_id, idem)).fetchone()
+        if prior:
+            if prior[0] != payload_digest:
+                return {"ok": False, "error": "idempotency_conflict",
+                        "detail": "That idempotency key was used with a "
+                                  "different payload."}, 409
+            out = json.loads(prior[1])
+            out["replayed"] = True
+            out["note"] = ("Idempotent retry. This is the original receipt; "
+                           "nothing was sealed twice.")
+            return out, 200
+
+    # ---- replay
+    _sweep_nonces(ctx)
+    seen = ctx["conn"].execute(
+        "SELECT seen_at FROM peer_nonce WHERE peer_id = ? AND nonce = ?",
+        (peer_id, nonce)).fetchone()
+    if seen:
+        return {"ok": False, "error": "replay",
+                "detail": "That nonce has already been used by this peer "
+                          "within the %ds window. Use a fresh nonce, or "
+                          "send an idempotency_key if you meant to retry."
+                          % NONCE_TTL_SECONDS}, 409
+
+    # ---- accept: seal it
+    now = _now()
+    event = {"module": "peer", "action": "submit", "peer_id": peer_id,
+             "chain_name": row[1], "payload_digest": payload_digest,
+             "payload": payload}
+    result = {"accepted": True, "signed_with": accepted_with,
+              "auth": "hmac-shared-secret"}
+    audit_hash = block_index = receipt_seq = None
+    try:
+        audit_hash, block_index, receipt_seq = ctx["seal"](
+            event, result, now, None)
+    except Exception:
+        pass
+
+    out = {
+        "ok": True,
+        "accepted": True,
+        "peer_id": peer_id,
+        "chain_name": row[1],
+        "payload_digest": payload_digest,
+        "signed_with": accepted_with,
+        "auth": "hmac-shared-secret",
+        "auth_scope": SHARED_SECRET_SCOPE,
+        "received_at": _iso(now),
+        "receipt": {"audit_hash": audit_hash,
+                    "block_index": block_index,
+                    "receipt_seq": receipt_seq},
+        "verify": {
+            "inclusion": "/x/complete/prove",
+            "ancestry": "/x/consistency/ancestor?tip=<any tip we served>",
+            "append_only": "/x/consistency/proof?first=&second=",
+        },
+    }
+
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "INSERT OR IGNORE INTO peer_nonce (peer_id, nonce, seen_at) "
+            "VALUES (?,?,?)", (peer_id, nonce, now))
+        ctx["conn"].execute(
+            "INSERT INTO peer_submission (peer_id, ts, idempotency_key, "
+            "payload_digest, response_json, audit_hash) VALUES (?,?,?,?,?,?)",
+            (peer_id, now, idem or None, payload_digest,
+             json.dumps(out), audit_hash))
+        ctx["conn"].execute(
+            "UPDATE peer_registry SET submissions = submissions + 1, "
+            "last_seen = ? WHERE peer_id = ?", (now, peer_id))
+        ctx["conn"].commit()
+
+    if accepted_with == "previous":
+        out["warning"] = ("Accepted with the previous secret. The overlap "
+                          "window ends %s." % _iso((row[4] or 0) +
+                                                   ROTATION_OVERLAP_SECONDS))
+    return out, 200
+
+
+# ------------------------------------------------------------- operator
+
+def _register(ctx, data):
+    _setup(ctx)
+    peer_id = (data.get("peer_id") or "").strip().lower()
+    if not _PEER_ID_RE.match(peer_id):
+        return {"ok": False, "error": "bad_peer_id",
+                "detail": "lowercase letters, digits, dot, dash, "
+                          "underscore; 2-63 chars"}, 400
+    if ctx["conn"].execute("SELECT 1 FROM peer_registry WHERE peer_id = ?",
+                           (peer_id,)).fetchone():
+        return {"ok": False, "error": "peer_exists",
+                "detail": "Use /x/peer/rotate to issue a new secret."}, 409
+
+    secret = _new_secret()
+    now = _now()
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "INSERT INTO peer_registry (peer_id, chain_name, url, "
+            "secret_current, secret_previous, rotated_at, status, created) "
+            "VALUES (?,?,?,?,NULL,NULL,'active',?)",
+            (peer_id, (data.get("chain_name") or peer_id).strip()[:120],
+             (data.get("url") or "").strip()[:400], secret, now))
+        ctx["conn"].commit()
+    try:
+        ctx["seal"]({"module": "peer", "action": "register",
+                     "peer_id": peer_id},
+                    {"registered": True}, now, None)
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "peer_id": peer_id,
+        "secret": secret,
+        "warning": "This secret is shown once and is not recoverable. "
+                   "Send it to the peer over a channel you trust.",
+        "tell_the_peer_this": SHARED_SECRET_SCOPE,
+        "endpoint": "/x/peer/submit",
+        "spec": "/x/peer/spec",
+        "stronger_lane": "/x/signed/spec",
+    }, 200
+
+
+def _rotate(ctx, data):
+    _setup(ctx)
+    peer_id = (data.get("peer_id") or "").strip().lower()
+    row = ctx["conn"].execute(
+        "SELECT secret_current FROM peer_registry WHERE peer_id = ?",
+        (peer_id,)).fetchone()
+    if not row:
+        return {"ok": False, "error": "unknown_peer"}, 404
+
+    new = _new_secret()
+    now = _now()
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "UPDATE peer_registry SET secret_previous = secret_current, "
+            "secret_current = ?, rotated_at = ? WHERE peer_id = ?",
+            (new, now, peer_id))
+        ctx["conn"].commit()
+    try:
+        ctx["seal"]({"module": "peer", "action": "rotate",
+                     "peer_id": peer_id}, {"rotated": True}, now, None)
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "peer_id": peer_id,
+        "secret": new,
+        "previous_valid_until": _iso(now + ROTATION_OVERLAP_SECONDS),
+        "detail": "Both secrets are accepted until then, so the peer can "
+                  "roll over without downtime. Submissions signed with the "
+                  "old one come back marked.",
+        "note": "The operator rotates this credential because the operator "
+                "holds it. At /x/signed/rotate the peer rotates their own "
+                "key and the operator cannot, because a rotation there must "
+                "be signed by the key being replaced.",
+    }, 200
+
+
+def _set_status(ctx, data, status):
+    _setup(ctx)
+    peer_id = (data.get("peer_id") or "").strip().lower()
+    if not ctx["conn"].execute("SELECT 1 FROM peer_registry WHERE peer_id = ?",
+                               (peer_id,)).fetchone():
+        return {"ok": False, "error": "unknown_peer"}, 404
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "UPDATE peer_registry SET status = ? WHERE peer_id = ?",
+            (status, peer_id))
+        ctx["conn"].commit()
+    try:
+        ctx["seal"]({"module": "peer", "action": status,
+                     "peer_id": peer_id}, {"status": status}, _now(), None)
+    except Exception:
+        pass
+    return {"ok": True, "peer_id": peer_id, "status": status}, 200
+
+
+def _peers(ctx):
+    _setup(ctx)
+    now = _now()
+    rows = ctx["conn"].execute(
+        "SELECT peer_id, chain_name, url, status, created, submissions, "
+        "last_seen, rotated_at FROM peer_registry ORDER BY created"
+    ).fetchall()
+    return {
+        "ok": True,
+        "count": len(rows),
+        "auth": "hmac-shared-secret",
+        "auth_scope": SHARED_SECRET_SCOPE,
+        "peers": [{
+            "peer_id": r[0], "chain_name": r[1], "url": r[2] or None,
+            "status": r[3], "registered": _iso(r[4]),
+            "submissions": r[5], "last_seen": _iso(r[6]) if r[6] else None,
+            "rotation_overlap_active":
+                bool(r[7] and r[7] + ROTATION_OVERLAP_SECONDS > now),
+        } for r in rows],
+        "note": "Secrets are never returned by any route.",
+    }, 200
+
+
+def _history(ctx, data):
+    _setup(ctx)
+    peer_id = (data.get("peer_id") or "").strip().lower()
+    try:
+        limit = min(int(data.get("limit", 50)), 500)
+    except (TypeError, ValueError):
+        limit = 50
+    q = ("SELECT peer_id, ts, idempotency_key, payload_digest, audit_hash "
+         "FROM peer_submission")
+    args = []
+    if peer_id:
+        q += " WHERE peer_id = ?"
+        args.append(peer_id)
+    q += " ORDER BY id DESC LIMIT ?"
+    args.append(limit)
+    rows = ctx["conn"].execute(q, args).fetchall()
+    return {
+        "ok": True, "count": len(rows),
+        "submissions": [{
+            "peer_id": r[0], "at": _iso(r[1]), "idempotency_key": r[2],
+            "payload_digest": r[3], "audit_hash": r[4],
+        } for r in rows],
+    }, 200
+
+
+def _canonical_route(data):
+    """
+    Debugging aid. Give it an envelope, get back the exact string this
+    server will sign. Reveals nothing -- the secret is not involved.
+    """
+    env = dict(data or {})
+    env.pop("signature", None)
+    if "ts" in env:
+        try:
+            env["ts"] = int(env["ts"])
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "malformed_ts"}, 400
+    s = string_to_sign(env)
+    known = {"peer_id", "ts", "nonce", "payload", "idempotency_key"}
+    extra = sorted(k for k in env if k not in known)
+    out = {
+        "ok": True,
+        "string_to_sign": s,
+        "sha256": hashlib.sha256(s.encode("utf-8")).hexdigest(),
+        "byte_length": len(s.encode("utf-8")),
+        "recipe": "\"AILEASH-PEER-v1\\n\" + json.dumps(envelope_without_"
+                  "signature, sort_keys=True, separators=(\",\",\":\"), "
+                  "ensure_ascii=True)",
+        "then": "signature = hmac_sha256(secret, string_to_sign).hexdigest()",
+    }
+    if extra:
+        out["warning"] = (
+            "This route echoes whatever you sent, but /x/peer/submit "
+            "rebuilds the envelope from known fields only. These extra "
+            "top-level fields would NOT be part of what submit verifies, "
+            "so a signature over the string above would be rejected: %s. "
+            "Move them inside payload." % ", ".join(extra))
+    return out, 200
+
+
+# ------------------------------------------------------------------ spec
+
+def _spec():
+    return {
+        "module": "peer",
+        "version": VERSION,
+        "auth": "hmac-shared-secret",
+        "read_this_first": SHARED_SECRET_SCOPE,
+        "purpose":
+            "Signed submission for named peers. Sits beside the open "
+            "/x/witness/observe endpoint rather than replacing it. The "
+            "open endpoint stays unauthenticated so anyone can audit the "
+            "network without an account; this one guarantees that only a "
+            "holder of the peer secret can submit as that chain -- noting "
+            "that the operator is also a holder.",
+        "choosing_a_lane": {
+            "/x/witness/observe": "Open. No credential. Anyone can submit "
+                                  "under any name; the record says how "
+                                  "strong the claim is rather than "
+                                  "refusing it.",
+            "/x/peer/submit": "This lane. Shared secret. Excludes third "
+                              "parties, does not exclude the operator. No "
+                              "key custody burden on the peer.",
+            "/x/signed/submit": "Ed25519. The peer holds the private key "
+                                "and this deployment holds only the public "
+                                "half, so the operator is excluded too. "
+                                "Strongest, at the cost of the peer "
+                                "carrying a long-lived private key.",
+        },
+        "envelope": {
+            "peer_id": "string, issued at registration",
+            "ts": "integer unix seconds",
+            "nonce": "string, at least %d chars, unique per peer for %ds"
+                     % (NONCE_MIN_LENGTH, NONCE_TTL_SECONDS),
+            "idempotency_key": "optional string, max %d chars"
+                               % MAX_IDEMPOTENCY_KEY,
+            "payload": "object. period roots, tips, whatever is agreed. "
+                       "max %d bytes canonicalized." % MAX_PAYLOAD_BYTES,
+            "signature": "hex hmac-sha256",
+            "no_other_top_level_fields":
+                "The server rebuilds the envelope from exactly the field "
+                "names above before verifying. Any extra top-level field "
+                "you signed is not part of what we verify and your "
+                "signature will not match. Put your own data inside "
+                "payload.",
+        },
+        "canonicalization": {
+            "recipe": "json.dumps(obj, sort_keys=True, "
+                      "separators=(\",\",\":\"), ensure_ascii=True)",
+            "string_to_sign": "\"AILEASH-PEER-v1\\n\" + canonical(envelope "
+                              "with the signature field removed)",
+            "signature": "hmac_sha256(secret, string_to_sign).hexdigest()",
+            "debug": "POST the envelope to /x/peer/canonical to get the "
+                     "exact string back. No secret required.",
+        },
+        "rules": {
+            "clock_skew": "+/-%ds. Outside: 401 clock_skew, with the "
+                          "server's time in the body."
+                          % CLOCK_SKEW_SECONDS,
+            "replay": "A nonce is single-use per peer for %ds. Reused: "
+                      "409 replay." % NONCE_TTL_SECONDS,
+            "idempotency": "Same idempotency_key and same payload returns "
+                           "the original receipt verbatim with "
+                           "replayed=true; nothing is sealed twice. Same "
+                           "key with a different payload: 409 "
+                           "idempotency_conflict.",
+            "retry": "Retry the identical envelope. With an "
+                     "idempotency_key that is a safe no-op. Without one, "
+                     "a retry inside the nonce window returns 409 replay "
+                     "-- so send an idempotency_key if you intend to "
+                     "retry at all.",
+            "suspension": "403 peer_suspended. Nothing is deleted and the "
+                          "peer's sealed history stands.",
+            "rotation": "A new secret is issued and the previous one stays "
+                        "valid for %ds. Submissions accepted on the old "
+                        "secret come back with signed_with=previous and a "
+                        "warning naming the cutoff. The operator performs "
+                        "the rotation, because the operator holds the "
+                        "secret."
+                        % ROTATION_OVERLAP_SECONDS,
+        },
+        "on_acceptance":
+            "The payload is sealed into the audit chain and you get "
+            "audit_hash, block_index and receipt_seq. Verify "
+            "independently: inclusion at /x/complete/prove, ancestry at "
+            "/x/consistency/ancestor, append-only at "
+            "/x/consistency/proof. Both offline verifiers "
+            "(aileash_verify.py, verify_authority.py) are stdlib only and "
+            "touch no network.",
+        "routes": {
+            "GET spec": "public. this document.",
+            "POST canonical": "public. the exact string to sign.",
+            "GET peers": "public. peer ids and status. never secrets.",
+            "POST submit": "signature authenticated. no API key.",
+            "POST register": "keyed. operator issues a credential.",
+            "POST rotate": "keyed. new secret, old one overlaps.",
+            "POST suspend / POST resume": "keyed.",
+            "GET history": "keyed. submissions, optionally by peer.",
+        },
+        "what_this_does_not_do": [
+            "It does not exclude the operator of this deployment. A shared "
+            "secret is held by both parties, so a valid signature means a "
+            "holder of the secret submitted - which is you and also us. "
+            "Use /x/signed/submit if that matters to you.",
+            "It does not make a submitted root true. It proves who "
+            "submitted it and when, and that it has not changed since.",
+            "It does not replace /x/witness/observe. Peers who prefer the "
+            "open path keep using it and lose nothing.",
+            "A shared secret authenticates a channel, not a person. If "
+            "the secret leaks, rotate it.",
+        ],
+        "worked_example": {
+            "envelope_before_signing": {
+                "peer_id": "example-001",
+                "ts": 1755432000,
+                "nonce": "0123456789abcdef",
+                "payload": {"period": "2026-Q3", "root": "ab12...", "count": 4096},
+            },
+            "note": "POST exactly that to /x/peer/canonical and you will "
+                    "get the string to sign, so you can confirm your "
+                    "implementation before you hold a secret.",
+        },
+    }
+
+
+# ---------------------------------------------------------------- router
+
+def handle(method, action, data, api_key, ctx):
+    data = data or {}
+
+    if action == "spec":
+        return _spec(), 200
+    if action == "canonical":
+        return _canonical_route(data)
+    if action == "peers":
+        return _peers(ctx)
+    if action == "submit":
+        return _submit(ctx, data)
+
+    if not api_key:
+        return {"ok": False, "error": "api_key_required"}, 401
+
+    if action == "register":
+        return _register(ctx, data)
+    if action == "rotate":
+        return _rotate(ctx, data)
+    if action == "suspend":
+        return _set_status(ctx, data, "suspended")
+    if action == "resume":
+        return _set_status(ctx, data, "active")
+    if action == "history":
+        return _history(ctx, data)
+
+    return {"ok": False, "error": "unknown_action", "action": action}, 404
+
+```
+
+
+## `modules/peerconsole.py`
+
+376 lines, 15478 bytes
+
+```python
+"""
+modules/peerconsole.py  v1.0  -  the peer credential page at /peers
+
+Register a peer, rotate their secret, suspend them, see who is on.
+Keyed POSTs a browser address bar cannot reach.
+
+Own patch attribute so it composes with console.py and packconsole.py.
+After a deploy, one /x/ request arms it: /x/peerconsole/status
+"""
+
+import sys
+from urllib.parse import urlparse
+
+VERSION = "1.0"
+PUBLIC = {("GET", "status")}
+PAGE_PATHS = ("/peers", "/peers.html", "/peer-console")
+
+_patched = [False]
+
+PAGE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Peers — AILeash</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--ink:#0a0f1e;--panel:#131b2e;--panel2:#1a2338;--edge:rgba(201,168,76,.22);
+--gold:#c9a84c;--text:#f2efe6;--mute:rgba(242,239,230,.42);--ok:#7fe3b0;--err:#ff8a80;
+--mono:'IBM Plex Mono',ui-monospace,monospace;--body:system-ui,-apple-system,sans-serif}
+body{background:var(--ink);color:var(--text);font-family:var(--body);font-size:16px;
+line-height:1.6;padding:0 0 60px}
+.wrap{max-width:640px;margin:0 auto;padding:0 18px}
+header{padding:30px 0 20px;border-bottom:1px solid var(--edge);margin-bottom:24px}
+.eyebrow{font-family:var(--mono);font-size:10px;letter-spacing:.24em;
+text-transform:uppercase;color:var(--gold);margin-bottom:8px}
+h1{font-size:34px;line-height:1;font-weight:800;letter-spacing:-.02em}
+h1 span{color:var(--gold)}
+.sub{color:var(--mute);font-size:14px;margin-top:10px}
+label{display:block;font-family:var(--mono);font-size:10px;letter-spacing:.16em;
+text-transform:uppercase;color:var(--mute);margin-bottom:6px}
+input{width:100%;background:var(--panel);border:1px solid var(--edge);color:var(--text);
+font-family:var(--mono);font-size:13px;padding:12px;border-radius:4px;outline:none}
+input:focus{border-color:var(--gold)}
+.keybar{background:var(--panel2);border:1px solid var(--edge);border-radius:6px;
+padding:16px;margin-bottom:24px}
+.keynote{font-size:12px;color:var(--mute);margin-top:8px}
+.op{border:1px solid var(--edge);border-radius:6px;background:var(--panel);
+margin-bottom:12px;overflow:hidden}
+.op-head{display:flex;align-items:baseline;gap:10px;padding:15px 16px;cursor:pointer}
+.op-head:hover{background:var(--panel2)}
+.op-n{font-family:var(--mono);font-size:10px;color:var(--gold);opacity:.6}
+.op-t{font-size:17px;font-weight:700}
+.op-r{margin-left:auto;font-family:var(--mono);font-size:10px;color:var(--mute)}
+.op-body{padding:0 16px 16px;display:none}
+.op.open .op-body{display:block}
+.op-why{font-size:13.5px;color:var(--mute);margin-bottom:14px}
+.field{margin-bottom:12px}
+button{width:100%;background:var(--gold);color:var(--ink);border:none;border-radius:4px;
+padding:14px;font-weight:700;font-size:14.5px;cursor:pointer}
+button:hover:not(:disabled){background:#dbbd63}
+button.quiet{background:transparent;color:var(--mute);border:1px solid var(--edge)}
+.two{display:flex;gap:10px}
+.two button{flex:1}
+#out{margin-top:24px}
+pre{font-family:var(--mono);font-size:11.5px;line-height:1.6;background:#080c16;
+color:var(--ok);padding:14px;border-radius:5px;overflow-x:auto;
+border:1px solid var(--edge);max-height:320px}
+.msg{font-family:var(--mono);font-size:12.5px;padding:13px 15px;border-radius:5px;
+border:1px solid var(--edge);color:var(--mute);margin-bottom:12px}
+.msg.bad{color:var(--err);border-color:rgba(200,54,43,.5);background:rgba(200,54,43,.08)}
+.msg.good{color:var(--ok);border-color:rgba(127,227,176,.35);background:rgba(26,158,110,.08)}
+.secret{background:#080c16;border:2px solid var(--gold);border-radius:6px;padding:18px;
+margin-bottom:14px}
+.secret .lbl{font-family:var(--mono);font-size:10px;letter-spacing:.16em;
+text-transform:uppercase;color:var(--gold);margin-bottom:10px}
+.secret .val{font-family:var(--mono);font-size:13px;color:var(--text);word-break:break-all;
+line-height:1.7;background:var(--panel);padding:12px;border-radius:4px}
+.secret .warn{color:var(--err);font-size:13px;margin-top:12px}
+.peer{padding:12px 0;border-bottom:1px solid var(--edge)}
+.peer:last-child{border-bottom:none}
+.peer .id{font-family:var(--mono);font-size:13.5px;color:var(--gold)}
+.peer .meta{font-size:12.5px;color:var(--mute);margin-top:3px}
+.pill{display:inline-block;font-family:var(--mono);font-size:10px;padding:2px 7px;
+border-radius:3px;letter-spacing:.1em;text-transform:uppercase}
+.pill.active{background:rgba(26,158,110,.18);color:var(--ok)}
+.pill.suspended{background:rgba(200,54,43,.15);color:var(--err)}
+footer{margin-top:30px;padding-top:16px;border-top:1px solid var(--edge);
+font-family:var(--mono);font-size:10.5px;color:var(--mute);line-height:1.8}
+a{color:var(--gold)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <p class="eyebrow">AILeash · peer credentials</p>
+  <h1>Signed <span>peers</span></h1>
+  <p class="sub">The open endpoint stays open. This issues credentials to peers who need a guarantee that only they can submit as their chain.</p>
+</header>
+
+<div class="keybar">
+  <label for="key">API key</label>
+  <input id="key" type="password" placeholder="al_live_…" autocomplete="off" spellcheck="false">
+  <p class="keynote">Held in this tab only. Close it and the key is gone.</p>
+</div>
+
+<div class="op open" id="op-reg">
+  <div class="op-head" onclick="tog('op-reg')">
+    <span class="op-n">01</span><span class="op-t">Register a peer</span>
+    <span class="op-r">POST /x/peer/register</span>
+  </div>
+  <div class="op-body">
+    <p class="op-why">Issues their secret. It is shown once here and never again — send it to them over a channel you trust, not the same email as everything else.</p>
+    <div class="field">
+      <label for="r-id">Peer id (lowercase, no spaces)</label>
+      <input id="r-id" placeholder="praesidium" autocomplete="off">
+    </div>
+    <div class="field">
+      <label for="r-name">Chain name</label>
+      <input id="r-name" placeholder="PRAXIS" autocomplete="off">
+    </div>
+    <div class="field">
+      <label for="r-url">Their public tip URL</label>
+      <input id="r-url" placeholder="https://example.com/api/tip" autocomplete="off">
+    </div>
+    <button onclick="run('register')">Issue the credential</button>
+  </div>
+</div>
+
+<div class="op" id="op-rot">
+  <div class="op-head" onclick="tog('op-rot')">
+    <span class="op-n">02</span><span class="op-t">Rotate a secret</span>
+    <span class="op-r">POST /x/peer/rotate</span>
+  </div>
+  <div class="op-body">
+    <p class="op-why">New secret now, old one keeps working for 24 hours so they can roll over without downtime.</p>
+    <div class="field">
+      <label for="o-id">Peer id</label>
+      <input id="o-id" placeholder="praesidium" autocomplete="off">
+    </div>
+    <button onclick="run('rotate')">Rotate</button>
+  </div>
+</div>
+
+<div class="op" id="op-sus">
+  <div class="op-head" onclick="tog('op-sus')">
+    <span class="op-n">03</span><span class="op-t">Suspend or resume</span>
+    <span class="op-r">POST /x/peer/suspend</span>
+  </div>
+  <div class="op-body">
+    <p class="op-why">Suspending refuses new submissions. Nothing is deleted and their sealed history stands.</p>
+    <div class="field">
+      <label for="s-id">Peer id</label>
+      <input id="s-id" placeholder="praesidium" autocomplete="off">
+    </div>
+    <div class="two">
+      <button onclick="run('suspend')">Suspend</button>
+      <button class="quiet" onclick="run('resume')">Resume</button>
+    </div>
+  </div>
+</div>
+
+<div class="op" id="op-list">
+  <div class="op-head" onclick="tog('op-list')">
+    <span class="op-n">04</span><span class="op-t">Who is registered</span>
+    <span class="op-r">GET /x/peer/peers</span>
+  </div>
+  <div class="op-body">
+    <p class="op-why">Public route. Secrets are never returned by anything.</p>
+    <button class="quiet" onclick="run('peers')">List them</button>
+  </div>
+</div>
+
+<div class="op" id="op-hist">
+  <div class="op-head" onclick="tog('op-hist')">
+    <span class="op-n">05</span><span class="op-t">Submissions</span>
+    <span class="op-r">GET /x/peer/history</span>
+  </div>
+  <div class="op-body">
+    <p class="op-why">What has come in, with the receipt for each. Leave the id blank for everything.</p>
+    <div class="field">
+      <label for="h-id">Peer id (optional)</label>
+      <input id="h-id" placeholder="leave blank for all" autocomplete="off">
+    </div>
+    <button class="quiet" onclick="run('history')">Show them</button>
+  </div>
+</div>
+
+<div id="out"></div>
+
+<footer>
+  Spec for peers to implement: <a href="/x/peer/spec">/x/peer/spec</a><br>
+  Open endpoint, unchanged: <a href="/x/witness/peers">/x/witness/peers</a><br>
+  Other consoles: <a href="/console">/console</a> · <a href="/pack">/pack</a>
+</footer>
+
+</div>
+
+<script>
+(function(){
+  var out=document.getElementById('out'), busy=false;
+  window.tog=function(id){document.getElementById(id).classList.toggle('open');};
+  function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+  function msg(t,k){out.innerHTML='<div class="msg '+(k||'')+'">'+esc(t)+'</div>';}
+  function raw(o){return '<pre>'+esc(JSON.stringify(o,null,2))+'</pre>';}
+  function val(id){return document.getElementById(id).value.trim();}
+  function key(){var k=val('key');if(!k){msg('Paste your API key at the top first.','bad');return null;}return k;}
+
+  async function call(path,method,body){
+    var k=key(); if(!k) return null;
+    var o={method:method,headers:{'Authorization':'Bearer '+k}};
+    if(body){o.headers['Content-Type']='application/json';o.body=JSON.stringify(body);}
+    var r=await fetch(path,o); var d;
+    try{d=await r.json();}catch(e){d={error:'unreadable_response'};}
+    return {status:r.status,data:d};
+  }
+
+  function showSecret(d,title,extra){
+    return '<div class="secret"><div class="lbl">'+esc(title)+' — '+esc(d.peer_id)+'</div>'
+      +'<div class="val">'+esc(d.secret)+'</div>'
+      +'<div class="warn">Shown once. Not recoverable. Copy it now and send it to them '
+      +'separately from anything else.</div>'
+      +(extra?'<div class="warn" style="color:var(--mute)">'+esc(extra)+'</div>':'')
+      +'</div>';
+  }
+
+  function showPeers(d){
+    if(!d.peers||!d.peers.length) return '<div class="msg">No peers registered yet.</div>';
+    var h='<div class="msg good">'+d.count+' registered</div><div class="op open"><div class="op-body" style="padding:16px">';
+    d.peers.forEach(function(p){
+      h+='<div class="peer"><span class="id">'+esc(p.peer_id)+'</span> '
+        +'<span class="pill '+esc(p.status)+'">'+esc(p.status)+'</span>'
+        +'<div class="meta">'+esc(p.chain_name||'')
+        +' · '+esc(p.submissions)+' submissions'
+        +(p.last_seen?' · last '+esc(p.last_seen):' · never submitted')
+        +(p.rotation_overlap_active?' · rotating':'')
+        +'</div>'
+        +(p.url?'<div class="meta">'+esc(p.url)+'</div>':'')
+        +'</div>';
+    });
+    return h+'</div></div>';
+  }
+
+  window.run=async function(what){
+    if(busy) return;
+    var path,method='POST',body=null;
+
+    if(what==='register'){
+      var id=val('r-id');
+      if(!id){msg('Give the peer an id.','bad');return;}
+      path='/x/peer/register';
+      body={peer_id:id.toLowerCase(),chain_name:val('r-name')||id,url:val('r-url')};
+    }
+    else if(what==='rotate'){
+      var oid=val('o-id');
+      if(!oid){msg('Which peer?','bad');return;}
+      path='/x/peer/rotate'; body={peer_id:oid.toLowerCase()};
+    }
+    else if(what==='suspend'||what==='resume'){
+      var sid=val('s-id');
+      if(!sid){msg('Which peer?','bad');return;}
+      path='/x/peer/'+what; body={peer_id:sid.toLowerCase()};
+    }
+    else if(what==='peers'){path='/x/peer/peers';method='GET';}
+    else if(what==='history'){
+      var hid=val('h-id');
+      path='/x/peer/history'+(hid?'?peer_id='+encodeURIComponent(hid.toLowerCase()):'');
+      method='GET';
+    }
+    else return;
+
+    busy=true;
+    out.innerHTML='<div class="msg">Working…</div>';
+    try{
+      var res=await call(path,method,body);
+      if(!res){busy=false;return;}
+      var d=res.data;
+      if(res.status===401){msg('That key was refused.','bad');}
+      else if(res.status===404&&d&&d.error==='unknown_module'){
+        msg('modules/peer.py is not deployed yet.','bad');}
+      else if(res.status>=400){
+        out.innerHTML='<div class="msg bad">'+esc((d&&(d.detail||d.error))||('HTTP '+res.status))+'</div>'+raw(d);}
+      else if(what==='register'&&d.secret){
+        out.innerHTML=showSecret(d,'Peer secret')
+          +'<div class="msg good">Registered. Send them /x/peer/spec so they can implement the signing.</div>'+raw(d);}
+      else if(what==='rotate'&&d.secret){
+        out.innerHTML=showSecret(d,'New secret','Previous secret valid until '+(d.previous_valid_until||''))+raw(d);}
+      else if(what==='peers'){out.innerHTML=showPeers(d)+raw(d);}
+      else{out.innerHTML='<div class="msg good">Done.</div>'+raw(d);}
+    }catch(e){msg('Could not reach the server.','bad');}
+    busy=false;
+  };
+})();
+</script>
+</body>
+</html>
+"""
+
+
+def _srv():
+    m = sys.modules.get("__main__")
+    if hasattr(m, "get_bearer"):
+        return m
+    return sys.modules.get("server")
+
+
+def _install(s):
+    if _patched[0]:
+        return "already installed"
+    H = getattr(s, "Handler", None)
+    if H is None or not hasattr(H, "do_GET"):
+        return "no handler"
+    if getattr(H, "_peerconsole_patched", False):
+        _patched[0] = True
+        return "already installed"
+
+    original = H.do_GET
+
+    def do_GET(self):
+        try:
+            p = urlparse(self.path).path.rstrip("/") or "/"
+        except Exception:
+            p = self.path or "/"
+        if p in PAGE_PATHS:
+            body = PAGE.encode("utf-8")
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Robots-Tag", "noindex, nofollow")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception:
+                pass
+            return
+        return original(self)
+
+    H.do_GET = do_GET
+    H._peerconsole_patched = True
+    _patched[0] = True
+    print("PEERCONSOLE: /peers page installed at runtime", flush=True)
+    return "installed"
+
+
+def handle(method, action, data, api_key, ctx):
+    s = _srv()
+    if s is None:
+        return {"error": "server_not_found"}, 500
+
+    state = "already installed" if _patched[0] else None
+    if not _patched[0]:
+        try:
+            state = _install(s)
+        except Exception as exc:
+            print("PEERCONSOLE: patch failed - " + str(exc), flush=True)
+            state = "failed: " + str(exc)
+
+    if method == "GET" and (action or "") in ("", "status"):
+        return {
+            "page": "/peers",
+            "installed": bool(_patched[0]),
+            "install_result": state,
+            "version": VERSION,
+            "paths": list(PAGE_PATHS),
+            "note": "The page holds no credentials. Every route it calls "
+                    "checks the key itself.",
+        }, 200
+
+    return {"error": "unknown_action", "action": action, "GET": ["status"]}, 404
+
+```
+
+
+## `modules/publish.py`
+
+491 lines, 21976 bytes
 
 ```python
 #!/usr/bin/env python3
 """
-modules/replay.py  -  proving the same inputs still produce the same verdict
-                      WITHOUT ever disclosing how the verdict is reached
-============================================================================
+modules/publish.py  -  sealing what you published, at the moment you publish it
+===============================================================================
 
-THE QUESTION NOBODY ELSE IN THIS MARKET CAN ANSWER
---------------------------------------------------
-Every compliance platform can tell you what it decided. Not one of them can
-prove it would decide the same way again.
+THE PROBLEM THIS EXISTS TO NEVER HAVE AGAIN
+-------------------------------------------
+Somebody asks when a page was published. You answer from git history. They
+point out - correctly - that git commit dates are fields in the commit
+object which anyone can set to anything with an environment variable before
+committing. Your strongest evidence turns out to be the weakest thing in
+the room, and it drags the credible parts down with it.
 
-Ask any of them to re-run decision 4,117 from its sealed inputs and show the
-same verdict falls out. They cannot. Not because they will not - because
-their scoring goes through a model call, and model calls are not
-reproducible. Same inputs, different day, different answer. Their audit
-trail describes a decision that can never be performed twice.
+The fix is not a better argument. It is sealing the page the moment it goes
+live, so the question never depends on anybody's word again.
 
-Ours is arithmetic. Deterministic below the model layer, and always has
-been. This module lets anyone establish that for themselves.
+WHAT THIS DOES
+--------------
+    POST /x/publish/seal {"url": "https://example.com/spec"}
 
-THE SCORING LOGIC IS NEVER DISCLOSED
-------------------------------------
-Read this before changing anything in here.
+We fetch the URL ourselves, hash exactly what was served, and seal the hash,
+the URL and the fetch time into the chain - where it is anchored externally
+and handed to peer chains like every other block.
 
-Nothing in this module publishes, returns, echoes or hints at the contents
-of the decision function. Not the source, not the weights, not the
-thresholds, not the signal names, not the intermediate values. The only
-thing that leaves the building is a SHA-256 of the deployed source, which
-is one-way and reveals nothing about what it hashes.
+From then on:
 
-Determinism is proved as a BLACK BOX instead: same inputs in, same verdict
-out, demonstrated repeatedly, by the challenger, on their own schedule,
-with every run sealed into the chain. That is a stronger proof than showing
-the code, because it is behaviour observed over time rather than a claim
-about a listing nobody can confirm is what actually runs in production.
+  - "this exact content was served at this address no later than T" is
+    arithmetic rather than a claim;
+  - re-sealing the same URL later builds a permanent revision history that
+    the publisher cannot edit, because each version is its own block;
+  - and anyone can check it without an account.
 
-  A competitor who reads every route here learns exactly one thing: that
-  our verdicts are reproducible. Which is the point, and which they cannot
-  copy, because reproducibility is a property of the architecture and not a
-  feature that can be bolted on.
+Seal at publication and you never argue about a publication date again. That
+is the entire point, and it takes one call.
 
-HOW SOMEONE CHECKS US WITHOUT SEEING ANYTHING
----------------------------------------------
-  POST /x/replay/challenge   send any inputs you like. We run them, seal
-                             the run into the chain, and hand you back the
-                             verdict, the audit hash, and a fingerprint of
-                             your own inputs.
+WHAT IT HONESTLY CANNOT DO
+--------------------------
+It cannot reach backwards. A seal made today proves the content existed
+today, not that it existed last week. Nothing can prove that - not this, not
+Bitcoin, not a notary. Timestamps are one-directional by nature.
 
-Send the same inputs again - an hour later, a year later, from a different
-address. If the verdict ever moves, you have caught us, and both runs are
-independently sealed and anchored so we cannot revise either one. If it
-never moves, you have established determinism yourself, empirically,
-adversarially, without a line of our code.
+So for anything already published before it was sealed, the module records
+EXTERNAL REFERENCES alongside: a GitHub push event, a Wayback Machine
+snapshot, a DigiCert or OpenTimestamps proof. Those are stored and sealed as
+supplied. We do not verify them and we do not present them as ours - they
+are somebody else's record, named so a third party can check it at source.
+That distinction is stated in every response rather than left to be
+discovered.
 
-We also report how many times that exact input has been challenged, when it
-was first seen, and every audit hash it produced, so the whole history is
-verifiable through routes we do not control the answers to.
+Two references are worth knowing about, because they are the ones that
+actually carry an earlier date:
 
-THE HONEST COST, WHICH IS REAL
-------------------------------
-An open scoring oracle can be probed. Feed it a thousand variations, watch
-the verdicts move, and a determined party can map the decision boundary
-without ever seeing the code. That is a genuine exposure and it is the
-price of this proof.
+  GitHub push events   api.github.com/repos/<owner>/<repo>/events
+                       The push timestamp is recorded server-side by GitHub
+                       and cannot be set by the pusher, unlike commit dates.
+                       Retained roughly 90 days - so it must be captured
+                       while it still exists.
 
-It is mitigated, not eliminated: challenges are rate limited per address,
-inputs are fingerprinted so repeat submissions are cheap and novel ones are
-not, and boundary-probing patterns are already logged elsewhere in the
-platform. Anyone systematically mapping the function leaves an obvious,
-sealed trail while doing it.
+  Wayback Machine      archive.org/wayback/available?url=...&timestamp=...
+                       An independent party with no stake in the dispute.
+                       If it caught the page, that settles it outright.
 
-The trade is deliberate. A closed engine nobody can test is worth less than
-a testable one somebody might partially map, because the first cannot be
-sold to a regulator and the second can.
+FETCHING SAFELY
+---------------
+This module makes the server fetch a URL. Done naively that is a hole worse
+than the one it closes. So the fetcher speaks only http and https, only on
+ports 80 and 443, resolves the hostname first and refuses any address that
+is private, loopback, link-local, reserved or multicast, never follows a
+redirect, times out fast, and stops reading after a cap. Sealing is keyed,
+so this is not an anonymous capability either.
 
-CONFIGURATION
--------------
-This module does not import server.py - nothing here does. It finds the
-live decision function at runtime among already-loaded modules, so it can
-only observe the engine, never change it. If your scorer is named something
-not in SCORER_NAMES below, add it there. Everything else is read from the
-audit_log schema at startup rather than assumed.
-
-    POST /x/replay/challenge     run any inputs, sealed          (public)
-    GET  /x/replay/history       every run of a given input       (public)
-    GET  /x/replay/self          reproduction rate over a sample  (public)
-    GET  /x/replay/fingerprint   hash of the deployed code        (public)
-    GET  /x/replay/spec          how to test us                   (public)
-    GET  /x/replay/check         re-run one sealed decision       (keyed)
-    POST /x/replay/attest        seal the current fingerprint     (keyed)
+    POST /x/publish/seal      fetch, hash and seal a live URL     (keyed)
+    GET  /x/publish/history   every version ever sealed of a URL  (public)
+    GET  /x/publish/verify    was this exact content served, when (public)
+    GET  /x/publish/list      everything sealed                   (public)
+    GET  /x/publish/spec      how to check any of it              (public)
 """
 
 import hashlib
-import inspect
-import json
-import sys
+import ipaddress
+import re
+import socket
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 VERSION = "1.0"
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
-# Challenge, history, self, fingerprint and spec are open - a
-# reproducibility claim you need an account to test is not a claim anyone
-# should accept. check stays keyed: it reads back a specific sealed
-# decision, which belongs to whoever owns it.
-PUBLIC = {("POST", "challenge"), ("GET", "history"), ("GET", "self"),
-          ("GET", "fingerprint"), ("GET", "spec")}
+# Reading is open. A publication record only settles an argument if the
+# other side can check it without going through the publisher.
+PUBLIC = {("GET", "history"), ("GET", "verify"), ("GET", "list"),
+          ("GET", "spec")}
 
-# Names the live decision function might go by. Add yours if it is not
-# here - this is the one thing that has to match your code.
-SCORER_NAMES = (
-    "score_event", "decide", "score", "evaluate", "run_decision",
-    "make_decision", "assess", "score_decision", "engine_decide",
-)
+CONTENT_PREFIX = b"AILEASH-PUBLISH-v1:"
 
-# Columns the sealed inputs might live in. Detected, never assumed.
-INPUT_COLUMNS = ("event", "event_json", "payload", "inputs", "request",
-                 "ev", "data", "event_data")
-RESULT_COLUMNS = ("result", "result_json", "res", "decision_json", "outcome",
-                  "response")
-VERDICT_COLUMNS = ("decision", "verdict", "action_taken")
-SCORE_COLUMNS = ("score", "risk_score", "points")
-
-SELF_SAMPLE_DEFAULT = 50
-SELF_SAMPLE_MAX = 500
-
-# Challenge throttle. Repeat submissions of an input we have already seen
-# are cheap; novel inputs are what a prober needs, so those are what get
-# limited.
-NOVEL_PER_HOUR = 40
-MAX_PAYLOAD_KEYS = 40
+FETCH_TIMEOUT = 8
+MAX_FETCH_BYTES = 2 * 1024 * 1024
+ALLOWED_SCHEMES = ("http", "https")
+ALLOWED_PORTS = (80, 443)
+MAX_EXTERNAL = 8
 
 _ready = False
-_columns = []
 
 
 def _setup(ctx):
-    global _ready, _columns
+    global _ready
     if _ready:
         return
-    cols = []
-    try:
-        with ctx["lock"]:
-            for row in ctx["conn"].execute("PRAGMA table_info(audit_log)").fetchall():
-                cols.append(row[1])
-    except Exception:
-        pass
-    _columns = cols
     with ctx["lock"]:
         c = ctx["conn"]
-        c.execute("CREATE TABLE IF NOT EXISTS replay_attest("
-                  "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,"
-                  "fingerprint TEXT,function TEXT,taken REAL,"
-                  "audit_hash TEXT,block_index INTEGER)")
-        # One row per challenge run. The input fingerprint is stored, the
-        # input itself is not - we have no reason to keep a stranger's
-        # payload and every reason not to.
-        c.execute("CREATE TABLE IF NOT EXISTS replay_challenge("
-                  "id INTEGER PRIMARY KEY AUTOINCREMENT,input_hash TEXT,"
-                  "verdict TEXT,score TEXT,code_fingerprint TEXT,ran REAL,"
-                  "audit_hash TEXT,block_index INTEGER,client TEXT)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_rep_input "
-                  "ON replay_challenge(input_hash,id)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_rep_ran ON replay_challenge(ran)")
+        c.execute("CREATE TABLE IF NOT EXISTS publish_seal("
+                  "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,url TEXT,"
+                  "content_hash TEXT,byte_length INTEGER,http_status INTEGER,"
+                  "content_type TEXT,note TEXT,external TEXT,"
+                  "fetched REAL,audit_hash TEXT,block_index INTEGER)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_pub_url ON publish_seal(url,id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_pub_hash ON publish_seal(content_hash)")
         c.commit()
     _ready = True
 
@@ -1258,472 +2253,335 @@ def _iso(ts):
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
 
 
-def _pick(candidates):
-    for name in candidates:
-        if name in _columns:
-            return name
-    return None
-
-
-def _canonical(payload):
-    """Stable rendering of an input payload, so the same inputs always
-    fingerprint to the same value regardless of key order or spacing."""
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"),
-                      ensure_ascii=False, default=str)
-
-
-def _input_hash(payload):
-    return hashlib.sha256(("AILEASH-INPUT-v1:" + _canonical(payload)).encode("utf-8")).hexdigest()
-
-
 # ----------------------------------------------------------------------
-# finding the live decision function
+# fetching - read the SSRF note above before touching any of this
 # ----------------------------------------------------------------------
 
-def _find_scorer():
-    """Locate the deployed decision function among loaded modules.
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect is an instruction to fetch a second URL we never checked."""
 
-    Deliberately does not import server.py. It looks at what is already
-    running, so this module can observe the engine and never alter it.
-    """
-    for module_name in ("__main__", "server", "app", "main"):
-        module = sys.modules.get(module_name)
-        if module is None:
-            continue
-        for name in SCORER_NAMES:
-            candidate = getattr(module, name, None)
-            if callable(candidate):
-                return candidate, "%s.%s" % (module_name, name), None
-    return None, None, ("no decision function found. Add its real name to SCORER_NAMES at the "
-                        "top of modules/replay.py.")
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
-def _fingerprint_of(function):
-    """SHA-256 of the deployed source. One-way: it commits to which code is
-    running without revealing any of it."""
+_opener = urllib.request.build_opener(_NoRedirect)
+
+
+def _address_allowed(host, port):
     try:
-        source = inspect.getsource(function)
-    except (OSError, TypeError):
-        return None, "source not readable for this callable"
-    normalised = "\n".join(line.rstrip() for line in source.splitlines()).strip()
-    return hashlib.sha256(normalised.encode("utf-8")).hexdigest(), None
-
-
-# ----------------------------------------------------------------------
-# running the engine
-# ----------------------------------------------------------------------
-
-def _rerun(function, inputs):
-    """Execute the live decision function against a set of inputs.
-
-    Never raises. On failure it reports that the call failed and nothing
-    about why the engine is shaped the way it is.
-    """
-    if inputs is None:
-        return None, "no inputs"
-    attempts = []
-    if isinstance(inputs, dict):
-        attempts.append(lambda: function(**inputs))
-        attempts.append(lambda: function(inputs))
-    else:
-        attempts.append(lambda: function(inputs))
-    for call in attempts:
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+    except Exception as exc:
+        return False, "could not resolve host (%s)" % type(exc).__name__
+    if not infos:
+        return False, "host resolved to nothing"
+    for info in infos:
         try:
-            return call(), None
-        except TypeError:
-            continue
-        except Exception:
-            return None, "the decision function could not process those inputs"
-    return None, "those inputs do not match the shape the engine expects"
+            addr = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return False, "unreadable address"
+        if (addr.is_private or addr.is_loopback or addr.is_link_local
+                or addr.is_reserved or addr.is_multicast or addr.is_unspecified):
+            return False, "address is not publicly routable"
+    return True, None
 
 
-def _extract(output):
-    """Pull (verdict, score) out of whatever the scorer returns. Nothing
-    else from the return value is ever surfaced."""
-    if isinstance(output, dict):
-        return (output.get("decision") or output.get("verdict"), output.get("score"))
-    if isinstance(output, (tuple, list)) and len(output) >= 2:
-        return output[0], output[1]
-    return output, None
+def _url_allowed(url):
+    if not url or not isinstance(url, str) or len(url) > 500:
+        return False, "no usable url"
+    try:
+        parts = urlparse(url.strip())
+    except Exception:
+        return False, "unparseable url"
+    if parts.scheme not in ALLOWED_SCHEMES:
+        return False, "scheme not allowed"
+    if not parts.hostname:
+        return False, "no host in url"
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    if port not in ALLOWED_PORTS:
+        return False, "port not allowed"
+    return _address_allowed(parts.hostname, port)
 
 
-def _same(a, b):
-    if a is None and b is None:
-        return True
-    if a is None or b is None:
-        return False
-    if isinstance(a, float) or isinstance(b, float):
-        try:
-            return abs(float(a) - float(b)) < 1e-9
-        except (TypeError, ValueError):
-            return False
-    return str(a).strip().upper() == str(b).strip().upper()
+def _fetch(url):
+    """Returns (body_bytes, status, content_type, error)."""
+    ok, why = _url_allowed(url)
+    if not ok:
+        return None, None, None, why
+    request = urllib.request.Request(url, headers={
+        "Accept": "*/*",
+        "User-Agent": "aileash-publish/%s" % VERSION,
+    })
+    try:
+        with _opener.open(request, timeout=FETCH_TIMEOUT) as response:
+            status = response.getcode()
+            content_type = response.headers.get("Content-Type", "")
+            body = response.read(MAX_FETCH_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        return None, exc.code, None, "url answered %s" % exc.code
+    except Exception as exc:
+        return None, None, None, "could not reach url (%s)" % type(exc).__name__
+    if len(body) > MAX_FETCH_BYTES:
+        return None, status, content_type, "response larger than the %d byte cap" % MAX_FETCH_BYTES
+    return body, status, content_type, None
+
+
+def _content_hash(body):
+    """Hash exactly the bytes served. No normalisation, no cleverness -
+    a whitespace-tolerant hash would be a hash of our opinion of the page
+    rather than of the page."""
+    return hashlib.sha256(CONTENT_PREFIX + body).hexdigest()
 
 
 # ----------------------------------------------------------------------
-# challenge - the public proof
+# seal
 # ----------------------------------------------------------------------
 
-def _novel_recently(ctx):
-    since = time.time() - 3600
-    with ctx["lock"]:
-        row = ctx["conn"].execute(
-            "SELECT COUNT(DISTINCT input_hash) FROM replay_challenge WHERE ran>=?",
-            (since,)).fetchone()
-    return int(row[0]) if row else 0
+def _clean_external(value):
+    """External references are recorded verbatim and never verified."""
+    if not isinstance(value, list):
+        return []
+    out = []
+    for item in value[:MAX_EXTERNAL]:
+        if isinstance(item, dict):
+            source = str(item.get("source", "")).strip()[:60]
+            reference = str(item.get("reference", item.get("url", ""))).strip()[:400]
+            claimed = str(item.get("claimed_time", "")).strip()[:60]
+            if source and reference:
+                out.append({"source": source, "reference": reference,
+                            "claimed_time": claimed or None})
+        elif isinstance(item, str) and item.strip():
+            out.append({"source": "unnamed", "reference": item.strip()[:400],
+                        "claimed_time": None})
+    return out
 
 
-def _challenge(ctx, api_key, data):
-    inputs = data.get("inputs", data.get("event", data.get("payload")))
-    if not isinstance(inputs, dict) or not inputs:
-        return {"error": "inputs_required",
-                "message": "Send an inputs object. We will run it, seal the run, and hand you "
-                           "back the verdict. Send the same object again whenever you like - "
-                           "if the answer ever moves, you have caught us."}, 400
-    if len(inputs) > MAX_PAYLOAD_KEYS:
-        return {"error": "payload_too_wide", "message": "at most %d keys" % MAX_PAYLOAD_KEYS}, 400
+def _seal(ctx, api_key, data):
+    url = str(data.get("url", "")).strip()
+    if not url:
+        return {"error": "url_required",
+                "message": "The address of the page you have just published."}, 400
 
-    fingerprint_in = _input_hash(inputs)
+    note = str(data.get("note", "") or "").strip()[:300]
+    external = _clean_external(data.get("external"))
+
+    body, status, content_type, why = _fetch(url)
+    if why:
+        return {"error": "fetch_failed", "url": url, "message": why,
+                "note": "Nothing was sealed. A record of a page we could not read would be "
+                        "worse than no record."}, 502
+
+    digest = _content_hash(body)
+    now = time.time()
 
     with ctx["lock"]:
         prior = ctx["conn"].execute(
-            "SELECT verdict,score,ran,audit_hash,block_index,code_fingerprint "
-            "FROM replay_challenge WHERE input_hash=? ORDER BY id ASC",
-            (fingerprint_in,)).fetchall()
+            "SELECT content_hash,fetched,audit_hash FROM publish_seal "
+            "WHERE url=? ORDER BY id ASC", (url,)).fetchall()
 
-    if not prior and _novel_recently(ctx) >= NOVEL_PER_HOUR:
-        return {"error": "rate_limited",
-                "message": "Too many distinct inputs in the last hour. Repeat submissions of "
-                           "inputs already seen are never limited - testing whether the answer "
-                           "moves is the whole point. Mapping the function is not.",
-                "repeat_freely": "any input_hash already in /x/replay/history"}, 429
+    unchanged = bool(prior) and prior[-1][0] == digest
+    first_of_this_version = None
+    for row in prior:
+        if row[0] == digest:
+            first_of_this_version = row[1]
+            break
 
-    function, name, why = _find_scorer()
-    if why:
-        return {"error": "engine_unavailable", "message": "the decision engine is not reachable "
-                                                          "from this route right now"}, 503
-
-    output, problem = _rerun(function, inputs)
-    if problem:
-        return {"error": "not_runnable", "message": problem}, 422
-
-    verdict, score = _extract(output)
-    code_fingerprint, _p = _fingerprint_of(function)
-    now = time.time()
-
-    ev = {"user_id": "chal:" + fingerprint_in[:16], "action": "replay_challenge", "amount": 0,
-          "country": "UK", "device_id": "replay", "anomaly": 0, "device_risk": 0}
-    res = {"decision": str(verdict), "score": score, "replay_version": VERSION,
-           "input_hash": fingerprint_in, "code_fingerprint": code_fingerprint,
-           "detail": "input=%s;verdict=%s;code=%s" % (fingerprint_in, verdict, code_fingerprint)}
-    audit_hash, block_index, seq = ctx["seal"](ev, res, now, api_key or "public-replay")
-
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "INSERT INTO replay_challenge(input_hash,verdict,score,code_fingerprint,ran,"
-            "audit_hash,block_index,client) VALUES(?,?,?,?,?,?,?,?)",
-            (fingerprint_in, str(verdict), str(score), code_fingerprint, now,
-             audit_hash, block_index, "keyed" if api_key else "anonymous"))
-        ctx["conn"].commit()
-
-    out = {
-        "input_hash": fingerprint_in,
-        "verdict": verdict, "score": score,
-        "ran_at": _iso(now),
-        "sealed_in_chain": audit_hash, "block_index": block_index, "receipt_seq": seq,
-        "code_fingerprint": code_fingerprint,
-        "runs_of_this_input": len(prior) + 1,
-        "replay_version": VERSION,
-        "how_to_use_this": "Send the identical inputs again, whenever you like, from wherever "
-                           "you like. Every run is sealed into a chain that is externally "
-                           "anchored and independently witnessed, so neither this answer nor "
-                           "the next one can be revised afterwards.",
-        "history": "/x/replay/history?input_hash=" + fingerprint_in,
-        "verify_this_run": "/x/consistency/ancestor?tip=" + audit_hash,
-    }
-
-    if prior:
-        first_verdict, first_score = prior[0][0], prior[0][1]
-        stable = _same(verdict, first_verdict) and _same(score, first_score)
-        out["first_seen"] = _iso(prior[0][2])
-        out["stable"] = stable
-        out["verdict_moved"] = not stable
-        if stable:
-            out["what_this_shows"] = ("Identical to the first run of these inputs on %s, and to "
-                                      "every run since. Determinism observed rather than "
-                                      "asserted." % _iso(prior[0][2]))
-        else:
-            out["what_this_shows"] = ("These inputs previously produced a different answer. "
-                                      "Either the code changed - compare the code fingerprints "
-                                      "in the history - or the engine is not deterministic. "
-                                      "Both runs are sealed and neither can be withdrawn.")
-    else:
-        out["stable"] = None
-        out["what_this_shows"] = ("First time these inputs have been seen. Send them again to "
-                                  "start building the record.")
-    return out, 200
-
-
-def _history(ctx, data):
-    input_hash = str(data.get("input_hash", data.get("hash", ""))).strip().lower()
-    if not input_hash:
-        return {"error": "input_hash_required"}, 400
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT verdict,score,ran,audit_hash,block_index,code_fingerprint,client "
-            "FROM replay_challenge WHERE input_hash=? ORDER BY id ASC LIMIT 500",
-            (input_hash,)).fetchall()
-    if not rows:
-        return {"error": "unknown_input", "input_hash": input_hash,
-                "message": "No run recorded for that input fingerprint."}, 404
-
-    verdicts = {r[0] for r in rows}
-    codes = {r[5] for r in rows if r[5]}
-    return {
-        "input_hash": input_hash,
-        "runs": len(rows),
-        "first_run": _iso(rows[0][2]), "latest_run": _iso(rows[-1][2]),
-        "distinct_verdicts": len(verdicts),
-        "stable": len(verdicts) == 1,
-        "code_versions_seen": len(codes),
-        "history": [{"verdict": r[0], "score": r[1], "ran_at": _iso(r[2]),
-                     "sealed_in_chain": r[3], "block_index": r[4],
-                     "code_fingerprint": r[5], "submitted_by": r[6]} for r in rows],
-        "what_this_is": "Every recorded run of one exact set of inputs, each sealed separately "
-                        "into the chain. Verify any of them independently at "
-                        "/x/consistency/ancestor - we cannot alter one after the fact.",
-        "note": "More than one distinct verdict across a single code fingerprint would mean the "
-                "engine is not deterministic. That is exactly what this is here to expose.",
-    }, 200
-
-
-# ----------------------------------------------------------------------
-# self audit
-# ----------------------------------------------------------------------
-
-def _fetch(ctx, where, args):
-    input_col = _pick(INPUT_COLUMNS)
-    result_col = _pick(RESULT_COLUMNS)
-    verdict_col = _pick(VERDICT_COLUMNS)
-    score_col = _pick(SCORE_COLUMNS)
-    if not input_col:
-        return None, ("audit_log does not store decision inputs on this deployment, so sealed "
-                      "decisions cannot be re-executed. Seal the event payload alongside the "
-                      "verdict and replay becomes available from that point on.")
-    fields = ["id", "audit_hash", "ts", input_col]
-    for extra in (result_col, verdict_col, score_col):
-        if extra and extra not in fields:
-            fields.append(extra)
-    sql = "SELECT %s FROM audit_log WHERE %s" % (", ".join(fields), where)
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(sql, tuple(args)).fetchall()
-    if not rows:
-        return None, "no sealed decision matched"
-    out = []
-    for row in rows:
-        record = dict(zip(fields, row))
-        raw = record.get(input_col)
-        try:
-            parsed = raw if isinstance(raw, (dict, list)) else json.loads(raw)
-        except Exception:
-            parsed = None
-        sealed_result = None
-        if result_col:
-            raw_result = record.get(result_col)
-            try:
-                sealed_result = raw_result if isinstance(raw_result, dict) else json.loads(raw_result)
-            except Exception:
-                sealed_result = None
-        out.append({"id": record.get("id"), "audit_hash": record.get("audit_hash"),
-                    "ts": record.get("ts"), "inputs": parsed,
-                    "sealed_result": sealed_result,
-                    "sealed_verdict": record.get(verdict_col) if verdict_col else None,
-                    "sealed_score": record.get(score_col) if score_col else None})
-    return out, None
-
-
-def _sealed_pair(record):
-    verdict = record.get("sealed_verdict")
-    score = record.get("sealed_score")
-    result = record.get("sealed_result")
-    if isinstance(result, dict):
-        if verdict is None:
-            verdict = result.get("decision") or result.get("verdict")
-        if score is None:
-            score = result.get("score")
-    return verdict, score
-
-
-def _compare(record, function):
-    output, why = _rerun(function, record.get("inputs"))
-    sealed_verdict, sealed_score = _sealed_pair(record)
-    if why:
-        return {"audit_hash": record["audit_hash"], "result": "not_replayable"}
-    verdict, score = _extract(output)
-    identical = _same(verdict, sealed_verdict) and _same(score, sealed_score)
-    return {"audit_hash": record["audit_hash"], "sealed_at": _iso(record.get("ts")),
-            "result": "identical" if identical else "divergent"}
-
-
-def _self(ctx, data):
-    try:
-        sample = int(data.get("sample", SELF_SAMPLE_DEFAULT))
-    except (TypeError, ValueError):
-        sample = SELF_SAMPLE_DEFAULT
-    sample = max(1, min(sample, SELF_SAMPLE_MAX))
-
-    function, name, why = _find_scorer()
-    if why:
-        return {"error": "engine_unavailable"}, 503
-
-    records, fetch_why = _fetch(ctx, "1=1 ORDER BY id DESC LIMIT ?", [sample])
-    if fetch_why:
-        return {"error": "cannot_replay", "message": fetch_why}, 400
-
-    identical = divergent = skipped = 0
-    divergent_hashes = []
-    started = time.time()
-    for record in records:
-        outcome = _compare(record, function)
-        if outcome["result"] == "identical":
-            identical += 1
-        elif outcome["result"] == "divergent":
-            divergent += 1
-            if len(divergent_hashes) < 10:
-                divergent_hashes.append(outcome["audit_hash"])
-        else:
-            skipped += 1
-
-    checked = identical + divergent
-    rate = round((identical / checked) * 100, 4) if checked else None
-    code_fingerprint, _p = _fingerprint_of(function)
-
-    body = {
-        "sampled": len(records), "replayable": checked,
-        "identical": identical, "divergent": divergent, "not_replayable": skipped,
-        "reproduction_rate_percent": rate,
-        "took_seconds": round(time.time() - started, 3),
-        "code_fingerprint": code_fingerprint,
-        "replay_version": VERSION,
-        "headline": ("%d of %d sealed decisions reproduce identically under the code deployed "
-                     "right now." % (identical, checked)) if checked else
-                    "Nothing replayable in this sample.",
-        "why_this_matters": "A platform whose scoring runs through a model call cannot do this "
-                            "at all. Reproducibility is a property of the architecture, not a "
-                            "feature that can be added later.",
-        "honest": "Divergences are counted here, not filtered out. A falling rate is the most "
-                  "useful thing this route can tell you.",
-        "independent_check": "Do not take our word for this - /x/replay/challenge lets you run "
-                             "your own inputs and repeat them whenever you like.",
-    }
-    if divergent_hashes:
-        body["divergent_receipts"] = divergent_hashes
-    return body, 200
-
-
-# ----------------------------------------------------------------------
-# fingerprint, keyed check, attest
-# ----------------------------------------------------------------------
-
-def _fingerprint(ctx):
-    function, name, why = _find_scorer()
-    if why:
-        return {"error": "engine_unavailable"}, 503
-    digest, problem = _fingerprint_of(function)
-    return {"code_fingerprint": digest, "problem": problem, "replay_version": VERSION,
-            "what_this_is": "A SHA-256 of the source of the code currently deciding. It commits "
-                            "to which version is running. It is one-way and discloses nothing "
-                            "about the logic, the weights or the thresholds.",
-            "what_it_is_for": "Sealed alongside verdicts via /x/replay/attest, so a change in "
-                              "behaviour can be attributed to a dated code change rather than "
-                              "looking like a fault - or hidden as one.",
-            "note": "The function name and signature are deliberately not published."}, 200
-
-
-def _check(ctx, data):
-    """Keyed. Re-runs one sealed decision and reports match or divergence."""
-    target = str(data.get("hash", data.get("receipt", ""))).strip().lower()
-    if not target:
-        return {"error": "hash_required"}, 400
-    records, why = _fetch(ctx, "audit_hash=? LIMIT 1", [target])
-    if why:
-        return {"error": "cannot_replay", "message": why}, 400
-    function, name, scorer_why = _find_scorer()
-    if scorer_why:
-        return {"error": "engine_unavailable"}, 503
-    outcome = _compare(records[0], function)
-    digest, _p = _fingerprint_of(function)
-    outcome.update({"code_fingerprint": digest, "replay_version": VERSION,
-                    "what_this_proves": "The sealed inputs were fed back through the live "
-                                        "decision function and the output compared with what "
-                                        "was sealed."})
-    return outcome, 200
-
-
-def _attest(ctx, api_key):
-    function, name, why = _find_scorer()
-    if why:
-        return {"error": "engine_unavailable"}, 503
-    digest, problem = _fingerprint_of(function)
-    if not digest:
-        return {"error": "no_fingerprint", "message": problem}, 503
-
-    now = time.time()
-    ev = {"user_id": "rep:" + digest[:16], "action": "code_fingerprint_sealed", "amount": 0,
-          "country": "UK", "device_id": "replay", "anomaly": 0, "device_risk": 0}
-    res = {"decision": "FINGERPRINT_SEALED", "score": 0, "replay_version": VERSION,
-           "fingerprint": digest, "detail": "fingerprint=%s" % digest}
+    external_summary = ";".join("%s=%s" % (e["source"], e["reference"][:60]) for e in external)
+    ev = {"user_id": "pub:" + digest[:16], "action": "publication_sealed", "amount": 0,
+          "country": "UK", "device_id": "publish", "anomaly": 0, "device_risk": 0}
+    res = {"decision": "PUBLICATION_SEALED", "score": 0, "publish_version": VERSION,
+           "url": url, "content_hash": digest, "bytes": len(body),
+           "http_status": status,
+           "detail": "url=%s;sha256=%s;bytes=%d%s"
+                     % (url, digest, len(body),
+                        ";external=" + external_summary if external_summary else "")}
     audit_hash, block_index, seq = ctx["seal"](ev, res, now, api_key)
 
     with ctx["lock"]:
-        ctx["conn"].execute("INSERT INTO replay_attest(api_key,fingerprint,function,taken,"
-                            "audit_hash,block_index) VALUES(?,?,?,?,?,?)",
-                            (api_key, digest, name, now, audit_hash, block_index))
+        ctx["conn"].execute(
+            "INSERT INTO publish_seal(api_key,url,content_hash,byte_length,http_status,"
+            "content_type,note,external,fetched,audit_hash,block_index) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (api_key, url, digest, len(body), status, content_type or None,
+             note or None,
+             "|".join("%s %s %s" % (e["source"], e["reference"], e["claimed_time"] or "")
+                      for e in external) or None,
+             now, audit_hash, block_index))
         ctx["conn"].commit()
 
-    return {"fingerprint": digest, "taken_at": _iso(now),
-            "sealed_in_chain": audit_hash, "block_index": block_index, "receipt_seq": seq,
-            "what_this_does": "Records which code was deciding at this moment, inside the chain "
-                              "the decisions are sealed in. Every verdict after this point is "
-                              "attributable to a known, timestamped version of the logic - "
-                              "without that logic being published.",
-            "do_this": "Attest on every deploy that touches scoring. A later divergence then "
-                       "reads as a dated policy change rather than an unexplained fault."}, 200
+    out = {
+        "url": url, "content_hash": digest, "bytes": len(body),
+        "http_status": status, "content_type": content_type,
+        "sealed_at": _iso(now),
+        "sealed_in_chain": audit_hash, "block_index": block_index, "receipt_seq": seq,
+        "version_number": len(prior) + 1,
+        "publish_version": VERSION,
+        "what_this_proves": "This exact content was served at this address when we fetched it, "
+                            "and the record of that cannot be altered afterwards.",
+        "what_it_does_not": "It does not prove the page existed earlier than this moment. "
+                            "Nothing can prove that after the fact - timestamps only run "
+                            "forwards. Seal at publication and the question never arises.",
+        "history": "/x/publish/history?url=" + url,
+        "verify_this_block": "/x/consistency/ancestor?tip=" + audit_hash,
+    }
+
+    if unchanged:
+        out["unchanged"] = True
+        out["first_sealed_in_this_form"] = _iso(first_of_this_version)
+        out["message"] = ("Identical to the last sealed version. The page has not changed since "
+                          "%s and now has an additional dated witness." % _iso(first_of_this_version))
+    elif prior:
+        out["changed"] = True
+        out["previous_hash"] = prior[-1][0]
+        out["previous_sealed_at"] = _iso(prior[-1][1])
+        out["message"] = ("The content has changed since the last seal. Both versions remain in "
+                          "the chain - a revision history the publisher cannot edit.")
+    else:
+        out["message"] = ("First seal for this address. Every later seal builds a permanent, "
+                          "dated revision history from here.")
+
+    if external:
+        out["external_references"] = external
+        out["external_caveat"] = ("Recorded exactly as supplied and sealed with the block. We do "
+                                  "not verify them and they are not our evidence - they are "
+                                  "somebody else's record, named so you can check them at "
+                                  "source.")
+    else:
+        out["advice"] = ("If this page was published before today, add external references - a "
+                         "GitHub push event, a Wayback snapshot - and they will be sealed "
+                         "alongside. Those carry an earlier date; a seal made now cannot.")
+    return out, 200
+
+
+# ----------------------------------------------------------------------
+# reading
+# ----------------------------------------------------------------------
+
+def _parse_external(blob):
+    if not blob:
+        return []
+    out = []
+    for line in blob.split("|"):
+        parts = line.strip().split(" ", 2)
+        if len(parts) >= 2:
+            out.append({"source": parts[0], "reference": parts[1],
+                        "claimed_time": parts[2] if len(parts) > 2 and parts[2] else None})
+    return out
+
+
+def _history(ctx, data):
+    url = str(data.get("url", "")).strip()
+    if not url:
+        return {"error": "url_required"}, 400
+    with ctx["lock"]:
+        rows = ctx["conn"].execute(
+            "SELECT content_hash,byte_length,fetched,audit_hash,block_index,note,external "
+            "FROM publish_seal WHERE url=? ORDER BY id ASC LIMIT 500", (url,)).fetchall()
+    if not rows:
+        return {"error": "never_sealed", "url": url,
+                "message": "No seal recorded for that address."}, 404
+
+    versions, last_hash = [], None
+    for content_hash, length, fetched, audit_hash, block_index, note, external in rows:
+        versions.append({
+            "content_hash": content_hash, "bytes": length,
+            "sealed_at": _iso(fetched), "sealed_in_chain": audit_hash,
+            "block_index": block_index, "note": note,
+            "changed_from_previous": last_hash is not None and content_hash != last_hash,
+            "external_references": _parse_external(external),
+        })
+        last_hash = content_hash
+
+    distinct = len({v["content_hash"] for v in versions})
+    return {"url": url, "seals": len(versions), "distinct_versions": distinct,
+            "first_sealed": versions[0]["sealed_at"], "latest_sealed": versions[-1]["sealed_at"],
+            "current_hash": versions[-1]["content_hash"],
+            "versions": versions,
+            "publish_version": VERSION,
+            "what_this_is": "A dated revision history the publisher cannot edit. Each version is "
+                            "its own block; altering or removing one breaks every block after it.",
+            "limit": "The first seal fixes an upper bound, not a lower one. Anything published "
+                     "before its first seal rests on external evidence, which is recorded here "
+                     "but not verified by us."}, 200
+
+
+def _verify(ctx, data):
+    url = str(data.get("url", "")).strip()
+    digest = str(data.get("hash", data.get("content_hash", ""))).strip().lower()
+    if not digest or not HEX64.match(digest):
+        return {"error": "hash_required",
+                "message": "sha256 of AILEASH-PUBLISH-v1: followed by the exact bytes served"}, 400
+
+    with ctx["lock"]:
+        if url:
+            rows = ctx["conn"].execute(
+                "SELECT url,fetched,audit_hash,block_index FROM publish_seal "
+                "WHERE url=? AND content_hash=? ORDER BY id ASC", (url, digest)).fetchall()
+        else:
+            rows = ctx["conn"].execute(
+                "SELECT url,fetched,audit_hash,block_index FROM publish_seal "
+                "WHERE content_hash=? ORDER BY id ASC", (digest,)).fetchall()
+
+    if not rows:
+        return {"sealed": False, "content_hash": digest, "url": url or None,
+                "message": "We hold no seal for that exact content. Either it was never sealed, "
+                           "or the content differs from what was - a single byte is enough."}, 404
+
+    return {"sealed": True, "content_hash": digest,
+            "url": rows[0][0], "times_sealed": len(rows),
+            "first_sealed": _iso(rows[0][1]),
+            "latest_sealed": _iso(rows[-1][1]),
+            "sealed_in_chain": rows[0][2], "block_index": rows[0][3],
+            "publish_version": VERSION,
+            "what_this_proves": "Content with exactly this fingerprint was served at that "
+                                "address no later than the first sealing time, and the record "
+                                "of it has not been altered since.",
+            "verify_the_block": "/x/consistency/ancestor?tip=" + rows[0][2]}, 200
+
+
+def _list(ctx):
+    with ctx["lock"]:
+        rows = ctx["conn"].execute(
+            "SELECT url,COUNT(*),MIN(fetched),MAX(fetched),COUNT(DISTINCT content_hash) "
+            "FROM publish_seal GROUP BY url ORDER BY MAX(fetched) DESC LIMIT 500").fetchall()
+    return {"count": len(rows),
+            "pages": [{"url": r[0], "seals": r[1], "first_sealed": _iso(r[2]),
+                       "latest_sealed": _iso(r[3]), "distinct_versions": r[4],
+                       "history": "/x/publish/history?url=" + r[0]} for r in rows],
+            "publish_version": VERSION,
+            "note": "Everything this platform has sealed about its own published pages. Ours is "
+                    "in here too - a publisher who seals everyone's pages but not their own is "
+                    "telling you something."}, 200
 
 
 def _spec():
     return {
-        "replay_version": VERSION,
-        "claim": "The same inputs produce the same verdict, and you can establish that yourself "
-                 "without an account and without seeing any of our logic.",
-        "the_logic_is_not_published": "No route here returns the scoring source, the weights, "
-                                      "the thresholds, the signal names or any intermediate "
-                                      "value. The only thing published is a SHA-256 of the "
-                                      "deployed source, which is one-way.",
-        "how_to_test_us": [
-            "POST /x/replay/challenge with any inputs object you like.",
-            "Keep the input_hash it returns.",
-            "Send the identical inputs again tomorrow, next month, next year, from anywhere.",
-            "GET /x/replay/history?input_hash=... to see every run, each sealed separately.",
-            "If the verdict ever moves under an unchanged code fingerprint, the engine is not "
-            "deterministic and you have proof of it that we cannot withdraw.",
-        ],
-        "why_black_box_is_stronger": "A published listing only shows what the code says. "
-                                     "Repeated challenge shows what production actually does, "
-                                     "over time, on inputs we did not choose.",
-        "what_breaks_determinism": [
-            "a wall-clock read inside the scoring path",
-            "iteration over an unordered structure",
-            "an unseeded random call",
-            "any model call in the decision path - which is why most platforms cannot do this",
-        ],
-        "what_this_does_not_prove": "That a decision was correct, or that the inputs were "
-                                    "honestly captured. Only that the same inputs still yield "
-                                    "the same output under known code. Determinism is not "
-                                    "fairness.",
-        "rate_limits": "Repeat submissions of inputs already seen are never limited - retesting "
-                       "is the point. Novel inputs are limited, because bulk novel inputs are "
-                       "how a decision boundary gets mapped rather than how a claim gets tested.",
+        "publish_version": VERSION,
+        "content_hash": "sha256('AILEASH-PUBLISH-v1:' || exact_bytes_served) as lowercase hex",
+        "no_normalisation": "The bytes are hashed exactly as served. Nothing is trimmed, "
+                            "reordered or cleaned up first - a whitespace-tolerant hash would "
+                            "be a hash of our opinion of the page rather than of the page.",
+        "reproduce_it": "curl the URL, pipe the raw bytes through sha256 with that prefix, and "
+                        "compare with what we sealed. If your bytes differ, the page changed.",
+        "what_a_seal_proves": "That content with this exact fingerprint was served at this "
+                              "address no later than the sealing time, and that the record has "
+                              "not been altered since - it is a chain block like any other, "
+                              "anchored externally and witnessed by peers.",
+        "what_it_cannot_prove": "That the page existed before the seal. Timestamps run forwards "
+                                "only. Any product implying otherwise is misdescribing what a "
+                                "timestamp is.",
+        "for_earlier_dates": {
+            "github_push": "api.github.com/repos/<owner>/<repo>/events - the push timestamp is "
+                           "recorded by GitHub, not the pusher, unlike commit author and "
+                           "committer dates which are settable fields. Retained around 90 days, "
+                           "so capture it while it exists.",
+            "wayback": "archive.org/wayback/available - an independent party with no stake in "
+                       "the dispute.",
+            "status": "Both are recorded and sealed as supplied, and neither is verified by us. "
+                      "They are somebody else's evidence, named so you can check them at source.",
+        },
+        "the_discipline": "Seal at publication. One call at the moment a page goes live means "
+                          "the publication date never rests on anyone's word, anyone's git "
+                          "history, or anyone's memory again.",
     }, 200
 
 
@@ -1739,814 +2597,21 @@ def handle(method, action, data, api_key, ctx):
     if method == "GET":
         if action == "spec":
             return _spec()
-        if action == "fingerprint":
-            return _fingerprint(ctx)
         if action == "history":
             return _history(ctx, data)
-        if action == "self":
-            return _self(ctx, data)
-        if action == "check":
-            if not api_key:
-                return {"error": "invalid_api_key"}, 401
-            return _check(ctx, data)
+        if action == "verify":
+            return _verify(ctx, data)
+        if action == "list":
+            return _list(ctx)
 
     if method == "POST":
-        if action == "challenge":
-            return _challenge(ctx, api_key, data)
         if not api_key:
             return {"error": "invalid_api_key"}, 401
-        if action == "attest":
-            return _attest(ctx, api_key)
+        if action == "seal":
+            return _seal(ctx, api_key, data)
 
     return {"error": "unknown_action", "action": action,
-            "GET": ["spec", "fingerprint", "history", "self", "check (keyed)"],
-            "POST": ["challenge", "attest (keyed)"]}, 404
-
-```
-
-
-## `modules/roster.py`
-
-537 lines, 21691 bytes
-
-```python
-"""
-modules/roster.py  v1.2  -  the canonical network list
-
-WHY
-    Witnessing runs on each operator's own machine. A new chain can join
-    the network and nobody else's server knows it exists, because nobody
-    told it. The result is a star with one operator in the middle, which
-    is the shape a witnessed log is supposed to avoid.
-
-    This publishes the list. Every peer, every tip URL, one public route.
-    A peer's sync reads it and witnesses everyone on it, including
-    whoever joined this morning.
-
-    It does not witness anything itself. It is a phone book.
-
-WHERE THE DATA COMES FROM
-    witness_log and witness_names, which witness.py already maintains,
-    plus signed_keys from signed.py where it exists. Nothing new is
-    recorded and no existing module changes. A chain appears here because
-    it submitted a tip, which is the same thing that binds its name today.
-
-WHAT MAKES THE LIST HONEST
-    Every entry carries its own evidence: when it was first and last
-    seen, how many observations, whether its name is bound to a host or
-    to a key, and whether it has gone quiet. Nothing is filtered out for
-    looking bad. A silent chain stays listed and is marked silent,
-    because hiding it would make the list a claim rather than a record.
-
-WHAT CHANGED IN 1.2, AND WHY
-    Two things, both prompted by peers reading their own entries.
-
-    1. THE STATUS WORDS NOW MEAN WHAT THE OTHER ROUTE MEANS.
-       /x/witness/peers has always used three bands - current under 6h,
-       stale from 6 to 48, silent beyond. This route used two, so the
-       same peer could read "silent" here and "stale" there in the same
-       minute, with no way to tell which was the real one. They now match,
-       and both publish what the bands mean.
-
-       The words describe elapsed time since we last recorded an
-       observation. Nothing else. A peer who publishes on a human
-       schedule rather than a timer reads stale between sessions, and
-       that is correct rather than a fault. It is never a claim that
-       anyone's endpoint was unavailable, and Philip Pinol (PRAXIS) had
-       to point that out from his own seat, which he should not have had
-       to do.
-
-    2. THE LIST NOW EXPLAINS ITS OWN VOCABULARY.
-       Entries carry liveness and name_status values written by
-       witness.py, and signed.py adds two more of them. Publishing a word
-       a reader cannot look up is the same failure as "confirmed" was:
-       the meaning lives somewhere else and does not travel with the
-       record. Every value this route can emit is now defined in the
-       response that emits it.
-
-ROUTES
-    GET  list      public   the roster. this is the one peers poll.
-    GET  spec      public   what this is and how to consume it
-    GET  health    public   one-line network summary
-"""
-
-import time
-
-VERSION = "1.2"
-
-PUBLIC = {("GET", "list"), ("GET", "spec"), ("GET", "health")}
-
-# Status bands, in hours. These MUST match witness.py's _peers, or the
-# same peer reads two different words about itself on two public routes.
-CURRENT_UNDER_HOURS = 6
-SILENT_AFTER_HOURS = 48
-
-# Our own entry, so a consumer of the roster does not have to be told
-# separately who publishes it.
-SELF_CHAIN = "sebbi.pro"
-SELF_TIP = "https://sebbi.pro/x/witness/tip"
-SELF_OBSERVE = "https://sebbi.pro/x/witness/observe"
-SELF_SIGNED = "https://sebbi.pro/x/signed/submit"
-
-# Every value this route can publish, and what it means. A word that
-# leaves here without its meaning attached is the same mistake as
-# "confirmed", one field over.
-LIVENESS_VOCABULARY = {
-    "self-consistent":
-        "The url the submitter gave served exactly the tip the submitter "
-        "sent. Both halves came from the submitter, so this records "
-        "self-consistency - NOT verification by us or any third party.",
-    "confirmed":
-        "The same check as self-consistent, under the name used before "
-        "witness v1.2. Sealed blocks cannot be altered, so older records "
-        "still carry the original word.",
-    "live":
-        "The url served a valid but different tip. A chain that moves "
-        "between submitting and our fetching is the normal case, not a "
-        "failure.",
-    "self-declared":
-        "No url, or we could not reach it. Taken on the submitter's word "
-        "and checked by nobody.",
-    "peer-signed":
-        "Submitted through /x/signed/submit and verified against an "
-        "Ed25519 public key the submitter enrolled. We hold only the "
-        "public half, so we could not have produced that signature. This "
-        "is the only value on this list that excludes us as well as third "
-        "parties.",
-    "self":
-        "This deployment's own entry. Not a check of anything.",
-    "unchecked":
-        "Recorded before liveness checking existed.",
-}
-
-NAME_VOCABULARY = {
-    "first-use":
-        "First time this name was seen with a reachable url, so the name "
-        "is now bound to it network-wide. A later submission under this "
-        "name from a different address records as conflict, permanently.",
-    "bound":
-        "Submitted from the same url this name was first bound to. Same "
-        "operator, consistently.",
-    "conflict":
-        "This name has been submitted from a different address than the "
-        "one it was first bound to. Not proof of theft - operators move "
-        "hosts - but it is the event an auditor needs to see.",
-    "unbound":
-        "No reachable url, so there is nothing to bind this name to. An "
-        "unbound name stays claimable by whoever submits it next WITH a "
-        "reachable url.",
-    "key-bound":
-        "This name is bound to an Ed25519 public key rather than to a "
-        "host address. Only the holder of the matching private key can "
-        "submit under it, and that holder is not us.",
-    "publisher":
-        "The deployment publishing this roster.",
-    "unchecked":
-        "Recorded before name binding existed.",
-}
-
-STATUS_VOCABULARY = {
-    "current": "observed within the last %dh" % CURRENT_UNDER_HOURS,
-    "stale": "last observed between %dh and %dh ago"
-             % (CURRENT_UNDER_HOURS, SILENT_AFTER_HOURS),
-    "silent": "not observed for more than %dh" % SILENT_AFTER_HOURS,
-    "unknown": "we hold no usable timestamp for this entry",
-    "read_this": "These describe elapsed time since we last recorded an "
-                 "observation, and nothing else. A peer that publishes on "
-                 "a human schedule rather than from an always-on timer "
-                 "will read stale between sessions, correctly. It is not "
-                 "a claim that anyone's endpoint was unavailable, and it "
-                 "is not a judgement about anyone.",
-}
-
-
-def _epoch(ts):
-    """
-    Accept either a unix number or an ISO-8601 string. witness.py stores
-    ISO strings; other tables store floats. Guessing wrong here silently
-    turned every peer's status into 'unknown', so it takes both.
-    """
-    if ts is None:
-        return None
-    if isinstance(ts, (int, float)):
-        return float(ts)
-    s = str(ts).strip()
-    if not s:
-        return None
-    try:
-        return float(s)
-    except ValueError:
-        pass
-    try:
-        import datetime
-        t = s.replace("Z", "+00:00")
-        return datetime.datetime.fromisoformat(t).timestamp()
-    except Exception:
-        return None
-
-
-def _iso(ts):
-    e = _epoch(ts)
-    if e is None:
-        return None
-    try:
-        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(e))
-    except Exception:
-        return None
-
-
-def _cols(conn, table):
-    try:
-        return [r[1] for r in conn.execute(
-            "PRAGMA table_info(%s)" % table).fetchall()]
-    except Exception:
-        return []
-
-
-def _status_for(hours):
-    if hours is None:
-        return "unknown"
-    if hours <= CURRENT_UNDER_HOURS:
-        return "current"
-    if hours <= SILENT_AFTER_HOURS:
-        return "stale"
-    return "silent"
-
-
-def _signed_keys(ctx):
-    """
-    Which names have enrolled an Ed25519 key with signed.py.
-
-    Defensive on purpose: signed.py may not be deployed, in which case
-    the table does not exist and every entry simply reports no key. This
-    module must never be the reason a deploy breaks.
-    """
-    keys = {}
-    try:
-        rows = ctx["conn"].execute(
-            "SELECT peer, pubkey, rotations FROM signed_keys").fetchall()
-        for peer, pubkey, rotations in rows:
-            if peer:
-                keys[peer.strip()] = {"pubkey": pubkey,
-                                      "rotations": rotations or 0}
-    except Exception:
-        pass
-    return keys
-
-
-def _gather(ctx):
-    """
-    Read whatever witness.py has. Written defensively: this module must
-    never be the reason a deploy breaks, so a missing table or column
-    degrades to a shorter list rather than a 500.
-    """
-    conn = ctx["conn"]
-    now = time.time()
-    out = {}
-
-    cols = _cols(conn, "witness_log")
-    if not cols:
-        return out
-
-    chain_col = None
-    for c in ("chain", "peer", "chain_name", "name"):
-        if c in cols:
-            chain_col = c
-            break
-    if not chain_col:
-        return out
-
-    # witness.py calls this "observed" and stores an epoch float.
-    # Other tables have used "ts". Try the real names in order.
-    ts_col = None
-    for c in ("observed", "ts", "seen", "peer_ts"):
-        if c in cols:
-            ts_col = c
-            break
-    url_col = "url" if "url" in cols else None
-    live_col = "liveness" if "liveness" in cols else None
-    name_col = "name_status" if "name_status" in cols else None
-
-    sel = [chain_col]
-    for c in (ts_col, url_col, live_col, name_col):
-        sel.append(c if c else "NULL")
-
-    try:
-        rows = conn.execute(
-            "SELECT %s FROM witness_log ORDER BY rowid" % ", ".join(sel)
-        ).fetchall()
-    except Exception:
-        return out
-
-    for r in rows:
-        chain = (r[0] or "").strip()
-        if not chain:
-            continue
-        e = out.setdefault(chain, {
-            "chain": chain, "observations": 0, "first_seen": None,
-            "last_seen": None, "url": None, "liveness": None,
-            "name_status": None,
-        })
-        e["observations"] += 1
-        ts = _epoch(r[1])
-        if ts is not None:
-            if e["first_seen"] is None or ts < e["first_seen"]:
-                e["first_seen"] = ts
-            if e["last_seen"] is None or ts > e["last_seen"]:
-                e["last_seen"] = ts
-        if r[2]:
-            e["url"] = r[2]
-        if r[3]:
-            e["liveness"] = r[3]
-        if r[4]:
-            e["name_status"] = r[4]
-
-    for e in out.values():
-        last = e["last_seen"]
-        hours = ((now - last) / 3600.0) if last else None
-        e["hours_since"] = round(hours, 1) if hours is not None else None
-        e["status"] = _status_for(hours)
-    return out
-
-
-def _entries(ctx):
-    peers = _gather(ctx)
-    keys = _signed_keys(ctx)
-    now = time.time()
-
-    listed = []
-    for chain, e in sorted(peers.items(), key=lambda kv: kv[0]):
-        entry = {
-            "chain": e["chain"],
-            "tip_url": e["url"],
-            "observations": e["observations"],
-            "first_seen": _iso(e["first_seen"]),
-            "last_seen": _iso(e["last_seen"]),
-            "hours_since": e["hours_since"],
-            "status": e["status"],
-            "liveness": e["liveness"],
-            "name_status": e["name_status"],
-            "witnessable": bool(e["url"]),
-        }
-        key = keys.get(chain)
-        if key:
-            # A peer with an enrolled key can be submitted for by nobody
-            # but the keyholder. Worth surfacing on the list a regulator
-            # or a buyer actually reads.
-            entry["signing_key"] = {
-                "algorithm": "ed25519",
-                "pubkey": key["pubkey"],
-                "rotations": key["rotations"],
-                "means": "Only the holder of the matching private key can "
-                         "submit under this name. This deployment holds "
-                         "the public half only and cannot sign for them.",
-                "verify_at": "/x/signed/keys",
-            }
-        listed.append(entry)
-
-    listed.insert(0, {
-        "chain": SELF_CHAIN,
-        "tip_url": SELF_TIP,
-        "observations": None,
-        "first_seen": None,
-        "last_seen": _iso(now),
-        "hours_since": 0,
-        "status": "current",
-        "liveness": "self",
-        "name_status": "publisher",
-        "witnessable": True,
-        "note": "The publisher of this roster. Listed so a consumer does "
-                "not have to be told separately who to witness.",
-    })
-    return listed
-
-
-def _used_vocabulary(entries):
-    """
-    Only define the words actually present in this response, plus a
-    pointer to the full set. A legend listing values nobody has used
-    reads as padding; a value with no definition is the failure this
-    version exists to fix.
-    """
-    live = {}
-    names = {}
-    stats = {}
-    for e in entries:
-        v = e.get("liveness")
-        if v:
-            live[v] = LIVENESS_VOCABULARY.get(
-                v, "Undefined in roster v%s. If you are reading this, the "
-                   "word was introduced by another module and this route "
-                   "has not been told what it means - treat it as "
-                   "unexplained rather than as a claim." % VERSION)
-        n = e.get("name_status")
-        if n:
-            names[n] = NAME_VOCABULARY.get(
-                n, "Undefined in roster v%s - see above." % VERSION)
-        s = e.get("status")
-        if s:
-            stats[s] = STATUS_VOCABULARY.get(s, "")
-    stats["read_this"] = STATUS_VOCABULARY["read_this"]
-    return {"liveness": live, "name_status": names, "status": stats}
-
-
-def _list(ctx):
-    entries = _entries(ctx)
-    usable = [e for e in entries if e["witnessable"]]
-    signed = [e for e in entries if e.get("signing_key")]
-    return {
-        "ok": True,
-        "roster_version": VERSION,
-        "generated": _iso(time.time()),
-        "submit_to": SELF_OBSERVE,
-        "submit_signed_to": SELF_SIGNED,
-        "count": len(entries),
-        "witnessable": len(usable),
-        "stale": len([e for e in entries if e["status"] == "stale"]),
-        "silent": len([e for e in entries if e["status"] == "silent"]),
-        "with_signing_key": len(signed),
-        "peers": entries,
-        "vocabulary": _used_vocabulary(entries),
-        "what_this_list_is":
-            "Parties that have submitted a tip to this deployment. That is "
-            "all it records. It is not a membership list, not a set of "
-            "partners, and not participants in anything AILeash is building. "
-            "Being listed implies no relationship beyond having sent a hash, "
-            "and no endorsement of anything sealed in anyone else's chain "
-            "including ours. A party appears here because they posted to an "
-            "open endpoint; they did not join anything and were not asked to "
-            "agree to anything.",
-        "how_to_use":
-            "Poll this route on your own schedule. For every entry with "
-            "witnessable=true, fetch tip_url, seal the tip in your own "
-            "chain, and POST your tip to their submit endpoint. A chain "
-            "that joins tomorrow appears here and gets picked up on your "
-            "next cycle with nothing to configure.",
-        "note":
-            "Chains that have gone quiet stay listed and are marked stale "
-            "or silent. Removing them would make this a claim rather than "
-            "a record. An entry with witnessable=false has never bound a "
-            "url and cannot be fetched from. Read the status vocabulary "
-            "before drawing a conclusion from either word - they measure "
-            "elapsed time and nothing else.",
-    }, 200
-
-
-def _health(ctx):
-    entries = _entries(ctx)
-    others = [e for e in entries if e["chain"] != SELF_CHAIN]
-    current = [e for e in others if e["status"] == "current"]
-    return {
-        "ok": True,
-        "chains_listed": len(entries),
-        "submitting_currently": len(current),
-        "stale": len([e for e in others if e["status"] == "stale"]),
-        "silent": len([e for e in others if e["status"] == "silent"]),
-        "with_signing_key": len([e for e in others if e.get("signing_key")]),
-        "status_vocabulary": STATUS_VOCABULARY,
-        "what_this_counts":
-            "Parties that have submitted a tip to this deployment, and how "
-            "recently. Nothing more.",
-        "what_this_does_not_tell_you": [
-            "Whether any of these parties witness each other. They may not. "
-            "Ask them, or read their own rosters.",
-            "Whether any of them has agreed to anything, with us or with "
-            "each other.",
-            "Whether the records behind any of these tips are true.",
-            "Whether a peer was reachable. A stale or silent entry means we "
-            "have not recorded an observation recently, which is a fact "
-            "about this list and not about their infrastructure.",
-        ],
-    }, 200
-
-
-def _spec():
-    return {
-        "module": "roster",
-        "version": VERSION,
-        "what": "A list of parties that have submitted a tip to this "
-                "deployment, with the tip URL each supplied.",
-        "what_it_is_not":
-            "Not a membership list. Not a set of partners, adopters, "
-            "validators or participants in anything AILeash is building. "
-            "Appearing here means a party posted a hash to an open endpoint. "
-            "It implies no agreement, no relationship and no endorsement in "
-            "any direction. Two surfaces, two separate things: being sealed "
-            "in the chain, and being named on this list. Neither is consent "
-            "to the other.",
-        "why":
-            "Witnessing runs on each operator's own machine, so a server "
-            "only witnesses chains it has been told about. Without a "
-            "shared list, every new joiner connects to whoever invited "
-            "them and the network becomes a star with one operator in "
-            "the middle. This route is the list, so a peer's sync can "
-            "witness everybody instead of just its introducer.",
-        "routes": {
-            "GET list": "public. the roster. poll this.",
-            "GET health": "public. one-line network summary.",
-            "GET spec": "public. this document.",
-        },
-        "entry_fields": {
-            "chain": "the chain's name as it submitted it",
-            "tip_url": "where to fetch their current tip. null if they "
-                       "have never bound one.",
-            "witnessable": "true when tip_url is present",
-            "status": "current, stale, silent or unknown - see "
-                      "status_vocabulary. Matches the bands on "
-                      "/x/witness/peers.",
-            "observations": "how many tips they have submitted to us",
-            "liveness": "as recorded at submission - see "
-                        "liveness_vocabulary for every possible value",
-            "name_status": "as recorded at submission - see "
-                           "name_vocabulary for every possible value",
-            "signing_key": "present only when the chain has enrolled an "
-                           "Ed25519 public key at /x/signed/enroll. When "
-                           "present, submissions under that name are "
-                           "verified against a key this deployment does "
-                           "not hold.",
-        },
-        "liveness_vocabulary": LIVENESS_VOCABULARY,
-        "name_vocabulary": NAME_VOCABULARY,
-        "status_vocabulary": STATUS_VOCABULARY,
-        "joining": {
-            "open": "POST a tip to %s with {\"chain\", \"tip\", \"url\"}. "
-                    "No account, no key. The url field is what makes you "
-                    "witnessable by everyone else, so do not omit it."
-                    % SELF_OBSERVE,
-            "signed": "If you would rather nobody - including the operator "
-                      "of this deployment - be able to submit under your "
-                      "name, enrol an Ed25519 public key at "
-                      "/x/signed/enroll and submit at %s. You keep the "
-                      "private key. See /x/signed/spec." % SELF_SIGNED,
-        },
-        "what_this_does_not_do": [
-            "It does not witness anything. It is a phone book.",
-            "It does not establish that anyone listed is a peer of anyone "
-            "else listed, or of us.",
-            "It does not prove a listed chain is honest, only that it "
-            "submitted to us and when.",
-            "It cannot make another operator witness you. Their server "
-            "decides that. This only makes sure they know you exist.",
-            "It reflects submissions to this deployment. Another node "
-            "publishing its own roster may list a different set.",
-            "The status word is not a statement about anyone's uptime. It "
-            "is elapsed time since our last recorded observation.",
-        ],
-        "drop_in":
-            "meshwitness.py reads this route and witnesses every entry on "
-            "it. Standard library, one file, one cron line.",
-    }
-
-
-def handle(method, action, data, api_key, ctx):
-    if action == "spec":
-        return _spec(), 200
-    if action == "health":
-        return _health(ctx)
-    if action in ("list", "", "status"):
-        return _list(ctx)
-    return {"ok": False, "error": "unknown_action", "action": action}, 404
-
-```
-
-
-## `modules/router.py`
-
-234 lines, 7196 bytes
-
-```python
-"""
-Module router - /x/<module>/<action>
-
-Dispatches to modules/<module>.py, which exposes:
-
-    def handle(method, action, data, api_key, ctx): return payload, status
-
-A module may declare PUBLIC = {("GET","attest"), ...} for routes that need no
-API key. Default is closed - a route has to be opted open deliberately.
-
-RATE LIMITING
--------------
-Authenticated routes reuse the server's own check_rate (60/min, 1000/hour per
-key), so module traffic counts against the same budget as /api/govern rather
-than sitting outside it.
-
-Public routes have no key to meter, so they are metered per client address on
-a deliberately tighter budget. Without this, an unauthenticated endpoint is an
-open invitation. The window store is bounded and self-pruning.
-
-PAYLOAD CAP
------------
-Module bodies are capped. Nothing here needs a megabyte of JSON, and an
-uncapped body on a public route is a memory exhaustion vector.
-
-POST SUPPORT WITHOUT EDITING server.py
---------------------------------------
-server.py has an /x/ branch in do_GET but not in do_POST, so POST routes
-return the server's 404. The correct fix is four lines in do_POST. This is
-the fix for when that is not practical.
-
-On first import, this module patches Handler.do_POST to check for /x/ before
-falling through to the original. The patch is idempotent, keeps the original
-behaviour for every other path, and reverts on restart because it lives in
-memory rather than on disk.
-
-The catch, stated plainly: a module is only imported when a request reaches
-the router, and the only working entry point is do_GET. So after every deploy
-the first /x/ request must be a GET - after that, POST works until the next
-restart. Anything hitting /x/ with a GET does it, including a browser.
-
-This is a workaround for an editing constraint, not good architecture. If the
-four lines ever go into do_POST, this patch detects the branch is already
-there and does nothing.
-"""
-
-import importlib, json, sys, time
-from collections import defaultdict, deque
-
-VERSION = "3.2"
-
-MAX_BODY_KEYS = 200
-MAX_BODY_CHARS = 200000
-
-PUBLIC_PER_MIN = 30
-PUBLIC_PER_HOUR = 300
-_ip_wins = defaultdict(lambda: {"min": deque(), "hour": deque()})
-_ip_last_prune = [0.0]
-
-_c = {}
-_patched = [False]
-
-
-def _install_post(s):
-    """Add an /x/ branch to do_POST at runtime. Idempotent and reversible."""
-    if _patched[0]:
-        return "already installed"
-    H = getattr(s, "Handler", None)
-    if H is None or not hasattr(H, "do_POST"):
-        return "no handler"
-    if getattr(H, "_x_post_patched", False):
-        _patched[0] = True
-        return "already installed"
-    original = H.do_POST
-
-    def do_POST(self):
-        try:
-            from urllib.parse import urlparse
-            p = urlparse(self.path).path
-        except Exception:
-            p = self.path or ""
-        if p.startswith("/x/"):
-            try:
-                body = s.read_body(self)
-            except Exception:
-                body = {}
-            payload, status = route(self, p, body)
-            s.send_json(self, payload, status)
-            return
-        return original(self)
-
-    H.do_POST = do_POST
-    H._x_post_patched = True
-    _patched[0] = True
-    print("ROUTER: /x/ POST branch installed at runtime", flush=True)
-    return "installed"
-
-
-def _srv():
-    m = sys.modules.get("__main__")
-    if hasattr(m, "get_bearer"):
-        return m
-    return sys.modules.get("server")
-
-
-def _load(name):
-    m = _c.get(name)
-    if m is None:
-        m = importlib.import_module("modules." + name)
-        _c[name] = m
-    return m
-
-
-def _client(h):
-    """Prefer the forwarded address - behind a proxy the socket address is
-    the proxy, which would meter every visitor as one client."""
-    try:
-        xff = h.headers.get("X-Forwarded-For", "")
-        if xff:
-            return xff.split(",")[0].strip()[:64]
-    except Exception:
-        pass
-    try:
-        return str(h.client_address[0])[:64]
-    except Exception:
-        return "unknown"
-
-
-def _prune_ips(t):
-    if t - _ip_last_prune[0] < 300:
-        return
-    _ip_last_prune[0] = t
-    dead = [k for k, w in _ip_wins.items()
-            if (not w["hour"]) or w["hour"][-1] < t - 3600]
-    for k in dead:
-        del _ip_wins[k]
-
-
-def _check_ip(ip):
-    t = time.time()
-    _prune_ips(t)
-    w = _ip_wins[ip]
-    while w["min"] and w["min"][0] < t - 60:
-        w["min"].popleft()
-    while w["hour"] and w["hour"][0] < t - 3600:
-        w["hour"].popleft()
-    if len(w["min"]) >= PUBLIC_PER_MIN:
-        return False, "rate_limit_minute"
-    if len(w["hour"]) >= PUBLIC_PER_HOUR:
-        return False, "rate_limit_hour"
-    w["min"].append(t)
-    w["hour"].append(t)
-    return True, None
-
-
-def _too_big(data):
-    if not isinstance(data, dict):
-        return False
-    if len(data) > MAX_BODY_KEYS:
-        return True
-    try:
-        return len(json.dumps(data)) > MAX_BODY_CHARS
-    except Exception:
-        return True
-
-
-def route(h, path, data):
-    try:
-        s = _srv()
-        if s is None:
-            return {"error": "server_not_found"}, 500
-
-        if not _patched[0]:
-            try:
-                _install_post(s)
-            except Exception as _e:
-                print("ROUTER: post patch failed - " + str(_e), flush=True)
-
-        parts = [x for x in path.strip("/").split("/") if x]
-        if len(parts) < 2:
-            return {"error": "bad_path",
-                    "expected": "/x/<module>/<action>"}, 404
-        name = parts[1]
-        act = parts[2] if len(parts) > 2 else ""
-
-        if isinstance(data, dict) and data and isinstance(list(data.values())[0], list):
-            data = {k: v[0] for k, v in data.items()}
-
-        if _too_big(data):
-            return {"error": "payload_too_large",
-                    "limit_chars": MAX_BODY_CHARS,
-                    "limit_keys": MAX_BODY_KEYS}, 413
-
-        try:
-            m = _load(name)
-        except Exception:
-            return {"error": "unknown_module", "module": name}, 404
-        if not hasattr(m, "handle"):
-            return {"error": "module_has_no_handle"}, 500
-
-        method = h.command
-        public = getattr(m, "PUBLIC", set())
-        is_public = (method, act) in public or (method, "") in public
-
-        a = s.get_bearer(h)
-
-        if is_public:
-            if a and not s.get_key(a):
-                a = None
-            if not a:
-                ok, why = _check_ip(_client(h))
-                if not ok:
-                    return {"error": why,
-                            "message": "Public endpoints are rate limited per client. Use an API key for the normal budget."}, 429
-        else:
-            if not a or not s.get_key(a):
-                return {"error": "invalid_api_key"}, 401
-
-        if a:
-            try:
-                ok, why = s.check_rate(a)
-                if not ok:
-                    return {"error": why}, 429
-            except Exception:
-                pass
-
-        ctx = {"conn": s._conn, "lock": s._db_lock,
-               "seal": s.seal, "get_key": s.get_key}
-        return m.handle(method, act, data, a, ctx)
-
-    except Exception as e:
-        print("ROUTER ERR: " + str(e), flush=True)
-        return {"error": "router_failed", "detail": str(e)}, 500
+            "GET": ["spec", "history", "verify", "list"],
+            "POST": ["seal (keyed)"]}, 404
 
 ```
