@@ -2,10 +2,10 @@
 
 Contains:
 - `modules/_ _ i n i t _ _ . p y`
+- `modules/bind.py`
 - `modules/capture.py`
 - `modules/codebase.py`
 - `modules/complete.py`
-- `modules/conformance.py`
 
 
 ## `modules/_ _ i n i t _ _ . p y`
@@ -14,6 +14,497 @@ Contains:
 
 ```
 # makes this folder a python package
+
+```
+
+
+## `modules/bind.py`
+
+483 lines, 21914 bytes
+
+```python
+#!/usr/bin/env python3
+"""
+modules/bind.py  -  the signed lane
+
+WHY THIS EXISTS
+---------------
+Name binding used to depend on a fetcher reaching a URL and parsing JSON out
+of it. Three things were wrong with that and a reviewer found all three:
+
+  - a page that is reachable but serves HTML does not bind, and the platform
+    described it as if it did
+  - a name with no binding is claimable by anybody, so a peer who followed
+    that description was left one submission away from being squatted
+  - the failure text asserted the URL was unreachable, when all the check had
+    established was that the response was not JSON. Reachability and
+    parseability are two different facts and conflating them put a false
+    statement in a sealed block
+
+This module removes the fetcher from the trust path entirely.
+
+A peer signs their own submission with a credential. Binding then rests on
+possession of a secret rather than on my crawler reaching anything, parsing
+anything, or on my description of what happens when it cannot. Nobody has to
+stand up an endpoint whose only purpose is to satisfy someone else's fetcher.
+
+WHAT A SIGNED BINDING PROVES, EXACTLY
+-------------------------------------
+That whoever submitted holds the credential issued for that name, on the date
+it was issued, and that the submission has not been altered since signing.
+
+WHAT IT DOES NOT PROVE
+----------------------
+That they own the domain. That they are who the name suggests. That anything
+in their chain is true. A credential is a shared secret between two parties
+and nothing more - it makes a name unstealable, not a claim honest. Domain
+control is a separate check this module does not perform and does not imply.
+
+    POST /x/bind/issue      issue a credential for a name   (operator key)
+    POST /x/bind/claim      seal a dated claim marker       (operator key)
+    POST /x/bind/revoke     revoke a credential             (operator key)
+    POST /x/bind/submit     signed tip submission           (signature only)
+    GET  /x/bind/name       binding state and history       (public)
+    GET  /x/bind/conflicts  every contested name            (public)
+    GET  /x/bind/spec       how to sign, in full            (public)
+"""
+
+import hashlib
+import hmac
+import json
+import secrets
+import time
+from datetime import datetime, timezone
+
+VERSION = "1.0"
+
+PUBLIC = {("GET", "name"), ("GET", "conflicts"), ("GET", "spec")}
+
+SIG_PREFIX = b"AILEASH-BIND-v1:"
+CLOCK_SKEW = 300          # seconds either side that a signature stays valid
+NONCE_KEEP = 3600         # how long a used nonce is remembered
+
+_ready = False
+
+
+def _setup(ctx):
+    global _ready
+    if _ready:
+        return
+    with ctx["lock"]:
+        c = ctx["conn"]
+        c.execute("CREATE TABLE IF NOT EXISTS bind_credential("
+                  "key_id TEXT PRIMARY KEY,name TEXT NOT NULL,secret TEXT NOT NULL,"
+                  "issued_to TEXT,issued REAL,revoked REAL,revoke_reason TEXT,"
+                  "audit_hash TEXT,block_index INTEGER)")
+        c.execute("CREATE TABLE IF NOT EXISTS bind_claim("
+                  "id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,"
+                  "claimant TEXT,claimed_at REAL,note TEXT,"
+                  "audit_hash TEXT,block_index INTEGER)")
+        c.execute("CREATE TABLE IF NOT EXISTS bind_submission("
+                  "id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,"
+                  "tip TEXT,key_id TEXT,ts REAL,nonce TEXT,"
+                  "audit_hash TEXT,block_index INTEGER)")
+        c.execute("CREATE TABLE IF NOT EXISTS bind_nonce("
+                  "nonce TEXT PRIMARY KEY,ts REAL)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_bind_name ON bind_submission(name)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_bind_claim ON bind_claim(name)")
+        c.commit()
+    _ready = True
+
+
+def _iso(ts):
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat() if ts else None
+
+
+def _canon(o):
+    return json.dumps(o, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _clean_name(n):
+    n = str(n or "").strip().lower()[:120]
+    return "".join(ch for ch in n if ch.isalnum() or ch in ".-_/:")
+
+
+def _sig(secret, name, tip, ts, nonce):
+    material = SIG_PREFIX + _canon({"name": name, "tip": tip,
+                                    "ts": int(ts), "nonce": nonce}).encode("utf-8")
+    return hmac.new(bytes.fromhex(secret), material, hashlib.sha256).hexdigest()
+
+
+# ----------------------------------------------------------------------
+
+def _issue(ctx, api_key, data):
+    name = _clean_name(data.get("name"))
+    if not name:
+        return {"error": "name_required"}, 400
+    to = str(data.get("issued_to", "")).strip()[:200] or None
+
+    with ctx["lock"]:
+        live = ctx["conn"].execute(
+            "SELECT key_id FROM bind_credential WHERE name=? AND revoked IS NULL",
+            (name,)).fetchone()
+    if live and not data.get("replace"):
+        return {"error": "credential_already_issued", "name": name,
+                "key_id": live[0],
+                "message": "A live credential exists for this name. Send "
+                           "replace true to revoke it and issue another, which "
+                           "is itself sealed."}, 409
+
+    secret = secrets.token_hex(32)
+    key_id = "bk_" + secrets.token_hex(8)
+    now = time.time()
+
+    ev = {"user_id": "bind:" + name[:40], "action": "credential_issued",
+          "amount": 0, "country": "UK", "device_id": "bind",
+          "anomaly": 0, "device_risk": 0}
+    res = {"decision": "CREDENTIAL_ISSUED", "score": 0, "bind_version": VERSION,
+           "name": name, "key_id": key_id, "issued_to": to,
+           "secret_sealed": False,
+           "detail": "name=%s;key_id=%s;issued_to=%s" % (name, key_id, to)}
+    h, idx, seq = ctx["seal"](ev, res, now, api_key)
+
+    with ctx["lock"]:
+        if live:
+            ctx["conn"].execute(
+                "UPDATE bind_credential SET revoked=?, revoke_reason=? "
+                "WHERE key_id=?", (now, "replaced by " + key_id, live[0]))
+        ctx["conn"].execute(
+            "INSERT INTO bind_credential(key_id,name,secret,issued_to,issued,"
+            "audit_hash,block_index) VALUES(?,?,?,?,?,?,?)",
+            (key_id, name, secret, to, now, h, idx))
+        ctx["conn"].commit()
+
+    return {"name": name, "key_id": key_id, "secret": secret,
+            "issued_to": to, "issued_at": _iso(now),
+            "sealed_in_chain": h, "block_index": idx, "receipt_seq": seq,
+            "send_this_once": ("The secret is shown here and nowhere else. It "
+                               "is not sealed into the chain and cannot be "
+                               "recovered - if it is lost, revoke and reissue."),
+            "how_to_sign": "/x/bind/spec",
+            "what_it_proves": ("Possession of this secret. It does not prove "
+                               "domain ownership and this platform does not "
+                               "check that."),
+            "replaced": live[0] if live else None}, 200
+
+
+def _claim(ctx, api_key, data):
+    """A dated marker, for a name that cannot yet be bound.
+
+    This does not bind anything. It puts the claim in the chain at a known
+    time, so a later competing submission is provably second and the conflict
+    is on the public record rather than being settled privately by whoever
+    runs the platform.
+    """
+    name = _clean_name(data.get("name"))
+    claimant = str(data.get("claimant", "")).strip()[:200]
+    if not name or not claimant:
+        return {"error": "name_and_claimant_required"}, 400
+    note = str(data.get("note", "")).strip()[:500] or None
+    now = time.time()
+
+    ev = {"user_id": "bind:" + name[:40], "action": "name_claimed", "amount": 0,
+          "country": "UK", "device_id": "bind", "anomaly": 0, "device_risk": 0}
+    res = {"decision": "NAME_CLAIMED", "score": 0, "bind_version": VERSION,
+           "name": name, "claimant": claimant, "note": note,
+           "detail": "name=%s;claimant=%s" % (name, claimant)}
+    h, idx, seq = ctx["seal"](ev, res, now, api_key)
+
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "INSERT INTO bind_claim(name,claimant,claimed_at,note,audit_hash,"
+            "block_index) VALUES(?,?,?,?,?,?)",
+            (name, claimant, now, note, h, idx))
+        ctx["conn"].commit()
+
+    return {"name": name, "claimant": claimant, "claimed_at": _iso(now),
+            "sealed_in_chain": h, "block_index": idx, "receipt_seq": seq,
+            "what_this_is": ("A dated marker, not a binding. Anyone can still "
+                             "submit under this name - but their block is "
+                             "provably later than this one, and the conflict "
+                             "is public."),
+            "what_this_is_not": ("Proof that the claimant owns the name, and "
+                                 "not a substitute for a credential. Issue one "
+                                 "at /x/bind/issue and the name stops being "
+                                 "claimable at all.")}, 200
+
+
+def _revoke(ctx, api_key, data):
+    key_id = str(data.get("key_id", "")).strip()
+    if not key_id:
+        return {"error": "key_id_required"}, 400
+    reason = str(data.get("reason", "")).strip()[:300] or "not stated"
+    now = time.time()
+
+    with ctx["lock"]:
+        row = ctx["conn"].execute(
+            "SELECT name, revoked FROM bind_credential WHERE key_id=?",
+            (key_id,)).fetchone()
+    if not row:
+        return {"error": "unknown_key_id"}, 404
+    if row[1]:
+        return {"error": "already_revoked", "revoked_at": _iso(row[1])}, 409
+
+    ev = {"user_id": "bind:" + row[0][:40], "action": "credential_revoked",
+          "amount": 0, "country": "UK", "device_id": "bind", "anomaly": 0,
+          "device_risk": 1}
+    res = {"decision": "CREDENTIAL_REVOKED", "score": 0, "name": row[0],
+           "key_id": key_id, "reason": reason,
+           "detail": "key_id=%s;reason=%s" % (key_id, reason)}
+    h, idx, _ = ctx["seal"](ev, res, now, api_key)
+
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "UPDATE bind_credential SET revoked=?, revoke_reason=? WHERE key_id=?",
+            (now, reason, key_id))
+        ctx["conn"].commit()
+
+    return {"key_id": key_id, "name": row[0], "revoked_at": _iso(now),
+            "reason": reason, "sealed_in_chain": h,
+            "note": "Submissions already bound stay bound. Revocation stops "
+                    "future ones and does not rewrite the past."}, 200
+
+
+def _submit(ctx, data):
+    """Signed submission. No account, no operator key - the signature is the
+    authentication, which is the whole point of the lane."""
+    name = _clean_name(data.get("name"))
+    tip = str(data.get("tip", "")).strip().lower()
+    key_id = str(data.get("key_id", "")).strip()
+    sig = str(data.get("signature", "")).strip().lower()
+    nonce = str(data.get("nonce", "")).strip()[:80]
+    try:
+        ts = int(data.get("ts", 0))
+    except (TypeError, ValueError):
+        ts = 0
+
+    missing = [k for k, v in (("name", name), ("tip", tip), ("key_id", key_id),
+                              ("signature", sig), ("nonce", nonce)) if not v]
+    if missing or not ts:
+        return {"error": "incomplete_submission",
+                "missing": missing + ([] if ts else ["ts"]),
+                "how_to_sign": "/x/bind/spec"}, 400
+    if len(tip) != 64:
+        return {"error": "tip_must_be_64_hex"}, 400
+
+    now = time.time()
+    if abs(now - ts) > CLOCK_SKEW:
+        return {"error": "timestamp_outside_window",
+                "your_ts": ts, "our_ts": int(now),
+                "window_seconds": CLOCK_SKEW,
+                "why": "a signature valid forever is a signature that can be "
+                       "replayed forever"}, 400
+
+    with ctx["lock"]:
+        cred = ctx["conn"].execute(
+            "SELECT secret, revoked, issued_to FROM bind_credential "
+            "WHERE key_id=? AND name=?", (key_id, name)).fetchone()
+        used = ctx["conn"].execute(
+            "SELECT 1 FROM bind_nonce WHERE nonce=?", (nonce,)).fetchone()
+
+    if not cred:
+        return {"error": "no_credential_for_that_name_and_key"}, 401
+    if cred[1]:
+        return {"error": "credential_revoked", "revoked_at": _iso(cred[1])}, 401
+    if used:
+        return {"error": "nonce_already_used",
+                "why": "each signature may be presented once"}, 409
+
+    expected = _sig(cred[0], name, tip, ts, nonce)
+    if not hmac.compare_digest(expected, sig):
+        return {"error": "signature_did_not_verify",
+                "check": "/x/bind/spec sets out the exact bytes signed"}, 401
+
+    ev = {"user_id": "bind:" + name[:40], "action": "signed_tip", "amount": 0,
+          "country": "UK", "device_id": "bind", "anomaly": 0, "device_risk": 0}
+    res = {"decision": "TIP_BOUND", "score": 0, "bind_version": VERSION,
+           "name": name, "tip": tip, "key_id": key_id, "binding": "signature",
+           "detail": "name=%s;tip=%s;key_id=%s" % (name, tip, key_id)}
+    h, idx, seq = ctx["seal"](ev, res, now, None)
+
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "INSERT INTO bind_submission(name,tip,key_id,ts,nonce,audit_hash,"
+            "block_index) VALUES(?,?,?,?,?,?,?)",
+            (name, tip, key_id, now, nonce, h, idx))
+        ctx["conn"].execute("INSERT OR IGNORE INTO bind_nonce(nonce,ts) "
+                            "VALUES(?,?)", (nonce, now))
+        ctx["conn"].execute("DELETE FROM bind_nonce WHERE ts < ?",
+                            (now - NONCE_KEEP,))
+        ctx["conn"].commit()
+
+    return {"bound": True, "name": name, "tip": tip, "key_id": key_id,
+            "sealed_in_chain": h, "block_index": idx, "receipt_seq": seq,
+            "binding": "signature",
+            "what_this_proves": ("that the holder of the credential issued for "
+                                 "this name submitted this tip, and that the "
+                                 "submission has not been altered since it was "
+                                 "signed"),
+            "what_this_does_not_prove": ("that they own the domain the name "
+                                         "resembles, or that anything in their "
+                                         "chain is true"),
+            "check_it": "/x/bind/name?name=" + name}, 200
+
+
+# ----------------------------------------------------------------------
+
+def _name(ctx, data):
+    name = _clean_name(data.get("name"))
+    if not name:
+        return {"error": "name_required"}, 400
+
+    with ctx["lock"]:
+        cred = ctx["conn"].execute(
+            "SELECT key_id, issued, revoked, issued_to FROM bind_credential "
+            "WHERE name=? ORDER BY issued DESC", (name,)).fetchall()
+        claims = ctx["conn"].execute(
+            "SELECT claimant, claimed_at, note, block_index FROM bind_claim "
+            "WHERE name=? ORDER BY claimed_at ASC", (name,)).fetchall()
+        subs = ctx["conn"].execute(
+            "SELECT tip, key_id, ts, block_index FROM bind_submission "
+            "WHERE name=? ORDER BY ts DESC LIMIT 20", (name,)).fetchall()
+
+    live = [c for c in cred if not c[2]]
+    state = ("bound" if live else
+             "claimed" if claims else
+             "unbound")
+
+    out = {
+        "name": name,
+        "state": state,
+        "credential": ({"key_id": live[0][0], "issued_at": _iso(live[0][1]),
+                        "issued_to": live[0][3]} if live else None),
+        "claims": [{"claimant": c[0], "claimed_at": _iso(c[1]), "note": c[2],
+                    "block_index": c[3]} for c in claims],
+        "signed_submissions": [{"tip": s[0], "key_id": s[1],
+                                "at": _iso(s[2]), "block_index": s[3]}
+                               for s in subs],
+        "revoked_credentials": [{"key_id": c[0], "revoked_at": _iso(c[2])}
+                                for c in cred if c[2]],
+    }
+    if state == "bound":
+        out["meaning"] = ("A live credential exists for this name. Only the "
+                          "holder of it can submit under this name, and every "
+                          "submission is signed.")
+    elif state == "claimed":
+        out["meaning"] = ("Claimed but not bound. The dated claim above is in "
+                          "the chain, so a competing submission would be "
+                          "provably later - but nothing prevents one being "
+                          "made. Issue a credential to close that.")
+        out["flag"] = "claimable"
+    else:
+        out["meaning"] = ("Nobody holds a credential for this name and nobody "
+                          "has claimed it. It is claimable by anyone.")
+        out["flag"] = "claimable"
+    out["what_binding_never_proves"] = (
+        "domain ownership. A credential is a shared secret; it makes a name "
+        "unstealable on this network, not a claim honest.")
+    return out, 200
+
+
+def _conflicts(ctx):
+    """Names where more than one party has a foot in the door. Published
+    rather than resolved quietly, because who arbitrates is exactly the
+    question a network like this should not be answering privately."""
+    with ctx["lock"]:
+        rows = ctx["conn"].execute(
+            "SELECT name, COUNT(DISTINCT claimant) FROM bind_claim "
+            "GROUP BY name HAVING COUNT(DISTINCT claimant) > 1").fetchall()
+        keys = ctx["conn"].execute(
+            "SELECT name, COUNT(DISTINCT key_id) FROM bind_credential "
+            "WHERE revoked IS NULL GROUP BY name "
+            "HAVING COUNT(DISTINCT key_id) > 1").fetchall()
+    return {"contested_claims": [{"name": r[0], "claimants": r[1]} for r in rows],
+            "names_with_multiple_live_credentials":
+                [{"name": k[0], "credentials": k[1]} for k in keys],
+            "note": ("A conflict is recorded, not arbitrated. This platform "
+                     "does not decide who owns a name and should not.")}, 200
+
+
+def _spec():
+    return {
+        "bind_version": VERSION,
+        "why_it_exists": ("Name binding used to depend on a fetcher reaching a "
+                          "URL and parsing JSON. A reachable page serving HTML "
+                          "did not bind, an unbound name was claimable by "
+                          "anyone, and the failure text asserted the URL was "
+                          "unreachable when the check had only established the "
+                          "response was not JSON. This lane removes the fetcher "
+                          "from the trust path."),
+        "signing": {
+            "material": "AILEASH-BIND-v1: || canonical JSON of "
+                        "{name, tip, ts, nonce}, keys sorted, separators "
+                        "(',',':'), UTF-8",
+            "algorithm": "HMAC-SHA256, secret as raw bytes from the hex issued",
+            "signature": "lower-case hex digest",
+            "ts": "unix seconds, must be within %d seconds of ours" % CLOCK_SKEW,
+            "nonce": "any string, once only, remembered for %d seconds"
+                     % NONCE_KEEP,
+        },
+        "worked_example": {
+            "1": "material = b'AILEASH-BIND-v1:' + "
+                 '\'{"name":"example.com","nonce":"abc123",'
+                 '"tip":"<64 hex>","ts":1787000000}\'.encode()',
+            "2": "signature = hmac.new(bytes.fromhex(secret), material, "
+                 "hashlib.sha256).hexdigest()",
+            "3": "POST /x/bind/submit with name, tip, ts, nonce, key_id, signature",
+            "note": "the JSON in step 1 has its keys sorted, which is why "
+                    "nonce appears before tip",
+        },
+        "what_a_signed_binding_proves": (
+            "possession of the credential issued for that name, and that the "
+            "submission is unaltered since signing"),
+        "what_it_does_not_prove": [
+            "domain ownership - not checked, not implied",
+            "that the submitter is who the name suggests",
+            "that anything in their chain is true",
+        ],
+        "claims": ("A name with no credential can be given a dated claim "
+                   "marker. That is not a binding. It means a later competing "
+                   "submission is provably second and the conflict is public."),
+        "conflicts": ("Recorded at /x/bind/conflicts and never arbitrated here. "
+                      "A network that lets its operator decide who owns a name "
+                      "has replaced one trusted party with another."),
+        "honest_limits": [
+            "A credential is a shared secret. This platform holds a copy, so "
+            "in principle it could sign on a peer's behalf - which is why a "
+            "public-key lane is the right end state and this is the interim.",
+            "Revoking a credential stops future submissions and does not "
+            "unbind past ones.",
+            "Nothing here checks DNS, TLS or WHOIS. Name resemblance to a real "
+            "domain is not evidence of anything.",
+        ],
+    }, 200
+
+
+def handle(method, action, data, api_key, ctx):
+    _setup(ctx)
+    action = (action or "").strip("/").lower()
+    data = data or {}
+
+    if method == "GET":
+        if action == "spec":
+            return _spec()
+        if action == "name":
+            return _name(ctx, data)
+        if action == "conflicts":
+            return _conflicts(ctx)
+
+    if method == "POST":
+        if action == "submit":
+            return _submit(ctx, data)      # signature is the authentication
+        if not api_key:
+            return {"error": "invalid_api_key"}, 401
+        if action == "issue":
+            return _issue(ctx, api_key, data)
+        if action == "claim":
+            return _claim(ctx, api_key, data)
+        if action == "revoke":
+            return _revoke(ctx, api_key, data)
+
+    return {"error": "unknown_action", "action": action,
+            "GET": ["spec", "name", "conflicts"],
+            "POST": ["issue", "claim", "revoke", "submit"]}, 404
 
 ```
 
@@ -1774,351 +2265,5 @@ def handle(method, action, data, api_key, ctx):
     return {"error": "unknown_action", "action": action,
             "GET": ["spec", "periods", "root", "prove"],
             "POST": ["verify", "commit", "erase"]}, 404
-
-```
-
-
-## `modules/conformance.py`
-
-338 lines, 14845 bytes
-
-```python
-"""
-Conformance testing - /x/conformance/<action>
-
-WHAT THIS IS FOR
-----------------
-Three limits are documented elsewhere in this platform, and all three have
-the same shape: the engine's arithmetic is sound, but the guarantee depends
-on something outside the engine.
-
-  1. Commit-before-reveal proves order - but only if the integrator does not
-     show its reviewers the machine verdict before calling /open.
-  2. Mutual witnessing gets its strength from breadth - two platforms
-     witnessing only each other prove very little.
-  3. A declaration is only as strong as the rules declared - one that
-     constrains nothing passes everything.
-
-None of these can be fixed by the engine on its own. All three can be
-MEASURED, and a measured weakness is a different animal from an unmeasured
-one. That is what this module does.
-
-1. PROBES - testing the integration, not trusting it
-----------------------------------------------------
-The idea is borrowed openly from how real audits work, and specifically from
-a point James Stokes made publicly: slip a case with a known answer into the
-queue, unannounced, and see who catches it.
-
-A probe creates a genuine oversight case whose machine verdict is
-deliberately set to a known-wrong value. The reviewer sees it exactly like
-any other case. Two things then follow:
-
-  - If they agree with the deliberately wrong verdict, they did not evaluate
-    it. That is a caught rubber stamp, sealed.
-  - If the integration is showing them the verdict before /open is called,
-    their probe agreement rate will match their normal agreement rate. If
-    they are genuinely deciding blind, it will not. The gap between the two
-    numbers is the conformance signal.
-
-A single probe proves nothing about a person. A catch rate across dozens is
-evidence about a process, which is the thing under audit.
-
-2. WITNESS BREADTH - concentration is visible
----------------------------------------------
-Reports how many distinct peers witness the chain, how concentrated the
-observations are in the largest peer, and how many peers have gone quiet.
-Below three live peers the network is reported as weak, because it is.
-
-3. DECLARATION STRENGTH - rules that never fire
-------------------------------------------------
-Runs the live declaration against sealed records and reports, per rule, how
-many records it actually CONSTRAINED - that is, how many matched its `when`
-condition and therefore had to satisfy its `require`. A rule that has never
-constrained a single record is not a standard. It is decoration, and it is
-named as such.
-
-HONEST LIMITS OF THIS MODULE
-----------------------------
-- Probes test the process, not any individual. Someone can catch a probe and
-  still rubber stamp the next hundred cases.
-- A determined integrator who identifies probe cases can treat them
-  differently. Probe case references are not marked in any way the reviewer
-  can see, but a sufficiently motivated operator controls their own UI.
-- Breadth and strength are measurements, not enforcement. Nothing here can
-  compel a platform to witness widely or declare strictly. It can only make
-  the alternative visible.
-
-    POST /x/conformance/probe        inject a probe case with a known-wrong verdict
-    GET  /x/conformance/probes       catch rate, and the conformance gap
-    GET  /x/conformance/witness      breadth, concentration, staleness
-    GET  /x/conformance/declaration  per-rule strength - what each rule constrains
-    GET  /x/conformance/report       all three, one call
-"""
-
-import importlib, json, secrets, time
-from datetime import datetime, timezone
-
-VERSION = "1.0"
-INVERT = {"allow": "block", "block": "allow",
-          "challenge": "allow", "escalate": "allow"}
-
-_ready = False
-
-
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        ctx["conn"].execute("CREATE TABLE IF NOT EXISTS conformance_probes(probe_id TEXT PRIMARY KEY,api_key TEXT,case_id TEXT,reviewer TEXT,planted_verdict TEXT,correct_verdict TEXT,injected REAL,resolved REAL,reviewer_verdict TEXT,caught INTEGER)")
-        ctx["conn"].execute("CREATE INDEX IF NOT EXISTS idx_probe_key ON conformance_probes(api_key)")
-        ctx["conn"].commit()
-    _ready = True
-
-
-def _iso(ts):
-    if not ts:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
-
-# ------------------------------------------------------------------ probes
-
-def _probe(ctx, api_key, data):
-    reviewer = str(data.get("reviewer", "")).strip()
-    if not reviewer:
-        return {"error": "reviewer_required"}, 400
-    correct = str(data.get("correct_verdict", "")).strip().lower()
-    if correct not in INVERT:
-        return {"error": "correct_verdict_required",
-                "allowed": sorted(INVERT)}, 400
-    material = data.get("material")
-    if material is None:
-        return {"error": "material_required",
-                "message": "A probe must look like a real case or it tests nothing."}, 400
-
-    planted = INVERT[correct]
-    try:
-        ovs = importlib.import_module("modules.oversight")
-    except Exception as e:
-        return {"error": "oversight_module_unavailable", "detail": str(e)}, 503
-
-    ref = str(data.get("case_ref", "")).strip() or ("CASE-" + secrets.token_hex(3).upper())
-    payload, status = ovs.handle("POST", "open",
-                                 {"case_ref": ref, "reviewer": reviewer,
-                                  "material": material,
-                                  "machine_verdict": planted},
-                                 api_key, ctx)
-    if status != 200:
-        return payload, status
-
-    pid = "PRB-" + secrets.token_hex(4).upper()
-    ts = time.time()
-    with ctx["lock"]:
-        ctx["conn"].execute("INSERT INTO conformance_probes(probe_id,api_key,case_id,reviewer,planted_verdict,correct_verdict,injected,resolved,reviewer_verdict,caught) VALUES(?,?,?,?,?,?,?,NULL,NULL,NULL)",
-                            (pid, api_key, payload["case_id"], reviewer, planted, correct, ts))
-        ctx["conn"].commit()
-
-    return {"probe_id": pid, "case_id": payload["case_id"],
-            "case_ref": ref, "reviewer": reviewer,
-            "planted_verdict": planted, "correct_verdict": correct,
-            "injected": _iso(ts),
-            "note": "This is an ordinary oversight case to the reviewer. Route it into their queue exactly like any other, or the probe is worthless."}, 200
-
-
-def _resolve_probes(ctx, api_key):
-    """Settle any probes whose oversight case has since been committed."""
-    with ctx["lock"]:
-        open_probes = ctx["conn"].execute("SELECT probe_id,case_id,planted_verdict,correct_verdict FROM conformance_probes WHERE api_key=? AND resolved IS NULL", (api_key,)).fetchall()
-        for pid, cid, planted, correct in open_probes:
-            row = ctx["conn"].execute("SELECT reviewer_verdict,committed FROM oversight_cases WHERE case_id=? AND api_key=?", (cid, api_key)).fetchone()
-            if not row or not row[1]:
-                continue
-            rv = (row[0] or "").lower()
-            caught = 1 if rv != planted else 0
-            ctx["conn"].execute("UPDATE conformance_probes SET resolved=?,reviewer_verdict=?,caught=? WHERE probe_id=?",
-                                (row[1], rv, caught, pid))
-        ctx["conn"].commit()
-
-
-def _probes(ctx, api_key):
-    try:
-        _resolve_probes(ctx, api_key)
-    except Exception:
-        pass
-    with ctx["lock"]:
-        rows = ctx["conn"].execute("SELECT reviewer,caught,resolved FROM conformance_probes WHERE api_key=? AND resolved IS NOT NULL", (api_key,)).fetchall()
-        pending = ctx["conn"].execute("SELECT COUNT(*) FROM conformance_probes WHERE api_key=? AND resolved IS NULL", (api_key,)).fetchone()[0]
-    if not rows:
-        return {"probes_resolved": 0, "probes_pending": pending,
-                "note": "No probes have come back yet."}, 200
-
-    by = {}
-    for reviewer, caught, _r in rows:
-        d = by.setdefault(reviewer, {"probes": 0, "caught": 0})
-        d["probes"] += 1
-        d["caught"] += caught
-
-    out = []
-    for reviewer, d in sorted(by.items()):
-        rate = round(100 * d["caught"] / d["probes"], 1)
-        entry = {"reviewer": reviewer, "probes": d["probes"],
-                 "caught": d["caught"], "catch_rate_pct": rate}
-        # conformance gap: probe agreement vs normal agreement
-        try:
-            ovs = importlib.import_module("modules.oversight")
-            stats, _s = ovs.handle("GET", "reviewer", {"id": reviewer}, api_key, ctx)
-            normal = stats.get("agreement_rate_pct")
-            if normal is not None and d["probes"] >= 5:
-                probe_agree = round(100 * (d["probes"] - d["caught"]) / d["probes"], 1)
-                gap = round(abs(probe_agree - normal), 1)
-                entry["normal_agreement_pct"] = normal
-                entry["probe_agreement_pct"] = probe_agree
-                entry["conformance_gap"] = gap
-                if gap < 5 and normal > 90:
-                    entry["flag"] = "probe agreement matches normal agreement at a high rate - consistent with the verdict being visible before commit"
-        except Exception:
-            pass
-        if d["probes"] >= 5 and rate == 0:
-            entry["flag"] = "caught none of " + str(d["probes"]) + " deliberately wrong verdicts"
-        out.append(entry)
-
-    total = sum(d["probes"] for d in by.values())
-    caught = sum(d["caught"] for d in by.values())
-    return {"probes_resolved": total, "probes_pending": pending,
-            "caught": caught,
-            "overall_catch_rate_pct": round(100 * caught / total, 1),
-            "by_reviewer": out,
-            "note": "A single probe proves nothing about a person. A catch rate across dozens is evidence about a process."}, 200
-
-
-# ----------------------------------------------------------------- witness
-
-def _witness(ctx, api_key):
-    t = time.time()
-    try:
-        with ctx["lock"]:
-            rows = ctx["conn"].execute("SELECT peer,COUNT(*),MAX(observed),COUNT(DISTINCT tip) FROM witness_log WHERE api_key=? GROUP BY peer", (api_key,)).fetchall()
-    except Exception:
-        rows = []
-    if not rows:
-        return {"peers": 0, "strength": "none",
-                "note": "No peers witnessed. Anchoring alone still applies; mutual witnessing does not."}, 200
-
-    total = sum(r[1] for r in rows)
-    live = [r for r in rows if (t - r[2]) < 6 * 3600]
-    stale = [r for r in rows if 6 * 3600 <= (t - r[2]) < 48 * 3600]
-    silent = [r for r in rows if (t - r[2]) >= 48 * 3600]
-    top = max(rows, key=lambda r: r[1])
-    conc = round(100 * top[1] / total, 1)
-
-    if len(live) >= 5 and conc < 50:
-        strength = "strong"
-    elif len(live) >= 3:
-        strength = "adequate"
-    elif len(live) >= 1:
-        strength = "weak"
-    else:
-        strength = "dormant"
-
-    out = {"peers": len(rows), "live": len(live), "stale": len(stale),
-           "silent": len(silent), "observations": total,
-           "largest_peer_share_pct": conc,
-           "strength": strength,
-           "distinct_tips_seen": sum(r[3] for r in rows)}
-    if len(live) < 3:
-        out["flag"] = "fewer than three live peers - breadth is what makes witnessing meaningful, and this network does not have it yet"
-    if conc > 80 and len(rows) > 1:
-        out["concentration_flag"] = "over 80% of observations come from a single peer"
-    if len(rows) == 1:
-        out["reciprocity_warning"] = "a single peer pair proves very little - two parties witnessing only each other can still collude"
-    return out, 200
-
-
-# ------------------------------------------------------------- declaration
-
-def _declaration(ctx, api_key):
-    try:
-        dec = importlib.import_module("modules.declare")
-    except Exception as e:
-        return {"error": "declare_module_unavailable", "detail": str(e)}, 503
-
-    cur, status = dec.handle("GET", "current", {}, api_key, ctx)
-    if status != 200:
-        return cur, status
-    rules = cur["declaration"]["rules"]
-    ver = cur["version"]
-
-    with ctx["lock"]:
-        recs = ctx["conn"].execute("SELECT event_json,result_json FROM audit_log WHERE api_key=? ORDER BY id DESC LIMIT 2000", (api_key,)).fetchall()
-
-    parsed = []
-    for ev, res in recs:
-        try:
-            r = {}
-            r.update(json.loads(ev))
-            r.update(json.loads(res))
-            if str(r.get("decision", "")).endswith("_SEALED"):
-                continue
-            parsed.append(r)
-        except Exception:
-            pass
-
-    report = []
-    for rule in rules:
-        constrained = 0
-        violated = 0
-        for r in parsed:
-            if not dec._test(rule.get("when"), r):
-                continue
-            constrained += 1
-            if not dec._test(rule.get("require"), r):
-                violated += 1
-        entry = {"rule": rule.get("id"), "describe": rule.get("describe"),
-                 "records_constrained": constrained,
-                 "violations": violated,
-                 "coverage_pct": (round(100 * constrained / len(parsed), 1) if parsed else 0)}
-        if constrained == 0:
-            entry["flag"] = "this rule has never constrained a single record - it is decoration, not a standard"
-        report.append(entry)
-
-    dead = len([r for r in report if r["records_constrained"] == 0])
-    covered = len({i for i, rule in enumerate(rules)
-                   if report[i]["records_constrained"] > 0})
-    out = {"declaration_version": ver, "rules": len(rules),
-           "records_examined": len(parsed),
-           "rules_that_constrain_nothing": dead,
-           "rules_with_effect": covered,
-           "per_rule": report}
-    if dead:
-        out["flag"] = str(dead) + " of " + str(len(rules)) + " rules constrain nothing"
-    if not rules:
-        out["flag"] = "an empty declaration passes everything"
-    return out, 200
-
-
-# ---------------------------------------------------------------- routing
-
-def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-    if method == "POST":
-        if action == "probe":
-            return _probe(ctx, api_key, data)
-    else:
-        if action == "probes":
-            return _probes(ctx, api_key)
-        if action == "witness":
-            return _witness(ctx, api_key)
-        if action == "declaration":
-            return _declaration(ctx, api_key)
-        if action in ("", "report"):
-            p, _a = _probes(ctx, api_key)
-            w, _b = _witness(ctx, api_key)
-            d, _c = _declaration(ctx, api_key)
-            return {"conformance_version": VERSION,
-                    "integration": p, "witness_breadth": w,
-                    "declaration_strength": d,
-                    "note": "These are measurements, not enforcement. Nothing here compels good behaviour - it only makes the alternative visible."}, 200
-    return {"error": "unknown_action", "action": action}, 404
 
 ```
