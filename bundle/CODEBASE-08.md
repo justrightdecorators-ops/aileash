@@ -3,9 +3,9 @@
 Contains:
 - `modules/pack.py`
 - `modules/packconsole.py`
-- `modules/peer.py`
 - `modules/peerconsole.py`
 - `modules/publish.py`
+- `modules/ratchet.py`
 
 
 ## `modules/pack.py`
@@ -951,789 +951,6 @@ def handle(method, action, data, api_key, ctx):
 ```
 
 
-## `modules/peer.py`
-
-775 lines, 31547 bytes
-
-```python
-"""
-modules/peer.py  v1.1  --  signed peer submission (shared secret)
-
-READ THIS FIRST: WHAT THIS LANE BINDS, AND WHAT IT DOES NOT
-    This lane authenticates with HMAC-SHA256 over a shared secret.
-
-    A shared secret is held by BOTH parties. So a valid signature proves
-    the submission came from someone holding that secret -- which is the
-    peer, and also the operator of this deployment.
-
-        It closes third-party submission under your name.
-        It does NOT close operator submission under your name.
-
-    That is a normal property of HMAC and not a defect. It is stated here,
-    at the top, because "signed" reads stronger than it is, and a peer
-    choosing between lanes should not have to work that out for
-    themselves. Raised by Ishaan (Shango MID), who was right.
-
-    If you need the operator excluded as well, use /x/signed/submit
-    instead. There you generate an Ed25519 keypair, keep the private half,
-    and this deployment holds only the public half -- so it can verify a
-    signature and can never produce one. That property is arithmetic
-    rather than a promise about our conduct.
-
-    Both lanes stay open. This one is simpler to implement and costs the
-    peer no key custody, which is a real advantage if a long-lived private
-    key is a liability you would rather not carry. The other is stronger.
-    Pick deliberately.
-
-WHY THIS EXISTS
-    /x/witness/observe is unauthenticated on purpose. Anyone can submit a
-    tip without an account, and that openness is what answers the
-    collusion objection -- nobody has to trust us to audit the network.
-
-    The cost of that openness is that anyone can submit a tip under any
-    name. Name binding catches most of it; it does not prevent it.
-
-    A named peer exchanging period roots wants a stronger guarantee than
-    the open endpoint gives. This module provides one WITHOUT changing the
-    open endpoint. All three run side by side.
-
-WHAT IT COVERS
-    canonicalization, HMAC-SHA256 signing, nonce, replay window, clock
-    skew, idempotency, retry semantics, suspension, key rotation with
-    overlap.
-
-AUTH LIVES IN THE BODY, NOT IN HEADERS
-    The module router hands modules a parsed body, not the raw headers,
-    so every authentication field travels in the JSON body. This also
-    makes the scheme trivial to implement from any language and easy to
-    replay in a test.
-
-THE SCHEME, IN FULL
-    Envelope:
-        {
-          "peer_id":         "prae-001",
-          "ts":              1755432000,          integer unix seconds
-          "nonce":           "<>=16 chars, unique per peer>",
-          "idempotency_key": "<optional, <=128 chars>",
-          "payload":         { ... the thing being submitted ... },
-          "signature":       "<hex hmac-sha256>"
-        }
-
-    THOSE FIELDS AND NO OTHERS. The server rebuilds the envelope from the
-    known field names before checking the signature, so any extra
-    top-level field you signed will not be part of what we verify and the
-    signature will not match. Put anything of your own inside payload.
-    This trips people up and now it is written down.
-
-    String to sign:
-        "AILEASH-PEER-v1\\n" + canonical(envelope_without_signature)
-
-    canonical() is exactly:
-        json.dumps(obj, sort_keys=True, separators=(",",":"),
-                   ensure_ascii=True)
-
-    signature = hmac_sha256(secret, string_to_sign).hexdigest()
-
-    POST /x/peer/canonical returns the exact string to sign for a given
-    envelope, so an implementer can debug canonicalization without
-    holding or revealing a secret.
-
-RULES
-    clock skew      +/- 300s. Outside that: 401 clock_skew.
-    nonce           unique per peer for 900s. Reused: 409 replay.
-    idempotency     same key + same payload digest returns the FIRST
-                    response verbatim, sealed once. Same key + different
-                    payload: 409 idempotency_conflict.
-    retry           safe. Retry the identical envelope; idempotency makes
-                    it a no-op that returns the original receipt.
-    suspension      403 peer_suspended. Submissions refused, nothing
-                    deleted, the peer's history stands.
-    rotation        two secrets live at once. A new secret is issued and
-                    the previous one stays valid for ROTATION_OVERLAP
-                    (default 24h) so a peer can roll without downtime.
-
-                    Note the asymmetry with the other lane: here the
-                    OPERATOR issues and rotates the secret, because the
-                    operator holds it too. At /x/signed/rotate the peer
-                    rotates their own key and the operator cannot, because
-                    a rotation must be signed by the key being replaced.
-
-ROUTES
-    GET  spec       public   full implementation guide
-    POST canonical  public   the exact string to sign. no secret needed.
-    GET  peers      public   peer ids, status, rotation state. no secrets.
-    POST submit     public route, SIGNATURE authenticated
-    POST register   keyed    operator issues a peer credential
-    POST rotate     keyed    issue a new secret, overlap the old
-    POST suspend    keyed
-    POST resume     keyed
-    GET  history    keyed    submissions by peer
-
-TABLES OWNED
-    peer_registry, peer_nonce, peer_submission
-"""
-
-import hashlib
-import hmac
-import json
-import os
-import re
-import time
-
-VERSION = "1.1"
-
-PUBLIC = {
-    ("GET", "spec"),
-    ("POST", "canonical"),
-    ("GET", "peers"),
-    ("POST", "submit"),
-}
-
-SIGN_PREFIX = "AILEASH-PEER-v1\n"
-
-CLOCK_SKEW_SECONDS = 300
-NONCE_TTL_SECONDS = 900
-NONCE_MIN_LENGTH = 16
-ROTATION_OVERLAP_SECONDS = 86400
-MAX_PAYLOAD_BYTES = 65536
-MAX_IDEMPOTENCY_KEY = 128
-
-# The one paragraph that must appear anywhere this lane describes itself.
-# Kept as a constant so it cannot drift between the spec route, the
-# register response and the peers listing.
-SHARED_SECRET_SCOPE = (
-    "This lane authenticates with a shared secret, held by both the peer "
-    "and the operator of this deployment. A valid signature proves the "
-    "submission came from a holder of that secret. It closes third-party "
-    "submission under your name and it does not close operator submission "
-    "under your name. That is a normal property of HMAC, stated rather "
-    "than implied. For a lane where the operator is excluded too, use "
-    "/x/signed/submit - you keep the private key and we hold only the "
-    "public half, so we can verify a signature and can never produce one."
-)
-
-_PEER_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,62}$")
-
-_ready = False
-
-
-# ---------------------------------------------------------------- storage
-
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    conn = ctx["conn"]
-    with ctx["lock"]:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS peer_registry (
-                peer_id          TEXT PRIMARY KEY,
-                chain_name       TEXT,
-                url              TEXT,
-                secret_current   TEXT,
-                secret_previous  TEXT,
-                rotated_at       REAL,
-                status           TEXT DEFAULT 'active',
-                created          REAL,
-                submissions      INTEGER DEFAULT 0,
-                last_seen        REAL
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS peer_nonce (
-                peer_id   TEXT,
-                nonce     TEXT,
-                seen_at   REAL,
-                PRIMARY KEY (peer_id, nonce)
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS peer_submission (
-                id               INTEGER PRIMARY KEY AUTOINCREMENT,
-                peer_id          TEXT,
-                ts               REAL,
-                idempotency_key  TEXT,
-                payload_digest   TEXT,
-                response_json    TEXT,
-                audit_hash       TEXT
-            )
-        """)
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS ix_peer_sub_idem "
-            "ON peer_submission(peer_id, idempotency_key)")
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS ix_peer_nonce_time "
-            "ON peer_nonce(seen_at)")
-        conn.commit()
-    _ready = True
-
-
-# ------------------------------------------------------------ primitives
-
-def canonical(obj):
-    """
-    THE canonicalization. Any implementation in any language must produce
-    this byte-for-byte. Sorted keys, no whitespace, ASCII-escaped.
-    """
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
-                      ensure_ascii=True)
-
-
-def string_to_sign(envelope):
-    """Envelope WITHOUT the signature field, prefixed and canonicalized."""
-    unsigned = {k: v for k, v in envelope.items() if k != "signature"}
-    return SIGN_PREFIX + canonical(unsigned)
-
-
-def sign(secret, envelope):
-    return hmac.new(secret.encode("utf-8"),
-                    string_to_sign(envelope).encode("utf-8"),
-                    hashlib.sha256).hexdigest()
-
-
-def _digest(payload):
-    return hashlib.sha256(canonical(payload).encode("utf-8")).hexdigest()
-
-
-def _new_secret():
-    return os.urandom(32).hex()
-
-
-def _now():
-    return time.time()
-
-
-def _iso(ts):
-    try:
-        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(ts)))
-    except Exception:
-        return None
-
-
-def _sweep_nonces(ctx):
-    cutoff = _now() - NONCE_TTL_SECONDS
-    with ctx["lock"]:
-        ctx["conn"].execute("DELETE FROM peer_nonce WHERE seen_at < ?",
-                            (cutoff,))
-        ctx["conn"].commit()
-
-
-# ------------------------------------------------------------ the submit
-
-def _submit(ctx, data):
-    """
-    Signature-authenticated. No API key. Every rule on the list is
-    enforced here, in a fixed order, and each failure names itself.
-    """
-    _setup(ctx)
-
-    # ---- shape
-    peer_id = (data.get("peer_id") or "").strip()
-    signature = (data.get("signature") or "").strip()
-    nonce = (data.get("nonce") or "").strip()
-    payload = data.get("payload")
-    idem = (data.get("idempotency_key") or "").strip()[:MAX_IDEMPOTENCY_KEY]
-
-    if not peer_id or not signature or not nonce or payload is None:
-        return {"ok": False, "error": "malformed_envelope",
-                "required": ["peer_id", "ts", "nonce", "payload",
-                             "signature"]}, 400
-
-    try:
-        ts = int(data.get("ts"))
-    except (TypeError, ValueError):
-        return {"ok": False, "error": "malformed_ts",
-                "detail": "ts must be an integer of unix seconds"}, 400
-
-    if len(nonce) < NONCE_MIN_LENGTH:
-        return {"ok": False, "error": "nonce_too_short",
-                "minimum": NONCE_MIN_LENGTH}, 400
-
-    if len(canonical(payload).encode("utf-8")) > MAX_PAYLOAD_BYTES:
-        return {"ok": False, "error": "payload_too_large",
-                "max_bytes": MAX_PAYLOAD_BYTES}, 413
-
-    # ---- peer known and active
-    row = ctx["conn"].execute(
-        "SELECT peer_id, chain_name, secret_current, secret_previous, "
-        "rotated_at, status FROM peer_registry WHERE peer_id = ?",
-        (peer_id,)).fetchone()
-    if not row:
-        return {"ok": False, "error": "unknown_peer", "peer_id": peer_id}, 401
-    if row[5] == "suspended":
-        return {"ok": False, "error": "peer_suspended",
-                "detail": "Submissions refused. Existing history stands "
-                          "and nothing has been removed."}, 403
-
-    # ---- clock skew, before any expensive work
-    skew = abs(_now() - ts)
-    if skew > CLOCK_SKEW_SECONDS:
-        return {"ok": False, "error": "clock_skew",
-                "detail": "Timestamp is %.0fs from server time; the window "
-                          "is +/-%ds." % (skew, CLOCK_SKEW_SECONDS),
-                "server_time": int(_now())}, 401
-
-    # ---- signature, against current then previous secret
-    #
-    # Note the envelope is rebuilt from KNOWN field names only. Any extra
-    # top-level field the caller signed is not part of what we verify, so
-    # the signature will not match. Documented in the spec; the failure
-    # response points at /x/peer/canonical, which is the fastest way for
-    # an implementer to see the difference.
-    envelope = {"peer_id": peer_id, "ts": ts, "nonce": nonce,
-                "payload": payload}
-    if idem:
-        envelope["idempotency_key"] = idem
-
-    accepted_with = None
-    if row[2] and hmac.compare_digest(sign(row[2], envelope), signature):
-        accepted_with = "current"
-    elif row[3] and (row[4] or 0) + ROTATION_OVERLAP_SECONDS > _now():
-        if hmac.compare_digest(sign(row[3], envelope), signature):
-            accepted_with = "previous"
-
-    if not accepted_with:
-        return {"ok": False, "error": "bad_signature",
-                "detail": "HMAC did not match. POST the same envelope to "
-                          "/x/peer/canonical to see the exact string this "
-                          "server signs.",
-                "common_cause": "An extra top-level field in your envelope. "
-                                "Only peer_id, ts, nonce, payload and "
-                                "idempotency_key are signed; anything else "
-                                "belongs inside payload.",
-                "string_to_sign_sha256":
-                    hashlib.sha256(
-                        string_to_sign(envelope).encode()).hexdigest(),
-                }, 401
-
-    payload_digest = _digest(payload)
-
-    # ---- idempotency, before the nonce check so a retry is a clean no-op
-    if idem:
-        prior = ctx["conn"].execute(
-            "SELECT payload_digest, response_json FROM peer_submission "
-            "WHERE peer_id = ? AND idempotency_key = ?",
-            (peer_id, idem)).fetchone()
-        if prior:
-            if prior[0] != payload_digest:
-                return {"ok": False, "error": "idempotency_conflict",
-                        "detail": "That idempotency key was used with a "
-                                  "different payload."}, 409
-            out = json.loads(prior[1])
-            out["replayed"] = True
-            out["note"] = ("Idempotent retry. This is the original receipt; "
-                           "nothing was sealed twice.")
-            return out, 200
-
-    # ---- replay
-    _sweep_nonces(ctx)
-    seen = ctx["conn"].execute(
-        "SELECT seen_at FROM peer_nonce WHERE peer_id = ? AND nonce = ?",
-        (peer_id, nonce)).fetchone()
-    if seen:
-        return {"ok": False, "error": "replay",
-                "detail": "That nonce has already been used by this peer "
-                          "within the %ds window. Use a fresh nonce, or "
-                          "send an idempotency_key if you meant to retry."
-                          % NONCE_TTL_SECONDS}, 409
-
-    # ---- accept: seal it
-    now = _now()
-    event = {"module": "peer", "action": "submit", "peer_id": peer_id,
-             "chain_name": row[1], "payload_digest": payload_digest,
-             "payload": payload}
-    result = {"accepted": True, "signed_with": accepted_with,
-              "auth": "hmac-shared-secret"}
-    audit_hash = block_index = receipt_seq = None
-    try:
-        audit_hash, block_index, receipt_seq = ctx["seal"](
-            event, result, now, None)
-    except Exception:
-        pass
-
-    out = {
-        "ok": True,
-        "accepted": True,
-        "peer_id": peer_id,
-        "chain_name": row[1],
-        "payload_digest": payload_digest,
-        "signed_with": accepted_with,
-        "auth": "hmac-shared-secret",
-        "auth_scope": SHARED_SECRET_SCOPE,
-        "received_at": _iso(now),
-        "receipt": {"audit_hash": audit_hash,
-                    "block_index": block_index,
-                    "receipt_seq": receipt_seq},
-        "verify": {
-            "inclusion": "/x/complete/prove",
-            "ancestry": "/x/consistency/ancestor?tip=<any tip we served>",
-            "append_only": "/x/consistency/proof?first=&second=",
-        },
-    }
-
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "INSERT OR IGNORE INTO peer_nonce (peer_id, nonce, seen_at) "
-            "VALUES (?,?,?)", (peer_id, nonce, now))
-        ctx["conn"].execute(
-            "INSERT INTO peer_submission (peer_id, ts, idempotency_key, "
-            "payload_digest, response_json, audit_hash) VALUES (?,?,?,?,?,?)",
-            (peer_id, now, idem or None, payload_digest,
-             json.dumps(out), audit_hash))
-        ctx["conn"].execute(
-            "UPDATE peer_registry SET submissions = submissions + 1, "
-            "last_seen = ? WHERE peer_id = ?", (now, peer_id))
-        ctx["conn"].commit()
-
-    if accepted_with == "previous":
-        out["warning"] = ("Accepted with the previous secret. The overlap "
-                          "window ends %s." % _iso((row[4] or 0) +
-                                                   ROTATION_OVERLAP_SECONDS))
-    return out, 200
-
-
-# ------------------------------------------------------------- operator
-
-def _register(ctx, data):
-    _setup(ctx)
-    peer_id = (data.get("peer_id") or "").strip().lower()
-    if not _PEER_ID_RE.match(peer_id):
-        return {"ok": False, "error": "bad_peer_id",
-                "detail": "lowercase letters, digits, dot, dash, "
-                          "underscore; 2-63 chars"}, 400
-    if ctx["conn"].execute("SELECT 1 FROM peer_registry WHERE peer_id = ?",
-                           (peer_id,)).fetchone():
-        return {"ok": False, "error": "peer_exists",
-                "detail": "Use /x/peer/rotate to issue a new secret."}, 409
-
-    secret = _new_secret()
-    now = _now()
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "INSERT INTO peer_registry (peer_id, chain_name, url, "
-            "secret_current, secret_previous, rotated_at, status, created) "
-            "VALUES (?,?,?,?,NULL,NULL,'active',?)",
-            (peer_id, (data.get("chain_name") or peer_id).strip()[:120],
-             (data.get("url") or "").strip()[:400], secret, now))
-        ctx["conn"].commit()
-    try:
-        ctx["seal"]({"module": "peer", "action": "register",
-                     "peer_id": peer_id},
-                    {"registered": True}, now, None)
-    except Exception:
-        pass
-
-    return {
-        "ok": True,
-        "peer_id": peer_id,
-        "secret": secret,
-        "warning": "This secret is shown once and is not recoverable. "
-                   "Send it to the peer over a channel you trust.",
-        "tell_the_peer_this": SHARED_SECRET_SCOPE,
-        "endpoint": "/x/peer/submit",
-        "spec": "/x/peer/spec",
-        "stronger_lane": "/x/signed/spec",
-    }, 200
-
-
-def _rotate(ctx, data):
-    _setup(ctx)
-    peer_id = (data.get("peer_id") or "").strip().lower()
-    row = ctx["conn"].execute(
-        "SELECT secret_current FROM peer_registry WHERE peer_id = ?",
-        (peer_id,)).fetchone()
-    if not row:
-        return {"ok": False, "error": "unknown_peer"}, 404
-
-    new = _new_secret()
-    now = _now()
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "UPDATE peer_registry SET secret_previous = secret_current, "
-            "secret_current = ?, rotated_at = ? WHERE peer_id = ?",
-            (new, now, peer_id))
-        ctx["conn"].commit()
-    try:
-        ctx["seal"]({"module": "peer", "action": "rotate",
-                     "peer_id": peer_id}, {"rotated": True}, now, None)
-    except Exception:
-        pass
-
-    return {
-        "ok": True,
-        "peer_id": peer_id,
-        "secret": new,
-        "previous_valid_until": _iso(now + ROTATION_OVERLAP_SECONDS),
-        "detail": "Both secrets are accepted until then, so the peer can "
-                  "roll over without downtime. Submissions signed with the "
-                  "old one come back marked.",
-        "note": "The operator rotates this credential because the operator "
-                "holds it. At /x/signed/rotate the peer rotates their own "
-                "key and the operator cannot, because a rotation there must "
-                "be signed by the key being replaced.",
-    }, 200
-
-
-def _set_status(ctx, data, status):
-    _setup(ctx)
-    peer_id = (data.get("peer_id") or "").strip().lower()
-    if not ctx["conn"].execute("SELECT 1 FROM peer_registry WHERE peer_id = ?",
-                               (peer_id,)).fetchone():
-        return {"ok": False, "error": "unknown_peer"}, 404
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "UPDATE peer_registry SET status = ? WHERE peer_id = ?",
-            (status, peer_id))
-        ctx["conn"].commit()
-    try:
-        ctx["seal"]({"module": "peer", "action": status,
-                     "peer_id": peer_id}, {"status": status}, _now(), None)
-    except Exception:
-        pass
-    return {"ok": True, "peer_id": peer_id, "status": status}, 200
-
-
-def _peers(ctx):
-    _setup(ctx)
-    now = _now()
-    rows = ctx["conn"].execute(
-        "SELECT peer_id, chain_name, url, status, created, submissions, "
-        "last_seen, rotated_at FROM peer_registry ORDER BY created"
-    ).fetchall()
-    return {
-        "ok": True,
-        "count": len(rows),
-        "auth": "hmac-shared-secret",
-        "auth_scope": SHARED_SECRET_SCOPE,
-        "peers": [{
-            "peer_id": r[0], "chain_name": r[1], "url": r[2] or None,
-            "status": r[3], "registered": _iso(r[4]),
-            "submissions": r[5], "last_seen": _iso(r[6]) if r[6] else None,
-            "rotation_overlap_active":
-                bool(r[7] and r[7] + ROTATION_OVERLAP_SECONDS > now),
-        } for r in rows],
-        "note": "Secrets are never returned by any route.",
-    }, 200
-
-
-def _history(ctx, data):
-    _setup(ctx)
-    peer_id = (data.get("peer_id") or "").strip().lower()
-    try:
-        limit = min(int(data.get("limit", 50)), 500)
-    except (TypeError, ValueError):
-        limit = 50
-    q = ("SELECT peer_id, ts, idempotency_key, payload_digest, audit_hash "
-         "FROM peer_submission")
-    args = []
-    if peer_id:
-        q += " WHERE peer_id = ?"
-        args.append(peer_id)
-    q += " ORDER BY id DESC LIMIT ?"
-    args.append(limit)
-    rows = ctx["conn"].execute(q, args).fetchall()
-    return {
-        "ok": True, "count": len(rows),
-        "submissions": [{
-            "peer_id": r[0], "at": _iso(r[1]), "idempotency_key": r[2],
-            "payload_digest": r[3], "audit_hash": r[4],
-        } for r in rows],
-    }, 200
-
-
-def _canonical_route(data):
-    """
-    Debugging aid. Give it an envelope, get back the exact string this
-    server will sign. Reveals nothing -- the secret is not involved.
-    """
-    env = dict(data or {})
-    env.pop("signature", None)
-    if "ts" in env:
-        try:
-            env["ts"] = int(env["ts"])
-        except (TypeError, ValueError):
-            return {"ok": False, "error": "malformed_ts"}, 400
-    s = string_to_sign(env)
-    known = {"peer_id", "ts", "nonce", "payload", "idempotency_key"}
-    extra = sorted(k for k in env if k not in known)
-    out = {
-        "ok": True,
-        "string_to_sign": s,
-        "sha256": hashlib.sha256(s.encode("utf-8")).hexdigest(),
-        "byte_length": len(s.encode("utf-8")),
-        "recipe": "\"AILEASH-PEER-v1\\n\" + json.dumps(envelope_without_"
-                  "signature, sort_keys=True, separators=(\",\",\":\"), "
-                  "ensure_ascii=True)",
-        "then": "signature = hmac_sha256(secret, string_to_sign).hexdigest()",
-    }
-    if extra:
-        out["warning"] = (
-            "This route echoes whatever you sent, but /x/peer/submit "
-            "rebuilds the envelope from known fields only. These extra "
-            "top-level fields would NOT be part of what submit verifies, "
-            "so a signature over the string above would be rejected: %s. "
-            "Move them inside payload." % ", ".join(extra))
-    return out, 200
-
-
-# ------------------------------------------------------------------ spec
-
-def _spec():
-    return {
-        "module": "peer",
-        "version": VERSION,
-        "auth": "hmac-shared-secret",
-        "read_this_first": SHARED_SECRET_SCOPE,
-        "purpose":
-            "Signed submission for named peers. Sits beside the open "
-            "/x/witness/observe endpoint rather than replacing it. The "
-            "open endpoint stays unauthenticated so anyone can audit the "
-            "network without an account; this one guarantees that only a "
-            "holder of the peer secret can submit as that chain -- noting "
-            "that the operator is also a holder.",
-        "choosing_a_lane": {
-            "/x/witness/observe": "Open. No credential. Anyone can submit "
-                                  "under any name; the record says how "
-                                  "strong the claim is rather than "
-                                  "refusing it.",
-            "/x/peer/submit": "This lane. Shared secret. Excludes third "
-                              "parties, does not exclude the operator. No "
-                              "key custody burden on the peer.",
-            "/x/signed/submit": "Ed25519. The peer holds the private key "
-                                "and this deployment holds only the public "
-                                "half, so the operator is excluded too. "
-                                "Strongest, at the cost of the peer "
-                                "carrying a long-lived private key.",
-        },
-        "envelope": {
-            "peer_id": "string, issued at registration",
-            "ts": "integer unix seconds",
-            "nonce": "string, at least %d chars, unique per peer for %ds"
-                     % (NONCE_MIN_LENGTH, NONCE_TTL_SECONDS),
-            "idempotency_key": "optional string, max %d chars"
-                               % MAX_IDEMPOTENCY_KEY,
-            "payload": "object. period roots, tips, whatever is agreed. "
-                       "max %d bytes canonicalized." % MAX_PAYLOAD_BYTES,
-            "signature": "hex hmac-sha256",
-            "no_other_top_level_fields":
-                "The server rebuilds the envelope from exactly the field "
-                "names above before verifying. Any extra top-level field "
-                "you signed is not part of what we verify and your "
-                "signature will not match. Put your own data inside "
-                "payload.",
-        },
-        "canonicalization": {
-            "recipe": "json.dumps(obj, sort_keys=True, "
-                      "separators=(\",\",\":\"), ensure_ascii=True)",
-            "string_to_sign": "\"AILEASH-PEER-v1\\n\" + canonical(envelope "
-                              "with the signature field removed)",
-            "signature": "hmac_sha256(secret, string_to_sign).hexdigest()",
-            "debug": "POST the envelope to /x/peer/canonical to get the "
-                     "exact string back. No secret required.",
-        },
-        "rules": {
-            "clock_skew": "+/-%ds. Outside: 401 clock_skew, with the "
-                          "server's time in the body."
-                          % CLOCK_SKEW_SECONDS,
-            "replay": "A nonce is single-use per peer for %ds. Reused: "
-                      "409 replay." % NONCE_TTL_SECONDS,
-            "idempotency": "Same idempotency_key and same payload returns "
-                           "the original receipt verbatim with "
-                           "replayed=true; nothing is sealed twice. Same "
-                           "key with a different payload: 409 "
-                           "idempotency_conflict.",
-            "retry": "Retry the identical envelope. With an "
-                     "idempotency_key that is a safe no-op. Without one, "
-                     "a retry inside the nonce window returns 409 replay "
-                     "-- so send an idempotency_key if you intend to "
-                     "retry at all.",
-            "suspension": "403 peer_suspended. Nothing is deleted and the "
-                          "peer's sealed history stands.",
-            "rotation": "A new secret is issued and the previous one stays "
-                        "valid for %ds. Submissions accepted on the old "
-                        "secret come back with signed_with=previous and a "
-                        "warning naming the cutoff. The operator performs "
-                        "the rotation, because the operator holds the "
-                        "secret."
-                        % ROTATION_OVERLAP_SECONDS,
-        },
-        "on_acceptance":
-            "The payload is sealed into the audit chain and you get "
-            "audit_hash, block_index and receipt_seq. Verify "
-            "independently: inclusion at /x/complete/prove, ancestry at "
-            "/x/consistency/ancestor, append-only at "
-            "/x/consistency/proof. Both offline verifiers "
-            "(aileash_verify.py, verify_authority.py) are stdlib only and "
-            "touch no network.",
-        "routes": {
-            "GET spec": "public. this document.",
-            "POST canonical": "public. the exact string to sign.",
-            "GET peers": "public. peer ids and status. never secrets.",
-            "POST submit": "signature authenticated. no API key.",
-            "POST register": "keyed. operator issues a credential.",
-            "POST rotate": "keyed. new secret, old one overlaps.",
-            "POST suspend / POST resume": "keyed.",
-            "GET history": "keyed. submissions, optionally by peer.",
-        },
-        "what_this_does_not_do": [
-            "It does not exclude the operator of this deployment. A shared "
-            "secret is held by both parties, so a valid signature means a "
-            "holder of the secret submitted - which is you and also us. "
-            "Use /x/signed/submit if that matters to you.",
-            "It does not make a submitted root true. It proves who "
-            "submitted it and when, and that it has not changed since.",
-            "It does not replace /x/witness/observe. Peers who prefer the "
-            "open path keep using it and lose nothing.",
-            "A shared secret authenticates a channel, not a person. If "
-            "the secret leaks, rotate it.",
-        ],
-        "worked_example": {
-            "envelope_before_signing": {
-                "peer_id": "example-001",
-                "ts": 1755432000,
-                "nonce": "0123456789abcdef",
-                "payload": {"period": "2026-Q3", "root": "ab12...", "count": 4096},
-            },
-            "note": "POST exactly that to /x/peer/canonical and you will "
-                    "get the string to sign, so you can confirm your "
-                    "implementation before you hold a secret.",
-        },
-    }
-
-
-# ---------------------------------------------------------------- router
-
-def handle(method, action, data, api_key, ctx):
-    data = data or {}
-
-    if action == "spec":
-        return _spec(), 200
-    if action == "canonical":
-        return _canonical_route(data)
-    if action == "peers":
-        return _peers(ctx)
-    if action == "submit":
-        return _submit(ctx, data)
-
-    if not api_key:
-        return {"ok": False, "error": "api_key_required"}, 401
-
-    if action == "register":
-        return _register(ctx, data)
-    if action == "rotate":
-        return _rotate(ctx, data)
-    if action == "suspend":
-        return _set_status(ctx, data, "suspended")
-    if action == "resume":
-        return _set_status(ctx, data, "active")
-    if action == "history":
-        return _history(ctx, data)
-
-    return {"ok": False, "error": "unknown_action", "action": action}, 404
-
-```
-
-
 ## `modules/peerconsole.py`
 
 376 lines, 15478 bytes
@@ -2613,5 +1830,628 @@ def handle(method, action, data, api_key, ctx):
     return {"error": "unknown_action", "action": action,
             "GET": ["spec", "history", "verify", "list"],
             "POST": ["seal (keyed)"]}, 404
+
+```
+
+
+## `modules/ratchet.py`
+
+615 lines, 25928 bytes
+
+```python
+"""
+ratchet.py - time only runs one way for the machine.
+
+WHAT THIS IS FOR
+----------------
+heartbeat.py proves WHEN a record can have been made. sortition.py proves
+NOBODY CHOSE what got reviewed. This one proves an actor cannot move
+backwards through time.
+
+Every action an agent takes is bound to the beacon round current at the
+moment it acted. Beacon rounds only ever increase. So an actor's actions
+form a strictly rising ladder, and the rule is one line:
+
+    an action carrying a beacon round at or below the actor's last
+    recorded round is REFUSED.
+
+WHAT THAT KILLS, WITHOUT A POLICY, A PROMPT OR A PROMISE
+--------------------------------------------------------
+BACKDATING     An agent cannot produce an action claiming to sit earlier
+               than one it already took. The earlier round is already
+               spent.
+REPLAY         Capture a valid action and fire it again later: the round
+               is stale and the digest is already on the ladder.
+PRE-COMPUTATION
+               An agent cannot prepare a batch of actions in advance,
+               because it cannot know tomorrow's beacon values today. A
+               round that has not been sealed here yet is refused.
+REWIND         Restore an agent from an old snapshot to undo its history
+               and its next action lands below the recorded floor. The
+               ladder is in a chain the agent does not control, so
+               restoring the agent does not restore its position.
+
+REFUSALS ARE SEALED, NOT DROPPED
+--------------------------------
+This is the part that matters. A refused action is written into the chain
+with the reason. An agent trying to rewind is the single most interesting
+event this system can observe, and throwing it away as a 409 would be
+throwing away the evidence. /x/ratchet/refusals is public.
+
+HONEST LIMITS
+-------------
+- It binds an actor's actions to an order. It says nothing about whether
+  any action was correct, authorised, or wise.
+- An actor that simply stops acting cannot be forced to continue. Silence
+  is visible (last_seen goes stale) but is not prevented.
+- Two different actor ids are two different ladders. Anyone able to mint
+  new actor ids can start a fresh ladder; that is an identity problem,
+  handled by whatever issues the ids, not here.
+- The floor is only as fine-grained as the beat cadence. At a five
+  minute cadence, two actions inside the same beat are ordered by
+  sequence, not by beacon time, and that is reported rather than dressed
+  up.
+- It depends on heartbeat. With no beats sealed, nothing can be admitted,
+  and this module says so rather than waving actions through.
+
+Contract: handle(method, action, data, api_key, ctx) -> (dict, status)
+Routes:
+  GET  spec      public  what this is and the exact admission rules
+  GET  actor     public  ?id= - one actor's current rung and ladder
+  GET  actors    public  every ladder, with staleness
+  GET  refusals  public  every refused attempt, with reason. The good bit.
+  GET  verify    public  ?id= - re-walk a ladder and report any break
+  GET  status    public  coverage, admission and refusal counts
+  POST act       keyed   submit an action. Admitted or refused; both sealed.
+"""
+
+import json
+import time
+import hashlib
+
+VERSION = "1.0.0"
+
+PUBLIC = {
+    ("GET", "spec"),
+    ("GET", "actor"),
+    ("GET", "actors"),
+    ("GET", "refusals"),
+    ("GET", "verify"),
+    ("GET", "status"),
+}
+
+MAX_LAG_BEATS = 3          # how far behind the newest beat an action may be
+MAX_ACTOR_LEN = 120
+STALE_SECONDS = 3600
+
+REASONS = {
+    "ok": "Admitted. The round is ahead of this actor's last rung.",
+    "no_beats": (
+        "Refused: no beacon has been sealed on this server, so there is no "
+        "time to bind to. Nothing is admitted on trust."),
+    "round_unknown": (
+        "Refused: that beacon round has not been sealed here. Either it has "
+        "not happened yet - which would mean the actor knew a value before "
+        "it existed - or this server has not observed it."),
+    "round_not_advanced": (
+        "Refused: the round is at or below this actor's last rung. This is "
+        "the ratchet. An actor cannot move backwards through beacon time, "
+        "whether by backdating, by replay, or by being restored from an "
+        "older snapshot."),
+    "round_too_stale": (
+        "Refused: the round is further behind the current beat than the "
+        "permitted lag. An action bound to old time is a replay or a very "
+        "slow actor; both are refused and both are recorded."),
+    "digest_replayed": (
+        "Refused: this exact action digest is already on this actor's "
+        "ladder. Identical work resubmitted is a replay by definition."),
+    "bad_request": "Refused: malformed submission.",
+}
+
+WHAT_THIS_PROVES = (
+    "That an actor's recorded actions only ever moved forward in a public "
+    "time nobody controls. It does not prove any action was correct, "
+    "authorised, or sensible."
+)
+
+DDL = [
+    """CREATE TABLE IF NOT EXISTS ratchet_rung (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        actor         TEXT NOT NULL,
+        seq           INTEGER NOT NULL,
+        beacon_round  INTEGER NOT NULL,
+        beacon_value  TEXT,
+        digest        TEXT NOT NULL,
+        label         TEXT,
+        at            REAL NOT NULL,
+        chain_rowid   INTEGER,
+        audit_hash    TEXT
+    )""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_rat_seq ON ratchet_rung(actor, seq)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_rat_dig ON ratchet_rung(actor, digest)",
+    "CREATE INDEX IF NOT EXISTS idx_rat_actor ON ratchet_rung(actor)",
+    """CREATE TABLE IF NOT EXISTS ratchet_refusal (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        actor         TEXT NOT NULL,
+        claimed_round INTEGER,
+        last_round    INTEGER,
+        digest        TEXT,
+        reason        TEXT NOT NULL,
+        at            REAL NOT NULL,
+        chain_rowid   INTEGER,
+        audit_hash    TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_rat_ref ON ratchet_refusal(actor)",
+]
+
+
+# ---------------------------------------------------------------------
+# plumbing
+# ---------------------------------------------------------------------
+
+def _ensure(conn, lock):
+    with lock:
+        cur = conn.cursor()
+        for stmt in DDL:
+            cur.execute(stmt)
+        conn.commit()
+
+
+def _iso(t):
+    if t is None:
+        return None
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+
+
+def _human(seconds):
+    if seconds is None:
+        return None
+    s = int(round(seconds))
+    if s < 60:
+        return "%d seconds" % s
+    if s < 3600:
+        return "%d minutes" % (s // 60)
+    if s < 86400:
+        return "%d hours" % (s // 3600)
+    return "%d days" % (s // 86400)
+
+
+def _seal(ctx, action, payload):
+    """server.py: seal(event, result, ts, api_key=None); event is a DICT
+    carrying user_id; returns (audit_hash, block_index, key_seq)."""
+    fn = ctx.get("seal")
+    if fn is None:
+        return None, None
+    ts = time.time()
+    event = {"user_id": "ratchet", "action": action, "amount": 0,
+             "country": "UK", "device_id": "ratchet", "anomaly": 0,
+             "device_risk": 0}
+    result = dict(payload)
+    result.setdefault("decision", "RATCHET")
+    result.setdefault("score", 0)
+    result.setdefault("version", VERSION)
+    result.setdefault("timestamp", ts)
+    for call in (lambda: fn(event, result, ts),
+                 lambda: fn(event, result, ts, None),
+                 lambda: fn(event, result)):
+        try:
+            out = call()
+        except TypeError:
+            continue
+        except Exception:
+            return None, None
+        h = idx = None
+        if isinstance(out, (tuple, list)):
+            for item in out:
+                if isinstance(item, str) and len(item) == 64 and h is None:
+                    h = item
+                elif isinstance(item, int) and idx is None:
+                    idx = item
+        elif isinstance(out, str):
+            h = out
+        return h, idx
+    return None, None
+
+
+def _newest_beat(conn):
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT beacon_round, value, fetched_at FROM heartbeat_tick"
+                    " WHERE chain_rowid IS NOT NULL AND beacon_round IS NOT NULL"
+                    " ORDER BY beacon_round DESC LIMIT 1")
+        return cur.fetchone()
+    except Exception:
+        return None
+
+
+def _beat(conn, rnd):
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT beacon_round, value, fetched_at FROM heartbeat_tick"
+                    " WHERE beacon_round=? AND chain_rowid IS NOT NULL LIMIT 1",
+                    (rnd,))
+        return cur.fetchone()
+    except Exception:
+        return None
+
+
+def _beats_between(conn, low, high):
+    """How many sealed beats sit in (low, high]. Used for the lag check."""
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM heartbeat_tick WHERE chain_rowid IS"
+                    " NOT NULL AND beacon_round>? AND beacon_round<=?",
+                    (low, high))
+        return cur.fetchone()[0]
+    except Exception:
+        return 0
+
+
+def _top(conn, actor):
+    cur = conn.cursor()
+    cur.execute("SELECT seq, beacon_round, digest, at FROM ratchet_rung"
+                " WHERE actor=? ORDER BY seq DESC LIMIT 1", (actor,))
+    return cur.fetchone()
+
+
+def _refuse(ctx, conn, lock, actor, rnd, last, digest, reason, extra=None):
+    now = time.time()
+    with lock:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO ratchet_refusal (actor, claimed_round,"
+                    " last_round, digest, reason, at) VALUES (?,?,?,?,?,?)",
+                    (actor, rnd, last, digest, reason, now))
+        rid = cur.lastrowid
+        conn.commit()
+    h, idx = _seal(ctx, "ratchet_refused", {
+        "kind": "ratchet_refusal", "actor": actor, "claimed_round": rnd,
+        "last_admitted_round": last, "digest": digest, "reason": reason,
+        "explanation": REASONS.get(reason, reason),
+        "note": ("A refused action is sealed rather than discarded. An actor "
+                 "attempting to move backwards is the most interesting event "
+                 "this module can observe."),
+    })
+    if h or idx:
+        with lock:
+            conn.execute("UPDATE ratchet_refusal SET chain_rowid=?,"
+                         " audit_hash=? WHERE id=?", (idx, h, rid))
+            conn.commit()
+    out = {
+        "admitted": False,
+        "reason": reason,
+        "explanation": REASONS.get(reason, reason),
+        "actor": actor,
+        "claimed_round": rnd,
+        "last_admitted_round": last,
+        "refusal_sealed_at_block": idx,
+        "refusal_audit_hash": h,
+        "this_refusal_is_permanent": True,
+        "public_record": "/x/ratchet/refusals",
+    }
+    if extra:
+        out.update(extra)
+    return out
+
+
+# ---------------------------------------------------------------------
+# handle
+# ---------------------------------------------------------------------
+
+def handle(method, action, data, api_key, ctx):
+    conn, lock = ctx["conn"], ctx["lock"]
+    _ensure(conn, lock)
+
+    if method == "GET" and action == "spec":
+        return _spec(), 200
+
+    # -------------------------------------------------- act
+    if method == "POST" and action == "act":
+        actor = str(data.get("actor") or "").strip().lower()[:MAX_ACTOR_LEN]
+        digest = str(data.get("digest") or "").strip().lower()
+        label = str(data.get("label") or "")[:200] or None
+        rnd = data.get("round")
+
+        if not actor:
+            return {"error": "actor_required",
+                    "note": "A stable identifier for the acting agent."}, 400
+        if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            return {"error": "digest_required",
+                    "note": ("A SHA-256 of the action. The action itself never "
+                             "leaves your system.")}, 400
+
+        newest = _newest_beat(conn)
+        if not newest:
+            top = _top(conn, actor)
+            return _refuse(ctx, conn, lock, actor, rnd,
+                           top[1] if top else None, digest, "no_beats"), 503
+
+        newest_round = newest[0]
+        if rnd is None:
+            rnd = newest_round          # bind to now if the caller does not say
+        try:
+            rnd = int(rnd)
+        except (TypeError, ValueError):
+            return {"error": "round_invalid"}, 400
+
+        top = _top(conn, actor)
+        last_round = top[1] if top else None
+        last_seq = top[0] if top else 0
+
+        if not _beat(conn, rnd):
+            return _refuse(ctx, conn, lock, actor, rnd, last_round, digest,
+                           "round_unknown",
+                           {"newest_sealed_round": newest_round}), 409
+
+        if last_round is not None and rnd <= last_round:
+            return _refuse(ctx, conn, lock, actor, rnd, last_round, digest,
+                           "round_not_advanced",
+                           {"the_rule": ("beacon round must be strictly greater "
+                                         "than the actor's last rung")}), 409
+
+        lag = _beats_between(conn, rnd, newest_round)
+        if lag > MAX_LAG_BEATS:
+            return _refuse(ctx, conn, lock, actor, rnd, last_round, digest,
+                           "round_too_stale",
+                           {"beats_behind": lag,
+                            "max_lag_beats": MAX_LAG_BEATS,
+                            "newest_sealed_round": newest_round}), 409
+
+        cur = conn.cursor()
+        cur.execute("SELECT seq FROM ratchet_rung WHERE actor=? AND digest=?",
+                    (actor, digest))
+        if cur.fetchone():
+            return _refuse(ctx, conn, lock, actor, rnd, last_round, digest,
+                           "digest_replayed"), 409
+
+        beat = _beat(conn, rnd)
+        now = time.time()
+        seq = last_seq + 1
+        with lock:
+            cur = conn.cursor()
+            cur.execute("INSERT INTO ratchet_rung (actor, seq, beacon_round,"
+                        " beacon_value, digest, label, at)"
+                        " VALUES (?,?,?,?,?,?,?)",
+                        (actor, seq, rnd, beat[1], digest, label, now))
+            rid = cur.lastrowid
+            conn.commit()
+
+        h, idx = _seal(ctx, "ratchet_step", {
+            "kind": "ratchet_step", "actor": actor, "seq": seq,
+            "beacon_round": rnd, "beacon_value": beat[1], "digest": digest,
+            "label": label, "previous_round": last_round,
+            "note": ("Bound to a public beacon value the actor could not have "
+                     "known before that round existed."),
+        })
+        if h or idx:
+            with lock:
+                conn.execute("UPDATE ratchet_rung SET chain_rowid=?,"
+                             " audit_hash=? WHERE id=?", (idx, h, rid))
+                conn.commit()
+
+        return {
+            "admitted": True, "actor": actor, "seq": seq,
+            "beacon_round": rnd, "beacon_value": beat[1],
+            "previous_round": last_round, "digest": digest,
+            "sealed_at_block": idx, "audit_hash": h,
+            "floor": ("This action cannot have been created before beacon "
+                      "round %d at %s." % (rnd, _iso(beat[2]))),
+            "ratchet": ("This actor can no longer act at or below round %d. "
+                        "That door is shut permanently." % rnd),
+            "verify_beacon": "/x/heartbeat/verify?round=%d" % rnd,
+        }, 200
+
+    # -------------------------------------------------- actor
+    if method == "GET" and action == "actor":
+        actor = str(data.get("id") or "").strip().lower()
+        if not actor:
+            return {"error": "id_required",
+                    "usage": "/x/ratchet/actor?id=<actor>"}, 400
+        cur = conn.cursor()
+        cur.execute("SELECT seq, beacon_round, digest, label, at, chain_rowid,"
+                    " audit_hash FROM ratchet_rung WHERE actor=? ORDER BY seq",
+                    (actor,))
+        rungs = cur.fetchall()
+        if not rungs:
+            return {"actor": actor, "rungs": 0,
+                    "message": "No ladder for this actor."}, 404
+        cur.execute("SELECT COUNT(*) FROM ratchet_refusal WHERE actor=?", (actor,))
+        refused = cur.fetchone()[0]
+        last = rungs[-1]
+        age = time.time() - last[4]
+        return {
+            "actor": actor,
+            "rungs": len(rungs),
+            "current_round": last[1],
+            "current_seq": last[0],
+            "last_action_at": _iso(last[4]),
+            "seconds_since": round(age, 1),
+            "status": "current" if age < STALE_SECONDS else "silent",
+            "refusals": refused,
+            "ladder": [{"seq": r[0], "round": r[1], "digest": r[2],
+                        "label": r[3], "at": _iso(r[4]), "block": r[5],
+                        "audit_hash": r[6]} for r in rungs[-50:]],
+            "floor_now": ("This actor cannot act at or below round %d."
+                          % last[1]),
+            "what_this_proves": WHAT_THIS_PROVES,
+        }, 200
+
+    # -------------------------------------------------- actors
+    if method == "GET" and action == "actors":
+        now = time.time()
+        cur = conn.cursor()
+        cur.execute("SELECT actor, COUNT(*), MAX(beacon_round), MAX(at)"
+                    " FROM ratchet_rung GROUP BY actor ORDER BY MAX(at) DESC")
+        out = []
+        for a, n, rnd, at in cur.fetchall():
+            cur2 = conn.cursor()
+            cur2.execute("SELECT COUNT(*) FROM ratchet_refusal WHERE actor=?", (a,))
+            out.append({"actor": a, "rungs": n, "current_round": rnd,
+                        "last_action": _iso(at),
+                        "silent_for": _human(now - at) if now - at > STALE_SECONDS else None,
+                        "refusals": cur2.fetchone()[0]})
+        return {"count": len(out), "actors": out,
+                "note": ("Silence is visible but not prevented. An actor that "
+                         "stops acting simply stops, and no design fixes "
+                         "that.")}, 200
+
+    # -------------------------------------------------- refusals
+    if method == "GET" and action == "refusals":
+        try:
+            limit = min(int(data.get("limit", 100)), 500)
+        except (TypeError, ValueError):
+            limit = 100
+        cur = conn.cursor()
+        cur.execute("SELECT actor, claimed_round, last_round, digest, reason,"
+                    " at, chain_rowid, audit_hash FROM ratchet_refusal"
+                    " ORDER BY id DESC LIMIT ?", (limit,))
+        rows = cur.fetchall()
+        mix = {}
+        for r in rows:
+            mix[r[4]] = mix.get(r[4], 0) + 1
+        return {
+            "count": len(rows),
+            "by_reason": mix,
+            "refusals": [{"actor": r[0], "claimed_round": r[1],
+                          "last_admitted_round": r[2], "digest": r[3],
+                          "reason": r[4], "explanation": REASONS.get(r[4], r[4]),
+                          "at": _iso(r[5]), "block": r[6], "audit_hash": r[7]}
+                         for r in rows],
+            "why_this_is_public": (
+                "A refused action is sealed rather than discarded, and the "
+                "list is open. An actor attempting to move backwards through "
+                "time is the single most interesting thing this system can "
+                "see, and hiding it would defeat the point of building it."),
+        }, 200
+
+    # -------------------------------------------------- verify
+    if method == "GET" and action == "verify":
+        actor = str(data.get("id") or "").strip().lower()
+        if not actor:
+            return {"error": "id_required"}, 400
+        cur = conn.cursor()
+        cur.execute("SELECT seq, beacon_round, beacon_value, digest FROM"
+                    " ratchet_rung WHERE actor=? ORDER BY seq", (actor,))
+        rungs = cur.fetchall()
+        if not rungs:
+            return {"error": "unknown_actor", "actor": actor}, 404
+        breaks = []
+        prev_seq = 0
+        prev_round = None
+        seen = set()
+        for seq, rnd, val, dig in rungs:
+            if seq != prev_seq + 1:
+                breaks.append({"at_seq": seq, "fault": "sequence_gap",
+                               "expected": prev_seq + 1})
+            if prev_round is not None and rnd <= prev_round:
+                breaks.append({"at_seq": seq, "fault": "round_did_not_advance",
+                               "round": rnd, "previous": prev_round})
+            if dig in seen:
+                breaks.append({"at_seq": seq, "fault": "duplicate_digest"})
+            b = _beat(conn, rnd)
+            if not b:
+                breaks.append({"at_seq": seq, "fault": "beacon_round_not_sealed",
+                               "round": rnd})
+            elif b[1] != val:
+                breaks.append({"at_seq": seq, "fault": "beacon_value_mismatch",
+                               "round": rnd})
+            seen.add(dig)
+            prev_seq, prev_round = seq, rnd
+        return {
+            "actor": actor, "rungs": len(rungs), "intact": not breaks,
+            "breaks": breaks,
+            "checked": ["sequence has no gaps",
+                        "beacon round strictly increases",
+                        "no digest appears twice",
+                        "each rung's beacon value matches the sealed beat"],
+            "do_it_without_us": (
+                "Every beacon round on the ladder is re-fetchable from the "
+                "beacon operator. Confirm each value there, then confirm each "
+                "audit_hash is in the chain at /api/verify-chain. Neither step "
+                "needs our cooperation."),
+            "what_this_proves": WHAT_THIS_PROVES,
+        }, 200
+
+    # -------------------------------------------------- status
+    if method == "GET" and action == "status":
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*), COUNT(DISTINCT actor) FROM ratchet_rung")
+        rungs, actors = cur.fetchone()
+        cur.execute("SELECT COUNT(*) FROM ratchet_refusal")
+        refused = cur.fetchone()[0]
+        cur.execute("SELECT reason, COUNT(*) FROM ratchet_refusal GROUP BY reason")
+        mix = {r[0]: r[1] for r in cur.fetchall()}
+        newest = _newest_beat(conn)
+        return {
+            "version": VERSION,
+            "actors": actors, "rungs_admitted": rungs,
+            "actions_refused": refused,
+            "refusals_by_reason": mix,
+            "current_beacon_round": newest[0] if newest else None,
+            "beacon_available": newest is not None,
+            "max_lag_beats": MAX_LAG_BEATS,
+            "depends_on": {
+                "heartbeat": ("supplies the time. With no beats sealed, "
+                              "nothing is admitted - actions are refused "
+                              "rather than waved through on trust."),
+            },
+            "what_this_proves": WHAT_THIS_PROVES,
+        }, 200
+
+    return {"error": "unknown_action", "action": action,
+            "actions": ["spec", "actor", "actors", "refusals", "verify",
+                        "status", "act"]}, 404
+
+
+def _spec():
+    return {
+        "module": "ratchet",
+        "version": VERSION,
+        "one_line": "Time only runs one way for the machine.",
+        "the_rule": (
+            "An action carrying a beacon round at or below the actor's last "
+            "recorded round is refused. Beacon rounds only increase, so an "
+            "actor's ladder only rises."),
+        "what_it_kills": {
+            "backdating": "the earlier round is already spent",
+            "replay": "stale round, and the digest is already on the ladder",
+            "pre_computation": ("an unsealed future round is refused, and "
+                                "nobody can know a beacon value early"),
+            "rewind": ("the ladder lives in a chain the actor does not "
+                       "control, so restoring an agent from a snapshot does "
+                       "not restore its position"),
+        },
+        "admission_rules_in_order": [
+            "1. A beat must exist. No beats, nothing admitted.",
+            "2. The claimed round must already be sealed here.",
+            "3. The round must be strictly above the actor's last rung.",
+            "4. The round must be within %d beats of the newest." % MAX_LAG_BEATS,
+            "5. The digest must not already be on this actor's ladder.",
+        ],
+        "refusals_are_sealed": (
+            "A refused action is written into the chain with its reason and "
+            "published at /x/ratchet/refusals. Discarding it would throw away "
+            "the most interesting evidence the system can produce."),
+        "privacy": (
+            "Only a SHA-256 of the action is submitted. The action itself, "
+            "its inputs and its outputs never leave the caller's system."),
+        "what_this_proves": WHAT_THIS_PROVES,
+        "limits": [
+            "It proves order, not correctness, authority or good judgement.",
+            "An actor that stops acting is visible but not prevented.",
+            "New actor ids start new ladders; identity is not this module's "
+            "problem and it does not pretend otherwise.",
+            "Within a single beat, actions are ordered by sequence rather "
+            "than by beacon time. At a five minute cadence that is a five "
+            "minute grain, and it is reported rather than dressed up.",
+        ],
+        "routes": {
+            "POST /x/ratchet/act": "keyed - submit an action digest",
+            "GET /x/ratchet/actor?id=": "one ladder",
+            "GET /x/ratchet/actors": "every ladder",
+            "GET /x/ratchet/refusals": "every refused attempt and why",
+            "GET /x/ratchet/verify?id=": "re-walk a ladder",
+            "GET /x/ratchet/status": "counts and current round",
+        },
+    }
 
 ```
