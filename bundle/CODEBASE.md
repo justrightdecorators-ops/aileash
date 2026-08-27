@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-119 files across 27 parts.
+120 files across 27 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -36,6 +36,7 @@ Generated automatically on every push. Do not edit by hand.
 - `modules/dsr.py`
 - `modules/fingerprint.py`
 - `modules/heartbeat.py`
+- `modules/lineage.py`
 
 ## [CODEBASE-07.md](CODEBASE-07.md)
 
