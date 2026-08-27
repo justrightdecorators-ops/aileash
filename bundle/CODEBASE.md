@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-119 files across 27 parts.
+120 files across 27 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -70,77 +70,78 @@ Generated automatically on every push. Do not edit by hand.
 ## [CODEBASE-11.md](CODEBASE-11.md)
 
 - `modules/selfcheck.py`
+- `modules/signed.py`
 - `modules/sortition.py`
 - `modules/spec.py`
-- `modules/standard.py`
-- `modules/stats.py`
 
 ## [CODEBASE-12.md](CODEBASE-12.md)
 
+- `modules/standard.py`
+- `modules/stats.py`
 - `modules/tokensaver.py`
-- `modules/verifier.py`
 
 ## [CODEBASE-13.md](CODEBASE-13.md)
 
+- `modules/verifier.py`
 - `modules/wallet.py`
 - `modules/warmup.py`
-- `modules/witness.py`
 
 ## [CODEBASE-14.md](CODEBASE-14.md)
 
+- `modules/witness.py`
 - `modules/witnessed.py`
 - `Verify_ai.py`
 - `ai_act_ranker.py`
 - `ai_safety_scanner.py`
 - `aigrade_insert.py`
 - `aileash_reporter.py`
+
+## [CODEBASE-15.md](CODEBASE-15.md)
+
 - `aileash_signed_client.py`
 - `aileash_verify.py`
 - `anchor.py`
 - `board_auditor.py`
-
-## [CODEBASE-15.md](CODEBASE-15.md)
-
 - `brain.py`
 - `broadcaster.py`
 - `build_sebbi_ecosystem.py`
 - `gateway_proxy.py`
 - `meshwitness.py`
-- `sebbi_orchestrator.py`
-- `sebbi_sdk.py`
 
 ## [CODEBASE-16.md](CODEBASE-16.md)
 
+- `sebbi_orchestrator.py`
+- `sebbi_sdk.py`
 - `sebbi_tokensaver.py`
-- `sebdog_engine.py`
-- `sebdog_licence.py`
-- `sebdog_reporter.py`
 
 ## [CODEBASE-17.md](CODEBASE-17.md)
 
+- `sebdog_engine.py`
+- `sebdog_licence.py`
+- `sebdog_reporter.py`
 - `tests/attack_continuity_1.py`
 - `tests/attack_continuity_2.py`
 - `tests/attack_continuity_3.py`
 - `tests/attack_continuity_4.py`
 - `tests/attack_continuity_5.py`
+
+## [CODEBASE-18.md](CODEBASE-18.md)
+
 - `tests/attack_continuity_6.py`
 - `tests/attack_witnessed.py`
 - `verify_authority.py`
 - `AILeash-API-Reference-v6.4.2.md`
 - `LICENCE`
 - `README.md`
-
-## [CODEBASE-18.md](CODEBASE-18.md)
-
 - `admin.html`
 - `ai-standard.html`
 - `ai-txt-kit.html`
 - `aitxt-popup-live.html`
 - `brain.html`
-- `certificate.html`
 
 ## [CODEBASE-19.md](CODEBASE-19.md)
 
+- `certificate.html`
 - `compliance-assistant.html`
 - `console.html`
 - `contact.html`

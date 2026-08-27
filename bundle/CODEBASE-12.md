@@ -1,8 +1,590 @@
 # Codebase — part 12 of 27
 
 Contains:
+- `modules/standard.py`
+- `modules/stats.py`
 - `modules/tokensaver.py`
-- `modules/verifier.py`
+
+
+## `modules/standard.py`
+
+422 lines, 19423 bytes
+
+```python
+"""
+modules/standard.py  -  the Ordering Test discovery document for this domain
+
+WHAT IT SERVES
+--------------
+  GET /.well-known/ordering-test.json   this operator's discovery document
+  GET /x/standard/hash                  sha256 of that document
+  GET /x/standard/status                what is installed, and honest counts
+
+SHAPE
+-----
+Deliberately identical to the shape Red Flag AI Pro published first:
+
+    checks: { <name>: { supported, demonstrable_publicly, endpoint, note } }
+
+Two fields, not one, and the second is the better idea. "We built it" and
+"you can verify it without an account" are different claims, and most of this
+market blurs them. Separating them lets a vendor be honest about having
+something real that an outsider still has to take on trust.
+
+WHAT THE HOST HEADER IS DOING HERE
+----------------------------------
+base_url is derived from the request rather than written into the file. An
+earlier draft had the domain hardcoded, which meant any operator running it
+would publish somebody else's domain as the source - the opposite of a mirror.
+Deriving it means this file can be lifted to any domain and tells the truth
+about wherever it is actually running.
+
+EVERY PUBLISHED ENDPOINT MUST WORK AS WRITTEN
+---------------------------------------------
+An endpoint marked demonstrable_publicly is a promise that a stranger can copy
+it out of this document and get an answer. If the route needs a parameter, the
+document names that parameter. If a value has to be discovered first, the
+document says where to discover it. An endpoint that errors when followed
+literally is a failed check, not a documentation detail.
+
+HONESTY RULES THIS FILE FOLLOWS
+-------------------------------
+  - A check we have not built says supported: false. It does not quietly go
+    missing from the document.
+  - A check that exists but needs an account says demonstrable_publicly:
+    false, however much we would like the tick.
+  - runner is null. A runner exists in draft, but the checks have not been
+    jointly agreed with the other mirror, so publishing one as though it were
+    a settled standard would claim something neither operator has earned yet.
+
+None of that is modesty. A conformance document whose author scores full marks
+on the day they publish it is a marketing page.
+"""
+
+import hashlib
+import json
+import sys
+
+VERSION = "1.2"
+ORDERING_TEST_VERSION = "0.1"
+
+PUBLIC = {("GET", "status"), ("GET", "hash"), ("GET", "spec"),
+          ("GET", "document")}
+
+# Several paths on purpose. /.well-known/ is where the standard says to look,
+# but some platforms and static handlers reserve that prefix, so a plain root
+# path is served as well. /x/standard/document goes through the normal router
+# and cannot be intercepted by anything, which makes it the diagnostic.
+DISCOVERY_PATHS = ("/.well-known/ordering-test.json",
+                   "/ordering-test.json",
+                   "/well-known/ordering-test.json")
+
+VENDOR = "AILeash"
+FALLBACK_BASE = "https://sebbi.pro"
+
+RUNNER = None
+RUNNER_NOTE = (
+    "No shared runner file is published here yet. The checks themselves have "
+    "not been jointly agreed with the other mirrors as of this document's "
+    "publication. This describes AILeash's own side only, not a settled "
+    "cross-vendor standard.")
+
+# Order follows the other mirror's document so the two read side by side.
+CHECKS = {
+    "rule_binding": {
+        "supported": True,
+        "demonstrable_publicly": True,
+        "endpoint": "/x/rulebind/prove",
+        "note": ("The ruleset version is a component of a digest sealed with the "
+                 "decision, not a field beside it. POST any inputs without an "
+                 "account and the response returns the exact string that was "
+                 "hashed - SHA-256 it yourself and confirm it matches. Alter the "
+                 "ruleset hash and the digest stops recomputing; alter the digest "
+                 "and the chain breaks. Verify a past record at "
+                 "/x/rulebind/verify?receipt=... and see ruleset history at "
+                 "/x/rulebind/packs. No scoring logic is disclosed at any point - "
+                 "inputs are published as a digest, never as values."),
+    },
+    "commit_before_reveal": {
+        "supported": True,
+        "demonstrable_publicly": True,
+        "endpoint": "/x/demo/review",
+        "note": ("The reviewer receives the case with the machine verdict "
+                 "withheld. Their own call and dwell time are sealed first, "
+                 "then the verdict is revealed, and the chain fixes that order "
+                 "permanently. No account needed - open a case, commit a "
+                 "verdict, and check the block indices yourself. Commit "
+                 "endpoint is /x/demo/commit."),
+    },
+    "authority_tokens": {
+        "supported": True,
+        "demonstrable_publicly": True,
+        "endpoint": "/x/continuity/decisions",
+        "note": ("Authority is derived, not looked up. Every grant points at a "
+                 "parent and terminates at a human principal; scope, limits, "
+                 "purpose and validity must narrow at every hop; and the whole "
+                 "chain is re-derived at the instant of execution rather than "
+                 "trusted from the instant of issue. A decision beyond delegated "
+                 "authority escalates rather than executes. Issuing and exercising "
+                 "authority are keyed, but the record is not: /x/continuity/decisions "
+                 "lists real sealed evaluations without an account, and any id from "
+                 "it opens at /x/continuity/decision and /x/continuity/trace, which "
+                 "returns the full authority path with the grant and invariant that "
+                 "broke. Blocks are listed alongside allows, because a refusal with "
+                 "no public record is indistinguishable from never having been asked. "
+                 "An empty list means no authority has been exercised yet, not that "
+                 "none failed. Derivation rules at /x/continuity/spec."),
+    },
+    "mutual_witnessing": {
+        "supported": True,
+        "demonstrable_publicly": True,
+        "endpoint": "/x/witness/peers",
+        "note": ("Live, running both directions with an external peer chain "
+                 "hourly since 1 August 2026. No account needed, run it "
+                 "yourself. Our current tip is at /x/witness/tip and any party "
+                 "can submit theirs at /x/witness/observe without an account."),
+    },
+    "completeness_proof": {
+        "supported": True,
+        "demonstrable_publicly": True,
+        "endpoint": "/x/complete/root?period={period}&kind=receipts",
+        "note": ("Per-period sorted Merkle root and exact leaf count, committed "
+                 "before any export is requested. An export can then be checked "
+                 "against a number fixed before anyone knew it would be asked "
+                 "for. Committed periods are listed at /x/complete/periods - "
+                 "take a period identifier from there and substitute it. Only "
+                 "closed periods can be committed, so the current period will "
+                 "not appear until it ends. A period listed nowhere is a period "
+                 "nobody committed, which is itself the finding."),
+    },
+    "absence_proof": {
+        "supported": True,
+        "demonstrable_publicly": True,
+        "endpoint": "/x/complete/prove?period={period}&value={value}",
+        "note": ("Two adjacent leaves with consecutive indices demonstrate that "
+                 "nothing sits between them, so absence is proved rather than "
+                 "asserted. Both parameters are required: take a period from "
+                 "/x/complete/periods and supply any value you like. Try a "
+                 "value that is not there."),
+    },
+    "reconciliation": {
+        "supported": True,
+        "demonstrable_publicly": True,
+        "endpoint": "/x/reconcile/public",
+        "note": ("The sample is derived from the chain tip and sealed BEFORE any "
+                 "data is requested, so the operator cannot choose which records "
+                 "get examined or prepare only the flattering ones. Planning and "
+                 "submitting are keyed because they touch an operator's own "
+                 "records, but the part that decides whether any of it means "
+                 "anything is not: /x/reconcile/public gives run counts, match "
+                 "rates and mismatches without an account, and "
+                 "/x/reconcile/proof?id=RUN-XXXXXXXX shows the two sealed block "
+                 "indices so anyone can confirm the selection block precedes the "
+                 "result block. Abandoned runs are published too - a plan is "
+                 "sealed when it is planned, so a test that came back badly and "
+                 "was dropped stays visible forever as a plan with no result. "
+                 "What this does not prove: that the records are true. Two "
+                 "systems the operator controls agreeing with each other is "
+                 "consistency, not truth."),
+    },
+    "reproducibility": {
+        "supported": True,
+        "demonstrable_publicly": True,
+        "endpoint": "/x/replay/challenge",
+        "note": ("Determinism proved by public challenge without disclosing any "
+                 "scoring logic. Submit inputs, the run is sealed, resubmit the "
+                 "same inputs later and the verdict must be identical under an "
+                 "unchanged code fingerprint at /x/replay/fingerprint."),
+    },
+    "consistency_proof": {
+        "supported": True,
+        "demonstrable_publicly": True,
+        "endpoint": "/x/consistency/proof?first={first}&second={second}",
+        "note": ("RFC 6962 consistency proofs, deliberately unmodified so "
+                 "existing Certificate Transparency verifiers work against them "
+                 "directly. first and second are tree sizes - read the current "
+                 "size from /x/consistency/root and pick any earlier one. "
+                 "Anyone holding any earlier tip we served can show it is a "
+                 "prefix of the current log at /x/consistency/ancestor."),
+    },
+
+    # ---- proposed addition, flagged as a proposal rather than assumed ----
+    "external_anchoring": {
+        "supported": True,
+        "demonstrable_publicly": True,
+        "endpoint": "/api/anchor-status",
+        "note": ("PROPOSED AS A SEPARATE CHECK, not settled. The other mirror "
+                 "currently folds anchoring into consistency_proof, but they "
+                 "answer different questions: consistency shows the log only "
+                 "ever grew, anchoring shows the time was fixed somewhere the "
+                 "operator cannot reach. A log can be perfectly append-only and "
+                 "still have been built last week. Here the tip is submitted to "
+                 "OpenTimestamps and committed into Bitcoin; the other mirror "
+                 "uses an RFC 3161 timestamp. The spec should permit any "
+                 "external authority the operator does not control and require "
+                 "it to be named - not mandate one. Offered for the joint "
+                 "session."),
+    },
+}
+
+DOCUMENT_NOTE = (
+    "Every endpoint marked demonstrable_publicly is unauthenticated by design - "
+    "run it yourself without asking us. Where an endpoint carries a {parameter}, "
+    "the note for that check says where to get a valid value; every published "
+    "endpoint is meant to work when followed literally, and one that does not is "
+    "a failed check on our side, not a quibble. Checks marked supported but not "
+    "demonstrable_publicly are real and built, but currently need a key to see, "
+    "and say so plainly rather than passing on the day this was published. "
+    "Nothing here proves the records are true. It describes the order things "
+    "were committed in, which is a narrower claim and the only one that holds.")
+
+_patched = [False]
+
+
+def _base_from(handler):
+    """Derive our own base URL from the request. An operator running this file
+    on their own domain publishes their domain, not whoever wrote it."""
+    try:
+        host = handler.headers.get("X-Forwarded-Host") or handler.headers.get("Host")
+        if not host:
+            return FALLBACK_BASE
+        host = host.split(",")[0].strip()[:200]
+        proto = (handler.headers.get("X-Forwarded-Proto") or "https").split(",")[0].strip()
+        if proto not in ("http", "https"):
+            proto = "https"
+        return proto + "://" + host
+    except Exception:
+        return FALLBACK_BASE
+
+
+def _base_from_ctx(ctx):
+    """Same derivation for the routed /x/standard/document call.
+
+    The router's ctx may or may not carry the request handler. If it does, the
+    document served through the router names the same domain as the one served
+    at /.well-known/ - which matters on a mirror, where hardcoding would make
+    this file publish somebody else's domain again."""
+    try:
+        if isinstance(ctx, dict):
+            for key in ("handler", "h", "request", "req", "self"):
+                obj = ctx.get(key)
+                if obj is not None and hasattr(obj, "headers"):
+                    return _base_from(obj)
+            headers = ctx.get("headers")
+            if headers is not None:
+                class _Shim(object):
+                    pass
+                shim = _Shim()
+                shim.headers = headers
+                return _base_from(shim)
+        elif ctx is not None and hasattr(ctx, "headers"):
+            return _base_from(ctx)
+    except Exception:
+        pass
+    return FALLBACK_BASE
+
+
+def _document(base):
+    checks = {}
+    for name, c in CHECKS.items():
+        checks[name] = {
+            "supported": c["supported"],
+            "demonstrable_publicly": c["demonstrable_publicly"],
+            "endpoint": c["endpoint"],
+            "note": c["note"],
+        }
+    return {
+        "ordering_test_version": ORDERING_TEST_VERSION,
+        "vendor": VENDOR,
+        "base_url": base,
+        "runner": RUNNER,
+        "runner_note": RUNNER_NOTE,
+        "checks": checks,
+        "witness_peers": base + "/x/witness/peers",
+        "witness_tip": base + "/x/witness/tip",
+        "committed_periods": base + "/x/complete/periods",
+        "note": DOCUMENT_NOTE,
+    }
+
+
+def _digest(doc):
+    return hashlib.sha256(
+        json.dumps(doc, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _srv():
+    m = sys.modules.get("__main__")
+    if hasattr(m, "get_bearer"):
+        return m
+    return sys.modules.get("server")
+
+
+def _install(s):
+    if _patched[0]:
+        return "already installed"
+    H = getattr(s, "Handler", None)
+    if H is None or not hasattr(H, "do_GET"):
+        return "no handler"
+    if getattr(H, "_standard_patched", False):
+        _patched[0] = True
+        return "already installed"
+
+    original = H.do_GET
+
+    def do_GET(self):
+        try:
+            from urllib.parse import urlparse
+            p = urlparse(self.path).path.rstrip("/") or "/"
+        except Exception:
+            p = self.path or "/"
+
+        if p in DISCOVERY_PATHS:
+            body = json.dumps(_document(_base_from(self)), indent=2).encode("utf-8")
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "public, max-age=300")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception:
+                pass
+            return
+
+        return original(self)
+
+    H.do_GET = do_GET
+    H._standard_patched = True
+    _patched[0] = True
+    print("STANDARD: /.well-known/ordering-test.json installed", flush=True)
+    return "installed"
+
+
+def handle(method, action, data, api_key, ctx):
+    s = _srv()
+    if s is None:
+        return {"error": "server_not_found"}, 500
+
+    state = "already installed" if _patched[0] else None
+    if not _patched[0]:
+        try:
+            state = _install(s)
+        except Exception as exc:
+            print("STANDARD: patch failed - " + str(exc), flush=True)
+            state = "failed: " + str(exc)
+
+    action = (action or "").strip("/").lower()
+    base = _base_from_ctx(ctx)
+    doc = _document(base)
+
+    if method == "GET" and action == "document":
+        return doc, 200
+
+    if method == "GET" and action == "hash":
+        canonical = _document(FALLBACK_BASE)
+        return {
+            "sha256": _digest(canonical),
+            "of": "this operator's discovery document",
+            "canonicalisation": ("JSON, keys sorted, no whitespace, UTF-8, "
+                                 "base_url fixed to " + FALLBACK_BASE +
+                                 " so the digest does not move with the "
+                                 "requesting host"),
+            "what_this_is_for": (
+                "Confirming our own document has not changed. It is NOT the "
+                "cross-mirror check - two operators publish different documents "
+                "by design, because they list different endpoints, so their "
+                "digests should differ and a mismatch would prove nothing. The "
+                "cross-mirror comparison only means something once every mirror "
+                "serves a byte-identical runner file and hashes that instead. "
+                "No runner is agreed yet."),
+            "document": canonical,
+        }, 200
+
+    if method == "GET" and action in ("", "status", "spec"):
+        supported = [k for k, c in CHECKS.items() if c["supported"]]
+        public = [k for k, c in CHECKS.items() if c["demonstrable_publicly"]]
+        parameterised = [k for k, c in CHECKS.items()
+                         if c["endpoint"] and "{" in c["endpoint"]]
+        return {
+            "installed": bool(_patched[0]),
+            "install_result": state,
+            "module_version": VERSION,
+            "ordering_test_version": ORDERING_TEST_VERSION,
+            "serving": list(DISCOVERY_PATHS),
+            "always_available": "/x/standard/document",
+            "checks_total": len(CHECKS),
+            "checks_supported": len(supported),
+            "checks_publicly_demonstrable": len(public),
+            "publicly_demonstrable": public,
+            "supported_but_not_public": [k for k in supported if k not in public],
+            "endpoints_needing_a_parameter": parameterised,
+            "runner": RUNNER,
+            "note": ("base_url is derived from the Host header, so this file "
+                     "publishes whichever domain is actually serving it. Checks "
+                     "listed under endpoints_needing_a_parameter cannot be "
+                     "demonstrated until a real value exists to substitute - "
+                     "for the completeness and absence checks that means at "
+                     "least one committed period at /x/complete/periods."),
+        }, 200
+
+    return {"error": "unknown_action", "action": action,
+            "GET": ["status", "hash", "document"]}, 404
+
+```
+
+
+## `modules/stats.py`
+
+143 lines, 5540 bytes
+
+```python
+"""
+Live figures for the Proving Ground - /x/stats
+
+Charts on a compliance site are usually decoration. These are not, provided
+they show something a visitor could otherwise only take on trust: that the
+chain is genuinely growing, that decisions really are distributed across the
+thresholds rather than hand-picked, and that people who click through a
+review case behave exactly as the oversight argument predicts.
+
+WHAT IS PUBLISHED, AND WHAT IS NOT
+----------------------------------
+Public and no key, because a figure nobody can see proves nothing.
+
+Published: total chain height, hourly block counts, the verdict mix and score
+distribution of PUBLIC DEMO decisions only, and dwell times from public review
+cases.
+
+Never published: anything scoped to a customer key. No customer verdict mix,
+no customer volumes, no per-key anything. A visitor learns how the engine
+behaves, not how any operator's business is going. That distinction is the
+whole reason this endpoint can be open.
+
+    GET /x/stats        everything below
+    GET /x/stats/chain  chain height and hourly growth only
+"""
+
+import json, time
+from datetime import datetime, timezone
+
+VERSION = "1.0"
+PUBLIC = {("GET", ""), ("GET", "stats"), ("GET", "chain")}
+
+DEMO_KEY = "public_demo"
+
+
+def _iso(ts):
+    if not ts:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+def _chain(ctx):
+    t = time.time()
+    with ctx["lock"]:
+        row = ctx["conn"].execute("SELECT COUNT(*),MIN(ts),MAX(ts) FROM audit_log").fetchone()
+        recent = ctx["conn"].execute("SELECT ts FROM audit_log WHERE ts>? ORDER BY ts ASC", (t - 86400,)).fetchall()
+    height = row[0] if row else 0
+    buckets = [0] * 24
+    for (ts,) in recent:
+        h = int((t - ts) // 3600)
+        if 0 <= h < 24:
+            buckets[23 - h] += 1
+    return {"height": height,
+            "first_block": _iso(row[1] if row else None),
+            "latest_block": _iso(row[2] if row else None),
+            "last_24h": buckets,
+            "blocks_last_24h": sum(buckets),
+            "note": "Every block, from every source. The chain is one sequence."}
+
+
+def _demo(ctx):
+    with ctx["lock"]:
+        rows = ctx["conn"].execute("SELECT result_json,ts FROM audit_log WHERE api_key=? ORDER BY id DESC LIMIT 2000", (DEMO_KEY,)).fetchall()
+    verdicts = {"ALLOW": 0, "CHALLENGE": 0, "BLOCK": 0}
+    # ten buckets of 0.1 across the score range
+    hist = [0] * 10
+    scores = []
+    for res, _ts in rows:
+        try:
+            r = json.loads(res)
+        except Exception:
+            continue
+        d = r.get("decision")
+        if d in verdicts:
+            verdicts[d] += 1
+            s = r.get("score")
+            if isinstance(s, (int, float)):
+                scores.append(s)
+                b = min(int(float(s) * 10), 9)
+                hist[b] += 1
+    total = sum(verdicts.values())
+    out = {"decisions": total, "verdicts": verdicts,
+           "score_histogram": hist,
+           "buckets": ["0.0-0.1", "0.1-0.2", "0.2-0.3", "0.3-0.4", "0.4-0.5",
+                       "0.5-0.6", "0.6-0.7", "0.7-0.8", "0.8-0.9", "0.9-1.0"],
+           "thresholds": {"allow_below": 0.35, "block_at_or_above": 0.70}}
+    if scores:
+        scores.sort()
+        out["median_score"] = round(scores[len(scores) // 2], 4)
+    return out
+
+
+def _oversight(ctx):
+    try:
+        with ctx["lock"]:
+            rows = ctx["conn"].execute("SELECT dwell,human_verdict,machine_verdict FROM demo_cases WHERE committed IS NOT NULL").fetchall()
+    except Exception:
+        rows = []
+    if not rows:
+        return {"reviews": 0,
+                "note": "Nobody has taken a review case yet."}
+    dwells = sorted(r[0] for r in rows if r[0] is not None)
+    agreed = len([r for r in rows if (r[1] or "").upper() == (r[2] or "").upper()])
+    # dwell buckets in seconds
+    edges = [2, 5, 10, 20, 45, 90]
+    labels = ["under 2s", "2-5s", "5-10s", "10-20s", "20-45s", "45-90s", "over 90s"]
+    hist = [0] * 7
+    for d in dwells:
+        placed = False
+        for i, e in enumerate(edges):
+            if d < e:
+                hist[i] += 1
+                placed = True
+                break
+        if not placed:
+            hist[6] += 1
+    n = len(dwells)
+    return {"reviews": len(rows),
+            "agreed_with_engine": agreed,
+            "agreement_rate_pct": round(100 * agreed / len(rows), 1),
+            "median_dwell_seconds": (dwells[n // 2] if n else None),
+            "under_2_seconds": hist[0],
+            "under_2_seconds_pct": (round(100 * hist[0] / n, 1) if n else 0),
+            "dwell_histogram": hist,
+            "dwell_labels": labels,
+            "note": "Visitors who committed in under two seconds did not read the case. That is the pattern the oversight record is designed to make visible."}
+
+
+def handle(method, action, data, api_key, ctx):
+    if method != "GET":
+        return {"error": "unknown_action", "action": action}, 404
+    if action == "chain":
+        return {"stats_version": VERSION, "chain": _chain(ctx)}, 200
+    if action in ("", "stats"):
+        return {"stats_version": VERSION,
+                "generated": _iso(time.time()),
+                "chain": _chain(ctx),
+                "public_decisions": _demo(ctx),
+                "public_reviews": _oversight(ctx),
+                "scope": "Public demonstration activity and total chain height only. Nothing scoped to a customer key is published here."}, 200
+    return {"error": "unknown_action", "action": action,
+            "available": ["GET stats", "GET chain"]}, 404
+
+```
 
 
 ## `modules/tokensaver.py`
@@ -1679,730 +2261,5 @@ def handle(method, action, data, api_key, ctx):
     return {"error": "unknown_action",
             "actions": ["spec", "stats", "verify", "estimate", "gate",
                         "record", "ledger", "budget", "prices", "forget"]}, 404
-
-```
-
-
-## `modules/verifier.py`
-
-717 lines, 26299 bytes
-
-```python
-#!/usr/bin/env python3
-"""
-modules/verifier.py  -  hand the verifier out at a URL
-
-WHY THIS EXISTS
----------------
-A proof that can only be checked by the party who issued it is not a proof.
-So the proof bundles at /x/continuity/proof are useless unless somebody can
-easily get hold of something that checks them, and telling people to clone a
-repository is a gate.
-
-This serves the standalone verifier as a plain file:
-
-    curl -sO https://sebbi.pro/verify-authority.py
-    curl -s "https://sebbi.pro/x/continuity/proof?evaluation=e_..." \\
-        | python3 verify-authority.py -
-
-The script it hands out has no dependencies and makes no network calls. It
-checks the Ed25519 signature, recomputes every digest, re-runs the whole
-derivation from the published rules, and reaches its own verdict - then says
-so if that verdict disagrees with ours.
-
-WHAT IT DELIBERATELY DOES NOT DO
---------------------------------
-It does not phone home, and this module records nothing about who downloaded
-it. A verification tool that reports back to the party being verified is not
-a verification tool.
-
-    GET /verify-authority.py   the script
-    GET /x/verifier/status     what is installed, and the script's digest
-"""
-
-import hashlib
-import sys
-
-VERSION = "1.1"
-
-PUBLIC = {("GET", "status")}
-
-# Deliberately NOT "/verify" - that is the sealed-post verification page and
-# this module would silently hijack it, handing a visitor a Python download
-# where they expected a page. A route grab is a bug even when the code works.
-FILE_PATHS = ("/verify-authority.py", "/verify_authority.py")
-
-_patched = [False]
-
-
-SCRIPT = r'''#!/usr/bin/env python3
-"""
-verify_authority.py  -  check an AILeash authority proof without AILeash
-
-    python3 verify_authority.py proof.json
-    curl -s "https://sebbi.pro/x/continuity/proof?evaluation=e_..." \\
-        | python3 verify_authority.py -
-
-WHAT THIS IS FOR
-----------------
-A proof that can only be checked by the party who issued it is not a proof.
-This script takes a bundle and reaches its own conclusion using nothing but
-the Python standard library. It does not call the issuing system, it does not
-import anything you have to install, and it does not take a single field of
-the bundle at face value.
-
-It does four separate things, and each one can fail on its own:
-
-  1. SIGNATURE   Ed25519 over the canonical bundle. Confirms the bundle came
-                 from the holder of the named key and has not been edited by
-                 anybody since.
-
-  2. INTEGRITY   Recomputes every grant digest, the lineage digest and the
-                 parameter digest from the fields in front of it. Confirms
-                 the bundle is internally consistent with its own contents.
-
-  3. DERIVATION  Re-runs the authority rules from scratch: root issued by a
-                 human, an unbroken parent chain, scope covered at every hop,
-                 constraints narrowing on every axis, purpose narrowing,
-                 validity windows contained, nothing revoked, and the action
-                 itself inside the effective limits of the whole lineage.
-
-  4. AGREEMENT   Compares the verdict this script reached with the verdict the
-                 bundle claims. Disagreement is reported as a failure of the
-                 issuer, not of this script.
-
-WHAT A PASS MEANS
------------------
-That the authority for this action was derivable, at that time, from that
-human grant - or, for a refusal, that it genuinely was not, and that the named
-grant and invariant really are where it broke.
-
-WHAT A PASS DOES NOT MEAN
--------------------------
-That the root grant should ever have been issued. That the parameters describe
-something that really happened. That the risk engine was right. Derivation is
-not merit and it is not truth.
-
-The risk half of a composed verdict cannot be re-derived here, because that
-needs the issuer's scoring engine. Where the bundle's authority verdict is
-BLOCK, the composed verdict stands regardless, because the composition takes
-the worse of the two.
-"""
-
-import binascii
-import hashlib
-import json
-import sys
-
-GRANT_PREFIX = b"AILEASH-GRANT-v1:"
-EVAL_PREFIX = b"AILEASH-AUTHEVAL-v1:"
-BUNDLE_PREFIX = b"AILEASH-AUTHORITY-PROOF-v1:"
-
-MAX_DEPTH = 32
-RANK = {"ALLOW": 0, "CHALLENGE": 1, "BLOCK": 2}
-
-
-# ======================================================================
-# Ed25519, RFC 8032, standard library only
-# ======================================================================
-
-_Q = 2 ** 255 - 19
-_L = 2 ** 252 + 27742317777372353535851937790883648493
-_D = -121665 * pow(121666, _Q - 2, _Q) % _Q
-_I = pow(2, (_Q - 1) // 4, _Q)
-
-
-def _h(m):
-    return hashlib.sha512(m).digest()
-
-
-def _inv(x):
-    return pow(x, _Q - 2, _Q)
-
-
-def _xrecover(y):
-    xx = (y * y - 1) * _inv(_D * y * y + 1)
-    x = pow(xx, (_Q + 3) // 8, _Q)
-    if (x * x - xx) % _Q != 0:
-        x = (x * _I) % _Q
-    if x % 2 != 0:
-        x = _Q - x
-    return x
-
-
-_BY = 4 * _inv(5) % _Q
-_BX = _xrecover(_BY)
-_B = (_BX % _Q, _BY % _Q, 1, (_BX * _BY) % _Q)
-_IDENT = (0, 1, 1, 0)
-
-
-def _add(p, q):
-    x1, y1, z1, t1 = p
-    x2, y2, z2, t2 = q
-    a = (y1 - x1) * (y2 - x2) % _Q
-    b = (y1 + x1) * (y2 + x2) % _Q
-    c = t1 * 2 * _D * t2 % _Q
-    dd = z1 * 2 * z2 % _Q
-    e, f, g, hh = b - a, dd - c, dd + c, b + a
-    return (e * f % _Q, g * hh % _Q, f * g % _Q, e * hh % _Q)
-
-
-def _scalarmult(p, e):
-    if e == 0:
-        return _IDENT
-    q = _scalarmult(p, e // 2)
-    q = _add(q, q)
-    if e & 1:
-        q = _add(q, p)
-    return q
-
-
-def _encodepoint(p):
-    x, y, z, _t = p
-    zi = _inv(z)
-    x, y = x * zi % _Q, y * zi % _Q
-    bits = [(y >> i) & 1 for i in range(255)] + [x & 1]
-    return bytes(sum(bits[i * 8 + j] << j for j in range(8)) for i in range(32))
-
-
-def _bit(h, i):
-    return (h[i // 8] >> (i % 8)) & 1
-
-
-def _hint(m):
-    h = _h(m)
-    return sum(2 ** i * _bit(h, i) for i in range(512))
-
-
-def _isoncurve(p):
-    x, y, z, t = p
-    return (z % _Q != 0 and x * y % _Q == z * t % _Q
-            and (y * y - x * x - z * z - _D * t * t) % _Q == 0)
-
-
-def _decodepoint(s):
-    y = int.from_bytes(s, "little") & ((1 << 255) - 1)
-    x = _xrecover(y)
-    if x & 1 != _bit(s, 255):
-        x = _Q - x
-    p = (x, y, 1, (x * y) % _Q)
-    if not _isoncurve(p):
-        raise ValueError("point off curve")
-    return p
-
-
-def ed25519_verify(sig, msg, pk):
-    if len(sig) != 64 or len(pk) != 32:
-        return False
-    try:
-        rr = _decodepoint(sig[:32])
-        a = _decodepoint(pk)
-    except Exception:
-        return False
-    s = int.from_bytes(sig[32:64], "little")
-    if s >= _L:
-        return False
-    hh = _hint(sig[:32] + pk + msg)
-    return _encodepoint(_scalarmult(_B, s)) == _encodepoint(_add(rr, _scalarmult(a, hh)))
-
-
-# ======================================================================
-# the rules, reimplemented from the published spec
-# ======================================================================
-
-def canon(obj):
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
-
-
-def sha(prefix, text):
-    return hashlib.sha256(prefix + text.encode("utf-8")).hexdigest()
-
-
-def grant_digest(g):
-    material = {
-        "id": g["id"], "parent": g["parent"], "issuer": g["issuer"],
-        "issuer_kind": g["issuer_kind"], "subject": g["subject"],
-        "subject_kind": g["subject_kind"], "scope": sorted(g["scope"]),
-        "constraints": g["constraints"], "purpose": g["purpose"],
-        "purpose_tags": sorted(g["purpose_tags"]),
-        "not_before": g["not_before"], "not_after": g["not_after"],
-        "depth": g["depth"], "delegations_left": g["delegations_left"],
-        "created": g["created"], "risk_accepted_by": g.get("risk_accepted_by"),
-    }
-    return sha(GRANT_PREFIX, canon(material))
-
-
-def covers(held, wanted):
-    if held == wanted or held == "*":
-        return True
-    if held.endswith(".*"):
-        return wanted == held[:-2] or wanted.startswith(held[:-1])
-    return False
-
-
-def wildcard_breadth(scope, capability):
-    best = None
-    for held in scope:
-        if not covers(held, capability):
-            continue
-        if held == capability:
-            return 0
-        width = (capability.count(".") + 2 if held == "*"
-                 else capability.count(".") - held[:-2].count("."))
-        best = width if best is None else min(best, width)
-    return best
-
-
-def direction(key):
-    for p in ("max_", "min_", "allowed_", "denied_", "may_"):
-        if key.startswith(p):
-            return p
-    return None
-
-
-def num(v):
-    if isinstance(v, bool) or v is None:
-        raise ValueError("not a number")
-    return float(v)
-
-
-def as_set(v):
-    if isinstance(v, (list, tuple, set)):
-        return set(v)
-    return {v}
-
-
-def narrower(parent_c, child_c):
-    for key in sorted(child_c):
-        d = direction(key)
-        cval = child_c[key]
-        if d is None:
-            return False, "constraint '%s' has no narrowing rule" % key
-        if key not in parent_c:
-            return False, "constraint '%s' is not expressed by the parent" % key
-        pval = parent_c[key]
-        try:
-            if d == "max_" and num(cval) > num(pval):
-                return False, "%s raised from %s to %s" % (key, pval, cval)
-            if d == "min_" and num(cval) < num(pval):
-                return False, "%s lowered from %s to %s" % (key, pval, cval)
-            if d == "allowed_" and not as_set(cval) <= as_set(pval):
-                return False, "%s adds values the parent does not hold" % key
-            if d == "denied_" and not as_set(pval) <= as_set(cval):
-                return False, "%s drops values the parent denies" % key
-            if d == "may_" and bool(cval) and not bool(pval):
-                return False, "%s enabled where the parent withholds it" % key
-        except (TypeError, ValueError):
-            return False, "constraint '%s' is not comparable" % key
-    return True, None
-
-
-def effective(chain):
-    eff = {}
-    for g in chain:
-        for k, v in g["constraints"].items():
-            d = direction(k)
-            if k not in eff:
-                eff[k] = v
-                continue
-            cur = eff[k]
-            try:
-                if d == "max_":
-                    eff[k] = min(num(cur), num(v))
-                elif d == "min_":
-                    eff[k] = max(num(cur), num(v))
-                elif d == "allowed_":
-                    eff[k] = sorted(as_set(cur) & as_set(v))
-                elif d == "denied_":
-                    eff[k] = sorted(as_set(cur) | as_set(v))
-                elif d == "may_":
-                    eff[k] = bool(cur) and bool(v)
-            except (TypeError, ValueError):
-                eff[k] = v
-    return eff
-
-
-def params_against(params, eff):
-    hard, unconstrained = [], []
-    for key in sorted(params):
-        val = params[key]
-        checked = False
-        for cname, cval in eff.items():
-            d = direction(cname)
-            if not d or cname[len(d):] != key:
-                continue
-            checked = True
-            try:
-                if d == "max_" and num(val) > num(cval):
-                    hard.append("%s=%s exceeds %s=%s" % (key, val, cname, cval))
-                elif d == "min_" and num(val) < num(cval):
-                    hard.append("%s=%s is below %s=%s" % (key, val, cname, cval))
-                elif d == "allowed_" and val not in as_set(cval):
-                    hard.append("%s=%s is outside %s" % (key, val, cname))
-                elif d == "denied_" and val in as_set(cval):
-                    hard.append("%s=%s is denied by %s" % (key, val, cname))
-                elif d == "may_" and bool(val) and not bool(cval):
-                    hard.append("%s requested where %s withholds it" % (key, cname))
-            except (TypeError, ValueError):
-                hard.append("%s cannot be compared with %s" % (key, cname))
-        if not checked:
-            unconstrained.append(key)
-    return hard, unconstrained
-
-
-# ======================================================================
-# the four checks
-# ======================================================================
-
-class Report(object):
-    def __init__(self):
-        self.rows = []
-        self.failed = False
-
-    def add(self, ok, name, detail=""):
-        self.rows.append((ok, name, detail))
-        if not ok:
-            self.failed = True
-
-    def note(self, name, detail=""):
-        self.rows.append((None, name, detail))
-
-    def render(self):
-        out = []
-        for ok, name, detail in self.rows:
-            mark = "  ok  " if ok else ("FAIL  " if ok is False else "  --  ")
-            out.append(mark + name + (("\n        " + detail) if detail else ""))
-        return "\n".join(out)
-
-
-def check_signature(bundle, rep):
-    sig_hex = bundle.get("signature")
-    pk_hex = (bundle.get("issued_by") or {}).get("public_key")
-    if not sig_hex or not pk_hex:
-        rep.add(False, "Signature present", "the bundle carries no signature or no key")
-        return
-    body = dict(bundle)
-    body.pop("signature", None)
-    body.pop("verify_with", None)
-    try:
-        sig = binascii.unhexlify(sig_hex)
-        pk = binascii.unhexlify(pk_hex)
-    except Exception:
-        rep.add(False, "Signature is readable hex")
-        return
-    ok = ed25519_verify(sig, BUNDLE_PREFIX + canon(body).encode("utf-8"), pk)
-    rep.add(ok, "Ed25519 signature over the canonical bundle",
-            "key " + pk_hex[:16] + "…  Verify this key independently at the issuer's "
-            "published address before trusting who signed." if ok else
-            "the bundle was altered after signing, or it was not signed by this key")
-
-
-def check_integrity(bundle, rep):
-    lineage = bundle.get("lineage") or []
-    bad = []
-    for g in lineage:
-        try:
-            if grant_digest(g) != g.get("digest"):
-                bad.append(g.get("id"))
-        except Exception:
-            bad.append(g.get("id"))
-    rep.add(not bad, "Every grant digest recomputes from its own fields",
-            "" if not bad else "mismatched: " + ", ".join(str(b) for b in bad))
-
-    claimed = (bundle.get("decision") or {}).get("lineage_digest")
-    mine = sha(EVAL_PREFIX, canon([g.get("digest") for g in lineage]))
-    rep.add(mine == claimed, "Lineage digest matches the ordered path",
-            "" if mine == claimed else "computed " + mine[:20] + "… claimed " + str(claimed)[:20] + "…")
-
-    req = bundle.get("request") or {}
-    claimed_p = (bundle.get("decision") or {}).get("params_digest")
-    mine_p = sha(EVAL_PREFIX, canon({"action": req.get("action"),
-                                     "params": req.get("params") or {}}))
-    rep.add(mine_p == claimed_p, "Parameter digest matches the request as stated",
-            "" if mine_p == claimed_p else "the parameters shown are not the "
-            "parameters that were judged")
-
-
-def rederive(bundle, rep):
-    """Run the published rules from scratch and reach an independent verdict."""
-    lineage = bundle.get("lineage") or []
-    decision = bundle.get("decision") or {}
-    req = bundle.get("request") or {}
-    at = decision.get("evaluated_at_epoch")
-
-    hard, soft = [], []
-    broken_at = broken_invariant = None
-
-    def fail(grant, invariant, detail):
-        nonlocal broken_at, broken_invariant
-        hard.append(detail)
-        if broken_at is None:
-            broken_at, broken_invariant = grant, invariant
-
-    if not lineage:
-        fail(None, "authority_continuity", "the bundle carries no authority path")
-    else:
-        root = lineage[0]
-        if root.get("parent") is not None:
-            fail(root["id"], "authority_continuity",
-                 "the path does not begin at a parentless root")
-        if root.get("issuer_kind") != "human":
-            fail(root["id"], "identity_continuity",
-                 "the root grant was not issued by a human principal")
-
-        previous = None
-        for g in lineage:
-            if g.get("revoked_at") is not None:
-                fail(g["id"], "authority_continuity",
-                     "grant %s was revoked" % g["id"])
-            if at is not None:
-                if at < g["not_before"]:
-                    fail(g["id"], "temporal_validity",
-                         "grant %s was not yet valid at the time of the decision" % g["id"])
-                if at >= g["not_after"]:
-                    fail(g["id"], "temporal_validity",
-                         "grant %s had expired at the time of the decision" % g["id"])
-            if previous is not None:
-                if g.get("parent") != previous.get("id"):
-                    fail(g["id"], "authority_continuity",
-                         "grant %s does not point at the grant above it" % g["id"])
-                missing = [c for c in g["scope"]
-                           if not any(covers(p, c) for p in previous["scope"])]
-                if missing:
-                    fail(g["id"], "boundary_integrity",
-                         "%s holds scope its parent does not: %s"
-                         % (g["id"], ", ".join(sorted(missing))))
-                ok, why = narrower(previous["constraints"], g["constraints"])
-                if not ok:
-                    fail(g["id"], "boundary_integrity", "%s: %s" % (g["id"], why))
-                if not set(g["purpose_tags"]) <= set(previous["purpose_tags"]):
-                    fail(g["id"], "intent_continuity",
-                         "%s carries purpose tags its parent does not" % g["id"])
-                if (g["not_before"] < previous["not_before"]
-                        or g["not_after"] > previous["not_after"]):
-                    fail(g["id"], "temporal_validity",
-                         "%s is valid outside its parent's window" % g["id"])
-                if g["depth"] != previous["depth"] + 1:
-                    fail(g["id"], "authority_continuity",
-                         "%s records a depth inconsistent with its parent" % g["id"])
-            previous = g
-
-        if len(lineage) - 1 > MAX_DEPTH:
-            fail(lineage[-1]["id"], "boundary_integrity", "delegation depth exceeds the ceiling")
-
-        if not any(g.get("risk_accepted_by") for g in lineage):
-            fail(lineage[0]["id"], "identity_continuity",
-                 "no grant in this path names who accepted the risk")
-
-        leaf = lineage[-1]
-        action = req.get("action")
-        params = req.get("params") or {}
-
-        if action and not any(covers(c, action) for c in leaf["scope"]):
-            fail(leaf["id"], "boundary_integrity",
-                 "action '%s' is outside the scope of the grant exercised" % action)
-        elif action:
-            breadth = wildcard_breadth(leaf["scope"], action)
-            if breadth and breadth >= 2:
-                soft.append("action '%s' is only covered by a broad wildcard" % action)
-
-        eff = effective(lineage)
-        failures, unconstrained = params_against(params, eff)
-        for f in failures:
-            fail(leaf["id"], "boundary_integrity", f)
-        for u in unconstrained:
-            soft.append("parameter '%s' is not constrained anywhere in the path" % u)
-
-        tag = req.get("purpose_tag")
-        if tag:
-            if tag not in leaf["purpose_tags"]:
-                soft.append("declared purpose '%s' is not carried by the grant" % tag)
-        else:
-            soft.append("the action declared no purpose")
-
-    verdict = "BLOCK" if hard else ("CHALLENGE" if soft else "ALLOW")
-    return verdict, hard, soft, broken_at, broken_invariant
-
-
-def check_agreement(bundle, rep, mine, hard, soft, broken_at, broken_invariant):
-    decision = bundle.get("decision") or {}
-    claimed = decision.get("authority_verdict") or decision.get("verdict")
-
-    rep.add(mine == claimed,
-            "Independently re-derived authority verdict: " + mine,
-            "" if mine == claimed else
-            "the issuer claims " + str(claimed) + " and this script reaches " + mine +
-            " from the same path. One of us is wrong and the rules are published.")
-
-    if mine == "BLOCK":
-        same_grant = (broken_at == decision.get("broken_at"))
-        same_inv = (broken_invariant == decision.get("broken_invariant"))
-        rep.add(same_grant and same_inv,
-                "Refusal reproduces at the same grant and invariant",
-                ("grant %s, invariant %s" % (broken_at, broken_invariant))
-                if same_grant and same_inv else
-                "this script breaks at grant %s / %s, the issuer says %s / %s"
-                % (broken_at, broken_invariant,
-                   decision.get("broken_at"), decision.get("broken_invariant")))
-        rep.note("Why authority could not be derived")
-        for h in hard:
-            rep.note("  " + h)
-    elif soft:
-        rep.note("Why this could not be settled without a person")
-        for x in soft:
-            rep.note("  " + x)
-
-    risk = decision.get("risk_verdict")
-    if risk and mine != "BLOCK":
-        rep.note("Risk verdict reported as " + str(risk) + ", not re-derivable here",
-                 "the composed verdict is the worse of the two; the scoring engine "
-                 "is not part of this bundle and is not checked by this script")
-
-
-def main():
-    if len(sys.argv) < 2:
-        print(__doc__)
-        return 2
-    src = sys.argv[1]
-    raw = sys.stdin.read() if src == "-" else open(src, "r").read()
-    try:
-        bundle = json.loads(raw)
-    except Exception as exc:
-        print("Not readable JSON: " + str(exc))
-        return 2
-
-    rep = Report()
-    print("=" * 66)
-    print("AUTHORITY PROOF  ·  independent verification")
-    print("=" * 66)
-    d = bundle.get("decision") or {}
-    print("evaluation   " + str(d.get("evaluation")))
-    print("action       " + str((bundle.get("request") or {}).get("action")))
-    print("at           " + str(d.get("evaluated_at")))
-    print("hops         " + str(max(0, len(bundle.get("lineage") or []) - 1)))
-    if bundle.get("lineage"):
-        print("authorised   " + str(bundle["lineage"][0].get("issuer")))
-        print("executed     " + str(bundle["lineage"][-1].get("subject")))
-        acc = [g.get("risk_accepted_by") for g in bundle["lineage"] if g.get("risk_accepted_by")]
-        print("risk owner   " + str(acc[-1] if acc else None))
-    print("-" * 66)
-
-    check_signature(bundle, rep)
-    check_integrity(bundle, rep)
-    mine, hard, soft, ba, bi = rederive(bundle, rep)
-    check_agreement(bundle, rep, mine, hard, soft, ba, bi)
-
-    print(rep.render())
-    print("-" * 66)
-    if rep.failed:
-        print("RESULT: NOT VERIFIED. Something above did not hold.")
-        return 1
-    print("RESULT: VERIFIED - " + mine)
-    if mine == "BLOCK":
-        print("This is a proof that the action was NOT authorised, and where it failed.")
-    print("Checked with no network access, no dependencies, and nothing taken on")
-    print("the issuer's word except the meaning of their public key.")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
-'''
-
-
-def _digest():
-    return hashlib.sha256(SCRIPT.encode("utf-8")).hexdigest()
-
-
-def _srv():
-    m = sys.modules.get("__main__")
-    if m is not None and hasattr(m, "get_bearer"):
-        return m
-    return sys.modules.get("server")
-
-
-def _install(s):
-    if _patched[0]:
-        return "already installed"
-    H = getattr(s, "Handler", None)
-    if H is None or not hasattr(H, "do_GET"):
-        return "no handler"
-    if getattr(H, "_verifier_patched", False):
-        _patched[0] = True
-        return "already installed"
-
-    original = H.do_GET
-
-    def do_GET(self):
-        try:
-            from urllib.parse import urlparse
-            p = urlparse(self.path).path.rstrip("/") or "/"
-        except Exception:
-            p = self.path or "/"
-
-        if p in FILE_PATHS:
-            body = SCRIPT.encode("utf-8")
-            try:
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Content-Disposition",
-                                 'attachment; filename="verify-authority.py"')
-                self.send_header("Cache-Control", "public, max-age=300")
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.send_header("X-Content-Type-Options", "nosniff")
-                self.end_headers()
-                self.wfile.write(body)
-            except Exception:
-                pass
-            return
-
-        return original(self)
-
-    H.do_GET = do_GET
-    H._verifier_patched = True
-    _patched[0] = True
-    print("VERIFIER: /verify-authority.py installed", flush=True)
-    return "installed"
-
-
-def handle(method, action, data, api_key, ctx):
-    s = _srv()
-    if s is None:
-        return {"error": "server_not_found"}, 500
-
-    state = "already installed" if _patched[0] else None
-    if not _patched[0]:
-        try:
-            state = _install(s)
-        except Exception as exc:
-            print("VERIFIER: patch failed - " + str(exc), flush=True)
-            state = "failed: " + str(exc)
-
-    action = (action or "").strip("/").lower()
-
-    if method == "GET" and action in ("", "status"):
-        return {
-            "installed": bool(_patched[0]),
-            "install_result": state,
-            "module_version": VERSION,
-            "serving": list(FILE_PATHS),
-            "script_bytes": len(SCRIPT),
-            "script_sha256": _digest(),
-            "how_to_use": [
-                "curl -sO https://sebbi.pro/verify-authority.py",
-                "curl -s 'https://sebbi.pro/x/continuity/proof?evaluation=<id>' "
-                "| python3 verify-authority.py -",
-            ],
-            "dependencies": "none - Python standard library only",
-            "network": "the script makes no network calls and reports nothing back. "
-                       "A verification tool that phones home to the party being "
-                       "verified is not a verification tool.",
-            "note": "Check script_sha256 against the file you downloaded. And read it "
-                    "before you run it, as you would with anything else handed to you "
-                    "by the party you are checking.",
-        }, 200
-
-    return {"error": "unknown_action", "action": action, "GET": ["status"]}, 404
 
 ```
