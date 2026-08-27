@@ -1,509 +1,11 @@
 # Codebase — part 9 of 27
 
 Contains:
-- `modules/publish.py`
 - `modules/ratchet.py`
 - `modules/reconcile.py`
 - `modules/replay.py`
-
-
-## `modules/publish.py`
-
-491 lines, 21976 bytes
-
-```python
-#!/usr/bin/env python3
-"""
-modules/publish.py  -  sealing what you published, at the moment you publish it
-===============================================================================
-
-THE PROBLEM THIS EXISTS TO NEVER HAVE AGAIN
--------------------------------------------
-Somebody asks when a page was published. You answer from git history. They
-point out - correctly - that git commit dates are fields in the commit
-object which anyone can set to anything with an environment variable before
-committing. Your strongest evidence turns out to be the weakest thing in
-the room, and it drags the credible parts down with it.
-
-The fix is not a better argument. It is sealing the page the moment it goes
-live, so the question never depends on anybody's word again.
-
-WHAT THIS DOES
---------------
-    POST /x/publish/seal {"url": "https://example.com/spec"}
-
-We fetch the URL ourselves, hash exactly what was served, and seal the hash,
-the URL and the fetch time into the chain - where it is anchored externally
-and handed to peer chains like every other block.
-
-From then on:
-
-  - "this exact content was served at this address no later than T" is
-    arithmetic rather than a claim;
-  - re-sealing the same URL later builds a permanent revision history that
-    the publisher cannot edit, because each version is its own block;
-  - and anyone can check it without an account.
-
-Seal at publication and you never argue about a publication date again. That
-is the entire point, and it takes one call.
-
-WHAT IT HONESTLY CANNOT DO
---------------------------
-It cannot reach backwards. A seal made today proves the content existed
-today, not that it existed last week. Nothing can prove that - not this, not
-Bitcoin, not a notary. Timestamps are one-directional by nature.
-
-So for anything already published before it was sealed, the module records
-EXTERNAL REFERENCES alongside: a GitHub push event, a Wayback Machine
-snapshot, a DigiCert or OpenTimestamps proof. Those are stored and sealed as
-supplied. We do not verify them and we do not present them as ours - they
-are somebody else's record, named so a third party can check it at source.
-That distinction is stated in every response rather than left to be
-discovered.
-
-Two references are worth knowing about, because they are the ones that
-actually carry an earlier date:
-
-  GitHub push events   api.github.com/repos/<owner>/<repo>/events
-                       The push timestamp is recorded server-side by GitHub
-                       and cannot be set by the pusher, unlike commit dates.
-                       Retained roughly 90 days - so it must be captured
-                       while it still exists.
-
-  Wayback Machine      archive.org/wayback/available?url=...&timestamp=...
-                       An independent party with no stake in the dispute.
-                       If it caught the page, that settles it outright.
-
-FETCHING SAFELY
----------------
-This module makes the server fetch a URL. Done naively that is a hole worse
-than the one it closes. So the fetcher speaks only http and https, only on
-ports 80 and 443, resolves the hostname first and refuses any address that
-is private, loopback, link-local, reserved or multicast, never follows a
-redirect, times out fast, and stops reading after a cap. Sealing is keyed,
-so this is not an anonymous capability either.
-
-    POST /x/publish/seal      fetch, hash and seal a live URL     (keyed)
-    GET  /x/publish/history   every version ever sealed of a URL  (public)
-    GET  /x/publish/verify    was this exact content served, when (public)
-    GET  /x/publish/list      everything sealed                   (public)
-    GET  /x/publish/spec      how to check any of it              (public)
-"""
-
-import hashlib
-import ipaddress
-import re
-import socket
-import time
-import urllib.error
-import urllib.request
-from datetime import datetime, timezone
-from urllib.parse import urlparse
-
-VERSION = "1.0"
-HEX64 = re.compile(r"^[0-9a-f]{64}$")
-
-# Reading is open. A publication record only settles an argument if the
-# other side can check it without going through the publisher.
-PUBLIC = {("GET", "history"), ("GET", "verify"), ("GET", "list"),
-          ("GET", "spec")}
-
-CONTENT_PREFIX = b"AILEASH-PUBLISH-v1:"
-
-FETCH_TIMEOUT = 8
-MAX_FETCH_BYTES = 2 * 1024 * 1024
-ALLOWED_SCHEMES = ("http", "https")
-ALLOWED_PORTS = (80, 443)
-MAX_EXTERNAL = 8
-
-_ready = False
-
-
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        c = ctx["conn"]
-        c.execute("CREATE TABLE IF NOT EXISTS publish_seal("
-                  "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,url TEXT,"
-                  "content_hash TEXT,byte_length INTEGER,http_status INTEGER,"
-                  "content_type TEXT,note TEXT,external TEXT,"
-                  "fetched REAL,audit_hash TEXT,block_index INTEGER)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_pub_url ON publish_seal(url,id)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_pub_hash ON publish_seal(content_hash)")
-        c.commit()
-    _ready = True
-
-
-def _iso(ts):
-    if not ts:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
-
-# ----------------------------------------------------------------------
-# fetching - read the SSRF note above before touching any of this
-# ----------------------------------------------------------------------
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """A redirect is an instruction to fetch a second URL we never checked."""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-
-_opener = urllib.request.build_opener(_NoRedirect)
-
-
-def _address_allowed(host, port):
-    try:
-        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
-    except Exception as exc:
-        return False, "could not resolve host (%s)" % type(exc).__name__
-    if not infos:
-        return False, "host resolved to nothing"
-    for info in infos:
-        try:
-            addr = ipaddress.ip_address(info[4][0])
-        except ValueError:
-            return False, "unreadable address"
-        if (addr.is_private or addr.is_loopback or addr.is_link_local
-                or addr.is_reserved or addr.is_multicast or addr.is_unspecified):
-            return False, "address is not publicly routable"
-    return True, None
-
-
-def _url_allowed(url):
-    if not url or not isinstance(url, str) or len(url) > 500:
-        return False, "no usable url"
-    try:
-        parts = urlparse(url.strip())
-    except Exception:
-        return False, "unparseable url"
-    if parts.scheme not in ALLOWED_SCHEMES:
-        return False, "scheme not allowed"
-    if not parts.hostname:
-        return False, "no host in url"
-    port = parts.port or (443 if parts.scheme == "https" else 80)
-    if port not in ALLOWED_PORTS:
-        return False, "port not allowed"
-    return _address_allowed(parts.hostname, port)
-
-
-def _fetch(url):
-    """Returns (body_bytes, status, content_type, error)."""
-    ok, why = _url_allowed(url)
-    if not ok:
-        return None, None, None, why
-    request = urllib.request.Request(url, headers={
-        "Accept": "*/*",
-        "User-Agent": "aileash-publish/%s" % VERSION,
-    })
-    try:
-        with _opener.open(request, timeout=FETCH_TIMEOUT) as response:
-            status = response.getcode()
-            content_type = response.headers.get("Content-Type", "")
-            body = response.read(MAX_FETCH_BYTES + 1)
-    except urllib.error.HTTPError as exc:
-        return None, exc.code, None, "url answered %s" % exc.code
-    except Exception as exc:
-        return None, None, None, "could not reach url (%s)" % type(exc).__name__
-    if len(body) > MAX_FETCH_BYTES:
-        return None, status, content_type, "response larger than the %d byte cap" % MAX_FETCH_BYTES
-    return body, status, content_type, None
-
-
-def _content_hash(body):
-    """Hash exactly the bytes served. No normalisation, no cleverness -
-    a whitespace-tolerant hash would be a hash of our opinion of the page
-    rather than of the page."""
-    return hashlib.sha256(CONTENT_PREFIX + body).hexdigest()
-
-
-# ----------------------------------------------------------------------
-# seal
-# ----------------------------------------------------------------------
-
-def _clean_external(value):
-    """External references are recorded verbatim and never verified."""
-    if not isinstance(value, list):
-        return []
-    out = []
-    for item in value[:MAX_EXTERNAL]:
-        if isinstance(item, dict):
-            source = str(item.get("source", "")).strip()[:60]
-            reference = str(item.get("reference", item.get("url", ""))).strip()[:400]
-            claimed = str(item.get("claimed_time", "")).strip()[:60]
-            if source and reference:
-                out.append({"source": source, "reference": reference,
-                            "claimed_time": claimed or None})
-        elif isinstance(item, str) and item.strip():
-            out.append({"source": "unnamed", "reference": item.strip()[:400],
-                        "claimed_time": None})
-    return out
-
-
-def _seal(ctx, api_key, data):
-    url = str(data.get("url", "")).strip()
-    if not url:
-        return {"error": "url_required",
-                "message": "The address of the page you have just published."}, 400
-
-    note = str(data.get("note", "") or "").strip()[:300]
-    external = _clean_external(data.get("external"))
-
-    body, status, content_type, why = _fetch(url)
-    if why:
-        return {"error": "fetch_failed", "url": url, "message": why,
-                "note": "Nothing was sealed. A record of a page we could not read would be "
-                        "worse than no record."}, 502
-
-    digest = _content_hash(body)
-    now = time.time()
-
-    with ctx["lock"]:
-        prior = ctx["conn"].execute(
-            "SELECT content_hash,fetched,audit_hash FROM publish_seal "
-            "WHERE url=? ORDER BY id ASC", (url,)).fetchall()
-
-    unchanged = bool(prior) and prior[-1][0] == digest
-    first_of_this_version = None
-    for row in prior:
-        if row[0] == digest:
-            first_of_this_version = row[1]
-            break
-
-    external_summary = ";".join("%s=%s" % (e["source"], e["reference"][:60]) for e in external)
-    ev = {"user_id": "pub:" + digest[:16], "action": "publication_sealed", "amount": 0,
-          "country": "UK", "device_id": "publish", "anomaly": 0, "device_risk": 0}
-    res = {"decision": "PUBLICATION_SEALED", "score": 0, "publish_version": VERSION,
-           "url": url, "content_hash": digest, "bytes": len(body),
-           "http_status": status,
-           "detail": "url=%s;sha256=%s;bytes=%d%s"
-                     % (url, digest, len(body),
-                        ";external=" + external_summary if external_summary else "")}
-    audit_hash, block_index, seq = ctx["seal"](ev, res, now, api_key)
-
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "INSERT INTO publish_seal(api_key,url,content_hash,byte_length,http_status,"
-            "content_type,note,external,fetched,audit_hash,block_index) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-            (api_key, url, digest, len(body), status, content_type or None,
-             note or None,
-             "|".join("%s %s %s" % (e["source"], e["reference"], e["claimed_time"] or "")
-                      for e in external) or None,
-             now, audit_hash, block_index))
-        ctx["conn"].commit()
-
-    out = {
-        "url": url, "content_hash": digest, "bytes": len(body),
-        "http_status": status, "content_type": content_type,
-        "sealed_at": _iso(now),
-        "sealed_in_chain": audit_hash, "block_index": block_index, "receipt_seq": seq,
-        "version_number": len(prior) + 1,
-        "publish_version": VERSION,
-        "what_this_proves": "This exact content was served at this address when we fetched it, "
-                            "and the record of that cannot be altered afterwards.",
-        "what_it_does_not": "It does not prove the page existed earlier than this moment. "
-                            "Nothing can prove that after the fact - timestamps only run "
-                            "forwards. Seal at publication and the question never arises.",
-        "history": "/x/publish/history?url=" + url,
-        "verify_this_block": "/x/consistency/ancestor?tip=" + audit_hash,
-    }
-
-    if unchanged:
-        out["unchanged"] = True
-        out["first_sealed_in_this_form"] = _iso(first_of_this_version)
-        out["message"] = ("Identical to the last sealed version. The page has not changed since "
-                          "%s and now has an additional dated witness." % _iso(first_of_this_version))
-    elif prior:
-        out["changed"] = True
-        out["previous_hash"] = prior[-1][0]
-        out["previous_sealed_at"] = _iso(prior[-1][1])
-        out["message"] = ("The content has changed since the last seal. Both versions remain in "
-                          "the chain - a revision history the publisher cannot edit.")
-    else:
-        out["message"] = ("First seal for this address. Every later seal builds a permanent, "
-                          "dated revision history from here.")
-
-    if external:
-        out["external_references"] = external
-        out["external_caveat"] = ("Recorded exactly as supplied and sealed with the block. We do "
-                                  "not verify them and they are not our evidence - they are "
-                                  "somebody else's record, named so you can check them at "
-                                  "source.")
-    else:
-        out["advice"] = ("If this page was published before today, add external references - a "
-                         "GitHub push event, a Wayback snapshot - and they will be sealed "
-                         "alongside. Those carry an earlier date; a seal made now cannot.")
-    return out, 200
-
-
-# ----------------------------------------------------------------------
-# reading
-# ----------------------------------------------------------------------
-
-def _parse_external(blob):
-    if not blob:
-        return []
-    out = []
-    for line in blob.split("|"):
-        parts = line.strip().split(" ", 2)
-        if len(parts) >= 2:
-            out.append({"source": parts[0], "reference": parts[1],
-                        "claimed_time": parts[2] if len(parts) > 2 and parts[2] else None})
-    return out
-
-
-def _history(ctx, data):
-    url = str(data.get("url", "")).strip()
-    if not url:
-        return {"error": "url_required"}, 400
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT content_hash,byte_length,fetched,audit_hash,block_index,note,external "
-            "FROM publish_seal WHERE url=? ORDER BY id ASC LIMIT 500", (url,)).fetchall()
-    if not rows:
-        return {"error": "never_sealed", "url": url,
-                "message": "No seal recorded for that address."}, 404
-
-    versions, last_hash = [], None
-    for content_hash, length, fetched, audit_hash, block_index, note, external in rows:
-        versions.append({
-            "content_hash": content_hash, "bytes": length,
-            "sealed_at": _iso(fetched), "sealed_in_chain": audit_hash,
-            "block_index": block_index, "note": note,
-            "changed_from_previous": last_hash is not None and content_hash != last_hash,
-            "external_references": _parse_external(external),
-        })
-        last_hash = content_hash
-
-    distinct = len({v["content_hash"] for v in versions})
-    return {"url": url, "seals": len(versions), "distinct_versions": distinct,
-            "first_sealed": versions[0]["sealed_at"], "latest_sealed": versions[-1]["sealed_at"],
-            "current_hash": versions[-1]["content_hash"],
-            "versions": versions,
-            "publish_version": VERSION,
-            "what_this_is": "A dated revision history the publisher cannot edit. Each version is "
-                            "its own block; altering or removing one breaks every block after it.",
-            "limit": "The first seal fixes an upper bound, not a lower one. Anything published "
-                     "before its first seal rests on external evidence, which is recorded here "
-                     "but not verified by us."}, 200
-
-
-def _verify(ctx, data):
-    url = str(data.get("url", "")).strip()
-    digest = str(data.get("hash", data.get("content_hash", ""))).strip().lower()
-    if not digest or not HEX64.match(digest):
-        return {"error": "hash_required",
-                "message": "sha256 of AILEASH-PUBLISH-v1: followed by the exact bytes served"}, 400
-
-    with ctx["lock"]:
-        if url:
-            rows = ctx["conn"].execute(
-                "SELECT url,fetched,audit_hash,block_index FROM publish_seal "
-                "WHERE url=? AND content_hash=? ORDER BY id ASC", (url, digest)).fetchall()
-        else:
-            rows = ctx["conn"].execute(
-                "SELECT url,fetched,audit_hash,block_index FROM publish_seal "
-                "WHERE content_hash=? ORDER BY id ASC", (digest,)).fetchall()
-
-    if not rows:
-        return {"sealed": False, "content_hash": digest, "url": url or None,
-                "message": "We hold no seal for that exact content. Either it was never sealed, "
-                           "or the content differs from what was - a single byte is enough."}, 404
-
-    return {"sealed": True, "content_hash": digest,
-            "url": rows[0][0], "times_sealed": len(rows),
-            "first_sealed": _iso(rows[0][1]),
-            "latest_sealed": _iso(rows[-1][1]),
-            "sealed_in_chain": rows[0][2], "block_index": rows[0][3],
-            "publish_version": VERSION,
-            "what_this_proves": "Content with exactly this fingerprint was served at that "
-                                "address no later than the first sealing time, and the record "
-                                "of it has not been altered since.",
-            "verify_the_block": "/x/consistency/ancestor?tip=" + rows[0][2]}, 200
-
-
-def _list(ctx):
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT url,COUNT(*),MIN(fetched),MAX(fetched),COUNT(DISTINCT content_hash) "
-            "FROM publish_seal GROUP BY url ORDER BY MAX(fetched) DESC LIMIT 500").fetchall()
-    return {"count": len(rows),
-            "pages": [{"url": r[0], "seals": r[1], "first_sealed": _iso(r[2]),
-                       "latest_sealed": _iso(r[3]), "distinct_versions": r[4],
-                       "history": "/x/publish/history?url=" + r[0]} for r in rows],
-            "publish_version": VERSION,
-            "note": "Everything this platform has sealed about its own published pages. Ours is "
-                    "in here too - a publisher who seals everyone's pages but not their own is "
-                    "telling you something."}, 200
-
-
-def _spec():
-    return {
-        "publish_version": VERSION,
-        "content_hash": "sha256('AILEASH-PUBLISH-v1:' || exact_bytes_served) as lowercase hex",
-        "no_normalisation": "The bytes are hashed exactly as served. Nothing is trimmed, "
-                            "reordered or cleaned up first - a whitespace-tolerant hash would "
-                            "be a hash of our opinion of the page rather than of the page.",
-        "reproduce_it": "curl the URL, pipe the raw bytes through sha256 with that prefix, and "
-                        "compare with what we sealed. If your bytes differ, the page changed.",
-        "what_a_seal_proves": "That content with this exact fingerprint was served at this "
-                              "address no later than the sealing time, and that the record has "
-                              "not been altered since - it is a chain block like any other, "
-                              "anchored externally and witnessed by peers.",
-        "what_it_cannot_prove": "That the page existed before the seal. Timestamps run forwards "
-                                "only. Any product implying otherwise is misdescribing what a "
-                                "timestamp is.",
-        "for_earlier_dates": {
-            "github_push": "api.github.com/repos/<owner>/<repo>/events - the push timestamp is "
-                           "recorded by GitHub, not the pusher, unlike commit author and "
-                           "committer dates which are settable fields. Retained around 90 days, "
-                           "so capture it while it exists.",
-            "wayback": "archive.org/wayback/available - an independent party with no stake in "
-                       "the dispute.",
-            "status": "Both are recorded and sealed as supplied, and neither is verified by us. "
-                      "They are somebody else's evidence, named so you can check them at source.",
-        },
-        "the_discipline": "Seal at publication. One call at the moment a page goes live means "
-                          "the publication date never rests on anyone's word, anyone's git "
-                          "history, or anyone's memory again.",
-    }, 200
-
-
-# ----------------------------------------------------------------------
-# router entry point
-# ----------------------------------------------------------------------
-
-def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-    action = (action or "").strip("/").lower()
-    data = data or {}
-
-    if method == "GET":
-        if action == "spec":
-            return _spec()
-        if action == "history":
-            return _history(ctx, data)
-        if action == "verify":
-            return _verify(ctx, data)
-        if action == "list":
-            return _list(ctx)
-
-    if method == "POST":
-        if not api_key:
-            return {"error": "invalid_api_key"}, 401
-        if action == "seal":
-            return _seal(ctx, api_key, data)
-
-    return {"error": "unknown_action", "action": action,
-            "GET": ["spec", "history", "verify", "list"],
-            "POST": ["seal (keyed)"]}, 404
-
-```
+- `modules/roster.py`
+- `modules/router.py`
 
 
 ## `modules/ratchet.py`
@@ -2259,5 +1761,792 @@ def handle(method, action, data, api_key, ctx):
     return {"error": "unknown_action", "action": action,
             "GET": ["spec", "fingerprint", "history", "self", "check (keyed)"],
             "POST": ["challenge", "attest (keyed)"]}, 404
+
+```
+
+
+## `modules/roster.py`
+
+537 lines, 21691 bytes
+
+```python
+"""
+modules/roster.py  v1.2  -  the canonical network list
+
+WHY
+    Witnessing runs on each operator's own machine. A new chain can join
+    the network and nobody else's server knows it exists, because nobody
+    told it. The result is a star with one operator in the middle, which
+    is the shape a witnessed log is supposed to avoid.
+
+    This publishes the list. Every peer, every tip URL, one public route.
+    A peer's sync reads it and witnesses everyone on it, including
+    whoever joined this morning.
+
+    It does not witness anything itself. It is a phone book.
+
+WHERE THE DATA COMES FROM
+    witness_log and witness_names, which witness.py already maintains,
+    plus signed_keys from signed.py where it exists. Nothing new is
+    recorded and no existing module changes. A chain appears here because
+    it submitted a tip, which is the same thing that binds its name today.
+
+WHAT MAKES THE LIST HONEST
+    Every entry carries its own evidence: when it was first and last
+    seen, how many observations, whether its name is bound to a host or
+    to a key, and whether it has gone quiet. Nothing is filtered out for
+    looking bad. A silent chain stays listed and is marked silent,
+    because hiding it would make the list a claim rather than a record.
+
+WHAT CHANGED IN 1.2, AND WHY
+    Two things, both prompted by peers reading their own entries.
+
+    1. THE STATUS WORDS NOW MEAN WHAT THE OTHER ROUTE MEANS.
+       /x/witness/peers has always used three bands - current under 6h,
+       stale from 6 to 48, silent beyond. This route used two, so the
+       same peer could read "silent" here and "stale" there in the same
+       minute, with no way to tell which was the real one. They now match,
+       and both publish what the bands mean.
+
+       The words describe elapsed time since we last recorded an
+       observation. Nothing else. A peer who publishes on a human
+       schedule rather than a timer reads stale between sessions, and
+       that is correct rather than a fault. It is never a claim that
+       anyone's endpoint was unavailable, and Philip Pinol (PRAXIS) had
+       to point that out from his own seat, which he should not have had
+       to do.
+
+    2. THE LIST NOW EXPLAINS ITS OWN VOCABULARY.
+       Entries carry liveness and name_status values written by
+       witness.py, and signed.py adds two more of them. Publishing a word
+       a reader cannot look up is the same failure as "confirmed" was:
+       the meaning lives somewhere else and does not travel with the
+       record. Every value this route can emit is now defined in the
+       response that emits it.
+
+ROUTES
+    GET  list      public   the roster. this is the one peers poll.
+    GET  spec      public   what this is and how to consume it
+    GET  health    public   one-line network summary
+"""
+
+import time
+
+VERSION = "1.2"
+
+PUBLIC = {("GET", "list"), ("GET", "spec"), ("GET", "health")}
+
+# Status bands, in hours. These MUST match witness.py's _peers, or the
+# same peer reads two different words about itself on two public routes.
+CURRENT_UNDER_HOURS = 6
+SILENT_AFTER_HOURS = 48
+
+# Our own entry, so a consumer of the roster does not have to be told
+# separately who publishes it.
+SELF_CHAIN = "sebbi.pro"
+SELF_TIP = "https://sebbi.pro/x/witness/tip"
+SELF_OBSERVE = "https://sebbi.pro/x/witness/observe"
+SELF_SIGNED = "https://sebbi.pro/x/signed/submit"
+
+# Every value this route can publish, and what it means. A word that
+# leaves here without its meaning attached is the same mistake as
+# "confirmed", one field over.
+LIVENESS_VOCABULARY = {
+    "self-consistent":
+        "The url the submitter gave served exactly the tip the submitter "
+        "sent. Both halves came from the submitter, so this records "
+        "self-consistency - NOT verification by us or any third party.",
+    "confirmed":
+        "The same check as self-consistent, under the name used before "
+        "witness v1.2. Sealed blocks cannot be altered, so older records "
+        "still carry the original word.",
+    "live":
+        "The url served a valid but different tip. A chain that moves "
+        "between submitting and our fetching is the normal case, not a "
+        "failure.",
+    "self-declared":
+        "No url, or we could not reach it. Taken on the submitter's word "
+        "and checked by nobody.",
+    "peer-signed":
+        "Submitted through /x/signed/submit and verified against an "
+        "Ed25519 public key the submitter enrolled. We hold only the "
+        "public half, so we could not have produced that signature. This "
+        "is the only value on this list that excludes us as well as third "
+        "parties.",
+    "self":
+        "This deployment's own entry. Not a check of anything.",
+    "unchecked":
+        "Recorded before liveness checking existed.",
+}
+
+NAME_VOCABULARY = {
+    "first-use":
+        "First time this name was seen with a reachable url, so the name "
+        "is now bound to it network-wide. A later submission under this "
+        "name from a different address records as conflict, permanently.",
+    "bound":
+        "Submitted from the same url this name was first bound to. Same "
+        "operator, consistently.",
+    "conflict":
+        "This name has been submitted from a different address than the "
+        "one it was first bound to. Not proof of theft - operators move "
+        "hosts - but it is the event an auditor needs to see.",
+    "unbound":
+        "No reachable url, so there is nothing to bind this name to. An "
+        "unbound name stays claimable by whoever submits it next WITH a "
+        "reachable url.",
+    "key-bound":
+        "This name is bound to an Ed25519 public key rather than to a "
+        "host address. Only the holder of the matching private key can "
+        "submit under it, and that holder is not us.",
+    "publisher":
+        "The deployment publishing this roster.",
+    "unchecked":
+        "Recorded before name binding existed.",
+}
+
+STATUS_VOCABULARY = {
+    "current": "observed within the last %dh" % CURRENT_UNDER_HOURS,
+    "stale": "last observed between %dh and %dh ago"
+             % (CURRENT_UNDER_HOURS, SILENT_AFTER_HOURS),
+    "silent": "not observed for more than %dh" % SILENT_AFTER_HOURS,
+    "unknown": "we hold no usable timestamp for this entry",
+    "read_this": "These describe elapsed time since we last recorded an "
+                 "observation, and nothing else. A peer that publishes on "
+                 "a human schedule rather than from an always-on timer "
+                 "will read stale between sessions, correctly. It is not "
+                 "a claim that anyone's endpoint was unavailable, and it "
+                 "is not a judgement about anyone.",
+}
+
+
+def _epoch(ts):
+    """
+    Accept either a unix number or an ISO-8601 string. witness.py stores
+    ISO strings; other tables store floats. Guessing wrong here silently
+    turned every peer's status into 'unknown', so it takes both.
+    """
+    if ts is None:
+        return None
+    if isinstance(ts, (int, float)):
+        return float(ts)
+    s = str(ts).strip()
+    if not s:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    try:
+        import datetime
+        t = s.replace("Z", "+00:00")
+        return datetime.datetime.fromisoformat(t).timestamp()
+    except Exception:
+        return None
+
+
+def _iso(ts):
+    e = _epoch(ts)
+    if e is None:
+        return None
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(e))
+    except Exception:
+        return None
+
+
+def _cols(conn, table):
+    try:
+        return [r[1] for r in conn.execute(
+            "PRAGMA table_info(%s)" % table).fetchall()]
+    except Exception:
+        return []
+
+
+def _status_for(hours):
+    if hours is None:
+        return "unknown"
+    if hours <= CURRENT_UNDER_HOURS:
+        return "current"
+    if hours <= SILENT_AFTER_HOURS:
+        return "stale"
+    return "silent"
+
+
+def _signed_keys(ctx):
+    """
+    Which names have enrolled an Ed25519 key with signed.py.
+
+    Defensive on purpose: signed.py may not be deployed, in which case
+    the table does not exist and every entry simply reports no key. This
+    module must never be the reason a deploy breaks.
+    """
+    keys = {}
+    try:
+        rows = ctx["conn"].execute(
+            "SELECT peer, pubkey, rotations FROM signed_keys").fetchall()
+        for peer, pubkey, rotations in rows:
+            if peer:
+                keys[peer.strip()] = {"pubkey": pubkey,
+                                      "rotations": rotations or 0}
+    except Exception:
+        pass
+    return keys
+
+
+def _gather(ctx):
+    """
+    Read whatever witness.py has. Written defensively: this module must
+    never be the reason a deploy breaks, so a missing table or column
+    degrades to a shorter list rather than a 500.
+    """
+    conn = ctx["conn"]
+    now = time.time()
+    out = {}
+
+    cols = _cols(conn, "witness_log")
+    if not cols:
+        return out
+
+    chain_col = None
+    for c in ("chain", "peer", "chain_name", "name"):
+        if c in cols:
+            chain_col = c
+            break
+    if not chain_col:
+        return out
+
+    # witness.py calls this "observed" and stores an epoch float.
+    # Other tables have used "ts". Try the real names in order.
+    ts_col = None
+    for c in ("observed", "ts", "seen", "peer_ts"):
+        if c in cols:
+            ts_col = c
+            break
+    url_col = "url" if "url" in cols else None
+    live_col = "liveness" if "liveness" in cols else None
+    name_col = "name_status" if "name_status" in cols else None
+
+    sel = [chain_col]
+    for c in (ts_col, url_col, live_col, name_col):
+        sel.append(c if c else "NULL")
+
+    try:
+        rows = conn.execute(
+            "SELECT %s FROM witness_log ORDER BY rowid" % ", ".join(sel)
+        ).fetchall()
+    except Exception:
+        return out
+
+    for r in rows:
+        chain = (r[0] or "").strip()
+        if not chain:
+            continue
+        e = out.setdefault(chain, {
+            "chain": chain, "observations": 0, "first_seen": None,
+            "last_seen": None, "url": None, "liveness": None,
+            "name_status": None,
+        })
+        e["observations"] += 1
+        ts = _epoch(r[1])
+        if ts is not None:
+            if e["first_seen"] is None or ts < e["first_seen"]:
+                e["first_seen"] = ts
+            if e["last_seen"] is None or ts > e["last_seen"]:
+                e["last_seen"] = ts
+        if r[2]:
+            e["url"] = r[2]
+        if r[3]:
+            e["liveness"] = r[3]
+        if r[4]:
+            e["name_status"] = r[4]
+
+    for e in out.values():
+        last = e["last_seen"]
+        hours = ((now - last) / 3600.0) if last else None
+        e["hours_since"] = round(hours, 1) if hours is not None else None
+        e["status"] = _status_for(hours)
+    return out
+
+
+def _entries(ctx):
+    peers = _gather(ctx)
+    keys = _signed_keys(ctx)
+    now = time.time()
+
+    listed = []
+    for chain, e in sorted(peers.items(), key=lambda kv: kv[0]):
+        entry = {
+            "chain": e["chain"],
+            "tip_url": e["url"],
+            "observations": e["observations"],
+            "first_seen": _iso(e["first_seen"]),
+            "last_seen": _iso(e["last_seen"]),
+            "hours_since": e["hours_since"],
+            "status": e["status"],
+            "liveness": e["liveness"],
+            "name_status": e["name_status"],
+            "witnessable": bool(e["url"]),
+        }
+        key = keys.get(chain)
+        if key:
+            # A peer with an enrolled key can be submitted for by nobody
+            # but the keyholder. Worth surfacing on the list a regulator
+            # or a buyer actually reads.
+            entry["signing_key"] = {
+                "algorithm": "ed25519",
+                "pubkey": key["pubkey"],
+                "rotations": key["rotations"],
+                "means": "Only the holder of the matching private key can "
+                         "submit under this name. This deployment holds "
+                         "the public half only and cannot sign for them.",
+                "verify_at": "/x/signed/keys",
+            }
+        listed.append(entry)
+
+    listed.insert(0, {
+        "chain": SELF_CHAIN,
+        "tip_url": SELF_TIP,
+        "observations": None,
+        "first_seen": None,
+        "last_seen": _iso(now),
+        "hours_since": 0,
+        "status": "current",
+        "liveness": "self",
+        "name_status": "publisher",
+        "witnessable": True,
+        "note": "The publisher of this roster. Listed so a consumer does "
+                "not have to be told separately who to witness.",
+    })
+    return listed
+
+
+def _used_vocabulary(entries):
+    """
+    Only define the words actually present in this response, plus a
+    pointer to the full set. A legend listing values nobody has used
+    reads as padding; a value with no definition is the failure this
+    version exists to fix.
+    """
+    live = {}
+    names = {}
+    stats = {}
+    for e in entries:
+        v = e.get("liveness")
+        if v:
+            live[v] = LIVENESS_VOCABULARY.get(
+                v, "Undefined in roster v%s. If you are reading this, the "
+                   "word was introduced by another module and this route "
+                   "has not been told what it means - treat it as "
+                   "unexplained rather than as a claim." % VERSION)
+        n = e.get("name_status")
+        if n:
+            names[n] = NAME_VOCABULARY.get(
+                n, "Undefined in roster v%s - see above." % VERSION)
+        s = e.get("status")
+        if s:
+            stats[s] = STATUS_VOCABULARY.get(s, "")
+    stats["read_this"] = STATUS_VOCABULARY["read_this"]
+    return {"liveness": live, "name_status": names, "status": stats}
+
+
+def _list(ctx):
+    entries = _entries(ctx)
+    usable = [e for e in entries if e["witnessable"]]
+    signed = [e for e in entries if e.get("signing_key")]
+    return {
+        "ok": True,
+        "roster_version": VERSION,
+        "generated": _iso(time.time()),
+        "submit_to": SELF_OBSERVE,
+        "submit_signed_to": SELF_SIGNED,
+        "count": len(entries),
+        "witnessable": len(usable),
+        "stale": len([e for e in entries if e["status"] == "stale"]),
+        "silent": len([e for e in entries if e["status"] == "silent"]),
+        "with_signing_key": len(signed),
+        "peers": entries,
+        "vocabulary": _used_vocabulary(entries),
+        "what_this_list_is":
+            "Parties that have submitted a tip to this deployment. That is "
+            "all it records. It is not a membership list, not a set of "
+            "partners, and not participants in anything AILeash is building. "
+            "Being listed implies no relationship beyond having sent a hash, "
+            "and no endorsement of anything sealed in anyone else's chain "
+            "including ours. A party appears here because they posted to an "
+            "open endpoint; they did not join anything and were not asked to "
+            "agree to anything.",
+        "how_to_use":
+            "Poll this route on your own schedule. For every entry with "
+            "witnessable=true, fetch tip_url, seal the tip in your own "
+            "chain, and POST your tip to their submit endpoint. A chain "
+            "that joins tomorrow appears here and gets picked up on your "
+            "next cycle with nothing to configure.",
+        "note":
+            "Chains that have gone quiet stay listed and are marked stale "
+            "or silent. Removing them would make this a claim rather than "
+            "a record. An entry with witnessable=false has never bound a "
+            "url and cannot be fetched from. Read the status vocabulary "
+            "before drawing a conclusion from either word - they measure "
+            "elapsed time and nothing else.",
+    }, 200
+
+
+def _health(ctx):
+    entries = _entries(ctx)
+    others = [e for e in entries if e["chain"] != SELF_CHAIN]
+    current = [e for e in others if e["status"] == "current"]
+    return {
+        "ok": True,
+        "chains_listed": len(entries),
+        "submitting_currently": len(current),
+        "stale": len([e for e in others if e["status"] == "stale"]),
+        "silent": len([e for e in others if e["status"] == "silent"]),
+        "with_signing_key": len([e for e in others if e.get("signing_key")]),
+        "status_vocabulary": STATUS_VOCABULARY,
+        "what_this_counts":
+            "Parties that have submitted a tip to this deployment, and how "
+            "recently. Nothing more.",
+        "what_this_does_not_tell_you": [
+            "Whether any of these parties witness each other. They may not. "
+            "Ask them, or read their own rosters.",
+            "Whether any of them has agreed to anything, with us or with "
+            "each other.",
+            "Whether the records behind any of these tips are true.",
+            "Whether a peer was reachable. A stale or silent entry means we "
+            "have not recorded an observation recently, which is a fact "
+            "about this list and not about their infrastructure.",
+        ],
+    }, 200
+
+
+def _spec():
+    return {
+        "module": "roster",
+        "version": VERSION,
+        "what": "A list of parties that have submitted a tip to this "
+                "deployment, with the tip URL each supplied.",
+        "what_it_is_not":
+            "Not a membership list. Not a set of partners, adopters, "
+            "validators or participants in anything AILeash is building. "
+            "Appearing here means a party posted a hash to an open endpoint. "
+            "It implies no agreement, no relationship and no endorsement in "
+            "any direction. Two surfaces, two separate things: being sealed "
+            "in the chain, and being named on this list. Neither is consent "
+            "to the other.",
+        "why":
+            "Witnessing runs on each operator's own machine, so a server "
+            "only witnesses chains it has been told about. Without a "
+            "shared list, every new joiner connects to whoever invited "
+            "them and the network becomes a star with one operator in "
+            "the middle. This route is the list, so a peer's sync can "
+            "witness everybody instead of just its introducer.",
+        "routes": {
+            "GET list": "public. the roster. poll this.",
+            "GET health": "public. one-line network summary.",
+            "GET spec": "public. this document.",
+        },
+        "entry_fields": {
+            "chain": "the chain's name as it submitted it",
+            "tip_url": "where to fetch their current tip. null if they "
+                       "have never bound one.",
+            "witnessable": "true when tip_url is present",
+            "status": "current, stale, silent or unknown - see "
+                      "status_vocabulary. Matches the bands on "
+                      "/x/witness/peers.",
+            "observations": "how many tips they have submitted to us",
+            "liveness": "as recorded at submission - see "
+                        "liveness_vocabulary for every possible value",
+            "name_status": "as recorded at submission - see "
+                           "name_vocabulary for every possible value",
+            "signing_key": "present only when the chain has enrolled an "
+                           "Ed25519 public key at /x/signed/enroll. When "
+                           "present, submissions under that name are "
+                           "verified against a key this deployment does "
+                           "not hold.",
+        },
+        "liveness_vocabulary": LIVENESS_VOCABULARY,
+        "name_vocabulary": NAME_VOCABULARY,
+        "status_vocabulary": STATUS_VOCABULARY,
+        "joining": {
+            "open": "POST a tip to %s with {\"chain\", \"tip\", \"url\"}. "
+                    "No account, no key. The url field is what makes you "
+                    "witnessable by everyone else, so do not omit it."
+                    % SELF_OBSERVE,
+            "signed": "If you would rather nobody - including the operator "
+                      "of this deployment - be able to submit under your "
+                      "name, enrol an Ed25519 public key at "
+                      "/x/signed/enroll and submit at %s. You keep the "
+                      "private key. See /x/signed/spec." % SELF_SIGNED,
+        },
+        "what_this_does_not_do": [
+            "It does not witness anything. It is a phone book.",
+            "It does not establish that anyone listed is a peer of anyone "
+            "else listed, or of us.",
+            "It does not prove a listed chain is honest, only that it "
+            "submitted to us and when.",
+            "It cannot make another operator witness you. Their server "
+            "decides that. This only makes sure they know you exist.",
+            "It reflects submissions to this deployment. Another node "
+            "publishing its own roster may list a different set.",
+            "The status word is not a statement about anyone's uptime. It "
+            "is elapsed time since our last recorded observation.",
+        ],
+        "drop_in":
+            "meshwitness.py reads this route and witnesses every entry on "
+            "it. Standard library, one file, one cron line.",
+    }
+
+
+def handle(method, action, data, api_key, ctx):
+    if action == "spec":
+        return _spec(), 200
+    if action == "health":
+        return _health(ctx)
+    if action in ("list", "", "status"):
+        return _list(ctx)
+    return {"ok": False, "error": "unknown_action", "action": action}, 404
+
+```
+
+
+## `modules/router.py`
+
+234 lines, 7196 bytes
+
+```python
+"""
+Module router - /x/<module>/<action>
+
+Dispatches to modules/<module>.py, which exposes:
+
+    def handle(method, action, data, api_key, ctx): return payload, status
+
+A module may declare PUBLIC = {("GET","attest"), ...} for routes that need no
+API key. Default is closed - a route has to be opted open deliberately.
+
+RATE LIMITING
+-------------
+Authenticated routes reuse the server's own check_rate (60/min, 1000/hour per
+key), so module traffic counts against the same budget as /api/govern rather
+than sitting outside it.
+
+Public routes have no key to meter, so they are metered per client address on
+a deliberately tighter budget. Without this, an unauthenticated endpoint is an
+open invitation. The window store is bounded and self-pruning.
+
+PAYLOAD CAP
+-----------
+Module bodies are capped. Nothing here needs a megabyte of JSON, and an
+uncapped body on a public route is a memory exhaustion vector.
+
+POST SUPPORT WITHOUT EDITING server.py
+--------------------------------------
+server.py has an /x/ branch in do_GET but not in do_POST, so POST routes
+return the server's 404. The correct fix is four lines in do_POST. This is
+the fix for when that is not practical.
+
+On first import, this module patches Handler.do_POST to check for /x/ before
+falling through to the original. The patch is idempotent, keeps the original
+behaviour for every other path, and reverts on restart because it lives in
+memory rather than on disk.
+
+The catch, stated plainly: a module is only imported when a request reaches
+the router, and the only working entry point is do_GET. So after every deploy
+the first /x/ request must be a GET - after that, POST works until the next
+restart. Anything hitting /x/ with a GET does it, including a browser.
+
+This is a workaround for an editing constraint, not good architecture. If the
+four lines ever go into do_POST, this patch detects the branch is already
+there and does nothing.
+"""
+
+import importlib, json, sys, time
+from collections import defaultdict, deque
+
+VERSION = "3.2"
+
+MAX_BODY_KEYS = 200
+MAX_BODY_CHARS = 200000
+
+PUBLIC_PER_MIN = 30
+PUBLIC_PER_HOUR = 300
+_ip_wins = defaultdict(lambda: {"min": deque(), "hour": deque()})
+_ip_last_prune = [0.0]
+
+_c = {}
+_patched = [False]
+
+
+def _install_post(s):
+    """Add an /x/ branch to do_POST at runtime. Idempotent and reversible."""
+    if _patched[0]:
+        return "already installed"
+    H = getattr(s, "Handler", None)
+    if H is None or not hasattr(H, "do_POST"):
+        return "no handler"
+    if getattr(H, "_x_post_patched", False):
+        _patched[0] = True
+        return "already installed"
+    original = H.do_POST
+
+    def do_POST(self):
+        try:
+            from urllib.parse import urlparse
+            p = urlparse(self.path).path
+        except Exception:
+            p = self.path or ""
+        if p.startswith("/x/"):
+            try:
+                body = s.read_body(self)
+            except Exception:
+                body = {}
+            payload, status = route(self, p, body)
+            s.send_json(self, payload, status)
+            return
+        return original(self)
+
+    H.do_POST = do_POST
+    H._x_post_patched = True
+    _patched[0] = True
+    print("ROUTER: /x/ POST branch installed at runtime", flush=True)
+    return "installed"
+
+
+def _srv():
+    m = sys.modules.get("__main__")
+    if hasattr(m, "get_bearer"):
+        return m
+    return sys.modules.get("server")
+
+
+def _load(name):
+    m = _c.get(name)
+    if m is None:
+        m = importlib.import_module("modules." + name)
+        _c[name] = m
+    return m
+
+
+def _client(h):
+    """Prefer the forwarded address - behind a proxy the socket address is
+    the proxy, which would meter every visitor as one client."""
+    try:
+        xff = h.headers.get("X-Forwarded-For", "")
+        if xff:
+            return xff.split(",")[0].strip()[:64]
+    except Exception:
+        pass
+    try:
+        return str(h.client_address[0])[:64]
+    except Exception:
+        return "unknown"
+
+
+def _prune_ips(t):
+    if t - _ip_last_prune[0] < 300:
+        return
+    _ip_last_prune[0] = t
+    dead = [k for k, w in _ip_wins.items()
+            if (not w["hour"]) or w["hour"][-1] < t - 3600]
+    for k in dead:
+        del _ip_wins[k]
+
+
+def _check_ip(ip):
+    t = time.time()
+    _prune_ips(t)
+    w = _ip_wins[ip]
+    while w["min"] and w["min"][0] < t - 60:
+        w["min"].popleft()
+    while w["hour"] and w["hour"][0] < t - 3600:
+        w["hour"].popleft()
+    if len(w["min"]) >= PUBLIC_PER_MIN:
+        return False, "rate_limit_minute"
+    if len(w["hour"]) >= PUBLIC_PER_HOUR:
+        return False, "rate_limit_hour"
+    w["min"].append(t)
+    w["hour"].append(t)
+    return True, None
+
+
+def _too_big(data):
+    if not isinstance(data, dict):
+        return False
+    if len(data) > MAX_BODY_KEYS:
+        return True
+    try:
+        return len(json.dumps(data)) > MAX_BODY_CHARS
+    except Exception:
+        return True
+
+
+def route(h, path, data):
+    try:
+        s = _srv()
+        if s is None:
+            return {"error": "server_not_found"}, 500
+
+        if not _patched[0]:
+            try:
+                _install_post(s)
+            except Exception as _e:
+                print("ROUTER: post patch failed - " + str(_e), flush=True)
+
+        parts = [x for x in path.strip("/").split("/") if x]
+        if len(parts) < 2:
+            return {"error": "bad_path",
+                    "expected": "/x/<module>/<action>"}, 404
+        name = parts[1]
+        act = parts[2] if len(parts) > 2 else ""
+
+        if isinstance(data, dict) and data and isinstance(list(data.values())[0], list):
+            data = {k: v[0] for k, v in data.items()}
+
+        if _too_big(data):
+            return {"error": "payload_too_large",
+                    "limit_chars": MAX_BODY_CHARS,
+                    "limit_keys": MAX_BODY_KEYS}, 413
+
+        try:
+            m = _load(name)
+        except Exception:
+            return {"error": "unknown_module", "module": name}, 404
+        if not hasattr(m, "handle"):
+            return {"error": "module_has_no_handle"}, 500
+
+        method = h.command
+        public = getattr(m, "PUBLIC", set())
+        is_public = (method, act) in public or (method, "") in public
+
+        a = s.get_bearer(h)
+
+        if is_public:
+            if a and not s.get_key(a):
+                a = None
+            if not a:
+                ok, why = _check_ip(_client(h))
+                if not ok:
+                    return {"error": why,
+                            "message": "Public endpoints are rate limited per client. Use an API key for the normal budget."}, 429
+        else:
+            if not a or not s.get_key(a):
+                return {"error": "invalid_api_key"}, 401
+
+        if a:
+            try:
+                ok, why = s.check_rate(a)
+                if not ok:
+                    return {"error": why}, 429
+            except Exception:
+                pass
+
+        ctx = {"conn": s._conn, "lock": s._db_lock,
+               "seal": s.seal, "get_key": s.get_key}
+        return m.handle(method, act, data, a, ctx)
+
+    except Exception as e:
+        print("ROUTER ERR: " + str(e), flush=True)
+        return {"error": "router_failed", "detail": str(e)}, 500
 
 ```

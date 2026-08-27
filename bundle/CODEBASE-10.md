@@ -1,798 +1,11 @@
 # Codebase — part 10 of 27
 
 Contains:
-- `modules/roster.py`
-- `modules/router.py`
 - `modules/rulebind.py`
 - `modules/run_benchmark.py`
 - `modules/savings.py`
-
-
-## `modules/roster.py`
-
-537 lines, 21691 bytes
-
-```python
-"""
-modules/roster.py  v1.2  -  the canonical network list
-
-WHY
-    Witnessing runs on each operator's own machine. A new chain can join
-    the network and nobody else's server knows it exists, because nobody
-    told it. The result is a star with one operator in the middle, which
-    is the shape a witnessed log is supposed to avoid.
-
-    This publishes the list. Every peer, every tip URL, one public route.
-    A peer's sync reads it and witnesses everyone on it, including
-    whoever joined this morning.
-
-    It does not witness anything itself. It is a phone book.
-
-WHERE THE DATA COMES FROM
-    witness_log and witness_names, which witness.py already maintains,
-    plus signed_keys from signed.py where it exists. Nothing new is
-    recorded and no existing module changes. A chain appears here because
-    it submitted a tip, which is the same thing that binds its name today.
-
-WHAT MAKES THE LIST HONEST
-    Every entry carries its own evidence: when it was first and last
-    seen, how many observations, whether its name is bound to a host or
-    to a key, and whether it has gone quiet. Nothing is filtered out for
-    looking bad. A silent chain stays listed and is marked silent,
-    because hiding it would make the list a claim rather than a record.
-
-WHAT CHANGED IN 1.2, AND WHY
-    Two things, both prompted by peers reading their own entries.
-
-    1. THE STATUS WORDS NOW MEAN WHAT THE OTHER ROUTE MEANS.
-       /x/witness/peers has always used three bands - current under 6h,
-       stale from 6 to 48, silent beyond. This route used two, so the
-       same peer could read "silent" here and "stale" there in the same
-       minute, with no way to tell which was the real one. They now match,
-       and both publish what the bands mean.
-
-       The words describe elapsed time since we last recorded an
-       observation. Nothing else. A peer who publishes on a human
-       schedule rather than a timer reads stale between sessions, and
-       that is correct rather than a fault. It is never a claim that
-       anyone's endpoint was unavailable, and Philip Pinol (PRAXIS) had
-       to point that out from his own seat, which he should not have had
-       to do.
-
-    2. THE LIST NOW EXPLAINS ITS OWN VOCABULARY.
-       Entries carry liveness and name_status values written by
-       witness.py, and signed.py adds two more of them. Publishing a word
-       a reader cannot look up is the same failure as "confirmed" was:
-       the meaning lives somewhere else and does not travel with the
-       record. Every value this route can emit is now defined in the
-       response that emits it.
-
-ROUTES
-    GET  list      public   the roster. this is the one peers poll.
-    GET  spec      public   what this is and how to consume it
-    GET  health    public   one-line network summary
-"""
-
-import time
-
-VERSION = "1.2"
-
-PUBLIC = {("GET", "list"), ("GET", "spec"), ("GET", "health")}
-
-# Status bands, in hours. These MUST match witness.py's _peers, or the
-# same peer reads two different words about itself on two public routes.
-CURRENT_UNDER_HOURS = 6
-SILENT_AFTER_HOURS = 48
-
-# Our own entry, so a consumer of the roster does not have to be told
-# separately who publishes it.
-SELF_CHAIN = "sebbi.pro"
-SELF_TIP = "https://sebbi.pro/x/witness/tip"
-SELF_OBSERVE = "https://sebbi.pro/x/witness/observe"
-SELF_SIGNED = "https://sebbi.pro/x/signed/submit"
-
-# Every value this route can publish, and what it means. A word that
-# leaves here without its meaning attached is the same mistake as
-# "confirmed", one field over.
-LIVENESS_VOCABULARY = {
-    "self-consistent":
-        "The url the submitter gave served exactly the tip the submitter "
-        "sent. Both halves came from the submitter, so this records "
-        "self-consistency - NOT verification by us or any third party.",
-    "confirmed":
-        "The same check as self-consistent, under the name used before "
-        "witness v1.2. Sealed blocks cannot be altered, so older records "
-        "still carry the original word.",
-    "live":
-        "The url served a valid but different tip. A chain that moves "
-        "between submitting and our fetching is the normal case, not a "
-        "failure.",
-    "self-declared":
-        "No url, or we could not reach it. Taken on the submitter's word "
-        "and checked by nobody.",
-    "peer-signed":
-        "Submitted through /x/signed/submit and verified against an "
-        "Ed25519 public key the submitter enrolled. We hold only the "
-        "public half, so we could not have produced that signature. This "
-        "is the only value on this list that excludes us as well as third "
-        "parties.",
-    "self":
-        "This deployment's own entry. Not a check of anything.",
-    "unchecked":
-        "Recorded before liveness checking existed.",
-}
-
-NAME_VOCABULARY = {
-    "first-use":
-        "First time this name was seen with a reachable url, so the name "
-        "is now bound to it network-wide. A later submission under this "
-        "name from a different address records as conflict, permanently.",
-    "bound":
-        "Submitted from the same url this name was first bound to. Same "
-        "operator, consistently.",
-    "conflict":
-        "This name has been submitted from a different address than the "
-        "one it was first bound to. Not proof of theft - operators move "
-        "hosts - but it is the event an auditor needs to see.",
-    "unbound":
-        "No reachable url, so there is nothing to bind this name to. An "
-        "unbound name stays claimable by whoever submits it next WITH a "
-        "reachable url.",
-    "key-bound":
-        "This name is bound to an Ed25519 public key rather than to a "
-        "host address. Only the holder of the matching private key can "
-        "submit under it, and that holder is not us.",
-    "publisher":
-        "The deployment publishing this roster.",
-    "unchecked":
-        "Recorded before name binding existed.",
-}
-
-STATUS_VOCABULARY = {
-    "current": "observed within the last %dh" % CURRENT_UNDER_HOURS,
-    "stale": "last observed between %dh and %dh ago"
-             % (CURRENT_UNDER_HOURS, SILENT_AFTER_HOURS),
-    "silent": "not observed for more than %dh" % SILENT_AFTER_HOURS,
-    "unknown": "we hold no usable timestamp for this entry",
-    "read_this": "These describe elapsed time since we last recorded an "
-                 "observation, and nothing else. A peer that publishes on "
-                 "a human schedule rather than from an always-on timer "
-                 "will read stale between sessions, correctly. It is not "
-                 "a claim that anyone's endpoint was unavailable, and it "
-                 "is not a judgement about anyone.",
-}
-
-
-def _epoch(ts):
-    """
-    Accept either a unix number or an ISO-8601 string. witness.py stores
-    ISO strings; other tables store floats. Guessing wrong here silently
-    turned every peer's status into 'unknown', so it takes both.
-    """
-    if ts is None:
-        return None
-    if isinstance(ts, (int, float)):
-        return float(ts)
-    s = str(ts).strip()
-    if not s:
-        return None
-    try:
-        return float(s)
-    except ValueError:
-        pass
-    try:
-        import datetime
-        t = s.replace("Z", "+00:00")
-        return datetime.datetime.fromisoformat(t).timestamp()
-    except Exception:
-        return None
-
-
-def _iso(ts):
-    e = _epoch(ts)
-    if e is None:
-        return None
-    try:
-        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(e))
-    except Exception:
-        return None
-
-
-def _cols(conn, table):
-    try:
-        return [r[1] for r in conn.execute(
-            "PRAGMA table_info(%s)" % table).fetchall()]
-    except Exception:
-        return []
-
-
-def _status_for(hours):
-    if hours is None:
-        return "unknown"
-    if hours <= CURRENT_UNDER_HOURS:
-        return "current"
-    if hours <= SILENT_AFTER_HOURS:
-        return "stale"
-    return "silent"
-
-
-def _signed_keys(ctx):
-    """
-    Which names have enrolled an Ed25519 key with signed.py.
-
-    Defensive on purpose: signed.py may not be deployed, in which case
-    the table does not exist and every entry simply reports no key. This
-    module must never be the reason a deploy breaks.
-    """
-    keys = {}
-    try:
-        rows = ctx["conn"].execute(
-            "SELECT peer, pubkey, rotations FROM signed_keys").fetchall()
-        for peer, pubkey, rotations in rows:
-            if peer:
-                keys[peer.strip()] = {"pubkey": pubkey,
-                                      "rotations": rotations or 0}
-    except Exception:
-        pass
-    return keys
-
-
-def _gather(ctx):
-    """
-    Read whatever witness.py has. Written defensively: this module must
-    never be the reason a deploy breaks, so a missing table or column
-    degrades to a shorter list rather than a 500.
-    """
-    conn = ctx["conn"]
-    now = time.time()
-    out = {}
-
-    cols = _cols(conn, "witness_log")
-    if not cols:
-        return out
-
-    chain_col = None
-    for c in ("chain", "peer", "chain_name", "name"):
-        if c in cols:
-            chain_col = c
-            break
-    if not chain_col:
-        return out
-
-    # witness.py calls this "observed" and stores an epoch float.
-    # Other tables have used "ts". Try the real names in order.
-    ts_col = None
-    for c in ("observed", "ts", "seen", "peer_ts"):
-        if c in cols:
-            ts_col = c
-            break
-    url_col = "url" if "url" in cols else None
-    live_col = "liveness" if "liveness" in cols else None
-    name_col = "name_status" if "name_status" in cols else None
-
-    sel = [chain_col]
-    for c in (ts_col, url_col, live_col, name_col):
-        sel.append(c if c else "NULL")
-
-    try:
-        rows = conn.execute(
-            "SELECT %s FROM witness_log ORDER BY rowid" % ", ".join(sel)
-        ).fetchall()
-    except Exception:
-        return out
-
-    for r in rows:
-        chain = (r[0] or "").strip()
-        if not chain:
-            continue
-        e = out.setdefault(chain, {
-            "chain": chain, "observations": 0, "first_seen": None,
-            "last_seen": None, "url": None, "liveness": None,
-            "name_status": None,
-        })
-        e["observations"] += 1
-        ts = _epoch(r[1])
-        if ts is not None:
-            if e["first_seen"] is None or ts < e["first_seen"]:
-                e["first_seen"] = ts
-            if e["last_seen"] is None or ts > e["last_seen"]:
-                e["last_seen"] = ts
-        if r[2]:
-            e["url"] = r[2]
-        if r[3]:
-            e["liveness"] = r[3]
-        if r[4]:
-            e["name_status"] = r[4]
-
-    for e in out.values():
-        last = e["last_seen"]
-        hours = ((now - last) / 3600.0) if last else None
-        e["hours_since"] = round(hours, 1) if hours is not None else None
-        e["status"] = _status_for(hours)
-    return out
-
-
-def _entries(ctx):
-    peers = _gather(ctx)
-    keys = _signed_keys(ctx)
-    now = time.time()
-
-    listed = []
-    for chain, e in sorted(peers.items(), key=lambda kv: kv[0]):
-        entry = {
-            "chain": e["chain"],
-            "tip_url": e["url"],
-            "observations": e["observations"],
-            "first_seen": _iso(e["first_seen"]),
-            "last_seen": _iso(e["last_seen"]),
-            "hours_since": e["hours_since"],
-            "status": e["status"],
-            "liveness": e["liveness"],
-            "name_status": e["name_status"],
-            "witnessable": bool(e["url"]),
-        }
-        key = keys.get(chain)
-        if key:
-            # A peer with an enrolled key can be submitted for by nobody
-            # but the keyholder. Worth surfacing on the list a regulator
-            # or a buyer actually reads.
-            entry["signing_key"] = {
-                "algorithm": "ed25519",
-                "pubkey": key["pubkey"],
-                "rotations": key["rotations"],
-                "means": "Only the holder of the matching private key can "
-                         "submit under this name. This deployment holds "
-                         "the public half only and cannot sign for them.",
-                "verify_at": "/x/signed/keys",
-            }
-        listed.append(entry)
-
-    listed.insert(0, {
-        "chain": SELF_CHAIN,
-        "tip_url": SELF_TIP,
-        "observations": None,
-        "first_seen": None,
-        "last_seen": _iso(now),
-        "hours_since": 0,
-        "status": "current",
-        "liveness": "self",
-        "name_status": "publisher",
-        "witnessable": True,
-        "note": "The publisher of this roster. Listed so a consumer does "
-                "not have to be told separately who to witness.",
-    })
-    return listed
-
-
-def _used_vocabulary(entries):
-    """
-    Only define the words actually present in this response, plus a
-    pointer to the full set. A legend listing values nobody has used
-    reads as padding; a value with no definition is the failure this
-    version exists to fix.
-    """
-    live = {}
-    names = {}
-    stats = {}
-    for e in entries:
-        v = e.get("liveness")
-        if v:
-            live[v] = LIVENESS_VOCABULARY.get(
-                v, "Undefined in roster v%s. If you are reading this, the "
-                   "word was introduced by another module and this route "
-                   "has not been told what it means - treat it as "
-                   "unexplained rather than as a claim." % VERSION)
-        n = e.get("name_status")
-        if n:
-            names[n] = NAME_VOCABULARY.get(
-                n, "Undefined in roster v%s - see above." % VERSION)
-        s = e.get("status")
-        if s:
-            stats[s] = STATUS_VOCABULARY.get(s, "")
-    stats["read_this"] = STATUS_VOCABULARY["read_this"]
-    return {"liveness": live, "name_status": names, "status": stats}
-
-
-def _list(ctx):
-    entries = _entries(ctx)
-    usable = [e for e in entries if e["witnessable"]]
-    signed = [e for e in entries if e.get("signing_key")]
-    return {
-        "ok": True,
-        "roster_version": VERSION,
-        "generated": _iso(time.time()),
-        "submit_to": SELF_OBSERVE,
-        "submit_signed_to": SELF_SIGNED,
-        "count": len(entries),
-        "witnessable": len(usable),
-        "stale": len([e for e in entries if e["status"] == "stale"]),
-        "silent": len([e for e in entries if e["status"] == "silent"]),
-        "with_signing_key": len(signed),
-        "peers": entries,
-        "vocabulary": _used_vocabulary(entries),
-        "what_this_list_is":
-            "Parties that have submitted a tip to this deployment. That is "
-            "all it records. It is not a membership list, not a set of "
-            "partners, and not participants in anything AILeash is building. "
-            "Being listed implies no relationship beyond having sent a hash, "
-            "and no endorsement of anything sealed in anyone else's chain "
-            "including ours. A party appears here because they posted to an "
-            "open endpoint; they did not join anything and were not asked to "
-            "agree to anything.",
-        "how_to_use":
-            "Poll this route on your own schedule. For every entry with "
-            "witnessable=true, fetch tip_url, seal the tip in your own "
-            "chain, and POST your tip to their submit endpoint. A chain "
-            "that joins tomorrow appears here and gets picked up on your "
-            "next cycle with nothing to configure.",
-        "note":
-            "Chains that have gone quiet stay listed and are marked stale "
-            "or silent. Removing them would make this a claim rather than "
-            "a record. An entry with witnessable=false has never bound a "
-            "url and cannot be fetched from. Read the status vocabulary "
-            "before drawing a conclusion from either word - they measure "
-            "elapsed time and nothing else.",
-    }, 200
-
-
-def _health(ctx):
-    entries = _entries(ctx)
-    others = [e for e in entries if e["chain"] != SELF_CHAIN]
-    current = [e for e in others if e["status"] == "current"]
-    return {
-        "ok": True,
-        "chains_listed": len(entries),
-        "submitting_currently": len(current),
-        "stale": len([e for e in others if e["status"] == "stale"]),
-        "silent": len([e for e in others if e["status"] == "silent"]),
-        "with_signing_key": len([e for e in others if e.get("signing_key")]),
-        "status_vocabulary": STATUS_VOCABULARY,
-        "what_this_counts":
-            "Parties that have submitted a tip to this deployment, and how "
-            "recently. Nothing more.",
-        "what_this_does_not_tell_you": [
-            "Whether any of these parties witness each other. They may not. "
-            "Ask them, or read their own rosters.",
-            "Whether any of them has agreed to anything, with us or with "
-            "each other.",
-            "Whether the records behind any of these tips are true.",
-            "Whether a peer was reachable. A stale or silent entry means we "
-            "have not recorded an observation recently, which is a fact "
-            "about this list and not about their infrastructure.",
-        ],
-    }, 200
-
-
-def _spec():
-    return {
-        "module": "roster",
-        "version": VERSION,
-        "what": "A list of parties that have submitted a tip to this "
-                "deployment, with the tip URL each supplied.",
-        "what_it_is_not":
-            "Not a membership list. Not a set of partners, adopters, "
-            "validators or participants in anything AILeash is building. "
-            "Appearing here means a party posted a hash to an open endpoint. "
-            "It implies no agreement, no relationship and no endorsement in "
-            "any direction. Two surfaces, two separate things: being sealed "
-            "in the chain, and being named on this list. Neither is consent "
-            "to the other.",
-        "why":
-            "Witnessing runs on each operator's own machine, so a server "
-            "only witnesses chains it has been told about. Without a "
-            "shared list, every new joiner connects to whoever invited "
-            "them and the network becomes a star with one operator in "
-            "the middle. This route is the list, so a peer's sync can "
-            "witness everybody instead of just its introducer.",
-        "routes": {
-            "GET list": "public. the roster. poll this.",
-            "GET health": "public. one-line network summary.",
-            "GET spec": "public. this document.",
-        },
-        "entry_fields": {
-            "chain": "the chain's name as it submitted it",
-            "tip_url": "where to fetch their current tip. null if they "
-                       "have never bound one.",
-            "witnessable": "true when tip_url is present",
-            "status": "current, stale, silent or unknown - see "
-                      "status_vocabulary. Matches the bands on "
-                      "/x/witness/peers.",
-            "observations": "how many tips they have submitted to us",
-            "liveness": "as recorded at submission - see "
-                        "liveness_vocabulary for every possible value",
-            "name_status": "as recorded at submission - see "
-                           "name_vocabulary for every possible value",
-            "signing_key": "present only when the chain has enrolled an "
-                           "Ed25519 public key at /x/signed/enroll. When "
-                           "present, submissions under that name are "
-                           "verified against a key this deployment does "
-                           "not hold.",
-        },
-        "liveness_vocabulary": LIVENESS_VOCABULARY,
-        "name_vocabulary": NAME_VOCABULARY,
-        "status_vocabulary": STATUS_VOCABULARY,
-        "joining": {
-            "open": "POST a tip to %s with {\"chain\", \"tip\", \"url\"}. "
-                    "No account, no key. The url field is what makes you "
-                    "witnessable by everyone else, so do not omit it."
-                    % SELF_OBSERVE,
-            "signed": "If you would rather nobody - including the operator "
-                      "of this deployment - be able to submit under your "
-                      "name, enrol an Ed25519 public key at "
-                      "/x/signed/enroll and submit at %s. You keep the "
-                      "private key. See /x/signed/spec." % SELF_SIGNED,
-        },
-        "what_this_does_not_do": [
-            "It does not witness anything. It is a phone book.",
-            "It does not establish that anyone listed is a peer of anyone "
-            "else listed, or of us.",
-            "It does not prove a listed chain is honest, only that it "
-            "submitted to us and when.",
-            "It cannot make another operator witness you. Their server "
-            "decides that. This only makes sure they know you exist.",
-            "It reflects submissions to this deployment. Another node "
-            "publishing its own roster may list a different set.",
-            "The status word is not a statement about anyone's uptime. It "
-            "is elapsed time since our last recorded observation.",
-        ],
-        "drop_in":
-            "meshwitness.py reads this route and witnesses every entry on "
-            "it. Standard library, one file, one cron line.",
-    }
-
-
-def handle(method, action, data, api_key, ctx):
-    if action == "spec":
-        return _spec(), 200
-    if action == "health":
-        return _health(ctx)
-    if action in ("list", "", "status"):
-        return _list(ctx)
-    return {"ok": False, "error": "unknown_action", "action": action}, 404
-
-```
-
-
-## `modules/router.py`
-
-234 lines, 7196 bytes
-
-```python
-"""
-Module router - /x/<module>/<action>
-
-Dispatches to modules/<module>.py, which exposes:
-
-    def handle(method, action, data, api_key, ctx): return payload, status
-
-A module may declare PUBLIC = {("GET","attest"), ...} for routes that need no
-API key. Default is closed - a route has to be opted open deliberately.
-
-RATE LIMITING
--------------
-Authenticated routes reuse the server's own check_rate (60/min, 1000/hour per
-key), so module traffic counts against the same budget as /api/govern rather
-than sitting outside it.
-
-Public routes have no key to meter, so they are metered per client address on
-a deliberately tighter budget. Without this, an unauthenticated endpoint is an
-open invitation. The window store is bounded and self-pruning.
-
-PAYLOAD CAP
------------
-Module bodies are capped. Nothing here needs a megabyte of JSON, and an
-uncapped body on a public route is a memory exhaustion vector.
-
-POST SUPPORT WITHOUT EDITING server.py
---------------------------------------
-server.py has an /x/ branch in do_GET but not in do_POST, so POST routes
-return the server's 404. The correct fix is four lines in do_POST. This is
-the fix for when that is not practical.
-
-On first import, this module patches Handler.do_POST to check for /x/ before
-falling through to the original. The patch is idempotent, keeps the original
-behaviour for every other path, and reverts on restart because it lives in
-memory rather than on disk.
-
-The catch, stated plainly: a module is only imported when a request reaches
-the router, and the only working entry point is do_GET. So after every deploy
-the first /x/ request must be a GET - after that, POST works until the next
-restart. Anything hitting /x/ with a GET does it, including a browser.
-
-This is a workaround for an editing constraint, not good architecture. If the
-four lines ever go into do_POST, this patch detects the branch is already
-there and does nothing.
-"""
-
-import importlib, json, sys, time
-from collections import defaultdict, deque
-
-VERSION = "3.2"
-
-MAX_BODY_KEYS = 200
-MAX_BODY_CHARS = 200000
-
-PUBLIC_PER_MIN = 30
-PUBLIC_PER_HOUR = 300
-_ip_wins = defaultdict(lambda: {"min": deque(), "hour": deque()})
-_ip_last_prune = [0.0]
-
-_c = {}
-_patched = [False]
-
-
-def _install_post(s):
-    """Add an /x/ branch to do_POST at runtime. Idempotent and reversible."""
-    if _patched[0]:
-        return "already installed"
-    H = getattr(s, "Handler", None)
-    if H is None or not hasattr(H, "do_POST"):
-        return "no handler"
-    if getattr(H, "_x_post_patched", False):
-        _patched[0] = True
-        return "already installed"
-    original = H.do_POST
-
-    def do_POST(self):
-        try:
-            from urllib.parse import urlparse
-            p = urlparse(self.path).path
-        except Exception:
-            p = self.path or ""
-        if p.startswith("/x/"):
-            try:
-                body = s.read_body(self)
-            except Exception:
-                body = {}
-            payload, status = route(self, p, body)
-            s.send_json(self, payload, status)
-            return
-        return original(self)
-
-    H.do_POST = do_POST
-    H._x_post_patched = True
-    _patched[0] = True
-    print("ROUTER: /x/ POST branch installed at runtime", flush=True)
-    return "installed"
-
-
-def _srv():
-    m = sys.modules.get("__main__")
-    if hasattr(m, "get_bearer"):
-        return m
-    return sys.modules.get("server")
-
-
-def _load(name):
-    m = _c.get(name)
-    if m is None:
-        m = importlib.import_module("modules." + name)
-        _c[name] = m
-    return m
-
-
-def _client(h):
-    """Prefer the forwarded address - behind a proxy the socket address is
-    the proxy, which would meter every visitor as one client."""
-    try:
-        xff = h.headers.get("X-Forwarded-For", "")
-        if xff:
-            return xff.split(",")[0].strip()[:64]
-    except Exception:
-        pass
-    try:
-        return str(h.client_address[0])[:64]
-    except Exception:
-        return "unknown"
-
-
-def _prune_ips(t):
-    if t - _ip_last_prune[0] < 300:
-        return
-    _ip_last_prune[0] = t
-    dead = [k for k, w in _ip_wins.items()
-            if (not w["hour"]) or w["hour"][-1] < t - 3600]
-    for k in dead:
-        del _ip_wins[k]
-
-
-def _check_ip(ip):
-    t = time.time()
-    _prune_ips(t)
-    w = _ip_wins[ip]
-    while w["min"] and w["min"][0] < t - 60:
-        w["min"].popleft()
-    while w["hour"] and w["hour"][0] < t - 3600:
-        w["hour"].popleft()
-    if len(w["min"]) >= PUBLIC_PER_MIN:
-        return False, "rate_limit_minute"
-    if len(w["hour"]) >= PUBLIC_PER_HOUR:
-        return False, "rate_limit_hour"
-    w["min"].append(t)
-    w["hour"].append(t)
-    return True, None
-
-
-def _too_big(data):
-    if not isinstance(data, dict):
-        return False
-    if len(data) > MAX_BODY_KEYS:
-        return True
-    try:
-        return len(json.dumps(data)) > MAX_BODY_CHARS
-    except Exception:
-        return True
-
-
-def route(h, path, data):
-    try:
-        s = _srv()
-        if s is None:
-            return {"error": "server_not_found"}, 500
-
-        if not _patched[0]:
-            try:
-                _install_post(s)
-            except Exception as _e:
-                print("ROUTER: post patch failed - " + str(_e), flush=True)
-
-        parts = [x for x in path.strip("/").split("/") if x]
-        if len(parts) < 2:
-            return {"error": "bad_path",
-                    "expected": "/x/<module>/<action>"}, 404
-        name = parts[1]
-        act = parts[2] if len(parts) > 2 else ""
-
-        if isinstance(data, dict) and data and isinstance(list(data.values())[0], list):
-            data = {k: v[0] for k, v in data.items()}
-
-        if _too_big(data):
-            return {"error": "payload_too_large",
-                    "limit_chars": MAX_BODY_CHARS,
-                    "limit_keys": MAX_BODY_KEYS}, 413
-
-        try:
-            m = _load(name)
-        except Exception:
-            return {"error": "unknown_module", "module": name}, 404
-        if not hasattr(m, "handle"):
-            return {"error": "module_has_no_handle"}, 500
-
-        method = h.command
-        public = getattr(m, "PUBLIC", set())
-        is_public = (method, act) in public or (method, "") in public
-
-        a = s.get_bearer(h)
-
-        if is_public:
-            if a and not s.get_key(a):
-                a = None
-            if not a:
-                ok, why = _check_ip(_client(h))
-                if not ok:
-                    return {"error": why,
-                            "message": "Public endpoints are rate limited per client. Use an API key for the normal budget."}, 429
-        else:
-            if not a or not s.get_key(a):
-                return {"error": "invalid_api_key"}, 401
-
-        if a:
-            try:
-                ok, why = s.check_rate(a)
-                if not ok:
-                    return {"error": why}, 429
-            except Exception:
-                pass
-
-        ctx = {"conn": s._conn, "lock": s._db_lock,
-               "seal": s.seal, "get_key": s.get_key}
-        return m.handle(method, act, data, a, ctx)
-
-    except Exception as e:
-        print("ROUTER ERR: " + str(e), flush=True)
-        return {"error": "router_failed", "detail": str(e)}, 500
-
-```
+- `modules/selfcheck.py`
+- `modules/signed.py`
 
 
 ## `modules/rulebind.py`
@@ -2079,5 +1292,1265 @@ def handle(method, action, data, api_key, ctx):
         return _verify(ctx, data)
     return {"error": "unknown_action", "action": action,
             "GET": ["status", "verify"], "POST": ["seal"]}, 404
+
+```
+
+
+## `modules/selfcheck.py`
+
+1091 lines, 45976 bytes
+
+```python
+#!/usr/bin/env python3
+"""
+modules/selfcheck.py  -  the conformance runner, served as a page
+
+WHY THIS IS A MODULE AND NOT A FILE IN ROOT
+-------------------------------------------
+A plain .html in the repo root does not get served on this deployment, so
+the page ships inside the module and is served by the same runtime do_GET
+patch that console.py uses for /console and network.py uses for /witness.
+It also means the page cannot drift from the module that serves it.
+
+WHAT THE PAGE DOES
+------------------
+Reads /.well-known/ordering-test.json, then runs every check the document
+declares, in the order the document declares them. It discovers what it
+needs as it goes: a committed period from /x/complete/periods, a tree size
+from /x/consistency/root, a probe value that is not in the log.
+
+It reports four outcomes and is deliberately mean about which is which:
+
+  VERIFIED       the response was checked for what the claim requires -
+                 consecutive leaf indices for absence, a proof path for
+                 consistency, identical verdicts for reproducibility
+  INCONCLUSIVE   the endpoint answered but the semantics were not checked,
+                 or the route is POST-only, or the check is key-gated
+  FAILED         published as publicly demonstrable and the endpoint is
+                 not there. This is the number that matters
+  NOT SUPPORTED  the document does not claim it
+
+Reachable is not the same as verified, and this page never counts one as
+the other. A runner that only ever passes has not been tested.
+
+NOT A SHARED RUNNER
+-------------------
+It tests one side. The discovery document's runner field stays null until
+the checks are jointly agreed with the other mirror, and publishing this as
+though it were the agreed conformance test would claim something neither
+operator has earned. Served unlinked and noindex for that reason.
+
+    GET /self-check          the page
+    GET /x/selfcheck/status  what is installed
+"""
+
+import sys
+
+VERSION = "2.0"
+
+PUBLIC = {("GET", "status")}
+
+PAGE_PATHS = ("/self-check", "/self-check.html")
+
+_patched = [False]
+
+
+PAGE = r'''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Ordering test — self check</title>
+<style>
+  :root{
+    --ink:#0a0f1e;
+    --ink2:#10182e;
+    --line:#1e2942;
+    --gold:#c9a84c;
+    --ok:#7fe3b0;
+    --err:#ff8a80;
+    --warn:#e8c06a;
+    --mute:#6b7894;
+    --text:#dbe3f4;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    background:var(--ink);
+    color:var(--text);
+    font-family:var(--mono);
+    font-size:14px;
+    line-height:1.5;
+    -webkit-text-size-adjust:100%;
+  }
+  .wrap{max-width:760px;margin:0 auto;padding:20px 16px 80px}
+
+  header{border-bottom:1px solid var(--line);padding-bottom:18px;margin-bottom:22px}
+  .eyebrow{
+    font-size:11px;letter-spacing:.18em;text-transform:uppercase;
+    color:var(--gold);margin:0 0 8px
+  }
+  h1{font-size:22px;line-height:1.25;margin:0 0 10px;font-weight:600;letter-spacing:-.01em}
+  .sub{color:var(--mute);font-size:13px;margin:0}
+  .sub b{color:var(--text);font-weight:600}
+
+  .bar{display:flex;gap:10px;flex-wrap:wrap;margin:18px 0 0}
+  button{
+    font-family:var(--mono);font-size:13px;
+    background:var(--gold);color:#10121a;border:0;border-radius:2px;
+    padding:11px 18px;font-weight:700;letter-spacing:.02em;cursor:pointer;
+  }
+  button.ghost{background:transparent;color:var(--text);border:1px solid var(--line);font-weight:400}
+  button:disabled{opacity:.4;cursor:default}
+  button:focus-visible{outline:2px solid var(--gold);outline-offset:2px}
+
+  .tally{
+    display:flex;gap:14px;flex-wrap:wrap;margin:20px 0 0;
+    font-size:12px;color:var(--mute)
+  }
+  .tally b{font-size:20px;display:block;font-weight:600;letter-spacing:-.02em}
+  .t-pass b{color:var(--ok)} .t-fail b{color:var(--err)}
+  .t-inc b{color:var(--warn)} .t-ns b{color:var(--mute)}
+
+  /* the spine: checks hold the order the document declares */
+  ol.spine{list-style:none;margin:26px 0 0;padding:0;position:relative}
+  ol.spine:before{
+    content:"";position:absolute;left:19px;top:6px;bottom:6px;width:1px;
+    background:var(--line)
+  }
+  li.check{position:relative;padding:0 0 2px 52px;margin:0 0 2px}
+  .slot{
+    position:absolute;left:0;top:12px;width:39px;height:22px;
+    display:flex;align-items:center;justify-content:center;
+    background:var(--ink);color:var(--mute);
+    font-size:11px;letter-spacing:.08em;z-index:1
+  }
+  .row{
+    border-bottom:1px solid var(--line);
+    padding:12px 0 13px;
+    display:flex;align-items:baseline;gap:10px;flex-wrap:wrap
+  }
+  .name{font-size:14px;font-weight:600;letter-spacing:-.01em}
+  .verdict{
+    font-size:10px;letter-spacing:.14em;text-transform:uppercase;
+    padding:3px 7px;border:1px solid currentColor;border-radius:2px;white-space:nowrap
+  }
+  .v-pass{color:var(--ok)} .v-fail{color:var(--err)}
+  .v-inc{color:var(--warn)} .v-ns{color:var(--mute)}
+  .v-run{color:var(--gold)}
+  .v-wait{color:var(--line)}
+  .why{flex-basis:100%;color:var(--mute);font-size:12.5px;margin-top:2px}
+  .why b{color:var(--text);font-weight:600}
+  .ep{
+    flex-basis:100%;font-size:11.5px;color:var(--mute);
+    margin-top:5px;word-break:break-all
+  }
+  .ep a{color:var(--gold);text-decoration:none;border-bottom:1px solid rgba(201,168,76,.35)}
+  details{flex-basis:100%;margin-top:8px}
+  summary{
+    font-size:11px;letter-spacing:.1em;text-transform:uppercase;
+    color:var(--mute);cursor:pointer;list-style:none
+  }
+  summary::-webkit-details-marker{display:none}
+  summary:before{content:"▸ ";}
+  details[open] summary:before{content:"▾ ";}
+  pre{
+    background:var(--ink2);border:1px solid var(--line);border-radius:2px;
+    margin:8px 0 0;padding:10px;font-size:11.5px;line-height:1.45;
+    white-space:pre-wrap;word-break:break-word;max-height:280px;overflow:auto
+  }
+  li.check.done .slot{color:var(--text)}
+
+  footer{
+    margin-top:34px;border-top:1px solid var(--line);padding-top:16px;
+    color:var(--mute);font-size:12px
+  }
+  footer p{margin:0 0 9px}
+  .flash{
+    border:1px solid var(--err);color:var(--err);
+    padding:11px;border-radius:2px;margin:16px 0 0;font-size:12.5px
+  }
+  @media (prefers-reduced-motion: no-preference){
+    li.check.done .row{animation:in .22s ease-out}
+    @keyframes in{from{opacity:.35}to{opacity:1}}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <p class="eyebrow">Ordering test · self check</p>
+  <h1>Run every check this domain publishes about itself.</h1>
+  <p class="sub">Reads <b>/.well-known/ordering-test.json</b>, then tests each check in the order the document declares it. Nothing here is a shared runner — it only tests this side.</p>
+  <div class="bar">
+    <button id="run">Run all checks</button>
+    <button id="reload" class="ghost">Reload document</button>
+  </div>
+  <div class="tally" id="tally" hidden>
+    <div class="t-pass"><b id="n-pass">0</b>verified</div>
+    <div class="t-fail"><b id="n-fail">0</b>failed</div>
+    <div class="t-inc"><b id="n-inc">0</b>inconclusive</div>
+    <div class="t-ns"><b id="n-ns">0</b>not public</div>
+  </div>
+  <div id="flash"></div>
+</header>
+
+<ol class="spine" id="spine"></ol>
+
+<footer>
+  <p><b>Verified</b> means the response was checked for what the claim actually requires. <b>Reachable</b> means the endpoint answered but this runner did not confirm the semantics — reported as inconclusive, not as a pass.</p>
+  <p>A check marked not publicly demonstrable is reported as such and never counted as a pass. This page cannot see behind a key and does not pretend to.</p>
+</footer>
+
+</div>
+
+<script>
+(function(){
+  "use strict";
+
+  var DOC = "/.well-known/ordering-test.json";
+  var doc = null;
+  var ctx = {};
+
+  var el = function(id){ return document.getElementById(id); };
+  var spine = el("spine");
+
+  function flash(msg){
+    el("flash").innerHTML = msg ? '<div class="flash">' + msg + '</div>' : '';
+  }
+
+  function pad(n){ return (n < 10 ? "0" : "") + n; }
+
+  function jget(path){
+    return fetch(path, {headers:{"Accept":"application/json"}}).then(function(r){
+      return r.text().then(function(t){
+        var body;
+        try { body = JSON.parse(t); } catch(e){ body = t; }
+        return {status:r.status, ok:r.ok, body:body};
+      });
+    });
+  }
+
+  function jpost(path, payload){
+    return fetch(path, {
+      method:"POST",
+      headers:{"Content-Type":"application/json","Accept":"application/json"},
+      body:JSON.stringify(payload)
+    }).then(function(r){
+      return r.text().then(function(t){
+        var body;
+        try { body = JSON.parse(t); } catch(e){ body = t; }
+        return {status:r.status, ok:r.ok, body:body};
+      });
+    });
+  }
+
+  // SHA-256 in the visitor's own browser. The point of rule binding is that
+  // the server hands back the exact string it hashed; if this page recomputes
+  // the digest and it matches, nothing was taken on the server's word.
+  function sha256hex(s){
+    return crypto.subtle.digest("SHA-256", new TextEncoder().encode(s))
+      .then(function(buf){
+        var b = new Uint8Array(buf), out = "";
+        for (var i = 0; i < b.length; i++){
+          var h = b[i].toString(16);
+          out += (h.length === 1 ? "0" : "") + h;
+        }
+        return out;
+      });
+  }
+
+  var HEX64 = /^[0-9a-f]{64}$/;
+
+  function walk(node, path, strings, hexes){
+    if (typeof node === "string"){
+      strings.push({path: path || "(root)", value: node});
+      if (HEX64.test(node)) hexes[node] = path || "(root)";
+      return;
+    }
+    if (Array.isArray(node)){
+      for (var i = 0; i < node.length; i++) walk(node[i], path + "[" + i + "]", strings, hexes);
+      return;
+    }
+    if (node && typeof node === "object"){
+      for (var k in node){
+        if (Object.prototype.hasOwnProperty.call(node, k)){
+          walk(node[k], path ? path + "." + k : k, strings, hexes);
+        }
+      }
+    }
+  }
+
+  // The payload these POST routes expect is not published, so this does two
+  // things rather than guess: it tries the shapes they plausibly take, and
+  // when a rejection names a missing field it adds that field and tries
+  // again. A module that answers "'trust'" has told you what it wants.
+  function defaultFor(name){
+    if (/country/.test(name)) return "GB";
+    if (/currency/.test(name)) return "GBP";
+    if (/(^|_)id$|_id$|user|device|session/.test(name)) return "self-check";
+    if (/trust|score|ratio|rate/.test(name)) return 0.5;
+    return 0;
+  }
+
+  function missingField(body){
+    var text = (body && typeof body === "object")
+      ? (body.message || body.error || JSON.stringify(body))
+      : String(body || "");
+    // A bare quoted identifier is what a KeyError looks like once it reaches
+    // the response. Also catch an explicit "missing x" phrasing.
+    var m = text.match(/^['"]([A-Za-z_][A-Za-z0-9_]*)['"]$/) ||
+            text.match(/missing[^A-Za-z0-9_]+['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?/i) ||
+            text.match(/required[^A-Za-z0-9_]+['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?/i);
+    return m ? m[1] : null;
+  }
+
+  function postShapes(url, inner){
+    var learned = [];
+
+    function round(probe, depth){
+      var shapes = [{name:"flat", body:probe},
+                    {name:"inputs", body:{inputs:probe}},
+                    {name:"event", body:{event:probe}}];
+      var rejected = {};
+
+      function go(i){
+        if (i >= shapes.length){
+          // Every shape failed the same way? Learn the field and go again.
+          var field = null;
+          for (var k in rejected){
+            if (Object.prototype.hasOwnProperty.call(rejected, k)){
+              field = missingField(rejected[k]);
+              if (field) break;
+            }
+          }
+          if (field && depth < 6 && !(field in probe)){
+            var next = {};
+            for (var p in probe){
+              if (Object.prototype.hasOwnProperty.call(probe, p)) next[p] = probe[p];
+            }
+            next[field] = defaultFor(field);
+            learned.push(field);
+            return round(next, depth + 1);
+          }
+          return Promise.resolve({ok:false, rejected:rejected, learned:learned, probe:probe});
+        }
+        return jpost(url, shapes[i].body).then(function(r){
+          if (!r.ok){ rejected[shapes[i].name] = r.body; return go(i + 1); }
+          return {ok:true, shape:shapes[i].name, body:r.body, sent:shapes[i].body,
+                  rejected:rejected, learned:learned};
+        }).catch(function(e){
+          rejected[shapes[i].name] = e.message; return go(i + 1);
+        });
+      }
+      return go(0);
+    }
+
+    return round(inner, 0);
+  }
+
+  function oneMessage(b){
+    if (b && typeof b === "object" && (b.message || b.error)) return b.message || b.error;
+    if (typeof b === "string") return b.slice(0, 200);
+    return "no message";
+  }
+
+  // Every shape's rejection, not just the first. The first one is usually the
+  // least informative, and the shape that nearly worked is the one that says
+  // what is actually wrong.
+  function firstMessage(rejected){
+    var parts = [];
+    for (var k in rejected){
+      if (Object.prototype.hasOwnProperty.call(rejected, k)){
+        parts.push("<b>" + k + "</b>: " + oneMessage(rejected[k]));
+      }
+    }
+    return parts.length ? parts.join(" \u00b7 ") : "no message returned";
+  }
+
+  function learnedNote(res){
+    return (res.learned && res.learned.length)
+      ? " (after adding the fields it named: " + res.learned.join(", ") + ")"
+      : "";
+  }
+
+  // The engine's real signal names. Guessing these from outside was the
+  // thing that kept the reproducibility check amber.
+  var PROBE = {action: "payment", amount: 4200, trust: 0.4,
+               v60: 12, v5m: 20, v1h: 60,
+               device_risk: 0.3, anomaly: 0.2, country: "UK",
+               country_shift: false};
+
+  function show(v){
+    try { return JSON.stringify(v, null, 2); } catch(e){ return String(v); }
+  }
+
+  // ---- document ---------------------------------------------------------
+
+  function loadDoc(){
+    flash("");
+    spine.innerHTML = "";
+    el("tally").hidden = true;
+    // The module that serves the discovery document installs its route on
+    // first use, so after a deploy the document 404s until something touches
+    // it. Touch it here rather than making a person remember to.
+    return jget("/x/standard/status").catch(function(){}).then(function(){
+      return jget(DOC);
+    }).then(function(r){
+      if (!r.ok || typeof r.body !== "object"){
+        flash("Could not read " + DOC + " — status " + r.status +
+              ". If this is a fresh deploy, open /x/standard/status once to install the route, then reload.");
+        doc = null;
+        return null;
+      }
+      doc = r.body;
+      draw();
+      return doc;
+    }).catch(function(e){
+      flash("Request failed: " + e.message + ". Serve this page from the same domain as the document.");
+    });
+  }
+
+  function draw(){
+    var names = Object.keys(doc.checks || {});
+    spine.innerHTML = "";
+    names.forEach(function(name, i){
+      var c = doc.checks[name];
+      var li = document.createElement("li");
+      li.className = "check";
+      li.id = "chk-" + name;
+      li.innerHTML =
+        '<span class="slot">' + pad(i+1) + '</span>' +
+        '<div class="row">' +
+          '<span class="name">' + name.replace(/_/g," ") + '</span>' +
+          '<span class="verdict v-wait" data-v>waiting</span>' +
+          '<div class="why" data-why>' +
+            (c.supported ? "declared supported" : "declared not supported") +
+            (c.demonstrable_publicly ? ", publicly demonstrable" : ", not publicly demonstrable") +
+          '</div>' +
+          (c.endpoint ? '<div class="ep">' + c.endpoint + '</div>' : '') +
+        '</div>';
+      spine.appendChild(li);
+    });
+    var t = doc.vendor ? doc.vendor : "this domain";
+    document.querySelector(".sub").innerHTML =
+      'Document loaded from <b>' + (doc.base_url || location.origin) + '</b> · vendor <b>' + t +
+      '</b> · version <b>' + (doc.ordering_test_version || "?") + '</b> · ' +
+      names.length + ' checks declared.';
+  }
+
+  function setResult(name, verdict, why, detail){
+    var li = el("chk-" + name);
+    if (!li) return;
+    li.classList.add("done");
+    var v = li.querySelector("[data-v]");
+    var map = {PASS:"v-pass", FAIL:"v-fail", INCONCLUSIVE:"v-inc", "NOT SUPPORTED":"v-ns", RUNNING:"v-run"};
+    v.className = "verdict " + (map[verdict] || "v-wait");
+    v.textContent = verdict;
+    li.querySelector("[data-why]").innerHTML = why;
+    if (detail !== undefined){
+      var old = li.querySelector("details");
+      if (old) old.remove();
+      var d = document.createElement("details");
+      d.innerHTML = "<summary>response</summary><pre>" +
+        show(detail).replace(/</g,"&lt;") + "</pre>";
+      li.querySelector(".row").appendChild(d);
+    }
+  }
+
+  function running(name){
+    var li = el("chk-" + name);
+    if (!li) return;
+    var v = li.querySelector("[data-v]");
+    v.className = "verdict v-run";
+    v.textContent = "running";
+  }
+
+  // ---- context the checks need before they can run ----------------------
+
+  function buildContext(){
+    ctx = {};
+    var jobs = [];
+
+    jobs.push(jget("/x/complete/periods").then(function(r){
+      if (!r.ok || typeof r.body !== "object") return;
+      var list = r.body.periods || r.body.committed || r.body;
+      if (!Array.isArray(list)) return;
+      for (var i = list.length - 1; i >= 0; i--){
+        var p = list[i];
+        var id = (typeof p === "string") ? p : (p.period || p.id);
+        var committed = (typeof p === "string") ? true :
+          (p.committed === undefined ? true : !!p.committed);
+        if (id && committed){ ctx.period = id; break; }
+      }
+    }).catch(function(){}));
+
+    jobs.push(jget("/x/consistency/root").then(function(r){
+      if (!r.ok || typeof r.body !== "object") return;
+      ctx.size = r.body.size || r.body.tree_size || r.body.count;
+      ctx.root = r.body.root;
+    }).catch(function(){}));
+
+    var hex = "0123456789abcdef";
+    ctx.absent = "";
+    for (var i = 0; i < 64; i++) ctx.absent += hex[Math.floor(Math.random() * 16)];
+
+    return Promise.all(jobs);
+  }
+
+  function fill(endpoint){
+    if (!endpoint) return null;
+    return endpoint
+      .replace("{period}", ctx.period || "")
+      .replace("{value}", ctx.absent)
+      .replace("{first}", "1")
+      .replace("{second}", ctx.size ? String(ctx.size) : "");
+  }
+
+  // ---- the checks -------------------------------------------------------
+  // Each returns {verdict, why, detail}.
+
+  var runners = {
+
+    authority_tokens: function(c){
+      return jget(c.endpoint || "/x/continuity/decisions").then(function(r){
+        if (!r.ok){
+          return {verdict:"FAIL", why:"returned " + r.status, detail:r.body};
+        }
+        var b = r.body || {};
+        var list = b.decisions || [];
+        if (!list.length){
+          return {verdict:"INCONCLUSIVE",
+                  why:"the record is public and readable, but no authority has been exercised " +
+                      "yet \u2014 nothing to check, which is not the same as nothing failing",
+                  detail:b};
+        }
+        // Pull one at random and confirm the listing agrees with the sealed
+        // decision behind it. A summary that disagrees with its own record is
+        // the failure worth catching here.
+        var pick = list[Math.floor(Math.random() * list.length)];
+        return jget("/x/continuity/decision?evaluation=" + encodeURIComponent(pick.evaluation))
+          .then(function(d){
+            if (!d.ok){
+              return {verdict:"FAIL",
+                      why:"the listing offers " + pick.evaluation + " but the decision behind " +
+                          "it returned " + d.status,
+                      detail:{listed:pick, fetched:d.body}};
+            }
+            var db = d.body || {};
+            if (db.verdict !== pick.verdict){
+              return {verdict:"FAIL",
+                      why:"the public listing says <b>" + pick.verdict + "</b> and the sealed " +
+                          "decision says <b>" + db.verdict + "</b>",
+                      detail:{listed:pick, sealed:db}};
+            }
+            if (!db.lineage_digest || db.block_index === undefined){
+              return {verdict:"INCONCLUSIVE",
+                      why:"decision retrieved without a key, but it carries no lineage digest " +
+                          "or block index to tie it to the chain",
+                      detail:db};
+            }
+            return {verdict:"PASS",
+                    why:"real sealed decisions readable without an account \u2014 <b>" +
+                        (b.totals ? b.totals.allowed : "?") + " allowed, " +
+                        (b.totals ? b.totals.challenged : "?") + " challenged, " +
+                        (b.totals ? b.totals.blocked : "?") + " blocked</b>. Picked <b>" +
+                        pick.evaluation + "</b> at random and the sealed record agrees with " +
+                        "the listing, carrying its lineage digest and block index" +
+                        (db.broken_invariant ? " and naming <b>" + db.broken_invariant +
+                                               "</b> as what broke" : ""),
+                    detail:{listing:b.totals, picked:pick, sealed:db}};
+          });
+      });
+    },
+
+    reconciliation: function(c){
+      return jget(c.endpoint || "/x/reconcile/public").then(function(r){
+        if (!r.ok){
+          return {verdict:"FAIL", why:"returned " + r.status, detail:r.body};
+        }
+        var b = r.body || {};
+        var runs = b.recent || [];
+        if (!runs.length){
+          return {verdict:"INCONCLUSIVE",
+                  why:"the record is public and readable, but no reconciliation run exists yet",
+                  detail:b};
+        }
+        var done = runs.filter(function(x){ return x.status === "reconciled"; });
+        var pick = (done.length ? done : runs)[0];
+        return jget("/x/reconcile/proof?id=" + encodeURIComponent(pick.run_id)).then(function(p){
+          if (!p.ok){
+            return {verdict:"FAIL",
+                    why:"the listing offers " + pick.run_id + " but its proof returned " + p.status,
+                    detail:{listed:pick, fetched:p.body}};
+          }
+          var pb = p.body || {};
+          if (pb.plan_block_index === null || pb.result_block_index === null){
+            return {verdict:"INCONCLUSIVE",
+                    why:"run <b>" + pick.run_id + "</b> was planned but never submitted, so " +
+                        "there is no result block to order against. Published rather than " +
+                        "hidden, which is the right behaviour, but it does not demonstrate " +
+                        "the check",
+                    detail:pb};
+          }
+          if (!(pb.plan_block_index < pb.result_block_index)){
+            return {verdict:"FAIL",
+                    why:"the selection was sealed at block " + pb.plan_block_index +
+                        " and the result at " + pb.result_block_index +
+                        " \u2014 the sample was not fixed before the data was requested",
+                    detail:pb};
+          }
+          return {verdict:"PASS",
+                  why:"the sample for <b>" + pb.run_id + "</b> was sealed at block <b>" +
+                      pb.plan_block_index + "</b> and the result at <b>" +
+                      pb.result_block_index + "</b> \u2014 fixed before any data was asked " +
+                      "for, checkable without an account. Across the record: <b>" +
+                      b.mismatched + " mismatches</b> and <b>" + b.abandoned +
+                      " abandoned run" + (b.abandoned === 1 ? "" : "s") +
+                      "</b> published rather than buried",
+                  detail:{summary:{runs:b.runs, matched:b.matched, mismatched:b.mismatched,
+                                   abandoned:b.abandoned}, proof:pb}};
+        });
+      });
+    },
+
+    rule_binding: function(c){
+      return postShapes(c.endpoint || "/x/rulebind/prove", PROBE).then(function(res){
+        if (!res.ok){
+          return {verdict:"INCONCLUSIVE",
+                  why:"live, but it rejected every payload shape this runner knows \u2014 " +
+                      firstMessage(res.rejected),
+                  detail:res.rejected};
+        }
+        var strings = [], hexes = {};
+        walk(res.body, "", strings, hexes);
+        return Promise.all(strings.map(function(s){
+          return sha256hex(s.value).then(function(h){ return {path:s.path, hash:h}; });
+        })).then(function(hashed){
+          for (var i = 0; i < hashed.length; i++){
+            if (hexes[hashed[i].hash]){
+              return {verdict:"PASS",
+                      why:"the response returned the exact string that was hashed. SHA-256 of " +
+                          "<b>" + hashed[i].path + "</b>, recomputed in this browser, equals " +
+                          "<b>" + hexes[hashed[i].hash] + "</b> \u2014 the ruleset version is " +
+                          "inside the digest, not a field beside it",
+                      detail:res.body};
+            }
+          }
+          return {verdict:"INCONCLUSIVE",
+                  why:"accepted the <b>" + res.shape + "</b> payload" + learnedNote(res) +
+                      ", but no string it returned " +
+                      "hashes to any digest in the response, so the binding was not confirmed here",
+                  detail:res.body};
+        });
+      });
+    },
+
+    commit_before_reveal: function(c){
+      return jpost(c.endpoint || "/x/demo/review", PROBE).then(function(r){
+        if (!r.ok){
+          return {verdict:"INCONCLUSIVE", why:"POST returned " + r.status, detail:r.body};
+        }
+        var b = r.body || {};
+        var cid = b.case_id;
+        if (!cid){
+          return {verdict:"INCONCLUSIVE", why:"no case id came back to commit against", detail:b};
+        }
+        // The case must arrive with the verdict withheld. If it is in there,
+        // nothing committed afterwards can have preceded a reveal that had
+        // already happened.
+        var text = JSON.stringify(b);
+        if (/"(machine_verdict|verdict|decision)"\s*:\s*"(ALLOW|CHALLENGE|BLOCK)"/i.test(text)){
+          return {verdict:"FAIL",
+                  why:"the case arrived with the machine verdict already in it \u2014 the order " +
+                      "cannot be fixed after the answer is known",
+                  detail:b};
+        }
+
+        return jpost("/x/demo/commit", {case_id: cid, verdict: "challenge"}).then(function(k){
+          if (!k.ok){
+            return {verdict:"INCONCLUSIVE",
+                    why:"the case opened with the verdict withheld, but the commit returned " +
+                        k.status,
+                    detail:{case:b, commit:k.body}};
+          }
+          var kb = k.body || {};
+          if (kb.block_index === undefined || !kb.machine_verdict){
+            return {verdict:"INCONCLUSIVE",
+                    why:"committed, but the response carries no block index or no revealed " +
+                        "verdict to check the order against",
+                    detail:{case:b, commit:kb}};
+          }
+          // A commitment you can redo is not a commitment.
+          return jpost("/x/demo/commit", {case_id: cid, verdict: "allow"}).then(function(again){
+            var refused = !again.ok ||
+                          (again.body && again.body.error === "already_committed");
+            if (!refused){
+              return {verdict:"FAIL",
+                      why:"the same case accepted a second, different verdict \u2014 a " +
+                          "commitment that can be redone fixes nothing",
+                      detail:{first:kb, second:again.body}};
+            }
+            return {verdict:"PASS",
+                    why:"the case was issued with the verdict withheld, a human verdict was " +
+                        "sealed at block <b>" + kb.block_index + "</b>, the machine verdict " +
+                        "(<b>" + kb.machine_verdict + "</b>) was revealed only in that same " +
+                        "response, dwell of <b>" + kb.dwell_seconds + "s</b> was recorded, and " +
+                        "a second commit was refused \u2014 the order is fixed, not asserted",
+                    detail:{case:b, commit:kb, second_attempt:again.body}};
+          });
+        });
+      }).catch(function(e){
+        return {verdict:"INCONCLUSIVE", why:"request failed: " + e.message};
+      });
+    },
+
+    mutual_witnessing: function(c){
+      return jget("/x/witness/peers").then(function(p){
+        return jget("/x/witness/tip").then(function(t){
+          if (!p.ok) return {verdict:"FAIL", why:"peers endpoint returned " + p.status, detail:p.body};
+          if (!t.ok) return {verdict:"FAIL", why:"tip endpoint returned " + t.status, detail:t.body};
+          var peers = p.body.peers || p.body;
+          var n = Array.isArray(peers) ? peers.length : 0;
+          if (n === 0){
+            return {verdict:"FAIL", why:"no peer chains listed — witnessing claims an external party and there isn't one", detail:p.body};
+          }
+          return {verdict:"PASS",
+                  why:"<b>" + n + " peer chain" + (n>1?"s":"") + "</b> listed and a current tip served, both without an account",
+                  detail:{peers:p.body, tip:t.body}};
+        });
+      });
+    },
+
+    completeness_proof: function(c){
+      if (!ctx.period){
+        return Promise.resolve({verdict:"INCONCLUSIVE",
+          why:"no closed committed period found at /x/complete/periods, so there is nothing to ask for a root of"});
+      }
+      var url = fill(c.endpoint) || ("/x/complete/root?period=" + ctx.period);
+      return jget(url).then(function(r){
+        if (r.status === 409) return {verdict:"INCONCLUSIVE", why:"period " + ctx.period + " is still live — only closed periods commit", detail:r.body};
+        if (!r.ok) return {verdict:"FAIL", why:"returned " + r.status, detail:r.body};
+        var root = r.body.root || r.body.merkle_root;
+        var count = r.body.count !== undefined ? r.body.count : r.body.leaf_count;
+        if (!root || count === undefined){
+          return {verdict:"INCONCLUSIVE", why:"reachable, but no root and exact leaf count in the response", detail:r.body};
+        }
+        return {verdict:"PASS",
+                why:"root and an exact count of <b>" + count + "</b> leaves, committed for " + ctx.period + " before any export was asked for",
+                detail:r.body};
+      });
+    },
+
+    absence_proof: function(c){
+      if (!ctx.period){
+        return Promise.resolve({verdict:"INCONCLUSIVE",
+          why:"no committed period, so there is nothing to prove absence against"});
+      }
+      var url = fill(c.endpoint) ||
+        ("/x/complete/prove?period=" + ctx.period + "&value=" + ctx.absent);
+      return jget(url).then(function(r){
+        if (!r.ok) return {verdict:"FAIL", why:"returned " + r.status, detail:r.body};
+        var n = (r.body && r.body.neighbours) || (r.body && r.body.neighbors) || {};
+        if (n.lower && n.upper &&
+            n.lower.index !== undefined && n.upper.index !== undefined){
+          if (n.upper.index - n.lower.index === 1){
+            return {verdict:"PASS",
+                    why:"neighbours at indices <b>" + n.lower.index + "</b> and <b>" +
+                        n.upper.index + "</b> \u2014 consecutive, so nothing can sit between " +
+                        "them. Absence proved, not asserted",
+                    detail:r.body};
+          }
+          return {verdict:"FAIL",
+                  why:"neighbour indices " + n.lower.index + " and " + n.upper.index +
+                      " are not consecutive \u2014 that proves nothing",
+                  detail:r.body};
+        }
+        if (n.lower || n.upper){
+          return {verdict:"INCONCLUSIVE",
+                  why:"boundary case \u2014 the probe sorted outside the whole set, so only one " +
+                      "neighbour came back. Valid, but it does not exercise the adjacency argument",
+                  detail:r.body};
+        }
+        return {verdict:"INCONCLUSIVE", why:"no neighbours in the response", detail:r.body};
+      });
+    },
+
+    consistency_proof: function(c){
+      if (!ctx.size){
+        return Promise.resolve({verdict:"INCONCLUSIVE",
+          why:"could not read a tree size from /x/consistency/root"});
+      }
+      var first = Math.max(1, Math.floor(ctx.size / 2));
+      var url = "/x/consistency/proof?first=" + first + "&second=" + ctx.size;
+      return jget(url).then(function(r){
+        if (!r.ok){
+          return {verdict:"FAIL",
+                  why:"returned " + r.status + " for first=" + first + " second=" + ctx.size,
+                  detail:r.body};
+        }
+        var b = r.body || {};
+        var path = b.consistency_proof || b.proof || b.path;
+        if (!Array.isArray(path) || path.length === 0){
+          return {verdict:"INCONCLUSIVE", why:"no proof path in the response", detail:b};
+        }
+        // The proof has to be against the same tip served at /x/consistency/root.
+        // A proof against some other root proves something about some other log.
+        if (ctx.root && b.second_root && b.second_root !== ctx.root){
+          return {verdict:"FAIL",
+                  why:"the proof is against a different root than /x/consistency/root serves \u2014 " +
+                      "two views of the log, which is the split view this check exists to rule out",
+                  detail:b};
+        }
+        return {verdict:"PASS",
+                why:"RFC 6962 proof of <b>" + path.length + " nodes</b> that the log at " + first +
+                    " is a prefix of the log at " + ctx.size +
+                    ", against the same tip served separately \u2014 append-only shown, not claimed",
+                detail:b};
+      });
+    },
+
+    reproducibility: function(c){
+      return postShapes(c.endpoint || "/x/replay/challenge", PROBE).then(function(res){
+        if (!res.ok){
+          return {verdict:"INCONCLUSIVE",
+                  why:"live, but it rejected every payload shape this runner knows \u2014 " +
+                      firstMessage(res.rejected) +
+                      ". This endpoint is published as publicly demonstrable, so the shape it " +
+                      "wants belongs in the document",
+                  detail:res.rejected};
+        }
+        return jpost(c.endpoint || "/x/replay/challenge", res.sent).then(function(b){
+          return jget("/x/replay/fingerprint").then(function(f){
+            var va = res.body && (res.body.verdict || res.body.decision);
+            var vb = b.body && (b.body.verdict || b.body.decision);
+            if (!va || !vb){
+              return {verdict:"INCONCLUSIVE",
+                      why:"both runs accepted under the <b>" + res.shape + "</b> shape, but no " +
+                          "verdict field came back to compare",
+                      detail:{first:res.body, second:b.body}};
+            }
+            if (va === vb){
+              return {verdict:"PASS",
+                      why:"identical inputs submitted twice both returned <b>" + va + "</b> " +
+                          "under one code fingerprint" + learnedNote(res) +
+                          " \u2014 determinism shown without disclosing any scoring logic",
+                      detail:{shape:res.shape, fingerprint:f.body,
+                              first:res.body, second:b.body}};
+            }
+            return {verdict:"FAIL",
+                    why:"identical inputs gave <b>" + va + "</b> then <b>" + vb +
+                        "</b> \u2014 not deterministic",
+                    detail:{first:res.body, second:b.body}};
+          });
+        });
+      });
+    },
+
+    external_anchoring: function(c){
+      var url = c.endpoint || "/api/anchor-status";
+      return jget(url).then(function(r){
+        if (!r.ok){
+          return {verdict:"FAIL",
+                  why:"<b>" + url + " returned " + r.status + "</b> \u2014 this check is " +
+                      "published as publicly demonstrable and the endpoint under it is not there",
+                  detail:r.body};
+        }
+        var b = r.body || {};
+        var tip = b.tip || b.chain_tip || b.anchored_tip;
+        if (!tip){
+          return {verdict:"INCONCLUSIVE",
+                  why:"the endpoint answers but names no anchored tip, so there is nothing to " +
+                      "check it against",
+                  detail:b};
+        }
+
+        // A browser cannot verify Bitcoin, and this page will not pretend to.
+        // What it CAN settle is the question that actually decides the check:
+        // is the tip that was submitted to the external authority a tip of
+        // THIS log? An anchor over some other chain proves nothing about this
+        // one, and that substitution is the only way this check fails
+        // quietly.
+        return jget("/x/consistency/ancestor?tip=" + encodeURIComponent(tip)).then(function(a){
+          if (a.status === 409){
+            return {verdict:"FAIL",
+                    why:"the anchored tip is <b>not</b> on the log being served now \u2014 the " +
+                        "external timestamp covers a different chain, which is the fork this " +
+                        "check exists to catch",
+                    detail:{anchor:b, ancestor:a.body}};
+          }
+          if (!a.ok){
+            return {verdict:"INCONCLUSIVE",
+                    why:"anchored tip found, but /x/consistency/ancestor returned " + a.status +
+                        " so it could not be placed on this log",
+                    detail:{anchor:b, ancestor:a.body}};
+          }
+          var text = JSON.stringify(a.body || {});
+          var placed = /"(ancestor|is_ancestor|valid|ok|confirmed|on_chain)"\s*:\s*true/i.test(text) ||
+                       /"(consistency_proof|proof|path)"\s*:\s*\[/.test(text);
+          if (!placed){
+            return {verdict:"INCONCLUSIVE",
+                    why:"anchored tip found and the ancestor route answered, but this runner " +
+                        "could not read a confirmation out of the response",
+                    detail:{anchor:b, ancestor:a.body}};
+          }
+          var stamped = (b.ots_ok === true) || /anchored/i.test(String(b.status || ""));
+          return {verdict:"PASS",
+                  why:"the tip submitted to the external authority is proved to be on <b>this</b> " +
+                      "log, not a substituted one \u2014 checked against /x/consistency/ancestor" +
+                      (stamped ? ", and the operator reports it stamped: " +
+                                 String(b.status || "anchored")
+                               : ", though the operator does not report it stamped yet") +
+                      ". The attestation itself is the authority's to confirm, not this page's",
+                  detail:{anchor:b, ancestor:a.body}};
+        }).catch(function(e){
+          return {verdict:"INCONCLUSIVE",
+                  why:"anchored tip found but the ancestor check failed: " + e.message,
+                  detail:b};
+        });
+      });
+    }
+  };
+
+  // generic fallback: liveness only, reported honestly as inconclusive
+  function genericRunner(name, c){
+    var url = fill(c.endpoint);
+    if (!url) return Promise.resolve({verdict:"INCONCLUSIVE", why:"declared publicly demonstrable but no endpoint given"});
+    if (url.indexOf("{") !== -1){
+      return Promise.resolve({verdict:"INCONCLUSIVE", why:"endpoint has a placeholder this runner could not fill: " + url});
+    }
+    return jget(url).then(function(r){
+      var b = r.body || {};
+      // This router answers a method mismatch with 404 unknown_action and
+      // lists the methods it does accept. A POST-only route is present, not
+      // missing, and calling it missing would be a false failure.
+      var postOnly = (b.error === "unknown_action") && Array.isArray(b.POST) &&
+                     (b.POST.indexOf(url.split("?")[0].split("/").pop()) !== -1 ||
+                      (Array.isArray(b.GET) && b.GET.length === 0));
+      if (r.status === 405 || r.status === 501 || postOnly){
+        return {verdict:"INCONCLUSIVE",
+                why:"POST-only endpoint \u2014 present and listed by the router, but it cannot " +
+                    "be exercised from a plain page",
+                detail:r.body};
+      }
+      if (b.error === "unknown_action"){
+        return {verdict:"INCONCLUSIVE",
+                why:"the route answered but does not accept GET. Reachable, semantics not checked",
+                detail:r.body};
+      }
+      if (!r.ok){
+        return {verdict:"FAIL", why:"<b>" + url + " returned " + r.status + "</b>", detail:r.body};
+      }
+      return {verdict:"INCONCLUSIVE", why:"reachable — semantics not checked by this runner", detail:r.body};
+    });
+  }
+
+  // ---- run --------------------------------------------------------------
+
+  function runAll(){
+    if (!doc){ flash("No document loaded."); return; }
+    el("run").disabled = true;
+    var tally = {PASS:0, FAIL:0, INCONCLUSIVE:0, "NOT SUPPORTED":0};
+    el("tally").hidden = false;
+
+    buildContext().then(function(){
+      var names = Object.keys(doc.checks);
+      var chain = Promise.resolve();
+
+      names.forEach(function(name){
+        chain = chain.then(function(){
+          var c = doc.checks[name];
+
+          if (!c.supported){
+            setResult(name, "NOT SUPPORTED", "the document does not claim this check");
+            tally["NOT SUPPORTED"]++;
+            return;
+          }
+          if (!c.demonstrable_publicly){
+            setResult(name, "INCONCLUSIVE",
+              "built and claimed, but key-gated — nothing here can confirm it, which is what the document says");
+            tally.INCONCLUSIVE++;
+            return;
+          }
+
+          running(name);
+          var fn = runners[name] ? runners[name].bind(null, c) : genericRunner.bind(null, name, c);
+          return fn().catch(function(e){
+            return {verdict:"FAIL", why:"request threw: " + e.message};
+          }).then(function(res){
+            setResult(name, res.verdict, res.why, res.detail);
+            tally[res.verdict] = (tally[res.verdict] || 0) + 1;
+            el("n-pass").textContent = tally.PASS;
+            el("n-fail").textContent = tally.FAIL;
+            el("n-inc").textContent = tally.INCONCLUSIVE;
+            el("n-ns").textContent = tally["NOT SUPPORTED"];
+          });
+        });
+      });
+
+      chain.then(function(){
+        el("run").disabled = false;
+        el("n-pass").textContent = tally.PASS;
+        el("n-fail").textContent = tally.FAIL;
+        el("n-inc").textContent = tally.INCONCLUSIVE;
+        el("n-ns").textContent = tally["NOT SUPPORTED"];
+        if (tally.FAIL > 0){
+          flash(tally.FAIL + " check" + (tally.FAIL>1?"s":"") +
+                " published as publicly demonstrable did not hold up. Fix the endpoint or change the document — the two have to agree.");
+        }
+      });
+    });
+  }
+
+  el("run").addEventListener("click", runAll);
+  el("reload").addEventListener("click", loadDoc);
+  loadDoc();
+})();
+</script>
+</body>
+</html>
+'''
+
+
+def _srv():
+    m = sys.modules.get("__main__")
+    if m is not None and hasattr(m, "get_bearer"):
+        return m
+    return sys.modules.get("server")
+
+
+def _install(s):
+    if _patched[0]:
+        return "already installed"
+    H = getattr(s, "Handler", None)
+    if H is None or not hasattr(H, "do_GET"):
+        return "no handler"
+    if getattr(H, "_selfcheck_patched", False):
+        _patched[0] = True
+        return "already installed"
+
+    original = H.do_GET
+
+    def do_GET(self):
+        try:
+            from urllib.parse import urlparse
+            p = urlparse(self.path).path.rstrip("/") or "/"
+        except Exception:
+            p = self.path or "/"
+
+        if p in PAGE_PATHS:
+            body = PAGE.encode("utf-8")
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Robots-Tag", "noindex, nofollow")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception:
+                pass
+            return
+
+        return original(self)
+
+    H.do_GET = do_GET
+    H._selfcheck_patched = True
+    _patched[0] = True
+    print("SELFCHECK: /self-check installed", flush=True)
+    return "installed"
+
+
+def handle(method, action, data, api_key, ctx):
+    s = _srv()
+    if s is None:
+        return {"error": "server_not_found"}, 500
+
+    state = "already installed" if _patched[0] else None
+    if not _patched[0]:
+        try:
+            state = _install(s)
+        except Exception as exc:
+            print("SELFCHECK: patch failed - " + str(exc), flush=True)
+            state = "failed: " + str(exc)
+
+    action = (action or "").strip("/").lower()
+
+    if method == "GET" and action in ("", "status"):
+        return {"installed": bool(_patched[0]),
+                "install_result": state,
+                "module_version": VERSION,
+                "serving": list(PAGE_PATHS),
+                "page_bytes": len(PAGE),
+                "note": "Runs against whichever host serves it. Same origin, so the browser "
+                        "does not block the requests. Unlinked and noindex on purpose - it "
+                        "tests one operator's own document and is not a joint runner."}, 200
+
+    return {"error": "unknown_action", "action": action, "GET": ["status"]}, 404
+
+```
+
+
+## `modules/signed.py`
+
+153 lines, 7060 bytes
+
+```python
+# ----------------------------------------------------------------------
+# Schema addition inside _setup(ctx)
+# ----------------------------------------------------------------------
+def _setup(ctx):
+    global _ready
+    if _ready:
+        return
+    with ctx["lock"]:
+        c = ctx["conn"]
+        c.execute("CREATE TABLE IF NOT EXISTS signed_keys("
+                  "peer TEXT PRIMARY KEY,pubkey TEXT,enrolled REAL,"
+                  "audit_hash TEXT,block_index INTEGER,"
+                  "rotations INTEGER DEFAULT 0,last_ts REAL,note TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS signed_log("
+                  "id INTEGER PRIMARY KEY AUTOINCREMENT,peer TEXT,tip TEXT,"
+                  "peer_ts REAL,observed REAL,signature TEXT,pubkey TEXT,"
+                  "audit_hash TEXT,block_index INTEGER)")
+        c.execute("CREATE TABLE IF NOT EXISTS signed_seq("
+                  "peer TEXT PRIMARY KEY, last_seq INTEGER DEFAULT 0)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_sig_peer ON signed_log(peer,id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_sig_tip ON signed_log(tip)")
+        c.commit()
+    _ready = True
+
+
+def _next_receipt_seq(ctx, peer):
+    """Monotonic gapless sequence counter per peer chain."""
+    with ctx["lock"]:
+        c = ctx["conn"]
+        c.execute("INSERT INTO signed_seq(peer, last_seq) VALUES(?, 1) "
+                  "ON CONFLICT(peer) DO UPDATE SET last_seq = last_seq + 1", (peer,))
+        seq = c.execute("SELECT last_seq FROM signed_seq WHERE peer=?", (peer,)).fetchone()[0]
+        c.commit()
+        return seq
+
+
+# ----------------------------------------------------------------------
+# Updated _submit(ctx, data)
+# ----------------------------------------------------------------------
+def _submit(ctx, data):
+    peer = _peer_name(data)
+    if not peer:
+        return {"error": "chain_required"}, 400
+    row = _key_row(ctx, peer)
+    if not row:
+        return {"error": "not_enrolled", "chain": peer,
+                "message": "No public key is enrolled for this name. Enrol at "
+                           "/x/signed/enroll, or use the open lane at "
+                           "/x/witness/observe which needs nothing."}, 404
+    pubkey, _enrolled, _h, _idx, rotations, last_ts = row
+
+    tip = str(data.get("tip", "")).strip().lower()
+    if not HEX64.match(tip):
+        return {"error": "invalid_tip",
+                "message": "A tip is 64 hex characters - a SHA-256 chain head."}, 400
+    signature = str(data.get("signature") or data.get("sig") or "").strip().lower()
+    if not HEX128.match(signature):
+        return {"error": "invalid_signature_format",
+                "message": "An Ed25519 signature is 64 bytes - 128 lowercase "
+                           "hex characters."}, 400
+    raw_ts = data.get("ts", data.get("peer_ts"))
+    try:
+        ts_int = int(raw_ts)
+    except (TypeError, ValueError):
+        return {"error": "invalid_ts",
+                "message": "ts must be integer epoch seconds, and must be the "
+                           "same value you signed."}, 400
+
+    ok, why = _check_ts(ts_int, last_ts)
+    if not ok:
+        return {"error": "timestamp_rejected", "message": why,
+                "our_time": int(time.time())}, 400
+
+    with ctx["lock"]:
+        dup = ctx["conn"].execute(
+            "SELECT observed FROM signed_log WHERE peer=? AND signature=? LIMIT 1",
+            (peer, signature)).fetchone()
+    if dup:
+        return {"error": "replayed_signature",
+                "message": "This exact signature was already accepted at %s."
+                           % _iso(dup[0])}, 409
+
+    message = "\n".join([MSG_PREFIX, peer, tip, str(ts_int)]).encode("utf-8")
+    if not ed25519_verify(bytes.fromhex(pubkey), message, bytes.fromhex(signature)):
+        return {"error": "signature_did_not_verify",
+                "chain": peer,
+                "message": "Nothing has been sealed. The signature does not "
+                           "verify against the key enrolled for this name. "
+                           "The usual cause is a canonical message built "
+                           "differently - check it byte for byte below.",
+                "we_verified_against": _canonical_help(peer),
+                "the_exact_bytes_we_hashed":
+                    "\n".join([MSG_PREFIX, peer, tip, str(ts_int)]),
+                "enrolled_pubkey": pubkey}, 400
+
+    observed = time.time()
+    detail = ("peer=" + peer + ";tip=" + tip + ";ts=" + str(ts_int) +
+              ";pubkey=" + pubkey + ";sig=" + signature)
+    ev = {"user_id": "sig:" + peer, "action": "signed_tip_observed", "amount": 0,
+          "country": "UK", "device_id": "signed", "anomaly": 0, "device_risk": 0}
+    res = {"decision": "SIGNED_TIP_SEALED", "score": 0, "signed_version": VERSION,
+           "peer": peer, "peer_tip": tip, "timestamp": observed,
+           "verification": "peer-signed", "detail": detail}
+
+    # Execute seal safely
+    try:
+        h, idx, _ = ctx["seal"](ev, res, observed, "public-signed")
+        if not h:
+            raise ValueError("Seal returned empty hash")
+    except Exception as e:
+        return {"error": "seal_failed",
+                "message": "Failed to seal submission into the witness chain. Nothing was saved.",
+                "detail": str(e)}, 500
+
+    # Assign gapless sequence only after successful seal
+    seq = _next_receipt_seq(ctx, peer)
+
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "INSERT INTO signed_log(peer,tip,peer_ts,observed,signature,"
+            "pubkey,audit_hash,block_index) VALUES(?,?,?,?,?,?,?,?)",
+            (peer, tip, float(ts_int), observed, signature, pubkey, h, idx))
+        ctx["conn"].execute("UPDATE signed_keys SET last_ts=? WHERE peer=?",
+                            (float(ts_int), peer))
+        ctx["conn"].commit()
+
+    mirrored = False
+    try:
+        with ctx["lock"]:
+            ctx["conn"].execute(
+                "INSERT INTO witness_log(api_key,peer,tip,peer_ts,observed,"
+                "audit_hash,block_index,note,url,liveness,name_status) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                ("public-signed", peer, tip, float(ts_int), observed, h, idx,
+                 "signed submission - verified against enrolled Ed25519 key",
+                 None, "peer-signed", "key-bound"))
+            ctx["conn"].commit()
+        mirrored = True
+    except Exception:
+        pass
+
+    return {"chain": peer, "witnessed_tip": tip, "observed_at": _iso(observed),
+            "peer_claimed_time": _iso(ts_int),
+            "sealed_in_our_chain": h, "block_index": idx,
+            "receipt_seq": seq, "key_seq": (rotations or 0) + 1,
+            "verification": "peer-signed",
+            "verified_against_pubkey": pubkey,
+            "on_public_roster": mirrored,
+            "signed_version": VERSION,
+            "verify": "/x/signed/verify?peer=" + peer + "&tip=" + tip,
+            "what_this_proves": MESSAGES["what_this_proves"],
+            "what_this_does_not_prove": MESSAGES["what_this_does_not_prove"]}, 200
 
 ```

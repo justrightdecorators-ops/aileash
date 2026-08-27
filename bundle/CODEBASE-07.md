@@ -1,547 +1,11 @@
 # Codebase — part 7 of 27
 
 Contains:
-- `modules/lineage.py`
 - `modules/mutual.py`
 - `modules/network.py`
 - `modules/ots.py`
 - `modules/oversight.py`
-
-
-## `modules/lineage.py`
-
-528 lines, 24761 bytes
-
-```python
-#!/usr/bin/env python3
-"""
-modules/lineage.py  -  provenance that crosses company boundaries
-=================================================================
-
-WHERE EVERY AUDIT TRAIL STOPS
------------------------------
-At the edge of the company that wrote it.
-
-A lender holds a score. The score came from a scoring supplier, which used
-a model, which was trained on a data snapshot bought from someone else.
-Four organisations, four audit trails, none of which reference each other.
-Ask "what produced this outcome" and you get four separate answers and no
-way to join them up.
-
-Every framework written in the last three years assumes somebody can trace
-an outcome across parties. Nobody can. Not because it is hard - because
-each party's evidence is only worth anything inside that party's own
-system, so joining them up would mean trusting whoever did the joining.
-
-WHY THIS WORKS WHEN A SHARED DATABASE WOULD NOT
------------------------------------------------
-The obvious approach is a consortium: everyone writes to one ledger,
-governed by someone. That fails on the first question anybody asks, which
-is who runs it, and it never gets built.
-
-This needs none of that, because the pieces already exist:
-
-  A chain tip already commits to everything sealed beneath it.
-  That tip is already handed to peers hourly and sealed into THEIR chains.
-  Those chains are anchored externally and witnessed in turn.
-
-So a receipt can already be walked up to a tip, and that tip already sits
-inside chains its issuer does not control. The trust problem is solved
-before lineage is even mentioned.
-
-The only thing missing was the sideways link: a decision recording which
-receipts fed it, and which chain each came from. That is what this module
-adds. One field, and the graph composes itself.
-
-Nobody opts into provenance. They opt into witnessing, which they already
-want, and provenance falls out of it.
-
-WHAT AN EDGE IS AND IS NOT
---------------------------
-An edge is a sealed, dated, non-repudiable CLAIM by the declaring party
-that these inputs fed that decision. Sealing does not make the claim true.
-What it removes is the ability to revise it quietly afterwards, which is
-the part that matters when an outcome is disputed a year later.
-
-Every edge is itself a chain entry. So the provenance graph is covered by
-the same completeness, consistency and witnessing guarantees as everything
-else - you cannot delete an inconvenient edge without breaking the chain,
-and you cannot add one after the fact without the timestamp showing it.
-
-THE PART THAT IS WORTH MORE THAN THE TRACING
---------------------------------------------
-    GET /x/lineage/impact?receipt=
-
-Trace runs upstream: what produced this. Impact runs downstream: what did
-this produce.
-
-When a data provider retracts a snapshot, or a model version turns out to
-be faulty, or an upstream decision is overturned, the question every
-regulator asks is which outputs were affected. Today that answer takes
-weeks of email and is never complete. Here it is a query, and it crosses
-company boundaries, and the answer is itself provable.
-
-That is corrective action under Article 20 turned from a fire drill into a
-lookup.
-
-VERIFICATION WITHOUT TRUSTING ANY PARTY IN THE CHAIN
-----------------------------------------------------
-This module never asserts that a remote hop is valid. It returns the exact
-routes a third party should call to check each hop themselves - on our
-chain and on everybody else's. An auditor verifies the whole graph without
-trusting us, the supplier, or anyone in between.
-
-HONEST LIMITS
--------------
-  - An edge is a claim, sealed and dated. It is not proof the inputs were
-    the real ones, only that this is what was declared and when.
-  - A cross-chain hop can only be checked while the other party keeps
-    their routes up. A dead peer leaves a stub in the graph - visible,
-    which is the honest outcome, rather than silently resolved.
-  - Declaring inputs is voluntary. A party that declares nothing is not
-    caught out by this module; they are simply the point where somebody
-    else's lineage goes dark, and their customer is the one who notices.
-  - We record edges pointing at other chains. We do not fetch from them
-    here - fetching is what /x/witness does, with its SSRF controls, and
-    duplicating that machinery in a second place would be a mistake.
-
-    POST /x/lineage/declare      record what fed a decision      (keyed)
-    GET  /x/lineage/trace        walk upstream                    (public)
-    GET  /x/lineage/impact       walk downstream                  (public)
-    GET  /x/lineage/receipt      portable proof for an output     (public)
-    GET  /x/lineage/spec         the format and how to check it   (public)
-"""
-
-import re
-import time
-from datetime import datetime, timezone
-
-VERSION = "1.0"
-HEX64 = re.compile(r"^[0-9a-f]{64}$")
-
-# Everything except declaring is open. The whole point is that a party
-# three hops downstream - who has no relationship with us at all - can
-# follow the graph and check it.
-PUBLIC = {("GET", "trace"), ("GET", "impact"), ("GET", "receipt"),
-          ("GET", "spec")}
-
-OUR_CHAIN_NAME = "aileash"
-OUR_BASE = "https://sebbi.pro"
-
-MAX_INPUTS = 50
-MAX_DEPTH = 6
-MAX_NODES = 400
-ROLES = ("input", "model", "data", "policy", "document", "upstream-decision",
-         "supplier", "other")
-
-_ready = False
-
-
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        c = ctx["conn"]
-        c.execute("CREATE TABLE IF NOT EXISTS lineage_edge("
-                  "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,"
-                  "child_chain TEXT,child_receipt TEXT,"
-                  "parent_chain TEXT,parent_receipt TEXT,parent_base TEXT,"
-                  "role TEXT,note TEXT,declared REAL,"
-                  "audit_hash TEXT,block_index INTEGER)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_lin_child "
-                  "ON lineage_edge(child_receipt)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_lin_parent "
-                  "ON lineage_edge(parent_receipt)")
-        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_lin_unique "
-                  "ON lineage_edge(child_receipt,parent_chain,parent_receipt)")
-        c.commit()
-    _ready = True
-
-
-def _iso(ts):
-    if not ts:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
-
-def _clean_chain(value):
-    value = str(value or "").strip().lower()
-    return value[:80] if value else ""
-
-
-def _exists_locally(ctx, receipt):
-    try:
-        with ctx["lock"]:
-            row = ctx["conn"].execute(
-                "SELECT 1 FROM audit_log WHERE audit_hash=? LIMIT 1", (receipt,)).fetchone()
-        return bool(row)
-    except Exception:
-        return False
-
-
-def _verification_plan(chain, receipt, base=None):
-    """The exact calls a third party makes to check one hop themselves.
-
-    We never tell anyone a hop is valid. We tell them how to find out
-    without asking us again.
-    """
-    root = (base or OUR_BASE).rstrip("/") if chain != OUR_CHAIN_NAME else OUR_BASE
-    if chain != OUR_CHAIN_NAME and not base:
-        return {
-            "chain": chain, "receipt": receipt,
-            "status": "external, no address declared",
-            "how_to_check": "Ask that chain's operator for their public witness and consistency "
-                            "routes, or look for their name at %s/x/witness/peers - if we have "
-                            "ever witnessed them, the address we fetched from is recorded "
-                            "there." % OUR_BASE,
-        }
-    return {
-        "chain": chain, "receipt": receipt, "base": root,
-        "on_their_chain": "%s/x/consistency/ancestor?tip=%s" % (root, receipt),
-        "nothing_was_omitted": "%s/x/complete/periods" % root,
-        "who_witnesses_them": "%s/x/witness/peers" % root,
-        "did_we_witness_them": "%s/x/witness/attest?peer=%s&tip=%s" % (OUR_BASE, chain, receipt),
-        "note": "Run these against their host, not ours. If their answers and ours disagree, "
-                "that disagreement is the finding.",
-    }
-
-
-# ----------------------------------------------------------------------
-# declare
-# ----------------------------------------------------------------------
-
-def _declare(ctx, api_key, data):
-    child = str(data.get("receipt", data.get("child", ""))).strip().lower()
-    if not HEX64.match(child):
-        return {"error": "receipt_required",
-                "message": "The audit hash of the decision whose inputs you are declaring."}, 400
-
-    child_chain = _clean_chain(data.get("chain") or OUR_CHAIN_NAME)
-    inputs = data.get("inputs")
-    if not isinstance(inputs, list) or not inputs:
-        return {"error": "inputs_required",
-                "message": "A list of what fed this decision. Each entry needs a receipt, and a "
-                           "chain if it came from someone else.",
-                "example": {"receipt": "<64 hex>", "inputs": [
-                    {"chain": "supplier-name", "receipt": "<64 hex>", "role": "data",
-                     "base": "https://supplier.example"}]}}, 400
-    if len(inputs) > MAX_INPUTS:
-        return {"error": "too_many_inputs", "message": "at most %d per declaration" % MAX_INPUTS}, 400
-
-    if child_chain == OUR_CHAIN_NAME and not _exists_locally(ctx, child):
-        return {"error": "unknown_receipt",
-                "message": "That receipt is not in this chain. Declaring inputs for a decision "
-                           "we never sealed would put an unverifiable node in the graph."}, 404
-
-    prepared = []
-    for item in inputs:
-        if not isinstance(item, dict):
-            return {"error": "bad_input", "message": "each input must be an object"}, 400
-        parent = str(item.get("receipt", "")).strip().lower()
-        if not HEX64.match(parent):
-            return {"error": "bad_input_receipt",
-                    "message": "every input needs a 64 character hex receipt"}, 400
-        parent_chain = _clean_chain(item.get("chain") or OUR_CHAIN_NAME)
-        if parent_chain == child_chain and parent == child:
-            return {"error": "self_reference",
-                    "message": "a decision cannot be its own input"}, 400
-        role = str(item.get("role", "input")).strip().lower()
-        if role not in ROLES:
-            role = "other"
-        base = str(item.get("base", item.get("url", "")) or "").strip()[:300]
-        note = str(item.get("note", "") or "").strip()[:200]
-        prepared.append((parent_chain, parent, base, role, note))
-
-    now = time.time()
-    summary = ";".join("%s/%s:%s" % (c, r[:12], role) for c, r, _b, role, _n in prepared)
-    ev = {"user_id": "lin:" + child[:16], "action": "lineage_declared", "amount": 0,
-          "country": "UK", "device_id": "lineage", "anomaly": 0, "device_risk": 0}
-    res = {"decision": "LINEAGE_SEALED", "score": 0, "lineage_version": VERSION,
-           "child_chain": child_chain, "child_receipt": child,
-           "input_count": len(prepared),
-           "detail": "child=%s;inputs=%s" % (child, summary)}
-    audit_hash, block_index, seq = ctx["seal"](ev, res, now, api_key)
-
-    written, duplicates = 0, 0
-    with ctx["lock"]:
-        for parent_chain, parent, base, role, note in prepared:
-            try:
-                ctx["conn"].execute(
-                    "INSERT INTO lineage_edge(api_key,child_chain,child_receipt,parent_chain,"
-                    "parent_receipt,parent_base,role,note,declared,audit_hash,block_index) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                    (api_key, child_chain, child, parent_chain, parent, base or None,
-                     role, note or None, now, audit_hash, block_index))
-                written += 1
-            except Exception:
-                duplicates += 1
-        ctx["conn"].commit()
-
-    return {"child_chain": child_chain, "child_receipt": child,
-            "edges_recorded": written, "already_declared": duplicates,
-            "declared_at": _iso(now),
-            "sealed_in_chain": audit_hash, "block_index": block_index, "receipt_seq": seq,
-            "lineage_version": VERSION,
-            "what_this_does": "The declaration is now a chain entry. It cannot be removed "
-                              "without breaking every block after it, and it cannot be added "
-                              "later without the timestamp showing when.",
-            "trace": "%s/x/lineage/trace?receipt=%s" % (OUR_BASE, child),
-            "portable_receipt": "%s/x/lineage/receipt?receipt=%s" % (OUR_BASE, child)}, 200
-
-
-# ----------------------------------------------------------------------
-# walking the graph
-# ----------------------------------------------------------------------
-
-def _parents(ctx, receipt):
-    with ctx["lock"]:
-        return ctx["conn"].execute(
-            "SELECT parent_chain,parent_receipt,parent_base,role,note,declared,audit_hash "
-            "FROM lineage_edge WHERE child_receipt=? ORDER BY id ASC", (receipt,)).fetchall()
-
-
-def _children(ctx, receipt):
-    with ctx["lock"]:
-        return ctx["conn"].execute(
-            "SELECT child_chain,child_receipt,role,declared,audit_hash "
-            "FROM lineage_edge WHERE parent_receipt=? ORDER BY id ASC", (receipt,)).fetchall()
-
-
-def _walk(ctx, start, depth, upstream):
-    """Breadth-first walk with cycle and size protection.
-
-    Anything on a chain we do not hold locally becomes a frontier entry -
-    named, with a verification plan, and explicitly not resolved by us.
-    """
-    seen = {start}
-    nodes, edges, frontier = [], [], []
-    queue = [(start, 0)]
-    truncated = False
-
-    while queue:
-        receipt, level = queue.pop(0)
-        if level >= depth or len(nodes) >= MAX_NODES:
-            if queue or level >= depth:
-                truncated = truncated or bool(queue)
-            continue
-
-        rows = _parents(ctx, receipt) if upstream else _children(ctx, receipt)
-        for row in rows:
-            if upstream:
-                chain, other, base, role, note, declared, sealed = row
-            else:
-                chain, other, role, declared, sealed = row
-                base, note = None, None
-
-            edges.append({
-                "from": other if upstream else receipt,
-                "to": receipt if upstream else other,
-                "role": role, "note": note,
-                "declared_at": _iso(declared),
-                "declaration_sealed_as": sealed,
-                "chain": chain,
-            })
-
-            local = (chain == OUR_CHAIN_NAME) and _exists_locally(ctx, other)
-            if not local:
-                if not any(f["receipt"] == other for f in frontier):
-                    frontier.append({"chain": chain, "receipt": other, "depth": level + 1,
-                                     "verify": _verification_plan(chain, other, base)})
-                continue
-
-            if other in seen:
-                continue
-            seen.add(other)
-            if len(nodes) >= MAX_NODES:
-                truncated = True
-                continue
-            nodes.append({"chain": chain, "receipt": other, "depth": level + 1,
-                          "verify": _verification_plan(chain, other, base)})
-            queue.append((other, level + 1))
-
-    return nodes, edges, frontier, truncated
-
-
-def _depth_arg(data):
-    try:
-        depth = int(data.get("depth", MAX_DEPTH))
-    except (TypeError, ValueError):
-        depth = MAX_DEPTH
-    return max(1, min(depth, MAX_DEPTH))
-
-
-def _trace(ctx, data):
-    receipt = str(data.get("receipt", "")).strip().lower()
-    if not HEX64.match(receipt):
-        return {"error": "receipt_required"}, 400
-    depth = _depth_arg(data)
-
-    nodes, edges, frontier, truncated = _walk(ctx, receipt, depth, upstream=True)
-    if not edges:
-        return {"receipt": receipt, "direction": "upstream", "nodes": [], "edges": [],
-                "external_frontier": [],
-                "lineage_version": VERSION,
-                "what_this_means": "No inputs have been declared for this decision. That is not "
-                                   "the same as it having none - it means nobody said. "
-                                   "Undeclared lineage is where a trail goes dark, and the party "
-                                   "who did not declare is the one to ask.",
-                "self": _verification_plan(OUR_CHAIN_NAME, receipt)}, 200
-
-    return {"receipt": receipt, "direction": "upstream", "depth_searched": depth,
-            "nodes": nodes, "edges": edges, "external_frontier": frontier,
-            "truncated": truncated,
-            "lineage_version": VERSION,
-            "self": _verification_plan(OUR_CHAIN_NAME, receipt),
-            "how_to_verify_this": "Every node carries the routes to check it on its own chain. "
-                                  "Nothing here asks you to take our word for a hop, including "
-                                  "the hops on our own chain.",
-            "what_an_edge_is": "A sealed, dated claim by the declaring party that these inputs "
-                               "fed that decision. Sealing makes it non-repudiable, not true.",
-            "frontier_note": "External entries are named but not resolved here. Run their "
-                             "verification plans against their own hosts - that is what makes "
-                             "the graph checkable without a shared database."}, 200
-
-
-def _impact(ctx, data):
-    receipt = str(data.get("receipt", "")).strip().lower()
-    if not HEX64.match(receipt):
-        return {"error": "receipt_required"}, 400
-    depth = _depth_arg(data)
-
-    nodes, edges, frontier, truncated = _walk(ctx, receipt, depth, upstream=False)
-    affected = len(nodes)
-    return {"receipt": receipt, "direction": "downstream", "depth_searched": depth,
-            "affected_decisions": affected, "nodes": nodes, "edges": edges,
-            "external_frontier": frontier, "truncated": truncated,
-            "lineage_version": VERSION,
-            "what_this_is_for": "If this input is retracted, wrong, or overturned, these are the "
-                                "decisions that declared a dependency on it. This is the answer "
-                                "to the first question asked after any upstream failure, and it "
-                                "normally takes weeks of email to assemble incompletely.",
-            "corrective_action": "The list is itself sealed and dated, so the scope of a recall "
-                                 "can be shown to have been determined honestly rather than "
-                                 "narrowed to suit.",
-            "limits": "Only covers dependencies that were declared. A downstream party who "
-                      "declared nothing does not appear - which is a fact about them rather "
-                      "than a gap here."}, 200
-
-
-# ----------------------------------------------------------------------
-# the portable receipt - proof that travels with an output
-# ----------------------------------------------------------------------
-
-def _receipt(ctx, data):
-    receipt = str(data.get("receipt", "")).strip().lower()
-    if not HEX64.match(receipt):
-        return {"error": "receipt_required"}, 400
-    if not _exists_locally(ctx, receipt):
-        return {"error": "unknown_receipt",
-                "message": "Not a decision sealed in this chain."}, 404
-
-    rows = _parents(ctx, receipt)
-    inputs = [{"chain": r[0], "receipt": r[1], "role": r[3],
-               "verify": _verification_plan(r[0], r[1], r[2])} for r in rows]
-
-    return {
-        "format": "aileash-portable-receipt",
-        "lineage_version": VERSION,
-        "chain": OUR_CHAIN_NAME,
-        "receipt": receipt,
-        "inputs": inputs,
-        "verify_this_decision": {
-            "still_on_our_chain": "%s/x/consistency/ancestor?tip=%s" % (OUR_BASE, receipt),
-            "our_log_is_append_only": "%s/x/consistency/proof" % OUR_BASE,
-            "nothing_was_left_out": "%s/x/complete/periods" % OUR_BASE,
-            "who_witnesses_us": "%s/x/witness/peers" % OUR_BASE,
-            "our_current_tip": "%s/x/witness/tip" % OUR_BASE,
-            "the_engine_reproduces": "%s/x/replay/spec" % OUR_BASE,
-            "trace_upstream": "%s/x/lineage/trace?receipt=%s" % (OUR_BASE, receipt),
-        },
-        "offline_verifier": "aileash_verify.py - one file, no dependencies, no network. Save "
-                            "this document and check it on your own machine, today or in four "
-                            "years.",
-        "what_you_can_establish": [
-            "this decision is in a log that has not been rewritten",
-            "that log is witnessed by parties we do not control",
-            "the period it sits in declared its total before anyone asked",
-            "the same inputs still produce the same verdict",
-            "and what fed it, hop by hop, across every company involved",
-        ],
-        "what_you_cannot": "That the decision was right, or that the inputs were honest. "
-                           "Cryptography establishes what happened and when. It does not "
-                           "establish that what happened was correct, and anybody telling you "
-                           "otherwise is selling something.",
-        "send_this_on": "Attach it to the output it describes. Whoever receives it can verify "
-                        "without an account, without contacting us, and without trusting anyone "
-                        "in the chain including the sender.",
-    }, 200
-
-
-def _spec():
-    return {
-        "lineage_version": VERSION,
-        "idea": "A decision records the receipts of its inputs and which chain each came from. "
-                "Nothing else is needed, because a chain tip already commits to everything "
-                "beneath it and is already witnessed by parties its operator does not control.",
-        "why_no_consortium": "A shared ledger needs a governor and never gets built. This needs "
-                             "no agreement between parties beyond each one sealing its own work "
-                             "and publishing a tip.",
-        "declare": {
-            "route": "POST /x/lineage/declare (keyed)",
-            "body": {"receipt": "<64 hex, the decision>",
-                     "inputs": [{"chain": "<who it came from>", "receipt": "<64 hex>",
-                                 "role": "one of %s" % ", ".join(ROLES),
-                                 "base": "<their public https base, optional>"}]},
-        },
-        "roles": list(ROLES),
-        "trace": "GET /x/lineage/trace?receipt= - upstream, what produced this",
-        "impact": "GET /x/lineage/impact?receipt= - downstream, what this produced",
-        "portable_receipt": "GET /x/lineage/receipt?receipt= - a document that travels with an "
-                            "output and lets the recipient verify it independently",
-        "verifying_a_hop": "Each node carries the routes to check it on its own chain: an "
-                           "ancestry proof that the receipt is still there, a completeness "
-                           "check that nothing was omitted from its period, and the witness "
-                           "list showing who else holds that chain's tips.",
-        "adopting_it": "Implement three public routes on your own system - a tip, an observe, "
-                       "and an ancestry check - and declare your inputs. There is nothing to "
-                       "join, nobody to ask, and no fee. If you can serve a tip, you are in.",
-        "honest": "An edge is a dated, sealed claim about what fed a decision. It cannot be "
-                  "quietly revised later. It was never proof that the claim was true, and this "
-                  "module does not pretend otherwise.",
-    }, 200
-
-
-# ----------------------------------------------------------------------
-# router entry point
-# ----------------------------------------------------------------------
-
-def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-    action = (action or "").strip("/").lower()
-    data = data or {}
-
-    if method == "GET":
-        if action == "spec":
-            return _spec()
-        if action == "trace":
-            return _trace(ctx, data)
-        if action == "impact":
-            return _impact(ctx, data)
-        if action == "receipt":
-            return _receipt(ctx, data)
-
-    if method == "POST":
-        if not api_key:
-            return {"error": "invalid_api_key"}, 401
-        if action == "declare":
-            return _declare(ctx, api_key, data)
-
-    return {"error": "unknown_action", "action": action,
-            "GET": ["spec", "trace", "impact", "receipt"],
-            "POST": ["declare (keyed)"]}, 404
-
-```
+- `modules/pack.py`
 
 
 ## `modules/mutual.py`
@@ -2455,5 +1919,514 @@ def handle(method, action, data, api_key, ctx):
                 return {"error": "id_required"}, 400
             return _reviewer(ctx, api_key, rid)
     return {"error": "unknown_action", "action": action}, 404
+
+```
+
+
+## `modules/pack.py`
+
+501 lines, 20695 bytes
+
+```python
+"""
+Evidence pack - /x/pack/<action>
+
+WHAT THIS IS
+------------
+The sellable artifact. Everything else in this platform produces evidence;
+this produces the document someone hands an auditor.
+
+For a chosen period it does not summarise the chain, it RE-VERIFIES it:
+every block in the range is rehashed from its stored contents using the
+same function that sealed it, and compared to the hash recorded at the
+time. Then the links between blocks are walked, and for a single key the
+gapless receipt sequence is checked end to end.
+
+A summary is a claim. A re-verification is a check anyone can repeat.
+
+WHAT IT DOES NOT PROVE
+----------------------
+- That any decision recorded here was correct. Wrong answers seal just as
+  cleanly as right ones.
+- That an external peer's own chain is honest. That is checked at the
+  peer's host, not here.
+- Anything about periods outside the range requested.
+
+    GET  /x/pack/spec                        public - what this does
+    GET  /x/pack/preview?period=2026-Q2      keyed  - the pack as JSON
+    GET  /x/pack/render?period=2026-Q2       keyed  - the pack as one page
+    GET  /x/pack/history                     keyed  - packs issued
+    POST /x/pack/issue                       keyed  - seal it into the chain
+
+period accepts YYYY, YYYY-MM, YYYY-Qn. Add scope=me to limit the pack to
+your own key; omit scope for a deployment-wide pack.
+"""
+
+import calendar
+import datetime
+import hashlib
+import json
+import time
+
+VERSION = "1.0"
+
+# (METHOD, action). Only the spec is open - a pack is customer evidence.
+PUBLIC = {("GET", "spec")}
+
+MAX_ROWS = 200000
+
+_ready = False
+
+
+def _setup(ctx):
+    global _ready
+    if _ready:
+        return
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "CREATE TABLE IF NOT EXISTS pack_issued("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,"
+            "period TEXT,scope TEXT,digest TEXT,issued REAL,"
+            "entries INTEGER,verified INTEGER,mismatches INTEGER,"
+            "audit_hash TEXT,block_index INTEGER)")
+        ctx["conn"].execute(
+            "CREATE INDEX IF NOT EXISTS idx_pack_key "
+            "ON pack_issued(api_key)")
+        ctx["conn"].commit()
+    _ready = True
+
+
+def _sha(p):
+    """Identical to the engine's own sha(). Written out here rather than
+    imported so this module depends on no other module's internals."""
+    return hashlib.sha256(
+        json.dumps(p, sort_keys=True).encode()).hexdigest()
+
+
+def _iso(ts):
+    if ts is None:
+        return None
+    return datetime.datetime.utcfromtimestamp(
+        float(ts)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _day(ts):
+    if ts is None:
+        return None
+    return datetime.datetime.utcfromtimestamp(
+        float(ts)).strftime("%Y-%m-%d")
+
+
+def _epoch(y, m, d):
+    return float(calendar.timegm((y, m, d, 0, 0, 0, 0, 0, 0)))
+
+
+def _bounds(period):
+    """YYYY | YYYY-MM | YYYY-Qn -> (start, end, label)."""
+    p = str(period or "").strip().upper()
+    try:
+        if len(p) == 4:
+            y = int(p)
+            return _epoch(y, 1, 1), _epoch(y + 1, 1, 1), p
+        if len(p) == 7 and p[4] == "-" and p[5] == "Q":
+            y, q = int(p[:4]), int(p[6])
+            if q < 1 or q > 4:
+                return None
+            m = (q - 1) * 3 + 1
+            em, ey = m + 3, y
+            if em > 12:
+                em, ey = em - 12, y + 1
+            return _epoch(y, m, 1), _epoch(ey, em, 1), p
+        if len(p) == 7 and p[4] == "-":
+            y, m = int(p[:4]), int(p[5:])
+            em, ey = m + 1, y
+            if em > 12:
+                em, ey = 1, y + 1
+            return _epoch(y, m, 1), _epoch(ey, em, 1), p
+    except (ValueError, IndexError):
+        return None
+    return None
+
+
+# ----------------------------------------------------------------------
+# assembly - the actual re-verification
+# ----------------------------------------------------------------------
+
+def _assemble(ctx, start, end, label, scope):
+    c = ctx["conn"]
+    cols = ("id,ts,event_json,result_json,prev_hash,audit_hash,"
+            "api_key,key_seq")
+
+    with ctx["lock"]:
+        if scope:
+            rows = c.execute(
+                "SELECT " + cols + " FROM audit_log WHERE ts>=? AND ts<? "
+                "AND api_key=? ORDER BY id ASC LIMIT ?",
+                (start, end, scope, MAX_ROWS)).fetchall()
+            began = c.execute(
+                "SELECT MIN(ts) FROM audit_log WHERE api_key=?",
+                (scope,)).fetchone()
+            dev_all = c.execute(
+                "SELECT COUNT(*) FROM device_seen WHERE api_key=?",
+                (scope,)).fetchone()
+            dev_new = c.execute(
+                "SELECT COUNT(*) FROM device_seen WHERE api_key=? "
+                "AND first_seen>=? AND first_seen<?",
+                (scope, start, end)).fetchone()
+        else:
+            rows = c.execute(
+                "SELECT " + cols + " FROM audit_log WHERE ts>=? AND ts<? "
+                "ORDER BY id ASC LIMIT ?",
+                (start, end, MAX_ROWS)).fetchall()
+            began = c.execute("SELECT MIN(ts) FROM audit_log").fetchone()
+            dev_all = c.execute(
+                "SELECT COUNT(*) FROM device_seen").fetchone()
+            dev_new = c.execute(
+                "SELECT COUNT(*) FROM device_seen "
+                "WHERE first_seen>=? AND first_seen<?",
+                (start, end)).fetchone()
+        chain_total = c.execute(
+            "SELECT COUNT(*) FROM audit_log").fetchone()[0]
+
+    verdicts = {}
+    actions = {}
+    seqs = []
+    verified = 0
+    mismatched = []
+    link_breaks = []
+    expect_prev = None
+    per_day = {}
+
+    for rid, ts, ev_j, res_j, prev, ah, akey, kseq in rows:
+        try:
+            ev = json.loads(ev_j)
+            res = json.loads(res_j)
+        except Exception:
+            mismatched.append(rid)
+            expect_prev = ah
+            continue
+
+        if _sha({"prev_hash": prev, "ts": ts,
+                 "event": ev, "result": res}) == ah:
+            verified += 1
+        else:
+            mismatched.append(rid)
+
+        if expect_prev is not None and prev != expect_prev:
+            link_breaks.append(rid)
+        expect_prev = ah
+
+        d = str(res.get("decision", "UNRECORDED"))
+        verdicts[d] = verdicts.get(d, 0) + 1
+        a = str(ev.get("action", "unrecorded"))
+        actions[a] = actions.get(a, 0) + 1
+        if kseq is not None:
+            try:
+                seqs.append(int(kseq))
+            except (TypeError, ValueError):
+                pass
+        k = _day(ts)
+        per_day[k] = per_day.get(k, 0) + 1
+
+    # does the first block in the period chain to the one before it
+    entry_link = "no_entries_in_period"
+    if rows:
+        with ctx["lock"]:
+            before = c.execute(
+                "SELECT audit_hash FROM audit_log WHERE id<? "
+                "ORDER BY id DESC LIMIT 1", (rows[0][0],)).fetchone()
+        if before is None:
+            entry_link = ("intact_from_genesis"
+                          if rows[0][4] == "GENESIS" else "broken")
+        else:
+            entry_link = "intact" if rows[0][4] == before[0] else "broken"
+
+    seq = {"applicable": bool(scope and seqs)}
+    if seq["applicable"]:
+        lo, hi = min(seqs), max(seqs)
+        have = set(seqs)
+        missing = [n for n in range(lo, hi + 1) if n not in have]
+        seq.update({"first": lo, "last": hi, "received": len(seqs),
+                    "expected": hi - lo + 1,
+                    "missing": missing[:200],
+                    "gapless": not missing,
+                    "note": "Receipt numbers are issued with no gaps by "
+                            "construction. A missing number is a record "
+                            "that left this chain."})
+
+    clean = (not mismatched and not link_breaks
+             and entry_link in ("intact", "intact_from_genesis"))
+
+    p = {
+        "pack_version": VERSION,
+        "period": label,
+        "period_start": _iso(start),
+        "period_end": _iso(end),
+        "generated_at": _iso(time.time()),
+        "scope": ("key " + str(scope)[:12] + "\u2026") if scope
+                 else "deployment-wide",
+        "unbroken_since": _day(began[0] if began else None),
+        "entries_in_period": len(rows),
+        "chain_total_entries": chain_total,
+        "first_block": rows[0][0] if rows else None,
+        "first_hash": rows[0][5] if rows else None,
+        "last_block": rows[-1][0] if rows else None,
+        "last_hash": rows[-1][5] if rows else None,
+        "integrity": {
+            "clean": clean,
+            "blocks_recomputed": len(rows),
+            "hashes_verified": verified,
+            "hash_mismatches": mismatched[:50],
+            "link_breaks": link_breaks[:50],
+            "link_into_period": entry_link,
+            "method": "SHA-256 over {prev_hash, ts, event, result}, "
+                      "recomputed from the stored row and compared to "
+                      "the hash sealed at the time",
+        },
+        "receipt_sequence": seq,
+        "verdicts": verdicts,
+        "actions": dict(sorted(actions.items(), key=lambda x: -x[1])[:20]),
+        "devices": {"total_ever": dev_all[0] if dev_all else 0,
+                    "first_seen_in_period": dev_new[0] if dev_new else 0},
+        "busiest_days": [{"day": d, "entries": n} for d, n in
+                         sorted(per_day.items(), key=lambda x: -x[1])[:5]],
+        "check_this_yourself": {
+            "offline": "aileash_verify.py - stdlib only, no network",
+            "still_on_this_chain": "/x/consistency/ancestor?tip=<last_hash>",
+            "append_only": "/x/consistency/proof?first=&second=",
+            "record_included": "/x/complete/prove",
+            "who_witnessed_us": "/x/witness/peers",
+        },
+        "this_does_not_prove": [
+            "That any decision recorded here was correct.",
+            "That an external peer's own chain is honest - that is "
+            "checked at the peer's host, not here.",
+            "Anything about periods outside the dates above.",
+        ],
+    }
+    p["pack_digest"] = hashlib.sha256(
+        b"AILEASH-PACK-v1\x00" + json.dumps(
+            p, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return p
+
+
+# ----------------------------------------------------------------------
+# one page, self contained
+# ----------------------------------------------------------------------
+
+def _html(p):
+    ig = p["integrity"]
+    sq = p["receipt_sequence"]
+    good = "#7fe3b0"
+    bad = "#ff8a80"
+
+    def card(inner):
+        return ("<div style='background:#10182e;border:1px solid #223055;"
+                "border-radius:12px;padding:16px;margin-bottom:14px'>"
+                + inner + "</div>")
+
+    def row(k, v):
+        return ("<tr><td style='padding:7px 0;border-bottom:1px solid "
+                "#1d2a4a'>" + str(k) + "</td><td style='padding:7px 0;"
+                "border-bottom:1px solid #1d2a4a;text-align:right;"
+                "color:#c9a84c;font-weight:600'>" + str(v) + "</td></tr>")
+
+    def mono(v):
+        return ("<code style='font:12px ui-monospace,monospace;"
+                "color:#9fb3d9;word-break:break-all'>" + str(v)
+                + "</code>")
+
+    integ = ("<div style='font-size:26px;font-weight:600;color:"
+             + (good if ig["clean"] else bad) + "'>"
+             + str(ig["hashes_verified"]) + " of "
+             + str(ig["blocks_recomputed"]) + " blocks re-verified</div>"
+             "<div style='color:#93a0bd;font-size:13px;margin-top:6px'>"
+             + ig["method"] + "</div>")
+    if not ig["clean"]:
+        integ += ("<div style='color:" + bad + ";font-size:13px;"
+                  "margin-top:8px'>mismatched blocks "
+                  + str(ig["hash_mismatches"]) + " &middot; link breaks "
+                  + str(ig["link_breaks"]) + " &middot; entry link "
+                  + ig["link_into_period"] + "</div>")
+
+    if sq.get("applicable"):
+        seqbox = ("<div style='font-size:20px;font-weight:600;color:"
+                  + (good if sq["gapless"] else bad) + "'>"
+                  + ("Receipt sequence complete" if sq["gapless"]
+                     else "GAPS IN RECEIPT SEQUENCE") + "</div>"
+                  "<div style='color:#93a0bd;font-size:13px'>"
+                  + str(sq["received"]) + " of " + str(sq["expected"])
+                  + " received, numbers " + str(sq["first"]) + " to "
+                  + str(sq["last"]) + "</div>")
+        if not sq["gapless"]:
+            seqbox += ("<div style='color:" + bad + ";font:12px "
+                       "ui-monospace,monospace;margin-top:6px'>missing "
+                       + str(sq["missing"]) + "</div>")
+    else:
+        seqbox = ("<div style='color:#93a0bd;font-size:13px'>Receipt "
+                  "sequence applies to a single key. This pack is "
+                  "deployment-wide.</div>")
+
+    checks = "".join("<li><b>" + k.replace("_", " ") + "</b> " + mono(v)
+                     + "</li>" for k, v in
+                     p["check_this_yourself"].items())
+    nots = "".join("<li>" + x + "</li>" for x in p["this_does_not_prove"])
+
+    return (
+        "<!doctype html><meta charset=utf-8>"
+        "<meta name=viewport content='width=device-width,initial-scale=1'>"
+        "<title>Evidence Pack " + p["period"] + " - AILeash</title>"
+        "<body style='background:#0a0f1e;color:#e8ecf5;margin:0;"
+        "padding:22px;font:15px/1.55 -apple-system,system-ui,sans-serif'>"
+        "<div style='max-width:760px;margin:0 auto'>"
+        "<h1 style='font-size:21px;margin:0 0 4px;color:#c9a84c'>"
+        "Evidence Pack &mdash; " + p["period"] + "</h1>"
+        "<div style='color:#93a0bd;font-size:13px;margin-bottom:20px'>"
+        + p["scope"] + " &middot; " + str(p["period_start"]) + " to "
+        + str(p["period_end"]) + " &middot; generated "
+        + str(p["generated_at"]) + "</div>"
+        + card("<div style='color:#93a0bd;font-size:13px'>Unbroken since"
+               "</div><div style='font-size:26px;color:" + good
+               + ";font-weight:600'>" + str(p["unbroken_since"])
+               + "</div>")
+        + card(integ)
+        + card(seqbox)
+        + card("<table style='width:100%;border-collapse:collapse;"
+               "font-size:14px'>"
+               + row("Entries in period", p["entries_in_period"])
+               + row("Chain total entries", p["chain_total_entries"])
+               + row("Devices, total ever", p["devices"]["total_ever"])
+               + row("Devices first seen this period",
+                     p["devices"]["first_seen_in_period"])
+               + "".join(row(k, v) for k, v in sorted(
+                   p["verdicts"].items()))
+               + "".join(row(k, v) for k, v in p["actions"].items())
+               + "</table>")
+        + card("<div style='color:#93a0bd;font-size:13px'>First block</div>"
+               + mono("#" + str(p["first_block"]) + " "
+                      + str(p["first_hash"]))
+               + "<div style='color:#93a0bd;font-size:13px;margin-top:10px'>"
+                 "Last block</div>"
+               + mono("#" + str(p["last_block"]) + " "
+                      + str(p["last_hash"]))
+               + "<div style='color:#93a0bd;font-size:13px;margin-top:10px'>"
+                 "Pack digest</div>" + mono(p["pack_digest"]))
+        + card("<div style='color:#93a0bd;font-size:13px'>Check every "
+               "figure above yourself:</div><ul style='margin:6px 0 0 18px;"
+               "padding:0;font-size:13px'>" + checks + "</ul>"
+               "<div style='color:#93a0bd;font-size:13px;margin-top:14px'>"
+               "What this pack does not prove:</div>"
+               "<ul style='margin:6px 0 0 18px;padding:0;color:#93a0bd;"
+               "font-size:13px'>" + nots + "</ul>")
+        + "<div style='color:#6d7b99;font-size:12px;margin-top:18px'>"
+          "AILeash &middot; sebbi.pro</div></div>")
+
+
+# ----------------------------------------------------------------------
+
+def _resolve(data, api_key):
+    b = _bounds(data.get("period"))
+    if not b:
+        return None, ({"error": "period_required",
+                       "accepts": ["YYYY", "YYYY-MM", "YYYY-Qn"],
+                       "example": "/x/pack/preview?period=2026-Q2"}, 400)
+    start, end, label = b
+    if end > time.time():
+        return None, ({"error": "period_not_closed", "period": label,
+                       "message": "A pack can only cover a period that "
+                                  "has finished."}, 409)
+    scope = data.get("scope")
+    if scope == "me":
+        scope = api_key
+    return (start, end, label, scope or None), None
+
+
+def handle(method, action, data, api_key, ctx):
+    if action == "spec":
+        return {"module": "pack", "version": VERSION,
+                "purpose": "Re-verifies every block in a period against "
+                           "the hash sealed at the time, and checks the "
+                           "gapless receipt sequence for a single key.",
+                "periods": ["YYYY", "YYYY-MM", "YYYY-Qn"],
+                "routes": {"GET /x/pack/spec": "public",
+                           "GET /x/pack/preview?period=": "keyed, json",
+                           "GET /x/pack/render?period=": "keyed, one page",
+                           "GET /x/pack/history": "keyed",
+                           "POST /x/pack/issue": "keyed, seals the pack"},
+                "scope": "add scope=me for your key only; omit for "
+                         "deployment-wide",
+                "does_not_prove": [
+                    "That any decision recorded here was correct.",
+                    "That an external peer's chain is honest.",
+                ]}, 200
+
+    if not api_key:
+        return {"error": "invalid_api_key"}, 401
+
+    _setup(ctx)
+
+    if method == "GET":
+        if action == "history":
+            with ctx["lock"]:
+                rows = ctx["conn"].execute(
+                    "SELECT period,scope,digest,issued,entries,verified,"
+                    "mismatches,audit_hash,block_index FROM pack_issued "
+                    "WHERE api_key=? ORDER BY id DESC LIMIT 200",
+                    (api_key,)).fetchall()
+            return {"count": len(rows), "packs": [
+                {"period": r[0], "scope": r[1], "digest": r[2],
+                 "issued": _iso(r[3]), "entries": r[4],
+                 "hashes_verified": r[5], "mismatches": r[6],
+                 "sealed_in_chain": r[7], "block_index": r[8]}
+                for r in rows]}, 200
+
+        if action in ("preview", "render"):
+            got, err = _resolve(data, api_key)
+            if err:
+                return err
+            start, end, label, scope = got
+            p = _assemble(ctx, start, end, label, scope)
+            if action == "preview":
+                return p, 200
+            return {"period": label, "content_type": "text/html",
+                    "html": _html(p)}, 200
+
+    if method == "POST" and action == "issue":
+        got, err = _resolve(data, api_key)
+        if err:
+            return err
+        start, end, label, scope = got
+        p = _assemble(ctx, start, end, label, scope)
+        ig = p["integrity"]
+        ts = time.time()
+        ev = {"user_id": "pack:" + label, "action": "evidence_pack_issued",
+              "amount": 0, "country": "UK", "device_id": "pack",
+              "anomaly": 0, "device_risk": 0}
+        res = {"decision": "PACK_ISSUED", "score": 0, "pack_version": VERSION,
+               "timestamp": ts, "period": label, "scope": p["scope"],
+               "entries": p["entries_in_period"],
+               "blocks_recomputed": ig["blocks_recomputed"],
+               "hashes_verified": ig["hashes_verified"],
+               "clean": ig["clean"], "pack_digest": p["pack_digest"],
+               "note": "evidence pack issued; the pack's own digest is "
+                       "now sealed, so the document cannot be edited "
+                       "after the fact"}
+        h, idx, seq = ctx["seal"](ev, res, ts, api_key)
+        with ctx["lock"]:
+            ctx["conn"].execute(
+                "INSERT INTO pack_issued(api_key,period,scope,digest,"
+                "issued,entries,verified,mismatches,audit_hash,"
+                "block_index) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (api_key, label, p["scope"], p["pack_digest"], ts,
+                 p["entries_in_period"], ig["hashes_verified"],
+                 len(ig["hash_mismatches"]), h, idx))
+            ctx["conn"].commit()
+        p["sealed"] = {"audit_hash": h, "block_index": idx,
+                       "receipt_seq": seq}
+        return p, 200
+
+    return {"error": "unknown_action", "action": action,
+            "GET": ["spec", "preview", "render", "history"],
+            "POST": ["issue"]}, 404
 
 ```
