@@ -1,4 +1,4 @@
-# Codebase — part 8 of 28
+# Codebase — part 8 of 27
 
 Contains:
 - `modules/pack.py`
