@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-120 files across 27 parts.
+119 files across 27 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -70,7 +70,6 @@ Generated automatically on every push. Do not edit by hand.
 
 ## [CODEBASE-11.md](CODEBASE-11.md)
 
-- `modules/signed.py`
 - `modules/sortition.py`
 - `modules/spec.py`
 - `modules/standard.py`
