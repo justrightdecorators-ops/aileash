@@ -208,5 +208,5 @@ Generated automatically on every push. Do not edit by hand.
 
 ## [CODEBASE-29.md](CODEBASE-29.md)
 
-- `whitepaper-9.html`
+- `whitepaper.html`
 

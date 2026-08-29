@@ -1,10 +1,10 @@
 # Codebase — part 29 of 29
 
 Contains:
-- `whitepaper-9.html`
+- `whitepaper.html`
 
 
-## `whitepaper-9.html`
+## `whitepaper.html`
 
 1442 lines, 122320 bytes
 
