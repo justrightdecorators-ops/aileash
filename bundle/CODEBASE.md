@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-121 files across 29 parts.
+120 files across 28 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -205,8 +205,4 @@ Generated automatically on every push. Do not edit by hand.
 
 - `tokensaver.html`
 - `verify.html`
-
-## [CODEBASE-29.md](CODEBASE-29.md)
-
-- `whitepaper.html`
 
