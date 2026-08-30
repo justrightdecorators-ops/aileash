@@ -1,12 +1,14 @@
-# Codebase — part 21 of 30
+# Codebase — part 21 of 29
 
 Contains:
 - `developers.html`
 - `dis.txt`
 - `docs/evidential-undertaking.md`
 - `docs/spec/ai-txt.md`
-- `field.html`
 - `green.html`
+- `guardian-parent.html`
+- `human-oversight.html`
+- `identity.html`
 
 
 ## `developers.html`
@@ -744,692 +746,6 @@ Published openly. Anyone may implement it, including competitors. The format bel
 ```
 
 
-## `field.html`
-
-678 lines, 39001 bytes
-
-```html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover">
-<title>AILeash &mdash; The Field</title>
-<meta name="description" content="Twenty-one sealed blocks. Six constellations. One chain. Enter the field, then read the record.">
-<meta property="og:title" content="AILeash — The Field">
-<meta property="og:description" content="Every AI decision. Sealed. Provable. Yours.">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,900&family=IBM+Plex+Mono:wght@400;500;600&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-:root{
-  --void:#04060e; --ink:#0a0f1e; --gold:#c9a84c; --ember:#e8a33d;
-  --plasma:#7fe3b0; --block:#c8362b; --challenge:#c07a1d;
-  --mute:rgba(233,226,205,0.42); --disp:'Fraunces',Georgia,serif;
-  --body:'Space Grotesk',system-ui,sans-serif; --mono:'IBM Plex Mono',ui-monospace,monospace;
-}
-html,body{height:100%;overflow:hidden;background:var(--void)}
-body{font-family:var(--body);color:#efe9db;-webkit-font-smoothing:antialiased;
-  -webkit-tap-highlight-color:transparent;touch-action:none}
-canvas#sky{display:block;position:fixed;inset:0;width:100%;height:100%}
-#veil{position:fixed;inset:0;pointer-events:none;z-index:2;
-  background:radial-gradient(125% 92% at 50% 45%,rgba(0,0,0,0) 26%,rgba(2,4,10,.5) 74%,rgba(2,4,10,.93) 100%)}
-#scan{position:fixed;inset:0;pointer-events:none;z-index:3;opacity:.05;
-  background:repeating-linear-gradient(0deg,rgba(255,255,255,.9) 0 1px,transparent 1px 3px)}
-#grain{position:fixed;inset:0;pointer-events:none;z-index:4;opacity:.13;mix-blend-mode:overlay;
-  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='140' height='140'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3'/></filter><rect width='140' height='140' filter='url(%23n)' opacity='.5'/></svg>")}
-
-.hud{position:fixed;z-index:6;font-family:var(--mono);pointer-events:none}
-.hud a,.hud button,.hud .hit{pointer-events:auto}
-
-#top{top:0;left:0;right:0;height:48px;display:flex;align-items:center;padding:0 14px;
-  background:linear-gradient(180deg,rgba(4,6,14,.95),rgba(4,6,14,.5) 72%,transparent);
-  border-bottom:1px solid rgba(201,168,76,.13)}
-.mark{font-family:var(--disp);font-weight:900;font-size:16px;letter-spacing:-.02em;color:#fff;
-  white-space:nowrap;margin-right:16px;text-decoration:none}
-.mark b{color:var(--gold)}
-.tel{display:flex;gap:15px;overflow-x:auto;scrollbar-width:none;flex:1;
-  mask-image:linear-gradient(90deg,#000 86%,transparent)}
-.tel::-webkit-scrollbar{display:none}
-.t{white-space:nowrap;font-size:9px;letter-spacing:.09em;color:var(--mute);text-transform:uppercase}
-.t i{font-style:normal;color:var(--gold);font-weight:600;margin-left:5px}
-.t i.g{color:var(--plasma)}
-.enter{flex:none;margin-left:12px;background:var(--gold);color:var(--ink);text-decoration:none;
-  font-family:var(--mono);font-size:9px;font-weight:600;letter-spacing:.15em;text-transform:uppercase;
-  padding:9px 14px;border-radius:2px;white-space:nowrap;transition:filter .2s,box-shadow .2s;
-  box-shadow:0 0 0 rgba(201,168,76,0)}
-.enter:hover{filter:brightness(1.15);box-shadow:0 0 22px rgba(201,168,76,.45)}
-.enter:focus-visible,.cb:focus-visible,.cst:focus-visible,.go:focus-visible,.walk button:focus-visible{outline:2px solid #fff;outline-offset:2px}
-
-#idx{left:14px;top:64px;width:190px}
-#idx .ttl{font-size:8.5px;letter-spacing:.28em;color:var(--gold);text-transform:uppercase;margin-bottom:8px}
-.cst{display:flex;align-items:center;gap:8px;padding:6px 9px;border-left:1px solid rgba(201,168,76,.18);
-  cursor:pointer;transition:background .25s,border-color .25s;background:none;width:100%;text-align:left}
-.cst:hover,.cst.on{background:rgba(201,168,76,.1);border-left-color:var(--gold)}
-.cst .dot{width:6px;height:6px;border-radius:50%;flex:none;background:currentColor;
-  box-shadow:0 0 9px currentColor}
-.cst .nm{font-family:var(--mono);font-size:9.5px;letter-spacing:.12em;text-transform:uppercase;color:#efe9db}
-.cst .ct{margin-left:auto;font-family:var(--mono);font-size:9px;color:var(--mute)}
-
-#panel{right:14px;top:64px;width:330px;max-height:calc(100vh - 214px);
-  background:rgba(6,10,22,.84);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
-  border:1px solid rgba(201,168,76,.22);border-radius:2px;display:flex;flex-direction:column;
-  transform:translateX(16px) scale(.985);opacity:0;transition:opacity .35s,transform .35s;overflow:hidden}
-#panel.on{opacity:1;transform:none}
-.ph{padding:14px 16px 12px;border-bottom:1px solid rgba(201,168,76,.16);position:relative}
-.ph .blk{font-size:8.5px;letter-spacing:.26em;color:var(--gold);text-transform:uppercase}
-.ph h2{font-family:var(--disp);font-weight:600;font-size:21px;line-height:1.13;margin-top:7px;
-  letter-spacing:-.015em;color:#fff}
-.ph .cs{font-size:8.5px;letter-spacing:.18em;text-transform:uppercase;color:var(--mute);margin-top:8px}
-.pb{padding:14px 16px 16px;overflow-y:auto;font-family:var(--body);font-size:12.5px;line-height:1.62;
-  color:rgba(239,233,219,.82)}
-.pb .hash{font-family:var(--mono);font-size:9px;color:var(--plasma);word-break:break-all;
-  margin-top:13px;padding-top:12px;border-top:1px solid rgba(255,255,255,.07);line-height:1.8}
-.pb .hash span{color:var(--mute)}
-.go{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:15px;
-  font-family:var(--mono);font-size:9.5px;letter-spacing:.15em;text-transform:uppercase;
-  color:var(--ink);background:var(--gold);padding:11px 14px;border-radius:2px;
-  text-decoration:none;font-weight:600;transition:filter .2s}
-.go:hover{filter:brightness(1.15)}
-.walk{display:flex;gap:6px;margin-top:8px}
-.walk button{flex:1;background:none;border:1px solid rgba(201,168,76,.26);color:var(--gold);
-  font-family:var(--mono);font-size:9px;letter-spacing:.14em;text-transform:uppercase;padding:9px 0;
-  border-radius:2px;cursor:pointer;transition:background .2s}
-.walk button:hover{background:rgba(201,168,76,.14)}
-.x{position:absolute;top:12px;right:12px;width:22px;height:22px;border:1px solid rgba(201,168,76,.3);
-  background:none;color:var(--gold);border-radius:2px;cursor:pointer;font-size:12px;line-height:1;font-family:var(--mono)}
-.x:hover{background:rgba(201,168,76,.14)}
-
-#inst{left:0;right:0;bottom:0;height:134px;display:flex;padding:0 14px 12px;
-  background:linear-gradient(0deg,rgba(4,6,14,.96),rgba(4,6,14,.58) 62%,transparent);
-  overflow-x:auto;scrollbar-width:none;align-items:flex-end}
-#inst::-webkit-scrollbar{display:none}
-.gauge{flex:1 0 200px;min-width:200px;border-left:1px solid rgba(201,168,76,.16);padding:0 13px}
-.gauge:first-child{border-left:none;padding-left:0}
-.gl{font-size:8.5px;letter-spacing:.24em;text-transform:uppercase;color:var(--gold);margin-bottom:2px}
-.gs{font-size:8.5px;color:var(--mute);letter-spacing:.05em;margin-bottom:7px;text-transform:uppercase}
-.gauge canvas{position:relative!important;width:100%!important;height:74px!important;display:block}
-
-#read{left:14px;bottom:152px;font-size:9px;letter-spacing:.16em;text-transform:uppercase;color:var(--mute)}
-#read b{color:var(--plasma);font-weight:500}
-#ctl{right:14px;bottom:152px;display:flex;gap:6px}
-.cb{width:34px;height:34px;border:1px solid rgba(201,168,76,.26);background:rgba(6,10,22,.72);
-  color:var(--gold);border-radius:2px;cursor:pointer;font-family:var(--mono);font-size:12px;
-  display:grid;place-items:center;transition:background .2s}
-.cb:hover{background:rgba(201,168,76,.16)}
-.cb.off{color:var(--mute);border-color:rgba(255,255,255,.12)}
-
-#gate{position:fixed;inset:0;z-index:9;background:var(--void);display:flex;align-items:center;
-  justify-content:center;flex-direction:column;gap:15px;transition:opacity 1s;padding:24px}
-#gate.gone{opacity:0;pointer-events:none}
-#gate .t2{font-family:var(--mono);font-size:9.5px;letter-spacing:.34em;text-transform:uppercase;
-  color:var(--gold);text-align:center}
-#gate .t1{font-family:var(--disp);font-weight:900;font-size:clamp(32px,7.6vw,64px);color:#fff;
-  letter-spacing:-.032em;text-align:center;line-height:1.01}
-#gate .t1 b{color:var(--gold)}
-#gate .bar{width:190px;height:1px;background:rgba(201,168,76,.2);overflow:hidden}
-#gate .bar i{display:block;height:100%;width:0;background:var(--gold);box-shadow:0 0 12px var(--gold);
-  transition:width .25s}
-#gate .skip{font-family:var(--mono);font-size:9px;letter-spacing:.2em;text-transform:uppercase;
-  color:var(--mute);text-decoration:none;border-bottom:1px solid rgba(201,168,76,.3);
-  padding-bottom:3px;margin-top:6px;transition:color .2s}
-#gate .skip:hover{color:var(--gold)}
-
-@media (max-width:900px){
-  #idx{display:none}
-  #panel{left:10px;right:10px;width:auto;top:auto;bottom:0;max-height:60vh;
-    transform:translateY(18px);border-radius:6px 6px 0 0;border-bottom:none}
-  #panel.on{transform:none}
-  #inst{height:118px;padding:0 10px 10px}
-  .gauge{flex:0 0 166px;min-width:166px}
-  #read{left:10px;bottom:132px;font-size:8px;letter-spacing:.12em}
-  #ctl{right:10px;bottom:132px}
-  #top{height:44px;padding:0 10px}
-  .mark{font-size:14px;margin-right:10px}
-  .enter{padding:8px 11px;font-size:8.5px;letter-spacing:.1em;margin-left:8px}
-  .ph h2{font-size:18px}
-}
-@media (prefers-reduced-motion:reduce){#gate{display:none}#scan{display:none}}
-</style>
-</head>
-<body>
-
-<canvas id="sky"></canvas>
-<div id="veil"></div>
-<div id="scan"></div>
-<div id="grain"></div>
-
-<div class="hud" id="top">
-  <a class="mark hit" href="https://sebbi.pro/">AI<b>Leash</b></a>
-  <div class="tel" id="tel"></div>
-  <a class="enter" id="enterTop" href="https://sebbi.pro/">Enter the site &rarr;</a>
-</div>
-
-<div class="hud" id="idx">
-  <div class="ttl">Constellations</div>
-  <div id="cstlist"></div>
-</div>
-
-<div class="hud" id="panel">
-  <div class="ph">
-    <button class="x" id="close" aria-label="Close">&times;</button>
-    <div class="blk" id="pblk">Block 001</div>
-    <h2 id="ptitle">&mdash;</h2>
-    <div class="cs" id="pcst">&mdash;</div>
-  </div>
-  <div class="pb">
-    <div id="pbody"></div>
-    <div class="hash" id="phash"></div>
-    <a class="go" id="pgo" href="https://sebbi.pro/">
-      <span id="pgotxt">Read this block</span><span>&rarr;</span>
-    </a>
-    <div class="walk">
-      <button id="prevb">&larr; Previous</button>
-      <button id="nextb">Next &rarr;</button>
-    </div>
-  </div>
-</div>
-
-<div class="hud" id="read">Field live &middot; <b id="rblocks">0</b> of 21 sealed &middot; drag to orbit &middot; tap a node</div>
-
-<div class="hud" id="ctl">
-  <button class="cb" id="btnSpin" title="Pause rotation" aria-label="Pause rotation">&#9199;</button>
-  <button class="cb" id="btnChain" title="Chain filament" aria-label="Toggle chain">&#8734;</button>
-  <button class="cb" id="btnReset" title="Reset view" aria-label="Reset view">&#8635;</button>
-</div>
-
-<div class="hud" id="inst">
-  <div class="gauge"><div class="gl">Signal field</div><div class="gs">9 core signals &middot; live event</div><canvas id="gRadar"></canvas></div>
-  <div class="gauge"><div class="gl">Chain growth</div><div class="gs">Blocks sealed &middot; cumulative</div><canvas id="gChain"></canvas></div>
-  <div class="gauge"><div class="gl">Verdict mix</div><div class="gs">Allow &middot; challenge &middot; block</div><canvas id="gVerd"></canvas></div>
-  <div class="gauge"><div class="gl">Seal latency</div><div class="gs">Milliseconds per decision</div><canvas id="gLat"></canvas></div>
-</div>
-
-<div id="gate">
-  <div class="t2">Monop Content &middot; sebbi.pro</div>
-  <div class="t1">Every AI decision.<br><b>Sealed.</b></div>
-  <div class="t2" id="gload">Igniting the field</div>
-  <div class="bar"><i id="gbar"></i></div>
-  <a class="skip" href="https://sebbi.pro/">Skip to the site</a>
-</div>
-
-<script>
-(function(){
-'use strict';
-
-/* ================= DATA ================= */
-var BASE='https://sebbi.pro/';
-var CST=[
- {id:'engine',   name:'The engine',    col:'#c9a84c', a:-0.30, r:1.00, y:-0.10},
- {id:'products', name:'The products',  col:'#e8a33d', a: 0.72, r:1.14, y: 0.22},
- {id:'proof',    name:'The proof',     col:'#7fe3b0', a: 1.86, r:1.06, y:-0.24},
- {id:'oversight',name:'The oversight', col:'#8fb8f0', a: 2.92, r:1.12, y: 0.14},
- {id:'law',      name:'The law',       col:'#c07a1d', a: 3.98, r:1.00, y:-0.18},
- {id:'commerce', name:'The commerce',  col:'#d8c98a', a: 5.08, r:1.16, y: 0.20}
-];
-var N=[
- {n:1,id:'how',c:'engine',t:'Three steps. That is it.',d:'Get a free key, send us the event, set your own price. Nine signals scored in under 30ms, returning ALLOW, CHALLENGE or BLOCK \u2014 sealed into the chain before you get the reply.'},
- {n:2,id:'sdk',c:'engine',t:'Add one line. Never think about it again.',d:'One decorator above a function and every call it makes is fingerprinted and sealed. The inputs and result are hashed on your machine; the hash goes out, the data does not. Measured cost: 0.098ms per call.'},
- {n:3,id:'products',c:'products',t:'Six products. One engine.',d:'AILeash, SonicBoom, Sentinel, Guardian, Sebdog and the Token Saver. The same nine-signal engine and audit chain underneath all of them. Four run on our infrastructure; two run on yours.'},
- {n:4,id:'onprem',c:'products',t:'The data never leaves. The proof still does.',d:'Sebdog is the same engine inside your building. Your decisions, events and hash chain sit on your disk and never move \u2014 so we cannot read them and cannot be subpoenaed for them. The tip still gets witnessed outside.'},
- {n:5,id:'tokensaver',c:'products',t:'Governance that costs tokens is part of the problem.',d:'Most governance products call a second model to judge the first. Ours scores with arithmetic and seals with a SHA-256 hash. At a hundred decisions a day or ten million, the governance layer adds nothing to your token bill.'},
- {n:6,id:'packs',c:'engine',t:'Nine signals as standard. Then add your own.',d:'Trust, three velocity windows, amount, device risk, anomaly, country shift, unsafe country. A Signal Pack loads more on top \u2014 and the pack itself is sealed into the chain, so the rules running at the moment of a decision are part of the record.'},
- {n:7,id:'margin',c:'commerce',t:'You set the price. You keep the rest.',d:'Free for 90 days, then 50p per device per month, metered on the real devices that used your key. Everything you charge above that is yours, every month.'},
- {n:8,id:'referral',c:'commerce',t:'Tell a friend. Earn forever.',d:'Every device that signs up with your referral code pays you 10p a month for as long as it stays. No cap, no expiry.'},
- {n:9,id:'notary-promo',c:'law',t:'Seal your profile before someone clones it.',d:'The Sovereign Profile Notary locks your public identity into the same chain, with an official timestamp and a short verification code. Change one letter and the check fails in public. The Payment Notary does the same for invoice details.'},
- {n:10,id:'law',c:'law',t:'What the law actually requires.',d:'Transparency duties live 2 Aug 2026. Content-marking grace ends 2 Dec 2026. High-risk duties \u2014 Articles 9, 12, 13 and 14 \u2014 apply 2 Dec 2027. The evidence they require is historical: you cannot seal decisions you already made.'},
- {n:11,id:'coverage',c:'law',t:'Article by article. Feature by feature.',d:'The requirement on the left, the mechanism on the right, taken from the regulation map sealed inside the engine itself. Article 9 risk management, Article 12 record keeping, Article 13 transparency, Article 14 human oversight.'},
- {n:12,id:'oversight',c:'oversight',t:'Nobody can prove a person thought about it.',d:'Thinking is an internal state and no amount of logging reaches it. But rubber-stamping is a pattern, and patterns leave marks. The reviewer commits before the verdict is revealed \u2014 two blocks, in that order, in a chain that cannot be reordered.'},
- {n:13,id:'anchor',c:'proof',t:'Pinned from both sides.',d:'The current tip is submitted to OpenTimestamps, aggregated into a Merkle root and committed to Bitcoin by several independent calendar servers. From that moment the clock sits outside our control.'},
- {n:14,id:'network',c:'proof',t:'One chain can be rebuilt. Ten cannot.',d:'Platforms witness each other. Four chains are live and exchanging tips, one unattended and hourly since 1 August. The roster is public at /x/roster/list \u2014 no key, no account. Your history sits inside chains you do not control.'},
- {n:15,id:'notaries',c:'oversight',t:'Sealing the things that get argued about.',d:'Data subject requests, incidents, consent, model changes. The parts that turn into a dispute eighteen months later when everyone\u2019s memory has conveniently improved. Each writes into the same chain, under the same anchor.'},
- {n:16,id:'evidence',c:'proof',t:'The thing you actually hand to the auditor.',d:'A chain is not a deliverable. The pack does not summarise the chain \u2014 it re-verifies it. Every block rewalked and rehashed from genesis at the moment the pack is built, and it fails loudly if the arithmetic does not come out.'},
- {n:17,id:'conformance',c:'proof',t:'The instrument that would catch us failing.',d:'Three things here have a soft edge and we would rather name them. Probes are real cases with the verdict deliberately set wrong. A weakness somebody is measuring is a very different thing from one nobody is.'},
- {n:18,id:'verify',c:'engine',t:'Don\u2019t take any of it on trust.',d:'Below the line is the live engine \u2014 no account, no email, no key. Send it a case, it scores it, seals it into the production chain, and hands you the block number so you can check the lot at endpoints that have never heard of you.'},
- {n:19,id:'authority',c:'oversight',t:'Authority, derived. Not assumed.',d:'Every grant points at a parent and terminates at a named human principal. Scope narrows at every hop \u2014 a child can inherit authority or reduce it, never widen it. A grant with no parent is not a root, it is an orphan, and it is refused.'},
- {n:20,id:'install',c:'commerce',t:'Five minutes. Start to sealed.',d:'No build step, no container, nothing added to your requirements file. One readable file rather than a supply chain \u2014 your engineer can read the whole thing over a coffee.'},
- {n:21,id:'signup',c:'commerce',t:'AILeash API key. 90 days free.',d:'Pick a product, add your name and email. Key, referral code and installation guide arrive instantly. No card. When the trial ends, Stripe bills only the real devices that used your key.'}
-];
-var TEL=[['Field','LIVE',1],['Chain','sebbi.pro'],['Blocks','21'],['Signals','9'],['Verdict','&lt;30ms'],
-  ['Seal','SHA-256'],['Anchor','OTS / BTC'],['Peers','4',1],['Egress','HASH ONLY',1],
-  ['Overhead','0.098ms'],['Trial','90 DAYS']];
-
-/* ================= FIELD ================= */
-var cv=document.getElementById('sky'),ctx=cv.getContext('2d',{alpha:false});
-var W=0,H=0,DPR=1,MOB=false;
-var reduce=window.matchMedia&&window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-var stars=[],dust=[],nodes=[],chainPts=[],bursts=[];
-var cam={rx:-.30,ry:.30,trx:-.30,tryy:.30,z:.14,tz:1,ox:0,oy:0,tox:0,toy:0};
-var spin=!reduce,chainOn=true,sel=-1,hov=-1,t0=performance.now(),boot=0,packet=0,warp=1;
-var genesis={x:0,y:0,z:0,px:0,py:0,ps:0};
-
-var sprite=(function(){
-  var s=document.createElement('canvas'),n=64,g=s.getContext('2d');
-  s.width=s.height=n;
-  var rg=g.createRadialGradient(n/2,n/2,0,n/2,n/2,n/2);
-  rg.addColorStop(0,'rgba(255,255,255,1)');rg.addColorStop(.22,'rgba(255,255,255,.55)');
-  rg.addColorStop(.55,'rgba(255,255,255,.13)');rg.addColorStop(1,'rgba(255,255,255,0)');
-  g.fillStyle=rg;g.fillRect(0,0,n,n);return s;
-})();
-var nebula=null;
-function makeNebula(){
-  var c=document.createElement('canvas');c.width=520;c.height=520;
-  var g=c.getContext('2d');
-  var blobs=[[150,180,190,'201,168,76',.10],[380,150,170,'232,163,61',.08],
-             [300,380,210,'127,227,176',.05],[110,400,150,'143,184,240',.045],
-             [430,330,160,'201,168,76',.06]];
-  blobs.forEach(function(b){
-    var rg=g.createRadialGradient(b[0],b[1],0,b[0],b[1],b[2]);
-    rg.addColorStop(0,'rgba('+b[3]+','+b[4]+')');rg.addColorStop(1,'rgba('+b[3]+',0)');
-    g.fillStyle=rg;g.fillRect(0,0,520,520);
-  });
-  nebula=c;
-}
-function rnd(a,b){return a+Math.random()*(b-a)}
-function gauss(){var u=0,v=0;while(!u)u=Math.random();while(!v)v=Math.random();
-  return Math.sqrt(-2*Math.log(u))*Math.cos(6.2831853*v)}
-
-function build(){
-  MOB=innerWidth<900;
-  var PER=MOB?44:104, STARS=MOB?280:560;
-  stars.length=0;
-  for(var i=0;i<STARS;i++){
-    var th=rnd(0,6.2831853),ph=Math.acos(rnd(-1,1)),R=rnd(3.2,5.8);
-    stars.push({x:R*Math.sin(ph)*Math.cos(th),y:R*Math.cos(ph)*.55,z:R*Math.sin(ph)*Math.sin(th),
-      s:rnd(.35,1.55),tw:rnd(0,6.28),ox:0,oy:0});
-  }
-  nodes.length=0;dust.length=0;
-  var byC={};CST.forEach(function(c){byC[c.id]=[]});
-  N.forEach(function(b){byC[b.c].push(b)});
-  CST.forEach(function(c){
-    var mem=byC[c.id],k=mem.length;
-    c.cx=Math.cos(c.a)*c.r*1.58;c.cz=Math.sin(c.a)*c.r*1.58;c.cy=c.y*1.05;
-    mem.forEach(function(b,j){
-      var sa=(j/k)*6.2831853+c.a*1.7, sr=(k===1?0:.30+.14*(j%2));
-      var nd={b:b,cst:c,x:c.cx+Math.cos(sa)*sr,y:c.cy+Math.sin(sa*1.7)*.16,
-              z:c.cz+Math.sin(sa)*sr,px:0,py:0,ps:0,vis:0,ig:0,p:[]};
-      for(var i=0;i<PER;i++){
-        var tail=i>PER*.62, r=tail?rnd(.10,.34):Math.abs(gauss())*.055;
-        var a1=rnd(0,6.2831853),a2=rnd(0,3.1415927),st=tail?(.55+Math.random()*.9):1;
-        nd.p.push({ox:Math.cos(a1)*Math.sin(a2)*r*(tail?1.5:1),oy:Math.cos(a2)*r*.52,
-          oz:Math.sin(a1)*Math.sin(a2)*r*(tail?1.5:1),s:rnd(.5,1.9)*st,ph:rnd(0,6.28),sp:rnd(.25,.9)});
-      }
-      nodes.push(nd);
-    });
-  });
-  nodes.sort(function(a,b){return a.b.n-b.b.n});
-  chainPts.length=0;
-  for(var i2=0;i2<nodes.length-1;i2++){
-    var A=nodes[i2],B=nodes[i2+1];
-    var mx=(A.x+B.x)/2*1.2,my=(A.y+B.y)/2*1.2-.05,mz=(A.z+B.z)/2*1.2;
-    for(var s2=0;s2<=14;s2++){
-      var u=s2/14,iu=1-u;
-      chainPts.push({x:iu*iu*A.x+2*iu*u*mx+u*u*B.x,y:iu*iu*A.y+2*iu*u*my+u*u*B.y,
-        z:iu*iu*A.z+2*iu*u*mz+u*u*B.z});
-    }
-  }
-  var DN=MOB?80:190;
-  for(var d=0;d<DN;d++)dust.push({x:rnd(-3,3),y:rnd(-1.1,1.1),z:rnd(-3,3),s:rnd(.3,1),ph:rnd(0,6.28)});
-}
-function resize(){
-  DPR=Math.min(window.devicePixelRatio||1,2);
-  W=innerWidth;H=innerHeight;
-  cv.width=W*DPR;cv.height=H*DPR;cv.style.width=W+'px';cv.style.height=H+'px';
-  ctx.setTransform(DPR,0,0,DPR,0,0);
-  build();
-}
-var _sx,_cx2,_sy,_cy2;
-function pre(){_sx=Math.sin(cam.ry);_cx2=Math.cos(cam.ry);_sy=Math.sin(cam.rx);_cy2=Math.cos(cam.rx)}
-function proj(x,y,z,o){
-  var x1=x*_cx2-z*_sx, z1=x*_sx+z*_cx2;
-  var y1=y*_cy2-z1*_sy, z2=y*_sy+z1*_cy2, zz=z2+4.6;
-  if(zz<.25)zz=.25;
-  var f=(Math.min(W,H)*.52*cam.z)/zz;
-  o.x=W/2+x1*f+cam.ox;o.y=H/2+y1*f+cam.oy;o.s=f/260;o.d=zz;return o;
-}
-var _p={},_q={};
-function hex(h,a){return 'rgba('+parseInt(h.slice(1,3),16)+','+parseInt(h.slice(3,5),16)+','+parseInt(h.slice(5,7),16)+','+a+')'}
-
-function frame(now){
-  var t=(now-t0)/1000;
-  boot=Math.min(1,boot+.0058);
-  var ease=1-Math.pow(1-boot,3);
-  warp=Math.max(0,warp-.011);
-  if(spin&&!reduce)cam.tryy+=.0013;
-  cam.ry+=(cam.tryy-cam.ry)*.07;cam.rx+=(cam.trx-cam.rx)*.07;
-  cam.z+=(cam.tz-cam.z)*.045;cam.ox+=(cam.tox-cam.ox)*.09;cam.oy+=(cam.toy-cam.oy)*.09;
-  pre();
-
-  ctx.globalCompositeOperation='source-over';ctx.globalAlpha=1;
-  var bg=ctx.createRadialGradient(W*.5,H*.45,0,W*.5,H*.45,Math.max(W,H)*.8);
-  bg.addColorStop(0,'#0b1122');bg.addColorStop(.52,'#060a15');bg.addColorStop(1,'#03050b');
-  ctx.fillStyle=bg;ctx.fillRect(0,0,W,H);
-
-  if(nebula){
-    ctx.globalCompositeOperation='lighter';ctx.globalAlpha=.55*ease;
-    var nw=Math.max(W,H)*1.5;
-    ctx.drawImage(nebula,W/2-nw/2+Math.sin(cam.ry*.4)*70,H/2-nw/2+cam.rx*90,nw,nw);
-  }
-  ctx.globalCompositeOperation='lighter';
-
-  for(var i=0;i<stars.length;i++){
-    var s=stars[i];proj(s.x,s.y,s.z,_p);
-    if(_p.x<-60||_p.x>W+60||_p.y<-60||_p.y>H+60){s.ox=_p.x;s.oy=_p.y;continue}
-    if(warp>.02&&s.ox){
-      ctx.globalAlpha=warp*.5;ctx.strokeStyle='rgba(201,168,76,.7)';ctx.lineWidth=1;
-      ctx.beginPath();ctx.moveTo(s.ox,s.oy);ctx.lineTo(_p.x,_p.y);ctx.stroke();
-    }
-    s.ox=_p.x;s.oy=_p.y;
-    ctx.globalAlpha=(.42+.34*Math.sin(t*1.4+s.tw))*.58*ease;
-    var sz=s.s*_p.s*22;ctx.drawImage(sprite,_p.x-sz,_p.y-sz,sz*2,sz*2);
-  }
-  ctx.globalAlpha=.15*ease;
-  for(var d=0;d<dust.length;d++){
-    var u=dust[d];proj(u.x,u.y+Math.sin(t*.25+u.ph)*.03,u.z,_p);
-    var ds=u.s*_p.s*16;ctx.drawImage(sprite,_p.x-ds,_p.y-ds,ds*2,ds*2);
-  }
-
-  if(chainOn&&chainPts.length){
-    var lit=Math.floor(ease*chainPts.length);ctx.lineWidth=1;
-    for(var c=1;c<lit;c++){
-      var A=chainPts[c-1],B=chainPts[c];proj(A.x,A.y,A.z,_p);proj(B.x,B.y,B.z,_q);
-      ctx.strokeStyle=hex('#c9a84c',.13*Math.max(0,Math.min(1,(6.4-_p.d)/3.6))+.04);
-      ctx.beginPath();ctx.moveTo(_p.x,_p.y);ctx.lineTo(_q.x,_q.y);ctx.stroke();
-    }
-    if(!reduce&&ease>.97){
-      packet+=.0015;if(packet>1)packet=0;
-      var pi=Math.floor(packet*(chainPts.length-1));
-      for(var k=0;k<28;k++){
-        var idx=pi-k;if(idx<1)break;
-        var P=chainPts[idx];proj(P.x,P.y,P.z,_p);
-        var fade=1-k/28;ctx.globalAlpha=fade*.92;
-        var psz=_p.s*(9+fade*14);ctx.drawImage(sprite,_p.x-psz,_p.y-psz,psz*2,psz*2);
-      }
-    }
-  }
-
-  /* genesis core — the way in */
-  proj(0,0,0,_p);genesis.px=_p.x;genesis.py=_p.y;genesis.ps=_p.s;
-  var gp=.8+.2*Math.sin(t*1.1);
-  ctx.globalAlpha=.55*ease*gp;
-  var gs=_p.s*(hov===0?96:74);
-  ctx.drawImage(sprite,_p.x-gs,_p.y-gs,gs*2,gs*2);
-  ctx.globalCompositeOperation='source-over';
-  ctx.globalAlpha=ease*.9;ctx.strokeStyle=hex('#c9a84c',.55);ctx.lineWidth=1;
-  var gr=Math.max(20,_p.s*52);
-  ctx.beginPath();ctx.arc(_p.x,_p.y,gr+(hov===0?5:0),0,6.2831853);ctx.stroke();
-  ctx.globalAlpha=ease*.3;
-  ctx.beginPath();ctx.arc(_p.x,_p.y,gr+9+Math.sin(t*1.6)*3,0,6.2831853);ctx.stroke();
-  ctx.globalCompositeOperation='lighter';
-
-  for(var n=0;n<nodes.length;n++){
-    var nd=nodes[n];
-    nd.ig+=(((n/nodes.length)<ease?1:0)-nd.ig)*.05;
-    proj(nd.x,nd.y,nd.z,_p);nd.px=_p.x;nd.py=_p.y;nd.ps=_p.s;nd.vis=_p.d;
-  }
-  var order=nodes.slice().sort(function(a,b){return b.vis-a.vis});
-  for(var o=0;o<order.length;o++){
-    var m=order[o],col=m.cst.col,act=(sel===m.b.n||hov===m.b.n);
-    var dim=(sel>0&&!act)?.32:1;
-    var near=Math.max(.18,Math.min(1,(6.6-m.vis)/3.4));
-    var pulse=.86+.14*Math.sin(t*1.5+m.b.n);
-    var A2=m.ig*dim*near*ease;
-    if(A2<=.01)continue;
-    for(var q=0;q<m.p.length;q++){
-      var pp=m.p[q],wob=Math.sin(t*pp.sp+pp.ph)*.012;
-      proj(m.x+pp.ox+wob,m.y+pp.oy+wob*.5,m.z+pp.oz,_q);
-      if(_q.x<-30||_q.x>W+30||_q.y<-30||_q.y>H+30)continue;
-      ctx.globalAlpha=A2*.30*pulse*(act?1.75:1);
-      var qs=pp.s*_q.s*(act?15:11);
-      ctx.drawImage(sprite,_q.x-qs,_q.y-qs,qs*2,qs*2);
-    }
-    ctx.globalAlpha=A2*(act?1:.78)*pulse;
-    var cs2=m.ps*(act?46:27);
-    ctx.drawImage(sprite,m.px-cs2,m.py-cs2,cs2*2,cs2*2);
-    ctx.globalAlpha=A2;ctx.fillStyle='#fff';
-    ctx.beginPath();ctx.arc(m.px,m.py,Math.max(1.1,m.ps*2.4),0,6.2831853);ctx.fill();
-    if(act){
-      ctx.globalCompositeOperation='source-over';
-      ctx.globalAlpha=.85;ctx.strokeStyle=hex(col,.7);ctx.lineWidth=1;
-      var rr=Math.max(16,m.ps*46)+Math.sin(t*2.4)*2;
-      ctx.beginPath();ctx.arc(m.px,m.py,rr,0,6.2831853);ctx.stroke();
-      ctx.globalAlpha=.24;ctx.beginPath();ctx.arc(m.px,m.py,rr+7,0,6.2831853);ctx.stroke();
-      ctx.globalCompositeOperation='lighter';
-    }
-  }
-
-  /* seal bursts */
-  ctx.globalCompositeOperation='source-over';
-  for(var bi=bursts.length-1;bi>=0;bi--){
-    var bu=bursts[bi];bu.a-=.022;
-    if(bu.a<=0){bursts.splice(bi,1);continue}
-    ctx.globalAlpha=bu.a*.8;ctx.strokeStyle=hex(bu.col,1);ctx.lineWidth=1.4;
-    ctx.beginPath();ctx.arc(bu.x,bu.y,(1-bu.a)*110+12,0,6.2831853);ctx.stroke();
-  }
-
-  ctx.textBaseline='middle';
-  for(var l=0;l<order.length;l++){
-    var nl=order[l];
-    var near2=Math.max(0,Math.min(1,(6.5-nl.vis)/2.6));
-    var act2=(sel===nl.b.n||hov===nl.b.n);
-    var la=nl.ig*ease*(act2?1:near2*(sel>0?.26:.6));
-    if(la<.06)continue;
-    var lx2=nl.px+Math.max(11,nl.ps*22);
-    ctx.font='600 '+(MOB?8.5:9.5)+'px "IBM Plex Mono",monospace';
-    ctx.fillStyle=hex(nl.cst.col,la);
-    ctx.fillText(('00'+nl.b.n).slice(-3),lx2,nl.py-(act2?6:0));
-    if(act2||(!MOB&&near2>.55&&sel<0)){
-      ctx.font='500 '+(MOB?9:10)+'px "Space Grotesk",sans-serif';
-      ctx.fillStyle='rgba(239,233,219,'+(la*.82)+')';
-      var lab=nl.b.t.length>34?nl.b.t.slice(0,33)+'\u2026':nl.b.t;
-      ctx.fillText(lab,lx2,nl.py+(act2?7:12));
-    }
-  }
-  /* genesis label */
-  if(sel<0){
-    ctx.font='600 '+(MOB?8.5:9.5)+'px "IBM Plex Mono",monospace';
-    ctx.textAlign='center';ctx.fillStyle=hex('#c9a84c',ease*.9);
-    ctx.fillText('GENESIS',genesis.px,genesis.py+gr+16);
-    ctx.font='500 '+(MOB?9:10)+'px "Space Grotesk",sans-serif';
-    ctx.fillStyle='rgba(239,233,219,'+(ease*.6)+')';
-    ctx.fillText('Enter the record',genesis.px,genesis.py+gr+29);
-    ctx.textAlign='left';
-  }
-  ctx.globalAlpha=1;
-  requestAnimationFrame(frame);
-}
-
-/* ================= INTERACTION ================= */
-var drag=false,lx=0,ly=0,moved=0,pinch=0;
-cv.addEventListener('pointerdown',function(e){drag=true;moved=0;lx=e.clientX;ly=e.clientY;
-  try{cv.setPointerCapture(e.pointerId)}catch(x){}});
-cv.addEventListener('pointermove',function(e){
-  if(drag){
-    var dx=e.clientX-lx,dy=e.clientY-ly;moved+=Math.abs(dx)+Math.abs(dy);
-    cam.tryy-=dx*.005;cam.trx=Math.max(-1.25,Math.min(1.25,cam.trx-dy*.004));
-    lx=e.clientX;ly=e.clientY;
-  }else if(!MOB){
-    hov=-1;var best=1e9;
-    if(Math.hypot(genesis.px-e.clientX,genesis.py-e.clientY)<Math.max(26,genesis.ps*52)){hov=0;best=0}
-    for(var i=0;i<nodes.length;i++){
-      var d=Math.hypot(nodes[i].px-e.clientX,nodes[i].py-e.clientY);
-      if(d<34&&d<best){best=d;hov=nodes[i].b.n}
-    }
-    cv.style.cursor=hov>=0?'pointer':'grab';
-  }
-});
-addEventListener('pointerup',function(e){if(drag&&moved<8)tap(e.clientX,e.clientY);drag=false});
-cv.addEventListener('wheel',function(e){e.preventDefault();
-  cam.tz=Math.max(.55,Math.min(2.8,cam.tz*(e.deltaY>0?.92:1.08)))},{passive:false});
-cv.addEventListener('touchstart',function(e){if(e.touches.length===2)
-  pinch=Math.hypot(e.touches[0].clientX-e.touches[1].clientX,e.touches[0].clientY-e.touches[1].clientY)},{passive:true});
-cv.addEventListener('touchmove',function(e){
-  if(e.touches.length===2&&pinch){
-    var d=Math.hypot(e.touches[0].clientX-e.touches[1].clientX,e.touches[0].clientY-e.touches[1].clientY);
-    cam.tz=Math.max(.55,Math.min(2.8,cam.tz*(d/pinch)));pinch=d;
-  }},{passive:true});
-
-function tap(x,y){
-  if(Math.hypot(genesis.px-x,genesis.py-y)<Math.max(30,genesis.ps*54)){location.href=BASE;return}
-  var best=1e9,pick=-1;
-  for(var i=0;i<nodes.length;i++){
-    var d=Math.hypot(nodes[i].px-x,nodes[i].py-y);
-    if(d<Math.max(30,nodes[i].ps*44)&&d<best){best=d;pick=i}
-  }
-  if(pick>=0)select(pick);else deselect();
-}
-var panel=document.getElementById('panel');
-function select(i){
-  i=Math.max(0,Math.min(nodes.length-1,i));
-  var nd=nodes[i],b=nd.b;sel=b.n;
-  document.getElementById('pblk').textContent='Block '+('00'+b.n).slice(-3)+' of 021';
-  document.getElementById('ptitle').textContent=b.t;
-  document.getElementById('pcst').textContent=nd.cst.name+' \u00b7 sealed';
-  document.getElementById('pbody').textContent=b.d;
-  document.getElementById('phash').innerHTML='<span>prev</span> '+fh(b.n-1)+'<br><span>this</span> '+fh(b.n);
-  document.getElementById('pgo').href=BASE+'#'+b.id;
-  document.getElementById('pgotxt').textContent='Read this block';
-  panel.classList.add('on');
-  bursts.push({x:nd.px,y:nd.py,a:1,col:nd.cst.col});
-  cam.tz=MOB?1.35:1.5;
-  cam.tryy=-Math.atan2(nd.z,nd.x)+Math.PI/2;
-  cam.toy=MOB?-60:0;
-  markCst(nd.cst.id);
-}
-function deselect(){sel=-1;panel.classList.remove('on');cam.tz=1;cam.toy=0;markCst(null)}
-document.getElementById('close').onclick=deselect;
-document.getElementById('prevb').onclick=function(){select((sel<=1?nodes.length:sel-1)-1)};
-document.getElementById('nextb').onclick=function(){select(sel>=nodes.length?0:sel)};
-function fh(n){
-  if(n<=0)return '0000000000000000000000000000000000000000000000000000000000000000'.slice(0,32);
-  var s='',sd=n*2654435761%4294967296;
-  for(var i=0;i<16;i++){sd=(sd*1664525+1013904223)%4294967296;s+=('0'+((sd>>>16)&255).toString(16)).slice(-2)}
-  return s;
-}
-var list=document.getElementById('cstlist');
-CST.forEach(function(c){
-  var el=document.createElement('button');
-  el.className='cst hit';el.dataset.c=c.id;el.type='button';
-  el.innerHTML='<span class="dot" style="color:'+c.col+'"></span><span class="nm">'+c.name+
-    '</span><span class="ct">'+N.filter(function(b){return b.c===c.id}).length+'</span>';
-  el.onclick=function(){for(var i=0;i<nodes.length;i++)if(nodes[i].b.c===c.id){select(i);break}};
-  list.appendChild(el);
-});
-function markCst(id){Array.prototype.forEach.call(list.children,function(el){
-  el.classList.toggle('on',el.dataset.c===id)})}
-(function(){var h='';TEL.forEach(function(x){
-  h+='<div class="t">'+x[0]+'<i class="'+(x[2]?'g':'')+'">'+x[1]+'</i></div>'});
-  document.getElementById('tel').innerHTML=h})();
-document.getElementById('btnSpin').onclick=function(){spin=!spin;this.classList.toggle('off',!spin)};
-document.getElementById('btnChain').onclick=function(){chainOn=!chainOn;this.classList.toggle('off',!chainOn)};
-document.getElementById('btnReset').onclick=function(){deselect();cam.trx=-.30;cam.tryy=.30;cam.tz=1;cam.tox=0;cam.toy=0};
-addEventListener('keydown',function(e){
-  if(e.key==='Escape')deselect();
-  else if(e.key==='ArrowRight'){e.preventDefault();select(sel>=nodes.length?0:sel)}
-  else if(e.key==='ArrowLeft'){e.preventDefault();select((sel<=1?nodes.length:sel-1)-1)}
-  else if(e.key==='Enter'&&sel>0)location.href=BASE+'#'+nodes[sel-1].b.id;
-});
-
-/* ================= INSTRUMENTS ================= */
-function g2(id){var c=document.getElementById(id),x=c.getContext('2d');
-  function fit(){var r=c.getBoundingClientRect();c.width=r.width*DPR;c.height=r.height*DPR;
-    x.setTransform(DPR,0,0,DPR,0,0);c._w=r.width;c._h=r.height}
-  fit();c._fit=fit;return{c:c,x:x}}
-var G={},sig=[],sigT=[];
-for(var z0=0;z0<9;z0++){sig.push(Math.random()*.6+.2);sigT.push(sig[z0])}
-var latH=[2,7,19,38,54,41,26,14,7,3],verd=[.71,.19,.10],chainSeries=[];
-(function(){var v=0;for(var i=0;i<40;i++){v+=Math.max(0,3+Math.sin(i/4)*2+Math.random()*3);chainSeries.push(v)}})();
-function initG(){G.radar=g2('gRadar');G.chain=g2('gChain');G.verd=g2('gVerd');G.lat=g2('gLat')}
-function drawG(t){
-  var R=G.radar,x=R.x,w=R.c._w,h=R.c._h;x.clearRect(0,0,w,h);
-  var cx=w/2,cy=h/2+2,rad=Math.min(w,h)/2-9;
-  x.strokeStyle='rgba(201,168,76,.16)';x.lineWidth=1;
-  for(var r=1;r<=3;r++){x.beginPath();
-    for(var i=0;i<=9;i++){var a=(i/9)*6.2831853-1.5708,px=cx+Math.cos(a)*rad*(r/3),py=cy+Math.sin(a)*rad*(r/3);
-      i?x.lineTo(px,py):x.moveTo(px,py)}x.stroke()}
-  x.beginPath();
-  for(var i2=0;i2<9;i2++){
-    if(Math.random()<.02)sigT[i2]=Math.random()*.75+.15;
-    sig[i2]+=(sigT[i2]-sig[i2])*.045;
-    var a2=(i2/9)*6.2831853-1.5708,vx=cx+Math.cos(a2)*rad*sig[i2],vy=cy+Math.sin(a2)*rad*sig[i2];
-    i2?x.lineTo(vx,vy):x.moveTo(vx,vy)}
-  x.closePath();x.fillStyle='rgba(201,168,76,.18)';x.fill();
-  x.strokeStyle='#c9a84c';x.lineWidth=1.2;x.stroke();
-  for(var i3=0;i3<9;i3++){var a3=(i3/9)*6.2831853-1.5708;
-    x.beginPath();x.arc(cx+Math.cos(a3)*rad*sig[i3],cy+Math.sin(a3)*rad*sig[i3],1.6,0,6.283);
-    x.fillStyle='#e8a33d';x.fill()}
-
-  var C=G.chain,y=C.x,cw=C.c._w,ch=C.c._h;y.clearRect(0,0,cw,ch);
-  var mx=Math.max.apply(null,chainSeries);
-  y.strokeStyle='rgba(255,255,255,.06)';
-  for(var gl=0;gl<3;gl++){var yy=ch-6-(gl/2)*(ch-14);y.beginPath();y.moveTo(0,yy);y.lineTo(cw,yy);y.stroke()}
-  var grd=y.createLinearGradient(0,0,0,ch);
-  grd.addColorStop(0,'rgba(127,227,176,.30)');grd.addColorStop(1,'rgba(127,227,176,0)');
-  y.beginPath();y.moveTo(0,ch-6);
-  chainSeries.forEach(function(v,i){y.lineTo((i/(chainSeries.length-1))*cw,ch-6-(v/mx)*(ch-14))});
-  y.lineTo(cw,ch-6);y.closePath();y.fillStyle=grd;y.fill();
-  y.beginPath();
-  chainSeries.forEach(function(v,i){var px=(i/(chainSeries.length-1))*cw,py=ch-6-(v/mx)*(ch-14);
-    i?y.lineTo(px,py):y.moveTo(px,py)});
-  y.strokeStyle='#7fe3b0';y.lineWidth=1.3;y.stroke();
-  y.beginPath();y.arc(cw-1,ch-6-(chainSeries[chainSeries.length-1]/mx)*(ch-14),2.4+Math.sin(t*3)*.6,0,6.283);
-  y.fillStyle='#7fe3b0';y.fill();
-
-  var V=G.verd,zz=V.x,vw=V.c._w,vh=V.c._h;zz.clearRect(0,0,vw,vh);
-  var cols=['#1a9e6e','#c07a1d','#c8362b'],labs=['ALLOW','CHAL','BLOCK'],bw=(vw-16)/3;
-  for(var b2=0;b2<3;b2++){
-    var bh=(vh-20)*verd[b2],bx=b2*(bw+8),by=vh-12-bh;
-    var g3=zz.createLinearGradient(0,by,0,vh-12);
-    g3.addColorStop(0,cols[b2]);g3.addColorStop(1,'rgba(255,255,255,.02)');
-    zz.fillStyle=g3;zz.fillRect(bx,by,bw,bh);
-    zz.fillStyle=cols[b2];zz.fillRect(bx,by,bw,1.5);
-    zz.font='500 7.5px "IBM Plex Mono",monospace';zz.fillStyle='rgba(239,233,219,.5)';
-    zz.fillText(labs[b2],bx,vh-3);
-    zz.fillStyle=cols[b2];zz.font='600 8.5px "IBM Plex Mono",monospace';
-    zz.fillText(Math.round(verd[b2]*100)+'%',bx,by-4);
-  }
-  var L=G.lat,m2=L.x,lw=L.c._w,lh=L.c._h;m2.clearRect(0,0,lw,lh);
-  var mxh=Math.max.apply(null,latH),bw2=lw/latH.length;
-  for(var i4=0;i4<latH.length;i4++){
-    var v2=latH[i4]/mxh,bh2=(lh-18)*v2,pl=(Math.floor(t*3)%latH.length===i4)?1:.55;
-    m2.fillStyle='rgba(201,168,76,'+(.20+v2*.55*pl)+')';
-    m2.fillRect(i4*bw2+1,lh-12-bh2,bw2-2,bh2);
-  }
-  m2.font='500 7.5px "IBM Plex Mono",monospace';m2.fillStyle='rgba(239,233,219,.45)';
-  m2.fillText('0.05',0,lh-2);m2.fillText('0.098 median',lw*.30,lh-2);m2.fillText('0.4',lw-16,lh-2);
-}
-
-/* ================= BOOT ================= */
-var rb=document.getElementById('rblocks');
-function tick(now){
-  drawG((now-t0)/1000);
-  rb.textContent=Math.min(21,Math.floor(Math.min(1,boot*1.05)*21));
-  setTimeout(function(){requestAnimationFrame(tick)},1000/22);
-}
-addEventListener('resize',function(){resize();
-  ['radar','chain','verd','lat'].forEach(function(k){if(G[k])G[k].c._fit()})});
-makeNebula();resize();initG();
-requestAnimationFrame(frame);requestAnimationFrame(tick);
-
-var gbar=document.getElementById('gbar'),gload=document.getElementById('gload'),gate=document.getElementById('gate');
-var steps=['Igniting the field','Loading 21 blocks','Linking the chain','Anchor confirmed'],si=0,pg=0;
-var iv=setInterval(function(){
-  pg=Math.min(100,pg+Math.random()*16+9);gbar.style.width=pg+'%';
-  var ns=Math.min(3,Math.floor(pg/26));if(ns!==si){si=ns;gload.textContent=steps[si]}
-  if(pg>=100){clearInterval(iv);
-    setTimeout(function(){gate.classList.add('gone');
-      setTimeout(function(){gate.style.display='none'},1000)},380)}
-},200);
-if(reduce){boot=1;warp=0;cam.z=1;gate.style.display='none'}
-})();
-</script>
-</body>
-</html>
-
-```
-
-
 ## `green.html`
 
 276 lines, 19875 bytes
@@ -1708,6 +1024,366 @@ footer a{color:var(--green);text-decoration:none}
   <p style="margin-top:8px;color:var(--muted)">Referenced legislation: EU EED 2023/1791 · EU AI Act 2024/1689 · CSRD · EnEfG · UK Climate Change Act 2008 · <a href="/ai-standard">OAAS-1.0</a></p>
 </footer>
 
+</body>
+</html>
+
+```
+
+
+## `guardian-parent.html`
+
+70 lines, 4511 bytes
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#0a0f1e">
+<title>Guardian - Child safety for your platform</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0a0f1e;color:#fff;min-height:100vh;line-height:1.6}
+.wrap{max-width:620px;margin:0 auto;padding:28px 20px 80px}
+.logo{display:flex;align-items:center;gap:10px;margin-bottom:24px}
+h1{font-size:30px;font-weight:800}h1 span{color:#c9a84c}
+.lead{font-size:18px;color:#e8e8f0;margin-bottom:8px;font-weight:600}
+.sub{color:#8a90a6;font-size:15px;margin-bottom:26px}
+.box{background:#111a30;border:1px solid #232d4a;border-radius:14px;padding:20px;margin-bottom:16px}
+.box h2{font-size:12px;color:#c9a84c;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:14px}
+.line{display:flex;gap:12px;margin:12px 0;font-size:15px;color:#c2c8dc}
+.line b{color:#c9a84c;flex-shrink:0;font-size:18px}
+.price{background:#0d2018;border:1px solid #1fae79;border-radius:14px;padding:20px;text-align:center;margin-bottom:16px}
+.price .big{font-size:34px;font-weight:800;color:#7fe3b0}
+.price .p{color:#a9b0c4;font-size:14px;margin-top:4px}
+.cta{display:block;background:#c9a84c;color:#0a0f1e;text-align:center;padding:18px;border-radius:12px;font-weight:800;font-size:17px;text-decoration:none;margin:22px 0 10px}
+.law{background:#1a1206;border:1px solid #c9a84c;border-radius:12px;padding:16px;font-size:14px;color:#e8d9b0;margin-bottom:16px;line-height:1.7}
+.tiny{color:#5a6178;font-size:12px;margin-top:20px;line-height:1.7}
+a.back{color:#c9a84c;text-decoration:none;font-size:14px;font-family:monospace}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="logo">
+    <svg width="30" height="30" viewBox="0 0 32 32"><circle cx="16" cy="16" r="13.5" fill="none" stroke="#c9a84c" stroke-width="2.6" stroke-dasharray="66 20" stroke-linecap="round" transform="rotate(-50 16 16)"/><circle cx="26.5" cy="7" r="3.1" fill="#c9a84c"/></svg>
+    <a class="back" href="/">&larr; AILeash</a>
+  </div>
+
+  <h1>Guard<span>ian</span></h1>
+  <p class="lead">Child safety, built into your platform.</p>
+  <p class="sub">For consoles, games and apps with young users &mdash; PlayStation, Roblox, Discord, TikTok and the like. The Online Safety Act now makes you responsible for keeping kids safe. Guardian is how you do it, and how you prove it.</p>
+
+  <div class="law">
+    <b>The problem:</b> if under-18s use your platform, the Online Safety Act says you must protect them from grooming and harm &mdash; and prove to Ofcom that you did. Get it wrong and the fines are huge.
+  </div>
+
+  <div class="box">
+    <h2>What Guardian gives your platform</h2>
+    <div class="line"><b>1</b><span>A one-tap <b>Help button</b> your young users can hit if something feels wrong &mdash; it alerts instantly.</span></div>
+    <div class="line"><b>2</b><span>Automatic <b>grooming-pattern flagging</b> on messages &mdash; it never falsely tells a child something is "safe".</span></div>
+    <div class="line"><b>3</b><span>A <b>tamper-proof record</b> of every safety event &mdash; the exact evidence Ofcom asks for, provable on demand.</span></div>
+    <div class="line"><b>4</b><span><b>CEOP, Childline and 999</b> one tap away for every child, always.</span></div>
+  </div>
+
+  <div class="box">
+    <h2>How you use it</h2>
+    <div class="line"><b>&#9656;</b><span>Sign up below and get your <b>API key</b>.</span></div>
+    <div class="line"><b>&#9656;</b><span>Your developers wire Guardian into <b>your own app</b> &mdash; your design, your branding. Our engine runs underneath, invisible.</span></div>
+    <div class="line"><b>&#9656;</b><span>Your young users are protected, and you have the audit trail proving it. Done.</span></div>
+  </div>
+
+  <div class="price">
+    <div class="big">50p</div>
+    <div class="p">per device, per month. The families on your platform never pay a penny.</div>
+  </div>
+
+  <a class="cta" href="/#signup" onclick="setProduct&&setProduct('guardian')">Sign up &amp; get your Guardian API key &rarr;</a>
+
+  <div class="tiny">Guardian cannot secretly read anyone's phone &mdash; that is deliberate. It flags known-risky patterns and lets a child ask for help. Message content is never stored, only a tamper-evident fingerprint. Any product promising to secretly read a child's phone is either lying or spyware.</div>
+</div>
+</body>
+</html>
+
+```
+
+
+## `human-oversight.html`
+
+115 lines, 13247 bytes
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Human Oversight Policy — Monop Content / AILeash</title>
+<meta name="description" content="How human oversight is engineered into the AILeash platform: commit-before-reveal, the CHALLENGE flow, delegated authority tokens, conformance probes, and the sealed evidence trail behind every human intervention. Aligned to EU AI Act Article 14.">
+<style>
+  :root{--ink:#0a0f1e;--ink2:#111a30;--line:#232d4a;--gold:#c9a84c;--gold-dim:#8a7838;--ok:#7fe3b0;--text:#e8e8f0;--muted:#c2c8dc;--faint:#5a6178;--code-bg:#0b1226}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--ink);color:#fff;line-height:1.7;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:720px;margin:0 auto;padding:26px 20px 90px}
+  a.back{color:var(--gold);text-decoration:none;font-size:13px;font-family:ui-monospace,Menlo,monospace;letter-spacing:.5px}
+  .eyebrow{font-family:ui-monospace,Menlo,monospace;font-size:10.5px;letter-spacing:2px;text-transform:uppercase;color:var(--gold-dim);margin:22px 0 10px}
+  h1{font-size:28px;font-weight:800;letter-spacing:-.5px;margin-bottom:10px;line-height:1.2}
+  h1 span{color:var(--gold)}
+  .meta{font-family:ui-monospace,Menlo,monospace;font-size:12px;color:var(--faint);margin-bottom:26px;line-height:1.9}
+  h2{font-size:19px;font-weight:800;margin:40px 0 8px;letter-spacing:-.3px}
+  h2 .n{color:var(--gold);font-family:ui-monospace,Menlo,monospace;font-size:13px;margin-right:8px}
+  h3{font-size:15px;font-weight:700;margin:22px 0 6px;color:var(--gold)}
+  p{font-size:14.5px;color:var(--muted);margin-bottom:13px}
+  p b{color:#fff}
+  ul{margin:0 0 14px 0;list-style:none}
+  li{position:relative;padding-left:20px;margin-bottom:9px;font-size:14px;color:var(--muted)}
+  li::before{content:'';position:absolute;left:0;top:9px;width:6px;height:6px;border-radius:50%;background:var(--gold)}
+  li b{color:#fff}
+  pre{background:var(--code-bg);border:1px solid var(--line);border-radius:10px;padding:15px;font-size:12.5px;color:var(--muted);overflow-x:auto;margin:14px 0;font-family:ui-monospace,Menlo,monospace;line-height:1.8}
+  pre b{color:var(--ok);font-weight:400}
+  .honest{border:1px solid rgba(201,168,76,.35);background:rgba(201,168,76,.05);border-radius:12px;padding:16px 20px;margin:16px 0;font-size:13.5px;color:var(--muted);line-height:1.75}
+  .honest b{color:var(--gold)}
+  hr{border:none;height:1px;background:linear-gradient(90deg,transparent,rgba(201,168,76,.25),transparent);margin:40px 0 0}
+  footer{margin-top:30px;text-align:center;font-size:12px;color:var(--faint);font-family:ui-monospace,Menlo,monospace}
+  footer a{color:var(--gold);text-decoration:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <a class="back" href="/">&larr; sebbi.pro</a>
+  <div class="eyebrow">monop content · policy document · public</div>
+  <h1>Human Oversight Policy<br><span>AILeash Platform</span></h1>
+  <div class="meta">
+    Document: MC-POL-003 · Version 2.0 · Effective 28 July 2026 · supersedes v1.0 (20 July 2026)<br>
+    Owner: Justin Dobson, Founder, Monop Content · Review cycle: quarterly, and on any change to the challenge, authority, commitment or conformance mechanisms<br>
+    Alignment: EU AI Act (Regulation 2024/1689) Article 14 · published at sebbi.pro/human-oversight
+  </div>
+
+  <h2><span class="n">1.</span>Position: oversight as engineering, not paperwork</h2>
+  <p>"Human in the loop" fails in practice for three predictable reasons: the human is invoked too late or not at all; nobody can later prove the human who intervened was actually authorised to; and — least often admitted — nobody can show the human did anything more than agree with whatever the machine had already decided.</p>
+  <p>This policy describes how the platform engineers all three away as far as they can be engineered, and states plainly where engineering stops.</p>
+
+  <div class="honest"><b>What this policy does not claim.</b> No system can prove a person deliberated. That is an internal state and no amount of recording reaches it. Any vendor asserting proof of genuine human thought is describing something that does not exist. What follows is what <i>can</i> be proved: that a human was invoked, that they were authorised, that they committed before they knew the answer, how long they took, and how often they disagree.</div>
+
+  <h2><span class="n">2.</span>When a human is brought in: the CHALLENGE band</h2>
+  <p>The decision engine returns three verdicts. ALLOW and BLOCK are the clear cases. Between them sits a deliberate band — <b>CHALLENGE</b> — where the engine's judgement is that the event is neither safe enough to pass nor dangerous enough to refuse, and a human must decide.</p>
+  <p>A CHALLENGE verdict is not advisory. The response includes a hosted resolution flow: a signed link the affected user or an authorised reviewer opens to confirm or deny the action, a status endpoint the customer's system polls, and an expiry after which the challenge lapses unresolved. Tokens are stateless and HMAC-signed; they cannot be forged or replayed after expiry.</p>
+  <pre>event → engine → <b>CHALLENGE</b> → hosted confirm/deny (human)
+       → resolution <b>sealed into the chain as its own block</b>
+       → customer system reads the outcome and proceeds accordingly</pre>
+  <p>The critical property: <b>the exception path is part of the evidence trail, not a gap in it.</b> Every human intervention — that it happened, when, and with what outcome — is sealed with the same tamper-evidence as the machine decisions around it.</p>
+
+  <h2><span class="n">3.</span>Commit before reveal: proving the judgement was independent</h2>
+  <p>An oversight record showing that a reviewer approved a decision the machine had already displayed to them proves very little. It is consistent with careful agreement and equally consistent with a rubber stamp. Until the two can be told apart, "human oversight" is an assertion.</p>
+  <p>The platform separates them by controlling <b>order</b>. A case is opened with the material and the machine's verdict, and the verdict is returned to the caller as <i>withheld</i>. The reviewer sees the case, not the answer. Their own decision and their reasoning are sealed as a block. Only then is the machine verdict released.</p>
+  <pre>open   → material sealed · machine verdict sealed but <b>withheld</b>
+review → human sees the case, not the answer
+commit → <b>human verdict and reasoning sealed</b>
+reveal → machine verdict returned
+result → the chain shows the human committed first</pre>
+  <p>Because blocks cannot be reordered without breaking every block after them, the record establishes that the reviewer could not simply have agreed with an answer they had already seen. That is not proof of thought. It is proof of independence, which is the part Article 14 actually turns on.</p>
+
+  <h3>Attention and divergence</h3>
+  <ul>
+    <li><b>Dwell time</b> — the interval between opening a case and committing to it is sealed with the decision. A sub-second approval sits in the record permanently, beside a two-minute one. One fast decision means nothing; four hundred consecutive fast decisions is a pattern that survives being explained away.</li>
+    <li><b>Divergence rate</b> — agreement with the machine is recorded per reviewer over time. A reviewer who has never once disagreed across a meaningful sample is visible in the data. One who diverges sometimes is demonstrably exercising judgement.</li>
+    <li><b>Reasoning</b> — a commitment with blank reasoning is refused outright. The reasoning is the part that gets examined later.</li>
+  </ul>
+
+  <h2><span class="n">4.</span>Who may oversee: delegated authority, sealed</h2>
+  <p>Oversight only satisfies Article 14 if the human is competent and mandated — and if that mandate can be demonstrated afterwards. The platform makes the mandate a first-class object:</p>
+  <ul>
+    <li>A customer issues a <b>signed authority token</b> binding a named user identifier to a role, a maximum amount, and an expiry. The grant itself is sealed into the chain at the moment of issue — who was empowered, to what limit, until when, is a permanent record.</li>
+    <li>Events carrying an authority token are verified deterministically. A token that is invalid, expired, bound to a different user, or below the amount at stake causes the verdict to <b>escalate</b> — an ALLOW becomes a CHALLENGE — with the specific reason (e.g. <i>authority_expired</i>, <i>authority_exceeds_limit</i>) sealed into the decision record.</li>
+    <li>An approval made outside granted authority therefore cannot pass silently. It becomes a flagged, sealed, examinable event — visible to the customer's own audit and to any later review.</li>
+  </ul>
+
+  <h2><span class="n">5.</span>The overseer's information: explainability</h2>
+  <p>A human cannot meaningfully oversee a verdict they cannot understand. Every verdict the engine returns carries its reasons in plain English — "velocity spike", "new country", "low trust", "authority exceeds limit" — not scores alone and never an unexplained refusal. The engine is deterministic: identical inputs always yield identical verdicts, so an overseer (or a court) re-examining a decision later sees exactly what the system saw and why it concluded what it did.</p>
+
+  <h2><span class="n">6.</span>Override and the record of it</h2>
+  <p>Ultimate control rests with the customer's humans, not with the engine. A customer may resolve any CHALLENGE in either direction, and may configure their own systems to overrule engine verdicts. The platform's role is not to remove human authority but to make its exercise <b>attributable and permanent</b>: the resolution, the resolver, and the timing are sealed. Oversight without a record is a claim; this is oversight with proof.</p>
+
+  <h2><span class="n">7.</span>Conformance: testing the arrangement rather than trusting it</h2>
+  <p>Section 3 has a dependency that must be stated openly. <b>The ordering guarantee holds only if the integrating system honours it.</b> If a platform displays the machine verdict to its own reviewers before opening the case, the sealed order proves nothing. The engine cannot see inside a customer's interface and does not pretend to.</p>
+  <p>What it can do is test the arrangement from the outside, using the method substantive audit has always used — and specifically the approach set out publicly by <b>James Stokes of Red Flag AI Pro</b>: place a case with a known answer into the queue, unannounced, and see who catches it.</p>
+  <ul>
+    <li>A <b>probe</b> is a genuine oversight case whose machine verdict has been deliberately set to a known-wrong value. To the reviewer it is indistinguishable from any other case.</li>
+    <li>Agreeing with the planted verdict means the case was not evaluated. That is a caught rubber stamp, sealed like any other event.</li>
+    <li>If the interface is leaking the verdict early, a reviewer's agreement rate on probes will track their agreement rate on ordinary cases. If they are deciding blind, it will not. <b>The gap between those two figures is the conformance signal.</b></li>
+  </ul>
+  <p>A single probe establishes nothing about an individual. A catch rate across dozens is evidence about a process, and the process is what is under audit.</p>
+
+  <h2><span class="n">8.</span>Oversight of the platform itself</h2>
+  <p>Monop Content applies the same standard to its own operation. The Founder is the accountable human for the platform (see the Risk Management Policy, MC-POL-001). Platform-level changes deploy only through a version-controlled pipeline attributable to a named commit; the platform cannot alter its own sealed history, and its integrity is continuously checkable by anyone at the public verification endpoint — meaning the platform's overseer is, by design, also overseeable.</p>
+
+  <div class="honest"><b>Honest limits, restated.</b> The platform routes borderline decisions to humans, proves who intervened with what mandate, and establishes that they committed before the answer was disclosed to them. It cannot make the human's judgement correct and does not claim to. A reviewer can leave a screen open, so dwell time is gameable by anyone deliberately gaming it. Authority tokens prove the grant, not the wisdom of granting it. Probes test a process, not a person — someone can catch a probe and rubber stamp the next hundred cases — and an operator who identifies probe cases controls their own interface. Customers remain responsible for staffing oversight roles with competent people; no software discharges that duty for them.</div>
+
+  <hr>
+  <footer>
+    <p style="margin-top:20px"><a href="/">sebbi.pro</a> · <a href="/risk-policy">Risk Management Policy</a> · <a href="/data-protection">Data Protection Statement</a> · <a href="/whitepaper">Whitepaper</a> · <a href="/contact">Contact</a></p>
+    <p style="margin-top:8px;color:var(--faint)">Monop Content · Blyth, Northumberland, UK · justin@monopcontent.com</p>
+  </footer>
+</div>
+</body>
+</html>
+
+```
+
+
+## `identity.html`
+
+151 lines, 9171 bytes
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Identity Notary — sebbi.pro</title>
+<style>
+  :root{--ink:#0a0f1e;--ink2:#10182e;--gold:#c9a84c;--ok:#7fe3b0;--err:#ff8a80;}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--ink);color:#fff;font-family:system-ui,sans-serif;min-height:100vh;padding:24px}
+  .wrap{max-width:560px;margin:0 auto}
+  .brand{font-family:monospace;font-size:10px;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,0.35)}
+  h1{font-family:Georgia,serif;font-size:26px;color:var(--gold);margin:14px 0 6px}
+  .sub{font-size:13.5px;color:rgba(255,255,255,0.5);line-height:1.7;margin-bottom:22px}
+  label{display:block;font-family:monospace;font-size:10px;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,0.45);margin:16px 0 6px}
+  input{width:100%;background:var(--ink2);border:1px solid rgba(201,168,76,0.35);color:#fff;border-radius:8px;padding:13px;font-size:15px;outline:none}
+  input:focus{border-color:var(--gold)}
+  button{width:100%;margin-top:20px;background:var(--gold);color:var(--ink);border:none;border-radius:8px;padding:16px;font-size:16px;font-weight:800;cursor:pointer}
+  button:disabled{opacity:0.5}
+  #cert{display:none;margin-top:24px;background:var(--ink2);border:2px solid var(--gold);border-radius:12px;padding:28px;text-align:center}
+  #cert .seal-ring{width:64px;height:64px;margin:0 auto 14px}
+  #cert h2{font-family:Georgia,serif;font-size:22px;color:#fff;margin-bottom:4px}
+  #cert .who{font-family:Georgia,serif;font-style:italic;font-size:18px;color:var(--gold);margin-bottom:14px}
+  #cert .row{font-family:monospace;font-size:11px;color:rgba(255,255,255,0.6);line-height:2;word-break:break-all;text-align:left;background:rgba(0,0,0,0.3);border-radius:8px;padding:14px;margin-top:10px}
+  #cert .row b{color:var(--ok)}
+  #status{margin-top:14px;font-family:monospace;font-size:12px;line-height:1.8;word-break:break-all}
+  .ok{color:var(--ok)}.err{color:var(--err)}
+  .note{margin-top:22px;font-size:12px;color:rgba(255,255,255,0.35);line-height:1.8}
+  .note b{color:var(--gold);font-weight:600}
+  a{color:var(--gold)}
+  .copybtn{background:var(--ink);color:var(--gold);border:1px solid rgba(201,168,76,0.4);margin-top:12px;padding:12px;font-size:13px;font-weight:600}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="brand">sebbi.pro &middot; sovereign identity notary</div>
+  <h1>Seal your identity into the chain.</h1>
+  <div class="sub">Enter your details below. They are fingerprinted with SHA-256 <b>inside your own browser</b> — the details themselves never leave your device and are never stored. Only the fingerprint is sealed into the live audit chain, creating permanent, tamper-evident proof that this exact identity existed at this exact moment.</div>
+
+  <label>Full name</label>
+  <input id="nm" placeholder="Justin Antony Dobson">
+
+  <label>Email</label>
+  <input id="em" type="email" placeholder="you@example.com">
+
+  <label>Organisation (optional)</label>
+  <input id="org" placeholder="Monop Content">
+
+  <label>Title (optional)</label>
+  <input id="ttl" placeholder="Founder">
+
+  <label>One-line bio (optional)</label>
+  <input id="bio" placeholder="Building tamper-evident AI compliance from Blyth.">
+
+  <button id="go" onclick="notarise()">Notarise this identity &rarr;</button>
+  <div id="status"></div>
+
+  <div id="cert">
+    <svg class="seal-ring" viewBox="0 0 32 32"><circle cx="16" cy="16" r="13.5" fill="none" stroke="#c9a84c" stroke-width="2.6" stroke-dasharray="66 20" stroke-linecap="round" transform="rotate(-50 16 16)"/><circle cx="26.5" cy="7" r="3.1" fill="#c9a84c"/><circle cx="16" cy="16" r="3.4" fill="#0a0f1e"/></svg>
+    <h2>Certificate of Notarised Identity</h2>
+    <div class="who" id="cwho"></div>
+    <div class="row" id="crow"></div>
+    <canvas id="cardcanvas" width="1200" height="628" style="width:100%;border-radius:8px;margin-top:14px;border:1px solid rgba(201,168,76,0.4)"></canvas>
+    <a id="carddl" class="copybtn" style="display:block;text-align:center;text-decoration:none" download="identity-card.png">Download identity card</a>
+    <button class="copybtn" onclick="copyCert()">Copy certificate text</button>
+  </div>
+
+  <div class="note"><b>Verify any time:</b> re-enter the identical details on this page and the chain will return the same fingerprint, block and timestamp — proof nothing changed. One character different produces a completely different fingerprint. Powered by the same engine that seals AI decisions: <a href="/">free for 90 days &rarr;</a></div>
+</div>
+
+<script>
+var lastCert="";
+async function sha256hex(s){
+  var buf=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(s));
+  return Array.from(new Uint8Array(buf)).map(function(b){return b.toString(16).padStart(2,"0");}).join("");
+}
+async function notarise(){
+  var nm=document.getElementById("nm").value.trim();
+  var em=document.getElementById("em").value.trim().toLowerCase();
+  var org=document.getElementById("org").value.trim();
+  var st=document.getElementById("status");
+  var cert=document.getElementById("cert");
+  cert.style.display="none";
+  if(!nm||!em||em.indexOf("@")<0){st.innerHTML="<span class='err'>Name and a valid email are required.</span>";return;}
+  var btn=document.getElementById("go");btn.disabled=true;
+  st.innerHTML="Fingerprinting in your browser\u2026";
+  try{
+    var ttl=document.getElementById("ttl").value.trim();var bio=document.getElementById("bio").value.trim();var canonical="identity:v1|"+nm+"|"+em+"|"+org+"|"+ttl+"|"+bio;
+    var fp=await sha256hex(canonical);
+    st.innerHTML="Fingerprint "+fp.slice(0,20)+"\u2026<br>Sealing into the chain\u2026";
+    var r=await fetch("/api/identity/seal",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({fingerprint:fp})});
+    var d=await r.json();
+    if(!d.sealed){st.innerHTML="<span class='err'>"+(d.error||"Sealing failed")+"</span>";btn.disabled=false;return;}
+    var when=new Date((d.sealed_at||Date.now()/1000)*1000);
+    document.getElementById("cwho").textContent=nm+(org?(" \u00b7 "+org):"");
+    document.getElementById("crow").innerHTML=
+      "Fingerprint <b>"+fp+"</b><br>"+
+      "Sealed in block <b>#"+d.block_index+"</b> of the live sebbi.pro audit chain<br>"+
+      "Seal <b>"+d.seal+"</b><br>"+
+      "Timestamp <b>"+when.toLocaleString("en-GB")+"</b><br>"+
+      "Chain verification: sebbi.pro/api/inclusion?hash="+d.seal;
+    lastCert="CERTIFICATE OF NOTARISED IDENTITY \u2014 sebbi.pro\n"+
+      nm+(org?(" \u00b7 "+org):"")+"\n"+
+      "Fingerprint: "+fp+"\n"+
+      "Block: #"+d.block_index+"\nSeal: "+d.seal+"\n"+
+      "Timestamp: "+when.toLocaleString("en-GB")+"\n"+
+      "Verify: sebbi.pro/api/inclusion?hash="+d.seal;
+    cert.style.display="block";drawCard(nm,ttl,org,bio,fp,d);
+    st.innerHTML="<span class='ok'>\u2713 Identity notarised. The details never left this device \u2014 only the fingerprint is in the chain.</span>";
+  }catch(e){st.innerHTML="<span class='err'>Network error: "+e+"</span>";}
+  btn.disabled=false;
+}
+function drawCard(nm,ttl,org,bio,fp,d){
+  var c=document.getElementById("cardcanvas"),x=c.getContext("2d");
+  var W=c.width,H=c.height;
+  var g=x.createLinearGradient(0,0,W,H);g.addColorStop(0,"#0a0f1e");g.addColorStop(1,"#141d36");
+  x.fillStyle=g;x.fillRect(0,0,W,H);
+  x.strokeStyle="#c9a84c";x.lineWidth=6;x.strokeRect(14,14,W-28,H-28);
+  x.strokeStyle="rgba(201,168,76,0.35)";x.lineWidth=1.5;x.setLineDash([6,5]);x.strokeRect(30,30,W-60,H-60);x.setLineDash([]);
+  x.fillStyle="#c9a84c";x.font="600 22px monospace";x.textAlign="center";
+  x.fillText("CERTIFICATE OF NOTARISED IDENTITY",W/2,86);
+  x.fillStyle="#ffffff";x.font="900 64px Georgia";
+  x.fillText(nm,W/2,180);
+  x.fillStyle="#c9a84c";x.font="italic 600 30px Georgia";
+  var sub=(ttl?ttl:"")+(ttl&&org?" \u00b7 ":"")+(org?org:"");
+  if(sub)x.fillText(sub,W/2,226);
+  if(bio){x.fillStyle="rgba(255,255,255,0.65)";x.font="26px Georgia";x.fillText(bio.slice(0,70),W/2,274);}
+  /* seal ring */
+  x.save();x.translate(W/2,360);x.strokeStyle="#c9a84c";x.lineWidth=7;x.setLineDash([52,16]);
+  x.beginPath();x.arc(0,0,44,0,Math.PI*2);x.stroke();x.setLineDash([]);
+  x.fillStyle="#c9a84c";x.beginPath();x.arc(30,-30,9,0,7);x.fill();
+  x.fillStyle="#0a0f1e";x.beginPath();x.arc(0,0,11,0,7);x.fill();x.restore();
+  x.fillStyle="#7fe3b0";x.font="600 21px monospace";
+  x.fillText("FINGERPRINT "+fp.slice(0,40)+"\u2026",W/2,452);
+  x.fillStyle="rgba(255,255,255,0.6)";x.font="600 21px monospace";
+  x.fillText("SEALED IN BLOCK #"+d.block_index+" \u00b7 LIVE SEBBI.PRO AUDIT CHAIN",W/2,490);
+  x.fillText(new Date(d.sealed_at*1000).toLocaleString("en-GB"),W/2,524);
+  x.fillStyle="#c9a84c";x.font="600 20px monospace";
+  x.fillText("verify: sebbi.pro/api/inclusion?hash="+d.seal.slice(0,24)+"\u2026",W/2,572);
+  document.getElementById("carddl").href=c.toDataURL("image/png");
+}
+function copyCert(){
+  navigator.clipboard.writeText(lastCert).then(function(){
+    document.getElementById("status").innerHTML="<span class='ok'>Certificate copied.</span>";
+  });
+}
+</script>
 </body>
 </html>
 
