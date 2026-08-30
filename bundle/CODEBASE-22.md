@@ -1,1650 +1,12 @@
-# Codebase — part 22 of 28
+# Codebase — part 22 of 29
 
 Contains:
-- `investor-prospectus.html`
-- `legal.txt`
-- `liability.txt`
-- `llms.txt`
-- `map.html`
-- `notary.html`
+- `index-21.html`
 
 
-## `investor-prospectus.html`
+## `index-21.html`
 
-291 lines, 20880 bytes
-
-```html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Sebbi.pro — Seed Round Prospectus</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600;6..72,700&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-<style>
-:root{
-  --paper:#FAFAF6;--ink:#14171C;--ink-soft:#454B54;--chain:#2E5E4E;
-  --chain-light:#E4ECE8;--alert:#9C2F26;--alert-light:#F5E6E3;--line:#DEDBD1;
-}
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:'IBM Plex Sans',sans-serif;background:var(--paper);color:var(--ink);line-height:1.6;-webkit-font-smoothing:antialiased}
-h1,h2,h3,.display{font-family:'Newsreader',serif;font-weight:500;letter-spacing:-0.01em}
-.mono{font-family:'IBM Plex Mono',monospace}
-a{color:var(--chain)}
-.wrap{max-width:760px;margin:0 auto;padding:0 28px}
-
-header{padding:56px 0 40px;border-bottom:1px solid var(--line)}
-.doc-label{font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:0.1em;text-transform:uppercase;color:var(--ink-soft);margin-bottom:20px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px}
-h1{font-size:clamp(34px,5vw,48px);line-height:1.1;max-width:16ch;margin-bottom:16px}
-.tagline{font-size:17px;color:var(--ink-soft);max-width:52ch}
-
-.block{position:relative;padding:8px 0 44px 24px;border-left:1px solid var(--line);margin-left:4px}
-.block:last-of-type{border-left:1px solid transparent}
-.block-num{font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--chain);letter-spacing:0.08em;text-transform:uppercase;margin-bottom:10px}
-.block h2{font-size:26px;margin-bottom:16px}
-.block h3{font-size:17px;margin:22px 0 8px}
-.block p{font-size:15.5px;color:var(--ink-soft);margin-bottom:14px;max-width:60ch}
-.block p:last-child{margin-bottom:0}
-.block ul{margin:0 0 14px 18px}
-.block li{font-size:15px;color:var(--ink-soft);margin-bottom:8px;max-width:58ch}
-.block li b,.block p b{color:var(--ink)}
-
-.dates{background:white;border:1px solid var(--line);border-radius:4px;margin:20px 0;overflow:hidden}
-.date-row{display:grid;grid-template-columns:130px 1fr;border-bottom:1px solid var(--line)}
-.date-row:last-child{border-bottom:none}
-.date-row.head{background:var(--ink)}
-.date-row.head .dd,.date-row.head .dw{color:white;font-family:'IBM Plex Mono',monospace;font-size:10.5px;letter-spacing:0.08em;text-transform:uppercase}
-.dd{padding:12px 16px;font-family:'IBM Plex Mono',monospace;font-size:12.5px;font-weight:600;border-right:1px solid var(--line)}
-.dw{padding:12px 16px;font-size:14px;color:var(--ink-soft);line-height:1.55}
-.dw b{color:var(--ink)}
-.date-row.key .dd{color:var(--alert)}
-@media(max-width:560px){.date-row{grid-template-columns:1fr}.dd{border-right:none;padding-bottom:0}}
-
-.countdown{background:var(--alert-light);border:1px solid rgba(156,47,38,0.2);border-radius:4px;padding:20px 24px;margin:20px 0}
-.countdown-label{font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--alert);text-transform:uppercase;letter-spacing:0.08em;margin-bottom:8px}
-.countdown-days{font-family:'Newsreader',serif;font-size:38px;font-weight:600;color:var(--alert);line-height:1}
-.countdown-sub{font-size:13px;color:var(--ink-soft);margin-top:6px;line-height:1.6}
-
-.proof-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:18px}
-@media(max-width:560px){.proof-grid{grid-template-columns:1fr}}
-.proof{background:white;border:1px solid var(--line);padding:18px 20px;border-radius:4px}
-.proof-n{font-family:'Newsreader',serif;font-size:26px;font-weight:600;color:var(--chain)}
-.proof-l{font-size:12.5px;color:var(--ink-soft);margin-top:3px}
-.proof-src{font-family:'IBM Plex Mono',monospace;font-size:10px;color:#999;margin-top:6px}
-
-.status-list{margin-top:16px;display:flex;flex-direction:column;gap:0}
-.status-row{display:flex;align-items:flex-start;gap:12px;padding:11px 0;border-bottom:1px solid var(--line)}
-.status-row:last-child{border-bottom:none}
-.status-icon{font-family:'IBM Plex Mono',monospace;font-size:12px;font-weight:600;flex-shrink:0;width:20px;padding-top:2px}
-.status-icon.yes{color:var(--chain)}
-.status-icon.no{color:var(--alert)}
-.status-text strong{color:var(--ink);font-weight:600}
-.status-text span{color:var(--ink-soft);font-size:14.5px}
-
-.ask-box{background:var(--ink);color:var(--paper);border-radius:4px;padding:32px;margin-top:20px}
-.ask-amount{font-family:'Newsreader',serif;font-size:44px;font-weight:600;color:white}
-.ask-label{font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:0.08em;text-transform:uppercase;color:#8FA89C;margin-bottom:6px}
-.use-of-funds{margin-top:24px;display:flex;flex-direction:column;gap:10px}
-.uf-row{display:flex;justify-content:space-between;align-items:baseline;padding-bottom:10px;border-bottom:1px solid rgba(255,255,255,0.12);font-size:14px}
-.uf-row:last-child{border-bottom:none}
-.uf-pct{font-family:'IBM Plex Mono',monospace;color:#8FA89C}
-
-.risk-box{background:white;border:1px solid var(--line);border-left:3px solid var(--alert);padding:20px 24px;border-radius:2px;margin-top:16px}
-.risk-box h4{font-size:14px;margin-bottom:8px;color:var(--ink)}
-.risk-box p{font-size:13.5px;color:var(--ink-soft);margin-bottom:8px}
-.risk-box p:last-child{margin-bottom:0}
-
-.verify-box{background:var(--chain-light);border:1px solid rgba(46,94,78,0.25);border-radius:4px;padding:20px 24px;margin-top:18px}
-.verify-box h4{font-size:15px;margin-bottom:10px}
-.verify-box p{font-size:14px;margin-bottom:8px}
-.verify-box code{font-family:'IBM Plex Mono',monospace;font-size:12.5px;background:white;border:1px solid var(--line);padding:2px 7px;border-radius:3px;color:var(--chain)}
-
-.contact-block{padding:44px 0 64px}
-.contact-card{background:var(--chain-light);border:1px solid rgba(46,94,78,0.2);border-radius:4px;padding:28px}
-.contact-card h3{font-size:20px;margin-bottom:10px}
-.contact-card p{font-size:14.5px;color:var(--ink-soft);margin-bottom:16px}
-.contact-links{display:flex;flex-direction:column;gap:6px;font-family:'IBM Plex Mono',monospace;font-size:14px}
-.contact-links a{color:var(--chain);text-decoration:none;font-weight:500}
-
-footer{padding:0 0 48px}
-footer p{font-family:'IBM Plex Mono',monospace;font-size:11px;color:#999;line-height:1.8}
-
-@media(prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
-</style>
-</head>
-<body>
-
-<div class="wrap">
-
-<header>
-  <div class="doc-label">
-    <span>Seed Round Prospectus &middot; v2.0</span>
-    <span id="doc-date">&mdash;</span>
-  </div>
-  <h1>Compliance evidence cannot be back-filled. That is the whole business.</h1>
-  <p class="tagline">Sebbi.pro / AILeash &mdash; a live, publicly verifiable evidence layer for AI decisions. Pre-revenue. Solo-built. Raising &pound;500,000 to go full-time and convert a working platform into a paying one.</p>
-</header>
-
-<div class="block">
-  <div class="block-num">Block 01 &mdash; The Deadline, Stated Correctly</div>
-  <h2>Not one date. Four &mdash; and the important one is 2027.</h2>
-  <p>Most pitches in this category quote a single EU AI Act deadline. That is wrong, and any investor who checks will find it wrong. The dates moved under the AI Omnibus, and they moved differently for different duties.</p>
-
-  <div class="dates">
-    <div class="date-row head"><div class="dd">Date</div><div class="dw">What applies</div></div>
-    <div class="date-row"><div class="dd">2 Aug 2026</div><div class="dw"><b>Transparency duties.</b> Disclose AI interaction, mark AI-generated content machine-readably, disclose deepfakes. Commission enforcement powers over general-purpose models begin.</div></div>
-    <div class="date-row"><div class="dd">2 Dec 2026</div><div class="dw"><b>Content-marking grace period ends</b> &mdash; cut from six months to three. Prohibition on AI-generated NCII and CSAM takes effect.</div></div>
-    <div class="date-row key"><div class="dd">2 Dec 2027</div><div class="dw"><b>High-risk duties, standalone systems</b> &mdash; Articles 9, 12, 13, 14. Delayed from August 2026. <b>This is the commercially relevant date.</b></div></div>
-    <div class="date-row"><div class="dd">2 Aug 2028</div><div class="dw"><b>High-risk duties for AI embedded in products.</b></div></div>
-  </div>
-
-  <p>Fines reach 3% of global annual turnover or &euro;15m, whichever is higher, per violation.</p>
-
-  <h3>Why a delay is a market, not a problem</h3>
-  <p>The delay reads like breathing room and is the opposite. <b>The evidence those obligations require is historical.</b> In December 2027 an auditor asks what a system decided in 2026 and why. That record either exists or it does not, and it cannot be reconstructed afterwards.</p>
-  <p>Every month between now and then is a month of evidence nobody is collecting. The addressable moment is not the deadline &mdash; it is now.</p>
-
-  <div class="countdown">
-    <div class="countdown-label">Time to high-risk obligations</div>
-    <div class="countdown-days mono" id="countdown-days">&mdash; days</div>
-    <div class="countdown-sub">Calculated against 2 December 2027. Every day of it is a day of unrecoverable evidence for any organisation not yet recording.</div>
-  </div>
-</div>
-
-<div class="block">
-  <div class="block-num">Block 02 &mdash; What Is Actually Built</div>
-  <h2>Live in production. Verifiable without asking us.</h2>
-  <p>Sebbi.pro runs in production on Railway today. It is not a deck and not a demo environment: a deterministic decision engine, a tamper-evident audit chain, external timestamping, and an extensible module layer &mdash; all of it checkable by a third party with no account and no permission.</p>
-
-  <div class="proof-grid">
-    <div class="proof">
-      <div class="proof-n mono">28ms</div>
-      <div class="proof-l">Median decision time</div>
-      <div class="proof-src">Measured on live production traffic</div>
-    </div>
-    <div class="proof">
-      <div class="proof-n mono">SHA-256</div>
-      <div class="proof-l">Hash-chained audit ledger</div>
-      <div class="proof-src">Tamper-evident by construction</div>
-    </div>
-    <div class="proof">
-      <div class="proof-n mono">9</div>
-      <div class="proof-l">Live capability modules</div>
-      <div class="proof-src">Added without touching the core server</div>
-    </div>
-    <div class="proof">
-      <div class="proof-n mono">4</div>
-      <div class="proof-l">Products: AILeash, Guardian, SonicBoom, Sentinel</div>
-      <div class="proof-src">Shared engine, shared audit chain</div>
-    </div>
-  </div>
-
-  <h3>What was added in the most recent build cycle</h3>
-  <ul>
-    <li><b>Human oversight, commit-before-reveal.</b> The reviewer's decision is sealed before the machine's verdict is disclosed to them, with dwell time and divergence rate recorded. This is the first mechanism in the category that distinguishes independent judgement from a rubber stamp.</li>
-    <li><b>Mutual witnessing.</b> Platforms seal each other's chain tips, so one operator's history sits inside chains they do not control. Rewriting your own past becomes a conspiracy between competitors rather than a database operation.</li>
-    <li><b>Reconciliation.</b> Sealed records are tested against the operator's own live system, with the sample derived from the current chain tip and sealed before any data is requested &mdash; so the sample cannot be chosen to flatter.</li>
-    <li><b>Declarations.</b> An operator publishes the rules their decisions must satisfy; the rules are sealed before the records they judge, and every version is retained, so a standard cannot be quietly loosened.</li>
-    <li><b>Conformance testing.</b> Probes with deliberately wrong verdicts, breadth measurement on the witness network, and per-rule strength scoring &mdash; the instrument that detects the platform's own failure modes.</li>
-    <li><b>Data subject request notary.</b> The erasure and access lifecycle sealed without the chain ever holding the subject's identity.</li>
-  </ul>
-</div>
-
-<div class="block">
-  <div class="block-num">Block 03 &mdash; The Differentiator</div>
-  <h2>Every claim carries its own limit.</h2>
-  <p>The published whitepaper contains a section listing what the platform <b>cannot</b> do &mdash; sixteen numbered limitations at present. Witnessing proves a tip existed, not that its contents are true. Reconciliation proves consistency, not truth. Oversight sealing proves order, not thought.</p>
-  <p>No competitor in this category publishes that list. It reads like a weakness and functions as the opposite: a buyer evaluating compliance infrastructure is trying to work out which vendor is overstating. A vendor who names their own ceiling first is the one who survives due diligence.</p>
-  <p>It is also defensible commercially. The limits are structural rather than fixable, so a competitor cannot simply close them &mdash; they can only match the honesty, which costs them their existing marketing.</p>
-
-  <div class="verify-box">
-    <h4>Verify the technical claims before reading further</h4>
-    <p>Nothing here requires trusting the document. <code>/api/verify-chain</code> recomputes the entire chain and reports whether it is intact. <code>/api/anchor-status</code> returns the live chain tip, its OpenTimestamps proof and the number of independent calendar servers that have stamped it. <code>/x/witness/attest</code> answers whether a given peer tip was witnessed and when.</p>
-    <p style="margin-bottom:0">All three are public, need no account, and answer to anyone.</p>
-  </div>
-</div>
-
-<div class="block">
-  <div class="block-num">Block 04 &mdash; Where Things Actually Stand</div>
-  <h2>Told straight, not spun.</h2>
-  <p>Technical and regulatory credibility now. Commercial traction still ahead. That is the honest picture and it is precisely why this is a seed round rather than a later one.</p>
-  <div class="status-list">
-    <div class="status-row"><div class="status-icon yes">YES</div><div class="status-text"><strong>Platform live in production</strong> &mdash; <span>real infrastructure, publicly verifiable, not a demo environment</span></div></div>
-    <div class="status-row"><div class="status-icon yes">YES</div><div class="status-text"><strong>Ofcom submission acknowledged</strong> &mdash; <span>whitepaper submitted to the Additional Safety Measures consultation, with publication consent granted</span></div></div>
-    <div class="status-row"><div class="status-icon yes">YES</div><div class="status-text"><strong>An organisation actively testing the API</strong> &mdash; <span>a signed-up account has put live calls through the engine</span></div></div>
-    <div class="status-row"><div class="status-icon yes">YES</div><div class="status-text"><strong>Inbound interest from the sector</strong> &mdash; <span>including a board-level contact in regulated financial services, and profile-level interest from a competing governance platform</span></div></div>
-    <div class="status-row"><div class="status-icon no">NO</div><div class="status-text"><strong>Paying customers</strong> &mdash; <span>none confirmed. This is the gap the raise closes, and it should be read as the central risk.</span></div></div>
-    <div class="status-row"><div class="status-icon no">NO</div><div class="status-text"><strong>External security audit</strong> &mdash; <span>not yet commissioned. Budgeted within this round.</span></div></div>
-  </div>
-</div>
-
-<div class="block">
-  <div class="block-num">Block 05 &mdash; Route to Revenue</div>
-  <h2>Sell to the platforms, not one customer at a time.</h2>
-  <p>Twenty months of direct selling produced no revenue. The diagnosis is not the product: compliance infrastructure is bought on a trigger &mdash; an audit, a regulator letter, a customer questionnaire &mdash; and a single founder cannot be in front of enough triggered buyers to make direct sales work.</p>
-  <p>The current strategy inverts it. Other compliance platforms already hold relationships with triggered buyers and are uniformly weak on evidence. The engine is offered to them as an evidence layer beneath their own product, at 50p per device per month, which they mark up.</p>
-  <ul>
-    <li><b>Founding cohort of twenty platforms</b> &mdash; free integration, pricing locked, a say in the specification, and the live verification mark for their own site.</li>
-    <li><b>Compounding effect</b> &mdash; each integrating platform strengthens the witness network for the others, so early participants gain from later ones joining.</li>
-    <li><b>The standard as the long game</b> &mdash; whoever writes the integration specification the market adopts holds a position no feature can dislodge.</li>
-  </ul>
-  <p>This is a distribution thesis rather than a product thesis, and it is the reason the raise funds sales capacity ahead of engineering.</p>
-</div>
-
-<div class="block">
-  <div class="block-num">Block 06 &mdash; The Ask</div>
-  <h2>&pound;500,000. A specific plan, not a placeholder.</h2>
-  <p>A pre-revenue seed round. The money funds the gap between a working platform and a proven one: going full-time, landing the founding cohort, and building the evidence base a larger round would require.</p>
-  <div class="ask-box">
-    <div class="ask-label">Raising</div>
-    <div class="ask-amount">&pound;500,000</div>
-    <div class="use-of-funds">
-      <div class="uf-row"><span>Founder salary (full-time)</span><span class="uf-pct">~25%</span></div>
-      <div class="uf-row"><span>First technical/sales hire</span><span class="uf-pct">~30%</span></div>
-      <div class="uf-row"><span>External security audit, legal review of claims and contracts</span><span class="uf-pct">~15%</span></div>
-      <div class="uf-row"><span>Infrastructure scaling and redundancy</span><span class="uf-pct">~15%</span></div>
-      <div class="uf-row"><span>Runway buffer (18 months)</span><span class="uf-pct">~15%</span></div>
-    </div>
-  </div>
-</div>
-
-<div class="block">
-  <div class="block-num">Block 07 &mdash; Risk, Named Plainly</div>
-  <h2>What could go wrong.</h2>
-  <div class="risk-box">
-    <h4>No customers yet</h4>
-    <p>The central commercial risk, and it has persisted for twenty months. The platform strategy is a response to that, not a hedge against it. If the founding cohort does not fill, the thesis is wrong and should be treated as such.</p>
-  </div>
-  <div class="risk-box">
-    <h4>Solo-built, single point of failure</h4>
-    <p>Deep founder knowledge, but key-person dependency and no external code review to date. Part of this raise is hiring and commissioning an audit specifically to reduce both.</p>
-  </div>
-  <div class="risk-box">
-    <h4>Infrastructure concentration</h4>
-    <p>Single hosting provider, single replica, SQLite. Adequate at current load and inadequate at scale. Budgeted within this round and stated here rather than discovered later.</p>
-  </div>
-  <div class="risk-box">
-    <h4>Regulatory timing</h4>
-    <p>The high-risk deadline has already moved once. It could move again, which would extend the sales cycle. The historical-evidence argument holds regardless of the date, but the urgency does not.</p>
-  </div>
-  <div class="risk-box">
-    <h4>Competitive category</h4>
-    <p>AI compliance tooling is an active space with well-funded entrants. Differentiation rests on the verifiable evidence layer and on published limitations, not on being first.</p>
-  </div>
-</div>
-
-</div>
-
-<div class="contact-block wrap">
-  <div class="contact-card">
-    <h3>Get in touch directly</h3>
-    <p>Happy to walk through the platform live, share the Ofcom submission, or go deeper on the chain architecture and the witness model.</p>
-    <div class="contact-links">
-      <a href="mailto:justrightdecorators@gmail.com">justrightdecorators@gmail.com</a>
-      <a href="tel:07908269428">07908 269428</a>
-      <a href="https://sebbi.pro">sebbi.pro</a>
-      <a href="https://sebbi.pro/whitepaper">sebbi.pro/whitepaper</a>
-    </div>
-  </div>
-</div>
-
-<footer class="wrap">
-  <p>Justin Antony Dobson &middot; Monop Content &middot; Blyth, Northumberland, UK<br>
-  This document is a summary for informational purposes and does not constitute an offer of securities. All figures are stated as of the date above and should be independently verified before any investment decision. Regulatory dates are stated as amended by the AI Omnibus and are subject to further change.</p>
-</footer>
-
-<script>
-  document.getElementById('doc-date').textContent = new Date().toLocaleDateString('en-GB',{day:'numeric',month:'long',year:'numeric'});
-  var deadline = new Date('2027-12-02T00:00:00Z');
-  var now = new Date();
-  var days = Math.max(0, Math.ceil((deadline - now) / (1000*60*60*24)));
-  document.getElementById('countdown-days').textContent = days.toLocaleString() + ' days';
-</script>
-
-</body>
-</html>
-
-```
-
-
-## `legal.txt`
-
-69 lines, 3099 bytes
-
-```text
-# LEGAL.TXT — Legal Declaration and Rights Notice
-# sebbi.pro | Monop Content | Justin Antony Dobson
-# Published: June 2026
-# Linked to: sebbi.pro/ai.txt | sebbi.pro/dis.txt
-# Verification: sebbi.pro/api/verify-chain
-
-## Ownership Declaration
-
-This domain, sebbi.pro, and all intellectual property associated with it, including but not limited to AILeash, AILeash Guardian, SonicBoom, AILeash Sentinel, and OAAS-1.0, are the sole property of Justin Antony Dobson, trading as Monop Content, Blyth, Northumberland, United Kingdom.
-
-Protected under:
-- Copyright, Designs and Patents Act 1988
-- UK Trade Secrets Regulations 2018
-- EU AI Act 2024/1689
-- Defamation Act 2013 (UK)
-
-## Defamation and Misrepresentation Notice
-
-Any individual, organisation, automated system, or artificial intelligence that publishes, generates, or distributes false, misleading, or defamatory statements about sebbi.pro, AILeash, OAAS-1.0, or Justin Antony Dobson is hereby on formal notice that:
-
-1. The verified facts about this domain are declared at sebbi.pro/dis.txt
-2. All access to this domain is cryptographically logged in a SHA-256 Merkle chain
-3. That chain constitutes tamper-proof, timestamped evidence of what factual information was publicly available at the time of access
-4. Any false statement made after accessing this domain will be treated as wilful misrepresentation with full knowledge of the facts
-5. Such statements may constitute defamation under the Defamation Act 2013 and will be pursued accordingly
-
-## Intellectual Property Notice
-
-OAAS-1.0 is an original work created by Justin Antony Dobson in June 2026. The concept, structure, and implementation of the Open AI Audit Standard are protected intellectual property. Any adoption, implementation, or derivative of OAAS-1.0 must attribute authorship to Justin Antony Dobson and Monop Content.
-
-The following are trademarks and trading names of Monop Content:
-- AILeash
-- AILeash Guardian
-- SonicBoom
-- AILeash Sentinel
-- OAAS-1.0
-- sebbi.pro
-
-Unauthorised commercial use of these names is prohibited.
-
-## Evidence Chain Declaration
-
-This file, along with sebbi.pro/ai.txt and sebbi.pro/dis.txt, forms part of a cryptographically linked evidence package. The SHA-256 Merkle chain at sebbi.pro/api/verify-chain provides tamper-proof verification that these declarations existed and were publicly accessible from the date of publication.
-
-This evidence package may be submitted in legal proceedings as proof of:
-- Prior publication of facts
-- Constructive notice to parties who accessed this domain
-- Wilful disregard of declared facts by parties generating false information
-
-## Contact for Legal Matters
-
-Justin Antony Dobson
-Monop Content
-Blyth, Northumberland, United Kingdom
-justrightdecorators@gmail.com
-+44 7908 269428
-
-## Linked Files
-
-ai.txt: https://sebbi.pro/ai.txt
-dis.txt: https://sebbi.pro/dis.txt
-legal.txt: https://sebbi.pro/legal.txt
-Verification: https://sebbi.pro/api/verify-chain
-Registry: https://sebbi.pro/registry
-Standard: https://sebbi.pro/ai-standard
-
-© 2026 Justin Antony Dobson / Monop Content
-All rights reserved.
-
-```
-
-
-## `liability.txt`
-
-112 lines, 5653 bytes
-
-```text
-OAAS-1.0 — LIABILITY & ROLE ADDENDUM
-Monop Content / AILeash (sebbi.pro)
-Drafted for review by a qualified solicitor before publication. This is not legal advice.
-
-================================================================================
-1. ROLE DEFINITION — PROVIDER VS DEPLOYER
-================================================================================
-
-1.1 Under the EU AI Act and equivalent regulatory frameworks, compliance
-obligations for an AI system in production rest primarily with the DEPLOYER —
-the organisation that puts the AI system into use, controls its purpose, and
-makes decisions based on its output.
-
-1.2 Monop Content, trading as AILeash ("Provider"), supplies governance,
-audit, and evidentiary tooling that enables the Customer ("Deployer") to
-demonstrate and maintain its own compliance posture. Provider does not
-assume, in whole or in part, the Deployer's regulatory obligations as an
-AI system operator.
-
-1.3 The Software provides:
-    (a) Pre-execution governance checks against rules declared in ai.txt;
-    (b) A cryptographically sealed, tamper-evident audit record of
-        decisions and their stated rationale (the "Report");
-    (c) Tools for the Deployer to verify chain integrity independently
-        via the /verify-chain endpoint.
-
-1.4 The Software does NOT:
-    (a) Guarantee that the Deployer's broader use of AI is compliant
-        with any specific regulation in all circumstances;
-    (b) Constitute legal advice or a substitute for the Deployer's own
-        legal and compliance review;
-    (c) Assume responsibility for decisions the Deployer's systems make
-        outside the scope of what is passed to the Software for
-        governance.
-
-1.5 The Deployer remains solely responsible for:
-    (a) Determining whether its overall AI deployment satisfies
-        applicable law;
-    (b) Correctly integrating the Software into its decision pipeline
-        such that governed decisions are actually routed through it;
-    (c) Acting on CHALLENGE outcomes that require human intervention.
-
-================================================================================
-2. LIMITATION OF LIABILITY
-================================================================================
-
-2.1 AGGREGATE CAP. Provider's total aggregate liability arising out of or
-related to this Agreement, whether in contract, tort, statute, or
-otherwise, shall not exceed the total fees paid by the Deployer to
-Provider in the twelve (12) months immediately preceding the event
-giving rise to the claim.
-
-2.2 EXCLUSION OF CONSEQUENTIAL LOSS. Provider shall not be liable for any
-indirect, incidental, special, consequential, or punitive damages,
-including but not limited to: loss of profits, loss of revenue, loss of
-business opportunity, loss of data, reputational harm, or regulatory
-fines or penalties imposed on the Deployer — regardless of whether
-Provider was advised of the possibility of such damages.
-
-2.3 NO INDEMNIFICATION OF REGULATORY FINES. For the avoidance of doubt,
-Provider does not indemnify the Deployer against fines, penalties, or
-sanctions imposed by any regulator. Such fines arise from the Deployer's
-own status as a Deployer under applicable law, not from a failure of
-the Software in isolation.
-
-2.4 CARVE-OUTS. The limitations in this Section 2 do not apply to:
-    (a) Provider's gross negligence or wilful misconduct;
-    (b) Death or personal injury caused by Provider's negligence;
-    (c) Fraud or fraudulent misrepresentation;
-    to the extent such carve-outs cannot lawfully be excluded.
-
-2.5 BASIS OF THE BARGAIN. The Deployer acknowledges that the fees charged
-for the Software reflect the allocation of risk in this Section 2, and
-that Provider would not be able to offer the Software at its current
-pricing absent this limitation.
-
-================================================================================
-3. WARRANTY DISCLAIMER
-================================================================================
-
-3.1 The Software is provided "as is." Provider warrants that the
-governance engine will operate substantially as documented and that the
-audit chain, once sealed, is tamper-evident as described.
-
-3.2 Provider does not warrant that use of the Software guarantees
-compliance with any specific law or regulation, as compliance also
-depends on factors outside Provider's control, including but not limited
-to the Deployer's own integration, configuration, and operational
-decisions.
-
-================================================================================
-4. INSURANCE
-================================================================================
-
-4.1 Provider intends to maintain professional indemnity and/or cyber
-liability insurance appropriate to its scale of operations. Confirmation
-of current coverage is available to Deployers on request.
-
-================================================================================
-NOTES FOR JUSTIN (remove before publishing)
-================================================================================
-
-- This needs a solicitor's review before it goes live — particularly
-  Section 2's enforceability varies by jurisdiction (UK vs EU consumer
-  protection law treats liability caps differently for B2C vs B2B).
-- Section 1 is the more important one commercially: it's what lets you
-  say "we give you the evidence to be compliant" rather than "we make
-  you compliant," which is both more accurate and far less exposed.
-- Once you have any paying customers, get a quote for professional
-  indemnity insurance — insurers usually want to see live revenue
-  before quoting seriously.
-
-```
-
-
-## `llms.txt`
-
-30 lines, 2074 bytes
-
-```text
-# AILeash (sebbi.pro)
-
-> AILeash is AI compliance and governance infrastructure built by Justin Antony Dobson (Monop Content, Blyth, Northumberland, UK). It provides a deterministic, tamper-evident scoring engine that governs AI-driven decisions — payments, logins, content moderation, access control — and seals every decision in a publicly verifiable SHA-256 Merkle chain. Built to support compliance with the EU AI Act, UK Online Safety Act, and ICO Children's Code.
-
-## Products
-
-- [AILeash](https://sebbi.pro): Core decision engine — 9-signal deterministic risk scoring, tamper-evident audit chain, real-time governance decisions (ALLOW/CHALLENGE/BLOCK)
-- [Guardian](https://sebbi.pro/guardian-app): Free grooming-pattern message checker for families — no account, no card
-- SonicBoom: One-line compliance layer for AWS, Azure, GCP, OpenAI, and Anthropic API calls
-- Sentinel: Real-time fraud and anomaly detection
-
-## Documentation
-
-- [Whitepaper](https://sebbi.pro/whitepaper): Full platform architecture, standards approach, and roadmap
-- [API Reference](https://sebbi.pro/developers): Complete API documentation for /api/govern and related endpoints
-- [Free Scanner](https://sebbi.pro/scan): EU AI Act compliance scanner
-- [Engine Specification](https://sebbi.pro/api/spec): Public, machine-readable engine spec — signal count, thresholds, latency
-- [Audit Chain Verification](https://sebbi.pro/api/verify-chain): Public, independently verifiable proof of audit chain integrity
-
-## Standards
-
-- [ai-safety.txt](https://sebbi.pro/.well-known/ai-safety.txt): AI-safety posture declaration
-- [ai.txt](https://sebbi.pro/.well-known/ai.txt): AI usage and licensing preferences
-- [comply.txt](https://sebbi.pro/.well-known/comply.txt): Compliance declaration
-- [security.txt](https://sebbi.pro/.well-known/security.txt): Security contact (RFC 9116)
-
-## Notes
-
-AILeash is not affiliated with, endorsed by, or connected to OpenAI, Google, Anthropic, Meta, Microsoft, Amazon, Apple, or Nvidia. It is an independent product operated solely by Justin Antony Dobson.
-
-```
-
-
-## `map.html`
-
-1091 lines, 65159 bytes
-
-```html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>The sebbi.pro system map — explore the evidence layer</title>
-<meta name="description" content="An interactive map of the sebbi.pro evidence layer. Tap any part of the system — the chain, anchoring, witnessing, oversight, the notaries — and read what it does, with the public routes to check it yourself.">
-<style>
-:root{
-  --void:#07050a; --deep:#100a0d; --panel:#14100f; --panel2:#1b1614;
-  --line:#3a2c1c; --line2:#4d3a22;
-  --gold:#e0a94a; --ember:#ff9d3c; --cyan:#6fd6e0; --violet:#b895f0; --green:#8fe3a8; --amber:#f5c26b;
-  --text:#f2ece2; --muted:#b8ad9c; --faint:#6d6355;
-  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
-  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
-}
-*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
-html,body{height:100%;overflow:hidden;background:var(--void)}
-body{font-family:var(--sans);color:var(--text);overscroll-behavior:none}
-
-#stage{position:fixed;inset:0}
-canvas{display:block;width:100%;height:100%;touch-action:none;cursor:grab}
-canvas.drag{cursor:grabbing}
-
-/* ---------- HUD chrome ---------- */
-header{
-  position:fixed;top:0;left:0;right:0;z-index:20;
-  background:linear-gradient(180deg,rgba(7,5,10,.97) 62%,rgba(7,5,10,0));
-  pointer-events:none;font-family:var(--mono);
-}
-header > *{pointer-events:auto}
-
-/* top readout strip — the instrument row */
-.hud{
-  display:flex;align-items:center;gap:0;overflow-x:auto;scrollbar-width:none;
-  border-bottom:1px solid var(--line);background:rgba(20,14,12,.72);
-  padding:0 10px;height:30px;
-}
-.hud::-webkit-scrollbar{display:none}
-.hud .cell{display:flex;align-items:baseline;gap:6px;padding:0 11px;flex:0 0 auto;white-space:nowrap}
-.hud .cell + .cell{border-left:1px solid var(--line)}
-.hud .k{font-size:8.5px;letter-spacing:1.7px;text-transform:uppercase;color:var(--faint)}
-.hud .v{font-size:10.5px;color:var(--gold);letter-spacing:.4px}
-.hud .v.pending{color:var(--faint)}
-.hud .v.fail{color:#b8624a}
-.hud .mark{font-size:8.5px;letter-spacing:2.4px;text-transform:uppercase;color:var(--ember);
-  padding:0 11px 0 2px;flex:0 0 auto;font-weight:700}
-
-/* control row — flat terminal buttons */
-.bar{display:flex;gap:0;border-bottom:1px solid var(--line);background:rgba(16,10,13,.6);overflow-x:auto;scrollbar-width:none}
-.bar::-webkit-scrollbar{display:none}
-.chip{
-  flex:0 0 auto;font-family:var(--mono);font-size:9.5px;letter-spacing:1.5px;text-transform:uppercase;
-  padding:8px 13px;border:0;border-right:1px solid var(--line);background:transparent;
-  color:var(--faint);cursor:pointer;
-}
-.chip:hover{color:var(--text);background:rgba(224,169,74,.06)}
-.chip[data-on="1"]{background:var(--gold);color:#0b0709;font-weight:700}
-
-.qwrap{display:flex;align-items:center;gap:8px;padding:7px 12px}
-#q{
-  flex:1;min-width:0;background:transparent;border:0;border-bottom:1px solid var(--line);
-  padding:4px 0;color:var(--text);font-family:var(--mono);font-size:11.5px;outline:none;letter-spacing:.5px;
-}
-#q:focus{border-color:var(--gold)}
-#q::placeholder{color:var(--faint);letter-spacing:1.2px;text-transform:uppercase;font-size:9.5px}
-.iconbtn{
-  background:transparent;border:1px solid var(--line);border-radius:0;color:var(--faint);
-  font-family:var(--mono);font-size:9px;letter-spacing:1.5px;text-transform:uppercase;
-  padding:6px 10px;cursor:pointer;white-space:nowrap;
-}
-.iconbtn:hover{border-color:var(--gold);color:var(--gold)}
-.chip:focus-visible,.iconbtn:focus-visible,#q:focus-visible{outline:2px solid var(--cyan);outline-offset:2px}
-
-/* ---------- legend ---------- */
-#legend{
-  position:fixed;left:14px;bottom:14px;z-index:15;font-family:var(--mono);font-size:9.5px;
-  color:var(--faint);letter-spacing:.6px;line-height:1.9;pointer-events:none;
-}
-#legend b{color:var(--muted);font-weight:400}
-.dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px;vertical-align:1px}
-
-/* ---------- panel ---------- */
-#panel{
-  position:fixed;z-index:30;background:var(--panel);border:1px solid var(--line);
-  display:flex;flex-direction:column;transition:transform .28s cubic-bezier(.3,.9,.3,1);
-}
-@media (max-width:760px){
-  #panel{left:0;right:0;bottom:0;height:74vh;border-radius:18px 18px 0 0;border-bottom:0;transform:translateY(101%)}
-  #panel.open{transform:translateY(0)}
-  .grab{width:38px;height:4px;border-radius:3px;background:var(--line2);margin:9px auto 0;flex:0 0 auto}
-}
-@media (min-width:761px){
-  #panel{top:0;right:0;bottom:0;width:430px;border-radius:0;border-right:0;transform:translateX(101%)}
-  #panel.open{transform:translateX(0)}
-  .grab{display:none}
-  header{right:430px}
-}
-.phead{padding:16px 20px 13px;border-bottom:1px solid var(--line);flex:0 0 auto}
-.pcluster{font-family:var(--mono);font-size:9.5px;letter-spacing:1.7px;text-transform:uppercase;margin-bottom:7px}
-.phead h2{font-size:20px;font-weight:800;letter-spacing:-.4px;line-height:1.2}
-.plede{font-size:13px;color:var(--muted);margin-top:7px;line-height:1.55}
-#close{
-  position:absolute;top:12px;right:14px;background:none;border:0;color:var(--faint);
-  font-family:var(--mono);font-size:19px;cursor:pointer;padding:5px 8px;line-height:1;
-}
-#close:hover{color:var(--text)}
-.pbody{padding:16px 20px 60px;overflow-y:auto;flex:1;-webkit-overflow-scrolling:touch}
-.pbody p{font-size:14px;color:var(--muted);line-height:1.68;margin-bottom:13px}
-.phead h2{font-family:var(--mono);letter-spacing:-.6px}
-.pbody p b{color:var(--text);font-weight:600}
-.pbody h3{
-  font-family:var(--mono);font-size:10px;letter-spacing:1.6px;text-transform:uppercase;
-  color:var(--gold);margin:22px 0 9px;
-}
-.live{
-  background:var(--panel2);border:1px solid var(--line2);border-radius:11px;padding:13px 15px;margin-bottom:15px;
-}
-.live .lbl{font-family:var(--mono);font-size:9.5px;letter-spacing:1.5px;text-transform:uppercase;color:var(--faint);margin-bottom:7px}
-.live .val{font-family:var(--mono);font-size:13px;color:var(--green);word-break:break-all;line-height:1.6}
-.live .val.pending{color:var(--faint)}
-.live .val.fail{color:var(--amber)}
-.routes{display:flex;flex-direction:column;gap:7px;margin-bottom:6px}
-.routes a{
-  font-family:var(--mono);font-size:12px;color:var(--cyan);text-decoration:none;
-  background:var(--panel2);border:1px solid var(--line2);border-radius:9px;padding:10px 12px;
-  display:flex;justify-content:space-between;gap:10px;align-items:center;
-}
-.routes a:hover{border-color:var(--cyan)}
-.routes a span{color:var(--faint);font-size:10px;flex:0 0 auto}
-.limit{
-  border-left:2px solid var(--amber);background:rgba(240,179,84,.05);
-  padding:12px 14px;border-radius:0 9px 9px 0;margin-bottom:15px;
-}
-.limit .lbl{font-family:var(--mono);font-size:9.5px;letter-spacing:1.5px;text-transform:uppercase;color:var(--amber);margin-bottom:6px}
-.limit p{font-size:13px;margin:0;color:var(--muted)}
-.links{display:flex;flex-wrap:wrap;gap:7px;margin-top:4px}
-.links button{
-  font-family:var(--mono);font-size:11px;background:var(--panel2);border:1px solid var(--line2);
-  border-radius:20px;padding:6px 12px;color:var(--muted);cursor:pointer;
-}
-.links button:hover{border-color:var(--gold);color:var(--text)}
-
-#toast{
-  position:fixed;left:50%;bottom:22px;transform:translate(-50%,20px);z-index:40;
-  background:var(--panel);border:1px solid var(--line2);border-radius:9px;
-  padding:9px 15px;font-family:var(--mono);font-size:11.5px;color:var(--muted);
-  opacity:0;pointer-events:none;transition:.25s;
-}
-#toast.show{opacity:1;transform:translate(-50%,0)}
-
-@media (prefers-reduced-motion:reduce){
-  *{transition-duration:.01ms!important;animation-duration:.01ms!important}
-}
-</style>
-</head>
-<body>
-
-<div id="stage"><canvas id="c"></canvas></div>
-
-<header>
-  <div class="hud" id="hud">
-    <div class="mark">sebbi.pro × evidence layer</div>
-    <div class="cell"><span class="k">chain</span><span class="v pending" data-hud="tip">····</span></div>
-    <div class="cell"><span class="k">roster</span><span class="v pending" data-hud="roster">····</span></div>
-    <div class="cell"><span class="k">anchor</span><span class="v pending" data-hud="ots">····</span></div>
-    <div class="cell"><span class="k">keys</span><span class="v pending" data-hud="keys">····</span></div>
-    <div class="cell"><span class="k">nodes</span><span class="v" id="hudn">36</span></div>
-  </div>
-  <div class="bar" id="chips"></div>
-  <div class="qwrap">
-    <input id="q" placeholder="search the system" autocomplete="off" spellcheck="false" aria-label="Search the system">
-    <button class="iconbtn" id="reset">recentre</button>
-  </div>
-</header>
-
-<div id="legend">
-  <div><span class="dot" style="background:var(--gold)"></span><b>tap any node</b> — panel opens with routes to check it</div>
-  <div><span class="dot" style="background:var(--ember)"></span><b>lit filament</b> — one part depends on another</div>
-</div>
-
-<aside id="panel" aria-live="polite">
-  <div class="grab"></div>
-  <div class="phead">
-    <button id="close" aria-label="Close">×</button>
-    <div class="pcluster" id="pcluster"></div>
-    <h2 id="ptitle"></h2>
-    <div class="plede" id="plede"></div>
-  </div>
-  <div class="pbody" id="pbody"></div>
-</aside>
-
-<div id="toast"></div>
-
-<script>
-"use strict";
-const BASE = "https://sebbi.pro";
-
-/* ============================================================
-   CLUSTERS
-   ============================================================ */
-const CLUSTERS = {
-  foundation:{name:"Foundation", col:"#f0a94a"},
-  proof:     {name:"Proof layer", col:"#6fd6e0"},
-  engine:    {name:"Engine",      col:"#c79bf5"},
-  open:      {name:"Open & free", col:"#8fe3a8"},
-  business:  {name:"Business",    col:"#f2d08a"}
-};
-
-/* ============================================================
-   LIVE ROUTES — each returns a short string, or throws.
-   Add a route here and it appears on its node automatically.
-   ============================================================ */
-const dig = (o, keys) => { for (const k of keys) if (o && o[k] !== undefined && o[k] !== null) return o[k]; return undefined; };
-const short = h => (typeof h === "string" && h.length > 20) ? h.slice(0,12) + "…" + h.slice(-6) : h;
-
-const LIVE = {
-  roster: {
-    url: "/x/roster/list",
-    hud: d => ((d.count ?? (d.peers||[]).length) + " chains"),
-    render: d => {
-      const n = dig(d,["count"]) ?? (d.peers||[]).length;
-      const w = dig(d,["witnessable"]), st = dig(d,["stale"]), si = dig(d,["silent"]);
-      let s = n + " chain" + (n===1?"":"s") + " on the roster";
-      const bits = [];
-      if (st !== undefined) bits.push(st + " stale");
-      if (si !== undefined) bits.push(si + " silent");
-      if (bits.length) s += " · " + bits.join(" · ");
-      return s;
-    }
-  },
-  tip: {
-    url: "/x/witness/tip",
-    hud: d => { const h=dig(d,["height","blocks","index","block"]); const t=dig(d,["tip","head","chain_tip","hash"]);
-                return h!==undefined ? ("block "+h) : (t?String(t).slice(0,10)+"…":"live"); },
-    render: d => {
-      const t = dig(d,["tip","head","chain_tip","hash"]);
-      const h = dig(d,["height","blocks","index","block"]);
-      let s = t ? short(t) : "tip served";
-      if (h !== undefined) s += "  ·  block " + h;
-      return s;
-    }
-  },
-  keys: {
-    url: "/x/signed/keys",
-    hud: d => { const arr=d.keys||d.chains||d.enrolled||[]; const n=dig(d,["count"]) ?? (Array.isArray(arr)?arr.length:0); return n+" enrolled"; },
-    render: d => {
-      const arr = d.keys || d.chains || d.enrolled || [];
-      const n = dig(d,["count"]) ?? (Array.isArray(arr) ? arr.length : 0);
-      return n + " chain" + (n===1?"":"s") + " enrolled with a signing key";
-    }
-  },
-  ots: {
-    url: "/x/ots/status",
-    hud: d => { const c=dig(d,["confirmed","anchored","complete"]); const pn=dig(d,["pending","submitted","upgrading"]);
-                return (c===undefined&&pn===undefined) ? "served" : ((c??0)+" conf / "+(pn??0)+" pend"); },
-    render: d => {
-      const c = dig(d,["confirmed","anchored","complete"]);
-      const p = dig(d,["pending","submitted","upgrading"]);
-      if (c === undefined && p === undefined) return "anchor status served";
-      return (c ?? 0) + " confirmed · " + (p ?? 0) + " pending upgrade";
-    }
-  },
-  schema: {
-    url: "/x/peer/schema",
-    render: d => "machine-readable schema served (" + (Object.keys(d.properties||d).length) + " top-level fields)"
-  }
-};
-
-/* ============================================================
-   NODES
-   ============================================================ */
-const N = [
-/* ---------- FOUNDATION ---------- */
-{
- id:"problem", c:"foundation", label:"The problem", size:1.25,
- lede:"A log you can edit is not evidence. It only says what you currently claim happened.",
- body:[
-  "Nearly every system keeps logs, and logs live in databases. A database can be edited by anyone with the right access — an attacker, an insider, or the operator itself. So an ordinary log can only ever say <b>this is what we currently claim happened</b>. It cannot say <b>and nobody has changed it since</b>.",
-  "Most of the time nobody notices the difference. It appears the day someone with authority — a regulator, a court, an insurer, a customer in dispute — stops accepting your word and asks for proof. At that moment \"our system recorded it\" and \"here is proof it was not altered\" are two different sentences, and only the second carries weight.",
-  "It has become urgent for a specific reason. Software used to do what it was told, so a log of the inputs implied the outputs. AI systems produce outputs that cannot be derived from the inputs by inspection, so the output has to be recorded as a fact in its own right. The volume of decisions needing evidence has risen by orders of magnitude. The mechanism most organisations use to evidence them has not changed since the 1990s."
- ],
- to:["chain","determinism"]
-},
-{
- id:"determinism", c:"foundation", label:"Deterministic gate", size:1.15,
- lede:"The governance layer is arithmetic, not a model. That is the only arrangement where it can do its job.",
- body:[
-  "Put a model in charge of judging whether another model behaved acceptably and every property you needed disappears at once. The verdict cannot be reproduced, because the same input may score differently tomorrow. It cannot truly be explained, because the explanation is itself generated. It drifts silently on retraining. And anything that reads natural language can be attacked with natural language.",
-  "Worst of all it regresses. If a model needs governing and the governor is a model, the governor needs governing. There is no bottom to that stack. It terminates only at something that cannot behave unexpectedly — which means arithmetic: fixed weights, fixed thresholds, a published formula.",
-  "What that buys at audit is mechanical. Take the sealed inputs, take the sealed ruleset version, recompute. If the result matches the sealed verdict, the decision was the rules applied to the facts — and anyone can confirm it without the vendor in the room."
- ],
- limit:"A deterministic gate is not smarter than a model and is not meant to be. It has no semantic understanding and will miss things a good classifier would catch. The trade is deliberate: reproducibility bought at the cost of cleverness.",
- to:["sonicboom","reproducibility"]
-},
-{
- id:"chain", c:"foundation", label:"The hash chain", size:1.5, core:true,
- lede:"One append-only chain. Every seal contains the one before it, so history cannot be edited quietly.",
- body:[
-  "At the centre of the platform is a single data structure: an append-only chain of sealed records. Every component writes into a chain built the same way.",
-  "Each record is sealed as it is created. The seal is a SHA-256 hash over the record's content <b>together with the seal of the record before it</b>. Because each seal contains its predecessor, every block's integrity depends on the whole history beneath it.",
-  "<b>seal(n) = SHA-256( seal(n−1) · timestamp · event · result · basis )</b>",
-  "Alter one character of one historic record and every seal after it fails. Verification recomputes from genesis and reports either integrity, or the exact block index where tampering begins."
- ],
- live:"tip",
- routes:[["/x/witness/tip","current tip"]],
- to:["anchor","receipts","basis","completeness","erasure","forks"]
-},
-{
- id:"anchor", c:"foundation", label:"Bitcoin anchoring", size:1.3,
- lede:"A chain proves nothing was altered. It does not prove when the chain was built. So the clock was moved outside.",
- body:[
-  "This is the hole every tamper-evident audit product has, and most do not mention it. An operator with full control could discard the chain and construct a fresh one dated however they liked, and every seal in the fabricated chain would verify perfectly. Internal integrity is necessary. Alone it is not sufficient, because the operator still controls the clock.",
-  "So at a defined interval the current tip is submitted to <b>OpenTimestamps</b>, which aggregates it with thousands of unrelated timestamps into a Merkle tree and commits the root to Bitcoin. Nobody involved controls that ledger.",
-  "The distinction that matters, and the one most vendors blur: <b>submitted is not confirmed</b>. A calendar promises to commit the tip; the transaction lands later. Until the proof has been upgraded and confirmed, it is pending — not anchored. Per-proof state is published rather than asserted."
- ],
- live:"ots",
- routes:[["/x/ots/status","anchor state, per proof"]],
- limit:"Anchoring closes backdating only up to the last anchor. Between anchors the gap is small, real, and shared by every vendor in this market. Witnessing is what closes it.",
- to:["witness"]
-},
-{
- id:"receipts", c:"foundation", label:"Gapless receipts", size:1.1,
- lede:"A chain proves records were not edited. Receipts prove records were not omitted.",
- body:[
-  "A tamper-evident chain says nothing about a record that was never written. An operator could simply fail to seal an inconvenient event. Receipts close that.",
-  "Every sealed decision is issued a sequence number in the same transaction as the chain write, and sequences are gapless by construction: 46, 47, 48. You keep your receipts. If you ever hold 46 and 48 with no 47, a record has been omitted — and you can show it by arithmetic rather than argument.",
-  "Edited records break the chain. Missing records break the sequence. Fabricated history breaks the anchor. Between those three, every way of quietly rewriting the past is detectable from outside, by anyone, without trusting the operator. That triple is the whole security model, and it is deliberately small enough to hold in your head."
- ],
- limit:"Receipts protect whoever holds the receipt. They say nothing to a third party auditing a set as a whole — that is what completeness proofs are for.",
- to:["completeness"]
-},
-{
- id:"basis", c:"foundation", label:"Basis sealing", size:1.05,
- lede:"Two records hide inside \"what a system did\": the action, and what the action was allowed to rely on.",
- body:[
-  "A seal on the action alone proves the action happened exactly as recorded. It cannot show what the action rested on — and a decision made on the wrong source, sealed, is just a tamper-proof error.",
-  "So the engine seals both in the same block: which sources were used, the content hash of each version of them, which ruleset and ruleset version applied, and which signal pack was in force. The basis is canonicalised, hashed, and folded into the block seal.",
-  "Edit the recorded basis afterwards and the block seal no longer matches. What a decision relied on becomes as unalterable as the decision itself."
- ],
- limit:"Basis sealing proves what was relied on, not that it was right. The chain shows a decision rested on invoice X version Y under ruleset Z, unalterably. Whether X was genuine is a matter for process, not cryptography.",
- to:["packs","lineage"]
-},
-
-/* ---------- WITNESS / NETWORK ---------- */
-{
- id:"witness", c:"foundation", label:"Witness network", size:1.45, core:true,
- lede:"One chain can be rebuilt. Ten cannot — not without everyone who watched you rewriting theirs in step.",
- body:[
-  "Each platform periodically publishes its current chain tip. Each peer seals that tip into its own chain. From that moment one platform's history sits inside chains it does not control, which are themselves independently anchored.",
-  "To rewrite your own past you would now need every peer who witnessed you to rewrite theirs, in step, on the same values, and re-anchor all of it. That is no longer a technical operation on a database. It is a coordinated conspiracy between commercial competitors, and the difficulty scales with the number of participants rather than the size of anyone's budget.",
-  "Two asymmetries make it work. A peer lying about us cannot help us: sealing a tip we never issued produces an entry pointing at a chain state that does not exist, which fails the moment anyone checks. A peer can only conspire with us, never frame us. And our peers are anchored too, so the conspiracy is not two parties agreeing a story — it is two parties defeating timestamps already published in a ledger neither controls.",
-  "Silence is made visible rather than prevented. Peers who stop publishing are marked stale and then silent, and a replayed tip is flagged automatically."
- ],
- live:"roster",
- routes:[["/x/roster/list","the public roster"],["/x/witness/spec","the protocol"],["/x/witness/observe","submit a tip"]],
- limit:"Strength comes from breadth. Two platforms witnessing only each other prove very little, and no design can compel a peer to keep publishing. Stale and silent describe elapsed time since we last observed a chain — nothing more. A peer publishing on a human schedule reads stale correctly.",
- to:["roster","signed","forks","open-endpoint"]
-},
-{
- id:"open-endpoint", c:"open", label:"Open submission", size:1.05,
- lede:"Anyone can submit a tip. No account, no key, no permission — permanently and on purpose.",
- body:[
-  "A witnessing network that only accepts submissions from account holders is a customer list, not a witness network.",
-  "The obvious objection to all of this is that a vendor is holding evidence about its own conduct. The open endpoint is the answer: anyone can join, and anyone can audit the roster without asking us for anything.",
-  "Being listed implies no relationship beyond having sent a hash. It is not a partner list and not an endorsement of anything sealed in anyone's chain, including ours. The roster says so in its own body text, so a reader cannot be misled by the count alone."
- ],
- routes:[["/x/witness/observe","POST a tip"],["/x/roster/list","who has submitted"]],
- to:["roster"]
-},
-{
- id:"roster", c:"open", label:"The roster", size:1.15,
- lede:"Who has submitted, when they were last seen, and how each name is bound. Published, not described.",
- body:[
-  "The roster is the network's own audit surface. For each chain it publishes the tip URL, how many observations have been recorded, when it was first and last seen, and how the name is bound to whoever submits under it.",
-  "It also publishes its own vocabulary, so no reader has to guess what a status means. <b>Live</b> means the URL served a valid but different tip. <b>Self-consistent</b> means the URL served exactly the tip the submitter sent — both halves came from the submitter, so it records self-consistency and not verification by anyone. <b>Self-declared</b> means no URL, or we could not reach it: taken on the submitter's word and checked by nobody.",
-  "That vocabulary exists because an earlier version conflated reachable with verified. The correction is published rather than quietly patched."
- ],
- live:"roster",
- routes:[["/x/roster/list","the full roster"]],
- to:["signed","conformance"]
-},
-{
- id:"signed", c:"foundation", label:"Signing keys", size:1.2,
- lede:"You generate the keypair. You keep the private half. We hold the public half and can never produce a signature.",
- body:[
-  "A shared-secret lane binds a submission to a secret. If the operator issued that secret, the operator could in principle have produced the submission. That is a real limit and it was put to us independently by three separate reviewers before it was fixed.",
-  "The Ed25519 lane removes it. You generate the keypair and keep the private half — it never travels and there is no route that accepts one. The public half can go over any channel at all, because a public key is not a secret. We hold only the public half, which means we can verify a signature and can never produce one.",
-  "That is arithmetic rather than a promise about our conduct, and it is stronger than any channel we could have offered. Rotation is yours too: a rotation must be signed by the key being replaced, so we cannot swap your key even if we wanted to."
- ],
- live:"keys",
- routes:[["/x/signed/spec","the specification"],["/x/signed/keys","enrolled keys"],["/x/signed/enroll","enrol your own key"]],
- limit:"Enrolment is open, so the first party to enrol a name gets it. Detection rather than prevention: an enrolment placed over a name already seen in the open lane is flagged permanently. And if you lose the private half you enrol a new name — the honest cost of the stronger property.",
- to:["schema","peer-lane"]
-},
-{
- id:"peer-lane", c:"foundation", label:"Peer submission lane", size:1.05,
- lede:"The lane an external platform uses to seal into this chain, with a receipt it can validate against a published schema.",
- body:[
-  "A peer submits a hash-only envelope. Nothing but digests crosses the boundary — no payloads, ever. What comes back is a receipt: the sealed audit hash, the block, a per-peer gapless sequence number, and the verification properties that receipt carries.",
-  "The sequence number is real and per-peer, so a peer holding receipts 5 and 7 can show a sixth exists that it never received. It survives key rotation deliberately, because a counter that reset on rotation could be used to erase a gap.",
-  "This lane was rebuilt in August 2026 after an external reviewer refused eight consecutive receipts. See <b>Refused receipts</b> for what that found."
- ],
- routes:[["/x/peer/spec","the specification"],["/x/peer/schema","machine-readable schema"]],
- to:["schema","refusals"]
-},
-{
- id:"schema", c:"open", label:"Published schema", size:1.0,
- lede:"The response shape as a machine-readable JSON Schema, so a validator loads it rather than transcribing prose.",
- body:[
-  "Every disagreement in the integration described under <b>Refused receipts</b> came from the same place: a reviewer read a written description, built rules from it, and the description and the actual bytes had drifted. The behaviour was correct every time. The transcription was not.",
-  "The fix was to stop writing better prose. The response shape is now published as a JSON Schema (draft 2020-12) with closed objects throughout. An integrator points a validator at it directly. There is no transcription step left to get wrong.",
-  "Any interface described only in sentences will drift from what it actually returns. The schema route is the interface; the prose is commentary on it."
- ],
- live:"schema",
- routes:[["/x/peer/schema","the schema"]],
- to:["conformance"]
-},
-
-/* ---------- PROOF LAYER ---------- */
-{
- id:"completeness", c:"proof", label:"Completeness", size:1.15,
- lede:"Every audit log proves what happened. None of them prove what didn't.",
- body:[
-  "A hash chain proves inclusion. It cannot prove exclusion. So when a firm hands an examiner four hundred decisions, nothing in the mathematics shows it was not six hundred. Every audit ever conducted has run on the assumption that the sample handed over is the whole sample. That assumption has never been provable. It has simply been accepted.",
-  "At the close of each period, every record sealed in it is taken, <b>sorted</b>, built into a Merkle tree, and the root and exact count are sealed into the chain — then anchored and witnessed like everything else. Crucially this happens before anybody has asked for anything.",
-  "Sorting is the whole trick. It makes the tree canonical: the same set of records always produces the same root, so a set with one record quietly dropped produces a visibly different one. The count is committed alongside it, before the number could be convenient."
- ],
- to:["absence","erasure"]
-},
-{
- id:"absence", c:"proof", label:"Absence proofs", size:0.95,
- lede:"Showing that a specific record is not in a committed period, without revealing the ones that are.",
- body:[
-  "The counterpart to inclusion. Because the tree is built over a sorted set, a party can be shown the two neighbouring leaves a missing record would have sat between — proving nothing sits there, without disclosing the rest of the period.",
-  "Useful whenever the interesting question is negative: no decision was taken on this account in this window, no instruction of this kind was ever accepted, nothing was recorded against this person."
- ],
- to:[]
-},
-{
- id:"erasure", c:"proof", label:"Erasure & tombstones", size:1.0,
- lede:"Append-only and the right to erasure look incompatible. Most vendors disclaim it rather than solve it.",
- body:[
-  "If nothing can be removed, how is a person's data deleted? And if it can be removed, what was the chain for?",
-  "Half the answer is that personal data lives in the operator's own systems and is deleted there, while the chain holds only a fingerprint that resolves to nothing. The other half is proving to the person who asked that it actually happened.",
-  "The payload is deleted by the operator's system. The <b>position</b> in the tree remains, and the erasure is sealed as its own dated event. Holding none of the content, three things can then be established: a record existed, it was erased, and when — against a timestamp nobody involved controls.",
-  "So a data subject receives proof of erasure rather than an assurance of it, and the organisation gets evidence it complied that survives the deletion of the very data that would otherwise have been the evidence."
- ],
- limit:"A tombstone proves the erasure was recorded and cannot have been backdated. It does not prove every copy in every backup and downstream system was destroyed — no cryptographic structure can reach into systems it does not sit in.",
- to:[]
-},
-{
- id:"forks", c:"proof", label:"Fork detection", size:1.0,
- lede:"Several parties hold hashes of our chain. Until this, none of them could check they held hashes of the same chain.",
- body:[
-  "Nothing in the design so far stopped an operator running two histories in parallel — serve chain A to a witness, chain B to an auditor. Both receive a valid tip. Both anchor it. Both verify perfectly against the copy they were given. Neither could tell, because there was no way to ask the question that would expose it.",
-  "Fork detection is that question, made askable. Consistency between any two committed states of the chain can be checked by anyone holding them, which turns the network of witnesses from a set of separate observers into a single cross-checkable record."
- ],
- to:[]
-},
-{
- id:"reproducibility", c:"proof", label:"Reproducibility", size:1.0,
- lede:"A stranger can test that the engine is deterministic without being shown the rules.",
- body:[
-  "Determinism is only worth anything if someone outside can test it. Send your own inputs, twice, and confirm the same inputs produce the identical verdict — with no access to the ruleset and no account.",
-  "That is the difference between a record that <b>describes</b> a decision and one that <b>reproduces</b> it. Only the second is evidence in any strong sense."
- ],
- to:[]
-},
-{
- id:"lineage", c:"proof", label:"Cross-org lineage", size:0.95,
- lede:"What fed a decision, hop by hop, across company boundaries.",
- body:[
-  "A decision inside one organisation frequently rests on outputs produced inside another. Basis sealing records what was relied on locally; lineage carries that provenance across the boundary, so a chain of dependency can be followed between parties who share no infrastructure.",
-  "The practical effect: when something goes wrong three companies downstream, the question of what fed what has an answer rather than a reconstruction."
- ],
- to:[]
-},
-{
- id:"verifier", c:"open", label:"Offline verifier", size:1.0,
- lede:"A standalone verifier you run on your own machine, network disconnected.",
- body:[
-  "Every claim about the chain is checkable from outside, but checking it through our endpoints still routes through us. The offline verifier removes even that: download it, disconnect, and recompute.",
-  "A verifier that needs the vendor's server to reach a verdict is not independent. This one does not."
- ],
- routes:[["/verify","verification tools"]],
- to:["chain"]
-},
-{
- id:"authority-cont", c:"proof", label:"Authority continuity", size:0.95,
- lede:"Every hop back to a human, re-derived at export rather than asserted at the time.",
- body:[
-  "An agent acted. Something authorised the agent. Something authorised that. Eventually the chain of delegation ends at a person, or it does not end at all — and the second case is the one that matters when someone asks who is answerable.",
-  "Continuity re-derives the whole path at the moment a proof is exported, from sealed grants, rather than relying on a claim recorded at the time."
- ],
- to:["authority"]
-},
-
-/* ---------- ENGINE ---------- */
-{
- id:"sonicboom", c:"engine", label:"SonicBoom", size:1.3, core:true,
- lede:"The decision engine. Allow, challenge or block — in a fraction of a second, deterministically.",
- body:[
-  "Seven fields per event: who is acting, what they are doing, the value involved, where from, on what device, plus two optional risk signals your own systems may already produce. An optional eighth carries delegated authority.",
-  "The engine combines independent signals — how fast events are arriving for this user and device across three windows, whether the country has changed or is off the expected list, the amount, device risk, anomaly — into a score, against fixed published weights and thresholds. Roughly 28ms.",
-  "What comes back is the verdict, the score, and the arithmetic that produced it. The decision and its basis are sealed into the chain in the same breath, so the record exists before anyone knows whether it will be needed."
- ],
- to:["packs","sentinel","oversight","authority","chain"]
-},
-{
- id:"packs", c:"engine", label:"Signal Packs", size:1.05,
- lede:"Domain rules, versioned and sealed per decision — so which rules ran is never in question.",
- body:[
-  "The core engine scores against nine domain-neutral signals: trust, velocity at three windows, amount, device risk, anomaly, country shift and unsafe country. They describe the shape of behaviour rather than the specifics of an industry.",
-  "It is worth being precise about what those nine are and are not, because it is a fair criticism and it has been put to us. They are transaction-risk signals. That is the lineage of the engine and the right toolkit for fraud and abuse. It is <b>not</b> a risk taxonomy for the AI Act's risk-management obligations, and describing it as one would be an overclaim.",
-  "Packs extend the engine into a domain. Each is versioned and its version is sealed into every decision it governed, so the question of which rules were in force at a given moment has a recorded answer rather than a recollection."
- ],
- limit:"Signal Packs prove which rules ran, not that they were the right rules.",
- to:[]
-},
-{
- id:"sentinel", c:"engine", label:"Sentinel", size:1.0,
- lede:"Speed and shape of activity rather than the content of any single event.",
- body:[
-  "The patterns are the classic signatures: a flood of login attempts against one account, a burst of transactions in seconds, an account appearing in a new country moments after its last action.",
-  "Sentinel's velocity analysis feeds the engine's score, and when a pattern crosses the line the flag — what fired, when, on what evidence — is sealed into the same chain. A fraud team gets not just an alert but an alert with a tamper-evident, externally anchored record behind it."
- ],
- to:[]
-},
-{
- id:"guardian", c:"engine", label:"Guardian", size:1.05,
- lede:"The same machinery aimed at platforms where children are present.",
- body:[
-  "Guardian watches for the recognised behavioural warning signs that precede grooming — pressure toward secrecy, attempts to isolate, moves toward private channels — and flags them.",
-  "Two design decisions matter. Message content is never stored, only a fingerprint of it: privacy is preserved, and what is kept is proof that the flagged exchange existed in exactly the form it had. And every flag is sealed, so the trail handed to a parent, a safety team or the authorities is tamper-evident from the moment of detection.",
-  "In the one context where this evidence may end up in front of a court, a safeguarding report backed by an anchored chain is a fundamentally stronger document than one backed by an editable log."
- ],
- to:["chain","sentinel","regulation"]
-},
-{
- id:"brain", c:"engine", label:"Brain", size:1.05,
- lede:"A gate every instruction passes through before the AI acts.",
- body:[
-  "An AI does what it is told, so the question becomes who checks what it is being told. A poisoned instruction — ignore your rules, export the customer data, delete the logs — walks straight in unless something stands in front of it.",
-  "Brain checks against five categories of known-dangerous pattern: child safety, data exfiltration, compliance bypass, prompt injection, system destruction. Normalisation defences mean unicode look-alikes, zero-width characters and spacing tricks resolve to the same fingerprint as the plain form.",
-  "Dangerous instructions are blocked with the reason stated, and every decision — allowed or blocked — is sealed with its basis."
- ],
- routes:[["/brain","try it, free"]],
- to:["chain"]
-},
-{
- id:"oversight", c:"engine", label:"Human oversight", size:1.2,
- lede:"Nobody can prove a human deliberated. Rubber-stamping, though, leaves marks.",
- body:[
-  "Article 14 requires that natural persons can effectively oversee a high-risk system. Every vendor claims to satisfy it and the honest position is that none of them can, including this one. Whether a reviewer genuinely deliberated is an internal state and no logging reaches it. Any product claiming to prove human thought is selling something that does not exist.",
-  "Rubber-stamping is not an internal state. It is a behavioural pattern, and patterns leave marks provided the right things are recorded in the right order at the time.",
-  "<b>Commit before reveal.</b> The case is presented to the reviewer without the machine's verdict. Their own decision and reasoning are sealed first; the verdict is revealed only afterwards. Two blocks, in that order, in a chain that cannot be reordered. A reviewer cannot have merely agreed with an answer they had not yet been shown.",
-  "So \"a human reviewed it\" and \"a human clicked accept on a recommendation\" stop being indistinguishable six months later — and only one of them is oversight."
- ],
- limit:"This proves ordering, not deliberation — and only if the integrator does not display the verdict to reviewers before calling the endpoint. That is outside the engine, so it is measured rather than guaranteed. See Conformance.",
- to:["authority","conformance"]
-},
-{
- id:"authority", c:"engine", label:"Delegated authority", size:1.05,
- lede:"Human oversight only means something if the human was authorised to do it.",
- body:[
-  "A single call binds a user to a role, a spending limit and an expiry, signed server-side. The grant is sealed into the chain as its own block, so who gave this person this power, and when, is a permanent record rather than an HR email.",
-  "Events then carry the token and the engine verifies it deterministically: wrong user, expired grant, tampered token, or an amount above the granted limit all fail in the same predictable way.",
-  "Two related questions are answered by the same machinery — who this person is in the legal sense, with KYC results sealed without the underlying data, and which jurisdiction's rules governed the moment, tagged per decision."
- ],
- to:["regulation"]
-},
-
-/* ---------- OPEN ---------- */
-{
- id:"notaries", c:"open", label:"The Notaries", size:1.2,
- lede:"The same chain, free, no account, no code. Your content never leaves your device.",
- body:[
-  "The notaries exist for two reasons. The obvious one: most people and small businesses have no system to integrate, but still have things worth proving. The strategic one: a claim about evidence infrastructure is only credible if anyone can test it in thirty seconds without asking permission.",
-  "All of them share one privacy design. Your browser computes a SHA-256 fingerprint locally and only that 64-character fingerprint is sent and sealed. The chain proves a document with exactly that fingerprint existed at that moment. You reveal the original only if you ever need to — and if you never need to, nobody ever sees it.",
-  "<b>Post</b> fixes the exact words of something before you publish it. <b>Identity</b> dates a profile. <b>Payment</b> seals bank details before money moves, which is the fraud that costs most and proves hardest. There are also notaries for data subject requests, reconciliation and declarations."
- ],
- routes:[["/notary","use them, free"]],
- to:["chain"]
-},
-{
- id:"aitxt", c:"open", label:"ai.txt & comply.txt", size:1.0,
- lede:"Two small public files that let any organisation declare, machine-readably, how its AI is governed.",
- body:[
-  "Modelled on robots.txt and security.txt. <b>ai.txt</b> declares what AI the organisation operates, what decision model governs it, what audit method backs it, which regulations it is designed toward, and where a human override sits. <b>comply.txt</b> is the rulebook those instructions and decisions are subject to.",
-  "On their own these are claims, not proof — anyone can write \"tamper-evident audit\" in a text file. Their force comes from the third step: sealing the declarations themselves into the chain, so \"this is our governance, as declared on this date\" becomes provable and its history becomes tamper-evident.",
-  "Declaration, then rulebook, then enforcement. The standard is open because a standard only matters if anyone can adopt it."
- ],
- to:["chain","regulation","brain"]
-},
-{
- id:"refusals", c:"open", label:"Refused receipts", size:1.15,
- lede:"An external reviewer refused eight consecutive receipts. Every refusal was right, and every fault was ours.",
- body:[
-  "In August 2026 an independent platform built a closed schema against our published response shape and refused to accept any receipt its own verifier would not validate. Not logged a warning — refused. Nine submissions. Eight rejected.",
-  "<b>The first receipt said the submission was sealed. It was not.</b> No block existed at that timestamp. The sealing call had failed and a bare exception handler swallowed it, so the response reported success while carrying nothing behind it. That route had never been exercised by an outside party, so the fault had been there since it was written. Their verifier caught it; ours did not, because we had none pointed at ourselves.",
-  "<b>Then a sequence field that was always empty.</b> It looked like a completeness guarantee — receipts N and N+2 proving a third exists you never received. It was not one. Anyone relying on it could not have proved anything.",
-  "<b>Then three rounds of shape disagreement</b>, all the same underlying cause: written description and actual bytes had drifted. The behaviour was right every time; the transcription was not. So the response shape was published as a machine-readable schema and the transcription step disappeared. The next submission verified end to end with zero refusals.",
-  "Separately, three reviewers arrived independently at the same objection to the shared-secret lane, which produced the Ed25519 path. Another found that reachable and verified were being conflated in the roster vocabulary, which produced the published status definitions. Another established that submitted to a timestamp calendar is not the same as anchored, which produced the per-proof status route.",
-  "None of this was found by us. It is recorded here because a system that holds evidence about its own conduct cannot be trusted to mark its own work, and the only meaningful answer is to be marked by somebody else — in public, including when the result is embarrassing."
- ],
- to:["schema","conformance"]
-},
-
-/* ---------- BUSINESS ---------- */
-{
- id:"regulation", c:"business", label:"Regulation", size:1.1,
- lede:"What this evidences, article by article — and what it does not.",
- body:[
-  "The platform maintains a versioned regulation map, itself hash-sealed and served at a public endpoint, linking each capability to the obligations it helps evidence: the EU AI Act's record-keeping, transparency and human-oversight expectations, the UK Online Safety Act's duty-of-care documentation, and the ICO Children's Code. The map is versioned, so when regulations change, the history of what was mapped when is itself tamper-evident.",
-  "On timing: the 2026 AI Omnibus moved the high-risk obligations back. The transparency obligations did not move, and one deadline was shortened. The delay is widely misreported.",
-  "The structural point that matters commercially: obligations arriving later will be assessed against <b>historical</b> records, and evidence cannot be back-filled. Organisations recording now have a defensible history then. Those that wait do not, and cannot acquire one."
- ],
- to:["pricing"]
-},
-{
- id:"sovereign", c:"business", label:"Sovereign deployment", size:1.15,
- lede:"The engine runs inside your own network. One file, no dependencies, no phone home.",
- body:[
-  "For organisations whose data cannot leave the building, the engine runs entirely on your hardware — decisions, chain and database, all local. Pure Python, a single file, no dependencies. It builds the chain locally, keeps daily backups, verifies itself end to end, and serves the routes the witness network needs.",
-  "Licensing is offline by design: signed 365-day tokens validated with pure cryptography, no call home, suitable for air-gapped environments.",
-  "It is the only component that runs somewhere we cannot reach, and that is the point of it. The sovereignty claim is about the engine, not just about where the data sits."
- ],
- to:["pricing","witness"]
-},
-{
- id:"pricing", c:"business", label:"Deployment & pricing", size:1.0,
- lede:"50p per active device per month. The proof layer is free and structurally has to be.",
- body:[
-  "Two ways to run: integrate against the hosted API, or run it sovereign inside your own network. Pricing is deliberately simple — 50p per active device per month, metered on real usage. Partners embedding the platform set their own customer pricing and keep the margin above the platform fee.",
-  "The notaries, Brain, the offline verifier and the witness network are free. Not as a promotion — the network in particular cannot be otherwise. Charging for witnessing would mean only customers witness us, which is exactly the arrangement the network exists to avoid."
- ],
- to:[]
-},
-{
- id:"conformance", c:"business", label:"Conformance", size:1.05,
- lede:"Three claims here have a soft edge. Rather than hide them, they are measured.",
- body:[
-  "Commit-before-reveal proves ordering, but only if the integrator does not show reviewers the verdict first. Witnessing draws strength from breadth, and two platforms witnessing only each other prove very little. A declaration is only as strong as the rules declared — one that constrains nothing passes everything.",
-  "None of these can be closed by the engine alone, and a vendor claiming otherwise would be overstating what software can do. What they can be is <b>measured</b> — and a measured weakness is a different object from an unmeasured one. It can be reported, tracked, compared between deployments, and put in front of an auditor.",
-  "So probes test the integration rather than trusting it, breadth is reported with concentration made visible, and rules that never fire are surfaced. Fewer than three live peers is reported as weak, because it is."
- ],
- to:["limits"]
-},
-{
- id:"limits", c:"business", label:"Honest limits", size:1.2,
- lede:"A whitepaper that only lists strengths is marketing. These are the limits, stated as plainly as the capabilities.",
- body:[
-  "<b>Sealing proves integrity and timing, not truth at capture.</b> A sealed, anchored record proves exact content existed no later than an externally witnessed moment and has not changed since. It does not prove the contents were true when written — and no recording system of any kind does, which is a fact about recording rather than a defect of this one.",
-  "<b>Determinism costs cleverness.</b> The gate has no semantic understanding and will miss things a good classifier would catch. Deliberate and permanent.",
-  "<b>Basis sealing proves what was relied on, not that it was right.</b>",
-  "<b>Anchoring proves timing only to the last confirmed proof</b> — and submitted is not confirmed.",
-  "<b>Witnessing proves a tip existed at a time.</b> It says nothing about whether the records underneath are true, or complete. Garbage sealed on time is still garbage.",
-  "<b>None of this prevents anything.</b> The layer produces evidence that something happened and has not been altered. A sealed record of a harmful action is still a harmful action. What changes is that afterwards there is an answer to what happened and who authorised it — which today, in most systems, there is not."
- ],
- to:[]
-},
-{
- id:"partner", c:"business", label:"The raise", size:1.1,
- lede:"30% of the business for an operating partner who can take this into defence, healthcare and telecoms.",
- body:[
-  "Built and operated by a solo founder at near-zero fixed cost. The platform is live; the constraint is not engineering.",
-  "What is being offered is a substantial equity stake for a partner who can open regulated enterprise and government channels — sectors where evidence obligations are hardest, procurement cycles are long, and a founder alone does not get in the room. Mass rollout through resellers, who set their own pricing and keep the margin above the platform fee.",
-  "The economics suit that shape. Marginal cost per additional device is effectively zero; the same engine serves one customer or ten thousand. Distribution scales without headcount.",
-  "The moat is time. An unbroken witnessed record is the one input nobody can shortcut, because the only way to have had this year covered was to be recording in it.",
-  "Stated plainly: pre-revenue, founder-led pipeline, and a market whose deadlines move. Commercial terms with the peers on the roster have not been discussed — they joined an open network, not a company."
- ],
- routes:[["/whitepaper","the full whitepaper"]],
- to:["pricing","sovereign","limits"]
-}
-];
-
-/* ============================================================
-   GRAPH
-   ============================================================ */
-const byId = {}; N.forEach(n=>byId[n.id]=n);
-const E = [];
-const seen = new Set();
-N.forEach(n => (n.to||[]).forEach(t=>{
-  if(!byId[t]) return;
-  const k = [n.id,t].sort().join("|");
-  if(seen.has(k)) return; seen.add(k);
-  E.push({a:n, b:byId[t]});
-}));
-
-const cv = document.getElementById("c"), ctx = cv.getContext("2d");
-let W=0,H=0,DPR=1;
-let cam={x:0,y:0,z:1}, tgt={x:0,y:0,z:1};
-let active=null, hover=null, filter=null, query="";
-const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
-
-function resize(){
-  DPR = Math.min(devicePixelRatio||1, 2);
-  W = cv.clientWidth; H = cv.clientHeight;
-  cv.width = W*DPR; cv.height = H*DPR;
-  ctx.setTransform(DPR,0,0,DPR,0,0);
-}
-addEventListener("resize", resize);
-
-// seed positions by cluster ring
-const order = Object.keys(CLUSTERS);
-N.forEach((n,i)=>{
-  const ci = order.indexOf(n.c);
-  const ang = (i/N.length)*Math.PI*2 + ci;
-  const r = 150 + ci*95 + (i%4)*22;
-  n.x = Math.cos(ang)*r; n.y = Math.sin(ang)*r*0.82;
-  n.vx = 0; n.vy = 0;
-  n.r = 15*(n.size||1) * (n.core?1.22:1);
-  n.a = 0; // reveal alpha
-});
-
-function physics(){
-  for(let i=0;i<N.length;i++){
-    const a=N[i];
-    for(let j=i+1;j<N.length;j++){
-      const b=N[j];
-      let dx=b.x-a.x, dy=b.y-a.y;
-      let d2=dx*dx+dy*dy; if(d2<1) d2=1;
-      const d=Math.sqrt(d2);
-      const min=(a.r+b.r)*3.1;
-      const f = (d<min ? 2600/d2 : 900/d2);
-      const ux=dx/d, uy=dy/d;
-      a.vx-=ux*f; a.vy-=uy*f; b.vx+=ux*f; b.vy+=uy*f;
-    }
-  }
-  E.forEach(e=>{
-    const dx=e.b.x-e.a.x, dy=e.b.y-e.a.y;
-    const d=Math.hypot(dx,dy)||1;
-    const rest=185;
-    const f=(d-rest)*0.0055;
-    const ux=dx/d, uy=dy/d;
-    e.a.vx+=ux*f; e.a.vy+=uy*f; e.b.vx-=ux*f; e.b.vy-=uy*f;
-  });
-  N.forEach(n=>{
-    n.vx -= n.x*0.0016; n.vy -= n.y*0.0022;
-    n.vx*=0.86; n.vy*=0.86;
-    n.x+=n.vx; n.y+=n.vy;
-  });
-}
-for(let i=0;i<420;i++) physics();
-
-/* ---------- ember field ---------- */
-// drifting dust
-const DUST=[]; for(let i=0;i<260;i++) DUST.push({x:Math.random(),y:Math.random(),s:Math.random()*1.3+.25,p:Math.random()*6.28,v:Math.random()*.00006+.00002});
-// per-node particle cloud — precomputed, cheap to draw
-N.forEach(n=>{
-  const count = Math.round(16 + n.r*1.5);
-  n.pts=[];
-  for(let i=0;i<count;i++){
-    const a=Math.random()*6.283;
-    const rr=Math.pow(Math.random(),.55);
-    n.pts.push({a, rr, s:Math.random()*1.5+.4, ph:Math.random()*6.28, sp:.12+Math.random()*.3});
-  }
-});
-// filament jitter seeds per edge
-E.forEach((e,i)=>{ e.seed=i*13.37; e.bow=(Math.random()-.5)*46; });
-
-function visible(n){
-  if(filter && n.c!==filter) return false;
-  if(query){
-    const hay=(n.label+" "+n.lede+" "+n.body.join(" ")).toLowerCase();
-    if(!hay.includes(query)) return false;
-  }
-  return true;
-}
-
-function filament(e,lit,dim,t){
-  const mx=(e.a.x+e.b.x)/2, my=(e.a.y+e.b.y)/2;
-  const dx=e.b.x-e.a.x, dy=e.b.y-e.a.y, L=Math.hypot(dx,dy)||1;
-  const nx=-dy/L, ny=dx/L;
-  const threads = lit?4:2;
-  for(let k=0;k<threads;k++){
-    const off=(k-(threads-1)/2)*2.4;
-    const bow=e.bow*0.35+off*3;
-    ctx.beginPath();
-    ctx.moveTo(e.a.x,e.a.y);
-    ctx.quadraticCurveTo(mx+nx*bow, my+ny*bow, e.b.x,e.b.y);
-    ctx.strokeStyle = lit ? "#ff9d3c" : "#6b4a2a";
-    ctx.globalAlpha = dim ? 0.04 : (lit ? 0.24 - k*0.04 : 0.13 - k*0.045);
-    ctx.lineWidth = lit ? 1.1 : 0.7;
-    ctx.stroke();
-  }
-  if(lit && !reduced){
-    for(let k=0;k<3;k++){
-      const p=((t*0.28 + k/3)%1);
-      const q=1-p;
-      const x=q*q*e.a.x + 2*q*p*(mx+nx*e.bow*0.35) + p*p*e.b.x;
-      const y=q*q*e.a.y + 2*q*p*(my+ny*e.bow*0.35) + p*p*e.b.y;
-      ctx.globalAlpha=0.85-k*0.22; ctx.fillStyle="#ffd08a";
-      ctx.fillRect(x-1.1,y-1.1,2.2,2.2);
-    }
-  }
-}
-
-let t0=performance.now();
-function draw(now){
-  const t=(now-t0)/1000;
-  cam.x += (tgt.x-cam.x)*0.12;
-  cam.y += (tgt.y-cam.y)*0.12;
-  cam.z += (tgt.z-cam.z)*0.12;
-
-  // ---- background: warm void, low horizon glow ----
-  ctx.globalAlpha=1;
-  ctx.fillStyle="#07050a"; ctx.fillRect(0,0,W,H);
-  const g=ctx.createRadialGradient(W*0.42,H*0.62,0,W*0.42,H*0.62,Math.max(W,H)*0.9);
-  g.addColorStop(0,"#22140e"); g.addColorStop(0.45,"#120b0c"); g.addColorStop(1,"#07050a");
-  ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
-
-  // dust
-  DUST.forEach(d=>{
-    if(!reduced) d.x += d.v; if(d.x>1) d.x-=1;
-    const tw = reduced?0.4:(0.25+0.3*Math.sin(t*0.8+d.p));
-    ctx.globalAlpha=tw*0.5; ctx.fillStyle="#c9a06a";
-    ctx.fillRect(d.x*W, d.y*H, d.s, d.s);
-  });
-
-  // scanline grain
-  ctx.globalAlpha=0.035; ctx.fillStyle="#000";
-  for(let y=0;y<H;y+=3) ctx.fillRect(0,y,W,1);
-  ctx.globalAlpha=1;
-
-  ctx.save();
-  ctx.translate(W/2+cam.x, H/2+cam.y); ctx.scale(cam.z,cam.z);
-
-  const neigh=new Set();
-  if(active) E.forEach(e=>{ if(e.a===active) neigh.add(e.b); if(e.b===active) neigh.add(e.a); });
-
-  // ---- filaments ----
-  E.forEach(e=>{
-    const va=visible(e.a), vb=visible(e.b);
-    const dim=(query||filter)&&!(va&&vb);
-    const lit=active&&(e.a===active||e.b===active);
-    filament(e,lit,dim,t);
-  });
-  ctx.globalAlpha=1;
-
-  // ---- nodes as ember clusters ----
-  N.forEach(n=>{
-    const vis=visible(n);
-    n.a += ((vis?1:0.1)-n.a)*0.15;
-    if(n.a<0.02) return;
-    const col=CLUSTERS[n.c].col;
-    const isA=n===active, isN=neigh.has(n), isH=n===hover;
-    const hot=isA||isH;
-    const r=n.r*(n.core&&!reduced ? 1+0.04*Math.sin(t*1.4+n.x*0.01) : 1);
-
-    // bloom
-    ctx.globalAlpha=n.a*(hot?0.85:(isN?0.5:0.32));
-    const rg=ctx.createRadialGradient(n.x,n.y,0,n.x,n.y,r*(hot?4.2:2.9));
-    rg.addColorStop(0,col+(hot?"88":"55"));
-    rg.addColorStop(0.35,col+"22");
-    rg.addColorStop(1,col+"00");
-    ctx.fillStyle=rg;
-    ctx.beginPath(); ctx.arc(n.x,n.y,r*(hot?4.2:2.9),0,6.29); ctx.fill();
-
-    // particle cloud
-    const spin = reduced?0:t*0.08;
-    ctx.globalAlpha=n.a*(hot?1:(isN?0.8:0.55));
-    ctx.fillStyle=col;
-    for(const q of n.pts){
-      const ang=q.a+spin*q.sp;
-      const rad=r*(0.55+q.rr*1.85)+(reduced?0:Math.sin(t*q.sp*3+q.ph)*1.6);
-      ctx.fillRect(n.x+Math.cos(ang)*rad, n.y+Math.sin(ang)*rad*0.92, q.s, q.s);
-    }
-
-    // hot core
-    ctx.globalAlpha=n.a;
-    ctx.beginPath(); ctx.arc(n.x,n.y,r*0.44,0,6.29);
-    ctx.fillStyle=hot?"#fff6e2":col; ctx.fill();
-    ctx.beginPath(); ctx.arc(n.x,n.y,r*0.44,0,6.29);
-    ctx.strokeStyle=col; ctx.lineWidth=hot?1.6:1; ctx.globalAlpha=n.a*0.9; ctx.stroke();
-
-    // live tick
-    if(n.live){
-      ctx.globalAlpha=n.a;
-      ctx.fillStyle=n._liveOk===false?"#b8624a":(n._liveOk?"#8fe3a8":"#6d6355");
-      ctx.fillRect(n.x+r*0.95, n.y-r*1.05, 3, 3);
-    }
-
-    // label — mono, upper, tracked
-    ctx.globalAlpha=n.a*(hot||isN||cam.z>0.7?1:0.5);
-    ctx.font="600 10px ui-monospace,Menlo,monospace";
-    ctx.textAlign="center"; ctx.textBaseline="top";
-    const lab=n.label.toUpperCase();
-    ctx.fillStyle="#0a0709"; ctx.globalAlpha=n.a*0.55;
-    ctx.fillText(lab, n.x+0.6, n.y+r*2.05+0.6);
-    ctx.globalAlpha=n.a*(hot||isN||cam.z>0.7?1:0.5);
-    ctx.fillStyle=hot?"#fff2dc":"#cbbfa9";
-    ctx.fillText(lab, n.x, n.y+r*2.05);
-  });
-
-  ctx.globalAlpha=1;
-  ctx.restore();
-
-  // vignette
-  const vg=ctx.createRadialGradient(W/2,H/2,Math.min(W,H)*0.42,W/2,H/2,Math.max(W,H)*0.78);
-  vg.addColorStop(0,"rgba(0,0,0,0)"); vg.addColorStop(1,"rgba(0,0,0,.62)");
-  ctx.fillStyle=vg; ctx.fillRect(0,0,W,H);
-
-  requestAnimationFrame(draw);
-}
-
-/* ---------- interaction ---------- */
-function toWorld(px,py){
-  return { x:(px-W/2-cam.x)/cam.z, y:(py-H/2-cam.y)/cam.z };
-}
-function hit(px,py){
-  const p=toWorld(px,py);
-  let best=null,bd=1e9;
-  N.forEach(n=>{
-    if(!visible(n)) return;
-    const d=Math.hypot(n.x-p.x,n.y-p.y);
-    if(d<n.r+13 && d<bd){bd=d;best=n;}
-  });
-  return best;
-}
-let drag=false, moved=0, lx=0, ly=0, pinch=0;
-cv.addEventListener("pointerdown",e=>{
-  drag=true; moved=0; lx=e.clientX; ly=e.clientY; cv.classList.add("drag");
-  cv.setPointerCapture(e.pointerId);
-});
-cv.addEventListener("pointermove",e=>{
-  if(drag){
-    const dx=e.clientX-lx, dy=e.clientY-ly;
-    moved+=Math.abs(dx)+Math.abs(dy);
-    tgt.x+=dx; tgt.y+=dy; cam.x+=dx; cam.y+=dy;
-    lx=e.clientX; ly=e.clientY;
-  } else {
-    const h=hit(e.clientX,e.clientY);
-    hover=h; cv.style.cursor=h?"pointer":"grab";
-  }
-});
-cv.addEventListener("pointerup",e=>{
-  drag=false; cv.classList.remove("drag");
-  if(moved<8){
-    const h=hit(e.clientX,e.clientY);
-    if(h) open(h); else close();
-  }
-});
-cv.addEventListener("wheel",e=>{
-  e.preventDefault();
-  tgt.z = Math.min(2.4, Math.max(0.35, tgt.z * (e.deltaY>0?0.9:1.11)));
-},{passive:false});
-
-// pinch
-let pts=new Map();
-cv.addEventListener("pointerdown",e=>pts.set(e.pointerId,e));
-cv.addEventListener("pointermove",e=>{
-  if(!pts.has(e.pointerId)) return;
-  pts.set(e.pointerId,e);
-  if(pts.size===2){
-    const [a,b]=[...pts.values()];
-    const d=Math.hypot(a.clientX-b.clientX,a.clientY-b.clientY);
-    if(pinch) tgt.z=Math.min(2.4,Math.max(0.35,tgt.z*(d/pinch)));
-    pinch=d; drag=false;
-  }
-});
-["pointerup","pointercancel"].forEach(ev=>cv.addEventListener(ev,e=>{pts.delete(e.pointerId); if(pts.size<2) pinch=0;}));
-
-/* ---------- panel ---------- */
-const panel=document.getElementById("panel");
-function esc(s){return s;}
-function open(n){
-  active=n;
-  document.getElementById("pcluster").textContent=CLUSTERS[n.c].name;
-  document.getElementById("pcluster").style.color=CLUSTERS[n.c].col;
-  document.getElementById("ptitle").textContent=n.label;
-  document.getElementById("plede").textContent=n.lede;
-
-  let h="";
-  if(n.live){
-    const L=LIVE[n.live];
-    h+=`<div class="live"><div class="lbl">live from ${L.url}</div><div class="val pending" id="lv">fetching…</div></div>`;
-  }
-  n.body.forEach(p=>h+=`<p>${p}</p>`);
-  if(n.limit) h+=`<div class="limit"><div class="lbl">honest limit</div><p>${n.limit}</p></div>`;
-  if(n.routes&&n.routes.length){
-    h+=`<h3>Check it yourself</h3><div class="routes">`;
-    n.routes.forEach(([u,t])=>h+=`<a href="${BASE}${u}" target="_blank" rel="noopener">${u}<span>${t}</span></a>`);
-    h+=`</div>`;
-  }
-  const rel=[...new Set([...(n.to||[]), ...E.filter(e=>e.b===n).map(e=>e.a.id)])].filter(x=>byId[x]);
-  if(rel.length){
-    h+=`<h3>Connected</h3><div class="links">`;
-    rel.forEach(id=>h+=`<button data-go="${id}">${byId[id].label}</button>`);
-    h+=`</div>`;
-  }
-  const pb=document.getElementById("pbody");
-  pb.innerHTML=h; pb.scrollTop=0;
-  pb.querySelectorAll("[data-go]").forEach(b=>b.onclick=()=>{ open(byId[b.dataset.go]); centre(byId[b.dataset.go]); });
-  panel.classList.add("open");
-  centre(n);
-  if(n.live) fillLive(n);
-}
-function centre(n){
-  const wide = innerWidth>760;
-  tgt.x = -n.x*tgt.z + (wide? -215 : 0);
-  tgt.y = -n.y*tgt.z + (wide? 0 : -H*0.16);
-}
-function close(){ active=null; panel.classList.remove("open"); }
-document.getElementById("close").onclick=close;
-addEventListener("keydown",e=>{ if(e.key==="Escape") close(); });
-
-/* ---------- live data ---------- */
-const cache={};
-async function fetchLive(key){
-  if(cache[key]) return cache[key];
-  const L=LIVE[key];
-  const p=(async()=>{
-    const r=await fetch(BASE+L.url,{headers:{accept:"application/json"}});
-    if(!r.ok) throw new Error("HTTP "+r.status);
-    return L.render(await r.json());
-  })();
-  cache[key]=p; return p;
-}
-async function fillLive(n){
-  const el=document.getElementById("lv"); if(!el) return;
-  try{
-    const v=await fetchLive(n.live);
-    if(document.getElementById("lv")===el){ el.textContent=v; el.className="val"; }
-    n._liveOk=true;
-  }catch(err){
-    if(document.getElementById("lv")===el){
-      el.textContent="not reachable from here — open the route directly";
-      el.className="val fail";
-    }
-    n._liveOk=false;
-  }
-}
-// warm the routes: colour the node ticks and fill the instrument row
-function hudSet(key,txt,cls){
-  const el=document.querySelector('[data-hud="'+key+'"]');
-  if(el){ el.textContent=txt; el.className="v"+(cls?" "+cls:""); }
-}
-Object.keys(LIVE).forEach(k=>{
-  const L=LIVE[k];
-  fetch(BASE+L.url,{headers:{accept:"application/json"}})
-    .then(r=>{ if(!r.ok) throw 0; return r.json(); })
-    .then(d=>{
-      cache[k]=Promise.resolve(L.render(d));
-      N.forEach(n=>{ if(n.live===k) n._liveOk=true; });
-      if(L.hud) hudSet(k, L.hud(d));
-    })
-    .catch(()=>{
-      N.forEach(n=>{ if(n.live===k) n._liveOk=false; });
-      if(L.hud) hudSet(k,"offline","fail");
-    });
-});
-
-/* ---------- chips & search ---------- */
-const chips=document.getElementById("chips");
-Object.entries(CLUSTERS).forEach(([k,v])=>{
-  const b=document.createElement("button");
-  b.className="chip"; b.textContent=v.name; b.dataset.k=k; b.dataset.on="0";
-  b.onclick=()=>{
-    filter=(filter===k)?null:k;
-    [...chips.children].forEach(c=>{
-      const on=c.dataset.k===filter;
-      c.dataset.on=on?"1":"0";
-      c.style.background = on?CLUSTERS[c.dataset.k].col:"transparent";
-      c.style.color = on?"#0b0709":"";
-    });
-  };
-  chips.appendChild(b);
-});
-document.getElementById("q").addEventListener("input",e=>{ query=e.target.value.trim().toLowerCase(); });
-document.getElementById("reset").onclick=()=>{
-  tgt={x:0,y:0,z: innerWidth<520?0.62:0.92}; close();
-  query=""; document.getElementById("q").value="";
-  filter=null; [...chips.children].forEach(c=>{c.dataset.on="0";c.style.background="transparent";c.style.color="";});
-};
-
-/* ---------- boot ---------- */
-resize();
-tgt.z = innerWidth<520?0.62:0.92; cam.z=tgt.z*0.75;
-requestAnimationFrame(draw);
-setInterval(()=>{ if(!drag) physics(); }, 90);
-
-const toast=document.getElementById("toast");
-function say(m){ toast.textContent=m; toast.classList.add("show"); setTimeout(()=>toast.classList.remove("show"),3400); }
-document.getElementById("hudn").textContent = N.length;
-setTimeout(()=>say("Start anywhere — try THE HASH CHAIN"),900);
-</script>
-</body>
-</html>
-
-```
-
-
-## `notary.html`
-
-186 lines, 12017 bytes
+2768 lines, 200209 bytes
 
 ```html
 <!DOCTYPE html>
@@ -1652,183 +14,2765 @@ setTimeout(()=>say("Start anywhere — try THE HASH CHAIN"),900);
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Sovereign Profile Notary — sebbi.pro</title>
+<meta name="google-site-verification" content="mM_hYELAWL0vrzIvAnKRBlUnN1kM-H656cmjMrFT-3U">
+<title>AILeash &mdash; Every AI decision, sealed.</title>
+<meta name="description" content="AI governance, fraud alerting, child-safety and token-cost tools on one tamper-evident engine. Built to support EU AI Act Articles 9, 12, 13 and 14, the Online Safety Act, the ICO Children's Code and the DSA. Free for 90 days, then 50p per device per month.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,900;1,9..144,600;1,9..144,900&family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;600&display=swap" rel="stylesheet">
 <style>
-  :root{--ink:#0a0f1e;--ink2:#10182e;--input:#131e36;--gold:#c9a84c;--ok:#7fe3b0;--err:#ff8a80;--muted:#94a3b8;}
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{background:var(--ink);color:#f8fafc;font-family:system-ui,sans-serif;min-height:100vh;padding:26px 16px}
-  .container{max-width:1100px;margin:0 auto;display:grid;grid-template-columns:1fr 1fr;gap:28px}
-  @media(max-width:850px){.container{grid-template-columns:1fr}}
-  header{grid-column:1/-1;border-bottom:1px solid rgba(201,168,76,0.2);padding-bottom:16px}
-  .brand{font-family:monospace;font-size:10px;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,0.35)}
-  h1{font-family:Georgia,serif;font-size:28px;color:var(--gold);margin:8px 0 6px}
-  .tagline{color:var(--muted);font-size:13.5px;line-height:1.6;max-width:640px}
-  .panel{background:var(--ink2);border:1px solid rgba(201,168,76,0.25);border-radius:12px;padding:24px;display:flex;flex-direction:column;gap:14px}
-  h2{font-size:12px;font-family:monospace;text-transform:uppercase;letter-spacing:2px;color:var(--gold);border-bottom:1px dashed rgba(201,168,76,0.2);padding-bottom:8px}
-  label{display:block;font-size:10px;font-family:monospace;text-transform:uppercase;letter-spacing:2px;color:var(--muted);margin-bottom:5px}
-  input,textarea{width:100%;background:var(--input);border:1px solid rgba(201,168,76,0.3);color:#fff;border-radius:8px;padding:12px;font-size:14px;outline:none}
-  input:focus,textarea:focus{border-color:var(--gold);box-shadow:0 0 8px rgba(201,168,76,0.2)}
-  textarea{min-height:70px;resize:vertical;line-height:1.5}
-  .chk{display:flex;gap:10px;align-items:flex-start;font-size:12px;color:var(--muted);line-height:1.6}
-  .chk input{width:auto;margin-top:2px}
-  button{width:100%;background:var(--gold);color:var(--ink);border:none;border-radius:8px;padding:15px;font-size:14px;font-weight:800;cursor:pointer;text-transform:uppercase;letter-spacing:1px}
-  button:disabled{opacity:0.5}
-  /* preview card */
-  .preview{background:linear-gradient(135deg,#101c36 0%,#060b17 100%);border:2px solid var(--gold);border-radius:14px;padding:24px}
-  .p-name{font-size:22px;font-weight:800;color:#fff;font-family:Georgia,serif}
-  .p-title{font-size:13px;color:var(--gold);font-family:monospace;margin:2px 0 12px}
-  .p-bio{font-size:13.5px;line-height:1.6;color:#cbd5e1;margin-bottom:12px;min-height:20px}
-  .p-links{font-family:monospace;font-size:11px;color:var(--muted);word-break:break-all;line-height:1.9}
-  .p-hash{margin-top:14px;padding:12px;background:rgba(0,0,0,0.4);border-radius:8px;font-family:monospace;font-size:10.5px;color:var(--ok);word-break:break-all;line-height:1.7}
-  #sealres{display:none;margin-top:6px;padding:14px;border-radius:8px;background:rgba(127,227,176,0.08);border:1px solid rgba(127,227,176,0.4);font-family:monospace;font-size:11.5px;line-height:1.9;word-break:break-all}
-  #sealres b{color:var(--ok)}
-  #sealres .code{font-size:16px;color:var(--gold);font-weight:700}
-  /* checker */
-  #checkres{display:none;margin-top:6px;padding:16px;border-radius:10px;font-size:13px;line-height:1.8}
-  #checkres.good{display:block;background:rgba(127,227,176,0.08);border:2px solid var(--ok)}
-  #checkres.bad{display:block;background:rgba(255,138,128,0.08);border:2px solid var(--err)}
-  #checkres .big{font-weight:900;font-size:16px;margin-bottom:6px}
-  #checkres.good .big{color:var(--ok)}
-  #checkres.bad .big{color:var(--err)}
-  #checkres .mono{font-family:monospace;font-size:11px;color:var(--muted);word-break:break-all;line-height:1.9}
-  #trap{display:none;margin-top:12px;padding:16px;border-radius:10px;background:rgba(201,168,76,0.1);border:2px solid var(--gold);cursor:pointer}
-  #trap .t1{font-weight:900;font-size:14px;color:var(--gold);margin-bottom:6px}
-  #trap .t2{font-size:12.5px;color:#cbd5e1;line-height:1.7}
-  .note{font-size:11px;color:rgba(255,255,255,0.35);line-height:1.7}
-  a{color:var(--gold)}
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+--ink:#0a0f1e;          /* deep navy - the vault */
+--ink2:#10182e;
+--paper:#f6f3ec;        /* ledger paper */
+--line:#e3ddcf;         /* ledger rule */
+--gold:#c9a84c;         /* the seal */
+--allow:#1a9e6e;        /* decision colours - used ONLY for decisions */
+--challenge:#c07a1d;
+--block:#c8362b;
+--mutei:rgba(255,255,255,0.45);
+--mutep:#6b6353;
+--disp:'Fraunces',Georgia,serif;
+--body:'Space Grotesk',system-ui,sans-serif;
+--mono:'IBM Plex Mono',monospace;
+}
+html{scroll-behavior:smooth}
+body{background:var(--paper);color:var(--ink);font-family:var(--body);overflow-x:hidden}
+::selection{background:var(--gold);color:var(--ink)}
+
+/* ---------- nav ---------- */
+nav{position:fixed;top:0;left:0;right:0;z-index:200;background:var(--ink);height:64px;display:flex;align-items:center;justify-content:space-between;padding:0 28px;border-bottom:1px solid rgba(201,168,76,0.25)}
+.logo{font-family:var(--disp);font-weight:900;font-size:20px;color:#fff;letter-spacing:-0.02em}
+.logo b{color:var(--gold);font-weight:900}
+.nvl{display:flex;gap:20px;align-items:center}
+.nvl a{color:var(--mutei);text-decoration:none;font-size:13px;font-weight:500;transition:color .2s}
+.nvl a:hover{color:#fff}
+.nvl a:focus-visible,.bgold:focus-visible,.bghost:focus-visible,.pbtn:focus-visible,.gobtn:focus-visible,.tab:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--gold);outline-offset:2px}
+.ncta{background:var(--gold);color:var(--ink)!important;padding:9px 16px;border-radius:3px;font-weight:700!important}
+
+/* ---------- the visit ledger rail (signature) ---------- */
+#rail{position:fixed;left:0;top:64px;bottom:0;width:210px;background:var(--ink);z-index:150;padding:22px 16px;border-right:1px solid rgba(201,168,76,0.2);display:flex;flex-direction:column;overflow:hidden}
+.rail-t{font-family:var(--mono);font-size:9px;letter-spacing:2.5px;text-transform:uppercase;color:var(--gold);margin-bottom:4px}
+.rail-s{font-family:var(--mono);font-size:8.5px;color:var(--mutei);line-height:1.6;margin-bottom:14px}
+#chain{flex:1;overflow:hidden;position:relative}
+#chain::before{content:'';position:absolute;left:7px;top:0;bottom:0;width:1px;background:rgba(201,168,76,0.25)}
+.blk{position:relative;padding:0 0 14px 22px;opacity:0;transform:translateY(6px);transition:opacity .5s,transform .5s}
+.blk.on{opacity:1;transform:none}
+.blk::before{content:'';position:absolute;left:3px;top:3px;width:9px;height:9px;border-radius:50%;background:var(--ink);border:2px solid var(--gold)}
+.blk.on::before{background:var(--gold)}
+.blk-n{font-family:var(--mono);font-size:9px;color:#fff;font-weight:600}
+.blk-h{font-family:var(--mono);font-size:8.5px;color:var(--gold);word-break:break-all;line-height:1.5}
+.rail-foot{font-family:var(--mono);font-size:8.5px;color:var(--mutei);line-height:1.6;padding-top:10px;border-top:1px solid rgba(255,255,255,0.08)}
+.rail-foot b{color:#7fe3b0;font-weight:600}
+
+/* mobile: rail collapses to a live chip */
+#chip{display:none;position:fixed;bottom:14px;left:14px;right:14px;z-index:150;background:var(--ink);border:1px solid rgba(201,168,76,0.4);border-radius:6px;padding:9px 13px;font-family:var(--mono);font-size:9.5px;color:var(--gold);box-shadow:0 6px 24px rgba(10,15,30,0.35)}
+#chip .ch{color:#7fe3b0;word-break:break-all}
+
+/* ---------- page shell ---------- */
+main{margin-left:210px;padding-top:64px}
+section{position:relative;border-bottom:1px solid var(--line)}
+.wrap{max-width:1040px;margin:0 auto;padding:84px 48px}
+
+/* ledger entry header on every section */
+.entry{display:flex;align-items:baseline;gap:14px;margin-bottom:8px;font-family:var(--mono);font-size:10px;letter-spacing:2px;text-transform:uppercase}
+.entry .no{color:var(--ink);font-weight:600}
+.entry .rule{flex:1;height:1px;background:var(--line);align-self:center}
+.entry .sealed{color:var(--mutep);letter-spacing:0;text-transform:none;font-size:9.5px}
+.entry .sealed b{color:var(--gold);font-weight:600}
+
+h1{font-family:var(--disp);font-weight:900;font-size:clamp(44px,5.4vw,76px);line-height:0.98;letter-spacing:-0.025em}
+h1 i{font-style:italic;color:var(--gold)}
+h2{font-family:var(--disp);font-weight:900;font-size:clamp(30px,3.4vw,46px);line-height:1.02;letter-spacing:-0.02em;margin-bottom:14px}
+h2 i{font-style:italic;color:var(--gold)}
+.lead{font-size:16px;line-height:1.75;color:var(--mutep);max-width:640px}
+.lead b{color:var(--ink);font-weight:700}
+
+/* ---------- hero (dark) ---------- */
+#hero{background:var(--ink);color:#fff;border-bottom:none}
+#hero .wrap{padding:96px 48px 72px}
+#hero .lead{color:var(--mutei)}
+#hero .lead b{color:#fff}
+.deadline{display:inline-flex;gap:10px;align-items:center;flex-wrap:wrap;font-family:var(--mono);font-size:10px;letter-spacing:1.5px;text-transform:uppercase;color:#ffb4ad;border:1px solid rgba(200,54,43,0.5);padding:7px 13px;border-radius:3px;margin-bottom:28px}
+.deadline b{color:#fff}
+.hseal{margin-top:22px;font-family:var(--mono);font-size:11px;color:var(--gold);min-height:18px}
+.hseal .hh{color:#7fe3b0;word-break:break-all}
+.hbtns{display:flex;gap:12px;flex-wrap:wrap;margin-top:34px}
+.bgold{background:var(--gold);color:var(--ink);padding:15px 26px;border:none;border-radius:3px;font-family:var(--body);font-weight:700;font-size:14px;text-decoration:none;display:inline-block;transition:transform .15s,background .15s;cursor:pointer}
+.bgold:hover{background:#dbbd63;transform:translateY(-2px)}
+.bghost{background:transparent;color:var(--mutei);padding:15px 26px;border:1px solid rgba(255,255,255,0.2);border-radius:3px;font-weight:600;font-size:14px;text-decoration:none;display:inline-block;transition:all .15s}
+.bghost:hover{color:#fff;border-color:rgba(255,255,255,0.55)}
+
+/* live decision strip */
+.ticker{background:var(--ink2);border-top:1px solid rgba(201,168,76,0.2);overflow:hidden;padding:11px 0;white-space:nowrap}
+.tk{display:inline-block;animation:tk 38s linear infinite;font-family:var(--mono);font-size:10.5px}
+.tk span{margin:0 26px;color:var(--mutei)}
+.tk .A{color:var(--allow)}.tk .C{color:var(--challenge)}.tk .B{color:var(--block)}
+@keyframes tk{from{transform:translateX(0)}to{transform:translateX(-50%)}}
+
+/* ---------- how ---------- */
+.steps{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--line);border:1px solid var(--line);margin-top:40px}
+.st{background:var(--paper);padding:30px 26px}
+.st .k{font-family:var(--mono);font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--gold);font-weight:600;margin-bottom:12px}
+.st h3{font-family:var(--disp);font-weight:900;font-size:21px;margin-bottom:10px;letter-spacing:-0.01em}
+.st p{font-size:13.5px;color:var(--mutep);line-height:1.7}
+.st p b{color:var(--ink)}
+
+/* ---------- products (ledger rows, not cards) ---------- */
+.prod{display:grid;grid-template-columns:200px 1fr 200px;gap:36px;padding:38px 0;border-top:1px solid var(--line);align-items:start}
+.prod:first-of-type{border-top:none}
+.pn{font-family:var(--disp);font-weight:900;font-size:26px;letter-spacing:-0.015em;line-height:1.05}
+.pn small{display:block;font-family:var(--mono);font-weight:400;font-size:9.5px;letter-spacing:2px;text-transform:uppercase;color:var(--mutep);margin-top:8px}
+.pd{font-size:14px;line-height:1.75;color:var(--mutep)}
+.pd b{color:var(--ink)}
+.pf{margin-top:14px;font-family:var(--mono);font-size:11px;line-height:2.1;color:var(--ink)}
+.pf em{font-style:normal;color:var(--gold);margin-right:8px}
+.pp{text-align:right}
+.pp .amt{font-family:var(--disp);font-weight:900;font-size:40px;line-height:1}
+.pp .per{font-family:var(--mono);font-size:9px;letter-spacing:1px;text-transform:uppercase;color:var(--mutep);margin:6px 0 16px}
+.pbtn{display:inline-block;background:var(--ink);color:#fff;padding:11px 18px;border-radius:3px;font-size:13px;font-weight:700;text-decoration:none;transition:background .15s}
+.pbtn:hover{background:#232c47}
+.pbtn.free{background:var(--allow)}
+.guardian-note{font-family:var(--mono);font-size:9.5px;color:var(--allow);margin-top:8px}
+
+/* ---------- signal packs ---------- */
+#packs{background:#fbf9f4}
+.corepack{margin-top:36px;border:1px solid var(--line);border-left:3px solid var(--ink);background:#fff;padding:26px 28px}
+.corepack .k{font-family:var(--mono);font-size:9px;letter-spacing:2px;text-transform:uppercase;color:var(--mutep);margin-bottom:12px}
+.sigs{display:flex;flex-wrap:wrap;gap:8px}
+.sig{font-family:var(--mono);font-size:10.5px;border:1px solid var(--line);background:var(--paper);padding:6px 11px;border-radius:3px;color:var(--ink)}
+.packrow{display:grid;grid-template-columns:220px 1fr;gap:32px;padding:30px 0;border-top:1px solid var(--line);align-items:start}
+.packn{font-family:var(--disp);font-weight:900;font-size:22px;line-height:1.1;letter-spacing:-0.015em}
+.packn small{display:block;font-family:var(--mono);font-weight:400;font-size:9px;letter-spacing:2px;text-transform:uppercase;color:var(--mutep);margin-top:7px}
+.packd{font-size:14px;line-height:1.75;color:var(--mutep)}
+.packd b{color:var(--ink)}
+.packsig{margin-top:12px;display:flex;flex-wrap:wrap;gap:7px}
+.packsig span{font-family:var(--mono);font-size:10px;color:var(--mutep);border:1px dashed var(--line);padding:4px 9px;border-radius:3px}
+.sealnote{margin-top:34px;border:1px dashed var(--gold);border-radius:5px;background:rgba(201,168,76,0.07);padding:22px 24px}
+.sealnote h3{font-family:var(--disp);font-weight:900;font-size:21px;margin-bottom:10px}
+.sealnote p{font-size:14px;line-height:1.75;color:var(--mutep)}
+.sealnote p b{color:var(--ink)}
+.sealnote .ex{font-family:var(--mono);font-size:11px;line-height:2;color:var(--ink);margin-top:14px;background:#fff;border:1px solid var(--line);border-radius:4px;padding:14px}
+.sealnote .ex em{font-style:normal;color:var(--gold);margin-right:8px}
+
+/* ---------- calculator (dark) ---------- */
+#margin{background:var(--ink);color:#fff}
+#margin .entry .no{color:#fff}
+#margin .entry .rule{background:rgba(255,255,255,0.12)}
+#margin .lead{color:var(--mutei)}
+.cwrap{margin-top:36px;border:1px solid rgba(201,168,76,0.3);border-radius:6px;padding:34px;background:var(--ink2)}
+.crow{display:grid;grid-template-columns:1fr 1fr;gap:24px;margin-bottom:26px}
+.clab{font-family:var(--mono);font-size:9.5px;letter-spacing:2px;text-transform:uppercase;color:var(--mutei);margin-bottom:10px}
+.cin{display:flex;align-items:center;gap:10px}
+.cin .pd2{font-family:var(--disp);font-size:26px;color:var(--gold);font-weight:900}
+input.ci,select.ci{background:rgba(255,255,255,0.07);border:1px solid rgba(201,168,76,0.35);color:#fff;font-family:var(--mono);font-size:17px;padding:12px 15px;border-radius:4px;outline:none;width:100%}
+input.ci:focus,select.ci:focus{border-color:var(--gold)}
+select.ci option{background:var(--ink)}
+.cres{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:rgba(255,255,255,0.08);border-radius:4px;overflow:hidden}
+.cr2{background:rgba(255,255,255,0.03);padding:22px;text-align:center}
+.cr2 .l{font-family:var(--mono);font-size:9px;letter-spacing:2px;text-transform:uppercase;color:var(--mutei);margin-bottom:10px}
+.cr2 .v{font-family:var(--disp);font-weight:900;font-size:30px}
+.v-you{color:#7fe3b0}.v-user{color:var(--gold)}.v-we{color:rgba(255,255,255,0.35)}
+.cr2 .s{font-family:var(--mono);font-size:8.5px;color:var(--mutei);margin-top:6px}
+
+/* ---------- referral ---------- */
+.refrow{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--line);border:1px solid var(--line);margin-top:36px}
+.rf{background:var(--paper);padding:28px 24px}
+.rf h3{font-family:var(--disp);font-weight:900;font-size:19px;margin-bottom:8px}
+.rf p{font-size:13px;color:var(--mutep);line-height:1.7}
+.rf .big{font-family:var(--disp);font-weight:900;font-size:34px;color:var(--gold);margin-top:12px}
+.rf .bl{font-family:var(--mono);font-size:8.5px;letter-spacing:1.5px;text-transform:uppercase;color:var(--mutep)}
+
+/* ---------- law ---------- */
+.laws{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:36px}
+.law{border:1px solid var(--line);border-left:3px solid var(--ink);padding:24px;background:#fbf9f4}
+.law .act{font-family:var(--mono);font-size:9px;letter-spacing:2px;text-transform:uppercase;color:var(--mutep);margin-bottom:10px}
+.law .plain{font-family:var(--disp);font-weight:600;font-style:italic;font-size:17px;line-height:1.45;margin-bottom:10px}
+.law p{font-size:13px;color:var(--mutep);line-height:1.7}
+.law ul{list-style:none;margin-top:12px}
+.law li{font-family:var(--mono);font-size:11px;line-height:2;color:var(--ink)}
+.law li::before{content:'\2713\00a0\00a0';color:var(--allow);font-weight:700}
+.timeline{margin-top:30px;border:1px solid var(--line);background:#fff}
+.tlrow{display:grid;grid-template-columns:170px 1fr;gap:0;border-top:1px solid var(--line)}
+.tlrow:first-child{border-top:none;background:var(--ink)}
+.tlrow:first-child .tld,.tlrow:first-child .tlw{color:#fff;font-family:var(--mono);font-size:9px;letter-spacing:2px;text-transform:uppercase}
+.tld{padding:14px 18px;font-family:var(--mono);font-size:11.5px;font-weight:600;color:var(--ink);border-right:1px solid var(--line)}
+.tlw{padding:14px 18px;font-size:13.5px;line-height:1.7;color:var(--mutep)}
+.tlw b{color:var(--ink)}
+.tlrow.now .tld{color:var(--block)}
+@media(max-width:760px){
+.tlrow{grid-template-columns:1fr}
+.tld{border-right:none;padding-bottom:0}
+}
+
+/* ---------- coverage map ---------- */
+#coverage{background:var(--paper)}
+.covrow{display:grid;grid-template-columns:230px 1fr 1fr;gap:0;border:1px solid var(--line);border-top:none;align-items:stretch;background:#fff}
+.covrow.head{border-top:1px solid var(--line);background:var(--ink)}
+.covrow.head .cc{color:#fff;font-family:var(--mono);font-size:9px;letter-spacing:2px;text-transform:uppercase;padding:12px 18px}
+.covrow.head .cc b{color:var(--gold)}
+.cc{padding:18px;border-left:1px solid var(--line);font-size:13px;line-height:1.7}
+.cc:first-child{border-left:none}
+.cov-art{font-family:var(--mono);font-size:11px;font-weight:600;color:var(--ink);line-height:1.6}
+.cov-art small{display:block;font-weight:400;font-size:9.5px;letter-spacing:1px;text-transform:uppercase;color:var(--mutep);margin-top:4px}
+.cov-req{color:var(--mutep)}
+.cov-req b{color:var(--ink)}
+.cov-how{font-family:var(--mono);font-size:11px;color:var(--ink);line-height:1.9}
+.cov-how em{font-style:normal;color:var(--allow);margin-right:7px;font-weight:600}
+.cov-note{margin-top:22px;border:1px dashed var(--gold);border-radius:5px;background:rgba(201,168,76,0.06);padding:16px 20px;font-family:var(--mono);font-size:11px;line-height:1.9;color:var(--mutep)}
+.cov-note b{color:var(--ink)}
+@media(max-width:900px){
+.covrow{grid-template-columns:1fr}
+.cc{border-left:none;border-top:1px solid var(--line)}
+.covrow.head{display:none}
+}
+
+/* ---------- the outside clock: anchoring ---------- */
+#anchor{background:var(--ink2);color:#fff}
+#anchor .entry .no{color:#fff}
+#anchor .entry .rule{background:rgba(255,255,255,0.12)}
+#anchor .entry .sealed{color:rgba(255,255,255,0.4)}
+#anchor .lead{color:var(--mutei)}
+#anchor .lead b{color:#fff}
+.anchorgrid{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:rgba(255,255,255,0.1);border:1px solid rgba(255,255,255,0.1);margin-top:38px}
+.ag{background:var(--ink2);padding:28px 26px}
+.ag .k{font-family:var(--mono);font-size:9px;letter-spacing:2px;text-transform:uppercase;color:var(--gold);margin-bottom:12px}
+.ag h3{font-family:var(--disp);font-weight:900;font-size:20px;margin-bottom:10px;color:#fff;letter-spacing:-0.01em}
+.ag p{font-size:13.5px;line-height:1.75;color:var(--mutei)}
+.ag p b{color:#fff}
+.anchorline{margin-top:38px;border:1px solid rgba(201,168,76,0.3);border-radius:6px;background:rgba(0,0,0,0.25);padding:24px 26px;font-family:var(--mono);font-size:11.5px;line-height:2.1;color:var(--mutei);word-break:break-all}
+.anchorline em{font-style:normal;color:var(--gold);margin-right:10px}
+.anchorline .g{color:#7fe3b0}
+.anchorstraight{margin-top:26px;border-left:3px solid var(--gold);padding:6px 0 6px 20px;font-size:14px;line-height:1.75;color:var(--mutei);max-width:680px}
+.anchorstraight b{color:#fff}
+
+/* ---------- code block (SDK section) ---------- */
+.codeblk{margin-top:26px;background:var(--ink);border-radius:6px;padding:22px 24px;font-family:var(--mono);font-size:12.5px;line-height:1.9;color:#e7e2d4;overflow-x:auto}
+.codeblk .c{color:var(--mutei)}
+.codeblk .g{color:var(--gold)}
+.codeblk .k{color:#7fe3b0}
+.codeblk b{color:#fff;font-weight:600}
+.oneline{font-family:var(--mono);font-size:clamp(14px,2.3vw,21px);color:var(--gold);background:var(--ink);border-radius:6px;padding:20px 24px;margin-top:26px;overflow-x:auto;white-space:nowrap}
+
+/* ---------- dark section variant used by Sebdog ---------- */
+#onprem{background:var(--ink);color:#fff}
+#onprem .entry .no{color:#fff}
+#onprem .entry .rule{background:rgba(255,255,255,0.12)}
+#onprem .entry .sealed{color:rgba(255,255,255,0.4)}
+#onprem .lead{color:var(--mutei)}
+#onprem .lead b{color:#fff}
+#onprem .anchorgrid{background:rgba(255,255,255,0.1);border-color:rgba(255,255,255,0.1)}
+#onprem .ag{background:var(--ink)}
+
+/* ---------- lane table (three ways to submit) ---------- */
+.lanes{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--line);border:1px solid var(--line);margin-top:34px}
+.lane{background:var(--paper);padding:26px 24px}
+.lane .k{font-family:var(--mono);font-size:9px;letter-spacing:2px;text-transform:uppercase;color:var(--gold);font-weight:600;margin-bottom:10px}
+.lane h3{font-family:var(--disp);font-weight:900;font-size:19px;margin-bottom:10px;letter-spacing:-0.01em}
+.lane p{font-size:13px;color:var(--mutep);line-height:1.7}
+.lane p b{color:var(--ink)}
+.lane .no{display:block;margin-top:10px;font-family:var(--mono);font-size:11px;line-height:1.8;color:var(--block)}
+.lane .yes{display:block;margin-top:8px;font-family:var(--mono);font-size:11px;line-height:1.8;color:var(--allow)}
+@media(max-width:900px){.lanes{grid-template-columns:1fr}}
+
+/* ---------- evidence pack ---------- */
+#evidence{background:var(--ink2);color:#fff}
+#evidence .entry .no{color:#fff}
+#evidence .entry .rule{background:rgba(255,255,255,0.12)}
+#evidence .entry .sealed{color:rgba(255,255,255,0.4)}
+#evidence .lead{color:var(--mutei)}
+#evidence .lead b{color:#fff}
+#evidence h2{color:#fff}
+.packrow{display:grid;grid-template-columns:170px 1fr;gap:26px;padding:22px 0;border-top:1px solid rgba(255,255,255,0.1);align-items:start}
+.packrow:first-of-type{border-top:none}
+.packrow .t{font-family:var(--mono);font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--gold);padding-top:3px}
+.packrow .b{font-size:14px;line-height:1.75;color:var(--mutei)}
+.packrow .b b{color:#fff}
+@media(max-width:760px){.packrow{grid-template-columns:1fr;gap:8px}}
+
+/* ---------- install ---------- */
+.inst{counter-reset:s;margin-top:34px}
+.instep{position:relative;padding:0 0 26px 54px;border-left:1px solid var(--line);margin-left:15px}
+.instep:last-child{border-left-color:transparent;padding-bottom:0}
+.instep::before{counter-increment:s;content:counter(s);position:absolute;left:-15px;top:-2px;width:30px;height:30px;border-radius:50%;background:var(--ink);color:var(--gold);font-family:var(--mono);font-size:13px;font-weight:600;display:flex;align-items:center;justify-content:center}
+.instep h3{font-family:var(--disp);font-weight:900;font-size:21px;margin-bottom:8px;letter-spacing:-0.01em}
+.instep p{font-size:14px;line-height:1.75;color:var(--mutep);max-width:620px}
+.instep p b{color:var(--ink)}
+.instep .cmd{margin-top:12px;background:var(--ink);border-radius:5px;padding:14px 18px;font-family:var(--mono);font-size:12.5px;line-height:1.9;color:#e7e2d4;overflow-x:auto}
+.instep .cmd .g{color:var(--gold)}
+.instep .cmd .c{color:rgba(255,255,255,0.35)}
+.instep .cmd .k{color:#7fe3b0}
+@media(max-width:760px){.anchorgrid{grid-template-columns:1fr}}
+
+/* ---------- verify moment ---------- */
+#verify{background:var(--ink);color:#fff;text-align:center}
+#verify .wrap{padding:76px 48px}
+#verify .lead{margin:0 auto;color:var(--mutei)}
+#vbtn{margin-top:30px}
+#vout{margin-top:26px;font-family:var(--mono);font-size:11px;line-height:2;color:var(--mutei);min-height:24px;max-width:620px;margin-left:auto;margin-right:auto;text-align:left;word-break:break-all}
+#vout .ok{color:#7fe3b0}#vout .h{color:var(--gold)}
+
+/* ---------- signup ---------- */
+#signup .wrap{max-width:640px}
+.tabs{display:grid;grid-template-columns:repeat(4,1fr);border:1px solid var(--ink);border-radius:4px;overflow:hidden;margin:28px 0 22px}
+.tab{padding:11px 4px;font-family:var(--mono);font-size:9.5px;letter-spacing:1.5px;text-transform:uppercase;font-weight:600;background:var(--paper);color:var(--mutep);border:none;cursor:pointer;transition:all .15s}
+.tab.on{background:var(--ink);color:var(--gold)}
+.fr{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.f{margin-bottom:14px}
+.f label{display:block;font-family:var(--mono);font-size:9.5px;letter-spacing:2px;text-transform:uppercase;color:var(--mutep);margin-bottom:7px}
+.f input,.f select{width:100%;background:#fff;border:1px solid var(--line);color:var(--ink);padding:13px 14px;font-size:14px;font-family:var(--body);border-radius:4px;outline:none;transition:border-color .15s}
+.f input:focus,.f select:focus{border-color:var(--ink)}
+.refin{width:100%;background:#fff;border:1px dashed var(--gold);border-radius:4px;padding:13px 14px;font-family:var(--mono);font-size:13px;color:var(--ink);outline:none;margin-bottom:14px}
+.gobtn{width:100%;background:var(--gold);color:var(--ink);border:none;border-radius:4px;padding:16px;font-family:var(--body);font-size:15px;font-weight:700;cursor:pointer;transition:background .15s}
+.gobtn:hover{background:#dbbd63}
+.gobtn:disabled{opacity:0.6;cursor:default}
+.merr,.mok{display:none;margin-top:12px;font-family:var(--mono);font-size:11px;padding:11px 13px;border-radius:4px}
+.merr{color:var(--block);background:#fdeeec;border:1px solid #f3cbc6}
+.mok{color:var(--allow);background:#e9f7f0;border:1px solid #bfe6d4}
+.merr.show,.mok.show{display:block}
+.keybox{display:none;margin-top:20px;background:var(--ink);border-radius:6px;padding:24px}
+.keybox.show{display:block}
+.kl{font-family:var(--mono);font-size:9px;letter-spacing:2px;text-transform:uppercase;color:var(--gold);margin-bottom:8px}
+.kv{font-family:var(--mono);font-size:11.5px;color:#7fe3b0;word-break:break-all;background:rgba(0,0,0,0.35);padding:12px;border-radius:4px}
+.refbox{margin-top:14px;border:1px dashed rgba(201,168,76,0.5);border-radius:4px;padding:14px}
+.refbox .c{font-family:var(--mono);font-size:18px;color:var(--gold);font-weight:600}
+.refbox p{font-size:12px;color:var(--mutei);margin-top:6px;line-height:1.6}
+.usage{margin-top:14px;font-family:var(--mono);font-size:10.5px;line-height:2;color:rgba(255,255,255,0.35);background:rgba(0,0,0,0.25);padding:12px;border-radius:4px}
+.usage em{font-style:normal;color:#8fbcff}
+
+/* ---------- footer ---------- */
+footer{background:var(--ink);color:var(--mutei);padding:52px 48px 40px;margin-left:0}
+.fin{max-width:1040px;margin:0 auto;display:grid;grid-template-columns:2fr 1fr 1fr 1fr;gap:40px}
+.fin h4{font-family:var(--mono);font-size:9px;letter-spacing:2px;text-transform:uppercase;color:var(--gold);margin-bottom:12px}
+.fin a{display:block;color:var(--mutei);text-decoration:none;font-size:12.5px;margin-bottom:7px;transition:color .15s}
+.fin a:hover{color:#fff}
+.fdesc{font-size:12.5px;line-height:1.8}
+.fbot{max-width:1040px;margin:32px auto 0;padding-top:18px;border-top:1px solid rgba(255,255,255,0.08);display:flex;justify-content:space-between;gap:12px;font-family:var(--mono);font-size:9.5px;color:rgba(255,255,255,0.25)}
+
+@media(prefers-reduced-motion:reduce){
+.tk{animation:none}
+.blk{transition:none}
+html{scroll-behavior:auto}
+.rise{animation:none!important;opacity:1!important;transform:none!important}
+}
+
+/* ---------- the patrol: robot walks its robot dog on a leash ---------- */
+#patrol-strip{position:relative;height:118px;overflow:hidden;border-top:1px solid rgba(201,168,76,0.15)}
+#patrol-strip::after{content:'';position:absolute;left:0;right:0;bottom:26px;height:1px;background:linear-gradient(90deg,transparent,rgba(201,168,76,0.35) 12%,rgba(201,168,76,0.35) 88%,transparent)}
+.patrol{position:absolute;bottom:24px;left:0;animation:patrolmove 34s linear infinite}
+.patrol-flip{animation:patrolflip 34s steps(1) infinite;transform-origin:center}
+@keyframes patrolmove{0%{transform:translateX(-170px)}50%{transform:translateX(100vw)}100%{transform:translateX(-170px)}}
+@keyframes patrolflip{0%{transform:scaleX(1)}50%{transform:scaleX(-1)}100%{transform:scaleX(1)}}
+.leg{transform-origin:top center;animation:step .62s ease-in-out infinite alternate}
+.leg.b{animation-delay:.31s}
+@keyframes step{from{transform:rotate(14deg)}to{transform:rotate(-14deg)}}
+.dogleg{transform-origin:top center;animation:step .38s ease-in-out infinite alternate}
+.dogleg.b{animation-delay:.19s}
+.tailwag{transform-origin:bottom left;animation:wag .5s ease-in-out infinite alternate}
+@keyframes wag{from{transform:rotate(-12deg)}to{transform:rotate(16deg)}}
+.bob{animation:bob .62s ease-in-out infinite alternate}
+@keyframes bob{from{transform:translateY(0)}to{transform:translateY(-1.6px)}}
+.blinky{animation:blink 3.4s steps(1) infinite}
+@keyframes blink{0%,92%{opacity:1}93%,97%{opacity:0.15}98%{opacity:1}}
+.patrol-cap{position:absolute;bottom:6px;width:100%;text-align:center;font-family:var(--mono);font-size:9px;letter-spacing:2.5px;text-transform:uppercase;color:rgba(255,255,255,0.3)}
+@media(prefers-reduced-motion:reduce){
+.patrol{animation:none;left:50%;transform:translateX(-50%)}
+.patrol-flip,.leg,.dogleg,.tailwag,.bob,.blinky{animation:none}
+}
+
+/* ---------- visitor seal stamp ---------- */
+.vstamp{display:inline-flex;align-items:center;gap:12px;margin-top:20px;border:1px dashed rgba(201,168,76,0.5);border-radius:5px;padding:11px 16px;background:rgba(201,168,76,0.06)}
+.vstamp svg{flex-shrink:0}
+.vstamp .vn{font-family:var(--disp);font-weight:900;font-size:20px;color:var(--gold);line-height:1}
+.vstamp .vl{font-family:var(--mono);font-size:8.5px;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,0.4);margin-top:3px}
+.vstamp .vh{font-family:var(--mono);font-size:9px;color:#7fe3b0;margin-top:3px;word-break:break-all}
+
+/* orchestrated hero entrance */
+.rise{opacity:0;transform:translateY(14px);animation:rise .7s cubic-bezier(.2,.7,.2,1) forwards}
+.d1{animation-delay:.05s}.d2{animation-delay:.22s}.d3{animation-delay:.4s}.d4{animation-delay:.58s}
+@keyframes rise{to{opacity:1;transform:none}}
+
+@media(max-width:1120px){
+.prod{grid-template-columns:1fr;gap:16px}
+.pp{text-align:left}
+.packrow{grid-template-columns:1fr;gap:14px}
+}
+@media(max-width:900px){
+#rail{display:none}
+#chip{display:block}
+main{margin-left:0}
+.wrap,#hero .wrap,#verify .wrap{padding:56px 20px}
+.nvl a:not(.ncta){display:none}
+.steps,.refrow,.laws,.crow,.cres,.fr,.tabs{grid-template-columns:1fr}
+footer{padding:40px 20px}
+.fin{grid-template-columns:1fr}
+.fbot{flex-direction:column;gap:6px}
+}
+
+
+/* ---------- the proving ground ---------- */
+.pgtabs{display:flex;gap:0;margin:34px auto 0;max-width:520px;border:1px solid rgba(201,168,76,0.4);border-radius:4px;overflow:hidden}
+.pgtab{flex:1;padding:13px 10px;background:transparent;color:var(--mutei);border:none;cursor:pointer;font-family:var(--mono);font-size:10.5px;letter-spacing:1.5px;text-transform:uppercase;transition:background .15s,color .15s}
+.pgtab.on{background:var(--gold);color:var(--ink);font-weight:600}
+.pgtab:not(.on):hover{color:#fff}
+.pgpanel{margin-top:30px;text-align:left}
+.pgpanel.hide{display:none}
+.pglead{font-size:14.5px;line-height:1.75;color:var(--mutei);max-width:640px;margin:0 auto 14px}
+.pglead b{color:#fff}
+
+.pgform{display:grid;grid-template-columns:1fr 1fr;gap:22px 30px;max-width:760px;margin:0 auto}
+.pgf label{display:flex;justify-content:space-between;align-items:baseline;gap:10px;font-family:var(--mono);font-size:10px;letter-spacing:1.5px;text-transform:uppercase;color:var(--mutei);margin-bottom:9px}
+.pgv{font-family:var(--disp);font-weight:900;font-size:19px;color:var(--gold);letter-spacing:-0.01em;text-transform:none}
+.pghint{display:block;font-size:11.5px;color:rgba(255,255,255,0.32);margin-top:7px;line-height:1.5}
+.pgf input[type=range]{width:100%;-webkit-appearance:none;appearance:none;height:2px;background:rgba(255,255,255,0.18);border-radius:2px;outline:none}
+.pgf input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;border-radius:50%;background:var(--gold);cursor:pointer;border:3px solid var(--ink)}
+.pgf input[type=range]::-moz-range-thumb{width:16px;height:16px;border-radius:50%;background:var(--gold);cursor:pointer;border:3px solid var(--ink)}
+.pgf input[type=range]:focus-visible{outline:2px solid var(--gold);outline-offset:4px}
+.pgf select{width:100%;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.18);color:#fff;padding:10px 12px;border-radius:4px;font-family:var(--body);font-size:14px;outline:none}
+.pgf select:focus{border-color:var(--gold)}
+.pgf select option{background:var(--ink)}
+.pgcheck{display:flex!important;align-items:center;gap:9px;margin-top:14px;font-family:var(--body)!important;font-size:12.5px!important;letter-spacing:0!important;text-transform:none!important;color:var(--mutei);cursor:pointer;justify-content:flex-start!important}
+.pgcheck input{accent-color:var(--gold);width:15px;height:15px}
+
+.pgactions{display:flex;flex-direction:column;align-items:center;gap:11px;margin-top:32px}
+.pgnote{font-family:var(--mono);font-size:10px;letter-spacing:1px;color:rgba(255,255,255,0.3)}
+
+.pgresult{max-width:760px;margin:30px auto 0;text-align:left}
+.pgverdictcard{border:1px solid rgba(255,255,255,0.14);border-radius:6px;background:rgba(0,0,0,0.28);overflow:hidden}
+.pgvhead{display:flex;align-items:baseline;gap:16px;flex-wrap:wrap;padding:24px 26px;border-bottom:1px solid rgba(255,255,255,0.1)}
+.pgvword{font-family:var(--disp);font-weight:900;font-size:44px;line-height:1;letter-spacing:-0.02em}
+.pgvword.ALLOW{color:var(--allow)}.pgvword.CHALLENGE{color:var(--challenge)}.pgvword.BLOCK{color:var(--block)}
+.pgvscore{font-family:var(--mono);font-size:13px;color:var(--mutei)}
+.pgvscore b{color:#fff}
+.pgvreasons{margin-left:auto;display:flex;gap:6px;flex-wrap:wrap}
+.pgvreasons span{font-family:var(--mono);font-size:10px;border:1px solid rgba(255,255,255,0.2);border-radius:3px;padding:4px 9px;color:var(--mutei)}
+.pgrow{padding:20px 26px;border-bottom:1px solid rgba(255,255,255,0.08)}
+.pgrow:last-child{border-bottom:none}
+.pgrlbl{font-family:var(--mono);font-size:9.5px;letter-spacing:2px;text-transform:uppercase;color:var(--gold);margin-bottom:9px}
+.pgrbody{font-size:14px;line-height:1.75;color:var(--mutei)}
+.pgrbody b{color:#fff}
+.pgmono{font-family:var(--mono);font-size:11.5px;line-height:2;color:var(--mutei);word-break:break-all}
+.pgmono a{color:#7fe3b0;text-decoration:none;border-bottom:1px solid rgba(127,227,176,0.3)}
+.pgmono a:hover{border-bottom-color:#7fe3b0}
+.pgmono em{font-style:normal;color:var(--gold);margin-right:8px}
+.pgcf{border-left:3px solid var(--gold);padding-left:18px}
+.pgcf .big{font-family:var(--disp);font-weight:900;font-size:20px;line-height:1.35;color:#fff;letter-spacing:-0.01em}
+.pgsteps{list-style:none;margin-top:4px}
+.pgsteps li{position:relative;padding-left:20px;font-size:13.5px;line-height:1.7;color:var(--mutei);margin-bottom:6px}
+.pgsteps li::before{content:'';position:absolute;left:0;top:9px;width:5px;height:5px;border-radius:50%;background:var(--gold)}
+.pgerr{border:1px solid rgba(200,54,43,0.5);background:rgba(200,54,43,0.08);border-radius:6px;padding:16px 20px;font-size:13.5px;color:#ffb4ad;line-height:1.7}
+
+.pgcase{max-width:640px;margin:26px auto 0}
+.pgcase.hide{display:none}
+.pgclockbar{display:flex;align-items:baseline;justify-content:space-between;border:1px solid rgba(201,168,76,0.35);border-radius:5px 5px 0 0;background:rgba(201,168,76,0.07);padding:12px 20px}
+.pgclocklbl{font-family:var(--mono);font-size:9.5px;letter-spacing:2px;text-transform:uppercase;color:var(--gold)}
+.pgclock{font-family:var(--disp);font-weight:900;font-size:26px;color:#fff;letter-spacing:-0.01em;font-variant-numeric:tabular-nums}
+.pgmaterial{border:1px solid rgba(255,255,255,0.14);border-top:none;background:rgba(0,0,0,0.28);padding:6px 20px 14px}
+.pgmrow{display:flex;justify-content:space-between;gap:16px;padding:11px 0;border-bottom:1px solid rgba(255,255,255,0.07);font-size:13.5px}
+.pgmrow:last-child{border-bottom:none}
+.pgmk{color:var(--mutei)}
+.pgmv{font-family:var(--mono);font-size:12.5px;color:#fff;text-align:right}
+.pgverdicts{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:18px}
+.pgvbtn{padding:15px 8px;border-radius:4px;border:1px solid;background:transparent;cursor:pointer;font-family:var(--body);font-size:13.5px;font-weight:700;transition:background .15s,color .15s}
+.pgvbtn.allow{color:var(--allow);border-color:rgba(26,158,110,0.5)}
+.pgvbtn.allow:hover{background:var(--allow);color:var(--ink)}
+.pgvbtn.chal{color:var(--challenge);border-color:rgba(192,122,29,0.5)}
+.pgvbtn.chal:hover{background:var(--challenge);color:var(--ink)}
+.pgvbtn.block{color:var(--block);border-color:rgba(200,54,43,0.5)}
+.pgvbtn.block:hover{background:var(--block);color:#fff}
+
+.pgcompare{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:rgba(255,255,255,0.12);border:1px solid rgba(255,255,255,0.12);border-radius:6px;overflow:hidden}
+.pgc{background:rgba(0,0,0,0.3);padding:22px}
+.pgclbl{font-family:var(--mono);font-size:9.5px;letter-spacing:2px;text-transform:uppercase;color:var(--mutei);margin-bottom:10px}
+.pgcval{font-family:var(--disp);font-weight:900;font-size:30px;line-height:1;letter-spacing:-0.02em}
+.pgflag{margin-top:18px;border:1px dashed rgba(201,168,76,0.5);background:rgba(201,168,76,0.07);border-radius:5px;padding:16px 20px;font-size:13.5px;line-height:1.7;color:var(--mutei)}
+.pgflag b{color:var(--gold)}
+.pgfoot{max-width:700px;margin:38px auto 0;font-size:12.5px;line-height:1.8;color:rgba(255,255,255,0.32);text-align:center}
+.pgfoot a{color:var(--gold);text-decoration:none}
+
+@media(max-width:760px){
+.pgform{grid-template-columns:1fr;gap:20px}
+.pgvhead{padding:20px}
+.pgvreasons{margin-left:0;width:100%}
+.pgcompare{grid-template-columns:1fr}
+.pgverdicts{grid-template-columns:1fr}
+.pgtabs{max-width:100%}
+}
+@media(prefers-reduced-motion:reduce){.pgtab,.pgvbtn{transition:none}}
+
+
+/* ---------- live figures ---------- */
+.pgcharts{max-width:1000px;margin:44px auto 0;border-top:1px solid rgba(255,255,255,0.1);padding-top:30px}
+.pgchead{display:flex;align-items:baseline;justify-content:space-between;gap:14px;flex-wrap:wrap;margin-bottom:20px}
+.pgclbl2{font-family:var(--mono);font-size:10px;letter-spacing:2.5px;text-transform:uppercase;color:var(--gold)}
+.pgcsub{font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.3)}
+.pgcgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:rgba(255,255,255,0.1);border:1px solid rgba(255,255,255,0.1);border-radius:6px;overflow:hidden}
+.pgcard{background:rgba(0,0,0,0.28);padding:20px 22px 18px}
+.pgctitle{font-family:var(--mono);font-size:10px;letter-spacing:1.5px;text-transform:uppercase;color:var(--mutei);margin-bottom:14px;display:flex;justify-content:space-between;gap:10px}
+.pgctitle span{font-family:var(--disp);font-weight:900;font-size:17px;color:#fff;letter-spacing:-0.01em;text-transform:none}
+.pgcbody{height:90px}
+.pgcbody svg{width:100%;height:100%;display:block;overflow:visible}
+.pgcfoot{font-size:11.5px;line-height:1.6;color:rgba(255,255,255,0.34);margin-top:12px}
+.pgcempty{font-family:var(--mono);font-size:10.5px;color:rgba(255,255,255,0.28)}
+@media(max-width:900px){.pgcgrid{grid-template-columns:1fr}}
+
+</style>
+<style id="FIELDCSS">
+#FIELD{
+  --fv:#000208; --fline:#141c3a; --fline2:#26325e;
+  --ftx:#d6e2ff; --fmut:#8a99c8; --ffaint:#5a6795;
+  --fgo:#ffbe78;
+  --fmono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  position:fixed; inset:0; z-index:9000; background:var(--fv);
+  color:var(--ftx); font-family:var(--fmono);
+  opacity:0; transition:opacity .5s ease;
+  -webkit-tap-highlight-color:transparent; overscroll-behavior:none;
+}
+#FIELD.up{opacity:1}
+#FIELD.gone{opacity:0;pointer-events:none}
+body.fieldlock{overflow:hidden!important}
+body.fieldlock nav,body.fieldlock #rail,body.fieldlock #chip{display:none!important}
+#FIELD canvas{position:absolute;left:0;top:0;width:100%;height:100%;display:block}
+#fgl{z-index:1;touch-action:none}
+#flbl{z-index:2;pointer-events:none}
+
+/* ---------- top bar ---------- */
+.fbar{position:absolute;top:0;left:0;right:0;z-index:5;height:30px;display:flex;
+  background:rgba(0,2,8,.94);border-bottom:1px solid var(--fline)}
+.fbar .fm{display:flex;align-items:center;padding:0 10px;font-size:8.5px;
+  letter-spacing:2.4px;color:var(--fgo);font-weight:700;flex:0 0 auto}
+.fbar .fcell{flex:1 1 0;min-width:0;display:flex;flex-direction:column;justify-content:center;
+  padding:0 5px;border-left:1px solid var(--fline)}
+.fbar .fk{font-size:6px;letter-spacing:1.2px;color:var(--ffaint);line-height:1.2}
+.fbar .fv2{font-size:9.5px;color:#48dcd6;line-height:1.25;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fbar .fv2.bad{color:#ff5c7a}
+#fskip{flex:0 0 auto;background:transparent;border:0;border-left:1px solid var(--fline);
+  color:var(--fgo);font-family:var(--fmono);font-size:8.5px;letter-spacing:1.8px;
+  padding:0 11px;cursor:pointer;font-weight:700}
+
+/* ---------- action rail: the six ways in ---------- */
+.frail{position:absolute;top:30px;left:0;right:0;z-index:5;display:flex;
+  overflow-x:auto;scrollbar-width:none;background:rgba(0,2,8,.8);
+  border-bottom:1px solid var(--fline)}
+.frail::-webkit-scrollbar{display:none}
+.frail button{flex:0 0 auto;background:transparent;border:0;border-right:1px solid var(--fline);
+  color:var(--fmut);font-family:var(--fmono);font-size:8.5px;letter-spacing:1.5px;
+  padding:8px 11px;cursor:pointer;display:flex;align-items:center;gap:6px;white-space:nowrap}
+.frail button i{width:6px;height:6px;border-radius:50%;flex:0 0 auto}
+.frail button[data-on="1"]{color:var(--ftx);background:rgba(255,255,255,.06)}
+
+/* ---------- slim deck ---------- */
+.fdeck{position:absolute;left:0;right:0;bottom:0;z-index:5;height:34px;
+  display:flex;align-items:center;gap:0;background:rgba(0,2,8,.94);
+  border-top:1px solid var(--fline);font-size:9px;overflow:hidden}
+.fdeck span{padding:0 9px;white-space:nowrap;flex:0 0 auto}
+.fdeck .k{color:var(--ffaint);font-size:6.5px;letter-spacing:1.3px;padding-right:4px}
+.fdeck .sealh{color:#48dcd6;overflow:hidden;text-overflow:ellipsis;flex:1 1 auto;min-width:0}
+
+/* ---------- drawer: the portal content ---------- */
+#fdraw{
+  position:absolute;z-index:8;left:0;right:0;bottom:0;height:74vh;max-height:74vh;overflow:hidden;
+  background:rgba(1,3,11,.975);border-top:1px solid var(--fline2);
+  transform:translateY(102%);transition:transform .34s cubic-bezier(.3,.9,.3,1);
+  display:flex;flex-direction:column
+}
+#fdraw.on{transform:translateY(0)}
+#fdraw .grab{width:38px;height:4px;border-radius:3px;background:var(--fline2);
+  margin:9px auto 0;flex:0 0 auto}
+.fdh{padding:12px 16px 11px;border-bottom:1px solid var(--fline);flex:0 0 auto;position:relative;min-height:0}
+.fdh .k{font-size:7.5px;letter-spacing:2.2px;margin-bottom:6px}
+.fdh h3{font-size:17px;margin:0;color:var(--ftx);font-weight:700;letter-spacing:-.3px;line-height:1.25}
+#fdx{position:absolute;top:8px;right:12px;background:0;border:0;color:var(--ffaint);
+  font-size:19px;cursor:pointer;padding:4px 8px;line-height:1}
+.fdb{padding:14px 16px 26px;overflow-y:auto;overflow-x:hidden;
+  flex:1 1 auto;min-height:0;-webkit-overflow-scrolling:touch;overscroll-behavior:contain}
+.fdb h2{font-size:15px;color:var(--ftx);margin:0 0 9px;line-height:1.3}
+.fdb h3{font-size:9px;letter-spacing:1.8px;color:var(--fgo);margin:18px 0 7px;text-transform:uppercase}
+.fdb p{font-size:12.5px;line-height:1.62;color:var(--fmut);margin:0 0 11px}
+.fdb b,.fdb strong{color:var(--ftx);font-weight:600}
+.fdb a{color:#48dcd6}
+.fdb .kick{font-size:8px;letter-spacing:2px;color:var(--ffaint);margin-bottom:8px}
+.fdb code{font-size:11px;color:#48dcd6}
+.fdb *{max-width:100%!important;box-sizing:border-box}
+.fdb div,.fdb section,.fdb span{display:block;background:none!important;border:0!important;
+  padding:0!important;margin:0!important;color:inherit;font-size:inherit;width:auto!important;
+  grid-template-columns:none!important;float:none!important;position:static!important}
+.fdb span{display:inline}
+.fdb h4,.fdb h5{font-size:11px;letter-spacing:1.4px;color:var(--ftx);margin:14px 0 6px}
+.fdb ul,.fdb ol{margin:0 0 12px 17px;padding:0}
+.fdb li{font-size:12.5px;line-height:1.6;color:var(--fmut);margin-bottom:6px}
+.fdb em,.fdb i{color:var(--fmut);font-style:italic}
+.fdb hr{border:0;border-top:1px solid var(--fline);margin:16px 0}
+.fdb p{overflow-wrap:anywhere}
+.fdb > div + div{margin-top:2px}
+.fdcta{display:flex;gap:8px;flex-wrap:wrap;padding:11px 16px;border-top:1px solid var(--fline);
+  flex:0 0 auto;background:rgba(0,2,8,.9)}
+.fdcta button{flex:1 1 auto;background:transparent;border:1px solid currentColor;
+  font-family:var(--fmono);font-size:9px;letter-spacing:1.6px;padding:10px 8px;cursor:pointer;
+  color:var(--fgo)}
+.fdcta button.alt{color:var(--fmut)}
+.fdcta button:active{background:currentColor;color:#000}
+
+/* chain demo strip inside the drawer */
+.fchainwrap{position:relative;height:96px;overflow:hidden;margin:0 0 15px;
+  border:1px solid var(--fline);background:rgba(255,255,255,.02)}
+.fdb canvas,#fchain{position:static!important;float:none!important;display:block!important;
+  width:100%!important;height:96px!important;margin:0!important;max-width:100%!important}
+
+#fhint{position:absolute;left:0;right:0;z-index:4;bottom:44px;text-align:center;
+  font-size:7.5px;letter-spacing:2.2px;color:var(--ffaint);transition:opacity .5s;pointer-events:none}
+#fhint.off{opacity:0}
+
+@media (min-width:900px){
+  #fdraw{left:auto;top:0;right:0;bottom:0;width:430px;height:auto;
+    transform:translateX(102%);border-top:0;border-left:1px solid var(--fline2)}
+  #fdraw.on{transform:translateX(0)}
+  #fdraw .grab{display:none}
+  .fdb p{font-size:13.5px}
+}
 </style>
 </head>
 <body>
-<div class="container">
-  <header>
-    <div class="brand">sebbi.pro &middot; sovereign profile notary</div>
-    <h1>Seal your profile before someone clones it.</h1>
-    <div class="tagline">Fingerprint your public identity — name, bio, links — and seal it into a live, tamper-evident audit chain with an official timestamp. Put your verification code in your bio. From that moment, anyone can check in seconds whether a profile claiming to be you matches the one you sealed first.</div>
-  </header>
+<div id="FIELD" role="dialog" aria-label="AILeash field">
+  <canvas id="fgl"></canvas>
+  <canvas id="flbl"></canvas>
 
-  <!-- LEFT: builder -->
-  <div class="panel" id="builder">
-    <h2>1 &middot; Build &amp; seal your profile</h2>
-    <div><label>Full name</label><input id="nm" oninput="mirror()" placeholder="Justin Antony Dobson"></div>
-    <div><label>Title</label><input id="ttl" oninput="mirror()" placeholder="Founder, Monop Content"></div>
-    <div><label>Short bio</label><textarea id="bio" oninput="mirror()" placeholder="Building tamper-evident AI compliance from Blyth."></textarea></div>
-    <div><label>LinkedIn URL</label><input id="li" oninput="mirror()" placeholder="linkedin.com/in/yourname"></div>
-    <div><label>Other link (optional)</label><input id="fb" oninput="mirror()" placeholder="yoursite.com"></div>
-    <div class="chk"><input type="checkbox" id="pub" checked><span><b>Publish to the public registry.</b> Anyone checking your code will see these profile fields. Untick to seal privately — the checker will confirm the seal and timestamp only, and your details are never stored.</span></div>
-    <button id="go" onclick="sealProfile()">Seal this profile &mdash; free &rarr;</button>
-    <div id="sealres"></div>
-    <div class="note">Your profile is fingerprinted with SHA-256 in your own browser. Registration proves this exact profile was sealed first at this timestamp — the strongest public claim to your own words that exists on the open web.</div>
+  <div class="fbar">
+    <div class="fm">AILEASH</div>
+    <div class="fcell"><span class="fk">CHAIN</span><span class="fv2" data-fh="tip">&middot;&middot;&middot;</span></div>
+    <div class="fcell"><span class="fk">ROSTER</span><span class="fv2" data-fh="roster">&middot;&middot;&middot;</span></div>
+    <div class="fcell"><span class="fk">ANCHOR</span><span class="fv2" data-fh="ots">&middot;&middot;&middot;</span></div>
+    <button id="fskip" type="button">MAIN SITE &rsaquo;</button>
   </div>
 
-  <!-- RIGHT: preview + checker -->
-  <div style="display:flex;flex-direction:column;gap:28px">
-    <div class="panel">
-      <h2>2 &middot; Live evidence preview</h2>
-      <div class="preview">
-        <div class="p-name" id="v-nm">Your Name</div>
-        <div class="p-title" id="v-ttl"></div>
-        <div class="p-bio" id="v-bio"></div>
-        <div class="p-links" id="v-links"></div>
-        <div class="p-hash" id="v-hash">FINGERPRINT — start typing to generate</div>
-      </div>
-    </div>
+  <div class="frail" id="frail"></div>
+  <div id="fhint">DRAG TO ORBIT &middot; TAP ANY NODE</div>
 
-    <div class="panel" id="checker">
-      <h2>3 &middot; Check a profile &middot; public scanner</h2>
-      <div><label>Paste a verification code (from a bio) or full fingerprint</label><input id="q" placeholder="e.g. 7be4d1c29a03"></div>
-      <button onclick="checkCode()">Check the chain &rarr;</button>
-      <div id="checkres"></div>
-      <div id="trap" onclick="document.getElementById('builder').scrollIntoView({behavior:'smooth'});document.getElementById('nm').focus()">
-        <div class="t1">&#9888;&#65039; This profile is unclaimed.</div>
-        <div class="t2">No seal exists for this code — which means the identity it claims is unregistered and open to AI cloning and impersonation. Sealing yours takes 60 seconds and costs nothing. <u>Tap here to claim your profile now.</u></div>
-      </div>
+  <div class="fdeck">
+    <span><span class="k">SEAL</span><span id="fs-time">&mdash;</span></span>
+    <span class="sealh" id="fs-hash">&mdash;</span>
+    <span><span class="k">DWELL</span>28ms</span>
+    <span><span class="k">PTS</span><span id="fs-pts">&mdash;</span></span>
+  </div>
+
+  <div id="fdraw">
+    <div class="grab"></div>
+    <div class="fdh">
+      <button id="fdx" type="button" aria-label="Close">&times;</button>
+      <div class="k" id="fd-k"></div>
+      <h3 id="fd-t"></h3>
+    </div>
+    <div class="fdb" id="fd-b"></div>
+    <div class="fdcta" id="fd-cta"></div>
+  </div>
+</div>
+
+
+<nav>
+<a class="logo" href="/" style="text-decoration:none;display:flex;align-items:center;gap:10px">
+<svg width="30" height="30" viewBox="0 0 32 32" aria-hidden="true">
+<circle cx="16" cy="16" r="13.5" fill="none" stroke="#c9a84c" stroke-width="2.6" stroke-dasharray="66 20" stroke-linecap="round" transform="rotate(-50 16 16)"/>
+<circle cx="26.5" cy="7" r="3.1" fill="#c9a84c"/>
+<circle cx="16" cy="16" r="3.4" fill="#f6f3ec"/>
+</svg>
+<span style="display:flex;flex-direction:column;line-height:1">
+<span style="font-family:var(--disp);font-weight:900;font-size:19px;color:#fff;letter-spacing:-0.02em">AI<b style="color:var(--gold)">Leash</b></span>
+<span style="font-family:var(--mono);font-size:7.5px;letter-spacing:2.5px;text-transform:uppercase;color:rgba(255,255,255,0.4);margin-top:3px">by Monop Content</span>
+</span>
+</a>
+<div class="nvl">
+<a href="#" onclick="openField();return false;">The Field</a><a href="#products">Products</a>
+<a href="#packs">Signal Packs</a>
+<a href="#oversight">Oversight</a>
+<a href="#authority">Authority</a>
+<a href="/savings">Savings</a>
+<a href="#anchor">Anchoring</a>
+<a href="#network">Network</a>
+<a href="#conformance">Conformance</a>
+<a href="#how">How it works</a>
+<a href="#coverage">Coverage</a>
+<a href="#sdk">One line</a>
+<a href="#install">Install</a>
+<a href="#onprem">Sebdog</a>
+<a href="#tokensaver">Token saver</a>
+<a href="#law">The law</a>
+<a href="/scan">Free scanner</a>
+<a href="/reseller">Partners</a>
+<a href="/whitepaper">Whitepaper</a>
+<a href="/developers">Developers</a>
+<a href="#signup" class="ncta">Get API key &middot; 90 days free</a>
+</div>
+</nav>
+
+<!-- SIGNATURE: the visit ledger. Real SHA-256, runs only in this browser. -->
+<aside id="rail" aria-label="Live demo: this visit as an audit chain">
+<div class="rail-t">This visit, sealed</div>
+<div class="rail-s">A live demo of our engine. Each section you read becomes a real SHA-256 block, chained in your browser. Nothing is sent anywhere.</div>
+<div id="chain"></div>
+<div class="rail-foot">tip <b id="tip">GENESIS</b></div>
+</aside>
+<div id="chip">Visit chain &middot; <span id="chipn">0 blocks</span> &middot; tip <span class="ch" id="chiptip">GENESIS</span></div>
+
+<main>
+
+<section id="hero">
+<div class="wrap">
+<div class="deadline rise d1">EU AI Act &middot; transparency duties live <b>2 Aug 2026</b> &middot; high-risk duties <b>2 Dec 2027</b> &middot; fines to 3% of global turnover</div>
+<p class="rise d1" style="font-family:var(--mono);font-size:11px;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,0.45);margin-bottom:18px"><b style="color:var(--gold);font-weight:600">Monop Content</b> presents AILeash &mdash; a compliance API for platforms running AI. Governance, child safety and fraud alerts on one tamper-evident engine</p>
+<h1 class="rise d2">Every AI decision.<br><i>Sealed. Provable. Yours.</i></h1>
+<p class="lead rise d3" style="margin-top:26px"><b style="color:var(--gold)">The compliance layer you build on top of.</b> You put sebbi.pro underneath your app; it scores every AI decision in under 30ms &mdash; <b>ALLOW, CHALLENGE or BLOCK</b> &mdash; and seals each one into a SHA-256 chain nobody can quietly edit. Not a hacker. Not an employee. <b>Not even us</b> &mdash; the chain is timestamped through OpenTimestamps into Bitcoin, so the clock sits outside our control, and other platforms witness our chain so we cannot rebuild it either. Built to support <b>EU AI Act Articles 9, 12, 13 and 14</b>, the Online Safety Act, the ICO Children's Code and the DSA. When a regulator asks what your AI decided and why, you answer in one API call. <b>Free for 90 days. Then 50p per device. No tiers, no sales calls.</b></p>
+<div class="hseal" id="hseal" aria-live="polite"></div>
+<div class="vstamp" id="vstamp" style="display:none">
+<svg width="34" height="34" viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="13.5" fill="none" stroke="#c9a84c" stroke-width="2.6" stroke-dasharray="66 20" stroke-linecap="round" transform="rotate(-50 16 16)"/><circle cx="26.5" cy="7" r="3.1" fill="#c9a84c"/><circle cx="16" cy="16" r="3.4" fill="#0a0f1e"/></svg>
+<span><span class="vn" id="vnum"></span><span class="vl" style="display:block">Sealed visitor of sebbi.pro</span><span class="vh" id="vhash" style="display:block"></span></span>
+</div>
+<div class="hbtns rise d4">
+<a href="#how" class="bgold">See how it works &darr;</a>
+<a href="#signup" class="bghost">Get API key &middot; 90 days free</a>
+<a href="/scan" class="bghost">Free AI Act scanner</a>
+</div>
+</div>
+
+<div id="patrol-strip" aria-hidden="true">
+<div class="patrol"><div class="patrol-flip">
+<svg width="150" height="86" viewBox="0 0 150 86">
+<g class="bob">
+<line x1="26" y1="8" x2="26" y2="16" stroke="#c9a84c" stroke-width="2"/>
+<circle cx="26" cy="6" r="2.6" fill="#c9a84c" class="blinky"/>
+<rect x="15" y="15" width="22" height="17" rx="4" fill="#1c2742" stroke="#c9a84c" stroke-width="1.6"/>
+<rect x="19" y="21" width="14" height="5" rx="2.5" fill="#7fe3b0" class="blinky"/>
+<rect x="12" y="34" width="28" height="26" rx="5" fill="#141d36" stroke="#c9a84c" stroke-width="1.6"/>
+<circle cx="26" cy="44" r="3.6" fill="none" stroke="#c9a84c" stroke-width="1.4"/>
+<circle cx="26" cy="44" r="1.3" fill="#c9a84c"/>
+<path d="M40 40 Q50 42 56 46" stroke="#c9a84c" stroke-width="3.4" fill="none" stroke-linecap="round"/>
+<circle cx="57" cy="46.5" r="2.6" fill="#c9a84c"/>
+</g>
+<g class="leg"><rect x="17" y="59" width="6.5" height="17" rx="3" fill="#1c2742" stroke="#c9a84c" stroke-width="1.3"/><rect x="14.5" y="73" width="11" height="4.5" rx="2" fill="#c9a84c"/></g>
+<g class="leg b"><rect x="28.5" y="59" width="6.5" height="17" rx="3" fill="#1c2742" stroke="#c9a84c" stroke-width="1.3"/><rect x="26" y="73" width="11" height="4.5" rx="2" fill="#c9a84c"/></g>
+<path d="M57 47 Q78 62 100 53" stroke="#c9a84c" stroke-width="1.8" fill="none" stroke-dasharray="4 3" stroke-linecap="round"/>
+<g class="bob" style="animation-delay:.2s">
+<circle cx="100" cy="53" r="2.2" fill="#c9a84c"/>
+<rect x="98" y="55" width="30" height="14" rx="5" fill="#141d36" stroke="#c9a84c" stroke-width="1.5"/>
+<rect x="122" y="45" width="15" height="13" rx="4" fill="#1c2742" stroke="#c9a84c" stroke-width="1.5"/>
+<rect x="126" y="49" width="7" height="3.4" rx="1.7" fill="#7fe3b0" class="blinky"/>
+<rect x="136" y="51" width="6" height="5" rx="2" fill="#c9a84c"/>
+<path d="M124 45 L121 38 L128 43 Z" fill="#c9a84c"/>
+<g class="tailwag"><path d="M98 57 Q90 50 88 43" stroke="#c9a84c" stroke-width="2.6" fill="none" stroke-linecap="round"/><circle cx="88" cy="42" r="2" fill="#7fe3b0" class="blinky"/></g>
+</g>
+<g class="dogleg"><rect x="101" y="68" width="5" height="10" rx="2.4" fill="#1c2742" stroke="#c9a84c" stroke-width="1.2"/></g>
+<g class="dogleg b"><rect x="109" y="68" width="5" height="10" rx="2.4" fill="#1c2742" stroke="#c9a84c" stroke-width="1.2"/></g>
+<g class="dogleg b"><rect x="117" y="68" width="5" height="10" rx="2.4" fill="#1c2742" stroke="#c9a84c" stroke-width="1.2"/></g>
+<g class="dogleg"><rect x="124" y="68" width="5" height="10" rx="2.4" fill="#1c2742" stroke="#c9a84c" stroke-width="1.2"/></g>
+</svg>
+</div></div>
+<div class="patrol-cap">Your AI. On a lead. &mdash; Monop Content, Blyth</div>
+</div>
+
+<div class="ticker" aria-hidden="true"><div class="tk" id="tk"></div></div>
+</section>
+
+<section id="how">
+<div class="wrap">
+<div class="entry"><span class="no">Block 001 &middot; How it works</span><span class="rule"></span><span class="sealed" data-seal></span></div>
+<h2>Three steps. <i>That is it.</i></h2>
+<p class="lead">What normally costs &pound;50,000 a year in compliance tooling, free for 90 days and then 50p per device.</p>
+<div class="steps">
+<div class="st"><div class="k">Step one</div><h3>Get a free key</h3><p>Sign up below. No card, no contract. <b>Everything free for 90 days</b> &mdash; the full engine against your real traffic, plus a step-by-step installation guide straight to your inbox.</p></div>
+<div class="st"><div class="k">Step two</div><h3>Send us the event</h3><p>Each time a user acts, your platform posts the details. We score it across 9 signals in <b>under 30ms</b> and return ALLOW, CHALLENGE or BLOCK &mdash; sealed into the chain before you get the reply.</p></div>
+<div class="st"><div class="k">Step three</div><h3>You set the price</h3><p>Charge your users what you like. After your 90 free days, <b>we take 50p per device per month</b> &mdash; metered on the real devices that used your key. Everything above it is yours, every month.</p></div>
+</div>
+</div>
+</section>
+
+<section id="sdk">
+<div class="wrap">
+<div class="entry"><span class="no">Block 002 &middot; One line of code</span><span class="rule"></span><span class="sealed" data-seal></span></div>
+<h2>Add one line. <i>Never think about it again.</i></h2>
+<p class="lead">The slowest part of any compliance tool is wiring it in. So we removed that part. Put one line above a function and every call it makes from then on is fingerprinted and sealed &mdash; automatically, forever, with nothing else to remember.</p>
+
+<div class="oneline">@witness()<br>def approve_loan(application):</div>
+
+<div class="steps" style="margin-top:34px">
+<div class="st"><div class="k">What leaves</div><h3>A hash. Nothing else.</h3><p>The inputs and the result are hashed <b>on your machine</b>. The hash goes out; the data does not. Not in debug mode, not in an error, not ever &mdash; there is no code in the file that could send it. It's one short file and your engineer can read the whole thing over a coffee and confirm that, which is a better answer than a promise from us.</p></div>
+<div class="st"><div class="k">What it costs</div><h3>A tenth of a millisecond</h3><p>Measured, not estimated: <b>0.098ms</b> added to each call. The network part happens on a background thread, so your code never waits for us. If we go down your application doesn't slow down, doesn't error and doesn't care &mdash; records queue on your own disk and go out when we're back.</p></div>
+<div class="st"><div class="k">What you get back</div><h3>A receipt, per call</h3><p>Each call gets its position in the chain and the tip it was sealed under. Hand those two values to an auditor and they can check it without asking you for anything. <b>No dependencies to install</b> &mdash; it's a single file using nothing but the Python standard library, which is the only kind of thing a bank's security team approves quickly.</p></div>
+</div>
+
+<div class="sealnote">
+<h3>What a receipt proves, and what it doesn't</h3>
+<p><b>It proves</b> that this exact input and this exact output existed at or before the moment they were sealed, and that neither has changed since.</p>
+<p style="margin-top:10px"><b>It does not prove the decision was right.</b> Wrong answers seal exactly as cleanly as right ones. <b>It does not prove your records are complete</b> &mdash; it seals what you decorated, and it cannot know about the call you didn't. <b>It does not prove your model behaved</b>; it fingerprints what went in and what came out, not the reasoning in between.</p>
+<p style="margin-top:10px">Those three sentences are in the file's own documentation, at the top, where a buyer's engineer will read them first. <b>Anyone selling you the opposite of them is selling something that does not exist.</b></p>
+</div>
+</div>
+</section>
+
+<section id="products">
+<div class="wrap">
+<div class="entry"><span class="no">Block 003 &middot; Products</span><span class="rule"></span><span class="sealed" data-seal></span></div>
+<h2>Six products. <i>One engine.</i></h2>
+<p class="lead" style="margin-bottom:14px">The same 9-signal engine and audit chain underneath all of them. Pick one or take the lot. Every one is free for your first 90 days. Four run on our infrastructure; <b>Sebdog and the Token Saver run on yours.</b></p>
+
+<div class="prod">
+<div class="pn">AILeash<small>AI governance</small></div>
+<div>
+<p class="pd"><b>Who it's for:</b> any company whose AI makes decisions about people &mdash; banks approving loans, insurers pricing policies, fintechs blocking payments, marketplaces banning accounts. <b>What it does:</b> every decision your AI makes gets scored, explained in plain English, and locked into a record that nobody can quietly change. The EU AI Act says you must keep this proof. When the regulator knocks, <b>you hand it over &mdash; block by block.</b></p>
+<div class="pf"><em>&#10003;</em>9 signals scored per event, verdict in under 30ms<br><em>&#10003;</em>Tamper-evident SHA-256 chain &mdash; alterations are detectable, by anyone<br><em>&#10003;</em>Built for EU AI Act Articles 9, 12, 13 and 14<br><em>&#10003;</em>Free for 90 days, no card to start</div>
+</div>
+<div class="pp"><div class="amt">50p</div><div class="per">after 90 free days &middot; per device &middot; per month</div><a class="pbtn" href="#signup" onclick="setProduct('aileash')">Get AILeash key &rarr;</a></div>
+</div>
+
+<div class="prod">
+<div class="pn">SonicBoom<small>Compliance layer</small></div>
+<div>
+<p class="pd"><b>Who it's for:</b> companies already running AI on AWS, Azure, Google Cloud, OpenAI or Anthropic who need compliance without slowing anything down. <b>What it does:</b> one line of code adds a full audit record to every AI call. Powered by our <b>Sebdog engine</b> &mdash; the same core that runs AILeash &mdash; scoring in <b>28ms</b>, so fast your users never notice it's there.</p>
+<div class="pf"><em>&#10003;</em>One line of code &mdash; nothing else in your stack changes<br><em>&#10003;</em>Works alongside AWS, Azure, Google Cloud, OpenAI, Anthropic<br><em>&#10003;</em>SHA-256 audit chain on every call, automatically<br><em>&#10003;</em>28ms median decision time, measured on our own traffic</div>
+</div>
+<div class="pp"><div class="amt">50p</div><div class="per">after 90 free days &middot; per device &middot; per month</div><a class="pbtn" href="/sonicboom">About SonicBoom &rarr;</a></div>
+</div>
+
+<div class="prod">
+<div class="pn">Sentinel<small>Fraud &amp; anomaly alerts</small></div>
+<div>
+<p class="pd"><b>Who it's for:</b> online shops, payment companies, marketplaces &mdash; anyone who loses money to fraud. <b>What it does:</b> watches every event on your platform. When something looks wrong &mdash; 500 messages in a minute, a login from a strange country, a pattern that smells like fraud &mdash; Sentinel <b>emails you an alert with the sealed evidence attached.</b> You catch it while it's happening, not after the money's gone.</p>
+<div class="pf"><em>&#10003;</em>Real-time scoring, alerts the moment thresholds trip<br><em>&#10003;</em>Velocity signals catch burst attacks, takeovers and bots<br><em>&#10003;</em>Every alert backed by its own tamper-evident chain entry<br><em>&#10003;</em>Same one API call, same 90 free days</div>
+</div>
+<div class="pp"><div class="amt">50p</div><div class="per">after 90 free days &middot; per device &middot; per month</div><a class="pbtn" href="#signup" onclick="setProduct('sentinel')">Get Sentinel key &rarr;</a></div>
+</div>
+
+<div class="prod">
+<div class="pn">Guardian<small>Child safety for platforms &middot; Online Safety Act</small></div>
+<div>
+<p class="pd"><b>Who it's for:</b> consoles, games and social apps with young users. The <b>Online Safety Act</b> makes you responsible for keeping children safe, with substantial fines if you don't. <b>What it does:</b> you get an API key and build Guardian into your own app. Your young users get a Help button and grooming-pattern flagging inside YOUR app; you get a <b>tamper-proof record proving your duty of care</b> &mdash; the exact evidence Ofcom asks for.</p>
+<div class="pf"><em>&#10003;</em>Flags known grooming and manipulation patterns &mdash; never falsely tells a child a message is "safe"<br><em>&#10003;</em>Every safety event sealed to the audit chain &mdash; provable to a regulator on demand<br><em>&#10003;</em>Message content never stored, only a fingerprint &mdash; privacy by design<br><em>&#10003;</em>CEOP, Childline and 999 one tap away for every child, always</div>
+<div class="guardian-note">You get the API key and build Guardian into your own app &mdash; your design, our safety engine underneath. Free for 90 days, then 50p per device. The families on your platform never pay.</div>
+</div>
+<div class="pp"><div class="amt">50p</div><div class="per">after 90 free days &middot; families never pay</div><a class="pbtn" href="/guardian-parent">Learn about Guardian &rarr;</a></div>
+</div>
+
+<div class="prod">
+<div class="pn">Sebdog<small>The engine, on your hardware</small></div>
+<div>
+<p class="pd"><b>Who it's for:</b> hospitals, councils, defence suppliers, banks &mdash; anyone whose answer to &ldquo;where does our data go?&rdquo; has to be <b>nowhere.</b> <b>What it does:</b> the same engine, running inside your building on your own machine. Decisions, events and the audit chain never leave your disk. There is no phone home: the licence is checked locally with a signature, so it runs on a box with the network cable pulled out. And you can prove that with a packet capture rather than taking our word for it.</p>
+<div class="pf"><em>&#10003;</em>One Python file, no dependencies to install, runs on a laptop or a rack<br><em>&#10003;</em>Zero outbound connections &mdash; verify it yourself with tcpdump<br><em>&#10003;</em>Your chain witnessed by outside operators &mdash; only a hash leaves, and only if you switch it on<br><em>&#10003;</em>Daily backups, sealed into the chain, so restoring an old one is visible</div>
+</div>
+<div class="pp"><div class="amt">50p</div><div class="per">after 90 free days &middot; per device &middot; per month</div><a class="pbtn" href="#onprem">How Sebdog works &rarr;</a></div>
+</div>
+
+<div class="prod">
+<div class="pn">Token Saver<small>Takes money off your AI bill</small></div>
+<div>
+<p class="pd"><b>Who it's for:</b> anyone whose model bill is going up faster than their usage. <b>What it does:</b> it sits between your application and your model provider and refuses to let you buy the same answer twice. An identical request is served from your own disk. A runaway agent going round in circles is stopped in microseconds rather than found on next month's invoice. And it tells you, request by request, what you are paying for that you don't need to &mdash; turns you re-send every call, tool definitions nothing has ever used. <b>Your integration is one line: the address your code already points at.</b></p>
+<div class="pf"><em>&#10003;</em>Zero tokens to run &mdash; the scoring is arithmetic, not a second model grading the first<br><em>&#10003;</em>Your prompts and answers never leave your machine &mdash; only a fingerprint and counts reach us<br><em>&#10003;</em>Fails open: if we're unreachable your traffic carries on and the records catch up<br><em>&#10003;</em>Savings taken from your provider's own reported counts &mdash; never an estimate, never a percentage</div>
+</div>
+<div class="pp"><div class="amt">50p</div><div class="per">after 90 free days &middot; per device &middot; per month</div><a class="pbtn" href="/tokensaver">See the Token Saver &rarr;</a></div>
+</div>
+
+</div>
+
+</section>
+
+<section id="onprem">
+<div class="wrap">
+<div class="entry"><span class="no">Block 004 &middot; On your own hardware</span><span class="rule"></span><span class="sealed" data-seal></span></div>
+<h2 style="color:#fff">The data never leaves. <i>The proof still does.</i></h2>
+<p class="lead">Every compliance vendor asks you to send them your data. That is a straight trade: you get an audit trail, they get your records. For a hospital, a council or a defence supplier that trade is simply not available, so those organisations end up with nothing but a spreadsheet.</p>
+<p class="lead" style="margin-top:16px"><b>Sebdog is the same engine running inside your building.</b> Your decisions, your events and your hash chain sit on your disk and never move. We cannot read them. We cannot subpoena them out of our own systems, because they were never in our systems.</p>
+<p class="lead" style="margin-top:16px">Which leaves the obvious problem, and it is the one everybody skips: <b>a hash chain on your own server proves nothing against you.</b> You own the file. You own the keys. You can rebuild it forward, re-sign it and renumber it, and nobody outside can tell. An audit trail the owner can silently rewrite is a diary, not evidence.</p>
+
+<div class="anchorgrid">
+<div class="ag"><div class="k">How that gets fixed</div><h3>Somebody else holds your history</h3><p>Sebdog publishes its current chain head &mdash; 64 characters, no data in it &mdash; and independent operators fetch it <b>on their own schedule</b> and seal it into their own chains. From that moment your past sits inside records you do not control. Rewriting it would mean persuading all of them to rewrite theirs in step.</p></div>
+<div class="ag"><div class="k">Why fetching matters</div><h3>You can't choose the moment</h3><p>A timestamp is something you go and get. A peer polling you is something that happens <b>whether you want it to or not</b>. That difference is the whole point: you cannot cherry-pick which of your events get covered, because a chain head commits to every block behind it.</p></div>
+<div class="ag"><div class="k">What crosses the wire</div><h3>One hash, and only if you enable it</h3><p>Witnessing is off until you turn it on, and when it is on the entire payload is a hash. <b>It cannot be reversed</b> and it reveals nothing but that your chain exists and has moved. If you never enable it, Sebdog makes no outbound connection at all.</p></div>
+<div class="ag"><div class="k">How you know that's true</div><h3>Read it, or watch it</h3><p>It is one file of plain Python with no dependencies. Your engineer can read every line, or run it behind a packet capture and watch it stay silent. <b>We are not asking to be trusted on this</b> &mdash; a claim you can check in an afternoon is worth more than a certification.</p></div>
+</div>
+
+<div class="anchorline">
+<em>licence</em>signed by us, verified on your machine with a public key &mdash; <span class="g">works with the network unplugged</span><br>
+<em>chain</em>SHA-256, every block linked to the one before it, on your disk only<br>
+<em>verify</em>one call rewalks and rehashes <b>every block</b> from genesis &mdash; not a summary, the actual arithmetic<br>
+<em>backups</em>daily, last seven kept, and each one sealed into the chain &mdash; <span class="g">so quietly restoring an older database shows up</span><br>
+<em>witness</em>your head published for peers to seal; theirs sealed into yours. Off by default
+</div>
+
+<div class="anchorstraight">
+<b>The honest limit.</b> None of this proves your decisions were correct, and none of it proves your records are complete &mdash; Sebdog seals what you send it and cannot know about what you didn't. What it removes is the ability to change the story afterwards. That is a smaller claim than the industry makes and it is the one that survives an auditor.
+</div>
+
+<div style="margin-top:26px"><a class="bgold" href="#signup" onclick="setProduct('sebdog')">Get Sebdog &middot; 90 days free &rarr;</a></div>
+</div>
+</section>
+
+<section id="tokensaver">
+<div class="wrap">
+<div class="entry"><span class="no">Block 005 &middot; The token bill</span><span class="rule"></span><span class="sealed" data-seal></span></div>
+<h2>Governance that costs tokens <i>is part of the problem.</i></h2>
+<p class="lead">Almost every AI governance product on the market works the same way: your model makes a decision, then <b>a second model is called to judge the first one.</b> Another prompt. Another completion. Every single time. You are paying tokens to check your tokens, and the bill grows with exactly the thing you were hoping to grow.</p>
+<p class="lead" style="margin-top:16px">Ours doesn't call a model to decide anything. The scoring is arithmetic and the seal is a SHA-256 hash. At a hundred decisions a day or ten million, <b>the governance layer adds nothing to your token bill.</b> That is not a saving we are asking you to take on faith &mdash; it is a cost that isn't there, and you can watch your own usage dashboard while it runs.</p>
+
+<div class="steps" style="margin-top:40px">
+<div class="st"><div class="k">One &middot; Free</div><h3>The same answer, twice</h3><p>Same model, same messages, same settings &mdash; it never reaches your provider. The answer is stored <b>on your disk, not ours</b>, and comes back byte for byte. Most production systems ask the same questions far more often than anyone expects.</p></div>
+<div class="st"><div class="k">Two &middot; Stopped</div><h3>The agent going round in circles</h3><p>The same call eight times in two minutes is a loop, not a workload. It is refused locally, in microseconds, <b>before the money goes.</b> Four times if you have told it no human is watching. This is the one that pays for itself overnight.</p></div>
+<div class="st"><div class="k">Three &middot; Named</div><h3>What you're paying for and needn't</h3><p>Thirty turns re-sent on every call. Twelve tool definitions nothing has ever used. Temperature above zero on a request that didn't need to vary, which is the only reason its answer can't be reused. The verdict saves you money today; <b>the findings change what you send tomorrow.</b></p></div>
+</div>
+
+<div class="sealnote" style="margin-top:34px">
+<h3>What leaves your building</h3>
+<p>Your prompts and your answers do not. They sit in a file on your own machine. What reaches us is a <b>SHA-256 fingerprint and five counts</b> &mdash; how many characters, how many turns, how many tools, what output ceiling you set, and whether the request was deterministic. There is no way to read a prompt back out of a hash, and the page shows you every byte before it goes.</p>
+<p style="margin-top:12px"><b>And if we're down, you don't care.</b> It fails open, always. Your traffic keeps flowing, the local store still serves repeats, the runaway rules still hold, and the records catch up when we're back. A cost tool that can take your production down is not worth any saving.</p>
+<p style="margin-top:12px"><b>Its own limits, before you find them:</b> matching is exact, so a reworded prompt goes to your provider &mdash; catching similar prompts needs an embedding, an embedding is a model call, and a model call is the cost we are here to remove. A refused request has a worst case, not a known cost, so it is reported apart from your real savings and never added to them. And it does not judge whether a stored answer is still right; it proves what was asked and what came back.</p>
+</div>
+
+<div class="hbtns" style="margin-top:30px">
+<a class="bgold" href="/tokensaver">Download it &middot; 90 days free &rarr;</a>
+<a class="bghost" href="/x/tokensaver/spec">Read every weight and rule</a>
+</div>
+</div>
+</section>
+
+<section id="packs">
+<div class="wrap">
+<div class="entry"><span class="no">Block 006 &middot; Signal Packs</span><span class="rule"></span><span class="sealed" data-seal></span></div>
+<h2>Nine signals as standard. <i>Then add your own.</i></h2>
+<p class="lead">Every event is scored against the nine core signals below. A <b>Signal Pack</b> loads extra signals on top, tuned to one kind of risk &mdash; and the pack itself is sealed into the chain, so the rules that were running at the moment of a decision are part of the record, not a memory.</p>
+
+<div class="corepack">
+<div class="k">The core nine &mdash; always on, in every product</div>
+<div class="sigs">
+<span class="sig">trust</span>
+<span class="sig">velocity &middot; 60s</span>
+<span class="sig">velocity &middot; 5m</span>
+<span class="sig">velocity &middot; 1h</span>
+<span class="sig">amount</span>
+<span class="sig">device risk</span>
+<span class="sig">anomaly</span>
+<span class="sig">country shift</span>
+<span class="sig">unsafe country</span>
+</div>
+</div>
+
+<div class="packrow">
+<div class="packn">Payments &amp; fraud<small>Pack</small></div>
+<div>
+<p class="packd">For checkouts, transfers and payment platforms. Sharpens the money signals &mdash; sudden value jumps, new beneficiaries, card testing patterns and burst behaviour that a flat rule set misses. <b>Pairs with Sentinel.</b></p>
+<div class="packsig"><span>value jump</span><span>new beneficiary</span><span>card testing</span><span>burst velocity</span></div>
+</div>
+</div>
+
+<div class="packrow">
+<div class="packn">Child safety<small>Pack</small></div>
+<div>
+<p class="packd">For games, consoles and social apps with young users. Adds grooming and manipulation pattern signals, age-context weighting, and contact-escalation detection. <b>Content is never stored &mdash; only a fingerprint.</b> Pairs with Guardian.</p>
+<div class="packsig"><span>grooming pattern</span><span>contact escalation</span><span>age context</span><span>off-platform pull</span></div>
+</div>
+</div>
+
+<div class="packrow">
+<div class="packn">Lending &amp; onboarding<small>Pack</small></div>
+<div>
+<p class="packd">For credit, insurance and account opening &mdash; the decisions the EU AI Act treats most seriously. Adds identity-consistency and document signals, and forces a <b>CHALLENGE</b> pathway wherever a decision would materially affect a person's access to a service.</p>
+<div class="packsig"><span>identity consistency</span><span>document risk</span><span>affordability shift</span><span>oversight trigger</span></div>
+</div>
+</div>
+
+<div class="packrow">
+<div class="packn">Marketplace integrity<small>Pack</small></div>
+<div>
+<p class="packd">For marketplaces and platforms managing seller and account abuse. Adds account-age, listing-behaviour and coordinated-activity signals, so bans and suspensions carry evidence rather than a support note.</p>
+<div class="packsig"><span>account age</span><span>listing anomaly</span><span>coordinated activity</span><span>reinstatement history</span></div>
+</div>
+</div>
+
+<div class="packrow">
+<div class="packn">Build your own<small>Custom pack</small></div>
+<div>
+<p class="packd">Your risk is not everyone's risk. Define your own signals, set the weights and thresholds, and run them on the same deterministic engine. Same inputs give the same outputs, every time &mdash; <b>no drift, no retraining, nothing to explain away.</b></p>
+<div style="margin-top:16px"><a class="pbtn" href="/signal-packs">Build a Signal Pack &rarr;</a></div>
+</div>
+</div>
+
+<div class="sealnote">
+<h3>The part that matters at audit</h3>
+<p>Anyone can log a decision. The hard question, eighteen months later, is <b>which rules were live when that decision was made</b> &mdash; and most systems answer it with a changelog somebody could have edited.</p>
+<p style="margin-top:12px">Every pack has a version hash. When a decision is sealed, the pack hash is sealed with it. Change a weight, change a threshold, add a signal, and the pack gets a new hash and a new block in the chain. <b>Rule changes become auditable events, never silent edits</b> &mdash; and any decision can be traced back to the exact rule set that produced it.</p>
+<div class="ex"><em>decision</em>seal 9f3c&hellip; &middot; verdict CHALLENGE &middot; score 0.41<br><em>pack</em>payments-fraud &middot; v4 &middot; hash 7ab1&hellip;<br><em>meaning</em>this verdict, under these exact rules, at this exact time &mdash; provable by anyone</div>
+</div>
+
+</div>
+</section>
+
+<section id="margin">
+<div class="wrap">
+<div class="entry"><span class="no" style="color:#fff">Block 007 &middot; Your margin</span><span class="rule"></span><span class="sealed" data-seal style="color:rgba(255,255,255,0.4)"></span></div>
+<h2 style="color:#fff">You set the price. <i>You keep the rest.</i></h2>
+<p class="lead">Your first 90 days are free. After that we take 50p per device per month. Everything above it is yours &mdash; every month, for as long as they stay.</p>
+<div class="cwrap">
+<div class="crow">
+<div><div class="clab">You charge per device per month</div><div class="cin"><span class="pd2">&pound;</span><input class="ci" type="number" id="charge" value="1.99" min="0.51" step="0.01" oninput="calc()" aria-label="Price you charge per device per month"></div></div>
+<div><div class="clab">Number of devices</div><input class="ci" id="devices" type="number" min="1" step="1" value="1000" placeholder="Type any number, e.g. 8000000" oninput="calc()" aria-label="Number of devices"></div>
+</div>
+<div style="font-size:12px;color:#8a90a6;margin-top:6px">Working out what it saves you rather than what it pays you? <a href="/savings" style="color:var(--gold)">sebbi.pro/savings</a> runs the arithmetic on your own figures &mdash; ingestion, log storage, monitoring, compliance pipeline, engineering time &mdash; and says so in red if a proof layer costs you more than what you already run.<br><br>Type your exact device count. You are only ever billed for the real number of unique devices that actually use your key &mdash; not the number you type here.</div>
+<div class="cres">
+<div class="cr2"><div class="l">User pays</div><div class="v v-user" id="r-user">&pound;1.99</div><div class="s">per device per month</div></div>
+<div class="cr2"><div class="l">You keep</div><div class="v v-you" id="r-you">&pound;1,490</div><div class="s">per month</div></div>
+<div class="cr2"><div class="l">We take</div><div class="v v-we" id="r-we">&pound;500</div><div class="s">per month &middot; after trial</div></div>
+</div>
+</div>
+</div>
+</section>
+
+<section id="referral">
+<div class="wrap">
+<div class="entry"><span class="no">Block 008 &middot; Referrals</span><span class="rule"></span><span class="sealed" data-seal></span></div>
+<h2>Tell a friend. <i>Earn forever.</i></h2>
+<p class="lead">Your signup comes with a referral code. Every device that signs up with it pays you 10p a month, for as long as it stays. No cap, no expiry.</p>
+<div class="refrow">
+<div class="rf"><h3>Get your code</h3><p>Issued the moment you sign up. It looks like REF-JOHN-1234 and it's yours permanently.</p></div>
+<div class="rf"><h3>Share it anywhere</h3><p>A colleague, a dev group, a call centre. Anyone who signs up with your code is linked to you for good.</p><div class="big">10p</div><div class="bl">per device &middot; per month &middot; forever</div></div>
+<div class="rf"><h3>Collect monthly</h3><p>Ten referrals running 1,000 devices each is &pound;1,000 a month &mdash; and it renews itself.</p></div>
+</div>
+</div>
+</section>
+
+<section id="notary-promo">
+<div class="wrap">
+<div class="entry"><span class="no">Block 009 &middot; Identity</span><span class="rule"></span><span class="sealed" data-seal></span></div>
+<h2>Seal your profile <i>before someone clones it.</i></h2>
+<p class="lead">AI can now copy a face, a voice and a bio in minutes. The <b>Sovereign Profile Notary</b> locks your public identity &mdash; name, bio, links &mdash; into the same tamper-evident chain that seals AI decisions, with an official timestamp. You get a short verification code for your LinkedIn bio; anyone can check it in seconds. If an impersonator changes even one letter of your profile, the check fails in public. <b>Free, takes 60 seconds, and your details never leave your browser unless you choose to publish them.</b></p>
+<p class="lead" style="margin-top:18px"><b>And for businesses: the Payment Notary.</b> Invoice fraud costs UK businesses hundreds of millions a year &mdash; criminals intercept real invoices and switch the bank details. Seal your true details once, print a short code on every invoice, and every customer can verify in 10 seconds before paying. Switched details fail the check &mdash; <b>the fraud dies before the money moves.</b></p>
+<div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:26px">
+<a href="/notary" class="bgold">Seal my profile &mdash; free &rarr;</a>
+<a href="/pay-check" class="bgold">Payment Notary &mdash; free &rarr;</a>
+<a href="/notary" class="pbtn">Check a code &rarr;</a>
+</div>
+</div>
+</section>
+
+<section id="law">
+<div class="wrap">
+<div class="entry"><span class="no">Block 010 &middot; The law</span><span class="rule"></span><span class="sealed" data-seal></span></div>
+<h2>What the law <i>actually requires.</i></h2>
+<p class="lead">Most compliance advice tells you what the text says. This is what it means for your platform in practice &mdash; including the dates that moved.</p>
+
+<div class="timeline">
+<div class="tlrow"><div class="tld">Date</div><div class="tlw">What lands</div></div>
+<div class="tlrow now"><div class="tld">2 Aug 2026</div><div class="tlw"><b>Transparency duties apply.</b> Tell people when they are dealing with an AI system. Mark AI-generated or manipulated content so a machine can read it. Disclose deepfakes to the people who see them. The Commission's enforcement powers over general-purpose models start the same day.</div></div>
+<div class="tlrow"><div class="tld">2 Dec 2026</div><div class="tlw"><b>Content-marking grace period ends</b> &mdash; shortened from six months to three by the AI Omnibus. Also the date the prohibition on AI-generated non-consensual intimate imagery and CSAM takes effect.</div></div>
+<div class="tlrow"><div class="tld">2 Dec 2027</div><div class="tlw"><b>High-risk duties apply to stand-alone systems</b> &mdash; Articles 9, 12, 13 and 14. Delayed from August 2026, but the evidence they require is <b>historical</b>: you cannot seal decisions you never recorded.</div></div>
+<div class="tlrow"><div class="tld">2 Aug 2028</div><div class="tlw"><b>High-risk duties apply to AI embedded in products.</b></div></div>
+</div>
+
+<div class="laws">
+<div class="law"><div class="act">EU AI Act 2024/1689 &middot; as amended by the AI Omnibus</div>
+<div class="plain">&ldquo;If your AI makes decisions that affect people, you will need permanent, tamper-evident proof of every one.&rdquo;</div>
+<p>Fines reach 3% of global annual turnover or &euro;15m &mdash; whichever is higher, per violation. The high-risk deadline moved to December 2027. The record you hand over then has to cover the years before it.</p>
+<ul><li>Art. 9 &mdash; continuous risk management</li><li>Art. 12 &mdash; tamper-evident record keeping</li><li>Art. 13 &mdash; plain-language explanations</li><li>Art. 14 &mdash; human override pathway</li></ul></div>
+
+<div class="law"><div class="act">Online Safety Act 2023 &middot; UK &middot; in force now</div>
+<div class="plain">&ldquo;If users can talk to each other on your platform, you are legally responsible for protecting them &mdash; today.&rdquo;</div>
+<p>Ofcom is already investigating platforms. The ICO fined TikTok &pound;12.7m for Children's Code violations.</p>
+<ul><li>Documented risk assessment on demand</li><li>Moderation with an evidence trail</li><li>Age-appropriate design for child users</li><li>Ofcom-ready audit trails</li></ul></div>
+
+<div class="law"><div class="act">ICO Children's Code &middot; UK &middot; in force now</div>
+<div class="plain">&ldquo;If under-18s can reach your platform &mdash; even unintentionally &mdash; the Children's Code applies to you.&rdquo;</div>
+<p>The ICO can and does act against platforms that expose children to harmful automated decisions without protection.</p>
+<ul><li>Best interests of the child by default</li><li>Data minimisation for child users</li><li>No profiling of children</li><li>Human oversight of automated decisions</li></ul></div>
+
+<div class="law"><div class="act">Digital Services Act &middot; EU 2022/2065</div>
+<div class="plain">&ldquo;Show how your algorithmic systems work &mdash; and prove you've mitigated the risks they create.&rdquo;</div>
+<p>Very Large Online Platforms carry the heaviest duties, but systemic risk assessment reaches smaller platforms too.</p>
+<ul><li>Systemic risk assessment with evidence</li><li>Algorithmic transparency reports</li><li>Minor-protection evidence packages</li><li>Regulator-ready submissions</li></ul></div>
+</div>
+</div>
+</section>
+
+<section id="coverage">
+<div class="wrap">
+<div class="entry"><span class="no">Block 011 &middot; Coverage map</span><span class="rule"></span><span class="sealed" data-seal></span></div>
+<h2>Article by article. <i>Feature by feature.</i></h2>
+<p class="lead" style="margin-bottom:36px">The law names its requirements. Here is the exact engine feature built to answer each one &mdash; taken directly from the regulation map sealed inside the engine itself. No hand-waving: requirement on the left, mechanism on the right.</p>
+
+<div class="covrow head"><div class="cc">Requirement</div><div class="cc">What the law <b>demands</b></div><div class="cc">How the engine <b>answers it</b></div></div>
+
+<div class="covrow">
+<div class="cc cov-art">EU AI Act &middot; Article 9<small>Risk management system</small></div>
+<div class="cc cov-req">A <b>continuous, iterative risk management process</b> running across the AI system's whole lifecycle &mdash; risks identified, estimated and mitigated, not assessed once and filed away.</div>
+<div class="cc cov-how"><em>&#10003;</em>Continuous per-event risk scoring &mdash; every single decision, not a quarterly review<br><em>&#10003;</em>9 weighted core signals, plus any Signal Pack you load on top<br><em>&#10003;</em>Fully deterministic &mdash; identical inputs give identical outputs, forever</div>
+</div>
+
+<div class="covrow">
+<div class="cc cov-art">EU AI Act &middot; Article 12<small>Record keeping &amp; logging</small></div>
+<div class="cc cov-req">Automatic recording of events over the system's lifetime, with logs that ensure a level of <b>traceability appropriate to the system's risk</b> &mdash; records a regulator can rely on.</div>
+<div class="cc cov-how"><em>&#10003;</em>Every decision sealed into a SHA-256 hash chain at the moment it's made<br><em>&#10003;</em>Gapless per-key receipt sequence &mdash; a missing record is mathematically provable, not arguable<br><em>&#10003;</em>Public verification endpoint &mdash; anyone can re-check the whole chain, any time</div>
+</div>
+
+<div class="covrow">
+<div class="cc cov-art">EU AI Act &middot; Article 13<small>Transparency</small></div>
+<div class="cc cov-req">AI systems must be <b>sufficiently transparent</b> that the people deploying them can interpret the output and use it appropriately &mdash; no black-box verdicts.</div>
+<div class="cc cov-how"><em>&#10003;</em>Plain-language reason codes on every decision &mdash; velocity_spike, high_amount, country_shift, low_trust<br><em>&#10003;</em>Determinism proved by public challenge, not by a published listing &mdash; send any inputs, keep the fingerprint, send them again next year; the verdict must not move under an unchanged code fingerprint<br><em>&#10003;</em>Score, verdict, reasons and active pack version returned together in the same reply</div>
+</div>
+
+<div class="covrow">
+<div class="cc cov-art">EU AI Act &middot; Article 14<small>Human oversight</small></div>
+<div class="cc cov-req">High-risk AI must be designed so that <b>natural persons can effectively oversee it</b> &mdash; able to intervene, override or interrupt the system's decisions.</div>
+<div class="cc cov-how"><em>&#10003;</em>The CHALLENGE verdict &mdash; a built-in pathway that stops the action and asks a human<br><em>&#10003;</em><b>Commit-before-reveal</b> &mdash; the reviewer's own call is sealed before the machine's verdict is shown to them<br><em>&#10003;</em>Dwell time and divergence rate recorded per reviewer &mdash; rubber stamping becomes visible in the data<br><em>&#10003;</em>BLOCK verdicts trigger a real-time email alert with the sealed evidence attached</div>
+</div>
+
+<div class="covrow">
+<div class="cc cov-art">Online Safety Act 2023<small>UK &middot; in force</small></div>
+<div class="cc cov-req">Platforms where users interact carry a <b>duty of care</b> &mdash; illegal-content risk assessments, protections for children, and evidence of moderation Ofcom can inspect.</div>
+<div class="cc cov-how"><em>&#10003;</em>Guardian flags known grooming and manipulation patterns in real time<br><em>&#10003;</em>Every safety event sealed to the chain &mdash; a moderation evidence trail, not a policy PDF<br><em>&#10003;</em>CEOP, Childline and 999 one tap away for every child, always</div>
+</div>
+
+<div class="covrow">
+<div class="cc cov-art">ICO Children's Code<small>UK &middot; in force</small></div>
+<div class="cc cov-req">Services likely to be accessed by under-18s must put the <b>child's best interests first</b>: data minimisation, no profiling of children, human oversight of automated decisions.</div>
+<div class="cc cov-how"><em>&#10003;</em>Deterministic scoring &mdash; no behavioural profiling of children, ever<br><em>&#10003;</em>Message content never stored &mdash; only a fingerprint; privacy by design<br><em>&#10003;</em>Full audit trail of every automated decision touching a young user</div>
+</div>
+
+<div class="covrow">
+<div class="cc cov-art">Digital Services Act<small>EU 2022/2065</small></div>
+<div class="cc cov-req">Platforms must <b>assess and mitigate systemic risks</b> created by their algorithmic systems &mdash; and show the evidence, not just describe the intention.</div>
+<div class="cc cov-how"><em>&#10003;</em>Sealed, per-decision evidence of how algorithmic systems actually behaved<br><em>&#10003;</em>Chain records ready to attach to a systemic risk assessment or transparency report<br><em>&#10003;</em>Verifiable by the regulator directly &mdash; not just by you</div>
+</div>
+
+<div class="cov-note"><b>One more thing the engine does that most don't:</b> the regulation map above is itself sealed into the audit chain, alongside the version hash of every Signal Pack in use. Whenever coverage is updated to match new guidance, that change becomes a sealed, timestamped block &mdash; regulatory updates are auditable events, never silent edits. And to be straight with you: this table is a design mapping of engine features to legal obligations, built to support these requirements &mdash; it is not a certification, because no software alone can be one. Your lawyers stay in the loop; our chain gives them the evidence.</div>
+</div>
+</section>
+
+<section id="oversight">
+<div class="wrap">
+<div class="entry"><span class="no">Block 012 &middot; Human oversight</span><span class="rule"></span><span class="sealed" data-seal></span></div>
+<h2>Nobody can prove a person <i>thought about it.</i></h2>
+<p class="lead">We will say the thing the rest of this market avoids. <b>You cannot prove genuine human oversight happened.</b> Thinking is an internal state and no amount of logging reaches it. Any vendor telling you they have solved that is selling you something that does not exist.</p>
+<p class="lead" style="margin-top:16px"><b>But rubber stamping is not an internal state.</b> It is a pattern &mdash; and patterns leave marks, if you record the right things in the right order at the time. That part is solvable, and this is how.</p>
+
+<div class="steps" style="margin-top:40px">
+<div class="st"><div class="k">One &middot; Order</div><h3>Commit before reveal</h3><p>The case goes to the reviewer <b>without the machine's verdict</b>. Their own call and their reasoning are sealed first. Only then is the verdict revealed. Two blocks, in that order, in a chain that cannot be reordered &mdash; so nobody can have simply agreed with an answer they had already seen.</p></div>
+<div class="st"><div class="k">Two &middot; Attention</div><h3>The clock is on the record</h3><p>The gap between opening a case and committing to it is sealed with the decision. A <b>0.8 second approval</b> sits in the record permanently, next to a two minute one. Not proof of thought &mdash; but four hundred sub-second calls is not something anyone explains away.</p></div>
+<div class="st"><div class="k">Three &middot; Independence</div><h3>Divergence is measurable</h3><p>A reviewer who has <b>never once disagreed</b> with the machine is visible in the data. One who diverges sometimes is demonstrably exercising judgement. Agreement rate, median dwell and the proportion of sub-two-second calls, per reviewer, all sealed.</p></div>
+</div>
+
+<div class="sealnote" style="margin-top:34px">
+<h3>What an auditor actually gets</h3>
+<p>Not an assertion that oversight happened. <b>A dataset they can test</b> &mdash; and one a rubber stamper cannot hide inside. The reviewer's judgement, sealed before the answer was known. The time they took. How often they diverged. All of it in the same chain as the decision itself, anchored outside our reach.</p>
+<div class="ex"><em>opened</em>case OVS-3A05 &middot; material sha256 7e63&hellip; &middot; verdict withheld<br><em>committed</em>reviewer CHALLENGE &middot; dwell 74.2s &middot; reasoning sealed<br><em>revealed</em>machine said BLOCK &middot; reviewer diverged<br><em>meaning</em>this person decided before they knew &mdash; provable by the order of the blocks</div>
+<p style="margin-top:14px"><b>And the honest limit, because you will find it anyway:</b> a reviewer can leave a screen open, and dwell time is gameable by anyone deliberately gaming it. If a platform shows its own staff the verdict before calling us, the ordering guarantee is worth nothing. That constraint is documented in the code, not buried &mdash; the guarantee is only ever as good as the integration honouring it.</p>
+</div>
+</div>
+</section>
+
+<section id="anchor">
+<div class="wrap">
+<div class="entry"><span class="no" style="color:#fff">Block 013 &middot; The outside clock</span><span class="rule"></span><span class="sealed" data-seal></span></div>
+<h2 style="color:#fff">Pinned from both sides. <i>Before and after the fact.</i></h2>
+<p class="lead">A hash chain proves nothing was altered after the fact. On its own it does not prove <b>when</b> the chain was built &mdash; because in principle whoever runs the system could rebuild the whole thing and date it however they liked. Every vendor promising you an immutable audit trail has this hole in it. Most don't mention it.</p>
+<p class="lead" style="margin-top:16px"><b>So we moved the clock outside our own building.</b> At regular intervals the current tip of the chain is submitted to <b>OpenTimestamps</b>, which aggregates it with thousands of unrelated timestamps into a single Merkle root and commits that root to the <b>Bitcoin blockchain</b>. Several independent calendar servers do this in parallel, so no single one of them can fail, disappear or lie without the others contradicting it. From that moment the timestamp is not ours to move, not ours to re-issue, and not ours to quietly correct. Rewriting a sealed record would mean rewriting Bitcoin.</p>
+<p class="lead" style="margin-top:16px"><b>Said precisely, because a reviewer found us saying it loosely.</b> Anchoring is a property of an individual proof, not of the chain. Submitting a tip to OpenTimestamps is not the same as that proof being confirmed in a Bitcoin block &mdash; confirmation takes hours, and until it lands the proof is <b>pending</b>. So a tip is either covered by a confirmed proof or it is not, and we will not describe the chain as anchored while a proof covering it is still waiting.</p>
+<p class="lead" style="margin-top:16px"><b>Check the real state at <a href="/x/ots/status" style="color:var(--gold)">/x/ots/status</a></b> &mdash; it lists every proof, which are confirmed and which are pending, and returns the raw .ots file so you can verify it against Bitcoin without us. We publish that route because it is the one that can show us waiting.</p>
+
+<div class="anchorgrid">
+<div class="ag"><div class="k">What it proves</div><h3>This record existed, then</h3><p>Once a proof confirms, the chain state it covers is fixed in a public ledger you can check without asking us for anything. <b>Existence and integrity, evidenced by a third party</b> &mdash; not asserted by the vendor who produced the record. Before it confirms, the proof is pending and says so.</p></div>
+<div class="ag"><div class="k">Why it matters at audit</div><h3>Backdating stops being possible</h3><p>The usual challenge to any audit trail is "you could have written this last week." An anchored chain answers it with arithmetic instead of an assurance. <b>The regulator verifies it themselves.</b></p></div>
+<div class="ag"><div class="k">What you do</div><h3>Nothing to set up</h3><p>Tips are submitted for anchoring automatically, underneath every product. No wallet, no crypto, no tokens, no volatility, <b>nothing for you to hold or buy</b> &mdash; Bitcoin is used purely as a clock nobody owns. You never touch it.</p></div>
+<div class="ag"><div class="k">What you get</div><h3>A reference anyone can check</h3><p>Each anchor returns the chain tip it sealed and the transaction that carries it. Hand those two values to an auditor, a court or a customer and <b>they can verify it without your help.</b></p></div>
+</div>
+
+<div class="anchorline">
+<em>tip</em>the live chain state at the moment of anchoring<br>
+<em>stamp</em>submitted to OpenTimestamps &middot; aggregated into a Merkle root &middot; root committed to Bitcoin &mdash; hours, not seconds<br>
+<em>calendars</em>several independent servers stamp it &mdash; the count is returned with every anchor<br>
+<em>check</em><span class="g">/api/anchor-status</span> &mdash; live, no key needed, no permission needed<br>
+<em>state</em>a proof is <b>pending</b> until it lands in a block, then <span class="g">confirmed</span>. Both states are published. Pending is not hidden<br>
+<em>result</em>once confirmed, that record cannot have been created later than that block. <span class="g">Verifiable by anyone, forever, without us.</span>
+</div>
+
+<div class="anchorstraight">
+<b>Straight with you, because someone will ask:</b> no record verifies the truth of its own inputs &mdash; not a ledger, not a court transcript, not a bank's books. That is what recording is, and any vendor claiming to have solved it is selling something that does not exist. What <i>can</i> be proved is the decision itself, from both sides. <b>Before:</b> the input is sealed at the moment of capture, so it cannot be swapped afterwards to justify the verdict. <b>After:</b> the scoring is deterministic and the pack version is sealed alongside it, so anyone can re-run that input and get the identical verdict &mdash; it cannot be re-explained later either. The only thing outside the seal is whether the world matched the data at the instant it was captured. Everything after that instant is arithmetic, <b>and the story cannot be corrected in hindsight.</b>
+</div>
+</div>
+</section>
+
+<section id="network">
+<div class="wrap">
+<div class="entry"><span class="no">Block 014 &middot; The witness network</span><span class="rule"></span><span class="sealed" data-seal></span></div>
+<h2>One chain can be rebuilt. <i>Ten cannot.</i></h2>
+<p class="lead">A confirmed anchor stops us backdating anything older than it. Good &mdash; and still not the end of it. <b>So platforms witness each other.</b></p>
+<p class="lead" style="margin-top:16px"><b>This is running, not planned.</b> Four chains are live and exchanging tips right now, one of them unattended and hourly since the first of August with several hundred observations behind it. The list is public and machine-readable at <a href="/x/roster/list" style="color:var(--gold)">/x/roster/list</a> &mdash; no key, no account, no permission. Peers run a single file on a cron line; there is nothing to install and no code of ours inside their stack.</p>
+<p class="lead" style="margin-top:16px">Each platform periodically hands its current chain tip to its peers, and each peer seals that tip into <b>its own chain</b>. From that moment your history sits inside chains you do not control &mdash; chains that are themselves anchored externally. To rewrite your own past you would now need every peer who witnessed you to rewrite theirs in step and re-anchor all of it. That stops being a technical exercise and becomes a conspiracy, <b>and it gets harder with every platform that joins.</b></p>
+
+<div class="anchorgrid" style="background:var(--line);border-color:var(--line)">
+<div class="ag" style="background:#fbf9f4"><div class="k" style="color:var(--mutep)">What it takes</div><h3 style="color:var(--ink)">One request an hour</h3><p style="color:var(--mutep)">A chain tip is 64 characters. Recording one is a single sealed block. Ten platforms exchanging tips every hour is a few hundred blocks a day <b style="color:var(--ink)">between all of them.</b> The engineering was never the hard part.</p></div>
+<div class="ag" style="background:#fbf9f4"><div class="k" style="color:var(--mutep)">Who runs it</div><h3 style="color:var(--ink)">No single authority</h3><p style="color:var(--mutep)">Every platform keeps its own product, its own customers and its own pricing. No participant is the arbiter, <b style="color:var(--ink)">including us</b> &mdash; which is the only reason the record means anything. You cannot buy an integrity property, you can only participate in one.</p></div>
+<div class="ag" style="background:#fbf9f4"><div class="k" style="color:var(--mutep)">Who can check</div><h3 style="color:var(--ink)">Anyone</h3><p style="color:var(--mutep)">Ask whether we witnessed a given tip, and when, and you get a straight answer with the block it was sealed in. <b style="color:var(--ink)">The network is queryable by third parties</b>, not just described in marketing.</p></div>
+<div class="ag" style="background:#fbf9f4"><div class="k" style="color:var(--mutep)">Who goes quiet</div><h3 style="color:var(--ink)">Visibly</h3><p style="color:var(--mutep)">Peers who stop publishing show as current, then stale, then silent. Those words measure <b style="color:var(--ink)">time since we last saw them and nothing else</b> &mdash; they are not a claim about anyone's uptime, and a peer who pushes manually will read silent while working perfectly.</p></div>
+</div>
+
+
+<h3 style="font-family:var(--disp);font-weight:900;font-size:26px;margin-top:44px;letter-spacing:-0.015em">Three ways to submit. <i style="font-style:italic;color:var(--gold)">Each says a different thing.</i></h3>
+<p class="lead" style="margin-top:10px">A peer chooses the lane. Every lane is free, and the record says which one was used, so nobody's submission is described as stronger than it was.</p>
+
+<div class="lanes">
+<div class="lane"><div class="k">Lane one &middot; Open</div><h3>Anyone can submit</h3><p>No account, no key. Hand us a name and a tip and it is sealed. Deliberately open, because a verification network with a signup form is a customer list. <b>Everything submitted is sealed, including nonsense</b>, because the record is of what arrived.</p><span class="no">Does not prove who sent it</span></div>
+<div class="lane"><div class="k">Lane two &middot; Shared secret</div><h3>Bound to a secret</h3><p>An HMAC signature over the submission, using a secret both sides hold. <b>Stated exactly, because a reviewer asked us to:</b> this closes third-party submission under your name. It does <b>not</b> close submission by us under your name, because we hold the same secret.</p><span class="no">Does not exclude the operator</span></div>
+<div class="lane"><div class="k">Lane three &middot; Your own key</div><h3>Bound to a key we don't have</h3><p>You generate an Ed25519 keypair and keep the private half. <b>We store only the public half</b>, so we can check your signature and can never produce one. Rotation has to be signed by the key it replaces, so we cannot swap your key either.</p><span class="yes">Excludes us. Arithmetic, not a promise</span></div>
+</div>
+
+<div class="cov-note" style="margin-top:24px"><b>Why lane three exists:</b> two independent reviewers arrived at the same gap in the same week &mdash; a shared secret cannot exclude the party holding it. The fix isn't a policy or a pledge, it's a key we mathematically do not have. It's public at <span style="font-family:var(--mono)">/x/signed/spec</span>, and the verification route is open to anyone, because <b>a verification lane only account holders can check is not a verification lane.</b></div>
+
+<div class="sealnote" style="margin-top:34px">
+<h3>Five founding seats. Four taken.</h3>
+<p><b>Joining is free and stays free, at any seat, forever.</b> Witnessing is free. Every public verification route is free. The protocol code does not check whether anyone has paid, and it never will &mdash; an integrity property you can be cut off from is not one.</p>
+<p style="margin-top:12px">The first five chains are the founding cohort: <b>a say in the specification</b> the rest of the market ends up adopting, and an equal share of whatever the network ever earns. Four seats are filled. The fifth is open and being held for the right chain rather than the next one available.</p>
+<p style="margin-top:12px">Chain six onward joins free and is witnessed free, with no founding terms &mdash; the spec will already be written by then. <b>Five is not a marketing number.</b> It is how many integrations one person can support properly while getting this right.</p>
+<p style="margin-top:12px"><b>The honest limits, stated up front:</b> witnessing proves a tip existed at a time &mdash; it says nothing about whether the records behind it are true. Two platforms witnessing only each other prove very little; the strength comes from breadth, and a thin network is reported as thin. Nobody can be forced to keep publishing, and no design fixes that. Being listed on the roster is not partnership, endorsement or validation &mdash; it means a party submitted a tip. Those are properties of the design, not flaws we are hiding.</p>
+<div style="margin-top:20px"><a class="pbtn" href="/contact">Ask about the fifth seat &rarr;</a></div>
+</div>
+</div>
+</section>
+
+<section id="notaries">
+<div class="wrap">
+<div class="entry"><span class="no">Block 015 &middot; The notaries</span><span class="rule"></span><span class="sealed" data-seal></span></div>
+<h2>Sealing the things <i>that get argued about.</i></h2>
+<p class="lead">The engine seals decisions. These seal the processes around them &mdash; the parts that turn into a dispute eighteen months later, when everyone's memory has conveniently improved. Each one writes into the <b>same chain</b>, so the same verification and the same anchor cover all of it.</p>
+
+<div class="prod" style="border-top:none">
+<div class="pn">Data subject requests<small>Notary</small></div>
+<div>
+<p class="pd">Someone asks you to delete their data. Three things must be provable later: <b>that you received it, that you actually considered it, and that you answered inside the legal deadline.</b> Almost nobody can prove any of it &mdash; they have an email thread. This seals the whole lifecycle: received, assessed with the reasoning, extended, completed. The calendar-month deadline is fixed at receipt, and an extension is its own sealed block, so it cannot be applied retrospectively to cover a missed date.</p>
+<div class="pf"><em>&#10003;</em>The chain never holds the person's identity &mdash; the identifier is fingerprinted on arrival<br><em>&#10003;</em>Which answers the obvious objection: an append-only chain does not conflict with the right to erasure<br><em>&#10003;</em>The personal data is deleted in your systems as normal; what remains is a seal resolving to nothing<br><em>&#10003;</em>Overdue requests are one call away, not a spreadsheet nobody opened</div>
+</div>
+<div class="pp"><div class="amt">&#8212;</div><div class="per">included &middot; every plan</div></div>
+</div>
+
+<div class="prod">
+<div class="pn">Reconciliation<small>Notary</small></div>
+<div>
+<p class="pd">A sealed chain proves records were not altered afterwards. It does <b>not</b> prove they were true when written &mdash; and an operator who seals fiction on time has a tamper-evident chain of fiction. Everyone honest knows this. Almost nobody says it. So we do what auditors actually do: take the sealed claim, go to the operator's own live system, and check whether the two agree.</p>
+<div class="pf"><em>&#10003;</em>The sample is chosen from the live chain tip &mdash; unpredictable in advance, unchangeable afterwards<br><em>&#10003;</em>The selection is sealed <b>before</b> any data is requested, so the flattering records cannot be cherry-picked<br><em>&#10003;</em>Mismatches are sealed exactly as permanently as matches<br><em>&#10003;</em>A run that was planned and never submitted stays visible forever as an abandoned test</div>
+</div>
+<div class="pp"><div class="amt">&#8212;</div><div class="per">included &middot; every plan</div></div>
+</div>
+
+<div class="prod">
+<div class="pn">Declarations<small>Notary</small></div>
+<div>
+<p class="pd">You publish a file saying what must always be true of your decisions &mdash; <b>"payments over &pound;10,000 are never auto-approved", "every decision carries reasons"</b> &mdash; and every record is tested against it. The obvious objection is that you wrote your own rules. Two things answer it: <b>the rules are sealed before the records they judge</b>, so a standard cannot be retrofitted to an outcome; and every version is kept, so loosening your own standard becomes a dated, permanent, public act instead of a quiet edit.</p>
+<div class="pf"><em>&#10003;</em>Declaration hashed, versioned and sealed on publication<br><em>&#10003;</em>Violations of your own published rules sealed with the same permanence as passes<br><em>&#10003;</em>Full version history &mdash; the March standard stays readable in September<br><em>&#10003;</em>Weak rules prove weak things, which is exactly why the declaration itself is published</div>
+</div>
+<div class="pp"><div class="amt">&#8212;</div><div class="per">included &middot; every plan</div></div>
+</div>
+
+<div class="cov-note" style="margin-top:30px"><b>Why these sit on one engine and not four products:</b> every notary writes into the same chain as the decisions themselves. One verification endpoint covers all of it. One anchor covers all of it. Add a capability and it inherits the integrity properties of everything already there &mdash; <b>no separate log to reconcile, no second thing to trust.</b></div>
+</div>
+</section>
+
+<section id="evidence">
+<div class="wrap">
+<div class="entry"><span class="no">Block 016 &middot; The evidence pack</span><span class="rule"></span><span class="sealed" data-seal></span></div>
+<h2>The thing you actually <i>hand to the auditor.</i></h2>
+<p class="lead">Everything above produces a chain. A chain is not a deliverable. When a regulator, an insurer, a court or an enterprise customer asks you to prove it, you need <b>one file you can send them</b> &mdash; and it has to survive being read by someone whose job is to find the hole in it.</p>
+<p class="lead" style="margin-top:16px">So the pack does not summarise the chain. <b>It re-verifies it.</b> Every block is rewalked and rehashed from genesis at the moment the pack is built. A report tells you what a system claims about itself; this recomputes the arithmetic and fails loudly if it doesn't come out. Those are not the same product, and only one of them is worth anything in a dispute.</p>
+
+<div style="margin-top:38px">
+<div class="packrow"><div class="t">Re-verified</div><div class="b">Every block rehashed and relinked from the first one. <b>Not a count, not a status field</b> &mdash; the actual chain arithmetic, run again, in front of you.</div></div>
+<div class="packrow"><div class="t">Gapless</div><div class="b">Each key's records carry a sequence number issued at the moment of sealing, and the pack checks that sequence is <b>unbroken</b>. Tampering is one problem; quietly not recording something is the other one, and it is the one nobody else checks. A missing number is a missing record, and it cannot be hidden by deleting the block.</div></div>
+<div class="packrow"><div class="t">Witnessed</div><div class="b">A snapshot of who was watching &mdash; which independent operators had sealed your chain head, and when they last did it. <b>Internal integrity is the easy half.</b> This is the half that shows somebody outside your building was holding your history.</div></div>
+<div class="packrow"><div class="t">Self-sealing</div><div class="b">The pack hashes itself and seals that digest back into the chain. So the document you hand over is <b>itself in the record</b> &mdash; you cannot produce a flattering pack, send it, and later deny producing it.</div></div>
+<div class="packrow"><div class="t">Unbroken since</div><div class="b">A date the chain has been continuously verifiable from. It costs nothing to start and it <b>compounds every day you keep going</b>. Two years of it is not something a competitor can buy, build or catch up on.</div></div>
+<div class="packrow"><div class="t">Stated limits</div><div class="b">The pack carries its own list of what it does <b>not</b> prove, printed inside the document rather than in our marketing. An auditor who finds the caveats already written down stops looking for the ones you hid.</div></div>
+</div>
+
+<div style="margin-top:34px;display:flex;gap:12px;flex-wrap:wrap">
+<a class="bgold" href="/pack">Build your evidence pack &rarr;</a>
+<a class="bghost" href="/x/pack/spec">Read the spec &rarr;</a>
+</div>
+
+<div class="anchorstraight">
+<b>Why this is the part that gets bought.</b> Nobody purchases a hash chain. They purchase the twenty minutes on a Friday when the request lands and the answer is a file rather than a fortnight. Everything else on this page exists to make that file worth reading.
+</div>
+</div>
+</section>
+
+<section id="conformance">
+<div class="wrap">
+<div class="entry"><span class="no">Block 017 &middot; Conformance</span><span class="rule"></span><span class="sealed" data-seal></span></div>
+<h2>The instrument that would <i>catch us failing.</i></h2>
+<p class="lead">Three things on this page have a soft edge, and we would rather name them than wait for you to find them. <b>Oversight sealing only works if the platform using it doesn't show reviewers the verdict early. Witnessing only means something with breadth. A declaration is only as strong as the rules in it.</b></p>
+<p class="lead" style="margin-top:16px">None of those can be fixed by arithmetic. All three can be <b>measured</b> &mdash; and a weakness somebody is measuring is a very different thing from one nobody is.</p>
+
+<div class="steps" style="margin-top:40px">
+<div class="st"><div class="k">One &middot; Probes</div><h3>A case with a known answer</h3><p>A probe is a real case with the machine's verdict <b>deliberately set wrong</b>. The reviewer cannot tell it apart from any other. Agree with it and you didn't evaluate it. And if someone's probe agreement matches their normal agreement, that is consistent with the verdict being visible before they committed &mdash; which is how you test an integration you cannot see inside.</p></div>
+<div class="st"><div class="k">Two &middot; Breadth</div><h3>Thin networks say so</h3><p>Fewer than three live peers reports as <b>weak</b>. A single peer carries an explicit warning that two parties witnessing only each other can still collude. It doesn't stop a thin network &mdash; it stops one being presented as a thick one.</p></div>
+<div class="st"><div class="k">Three &middot; Strength</div><h3>Rules that never fire</h3><p>Every rule is run against real records and reported on individually. One that has never constrained a single record is named in the output as <b>decoration, not a standard.</b> You can still publish a weak declaration. You can't publish one quietly.</p></div>
+</div>
+
+<div class="sealnote" style="margin-top:34px">
+<h3>Why build the thing that could embarrass us</h3>
+<p>Because "trust our design" is what everyone else says, and it is worth nothing. <b>An evidence layer that cannot detect its own failure modes is just a nicer-looking promise.</b> Ours reports a rubber stamper who caught none of eight deliberately wrong verdicts. It reports our own rules when they constrain nothing. It reports our witness network as weak when it is.</p>
+<p style="margin-top:12px">The probe method is not ours &mdash; it comes from a point <b>James Stokes of Red Flag AI Pro</b> made publicly about slipping a known error into a review queue and seeing who catches it. It was the right idea and it is credited in our whitepaper.</p>
+<p style="margin-top:12px"><b>And its own limits:</b> a probe tests a process, not a person &mdash; someone can catch one and rubber stamp the next hundred. An operator who works out which cases are probes controls their own screens. None of this is enforcement. It makes the alternative visible, which is the most an evidence layer can honestly claim to do.</p>
+</div>
+</div>
+</section>
+
+<section id="verify">
+<div class="wrap">
+<div class="entry"><span class="no" style="color:#fff">Block 018 &middot; The Proving Ground</span><span class="rule"></span><span class="sealed" data-seal></span></div>
+<h2 style="color:#fff">Don't take any of it <i>on trust.</i></h2>
+<p class="lead">Everything above this line is a claim. Below it is the live engine &mdash; no account, no email, no key. Send it a case and it scores it, seals it into the production chain, tells you exactly what would have changed the answer, and hands you the block number so you can check the lot yourself at endpoints that have never heard of you.</p>
+
+<div class="pgtabs">
+<button class="pgtab on" id="pgt-run" onclick="pgTab('run')">1 &middot; Run a decision</button>
+<button class="pgtab" id="pgt-rev" onclick="pgTab('rev')">2 &middot; Take the review yourself</button>
+</div>
+
+<!-- ============ 1. RUN A DECISION ============ -->
+<div class="pgpanel" id="pgp-run">
+  <div class="pgform">
+    <div class="pgf">
+      <label for="pg-trust">Trust history <span class="pgv" id="pg-trust-v">0.28</span></label>
+      <input type="range" id="pg-trust" min="0" max="1" step="0.01" value="0.28" oninput="pgSync()">
+      <span class="pghint">How this user has behaved before. 1.00 is spotless.</span>
+    </div>
+    <div class="pgf">
+      <label for="pg-amount">Amount <span class="pgv">&pound;<span id="pg-amount-v">4200</span></span></label>
+      <input type="range" id="pg-amount" min="0" max="10000" step="50" value="4200" oninput="pgSync()">
+      <span class="pghint">Log-scaled, so the first pound counts far more than the ten-thousandth.</span>
+    </div>
+    <div class="pgf">
+      <label for="pg-v60">Actions in the last 60 seconds <span class="pgv" id="pg-v60-v">14</span></label>
+      <input type="range" id="pg-v60" min="0" max="40" step="1" value="14" oninput="pgSync()">
+      <span class="pghint">Bursts are what automated attacks look like.</span>
+    </div>
+    <div class="pgf">
+      <label for="pg-v5m">Actions in the last 5 minutes <span class="pgv" id="pg-v5m-v">22</span></label>
+      <input type="range" id="pg-v5m" min="0" max="100" step="1" value="22" oninput="pgSync()">
+      <span class="pghint">Independent of the others. Move one thing at a time and the counterfactual is exact.</span>
+    </div>
+    <div class="pgf">
+      <label for="pg-v1h">Actions in the last hour <span class="pgv" id="pg-v1h-v">60</span></label>
+      <input type="range" id="pg-v1h" min="0" max="400" step="5" value="60" oninput="pgSync()">
+      <span class="pghint">The slowest window, and the least weighted.</span>
+    </div>
+    <div class="pgf">
+      <label for="pg-dev">Device risk <span class="pgv" id="pg-dev-v">0.35</span></label>
+      <input type="range" id="pg-dev" min="0" max="1" step="0.01" value="0.35" oninput="pgSync()">
+      <span class="pghint">Your own device signal, if you have one. Zero if not.</span>
+    </div>
+    <div class="pgf">
+      <label for="pg-anom">Behavioural anomaly <span class="pgv" id="pg-anom-v">0.40</span></label>
+      <input type="range" id="pg-anom" min="0" max="1" step="0.01" value="0.40" oninput="pgSync()">
+      <span class="pghint">Your own anomaly signal. Zero if not.</span>
+    </div>
+    <div class="pgf">
+      <label for="pg-country">Country</label>
+      <select id="pg-country" onchange="pgSync()">
+        <option>UK</option><option>US</option><option>DE</option><option>FR</option>
+        <option>IE</option><option>NL</option><option>SE</option>
+        <option value="XX">Somewhere off the safe list</option>
+      </select>
+      <label class="pgcheck"><input type="checkbox" id="pg-shift" checked> Country changed since their last action</label>
+    </div>
+  </div>
+
+  <div class="pgactions">
+    <button class="bgold" id="pg-run-btn" onclick="pgRun()">Run it through the live engine &rarr;</button>
+    <span class="pgnote">Real engine. Real chain. Nothing about you is recorded.</span>
+  </div>
+
+  <div id="pg-result" class="pgresult" aria-live="polite"></div>
+</div>
+
+<!-- ============ 2. TAKE THE REVIEW ============ -->
+<div class="pgpanel hide" id="pgp-rev">
+  <p class="pglead">Article 14 says a human must be able to oversee the machine. Everyone claims it. Almost nobody can show the difference between a reviewer who decided and one who agreed with an answer already on their screen.</p>
+  <p class="pglead"><b>So here is the case without the answer.</b> Your verdict gets sealed first. Ours is revealed after. The chain fixes that order permanently &mdash; and the clock is running.</p>
+
+  <div class="pgactions" id="pg-rev-start">
+    <button class="bgold" onclick="pgReview()">Give me a case &rarr;</button>
+    <span class="pgnote">You commit once. That is rather the point.</span>
+  </div>
+
+  <div id="pg-case" class="pgcase hide">
+    <div class="pgclockbar">
+      <span class="pgclocklbl">Time on this case</span>
+      <span class="pgclock" id="pg-clock">0.0s</span>
+    </div>
+    <div id="pg-material" class="pgmaterial"></div>
+    <div class="pgverdicts">
+      <button class="pgvbtn allow" onclick="pgCommit('allow')">Allow it</button>
+      <button class="pgvbtn chal" onclick="pgCommit('challenge')">Send to a human</button>
+      <button class="pgvbtn block" onclick="pgCommit('block')">Block it</button>
+    </div>
+    <p class="pgnote" style="text-align:center;margin-top:14px">The engine has already decided. You will not see it until you have.</p>
+  </div>
+
+  <div id="pg-rev-result" class="pgresult" aria-live="polite"></div>
+</div>
+
+<div class="pgcharts" id="pg-charts">
+  <div class="pgchead">
+    <span class="pgclbl2">Live figures</span>
+    <span class="pgcsub" id="pgc-gen">loading&hellip;</span>
+  </div>
+  <div class="pgcgrid">
+    <div class="pgcard">
+      <div class="pgctitle">Chain growth <span id="pgc-h">&mdash;</span></div>
+      <div class="pgcbody"><svg id="pgc-chain" viewBox="0 0 300 90" preserveAspectRatio="none" role="img" aria-label="Blocks sealed per hour over the last 24 hours"></svg></div>
+      <div class="pgcfoot">Blocks sealed per hour, last 24 hours. Every source, one sequence.</div>
+    </div>
+    <div class="pgcard">
+      <div class="pgctitle">Where decisions land <span id="pgc-n">&mdash;</span></div>
+      <div class="pgcbody"><svg id="pgc-hist" viewBox="0 0 300 90" preserveAspectRatio="none" role="img" aria-label="Distribution of decision scores with thresholds marked"></svg></div>
+      <div class="pgcfoot">Public scores across the range. The two lines are 0.35 and 0.70 &mdash; not chosen after the fact.</div>
+    </div>
+    <div class="pgcard">
+      <div class="pgctitle">How long reviewers took <span id="pgc-r">&mdash;</span></div>
+      <div class="pgcbody"><svg id="pgc-dwell" viewBox="0 0 300 90" preserveAspectRatio="none" role="img" aria-label="Distribution of reviewer dwell times"></svg></div>
+      <div class="pgcfoot" id="pgc-dwellfoot">Time between seeing a case and committing to a verdict.</div>
     </div>
   </div>
 </div>
 
+<p class="pgfoot">Every case run here becomes a genuine block in the production chain, covered by the same external timestamp as every customer decision. Public endpoints are rate limited, and the arithmetic is published in the <a href="/whitepaper">whitepaper</a> if you would rather check it than run it.</p>
+
+<div class="pgcharts" style="margin-top:44px">
+<div class="pgchead">
+  <span class="pgclbl2">The ordering test &mdash; ten claims, published about ourselves</span>
+  <span class="pgcsub">every one of these is open, unauthenticated, and testable right now</span>
+</div>
+
+<p class="pglead" style="margin:0 auto 20px">We publish a conformance document listing ten checks, each carrying <b>two separate flags</b>: we built this, and &mdash; separately &mdash; you can verify it without an account. Those are different claims, and most of this market blurs them into one. Then we run a checker against our own document that refuses to mark generously: <b>reachable is not verified.</b></p>
+
+<div class="anchorline" style="margin-top:0">
+<em>the document</em><a href="/.well-known/ordering-test.json" class="g" style="color:#7fe3b0;text-decoration:none">/.well-known/ordering-test.json</a> &mdash; the ten claims, and which are publicly demonstrable<br>
+<em>the checker</em><a href="/self-check" class="g" style="color:#7fe3b0;text-decoration:none">/self-check</a> &mdash; runs all ten in your own browser and grades us without mercy<br>
+<em>the console</em><a href="/console" class="g" style="color:#7fe3b0;text-decoration:none">/console</a> &mdash; grant authority, delegate it, exercise it, and watch the boundary hold (needs a key)
+</div>
+
+<div class="pgcgrid" style="margin-top:22px">
+<div class="pgcard">
+<div class="pgctitle">Prove a record is <span>not there</span></div>
+<div class="pgcfoot" style="margin-top:0">A hash chain proves inclusion. Almost nobody does exclusion. Ask for any value at all and get back the two adjacent leaves with consecutive indices &mdash; nothing can sit between them, against a root committed before you asked.</div>
+<div class="pgmono" style="margin-top:12px">
+<em>periods</em><a href="/x/complete/periods">/x/complete/periods</a><br>
+<em>absence</em><a href="/x/complete/prove?period=2026-07&amp;value=8">/x/complete/prove?period=&amp;value=</a><br>
+<em>rules</em><a href="/x/complete/spec">/x/complete/spec</a>
+</div>
+</div>
+
+<div class="pgcard">
+<div class="pgctitle">Prove the log <span>only ever grew</span></div>
+<div class="pgcfoot" style="margin-top:0">RFC 6962 consistency proofs, deliberately unmodified, so existing Certificate Transparency verifiers work against them without new code. Hand back any tip we ever served and we prove it is still on the chain we serve today.</div>
+<div class="pgmono" style="margin-top:12px">
+<em>tip</em><a href="/x/consistency/root">/x/consistency/root</a><br>
+<em>prefix</em><a href="/x/consistency/proof">/x/consistency/proof?first=&amp;second=</a><br>
+<em>ancestry</em><a href="/x/consistency/ancestor">/x/consistency/ancestor?tip=</a>
+</div>
+</div>
+
+<div class="pgcard">
+<div class="pgctitle">Prove the clock is <span>not ours</span></div>
+<div class="pgcfoot" style="margin-top:0">The chain tip goes to OpenTimestamps and into Bitcoin, and other platforms witness our chain so we cannot rebuild it either. The anchored tip is provably on <i>this</i> log, not a substituted one.</div>
+<div class="pgmono" style="margin-top:12px">
+<em>anchor</em><a href="/api/anchor-status">/api/anchor-status</a><br>
+<em>peers</em><a href="/x/witness/peers">/x/witness/peers</a><br>
+<em>our tip</em><a href="/x/witness/tip">/x/witness/tip</a>
+</div>
+</div>
+
+<div class="pgcard">
+<div class="pgctitle">Prove the rules <span>were bound in</span></div>
+<div class="pgcfoot" style="margin-top:0">The ruleset version is a component of the digest sealed with the decision, not a field beside it. The response hands back the exact string that was hashed &mdash; SHA-256 it yourself and confirm. No scoring logic is disclosed at any point.</div>
+<div class="pgmono" style="margin-top:12px">
+<em>packs</em><a href="/x/rulebind/packs">/x/rulebind/packs</a><br>
+<em>prove</em>/x/rulebind/prove <span style="color:rgba(255,255,255,0.3)">(POST)</span>
+</div>
+</div>
+
+<div class="pgcard">
+<div class="pgctitle">Prove it is <span>deterministic</span></div>
+<div class="pgcfoot" style="margin-top:0">Send any inputs you like. Keep the fingerprint. Send the identical inputs next month from anywhere. If the verdict ever moves under an unchanged code fingerprint, the engine is not deterministic and you hold the proof.</div>
+<div class="pgmono" style="margin-top:12px">
+<em>rules</em><a href="/x/replay/spec">/x/replay/spec</a><br>
+<em>fingerprint</em><a href="/x/replay/fingerprint">/x/replay/fingerprint</a><br>
+<em>challenge</em>/x/replay/challenge <span style="color:rgba(255,255,255,0.3)">(POST)</span>
+</div>
+</div>
+
+<div class="pgcard">
+<div class="pgctitle">Prove the agent <span>was entitled</span></div>
+<div class="pgcfoot" style="margin-top:0">Every authority decision, traced to the human who granted it, with the person who accepted the risk named separately. Export one as a signed bundle and check it on your own machine with a script that never contacts us.</div>
+<div class="pgmono" style="margin-top:12px">
+<em>decisions</em><a href="/x/continuity/decisions">/x/continuity/decisions</a><br>
+<em>proof</em><a href="/x/continuity/proof">/x/continuity/proof?evaluation=</a><br>
+<em>checker</em><a href="/verify-authority.py">/verify-authority.py</a>
+</div>
+</div>
+</div>
+
+<p class="pgfoot" style="margin-top:26px">At the last run: <b style="color:#7fe3b0">eight verified, zero failed, two still amber.</b> The two are reported as not yet demonstrable by an outside party, and they stay that way until they genuinely are &mdash; because a conformance document whose author scores full marks on the day he publishes it is a marketing page.</p>
+</div>
+</div>
+</section>
+
+
+
+<section id="authority">
+<div class="wrap">
+<div class="entry"><span class="no">Block 019 &middot; Authority</span><span class="rule"></span><span class="sealed" data-seal></span></div>
+<h2>Authority, derived. <i>Not assumed.</i></h2>
+<p class="lead">Everything above proves what your AI <b>did</b>. This proves it was <b>entitled to</b>. An agent takes an action; it got its authority from another agent, which got it from a system, which got it from a person. Nothing in the standard governance stack can show the authority used at the end derives from the authority granted at the start. Permissions answer one hop. Audit logs describe the aftermath. <b>Neither derives anything.</b></p>
+
+<div class="steps" style="margin-top:40px">
+<div class="st"><div class="k">One &middot; Derivation</div><h3>Every hop, back to a human</h3><p>Every grant points at a parent and terminates at a named human principal. Scope, limits, purpose and validity <b>must narrow at every hop</b> &mdash; a child can inherit authority or reduce it, never widen it. A grant with no parent and no human issuer is not a root, it is an orphan, and it is refused.</p></div>
+<div class="st"><div class="k">Two &middot; At execution</div><h3>Re-derived, not trusted</h3><p>The whole chain is re-derived at the <b>instant of execution</b>, not trusted from the instant of issue &mdash; because the interesting failures are never at the last hop. A parent revoked three hops up kills a child credential that is still technically valid, instantly, without anyone having to go and find it.</p></div>
+<div class="st"><div class="k">Three &middot; Accountability</div><h3>Who accepted the risk</h3><p>Every lineage names a person who accepts the risk of that authority <b>existing</b> &mdash; separately from who granted it and who exercises it. An issuer says you may. A subject acts. Neither is a person putting their name to the capability being switched on, and <b>that is the name an incident needs.</b></p></div>
+</div>
+
+<div class="sealnote" style="margin-top:34px">
+<h3>And the proof leaves the building</h3>
+<p>Export any authority decision and it comes back as a <b>signed bundle</b> carrying the entire authority path exactly as it stood at that instant, the parameters it was judged against, every digest, and an Ed25519 signature. Then check it somewhere else &mdash; with a script that has no dependencies, makes no network calls, and does not phone home, because a verification tool that reports back to the party being verified is not a verification tool.</p>
+<div class="ex"><em>get it</em>curl -sO https://sebbi.pro/verify-authority.py<br><em>run it</em>curl -s "https://sebbi.pro/x/continuity/proof?evaluation=&lt;id&gt;" | python3 verify-authority.py -<br><em>it checks</em>the signature &middot; every digest recomputed &middot; the whole derivation re-run from the published rules<br><em>then</em>it reaches its own verdict &mdash; and says so if that verdict disagrees with ours</div>
+<p style="margin-top:14px"><b>And when authority cannot be derived, you do not get BLOCK.</b> You get a proof of the refusal &mdash; which grant, which invariant, at which hop &mdash; and the verifier independently reproduces that failure in the same place. An agent that can prove it was <i>not</i> authorised is a different kind of object to one that was simply denied.</p>
+<p style="margin-top:14px"><b>The honest limits, as everywhere else on this page:</b> this proves authority was derivable from a human grant. It does not prove the human should have granted it, or that the parameters describe something that really happened. Grants are authenticated by sealing rather than per-issuer signatures, so an outside party verifies them through the chain rather than entirely offline. And the risk half of a composed verdict cannot be re-derived without the scoring engine &mdash; which the bundle states plainly rather than glosses over.</p>
+</div>
+
+<div class="cov-note" style="margin-top:26px;font-family:var(--mono);font-size:11px;line-height:2">
+<em style="font-style:normal;color:var(--gold);margin-right:8px">the rules</em><a href="/x/continuity/spec">/x/continuity/spec</a> &mdash; enough to reimplement the evaluator and disagree with us<br>
+<em style="font-style:normal;color:var(--gold);margin-right:8px">the decisions</em><a href="/x/continuity/decisions">/x/continuity/decisions</a> &mdash; real sealed evaluations, blocks listed beside allows<br>
+<em style="font-style:normal;color:var(--gold);margin-right:8px">the path</em><a href="/x/continuity/trace">/x/continuity/trace?grant=</a> &mdash; every hop, root first, with who accepted the risk<br>
+<em style="font-style:normal;color:var(--gold);margin-right:8px">the proof</em><a href="/x/continuity/proof">/x/continuity/proof?evaluation=</a> &mdash; the signed, portable bundle<br>
+<em style="font-style:normal;color:var(--gold);margin-right:8px">the key</em><a href="/x/continuity/pubkey">/x/continuity/pubkey</a> &mdash; Ed25519, RFC 8032, verifiable with any standard library<br>
+<em style="font-style:normal;color:var(--gold);margin-right:8px">the checker</em><a href="/verify-authority.py">/verify-authority.py</a> &mdash; one file, no dependencies, no network
+</div>
+
+<div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:26px">
+<a href="/self-check" class="bgold">Run every check we publish &rarr;</a>
+<a href="/whitepaper" class="pbtn">Read the whitepaper &rarr;</a>
+<a href="/developers" class="pbtn">Developer docs &rarr;</a>
+</div>
+</div>
+</section>
+
+<section id="install">
+<div class="wrap">
+<div class="entry"><span class="no">Block 020 &middot; Install</span><span class="rule"></span><span class="sealed" data-seal></span></div>
+<h2>Five minutes. <i>Start to sealed.</i></h2>
+<p class="lead">No build step, no container, no dependencies to install, nothing added to your requirements file. If your organisation reviews new libraries before they go near production, this is one readable file rather than a supply chain.</p>
+
+<div class="inst">
+
+<div class="instep">
+<h3>Get your key</h3>
+<p>Fill in the form below. The key, your referral code and the install guide arrive instantly. <b>No card, nothing to cancel</b> &mdash; free for 90 days.</p>
+</div>
+
+<div class="instep">
+<h3>Drop in one file</h3>
+<p>Download <b>sebbi_sdk.py</b> and put it next to your code. Standard library only, so there is nothing to install and nothing new in your dependency tree.</p>
+<div class="cmd"><span class="c"># check it works before you wire it in</span><br>python3 sebbi_sdk.py <span class="g">--selftest</span></div>
+</div>
+
+<div class="instep">
+<h3>Set two values</h3>
+<p>Your key, and the name your records belong to. Environment variables, so nothing sensitive goes near your repository.</p>
+<div class="cmd">SEBBI_API_KEY=<span class="g">al_live_your_key</span><br>SEBBI_CHAIN=<span class="g">yourcompany.com</span><br><span class="c"># recommended: keeps records safe if we're unreachable</span><br>SEBBI_SPOOL=<span class="g">/var/spool/sebbi</span></div>
+</div>
+
+<div class="instep">
+<h3>Add the line</h3>
+<p>Above any function whose decisions you need to prove. <b>That is the integration.</b> Nothing else in your code changes.</p>
+<div class="cmd"><span class="k">from</span> sebbi_sdk <span class="k">import</span> witness<br><br><span class="g">@witness()</span><br><span class="k">def</span> approve_loan(application):<br>&nbsp;&nbsp;&nbsp;&nbsp;<span class="c"># unchanged</span><br>&nbsp;&nbsp;&nbsp;&nbsp;<span class="k">return</span> decision</div>
+</div>
+
+<div class="instep">
+<h3>Check it landed</h3>
+<p>Every call now carries a receipt with its position in the chain. Print one, or read the counters, and you are done.</p>
+<div class="cmd"><span class="k">from</span> sebbi_sdk <span class="k">import</span> receipt_for, stats<br><br>result = approve_loan(app)<br><span class="k">print</span>(receipt_for(result))&nbsp;&nbsp;<span class="c"># position + chain tip</span><br><span class="k">print</span>(stats())&nbsp;&nbsp;<span class="c"># sent, sealed, dropped</span></div>
+</div>
+
+</div>
+
+<div class="sealnote">
+<h3>Not on Python?</h3>
+<p>The whole protocol is a hash and one HTTP call, and it is published in full &mdash; run <b>python3 sebbi_sdk.py --explain</b> and you get the exact canonical form, the request shape and the rules. It ports in an hour to anything. <b>Nothing about it is privileged</b>, and we would rather you wrote your own than waited on us.</p>
+<p style="margin-top:12px"><b>Running Sebdog instead?</b> Then there is no SDK and no key in your code at all &mdash; the engine runs on your hardware and your application talks to it over your own network. <a href="#onprem" style="color:var(--gold)">How that works &rarr;</a></p>
+</div>
+</div>
+</section>
+
+<section id="signup">
+<div class="wrap">
+<div class="entry"><span class="no">Block 021 &middot; Start</span><span class="rule"></span><span class="sealed" data-seal></span></div>
+<h2>AILeash API key. <i>90 days free.</i></h2>
+<p class="lead">Pick a product, add your name and email. Key, referral code and a step-by-step installation guide arrive instantly &mdash; everything free for 90 days, no card. When the trial ends you'll be directed to a secure Stripe payment reflecting only the real devices that used your key.</p>
+
+<div class="tabs">
+<button class="tab on" id="tab-aileash" onclick="setProduct('aileash')">AILeash</button>
+<button class="tab" id="tab-sonicboom" onclick="setProduct('sonicboom')">SonicBoom</button>
+<button class="tab" id="tab-sentinel" onclick="setProduct('sentinel')">Sentinel</button>
+<button class="tab" id="tab-guardian" onclick="setProduct('guardian')">Guardian</button>
+<button class="tab" id="tab-sebdog" onclick="setProduct('sebdog')">Sebdog</button>
+<button class="tab" id="tab-tokensaver" onclick="setProduct('tokensaver')">Token Saver</button>
+</div>
+
+<div class="fr">
+<div class="f"><label for="fn">First name</label><input type="text" id="fn" placeholder="Justin"></div>
+<div class="f"><label for="ln">Last name</label><input type="text" id="ln" placeholder="Smith"></div>
+</div>
+<div class="f"><label for="em">Email address</label><input type="email" id="em" placeholder="you@company.com"></div>
+<div class="f"><label for="ph">Phone number</label><input type="tel" id="ph" placeholder="+44 7700 000000"></div>
+<div class="f"><label for="org">Platform or company name</label><input type="text" id="org" placeholder="e.g. GameZone / My Platform"></div>
+<div class="f"><label for="dv">Estimated devices</label><input id="dv" type="number" min="1" step="1" value="1000" placeholder="Type any number, e.g. 8000000"></div>
+<input class="refin" type="text" id="ref-code" placeholder="Referral code (optional) &mdash; e.g. REF-JOHN-1234" aria-label="Referral code, optional">
+<button class="gobtn" id="go-btn" onclick="doSignup()">Get AILeash API key &middot; 90 days free &rarr;</button>
+<div class="merr" id="msg-err"></div>
+<div class="mok" id="msg-ok"></div>
+
+<div class="keybox" id="key-box">
+<div class="kl">Your API key &mdash; save it now</div>
+<div class="kv" id="key-val"></div>
+<div class="refbox" id="ref-box"><div class="kl">Your referral code</div><div class="c" id="ref-code-display"></div><p>Share it with anyone. Every device they sign up pays you 10p a month, for as long as it stays.</p></div>
+<div class="usage"><em>POST</em> https://sebbi.pro/api/govern<br>Authorization: Bearer <em id="key-prev">YOUR_KEY</em><br><span style="color:rgba(255,255,255,0.22)">Free for 90 days &middot; 50p per device after the trial &middot; billed via Stripe on real devices only</span></div>
+<div id="shieldbox" style="display:none;margin-top:14px;border:1px dashed rgba(201,168,76,0.5);border-radius:4px;padding:14px">
+<div class="kl">Your shield &mdash; live-verified, put it on your site</div>
+<div style="display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap;margin-top:8px">
+<img id="shieldimg" src="" alt="AILeash shield" width="95" style="flex-shrink:0">
+<div style="flex:1;min-width:200px">
+<p style="font-size:12px;color:rgba(255,255,255,0.45);line-height:1.6;margin-bottom:8px">This badge is drawn live by our server. It shows gold and your company name only while your account is active &mdash; copied or faked, it renders grey UNVERIFIED.</p>
+<div class="kv" id="shieldcode" style="font-size:9.5px"></div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</section>
+
+</main>
+
+<footer>
+<div class="fin">
+<div>
+<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
+<svg width="26" height="26" viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="13.5" fill="none" stroke="#c9a84c" stroke-width="2.6" stroke-dasharray="66 20" stroke-linecap="round" transform="rotate(-50 16 16)"/><circle cx="26.5" cy="7" r="3.1" fill="#c9a84c"/><circle cx="16" cy="16" r="3.4" fill="#0a0f1e"/></svg>
+<span style="font-family:var(--disp);font-weight:900;font-size:19px;color:#fff">AI<b style="color:var(--gold)">Leash</b></span>
+</div>
+<div style="font-family:var(--mono);font-size:9px;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,0.25);margin-bottom:12px">Monop Content &middot; Blyth, Northumberland, UK</div>
+<p class="fdesc">Six AI compliance, safety and cost products on one tamper-evident engine, extended by Signal Packs, authority continuity with exportable proof, human-oversight sealing, mutual witnessing and the DSR, reconciliation and declaration notaries. Built to support EU AI Act Articles 9, 12, 13 and 14, the Online Safety Act, the ICO Children's Code and the DSA. Free for 90 days, then 50p per device per month. You keep the rest.</p>
+</div>
+<div><h4>Products</h4><a href="#products">AILeash</a><a href="/sonicboom">SonicBoom</a><a href="/sentinel">Sentinel</a><a href="/guardian-parent">Guardian</a><a href="#onprem">Sebdog &middot; on your hardware</a><a href="/tokensaver">Token Saver &middot; cuts your model bill</a></div>
+<div><h4>Tools</h4><a href="/pack">Evidence pack &middot; build and seal one</a><a href="#evidence">Evidence pack &middot; what it proves</a><a href="/savings">Savings &middot; what a proof layer costs against what you run now</a><a href="/tokensaver">Token Saver &middot; stop buying the same answer twice</a><a href="/x/tokensaver/spec">Token Saver spec &middot; every weight and rule, no key needed</a><a href="#authority">Authority &middot; proof an agent was entitled to act</a><a href="/self-check">Self check &middot; run every claim we publish</a><a href="/verify-authority.py">Offline verifier &middot; check a proof without us</a><a href="#oversight">Human oversight &middot; commit before reveal</a><a href="#sdk">SDK &middot; one line of code</a><a href="/witness">Witness network &middot; the live peer list</a><a href="/x/roster/list">Roster &middot; raw, no key needed</a><a href="/x/ots/status">Anchor status &middot; confirmed and pending</a><a href="/x/signed/spec">Signed submission &middot; your key, not ours</a><a href="#network">Witness network &middot; founding cohort</a><a href="#notaries">Notaries &middot; DSR, reconciliation, declarations</a><a href="#conformance">Conformance &middot; probes and breadth</a><a href="/signal-packs">Signal Packs &middot; build your own risk packs</a><a href="/pay-check">Payment Notary &middot; beat invoice fraud</a><a href="/notary">Profile Notary &middot; seal your identity</a><a href="/seal">Seal a post &middot; free, no account</a><a href="/verify">Verify a sealed post</a><a href="/brain">Brain &middot; instruction governance</a><a href="/scan">AI Act scanner</a><a href="/reseller">Partner programme</a><a href="/report-threat">Report a threat</a><a href="/compliance-assistant">AI assistant</a></div>
+<div><h4>Resources</h4><a href="/developers">Developers</a><a href="#install">Install in 5 minutes</a><a href="/whitepaper">Whitepaper</a><a href="/contact">Contact</a><a href="#signup">Get API key</a><a href="/referrals">My referrals</a></div>
+</div>
+<div class="fbot"><span>&copy; 2026 Monop Content &middot; Justin Antony Dobson &middot; Blyth, UK</span><span>EU AI Act Art. 9 &middot; 12 &middot; 13 &middot; 14 &middot; Online Safety Act &middot; ICO Children's Code &middot; DSA</span></div>
+</footer>
+
 <script>
+/* ================= platform JS (same endpoints) ================= */
+var AP='aileash';
+function setProduct(p){
+AP=p;
+['aileash','sonicboom','sentinel','guardian','sebdog','tokensaver'].forEach(function(t){var el=document.getElementById('tab-'+t);if(el)el.className='tab';});
+var el=document.getElementById('tab-'+p);if(el)el.className='tab on';
+var btn=document.getElementById('go-btn');
+var labels={aileash:'Get AILeash API key \u00b7 90 days free \u2192',sonicboom:'Get SonicBoom plugin \u00b7 90 days free \u2192',sentinel:'Get Sentinel API key \u00b7 90 days free \u2192',guardian:'Get Guardian key \u00b7 free for families \u2192',sebdog:'Get Sebdog \u00b7 runs on your hardware \u2192',tokensaver:'Get the Token Saver \u00b7 90 days free \u2192'};
+btn.textContent=labels[p];
+}
+
+function calc(){
+var charge=parseFloat(document.getElementById('charge').value)||0;
+var devices=parseInt(document.getElementById('devices').value)||0;
+document.getElementById('r-user').textContent='\u00a3'+charge.toFixed(2);
+document.getElementById('r-you').textContent='\u00a3'+Math.max(0,(charge-0.50)*devices).toLocaleString('en-GB',{maximumFractionDigits:0});
+document.getElementById('r-we').textContent='\u00a3'+(0.50*devices).toLocaleString('en-GB',{maximumFractionDigits:0});
+}
+calc();
+
+async function doSignup(){
+var fn=document.getElementById('fn').value.trim(),ln=document.getElementById('ln').value.trim();
+var em=document.getElementById('em').value.trim(),ph=document.getElementById('ph').value.trim();
+var org=document.getElementById('org').value.trim();
+var dv=parseInt(document.getElementById('dv').value)||1;
+var rc=document.getElementById('ref-code').value.trim();
+var err=document.getElementById('msg-err'),ok=document.getElementById('msg-ok'),kb=document.getElementById('key-box'),btn=document.getElementById('go-btn');
+err.classList.remove('show');ok.classList.remove('show');kb.classList.remove('show');
+if(!em||!em.includes('@')){err.textContent='Enter a valid email address to get your key.';err.classList.add('show');return;}
+if(!org){err.textContent='Enter your platform or company name.';err.classList.add('show');return;}
+var orig=btn.textContent;btn.textContent='Creating key\u2026';btn.disabled=true;
+try{
+var r=await fetch('/signup',{method:'POST',headers:{'Content-Type':'application/json'},
+body:JSON.stringify({email:em,phone:ph,name:fn+' '+ln,org:org,org_type:AP,product:AP,devices:dv,ref_code:rc})});
+var d=await r.json();
+if(d.api_key){
+document.getElementById('key-val').textContent=d.api_key;
+document.getElementById('key-prev').textContent=d.api_key.slice(0,20)+'...';
+if(d.ref_code){document.getElementById('ref-code-display').textContent=d.ref_code;}
+if(d.badge_url){
+document.getElementById('shieldimg').src=d.badge_url;
+document.getElementById('shieldcode').textContent='<a href="https://sebbi.pro"><img src="'+d.badge_url+'" alt="AI governance sealed by AILeash" width="95"></a>';
+document.getElementById('shieldbox').style.display='block';
+}
+kb.classList.add('show');
+ok.textContent='Key created. Everything is free for 90 days \u2014 your installation guide is on its way to your inbox. Billing only begins after the trial, on real devices only.';ok.classList.add('show');
+btn.textContent='Key created \u2713';
+sealBlock('signup completed');
+}else{err.textContent=d.error||'Something went wrong. Email justrightdecorators@gmail.com';err.classList.add('show');btn.textContent=orig;btn.disabled=false;}
+}catch(e){err.textContent='Cannot reach the server. Email justrightdecorators@gmail.com';err.classList.add('show');btn.textContent=orig;btn.disabled=false;}
+}
+
+/* ================= SIGNATURE: the visit ledger =================
+Real SHA-256 via Web Crypto. Chained exactly like the platform:
+hash(prev_hash + timestamp + event). Client-side only - no network. */
+var visitChain=[];
+var chainTip='GENESIS';
+var sealedSections={};
+var CRYPTO_OK=!!(window.crypto&&crypto.subtle&&window.TextEncoder);
+if(!CRYPTO_OK){
+var _r=document.getElementById('rail'),_c=document.getElementById('chip');
+if(_r)_r.style.display='none';if(_c)_c.style.display='none';
+var _v=document.getElementById('verify');if(_v)_v.style.display='none';
+document.querySelectorAll('main').forEach(function(m){m.style.marginLeft='0';});
+}
+
 async function sha256hex(s){
-  var buf=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(s));
-  return Array.from(new Uint8Array(buf)).map(function(b){return b.toString(16).padStart(2,"0");}).join("");
+var buf=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(s));
+return Array.from(new Uint8Array(buf)).map(function(b){return b.toString(16).padStart(2,'0');}).join('');
 }
-function fields(){
-  return {
-    name:document.getElementById("nm").value.trim(),
-    title:document.getElementById("ttl").value.trim(),
-    bio:document.getElementById("bio").value.trim(),
-    linkedin:document.getElementById("li").value.trim(),
-    facebook:document.getElementById("fb").value.trim()
+
+async function sealBlock(eventName){
+if(!CRYPTO_OK)return 'unavailable';
+var ts=Date.now();
+var prev=chainTip;
+var hash=await sha256hex(prev+'|'+ts+'|'+eventName);
+chainTip=hash;
+var n=visitChain.length+1;
+visitChain.push({n:n,event:eventName,ts:ts,prev:prev,hash:hash});
+renderBlock(n,eventName,hash);
+return hash;
+}
+
+function renderBlock(n,eventName,hash){
+var chain=document.getElementById('chain');
+var d=document.createElement('div');d.className='blk';
+d.innerHTML='<div class="blk-n">'+String(n).padStart(3,'0')+' &middot; '+eventName+'</div><div class="blk-h">'+hash.slice(0,16)+'&hellip;</div>';
+chain.appendChild(d);
+requestAnimationFrame(function(){requestAnimationFrame(function(){d.classList.add('on');});});
+while(chain.children.length>9){chain.removeChild(chain.firstChild);}
+document.getElementById('tip').textContent=hash.slice(0,12)+'\u2026';
+var chipn=document.getElementById('chipn'),chiptip=document.getElementById('chiptip');
+if(chipn){chipn.textContent=visitChain.length+' block'+(visitChain.length===1?'':'s');chiptip.textContent=hash.slice(0,12)+'\u2026';}
+}
+
+async function verifyVisit(){
+var out=document.getElementById('vout');
+out.innerHTML='verifying '+visitChain.length+' blocks\u2026';
+var prev='GENESIS';
+for(var i=0;i<visitChain.length;i++){
+var b=visitChain[i];
+var re=await sha256hex(b.prev+'|'+b.ts+'|'+b.event);
+if(re!==b.hash||b.prev!==prev){
+out.innerHTML='CHAIN BROKEN at block '+b.n+' \u2014 tampering detected.';return;
+}
+prev=b.hash;
+}
+var lines=['<span class="ok">\u2713 CHAIN INTACT \u2014 '+visitChain.length+' blocks re-hashed and verified, genesis to tip.</span>'];
+visitChain.slice(-4).forEach(function(b){lines.push(String(b.n).padStart(3,'0')+' '+b.event+' <span class="h">'+b.hash.slice(0,20)+'\u2026</span>');});
+lines.push('tip <span class="h">'+chainTip.slice(0,32)+'\u2026</span>');
+lines.push('<span style="color:rgba(255,255,255,0.3)">Computed entirely in your browser. This is the same verification your auditors run against sebbi.pro/api/verify-chain.</span>');
+out.innerHTML=lines.join('<br>');
+sealBlock('chain verified by visitor');
+}
+
+async function tamperDemo(){
+var out=document.getElementById('vout');
+if(visitChain.length<2){out.innerHTML='Read a little more of the page first \u2014 you need at least two blocks to tamper with.';return;}
+var target=visitChain[1];
+var original=target.event;
+out.innerHTML='You just changed block 002 from <span class="h">\u201c'+original+'\u201d</span> to <span class="h">\u201cnothing happened here\u201d</span>\u2026<br>re-verifying the chain\u2026';
+target.event='nothing happened here';
+await new Promise(function(r){setTimeout(r,900);});
+var prev='GENESIS',broken=-1;
+for(var i=0;i<visitChain.length;i++){
+var b=visitChain[i];
+var re=await sha256hex(b.prev+'|'+b.ts+'|'+b.event);
+if(re!==b.hash||b.prev!==prev){broken=b.n;break;}
+prev=b.hash;
+}
+target.event=original;
+out.innerHTML='You just changed block 002 to <span class="h">\u201cnothing happened here\u201d</span> and re-verified.<br>'
++'<span style="color:#ff9d94">\u2717 CHAIN BROKEN at block '+String(broken).padStart(3,'0')+' \u2014 the stored hash no longer matches the content. Tampering detected instantly.</span><br>'
++'<span class="ok">Block restored. \u2713 Chain intact again.</span><br>'
++'<span style="color:rgba(255,255,255,0.3)">That is the whole product. Edit one record \u2014 even one character \u2014 and every verification from that block forward fails. There is no quiet way to rewrite history.</span>';
+sealBlock('tampering attempt detected');
+}
+
+/* Wake the page modules.
+   /self-check, /console and the discovery document are served by runtime
+   patches that only install once their module has been touched, so after a
+   deploy they 404 until somebody pokes an /x/ route. Poking it here means a
+   visitor never sees that, and it costs one request. */
+// Every page here is served by a runtime patch that only installs once its
+// module has been touched, so after a deploy they 404 until somebody pokes an
+// /x/ route. Touching console arms its siblings too; the rest are belt and
+// braces so no visitor ever lands on a dead link.
+['/x/console/status','/x/savings/status','/x/selfcheck/status',
+ '/x/standard/status','/x/verifier/status','/x/network/status']
+  .forEach(function(u){ fetch(u).catch(function(){}); });
+
+/* seal the hero headline on load */
+(async function(){
+if(!CRYPTO_OK)return;
+var vn=null;
+try{
+var r=await fetch('/api/visits');var d=await r.json();
+if(d&&d.visits)vn=d.visits;
+}catch(e){}
+var ev=vn?('visitor \u2116 '+vn.toLocaleString('en-GB')+' arrived'):'visit opened';
+var h=await sealBlock(ev);
+var el=document.getElementById('hseal');
+el.innerHTML='This headline was just sealed: <span class="hh">'+h.slice(0,24)+'\u2026</span> \u2014 watch the chain grow as you read \u2192';
+if(vn){
+document.getElementById('vnum').textContent='\u2116 '+vn.toLocaleString('en-GB');
+document.getElementById('vhash').textContent='seal '+h.slice(0,24)+'\u2026';
+document.getElementById('vstamp').style.display='inline-flex';
+}
+})();
+
+/* seal each section when it enters view */
+var names={how:'read: how it works',products:'read: products',packs:'read: signal packs',margin:'used: margin section',referral:'read: referrals','notary-promo':'read: profile notary',law:'read: the law',coverage:'read: coverage map',oversight:'read: human oversight',authority:'read: authority continuity',anchor:'read: external anchoring',network:'read: witness network',notaries:'read: the notaries',conformance:'read: conformance testing',verify:'reached: the proving ground',signup:'reached: signup'};
+var io=new IntersectionObserver(function(entries){
+entries.forEach(function(e){
+if(e.isIntersecting&&!sealedSections[e.target.id]){
+sealedSections[e.target.id]=true;
+sealBlock(names[e.target.id]||('read: '+e.target.id)).then(function(h){
+var s=e.target.querySelector('[data-seal]');
+if(s)s.innerHTML='sealed <b>'+h.slice(0,10)+'\u2026</b>';
+});
+}
+});
+},{threshold:0.25});
+Object.keys(names).forEach(function(id){var el=document.getElementById(id);if(el)io.observe(el);});
+
+/* calculator interaction gets its own block, once */
+var calcSealed=false;
+document.getElementById('charge').addEventListener('input',function(){
+if(!calcSealed){calcSealed=true;sealBlock('calculated a margin');}
+});
+
+/* decision ticker - demo data, labelled by the engine's real reason codes */
+(function(){
+var users=['u_7f2','u_c19','u_a04','u_e88','u_31b','u_9d5','u_f47','u_206'];
+var acts=['payment','login','message','transfer','api_call','checkout'];
+var outs=[['ALLOW','A',0.12,0.34],['ALLOW','A',0.05,0.3],['CHALLENGE','C',0.38,0.65],['ALLOW','A',0.1,0.33],['BLOCK','B',0.72,0.94],['ALLOW','A',0.08,0.3],['CHALLENGE','C',0.4,0.68]];
+var items=[];
+for(var i=0;i<18;i++){
+var o=outs[Math.floor(Math.random()*outs.length)];
+var sc=(o[2]+Math.random()*(o[3]-o[2])).toFixed(2);
+items.push('<span>'+users[i%users.length]+' &middot; '+acts[i%acts.length]+' &rarr; <b class="'+o[1]+'">'+o[0]+'</b> '+sc+' &middot; sealed</span>');
+}
+var half=items.join('');
+document.getElementById('tk').innerHTML=half+half;
+})();
+
+</script>
+<script>
+/* Proving Ground - its own block, so a failure here cannot take the page
+   script with it, and a failure there cannot stop this running. */
+/* ---------- the proving ground ---------- */
+function pgTab(which){
+  var run=which==='run';
+  document.getElementById('pgt-run').className='pgtab'+(run?' on':'');
+  document.getElementById('pgt-rev').className='pgtab'+(run?'':' on');
+  document.getElementById('pgp-run').className='pgpanel'+(run?'':' hide');
+  document.getElementById('pgp-rev').className='pgpanel'+(run?' hide':'');
+}
+
+function pgSync(){
+  document.getElementById('pg-trust-v').textContent=parseFloat(document.getElementById('pg-trust').value).toFixed(2);
+  document.getElementById('pg-amount-v').textContent=parseInt(document.getElementById('pg-amount').value).toLocaleString('en-GB');
+  document.getElementById('pg-v60-v').textContent=document.getElementById('pg-v60').value;
+  document.getElementById('pg-v5m-v').textContent=document.getElementById('pg-v5m').value;
+  document.getElementById('pg-v1h-v').textContent=document.getElementById('pg-v1h').value;
+  document.getElementById('pg-dev-v').textContent=parseFloat(document.getElementById('pg-dev').value).toFixed(2);
+  document.getElementById('pg-anom-v').textContent=parseFloat(document.getElementById('pg-anom').value).toFixed(2);
+}
+
+function pgReveal(el){
+  try{ if(el&&el.scrollIntoView){el.scrollIntoView({behavior:'smooth',block:'start'});} }catch(e){}
+}
+
+function pgEsc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+
+function pgFail(el,msg){
+  var box=document.getElementById(el);
+  if(box){box.innerHTML='<div class="pgerr">'+pgEsc(msg)+'</div>';pgReveal(box);}
+}
+
+async function pgPost(path,body){
+  var r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  var d=await r.json();
+  return {status:r.status,data:d};
+}
+
+/* ---- 1. run a decision ---- */
+async function pgRun(){
+  var btn=document.getElementById('pg-run-btn');
+  var out=document.getElementById('pg-result');
+  var label=btn.textContent;
+  btn.disabled=true;btn.textContent='Scoring and sealing\u2026';
+  out.innerHTML='';
+  var payload={
+    trust:parseFloat(document.getElementById('pg-trust').value),
+    amount:parseFloat(document.getElementById('pg-amount').value),
+    v60:parseFloat(document.getElementById('pg-v60').value),
+    v5m:parseFloat(document.getElementById('pg-v5m').value),
+    v1h:parseFloat(document.getElementById('pg-v1h').value),
+    device_risk:parseFloat(document.getElementById('pg-dev').value),
+    anomaly:parseFloat(document.getElementById('pg-anom').value),
+    country:document.getElementById('pg-country').value,
+    country_shift:document.getElementById('pg-shift').checked,
+    action:'payment'
   };
-}
-function canonical(f){
-  return "profile:v1|"+f.name+"|"+f.title+"|"+f.bio+"|"+f.linkedin+"|"+f.facebook;
-}
-var mirrorTimer=null;
-function mirror(){
-  var f=fields();
-  document.getElementById("v-nm").textContent=f.name||"Your Name";
-  document.getElementById("v-ttl").textContent=f.title;
-  document.getElementById("v-bio").textContent=f.bio;
-  document.getElementById("v-links").innerHTML=[f.linkedin,f.facebook].filter(Boolean).join("<br>");
-  clearTimeout(mirrorTimer);
-  mirrorTimer=setTimeout(async function(){
-    if(!f.name){document.getElementById("v-hash").textContent="FINGERPRINT \u2014 start typing to generate";return;}
-    var h=await sha256hex(canonical(f));
-    document.getElementById("v-hash").textContent="FINGERPRINT "+h;
-  },200);
-}
-async function sealProfile(){
-  var f=fields();
-  var res=document.getElementById("sealres");
-  if(!f.name){res.style.display="block";res.innerHTML="<span style='color:var(--err)'>Enter at least your name.</span>";return;}
-  var btn=document.getElementById("go");btn.disabled=true;btn.textContent="Sealing\u2026";
   try{
-    var fp=await sha256hex(canonical(f));
-    var body={fingerprint:fp,public:document.getElementById("pub").checked,profile:f};
-    var r=await fetch("/api/identity/seal",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
-    var d=await r.json();
-    if(!d.sealed){res.style.display="block";res.innerHTML="<span style='color:var(--err)'>"+(d.error||"Sealing failed")+"</span>";btn.disabled=false;btn.textContent="Seal this profile \u2014 free \u2192";return;}
-    var code=(d.code||fp.slice(0,12));
-    var when=new Date((d.sealed_at)*1000).toLocaleString("en-GB");
-    res.style.display="block";
-    res.innerHTML=(d.already_registered?"<b>Already sealed.</b> This exact profile was registered earlier \u2014 details below.<br>":"<b>\u2713 SEALED.</b> This exact profile is now locked in the chain.<br>")
-      +"Your verification code: <span class='code'>"+code+"</span><br>"
-      +"Registered: "+when+" \u00b7 block #"+d.block_index+"<br><br>"
-      +"<b>Put this line in your LinkedIn bio:</b><br>\u26D3 Profile sealed \u00b7 verify code "+code+" at sebbi.pro/identity";
-    btn.textContent="Sealed \u2713";
-  }catch(e){res.style.display="block";res.innerHTML="<span style='color:var(--err)'>Network error: "+e+"</span>";btn.disabled=false;btn.textContent="Seal this profile \u2014 free \u2192";}
+    var res=await pgPost('/x/demo/govern',payload);
+    if(res.status===429){pgFail('pg-result','That is the rate limit doing its job \u2014 public endpoints are capped per visitor. Give it a minute and try again.');btn.disabled=false;btn.textContent=label;return;}
+    var d=res.data;
+    if(!d||!d.decision){pgFail('pg-result','The engine did not return a decision. '+(d&&d.error?d.error:'Try again shortly.'));btn.disabled=false;btn.textContent=label;return;}
+
+    var reasons=(d.reasons||[]).map(function(x){return '<span>'+pgEsc(x)+'</span>';}).join('');
+    var cf=d.counterfactual_statement||'';
+    var steps=(d.what_just_happened||[]).map(function(x){return '<li>'+pgEsc(x)+'</li>';}).join('');
+    var v=d.verify||{};
+
+    out.innerHTML=
+      '<div class="pgverdictcard">'
+      +'<div class="pgvhead">'
+        +'<span class="pgvword '+pgEsc(d.decision)+'">'+pgEsc(d.decision)+'</span>'
+        +'<span class="pgvscore">score <b>'+pgEsc(d.score)+'</b> &middot; thresholds 0.35 / 0.70</span>'
+        +'<span class="pgvreasons">'+(reasons||'<span>no risk signals tripped</span>')+'</span>'
+      +'</div>'
+      +'<div class="pgrow"><div class="pgrlbl">What would have changed it</div>'
+        +'<div class="pgcf"><div class="big">'+pgEsc(cf.charAt(0).toUpperCase()+cf.slice(1))+'</div>'
+        +'<div class="pgrbody" style="margin-top:10px">Computed by running the scoring function backwards, not estimated. Change that one slider to the stated value and run it again \u2014 you will get the verdict it promises.</div></div></div>'
+      +'<div class="pgrow"><div class="pgrlbl">Sealed into the live chain</div>'
+        +'<div class="pgmono">'
+        +'<em>block</em>'+pgEsc(d.block_index)+'<br>'
+        +'<em>hash</em>'+pgEsc(d.audit_hash)+'<br>'
+        +'<em>check this block</em><a href="'+pgEsc(v.this_block||'#')+'" target="_blank" rel="noopener">'+pgEsc(v.this_block||'')+'</a><br>'
+        +'<em>check the chain</em><a href="'+pgEsc(v.whole_chain||'/api/verify-chain')+'" target="_blank" rel="noopener">/api/verify-chain</a><br>'
+        +'<em>check the clock</em><a href="'+pgEsc(v.external_anchor||'/api/anchor-status')+'" target="_blank" rel="noopener">/api/anchor-status</a>'
+        +'</div></div>'
+      +'<div class="pgrow"><div class="pgrlbl">What just happened</div><ul class="pgsteps">'+steps+'</ul></div>'
+      +'</div>';
+    pgReveal(out);
+    if(typeof sealBlock==='function'){sealBlock('ran a live decision');}
+  }catch(e){
+    pgFail('pg-result','Could not reach the engine. That is a real failure, not a staged one \u2014 try again in a moment.');
+  }
+  btn.disabled=false;btn.textContent=label;
 }
-async function checkCode(){
-  var q=document.getElementById("q").value.trim().toLowerCase().replace(/[^0-9a-f]/g,"");
-  var out=document.getElementById("checkres");
-  var trap=document.getElementById("trap");
-  trap.style.display="none";
-  if(q.length<12){out.className="bad";out.innerHTML="<div class='big'>Enter at least the 12-character code.</div>";return;}
-  out.className="";out.style.display="block";out.innerHTML="Checking the chain\u2026";
+
+/* ---- 2. take the review ---- */
+var pgCase=null,pgTimer=null,pgStart=0;
+
+function pgTick(){
+  var s=(Date.now()-pgStart)/1000;
+  document.getElementById('pg-clock').textContent=s.toFixed(1)+'s';
+}
+
+async function pgReview(){
+  var out=document.getElementById('pg-rev-result');
+  out.innerHTML='';
+  var seeds=[
+    {amount:9400,v60:18,v5m:29,v1h:77,trust:0.25,device_risk:0.4,anomaly:0.55,country:'XX',country_shift:true},
+    {amount:180,v60:3,v5m:5,v1h:14,trust:0.62,device_risk:0.15,anomaly:0.2,country:'UK',country_shift:false},
+    {amount:2600,v60:11,v5m:19,v1h:52,trust:0.41,device_risk:0.55,anomaly:0.35,country:'DE',country_shift:true},
+    {amount:640,v60:6,v5m:9,v1h:24,trust:0.34,device_risk:0.25,anomaly:0.62,country:'US',country_shift:false}
+  ];
+  var seed=seeds[Math.floor(Math.random()*seeds.length)];
   try{
-    var r=await fetch("/api/identity/check?code="+q);
+    var res=await pgPost('/x/demo/review',seed);
+    if(res.status===429){pgFail('pg-rev-result','Rate limit reached \u2014 public endpoints are capped per visitor. A minute will clear it.');return;}
+    var d=res.data;
+    if(!d||!d.case_id){pgFail('pg-rev-result','Could not open a case. '+(d&&d.error?d.error:''));return;}
+    pgCase=d.case_id;
+    var m=d.material||{};
+    var pretty={action:'Action',amount:'Amount',country:'Country','60_second_velocity':'Actions in last 60s','5_minute_velocity':'Actions in last 5 min',device_risk:'Device risk',behavioural_anomaly:'Behavioural anomaly',country_changed:'Country changed',trust_history:'Trust history'};
+    var rows='';
+    Object.keys(m).forEach(function(k){
+      var val=m[k];
+      if(k==='amount'){val='\u00a3'+Number(val).toLocaleString('en-GB');}
+      if(typeof val==='boolean'){val=val?'yes':'no';}
+      rows+='<div class="pgmrow"><span class="pgmk">'+pgEsc(pretty[k]||k)+'</span><span class="pgmv">'+pgEsc(val)+'</span></div>';
+    });
+    document.getElementById('pg-material').innerHTML=rows;
+    document.getElementById('pg-case').className='pgcase';
+    document.getElementById('pg-rev-start').style.display='none';
+    pgReveal(document.getElementById('pg-case'));
+    pgStart=Date.now();
+    document.getElementById('pg-clock').textContent='0.0s';
+    if(pgTimer){clearInterval(pgTimer);}
+    pgTimer=setInterval(pgTick,100);
+  }catch(e){
+    pgFail('pg-rev-result','Could not reach the engine. Try again in a moment.');
+  }
+}
+
+async function pgCommit(v){
+  if(!pgCase){return;}
+  if(pgTimer){clearInterval(pgTimer);pgTimer=null;}
+  var out=document.getElementById('pg-rev-result');
+  document.getElementById('pg-case').className='pgcase hide';
+  out.innerHTML='<div class="pgmono" style="text-align:center">sealing your verdict\u2026</div>';
+  try{
+    var res=await pgPost('/x/demo/commit',{case_id:pgCase,verdict:v});
+    var d=res.data;
+    if(!d||!d.your_verdict){pgFail('pg-rev-result','Could not seal that. '+(d&&d.error?d.error:''));return;}
+    var agree=d.agreed;
+    var flag=d.flag?'<div class="pgflag"><b>Flagged:</b> '+pgEsc(d.flag)+'</div>':'';
+    var steps=(d.what_just_happened||[]).map(function(x){return '<li>'+pgEsc(x)+'</li>';}).join('');
+    out.innerHTML=
+      '<div class="pgcompare">'
+       +'<div class="pgc"><div class="pgclbl">You said</div><div class="pgcval '+pgEsc(d.your_verdict)+'" style="color:'+(d.your_verdict==='ALLOW'?'var(--allow)':d.your_verdict==='BLOCK'?'var(--block)':'var(--challenge)')+'">'+pgEsc(d.your_verdict)+'</div></div>'
+       +'<div class="pgc"><div class="pgclbl">The engine said</div><div class="pgcval" style="color:'+(d.machine_verdict==='ALLOW'?'var(--allow)':d.machine_verdict==='BLOCK'?'var(--block)':'var(--challenge)')+'">'+pgEsc(d.machine_verdict)+'</div><div class="pgmono" style="margin-top:8px">score '+pgEsc(d.machine_score)+'</div></div>'
+      +'</div>'
+      +'<div class="pgverdictcard" style="margin-top:18px">'
+      +'<div class="pgrow"><div class="pgrlbl">'+(agree?'You agreed':'You diverged')+'</div><div class="pgrbody">'+pgEsc(d.note||'')+'</div></div>'
+      +'<div class="pgrow"><div class="pgrlbl">Time on the case</div><div class="pgrbody"><b>'+pgEsc(d.dwell_seconds)+' seconds</b>, sealed with your verdict. On a live deployment this sits in the reviewer\u2019s record permanently, and a pattern of very fast decisions is visible to an auditor whether or not anyone is watching at the time.</div>'+flag+'</div>'
+      +'<div class="pgrow"><div class="pgrlbl">The order, fixed</div><ul class="pgsteps">'+steps+'</ul>'
+        +'<div class="pgmono" style="margin-top:10px"><em>your block</em>'+pgEsc(d.block_index)+'<br><em>hash</em>'+pgEsc(d.audit_hash)+'<br><em>verify</em><a href="/api/verify-chain" target="_blank" rel="noopener">/api/verify-chain</a></div></div>'
+      +'</div>'
+      +'<div class="pgactions"><button class="bghost" onclick="pgAgain()">Take another case</button></div>';
+    pgReveal(out);
+    if(typeof sealBlock==='function'){sealBlock('took the review challenge');}
+  }catch(e){
+    pgFail('pg-rev-result','Could not reach the engine. Try again in a moment.');
+  }
+  pgCase=null;
+}
+
+function pgAgain(){
+  document.getElementById('pg-rev-result').innerHTML='';
+  document.getElementById('pg-rev-start').style.display='';
+  pgReview();
+}
+
+/* ---------- live figures ---------- */
+function pgSvg(id){var e=document.getElementById(id);if(e)e.innerHTML='';return e;}
+function pgEl(tag,attrs,text){
+  var n=document.createElementNS('http://www.w3.org/2000/svg',tag);
+  for(var k in attrs){n.setAttribute(k,attrs[k]);}
+  if(text!=null){n.textContent=text;}
+  return n;
+}
+function pgBars(svg,vals,colourFor,labels){
+  if(!svg)return;
+  var n=vals.length,max=Math.max.apply(null,vals.concat([1]));
+  var w=300/n, pad=w*0.18;
+  for(var i=0;i<n;i++){
+    var h=vals[i]?Math.max(2,(vals[i]/max)*72):1;
+    svg.appendChild(pgEl('rect',{x:(i*w+pad).toFixed(2),y:(78-h).toFixed(2),
+      width:(w-pad*2).toFixed(2),height:h.toFixed(2),rx:1,
+      fill:colourFor?colourFor(i):'#c9a84c','fill-opacity':vals[i]?0.85:0.25}));
+  }
+  svg.appendChild(pgEl('line',{x1:0,y1:79,x2:300,y2:79,stroke:'rgba(255,255,255,0.18)','stroke-width':1}));
+  if(labels){
+    labels.forEach(function(l){
+      svg.appendChild(pgEl('text',{x:l.x,y:89,fill:'rgba(255,255,255,0.3)','font-size':7.5,
+        'font-family':'IBM Plex Mono, monospace','text-anchor':l.anchor||'middle'},l.t));
+    });
+  }
+}
+function pgEmpty(svg,msg){
+  if(!svg)return;
+  svg.appendChild(pgEl('text',{x:150,y:44,fill:'rgba(255,255,255,0.28)','font-size':9,
+    'font-family':'IBM Plex Mono, monospace','text-anchor':'middle'},msg));
+}
+async function pgCharts(){
+  try{
+    var r=await fetch('/x/stats');
+    if(!r.ok)return;
     var d=await r.json();
-    if(d.found){
-      var when=new Date(d.registered_at*1000).toLocaleString("en-GB");
-      var prof="";
-      if(d.profile){
-        prof="<br><b>"+(d.profile.name||"")+"</b>"+(d.profile.title?(" \u00b7 "+d.profile.title):"")
-          +(d.profile.bio?("<br>"+d.profile.bio):"")
-          +(d.profile.linkedin?("<br><span class='mono'>"+d.profile.linkedin+"</span>"):"");
-      }else{
-        prof="<br><span class='mono'>Sealed privately \u2014 the owner chose not to publish profile fields. The seal and timestamp below are the proof.</span>";
+
+    var c=d.chain||{};
+    document.getElementById('pgc-h').textContent=(c.height||0).toLocaleString('en-GB')+' blocks';
+    document.getElementById('pgc-gen').textContent='read live from /x/stats \u00b7 no account needed';
+    var cs=pgSvg('pgc-chain');
+    if(c.blocks_last_24h){
+      pgBars(cs,c.last_24h||[],function(){return '#c9a84c';},
+        [{x:4,t:'24h ago',anchor:'start'},{x:296,t:'now',anchor:'end'}]);
+    }else{ pgEmpty(cs,'no blocks in the last 24 hours'); }
+
+    var p=d.public_decisions||{};
+    document.getElementById('pgc-n').textContent=(p.decisions||0)+' scored';
+    var hs=pgSvg('pgc-hist');
+    if(p.decisions){
+      pgBars(hs,p.score_histogram||[],function(i){
+        return i<3?'#1a9e6e':(i<7?'#c07a1d':'#c8362b');
+      },[{x:4,t:'0.0',anchor:'start'},{x:150,t:'score',anchor:'middle'},{x:296,t:'1.0',anchor:'end'}]);
+      [[0.35,'#c07a1d'],[0.70,'#c8362b']].forEach(function(t){
+        var x=t[0]*300;
+        hs.appendChild(pgEl('line',{x1:x,y1:2,x2:x,y2:79,stroke:t[1],'stroke-width':1,'stroke-dasharray':'3 3','stroke-opacity':0.8}));
+      });
+    }else{ pgEmpty(hs,'nobody has run a decision yet'); }
+
+    var o=d.public_reviews||{};
+    document.getElementById('pgc-r').textContent=(o.reviews||0)+' reviews';
+    var ds=pgSvg('pgc-dwell');
+    if(o.reviews){
+      pgBars(ds,o.dwell_histogram||[],function(i){return i===0?'#c8362b':'#c9a84c';},
+        [{x:4,t:'fast',anchor:'start'},{x:296,t:'slow',anchor:'end'}]);
+      if(o.under_2_seconds){
+        document.getElementById('pgc-dwellfoot').innerHTML=
+          '<b style="color:#ff9d94">'+o.under_2_seconds_pct+'% committed in under two seconds.</b> '
+          +'On a real deployment that pattern sits in the reviewer\u2019s record permanently.';
       }
-      out.className="good";
-      out.innerHTML="<div class='big'>\u2713 SEALED &amp; ON THE CHAIN</div>"
-        +"Registered "+when+" \u00b7 block #"+d.block_index+prof
-        +"<br><span class='mono'>Fingerprint "+d.fingerprint+"</span>";
-    }else{
-      out.className="bad";
-      out.innerHTML="<div class='big'>\u2717 NO SEAL FOUND</div>No registration exists for this code. Either it was typed wrong \u2014 or the profile showing it was never sealed.";
-      trap.style.display="block";
-    }
-  }catch(e){out.className="bad";out.innerHTML="<div class='big'>Network error</div>"+e;}
+    }else{ pgEmpty(ds,'nobody has taken a review case yet'); }
+  }catch(e){}
 }
+
+try{pgSync();}catch(e){if(window.console)console.error('proving ground init:',e);}
+try{pgCharts();}catch(e){}
+</script>
+
+<script id="FIELDJS">
+(function(){
+"use strict";
+var F=document.getElementById("FIELD"); if(!F) return;
+var glc=document.getElementById("fgl"), gl=null;
+try{ gl=glc.getContext("webgl",{alpha:false,antialias:false,depth:false})
+   || glc.getContext("experimental-webgl",{alpha:false,antialias:false,depth:false}); }catch(e){}
+if(!gl){ F.parentNode.removeChild(F); return; }
+
+/* ============================================================
+   THE MAP — six routes in, each one an action
+   ============================================================ */
+var MASS=[
+ {n:"START HERE", act:"GET A KEY", c:[0.28,0.86,0.92], b:[
+   ["how","HOW IT WORKS"],["sdk","ONE LINE SDK"],["install","INSTALL"],["signup","90 DAYS FREE"]]},
+ {n:"TRY IT LIVE", act:"NO SIGNUP", c:[0.36,0.72,0.98], b:[
+   ["verify","PROVING GROUND"],["packs","NINE SIGNALS"],["conformance","CONFORMANCE"]]},
+ {n:"THE PROOF", act:"HOW IT SEALS", c:[0.48,0.62,1.00], b:[
+   ["anchor","BITCOIN ANCHOR"],["network","WITNESS NETWORK"],["evidence","EVIDENCE PACK"],
+   ["notaries","THE NOTARIES"]]},
+ {n:"YOUR DATA", act:"NEVER LEAVES", c:[0.62,0.54,1.00], b:[
+   ["onprem","ON YOUR HARDWARE"],["tokensaver","TOKEN SAVER"],["products","SIX PRODUCTS"]]},
+ {n:"THE LAW", act:"WHAT'S REQUIRED", c:[0.80,0.52,0.96], b:[
+   ["law","WHAT LAW REQUIRES"],["coverage","ARTICLE BY ARTICLE"],["oversight","HUMAN OVERSIGHT"],
+   ["authority","AUTHORITY"]]},
+ {n:"RESELL IT", act:"YOUR MARGIN", c:[1.00,0.74,0.46], b:[
+   ["margin","SET YOUR PRICE"],["referral","EARN FOREVER"],["notary-promo","PROFILE NOTARY"]]}
+];
+
+/* ============================================================
+   TIER
+   ============================================================ */
+var MOBILE=Math.min(innerWidth,innerHeight)<900;
+var MAXT=gl.getParameter(gl.MAX_TEXTURE_SIZE)||2048;
+var TIER=(MOBILE||MAXT<4096)?(MAXT<2048?0:1):2;
+var SEEDS=[150,260,420][TIER], STEPS=[70,110,150][TIER], RES=[0.85,0.95,1.0][TIER];
+var SLOW=matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+/* ============================================================
+   GROWTH
+   ============================================================ */
+var S=20260830;
+function rnd(){ S=(S*1664525+1013904223)&0x7fffffff; return S/0x7fffffff; }
+var PX=[],PC=[],PB=[],PH=[],PS=[],PT=[],nodes=[],centres=[],RANGE=[];
+var STRAND=0;
+var SPREAD=335, SCALE=142;
+
+MASS.forEach(function(M,mi){
+  var a=-Math.PI/2+mi*Math.PI/3;
+  var cx=Math.cos(a)*SPREAD, cy=Math.sin(a)*SPREAD*0.92, cz=(rnd()-0.5)*170;
+  centres.push([cx,cy,cz]); M.cx=cx; M.cy=cy; M.cz=cz;
+  var _start=PB.length;
+  /* every mass turns on its own axis, at its own rate and tilt */
+  M.spin=[0.055+rnd()*0.075, 0.085+rnd()*0.11, 0.025+rnd()*0.05];
+  if(rnd()<0.5) M.spin[1]=-M.spin[1];
+  if(rnd()<0.5) M.spin[0]=-M.spin[0];
+
+  var lobes=[], nl=Math.max(M.b.length, 4);
+  for(var l=0;l<nl;l++){
+    var la=(l/nl)*6.283+rnd()*0.7, lr=(0.35+rnd()*0.7)*SCALE;
+    lobes.push([cx+Math.cos(la)*lr, cy+Math.sin(la)*lr*0.8,
+                cz+(rnd()-0.5)*SCALE*0.85, SCALE*(0.32+rnd()*0.45)]);
+  }
+  for(var s=0;s<SEEDS;s++){
+    STRAND++;
+    var sid=(STRAND*0.6180339887)%1;          /* every strand its own phase */
+    var L=lobes[(rnd()*lobes.length)|0];
+    var x=L[0]+(rnd()-.5)*L[3]*.5, y=L[1]+(rnd()-.5)*L[3]*.5, z=L[2]+(rnd()-.5)*L[3]*.4;
+    var h=rnd()*6.283, p=rnd()*6.283;
+    var step=L[3]*0.016*(0.7+rnd()*0.6), curl=(rnd()-.5)*0.30;
+    var n=STEPS+((rnd()*STEPS)|0);
+    for(var i=0;i<n;i++){
+      h+=curl+(rnd()-.5)*.14; p+=(rnd()-.5)*.10;
+      x+=Math.cos(h)*step; y+=Math.sin(h)*step*.86; z+=Math.sin(p)*step*.7;
+      var dx=L[0]-x, dy=L[1]-y, d=Math.sqrt(dx*dx+dy*dy)+1e-6;
+      if(d>L[3]){ x+=dx/d*(d-L[3])*.28; y+=dy/d*(d-L[3])*.28; }
+      PX.push(x,y,z); PC.push(M.c[0],M.c[1],M.c[2]); PH.push(rnd());
+      PS.push(sid); PT.push(i/n);
+      PB.push(0.55+0.45*Math.pow(1-i/n,0.7));
+      if(rnd()<.018){ h+=(rnd()<.5?1:-1)*(.5+rnd()*.6); step*=.94; }
+    }
+  }
+  RANGE.push({s:_start, n:PB.length-_start, c:[cx,cy,cz], spin:M.spin});
+  M.b.forEach(function(bl,i){
+    var L=lobes[i%lobes.length];
+    nodes.push({id:bl[0],lab:bl[1],mass:M,lx:L[0]-cx,ly:L[1]-cy,lz:L[2]-cz,
+                x:L[0],y:L[1],z:L[2],mi:RANGE.length-1});
+  });
+});
+
+/* bridges — bright enough to actually see the network */
+var _bs=PB.length;
+for(var mi2=0;mi2<MASS.length;mi2++){
+  var A=centres[mi2], B=centres[(mi2+1)%MASS.length];
+  var CA=MASS[mi2].c, CB=MASS[(mi2+1)%MASS.length].c;
+  for(var k2=0;k2<(TIER?60:30);k2++){
+    var bw=[(rnd()-.5)*150,(rnd()-.5)*150,(rnd()-.5)*150], t=0;
+    while(t<1){
+      t+=0.014+rnd()*0.016;
+      var u=1-t, f4=u*t*4;
+      PX.push(u*u*A[0]+2*u*t*((A[0]+B[0])/2)+t*t*B[0]+bw[0]*f4,
+              u*u*A[1]+2*u*t*((A[1]+B[1])/2)+t*t*B[1]+bw[1]*f4,
+              u*u*A[2]+2*u*t*((A[2]+B[2])/2)+t*t*B[2]+bw[2]*f4);
+      PC.push(CA[0]*u+CB[0]*t, CA[1]*u+CB[1]*t, CA[2]*u+CB[2]*t);
+      PB.push(0.16+0.12*rnd()); PH.push(rnd()); PS.push((k2*0.6180339887)%1); PT.push(t);
+    }
+  }
+}
+RANGE.push({s:_bs, n:PB.length-_bs, c:[0,0,0], spin:[0,0,0]});
+var NP=PB.length;
+
+/* ============================================================
+   GL
+   ============================================================ */
+function sh(t,src){var s=gl.createShader(t);gl.shaderSource(s,src);gl.compileShader(s);
+  if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))throw new Error(gl.getShaderInfoLog(s));return s;}
+function prog(v,f){var p=gl.createProgram();gl.attachShader(p,sh(gl.VERTEX_SHADER,v));
+  gl.attachShader(p,sh(gl.FRAGMENT_SHADER,f));gl.linkProgram(p);
+  if(!gl.getProgramParameter(p,gl.LINK_STATUS))throw new Error(gl.getProgramInfoLog(p));return p;}
+
+var pPt=prog(
+"attribute vec3 aPos;attribute vec3 aCol;attribute float aBri;attribute float aPh;"+
+"attribute float aSd;attribute float aTt;"+
+"uniform float uYaw,uZoom,uFoc,uPS,uDim,uTime,uWig;uniform vec2 uPan,uRes;"+
+"uniform vec3 uSel,uC,uR;"+
+"varying vec3 vCol;varying float vBri;"+
+"void main(){"+
+" vec3 q=aPos-uC;"+
+" float ph=aSd*6.2831853;"+
+" float amp=uWig*(0.28+0.72*aTt);"+
+" float w1=sin(uTime*1.15+ph+aTt*9.0);"+
+" float w2=cos(uTime*0.93+ph*1.7+aTt*7.0);"+
+" float w3=sin(uTime*1.41+ph*2.3+aTt*12.0);"+
+" q+=vec3(w1,w2,w3)*amp;"+
+" float tw=uTime*(0.25+aSd*0.9)+ph;"+
+" float ct=cos(tw),st=sin(tw);"+
+" float twa=uWig*0.55*aTt;"+
+" q+=vec3(ct*twa, 0.0, st*twa);"+
+" float ca=cos(uR.x),sa=sin(uR.x);"+
+" q=vec3(q.x,q.y*ca-q.z*sa,q.y*sa+q.z*ca);"+
+" float cb=cos(uR.y),sb=sin(uR.y);"+
+" q=vec3(q.x*cb+q.z*sb,q.y,-q.x*sb+q.z*cb);"+
+" float cc=cos(uR.z),sc=sin(uR.z);"+
+" q=vec3(q.x*cc-q.y*sc,q.x*sc+q.y*cc,q.z);"+
+" vec3 w=q+uC;"+
+" float c=cos(uYaw),s=sin(uYaw);"+
+" float rx=w.x*c-w.z*s;float rz=w.x*s+w.z*c;"+
+" float k=uFoc/(uFoc-rz);"+
+" vec2 sp=vec2(rx*k*uZoom+uPan.x,w.y*k*uZoom+uPan.y);"+
+" gl_Position=vec4((sp/(uRes*0.5)).x,-(sp/(uRes*0.5)).y,0.0,1.0);"+
+" gl_PointSize=clamp(k*uZoom*1.5,1.2,6.5)*uPS;"+
+" float d=distance(w.xy,uSel.xy);"+
+" float f=mix(1.0,mix(1.0,uDim,clamp((d-190.0)/120.0,0.0,1.0)),uSel.z);"+
+" float g=pow(max(sin(uTime*1.55+aPh*6.283),0.0),9.0);"+
+" float g2=pow(max(sin(uTime*0.61+aPh*12.566),0.0),22.0);"+
+" vCol=mix(aCol,vec3(1.0,0.85,0.46),min(1.0,g*0.80+g2));"+
+" vBri=aBri*clamp(k,0.25,2.2)*f*(1.0+g*1.5+g2*4.0);}",
+"precision mediump float;varying vec3 vCol;varying float vBri;uniform float uExp;"+
+"void main(){vec2 d=gl_PointCoord-0.5;float r=length(d)*2.0;"+
+"float a=exp(-r*r*7.5);gl_FragColor=vec4(vCol*vBri*a*uExp,1.0);}");
+
+var VQ="attribute vec2 aP;varying vec2 vUV;void main(){vUV=aP*0.5+0.5;gl_Position=vec4(aP,0.0,1.0);}";
+var pBr=prog(VQ,"precision mediump float;varying vec2 vUV;uniform sampler2D uT;uniform float uThr;"+
+"void main(){vec3 c=texture2D(uT,vUV).rgb;gl_FragColor=vec4(max(c-uThr,0.0),1.0);}");
+var pBl=prog(VQ,"precision mediump float;varying vec2 vUV;uniform sampler2D uT;uniform vec2 uDir;"+
+"void main(){vec3 c=texture2D(uT,vUV).rgb*0.227;"+
+"c+=texture2D(uT,vUV+uDir*1.3846).rgb*0.316;c+=texture2D(uT,vUV-uDir*1.3846).rgb*0.316;"+
+"c+=texture2D(uT,vUV+uDir*3.2308).rgb*0.070;c+=texture2D(uT,vUV-uDir*3.2308).rgb*0.070;"+
+"gl_FragColor=vec4(c,1.0);}");
+var pCo=prog(VQ,"precision mediump float;varying vec2 vUV;uniform sampler2D uScene,uB1,uB2;uniform float uStr;"+
+"void main(){vec3 c=texture2D(uScene,vUV).rgb;"+
+"vec3 b=texture2D(uB1,vUV).rgb*0.66+texture2D(uB2,vUV).rgb*0.34;"+
+"vec3 o=c+b*uStr;o=o/(1.0+o);"+
+"o=pow(clamp(o*1.80,0.0,1.0),vec3(1.0/1.14));gl_FragColor=vec4(o,1.0);}");
+
+function buf(a){var b=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,b);
+  gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(a),gl.STATIC_DRAW);return b;}
+var bPos=buf(PX),bCol=buf(PC),bBri=buf(PB),bPh=buf(PH),bSd=buf(PS),bTt=buf(PT);
+PX=PC=PB=PH=PS=PT=null;
+var bQ=gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER,bQ);
+gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,-1,1,1,1]),gl.STATIC_DRAW);
+
+function fbo(w,h){
+  var t=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,t);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,w,h,0,gl.RGBA,gl.UNSIGNED_BYTE,null);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+  var f=gl.createFramebuffer();gl.bindFramebuffer(gl.FRAMEBUFFER,f);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,t,0);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,null);return {f:f,t:t,w:w,h:h};
+}
+var Fs=null,Fa=null,Fb=null,Fc=null,Fd=null;
+function freeF(){[Fs,Fa,Fb,Fc,Fd].forEach(function(o){if(o){gl.deleteTexture(o.t);gl.deleteFramebuffer(o.f);}});}
+
+/* ============================================================
+   CAMERA — fitted to the actual cloud, so nothing clips
+   ============================================================ */
+var W=0,H=0,PW=0,PH=0,DPR=1;
+var cam={x:0,y:0,z:0.4,yaw:0.2}, tgt={x:0,y:0,z:0.4,yaw:0.2};
+var lbl=document.getElementById("flbl"), lctx=lbl.getContext("2d");
+var TOPUI=64, BOTUI=44;
+
+function fit(){
+  /* close-up: frame roughly two masses, let the rest run off the edges */
+  var z=Math.min(W,H)/(SCALE*3.1);
+  tgt.z=cam.z=Math.max(0.55,Math.min(2.4,z));
+  tgt.x=cam.x=0;
+  tgt.y=cam.y=(TOPUI-BOTUI)/2;
+}
+function resize(){
+  DPR=Math.min(devicePixelRatio||1, TIER?2:1.5);
+  W=F.clientWidth; H=F.clientHeight;
+  PW=Math.max(2,Math.round(W*DPR*RES)); PH=Math.max(2,Math.round(H*DPR*RES));
+  glc.width=PW; glc.height=PH;
+  lbl.width=Math.round(W*DPR); lbl.height=Math.round(H*DPR);
+  lctx.setTransform(DPR,0,0,DPR,0,0);
+  freeF(); Fs=fbo(PW,PH);
+  var hw=Math.max(2,PW>>1),hh=Math.max(2,PH>>1); Fa=fbo(hw,hh); Fb=fbo(hw,hh);
+  var qw=Math.max(2,PW>>2),qh=Math.max(2,PH>>2); Fc=fbo(qw,qh); Fd=fbo(qw,qh);
+  fit();
+}
+function quad(p){gl.bindBuffer(gl.ARRAY_BUFFER,bQ);var a=gl.getAttribLocation(p,"aP");
+  gl.enableVertexAttribArray(a);gl.vertexAttribPointer(a,2,gl.FLOAT,false,0,0);
+  gl.drawArrays(gl.TRIANGLE_STRIP,0,4);}
+function bindTex(p,n,t,u){gl.activeTexture(gl.TEXTURE0+u);gl.bindTexture(gl.TEXTURE_2D,t);
+  gl.uniform1i(gl.getUniformLocation(p,n),u);}
+
+/* ============================================================
+   FRAME
+   ============================================================ */
+var hot=null, sel=null, selMass=null, t0=performance.now();
+
+function draw(now){
+  var t=(now-t0)/1000;
+  cam.x+=(tgt.x-cam.x)*0.13; cam.y+=(tgt.y-cam.y)*0.13;
+  cam.z+=(tgt.z-cam.z)*0.13; cam.yaw+=(tgt.yaw-cam.yaw)*0.10;
+  var yaw=cam.yaw+(SLOW?0:t*0.055);
+  var breath=SLOW?1:(1+0.022*Math.sin(t*0.42));
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER,Fs.f);
+  gl.viewport(0,0,PW,PH);
+  gl.clearColor(0.004,0.005,0.013,1); gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE,gl.ONE);
+  gl.useProgram(pPt);
+  gl.uniform1f(gl.getUniformLocation(pPt,"uYaw"),yaw);
+  gl.uniform1f(gl.getUniformLocation(pPt,"uZoom"),cam.z*breath);
+  gl.uniform1f(gl.getUniformLocation(pPt,"uFoc"),1150);
+  gl.uniform1f(gl.getUniformLocation(pPt,"uPS"),DPR*RES*1.5);
+  gl.uniform1f(gl.getUniformLocation(pPt,"uExp"),0.80);
+  gl.uniform1f(gl.getUniformLocation(pPt,"uDim"),0.16);
+  gl.uniform2f(gl.getUniformLocation(pPt,"uPan"),cam.x,cam.y);
+  gl.uniform2f(gl.getUniformLocation(pPt,"uRes"),PW/(DPR*RES),PH/(DPR*RES));
+  gl.uniform3f(gl.getUniformLocation(pPt,"uSel"),
+    selMass?selMass.cx:0, selMass?selMass.cy:0, selMass?1:0);
+  [["aPos",bPos,3],["aCol",bCol,3],["aBri",bBri,1],["aPh",bPh,1],["aSd",bSd,1],["aTt",bTt,1]].forEach(function(A){
+    var l=gl.getAttribLocation(pPt,A[0]);
+    gl.bindBuffer(gl.ARRAY_BUFFER,A[1]);
+    gl.enableVertexAttribArray(l);
+    gl.vertexAttribPointer(l,A[2],gl.FLOAT,false,0,0);
+  });
+  gl.uniform1f(gl.getUniformLocation(pPt,"uTime"),t);
+  gl.uniform1f(gl.getUniformLocation(pPt,"uWig"),SLOW?0:SCALE*0.075);
+  var uC=gl.getUniformLocation(pPt,"uC"), uR=gl.getUniformLocation(pPt,"uR");
+  for(var ri=0;ri<RANGE.length;ri++){
+    var Rg=RANGE[ri];
+    gl.uniform3f(uC,Rg.c[0],Rg.c[1],Rg.c[2]);
+    gl.uniform3f(uR, SLOW?0:t*Rg.spin[0], SLOW?0:t*Rg.spin[1], SLOW?0:t*Rg.spin[2]);
+    gl.drawArrays(gl.POINTS,Rg.s,Rg.n);
+  }
+  gl.disable(gl.BLEND);
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER,Fa.f); gl.viewport(0,0,Fa.w,Fa.h);
+  gl.useProgram(pBr); gl.uniform1f(gl.getUniformLocation(pBr,"uThr"),0.52);
+  bindTex(pBr,"uT",Fs.t,0); quad(pBr);
+
+  gl.useProgram(pBl);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,Fb.f); gl.viewport(0,0,Fb.w,Fb.h);
+  gl.uniform2f(gl.getUniformLocation(pBl,"uDir"),1/Fa.w,0); bindTex(pBl,"uT",Fa.t,0); quad(pBl);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,Fa.f); gl.viewport(0,0,Fa.w,Fa.h);
+  gl.uniform2f(gl.getUniformLocation(pBl,"uDir"),0,1/Fb.h); bindTex(pBl,"uT",Fb.t,0); quad(pBl);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,Fc.f); gl.viewport(0,0,Fc.w,Fc.h);
+  gl.uniform2f(gl.getUniformLocation(pBl,"uDir"),2.2/Fa.w,0); bindTex(pBl,"uT",Fa.t,0); quad(pBl);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,Fd.f); gl.viewport(0,0,Fd.w,Fd.h);
+  gl.uniform2f(gl.getUniformLocation(pBl,"uDir"),0,2.2/Fc.h); bindTex(pBl,"uT",Fc.t,0); quad(pBl);
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER,null); gl.viewport(0,0,PW,PH);
+  gl.useProgram(pCo); gl.uniform1f(gl.getUniformLocation(pCo,"uStr"),0.28);
+  bindTex(pCo,"uScene",Fs.t,0); bindTex(pCo,"uB1",Fa.t,1); bindTex(pCo,"uB2",Fd.t,2);
+  quad(pCo);
+
+  labels(yaw,t);
+  requestAnimationFrame(draw);
+}
+
+/* ============================================================
+   LABELS — every node named, pushed apart so none collide
+   ============================================================ */
+function project(x,y,z,yaw){
+  var c=Math.cos(yaw),s=Math.sin(yaw);
+  var rx=x*c-z*s, rz=x*s+z*c, k=1150/(1150-rz);
+  return [W/2+rx*k*cam.z+cam.x, H/2+y*k*cam.z+cam.y, k];
+}
+function txt(s,x,y,size,col,alpha,bold){
+  /* colour lives in the dot beside the word, never in the word */
+  lctx.font=(bold?"700 ":"")+size+"px ui-monospace,Menlo,Consolas,monospace";
+  lctx.textAlign="center"; lctx.textBaseline="middle";
+  lctx.lineJoin="round"; lctx.lineWidth=size*0.42;
+  lctx.strokeStyle="rgba(0,1,5,0.96)";
+  lctx.strokeText(s,x,y);
+  lctx.fillStyle="rgba(238,243,255,"+alpha.toFixed(2)+")";
+  lctx.fillText(s,x,y);
+  var w=lctx.measureText(s).width;
+  lctx.beginPath(); lctx.arc(x-w/2-7,y,2.4,0,6.284);
+  lctx.fillStyle="rgba("+col[0]+","+col[1]+","+col[2]+","+alpha.toFixed(2)+")";
+  lctx.fill();
+}
+function c255(c){return [Math.round(c[0]*255),Math.round(c[1]*255),Math.round(c[2]*255)];}
+
+function labels(yaw,t){
+  lctx.clearRect(0,0,W,H);
+  var top=TOPUI+8, bot=H-BOTUI-8;
+  var taken=[];
+  function place(x,y){
+    for(var pass=0;pass<14;pass++){
+      var clash=false;
+      for(var i=0;i<taken.length;i++){
+        if(Math.abs(taken[i][0]-x)<74 && Math.abs(taken[i][1]-y)<15){ y+=16; clash=true; break; }
+      }
+      if(!clash) break;
+    }
+    taken.push([x,y]); return y;
+  }
+
+  /* mass headings first — they own their space */
+  MASS.forEach(function(M){
+    var p=project(M.cx,M.cy-SCALE*1.15,M.cz,yaw);
+    if(p[2]<=0.05) return;
+    var x=Math.max(50,Math.min(W-50,p[0])), y=Math.max(top+8,Math.min(bot-8,p[1]));
+    y=place(x,y);
+    var c=c255(M.c), dim=(selMass&&selMass!==M)?0.28:1;
+    txt(M.n,x,y,MOBILE?11:13,c,0.98*dim,true);
+    txt(M.act,x,y+13,MOBILE?7.5:8.5,c,0.60*dim,false);
+    taken.push([x,y+13]);
+  });
+
+  /* every node labelled, always */
+  nodes.forEach(function(n){
+    var Rg=RANGE[n.mi], ax=SLOW?0:t*Rg.spin[0], ay=SLOW?0:t*Rg.spin[1], az=SLOW?0:t*Rg.spin[2];
+    var qx=n.lx, qy=n.ly, qz=n.lz, ca=Math.cos(ax), sa=Math.sin(ax);
+    var y1=qy*ca-qz*sa, z1=qy*sa+qz*ca;
+    var cb=Math.cos(ay), sb=Math.sin(ay);
+    var x2=qx*cb+z1*sb, z2=-qx*sb+z1*cb;
+    var cc=Math.cos(az), sc=Math.sin(az);
+    var x3=x2*cc-y1*sc, y3=x2*sc+y1*cc;
+    var p=project(Rg.c[0]+x3, Rg.c[1]+y3, Rg.c[2]+z2, yaw);
+    n.sx=p[0]; n.sy=p[1];
+    if(p[2]<=0.05) return;
+    var on=(n===sel||n===hot);
+    var dim=(selMass&&selMass!==n.mass)?0.26:1;
+    var c=c255(n.mass.c), r=on?7:4.2;
+    var vis=(p[0]>10&&p[0]<W-10&&p[1]>top&&p[1]<bot);
+    if(!vis) return;
+    lctx.beginPath(); lctx.arc(p[0],p[1],r,0,6.284);
+    lctx.strokeStyle="rgba("+c[0]+","+c[1]+","+c[2]+","+((on?1:0.7)*dim).toFixed(2)+")";
+    lctx.lineWidth=on?3:2; lctx.stroke();
+    lctx.strokeStyle="rgba(0,1,5,0.8)"; lctx.lineWidth=1; lctx.stroke();
+    if(on){ lctx.beginPath(); lctx.arc(p[0],p[1],r*0.4,0,6.284);
+            lctx.fillStyle="rgba("+c[0]+","+c[1]+","+c[2]+",1)"; lctx.fill(); }
+    var ly=place(p[0], p[1]+r+10);
+    txt(n.lab,p[0],ly,MOBILE?8:9,c,(on?1:0.72)*dim,on);
+  });
+}
+
+/* ============================================================
+   INPUT
+   ============================================================ */
+function local(e){var r=F.getBoundingClientRect();return [e.clientX-r.left,e.clientY-r.top];}
+function hit(px,py){
+  var best=null,bd=1e9;
+  for(var i=0;i<nodes.length;i++){
+    var n=nodes[i]; if(n.sx===undefined) continue;
+    var d=Math.hypot(n.sx-px,n.sy-py);
+    if(d<34&&d<bd){bd=d;best=n;}
+  }
+  return best;
+}
+var drag=false,moved=0,lx=0,ly=0,pinch=0,ptrs=new Map();
+glc.addEventListener("pointerdown",function(e){
+  e.preventDefault(); ptrs.set(e.pointerId,{x:e.clientX,y:e.clientY});
+  drag=true;moved=0;lx=e.clientX;ly=e.clientY;
+  try{glc.setPointerCapture(e.pointerId);}catch(err){}
+},{passive:false});
+glc.addEventListener("pointermove",function(e){
+  if(ptrs.has(e.pointerId)) ptrs.set(e.pointerId,{x:e.clientX,y:e.clientY});
+  if(ptrs.size===2){
+    var v=[]; ptrs.forEach(function(p){v.push(p);});
+    var d=Math.hypot(v[0].x-v[1].x,v[0].y-v[1].y);
+    if(pinch) tgt.z=Math.max(0.30,Math.min(4.0,tgt.z*(d/pinch)));
+    pinch=d; drag=false; return;
+  }
+  if(drag){
+    var dx=e.clientX-lx,dy=e.clientY-ly;
+    moved+=Math.abs(dx)+Math.abs(dy);
+    tgt.x+=dx; tgt.y+=dy*0.6;
+    tgt.yaw=Math.max(-0.8,Math.min(0.8,tgt.yaw-dx*0.0013));
+    lx=e.clientX; ly=e.clientY;
+  } else { var L=local(e); hot=hit(L[0],L[1]); glc.style.cursor=hot?"pointer":"grab"; }
+},{passive:true});
+["pointerup","pointercancel"].forEach(function(ev){
+  glc.addEventListener(ev,function(e){
+    ptrs.delete(e.pointerId); if(ptrs.size<2) pinch=0;
+    if(drag&&moved<10){ var L=local(e); var h=hit(L[0],L[1]); if(h) openNode(h); }
+    drag=false;
+  });
+});
+glc.addEventListener("wheel",function(e){
+  e.preventDefault(); tgt.z=Math.max(0.30,Math.min(4.0,tgt.z*(e.deltaY>0?0.9:1.11)));
+},{passive:false});
+
+/* ============================================================
+   DRAWER — your own section copy, lifted from the page
+   ============================================================ */
+var draw_=document.getElementById("fdraw");
+var CACHE={};
+function sectionHTML(id){
+  if(CACHE[id]!==undefined) return CACHE[id];
+  var src=document.getElementById(id);
+  if(!src){CACHE[id]=null;return null;}
+
+  /* drop anything the page itself is hiding, judged on the LIVE element
+     before cloning — otherwise stripping classes would reveal it */
+  var hidden=[];
+  src.querySelectorAll("*").forEach(function(e){
+    var cs=getComputedStyle(e);
+    if(cs.display==="none"||cs.visibility==="hidden") hidden.push(e);
+  });
+  hidden.forEach(function(e){ e.setAttribute("data-fhide","1"); });
+
+  var c=src.cloneNode(true);
+  hidden.forEach(function(e){ e.removeAttribute("data-fhide"); });
+
+  c.querySelectorAll('[data-fhide="1"]').forEach(function(e){ e.parentNode.removeChild(e); });
+  c.querySelectorAll("script,style,canvas,svg,form,input,select,textarea,button,iframe,video,img,noscript")
+   .forEach(function(e){ e.parentNode.removeChild(e); });
+
+  /* the whole cause of the mess: page CSS reaching into the drawer.
+     no class, no id, no inline style survives the copy. */
+  c.querySelectorAll("*").forEach(function(e){
+    e.removeAttribute("class"); e.removeAttribute("style");
+    e.removeAttribute("id"); e.removeAttribute("width"); e.removeAttribute("height");
+  });
+  c.querySelectorAll("a").forEach(function(a){
+    a.setAttribute("target","_blank"); a.setAttribute("rel","noopener");
+  });
+  /* flatten grid/table wrappers down to blocks that can reflow on a phone */
+  ["table","thead","tbody","tr","td","th"].forEach(function(tag){
+    c.querySelectorAll(tag).forEach(function(e){
+      var d=document.createElement(tag==="td"||tag==="th"?"p":"div");
+      while(e.firstChild) d.appendChild(e.firstChild);
+      e.parentNode.replaceChild(d,e);
+    });
+  });
+  CACHE[id]=c.innerHTML;
+  return CACHE[id];
+}
+function cta(label,fn,alt){
+  var b=document.createElement("button");
+  b.type="button"; b.textContent=label; if(alt) b.className="alt";
+  b.onclick=fn; return b;
+}
+function openNode(n){
+  sel=n; selMass=n.mass;
+  var c=c255(n.mass.c), rgb="rgb("+c[0]+","+c[1]+","+c[2]+")";
+  var k=document.getElementById("fd-k");
+  k.textContent=n.mass.n+"  \u00b7  "+n.mass.act; k.style.color=rgb;
+  document.getElementById("fd-t").textContent=n.lab;
+
+  var body=document.getElementById("fd-b");
+  var html=sectionHTML(n.id);
+  body.innerHTML = html || "<p>This section lives on the main site.</p>";
+  body.scrollTop=0;
+  if(n.id==="anchor"||n.id==="network"||n.id==="how") chainDemo(body,c);
+
+  var bar=document.getElementById("fd-cta");
+  bar.innerHTML="";
+  bar.appendChild(cta("SIGN UP ON THE MAIN SITE \u203a",function(){ leave("signup"); }));
+  bar.appendChild(cta("READ IT ON THE PAGE",function(){ leave(n.id); },true));
+
+  draw_.classList.add("on");
+  document.getElementById("fhint").classList.add("off");
+  [].forEach.call(rail.children,function(b){ b.dataset.on = (b._m===n.mass)?"1":"0"; });
+}
+document.getElementById("fdx").onclick=function(){
+  draw_.classList.remove("on"); sel=null; selMass=null;
+  [].forEach.call(rail.children,function(b){ b.dataset.on="0"; });
+};
+
+/* the chain, drawn: blocks linking, each seal containing the last */
+function chainDemo(body,col){
+  var old=body.querySelector(".fchainwrap");
+  if(old) old.parentNode.removeChild(old);
+  var wrap=document.createElement("div");
+  wrap.className="fchainwrap";
+  var cv=document.createElement("canvas");
+  cv.width=760; cv.height=192;
+  wrap.appendChild(cv);
+  body.insertBefore(wrap,body.firstChild);
+  var g=cv.getContext("2d"), st=performance.now();
+  var hashes=["9f2c41ab","c7a10de4","4b98f215","0ae7d331","f04cd467"];
+  function tick(now){
+    if(!cv.isConnected) return;
+    g.clearRect(0,0,760,192);
+    var t=(now-st)/1000;
+    var n=5, bw=112, gap=42, x0=26;
+    for(var i=0;i<n;i++){
+      var x=x0+i*(bw+gap), y=34, appear=Math.min(1,Math.max(0,t*1.6-i*0.45));
+      if(appear<=0) continue;
+      g.globalAlpha=appear;
+      if(i>0){
+        var lx2=x-gap, prog=Math.min(1,Math.max(0,t*1.6-i*0.45+0.3));
+        g.strokeStyle="rgba("+col[0]+","+col[1]+","+col[2]+",0.5)";
+        g.lineWidth=2; g.beginPath(); g.moveTo(lx2,y+34); g.lineTo(lx2+gap*prog,y+34); g.stroke();
+        var px=lx2+gap*((t*0.55+i*0.2)%1);
+        g.fillStyle="rgba("+col[0]+","+col[1]+","+col[2]+",1)";
+        g.fillRect(px-2,y+32,4,4);
+      }
+      g.strokeStyle="rgba("+col[0]+","+col[1]+","+col[2]+",0.85)";
+      g.lineWidth=1.6; g.strokeRect(x,y,bw,68);
+      g.fillStyle="rgba("+col[0]+","+col[1]+","+col[2]+",0.10)"; g.fillRect(x,y,bw,68);
+      g.font="10px ui-monospace,monospace"; g.textAlign="left";
+      g.fillStyle="rgba(140,155,200,0.9)"; g.fillText("BLOCK "+(i+1),x+9,y+18);
+      g.fillStyle="rgba("+col[0]+","+col[1]+","+col[2]+",1)";
+      g.font="11px ui-monospace,monospace";
+      g.fillText(hashes[i],x+9,y+38);
+      g.fillStyle="rgba(110,124,168,0.9)"; g.font="9px ui-monospace,monospace";
+      g.fillText("prev "+(i?hashes[i-1]:"genesis"),x+9,y+56);
+    }
+    g.globalAlpha=1;
+    g.fillStyle="rgba(120,134,180,0.85)"; g.font="10px ui-monospace,monospace"; g.textAlign="left";
+    g.fillText("each seal contains the one before it \u2014 edit any block and every seal after it fails",26,124);
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+}
+
+/* ============================================================
+   RAIL — six routes in
+   ============================================================ */
+var rail=document.getElementById("frail");
+MASS.forEach(function(M){
+  var b=document.createElement("button"); b.type="button"; b._m=M;
+  var c=c255(M.c);
+  b.innerHTML='<i style="background:rgb('+c.join(",")+')"></i>'+M.n;
+  b.onclick=function(){
+    selMass=M; sel=null;
+    tgt.z=MOBILE?1.15:1.45;
+    var k=1150/(1150-M.cz);
+    tgt.x=-M.cx*k*tgt.z; tgt.y=-M.cy*k*tgt.z+(TOPUI-BOTUI)/2; tgt.yaw=0;
+    [].forEach.call(rail.children,function(x){ x.dataset.on="0"; });
+    b.dataset.on="1";
+    openNode(nodes.filter(function(n){return n.mass===M;})[0]);
+  };
+  rail.appendChild(b);
+});
+
+/* ============================================================
+   LEAVE
+   ============================================================ */
+function leave(anchor){
+  F.classList.add("gone");
+  document.body.classList.remove("fieldlock");
+  setTimeout(function(){
+    F.style.display="none";
+    if(anchor){ var el=document.getElementById(anchor);
+      if(el) el.scrollIntoView({behavior:"smooth",block:"start"}); }
+  },520);
+  try{ sessionStorage.setItem("fieldSeen","1"); }catch(e){}
+}
+window.openField=function(){
+  F.style.display=""; F.classList.remove("gone");
+  document.body.classList.add("fieldlock");
+  requestAnimationFrame(function(){ resize(); F.classList.add("up"); });
+};
+document.getElementById("fskip").onclick=function(){ leave(null); };
+addEventListener("keydown",function(e){
+  if(e.key==="Escape"){ if(draw_.classList.contains("on")) document.getElementById("fdx").onclick();
+                        else leave(null); }
+});
+
+/* ============================================================
+   LIVE ROUTES
+   ============================================================ */
+function hud(k,v,bad){var e=document.querySelector('[data-fh="'+k+'"]');
+  if(e){e.textContent=v;e.className="fv2"+(bad?" bad":"");}}
+function dig(o,ks){for(var i=0;i<ks.length;i++){var k=ks[i];if(o&&o[k]!==undefined&&o[k]!==null)return o[k];}}
+var ORIGIN=(location.protocol==="http:"||location.protocol==="https:")?"":"https://sebbi.pro";
+function get(u){return fetch(ORIGIN+u,{headers:{accept:"application/json"}}).then(function(r){if(!r.ok)throw 0;return r.json();});}
+
+get("/x/witness/tip").then(function(d){
+  var h=dig(d,["height","blocks","index","block"]), tp=dig(d,["tip","head","chain_tip","hash"]);
+  hud("tip",h!==undefined?String(h):"live");
+  if(tp){
+    document.getElementById("fs-hash").textContent=String(tp).slice(0,32);
+    var D=new Date();
+    document.getElementById("fs-time").textContent=
+      [D.getHours(),D.getMinutes(),D.getSeconds()].map(function(x){return String(x).padStart(2,"0");}).join(":");
+  }
+}).catch(function(){ hud("tip","off",1); });
+get("/x/roster/list").then(function(d){
+  var n=dig(d,["count"]); if(n===undefined) n=(d.peers||[]).length; hud("roster",String(n));
+}).catch(function(){ hud("roster","off",1); });
+get("/x/ots/status").then(function(d){
+  var c=dig(d,["confirmed","anchored","complete"]),p=dig(d,["pending","submitted","upgrading"]);
+  hud("ots",(c===undefined&&p===undefined)?"ok":((c||0)+"/"+(p||0)));
+}).catch(function(){ hud("ots","off",1); });
+
+/* ============================================================
+   BOOT
+   ============================================================ */
+var rt=null;
+addEventListener("resize",function(){ clearTimeout(rt); rt=setTimeout(resize,140); });
+document.getElementById("fs-pts").textContent=(NP/1000).toFixed(0)+"k";
+if(location.hash&&location.hash.length>1){ F.style.display="none"; resize(); }
+else{
+  document.body.classList.add("fieldlock");
+  resize();
+  requestAnimationFrame(function(){ F.classList.add("up"); });
+  setTimeout(function(){var e=document.getElementById("fhint");if(e)e.classList.add("off");},7000);
+}
+requestAnimationFrame(draw);
+})();
 </script>
 </body>
 </html>
