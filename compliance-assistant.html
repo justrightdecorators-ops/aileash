@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Own the thing everyone needs. 50p in, your price out. &middot; sebbi.pro</title>
+<meta name="description" content="Buy the child-safety and fraud package at 50p per phone per month. Sell it at your price. No stock, no fees, no boss. Recurring income that pays you again every month.">
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;800;900&family=DM+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--navy:#070b16;--surface:#111a30;--surface2:#0c1322;--border:#1e2a45;--gold:#c9a84c;--gold2:#f0d78a;--green:#7fe3b0;--green2:#2ee68a;--cyan:#00d4ff;--red:#ff6b6b;--mono:'JetBrains Mono',monospace;--sans:'DM Sans',sans-serif;--display:'Playfair Display',serif;--muted:#8a90a6}
+html{scroll-behavior:smooth}
+body{background:var(--navy);color:#fff;font-family:var(--sans);line-height:1.7;-webkit-font-smoothing:antialiased;overflow-x:hidden}
+
+nav{position:sticky;top:0;z-index:100;background:rgba(7,11,22,0.96);backdrop-filter:blur(14px);padding:0 20px;height:58px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid rgba(201,168,76,0.15)}
+.nav-logo{font-family:var(--display);font-size:17px;color:#fff;font-weight:900;text-decoration:none}.nav-logo span{color:var(--gold)}
+.nav-links{display:flex;gap:14px;align-items:center}
+.nav-links a{color:rgba(255,255,255,0.45);text-decoration:none;font-size:13px}.nav-links a:hover{color:#fff}
+.nav-cta{background:var(--gold)!important;color:var(--navy)!important;padding:8px 15px;font-weight:800!important;border-radius:6px}
+
+.hero{padding:52px 20px 44px;text-align:center;position:relative;overflow:hidden}
+.hero::before{content:'';position:absolute;inset:0;background:radial-gradient(ellipse at 50% -10%,rgba(201,168,76,0.14),transparent 58%)}
+.hero::after{content:'';position:absolute;left:0;right:0;bottom:0;height:1px;background:linear-gradient(90deg,transparent,rgba(201,168,76,0.4),transparent)}
+.hero-in{max-width:820px;margin:0 auto;position:relative}
+.kick{display:inline-block;font-family:var(--mono);font-size:10px;letter-spacing:2.5px;text-transform:uppercase;color:var(--gold);border:1px solid rgba(201,168,76,0.35);background:rgba(201,168,76,0.07);padding:6px 14px;border-radius:100px;margin-bottom:22px}
+h1{font-family:var(--display);font-size:clamp(34px,8vw,66px);line-height:1.02;font-weight:900;margin-bottom:20px;letter-spacing:-0.5px}
+h1 em{font-style:normal;background:linear-gradient(100deg,var(--gold),var(--gold2));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+.hero-sub{font-size:17.5px;color:rgba(255,255,255,0.58);line-height:1.72;max-width:600px;margin:0 auto}
+.hero-sub b{color:#fff;font-weight:700}
+
+.flow{display:flex;gap:6px;max-width:560px;margin:32px auto 0}
+.flow-b{flex:1;background:var(--surface2);border:1px solid var(--border);border-radius:11px;padding:16px 10px}
+.flow-b.hot{border-color:rgba(127,227,176,0.45);background:rgba(127,227,176,0.06)}
+.flow-b .k{font-family:var(--mono);font-size:8.5px;letter-spacing:1.8px;text-transform:uppercase;color:rgba(255,255,255,0.3);margin-bottom:7px}
+.flow-b .v{font-family:var(--display);font-size:clamp(19px,4.6vw,27px);font-weight:900;line-height:1.05}
+.c-dim{color:rgba(255,255,255,0.45)}.c-gold{color:var(--gold)}.c-green{color:var(--green)}
+
+section.sec{max-width:880px;margin:0 auto;padding:60px 20px 0}
+.eyebrow{font-family:var(--mono);font-size:10px;letter-spacing:2.8px;text-transform:uppercase;color:rgba(201,168,76,0.7);margin-bottom:13px;display:block}
+h2{font-family:var(--display);font-size:clamp(28px,5.6vw,44px);font-weight:900;line-height:1.06;margin-bottom:15px;letter-spacing:-0.3px}
+h2 em{font-style:normal;background:linear-gradient(100deg,var(--gold),var(--gold2));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+h2 em.g{background:linear-gradient(100deg,var(--green),var(--green2));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+.sub{font-size:15.5px;color:rgba(255,255,255,0.52);line-height:1.8;max-width:640px;margin-bottom:30px}
+.sub b{color:#fff}
+
+.clock{background:linear-gradient(160deg,rgba(201,168,76,0.09),rgba(127,227,176,0.05));border:2px solid rgba(201,168,76,0.3);border-radius:18px;padding:26px 20px;margin-bottom:18px;text-align:center}
+.clock-k{font-family:var(--mono);font-size:9.5px;letter-spacing:2.5px;text-transform:uppercase;color:rgba(255,255,255,0.4);margin-bottom:12px}
+.clock-big{font-family:var(--display);font-size:clamp(52px,15vw,104px);font-weight:900;line-height:0.95;background:linear-gradient(100deg,var(--gold),var(--gold2));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+.clock-unit{font-family:var(--display);font-size:clamp(18px,4vw,26px);font-weight:900;color:rgba(255,255,255,0.5);margin-top:2px}
+.clock-date{font-family:var(--mono);font-size:12px;color:var(--green);letter-spacing:1.5px;margin-top:14px}
+.clock-sm{font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.3);margin-top:8px;line-height:1.7;max-width:430px;margin-left:auto;margin-right:auto}
+
+.panel{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:24px 20px;margin-bottom:18px}
+.ctrl{margin-bottom:22px}
+.ctrl:last-child{margin-bottom:0}
+.ctrl-top{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:9px;gap:12px}
+.ctrl-lbl{font-family:var(--mono);font-size:9.5px;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,0.35)}
+.ctrl-val{font-family:var(--display);font-size:25px;font-weight:900;color:var(--gold);line-height:1;white-space:nowrap}
+input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:7px;border-radius:4px;background:rgba(255,255,255,0.09);outline:none}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:30px;height:30px;border-radius:50%;background:linear-gradient(160deg,var(--gold2),var(--gold));cursor:pointer;border:4px solid var(--navy);box-shadow:0 0 0 1px rgba(201,168,76,0.6),0 0 18px rgba(201,168,76,0.35)}
+input[type=range]::-moz-range-thumb{width:30px;height:30px;border-radius:50%;background:var(--gold);cursor:pointer;border:4px solid var(--navy)}
+.hint{font-family:var(--mono);font-size:9.5px;color:rgba(255,255,255,0.26);margin-top:8px;line-height:1.7}
+
+.figs{display:grid;grid-template-columns:1fr 1fr 1fr;gap:2px;background:rgba(255,255,255,0.05);border-radius:12px;overflow:hidden;margin-bottom:16px}
+.fig{background:var(--surface2);padding:17px 10px;text-align:center}
+.fig .k{font-family:var(--mono);font-size:8.5px;letter-spacing:1.6px;text-transform:uppercase;color:rgba(255,255,255,0.28);margin-bottom:7px}
+.fig .v{font-family:var(--display);font-size:clamp(20px,5vw,30px);font-weight:900;line-height:1}
+.fig .s{font-family:var(--mono);font-size:8.5px;color:rgba(255,255,255,0.22);margin-top:5px}
+
+.rung{display:flex;align-items:center;gap:14px;background:var(--surface2);border:1px solid var(--border);border-radius:11px;padding:14px 16px;margin-bottom:8px;transition:all .25s}
+.rung.hit{border-color:rgba(127,227,176,0.45);background:rgba(127,227,176,0.055)}
+.rung.now{border-color:var(--gold);background:rgba(201,168,76,0.09);box-shadow:0 0 24px rgba(201,168,76,0.12)}
+.rung-n{font-family:var(--display);font-size:20px;font-weight:900;color:rgba(255,255,255,0.35);min-width:66px;line-height:1.1}
+.rung.hit .rung-n{color:var(--green)}
+.rung.now .rung-n{color:var(--gold)}
+.rung-n small{display:block;font-family:var(--mono);font-size:8px;letter-spacing:1.4px;text-transform:uppercase;color:rgba(255,255,255,0.25);font-weight:400;margin-top:3px}
+.rung-mid{flex:1;min-width:0}
+.rung-mid .t{font-size:14.5px;font-weight:700;color:#fff;line-height:1.35}
+.rung-mid .d{font-size:12.5px;color:rgba(255,255,255,0.42);line-height:1.5;margin-top:2px}
+.rung-amt{font-family:var(--display);font-size:19px;font-weight:900;color:var(--green);text-align:right;white-space:nowrap}
+.rung-amt small{display:block;font-family:var(--mono);font-size:8px;color:rgba(255,255,255,0.25);font-weight:400;letter-spacing:1px;margin-top:3px}
+
+.vs{display:grid;grid-template-columns:1fr 1fr;gap:2px;background:rgba(255,255,255,0.05);border-radius:12px;overflow:hidden}
+.vs-col{background:var(--surface2);padding:24px 20px}
+.vs-col.bad h3{color:rgba(255,255,255,0.4)}
+.vs-col.good h3{background:linear-gradient(100deg,var(--green),var(--green2));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+.vs-col h3{font-family:var(--display);font-size:20px;font-weight:900;margin-bottom:15px}
+.vs-col li{list-style:none;font-size:13.5px;line-height:1.6;padding:9px 0 9px 20px;position:relative;color:rgba(255,255,255,0.5);border-bottom:1px solid rgba(255,255,255,0.04)}
+.vs-col li:last-child{border-bottom:none}
+.vs-col li b{color:#fff}
+.vs-col.bad li::before{content:'\2715';position:absolute;left:0;color:var(--red);opacity:.7}
+.vs-col.good li::before{content:'\2713';position:absolute;left:0;color:var(--green)}
+
+.packs{display:grid;grid-template-columns:1fr 1fr;gap:11px}
+.pk{background:var(--surface);border:1px solid var(--border);border-radius:13px;padding:20px}
+.pk .tag{font-family:var(--mono);font-size:8.5px;letter-spacing:1.6px;text-transform:uppercase;padding:3px 9px;border-radius:4px;display:inline-block;margin-bottom:11px}
+.tg-red{color:var(--red);background:rgba(255,107,107,0.09);border:1px solid rgba(255,107,107,0.3)}
+.tg-cyan{color:var(--cyan);background:rgba(0,212,255,0.08);border:1px solid rgba(0,212,255,0.3)}
+.tg-green{color:var(--green);background:rgba(127,227,176,0.08);border:1px solid rgba(127,227,176,0.3)}
+.tg-gold{color:var(--gold);background:rgba(201,168,76,0.09);border:1px solid rgba(201,168,76,0.32)}
+.pk h3{font-family:var(--display);font-size:20px;font-weight:900;margin-bottom:6px}
+.pk .one{font-size:14px;color:rgba(255,255,255,0.72);font-weight:600;margin-bottom:10px}
+.pk p{font-size:13.5px;color:rgba(255,255,255,0.47);line-height:1.7}
+.pk p b{color:rgba(255,255,255,0.82)}
+.say{background:rgba(201,168,76,0.06);border-left:3px solid var(--gold);padding:11px 14px;margin-top:13px;border-radius:0 6px 6px 0}
+.say .k{font-family:var(--mono);font-size:8px;letter-spacing:1.6px;text-transform:uppercase;color:var(--gold);margin-bottom:5px}
+.say p{font-size:13px;color:rgba(255,255,255,0.65);font-style:italic;margin:0}
+
+.script{background:var(--surface);border:1px solid var(--border);border-radius:13px;padding:20px;margin-bottom:11px}
+.script-h{display:flex;justify-content:space-between;align-items:baseline;gap:12px;margin-bottom:12px;flex-wrap:wrap}
+.script-h h4{font-family:var(--display);font-size:19px;font-weight:900}
+.script-h .who{font-family:var(--mono);font-size:9px;letter-spacing:1.5px;text-transform:uppercase;color:var(--cyan)}
+.words{background:rgba(0,0,0,0.35);border:1px solid rgba(0,212,255,0.14);border-radius:8px;padding:15px 17px;font-size:14px;color:rgba(255,255,255,0.75);line-height:1.75;font-style:italic}
+.words b{color:var(--gold);font-style:normal}
+.script .after{font-size:13px;color:rgba(255,255,255,0.42);line-height:1.65;margin-top:11px}
+.script .after b{color:#fff}
+
+.claims{display:grid;grid-template-columns:1fr 1fr;gap:2px;background:rgba(255,255,255,0.05);border-radius:12px;overflow:hidden}
+.cl{background:var(--surface2);padding:22px 19px}
+.cl h4{font-family:var(--display);font-size:18px;font-weight:900;margin-bottom:13px}
+.cl.y h4{color:var(--green)}.cl.n h4{color:var(--red)}
+.cl li{list-style:none;font-size:13.5px;line-height:1.6;padding:8px 0 8px 21px;position:relative;color:rgba(255,255,255,0.52);border-bottom:1px solid rgba(255,255,255,0.04)}
+.cl li:last-child{border-bottom:none}
+.cl.y li::before{content:'\2713';position:absolute;left:0;color:var(--green);font-weight:700}
+.cl.n li::before{content:'\2715';position:absolute;left:0;color:var(--red);font-weight:700}
+
+.note{border-radius:10px;padding:15px 19px;font-size:13.5px;line-height:1.75;margin-top:15px}
+.note-cyan{background:rgba(0,212,255,0.05);border:1px solid rgba(0,212,255,0.22);color:rgba(255,255,255,0.58)}
+.note-cyan b{color:var(--cyan)}
+.note-red{background:rgba(255,107,107,0.05);border:1px solid rgba(255,107,107,0.24);color:rgba(255,255,255,0.58)}
+.note-red b{color:var(--red)}
+.note-gold{background:rgba(201,168,76,0.05);border:1px solid rgba(201,168,76,0.28);color:rgba(255,255,255,0.58)}
+.note-gold b{color:var(--gold)}
+
+.faq{background:var(--surface);border:1px solid var(--border);border-radius:10px;margin-bottom:8px;overflow:hidden}
+.faq-q{padding:15px 19px;font-size:14.5px;font-weight:600;cursor:pointer;display:flex;justify-content:space-between;gap:14px;align-items:center}
+.faq-q::after{content:'+';font-family:var(--mono);color:var(--gold);font-size:18px;flex-shrink:0}
+.faq.open .faq-q::after{content:'\2013'}
+.faq-a{display:none;padding:0 19px 17px;font-size:13.5px;color:rgba(255,255,255,0.5);line-height:1.75}
+.faq.open .faq-a{display:block}
+.faq-a b{color:#fff}
+
+.cta{max-width:880px;margin:0 auto;padding:64px 20px 34px;text-align:center}
+.cta p{color:rgba(255,255,255,0.52);font-size:15.5px;margin-bottom:26px;max-width:540px;margin-left:auto;margin-right:auto}
+.btn{background:linear-gradient(140deg,var(--gold2),var(--gold));color:var(--navy);padding:17px 34px;border:none;font-family:var(--sans);font-weight:800;font-size:16px;cursor:pointer;text-decoration:none;border-radius:8px;display:inline-block;transition:all .2s;box-shadow:0 6px 26px rgba(201,168,76,0.24)}
+.btn:hover{transform:translateY(-2px)}
+.btn2{background:transparent;color:rgba(255,255,255,0.55);padding:17px 30px;border:1px solid rgba(255,255,255,0.16);font-weight:600;font-size:15px;text-decoration:none;border-radius:8px;display:inline-block;margin-left:8px}
+.btn2:hover{color:#fff;border-color:rgba(255,255,255,0.4)}
+
+.honest{max-width:880px;margin:0 auto;padding:0 20px 54px}
+.honest-box{border:1px solid rgba(201,168,76,0.28);background:rgba(201,168,76,0.04);border-radius:11px;padding:19px 22px;font-size:13.5px;color:var(--muted);line-height:1.8}
+.honest-box b{color:var(--gold)}
+
+footer{background:rgba(0,0,0,0.45);padding:32px 20px;border-top:1px solid rgba(255,255,255,0.05);text-align:center}
+.fl{display:flex;gap:18px;flex-wrap:wrap;justify-content:center;margin-bottom:13px}
+.fl a{color:rgba(255,255,255,0.35);text-decoration:none;font-size:12.5px}.fl a:hover{color:#fff}
+.fc{font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.22);line-height:1.85;max-width:620px;margin:0 auto}
+
+@media(max-width:740px){
+  .nav-links a:not(.nav-cta){display:none}
+  .packs,.vs,.claims{grid-template-columns:1fr}
+  .figs{grid-template-columns:1fr 1fr}
+  .btn2{margin-left:0;margin-top:10px;display:block}
+  .rung{padding:12px 13px;gap:10px}
+  .rung-n{min-width:54px;font-size:17px}
+  .rung-amt{font-size:16px}
+  .rung-mid .t{font-size:13.5px}
+}
+</style>
+</head>
+<body>
+
+<nav>
+  <a href="/" class="nav-logo">Monop <span>Content</span></a>
+  <div class="nav-links">
+    <a href="#clock">The numbers</a>
+    <a href="#package">What you sell</a>
+    <a href="#scripts">The words</a>
+    <a href="#start" class="nav-cta">Start free</a>
+  </div>
+</nav>
+
+<section class="hero">
+  <div class="hero-in">
+    <span class="kick">No stock &middot; no fees &middot; no boss &middot; start today</span>
+    <h1>Everyone's flogging<br>somebody else's tat.<br><em>Sell something that matters.</em></h1>
+    <p class="hero-sub">You buy a child-safety and fraud package for <b>50p per phone per month</b>. You sell it for whatever you like. The difference is yours, and it lands again next month whether you worked that month or not. <b>No stock. No shipping. Nothing up front.</b> One phone or a hundred thousand.</p>
+
+    <div class="flow">
+      <div class="flow-b"><div class="k">You pay</div><div class="v c-dim">50p</div></div>
+      <div class="flow-b"><div class="k">You charge</div><div class="v c-gold">&pound;4.50</div></div>
+      <div class="flow-b hot"><div class="k">You keep</div><div class="v c-green">&pound;4.00</div></div>
+    </div>
+  </div>
+</section>
+
+<section class="sec" id="clock">
+  <span class="eyebrow">01 &middot; Your number</span>
+  <h2>How long until you've<br>earned <em>a million?</em></h2>
+  <p class="sub">Set your price. Set how many phones you get it onto. The clock does the rest. <b>It's arithmetic, not a promise</b> &mdash; nobody's handing you the phones, you go and get them. But this is what the maths says when you do.</p>
+
+  <div class="clock">
+    <div class="clock-k">You pass &pound;1,000,000 earned in</div>
+    <div class="clock-big" id="c-num">25</div>
+    <div class="clock-unit" id="c-unit">months</div>
+    <div class="clock-date" id="c-date">&nbsp;</div>
+    <div class="clock-sm">Total earned over time, before tax and your own costs. Not a lump sum and not net worth &mdash; anyone telling you different is selling you something.</div>
+  </div>
+
+  <div class="panel">
+    <div class="ctrl">
+      <div class="ctrl-top"><span class="ctrl-lbl">Phones you get it onto</span><span class="ctrl-val" id="v-dev">10,000</span></div>
+      <input type="range" id="s-dev" min="0" max="100" value="76" oninput="draw()">
+      <div class="hint">Start where you actually are. Ten is a real number. So is fifty.</div>
+    </div>
+    <div class="ctrl">
+      <div class="ctrl-top"><span class="ctrl-lbl">What you charge per phone, per month</span><span class="ctrl-val" id="v-price">&pound;4.50</span></div>
+      <input type="range" id="s-price" min="60" max="2000" value="450" step="10" oninput="draw()">
+      <div class="hint">Your market, your price, your currency. Parents pay this for one coffee a month.</div>
+    </div>
+  </div>
+
+  <div class="figs">
+    <div class="fig"><div class="k">You keep</div><div class="v c-green" id="f-mo">&pound;40,000</div><div class="s">every month</div></div>
+    <div class="fig"><div class="k">Over a year</div><div class="v" style="color:var(--cyan)" id="f-yr">&pound;480,000</div><div class="s">recurring</div></div>
+    <div class="fig"><div class="k">We take</div><div class="v c-dim" id="f-us">&pound;5,000</div><div class="s">50p a phone</div></div>
+  </div>
+
+  <div class="note note-cyan" id="reality">&nbsp;</div>
+</section>
+
+<section class="sec">
+  <span class="eyebrow">02 &middot; The climb</span>
+  <h2>It doesn't start at a million.<br>It starts at <em class="g">ten phones.</em></h2>
+  <p class="sub">Every rung, at the price you just set. The first one takes an afternoon. Every one after is the same conversation again. <b>Nothing resets &mdash; last month's phones still pay you this month.</b></p>
+
+  <div id="ladder"></div>
+
+  <div class="note note-gold"><b>The bit people miss:</b> this is the opposite of a job. A job pays you once for the hour you worked. Every phone you sign up pays you again next month, and the month after, while you're asleep or out signing up the next one. <b>Ten new customers a month isn't ten customers &mdash; by December it's a hundred and twenty, all still paying.</b></div>
+</section>
+
+<section class="sec">
+  <span class="eyebrow">03 &middot; Why this and not the other stuff</span>
+  <h2>You've seen the<br>dropshipping <em>adverts.</em></h2>
+  <p class="sub">The honest comparison, including the bit that's harder here. If you want easy, this isn't easy. If you want something still paying you in two years, read on.</p>
+
+  <div class="vs">
+    <div class="vs-col bad">
+      <h3>Flipping products</h3>
+      <li>You get paid <b>once</b>. Then back to zero.</li>
+      <li>Someone always undercuts you. Margins die.</li>
+      <li>Money up front on stock or ads before you earn a penny.</li>
+      <li>Returns, shipping, angry customers, customs.</li>
+      <li>Anyone can copy your shop in a weekend.</li>
+      <li>Nobody's life is better because you sold it.</li>
+    </div>
+    <div class="vs-col good">
+      <h3>This</h3>
+      <li>You get paid <b>every month</b>, as long as they keep it.</li>
+      <li>Your cost is fixed at 50p. It doesn't rise when you grow.</li>
+      <li><b>Nothing up front.</b> No stock, no fee, no minimum.</li>
+      <li>No shipping, no returns, no warehouse. It's software.</li>
+      <li>Harder to sell than a phone case &mdash; you have to explain it.</li>
+      <li>A parent finds out early. That's the product.</li>
+    </div>
+  </div>
+</section>
+
+<section class="sec" id="package">
+  <span class="eyebrow">04 &middot; What they actually get</span>
+  <h2>Four things.<br>One price. <em>One install.</em></h2>
+  <p class="sub">What's on the phone after they say yes. Each one has the exact sentence to use &mdash; nick them word for word, they're written to be said out loud.</p>
+
+  <div class="packs">
+    <div class="pk">
+      <span class="tag tg-red">Guardian</span>
+      <h3>Child protection</h3>
+      <p class="one">Spots the patterns that come before harm.</p>
+      <p>Watches for the known warning signs of grooming &mdash; pushing for secrecy, isolating a child, moving them to a private chat &mdash; and tells the parent. <b>The messages are never stored</b>, only a fingerprint. What is kept is sealed, so it can't be edited later and it means something to a school or the police.</p>
+      <div class="say"><div class="k">Say this</div><p>&ldquo;Your kid's phone tells you when something starts going wrong &mdash; without you having to read their messages.&rdquo;</p></div>
+    </div>
+
+    <div class="pk">
+      <span class="tag tg-cyan">Sentinel</span>
+      <h3>Fraud alarm</h3>
+      <p class="one">Catches it during, not on the statement.</p>
+      <p>Watches speed and pattern &mdash; a run of login attempts, a burst of payments, the account popping up in another country minutes after the last one. Classic takeover signals. Flags them live and <b>seals the evidence</b>, so there's something real to show the bank.</p>
+      <div class="say"><div class="k">Say this</div><p>&ldquo;When someone tries to get into your account, you find out while it's happening.&rdquo;</p></div>
+    </div>
+
+    <div class="pk">
+      <span class="tag tg-green">Sebdog</span>
+      <h3>It runs on the phone</h3>
+      <p class="one">Not on our computers. Theirs.</p>
+      <p>The engine sits on the device itself, so their data doesn't have to leave it to be protected. <b>No round trip, nobody in the middle.</b> Companies pay serious money for this as an on-site product. Here it's just part of the package.</p>
+      <div class="say"><div class="k">Say this</div><p>&ldquo;It protects you without sending your life to somebody else's computer.&rdquo;</p></div>
+    </div>
+
+    <div class="pk">
+      <span class="tag tg-gold">Signal Packs</span>
+      <h3>Their rules, not ours</h3>
+      <p class="one">They build it. That's why they keep it.</p>
+      <p>A Signal Pack is a set of rules the parent writes themselves: which numbers get through, which sites are allowed, what counts as odd for this particular kid. <b>They've put work into it, so they don't cancel it.</b></p>
+      <div class="say"><div class="k">Say this</div><p>&ldquo;You set the rules. It's your phone and your family.&rdquo;</p></div>
+    </div>
+  </div>
+
+  <div class="note note-gold"><b>Underneath all four:</b> everything is written into a chain where each record is locked to the one before, so nothing can be quietly changed afterwards &mdash; not by us either. That's what turns an alert into evidence instead of a screenshot.</div>
+</section>
+
+<section class="sec" id="scripts">
+  <span class="eyebrow">05 &middot; Your first ten customers</span>
+  <h2>You already know<br>every one of <em>them.</em></h2>
+  <p class="sub">You don't need adverts or a website to start. You need ten people who trust you and have kids with phones. <b>Here are the actual words.</b> Change them to sound like you, then use them ten times.</p>
+
+  <div class="script">
+    <div class="script-h"><h4>The school gate</h4><span class="who">In person &middot; 30 seconds</span></div>
+    <div class="words">&ldquo;Can I ask you something daft &mdash; has your lad got a phone yet? Right. So I've started doing something that puts a thing on it that watches for the grooming stuff. It doesn't read his messages, it just tells you if someone starts asking him to keep secrets or move to a private chat. <b>It's a fiver a month.</b> Want me to put it on for you?&rdquo;</div>
+    <div class="after"><b>Why it works:</b> you named the fear, you killed the objection they were about to make (reading his messages), and you gave the price before they had to ask. <b>Say the price.</b> People who hide the price never sell anything.</div>
+  </div>
+
+  <div class="script">
+    <div class="script-h"><h4>The group chat</h4><span class="who">WhatsApp &middot; paste it</span></div>
+    <div class="words">&ldquo;Bit random. I've started doing a thing for kids' phones &mdash; it watches for the grooming warning signs and tells the parent, without reading their messages. Also catches someone trying to get into your bank. <b>&pound;4.50 a month, cancel whenever.</b> If anyone wants it on their kid's phone give me a shout and I'll sort it.&rdquo;</div>
+    <div class="after"><b>Why it works:</b> low pressure, no link, no sales voice. In a group of forty parents you'll get three. <b>Three is £13.50 a month, forever, from one message</b> &mdash; and those three tell other parents, because this is the thing parents actually talk about.</div>
+  </div>
+
+  <div class="script">
+    <div class="script-h"><h4>The shop counter</h4><span class="who">If you sell phones</span></div>
+    <div class="words">&ldquo;Is this one for yourself or for one of the kids? For your daughter &mdash; right. Do you want me to put the safety package on before you go? It watches for grooming and tells you, and it flags anyone trying to get into her accounts. <b>It's five pound a month and I can set it up now while you're stood here.</b>&rdquo;</div>
+    <div class="after"><b>Why it works:</b> they're already spending and already thinking about their kid. <b>Every handset becomes a monthly income you keep for years</b> instead of a one-off margin you spend that week.</div>
+  </div>
+
+  <div class="script">
+    <div class="script-h"><h4>The business one</h4><span class="who">Phone &middot; clubs, schools, firms</span></div>
+    <div class="words">&ldquo;I supply a safety package that goes on phones &mdash; it flags the grooming warning signs to a parent and keeps a sealed record you could hand to the police if it ever came to it. I'm offering it to your families at <b>&pound;4 a month.</b> Could I show you what a parent actually sees? Takes five minutes.&rdquo;</div>
+    <div class="after"><b>Why it works:</b> one club or one school is a hundred families in a single conversation. <b>That's £350 a month from one phone call.</b> Ask for the five minutes, not the sale.</div>
+  </div>
+
+  <div class="note note-cyan"><b>The only rule:</b> ask for the money. Nine out of ten people who fail at this never say a price out loud. Say it plainly, then stop talking and let them answer.</div>
+</section>
+
+<section class="sec">
+  <span class="eyebrow">06 &middot; How the good ones sell it</span>
+  <h2>Never oversell<br>this <em>one thing.</em></h2>
+  <p class="sub">Everything on the left is true and provable. Everything on the right is a promise nobody on earth can keep, including us. <b>The left-hand column closes better anyway</b> &mdash; parents can smell a salesman, and they trust the person who tells them what it can't do.</p>
+
+  <div class="claims">
+    <div class="cl y">
+      <h4>True. Say it freely.</h4>
+      <li>Flags known warning signs of grooming and alerts the parent</li>
+      <li>Never stores the messages &mdash; only a fingerprint</li>
+      <li>Keeps a sealed record nobody can quietly change later</li>
+      <li>Catches fraud patterns as they happen</li>
+      <li>Runs on the phone, so their data stays on it</li>
+      <li>Something real to hand to a school or the police</li>
+    </div>
+    <div class="cl n">
+      <h4>Never. Not once.</h4>
+      <li>&ldquo;Stops grooming&rdquo; or &ldquo;keeps your child safe&rdquo;</li>
+      <li>&ldquo;Catches every predator&rdquo; &middot; &ldquo;100% detection&rdquo;</li>
+      <li>&ldquo;Unhackable&rdquo; or &ldquo;impossible to get round&rdquo;</li>
+      <li>&ldquo;Police approved&rdquo; &middot; &ldquo;certified&rdquo; &middot; &ldquo;government backed&rdquo;</li>
+      <li>&ldquo;Makes you compliant&rdquo; with any law</li>
+      <li>Anything hinting a parent can stop paying attention</li>
+    </div>
+  </div>
+
+  <div class="note note-red"><b>Why we're hard on this:</b> it catches known patterns. It cannot catch every clever rewording, and no honest product claims otherwise. What it guarantees is the <b>record</b>. Sell the early warning and the proof. <b>A parent promised a wall who got a smoke alarm cancels, tells forty other parents, and takes your income with them.</b> Sell it straight and they stay for years. Overclaim on child safety and your code gets pulled.</div>
+</section>
+
+<section class="sec">
+  <span class="eyebrow">07 &middot; The deal, plainly</span>
+  <h2>You get rich,<br>we get <em class="g">busy.</em></h2>
+  <p class="sub">No catch, and here's exactly where our money comes from so you're not left wondering.</p>
+
+  <div class="vs">
+    <div class="vs-col good">
+      <h3>What you get</h3>
+      <li>Everything above 50p. <b>We never see your price.</b></li>
+      <li>Your own brand on it if you want one.</li>
+      <li>Your customers, your invoices, your relationship.</li>
+      <li>Phones locked to your code <b>permanently</b> &mdash; they grow, you grow.</li>
+      <li>No joining fee, no minimum, no exclusivity, no quota.</li>
+      <li>Sell nothing, owe nothing.</li>
+    </div>
+    <div class="vs-col good">
+      <h3>What we get</h3>
+      <li>50p per active phone. <b>That's the entire deal.</b></li>
+      <li>We'd rather have 50p from a million phones than &pound;50 from a thousand.</li>
+      <li>You sell in places we'd never reach.</li>
+      <li>Every phone makes the network stronger for everyone on it.</li>
+      <li>We only earn when you earn. <b>You sell nothing, we get nothing.</b></li>
+      <li>Which is why the 50p doesn't move when you scale.</li>
+    </div>
+  </div>
+
+  <div class="note note-gold"><b>Say it to your customers if you like</b> &mdash; there's no shame in the model. You're the one out there doing the work, having the conversations, taking the knock-backs. <b>You should keep the lion's share, and you do.</b></div>
+</section>
+
+<section class="sec">
+  <span class="eyebrow">08 &middot; Straight answers</span>
+  <h2>What everyone<br><em>asks first.</em></h2>
+  <div style="margin-top:24px">
+    <div class="faq"><div class="faq-q" onclick="tf(this)">Do I need money to start?</div><div class="faq-a">No. Not a penny. No joining fee, no stock, no minimum, no ads. You pay us 50p only for phones that are actually live &mdash; and by then your customer has already paid you.</div></div>
+    <div class="faq"><div class="faq-q" onclick="tf(this)">Do I need to be technical?</div><div class="faq-a">No. You get a code, they install it, that's it. If you can set up a phone for somebody, you can do this.</div></div>
+    <div class="faq"><div class="faq-q" onclick="tf(this)">Do I need a company?</div><div class="faq-a">Not to start. But once money's coming in, <b>tell HMRC</b> &mdash; income from this is taxable like any other, and registering as a sole trader is free and takes ten minutes online. Don't skip it, and don't let anyone tell you it doesn't count.</div></div>
+    <div class="faq"><div class="faq-q" onclick="tf(this)">Is this one of them pyramid things?</div><div class="faq-a"><b>No, and here's how you check.</b> You don't recruit anybody. You don't earn from other sellers. You don't buy in, and there's nothing to buy. You sell a real product to real people who use it, and you pay 50p per phone. If a scheme's money comes from recruiting rather than selling, walk away &mdash; that's the test, and this one passes it.</div></div>
+    <div class="faq"><div class="faq-q" onclick="tf(this)">Can I sell it outside the UK?</div><div class="faq-a">Yes, anywhere. Your currency, your price, your language. The 50p stays in sterling, so in plenty of markets the margin is <b>better</b>, not worse.</div></div>
+    <div class="faq"><div class="faq-q" onclick="tf(this)">What if someone cancels?</div><div class="faq-a">Billing stops for that phone &mdash; your bit and our bit. No penalty, no clawback, no notice period. Your other customers aren't affected.</div></div>
+    <div class="faq"><div class="faq-q" onclick="tf(this)">Will you go behind my back to my customers?</div><div class="faq-a">No. You invoice them, you hold the relationship, and their phones are tied to your code permanently. If your ten become ten thousand, that's yours.</div></div>
+    <div class="faq"><div class="faq-q" onclick="tf(this)">How do I know any of this is real?</div><div class="faq-a">Don't take our word for it. The chain is public, the checking routes need no account, and the verifier runs on your own machine with the internet off. <b>You're meant to check rather than trust.</b> Start at <a href="/whitepaper" style="color:var(--gold)">the whitepaper</a>.</div></div>
+    <div class="faq"><div class="faq-q" onclick="tf(this)">How much can I really make in month one?</div><div class="faq-a">Realistically? Ten to thirty phones if you actually ask everyone you know. At &pound;4.50 that's <b>&pound;40 to &pound;120 a month</b> &mdash; and it's still arriving next January. Anyone promising you thousands in week one is lying to you.</div></div>
+  </div>
+</section>
+
+<div class="cta" id="start">
+  <h2>Ten phones by <em>Friday.</em></h2>
+  <p>Get your code, set your price, ask the first ten people you know. It costs you nothing to find out whether you're any good at this.</p>
+  <a href="/#signup" class="btn">Get my code &mdash; free &rarr;</a>
+  <a href="/contact" class="btn2">Talk to Justin first</a>
+</div>
+
+<div class="honest">
+  <div class="honest-box"><b>About the numbers on this page:</b> every figure comes from sliders you set yourself. It's arithmetic, not a forecast, and nobody is promising you customers or income. The million is <b>total earned over time, before tax and your own costs</b> &mdash; not a lump sum, not net worth. What we promise is the price: <b>50p per active phone per month and nothing else.</b> Whether anyone buys is down to you, which is exactly why the margin is yours.<br><br><b>About the product:</b> sealing proves something happened in a particular form at a particular time and hasn't changed since. It does not prove the contents are true and it does not discharge anybody's legal duties. <b>Guardian is a safeguarding aid and an evidence layer. It supports a parent. It never replaces one.</b></div>
+</div>
+
+<footer>
+  <div class="fl">
+    <a href="/">Home</a>
+    <a href="/whitepaper">Whitepaper</a>
+    <a href="/developers">Developers</a>
+    <a href="/verify">Verify</a>
+    <a href="/contact">Contact</a>
+  </div>
+  <div class="fc">&copy; 2026 Monop Content &middot; Blyth, Northumberland, UK &middot; sebbi.pro<br>Figures are arithmetic on values you enter. Not projections, not guarantees of earnings.</div>
+</footer>
+
+<script>
+var DEV=[5,10,20,35,50,75,100,150,250,400,600,1000,1600,2500,4000,6500,10000,16000,25000,40000,65000,100000];
+var COST=0.50;
+var MONTHS=['January','February','March','April','May','June','July','August','September','October','November','December'];
+var RUNGS=[
+  {n:10,    t:'Your phone bill',       d:'One afternoon. Family and the neighbours.'},
+  {n:50,    t:'The weekly shop',       d:'Your street, your group chat, the school gate.'},
+  {n:100,   t:'The car payment',       d:'One club, one class, one small school.'},
+  {n:250,   t:'Rent money',            d:'Word of mouth has started doing it for you.'},
+  {n:500,   t:'A full-time wage',      d:'You could pack the day job in around here.'},
+  {n:2000,  t:"You're an employer",    d:'Somebody else is making the calls for you now.'},
+  {n:10000, t:'You run a company',     d:'A shop chain, an operator, a proper region.'},
+  {n:25000, t:'Millionaire territory', d:'Cumulative, over time. Still just phones.'}
+];
+
+function money(n){
+  if(n>=1000000) return '\u00a3'+(n/1000000).toFixed(n>=10000000?0:2)+'m';
+  if(n>=100000)  return '\u00a3'+Math.round(n/1000)+'k';
+  return '\u00a3'+Math.round(n).toLocaleString('en-GB');
+}
+function num(n){
+  if(n>=1000000) return (n/1000000).toFixed(n>=10000000?0:1)+'m';
+  if(n>=10000)   return Math.round(n/1000)+'k';
+  return Math.round(n).toLocaleString('en-GB');
+}
+function devFrom(v){
+  var i=Math.round(v/100*(DEV.length-1));
+  return DEV[Math.max(0,Math.min(DEV.length-1,i))];
+}
+function futureDate(m){
+  var d=new Date(); d.setMonth(d.getMonth()+m);
+  return MONTHS[d.getMonth()]+' '+d.getFullYear();
+}
+
+function draw(){
+  var dev=devFrom(+document.getElementById('s-dev').value);
+  var price=(+document.getElementById('s-price').value)/100;
+  var per=Math.max(0,price-COST);
+  var mo=per*dev;
+
+  document.getElementById('v-dev').textContent=num(dev);
+  document.getElementById('v-price').textContent='\u00a3'+price.toFixed(2);
+  document.getElementById('f-mo').textContent=money(mo);
+  document.getElementById('f-yr').textContent=money(mo*12);
+  document.getElementById('f-us').textContent=money(COST*dev);
+
+  var cn=document.getElementById('c-num'),cu=document.getElementById('c-unit'),cd=document.getElementById('c-date');
+  if(mo<=0){
+    cn.textContent='\u2014'; cu.textContent='never at this price';
+    cd.textContent='you\u2019re charging 50p or less \u2014 push the price up';
+  } else {
+    var months=Math.ceil(1000000/mo);
+    if(months<=120){
+      cn.textContent=months; cu.textContent=(months===1?'month':'months');
+      cd.textContent='around '+futureDate(months);
+    } else {
+      var yrs=Math.round(months/12);
+      cn.textContent=yrs; cu.textContent='years';
+      cd.textContent=(yrs>60?'a long way off \u2014 add phones or raise your price':'around '+futureDate(months));
+    }
+  }
+
+  var rl=document.getElementById('reality');
+  if(price<=COST){
+    rl.className='note note-red';
+    rl.innerHTML='<b>You\u2019d be working for nothing.</b> At \u00a3'+price.toFixed(2)+' you\u2019re at or below the 50p we charge. Even \u00a31.50 leaves you a pound a month per phone \u2014 push it up.';
+  } else if(dev>=25000){
+    rl.className='note note-cyan';
+    rl.innerHTML='<b>That\u2019s operator scale.</b> '+num(dev)+' phones is a network deal or a shop chain, not a school gate. Real, but it\u2019s a boardroom, not an afternoon. Drag it back to 50 and look at where you\u2019d actually start.';
+  } else {
+    rl.className='note note-cyan';
+    rl.innerHTML='<b>Straight up:</b> the clock assumes you hold '+num(dev)+' phones the whole way. Real life is a climb \u2014 you\u2019ll be at 20 before you\u2019re at 200. Which is why the ladder below matters more than the big number.';
+  }
+
+  var out='',marked=false;
+  for(var i=RUNGS.length-1;i>=0;i--){
+    RUNGS[i]._cls = (RUNGS[i].n<=dev && !marked) ? 'rung now' : (RUNGS[i].n<=dev ? 'rung hit' : 'rung');
+    if(RUNGS[i].n<=dev) marked=true;
+  }
+  RUNGS.forEach(function(r){
+    out+='<div class="'+r._cls+'">'+
+      '<div class="rung-n">'+num(r.n)+'<small>phones</small></div>'+
+      '<div class="rung-mid"><div class="t">'+r.t+'</div><div class="d">'+r.d+'</div></div>'+
+      '<div class="rung-amt">'+money(per*r.n)+'<small>a month</small></div>'+
+    '</div>';
+  });
+  document.getElementById('ladder').innerHTML=out;
+}
+
+function tf(el){el.parentElement.classList.toggle('open');}
+draw();
+</script>
+</body>
+</html>
