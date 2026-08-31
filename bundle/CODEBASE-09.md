@@ -1,10 +1,638 @@
 # Codebase — part 9 of 29
 
 Contains:
+- `modules/praxis.py`
 - `modules/publish.py`
 - `modules/ratchet.py`
 - `modules/reconcile.py`
-- `modules/replay.py`
+
+
+## `modules/praxis.py`
+
+620 lines, 21670 bytes
+
+```python
+"""
+modules/praxis.py  v1.0.0
+
+Outbound submitter for the PRAXIS external-witness observe endpoint (chain 4).
+
+Contract implemented against the SERVED schema route, not prose:
+    GET  https://chain4.thepraesidium.ai/api/external-witness/observe/schema
+    POST https://chain4.thepraesidium.ai/api/external-witness/observe
+
+Signing:
+    preimage  = b"PRAXIS-OBSERVE-v1\\n" + canonical JSON of the envelope
+                with the "signature" field REMOVED
+    canonical = json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                           ensure_ascii=True).encode("utf-8")
+    signature = lowercase hex HMAC-SHA256, carried in the body
+
+Secret:
+    environment variable PRAXIS_OBSERVE_SECRET
+    (never written to a file, never returned by any route)
+
+Routes
+    GET  /x/praxis/spec      public   what this module does and how it signs
+    GET  /x/praxis/status    public   config check + arms the /praxis page
+    GET  /x/praxis/schema    public   fetches THEIR live contract, reports version
+    GET  /x/praxis/history   keyed    past attempts from our own chain
+    POST /x/praxis/canonical keyed    dry run: envelope, preimage, signature, NO send
+    POST /x/praxis/submit    keyed    signs and sends ONE bounded submission
+
+Every submit is sealed into our own chain with a user_id, and the seal result
+is reported honestly rather than swallowed. A failed seal never hides the fact
+that the remote call already happened.
+"""
+
+import os
+import json
+import time
+import hmac
+import hashlib
+import secrets
+import sys
+import urllib.request
+import urllib.error
+from datetime import datetime, timezone
+
+VERSION = "1.0.0"
+
+# ---------------------------------------------------------------- constants
+
+BASE = "https://chain4.thepraesidium.ai"
+OBSERVE_URL = BASE + "/api/external-witness/observe"
+SCHEMA_URL = BASE + "/api/external-witness/observe/schema"
+
+DOMAIN = b"PRAXIS-OBSERVE-v1\n"
+ENVELOPE_SCHEMA = "praxis_external_observe_request_v1"
+
+OUR_PEER_ID = "aileash"
+OUR_TIP_URL = "https://sebbi.pro/x/witness/tip"
+
+SECRET_ENV = "PRAXIS_OBSERVE_SECRET"
+
+TIMEOUT = 20
+MAX_RESPONSE_BYTES = 262144
+
+PUBLIC = {
+    ("GET", "spec"),
+    ("GET", "status"),
+    ("GET", "schema"),
+}
+
+
+# ---------------------------------------------------------------- helpers
+
+def _now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _canonical(obj):
+    return json.dumps(
+        obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+
+
+def _sha256_hex(b):
+    return hashlib.sha256(b).hexdigest()
+
+
+def _secret():
+    s = os.environ.get(SECRET_ENV, "")
+    return s.strip()
+
+
+def _fresh_nonce():
+    # matches ^[A-Za-z0-9_.:-]{12,128}$
+    return secrets.token_hex(20)
+
+
+def _fresh_idem():
+    # matches ^[0-9a-f]{64}(\.attempt-N)?$
+    return secrets.token_hex(32)
+
+
+def _http(method, url, body=None):
+    req = urllib.request.Request(url, data=body, method=method)
+    req.add_header("Accept", "application/json")
+    req.add_header("User-Agent", "AILeash-praxis/" + VERSION)
+    if body is not None:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+            raw = r.read(MAX_RESPONSE_BYTES)
+            return r.status, dict(r.headers), raw, None
+    except urllib.error.HTTPError as e:
+        raw = b""
+        try:
+            raw = e.read(MAX_RESPONSE_BYTES)
+        except Exception:
+            pass
+        return e.code, dict(getattr(e, "headers", {}) or {}), raw, None
+    except Exception as e:
+        return 0, {}, b"", "%s: %s" % (type(e).__name__, e)
+
+
+def _parse_json(raw):
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+
+
+def _build_envelope(tip_digest, witnessed_peer_id, source_url,
+                    receipt_digest=None, attempt=None, observed_at=None):
+    payload = {
+        "witnessed_peer_id": witnessed_peer_id,
+        "data_class": "HASH_ONLY",
+        "tip_digest": tip_digest,
+        "source_url": source_url,
+        "observed_at": observed_at or _now_iso(),
+    }
+    # receipt_digest is OPTIONAL in contract v1_1 and is omitted for a pure
+    # chain-tip observation. Never duplicate tip_digest into it.
+    if receipt_digest:
+        payload["receipt_digest"] = receipt_digest
+
+    key = _fresh_idem()
+    if attempt:
+        key = "%s.attempt-%s" % (key, attempt)
+
+    return {
+        "schema_version": ENVELOPE_SCHEMA,
+        "peer_id": OUR_PEER_ID,
+        "ts": _now_iso(),
+        "nonce": _fresh_nonce(),
+        "idempotency_key": key,
+        "payload": payload,
+    }
+
+
+def _sign(envelope, secret):
+    unsigned = {k: v for k, v in envelope.items() if k != "signature"}
+    canonical = _canonical(unsigned)
+    preimage = DOMAIN + canonical
+    sig = hmac.new(secret.encode("utf-8"), preimage, hashlib.sha256).hexdigest()
+    return canonical, preimage, sig
+
+
+def _validate(tip_digest, witnessed_peer_id, source_url, receipt_digest):
+    import re
+    if not re.fullmatch(r"[0-9a-f]{64}", tip_digest or ""):
+        return "tip_digest must be 64 lowercase hex characters"
+    if not re.fullmatch(r"[a-z][a-z0-9_.:-]{2,63}", witnessed_peer_id or ""):
+        return "witnessed_peer_id must match ^[a-z][a-z0-9_.:-]{2,63}$"
+    if not (source_url or "").startswith("https://") or (source_url or "").count("/") < 3:
+        return "source_url must be an https URL with a path"
+    if len(source_url) > 512:
+        return "source_url exceeds 512 characters"
+    if receipt_digest and not re.fullmatch(r"[0-9a-f]{64}", receipt_digest):
+        return "receipt_digest, if supplied, must be 64 lowercase hex characters"
+    if receipt_digest and receipt_digest == tip_digest:
+        return "receipt_digest must not duplicate tip_digest"
+    return None
+
+
+def _seal(ctx, event):
+    """Seal into our own chain. Never swallowed, never allowed to hide a send."""
+    out = {"sealed": False, "audit_hash": None, "error": None}
+    try:
+        sealer = ctx.get("seal")
+        if not sealer:
+            out["error"] = "no seal function in ctx"
+            return out
+        res = sealer(event)
+        if isinstance(res, dict):
+            out["audit_hash"] = res.get("audit_hash") or res.get("hash")
+            out["block_index"] = res.get("block_index")
+        elif isinstance(res, str):
+            out["audit_hash"] = res
+        out["sealed"] = bool(out["audit_hash"])
+        if not out["sealed"]:
+            out["error"] = "seal returned no hash"
+    except Exception as e:
+        out["error"] = "%s: %s" % (type(e).__name__, e)
+    return out
+
+
+# ---------------------------------------------------------------- page
+
+PAGE = """<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex">
+<title>PRAXIS submit</title>
+<style>
+:root{--ink:#0a0f1e;--ink2:#10182e;--gold:#c9a84c;--ok:#7fe3b0;--err:#ff8a80}
+*{box-sizing:border-box}
+body{margin:0;padding:16px;background:var(--ink);color:#e8ecf5;
+     font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+h1{font-size:18px;margin:0 0 4px;color:var(--gold)}
+p.sub{margin:0 0 18px;color:#8b96ad;font-size:13px}
+label{display:block;margin:12px 0 4px;font-size:12px;color:#8b96ad;
+      text-transform:uppercase;letter-spacing:.06em}
+input{width:100%;padding:11px;background:var(--ink2);border:1px solid #24304e;
+      border-radius:8px;color:#e8ecf5;font:14px monospace}
+input:focus{outline:none;border-color:var(--gold)}
+.row{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px}
+button{flex:1;min-width:120px;padding:13px;border:0;border-radius:8px;
+       background:var(--gold);color:#0a0f1e;font-weight:600;font-size:15px}
+button.alt{background:var(--ink2);color:#e8ecf5;border:1px solid #24304e}
+button:disabled{opacity:.45}
+pre{margin-top:16px;padding:12px;background:var(--ink2);border:1px solid #24304e;
+    border-radius:8px;white-space:pre-wrap;word-break:break-all;
+    font:12px/1.45 monospace;max-height:60vh;overflow:auto}
+.ok{color:var(--ok)}.err{color:var(--err)}
+</style></head><body>
+
+<h1>PRAXIS observe &mdash; chain 4</h1>
+<p class="sub">Signs one bounded submission and sends it. Fresh ts, nonce and
+idempotency key every press.</p>
+
+<label>API key</label>
+<input id="key" type="password" placeholder="AILeash API key" autocomplete="off">
+
+<label>Tip digest (64 hex)</label>
+<input id="tip" placeholder="press Load tip">
+
+<label>Witnessed peer id</label>
+<input id="wpid" value="aileash">
+
+<label>Source URL</label>
+<input id="src" value="https://sebbi.pro/x/witness/tip">
+
+<label>Attempt marker (optional)</label>
+<input id="att" placeholder="leave blank for a first attempt">
+
+<div class="row">
+  <button class="alt" onclick="loadTip()">Load tip</button>
+  <button class="alt" onclick="theirSchema()">Their schema</button>
+</div>
+<div class="row">
+  <button class="alt" onclick="go('canonical')">Dry run</button>
+  <button onclick="send()">Send</button>
+</div>
+
+<pre id="out">Ready.</pre>
+
+<script>
+var out = document.getElementById('out');
+function show(t, cls){ out.className = cls || ''; out.textContent = t; }
+function val(id){ return document.getElementById(id).value.trim(); }
+
+function loadTip(){
+  show('Loading our tip...');
+  fetch('/x/witness/tip').then(function(r){ return r.json(); }).then(function(j){
+    var t = j.tip || j.hash || j.head || j.chain_tip || j.latest || '';
+    document.getElementById('tip').value = t;
+    show('Tip loaded.\\n\\n' + JSON.stringify(j, null, 2), 'ok');
+  }).catch(function(e){ show('Failed: ' + e, 'err'); });
+}
+
+function theirSchema(){
+  show('Fetching their live contract...');
+  fetch('/x/praxis/schema').then(function(r){ return r.json(); }).then(function(j){
+    show(JSON.stringify(j, null, 2), j.receipt_digest_required ? 'err' : 'ok');
+  }).catch(function(e){ show('Failed: ' + e, 'err'); });
+}
+
+function body(){
+  return {
+    tip_digest: val('tip'),
+    witnessed_peer_id: val('wpid'),
+    source_url: val('src'),
+    attempt: val('att') || null
+  };
+}
+
+function go(action){
+  var k = val('key');
+  if(!k){ show('API key required.', 'err'); return; }
+  show('Working...');
+  fetch('/x/praxis/' + action, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + k },
+    body: JSON.stringify(body())
+  }).then(function(r){ return r.json(); }).then(function(j){
+    show(JSON.stringify(j, null, 2), j.ok === false ? 'err' : 'ok');
+  }).catch(function(e){ show('Failed: ' + e, 'err'); });
+}
+
+function send(){
+  if(!confirm('Send one bounded submission to chain 4 now?')) return;
+  go('submit');
+}
+</script>
+</body></html>"""
+
+
+def _install_page():
+    """Serve /praxis by wrapping the running handler's do_GET, once."""
+    for mod in list(sys.modules.values()):
+        if mod is None:
+            continue
+        try:
+            names = dir(mod)
+        except Exception:
+            continue
+        for name in names:
+            try:
+                obj = getattr(mod, name, None)
+            except Exception:
+                continue
+            if not isinstance(obj, type):
+                continue
+            if not (hasattr(obj, "do_GET") and hasattr(obj, "do_POST")):
+                continue
+            if getattr(obj, "_praxis_patched", False):
+                return True
+            original = obj.do_GET
+
+            def patched(self, _original=original):
+                try:
+                    path = self.path.split("?")[0].rstrip("/")
+                except Exception:
+                    path = ""
+                if path == "/praxis":
+                    data = PAGE.encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("X-Robots-Tag", "noindex")
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+                return _original(self)
+
+            obj.do_GET = patched
+            obj._praxis_patched = True
+            return True
+    return False
+
+
+# ---------------------------------------------------------------- actions
+
+def _spec():
+    return {
+        "module": "praxis",
+        "version": VERSION,
+        "what_this_is": (
+            "Outbound submitter for the PRAXIS external-witness observe "
+            "endpoint. One bounded submission per press. This module sends; "
+            "it does not receive."
+        ),
+        "target": {"observe": OBSERVE_URL, "schema": SCHEMA_URL},
+        "signing": {
+            "algorithm": "hmac-sha256",
+            "domain": "PRAXIS-OBSERVE-v1\\n",
+            "canonicalization": "sort_keys=true, separators=(',',':'), ensure_ascii=true, utf-8",
+            "preimage": "domain bytes + canonical JSON of the envelope with 'signature' removed",
+            "signature_encoding": "lowercase hex",
+            "auth_transport": "body, not headers",
+        },
+        "payload_policy": (
+            "receipt_digest is optional under their contract v1_1 and is "
+            "omitted for a pure chain-tip observation. It is never filled "
+            "with a duplicate of tip_digest or a placeholder."
+        ),
+        "freshness": "fresh ts, fresh nonce and a fresh idempotency key on every submit",
+        "not_claimed": [
+            "this lane is one-directional and does not establish mutual witnessing",
+            "their acceptance is a transport and signature outcome, not verification "
+            "of anything in our chain",
+        ],
+        "routes": {
+            "public": ["GET spec", "GET status", "GET schema"],
+            "keyed": ["GET history", "POST canonical", "POST submit"],
+        },
+    }
+
+
+def _status():
+    installed = _install_page()
+    s = _secret()
+    return {
+        "module": "praxis",
+        "version": VERSION,
+        "page": "/praxis",
+        "page_installed": installed,
+        "peer_id": OUR_PEER_ID,
+        "secret_configured": bool(s),
+        "secret_env": SECRET_ENV,
+        "secret_length": len(s) if s else 0,
+        "target": OBSERVE_URL,
+        "note": (
+            "secret_configured false means the environment variable is not set "
+            "on this replica; the secret itself is never returned by any route"
+        ),
+    }
+
+
+def _their_schema():
+    code, headers, raw, err = _http("GET", SCHEMA_URL)
+    if err:
+        return {"ok": False, "error": "fetch_failed", "detail": err}, 502
+    doc = _parse_json(raw)
+    if doc is None:
+        return {"ok": False, "error": "unparseable", "status": code}, 502
+
+    req = (((doc.get("request_schema") or {}).get("properties") or {})
+           .get("payload") or {})
+    required = req.get("required") or []
+    hdr = {}
+    for k, v in (headers or {}).items():
+        if k.lower().startswith("x-praxis") or k.lower() == "cache-control":
+            hdr[k.lower()] = v
+
+    return {
+        "ok": True,
+        "fetched_at": _now_iso(),
+        "http_status": code,
+        "contract_version": doc.get("schema_version"),
+        "payload_required": required,
+        "receipt_digest_required": "receipt_digest" in required,
+        "canonicalization": ((doc.get("signing") or {}).get("canonicalization")),
+        "domain": ((doc.get("signing") or {}).get("domain")),
+        "clock_skew_seconds": ((doc.get("freshness") or {}).get("clock_skew_seconds")),
+        "headers": hdr,
+        "body_sha256": _sha256_hex(raw),
+    }, 200
+
+
+def _canonical_action(data):
+    tip = (data.get("tip_digest") or "").strip().lower()
+    wpid = (data.get("witnessed_peer_id") or OUR_PEER_ID).strip().lower()
+    src = (data.get("source_url") or OUR_TIP_URL).strip()
+    rcpt = (data.get("receipt_digest") or "").strip().lower() or None
+    attempt = data.get("attempt") or None
+
+    bad = _validate(tip, wpid, src, rcpt)
+    if bad:
+        return {"ok": False, "error": "invalid_input", "detail": bad}, 400
+
+    secret = _secret()
+    if not secret:
+        return {"ok": False, "error": "secret_unconfigured",
+                "detail": "set %s in the environment" % SECRET_ENV}, 503
+
+    env = _build_envelope(tip, wpid, src, rcpt, attempt)
+    canonical, preimage, sig = _sign(env, secret)
+    signed = dict(env)
+    signed["signature"] = sig
+
+    return {
+        "ok": True,
+        "dry_run": True,
+        "sent": False,
+        "envelope": signed,
+        "canonical_json": canonical.decode("utf-8"),
+        "canonical_sha256": _sha256_hex(canonical),
+        "preimage_sha256": _sha256_hex(preimage),
+        "signature": sig,
+        "note": "nothing was sent; ts, nonce and idempotency_key here are "
+                "single-use and will be regenerated on an actual submit",
+    }, 200
+
+
+def _submit(data, ctx):
+    tip = (data.get("tip_digest") or "").strip().lower()
+    wpid = (data.get("witnessed_peer_id") or OUR_PEER_ID).strip().lower()
+    src = (data.get("source_url") or OUR_TIP_URL).strip()
+    rcpt = (data.get("receipt_digest") or "").strip().lower() or None
+    attempt = data.get("attempt") or None
+
+    bad = _validate(tip, wpid, src, rcpt)
+    if bad:
+        return {"ok": False, "error": "invalid_input", "detail": bad}, 400
+
+    secret = _secret()
+    if not secret:
+        return {"ok": False, "error": "secret_unconfigured",
+                "detail": "set %s in the environment" % SECRET_ENV}, 503
+
+    env = _build_envelope(tip, wpid, src, rcpt, attempt)
+    canonical, preimage, sig = _sign(env, secret)
+    signed = dict(env)
+    signed["signature"] = sig
+    wire = _canonical(signed)
+
+    started = time.time()
+    code, headers, raw, err = _http("POST", OBSERVE_URL, wire)
+    took = round(time.time() - started, 3)
+
+    parsed = _parse_json(raw)
+    result = {
+        "ok": err is None and code in (200, 202),
+        "sent": err is None,
+        "took_seconds": took,
+        "http_status": code,
+        "transport_error": err,
+        "request": {
+            "idempotency_key": env["idempotency_key"],
+            "nonce": env["nonce"],
+            "ts": env["ts"],
+            "peer_id": env["peer_id"],
+            "payload": env["payload"],
+            "signature": sig,
+            "canonical_sha256": _sha256_hex(canonical),
+            "wire_sha256": _sha256_hex(wire),
+            "wire_bytes": len(wire),
+        },
+        "response": {
+            "body": parsed,
+            "raw_sha256": _sha256_hex(raw) if raw else None,
+            "raw_bytes": len(raw),
+            "raw_text": (raw.decode("utf-8", "replace")[:4000] if raw else None),
+        },
+    }
+
+    if isinstance(parsed, dict):
+        result["their_error"] = parsed.get("error")
+        result["their_accepted"] = parsed.get("accepted")
+        result["their_replayed"] = parsed.get("replayed")
+        result["their_request_digest"] = parsed.get("request_digest")
+        result["their_durable_event_recorded"] = parsed.get("durable_event_recorded")
+        result["their_accepted_decision_recorded"] = parsed.get(
+            "accepted_decision_recorded")
+
+    event = {
+        "user_id": "praxis:" + OUR_PEER_ID,
+        "event": "praxis_observe_submit",
+        "kind": "praxis_observe_submit",
+        "ts": _now_iso(),
+        "target": OBSERVE_URL,
+        "idempotency_key": env["idempotency_key"],
+        "request_wire_sha256": result["request"]["wire_sha256"],
+        "http_status": code,
+        "response_sha256": result["response"]["raw_sha256"],
+        "their_error": result.get("their_error"),
+        "their_accepted": result.get("their_accepted"),
+        "result": "sent" if err is None else "transport_error",
+    }
+    result["our_seal"] = _seal(ctx, event)
+
+    status = 200 if result["ok"] else (502 if err else 200)
+    return result, status
+
+
+def _history(ctx, data):
+    limit = 20
+    try:
+        limit = max(1, min(100, int(data.get("limit") or 20)))
+    except Exception:
+        pass
+    rows = []
+    try:
+        conn = ctx.get("conn")
+        lock = ctx.get("lock")
+        sql = ("SELECT rowid, * FROM audit_log "
+               "WHERE user_id = ? ORDER BY rowid DESC LIMIT ?")
+        if lock:
+            with lock:
+                cur = conn.execute(sql, ("praxis:" + OUR_PEER_ID, limit))
+                cols = [d[0] for d in cur.description]
+                rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+        else:
+            cur = conn.execute(sql, ("praxis:" + OUR_PEER_ID, limit))
+            cols = [d[0] for d in cur.description]
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    except Exception as e:
+        return {"ok": False, "error": "query_failed",
+                "detail": "%s: %s" % (type(e).__name__, e)}, 500
+    return {"ok": True, "count": len(rows), "rows": rows}, 200
+
+
+# ---------------------------------------------------------------- router
+
+def handle(method, action, data, api_key, ctx):
+    data = data or {}
+
+    if method == "GET" and action == "spec":
+        return _spec(), 200
+
+    if method == "GET" and action == "status":
+        return _status(), 200
+
+    if method == "GET" and action == "schema":
+        return _their_schema()
+
+    if method == "GET" and action == "history":
+        return _history(ctx, data)
+
+    if method == "POST" and action == "canonical":
+        return _canonical_action(data)
+
+    if method == "POST" and action == "submit":
+        return _submit(data, ctx)
+
+    return {"ok": False, "error": "unknown_action", "action": action,
+            "available": ["spec", "status", "schema", "history",
+                          "canonical", "submit"]}, 404
+
+```
 
 
 ## `modules/publish.py`
@@ -1573,691 +2201,5 @@ def handle(method, action, data, api_key, ctx):
     return {"error": "unknown_action", "action": action,
             "GET": ["public", "proof", "score", "list", "run"],
             "POST": ["plan", "submit"]}, 404
-
-```
-
-
-## `modules/replay.py`
-
-678 lines, 30538 bytes
-
-```python
-#!/usr/bin/env python3
-"""
-modules/replay.py  -  proving the same inputs still produce the same verdict
-                      WITHOUT ever disclosing how the verdict is reached
-============================================================================
-
-THE QUESTION NOBODY ELSE IN THIS MARKET CAN ANSWER
---------------------------------------------------
-Every compliance platform can tell you what it decided. Not one of them can
-prove it would decide the same way again.
-
-Ask any of them to re-run decision 4,117 from its sealed inputs and show the
-same verdict falls out. They cannot. Not because they will not - because
-their scoring goes through a model call, and model calls are not
-reproducible. Same inputs, different day, different answer. Their audit
-trail describes a decision that can never be performed twice.
-
-Ours is arithmetic. Deterministic below the model layer, and always has
-been. This module lets anyone establish that for themselves.
-
-THE SCORING LOGIC IS NEVER DISCLOSED
-------------------------------------
-Read this before changing anything in here.
-
-Nothing in this module publishes, returns, echoes or hints at the contents
-of the decision function. Not the source, not the weights, not the
-thresholds, not the signal names, not the intermediate values. The only
-thing that leaves the building is a SHA-256 of the deployed source, which
-is one-way and reveals nothing about what it hashes.
-
-Determinism is proved as a BLACK BOX instead: same inputs in, same verdict
-out, demonstrated repeatedly, by the challenger, on their own schedule,
-with every run sealed into the chain. That is a stronger proof than showing
-the code, because it is behaviour observed over time rather than a claim
-about a listing nobody can confirm is what actually runs in production.
-
-  A competitor who reads every route here learns exactly one thing: that
-  our verdicts are reproducible. Which is the point, and which they cannot
-  copy, because reproducibility is a property of the architecture and not a
-  feature that can be bolted on.
-
-HOW SOMEONE CHECKS US WITHOUT SEEING ANYTHING
----------------------------------------------
-  POST /x/replay/challenge   send any inputs you like. We run them, seal
-                             the run into the chain, and hand you back the
-                             verdict, the audit hash, and a fingerprint of
-                             your own inputs.
-
-Send the same inputs again - an hour later, a year later, from a different
-address. If the verdict ever moves, you have caught us, and both runs are
-independently sealed and anchored so we cannot revise either one. If it
-never moves, you have established determinism yourself, empirically,
-adversarially, without a line of our code.
-
-We also report how many times that exact input has been challenged, when it
-was first seen, and every audit hash it produced, so the whole history is
-verifiable through routes we do not control the answers to.
-
-THE HONEST COST, WHICH IS REAL
-------------------------------
-An open scoring oracle can be probed. Feed it a thousand variations, watch
-the verdicts move, and a determined party can map the decision boundary
-without ever seeing the code. That is a genuine exposure and it is the
-price of this proof.
-
-It is mitigated, not eliminated: challenges are rate limited per address,
-inputs are fingerprinted so repeat submissions are cheap and novel ones are
-not, and boundary-probing patterns are already logged elsewhere in the
-platform. Anyone systematically mapping the function leaves an obvious,
-sealed trail while doing it.
-
-The trade is deliberate. A closed engine nobody can test is worth less than
-a testable one somebody might partially map, because the first cannot be
-sold to a regulator and the second can.
-
-CONFIGURATION
--------------
-This module does not import server.py - nothing here does. It finds the
-live decision function at runtime among already-loaded modules, so it can
-only observe the engine, never change it. If your scorer is named something
-not in SCORER_NAMES below, add it there. Everything else is read from the
-audit_log schema at startup rather than assumed.
-
-    POST /x/replay/challenge     run any inputs, sealed          (public)
-    GET  /x/replay/history       every run of a given input       (public)
-    GET  /x/replay/self          reproduction rate over a sample  (public)
-    GET  /x/replay/fingerprint   hash of the deployed code        (public)
-    GET  /x/replay/spec          how to test us                   (public)
-    GET  /x/replay/check         re-run one sealed decision       (keyed)
-    POST /x/replay/attest        seal the current fingerprint     (keyed)
-"""
-
-import hashlib
-import inspect
-import json
-import sys
-import time
-from datetime import datetime, timezone
-
-VERSION = "1.0"
-
-# Challenge, history, self, fingerprint and spec are open - a
-# reproducibility claim you need an account to test is not a claim anyone
-# should accept. check stays keyed: it reads back a specific sealed
-# decision, which belongs to whoever owns it.
-PUBLIC = {("POST", "challenge"), ("GET", "history"), ("GET", "self"),
-          ("GET", "fingerprint"), ("GET", "spec")}
-
-# Names the live decision function might go by. Add yours if it is not
-# here - this is the one thing that has to match your code.
-SCORER_NAMES = (
-    "score_event", "decide", "score", "evaluate", "run_decision",
-    "make_decision", "assess", "score_decision", "engine_decide",
-)
-
-# Columns the sealed inputs might live in. Detected, never assumed.
-INPUT_COLUMNS = ("event", "event_json", "payload", "inputs", "request",
-                 "ev", "data", "event_data")
-RESULT_COLUMNS = ("result", "result_json", "res", "decision_json", "outcome",
-                  "response")
-VERDICT_COLUMNS = ("decision", "verdict", "action_taken")
-SCORE_COLUMNS = ("score", "risk_score", "points")
-
-SELF_SAMPLE_DEFAULT = 50
-SELF_SAMPLE_MAX = 500
-
-# Challenge throttle. Repeat submissions of an input we have already seen
-# are cheap; novel inputs are what a prober needs, so those are what get
-# limited.
-NOVEL_PER_HOUR = 40
-MAX_PAYLOAD_KEYS = 40
-
-_ready = False
-_columns = []
-
-
-def _setup(ctx):
-    global _ready, _columns
-    if _ready:
-        return
-    cols = []
-    try:
-        with ctx["lock"]:
-            for row in ctx["conn"].execute("PRAGMA table_info(audit_log)").fetchall():
-                cols.append(row[1])
-    except Exception:
-        pass
-    _columns = cols
-    with ctx["lock"]:
-        c = ctx["conn"]
-        c.execute("CREATE TABLE IF NOT EXISTS replay_attest("
-                  "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,"
-                  "fingerprint TEXT,function TEXT,taken REAL,"
-                  "audit_hash TEXT,block_index INTEGER)")
-        # One row per challenge run. The input fingerprint is stored, the
-        # input itself is not - we have no reason to keep a stranger's
-        # payload and every reason not to.
-        c.execute("CREATE TABLE IF NOT EXISTS replay_challenge("
-                  "id INTEGER PRIMARY KEY AUTOINCREMENT,input_hash TEXT,"
-                  "verdict TEXT,score TEXT,code_fingerprint TEXT,ran REAL,"
-                  "audit_hash TEXT,block_index INTEGER,client TEXT)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_rep_input "
-                  "ON replay_challenge(input_hash,id)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_rep_ran ON replay_challenge(ran)")
-        c.commit()
-    _ready = True
-
-
-def _iso(ts):
-    if not ts:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
-
-def _pick(candidates):
-    for name in candidates:
-        if name in _columns:
-            return name
-    return None
-
-
-def _canonical(payload):
-    """Stable rendering of an input payload, so the same inputs always
-    fingerprint to the same value regardless of key order or spacing."""
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"),
-                      ensure_ascii=False, default=str)
-
-
-def _input_hash(payload):
-    return hashlib.sha256(("AILEASH-INPUT-v1:" + _canonical(payload)).encode("utf-8")).hexdigest()
-
-
-# ----------------------------------------------------------------------
-# finding the live decision function
-# ----------------------------------------------------------------------
-
-def _find_scorer():
-    """Locate the deployed decision function among loaded modules.
-
-    Deliberately does not import server.py. It looks at what is already
-    running, so this module can observe the engine and never alter it.
-    """
-    for module_name in ("__main__", "server", "app", "main"):
-        module = sys.modules.get(module_name)
-        if module is None:
-            continue
-        for name in SCORER_NAMES:
-            candidate = getattr(module, name, None)
-            if callable(candidate):
-                return candidate, "%s.%s" % (module_name, name), None
-    return None, None, ("no decision function found. Add its real name to SCORER_NAMES at the "
-                        "top of modules/replay.py.")
-
-
-def _fingerprint_of(function):
-    """SHA-256 of the deployed source. One-way: it commits to which code is
-    running without revealing any of it."""
-    try:
-        source = inspect.getsource(function)
-    except (OSError, TypeError):
-        return None, "source not readable for this callable"
-    normalised = "\n".join(line.rstrip() for line in source.splitlines()).strip()
-    return hashlib.sha256(normalised.encode("utf-8")).hexdigest(), None
-
-
-# ----------------------------------------------------------------------
-# running the engine
-# ----------------------------------------------------------------------
-
-def _rerun(function, inputs):
-    """Execute the live decision function against a set of inputs.
-
-    Never raises. On failure it reports that the call failed and nothing
-    about why the engine is shaped the way it is.
-    """
-    if inputs is None:
-        return None, "no inputs"
-    attempts = []
-    if isinstance(inputs, dict):
-        attempts.append(lambda: function(**inputs))
-        attempts.append(lambda: function(inputs))
-    else:
-        attempts.append(lambda: function(inputs))
-    for call in attempts:
-        try:
-            return call(), None
-        except TypeError:
-            continue
-        except Exception:
-            return None, "the decision function could not process those inputs"
-    return None, "those inputs do not match the shape the engine expects"
-
-
-def _extract(output):
-    """Pull (verdict, score) out of whatever the scorer returns. Nothing
-    else from the return value is ever surfaced."""
-    if isinstance(output, dict):
-        return (output.get("decision") or output.get("verdict"), output.get("score"))
-    if isinstance(output, (tuple, list)) and len(output) >= 2:
-        return output[0], output[1]
-    return output, None
-
-
-def _same(a, b):
-    if a is None and b is None:
-        return True
-    if a is None or b is None:
-        return False
-    if isinstance(a, float) or isinstance(b, float):
-        try:
-            return abs(float(a) - float(b)) < 1e-9
-        except (TypeError, ValueError):
-            return False
-    return str(a).strip().upper() == str(b).strip().upper()
-
-
-# ----------------------------------------------------------------------
-# challenge - the public proof
-# ----------------------------------------------------------------------
-
-def _novel_recently(ctx):
-    since = time.time() - 3600
-    with ctx["lock"]:
-        row = ctx["conn"].execute(
-            "SELECT COUNT(DISTINCT input_hash) FROM replay_challenge WHERE ran>=?",
-            (since,)).fetchone()
-    return int(row[0]) if row else 0
-
-
-def _challenge(ctx, api_key, data):
-    inputs = data.get("inputs", data.get("event", data.get("payload")))
-    if not isinstance(inputs, dict) or not inputs:
-        return {"error": "inputs_required",
-                "message": "Send an inputs object. We will run it, seal the run, and hand you "
-                           "back the verdict. Send the same object again whenever you like - "
-                           "if the answer ever moves, you have caught us."}, 400
-    if len(inputs) > MAX_PAYLOAD_KEYS:
-        return {"error": "payload_too_wide", "message": "at most %d keys" % MAX_PAYLOAD_KEYS}, 400
-
-    fingerprint_in = _input_hash(inputs)
-
-    with ctx["lock"]:
-        prior = ctx["conn"].execute(
-            "SELECT verdict,score,ran,audit_hash,block_index,code_fingerprint "
-            "FROM replay_challenge WHERE input_hash=? ORDER BY id ASC",
-            (fingerprint_in,)).fetchall()
-
-    if not prior and _novel_recently(ctx) >= NOVEL_PER_HOUR:
-        return {"error": "rate_limited",
-                "message": "Too many distinct inputs in the last hour. Repeat submissions of "
-                           "inputs already seen are never limited - testing whether the answer "
-                           "moves is the whole point. Mapping the function is not.",
-                "repeat_freely": "any input_hash already in /x/replay/history"}, 429
-
-    function, name, why = _find_scorer()
-    if why:
-        return {"error": "engine_unavailable", "message": "the decision engine is not reachable "
-                                                          "from this route right now"}, 503
-
-    output, problem = _rerun(function, inputs)
-    if problem:
-        return {"error": "not_runnable", "message": problem}, 422
-
-    verdict, score = _extract(output)
-    code_fingerprint, _p = _fingerprint_of(function)
-    now = time.time()
-
-    ev = {"user_id": "chal:" + fingerprint_in[:16], "action": "replay_challenge", "amount": 0,
-          "country": "UK", "device_id": "replay", "anomaly": 0, "device_risk": 0}
-    res = {"decision": str(verdict), "score": score, "replay_version": VERSION,
-           "input_hash": fingerprint_in, "code_fingerprint": code_fingerprint,
-           "detail": "input=%s;verdict=%s;code=%s" % (fingerprint_in, verdict, code_fingerprint)}
-    audit_hash, block_index, seq = ctx["seal"](ev, res, now, api_key or "public-replay")
-
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "INSERT INTO replay_challenge(input_hash,verdict,score,code_fingerprint,ran,"
-            "audit_hash,block_index,client) VALUES(?,?,?,?,?,?,?,?)",
-            (fingerprint_in, str(verdict), str(score), code_fingerprint, now,
-             audit_hash, block_index, "keyed" if api_key else "anonymous"))
-        ctx["conn"].commit()
-
-    out = {
-        "input_hash": fingerprint_in,
-        "verdict": verdict, "score": score,
-        "ran_at": _iso(now),
-        "sealed_in_chain": audit_hash, "block_index": block_index, "receipt_seq": seq,
-        "code_fingerprint": code_fingerprint,
-        "runs_of_this_input": len(prior) + 1,
-        "replay_version": VERSION,
-        "how_to_use_this": "Send the identical inputs again, whenever you like, from wherever "
-                           "you like. Every run is sealed into a chain that is externally "
-                           "anchored and independently witnessed, so neither this answer nor "
-                           "the next one can be revised afterwards.",
-        "history": "/x/replay/history?input_hash=" + fingerprint_in,
-        "verify_this_run": "/x/consistency/ancestor?tip=" + audit_hash,
-    }
-
-    if prior:
-        first_verdict, first_score = prior[0][0], prior[0][1]
-        stable = _same(verdict, first_verdict) and _same(score, first_score)
-        out["first_seen"] = _iso(prior[0][2])
-        out["stable"] = stable
-        out["verdict_moved"] = not stable
-        if stable:
-            out["what_this_shows"] = ("Identical to the first run of these inputs on %s, and to "
-                                      "every run since. Determinism observed rather than "
-                                      "asserted." % _iso(prior[0][2]))
-        else:
-            out["what_this_shows"] = ("These inputs previously produced a different answer. "
-                                      "Either the code changed - compare the code fingerprints "
-                                      "in the history - or the engine is not deterministic. "
-                                      "Both runs are sealed and neither can be withdrawn.")
-    else:
-        out["stable"] = None
-        out["what_this_shows"] = ("First time these inputs have been seen. Send them again to "
-                                  "start building the record.")
-    return out, 200
-
-
-def _history(ctx, data):
-    input_hash = str(data.get("input_hash", data.get("hash", ""))).strip().lower()
-    if not input_hash:
-        return {"error": "input_hash_required"}, 400
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT verdict,score,ran,audit_hash,block_index,code_fingerprint,client "
-            "FROM replay_challenge WHERE input_hash=? ORDER BY id ASC LIMIT 500",
-            (input_hash,)).fetchall()
-    if not rows:
-        return {"error": "unknown_input", "input_hash": input_hash,
-                "message": "No run recorded for that input fingerprint."}, 404
-
-    verdicts = {r[0] for r in rows}
-    codes = {r[5] for r in rows if r[5]}
-    return {
-        "input_hash": input_hash,
-        "runs": len(rows),
-        "first_run": _iso(rows[0][2]), "latest_run": _iso(rows[-1][2]),
-        "distinct_verdicts": len(verdicts),
-        "stable": len(verdicts) == 1,
-        "code_versions_seen": len(codes),
-        "history": [{"verdict": r[0], "score": r[1], "ran_at": _iso(r[2]),
-                     "sealed_in_chain": r[3], "block_index": r[4],
-                     "code_fingerprint": r[5], "submitted_by": r[6]} for r in rows],
-        "what_this_is": "Every recorded run of one exact set of inputs, each sealed separately "
-                        "into the chain. Verify any of them independently at "
-                        "/x/consistency/ancestor - we cannot alter one after the fact.",
-        "note": "More than one distinct verdict across a single code fingerprint would mean the "
-                "engine is not deterministic. That is exactly what this is here to expose.",
-    }, 200
-
-
-# ----------------------------------------------------------------------
-# self audit
-# ----------------------------------------------------------------------
-
-def _fetch(ctx, where, args):
-    input_col = _pick(INPUT_COLUMNS)
-    result_col = _pick(RESULT_COLUMNS)
-    verdict_col = _pick(VERDICT_COLUMNS)
-    score_col = _pick(SCORE_COLUMNS)
-    if not input_col:
-        return None, ("audit_log does not store decision inputs on this deployment, so sealed "
-                      "decisions cannot be re-executed. Seal the event payload alongside the "
-                      "verdict and replay becomes available from that point on.")
-    fields = ["id", "audit_hash", "ts", input_col]
-    for extra in (result_col, verdict_col, score_col):
-        if extra and extra not in fields:
-            fields.append(extra)
-    sql = "SELECT %s FROM audit_log WHERE %s" % (", ".join(fields), where)
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(sql, tuple(args)).fetchall()
-    if not rows:
-        return None, "no sealed decision matched"
-    out = []
-    for row in rows:
-        record = dict(zip(fields, row))
-        raw = record.get(input_col)
-        try:
-            parsed = raw if isinstance(raw, (dict, list)) else json.loads(raw)
-        except Exception:
-            parsed = None
-        sealed_result = None
-        if result_col:
-            raw_result = record.get(result_col)
-            try:
-                sealed_result = raw_result if isinstance(raw_result, dict) else json.loads(raw_result)
-            except Exception:
-                sealed_result = None
-        out.append({"id": record.get("id"), "audit_hash": record.get("audit_hash"),
-                    "ts": record.get("ts"), "inputs": parsed,
-                    "sealed_result": sealed_result,
-                    "sealed_verdict": record.get(verdict_col) if verdict_col else None,
-                    "sealed_score": record.get(score_col) if score_col else None})
-    return out, None
-
-
-def _sealed_pair(record):
-    verdict = record.get("sealed_verdict")
-    score = record.get("sealed_score")
-    result = record.get("sealed_result")
-    if isinstance(result, dict):
-        if verdict is None:
-            verdict = result.get("decision") or result.get("verdict")
-        if score is None:
-            score = result.get("score")
-    return verdict, score
-
-
-def _compare(record, function):
-    output, why = _rerun(function, record.get("inputs"))
-    sealed_verdict, sealed_score = _sealed_pair(record)
-    if why:
-        return {"audit_hash": record["audit_hash"], "result": "not_replayable"}
-    verdict, score = _extract(output)
-    identical = _same(verdict, sealed_verdict) and _same(score, sealed_score)
-    return {"audit_hash": record["audit_hash"], "sealed_at": _iso(record.get("ts")),
-            "result": "identical" if identical else "divergent"}
-
-
-def _self(ctx, data):
-    try:
-        sample = int(data.get("sample", SELF_SAMPLE_DEFAULT))
-    except (TypeError, ValueError):
-        sample = SELF_SAMPLE_DEFAULT
-    sample = max(1, min(sample, SELF_SAMPLE_MAX))
-
-    function, name, why = _find_scorer()
-    if why:
-        return {"error": "engine_unavailable"}, 503
-
-    records, fetch_why = _fetch(ctx, "1=1 ORDER BY id DESC LIMIT ?", [sample])
-    if fetch_why:
-        return {"error": "cannot_replay", "message": fetch_why}, 400
-
-    identical = divergent = skipped = 0
-    divergent_hashes = []
-    started = time.time()
-    for record in records:
-        outcome = _compare(record, function)
-        if outcome["result"] == "identical":
-            identical += 1
-        elif outcome["result"] == "divergent":
-            divergent += 1
-            if len(divergent_hashes) < 10:
-                divergent_hashes.append(outcome["audit_hash"])
-        else:
-            skipped += 1
-
-    checked = identical + divergent
-    rate = round((identical / checked) * 100, 4) if checked else None
-    code_fingerprint, _p = _fingerprint_of(function)
-
-    body = {
-        "sampled": len(records), "replayable": checked,
-        "identical": identical, "divergent": divergent, "not_replayable": skipped,
-        "reproduction_rate_percent": rate,
-        "took_seconds": round(time.time() - started, 3),
-        "code_fingerprint": code_fingerprint,
-        "replay_version": VERSION,
-        "headline": ("%d of %d sealed decisions reproduce identically under the code deployed "
-                     "right now." % (identical, checked)) if checked else
-                    "Nothing replayable in this sample.",
-        "why_this_matters": "A platform whose scoring runs through a model call cannot do this "
-                            "at all. Reproducibility is a property of the architecture, not a "
-                            "feature that can be added later.",
-        "honest": "Divergences are counted here, not filtered out. A falling rate is the most "
-                  "useful thing this route can tell you.",
-        "independent_check": "Do not take our word for this - /x/replay/challenge lets you run "
-                             "your own inputs and repeat them whenever you like.",
-    }
-    if divergent_hashes:
-        body["divergent_receipts"] = divergent_hashes
-    return body, 200
-
-
-# ----------------------------------------------------------------------
-# fingerprint, keyed check, attest
-# ----------------------------------------------------------------------
-
-def _fingerprint(ctx):
-    function, name, why = _find_scorer()
-    if why:
-        return {"error": "engine_unavailable"}, 503
-    digest, problem = _fingerprint_of(function)
-    return {"code_fingerprint": digest, "problem": problem, "replay_version": VERSION,
-            "what_this_is": "A SHA-256 of the source of the code currently deciding. It commits "
-                            "to which version is running. It is one-way and discloses nothing "
-                            "about the logic, the weights or the thresholds.",
-            "what_it_is_for": "Sealed alongside verdicts via /x/replay/attest, so a change in "
-                              "behaviour can be attributed to a dated code change rather than "
-                              "looking like a fault - or hidden as one.",
-            "note": "The function name and signature are deliberately not published."}, 200
-
-
-def _check(ctx, data):
-    """Keyed. Re-runs one sealed decision and reports match or divergence."""
-    target = str(data.get("hash", data.get("receipt", ""))).strip().lower()
-    if not target:
-        return {"error": "hash_required"}, 400
-    records, why = _fetch(ctx, "audit_hash=? LIMIT 1", [target])
-    if why:
-        return {"error": "cannot_replay", "message": why}, 400
-    function, name, scorer_why = _find_scorer()
-    if scorer_why:
-        return {"error": "engine_unavailable"}, 503
-    outcome = _compare(records[0], function)
-    digest, _p = _fingerprint_of(function)
-    outcome.update({"code_fingerprint": digest, "replay_version": VERSION,
-                    "what_this_proves": "The sealed inputs were fed back through the live "
-                                        "decision function and the output compared with what "
-                                        "was sealed."})
-    return outcome, 200
-
-
-def _attest(ctx, api_key):
-    function, name, why = _find_scorer()
-    if why:
-        return {"error": "engine_unavailable"}, 503
-    digest, problem = _fingerprint_of(function)
-    if not digest:
-        return {"error": "no_fingerprint", "message": problem}, 503
-
-    now = time.time()
-    ev = {"user_id": "rep:" + digest[:16], "action": "code_fingerprint_sealed", "amount": 0,
-          "country": "UK", "device_id": "replay", "anomaly": 0, "device_risk": 0}
-    res = {"decision": "FINGERPRINT_SEALED", "score": 0, "replay_version": VERSION,
-           "fingerprint": digest, "detail": "fingerprint=%s" % digest}
-    audit_hash, block_index, seq = ctx["seal"](ev, res, now, api_key)
-
-    with ctx["lock"]:
-        ctx["conn"].execute("INSERT INTO replay_attest(api_key,fingerprint,function,taken,"
-                            "audit_hash,block_index) VALUES(?,?,?,?,?,?)",
-                            (api_key, digest, name, now, audit_hash, block_index))
-        ctx["conn"].commit()
-
-    return {"fingerprint": digest, "taken_at": _iso(now),
-            "sealed_in_chain": audit_hash, "block_index": block_index, "receipt_seq": seq,
-            "what_this_does": "Records which code was deciding at this moment, inside the chain "
-                              "the decisions are sealed in. Every verdict after this point is "
-                              "attributable to a known, timestamped version of the logic - "
-                              "without that logic being published.",
-            "do_this": "Attest on every deploy that touches scoring. A later divergence then "
-                       "reads as a dated policy change rather than an unexplained fault."}, 200
-
-
-def _spec():
-    return {
-        "replay_version": VERSION,
-        "claim": "The same inputs produce the same verdict, and you can establish that yourself "
-                 "without an account and without seeing any of our logic.",
-        "the_logic_is_not_published": "No route here returns the scoring source, the weights, "
-                                      "the thresholds, the signal names or any intermediate "
-                                      "value. The only thing published is a SHA-256 of the "
-                                      "deployed source, which is one-way.",
-        "how_to_test_us": [
-            "POST /x/replay/challenge with any inputs object you like.",
-            "Keep the input_hash it returns.",
-            "Send the identical inputs again tomorrow, next month, next year, from anywhere.",
-            "GET /x/replay/history?input_hash=... to see every run, each sealed separately.",
-            "If the verdict ever moves under an unchanged code fingerprint, the engine is not "
-            "deterministic and you have proof of it that we cannot withdraw.",
-        ],
-        "why_black_box_is_stronger": "A published listing only shows what the code says. "
-                                     "Repeated challenge shows what production actually does, "
-                                     "over time, on inputs we did not choose.",
-        "what_breaks_determinism": [
-            "a wall-clock read inside the scoring path",
-            "iteration over an unordered structure",
-            "an unseeded random call",
-            "any model call in the decision path - which is why most platforms cannot do this",
-        ],
-        "what_this_does_not_prove": "That a decision was correct, or that the inputs were "
-                                    "honestly captured. Only that the same inputs still yield "
-                                    "the same output under known code. Determinism is not "
-                                    "fairness.",
-        "rate_limits": "Repeat submissions of inputs already seen are never limited - retesting "
-                       "is the point. Novel inputs are limited, because bulk novel inputs are "
-                       "how a decision boundary gets mapped rather than how a claim gets tested.",
-    }, 200
-
-
-# ----------------------------------------------------------------------
-# router entry point
-# ----------------------------------------------------------------------
-
-def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-    action = (action or "").strip("/").lower()
-    data = data or {}
-
-    if method == "GET":
-        if action == "spec":
-            return _spec()
-        if action == "fingerprint":
-            return _fingerprint(ctx)
-        if action == "history":
-            return _history(ctx, data)
-        if action == "self":
-            return _self(ctx, data)
-        if action == "check":
-            if not api_key:
-                return {"error": "invalid_api_key"}, 401
-            return _check(ctx, data)
-
-    if method == "POST":
-        if action == "challenge":
-            return _challenge(ctx, api_key, data)
-        if not api_key:
-            return {"error": "invalid_api_key"}, 401
-        if action == "attest":
-            return _attest(ctx, api_key)
-
-    return {"error": "unknown_action", "action": action,
-            "GET": ["spec", "fingerprint", "history", "self", "check (keyed)"],
-            "POST": ["challenge", "attest (keyed)"]}, 404
 
 ```
