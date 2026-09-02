@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-121 files across 30 parts.
+120 files across 30 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -171,7 +171,6 @@ Generated automatically on every push. Do not edit by hand.
 
 ## [CODEBASE-24.md](CODEBASE-24.md)
 
-- `investor-prospectus.html`
 - `legal.txt`
 - `liability.txt`
 - `llms.txt`
