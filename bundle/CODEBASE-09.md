@@ -1,11 +1,1320 @@
-# Codebase — part 9 of 29
+# Codebase — part 9 of 30
 
 Contains:
+- `modules/peer.py`
 - `modules/peerconsole.py`
 - `modules/praxis.py`
-- `modules/publish.py`
-- `modules/ratchet.py`
-- `modules/reconcile.py`
+
+
+## `modules/peer.py`
+
+1303 lines, 58656 bytes
+
+```python
+"""
+modules/peer.py  v1.4.0  --  signed peer submission (shared secret)
+
+WHAT CHANGED IN 1.2.1 -- THE ACTUAL FAULT
+    Every seal from this module had always failed, from the day it was
+    written. Not intermittently. Every call, every action.
+
+    server.py's seal() writes the row with event["user_id"] -- a direct key
+    lookup, not a .get(). This module's events never carried a user_id, so
+    the insert raised KeyError every time. witness.py passes
+    "user_id": "wit:<peer>" and seals fine, which is why the hourly witness
+    traffic worked either side of a peer submission that did not.
+
+    Found by comparing the two modules' event shapes against seal() after
+    four consecutive failures from praesidium / PRAXIS on 2026-08-26. The
+    1.2 change is what made it findable: before that the KeyError was
+    swallowed and reported as a successful receipt.
+
+    Every event this module seals now carries "user_id": "peer:<peer_id>",
+    following the same convention witness.py uses.
+
+    Note what this means for history: peer registrations before this version
+    were never sealed either. The credential exists in peer_registry and
+    works, but there is no audit block for it. That gap is real and is not
+    retro-fillable -- sealing it now would date it now.
+
+WHAT CHANGED IN 1.2
+    A failed seal no longer returns success.
+
+    In 1.1 the call into the audit chain was wrapped in a bare exception
+    handler that swallowed anything it threw. If sealing failed, the peer
+    still got ok=true and accepted=true, with audit_hash, block_index and
+    receipt_seq all null. The submission was counted in the registry and
+    stored, but nothing entered the chain. From the peer's side it looked
+    like a receipt. It was not one.
+
+    That happened in the wild on 2026-08-26 to the first external peer to
+    use this route (praesidium / PRAXIS). Found by checking the chain for
+    a block at the submission timestamp and finding none. The peer's own
+    verifier had already refused the receipt, which is the only reason it
+    surfaced at all.
+
+    Now: if the seal throws, or returns without an audit hash, submit
+    returns 500 and says so. Nothing is recorded, the nonce stays unused,
+    and the peer can resend the identical envelope once the underlying
+    fault is fixed. The exception text is returned so the peer can tell
+    the operator what actually broke.
+
+    The three operator routes (register, rotate, suspend/resume) seal an
+    audit note as a side effect. A failure there does not undo the
+    operation, but it is no longer hidden: the response carries
+    sealed=false and the exception text.
+
+    Also in 1.2: the stored copy of the response is now written after any
+    rotation warning is added, so the stored body is byte-identical to
+    what the peer received. Peers that hash the response to prove they
+    received it need that to hold.
+
+READ THIS FIRST: WHAT THIS LANE BINDS, AND WHAT IT DOES NOT
+    This lane authenticates with HMAC-SHA256 over a shared secret.
+
+    A shared secret is held by BOTH parties. So a valid signature proves
+    the submission came from someone holding that secret -- which is the
+    peer, and also the operator of this deployment.
+
+        It closes third-party submission under your name.
+        It does NOT close operator submission under your name.
+
+    That is a normal property of HMAC and not a defect. It is stated here,
+    at the top, because "signed" reads stronger than it is, and a peer
+    choosing between lanes should not have to work that out for
+    themselves. Raised by Ishaan (Shango MID), who was right.
+
+    If you need the operator excluded as well, use /x/signed/submit
+    instead. There you generate an Ed25519 keypair, keep the private half,
+    and this deployment holds only the public half -- so it can verify a
+    signature and can never produce one. That property is arithmetic
+    rather than a promise about our conduct.
+
+    Both lanes stay open. This one is simpler to implement and costs the
+    peer no key custody, which is a real advantage if a long-lived private
+    key is a liability you would rather not carry. The other is stronger.
+    Pick deliberately.
+
+WHY THIS EXISTS
+    /x/witness/observe is unauthenticated on purpose. Anyone can submit a
+    tip without an account, and that openness is what answers the
+    collusion objection -- nobody has to trust us to audit the network.
+
+    The cost of that openness is that anyone can submit a tip under any
+    name. Name binding catches most of it; it does not prevent it.
+
+    A named peer exchanging period roots wants a stronger guarantee than
+    the open endpoint gives. This module provides one WITHOUT changing the
+    open endpoint. All three run side by side.
+
+WHAT IT COVERS
+    canonicalization, HMAC-SHA256 signing, nonce, replay window, clock
+    skew, idempotency, retry semantics, suspension, key rotation with
+    overlap, and honest reporting of seal failure.
+
+AUTH LIVES IN THE BODY, NOT IN HEADERS
+    The module router hands modules a parsed body, not the raw headers,
+    so every authentication field travels in the JSON body. This also
+    makes the scheme trivial to implement from any language and easy to
+    replay in a test.
+
+THE SCHEME, IN FULL
+    Envelope:
+        {
+          "peer_id":         "prae-001",
+          "ts":              1755432000,          integer unix seconds
+          "nonce":           "<>=16 chars, unique per peer>",
+          "idempotency_key": "<optional, <=128 chars>",
+          "payload":         { ... the thing being submitted ... },
+          "signature":       "<hex hmac-sha256>"
+        }
+
+    THOSE FIELDS AND NO OTHERS. The server rebuilds the envelope from the
+    known field names before checking the signature, so any extra
+    top-level field you signed will not be part of what we verify and the
+    signature will not match. Put anything of your own inside payload.
+    This trips people up and now it is written down.
+
+    String to sign:
+        "AILEASH-PEER-v1\\n" + canonical(envelope_without_signature)
+
+    canonical() is exactly:
+        json.dumps(obj, sort_keys=True, separators=(",",":"),
+                   ensure_ascii=True)
+
+    signature = hmac_sha256(secret, string_to_sign).hexdigest()
+
+    POST /x/peer/canonical returns the exact string to sign for a given
+    envelope, so an implementer can debug canonicalization without
+    holding or revealing a secret.
+
+WHAT COMES BACK ON ACCEPTANCE
+    The full response shape, so a peer can pin a schema to it:
+
+        ok                true
+        accepted          true
+        peer_id           string
+        chain_name        string
+        payload_digest    sha256 hex of canonical(payload)
+        signed_with       "current" or "previous"
+        auth              "hmac-shared-secret"
+        auth_scope        the paragraph at the top of this file
+        received_at       ISO 8601 Z, server clock at acceptance
+        receipt           { audit_hash, block_index, receipt_seq }
+        verify            { inclusion, ancestry, append_only }
+        warning           present only when signed_with is "previous"
+        replayed          present only on an idempotent retry
+        note              present only on an idempotent retry
+
+    received_at is TOP LEVEL. It is a sibling of receipt, not a member
+    of it. The receipt object contains exactly three fields. This is
+    spelled out because pinning a schema against the wrong nesting is an
+    easy mistake to make and the earlier spec did not say where the field
+    lived.
+
+    received_at is this server's clock at the moment of acceptance. It is
+    not evidence of when anything happened. The audit_hash is.
+
+RULES
+    clock skew      +/- 300s. Outside that: 401 clock_skew.
+    nonce           unique per peer for 900s. Reused: 409 replay.
+    idempotency     same key + same payload digest returns the FIRST
+                    response verbatim, sealed once. Same key + different
+                    payload: 409 idempotency_conflict.
+    retry           safe. Retry the identical envelope; idempotency makes
+                    it a no-op that returns the original receipt.
+    suspension      403 peer_suspended. Submissions refused, nothing
+                    deleted, the peer's history stands.
+    rotation        two secrets live at once. A new secret is issued and
+                    the previous one stays valid for ROTATION_OVERLAP
+                    (default 24h) so a peer can roll without downtime.
+
+                    Note the asymmetry with the other lane: here the
+                    OPERATOR issues and rotates the secret, because the
+                    operator holds it too. At /x/signed/rotate the peer
+                    rotates their own key and the operator cannot, because
+                    a rotation must be signed by the key being replaced.
+
+    seal failure    500 seal_failed or 500 seal_incomplete. Nothing is
+                    recorded and no receipt is issued. A receipt that
+                    cannot be verified is worse than no receipt, so this
+                    lane refuses to issue one.
+
+ROUTES
+    GET  spec       public   full implementation guide
+    POST canonical  public   the exact string to sign. no secret needed.
+    GET  peers      public   peer ids, status, rotation state. no secrets.
+    POST submit     public route, SIGNATURE authenticated
+    POST register   keyed    operator issues a peer credential
+    POST rotate     keyed    issue a new secret, overlap the old
+    POST suspend    keyed
+    POST resume     keyed
+    GET  history    keyed    submissions by peer, with stored response
+
+TABLES OWNED
+    peer_registry, peer_nonce, peer_submission
+"""
+
+import hashlib
+import hmac
+import json
+import os
+import re
+import time
+
+VERSION = "1.4.0"
+
+PUBLIC = {
+    ("GET", "spec"),
+    ("GET", "schema"),
+    ("POST", "canonical"),
+    ("GET", "peers"),
+    ("POST", "submit"),
+}
+
+SIGN_PREFIX = "AILEASH-PEER-v1\n"
+
+CLOCK_SKEW_SECONDS = 300
+NONCE_TTL_SECONDS = 900
+NONCE_MIN_LENGTH = 16
+ROTATION_OVERLAP_SECONDS = 86400
+MAX_PAYLOAD_BYTES = 65536
+MAX_IDEMPOTENCY_KEY = 128
+
+# The one paragraph that must appear anywhere this lane describes itself.
+# Kept as a constant so it cannot drift between the spec route, the
+# register response and the peers listing.
+SHARED_SECRET_SCOPE = (
+    "This lane authenticates with a shared secret, held by both the peer "
+    "and the operator of this deployment. A valid signature proves the "
+    "submission came from a holder of that secret. It closes third-party "
+    "submission under your name and it does not close operator submission "
+    "under your name. That is a normal property of HMAC, stated rather "
+    "than implied. For a lane where the operator is excluded too, use "
+    "/x/signed/submit - you keep the private key and we hold only the "
+    "public half, so we can verify a signature and can never produce one."
+)
+
+_PEER_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,62}$")
+
+_ready = False
+
+
+# ---------------------------------------------------------------- storage
+
+def _setup(ctx):
+    global _ready
+    if _ready:
+        return
+    conn = ctx["conn"]
+    with ctx["lock"]:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS peer_registry (
+                peer_id          TEXT PRIMARY KEY,
+                chain_name       TEXT,
+                url              TEXT,
+                secret_current   TEXT,
+                secret_previous  TEXT,
+                rotated_at       REAL,
+                status           TEXT DEFAULT 'active',
+                created          REAL,
+                submissions      INTEGER DEFAULT 0,
+                last_seen        REAL,
+                seq              INTEGER DEFAULT 0
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS peer_nonce (
+                peer_id   TEXT,
+                nonce     TEXT,
+                seen_at   REAL,
+                PRIMARY KEY (peer_id, nonce)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS peer_submission (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                peer_id          TEXT,
+                ts               REAL,
+                idempotency_key  TEXT,
+                payload_digest   TEXT,
+                response_json    TEXT,
+                audit_hash       TEXT
+            )
+        """)
+        # Added in 1.3.0. Existing rows get NULL, read as 0 by
+        # COALESCE, so the first submission after upgrading is seq 1.
+        have = set()
+        try:
+            for r in conn.execute("PRAGMA table_info(peer_registry)").fetchall():
+                have.add(r[1])
+        except Exception:
+            pass
+        if "seq" not in have:
+            try:
+                conn.execute("ALTER TABLE peer_registry ADD COLUMN seq INTEGER DEFAULT 0")
+            except Exception:
+                pass
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_peer_sub_idem "
+            "ON peer_submission(peer_id, idempotency_key)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_peer_nonce_time "
+            "ON peer_nonce(seen_at)")
+        conn.commit()
+    _ready = True
+
+
+# ------------------------------------------------------------ primitives
+
+def canonical(obj):
+    """
+    THE canonicalization. Any implementation in any language must produce
+    this byte-for-byte. Sorted keys, no whitespace, ASCII-escaped.
+    """
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=True)
+
+
+def string_to_sign(envelope):
+    """Envelope WITHOUT the signature field, prefixed and canonicalized."""
+    unsigned = {k: v for k, v in envelope.items() if k != "signature"}
+    return SIGN_PREFIX + canonical(unsigned)
+
+
+def sign(secret, envelope):
+    return hmac.new(secret.encode("utf-8"),
+                    string_to_sign(envelope).encode("utf-8"),
+                    hashlib.sha256).hexdigest()
+
+
+def _digest(payload):
+    return hashlib.sha256(canonical(payload).encode("utf-8")).hexdigest()
+
+
+def _new_secret():
+    return os.urandom(32).hex()
+
+
+def _now():
+    return time.time()
+
+
+def _iso(ts):
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(ts)))
+    except Exception:
+        return None
+
+
+def _describe_exception(exc):
+    """
+    Short, safe description of what went wrong. Type and message only --
+    no traceback, no local variables, nothing that leaks a secret. The
+    peer needs enough to tell us what broke; they do not need our stack.
+    """
+    text = str(exc) or "(no message)"
+    return "%s: %s" % (type(exc).__name__, text[:400])
+
+
+def _sweep_nonces(ctx):
+    cutoff = _now() - NONCE_TTL_SECONDS
+    with ctx["lock"]:
+        ctx["conn"].execute("DELETE FROM peer_nonce WHERE seen_at < ?",
+                            (cutoff,))
+        ctx["conn"].commit()
+
+
+def _try_seal(ctx, event, result, when):
+    """
+    Seal, and say plainly whether it worked.
+
+    Returns (audit_hash, block_index, receipt_seq, error) where error is
+    None on success and a short string on failure. Nothing here swallows
+    a failure silently. That was the 1.1 bug and it is the whole point of
+    this version.
+    """
+    try:
+        audit_hash, block_index, receipt_seq = ctx["seal"](
+            event, result, when, None)
+    except Exception as exc:
+        return None, None, None, _describe_exception(exc)
+
+    if not audit_hash:
+        return None, None, None, ("seal returned no audit hash")
+
+    return audit_hash, block_index, receipt_seq, None
+
+
+# ------------------------------------------------------------ the submit
+
+def _submit(ctx, data):
+    """
+    Signature-authenticated. No API key. Every rule on the list is
+    enforced here, in a fixed order, and each failure names itself.
+    """
+    _setup(ctx)
+
+    # ---- shape
+    peer_id = (data.get("peer_id") or "").strip()
+    signature = (data.get("signature") or "").strip()
+    nonce = (data.get("nonce") or "").strip()
+    payload = data.get("payload")
+    idem = (data.get("idempotency_key") or "").strip()[:MAX_IDEMPOTENCY_KEY]
+
+    if not peer_id or not signature or not nonce or payload is None:
+        return {"ok": False, "error": "malformed_envelope",
+                "required": ["peer_id", "ts", "nonce", "payload",
+                             "signature"]}, 400
+
+    try:
+        ts = int(data.get("ts"))
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "malformed_ts",
+                "detail": "ts must be an integer of unix seconds"}, 400
+
+    if len(nonce) < NONCE_MIN_LENGTH:
+        return {"ok": False, "error": "nonce_too_short",
+                "minimum": NONCE_MIN_LENGTH}, 400
+
+    if len(canonical(payload).encode("utf-8")) > MAX_PAYLOAD_BYTES:
+        return {"ok": False, "error": "payload_too_large",
+                "max_bytes": MAX_PAYLOAD_BYTES}, 413
+
+    # ---- peer known and active
+    row = ctx["conn"].execute(
+        "SELECT peer_id, chain_name, secret_current, secret_previous, "
+        "rotated_at, status FROM peer_registry WHERE peer_id = ?",
+        (peer_id,)).fetchone()
+    if not row:
+        return {"ok": False, "error": "unknown_peer", "peer_id": peer_id}, 401
+    if row[5] == "suspended":
+        return {"ok": False, "error": "peer_suspended",
+                "detail": "Submissions refused. Existing history stands "
+                          "and nothing has been removed."}, 403
+
+    # ---- clock skew, before any expensive work
+    skew = abs(_now() - ts)
+    if skew > CLOCK_SKEW_SECONDS:
+        return {"ok": False, "error": "clock_skew",
+                "detail": "Timestamp is %.0fs from server time; the window "
+                          "is +/-%ds." % (skew, CLOCK_SKEW_SECONDS),
+                "server_time": int(_now())}, 401
+
+    # ---- signature, against current then previous secret
+    #
+    # Note the envelope is rebuilt from KNOWN field names only. Any extra
+    # top-level field the caller signed is not part of what we verify, so
+    # the signature will not match. Documented in the spec; the failure
+    # response points at /x/peer/canonical, which is the fastest way for
+    # an implementer to see the difference.
+    envelope = {"peer_id": peer_id, "ts": ts, "nonce": nonce,
+                "payload": payload}
+    if idem:
+        envelope["idempotency_key"] = idem
+
+    accepted_with = None
+    if row[2] and hmac.compare_digest(sign(row[2], envelope), signature):
+        accepted_with = "current"
+    elif row[3] and (row[4] or 0) + ROTATION_OVERLAP_SECONDS > _now():
+        if hmac.compare_digest(sign(row[3], envelope), signature):
+            accepted_with = "previous"
+
+    if not accepted_with:
+        return {"ok": False, "error": "bad_signature",
+                "detail": "HMAC did not match. POST the same envelope to "
+                          "/x/peer/canonical to see the exact string this "
+                          "server signs.",
+                "common_cause": "An extra top-level field in your envelope. "
+                                "Only peer_id, ts, nonce, payload and "
+                                "idempotency_key are signed; anything else "
+                                "belongs inside payload.",
+                "string_to_sign_sha256":
+                    hashlib.sha256(
+                        string_to_sign(envelope).encode()).hexdigest(),
+                }, 401
+
+    payload_digest = _digest(payload)
+
+    # ---- idempotency, before the nonce check so a retry is a clean no-op
+    if idem:
+        prior = ctx["conn"].execute(
+            "SELECT payload_digest, response_json FROM peer_submission "
+            "WHERE peer_id = ? AND idempotency_key = ?",
+            (peer_id, idem)).fetchone()
+        if prior:
+            if prior[0] != payload_digest:
+                return {"ok": False, "error": "idempotency_conflict",
+                        "detail": "That idempotency key was used with a "
+                                  "different payload."}, 409
+            out = json.loads(prior[1])
+            out["replayed"] = True
+            out["note"] = ("Idempotent retry. This is the original receipt; "
+                           "nothing was sealed twice.")
+            return out, 200
+
+    # ---- replay
+    _sweep_nonces(ctx)
+    seen = ctx["conn"].execute(
+        "SELECT seen_at FROM peer_nonce WHERE peer_id = ? AND nonce = ?",
+        (peer_id, nonce)).fetchone()
+    if seen:
+        return {"ok": False, "error": "replay",
+                "detail": "That nonce has already been used by this peer "
+                          "within the %ds window. Use a fresh nonce, or "
+                          "send an idempotency_key if you meant to retry."
+                          % NONCE_TTL_SECONDS}, 409
+
+    # ---- seal it FIRST, and only claim success if it actually sealed
+    #
+    # This ordering is deliberate. Before 1.2 the response was built and
+    # returned whether or not the seal worked, with null receipt fields
+    # and ok=true. A peer had no way to tell a real receipt from an empty
+    # one without going and looking at the chain. Now nothing is recorded
+    # and nothing is claimed unless there is an audit hash to point at.
+    now = _now()
+    event = {"user_id": "peer:" + peer_id,
+             "module": "peer", "action": "submit", "peer_id": peer_id,
+             "chain_name": row[1], "payload_digest": payload_digest,
+             "payload": payload}
+    result = {"accepted": True, "signed_with": accepted_with,
+              "auth": "hmac-shared-secret"}
+
+    audit_hash, block_index, receipt_seq, seal_error = _try_seal(
+        ctx, event, result, now)
+
+    if seal_error:
+        return {
+            "ok": False,
+            "accepted": False,
+            "error": "seal_failed",
+            "detail": "Your envelope verified correctly, but the audit "
+                      "chain did not seal it, so there is no receipt to "
+                      "give you. This is a fault on this deployment and "
+                      "not a problem with your submission.",
+            "seal_error": seal_error,
+            "recorded": False,
+            "retry": "Nothing was written. Your nonce is unused and your "
+                     "idempotency key is free, so the identical envelope "
+                     "can be resent once this is fixed.",
+            "peer_id": peer_id,
+            "payload_digest": payload_digest,
+            "received_at": _iso(now),
+        }, 500
+
+    # ---- accepted and sealed. Issue the receipt sequence.
+    #
+    # New in 1.3.0. server.py's seal() only issues its sequence number
+    # when an api_key is passed, because that counter lives on the key.
+    # This lane authenticates by signature and holds no key, so seal()
+    # returned None and the gapless property - the one that lets a peer
+    # holding N and N+2 PROVE N+1 is missing - simply did not exist here.
+    # Raised by Philip Pinol (PRAXIS) whose schema required an integer and
+    # got a null. He was right to require it.
+    #
+    # So the sequence is issued here instead, per peer, from a counter on
+    # peer_registry. It is incremented and read inside the SAME lock hold
+    # that writes the submission row, so a number is never issued for a
+    # submission that was not stored, and never skipped for one that was.
+    #
+    # Note the difference from the api_key sequence deliberately: that one
+    # counts everything a key ever sealed across all modules. This one
+    # counts what THIS peer submitted to THIS lane. Both are gapless
+    # within their own scope and they are not comparable to each other.
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "UPDATE peer_registry SET seq = COALESCE(seq, 0) + 1 "
+            "WHERE peer_id = ?", (peer_id,))
+        srow = ctx["conn"].execute(
+            "SELECT seq FROM peer_registry WHERE peer_id = ?",
+            (peer_id,)).fetchone()
+        peer_seq = int(srow[0]) if srow and srow[0] is not None else None
+
+        out = {
+            "ok": True,
+            "accepted": True,
+            "peer_id": peer_id,
+            "chain_name": row[1],
+            "payload_digest": payload_digest,
+            "signed_with": accepted_with,
+            "auth": "hmac-shared-secret",
+            "auth_scope": SHARED_SECRET_SCOPE,
+            "received_at": _iso(now),
+            "receipt": {"audit_hash": audit_hash,
+                        "block_index": block_index,
+                        "receipt_seq": peer_seq,
+                        "receipt_seq_scope": "per-peer",
+                        "key_seq": receipt_seq},
+            "verify": {
+                "inclusion": "/x/complete/prove",
+                "ancestry": "/x/consistency/ancestor?tip=<any tip we served>",
+                "append_only": "/x/consistency/proof?first=&second=",
+            },
+            # Top level, not inside verify. In 1.3.0 this sat inside the
+            # verify object, which the spec documented as exactly three
+            # keys - so the response carried a fourth key the written shape
+            # did not have. Philip Pinol (PRAXIS) caught it as
+            # verify_format_invalid. It is a property of the sequence
+            # rather than a route to call, so it never belonged in a map of
+            # verification routes.
+            "gapless": "receipt_seq increments by exactly one per accepted "
+                       "submission from this peer. Two receipts numbered N "
+                       "and N+2 prove a third exists and you did not "
+                       "receive it. The current highest is published per "
+                       "peer at /x/peer/peers.",
+        }
+
+        # Rotation warning is added BEFORE storing, so the stored copy is
+        # byte-identical to what the peer receives. A peer that hashes the
+        # response to prove what it got needs that to be true.
+        if accepted_with == "previous":
+            out["warning"] = ("Accepted with the previous secret. The "
+                              "overlap window ends %s."
+                              % _iso((row[4] or 0) +
+                                     ROTATION_OVERLAP_SECONDS))
+
+        ctx["conn"].execute(
+            "INSERT OR IGNORE INTO peer_nonce (peer_id, nonce, seen_at) "
+            "VALUES (?,?,?)", (peer_id, nonce, now))
+        ctx["conn"].execute(
+            "INSERT INTO peer_submission (peer_id, ts, idempotency_key, "
+            "payload_digest, response_json, audit_hash) VALUES (?,?,?,?,?,?)",
+            (peer_id, now, idem or None, payload_digest,
+             json.dumps(out), audit_hash))
+        ctx["conn"].execute(
+            "UPDATE peer_registry SET submissions = submissions + 1, "
+            "last_seen = ? WHERE peer_id = ?", (now, peer_id))
+        ctx["conn"].commit()
+
+    return out, 200
+
+
+# ------------------------------------------------------------- operator
+
+def _register(ctx, data):
+    _setup(ctx)
+    peer_id = (data.get("peer_id") or "").strip().lower()
+    if not _PEER_ID_RE.match(peer_id):
+        return {"ok": False, "error": "bad_peer_id",
+                "detail": "lowercase letters, digits, dot, dash, "
+                          "underscore; 2-63 chars"}, 400
+    if ctx["conn"].execute("SELECT 1 FROM peer_registry WHERE peer_id = ?",
+                           (peer_id,)).fetchone():
+        return {"ok": False, "error": "peer_exists",
+                "detail": "Use /x/peer/rotate to issue a new secret."}, 409
+
+    secret = _new_secret()
+    now = _now()
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "INSERT INTO peer_registry (peer_id, chain_name, url, "
+            "secret_current, secret_previous, rotated_at, status, created) "
+            "VALUES (?,?,?,?,NULL,NULL,'active',?)",
+            (peer_id, (data.get("chain_name") or peer_id).strip()[:120],
+             (data.get("url") or "").strip()[:400], secret, now))
+        ctx["conn"].commit()
+
+    audit_hash, _bi, _rs, seal_error = _try_seal(
+        ctx, {"user_id": "peer:" + peer_id, "module": "peer",
+              "action": "register", "peer_id": peer_id},
+        {"registered": True}, now)
+
+    out = {
+        "ok": True,
+        "peer_id": peer_id,
+        "secret": secret,
+        "warning": "This secret is shown once and is not recoverable. "
+                   "Send it to the peer over a channel you trust.",
+        "tell_the_peer_this": SHARED_SECRET_SCOPE,
+        "endpoint": "/x/peer/submit",
+        "spec": "/x/peer/spec",
+        "stronger_lane": "/x/signed/spec",
+        "sealed": seal_error is None,
+        "audit_hash": audit_hash,
+    }
+    if seal_error:
+        out["seal_error"] = seal_error
+        out["seal_note"] = ("The credential was issued and is usable. The "
+                            "audit note about issuing it did not seal. "
+                            "That is a fault worth chasing, but it does "
+                            "not affect the credential.")
+    return out, 200
+
+
+def _rotate(ctx, data):
+    _setup(ctx)
+    peer_id = (data.get("peer_id") or "").strip().lower()
+    row = ctx["conn"].execute(
+        "SELECT secret_current FROM peer_registry WHERE peer_id = ?",
+        (peer_id,)).fetchone()
+    if not row:
+        return {"ok": False, "error": "unknown_peer"}, 404
+
+    new = _new_secret()
+    now = _now()
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "UPDATE peer_registry SET secret_previous = secret_current, "
+            "secret_current = ?, rotated_at = ? WHERE peer_id = ?",
+            (new, now, peer_id))
+        ctx["conn"].commit()
+
+    audit_hash, _bi, _rs, seal_error = _try_seal(
+        ctx, {"user_id": "peer:" + peer_id, "module": "peer",
+              "action": "rotate", "peer_id": peer_id},
+        {"rotated": True}, now)
+
+    out = {
+        "ok": True,
+        "peer_id": peer_id,
+        "secret": new,
+        "previous_valid_until": _iso(now + ROTATION_OVERLAP_SECONDS),
+        "detail": "Both secrets are accepted until then, so the peer can "
+                  "roll over without downtime. Submissions signed with the "
+                  "old one come back marked.",
+        "note": "The operator rotates this credential because the operator "
+                "holds it. At /x/signed/rotate the peer rotates their own "
+                "key and the operator cannot, because a rotation there must "
+                "be signed by the key being replaced.",
+        "sealed": seal_error is None,
+        "audit_hash": audit_hash,
+    }
+    if seal_error:
+        out["seal_error"] = seal_error
+        out["seal_note"] = ("The rotation happened and the new secret is "
+                            "live. The audit note about it did not seal.")
+    return out, 200
+
+
+def _set_status(ctx, data, status):
+    _setup(ctx)
+    peer_id = (data.get("peer_id") or "").strip().lower()
+    if not ctx["conn"].execute("SELECT 1 FROM peer_registry WHERE peer_id = ?",
+                               (peer_id,)).fetchone():
+        return {"ok": False, "error": "unknown_peer"}, 404
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "UPDATE peer_registry SET status = ? WHERE peer_id = ?",
+            (status, peer_id))
+        ctx["conn"].commit()
+
+    audit_hash, _bi, _rs, seal_error = _try_seal(
+        ctx, {"user_id": "peer:" + peer_id, "module": "peer",
+              "action": status, "peer_id": peer_id},
+        {"status": status}, _now())
+
+    out = {"ok": True, "peer_id": peer_id, "status": status,
+           "sealed": seal_error is None, "audit_hash": audit_hash}
+    if seal_error:
+        out["seal_error"] = seal_error
+        out["seal_note"] = ("The status change took effect. The audit note "
+                            "about it did not seal.")
+    return out, 200
+
+
+def _peers(ctx):
+    _setup(ctx)
+    now = _now()
+    rows = ctx["conn"].execute(
+        "SELECT peer_id, chain_name, url, status, created, submissions, "
+        "last_seen, rotated_at, seq FROM peer_registry ORDER BY created"
+    ).fetchall()
+    return {
+        "ok": True,
+        "count": len(rows),
+        "auth": "hmac-shared-secret",
+        "auth_scope": SHARED_SECRET_SCOPE,
+        "peers": [{
+            "peer_id": r[0], "chain_name": r[1], "url": r[2] or None,
+            "status": r[3], "registered": _iso(r[4]),
+            "submissions": r[5], "last_seen": _iso(r[6]) if r[6] else None,
+            "rotation_overlap_active":
+                bool(r[7] and r[7] + ROTATION_OVERLAP_SECONDS > now),
+            "latest_receipt_seq": r[8] or 0,
+        } for r in rows],
+        "note": "Secrets are never returned by any route.",
+        "receipt_seq_note":
+            "latest_receipt_seq is the highest receipt number issued to "
+            "that peer on this lane. A peer whose own highest receipt is "
+            "lower than this has not received one of them, and can say "
+            "exactly how many. Public on purpose - a gap you can only see "
+            "from the inside is not evidence of anything.",
+    }, 200
+
+
+def _history(ctx, data):
+    """
+    Keyed. Now returns the stored response body as well as the summary.
+
+    A peer that hashed the response it received can ask the operator to
+    hash the stored copy and compare. Without the body on this route
+    there is no way to settle a disagreement about what was sent, which
+    came up the first time a peer's verifier disagreed with a receipt.
+
+    Pass full=false to get the summary only.
+    """
+    _setup(ctx)
+    peer_id = (data.get("peer_id") or "").strip().lower()
+    full = data.get("full", True)
+    if isinstance(full, str):
+        full = full.strip().lower() not in ("0", "false", "no")
+    try:
+        limit = min(int(data.get("limit", 50)), 500)
+    except (TypeError, ValueError):
+        limit = 50
+
+    q = ("SELECT peer_id, ts, idempotency_key, payload_digest, audit_hash, "
+         "response_json FROM peer_submission")
+    args = []
+    if peer_id:
+        q += " WHERE peer_id = ?"
+        args.append(peer_id)
+    q += " ORDER BY id DESC LIMIT ?"
+    args.append(limit)
+    rows = ctx["conn"].execute(q, args).fetchall()
+
+    subs = []
+    for r in rows:
+        item = {
+            "peer_id": r[0], "at": _iso(r[1]), "idempotency_key": r[2],
+            "payload_digest": r[3], "audit_hash": r[4],
+            "sealed": bool(r[4]),
+        }
+        body = r[5]
+        if body:
+            try:
+                parsed = json.loads(body)
+            except Exception:
+                parsed = None
+            if parsed is not None:
+                item["response_digest"] = hashlib.sha256(
+                    canonical(parsed).encode("ascii")).hexdigest()
+                if full:
+                    item["response"] = parsed
+        subs.append(item)
+
+    return {
+        "ok": True, "count": len(subs),
+        "response_digest_recipe":
+            "sha256(json.dumps(response, sort_keys=True, "
+            "separators=(\",\",\":\"), ensure_ascii=True).encode(\"ascii\"))",
+        "note": "response_digest is over the stored copy of exactly what "
+                "was returned to the peer. A peer that hashed what it "
+                "received the same way can compare directly.",
+        "submissions": subs,
+    }, 200
+
+
+def _canonical_route(data):
+    """
+    Debugging aid. Give it an envelope, get back the exact string this
+    server will sign. Reveals nothing -- the secret is not involved.
+    """
+    env = dict(data or {})
+    env.pop("signature", None)
+    if "ts" in env:
+        try:
+            env["ts"] = int(env["ts"])
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "malformed_ts"}, 400
+    s = string_to_sign(env)
+    known = {"peer_id", "ts", "nonce", "payload", "idempotency_key"}
+    extra = sorted(k for k in env if k not in known)
+    out = {
+        "ok": True,
+        "string_to_sign": s,
+        "sha256": hashlib.sha256(s.encode("utf-8")).hexdigest(),
+        "byte_length": len(s.encode("utf-8")),
+        "recipe": "\"AILEASH-PEER-v1\\n\" + json.dumps(envelope_without_"
+                  "signature, sort_keys=True, separators=(\",\",\":\"), "
+                  "ensure_ascii=True)",
+        "then": "signature = hmac_sha256(secret, string_to_sign).hexdigest()",
+    }
+    if extra:
+        out["warning"] = (
+            "This route echoes whatever you sent, but /x/peer/submit "
+            "rebuilds the envelope from known fields only. These extra "
+            "top-level fields would NOT be part of what submit verifies, "
+            "so a signature over the string above would be rejected: %s. "
+            "Move them inside payload." % ", ".join(extra))
+    return out, 200
+
+
+# ------------------------------------------------------------------ spec
+
+def _spec():
+    return {
+        "module": "peer",
+        "version": VERSION,
+        "auth": "hmac-shared-secret",
+        "read_this_first": SHARED_SECRET_SCOPE,
+        "purpose":
+            "Signed submission for named peers. Sits beside the open "
+            "/x/witness/observe endpoint rather than replacing it. The "
+            "open endpoint stays unauthenticated so anyone can audit the "
+            "network without an account; this one guarantees that only a "
+            "holder of the peer secret can submit as that chain -- noting "
+            "that the operator is also a holder.",
+        "choosing_a_lane": {
+            "/x/witness/observe": "Open. No credential. Anyone can submit "
+                                  "under any name; the record says how "
+                                  "strong the claim is rather than "
+                                  "refusing it.",
+            "/x/peer/submit": "This lane. Shared secret. Excludes third "
+                              "parties, does not exclude the operator. No "
+                              "key custody burden on the peer.",
+            "/x/signed/submit": "Ed25519. The peer holds the private key "
+                                "and this deployment holds only the public "
+                                "half, so the operator is excluded too. "
+                                "Strongest, at the cost of the peer "
+                                "carrying a long-lived private key.",
+        },
+        "envelope": {
+            "peer_id": "string, issued at registration",
+            "ts": "integer unix seconds",
+            "nonce": "string, at least %d chars, unique per peer for %ds"
+                     % (NONCE_MIN_LENGTH, NONCE_TTL_SECONDS),
+            "idempotency_key": "optional string, max %d chars"
+                               % MAX_IDEMPOTENCY_KEY,
+            "payload": "object. period roots, tips, whatever is agreed. "
+                       "max %d bytes canonicalized." % MAX_PAYLOAD_BYTES,
+            "signature": "hex hmac-sha256",
+            "no_other_top_level_fields":
+                "The server rebuilds the envelope from exactly the field "
+                "names above before verifying. Any extra top-level field "
+                "you signed is not part of what we verify and your "
+                "signature will not match. Put your own data inside "
+                "payload.",
+        },
+        "canonicalization": {
+            "recipe": "json.dumps(obj, sort_keys=True, "
+                      "separators=(\",\",\":\"), ensure_ascii=True)",
+            "string_to_sign": "\"AILEASH-PEER-v1\\n\" + canonical(envelope "
+                              "with the signature field removed)",
+            "signature": "hmac_sha256(secret, string_to_sign).hexdigest()",
+            "debug": "POST the envelope to /x/peer/canonical to get the "
+                     "exact string back. No secret required.",
+        },
+        "rules": {
+            "clock_skew": "+/-%ds. Outside: 401 clock_skew, with the "
+                          "server's time in the body."
+                          % CLOCK_SKEW_SECONDS,
+            "replay": "A nonce is single-use per peer for %ds. Reused: "
+                      "409 replay." % NONCE_TTL_SECONDS,
+            "idempotency": "Same idempotency_key and same payload returns "
+                           "the original receipt verbatim with "
+                           "replayed=true; nothing is sealed twice. Same "
+                           "key with a different payload: 409 "
+                           "idempotency_conflict.",
+            "retry": "Retry the identical envelope. With an "
+                     "idempotency_key that is a safe no-op. Without one, "
+                     "a retry inside the nonce window returns 409 replay "
+                     "-- so send an idempotency_key if you intend to "
+                     "retry at all.",
+            "suspension": "403 peer_suspended. Nothing is deleted and the "
+                          "peer's sealed history stands.",
+            "rotation": "A new secret is issued and the previous one stays "
+                        "valid for %ds. Submissions accepted on the old "
+                        "secret come back with signed_with=previous and a "
+                        "warning naming the cutoff. The operator performs "
+                        "the rotation, because the operator holds the "
+                        "secret."
+                        % ROTATION_OVERLAP_SECONDS,
+            "seal_failure":
+                "If the audit chain does not seal your submission, you get "
+                "500 seal_failed with the reason, and nothing is recorded "
+                "-- no nonce, no counter, no receipt. Resend the identical "
+                "envelope once the fault is fixed. A receipt you cannot "
+                "verify is worse than no receipt, so this lane will not "
+                "issue one.",
+        },
+        "on_acceptance": {
+            "summary":
+                "The payload is sealed into the audit chain and you get a "
+                "receipt. Verify independently: inclusion at "
+                "/x/complete/prove, ancestry at /x/consistency/ancestor, "
+                "append-only at /x/consistency/proof. Both offline "
+                "verifiers (aileash_verify.py, verify_authority.py) are "
+                "stdlib only and touch no network.",
+            "response_shape": {
+                "ok": "true",
+                "accepted": "true",
+                "peer_id": "string",
+                "chain_name": "string",
+                "payload_digest": "sha256 hex of canonical(payload)",
+                "signed_with": "current | previous",
+                "auth": "hmac-shared-secret",
+                "auth_scope": "the shared-secret paragraph",
+                "received_at": "ISO 8601 Z. TOP LEVEL, beside receipt, "
+                               "not inside it.",
+                "receipt": "{ audit_hash, block_index, receipt_seq, "
+                           "receipt_seq_scope, key_seq }",
+                "verify": "{ inclusion, ancestry, append_only } "
+                          "-- exactly these three keys",
+                "gapless": "string. TOP LEVEL, not inside verify.",
+                "warning": "present only when signed_with is previous",
+                "replayed": "present only on an idempotent retry",
+                "note": "present only on an idempotent retry",
+            },
+            "where_received_at_lives":
+                "Top level. It is a sibling of receipt, not a member of "
+                "it. The receipt object holds three fields and no others. "
+                "Pin your schema accordingly -- the earlier version of "
+                "this document listed the three receipt fields without "
+                "saying where received_at sat, and a peer reasonably "
+                "pinned it in the wrong place.",
+            "receipt_seq":
+                "An integer, never null, incremented by exactly one for "
+                "each accepted submission FROM THIS PEER on this lane. "
+                "Issued inside the same lock that writes the record, so a "
+                "number is never spent on a submission that was not "
+                "stored. Two receipts numbered N and N+2 prove a third "
+                "exists that you did not receive. The current highest is "
+                "published per peer at /x/peer/peers, so the check does "
+                "not depend on asking us.",
+            "receipt_seq_scope": {'values': ['per-peer', 'per-name', 'per-chain'], 'per-peer': 'issued per registered peer_id. Used by /x/peer/submit.', 'per-name': 'issued per bound name. Used by /x/bind/submit.', 'per-chain': 'issued per enrolled chain name. Used by /x/signed/submit.', 'why_it_is_here': 'The three signed lanes each count within their own scope, so a receipt carries the scope of its own sequence rather than requiring the holder to remember which lane produced it. The set is closed: a value outside this list is an error on our side, not a new scope you should widen a schema for.', 'not_comparable_across_scopes': 'Two receipts with different scopes are counting different things and their numbers say nothing about each other.'},
+            "key_seq":
+                "The server-wide per-API-key sequence, which is null on "
+                "this lane and always will be. That counter lives on an "
+                "api_key and this lane authenticates by signature with no "
+                "key to count against. It is returned rather than omitted "
+                "so the absence is visible instead of inferred. Before "
+                "1.3.0 this null was reported as receipt_seq, which made "
+                "a missing property look like a broken field. Raised by "
+                "Philip Pinol (PRAXIS), correctly.",
+            "what_received_at_is":
+                "This server's clock at the moment of acceptance. It is "
+                "not evidence of when anything happened and should not be "
+                "relied on as such. The audit_hash is the evidence.",
+            "proving_what_you_received":
+                "The full response body is stored server side. A peer who "
+                "hashes the response with sha256 over "
+                "json.dumps(response, sort_keys=True, separators=(\",\","
+                "\":\"), ensure_ascii=True) can ask the operator to "
+                "compare against the stored copy via GET history.",
+        },
+        "routes": {
+            "GET spec": "public. this document.",
+            "GET schema": "public. the same response shape as a JSON Schema "
+                          "a validator can load directly, so nobody has to "
+                          "transcribe prose into rules.",
+            "POST canonical": "public. the exact string to sign.",
+            "GET peers": "public. peer ids and status. never secrets.",
+            "POST submit": "signature authenticated. no API key.",
+            "POST register": "keyed. operator issues a credential.",
+            "POST rotate": "keyed. new secret, old one overlaps.",
+            "POST suspend / POST resume": "keyed.",
+            "GET history": "keyed. submissions with the stored response "
+                           "body and its digest. Pass full=false for the "
+                           "summary only.",
+        },
+        "what_this_does_not_do": [
+            "It does not exclude the operator of this deployment. A shared "
+            "secret is held by both parties, so a valid signature means a "
+            "holder of the secret submitted - which is you and also us. "
+            "Use /x/signed/submit if that matters to you.",
+            "It does not make a submitted root true. It proves who "
+            "submitted it and when, and that it has not changed since.",
+            "It does not replace /x/witness/observe. Peers who prefer the "
+            "open path keep using it and lose nothing.",
+            "A shared secret authenticates a channel, not a person. If "
+            "the secret leaks, rotate it.",
+        ],
+        "worked_example": {
+            "envelope_before_signing": {
+                "peer_id": "example-001",
+                "ts": 1755432000,
+                "nonce": "0123456789abcdef",
+                "payload": {"period": "2026-Q3", "root": "ab12...", "count": 4096},
+            },
+            "note": "POST exactly that to /x/peer/canonical and you will "
+                    "get the string to sign, so you can confirm your "
+                    "implementation before you hold a secret.",
+        },
+        "machine_readable_schema": "/x/peer/schema",
+        "changed_in_1_4_0": [
+            "Added GET /x/peer/schema - the accepted-response shape as a "
+            "JSON Schema, additionalProperties false throughout, loadable "
+            "straight into a validator. Every failure this lane had in its "
+            "first week came from a peer transcribing a written description "
+            "into a closed schema and the two disagreeing. This removes the "
+            "transcription step.",
+        ],
+        "changed_in_1_3_2": [
+            "gapless moved out of the verify object to the top level. In "
+            "1.3.0 and 1.3.1 verify carried four keys while the spec "
+            "documented three, so a closed schema pinned to the written "
+            "shape refused a correct response. Caught by Philip Pinol "
+            "(PRAXIS). verify now carries exactly inclusion, ancestry and "
+            "append_only, as documented.",
+            "auth_scope is unchanged and is 535 bytes of prose on one "
+            "line. There is no published length limit on it and there "
+            "never has been - if you have been told otherwise, that rule "
+            "did not come from this spec.",
+        ],
+        "changed_in_1_3_1": [
+            "receipt_seq_scope is now a bare token from a closed set - "
+            "per-peer, per-name, per-chain - rather than a sentence. The "
+            "set is published under on_acceptance.receipt_seq_scope so a "
+            "closed schema can pin an enum rather than a bounded string. "
+            "Asked for by Philip Pinol (PRAXIS). Value change only; the "
+            "response shape is unchanged from 1.3.0.",
+        ],
+        "changed_in_1_3_0": [
+            "receipt_seq is now a real per-peer gapless sequence issued by "
+            "this module, not the api_key counter that was always null "
+            "here. The completeness property applies to this lane for the "
+            "first time.",
+            "The api_key counter is still returned, as key_seq, and is "
+            "null by design so the absence is stated rather than hidden.",
+            "/x/peer/peers publishes latest_receipt_seq per peer, so a "
+            "peer can detect a missing receipt without asking us.",
+        ],
+        "changed_in_1_2": [
+            "A failed seal returns 500 instead of a receipt with null "
+            "fields and ok=true. Found in production on 2026-08-26.",
+            "Operator routes report sealed true/false rather than "
+            "swallowing a seal failure.",
+            "GET history returns the stored response body and its digest.",
+            "The response shape is documented in full, including where "
+            "received_at lives.",
+        ],
+    }
+
+
+
+# ----------------------------------------------------------------------
+# machine-readable schema
+# ----------------------------------------------------------------------
+
+# The three scopes any lane on this deployment can issue a sequence in.
+# Referenced by the schema below AND by the spec prose, so the enum cannot
+# say one thing in one place and another somewhere else.
+SEQ_SCOPES = ("per-peer", "per-name", "per-chain")
+
+
+def _schema():
+    """JSON Schema for the accepted-submission response.
+
+    WHY THIS EXISTS
+        Every failure in this lane's first week was the same failure: a peer
+        transcribing a written description into a closed schema, and the
+        description and the bytes disagreeing. received_at in the wrong
+        place. key_seq at the wrong level. receipt_seq_scope pinned as an
+        identifier when it was prose. gapless inside verify when the prose
+        said three keys.
+
+        None of those were disagreements about behaviour. Every one was a
+        human reading a paragraph and writing a rule from it. So the
+        paragraph stops being the interface.
+
+        This route returns a schema a validator loads directly. Nobody
+        transcribes anything, and if the shape changes the schema changes
+        with it rather than a sentence somewhere needing to be noticed.
+
+    WHAT IT DOES NOT DO
+        It does not make the shape correct - it makes the shape STATED in a
+        form that cannot be misread. If this deployment returns something
+        the schema forbids, that is a fault here and your validator should
+        refuse it. That is the point.
+
+        additionalProperties is false on every object on purpose. A schema
+        that quietly tolerates unknown keys would have hidden the gapless
+        mistake instead of catching it.
+    """
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://sebbi.pro/x/peer/schema",
+        "title": "AILEASH-PEER-v1 accepted submission response",
+        "module_version": VERSION,
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["ok", "accepted", "peer_id", "chain_name",
+                     "payload_digest", "signed_with", "auth", "auth_scope",
+                     "received_at", "receipt", "verify", "gapless"],
+        "properties": {
+            "ok": {"const": True},
+            "accepted": {"const": True},
+            "peer_id": {"type": "string"},
+            "chain_name": {"type": ["string", "null"]},
+            "payload_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "signed_with": {"enum": ["current", "previous"]},
+            "auth": {"const": "hmac-shared-secret"},
+            "auth_scope": {
+                "type": "string",
+                "description": "Prose, not an identifier. The shared-secret "
+                               "scope paragraph. No length limit is defined "
+                               "and none should be assumed.",
+            },
+            "received_at": {
+                "type": ["string", "null"],
+                "description": "ISO 8601 Z, this server's clock at "
+                               "acceptance. TOP LEVEL, beside receipt. Not "
+                               "evidence of when anything happened.",
+            },
+            "receipt": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["audit_hash", "block_index", "receipt_seq",
+                             "receipt_seq_scope", "key_seq"],
+                "properties": {
+                    "audit_hash": {"type": "string",
+                                   "pattern": "^[0-9a-f]{64}$"},
+                    "block_index": {"type": "integer"},
+                    "receipt_seq": {"type": "integer", "minimum": 1},
+                    "receipt_seq_scope": {"enum": list(SEQ_SCOPES)},
+                    "key_seq": {
+                        "type": "null",
+                        "description": "Null on this lane and always will "
+                                       "be. Returned so the absence is "
+                                       "visible rather than inferred.",
+                    },
+                },
+            },
+            "verify": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["inclusion", "ancestry", "append_only"],
+                "properties": {
+                    "inclusion": {"type": "string"},
+                    "ancestry": {"type": "string"},
+                    "append_only": {"type": "string"},
+                },
+                "description": "Exactly three route hints. Strings, not "
+                               "structured objects.",
+            },
+            "gapless": {"type": "string"},
+            "warning": {
+                "type": "string",
+                "description": "Present ONLY when signed_with is previous.",
+            },
+            "replayed": {
+                "const": True,
+                "description": "Present ONLY on an idempotent retry.",
+            },
+            "note": {
+                "type": "string",
+                "description": "Present ONLY on an idempotent retry.",
+            },
+        },
+        "conditional_fields": {
+            "warning": "signed_with == previous",
+            "replayed": "idempotent retry",
+            "note": "idempotent retry",
+        },
+        "on_failure": {
+            "note": "Failure responses are NOT covered by this schema. They "
+                    "carry ok false with an error string, and a validator "
+                    "should branch on the status code before validating.",
+            "errors": ["malformed_envelope", "malformed_ts", "nonce_too_short",
+                       "payload_too_large", "unknown_peer", "peer_suspended",
+                       "clock_skew", "bad_signature", "idempotency_conflict",
+                       "replay", "seal_failed"],
+        },
+        "how_to_use_it": (
+            "Load this document into any JSON Schema validator and point it "
+            "at the response body. Do not transcribe it into your own rules "
+            "- transcription is what went wrong every time this lane broke."),
+        "if_we_break_it": (
+            "additionalProperties is false everywhere. If this deployment "
+            "returns a key not listed here, your validator refuses it and "
+            "that refusal is correct. Tell us; it is our fault, not a "
+            "schema you should widen."),
+    }, 200
+
+# ---------------------------------------------------------------- router
+
+def handle(method, action, data, api_key, ctx):
+    data = data or {}
+
+    if action == "spec":
+        return _spec(), 200
+    if action == "schema":
+        return _schema()
+    if action == "canonical":
+        return _canonical_route(data)
+    if action == "peers":
+        return _peers(ctx)
+    if action == "submit":
+        return _submit(ctx, data)
+
+    if not api_key:
+        return {"ok": False, "error": "api_key_required"}, 401
+
+    if action == "register":
+        return _register(ctx, data)
+    if action == "rotate":
+        return _rotate(ctx, data)
+    if action == "suspend":
+        return _set_status(ctx, data, "suspended")
+    if action == "resume":
+        return _set_status(ctx, data, "active")
+    if action == "history":
+        return _history(ctx, data)
+
+    return {"ok": False, "error": "unknown_action", "action": action}, 404
+
+```
 
 
 ## `modules/peerconsole.py`
@@ -1016,1575 +2325,5 @@ def handle(method, action, data, api_key, ctx):
     return {"ok": False, "error": "unknown_action", "action": action,
             "available": ["spec", "status", "schema", "history",
                           "canonical", "submit"]}, 404
-
-```
-
-
-## `modules/publish.py`
-
-491 lines, 21976 bytes
-
-```python
-#!/usr/bin/env python3
-"""
-modules/publish.py  -  sealing what you published, at the moment you publish it
-===============================================================================
-
-THE PROBLEM THIS EXISTS TO NEVER HAVE AGAIN
--------------------------------------------
-Somebody asks when a page was published. You answer from git history. They
-point out - correctly - that git commit dates are fields in the commit
-object which anyone can set to anything with an environment variable before
-committing. Your strongest evidence turns out to be the weakest thing in
-the room, and it drags the credible parts down with it.
-
-The fix is not a better argument. It is sealing the page the moment it goes
-live, so the question never depends on anybody's word again.
-
-WHAT THIS DOES
---------------
-    POST /x/publish/seal {"url": "https://example.com/spec"}
-
-We fetch the URL ourselves, hash exactly what was served, and seal the hash,
-the URL and the fetch time into the chain - where it is anchored externally
-and handed to peer chains like every other block.
-
-From then on:
-
-  - "this exact content was served at this address no later than T" is
-    arithmetic rather than a claim;
-  - re-sealing the same URL later builds a permanent revision history that
-    the publisher cannot edit, because each version is its own block;
-  - and anyone can check it without an account.
-
-Seal at publication and you never argue about a publication date again. That
-is the entire point, and it takes one call.
-
-WHAT IT HONESTLY CANNOT DO
---------------------------
-It cannot reach backwards. A seal made today proves the content existed
-today, not that it existed last week. Nothing can prove that - not this, not
-Bitcoin, not a notary. Timestamps are one-directional by nature.
-
-So for anything already published before it was sealed, the module records
-EXTERNAL REFERENCES alongside: a GitHub push event, a Wayback Machine
-snapshot, a DigiCert or OpenTimestamps proof. Those are stored and sealed as
-supplied. We do not verify them and we do not present them as ours - they
-are somebody else's record, named so a third party can check it at source.
-That distinction is stated in every response rather than left to be
-discovered.
-
-Two references are worth knowing about, because they are the ones that
-actually carry an earlier date:
-
-  GitHub push events   api.github.com/repos/<owner>/<repo>/events
-                       The push timestamp is recorded server-side by GitHub
-                       and cannot be set by the pusher, unlike commit dates.
-                       Retained roughly 90 days - so it must be captured
-                       while it still exists.
-
-  Wayback Machine      archive.org/wayback/available?url=...&timestamp=...
-                       An independent party with no stake in the dispute.
-                       If it caught the page, that settles it outright.
-
-FETCHING SAFELY
----------------
-This module makes the server fetch a URL. Done naively that is a hole worse
-than the one it closes. So the fetcher speaks only http and https, only on
-ports 80 and 443, resolves the hostname first and refuses any address that
-is private, loopback, link-local, reserved or multicast, never follows a
-redirect, times out fast, and stops reading after a cap. Sealing is keyed,
-so this is not an anonymous capability either.
-
-    POST /x/publish/seal      fetch, hash and seal a live URL     (keyed)
-    GET  /x/publish/history   every version ever sealed of a URL  (public)
-    GET  /x/publish/verify    was this exact content served, when (public)
-    GET  /x/publish/list      everything sealed                   (public)
-    GET  /x/publish/spec      how to check any of it              (public)
-"""
-
-import hashlib
-import ipaddress
-import re
-import socket
-import time
-import urllib.error
-import urllib.request
-from datetime import datetime, timezone
-from urllib.parse import urlparse
-
-VERSION = "1.0"
-HEX64 = re.compile(r"^[0-9a-f]{64}$")
-
-# Reading is open. A publication record only settles an argument if the
-# other side can check it without going through the publisher.
-PUBLIC = {("GET", "history"), ("GET", "verify"), ("GET", "list"),
-          ("GET", "spec")}
-
-CONTENT_PREFIX = b"AILEASH-PUBLISH-v1:"
-
-FETCH_TIMEOUT = 8
-MAX_FETCH_BYTES = 2 * 1024 * 1024
-ALLOWED_SCHEMES = ("http", "https")
-ALLOWED_PORTS = (80, 443)
-MAX_EXTERNAL = 8
-
-_ready = False
-
-
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        c = ctx["conn"]
-        c.execute("CREATE TABLE IF NOT EXISTS publish_seal("
-                  "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,url TEXT,"
-                  "content_hash TEXT,byte_length INTEGER,http_status INTEGER,"
-                  "content_type TEXT,note TEXT,external TEXT,"
-                  "fetched REAL,audit_hash TEXT,block_index INTEGER)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_pub_url ON publish_seal(url,id)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_pub_hash ON publish_seal(content_hash)")
-        c.commit()
-    _ready = True
-
-
-def _iso(ts):
-    if not ts:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
-
-# ----------------------------------------------------------------------
-# fetching - read the SSRF note above before touching any of this
-# ----------------------------------------------------------------------
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """A redirect is an instruction to fetch a second URL we never checked."""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-
-_opener = urllib.request.build_opener(_NoRedirect)
-
-
-def _address_allowed(host, port):
-    try:
-        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
-    except Exception as exc:
-        return False, "could not resolve host (%s)" % type(exc).__name__
-    if not infos:
-        return False, "host resolved to nothing"
-    for info in infos:
-        try:
-            addr = ipaddress.ip_address(info[4][0])
-        except ValueError:
-            return False, "unreadable address"
-        if (addr.is_private or addr.is_loopback or addr.is_link_local
-                or addr.is_reserved or addr.is_multicast or addr.is_unspecified):
-            return False, "address is not publicly routable"
-    return True, None
-
-
-def _url_allowed(url):
-    if not url or not isinstance(url, str) or len(url) > 500:
-        return False, "no usable url"
-    try:
-        parts = urlparse(url.strip())
-    except Exception:
-        return False, "unparseable url"
-    if parts.scheme not in ALLOWED_SCHEMES:
-        return False, "scheme not allowed"
-    if not parts.hostname:
-        return False, "no host in url"
-    port = parts.port or (443 if parts.scheme == "https" else 80)
-    if port not in ALLOWED_PORTS:
-        return False, "port not allowed"
-    return _address_allowed(parts.hostname, port)
-
-
-def _fetch(url):
-    """Returns (body_bytes, status, content_type, error)."""
-    ok, why = _url_allowed(url)
-    if not ok:
-        return None, None, None, why
-    request = urllib.request.Request(url, headers={
-        "Accept": "*/*",
-        "User-Agent": "aileash-publish/%s" % VERSION,
-    })
-    try:
-        with _opener.open(request, timeout=FETCH_TIMEOUT) as response:
-            status = response.getcode()
-            content_type = response.headers.get("Content-Type", "")
-            body = response.read(MAX_FETCH_BYTES + 1)
-    except urllib.error.HTTPError as exc:
-        return None, exc.code, None, "url answered %s" % exc.code
-    except Exception as exc:
-        return None, None, None, "could not reach url (%s)" % type(exc).__name__
-    if len(body) > MAX_FETCH_BYTES:
-        return None, status, content_type, "response larger than the %d byte cap" % MAX_FETCH_BYTES
-    return body, status, content_type, None
-
-
-def _content_hash(body):
-    """Hash exactly the bytes served. No normalisation, no cleverness -
-    a whitespace-tolerant hash would be a hash of our opinion of the page
-    rather than of the page."""
-    return hashlib.sha256(CONTENT_PREFIX + body).hexdigest()
-
-
-# ----------------------------------------------------------------------
-# seal
-# ----------------------------------------------------------------------
-
-def _clean_external(value):
-    """External references are recorded verbatim and never verified."""
-    if not isinstance(value, list):
-        return []
-    out = []
-    for item in value[:MAX_EXTERNAL]:
-        if isinstance(item, dict):
-            source = str(item.get("source", "")).strip()[:60]
-            reference = str(item.get("reference", item.get("url", ""))).strip()[:400]
-            claimed = str(item.get("claimed_time", "")).strip()[:60]
-            if source and reference:
-                out.append({"source": source, "reference": reference,
-                            "claimed_time": claimed or None})
-        elif isinstance(item, str) and item.strip():
-            out.append({"source": "unnamed", "reference": item.strip()[:400],
-                        "claimed_time": None})
-    return out
-
-
-def _seal(ctx, api_key, data):
-    url = str(data.get("url", "")).strip()
-    if not url:
-        return {"error": "url_required",
-                "message": "The address of the page you have just published."}, 400
-
-    note = str(data.get("note", "") or "").strip()[:300]
-    external = _clean_external(data.get("external"))
-
-    body, status, content_type, why = _fetch(url)
-    if why:
-        return {"error": "fetch_failed", "url": url, "message": why,
-                "note": "Nothing was sealed. A record of a page we could not read would be "
-                        "worse than no record."}, 502
-
-    digest = _content_hash(body)
-    now = time.time()
-
-    with ctx["lock"]:
-        prior = ctx["conn"].execute(
-            "SELECT content_hash,fetched,audit_hash FROM publish_seal "
-            "WHERE url=? ORDER BY id ASC", (url,)).fetchall()
-
-    unchanged = bool(prior) and prior[-1][0] == digest
-    first_of_this_version = None
-    for row in prior:
-        if row[0] == digest:
-            first_of_this_version = row[1]
-            break
-
-    external_summary = ";".join("%s=%s" % (e["source"], e["reference"][:60]) for e in external)
-    ev = {"user_id": "pub:" + digest[:16], "action": "publication_sealed", "amount": 0,
-          "country": "UK", "device_id": "publish", "anomaly": 0, "device_risk": 0}
-    res = {"decision": "PUBLICATION_SEALED", "score": 0, "publish_version": VERSION,
-           "url": url, "content_hash": digest, "bytes": len(body),
-           "http_status": status,
-           "detail": "url=%s;sha256=%s;bytes=%d%s"
-                     % (url, digest, len(body),
-                        ";external=" + external_summary if external_summary else "")}
-    audit_hash, block_index, seq = ctx["seal"](ev, res, now, api_key)
-
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "INSERT INTO publish_seal(api_key,url,content_hash,byte_length,http_status,"
-            "content_type,note,external,fetched,audit_hash,block_index) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-            (api_key, url, digest, len(body), status, content_type or None,
-             note or None,
-             "|".join("%s %s %s" % (e["source"], e["reference"], e["claimed_time"] or "")
-                      for e in external) or None,
-             now, audit_hash, block_index))
-        ctx["conn"].commit()
-
-    out = {
-        "url": url, "content_hash": digest, "bytes": len(body),
-        "http_status": status, "content_type": content_type,
-        "sealed_at": _iso(now),
-        "sealed_in_chain": audit_hash, "block_index": block_index, "receipt_seq": seq,
-        "version_number": len(prior) + 1,
-        "publish_version": VERSION,
-        "what_this_proves": "This exact content was served at this address when we fetched it, "
-                            "and the record of that cannot be altered afterwards.",
-        "what_it_does_not": "It does not prove the page existed earlier than this moment. "
-                            "Nothing can prove that after the fact - timestamps only run "
-                            "forwards. Seal at publication and the question never arises.",
-        "history": "/x/publish/history?url=" + url,
-        "verify_this_block": "/x/consistency/ancestor?tip=" + audit_hash,
-    }
-
-    if unchanged:
-        out["unchanged"] = True
-        out["first_sealed_in_this_form"] = _iso(first_of_this_version)
-        out["message"] = ("Identical to the last sealed version. The page has not changed since "
-                          "%s and now has an additional dated witness." % _iso(first_of_this_version))
-    elif prior:
-        out["changed"] = True
-        out["previous_hash"] = prior[-1][0]
-        out["previous_sealed_at"] = _iso(prior[-1][1])
-        out["message"] = ("The content has changed since the last seal. Both versions remain in "
-                          "the chain - a revision history the publisher cannot edit.")
-    else:
-        out["message"] = ("First seal for this address. Every later seal builds a permanent, "
-                          "dated revision history from here.")
-
-    if external:
-        out["external_references"] = external
-        out["external_caveat"] = ("Recorded exactly as supplied and sealed with the block. We do "
-                                  "not verify them and they are not our evidence - they are "
-                                  "somebody else's record, named so you can check them at "
-                                  "source.")
-    else:
-        out["advice"] = ("If this page was published before today, add external references - a "
-                         "GitHub push event, a Wayback snapshot - and they will be sealed "
-                         "alongside. Those carry an earlier date; a seal made now cannot.")
-    return out, 200
-
-
-# ----------------------------------------------------------------------
-# reading
-# ----------------------------------------------------------------------
-
-def _parse_external(blob):
-    if not blob:
-        return []
-    out = []
-    for line in blob.split("|"):
-        parts = line.strip().split(" ", 2)
-        if len(parts) >= 2:
-            out.append({"source": parts[0], "reference": parts[1],
-                        "claimed_time": parts[2] if len(parts) > 2 and parts[2] else None})
-    return out
-
-
-def _history(ctx, data):
-    url = str(data.get("url", "")).strip()
-    if not url:
-        return {"error": "url_required"}, 400
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT content_hash,byte_length,fetched,audit_hash,block_index,note,external "
-            "FROM publish_seal WHERE url=? ORDER BY id ASC LIMIT 500", (url,)).fetchall()
-    if not rows:
-        return {"error": "never_sealed", "url": url,
-                "message": "No seal recorded for that address."}, 404
-
-    versions, last_hash = [], None
-    for content_hash, length, fetched, audit_hash, block_index, note, external in rows:
-        versions.append({
-            "content_hash": content_hash, "bytes": length,
-            "sealed_at": _iso(fetched), "sealed_in_chain": audit_hash,
-            "block_index": block_index, "note": note,
-            "changed_from_previous": last_hash is not None and content_hash != last_hash,
-            "external_references": _parse_external(external),
-        })
-        last_hash = content_hash
-
-    distinct = len({v["content_hash"] for v in versions})
-    return {"url": url, "seals": len(versions), "distinct_versions": distinct,
-            "first_sealed": versions[0]["sealed_at"], "latest_sealed": versions[-1]["sealed_at"],
-            "current_hash": versions[-1]["content_hash"],
-            "versions": versions,
-            "publish_version": VERSION,
-            "what_this_is": "A dated revision history the publisher cannot edit. Each version is "
-                            "its own block; altering or removing one breaks every block after it.",
-            "limit": "The first seal fixes an upper bound, not a lower one. Anything published "
-                     "before its first seal rests on external evidence, which is recorded here "
-                     "but not verified by us."}, 200
-
-
-def _verify(ctx, data):
-    url = str(data.get("url", "")).strip()
-    digest = str(data.get("hash", data.get("content_hash", ""))).strip().lower()
-    if not digest or not HEX64.match(digest):
-        return {"error": "hash_required",
-                "message": "sha256 of AILEASH-PUBLISH-v1: followed by the exact bytes served"}, 400
-
-    with ctx["lock"]:
-        if url:
-            rows = ctx["conn"].execute(
-                "SELECT url,fetched,audit_hash,block_index FROM publish_seal "
-                "WHERE url=? AND content_hash=? ORDER BY id ASC", (url, digest)).fetchall()
-        else:
-            rows = ctx["conn"].execute(
-                "SELECT url,fetched,audit_hash,block_index FROM publish_seal "
-                "WHERE content_hash=? ORDER BY id ASC", (digest,)).fetchall()
-
-    if not rows:
-        return {"sealed": False, "content_hash": digest, "url": url or None,
-                "message": "We hold no seal for that exact content. Either it was never sealed, "
-                           "or the content differs from what was - a single byte is enough."}, 404
-
-    return {"sealed": True, "content_hash": digest,
-            "url": rows[0][0], "times_sealed": len(rows),
-            "first_sealed": _iso(rows[0][1]),
-            "latest_sealed": _iso(rows[-1][1]),
-            "sealed_in_chain": rows[0][2], "block_index": rows[0][3],
-            "publish_version": VERSION,
-            "what_this_proves": "Content with exactly this fingerprint was served at that "
-                                "address no later than the first sealing time, and the record "
-                                "of it has not been altered since.",
-            "verify_the_block": "/x/consistency/ancestor?tip=" + rows[0][2]}, 200
-
-
-def _list(ctx):
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT url,COUNT(*),MIN(fetched),MAX(fetched),COUNT(DISTINCT content_hash) "
-            "FROM publish_seal GROUP BY url ORDER BY MAX(fetched) DESC LIMIT 500").fetchall()
-    return {"count": len(rows),
-            "pages": [{"url": r[0], "seals": r[1], "first_sealed": _iso(r[2]),
-                       "latest_sealed": _iso(r[3]), "distinct_versions": r[4],
-                       "history": "/x/publish/history?url=" + r[0]} for r in rows],
-            "publish_version": VERSION,
-            "note": "Everything this platform has sealed about its own published pages. Ours is "
-                    "in here too - a publisher who seals everyone's pages but not their own is "
-                    "telling you something."}, 200
-
-
-def _spec():
-    return {
-        "publish_version": VERSION,
-        "content_hash": "sha256('AILEASH-PUBLISH-v1:' || exact_bytes_served) as lowercase hex",
-        "no_normalisation": "The bytes are hashed exactly as served. Nothing is trimmed, "
-                            "reordered or cleaned up first - a whitespace-tolerant hash would "
-                            "be a hash of our opinion of the page rather than of the page.",
-        "reproduce_it": "curl the URL, pipe the raw bytes through sha256 with that prefix, and "
-                        "compare with what we sealed. If your bytes differ, the page changed.",
-        "what_a_seal_proves": "That content with this exact fingerprint was served at this "
-                              "address no later than the sealing time, and that the record has "
-                              "not been altered since - it is a chain block like any other, "
-                              "anchored externally and witnessed by peers.",
-        "what_it_cannot_prove": "That the page existed before the seal. Timestamps run forwards "
-                                "only. Any product implying otherwise is misdescribing what a "
-                                "timestamp is.",
-        "for_earlier_dates": {
-            "github_push": "api.github.com/repos/<owner>/<repo>/events - the push timestamp is "
-                           "recorded by GitHub, not the pusher, unlike commit author and "
-                           "committer dates which are settable fields. Retained around 90 days, "
-                           "so capture it while it exists.",
-            "wayback": "archive.org/wayback/available - an independent party with no stake in "
-                       "the dispute.",
-            "status": "Both are recorded and sealed as supplied, and neither is verified by us. "
-                      "They are somebody else's evidence, named so you can check them at source.",
-        },
-        "the_discipline": "Seal at publication. One call at the moment a page goes live means "
-                          "the publication date never rests on anyone's word, anyone's git "
-                          "history, or anyone's memory again.",
-    }, 200
-
-
-# ----------------------------------------------------------------------
-# router entry point
-# ----------------------------------------------------------------------
-
-def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-    action = (action or "").strip("/").lower()
-    data = data or {}
-
-    if method == "GET":
-        if action == "spec":
-            return _spec()
-        if action == "history":
-            return _history(ctx, data)
-        if action == "verify":
-            return _verify(ctx, data)
-        if action == "list":
-            return _list(ctx)
-
-    if method == "POST":
-        if not api_key:
-            return {"error": "invalid_api_key"}, 401
-        if action == "seal":
-            return _seal(ctx, api_key, data)
-
-    return {"error": "unknown_action", "action": action,
-            "GET": ["spec", "history", "verify", "list"],
-            "POST": ["seal (keyed)"]}, 404
-
-```
-
-
-## `modules/ratchet.py`
-
-615 lines, 25928 bytes
-
-```python
-"""
-ratchet.py - time only runs one way for the machine.
-
-WHAT THIS IS FOR
-----------------
-heartbeat.py proves WHEN a record can have been made. sortition.py proves
-NOBODY CHOSE what got reviewed. This one proves an actor cannot move
-backwards through time.
-
-Every action an agent takes is bound to the beacon round current at the
-moment it acted. Beacon rounds only ever increase. So an actor's actions
-form a strictly rising ladder, and the rule is one line:
-
-    an action carrying a beacon round at or below the actor's last
-    recorded round is REFUSED.
-
-WHAT THAT KILLS, WITHOUT A POLICY, A PROMPT OR A PROMISE
---------------------------------------------------------
-BACKDATING     An agent cannot produce an action claiming to sit earlier
-               than one it already took. The earlier round is already
-               spent.
-REPLAY         Capture a valid action and fire it again later: the round
-               is stale and the digest is already on the ladder.
-PRE-COMPUTATION
-               An agent cannot prepare a batch of actions in advance,
-               because it cannot know tomorrow's beacon values today. A
-               round that has not been sealed here yet is refused.
-REWIND         Restore an agent from an old snapshot to undo its history
-               and its next action lands below the recorded floor. The
-               ladder is in a chain the agent does not control, so
-               restoring the agent does not restore its position.
-
-REFUSALS ARE SEALED, NOT DROPPED
---------------------------------
-This is the part that matters. A refused action is written into the chain
-with the reason. An agent trying to rewind is the single most interesting
-event this system can observe, and throwing it away as a 409 would be
-throwing away the evidence. /x/ratchet/refusals is public.
-
-HONEST LIMITS
--------------
-- It binds an actor's actions to an order. It says nothing about whether
-  any action was correct, authorised, or wise.
-- An actor that simply stops acting cannot be forced to continue. Silence
-  is visible (last_seen goes stale) but is not prevented.
-- Two different actor ids are two different ladders. Anyone able to mint
-  new actor ids can start a fresh ladder; that is an identity problem,
-  handled by whatever issues the ids, not here.
-- The floor is only as fine-grained as the beat cadence. At a five
-  minute cadence, two actions inside the same beat are ordered by
-  sequence, not by beacon time, and that is reported rather than dressed
-  up.
-- It depends on heartbeat. With no beats sealed, nothing can be admitted,
-  and this module says so rather than waving actions through.
-
-Contract: handle(method, action, data, api_key, ctx) -> (dict, status)
-Routes:
-  GET  spec      public  what this is and the exact admission rules
-  GET  actor     public  ?id= - one actor's current rung and ladder
-  GET  actors    public  every ladder, with staleness
-  GET  refusals  public  every refused attempt, with reason. The good bit.
-  GET  verify    public  ?id= - re-walk a ladder and report any break
-  GET  status    public  coverage, admission and refusal counts
-  POST act       keyed   submit an action. Admitted or refused; both sealed.
-"""
-
-import json
-import time
-import hashlib
-
-VERSION = "1.0.0"
-
-PUBLIC = {
-    ("GET", "spec"),
-    ("GET", "actor"),
-    ("GET", "actors"),
-    ("GET", "refusals"),
-    ("GET", "verify"),
-    ("GET", "status"),
-}
-
-MAX_LAG_BEATS = 3          # how far behind the newest beat an action may be
-MAX_ACTOR_LEN = 120
-STALE_SECONDS = 3600
-
-REASONS = {
-    "ok": "Admitted. The round is ahead of this actor's last rung.",
-    "no_beats": (
-        "Refused: no beacon has been sealed on this server, so there is no "
-        "time to bind to. Nothing is admitted on trust."),
-    "round_unknown": (
-        "Refused: that beacon round has not been sealed here. Either it has "
-        "not happened yet - which would mean the actor knew a value before "
-        "it existed - or this server has not observed it."),
-    "round_not_advanced": (
-        "Refused: the round is at or below this actor's last rung. This is "
-        "the ratchet. An actor cannot move backwards through beacon time, "
-        "whether by backdating, by replay, or by being restored from an "
-        "older snapshot."),
-    "round_too_stale": (
-        "Refused: the round is further behind the current beat than the "
-        "permitted lag. An action bound to old time is a replay or a very "
-        "slow actor; both are refused and both are recorded."),
-    "digest_replayed": (
-        "Refused: this exact action digest is already on this actor's "
-        "ladder. Identical work resubmitted is a replay by definition."),
-    "bad_request": "Refused: malformed submission.",
-}
-
-WHAT_THIS_PROVES = (
-    "That an actor's recorded actions only ever moved forward in a public "
-    "time nobody controls. It does not prove any action was correct, "
-    "authorised, or sensible."
-)
-
-DDL = [
-    """CREATE TABLE IF NOT EXISTS ratchet_rung (
-        id            INTEGER PRIMARY KEY AUTOINCREMENT,
-        actor         TEXT NOT NULL,
-        seq           INTEGER NOT NULL,
-        beacon_round  INTEGER NOT NULL,
-        beacon_value  TEXT,
-        digest        TEXT NOT NULL,
-        label         TEXT,
-        at            REAL NOT NULL,
-        chain_rowid   INTEGER,
-        audit_hash    TEXT
-    )""",
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_rat_seq ON ratchet_rung(actor, seq)",
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_rat_dig ON ratchet_rung(actor, digest)",
-    "CREATE INDEX IF NOT EXISTS idx_rat_actor ON ratchet_rung(actor)",
-    """CREATE TABLE IF NOT EXISTS ratchet_refusal (
-        id            INTEGER PRIMARY KEY AUTOINCREMENT,
-        actor         TEXT NOT NULL,
-        claimed_round INTEGER,
-        last_round    INTEGER,
-        digest        TEXT,
-        reason        TEXT NOT NULL,
-        at            REAL NOT NULL,
-        chain_rowid   INTEGER,
-        audit_hash    TEXT
-    )""",
-    "CREATE INDEX IF NOT EXISTS idx_rat_ref ON ratchet_refusal(actor)",
-]
-
-
-# ---------------------------------------------------------------------
-# plumbing
-# ---------------------------------------------------------------------
-
-def _ensure(conn, lock):
-    with lock:
-        cur = conn.cursor()
-        for stmt in DDL:
-            cur.execute(stmt)
-        conn.commit()
-
-
-def _iso(t):
-    if t is None:
-        return None
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
-
-
-def _human(seconds):
-    if seconds is None:
-        return None
-    s = int(round(seconds))
-    if s < 60:
-        return "%d seconds" % s
-    if s < 3600:
-        return "%d minutes" % (s // 60)
-    if s < 86400:
-        return "%d hours" % (s // 3600)
-    return "%d days" % (s // 86400)
-
-
-def _seal(ctx, action, payload):
-    """server.py: seal(event, result, ts, api_key=None); event is a DICT
-    carrying user_id; returns (audit_hash, block_index, key_seq)."""
-    fn = ctx.get("seal")
-    if fn is None:
-        return None, None
-    ts = time.time()
-    event = {"user_id": "ratchet", "action": action, "amount": 0,
-             "country": "UK", "device_id": "ratchet", "anomaly": 0,
-             "device_risk": 0}
-    result = dict(payload)
-    result.setdefault("decision", "RATCHET")
-    result.setdefault("score", 0)
-    result.setdefault("version", VERSION)
-    result.setdefault("timestamp", ts)
-    for call in (lambda: fn(event, result, ts),
-                 lambda: fn(event, result, ts, None),
-                 lambda: fn(event, result)):
-        try:
-            out = call()
-        except TypeError:
-            continue
-        except Exception:
-            return None, None
-        h = idx = None
-        if isinstance(out, (tuple, list)):
-            for item in out:
-                if isinstance(item, str) and len(item) == 64 and h is None:
-                    h = item
-                elif isinstance(item, int) and idx is None:
-                    idx = item
-        elif isinstance(out, str):
-            h = out
-        return h, idx
-    return None, None
-
-
-def _newest_beat(conn):
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT beacon_round, value, fetched_at FROM heartbeat_tick"
-                    " WHERE chain_rowid IS NOT NULL AND beacon_round IS NOT NULL"
-                    " ORDER BY beacon_round DESC LIMIT 1")
-        return cur.fetchone()
-    except Exception:
-        return None
-
-
-def _beat(conn, rnd):
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT beacon_round, value, fetched_at FROM heartbeat_tick"
-                    " WHERE beacon_round=? AND chain_rowid IS NOT NULL LIMIT 1",
-                    (rnd,))
-        return cur.fetchone()
-    except Exception:
-        return None
-
-
-def _beats_between(conn, low, high):
-    """How many sealed beats sit in (low, high]. Used for the lag check."""
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM heartbeat_tick WHERE chain_rowid IS"
-                    " NOT NULL AND beacon_round>? AND beacon_round<=?",
-                    (low, high))
-        return cur.fetchone()[0]
-    except Exception:
-        return 0
-
-
-def _top(conn, actor):
-    cur = conn.cursor()
-    cur.execute("SELECT seq, beacon_round, digest, at FROM ratchet_rung"
-                " WHERE actor=? ORDER BY seq DESC LIMIT 1", (actor,))
-    return cur.fetchone()
-
-
-def _refuse(ctx, conn, lock, actor, rnd, last, digest, reason, extra=None):
-    now = time.time()
-    with lock:
-        cur = conn.cursor()
-        cur.execute("INSERT INTO ratchet_refusal (actor, claimed_round,"
-                    " last_round, digest, reason, at) VALUES (?,?,?,?,?,?)",
-                    (actor, rnd, last, digest, reason, now))
-        rid = cur.lastrowid
-        conn.commit()
-    h, idx = _seal(ctx, "ratchet_refused", {
-        "kind": "ratchet_refusal", "actor": actor, "claimed_round": rnd,
-        "last_admitted_round": last, "digest": digest, "reason": reason,
-        "explanation": REASONS.get(reason, reason),
-        "note": ("A refused action is sealed rather than discarded. An actor "
-                 "attempting to move backwards is the most interesting event "
-                 "this module can observe."),
-    })
-    if h or idx:
-        with lock:
-            conn.execute("UPDATE ratchet_refusal SET chain_rowid=?,"
-                         " audit_hash=? WHERE id=?", (idx, h, rid))
-            conn.commit()
-    out = {
-        "admitted": False,
-        "reason": reason,
-        "explanation": REASONS.get(reason, reason),
-        "actor": actor,
-        "claimed_round": rnd,
-        "last_admitted_round": last,
-        "refusal_sealed_at_block": idx,
-        "refusal_audit_hash": h,
-        "this_refusal_is_permanent": True,
-        "public_record": "/x/ratchet/refusals",
-    }
-    if extra:
-        out.update(extra)
-    return out
-
-
-# ---------------------------------------------------------------------
-# handle
-# ---------------------------------------------------------------------
-
-def handle(method, action, data, api_key, ctx):
-    conn, lock = ctx["conn"], ctx["lock"]
-    _ensure(conn, lock)
-
-    if method == "GET" and action == "spec":
-        return _spec(), 200
-
-    # -------------------------------------------------- act
-    if method == "POST" and action == "act":
-        actor = str(data.get("actor") or "").strip().lower()[:MAX_ACTOR_LEN]
-        digest = str(data.get("digest") or "").strip().lower()
-        label = str(data.get("label") or "")[:200] or None
-        rnd = data.get("round")
-
-        if not actor:
-            return {"error": "actor_required",
-                    "note": "A stable identifier for the acting agent."}, 400
-        if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
-            return {"error": "digest_required",
-                    "note": ("A SHA-256 of the action. The action itself never "
-                             "leaves your system.")}, 400
-
-        newest = _newest_beat(conn)
-        if not newest:
-            top = _top(conn, actor)
-            return _refuse(ctx, conn, lock, actor, rnd,
-                           top[1] if top else None, digest, "no_beats"), 503
-
-        newest_round = newest[0]
-        if rnd is None:
-            rnd = newest_round          # bind to now if the caller does not say
-        try:
-            rnd = int(rnd)
-        except (TypeError, ValueError):
-            return {"error": "round_invalid"}, 400
-
-        top = _top(conn, actor)
-        last_round = top[1] if top else None
-        last_seq = top[0] if top else 0
-
-        if not _beat(conn, rnd):
-            return _refuse(ctx, conn, lock, actor, rnd, last_round, digest,
-                           "round_unknown",
-                           {"newest_sealed_round": newest_round}), 409
-
-        if last_round is not None and rnd <= last_round:
-            return _refuse(ctx, conn, lock, actor, rnd, last_round, digest,
-                           "round_not_advanced",
-                           {"the_rule": ("beacon round must be strictly greater "
-                                         "than the actor's last rung")}), 409
-
-        lag = _beats_between(conn, rnd, newest_round)
-        if lag > MAX_LAG_BEATS:
-            return _refuse(ctx, conn, lock, actor, rnd, last_round, digest,
-                           "round_too_stale",
-                           {"beats_behind": lag,
-                            "max_lag_beats": MAX_LAG_BEATS,
-                            "newest_sealed_round": newest_round}), 409
-
-        cur = conn.cursor()
-        cur.execute("SELECT seq FROM ratchet_rung WHERE actor=? AND digest=?",
-                    (actor, digest))
-        if cur.fetchone():
-            return _refuse(ctx, conn, lock, actor, rnd, last_round, digest,
-                           "digest_replayed"), 409
-
-        beat = _beat(conn, rnd)
-        now = time.time()
-        seq = last_seq + 1
-        with lock:
-            cur = conn.cursor()
-            cur.execute("INSERT INTO ratchet_rung (actor, seq, beacon_round,"
-                        " beacon_value, digest, label, at)"
-                        " VALUES (?,?,?,?,?,?,?)",
-                        (actor, seq, rnd, beat[1], digest, label, now))
-            rid = cur.lastrowid
-            conn.commit()
-
-        h, idx = _seal(ctx, "ratchet_step", {
-            "kind": "ratchet_step", "actor": actor, "seq": seq,
-            "beacon_round": rnd, "beacon_value": beat[1], "digest": digest,
-            "label": label, "previous_round": last_round,
-            "note": ("Bound to a public beacon value the actor could not have "
-                     "known before that round existed."),
-        })
-        if h or idx:
-            with lock:
-                conn.execute("UPDATE ratchet_rung SET chain_rowid=?,"
-                             " audit_hash=? WHERE id=?", (idx, h, rid))
-                conn.commit()
-
-        return {
-            "admitted": True, "actor": actor, "seq": seq,
-            "beacon_round": rnd, "beacon_value": beat[1],
-            "previous_round": last_round, "digest": digest,
-            "sealed_at_block": idx, "audit_hash": h,
-            "floor": ("This action cannot have been created before beacon "
-                      "round %d at %s." % (rnd, _iso(beat[2]))),
-            "ratchet": ("This actor can no longer act at or below round %d. "
-                        "That door is shut permanently." % rnd),
-            "verify_beacon": "/x/heartbeat/verify?round=%d" % rnd,
-        }, 200
-
-    # -------------------------------------------------- actor
-    if method == "GET" and action == "actor":
-        actor = str(data.get("id") or "").strip().lower()
-        if not actor:
-            return {"error": "id_required",
-                    "usage": "/x/ratchet/actor?id=<actor>"}, 400
-        cur = conn.cursor()
-        cur.execute("SELECT seq, beacon_round, digest, label, at, chain_rowid,"
-                    " audit_hash FROM ratchet_rung WHERE actor=? ORDER BY seq",
-                    (actor,))
-        rungs = cur.fetchall()
-        if not rungs:
-            return {"actor": actor, "rungs": 0,
-                    "message": "No ladder for this actor."}, 404
-        cur.execute("SELECT COUNT(*) FROM ratchet_refusal WHERE actor=?", (actor,))
-        refused = cur.fetchone()[0]
-        last = rungs[-1]
-        age = time.time() - last[4]
-        return {
-            "actor": actor,
-            "rungs": len(rungs),
-            "current_round": last[1],
-            "current_seq": last[0],
-            "last_action_at": _iso(last[4]),
-            "seconds_since": round(age, 1),
-            "status": "current" if age < STALE_SECONDS else "silent",
-            "refusals": refused,
-            "ladder": [{"seq": r[0], "round": r[1], "digest": r[2],
-                        "label": r[3], "at": _iso(r[4]), "block": r[5],
-                        "audit_hash": r[6]} for r in rungs[-50:]],
-            "floor_now": ("This actor cannot act at or below round %d."
-                          % last[1]),
-            "what_this_proves": WHAT_THIS_PROVES,
-        }, 200
-
-    # -------------------------------------------------- actors
-    if method == "GET" and action == "actors":
-        now = time.time()
-        cur = conn.cursor()
-        cur.execute("SELECT actor, COUNT(*), MAX(beacon_round), MAX(at)"
-                    " FROM ratchet_rung GROUP BY actor ORDER BY MAX(at) DESC")
-        out = []
-        for a, n, rnd, at in cur.fetchall():
-            cur2 = conn.cursor()
-            cur2.execute("SELECT COUNT(*) FROM ratchet_refusal WHERE actor=?", (a,))
-            out.append({"actor": a, "rungs": n, "current_round": rnd,
-                        "last_action": _iso(at),
-                        "silent_for": _human(now - at) if now - at > STALE_SECONDS else None,
-                        "refusals": cur2.fetchone()[0]})
-        return {"count": len(out), "actors": out,
-                "note": ("Silence is visible but not prevented. An actor that "
-                         "stops acting simply stops, and no design fixes "
-                         "that.")}, 200
-
-    # -------------------------------------------------- refusals
-    if method == "GET" and action == "refusals":
-        try:
-            limit = min(int(data.get("limit", 100)), 500)
-        except (TypeError, ValueError):
-            limit = 100
-        cur = conn.cursor()
-        cur.execute("SELECT actor, claimed_round, last_round, digest, reason,"
-                    " at, chain_rowid, audit_hash FROM ratchet_refusal"
-                    " ORDER BY id DESC LIMIT ?", (limit,))
-        rows = cur.fetchall()
-        mix = {}
-        for r in rows:
-            mix[r[4]] = mix.get(r[4], 0) + 1
-        return {
-            "count": len(rows),
-            "by_reason": mix,
-            "refusals": [{"actor": r[0], "claimed_round": r[1],
-                          "last_admitted_round": r[2], "digest": r[3],
-                          "reason": r[4], "explanation": REASONS.get(r[4], r[4]),
-                          "at": _iso(r[5]), "block": r[6], "audit_hash": r[7]}
-                         for r in rows],
-            "why_this_is_public": (
-                "A refused action is sealed rather than discarded, and the "
-                "list is open. An actor attempting to move backwards through "
-                "time is the single most interesting thing this system can "
-                "see, and hiding it would defeat the point of building it."),
-        }, 200
-
-    # -------------------------------------------------- verify
-    if method == "GET" and action == "verify":
-        actor = str(data.get("id") or "").strip().lower()
-        if not actor:
-            return {"error": "id_required"}, 400
-        cur = conn.cursor()
-        cur.execute("SELECT seq, beacon_round, beacon_value, digest FROM"
-                    " ratchet_rung WHERE actor=? ORDER BY seq", (actor,))
-        rungs = cur.fetchall()
-        if not rungs:
-            return {"error": "unknown_actor", "actor": actor}, 404
-        breaks = []
-        prev_seq = 0
-        prev_round = None
-        seen = set()
-        for seq, rnd, val, dig in rungs:
-            if seq != prev_seq + 1:
-                breaks.append({"at_seq": seq, "fault": "sequence_gap",
-                               "expected": prev_seq + 1})
-            if prev_round is not None and rnd <= prev_round:
-                breaks.append({"at_seq": seq, "fault": "round_did_not_advance",
-                               "round": rnd, "previous": prev_round})
-            if dig in seen:
-                breaks.append({"at_seq": seq, "fault": "duplicate_digest"})
-            b = _beat(conn, rnd)
-            if not b:
-                breaks.append({"at_seq": seq, "fault": "beacon_round_not_sealed",
-                               "round": rnd})
-            elif b[1] != val:
-                breaks.append({"at_seq": seq, "fault": "beacon_value_mismatch",
-                               "round": rnd})
-            seen.add(dig)
-            prev_seq, prev_round = seq, rnd
-        return {
-            "actor": actor, "rungs": len(rungs), "intact": not breaks,
-            "breaks": breaks,
-            "checked": ["sequence has no gaps",
-                        "beacon round strictly increases",
-                        "no digest appears twice",
-                        "each rung's beacon value matches the sealed beat"],
-            "do_it_without_us": (
-                "Every beacon round on the ladder is re-fetchable from the "
-                "beacon operator. Confirm each value there, then confirm each "
-                "audit_hash is in the chain at /api/verify-chain. Neither step "
-                "needs our cooperation."),
-            "what_this_proves": WHAT_THIS_PROVES,
-        }, 200
-
-    # -------------------------------------------------- status
-    if method == "GET" and action == "status":
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*), COUNT(DISTINCT actor) FROM ratchet_rung")
-        rungs, actors = cur.fetchone()
-        cur.execute("SELECT COUNT(*) FROM ratchet_refusal")
-        refused = cur.fetchone()[0]
-        cur.execute("SELECT reason, COUNT(*) FROM ratchet_refusal GROUP BY reason")
-        mix = {r[0]: r[1] for r in cur.fetchall()}
-        newest = _newest_beat(conn)
-        return {
-            "version": VERSION,
-            "actors": actors, "rungs_admitted": rungs,
-            "actions_refused": refused,
-            "refusals_by_reason": mix,
-            "current_beacon_round": newest[0] if newest else None,
-            "beacon_available": newest is not None,
-            "max_lag_beats": MAX_LAG_BEATS,
-            "depends_on": {
-                "heartbeat": ("supplies the time. With no beats sealed, "
-                              "nothing is admitted - actions are refused "
-                              "rather than waved through on trust."),
-            },
-            "what_this_proves": WHAT_THIS_PROVES,
-        }, 200
-
-    return {"error": "unknown_action", "action": action,
-            "actions": ["spec", "actor", "actors", "refusals", "verify",
-                        "status", "act"]}, 404
-
-
-def _spec():
-    return {
-        "module": "ratchet",
-        "version": VERSION,
-        "one_line": "Time only runs one way for the machine.",
-        "the_rule": (
-            "An action carrying a beacon round at or below the actor's last "
-            "recorded round is refused. Beacon rounds only increase, so an "
-            "actor's ladder only rises."),
-        "what_it_kills": {
-            "backdating": "the earlier round is already spent",
-            "replay": "stale round, and the digest is already on the ladder",
-            "pre_computation": ("an unsealed future round is refused, and "
-                                "nobody can know a beacon value early"),
-            "rewind": ("the ladder lives in a chain the actor does not "
-                       "control, so restoring an agent from a snapshot does "
-                       "not restore its position"),
-        },
-        "admission_rules_in_order": [
-            "1. A beat must exist. No beats, nothing admitted.",
-            "2. The claimed round must already be sealed here.",
-            "3. The round must be strictly above the actor's last rung.",
-            "4. The round must be within %d beats of the newest." % MAX_LAG_BEATS,
-            "5. The digest must not already be on this actor's ladder.",
-        ],
-        "refusals_are_sealed": (
-            "A refused action is written into the chain with its reason and "
-            "published at /x/ratchet/refusals. Discarding it would throw away "
-            "the most interesting evidence the system can produce."),
-        "privacy": (
-            "Only a SHA-256 of the action is submitted. The action itself, "
-            "its inputs and its outputs never leave the caller's system."),
-        "what_this_proves": WHAT_THIS_PROVES,
-        "limits": [
-            "It proves order, not correctness, authority or good judgement.",
-            "An actor that stops acting is visible but not prevented.",
-            "New actor ids start new ladders; identity is not this module's "
-            "problem and it does not pretend otherwise.",
-            "Within a single beat, actions are ordered by sequence rather "
-            "than by beacon time. At a five minute cadence that is a five "
-            "minute grain, and it is reported rather than dressed up.",
-        ],
-        "routes": {
-            "POST /x/ratchet/act": "keyed - submit an action digest",
-            "GET /x/ratchet/actor?id=": "one ladder",
-            "GET /x/ratchet/actors": "every ladder",
-            "GET /x/ratchet/refusals": "every refused attempt and why",
-            "GET /x/ratchet/verify?id=": "re-walk a ladder",
-            "GET /x/ratchet/status": "counts and current round",
-        },
-    }
-
-```
-
-
-## `modules/reconcile.py`
-
-440 lines, 20123 bytes
-
-```python
-"""
-Reconciliation notary - /x/reconcile/<action>
-
-THE PROBLEM THIS ATTACKS
-------------------------
-A sealed chain proves records were not altered after the fact. It does not
-prove they were true when written. An operator who seals fiction on time has
-a tamper-evident chain of fiction. Every honest person in this market knows
-that, and almost nobody says it.
-
-You cannot prove truth from outside a system. What you CAN do is what real
-auditors do: substantive testing. Take the sealed claim, go to the operator's
-own live system, and check whether the two agree - then seal the result of
-that check, including the failures.
-
-WHY THIS ONE IS DIFFERENT
--------------------------
-The sample is fixed before the operator sees it.
-
-/plan derives a selection seed from the current chain tip - a value the
-operator cannot predict in advance and cannot change afterwards without
-breaking the chain - picks the records to be tested, and seals that selection
-BEFORE any data is requested. Only then are the record identifiers returned.
-
-So the operator cannot choose which records get examined, cannot prepare only
-the flattering ones, and cannot quietly drop a test that came back badly:
-every planned run is sealed at the moment it is planned, and a plan with no
-submitted result is visible forever as an abandoned test.
-
-Mismatches are sealed with the same permanence as matches. That is the whole
-design. A reconciliation system that can bury its own failures is decoration.
-
-WHAT A PASS ACTUALLY MEANS
---------------------------
-That two systems the operator controls agree with each other, on records the
-operator could not choose, at a time the operator could not pick.
-
-That is not proof of truth. An operator who fabricates consistently across
-every system, in real time, without knowing what will be sampled, will pass.
-What it does is raise the cost of lying from "edit one database" to
-"maintain a coherent parallel reality across independent systems indefinitely,
-under unpredictable sampling, with every failure sealed permanently."
-
-That is the honest claim. It is also, as far as I know, more than anyone else
-in this market is doing.
-
-HONEST LIMITS
--------------
-- Consistency is not truth. Two agreeing systems can both be wrong.
-- The operator supplies the comparison data. This tests their systems against
-  each other, not against the world.
-- Sampling only covers what has been sealed. It cannot find a decision that
-  was never recorded at all - gapless receipts are what cover that.
-- A high match rate on a badly chosen field proves nothing. Reconcile the
-  fields that would hurt to get wrong.
-
-    POST /x/reconcile/plan     sample_size, field  - seals the selection first
-    POST /x/reconcile/submit   run_id, results     - seals the comparison
-    GET  /x/reconcile/run?id=RUN-XXXXXXXX
-    GET  /x/reconcile/score
-    GET  /x/reconcile/list
-"""
-
-import hashlib, json, time
-from datetime import datetime, timezone
-
-VERSION = "1.1"
-MAX_SAMPLE = 200
-
-# Planning and submitting stay keyed - they touch an operator's own records.
-# What is public is the part that decides whether any of it means anything:
-# that the sample was fixed before the data was asked for, and that failures
-# were sealed as permanently as passes.
-PUBLIC = {("GET", "public"), ("GET", "proof")}
-
-_ready = False
-
-
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        ctx["conn"].execute("CREATE TABLE IF NOT EXISTS reconcile_runs(run_id TEXT PRIMARY KEY,api_key TEXT,field TEXT,seed TEXT,planned REAL,submitted REAL,sample_size INTEGER,matched INTEGER,mismatched INTEGER,missing INTEGER,status TEXT DEFAULT 'planned',block_ids TEXT,detail TEXT)")
-        ctx["conn"].execute("CREATE INDEX IF NOT EXISTS idx_rec_key ON reconcile_runs(api_key)")
-        ctx["conn"].commit()
-    _ready = True
-
-
-def _iso(ts):
-    if not ts:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
-
-def _sha(s):
-    return hashlib.sha256(s.encode()).hexdigest()
-
-
-def _seal_event(ctx, api_key, rid, action, detail):
-    ts = time.time()
-    ev = {"user_id": "rec:" + rid, "action": "reconcile_" + action, "amount": 0,
-          "country": "UK", "device_id": "reconcile", "anomaly": 0, "device_risk": 0}
-    res = {"decision": "RECONCILE_SEALED", "score": 0, "reconcile_action": action,
-           "reconcile_version": VERSION, "timestamp": ts, "detail": detail}
-    h, idx, seq = ctx["seal"](ev, res, ts, api_key)
-    return h, idx, seq, ts
-
-
-def _plan(ctx, api_key, data):
-    try:
-        n = int(data.get("sample_size", 25))
-    except Exception:
-        return {"error": "invalid_sample_size"}, 400
-    if n < 1 or n > MAX_SAMPLE:
-        return {"error": "sample_size_out_of_range", "max": MAX_SAMPLE}, 400
-    field = str(data.get("field", "decision")).strip()[:60] or "decision"
-
-    with ctx["lock"]:
-        tiprow = ctx["conn"].execute("SELECT audit_hash FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()
-        rows = ctx["conn"].execute("SELECT id,user_id,result_json,ts FROM audit_log WHERE api_key=? ORDER BY id ASC", (api_key,)).fetchall()
-
-    if not rows:
-        return {"error": "nothing_to_reconcile",
-                "message": "No sealed records under this key yet."}, 400
-
-    tip = tiprow[0] if tiprow else "GENESIS"
-    ts = time.time()
-    # Seed is bound to the chain tip. The operator cannot know it before the
-    # records exist, and cannot alter it afterwards without breaking the chain.
-    seed = _sha(tip + ":" + str(int(ts)) + ":" + field + ":" + str(n))
-
-    # Deterministic selection from the seed - reproducible by anyone holding it.
-    scored = sorted(rows, key=lambda r: _sha(seed + ":" + str(r[0])))
-    picked = scored[:min(n, len(scored))]
-
-    rid = "RUN-" + seed[:8].upper()
-    block_ids = [p[0] for p in picked]
-
-    sample = []
-    for bid, uid, res_json, bts in picked:
-        try:
-            r = json.loads(res_json)
-            sealed_val = r.get(field)
-        except Exception:
-            sealed_val = None
-        sample.append({"block_index": bid, "record_id": uid,
-                       "sealed_at": _iso(bts),
-                       "sealed_value_sha256": _sha(str(sealed_val))})
-
-    detail = ("field=" + field + ";sample_size=" + str(len(picked)) +
-              ";seed=" + seed + ";from_tip=" + tip +
-              ";blocks=" + ",".join(str(b) for b in block_ids[:60]))
-    h, idx, seq, _x = _seal_event(ctx, api_key, rid, "planned", detail)
-
-    with ctx["lock"]:
-        ctx["conn"].execute("INSERT OR REPLACE INTO reconcile_runs(run_id,api_key,field,seed,planned,submitted,sample_size,matched,mismatched,missing,status,block_ids,detail) VALUES(?,?,?,?,?,NULL,?,NULL,NULL,NULL,'planned',?,NULL)",
-                            (rid, api_key, field, seed, ts, len(picked), json.dumps(block_ids)))
-        ctx["conn"].commit()
-
-    return {"run_id": rid, "field": field, "sample_size": len(picked),
-            "seed": seed, "derived_from_tip": tip, "planned_at": _iso(ts),
-            "audit_hash": h, "block_index": idx, "receipt_seq": seq,
-            "sample": sample,
-            "next": "Fetch these record_ids from your own live system and POST them to /x/reconcile/submit",
-            "note": "This selection is now sealed. It cannot be changed, and an unsubmitted plan stays visible as an abandoned test."}, 200
-
-
-def _submit(ctx, api_key, data):
-    rid = str(data.get("run_id", "")).strip().upper()
-    with ctx["lock"]:
-        row = ctx["conn"].execute("SELECT field,seed,status,block_ids FROM reconcile_runs WHERE run_id=? AND api_key=?", (rid, api_key)).fetchone()
-    if not row:
-        return {"error": "unknown_run_id"}, 404
-    if row[2] != "planned":
-        return {"error": "already_submitted",
-                "message": "A run is reconciled once. Re-running until it passes is not reconciliation."}, 400
-
-    results = data.get("results")
-    if not isinstance(results, dict) or not results:
-        return {"error": "results_required",
-                "message": "Send {block_index: live_value} from your own system."}, 400
-
-    field = row[0]
-    block_ids = json.loads(row[3])
-
-    with ctx["lock"]:
-        rows = ctx["conn"].execute("SELECT id,user_id,result_json FROM audit_log WHERE id IN (" + ",".join("?" * len(block_ids)) + ")", block_ids).fetchall()
-
-    sealed = {}
-    for bid, uid, res_json in rows:
-        try:
-            sealed[bid] = json.loads(res_json).get(field)
-        except Exception:
-            sealed[bid] = None
-
-    matched, mismatched, missing = [], [], []
-    for bid in block_ids:
-        key = str(bid)
-        if key not in results:
-            missing.append({"block_index": bid})
-            continue
-        live = results[key]
-        want = sealed.get(bid)
-        if str(live).strip().lower() == str(want).strip().lower():
-            matched.append(bid)
-        else:
-            mismatched.append({"block_index": bid,
-                               "sealed_value": want,
-                               "live_value": live})
-
-    ts = time.time()
-    rate = round(100 * len(matched) / len(block_ids), 2) if block_ids else 0
-    detail = ("field=" + field + ";matched=" + str(len(matched)) +
-              ";mismatched=" + str(len(mismatched)) + ";missing=" + str(len(missing)) +
-              ";match_rate=" + str(rate) +
-              ";mismatch_blocks=" + ",".join(str(m["block_index"]) for m in mismatched[:40]))
-    h, idx, seq, _x = _seal_event(ctx, api_key, rid, "reconciled", detail)
-
-    with ctx["lock"]:
-        ctx["conn"].execute("UPDATE reconcile_runs SET submitted=?,matched=?,mismatched=?,missing=?,status='reconciled',detail=? WHERE run_id=? AND api_key=?",
-                            (ts, len(matched), len(mismatched), len(missing), json.dumps({"mismatched": mismatched[:100], "missing": missing[:100]}), rid, api_key))
-        ctx["conn"].commit()
-
-    out = {"run_id": rid, "field": field, "sample_size": len(block_ids),
-           "matched": len(matched), "mismatched": len(mismatched),
-           "missing": len(missing), "match_rate_pct": rate,
-           "reconciled_at": _iso(ts), "audit_hash": h, "block_index": idx,
-           "receipt_seq": seq,
-           "note": "This result is sealed whichever way it went. It cannot be withdrawn."}
-    if mismatched:
-        out["mismatches"] = mismatched[:20]
-        out["flag"] = "sealed records and live system disagree on " + str(len(mismatched)) + " of " + str(len(block_ids))
-    if missing:
-        out["missing_detail"] = "records the live system did not return - a gap, not a match"
-    return out, 200
-
-
-def _run(ctx, api_key, rid):
-    with ctx["lock"]:
-        row = ctx["conn"].execute("SELECT field,seed,planned,submitted,sample_size,matched,mismatched,missing,status,detail FROM reconcile_runs WHERE run_id=? AND api_key=?", (rid.upper(), api_key)).fetchone()
-        if not row:
-            return {"error": "unknown_run_id"}, 404
-        blocks = ctx["conn"].execute("SELECT ts,result_json,audit_hash FROM audit_log WHERE user_id=? ORDER BY id ASC", ("rec:" + rid.upper(),)).fetchall()
-    events = []
-    for bts, res, ah in blocks:
-        try:
-            r = json.loads(res)
-            events.append({"at": _iso(bts), "event": r.get("reconcile_action"),
-                           "detail": r.get("detail"), "sealed": ah})
-        except Exception:
-            pass
-    total = row[4] or 0
-    out = {"run_id": rid.upper(), "field": row[0], "seed": row[1],
-           "planned": _iso(row[2]), "submitted": _iso(row[3]),
-           "sample_size": total, "matched": row[5], "mismatched": row[6],
-           "missing": row[7], "status": row[8], "events": events,
-           "ordering_proof": "The plan block precedes the result block. The sample was fixed before any data was requested."}
-    if row[9]:
-        try:
-            out["detail"] = json.loads(row[9])
-        except Exception:
-            pass
-    if row[8] == "planned":
-        out["flag"] = "planned but never submitted - an abandoned test, visible permanently"
-    return out, 200
-
-
-def _score(ctx, api_key):
-    with ctx["lock"]:
-        rows = ctx["conn"].execute("SELECT sample_size,matched,mismatched,missing,status,planned FROM reconcile_runs WHERE api_key=? ORDER BY planned DESC LIMIT 500", (api_key,)).fetchall()
-    if not rows:
-        return {"runs": 0, "note": "No reconciliation runs on record."}, 200
-    done = [r for r in rows if r[4] == "reconciled"]
-    abandoned = len(rows) - len(done)
-    tested = sum(r[0] or 0 for r in done)
-    ok = sum(r[1] or 0 for r in done)
-    bad = sum(r[2] or 0 for r in done)
-    gone = sum(r[3] or 0 for r in done)
-    out = {"runs": len(rows), "reconciled": len(done), "abandoned": abandoned,
-           "records_tested": tested, "matched": ok, "mismatched": bad,
-           "missing": gone,
-           "match_rate_pct": (round(100 * ok / tested, 2) if tested else None),
-           "last_run": _iso(rows[0][5])}
-    if abandoned:
-        out["flag"] = str(abandoned) + " planned run(s) never submitted"
-    return out, 200
-
-
-def _list(ctx, api_key):
-    with ctx["lock"]:
-        rows = ctx["conn"].execute("SELECT run_id,field,planned,submitted,sample_size,matched,mismatched,missing,status FROM reconcile_runs WHERE api_key=? ORDER BY planned DESC LIMIT 200", (api_key,)).fetchall()
-    return {"count": len(rows),
-            "runs": [{"run_id": r[0], "field": r[1], "planned": _iso(r[2]),
-                      "submitted": _iso(r[3]), "sample_size": r[4],
-                      "matched": r[5], "mismatched": r[6], "missing": r[7],
-                      "status": r[8]} for r in rows]}, 200
-
-
-def _public(ctx):
-    """The reconciliation record, readable without a key.
-
-    Counts only. No record identifiers, no field values, no operator
-    identity. What a stranger gets is the three numbers that cannot be
-    flattered: how many runs were reconciled, how many disagreed, and how
-    many were planned and then quietly abandoned.
-
-    Abandoned runs are the important one. A planned run is sealed at the
-    moment it is planned, so a test that came back badly and was dropped
-    cannot be deleted - it sits here forever as a plan with no result.
-    """
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT run_id,field,planned,submitted,sample_size,matched,mismatched,"
-            "missing,status FROM reconcile_runs ORDER BY planned DESC LIMIT 200").fetchall()
-
-    done = [r for r in rows if r[8] == "reconciled"]
-    abandoned = [r for r in rows if r[8] != "reconciled"]
-    tested = sum(r[4] or 0 for r in done)
-    ok = sum(r[5] or 0 for r in done)
-    bad = sum(r[6] or 0 for r in done)
-    gone = sum(r[7] or 0 for r in done)
-
-    out = {
-        "runs": len(rows),
-        "reconciled": len(done),
-        "abandoned": len(abandoned),
-        "records_tested": tested,
-        "matched": ok,
-        "mismatched": bad,
-        "missing": gone,
-        "match_rate_pct": (round(100 * ok / tested, 2) if tested else None),
-        "recent": [{"run_id": r[0], "field": r[1], "planned": _iso(r[2]),
-                    "submitted": _iso(r[3]), "sample_size": r[4],
-                    "matched": r[5], "mismatched": r[6], "missing": r[7],
-                    "status": r[8]} for r in rows[:50]],
-        "check_any_of_them": "/x/reconcile/proof?id=RUN-XXXXXXXX",
-        "what_is_being_shown": "Not that the records are true. That the sample was fixed "
-                               "before the data was requested, and that what came back was "
-                               "sealed either way.",
-        "what_a_mismatch_means": "The sealed record and the operator's own live system "
-                                 "disagreed. It is published because a reconciliation system "
-                                 "that can bury its own failures is decoration.",
-    }
-    if abandoned:
-        out["flag"] = (str(len(abandoned)) + " run(s) planned and never submitted. A sample was "
-                       "fixed, and no result was ever sealed against it.")
-    return out, 200
-
-
-def _proof(ctx, rid):
-    """The ordering, straight out of the chain, without a key.
-
-    Both events are already sealed under a public identifier, so this route
-    reveals nothing the chain does not already carry. It just makes the one
-    claim that matters legible: the plan block comes before the result block.
-    """
-    rid = (rid or "").strip().upper()
-    if not rid:
-        return {"error": "id_required"}, 400
-
-    with ctx["lock"]:
-        row = ctx["conn"].execute(
-            "SELECT field,seed,planned,submitted,sample_size,matched,mismatched,missing,status "
-            "FROM reconcile_runs WHERE run_id=?", (rid,)).fetchone()
-        blocks = ctx["conn"].execute(
-            "SELECT id,ts,result_json,audit_hash FROM audit_log WHERE user_id=? ORDER BY id ASC",
-            ("rec:" + rid,)).fetchall()
-    if not row:
-        return {"error": "unknown_run_id", "list": "/x/reconcile/public"}, 404
-
-    events = []
-    plan_block = result_block = None
-    for bid, bts, res, ah in blocks:
-        try:
-            r = json.loads(res)
-        except Exception:
-            continue
-        what = r.get("reconcile_action")
-        events.append({"event": what, "at": _iso(bts), "block_index": bid,
-                       "sealed_in_chain": ah, "sealed_detail": r.get("detail")})
-        if what == "planned" and plan_block is None:
-            plan_block = bid
-        if what == "reconciled" and result_block is None:
-            result_block = bid
-
-    ordered = (plan_block is not None and result_block is not None
-               and plan_block < result_block)
-
-    out = {"run_id": rid, "field": row[0], "status": row[8],
-           "seed": row[1], "planned_at": _iso(row[2]), "submitted_at": _iso(row[3]),
-           "sample_size": row[4], "matched": row[5], "mismatched": row[6],
-           "missing": row[7],
-           "plan_block_index": plan_block, "result_block_index": result_block,
-           "selection_precedes_result": ordered,
-           "events": events,
-           "how_to_check_this_yourself": [
-               "The seed is derived from the chain tip at planning time, which the operator "
-               "cannot predict in advance or change afterwards without breaking the chain.",
-               "The plan block seals which records were selected, and its detail is above.",
-               "The result block seals what came back. Compare the two block indices.",
-               "A lower plan index than result index means the sample was fixed before any "
-               "data was requested. That is the whole claim, and it is the only one made."],
-           "what_this_does_not_prove": "That the records are true. Two systems the operator "
-                                       "controls agreeing with each other is consistency, not "
-                                       "truth."}
-    if row[8] != "reconciled":
-        out["flag"] = ("planned and never submitted. The selection is sealed and no result "
-                       "was ever put against it.")
-    elif not ordered:
-        out["flag"] = ("the plan block does not precede the result block. That should be "
-                       "impossible and it is the finding.")
-    return out, 200
-
-
-def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-    if method == "POST":
-        if action == "plan":
-            return _plan(ctx, api_key, data)
-        if action == "submit":
-            return _submit(ctx, api_key, data)
-    else:
-        if action == "public":
-            return _public(ctx)
-        if action == "proof":
-            return _proof(ctx, str((data or {}).get("id", "")))
-        if action == "score":
-            return _score(ctx, api_key)
-        if action == "list":
-            return _list(ctx, api_key)
-        if action == "run":
-            rid = str(data.get("id", "")).strip()
-            if not rid:
-                return {"error": "id_required"}, 400
-            return _run(ctx, api_key, rid)
-    return {"error": "unknown_action", "action": action,
-            "GET": ["public", "proof", "score", "list", "run"],
-            "POST": ["plan", "submit"]}, 404
 
 ```
