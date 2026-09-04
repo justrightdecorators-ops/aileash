@@ -1,1406 +1,1519 @@
-# Codebase — part 13 of 30
+# Codebase — part 13 of 28
 
 Contains:
-- `modules/sortition.py`
-- `modules/spec.py`
-- `modules/standard.py`
-- `modules/stats.py`
+- `modules/wallet.py`
+- `modules/warmup.py`
+- `modules/witness.py`
 
 
-## `modules/sortition.py`
+## `modules/wallet.py`
 
-789 lines, 33138 bytes
+791 lines, 30234 bytes
 
 ```python
 """
-sortition.py - selection by lot. The operator stops choosing who gets audited.
+wallet.py - metering gate
+=========================
+v1.2.0
 
-THE HOLE THIS FILLS
--------------------
-Every system claiming human oversight reviews a sample of decisions. In
-every one of them, the operator picks the sample. So the sample proves
-nothing: you can review the easy ones, or the ones you already know are
-clean, and nobody outside can tell the difference. It is the softest spot
-in every Article 14 claim in the industry, and it has stayed soft because
-there was no alternative.
+WHAT THIS IS
+------------
+The thing that decides whether a decision is allowed to happen, and
+seals that decision into the same chain as the decision itself. Spend
+record and audit record are one record.
 
-There is one now. heartbeat.py seals a public beacon value on a cadence -
-a number nobody, including the operator, can know before its tick. That is
-a dice roll no one owns.
+Three ways a call is allowed:
 
-THE THREE LOCKS, IN ORDER. THE ORDER IS THE WHOLE POINT.
---------------------------------------------------------
-1. COMMIT THE POOL. Every record eligible for review in a period is
-   listed, hashed into one pool digest, and sealed. The pool is now fixed.
-2. WAIT FOR A TICK. The draw may only use a beacon value sealed AFTER the
-   pool commit. This module refuses otherwise. So the pool was fixed
-   before the dice existed, and cannot be edited once they do.
-3. DRAW. The beacon value deterministically ranks the pool. The lowest k
-   ranks are selected. Anyone can recompute it from public values.
+  1. FREE WINDOW  - the key is under 90 days old. Nothing is charged.
+  2. SUBSCRIBED   - the device has a live 30-day plan. Nothing is charged.
+  3. METERED      - neither of the above. The balance pays per decision
+                    and the call is refused at zero.
 
-Break any one and the sample is choosable again. Enforced here, not
-promised.
+MONEY
+-----
+Held as integer millipence. No floats anywhere near a balance.
+Settlement is deliberately not implemented. `topup` is a keyed
+operation you run by hand after a payment clears. Nothing in this
+module talks to a payment provider, and it must not be wired to one
+without the duplicate-credit problem being solved first.
 
-WHAT IT CATCHES
----------------
-A selected record with no review sealed against it is a permanent, visible
-hole with a name on it. You cannot quietly skip an awkward case, because
-the case was chosen for you in public, and its absence is the evidence.
+THE HALT RULE
+-------------
+A receipt presented twice halts the whole key with 423 - subscribed
+devices included. Not "probably a retry", not "probably a collision".
+A person looks at it at /x/wallet/review and clears it. A machine does
+not get to decide whether a repeated hash was a replay.
 
-Refusal is allowed and is not hidden - it is sealed as a refusal with a
-reason. An honest refusal on the record is worth more than a silent gap.
+SEALING
+-------
+Every charge, credit, subscription, halt and clearance goes through
+ctx["seal"](ev, res, ts, api_key) - the same call witness.py makes -
+and the returned audit hash and block index are stored on the ledger
+row. The seal is NOT wrapped in a try/except: if the chain will not
+accept the record, the charge must not be reported as allowed. A 500
+here is the correct outcome, because an unsealed charge is exactly the
+thing this module exists to prevent.
 
-THE SELECTION FUNCTION, PUBLISHED SO IT IS NOT OURS
----------------------------------------------------
-  seed = SHA256("AILEASH-SORTITION-v1" | period | pool_digest | beacon_value)
-  rank(i) = SHA256(seed | ":" | record_hash_i)
-  selected = the k records with the lowest rank, ties by record hash
+v1.2.0 fixes the seal call. v1.1.0 guessed at the signature, could not
+match it, and silently recorded nothing - every charge came back with
+sealed_as null. Nothing was lost, because nothing had been charged
+yet, but a spend gate that does not seal is only a spend gate.
 
-No random number generator, no language-specific behaviour, no library.
-Ten lines in any language. A stranger recomputes it and either gets our
-list or catches us.
-
-WHAT THIS DOES NOT DO
----------------------
-- It does not prove the reviews were any good. It proves nobody chose
-  which ones happened.
-- It does not stop an operator declining to draw at all. A period with no
-  draw is a period with no sample, and /outstanding says so.
-- Pool membership is asserted by this server. What stops a record being
-  left out of the pool is complete.py, which commits the period's record
-  count in advance - separate module, separate check.
-- Selection is uniform. Risk-weighted sampling is deliberately not offered:
-  a weighting the operator sets is a choice the operator made.
-
-Contract: handle(method, action, data, api_key, ctx) -> (dict, status)
-Routes:
-  GET  spec         public  what this is and the exact selection function
-  GET  draws        public  every draw ever made
-  GET  draw         public  ?id= - one draw, its beacon value, its selection
-  GET  verify       public  ?id= - recompute the draw from scratch, here
-  GET  outstanding  public  selected records with no review yet, and how late
-  GET  status       public  coverage, response rate, oldest unanswered
-  POST pool         keyed   commit the pool for a period
-  POST draw         keyed   draw a sample against a sealed beacon tick
-  POST review       keyed   record a review, or a refusal with a reason
+ROUTES
+------
+  GET  /x/wallet/spec       public
+  GET  /x/wallet/status     keyed
+  GET  /x/wallet/quote      keyed
+  POST /x/wallet/charge     keyed   - the gate
+  POST /x/wallet/topup      keyed   - manual credit
+  GET  /x/wallet/ledger     keyed
+  POST /x/wallet/simulate   keyed   - dry run, spends nothing
+  POST /x/wallet/subscribe  keyed
+  GET  /x/wallet/devices    keyed
+  GET  /x/wallet/review     keyed   - open halts
+  POST /x/wallet/clear      keyed   - a person clears a halt
 """
 
-import json
+import re
 import time
-import hashlib
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
-PUBLIC = {
-    ("GET", "spec"),
-    ("GET", "draws"),
-    ("GET", "draw"),
-    ("GET", "verify"),
-    ("GET", "outstanding"),
-    ("GET", "status"),
-}
+PUBLIC = {("GET", "spec")}
 
-DOMAIN_SEED = b"AILEASH-SORTITION-v1"
-DOMAIN_POOL = b"AILEASH-POOL-v1"
+# ---------------------------------------------------------------- pricing
+# 1 penny = 1000 millipence. Change these three lines and nothing else.
+MILLIPENCE_PER_PENNY = 1000
+DEVICE_PLAN_MILLIPENCE = 50 * MILLIPENCE_PER_PENNY      # 50p
+DEVICE_PLAN_DAYS = 30
+DECISION_MILLIPENCE = 100                                # 0.1p per decision
 
-DEFAULT_RATE = 0.05          # 5 percent
-MIN_SELECT = 1
-MAX_SELECT = 500
-MAX_POOL = 200000
-REVIEW_DUE_HOURS = 72
+FREE_WINDOW_DAYS = 90
+FREE_WINDOW_SECONDS = FREE_WINDOW_DAYS * 86400
+DAY = 86400
 
-DDL = [
-    """CREATE TABLE IF NOT EXISTS sortition_pool (
-        id           INTEGER PRIMARY KEY AUTOINCREMENT,
-        period       TEXT NOT NULL,
-        pool_digest  TEXT NOT NULL,
-        pool_size    INTEGER NOT NULL,
-        members      TEXT NOT NULL,
-        committed_at REAL NOT NULL,
-        chain_rowid  INTEGER,
-        audit_hash   TEXT
-    )""",
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_sort_pool ON sortition_pool(period)",
-    """CREATE TABLE IF NOT EXISTS sortition_draw (
-        id            INTEGER PRIMARY KEY AUTOINCREMENT,
-        period        TEXT NOT NULL,
-        pool_id       INTEGER NOT NULL,
-        pool_digest   TEXT NOT NULL,
-        pool_size     INTEGER NOT NULL,
-        rate          REAL NOT NULL,
-        select_count  INTEGER NOT NULL,
-        beacon_source TEXT,
-        beacon_round  INTEGER,
-        beacon_value  TEXT NOT NULL,
-        beacon_rowid  INTEGER,
-        seed          TEXT NOT NULL,
-        selected      TEXT NOT NULL,
-        drawn_at      REAL NOT NULL,
-        chain_rowid   INTEGER,
-        audit_hash    TEXT
-    )""",
-    """CREATE TABLE IF NOT EXISTS sortition_review (
-        id           INTEGER PRIMARY KEY AUTOINCREMENT,
-        draw_id      INTEGER NOT NULL,
-        record_hash  TEXT NOT NULL,
-        outcome      TEXT NOT NULL,
-        reviewer     TEXT,
-        reason       TEXT,
-        recorded_at  REAL NOT NULL,
-        chain_rowid  INTEGER,
-        audit_hash   TEXT
-    )""",
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_sort_rev ON sortition_review(draw_id, record_hash)",
-]
+MAX_TOPUP_MILLIPENCE = 500 * 100 * MILLIPENCE_PER_PENNY  # £500 a go
+MAX_LEDGER = 200
+MAX_DEVICE_ID = 80
 
-OUTCOMES = ("agreed", "disagreed", "escalated", "refused")
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
+DEVICE_OK = re.compile(r"^[A-Za-z0-9._:-]{1,80}$")
 
-VOCABULARY = {
-    "pool": "Every record eligible for review in a period, fixed and sealed before any dice exist.",
-    "draw": "The selection, computed from a beacon value that did not exist when the pool was sealed.",
-    "selected": "Chosen by the beacon, not by us. We could not have known which.",
-    "outstanding": "Selected and not yet answered. Visible, named, and counting.",
-    "refused": "Declined on the record with a reason. Not a gap - a decision that is now permanent.",
-    "gap": "Selected, past due, and never answered. The thing this module exists to make impossible to hide.",
-}
-
-WHAT_THIS_PROVES = (
-    "That nobody chose which records were reviewed. It does not prove the "
-    "reviews were competent, honest or useful. Those are different problems "
-    "and this module does not touch them."
-)
+_ready = False
 
 
-# ---------------------------------------------------------------------
-# helpers
-# ---------------------------------------------------------------------
+# ---------------------------------------------------------------- helpers
 
-def _ensure(conn, lock):
-    with lock:
-        cur = conn.cursor()
-        for stmt in DDL:
-            cur.execute(stmt)
-        conn.commit()
+def _now():
+    return round(time.time(), 3)
 
 
-def _cols(conn, table):
-    cur = conn.cursor()
-    cur.execute("PRAGMA table_info(%s)" % table)
-    return [r[1] for r in cur.fetchall()]
+def _pence(millipence):
+    """For display only. Never used in arithmetic that decides anything."""
+    return round(millipence / MILLIPENCE_PER_PENNY, 3)
 
 
-def _hash_col(conn):
-    c = _cols(conn, "audit_log")
-    for n in ("audit_hash", "hash", "block_hash"):
-        if n in c:
-            return n
-    return None
-
-
-def _ts_col(conn):
-    c = _cols(conn, "audit_log")
-    for n in ("ts", "timestamp", "created", "observed"):
-        if n in c:
-            return n
-    return None
-
-
-def _period_bounds(period):
-    """YYYY, YYYY-MM, YYYY-MM-DD -> (start_epoch, end_epoch) UTC."""
-    p = str(period).strip()
-    try:
-        if len(p) == 4:
-            s = time.strptime(p + "-01-01", "%Y-%m-%d")
-            e = time.strptime(str(int(p) + 1) + "-01-01", "%Y-%m-%d")
-        elif len(p) == 7:
-            s = time.strptime(p + "-01", "%Y-%m-%d")
-            y, m = int(p[:4]), int(p[5:7])
-            y2, m2 = (y + 1, 1) if m == 12 else (y, m + 1)
-            e = time.strptime("%04d-%02d-01" % (y2, m2), "%Y-%m-%d")
-        elif len(p) == 10:
-            s = time.strptime(p, "%Y-%m-%d")
-            e = time.gmtime(_cal(s) + 86400)
-        else:
-            return None
-    except ValueError:
-        return None
-    return _cal(s), _cal(e)
-
-
-def _cal(st):
-    import calendar
-    return calendar.timegm(st)
-
-
-def _iso(t):
-    if t is None:
-        return None
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
-
-
-def _human(seconds):
-    if seconds is None:
-        return None
-    s = int(round(seconds))
-    if s < 60:
-        return "%d seconds" % s
-    if s < 3600:
-        return "%d minutes" % (s // 60)
-    if s < 86400:
-        return "%d hours %d minutes" % (s // 3600, (s % 3600) // 60)
-    return "%d days %d hours" % (s // 86400, (s % 86400) // 3600)
-
-
-def _pool_digest(members):
-    h = hashlib.sha256()
-    h.update(DOMAIN_POOL + b"\n")
-    for m in members:
-        h.update(m.encode() + b"\n")
-    return h.hexdigest()
-
-
-def _seed(period, pool_digest, beacon_value):
-    h = hashlib.sha256()
-    h.update(DOMAIN_SEED + b"|")
-    h.update(str(period).encode() + b"|")
-    h.update(pool_digest.encode() + b"|")
-    h.update(str(beacon_value).encode())
-    return h.hexdigest()
-
-
-def select(members, seed, k):
-    """The published selection function. Deterministic, no RNG."""
-    ranked = []
-    for m in members:
-        r = hashlib.sha256((seed + ":" + m).encode()).hexdigest()
-        ranked.append((r, m))
-    ranked.sort()
-    return [m for _, m in ranked[:k]]
-
-
-def _seal(ctx, action, payload):
-    """Seal through the host's seal().
-
-    server.py: seal(event, result, ts, api_key=None) where EVENT IS A DICT
-    carrying user_id (subscripted inside), returning
-    (audit_hash, block_index, key_seq).
+def _seal(ctx, api_key, action, decision, device_id, detail, risk=0):
     """
-    fn = ctx.get("seal")
-    if fn is None:
-        return None, None
+    Write a block through the server's own seal.
+
+    Signature is ctx["seal"](ev, res, ts, api_key) returning
+    (audit_hash, block_index, seq) - the same call witness.py and
+    witnessed.py make. Deliberately not guarded: an unsealed charge must
+    fail loudly, not pass quietly.
+    """
     ts = time.time()
-    event = {"user_id": "sortition", "action": action, "amount": 0,
-             "country": "UK", "device_id": "sortition", "anomaly": 0,
-             "device_risk": 0}
-    result = dict(payload)
-    result.setdefault("decision", "SORTITION")
-    result.setdefault("score", 0)
-    result.setdefault("version", VERSION)
-    result.setdefault("timestamp", ts)
-    for call in (lambda: fn(event, result, ts),
-                 lambda: fn(event, result, ts, None),
-                 lambda: fn(event, result)):
+    ev = {"user_id": "wallet:" + (device_id or "-")[:40],
+          "action": action,
+          "amount": 0,
+          "country": "UK",
+          "device_id": device_id or "wallet",
+          "anomaly": 0,
+          "device_risk": risk}
+    res = {"decision": decision, "score": 0, "wallet_version": VERSION}
+    res.update(detail or {})
+    audit_hash, block_index, seq = ctx["seal"](ev, res, ts, api_key)
+    return audit_hash, block_index, seq
+
+
+def _setup(ctx):
+    global _ready
+    if _ready:
+        return
+    conn = ctx["conn"]
+    with ctx["lock"]:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS wallet_balance (
+                api_key      TEXT PRIMARY KEY,
+                millipence   INTEGER NOT NULL DEFAULT 0,
+                updated      REAL NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS wallet_ledger (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                api_key       TEXT NOT NULL,
+                kind          TEXT NOT NULL,
+                millipence    INTEGER NOT NULL,
+                balance_after INTEGER NOT NULL,
+                device_id     TEXT,
+                receipt       TEXT,
+                note          TEXT,
+                seal_ref      TEXT,
+                created       REAL NOT NULL
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_wallet_ledger_key "
+            "ON wallet_ledger(api_key, id)")
+
+        # Added in 1.2. Rows written by 1.1 keep NULL, which reads as
+        # unsealed - correct, because they were.
+        have = set()
         try:
-            out = call()
-        except TypeError:
-            continue
+            for row in conn.execute(
+                    "PRAGMA table_info(wallet_ledger)").fetchall():
+                have.add(row[1])
         except Exception:
-            return None, None
-        h = idx = None
-        if isinstance(out, (tuple, list)):
-            for item in out:
-                if isinstance(item, str) and len(item) == 64 and h is None:
-                    h = item
-                elif isinstance(item, int) and idx is None:
-                    idx = item
-        elif isinstance(out, str):
-            h = out
-        return h, idx
-    return None, None
+            pass
+        if "block_index" not in have:
+            try:
+                conn.execute(
+                    "ALTER TABLE wallet_ledger ADD COLUMN block_index INTEGER")
+            except Exception:
+                pass
 
-
-def _backfill(conn, lock, table, rowid_field, pk):
-    hcol = _hash_col(conn)
-    with lock:
-        cur = conn.cursor()
-        cur.execute("SELECT MAX(rowid) FROM audit_log")
-        r = cur.fetchone()
-        rid = r[0] if r and r[0] is not None else None
-        h = None
-        if rid is not None and hcol:
-            cur.execute("SELECT %s FROM audit_log WHERE rowid=?" % hcol, (rid,))
-            r2 = cur.fetchone()
-            h = r2[0] if r2 else None
-        cur.execute("UPDATE %s SET chain_rowid=?, audit_hash=? WHERE id=?" % table,
-                    (rid, h, pk))
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS wallet_device (
+                api_key      TEXT NOT NULL,
+                device_id    TEXT NOT NULL,
+                expires      REAL NOT NULL,
+                first_seen   REAL NOT NULL,
+                PRIMARY KEY (api_key, device_id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS wallet_receipt (
+                api_key      TEXT NOT NULL,
+                receipt      TEXT NOT NULL,
+                device_id    TEXT,
+                created      REAL NOT NULL,
+                PRIMARY KEY (api_key, receipt)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS wallet_halt (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                api_key      TEXT NOT NULL,
+                reason       TEXT NOT NULL,
+                receipt      TEXT,
+                device_id    TEXT,
+                detail       TEXT,
+                cleared      INTEGER NOT NULL DEFAULT 0,
+                cleared_by   TEXT,
+                cleared_note TEXT,
+                cleared_at   REAL,
+                created      REAL NOT NULL
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_wallet_halt_open "
+            "ON wallet_halt(api_key, cleared)")
         conn.commit()
-    return rid, h
+    _ready = True
 
 
-def _latest_beat_after(conn, rowid):
-    """The first heartbeat sealed strictly after a given chain row."""
+def _balance(ctx, api_key):
+    with ctx["lock"]:
+        row = ctx["conn"].execute(
+            "SELECT millipence FROM wallet_balance WHERE api_key=?",
+            (api_key,)).fetchone()
+    return int(row[0]) if row else 0
+
+
+def _set_balance(ctx, api_key, millipence):
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "INSERT INTO wallet_balance (api_key, millipence, updated) "
+            "VALUES (?,?,?) ON CONFLICT(api_key) DO UPDATE SET "
+            "millipence=excluded.millipence, updated=excluded.updated",
+            (api_key, int(millipence), _now()))
+        ctx["conn"].commit()
+
+
+def _write_ledger(ctx, api_key, kind, delta, balance_after, device_id=None,
+                  receipt=None, note=None, seal_ref=None, block_index=None):
+    """
+    The seal is the record. This row is a convenience for lookup, so a
+    failure here is reported and never turns a sealed charge into a
+    failed one - same posture as witness.py's index insert.
+    """
     try:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT source, beacon_round, value, chain_rowid, fetched_at"
-            " FROM heartbeat_tick WHERE chain_rowid IS NOT NULL AND chain_rowid>?"
-            " ORDER BY chain_rowid DESC LIMIT 1", (rowid,))
-        return cur.fetchone()
+        with ctx["lock"]:
+            ctx["conn"].execute(
+                "INSERT INTO wallet_ledger (api_key, kind, millipence, "
+                "balance_after, device_id, receipt, note, seal_ref, "
+                "block_index, created) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (api_key, kind, int(delta), int(balance_after), device_id,
+                 receipt, note, seal_ref, block_index, _now()))
+            ctx["conn"].commit()
+        return None
+    except Exception as exc:
+        return type(exc).__name__
+
+
+def _key_created(ctx, api_key):
+    """
+    When was this key made. Read api_keys' real schema rather than
+    assume a column name. Returns None if it cannot be determined -
+    and None means NO free window, not an unlimited one.
+    """
+    conn = ctx["conn"]
+    try:
+        with ctx["lock"]:
+            cols = [r[1] for r in
+                    conn.execute("PRAGMA table_info(api_keys)").fetchall()]
     except Exception:
         return None
-
-
-def _beats_available(conn):
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM heartbeat_tick")
-        return cur.fetchone()[0]
-    except Exception:
+    if not cols:
         return None
-
-
-# ---------------------------------------------------------------------
-# handle
-# ---------------------------------------------------------------------
-
-def handle(method, action, data, api_key, ctx):
-    conn, lock = ctx["conn"], ctx["lock"]
-    _ensure(conn, lock)
-
-    if method == "GET" and action == "spec":
-        return _spec(), 200
-
-    # -------------------------------------------------- pool
-    if method == "POST" and action == "pool":
-        period = data.get("period")
-        bounds = _period_bounds(period) if period else None
-        if not bounds:
-            return {"error": "period_required",
-                    "formats": ["YYYY", "YYYY-MM", "YYYY-MM-DD"]}, 400
-        start, end = bounds
-        if end > time.time():
-            return {"error": "period_not_closed",
-                    "note": ("A pool can only be committed for a period that "
-                             "has ended. Committing a live period would let "
-                             "records arrive after the pool was fixed."),
-                    "period_ends": _iso(end)}, 409
-
-        hcol, tcol = _hash_col(conn), _ts_col(conn)
-        if not hcol or not tcol:
-            return {"error": "audit_log_schema_unrecognised"}, 500
-
-        cur = conn.cursor()
-        kind = data.get("event")
-        if kind:
-            cur.execute(
-                "SELECT %s FROM audit_log WHERE %s>=? AND %s<? AND event=?"
-                " ORDER BY rowid" % (hcol, tcol, tcol), (start, end, kind))
-        else:
-            cur.execute(
-                "SELECT %s FROM audit_log WHERE %s>=? AND %s<? ORDER BY rowid"
-                % (hcol, tcol, tcol), (start, end))
-        members = sorted({r[0] for r in cur.fetchall() if r[0]})
-        if not members:
-            return {"error": "empty_period", "period": period}, 404
-        if len(members) > MAX_POOL:
-            return {"error": "pool_too_large", "size": len(members),
-                    "max": MAX_POOL}, 413
-
-        digest = _pool_digest(members)
-        now = time.time()
-        with lock:
-            cur = conn.cursor()
-            cur.execute("SELECT id, pool_digest FROM sortition_pool WHERE period=?",
-                        (period,))
-            prior = cur.fetchone()
-            if prior:
-                return {"error": "pool_already_committed", "period": period,
-                        "pool_digest": prior[1],
-                        "note": "A pool commits once. That is what makes it a pool."}, 409
-            cur.execute(
-                "INSERT INTO sortition_pool (period, pool_digest, pool_size,"
-                " members, committed_at) VALUES (?,?,?,?,?)",
-                (period, digest, len(members), json.dumps(members), now))
-            pid = cur.lastrowid
-            conn.commit()
-
-        sh, sidx = _seal(ctx, "sortition_pool", {
-            "period": period, "pool_digest": digest, "pool_size": len(members),
-            "event_filter": kind,
-            "note": ("Pool fixed. Any draw against it must use a beacon value "
-                     "sealed after this block."),
-        })
-        rid, h = (sidx, sh) if (sidx and sh) else _backfill(conn, lock, "sortition_pool", "chain_rowid", pid)
-        if sidx and sh:
-            with lock:
-                conn.execute("UPDATE sortition_pool SET chain_rowid=?, audit_hash=? WHERE id=?", (rid, h, pid))
-                conn.commit()
-
-        return {"pool_id": pid, "period": period, "pool_digest": digest,
-                "pool_size": len(members), "sealed_at_chain_rowid": rid,
-                "audit_hash": h,
-                "next": ("Wait for a heartbeat sealed after block %s, then "
-                         "POST /x/sortition/draw." % rid)}, 200
-
-    # -------------------------------------------------- draw
-    if method == "POST" and action == "draw":
-        period = data.get("period")
-        cur = conn.cursor()
-        cur.execute("SELECT id, pool_digest, pool_size, members, chain_rowid"
-                    " FROM sortition_pool WHERE period=?", (period,))
-        pool = cur.fetchone()
-        if not pool:
-            return {"error": "no_pool_for_period", "period": period,
-                    "next": "POST /x/sortition/pool first"}, 404
-        pid, digest, size, members_json, pool_rowid = pool
-
-        cur.execute("SELECT id FROM sortition_draw WHERE period=?", (period,))
-        if cur.fetchone():
-            return {"error": "already_drawn", "period": period,
-                    "note": "One draw per pool. A second draw is a second chance."}, 409
-
-        if pool_rowid is None:
-            return {"error": "pool_not_located_in_chain"}, 500
-
-        beat = _latest_beat_after(conn, pool_rowid)
-        if not beat:
-            n = _beats_available(conn)
-            return {"error": "no_beacon_since_pool_commit",
-                    "beats_in_system": n,
-                    "why": ("The draw must use a value that did not exist when "
-                            "the pool was sealed. Wait for the next heartbeat."),
-                    "check": "/x/heartbeat/latest"}, 409
-
-        b_source, b_round, b_value, b_rowid, b_at = beat
-        members = json.loads(members_json)
-
-        try:
-            rate = float(data.get("rate", DEFAULT_RATE))
-        except (TypeError, ValueError):
-            rate = DEFAULT_RATE
-        rate = max(0.0001, min(1.0, rate))
-        k = int(round(size * rate))
-        k = max(MIN_SELECT, min(k, MAX_SELECT, size))
-
-        seed = _seed(period, digest, b_value)
-        chosen = select(members, seed, k)
-        now = time.time()
-
-        with lock:
-            cur = conn.cursor()
-            cur.execute(
-                "INSERT INTO sortition_draw (period, pool_id, pool_digest,"
-                " pool_size, rate, select_count, beacon_source, beacon_round,"
-                " beacon_value, beacon_rowid, seed, selected, drawn_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (period, pid, digest, size, rate, k, b_source, b_round,
-                 b_value, b_rowid, seed, json.dumps(chosen), now))
-            did = cur.lastrowid
-            conn.commit()
-
-        sh, sidx = _seal(ctx, "sortition_draw", {
-            "draw_id": did, "period": period, "pool_digest": digest,
-            "pool_size": size, "rate": rate, "selected_count": k,
-            "beacon": {"source": b_source, "round": b_round, "value": b_value,
-                       "sealed_at_block": b_rowid},
-            "seed": seed, "selected": chosen,
-            "note": ("Selection is recomputable by anyone from pool_digest and "
-                     "the beacon value. See /x/sortition/spec."),
-        })
-        rid, h = (sidx, sh) if (sidx and sh) else _backfill(conn, lock, "sortition_draw", "chain_rowid", did)
-        if sidx and sh:
-            with lock:
-                conn.execute("UPDATE sortition_draw SET chain_rowid=?, audit_hash=? WHERE id=?", (rid, h, did))
-                conn.commit()
-
-        return {"draw_id": did, "period": period, "pool_size": size,
-                "rate": rate, "selected_count": k, "selected": chosen,
-                "beacon": {"source": b_source, "round": b_round,
-                           "value": b_value, "sealed_at_block": b_rowid,
-                           "sealed_at": _iso(b_at)},
-                "seed": seed, "sealed_at_chain_rowid": rid, "audit_hash": h,
-                "review_due": _iso(now + REVIEW_DUE_HOURS * 3600),
-                "recompute_this_yourself": "/x/sortition/verify?id=%d" % did}, 200
-
-    # -------------------------------------------------- review
-    if method == "POST" and action == "review":
-        did = data.get("draw_id")
-        rec = data.get("record")
-        outcome = str(data.get("outcome", "")).lower()
-        if not did or not rec:
-            return {"error": "draw_id_and_record_required"}, 400
-        if outcome not in OUTCOMES:
-            return {"error": "outcome_invalid", "allowed": list(OUTCOMES)}, 400
-        if outcome == "refused" and not data.get("reason"):
-            return {"error": "reason_required_to_refuse",
-                    "why": ("A refusal without a reason is a gap wearing a "
-                            "label. The reason is sealed and permanent.")}, 400
-
-        cur = conn.cursor()
-        cur.execute("SELECT selected FROM sortition_draw WHERE id=?", (did,))
-        row = cur.fetchone()
-        if not row:
-            return {"error": "unknown_draw", "draw_id": did}, 404
-        if rec not in json.loads(row[0]):
-            return {"error": "record_not_selected",
-                    "note": ("Reviews can only be filed against records the "
-                             "beacon chose. Volunteering extra reviews does "
-                             "not count toward the sample.")}, 409
-
-        now = time.time()
-        with lock:
-            cur = conn.cursor()
-            cur.execute("SELECT id FROM sortition_review WHERE draw_id=? AND record_hash=?",
-                        (did, rec))
-            if cur.fetchone():
-                return {"error": "already_reviewed",
-                        "note": "A review is filed once and cannot be replaced."}, 409
-            cur.execute(
-                "INSERT INTO sortition_review (draw_id, record_hash, outcome,"
-                " reviewer, reason, recorded_at) VALUES (?,?,?,?,?,?)",
-                (did, rec, outcome, data.get("reviewer"), data.get("reason"), now))
-            rvid = cur.lastrowid
-            conn.commit()
-
-        sh, sidx = _seal(ctx, "sortition_review", {
-            "draw_id": did, "record": rec, "outcome": outcome,
-            "reviewer": data.get("reviewer"), "reason": data.get("reason"),
-        })
-        rid, h = (sidx, sh) if (sidx and sh) else _backfill(conn, lock, "sortition_review", "chain_rowid", rvid)
-        if sidx and sh:
-            with lock:
-                conn.execute("UPDATE sortition_review SET chain_rowid=?, audit_hash=? WHERE id=?", (rid, h, rvid))
-                conn.commit()
-        return {"recorded": True, "review_id": rvid, "outcome": outcome,
-                "sealed_at_chain_rowid": rid, "audit_hash": h}, 200
-
-    # -------------------------------------------------- draws
-    if method == "GET" and action == "draws":
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT id, period, pool_size, rate, select_count, beacon_source,"
-            " beacon_round, drawn_at, audit_hash FROM sortition_draw"
-            " ORDER BY id DESC LIMIT 100")
-        out = []
-        for r in cur.fetchall():
-            cur2 = conn.cursor()
-            cur2.execute("SELECT COUNT(*) FROM sortition_review WHERE draw_id=?", (r[0],))
-            done = cur2.fetchone()[0]
-            out.append({"draw_id": r[0], "period": r[1], "pool_size": r[2],
-                        "rate": r[3], "selected": r[4], "reviewed": done,
-                        "outstanding": r[4] - done,
-                        "beacon": {"source": r[5], "round": r[6]},
-                        "drawn_at": _iso(r[7]), "audit_hash": r[8]})
-        return {"count": len(out), "draws": out, "vocabulary": VOCABULARY}, 200
-
-    # -------------------------------------------------- one draw
-    if method == "GET" and action == "draw":
-        did = data.get("id")
-        if not did:
-            return {"error": "id_required"}, 400
-        d = _draw_row(conn, did)
-        if not d:
-            return {"error": "unknown_draw"}, 404
-        cur = conn.cursor()
-        cur.execute("SELECT record_hash, outcome, reviewer, reason, recorded_at"
-                    " FROM sortition_review WHERE draw_id=?", (did,))
-        revs = {r[0]: {"outcome": r[1], "reviewer": r[2], "reason": r[3],
-                       "at": _iso(r[4])} for r in cur.fetchall()}
-        items = []
-        for m in json.loads(d["selected_json"]):
-            items.append({"record": m, "review": revs.get(m),
-                          "state": "answered" if m in revs else "outstanding"})
-        return {"draw_id": did, "period": d["period"],
-                "pool_digest": d["pool_digest"], "pool_size": d["pool_size"],
-                "rate": d["rate"], "selected_count": d["select_count"],
-                "beacon": {"source": d["beacon_source"], "round": d["beacon_round"],
-                           "value": d["beacon_value"],
-                           "sealed_at_block": d["beacon_rowid"]},
-                "seed": d["seed"], "drawn_at": _iso(d["drawn_at"]),
-                "items": items,
-                "what_this_proves": WHAT_THIS_PROVES,
-                "recompute": "/x/sortition/verify?id=%s" % did}, 200
-
-    # -------------------------------------------------- verify
-    if method == "GET" and action == "verify":
-        did = data.get("id")
-        if not did:
-            return {"error": "id_required"}, 400
-        d = _draw_row(conn, did)
-        if not d:
-            return {"error": "unknown_draw"}, 404
-        cur = conn.cursor()
-        cur.execute("SELECT members FROM sortition_pool WHERE id=?", (d["pool_id"],))
-        row = cur.fetchone()
-        members = json.loads(row[0]) if row else []
-        recomputed_digest = _pool_digest(members)
-        recomputed_seed = _seed(d["period"], d["pool_digest"], d["beacon_value"])
-        recomputed = select(members, recomputed_seed, d["select_count"])
-        stored = json.loads(d["selected_json"])
-        ok = (recomputed_digest == d["pool_digest"]
-              and recomputed_seed == d["seed"]
-              and sorted(recomputed) == sorted(stored))
-        return {
-            "draw_id": did,
-            "matches": ok,
-            "pool_digest_recomputed": recomputed_digest,
-            "pool_digest_sealed": d["pool_digest"],
-            "seed_recomputed": recomputed_seed,
-            "seed_sealed": d["seed"],
-            "selection_matches": sorted(recomputed) == sorted(stored),
-            "beacon_value": d["beacon_value"],
-            "beacon_check": ("Confirm this value independently at "
-                             "/x/heartbeat/verify?round=%s, then at the beacon "
-                             "operator's own endpoint." % d["beacon_round"]),
-            "do_it_without_us": {
-                "seed": 'SHA256("AILEASH-SORTITION-v1|" + period + "|" + pool_digest + "|" + beacon_value)',
-                "rank": 'SHA256(seed + ":" + record_hash)',
-                "select": "lowest k ranks, ascending",
-                "note": ("This route runs the same function on our server, so "
-                         "it is a convenience, not the proof. The proof is you "
-                         "running those three lines yourself."),
-            },
-        }, 200
-
-    # -------------------------------------------------- outstanding
-    if method == "GET" and action == "outstanding":
-        now = time.time()
-        cur = conn.cursor()
-        cur.execute("SELECT id, period, selected, drawn_at FROM sortition_draw"
-                    " ORDER BY id DESC")
-        items = []
-        for did, period, sel, drawn in cur.fetchall():
-            cur2 = conn.cursor()
-            cur2.execute("SELECT record_hash FROM sortition_review WHERE draw_id=?", (did,))
-            done = {r[0] for r in cur2.fetchall()}
-            due = drawn + REVIEW_DUE_HOURS * 3600
-            for m in json.loads(sel):
-                if m in done:
-                    continue
-                items.append({
-                    "draw_id": did, "period": period, "record": m,
-                    "drawn_at": _iso(drawn), "due": _iso(due),
-                    "state": "gap" if now > due else "outstanding",
-                    "late_by": _human(now - due) if now > due else None,
-                })
-        gaps = [i for i in items if i["state"] == "gap"]
-        return {"outstanding_count": len(items), "gap_count": len(gaps),
-                "due_after_hours": REVIEW_DUE_HOURS,
-                "items": items[:500],
-                "meaning": VOCABULARY["gap"]}, 200
-
-    # -------------------------------------------------- status
-    if method == "GET" and action == "status":
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*), SUM(select_count) FROM sortition_draw")
-        ndraws, nsel = cur.fetchone()
-        nsel = nsel or 0
-        cur.execute("SELECT COUNT(*) FROM sortition_review")
-        nrev = cur.fetchone()[0]
-        cur.execute("SELECT outcome, COUNT(*) FROM sortition_review GROUP BY outcome")
-        mix = {r[0]: r[1] for r in cur.fetchall()}
-        cur.execute("SELECT COUNT(*) FROM sortition_pool")
-        npool = cur.fetchone()[0]
-        beats = _beats_available(conn)
-        return {
-            "version": VERSION,
-            "pools_committed": npool,
-            "draws": ndraws,
-            "records_selected": nsel,
-            "reviews_recorded": nrev,
-            "response_rate": round(nrev / nsel, 4) if nsel else None,
-            "outcome_mix": mix,
-            "beacon_available": beats is not None,
-            "beats_in_system": beats,
-            "depends_on": {
-                "heartbeat": ("supplies the dice. Without a beacon sealed "
-                              "after the pool, no draw is possible."),
-                "complete": ("commits the period's record count in advance. "
-                             "Without it, a record could be kept out of the "
-                             "pool. Separate module, separate check: "
-                             "/x/complete/periods"),
-            },
-            "what_this_proves": WHAT_THIS_PROVES,
-        }, 200
-
-    return {"error": "unknown_action", "action": action,
-            "actions": ["spec", "draws", "draw", "verify", "outstanding",
-                        "status", "pool", "review"]}, 404
-
-
-def _draw_row(conn, did):
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT id, period, pool_id, pool_digest, pool_size, rate, select_count,"
-        " beacon_source, beacon_round, beacon_value, beacon_rowid, seed,"
-        " selected, drawn_at FROM sortition_draw WHERE id=?", (did,))
-    r = cur.fetchone()
-    if not r:
+    for name in ("created", "created_at", "created_ts", "issued", "ts"):
+        if name not in cols:
+            continue
+        for keycol in ("key", "api_key"):
+            if keycol not in cols:
+                continue
+            try:
+                with ctx["lock"]:
+                    row = conn.execute(
+                        "SELECT %s FROM api_keys WHERE %s=?" % (name, keycol),
+                        (api_key,)).fetchone()
+            except Exception:
+                continue
+            if row and row[0]:
+                try:
+                    return float(row[0])
+                except (TypeError, ValueError):
+                    return None
         return None
-    keys = ["id", "period", "pool_id", "pool_digest", "pool_size", "rate",
-            "select_count", "beacon_source", "beacon_round", "beacon_value",
-            "beacon_rowid", "seed", "selected_json", "drawn_at"]
-    return dict(zip(keys, r))
+    return None
 
+
+def _free_window(ctx, api_key):
+    created = _key_created(ctx, api_key)
+    if created is None:
+        return {"in_free_window": False, "reason": "key age unknown"}
+    ends = created + FREE_WINDOW_SECONDS
+    remaining = ends - time.time()
+    return {
+        "in_free_window": remaining > 0,
+        "key_created": round(created, 3),
+        "free_until": round(ends, 3),
+        "days_remaining": round(remaining / DAY, 2) if remaining > 0 else 0,
+    }
+
+
+def _open_halt(ctx, api_key):
+    with ctx["lock"]:
+        row = ctx["conn"].execute(
+            "SELECT id, reason, receipt, device_id, detail, created "
+            "FROM wallet_halt WHERE api_key=? AND cleared=0 "
+            "ORDER BY id LIMIT 1", (api_key,)).fetchone()
+    if not row:
+        return None
+    return {"halt_id": row[0], "reason": row[1], "receipt": row[2],
+            "device_id": row[3], "detail": row[4], "since": row[5]}
+
+
+def _halted_response(halt):
+    return {
+        "allowed": False,
+        "halted": True,
+        "halt": halt,
+        "means": ("This key is stopped. A subscribed device does not pass "
+                  "either. A person has to look at the halt and clear it at "
+                  "/x/wallet/clear before anything runs again."),
+    }, 423
+
+
+def _device_live(ctx, api_key, device_id):
+    with ctx["lock"]:
+        row = ctx["conn"].execute(
+            "SELECT expires FROM wallet_device WHERE api_key=? AND device_id=?",
+            (api_key, device_id)).fetchone()
+    if not row:
+        return None
+    expires = float(row[0])
+    return expires if expires > time.time() else None
+
+
+def _check_device(value):
+    device_id = (value or "").strip() if isinstance(value, str) else ""
+    if not device_id:
+        return None, {"error": "device_id required"}
+    if len(device_id) > MAX_DEVICE_ID or not DEVICE_OK.match(device_id):
+        return None, {"error": "device_id must be 1-80 characters, letters, "
+                               "digits, dot, underscore, colon or hyphen"}
+    return device_id, None
+
+
+# ------------------------------------------------------------------ spec
 
 def _spec():
     return {
-        "module": "sortition",
+        "module": "wallet",
         "version": VERSION,
-        "name_means": "selection by lot - the ancient method for stopping the powerful choosing who gets scrutinised",
-        "the_hole": (
-            "Every system claiming human oversight reviews a sample. In every "
-            "one, the operator picks the sample, so the sample proves nothing."
-        ),
-        "the_three_locks": [
-            "1. The pool of eligible records is fixed and sealed first.",
-            "2. The draw may only use a beacon value sealed AFTER the pool. "
-            "Refused otherwise. So the pool was fixed before the dice existed.",
-            "3. The beacon value ranks the pool. Lowest k are selected. "
-            "Anyone recomputes it from public values.",
+        "what_this_is": (
+            "A gate. It decides whether a decision may proceed and seals "
+            "that decision into the audit chain, so the spend record and "
+            "the audit record are the same record."),
+        "allowed_when": [
+            "free_window - key under %d days old, nothing charged"
+            % FREE_WINDOW_DAYS,
+            "subscribed - device has a live %d-day plan, nothing charged"
+            % DEVICE_PLAN_DAYS,
+            "metered - balance pays per decision, refused at zero",
         ],
-        "selection_function": {
-            "seed": 'SHA256("AILEASH-SORTITION-v1|" + period + "|" + pool_digest + "|" + beacon_value)',
-            "rank": 'SHA256(seed + ":" + record_hash)',
-            "select": "the k lowest ranks in ascending order",
-            "why_no_rng": ("A random number generator is a library, a version "
-                           "and a seed we control. Two SHA-256 calls are none "
-                           "of those and run in any language."),
+        "pricing": {
+            "device_plan_pence": _pence(DEVICE_PLAN_MILLIPENCE),
+            "device_plan_days": DEVICE_PLAN_DAYS,
+            "per_decision_pence": _pence(DECISION_MILLIPENCE),
+            "unit": "millipence, integer. 1000 millipence = 1 penny.",
+            "renewal": ("Subscribing again before expiry extends from the "
+                        "existing expiry. It does not reset it."),
         },
-        "uniform_only": (
-            "Risk-weighted sampling is deliberately not offered. A weighting "
-            "the operator sets is a choice the operator made, which is the "
-            "thing this module exists to remove."
-        ),
-        "refusal": (
-            "A reviewer may refuse a selected case, with a reason, sealed. "
-            "An honest refusal on the record beats a silent gap. A selection "
-            "left unanswered past the due window is published as a gap with "
-            "the record named."
-        ),
-        "vocabulary": VOCABULARY,
-        "what_this_proves": WHAT_THIS_PROVES,
-        "limits": [
-            "It does not prove the reviews were any good.",
-            "It does not force anyone to draw at all. A period with no draw "
-            "is a period with no sample and status says so.",
-            "Pool membership is asserted by this server; completeness of the "
-            "pool is complete.py's job, not this module's.",
-            "The beacon is a third party. If drand and Bitcoin both vanish, "
-            "new draws stop. Old draws stay verifiable.",
+        "duplicate_receipts": {
+            "rule": ("A receipt presented twice halts the whole key with "
+                     "HTTP 423, subscribed devices included."),
+            "why": ("A repeated hash is either a replay or a collision. "
+                    "Neither is a thing a machine should rule on."),
+            "clearing": "A person clears it at POST /x/wallet/clear.",
+        },
+        "sealing": (
+            "Every charge, credit, subscription, halt and clearance is a "
+            "block in this chain. If the chain will not accept the record "
+            "the call fails - an unsealed charge is never reported as "
+            "allowed."),
+        "settlement": (
+            "Not implemented, on purpose. topup is a keyed operation run "
+            "by hand once a payment has cleared. This module does not "
+            "talk to a payment provider."),
+        "what_this_does_not_do": [
+            "It does not stop a model saying something false. It records "
+            "what ran, and refuses to let more run than was paid for.",
+            "It does not settle, refund, or invoice.",
         ],
         "routes": {
-            "POST /x/sortition/pool": "keyed - commit the pool for a closed period",
-            "POST /x/sortition/draw": "keyed - draw against a beacon sealed after the pool",
-            "POST /x/sortition/review": "keyed - file a review or a refusal with a reason",
-            "GET /x/sortition/draws": "every draw",
-            "GET /x/sortition/draw?id=": "one draw and its answers",
-            "GET /x/sortition/verify?id=": "recompute the draw",
-            "GET /x/sortition/outstanding": "selected and unanswered, with gaps named",
-            "GET /x/sortition/status": "coverage and response rate",
+            "GET  spec": "public",
+            "GET  status": "keyed - balance, window, devices, halts",
+            "GET  quote": "keyed - current prices",
+            "POST charge": "keyed - the gate. device_id, receipt",
+            "POST topup": "keyed - millipence, note",
+            "GET  ledger": "keyed - limit",
+            "POST simulate": "keyed - how far does a runaway loop get",
+            "POST subscribe": "keyed - device_id",
+            "GET  devices": "keyed",
+            "GET  review": "keyed - open halts",
+            "POST clear": "keyed - halt_id, cleared_by, note",
         },
     }
+
+
+# ---------------------------------------------------------------- charge
+
+def _charge(data, api_key, ctx, dry_run=False):
+    device_id, err = _check_device((data or {}).get("device_id"))
+    if err:
+        return err, 400
+
+    receipt = (data or {}).get("receipt")
+    receipt = receipt.strip().lower() if isinstance(receipt, str) else ""
+    if not HEX64.match(receipt or ""):
+        return {"error": "receipt must be 64 lowercase hex characters",
+                "note": "This is the digest of the decision being charged "
+                        "for. It is what makes a replay detectable."}, 400
+
+    halt = _open_halt(ctx, api_key)
+    if halt:
+        return _halted_response(halt)
+
+    # ---- replay check
+    with ctx["lock"]:
+        seen = ctx["conn"].execute(
+            "SELECT device_id, created FROM wallet_receipt "
+            "WHERE api_key=? AND receipt=?", (api_key, receipt)).fetchone()
+
+    if seen:
+        if dry_run:
+            return {"allowed": False, "would_halt": True,
+                    "reason": "duplicate_receipt", "first_seen": seen[1],
+                    "dry_run": True}, 200
+
+        detail = ("receipt=%s;first_seen=%s;first_device=%s;presented_by=%s"
+                  % (receipt, seen[1], seen[0], device_id))
+        audit_hash, block_index, seq = _seal(
+            ctx, api_key, "wallet_halted", "WALLET_HALTED", device_id,
+            {"reason": "duplicate_receipt", "receipt": receipt,
+             "first_seen": seen[1], "detail": detail}, risk=1)
+
+        with ctx["lock"]:
+            ctx["conn"].execute(
+                "INSERT INTO wallet_halt (api_key, reason, receipt, "
+                "device_id, detail, created) VALUES (?,?,?,?,?,?)",
+                (api_key, "duplicate_receipt", receipt, device_id,
+                 detail, _now()))
+            ctx["conn"].commit()
+
+        out, status = _halted_response(_open_halt(ctx, api_key))
+        out["sealed_as"] = audit_hash
+        out["block_index"] = block_index
+        out["receipt_seq"] = seq
+        return out, status
+
+    # ---- work out who pays
+    window = _free_window(ctx, api_key)
+    expires = _device_live(ctx, api_key, device_id)
+    balance = _balance(ctx, api_key)
+
+    if window["in_free_window"]:
+        basis, cost = "free_window", 0
+    elif expires:
+        basis, cost = "subscribed", 0
+    else:
+        basis, cost = "metered", DECISION_MILLIPENCE
+
+    if cost and balance < cost:
+        out = {"allowed": False, "reason": "insufficient_balance",
+               "basis": "metered",
+               "balance_millipence": balance,
+               "balance_pence": _pence(balance),
+               "needed_millipence": cost,
+               "fix": ["POST /x/wallet/subscribe for this device, or",
+                       "POST /x/wallet/topup once a payment has cleared"]}
+        if dry_run:
+            out["dry_run"] = True
+            return out, 200
+        return out, 402
+
+    if dry_run:
+        return {"allowed": True, "dry_run": True, "basis": basis,
+                "would_cost_millipence": cost,
+                "balance_millipence": balance,
+                "decisions_remaining_at_this_rate":
+                    (None if not cost else balance // cost),
+                "note": "Nothing was spent, sealed or recorded."}, 200
+
+    # ---- seal first. No block, no charge.
+    new_balance = balance - cost
+    audit_hash, block_index, seq = _seal(
+        ctx, api_key, "wallet_charge", "WALLET_CHARGED", device_id,
+        {"receipt": receipt, "basis": basis, "cost_millipence": cost,
+         "balance_after": new_balance,
+         "detail": "receipt=%s;basis=%s;cost=%d;balance_after=%d"
+                   % (receipt, basis, cost, new_balance)})
+
+    if cost:
+        _set_balance(ctx, api_key, new_balance)
+
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "INSERT OR IGNORE INTO wallet_receipt "
+            "(api_key, receipt, device_id, created) VALUES (?,?,?,?)",
+            (api_key, receipt, device_id, _now()))
+        ctx["conn"].commit()
+
+    index_error = _write_ledger(ctx, api_key, "charge", -cost, new_balance,
+                                device_id=device_id, receipt=receipt,
+                                note=basis, seal_ref=audit_hash,
+                                block_index=block_index)
+
+    out = {"allowed": True, "basis": basis, "cost_millipence": cost,
+           "balance_millipence": new_balance,
+           "balance_pence": _pence(new_balance),
+           "receipt": receipt,
+           "sealed_as": audit_hash,
+           "block_index": block_index,
+           "receipt_seq": seq,
+           "device_plan_expires": expires,
+           "means": ("This decision is paid for and recorded in the chain. "
+                     "Nothing here says the decision was correct.")}
+    if index_error:
+        out["index_warning"] = (
+            "Sealed into the chain, but the ledger row did not write (%s). "
+            "The block is valid and permanent; the ledger listing may not "
+            "show this charge until the index is repaired. Reported rather "
+            "than hidden." % index_error)
+    return out, 200
+
+
+# -------------------------------------------------------------- the rest
+
+def _topup(data, api_key, ctx):
+    raw = (data or {}).get("millipence")
+    try:
+        amount = int(raw)
+    except (TypeError, ValueError):
+        return {"error": "millipence must be a whole number",
+                "note": "1000 millipence = 1 penny"}, 400
+    if amount <= 0 or amount > MAX_TOPUP_MILLIPENCE:
+        return {"error": "millipence out of range",
+                "max": MAX_TOPUP_MILLIPENCE}, 400
+
+    note = (data or {}).get("note")
+    note = note.strip()[:200] if isinstance(note, str) else None
+    if not note:
+        return {"error": "note required",
+                "why": "Every credit needs a reason recorded - the payment "
+                       "reference, invoice number or who authorised it."}, 400
+
+    balance = _balance(ctx, api_key) + amount
+
+    audit_hash, block_index, seq = _seal(
+        ctx, api_key, "wallet_topup", "WALLET_CREDITED", None,
+        {"millipence": amount, "balance_after": balance, "reference": note,
+         "detail": "credit=%d;balance_after=%d;ref=%s"
+                   % (amount, balance, note)})
+
+    _set_balance(ctx, api_key, balance)
+    _write_ledger(ctx, api_key, "topup", amount, balance, note=note,
+                  seal_ref=audit_hash, block_index=block_index)
+
+    return {"ok": True, "credited_millipence": amount,
+            "credited_pence": _pence(amount),
+            "balance_millipence": balance,
+            "balance_pence": _pence(balance),
+            "note": note, "sealed_as": audit_hash,
+            "block_index": block_index, "receipt_seq": seq}, 200
+
+
+def _subscribe(data, api_key, ctx):
+    device_id, err = _check_device((data or {}).get("device_id"))
+    if err:
+        return err, 400
+
+    halt = _open_halt(ctx, api_key)
+    if halt:
+        return _halted_response(halt)
+
+    balance = _balance(ctx, api_key)
+    if balance < DEVICE_PLAN_MILLIPENCE:
+        return {"error": "insufficient_balance",
+                "needed_millipence": DEVICE_PLAN_MILLIPENCE,
+                "needed_pence": _pence(DEVICE_PLAN_MILLIPENCE),
+                "balance_millipence": balance}, 402
+
+    now = time.time()
+    existing = _device_live(ctx, api_key, device_id)
+    base = existing if existing else now          # early renewal extends
+    expires = base + DEVICE_PLAN_DAYS * DAY
+    new_balance = balance - DEVICE_PLAN_MILLIPENCE
+
+    audit_hash, block_index, seq = _seal(
+        ctx, api_key, "wallet_subscribe", "DEVICE_SUBSCRIBED", device_id,
+        {"expires": expires, "cost_millipence": DEVICE_PLAN_MILLIPENCE,
+         "balance_after": new_balance, "extended": bool(existing),
+         "detail": "device=%s;days=%d;expires=%s"
+                   % (device_id, DEVICE_PLAN_DAYS, expires)})
+
+    _set_balance(ctx, api_key, new_balance)
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "INSERT INTO wallet_device (api_key, device_id, expires, "
+            "first_seen) VALUES (?,?,?,?) "
+            "ON CONFLICT(api_key, device_id) DO UPDATE SET "
+            "expires=excluded.expires",
+            (api_key, device_id, expires, _now()))
+        ctx["conn"].commit()
+
+    _write_ledger(ctx, api_key, "subscribe", -DEVICE_PLAN_MILLIPENCE,
+                  new_balance, device_id=device_id,
+                  note="%d days" % DEVICE_PLAN_DAYS, seal_ref=audit_hash,
+                  block_index=block_index)
+
+    return {"ok": True, "device_id": device_id, "expires": round(expires, 3),
+            "extended_from_existing": bool(existing),
+            "balance_millipence": new_balance,
+            "balance_pence": _pence(new_balance),
+            "sealed_as": audit_hash, "block_index": block_index,
+            "receipt_seq": seq}, 200
+
+
+def _devices(api_key, ctx):
+    now = time.time()
+    with ctx["lock"]:
+        rows = ctx["conn"].execute(
+            "SELECT device_id, expires, first_seen FROM wallet_device "
+            "WHERE api_key=? ORDER BY device_id", (api_key,)).fetchall()
+    devices = [{"device_id": r[0], "expires": r[1], "live": r[1] > now,
+                "days_remaining": round((r[1] - now) / DAY, 2)
+                if r[1] > now else 0,
+                "first_seen": r[2]} for r in rows]
+    return {"count": len(devices),
+            "live": sum(1 for d in devices if d["live"]),
+            "devices": devices}, 200
+
+
+def _ledger(data, api_key, ctx):
+    try:
+        limit = int((data or {}).get("limit", 50))
+    except (TypeError, ValueError):
+        limit = 50
+    limit = max(1, min(limit, MAX_LEDGER))
+    with ctx["lock"]:
+        rows = ctx["conn"].execute(
+            "SELECT kind, millipence, balance_after, device_id, receipt, "
+            "note, seal_ref, created, block_index FROM wallet_ledger "
+            "WHERE api_key=? ORDER BY id DESC LIMIT ?",
+            (api_key, limit)).fetchall()
+    return {"count": len(rows), "limit": limit,
+            "entries": [{"kind": r[0], "millipence": r[1],
+                         "balance_after": r[2], "device_id": r[3],
+                         "receipt": r[4], "note": r[5], "sealed_as": r[6],
+                         "at": r[7], "block_index": r[8]} for r in rows]}, 200
+
+
+def _review(api_key, ctx):
+    with ctx["lock"]:
+        rows = ctx["conn"].execute(
+            "SELECT id, reason, receipt, device_id, detail, created "
+            "FROM wallet_halt WHERE api_key=? AND cleared=0 ORDER BY id",
+            (api_key,)).fetchall()
+    return {"open": len(rows),
+            "halts": [{"halt_id": r[0], "reason": r[1], "receipt": r[2],
+                       "device_id": r[3], "detail": r[4], "since": r[5]}
+                      for r in rows],
+            "note": ("While any halt is open this key is stopped. Clearing "
+                     "is a human decision and is itself sealed.")}, 200
+
+
+def _clear(data, api_key, ctx):
+    try:
+        halt_id = int((data or {}).get("halt_id"))
+    except (TypeError, ValueError):
+        return {"error": "halt_id required"}, 400
+
+    who = (data or {}).get("cleared_by")
+    who = who.strip()[:120] if isinstance(who, str) else None
+    note = (data or {}).get("note")
+    note = note.strip()[:300] if isinstance(note, str) else None
+    if not who or not note:
+        return {"error": "cleared_by and note both required",
+                "why": "A halt is cleared by a named person giving a "
+                       "reason. Both are sealed."}, 400
+
+    with ctx["lock"]:
+        row = ctx["conn"].execute(
+            "SELECT reason, receipt, device_id FROM wallet_halt "
+            "WHERE id=? AND api_key=? AND cleared=0",
+            (halt_id, api_key)).fetchone()
+    if not row:
+        return {"error": "no open halt with that id for this key"}, 404
+
+    audit_hash, block_index, seq = _seal(
+        ctx, api_key, "wallet_halt_cleared", "HALT_CLEARED", row[2],
+        {"halt_id": halt_id, "reason": row[0], "receipt": row[1],
+         "cleared_by": who, "cleared_note": note,
+         "detail": "halt=%d;by=%s;note=%s" % (halt_id, who, note)})
+
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "UPDATE wallet_halt SET cleared=1, cleared_by=?, "
+            "cleared_note=?, cleared_at=? WHERE id=?",
+            (who, note, _now(), halt_id))
+        ctx["conn"].commit()
+
+    remaining = _open_halt(ctx, api_key)
+    return {"ok": True, "halt_id": halt_id, "cleared_by": who,
+            "sealed_as": audit_hash, "block_index": block_index,
+            "receipt_seq": seq,
+            "key_running": remaining is None,
+            "still_open": remaining}, 200
+
+
+def _status(api_key, ctx):
+    balance = _balance(ctx, api_key)
+    window = _free_window(ctx, api_key)
+    halt = _open_halt(ctx, api_key)
+    devices, _ = _devices(api_key, ctx)
+    return {"balance_millipence": balance,
+            "balance_pence": _pence(balance),
+            "free_window": window,
+            "devices_live": devices["live"],
+            "devices_total": devices["count"],
+            "halted": halt is not None,
+            "halt": halt,
+            "decisions_left_if_metered": balance // DECISION_MILLIPENCE,
+            "wallet_version": VERSION,
+            "settlement": "manual - topup is run by hand after payment "
+                          "clears"}, 200
+
+
+def _quote():
+    return {"device_plan": {"pence": _pence(DEVICE_PLAN_MILLIPENCE),
+                            "millipence": DEVICE_PLAN_MILLIPENCE,
+                            "days": DEVICE_PLAN_DAYS},
+            "per_decision": {"pence": _pence(DECISION_MILLIPENCE),
+                             "millipence": DECISION_MILLIPENCE},
+            "free_window_days": FREE_WINDOW_DAYS,
+            "note": ("A subscribed device's decisions cost nothing while the "
+                     "plan runs. Everything else is metered.")}, 200
+
+
+# ---------------------------------------------------------------- router
+
+def handle(method, action, data, api_key, ctx):
+    try:
+        if method == "GET" and action == "spec":
+            return _spec(), 200
+
+        if not api_key:
+            return {"error": "invalid_api_key"}, 401
+
+        _setup(ctx)
+
+        if method == "GET":
+            if action == "status":
+                return _status(api_key, ctx)
+            if action == "quote":
+                return _quote()
+            if action == "ledger":
+                return _ledger(data, api_key, ctx)
+            if action == "devices":
+                return _devices(api_key, ctx)
+            if action == "review":
+                return _review(api_key, ctx)
+
+        if method == "POST":
+            if action == "charge":
+                return _charge(data, api_key, ctx, dry_run=False)
+            if action == "simulate":
+                return _charge(data, api_key, ctx, dry_run=True)
+            if action == "topup":
+                return _topup(data, api_key, ctx)
+            if action == "subscribe":
+                return _subscribe(data, api_key, ctx)
+            if action == "clear":
+                return _clear(data, api_key, ctx)
+
+        return {"error": "unknown_action", "action": action,
+                "module": "wallet", "see": "/x/wallet/spec"}, 404
+
+    except Exception as exc:
+        return {"error": "wallet module error",
+                "detail": str(exc)[:200]}, 500
 
 ```
 
 
-## `modules/spec.py`
+## `modules/warmup.py`
 
-121 lines, 5086 bytes
+211 lines, 7688 bytes
 
 ```python
 """
-Live API specification - /x/spec
+modules/warmup.py  v1.0  -  arm every page module in one request
 
-/api/spec is a hardcoded constant. It describes the API as it was when
-somebody last remembered to update it, which is a documentation problem
-pretending to be a feature.
+THE PROBLEM THIS ENDS
+---------------------
+console.py, packconsole.py, peerconsole.py, selfcheck.py and the rest all
+install their page by patching do_GET at runtime, and that only happens the
+first time their handle() runs. So after every deploy the pages 404 until
+somebody happens to hit each module's /x/ route.
 
-This discovers what is actually loaded, right now, by reading the modules
-directory and each module's own docstring. Add a module and the spec
-updates itself. Delete one and it disappears. There is no separate list to
-maintain and therefore no list that can drift.
+Worse, most of those modules only make `status` public. A keyless request to
+/x/console/ is rejected by the router before the module is ever imported, so
+the obvious way of arming them does not work and looks like a broken site
+instead of a cold one.
 
-That matters here more than it would elsewhere: a platform whose pitch is
-"check it, don't trust it" should not ship a self-description that is
-quietly out of date.
+WHAT THIS DOES
+--------------
+One public route that imports each page module and calls its handle() once,
+which is exactly what installs the patch. Every page comes back in a single
+request, with no key.
 
-    GET /x/spec           everything currently live
-    GET /x/spec/modules   just the module list
+    GET /x/warmup/all       arm everything, report what happened
+    GET /x/warmup/status    what is armed right now, arms nothing
+    GET /x/warmup/spec      what this is
+
+POINT RAILWAY AT IT
+-------------------
+Set the healthcheck path to:
+
+    /x/warmup/all
+
+Railway calls it after every deploy, so the site is armed before anyone
+opens it. It always returns 200 as long as the process is up - a module
+that fails to arm is reported in the body rather than failing the
+healthcheck, because one broken page should not roll back a good deploy.
+
+SAFE TO RUN REPEATEDLY
+----------------------
+Every module guards its own patch with a `_patched` flag, so a second call
+is a no-op. Call it every minute if you like.
+
+ADDING A MODULE
+---------------
+Put its name in PAGE_MODULES. Nothing else. If the module is not deployed
+it is reported as missing and the others still arm.
 """
 
-import importlib, os, pkgutil, re
+import importlib
+import sys
+import time
+import traceback
 
 VERSION = "1.0"
 
-_EP = re.compile(r"^\s*(GET|POST|PUT|DELETE)\s+(/\S+)\s*(.*)$")
+PUBLIC = {("GET", "all"), ("GET", "status"), ("GET", "spec"), ("GET", "")}
+
+# Modules that serve an HTML page by patching do_GET at runtime.
+# Name only - no path, no .py.
+PAGE_MODULES = [
+    "console",
+    "packconsole",
+    "peerconsole",
+    "selfcheck",
+    "savings",
+    "standard",
+    "network",
+    "demo",
+]
+
+# Import prefixes tried in order. Different deployments load modules
+# differently and guessing once and failing is how you get a 404 you
+# cannot explain.
+_PREFIXES = ("modules.", "", "aileash.modules.")
+
+_last_run = {"at": None, "results": None}
 
 
-def _describe(name):
-    """Pull a module's summary and endpoint list out of its own docstring."""
+def _find(name):
+    """Return an already-imported module, or import it. (module, how) or (None, why)."""
+    for pre in _PREFIXES:
+        mod = sys.modules.get(pre + name)
+        if mod is not None:
+            return mod, "already imported as " + pre + name
+    errors = []
+    for pre in _PREFIXES:
+        try:
+            return importlib.import_module(pre + name), "imported as " + pre + name
+        except ImportError as exc:
+            errors.append(pre + name + ": " + str(exc))
+        except Exception as exc:
+            # A real error inside the module - a syntax error, a bad import
+            # of its own. Worth reporting properly rather than as "missing",
+            # because those look identical from outside and cost hours.
+            return None, "FAILED TO LOAD (%s): %s" % (
+                type(exc).__name__, str(exc)[:200])
+    return None, "not found (" + "; ".join(errors[:1]) + ")"
+
+
+def _arm(name, ctx):
+    """Import a page module and call handle() once, which installs its patch."""
+    mod, how = _find(name)
+    if mod is None:
+        return {"module": name, "armed": False, "detail": how}
+
+    fn = getattr(mod, "handle", None)
+    if not callable(fn):
+        return {"module": name, "armed": False,
+                "detail": "loaded but has no handle()"}
+
     try:
-        m = importlib.import_module("modules." + name)
-    except Exception as e:
-        return {"module": name, "loaded": False, "error": str(e)}
-    doc = (m.__doc__ or "").strip()
-    lines = doc.splitlines()
-    summary = ""
-    for ln in lines:
-        t = ln.strip()
-        if t and not t.startswith("-") and not _EP.match(ln):
-            summary = t
-            break
-    endpoints = []
-    for ln in lines:
-        mm = _EP.match(ln)
-        if mm:
-            endpoints.append({"method": mm.group(1),
-                              "path": mm.group(2),
-                              "takes": mm.group(3).strip() or None})
-    out = {"module": name, "loaded": True, "summary": summary,
-           "endpoints": endpoints,
-           "version": getattr(m, "VERSION", None)}
-    if not hasattr(m, "handle"):
-        out["warning"] = "module has no handle() - it will not route"
+        body, status = fn("GET", "status", {}, None, ctx)
+    except Exception as exc:
+        return {"module": name, "armed": False,
+                "detail": "handle() raised %s: %s" % (
+                    type(exc).__name__, str(exc)[:200]),
+                "traceback": traceback.format_exc(limit=3).splitlines()[-3:]}
+
+    body = body if isinstance(body, dict) else {}
+    armed = bool(body.get("installed", True))
+    out = {"module": name, "armed": armed, "http": status, "load": how}
+    for k in ("page", "install_result", "version"):
+        if k in body:
+            out[k] = body[k]
+    if not armed:
+        out["detail"] = body.get("install_result") or "reported not installed"
     return out
 
 
-def _modules():
-    d = os.path.dirname(__file__)
-    names = sorted(x.name for x in pkgutil.iter_modules([d])
-                   if x.name not in ("router", "spec"))
-    return [_describe(n) for n in names]
+def _status_only(ctx):
+    """What is armed, without arming anything. Read-only."""
+    rows = []
+    for name in PAGE_MODULES:
+        found = None
+        for pre in _PREFIXES:
+            if (pre + name) in sys.modules:
+                found = sys.modules[pre + name]
+                break
+        if found is None:
+            rows.append({"module": name, "loaded": False, "armed": False})
+            continue
+        flag = getattr(found, "_patched", None)
+        armed = bool(flag[0]) if isinstance(flag, list) and flag else None
+        rows.append({"module": name, "loaded": True, "armed": armed,
+                     "page": getattr(found, "PAGE_PATHS", [None])[0]
+                             if hasattr(found, "PAGE_PATHS") else None})
+    return rows
 
 
 def handle(method, action, data, api_key, ctx):
+    action = (action or "").strip().lower()
+
     if method != "GET":
-        return {"error": "unknown_action", "action": action}, 404
+        return {"error": "unknown_action", "action": action,
+                "GET": ["all", "status", "spec"]}, 404
 
-    mods = _modules()
-
-    if action == "modules":
-        return {"count": len(mods), "modules": mods}, 200
-
-    if action in ("", "all"):
+    if action == "spec":
         return {
-            "spec_version": VERSION,
-            "generated": "live - discovered at request time, not a stored list",
-            "core": {
-                "decision_engine": {
-                    "path": "/api/govern",
-                    "method": "POST",
-                    "auth": "Bearer key",
-                    "note": "deterministic scoring, verdict sealed before the response returns"
-                },
-                "notaries_public": [
-                    {"method": "POST", "path": "/api/post/seal", "auth": "none"},
-                    {"method": "GET", "path": "/api/verify-post", "auth": "none"},
-                    {"method": "POST", "path": "/api/identity/seal", "auth": "none"},
-                    {"method": "GET", "path": "/api/identity/check", "auth": "none"},
-                    {"method": "POST", "path": "/api/payment/seal", "auth": "none"},
-                    {"method": "GET", "path": "/api/payment/check", "auth": "none"}
-                ],
-                "verification_public": [
-                    {"method": "GET", "path": "/api/verify-chain",
-                     "returns": "whole-chain integrity, recomputed"},
-                    {"method": "GET", "path": "/api/inclusion",
-                     "returns": "whether a given 64-char hash is sealed"},
-                    {"method": "GET", "path": "/api/anchor-status",
-                     "returns": "current tip, OpenTimestamps proof, calendar count"},
-                    {"method": "GET", "path": "/api/regulation-map",
-                     "returns": "engine features mapped to legal obligations"}
-                ]
+            "module": "warmup",
+            "version": VERSION,
+            "what_it_is": (
+                "Page modules install their route by patching do_GET the "
+                "first time they run, so every deploy leaves those pages "
+                "404 until something touches each one. This touches all of "
+                "them in one public request."),
+            "routes": {
+                "/x/warmup/all": "arm every page module, report each",
+                "/x/warmup/status": "what is armed now, arms nothing",
+                "/x/warmup/spec": "this",
             },
-            "modules": {
-                "prefix": "/x/<module>/<action>",
-                "auth": "Bearer key on every module route",
-                "count": len(mods),
-                "loaded": mods
-            },
-            "chain": {
-                "algorithm": "SHA-256 hash chain",
-                "scope": "one chain - every module seals into the same sequence as /api/govern",
-                "anchoring": "chain tip submitted to OpenTimestamps, aggregated into a Merkle root, root committed to Bitcoin by several independent calendars",
-                "receipts": "gapless per-key sequence issued in the same transaction as the chain write",
-                "verify": "/api/verify-chain and /api/anchor-status, both without a key"
-            },
-            "honest_note": "This spec is generated by reading the modules directory at request time rather than from a stored list, so it cannot describe capabilities that are not actually loaded."
+            "railway_healthcheck_path": "/x/warmup/all",
+            "modules": list(PAGE_MODULES),
+            "safe_to_repeat": True,
+            "note": ("Always returns 200 while the process is up. A module "
+                     "that fails to arm is reported in the body, because one "
+                     "bad page should not roll back a good deploy."),
         }, 200
 
-    return {"error": "unknown_action", "action": action,
-            "available": ["", "modules"]}, 404
+    if action == "status":
+        return {"armed_now": _status_only(ctx),
+                "last_warmup": _last_run["at"],
+                "note": "Read-only. Call /x/warmup/all to actually arm."}, 200
+
+    # "" or "all"
+    t0 = time.time()
+    results = [_arm(name, ctx) for name in PAGE_MODULES]
+    _last_run["at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    _last_run["results"] = results
+
+    armed = [r["module"] for r in results if r.get("armed")]
+    failed = [r for r in results if not r.get("armed")]
+
+    for r in failed:
+        print("WARMUP: %s did not arm - %s"
+              % (r["module"], r.get("detail", "?")), flush=True)
+    print("WARMUP: %d/%d armed in %.0fms"
+          % (len(armed), len(results), (time.time() - t0) * 1000), flush=True)
+
+    return {
+        "ok": True,
+        "armed": len(armed),
+        "of": len(results),
+        "took_ms": round((time.time() - t0) * 1000, 1),
+        "pages_ready": [r.get("page") for r in results
+                        if r.get("armed") and r.get("page")],
+        "results": results,
+        "at": _last_run["at"],
+        "note": ("A module listed as not armed is either not deployed or "
+                 "raised on load - the detail says which. The rest still "
+                 "armed."),
+    }, 200
 
 ```
 
 
-## `modules/standard.py`
+## `modules/witness.py`
 
-422 lines, 19423 bytes
+1103 lines, 52024 bytes
 
 ```python
 """
-modules/standard.py  -  the Ordering Test discovery document for this domain
+Mutual witness network - /x/witness/<action>
 
-WHAT IT SERVES
+THE PROBLEM
+-----------
+Every compliance vendor, this one included, holds the evidence about its own
+conduct. A hash chain stops anyone else altering it. It does not stop the
+operator rebuilding the whole chain from scratch and presenting the result as
+history. External anchoring narrows that to "you cannot rewrite anything older
+than your last CONFIRMED anchor" - which is good, and still not enough.
+
+WHAT THIS DOES
 --------------
-  GET /.well-known/ordering-test.json   this operator's discovery document
-  GET /x/standard/hash                  sha256 of that document
-  GET /x/standard/status                what is installed, and honest counts
+Platforms witness each other.
 
-SHAPE
------
-Deliberately identical to the shape Red Flag AI Pro published first:
+Each platform periodically hands its current chain tip to its peers. Each peer
+seals that tip into its OWN chain. From that moment the first platform's
+history is recorded inside chains it does not control.
 
-    checks: { <name>: { supported, demonstrable_publicly, endpoint, note } }
+To rewrite your own history now, you would need every peer who witnessed you
+to rewrite theirs too, in step. That is not a technical exercise. That is a
+conspiracy, and it grows harder with every platform that joins.
 
-Two fields, not one, and the second is the better idea. "We built it" and
-"you can verify it without an account" are different claims, and most of this
-market blurs them. Separating them lets a vendor be honest about having
-something real that an outsider still has to take on trust.
+WHY observe IS OPEN
+-------------------
+A witnessing network that only accepts tips from account holders is not a
+witnessing network, it is a customer list. Anyone must be able to hand us a
+tip without asking permission. Unauthenticated observations are filed under
+ANON_KEY, and the router meters them per client address.
 
-WHAT THE HOST HEADER IS DOING HERE
-----------------------------------
-base_url is derived from the request rather than written into the file. An
-earlier draft had the domain hardcoded, which meant any operator running it
-would publish somebody else's domain as the source - the opposite of a mirror.
-Deriving it means this file can be lifted to any domain and tells the truth
-about wherever it is actually running.
+NAMES, AND WHAT WE CAN ACTUALLY PROVE ABOUT THEM
+------------------------------------------------
+The chain name in a submission is self-declared. Anyone can post under any
+name. We do not solve that with accounts, because accounts would make the
+network closed. We solve it by publishing how strong each claim is, and by
+remembering.
 
-EVERY PUBLISHED ENDPOINT MUST WORK AS WRITTEN
----------------------------------------------
-An endpoint marked demonstrable_publicly is a promise that a stranger can copy
-it out of this document and get an answer. If the route needs a parameter, the
-document names that parameter. If a value has to be discovered first, the
-document says where to discover it. An endpoint that errors when followed
-literally is a failed check, not a documentation detail.
+Two independent checks run on every submission, and NEITHER of them can
+reject it. A submission is always sealed. What changes is what we say about it.
 
-HONESTY RULES THIS FILE FOLLOWS
--------------------------------
-  - A check we have not built says supported: false. It does not quietly go
-    missing from the document.
-  - A check that exists but needs an account says demonstrable_publicly:
-    false, however much we would like the tick.
-  - runner is null. A runner exists in draft, but the checks have not been
-    jointly agreed with the other mirror, so publishing one as though it were
-    a settled standard would claim something neither operator has earned yet.
+1. LIVENESS - is there a real chain behind this name?
+   If the submission carries a url, we fetch it and compare what it serves
+   to what was submitted.
+     self-consistent  the url serves exactly the tip that was submitted
+     live             the url serves a valid tip, but a different one. A busy
+                      chain moves between submitting and our fetching, so this
+                      is normal and honest, not a failure
+     self-declared    no url, or we could not reach it, or we reached it and
+                      it did not serve a valid tip
 
-None of that is modesty. A conformance document whose author scores full marks
-on the day they publish it is a marketing page.
+   WHY "self-consistent" AND NOT "confirmed" (changed in 1.2)
+   ----------------------------------------------------------
+   Both halves of this check come from the same party. The submitter tells us
+   the tip and the submitter tells us where to look. Agreement between them
+   establishes that the submitter's endpoint agrees with the submitter. That
+   is self-consistency, not verification by anyone else.
+
+   Up to v1.1 this value was written as "confirmed", which was the only
+   approving word in a schema deliberately built without adjectives - and the
+   permanent one, since it is sealed. The docstring carried the caveat and the
+   field name contradicted it. Raised by Ishaan (Shango MID), correctly, and
+   changed rather than defended.
+
+   Blocks sealed before 1.2 say "confirmed" and cannot be altered - that is
+   the property working as intended. Both values mean the same check. The
+   legend on /x/witness/peers names both.
+
+   It still proves the submitter operates a live chain producing that data. It
+   does NOT prove they are who they say. Anyone running a real chain can point
+   a stolen name at their own url and pass this check cleanly.
+
+2. NAME BINDING - is this the same operator as last time?
+   The first time a name is seen with a url we can reach, we record that url
+   against the name. Every later submission under that name is compared.
+     first-use      never seen this name before, binding recorded
+     bound          same url as the first time. Same operator, consistently
+     conflict       this name has been submitted from a different url than
+                    the one it was first bound to
+
+   A conflict is not proof of theft. Operators move hosts. But it is exactly
+   the event anyone auditing the network needs to see, and it is recorded
+   permanently in our chain rather than resolved quietly by us.
+
+   This is what actually closes name theft. Check 1 alone does not.
+
+REACHED IS NOT THE SAME AS PARSED (corrected in 1.4)
+-----------------------------------------------------
+Up to v1.3 a submission whose url answered with HTML sealed this flag:
+
+    "url did not return json; no reachable url, so nothing to bind this
+     name to"
+
+The first clause is true. The second is false. The url was reachable - it
+answered, over TLS, with a body. What the check established was that the body
+was not JSON, and it then asserted a conclusion about reachability that it had
+never tested. That statement is sealed and cannot be withdrawn.
+
+It is the same failure as the "confirmed" rename one field over: wording that
+claimed more than the check performed. That it happened again, in a file whose
+whole purpose is claim discipline, is the point rather than the excuse. Raised
+by Ishaan (Shango MID) against block 1600, correctly.
+
+Two things changed:
+
+  - reachability is now its own recorded value, not something inferred from a
+    parse failure. REACHED_YES, REACHED_NO and REACHED_UNTRIED are sealed
+    alongside liveness, so "we got a response we could not use" and "we never
+    got a response" stop being the same record.
+
+  - no message in this module asserts unreachability unless the fetch actually
+    failed to connect. Where a url answered and was unusable, the record says
+    exactly that.
+
+Older blocks keep their original wording, including the false clause. They are
+not editable and pretending otherwise would defeat the point of sealing them.
+What this version changes is what gets written from here on.
+
+WHY EVERY READER-FACING PHRASE LIVES IN ONE BLOCK (added in 1.3)
+-----------------------------------------------------------------
+Four separate corrections in one week were all the same job: find the
+sentence, change the sentence, and hope there is not a second copy of it
+somewhere else in the file. There usually was. A word that goes into a sealed
+record, or into a response a peer will quote back at us, is not incidental
+prose - it is part of the interface, and it needs one home.
+
+Everything a reader sees now lives in VOCABULARY and MESSAGES at the top of
+this file. The code below references those keys and never spells a claim out
+inline. The next peer who finds an overstatement costs one line in one place,
+and the wording can be reviewed on its own without reading the logic.
+
+SSRF
+----
+Check 1 makes our server fetch a url chosen by an anonymous stranger. Done
+naively that is a hole considerably worse than the one it fixes: it would let
+anyone use us to reach services on our own private network, and to bounce
+traffic at a third party. So the fetcher only speaks http and https, only on
+ports 80 and 443, resolves the hostname first and refuses any address that is
+private, loopback, link-local, reserved or multicast, never follows a
+redirect, times out fast, and stops reading after a small cap.
+
+HONEST LIMITS
+-------------
+- Nobody can be forced to keep publishing. A witness network's guarantee is
+  only as durable as its least persistent member, and that is not a property
+  any amount of design can fix. Listed first because it is the one that
+  actually bites.
+- ANCHORING IS PER-PROOF, NOT A PROPERTY OF THE CHAIN. Up to v1.2 this module
+  told readers "our chain is externally anchored" as a standing fact. It is
+  not. A proof is submitted to the OpenTimestamps calendars immediately, and
+  only becomes Bitcoin-confirmed once it has been upgraded and independently
+  verified. A given block is anchored when a proof covering it has confirmed,
+  and not before. Raised by Philip Pinol (PRAXIS / ThePraesidium.ai) against
+  block 846, correctly. Every route now points at /x/ots/status rather than
+  asserting a state this module cannot see.
+- Witnessing proves a tip EXISTED at a time. It says nothing about whether the
+  records behind it are true or complete. Garbage sealed on time is still
+  garbage.
+- Two colluding platforms witnessing only each other prove very little. The
+  guarantee comes from breadth.
+- This module does not verify a peer's chain is internally valid. It records
+  what they claimed, when, and how well it stood up to checking.
+- REACHED_YES means we received an HTTP response. It does not mean the
+  endpoint is the peer's, that it is healthy, or that anything it served is
+  true. It is the narrowest possible fact and is recorded as such.
+- The liveness fetch resolves a hostname and then fetches it. An attacker
+  controlling DNS could answer differently between those two steps. Closing
+  that needs the connection pinned to the checked address, which is more
+  machinery than this warrants today. It is written down rather than hidden.
+
+    GET  /x/witness/tip                 our current tip, for peers to record
+    POST /x/witness/observe             chain, tip, url - we seal their tip
+                                        (peer accepted as an alias for chain;
+                                         optional peer_ts or ts, epoch or ISO)
+    GET  /x/witness/attest?peer=&tip=   did we witness this, and when
+    GET  /x/witness/peers               who we witness, and how consistently
+    GET  /x/witness/spec                the protocol, in four calls
+    GET  /x/witness/history?peer=       every tip we hold for that peer (keyed)
 """
 
-import hashlib
+import ipaddress
 import json
-import sys
+import re
+import socket
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from urllib.parse import urlparse
 
-VERSION = "1.2"
-ORDERING_TEST_VERSION = "0.1"
+VERSION = "1.4"
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
-PUBLIC = {("GET", "status"), ("GET", "hash"), ("GET", "spec"),
-          ("GET", "document")}
+# ----------------------------------------------------------------------
+# values that get sealed
+#
+# Anything in this section is written into a permanent record AND compared
+# against in code. Both roles are invisible to each other from outside, which
+# is exactly how renaming the match value in 1.2 silently broke first-use
+# binding. One constant, one meaning, every comparison through the name.
+# ----------------------------------------------------------------------
 
-# Several paths on purpose. /.well-known/ is where the standard says to look,
-# but some platforms and static handlers reserve that prefix, so a plain root
-# path is served as well. /x/standard/document goes through the normal router
-# and cannot be intercepted by anything, which makes it the diagnostic.
-DISCOVERY_PATHS = ("/.well-known/ordering-test.json",
-                   "/ordering-test.json",
-                   "/well-known/ordering-test.json")
+# The liveness value written when a submitted url serves exactly the submitted
+# tip. Was "confirmed" up to v1.1 - see the docstring.
+LIVENESS_MATCH = "self-consistent"
 
-VENDOR = "AILeash"
-FALLBACK_BASE = "https://sebbi.pro"
+# Historical value for the same check, still present in blocks sealed before
+# v1.2. Sealed blocks cannot be altered, so both are accepted wherever a
+# comparison is made.
+LIVENESS_MATCH_LEGACY = "confirmed"
 
-RUNNER = None
-RUNNER_NOTE = (
-    "No shared runner file is published here yet. The checks themselves have "
-    "not been jointly agreed with the other mirrors as of this document's "
-    "publication. This describes AILeash's own side only, not a settled "
-    "cross-vendor standard.")
+# The url answered with a valid tip, but a different one. A moving chain.
+LIVENESS_MOVED = "live"
 
-# Order follows the other mirror's document so the two read side by side.
-CHECKS = {
-    "rule_binding": {
-        "supported": True,
-        "demonstrable_publicly": True,
-        "endpoint": "/x/rulebind/prove",
-        "note": ("The ruleset version is a component of a digest sealed with the "
-                 "decision, not a field beside it. POST any inputs without an "
-                 "account and the response returns the exact string that was "
-                 "hashed - SHA-256 it yourself and confirm it matches. Alter the "
-                 "ruleset hash and the digest stops recomputing; alter the digest "
-                 "and the chain breaks. Verify a past record at "
-                 "/x/rulebind/verify?receipt=... and see ruleset history at "
-                 "/x/rulebind/packs. No scoring logic is disclosed at any point - "
-                 "inputs are published as a digest, never as values."),
-    },
-    "commit_before_reveal": {
-        "supported": True,
-        "demonstrable_publicly": True,
-        "endpoint": "/x/demo/review",
-        "note": ("The reviewer receives the case with the machine verdict "
-                 "withheld. Their own call and dwell time are sealed first, "
-                 "then the verdict is revealed, and the chain fixes that order "
-                 "permanently. No account needed - open a case, commit a "
-                 "verdict, and check the block indices yourself. Commit "
-                 "endpoint is /x/demo/commit."),
-    },
-    "authority_tokens": {
-        "supported": True,
-        "demonstrable_publicly": True,
-        "endpoint": "/x/continuity/decisions",
-        "note": ("Authority is derived, not looked up. Every grant points at a "
-                 "parent and terminates at a human principal; scope, limits, "
-                 "purpose and validity must narrow at every hop; and the whole "
-                 "chain is re-derived at the instant of execution rather than "
-                 "trusted from the instant of issue. A decision beyond delegated "
-                 "authority escalates rather than executes. Issuing and exercising "
-                 "authority are keyed, but the record is not: /x/continuity/decisions "
-                 "lists real sealed evaluations without an account, and any id from "
-                 "it opens at /x/continuity/decision and /x/continuity/trace, which "
-                 "returns the full authority path with the grant and invariant that "
-                 "broke. Blocks are listed alongside allows, because a refusal with "
-                 "no public record is indistinguishable from never having been asked. "
-                 "An empty list means no authority has been exercised yet, not that "
-                 "none failed. Derivation rules at /x/continuity/spec."),
-    },
-    "mutual_witnessing": {
-        "supported": True,
-        "demonstrable_publicly": True,
-        "endpoint": "/x/witness/peers",
-        "note": ("Live, running both directions with an external peer chain "
-                 "hourly since 1 August 2026. No account needed, run it "
-                 "yourself. Our current tip is at /x/witness/tip and any party "
-                 "can submit theirs at /x/witness/observe without an account."),
-    },
-    "completeness_proof": {
-        "supported": True,
-        "demonstrable_publicly": True,
-        "endpoint": "/x/complete/root?period={period}&kind=receipts",
-        "note": ("Per-period sorted Merkle root and exact leaf count, committed "
-                 "before any export is requested. An export can then be checked "
-                 "against a number fixed before anyone knew it would be asked "
-                 "for. Committed periods are listed at /x/complete/periods - "
-                 "take a period identifier from there and substitute it. Only "
-                 "closed periods can be committed, so the current period will "
-                 "not appear until it ends. A period listed nowhere is a period "
-                 "nobody committed, which is itself the finding."),
-    },
-    "absence_proof": {
-        "supported": True,
-        "demonstrable_publicly": True,
-        "endpoint": "/x/complete/prove?period={period}&value={value}",
-        "note": ("Two adjacent leaves with consecutive indices demonstrate that "
-                 "nothing sits between them, so absence is proved rather than "
-                 "asserted. Both parameters are required: take a period from "
-                 "/x/complete/periods and supply any value you like. Try a "
-                 "value that is not there."),
-    },
-    "reconciliation": {
-        "supported": True,
-        "demonstrable_publicly": True,
-        "endpoint": "/x/reconcile/public",
-        "note": ("The sample is derived from the chain tip and sealed BEFORE any "
-                 "data is requested, so the operator cannot choose which records "
-                 "get examined or prepare only the flattering ones. Planning and "
-                 "submitting are keyed because they touch an operator's own "
-                 "records, but the part that decides whether any of it means "
-                 "anything is not: /x/reconcile/public gives run counts, match "
-                 "rates and mismatches without an account, and "
-                 "/x/reconcile/proof?id=RUN-XXXXXXXX shows the two sealed block "
-                 "indices so anyone can confirm the selection block precedes the "
-                 "result block. Abandoned runs are published too - a plan is "
-                 "sealed when it is planned, so a test that came back badly and "
-                 "was dropped stays visible forever as a plan with no result. "
-                 "What this does not prove: that the records are true. Two "
-                 "systems the operator controls agreeing with each other is "
-                 "consistency, not truth."),
-    },
-    "reproducibility": {
-        "supported": True,
-        "demonstrable_publicly": True,
-        "endpoint": "/x/replay/challenge",
-        "note": ("Determinism proved by public challenge without disclosing any "
-                 "scoring logic. Submit inputs, the run is sealed, resubmit the "
-                 "same inputs later and the verdict must be identical under an "
-                 "unchanged code fingerprint at /x/replay/fingerprint."),
-    },
-    "consistency_proof": {
-        "supported": True,
-        "demonstrable_publicly": True,
-        "endpoint": "/x/consistency/proof?first={first}&second={second}",
-        "note": ("RFC 6962 consistency proofs, deliberately unmodified so "
-                 "existing Certificate Transparency verifiers work against them "
-                 "directly. first and second are tree sizes - read the current "
-                 "size from /x/consistency/root and pick any earlier one. "
-                 "Anyone holding any earlier tip we served can show it is a "
-                 "prefix of the current log at /x/consistency/ancestor."),
-    },
+# No url, unreachable url, or a url that answered without a valid tip.
+LIVENESS_NONE = "self-declared"
 
-    # ---- proposed addition, flagged as a proposal rather than assumed ----
-    "external_anchoring": {
-        "supported": True,
-        "demonstrable_publicly": True,
-        "endpoint": "/api/anchor-status",
-        "note": ("PROPOSED AS A SEPARATE CHECK, not settled. The other mirror "
-                 "currently folds anchoring into consistency_proof, but they "
-                 "answer different questions: consistency shows the log only "
-                 "ever grew, anchoring shows the time was fixed somewhere the "
-                 "operator cannot reach. A log can be perfectly append-only and "
-                 "still have been built last week. Here the tip is submitted to "
-                 "OpenTimestamps and committed into Bitcoin; the other mirror "
-                 "uses an RFC 3161 timestamp. The spec should permit any "
-                 "external authority the operator does not control and require "
-                 "it to be named - not mandate one. Offered for the joint "
-                 "session."),
-    },
+# Values that count as "we reached a url and it served a valid tip", for the
+# purpose of binding a name to that url.
+LIVENESS_REACHED = (LIVENESS_MATCH, LIVENESS_MATCH_LEGACY, LIVENESS_MOVED)
+
+# Reachability. Added in 1.4 and deliberately separate from liveness, because
+# conflating the two is what put a false statement in a sealed block. This
+# records only whether an HTTP response arrived - not what was in it.
+REACHED_YES = "reached"
+REACHED_NO = "not-reached"
+REACHED_UNTRIED = "not-attempted"
+
+NAME_FIRST = "first-use"
+NAME_BOUND = "bound"
+NAME_CONFLICT = "conflict"
+NAME_UNBOUND = "unbound"
+
+# ----------------------------------------------------------------------
+# everything a reader sees
+#
+# Nothing below this block spells out a claim inline. If a phrase needs
+# correcting it is corrected here, once, and every route that returns it
+# changes together.
+# ----------------------------------------------------------------------
+
+# Said wherever this module would previously have asserted that the chain is
+# anchored. It is not this module's fact to assert - anchoring state lives in
+# the OTS proofs and only /x/ots/status can see it.
+ANCHOR_NOTE = (
+    "Separately from the hash chain: this deployment submits its chain to the "
+    "OpenTimestamps calendars for Bitcoin anchoring. Submission is not "
+    "confirmation. A block is Bitcoin-confirmed only once a proof covering it "
+    "has been upgraded and verified with a standard OpenTimestamps client. "
+    "Check /x/ots/status for the state of the proof covering this block. "
+    "Until that proof confirms, the guarantee here is the hash chain and not "
+    "Bitcoin."
+)
+
+VOCABULARY = {
+    LIVENESS_MATCH: (
+        "The submitted url served exactly the submitted tip. Both halves came "
+        "from the submitter, so this records self-consistency - NOT "
+        "verification by us or any third party. Written as '%s' from witness "
+        "v1.2 onward." % LIVENESS_MATCH),
+    LIVENESS_MATCH_LEGACY: (
+        "The same check as '%s', under the name used before witness v1.2. It "
+        "was renamed because the old name implied third-party verification "
+        "that the check does not perform. Sealed blocks cannot be altered, so "
+        "this record keeps the original word." % LIVENESS_MATCH),
+    LIVENESS_MOVED: (
+        "The url served a valid but different tip. A chain that moves between "
+        "submitting and our fetching is the normal case, not a failure."),
+    LIVENESS_NONE: (
+        "No usable tip was obtained. That covers three different situations - "
+        "no url was supplied, a url was supplied and could not be reached, or "
+        "a url was reached and did not serve a valid tip. Read the "
+        "'reachability' field beside this one to see which. Before witness "
+        "v1.4 those three were reported identically and the flag text "
+        "asserted unreachability in all of them, which was wrong in the third "
+        "case and is sealed in blocks from that period."),
+    None: "Not checked. Recorded before liveness checking existed.",
 }
 
-DOCUMENT_NOTE = (
-    "Every endpoint marked demonstrable_publicly is unauthenticated by design - "
-    "run it yourself without asking us. Where an endpoint carries a {parameter}, "
-    "the note for that check says where to get a valid value; every published "
-    "endpoint is meant to work when followed literally, and one that does not is "
-    "a failed check on our side, not a quibble. Checks marked supported but not "
-    "demonstrable_publicly are real and built, but currently need a key to see, "
-    "and say so plainly rather than passing on the day this was published. "
-    "Nothing here proves the records are true. It describes the order things "
-    "were committed in, which is a narrower claim and the only one that holds.")
+# Added in 1.4. Reachability answers one question and nothing else: did an
+# HTTP response arrive. It says nothing about the content, the health of the
+# endpoint, or who operates it.
+REACH_VOCABULARY = {
+    REACHED_YES: (
+        "An HTTP response was received from the submitted url. That is the "
+        "whole claim. It does not mean the response was usable, that the "
+        "endpoint belongs to the submitter, or that anything it served is "
+        "true - only that the address answered."),
+    REACHED_NO: (
+        "A url was supplied and no HTTP response was received - refused, "
+        "timed out, would not resolve, or was refused by our own address "
+        "rules before any request was made."),
+    REACHED_UNTRIED: (
+        "No url was supplied, so nothing was attempted. Distinct from "
+        "'not-reached', which means we tried and failed."),
+    None: (
+        "Not recorded. This observation predates witness v1.4, when "
+        "reachability and parseability were reported as one value."),
+}
 
-_patched = [False]
+NAME_VOCABULARY = {
+    NAME_FIRST: (
+        "First time this name was seen with a url serving a valid tip, so the "
+        "name is now bound to it network-wide. Any later submission under this "
+        "name from a different address records as conflict, permanently."),
+    NAME_BOUND: (
+        "Submitted from the same url this name was first bound to. Same "
+        "operator, consistently."),
+    NAME_CONFLICT: (
+        "This name has been submitted from a different address than the one "
+        "it was first bound to. Not proof of theft - operators move hosts - "
+        "but it is the event an auditor needs to see, and it is permanent."),
+    NAME_UNBOUND: (
+        "No url served a valid tip, so there is nothing to bind this name to. "
+        "Note that this covers a url we never reached AND a url that answered "
+        "with something we could not use - check the 'reachability' field to "
+        "see which happened here. "
+        "IMPORTANT: an unbound name stays claimable. Whoever submits it next "
+        "WITH a url serving a valid tip takes the binding, and your own later "
+        "submission would then read conflict. We cannot prevent that - an "
+        "open endpoint has no way to tell two claimants apart - but a binding "
+        "placed over a name that was submitted before is recorded as such. If "
+        "the name matters, either submit with a url serving your tip, or use "
+        "the signed lane at /x/peer/submit."),
+    None: "Not checked.",
+}
+
+# What the signed lane does and does not bind. Agreed wording, unsoftened:
+# a shared secret is held by both parties, so it excludes third parties and
+# does not exclude the operator. Stated here rather than left for a peer to
+# work out from the word "signed".
+SIGNED_LANE_NOTE = (
+    "The signed lane at /x/peer/submit binds a name to knowledge of a shared "
+    "secret, not to control of an address. Because the operator of this "
+    "deployment holds the same secret, it closes third-party submission under "
+    "your name and does not close operator submission under your name. That "
+    "is a normal property of HMAC and it is stated rather than implied."
+)
+
+MESSAGES = {
+    "tip_note": (
+        "Record this tip in your own chain. Hand us yours at "
+        "/x/witness/observe and we will record it in ours."),
+    "tip_verify": (
+        "/api/verify-chain checks this chain end to end. /x/ots/status shows "
+        "the state of each external timestamp proof."),
+    "observe_ok": (
+        "Your tip is now inside a chain you do not control. What that block "
+        "carries is stated in what_this_proves - it is a record that this "
+        "value was handed to us at this time, and nothing about whether the "
+        "records behind it are true."),
+    "observe_advice": (
+        "Send a url serving your current tip and this becomes checkable by "
+        "anyone rather than taken on your word. Read name_vocabulary first: "
+        "withholding a url also leaves the name claimable."),
+    "observe_advice_unusable": (
+        "Your url answered but did not serve a tip we could read, so there is "
+        "nothing to bind the name to. We accept a tip as 64 lowercase hex in "
+        "a JSON object under any of the field names listed at "
+        "/x/witness/spec. This is a parsing outcome and not a statement that "
+        "your endpoint is down - the reachability field records that "
+        "separately."),
+    "observe_conflict": (
+        "Sealed, and flagged. This name has been used from a different "
+        "address before. That discrepancy is now permanent in our chain."),
+    "attest_proves": (
+        "That this tip was handed to us at this time and sealed into our "
+        "chain. Liveness records whether a url the submitter supplied served "
+        "the same tip the submitter sent - self-consistency, not verification "
+        "by us. Reachability records only whether that url answered at all. "
+        "Neither proves the submitter's identity."),
+    "attest_proof": (
+        "This observation is a block in our chain. Altering or removing it "
+        "breaks every block after it, and that is checkable by anyone at "
+        "/api/verify-chain. " + ANCHOR_NOTE),
+    "list_is": (
+        "Parties that have submitted a tip to this deployment. Being listed "
+        "here is not membership of anything, not endorsement of anything "
+        "sealed in this chain, and implies no relationship beyond having sent "
+        "a hash."),
+    "list_note": (
+        "Silent peers are visible by design. A network you cannot audit is "
+        "not a network. Nothing here proves identity - it shows how well each "
+        "claim stood up to checking."),
+    "history_note": (
+        "If this peer ever presents a history whose tips do not match these, "
+        "the divergence is provable."),
+    "chain_required": "A short stable identifier - a domain works well.",
+    "invalid_tip": "A tip is 64 hex characters - a SHA-256 chain head.",
+    "not_witnessed": "We hold no record of this tip from this peer.",
+}
+
+LEGEND = {
+    LIVENESS_MATCH: VOCABULARY[LIVENESS_MATCH],
+    LIVENESS_MATCH_LEGACY: VOCABULARY[LIVENESS_MATCH_LEGACY],
+    LIVENESS_MOVED: VOCABULARY[LIVENESS_MOVED],
+    LIVENESS_NONE: VOCABULARY[LIVENESS_NONE],
+    REACHED_YES: REACH_VOCABULARY[REACHED_YES],
+    REACHED_NO: REACH_VOCABULARY[REACHED_NO],
+    REACHED_UNTRIED: REACH_VOCABULARY[REACHED_UNTRIED],
+    NAME_FIRST: NAME_VOCABULARY[NAME_FIRST],
+    NAME_BOUND: NAME_VOCABULARY[NAME_BOUND],
+    NAME_CONFLICT: NAME_VOCABULARY[NAME_CONFLICT],
+    NAME_UNBOUND: NAME_VOCABULARY[NAME_UNBOUND],
+    "reached_is_not_parsed": (
+        "Reachability and liveness answer different questions and are "
+        "recorded separately from witness v1.4. A url can be reached and "
+        "still serve nothing we can use; before v1.4 both were reported as "
+        "though the url could not be reached, which was false in that case "
+        "and is sealed permanently in blocks from that period."),
+    "unbound_costs_you_the_name": (
+        "A submission with no url serving a valid tip does not bind the name. "
+        "Whoever submits it next with one takes the binding. Choosing the "
+        "accurate weaker liveness status therefore leaves the name claimable "
+        "- a coupling worth knowing before it bites."),
+    "signed_lane": SIGNED_LANE_NOTE,
+    "anchoring": ANCHOR_NOTE,
+}
+
+# Routes that need no API key. A third party must be able to check the
+# network without holding an account, or the claim that anyone can audit
+# it is not true.
+PUBLIC = {("GET", "attest"), ("GET", "peers"), ("GET", "tip"),
+          ("GET", "spec"), ("POST", "observe")}
+
+# Observations arriving without a key are filed under this.
+ANON_KEY = "public-witness"
+
+# Liveness fetch limits. Deliberately tight - this runs on an anonymous
+# request, so every one of these is also a denial-of-service control.
+FETCH_TIMEOUT = 4
+MAX_FETCH_BYTES = 65536
+ALLOWED_SCHEMES = ("http", "https")
+ALLOWED_PORTS = (80, 443)
+
+# Field names other implementations serve their tip under. Being strict about
+# a name we never published is a bug in the receiver, not in the peer. Kept
+# identical to the list mutual.py advertises.
+TIP_FIELDS = ("tip", "hash", "head", "tip_sha256", "root", "current_tip",
+              "chain_tip", "latest")
+
+MAX_HISTORY = 500
+
+_ready = False
 
 
-def _base_from(handler):
-    """Derive our own base URL from the request. An operator running this file
-    on their own domain publishes their domain, not whoever wrote it."""
-    try:
-        host = handler.headers.get("X-Forwarded-Host") or handler.headers.get("Host")
-        if not host:
-            return FALLBACK_BASE
-        host = host.split(",")[0].strip()[:200]
-        proto = (handler.headers.get("X-Forwarded-Proto") or "https").split(",")[0].strip()
-        if proto not in ("http", "https"):
-            proto = "https"
-        return proto + "://" + host
-    except Exception:
-        return FALLBACK_BASE
+def _setup(ctx):
+    global _ready
+    if _ready:
+        return
+    with ctx["lock"]:
+        c = ctx["conn"]
+        c.execute("CREATE TABLE IF NOT EXISTS witness_log(id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,peer TEXT,tip TEXT,peer_ts REAL,observed REAL,audit_hash TEXT,block_index INTEGER,note TEXT)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_wit_peer ON witness_log(api_key,peer)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_wit_tip ON witness_log(tip)")
 
-
-def _base_from_ctx(ctx):
-    """Same derivation for the routed /x/standard/document call.
-
-    The router's ctx may or may not carry the request handler. If it does, the
-    document served through the router names the same domain as the one served
-    at /.well-known/ - which matters on a mirror, where hardcoding would make
-    this file publish somebody else's domain again."""
-    try:
-        if isinstance(ctx, dict):
-            for key in ("handler", "h", "request", "req", "self"):
-                obj = ctx.get(key)
-                if obj is not None and hasattr(obj, "headers"):
-                    return _base_from(obj)
-            headers = ctx.get("headers")
-            if headers is not None:
-                class _Shim(object):
-                    pass
-                shim = _Shim()
-                shim.headers = headers
-                return _base_from(shim)
-        elif ctx is not None and hasattr(ctx, "headers"):
-            return _base_from(ctx)
-    except Exception:
-        pass
-    return FALLBACK_BASE
-
-
-def _document(base):
-    checks = {}
-    for name, c in CHECKS.items():
-        checks[name] = {
-            "supported": c["supported"],
-            "demonstrable_publicly": c["demonstrable_publicly"],
-            "endpoint": c["endpoint"],
-            "note": c["note"],
-        }
-    return {
-        "ordering_test_version": ORDERING_TEST_VERSION,
-        "vendor": VENDOR,
-        "base_url": base,
-        "runner": RUNNER,
-        "runner_note": RUNNER_NOTE,
-        "checks": checks,
-        "witness_peers": base + "/x/witness/peers",
-        "witness_tip": base + "/x/witness/tip",
-        "committed_periods": base + "/x/complete/periods",
-        "note": DOCUMENT_NOTE,
-    }
-
-
-def _digest(doc):
-    return hashlib.sha256(
-        json.dumps(doc, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-
-
-def _srv():
-    m = sys.modules.get("__main__")
-    if hasattr(m, "get_bearer"):
-        return m
-    return sys.modules.get("server")
-
-
-def _install(s):
-    if _patched[0]:
-        return "already installed"
-    H = getattr(s, "Handler", None)
-    if H is None or not hasattr(H, "do_GET"):
-        return "no handler"
-    if getattr(H, "_standard_patched", False):
-        _patched[0] = True
-        return "already installed"
-
-    original = H.do_GET
-
-    def do_GET(self):
+        # Added in 1.1, extended in 1.4 with reachability. Existing rows keep
+        # NULL, which reads as unrecorded - correct, because it was not
+        # recorded separately before 1.4.
+        have = set()
         try:
-            from urllib.parse import urlparse
-            p = urlparse(self.path).path.rstrip("/") or "/"
+            for row in c.execute("PRAGMA table_info(witness_log)").fetchall():
+                have.add(row[1])
         except Exception:
-            p = self.path or "/"
+            pass
+        for col in ("url", "liveness", "name_status", "reachability"):
+            if col not in have:
+                try:
+                    c.execute("ALTER TABLE witness_log ADD COLUMN %s TEXT" % col)
+                except Exception:
+                    pass
 
-        if p in DISCOVERY_PATHS:
-            body = json.dumps(_document(_base_from(self)), indent=2).encode("utf-8")
-            try:
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Cache-Control", "public, max-age=300")
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.send_header("X-Content-Type-Options", "nosniff")
-                self.end_headers()
-                self.wfile.write(body)
-            except Exception:
-                pass
-            return
-
-        return original(self)
-
-    H.do_GET = do_GET
-    H._standard_patched = True
-    _patched[0] = True
-    print("STANDARD: /.well-known/ordering-test.json installed", flush=True)
-    return "installed"
-
-
-def handle(method, action, data, api_key, ctx):
-    s = _srv()
-    if s is None:
-        return {"error": "server_not_found"}, 500
-
-    state = "already installed" if _patched[0] else None
-    if not _patched[0]:
+        # Added in 1.3. /x/witness/peers previously read every row in the
+        # table on every call to work out each peer's latest status. At 700
+        # observations that is wasteful; at 70,000 it is a problem. This index
+        # lets the same answer come from a grouped query.
         try:
-            state = _install(s)
-        except Exception as exc:
-            print("STANDARD: patch failed - " + str(exc), flush=True)
-            state = "failed: " + str(exc)
+            c.execute("CREATE INDEX IF NOT EXISTS idx_wit_peer_id ON witness_log(peer,id)")
+        except Exception:
+            pass
 
-    action = (action or "").strip("/").lower()
-    base = _base_from_ctx(ctx)
-    doc = _document(base)
-
-    if method == "GET" and action == "document":
-        return doc, 200
-
-    if method == "GET" and action == "hash":
-        canonical = _document(FALLBACK_BASE)
-        return {
-            "sha256": _digest(canonical),
-            "of": "this operator's discovery document",
-            "canonicalisation": ("JSON, keys sorted, no whitespace, UTF-8, "
-                                 "base_url fixed to " + FALLBACK_BASE +
-                                 " so the digest does not move with the "
-                                 "requesting host"),
-            "what_this_is_for": (
-                "Confirming our own document has not changed. It is NOT the "
-                "cross-mirror check - two operators publish different documents "
-                "by design, because they list different endpoints, so their "
-                "digests should differ and a mismatch would prove nothing. The "
-                "cross-mirror comparison only means something once every mirror "
-                "serves a byte-identical runner file and hashes that instead. "
-                "No runner is agreed yet."),
-            "document": canonical,
-        }, 200
-
-    if method == "GET" and action in ("", "status", "spec"):
-        supported = [k for k, c in CHECKS.items() if c["supported"]]
-        public = [k for k, c in CHECKS.items() if c["demonstrable_publicly"]]
-        parameterised = [k for k, c in CHECKS.items()
-                         if c["endpoint"] and "{" in c["endpoint"]]
-        return {
-            "installed": bool(_patched[0]),
-            "install_result": state,
-            "module_version": VERSION,
-            "ordering_test_version": ORDERING_TEST_VERSION,
-            "serving": list(DISCOVERY_PATHS),
-            "always_available": "/x/standard/document",
-            "checks_total": len(CHECKS),
-            "checks_supported": len(supported),
-            "checks_publicly_demonstrable": len(public),
-            "publicly_demonstrable": public,
-            "supported_but_not_public": [k for k in supported if k not in public],
-            "endpoints_needing_a_parameter": parameterised,
-            "runner": RUNNER,
-            "note": ("base_url is derived from the Host header, so this file "
-                     "publishes whichever domain is actually serving it. Checks "
-                     "listed under endpoints_needing_a_parameter cannot be "
-                     "demonstrated until a real value exists to substitute - "
-                     "for the completeness and absence checks that means at "
-                     "least one committed period at /x/complete/periods."),
-        }, 200
-
-    return {"error": "unknown_action", "action": action,
-            "GET": ["status", "hash", "document"]}, 404
-
-```
-
-
-## `modules/stats.py`
-
-143 lines, 5540 bytes
-
-```python
-"""
-Live figures for the Proving Ground - /x/stats
-
-Charts on a compliance site are usually decoration. These are not, provided
-they show something a visitor could otherwise only take on trust: that the
-chain is genuinely growing, that decisions really are distributed across the
-thresholds rather than hand-picked, and that people who click through a
-review case behave exactly as the oversight argument predicts.
-
-WHAT IS PUBLISHED, AND WHAT IS NOT
-----------------------------------
-Public and no key, because a figure nobody can see proves nothing.
-
-Published: total chain height, hourly block counts, the verdict mix and score
-distribution of PUBLIC DEMO decisions only, and dwell times from public review
-cases.
-
-Never published: anything scoped to a customer key. No customer verdict mix,
-no customer volumes, no per-key anything. A visitor learns how the engine
-behaves, not how any operator's business is going. That distinction is the
-whole reason this endpoint can be open.
-
-    GET /x/stats        everything below
-    GET /x/stats/chain  chain height and hourly growth only
-"""
-
-import json, time
-from datetime import datetime, timezone
-
-VERSION = "1.0"
-PUBLIC = {("GET", ""), ("GET", "stats"), ("GET", "chain")}
-
-DEMO_KEY = "public_demo"
+        # Name bindings are network-wide, not per api_key. A name means one
+        # operator across the whole network or it means nothing.
+        c.execute("CREATE TABLE IF NOT EXISTS witness_names(peer TEXT PRIMARY KEY,url TEXT,first_seen REAL,first_liveness TEXT)")
+        c.commit()
+    _ready = True
 
 
 def _iso(ts):
@@ -1409,106 +1522,614 @@ def _iso(ts):
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
 
 
-def _chain(ctx):
-    t = time.time()
+def _our_tip(ctx):
     with ctx["lock"]:
-        row = ctx["conn"].execute("SELECT COUNT(*),MIN(ts),MAX(ts) FROM audit_log").fetchone()
-        recent = ctx["conn"].execute("SELECT ts FROM audit_log WHERE ts>? ORDER BY ts ASC", (t - 86400,)).fetchall()
-    height = row[0] if row else 0
-    buckets = [0] * 24
-    for (ts,) in recent:
-        h = int((t - ts) // 3600)
-        if 0 <= h < 24:
-            buckets[23 - h] += 1
-    return {"height": height,
-            "first_block": _iso(row[1] if row else None),
-            "latest_block": _iso(row[2] if row else None),
-            "last_24h": buckets,
-            "blocks_last_24h": sum(buckets),
-            "note": "Every block, from every source. The chain is one sequence."}
+        r = ctx["conn"].execute("SELECT audit_hash,ts,id FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()
+    if not r:
+        return "GENESIS", None, 0
+    return r[0], r[1], r[2]
 
 
-def _demo(ctx):
-    with ctx["lock"]:
-        rows = ctx["conn"].execute("SELECT result_json,ts FROM audit_log WHERE api_key=? ORDER BY id DESC LIMIT 2000", (DEMO_KEY,)).fetchall()
-    verdicts = {"ALLOW": 0, "CHALLENGE": 0, "BLOCK": 0}
-    # ten buckets of 0.1 across the score range
-    hist = [0] * 10
-    scores = []
-    for res, _ts in rows:
+def _tip(ctx, api_key):
+    tip, ts, height = _our_tip(ctx)
+    return {"tip": tip, "height": height, "sealed_at": _iso(ts),
+            "witness_version": VERSION,
+            "note": MESSAGES["tip_note"],
+            "verify": MESSAGES["tip_verify"],
+            "anchoring": ANCHOR_NOTE}, 200
+
+
+# ----------------------------------------------------------------------
+# liveness fetch - see the SSRF section above before touching any of this
+# ----------------------------------------------------------------------
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect is an instruction from a stranger to fetch a second url we
+    never checked. Refuse rather than follow."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_opener = urllib.request.build_opener(_NoRedirect)
+
+
+def _address_allowed(host, port):
+    """Resolve and refuse anything that isn't plainly on the public internet."""
+    try:
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+    except Exception as exc:
+        return False, "could not resolve host (%s)" % type(exc).__name__
+    if not infos:
+        return False, "host resolved to nothing"
+    for info in infos:
+        raw = info[4][0]
         try:
-            r = json.loads(res)
-        except Exception:
-            continue
-        d = r.get("decision")
-        if d in verdicts:
-            verdicts[d] += 1
-            s = r.get("score")
-            if isinstance(s, (int, float)):
-                scores.append(s)
-                b = min(int(float(s) * 10), 9)
-                hist[b] += 1
-    total = sum(verdicts.values())
-    out = {"decisions": total, "verdicts": verdicts,
-           "score_histogram": hist,
-           "buckets": ["0.0-0.1", "0.1-0.2", "0.2-0.3", "0.3-0.4", "0.4-0.5",
-                       "0.5-0.6", "0.6-0.7", "0.7-0.8", "0.8-0.9", "0.9-1.0"],
-           "thresholds": {"allow_below": 0.35, "block_at_or_above": 0.70}}
-    if scores:
-        scores.sort()
-        out["median_score"] = round(scores[len(scores) // 2], 4)
+            addr = ipaddress.ip_address(raw)
+        except ValueError:
+            return False, "unreadable address"
+        if (addr.is_private or addr.is_loopback or addr.is_link_local
+                or addr.is_reserved or addr.is_multicast or addr.is_unspecified):
+            return False, "address is not publicly routable"
+    return True, None
+
+
+def _url_allowed(url):
+    if not url or not isinstance(url, str) or len(url) > 500:
+        return False, "no usable url"
+    try:
+        parts = urlparse(url.strip())
+    except Exception:
+        return False, "unparseable url"
+    if parts.scheme not in ALLOWED_SCHEMES:
+        return False, "scheme not allowed"
+    host = parts.hostname
+    if not host:
+        return False, "no host in url"
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    if port not in ALLOWED_PORTS:
+        return False, "port not allowed"
+    return _address_allowed(host, port)
+
+
+def _norm_url(url):
+    """Normalise a url for COMPARISON only. The raw string is what gets stored
+    and shown.
+
+    Added in 1.3. Binding compared raw strings, so the same endpoint submitted
+    as https://x.test/w and https://X.test/w/ recorded a permanent conflict
+    against an operator who had done nothing wrong. A conflict is the loudest
+    thing this module can say about somebody and it cannot be withdrawn, so it
+    should fire on a genuinely different address and not on a trailing slash.
+
+    Deliberately conservative: case on scheme and host, the default port, and
+    one trailing slash. Path case, query order and anything else still count
+    as different, because they can be.
+    """
+    if not url:
+        return ""
+    raw = url.strip()
+    try:
+        p = urlparse(raw)
+    except Exception:
+        return raw.lower()
+    scheme = (p.scheme or "").lower()
+    host = (p.hostname or "").lower()
+    if not scheme or not host:
+        return raw.lower()
+    port = p.port
+    if (scheme == "https" and port == 443) or (scheme == "http" and port == 80):
+        port = None
+    netloc = host + (":%d" % port if port else "")
+    path = p.path or "/"
+    if len(path) > 1 and path.endswith("/"):
+        path = path[:-1]
+    out = scheme + "://" + netloc + path
+    if p.query:
+        out += "?" + p.query
     return out
 
 
-def _oversight(ctx):
+def _fetch_tip(url):
+    """Returns (tip_or_None, note, reachability). Never raises.
+
+    Changed in 1.4 to report reachability separately. Every path that used to
+    return None with a note now also says whether an HTTP response actually
+    arrived, because "we could not connect" and "it answered with HTML" are
+    different facts and reporting them as one put a false statement in a
+    sealed block.
+    """
+    ok, why = _url_allowed(url)
+    if not ok:
+        # Refused before any request was made, so nothing was attempted
+        # against the address itself.
+        return None, why, REACHED_NO
+    request = urllib.request.Request(url, headers={
+        "Accept": "application/json",
+        "User-Agent": "aileash-witness/%s" % VERSION,
+    })
+    try:
+        with _opener.open(request, timeout=FETCH_TIMEOUT) as response:
+            code = response.getcode()
+            if code != 200:
+                # It answered. That is reached, whatever the status.
+                return None, "url answered %s" % code, REACHED_YES
+            body = response.read(MAX_FETCH_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        # An HTTP error IS a response. The server was reached.
+        return None, "url answered %s" % exc.code, REACHED_YES
+    except Exception as exc:
+        return None, "could not reach url (%s)" % type(exc).__name__, REACHED_NO
+    if len(body) > MAX_FETCH_BYTES:
+        return None, "url answered, response too large to read", REACHED_YES
+    try:
+        data = json.loads(body.decode("utf-8", "replace"))
+    except Exception:
+        return None, "url answered but did not return json", REACHED_YES
+    if not isinstance(data, dict):
+        return None, "url answered but did not return an object", REACHED_YES
+    found = ""
+    for field in TIP_FIELDS:
+        value = data.get(field)
+        if value:
+            found = str(value).strip().lower()
+            break
+    if not HEX64.match(found or ""):
+        return None, "url answered but served no valid tip", REACHED_YES
+    return found, None, REACHED_YES
+
+
+def _check_liveness(url, tip):
+    """Returns (liveness, note, reachability). Never rejects anything.
+
+    Note what self-consistent means: the submitter told us the tip AND told us
+    where to look, and the two agreed. That is the submitter agreeing with
+    themselves. It is worth recording and it is not third-party verification.
+    """
+    if not url:
+        return LIVENESS_NONE, "no url supplied", REACHED_UNTRIED
+    found, why, reached = _fetch_tip(url)
+    if found is None:
+        return LIVENESS_NONE, why, reached
+    if found == tip:
+        return LIVENESS_MATCH, ("the submitted url served exactly the submitted "
+                                "tip - both sides of this check come from the "
+                                "submitter, so this is self-consistency, not "
+                                "third-party verification"), reached
+    return LIVENESS_MOVED, ("url serves a different tip (%s) - chain has moved "
+                            "on since submitting" % found[:16]), reached
+
+
+def _prior_unbound(ctx, peer):
+    """How many times this name has been submitted with no bindable url.
+
+    Exists because of a gap Ishaan (Shango MID) found: a submission without
+    a url does not bind, so a recognisable name can be used honestly by its
+    owner and then bound by somebody else who supplies a url first. The
+    owner's later submission would read conflict, and they would be the one
+    looking like the impostor.
+
+    An anonymous endpoint cannot tell two claimants apart - there is nothing
+    to bind to - so this does not prevent the squat. What it does is make it
+    visible: a binding over a name that has been submitted before is
+    recorded as such, permanently, in the sealed note. An auditor sees the
+    name was not fresh when it was claimed.
+
+    Detection rather than prevention. Prevention needs a credential, which
+    is what the signed lane at /x/peer/submit is for - within the limit
+    stated in SIGNED_LANE_NOTE.
+    """
     try:
         with ctx["lock"]:
-            rows = ctx["conn"].execute("SELECT dwell,human_verdict,machine_verdict FROM demo_cases WHERE committed IS NOT NULL").fetchall()
+            row = ctx["conn"].execute(
+                "SELECT COUNT(*) FROM witness_log WHERE peer=? AND "
+                "(url IS NULL OR url='')", (peer,)).fetchone()
+        return int(row[0]) if row else 0
     except Exception:
-        rows = []
+        return 0
+
+
+def _check_name(ctx, peer, url, liveness, reachability):
+    """first-use / bound / conflict / unbound.
+
+    Only bind a name to a url that served a valid tip. Binding to a url that
+    never produced one would let someone reserve a name with an address that
+    answers with anything at all.
+
+    Corrected in 1.4: the unbound message used to say "no reachable url",
+    which was false whenever a url answered and simply was not usable. It now
+    reports what was actually established, and the reachability value is
+    carried in beside it rather than inferred.
+    """
+    with ctx["lock"]:
+        row = ctx["conn"].execute("SELECT url,first_seen FROM witness_names WHERE peer=?", (peer,)).fetchone()
+
+    if row and row[0]:
+        if not url:
+            return NAME_UNBOUND, "no url supplied; this name is bound to %s" % row[0]
+        if _norm_url(url) == _norm_url(row[0]):
+            if url.strip() != row[0]:
+                return NAME_BOUND, ("same address as the binding, written "
+                                    "differently (bound as %s, submitted as "
+                                    "%s)" % (row[0], url.strip()))
+            return NAME_BOUND, None
+        return NAME_CONFLICT, ("this name was first seen at %s and has now been submitted from %s"
+                               % (row[0], url.strip()))
+
+    # LIVENESS_REACHED, not a literal - renaming the match value in 1.2 would
+    # otherwise have silently stopped first-use binding for exact matches.
+    if url and liveness in LIVENESS_REACHED:
+        prior = _prior_unbound(ctx, peer)
+        with ctx["lock"]:
+            ctx["conn"].execute(
+                "INSERT OR REPLACE INTO witness_names(peer,url,first_seen,first_liveness) VALUES(?,?,?,?)",
+                (peer, url.strip(), time.time(), liveness))
+            ctx["conn"].commit()
+        note = "name now bound to %s" % url.strip()
+        if prior:
+            note += ("; WARNING: this name was submitted %d time(s) before "
+                     "this binding with no url, so it was not a fresh name "
+                     "when it was claimed - if that was not you, the earlier "
+                     "submissions are permanently in this chain and so is "
+                     "this warning" % prior)
+        return NAME_FIRST, note
+
+    # Say only what was established. Three different situations reach here and
+    # they are no longer described as though they were one.
+    if not url:
+        why = "no url was supplied, so there is nothing to bind this name to"
+    elif reachability == REACHED_YES:
+        why = ("the url answered but served no tip we could read, so there is "
+               "nothing to bind this name to. This is a parsing outcome, not "
+               "a statement that the endpoint is unreachable")
+    else:
+        why = ("the url could not be reached, so there is nothing to bind "
+               "this name to")
+    return NAME_UNBOUND, (why + ". This name remains claimable by anyone who "
+                          "submits it with a url serving a valid tip - see "
+                          "name_vocabulary")
+
+
+# ----------------------------------------------------------------------
+# observe
+# ----------------------------------------------------------------------
+
+def _observe(ctx, api_key, data):
+    # The published standard calls this field "chain"; earlier internal
+    # callers used "peer". Accept either. A receiver being strict about
+    # field names it never published is a bug in the receiver.
+    peer = str(data.get("chain") or data.get("peer") or "").strip().lower()
+    if not peer or len(peer) > 80:
+        return {"error": "chain_required",
+                "message": MESSAGES["chain_required"],
+                "field": "chain (peer also accepted)"}, 400
+    tip = str(data.get("tip", "")).strip().lower()
+    if not HEX64.match(tip):
+        return {"error": "invalid_tip", "message": MESSAGES["invalid_tip"]}, 400
+
+    url = data.get("url")
+    url = str(url).strip() if url else ""
+    if len(url) > 500:
+        url = ""
+
+    # Time the peer claims it sealed at. Epoch or ISO, either field name.
+    # Carry on without it - supporting detail, not the evidence.
+    peer_ts = data.get("peer_ts", data.get("ts"))
+    if peer_ts is not None:
+        try:
+            peer_ts = float(peer_ts)
+        except (TypeError, ValueError):
+            try:
+                s = str(peer_ts).strip().replace("Z", "+00:00")
+                peer_ts = datetime.fromisoformat(s).timestamp()
+            except Exception:
+                peer_ts = None
+
+    liveness, live_note, reachability = _check_liveness(url, tip)
+    name_status, name_note = _check_name(ctx, peer, url, liveness, reachability)
+
+    ts = time.time()
+    notes = []
+
+    with ctx["lock"]:
+        prev = ctx["conn"].execute("SELECT tip,observed FROM witness_log WHERE api_key=? AND peer=? ORDER BY id DESC LIMIT 1", (api_key, peer)).fetchone()
+        seen = ctx["conn"].execute("SELECT observed FROM witness_log WHERE api_key=? AND peer=? AND tip=? LIMIT 1", (api_key, peer, tip)).fetchone()
+
+    if seen:
+        notes.append("tip already witnessed at " + str(_iso(seen[0])) + " - chain has not advanced, or history was replayed")
+    elif prev and prev[0] == tip:
+        notes.append("unchanged since last observation")
+    if live_note:
+        notes.append(live_note)
+    if name_note:
+        notes.append(name_note)
+    note = "; ".join(notes)
+
+    # The verification result is sealed alongside the tip. If we later claim a
+    # submission was self-consistent, the chain has to agree.
+    detail = ("peer=" + peer + ";tip=" + tip + ";url=" + (url or "-") +
+              ";liveness=" + liveness + ";reachability=" + reachability +
+              ";name=" + name_status +
+              ";peer_ts=" + str(peer_ts) + (";note=" + note if note else ""))
+    ev = {"user_id": "wit:" + peer, "action": "witness_observed", "amount": 0,
+          "country": "UK", "device_id": "witness", "anomaly": 0, "device_risk": 0}
+    res = {"decision": "WITNESS_SEALED", "score": 0, "witness_version": VERSION,
+           "peer": peer, "peer_tip": tip, "timestamp": ts,
+           "liveness": liveness, "reachability": reachability,
+           "name_status": name_status, "detail": detail}
+    h, idx, seq = ctx["seal"](ev, res, ts, api_key)
+
+    # The seal is the record. If this insert fails the block still exists and
+    # is still valid - the index row is a convenience for lookup, not the
+    # evidence - so a failure here must not be reported as a failed
+    # observation.
+    index_ok = True
+    try:
+        with ctx["lock"]:
+            ctx["conn"].execute("INSERT INTO witness_log(api_key,peer,tip,peer_ts,observed,audit_hash,block_index,note,url,liveness,name_status,reachability) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                                (api_key, peer, tip, peer_ts, ts, h, idx, note or None,
+                                 url or None, liveness, name_status, reachability))
+            ctx["conn"].commit()
+    except Exception as exc:
+        index_ok = False
+        index_error = type(exc).__name__
+
+    our, _t, height = _our_tip(ctx)
+    out = {"peer": peer, "witnessed_tip": tip, "observed_at": _iso(ts),
+           "sealed_in_our_chain": h, "block_index": idx, "receipt_seq": seq,
+           "our_tip_now": our, "our_height": height,
+           "liveness": liveness, "reachability": reachability,
+           "name_status": name_status,
+           "attest": "/x/witness/attest?peer=" + peer + "&tip=" + tip,
+           "message": MESSAGES["observe_ok"],
+           "anchoring": ANCHOR_NOTE}
+    if note:
+        out["flag"] = note
+    out["witness_version"] = VERSION
+    out["liveness_vocabulary"] = _vocab(liveness)
+    out["reachability_vocabulary"] = _reach_vocab(reachability)
+    out["name_vocabulary"] = _name_vocab(name_status)
+    if not index_ok:
+        out["index_warning"] = (
+            "Sealed into the chain, but our lookup index did not accept the "
+            "row (%s). The block is valid and permanent; /x/witness/attest "
+            "may not find it until the index is repaired. Reported rather "
+            "than hidden." % index_error)
+    if liveness == LIVENESS_NONE:
+        out["advice"] = (MESSAGES["observe_advice_unusable"]
+                         if reachability == REACHED_YES
+                         else MESSAGES["observe_advice"])
+    if name_status == NAME_CONFLICT:
+        out["warning"] = MESSAGES["observe_conflict"]
+    return out, 200
+
+
+def _attest(ctx, api_key, data):
+    peer = str(data.get("peer", "")).strip().lower()
+    tip = str(data.get("tip", "")).strip().lower()
+    if not peer or not tip:
+        return {"error": "peer_and_tip_required",
+                "usage": "/x/witness/attest?peer=<name>&tip=<64 hex>"}, 400
+    with ctx["lock"]:
+        if api_key:
+            rows = ctx["conn"].execute("SELECT observed,audit_hash,block_index,peer_ts,liveness,name_status,url,reachability FROM witness_log WHERE api_key=? AND peer=? AND tip=? ORDER BY id ASC", (api_key, peer, tip)).fetchall()
+        else:
+            rows = ctx["conn"].execute("SELECT observed,audit_hash,block_index,peer_ts,liveness,name_status,url,reachability FROM witness_log WHERE peer=? AND tip=? ORDER BY id ASC", (peer, tip)).fetchall()
     if not rows:
-        return {"reviews": 0,
-                "note": "Nobody has taken a review case yet."}
-    dwells = sorted(r[0] for r in rows if r[0] is not None)
-    agreed = len([r for r in rows if (r[1] or "").upper() == (r[2] or "").upper()])
-    # dwell buckets in seconds
-    edges = [2, 5, 10, 20, 45, 90]
-    labels = ["under 2s", "2-5s", "5-10s", "10-20s", "20-45s", "45-90s", "over 90s"]
-    hist = [0] * 7
-    for d in dwells:
-        placed = False
-        for i, e in enumerate(edges):
-            if d < e:
-                hist[i] += 1
-                placed = True
-                break
-        if not placed:
-            hist[6] += 1
-    n = len(dwells)
-    return {"reviews": len(rows),
-            "agreed_with_engine": agreed,
-            "agreement_rate_pct": round(100 * agreed / len(rows), 1),
-            "median_dwell_seconds": (dwells[n // 2] if n else None),
-            "under_2_seconds": hist[0],
-            "under_2_seconds_pct": (round(100 * hist[0] / n, 1) if n else 0),
-            "dwell_histogram": hist,
-            "dwell_labels": labels,
-            "note": "Visitors who committed in under two seconds did not read the case. That is the pattern the oversight record is designed to make visible."}
+        return {"witnessed": False, "peer": peer, "tip": tip,
+                "message": MESSAGES["not_witnessed"]}, 404
+    return {"witnessed": True, "peer": peer, "tip": tip,
+            "first_observed": _iso(rows[0][0]),
+            "last_observed": _iso(rows[-1][0]),
+            "times_observed": len(rows),
+            "sealed_in_our_chain": rows[0][1],
+            "block_index": rows[0][2],
+            "peer_claimed_time": _iso(rows[0][3]),
+            "liveness": rows[0][4] or "unchecked",
+            "liveness_vocabulary": _vocab(rows[0][4]),
+            "reachability": rows[0][7] or "unrecorded",
+            "reachability_vocabulary": _reach_vocab(rows[0][7]),
+            "name_status": rows[0][5] or "unchecked",
+            "name_vocabulary": _name_vocab(rows[0][5]),
+            "submitted_url": rows[0][6],
+            "witness_version": VERSION,
+            "what_this_proves": MESSAGES["attest_proves"],
+            "proof": MESSAGES["attest_proof"],
+            "anchoring": ANCHOR_NOTE}, 200
+
+
+def _vocab(liveness):
+    """Make the vocabulary travel with the value.
+
+    The legend on /x/witness/peers reconciles self-consistent and confirmed
+    for whoever reads the legend. Sealed blocks travel and legends do not:
+    anyone quoting a block elsewhere carries the word without the
+    reconciliation attached. Raised by Ishaan (Shango MID) after hitting the
+    same thing on his own register - the correction reached the page and not
+    the metadata that gets shared with the link.
+
+    So any route that returns an observation returns what the word means at
+    the point it is read, rather than pointing at a legend that may not
+    follow it.
+
+    General form worth keeping: a name a reader treats as documentation may
+    be a value the code branches on, and the two roles are invisible to each
+    other from outside.
+    """
+    return VOCABULARY.get(liveness, VOCABULARY[None])
+
+
+def _reach_vocab(reachability):
+    """What the reachability value means, travelling with the value.
+
+    Added in 1.4. Same reasoning as _vocab: a value that gets quoted
+    elsewhere needs its meaning attached, not left in a legend on a page
+    somebody may never open.
+    """
+    return REACH_VOCABULARY.get(reachability, REACH_VOCABULARY[None])
+
+
+def _name_vocab(name_status):
+    """What the name status means, and what it costs.
+
+    Travels with the value for the same reason liveness vocabulary does. The
+    unbound entry states the exposure plainly rather than leaving a submitter
+    to work it out: choosing the accurate weaker liveness status by
+    withholding a url also leaves the name claimable, and nobody should have
+    to discover that coupling by being squatted.
+    """
+    return NAME_VOCABULARY.get(name_status, NAME_VOCABULARY[None])
+
+
+def _peers(ctx, api_key):
+    """Who we witness, and how consistently.
+
+    Rewritten in 1.3. This used to read every row in witness_log to find each
+    peer's most recent liveness and name status. Now the same answer comes
+    from a grouped query against the (peer,id) index, so the cost stops
+    growing with the size of the log.
+    """
+    with ctx["lock"]:
+        c = ctx["conn"]
+        if api_key:
+            rows = c.execute("SELECT peer,COUNT(*),MIN(observed),MAX(observed),COUNT(DISTINCT tip) FROM witness_log WHERE api_key=? GROUP BY peer ORDER BY MAX(observed) DESC", (api_key,)).fetchall()
+        else:
+            rows = c.execute("SELECT peer,COUNT(*),MIN(observed),MAX(observed),COUNT(DISTINCT tip) FROM witness_log GROUP BY peer ORDER BY MAX(observed) DESC").fetchall()
+
+        latest = {}
+        for p, live, name, reach in c.execute(
+                "SELECT w.peer,w.liveness,w.name_status,w.reachability FROM witness_log w "
+                "JOIN (SELECT peer,MAX(id) AS mid FROM witness_log GROUP BY peer) m "
+                "ON w.id=m.mid").fetchall():
+            latest[p] = (live, name, reach)
+
+        conflicts = {}
+        for p, n in c.execute(
+                "SELECT peer,COUNT(*) FROM witness_log WHERE name_status=? "
+                "GROUP BY peer", (NAME_CONFLICT,)).fetchall():
+            conflicts[p] = n
+
+        bindings = {}
+        for p, u in c.execute("SELECT peer,url FROM witness_names").fetchall():
+            bindings[p] = u
+
+    t = time.time()
+    peers = []
+    for p, n, first, last, distinct in rows:
+        hours = round((t - last) / 3600, 1)
+        live, name, reach = latest.get(p, (None, None, None))
+        entry = {"peer": p, "observations": n, "distinct_tips": distinct,
+                 "first_seen": _iso(first), "last_seen": _iso(last),
+                 "hours_since_last": hours,
+                 "status": ("current" if hours < 6 else "stale" if hours < 48 else "silent"),
+                 "liveness": live or "unchecked",
+                 "reachability": reach or "unrecorded",
+                 "name_status": name or "unchecked",
+                 "bound_to": bindings.get(p)}
+        if conflicts.get(p):
+            entry["name_conflicts"] = conflicts[p]
+        peers.append(entry)
+    return {"count": len(peers), "peers": peers,
+            "witness_version": VERSION,
+            "what_this_list_is": MESSAGES["list_is"],
+            "status_vocabulary": {
+                "current": "observed within the last 6 hours",
+                "stale": "last observed between 6 and 48 hours ago",
+                "silent": "not observed for more than 48 hours",
+                "note": ("These describe elapsed time since we last recorded "
+                         "an observation and nothing else. A peer that "
+                         "publishes on a human schedule rather than a timer "
+                         "will read stale between sessions, correctly. It is "
+                         "not a claim that anyone's endpoint was unavailable."),
+            },
+            "legend": LEGEND,
+            "note": MESSAGES["list_note"]}, 200
+
+
+def _history(ctx, api_key, peer):
+    with ctx["lock"]:
+        rows = ctx["conn"].execute("SELECT tip,observed,audit_hash,block_index,note,liveness,name_status,url,reachability FROM witness_log WHERE api_key=? AND peer=? ORDER BY id ASC LIMIT ?", (api_key, peer, MAX_HISTORY)).fetchall()
+    if not rows:
+        return {"error": "unknown_peer", "peer": peer}, 404
+    return {"peer": peer, "count": len(rows), "limit": MAX_HISTORY,
+            "witness_version": VERSION,
+            "observations": [{"tip": r[0], "observed": _iso(r[1]),
+                              "sealed": r[2], "block_index": r[3],
+                              "flag": r[4], "liveness": r[5] or "unchecked",
+                              "name_status": r[6] or "unchecked",
+                              "reachability": r[8] or "unrecorded",
+                              "url": r[7]} for r in rows],
+            "note": MESSAGES["history_note"]}, 200
+
+
+def _spec():
+    """The whole protocol, for someone who is not going to run our code.
+
+    Added in 1.3. Every other module publishes a spec route and this one did
+    not, which meant the four calls a new peer needs were only written down
+    in a page they had to be sent a link to.
+    """
+    return {"witness_version": VERSION,
+            "the_protocol_in_four_calls": [
+                "1. GET /x/witness/tip - our current chain head.",
+                "2. Seal that value into your own chain, however your chain works.",
+                "3. POST /x/witness/observe with {\"chain\":\"<your name>\","
+                "\"tip\":\"<your 64 hex head>\",\"url\":\"<where you publish "
+                "your head>\"}. No account, no key.",
+                "4. GET /x/witness/attest?peer=<your name>&tip=<your head> - "
+                "your receipt, readable by anyone.",
+            ],
+            "fields": {
+                "chain": "required. Short stable identifier, 80 chars max. "
+                         "'peer' accepted as an alias.",
+                "tip": "required. 64 lowercase hex characters.",
+                "url": "optional but strongly advised - see name_vocabulary. "
+                       "http or https, port 80 or 443, must resolve to a "
+                       "publicly routable address, no redirects followed. It "
+                       "must serve JSON containing your tip - a page that "
+                       "answers with HTML is reachable but not bindable, and "
+                       "those two facts are recorded separately.",
+                "peer_ts": "optional. Epoch seconds or ISO 8601. 'ts' accepted "
+                           "as an alias.",
+            },
+            "tip_fields_we_accept_at_your_url": list(TIP_FIELDS),
+            "nothing_is_rejected": (
+                "Both checks are non-rejecting. Every well-formed submission "
+                "is sealed. What varies is what the record says about it."),
+            "liveness_vocabulary": {k: v for k, v in VOCABULARY.items() if k},
+            "reachability_vocabulary": {k: v for k, v in REACH_VOCABULARY.items() if k},
+            "reached_is_not_parsed": LEGEND["reached_is_not_parsed"],
+            "name_vocabulary": {k: v for k, v in NAME_VOCABULARY.items() if k},
+            "signed_lane": SIGNED_LANE_NOTE,
+            "anchoring": ANCHOR_NOTE,
+            "what_this_is_not": MESSAGES["list_is"]}, 200
 
 
 def handle(method, action, data, api_key, ctx):
-    if method != "GET":
-        return {"error": "unknown_action", "action": action}, 404
-    if action == "chain":
-        return {"stats_version": VERSION, "chain": _chain(ctx)}, 200
-    if action in ("", "stats"):
-        return {"stats_version": VERSION,
-                "generated": _iso(time.time()),
-                "chain": _chain(ctx),
-                "public_decisions": _demo(ctx),
-                "public_reviews": _oversight(ctx),
-                "scope": "Public demonstration activity and total chain height only. Nothing scoped to a customer key is published here."}, 200
-    return {"error": "unknown_action", "action": action,
-            "available": ["GET stats", "GET chain"]}, 404
+    _setup(ctx)
+    if method == "POST":
+        if action == "observe":
+            # No key needed. Anonymous submissions are partitioned under
+            # ANON_KEY so they never mix with a customer's own witness log.
+            return _observe(ctx, api_key or ANON_KEY, data)
+        if not api_key:
+            return {"error": "invalid_api_key"}, 401
+    else:
+        if action == "tip":
+            return _tip(ctx, api_key)
+        if action == "peers":
+            return _peers(ctx, api_key)
+        if action == "attest":
+            return _attest(ctx, api_key, data)
+        if action == "spec":
+            return _spec()
+        if action == "history":
+            if not api_key:
+                return {"error": "invalid_api_key"}, 401
+            peer = str(data.get("peer", "")).strip().lower()
+            if not peer:
+                return {"error": "peer_required"}, 400
+            return _history(ctx, api_key, peer)
+    return {"error": "unknown_action", "action": action}, 404
 
 ```

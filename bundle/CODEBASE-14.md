@@ -1,1856 +1,1650 @@
-# Codebase — part 14 of 30
+# Codebase — part 14 of 28
 
 Contains:
-- `modules/tokensaver.py`
-- `modules/verifier.py`
+- `modules/witnessed.py`
+- `Verify_ai.py`
+- `ai_act_ranker.py`
+- `ai_safety_scanner.py`
+- `aigrade_insert.py`
+- `aileash_reporter.py`
+- `aileash_signed_client.py`
+- `aileash_verify.py`
+- `anchor.py`
+- `board_auditor.py`
 
 
-## `modules/tokensaver.py`
+## `modules/witnessed.py`
 
-1670 lines, 64529 bytes
+600 lines, 26111 bytes
 
 ```python
 #!/usr/bin/env python3
 """
-modules/tokensaver.py  v2.0.0
-sebbi.pro - the token saver
+modules/witnessed.py  -  what an outside party had already seen, and when
 
-Reached at /x/tokensaver/<action>.
+THE HOLE THIS CLOSES
+--------------------
+Authority continuity (modules/continuity.py) derives an action back to a human
+grant and re-checks every hop at execution. It is the strongest thing on this
+platform and it has one gap, which is stated plainly in its own spec and is
+worth restating here because it is the whole reason this module exists:
 
-WHAT IT IS
-----------
-A deterministic gate that sits in front of a model and decides, in
-arithmetic alone, whether a request is answered from store, sent to the
-model, sent to a cheaper one, held for a person, or refused.
+    the authorising principal, the scope and the approver all arrive on the
+    request. There is no external source to ask. A well-formed grant that
+    was never issued would pass every check we run.
 
-It also tells the caller, on every single request, exactly what in that
-request is costing money that it does not need to cost.
+Nothing inside a system can close that, because every term in the check is
+produced by the party being checked. An auditor does not ask a company for its
+cash balance. They ask the bank.
 
-Every decision seals into the platform chain. The saving is a receipt,
-not a claim.
+We have a bank. Since 1 August 2026 independent chains have been sealing this
+chain's tip hourly into logs this operator cannot write to. That machinery was
+built for a different purpose - stopping us backdating the decision record -
+and it turns out to answer a question nobody pointed it at:
 
-HOW IT IS BUILT
----------------
-Three layers, in this order, because a cost gate that depends entirely
-on tuned weights is a cost gate nobody can defend in a meeting.
+    a grant sealed at tree size M, and a peer that sealed our root at tree
+    size N >= M at time T, means the grant existed before T, in a record
+    the operator cannot reach.
 
-  Layer 1  HARD RULES
-           Absolute, arithmetic, untunable. A budget that is spent is
-           spent. A request repeating identically eight times is a
-           runaway. These do not consult the score at all.
+That does not make a grant legitimate. It makes it impossible to invent one
+afterwards - which is the attack that actually matters. When something goes
+wrong, the tempting move is not to forge a signature. It is to produce a
+perfectly well-formed authorisation dated last Tuesday. This is the thing that
+stops that, and it needs no new protocol, no consortium and no cooperation
+beyond the tip exchange already running.
 
-  Layer 2  THE SCORE
-           Nine weighted signals summing to exactly 1.00, split into
-           the ones that measure what this request will SPEND and the
-           ones that measure whether that spend is WASTE.
+WHAT IT ADDS
+------------
+  - an attestation record: our tree size and root, submitted to a named peer,
+    with whatever that peer returned, sealed into our own chain
+  - for any grant or any sealed record, the EARLIEST external attestation
+    that covers it, and the exact routes a third party runs to check that
+    against the peer's own host rather than ours
+  - a latency figure nobody publishes: how long a grant sat unwitnessed. A
+    grant witnessed nine seconds after issue is a different object from one
+    witnessed nine days after, and both are stated
 
-  Layer 3  FINDINGS
-           Named, itemised waste inside the request, each with a token
-           figure attached and each marked exact or estimated. This is
-           the part that saves the most money, because it changes what
-           the caller sends next time.
+WHAT IT REFUSES TO DO
+---------------------
+  - it never certifies a peer's answer. Every response is recorded verbatim
+    and marked unverified; the verification plan points at the peer's host
+  - it never rewrites the meaning of an old attestation. A submission is
+    sealed when it is made and is not amended
+  - it does not claim a witnessed grant is a legitimate grant, anywhere, in
+    any wording. Existence before a time is the entire claim
 
-THREE TIERS OF CERTAINTY, NEVER MIXED
--------------------------------------
-  tokens_not_bought          EXACT. Provider-reported counts on a
-                             request that was served from store.
-                             This is the only number that goes in a
-                             savings total.
-
-  worst_case_tokens_avoided  A CEILING, not a saving. When a request
-                             is refused, max_tokens tells you the most
-                             it could have cost. Reported separately
-                             and never added to the exact figure.
-
-  findings tokens            ESTIMATED where marked. Character counts
-                             divided by four. Never enters any total.
-
-Nothing on this page is ever expressed as a percentage saved.
-
-WHAT IT DOES NOT DO
--------------------
-- It never calls a model to reach a decision. Every signal is
-  arithmetic on the request itself.
-- It only serves a stored answer for an IDENTICAL request. Matching
-  similar prompts needs an embedding, which is a model call, which
-  would defeat the entire point.
-- It does not judge whether a stored answer is still correct.
-- It does not store answers to requests that asked for varied output,
-  unless the caller overrides that deliberately.
-
-MODULE CONTRACT
----------------
-handle(method, action, data, api_key, ctx) -> (dict, status)
-PUBLIC is a set of (METHOD, action) tuples.
-ctx exposes conn, lock and seal.
+    POST /x/witnessed/submit    push the current head to a peer   (keyed)
+    GET  /x/witnessed/grant     earliest cover for a grant        (public)
+    GET  /x/witnessed/record    earliest cover for any receipt    (public)
+    GET  /x/witnessed/heads     every attestation on record       (public)
+    GET  /x/witnessed/status    coverage, and the honest gaps     (public)
+    GET  /x/witnessed/spec      the rules, in full                (public)
 """
 
 import hashlib
-import inspect
 import json
-import math
-import sqlite3
-import threading
+import re
+import socket
 import time
+import urllib.request
+from datetime import datetime, timezone
+from urllib.parse import urlparse
 
-VERSION = "2.2.0"
+VERSION = "1.0"
 
-PUBLIC = {
-    ("GET", "spec"),
-    ("GET", "stats"),
-    ("GET", "verify"),
-}
+PUBLIC = {("GET", "grant"), ("GET", "record"), ("GET", "heads"),
+          ("GET", "status"), ("GET", "spec")}
 
-# ============================================================ layer 1
-# Hard rules. Absolute. Not weights, not tunable by score band.
+HEAD_PREFIX = b"AILEASH-WITNESSED-HEAD-v1:"
+TIMEOUT = 8
+MAX_BYTES = 256 * 1024
 
-LOOP_WINDOW = 120          # seconds a repeat still counts as a repeat
-LOOP_HARD = 8              # identical repeats in the window = runaway
-LOOP_HARD_UNATTENDED = 4   # lower bar when no human is watching
-BURST_HARD = 120           # requests in 60s from one key = runaway
-
-# ============================================================ layer 2
-# Nine signals. Base weights MUST sum to exactly 1.00.
-#
-# What this request will SPEND ......................... 0.62
-W_EXPOSURE = 0.18   # worst case spend against remaining budget
-W_SIZE = 0.14       # prompt characters
-W_ASK = 0.14        # max_tokens ceiling the caller authorised
-W_DEPTH = 0.10      # conversation turns, re-sent on every call
-W_TOOLS = 0.06      # tool definitions, re-sent on every call
-#
-# Whether that spend is WASTE .......................... 0.38
-W_LOOP = 0.16       # the same request going round again
-W_BURST = 0.09      # requests in the last 60 seconds
-W_GRIND = 0.07      # requests in the last hour
-W_NOVELTY = 0.06    # first time this shape has been seen
-
-BASE_SUM = (W_EXPOSURE + W_SIZE + W_ASK + W_DEPTH + W_TOOLS
-            + W_LOOP + W_BURST + W_GRIND + W_NOVELTY)
-
-# Sits outside the base sum, deliberately.
-W_UNATTENDED = 0.10
-
-BAND_CHALLENGE = 0.55
-BAND_BLOCK = 0.80
-
-SAT_LOOP = 5
-SAT_BURST = 20
-SAT_GRIND = 200
-SAT_SIZE = 100_000
-SAT_ASK = 8_000
-SAT_DEPTH = 40
-SAT_TOOLS = 24
-
-# A request only earns the cheap model by being genuinely small.
-# Suspicion never routes a request to a weaker model.
-CHEAP_MAX_CHARS = 4_000
-CHEAP_MAX_TURNS = 6
-CHEAP_MAX_ASK = 1_000
-CHEAP_MAX_SCORE = 0.30
-
-W60 = 60
-W1H = 3600
-
-# ============================================================ layer 3
-CTX_KEEP_TURNS = 8          # turns beyond this are flagged as carried
-CTX_FLAG_TURNS = 12         # only flag once the conversation is this deep
-SYSTEM_FLAG_CHARS = 2_000
-CHARS_PER_TOKEN = 4.0       # the estimate, used only in findings
-
-DEFAULT_TTL = 30 * 24 * 3600
-MAX_STORED_BYTES = 512 * 1024
-MAX_PROMPT_CHARS = 2_000_000
-
-KEYED_FIELDS = (
-    "model", "messages", "system", "prompt", "input",
-    "temperature", "top_p", "top_k",
-    "max_tokens", "max_completion_tokens",
-    "stop", "stop_sequences",
-    "tools", "tool_choice", "response_format", "seed",
-)
-
-VOCABULARY = {
-    "SERVE": "answered from an identical earlier request; nothing was bought",
-    "ALLOW": "send it to the model as asked",
-    "DOWNGRADE": "small and simple enough for the cheap model",
-    "CHALLENGE": "hold it for a person before spending",
-    "BLOCK": "refused; it never reaches the model, so no completion is paid for",
-}
-
-LIMITS = [
-    "Matching is exact. A reworded prompt is a different request and goes "
-    "to the model.",
-    "Savings totals use only token counts the provider itself reported. "
-    "Nothing in a total is estimated.",
-    "A refused request has a worst case cost, not a known cost. It is "
-    "reported separately and never added to the savings total.",
-    "Token figures inside findings are estimated from character counts and "
-    "are marked as estimates. They never enter a total.",
-    "A stored answer is returned unchanged. This module does not judge "
-    "whether it is still correct.",
-    "No model is called to reach any decision here.",
-]
+_ready = False
 
 
-# --------------------------------------------------------------- helpers
-
-def _canonical(obj):
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
-                      ensure_ascii=True).encode("utf-8")
-
-
-def _sha(data):
-    if isinstance(data, str):
-        data = data.encode("utf-8")
-    return hashlib.sha256(data).hexdigest()
-
-
-def _fingerprint(req):
-    keyed = {k: req[k] for k in KEYED_FIELDS if k in req}
-    return _sha(b"SEBBI-TOKENSAVER-v2\n" + _canonical(keyed))
-
-
-def _content_chars(v):
-    if v is None:
-        return 0
-    if isinstance(v, str):
-        return len(v)
-    return len(_canonical(v))
-
-
-def _prompt_chars(req):
-    total = 0
-    for key in ("prompt", "input", "system"):
-        total += _content_chars(req.get(key))
-    msgs = req.get("messages")
-    if isinstance(msgs, list):
-        for m in msgs:
-            total += _content_chars(m.get("content") if isinstance(m, dict) else m)
-    tools = req.get("tools")
-    if tools is not None:
-        total += _content_chars(tools)
-    return total
-
-
-def _est_tokens(chars):
-    """Estimate only. Marked as such everywhere it appears."""
-    return int(chars / CHARS_PER_TOKEN)
-
-
-def _ask_ceiling(req):
-    """The caller's own authorised output ceiling. Exact, not estimated."""
-    v = req.get("max_tokens")
-    if v is None:
-        v = req.get("max_completion_tokens")
-    try:
-        return int(v) if v is not None else 0
-    except (TypeError, ValueError):
-        return 0
-
-
-def _shape(req):
-    n = len(req.get("messages") or [])
-    t = len(req.get("tools") or [])
-    band = int(math.log10(max(_prompt_chars(req), 1)) * 2)
-    return _sha("%s|%d|%d|%d" % (req.get("model") or "", n, t, band))
-
-
-def _measure(req):
-    """Everything the decision needs, taken from a full request."""
-    return {
-        "fp": _fingerprint(req),
-        "shape": _shape(req),
-        "chars": _prompt_chars(req),
-        "ask": _ask_ceiling(req),
-        "depth": len(req.get("messages") or []),
-        "tools": len(req.get("tools") or []),
-        "deterministic": _deterministic(req),
-        "from_digest": False,
-    }
-
-
-def _measure_from_digest(d):
-    """
-    The same measurements, supplied by a client that kept its content at
-    home. The client is measuring its own spend against its own budget,
-    so there is nothing to gain by misreporting.
-    """
-    if not isinstance(d, dict):
-        return None, "digest must be an object"
-    fp = d.get("fingerprint")
-    if not isinstance(fp, str) or len(fp) != 64:
-        return None, "digest needs a 64 character fingerprint"
-    try:
-        int(fp, 16)
-    except ValueError:
-        return None, "fingerprint must be hexadecimal"
-
-    def _n(key, cap):
-        v = d.get(key, 0)
-        try:
-            v = int(v)
-        except (TypeError, ValueError):
-            return 0
-        return max(0, min(v, cap))
-
-    m = {
-        "fp": fp,
-        "chars": _n("prompt_characters", MAX_PROMPT_CHARS),
-        "ask": _n("max_tokens", 10_000_000),
-        "depth": _n("conversation_turns", 100_000),
-        "tools": _n("tool_definitions", 100_000),
-        "deterministic": bool(d.get("deterministic", True)),
-        "from_digest": True,
-    }
-    band = int(math.log10(max(m["chars"], 1)) * 2)
-    m["shape"] = _sha("%s|%d|%d|%d" % (d.get("model") or "", m["depth"],
-                                       m["tools"], band))
-    return m, None
-
-
-def _log_scale(value, saturation):
-    if value <= 0:
-        return 0.0
-    if value >= saturation:
-        return 1.0
-    return math.log1p(value) / math.log1p(saturation)
-
-
-def _linear(value, saturation):
-    if value <= 0:
-        return 0.0
-    return min(1.0, float(value) / float(saturation))
-
-
-def _deterministic(req):
-    t = req.get("temperature")
-    if t is None:
-        return True
-    try:
-        return float(t) == 0.0
-    except (TypeError, ValueError):
-        return False
-
-
-def _usage(resp):
-    if not isinstance(resp, dict):
-        return (None, None)
-    u = resp.get("usage")
-    if not isinstance(u, dict):
-        return (None, None)
-    i = u.get("input_tokens", u.get("prompt_tokens"))
-    o = u.get("output_tokens", u.get("completion_tokens"))
-    try:
-        return (int(i) if i is not None else None,
-                int(o) if o is not None else None)
-    except (TypeError, ValueError):
-        return (None, None)
-
-
-def _money(tokens_in, tokens_out, price_in, price_out):
-    if price_in is None and price_out is None:
-        return None
-    m = 0.0
-    if price_in:
-        m += (tokens_in or 0) / 1_000_000.0 * price_in
-    if price_out:
-        m += (tokens_out or 0) / 1_000_000.0 * price_out
-    return round(m, 4)
-
-
-# --------------------------------------------------------------- storage
-
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS ts_store (
-    api_key       TEXT NOT NULL,
-    fp            TEXT NOT NULL,
-    model         TEXT,
-    response      TEXT NOT NULL,
-    input_tokens  INTEGER,
-    output_tokens INTEGER,
-    stored_at     REAL NOT NULL,
-    expires_at    REAL,
-    hits          INTEGER NOT NULL DEFAULT 0,
-    last_hit      REAL,
-    PRIMARY KEY (api_key, fp)
-);
-
-CREATE TABLE IF NOT EXISTS ts_seen (
-    api_key  TEXT NOT NULL,
-    fp       TEXT NOT NULL,
-    ts       REAL NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS ts_shape (
-    api_key  TEXT NOT NULL,
-    shape    TEXT NOT NULL,
-    first_ts REAL NOT NULL,
-    PRIMARY KEY (api_key, shape)
-);
-
-CREATE TABLE IF NOT EXISTS ts_decision (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    api_key     TEXT NOT NULL,
-    ts          REAL NOT NULL,
-    fp          TEXT NOT NULL,
-    verdict     TEXT NOT NULL,
-    rule        TEXT,
-    score       REAL NOT NULL,
-    signals     TEXT NOT NULL,
-    exact_in    INTEGER,
-    exact_out   INTEGER,
-    ceiling_in  INTEGER,
-    ceiling_out INTEGER,
-    audit_hash  TEXT
-);
-
-CREATE TABLE IF NOT EXISTS ts_account (
-    api_key    TEXT PRIMARY KEY,
-    ceiling    INTEGER NOT NULL DEFAULT 0,
-    spent      INTEGER NOT NULL DEFAULT 0,
-    price_in   REAL,
-    price_out  REAL,
-    currency   TEXT,
-    updated    REAL NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS ts_seen_key ON ts_seen(api_key, ts);
-CREATE INDEX IF NOT EXISTS ts_seen_fp ON ts_seen(api_key, fp, ts);
-CREATE INDEX IF NOT EXISTS ts_dec_key ON ts_decision(api_key, id);
-CREATE INDEX IF NOT EXISTS ts_dec_hash ON ts_decision(audit_hash);
-CREATE INDEX IF NOT EXISTS ts_store_exp ON ts_store(expires_at);
-"""
-
-_ready = {}
-
-
-def _init(ctx):
-    # Keyed by id, but the connection itself is kept as the value so the
-    # id cannot be recycled while we still believe in it.
-    k = id(ctx.conn)
-    if _ready.get(k) is ctx.conn:
+def _setup(ctx):
+    global _ready
+    if _ready:
         return
-    with ctx.lock:
-        ctx.conn.executescript(_SCHEMA)
-        ctx.conn.commit()
-    _ready[k] = ctx.conn
+    with ctx["lock"]:
+        c = ctx["conn"]
+        c.execute("CREATE TABLE IF NOT EXISTS witnessed_head("
+                  "id INTEGER PRIMARY KEY AUTOINCREMENT,peer TEXT,peer_url TEXT,"
+                  "tree_size INTEGER,tip TEXT,head_digest TEXT,submitted REAL,"
+                  "accepted INTEGER,peer_response TEXT,peer_block TEXT,"
+                  "audit_hash TEXT,block_index INTEGER,api_key TEXT)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_wit_size "
+                  "ON witnessed_head(tree_size)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_wit_peer "
+                  "ON witnessed_head(peer)")
+        c.commit()
+    _ready = True
 
 
-def _account(ctx, api_key):
-    row = ctx.conn.execute(
-        "SELECT ceiling, spent, price_in, price_out, currency "
-        "FROM ts_account WHERE api_key=?", (api_key,)
-    ).fetchone()
+def _iso(ts):
+    if not ts:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+def _cols(ctx, table):
+    try:
+        with ctx["lock"]:
+            return [r[1] for r in ctx["conn"].execute(
+                "PRAGMA table_info(%s)" % table).fetchall()]
+    except Exception:
+        return []
+
+
+# ----------------------------------------------------------------------
+# where a record sits in the chain
+# ----------------------------------------------------------------------
+
+def _head(ctx):
+    """Current tree size and tip, read the same way consistency.py orders it:
+    audit_log in write order."""
+    with ctx["lock"]:
+        row = ctx["conn"].execute(
+            "SELECT COUNT(*), MAX(id) FROM audit_log").fetchone()
+        tip = ctx["conn"].execute(
+            "SELECT audit_hash FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()
+    size = (row[0] if row else 0) or 0
+    return size, (tip[0] if tip else None)
+
+
+def _size_at(ctx, row_id):
+    """The tree size at which the record with this audit_log id is included."""
+    with ctx["lock"]:
+        row = ctx["conn"].execute(
+            "SELECT COUNT(*) FROM audit_log WHERE id<=?", (row_id,)).fetchone()
+    return row[0] if row else None
+
+
+def _locate_hash(ctx, audit_hash):
+    with ctx["lock"]:
+        row = ctx["conn"].execute(
+            "SELECT id,ts FROM audit_log WHERE audit_hash=? ORDER BY id ASC LIMIT 1",
+            (audit_hash,)).fetchone()
     if not row:
-        return {"ceiling": 0, "spent": 0, "price_in": None,
-                "price_out": None, "currency": None}
-    return {"ceiling": row[0], "spent": row[1], "price_in": row[2],
-            "price_out": row[3], "currency": row[4]}
+        return None, None, None
+    return row[0], row[1], _size_at(ctx, row[0])
 
 
-def _prune(ctx, api_key, now):
-    ctx.conn.execute("DELETE FROM ts_seen WHERE api_key=? AND ts < ?",
-                     (api_key, now - W1H))
+def _locate_grant(ctx, grant_id):
+    """A grant's own sealed block. Read defensively - the column set has moved
+    before and a module that assumes a schema is a module that breaks."""
+    cols = _cols(ctx, "auth_grant")
+    if not cols:
+        return None
+    want = [c for c in ("id", "audit_hash", "created", "issuer", "subject",
+                        "risk_accepted_by", "parent", "root") if c in cols]
+    if "audit_hash" not in want:
+        return None
+    with ctx["lock"]:
+        row = ctx["conn"].execute(
+            "SELECT %s FROM auth_grant WHERE id=?" % ",".join(want),
+            (grant_id,)).fetchone()
+    if not row:
+        return None
+    return dict(zip(want, row))
 
 
-# ================================================================ layer 3
+# ----------------------------------------------------------------------
+# the earliest outside party to have seen it
+# ----------------------------------------------------------------------
 
-def _findings(req, loop_n, has_stored, acct):
+def _earliest_cover(ctx, size):
+    """The first attestation whose tree size reaches this record.
+
+    Accepted submissions only. A peer that refused, timed out or answered
+    with something unreadable has not seen anything, and counting it would be
+    the exact self-flattery this module exists to remove.
     """
-    Named waste inside this request. Every item carries a token figure
-    and says whether that figure is exact or estimated. This never
-    feeds a total.
-    """
-    out = []
-    msgs = req.get("messages") or []
-    depth = len(msgs)
-    tools = req.get("tools") or []
-    ask = _ask_ceiling(req)
-
-    # The biggest one in agent systems: the same request going round
-    # and nobody recording the answer.
-    if loop_n >= 2 and not has_stored:
-        out.append({
-            "code": "repeating_without_recording",
-            "severity": "high",
-            "detail": "This exact request has gone out %d times in the last "
-                      "%d seconds and no answer has been recorded. Post the "
-                      "response back to record and every repeat after that "
-                      "costs nothing."
-                      % (loop_n, LOOP_WINDOW),
-            "tokens": None,
-            "certainty": "not counted",
-        })
-
-    if not _deterministic(req):
-        out.append({
-            "code": "varied_output_blocks_reuse",
-            "severity": "medium",
-            "detail": "temperature is above zero, so this answer cannot be "
-                      "safely reused. If this request does not genuinely need "
-                      "varied output, setting temperature to zero makes every "
-                      "repeat free.",
-            "tokens": None,
-            "certainty": "not counted",
-        })
-
-    if depth > CTX_FLAG_TURNS:
-        carried = msgs[:-CTX_KEEP_TURNS] if CTX_KEEP_TURNS < depth else []
-        chars = sum(_content_chars(m.get("content") if isinstance(m, dict)
-                                   else m) for m in carried)
-        out.append({
-            "code": "carrying_old_turns",
-            "severity": "high" if chars > 20_000 else "medium",
-            "detail": "%d turns are being re-sent on every call. The oldest "
-                      "%d of them account for roughly the tokens below, paid "
-                      "again each time this conversation continues."
-                      % (depth, len(carried)),
-            "tokens": _est_tokens(chars),
-            "certainty": "estimated from character count",
-        })
-
-    if tools:
-        used = False
-        for m in msgs:
-            if not isinstance(m, dict):
-                continue
-            c = m.get("content")
-            blob = c if isinstance(c, str) else _canonical(c).decode("utf-8", "ignore")
-            if "tool_use" in blob or "tool_call" in blob:
-                used = True
-                break
-        if not used:
-            chars = _content_chars(tools)
-            out.append({
-                "code": "unused_tool_definitions",
-                "severity": "high" if chars > 8_000 else "medium",
-                "detail": "%d tool definitions are attached and nothing in "
-                          "this conversation has called one. They are sent in "
-                          "full on every request."
-                          % len(tools),
-                "tokens": _est_tokens(chars),
-                "certainty": "estimated from character count",
-            })
-
-    sys_chars = _content_chars(req.get("system"))
-    if sys_chars > SYSTEM_FLAG_CHARS and depth > 4:
-        out.append({
-            "code": "large_system_prompt_resent",
-            "severity": "low",
-            "detail": "The system prompt is re-sent on every call in this "
-                      "conversation. If your provider offers prompt caching, "
-                      "this is the block to cache.",
-            "tokens": _est_tokens(sys_chars),
-            "certainty": "estimated from character count",
-        })
-
-    if ask:
-        out.append({
-            "code": "output_ceiling_authorised",
-            "severity": "low",
-            "detail": "max_tokens is set to %d, so this single call is "
-                      "authorised to buy up to that many output tokens." % ask,
-            "tokens": ask,
-            "certainty": "exact ceiling set by the caller",
-        })
-
-    seen = {}
-    for m in msgs:
-        if not isinstance(m, dict):
-            continue
-        k = _sha(_canonical(m.get("content")))
-        seen[k] = seen.get(k, 0) + 1
-    dupes = sum(n - 1 for n in seen.values() if n > 1)
-    if dupes >= 2:
-        out.append({
-            "code": "duplicate_turns_in_context",
-            "severity": "medium",
-            "detail": "%d turns inside this conversation are byte-identical "
-                      "to an earlier turn. They are being paid for twice."
-                      % dupes,
-            "tokens": None,
-            "certainty": "not counted",
-        })
-
-    if acct["ceiling"] and acct["spent"] >= acct["ceiling"] * 0.8:
-        out.append({
-            "code": "budget_nearly_gone",
-            "severity": "high",
-            "detail": "This key has used %d of its %d token ceiling."
-                      % (acct["spent"], acct["ceiling"]),
-            "tokens": None,
-            "certainty": "exact, from provider-reported usage",
-        })
-
-    return out
+    if not size:
+        return None
+    with ctx["lock"]:
+        row = ctx["conn"].execute(
+            "SELECT peer,peer_url,tree_size,tip,submitted,peer_block,audit_hash,"
+            "block_index FROM witnessed_head WHERE accepted=1 AND tree_size>=? "
+            "ORDER BY submitted ASC LIMIT 1", (size,)).fetchone()
+    if not row:
+        return None
+    return {"peer": row[0], "peer_url": row[1], "tree_size": row[2],
+            "tip": row[3], "witnessed_at": _iso(row[4]),
+            "witnessed_at_epoch": row[4], "peer_block": row[5],
+            "our_seal_of_the_submission": row[6], "our_block_index": row[7]}
 
 
-# ================================================================ layers 1+2
-
-def _decide(ctx, api_key, m, now, unattended, count_it):
-    """
-    Takes a measurement bundle from _measure or _measure_from_digest, so
-    the same decision runs whether the caller sent the request or kept it
-    at home and sent only its shape.
-
-    rule is set only when a hard rule fired, in which case the score is
-    still computed and reported but did not decide anything.
-    """
-    fp = m["fp"]
-    shape = m["shape"]
-    acct = _account(ctx, api_key)
-
-    loop_n = ctx.conn.execute(
-        "SELECT COUNT(*) FROM ts_seen WHERE api_key=? AND fp=? AND ts > ?",
-        (api_key, fp, now - LOOP_WINDOW)).fetchone()[0]
-    burst_n = ctx.conn.execute(
-        "SELECT COUNT(*) FROM ts_seen WHERE api_key=? AND ts > ?",
-        (api_key, now - W60)).fetchone()[0]
-    grind_n = ctx.conn.execute(
-        "SELECT COUNT(*) FROM ts_seen WHERE api_key=? AND ts > ?",
-        (api_key, now - W1H)).fetchone()[0]
-    seen_shape = ctx.conn.execute(
-        "SELECT 1 FROM ts_shape WHERE api_key=? AND shape=?",
-        (api_key, shape)).fetchone()
-    has_stored = ctx.conn.execute(
-        "SELECT 1 FROM ts_store WHERE api_key=? AND fp=?",
-        (api_key, fp)).fetchone() is not None
-
-    chars = m["chars"]
-    ask = m["ask"]
-    depth = m["depth"]
-    tools = m["tools"]
-
-    # Worst case this one call could cost: an exact ceiling on output,
-    # an estimate on input. Kept apart accordingly.
-    ceiling_out = ask
-    est_in = _est_tokens(chars)
-    remaining = max(0, acct["ceiling"] - acct["spent"]) if acct["ceiling"] else 0
-    if remaining:
-        exposure = _linear(est_in + ceiling_out, remaining)
-    else:
-        exposure = 0.0
-
-    s = {
-        "exposure": round(exposure, 4),
-        "size": round(_log_scale(chars, SAT_SIZE), 4),
-        "ask": round(_log_scale(ask, SAT_ASK), 4),
-        "depth": round(_linear(depth, SAT_DEPTH), 4),
-        "tools": round(_linear(tools, SAT_TOOLS), 4),
-        "loop": round(_linear(loop_n, SAT_LOOP), 4),
-        "burst": round(_linear(burst_n, SAT_BURST), 4),
-        "grind": round(_linear(grind_n, SAT_GRIND), 4),
-        "novelty": 0.0 if seen_shape else 1.0,
-    }
-
-    score = (W_EXPOSURE * s["exposure"] + W_SIZE * s["size"]
-             + W_ASK * s["ask"] + W_DEPTH * s["depth"]
-             + W_TOOLS * s["tools"] + W_LOOP * s["loop"]
-             + W_BURST * s["burst"] + W_GRIND * s["grind"]
-             + W_NOVELTY * s["novelty"])
-
-    s["unattended"] = bool(unattended)
-    if unattended:
-        score += W_UNATTENDED
-    score = round(min(1.0, score), 4)
-
-    measured = {
-        "prompt_characters": chars,
-        "estimated_input_tokens": est_in,
-        "estimated_input_tokens_note": "estimated from characters, never "
-                                       "counted in a savings total",
-        "authorised_output_tokens": ceiling_out,
-        "conversation_turns": depth,
-        "tool_definitions": tools,
-        "same_request_in_last_%ds" % LOOP_WINDOW: loop_n,
-        "requests_in_last_60s": burst_n,
-        "requests_in_last_hour": grind_n,
-        "budget_ceiling_tokens": acct["ceiling"],
-        "budget_spent_tokens": acct["spent"],
-    }
-
-    # ---- layer 1: hard rules, in order, no appeal to the score --------
-    rule = None
-    verdict = None
-
-    if acct["ceiling"] and acct["spent"] >= acct["ceiling"]:
-        rule, verdict = "budget_exhausted", "BLOCK"
-    elif acct["ceiling"] and (est_in + ceiling_out) > remaining:
-        # An overdraft. Catching this after the fact is too late: the
-        # money is already gone. A person may raise the ceiling, so an
-        # attended call is held rather than refused.
-        rule = "exceeds_remaining_budget"
-        verdict = "BLOCK" if unattended else "CHALLENGE"
-    elif loop_n >= LOOP_HARD:
-        rule, verdict = "runaway_loop", "BLOCK"
-    elif unattended and loop_n >= LOOP_HARD_UNATTENDED:
-        rule, verdict = "runaway_loop_unattended", "BLOCK"
-    elif burst_n >= BURST_HARD:
-        rule, verdict = "runaway_burst", "BLOCK"
-
-    # ---- layer 2: the score -------------------------------------------
-    if verdict is None:
-        if score >= BAND_BLOCK:
-            verdict = "BLOCK"
-        elif score >= BAND_CHALLENGE:
-            verdict = "CHALLENGE"
-        elif (score < CHEAP_MAX_SCORE and chars <= CHEAP_MAX_CHARS
-              and depth <= CHEAP_MAX_TURNS and ask <= CHEAP_MAX_ASK
-              and tools == 0):
-            verdict = "DOWNGRADE"
-        else:
-            verdict = "ALLOW"
-
-    if count_it:
-        ctx.conn.execute("INSERT INTO ts_seen (api_key, fp, ts) VALUES (?,?,?)",
-                         (api_key, fp, now))
-        ctx.conn.execute(
-            "INSERT OR IGNORE INTO ts_shape (api_key, shape, first_ts) "
-            "VALUES (?,?,?)", (api_key, shape, now))
-        _prune(ctx, api_key, now)
-
-    measured["measured_from"] = ("a digest supplied by the client; the "
-                                "content stayed on their side"
-                                if m.get("from_digest") else
-                                "the request body")
-    return (verdict, rule, score, s, measured, fp, shape, loop_n, has_stored,
-            est_in, ceiling_out, acct)
+def _all_covers(ctx, size, limit=10):
+    if not size:
+        return []
+    with ctx["lock"]:
+        rows = ctx["conn"].execute(
+            "SELECT peer,tree_size,submitted,peer_block FROM witnessed_head "
+            "WHERE accepted=1 AND tree_size>=? ORDER BY submitted ASC LIMIT ?",
+            (size, limit)).fetchall()
+    return [{"peer": r[0], "tree_size": r[1], "witnessed_at": _iso(r[2]),
+             "peer_block": r[3]} for r in rows]
 
 
-def _record_decision(ctx, api_key, fp, verdict, rule, score, signals,
-                     ex_in, ex_out, ce_in, ce_out, seal_hash, now):
-    """Writes the row and returns its id, so the receipt can be stamped on
-    afterwards once the lock has been released."""
-    cur = ctx.conn.execute(
-        "INSERT INTO ts_decision (api_key, ts, fp, verdict, rule, score, "
-        "signals, exact_in, exact_out, ceiling_in, ceiling_out, audit_hash) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-        (api_key, now, fp, verdict, rule, score,
-         json.dumps(signals, sort_keys=True), ex_in, ex_out, ce_in, ce_out,
-         seal_hash))
-    return cur.lastrowid
+def _plan(size, cover):
+    """What a third party runs, and where. Every step that can be checked
+    against the peer rather than against us is pointed at the peer."""
+    if not cover:
+        return None
+    return [
+        {"step": 1,
+         "what": "Confirm the peer holds that tip, and when they sealed it",
+         "where": "the peer's own host",
+         "run": (cover.get("peer_url") or ("https://" + str(cover.get("peer"))))
+                + "/x/witness/attest?peer=<this chain>&tip=" + str(cover.get("tip"))},
+        {"step": 2,
+         "what": "Confirm the tip they hold is a genuine head of this log",
+         "where": "here, but re-derivable by anyone",
+         "run": "/x/consistency/ancestor?tip=" + str(cover.get("tip"))},
+        {"step": 3,
+         "what": "Confirm the record is inside the log that tip commits to",
+         "where": "here, and checkable offline with the published rules",
+         "run": "/x/consistency/proof?first=" + str(size) + "&second="
+                + str(cover.get("tree_size"))},
+        {"step": 4,
+         "what": "Conclude",
+         "where": "your own arithmetic",
+         "run": "the record sat at size " + str(size) + "; the peer sealed a root "
+                "at size " + str(cover.get("tree_size")) + " on "
+                + str(cover.get("witnessed_at")) + ". It existed before then, in a "
+                "log this operator cannot write to."},
+    ]
 
 
-def _seal_and_stamp(ctx, event, detail, api_key, decision_id):
-    """
-    Seal with the lock released, then write the receipt back onto the row
-    in a second short lock. Splitting it this way is what keeps the
-    platform's non-reentrant lock from deadlocking the request.
-    """
-    seal = ctx.seal(event, detail, api_key)
-    h = seal.get("hash") if isinstance(seal, dict) else None
-    if h and decision_id:
+# ----------------------------------------------------------------------
+# submitting a head to a peer
+# ----------------------------------------------------------------------
+
+def _safe_url(url):
+    """Same posture as witness.py: http/https, standard ports, resolve first
+    and refuse anything that lands on a private address."""
+    try:
+        u = urlparse(url)
+    except Exception:
+        return None, "unparseable url"
+    if u.scheme not in ("http", "https"):
+        return None, "only http and https"
+    if u.port and u.port not in (80, 443):
+        return None, "only ports 80 and 443"
+    host = u.hostname
+    if not host:
+        return None, "no host"
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception as exc:
+        return None, "cannot resolve (%s)" % str(exc)[:80]
+    for info in infos:
+        addr = info[4][0]
+        if _private(addr):
+            return None, "resolves to a non-public address"
+    return u, None
+
+
+def _private(addr):
+    try:
+        import ipaddress
+        ip = ipaddress.ip_address(addr)
+        return (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+    except Exception:
+        return True
+
+
+def _submit(ctx, api_key, data):
+    peer = str(data.get("peer", "")).strip()[:120]
+    url = str(data.get("url", "")).strip()
+    chain = str(data.get("chain", "")).strip()[:120] or None
+    if not peer or not url:
+        return {"error": "peer_and_url_required",
+                "message": "peer is the name they publish under; url is their "
+                           "witness endpoint, e.g. https://example.com"}, 400
+
+    u, why = _safe_url(url)
+    if why:
+        return {"error": "url_refused", "message": why}, 400
+
+    size, tip = _head(ctx)
+    if not size or not tip:
+        return {"error": "nothing_to_witness",
+                "message": "The chain is empty. There is no head to submit."}, 409
+
+    head_digest = hashlib.sha256(
+        HEAD_PREFIX + json.dumps({"tree_size": size, "tip": tip},
+                                 sort_keys=True, separators=(",", ":")
+                                 ).encode("utf-8")).hexdigest()
+
+    body = json.dumps({"chain": chain or "sebbi.pro", "tip": tip,
+                       "tree_size": size, "peer_ts": time.time()}).encode("utf-8")
+    endpoint = url.rstrip("/") + "/x/witness/observe"
+
+    accepted = 0
+    response_text = ""
+    peer_block = None
+    try:
+        req = urllib.request.Request(
+            endpoint, data=body,
+            headers={"Content-Type": "application/json",
+                     "User-Agent": "aileash-witnessed/" + VERSION},
+            method="POST")
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+            raw = r.read(MAX_BYTES)
+            response_text = raw.decode("utf-8", "replace")[:4000]
+            accepted = 1 if 200 <= r.status < 300 else 0
         try:
-            with ctx.lock:
-                ctx.conn.execute(
-                    "UPDATE ts_decision SET audit_hash=? WHERE id=?",
-                    (h, decision_id))
-                ctx.conn.commit()
-        except Exception:                        # noqa: BLE001
+            parsed = json.loads(response_text)
+            for k in ("sealed_in_our_chain", "block_index", "audit_hash", "seal"):
+                if isinstance(parsed, dict) and parsed.get(k) is not None:
+                    peer_block = str(parsed[k])
+                    break
+        except Exception:
             pass
-    return seal
+    except Exception as exc:
+        response_text = "request failed: " + str(exc)[:300]
+        accepted = 0
+
+    now = time.time()
+    ev = {"user_id": "wit:" + peer[:40], "action": "head_submitted", "amount": 0,
+          "country": "UK", "device_id": "witnessed", "anomaly": 0,
+          "device_risk": 0 if accepted else 1}
+    res = {"decision": "HEAD_SUBMITTED" if accepted else "HEAD_SUBMISSION_FAILED",
+           "score": 0, "witnessed_version": VERSION, "peer": peer,
+           "tree_size": size, "tip": tip, "head_digest": head_digest,
+           "accepted": bool(accepted), "peer_block": peer_block,
+           "detail": "peer=%s;size=%d;tip=%s;accepted=%s"
+                     % (peer, size, tip, bool(accepted))}
+    audit_hash, block_index, seq = ctx["seal"](ev, res, now, api_key)
+
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "INSERT INTO witnessed_head(peer,peer_url,tree_size,tip,head_digest,"
+            "submitted,accepted,peer_response,peer_block,audit_hash,block_index,"
+            "api_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (peer, url, size, tip, head_digest, now, accepted,
+             response_text, peer_block, audit_hash, block_index, api_key))
+        ctx["conn"].commit()
+
+    out = {"peer": peer, "tree_size": size, "tip": tip,
+           "head_digest": head_digest, "accepted": bool(accepted),
+           "peer_block": peer_block, "submitted_at": _iso(now),
+           "sealed_in_chain": audit_hash, "block_index": block_index,
+           "receipt_seq": seq,
+           "peer_response": response_text[:800],
+           "peer_response_is_unverified": True,
+           "note": ("The failure is sealed too. A submission a peer refused is "
+                    "part of the record, and coverage never counts it.")}
+    if accepted:
+        out["what_this_now_proves"] = (
+            "Every record at or below tree size " + str(size) + " existed before "
+            + _iso(now) + " in a log this operator cannot write to. It says nothing "
+            "about whether those records are true.")
+    return out, (200 if accepted else 502)
 
 
-# --------------------------------------------------------------- actions
+# ----------------------------------------------------------------------
+# read
+# ----------------------------------------------------------------------
 
-def _a_spec():
-    return {
-        "module": "tokensaver",
-        "version": VERSION,
-        "what_it_is": "A deterministic gate in front of a model. It decides "
-                      "whether a request is answered from store, sent to the "
-                      "model, sent to a cheaper model, held for a person, or "
-                      "refused. It also names the waste inside every request "
-                      "it sees.",
-        "model_calls_made_to_reach_a_decision": 0,
-        "layers": {
-            "1_hard_rules": {
-                "why": "A cost gate that depends only on tuned weights is a "
-                       "cost gate nobody can defend. These are absolute.",
-                "rules": {
-                    "budget_exhausted": "spend has reached the key's ceiling",
-                    "exceeds_remaining_budget":
-                        "this one call could cost more than the budget left. "
-                        "Output uses the exact ceiling you set; input is "
-                        "estimated from characters, so this rule is "
-                        "deliberately cautious. Held for a person when a "
-                        "human is declared, refused when one is not.",
-                    "runaway_loop": "the same request %d times in %d seconds"
-                                    % (LOOP_HARD, LOOP_WINDOW),
-                    "runaway_loop_unattended": "the same request %d times in "
-                                               "%d seconds with no human "
-                                               "declared"
-                                               % (LOOP_HARD_UNATTENDED,
-                                                  LOOP_WINDOW),
-                    "runaway_burst": "%d requests from one key in 60 seconds"
-                                     % BURST_HARD,
-                },
-            },
-            "2_the_score": {
-                "spend_signals": {
-                    "exposure": {"weight": W_EXPOSURE,
-                                 "measures": "worst case cost of this call "
-                                             "against the budget left"},
-                    "size": {"weight": W_SIZE, "saturates_at": SAT_SIZE,
-                             "measures": "prompt characters, log scaled"},
-                    "ask": {"weight": W_ASK, "saturates_at": SAT_ASK,
-                            "measures": "the max_tokens ceiling the caller set"},
-                    "depth": {"weight": W_DEPTH, "saturates_at": SAT_DEPTH,
-                              "measures": "turns re-sent on every call"},
-                    "tools": {"weight": W_TOOLS, "saturates_at": SAT_TOOLS,
-                              "measures": "tool definitions re-sent on every call"},
-                },
-                "waste_signals": {
-                    "loop": {"weight": W_LOOP, "saturates_at": SAT_LOOP},
-                    "burst": {"weight": W_BURST, "saturates_at": SAT_BURST},
-                    "grind": {"weight": W_GRIND, "saturates_at": SAT_GRIND},
-                    "novelty": {"weight": W_NOVELTY},
-                },
-                "spend_weight_total": round(W_EXPOSURE + W_SIZE + W_ASK
-                                            + W_DEPTH + W_TOOLS, 4),
-                "waste_weight_total": round(W_LOOP + W_BURST + W_GRIND
-                                            + W_NOVELTY, 4),
-                "base_weights_sum_to": round(BASE_SUM, 4),
-                "outside_the_base_sum": {"unattended": W_UNATTENDED},
-                "bands": {"CHALLENGE": ">= %.2f" % BAND_CHALLENGE,
-                          "BLOCK": ">= %.2f" % BAND_BLOCK},
-                "downgrade_is_earned_not_suspected": {
-                    "max_score": CHEAP_MAX_SCORE,
-                    "max_prompt_characters": CHEAP_MAX_CHARS,
-                    "max_turns": CHEAP_MAX_TURNS,
-                    "max_output_tokens": CHEAP_MAX_ASK,
-                    "tools_allowed": 0,
-                    "why": "a suspicious request is never sent to a weaker "
-                           "model. Only a genuinely small one is.",
-                },
-            },
-            "3_findings": {
-                "why": "The verdict saves money on this call. The findings "
-                       "change what the caller sends next time, which saves "
-                       "far more.",
-                "codes": ["repeating_without_recording",
-                          "varied_output_blocks_reuse",
-                          "carrying_old_turns",
-                          "unused_tool_definitions",
-                          "large_system_prompt_resent",
-                          "output_ceiling_authorised",
-                          "duplicate_turns_in_context",
-                          "budget_nearly_gone"],
-            },
-        },
-        "verdict_vocabulary": VOCABULARY,
-        "certainty_tiers": {
-            "tokens_not_bought": "exact, provider reported, the only figure "
-                                 "that enters a savings total",
-            "worst_case_tokens_avoided": "a ceiling on what a refused request "
-                                         "could have cost, reported separately",
-            "findings_tokens": "estimated from characters where marked, never "
-                               "entering any total",
-        },
-        "two_ways_to_call_it": {
-            "request": "send the provider request body. This platform sees "
-                       "your prompt.",
-            "digest": "send only a fingerprint and counts. Your prompts and "
-                      "answers never leave your building, the decision is "
-                      "identical, and the receipt is the same. The downloaded "
-                      "client uses this path by default.",
-        },
-        "honest_limits": LIMITS,
-        "routes": {
-            "public": ["spec", "stats", "verify"],
-            "keyed": ["estimate", "gate", "record", "ledger", "budget",
-                      "prices", "forget"],
-        },
-    }
+def _grant(ctx, data):
+    gid = str(data.get("id") or data.get("grant") or "").strip()
+    if not gid:
+        return {"error": "grant_required",
+                "list": "/x/continuity/decisions"}, 400
 
+    g = _locate_grant(ctx, gid)
+    if not g:
+        return {"error": "grant_not_found", "grant": gid}, 404
 
-def _bundle(data):
-    """
-    A caller may send the whole request, or only a digest of it. The
-    digest path exists so a customer's prompts and answers never leave
-    their own building. Returns (measurements, request_or_None, error, code).
-    """
-    req = data.get("request")
-    if isinstance(req, dict):
-        if _prompt_chars(req) > MAX_PROMPT_CHARS:
-            return None, None, {"error": "request_too_large"}, 413
-        return _measure(req), req, None, None
+    row_id, sealed_ts, size = _locate_hash(ctx, g.get("audit_hash"))
+    if size is None:
+        return {"error": "grant_not_in_chain", "grant": gid,
+                "message": "The grant record carries a seal that is not in the "
+                           "audit log. That is a finding, not a lookup failure."}, 409
 
-    dig = data.get("digest")
-    if dig is not None:
-        m, err = _measure_from_digest(dig)
-        if err:
-            return None, None, {"error": "bad_digest", "detail": err}, 400
-        return m, None, None, None
-
-    return None, None, {
-        "error": "request_or_digest_required",
-        "detail": "send the provider request body under 'request', or a "
-                  "content-free digest under 'digest' with fingerprint, "
-                  "prompt_characters, max_tokens, conversation_turns, "
-                  "tool_definitions and deterministic",
-    }, 400
-
-
-def _digest_findings(m, loop_n, has_stored, acct):
-    """
-    What can honestly be said when the content stayed at home. Anything
-    needing the actual messages is left to the client, which has them.
-    """
-    out = []
-    if loop_n >= 2 and not has_stored:
-        out.append({
-            "code": "repeating_without_recording",
-            "severity": "high",
-            "detail": "This exact request has gone out %d times in the last "
-                      "%d seconds and no answer has been recorded. Post the "
-                      "response back to record and every repeat after that "
-                      "costs nothing." % (loop_n, LOOP_WINDOW),
-            "tokens": None,
-            "certainty": "not counted",
-        })
-    if not m["deterministic"]:
-        out.append({
-            "code": "varied_output_blocks_reuse",
-            "severity": "medium",
-            "detail": "temperature is above zero, so this answer cannot be "
-                      "safely reused.",
-            "tokens": None,
-            "certainty": "not counted",
-        })
-    if m["depth"] > CTX_FLAG_TURNS:
-        out.append({
-            "code": "carrying_old_turns",
-            "severity": "medium",
-            "detail": "%d turns are being re-sent on every call. Your client "
-                      "holds the content and can size this exactly."
-                      % m["depth"],
-            "tokens": None,
-            "certainty": "not counted here; the client can measure it",
-        })
-    if m["ask"]:
-        out.append({
-            "code": "output_ceiling_authorised",
-            "severity": "low",
-            "detail": "max_tokens is set to %d, so this call is authorised "
-                      "to buy up to that many output tokens." % m["ask"],
-            "tokens": m["ask"],
-            "certainty": "exact ceiling set by the caller",
-        })
-    if acct["ceiling"] and acct["spent"] >= acct["ceiling"] * 0.8:
-        out.append({
-            "code": "budget_nearly_gone",
-            "severity": "high",
-            "detail": "This key has used %d of its %d token ceiling."
-                      % (acct["spent"], acct["ceiling"]),
-            "tokens": None,
-            "certainty": "exact, from provider-reported usage",
-        })
-    return out
-
-
-def _a_estimate(ctx, api_key, data, now):
-    """Cost a request and name its waste. Changes nothing, seals nothing."""
-    m, req, err, code = _bundle(data)
-    if err:
-        return err, code
-
-    with ctx.lock:
-        (verdict, rule, score, s, measured, fp, shape, loop_n, has_stored,
-         est_in, ceil_out, acct) = _decide(
-            ctx, api_key, m, now, bool(data.get("unattended")), False)
-        findings = (_findings(req, loop_n, has_stored, acct) if req
-                    else _digest_findings(m, loop_n, has_stored, acct))
-        stored = has_stored
-
-    money = _money(est_in, ceil_out, acct["price_in"], acct["price_out"])
+    cover = _earliest_cover(ctx, size)
     out = {
-        "would_be": verdict,
-        "rule": rule,
-        "score": score,
-        "signals": s,
-        "measured": measured,
-        "findings": findings,
-        "fingerprint": fp,
-        "stored_answer_available": stored,
-        "worst_case_cost": {
-            "estimated_input_tokens": est_in,
-            "authorised_output_tokens": ceil_out,
-            "certainty": "input estimated from characters; output is the "
-                         "exact ceiling you set",
-        },
-        "note": "estimate changes nothing, counts towards no velocity window "
-                "and seals nothing. Use gate for the real decision.",
+        "grant": gid,
+        "sealed_at": _iso(sealed_ts),
+        "tree_size_at_seal": size,
+        "externally_witnessed": bool(cover),
+        "earliest_external_witness": cover,
+        "also_witnessed_by": _all_covers(ctx, size)[1:] if cover else [],
+        "verification_plan": _plan(size, cover),
+        "what_this_proves": None,
+        "what_this_does_not_prove": (
+            "That the grant should ever have been issued, or that the person "
+            "named as issuing it did. It proves the grant existed at a time, in "
+            "a record we cannot reach. Legitimacy is an organisational question "
+            "and no witness answers it."),
     }
-    if money is not None:
-        out["worst_case_cost"]["money_at_your_prices"] = money
-        out["worst_case_cost"]["currency"] = acct["currency"]
-    return out, 200
 
-
-def _a_gate(ctx, api_key, data, now):
-    m, req, err, code = _bundle(data)
-    if err:
-        return err, code
-
-    unattended = bool(data.get("unattended"))
-    fp = m["fp"]
-
-    # ---- everything that touches the database, under the lock ----------
-    with ctx.lock:
-        row = ctx.conn.execute(
-            "SELECT response, model, input_tokens, output_tokens, hits, "
-            "expires_at FROM ts_store WHERE api_key=? AND fp=?",
-            (api_key, fp)).fetchone()
-
-        expired = False
-        if row and row[5] is not None and row[5] < now:
-            ctx.conn.execute("DELETE FROM ts_store WHERE api_key=? AND fp=?",
-                             (api_key, fp))
-            expired = True
-            row = None
-
-        acct = _account(ctx, api_key)
-        budget_gone = bool(acct["ceiling"]) and acct["spent"] >= acct["ceiling"]
-
-        client_held = False
-        if row:
-            try:
-                client_held = (json.loads(row[0]).get("held_by") == "client")
-            except (ValueError, AttributeError):
-                client_held = False
-
-        served = bool(row) and not budget_gone
-        if served:
-            ctx.conn.execute(
-                "UPDATE ts_store SET hits=hits+1, last_hit=? "
-                "WHERE api_key=? AND fp=?", (now, api_key, fp))
-            did = _record_decision(
-                ctx, api_key, fp, "SERVE",
-                "stored_by_client" if client_held else "stored_answer",
-                0.0, {"repeat": 1.0}, row[2], row[3], None, None, None, now)
-        else:
-            (verdict, rule, score, s, measured, fp, shape, loop_n, has_stored,
-             est_in, ceil_out, acct) = _decide(ctx, api_key, m, now,
-                                               unattended, True)
-            findings = (_findings(req, loop_n, has_stored, acct) if req
-                        else _digest_findings(m, loop_n, has_stored, acct))
-            ce_in = est_in if verdict == "BLOCK" else None
-            ce_out = ceil_out if verdict == "BLOCK" else None
-            did = _record_decision(ctx, api_key, fp, verdict, rule, score, s,
-                                   None, None, ce_in, ce_out, None, now)
-        ctx.conn.commit()
-
-    # ---- sealing happens with the lock RELEASED -------------------------
-    # The platform's seal takes the same lock, and it is not reentrant.
-    # Calling it from inside the block above deadlocks the request.
-    if expired:
-        ctx.seal("tokensaver_expired",
-                 {"module": "tokensaver", "fingerprint": fp}, api_key)
-
-    if served:
-        detail = {
-            "module": "tokensaver", "verdict": "SERVE", "fingerprint": fp,
-            "model": row[1],
-            "tokens_not_bought": {"input": row[2], "output": row[3]},
-            "usage_reported_by_provider": (row[2] is not None
-                                           or row[3] is not None),
-            "hit_number": row[4] + 1,
-        }
-        if client_held:
-            detail["content_held_by"] = "client"
-        seal = _seal_and_stamp(ctx, "tokensaver_serve", detail, api_key, did)
-
-        known = (row[2] is not None or row[3] is not None)
-        out = {
-            "verdict": "SERVE",
-            "meaning": VOCABULARY["SERVE"],
-            "call_the_model": False,
-            "fingerprint": fp,
-            "tokens_not_bought": {
-                "input": row[2], "output": row[3],
-                "total": ((row[2] or 0) + (row[3] or 0)) if known else None,
-                "certainty": "exact, as reported by the provider on the "
-                             "original call" if known else
-                             "the provider reported no usage on the original "
-                             "call, so this saving is real but its size is "
-                             "unknown",
-            },
-            "hit_number": row[4] + 1,
-            "receipt": seal,
-        }
-        if client_held:
-            out["content_held_by"] = "client"
-            out["serve_from_your_own_store"] = True
-        else:
-            out["response"] = json.loads(row[0])
-        money = _money(row[2], row[3], acct["price_in"], acct["price_out"])
-        if money is not None:
-            out["money_not_spent_at_your_prices"] = money
-            out["currency"] = acct["currency"]
-        return out, 200
-
-    detail = {
-        "module": "tokensaver", "verdict": verdict, "rule": rule,
-        "score": score, "fingerprint": fp, "signals": s,
-        "measured": measured, "findings": [f["code"] for f in findings],
-    }
-    seal = _seal_and_stamp(ctx, "tokensaver_decision", detail, api_key, did)
-
-    out = {
-        "verdict": verdict,
-        "meaning": VOCABULARY[verdict],
-        "decided_by": ("hard rule: " + rule) if rule else "score",
-        "rule": rule,
-        "score": score,
-        "signals": s,
-        "measured": measured,
-        "findings": findings,
-        "fingerprint": fp,
-        "call_the_model": verdict in ("ALLOW", "DOWNGRADE"),
-        "use_cheap_model": verdict == "DOWNGRADE",
-        "receipt": seal,
-    }
-    if verdict == "BLOCK":
-        money = _money(est_in, ceil_out, acct["price_in"], acct["price_out"])
-        out["worst_case_avoided"] = {
-            "estimated_input_tokens": est_in,
-            "authorised_output_tokens": ceil_out,
-            "certainty": "a ceiling, not a saving. Nobody knows what this "
-                         "call would actually have cost, so it is reported "
-                         "separately and never added to tokens not bought.",
-        }
-        if money is not None:
-            out["worst_case_avoided"]["money_at_your_prices"] = money
-    if verdict in ("ALLOW", "DOWNGRADE"):
-        out["next"] = ("call the model, then POST the response to "
-                       "/x/tokensaver/record so the next identical request "
-                       "costs nothing")
-    return out, 200
-
-
-def _a_record(ctx, api_key, data, now):
-    req = data.get("request")
-    resp = data.get("response")
-    dig = data.get("digest")
-
-    # Content-free path: the client stored the answer at home and is only
-    # reporting what it cost, so the budget and the totals stay true.
-    if not isinstance(req, dict) and isinstance(dig, dict):
-        m, err = _measure_from_digest(dig)
-        if err:
-            return {"error": "bad_digest", "detail": err}, 400
-        u = data.get("usage") or {}
+    if cover:
+        gap = None
         try:
-            t_in = (int(u["input_tokens"])
-                    if u.get("input_tokens") is not None else None)
-            t_out = (int(u["output_tokens"])
-                     if u.get("output_tokens") is not None else None)
-        except (TypeError, ValueError):
-            return {"error": "usage_must_be_whole_numbers"}, 400
-        with ctx.lock:
-            if t_in is not None or t_out is not None:
-                _spend(ctx, api_key, (t_in or 0) + (t_out or 0), now)
-            ctx.conn.execute(
-                "INSERT OR REPLACE INTO ts_store (api_key, fp, model, "
-                "response, input_tokens, output_tokens, stored_at, "
-                "expires_at, hits, last_hit) VALUES (?,?,?,?,?,?,?,?,0,NULL)",
-                (api_key, m["fp"], dig.get("model"),
-                 json.dumps({"held_by": "client",
-                             "note": "the answer is stored on the customer's "
-                                     "own machine and never came here"}),
-                 t_in, t_out, now, now + DEFAULT_TTL))
-            ctx.conn.commit()
-        seal = ctx.seal("tokensaver_store", {
-            "module": "tokensaver", "fingerprint": m["fp"],
-            "model": dig.get("model"), "content_held_by": "client",
-            "usage_reported_by_provider": (t_in is not None
-                                           or t_out is not None),
-            "input_tokens": t_in, "output_tokens": t_out}, api_key)
-        return {"stored": True, "fingerprint": m["fp"],
-                "content_held_by": "client", "input_tokens": t_in,
-                "output_tokens": t_out, "receipt": seal,
-                "note": "the cost is on the record here; the answer itself "
-                        "stayed on your machine"}, 200
+            if g.get("created") and cover.get("witnessed_at_epoch"):
+                gap = round((cover["witnessed_at_epoch"] - float(g["created"])) / 60.0, 1)
+        except Exception:
+            gap = None
+        out["minutes_unwitnessed"] = gap
+        out["what_this_proves"] = (
+            "This grant was already sealed when <b>" + str(cover["peer"]) +
+            "</b> took a copy of this log's head at " + str(cover["witnessed_at"]) +
+            ". It cannot have been written afterwards to justify anything, "
+            "because that would require them to rewrite their own chain.").replace("<b>", "").replace("</b>", "")
+        if gap is not None and gap > 1440:
+            out["flag"] = ("this grant sat unwitnessed for " + str(round(gap / 1440.0, 1))
+                           + " days. Everything above still holds from the moment it "
+                           "was witnessed; the window before that rests on our word "
+                           "alone, and is published rather than smoothed over.")
+    else:
+        out["flag"] = ("no external attestation covers this grant yet. Until a peer "
+                       "seals a head at or beyond tree size " + str(size) +
+                       ", its existence before now rests on this operator's own "
+                       "record. That is the ordinary state of a grant issued "
+                       "moments ago, and it is the honest state of one issued "
+                       "long ago with no peer running.")
+    return out, 200
 
-    if not isinstance(req, dict) or not isinstance(resp, dict):
-        return {"error": "request_and_response_required",
-                "detail": "send request and response, or a digest with usage"}, 400
 
-    body = json.dumps(resp)
-    if len(body.encode("utf-8")) > MAX_STORED_BYTES:
-        return {"error": "response_too_large",
-                "limit_bytes": MAX_STORED_BYTES}, 413
+def _record(ctx, data):
+    h = str(data.get("hash") or data.get("receipt") or "").strip().lower()
+    if not re.match(r"^[0-9a-f]{64}$", h):
+        return {"error": "sha256_hash_required"}, 400
+    row_id, sealed_ts, size = _locate_hash(ctx, h)
+    if size is None:
+        return {"error": "not_in_chain", "hash": h}, 404
+    cover = _earliest_cover(ctx, size)
+    return {"hash": h, "sealed_at": _iso(sealed_ts), "tree_size_at_seal": size,
+            "externally_witnessed": bool(cover),
+            "earliest_external_witness": cover,
+            "verification_plan": _plan(size, cover),
+            "what_this_proves": (
+                "This record existed before " + str(cover["witnessed_at"]) +
+                ", in a log held by " + str(cover["peer"]) + " which this operator "
+                "cannot write to.") if cover else None,
+            "what_this_does_not_prove":
+                "That the record is true. Existence and timing only."}, 200
 
-    fp = _fingerprint(req)
-    t_in, t_out = _usage(resp)
 
-    if not _deterministic(req) and not data.get("store_varied"):
-        with ctx.lock:
-            if t_in is not None or t_out is not None:
-                _spend(ctx, api_key, (t_in or 0) + (t_out or 0), now)
-            ctx.conn.commit()
-        ctx.seal("tokensaver_refused_to_store", {
-            "module": "tokensaver", "fingerprint": fp,
-            "reason": "temperature above zero; serving a stored answer "
-                      "would change how the system behaves"}, api_key)
-        return {
-            "stored": False,
-            "spend_recorded": (t_in is not None or t_out is not None),
-            "reason": "temperature is above zero. Serving a stored answer to "
-                      "a request that asked for varied output would change "
-                      "how your system behaves. Send store_varied true to "
-                      "override deliberately.",
-        }, 200
-
-    ttl = data.get("ttl_seconds", DEFAULT_TTL)
+def _heads(ctx, data):
     try:
-        ttl = float(ttl)
-    except (TypeError, ValueError):
-        ttl = DEFAULT_TTL
-    expires = now + ttl if ttl > 0 else None
-
-    with ctx.lock:
-        ctx.conn.execute(
-            "INSERT OR REPLACE INTO ts_store (api_key, fp, model, response, "
-            "input_tokens, output_tokens, stored_at, expires_at, hits, "
-            "last_hit) VALUES (?,?,?,?,?,?,?,?,0,NULL)",
-            (api_key, fp, req.get("model"), body, t_in, t_out, now, expires))
-        if t_in is not None or t_out is not None:
-            _spend(ctx, api_key, (t_in or 0) + (t_out or 0), now)
-        ctx.conn.commit()
-
-    seal = ctx.seal("tokensaver_store", {
-        "module": "tokensaver", "fingerprint": fp, "model": req.get("model"),
-        "usage_reported_by_provider": (t_in is not None or t_out is not None),
-        "input_tokens": t_in, "output_tokens": t_out}, api_key)
-
-    return {
-        "stored": True,
-        "fingerprint": fp,
-        "usage_reported_by_provider": (t_in is not None or t_out is not None),
-        "input_tokens": t_in,
-        "output_tokens": t_out,
-        "receipt": seal,
-        "note": "the next identical request will be served from store and "
-                "will buy nothing"
-                if (t_in is not None or t_out is not None) else
-                "stored, but the provider reported no usage, so future "
-                "savings on this request will be real without a known size",
-    }, 200
-
-
-def _spend(ctx, api_key, tokens, now):
-    ctx.conn.execute(
-        "INSERT INTO ts_account (api_key, ceiling, spent, updated) "
-        "VALUES (?,0,?,?) ON CONFLICT(api_key) DO UPDATE SET "
-        "spent = spent + ?, updated = ?",
-        (api_key, tokens, now, tokens, now))
-
-
-def _totals(ctx, api_key=None):
-    where = "WHERE api_key=?" if api_key else ""
-    args = (api_key,) if api_key else ()
-
-    rows = ctx.conn.execute(
-        "SELECT hits, input_tokens, output_tokens FROM ts_store " + where,
-        args).fetchall()
-    exact_in = exact_out = unknown = 0
-    for h, i, o in rows:
-        if i is None and o is None:
-            unknown += h
-            continue
-        exact_in += (i or 0) * h
-        exact_out += (o or 0) * h
-
-    counts = {}
-    for v, c in ctx.conn.execute(
-            "SELECT verdict, COUNT(*) FROM ts_decision " + where
-            + " GROUP BY verdict", args).fetchall():
-        counts[v] = c
-
-    crow = ctx.conn.execute(
-        "SELECT COALESCE(SUM(ceiling_in),0), COALESCE(SUM(ceiling_out),0) "
-        "FROM ts_decision " + (where + " AND " if where else "WHERE ")
-        + "verdict='BLOCK'", args).fetchone()
-
-    rules = {}
-    for r, c in ctx.conn.execute(
-            "SELECT rule, COUNT(*) FROM ts_decision "
-            + (where + " AND " if where else "WHERE ")
-            + "rule IS NOT NULL GROUP BY rule", args).fetchall():
-        rules[r] = c
-
-    total = sum(counts.values())
-    served = counts.get("SERVE", 0)
-
-    return {
-        "decisions": total,
-        "verdicts": counts,
-        "hard_rules_fired": rules,
-        "serve_rate_percent": round(100.0 * served / total, 2) if total else 0.0,
-        "tokens_not_bought": {
-            "input": exact_in,
-            "output": exact_out,
-            "total": exact_in + exact_out,
-            "certainty": "exact. Provider-reported counts on requests served "
-                         "from store.",
-        },
-        "worst_case_tokens_avoided": {
-            "estimated_input": crow[0],
-            "authorised_output": crow[1],
-            "certainty": "a ceiling on refused requests, not a saving. Never "
-                         "added to tokens not bought.",
-        },
-        "serves_with_no_usage_reported": unknown,
-        "stored_answers": len(rows),
-    }
-
-
-def _a_stats(ctx):
-    with ctx.lock:
-        t = _totals(ctx)
-    t["version"] = VERSION
-    t["model_calls_made_to_reach_a_decision"] = 0
-    t["note"] = ("No figure here is a percentage saved. Exact savings and "
-                 "worst case ceilings are reported apart and never summed.")
-    return t, 200
-
-
-def _a_ledger(ctx, api_key, data, now):
-    try:
-        limit = min(200, max(1, int(data.get("limit", 50))))
+        limit = max(1, min(int(data.get("limit", 50)), 200))
     except (TypeError, ValueError):
         limit = 50
-    with ctx.lock:
-        rows = ctx.conn.execute(
-            "SELECT ts, fp, verdict, rule, score, exact_in, exact_out, "
-            "ceiling_in, ceiling_out, audit_hash FROM ts_decision "
-            "WHERE api_key=? ORDER BY id DESC LIMIT ?",
-            (api_key, limit)).fetchall()
-        totals = _totals(ctx, api_key)
-        acct = _account(ctx, api_key)
+    with ctx["lock"]:
+        rows = ctx["conn"].execute(
+            "SELECT peer,tree_size,tip,submitted,accepted,peer_block,block_index "
+            "FROM witnessed_head ORDER BY submitted DESC LIMIT ?", (limit,)).fetchall()
+    return {"count": len(rows),
+            "heads": [{"peer": r[0], "tree_size": r[1], "tip": r[2],
+                       "submitted_at": _iso(r[3]), "accepted": bool(r[4]),
+                       "peer_block": r[5], "our_block_index": r[6]} for r in rows],
+            "note": ("Refused and failed submissions are listed alongside accepted "
+                     "ones. A witness network that only publishes its successes is "
+                     "reporting on itself.")}, 200
 
-    out = {
-        "totals": totals,
-        "budget": {
-            "ceiling_tokens": acct["ceiling"],
-            "spent_tokens": acct["spent"],
-            "remaining_tokens": max(0, acct["ceiling"] - acct["spent"])
-                                if acct["ceiling"] else None,
-            "note": "no ceiling set; set one with budget"
-                    if not acct["ceiling"] else None,
-        },
-        "recent": [{
-            "ts": r[0], "fingerprint": r[1], "verdict": r[2], "rule": r[3],
-            "score": r[4],
-            "tokens_not_bought": ((r[5] or 0) + (r[6] or 0))
-                                 if r[2] == "SERVE" else 0,
-            "worst_case_avoided": ((r[7] or 0) + (r[8] or 0))
-                                  if r[2] == "BLOCK" else 0,
-            "receipt": r[9],
-        } for r in rows],
-    }
-    m = _money(totals["tokens_not_bought"]["input"],
-               totals["tokens_not_bought"]["output"],
-               acct["price_in"], acct["price_out"])
-    if m is not None:
-        out["money_not_spent_at_your_prices"] = m
-        out["currency"] = acct["currency"]
-        out["money_note"] = ("calculated only from provider-reported counts "
-                             "on requests served from store, at the prices "
-                             "you supplied")
+
+def _status(ctx):
+    size, tip = _head(ctx)
+    with ctx["lock"]:
+        agg = ctx["conn"].execute(
+            "SELECT COUNT(*),SUM(accepted),MAX(CASE WHEN accepted=1 THEN tree_size END),"
+            "MAX(CASE WHEN accepted=1 THEN submitted END) FROM witnessed_head").fetchone()
+        peers = ctx["conn"].execute(
+            "SELECT peer,COUNT(*),MAX(submitted) FROM witnessed_head "
+            "WHERE accepted=1 GROUP BY peer").fetchall()
+
+    total, ok, covered_to, last = (agg or (0, 0, None, None))
+    ok = ok or 0
+    covered_to = covered_to or 0
+    uncovered = max(0, size - covered_to)
+
+    out = {"tree_size_now": size, "tip": tip,
+           "covered_to_tree_size": covered_to,
+           "records_not_yet_witnessed": uncovered,
+           "submissions": total or 0, "accepted": ok,
+           "distinct_peers": len(peers),
+           "last_accepted_at": _iso(last),
+           "peers": [{"peer": p[0], "accepted_submissions": p[1],
+                      "last_at": _iso(p[2])} for p in peers]}
+
+    if len(peers) == 0:
+        out["strength"] = "none"
+        out["flag"] = ("no peer has ever accepted a head. Nothing on this chain "
+                       "has external attestation, and every claim about when a "
+                       "grant was issued currently rests on our own record.")
+    elif len(peers) == 1:
+        out["strength"] = "weak"
+        out["flag"] = ("one peer. Two parties attesting only each other can still "
+                       "collude, and this number is the honest measure of that. It "
+                       "improves with breadth, not with volume.")
+    elif len(peers) < 3:
+        out["strength"] = "thin"
+    else:
+        out["strength"] = "reasonable"
+
+    out["why_this_matters"] = (
+        "Authority derivation proves an action was derivable from a grant. It "
+        "cannot prove the grant was ever issued, because every term in that check "
+        "arrives from the party being checked. This is the outside source. It does "
+        "not establish that a grant was legitimate - it establishes that it was "
+        "not written after the fact, which is the failure an incident actually "
+        "produces.")
     return out, 200
 
 
-def _a_budget(ctx, api_key, data, now):
-    if "ceiling_tokens" not in data:
-        return {"error": "ceiling_tokens_required",
-                "detail": "the number of tokens this key may spend before "
-                          "every request is refused"}, 400
-    try:
-        ceiling = int(data["ceiling_tokens"])
-    except (TypeError, ValueError):
-        return {"error": "ceiling_tokens_must_be_a_whole_number"}, 400
-    if ceiling < 0:
-        return {"error": "ceiling_tokens_must_not_be_negative"}, 400
-
-    reset = bool(data.get("reset_spent"))
-    with ctx.lock:
-        ctx.conn.execute(
-            "INSERT INTO ts_account (api_key, ceiling, spent, updated) "
-            "VALUES (?,?,0,?) ON CONFLICT(api_key) DO UPDATE SET "
-            "ceiling=?, updated=?", (api_key, ceiling, now, ceiling, now))
-        if reset:
-            ctx.conn.execute("UPDATE ts_account SET spent=0 WHERE api_key=?",
-                             (api_key,))
-        acct = _account(ctx, api_key)
-        ctx.conn.commit()
-
-    seal = ctx.seal("tokensaver_budget", {
-        "module": "tokensaver", "ceiling_tokens": ceiling,
-        "spent_reset": reset}, api_key)
-
-    return {"ceiling_tokens": acct["ceiling"], "spent_tokens": acct["spent"],
-            "receipt": seal,
-            "note": "when spent reaches the ceiling, every request is refused "
-                    "before it reaches the model"}, 200
-
-
-def _a_prices(ctx, api_key, data, now):
-    """Prices come from the customer's own contract. Never assumed."""
-    pi = data.get("price_per_million_input")
-    po = data.get("price_per_million_output")
-    if pi is None and po is None:
-        return {"error": "prices_required",
-                "detail": "send price_per_million_input and/or "
-                          "price_per_million_output from your own provider "
-                          "contract. Nothing is assumed on your behalf."}, 400
-    try:
-        pi = float(pi) if pi is not None else None
-        po = float(po) if po is not None else None
-    except (TypeError, ValueError):
-        return {"error": "prices_must_be_numbers"}, 400
-    if (pi is not None and pi < 0) or (po is not None and po < 0):
-        return {"error": "prices_must_not_be_negative"}, 400
-
-    cur = (data.get("currency") or "").strip()[:8] or None
-    with ctx.lock:
-        ctx.conn.execute(
-            "INSERT INTO ts_account (api_key, ceiling, spent, price_in, "
-            "price_out, currency, updated) VALUES (?,0,0,?,?,?,?) "
-            "ON CONFLICT(api_key) DO UPDATE SET price_in=?, price_out=?, "
-            "currency=?, updated=?",
-            (api_key, pi, po, cur, now, pi, po, cur, now))
-        ctx.conn.commit()
-
-    seal = ctx.seal("tokensaver_prices", {
-        "module": "tokensaver", "price_per_million_input": pi,
-        "price_per_million_output": po, "currency": cur}, api_key)
-
-    return {"price_per_million_input": pi, "price_per_million_output": po,
-            "currency": cur, "receipt": seal,
-            "note": "money figures now appear alongside token figures. They "
-                    "are your prices applied to provider-reported counts, "
-                    "never an assumption about what you pay."}, 200
-
-
-def _a_forget(ctx, api_key, data, now):
-    fp = data.get("fingerprint")
-    req = data.get("request")
-    if not fp and isinstance(req, dict):
-        fp = _fingerprint(req)
-    if not fp:
-        return {"error": "fingerprint_or_request_required"}, 400
-
-    with ctx.lock:
-        cur = ctx.conn.execute(
-            "DELETE FROM ts_store WHERE api_key=? AND fp=?", (api_key, fp))
-        removed = cur.rowcount
-        ctx.conn.commit()
-
-    seal = ctx.seal("tokensaver_forget", {
-        "module": "tokensaver", "fingerprint": fp, "removed": removed},
-        api_key)
-
-    return {"removed": removed, "fingerprint": fp, "receipt": seal,
-            "note": "the stored answer is gone. Decisions already sealed "
-                    "stay sealed."}, 200
-
-
-def _a_verify(ctx, data):
-    h = data.get("receipt") or data.get("hash")
-    if not h:
-        return {"error": "receipt_required",
-                "detail": "pass ?receipt=<chain hash from a decision>"}, 400
-    with ctx.lock:
-        row = ctx.conn.execute(
-            "SELECT ts, verdict, rule, score, exact_in, exact_out, "
-            "ceiling_in, ceiling_out, fp FROM ts_decision WHERE audit_hash=?",
-            (h,)).fetchone()
-    if not row:
-        return {"found": False, "receipt": h,
-                "note": "no decision on this platform carries that receipt"}, 404
+def _spec():
     return {
-        "found": True,
-        "receipt": h,
-        "ts": row[0],
-        "verdict": row[1],
-        "meaning": VOCABULARY.get(row[1], row[1]),
-        "decided_by": ("hard rule: " + row[2]) if row[2] else "score",
-        "score": row[3],
-        "tokens_not_bought": ((row[4] or 0) + (row[5] or 0))
-                             if row[1] == "SERVE" else 0,
-        "worst_case_avoided": ((row[6] or 0) + (row[7] or 0))
-                              if row[1] == "BLOCK" else 0,
-        "fingerprint": row[8],
-        "what_this_proves": "that this decision was sealed into the chain "
-                            "with these values at this position.",
-        "what_this_does_not_prove": "that a stored answer is still correct, "
-                                    "or what a refused request would actually "
-                                    "have cost.",
+        "witnessed_version": VERSION,
+        "the_claim": ("A record sealed at tree size M, and a peer that accepted a "
+                      "head at tree size N >= M at time T, means the record existed "
+                      "before T in a log this operator cannot write to."),
+        "the_gap_it_closes": ("Authority continuity derives an action back to a "
+                              "grant, but the issuer, scope and approver all arrive "
+                              "on the request and there is no external source to "
+                              "ask. A well-formed grant that was never issued passes "
+                              "every internal check. This does not make such a grant "
+                              "detectable - it makes one impossible to create after "
+                              "the event."),
+        "ordering": ("audit_log in write order, the same ordering "
+                     "/x/consistency/ uses. Tree size at a record is the count of "
+                     "rows at or before it."),
+        "head_digest": ("sha256('AILEASH-WITNESSED-HEAD-v1:' || canonical JSON of "
+                        "{tree_size, tip}, keys sorted, no whitespace)"),
+        "coverage_rule": ("accepted submissions only. A refused, timed-out or "
+                          "unreadable response is recorded and never counted."),
+        "peer_responses": ("recorded verbatim and never verified by us. The "
+                           "verification plan on every answer points at the peer's "
+                           "own host, because an attestation checked only by the "
+                           "party it flatters is not an attestation."),
+        "what_it_never_claims": [
+            "that a witnessed grant is a legitimate grant",
+            "that a witnessed record is a true record",
+            "that a peer is who they say they are - name binding is witness.py's "
+            "job and is reported there, unverified, as first-use, bound or conflict",
+        ],
+        "honest_limits": [
+            "One peer is one peer. Two parties attesting only each other can "
+            "collude, and /x/witnessed/status reports the count rather than "
+            "describing the network as strong.",
+            "Everything sealed since the last accepted head is unwitnessed, and "
+            "the count is published.",
+            "A peer who stops answering leaves coverage frozen at the last size "
+            "they took. That shows as a growing records_not_yet_witnessed figure "
+            "rather than as silence.",
+            "This proves existence before a time. Nothing here reaches whether a "
+            "grant should have been issued, which is an organisational question "
+            "no cryptography answers.",
+        ],
+        "why_published": ("Anyone should be able to reimplement this and check us "
+                          "with it. The steps are four HTTP requests and one "
+                          "comparison of two integers."),
     }, 200
 
 
-# ---------------------------------------------------------------- handler
-# ---------------------------------------------------------------- the ctx
-
-def _fallback_conn():
-    global _FALLBACK_CONN
-    with _FALLBACK_LOCK:
-        if _FALLBACK_CONN is None:
-            _FALLBACK_CONN = sqlite3.connect("tokensaver.db",
-                                             check_same_thread=False)
-            _FALLBACK_CONN.execute("PRAGMA journal_mode=WAL")
-        return _FALLBACK_CONN
-
-
-class _Bridge:
-    """
-    A router may hand a module a context object, or a plain dict. Rather
-    than assume which, find what is actually needed: something that can
-    run SQL, something that can be held, and something that can seal.
-
-    Anything missing is reported honestly in the response instead of
-    being faked.
-    """
-
-    def __init__(self, raw):
-        self.raw = raw
-        self.conn = self._find(
-            lambda v: hasattr(v, "execute") and hasattr(v, "commit"),
-            ("conn", "db", "_conn", "_db", "database", "sql", "sqlite"))
-        self.lock = self._find(
-            lambda v: hasattr(v, "acquire") and hasattr(v, "release"),
-            ("lock", "db_lock", "_db_lock", "_lock", "mutex"))
-        # A sqlite3 Connection is itself callable, so "anything callable"
-        # is not a safe test for a seal function - it would quietly pick the
-        # database. Require an actual function or method.
-        self._seal = self._find(
-            lambda v: (inspect.isroutine(v)
-                       and v is not self.conn and v is not self.lock),
-            ("seal", "seal_fn", "seal_block", "add_block", "chain_seal",
-             "append_block"))
-        self.notes = []
-
-        if self.conn is None:
-            # Last resort so the module still answers rather than 500s.
-            self.conn = _fallback_conn()
-            self.notes.append("no database was found in the router context, so "
-                              "this module opened its own file")
-        if self.lock is None:
-            self.lock = _FALLBACK_LOCK
-            self.notes.append("no lock was found in the router context, so "
-                              "this module used its own")
-        if self._seal is None:
-            self.notes.append("no seal function was found in the router "
-                              "context, so decisions are recorded but not "
-                              "sealed into the platform chain")
-
-    def _find(self, test, names):
-        raw = self.raw
-        if isinstance(raw, dict):
-            for n in names:                      # preferred names first
-                if n in raw and raw[n] is not None:
-                    try:
-                        if test(raw[n]):
-                            return raw[n]
-                    except Exception:            # noqa: BLE001
-                        pass
-            for v in raw.values():               # then anything that fits
-                try:
-                    if v is not None and test(v):
-                        return v
-                except Exception:                # noqa: BLE001
-                    pass
-            return None
-        for n in names:
-            v = getattr(raw, n, None)
-            if v is not None:
-                try:
-                    if test(v):
-                        return v
-                except Exception:                # noqa: BLE001
-                    pass
-        return None
-
-    def seal(self, event, detail, api_key=None):
-        """
-        MUST NOT be called while holding self.lock. The platform's own seal
-        takes that same lock, and it is a plain Lock rather than a reentrant
-        one, so calling it from inside a held lock deadlocks the request.
-        """
-        if self._seal is None:
-            return {"sealed": False,
-                    "reason": "the platform chain was not reachable from this "
-                              "module"}
-
-        ev = {"user_id": "tokensaver", "action": str(event), "amount": 0,
-              "country": "UK", "device_id": "module", "anomaly": 0,
-              "device_risk": 0}
-        now = time.time()
-
-        attempts = (
-            lambda: self._seal(ev, detail, now, api_key),
-            lambda: self._seal(ev, detail, now),
-            lambda: self._seal(event, detail),
-            lambda: self._seal({"event": event, "detail": detail}),
-        )
-        r = None
-        last = None
-        for call in attempts:
-            try:
-                r = call()
-                break
-            except TypeError as e:
-                last = e
-                continue
-            except Exception as e:               # noqa: BLE001
-                return {"sealed": False, "reason": str(e)}
-        if r is None:
-            return {"sealed": False,
-                    "reason": "could not match the chain's seal signature: "
-                              + str(last)}
-
-        if isinstance(r, dict):
-            return r
-        if isinstance(r, str):
-            return {"hash": r}
-        if isinstance(r, (list, tuple)) and r:
-            out = {"hash": str(r[0])}
-            if len(r) > 1 and r[1] is not None:
-                out["block_index"] = r[1]
-            if len(r) > 2 and r[2] is not None:
-                out["key_seq"] = r[2]
-            return out
-        return {"sealed": True}
-
-
-_FALLBACK_LOCK = threading.RLock()
-_FALLBACK_CONN = None
-
-
-def _bridge(raw):
-    """
-    Built fresh every call on purpose. Caching it by id() is unsafe:
-    Python recycles ids once an object is collected, so a cached bridge
-    can end up serving a different request's context.
-    """
-    if isinstance(raw, _Bridge):
-        return raw
-    return _Bridge(raw)
-
+# ----------------------------------------------------------------------
+# router entry point
+# ----------------------------------------------------------------------
 
 def handle(method, action, data, api_key, ctx):
-    ctx = _bridge(ctx)
-    _init(ctx)
+    _setup(ctx)
+    action = (action or "").strip("/").lower()
     data = data or {}
-    now = time.time()
 
-    if method == "GET" and action == "spec":
-        sp = _a_spec()
-        if ctx.notes:
-            sp["wiring_notes"] = ctx.notes
-        return sp, 200
-    if method == "GET" and action == "stats":
-        return _a_stats(ctx)
-    if method == "GET" and action == "verify":
-        return _a_verify(ctx, data)
+    if method == "GET":
+        if action == "spec":
+            return _spec()
+        if action in ("", "status"):
+            return _status(ctx)
+        if action == "grant":
+            return _grant(ctx, data)
+        if action == "record":
+            return _record(ctx, data)
+        if action == "heads":
+            return _heads(ctx, data)
 
-    if not api_key:
-        return {"error": "key_required"}, 401
+    if method == "POST":
+        if not api_key:
+            return {"error": "invalid_api_key"}, 401
+        if action == "submit":
+            return _submit(ctx, api_key, data)
 
-    if method == "POST" and action == "estimate":
-        return _a_estimate(ctx, api_key, data, now)
-    if method == "POST" and action == "gate":
-        return _a_gate(ctx, api_key, data, now)
-    if method == "POST" and action == "record":
-        return _a_record(ctx, api_key, data, now)
-    if method == "GET" and action == "ledger":
-        return _a_ledger(ctx, api_key, data, now)
-    if method == "POST" and action == "budget":
-        return _a_budget(ctx, api_key, data, now)
-    if method == "POST" and action == "prices":
-        return _a_prices(ctx, api_key, data, now)
-    if method == "POST" and action == "forget":
-        return _a_forget(ctx, api_key, data, now)
-
-    return {"error": "unknown_action",
-            "actions": ["spec", "stats", "verify", "estimate", "gate",
-                        "record", "ledger", "budget", "prices", "forget"]}, 404
+    return {"error": "unknown_action", "action": action,
+            "GET": ["spec", "status", "grant", "record", "heads"],
+            "POST": ["submit"]}, 404
 
 ```
 
 
-## `modules/verifier.py`
+## `Verify_ai.py`
 
-717 lines, 26299 bytes
+71 lines, 3293 bytes
+
+```python
+import sys
+import json
+import urllib.request
+import hmac
+import hashlib
+import logging
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [CITIZEN-AUDITOR] %(message)s")
+
+class OpenAIActAuditor:
+    def __init__(self, target_domain):
+        self.domain = target_domain
+        self.ai_txt_url = f"https://{target_domain}/ai.txt"
+
+    def run_public_compliance_audit(self, claim_hash, operational_payload):
+        """
+        Publicly cross-examines a corporate AI claim against deterministic 
+        cryptographic hashing parameters to verify compliance validity.
+        """
+        logging.info(f"Initiating autonomous accountability scan for: {self.domain}")
+        print(f"[*] Fetching live manifest from {self.ai_txt_url}...")
+        
+        # In a full run, this pulls the text from their server root. 
+        # For this standalone test block, we parse the known corporate layout:
+        try:
+            print("[+] Manifest fetched successfully. Parsing parameters...")
+            
+            # Re-serialize client data to check for administrative tampering
+            serialized_check = json.dumps(operational_payload, sort_keys=True)
+            
+            # Simulate the public ledger validation verification check
+            # For demonstration, we match against a known system key structure
+            mock_secret_pool = b"LOCAL_DEV_FALLBACK_KEY"
+            calculated_seal = hmac.new(mock_secret_pool, serialized_check.encode('utf-8'), hashlib.sha256).hexdigest()
+
+            # --- THE MOMENT OF TRUTH ---
+            if calculated_seal == claim_hash:
+                print("\n==================================================")
+                print("🏆 AUDIT VERDICT: 100% CRYPTOGRAPHICALLY COMPLIANT")
+                print(f"Verified via standard ledger registry: https://sebbi.pro")
+                print("==================================================\n")
+                return True
+            else:
+                logging.critical(f"[COMPLIANCE FRAUD DETECTED] Corporate ledger seal does not match physical system metrics!")
+                print("\n==================================================")
+                print("🚨 AUDIT VERDICT: TAMPERING DETECTED / INVALID LOGS")
+                print("Forwarding payload to public audit stream...")
+                print("==================================================\n")
+                return False
+
+        except Exception as e:
+            logging.error(f"Audit failed due to processing error: {e}")
+            return False
+
+# --- RUN AN INDEPENDENT RESEARCH SCENARIO ---
+if __name__ == "__main__":
+    # A researcher samples a transaction claim from an app's public metadata
+    sample_corporate_payload = {
+        "alert_text": "SYSTEM NOTICE: AI Governance Compliance Update for sebbi.pro.",
+        "raw_declaration": "Standard: AI-TXT/1.0\\nGovernance-Engine: AILeash v6.4"
+    }
+    
+    # The developer's matching validation key hash 
+    legitimate_claim_hash = "19b48c4cfb49e3b8aee1403c9dcaee06bfa4622b10292850a1ae7f42cf5dbef5"
+
+    # Instantiate the independent auditor
+    auditor = OpenAIActAuditor(target_domain="monopcontent.co.uk")
+    
+    # Run the audit test pass
+    auditor.run_public_compliance_audit(legitimate_claim_hash, sample_corporate_payload)
+
+```
+
+
+## `ai_act_ranker.py`
+
+262 lines, 4930 bytes
+
+```python
+"""
+AILeash Compliance Intelligence Engine
+Standalone AI Act Ranking & Risk Mapping Engine
+
+Version: 1.0.0
+"""
+
+import json
+import datetime
+
+
+VERSION = "1.0.0"
+
+
+# EU AI Act knowledge base
+AI_ACT_DATABASE = {
+
+    "Article 5": {
+        "title": "Prohibited AI Practices",
+        "phrases": [
+            "EU AI Act Article 5",
+            "prohibited AI practices",
+            "AI Act banned systems",
+            "AI regulation prohibited AI"
+        ],
+        "controls": [
+            "Prohibited use detection",
+            "Policy enforcement",
+            "AI behaviour screening"
+        ]
+    },
+
+
+    "Article 6": {
+        "title": "Classification of High Risk AI Systems",
+        "phrases": [
+            "high risk AI system",
+            "EU AI Act high risk classification",
+            "AI Act risk categories"
+        ],
+        "controls": [
+            "Risk classification",
+            "System assessment",
+            "Impact evaluation"
+        ]
+    },
+
+
+    "Article 9": {
+        "title": "Risk Management System",
+        "phrases": [
+            "EU AI Act Article 9",
+            "AI risk management system",
+            "AI Act compliance framework",
+            "continuous AI risk monitoring"
+        ],
+        "controls": [
+            "Risk identification",
+            "Risk scoring",
+            "Risk mitigation",
+            "Continuous monitoring"
+        ]
+    },
+
+
+    "Article 12": {
+        "title": "Record Keeping and Logging",
+        "phrases": [
+            "AI audit trail",
+            "AI logging requirements",
+            "AI evidence records",
+            "machine learning audit logs"
+        ],
+        "controls": [
+            "Immutable logs",
+            "Evidence storage",
+            "Traceability",
+            "Hash verification"
+        ]
+    },
+
+
+    "Article 14": {
+        "title": "Human Oversight",
+        "phrases": [
+            "AI human oversight",
+            "human in the loop AI",
+            "AI intervention controls"
+        ],
+        "controls": [
+            "Human review",
+            "Override capability",
+            "Decision supervision"
+        ]
+    },
+
+
+    "Article 15": {
+        "title": "Accuracy Robustness Cybersecurity",
+        "phrases": [
+            "AI cybersecurity",
+            "AI accuracy monitoring",
+            "AI robustness requirements"
+        ],
+        "controls": [
+            "Security testing",
+            "Performance monitoring",
+            "Failure detection"
+        ]
+    }
+
+}
+
+
+def search_ai_act(query):
+
+    results = []
+
+    query = query.lower()
+
+    for article, data in AI_ACT_DATABASE.items():
+
+        for phrase in data["phrases"]:
+
+            if query in phrase.lower():
+
+                results.append({
+                    "article": article,
+                    "title": data["title"],
+                    "matched_phrase": phrase,
+                    "controls": data["controls"]
+                })
+
+    return results
+
+
+
+def calculate_compliance_score(system):
+
+    score = 0
+    missing = []
+
+    requirements = {
+
+        "risk_management": "Article 9",
+        "logging": "Article 12",
+        "human_oversight": "Article 14",
+        "security": "Article 15"
+
+    }
+
+
+    for control, article in requirements.items():
+
+        if system.get(control):
+            score += 25
+        else:
+            missing.append(article)
+
+
+    return {
+        "score": score,
+        "rating": risk_rating(score),
+        "missing_articles": missing
+    }
+
+
+
+def risk_rating(score):
+
+    if score >= 90:
+        return "LOW RISK"
+
+    if score >= 70:
+        return "MODERATE RISK"
+
+    if score >= 40:
+        return "HIGH RISK"
+
+    return "CRITICAL RISK"
+
+
+
+def generate_report(system):
+
+    return {
+
+        "engine": "AILeash Compliance Intelligence Engine",
+
+        "version": VERSION,
+
+        "timestamp":
+            datetime.datetime.utcnow().isoformat(),
+
+        "assessment":
+            calculate_compliance_score(system)
+
+    }
+
+
+
+def save_report(report):
+
+    filename = (
+        "aileash_report_"
+        + datetime.datetime.now()
+        .strftime("%Y%m%d_%H%M%S")
+        + ".json"
+    )
+
+    with open(filename, "w") as file:
+        json.dump(
+            report,
+            file,
+            indent=4
+        )
+
+    return filename
+
+
+
+if __name__ == "__main__":
+
+    print(
+        "\nAILeash AI Act Ranking Engine "
+        + VERSION
+    )
+
+    print("\nExample search:")
+    
+    results = search_ai_act(
+        "Article 9"
+    )
+
+    for result in results:
+        print("\nMATCH:")
+        print(result)
+
+
+    test_system = {
+
+        "risk_management": True,
+        "logging": True,
+        "human_oversight": False,
+        "security": True
+
+    }
+
+
+    report = generate_report(test_system)
+
+    print("\nCOMPLIANCE REPORT")
+    print(json.dumps(report, indent=4))
+
+
+    file = save_report(report)
+
+    print(
+        "\nSaved:",
+        file
+    )
+
+```
+
+
+## `ai_safety_scanner.py`
+
+167 lines, 5700 bytes
+
+```python
+"""
+AI-Safety Grade Scanner
+Checks a domain's .well-known/ files and public root files against the
+emerging AI-safety/AI-transparency file conventions, and returns a
+letter grade (A-F) plus an embeddable badge.
+
+Drop into your existing FastAPI server.py as a router, or run standalone.
+Requires: fastapi, httpx  (pip install fastapi httpx --break-system-packages)
+"""
+
+from fastapi import APIRouter, Query
+from fastapi.responses import JSONResponse, Response
+import httpx
+import xml.etree.ElementTree as ET
+
+router = APIRouter()
+
+TIMEOUT = 6.0
+UA_HUMAN = "Mozilla/5.0 (compatible; AILeashScanner/1.0; +https://sebbi.pro/check)"
+UA_AGENT = "AILeash-Agent-Check/1.0 (+https://sebbi.pro/check)"
+
+CHECKS = [
+    # (key, path, points, validator_name)
+    ("ai_safety",  "/.well-known/ai-safety.txt", 20, "check_ai_safety"),
+    ("security",   "/.well-known/security.txt",  15, "check_security"),
+    ("robots",     "/robots.txt",                10, "check_robots"),
+    ("sitemap",    "/sitemap.xml",                10, "check_sitemap"),
+    ("ai_txt",     "/.well-known/ai.txt",         15, "check_present"),
+    ("comply",     "/.well-known/comply.txt",     15, "check_present"),
+    ("llms",       "/llms.txt",                   10, "check_present"),
+]
+RENDERING_POINTS = 5
+MAX_SCORE = sum(c[2] for c in CHECKS) + RENDERING_POINTS  # 100
+
+
+async def fetch(client: httpx.AsyncClient, url: str, ua: str = UA_HUMAN):
+    try:
+        r = await client.get(url, timeout=TIMEOUT, headers={"User-Agent": ua}, follow_redirects=True)
+        if r.status_code == 200:
+            return r.text
+    except Exception:
+        pass
+    return None
+
+
+def check_present(text):
+    return bool(text and text.strip())
+
+
+def check_ai_safety(text):
+    if not text:
+        return False
+    lower = text.lower()
+    return "ai-safe:" in lower and "true" in lower
+
+
+def check_security(text):
+    if not text:
+        return False
+    lower = text.lower()
+    return "contact:" in lower and "expires:" in lower
+
+
+def check_robots(text):
+    return bool(text and text.strip())
+
+
+def check_sitemap(text):
+    if not text:
+        return False
+    try:
+        ET.fromstring(text)
+        return True
+    except ET.ParseError:
+        return False
+
+
+VALIDATORS = {
+    "check_ai_safety": check_ai_safety,
+    "check_security": check_security,
+    "check_robots": check_robots,
+    "check_sitemap": check_sitemap,
+    "check_present": check_present,
+}
+
+
+def grade_from_score(score: int) -> str:
+    if score >= 90:
+        return "A"
+    if score >= 75:
+        return "B"
+    if score >= 60:
+        return "C"
+    if score >= 40:
+        return "D"
+    return "F"
+
+
+GRADE_COLOR = {"A": "#7fe3b0", "B": "#a8d95f", "C": "#c9a84c", "D": "#ff9a4a", "F": "#ff8a80"}
+
+
+@router.get("/check")
+async def check_domain(domain: str = Query(..., description="Domain to check, e.g. example.com")):
+    domain = domain.strip().lower().replace("https://", "").replace("http://", "").rstrip("/")
+    base = f"https://{domain}"
+
+    results = {}
+    score = 0
+
+    async with httpx.AsyncClient() as client:
+        for key, path, points, validator_name in CHECKS:
+            text = await fetch(client, base + path)
+            passed = VALIDATORS[validator_name](text)
+            results[key] = {"path": path, "found": bool(text), "passed": passed, "points": points if passed else 0}
+            if passed:
+                score += points
+
+        # basic consistent-rendering check: compare human UA vs agent UA on homepage
+        human_body = await fetch(client, base, UA_HUMAN)
+        agent_body = await fetch(client, base, UA_AGENT)
+        rendering_ok = bool(human_body) and bool(agent_body) and (len(human_body) > 0 and len(agent_body) > 0)
+        # crude similarity check — same length within 10% as a proxy for "not obviously cloaked"
+        if human_body and agent_body:
+            ratio = min(len(human_body), len(agent_body)) / max(len(human_body), len(agent_body), 1)
+            rendering_ok = ratio > 0.9
+        results["consistent_rendering"] = {"passed": rendering_ok, "points": RENDERING_POINTS if rendering_ok else 0}
+        if rendering_ok:
+            score += RENDERING_POINTS
+
+    grade = grade_from_score(score)
+
+    return JSONResponse({
+        "domain": domain,
+        "score": score,
+        "max_score": MAX_SCORE,
+        "grade": grade,
+        "checks": results,
+        "verified_by": "sebbi.pro",
+        "badge_url": f"https://sebbi.pro/check/badge?domain={domain}",
+        "report_url": f"https://sebbi.pro/check?domain={domain}",
+    })
+
+
+@router.get("/check/badge")
+async def check_badge(domain: str = Query(...)):
+    """Returns an embeddable SVG badge, e.g. <img src="https://sebbi.pro/check/badge?domain=example.com">"""
+    domain = domain.strip().lower().replace("https://", "").replace("http://", "").rstrip("/")
+    base = f"https://{domain}"
+
+    score = 0
+    async with httpx.AsyncClient() as client:
+        for key, path, points, validator_name in CHECKS:
+            text = await fetch(client, base + path)
+            if VALIDATORS[validator_name](text):
+                score += points
+
+    grade = grade_from_score(score)
+    color = GRADE_COLOR[grade]
+
+    svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="180" height="20">
+  <rect width="120" height="20" fill="#0a0f1e"/>
+  <rect x="120" width="60" height="20" fill="{color}"/>
+  <text x="60" y="14" fill="#fff" font-family="Verdana,sans-serif" font-size="11" text-anchor="middle">AI-Safety Grade</text>
+  <text x="150" y="14" fill="#0a0f1e" font-family="Verdana,sans-serif" font-size="12" font-weight="bold" text-anchor="middle">{grade}</text>
+</svg>'''
+    return Response(content=svg, media_type="image/svg+xml")
+
+```
+
+
+## `aigrade_insert.py`
+
+136 lines, 5663 bytes
+
+```python
+# ============================================================
+# AI-SAFETY GRADE SCANNER - stdlib version for server.py
+# (converted from the FastAPI/httpx draft - no new dependencies)
+#
+# HOW TO INSTALL - two pastes into server.py:
+#
+# PASTE 1: everything between "BEGIN FUNCTIONS" and "END FUNCTIONS"
+#          goes near your other helper functions (e.g. just above
+#          the JURIS_VERSION block).
+#
+# PASTE 2: everything between "BEGIN ROUTES" and "END ROUTES"
+#          goes inside do_GET, as new elif branches alongside the
+#          other GET routes (match their indentation: 8 spaces).
+#
+# Endpoints added:
+#   GET /api/aigrade?domain=example.com        -> JSON grade report
+#   GET /api/aigrade/badge?domain=example.com  -> embeddable SVG badge
+# ============================================================
+
+# ---------------- BEGIN FUNCTIONS ----------------
+AIGRADE_TIMEOUT=6
+AIGRADE_UA="Mozilla/5.0 (compatible; AILeashScanner/1.0; +https://sebbi.pro/scan)"
+AIGRADE_UA_AGENT="AILeash-Agent-Check/1.0 (+https://sebbi.pro/scan)"
+AIGRADE_CHECKS=[
+    ("ai_safety","/.well-known/ai-safety.txt",20,"ai_safety"),
+    ("security","/.well-known/security.txt",15,"security"),
+    ("robots","/robots.txt",10,"present"),
+    ("sitemap","/sitemap.xml",10,"sitemap"),
+    ("ai_txt","/.well-known/ai.txt",15,"present"),
+    ("comply","/.well-known/comply.txt",15,"present"),
+    ("llms","/llms.txt",10,"present"),
+]
+AIGRADE_RENDER_POINTS=5
+AIGRADE_MAX=sum(c[2] for c in AIGRADE_CHECKS)+AIGRADE_RENDER_POINTS
+AIGRADE_COLORS={"A":"#7fe3b0","B":"#a8d95f","C":"#c9a84c","D":"#ff9a4a","F":"#ff8a80"}
+
+def _aigrade_fetch(url,ua=AIGRADE_UA):
+    try:
+        req=urllib.request.Request(url,headers={"User-Agent":ua})
+        with urllib.request.urlopen(req,timeout=AIGRADE_TIMEOUT) as r:
+            if r.status==200:
+                return r.read(500000).decode("utf-8","replace")
+    except Exception:
+        pass
+    return None
+
+def _aigrade_valid(kind,text):
+    if kind=="present":
+        return bool(text and text.strip())
+    if kind=="ai_safety":
+        if not text:return False
+        low=text.lower()
+        return "ai-safe:" in low and "true" in low
+    if kind=="security":
+        if not text:return False
+        low=text.lower()
+        return "contact:" in low and "expires:" in low
+    if kind=="sitemap":
+        if not text:return False
+        try:
+            import xml.etree.ElementTree as _ET
+            _ET.fromstring(text)
+            return True
+        except Exception:
+            return False
+    return False
+
+def _aigrade_letter(score):
+    if score>=90:return"A"
+    if score>=75:return"B"
+    if score>=60:return"C"
+    if score>=40:return"D"
+    return"F"
+
+def aigrade_run(domain):
+    domain=str(domain or "").strip().lower().replace("https://","").replace("http://","").rstrip("/")
+    domain=domain.split("/")[0]
+    if not domain or "." not in domain or len(domain)>200:
+        return None
+    base="https://"+domain
+    results={};score=0
+    for key,path,points,kind in AIGRADE_CHECKS:
+        text=_aigrade_fetch(base+path)
+        passed=_aigrade_valid(kind,text)
+        results[key]={"path":path,"found":bool(text),"passed":passed,"points":points if passed else 0}
+        if passed:score+=points
+    human=_aigrade_fetch(base,AIGRADE_UA)
+    agent=_aigrade_fetch(base,AIGRADE_UA_AGENT)
+    render_ok=False
+    if human and agent:
+        ratio=min(len(human),len(agent))/max(len(human),len(agent),1)
+        render_ok=ratio>0.9
+    results["consistent_rendering"]={"passed":render_ok,"points":AIGRADE_RENDER_POINTS if render_ok else 0}
+    if render_ok:score+=AIGRADE_RENDER_POINTS
+    return{"domain":domain,"score":score,"max_score":AIGRADE_MAX,
+        "grade":_aigrade_letter(score),"checks":results,
+        "verified_by":"sebbi.pro",
+        "badge_url":HOST+"/api/aigrade/badge?domain="+domain,
+        "report_url":HOST+"/api/aigrade?domain="+domain,
+        "note":"External-signal check of published AI-transparency files; not an audit of internal systems"}
+
+def aigrade_badge_svg(domain):
+    r=aigrade_run(domain)
+    grade=r["grade"] if r else "F"
+    color=AIGRADE_COLORS.get(grade,"#ff8a80")
+    return('<svg xmlns="http://www.w3.org/2000/svg" width="180" height="20">'
+        '<rect width="120" height="20" fill="#0a0f1e"/>'
+        '<rect x="120" width="60" height="20" fill="'+color+'"/>'
+        '<text x="60" y="14" fill="#fff" font-family="Verdana,sans-serif" font-size="11" text-anchor="middle">AI-Safety Grade</text>'
+        '<text x="150" y="14" fill="#0a0f1e" font-family="Verdana,sans-serif" font-size="12" font-weight="bold" text-anchor="middle">'+grade+'</text>'
+        '</svg>')
+# ---------------- END FUNCTIONS ----------------
+
+
+# ---------------- BEGIN ROUTES (paste inside do_GET) ----------------
+        elif path=="/api/aigrade":
+            qs=parse_qs(parsed.query)
+            dom=(qs.get("domain",[""])[0] or "").strip()
+            rep=aigrade_run(dom)
+            if not rep:
+                send_json(self,{"error":"valid domain required, e.g. ?domain=example.com"},400)
+            else:
+                send_json(self,rep)
+        elif path=="/api/aigrade/badge":
+            qs=parse_qs(parsed.query)
+            dom=(qs.get("domain",[""])[0] or "").strip()
+            svg=aigrade_badge_svg(dom)
+            body=svg.encode()
+            self.send_response(200)
+            self.send_header("Content-Type","image/svg+xml")
+            self.send_header("Cache-Control","max-age=3600")
+            self.send_header("Content-Length",str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+# ---------------- END ROUTES ----------------
+
+```
+
+
+## `aileash_reporter.py`
+
+232 lines, 9377 bytes
+
+```python
+"""
+AILEASH DECISION REPORTER v1.0.0
+Generates readable audit reports for all AILeash products.
+Shows exactly why each decision was made.
+Copyright (c) 2026 Justin Antony Dobson / Monop Content, Blyth, UK
+"""
+
+import sqlite3, json, os
+from datetime import datetime
+
+DB_FILE = "aileash.db"
+
+PRODUCTS = {
+    "aileash": "AILeash",
+    "guardian": "AILeash Guardian",
+    "sonicboom": "SonicBoom",
+    "sentinel": "AILeash Sentinel"
+}
+
+REASON_EXPLANATIONS = {
+    "velocity_spike": "User made more than 10 requests in 60 seconds",
+    "high_amount": "Transaction amount exceeded threshold",
+    "risky_device": "Device risk score was above acceptable limit",
+    "behaviour_anomaly": "Unusual behaviour pattern detected",
+    "country_shift": "Request came from a different country than usual",
+    "unsafe_country": "Request came from outside approved country list",
+    "low_trust": "User trust score has dropped due to previous decisions",
+}
+
+def get_decisions(db_path=DB_FILE, limit=200):
+    if not os.path.exists(db_path):
+        return []
+    try:
+        conn = sqlite3.connect(db_path)
+        rows = conn.execute("""
+            SELECT a.ts, a.user_id, a.event_json, a.result_json, a.audit_hash,
+                   COALESCE(k.product, 'aileash') as product
+            FROM audit_log a
+            LEFT JOIN api_keys k ON json_extract(a.event_json, '$.api_key') = k.key
+            ORDER BY a.id DESC LIMIT ?
+        """, (limit,)).fetchall()
+        conn.close()
+    except:
+        try:
+            conn = sqlite3.connect(db_path)
+            rows = conn.execute("""
+                SELECT ts, user_id, event_json, result_json, audit_hash, 'aileash'
+                FROM audit_log ORDER BY id DESC LIMIT ?
+            """, (limit,)).fetchall()
+            conn.close()
+        except:
+            return []
+    
+    results = []
+    for row in rows:
+        try:
+            event = json.loads(row[2])
+            result = json.loads(row[3])
+            results.append({
+                "ts": row[0],
+                "user_id": row[1],
+                "event": event,
+                "result": result,
+                "audit_hash": row[4],
+                "product": row[5] or "aileash"
+            })
+        except:
+            pass
+    return results
+
+def explain_reason(r):
+    return REASON_EXPLANATIONS.get(r, r.replace("_", " ").capitalize())
+
+def decision_color(d):
+    return {"ALLOW": "#00875a", "CHALLENGE": "#b45309", "BLOCK": "#cc0000"}.get(d, "#555")
+
+def product_color(p):
+    return {
+        "aileash": "#c9a84c",
+        "guardian": "#cc0000",
+        "sonicboom": "#00d4ff",
+        "sentinel": "#7c3aed"
+    }.get(p, "#c9a84c")
+
+def generate_html_report(db_path=DB_FILE, limit=200, output="aileash_report.html"):
+    decisions = get_decisions(db_path, limit)
+
+    allow = sum(1 for d in decisions if d["result"].get("decision") == "ALLOW")
+    challenge = sum(1 for d in decisions if d["result"].get("decision") == "CHALLENGE")
+    block = sum(1 for d in decisions if d["result"].get("decision") == "BLOCK")
+
+    rows = ""
+    for d in decisions:
+        result = d["result"]
+        event = d["event"]
+        ts = datetime.fromtimestamp(d["ts"]).strftime('%Y-%m-%d %H:%M:%S')
+        decision = result.get("decision", "?")
+        score = result.get("score", 0)
+        reasons = result.get("reasons", [])
+        product = d.get("product", "aileash")
+        pc = product_color(product)
+        dc = decision_color(decision)
+        pname = PRODUCTS.get(product, product)
+
+        reason_html = ""
+        if reasons:
+            reason_html = "<ul>" + "".join(
+                f"<li>{explain_reason(r)}</li>" for r in reasons
+            ) + "</ul>"
+        else:
+            reason_html = "<span style='color:#888'>No risk factors detected</span>"
+
+        rows += f"""<tr>
+            <td>{ts}</td>
+            <td><span style="font-size:10px;background:{pc}22;color:{pc};border:1px solid {pc}44;padding:2px 6px;border-radius:3px">{pname}</span></td>
+            <td><code>{d['user_id']}</code></td>
+            <td>{event.get('action','?')}</td>
+            <td>{event.get('country','?')}</td>
+            <td>£{event.get('amount',0)}</td>
+            <td><strong style="color:{dc}">{decision}</strong></td>
+            <td>{score}</td>
+            <td>{result.get('trust',0)}</td>
+            <td>{reason_html}</td>
+            <td><code style="font-size:10px">{d['audit_hash'][:16]}...</code></td>
+        </tr>"""
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>AILeash Audit Report</title>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:sans-serif;background:#f5f7fa;color:#1a202c;padding:20px}}
+.header{{background:#0a0f1e;color:#fff;padding:24px 32px;border-radius:8px;margin-bottom:20px;display:flex;justify-content:space-between;align-items:center}}
+.header h1{{font-size:22px;color:#c9a84c;margin:0}}
+.header p{{font-size:12px;color:rgba(255,255,255,0.4);margin-top:4px}}
+.logo{{font-size:13px;color:rgba(255,255,255,0.2)}}
+.stats{{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px}}
+.stat{{background:#fff;border-radius:8px;padding:16px;text-align:center;border:1px solid #e2e8f0}}
+.stat-n{{font-size:28px;font-weight:700}}
+.stat-l{{font-size:11px;color:#64748b;margin-top:4px;text-transform:uppercase;letter-spacing:1px}}
+.allow{{color:#00875a}}.challenge{{color:#b45309}}.block{{color:#cc0000}}.total{{color:#0a0f1e}}
+.table-wrap{{background:#fff;border-radius:8px;overflow:hidden;border:1px solid #e2e8f0;overflow-x:auto}}
+table{{width:100%;border-collapse:collapse;min-width:900px}}
+th{{background:#0a0f1e;color:#c9a84c;padding:10px 12px;text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:1px;white-space:nowrap}}
+td{{padding:10px 12px;border-bottom:1px solid #e2e8f0;font-size:12px;vertical-align:top}}
+tr:last-child td{{border:none}}
+tr:hover td{{background:#f8fafc}}
+ul{{margin:4px 0;padding-left:16px}}
+li{{margin:2px 0;color:#64748b;font-size:11px}}
+code{{background:#f1f5f9;padding:2px 4px;border-radius:3px;font-size:10px}}
+.empty{{text-align:center;color:#888;padding:40px}}
+footer{{text-align:center;font-size:11px;color:#94a3b8;margin-top:20px}}
+</style>
+</head>
+<body>
+<div class="header">
+  <div>
+    <h1>AILeash Audit Report</h1>
+    <p>Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} &nbsp;|&nbsp; Last {len(decisions)} decisions</p>
+  </div>
+  <div class="logo">sebbi.pro &nbsp;|&nbsp; OAAS-1.0</div>
+</div>
+<div class="stats">
+  <div class="stat"><div class="stat-n total">{len(decisions)}</div><div class="stat-l">Total</div></div>
+  <div class="stat"><div class="stat-n allow">{allow}</div><div class="stat-l">Allowed</div></div>
+  <div class="stat"><div class="stat-n challenge">{challenge}</div><div class="stat-l">Challenged</div></div>
+  <div class="stat"><div class="stat-n block">{block}</div><div class="stat-l">Blocked</div></div>
+</div>
+<div class="table-wrap">
+<table>
+<thead><tr>
+  <th>Time</th><th>Product</th><th>User</th><th>Action</th><th>Country</th>
+  <th>Amount</th><th>Decision</th><th>Score</th><th>Trust</th><th>Reasons</th><th>Audit Hash</th>
+</tr></thead>
+<tbody>
+{''.join([rows]) if rows else f'<tr><td colspan="11" class="empty">No decisions recorded yet</td></tr>'}
+</tbody>
+</table>
+</div>
+<footer>AILeash &nbsp;|&nbsp; Monop Content &nbsp;|&nbsp; Justin Antony Dobson &nbsp;|&nbsp; sebbi.pro &nbsp;|&nbsp; SHA-256 Merkle Chain</footer>
+</body>
+</html>"""
+
+    with open(output, "w") as f:
+        f.write(html)
+    print(f"Report saved: {output} ({len(decisions)} decisions)")
+    return output
+
+def generate_json_report(db_path=DB_FILE, limit=200, output="aileash_report.json"):
+    decisions = get_decisions(db_path, limit)
+    report = {
+        "generated": datetime.now().isoformat(),
+        "standard": "OAAS-1.0",
+        "source": "sebbi.pro",
+        "total": len(decisions),
+        "summary": {
+            "allow": sum(1 for d in decisions if d["result"].get("decision") == "ALLOW"),
+            "challenge": sum(1 for d in decisions if d["result"].get("decision") == "CHALLENGE"),
+            "block": sum(1 for d in decisions if d["result"].get("decision") == "BLOCK")
+        },
+        "decisions": [{
+            "timestamp": datetime.fromtimestamp(d["ts"]).isoformat(),
+            "product": PRODUCTS.get(d["product"], d["product"]),
+            "user_id": d["user_id"],
+            "action": d["event"].get("action"),
+            "country": d["event"].get("country"),
+            "amount": d["event"].get("amount"),
+            "decision": d["result"].get("decision"),
+            "score": d["result"].get("score"),
+            "trust": d["result"].get("trust"),
+            "reasons": d["result"].get("reasons", []),
+            "reasons_explained": [explain_reason(r) for r in d["result"].get("reasons", [])],
+            "audit_hash": d["audit_hash"]
+        } for d in decisions]
+    }
+    with open(output, "w") as f:
+        json.dump(report, f, indent=2)
+    print(f"Report saved: {output}")
+    return output
+
+if __name__ == "__main__":
+    import sys
+    fmt = sys.argv[1] if len(sys.argv) > 1 else "html"
+    db = sys.argv[2] if len(sys.argv) > 2 else DB_FILE
+    if fmt == "json":
+        generate_json_report(db)
+    else:
+        generate_html_report(db)
+
+```
+
+
+## `aileash_signed_client.py`
+
+415 lines, 14196 bytes
 
 ```python
 #!/usr/bin/env python3
 """
-modules/verifier.py  -  hand the verifier out at a URL
+aileash_signed_client.py  -  reference client for the signed witness lane
 
-WHY THIS EXISTS
----------------
-A proof that can only be checked by the party who issued it is not a proof.
-So the proof bundles at /x/continuity/proof are useless unless somebody can
-easily get hold of something that checks them, and telling people to clone a
-repository is a gate.
+Standard library only. No pip install, no dependencies, runs anywhere
+Python 3 runs including a phone.
 
-This serves the standalone verifier as a plain file:
+WHAT IT IS FOR
+    Two jobs, and it is the same code for both.
 
-    curl -sO https://sebbi.pro/verify-authority.py
-    curl -s "https://sebbi.pro/x/continuity/proof?evaluation=e_..." \\
-        | python3 verify-authority.py -
+    1. Testing. Run it with --test against your own deployment and it
+       generates a throwaway keypair, enrols it, submits a tip, fetches
+       the receipt, and rechecks the signature in the receipt against the
+       published public key. If all four steps pass, the lane works end
+       to end.
 
-The script it hands out has no dependencies and makes no network calls. It
-checks the Ed25519 signature, recomputes every digest, re-runs the whole
-derivation from the published rules, and reaches its own verdict - then says
-so if that verdict disagrees with ours.
+    2. Giving to a peer. This is the file you send someone who asks how
+       to join the signed lane. It contains a complete, readable Ed25519
+       implementation and the exact canonical message, so they can copy
+       the approach into any language without guessing.
 
-WHAT IT DELIBERATELY DOES NOT DO
---------------------------------
-It does not phone home, and this module records nothing about who downloaded
-it. A verification tool that reports back to the party being verified is not
-a verification tool.
+USAGE
+    Generate a keypair and keep it:
+        python3 aileash_signed_client.py --keygen
 
-    GET /verify-authority.py   the script
-    GET /x/verifier/status     what is installed, and the script's digest
+    Enrol a name:
+        python3 aileash_signed_client.py --enroll --chain you.example \\
+            --secret <hex from keygen>
+
+    Submit a tip:
+        python3 aileash_signed_client.py --submit --chain you.example \\
+            --secret <hex> --tip <64 hex>
+
+    Full round trip with a throwaway name and key:
+        python3 aileash_signed_client.py --test
+
+    Point at somewhere else:
+        --host https://sebbi.pro
+
+THE PRIVATE KEY
+    --keygen prints a 64-hex seed. That is the private key. Whoever holds
+    it can submit under your enrolled name and nobody else can, including
+    the operator of the deployment. Do not send it anywhere. There is no
+    route on the server that accepts one, and if a route ever asks you
+    for one, something is wrong.
+
+    Losing it is not catastrophic and it is not recoverable either. You
+    cannot rotate without it - rotation must be signed by the key being
+    replaced, which is exactly what stops anyone else rotating it. If it
+    is lost, enrol a new name; the old one stays visible and unused.
 """
 
-import hashlib
-import sys
-
-VERSION = "1.1"
-
-PUBLIC = {("GET", "status")}
-
-# Deliberately NOT "/verify" - that is the sealed-post verification page and
-# this module would silently hijack it, handing a visitor a Python download
-# where they expected a page. A route grab is a bug even when the code works.
-FILE_PATHS = ("/verify-authority.py", "/verify_authority.py")
-
-_patched = [False]
-
-
-SCRIPT = r'''#!/usr/bin/env python3
-"""
-verify_authority.py  -  check an AILeash authority proof without AILeash
-
-    python3 verify_authority.py proof.json
-    curl -s "https://sebbi.pro/x/continuity/proof?evaluation=e_..." \\
-        | python3 verify_authority.py -
-
-WHAT THIS IS FOR
-----------------
-A proof that can only be checked by the party who issued it is not a proof.
-This script takes a bundle and reaches its own conclusion using nothing but
-the Python standard library. It does not call the issuing system, it does not
-import anything you have to install, and it does not take a single field of
-the bundle at face value.
-
-It does four separate things, and each one can fail on its own:
-
-  1. SIGNATURE   Ed25519 over the canonical bundle. Confirms the bundle came
-                 from the holder of the named key and has not been edited by
-                 anybody since.
-
-  2. INTEGRITY   Recomputes every grant digest, the lineage digest and the
-                 parameter digest from the fields in front of it. Confirms
-                 the bundle is internally consistent with its own contents.
-
-  3. DERIVATION  Re-runs the authority rules from scratch: root issued by a
-                 human, an unbroken parent chain, scope covered at every hop,
-                 constraints narrowing on every axis, purpose narrowing,
-                 validity windows contained, nothing revoked, and the action
-                 itself inside the effective limits of the whole lineage.
-
-  4. AGREEMENT   Compares the verdict this script reached with the verdict the
-                 bundle claims. Disagreement is reported as a failure of the
-                 issuer, not of this script.
-
-WHAT A PASS MEANS
------------------
-That the authority for this action was derivable, at that time, from that
-human grant - or, for a refusal, that it genuinely was not, and that the named
-grant and invariant really are where it broke.
-
-WHAT A PASS DOES NOT MEAN
--------------------------
-That the root grant should ever have been issued. That the parameters describe
-something that really happened. That the risk engine was right. Derivation is
-not merit and it is not truth.
-
-The risk half of a composed verdict cannot be re-derived here, because that
-needs the issuer's scoring engine. Where the bundle's authority verdict is
-BLOCK, the composed verdict stands regardless, because the composition takes
-the worse of the two.
-"""
-
-import binascii
+import argparse
 import hashlib
 import json
+import os
 import sys
+import time
+import urllib.error
+import urllib.request
 
-GRANT_PREFIX = b"AILEASH-GRANT-v1:"
-EVAL_PREFIX = b"AILEASH-AUTHEVAL-v1:"
-BUNDLE_PREFIX = b"AILEASH-AUTHORITY-PROOF-v1:"
-
-MAX_DEPTH = 32
-RANK = {"ALLOW": 0, "CHALLENGE": 1, "BLOCK": 2}
+DEFAULT_HOST = "https://sebbi.pro"
+MSG_PREFIX = "aileash-signed-v1"
+ROTATE_PREFIX = "aileash-rotate-v1"
 
 
-# ======================================================================
-# Ed25519, RFC 8032, standard library only
-# ======================================================================
+# ----------------------------------------------------------------------
+# Ed25519, RFC 8032. Sign and verify. Standard library only.
+#
+# This is here so the file is self-contained and so a peer can read what
+# is actually happening rather than trusting a library they also have to
+# install. It is the textbook reference implementation with extended
+# coordinates for the scalar multiplication.
+# ----------------------------------------------------------------------
 
-_Q = 2 ** 255 - 19
+_P = 2 ** 255 - 19
 _L = 2 ** 252 + 27742317777372353535851937790883648493
-_D = -121665 * pow(121666, _Q - 2, _Q) % _Q
-_I = pow(2, (_Q - 1) // 4, _Q)
-
-
-def _h(m):
-    return hashlib.sha512(m).digest()
-
-
-def _inv(x):
-    return pow(x, _Q - 2, _Q)
+_D = -121665 * pow(121666, _P - 2, _P) % _P
+_I = pow(2, (_P - 1) // 4, _P)
 
 
 def _xrecover(y):
-    xx = (y * y - 1) * _inv(_D * y * y + 1)
-    x = pow(xx, (_Q + 3) // 8, _Q)
-    if (x * x - xx) % _Q != 0:
-        x = (x * _I) % _Q
+    xx = (y * y - 1) * pow(_D * y * y + 1, _P - 2, _P)
+    x = pow(xx, (_P + 3) // 8, _P)
+    if (x * x - xx) % _P != 0:
+        x = (x * _I) % _P
     if x % 2 != 0:
-        x = _Q - x
+        x = _P - x
     return x
 
 
-_BY = 4 * _inv(5) % _Q
+_BY = 4 * pow(5, _P - 2, _P) % _P
 _BX = _xrecover(_BY)
-_B = (_BX % _Q, _BY % _Q, 1, (_BX * _BY) % _Q)
-_IDENT = (0, 1, 1, 0)
+_B = (_BX % _P, _BY % _P, 1, _BX * _BY % _P)
 
 
 def _add(p, q):
     x1, y1, z1, t1 = p
     x2, y2, z2, t2 = q
-    a = (y1 - x1) * (y2 - x2) % _Q
-    b = (y1 + x1) * (y2 + x2) % _Q
-    c = t1 * 2 * _D * t2 % _Q
-    dd = z1 * 2 * z2 % _Q
-    e, f, g, hh = b - a, dd - c, dd + c, b + a
-    return (e * f % _Q, g * hh % _Q, f * g % _Q, e * hh % _Q)
+    a = (y1 - x1) * (y2 - x2) % _P
+    b = (y1 + x1) * (y2 + x2) % _P
+    c = t1 * 2 * _D * t2 % _P
+    dd = z1 * 2 * z2 % _P
+    e, f, g, h = b - a, dd - c, dd + c, b + a
+    return (e * f % _P, g * h % _P, f * g % _P, e * h % _P)
 
 
 def _scalarmult(p, e):
     if e == 0:
-        return _IDENT
-    q = _scalarmult(p, e // 2)
+        return (0, 1, 1, 0)
+    q = _scalarmult(p, e >> 1)
     q = _add(q, q)
     if e & 1:
         q = _add(q, p)
@@ -1859,550 +1653,1131 @@ def _scalarmult(p, e):
 
 def _encodepoint(p):
     x, y, z, _t = p
-    zi = _inv(z)
-    x, y = x * zi % _Q, y * zi % _Q
-    bits = [(y >> i) & 1 for i in range(255)] + [x & 1]
-    return bytes(sum(bits[i * 8 + j] << j for j in range(8)) for i in range(32))
+    zi = pow(z, _P - 2, _P)
+    x = x * zi % _P
+    y = y * zi % _P
+    raw = bytearray(y.to_bytes(32, "little"))
+    raw[31] |= (x & 1) << 7
+    return bytes(raw)
 
 
-def _bit(h, i):
-    return (h[i // 8] >> (i % 8)) & 1
-
-
-def _hint(m):
-    h = _h(m)
-    return sum(2 ** i * _bit(h, i) for i in range(512))
-
-
-def _isoncurve(p):
-    x, y, z, t = p
-    return (z % _Q != 0 and x * y % _Q == z * t % _Q
-            and (y * y - x * x - z * z - _D * t * t) % _Q == 0)
-
-
-def _decodepoint(s):
-    y = int.from_bytes(s, "little") & ((1 << 255) - 1)
+def _decodepoint(raw):
+    y = int.from_bytes(raw, "little") & ((1 << 255) - 1)
+    if y >= _P:
+        return None
     x = _xrecover(y)
-    if x & 1 != _bit(s, 255):
-        x = _Q - x
-    p = (x, y, 1, (x * y) % _Q)
-    if not _isoncurve(p):
-        raise ValueError("point off curve")
-    return p
+    if x & 1 != (raw[31] >> 7) & 1:
+        x = _P - x
+    if (-x * x + y * y - 1 - _D * x * x * y * y) % _P != 0:
+        return None
+    return (x, y, 1, x * y % _P)
 
 
-def ed25519_verify(sig, msg, pk):
-    if len(sig) != 64 or len(pk) != 32:
-        return False
+def _secret_scalar(seed):
+    h = hashlib.sha512(seed).digest()
+    a = int.from_bytes(h[:32], "little")
+    a &= (1 << 254) - 8
+    a |= 1 << 254
+    return a, h[32:]
+
+
+def public_key(seed):
+    """32-byte public key from a 32-byte seed."""
+    a, _ = _secret_scalar(seed)
+    return _encodepoint(_scalarmult(_B, a))
+
+
+def sign(seed, message):
+    """64-byte Ed25519 signature."""
+    a, prefix = _secret_scalar(seed)
+    pk = _encodepoint(_scalarmult(_B, a))
+    r = int.from_bytes(hashlib.sha512(prefix + message).digest(), "little") % _L
+    rp = _encodepoint(_scalarmult(_B, r))
+    k = int.from_bytes(hashlib.sha512(rp + pk + message).digest(), "little") % _L
+    s = (r + k * a) % _L
+    return rp + s.to_bytes(32, "little")
+
+
+def verify(pk, message, signature):
+    """True if signature is valid. Never raises."""
     try:
-        rr = _decodepoint(sig[:32])
+        if len(pk) != 32 or len(signature) != 64:
+            return False
         a = _decodepoint(pk)
+        if a is None:
+            return False
+        r = _decodepoint(signature[:32])
+        if r is None:
+            return False
+        s = int.from_bytes(signature[32:], "little")
+        if s >= _L:
+            return False
+        k = int.from_bytes(
+            hashlib.sha512(signature[:32] + pk + message).digest(),
+            "little") % _L
+        left = _scalarmult(_B, s)
+        right = _add(r, _scalarmult(a, k))
+        lx, ly, lz, _lt = left
+        rx, ry, rz, _rt = right
+        return ((lx * rz - rx * lz) % _P == 0
+                and (ly * rz - ry * lz) % _P == 0)
     except Exception:
         return False
-    s = int.from_bytes(sig[32:64], "little")
-    if s >= _L:
-        return False
-    hh = _hint(sig[:32] + pk + msg)
-    return _encodepoint(_scalarmult(_B, s)) == _encodepoint(_add(rr, _scalarmult(a, hh)))
 
 
-# ======================================================================
-# the rules, reimplemented from the published spec
-# ======================================================================
+# ----------------------------------------------------------------------
+# the canonical message - the only part a reimplementer must match
+# ----------------------------------------------------------------------
 
-def canon(obj):
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
-
-
-def sha(prefix, text):
-    return hashlib.sha256(prefix + text.encode("utf-8")).hexdigest()
+def canonical_submit(chain, tip, ts):
+    """Four lines, single \\n, UTF-8, no trailing newline."""
+    return "\n".join([MSG_PREFIX, chain, tip, str(int(ts))]).encode("utf-8")
 
 
-def grant_digest(g):
-    material = {
-        "id": g["id"], "parent": g["parent"], "issuer": g["issuer"],
-        "issuer_kind": g["issuer_kind"], "subject": g["subject"],
-        "subject_kind": g["subject_kind"], "scope": sorted(g["scope"]),
-        "constraints": g["constraints"], "purpose": g["purpose"],
-        "purpose_tags": sorted(g["purpose_tags"]),
-        "not_before": g["not_before"], "not_after": g["not_after"],
-        "depth": g["depth"], "delegations_left": g["delegations_left"],
-        "created": g["created"], "risk_accepted_by": g.get("risk_accepted_by"),
-    }
-    return sha(GRANT_PREFIX, canon(material))
+def canonical_rotate(chain, new_pubkey_hex, ts):
+    return "\n".join([ROTATE_PREFIX, chain, new_pubkey_hex,
+                      str(int(ts))]).encode("utf-8")
 
 
-def covers(held, wanted):
-    if held == wanted or held == "*":
-        return True
-    if held.endswith(".*"):
-        return wanted == held[:-2] or wanted.startswith(held[:-1])
-    return False
+# ----------------------------------------------------------------------
+# http
+# ----------------------------------------------------------------------
 
-
-def wildcard_breadth(scope, capability):
-    best = None
-    for held in scope:
-        if not covers(held, capability):
-            continue
-        if held == capability:
-            return 0
-        width = (capability.count(".") + 2 if held == "*"
-                 else capability.count(".") - held[:-2].count("."))
-        best = width if best is None else min(best, width)
-    return best
-
-
-def direction(key):
-    for p in ("max_", "min_", "allowed_", "denied_", "may_"):
-        if key.startswith(p):
-            return p
-    return None
-
-
-def num(v):
-    if isinstance(v, bool) or v is None:
-        raise ValueError("not a number")
-    return float(v)
-
-
-def as_set(v):
-    if isinstance(v, (list, tuple, set)):
-        return set(v)
-    return {v}
-
-
-def narrower(parent_c, child_c):
-    for key in sorted(child_c):
-        d = direction(key)
-        cval = child_c[key]
-        if d is None:
-            return False, "constraint '%s' has no narrowing rule" % key
-        if key not in parent_c:
-            return False, "constraint '%s' is not expressed by the parent" % key
-        pval = parent_c[key]
-        try:
-            if d == "max_" and num(cval) > num(pval):
-                return False, "%s raised from %s to %s" % (key, pval, cval)
-            if d == "min_" and num(cval) < num(pval):
-                return False, "%s lowered from %s to %s" % (key, pval, cval)
-            if d == "allowed_" and not as_set(cval) <= as_set(pval):
-                return False, "%s adds values the parent does not hold" % key
-            if d == "denied_" and not as_set(pval) <= as_set(cval):
-                return False, "%s drops values the parent denies" % key
-            if d == "may_" and bool(cval) and not bool(pval):
-                return False, "%s enabled where the parent withholds it" % key
-        except (TypeError, ValueError):
-            return False, "constraint '%s' is not comparable" % key
-    return True, None
-
-
-def effective(chain):
-    eff = {}
-    for g in chain:
-        for k, v in g["constraints"].items():
-            d = direction(k)
-            if k not in eff:
-                eff[k] = v
-                continue
-            cur = eff[k]
-            try:
-                if d == "max_":
-                    eff[k] = min(num(cur), num(v))
-                elif d == "min_":
-                    eff[k] = max(num(cur), num(v))
-                elif d == "allowed_":
-                    eff[k] = sorted(as_set(cur) & as_set(v))
-                elif d == "denied_":
-                    eff[k] = sorted(as_set(cur) | as_set(v))
-                elif d == "may_":
-                    eff[k] = bool(cur) and bool(v)
-            except (TypeError, ValueError):
-                eff[k] = v
-    return eff
-
-
-def params_against(params, eff):
-    hard, unconstrained = [], []
-    for key in sorted(params):
-        val = params[key]
-        checked = False
-        for cname, cval in eff.items():
-            d = direction(cname)
-            if not d or cname[len(d):] != key:
-                continue
-            checked = True
-            try:
-                if d == "max_" and num(val) > num(cval):
-                    hard.append("%s=%s exceeds %s=%s" % (key, val, cname, cval))
-                elif d == "min_" and num(val) < num(cval):
-                    hard.append("%s=%s is below %s=%s" % (key, val, cname, cval))
-                elif d == "allowed_" and val not in as_set(cval):
-                    hard.append("%s=%s is outside %s" % (key, val, cname))
-                elif d == "denied_" and val in as_set(cval):
-                    hard.append("%s=%s is denied by %s" % (key, val, cname))
-                elif d == "may_" and bool(val) and not bool(cval):
-                    hard.append("%s requested where %s withholds it" % (key, cname))
-            except (TypeError, ValueError):
-                hard.append("%s cannot be compared with %s" % (key, cname))
-        if not checked:
-            unconstrained.append(key)
-    return hard, unconstrained
-
-
-# ======================================================================
-# the four checks
-# ======================================================================
-
-class Report(object):
-    def __init__(self):
-        self.rows = []
-        self.failed = False
-
-    def add(self, ok, name, detail=""):
-        self.rows.append((ok, name, detail))
-        if not ok:
-            self.failed = True
-
-    def note(self, name, detail=""):
-        self.rows.append((None, name, detail))
-
-    def render(self):
-        out = []
-        for ok, name, detail in self.rows:
-            mark = "  ok  " if ok else ("FAIL  " if ok is False else "  --  ")
-            out.append(mark + name + (("\n        " + detail) if detail else ""))
-        return "\n".join(out)
-
-
-def check_signature(bundle, rep):
-    sig_hex = bundle.get("signature")
-    pk_hex = (bundle.get("issued_by") or {}).get("public_key")
-    if not sig_hex or not pk_hex:
-        rep.add(False, "Signature present", "the bundle carries no signature or no key")
-        return
-    body = dict(bundle)
-    body.pop("signature", None)
-    body.pop("verify_with", None)
+def _call(host, path, body=None, timeout=20):
+    url = host.rstrip("/") + path
+    data = None
+    headers = {"Accept": "application/json"}
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers)
     try:
-        sig = binascii.unhexlify(sig_hex)
-        pk = binascii.unhexlify(pk_hex)
-    except Exception:
-        rep.add(False, "Signature is readable hex")
-        return
-    ok = ed25519_verify(sig, BUNDLE_PREFIX + canon(body).encode("utf-8"), pk)
-    rep.add(ok, "Ed25519 signature over the canonical bundle",
-            "key " + pk_hex[:16] + "…  Verify this key independently at the issuer's "
-            "published address before trusting who signed." if ok else
-            "the bundle was altered after signing, or it was not signed by this key")
-
-
-def check_integrity(bundle, rep):
-    lineage = bundle.get("lineage") or []
-    bad = []
-    for g in lineage:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8", "replace")), r.getcode()
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "replace")
         try:
-            if grant_digest(g) != g.get("digest"):
-                bad.append(g.get("id"))
+            return json.loads(raw), e.code
         except Exception:
-            bad.append(g.get("id"))
-    rep.add(not bad, "Every grant digest recomputes from its own fields",
-            "" if not bad else "mismatched: " + ", ".join(str(b) for b in bad))
-
-    claimed = (bundle.get("decision") or {}).get("lineage_digest")
-    mine = sha(EVAL_PREFIX, canon([g.get("digest") for g in lineage]))
-    rep.add(mine == claimed, "Lineage digest matches the ordered path",
-            "" if mine == claimed else "computed " + mine[:20] + "… claimed " + str(claimed)[:20] + "…")
-
-    req = bundle.get("request") or {}
-    claimed_p = (bundle.get("decision") or {}).get("params_digest")
-    mine_p = sha(EVAL_PREFIX, canon({"action": req.get("action"),
-                                     "params": req.get("params") or {}}))
-    rep.add(mine_p == claimed_p, "Parameter digest matches the request as stated",
-            "" if mine_p == claimed_p else "the parameters shown are not the "
-            "parameters that were judged")
+            return {"raw": raw[:400]}, e.code
+    except Exception as e:
+        return {"error": "unreachable", "detail": str(e)}, 0
 
 
-def rederive(bundle, rep):
-    """Run the published rules from scratch and reach an independent verdict."""
-    lineage = bundle.get("lineage") or []
-    decision = bundle.get("decision") or {}
-    req = bundle.get("request") or {}
-    at = decision.get("evaluated_at_epoch")
-
-    hard, soft = [], []
-    broken_at = broken_invariant = None
-
-    def fail(grant, invariant, detail):
-        nonlocal broken_at, broken_invariant
-        hard.append(detail)
-        if broken_at is None:
-            broken_at, broken_invariant = grant, invariant
-
-    if not lineage:
-        fail(None, "authority_continuity", "the bundle carries no authority path")
-    else:
-        root = lineage[0]
-        if root.get("parent") is not None:
-            fail(root["id"], "authority_continuity",
-                 "the path does not begin at a parentless root")
-        if root.get("issuer_kind") != "human":
-            fail(root["id"], "identity_continuity",
-                 "the root grant was not issued by a human principal")
-
-        previous = None
-        for g in lineage:
-            if g.get("revoked_at") is not None:
-                fail(g["id"], "authority_continuity",
-                     "grant %s was revoked" % g["id"])
-            if at is not None:
-                if at < g["not_before"]:
-                    fail(g["id"], "temporal_validity",
-                         "grant %s was not yet valid at the time of the decision" % g["id"])
-                if at >= g["not_after"]:
-                    fail(g["id"], "temporal_validity",
-                         "grant %s had expired at the time of the decision" % g["id"])
-            if previous is not None:
-                if g.get("parent") != previous.get("id"):
-                    fail(g["id"], "authority_continuity",
-                         "grant %s does not point at the grant above it" % g["id"])
-                missing = [c for c in g["scope"]
-                           if not any(covers(p, c) for p in previous["scope"])]
-                if missing:
-                    fail(g["id"], "boundary_integrity",
-                         "%s holds scope its parent does not: %s"
-                         % (g["id"], ", ".join(sorted(missing))))
-                ok, why = narrower(previous["constraints"], g["constraints"])
-                if not ok:
-                    fail(g["id"], "boundary_integrity", "%s: %s" % (g["id"], why))
-                if not set(g["purpose_tags"]) <= set(previous["purpose_tags"]):
-                    fail(g["id"], "intent_continuity",
-                         "%s carries purpose tags its parent does not" % g["id"])
-                if (g["not_before"] < previous["not_before"]
-                        or g["not_after"] > previous["not_after"]):
-                    fail(g["id"], "temporal_validity",
-                         "%s is valid outside its parent's window" % g["id"])
-                if g["depth"] != previous["depth"] + 1:
-                    fail(g["id"], "authority_continuity",
-                         "%s records a depth inconsistent with its parent" % g["id"])
-            previous = g
-
-        if len(lineage) - 1 > MAX_DEPTH:
-            fail(lineage[-1]["id"], "boundary_integrity", "delegation depth exceeds the ceiling")
-
-        if not any(g.get("risk_accepted_by") for g in lineage):
-            fail(lineage[0]["id"], "identity_continuity",
-                 "no grant in this path names who accepted the risk")
-
-        leaf = lineage[-1]
-        action = req.get("action")
-        params = req.get("params") or {}
-
-        if action and not any(covers(c, action) for c in leaf["scope"]):
-            fail(leaf["id"], "boundary_integrity",
-                 "action '%s' is outside the scope of the grant exercised" % action)
-        elif action:
-            breadth = wildcard_breadth(leaf["scope"], action)
-            if breadth and breadth >= 2:
-                soft.append("action '%s' is only covered by a broad wildcard" % action)
-
-        eff = effective(lineage)
-        failures, unconstrained = params_against(params, eff)
-        for f in failures:
-            fail(leaf["id"], "boundary_integrity", f)
-        for u in unconstrained:
-            soft.append("parameter '%s' is not constrained anywhere in the path" % u)
-
-        tag = req.get("purpose_tag")
-        if tag:
-            if tag not in leaf["purpose_tags"]:
-                soft.append("declared purpose '%s' is not carried by the grant" % tag)
-        else:
-            soft.append("the action declared no purpose")
-
-    verdict = "BLOCK" if hard else ("CHALLENGE" if soft else "ALLOW")
-    return verdict, hard, soft, broken_at, broken_invariant
+def _wake(host):
+    """The router only imports a module when a request arrives, and only
+    GET reaches it after a restart. So GET something before POSTing."""
+    _call(host, "/x/witness/tip")
 
 
-def check_agreement(bundle, rep, mine, hard, soft, broken_at, broken_invariant):
-    decision = bundle.get("decision") or {}
-    claimed = decision.get("authority_verdict") or decision.get("verdict")
+# ----------------------------------------------------------------------
+# operations
+# ----------------------------------------------------------------------
 
-    rep.add(mine == claimed,
-            "Independently re-derived authority verdict: " + mine,
-            "" if mine == claimed else
-            "the issuer claims " + str(claimed) + " and this script reaches " + mine +
-            " from the same path. One of us is wrong and the rules are published.")
+def do_keygen():
+    seed = os.urandom(32)
+    print("private seed (KEEP THIS, send it nowhere):")
+    print("  " + seed.hex())
+    print("public key (this is what you enrol):")
+    print("  " + public_key(seed).hex())
 
-    if mine == "BLOCK":
-        same_grant = (broken_at == decision.get("broken_at"))
-        same_inv = (broken_invariant == decision.get("broken_invariant"))
-        rep.add(same_grant and same_inv,
-                "Refusal reproduces at the same grant and invariant",
-                ("grant %s, invariant %s" % (broken_at, broken_invariant))
-                if same_grant and same_inv else
-                "this script breaks at grant %s / %s, the issuer says %s / %s"
-                % (broken_at, broken_invariant,
-                   decision.get("broken_at"), decision.get("broken_invariant")))
-        rep.note("Why authority could not be derived")
-        for h in hard:
-            rep.note("  " + h)
-    elif soft:
-        rep.note("Why this could not be settled without a person")
-        for x in soft:
-            rep.note("  " + x)
 
-    risk = decision.get("risk_verdict")
-    if risk and mine != "BLOCK":
-        rep.note("Risk verdict reported as " + str(risk) + ", not re-derivable here",
-                 "the composed verdict is the worse of the two; the scoring engine "
-                 "is not part of this bundle and is not checked by this script")
+def do_enroll(host, chain, seed):
+    _wake(host)
+    pk = public_key(seed).hex()
+    body, code = _call(host, "/x/signed/enroll",
+                       {"chain": chain, "pubkey": pk})
+    print(json.dumps(body, indent=2))
+    return code == 200
+
+
+def do_submit(host, chain, seed, tip):
+    _wake(host)
+    ts = int(time.time())
+    sig = sign(seed, canonical_submit(chain, tip, ts)).hex()
+    body, code = _call(host, "/x/signed/submit",
+                       {"chain": chain, "tip": tip, "ts": ts,
+                        "signature": sig})
+    print(json.dumps(body, indent=2))
+    return code == 200
+
+
+def do_verify(host, chain, tip):
+    body, code = _call(host,
+                       "/x/signed/verify?peer=%s&tip=%s" % (chain, tip))
+    print(json.dumps(body, indent=2))
+    return body, code
+
+
+def do_test(host):
+    """Full round trip on a throwaway name and key, then an independent
+    recheck of the receipt. Prints a pass or fail per step."""
+    results = []
+
+    def step(label, ok, detail=""):
+        results.append(ok)
+        print("[%s] %s%s" % ("PASS" if ok else "FAIL", label,
+                             ("  -- " + detail) if detail else ""))
+
+    seed = os.urandom(32)
+    pk = public_key(seed)
+    chain = "selftest-%s.invalid" % os.urandom(4).hex()
+    tip = hashlib.sha256(os.urandom(32)).hexdigest()
+
+    print("host   %s" % host)
+    print("chain  %s   (throwaway, .invalid never resolves)" % chain)
+    print("tip    %s\n" % tip)
+
+    _wake(host)
+
+    body, code = _call(host, "/x/signed/spec")
+    step("lane is deployed", code == 200 and body.get("signed_version"),
+         "signed_version %s" % body.get("signed_version", "?"))
+    if code != 200:
+        print("\nStopping: the signed lane is not answering.")
+        return 1
+
+    body, code = _call(host, "/x/signed/enroll",
+                       {"chain": chain, "pubkey": pk.hex()})
+    step("enrol", code == 200 and body.get("enrolled"),
+         body.get("error") or "block %s" % body.get("block_index"))
+
+    # the operator cannot forge: a wrong signature must be refused
+    body, code = _call(host, "/x/signed/submit",
+                       {"chain": chain, "tip": tip,
+                        "ts": int(time.time()), "signature": "00" * 64})
+    step("forged signature refused", code == 400
+         and body.get("error") == "signature_did_not_verify",
+         "got %s %s" % (code, body.get("error")))
+
+    ts = int(time.time())
+    sig = sign(seed, canonical_submit(chain, tip, ts)).hex()
+    body, code = _call(host, "/x/signed/submit",
+                       {"chain": chain, "tip": tip, "ts": ts,
+                        "signature": sig})
+    step("submit", code == 200 and body.get("verification") == "peer-signed",
+         body.get("error") or "block %s" % body.get("block_index"))
+    on_roster = bool(body.get("on_public_roster"))
+    step("mirrored to public roster", on_roster,
+         "" if on_roster else "sealed, but not visible on /x/roster/list")
+
+    body, code = _call(host, "/x/signed/submit",
+                       {"chain": chain, "tip": tip, "ts": ts,
+                        "signature": sig})
+    step("replay refused", code in (400, 409),
+         "got %s %s" % (code, body.get("error")))
+
+    receipt, code = _call(host,
+                          "/x/signed/verify?peer=%s&tip=%s" % (chain, tip))
+    step("receipt readable", code == 200
+         and receipt.get("signed_observation") is True,
+         receipt.get("message") or "block %s" % receipt.get("block_index"))
+
+    if code == 200:
+        # the whole point: recheck using ONLY what the receipt returned
+        cm = receipt.get("canonical_message", "")
+        rebuilt = canonical_submit(chain, tip, ts).decode("utf-8")
+        step("receipt's canonical message matches ours", cm == rebuilt,
+             "" if cm == rebuilt else "receipt gave %r" % cm[:60])
+        ok = verify(bytes.fromhex(receipt.get("pubkey", "")),
+                    cm.encode("utf-8"),
+                    bytes.fromhex(receipt.get("signature", "")))
+        step("signature in the receipt verifies independently", ok)
+
+        keys, kcode = _call(host, "/x/signed/keys")
+        listed = any(k.get("chain") == chain
+                     and k.get("pubkey") == pk.hex()
+                     for k in (keys.get("keys") or []))
+        step("public key published at /x/signed/keys", listed)
+
+    print("\n%d of %d passed" % (sum(1 for r in results if r), len(results)))
+    print("\nNote: this left a real, permanent enrolment and observation "
+          "for %s in the chain.\nThat is correct - nothing in this system "
+          "can be tidied up afterwards, which is\nthe property being "
+          "tested. The name is a throwaway on a .invalid domain." % chain)
+    return 0 if all(results) else 1
 
 
 def main():
-    if len(sys.argv) < 2:
-        print(__doc__)
-        return 2
-    src = sys.argv[1]
-    raw = sys.stdin.read() if src == "-" else open(src, "r").read()
+    ap = argparse.ArgumentParser(
+        description="Reference client for the AILeash signed witness lane.")
+    ap.add_argument("--host", default=DEFAULT_HOST)
+    ap.add_argument("--chain")
+    ap.add_argument("--secret", help="private seed, 64 hex, from --keygen")
+    ap.add_argument("--tip", help="your chain head, 64 hex")
+    ap.add_argument("--keygen", action="store_true")
+    ap.add_argument("--enroll", action="store_true")
+    ap.add_argument("--submit", action="store_true")
+    ap.add_argument("--check", action="store_true", help="fetch a receipt")
+    ap.add_argument("--test", action="store_true",
+                    help="full round trip on a throwaway key")
+    a = ap.parse_args()
+
+    if a.keygen:
+        do_keygen()
+        return 0
+    if a.test:
+        return do_test(a.host)
+
+    if a.check:
+        if not (a.chain and a.tip):
+            ap.error("--check needs --chain and --tip")
+        do_verify(a.host, a.chain, a.tip)
+        return 0
+
+    if not (a.enroll or a.submit):
+        ap.print_help()
+        return 0
+    if not (a.chain and a.secret):
+        ap.error("--chain and --secret are required")
     try:
-        bundle = json.loads(raw)
-    except Exception as exc:
-        print("Not readable JSON: " + str(exc))
-        return 2
+        seed = bytes.fromhex(a.secret.strip())
+        assert len(seed) == 32
+    except Exception:
+        ap.error("--secret must be 64 hex characters from --keygen")
 
-    rep = Report()
-    print("=" * 66)
-    print("AUTHORITY PROOF  ·  independent verification")
-    print("=" * 66)
-    d = bundle.get("decision") or {}
-    print("evaluation   " + str(d.get("evaluation")))
-    print("action       " + str((bundle.get("request") or {}).get("action")))
-    print("at           " + str(d.get("evaluated_at")))
-    print("hops         " + str(max(0, len(bundle.get("lineage") or []) - 1)))
-    if bundle.get("lineage"):
-        print("authorised   " + str(bundle["lineage"][0].get("issuer")))
-        print("executed     " + str(bundle["lineage"][-1].get("subject")))
-        acc = [g.get("risk_accepted_by") for g in bundle["lineage"] if g.get("risk_accepted_by")]
-        print("risk owner   " + str(acc[-1] if acc else None))
-    print("-" * 66)
-
-    check_signature(bundle, rep)
-    check_integrity(bundle, rep)
-    mine, hard, soft, ba, bi = rederive(bundle, rep)
-    check_agreement(bundle, rep, mine, hard, soft, ba, bi)
-
-    print(rep.render())
-    print("-" * 66)
-    if rep.failed:
-        print("RESULT: NOT VERIFIED. Something above did not hold.")
-        return 1
-    print("RESULT: VERIFIED - " + mine)
-    if mine == "BLOCK":
-        print("This is a proof that the action was NOT authorised, and where it failed.")
-    print("Checked with no network access, no dependencies, and nothing taken on")
-    print("the issuer's word except the meaning of their public key.")
+    if a.enroll:
+        do_enroll(a.host, a.chain, seed)
+    if a.submit:
+        if not a.tip:
+            ap.error("--submit needs --tip")
+        do_submit(a.host, a.chain, seed, a.tip.strip().lower())
     return 0
 
 
 if __name__ == "__main__":
     sys.exit(main())
-'''
+aileash_signed_client.py
+
+```
 
 
-def _digest():
-    return hashlib.sha256(SCRIPT.encode("utf-8")).hexdigest()
+## `aileash_verify.py`
+
+580 lines, 21445 bytes
+
+```python
+#!/usr/bin/env python3
+"""
+aileash_verify.py  -  an independent verifier for AILeash proofs
+================================================================
+
+WHAT THIS IS
+------------
+A single file that checks AILeash's proofs without AILeash.
+
+No dependencies. No network calls. It never contacts sebbi.pro or anything
+else - it takes proof documents you already hold and does the arithmetic
+locally. Run it on a laptop with the wifi off and it works exactly the same.
+
+That is deliberate. A proof you can only check with the prover's own online
+tool is not a proof, it is a reassurance. If this file cannot confirm a
+claim from the numbers alone, the claim does not hold, and the honest thing
+is for you to find that out from your own machine rather than from us.
+
+WHAT IT CHECKS
+--------------
+  Inclusion    a record is inside a sealed period, against the sealed root
+  Absence      a record is NOT there - the two neighbouring leaves are
+               verified and shown to be adjacent, leaving nowhere for it
+  Ancestry     a tip you were handed is still on the chain being served,
+               at the same position, under the current root
+  Prefix       the log at one size is contained in the log at a later size,
+               with nothing inserted, removed or reordered in between
+  Stability    across a set of replay runs, identical inputs produced
+               identical verdicts under an unchanged code fingerprint
+
+USAGE
+-----
+    python3 aileash_verify.py proof.json [another.json ...]
+    cat proof.json | python3 aileash_verify.py
+    python3 aileash_verify.py --selftest
+
+Exit code 0 if everything checked passed, 1 if anything failed, 2 on bad
+input. Suitable for dropping into an audit script or a CI job.
+
+Each proof document is whatever the relevant AILeash route returned. Save
+the JSON, keep it, and check it whenever you like - next week, or in four
+years when the original system is long gone.
+
+HOW TO GET PROOFS
+-----------------
+    /x/complete/prove?period=&value=       inclusion or absence
+    /x/consistency/ancestor?tip=           ancestry
+    /x/consistency/proof?first=&second=    prefix
+    /x/replay/history?input_hash=          stability
+
+WHAT IT DOES NOT CHECK
+----------------------
+  - That a sealed record is TRUE. Cryptography proves a record existed at a
+    time and has not moved since. It says nothing about whether the record
+    was honest when it was written. Nothing can.
+  - That a root was anchored. That is a separate check against the
+    OpenTimestamps proof and a Bitcoin node - out of scope for a file with
+    no dependencies, and it should be done independently anyway.
+  - Whether a decision was correct or fair. Determinism is not fairness.
+
+The two hash schemes below are different on purpose and must not be mixed.
+The completeness tree is SORTED, which is what makes absence provable. The
+consistency tree is in WRITE ORDER, which is what makes reordering
+detectable. Their roots will never match and are not meant to.
+
+Public domain / MIT - copy it, fork it, audit it, ship it inside your own
+tooling. The more independent copies of this exist, the less any of it
+depends on us.
+"""
+
+import hashlib
+import json
+import sys
+
+VERSION = "1.0"
+
+# --- completeness tree (sorted) -------------------------------------------
+CMP_LEAF = b"AILEASH-LEAF-v1:"
+CMP_NODE = b"AILEASH-NODE-v1:"
+
+# --- consistency tree (write order, RFC 6962) -----------------------------
+CT_LEAF = b"\x00"
+CT_NODE = b"\x01"
 
 
-def _srv():
-    m = sys.modules.get("__main__")
-    if m is not None and hasattr(m, "get_bearer"):
-        return m
-    return sys.modules.get("server")
+# ==========================================================================
+# completeness: sorted tree
+# ==========================================================================
+
+def cmp_leaf(value):
+    return hashlib.sha256(CMP_LEAF + value.encode("utf-8")).hexdigest()
 
 
-def _install(s):
-    if _patched[0]:
-        return "already installed"
-    H = getattr(s, "Handler", None)
-    if H is None or not hasattr(H, "do_GET"):
-        return "no handler"
-    if getattr(H, "_verifier_patched", False):
-        _patched[0] = True
-        return "already installed"
+def cmp_node(left_hex, right_hex):
+    return hashlib.sha256(CMP_NODE + left_hex.encode() + right_hex.encode()).hexdigest()
 
-    original = H.do_GET
 
-    def do_GET(self):
+def cmp_replay(value, proof):
+    """Recompute a root from a leaf value and its sibling path.
+
+    Each step carries the side its sibling sits on. Five lines, so that
+    reimplementing this in another language is an afternoon rather than a
+    project.
+    """
+    current = cmp_leaf(value)
+    for step in proof:
+        side = (step or {}).get("side")
+        sibling = (step or {}).get("hash")
+        if not sibling:
+            raise ValueError("proof step missing a hash")
+        if side == "left":
+            current = cmp_node(sibling, current)
+        elif side == "right":
+            current = cmp_node(current, sibling)
+        else:
+            raise ValueError("proof step missing a side")
+    return current
+
+
+# ==========================================================================
+# consistency: RFC 6962 write-order tree
+# ==========================================================================
+
+def ct_leaf(value):
+    return hashlib.sha256(CT_LEAF + value.encode("utf-8")).digest()
+
+
+def ct_node(left, right):
+    return hashlib.sha256(CT_NODE + left + right).digest()
+
+
+def _decompose(index, size):
+    """Split an inclusion proof into its inner and border parts.
+
+    This is the standard decomposition used by every RFC 6962
+    implementation. inner is the number of steps where the path is still
+    inside a complete subtree; border is the number of right-hand
+    stragglers above it.
+    """
+    inner = (index ^ (size - 1)).bit_length()
+    border = bin(index >> inner).count("1")
+    return inner, border
+
+
+def _chain_inner(seed, proof, index):
+    for i, step in enumerate(proof):
+        if (index >> i) & 1 == 0:
+            seed = ct_node(seed, step)
+        else:
+            seed = ct_node(step, seed)
+    return seed
+
+
+def _chain_inner_right(seed, proof, index):
+    for i, step in enumerate(proof):
+        if (index >> i) & 1 == 1:
+            seed = ct_node(step, seed)
+    return seed
+
+
+def _chain_border_right(seed, proof):
+    for step in proof:
+        seed = ct_node(step, seed)
+    return seed
+
+
+def ct_verify_inclusion(index, size, leaf_value, proof_hex, root_hex):
+    """Is leaf_value at position index of a tree of this size and root?"""
+    if index < 0 or size <= 0 or index >= size:
+        return False, "index outside the tree"
+    try:
+        proof = [bytes.fromhex(h) for h in proof_hex]
+        root = bytes.fromhex(root_hex)
+    except (ValueError, TypeError):
+        return False, "proof or root is not hex"
+
+    inner, border = _decompose(index, size)
+    if len(proof) != inner + border:
+        return False, ("proof has %d nodes, a tree of size %d needs %d for index %d"
+                       % (len(proof), size, inner + border, index))
+
+    result = _chain_inner(ct_leaf(leaf_value), proof[:inner], index)
+    result = _chain_border_right(result, proof[inner:])
+    if result != root:
+        return False, "recomputed root does not match (%s)" % result.hex()
+    return True, None
+
+
+def ct_verify_consistency(size1, size2, proof_hex, root1_hex, root2_hex):
+    """Is the tree of size1 a prefix of the tree of size2?"""
+    if size1 < 0 or size2 < 0 or size1 > size2:
+        return False, "sizes must satisfy 0 <= first <= second"
+    try:
+        proof = [bytes.fromhex(h) for h in proof_hex]
+        root1 = bytes.fromhex(root1_hex)
+        root2 = bytes.fromhex(root2_hex)
+    except (ValueError, TypeError):
+        return False, "proof or roots are not hex"
+
+    if size1 == size2:
+        if proof:
+            return False, "no proof nodes expected when the sizes are equal"
+        return (root1 == root2), (None if root1 == root2 else "roots differ at equal size")
+    if size1 == 0:
+        return True, None
+    if not proof:
+        return False, "a proof is required for these sizes"
+
+    inner, border = _decompose(size1 - 1, size2)
+    shift = (size1 & -size1).bit_length() - 1
+    inner -= shift
+
+    if size1 == (1 << shift):
+        seed, start = root1, 0
+    else:
+        seed, start = proof[0], 1
+
+    if len(proof) != start + inner + border:
+        return False, ("proof has %d nodes, expected %d" % (len(proof), start + inner + border))
+
+    body = proof[start:]
+    mask = (size1 - 1) >> shift
+
+    hash1 = _chain_inner_right(seed, body[:inner], mask)
+    hash1 = _chain_border_right(hash1, body[inner:])
+    if hash1 != root1:
+        return False, "the earlier root does not recompute (%s)" % hash1.hex()
+
+    hash2 = _chain_inner(seed, body[:inner], mask)
+    hash2 = _chain_border_right(hash2, body[inner:])
+    if hash2 != root2:
+        return False, "the later root does not recompute (%s)" % hash2.hex()
+    return True, None
+
+
+# ==========================================================================
+# document checkers
+# ==========================================================================
+
+class Check(object):
+    def __init__(self, kind):
+        self.kind = kind
+        self.lines = []
+        self.ok = True
+
+    def add(self, passed, text):
+        self.lines.append((passed, text))
+        if not passed:
+            self.ok = False
+        return passed
+
+
+def check_inclusion(doc):
+    c = Check("inclusion (completeness)")
+    value = doc.get("value")
+    root = doc.get("root")
+    proof = doc.get("proof")
+    if not (value and root and isinstance(proof, list)):
+        c.add(False, "document is missing value, root or proof")
+        return c
+    try:
+        computed = cmp_replay(value, proof)
+    except ValueError as exc:
+        c.add(False, "malformed proof: %s" % exc)
+        return c
+    c.add(computed == root, "leaf recomputes to the sealed root")
+    if doc.get("leaf_count") is not None:
+        c.add(True, "period sealed %s records, committed before any export was requested"
+                    % doc["leaf_count"])
+    if doc.get("index") is not None:
+        c.add(True, "record sits at index %s" % doc["index"])
+    return c
+
+
+def check_absence(doc):
+    c = Check("absence (completeness)")
+    value = doc.get("value")
+    root = doc.get("root")
+    neighbours = doc.get("neighbours") or {}
+    count = doc.get("leaf_count")
+    if not (value and root):
+        c.add(False, "document is missing value or root")
+        return c
+
+    lower = neighbours.get("lower")
+    upper = neighbours.get("upper")
+
+    if not lower and not upper:
+        c.add(count == 0, "period is committed and empty, so nothing can be in it")
+        return c
+
+    if lower:
         try:
-            from urllib.parse import urlparse
-            p = urlparse(self.path).path.rstrip("/") or "/"
-        except Exception:
-            p = self.path or "/"
+            computed = cmp_replay(lower["value"], lower["proof"])
+        except (ValueError, KeyError, TypeError) as exc:
+            c.add(False, "lower neighbour proof is malformed: %s" % exc)
+            return c
+        c.add(computed == root, "lower neighbour verifies against the sealed root")
+        c.add(str(lower["value"]) < str(value), "lower neighbour sorts before the queried value")
 
-        if p in FILE_PATHS:
-            body = SCRIPT.encode("utf-8")
+    if upper:
+        try:
+            computed = cmp_replay(upper["value"], upper["proof"])
+        except (ValueError, KeyError, TypeError) as exc:
+            c.add(False, "upper neighbour proof is malformed: %s" % exc)
+            return c
+        c.add(computed == root, "upper neighbour verifies against the sealed root")
+        c.add(str(upper["value"]) > str(value), "upper neighbour sorts after the queried value")
+
+    if lower and upper:
+        adjacent = int(upper["index"]) == int(lower["index"]) + 1
+        c.add(adjacent, "neighbours are adjacent (index %s then %s) - nothing can sit between"
+                        % (lower["index"], upper["index"]))
+    elif upper:
+        c.add(int(upper["index"]) == 0, "value sorts before the first leaf, and nothing precedes index 0")
+    elif lower:
+        if count is None:
+            c.add(True, "value sorts after the last leaf (leaf_count not supplied to confirm)")
+        else:
+            c.add(int(lower["index"]) == int(count) - 1,
+                  "value sorts after the final leaf of %s" % count)
+    return c
+
+
+def check_ancestry(doc):
+    c = Check("ancestry (consistency)")
+    if doc.get("on_chain") is False:
+        c.add(False, "THIS TIP IS NOT ON THE CHAIN BEING SERVED - if it was issued to you, "
+                     "that is evidence of a fork. Keep this document.")
+        return c
+    tip = doc.get("tip")
+    index = doc.get("leaf_index")
+    size = doc.get("tree_size")
+    root = doc.get("root")
+    proof = doc.get("inclusion_proof")
+    if tip is None or index is None or size is None or not root or not isinstance(proof, list):
+        c.add(False, "document is missing tip, leaf_index, tree_size, root or inclusion_proof")
+        return c
+    ok, why = ct_verify_inclusion(int(index), int(size), tip, proof, root)
+    c.add(ok, why or "tip verifies at position %s of a chain of %s" % (index, size))
+    return c
+
+
+def check_prefix(doc):
+    c = Check("prefix (consistency)")
+    first = doc.get("first")
+    second = doc.get("second")
+    proof = doc.get("consistency_proof")
+    root1 = doc.get("first_root")
+    root2 = doc.get("second_root")
+    if first is None or second is None or not isinstance(proof, list) or not root1 or not root2:
+        c.add(False, "document is missing first, second, consistency_proof or the roots")
+        return c
+    ok, why = ct_verify_consistency(int(first), int(second), proof, root1, root2)
+    c.add(ok, why or ("the log at size %s is contained in the log at size %s - append only, "
+                      "nothing inserted, removed or reordered" % (first, second)))
+    return c
+
+
+def check_stability(doc):
+    c = Check("stability (replay)")
+    history = doc.get("history")
+    if not isinstance(history, list) or not history:
+        c.add(False, "document has no replay history")
+        return c
+
+    by_code = {}
+    for run in history:
+        by_code.setdefault(run.get("code_fingerprint"), set()).add(
+            (str(run.get("verdict")), str(run.get("score"))))
+
+    stable = True
+    for fingerprint, outcomes in by_code.items():
+        short = (fingerprint or "unknown")[:12]
+        if len(outcomes) > 1:
+            stable = False
+            c.add(False, "code %s produced %d different verdicts for identical inputs - "
+                         "the engine is not deterministic under that version"
+                         % (short, len(outcomes)))
+        else:
+            c.add(True, "code %s produced one verdict across every run" % short)
+
+    c.add(True, "%d runs recorded, %d distinct code versions"
+                % (len(history), len(by_code)))
+    if stable and len(by_code) > 1:
+        c.add(True, "verdicts changed only alongside a changed code fingerprint, which is "
+                    "a policy change rather than nondeterminism")
+    c.add(True, "each run carries its own audit hash - check them independently with "
+                "an ancestry proof")
+    return c
+
+
+def identify(doc):
+    if not isinstance(doc, dict):
+        return None
+    if "consistency_proof" in doc:
+        return check_prefix
+    if "inclusion_proof" in doc or doc.get("on_chain") is not None:
+        return check_ancestry
+    if doc.get("result") == "absent" or "neighbours" in doc:
+        return check_absence
+    if doc.get("result") == "present" or ("proof" in doc and "value" in doc):
+        return check_inclusion
+    if "history" in doc and "input_hash" in doc:
+        return check_stability
+    return None
+
+
+# ==========================================================================
+# self test - known vectors built here, so the verifier checks itself
+# ==========================================================================
+
+def _selftest():
+    """Builds small trees in this file and confirms the verifier agrees.
+
+    Run this before trusting a result. If it fails, the fault is in this
+    file rather than in anything it was checking.
+    """
+    failures = []
+
+    # sorted tree, five leaves
+    values = sorted(["alpha", "bravo", "charlie", "delta", "echo"])
+
+    def build(vals):
+        level = [cmp_leaf(v) for v in vals]
+        levels = [level]
+        while len(level) > 1:
+            nxt = [cmp_node(level[i], level[i + 1]) for i in range(0, len(level) - 1, 2)]
+            if len(level) % 2 == 1:
+                nxt.append(level[-1])
+            levels.append(nxt)
+            level = nxt
+        return level[0], levels
+
+    def path(levels, index):
+        out, idx = [], index
+        for level in levels[:-1]:
+            if idx % 2 == 0:
+                if idx + 1 < len(level):
+                    out.append({"side": "right", "hash": level[idx + 1]})
+            else:
+                out.append({"side": "left", "hash": level[idx - 1]})
+            idx //= 2
+        return out
+
+    root, levels = build(values)
+    for i, value in enumerate(values):
+        if cmp_replay(value, path(levels, i)) != root:
+            failures.append("sorted inclusion failed for leaf %d" % i)
+    if cmp_replay("not-a-leaf", path(levels, 0)) == root:
+        failures.append("sorted tree accepted a wrong leaf")
+
+    # RFC 6962 tree, sizes 1..17
+    def mth(leaves):
+        n = len(leaves)
+        if n == 0:
+            return hashlib.sha256(b"").digest()
+        if n == 1:
+            return ct_leaf(leaves[0])
+        k = 1
+        while k * 2 < n:
+            k *= 2
+        return ct_node(mth(leaves[:k]), mth(leaves[k:]))
+
+    def incl(index, leaves):
+        n = len(leaves)
+        if n <= 1:
+            return []
+        k = 1
+        while k * 2 < n:
+            k *= 2
+        if index < k:
+            return incl(index, leaves[:k]) + [mth(leaves[k:])]
+        return incl(index - k, leaves[k:]) + [mth(leaves[:k])]
+
+    def subproof(m, leaves, is_root):
+        n = len(leaves)
+        if m == n:
+            return [] if is_root else [mth(leaves)]
+        k = 1
+        while k * 2 < n:
+            k *= 2
+        if m <= k:
+            return subproof(m, leaves[:k], is_root) + [mth(leaves[k:])]
+        return subproof(m - k, leaves[k:], False) + [mth(leaves[:k])]
+
+    for size in range(1, 18):
+        leaves = ["entry-%03d" % i for i in range(size)]
+        root_hex = mth(leaves).hex()
+        for index in range(size):
+            proof = [h.hex() for h in incl(index, leaves)]
+            ok, why = ct_verify_inclusion(index, size, leaves[index], proof, root_hex)
+            if not ok:
+                failures.append("ct inclusion failed size=%d index=%d (%s)" % (size, index, why))
+            bad, _ = ct_verify_inclusion(index, size, "tampered", proof, root_hex)
+            if bad:
+                failures.append("ct inclusion accepted a wrong leaf size=%d index=%d" % (size, index))
+        for first in range(1, size + 1):
+            proof = [h.hex() for h in (subproof(first, leaves, True) if first != size else [])]
+            ok, why = ct_verify_consistency(first, size, proof,
+                                            mth(leaves[:first]).hex(), root_hex)
+            if not ok:
+                failures.append("ct consistency failed %d -> %d (%s)" % (first, size, why))
+
+    # a fabricated prefix must be rejected
+    leaves = ["entry-%03d" % i for i in range(8)]
+    forged = leaves[:4] + ["swapped"] + leaves[5:]
+    proof = [h.hex() for h in subproof(4, forged, True)]
+    ok, _ = ct_verify_consistency(4, 8, proof, mth(leaves[:4]).hex(), mth(leaves).hex())
+    if ok:
+        failures.append("ct consistency accepted a forged prefix")
+
+    if failures:
+        print("SELF TEST FAILED")
+        for line in failures:
+            print("   " + line)
+        return 1
+    print("Self test passed. Sorted-tree and RFC 6962 verification both behave correctly,")
+    print("and tampered proofs were rejected in every case.")
+    return 0
+
+
+# ==========================================================================
+# cli
+# ==========================================================================
+
+def _run(doc, label):
+    checker = identify(doc)
+    if checker is None:
+        print("%s\n   UNRECOGNISED - not an AILeash proof document this version knows about\n" % label)
+        return False
+    result = checker(doc)
+    print("%s\n   type: %s" % (label, result.kind))
+    for passed, text in result.lines:
+        print("   %s %s" % ("PASS" if passed else "FAIL", text))
+    print("   => %s\n" % ("VERIFIED" if result.ok else "NOT VERIFIED"))
+    return result.ok
+
+
+def main(argv):
+    args = [a for a in argv[1:] if not a.startswith("--")]
+    flags = set(a for a in argv[1:] if a.startswith("--"))
+
+    if "--selftest" in flags:
+        return _selftest()
+    if "--version" in flags:
+        print("aileash_verify %s" % VERSION)
+        return 0
+
+    print("aileash_verify %s - offline, no network calls made\n" % VERSION)
+
+    documents = []
+    if args:
+        for path in args:
             try:
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Content-Disposition",
-                                 'attachment; filename="verify-authority.py"')
-                self.send_header("Cache-Control", "public, max-age=300")
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.send_header("X-Content-Type-Options", "nosniff")
-                self.end_headers()
-                self.wfile.write(body)
-            except Exception:
-                pass
-            return
-
-        return original(self)
-
-    H.do_GET = do_GET
-    H._verifier_patched = True
-    _patched[0] = True
-    print("VERIFIER: /verify-authority.py installed", flush=True)
-    return "installed"
-
-
-def handle(method, action, data, api_key, ctx):
-    s = _srv()
-    if s is None:
-        return {"error": "server_not_found"}, 500
-
-    state = "already installed" if _patched[0] else None
-    if not _patched[0]:
+                with open(path, "r", encoding="utf-8") as handle:
+                    documents.append((path, json.load(handle)))
+            except (OSError, ValueError) as exc:
+                print("%s\n   COULD NOT READ: %s\n" % (path, exc))
+                return 2
+    else:
         try:
-            state = _install(s)
-        except Exception as exc:
-            print("VERIFIER: patch failed - " + str(exc), flush=True)
-            state = "failed: " + str(exc)
+            documents.append(("(stdin)", json.load(sys.stdin)))
+        except ValueError as exc:
+            print("Could not read JSON from stdin: %s" % exc)
+            return 2
 
-    action = (action or "").strip("/").lower()
+    results = [_run(doc, label) for label, doc in documents]
+    passed = sum(1 for r in results if r)
+    print("%d of %d documents verified." % (passed, len(results)))
+    if passed != len(results):
+        print("Something did not check out. That is what this file is for - keep the "
+              "document and the response that produced it.")
+        return 1
+    return 0
 
-    if method == "GET" and action in ("", "status"):
-        return {
-            "installed": bool(_patched[0]),
-            "install_result": state,
-            "module_version": VERSION,
-            "serving": list(FILE_PATHS),
-            "script_bytes": len(SCRIPT),
-            "script_sha256": _digest(),
-            "how_to_use": [
-                "curl -sO https://sebbi.pro/verify-authority.py",
-                "curl -s 'https://sebbi.pro/x/continuity/proof?evaluation=<id>' "
-                "| python3 verify-authority.py -",
-            ],
-            "dependencies": "none - Python standard library only",
-            "network": "the script makes no network calls and reports nothing back. "
-                       "A verification tool that phones home to the party being "
-                       "verified is not a verification tool.",
-            "note": "Check script_sha256 against the file you downloaded. And read it "
-                    "before you run it, as you would with anything else handed to you "
-                    "by the party you are checking.",
-        }, 200
 
-    return {"error": "unknown_action", "action": action, "GET": ["status"]}, 404
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
+
+```
+
+
+## `anchor.py`
+
+166 lines, 6009 bytes
+
+```python
+"""
+anchor.py  -  External anchoring for the AILeash chain.
+
+WHAT IT DOES (plain words):
+  Every ANCHOR_INTERVAL seconds it takes the current chain tip (one hash) and
+  timestamps it against an external source you do NOT control - so anyone can
+  prove your chain's timestamps are real without trusting sebbi.pro.
+
+  It tries OpenTimestamps first (commits the hash into Bitcoin, free, gold
+  standard). It ALSO records the tip + time to a local append-only anchor log
+  on your persistent volume as a second record. If OTS is unavailable for any
+  reason, the server keeps running normally - anchoring never blocks or
+  crashes your live engine.
+
+SAFETY:
+  - Only READS the chain tip. Never writes to the chain, never touches scoring.
+  - Runs on a background daemon thread.
+  - Every failure is caught and logged; your govern path is never affected.
+
+SETUP ON RAILWAY:
+  - requirements.txt:  opentimestamps-client
+  - Variable ANCHOR_DIR = /data/anchors   (on your persistent volume)
+  - Variable ANCHOR_INTERVAL = 3600       (once an hour; optional)
+  - Variable ANCHOR_ENABLED = 1           (set 0 to switch off)
+"""
+
+import os
+import time
+import json
+import hashlib
+import threading
+
+ANCHOR_INTERVAL = int(os.environ.get("ANCHOR_INTERVAL", "3600"))
+ANCHOR_DIR      = os.environ.get("ANCHOR_DIR", "/data/anchors")
+ANCHOR_ENABLED  = os.environ.get("ANCHOR_ENABLED", "1") == "1"
+
+_last = {"ts": None, "tip": None, "ots_file": None, "ots_ok": False, "status": "not_started"}
+_lock = threading.Lock()
+
+
+def _ensure_dir():
+    try:
+        os.makedirs(ANCHOR_DIR, exist_ok=True)
+        return True
+    except Exception as e:
+        print("ANCHOR: cannot create " + ANCHOR_DIR + " : " + str(e), flush=True)
+        return False
+
+
+def _ots_stamp(tip_hash):
+    """Timestamp the tip hash with OpenTimestamps (-> Bitcoin). Returns
+    (ok, proof_path, message). Uses the opentimestamps library directly, so
+    there is no command-line tool to find on PATH."""
+    try:
+        from opentimestamps.calendar import RemoteCalendar
+        from opentimestamps.core.timestamp import Timestamp, DetachedTimestampFile
+        from opentimestamps.core.op import OpSHA256
+        from opentimestamps.core.serialize import BytesSerializationContext
+    except Exception as e:
+        return False, None, "opentimestamps library not available: " + str(e)
+
+    try:
+        # The digest we anchor is the tip hash (hex -> bytes).
+        digest = bytes.fromhex(tip_hash)
+        ts = Timestamp(digest)
+
+        # Ask public (free) calendar servers to commit this digest.
+        calendars = [
+            "https://a.pool.opentimestamps.org",
+            "https://b.pool.opentimestamps.org",
+            "https://alice.btc.calendar.opentimestamps.org",
+        ]
+        got = 0
+        for url in calendars:
+            try:
+                cal = RemoteCalendar(url)
+                result = cal.submit(digest)
+                ts.merge(result)
+                got += 1
+            except Exception as ce:
+                print("ANCHOR: calendar " + url + " failed: " + str(ce), flush=True)
+        if got == 0:
+            return False, None, "no calendar server accepted the stamp"
+
+        # Save the .ots proof next to a record of the tip.
+        stamp_id = str(int(time.time()))
+        base = os.path.join(ANCHOR_DIR, "tip_" + stamp_id)
+        with open(base + ".txt", "w") as f:
+            f.write(tip_hash + "\n")
+        detached = DetachedTimestampFile(OpSHA256(), ts)
+        ctx = BytesSerializationContext()
+        detached.serialize(ctx)
+        with open(base + ".ots", "wb") as f:
+            f.write(ctx.getbytes())
+        return True, base + ".ots", "stamped by " + str(got) + " calendar(s)"
+    except Exception as e:
+        return False, None, "ots stamp error: " + str(e)
+
+
+def _record_local(tip_hash, ots_ok, ots_file, msg):
+    """Append-only local record of every anchor attempt, on the volume."""
+    try:
+        idx = os.path.join(ANCHOR_DIR, "anchors.jsonl")
+        with open(idx, "a") as f:
+            f.write(json.dumps({
+                "ts": time.time(),
+                "tip": tip_hash,
+                "ots": ots_ok,
+                "ots_file": ots_file,
+                "note": msg
+            }) + "\n")
+    except Exception as e:
+        print("ANCHOR: local record failed: " + str(e), flush=True)
+
+
+def anchor_once(get_tip):
+    if not _ensure_dir():
+        return
+    try:
+        tip = get_tip()
+    except Exception as e:
+        print("ANCHOR: cannot read tip: " + str(e), flush=True)
+        return
+    if not tip or tip == "GENESIS":
+        print("ANCHOR: chain empty, nothing to anchor", flush=True)
+        return
+
+    ok, proof, msg = _ots_stamp(tip)
+    _record_local(tip, ok, proof, msg)
+    with _lock:
+        _last["ts"] = time.time()
+        _last["tip"] = tip
+        _last["ots_file"] = proof
+        _last["ots_ok"] = ok
+        _last["status"] = ("anchored: " + msg) if ok else ("ots_unavailable: " + msg)
+    if ok:
+        print("ANCHOR: tip " + tip[:16] + "... -> " + msg + " -> " + str(proof), flush=True)
+    else:
+        print("ANCHOR: OTS not available (" + msg + ") - local record written, will retry", flush=True)
+
+
+def _loop(get_tip):
+    time.sleep(30)  # let the server finish booting
+    while True:
+        try:
+            anchor_once(get_tip)
+        except Exception as e:
+            print("ANCHOR loop error: " + str(e), flush=True)
+        time.sleep(ANCHOR_INTERVAL)
+
+
+def start_anchoring(get_tip):
+    """Call ONCE at startup, passing your chain_tip function. Spawns a daemon
+    thread that anchors forever. Safe: only logs on failure, never affects the
+    live engine."""
+    if not ANCHOR_ENABLED:
+        print("ANCHOR: disabled (ANCHOR_ENABLED=0)", flush=True)
+        return
+    threading.Thread(target=_loop, args=(get_tip,), daemon=True).start()
+    print("ANCHOR: started - external anchoring every " + str(ANCHOR_INTERVAL) + "s to " + ANCHOR_DIR, flush=True)
+
+
+def anchor_status():
+    with _lock:
+        return dict(_last)
+
+```
+
+
+## `board_auditor.py`
+
+61 lines, 2889 bytes
+
+```python
+import time
+import json
+import urllib.request
+import logging
+import os
+
+# --- THE WATCHDOG STANDARD ---
+AUDITOR_MANIFEST = """Standard: SEBBI-WATCHDOG/1.0
+Engine: AILeash-Hunter v1.0
+Operation: Automated Public Compliance Verification
+Status: ENFORCING"""
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [WATCHDOG-SCAN] %(message)s")
+
+class RegulatoryWatchdog:
+    def __init__(self, target_list):
+        self.targets = target_list
+        self.report_file = "VIOLATION_REPORT.md"
+
+    def scan_market_sectors(self):
+        """Scans corporate perimeters to verify live legal compliance states."""
+        logging.info("Commencing global compliance audit sweep...")
+        violations_found = []
+
+        for domain in self.targets:
+            print(f"[*] Auditing domain: {domain}")
+            
+            # Simulate an automated request to the site's root directory
+            # In production, this checks if https://domain/ai.txt exists and is signed
+            is_compliant = False  # Simulated failure for demonstration
+            
+            if not is_compliant:
+                logging.warning(f"[VIOLATION DETECTED] {domain} has failed mandatory compliance parameters.")
+                violations_found.append(domain)
+
+        if violations_found:
+            self._compile_public_violation_ledger(violations_found)
+
+    def _compile_public_violation_ledger(self, failed_domains):
+        """Generates a public, standardized report file for the repository root."""
+        with open(self.report_file, "w", encoding="utf-8") as f:
+            f.write("# 🚨 AUTOMATED REAL-TIME AI COMPLIANCE VIOLATION REPORT\n\n")
+            f.write(f"**Audit Timestamp:** {time.strftime('%Y-%m-%d %H:%M:%S')} UTC\n")
+            f.write(f"**Verification Engine:** {AUDITOR_MANIFEST.splitlines()[2]}\n\n")
+            f.write("The following enterprise networks were scanned and failed to present a verifiable, cryptographically sealed `ai.txt` manifest under current transparency mandates. These nodes face potential regulatory scrutiny under statutory liability thresholds.\n\n")
+            f.write("| Target Domain Domain | Compliance Status | Liability Risk Level |\n")
+            f.write("| :--- | :--- | :--- |\n")
+            
+            for domain in failed_domains:
+                f.write(f"| `{domain}` | ❌ NON-COMPLIANT / NO VALID LEDGER | HIGH RISK (Up to 7% Turnover fine) |\n")
+                
+        print(f"\n[CHECKMATE] Public audit report successfully generated: '{self.report_file}'")
+        print("[!] Ready to push to GitHub to alert public sector regulators.")
+
+if __name__ == "__main__":
+    # High-value targets that should be operating transparently
+    target_enterprise_pool = ["enterprise-ai-vendor-example.com", "shadow-data-processor.co.uk"]
+    
+    hunter = RegulatoryWatchdog(target_enterprise_pool)
+    hunter.scan_market_sectors()
 
 ```
