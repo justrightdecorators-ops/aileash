@@ -1,2317 +1,1027 @@
-# Codebase — part 12 of 28
+# Codebase — part 12 of 30
 
 Contains:
-- `modules/tokensaver.py`
-- `modules/verifier.py`
+- `modules/selfcheck.py`
+- `modules/signed.py`
 
 
-## `modules/tokensaver.py`
+## `modules/selfcheck.py`
 
-1670 lines, 64529 bytes
+1091 lines, 45976 bytes
 
 ```python
 #!/usr/bin/env python3
 """
-modules/tokensaver.py  v2.0.0
-sebbi.pro - the token saver
+modules/selfcheck.py  -  the conformance runner, served as a page
 
-Reached at /x/tokensaver/<action>.
+WHY THIS IS A MODULE AND NOT A FILE IN ROOT
+-------------------------------------------
+A plain .html in the repo root does not get served on this deployment, so
+the page ships inside the module and is served by the same runtime do_GET
+patch that console.py uses for /console and network.py uses for /witness.
+It also means the page cannot drift from the module that serves it.
 
-WHAT IT IS
-----------
-A deterministic gate that sits in front of a model and decides, in
-arithmetic alone, whether a request is answered from store, sent to the
-model, sent to a cheaper one, held for a person, or refused.
+WHAT THE PAGE DOES
+------------------
+Reads /.well-known/ordering-test.json, then runs every check the document
+declares, in the order the document declares them. It discovers what it
+needs as it goes: a committed period from /x/complete/periods, a tree size
+from /x/consistency/root, a probe value that is not in the log.
 
-It also tells the caller, on every single request, exactly what in that
-request is costing money that it does not need to cost.
+It reports four outcomes and is deliberately mean about which is which:
 
-Every decision seals into the platform chain. The saving is a receipt,
-not a claim.
+  VERIFIED       the response was checked for what the claim requires -
+                 consecutive leaf indices for absence, a proof path for
+                 consistency, identical verdicts for reproducibility
+  INCONCLUSIVE   the endpoint answered but the semantics were not checked,
+                 or the route is POST-only, or the check is key-gated
+  FAILED         published as publicly demonstrable and the endpoint is
+                 not there. This is the number that matters
+  NOT SUPPORTED  the document does not claim it
 
-HOW IT IS BUILT
----------------
-Three layers, in this order, because a cost gate that depends entirely
-on tuned weights is a cost gate nobody can defend in a meeting.
+Reachable is not the same as verified, and this page never counts one as
+the other. A runner that only ever passes has not been tested.
 
-  Layer 1  HARD RULES
-           Absolute, arithmetic, untunable. A budget that is spent is
-           spent. A request repeating identically eight times is a
-           runaway. These do not consult the score at all.
-
-  Layer 2  THE SCORE
-           Nine weighted signals summing to exactly 1.00, split into
-           the ones that measure what this request will SPEND and the
-           ones that measure whether that spend is WASTE.
-
-  Layer 3  FINDINGS
-           Named, itemised waste inside the request, each with a token
-           figure attached and each marked exact or estimated. This is
-           the part that saves the most money, because it changes what
-           the caller sends next time.
-
-THREE TIERS OF CERTAINTY, NEVER MIXED
--------------------------------------
-  tokens_not_bought          EXACT. Provider-reported counts on a
-                             request that was served from store.
-                             This is the only number that goes in a
-                             savings total.
-
-  worst_case_tokens_avoided  A CEILING, not a saving. When a request
-                             is refused, max_tokens tells you the most
-                             it could have cost. Reported separately
-                             and never added to the exact figure.
-
-  findings tokens            ESTIMATED where marked. Character counts
-                             divided by four. Never enters any total.
-
-Nothing on this page is ever expressed as a percentage saved.
-
-WHAT IT DOES NOT DO
+NOT A SHARED RUNNER
 -------------------
-- It never calls a model to reach a decision. Every signal is
-  arithmetic on the request itself.
-- It only serves a stored answer for an IDENTICAL request. Matching
-  similar prompts needs an embedding, which is a model call, which
-  would defeat the entire point.
-- It does not judge whether a stored answer is still correct.
-- It does not store answers to requests that asked for varied output,
-  unless the caller overrides that deliberately.
+It tests one side. The discovery document's runner field stays null until
+the checks are jointly agreed with the other mirror, and publishing this as
+though it were the agreed conformance test would claim something neither
+operator has earned. Served unlinked and noindex for that reason.
 
-MODULE CONTRACT
----------------
-handle(method, action, data, api_key, ctx) -> (dict, status)
-PUBLIC is a set of (METHOD, action) tuples.
-ctx exposes conn, lock and seal.
+    GET /self-check          the page
+    GET /x/selfcheck/status  what is installed
 """
 
-import hashlib
-import inspect
-import json
-import math
-import sqlite3
-import threading
-import time
-
-VERSION = "2.2.0"
-
-PUBLIC = {
-    ("GET", "spec"),
-    ("GET", "stats"),
-    ("GET", "verify"),
-}
-
-# ============================================================ layer 1
-# Hard rules. Absolute. Not weights, not tunable by score band.
-
-LOOP_WINDOW = 120          # seconds a repeat still counts as a repeat
-LOOP_HARD = 8              # identical repeats in the window = runaway
-LOOP_HARD_UNATTENDED = 4   # lower bar when no human is watching
-BURST_HARD = 120           # requests in 60s from one key = runaway
-
-# ============================================================ layer 2
-# Nine signals. Base weights MUST sum to exactly 1.00.
-#
-# What this request will SPEND ......................... 0.62
-W_EXPOSURE = 0.18   # worst case spend against remaining budget
-W_SIZE = 0.14       # prompt characters
-W_ASK = 0.14        # max_tokens ceiling the caller authorised
-W_DEPTH = 0.10      # conversation turns, re-sent on every call
-W_TOOLS = 0.06      # tool definitions, re-sent on every call
-#
-# Whether that spend is WASTE .......................... 0.38
-W_LOOP = 0.16       # the same request going round again
-W_BURST = 0.09      # requests in the last 60 seconds
-W_GRIND = 0.07      # requests in the last hour
-W_NOVELTY = 0.06    # first time this shape has been seen
-
-BASE_SUM = (W_EXPOSURE + W_SIZE + W_ASK + W_DEPTH + W_TOOLS
-            + W_LOOP + W_BURST + W_GRIND + W_NOVELTY)
-
-# Sits outside the base sum, deliberately.
-W_UNATTENDED = 0.10
-
-BAND_CHALLENGE = 0.55
-BAND_BLOCK = 0.80
-
-SAT_LOOP = 5
-SAT_BURST = 20
-SAT_GRIND = 200
-SAT_SIZE = 100_000
-SAT_ASK = 8_000
-SAT_DEPTH = 40
-SAT_TOOLS = 24
-
-# A request only earns the cheap model by being genuinely small.
-# Suspicion never routes a request to a weaker model.
-CHEAP_MAX_CHARS = 4_000
-CHEAP_MAX_TURNS = 6
-CHEAP_MAX_ASK = 1_000
-CHEAP_MAX_SCORE = 0.30
-
-W60 = 60
-W1H = 3600
-
-# ============================================================ layer 3
-CTX_KEEP_TURNS = 8          # turns beyond this are flagged as carried
-CTX_FLAG_TURNS = 12         # only flag once the conversation is this deep
-SYSTEM_FLAG_CHARS = 2_000
-CHARS_PER_TOKEN = 4.0       # the estimate, used only in findings
-
-DEFAULT_TTL = 30 * 24 * 3600
-MAX_STORED_BYTES = 512 * 1024
-MAX_PROMPT_CHARS = 2_000_000
-
-KEYED_FIELDS = (
-    "model", "messages", "system", "prompt", "input",
-    "temperature", "top_p", "top_k",
-    "max_tokens", "max_completion_tokens",
-    "stop", "stop_sequences",
-    "tools", "tool_choice", "response_format", "seed",
-)
-
-VOCABULARY = {
-    "SERVE": "answered from an identical earlier request; nothing was bought",
-    "ALLOW": "send it to the model as asked",
-    "DOWNGRADE": "small and simple enough for the cheap model",
-    "CHALLENGE": "hold it for a person before spending",
-    "BLOCK": "refused; it never reaches the model, so no completion is paid for",
-}
-
-LIMITS = [
-    "Matching is exact. A reworded prompt is a different request and goes "
-    "to the model.",
-    "Savings totals use only token counts the provider itself reported. "
-    "Nothing in a total is estimated.",
-    "A refused request has a worst case cost, not a known cost. It is "
-    "reported separately and never added to the savings total.",
-    "Token figures inside findings are estimated from character counts and "
-    "are marked as estimates. They never enter a total.",
-    "A stored answer is returned unchanged. This module does not judge "
-    "whether it is still correct.",
-    "No model is called to reach any decision here.",
-]
-
-
-# --------------------------------------------------------------- helpers
-
-def _canonical(obj):
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
-                      ensure_ascii=True).encode("utf-8")
-
-
-def _sha(data):
-    if isinstance(data, str):
-        data = data.encode("utf-8")
-    return hashlib.sha256(data).hexdigest()
-
-
-def _fingerprint(req):
-    keyed = {k: req[k] for k in KEYED_FIELDS if k in req}
-    return _sha(b"SEBBI-TOKENSAVER-v2\n" + _canonical(keyed))
-
-
-def _content_chars(v):
-    if v is None:
-        return 0
-    if isinstance(v, str):
-        return len(v)
-    return len(_canonical(v))
-
-
-def _prompt_chars(req):
-    total = 0
-    for key in ("prompt", "input", "system"):
-        total += _content_chars(req.get(key))
-    msgs = req.get("messages")
-    if isinstance(msgs, list):
-        for m in msgs:
-            total += _content_chars(m.get("content") if isinstance(m, dict) else m)
-    tools = req.get("tools")
-    if tools is not None:
-        total += _content_chars(tools)
-    return total
-
-
-def _est_tokens(chars):
-    """Estimate only. Marked as such everywhere it appears."""
-    return int(chars / CHARS_PER_TOKEN)
-
-
-def _ask_ceiling(req):
-    """The caller's own authorised output ceiling. Exact, not estimated."""
-    v = req.get("max_tokens")
-    if v is None:
-        v = req.get("max_completion_tokens")
-    try:
-        return int(v) if v is not None else 0
-    except (TypeError, ValueError):
-        return 0
-
-
-def _shape(req):
-    n = len(req.get("messages") or [])
-    t = len(req.get("tools") or [])
-    band = int(math.log10(max(_prompt_chars(req), 1)) * 2)
-    return _sha("%s|%d|%d|%d" % (req.get("model") or "", n, t, band))
-
-
-def _measure(req):
-    """Everything the decision needs, taken from a full request."""
-    return {
-        "fp": _fingerprint(req),
-        "shape": _shape(req),
-        "chars": _prompt_chars(req),
-        "ask": _ask_ceiling(req),
-        "depth": len(req.get("messages") or []),
-        "tools": len(req.get("tools") or []),
-        "deterministic": _deterministic(req),
-        "from_digest": False,
-    }
-
-
-def _measure_from_digest(d):
-    """
-    The same measurements, supplied by a client that kept its content at
-    home. The client is measuring its own spend against its own budget,
-    so there is nothing to gain by misreporting.
-    """
-    if not isinstance(d, dict):
-        return None, "digest must be an object"
-    fp = d.get("fingerprint")
-    if not isinstance(fp, str) or len(fp) != 64:
-        return None, "digest needs a 64 character fingerprint"
-    try:
-        int(fp, 16)
-    except ValueError:
-        return None, "fingerprint must be hexadecimal"
-
-    def _n(key, cap):
-        v = d.get(key, 0)
-        try:
-            v = int(v)
-        except (TypeError, ValueError):
-            return 0
-        return max(0, min(v, cap))
-
-    m = {
-        "fp": fp,
-        "chars": _n("prompt_characters", MAX_PROMPT_CHARS),
-        "ask": _n("max_tokens", 10_000_000),
-        "depth": _n("conversation_turns", 100_000),
-        "tools": _n("tool_definitions", 100_000),
-        "deterministic": bool(d.get("deterministic", True)),
-        "from_digest": True,
-    }
-    band = int(math.log10(max(m["chars"], 1)) * 2)
-    m["shape"] = _sha("%s|%d|%d|%d" % (d.get("model") or "", m["depth"],
-                                       m["tools"], band))
-    return m, None
-
-
-def _log_scale(value, saturation):
-    if value <= 0:
-        return 0.0
-    if value >= saturation:
-        return 1.0
-    return math.log1p(value) / math.log1p(saturation)
-
-
-def _linear(value, saturation):
-    if value <= 0:
-        return 0.0
-    return min(1.0, float(value) / float(saturation))
-
-
-def _deterministic(req):
-    t = req.get("temperature")
-    if t is None:
-        return True
-    try:
-        return float(t) == 0.0
-    except (TypeError, ValueError):
-        return False
-
-
-def _usage(resp):
-    if not isinstance(resp, dict):
-        return (None, None)
-    u = resp.get("usage")
-    if not isinstance(u, dict):
-        return (None, None)
-    i = u.get("input_tokens", u.get("prompt_tokens"))
-    o = u.get("output_tokens", u.get("completion_tokens"))
-    try:
-        return (int(i) if i is not None else None,
-                int(o) if o is not None else None)
-    except (TypeError, ValueError):
-        return (None, None)
-
-
-def _money(tokens_in, tokens_out, price_in, price_out):
-    if price_in is None and price_out is None:
-        return None
-    m = 0.0
-    if price_in:
-        m += (tokens_in or 0) / 1_000_000.0 * price_in
-    if price_out:
-        m += (tokens_out or 0) / 1_000_000.0 * price_out
-    return round(m, 4)
-
-
-# --------------------------------------------------------------- storage
-
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS ts_store (
-    api_key       TEXT NOT NULL,
-    fp            TEXT NOT NULL,
-    model         TEXT,
-    response      TEXT NOT NULL,
-    input_tokens  INTEGER,
-    output_tokens INTEGER,
-    stored_at     REAL NOT NULL,
-    expires_at    REAL,
-    hits          INTEGER NOT NULL DEFAULT 0,
-    last_hit      REAL,
-    PRIMARY KEY (api_key, fp)
-);
-
-CREATE TABLE IF NOT EXISTS ts_seen (
-    api_key  TEXT NOT NULL,
-    fp       TEXT NOT NULL,
-    ts       REAL NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS ts_shape (
-    api_key  TEXT NOT NULL,
-    shape    TEXT NOT NULL,
-    first_ts REAL NOT NULL,
-    PRIMARY KEY (api_key, shape)
-);
-
-CREATE TABLE IF NOT EXISTS ts_decision (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    api_key     TEXT NOT NULL,
-    ts          REAL NOT NULL,
-    fp          TEXT NOT NULL,
-    verdict     TEXT NOT NULL,
-    rule        TEXT,
-    score       REAL NOT NULL,
-    signals     TEXT NOT NULL,
-    exact_in    INTEGER,
-    exact_out   INTEGER,
-    ceiling_in  INTEGER,
-    ceiling_out INTEGER,
-    audit_hash  TEXT
-);
-
-CREATE TABLE IF NOT EXISTS ts_account (
-    api_key    TEXT PRIMARY KEY,
-    ceiling    INTEGER NOT NULL DEFAULT 0,
-    spent      INTEGER NOT NULL DEFAULT 0,
-    price_in   REAL,
-    price_out  REAL,
-    currency   TEXT,
-    updated    REAL NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS ts_seen_key ON ts_seen(api_key, ts);
-CREATE INDEX IF NOT EXISTS ts_seen_fp ON ts_seen(api_key, fp, ts);
-CREATE INDEX IF NOT EXISTS ts_dec_key ON ts_decision(api_key, id);
-CREATE INDEX IF NOT EXISTS ts_dec_hash ON ts_decision(audit_hash);
-CREATE INDEX IF NOT EXISTS ts_store_exp ON ts_store(expires_at);
-"""
-
-_ready = {}
-
-
-def _init(ctx):
-    # Keyed by id, but the connection itself is kept as the value so the
-    # id cannot be recycled while we still believe in it.
-    k = id(ctx.conn)
-    if _ready.get(k) is ctx.conn:
-        return
-    with ctx.lock:
-        ctx.conn.executescript(_SCHEMA)
-        ctx.conn.commit()
-    _ready[k] = ctx.conn
-
-
-def _account(ctx, api_key):
-    row = ctx.conn.execute(
-        "SELECT ceiling, spent, price_in, price_out, currency "
-        "FROM ts_account WHERE api_key=?", (api_key,)
-    ).fetchone()
-    if not row:
-        return {"ceiling": 0, "spent": 0, "price_in": None,
-                "price_out": None, "currency": None}
-    return {"ceiling": row[0], "spent": row[1], "price_in": row[2],
-            "price_out": row[3], "currency": row[4]}
-
-
-def _prune(ctx, api_key, now):
-    ctx.conn.execute("DELETE FROM ts_seen WHERE api_key=? AND ts < ?",
-                     (api_key, now - W1H))
-
-
-# ================================================================ layer 3
-
-def _findings(req, loop_n, has_stored, acct):
-    """
-    Named waste inside this request. Every item carries a token figure
-    and says whether that figure is exact or estimated. This never
-    feeds a total.
-    """
-    out = []
-    msgs = req.get("messages") or []
-    depth = len(msgs)
-    tools = req.get("tools") or []
-    ask = _ask_ceiling(req)
-
-    # The biggest one in agent systems: the same request going round
-    # and nobody recording the answer.
-    if loop_n >= 2 and not has_stored:
-        out.append({
-            "code": "repeating_without_recording",
-            "severity": "high",
-            "detail": "This exact request has gone out %d times in the last "
-                      "%d seconds and no answer has been recorded. Post the "
-                      "response back to record and every repeat after that "
-                      "costs nothing."
-                      % (loop_n, LOOP_WINDOW),
-            "tokens": None,
-            "certainty": "not counted",
-        })
-
-    if not _deterministic(req):
-        out.append({
-            "code": "varied_output_blocks_reuse",
-            "severity": "medium",
-            "detail": "temperature is above zero, so this answer cannot be "
-                      "safely reused. If this request does not genuinely need "
-                      "varied output, setting temperature to zero makes every "
-                      "repeat free.",
-            "tokens": None,
-            "certainty": "not counted",
-        })
-
-    if depth > CTX_FLAG_TURNS:
-        carried = msgs[:-CTX_KEEP_TURNS] if CTX_KEEP_TURNS < depth else []
-        chars = sum(_content_chars(m.get("content") if isinstance(m, dict)
-                                   else m) for m in carried)
-        out.append({
-            "code": "carrying_old_turns",
-            "severity": "high" if chars > 20_000 else "medium",
-            "detail": "%d turns are being re-sent on every call. The oldest "
-                      "%d of them account for roughly the tokens below, paid "
-                      "again each time this conversation continues."
-                      % (depth, len(carried)),
-            "tokens": _est_tokens(chars),
-            "certainty": "estimated from character count",
-        })
-
-    if tools:
-        used = False
-        for m in msgs:
-            if not isinstance(m, dict):
-                continue
-            c = m.get("content")
-            blob = c if isinstance(c, str) else _canonical(c).decode("utf-8", "ignore")
-            if "tool_use" in blob or "tool_call" in blob:
-                used = True
-                break
-        if not used:
-            chars = _content_chars(tools)
-            out.append({
-                "code": "unused_tool_definitions",
-                "severity": "high" if chars > 8_000 else "medium",
-                "detail": "%d tool definitions are attached and nothing in "
-                          "this conversation has called one. They are sent in "
-                          "full on every request."
-                          % len(tools),
-                "tokens": _est_tokens(chars),
-                "certainty": "estimated from character count",
-            })
-
-    sys_chars = _content_chars(req.get("system"))
-    if sys_chars > SYSTEM_FLAG_CHARS and depth > 4:
-        out.append({
-            "code": "large_system_prompt_resent",
-            "severity": "low",
-            "detail": "The system prompt is re-sent on every call in this "
-                      "conversation. If your provider offers prompt caching, "
-                      "this is the block to cache.",
-            "tokens": _est_tokens(sys_chars),
-            "certainty": "estimated from character count",
-        })
-
-    if ask:
-        out.append({
-            "code": "output_ceiling_authorised",
-            "severity": "low",
-            "detail": "max_tokens is set to %d, so this single call is "
-                      "authorised to buy up to that many output tokens." % ask,
-            "tokens": ask,
-            "certainty": "exact ceiling set by the caller",
-        })
-
-    seen = {}
-    for m in msgs:
-        if not isinstance(m, dict):
-            continue
-        k = _sha(_canonical(m.get("content")))
-        seen[k] = seen.get(k, 0) + 1
-    dupes = sum(n - 1 for n in seen.values() if n > 1)
-    if dupes >= 2:
-        out.append({
-            "code": "duplicate_turns_in_context",
-            "severity": "medium",
-            "detail": "%d turns inside this conversation are byte-identical "
-                      "to an earlier turn. They are being paid for twice."
-                      % dupes,
-            "tokens": None,
-            "certainty": "not counted",
-        })
-
-    if acct["ceiling"] and acct["spent"] >= acct["ceiling"] * 0.8:
-        out.append({
-            "code": "budget_nearly_gone",
-            "severity": "high",
-            "detail": "This key has used %d of its %d token ceiling."
-                      % (acct["spent"], acct["ceiling"]),
-            "tokens": None,
-            "certainty": "exact, from provider-reported usage",
-        })
-
-    return out
-
-
-# ================================================================ layers 1+2
-
-def _decide(ctx, api_key, m, now, unattended, count_it):
-    """
-    Takes a measurement bundle from _measure or _measure_from_digest, so
-    the same decision runs whether the caller sent the request or kept it
-    at home and sent only its shape.
-
-    rule is set only when a hard rule fired, in which case the score is
-    still computed and reported but did not decide anything.
-    """
-    fp = m["fp"]
-    shape = m["shape"]
-    acct = _account(ctx, api_key)
-
-    loop_n = ctx.conn.execute(
-        "SELECT COUNT(*) FROM ts_seen WHERE api_key=? AND fp=? AND ts > ?",
-        (api_key, fp, now - LOOP_WINDOW)).fetchone()[0]
-    burst_n = ctx.conn.execute(
-        "SELECT COUNT(*) FROM ts_seen WHERE api_key=? AND ts > ?",
-        (api_key, now - W60)).fetchone()[0]
-    grind_n = ctx.conn.execute(
-        "SELECT COUNT(*) FROM ts_seen WHERE api_key=? AND ts > ?",
-        (api_key, now - W1H)).fetchone()[0]
-    seen_shape = ctx.conn.execute(
-        "SELECT 1 FROM ts_shape WHERE api_key=? AND shape=?",
-        (api_key, shape)).fetchone()
-    has_stored = ctx.conn.execute(
-        "SELECT 1 FROM ts_store WHERE api_key=? AND fp=?",
-        (api_key, fp)).fetchone() is not None
-
-    chars = m["chars"]
-    ask = m["ask"]
-    depth = m["depth"]
-    tools = m["tools"]
-
-    # Worst case this one call could cost: an exact ceiling on output,
-    # an estimate on input. Kept apart accordingly.
-    ceiling_out = ask
-    est_in = _est_tokens(chars)
-    remaining = max(0, acct["ceiling"] - acct["spent"]) if acct["ceiling"] else 0
-    if remaining:
-        exposure = _linear(est_in + ceiling_out, remaining)
-    else:
-        exposure = 0.0
-
-    s = {
-        "exposure": round(exposure, 4),
-        "size": round(_log_scale(chars, SAT_SIZE), 4),
-        "ask": round(_log_scale(ask, SAT_ASK), 4),
-        "depth": round(_linear(depth, SAT_DEPTH), 4),
-        "tools": round(_linear(tools, SAT_TOOLS), 4),
-        "loop": round(_linear(loop_n, SAT_LOOP), 4),
-        "burst": round(_linear(burst_n, SAT_BURST), 4),
-        "grind": round(_linear(grind_n, SAT_GRIND), 4),
-        "novelty": 0.0 if seen_shape else 1.0,
-    }
-
-    score = (W_EXPOSURE * s["exposure"] + W_SIZE * s["size"]
-             + W_ASK * s["ask"] + W_DEPTH * s["depth"]
-             + W_TOOLS * s["tools"] + W_LOOP * s["loop"]
-             + W_BURST * s["burst"] + W_GRIND * s["grind"]
-             + W_NOVELTY * s["novelty"])
-
-    s["unattended"] = bool(unattended)
-    if unattended:
-        score += W_UNATTENDED
-    score = round(min(1.0, score), 4)
-
-    measured = {
-        "prompt_characters": chars,
-        "estimated_input_tokens": est_in,
-        "estimated_input_tokens_note": "estimated from characters, never "
-                                       "counted in a savings total",
-        "authorised_output_tokens": ceiling_out,
-        "conversation_turns": depth,
-        "tool_definitions": tools,
-        "same_request_in_last_%ds" % LOOP_WINDOW: loop_n,
-        "requests_in_last_60s": burst_n,
-        "requests_in_last_hour": grind_n,
-        "budget_ceiling_tokens": acct["ceiling"],
-        "budget_spent_tokens": acct["spent"],
-    }
-
-    # ---- layer 1: hard rules, in order, no appeal to the score --------
-    rule = None
-    verdict = None
-
-    if acct["ceiling"] and acct["spent"] >= acct["ceiling"]:
-        rule, verdict = "budget_exhausted", "BLOCK"
-    elif acct["ceiling"] and (est_in + ceiling_out) > remaining:
-        # An overdraft. Catching this after the fact is too late: the
-        # money is already gone. A person may raise the ceiling, so an
-        # attended call is held rather than refused.
-        rule = "exceeds_remaining_budget"
-        verdict = "BLOCK" if unattended else "CHALLENGE"
-    elif loop_n >= LOOP_HARD:
-        rule, verdict = "runaway_loop", "BLOCK"
-    elif unattended and loop_n >= LOOP_HARD_UNATTENDED:
-        rule, verdict = "runaway_loop_unattended", "BLOCK"
-    elif burst_n >= BURST_HARD:
-        rule, verdict = "runaway_burst", "BLOCK"
-
-    # ---- layer 2: the score -------------------------------------------
-    if verdict is None:
-        if score >= BAND_BLOCK:
-            verdict = "BLOCK"
-        elif score >= BAND_CHALLENGE:
-            verdict = "CHALLENGE"
-        elif (score < CHEAP_MAX_SCORE and chars <= CHEAP_MAX_CHARS
-              and depth <= CHEAP_MAX_TURNS and ask <= CHEAP_MAX_ASK
-              and tools == 0):
-            verdict = "DOWNGRADE"
-        else:
-            verdict = "ALLOW"
-
-    if count_it:
-        ctx.conn.execute("INSERT INTO ts_seen (api_key, fp, ts) VALUES (?,?,?)",
-                         (api_key, fp, now))
-        ctx.conn.execute(
-            "INSERT OR IGNORE INTO ts_shape (api_key, shape, first_ts) "
-            "VALUES (?,?,?)", (api_key, shape, now))
-        _prune(ctx, api_key, now)
-
-    measured["measured_from"] = ("a digest supplied by the client; the "
-                                "content stayed on their side"
-                                if m.get("from_digest") else
-                                "the request body")
-    return (verdict, rule, score, s, measured, fp, shape, loop_n, has_stored,
-            est_in, ceiling_out, acct)
-
-
-def _record_decision(ctx, api_key, fp, verdict, rule, score, signals,
-                     ex_in, ex_out, ce_in, ce_out, seal_hash, now):
-    """Writes the row and returns its id, so the receipt can be stamped on
-    afterwards once the lock has been released."""
-    cur = ctx.conn.execute(
-        "INSERT INTO ts_decision (api_key, ts, fp, verdict, rule, score, "
-        "signals, exact_in, exact_out, ceiling_in, ceiling_out, audit_hash) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-        (api_key, now, fp, verdict, rule, score,
-         json.dumps(signals, sort_keys=True), ex_in, ex_out, ce_in, ce_out,
-         seal_hash))
-    return cur.lastrowid
-
-
-def _seal_and_stamp(ctx, event, detail, api_key, decision_id):
-    """
-    Seal with the lock released, then write the receipt back onto the row
-    in a second short lock. Splitting it this way is what keeps the
-    platform's non-reentrant lock from deadlocking the request.
-    """
-    seal = ctx.seal(event, detail, api_key)
-    h = seal.get("hash") if isinstance(seal, dict) else None
-    if h and decision_id:
-        try:
-            with ctx.lock:
-                ctx.conn.execute(
-                    "UPDATE ts_decision SET audit_hash=? WHERE id=?",
-                    (h, decision_id))
-                ctx.conn.commit()
-        except Exception:                        # noqa: BLE001
-            pass
-    return seal
-
-
-# --------------------------------------------------------------- actions
-
-def _a_spec():
-    return {
-        "module": "tokensaver",
-        "version": VERSION,
-        "what_it_is": "A deterministic gate in front of a model. It decides "
-                      "whether a request is answered from store, sent to the "
-                      "model, sent to a cheaper model, held for a person, or "
-                      "refused. It also names the waste inside every request "
-                      "it sees.",
-        "model_calls_made_to_reach_a_decision": 0,
-        "layers": {
-            "1_hard_rules": {
-                "why": "A cost gate that depends only on tuned weights is a "
-                       "cost gate nobody can defend. These are absolute.",
-                "rules": {
-                    "budget_exhausted": "spend has reached the key's ceiling",
-                    "exceeds_remaining_budget":
-                        "this one call could cost more than the budget left. "
-                        "Output uses the exact ceiling you set; input is "
-                        "estimated from characters, so this rule is "
-                        "deliberately cautious. Held for a person when a "
-                        "human is declared, refused when one is not.",
-                    "runaway_loop": "the same request %d times in %d seconds"
-                                    % (LOOP_HARD, LOOP_WINDOW),
-                    "runaway_loop_unattended": "the same request %d times in "
-                                               "%d seconds with no human "
-                                               "declared"
-                                               % (LOOP_HARD_UNATTENDED,
-                                                  LOOP_WINDOW),
-                    "runaway_burst": "%d requests from one key in 60 seconds"
-                                     % BURST_HARD,
-                },
-            },
-            "2_the_score": {
-                "spend_signals": {
-                    "exposure": {"weight": W_EXPOSURE,
-                                 "measures": "worst case cost of this call "
-                                             "against the budget left"},
-                    "size": {"weight": W_SIZE, "saturates_at": SAT_SIZE,
-                             "measures": "prompt characters, log scaled"},
-                    "ask": {"weight": W_ASK, "saturates_at": SAT_ASK,
-                            "measures": "the max_tokens ceiling the caller set"},
-                    "depth": {"weight": W_DEPTH, "saturates_at": SAT_DEPTH,
-                              "measures": "turns re-sent on every call"},
-                    "tools": {"weight": W_TOOLS, "saturates_at": SAT_TOOLS,
-                              "measures": "tool definitions re-sent on every call"},
-                },
-                "waste_signals": {
-                    "loop": {"weight": W_LOOP, "saturates_at": SAT_LOOP},
-                    "burst": {"weight": W_BURST, "saturates_at": SAT_BURST},
-                    "grind": {"weight": W_GRIND, "saturates_at": SAT_GRIND},
-                    "novelty": {"weight": W_NOVELTY},
-                },
-                "spend_weight_total": round(W_EXPOSURE + W_SIZE + W_ASK
-                                            + W_DEPTH + W_TOOLS, 4),
-                "waste_weight_total": round(W_LOOP + W_BURST + W_GRIND
-                                            + W_NOVELTY, 4),
-                "base_weights_sum_to": round(BASE_SUM, 4),
-                "outside_the_base_sum": {"unattended": W_UNATTENDED},
-                "bands": {"CHALLENGE": ">= %.2f" % BAND_CHALLENGE,
-                          "BLOCK": ">= %.2f" % BAND_BLOCK},
-                "downgrade_is_earned_not_suspected": {
-                    "max_score": CHEAP_MAX_SCORE,
-                    "max_prompt_characters": CHEAP_MAX_CHARS,
-                    "max_turns": CHEAP_MAX_TURNS,
-                    "max_output_tokens": CHEAP_MAX_ASK,
-                    "tools_allowed": 0,
-                    "why": "a suspicious request is never sent to a weaker "
-                           "model. Only a genuinely small one is.",
-                },
-            },
-            "3_findings": {
-                "why": "The verdict saves money on this call. The findings "
-                       "change what the caller sends next time, which saves "
-                       "far more.",
-                "codes": ["repeating_without_recording",
-                          "varied_output_blocks_reuse",
-                          "carrying_old_turns",
-                          "unused_tool_definitions",
-                          "large_system_prompt_resent",
-                          "output_ceiling_authorised",
-                          "duplicate_turns_in_context",
-                          "budget_nearly_gone"],
-            },
-        },
-        "verdict_vocabulary": VOCABULARY,
-        "certainty_tiers": {
-            "tokens_not_bought": "exact, provider reported, the only figure "
-                                 "that enters a savings total",
-            "worst_case_tokens_avoided": "a ceiling on what a refused request "
-                                         "could have cost, reported separately",
-            "findings_tokens": "estimated from characters where marked, never "
-                               "entering any total",
-        },
-        "two_ways_to_call_it": {
-            "request": "send the provider request body. This platform sees "
-                       "your prompt.",
-            "digest": "send only a fingerprint and counts. Your prompts and "
-                      "answers never leave your building, the decision is "
-                      "identical, and the receipt is the same. The downloaded "
-                      "client uses this path by default.",
-        },
-        "honest_limits": LIMITS,
-        "routes": {
-            "public": ["spec", "stats", "verify"],
-            "keyed": ["estimate", "gate", "record", "ledger", "budget",
-                      "prices", "forget"],
-        },
-    }
-
-
-def _bundle(data):
-    """
-    A caller may send the whole request, or only a digest of it. The
-    digest path exists so a customer's prompts and answers never leave
-    their own building. Returns (measurements, request_or_None, error, code).
-    """
-    req = data.get("request")
-    if isinstance(req, dict):
-        if _prompt_chars(req) > MAX_PROMPT_CHARS:
-            return None, None, {"error": "request_too_large"}, 413
-        return _measure(req), req, None, None
-
-    dig = data.get("digest")
-    if dig is not None:
-        m, err = _measure_from_digest(dig)
-        if err:
-            return None, None, {"error": "bad_digest", "detail": err}, 400
-        return m, None, None, None
-
-    return None, None, {
-        "error": "request_or_digest_required",
-        "detail": "send the provider request body under 'request', or a "
-                  "content-free digest under 'digest' with fingerprint, "
-                  "prompt_characters, max_tokens, conversation_turns, "
-                  "tool_definitions and deterministic",
-    }, 400
-
-
-def _digest_findings(m, loop_n, has_stored, acct):
-    """
-    What can honestly be said when the content stayed at home. Anything
-    needing the actual messages is left to the client, which has them.
-    """
-    out = []
-    if loop_n >= 2 and not has_stored:
-        out.append({
-            "code": "repeating_without_recording",
-            "severity": "high",
-            "detail": "This exact request has gone out %d times in the last "
-                      "%d seconds and no answer has been recorded. Post the "
-                      "response back to record and every repeat after that "
-                      "costs nothing." % (loop_n, LOOP_WINDOW),
-            "tokens": None,
-            "certainty": "not counted",
-        })
-    if not m["deterministic"]:
-        out.append({
-            "code": "varied_output_blocks_reuse",
-            "severity": "medium",
-            "detail": "temperature is above zero, so this answer cannot be "
-                      "safely reused.",
-            "tokens": None,
-            "certainty": "not counted",
-        })
-    if m["depth"] > CTX_FLAG_TURNS:
-        out.append({
-            "code": "carrying_old_turns",
-            "severity": "medium",
-            "detail": "%d turns are being re-sent on every call. Your client "
-                      "holds the content and can size this exactly."
-                      % m["depth"],
-            "tokens": None,
-            "certainty": "not counted here; the client can measure it",
-        })
-    if m["ask"]:
-        out.append({
-            "code": "output_ceiling_authorised",
-            "severity": "low",
-            "detail": "max_tokens is set to %d, so this call is authorised "
-                      "to buy up to that many output tokens." % m["ask"],
-            "tokens": m["ask"],
-            "certainty": "exact ceiling set by the caller",
-        })
-    if acct["ceiling"] and acct["spent"] >= acct["ceiling"] * 0.8:
-        out.append({
-            "code": "budget_nearly_gone",
-            "severity": "high",
-            "detail": "This key has used %d of its %d token ceiling."
-                      % (acct["spent"], acct["ceiling"]),
-            "tokens": None,
-            "certainty": "exact, from provider-reported usage",
-        })
-    return out
-
-
-def _a_estimate(ctx, api_key, data, now):
-    """Cost a request and name its waste. Changes nothing, seals nothing."""
-    m, req, err, code = _bundle(data)
-    if err:
-        return err, code
-
-    with ctx.lock:
-        (verdict, rule, score, s, measured, fp, shape, loop_n, has_stored,
-         est_in, ceil_out, acct) = _decide(
-            ctx, api_key, m, now, bool(data.get("unattended")), False)
-        findings = (_findings(req, loop_n, has_stored, acct) if req
-                    else _digest_findings(m, loop_n, has_stored, acct))
-        stored = has_stored
-
-    money = _money(est_in, ceil_out, acct["price_in"], acct["price_out"])
-    out = {
-        "would_be": verdict,
-        "rule": rule,
-        "score": score,
-        "signals": s,
-        "measured": measured,
-        "findings": findings,
-        "fingerprint": fp,
-        "stored_answer_available": stored,
-        "worst_case_cost": {
-            "estimated_input_tokens": est_in,
-            "authorised_output_tokens": ceil_out,
-            "certainty": "input estimated from characters; output is the "
-                         "exact ceiling you set",
-        },
-        "note": "estimate changes nothing, counts towards no velocity window "
-                "and seals nothing. Use gate for the real decision.",
-    }
-    if money is not None:
-        out["worst_case_cost"]["money_at_your_prices"] = money
-        out["worst_case_cost"]["currency"] = acct["currency"]
-    return out, 200
-
-
-def _a_gate(ctx, api_key, data, now):
-    m, req, err, code = _bundle(data)
-    if err:
-        return err, code
-
-    unattended = bool(data.get("unattended"))
-    fp = m["fp"]
-
-    # ---- everything that touches the database, under the lock ----------
-    with ctx.lock:
-        row = ctx.conn.execute(
-            "SELECT response, model, input_tokens, output_tokens, hits, "
-            "expires_at FROM ts_store WHERE api_key=? AND fp=?",
-            (api_key, fp)).fetchone()
-
-        expired = False
-        if row and row[5] is not None and row[5] < now:
-            ctx.conn.execute("DELETE FROM ts_store WHERE api_key=? AND fp=?",
-                             (api_key, fp))
-            expired = True
-            row = None
-
-        acct = _account(ctx, api_key)
-        budget_gone = bool(acct["ceiling"]) and acct["spent"] >= acct["ceiling"]
-
-        client_held = False
-        if row:
-            try:
-                client_held = (json.loads(row[0]).get("held_by") == "client")
-            except (ValueError, AttributeError):
-                client_held = False
-
-        served = bool(row) and not budget_gone
-        if served:
-            ctx.conn.execute(
-                "UPDATE ts_store SET hits=hits+1, last_hit=? "
-                "WHERE api_key=? AND fp=?", (now, api_key, fp))
-            did = _record_decision(
-                ctx, api_key, fp, "SERVE",
-                "stored_by_client" if client_held else "stored_answer",
-                0.0, {"repeat": 1.0}, row[2], row[3], None, None, None, now)
-        else:
-            (verdict, rule, score, s, measured, fp, shape, loop_n, has_stored,
-             est_in, ceil_out, acct) = _decide(ctx, api_key, m, now,
-                                               unattended, True)
-            findings = (_findings(req, loop_n, has_stored, acct) if req
-                        else _digest_findings(m, loop_n, has_stored, acct))
-            ce_in = est_in if verdict == "BLOCK" else None
-            ce_out = ceil_out if verdict == "BLOCK" else None
-            did = _record_decision(ctx, api_key, fp, verdict, rule, score, s,
-                                   None, None, ce_in, ce_out, None, now)
-        ctx.conn.commit()
-
-    # ---- sealing happens with the lock RELEASED -------------------------
-    # The platform's seal takes the same lock, and it is not reentrant.
-    # Calling it from inside the block above deadlocks the request.
-    if expired:
-        ctx.seal("tokensaver_expired",
-                 {"module": "tokensaver", "fingerprint": fp}, api_key)
-
-    if served:
-        detail = {
-            "module": "tokensaver", "verdict": "SERVE", "fingerprint": fp,
-            "model": row[1],
-            "tokens_not_bought": {"input": row[2], "output": row[3]},
-            "usage_reported_by_provider": (row[2] is not None
-                                           or row[3] is not None),
-            "hit_number": row[4] + 1,
-        }
-        if client_held:
-            detail["content_held_by"] = "client"
-        seal = _seal_and_stamp(ctx, "tokensaver_serve", detail, api_key, did)
-
-        known = (row[2] is not None or row[3] is not None)
-        out = {
-            "verdict": "SERVE",
-            "meaning": VOCABULARY["SERVE"],
-            "call_the_model": False,
-            "fingerprint": fp,
-            "tokens_not_bought": {
-                "input": row[2], "output": row[3],
-                "total": ((row[2] or 0) + (row[3] or 0)) if known else None,
-                "certainty": "exact, as reported by the provider on the "
-                             "original call" if known else
-                             "the provider reported no usage on the original "
-                             "call, so this saving is real but its size is "
-                             "unknown",
-            },
-            "hit_number": row[4] + 1,
-            "receipt": seal,
-        }
-        if client_held:
-            out["content_held_by"] = "client"
-            out["serve_from_your_own_store"] = True
-        else:
-            out["response"] = json.loads(row[0])
-        money = _money(row[2], row[3], acct["price_in"], acct["price_out"])
-        if money is not None:
-            out["money_not_spent_at_your_prices"] = money
-            out["currency"] = acct["currency"]
-        return out, 200
-
-    detail = {
-        "module": "tokensaver", "verdict": verdict, "rule": rule,
-        "score": score, "fingerprint": fp, "signals": s,
-        "measured": measured, "findings": [f["code"] for f in findings],
-    }
-    seal = _seal_and_stamp(ctx, "tokensaver_decision", detail, api_key, did)
-
-    out = {
-        "verdict": verdict,
-        "meaning": VOCABULARY[verdict],
-        "decided_by": ("hard rule: " + rule) if rule else "score",
-        "rule": rule,
-        "score": score,
-        "signals": s,
-        "measured": measured,
-        "findings": findings,
-        "fingerprint": fp,
-        "call_the_model": verdict in ("ALLOW", "DOWNGRADE"),
-        "use_cheap_model": verdict == "DOWNGRADE",
-        "receipt": seal,
-    }
-    if verdict == "BLOCK":
-        money = _money(est_in, ceil_out, acct["price_in"], acct["price_out"])
-        out["worst_case_avoided"] = {
-            "estimated_input_tokens": est_in,
-            "authorised_output_tokens": ceil_out,
-            "certainty": "a ceiling, not a saving. Nobody knows what this "
-                         "call would actually have cost, so it is reported "
-                         "separately and never added to tokens not bought.",
-        }
-        if money is not None:
-            out["worst_case_avoided"]["money_at_your_prices"] = money
-    if verdict in ("ALLOW", "DOWNGRADE"):
-        out["next"] = ("call the model, then POST the response to "
-                       "/x/tokensaver/record so the next identical request "
-                       "costs nothing")
-    return out, 200
-
-
-def _a_record(ctx, api_key, data, now):
-    req = data.get("request")
-    resp = data.get("response")
-    dig = data.get("digest")
-
-    # Content-free path: the client stored the answer at home and is only
-    # reporting what it cost, so the budget and the totals stay true.
-    if not isinstance(req, dict) and isinstance(dig, dict):
-        m, err = _measure_from_digest(dig)
-        if err:
-            return {"error": "bad_digest", "detail": err}, 400
-        u = data.get("usage") or {}
-        try:
-            t_in = (int(u["input_tokens"])
-                    if u.get("input_tokens") is not None else None)
-            t_out = (int(u["output_tokens"])
-                     if u.get("output_tokens") is not None else None)
-        except (TypeError, ValueError):
-            return {"error": "usage_must_be_whole_numbers"}, 400
-        with ctx.lock:
-            if t_in is not None or t_out is not None:
-                _spend(ctx, api_key, (t_in or 0) + (t_out or 0), now)
-            ctx.conn.execute(
-                "INSERT OR REPLACE INTO ts_store (api_key, fp, model, "
-                "response, input_tokens, output_tokens, stored_at, "
-                "expires_at, hits, last_hit) VALUES (?,?,?,?,?,?,?,?,0,NULL)",
-                (api_key, m["fp"], dig.get("model"),
-                 json.dumps({"held_by": "client",
-                             "note": "the answer is stored on the customer's "
-                                     "own machine and never came here"}),
-                 t_in, t_out, now, now + DEFAULT_TTL))
-            ctx.conn.commit()
-        seal = ctx.seal("tokensaver_store", {
-            "module": "tokensaver", "fingerprint": m["fp"],
-            "model": dig.get("model"), "content_held_by": "client",
-            "usage_reported_by_provider": (t_in is not None
-                                           or t_out is not None),
-            "input_tokens": t_in, "output_tokens": t_out}, api_key)
-        return {"stored": True, "fingerprint": m["fp"],
-                "content_held_by": "client", "input_tokens": t_in,
-                "output_tokens": t_out, "receipt": seal,
-                "note": "the cost is on the record here; the answer itself "
-                        "stayed on your machine"}, 200
-
-    if not isinstance(req, dict) or not isinstance(resp, dict):
-        return {"error": "request_and_response_required",
-                "detail": "send request and response, or a digest with usage"}, 400
-
-    body = json.dumps(resp)
-    if len(body.encode("utf-8")) > MAX_STORED_BYTES:
-        return {"error": "response_too_large",
-                "limit_bytes": MAX_STORED_BYTES}, 413
-
-    fp = _fingerprint(req)
-    t_in, t_out = _usage(resp)
-
-    if not _deterministic(req) and not data.get("store_varied"):
-        with ctx.lock:
-            if t_in is not None or t_out is not None:
-                _spend(ctx, api_key, (t_in or 0) + (t_out or 0), now)
-            ctx.conn.commit()
-        ctx.seal("tokensaver_refused_to_store", {
-            "module": "tokensaver", "fingerprint": fp,
-            "reason": "temperature above zero; serving a stored answer "
-                      "would change how the system behaves"}, api_key)
-        return {
-            "stored": False,
-            "spend_recorded": (t_in is not None or t_out is not None),
-            "reason": "temperature is above zero. Serving a stored answer to "
-                      "a request that asked for varied output would change "
-                      "how your system behaves. Send store_varied true to "
-                      "override deliberately.",
-        }, 200
-
-    ttl = data.get("ttl_seconds", DEFAULT_TTL)
-    try:
-        ttl = float(ttl)
-    except (TypeError, ValueError):
-        ttl = DEFAULT_TTL
-    expires = now + ttl if ttl > 0 else None
-
-    with ctx.lock:
-        ctx.conn.execute(
-            "INSERT OR REPLACE INTO ts_store (api_key, fp, model, response, "
-            "input_tokens, output_tokens, stored_at, expires_at, hits, "
-            "last_hit) VALUES (?,?,?,?,?,?,?,?,0,NULL)",
-            (api_key, fp, req.get("model"), body, t_in, t_out, now, expires))
-        if t_in is not None or t_out is not None:
-            _spend(ctx, api_key, (t_in or 0) + (t_out or 0), now)
-        ctx.conn.commit()
-
-    seal = ctx.seal("tokensaver_store", {
-        "module": "tokensaver", "fingerprint": fp, "model": req.get("model"),
-        "usage_reported_by_provider": (t_in is not None or t_out is not None),
-        "input_tokens": t_in, "output_tokens": t_out}, api_key)
-
-    return {
-        "stored": True,
-        "fingerprint": fp,
-        "usage_reported_by_provider": (t_in is not None or t_out is not None),
-        "input_tokens": t_in,
-        "output_tokens": t_out,
-        "receipt": seal,
-        "note": "the next identical request will be served from store and "
-                "will buy nothing"
-                if (t_in is not None or t_out is not None) else
-                "stored, but the provider reported no usage, so future "
-                "savings on this request will be real without a known size",
-    }, 200
-
-
-def _spend(ctx, api_key, tokens, now):
-    ctx.conn.execute(
-        "INSERT INTO ts_account (api_key, ceiling, spent, updated) "
-        "VALUES (?,0,?,?) ON CONFLICT(api_key) DO UPDATE SET "
-        "spent = spent + ?, updated = ?",
-        (api_key, tokens, now, tokens, now))
-
-
-def _totals(ctx, api_key=None):
-    where = "WHERE api_key=?" if api_key else ""
-    args = (api_key,) if api_key else ()
-
-    rows = ctx.conn.execute(
-        "SELECT hits, input_tokens, output_tokens FROM ts_store " + where,
-        args).fetchall()
-    exact_in = exact_out = unknown = 0
-    for h, i, o in rows:
-        if i is None and o is None:
-            unknown += h
-            continue
-        exact_in += (i or 0) * h
-        exact_out += (o or 0) * h
-
-    counts = {}
-    for v, c in ctx.conn.execute(
-            "SELECT verdict, COUNT(*) FROM ts_decision " + where
-            + " GROUP BY verdict", args).fetchall():
-        counts[v] = c
-
-    crow = ctx.conn.execute(
-        "SELECT COALESCE(SUM(ceiling_in),0), COALESCE(SUM(ceiling_out),0) "
-        "FROM ts_decision " + (where + " AND " if where else "WHERE ")
-        + "verdict='BLOCK'", args).fetchone()
-
-    rules = {}
-    for r, c in ctx.conn.execute(
-            "SELECT rule, COUNT(*) FROM ts_decision "
-            + (where + " AND " if where else "WHERE ")
-            + "rule IS NOT NULL GROUP BY rule", args).fetchall():
-        rules[r] = c
-
-    total = sum(counts.values())
-    served = counts.get("SERVE", 0)
-
-    return {
-        "decisions": total,
-        "verdicts": counts,
-        "hard_rules_fired": rules,
-        "serve_rate_percent": round(100.0 * served / total, 2) if total else 0.0,
-        "tokens_not_bought": {
-            "input": exact_in,
-            "output": exact_out,
-            "total": exact_in + exact_out,
-            "certainty": "exact. Provider-reported counts on requests served "
-                         "from store.",
-        },
-        "worst_case_tokens_avoided": {
-            "estimated_input": crow[0],
-            "authorised_output": crow[1],
-            "certainty": "a ceiling on refused requests, not a saving. Never "
-                         "added to tokens not bought.",
-        },
-        "serves_with_no_usage_reported": unknown,
-        "stored_answers": len(rows),
-    }
-
-
-def _a_stats(ctx):
-    with ctx.lock:
-        t = _totals(ctx)
-    t["version"] = VERSION
-    t["model_calls_made_to_reach_a_decision"] = 0
-    t["note"] = ("No figure here is a percentage saved. Exact savings and "
-                 "worst case ceilings are reported apart and never summed.")
-    return t, 200
-
-
-def _a_ledger(ctx, api_key, data, now):
-    try:
-        limit = min(200, max(1, int(data.get("limit", 50))))
-    except (TypeError, ValueError):
-        limit = 50
-    with ctx.lock:
-        rows = ctx.conn.execute(
-            "SELECT ts, fp, verdict, rule, score, exact_in, exact_out, "
-            "ceiling_in, ceiling_out, audit_hash FROM ts_decision "
-            "WHERE api_key=? ORDER BY id DESC LIMIT ?",
-            (api_key, limit)).fetchall()
-        totals = _totals(ctx, api_key)
-        acct = _account(ctx, api_key)
-
-    out = {
-        "totals": totals,
-        "budget": {
-            "ceiling_tokens": acct["ceiling"],
-            "spent_tokens": acct["spent"],
-            "remaining_tokens": max(0, acct["ceiling"] - acct["spent"])
-                                if acct["ceiling"] else None,
-            "note": "no ceiling set; set one with budget"
-                    if not acct["ceiling"] else None,
-        },
-        "recent": [{
-            "ts": r[0], "fingerprint": r[1], "verdict": r[2], "rule": r[3],
-            "score": r[4],
-            "tokens_not_bought": ((r[5] or 0) + (r[6] or 0))
-                                 if r[2] == "SERVE" else 0,
-            "worst_case_avoided": ((r[7] or 0) + (r[8] or 0))
-                                  if r[2] == "BLOCK" else 0,
-            "receipt": r[9],
-        } for r in rows],
-    }
-    m = _money(totals["tokens_not_bought"]["input"],
-               totals["tokens_not_bought"]["output"],
-               acct["price_in"], acct["price_out"])
-    if m is not None:
-        out["money_not_spent_at_your_prices"] = m
-        out["currency"] = acct["currency"]
-        out["money_note"] = ("calculated only from provider-reported counts "
-                             "on requests served from store, at the prices "
-                             "you supplied")
-    return out, 200
-
-
-def _a_budget(ctx, api_key, data, now):
-    if "ceiling_tokens" not in data:
-        return {"error": "ceiling_tokens_required",
-                "detail": "the number of tokens this key may spend before "
-                          "every request is refused"}, 400
-    try:
-        ceiling = int(data["ceiling_tokens"])
-    except (TypeError, ValueError):
-        return {"error": "ceiling_tokens_must_be_a_whole_number"}, 400
-    if ceiling < 0:
-        return {"error": "ceiling_tokens_must_not_be_negative"}, 400
-
-    reset = bool(data.get("reset_spent"))
-    with ctx.lock:
-        ctx.conn.execute(
-            "INSERT INTO ts_account (api_key, ceiling, spent, updated) "
-            "VALUES (?,?,0,?) ON CONFLICT(api_key) DO UPDATE SET "
-            "ceiling=?, updated=?", (api_key, ceiling, now, ceiling, now))
-        if reset:
-            ctx.conn.execute("UPDATE ts_account SET spent=0 WHERE api_key=?",
-                             (api_key,))
-        acct = _account(ctx, api_key)
-        ctx.conn.commit()
-
-    seal = ctx.seal("tokensaver_budget", {
-        "module": "tokensaver", "ceiling_tokens": ceiling,
-        "spent_reset": reset}, api_key)
-
-    return {"ceiling_tokens": acct["ceiling"], "spent_tokens": acct["spent"],
-            "receipt": seal,
-            "note": "when spent reaches the ceiling, every request is refused "
-                    "before it reaches the model"}, 200
-
-
-def _a_prices(ctx, api_key, data, now):
-    """Prices come from the customer's own contract. Never assumed."""
-    pi = data.get("price_per_million_input")
-    po = data.get("price_per_million_output")
-    if pi is None and po is None:
-        return {"error": "prices_required",
-                "detail": "send price_per_million_input and/or "
-                          "price_per_million_output from your own provider "
-                          "contract. Nothing is assumed on your behalf."}, 400
-    try:
-        pi = float(pi) if pi is not None else None
-        po = float(po) if po is not None else None
-    except (TypeError, ValueError):
-        return {"error": "prices_must_be_numbers"}, 400
-    if (pi is not None and pi < 0) or (po is not None and po < 0):
-        return {"error": "prices_must_not_be_negative"}, 400
-
-    cur = (data.get("currency") or "").strip()[:8] or None
-    with ctx.lock:
-        ctx.conn.execute(
-            "INSERT INTO ts_account (api_key, ceiling, spent, price_in, "
-            "price_out, currency, updated) VALUES (?,0,0,?,?,?,?) "
-            "ON CONFLICT(api_key) DO UPDATE SET price_in=?, price_out=?, "
-            "currency=?, updated=?",
-            (api_key, pi, po, cur, now, pi, po, cur, now))
-        ctx.conn.commit()
-
-    seal = ctx.seal("tokensaver_prices", {
-        "module": "tokensaver", "price_per_million_input": pi,
-        "price_per_million_output": po, "currency": cur}, api_key)
-
-    return {"price_per_million_input": pi, "price_per_million_output": po,
-            "currency": cur, "receipt": seal,
-            "note": "money figures now appear alongside token figures. They "
-                    "are your prices applied to provider-reported counts, "
-                    "never an assumption about what you pay."}, 200
-
-
-def _a_forget(ctx, api_key, data, now):
-    fp = data.get("fingerprint")
-    req = data.get("request")
-    if not fp and isinstance(req, dict):
-        fp = _fingerprint(req)
-    if not fp:
-        return {"error": "fingerprint_or_request_required"}, 400
-
-    with ctx.lock:
-        cur = ctx.conn.execute(
-            "DELETE FROM ts_store WHERE api_key=? AND fp=?", (api_key, fp))
-        removed = cur.rowcount
-        ctx.conn.commit()
-
-    seal = ctx.seal("tokensaver_forget", {
-        "module": "tokensaver", "fingerprint": fp, "removed": removed},
-        api_key)
-
-    return {"removed": removed, "fingerprint": fp, "receipt": seal,
-            "note": "the stored answer is gone. Decisions already sealed "
-                    "stay sealed."}, 200
-
-
-def _a_verify(ctx, data):
-    h = data.get("receipt") or data.get("hash")
-    if not h:
-        return {"error": "receipt_required",
-                "detail": "pass ?receipt=<chain hash from a decision>"}, 400
-    with ctx.lock:
-        row = ctx.conn.execute(
-            "SELECT ts, verdict, rule, score, exact_in, exact_out, "
-            "ceiling_in, ceiling_out, fp FROM ts_decision WHERE audit_hash=?",
-            (h,)).fetchone()
-    if not row:
-        return {"found": False, "receipt": h,
-                "note": "no decision on this platform carries that receipt"}, 404
-    return {
-        "found": True,
-        "receipt": h,
-        "ts": row[0],
-        "verdict": row[1],
-        "meaning": VOCABULARY.get(row[1], row[1]),
-        "decided_by": ("hard rule: " + row[2]) if row[2] else "score",
-        "score": row[3],
-        "tokens_not_bought": ((row[4] or 0) + (row[5] or 0))
-                             if row[1] == "SERVE" else 0,
-        "worst_case_avoided": ((row[6] or 0) + (row[7] or 0))
-                              if row[1] == "BLOCK" else 0,
-        "fingerprint": row[8],
-        "what_this_proves": "that this decision was sealed into the chain "
-                            "with these values at this position.",
-        "what_this_does_not_prove": "that a stored answer is still correct, "
-                                    "or what a refused request would actually "
-                                    "have cost.",
-    }, 200
-
-
-# ---------------------------------------------------------------- handler
-# ---------------------------------------------------------------- the ctx
-
-def _fallback_conn():
-    global _FALLBACK_CONN
-    with _FALLBACK_LOCK:
-        if _FALLBACK_CONN is None:
-            _FALLBACK_CONN = sqlite3.connect("tokensaver.db",
-                                             check_same_thread=False)
-            _FALLBACK_CONN.execute("PRAGMA journal_mode=WAL")
-        return _FALLBACK_CONN
-
-
-class _Bridge:
-    """
-    A router may hand a module a context object, or a plain dict. Rather
-    than assume which, find what is actually needed: something that can
-    run SQL, something that can be held, and something that can seal.
-
-    Anything missing is reported honestly in the response instead of
-    being faked.
-    """
-
-    def __init__(self, raw):
-        self.raw = raw
-        self.conn = self._find(
-            lambda v: hasattr(v, "execute") and hasattr(v, "commit"),
-            ("conn", "db", "_conn", "_db", "database", "sql", "sqlite"))
-        self.lock = self._find(
-            lambda v: hasattr(v, "acquire") and hasattr(v, "release"),
-            ("lock", "db_lock", "_db_lock", "_lock", "mutex"))
-        # A sqlite3 Connection is itself callable, so "anything callable"
-        # is not a safe test for a seal function - it would quietly pick the
-        # database. Require an actual function or method.
-        self._seal = self._find(
-            lambda v: (inspect.isroutine(v)
-                       and v is not self.conn and v is not self.lock),
-            ("seal", "seal_fn", "seal_block", "add_block", "chain_seal",
-             "append_block"))
-        self.notes = []
-
-        if self.conn is None:
-            # Last resort so the module still answers rather than 500s.
-            self.conn = _fallback_conn()
-            self.notes.append("no database was found in the router context, so "
-                              "this module opened its own file")
-        if self.lock is None:
-            self.lock = _FALLBACK_LOCK
-            self.notes.append("no lock was found in the router context, so "
-                              "this module used its own")
-        if self._seal is None:
-            self.notes.append("no seal function was found in the router "
-                              "context, so decisions are recorded but not "
-                              "sealed into the platform chain")
-
-    def _find(self, test, names):
-        raw = self.raw
-        if isinstance(raw, dict):
-            for n in names:                      # preferred names first
-                if n in raw and raw[n] is not None:
-                    try:
-                        if test(raw[n]):
-                            return raw[n]
-                    except Exception:            # noqa: BLE001
-                        pass
-            for v in raw.values():               # then anything that fits
-                try:
-                    if v is not None and test(v):
-                        return v
-                except Exception:                # noqa: BLE001
-                    pass
-            return None
-        for n in names:
-            v = getattr(raw, n, None)
-            if v is not None:
-                try:
-                    if test(v):
-                        return v
-                except Exception:                # noqa: BLE001
-                    pass
-        return None
-
-    def seal(self, event, detail, api_key=None):
-        """
-        MUST NOT be called while holding self.lock. The platform's own seal
-        takes that same lock, and it is a plain Lock rather than a reentrant
-        one, so calling it from inside a held lock deadlocks the request.
-        """
-        if self._seal is None:
-            return {"sealed": False,
-                    "reason": "the platform chain was not reachable from this "
-                              "module"}
-
-        ev = {"user_id": "tokensaver", "action": str(event), "amount": 0,
-              "country": "UK", "device_id": "module", "anomaly": 0,
-              "device_risk": 0}
-        now = time.time()
-
-        attempts = (
-            lambda: self._seal(ev, detail, now, api_key),
-            lambda: self._seal(ev, detail, now),
-            lambda: self._seal(event, detail),
-            lambda: self._seal({"event": event, "detail": detail}),
-        )
-        r = None
-        last = None
-        for call in attempts:
-            try:
-                r = call()
-                break
-            except TypeError as e:
-                last = e
-                continue
-            except Exception as e:               # noqa: BLE001
-                return {"sealed": False, "reason": str(e)}
-        if r is None:
-            return {"sealed": False,
-                    "reason": "could not match the chain's seal signature: "
-                              + str(last)}
-
-        if isinstance(r, dict):
-            return r
-        if isinstance(r, str):
-            return {"hash": r}
-        if isinstance(r, (list, tuple)) and r:
-            out = {"hash": str(r[0])}
-            if len(r) > 1 and r[1] is not None:
-                out["block_index"] = r[1]
-            if len(r) > 2 and r[2] is not None:
-                out["key_seq"] = r[2]
-            return out
-        return {"sealed": True}
-
-
-_FALLBACK_LOCK = threading.RLock()
-_FALLBACK_CONN = None
-
-
-def _bridge(raw):
-    """
-    Built fresh every call on purpose. Caching it by id() is unsafe:
-    Python recycles ids once an object is collected, so a cached bridge
-    can end up serving a different request's context.
-    """
-    if isinstance(raw, _Bridge):
-        return raw
-    return _Bridge(raw)
-
-
-def handle(method, action, data, api_key, ctx):
-    ctx = _bridge(ctx)
-    _init(ctx)
-    data = data or {}
-    now = time.time()
-
-    if method == "GET" and action == "spec":
-        sp = _a_spec()
-        if ctx.notes:
-            sp["wiring_notes"] = ctx.notes
-        return sp, 200
-    if method == "GET" and action == "stats":
-        return _a_stats(ctx)
-    if method == "GET" and action == "verify":
-        return _a_verify(ctx, data)
-
-    if not api_key:
-        return {"error": "key_required"}, 401
-
-    if method == "POST" and action == "estimate":
-        return _a_estimate(ctx, api_key, data, now)
-    if method == "POST" and action == "gate":
-        return _a_gate(ctx, api_key, data, now)
-    if method == "POST" and action == "record":
-        return _a_record(ctx, api_key, data, now)
-    if method == "GET" and action == "ledger":
-        return _a_ledger(ctx, api_key, data, now)
-    if method == "POST" and action == "budget":
-        return _a_budget(ctx, api_key, data, now)
-    if method == "POST" and action == "prices":
-        return _a_prices(ctx, api_key, data, now)
-    if method == "POST" and action == "forget":
-        return _a_forget(ctx, api_key, data, now)
-
-    return {"error": "unknown_action",
-            "actions": ["spec", "stats", "verify", "estimate", "gate",
-                        "record", "ledger", "budget", "prices", "forget"]}, 404
-
-```
-
-
-## `modules/verifier.py`
-
-717 lines, 26299 bytes
-
-```python
-#!/usr/bin/env python3
-"""
-modules/verifier.py  -  hand the verifier out at a URL
-
-WHY THIS EXISTS
----------------
-A proof that can only be checked by the party who issued it is not a proof.
-So the proof bundles at /x/continuity/proof are useless unless somebody can
-easily get hold of something that checks them, and telling people to clone a
-repository is a gate.
-
-This serves the standalone verifier as a plain file:
-
-    curl -sO https://sebbi.pro/verify-authority.py
-    curl -s "https://sebbi.pro/x/continuity/proof?evaluation=e_..." \\
-        | python3 verify-authority.py -
-
-The script it hands out has no dependencies and makes no network calls. It
-checks the Ed25519 signature, recomputes every digest, re-runs the whole
-derivation from the published rules, and reaches its own verdict - then says
-so if that verdict disagrees with ours.
-
-WHAT IT DELIBERATELY DOES NOT DO
---------------------------------
-It does not phone home, and this module records nothing about who downloaded
-it. A verification tool that reports back to the party being verified is not
-a verification tool.
-
-    GET /verify-authority.py   the script
-    GET /x/verifier/status     what is installed, and the script's digest
-"""
-
-import hashlib
 import sys
 
-VERSION = "1.1"
+VERSION = "2.0"
 
 PUBLIC = {("GET", "status")}
 
-# Deliberately NOT "/verify" - that is the sealed-post verification page and
-# this module would silently hijack it, handing a visitor a Python download
-# where they expected a page. A route grab is a bug even when the code works.
-FILE_PATHS = ("/verify-authority.py", "/verify_authority.py")
+PAGE_PATHS = ("/self-check", "/self-check.html")
 
 _patched = [False]
 
 
-SCRIPT = r'''#!/usr/bin/env python3
-"""
-verify_authority.py  -  check an AILeash authority proof without AILeash
+PAGE = r'''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Ordering test — self check</title>
+<style>
+  :root{
+    --ink:#0a0f1e;
+    --ink2:#10182e;
+    --line:#1e2942;
+    --gold:#c9a84c;
+    --ok:#7fe3b0;
+    --err:#ff8a80;
+    --warn:#e8c06a;
+    --mute:#6b7894;
+    --text:#dbe3f4;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    background:var(--ink);
+    color:var(--text);
+    font-family:var(--mono);
+    font-size:14px;
+    line-height:1.5;
+    -webkit-text-size-adjust:100%;
+  }
+  .wrap{max-width:760px;margin:0 auto;padding:20px 16px 80px}
 
-    python3 verify_authority.py proof.json
-    curl -s "https://sebbi.pro/x/continuity/proof?evaluation=e_..." \\
-        | python3 verify_authority.py -
+  header{border-bottom:1px solid var(--line);padding-bottom:18px;margin-bottom:22px}
+  .eyebrow{
+    font-size:11px;letter-spacing:.18em;text-transform:uppercase;
+    color:var(--gold);margin:0 0 8px
+  }
+  h1{font-size:22px;line-height:1.25;margin:0 0 10px;font-weight:600;letter-spacing:-.01em}
+  .sub{color:var(--mute);font-size:13px;margin:0}
+  .sub b{color:var(--text);font-weight:600}
 
-WHAT THIS IS FOR
-----------------
-A proof that can only be checked by the party who issued it is not a proof.
-This script takes a bundle and reaches its own conclusion using nothing but
-the Python standard library. It does not call the issuing system, it does not
-import anything you have to install, and it does not take a single field of
-the bundle at face value.
+  .bar{display:flex;gap:10px;flex-wrap:wrap;margin:18px 0 0}
+  button{
+    font-family:var(--mono);font-size:13px;
+    background:var(--gold);color:#10121a;border:0;border-radius:2px;
+    padding:11px 18px;font-weight:700;letter-spacing:.02em;cursor:pointer;
+  }
+  button.ghost{background:transparent;color:var(--text);border:1px solid var(--line);font-weight:400}
+  button:disabled{opacity:.4;cursor:default}
+  button:focus-visible{outline:2px solid var(--gold);outline-offset:2px}
 
-It does four separate things, and each one can fail on its own:
+  .tally{
+    display:flex;gap:14px;flex-wrap:wrap;margin:20px 0 0;
+    font-size:12px;color:var(--mute)
+  }
+  .tally b{font-size:20px;display:block;font-weight:600;letter-spacing:-.02em}
+  .t-pass b{color:var(--ok)} .t-fail b{color:var(--err)}
+  .t-inc b{color:var(--warn)} .t-ns b{color:var(--mute)}
 
-  1. SIGNATURE   Ed25519 over the canonical bundle. Confirms the bundle came
-                 from the holder of the named key and has not been edited by
-                 anybody since.
+  /* the spine: checks hold the order the document declares */
+  ol.spine{list-style:none;margin:26px 0 0;padding:0;position:relative}
+  ol.spine:before{
+    content:"";position:absolute;left:19px;top:6px;bottom:6px;width:1px;
+    background:var(--line)
+  }
+  li.check{position:relative;padding:0 0 2px 52px;margin:0 0 2px}
+  .slot{
+    position:absolute;left:0;top:12px;width:39px;height:22px;
+    display:flex;align-items:center;justify-content:center;
+    background:var(--ink);color:var(--mute);
+    font-size:11px;letter-spacing:.08em;z-index:1
+  }
+  .row{
+    border-bottom:1px solid var(--line);
+    padding:12px 0 13px;
+    display:flex;align-items:baseline;gap:10px;flex-wrap:wrap
+  }
+  .name{font-size:14px;font-weight:600;letter-spacing:-.01em}
+  .verdict{
+    font-size:10px;letter-spacing:.14em;text-transform:uppercase;
+    padding:3px 7px;border:1px solid currentColor;border-radius:2px;white-space:nowrap
+  }
+  .v-pass{color:var(--ok)} .v-fail{color:var(--err)}
+  .v-inc{color:var(--warn)} .v-ns{color:var(--mute)}
+  .v-run{color:var(--gold)}
+  .v-wait{color:var(--line)}
+  .why{flex-basis:100%;color:var(--mute);font-size:12.5px;margin-top:2px}
+  .why b{color:var(--text);font-weight:600}
+  .ep{
+    flex-basis:100%;font-size:11.5px;color:var(--mute);
+    margin-top:5px;word-break:break-all
+  }
+  .ep a{color:var(--gold);text-decoration:none;border-bottom:1px solid rgba(201,168,76,.35)}
+  details{flex-basis:100%;margin-top:8px}
+  summary{
+    font-size:11px;letter-spacing:.1em;text-transform:uppercase;
+    color:var(--mute);cursor:pointer;list-style:none
+  }
+  summary::-webkit-details-marker{display:none}
+  summary:before{content:"▸ ";}
+  details[open] summary:before{content:"▾ ";}
+  pre{
+    background:var(--ink2);border:1px solid var(--line);border-radius:2px;
+    margin:8px 0 0;padding:10px;font-size:11.5px;line-height:1.45;
+    white-space:pre-wrap;word-break:break-word;max-height:280px;overflow:auto
+  }
+  li.check.done .slot{color:var(--text)}
 
-  2. INTEGRITY   Recomputes every grant digest, the lineage digest and the
-                 parameter digest from the fields in front of it. Confirms
-                 the bundle is internally consistent with its own contents.
+  footer{
+    margin-top:34px;border-top:1px solid var(--line);padding-top:16px;
+    color:var(--mute);font-size:12px
+  }
+  footer p{margin:0 0 9px}
+  .flash{
+    border:1px solid var(--err);color:var(--err);
+    padding:11px;border-radius:2px;margin:16px 0 0;font-size:12.5px
+  }
+  @media (prefers-reduced-motion: no-preference){
+    li.check.done .row{animation:in .22s ease-out}
+    @keyframes in{from{opacity:.35}to{opacity:1}}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
 
-  3. DERIVATION  Re-runs the authority rules from scratch: root issued by a
-                 human, an unbroken parent chain, scope covered at every hop,
-                 constraints narrowing on every axis, purpose narrowing,
-                 validity windows contained, nothing revoked, and the action
-                 itself inside the effective limits of the whole lineage.
+<header>
+  <p class="eyebrow">Ordering test · self check</p>
+  <h1>Run every check this domain publishes about itself.</h1>
+  <p class="sub">Reads <b>/.well-known/ordering-test.json</b>, then tests each check in the order the document declares it. Nothing here is a shared runner — it only tests this side.</p>
+  <div class="bar">
+    <button id="run">Run all checks</button>
+    <button id="reload" class="ghost">Reload document</button>
+  </div>
+  <div class="tally" id="tally" hidden>
+    <div class="t-pass"><b id="n-pass">0</b>verified</div>
+    <div class="t-fail"><b id="n-fail">0</b>failed</div>
+    <div class="t-inc"><b id="n-inc">0</b>inconclusive</div>
+    <div class="t-ns"><b id="n-ns">0</b>not public</div>
+  </div>
+  <div id="flash"></div>
+</header>
 
-  4. AGREEMENT   Compares the verdict this script reached with the verdict the
-                 bundle claims. Disagreement is reported as a failure of the
-                 issuer, not of this script.
+<ol class="spine" id="spine"></ol>
 
-WHAT A PASS MEANS
------------------
-That the authority for this action was derivable, at that time, from that
-human grant - or, for a refusal, that it genuinely was not, and that the named
-grant and invariant really are where it broke.
+<footer>
+  <p><b>Verified</b> means the response was checked for what the claim actually requires. <b>Reachable</b> means the endpoint answered but this runner did not confirm the semantics — reported as inconclusive, not as a pass.</p>
+  <p>A check marked not publicly demonstrable is reported as such and never counted as a pass. This page cannot see behind a key and does not pretend to.</p>
+</footer>
 
-WHAT A PASS DOES NOT MEAN
--------------------------
-That the root grant should ever have been issued. That the parameters describe
-something that really happened. That the risk engine was right. Derivation is
-not merit and it is not truth.
+</div>
 
-The risk half of a composed verdict cannot be re-derived here, because that
-needs the issuer's scoring engine. Where the bundle's authority verdict is
-BLOCK, the composed verdict stands regardless, because the composition takes
-the worse of the two.
-"""
+<script>
+(function(){
+  "use strict";
 
-import binascii
-import hashlib
-import json
-import sys
+  var DOC = "/.well-known/ordering-test.json";
+  var doc = null;
+  var ctx = {};
 
-GRANT_PREFIX = b"AILEASH-GRANT-v1:"
-EVAL_PREFIX = b"AILEASH-AUTHEVAL-v1:"
-BUNDLE_PREFIX = b"AILEASH-AUTHORITY-PROOF-v1:"
+  var el = function(id){ return document.getElementById(id); };
+  var spine = el("spine");
 
-MAX_DEPTH = 32
-RANK = {"ALLOW": 0, "CHALLENGE": 1, "BLOCK": 2}
+  function flash(msg){
+    el("flash").innerHTML = msg ? '<div class="flash">' + msg + '</div>' : '';
+  }
 
+  function pad(n){ return (n < 10 ? "0" : "") + n; }
 
-# ======================================================================
-# Ed25519, RFC 8032, standard library only
-# ======================================================================
+  function jget(path){
+    return fetch(path, {headers:{"Accept":"application/json"}}).then(function(r){
+      return r.text().then(function(t){
+        var body;
+        try { body = JSON.parse(t); } catch(e){ body = t; }
+        return {status:r.status, ok:r.ok, body:body};
+      });
+    });
+  }
 
-_Q = 2 ** 255 - 19
-_L = 2 ** 252 + 27742317777372353535851937790883648493
-_D = -121665 * pow(121666, _Q - 2, _Q) % _Q
-_I = pow(2, (_Q - 1) // 4, _Q)
+  function jpost(path, payload){
+    return fetch(path, {
+      method:"POST",
+      headers:{"Content-Type":"application/json","Accept":"application/json"},
+      body:JSON.stringify(payload)
+    }).then(function(r){
+      return r.text().then(function(t){
+        var body;
+        try { body = JSON.parse(t); } catch(e){ body = t; }
+        return {status:r.status, ok:r.ok, body:body};
+      });
+    });
+  }
 
+  // SHA-256 in the visitor's own browser. The point of rule binding is that
+  // the server hands back the exact string it hashed; if this page recomputes
+  // the digest and it matches, nothing was taken on the server's word.
+  function sha256hex(s){
+    return crypto.subtle.digest("SHA-256", new TextEncoder().encode(s))
+      .then(function(buf){
+        var b = new Uint8Array(buf), out = "";
+        for (var i = 0; i < b.length; i++){
+          var h = b[i].toString(16);
+          out += (h.length === 1 ? "0" : "") + h;
+        }
+        return out;
+      });
+  }
 
-def _h(m):
-    return hashlib.sha512(m).digest()
+  var HEX64 = /^[0-9a-f]{64}$/;
 
-
-def _inv(x):
-    return pow(x, _Q - 2, _Q)
-
-
-def _xrecover(y):
-    xx = (y * y - 1) * _inv(_D * y * y + 1)
-    x = pow(xx, (_Q + 3) // 8, _Q)
-    if (x * x - xx) % _Q != 0:
-        x = (x * _I) % _Q
-    if x % 2 != 0:
-        x = _Q - x
-    return x
-
-
-_BY = 4 * _inv(5) % _Q
-_BX = _xrecover(_BY)
-_B = (_BX % _Q, _BY % _Q, 1, (_BX * _BY) % _Q)
-_IDENT = (0, 1, 1, 0)
-
-
-def _add(p, q):
-    x1, y1, z1, t1 = p
-    x2, y2, z2, t2 = q
-    a = (y1 - x1) * (y2 - x2) % _Q
-    b = (y1 + x1) * (y2 + x2) % _Q
-    c = t1 * 2 * _D * t2 % _Q
-    dd = z1 * 2 * z2 % _Q
-    e, f, g, hh = b - a, dd - c, dd + c, b + a
-    return (e * f % _Q, g * hh % _Q, f * g % _Q, e * hh % _Q)
-
-
-def _scalarmult(p, e):
-    if e == 0:
-        return _IDENT
-    q = _scalarmult(p, e // 2)
-    q = _add(q, q)
-    if e & 1:
-        q = _add(q, p)
-    return q
-
-
-def _encodepoint(p):
-    x, y, z, _t = p
-    zi = _inv(z)
-    x, y = x * zi % _Q, y * zi % _Q
-    bits = [(y >> i) & 1 for i in range(255)] + [x & 1]
-    return bytes(sum(bits[i * 8 + j] << j for j in range(8)) for i in range(32))
-
-
-def _bit(h, i):
-    return (h[i // 8] >> (i % 8)) & 1
-
-
-def _hint(m):
-    h = _h(m)
-    return sum(2 ** i * _bit(h, i) for i in range(512))
-
-
-def _isoncurve(p):
-    x, y, z, t = p
-    return (z % _Q != 0 and x * y % _Q == z * t % _Q
-            and (y * y - x * x - z * z - _D * t * t) % _Q == 0)
-
-
-def _decodepoint(s):
-    y = int.from_bytes(s, "little") & ((1 << 255) - 1)
-    x = _xrecover(y)
-    if x & 1 != _bit(s, 255):
-        x = _Q - x
-    p = (x, y, 1, (x * y) % _Q)
-    if not _isoncurve(p):
-        raise ValueError("point off curve")
-    return p
-
-
-def ed25519_verify(sig, msg, pk):
-    if len(sig) != 64 or len(pk) != 32:
-        return False
-    try:
-        rr = _decodepoint(sig[:32])
-        a = _decodepoint(pk)
-    except Exception:
-        return False
-    s = int.from_bytes(sig[32:64], "little")
-    if s >= _L:
-        return False
-    hh = _hint(sig[:32] + pk + msg)
-    return _encodepoint(_scalarmult(_B, s)) == _encodepoint(_add(rr, _scalarmult(a, hh)))
-
-
-# ======================================================================
-# the rules, reimplemented from the published spec
-# ======================================================================
-
-def canon(obj):
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
-
-
-def sha(prefix, text):
-    return hashlib.sha256(prefix + text.encode("utf-8")).hexdigest()
-
-
-def grant_digest(g):
-    material = {
-        "id": g["id"], "parent": g["parent"], "issuer": g["issuer"],
-        "issuer_kind": g["issuer_kind"], "subject": g["subject"],
-        "subject_kind": g["subject_kind"], "scope": sorted(g["scope"]),
-        "constraints": g["constraints"], "purpose": g["purpose"],
-        "purpose_tags": sorted(g["purpose_tags"]),
-        "not_before": g["not_before"], "not_after": g["not_after"],
-        "depth": g["depth"], "delegations_left": g["delegations_left"],
-        "created": g["created"], "risk_accepted_by": g.get("risk_accepted_by"),
+  function walk(node, path, strings, hexes){
+    if (typeof node === "string"){
+      strings.push({path: path || "(root)", value: node});
+      if (HEX64.test(node)) hexes[node] = path || "(root)";
+      return;
     }
-    return sha(GRANT_PREFIX, canon(material))
+    if (Array.isArray(node)){
+      for (var i = 0; i < node.length; i++) walk(node[i], path + "[" + i + "]", strings, hexes);
+      return;
+    }
+    if (node && typeof node === "object"){
+      for (var k in node){
+        if (Object.prototype.hasOwnProperty.call(node, k)){
+          walk(node[k], path ? path + "." + k : k, strings, hexes);
+        }
+      }
+    }
+  }
 
+  // The payload these POST routes expect is not published, so this does two
+  // things rather than guess: it tries the shapes they plausibly take, and
+  // when a rejection names a missing field it adds that field and tries
+  // again. A module that answers "'trust'" has told you what it wants.
+  function defaultFor(name){
+    if (/country/.test(name)) return "GB";
+    if (/currency/.test(name)) return "GBP";
+    if (/(^|_)id$|_id$|user|device|session/.test(name)) return "self-check";
+    if (/trust|score|ratio|rate/.test(name)) return 0.5;
+    return 0;
+  }
 
-def covers(held, wanted):
-    if held == wanted or held == "*":
-        return True
-    if held.endswith(".*"):
-        return wanted == held[:-2] or wanted.startswith(held[:-1])
-    return False
+  function missingField(body){
+    var text = (body && typeof body === "object")
+      ? (body.message || body.error || JSON.stringify(body))
+      : String(body || "");
+    // A bare quoted identifier is what a KeyError looks like once it reaches
+    // the response. Also catch an explicit "missing x" phrasing.
+    var m = text.match(/^['"]([A-Za-z_][A-Za-z0-9_]*)['"]$/) ||
+            text.match(/missing[^A-Za-z0-9_]+['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?/i) ||
+            text.match(/required[^A-Za-z0-9_]+['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?/i);
+    return m ? m[1] : null;
+  }
 
+  function postShapes(url, inner){
+    var learned = [];
 
-def wildcard_breadth(scope, capability):
-    best = None
-    for held in scope:
-        if not covers(held, capability):
-            continue
-        if held == capability:
-            return 0
-        width = (capability.count(".") + 2 if held == "*"
-                 else capability.count(".") - held[:-2].count("."))
-        best = width if best is None else min(best, width)
-    return best
+    function round(probe, depth){
+      var shapes = [{name:"flat", body:probe},
+                    {name:"inputs", body:{inputs:probe}},
+                    {name:"event", body:{event:probe}}];
+      var rejected = {};
 
+      function go(i){
+        if (i >= shapes.length){
+          // Every shape failed the same way? Learn the field and go again.
+          var field = null;
+          for (var k in rejected){
+            if (Object.prototype.hasOwnProperty.call(rejected, k)){
+              field = missingField(rejected[k]);
+              if (field) break;
+            }
+          }
+          if (field && depth < 6 && !(field in probe)){
+            var next = {};
+            for (var p in probe){
+              if (Object.prototype.hasOwnProperty.call(probe, p)) next[p] = probe[p];
+            }
+            next[field] = defaultFor(field);
+            learned.push(field);
+            return round(next, depth + 1);
+          }
+          return Promise.resolve({ok:false, rejected:rejected, learned:learned, probe:probe});
+        }
+        return jpost(url, shapes[i].body).then(function(r){
+          if (!r.ok){ rejected[shapes[i].name] = r.body; return go(i + 1); }
+          return {ok:true, shape:shapes[i].name, body:r.body, sent:shapes[i].body,
+                  rejected:rejected, learned:learned};
+        }).catch(function(e){
+          rejected[shapes[i].name] = e.message; return go(i + 1);
+        });
+      }
+      return go(0);
+    }
 
-def direction(key):
-    for p in ("max_", "min_", "allowed_", "denied_", "may_"):
-        if key.startswith(p):
-            return p
-    return None
+    return round(inner, 0);
+  }
 
+  function oneMessage(b){
+    if (b && typeof b === "object" && (b.message || b.error)) return b.message || b.error;
+    if (typeof b === "string") return b.slice(0, 200);
+    return "no message";
+  }
 
-def num(v):
-    if isinstance(v, bool) or v is None:
-        raise ValueError("not a number")
-    return float(v)
+  // Every shape's rejection, not just the first. The first one is usually the
+  // least informative, and the shape that nearly worked is the one that says
+  // what is actually wrong.
+  function firstMessage(rejected){
+    var parts = [];
+    for (var k in rejected){
+      if (Object.prototype.hasOwnProperty.call(rejected, k)){
+        parts.push("<b>" + k + "</b>: " + oneMessage(rejected[k]));
+      }
+    }
+    return parts.length ? parts.join(" \u00b7 ") : "no message returned";
+  }
 
+  function learnedNote(res){
+    return (res.learned && res.learned.length)
+      ? " (after adding the fields it named: " + res.learned.join(", ") + ")"
+      : "";
+  }
 
-def as_set(v):
-    if isinstance(v, (list, tuple, set)):
-        return set(v)
-    return {v}
+  // The engine's real signal names. Guessing these from outside was the
+  // thing that kept the reproducibility check amber.
+  var PROBE = {action: "payment", amount: 4200, trust: 0.4,
+               v60: 12, v5m: 20, v1h: 60,
+               device_risk: 0.3, anomaly: 0.2, country: "UK",
+               country_shift: false};
 
+  function show(v){
+    try { return JSON.stringify(v, null, 2); } catch(e){ return String(v); }
+  }
 
-def narrower(parent_c, child_c):
-    for key in sorted(child_c):
-        d = direction(key)
-        cval = child_c[key]
-        if d is None:
-            return False, "constraint '%s' has no narrowing rule" % key
-        if key not in parent_c:
-            return False, "constraint '%s' is not expressed by the parent" % key
-        pval = parent_c[key]
-        try:
-            if d == "max_" and num(cval) > num(pval):
-                return False, "%s raised from %s to %s" % (key, pval, cval)
-            if d == "min_" and num(cval) < num(pval):
-                return False, "%s lowered from %s to %s" % (key, pval, cval)
-            if d == "allowed_" and not as_set(cval) <= as_set(pval):
-                return False, "%s adds values the parent does not hold" % key
-            if d == "denied_" and not as_set(pval) <= as_set(cval):
-                return False, "%s drops values the parent denies" % key
-            if d == "may_" and bool(cval) and not bool(pval):
-                return False, "%s enabled where the parent withholds it" % key
-        except (TypeError, ValueError):
-            return False, "constraint '%s' is not comparable" % key
-    return True, None
+  // ---- document ---------------------------------------------------------
 
+  function loadDoc(){
+    flash("");
+    spine.innerHTML = "";
+    el("tally").hidden = true;
+    // The module that serves the discovery document installs its route on
+    // first use, so after a deploy the document 404s until something touches
+    // it. Touch it here rather than making a person remember to.
+    return jget("/x/standard/status").catch(function(){}).then(function(){
+      return jget(DOC);
+    }).then(function(r){
+      if (!r.ok || typeof r.body !== "object"){
+        flash("Could not read " + DOC + " — status " + r.status +
+              ". If this is a fresh deploy, open /x/standard/status once to install the route, then reload.");
+        doc = null;
+        return null;
+      }
+      doc = r.body;
+      draw();
+      return doc;
+    }).catch(function(e){
+      flash("Request failed: " + e.message + ". Serve this page from the same domain as the document.");
+    });
+  }
 
-def effective(chain):
-    eff = {}
-    for g in chain:
-        for k, v in g["constraints"].items():
-            d = direction(k)
-            if k not in eff:
-                eff[k] = v
-                continue
-            cur = eff[k]
-            try:
-                if d == "max_":
-                    eff[k] = min(num(cur), num(v))
-                elif d == "min_":
-                    eff[k] = max(num(cur), num(v))
-                elif d == "allowed_":
-                    eff[k] = sorted(as_set(cur) & as_set(v))
-                elif d == "denied_":
-                    eff[k] = sorted(as_set(cur) | as_set(v))
-                elif d == "may_":
-                    eff[k] = bool(cur) and bool(v)
-            except (TypeError, ValueError):
-                eff[k] = v
-    return eff
+  function draw(){
+    var names = Object.keys(doc.checks || {});
+    spine.innerHTML = "";
+    names.forEach(function(name, i){
+      var c = doc.checks[name];
+      var li = document.createElement("li");
+      li.className = "check";
+      li.id = "chk-" + name;
+      li.innerHTML =
+        '<span class="slot">' + pad(i+1) + '</span>' +
+        '<div class="row">' +
+          '<span class="name">' + name.replace(/_/g," ") + '</span>' +
+          '<span class="verdict v-wait" data-v>waiting</span>' +
+          '<div class="why" data-why>' +
+            (c.supported ? "declared supported" : "declared not supported") +
+            (c.demonstrable_publicly ? ", publicly demonstrable" : ", not publicly demonstrable") +
+          '</div>' +
+          (c.endpoint ? '<div class="ep">' + c.endpoint + '</div>' : '') +
+        '</div>';
+      spine.appendChild(li);
+    });
+    var t = doc.vendor ? doc.vendor : "this domain";
+    document.querySelector(".sub").innerHTML =
+      'Document loaded from <b>' + (doc.base_url || location.origin) + '</b> · vendor <b>' + t +
+      '</b> · version <b>' + (doc.ordering_test_version || "?") + '</b> · ' +
+      names.length + ' checks declared.';
+  }
 
+  function setResult(name, verdict, why, detail){
+    var li = el("chk-" + name);
+    if (!li) return;
+    li.classList.add("done");
+    var v = li.querySelector("[data-v]");
+    var map = {PASS:"v-pass", FAIL:"v-fail", INCONCLUSIVE:"v-inc", "NOT SUPPORTED":"v-ns", RUNNING:"v-run"};
+    v.className = "verdict " + (map[verdict] || "v-wait");
+    v.textContent = verdict;
+    li.querySelector("[data-why]").innerHTML = why;
+    if (detail !== undefined){
+      var old = li.querySelector("details");
+      if (old) old.remove();
+      var d = document.createElement("details");
+      d.innerHTML = "<summary>response</summary><pre>" +
+        show(detail).replace(/</g,"&lt;") + "</pre>";
+      li.querySelector(".row").appendChild(d);
+    }
+  }
 
-def params_against(params, eff):
-    hard, unconstrained = [], []
-    for key in sorted(params):
-        val = params[key]
-        checked = False
-        for cname, cval in eff.items():
-            d = direction(cname)
-            if not d or cname[len(d):] != key:
-                continue
-            checked = True
-            try:
-                if d == "max_" and num(val) > num(cval):
-                    hard.append("%s=%s exceeds %s=%s" % (key, val, cname, cval))
-                elif d == "min_" and num(val) < num(cval):
-                    hard.append("%s=%s is below %s=%s" % (key, val, cname, cval))
-                elif d == "allowed_" and val not in as_set(cval):
-                    hard.append("%s=%s is outside %s" % (key, val, cname))
-                elif d == "denied_" and val in as_set(cval):
-                    hard.append("%s=%s is denied by %s" % (key, val, cname))
-                elif d == "may_" and bool(val) and not bool(cval):
-                    hard.append("%s requested where %s withholds it" % (key, cname))
-            except (TypeError, ValueError):
-                hard.append("%s cannot be compared with %s" % (key, cname))
-        if not checked:
-            unconstrained.append(key)
-    return hard, unconstrained
+  function running(name){
+    var li = el("chk-" + name);
+    if (!li) return;
+    var v = li.querySelector("[data-v]");
+    v.className = "verdict v-run";
+    v.textContent = "running";
+  }
 
+  // ---- context the checks need before they can run ----------------------
 
-# ======================================================================
-# the four checks
-# ======================================================================
+  function buildContext(){
+    ctx = {};
+    var jobs = [];
 
-class Report(object):
-    def __init__(self):
-        self.rows = []
-        self.failed = False
+    jobs.push(jget("/x/complete/periods").then(function(r){
+      if (!r.ok || typeof r.body !== "object") return;
+      var list = r.body.periods || r.body.committed || r.body;
+      if (!Array.isArray(list)) return;
+      for (var i = list.length - 1; i >= 0; i--){
+        var p = list[i];
+        var id = (typeof p === "string") ? p : (p.period || p.id);
+        var committed = (typeof p === "string") ? true :
+          (p.committed === undefined ? true : !!p.committed);
+        if (id && committed){ ctx.period = id; break; }
+      }
+    }).catch(function(){}));
 
-    def add(self, ok, name, detail=""):
-        self.rows.append((ok, name, detail))
-        if not ok:
-            self.failed = True
+    jobs.push(jget("/x/consistency/root").then(function(r){
+      if (!r.ok || typeof r.body !== "object") return;
+      ctx.size = r.body.size || r.body.tree_size || r.body.count;
+      ctx.root = r.body.root;
+    }).catch(function(){}));
 
-    def note(self, name, detail=""):
-        self.rows.append((None, name, detail))
+    var hex = "0123456789abcdef";
+    ctx.absent = "";
+    for (var i = 0; i < 64; i++) ctx.absent += hex[Math.floor(Math.random() * 16)];
 
-    def render(self):
-        out = []
-        for ok, name, detail in self.rows:
-            mark = "  ok  " if ok else ("FAIL  " if ok is False else "  --  ")
-            out.append(mark + name + (("\n        " + detail) if detail else ""))
-        return "\n".join(out)
+    return Promise.all(jobs);
+  }
 
+  function fill(endpoint){
+    if (!endpoint) return null;
+    return endpoint
+      .replace("{period}", ctx.period || "")
+      .replace("{value}", ctx.absent)
+      .replace("{first}", "1")
+      .replace("{second}", ctx.size ? String(ctx.size) : "");
+  }
 
-def check_signature(bundle, rep):
-    sig_hex = bundle.get("signature")
-    pk_hex = (bundle.get("issued_by") or {}).get("public_key")
-    if not sig_hex or not pk_hex:
-        rep.add(False, "Signature present", "the bundle carries no signature or no key")
-        return
-    body = dict(bundle)
-    body.pop("signature", None)
-    body.pop("verify_with", None)
-    try:
-        sig = binascii.unhexlify(sig_hex)
-        pk = binascii.unhexlify(pk_hex)
-    except Exception:
-        rep.add(False, "Signature is readable hex")
-        return
-    ok = ed25519_verify(sig, BUNDLE_PREFIX + canon(body).encode("utf-8"), pk)
-    rep.add(ok, "Ed25519 signature over the canonical bundle",
-            "key " + pk_hex[:16] + "…  Verify this key independently at the issuer's "
-            "published address before trusting who signed." if ok else
-            "the bundle was altered after signing, or it was not signed by this key")
+  // ---- the checks -------------------------------------------------------
+  // Each returns {verdict, why, detail}.
 
+  var runners = {
 
-def check_integrity(bundle, rep):
-    lineage = bundle.get("lineage") or []
-    bad = []
-    for g in lineage:
-        try:
-            if grant_digest(g) != g.get("digest"):
-                bad.append(g.get("id"))
-        except Exception:
-            bad.append(g.get("id"))
-    rep.add(not bad, "Every grant digest recomputes from its own fields",
-            "" if not bad else "mismatched: " + ", ".join(str(b) for b in bad))
+    authority_tokens: function(c){
+      return jget(c.endpoint || "/x/continuity/decisions").then(function(r){
+        if (!r.ok){
+          return {verdict:"FAIL", why:"returned " + r.status, detail:r.body};
+        }
+        var b = r.body || {};
+        var list = b.decisions || [];
+        if (!list.length){
+          return {verdict:"INCONCLUSIVE",
+                  why:"the record is public and readable, but no authority has been exercised " +
+                      "yet \u2014 nothing to check, which is not the same as nothing failing",
+                  detail:b};
+        }
+        // Pull one at random and confirm the listing agrees with the sealed
+        // decision behind it. A summary that disagrees with its own record is
+        // the failure worth catching here.
+        var pick = list[Math.floor(Math.random() * list.length)];
+        return jget("/x/continuity/decision?evaluation=" + encodeURIComponent(pick.evaluation))
+          .then(function(d){
+            if (!d.ok){
+              return {verdict:"FAIL",
+                      why:"the listing offers " + pick.evaluation + " but the decision behind " +
+                          "it returned " + d.status,
+                      detail:{listed:pick, fetched:d.body}};
+            }
+            var db = d.body || {};
+            if (db.verdict !== pick.verdict){
+              return {verdict:"FAIL",
+                      why:"the public listing says <b>" + pick.verdict + "</b> and the sealed " +
+                          "decision says <b>" + db.verdict + "</b>",
+                      detail:{listed:pick, sealed:db}};
+            }
+            if (!db.lineage_digest || db.block_index === undefined){
+              return {verdict:"INCONCLUSIVE",
+                      why:"decision retrieved without a key, but it carries no lineage digest " +
+                          "or block index to tie it to the chain",
+                      detail:db};
+            }
+            return {verdict:"PASS",
+                    why:"real sealed decisions readable without an account \u2014 <b>" +
+                        (b.totals ? b.totals.allowed : "?") + " allowed, " +
+                        (b.totals ? b.totals.challenged : "?") + " challenged, " +
+                        (b.totals ? b.totals.blocked : "?") + " blocked</b>. Picked <b>" +
+                        pick.evaluation + "</b> at random and the sealed record agrees with " +
+                        "the listing, carrying its lineage digest and block index" +
+                        (db.broken_invariant ? " and naming <b>" + db.broken_invariant +
+                                               "</b> as what broke" : ""),
+                    detail:{listing:b.totals, picked:pick, sealed:db}};
+          });
+      });
+    },
 
-    claimed = (bundle.get("decision") or {}).get("lineage_digest")
-    mine = sha(EVAL_PREFIX, canon([g.get("digest") for g in lineage]))
-    rep.add(mine == claimed, "Lineage digest matches the ordered path",
-            "" if mine == claimed else "computed " + mine[:20] + "… claimed " + str(claimed)[:20] + "…")
+    reconciliation: function(c){
+      return jget(c.endpoint || "/x/reconcile/public").then(function(r){
+        if (!r.ok){
+          return {verdict:"FAIL", why:"returned " + r.status, detail:r.body};
+        }
+        var b = r.body || {};
+        var runs = b.recent || [];
+        if (!runs.length){
+          return {verdict:"INCONCLUSIVE",
+                  why:"the record is public and readable, but no reconciliation run exists yet",
+                  detail:b};
+        }
+        var done = runs.filter(function(x){ return x.status === "reconciled"; });
+        var pick = (done.length ? done : runs)[0];
+        return jget("/x/reconcile/proof?id=" + encodeURIComponent(pick.run_id)).then(function(p){
+          if (!p.ok){
+            return {verdict:"FAIL",
+                    why:"the listing offers " + pick.run_id + " but its proof returned " + p.status,
+                    detail:{listed:pick, fetched:p.body}};
+          }
+          var pb = p.body || {};
+          if (pb.plan_block_index === null || pb.result_block_index === null){
+            return {verdict:"INCONCLUSIVE",
+                    why:"run <b>" + pick.run_id + "</b> was planned but never submitted, so " +
+                        "there is no result block to order against. Published rather than " +
+                        "hidden, which is the right behaviour, but it does not demonstrate " +
+                        "the check",
+                    detail:pb};
+          }
+          if (!(pb.plan_block_index < pb.result_block_index)){
+            return {verdict:"FAIL",
+                    why:"the selection was sealed at block " + pb.plan_block_index +
+                        " and the result at " + pb.result_block_index +
+                        " \u2014 the sample was not fixed before the data was requested",
+                    detail:pb};
+          }
+          return {verdict:"PASS",
+                  why:"the sample for <b>" + pb.run_id + "</b> was sealed at block <b>" +
+                      pb.plan_block_index + "</b> and the result at <b>" +
+                      pb.result_block_index + "</b> \u2014 fixed before any data was asked " +
+                      "for, checkable without an account. Across the record: <b>" +
+                      b.mismatched + " mismatches</b> and <b>" + b.abandoned +
+                      " abandoned run" + (b.abandoned === 1 ? "" : "s") +
+                      "</b> published rather than buried",
+                  detail:{summary:{runs:b.runs, matched:b.matched, mismatched:b.mismatched,
+                                   abandoned:b.abandoned}, proof:pb}};
+        });
+      });
+    },
 
-    req = bundle.get("request") or {}
-    claimed_p = (bundle.get("decision") or {}).get("params_digest")
-    mine_p = sha(EVAL_PREFIX, canon({"action": req.get("action"),
-                                     "params": req.get("params") or {}}))
-    rep.add(mine_p == claimed_p, "Parameter digest matches the request as stated",
-            "" if mine_p == claimed_p else "the parameters shown are not the "
-            "parameters that were judged")
+    rule_binding: function(c){
+      return postShapes(c.endpoint || "/x/rulebind/prove", PROBE).then(function(res){
+        if (!res.ok){
+          return {verdict:"INCONCLUSIVE",
+                  why:"live, but it rejected every payload shape this runner knows \u2014 " +
+                      firstMessage(res.rejected),
+                  detail:res.rejected};
+        }
+        var strings = [], hexes = {};
+        walk(res.body, "", strings, hexes);
+        return Promise.all(strings.map(function(s){
+          return sha256hex(s.value).then(function(h){ return {path:s.path, hash:h}; });
+        })).then(function(hashed){
+          for (var i = 0; i < hashed.length; i++){
+            if (hexes[hashed[i].hash]){
+              return {verdict:"PASS",
+                      why:"the response returned the exact string that was hashed. SHA-256 of " +
+                          "<b>" + hashed[i].path + "</b>, recomputed in this browser, equals " +
+                          "<b>" + hexes[hashed[i].hash] + "</b> \u2014 the ruleset version is " +
+                          "inside the digest, not a field beside it",
+                      detail:res.body};
+            }
+          }
+          return {verdict:"INCONCLUSIVE",
+                  why:"accepted the <b>" + res.shape + "</b> payload" + learnedNote(res) +
+                      ", but no string it returned " +
+                      "hashes to any digest in the response, so the binding was not confirmed here",
+                  detail:res.body};
+        });
+      });
+    },
 
+    commit_before_reveal: function(c){
+      return jpost(c.endpoint || "/x/demo/review", PROBE).then(function(r){
+        if (!r.ok){
+          return {verdict:"INCONCLUSIVE", why:"POST returned " + r.status, detail:r.body};
+        }
+        var b = r.body || {};
+        var cid = b.case_id;
+        if (!cid){
+          return {verdict:"INCONCLUSIVE", why:"no case id came back to commit against", detail:b};
+        }
+        // The case must arrive with the verdict withheld. If it is in there,
+        // nothing committed afterwards can have preceded a reveal that had
+        // already happened.
+        var text = JSON.stringify(b);
+        if (/"(machine_verdict|verdict|decision)"\s*:\s*"(ALLOW|CHALLENGE|BLOCK)"/i.test(text)){
+          return {verdict:"FAIL",
+                  why:"the case arrived with the machine verdict already in it \u2014 the order " +
+                      "cannot be fixed after the answer is known",
+                  detail:b};
+        }
 
-def rederive(bundle, rep):
-    """Run the published rules from scratch and reach an independent verdict."""
-    lineage = bundle.get("lineage") or []
-    decision = bundle.get("decision") or {}
-    req = bundle.get("request") or {}
-    at = decision.get("evaluated_at_epoch")
+        return jpost("/x/demo/commit", {case_id: cid, verdict: "challenge"}).then(function(k){
+          if (!k.ok){
+            return {verdict:"INCONCLUSIVE",
+                    why:"the case opened with the verdict withheld, but the commit returned " +
+                        k.status,
+                    detail:{case:b, commit:k.body}};
+          }
+          var kb = k.body || {};
+          if (kb.block_index === undefined || !kb.machine_verdict){
+            return {verdict:"INCONCLUSIVE",
+                    why:"committed, but the response carries no block index or no revealed " +
+                        "verdict to check the order against",
+                    detail:{case:b, commit:kb}};
+          }
+          // A commitment you can redo is not a commitment.
+          return jpost("/x/demo/commit", {case_id: cid, verdict: "allow"}).then(function(again){
+            var refused = !again.ok ||
+                          (again.body && again.body.error === "already_committed");
+            if (!refused){
+              return {verdict:"FAIL",
+                      why:"the same case accepted a second, different verdict \u2014 a " +
+                          "commitment that can be redone fixes nothing",
+                      detail:{first:kb, second:again.body}};
+            }
+            return {verdict:"PASS",
+                    why:"the case was issued with the verdict withheld, a human verdict was " +
+                        "sealed at block <b>" + kb.block_index + "</b>, the machine verdict " +
+                        "(<b>" + kb.machine_verdict + "</b>) was revealed only in that same " +
+                        "response, dwell of <b>" + kb.dwell_seconds + "s</b> was recorded, and " +
+                        "a second commit was refused \u2014 the order is fixed, not asserted",
+                    detail:{case:b, commit:kb, second_attempt:again.body}};
+          });
+        });
+      }).catch(function(e){
+        return {verdict:"INCONCLUSIVE", why:"request failed: " + e.message};
+      });
+    },
 
-    hard, soft = [], []
-    broken_at = broken_invariant = None
+    mutual_witnessing: function(c){
+      return jget("/x/witness/peers").then(function(p){
+        return jget("/x/witness/tip").then(function(t){
+          if (!p.ok) return {verdict:"FAIL", why:"peers endpoint returned " + p.status, detail:p.body};
+          if (!t.ok) return {verdict:"FAIL", why:"tip endpoint returned " + t.status, detail:t.body};
+          var peers = p.body.peers || p.body;
+          var n = Array.isArray(peers) ? peers.length : 0;
+          if (n === 0){
+            return {verdict:"FAIL", why:"no peer chains listed — witnessing claims an external party and there isn't one", detail:p.body};
+          }
+          return {verdict:"PASS",
+                  why:"<b>" + n + " peer chain" + (n>1?"s":"") + "</b> listed and a current tip served, both without an account",
+                  detail:{peers:p.body, tip:t.body}};
+        });
+      });
+    },
 
-    def fail(grant, invariant, detail):
-        nonlocal broken_at, broken_invariant
-        hard.append(detail)
-        if broken_at is None:
-            broken_at, broken_invariant = grant, invariant
+    completeness_proof: function(c){
+      if (!ctx.period){
+        return Promise.resolve({verdict:"INCONCLUSIVE",
+          why:"no closed committed period found at /x/complete/periods, so there is nothing to ask for a root of"});
+      }
+      var url = fill(c.endpoint) || ("/x/complete/root?period=" + ctx.period);
+      return jget(url).then(function(r){
+        if (r.status === 409) return {verdict:"INCONCLUSIVE", why:"period " + ctx.period + " is still live — only closed periods commit", detail:r.body};
+        if (!r.ok) return {verdict:"FAIL", why:"returned " + r.status, detail:r.body};
+        var root = r.body.root || r.body.merkle_root;
+        var count = r.body.count !== undefined ? r.body.count : r.body.leaf_count;
+        if (!root || count === undefined){
+          return {verdict:"INCONCLUSIVE", why:"reachable, but no root and exact leaf count in the response", detail:r.body};
+        }
+        return {verdict:"PASS",
+                why:"root and an exact count of <b>" + count + "</b> leaves, committed for " + ctx.period + " before any export was asked for",
+                detail:r.body};
+      });
+    },
 
-    if not lineage:
-        fail(None, "authority_continuity", "the bundle carries no authority path")
-    else:
-        root = lineage[0]
-        if root.get("parent") is not None:
-            fail(root["id"], "authority_continuity",
-                 "the path does not begin at a parentless root")
-        if root.get("issuer_kind") != "human":
-            fail(root["id"], "identity_continuity",
-                 "the root grant was not issued by a human principal")
+    absence_proof: function(c){
+      if (!ctx.period){
+        return Promise.resolve({verdict:"INCONCLUSIVE",
+          why:"no committed period, so there is nothing to prove absence against"});
+      }
+      var url = fill(c.endpoint) ||
+        ("/x/complete/prove?period=" + ctx.period + "&value=" + ctx.absent);
+      return jget(url).then(function(r){
+        if (!r.ok) return {verdict:"FAIL", why:"returned " + r.status, detail:r.body};
+        var n = (r.body && r.body.neighbours) || (r.body && r.body.neighbors) || {};
+        if (n.lower && n.upper &&
+            n.lower.index !== undefined && n.upper.index !== undefined){
+          if (n.upper.index - n.lower.index === 1){
+            return {verdict:"PASS",
+                    why:"neighbours at indices <b>" + n.lower.index + "</b> and <b>" +
+                        n.upper.index + "</b> \u2014 consecutive, so nothing can sit between " +
+                        "them. Absence proved, not asserted",
+                    detail:r.body};
+          }
+          return {verdict:"FAIL",
+                  why:"neighbour indices " + n.lower.index + " and " + n.upper.index +
+                      " are not consecutive \u2014 that proves nothing",
+                  detail:r.body};
+        }
+        if (n.lower || n.upper){
+          return {verdict:"INCONCLUSIVE",
+                  why:"boundary case \u2014 the probe sorted outside the whole set, so only one " +
+                      "neighbour came back. Valid, but it does not exercise the adjacency argument",
+                  detail:r.body};
+        }
+        return {verdict:"INCONCLUSIVE", why:"no neighbours in the response", detail:r.body};
+      });
+    },
 
-        previous = None
-        for g in lineage:
-            if g.get("revoked_at") is not None:
-                fail(g["id"], "authority_continuity",
-                     "grant %s was revoked" % g["id"])
-            if at is not None:
-                if at < g["not_before"]:
-                    fail(g["id"], "temporal_validity",
-                         "grant %s was not yet valid at the time of the decision" % g["id"])
-                if at >= g["not_after"]:
-                    fail(g["id"], "temporal_validity",
-                         "grant %s had expired at the time of the decision" % g["id"])
-            if previous is not None:
-                if g.get("parent") != previous.get("id"):
-                    fail(g["id"], "authority_continuity",
-                         "grant %s does not point at the grant above it" % g["id"])
-                missing = [c for c in g["scope"]
-                           if not any(covers(p, c) for p in previous["scope"])]
-                if missing:
-                    fail(g["id"], "boundary_integrity",
-                         "%s holds scope its parent does not: %s"
-                         % (g["id"], ", ".join(sorted(missing))))
-                ok, why = narrower(previous["constraints"], g["constraints"])
-                if not ok:
-                    fail(g["id"], "boundary_integrity", "%s: %s" % (g["id"], why))
-                if not set(g["purpose_tags"]) <= set(previous["purpose_tags"]):
-                    fail(g["id"], "intent_continuity",
-                         "%s carries purpose tags its parent does not" % g["id"])
-                if (g["not_before"] < previous["not_before"]
-                        or g["not_after"] > previous["not_after"]):
-                    fail(g["id"], "temporal_validity",
-                         "%s is valid outside its parent's window" % g["id"])
-                if g["depth"] != previous["depth"] + 1:
-                    fail(g["id"], "authority_continuity",
-                         "%s records a depth inconsistent with its parent" % g["id"])
-            previous = g
+    consistency_proof: function(c){
+      if (!ctx.size){
+        return Promise.resolve({verdict:"INCONCLUSIVE",
+          why:"could not read a tree size from /x/consistency/root"});
+      }
+      var first = Math.max(1, Math.floor(ctx.size / 2));
+      var url = "/x/consistency/proof?first=" + first + "&second=" + ctx.size;
+      return jget(url).then(function(r){
+        if (!r.ok){
+          return {verdict:"FAIL",
+                  why:"returned " + r.status + " for first=" + first + " second=" + ctx.size,
+                  detail:r.body};
+        }
+        var b = r.body || {};
+        var path = b.consistency_proof || b.proof || b.path;
+        if (!Array.isArray(path) || path.length === 0){
+          return {verdict:"INCONCLUSIVE", why:"no proof path in the response", detail:b};
+        }
+        // The proof has to be against the same tip served at /x/consistency/root.
+        // A proof against some other root proves something about some other log.
+        if (ctx.root && b.second_root && b.second_root !== ctx.root){
+          return {verdict:"FAIL",
+                  why:"the proof is against a different root than /x/consistency/root serves \u2014 " +
+                      "two views of the log, which is the split view this check exists to rule out",
+                  detail:b};
+        }
+        return {verdict:"PASS",
+                why:"RFC 6962 proof of <b>" + path.length + " nodes</b> that the log at " + first +
+                    " is a prefix of the log at " + ctx.size +
+                    ", against the same tip served separately \u2014 append-only shown, not claimed",
+                detail:b};
+      });
+    },
 
-        if len(lineage) - 1 > MAX_DEPTH:
-            fail(lineage[-1]["id"], "boundary_integrity", "delegation depth exceeds the ceiling")
+    reproducibility: function(c){
+      return postShapes(c.endpoint || "/x/replay/challenge", PROBE).then(function(res){
+        if (!res.ok){
+          return {verdict:"INCONCLUSIVE",
+                  why:"live, but it rejected every payload shape this runner knows \u2014 " +
+                      firstMessage(res.rejected) +
+                      ". This endpoint is published as publicly demonstrable, so the shape it " +
+                      "wants belongs in the document",
+                  detail:res.rejected};
+        }
+        return jpost(c.endpoint || "/x/replay/challenge", res.sent).then(function(b){
+          return jget("/x/replay/fingerprint").then(function(f){
+            var va = res.body && (res.body.verdict || res.body.decision);
+            var vb = b.body && (b.body.verdict || b.body.decision);
+            if (!va || !vb){
+              return {verdict:"INCONCLUSIVE",
+                      why:"both runs accepted under the <b>" + res.shape + "</b> shape, but no " +
+                          "verdict field came back to compare",
+                      detail:{first:res.body, second:b.body}};
+            }
+            if (va === vb){
+              return {verdict:"PASS",
+                      why:"identical inputs submitted twice both returned <b>" + va + "</b> " +
+                          "under one code fingerprint" + learnedNote(res) +
+                          " \u2014 determinism shown without disclosing any scoring logic",
+                      detail:{shape:res.shape, fingerprint:f.body,
+                              first:res.body, second:b.body}};
+            }
+            return {verdict:"FAIL",
+                    why:"identical inputs gave <b>" + va + "</b> then <b>" + vb +
+                        "</b> \u2014 not deterministic",
+                    detail:{first:res.body, second:b.body}};
+          });
+        });
+      });
+    },
 
-        if not any(g.get("risk_accepted_by") for g in lineage):
-            fail(lineage[0]["id"], "identity_continuity",
-                 "no grant in this path names who accepted the risk")
+    external_anchoring: function(c){
+      var url = c.endpoint || "/api/anchor-status";
+      return jget(url).then(function(r){
+        if (!r.ok){
+          return {verdict:"FAIL",
+                  why:"<b>" + url + " returned " + r.status + "</b> \u2014 this check is " +
+                      "published as publicly demonstrable and the endpoint under it is not there",
+                  detail:r.body};
+        }
+        var b = r.body || {};
+        var tip = b.tip || b.chain_tip || b.anchored_tip;
+        if (!tip){
+          return {verdict:"INCONCLUSIVE",
+                  why:"the endpoint answers but names no anchored tip, so there is nothing to " +
+                      "check it against",
+                  detail:b};
+        }
 
-        leaf = lineage[-1]
-        action = req.get("action")
-        params = req.get("params") or {}
+        // A browser cannot verify Bitcoin, and this page will not pretend to.
+        // What it CAN settle is the question that actually decides the check:
+        // is the tip that was submitted to the external authority a tip of
+        // THIS log? An anchor over some other chain proves nothing about this
+        // one, and that substitution is the only way this check fails
+        // quietly.
+        return jget("/x/consistency/ancestor?tip=" + encodeURIComponent(tip)).then(function(a){
+          if (a.status === 409){
+            return {verdict:"FAIL",
+                    why:"the anchored tip is <b>not</b> on the log being served now \u2014 the " +
+                        "external timestamp covers a different chain, which is the fork this " +
+                        "check exists to catch",
+                    detail:{anchor:b, ancestor:a.body}};
+          }
+          if (!a.ok){
+            return {verdict:"INCONCLUSIVE",
+                    why:"anchored tip found, but /x/consistency/ancestor returned " + a.status +
+                        " so it could not be placed on this log",
+                    detail:{anchor:b, ancestor:a.body}};
+          }
+          var text = JSON.stringify(a.body || {});
+          var placed = /"(ancestor|is_ancestor|valid|ok|confirmed|on_chain)"\s*:\s*true/i.test(text) ||
+                       /"(consistency_proof|proof|path)"\s*:\s*\[/.test(text);
+          if (!placed){
+            return {verdict:"INCONCLUSIVE",
+                    why:"anchored tip found and the ancestor route answered, but this runner " +
+                        "could not read a confirmation out of the response",
+                    detail:{anchor:b, ancestor:a.body}};
+          }
+          var stamped = (b.ots_ok === true) || /anchored/i.test(String(b.status || ""));
+          return {verdict:"PASS",
+                  why:"the tip submitted to the external authority is proved to be on <b>this</b> " +
+                      "log, not a substituted one \u2014 checked against /x/consistency/ancestor" +
+                      (stamped ? ", and the operator reports it stamped: " +
+                                 String(b.status || "anchored")
+                               : ", though the operator does not report it stamped yet") +
+                      ". The attestation itself is the authority's to confirm, not this page's",
+                  detail:{anchor:b, ancestor:a.body}};
+        }).catch(function(e){
+          return {verdict:"INCONCLUSIVE",
+                  why:"anchored tip found but the ancestor check failed: " + e.message,
+                  detail:b};
+        });
+      });
+    }
+  };
 
-        if action and not any(covers(c, action) for c in leaf["scope"]):
-            fail(leaf["id"], "boundary_integrity",
-                 "action '%s' is outside the scope of the grant exercised" % action)
-        elif action:
-            breadth = wildcard_breadth(leaf["scope"], action)
-            if breadth and breadth >= 2:
-                soft.append("action '%s' is only covered by a broad wildcard" % action)
+  // generic fallback: liveness only, reported honestly as inconclusive
+  function genericRunner(name, c){
+    var url = fill(c.endpoint);
+    if (!url) return Promise.resolve({verdict:"INCONCLUSIVE", why:"declared publicly demonstrable but no endpoint given"});
+    if (url.indexOf("{") !== -1){
+      return Promise.resolve({verdict:"INCONCLUSIVE", why:"endpoint has a placeholder this runner could not fill: " + url});
+    }
+    return jget(url).then(function(r){
+      var b = r.body || {};
+      // This router answers a method mismatch with 404 unknown_action and
+      // lists the methods it does accept. A POST-only route is present, not
+      // missing, and calling it missing would be a false failure.
+      var postOnly = (b.error === "unknown_action") && Array.isArray(b.POST) &&
+                     (b.POST.indexOf(url.split("?")[0].split("/").pop()) !== -1 ||
+                      (Array.isArray(b.GET) && b.GET.length === 0));
+      if (r.status === 405 || r.status === 501 || postOnly){
+        return {verdict:"INCONCLUSIVE",
+                why:"POST-only endpoint \u2014 present and listed by the router, but it cannot " +
+                    "be exercised from a plain page",
+                detail:r.body};
+      }
+      if (b.error === "unknown_action"){
+        return {verdict:"INCONCLUSIVE",
+                why:"the route answered but does not accept GET. Reachable, semantics not checked",
+                detail:r.body};
+      }
+      if (!r.ok){
+        return {verdict:"FAIL", why:"<b>" + url + " returned " + r.status + "</b>", detail:r.body};
+      }
+      return {verdict:"INCONCLUSIVE", why:"reachable — semantics not checked by this runner", detail:r.body};
+    });
+  }
 
-        eff = effective(lineage)
-        failures, unconstrained = params_against(params, eff)
-        for f in failures:
-            fail(leaf["id"], "boundary_integrity", f)
-        for u in unconstrained:
-            soft.append("parameter '%s' is not constrained anywhere in the path" % u)
+  // ---- run --------------------------------------------------------------
 
-        tag = req.get("purpose_tag")
-        if tag:
-            if tag not in leaf["purpose_tags"]:
-                soft.append("declared purpose '%s' is not carried by the grant" % tag)
-        else:
-            soft.append("the action declared no purpose")
+  function runAll(){
+    if (!doc){ flash("No document loaded."); return; }
+    el("run").disabled = true;
+    var tally = {PASS:0, FAIL:0, INCONCLUSIVE:0, "NOT SUPPORTED":0};
+    el("tally").hidden = false;
 
-    verdict = "BLOCK" if hard else ("CHALLENGE" if soft else "ALLOW")
-    return verdict, hard, soft, broken_at, broken_invariant
+    buildContext().then(function(){
+      var names = Object.keys(doc.checks);
+      var chain = Promise.resolve();
 
+      names.forEach(function(name){
+        chain = chain.then(function(){
+          var c = doc.checks[name];
 
-def check_agreement(bundle, rep, mine, hard, soft, broken_at, broken_invariant):
-    decision = bundle.get("decision") or {}
-    claimed = decision.get("authority_verdict") or decision.get("verdict")
+          if (!c.supported){
+            setResult(name, "NOT SUPPORTED", "the document does not claim this check");
+            tally["NOT SUPPORTED"]++;
+            return;
+          }
+          if (!c.demonstrable_publicly){
+            setResult(name, "INCONCLUSIVE",
+              "built and claimed, but key-gated — nothing here can confirm it, which is what the document says");
+            tally.INCONCLUSIVE++;
+            return;
+          }
 
-    rep.add(mine == claimed,
-            "Independently re-derived authority verdict: " + mine,
-            "" if mine == claimed else
-            "the issuer claims " + str(claimed) + " and this script reaches " + mine +
-            " from the same path. One of us is wrong and the rules are published.")
+          running(name);
+          var fn = runners[name] ? runners[name].bind(null, c) : genericRunner.bind(null, name, c);
+          return fn().catch(function(e){
+            return {verdict:"FAIL", why:"request threw: " + e.message};
+          }).then(function(res){
+            setResult(name, res.verdict, res.why, res.detail);
+            tally[res.verdict] = (tally[res.verdict] || 0) + 1;
+            el("n-pass").textContent = tally.PASS;
+            el("n-fail").textContent = tally.FAIL;
+            el("n-inc").textContent = tally.INCONCLUSIVE;
+            el("n-ns").textContent = tally["NOT SUPPORTED"];
+          });
+        });
+      });
 
-    if mine == "BLOCK":
-        same_grant = (broken_at == decision.get("broken_at"))
-        same_inv = (broken_invariant == decision.get("broken_invariant"))
-        rep.add(same_grant and same_inv,
-                "Refusal reproduces at the same grant and invariant",
-                ("grant %s, invariant %s" % (broken_at, broken_invariant))
-                if same_grant and same_inv else
-                "this script breaks at grant %s / %s, the issuer says %s / %s"
-                % (broken_at, broken_invariant,
-                   decision.get("broken_at"), decision.get("broken_invariant")))
-        rep.note("Why authority could not be derived")
-        for h in hard:
-            rep.note("  " + h)
-    elif soft:
-        rep.note("Why this could not be settled without a person")
-        for x in soft:
-            rep.note("  " + x)
+      chain.then(function(){
+        el("run").disabled = false;
+        el("n-pass").textContent = tally.PASS;
+        el("n-fail").textContent = tally.FAIL;
+        el("n-inc").textContent = tally.INCONCLUSIVE;
+        el("n-ns").textContent = tally["NOT SUPPORTED"];
+        if (tally.FAIL > 0){
+          flash(tally.FAIL + " check" + (tally.FAIL>1?"s":"") +
+                " published as publicly demonstrable did not hold up. Fix the endpoint or change the document — the two have to agree.");
+        }
+      });
+    });
+  }
 
-    risk = decision.get("risk_verdict")
-    if risk and mine != "BLOCK":
-        rep.note("Risk verdict reported as " + str(risk) + ", not re-derivable here",
-                 "the composed verdict is the worse of the two; the scoring engine "
-                 "is not part of this bundle and is not checked by this script")
-
-
-def main():
-    if len(sys.argv) < 2:
-        print(__doc__)
-        return 2
-    src = sys.argv[1]
-    raw = sys.stdin.read() if src == "-" else open(src, "r").read()
-    try:
-        bundle = json.loads(raw)
-    except Exception as exc:
-        print("Not readable JSON: " + str(exc))
-        return 2
-
-    rep = Report()
-    print("=" * 66)
-    print("AUTHORITY PROOF  ·  independent verification")
-    print("=" * 66)
-    d = bundle.get("decision") or {}
-    print("evaluation   " + str(d.get("evaluation")))
-    print("action       " + str((bundle.get("request") or {}).get("action")))
-    print("at           " + str(d.get("evaluated_at")))
-    print("hops         " + str(max(0, len(bundle.get("lineage") or []) - 1)))
-    if bundle.get("lineage"):
-        print("authorised   " + str(bundle["lineage"][0].get("issuer")))
-        print("executed     " + str(bundle["lineage"][-1].get("subject")))
-        acc = [g.get("risk_accepted_by") for g in bundle["lineage"] if g.get("risk_accepted_by")]
-        print("risk owner   " + str(acc[-1] if acc else None))
-    print("-" * 66)
-
-    check_signature(bundle, rep)
-    check_integrity(bundle, rep)
-    mine, hard, soft, ba, bi = rederive(bundle, rep)
-    check_agreement(bundle, rep, mine, hard, soft, ba, bi)
-
-    print(rep.render())
-    print("-" * 66)
-    if rep.failed:
-        print("RESULT: NOT VERIFIED. Something above did not hold.")
-        return 1
-    print("RESULT: VERIFIED - " + mine)
-    if mine == "BLOCK":
-        print("This is a proof that the action was NOT authorised, and where it failed.")
-    print("Checked with no network access, no dependencies, and nothing taken on")
-    print("the issuer's word except the meaning of their public key.")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+  el("run").addEventListener("click", runAll);
+  el("reload").addEventListener("click", loadDoc);
+  loadDoc();
+})();
+</script>
+</body>
+</html>
 '''
-
-
-def _digest():
-    return hashlib.sha256(SCRIPT.encode("utf-8")).hexdigest()
 
 
 def _srv():
@@ -2327,7 +1037,7 @@ def _install(s):
     H = getattr(s, "Handler", None)
     if H is None or not hasattr(H, "do_GET"):
         return "no handler"
-    if getattr(H, "_verifier_patched", False):
+    if getattr(H, "_selfcheck_patched", False):
         _patched[0] = True
         return "already installed"
 
@@ -2340,16 +1050,14 @@ def _install(s):
         except Exception:
             p = self.path or "/"
 
-        if p in FILE_PATHS:
-            body = SCRIPT.encode("utf-8")
+        if p in PAGE_PATHS:
+            body = PAGE.encode("utf-8")
             try:
                 self.send_response(200)
-                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
-                self.send_header("Content-Disposition",
-                                 'attachment; filename="verify-authority.py"')
-                self.send_header("Cache-Control", "public, max-age=300")
-                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Robots-Tag", "noindex, nofollow")
                 self.send_header("X-Content-Type-Options", "nosniff")
                 self.end_headers()
                 self.wfile.write(body)
@@ -2360,9 +1068,9 @@ def _install(s):
         return original(self)
 
     H.do_GET = do_GET
-    H._verifier_patched = True
+    H._selfcheck_patched = True
     _patched[0] = True
-    print("VERIFIER: /verify-authority.py installed", flush=True)
+    print("SELFCHECK: /self-check installed", flush=True)
     return "installed"
 
 
@@ -2376,33 +1084,982 @@ def handle(method, action, data, api_key, ctx):
         try:
             state = _install(s)
         except Exception as exc:
-            print("VERIFIER: patch failed - " + str(exc), flush=True)
+            print("SELFCHECK: patch failed - " + str(exc), flush=True)
             state = "failed: " + str(exc)
 
     action = (action or "").strip("/").lower()
 
     if method == "GET" and action in ("", "status"):
-        return {
-            "installed": bool(_patched[0]),
-            "install_result": state,
-            "module_version": VERSION,
-            "serving": list(FILE_PATHS),
-            "script_bytes": len(SCRIPT),
-            "script_sha256": _digest(),
-            "how_to_use": [
-                "curl -sO https://sebbi.pro/verify-authority.py",
-                "curl -s 'https://sebbi.pro/x/continuity/proof?evaluation=<id>' "
-                "| python3 verify-authority.py -",
-            ],
-            "dependencies": "none - Python standard library only",
-            "network": "the script makes no network calls and reports nothing back. "
-                       "A verification tool that phones home to the party being "
-                       "verified is not a verification tool.",
-            "note": "Check script_sha256 against the file you downloaded. And read it "
-                    "before you run it, as you would with anything else handed to you "
-                    "by the party you are checking.",
-        }, 200
+        return {"installed": bool(_patched[0]),
+                "install_result": state,
+                "module_version": VERSION,
+                "serving": list(PAGE_PATHS),
+                "page_bytes": len(PAGE),
+                "note": "Runs against whichever host serves it. Same origin, so the browser "
+                        "does not block the requests. Unlinked and noindex on purpose - it "
+                        "tests one operator's own document and is not a joint runner."}, 200
 
     return {"error": "unknown_action", "action": action, "GET": ["status"]}, 404
+
+```
+
+
+## `modules/signed.py`
+
+953 lines, 44350 bytes
+
+```python
+"""
+Peer-signed submissions - /x/signed/<action>
+
+WHAT CHANGED IN 1.1
+-------------------
+Three things, all of the same kind: a field that read stronger than it was.
+
+1. receipt_seq is a real number now.
+
+   This lane returned whatever server.py's seal() gave back for the
+   sequence, and passed the literal string "public-signed" as the api_key.
+   That is not a row in api_keys, so the UPDATE matched nothing, the SELECT
+   returned nothing, and the value was always null. The field sat in the
+   response named as though it were a receipt sequence, carrying nothing.
+
+   The point of a sequence is that a holder of receipts N and N+2 can PROVE
+   N+1 exists and was not received. A null cannot do that, so this lane had
+   no completeness property while appearing to offer one.
+
+   Found on the sibling lane at /x/peer/submit by Philip Pinol (PRAXIS),
+   whose schema required an integer and got a null. Same fault here, fixed
+   before anybody hit it. The sequence is now issued by this module, per
+   enrolled name, inside the same lock hold that writes the row.
+
+2. A failed seal no longer returns a receipt.
+
+   ctx["seal"] was called and its result used without checking. If it
+   raised or came back without a hash, this lane would have returned a
+   success body with nothing behind it - the exact hollow receipt that
+   turned up on the peer lane on 2026-08-26. It now returns 500, records
+   nothing, and says why.
+
+3. Enrolment and rotation report whether they sealed.
+
+   Both were sealing as a side effect and ignoring the outcome. The
+   operation still happens - a key is a database row and a failed audit
+   note does not un-enrol it - but the response says sealed true or false
+   with the error, rather than leaving it to be assumed.
+
+The server-wide key counter is still returned, as key_seq, and is still
+null. Reported rather than omitted so the absence is visible instead of
+inferred, which is the confusion that made this worth fixing at all.
+
+THE GAP THIS CLOSES
+-------------------
+Two people arrived at the same missing piece from opposite directions on the
+same day.
+
+Ishaan (Shango MID) read the existing signed lane and said, correctly, that
+"binds a name to a secret rather than to an address" reads stronger than it
+is. An HMAC uses a shared secret. A shared secret is held by both parties. So
+it proves the submission came from SOMEONE HOLDING THE SECRET - which is the
+peer and also the operator of this deployment. It closes third-party
+submission under a peer's name. It does not close operator submission under a
+peer's name.
+
+Chidi (ViriSIM) came at it from the regulator's side: for the evidence to mean
+anything to a third party, the customer has to sign, not the platform holding
+the customer's records.
+
+Same gap. This module closes it.
+
+HOW
+---
+The peer generates an Ed25519 keypair and keeps the private half. This
+deployment is given ONLY the public half. A public key is not a secret and
+grants nothing: it verifies a signature and cannot produce one.
+
+From then on, a submission under that name is accepted only if it carries a
+signature this deployment can verify against that public key - and this
+deployment CANNOT create such a signature, because it does not hold the
+private key and never has. The property is not a promise about our conduct.
+It is arithmetic.
+
+WHAT THIS MEANS FOR THE RECORD
+------------------------------
+The other lanes answer "did somebody hand us this tip". This lane answers
+"did the holder of this key hand us this tip", and the difference matters
+precisely when the operator is the party you are worried about.
+
+A regulator or auditor reading a signed observation does not have to trust
+this deployment about who submitted it. They can take the public key from
+/x/signed/keys, take the canonical message and the signature from the record,
+and check it themselves with any Ed25519 library in any language.
+
+WHAT IT STILL DOES NOT DO
+-------------------------
+- It does not prove the records behind the tip are true. Nothing here does.
+- It does not prove completeness of the peer's own chain. A signed chain can
+  still omit records. Catching that needs an audit protocol, not
+  cryptography - see Chidi's incognito-user test, which is the only thing
+  anyone has proposed that attacks it. Note this is a different claim from
+  the receipt sequence below, which is about completeness of the receipts WE
+  issued, not of the records THEY sealed.
+- It does not prove who the keyholder IS. It proves the same party signed
+  each time. Identity is a separate problem and this does not solve it.
+- Enrolment is open, so the first party to enrol a name gets it. Same as
+  everywhere else in this standard, that is detection rather than
+  prevention: an enrolment is sealed, permanent and public, and an enrolment
+  placed over a name already seen in the witness log is flagged as such.
+
+WHY THE OPERATOR CANNOT QUIETLY SWAP A KEY
+------------------------------------------
+The obvious attack on the whole idea: the operator replaces the peer's public
+key with one of their own, then signs freely. So there is no route that
+overwrites a key. Rotation exists, and a rotation must itself be signed by
+the key being replaced. An operator who does not hold the current private key
+cannot rotate it, and every rotation is sealed into the chain with both keys
+recorded. A peer who has lost their key cannot rotate either - they enrol a
+new name, and the abandoned one stays visible.
+
+CANONICAL MESSAGE
+-----------------
+Exactly this, UTF-8, no trailing newline, four lines joined by \\n:
+
+    aileash-signed-v1
+    <chain>
+    <tip>
+    <ts>
+
+  chain  the peer name, lowercase, as enrolled
+  tip    64 lowercase hex characters
+  ts     integer epoch seconds, no decimal point
+
+Sign those bytes with the Ed25519 private key. Send the 64-byte signature as
+128 lowercase hex characters. The message is deliberately short, positional
+and free of JSON so that two implementations cannot disagree about how to
+build it.
+
+Rotation signs a different message with the SAME shape:
+
+    aileash-rotate-v1
+    <chain>
+    <new public key, 64 hex>
+    <ts>
+
+REPLAY
+------
+A signature is a bearer token for the statement it signs. Anyone who sees one
+can send it again. So: ts must be within SKEW_PAST seconds behind and
+SKEW_FUTURE ahead of our clock, ts must be strictly greater than the last ts
+we accepted for that name, and an exact repeat of a signature already stored
+is refused. None of that is exotic - it is the ordinary set, written down so
+nobody has to guess which of them we do.
+
+WHY THIS LANE REJECTS, WHEN THE OPEN LANE NEVER DOES
+----------------------------------------------------
+/x/witness/observe seals everything and describes what it sealed, because
+refusing an anonymous submission would mean deciding who is allowed to be
+recorded. This lane is the opposite case. A submission whose signature does
+not verify has no business being written into a name's history at all - the
+harm is exactly that it would sit in the record looking like an event
+involving that peer. So this lane refuses, says why, and seals nothing.
+
+    GET  /x/signed/spec                  the protocol
+    GET  /x/signed/keys                  every enrolled name and public key
+    POST /x/signed/enroll                chain, pubkey
+    POST /x/signed/submit                chain, tip, ts, signature
+    POST /x/signed/rotate                chain, new_pubkey, ts, signature
+    GET  /x/signed/verify?peer=&tip=     the receipt, with everything a third
+                                         party needs to check it themselves
+"""
+
+import hashlib
+import re
+import time
+from datetime import datetime, timezone
+
+VERSION = "1.1.1"
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
+HEX128 = re.compile(r"^[0-9a-f]{128}$")
+
+MSG_PREFIX = "aileash-signed-v1"
+ROTATE_PREFIX = "aileash-rotate-v1"
+
+# Replay window. Generous enough for a batch job on a slow link, tight enough
+# that a captured signature is not useful for long.
+SKEW_PAST = 900
+SKEW_FUTURE = 120
+
+# Everything here is readable and usable without an account. A verification
+# lane that only account holders can check is not a verification lane.
+PUBLIC = {("GET", "spec"), ("GET", "keys"), ("GET", "verify"),
+          ("POST", "enroll"), ("POST", "submit"), ("POST", "rotate")}
+
+MAX_LIST = 500
+
+# What this lane files its own audit rows under. Deliberately not a real
+# api_key - it is a label, and it is exactly why server.py's per-key
+# sequence comes back null here. See _seq_note.
+FILED_UNDER = "public-signed"
+
+MESSAGES = {
+    "what_this_proves": (
+        "That the holder of the enrolled private key produced this exact "
+        "statement - name, tip and timestamp - and that we sealed it at the "
+        "recorded time. This deployment holds only the public key and cannot "
+        "produce such a signature, so it is not a claim you have to take on "
+        "our word. Recheck it yourself with any Ed25519 library."),
+    "what_this_does_not_prove": (
+        "Nothing about whether the records behind the tip are true, nothing "
+        "about whether the peer's chain is complete, and nothing about who "
+        "the keyholder is in the world. It proves the same party signed each "
+        "time."),
+    "enrolled": (
+        "This name is now bound to this public key permanently. We cannot "
+        "change it - rotation requires a signature from the key being "
+        "replaced, which we do not hold."),
+    "keys_note": (
+        "Public keys are not secrets. They are published so that anyone can "
+        "verify a signed observation without asking us for anything."),
+    "seq": (
+        "An integer, never null, incremented by exactly one for each accepted "
+        "submission UNDER THIS NAME on this lane. Issued inside the same lock "
+        "that writes the record, so a number is never spent on a submission "
+        "that was not stored. Two receipts numbered N and N+2 prove a third "
+        "exists that you did not receive. The current highest is published at "
+        "/x/signed/keys, so the check does not depend on asking us."),
+    "key_seq": (
+        "The server-wide per-API-key sequence, which is null on this lane and "
+        "always will be. That counter lives on an api_key row, and this lane "
+        "files under a label rather than a key because it authenticates by "
+        "signature and issues nobody an account. It is returned rather than "
+        "omitted so the absence is visible instead of inferred. Before 1.1 "
+        "this null was reported as receipt_seq, which made a missing property "
+        "look like a broken field."),
+    "seq_survives_rotation": (
+        "Rotating the key does not reset the sequence. It belongs to the "
+        "name's submission history rather than to the key, so a rotation "
+        "cannot be used to erase a gap."),
+}
+
+_ready = False
+
+
+# ----------------------------------------------------------------------
+# Ed25519 verification, RFC 8032, pure standard library
+#
+# Deliberately no third-party dependency. This deployment runs on a small
+# box and a verification routine that needs a native extension is a
+# verification routine that stops working on a platform migration. Extended
+# homogeneous coordinates so a verify is milliseconds rather than seconds.
+#
+# Verify only. There is no signing function in this file, and that is not an
+# oversight - there is nothing here that could be turned into a way for this
+# deployment to produce a peer's signature.
+# ----------------------------------------------------------------------
+
+_P = 2 ** 255 - 19
+_L = 2 ** 252 + 27742317777372353535851937790883648493
+_D = -121665 * pow(121666, _P - 2, _P) % _P
+_I = pow(2, (_P - 1) // 4, _P)
+
+
+def _xrecover(y):
+    xx = (y * y - 1) * pow(_D * y * y + 1, _P - 2, _P)
+    x = pow(xx, (_P + 3) // 8, _P)
+    if (x * x - xx) % _P != 0:
+        x = (x * _I) % _P
+    if x % 2 != 0:
+        x = _P - x
+    return x
+
+
+_BY = 4 * pow(5, _P - 2, _P) % _P
+_BX = _xrecover(_BY)
+_B = (_BX % _P, _BY % _P, 1, _BX * _BY % _P)
+
+
+def _add(p, q):
+    x1, y1, z1, t1 = p
+    x2, y2, z2, t2 = q
+    a = (y1 - x1) * (y2 - x2) % _P
+    b = (y1 + x1) * (y2 + x2) % _P
+    c = t1 * 2 * _D * t2 % _P
+    dd = z1 * 2 * z2 % _P
+    e = b - a
+    f = dd - c
+    g = dd + c
+    h = b + a
+    return (e * f % _P, g * h % _P, f * g % _P, e * h % _P)
+
+
+def _double(p):
+    return _add(p, p)
+
+
+def _scalarmult(p, e):
+    if e == 0:
+        return (0, 1, 1, 0)
+    q = _scalarmult(p, e >> 1)
+    q = _double(q)
+    if e & 1:
+        q = _add(q, p)
+    return q
+
+
+def _decodepoint(raw):
+    y = int.from_bytes(raw, "little") & ((1 << 255) - 1)
+    if y >= _P:
+        return None
+    x = _xrecover(y)
+    if x & 1 != (raw[31] >> 7) & 1:
+        x = _P - x
+    point = (x, y, 1, x * y % _P)
+    # on-curve check: -x^2 + y^2 = 1 + d x^2 y^2
+    if (-x * x + y * y - 1 - _D * x * x * y * y) % _P != 0:
+        return None
+    return point
+
+
+def _equal(p, q):
+    x1, y1, z1, _t1 = p
+    x2, y2, z2, _t2 = q
+    if (x1 * z2 - x2 * z1) % _P != 0:
+        return False
+    if (y1 * z2 - y2 * z1) % _P != 0:
+        return False
+    return True
+
+
+def ed25519_verify(public_key, message, signature):
+    """True if signature is a valid Ed25519 signature of message under
+    public_key. Bytes in, bool out, never raises."""
+    try:
+        if len(public_key) != 32 or len(signature) != 64:
+            return False
+        a = _decodepoint(public_key)
+        if a is None:
+            return False
+        r_raw = signature[:32]
+        r = _decodepoint(r_raw)
+        if r is None:
+            return False
+        s = int.from_bytes(signature[32:], "little")
+        if s >= _L:
+            return False
+        h = int.from_bytes(
+            hashlib.sha512(r_raw + public_key + message).digest(), "little") % _L
+        left = _scalarmult(_B, s)
+        right = _add(r, _scalarmult(a, h))
+        return _equal(left, right)
+    except Exception:
+        return False
+
+
+# ----------------------------------------------------------------------
+# storage
+# ----------------------------------------------------------------------
+
+def _setup(ctx):
+    global _ready
+    if _ready:
+        return
+    with ctx["lock"]:
+        c = ctx["conn"]
+        c.execute("CREATE TABLE IF NOT EXISTS signed_keys("
+                  "peer TEXT PRIMARY KEY,pubkey TEXT,enrolled REAL,"
+                  "audit_hash TEXT,block_index INTEGER,"
+                  "rotations INTEGER DEFAULT 0,last_ts REAL,note TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS signed_log("
+                  "id INTEGER PRIMARY KEY AUTOINCREMENT,peer TEXT,tip TEXT,"
+                  "peer_ts REAL,observed REAL,signature TEXT,pubkey TEXT,"
+                  "audit_hash TEXT,block_index INTEGER)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_sig_peer ON signed_log(peer,id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_sig_tip ON signed_log(tip)")
+
+        # Added in 1.1. The receipt counter, per enrolled name, in its own
+        # table so the counter survives anything that happens to the key row
+        # - including a rotation. A rotation that reset the sequence could be
+        # used to erase a gap, which is the one thing the sequence exists to
+        # make impossible.
+        c.execute("CREATE TABLE IF NOT EXISTS signed_seq("
+                  "peer TEXT PRIMARY KEY, last_seq INTEGER DEFAULT 0)")
+        c.commit()
+    _ready = True
+
+
+def _iso(ts):
+    if not ts:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+def _peer_name(data):
+    return str(data.get("chain") or data.get("peer") or "").strip().lower()
+
+
+def _key_row(ctx, peer):
+    with ctx["lock"]:
+        return ctx["conn"].execute(
+            "SELECT pubkey,enrolled,audit_hash,block_index,rotations,last_ts "
+            "FROM signed_keys WHERE peer=?", (peer,)).fetchone()
+
+
+def _latest_seq(ctx, peer):
+    """Highest receipt number issued to this name. 0 if none."""
+    try:
+        with ctx["lock"]:
+            row = ctx["conn"].execute(
+                "SELECT last_seq FROM signed_seq WHERE peer=?", (peer,)).fetchone()
+        return int(row[0]) if row and row[0] is not None else 0
+    except Exception:
+        return 0
+
+
+def _try_seal(ctx, event, result, when, api_key):
+    """Seal, and say plainly whether it worked.
+
+    Returns (audit_hash, block_index, key_seq, error). Nothing here swallows
+    a failure. Before 1.1 the result was used without checking, which is how
+    a hollow receipt gets issued.
+    """
+    try:
+        h, idx, seq = ctx["seal"](event, result, when, api_key)
+    except Exception as exc:
+        return None, None, None, "%s: %s" % (type(exc).__name__, str(exc)[:300])
+    if not h:
+        return None, None, None, "seal returned no audit hash"
+    return h, idx, seq, None
+
+
+def _seen_in_open_lane(ctx, peer):
+    """Has this name already appeared in the open witness log?
+
+    An enrolment over a name somebody else has been using is the same shape as
+    the url squat, and gets the same treatment: we cannot prevent it, so we
+    record it permanently at the moment it happens.
+    """
+    try:
+        with ctx["lock"]:
+            row = ctx["conn"].execute(
+                "SELECT COUNT(*) FROM witness_log WHERE peer=?", (peer,)).fetchone()
+        return int(row[0]) if row else 0
+    except Exception:
+        return 0
+
+
+def _check_ts(ts, last_ts):
+    now = time.time()
+    if ts > now + SKEW_FUTURE:
+        return False, ("timestamp is %d seconds in the future; limit is %d"
+                       % (int(ts - now), SKEW_FUTURE))
+    if ts < now - SKEW_PAST:
+        return False, ("timestamp is %d seconds old; limit is %d"
+                       % (int(now - ts), SKEW_PAST))
+    if last_ts is not None and ts <= last_ts:
+        return False, ("timestamp %d is not later than the last one accepted "
+                       "for this name (%d) - a signature cannot be replayed "
+                       "and submissions must move forward"
+                       % (int(ts), int(last_ts)))
+    return True, None
+
+
+# ----------------------------------------------------------------------
+# routes
+# ----------------------------------------------------------------------
+
+def _enroll(ctx, data):
+    peer = _peer_name(data)
+    if not peer or len(peer) > 80:
+        return {"error": "chain_required",
+                "message": "A short stable identifier - a domain works well."}, 400
+    pubkey = str(data.get("pubkey") or data.get("public_key") or "").strip().lower()
+    if not HEX64.match(pubkey):
+        return {"error": "invalid_pubkey",
+                "message": "An Ed25519 public key is 32 bytes - 64 lowercase "
+                           "hex characters. Send the public half only. Never "
+                           "send us a private key; we have no use for one and "
+                           "no route that accepts one."}, 400
+    if _decodepoint(bytes.fromhex(pubkey)) is None:
+        return {"error": "invalid_pubkey",
+                "message": "That value is 64 hex characters but is not a "
+                           "point on the curve, so it is not an Ed25519 "
+                           "public key."}, 400
+
+    existing = _key_row(ctx, peer)
+    if existing:
+        if existing[0] == pubkey:
+            return {"already_enrolled": True, "chain": peer, "pubkey": pubkey,
+                    "enrolled_at": _iso(existing[1]),
+                    "block_index": existing[3],
+                    "latest_receipt_seq": _latest_seq(ctx, peer),
+                    "message": "This name is already bound to this key. "
+                               "Nothing changed."}, 200
+        return {"error": "name_already_enrolled", "chain": peer,
+                "enrolled_pubkey": existing[0],
+                "enrolled_at": _iso(existing[1]),
+                "message": "This name is bound to a different key. We do not "
+                           "overwrite a binding. If you hold the enrolled "
+                           "private key, use /x/signed/rotate. If you do not, "
+                           "this name is not available to you and this "
+                           "attempt is not sealed."}, 409
+
+    prior = _seen_in_open_lane(ctx, peer)
+    ts = time.time()
+    note = "enrolled"
+    if prior:
+        note = ("WARNING: this name had already been submitted %d time(s) to "
+                "the open witness lane before this key was enrolled, so it "
+                "was not a fresh name when it was claimed" % prior)
+
+    ev = {"user_id": "sig:" + peer, "action": "signed_key_enrolled", "amount": 0,
+          "country": "UK", "device_id": "signed", "anomaly": 0, "device_risk": 0}
+    res = {"decision": "KEY_ENROLLED", "score": 0, "signed_version": VERSION,
+           "peer": peer, "pubkey": pubkey, "timestamp": ts, "detail": note}
+    h, idx, _seq, seal_error = _try_seal(ctx, ev, res, ts, FILED_UNDER)
+
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "INSERT INTO signed_keys(peer,pubkey,enrolled,audit_hash,"
+            "block_index,rotations,last_ts,note) VALUES(?,?,?,?,?,0,NULL,?)",
+            (peer, pubkey, ts, h, idx, note))
+        ctx["conn"].execute(
+            "INSERT OR IGNORE INTO signed_seq(peer,last_seq) VALUES(?,0)", (peer,))
+        ctx["conn"].commit()
+
+    out = {"enrolled": True, "chain": peer, "pubkey": pubkey,
+           "enrolled_at": _iso(ts), "sealed_in_our_chain": h,
+           "block_index": idx, "signed_version": VERSION,
+           "sealed": seal_error is None,
+           "latest_receipt_seq": 0,
+           "message": MESSAGES["enrolled"],
+           "canonical_message": _canonical_help(peer),
+           "submit": "/x/signed/submit"}
+    if seal_error:
+        out["seal_error"] = seal_error
+        out["seal_note"] = ("The key is enrolled and usable - it is a database "
+                            "row and a failed audit note does not un-enrol it. "
+                            "But the record of the enrolment did not seal, "
+                            "which is a fault worth chasing and is reported "
+                            "rather than hidden.")
+    if prior:
+        out["flag"] = note
+    return out, 200
+
+
+def _canonical_help(peer):
+    return {"format": MSG_PREFIX + "\\n<chain>\\n<tip>\\n<ts>",
+            "example_for_this_name": MSG_PREFIX + "\\n" + peer +
+                                     "\\n<64 hex tip>\\n<integer epoch seconds>",
+            "encoding": "UTF-8, no trailing newline, lines joined with a "
+                        "single \\n",
+            "signature": "Ed25519 over those bytes, sent as 128 lowercase hex"}
+
+
+def _submit(ctx, data):
+    peer = _peer_name(data)
+    if not peer:
+        return {"error": "chain_required"}, 400
+    row = _key_row(ctx, peer)
+    if not row:
+        return {"error": "not_enrolled", "chain": peer,
+                "message": "No public key is enrolled for this name. Enrol at "
+                           "/x/signed/enroll, or use the open lane at "
+                           "/x/witness/observe which needs nothing."}, 404
+    pubkey, _enrolled, _h, _idx, _rot, last_ts = row
+
+    tip = str(data.get("tip", "")).strip().lower()
+    if not HEX64.match(tip):
+        return {"error": "invalid_tip",
+                "message": "A tip is 64 hex characters - a SHA-256 chain head."}, 400
+    signature = str(data.get("signature") or data.get("sig") or "").strip().lower()
+    if not HEX128.match(signature):
+        return {"error": "invalid_signature_format",
+                "message": "An Ed25519 signature is 64 bytes - 128 lowercase "
+                           "hex characters."}, 400
+    raw_ts = data.get("ts", data.get("peer_ts"))
+    try:
+        ts_int = int(raw_ts)
+    except (TypeError, ValueError):
+        return {"error": "invalid_ts",
+                "message": "ts must be integer epoch seconds, and must be the "
+                           "same value you signed."}, 400
+
+    ok, why = _check_ts(ts_int, last_ts)
+    if not ok:
+        return {"error": "timestamp_rejected", "message": why,
+                "our_time": int(time.time())}, 400
+
+    with ctx["lock"]:
+        dup = ctx["conn"].execute(
+            "SELECT observed FROM signed_log WHERE peer=? AND signature=? LIMIT 1",
+            (peer, signature)).fetchone()
+    if dup:
+        return {"error": "replayed_signature",
+                "message": "This exact signature was already accepted at %s."
+                           % _iso(dup[0])}, 409
+
+    message = "\n".join([MSG_PREFIX, peer, tip, str(ts_int)]).encode("utf-8")
+    if not ed25519_verify(bytes.fromhex(pubkey), message, bytes.fromhex(signature)):
+        return {"error": "signature_did_not_verify",
+                "chain": peer,
+                "message": "Nothing has been sealed. The signature does not "
+                           "verify against the key enrolled for this name. "
+                           "The usual cause is a canonical message built "
+                           "differently - check it byte for byte below.",
+                "we_verified_against": _canonical_help(peer),
+                "the_exact_bytes_we_hashed":
+                    "\n".join([MSG_PREFIX, peer, tip, str(ts_int)]),
+                "enrolled_pubkey": pubkey}, 400
+
+    observed = time.time()
+    detail = ("peer=" + peer + ";tip=" + tip + ";ts=" + str(ts_int) +
+              ";pubkey=" + pubkey + ";sig=" + signature)
+    ev = {"user_id": "sig:" + peer, "action": "signed_tip_observed", "amount": 0,
+          "country": "UK", "device_id": "signed", "anomaly": 0, "device_risk": 0}
+    res = {"decision": "SIGNED_TIP_SEALED", "score": 0, "signed_version": VERSION,
+           "peer": peer, "peer_tip": tip, "timestamp": observed,
+           "verification": "peer-signed", "detail": detail}
+
+    # Seal FIRST, and only claim success if it produced a hash. A signed
+    # submission that returns a receipt with no block behind it is worse than
+    # a refusal, because the peer has no way to tell the difference without
+    # going and looking at the chain.
+    h, idx, key_seq, seal_error = _try_seal(ctx, ev, res, observed, FILED_UNDER)
+    if seal_error:
+        return {"ok": False, "accepted": False, "error": "seal_failed",
+                "chain": peer, "tip": tip,
+                "detail": "Your signature verified correctly, but the audit "
+                          "chain did not seal the submission, so there is no "
+                          "receipt to give you. This is a fault on this "
+                          "deployment and not a problem with your submission.",
+                "seal_error": seal_error,
+                "recorded": False,
+                "retry": "Nothing was written. No sequence number was spent "
+                         "and your signature is not recorded as used, so a "
+                         "fresh submission with a later ts can be sent once "
+                         "this is fixed.",
+                "observed_at": _iso(observed)}, 500
+
+    # Issue the receipt number inside the same lock hold that writes the row.
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "INSERT OR IGNORE INTO signed_seq(peer,last_seq) VALUES(?,0)", (peer,))
+        ctx["conn"].execute(
+            "UPDATE signed_seq SET last_seq = COALESCE(last_seq,0) + 1 "
+            "WHERE peer=?", (peer,))
+        srow = ctx["conn"].execute(
+            "SELECT last_seq FROM signed_seq WHERE peer=?", (peer,)).fetchone()
+        receipt_seq = int(srow[0]) if srow and srow[0] is not None else None
+
+        ctx["conn"].execute(
+            "INSERT INTO signed_log(peer,tip,peer_ts,observed,signature,"
+            "pubkey,audit_hash,block_index) VALUES(?,?,?,?,?,?,?,?)",
+            (peer, tip, float(ts_int), observed, signature, pubkey, h, idx))
+        ctx["conn"].execute("UPDATE signed_keys SET last_ts=? WHERE peer=?",
+                            (float(ts_int), peer))
+        ctx["conn"].commit()
+
+    # Mirror into the open witness log so the peer appears on the public
+    # roster alongside everyone else. Guarded: the roster is a convenience
+    # and the seal above is the evidence, so a failure here must not turn a
+    # good submission into an error.
+    mirrored = False
+    try:
+        with ctx["lock"]:
+            ctx["conn"].execute(
+                "INSERT INTO witness_log(api_key,peer,tip,peer_ts,observed,"
+                "audit_hash,block_index,note,url,liveness,name_status) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (FILED_UNDER, peer, tip, float(ts_int), observed, h, idx,
+                 "signed submission - verified against enrolled Ed25519 key",
+                 None, "peer-signed", "key-bound"))
+            ctx["conn"].commit()
+        mirrored = True
+    except Exception:
+        pass
+
+    return {"chain": peer, "witnessed_tip": tip, "observed_at": _iso(observed),
+            "peer_claimed_time": _iso(ts_int),
+            "sealed_in_our_chain": h, "block_index": idx,
+            "receipt_seq": receipt_seq,
+            "receipt_seq_scope": "per-chain",
+            "key_seq": key_seq,
+            "verification": "peer-signed",
+            "verified_against_pubkey": pubkey,
+            "on_public_roster": mirrored,
+            "signed_version": VERSION,
+            "verify": "/x/signed/verify?peer=" + peer + "&tip=" + tip,
+            "gapless": MESSAGES["seq"],
+            "key_seq_note": MESSAGES["key_seq"],
+            "what_this_proves": MESSAGES["what_this_proves"],
+            "what_this_does_not_prove": MESSAGES["what_this_does_not_prove"]}, 200
+
+
+def _rotate(ctx, data):
+    peer = _peer_name(data)
+    row = _key_row(ctx, peer)
+    if not row:
+        return {"error": "not_enrolled", "chain": peer}, 404
+    current, _enrolled, _h, _idx, rotations, last_ts = row
+
+    new_pubkey = str(data.get("new_pubkey") or data.get("pubkey") or "").strip().lower()
+    if not HEX64.match(new_pubkey) or _decodepoint(bytes.fromhex(new_pubkey)) is None:
+        return {"error": "invalid_pubkey",
+                "message": "new_pubkey must be an Ed25519 public key - 64 "
+                           "lowercase hex characters."}, 400
+    if new_pubkey == current:
+        return {"error": "no_change",
+                "message": "That is already the enrolled key."}, 400
+    signature = str(data.get("signature") or data.get("sig") or "").strip().lower()
+    if not HEX128.match(signature):
+        return {"error": "invalid_signature_format"}, 400
+    try:
+        ts_int = int(data.get("ts"))
+    except (TypeError, ValueError):
+        return {"error": "invalid_ts"}, 400
+    ok, why = _check_ts(ts_int, last_ts)
+    if not ok:
+        return {"error": "timestamp_rejected", "message": why,
+                "our_time": int(time.time())}, 400
+
+    message = "\n".join([ROTATE_PREFIX, peer, new_pubkey, str(ts_int)]).encode("utf-8")
+    if not ed25519_verify(bytes.fromhex(current), message, bytes.fromhex(signature)):
+        return {"error": "signature_did_not_verify",
+                "message": "Nothing has been changed. A rotation must be "
+                           "signed by the key being replaced. This is what "
+                           "stops anyone - including the operator of this "
+                           "deployment - swapping a peer's key.",
+                "we_verified_against": {
+                    "format": ROTATE_PREFIX + "\\n<chain>\\n<new pubkey>\\n<ts>",
+                    "the_exact_bytes_we_hashed":
+                        "\n".join([ROTATE_PREFIX, peer, new_pubkey,
+                                   str(ts_int)])},
+                "signed_by_key_expected": current}, 400
+
+    ts = time.time()
+    ev = {"user_id": "sig:" + peer, "action": "signed_key_rotated", "amount": 0,
+          "country": "UK", "device_id": "signed", "anomaly": 0, "device_risk": 0}
+    res = {"decision": "KEY_ROTATED", "score": 0, "signed_version": VERSION,
+           "peer": peer, "timestamp": ts,
+           "detail": "from=" + current + ";to=" + new_pubkey +
+                     ";authorised_by=" + current}
+    h, idx, _seq, seal_error = _try_seal(ctx, ev, res, ts, FILED_UNDER)
+
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "UPDATE signed_keys SET pubkey=?,rotations=?,last_ts=? WHERE peer=?",
+            (new_pubkey, (rotations or 0) + 1, float(ts_int), peer))
+        ctx["conn"].commit()
+
+    out = {"rotated": True, "chain": peer, "previous_pubkey": current,
+           "pubkey": new_pubkey, "rotations": (rotations or 0) + 1,
+           "sealed_in_our_chain": h, "block_index": idx,
+           "sealed": seal_error is None,
+           "latest_receipt_seq": _latest_seq(ctx, peer),
+           "signed_version": VERSION,
+           "sequence_note": MESSAGES["seq_survives_rotation"],
+           "message": "Rotation sealed. Both keys are permanently in the "
+                      "chain, so the history of this name's keys is public "
+                      "and cannot be tidied up later."}
+    if seal_error:
+        out["seal_error"] = seal_error
+        out["message"] = ("The rotation took effect and the new key is live. "
+                          "The audit note about it did not seal, which is "
+                          "reported rather than hidden.")
+    return out, 200
+
+
+def _keys(ctx):
+    with ctx["lock"]:
+        rows = ctx["conn"].execute(
+            "SELECT k.peer,k.pubkey,k.enrolled,k.block_index,k.rotations,k.note,"
+            "COALESCE(s.last_seq,0) FROM signed_keys k "
+            "LEFT JOIN signed_seq s ON s.peer = k.peer "
+            "ORDER BY k.enrolled ASC LIMIT ?", (MAX_LIST,)).fetchall()
+    out = []
+    for peer, pubkey, enrolled, idx, rotations, note, seq in rows:
+        entry = {"chain": peer, "pubkey": pubkey, "algorithm": "ed25519",
+                 "enrolled_at": _iso(enrolled), "enrolment_block": idx,
+                 "rotations": rotations or 0,
+                 "latest_receipt_seq": seq or 0}
+        if note and note.startswith("WARNING"):
+            entry["flag"] = note
+        out.append(entry)
+    return {"count": len(out), "keys": out, "signed_version": VERSION,
+            "note": MESSAGES["keys_note"],
+            "receipt_seq_note": (
+                "latest_receipt_seq is the highest receipt number issued to "
+                "that name on this lane. A keyholder whose own highest "
+                "receipt is lower than this has not received one of them, and "
+                "can say exactly how many. Public on purpose - a gap you can "
+                "only see from the inside is not evidence of anything."),
+            "how_to_check_a_record": (
+                "Take the pubkey from here, rebuild the canonical message "
+                "from the record at /x/signed/verify, and check the signature "
+                "with any Ed25519 implementation. You do not need anything "
+                "from us to do it and you do not have to believe us.")}, 200
+
+
+def _verify(ctx, data):
+    peer = str(data.get("peer", "")).strip().lower()
+    tip = str(data.get("tip", "")).strip().lower()
+    if not peer or not tip:
+        return {"error": "peer_and_tip_required",
+                "usage": "/x/signed/verify?peer=<name>&tip=<64 hex>"}, 400
+    with ctx["lock"]:
+        rows = ctx["conn"].execute(
+            "SELECT observed,peer_ts,signature,pubkey,audit_hash,block_index "
+            "FROM signed_log WHERE peer=? AND tip=? ORDER BY id ASC",
+            (peer, tip)).fetchall()
+    if not rows:
+        return {"signed_observation": False, "peer": peer, "tip": tip,
+                "message": "We hold no signed observation of this tip from "
+                           "this name. It may still be in the open lane - "
+                           "check /x/witness/attest."}, 404
+    observed, peer_ts, signature, pubkey, h, idx = rows[0]
+    ts_int = int(peer_ts)
+    return {"signed_observation": True, "chain": peer, "tip": tip,
+            "observed_at": _iso(observed), "peer_claimed_time": _iso(peer_ts),
+            "sealed_in_our_chain": h, "block_index": idx,
+            "times_observed": len(rows),
+            "latest_receipt_seq": _latest_seq(ctx, peer),
+            "signature": signature, "pubkey": pubkey, "algorithm": "ed25519",
+            "canonical_message": "\n".join([MSG_PREFIX, peer, tip, str(ts_int)]),
+            "canonical_message_bytes_note": (
+                "Those four lines joined by a single newline, UTF-8, no "
+                "trailing newline. Hash nothing yourself - Ed25519 takes the "
+                "message, not a digest of it."),
+            "signed_version": VERSION,
+            "what_this_proves": MESSAGES["what_this_proves"],
+            "what_this_does_not_prove": MESSAGES["what_this_does_not_prove"],
+            "recheck_it_yourself": (
+                "python: pip install pynacl, then "
+                "nacl.signing.VerifyKey(bytes.fromhex(pubkey))"
+                ".verify(canonical_message.encode(), bytes.fromhex(signature))")}, 200
+
+
+def _spec():
+    return {"signed_version": VERSION,
+            "what_this_lane_is": (
+                "Submissions signed by a key this deployment does not hold. "
+                "The open lane at /x/witness/observe proves somebody handed "
+                "us a tip. This lane proves the holder of a specific private "
+                "key did - including against us, because we only ever hold "
+                "the public half."),
+            "why_it_exists": (
+                "The HMAC lane binds a name to a shared secret, and a shared "
+                "secret is held by both parties. It closes third-party "
+                "submission under your name and does not close operator "
+                "submission under your name. This lane closes both, and it "
+                "does so by arithmetic rather than by our promise."),
+            "steps": [
+                "1. Generate an Ed25519 keypair. Keep the private half. It "
+                "never leaves your side and we have no route that accepts one.",
+                "2. POST /x/signed/enroll with {\"chain\":\"<name>\","
+                "\"pubkey\":\"<64 hex>\"}.",
+                "3. Build the canonical message, sign it, and POST "
+                "/x/signed/submit with {\"chain\",\"tip\",\"ts\",\"signature\"}.",
+                "4. GET /x/signed/verify?peer=&tip= for the receipt, which "
+                "carries everything a third party needs to recheck it "
+                "without us.",
+            ],
+            "canonical_message": {
+                "submit": MSG_PREFIX + "\\n<chain>\\n<tip>\\n<ts>",
+                "rotate": ROTATE_PREFIX + "\\n<chain>\\n<new pubkey>\\n<ts>",
+                "encoding": "UTF-8, single \\n between lines, no trailing "
+                            "newline. ts is integer epoch seconds.",
+            },
+            "replay_controls": {
+                "max_age_seconds": SKEW_PAST,
+                "max_future_seconds": SKEW_FUTURE,
+                "monotonic": "ts must be strictly greater than the last ts "
+                             "accepted for the name",
+                "duplicate_signatures": "refused",
+            },
+            "on_acceptance": {
+                "receipt_seq": MESSAGES["seq"],
+                "receipt_seq_scope": {'values': ['per-peer', 'per-name', 'per-chain'], 'per-peer': 'issued per registered peer_id. Used by /x/peer/submit.', 'per-name': 'issued per bound name. Used by /x/bind/submit.', 'per-chain': 'issued per enrolled chain name. Used by /x/signed/submit.', 'why_it_is_here': 'The three signed lanes each count within their own scope, so a receipt carries the scope of its own sequence rather than requiring the holder to remember which lane produced it. The set is closed: a value outside this list is an error on our side, not a new scope you should widen a schema for.', 'not_comparable_across_scopes': 'Two receipts with different scopes are counting different things and their numbers say nothing about each other.'},
+                "key_seq": MESSAGES["key_seq"],
+                "sequence_survives_rotation": MESSAGES["seq_survives_rotation"],
+                "seal_failure": (
+                    "If the audit chain does not seal your submission you get "
+                    "500 seal_failed with the reason, and nothing is "
+                    "recorded - no sequence number, no log row, no receipt. "
+                    "Send a fresh submission with a later ts once the fault "
+                    "is fixed. A receipt you cannot verify is worse than no "
+                    "receipt, so this lane will not issue one."),
+                "two_different_completeness_claims": (
+                    "receipt_seq is about completeness of the receipts WE "
+                    "issued to you. It says nothing about completeness of the "
+                    "records YOUR chain sealed, which no signature can reach "
+                    "and which is listed under honest_limits."),
+            },
+            "this_lane_rejects": (
+                "Unlike the open lane, a submission that does not verify is "
+                "refused and nothing is sealed. Writing an unverifiable "
+                "signature into a name's history is the harm, not the "
+                "protection."),
+            "key_rotation": (
+                "A rotation must be signed by the key being replaced. Nobody "
+                "who lacks the current private key can rotate it, this "
+                "deployment included, and every rotation is sealed with both "
+                "keys recorded."),
+            "honest_limits": [
+                "Does not prove the records behind the tip are true.",
+                "Does not prove the peer's own chain is complete. Catching an "
+                "omission there needs an audit protocol, not cryptography.",
+                "Does not prove who the keyholder is in the world - only that "
+                "the same party signed each time.",
+                "Enrolment is open, so the first party to enrol a name gets "
+                "it. An enrolment over a name already seen in the open lane "
+                "is flagged permanently, which is detection and not "
+                "prevention.",
+                "receipt_seq proves you are missing a receipt. It does not "
+                "prove why, and it cannot distinguish a lost response from "
+                "one that was never sent.",
+            ],
+            "changed_in_1_1_1": [
+                "receipt_seq_scope is now a bare token from a closed set - "
+                "per-peer, per-name, per-chain - rather than a sentence, "
+                "and the set is published so a closed schema can pin an "
+                "enum. Asked for by Philip Pinol (PRAXIS). Value change "
+                "only; the response shape is unchanged from 1.1.",
+            ],
+            "changed_in_1_1": [
+                "receipt_seq is a real per-chain gapless sequence issued by "
+                "this module, not the api_key counter that was always null "
+                "here because this lane files under a label rather than a "
+                "key. The completeness property applies to this lane for the "
+                "first time.",
+                "The api_key counter is still returned, as key_seq, and is "
+                "null by design so the absence is stated rather than hidden.",
+                "A failed seal returns 500 and records nothing, instead of "
+                "returning a receipt with no block behind it.",
+                "Enrolment and rotation report sealed true or false with the "
+                "error, rather than sealing as a side effect and ignoring "
+                "the outcome.",
+                "/x/signed/keys publishes latest_receipt_seq per name.",
+            ],
+            "what_this_proves": MESSAGES["what_this_proves"],
+            "what_this_does_not_prove": MESSAGES["what_this_does_not_prove"]}, 200
+
+
+def handle(method, action, data, api_key, ctx):
+    _setup(ctx)
+    if method == "POST":
+        if action == "enroll":
+            return _enroll(ctx, data)
+        if action == "submit":
+            return _submit(ctx, data)
+        if action == "rotate":
+            return _rotate(ctx, data)
+    else:
+        if action == "spec":
+            return _spec()
+        if action == "keys":
+            return _keys(ctx)
+        if action == "verify":
+            return _verify(ctx, data)
+    return {"error": "unknown_action", "action": action}, 404
 
 ```

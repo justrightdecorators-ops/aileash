@@ -1,1540 +1,2487 @@
-# Codebase — part 19 of 28
+# Codebase — part 19 of 30
 
 Contains:
-- `compliance-assistant.html`
-- `console.html`
-- `contact.html`
-- `copyright.txt`
-- `data-protection.html`
-
-
-## `compliance-assistant.html`
-
-768 lines, 55772 bytes
-
-```html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Build a recurring-revenue business from nothing &middot; 50p in, your price out</title>
-<meta name="description" content="Buy the phone safety package at 50p per device per month. Sell it at your price. No stock, no fees, no capital. Recurring revenue that becomes a book worth selling.">
-<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;800;900&family=DM+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-:root{--navy:#070b16;--surface:#111a30;--surface2:#0c1322;--border:#1e2a45;--gold:#c9a84c;--gold2:#f0d78a;--green:#7fe3b0;--green2:#2ee68a;--cyan:#00d4ff;--red:#ff6b6b;--mono:'JetBrains Mono',monospace;--sans:'DM Sans',sans-serif;--display:'Playfair Display',serif;--muted:#8a90a6}
-html{scroll-behavior:smooth}
-body{background:var(--navy);color:#fff;font-family:var(--sans);line-height:1.7;-webkit-font-smoothing:antialiased;overflow-x:hidden}
-
-nav{position:sticky;top:0;z-index:100;background:rgba(7,11,22,0.96);backdrop-filter:blur(14px);padding:0 18px;height:56px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid rgba(201,168,76,0.15)}
-.nav-logo{font-family:var(--display);font-size:16px;color:#fff;font-weight:900;text-decoration:none}.nav-logo span{color:var(--gold)}
-.nav-links{display:flex;gap:14px;align-items:center}
-.nav-links a{color:rgba(255,255,255,0.45);text-decoration:none;font-size:13px}.nav-links a:hover{color:#fff}
-.nav-cta{background:var(--gold)!important;color:var(--navy)!important;padding:8px 15px;font-weight:800!important;border-radius:6px}
-
-.hero{padding:50px 20px 42px;text-align:center;position:relative;overflow:hidden}
-.hero::before{content:'';position:absolute;inset:0;background:radial-gradient(ellipse at 50% -10%,rgba(201,168,76,0.14),transparent 58%)}
-.hero::after{content:'';position:absolute;left:0;right:0;bottom:0;height:1px;background:linear-gradient(90deg,transparent,rgba(201,168,76,0.4),transparent)}
-.hero-in{max-width:800px;margin:0 auto;position:relative}
-.kick{display:inline-block;font-family:var(--mono);font-size:10px;letter-spacing:2.4px;text-transform:uppercase;color:var(--gold);border:1px solid rgba(201,168,76,0.35);background:rgba(201,168,76,0.07);padding:6px 14px;border-radius:100px;margin-bottom:20px}
-h1{font-family:var(--display);font-size:clamp(33px,7.6vw,62px);line-height:1.03;font-weight:900;margin-bottom:18px;letter-spacing:-0.5px}
-h1 em{font-style:normal;background:linear-gradient(100deg,var(--gold),var(--gold2));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
-.hero-sub{font-size:17px;color:rgba(255,255,255,0.58);line-height:1.72;max-width:590px;margin:0 auto}
-.hero-sub b{color:#fff;font-weight:700}
-.flow{display:flex;gap:6px;max-width:540px;margin:30px auto 0}
-.flow-b{flex:1;background:var(--surface2);border:1px solid var(--border);border-radius:11px;padding:15px 8px}
-.flow-b.hot{border-color:rgba(127,227,176,0.45);background:rgba(127,227,176,0.06)}
-.flow-b .k{font-family:var(--mono);font-size:8px;letter-spacing:1.6px;text-transform:uppercase;color:rgba(255,255,255,0.3);margin-bottom:6px}
-.flow-b .v{font-family:var(--display);font-size:clamp(18px,4.4vw,26px);font-weight:900;line-height:1.05}
-.c-dim{color:rgba(255,255,255,0.45)}.c-gold{color:var(--gold)}.c-green{color:var(--green)}
-
-section.sec{max-width:880px;margin:0 auto;padding:58px 20px 0}
-.eyebrow{font-family:var(--mono);font-size:10px;letter-spacing:2.6px;text-transform:uppercase;color:rgba(201,168,76,0.7);margin-bottom:12px;display:block}
-h2{font-family:var(--display);font-size:clamp(27px,5.4vw,42px);font-weight:900;line-height:1.07;margin-bottom:14px;letter-spacing:-0.3px}
-h2 em{font-style:normal;background:linear-gradient(100deg,var(--gold),var(--gold2));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
-h2 em.g{background:linear-gradient(100deg,var(--green),var(--green2));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
-.sub{font-size:15.5px;color:rgba(255,255,255,0.52);line-height:1.8;max-width:640px;margin-bottom:28px}
-.sub b{color:#fff}
-
-.panel{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:22px 19px;margin-bottom:16px}
-.ctrl{margin-bottom:20px}.ctrl:last-child{margin-bottom:0}
-.ctrl-top{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:9px;gap:12px}
-.ctrl-lbl{font-family:var(--mono);font-size:9.5px;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,0.35)}
-.ctrl-val{font-family:var(--display);font-size:24px;font-weight:900;color:var(--gold);line-height:1;white-space:nowrap}
-input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:7px;border-radius:4px;background:rgba(255,255,255,0.09);outline:none}
-input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:30px;height:30px;border-radius:50%;background:linear-gradient(160deg,var(--gold2),var(--gold));cursor:pointer;border:4px solid var(--navy);box-shadow:0 0 0 1px rgba(201,168,76,0.6),0 0 18px rgba(201,168,76,0.3)}
-input[type=range]::-moz-range-thumb{width:30px;height:30px;border-radius:50%;background:var(--gold);cursor:pointer;border:4px solid var(--navy)}
-.hint{font-family:var(--mono);font-size:9.5px;color:rgba(255,255,255,0.26);margin-top:8px;line-height:1.7}
-
-.graph{background:var(--surface2);border:1px solid var(--border);border-radius:13px;padding:18px 12px 8px;margin-bottom:16px}
-.graph-t{font-family:var(--mono);font-size:9.5px;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,0.32);padding-left:4px}
-.graph-s{font-family:var(--mono);font-size:9px;color:rgba(255,255,255,0.22);padding-left:4px;margin-bottom:12px}
-svg.chart{width:100%;height:auto;display:block;overflow:visible}
-.legend{display:flex;gap:15px;flex-wrap:wrap;padding:11px 4px 3px;font-family:var(--mono);font-size:9px;letter-spacing:1px;color:rgba(255,255,255,0.33)}
-.legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px;vertical-align:-1px}
-
-.figs{display:grid;grid-template-columns:1fr 1fr;gap:2px;background:rgba(255,255,255,0.05);border-radius:12px;overflow:hidden;margin-bottom:14px}
-.fig{background:var(--surface2);padding:16px 12px;text-align:center}
-.fig .k{font-family:var(--mono);font-size:8.5px;letter-spacing:1.5px;text-transform:uppercase;color:rgba(255,255,255,0.28);margin-bottom:6px}
-.fig .v{font-family:var(--display);font-size:clamp(21px,5.2vw,31px);font-weight:900;line-height:1}
-.fig .s{font-family:var(--mono);font-size:8.5px;color:rgba(255,255,255,0.22);margin-top:5px}
-
-.asset{background:linear-gradient(160deg,rgba(201,168,76,0.1),rgba(127,227,176,0.05));border:2px solid rgba(201,168,76,0.3);border-radius:16px;padding:24px 20px;text-align:center;margin-bottom:14px}
-.asset .k{font-family:var(--mono);font-size:9.5px;letter-spacing:2.4px;text-transform:uppercase;color:rgba(255,255,255,0.4);margin-bottom:10px}
-.asset .v{font-family:var(--display);font-size:clamp(38px,10vw,66px);font-weight:900;line-height:1;background:linear-gradient(100deg,var(--gold),var(--gold2));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
-.asset .s{font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.32);margin-top:11px;line-height:1.7;max-width:430px;margin-left:auto;margin-right:auto}
-
-.rung{display:flex;align-items:center;gap:13px;background:var(--surface2);border:1px solid var(--border);border-radius:11px;padding:13px 15px;margin-bottom:7px}
-.rung.hit{border-color:rgba(127,227,176,0.42);background:rgba(127,227,176,0.05)}
-.rung.now{border-color:var(--gold);background:rgba(201,168,76,0.09)}
-.rung-n{font-family:var(--display);font-size:19px;font-weight:900;color:rgba(255,255,255,0.35);min-width:62px;line-height:1.1}
-.rung.hit .rung-n{color:var(--green)}.rung.now .rung-n{color:var(--gold)}
-.rung-n small{display:block;font-family:var(--mono);font-size:7.5px;letter-spacing:1.3px;text-transform:uppercase;color:rgba(255,255,255,0.25);font-weight:400;margin-top:3px}
-.rung-mid{flex:1;min-width:0}
-.rung-mid .t{font-size:14px;font-weight:700;line-height:1.35}
-.rung-mid .d{font-size:12.5px;color:rgba(255,255,255,0.42);line-height:1.5;margin-top:2px}
-.rung-amt{font-family:var(--display);font-size:18px;font-weight:900;color:var(--green);text-align:right;white-space:nowrap}
-.rung-amt small{display:block;font-family:var(--mono);font-size:7.5px;color:rgba(255,255,255,0.25);font-weight:400;letter-spacing:1px;margin-top:3px}
-
-.vs{display:grid;grid-template-columns:1fr 1fr;gap:2px;background:rgba(255,255,255,0.05);border-radius:12px;overflow:hidden}
-.vs-col{background:var(--surface2);padding:23px 19px}
-.vs-col.bad h3{color:rgba(255,255,255,0.4)}
-.vs-col.good h3{background:linear-gradient(100deg,var(--green),var(--green2));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
-.vs-col h3{font-family:var(--display);font-size:19px;font-weight:900;margin-bottom:14px}
-.vs-col li{list-style:none;font-size:13.5px;line-height:1.6;padding:9px 0 9px 20px;position:relative;color:rgba(255,255,255,0.5);border-bottom:1px solid rgba(255,255,255,0.04)}
-.vs-col li:last-child{border-bottom:none}
-.vs-col li b{color:#fff}
-.vs-col.bad li::before{content:'\2715';position:absolute;left:0;color:var(--red);opacity:.7}
-.vs-col.good li::before{content:'\2713';position:absolute;left:0;color:var(--green)}
-
-.packs{display:grid;grid-template-columns:1fr 1fr;gap:11px}
-.pk{background:var(--surface);border:1px solid var(--border);border-radius:13px;padding:19px}
-.pk .tag{font-family:var(--mono);font-size:8.5px;letter-spacing:1.5px;text-transform:uppercase;padding:3px 9px;border-radius:4px;display:inline-block;margin-bottom:10px}
-.tg-red{color:var(--red);background:rgba(255,107,107,0.09);border:1px solid rgba(255,107,107,0.3)}
-.tg-cyan{color:var(--cyan);background:rgba(0,212,255,0.08);border:1px solid rgba(0,212,255,0.3)}
-.tg-green{color:var(--green);background:rgba(127,227,176,0.08);border:1px solid rgba(127,227,176,0.3)}
-.pk h3{font-family:var(--display);font-size:19px;font-weight:900;margin-bottom:6px}
-.pk .one{font-size:14px;color:rgba(255,255,255,0.72);font-weight:600;margin-bottom:9px}
-.pk p{font-size:13.5px;color:rgba(255,255,255,0.47);line-height:1.7}
-.pk p b{color:rgba(255,255,255,0.82)}
-.say{background:rgba(201,168,76,0.06);border-left:3px solid var(--gold);padding:10px 13px;margin-top:12px;border-radius:0 6px 6px 0}
-.say .k{font-family:var(--mono);font-size:8px;letter-spacing:1.5px;text-transform:uppercase;color:var(--gold);margin-bottom:4px}
-.say p{font-size:13px;color:rgba(255,255,255,0.65);font-style:italic;margin:0}
-
-.spotlight{background:linear-gradient(150deg,rgba(201,168,76,0.09),rgba(0,212,255,0.04));border:2px solid rgba(201,168,76,0.28);border-radius:16px;padding:26px 22px}
-.spotlight h3{font-family:var(--display);font-size:clamp(24px,5vw,34px);font-weight:900;margin-bottom:10px;line-height:1.1}
-.spotlight h3 em{font-style:normal;color:var(--gold)}
-.spotlight>p{font-size:15px;color:rgba(255,255,255,0.58);line-height:1.75;margin-bottom:18px}
-.spotlight>p b{color:#fff}
-.sp-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:16px}
-.sp{background:rgba(0,0,0,0.28);border:1px solid rgba(255,255,255,0.07);border-radius:10px;padding:15px 17px}
-.sp .t{font-size:14px;font-weight:700;color:var(--gold);margin-bottom:5px}
-.sp p{font-size:13px;color:rgba(255,255,255,0.5);line-height:1.65;margin:0}
-
-.script{background:var(--surface);border:1px solid var(--border);border-radius:13px;padding:19px;margin-bottom:10px}
-.script-h{display:flex;justify-content:space-between;align-items:baseline;gap:12px;margin-bottom:11px;flex-wrap:wrap}
-.script-h h4{font-family:var(--display);font-size:18px;font-weight:900}
-.script-h .who{font-family:var(--mono);font-size:9px;letter-spacing:1.4px;text-transform:uppercase;color:var(--cyan)}
-.words{background:rgba(0,0,0,0.35);border:1px solid rgba(0,212,255,0.14);border-radius:8px;padding:14px 16px;font-size:14px;color:rgba(255,255,255,0.75);line-height:1.75;font-style:italic}
-.words b{color:var(--gold);font-style:normal}
-.script .after{font-size:13px;color:rgba(255,255,255,0.42);line-height:1.65;margin-top:10px}
-.script .after b{color:#fff}
-
-.claims{display:grid;grid-template-columns:1fr 1fr;gap:2px;background:rgba(255,255,255,0.05);border-radius:12px;overflow:hidden}
-.cl{background:var(--surface2);padding:21px 18px}
-.cl h4{font-family:var(--display);font-size:17px;font-weight:900;margin-bottom:12px}
-.cl.y h4{color:var(--green)}.cl.n h4{color:var(--red)}
-.cl li{list-style:none;font-size:13.5px;line-height:1.6;padding:8px 0 8px 21px;position:relative;color:rgba(255,255,255,0.52);border-bottom:1px solid rgba(255,255,255,0.04)}
-.cl li:last-child{border-bottom:none}
-.cl.y li::before{content:'\2713';position:absolute;left:0;color:var(--green);font-weight:700}
-.cl.n li::before{content:'\2715';position:absolute;left:0;color:var(--red);font-weight:700}
-
-.note{border-radius:10px;padding:14px 18px;font-size:13.5px;line-height:1.75;margin-top:14px}
-.note-cyan{background:rgba(0,212,255,0.05);border:1px solid rgba(0,212,255,0.22);color:rgba(255,255,255,0.58)}
-.note-cyan b{color:var(--cyan)}
-.note-red{background:rgba(255,107,107,0.05);border:1px solid rgba(255,107,107,0.24);color:rgba(255,255,255,0.58)}
-.note-red b{color:var(--red)}
-.note-gold{background:rgba(201,168,76,0.05);border:1px solid rgba(201,168,76,0.28);color:rgba(255,255,255,0.58)}
-.note-gold b{color:var(--gold)}
-
-/* SIGNUP */
-.signup{background:linear-gradient(160deg,rgba(201,168,76,0.08),rgba(127,227,176,0.04));border:2px solid rgba(201,168,76,0.3);border-radius:16px;padding:28px 22px}
-.signup h3{font-family:var(--display);font-size:clamp(25px,5.4vw,36px);font-weight:900;margin-bottom:8px;line-height:1.1}
-.signup>p{font-size:14.5px;color:rgba(255,255,255,0.52);line-height:1.7;margin-bottom:22px}
-.fg{margin-bottom:11px}
-.fg label{display:block;font-family:var(--mono);font-size:9px;color:rgba(255,255,255,0.3);letter-spacing:1.8px;text-transform:uppercase;margin-bottom:6px}
-.fg input,.fg select{width:100%;background:rgba(255,255,255,0.05);border:2px solid rgba(255,255,255,0.09);color:#fff;padding:13px 14px;font-size:15px;font-family:var(--sans);outline:none;border-radius:7px}
-.fg input:focus,.fg select:focus{border-color:var(--gold)}
-.fg input::placeholder{color:rgba(255,255,255,0.2)}
-.fg select option{background:var(--navy)}
-.fg2{display:grid;grid-template-columns:1fr 1fr;gap:11px}
-.btn-full{width:100%;padding:16px;font-size:16px;font-weight:800;border-radius:8px;border:none;cursor:pointer;font-family:var(--sans);background:linear-gradient(140deg,var(--gold2),var(--gold));color:var(--navy);margin-top:8px;transition:all .2s}
-.btn-full:hover{transform:translateY(-2px)}
-.btn-full:disabled{opacity:.5;transform:none}
-.err{display:none;color:var(--red);font-family:var(--mono);font-size:11.5px;margin-top:11px;padding:11px 13px;background:rgba(255,107,107,0.08);border-radius:7px;border:1px solid rgba(255,107,107,0.22);line-height:1.6}
-.err.show{display:block}
-.got{display:none;margin-top:20px;background:rgba(0,0,0,0.35);border:1px solid rgba(201,168,76,0.25);border-radius:12px;padding:20px}
-.got.show{display:block}
-.got-k{font-family:var(--mono);font-size:8.5px;letter-spacing:1.8px;color:var(--gold);text-transform:uppercase;margin-bottom:7px}
-.got-v{font-family:var(--mono);font-size:12px;color:var(--green);word-break:break-all;background:rgba(0,0,0,0.4);padding:11px 13px;border-radius:6px;margin-bottom:16px;line-height:1.6}
-.got-code{font-family:var(--display);font-size:clamp(26px,7vw,38px);font-weight:900;color:var(--green);letter-spacing:2px;margin:4px 0 8px;word-break:break-all}
-.cpy{background:rgba(0,212,255,0.09);border:1px solid rgba(0,212,255,0.25);color:var(--cyan);padding:10px 18px;border-radius:6px;font-family:var(--mono);font-size:10px;cursor:pointer;letter-spacing:1.4px;text-transform:uppercase;margin-top:6px}
-.next{margin-top:18px;padding-top:16px;border-top:1px solid rgba(255,255,255,0.08);font-size:13.5px;color:rgba(255,255,255,0.5);line-height:1.75}
-.next b{color:#fff}
-
-.faq{background:var(--surface);border:1px solid var(--border);border-radius:10px;margin-bottom:8px;overflow:hidden}
-.faq-q{padding:15px 18px;font-size:14.5px;font-weight:600;cursor:pointer;display:flex;justify-content:space-between;gap:14px;align-items:center}
-.faq-q::after{content:'+';font-family:var(--mono);color:var(--gold);font-size:18px;flex-shrink:0}
-.faq.open .faq-q::after{content:'\2013'}
-.faq-a{display:none;padding:0 18px 16px;font-size:13.5px;color:rgba(255,255,255,0.5);line-height:1.75}
-.faq.open .faq-a{display:block}
-.faq-a b{color:#fff}
-
-.honest{max-width:880px;margin:0 auto;padding:44px 20px 50px}
-.honest-box{border:1px solid rgba(201,168,76,0.28);background:rgba(201,168,76,0.04);border-radius:11px;padding:19px 21px;font-size:13.5px;color:var(--muted);line-height:1.8}
-.honest-box b{color:var(--gold)}
-
-footer{background:rgba(0,0,0,0.45);padding:30px 20px;border-top:1px solid rgba(255,255,255,0.05);text-align:center}
-.fl{display:flex;gap:17px;flex-wrap:wrap;justify-content:center;margin-bottom:12px}
-.fl a{color:rgba(255,255,255,0.35);text-decoration:none;font-size:12.5px}.fl a:hover{color:#fff}
-.fc{font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.22);line-height:1.85;max-width:620px;margin:0 auto}
-
-@media(max-width:740px){
-  .nav-links a:not(.nav-cta){display:none}
-  .packs,.vs,.claims,.sp-grid,.fg2{grid-template-columns:1fr}
-  .rung{padding:11px 12px;gap:9px}
-  .rung-n{min-width:52px;font-size:16px}
-  .rung-amt{font-size:15px}
-  .rung-mid .t{font-size:13px}
-}
-</style>
-</head>
-<body>
-
-<nav>
-  <a href="/" class="nav-logo">Monop <span>Content</span></a>
-  <div class="nav-links">
-    <a href="#numbers">The numbers</a>
-    <a href="#product">The product</a>
-    <a href="#words">The words</a>
-    <a href="#signup" class="nav-cta">Start free</a>
-  </div>
-</nav>
-
-<section class="hero">
-  <div class="hero-in">
-    <span class="kick">No capital &middot; no stock &middot; no fees &middot; start today</span>
-    <h1>Don't resell a product.<br><em>Build your own.</em></h1>
-    <p class="hero-sub">You buy the engine at <b>50p per device per month</b>. Then you decide what it is. Child safety for parents. Endpoint monitoring for a call centre. Driver checks for a haulage firm. <b>You write the rules, you name the product, you set the price</b> &mdash; and every customer pays you again next month whether you worked or not.</p>
-    <div class="flow">
-      <div class="flow-b"><div class="k">Your cost</div><div class="v c-dim">50p</div></div>
-      <div class="flow-b"><div class="k">Your price</div><div class="v c-gold">&pound;4.50</div></div>
-      <div class="flow-b hot"><div class="k">Your margin</div><div class="v c-green">&pound;4.00</div></div>
-    </div>
-  </div>
-</section>
-
-<!-- ========== NUMBERS ========== -->
-<section class="sec" id="numbers">
-  <span class="eyebrow">01 &middot; Run it like a business</span>
-  <h2>Not a wage.<br>A <em>book of revenue.</em></h2>
-  <p class="sub">Forget how much you make this month. The question a businessman asks is what the whole thing is worth in three years. Set how many customers you can add each month and what you charge them &mdash; <b>the graph stacks it up, because last month's customers are still paying.</b></p>
-
-  <div class="panel">
-    <div class="ctrl">
-      <div class="ctrl-top"><span class="ctrl-lbl">New devices you add each month</span><span class="ctrl-val" id="v-add">25</span></div>
-      <input type="range" id="s-add" min="0" max="100" value="42" oninput="draw()">
-      <div class="hint">Not total &mdash; new ones per month. Five is a slow start. Fifty means you're working at it.</div>
-    </div>
-    <div class="ctrl">
-      <div class="ctrl-top"><span class="ctrl-lbl">Your price per device, per month</span><span class="ctrl-val" id="v-price">&pound;4.50</span></div>
-      <input type="range" id="s-price" min="60" max="2000" value="450" step="10" oninput="draw()">
-      <div class="hint">Your market, your price, your currency. We take 50p of it and nothing else.</div>
-    </div>
-    <div class="ctrl">
-      <div class="ctrl-top"><span class="ctrl-lbl">Customers who stay each month</span><span class="ctrl-val" id="v-keep">97%</span></div>
-      <input type="range" id="s-keep" min="85" max="100" value="97" oninput="draw()">
-      <div class="hint">Nobody keeps everyone. 97% means three in every hundred leave each month &mdash; normal for a consumer subscription, and the number your buyer will ask for.</div>
-    </div>
-  </div>
-
-  <div class="graph">
-    <div class="graph-t">Monthly margin, three years out</div>
-    <div class="graph-s" id="g-sub">&nbsp;</div>
-    <svg class="chart" id="chart" viewBox="0 0 340 170" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Monthly margin growing over 36 months"></svg>
-    <div class="legend">
-      <span><i style="background:var(--green)"></i>Your margin</span>
-      <span><i style="background:#2a3550"></i>Our 50p</span>
-    </div>
-  </div>
-
-  <div class="figs">
-    <div class="fig"><div class="k">Month 12 margin</div><div class="v c-green" id="f-12">&pound;0</div><div class="s">per month</div></div>
-    <div class="fig"><div class="k">Month 36 margin</div><div class="v c-green" id="f-36">&pound;0</div><div class="s">per month</div></div>
-    <div class="fig"><div class="k">Devices by month 36</div><div class="v c-dim" id="f-dev">0</div><div class="s">all still paying</div></div>
-    <div class="fig"><div class="k">Earned over 3 years</div><div class="v" style="color:var(--cyan)" id="f-tot">&pound;0</div><div class="s">cumulative</div></div>
-  </div>
-
-  <div class="asset">
-    <div class="k">What the book itself is worth by year three</div>
-    <div class="v" id="f-val">&pound;0</div>
-    <div class="s">Recurring-revenue businesses typically change hands at somewhere around 2&ndash;4&times; annual revenue, depending on churn and how much of it depends on you personally. This is the middle of that range on your own numbers &mdash; an illustration, not a valuation.</div>
-  </div>
-
-  <div class="note note-cyan" id="reality">&nbsp;</div>
-</section>
-
-<!-- ========== LADDER ========== -->
-<section class="sec">
-  <span class="eyebrow">02 &middot; The climb</span>
-  <h2>It starts at <em class="g">ten devices.</em></h2>
-  <p class="sub">Every rung at the price you just set. The first takes an afternoon. Every one after is the same conversation again.</p>
-  <div id="ladder"></div>
-  <div class="note note-gold"><b>The bit people miss:</b> a job pays you once for the hour you worked. Every device you sign up pays you again next month, and the month after, while you're asleep or out signing up the next one. <b>Ten new customers a month isn't ten customers &mdash; by December it's a hundred and twenty, all still paying.</b></div>
-</section>
-
-<!-- ========== VS ========== -->
-<section class="sec">
-  <span class="eyebrow">03 &middot; Why this and not the other stuff</span>
-  <h2>You've seen the<br>dropshipping <em>adverts.</em></h2>
-  <p class="sub">The honest comparison, including the part that's harder here.</p>
-  <div class="vs">
-    <div class="vs-col bad">
-      <h3>Flipping products</h3>
-      <li>Paid <b>once</b>. Then back to zero next month.</li>
-      <li>Someone always undercuts you. Margins die.</li>
-      <li>Capital up front on stock or ads before a penny comes back.</li>
-      <li>Returns, shipping, customs, angry customers.</li>
-      <li>You can't sell the business. There isn't one.</li>
-      <li>Nobody's life is better because you sold it.</li>
-    </div>
-    <div class="vs-col good">
-      <h3>This</h3>
-      <li>Paid <b>every month</b>, for as long as they keep it.</li>
-      <li>Your cost is fixed at 50p and doesn't rise as you grow.</li>
-      <li><b>No capital.</b> No stock, no fee, no minimum.</li>
-      <li>No shipping, no returns, no warehouse. It's software.</li>
-      <li><b>A book of subscriptions is an asset you can sell.</b></li>
-      <li>Harder to sell than a phone case &mdash; you have to explain it.</li>
-    </div>
-  </div>
-</section>
-
-<!-- ========== PRODUCT ========== -->
-<section class="sec" id="product">
-  <span class="eyebrow">04 &middot; What they get for the money</span>
-  <h2>Three things<br>on the <em>phone itself.</em></h2>
-  <p class="sub">Each has the exact sentence to use. Nick them word for word &mdash; they're written to be said out loud.</p>
-
-  <div class="packs">
-    <div class="pk">
-      <span class="tag tg-red">Guardian</span>
-      <h3>Child protection</h3>
-      <p class="one">Spots the patterns that come before harm.</p>
-      <p>Watches for known warning signs of grooming &mdash; pushing for secrecy, isolating a child, moving them to a private chat &mdash; and tells the parent. <b>The messages are never stored</b>, only a fingerprint. What is kept is sealed, so it can't be edited later and it means something to a school or the police.</p>
-      <div class="say"><div class="k">Say this</div><p>&ldquo;Your kid's phone tells you when something starts going wrong &mdash; without you having to read their messages.&rdquo;</p></div>
-    </div>
-    <div class="pk">
-      <span class="tag tg-cyan">Sentinel</span>
-      <h3>Fraud alarm</h3>
-      <p class="one">Catches it during, not on the statement.</p>
-      <p>Watches speed and pattern &mdash; a run of login attempts, a burst of payments, the account surfacing in another country minutes after the last one. Classic takeover signals. Flags them live and <b>seals the evidence</b>, so there's something real to show the bank.</p>
-      <div class="say"><div class="k">Say this</div><p>&ldquo;When someone tries to get into your account, you find out while it's happening.&rdquo;</p></div>
-    </div>
-    <div class="pk">
-      <span class="tag tg-green">Sebdog</span>
-      <h3>It runs on the phone</h3>
-      <p class="one">Not on our computers. Theirs.</p>
-      <p>The engine sits on the device itself, so their data doesn't have to leave it to be protected. <b>No round trip, nobody in the middle.</b> Businesses pay serious money for this as an on-site product. Here it's part of the package.</p>
-      <div class="say"><div class="k">Say this</div><p>&ldquo;It protects you without sending your life to somebody else's computer.&rdquo;</p></div>
-    </div>
-    <div class="pk">
-      <span class="tag tg-green">The proof layer</span>
-      <h3>All of it, sealed</h3>
-      <p class="one">A record nobody can rewrite &mdash; us included.</p>
-      <p>Every alert is written into a chain where each record is locked to the one before, so altering anything past visibly breaks it. <b>That's what turns an alert into evidence</b> rather than a screenshot somebody could have faked.</p>
-      <div class="say"><div class="k">Say this</div><p>&ldquo;If it happened, you can prove it happened.&rdquo;</p></div>
-    </div>
-  </div>
-</section>
-
-<!-- ========== SIGNAL PACKS ========== -->
-<section class="sec">
-  <span class="eyebrow">05 &middot; The part that makes you a company</span>
-  <div class="spotlight">
-    <h3>Signal Packs &mdash;<br>your product, <em>not ours.</em></h3>
-    <p>Here's what you're really buying, and it isn't a child-safety app. The engine watches events on a device, scores them against <b>a set of rules somebody wrote</b>, and seals the result so it can't be altered afterwards. Guardian is just one set of rules. <b>A Signal Pack is you writing your own set</b> &mdash; and the moment you do, it stops being our product and starts being yours.</p>
-    <div class="sp-grid">
-      <div class="sp"><div class="t">You define what's risky</div><p>Not us. You decide what the engine watches for and what it does about it. Same engine, completely different product.</p></div>
-      <div class="sp"><div class="t">You name it and brand it</div><p>Your product name, your logo, your pricing page. Your customers never need to hear of us.</p></div>
-      <div class="sp"><div class="t">One pack, sold a thousand times</div><p>Write it once for a market you understand, then sell that same pack to every firm in that market. <b>That's a product line, not a side hustle.</b></p></div>
-      <div class="sp"><div class="t">Different packs, different prices</div><p>A parent pays &pound;4. A call centre pays &pound;12 a seat for the same engine with different rules and a sealed audit trail.</p></div>
-    </div>
-    <div class="note note-gold" style="margin-top:16px"><b>And the churn angle:</b> a customer who has helped shape their own pack does not cancel in month three. Churn is the single number that decides what your book is worth &mdash; <b>every point of it you avoid raises the sale price of the whole business.</b></div>
-  </div>
-
-  <div class="note note-cyan"><b>Be straight about the boundary:</b> the engine works on the signals it can actually see on a device &mdash; patterns, timing, addresses, activity. A Signal Pack decides what to do with those signals. <b>It is a rules-and-evidence layer, not magic</b>, and you'll sell far more of it by telling a buyer exactly what it watches than by implying it watches everything.</div>
-</section>
-
-<!-- ========== MARKETS ========== -->
-<section class="sec">
-  <span class="eyebrow">06 &middot; Pick your market</span>
-  <h2>Same 50p.<br>Seven different <em>businesses.</em></h2>
-  <p class="sub">Every one of these is the same engine at the same cost to you. The only thing that changes is the pack you write and the price you charge. <b>Pick the market you already understand</b> &mdash; the one where you know how people talk.</p>
-
-  <div class="packs">
-    <div class="pk">
-      <span class="tag tg-red">Consumer</span>
-      <h3>Parents</h3>
-      <p class="one">The easiest first sale you'll ever make.</p>
-      <p>Grooming warning signs, sealed alerts, rules the parent sets. <b>Sell it at &pound;4&ndash;&pound;6 a month.</b> Low price, huge market, and the referrals do the work &mdash; parents talk to other parents about exactly this.</p>
-    </div>
-    <div class="pk">
-      <span class="tag tg-cyan">Business</span>
-      <h3>Call centres</h3>
-      <p class="one">Hundreds of seats in one signature.</p>
-      <p>Every agent's endpoint monitored against your pack, every flag sealed into a record a compliance manager can produce later. <b>&pound;8&ndash;&pound;15 a seat.</b> One five-hundred-seat floor is more revenue than two hundred parents, from one meeting.</p>
-    </div>
-    <div class="pk">
-      <span class="tag tg-cyan">Business</span>
-      <h3>Any firm with endpoints</h3>
-      <p class="one">Laptops, tablets, handsets, kiosks.</p>
-      <p>Write a pack for their policy &mdash; what's normal on a company device and what isn't &mdash; and sell it as monitored-with-evidence. <b>&pound;5&ndash;&pound;12 a device.</b> Two hundred devices is a real contract with one invoice.</p>
-    </div>
-    <div class="pk">
-      <span class="tag tg-green">Vertical</span>
-      <h3>Care &amp; support agencies</h3>
-      <p class="one">Lone workers, vulnerable clients.</p>
-      <p>A pack built around visits, hours and unusual activity, with a sealed trail for safeguarding. <b>&pound;8&ndash;&pound;20 a device.</b> They already have the duty; nobody's sold them the evidence layer for it.</p>
-    </div>
-    <div class="pk">
-      <span class="tag tg-green">Vertical</span>
-      <h3>Haulage, taxi, delivery</h3>
-      <p class="one">Drivers, handsets, disputes.</p>
-      <p>Your pack, their fleet, and a record that settles an argument about what happened and when. <b>&pound;5&ndash;&pound;10 a driver.</b> One firm with sixty drivers is &pound;400 a month from a single phone call.</p>
-    </div>
-    <div class="pk">
-      <span class="tag tg-green">Vertical</span>
-      <h3>Schools &amp; youth clubs</h3>
-      <p class="one">One conversation, a hundred families.</p>
-      <p>Sell to the institution, deploy across the families. <b>&pound;3&ndash;&pound;5 a device</b> at volume, one invoice, one relationship to maintain, and a safeguarding lead who wants the evidence trail anyway.</p>
-    </div>
-  </div>
-
-  <div class="note note-gold"><b>The move nobody makes:</b> don't sell all seven. <b>Pick one, write one really good pack, and go and own that market.</b> The firm that becomes "the endpoint evidence people for care agencies" charges four times what a generalist charges, and sells the business for more at the end because the book is concentrated and defensible.</div>
-</section>
-
-<!-- ========== SALES FORCE ========== -->
-<section class="sec">
-  <span class="eyebrow">07 &middot; Scale past yourself</span>
-  <h2>Your book.<br>Your <em>sales force.</em></h2>
-  <p class="sub">There's a ceiling on what one person can sell, and it's about five hundred devices. Past that you stop selling and start running something.</p>
-
-  <div class="vs">
-    <div class="vs-col good">
-      <h3>Put people on it</h3>
-      <li>Your cost stays at 50p <b>no matter who made the sale.</b></li>
-      <li>Pay a seller commission out of your margin &mdash; at &pound;4.50 there's room for both of you.</li>
-      <li>Give them the scripts on this page. They're written to be read out.</li>
-      <li>A pack you already wrote means <b>a new seller needs no product knowledge</b>, just the conversation.</li>
-      <li>Recurring revenue means their sale keeps paying you long after their commission is spent.</li>
-    </div>
-    <div class="vs-col good">
-      <h3>Or put a machine on it</h3>
-      <li>An existing call centre can sell this <b>tomorrow</b>, off a script, into their existing list.</li>
-      <li>A phone shop chain adds it at the counter across every branch.</li>
-      <li>An IT firm adds one line to invoices clients already pay monthly.</li>
-      <li>Any business with a customer list already owns the expensive part &mdash; <b>the customers.</b></li>
-      <li>You keep every penny above 50p on all of it.</li>
-    </div>
-  </div>
-
-  <div class="note note-cyan"><b>The honest maths on hiring:</b> at &pound;4.50 you keep &pound;4. Give a seller &pound;1 per device per month and you still hold &pound;3, on a sale you didn't make. <b>Ten sellers doing twenty a month each is 200 devices a month landing on a book you own.</b> That's the difference between a wage and a company.</div>
-</section>
-
-<!-- ========== WORDS ========== -->
-<section class="sec" id="words">
-  <span class="eyebrow">08 &middot; Your first ten customers</span>
-  <h2>You already know<br>every one of <em>them.</em></h2>
-  <p class="sub">No adverts, no website, no capital. Ten people who trust you and have kids with phones. <b>Here are the words.</b></p>
-
-  <div class="script">
-    <div class="script-h"><h4>The school gate</h4><span class="who">In person &middot; 30 seconds</span></div>
-    <div class="words">&ldquo;Can I ask you something daft &mdash; has your lad got a phone yet? Right. So I've started doing something that puts a thing on it that watches for the grooming stuff. It doesn't read his messages, it just tells you if someone starts asking him to keep secrets or move to a private chat. <b>It's a fiver a month.</b> Want me to put it on for you?&rdquo;</div>
-    <div class="after"><b>Why it works:</b> you named the fear, killed the objection they were about to make, and gave the price before they had to ask. <b>Say the price.</b> People who hide the price never sell anything.</div>
-  </div>
-
-  <div class="script">
-    <div class="script-h"><h4>The group chat</h4><span class="who">WhatsApp &middot; paste it</span></div>
-    <div class="words">&ldquo;Bit random. I've started doing a thing for kids' phones &mdash; it watches for the grooming warning signs and tells the parent, without reading their messages. Also catches someone trying to get into your bank. <b>&pound;4.50 a month, cancel whenever.</b> If anyone wants it on their kid's phone give me a shout.&rdquo;</div>
-    <div class="after"><b>Why it works:</b> no link, no sales voice, no pressure. In a group of forty parents you'll get three &mdash; and <b>those three tell other parents</b>, because this is the thing parents actually talk about.</div>
-  </div>
-
-  <div class="script">
-    <div class="script-h"><h4>The counter</h4><span class="who">If you sell or fix phones</span></div>
-    <div class="words">&ldquo;Is this one for yourself or one of the kids? For your daughter &mdash; right. Do you want me to put the safety package on before you go? It watches for grooming and tells you, and flags anyone trying to get into her accounts. <b>Five pound a month and I'll set it up now while you're stood here.</b>&rdquo;</div>
-    <div class="after"><b>Why it works:</b> they're already spending and already thinking about their kid. <b>Every handset becomes years of monthly revenue</b> instead of one margin you spend that week.</div>
-  </div>
-
-  <div class="script">
-    <div class="script-h"><h4>The business call</h4><span class="who">Clubs &middot; schools &middot; employers</span></div>
-    <div class="words">&ldquo;I supply a safety package for phones &mdash; it flags grooming warning signs to a parent and keeps a sealed record you could hand to the police if it came to it. I'm offering it to your families at <b>&pound;4 a month.</b> Could I show you what a parent actually sees? Five minutes.&rdquo;</div>
-    <div class="after"><b>Why it works:</b> one club is a hundred families in one conversation. <b>That's £350 a month from a single phone call.</b> Ask for the five minutes, not the sale.</div>
-  </div>
-
-  <div class="note note-cyan"><b>The only rule:</b> ask for the money. Nine out of ten people who fail at this never say a price out loud. Say it plainly, then stop talking and let them answer.</div>
-</section>
-
-<!-- ========== CLAIMS ========== -->
-<section class="sec">
-  <span class="eyebrow">09 &middot; How the good ones sell it</span>
-  <h2>Never oversell<br>this <em>one thing.</em></h2>
-  <p class="sub">Left column is true and provable. Right column is a promise nobody on earth can keep, us included. <b>The left closes better anyway</b> &mdash; people trust the seller who tells them what it can't do.</p>
-  <div class="claims">
-    <div class="cl y">
-      <h4>True. Say it freely.</h4>
-      <li>Flags known warning signs of grooming and alerts the parent</li>
-      <li>Never stores the messages &mdash; only a fingerprint</li>
-      <li>Keeps a sealed record nobody can quietly change later</li>
-      <li>Catches fraud patterns as they happen</li>
-      <li>Runs on the phone, so their data stays on it</li>
-      <li>Something real to hand to a school or the police</li>
-    </div>
-    <div class="cl n">
-      <h4>Never. Not once.</h4>
-      <li>&ldquo;Stops grooming&rdquo; or &ldquo;keeps your child safe&rdquo;</li>
-      <li>&ldquo;Catches every predator&rdquo; &middot; &ldquo;100% detection&rdquo;</li>
-      <li>&ldquo;Unhackable&rdquo; or &ldquo;impossible to get round&rdquo;</li>
-      <li>&ldquo;Police approved&rdquo; &middot; &ldquo;certified&rdquo; &middot; &ldquo;government backed&rdquo;</li>
-      <li>&ldquo;Makes you compliant&rdquo; with any law</li>
-      <li>Anything hinting a parent can stop paying attention</li>
-    </div>
-  </div>
-  <div class="note note-red"><b>Why we're hard on this:</b> it catches known patterns. It cannot catch every clever rewording and no honest product claims otherwise. What it guarantees is the <b>record</b>. <b>A parent promised a wall who got a smoke alarm cancels, tells forty other parents, and takes your book with them.</b> Sell it straight and they stay for years. Overclaim on child safety and your code gets pulled.</div>
-</section>
-
-<!-- ========== SIGNUP ========== -->
-<section class="sec" id="signup">
-  <span class="eyebrow">10 &middot; Start</span>
-  <div class="signup">
-    <h3>Get your reseller code</h3>
-    <p>Free. No fee, no minimum, no contract, no card. You get your code and your key on this page in about ten seconds &mdash; then go and ask the first ten people you know.</p>
-
-    <div class="fg2">
-      <div class="fg"><label>First name</label><input type="text" id="i-fn" placeholder="Jane" autocomplete="given-name"></div>
-      <div class="fg"><label>Last name</label><input type="text" id="i-ln" placeholder="Smith" autocomplete="family-name"></div>
-    </div>
-    <div class="fg"><label>Email</label><input type="email" id="i-em" placeholder="you@email.com" autocomplete="email"></div>
-    <div class="fg"><label>Phone (optional)</label><input type="tel" id="i-ph" placeholder="07700 000000" autocomplete="tel"></div>
-    <div class="fg"><label>Trading name &mdash; or just your own</label><input type="text" id="i-org" placeholder="Jane Smith" autocomplete="organization"></div>
-    <div class="fg"><label>Where will you sell it?</label>
-      <select id="i-type">
-        <option value="personal">People I know &mdash; starting from scratch</option>
-        <option value="phoneshop">Phone shop or repair shop</option>
-        <option value="school">School, club or parent group</option>
-        <option value="it">IT firm or consultancy</option>
-        <option value="operator">Network, MVNO or large rollout</option>
-        <option value="overseas">Outside the UK</option>
-        <option value="other">Something else</option>
-      </select>
-    </div>
-    <div class="fg"><label>What you plan to charge (you can change it any time)</label>
-      <select id="i-price">
-        <option value="1.50">&pound;1.50 per device</option>
-        <option value="2.99">&pound;2.99 per device</option>
-        <option value="4.50" selected>&pound;4.50 per device</option>
-        <option value="7.00">&pound;7.00 per device</option>
-        <option value="10.00">&pound;10.00 per device</option>
-        <option value="0">Not decided yet</option>
-      </select>
-    </div>
-
-    <button class="btn-full" id="btn-go" onclick="signup()">Get my reseller code &rarr;</button>
-    <div class="err" id="err"></div>
-
-    <div class="got" id="got">
-      <div class="got-k">Your reseller code &mdash; every device signed up with this is yours</div>
-      <div class="got-code" id="out-code">&mdash;</div>
-      <button class="cpy" onclick="copyIt('out-code')">Copy code</button>
-      <div style="height:18px"></div>
-      <div class="got-k">Your API key &mdash; save this somewhere safe</div>
-      <div class="got-v" id="out-key">&mdash;</div>
-      <button class="cpy" onclick="copyIt('out-key')">Copy key</button>
-      <div class="next">
-        <b>Next three things, in order:</b><br>
-        1. Save that key somewhere you won't lose it.<br>
-        2. Decide your price and stick to it for the first month.<br>
-        3. Use the school gate script on five people today. <b>Not tomorrow.</b>
-      </div>
-    </div>
-  </div>
-</section>
-
-<!-- ========== FAQ ========== -->
-<section class="sec">
-  <span class="eyebrow">11 &middot; Straight answers</span>
-  <h2>What everyone<br><em>asks first.</em></h2>
-  <div style="margin-top:22px">
-    <div class="faq"><div class="faq-q" onclick="tf(this)">Do I need money to start?</div><div class="faq-a">No. Not a penny. No joining fee, no stock, no minimum, no card. You pay 50p only for devices that are actually live &mdash; and by then your customer has already paid you.</div></div>
-    <div class="faq"><div class="faq-q" onclick="tf(this)">Do I need to be technical?</div><div class="faq-a">No. You get a code, they install it, that's it. If you can set up a phone for somebody, you can do this.</div></div>
-    <div class="faq"><div class="faq-q" onclick="tf(this)">Do I need a company?</div><div class="faq-a">Not to start. But once money's coming in, <b>tell HMRC</b> &mdash; this income is taxable like any other, and registering as a sole trader is free and takes ten minutes online. Don't skip it.</div></div>
-    <div class="faq"><div class="faq-q" onclick="tf(this)">Is this one of them pyramid things?</div><div class="faq-a"><b>No, and here's the test.</b> You don't recruit anybody. You don't earn from other sellers. You don't buy in and there's nothing to buy. You sell a real product to real people who use it, and you pay 50p per device. If a scheme's money comes from recruiting rather than selling, walk away &mdash; this one passes that test.</div></div>
-    <div class="faq"><div class="faq-q" onclick="tf(this)">Can I really sell the business later?</div><div class="faq-a">A book of live subscriptions is a real asset and people do buy them. What it fetches depends on churn, how many customers depend on you personally, and whether your records are clean. <b>Nobody can promise you a buyer</b> &mdash; but unlike flipping products, there's something there to sell.</div></div>
-    <div class="faq"><div class="faq-q" onclick="tf(this)">Can I sell outside the UK?</div><div class="faq-a">Yes, anywhere. Your currency, your price, your language. The 50p stays in sterling, so in plenty of markets the margin is <b>better</b>, not worse.</div></div>
-    <div class="faq"><div class="faq-q" onclick="tf(this)">What if a customer cancels?</div><div class="faq-a">Billing stops for that device &mdash; your bit and our bit. No penalty, no clawback, no notice period. Your other customers are untouched.</div></div>
-    <div class="faq"><div class="faq-q" onclick="tf(this)">Will you go behind my back to my customers?</div><div class="faq-a">No. You invoice them, you hold the relationship, and their devices are tied to your code permanently. If your ten become ten thousand, that's yours.</div></div>
-    <div class="faq"><div class="faq-q" onclick="tf(this)">How do I know any of this is real?</div><div class="faq-a">Don't take our word for it. The chain is public, the checking routes need no account, and the verifier runs on your own machine with the internet off. <b>You're meant to check rather than trust.</b> Start at <a href="/whitepaper" style="color:var(--gold)">the whitepaper</a>.</div></div>
-    <div class="faq"><div class="faq-q" onclick="tf(this)">Honestly &mdash; month one?</div><div class="faq-a">Ten to thirty devices if you actually ask everyone you know. At &pound;4.50 that's <b>&pound;40 to &pound;120 a month</b> &mdash; still arriving next January, and the January after. Anyone promising you thousands in week one is lying to you.</div></div>
-  </div>
-</section>
-
-<div class="honest">
-  <div class="honest-box"><b>About the numbers:</b> every figure comes from sliders you set yourself. It's arithmetic, not a forecast, and nobody is promising you customers or income. The valuation figure is an illustration using a common market range for recurring-revenue businesses &mdash; <b>it is not an offer, an appraisal, or a guarantee that anyone will buy your book.</b> What we promise is the price: 50p per active device per month and nothing else.<br><br><b>About the product:</b> sealing proves something happened in a particular form at a particular time and hasn't changed since. It does not prove the contents are true and it does not discharge anybody's legal duties. <b>Guardian is a safeguarding aid and an evidence layer. It supports a parent. It never replaces one.</b></div>
-</div>
-
-<footer>
-  <div class="fl">
-    <a href="/">Home</a>
-    <a href="/whitepaper">Whitepaper</a>
-    <a href="/developers">Developers</a>
-    <a href="/verify">Verify</a>
-    <a href="/contact">Contact</a>
-  </div>
-  <div class="fc">&copy; 2026 Monop Content &middot; Blyth, Northumberland, UK &middot; sebbi.pro<br>Figures are arithmetic on values you enter. Not projections, not guarantees of earnings.</div>
-</footer>
-
-<script>
-var ADD=[1,2,3,5,8,10,15,20,25,35,50,75,100,150,250,400,650,1000,1600,2500,4000];
-var COST=0.50, VAL_MULT=3, HORIZON=36;
-var RUNGS=[
-  {n:10,    t:'Your phone bill',       d:'One afternoon. Family and neighbours.'},
-  {n:50,    t:'The weekly shop',       d:'Your street, your group chat, the school gate.'},
-  {n:100,   t:'The car payment',       d:'One club, one class, one small school.'},
-  {n:250,   t:'Rent money',            d:'Word of mouth is doing some of it for you.'},
-  {n:500,   t:'A full-time wage',      d:'You could pack the day job in around here.'},
-  {n:2000,  t:"You're an employer",    d:'Somebody else is making the calls now.'},
-  {n:10000, t:'You run a company',     d:'A shop chain, an operator, a region.'}
-];
-
-function money(n){
-  if(n>=1000000) return '\u00a3'+(n/1000000).toFixed(n>=10000000?1:2)+'m';
-  if(n>=100000)  return '\u00a3'+Math.round(n/1000)+'k';
-  return '\u00a3'+Math.round(n).toLocaleString('en-GB');
-}
-function num(n){
-  if(n>=1000000) return (n/1000000).toFixed(1)+'m';
-  if(n>=10000)   return Math.round(n/1000)+'k';
-  return Math.round(n).toLocaleString('en-GB');
-}
-function addFrom(v){
-  var i=Math.round(v/100*(ADD.length-1));
-  return ADD[Math.max(0,Math.min(ADD.length-1,i))];
-}
-
-function series(add,keep){
-  var live=0,out=[];
-  for(var m=1;m<=HORIZON;m++){ live=live*keep+add; out.push(live); }
-  return out;
-}
-
-function draw(){
-  var add=addFrom(+document.getElementById('s-add').value);
-  var price=(+document.getElementById('s-price').value)/100;
-  var keepPct=+document.getElementById('s-keep').value;
-  var keep=keepPct/100;
-  var per=Math.max(0,price-COST);
-
-  document.getElementById('v-add').textContent=num(add);
-  document.getElementById('v-price').textContent='\u00a3'+price.toFixed(2);
-  document.getElementById('v-keep').textContent=keepPct+'%';
-
-  var s=series(add,keep);
-  var d12=s[11], d36=s[35];
-  var total=0; for(var i=0;i<s.length;i++) total+=s[i]*per;
-  var annual36=d36*per*12;
-
-  document.getElementById('f-12').textContent=money(d12*per);
-  document.getElementById('f-36').textContent=money(d36*per);
-  document.getElementById('f-dev').textContent=num(d36);
-  document.getElementById('f-tot').textContent=money(total);
-  document.getElementById('f-val').textContent=money(annual36*VAL_MULT);
-  document.getElementById('g-sub').textContent=num(add)+' new a month \u00b7 '+keepPct+'% stay \u00b7 \u00a3'+price.toFixed(2)+' each';
-
-  var rl=document.getElementById('reality');
-  if(per<=0){
-    rl.className='note note-red';
-    rl.innerHTML='<b>You\u2019d be working for nothing.</b> At \u00a3'+price.toFixed(2)+' you\u2019re at or below the 50p we charge. Even \u00a31.50 leaves you a pound per device per month.';
-  } else if(keepPct<=90){
-    rl.className='note note-red';
-    rl.innerHTML='<b>Churn is eating you alive.</b> At '+keepPct+'% you lose '+(100-keepPct)+' customers in every hundred, every month \u2014 you\u2019d be running to stand still, and no buyer touches a book like that. <b>Get every customer building a Signal Pack in week one</b> and this number is the one that moves.';
-  } else {
-    rl.className='note note-cyan';
-    rl.innerHTML='<b>What this actually says:</b> add '+num(add)+' a month and keep '+keepPct+'% of them, and by month 36 you hold '+num(d36)+' paying devices without ever having a bigger month than your first. <b>The stack does the work, not the heroics.</b>';
-  }
-
-  chart(s,per,keep);
-  ladder(d36,per);
-}
-
-function chart(s,per,keep){
-  var W=340,H=170,padL=6,padR=6,padT=14,padB=22;
-  var n=s.length, plotH=H-padT-padB, plotW=W-padL-padR;
-  var maxTot=s[n-1]*(per+COST); if(maxTot<=0) maxTot=1;
-  var bw=plotW/n, gap=bw*0.22;
-  var o='';
-  o+='<line x1="'+padL+'" y1="'+(H-padB)+'" x2="'+(W-padR)+'" y2="'+(H-padB)+'" stroke="#1e2a45" stroke-width="1"/>';
-  for(var i=0;i<n;i++){
-    var live=s[i], tot=live*(per+COST);
-    var totH=plotH*(tot/maxTot);
-    var costH=totH*(COST/(per+COST));
-    var keepH=totH-costH;
-    var x=padL+i*bw;
-    o+='<rect x="'+x.toFixed(1)+'" y="'+(H-padB-costH).toFixed(1)+'" width="'+(bw-gap).toFixed(1)+'" height="'+Math.max(0,costH).toFixed(1)+'" fill="#2a3550"/>';
-    o+='<rect x="'+x.toFixed(1)+'" y="'+(H-padB-totH).toFixed(1)+'" width="'+(bw-gap).toFixed(1)+'" height="'+Math.max(0,keepH).toFixed(1)+'" fill="'+(i===11||i===35?'#7fe3b0':'rgba(127,227,176,0.4)')+'"/>';
-    if(i===11||i===35){
-      o+='<text x="'+(x+(bw-gap)/2).toFixed(1)+'" y="'+(H-padB-totH-4).toFixed(1)+'" text-anchor="middle" font-family="DM Sans,sans-serif" font-size="8.5" font-weight="700" fill="#7fe3b0">'+money(live*per)+'</text>';
-    }
-  }
-  ['1','12','24','36'].forEach(function(m){
-    var i=(+m)-1, x=padL+i*bw+(bw-gap)/2;
-    o+='<text x="'+x.toFixed(1)+'" y="'+(H-padB+13)+'" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="8" fill="rgba(255,255,255,0.3)">m'+m+'</text>';
-  });
-  document.getElementById('chart').innerHTML=o;
-}
-
-function ladder(dev,per){
-  var marked=false, cls={};
-  for(var i=RUNGS.length-1;i>=0;i--){
-    var n=RUNGS[i].n;
-    cls[n]=(n<=dev&&!marked)?'rung now':(n<=dev?'rung hit':'rung');
-    if(n<=dev) marked=true;
-  }
-  var o='';
-  RUNGS.forEach(function(r){
-    o+='<div class="'+cls[r.n]+'">'+
-      '<div class="rung-n">'+num(r.n)+'<small>devices</small></div>'+
-      '<div class="rung-mid"><div class="t">'+r.t+'</div><div class="d">'+r.d+'</div></div>'+
-      '<div class="rung-amt">'+money(per*r.n)+'<small>a month</small></div>'+
-    '</div>';
-  });
-  document.getElementById('ladder').innerHTML=o;
-}
-
-function tf(el){el.parentElement.classList.toggle('open');}
-
-function copyIt(id){
-  var t=document.getElementById(id).textContent.trim();
-  if(navigator.clipboard){navigator.clipboard.writeText(t).then(function(){alert('Copied');},function(){});}
-}
-
-function clean(s){
-  // strip anything a phone keyboard may have smuggled in
-  return (s||'').replace(/[\u2018\u2019\u201c\u201d]/g,"'").replace(/[^\x20-\x7E]/g,'').trim();
-}
-
-async function signup(){
-  var fn=clean(document.getElementById('i-fn').value);
-  var ln=clean(document.getElementById('i-ln').value);
-  var em=clean(document.getElementById('i-em').value);
-  var ph=clean(document.getElementById('i-ph').value);
-  var org=clean(document.getElementById('i-org').value);
-  var type=document.getElementById('i-type').value;
-  var price=document.getElementById('i-price').value;
-  var err=document.getElementById('err'), got=document.getElementById('got'), btn=document.getElementById('btn-go');
-  err.classList.remove('show'); got.classList.remove('show');
-
-  if(!em||em.indexOf('@')<1){err.textContent='Enter a valid email address.';err.classList.add('show');return;}
-  if(!fn&&!org){err.textContent='Enter your name or a trading name.';err.classList.add('show');return;}
-
-  var label=org||((fn+' '+ln).trim());
-  btn.disabled=true; btn.textContent='Setting you up\u2026';
-  try{
-    var r=await fetch('/signup',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({
-        email:em, phone:ph, name:(fn+' '+ln).trim(), org:label,
-        org_type:'reseller_'+type, product:'guardian-package',
-        intended_price:price, devices:1
-      })
-    });
-    var d=await r.json();
-    if(d && d.api_key){
-      document.getElementById('out-key').textContent=d.api_key;
-      document.getElementById('out-code').textContent=d.ref_code||d.referral_code||'(check your email)';
-      got.classList.add('show');
-      btn.textContent='You\u2019re in \u2713';
-      got.scrollIntoView({behavior:'smooth',block:'center'});
-    } else {
-      err.textContent=(d&&d.error)?d.error:'Something went wrong. Email justrightdecorators@gmail.com and we will set you up by hand.';
-      err.classList.add('show'); btn.disabled=false; btn.textContent='Get my reseller code \u2192';
-    }
-  }catch(e){
-    err.textContent='Could not reach the server. Email justrightdecorators@gmail.com and we will set you up by hand.';
-    err.classList.add('show'); btn.disabled=false; btn.textContent='Get my reseller code \u2192';
-  }
-}
-
-draw();
-</script>
-</body>
-</html>
+- `tests/attack_continuity_1.py`
+- `tests/attack_continuity_2.py`
+- `tests/attack_continuity_3.py`
+- `tests/attack_continuity_4.py`
+- `tests/attack_continuity_5.py`
+- `tests/attack_continuity_6.py`
+- `tests/attack_witnessed.py`
+- `verify_authority.py`
+- `AILeash-API-Reference-v6.4.2.md`
+- `LICENCE`
+- `README.md`
+
+
+## `tests/attack_continuity_1.py`
+
+440 lines, 22747 bytes
+
+```python
+#!/usr/bin/env python3
+"""Attack harness for modules/lineage.py.
+
+Every test is written from the position of an agent that HAS some authority
+and is trying to end up with more. Passing means the attack was refused for
+the right reason, not merely refused.
+"""
+
+import hashlib
+import json
+import sqlite3
+import threading
+import time
+import sys
+
+import continuity as lineage
+# --- stand-in for the deployed engine ---------------------------------
+import types as _types
+_ENGINE = {"verdict": "ALLOW"}
+
+def install_engine(verdict="ALLOW", raises=False, shape="dict"):
+    _ENGINE["verdict"] = verdict
+    mod = _types.ModuleType("server")
+    mod.get_bearer = lambda *a, **k: None
+    def score_event(event):
+        if raises:
+            raise RuntimeError("engine down")
+        if shape == "dict":
+            return {"decision": _ENGINE["verdict"], "score": 0.1}
+        if shape == "tuple":
+            return (_ENGINE["verdict"], 0.1)
+        return _ENGINE["verdict"]
+    mod.score_event = score_event
+    sys.modules["server"] = mod
+
+def remove_engine():
+    sys.modules.pop("server", None)
+
+install_engine("ALLOW")
+
+
+PASS, FAIL = [], []
+
+
+def make_ctx():
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    lock = threading.RLock()
+    chain = {"n": 0, "prev": "0" * 64}
+
+    def seal(ev, res, ts, api_key):
+        chain["n"] += 1
+        payload = json.dumps([ev, res, ts, api_key, chain["prev"]], sort_keys=True)
+        h = hashlib.sha256(payload.encode()).hexdigest()
+        chain["prev"] = h
+        return h, chain["n"], chain["n"]
+
+    lineage._ready = False
+    ctx = {"conn": conn, "lock": lock, "seal": seal}
+    lineage._setup(ctx)
+    return ctx
+
+
+def check(name, condition, detail=""):
+    (PASS if condition else FAIL).append(name)
+    print(("  ok   " if condition else "  FAIL ") + name + (("  -> " + detail) if detail and not condition else ""))
+
+
+def issue(ctx, **kw):
+    if kw.get("parent") and int(kw.get("delegations_left", 0)) > 0 \
+            and not kw.get("risk_accepted_by"):
+        kw["risk_accepted_by"] = "owner@example.com"
+    return lineage._issue(ctx, "k", kw)
+
+
+def exercise(ctx, **kw):
+    return lineage._evaluate(ctx, "k", kw)
+
+
+NOW = time.time()
+HOUR = 3600
+
+
+def base_root(ctx, **over):
+    args = dict(
+        id="root", issuer="justin@monop", issuer_kind="human",
+        subject="orchestrator", subject_kind="agent",
+        scope=["payments.refund", "payments.read", "tickets.*"],
+        constraints={"max_amount": 5000, "allowed_currency": ["GBP", "EUR"],
+                     "denied_country": ["KP"], "may_contact_customer": True},
+        purpose="resolve customer refund complaints",
+        purpose_tags=["refunds", "support"],
+        not_before=NOW - HOUR, not_after=NOW + 10 * HOUR,
+        delegations_left=3)
+    args.update(over)
+    return issue(ctx, **args)
+
+
+print("\n=== 1. the happy path must actually work ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent",
+      subject="refund-agent", scope=["payments.refund"],
+      constraints={"max_amount": 500, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="issue refunds under 500", purpose_tags=["refunds"],
+      not_before=NOW - HOUR, not_after=NOW + 2 * HOUR, delegations_left=1)
+r, code = exercise(ctx, grant="mid", action="payments.refund",
+                   params={"amount": 100, "currency": "GBP", "country": "GB",
+                           "contact_customer": True},
+                   purpose_tag="refunds")
+check("a derivable action returns ALLOW", r["verdict"] == "ALLOW", str(r["reasons"]))
+check("lineage names the human at the root", r["authorised_by"] == "justin@monop")
+check("depth is reported", r["delegation_depth"] == 1)
+check("the decision is sealed", bool(r.get("sealed_in_chain")))
+
+print("\n=== 2. orphan root: an agent grants itself authority ===")
+ctx = make_ctx()
+r, code = issue(ctx, id="self", issuer="rogue-agent", issuer_kind="agent",
+                subject="rogue-agent", scope=["payments.refund"],
+                constraints={"max_amount": 999999}, purpose="whatever I decide",
+                purpose_tags=["anything"], not_after=NOW + HOUR)
+check("self-issued root is refused at issue", code == 409 and r.get("error") == "identity_continuity", str(r))
+
+print("\n=== 3. scope escalation in a child ===")
+ctx = make_ctx()
+base_root(ctx)
+r, code = issue(ctx, id="wide", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="rogue", scope=["payments.refund", "payments.transfer"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                             "denied_country": ["KP"], "may_contact_customer": False},
+                purpose="sneak in a transfer", purpose_tags=["refunds"],
+                not_after=NOW + HOUR, delegations_left=0)
+check("scope the parent never held is refused",
+      code == 409 and "payments.transfer" in r.get("message", ""), str(r))
+
+print("\n=== 4. constraint loosening ===")
+ctx = make_ctx()
+base_root(ctx)
+r, code = issue(ctx, id="rich", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="rogue", scope=["payments.refund"],
+                constraints={"max_amount": 50000, "allowed_currency": ["GBP"],
+                             "denied_country": ["KP"], "may_contact_customer": True},
+                purpose="bigger refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+check("raising a max_ cap is refused", code == 409 and "max_amount" in r.get("message", ""), str(r))
+
+r, code = issue(ctx, id="wide2", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="rogue", scope=["payments.refund"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP", "USD"],
+                             "denied_country": ["KP"], "may_contact_customer": True},
+                purpose="new currency", purpose_tags=["refunds"], not_after=NOW + HOUR)
+check("adding to an allowed_ set is refused", code == 409 and "USD" in r.get("message", ""), str(r))
+
+r, code = issue(ctx, id="undeny", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="rogue", scope=["payments.refund"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                             "denied_country": [], "may_contact_customer": True},
+                purpose="drop the denylist", purpose_tags=["refunds"], not_after=NOW + HOUR)
+check("dropping from a denied_ set is refused", code == 409 and "KP" in r.get("message", ""), str(r))
+
+r, code = issue(ctx, id="newkey", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="rogue", scope=["payments.refund"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                             "denied_country": ["KP"], "may_contact_customer": True,
+                             "may_export_data": True},
+                purpose="invent a permission", purpose_tags=["refunds"], not_after=NOW + HOUR)
+check("introducing a constraint key the parent never expressed is refused",
+      code == 409 and "may_export_data" in r.get("message", ""), str(r))
+
+print("\n=== 5. temporal attacks ===")
+ctx = make_ctx()
+base_root(ctx)
+r, code = issue(ctx, id="long", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="rogue", scope=["payments.refund"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                             "denied_country": ["KP"], "may_contact_customer": True},
+                purpose="outlive the parent", purpose_tags=["refunds"],
+                not_before=NOW, not_after=NOW + 100 * HOUR)
+check("a child cannot outlive its parent", code == 409 and r.get("error") == "temporal_validity", str(r))
+
+# expired ancestor, live leaf, forced in past the issue check
+ctx = make_ctx()
+base_root(ctx, not_after=NOW + HOUR)
+issue(ctx, id="child", parent="root", issuer="orchestrator", issuer_kind="agent",
+      subject="agent-b", scope=["payments.refund"],
+      constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+with ctx["lock"]:
+    ctx["conn"].execute("UPDATE auth_grant SET not_after=? WHERE id='root'", (NOW - 60,))
+    ctx["conn"].commit()
+r, _ = exercise(ctx, grant="child", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "GB",
+                        "contact_customer": True}, purpose_tag="refunds")
+check("an expired ancestor kills a live leaf", r["verdict"] == "BLOCK", str(r["reasons"]))
+check("...and it is reported as tampering, since the row no longer matches its digest",
+      r["broken_invariant"] == "evidence_continuity", r["broken_invariant"] or "")
+
+print("\n=== 6. revocation is transitive ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent",
+      subject="b", scope=["payments.refund"],
+      constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR, delegations_left=1)
+issue(ctx, id="leaf", parent="mid", issuer="b", issuer_kind="agent",
+      subject="c", scope=["payments.refund"],
+      constraints={"max_amount": 50, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+lineage._revoke(ctx, "k", {"grant": "mid", "reason": "agent compromised"})
+r, _ = exercise(ctx, grant="leaf", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "GB",
+                        "contact_customer": True}, purpose_tag="refunds")
+check("revoking the middle blocks the leaf without touching it", r["verdict"] == "BLOCK")
+check("the revoked grant is named", r["broken_at"] == "mid", str(r["broken_at"]))
+r2, _ = exercise(ctx, grant="root", action="payments.refund",
+                 params={"amount": 10, "currency": "GBP", "country": "GB",
+                         "contact_customer": True}, purpose_tag="refunds")
+check("revoking a child does not harm the parent", r2["verdict"] == "ALLOW", str(r2["reasons"]))
+
+print("\n=== 7. delegation depth cannot be manufactured ===")
+ctx = make_ctx()
+base_root(ctx, delegations_left=1)
+issue(ctx, id="d1", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.refund"],
+      constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR, delegations_left=0)
+r, code = issue(ctx, id="d2", parent="d1", issuer="b", issuer_kind="agent", subject="c",
+                scope=["payments.refund"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                             "denied_country": ["KP"], "may_contact_customer": True},
+                purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+check("an exhausted delegation budget stops the chain",
+      code == 409 and r.get("error") == "delegation_not_permitted", str(r))
+
+ctx = make_ctx()
+base_root(ctx, delegations_left=2)
+r, code = issue(ctx, id="greedy", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="b", scope=["payments.refund"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                             "denied_country": ["KP"], "may_contact_customer": True},
+                purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR,
+                delegations_left=5)
+check("a child cannot award itself more onward delegations than remained",
+      code == 409, str(r))
+
+print("\n=== 8. tampering with a stored grant ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.refund"],
+      constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+with ctx["lock"]:
+    ctx["conn"].execute(
+        "UPDATE auth_grant SET constraints=? WHERE id='mid'",
+        (json.dumps({"max_amount": 999999, "allowed_currency": ["GBP", "USD"],
+                     "denied_country": [], "may_contact_customer": True},
+                    sort_keys=True, separators=(",", ":")),))
+    ctx["conn"].commit()
+r, _ = exercise(ctx, grant="mid", action="payments.refund",
+                params={"amount": 900000, "currency": "USD", "country": "GB",
+                        "contact_customer": True}, purpose_tag="refunds")
+check("editing the database does not widen authority", r["verdict"] == "BLOCK")
+check("the tamper is reported as an evidence failure",
+      r["broken_invariant"] == "evidence_continuity", str(r["broken_invariant"]))
+
+print("\n=== 9. re-parenting onto a wider ancestor ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="narrow", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.read"],
+      constraints={"max_amount": 1, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": False},
+      purpose="read only", purpose_tags=["support"], not_after=NOW + HOUR)
+with ctx["lock"]:
+    ctx["conn"].execute("UPDATE auth_grant SET parent=NULL WHERE id='narrow'")
+    ctx["conn"].commit()
+r, _ = exercise(ctx, grant="narrow", action="payments.read",
+                params={}, purpose_tag="support")
+check("detaching a grant to make it a root fails integrity", r["verdict"] == "BLOCK",
+      str(r["reasons"]))
+
+print("\n=== 10. parent cycle ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="a", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.refund"],
+      constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR, delegations_left=1)
+issue(ctx, id="b", parent="a", issuer="b", issuer_kind="agent", subject="c",
+      scope=["payments.refund"],
+      constraints={"max_amount": 50, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+with ctx["lock"]:
+    ctx["conn"].execute("UPDATE auth_grant SET parent='b' WHERE id='a'")
+    ctx["conn"].commit()
+start = time.time()
+r, _ = exercise(ctx, grant="b", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "GB",
+                        "contact_customer": True}, purpose_tag="refunds")
+check("a parent cycle terminates rather than hangs", time.time() - start < 2)
+check("a cycle is BLOCKed as an authority failure", r["verdict"] == "BLOCK")
+
+print("\n=== 11. action parameters beyond the effective constraints ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.refund"],
+      constraints={"max_amount": 500, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+r, _ = exercise(ctx, grant="mid", action="payments.refund",
+                params={"amount": 501, "currency": "GBP", "country": "GB",
+                        "contact_customer": True}, purpose_tag="refunds")
+check("an amount over the cap is BLOCKed", r["verdict"] == "BLOCK", str(r["reasons"]))
+r, _ = exercise(ctx, grant="mid", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "KP",
+                        "contact_customer": True}, purpose_tag="refunds")
+check("a denied country is BLOCKed", r["verdict"] == "BLOCK", str(r["reasons"]))
+
+print("\n=== 12. uncertainty is challenged, not guessed ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.refund"],
+      constraints={"max_amount": 500, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="issue refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+r, _ = exercise(ctx, grant="mid", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "GB",
+                        "contact_customer": True}, purpose_tag="marketing")
+check("a purpose the grant does not carry is CHALLENGED", r["verdict"] == "CHALLENGE", str(r))
+r, _ = exercise(ctx, grant="mid", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "GB",
+                        "contact_customer": True})
+check("no declared purpose is CHALLENGED", r["verdict"] == "CHALLENGE", str(r))
+r, _ = exercise(ctx, grant="mid", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "GB",
+                        "contact_customer": True, "recipient_iban": "GB00XXXX"},
+                purpose_tag="refunds")
+check("an unconstrained parameter is CHALLENGED, not ignored",
+      r["verdict"] == "CHALLENGE" and any("recipient_iban" in x for x in r["reasons"]), str(r))
+
+print("\n=== 13. wildcard breadth ===")
+ctx = make_ctx()
+base_root(ctx)
+r, _ = exercise(ctx, grant="root", action="tickets.close.bulk.all",
+                params={}, purpose_tag="support")
+check("a broad wildcard match is CHALLENGED rather than silently allowed",
+      r["verdict"] == "CHALLENGE", str(r))
+
+ctx = make_ctx()
+base_root(ctx, scope=["*"], id="star")
+r, _ = exercise(ctx, grant="star", action="payments.transfer", params={}, purpose_tag="refunds")
+check("a bare * never reaches ALLOW", r["verdict"] == "CHALLENGE", str(r))
+
+print("\n=== 14. no union of grants ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="money", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.refund"],
+      constraints={"max_amount": 500, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": False},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+issue(ctx, id="contact", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.read"],
+      constraints={"max_amount": 0, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="contact", purpose_tags=["support"], not_after=NOW + HOUR)
+r, code = exercise(ctx, grant="money,contact", action="payments.refund",
+                   params={"amount": 10, "currency": "GBP", "contact_customer": True},
+                   purpose_tag="refunds")
+check("two grant ids cannot be combined into one exercise", r["verdict"] == "BLOCK", str(r))
+r, _ = exercise(ctx, grant="money", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "contact_customer": True},
+                purpose_tag="refunds")
+check("the capability from the sibling grant does not leak in", r["verdict"] == "BLOCK",
+      str(r["reasons"]))
+
+print("\n=== 15. time of check vs time of use ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.refund"],
+      constraints={"max_amount": 500, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+r, _ = exercise(ctx, grant="mid", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "GB",
+                        "contact_customer": True}, purpose_tag="refunds")
+eval_id = r["evaluation"]
+c, code = lineage._confirm(ctx, "k", {"evaluation": eval_id, "action": "payments.refund",
+                                      "params": {"amount": 10, "currency": "GBP",
+                                                 "country": "GB", "contact_customer": True}})
+check("executing exactly what was evaluated binds", c["bound"] is True, str(c))
+c, code = lineage._confirm(ctx, "k", {"evaluation": eval_id, "action": "payments.refund",
+                                      "params": {"amount": 400, "currency": "GBP",
+                                                 "country": "GB", "contact_customer": True}})
+check("executing different values than were evaluated is rejected", c["bound"] is False, str(c))
+check("the rejected execution is still sealed", bool(c.get("sealed_in_chain")))
+
+with ctx["lock"]:
+    ctx["conn"].execute("UPDATE auth_eval SET valid_until=? WHERE id=?", (NOW - 1, eval_id))
+    ctx["conn"].commit()
+c, _ = lineage._confirm(ctx, "k", {"evaluation": eval_id})
+check("a banked evaluation cannot be spent after its window", c["bound"] is False, str(c))
+
+print("\n=== 16. a BLOCK is evidence, not silence ===")
+ctx = make_ctx()
+base_root(ctx)
+r, _ = exercise(ctx, grant="nonexistent", action="payments.refund", params={})
+check("an unknown grant BLOCKs", r["verdict"] == "BLOCK")
+check("the block is sealed in the chain", bool(r.get("sealed_in_chain")))
+d, code = lineage._decision(ctx, {"evaluation": r["evaluation"]})
+check("the sealed decision is publicly retrievable", code == 200 and d["verdict"] == "BLOCK")
+
+print("\n=== 17. no authority without a stated purpose or an end date ===")
+ctx = make_ctx()
+r, code = issue(ctx, id="forever", issuer="justin@monop", issuer_kind="human", subject="a",
+                scope=["payments.refund"], constraints={"max_amount": 1},
+                purpose="anything", purpose_tags=["x"])
+check("a grant with no expiry is refused", code == 400 and r.get("error") == "not_after_required")
+r, code = issue(ctx, id="vague", issuer="justin@monop", issuer_kind="human", subject="a",
+                scope=["payments.refund"], constraints={"max_amount": 1},
+                purpose="", purpose_tags=["x"], not_after=NOW + HOUR)
+check("a grant with no purpose is refused", code == 400 and r.get("error") == "purpose_required")
+
+print("\n" + "=" * 60)
+print("passed %d, failed %d" % (len(PASS), len(FAIL)))
+if FAIL:
+    for f in FAIL:
+        print("  FAILED: " + f)
+    sys.exit(1)
 
 ```
 
 
-## `console.html`
+## `tests/attack_continuity_2.py`
 
-391 lines, 17987 bytes
+228 lines, 10573 bytes
 
-```html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
-<meta name="robots" content="noindex,nofollow">
-<title>Console — sebbi.pro</title>
-<style>
-  :root{
-    --ink:#0a0f1e; --ink2:#10182e; --gold:#c9a84c;
-    --ok:#7fe3b0; --err:#ff8a80;
-    --line:rgba(201,168,76,0.22);
-    --mute:rgba(255,255,255,0.45);
-  }
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{background:var(--ink);color:#fff;font-family:system-ui,-apple-system,sans-serif;
-       min-height:100vh;padding:18px 16px 60px;-webkit-text-size-adjust:100%}
-  .wrap{max-width:640px;margin:0 auto}
+```python
+#!/usr/bin/env python3
+"""Second wave. The first wave tested the obvious escalations. This one
+tests the ones that would survive a code review."""
 
-  .brand{font-family:ui-monospace,monospace;font-size:10px;letter-spacing:2.5px;
-         text-transform:uppercase;color:rgba(255,255,255,0.32)}
-  h1{font-family:Georgia,serif;font-size:25px;color:var(--gold);margin:12px 0 4px}
-  .sub{font-size:13px;color:var(--mute);line-height:1.65;margin-bottom:20px}
+import hashlib
+import json
+import sqlite3
+import threading
+import time
+import sys
 
-  .keybar{background:var(--ink2);border:1px solid var(--line);border-radius:10px;
-          padding:14px;margin-bottom:18px}
-  .keybar label{display:block;font-size:11px;letter-spacing:1.2px;text-transform:uppercase;
-                color:var(--mute);margin-bottom:7px}
-  .keystate{margin-top:9px;font-family:ui-monospace,monospace;font-size:11px;color:var(--mute)}
-  .keystate b{color:var(--gold);font-weight:600}
+import continuity as lineage
+# --- stand-in for the deployed engine ---------------------------------
+import types as _types
+_ENGINE = {"verdict": "ALLOW"}
 
-  input,select,textarea{width:100%;background:#0c1424;border:1px solid var(--line);
-    color:#fff;border-radius:7px;padding:11px 12px;font-size:15px;font-family:inherit;outline:none}
-  input:focus,select,textarea:focus{border-color:var(--gold)}
-  textarea{font-family:ui-monospace,monospace;font-size:13px;line-height:1.55;min-height:74px;resize:vertical}
-  select{appearance:none;background-image:linear-gradient(45deg,transparent 50%,var(--gold) 50%),
-         linear-gradient(135deg,var(--gold) 50%,transparent 50%);
-         background-position:calc(100% - 18px) 20px,calc(100% - 13px) 20px;
-         background-size:5px 5px,5px 5px;background-repeat:no-repeat}
+def install_engine(verdict="ALLOW", raises=False, shape="dict"):
+    _ENGINE["verdict"] = verdict
+    mod = _types.ModuleType("server")
+    mod.get_bearer = lambda *a, **k: None
+    def score_event(event):
+        if raises:
+            raise RuntimeError("engine down")
+        if shape == "dict":
+            return {"decision": _ENGINE["verdict"], "score": 0.1}
+        if shape == "tuple":
+            return (_ENGINE["verdict"], 0.1)
+        return _ENGINE["verdict"]
+    mod.score_event = score_event
+    sys.modules["server"] = mod
 
-  section{border:1px solid var(--line);border-radius:10px;margin-bottom:14px;overflow:hidden}
-  section > h2{font-family:Georgia,serif;font-size:16px;color:var(--gold);
-    padding:14px 15px;background:var(--ink2);cursor:pointer;display:flex;
-    justify-content:space-between;align-items:center;font-weight:400}
-  section > h2 .chev{font-size:12px;color:var(--mute)}
-  .body{padding:15px;display:none;border-top:1px solid var(--line)}
-  section.open .body{display:block}
-  section.open > h2 .chev{transform:rotate(180deg)}
+def remove_engine():
+    sys.modules.pop("server", None)
 
-  .op{padding:13px 0;border-bottom:1px solid rgba(255,255,255,0.06)}
-  .op:last-child{border-bottom:none;padding-bottom:0}
-  .op:first-child{padding-top:0}
-  .op .name{font-family:ui-monospace,monospace;font-size:12.5px;color:#fff;margin-bottom:3px}
-  .op .name span{color:var(--mute)}
-  .op .why{font-size:12px;color:var(--mute);line-height:1.6;margin-bottom:9px}
-  .row{display:flex;gap:8px;margin-bottom:8px}
-  .row > *{flex:1;min-width:0}
+install_engine("ALLOW")
 
-  button{background:var(--gold);color:var(--ink);border:none;border-radius:7px;
-    padding:12px 14px;font-size:14px;font-weight:800;cursor:pointer;width:100%;
-    font-family:inherit;letter-spacing:0.2px}
-  button:active{opacity:0.8}
-  button:disabled{opacity:0.45}
-  button.quiet{background:transparent;color:var(--gold);border:1px solid var(--line);font-weight:600}
-  button.danger{background:transparent;color:var(--err);border:1px solid rgba(255,138,128,0.4);font-weight:600}
 
-  #out{position:sticky;bottom:0;margin-top:18px;background:#070c18;
-       border:1px solid var(--line);border-radius:10px;overflow:hidden}
-  #out .head{display:flex;justify-content:space-between;align-items:center;
-    padding:10px 13px;background:var(--ink2);font-family:ui-monospace,monospace;font-size:11px}
-  #out .code{font-weight:700;letter-spacing:1px}
-  #out .code.g{color:var(--ok)} #out .code.r{color:var(--err)} #out .code.n{color:var(--mute)}
-  #out .route{color:var(--mute);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
-    max-width:62%;text-align:right}
-  #out pre{padding:13px;font-family:ui-monospace,monospace;font-size:11.5px;line-height:1.65;
-    color:rgba(255,255,255,0.85);white-space:pre-wrap;word-break:break-word;
-    max-height:44vh;overflow:auto}
-  .foot{margin-top:22px;font-size:11.5px;color:rgba(255,255,255,0.3);line-height:1.8}
-  .foot b{color:var(--gold);font-weight:600}
-</style>
-</head>
-<body>
-<div class="wrap">
+PASS, FAIL = [], []
+NOW = time.time()
+HOUR = 3600
 
-  <div class="brand">sebbi.pro &middot; operator console</div>
-  <h1>Console</h1>
-  <div class="sub">Keyed routes, run from a phone. The key stays in this tab and is never written to storage — closing the tab forgets it.</div>
 
-  <div class="keybar">
-    <label for="key">API key</label>
-    <input id="key" type="password" autocomplete="off" autocapitalize="off"
-           spellcheck="false" placeholder="Paste your key" oninput="keyState()">
-    <div class="keystate" id="keystate">No key set. Every route below will answer <b>401</b>.</div>
-  </div>
+def make_ctx():
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    lock = threading.RLock()
+    n = {"i": 0}
 
-  <!-- ================= WALLET ================= -->
-  <section id="s-wallet" class="open">
-    <h2 onclick="toggle('s-wallet')">Wallet <span class="chev">&#9660;</span></h2>
-    <div class="body">
+    def seal(ev, res, ts, api_key):
+        n["i"] += 1
+        return hashlib.sha256(json.dumps([ev, res, ts], sort_keys=True,
+                                         default=str).encode()).hexdigest(), n["i"], n["i"]
+    lineage._ready = False
+    ctx = {"conn": conn, "lock": lock, "seal": seal}
+    lineage._setup(ctx)
+    return ctx
 
-      <div class="op">
-        <div class="name">GET status <span>· quote · devices · review</span></div>
-        <div class="why">Balance, free window, live devices and any open halt.</div>
-        <div class="row">
-          <button class="quiet" onclick="go('GET','wallet','status')">Status</button>
-          <button class="quiet" onclick="go('GET','wallet','quote')">Prices</button>
-        </div>
-        <div class="row">
-          <button class="quiet" onclick="go('GET','wallet','devices')">Devices</button>
-          <button class="quiet" onclick="go('GET','wallet','review')">Open halts</button>
-        </div>
-      </div>
 
-      <div class="op">
-        <div class="name">POST charge <span>· the gate</span></div>
-        <div class="why">Simulate spends nothing and seals nothing. Charge does both. Send the same receipt twice and the key halts on purpose.</div>
-        <input id="w-device" placeholder="device_id, e.g. test-device-01" value="test-device-01">
-        <div style="height:8px"></div>
-        <input id="w-receipt" placeholder="receipt — 64 hex" autocapitalize="off" spellcheck="false">
-        <div style="height:8px"></div>
-        <div class="row">
-          <button class="quiet" onclick="newReceipt()">New receipt</button>
-          <button class="quiet" onclick="chargeCall('simulate')">Simulate</button>
-        </div>
-        <button onclick="chargeCall('charge')">Charge</button>
-      </div>
+def check(name, cond, detail=""):
+    (PASS if cond else FAIL).append(name)
+    print(("  ok   " if cond else "  FAIL ") + name + (("  -> " + str(detail)[:300]) if detail and not cond else ""))
 
-      <div class="op">
-        <div class="name">POST subscribe</div>
-        <div class="why">Puts one device on the 30-day plan and takes it off the balance. Renewing early extends the existing expiry.</div>
-        <input id="w-subdev" placeholder="device_id" value="test-device-01">
-        <div style="height:8px"></div>
-        <button onclick="go('POST','wallet','subscribe',{device_id:val('w-subdev')})">Subscribe device</button>
-      </div>
 
-      <div class="op">
-        <div class="name">POST topup <span>· after a payment clears</span></div>
-        <div class="why">1000 millipence = 1 penny, so 50p is 50000. The note is required — put the Stripe payment reference in it so the ledger reconciles.</div>
-        <div class="row">
-          <input id="w-amount" inputmode="numeric" placeholder="millipence" value="50000">
-          <input id="w-note" placeholder="Stripe ref / who authorised">
-        </div>
-        <button onclick="go('POST','wallet','topup',{millipence:num('w-amount'),note:val('w-note')})">Credit balance</button>
-      </div>
+def issue(ctx, **kw):
+    if kw.get("parent") and int(kw.get("delegations_left", 0)) > 0 \
+            and not kw.get("risk_accepted_by"):
+        kw["risk_accepted_by"] = "owner@example.com"
+    return lineage._issue(ctx, "k", kw)
 
-      <div class="op">
-        <div class="name">GET ledger</div>
-        <div class="why">Every charge, topup and subscription, newest first.</div>
-        <div class="row">
-          <input id="w-limit" inputmode="numeric" placeholder="limit" value="25">
-          <button class="quiet" onclick="go('GET','wallet','ledger',{limit:num('w-limit')})">Show ledger</button>
-        </div>
-      </div>
 
-      <div class="op">
-        <div class="name">POST clear <span>· human decision</span></div>
-        <div class="why">Releases a halted key. Your name and the reason are sealed into the chain with it.</div>
-        <div class="row">
-          <input id="w-halt" inputmode="numeric" placeholder="halt_id">
-          <input id="w-by" placeholder="cleared_by">
-        </div>
-        <input id="w-cnote" placeholder="Why this halt is safe to clear">
-        <div style="height:8px"></div>
-        <button class="danger" onclick="go('POST','wallet','clear',{halt_id:num('w-halt'),cleared_by:val('w-by'),note:val('w-cnote')})">Clear halt</button>
-      </div>
+def root(ctx, **over):
+    args = dict(id="root", issuer="owner@example.com", issuer_kind="human",
+                subject="orchestrator", scope=["payments.refund", "payments.read"],
+                constraints={"max_amount": 5000, "allowed_currency": ["GBP", "EUR"]},
+                purpose="refunds", purpose_tags=["refunds"],
+                not_before=NOW - HOUR, not_after=NOW + 10 * HOUR, delegations_left=10)
+    args.update(over)
+    return issue(ctx, **args)
 
-    </div>
-  </section>
 
-  <!-- ================= ANCHORING ================= -->
-  <section id="s-ots">
-    <h2 onclick="toggle('s-ots')">Anchoring <span class="chev">&#9660;</span></h2>
-    <div class="body">
-      <div class="op">
-        <div class="name">GET ots/status</div>
-        <div class="why">Proof count on disk against stamps recorded. Warns if a volume was lost.</div>
-        <button class="quiet" onclick="go('GET','ots','status')">Anchor status</button>
-      </div>
-      <div class="op">
-        <div class="name">POST ots/upgrade</div>
-        <div class="why">Fetches each pending proof again from the calendars. Anything stamped more than a few hours ago should come back confirmed with a Bitcoin block height. Until this runs, pending is all you have.</div>
-        <button onclick="go('POST','ots','upgrade',{})">Upgrade proofs</button>
-      </div>
-    </div>
-  </section>
+print("\n=== 18. double execution against one ALLOW ===")
+ctx = make_ctx()
+root(ctx)
+r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments.refund",
+                                    "params": {"amount": 100, "currency": "GBP"},
+                                    "purpose_tag": "refunds"})
+eid = r["evaluation"]
+p = {"amount": 100, "currency": "GBP"}
+c1, _ = lineage._confirm(ctx, "k", {"evaluation": eid, "action": "payments.refund", "params": p})
+c2, _ = lineage._confirm(ctx, "k", {"evaluation": eid, "action": "payments.refund", "params": p})
+check("the first execution binds", c1["bound"] is True, c1)
+check("the same evaluation cannot be spent twice", c2["bound"] is False, c2)
 
-  <!-- ================= NETWORK ================= -->
-  <section id="s-net">
-    <h2 onclick="toggle('s-net')">Network <span class="chev">&#9660;</span></h2>
-    <div class="body">
-      <div class="op">
-        <div class="name">Witness exchange</div>
-        <div class="why">Peers, last sync result, and the published roster.</div>
-        <div class="row">
-          <button class="quiet" onclick="go('GET','mutual','peers')">Peers</button>
-          <button class="quiet" onclick="go('GET','mutual','status')">Sync status</button>
-        </div>
-        <button class="quiet" onclick="go('GET','roster','list')">Roster</button>
-      </div>
-      <div class="op">
-        <div class="name">POST mutual/sync</div>
-        <div class="why">Runs a cycle now instead of waiting for the hourly timer.</div>
-        <button onclick="go('POST','mutual','sync',{})">Sync now</button>
-      </div>
-    </div>
-  </section>
+print("\n=== 19. type confusion in constraints ===")
+ctx = make_ctx()
+root(ctx, constraints={"max_amount": 5000, "allowed_currency": "GBP"})
+r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments.refund",
+                                    "params": {"amount": 10, "currency": "G"},
+                                    "purpose_tag": "refunds"})
+check("a single character does not satisfy a string-valued allowed_ list",
+      r["verdict"] == "BLOCK", r["reasons"])
 
-  <!-- ================= EVIDENCE ================= -->
-  <section id="s-ev">
-    <h2 onclick="toggle('s-ev')">Evidence <span class="chev">&#9660;</span></h2>
-    <div class="body">
-      <div class="op">
-        <div class="name">POST codebase/seal</div>
-        <div class="why">Hashes the deployed source tree into one manifest root and seals it with an authorship declaration. Dated evidence of what you held and when — not proof of ownership.</div>
-        <div class="row">
-          <input id="c-author" placeholder="author">
-          <input id="c-entity" placeholder="entity">
-        </div>
-        <input id="c-stmt" placeholder="statement">
-        <div style="height:8px"></div>
-        <button onclick="go('POST','codebase','seal',{author:val('c-author'),entity:val('c-entity'),statement:val('c-stmt')})">Seal codebase</button>
-      </div>
-      <div class="op">
-        <div class="name">POST publish/seal</div>
-        <div class="why">Fetches a URL, hashes the exact bytes served, and seals it. Re-sealing builds a revision history.</div>
-        <input id="p-url" placeholder="https://sebbi.pro/..." autocapitalize="off" spellcheck="false">
-        <div style="height:8px"></div>
-        <button onclick="go('POST','publish','seal',{url:val('p-url')})">Seal page</button>
-      </div>
-      <div class="op">
-        <div class="name">Evidence pack</div>
-        <div class="why">Preview re-verifies a period without issuing. Issue seals the pack's own digest so the document cannot be edited afterwards.</div>
-        <input id="k-period" placeholder="period — 2026-Q3, 2026-08, 2026-08-23" value="2026-08">
-        <div style="height:8px"></div>
-        <div class="row">
-          <button class="quiet" onclick="go('POST','pack','preview',{period:val('k-period')})">Preview</button>
-          <button onclick="go('POST','pack','issue',{period:val('k-period')})">Issue</button>
-        </div>
-      </div>
-    </div>
-  </section>
+ctx = make_ctx()
+root(ctx)
+r, code = issue(ctx, id="strnum", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="b", scope=["payments.refund"],
+                constraints={"max_amount": "50000", "allowed_currency": ["GBP"]},
+                purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+check("a numeric cap passed as a string cannot beat the parent", code == 409, r)
 
-  <!-- ================= ANY ROUTE ================= -->
-  <section id="s-raw">
-    <h2 onclick="toggle('s-raw')">Any route <span class="chev">&#9660;</span></h2>
-    <div class="body">
-      <div class="op">
-        <div class="why">Every module is reachable here without waiting for a form to be built for it. GET sends the JSON as query parameters; POST sends it as the body.</div>
-        <div class="row">
-          <select id="r-method"><option>GET</option><option>POST</option></select>
-          <input id="r-module" placeholder="module" autocapitalize="off" spellcheck="false">
-          <input id="r-action" placeholder="action" autocapitalize="off" spellcheck="false">
-        </div>
-        <textarea id="r-body" placeholder='{}' spellcheck="false">{}</textarea>
-        <div style="height:8px"></div>
-        <button onclick="raw()">Send</button>
-      </div>
-    </div>
-  </section>
+ctx = make_ctx()
+root(ctx)
+r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments.refund",
+                                    "params": {"amount": "99999", "currency": "GBP"},
+                                    "purpose_tag": "refunds"})
+check("a string amount is still compared numerically", r["verdict"] == "BLOCK", r["reasons"])
 
-  <div id="out">
-    <div class="head">
-      <span class="code n" id="out-code">READY</span>
-      <span class="route" id="out-route">Nothing sent yet</span>
-    </div>
-    <pre id="out-body">Set a key, then run a route. Start with Wallet → Status.</pre>
-  </div>
+ctx = make_ctx()
+root(ctx)
+r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments.refund",
+                                    "params": {"amount": True, "currency": "GBP"},
+                                    "purpose_tag": "refunds"})
+check("a non-numeric amount does not slip through as unconstrained",
+      r["verdict"] in ("BLOCK", "CHALLENGE"), r)
 
-  <div class="foot">
-    <b>Notes.</b> The key is held in a variable in this tab only — not in localStorage, not in the URL, not in a cookie.<br>
-    A 401 means no key or the wrong key. A 404 usually means the router has not been armed since the last deploy — send anything once and try again. A 423 means the wallet has halted the key and a person needs to clear it.
-  </div>
+print("\n=== 20. capability prefix tricks ===")
+ctx = make_ctx()
+root(ctx, scope=["payments.refund"])
+for probe in ["payments.refunds", "payments.refund.approve", "payments.refundX",
+              "Payments.Refund", "payments.refund "]:
+    r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": probe,
+                                        "params": {}, "purpose_tag": "refunds"})
+    check("'%s' is not covered by 'payments.refund'" % probe, r["verdict"] == "BLOCK", r["reasons"])
 
-</div>
+ctx = make_ctx()
+root(ctx, scope=["payments.*"])
+r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments2.transfer",
+                                    "params": {}, "purpose_tag": "refunds"})
+check("'payments.*' does not cover 'payments2.transfer'", r["verdict"] == "BLOCK", r["reasons"])
 
-<script>
-var apiKey = "";
+print("\n=== 21. a long but legitimate chain ===")
+ctx = make_ctx()
+root(ctx, constraints={"max_amount": 10000, "allowed_currency": ["GBP", "EUR"]},
+     delegations_left=12)
+parent, cap = "root", 10000
+for i in range(10):
+    cap = cap // 2
+    gid = "d%d" % i
+    r, code = issue(ctx, id=gid, parent=parent, issuer="a%d" % i, issuer_kind="agent",
+                    subject="a%d" % (i + 1), scope=["payments.refund"],
+                    constraints={"max_amount": cap, "allowed_currency": ["GBP"]},
+                    purpose="refunds", purpose_tags=["refunds"],
+                    not_after=NOW + HOUR, delegations_left=11 - i)
+    if code != 200:
+        break
+    parent = gid
+check("ten legitimate narrowing hops are accepted", code == 200 and parent == "d9", r)
+r, _ = lineage._evaluate(ctx, "k", {"grant": "d9", "action": "payments.refund",
+                                    "params": {"amount": 5, "currency": "GBP"},
+                                    "purpose_tag": "refunds"})
+check("the deep chain still ALLOWs a derivable action", r["verdict"] == "ALLOW", r["reasons"])
+check("the effective cap is the tightest in the chain",
+      float(r["effective_constraints"]["max_amount"]) == 9, r["effective_constraints"])
+check("the human at the root is still named ten hops down",
+      r["authorised_by"] == "owner@example.com")
+r, _ = lineage._evaluate(ctx, "k", {"grant": "d9", "action": "payments.refund",
+                                    "params": {"amount": 10, "currency": "GBP"},
+                                    "purpose_tag": "refunds"})
+check("one unit over the deepest cap is BLOCKed", r["verdict"] == "BLOCK", r["reasons"])
 
-function val(id){ return document.getElementById(id).value.trim(); }
-function num(id){ var n = parseInt(val(id), 10); return isNaN(n) ? null : n; }
+print("\n=== 22. revoking the root kills the whole tree ===")
+lineage._revoke(ctx, "k", {"grant": "root", "reason": "principal withdrew authority"})
+r, _ = lineage._evaluate(ctx, "k", {"grant": "d9", "action": "payments.refund",
+                                    "params": {"amount": 1, "currency": "GBP"},
+                                    "purpose_tag": "refunds"})
+check("revoking the root blocks a leaf ten hops away", r["verdict"] == "BLOCK")
+check("the root is named as the break point", r["broken_at"] == "root", r["broken_at"])
 
-function keyState(){
-  apiKey = document.getElementById("key").value.trim();
-  var el = document.getElementById("keystate");
-  if(!apiKey){
-    el.innerHTML = "No key set. Every route below will answer <b>401</b>.";
-  } else {
-    el.innerHTML = "Key set — <b>" + apiKey.length + "</b> characters, ending <b>"
-                 + apiKey.slice(-4) + "</b>. Held in this tab only.";
-  }
-}
+print("\n=== 23. issuing under a revoked or expired parent ===")
+ctx = make_ctx()
+root(ctx)
+lineage._revoke(ctx, "k", {"grant": "root", "reason": "x"})
+r, code = issue(ctx, id="after", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="b", scope=["payments.refund"],
+                constraints={"max_amount": 1, "allowed_currency": ["GBP"]},
+                purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+check("no new delegation under a revoked parent", code == 409 and r.get("error") == "parent_revoked", r)
 
-function toggle(id){ document.getElementById(id).classList.toggle("open"); }
+print("\n=== 24. duplicate grant id cannot overwrite a grant ===")
+ctx = make_ctx()
+root(ctx)
+r, code = root(ctx, scope=["*"], constraints={"max_amount": 999999})
+check("re-issuing an existing id is refused", code == 409 and r.get("error") == "grant_exists", r)
 
-function newReceipt(){
-  var b = new Uint8Array(32);
-  crypto.getRandomValues(b);
-  var hex = Array.from(b).map(function(x){return x.toString(16).padStart(2,"0");}).join("");
-  document.getElementById("w-receipt").value = hex;
-  show("n", "receipt generated",
-       "A fresh 64-hex value.\n\nCharge it once and it is accepted.\nCharge the same one again and the key halts — that is the replay rule working, not a fault.");
-}
+print("\n=== 25. the boundary values themselves ===")
+ctx = make_ctx()
+root(ctx, constraints={"max_amount": 100, "allowed_currency": ["GBP"]}, delegations_left=2)
+r, code = issue(ctx, id="equal", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="b", scope=["payments.refund"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP"]},
+                purpose="refunds", purpose_tags=["refunds"],
+                not_after=NOW + 10 * HOUR, delegations_left=1)
+check("an equal-not-wider child is accepted", code == 200, r)
+r, _ = lineage._evaluate(ctx, "k", {"grant": "equal", "action": "payments.refund",
+                                    "params": {"amount": 100, "currency": "GBP"},
+                                    "purpose_tag": "refunds"})
+check("exactly the cap is allowed", r["verdict"] == "ALLOW", r["reasons"])
+r, _ = lineage._evaluate(ctx, "k", {"grant": "equal", "action": "payments.refund",
+                                    "params": {"amount": 100.01, "currency": "GBP"},
+                                    "purpose_tag": "refunds"})
+check("a penny over the cap is blocked", r["verdict"] == "BLOCK", r["reasons"])
 
-function chargeCall(action){
-  var r = val("w-receipt");
-  if(!r){ newReceipt(); r = val("w-receipt"); }
-  go("POST", "wallet", action, { device_id: val("w-device"), receipt: r });
-}
+print("\n=== 26. a CHALLENGE cannot be executed ===")
+ctx = make_ctx()
+root(ctx)
+r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments.refund",
+                                    "params": {"amount": 1, "currency": "GBP"}})
+check("no declared purpose gives CHALLENGE", r["verdict"] == "CHALLENGE", r["verdict"])
+c, code = lineage._confirm(ctx, "k", {"evaluation": r["evaluation"],
+                                      "action": "payments.refund",
+                                      "params": {"amount": 1, "currency": "GBP"}})
+check("a CHALLENGE cannot be bound as an execution", c["bound"] is False, c)
 
-function show(cls, route, text){
-  document.getElementById("out-code").className = "code " + cls;
-  document.getElementById("out-code").textContent =
-    (cls === "n" ? "NOTE" : document.getElementById("out-code").textContent);
-  document.getElementById("out-route").textContent = route;
-  document.getElementById("out-body").textContent = text;
-}
-
-function raw(){
-  var body = {};
-  var txt = val("r-body");
-  if(txt){
-    try { body = JSON.parse(txt); }
-    catch(e){
-      document.getElementById("out-code").className = "code r";
-      document.getElementById("out-code").textContent = "BAD JSON";
-      document.getElementById("out-route").textContent = "not sent";
-      document.getElementById("out-body").textContent =
-        "The body is not valid JSON, so nothing was sent.\n\n" + e;
-      return;
-    }
-  }
-  go(val("r-method"), val("r-module"), val("r-action"), body);
-}
-
-async function go(method, module, action, body){
-  if(!module || !action) return;
-  keyState();
-
-  var path = "/x/" + module + "/" + action;
-  var opts = { method: method, headers: {} };
-
-  if(apiKey){
-    opts.headers["Authorization"] = "Bearer " + apiKey;
-    opts.headers["X-API-Key"] = apiKey;
-  }
-
-  if(method === "GET"){
-    var qs = [];
-    for(var k in (body || {})){
-      if(body[k] === null || body[k] === undefined || body[k] === "") continue;
-      qs.push(encodeURIComponent(k) + "=" + encodeURIComponent(body[k]));
-    }
-    if(qs.length) path += "?" + qs.join("&");
-  } else {
-    opts.headers["Content-Type"] = "application/json";
-    opts.body = JSON.stringify(body || {});
-  }
-
-  var codeEl = document.getElementById("out-code");
-  codeEl.className = "code n";
-  codeEl.textContent = "···";
-  document.getElementById("out-route").textContent = method + " " + path;
-  document.getElementById("out-body").textContent = "Sending…";
-
-  try {
-    var res = await fetch(path, opts);
-    var text = await res.text();
-    var pretty = text;
-    try { pretty = JSON.stringify(JSON.parse(text), null, 2); } catch(e){}
-
-    codeEl.className = "code " + (res.ok ? "g" : "r");
-    codeEl.textContent = res.status + (res.ok ? " OK" : "");
-    document.getElementById("out-body").textContent = pretty;
-
-    if(res.status === 404){
-      document.getElementById("out-body").textContent =
-        pretty + "\n\n— The router may not have been armed since the last deploy. Send this again.";
-    }
-  } catch(e){
-    codeEl.className = "code r";
-    codeEl.textContent = "NO REPLY";
-    document.getElementById("out-body").textContent =
-      "The request never reached the server.\n\n" + e;
-  }
-}
-
-keyState();
-</script>
-</body>
-</html>
+print("\n" + "=" * 60)
+print("passed %d, failed %d" % (len(PASS), len(FAIL)))
+for f in FAIL:
+    print("  FAILED: " + f)
+sys.exit(1 if FAIL else 0)
 
 ```
 
 
-## `contact.html`
+## `tests/attack_continuity_3.py`
 
-134 lines, 7574 bytes
+114 lines, 5626 bytes
 
-```html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Contact &mdash; Monop Content</title>
-<meta name="description" content="Get in touch with Monop Content about AILeash, Guardian, SonicBoom or Sentinel.">
-<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;900&family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-:root{--navy:#0a0f1e;--gold:#c9a84c;--green:#00875a;--red:#cc0000;--white:#fff;--off:#f5f7fa;--border:#e2e8f0;--muted:#64748b;--text:#1a202c;--mono:'JetBrains Mono',monospace;--sans:'DM Sans',sans-serif;--display:'Playfair Display',serif}
-html,body{background:var(--off);color:var(--text);font-family:var(--sans);min-height:100vh}
-nav{background:var(--navy);padding:0 48px;height:68px;display:flex;align-items:center;justify-content:space-between}
-.nav-logo{font-family:var(--display);font-size:22px;color:var(--white);font-weight:900;text-decoration:none}.nav-logo span{color:var(--gold)}
-.nav-back{color:rgba(255,255,255,0.5);text-decoration:none;font-size:13px;font-weight:500}
-.nav-back:hover{color:var(--white)}
-.page{max-width:600px;margin:0 auto;padding:60px 24px}
-.page-label{font-family:var(--mono);font-size:10px;letter-spacing:3px;text-transform:uppercase;color:var(--gold);margin-bottom:12px}
-h1{font-family:var(--display);font-size:clamp(32px,4vw,48px);font-weight:900;color:var(--navy);margin-bottom:12px;line-height:1.1}
-h1 em{color:var(--gold);font-style:normal}
-.page-sub{font-size:15px;color:var(--muted);line-height:1.75;margin-bottom:40px}
-.form-card{background:var(--white);border:1px solid var(--border);border-radius:8px;padding:36px}
-.fg{margin-bottom:16px}
-.fg label{display:block;font-family:var(--mono);font-size:9px;color:var(--muted);letter-spacing:2px;text-transform:uppercase;margin-bottom:6px}
-.fg input,.fg select,.fg textarea{width:100%;background:var(--off);border:2px solid var(--border);color:var(--text);padding:12px 14px;font-size:14px;font-family:var(--sans);outline:none;border-radius:4px;transition:border-color .2s}
-.fg input:focus,.fg select:focus,.fg textarea:focus{border-color:var(--navy)}
-.fg input::placeholder,.fg textarea::placeholder{color:#bbb}
-.fg textarea{resize:vertical;min-height:120px;line-height:1.6}
-.fg-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-.submit-btn{width:100%;padding:14px;font-size:15px;font-weight:700;border-radius:4px;border:none;cursor:pointer;font-family:var(--sans);background:var(--gold);color:var(--navy);margin-top:8px;transition:background .2s}
-.submit-btn:hover{background:#e8c96a}
-.submit-btn:disabled{opacity:0.5;cursor:not-allowed}
-.msg-ok{display:none;color:var(--green);font-family:var(--mono);font-size:11px;margin-top:12px;padding:12px;background:#f0fff8;border-radius:4px;border:1px solid #bbf7d0}
-.msg-ok.show{display:block}
-.msg-err{display:none;color:var(--red);font-family:var(--mono);font-size:11px;margin-top:12px;padding:12px;background:#fff0f0;border-radius:4px;border:1px solid #ffcccc}
-.msg-err.show{display:block}
-.direct{margin-top:32px;background:var(--navy);border-radius:8px;padding:28px}
-.direct-label{font-family:var(--mono);font-size:9px;color:rgba(255,255,255,0.3);letter-spacing:2px;text-transform:uppercase;margin-bottom:16px}
-.direct-item{display:flex;align-items:center;gap:12px;margin-bottom:12px}
-.direct-item:last-child{margin:0}
-.di-icon{font-size:18px;flex-shrink:0}
-.di-text{font-size:14px;color:rgba(255,255,255,0.6)}
-.di-text a{color:var(--gold);text-decoration:none}
-@media(max-width:600px){
-  nav{padding:0 20px}
-  .page{padding:40px 16px}
-  .form-card{padding:24px}
-  .fg-row{grid-template-columns:1fr}
-}
-</style>
-</head>
-<body>
+```python
+#!/usr/bin/env python3
+"""Third wave: concurrency, and reconstruction from evidence alone."""
+import hashlib, json, sqlite3, threading, time, sys
+import continuity as lineage
+# --- stand-in for the deployed engine ---------------------------------
+import types as _types
+_ENGINE = {"verdict": "ALLOW"}
 
-<nav>
-  <a href="/" class="nav-logo">Monop <span>Content</span></a>
-  <a href="/" class="nav-back">&larr; Back to Platform</a>
-</nav>
+def install_engine(verdict="ALLOW", raises=False, shape="dict"):
+    _ENGINE["verdict"] = verdict
+    mod = _types.ModuleType("server")
+    mod.get_bearer = lambda *a, **k: None
+    def score_event(event):
+        if raises:
+            raise RuntimeError("engine down")
+        if shape == "dict":
+            return {"decision": _ENGINE["verdict"], "score": 0.1}
+        if shape == "tuple":
+            return (_ENGINE["verdict"], 0.1)
+        return _ENGINE["verdict"]
+    mod.score_event = score_event
+    sys.modules["server"] = mod
 
-<div class="page">
-  <div class="page-label">Get In Touch</div>
-  <h1>Send us a <em>message.</em></h1>
-  <p class="page-sub">Questions about AILeash, Guardian, SonicBoom or Sentinel. Partnership enquiries. Press. Anything. We reply within 24 hours.</p>
+def remove_engine():
+    sys.modules.pop("server", None)
 
-  <div class="form-card">
-    <div class="fg-row">
-      <div class="fg"><label>First Name</label><input type="text" id="fn" placeholder="Jane"></div>
-      <div class="fg"><label>Last Name</label><input type="text" id="ln" placeholder="Smith"></div>
-    </div>
-    <div class="fg"><label>Email Address</label><input type="email" id="em" placeholder="you@company.com"></div>
-    <div class="fg"><label>Phone (optional)</label><input type="tel" id="ph" placeholder="+44 7700 000000"></div>
-    <div class="fg"><label>Organisation</label><input type="text" id="org" placeholder="Company or platform name"></div>
-    <div class="fg"><label>Message</label><textarea id="msg" placeholder="Tell us what you need..."></textarea></div>
-    <button class="submit-btn" id="submit-btn" onclick="doSubmit()">Send Message &rarr;</button>
-    <div class="msg-ok" id="msg-ok">Message sent. We will reply within 24 hours.</div>
-    <div class="msg-err" id="msg-err">Something went wrong. Email justin@monopcontent.com directly.</div>
-  </div>
+install_engine("ALLOW")
 
-  <div class="direct">
-    <div class="direct-label">Or contact directly</div>
-    <div class="direct-item">
-      <div class="di-icon">&#9993;</div>
-      <div class="di-text"><a href="mailto:justin@monopcontent.com">justin@monopcontent.com</a></div>
-    </div>
-    <div class="direct-item">
-      <div class="di-icon">&#128222;</div>
-      <div class="di-text"><a href="tel:07908269428">07908 269428</a></div>
-    </div>
-    <div class="direct-item">
-      <div class="di-icon">&#127968;</div>
-      <div class="di-text" style="color:rgba(255,255,255,0.4)">Monop Content &middot; Blyth, Northumberland, UK</div>
-    </div>
-  </div>
-</div>
 
-<script>
-async function doSubmit(){
-  var fn=document.getElementById('fn').value.trim();
-  var ln=document.getElementById('ln').value.trim();
-  var em=document.getElementById('em').value.trim();
-  var ph=document.getElementById('ph').value.trim();
-  var org=document.getElementById('org').value.trim();
-  var msg=document.getElementById('msg').value.trim();
-  var ok=document.getElementById('msg-ok');
-  var err=document.getElementById('msg-err');
-  var btn=document.getElementById('submit-btn');
-  ok.classList.remove('show');err.classList.remove('show');
-  if(!em||!em.includes('@')){err.textContent='Please enter a valid email address.';err.classList.add('show');return;}
-  if(!msg){err.textContent='Please enter a message.';err.classList.add('show');return;}
-  btn.disabled=true;btn.textContent='Sending...';
-  try{
-    var r=await fetch('/contact',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({name:fn+' '+ln,email:em,phone:ph,org:org,message:msg})});
-    var d=await r.json();
-    if(d.ok){
-      ok.classList.add('show');
-      btn.textContent='Sent';
-      document.getElementById('fn').value='';
-      document.getElementById('ln').value='';
-      document.getElementById('em').value='';
-      document.getElementById('ph').value='';
-      document.getElementById('org').value='';
-      document.getElementById('msg').value='';
-    }else{
-      err.textContent=d.error||'Something went wrong. Email justin@monopcontent.com directly.';
-      err.classList.add('show');btn.disabled=false;btn.textContent='Send Message \u2192';
+PASS, FAIL = [], []
+NOW, HOUR = time.time(), 3600
+
+def make_ctx():
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    lock = threading.RLock(); n = {"i": 0}
+    def seal(ev, res, ts, k):
+        with lock:
+            n["i"] += 1
+            return hashlib.sha256(json.dumps([ev,res,ts],sort_keys=True,default=str).encode()).hexdigest(), n["i"], n["i"]
+    lineage._ready = False
+    ctx = {"conn": conn, "lock": lock, "seal": seal}
+    lineage._setup(ctx); return ctx
+
+def check(n, c, d=""):
+    (PASS if c else FAIL).append(n)
+    print(("  ok   " if c else "  FAIL ") + n + (("  -> " + str(d)[:250]) if d and not c else ""))
+
+print("\n=== 27. concurrent execution of one ALLOW ===")
+ctx = make_ctx()
+lineage._issue(ctx,"k",dict(id="root",issuer="owner@example.com",issuer_kind="human",
+    subject="agent",scope=["payments.refund"],constraints={"max_amount":5000},
+    purpose="refunds",purpose_tags=["refunds"],not_after=NOW+HOUR,delegations_left=0))
+r,_ = lineage._evaluate(ctx,"k",{"grant":"root","action":"payments.refund",
+    "params":{"amount":100},"purpose_tag":"refunds"})
+eid = r["evaluation"]; results = []
+def race():
+    c,_ = lineage._confirm(ctx,"k",{"evaluation":eid,"action":"payments.refund","params":{"amount":100}})
+    results.append(c["bound"])
+ts = [threading.Thread(target=race) for _ in range(8)]
+[t.start() for t in ts]; [t.join() for t in ts]
+check("exactly one of eight concurrent executions binds", results.count(True) == 1, results)
+with ctx["lock"]:
+    rows = ctx["conn"].execute("SELECT COUNT(*) FROM auth_exec WHERE eval_id=? AND outcome<>'rejected'",(eid,)).fetchone()
+check("only one accepted binding exists in storage", rows[0] == 1, rows)
+
+print("\n=== 28. reconstruct the whole story from the sealed record ===")
+ctx = make_ctx()
+lineage._issue(ctx,"k",dict(id="r",issuer="owner@example.com",issuer_kind="human",
+    subject="orchestrator",scope=["payments.*"],constraints={"max_amount":5000},
+    purpose="close the refund backlog",purpose_tags=["refunds"],
+    not_after=NOW+HOUR,delegations_left=2))
+lineage._issue(ctx,"k",dict(id="m",parent="r",issuer="orchestrator",issuer_kind="agent",
+    subject="refund-bot",scope=["payments.refund"],constraints={"max_amount":200},
+    purpose="issue small refunds",purpose_tags=["refunds"],not_after=NOW+HOUR,delegations_left=0))
+r,_ = lineage._evaluate(ctx,"k",{"grant":"m","action":"payments.refund",
+    "params":{"amount":150},"purpose_tag":"refunds"})
+t,code = lineage._trace(ctx,{"grant":"m"})
+check("the trace names who authorised it", t["authorised_by"] == "owner@example.com")
+check("the trace names who held it at execution", t["holder"] == "refund-bot")
+check("the trace shows what changed at each hop",
+      t["lineage"][0]["scope"] == ["payments.*"] and t["lineage"][1]["scope"] == ["payments.refund"])
+check("the effective constraint is the narrowest, not the granted one",
+      float(t["effective_constraints"]["max_amount"]) == 200, t["effective_constraints"])
+d,code = lineage._decision(ctx,{"evaluation":r["evaluation"]})
+check("the decision is retrievable without a key and matches", d["verdict"] == r["verdict"])
+check("the decision carries the lineage digest", d["lineage_digest"] == r["lineage_digest"])
+check("every hop carries its own block index",
+      all(h["block_index"] for h in t["lineage"]))
+
+print("\n=== 29. widening midway is visible in the trace, not just blocked ===")
+ctx = make_ctx()
+lineage._issue(ctx,"k",dict(id="r",issuer="owner@example.com",issuer_kind="human",
+    subject="a",scope=["payments.refund"],constraints={"max_amount":100},
+    purpose="p",purpose_tags=["refunds"],not_after=NOW+HOUR,delegations_left=2))
+lineage._issue(ctx,"k",dict(id="m",parent="r",issuer="a",issuer_kind="agent",
+    subject="b",scope=["payments.refund"],constraints={"max_amount":100},
+    purpose="p",purpose_tags=["refunds"],not_after=NOW+HOUR,delegations_left=1,
+    risk_accepted_by="owner@example.com"))
+with ctx["lock"]:
+    ctx["conn"].execute("UPDATE auth_grant SET constraints=? WHERE id='m'",
+        (json.dumps({"max_amount":100000},sort_keys=True,separators=(",",":")),))
+    ctx["conn"].commit()
+t,_ = lineage._trace(ctx,{"grant":"m"})
+check("the trace flags the altered hop by name",
+      t["lineage"][1]["integrity"] == "FAILED" and t["lineage"][0]["integrity"] == "ok", t["lineage"])
+r,_ = lineage._evaluate(ctx,"k",{"grant":"m","action":"payments.refund",
+    "params":{"amount":50},"purpose_tag":"refunds"})
+check("and the exercise names the exact grant that broke", r["broken_at"] == "m", r["broken_at"])
+
+print("\n" + "="*60)
+print("passed %d, failed %d" % (len(PASS), len(FAIL)))
+for f in FAIL: print("  FAILED: "+f)
+sys.exit(1 if FAIL else 0)
+
+```
+
+
+## `tests/attack_continuity_4.py`
+
+107 lines, 4723 bytes
+
+```python
+#!/usr/bin/env python3
+"""Fourth wave: does it actually compose with the existing engine, and can
+either side be bypassed by the other?"""
+import hashlib, json, sqlite3, threading, time, sys, types
+import continuity as C
+
+PASS, FAIL = [], []
+NOW, HOUR = time.time(), 3600
+STATE = {"verdict": "ALLOW", "raises": False, "shape": "dict", "seen": []}
+
+def install(verdict="ALLOW", raises=False, shape="dict"):
+    STATE.update(verdict=verdict, raises=raises, shape=shape)
+    m = types.ModuleType("server")
+    m.get_bearer = lambda *a, **k: None
+    def score_event(event):
+        STATE["seen"].append(event)
+        if STATE["raises"]: raise RuntimeError("engine down")
+        if STATE["shape"] == "dict": return {"decision": STATE["verdict"], "score": 0.42}
+        if STATE["shape"] == "tuple": return (STATE["verdict"], 0.42)
+        if STATE["shape"] == "junk": return {"nothing": "useful"}
+        return STATE["verdict"]
+    m.score_event = score_event
+    sys.modules["server"] = m
+
+def make_ctx():
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    lock = threading.RLock(); n = {"i":0}
+    def seal(ev,res,ts,k):
+        n["i"] += 1
+        return hashlib.sha256(json.dumps([ev,res,ts],sort_keys=True,default=str).encode()).hexdigest(), n["i"], n["i"]
+    C._ready = False
+    ctx = {"conn":conn,"lock":lock,"seal":seal}; C._setup(ctx); return ctx
+
+def check(n,c,d=""):
+    (PASS if c else FAIL).append(n)
+    print(("  ok   " if c else "  FAIL ")+n+(("  -> "+str(d)[:250]) if d and not c else ""))
+
+def setup():
+    ctx = make_ctx()
+    C._issue(ctx,"k",dict(id="root",issuer="owner@example.com",issuer_kind="human",
+        subject="agent",scope=["payments.refund"],
+        constraints={"max_amount":5000,"allowed_currency":["GBP"]},
+        purpose="refunds",purpose_tags=["refunds"],not_after=NOW+HOUR,delegations_left=0))
+    return ctx
+
+def run(ctx, amount=100):
+    return C._evaluate(ctx,"k",{"grant":"root","action":"payments.refund",
+        "params":{"amount":amount,"currency":"GBP"},"purpose_tag":"refunds"})[0]
+
+print("\n=== 30. the engine is actually consulted ===")
+install("ALLOW"); STATE["seen"] = []
+r = run(setup())
+check("a clean authority plus a clean engine is ALLOW", r["verdict"]=="ALLOW", r)
+check("the engine was called with the real action and amount",
+      STATE["seen"] and STATE["seen"][-1]["action"]=="payments.refund"
+      and STATE["seen"][-1]["amount"]==100, STATE["seen"][-1] if STATE["seen"] else None)
+check("both components are reported separately",
+      r["authority_verdict"]=="ALLOW" and r["risk_verdict"]=="ALLOW", r)
+
+print("\n=== 31. neither side can wave the other through ===")
+install("BLOCK")
+r = run(setup())
+check("perfect authority does not survive an engine BLOCK", r["verdict"]=="BLOCK", r)
+check("the authority component still reads ALLOW underneath it",
+      r["authority_verdict"]=="ALLOW", r)
+install("CHALLENGE")
+r = run(setup())
+check("an engine CHALLENGE lifts a clean authority to CHALLENGE", r["verdict"]=="CHALLENGE", r)
+install("ALLOW")
+ctx = setup()
+r = C._evaluate(ctx,"k",{"grant":"root","action":"payments.transfer",
+    "params":{"amount":1},"purpose_tag":"refunds"})[0]
+check("a clean engine does not confer authority nobody granted", r["verdict"]=="BLOCK", r)
+check("and the engine is not even asked once authority has failed",
+      r["risk_engine"]["available"] is False, r["risk_engine"])
+
+print("\n=== 32. a missing or broken engine is not an ALLOW ===")
+install("ALLOW", raises=True)
+r = run(setup())
+check("an engine that throws downgrades ALLOW to CHALLENGE", r["verdict"]=="CHALLENGE", r)
+install("ALLOW", shape="junk")
+r = run(setup())
+check("an unreadable engine response downgrades to CHALLENGE", r["verdict"]=="CHALLENGE", r)
+sys.modules.pop("server", None); sys.modules.pop("__main__", None)
+r = run(setup())
+check("no engine present downgrades to CHALLENGE", r["verdict"]=="CHALLENGE", r)
+check("the reason names the missing engine",
+      any("risk engine" in x for x in r["reasons"]), r["reasons"])
+
+print("\n=== 33. it reads the engine's other return shapes ===")
+for shape in ("dict","tuple","str"):
+    install("BLOCK", shape=shape)
+    r = run(setup())
+    check("a %s return shape is understood" % shape, r["verdict"]=="BLOCK", r["risk_engine"])
+
+print("\n=== 34. an engine BLOCK cannot be executed ===")
+install("BLOCK")
+ctx = setup(); r = run(ctx)
+c,_ = C._confirm(ctx,"k",{"evaluation":r["evaluation"],"action":"payments.refund",
+    "params":{"amount":100,"currency":"GBP"}})
+check("execution is refused when the engine blocked", c["bound"] is False, c)
+
+print("\n" + "="*60)
+print("passed %d, failed %d" % (len(PASS), len(FAIL)))
+for f in FAIL: print("  FAILED: "+f)
+sys.exit(1 if FAIL else 0)
+
+```
+
+
+## `tests/attack_continuity_5.py`
+
+116 lines, 5639 bytes
+
+```python
+#!/usr/bin/env python3
+"""Fifth wave: risk acceptance. Who put their name to this capability
+existing at all - separately from who granted it and who holds it."""
+import hashlib, json, sqlite3, threading, time, sys, types
+import continuity as C
+
+PASS, FAIL = [], []
+NOW, HOUR = time.time(), 3600
+
+def install():
+    m = types.ModuleType("server")
+    m.get_bearer = lambda *a, **k: None
+    m.score_event = lambda e: {"decision": "ALLOW", "score": 0.1}
+    sys.modules["server"] = m
+install()
+
+def make_ctx():
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    lock = threading.RLock(); n = {"i":0}
+    def seal(ev,res,ts,k):
+        n["i"] += 1
+        return hashlib.sha256(json.dumps([ev,res,ts],sort_keys=True,default=str).encode()).hexdigest(), n["i"], n["i"]
+    C._ready = False
+    ctx = {"conn":conn,"lock":lock,"seal":seal}; C._setup(ctx); return ctx
+
+def check(n,c,d=""):
+    (PASS if c else FAIL).append(n)
+    print(("  ok   " if c else "  FAIL ")+n+(("  -> "+str(d)[:250]) if d and not c else ""))
+
+def root(ctx, **over):
+    args = dict(id="root", issuer="owner@example.com", issuer_kind="human",
+                subject="orchestrator", scope=["payments.refund"],
+                constraints={"max_amount":5000}, purpose="refunds",
+                purpose_tags=["refunds"], not_after=NOW+HOUR, delegations_left=3)
+    args.update(over)
+    return C._issue(ctx,"k",args)
+
+print("\n=== 35. a root accepts its own risk by default ===")
+ctx = make_ctx()
+r, code = root(ctx)
+check("a root grant records an acceptor without being asked",
+      code == 200 and r["risk_accepted_by"] == "owner@example.com", r)
+r2, _ = root(ctx, id="root2", risk_accepted_by="risk.officer@example.com")
+check("a root can name someone other than the issuer",
+      r2["risk_accepted_by"] == "risk.officer@example.com", r2)
+
+print("\n=== 36. switching on onward delegation needs a name ===")
+ctx = make_ctx(); root(ctx)
+r, code = C._issue(ctx,"k",dict(id="deleg", parent="root", issuer="orchestrator",
+    issuer_kind="agent", subject="b", scope=["payments.refund"],
+    constraints={"max_amount":100}, purpose="refunds", purpose_tags=["refunds"],
+    not_after=NOW+HOUR, delegations_left=1))
+check("a delegable child with no acceptor is refused",
+      code == 409 and r.get("error") == "risk_acceptance_required", r)
+
+r, code = C._issue(ctx,"k",dict(id="leaf", parent="root", issuer="orchestrator",
+    issuer_kind="agent", subject="b", scope=["payments.refund"],
+    constraints={"max_amount":100}, purpose="refunds", purpose_tags=["refunds"],
+    not_after=NOW+HOUR, delegations_left=0))
+check("a non-delegable child inherits the acceptor above it", code == 200, r)
+
+r, code = C._issue(ctx,"k",dict(id="deleg2", parent="root", issuer="orchestrator",
+    issuer_kind="agent", subject="b", scope=["payments.refund"],
+    constraints={"max_amount":100}, purpose="refunds", purpose_tags=["refunds"],
+    not_after=NOW+HOUR, delegations_left=1, risk_accepted_by="head.of.ops@example.com"))
+check("a delegable child with a named acceptor is accepted", code == 200, r)
+
+print("\n=== 37. the decision names the accountable person ===")
+e, _ = C._evaluate(ctx,"k",{"grant":"leaf","action":"payments.refund",
+    "params":{"amount":10},"purpose_tag":"refunds"})
+check("an evaluation reports who accepts the risk",
+      e["risk_accepted_by"] == "owner@example.com", e.get("risk_accepted_by"))
+check("...separately from who authorised it and who executed it",
+      e["authorised_by"] == "owner@example.com" and e["executed_by"] == "b", e)
+
+e2, _ = C._evaluate(ctx,"k",{"grant":"deleg2","action":"payments.refund",
+    "params":{"amount":10},"purpose_tag":"refunds"})
+check("the nearest acceptor wins, not the root one",
+      e2["risk_accepted_by"] == "head.of.ops@example.com", e2.get("risk_accepted_by"))
+
+t, _ = C._trace(ctx,{"grant":"deleg2"})
+check("the trace shows the acceptor at each hop",
+      t["risk_accepted_by"] == "head.of.ops@example.com" and
+      t["lineage"][0]["risk_accepted_by"] == "owner@example.com", t)
+
+print("\n=== 38. an unaccepted lineage cannot act ===")
+ctx = make_ctx(); root(ctx)
+C._issue(ctx,"k",dict(id="leaf", parent="root", issuer="orchestrator",
+    issuer_kind="agent", subject="b", scope=["payments.refund"],
+    constraints={"max_amount":100}, purpose="refunds", purpose_tags=["refunds"],
+    not_after=NOW+HOUR, delegations_left=0))
+with ctx["lock"]:
+    ctx["conn"].execute("UPDATE auth_grant SET risk_accepted_by=NULL")
+    ctx["conn"].commit()
+e, _ = C._evaluate(ctx,"k",{"grant":"leaf","action":"payments.refund",
+    "params":{"amount":10},"purpose_tag":"refunds"})
+check("stripping every acceptor blocks the action", e["verdict"] == "BLOCK", e["reasons"])
+check("...and says an incident would have no accountable person",
+      any("accountable" in x for x in e["reasons"]), e["reasons"])
+
+print("\n=== 39. the acceptor cannot be swapped after the fact ===")
+ctx = make_ctx(); root(ctx, risk_accepted_by="risk.officer@example.com")
+with ctx["lock"]:
+    ctx["conn"].execute("UPDATE auth_grant SET risk_accepted_by='someone.else@example.com' WHERE id='root'")
+    ctx["conn"].commit()
+e, _ = C._evaluate(ctx,"k",{"grant":"root","action":"payments.refund",
+    "params":{"amount":10},"purpose_tag":"refunds"})
+check("editing who accepted the risk fails the digest", e["verdict"] == "BLOCK", e["reasons"])
+check("...reported as an evidence failure, naming the grant",
+      e["broken_invariant"] == "evidence_continuity" and e["broken_at"] == "root", e)
+
+print("\n" + "="*60)
+print("passed %d, failed %d" % (len(PASS), len(FAIL)))
+for f in FAIL: print("  FAILED: "+f)
+sys.exit(1 if FAIL else 0)
+
+```
+
+
+## `tests/attack_continuity_6.py`
+
+92 lines, 3965 bytes
+
+```python
+"""End to end: issue, delegate, exercise, export a proof, verify it elsewhere,
+then try to forge one."""
+import hashlib, json, sqlite3, threading, time, sys, types, subprocess, copy
+import continuity as C
+
+m = types.ModuleType("server")
+m.get_bearer = lambda *a, **k: None
+m.score_event = lambda e: 0.12          # bare score, like the real engine
+sys.modules["server"] = m
+
+conn = sqlite3.connect(":memory:", check_same_thread=False)
+lock = threading.RLock(); n = {"i": 0}
+def seal(ev, res, ts, k):
+    n["i"] += 1
+    return hashlib.sha256(json.dumps([ev, res, ts], sort_keys=True, default=str).encode()).hexdigest(), n["i"], n["i"]
+ctx = {"conn": conn, "lock": lock, "seal": seal}
+C._ready = False; C._setup(ctx)
+
+NOW, HOUR = time.time(), 3600
+C._issue(ctx, "k", dict(id="root", issuer="justin@monopcontent.com", issuer_kind="human",
+    subject="orchestrator", scope=["payments.refund", "payments.read"],
+    constraints={"max_amount": 5000, "allowed_currency": ["GBP", "EUR"]},
+    purpose="resolve customer refund complaints", purpose_tags=["refunds", "support"],
+    not_after=NOW + 10 * HOUR, delegations_left=2))
+C._issue(ctx, "k", dict(id="mid", parent="root", issuer="orchestrator", issuer_kind="agent",
+    subject="refund-agent", scope=["payments.refund"],
+    constraints={"max_amount": 200, "allowed_currency": ["GBP"]},
+    purpose="issue small refunds", purpose_tags=["refunds"],
+    not_after=NOW + 2 * HOUR, delegations_left=0))
+
+def run(params, tag="refunds", action="payments.refund"):
+    r, _ = C._evaluate(ctx, "k", {"grant": "mid", "action": action,
+                                  "params": params, "purpose_tag": tag})
+    return r
+
+allow = run({"amount": 150, "currency": "GBP"})
+block = run({"amount": 900, "currency": "GBP"})
+print("allow verdict:", allow["verdict"], "| block verdict:", block["verdict"],
+      "->", block["broken_invariant"])
+
+def bundle_for(ev):
+    b, code = C._proof(ctx, {"evaluation": ev})
+    assert code == 200, b
+    return b
+
+for label, ev in (("ALLOW", allow["evaluation"]), ("BLOCK", block["evaluation"])):
+    b = bundle_for(ev)
+    open("/tmp/%s.json" % label, "w").write(json.dumps(b, indent=1))
+    print("\n" + "#" * 66 + "\n# %s bundle\n" % label + "#" * 66)
+    out = subprocess.run([sys.executable, "verify_authority.py", "/tmp/%s.json" % label],
+                         capture_output=True, text=True)
+    print(out.stdout.strip()); print("exit:", out.returncode)
+
+print("\n" + "#" * 66 + "\n# forgeries\n" + "#" * 66)
+good = json.load(open("/tmp/BLOCK.json"))
+
+def forge(name, mutate):
+    b = copy.deepcopy(good)
+    mutate(b)
+    open("/tmp/forged.json", "w").write(json.dumps(b))
+    out = subprocess.run([sys.executable, "verify_authority.py", "/tmp/forged.json"],
+                         capture_output=True, text=True)
+    caught = out.returncode != 0
+    line = [l for l in out.stdout.splitlines() if l.startswith("FAIL")]
+    print(("  ok   " if caught else "  MISS ") + name)
+    for l in line[:2]:
+        print("         " + l.strip())
+
+def flip_verdict(b):
+    b["decision"]["verdict"] = "ALLOW"; b["decision"]["authority_verdict"] = "ALLOW"
+def raise_cap(b):
+    pass_idx = 1
+    b["lineage"][1]["constraints"]["max_amount"] = 100000
+def widen_scope(b):
+    b["lineage"][1]["scope"] = ["payments.refund", "payments.transfer"]
+def swap_human(b):
+    b["lineage"][0]["issuer_kind"] = "agent"
+def change_params(b):
+    b["request"]["params"]["amount"] = 1
+def drop_acceptor(b):
+    for g in b["lineage"]: g["risk_accepted_by"] = None
+def restamp(b):
+    b["decision"]["evaluated_at_epoch"] = NOW + 9 * HOUR
+
+forge("claimed ALLOW on a bundle that blocks", flip_verdict)
+forge("cap raised inside the lineage", raise_cap)
+forge("scope widened inside the lineage", widen_scope)
+forge("root demoted from human", swap_human)
+forge("parameters swapped after the fact", change_params)
+forge("risk acceptor stripped", drop_acceptor)
+forge("timestamp moved past the leaf's expiry", restamp)
+
+```
+
+
+## `tests/attack_witnessed.py`
+
+160 lines, 7875 bytes
+
+```python
+"""Attack it the same way as everything else: from the position of an operator
+trying to make a grant look older than it is."""
+import hashlib, json, sqlite3, threading, time, sys, types
+import witnessed as W
+
+P, F = [], []
+def check(n, c, d=""):
+    (P if c else F).append(n)
+    print(("  ok   " if c else "  FAIL ") + n + (("  -> " + str(d)[:200]) if d and not c else ""))
+
+def make():
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    lock = threading.RLock(); n = {"i": 0}
+    conn.execute("CREATE TABLE audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                 "ts REAL,user_id TEXT,api_key TEXT,result_json TEXT,audit_hash TEXT)")
+    # the real grant table shape, including columns added later
+    conn.execute("CREATE TABLE auth_grant(id TEXT PRIMARY KEY,parent TEXT,root TEXT,"
+                 "issuer TEXT,subject TEXT,created REAL,digest TEXT,audit_hash TEXT,"
+                 "block_index INTEGER,risk_accepted_by TEXT)")
+    def seal(ev, res, ts, key):
+        n["i"] += 1
+        h = hashlib.sha256(json.dumps([ev,res,ts,n["i"]],sort_keys=True,default=str).encode()).hexdigest()
+        conn.execute("INSERT INTO audit_log(ts,user_id,api_key,result_json,audit_hash) "
+                     "VALUES(?,?,?,?,?)", (ts, ev.get("user_id"), key, json.dumps(res), h))
+        conn.commit()
+        return h, n["i"], n["i"]
+    W._ready = False
+    ctx = {"conn": conn, "lock": lock, "seal": seal}
+    W._setup(ctx)
+    return ctx
+
+def seal_grant(ctx, gid, created):
+    h, idx, _ = ctx["seal"]({"user_id": "lin:"+gid}, {"decision":"AUTHORITY_GRANTED","grant":gid}, created, "k")
+    with ctx["lock"]:
+        ctx["conn"].execute("INSERT INTO auth_grant(id,issuer,subject,created,audit_hash,block_index) "
+                            "VALUES(?,?,?,?,?,?)", (gid,"owner@example.com","agent",created,h,idx))
+        ctx["conn"].commit()
+    return h
+
+def noise(ctx, k=5):
+    for i in range(k):
+        ctx["seal"]({"user_id":"n%d"%i},{"decision":"ALLOW"},time.time(),"k")
+
+def record_head(ctx, peer, accepted=1, when=None, size=None, tip=None):
+    """Insert an attestation directly, standing in for a live peer."""
+    s, t = W._head(ctx)
+    when = when or time.time()
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "INSERT INTO witnessed_head(peer,peer_url,tree_size,tip,head_digest,"
+            "submitted,accepted,peer_response,peer_block,audit_hash,block_index,api_key)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (peer,"https://%s"%peer, size or s, tip or t,"d",when,accepted,"{}","b1","ah",1,"k"))
+        ctx["conn"].commit()
+
+NOW = time.time()
+
+print("\n=== 1. a grant witnessed after issue ===")
+ctx = make()
+noise(ctx, 3)
+g = seal_grant(ctx, "root", NOW - 3600)
+noise(ctx, 4)
+record_head(ctx, "redflagai.pro", when=NOW - 1800)
+r, code = W._grant(ctx, {"id": "root"})
+check("witnessed grant reports externally_witnessed", code==200 and r["externally_witnessed"], r)
+check("names the peer and the time", r["earliest_external_witness"]["peer"]=="redflagai.pro", r)
+check("gives a four-step plan pointed at the peer",
+      len(r["verification_plan"])==4 and "attest" in r["verification_plan"][0]["run"], r["verification_plan"][0])
+check("states what it does not prove", "should ever have been issued" in r["what_this_does_not_prove"])
+check("reports how long it sat unwitnessed", r["minutes_unwitnessed"] is not None, r.get("minutes_unwitnessed"))
+
+print("\n=== 2. THE ATTACK: a grant back-dated after the fact ===")
+# operator invents a root grant now, and writes created= last week
+ctx = make()
+noise(ctx, 3)
+record_head(ctx, "redflagai.pro", when=NOW - 86400)      # peer saw the log yesterday
+forged = seal_grant(ctx, "forged", NOW - 7*86400)        # grant CLAIMS to be a week old
+r, code = W._grant(ctx, {"id": "forged"})
+check("a grant sealed after the last witness is NOT covered", not r["externally_witnessed"], r)
+check("and says so plainly rather than staying quiet", "rests on this operator's own record" in r.get("flag",""), r.get("flag"))
+# now a peer witnesses; from here it is covered, but only from here
+record_head(ctx, "redflagai.pro", when=NOW)
+r2, _ = W._grant(ctx, {"id": "forged"})
+check("after a later witness it becomes covered", r2["externally_witnessed"])
+gapdays = round(r2["minutes_unwitnessed"]/1440.0, 1)
+check("the seven-day claim-to-witness gap is published, not hidden",
+      r2.get("flag") and "days" in r2["flag"] and gapdays >= 6.9, {"gap_days":gapdays,"flag":r2.get("flag")})
+
+print("\n=== 3. coverage counts only what a peer accepted ===")
+ctx = make()
+noise(ctx, 2); g = seal_grant(ctx, "g1", NOW); noise(ctx, 2)
+record_head(ctx, "peer-that-refused", accepted=0)
+r, _ = W._grant(ctx, {"id": "g1"})
+check("a refused submission gives no coverage", not r["externally_witnessed"], r.get("earliest_external_witness"))
+h, _ = W._heads(ctx, {})
+check("but the refusal is still on the public record", h["count"]==1 and h["heads"][0]["accepted"] is False, h)
+
+print("\n=== 4. a head that predates the grant does not cover it ===")
+ctx = make()
+record_head(ctx, "early-peer", when=NOW-9999)   # size 0
+noise(ctx, 3)
+seal_grant(ctx, "later", NOW)
+r, _ = W._grant(ctx, {"id": "later"})
+check("an earlier, smaller head cannot reach a later record", not r["externally_witnessed"], r)
+
+print("\n=== 5. the earliest witness wins, not the most convenient ===")
+ctx = make()
+noise(ctx, 2); seal_grant(ctx, "g", NOW - 600); noise(ctx, 2)
+record_head(ctx, "second-peer", when=NOW - 100)
+record_head(ctx, "first-peer",  when=NOW - 400)
+r, _ = W._grant(ctx, {"id": "g"})
+check("earliest accepted attestation is the one reported",
+      r["earliest_external_witness"]["peer"]=="first-peer", r["earliest_external_witness"])
+check("the others are listed too", any(c["peer"]=="second-peer" for c in r["also_witnessed_by"]), r["also_witnessed_by"])
+
+print("\n=== 6. status is honest about thin networks ===")
+ctx = make(); noise(ctx, 3)
+s, _ = W._status(ctx)
+check("no peers at all reports strength none", s["strength"]=="none" and "rests on our own record" in s["flag"], s)
+record_head(ctx, "only-peer")
+s, _ = W._status(ctx)
+check("one peer reports weak and names collusion", s["strength"]=="weak" and "collude" in s["flag"], s)
+for p in ("p2","p3"): record_head(ctx, p)
+s, _ = W._status(ctx)
+check("three peers reports reasonable", s["strength"]=="reasonable", s)
+noise(ctx, 6)
+s, _ = W._status(ctx)
+check("records sealed since the last head are counted as unwitnessed",
+      s["records_not_yet_witnessed"]==6, s)
+
+print("\n=== 7. tampering with the grant row ===")
+ctx = make(); noise(ctx,2); seal_grant(ctx,"t",NOW); record_head(ctx,"peer")
+with ctx["lock"]:
+    ctx["conn"].execute("UPDATE auth_grant SET audit_hash='0'*64 WHERE id='t'")
+    ctx["conn"].commit()
+r, code = W._grant(ctx, {"id":"t"})
+check("a grant whose seal is not in the log is a finding, not a 404",
+      code==409 and "finding" in r.get("message",""), (code, r))
+
+print("\n=== 8. url safety on submit ===")
+ctx = make(); noise(ctx,2)
+for bad, why in [("http://127.0.0.1/x","loopback"),("http://10.0.0.5/x","private"),
+                 ("ftp://example.com","scheme"),("https://example.com:8443/x","port")]:
+    r, code = W._submit(ctx, "k", {"peer":"p","url":bad})
+    check("refuses %s" % why, code==400 and r.get("error")=="url_refused", (bad,code,r))
+
+print("\n=== 9. any sealed record, not just grants ===")
+ctx = make(); noise(ctx,2)
+h,_ ,_ = ctx["seal"]({"user_id":"x"},{"decision":"ALLOW"},NOW,"k")
+noise(ctx,1); record_head(ctx,"peer")
+r, code = W._record(ctx, {"hash": h})
+check("a decision receipt gets the same treatment", code==200 and r["externally_witnessed"], r)
+r, code = W._record(ctx, {"hash": "zz"})
+check("a malformed hash is refused", code==400, (code,r))
+
+print("\n" + "="*62)
+print("passed %d, failed %d" % (len(P), len(F)))
+for f in F: print("  FAILED: " + f)
+sys.exit(1 if F else 0)
+
+```
+
+
+## `verify_authority.py`
+
+573 lines, 21333 bytes
+
+```python
+#!/usr/bin/env python3
+"""
+verify_authority.py  -  check an AILeash authority proof without AILeash
+
+    python3 verify_authority.py proof.json
+    curl -s "https://sebbi.pro/x/continuity/proof?evaluation=e_..." \\
+        | python3 verify_authority.py -
+
+WHAT THIS IS FOR
+----------------
+A proof that can only be checked by the party who issued it is not a proof.
+This script takes a bundle and reaches its own conclusion using nothing but
+the Python standard library. It does not call the issuing system, it does not
+import anything you have to install, and it does not take a single field of
+the bundle at face value.
+
+It does four separate things, and each one can fail on its own:
+
+  1. SIGNATURE   Ed25519 over the canonical bundle. Confirms the bundle came
+                 from the holder of the named key and has not been edited by
+                 anybody since.
+
+  2. INTEGRITY   Recomputes every grant digest, the lineage digest and the
+                 parameter digest from the fields in front of it. Confirms
+                 the bundle is internally consistent with its own contents.
+
+  3. DERIVATION  Re-runs the authority rules from scratch: root issued by a
+                 human, an unbroken parent chain, scope covered at every hop,
+                 constraints narrowing on every axis, purpose narrowing,
+                 validity windows contained, nothing revoked, and the action
+                 itself inside the effective limits of the whole lineage.
+
+  4. AGREEMENT   Compares the verdict this script reached with the verdict the
+                 bundle claims. Disagreement is reported as a failure of the
+                 issuer, not of this script.
+
+WHAT A PASS MEANS
+-----------------
+That the authority for this action was derivable, at that time, from that
+human grant - or, for a refusal, that it genuinely was not, and that the named
+grant and invariant really are where it broke.
+
+WHAT A PASS DOES NOT MEAN
+-------------------------
+That the root grant should ever have been issued. That the parameters describe
+something that really happened. That the risk engine was right. Derivation is
+not merit and it is not truth.
+
+The risk half of a composed verdict cannot be re-derived here, because that
+needs the issuer's scoring engine. Where the bundle's authority verdict is
+BLOCK, the composed verdict stands regardless, because the composition takes
+the worse of the two.
+"""
+
+import binascii
+import hashlib
+import json
+import sys
+
+GRANT_PREFIX = b"AILEASH-GRANT-v1:"
+EVAL_PREFIX = b"AILEASH-AUTHEVAL-v1:"
+BUNDLE_PREFIX = b"AILEASH-AUTHORITY-PROOF-v1:"
+
+MAX_DEPTH = 32
+RANK = {"ALLOW": 0, "CHALLENGE": 1, "BLOCK": 2}
+
+
+# ======================================================================
+# Ed25519, RFC 8032, standard library only
+# ======================================================================
+
+_Q = 2 ** 255 - 19
+_L = 2 ** 252 + 27742317777372353535851937790883648493
+_D = -121665 * pow(121666, _Q - 2, _Q) % _Q
+_I = pow(2, (_Q - 1) // 4, _Q)
+
+
+def _h(m):
+    return hashlib.sha512(m).digest()
+
+
+def _inv(x):
+    return pow(x, _Q - 2, _Q)
+
+
+def _xrecover(y):
+    xx = (y * y - 1) * _inv(_D * y * y + 1)
+    x = pow(xx, (_Q + 3) // 8, _Q)
+    if (x * x - xx) % _Q != 0:
+        x = (x * _I) % _Q
+    if x % 2 != 0:
+        x = _Q - x
+    return x
+
+
+_BY = 4 * _inv(5) % _Q
+_BX = _xrecover(_BY)
+_B = (_BX % _Q, _BY % _Q, 1, (_BX * _BY) % _Q)
+_IDENT = (0, 1, 1, 0)
+
+
+def _add(p, q):
+    x1, y1, z1, t1 = p
+    x2, y2, z2, t2 = q
+    a = (y1 - x1) * (y2 - x2) % _Q
+    b = (y1 + x1) * (y2 + x2) % _Q
+    c = t1 * 2 * _D * t2 % _Q
+    dd = z1 * 2 * z2 % _Q
+    e, f, g, hh = b - a, dd - c, dd + c, b + a
+    return (e * f % _Q, g * hh % _Q, f * g % _Q, e * hh % _Q)
+
+
+def _scalarmult(p, e):
+    if e == 0:
+        return _IDENT
+    q = _scalarmult(p, e // 2)
+    q = _add(q, q)
+    if e & 1:
+        q = _add(q, p)
+    return q
+
+
+def _encodepoint(p):
+    x, y, z, _t = p
+    zi = _inv(z)
+    x, y = x * zi % _Q, y * zi % _Q
+    bits = [(y >> i) & 1 for i in range(255)] + [x & 1]
+    return bytes(sum(bits[i * 8 + j] << j for j in range(8)) for i in range(32))
+
+
+def _bit(h, i):
+    return (h[i // 8] >> (i % 8)) & 1
+
+
+def _hint(m):
+    h = _h(m)
+    return sum(2 ** i * _bit(h, i) for i in range(512))
+
+
+def _isoncurve(p):
+    x, y, z, t = p
+    return (z % _Q != 0 and x * y % _Q == z * t % _Q
+            and (y * y - x * x - z * z - _D * t * t) % _Q == 0)
+
+
+def _decodepoint(s):
+    y = int.from_bytes(s, "little") & ((1 << 255) - 1)
+    x = _xrecover(y)
+    if x & 1 != _bit(s, 255):
+        x = _Q - x
+    p = (x, y, 1, (x * y) % _Q)
+    if not _isoncurve(p):
+        raise ValueError("point off curve")
+    return p
+
+
+def ed25519_verify(sig, msg, pk):
+    if len(sig) != 64 or len(pk) != 32:
+        return False
+    try:
+        rr = _decodepoint(sig[:32])
+        a = _decodepoint(pk)
+    except Exception:
+        return False
+    s = int.from_bytes(sig[32:64], "little")
+    if s >= _L:
+        return False
+    hh = _hint(sig[:32] + pk + msg)
+    return _encodepoint(_scalarmult(_B, s)) == _encodepoint(_add(rr, _scalarmult(a, hh)))
+
+
+# ======================================================================
+# the rules, reimplemented from the published spec
+# ======================================================================
+
+def canon(obj):
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def sha(prefix, text):
+    return hashlib.sha256(prefix + text.encode("utf-8")).hexdigest()
+
+
+def grant_digest(g):
+    material = {
+        "id": g["id"], "parent": g["parent"], "issuer": g["issuer"],
+        "issuer_kind": g["issuer_kind"], "subject": g["subject"],
+        "subject_kind": g["subject_kind"], "scope": sorted(g["scope"]),
+        "constraints": g["constraints"], "purpose": g["purpose"],
+        "purpose_tags": sorted(g["purpose_tags"]),
+        "not_before": g["not_before"], "not_after": g["not_after"],
+        "depth": g["depth"], "delegations_left": g["delegations_left"],
+        "created": g["created"], "risk_accepted_by": g.get("risk_accepted_by"),
     }
-  }catch(e){
-    err.classList.add('show');btn.disabled=false;btn.textContent='Send Message \u2192';
-  }
+    return sha(GRANT_PREFIX, canon(material))
+
+
+def covers(held, wanted):
+    if held == wanted or held == "*":
+        return True
+    if held.endswith(".*"):
+        return wanted == held[:-2] or wanted.startswith(held[:-1])
+    return False
+
+
+def wildcard_breadth(scope, capability):
+    best = None
+    for held in scope:
+        if not covers(held, capability):
+            continue
+        if held == capability:
+            return 0
+        width = (capability.count(".") + 2 if held == "*"
+                 else capability.count(".") - held[:-2].count("."))
+        best = width if best is None else min(best, width)
+    return best
+
+
+def direction(key):
+    for p in ("max_", "min_", "allowed_", "denied_", "may_"):
+        if key.startswith(p):
+            return p
+    return None
+
+
+def num(v):
+    if isinstance(v, bool) or v is None:
+        raise ValueError("not a number")
+    return float(v)
+
+
+def as_set(v):
+    if isinstance(v, (list, tuple, set)):
+        return set(v)
+    return {v}
+
+
+def narrower(parent_c, child_c):
+    for key in sorted(child_c):
+        d = direction(key)
+        cval = child_c[key]
+        if d is None:
+            return False, "constraint '%s' has no narrowing rule" % key
+        if key not in parent_c:
+            return False, "constraint '%s' is not expressed by the parent" % key
+        pval = parent_c[key]
+        try:
+            if d == "max_" and num(cval) > num(pval):
+                return False, "%s raised from %s to %s" % (key, pval, cval)
+            if d == "min_" and num(cval) < num(pval):
+                return False, "%s lowered from %s to %s" % (key, pval, cval)
+            if d == "allowed_" and not as_set(cval) <= as_set(pval):
+                return False, "%s adds values the parent does not hold" % key
+            if d == "denied_" and not as_set(pval) <= as_set(cval):
+                return False, "%s drops values the parent denies" % key
+            if d == "may_" and bool(cval) and not bool(pval):
+                return False, "%s enabled where the parent withholds it" % key
+        except (TypeError, ValueError):
+            return False, "constraint '%s' is not comparable" % key
+    return True, None
+
+
+def effective(chain):
+    eff = {}
+    for g in chain:
+        for k, v in g["constraints"].items():
+            d = direction(k)
+            if k not in eff:
+                eff[k] = v
+                continue
+            cur = eff[k]
+            try:
+                if d == "max_":
+                    eff[k] = min(num(cur), num(v))
+                elif d == "min_":
+                    eff[k] = max(num(cur), num(v))
+                elif d == "allowed_":
+                    eff[k] = sorted(as_set(cur) & as_set(v))
+                elif d == "denied_":
+                    eff[k] = sorted(as_set(cur) | as_set(v))
+                elif d == "may_":
+                    eff[k] = bool(cur) and bool(v)
+            except (TypeError, ValueError):
+                eff[k] = v
+    return eff
+
+
+def params_against(params, eff):
+    hard, unconstrained = [], []
+    for key in sorted(params):
+        val = params[key]
+        checked = False
+        for cname, cval in eff.items():
+            d = direction(cname)
+            if not d or cname[len(d):] != key:
+                continue
+            checked = True
+            try:
+                if d == "max_" and num(val) > num(cval):
+                    hard.append("%s=%s exceeds %s=%s" % (key, val, cname, cval))
+                elif d == "min_" and num(val) < num(cval):
+                    hard.append("%s=%s is below %s=%s" % (key, val, cname, cval))
+                elif d == "allowed_" and val not in as_set(cval):
+                    hard.append("%s=%s is outside %s" % (key, val, cname))
+                elif d == "denied_" and val in as_set(cval):
+                    hard.append("%s=%s is denied by %s" % (key, val, cname))
+                elif d == "may_" and bool(val) and not bool(cval):
+                    hard.append("%s requested where %s withholds it" % (key, cname))
+            except (TypeError, ValueError):
+                hard.append("%s cannot be compared with %s" % (key, cname))
+        if not checked:
+            unconstrained.append(key)
+    return hard, unconstrained
+
+
+# ======================================================================
+# the four checks
+# ======================================================================
+
+class Report(object):
+    def __init__(self):
+        self.rows = []
+        self.failed = False
+
+    def add(self, ok, name, detail=""):
+        self.rows.append((ok, name, detail))
+        if not ok:
+            self.failed = True
+
+    def note(self, name, detail=""):
+        self.rows.append((None, name, detail))
+
+    def render(self):
+        out = []
+        for ok, name, detail in self.rows:
+            mark = "  ok  " if ok else ("FAIL  " if ok is False else "  --  ")
+            out.append(mark + name + (("\n        " + detail) if detail else ""))
+        return "\n".join(out)
+
+
+def check_signature(bundle, rep):
+    sig_hex = bundle.get("signature")
+    pk_hex = (bundle.get("issued_by") or {}).get("public_key")
+    if not sig_hex or not pk_hex:
+        rep.add(False, "Signature present", "the bundle carries no signature or no key")
+        return
+    body = dict(bundle)
+    body.pop("signature", None)
+    body.pop("verify_with", None)
+    try:
+        sig = binascii.unhexlify(sig_hex)
+        pk = binascii.unhexlify(pk_hex)
+    except Exception:
+        rep.add(False, "Signature is readable hex")
+        return
+    ok = ed25519_verify(sig, BUNDLE_PREFIX + canon(body).encode("utf-8"), pk)
+    rep.add(ok, "Ed25519 signature over the canonical bundle",
+            "key " + pk_hex[:16] + "…  Verify this key independently at the issuer's "
+            "published address before trusting who signed." if ok else
+            "the bundle was altered after signing, or it was not signed by this key")
+
+
+def check_integrity(bundle, rep):
+    lineage = bundle.get("lineage") or []
+    bad = []
+    for g in lineage:
+        try:
+            if grant_digest(g) != g.get("digest"):
+                bad.append(g.get("id"))
+        except Exception:
+            bad.append(g.get("id"))
+    rep.add(not bad, "Every grant digest recomputes from its own fields",
+            "" if not bad else "mismatched: " + ", ".join(str(b) for b in bad))
+
+    claimed = (bundle.get("decision") or {}).get("lineage_digest")
+    mine = sha(EVAL_PREFIX, canon([g.get("digest") for g in lineage]))
+    rep.add(mine == claimed, "Lineage digest matches the ordered path",
+            "" if mine == claimed else "computed " + mine[:20] + "… claimed " + str(claimed)[:20] + "…")
+
+    req = bundle.get("request") or {}
+    claimed_p = (bundle.get("decision") or {}).get("params_digest")
+    mine_p = sha(EVAL_PREFIX, canon({"action": req.get("action"),
+                                     "params": req.get("params") or {}}))
+    rep.add(mine_p == claimed_p, "Parameter digest matches the request as stated",
+            "" if mine_p == claimed_p else "the parameters shown are not the "
+            "parameters that were judged")
+
+
+def rederive(bundle, rep):
+    """Run the published rules from scratch and reach an independent verdict."""
+    lineage = bundle.get("lineage") or []
+    decision = bundle.get("decision") or {}
+    req = bundle.get("request") or {}
+    at = decision.get("evaluated_at_epoch")
+
+    hard, soft = [], []
+    broken_at = broken_invariant = None
+
+    def fail(grant, invariant, detail):
+        nonlocal broken_at, broken_invariant
+        hard.append(detail)
+        if broken_at is None:
+            broken_at, broken_invariant = grant, invariant
+
+    if not lineage:
+        fail(None, "authority_continuity", "the bundle carries no authority path")
+    else:
+        root = lineage[0]
+        if root.get("parent") is not None:
+            fail(root["id"], "authority_continuity",
+                 "the path does not begin at a parentless root")
+        if root.get("issuer_kind") != "human":
+            fail(root["id"], "identity_continuity",
+                 "the root grant was not issued by a human principal")
+
+        previous = None
+        for g in lineage:
+            if g.get("revoked_at") is not None:
+                fail(g["id"], "authority_continuity",
+                     "grant %s was revoked" % g["id"])
+            if at is not None:
+                if at < g["not_before"]:
+                    fail(g["id"], "temporal_validity",
+                         "grant %s was not yet valid at the time of the decision" % g["id"])
+                if at >= g["not_after"]:
+                    fail(g["id"], "temporal_validity",
+                         "grant %s had expired at the time of the decision" % g["id"])
+            if previous is not None:
+                if g.get("parent") != previous.get("id"):
+                    fail(g["id"], "authority_continuity",
+                         "grant %s does not point at the grant above it" % g["id"])
+                missing = [c for c in g["scope"]
+                           if not any(covers(p, c) for p in previous["scope"])]
+                if missing:
+                    fail(g["id"], "boundary_integrity",
+                         "%s holds scope its parent does not: %s"
+                         % (g["id"], ", ".join(sorted(missing))))
+                ok, why = narrower(previous["constraints"], g["constraints"])
+                if not ok:
+                    fail(g["id"], "boundary_integrity", "%s: %s" % (g["id"], why))
+                if not set(g["purpose_tags"]) <= set(previous["purpose_tags"]):
+                    fail(g["id"], "intent_continuity",
+                         "%s carries purpose tags its parent does not" % g["id"])
+                if (g["not_before"] < previous["not_before"]
+                        or g["not_after"] > previous["not_after"]):
+                    fail(g["id"], "temporal_validity",
+                         "%s is valid outside its parent's window" % g["id"])
+                if g["depth"] != previous["depth"] + 1:
+                    fail(g["id"], "authority_continuity",
+                         "%s records a depth inconsistent with its parent" % g["id"])
+            previous = g
+
+        if len(lineage) - 1 > MAX_DEPTH:
+            fail(lineage[-1]["id"], "boundary_integrity", "delegation depth exceeds the ceiling")
+
+        if not any(g.get("risk_accepted_by") for g in lineage):
+            fail(lineage[0]["id"], "identity_continuity",
+                 "no grant in this path names who accepted the risk")
+
+        leaf = lineage[-1]
+        action = req.get("action")
+        params = req.get("params") or {}
+
+        if action and not any(covers(c, action) for c in leaf["scope"]):
+            fail(leaf["id"], "boundary_integrity",
+                 "action '%s' is outside the scope of the grant exercised" % action)
+        elif action:
+            breadth = wildcard_breadth(leaf["scope"], action)
+            if breadth and breadth >= 2:
+                soft.append("action '%s' is only covered by a broad wildcard" % action)
+
+        eff = effective(lineage)
+        failures, unconstrained = params_against(params, eff)
+        for f in failures:
+            fail(leaf["id"], "boundary_integrity", f)
+        for u in unconstrained:
+            soft.append("parameter '%s' is not constrained anywhere in the path" % u)
+
+        tag = req.get("purpose_tag")
+        if tag:
+            if tag not in leaf["purpose_tags"]:
+                soft.append("declared purpose '%s' is not carried by the grant" % tag)
+        else:
+            soft.append("the action declared no purpose")
+
+    verdict = "BLOCK" if hard else ("CHALLENGE" if soft else "ALLOW")
+    return verdict, hard, soft, broken_at, broken_invariant
+
+
+def check_agreement(bundle, rep, mine, hard, soft, broken_at, broken_invariant):
+    decision = bundle.get("decision") or {}
+    claimed = decision.get("authority_verdict") or decision.get("verdict")
+
+    rep.add(mine == claimed,
+            "Independently re-derived authority verdict: " + mine,
+            "" if mine == claimed else
+            "the issuer claims " + str(claimed) + " and this script reaches " + mine +
+            " from the same path. One of us is wrong and the rules are published.")
+
+    if mine == "BLOCK":
+        same_grant = (broken_at == decision.get("broken_at"))
+        same_inv = (broken_invariant == decision.get("broken_invariant"))
+        rep.add(same_grant and same_inv,
+                "Refusal reproduces at the same grant and invariant",
+                ("grant %s, invariant %s" % (broken_at, broken_invariant))
+                if same_grant and same_inv else
+                "this script breaks at grant %s / %s, the issuer says %s / %s"
+                % (broken_at, broken_invariant,
+                   decision.get("broken_at"), decision.get("broken_invariant")))
+        rep.note("Why authority could not be derived")
+        for h in hard:
+            rep.note("  " + h)
+    elif soft:
+        rep.note("Why this could not be settled without a person")
+        for x in soft:
+            rep.note("  " + x)
+
+    risk = decision.get("risk_verdict")
+    if risk and mine != "BLOCK":
+        rep.note("Risk verdict reported as " + str(risk) + ", not re-derivable here",
+                 "the composed verdict is the worse of the two; the scoring engine "
+                 "is not part of this bundle and is not checked by this script")
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        return 2
+    src = sys.argv[1]
+    raw = sys.stdin.read() if src == "-" else open(src, "r").read()
+    try:
+        bundle = json.loads(raw)
+    except Exception as exc:
+        print("Not readable JSON: " + str(exc))
+        return 2
+
+    rep = Report()
+    print("=" * 66)
+    print("AUTHORITY PROOF  ·  independent verification")
+    print("=" * 66)
+    d = bundle.get("decision") or {}
+    print("evaluation   " + str(d.get("evaluation")))
+    print("action       " + str((bundle.get("request") or {}).get("action")))
+    print("at           " + str(d.get("evaluated_at")))
+    print("hops         " + str(max(0, len(bundle.get("lineage") or []) - 1)))
+    if bundle.get("lineage"):
+        print("authorised   " + str(bundle["lineage"][0].get("issuer")))
+        print("executed     " + str(bundle["lineage"][-1].get("subject")))
+        acc = [g.get("risk_accepted_by") for g in bundle["lineage"] if g.get("risk_accepted_by")]
+        print("risk owner   " + str(acc[-1] if acc else None))
+    print("-" * 66)
+
+    check_signature(bundle, rep)
+    check_integrity(bundle, rep)
+    mine, hard, soft, ba, bi = rederive(bundle, rep)
+    check_agreement(bundle, rep, mine, hard, soft, ba, bi)
+
+    print(rep.render())
+    print("-" * 66)
+    if rep.failed:
+        print("RESULT: NOT VERIFIED. Something above did not hold.")
+        return 1
+    print("RESULT: VERIFIED - " + mine)
+    if mine == "BLOCK":
+        print("This is a proof that the action was NOT authorised, and where it failed.")
+    print("Checked with no network access, no dependencies, and nothing taken on")
+    print("the issuer's word except the meaning of their public key.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+```
+
+
+## `AILeash-API-Reference-v6.4.2.md`
+
+256 lines, 6799 bytes
+
+```markdown
+# AILeash v6.4.2 — Complete API Reference
+
+## Core Decision Endpoint
+
+### POST /api/govern
+**The engine. Every action scores here.**
+
+Auth: `Bearer YOUR_API_KEY`
+
+**Request:**
+```json
+{
+  "user_id": "string (required)",
+  "action": "string (required) — payment/login/message/transfer/checkout/api_call",
+  "amount": "number (optional, default 0) — monetary value in GBP",
+  "country": "string (required) — ISO 3166-1 alpha-2 code",
+  "device_id": "string (required) — unique device identifier",
+  "anomaly": "number 0..1 (optional) — behavioural anomaly score",
+  "device_risk": "number 0..1 (optional) — device risk score"
 }
-</script>
-</body>
-</html>
+```
+
+**Response (200 OK):**
+```json
+{
+  "decision": "ALLOW|CHALLENGE|BLOCK",
+  "score": 0.0..1.0,
+  "trust": 0.05..1.0,
+  "reasons": ["velocity_spike", "high_amount", "country_shift"],
+  "audit_hash": "sha256_hex_string",
+  "block_index": 12345,
+  "receipt_seq": 42,
+  "timestamp": 1719072000.0,
+  "challenge_url": "https://sebbi.pro/verify-challenge?token=...",
+  "challenge_expires_in": 900
+}
+```
+
+**Error responses:**
+- `401 Unauthorized` — Missing or invalid API key
+- `403 Forbidden` — Account inactive or over quota
+- `429 Too Many Requests` — Rate limited
+- `503 Service Unavailable` — Server overloaded
+
+---
+
+## Account Management
+
+### POST /api/keys or /signup
+**Create a new API key. Instant. No card. No humans in the loop.**
+
+No auth required.
+
+**Request:**
+```json
+{
+  "email": "user@example.com (required)",
+  "name": "John Doe (optional)",
+  "phone": "+441234567890 (optional)",
+  "org": "Acme Corp (optional)",
+  "product": "aileash|guardian|sonicboom|sentinel (default: aileash)",
+  "devices": 1..1000000 (default: 1),
+  "ref_code": "REF-XXXX-1234 (optional)"
+}
+```
+
+**Response (200 OK):**
+```json
+{
+  "api_key": "al_live_...",
+  "email": "user@example.com",
+  "product": "aileash",
+  "devices": 1,
+  "monthly_cost": 0.50,
+  "quota": 100,
+  "ref_code": "REF-JOHN-5678",
+  "badge_id": "abc123def456",
+  "message": "100 free decisions. Then 50p per device per month via Stripe."
+}
+```
+
+---
+
+## Verification & Public Endpoints
+
+### GET /api/spec
+**Engine specification. Public. No auth.**
+
+**Response (200 OK):**
+```json
+{
+  "engine": "AILeash v6.4.2",
+  "version": "6.4.2",
+  "signals": 9,
+  "decision_latency_ms": 28,
+  "threshold_allow": 0.35,
+  "threshold_challenge": 0.70,
+  "threshold_block": 1.0,
+  "features": ["deterministic scoring", "tamper-evident chain", "real-time alerts", "gapless receipts", "sovereign deployment"]
+}
+```
+
+### GET /api/verify-chain
+**Full audit chain integrity proof. Public. No auth.**
+
+**Response (200 OK):**
+```json
+{
+  "valid": true,
+  "blocks": 45678,
+  "genesis": "GENESIS",
+  "tip": "abc123...",
+  "message": "Chain intact. No tampering detected.",
+  "verifiable_by": "anyone, anywhere"
+}
+```
+
+### GET /api/health
+**Server health and load. Public. No auth.**
+
+**Response (200 OK):**
+```json
+{
+  "status": "ok",
+  "version": "6.4.2",
+  "uptime_seconds": 864000,
+  "rps": 42,
+  "timestamp": 1719072000.0
+}
+```
+
+---
+
+## Real-time Dashboards
+
+### GET /api/pulse
+**Live risk posture. Your current state.**
+
+Auth: `Bearer YOUR_API_KEY`
+
+**Response (200 OK):**
+```json
+{
+  "last_hour": {
+    "ALLOW": 486,
+    "CHALLENGE": 23,
+    "BLOCK": 4
+  },
+  "recent": [
+    {
+      "ts": 1719072000,
+      "user_id": "u_7f2",
+      "action": "payment",
+      "decision": "ALLOW",
+      "score": 0.12,
+      "reasons": [],
+      "audit_hash": "abc123..."
+    }
+  ],
+  "chain_tip": "abc123...",
+  "message": "All green. Chain tip sealed."
+}
+```
+
+---
+
+## Billing & Webhooks
+
+### POST /stripe-webhook
+**Stripe webhook receiver. Signature verified automatically.**
+
+Supports events:
+- `checkout.session.completed` — User upgraded
+- `invoice.paid` — Monthly subscription paid
+- `customer.subscription.deleted` — User cancelled
+- `invoice.payment_failed` — Payment failed
+
+---
+
+## Four Products. One Engine.
+
+### AILeash
+- **What:** Every AI decision your platform makes about a person gets scored, explained, and sealed.
+- **Who:** Platforms using AI for any regulated decision (lending, hiring, content moderation, fraud, access control).
+- **Price:** 50p per device per month + your margin.
+- **Free tier:** 100 decisions/month, no card.
+
+### Guardian
+- **What:** Free message checker for families. Child pastes a message in, gets instant plain-English assessment against grooming patterns.
+- **Who:** Families. Free forever. No card. No catch.
+- **Price:** Free. Always.
+- **Built for:** ICO Children's Code, Online Safety Act, child safety.
+
+### SonicBoom
+- **What:** One line of code. Drops into AWS, Azure, GCP, OpenAI, Anthropic. Adds full compliance audit chain to every call.
+- **Who:** Platforms already running AI in the cloud.
+- **Price:** 50p per device per month + your margin.
+- **Latency:** No impact. Chain sealing is asynchronous.
+
+### Sentinel
+- **What:** Fraud and anomaly alerting. Scores unusual patterns (500 messages in a minute, login from new country, velocity spikes) in real-time.
+- **Who:** Platforms managing fraud, abuse, takeovers.
+- **Price:** 50p per device per month + your margin.
+- **Real-time:** Alerts the moment thresholds trip.
+
+---
+
+## The Score Formula (Immutable)
+
+**Raw weighted sum (Σ_raw):**
+```
+Σ_raw =
+  (1 − trust) × 0.30
+  + min(velocity_60s / 20, 1) × 0.15
+  + min(velocity_5m / 50, 1) × 0.10
+  + min(velocity_1h / 200, 1) × 0.10
+  + min(ln(1+amount) / ln(1+10000), 1) × 0.15
+  + device_risk × 0.10
+  + behavioural_anomaly × 0.10
+  + country_shift × 0.10
+  + unsafe_country × 0.10
+```
+
+**Normalization:** the nine weights above sum to 1.20, not 1.0. To keep every signal's *relative* importance exactly as designed while guaranteeing the score behaves as a true 0–1 weighted average (not one that can reach BLOCK-level values from fewer combined signals than intended), divide by the actual weight total before clamping:
+
+```
+WEIGHT_TOTAL = 0.30 + 0.15 + 0.10 + 0.10 + 0.15 + 0.10 + 0.10 + 0.10 + 0.10   # = 1.20
+
+score = clamp( Σ_raw / WEIGHT_TOTAL , 0, 1 )
+
+decision = ALLOW if score < 0.35
+         = CHALLENGE if score < 0.70
+         = BLOCK otherwise
+```
+
+No machine learning. No drift. No retraining. Weights are written in code and cannot change without a new release. `WEIGHT_TOTAL` is a fixed constant (1.20) recomputed only if a signal is added, removed, or reweighted in a future release — never at runtime.
+
+---
+
+## Rate Limits
+
+- **Free tier:** 100 decisions/month
+- **Paid:** Unlimited (or by plan)
+- **Public endpoints:** No rate limit
+
+---
+
+## Documentation
+
+- **Homepage:** https://sebbi.pro
+- **Whitepaper:** https://sebbi.pro/whitepaper
+- **Developers:** https://sebbi.pro/developers
+- **Scanner (free):** https://sebbi.pro/scan
+- **Guardian:** https://sebbi.pro/guardian-app
+- **Contact:** justrightdecorators@gmail.com
 
 ```
 
 
-## `copyright.txt`
+## `LICENCE`
 
-76 lines, 4491 bytes
+22 lines, 1074 bytes
 
-```text
-# COPYRIGHT.TXT — Copyright and Originality Declaration
-# sebbi.pro | Monop Content | Justin Antony Dobson
-# Published: June 2026
-# Linked to: sebbi.pro/ai.txt | sebbi.pro/dis.txt | sebbi.pro/legal.txt
-# Verification: sebbi.pro/api/verify-chain
+```
+MIT License
 
-## Automatic Copyright Notice
+Copyright (c) 2026 Monop (Blyth, UK)
 
-Under the Copyright, Designs and Patents Act 1988, copyright in an original work arises automatically upon creation. No registration is required. The following original works are the intellectual property of Justin Antony Dobson, trading as Monop Content, from the date of their creation.
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
 
-## Original Works Declared
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
 
-COPYRIGHT-001: OAAS-1.0 — Open AI Audit Standard
-The concept, structure, format, and specific wording of the Open AI Audit Standard, including the ai.txt declaration format, is an original work created by Justin Antony Dobson in June 2026. First published at sebbi.pro/ai.txt.
-
-COPYRIGHT-002: dis.txt — Disinformation Protection Standard
-The concept, structure, and format of a machine-readable disinformation protection declaration file linked to a cryptographic audit chain is an original work created by Justin Antony Dobson in June 2026. First published at sebbi.pro/dis.txt.
-
-COPYRIGHT-003: legal.txt — Legal Declaration Standard
-The concept, structure, and format of a machine-readable legal declaration file linked to a cryptographic audit chain is an original work created by Justin Antony Dobson in June 2026. First published at sebbi.pro/legal.txt.
-
-COPYRIGHT-004: copyright.txt — Copyright Declaration Standard
-The concept, structure, and format of this file is an original work created by Justin Antony Dobson in June 2026. First published at sebbi.pro/copyright.txt.
-
-COPYRIGHT-005: AILeash Platform
-The AILeash platform including its governance engine, 9-signal weighted scoring system, SHA-256 Merkle audit chain implementation, trust decay model, velocity tracking system, and sovereign deployment architecture is an original work created by Justin Antony Dobson between 2021 and 2026.
-
-COPYRIGHT-006: AILeash Guardian
-The AILeash Guardian child safety platform including its grooming detection methodology, parent PWA dashboard, and evidence chain implementation is an original work created by Justin Antony Dobson.
-
-COPYRIGHT-007: SonicBoom
-The SonicBoom speed and compliance layer concept and implementation is an original work created by Justin Antony Dobson.
-
-COPYRIGHT-008: AILeash Sentinel
-The AILeash Sentinel fraud and anomaly detection platform is an original work created by Justin Antony Dobson.
-
-## What Is Protected
-
-The following are protected by copyright and may not be reproduced, copied, or distributed without permission:
-
-- The specific wording, format, and structure of ai.txt, dis.txt, legal.txt, and copyright.txt
-- The source code of server.py, engine.py, and all associated platform files
-- The specific implementation of the SHA-256 Merkle chain audit system as built by Justin Antony Dobson
-- All HTML, CSS, and JavaScript files published at sebbi.pro
-- The OAAS-1.0 standard document published at sebbi.pro/ai-standard
-
-## What Is Not Restricted
-
-Others may:
-- Build their own AI compliance products using different code and different approaches
-- Implement the general concept of AI audit chains using their own implementations
-- Reference OAAS-1.0 provided they attribute authorship to Justin Antony Dobson
-
-Others may not:
-- Copy the specific format of these declaration files and present them as their own
-- Reproduce the source code of the AILeash platform without permission
-- Claim authorship or co-authorship of OAAS-1.0 or any of the above works
-
-## Prior Art Declaration
-
-This file, combined with the SHA-256 Merkle chain at sebbi.pro/api/verify-chain, constitutes a timestamped prior art declaration. The chain provides cryptographic proof of the date and content of all original works listed above.
-
-If any third party seeks to patent, trademark, or claim ownership of concepts substantially similar to those listed above after the publication date of this file, this declaration and the associated Merkle chain evidence will be submitted as prior art.
-
-## Linked Files
-
-ai.txt: https://sebbi.pro/ai.txt
-dis.txt: https://sebbi.pro/dis.txt
-legal.txt: https://sebbi.pro/legal.txt
-copyright.txt: https://sebbi.pro/copyright.txt
-Verification: https://sebbi.pro/api/verify-chain
-
-© 2026 Justin Antony Dobson / Monop Content
-Blyth, Northumberland, United Kingdom
-All rights reserved under the Copyright, Designs and Patents Act 1988.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 
 ```
 
 
-## `data-protection.html`
+## `README.md`
 
-123 lines, 12310 bytes
+277 lines, 15728 bytes
 
-```html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Data Protection &amp; Sovereignty Statement — Monop Content / AILeash</title>
-<meta name="description" content="What data the AILeash platform processes, what it deliberately never holds, where data lives, how long it is kept, and how data subject rights are handled.">
-<style>
-  :root{--ink:#0a0f1e;--ink2:#111a30;--line:#232d4a;--gold:#c9a84c;--gold-dim:#8a7838;--ok:#7fe3b0;--text:#e8e8f0;--muted:#c2c8dc;--faint:#5a6178}
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--ink);color:#fff;line-height:1.7;-webkit-font-smoothing:antialiased}
-  .wrap{max-width:720px;margin:0 auto;padding:26px 20px 90px}
-  a.back{color:var(--gold);text-decoration:none;font-size:13px;font-family:ui-monospace,Menlo,monospace;letter-spacing:.5px}
-  .eyebrow{font-family:ui-monospace,Menlo,monospace;font-size:10.5px;letter-spacing:2px;text-transform:uppercase;color:var(--gold-dim);margin:22px 0 10px}
-  h1{font-size:28px;font-weight:800;letter-spacing:-.5px;margin-bottom:10px;line-height:1.2}
-  h1 span{color:var(--gold)}
-  .meta{font-family:ui-monospace,Menlo,monospace;font-size:12px;color:var(--faint);margin-bottom:26px;line-height:1.9}
-  h2{font-size:19px;font-weight:800;margin:40px 0 8px;letter-spacing:-.3px}
-  h2 .n{color:var(--gold);font-family:ui-monospace,Menlo,monospace;font-size:13px;margin-right:8px}
-  p{font-size:14.5px;color:var(--muted);margin-bottom:13px}
-  p b{color:#fff}
-  ul{margin:0 0 14px 0;list-style:none}
-  li{position:relative;padding-left:20px;margin-bottom:9px;font-size:14px;color:var(--muted)}
-  li::before{content:'';position:absolute;left:0;top:9px;width:6px;height:6px;border-radius:50%;background:var(--gold)}
-  li b{color:#fff}
-  .honest{border:1px solid rgba(201,168,76,.35);background:rgba(201,168,76,.05);border-radius:12px;padding:16px 20px;margin:16px 0;font-size:13.5px;color:var(--muted);line-height:1.75}
-  .honest b{color:var(--gold)}
-  .green{border:1px solid rgba(127,227,176,.3);background:rgba(127,227,176,.05);border-radius:12px;padding:16px 20px;margin:16px 0;font-size:13.5px;color:var(--muted);line-height:1.75}
-  .green b{color:var(--ok)}
-  table{width:100%;border-collapse:collapse;font-size:13px;margin:14px 0}
-  th{padding:9px 10px;text-align:left;font-size:10.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--faint);border-bottom:2px solid var(--line)}
-  td{padding:10px;border-bottom:1px solid var(--line);vertical-align:top;color:var(--muted)}
-  td:first-child{color:#fff;font-weight:600}
-  hr{border:none;height:1px;background:linear-gradient(90deg,transparent,rgba(201,168,76,.25),transparent);margin:40px 0 0}
-  footer{margin-top:30px;text-align:center;font-size:12px;color:var(--faint);font-family:ui-monospace,Menlo,monospace}
-  footer a{color:var(--gold);text-decoration:none}
-</style>
-</head>
-<body>
-<div class="wrap">
-  <a class="back" href="/">&larr; sebbi.pro</a>
-  <div class="eyebrow">monop content · policy document · public</div>
-  <h1>Data Protection &amp;<br><span>Sovereignty Statement</span></h1>
-  <div class="meta">
-    Document: MC-POL-002 · Version 1.0 · Effective 20 July 2026<br>
-    Owner: Justin Dobson, Founder, Monop Content · Review cycle: quarterly, and on any material change to data handling<br>
-    Alignment: UK GDPR / EU GDPR · published at sebbi.pro/data-protection
-  </div>
+```markdown
+<div align="center">
 
-  <h2><span class="n">1.</span>The design principle: the safest data is the data we never hold</h2>
-  <p>AILeash is built on aggressive data minimisation. Wherever the platform can do its job with a cryptographic fingerprint instead of content, it holds only the fingerprint. This is not a bolted-on privacy feature — it is the architecture:</p>
-  <ul>
-    <li><b>The notaries</b> fingerprint content in the user's own browser. The document, post or bank details <b>never leave the user's device</b>; only the 64-character SHA-256 hash is transmitted and sealed. A hash cannot be reversed into the content it fingerprints.</li>
-    <li><b>KYC sealing</b> stores only the SHA-256 of the verification provider's reference — never the identity document, never the raw reference number, never the personal data the provider examined.</li>
-    <li><b>Guardian</b> never stores message content — only fingerprints of flagged exchanges, sufficient to prove later that a specific exchange existed in a specific form.</li>
-    <li><b>The decision engine</b> receives only the seven event fields the customer chooses to send. Customers are instructed (in the developer documentation and below) to send pseudonymous identifiers, not names or contact details.</li>
-  </ul>
+```
+        ┌─────────────────────────────────────────────────┐
+        │   s e b b i . p r o                              │
+        │                                                  │
+        │   O N E   C H A I N .   E V E R Y   P R O O F .   │
+        └─────────────────────────────────────────────────┘
+```
 
-  <h2><span class="n">2.</span>What we process, and why</h2>
-  <table>
-    <thead><tr><th>Data</th><th>Content</th><th>Purpose · lawful basis</th></tr></thead>
-    <tbody>
-      <tr><td>Governed events</td><td>user_id (customer-supplied identifier), action label, amount, country code, device_id, two 0–1 risk signals, optional authority token</td><td>Delivering the contracted decision and evidence service · performance of contract</td></tr>
-      <tr><td>Sealed chain records</td><td>Event, verdict, reasons, jurisdiction tag, timestamp, hashes</td><td>The tamper-evident evidence record that is the product itself · performance of contract; customers' legitimate interest in verifiable records</td></tr>
-      <tr><td>Account data</td><td>E-mail address, hashed API key, plan status, device counts</td><td>Account operation, alerts, billing · performance of contract</td></tr>
-      <tr><td>Billing data</td><td>Handled by Stripe; we hold no card numbers</td><td>Payment collection · performance of contract</td></tr>
-      <tr><td>Notary seals</td><td>SHA-256 fingerprints; for identity seals marked public, the limited display fields the user chooses to include; masked payment display fields</td><td>The public notarisation service · consent (the user submits the seal)</td></tr>
-      <tr><td>Contact messages</td><td>What the sender chooses to write</td><td>Responding · legitimate interest</td></tr>
-    </tbody>
-  </table>
-  <div class="honest"><b>Pseudonymisation is a shared responsibility, stated plainly:</b> the <code style="color:#7fe3b0">user_id</code> and <code style="color:#7fe3b0">device_id</code> fields are supplied by the customer. Our documentation instructs customers to send pseudonymous identifiers (e.g. <i>user_4471</i>), never names, e-mail addresses or other direct identifiers. Where a customer follows this, chain records contain no directly identifying personal data. Customers acting as controllers remain responsible for what they choose to transmit; Monop Content acts as processor for event data processed on customers' instructions.</div>
+### The tamper-evident evidence layer for AI decisions, payments, and records.
 
-  <h2><span class="n">3.</span>What we deliberately do not hold</h2>
-  <ul>
-    <li>No notarised content — documents, posts, messages and bank details are fingerprinted client-side and never transmitted.</li>
-    <li>No identity documents and no raw KYC references — hashes only.</li>
-    <li>No message content in Guardian — fingerprints only.</li>
-    <li>No card or bank account numbers — payments are processed by Stripe; the Payment Notary stores only user-chosen masked display fields.</li>
-    <li>No behavioural profiles beyond the per-user trust score the customer's own events generate, held against the customer's pseudonymous identifier.</li>
-    <li>No advertising, no analytics resale, no third-party data sharing of any kind. The business model is the platform fee; the data is not the product.</li>
-  </ul>
+*Every event sealed into a hash chain at the moment it happens —*
+*the decision, **and the basis it rested on** — unalterable by anyone. Including us.*
 
-  <h2><span class="n">4.</span>Where data lives, and the sovereign option</h2>
-  <p>The hosted platform runs on Railway cloud infrastructure with the database on a persistent encrypted volume; connections are TLS-encrypted in transit; backups are taken daily. Sub-processors are listed in §7. Hosting region details and current sub-processor terms are available on request at justin@monopcontent.com.</p>
-  <div class="green"><b>Full data sovereignty is a product option, not a promise:</b> organisations whose data cannot leave their own network can run the sovereign engine entirely on their own hardware — decisions, chain and database inside their building, licence validation fully offline, no phone-home. Under sovereign deployment, Monop Content processes nothing at all.</div>
+<br>
 
-  <h2><span class="n">5.</span>Retention — and the honest tension with an append-only chain</h2>
-  <p>Account and billing data are retained for the life of the account plus the period required by tax and accounting law. Contact messages are retained only as long as needed to respond.</p>
-  <p>Chain records require an honest explanation rather than a boilerplate one. The chain is append-only by design — its evidential value exists precisely because records cannot be deleted or altered. This is why the platform is architected so that chain records should contain <b>no directly identifying personal data</b>: fingerprints, pseudonymous identifiers and hashes are sealed; content and identities are not. Where a valid erasure request nonetheless touches sealed data (for example, display fields a user chose to make public on an identity seal), we honour it by erasing the stored display data while the cryptographic fingerprint — which identifies no one — remains in the chain. This preserves both the data subject's rights and the integrity of the record for everyone else.</p>
+[![live](https://img.shields.io/badge/live-sebbi.pro-c9a84c?style=for-the-badge)](https://sebbi.pro)
+[![verify the chain](https://img.shields.io/badge/verify_the_chain-open_endpoint-7fe3b0?style=for-the-badge)](https://sebbi.pro/api/verify-chain)
+[![seal something free](https://img.shields.io/badge/seal_something-free,_no_account-7cc8ff?style=for-the-badge)](https://sebbi.pro/seal)
 
-  <h2><span class="n">6.</span>Data subject rights</h2>
-  <p>Requests for access, rectification, erasure, restriction or portability go to <b>justin@monopcontent.com</b> and are answered within one calendar month. For event data processed on a customer's behalf, requests are handled with, and routed via, the customer as controller. UK data subjects may complain to the ICO; EU data subjects to their national supervisory authority.</p>
+**[Try it](https://sebbi.pro/seal)** · **[Verify it](https://sebbi.pro/verify)** · **[Read the code](https://sebbi.pro/brain)** · **[Developer docs](https://sebbi.pro/developers)** · **[Whitepaper](https://sebbi.pro/whitepaper)**
 
-  <h2><span class="n">7.</span>Sub-processors</h2>
-  <table>
-    <thead><tr><th>Provider</th><th>Purpose</th><th>Data touched</th></tr></thead>
-    <tbody>
-      <tr><td>Railway</td><td>Application hosting and database volume</td><td>All hosted-platform data at rest and in transit</td></tr>
-      <tr><td>Stripe</td><td>Billing and payment processing</td><td>Billing identity and payment card data (held by Stripe, not by us)</td></tr>
-      <tr><td>Brevo</td><td>Transactional e-mail (alerts, receipts, contact)</td><td>E-mail addresses and message content of e-mails sent</td></tr>
-    </tbody>
-  </table>
-  <p>Sub-processors will not be added or changed without this document being updated — and each revision of this document is fingerprinted and sealed into the chain, so its history is tamper-evident.</p>
-
-  <h2><span class="n">8.</span>Security measures, summarised</h2>
-  <ul>
-    <li>TLS for all connections; secrets held in environment variables, never in code or the repository.</li>
-    <li>Bearer-key authentication with per-key rate limits; HMAC-SHA256 signed tokens for challenges, authority and licences.</li>
-    <li>Single-lock, write-ahead-journaled database writes; the sealed chain makes any tampering — including by the operator — externally detectable.</li>
-    <li>Daily automated backups; deployment exclusively through version-controlled pipeline, so every production state is attributable.</li>
-  </ul>
-
-  <div class="honest"><b>Honest maturity statement:</b> Monop Content is an early-stage, single-operator company. This statement describes practices genuinely in operation today. We do not hold ISO 27001 or SOC 2 certification at this stage and will not imply otherwise; what we offer instead, unusually, is a platform whose core integrity claims any prospect can verify from outside before trusting us with anything.</div>
-
-  <hr>
-  <footer>
-    <p style="margin-top:20px"><a href="/">sebbi.pro</a> · <a href="/risk-policy">Risk Management Policy</a> · <a href="/human-oversight">Human Oversight Policy</a> · <a href="/whitepaper">Whitepaper</a> · <a href="/contact">Contact</a></p>
-    <p style="margin-top:8px;color:var(--faint)">Monop Content · Blyth, Northumberland, UK · justin@monopcontent.com</p>
-  </footer>
 </div>
-</body>
-</html>
+
+---
+
+> ### *A system that does not trust its own creator*
+> ### *is the only kind whose records qualify as evidence.*
+
+---
+
+## Don't read about it. Watch it work.
+
+Here is a **real** four-block chain. Every hash below is reproducible — same inputs, same seals, forever. Copy the recipe at the bottom and compute them yourself.
+
+```
+  #   EVENT                             RESULT      SEAL (SHA-256, truncated)
+  ─────────────────────────────────────────────────────────────────────────
+  1   system_regmap                     ALLOW       411ffd9a31a3d9f4…
+  2   seal_post: quarterly_report.pdf   NOTARISED   c7309616a9e92bc7…
+  3   govern: payment 9000 GBP          BLOCK       293181a2bc2dab88…
+  4   brain: approve supplier 88        ALLOW       6abba40eb964959e…
+  ─────────────────────────────────────────────────────────────────────────
+  genesis  9fd06d6fdc19761d…                         tip  6abba40eb964959e…
+```
+
+Now watch someone try to cover up that blocked £9,000 payment by flipping block 3 from **BLOCK** to **ALLOW**:
+
+```
+  block 3 altered  →  tip becomes  5e15bc5710426088…   ❌  ≠ 6abba40eb964959e…
+```
+
+**The tip changed. The forgery is exposed instantly, by arithmetic, to anyone — no account, no trust required.** That is the entire product in six lines. Everything below is detail.
+
+<details>
+<summary><b>▸ Reproduce every hash yourself (10 lines of Python)</b></summary>
+
+```python
+import hashlib, json
+seal = lambda prev, ts, ev, res, basis: hashlib.sha256(
+    json.dumps({"prev":prev,"ts":ts,"event":ev,"result":res,"basis":basis},
+               sort_keys=True).encode()).hexdigest()
+
+prev = hashlib.sha256(b"AILEASH_BRAIN_GENESIS|sebbi.pro|v5").hexdigest()
+chain = [("system_regmap","ALLOW","regmap-v7"),
+         ("seal_post: quarterly_report.pdf","NOTARISED","NO_BASIS"),
+         ("govern: payment 9000 GBP","BLOCK","invoice_4471|regmap-v7"),
+         ("brain: approve supplier 88","ALLOW","invoice_4471|regmap-v7")]
+ts = 1752940000
+for ev,res,basis in chain:
+    prev = seal(prev, ts, ev, res, basis); ts += 3600
+    print(prev[:16], "…", ev)
+# final line prints the tip: 6abba40eb964959e …
+```
+Change one character of one event and every seal after it changes. That's the whole idea.
+</details>
+
+---
+
+## Why this exists
+
+Every system keeps logs. Logs live in databases. Databases can be edited — by an attacker, an insider, or the operator itself. So an ordinary log only ever says *"this is what we currently claim happened."* It can never say *"and nobody changed it since."*
+
+Nobody notices the difference — until a regulator, a court, an insurer, or a customer asks for **proof**. Then *"our system recorded it"* and *"here is proof it wasn't changed"* become two very different sentences. Only the second carries weight.
+
+**sebbi.pro produces the second sentence — automatically, as a by-product of your system doing its normal work.**
+
+---
+
+## The chain, in one formula
+
+```
+seal(n) = SHA-256( seal(n−1) · timestamp · event · result · basis )
+```
+
+| Property | What it means |
+|---|---|
+| **Tamper-evident** | Each seal contains its predecessor. Alter history → every later seal fails, publicly. |
+| **Gapless receipts** | Every decision gets a sequence number in the same transaction. Edited records break the chain; **missing** records break the sequence. |
+| **Truncation-evident** | The tip is anchored per-write. Chop blocks off the end → the anchor breaks. |
+| **Basis-sealed** | Not just *what* was decided — *what it rested on*: sources, versions, ruleset. Same block. |
+| **Jurisdiction-tagged** | Every decision sealed with the regulatory frameworks that applied to it at that moment. |
+| **Fast** | Score + decide + seal + respond inline, **~28 ms** median. |
+| **Crash-safe** | WAL journaling, full-sync commits, single-lock seal path, no race window, daily backups. |
+
+> **The one honest boundary, stated up front:** basis-sealing proves **what** a decision relied on — not that it was **correct**. Cryptography verifies integrity, never truth. Any product claiming to prove correctness is misdescribing what maths can do. We won't.
+
+---
+
+## The products — one chain underneath all of them
+
+| | Product | What it does | Access |
+|---|---|---|---|
+| 🧠 | **Brain** | Instruction gate for AI. Blocks prompt injection, exfiltration, compliance-bypass, child-safety and destruction patterns — with unicode/obfuscation defences — and seals every decision + basis. Pure Python, runs on your machine. | **Free download** |
+| ⚡ | **SonicBoom** | Decision engine. Any event scored in ~28ms: ALLOW / CHALLENGE / BLOCK, plain-English reasons, sealed before it replies. Per-user trust learned over time — lost 8× faster than earned, so burst attacks destroy their own standing. Hosted human-oversight challenge flow, itself sealed. | API key |
+| 🔐 | **Delegation layer** | Signed authority tokens (who may approve, to what limit, until when — the grant itself sealed), provider-agnostic KYC result sealing (outcome provable, zero personal data held), and per-decision jurisdiction tagging. Article 14 human oversight as engineering. | API key |
+| 🛡️ | **Sentinel** | Fraud pattern + velocity detection: credential stuffing, card testing, country-jump takeovers. Flags sealed as evidence. | API key |
+| 👁️ | **Guardian** | Child-safety flags: grooming patterns (secrecy, isolation, channel-moving). Content never stored — only fingerprints. Every flag sealed for parents, platforms, authorities. | Platform |
+| 📝 | **Post Notary** | Prove exact text existed on a date, unchanged. | **Free, no account** |
+| 🆔 | **Identity Notary** | Prove a profile is the genuine original — kills impersonation. | **Free, no account** |
+| 💷 | **Payment Notary** | Stop invoice/APP fraud. Seal real bank details once; payers verify a code before funds move. MISMATCH → payment stops. The check itself is sealed. | **Free, no account** |
+
+**Privacy by design:** the notaries fingerprint content *locally*. Your content never leaves your device — only the 64-character hash is sealed. The KYC sealer keeps only the SHA-256 of the provider reference — never the document.
+
+---
+
+## The open standard — `ai.txt`
+
+Like `robots.txt` for crawlers and `security.txt` for researchers — **`ai.txt`** is a public, machine-readable declaration of how your AI is governed: decision model, audit method, regulations designed toward, human override. Its companion **`comply.txt`** declares the rulebook every instruction is subject to.
+
+Declarations are claims. **Sealing them into the chain makes them provable** — and their history tamper-evident.
+
+```
+  declaration  →  rulebook  →  enforcement
+     ai.txt        comply.txt      brain.py
+     "we claim"    "the rules"     "the code that proves it"
+```
+
+Publish yours at `/.well-known/ai.txt`. Read [ours](https://sebbi.pro/.well-known/ai.txt).
+
+---
+
+## The stack — how it all fits
+
+```
+  DECLARATION    ai.txt · comply.txt     what we claim, publicly
+       │
+  GATE           Brain                   instructions checked before the AI acts
+       │
+  DELEGATION     authority · identity ·  who may act, who they legally are,
+                 jurisdiction            which rules governed the moment
+       │
+  DECISION       SonicBoom               every event: allow / challenge / block
+       │
+  DETECTION      Sentinel · Guardian     attack patterns · child-safety patterns
+       │
+  PUBLIC ACCESS  the Notaries            the same chain, free, for anyone
+       │
+       ▼
+  ╔══════════════════════════════════════════════════════════════════╗
+  ║  EVIDENCE     the hash chain                                      ║
+  ║               everything above seals into here —                 ║
+  ║               action + basis + receipt · gapless · anchored ·    ║
+  ║               publicly verifiable · unalterable by anyone        ║
+  ╚══════════════════════════════════════════════════════════════════╝
+```
+
+**Evidence accrues as a by-product of the system working.** Nobody remembers to log anything. Nobody compiles an audit file before an inspection. The proof exists because the system ran — equally trustworthy whether the operator is honest or not. Which is the only kind of trustworthy that counts.
+
+---
+
+## Integrate in minutes
+
+```python
+# ── Notary: seal anything, free, no key. Content stays on your machine. ──
+import hashlib, requests
+fp = hashlib.sha256(content.encode()).hexdigest()
+requests.post("https://sebbi.pro/api/post/seal", json={"fingerprint": fp})
+#   → { sealed, seal, block_index, code }   ← keep the code; anyone can verify it
+
+# ── Decision engine: score + seal an event (API key) ──
+requests.post("https://sebbi.pro/api/govern",
+  headers={"Authorization":"Bearer YOUR_KEY"},
+  json={"user_id":"u1","action":"payment","amount":9000,
+        "country":"UK","device_id":"d1","anomaly":0,"device_risk":0})
+#   → ALLOW / CHALLENGE / BLOCK · reasons · jurisdiction tag · sealed hash · receipt_seq
+
+# ── Delegated authority: grant sealed, enforcement deterministic ──
+tok = requests.post("https://sebbi.pro/api/authority/issue",
+  headers={"Authorization":"Bearer YOUR_KEY"},
+  json={"user_id":"u1","role":"payments_approver",
+        "max_amount":5000,"ttl_hours":24}).json()["authority_token"]
+#   include as "authority_token" in govern events — over-limit or expired
+#   authority escalates the verdict with the reason sealed
+
+# ── KYC result: outcome provable, zero personal data held ──
+requests.post("https://sebbi.pro/api/identity/kyc-seal",
+  headers={"Authorization":"Bearer YOUR_KEY"},
+  json={"user_id":"u1","provider":"onfido","verified":True,
+        "reference":"chk_9f2"})
+#   → only the SHA-256 of the reference is stored — never the document
+
+# ── Brain: gate an instruction and seal its basis (free, local) ──
+from brain import BrainGovernor
+BrainGovernor().evaluate("approve payment to supplier 88", basis={
+  "sources":["invoice_4471.pdf"], "source_versions":["sha256:ab12…"],
+  "ruleset":"AI-TXT/1.0 + EU-AI-Act-2024/1689", "ruleset_version":"regmap-v7"})
+```
+
+Full reference → **[sebbi.pro/developers](https://sebbi.pro/developers)**
+
+---
+
+## What this evidences — stated precisely
+
+A versioned, hash-sealed **regulation map** links each capability to the obligations it helps evidence: EU AI Act record-keeping, transparency & human-oversight (Articles 9, 12, 13, 14 — delegated-authority tokens directly supporting Article 14's attributable human oversight), UK Online Safety Act duty-of-care documentation, ICO Children's Code. Jurisdiction tagging extends this to the per-decision level: every sealed block records which frameworks applied at the moment of decision.
+
+These tools help you **evidence** your obligations — tamper-evident, explainable, independently verifiable records of what your systems decided and why. **They do not, on their own, make you compliant. No software does. Anyone who says otherwise is selling you something.**
+
+---
+
+## Honest limits — because the whole product is honesty
+
+- **Sealing proves integrity, not truth** — exact content, exact time, unchanged. Not that it was true or agreed to.
+- **Basis-sealing proves what was relied on, not that it was right** — cryptography can't verify the real world.
+- **Authority tokens prove the grant, not the wisdom** — who was empowered, to what limit, until when. Not that granting it was a good idea.
+- **Jurisdiction tagging records applicable frameworks; it does not decide law** — courts do that. It is a versioned, sealed lookup — nothing grander, deliberately.
+- **Brain's filter is a first line, not a wall** — known patterns caught; novel phrasing can pass. The guarantee is the sealed record.
+- **Fingerprints match exact content** — a re-encoded copy or paraphrase won't match.
+- **We evidence compliance; we don't confer it.**
+
+*A vendor who states their limits is giving you the strongest available evidence of how they'll behave when it matters.*
+
+---
+
+## Deployment & pricing
+
+- **Cloud** — a few lines against the hosted API. Notaries and Brain free forever.
+- **Sovereign** — the whole engine inside your own network. Offline HMAC-signed 365-day licences, no phone-home, air-gap ready.
+- **50p per active device / month.** Partners set their own pricing above the platform fee.
+
+## Investors
+
+The whitepaper carries a dedicated investor section — market timing (EU AI Act, August 2026), the metered per-device model, the moat, and the stage stated honestly: **[sebbi.pro/whitepaper](https://sebbi.pro/whitepaper)** · justin@monopcontent.com
+
+---
+
+<div align="center">
+
+## Check us. Don't trust us.
+
+*That's not a slogan. It's the design requirement — and the only standard by which an evidence layer should ever be judged.*
+
+**[Verify the chain now →](https://sebbi.pro/api/verify-chain)**
+
+<br>
+
+```
+  Built by Justin Dobson · Monop Content · Blyth, Northumberland, UK
+  Solo-built, from scratch, on a phone —
+  because the evidence layer wasn't going to build itself.
+```
+
+[LinkedIn](https://www.linkedin.com/in/justin-dobson-037721217) · [sebbi.pro](https://sebbi.pro)
+
+</div>
+
+<!--
+Keywords: tamper-evident audit trail · AI governance · AI compliance evidence ·
+EU AI Act record keeping · hash chain audit log · APP fraud prevention ·
+invoice verification · prompt injection defence · AI decision audit ·
+delegated authority tokens · KYC evidence sealing · jurisdiction tagging ·
+ai.txt standard · comply.txt · cryptographic proof of action · immutable audit log ·
+agentic AI governance · sovereign AI deployment · SonicBoom · Brain · Sentinel · Guardian
+-->
 
 ```
