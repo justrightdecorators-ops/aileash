@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-123 files across 30 parts.
+122 files across 30 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -112,7 +112,6 @@ Generated automatically on every push. Do not edit by hand.
 ## [CODEBASE-17.md](CODEBASE-17.md)
 
 - `brain.py`
-- `build_pyramid.py`
 - `gateway_proxy.py`
 - `meshwitness.py`
 - `sebbi_sdk.py`
