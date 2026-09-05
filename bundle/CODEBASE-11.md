@@ -2086,24 +2086,16 @@ def handle(method, action, data, api_key, ctx):
 
 ## `modules/sebbi_engine.py`
 
-52 lines, 1580 bytes
+58 lines, 1757 bytes
 
 ```python
 # modules/sebbi_engine.py
 """
-Minimal, non-invasive module for AILeash.
+AILeash module for /x/sebbi_engine/verify
 
-Provides a route(handler, path, qs_or_data) function so the existing server
-(which forwards /x/* to modules.router) will call this code for
-/x/sebbi_engine/verify. This file is intentionally tiny and has no side
-effects other than returning a JSON payload.
-
-Environment variables:
-- SEAL_PHRASE (default: "APEX_ENGINE_SEAL")
-- TOKEN_BUDGET (default: 66000)
-- MODULE_NAME (default: "sebbi_engine")
-
-Return: (payload_dict, http_status_int)
+Exposes `handle(method, action, data, api_key, ctx)` as required by
+modules/router.py. This file is deliberately minimal and public for GET /verify
+so it can be machine-checked without an API key. No state is modified.
 """
 
 import os
@@ -2114,16 +2106,29 @@ MODULE_NAME = os.environ.get("MODULE_NAME", "sebbi_engine")
 DEFAULT_SEAL_PHRASE = "APEX_ENGINE_SEAL"
 DEFAULT_TOKEN_BUDGET = 66000
 
+# Allow GET /verify without an API key
+PUBLIC = {("GET", "verify")}
 
-def route(handler, path, qs_or_data):
-    """Handle /x/sebbi_engine/verify requests.
 
-    The server calls modules.router.route(self, path, qs) or with data for POSTs.
-    We accept either and return (payload, status_code). Do not alter any state.
+def handle(method, action, data, api_key, ctx):
+    """Handle module routes. Called from modules/router.route().
+
+    Args:
+        method: HTTP method string (e.g., 'GET')
+        action: action part of the path (e.g., 'verify' for /x/sebbi_engine/verify)
+        data: parsed query/body
+        api_key: provided API key or None
+        ctx: context dict with 'conn','lock','seal', etc. (unused)
+
+    Returns:
+        (payload_dict, http_status_int)
     """
-    # Normalize the expected path
-    if path != "/x/sebbi_engine/verify":
+    # Only support GET /verify for now
+    if action != "verify":
         return {"error": "not_found"}, 404
+
+    if method != "GET":
+        return {"error": "method_not_allowed"}, 405
 
     seal_phrase = os.environ.get("SEAL_PHRASE", DEFAULT_SEAL_PHRASE).encode("utf-8")
     try:
@@ -2137,6 +2142,7 @@ def route(handler, path, qs_or_data):
         "status": "sealed",
         "token_budget": token_budget,
         "state_validation": digest,
+        # include a machine-friendly checked timestamp
         "checked_at": int(time.time()),
     }
     return payload, 200
