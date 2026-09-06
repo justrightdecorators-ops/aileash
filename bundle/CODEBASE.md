@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-125 files across 31 parts.
+126 files across 31 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -69,6 +69,7 @@ Generated automatically on every push. Do not edit by hand.
 
 - `modules/register.py`
 - `modules/replay.py`
+- `modules/reset.py`
 
 ## [CODEBASE-12.md](CODEBASE-12.md)
 
