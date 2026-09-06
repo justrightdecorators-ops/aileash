@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-123 files across 30 parts.
+122 files across 30 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -184,7 +184,6 @@ Generated automatically on every push. Do not edit by hand.
 
 - `pack.html`
 - `pay-check.html`
-- `registry.html`
 - `report-threat.html`
 - `requirements.txt`
 
