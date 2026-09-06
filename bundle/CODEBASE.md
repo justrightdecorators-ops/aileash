@@ -66,7 +66,7 @@ Generated automatically on every push. Do not edit by hand.
 
 ## [CODEBASE-11.md](CODEBASE-11.md)
 
-- `modules/registry.py`
+- `modules/register.py`
 - `modules/replay.py`
 - `modules/roster.py`
 - `modules/router.py`

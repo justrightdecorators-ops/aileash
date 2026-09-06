@@ -1,13 +1,13 @@
 # Codebase — part 11 of 30
 
 Contains:
-- `modules/registry.py`
+- `modules/register.py`
 - `modules/replay.py`
 - `modules/roster.py`
 - `modules/router.py`
 
 
-## `modules/registry.py`
+## `modules/register.py`
 
 1287 lines, 50021 bytes
 
