@@ -1,1248 +1,2322 @@
-# Codebase — part 14 of 31
+# Codebase — part 14 of 30
 
 Contains:
-- `modules/sortition.py`
-- `modules/spec.py`
-- `modules/standard.py`
-- `modules/stats.py`
+- `modules/tokensaver.py`
+- `modules/verifier.py`
 
 
-## `modules/sortition.py`
+## `modules/tokensaver.py`
 
-789 lines, 33138 bytes
+1670 lines, 64529 bytes
 
 ```python
+#!/usr/bin/env python3
 """
-sortition.py - selection by lot. The operator stops choosing who gets audited.
+modules/tokensaver.py  v2.0.0
+sebbi.pro - the token saver
 
-THE HOLE THIS FILLS
--------------------
-Every system claiming human oversight reviews a sample of decisions. In
-every one of them, the operator picks the sample. So the sample proves
-nothing: you can review the easy ones, or the ones you already know are
-clean, and nobody outside can tell the difference. It is the softest spot
-in every Article 14 claim in the industry, and it has stayed soft because
-there was no alternative.
+Reached at /x/tokensaver/<action>.
 
-There is one now. heartbeat.py seals a public beacon value on a cadence -
-a number nobody, including the operator, can know before its tick. That is
-a dice roll no one owns.
+WHAT IT IS
+----------
+A deterministic gate that sits in front of a model and decides, in
+arithmetic alone, whether a request is answered from store, sent to the
+model, sent to a cheaper one, held for a person, or refused.
 
-THE THREE LOCKS, IN ORDER. THE ORDER IS THE WHOLE POINT.
---------------------------------------------------------
-1. COMMIT THE POOL. Every record eligible for review in a period is
-   listed, hashed into one pool digest, and sealed. The pool is now fixed.
-2. WAIT FOR A TICK. The draw may only use a beacon value sealed AFTER the
-   pool commit. This module refuses otherwise. So the pool was fixed
-   before the dice existed, and cannot be edited once they do.
-3. DRAW. The beacon value deterministically ranks the pool. The lowest k
-   ranks are selected. Anyone can recompute it from public values.
+It also tells the caller, on every single request, exactly what in that
+request is costing money that it does not need to cost.
 
-Break any one and the sample is choosable again. Enforced here, not
-promised.
+Every decision seals into the platform chain. The saving is a receipt,
+not a claim.
 
-WHAT IT CATCHES
+HOW IT IS BUILT
 ---------------
-A selected record with no review sealed against it is a permanent, visible
-hole with a name on it. You cannot quietly skip an awkward case, because
-the case was chosen for you in public, and its absence is the evidence.
+Three layers, in this order, because a cost gate that depends entirely
+on tuned weights is a cost gate nobody can defend in a meeting.
 
-Refusal is allowed and is not hidden - it is sealed as a refusal with a
-reason. An honest refusal on the record is worth more than a silent gap.
+  Layer 1  HARD RULES
+           Absolute, arithmetic, untunable. A budget that is spent is
+           spent. A request repeating identically eight times is a
+           runaway. These do not consult the score at all.
 
-THE SELECTION FUNCTION, PUBLISHED SO IT IS NOT OURS
----------------------------------------------------
-  seed = SHA256("AILEASH-SORTITION-v1" | period | pool_digest | beacon_value)
-  rank(i) = SHA256(seed | ":" | record_hash_i)
-  selected = the k records with the lowest rank, ties by record hash
+  Layer 2  THE SCORE
+           Nine weighted signals summing to exactly 1.00, split into
+           the ones that measure what this request will SPEND and the
+           ones that measure whether that spend is WASTE.
 
-No random number generator, no language-specific behaviour, no library.
-Ten lines in any language. A stranger recomputes it and either gets our
-list or catches us.
+  Layer 3  FINDINGS
+           Named, itemised waste inside the request, each with a token
+           figure attached and each marked exact or estimated. This is
+           the part that saves the most money, because it changes what
+           the caller sends next time.
 
-WHAT THIS DOES NOT DO
----------------------
-- It does not prove the reviews were any good. It proves nobody chose
-  which ones happened.
-- It does not stop an operator declining to draw at all. A period with no
-  draw is a period with no sample, and /outstanding says so.
-- Pool membership is asserted by this server. What stops a record being
-  left out of the pool is complete.py, which commits the period's record
-  count in advance - separate module, separate check.
-- Selection is uniform. Risk-weighted sampling is deliberately not offered:
-  a weighting the operator sets is a choice the operator made.
+THREE TIERS OF CERTAINTY, NEVER MIXED
+-------------------------------------
+  tokens_not_bought          EXACT. Provider-reported counts on a
+                             request that was served from store.
+                             This is the only number that goes in a
+                             savings total.
 
-Contract: handle(method, action, data, api_key, ctx) -> (dict, status)
-Routes:
-  GET  spec         public  what this is and the exact selection function
-  GET  draws        public  every draw ever made
-  GET  draw         public  ?id= - one draw, its beacon value, its selection
-  GET  verify       public  ?id= - recompute the draw from scratch, here
-  GET  outstanding  public  selected records with no review yet, and how late
-  GET  status       public  coverage, response rate, oldest unanswered
-  POST pool         keyed   commit the pool for a period
-  POST draw         keyed   draw a sample against a sealed beacon tick
-  POST review       keyed   record a review, or a refusal with a reason
+  worst_case_tokens_avoided  A CEILING, not a saving. When a request
+                             is refused, max_tokens tells you the most
+                             it could have cost. Reported separately
+                             and never added to the exact figure.
+
+  findings tokens            ESTIMATED where marked. Character counts
+                             divided by four. Never enters any total.
+
+Nothing on this page is ever expressed as a percentage saved.
+
+WHAT IT DOES NOT DO
+-------------------
+- It never calls a model to reach a decision. Every signal is
+  arithmetic on the request itself.
+- It only serves a stored answer for an IDENTICAL request. Matching
+  similar prompts needs an embedding, which is a model call, which
+  would defeat the entire point.
+- It does not judge whether a stored answer is still correct.
+- It does not store answers to requests that asked for varied output,
+  unless the caller overrides that deliberately.
+
+MODULE CONTRACT
+---------------
+handle(method, action, data, api_key, ctx) -> (dict, status)
+PUBLIC is a set of (METHOD, action) tuples.
+ctx exposes conn, lock and seal.
 """
 
-import json
-import time
 import hashlib
+import inspect
+import json
+import math
+import sqlite3
+import threading
+import time
 
-VERSION = "1.1.0"
+VERSION = "2.2.0"
 
 PUBLIC = {
     ("GET", "spec"),
-    ("GET", "draws"),
-    ("GET", "draw"),
+    ("GET", "stats"),
     ("GET", "verify"),
-    ("GET", "outstanding"),
-    ("GET", "status"),
 }
 
-DOMAIN_SEED = b"AILEASH-SORTITION-v1"
-DOMAIN_POOL = b"AILEASH-POOL-v1"
+# ============================================================ layer 1
+# Hard rules. Absolute. Not weights, not tunable by score band.
 
-DEFAULT_RATE = 0.05          # 5 percent
-MIN_SELECT = 1
-MAX_SELECT = 500
-MAX_POOL = 200000
-REVIEW_DUE_HOURS = 72
+LOOP_WINDOW = 120          # seconds a repeat still counts as a repeat
+LOOP_HARD = 8              # identical repeats in the window = runaway
+LOOP_HARD_UNATTENDED = 4   # lower bar when no human is watching
+BURST_HARD = 120           # requests in 60s from one key = runaway
 
-DDL = [
-    """CREATE TABLE IF NOT EXISTS sortition_pool (
-        id           INTEGER PRIMARY KEY AUTOINCREMENT,
-        period       TEXT NOT NULL,
-        pool_digest  TEXT NOT NULL,
-        pool_size    INTEGER NOT NULL,
-        members      TEXT NOT NULL,
-        committed_at REAL NOT NULL,
-        chain_rowid  INTEGER,
-        audit_hash   TEXT
-    )""",
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_sort_pool ON sortition_pool(period)",
-    """CREATE TABLE IF NOT EXISTS sortition_draw (
-        id            INTEGER PRIMARY KEY AUTOINCREMENT,
-        period        TEXT NOT NULL,
-        pool_id       INTEGER NOT NULL,
-        pool_digest   TEXT NOT NULL,
-        pool_size     INTEGER NOT NULL,
-        rate          REAL NOT NULL,
-        select_count  INTEGER NOT NULL,
-        beacon_source TEXT,
-        beacon_round  INTEGER,
-        beacon_value  TEXT NOT NULL,
-        beacon_rowid  INTEGER,
-        seed          TEXT NOT NULL,
-        selected      TEXT NOT NULL,
-        drawn_at      REAL NOT NULL,
-        chain_rowid   INTEGER,
-        audit_hash    TEXT
-    )""",
-    """CREATE TABLE IF NOT EXISTS sortition_review (
-        id           INTEGER PRIMARY KEY AUTOINCREMENT,
-        draw_id      INTEGER NOT NULL,
-        record_hash  TEXT NOT NULL,
-        outcome      TEXT NOT NULL,
-        reviewer     TEXT,
-        reason       TEXT,
-        recorded_at  REAL NOT NULL,
-        chain_rowid  INTEGER,
-        audit_hash   TEXT
-    )""",
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_sort_rev ON sortition_review(draw_id, record_hash)",
-]
+# ============================================================ layer 2
+# Nine signals. Base weights MUST sum to exactly 1.00.
+#
+# What this request will SPEND ......................... 0.62
+W_EXPOSURE = 0.18   # worst case spend against remaining budget
+W_SIZE = 0.14       # prompt characters
+W_ASK = 0.14        # max_tokens ceiling the caller authorised
+W_DEPTH = 0.10      # conversation turns, re-sent on every call
+W_TOOLS = 0.06      # tool definitions, re-sent on every call
+#
+# Whether that spend is WASTE .......................... 0.38
+W_LOOP = 0.16       # the same request going round again
+W_BURST = 0.09      # requests in the last 60 seconds
+W_GRIND = 0.07      # requests in the last hour
+W_NOVELTY = 0.06    # first time this shape has been seen
 
-OUTCOMES = ("agreed", "disagreed", "escalated", "refused")
+BASE_SUM = (W_EXPOSURE + W_SIZE + W_ASK + W_DEPTH + W_TOOLS
+            + W_LOOP + W_BURST + W_GRIND + W_NOVELTY)
 
-VOCABULARY = {
-    "pool": "Every record eligible for review in a period, fixed and sealed before any dice exist.",
-    "draw": "The selection, computed from a beacon value that did not exist when the pool was sealed.",
-    "selected": "Chosen by the beacon, not by us. We could not have known which.",
-    "outstanding": "Selected and not yet answered. Visible, named, and counting.",
-    "refused": "Declined on the record with a reason. Not a gap - a decision that is now permanent.",
-    "gap": "Selected, past due, and never answered. The thing this module exists to make impossible to hide.",
-}
+# Sits outside the base sum, deliberately.
+W_UNATTENDED = 0.10
 
-WHAT_THIS_PROVES = (
-    "That nobody chose which records were reviewed. It does not prove the "
-    "reviews were competent, honest or useful. Those are different problems "
-    "and this module does not touch them."
+BAND_CHALLENGE = 0.55
+BAND_BLOCK = 0.80
+
+SAT_LOOP = 5
+SAT_BURST = 20
+SAT_GRIND = 200
+SAT_SIZE = 100_000
+SAT_ASK = 8_000
+SAT_DEPTH = 40
+SAT_TOOLS = 24
+
+# A request only earns the cheap model by being genuinely small.
+# Suspicion never routes a request to a weaker model.
+CHEAP_MAX_CHARS = 4_000
+CHEAP_MAX_TURNS = 6
+CHEAP_MAX_ASK = 1_000
+CHEAP_MAX_SCORE = 0.30
+
+W60 = 60
+W1H = 3600
+
+# ============================================================ layer 3
+CTX_KEEP_TURNS = 8          # turns beyond this are flagged as carried
+CTX_FLAG_TURNS = 12         # only flag once the conversation is this deep
+SYSTEM_FLAG_CHARS = 2_000
+CHARS_PER_TOKEN = 4.0       # the estimate, used only in findings
+
+DEFAULT_TTL = 30 * 24 * 3600
+MAX_STORED_BYTES = 512 * 1024
+MAX_PROMPT_CHARS = 2_000_000
+
+KEYED_FIELDS = (
+    "model", "messages", "system", "prompt", "input",
+    "temperature", "top_p", "top_k",
+    "max_tokens", "max_completion_tokens",
+    "stop", "stop_sequences",
+    "tools", "tool_choice", "response_format", "seed",
 )
 
+VOCABULARY = {
+    "SERVE": "answered from an identical earlier request; nothing was bought",
+    "ALLOW": "send it to the model as asked",
+    "DOWNGRADE": "small and simple enough for the cheap model",
+    "CHALLENGE": "hold it for a person before spending",
+    "BLOCK": "refused; it never reaches the model, so no completion is paid for",
+}
 
-# ---------------------------------------------------------------------
-# helpers
-# ---------------------------------------------------------------------
-
-def _ensure(conn, lock):
-    with lock:
-        cur = conn.cursor()
-        for stmt in DDL:
-            cur.execute(stmt)
-        conn.commit()
-
-
-def _cols(conn, table):
-    cur = conn.cursor()
-    cur.execute("PRAGMA table_info(%s)" % table)
-    return [r[1] for r in cur.fetchall()]
-
-
-def _hash_col(conn):
-    c = _cols(conn, "audit_log")
-    for n in ("audit_hash", "hash", "block_hash"):
-        if n in c:
-            return n
-    return None
+LIMITS = [
+    "Matching is exact. A reworded prompt is a different request and goes "
+    "to the model.",
+    "Savings totals use only token counts the provider itself reported. "
+    "Nothing in a total is estimated.",
+    "A refused request has a worst case cost, not a known cost. It is "
+    "reported separately and never added to the savings total.",
+    "Token figures inside findings are estimated from character counts and "
+    "are marked as estimates. They never enter a total.",
+    "A stored answer is returned unchanged. This module does not judge "
+    "whether it is still correct.",
+    "No model is called to reach any decision here.",
+]
 
 
-def _ts_col(conn):
-    c = _cols(conn, "audit_log")
-    for n in ("ts", "timestamp", "created", "observed"):
-        if n in c:
-            return n
-    return None
+# --------------------------------------------------------------- helpers
+
+def _canonical(obj):
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=True).encode("utf-8")
 
 
-def _period_bounds(period):
-    """YYYY, YYYY-MM, YYYY-MM-DD -> (start_epoch, end_epoch) UTC."""
-    p = str(period).strip()
+def _sha(data):
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    return hashlib.sha256(data).hexdigest()
+
+
+def _fingerprint(req):
+    keyed = {k: req[k] for k in KEYED_FIELDS if k in req}
+    return _sha(b"SEBBI-TOKENSAVER-v2\n" + _canonical(keyed))
+
+
+def _content_chars(v):
+    if v is None:
+        return 0
+    if isinstance(v, str):
+        return len(v)
+    return len(_canonical(v))
+
+
+def _prompt_chars(req):
+    total = 0
+    for key in ("prompt", "input", "system"):
+        total += _content_chars(req.get(key))
+    msgs = req.get("messages")
+    if isinstance(msgs, list):
+        for m in msgs:
+            total += _content_chars(m.get("content") if isinstance(m, dict) else m)
+    tools = req.get("tools")
+    if tools is not None:
+        total += _content_chars(tools)
+    return total
+
+
+def _est_tokens(chars):
+    """Estimate only. Marked as such everywhere it appears."""
+    return int(chars / CHARS_PER_TOKEN)
+
+
+def _ask_ceiling(req):
+    """The caller's own authorised output ceiling. Exact, not estimated."""
+    v = req.get("max_tokens")
+    if v is None:
+        v = req.get("max_completion_tokens")
     try:
-        if len(p) == 4:
-            s = time.strptime(p + "-01-01", "%Y-%m-%d")
-            e = time.strptime(str(int(p) + 1) + "-01-01", "%Y-%m-%d")
-        elif len(p) == 7:
-            s = time.strptime(p + "-01", "%Y-%m-%d")
-            y, m = int(p[:4]), int(p[5:7])
-            y2, m2 = (y + 1, 1) if m == 12 else (y, m + 1)
-            e = time.strptime("%04d-%02d-01" % (y2, m2), "%Y-%m-%d")
-        elif len(p) == 10:
-            s = time.strptime(p, "%Y-%m-%d")
-            e = time.gmtime(_cal(s) + 86400)
-        else:
-            return None
-    except ValueError:
-        return None
-    return _cal(s), _cal(e)
+        return int(v) if v is not None else 0
+    except (TypeError, ValueError):
+        return 0
 
 
-def _cal(st):
-    import calendar
-    return calendar.timegm(st)
+def _shape(req):
+    n = len(req.get("messages") or [])
+    t = len(req.get("tools") or [])
+    band = int(math.log10(max(_prompt_chars(req), 1)) * 2)
+    return _sha("%s|%d|%d|%d" % (req.get("model") or "", n, t, band))
 
 
-def _iso(t):
-    if t is None:
-        return None
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
-
-
-def _human(seconds):
-    if seconds is None:
-        return None
-    s = int(round(seconds))
-    if s < 60:
-        return "%d seconds" % s
-    if s < 3600:
-        return "%d minutes" % (s // 60)
-    if s < 86400:
-        return "%d hours %d minutes" % (s // 3600, (s % 3600) // 60)
-    return "%d days %d hours" % (s // 86400, (s % 86400) // 3600)
-
-
-def _pool_digest(members):
-    h = hashlib.sha256()
-    h.update(DOMAIN_POOL + b"\n")
-    for m in members:
-        h.update(m.encode() + b"\n")
-    return h.hexdigest()
-
-
-def _seed(period, pool_digest, beacon_value):
-    h = hashlib.sha256()
-    h.update(DOMAIN_SEED + b"|")
-    h.update(str(period).encode() + b"|")
-    h.update(pool_digest.encode() + b"|")
-    h.update(str(beacon_value).encode())
-    return h.hexdigest()
-
-
-def select(members, seed, k):
-    """The published selection function. Deterministic, no RNG."""
-    ranked = []
-    for m in members:
-        r = hashlib.sha256((seed + ":" + m).encode()).hexdigest()
-        ranked.append((r, m))
-    ranked.sort()
-    return [m for _, m in ranked[:k]]
-
-
-def _seal(ctx, action, payload):
-    """Seal through the host's seal().
-
-    server.py: seal(event, result, ts, api_key=None) where EVENT IS A DICT
-    carrying user_id (subscripted inside), returning
-    (audit_hash, block_index, key_seq).
-    """
-    fn = ctx.get("seal")
-    if fn is None:
-        return None, None
-    ts = time.time()
-    event = {"user_id": "sortition", "action": action, "amount": 0,
-             "country": "UK", "device_id": "sortition", "anomaly": 0,
-             "device_risk": 0}
-    result = dict(payload)
-    result.setdefault("decision", "SORTITION")
-    result.setdefault("score", 0)
-    result.setdefault("version", VERSION)
-    result.setdefault("timestamp", ts)
-    for call in (lambda: fn(event, result, ts),
-                 lambda: fn(event, result, ts, None),
-                 lambda: fn(event, result)):
-        try:
-            out = call()
-        except TypeError:
-            continue
-        except Exception:
-            return None, None
-        h = idx = None
-        if isinstance(out, (tuple, list)):
-            for item in out:
-                if isinstance(item, str) and len(item) == 64 and h is None:
-                    h = item
-                elif isinstance(item, int) and idx is None:
-                    idx = item
-        elif isinstance(out, str):
-            h = out
-        return h, idx
-    return None, None
-
-
-def _backfill(conn, lock, table, rowid_field, pk):
-    hcol = _hash_col(conn)
-    with lock:
-        cur = conn.cursor()
-        cur.execute("SELECT MAX(rowid) FROM audit_log")
-        r = cur.fetchone()
-        rid = r[0] if r and r[0] is not None else None
-        h = None
-        if rid is not None and hcol:
-            cur.execute("SELECT %s FROM audit_log WHERE rowid=?" % hcol, (rid,))
-            r2 = cur.fetchone()
-            h = r2[0] if r2 else None
-        cur.execute("UPDATE %s SET chain_rowid=?, audit_hash=? WHERE id=?" % table,
-                    (rid, h, pk))
-        conn.commit()
-    return rid, h
-
-
-def _latest_beat_after(conn, rowid):
-    """The first heartbeat sealed strictly after a given chain row."""
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT source, beacon_round, value, chain_rowid, fetched_at"
-            " FROM heartbeat_tick WHERE chain_rowid IS NOT NULL AND chain_rowid>?"
-            " ORDER BY chain_rowid DESC LIMIT 1", (rowid,))
-        return cur.fetchone()
-    except Exception:
-        return None
-
-
-def _beats_available(conn):
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM heartbeat_tick")
-        return cur.fetchone()[0]
-    except Exception:
-        return None
-
-
-# ---------------------------------------------------------------------
-# handle
-# ---------------------------------------------------------------------
-
-def handle(method, action, data, api_key, ctx):
-    conn, lock = ctx["conn"], ctx["lock"]
-    _ensure(conn, lock)
-
-    if method == "GET" and action == "spec":
-        return _spec(), 200
-
-    # -------------------------------------------------- pool
-    if method == "POST" and action == "pool":
-        period = data.get("period")
-        bounds = _period_bounds(period) if period else None
-        if not bounds:
-            return {"error": "period_required",
-                    "formats": ["YYYY", "YYYY-MM", "YYYY-MM-DD"]}, 400
-        start, end = bounds
-        if end > time.time():
-            return {"error": "period_not_closed",
-                    "note": ("A pool can only be committed for a period that "
-                             "has ended. Committing a live period would let "
-                             "records arrive after the pool was fixed."),
-                    "period_ends": _iso(end)}, 409
-
-        hcol, tcol = _hash_col(conn), _ts_col(conn)
-        if not hcol or not tcol:
-            return {"error": "audit_log_schema_unrecognised"}, 500
-
-        cur = conn.cursor()
-        kind = data.get("event")
-        if kind:
-            cur.execute(
-                "SELECT %s FROM audit_log WHERE %s>=? AND %s<? AND event=?"
-                " ORDER BY rowid" % (hcol, tcol, tcol), (start, end, kind))
-        else:
-            cur.execute(
-                "SELECT %s FROM audit_log WHERE %s>=? AND %s<? ORDER BY rowid"
-                % (hcol, tcol, tcol), (start, end))
-        members = sorted({r[0] for r in cur.fetchall() if r[0]})
-        if not members:
-            return {"error": "empty_period", "period": period}, 404
-        if len(members) > MAX_POOL:
-            return {"error": "pool_too_large", "size": len(members),
-                    "max": MAX_POOL}, 413
-
-        digest = _pool_digest(members)
-        now = time.time()
-        with lock:
-            cur = conn.cursor()
-            cur.execute("SELECT id, pool_digest FROM sortition_pool WHERE period=?",
-                        (period,))
-            prior = cur.fetchone()
-            if prior:
-                return {"error": "pool_already_committed", "period": period,
-                        "pool_digest": prior[1],
-                        "note": "A pool commits once. That is what makes it a pool."}, 409
-            cur.execute(
-                "INSERT INTO sortition_pool (period, pool_digest, pool_size,"
-                " members, committed_at) VALUES (?,?,?,?,?)",
-                (period, digest, len(members), json.dumps(members), now))
-            pid = cur.lastrowid
-            conn.commit()
-
-        sh, sidx = _seal(ctx, "sortition_pool", {
-            "period": period, "pool_digest": digest, "pool_size": len(members),
-            "event_filter": kind,
-            "note": ("Pool fixed. Any draw against it must use a beacon value "
-                     "sealed after this block."),
-        })
-        rid, h = (sidx, sh) if (sidx and sh) else _backfill(conn, lock, "sortition_pool", "chain_rowid", pid)
-        if sidx and sh:
-            with lock:
-                conn.execute("UPDATE sortition_pool SET chain_rowid=?, audit_hash=? WHERE id=?", (rid, h, pid))
-                conn.commit()
-
-        return {"pool_id": pid, "period": period, "pool_digest": digest,
-                "pool_size": len(members), "sealed_at_chain_rowid": rid,
-                "audit_hash": h,
-                "next": ("Wait for a heartbeat sealed after block %s, then "
-                         "POST /x/sortition/draw." % rid)}, 200
-
-    # -------------------------------------------------- draw
-    if method == "POST" and action == "draw":
-        period = data.get("period")
-        cur = conn.cursor()
-        cur.execute("SELECT id, pool_digest, pool_size, members, chain_rowid"
-                    " FROM sortition_pool WHERE period=?", (period,))
-        pool = cur.fetchone()
-        if not pool:
-            return {"error": "no_pool_for_period", "period": period,
-                    "next": "POST /x/sortition/pool first"}, 404
-        pid, digest, size, members_json, pool_rowid = pool
-
-        cur.execute("SELECT id FROM sortition_draw WHERE period=?", (period,))
-        if cur.fetchone():
-            return {"error": "already_drawn", "period": period,
-                    "note": "One draw per pool. A second draw is a second chance."}, 409
-
-        if pool_rowid is None:
-            return {"error": "pool_not_located_in_chain"}, 500
-
-        beat = _latest_beat_after(conn, pool_rowid)
-        if not beat:
-            n = _beats_available(conn)
-            return {"error": "no_beacon_since_pool_commit",
-                    "beats_in_system": n,
-                    "why": ("The draw must use a value that did not exist when "
-                            "the pool was sealed. Wait for the next heartbeat."),
-                    "check": "/x/heartbeat/latest"}, 409
-
-        b_source, b_round, b_value, b_rowid, b_at = beat
-        members = json.loads(members_json)
-
-        try:
-            rate = float(data.get("rate", DEFAULT_RATE))
-        except (TypeError, ValueError):
-            rate = DEFAULT_RATE
-        rate = max(0.0001, min(1.0, rate))
-        k = int(round(size * rate))
-        k = max(MIN_SELECT, min(k, MAX_SELECT, size))
-
-        seed = _seed(period, digest, b_value)
-        chosen = select(members, seed, k)
-        now = time.time()
-
-        with lock:
-            cur = conn.cursor()
-            cur.execute(
-                "INSERT INTO sortition_draw (period, pool_id, pool_digest,"
-                " pool_size, rate, select_count, beacon_source, beacon_round,"
-                " beacon_value, beacon_rowid, seed, selected, drawn_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (period, pid, digest, size, rate, k, b_source, b_round,
-                 b_value, b_rowid, seed, json.dumps(chosen), now))
-            did = cur.lastrowid
-            conn.commit()
-
-        sh, sidx = _seal(ctx, "sortition_draw", {
-            "draw_id": did, "period": period, "pool_digest": digest,
-            "pool_size": size, "rate": rate, "selected_count": k,
-            "beacon": {"source": b_source, "round": b_round, "value": b_value,
-                       "sealed_at_block": b_rowid},
-            "seed": seed, "selected": chosen,
-            "note": ("Selection is recomputable by anyone from pool_digest and "
-                     "the beacon value. See /x/sortition/spec."),
-        })
-        rid, h = (sidx, sh) if (sidx and sh) else _backfill(conn, lock, "sortition_draw", "chain_rowid", did)
-        if sidx and sh:
-            with lock:
-                conn.execute("UPDATE sortition_draw SET chain_rowid=?, audit_hash=? WHERE id=?", (rid, h, did))
-                conn.commit()
-
-        return {"draw_id": did, "period": period, "pool_size": size,
-                "rate": rate, "selected_count": k, "selected": chosen,
-                "beacon": {"source": b_source, "round": b_round,
-                           "value": b_value, "sealed_at_block": b_rowid,
-                           "sealed_at": _iso(b_at)},
-                "seed": seed, "sealed_at_chain_rowid": rid, "audit_hash": h,
-                "review_due": _iso(now + REVIEW_DUE_HOURS * 3600),
-                "recompute_this_yourself": "/x/sortition/verify?id=%d" % did}, 200
-
-    # -------------------------------------------------- review
-    if method == "POST" and action == "review":
-        did = data.get("draw_id")
-        rec = data.get("record")
-        outcome = str(data.get("outcome", "")).lower()
-        if not did or not rec:
-            return {"error": "draw_id_and_record_required"}, 400
-        if outcome not in OUTCOMES:
-            return {"error": "outcome_invalid", "allowed": list(OUTCOMES)}, 400
-        if outcome == "refused" and not data.get("reason"):
-            return {"error": "reason_required_to_refuse",
-                    "why": ("A refusal without a reason is a gap wearing a "
-                            "label. The reason is sealed and permanent.")}, 400
-
-        cur = conn.cursor()
-        cur.execute("SELECT selected FROM sortition_draw WHERE id=?", (did,))
-        row = cur.fetchone()
-        if not row:
-            return {"error": "unknown_draw", "draw_id": did}, 404
-        if rec not in json.loads(row[0]):
-            return {"error": "record_not_selected",
-                    "note": ("Reviews can only be filed against records the "
-                             "beacon chose. Volunteering extra reviews does "
-                             "not count toward the sample.")}, 409
-
-        now = time.time()
-        with lock:
-            cur = conn.cursor()
-            cur.execute("SELECT id FROM sortition_review WHERE draw_id=? AND record_hash=?",
-                        (did, rec))
-            if cur.fetchone():
-                return {"error": "already_reviewed",
-                        "note": "A review is filed once and cannot be replaced."}, 409
-            cur.execute(
-                "INSERT INTO sortition_review (draw_id, record_hash, outcome,"
-                " reviewer, reason, recorded_at) VALUES (?,?,?,?,?,?)",
-                (did, rec, outcome, data.get("reviewer"), data.get("reason"), now))
-            rvid = cur.lastrowid
-            conn.commit()
-
-        sh, sidx = _seal(ctx, "sortition_review", {
-            "draw_id": did, "record": rec, "outcome": outcome,
-            "reviewer": data.get("reviewer"), "reason": data.get("reason"),
-        })
-        rid, h = (sidx, sh) if (sidx and sh) else _backfill(conn, lock, "sortition_review", "chain_rowid", rvid)
-        if sidx and sh:
-            with lock:
-                conn.execute("UPDATE sortition_review SET chain_rowid=?, audit_hash=? WHERE id=?", (rid, h, rvid))
-                conn.commit()
-        return {"recorded": True, "review_id": rvid, "outcome": outcome,
-                "sealed_at_chain_rowid": rid, "audit_hash": h}, 200
-
-    # -------------------------------------------------- draws
-    if method == "GET" and action == "draws":
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT id, period, pool_size, rate, select_count, beacon_source,"
-            " beacon_round, drawn_at, audit_hash FROM sortition_draw"
-            " ORDER BY id DESC LIMIT 100")
-        out = []
-        for r in cur.fetchall():
-            cur2 = conn.cursor()
-            cur2.execute("SELECT COUNT(*) FROM sortition_review WHERE draw_id=?", (r[0],))
-            done = cur2.fetchone()[0]
-            out.append({"draw_id": r[0], "period": r[1], "pool_size": r[2],
-                        "rate": r[3], "selected": r[4], "reviewed": done,
-                        "outstanding": r[4] - done,
-                        "beacon": {"source": r[5], "round": r[6]},
-                        "drawn_at": _iso(r[7]), "audit_hash": r[8]})
-        return {"count": len(out), "draws": out, "vocabulary": VOCABULARY}, 200
-
-    # -------------------------------------------------- one draw
-    if method == "GET" and action == "draw":
-        did = data.get("id")
-        if not did:
-            return {"error": "id_required"}, 400
-        d = _draw_row(conn, did)
-        if not d:
-            return {"error": "unknown_draw"}, 404
-        cur = conn.cursor()
-        cur.execute("SELECT record_hash, outcome, reviewer, reason, recorded_at"
-                    " FROM sortition_review WHERE draw_id=?", (did,))
-        revs = {r[0]: {"outcome": r[1], "reviewer": r[2], "reason": r[3],
-                       "at": _iso(r[4])} for r in cur.fetchall()}
-        items = []
-        for m in json.loads(d["selected_json"]):
-            items.append({"record": m, "review": revs.get(m),
-                          "state": "answered" if m in revs else "outstanding"})
-        return {"draw_id": did, "period": d["period"],
-                "pool_digest": d["pool_digest"], "pool_size": d["pool_size"],
-                "rate": d["rate"], "selected_count": d["select_count"],
-                "beacon": {"source": d["beacon_source"], "round": d["beacon_round"],
-                           "value": d["beacon_value"],
-                           "sealed_at_block": d["beacon_rowid"]},
-                "seed": d["seed"], "drawn_at": _iso(d["drawn_at"]),
-                "items": items,
-                "what_this_proves": WHAT_THIS_PROVES,
-                "recompute": "/x/sortition/verify?id=%s" % did}, 200
-
-    # -------------------------------------------------- verify
-    if method == "GET" and action == "verify":
-        did = data.get("id")
-        if not did:
-            return {"error": "id_required"}, 400
-        d = _draw_row(conn, did)
-        if not d:
-            return {"error": "unknown_draw"}, 404
-        cur = conn.cursor()
-        cur.execute("SELECT members FROM sortition_pool WHERE id=?", (d["pool_id"],))
-        row = cur.fetchone()
-        members = json.loads(row[0]) if row else []
-        recomputed_digest = _pool_digest(members)
-        recomputed_seed = _seed(d["period"], d["pool_digest"], d["beacon_value"])
-        recomputed = select(members, recomputed_seed, d["select_count"])
-        stored = json.loads(d["selected_json"])
-        ok = (recomputed_digest == d["pool_digest"]
-              and recomputed_seed == d["seed"]
-              and sorted(recomputed) == sorted(stored))
-        return {
-            "draw_id": did,
-            "matches": ok,
-            "pool_digest_recomputed": recomputed_digest,
-            "pool_digest_sealed": d["pool_digest"],
-            "seed_recomputed": recomputed_seed,
-            "seed_sealed": d["seed"],
-            "selection_matches": sorted(recomputed) == sorted(stored),
-            "beacon_value": d["beacon_value"],
-            "beacon_check": ("Confirm this value independently at "
-                             "/x/heartbeat/verify?round=%s, then at the beacon "
-                             "operator's own endpoint." % d["beacon_round"]),
-            "do_it_without_us": {
-                "seed": 'SHA256("AILEASH-SORTITION-v1|" + period + "|" + pool_digest + "|" + beacon_value)',
-                "rank": 'SHA256(seed + ":" + record_hash)',
-                "select": "lowest k ranks, ascending",
-                "note": ("This route runs the same function on our server, so "
-                         "it is a convenience, not the proof. The proof is you "
-                         "running those three lines yourself."),
-            },
-        }, 200
-
-    # -------------------------------------------------- outstanding
-    if method == "GET" and action == "outstanding":
-        now = time.time()
-        cur = conn.cursor()
-        cur.execute("SELECT id, period, selected, drawn_at FROM sortition_draw"
-                    " ORDER BY id DESC")
-        items = []
-        for did, period, sel, drawn in cur.fetchall():
-            cur2 = conn.cursor()
-            cur2.execute("SELECT record_hash FROM sortition_review WHERE draw_id=?", (did,))
-            done = {r[0] for r in cur2.fetchall()}
-            due = drawn + REVIEW_DUE_HOURS * 3600
-            for m in json.loads(sel):
-                if m in done:
-                    continue
-                items.append({
-                    "draw_id": did, "period": period, "record": m,
-                    "drawn_at": _iso(drawn), "due": _iso(due),
-                    "state": "gap" if now > due else "outstanding",
-                    "late_by": _human(now - due) if now > due else None,
-                })
-        gaps = [i for i in items if i["state"] == "gap"]
-        return {"outstanding_count": len(items), "gap_count": len(gaps),
-                "due_after_hours": REVIEW_DUE_HOURS,
-                "items": items[:500],
-                "meaning": VOCABULARY["gap"]}, 200
-
-    # -------------------------------------------------- status
-    if method == "GET" and action == "status":
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*), SUM(select_count) FROM sortition_draw")
-        ndraws, nsel = cur.fetchone()
-        nsel = nsel or 0
-        cur.execute("SELECT COUNT(*) FROM sortition_review")
-        nrev = cur.fetchone()[0]
-        cur.execute("SELECT outcome, COUNT(*) FROM sortition_review GROUP BY outcome")
-        mix = {r[0]: r[1] for r in cur.fetchall()}
-        cur.execute("SELECT COUNT(*) FROM sortition_pool")
-        npool = cur.fetchone()[0]
-        beats = _beats_available(conn)
-        return {
-            "version": VERSION,
-            "pools_committed": npool,
-            "draws": ndraws,
-            "records_selected": nsel,
-            "reviews_recorded": nrev,
-            "response_rate": round(nrev / nsel, 4) if nsel else None,
-            "outcome_mix": mix,
-            "beacon_available": beats is not None,
-            "beats_in_system": beats,
-            "depends_on": {
-                "heartbeat": ("supplies the dice. Without a beacon sealed "
-                              "after the pool, no draw is possible."),
-                "complete": ("commits the period's record count in advance. "
-                             "Without it, a record could be kept out of the "
-                             "pool. Separate module, separate check: "
-                             "/x/complete/periods"),
-            },
-            "what_this_proves": WHAT_THIS_PROVES,
-        }, 200
-
-    return {"error": "unknown_action", "action": action,
-            "actions": ["spec", "draws", "draw", "verify", "outstanding",
-                        "status", "pool", "review"]}, 404
-
-
-def _draw_row(conn, did):
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT id, period, pool_id, pool_digest, pool_size, rate, select_count,"
-        " beacon_source, beacon_round, beacon_value, beacon_rowid, seed,"
-        " selected, drawn_at FROM sortition_draw WHERE id=?", (did,))
-    r = cur.fetchone()
-    if not r:
-        return None
-    keys = ["id", "period", "pool_id", "pool_digest", "pool_size", "rate",
-            "select_count", "beacon_source", "beacon_round", "beacon_value",
-            "beacon_rowid", "seed", "selected_json", "drawn_at"]
-    return dict(zip(keys, r))
-
-
-def _spec():
+def _measure(req):
+    """Everything the decision needs, taken from a full request."""
     return {
-        "module": "sortition",
-        "version": VERSION,
-        "name_means": "selection by lot - the ancient method for stopping the powerful choosing who gets scrutinised",
-        "the_hole": (
-            "Every system claiming human oversight reviews a sample. In every "
-            "one, the operator picks the sample, so the sample proves nothing."
-        ),
-        "the_three_locks": [
-            "1. The pool of eligible records is fixed and sealed first.",
-            "2. The draw may only use a beacon value sealed AFTER the pool. "
-            "Refused otherwise. So the pool was fixed before the dice existed.",
-            "3. The beacon value ranks the pool. Lowest k are selected. "
-            "Anyone recomputes it from public values.",
-        ],
-        "selection_function": {
-            "seed": 'SHA256("AILEASH-SORTITION-v1|" + period + "|" + pool_digest + "|" + beacon_value)',
-            "rank": 'SHA256(seed + ":" + record_hash)',
-            "select": "the k lowest ranks in ascending order",
-            "why_no_rng": ("A random number generator is a library, a version "
-                           "and a seed we control. Two SHA-256 calls are none "
-                           "of those and run in any language."),
-        },
-        "uniform_only": (
-            "Risk-weighted sampling is deliberately not offered. A weighting "
-            "the operator sets is a choice the operator made, which is the "
-            "thing this module exists to remove."
-        ),
-        "refusal": (
-            "A reviewer may refuse a selected case, with a reason, sealed. "
-            "An honest refusal on the record beats a silent gap. A selection "
-            "left unanswered past the due window is published as a gap with "
-            "the record named."
-        ),
-        "vocabulary": VOCABULARY,
-        "what_this_proves": WHAT_THIS_PROVES,
-        "limits": [
-            "It does not prove the reviews were any good.",
-            "It does not force anyone to draw at all. A period with no draw "
-            "is a period with no sample and status says so.",
-            "Pool membership is asserted by this server; completeness of the "
-            "pool is complete.py's job, not this module's.",
-            "The beacon is a third party. If drand and Bitcoin both vanish, "
-            "new draws stop. Old draws stay verifiable.",
-        ],
-        "routes": {
-            "POST /x/sortition/pool": "keyed - commit the pool for a closed period",
-            "POST /x/sortition/draw": "keyed - draw against a beacon sealed after the pool",
-            "POST /x/sortition/review": "keyed - file a review or a refusal with a reason",
-            "GET /x/sortition/draws": "every draw",
-            "GET /x/sortition/draw?id=": "one draw and its answers",
-            "GET /x/sortition/verify?id=": "recompute the draw",
-            "GET /x/sortition/outstanding": "selected and unanswered, with gaps named",
-            "GET /x/sortition/status": "coverage and response rate",
-        },
+        "fp": _fingerprint(req),
+        "shape": _shape(req),
+        "chars": _prompt_chars(req),
+        "ask": _ask_ceiling(req),
+        "depth": len(req.get("messages") or []),
+        "tools": len(req.get("tools") or []),
+        "deterministic": _deterministic(req),
+        "from_digest": False,
     }
 
-```
 
-
-## `modules/spec.py`
-
-121 lines, 5086 bytes
-
-```python
-"""
-Live API specification - /x/spec
-
-/api/spec is a hardcoded constant. It describes the API as it was when
-somebody last remembered to update it, which is a documentation problem
-pretending to be a feature.
-
-This discovers what is actually loaded, right now, by reading the modules
-directory and each module's own docstring. Add a module and the spec
-updates itself. Delete one and it disappears. There is no separate list to
-maintain and therefore no list that can drift.
-
-That matters here more than it would elsewhere: a platform whose pitch is
-"check it, don't trust it" should not ship a self-description that is
-quietly out of date.
-
-    GET /x/spec           everything currently live
-    GET /x/spec/modules   just the module list
-"""
-
-import importlib, os, pkgutil, re
-
-VERSION = "1.0"
-
-_EP = re.compile(r"^\s*(GET|POST|PUT|DELETE)\s+(/\S+)\s*(.*)$")
-
-
-def _describe(name):
-    """Pull a module's summary and endpoint list out of its own docstring."""
+def _measure_from_digest(d):
+    """
+    The same measurements, supplied by a client that kept its content at
+    home. The client is measuring its own spend against its own budget,
+    so there is nothing to gain by misreporting.
+    """
+    if not isinstance(d, dict):
+        return None, "digest must be an object"
+    fp = d.get("fingerprint")
+    if not isinstance(fp, str) or len(fp) != 64:
+        return None, "digest needs a 64 character fingerprint"
     try:
-        m = importlib.import_module("modules." + name)
-    except Exception as e:
-        return {"module": name, "loaded": False, "error": str(e)}
-    doc = (m.__doc__ or "").strip()
-    lines = doc.splitlines()
-    summary = ""
-    for ln in lines:
-        t = ln.strip()
-        if t and not t.startswith("-") and not _EP.match(ln):
-            summary = t
-            break
-    endpoints = []
-    for ln in lines:
-        mm = _EP.match(ln)
-        if mm:
-            endpoints.append({"method": mm.group(1),
-                              "path": mm.group(2),
-                              "takes": mm.group(3).strip() or None})
-    out = {"module": name, "loaded": True, "summary": summary,
-           "endpoints": endpoints,
-           "version": getattr(m, "VERSION", None)}
-    if not hasattr(m, "handle"):
-        out["warning"] = "module has no handle() - it will not route"
+        int(fp, 16)
+    except ValueError:
+        return None, "fingerprint must be hexadecimal"
+
+    def _n(key, cap):
+        v = d.get(key, 0)
+        try:
+            v = int(v)
+        except (TypeError, ValueError):
+            return 0
+        return max(0, min(v, cap))
+
+    m = {
+        "fp": fp,
+        "chars": _n("prompt_characters", MAX_PROMPT_CHARS),
+        "ask": _n("max_tokens", 10_000_000),
+        "depth": _n("conversation_turns", 100_000),
+        "tools": _n("tool_definitions", 100_000),
+        "deterministic": bool(d.get("deterministic", True)),
+        "from_digest": True,
+    }
+    band = int(math.log10(max(m["chars"], 1)) * 2)
+    m["shape"] = _sha("%s|%d|%d|%d" % (d.get("model") or "", m["depth"],
+                                       m["tools"], band))
+    return m, None
+
+
+def _log_scale(value, saturation):
+    if value <= 0:
+        return 0.0
+    if value >= saturation:
+        return 1.0
+    return math.log1p(value) / math.log1p(saturation)
+
+
+def _linear(value, saturation):
+    if value <= 0:
+        return 0.0
+    return min(1.0, float(value) / float(saturation))
+
+
+def _deterministic(req):
+    t = req.get("temperature")
+    if t is None:
+        return True
+    try:
+        return float(t) == 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+def _usage(resp):
+    if not isinstance(resp, dict):
+        return (None, None)
+    u = resp.get("usage")
+    if not isinstance(u, dict):
+        return (None, None)
+    i = u.get("input_tokens", u.get("prompt_tokens"))
+    o = u.get("output_tokens", u.get("completion_tokens"))
+    try:
+        return (int(i) if i is not None else None,
+                int(o) if o is not None else None)
+    except (TypeError, ValueError):
+        return (None, None)
+
+
+def _money(tokens_in, tokens_out, price_in, price_out):
+    if price_in is None and price_out is None:
+        return None
+    m = 0.0
+    if price_in:
+        m += (tokens_in or 0) / 1_000_000.0 * price_in
+    if price_out:
+        m += (tokens_out or 0) / 1_000_000.0 * price_out
+    return round(m, 4)
+
+
+# --------------------------------------------------------------- storage
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS ts_store (
+    api_key       TEXT NOT NULL,
+    fp            TEXT NOT NULL,
+    model         TEXT,
+    response      TEXT NOT NULL,
+    input_tokens  INTEGER,
+    output_tokens INTEGER,
+    stored_at     REAL NOT NULL,
+    expires_at    REAL,
+    hits          INTEGER NOT NULL DEFAULT 0,
+    last_hit      REAL,
+    PRIMARY KEY (api_key, fp)
+);
+
+CREATE TABLE IF NOT EXISTS ts_seen (
+    api_key  TEXT NOT NULL,
+    fp       TEXT NOT NULL,
+    ts       REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ts_shape (
+    api_key  TEXT NOT NULL,
+    shape    TEXT NOT NULL,
+    first_ts REAL NOT NULL,
+    PRIMARY KEY (api_key, shape)
+);
+
+CREATE TABLE IF NOT EXISTS ts_decision (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    api_key     TEXT NOT NULL,
+    ts          REAL NOT NULL,
+    fp          TEXT NOT NULL,
+    verdict     TEXT NOT NULL,
+    rule        TEXT,
+    score       REAL NOT NULL,
+    signals     TEXT NOT NULL,
+    exact_in    INTEGER,
+    exact_out   INTEGER,
+    ceiling_in  INTEGER,
+    ceiling_out INTEGER,
+    audit_hash  TEXT
+);
+
+CREATE TABLE IF NOT EXISTS ts_account (
+    api_key    TEXT PRIMARY KEY,
+    ceiling    INTEGER NOT NULL DEFAULT 0,
+    spent      INTEGER NOT NULL DEFAULT 0,
+    price_in   REAL,
+    price_out  REAL,
+    currency   TEXT,
+    updated    REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ts_seen_key ON ts_seen(api_key, ts);
+CREATE INDEX IF NOT EXISTS ts_seen_fp ON ts_seen(api_key, fp, ts);
+CREATE INDEX IF NOT EXISTS ts_dec_key ON ts_decision(api_key, id);
+CREATE INDEX IF NOT EXISTS ts_dec_hash ON ts_decision(audit_hash);
+CREATE INDEX IF NOT EXISTS ts_store_exp ON ts_store(expires_at);
+"""
+
+_ready = {}
+
+
+def _init(ctx):
+    # Keyed by id, but the connection itself is kept as the value so the
+    # id cannot be recycled while we still believe in it.
+    k = id(ctx.conn)
+    if _ready.get(k) is ctx.conn:
+        return
+    with ctx.lock:
+        ctx.conn.executescript(_SCHEMA)
+        ctx.conn.commit()
+    _ready[k] = ctx.conn
+
+
+def _account(ctx, api_key):
+    row = ctx.conn.execute(
+        "SELECT ceiling, spent, price_in, price_out, currency "
+        "FROM ts_account WHERE api_key=?", (api_key,)
+    ).fetchone()
+    if not row:
+        return {"ceiling": 0, "spent": 0, "price_in": None,
+                "price_out": None, "currency": None}
+    return {"ceiling": row[0], "spent": row[1], "price_in": row[2],
+            "price_out": row[3], "currency": row[4]}
+
+
+def _prune(ctx, api_key, now):
+    ctx.conn.execute("DELETE FROM ts_seen WHERE api_key=? AND ts < ?",
+                     (api_key, now - W1H))
+
+
+# ================================================================ layer 3
+
+def _findings(req, loop_n, has_stored, acct):
+    """
+    Named waste inside this request. Every item carries a token figure
+    and says whether that figure is exact or estimated. This never
+    feeds a total.
+    """
+    out = []
+    msgs = req.get("messages") or []
+    depth = len(msgs)
+    tools = req.get("tools") or []
+    ask = _ask_ceiling(req)
+
+    # The biggest one in agent systems: the same request going round
+    # and nobody recording the answer.
+    if loop_n >= 2 and not has_stored:
+        out.append({
+            "code": "repeating_without_recording",
+            "severity": "high",
+            "detail": "This exact request has gone out %d times in the last "
+                      "%d seconds and no answer has been recorded. Post the "
+                      "response back to record and every repeat after that "
+                      "costs nothing."
+                      % (loop_n, LOOP_WINDOW),
+            "tokens": None,
+            "certainty": "not counted",
+        })
+
+    if not _deterministic(req):
+        out.append({
+            "code": "varied_output_blocks_reuse",
+            "severity": "medium",
+            "detail": "temperature is above zero, so this answer cannot be "
+                      "safely reused. If this request does not genuinely need "
+                      "varied output, setting temperature to zero makes every "
+                      "repeat free.",
+            "tokens": None,
+            "certainty": "not counted",
+        })
+
+    if depth > CTX_FLAG_TURNS:
+        carried = msgs[:-CTX_KEEP_TURNS] if CTX_KEEP_TURNS < depth else []
+        chars = sum(_content_chars(m.get("content") if isinstance(m, dict)
+                                   else m) for m in carried)
+        out.append({
+            "code": "carrying_old_turns",
+            "severity": "high" if chars > 20_000 else "medium",
+            "detail": "%d turns are being re-sent on every call. The oldest "
+                      "%d of them account for roughly the tokens below, paid "
+                      "again each time this conversation continues."
+                      % (depth, len(carried)),
+            "tokens": _est_tokens(chars),
+            "certainty": "estimated from character count",
+        })
+
+    if tools:
+        used = False
+        for m in msgs:
+            if not isinstance(m, dict):
+                continue
+            c = m.get("content")
+            blob = c if isinstance(c, str) else _canonical(c).decode("utf-8", "ignore")
+            if "tool_use" in blob or "tool_call" in blob:
+                used = True
+                break
+        if not used:
+            chars = _content_chars(tools)
+            out.append({
+                "code": "unused_tool_definitions",
+                "severity": "high" if chars > 8_000 else "medium",
+                "detail": "%d tool definitions are attached and nothing in "
+                          "this conversation has called one. They are sent in "
+                          "full on every request."
+                          % len(tools),
+                "tokens": _est_tokens(chars),
+                "certainty": "estimated from character count",
+            })
+
+    sys_chars = _content_chars(req.get("system"))
+    if sys_chars > SYSTEM_FLAG_CHARS and depth > 4:
+        out.append({
+            "code": "large_system_prompt_resent",
+            "severity": "low",
+            "detail": "The system prompt is re-sent on every call in this "
+                      "conversation. If your provider offers prompt caching, "
+                      "this is the block to cache.",
+            "tokens": _est_tokens(sys_chars),
+            "certainty": "estimated from character count",
+        })
+
+    if ask:
+        out.append({
+            "code": "output_ceiling_authorised",
+            "severity": "low",
+            "detail": "max_tokens is set to %d, so this single call is "
+                      "authorised to buy up to that many output tokens." % ask,
+            "tokens": ask,
+            "certainty": "exact ceiling set by the caller",
+        })
+
+    seen = {}
+    for m in msgs:
+        if not isinstance(m, dict):
+            continue
+        k = _sha(_canonical(m.get("content")))
+        seen[k] = seen.get(k, 0) + 1
+    dupes = sum(n - 1 for n in seen.values() if n > 1)
+    if dupes >= 2:
+        out.append({
+            "code": "duplicate_turns_in_context",
+            "severity": "medium",
+            "detail": "%d turns inside this conversation are byte-identical "
+                      "to an earlier turn. They are being paid for twice."
+                      % dupes,
+            "tokens": None,
+            "certainty": "not counted",
+        })
+
+    if acct["ceiling"] and acct["spent"] >= acct["ceiling"] * 0.8:
+        out.append({
+            "code": "budget_nearly_gone",
+            "severity": "high",
+            "detail": "This key has used %d of its %d token ceiling."
+                      % (acct["spent"], acct["ceiling"]),
+            "tokens": None,
+            "certainty": "exact, from provider-reported usage",
+        })
+
     return out
 
 
-def _modules():
-    d = os.path.dirname(__file__)
-    names = sorted(x.name for x in pkgutil.iter_modules([d])
-                   if x.name not in ("router", "spec"))
-    return [_describe(n) for n in names]
+# ================================================================ layers 1+2
+
+def _decide(ctx, api_key, m, now, unattended, count_it):
+    """
+    Takes a measurement bundle from _measure or _measure_from_digest, so
+    the same decision runs whether the caller sent the request or kept it
+    at home and sent only its shape.
+
+    rule is set only when a hard rule fired, in which case the score is
+    still computed and reported but did not decide anything.
+    """
+    fp = m["fp"]
+    shape = m["shape"]
+    acct = _account(ctx, api_key)
+
+    loop_n = ctx.conn.execute(
+        "SELECT COUNT(*) FROM ts_seen WHERE api_key=? AND fp=? AND ts > ?",
+        (api_key, fp, now - LOOP_WINDOW)).fetchone()[0]
+    burst_n = ctx.conn.execute(
+        "SELECT COUNT(*) FROM ts_seen WHERE api_key=? AND ts > ?",
+        (api_key, now - W60)).fetchone()[0]
+    grind_n = ctx.conn.execute(
+        "SELECT COUNT(*) FROM ts_seen WHERE api_key=? AND ts > ?",
+        (api_key, now - W1H)).fetchone()[0]
+    seen_shape = ctx.conn.execute(
+        "SELECT 1 FROM ts_shape WHERE api_key=? AND shape=?",
+        (api_key, shape)).fetchone()
+    has_stored = ctx.conn.execute(
+        "SELECT 1 FROM ts_store WHERE api_key=? AND fp=?",
+        (api_key, fp)).fetchone() is not None
+
+    chars = m["chars"]
+    ask = m["ask"]
+    depth = m["depth"]
+    tools = m["tools"]
+
+    # Worst case this one call could cost: an exact ceiling on output,
+    # an estimate on input. Kept apart accordingly.
+    ceiling_out = ask
+    est_in = _est_tokens(chars)
+    remaining = max(0, acct["ceiling"] - acct["spent"]) if acct["ceiling"] else 0
+    if remaining:
+        exposure = _linear(est_in + ceiling_out, remaining)
+    else:
+        exposure = 0.0
+
+    s = {
+        "exposure": round(exposure, 4),
+        "size": round(_log_scale(chars, SAT_SIZE), 4),
+        "ask": round(_log_scale(ask, SAT_ASK), 4),
+        "depth": round(_linear(depth, SAT_DEPTH), 4),
+        "tools": round(_linear(tools, SAT_TOOLS), 4),
+        "loop": round(_linear(loop_n, SAT_LOOP), 4),
+        "burst": round(_linear(burst_n, SAT_BURST), 4),
+        "grind": round(_linear(grind_n, SAT_GRIND), 4),
+        "novelty": 0.0 if seen_shape else 1.0,
+    }
+
+    score = (W_EXPOSURE * s["exposure"] + W_SIZE * s["size"]
+             + W_ASK * s["ask"] + W_DEPTH * s["depth"]
+             + W_TOOLS * s["tools"] + W_LOOP * s["loop"]
+             + W_BURST * s["burst"] + W_GRIND * s["grind"]
+             + W_NOVELTY * s["novelty"])
+
+    s["unattended"] = bool(unattended)
+    if unattended:
+        score += W_UNATTENDED
+    score = round(min(1.0, score), 4)
+
+    measured = {
+        "prompt_characters": chars,
+        "estimated_input_tokens": est_in,
+        "estimated_input_tokens_note": "estimated from characters, never "
+                                       "counted in a savings total",
+        "authorised_output_tokens": ceiling_out,
+        "conversation_turns": depth,
+        "tool_definitions": tools,
+        "same_request_in_last_%ds" % LOOP_WINDOW: loop_n,
+        "requests_in_last_60s": burst_n,
+        "requests_in_last_hour": grind_n,
+        "budget_ceiling_tokens": acct["ceiling"],
+        "budget_spent_tokens": acct["spent"],
+    }
+
+    # ---- layer 1: hard rules, in order, no appeal to the score --------
+    rule = None
+    verdict = None
+
+    if acct["ceiling"] and acct["spent"] >= acct["ceiling"]:
+        rule, verdict = "budget_exhausted", "BLOCK"
+    elif acct["ceiling"] and (est_in + ceiling_out) > remaining:
+        # An overdraft. Catching this after the fact is too late: the
+        # money is already gone. A person may raise the ceiling, so an
+        # attended call is held rather than refused.
+        rule = "exceeds_remaining_budget"
+        verdict = "BLOCK" if unattended else "CHALLENGE"
+    elif loop_n >= LOOP_HARD:
+        rule, verdict = "runaway_loop", "BLOCK"
+    elif unattended and loop_n >= LOOP_HARD_UNATTENDED:
+        rule, verdict = "runaway_loop_unattended", "BLOCK"
+    elif burst_n >= BURST_HARD:
+        rule, verdict = "runaway_burst", "BLOCK"
+
+    # ---- layer 2: the score -------------------------------------------
+    if verdict is None:
+        if score >= BAND_BLOCK:
+            verdict = "BLOCK"
+        elif score >= BAND_CHALLENGE:
+            verdict = "CHALLENGE"
+        elif (score < CHEAP_MAX_SCORE and chars <= CHEAP_MAX_CHARS
+              and depth <= CHEAP_MAX_TURNS and ask <= CHEAP_MAX_ASK
+              and tools == 0):
+            verdict = "DOWNGRADE"
+        else:
+            verdict = "ALLOW"
+
+    if count_it:
+        ctx.conn.execute("INSERT INTO ts_seen (api_key, fp, ts) VALUES (?,?,?)",
+                         (api_key, fp, now))
+        ctx.conn.execute(
+            "INSERT OR IGNORE INTO ts_shape (api_key, shape, first_ts) "
+            "VALUES (?,?,?)", (api_key, shape, now))
+        _prune(ctx, api_key, now)
+
+    measured["measured_from"] = ("a digest supplied by the client; the "
+                                "content stayed on their side"
+                                if m.get("from_digest") else
+                                "the request body")
+    return (verdict, rule, score, s, measured, fp, shape, loop_n, has_stored,
+            est_in, ceiling_out, acct)
+
+
+def _record_decision(ctx, api_key, fp, verdict, rule, score, signals,
+                     ex_in, ex_out, ce_in, ce_out, seal_hash, now):
+    """Writes the row and returns its id, so the receipt can be stamped on
+    afterwards once the lock has been released."""
+    cur = ctx.conn.execute(
+        "INSERT INTO ts_decision (api_key, ts, fp, verdict, rule, score, "
+        "signals, exact_in, exact_out, ceiling_in, ceiling_out, audit_hash) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        (api_key, now, fp, verdict, rule, score,
+         json.dumps(signals, sort_keys=True), ex_in, ex_out, ce_in, ce_out,
+         seal_hash))
+    return cur.lastrowid
+
+
+def _seal_and_stamp(ctx, event, detail, api_key, decision_id):
+    """
+    Seal with the lock released, then write the receipt back onto the row
+    in a second short lock. Splitting it this way is what keeps the
+    platform's non-reentrant lock from deadlocking the request.
+    """
+    seal = ctx.seal(event, detail, api_key)
+    h = seal.get("hash") if isinstance(seal, dict) else None
+    if h and decision_id:
+        try:
+            with ctx.lock:
+                ctx.conn.execute(
+                    "UPDATE ts_decision SET audit_hash=? WHERE id=?",
+                    (h, decision_id))
+                ctx.conn.commit()
+        except Exception:                        # noqa: BLE001
+            pass
+    return seal
+
+
+# --------------------------------------------------------------- actions
+
+def _a_spec():
+    return {
+        "module": "tokensaver",
+        "version": VERSION,
+        "what_it_is": "A deterministic gate in front of a model. It decides "
+                      "whether a request is answered from store, sent to the "
+                      "model, sent to a cheaper model, held for a person, or "
+                      "refused. It also names the waste inside every request "
+                      "it sees.",
+        "model_calls_made_to_reach_a_decision": 0,
+        "layers": {
+            "1_hard_rules": {
+                "why": "A cost gate that depends only on tuned weights is a "
+                       "cost gate nobody can defend. These are absolute.",
+                "rules": {
+                    "budget_exhausted": "spend has reached the key's ceiling",
+                    "exceeds_remaining_budget":
+                        "this one call could cost more than the budget left. "
+                        "Output uses the exact ceiling you set; input is "
+                        "estimated from characters, so this rule is "
+                        "deliberately cautious. Held for a person when a "
+                        "human is declared, refused when one is not.",
+                    "runaway_loop": "the same request %d times in %d seconds"
+                                    % (LOOP_HARD, LOOP_WINDOW),
+                    "runaway_loop_unattended": "the same request %d times in "
+                                               "%d seconds with no human "
+                                               "declared"
+                                               % (LOOP_HARD_UNATTENDED,
+                                                  LOOP_WINDOW),
+                    "runaway_burst": "%d requests from one key in 60 seconds"
+                                     % BURST_HARD,
+                },
+            },
+            "2_the_score": {
+                "spend_signals": {
+                    "exposure": {"weight": W_EXPOSURE,
+                                 "measures": "worst case cost of this call "
+                                             "against the budget left"},
+                    "size": {"weight": W_SIZE, "saturates_at": SAT_SIZE,
+                             "measures": "prompt characters, log scaled"},
+                    "ask": {"weight": W_ASK, "saturates_at": SAT_ASK,
+                            "measures": "the max_tokens ceiling the caller set"},
+                    "depth": {"weight": W_DEPTH, "saturates_at": SAT_DEPTH,
+                              "measures": "turns re-sent on every call"},
+                    "tools": {"weight": W_TOOLS, "saturates_at": SAT_TOOLS,
+                              "measures": "tool definitions re-sent on every call"},
+                },
+                "waste_signals": {
+                    "loop": {"weight": W_LOOP, "saturates_at": SAT_LOOP},
+                    "burst": {"weight": W_BURST, "saturates_at": SAT_BURST},
+                    "grind": {"weight": W_GRIND, "saturates_at": SAT_GRIND},
+                    "novelty": {"weight": W_NOVELTY},
+                },
+                "spend_weight_total": round(W_EXPOSURE + W_SIZE + W_ASK
+                                            + W_DEPTH + W_TOOLS, 4),
+                "waste_weight_total": round(W_LOOP + W_BURST + W_GRIND
+                                            + W_NOVELTY, 4),
+                "base_weights_sum_to": round(BASE_SUM, 4),
+                "outside_the_base_sum": {"unattended": W_UNATTENDED},
+                "bands": {"CHALLENGE": ">= %.2f" % BAND_CHALLENGE,
+                          "BLOCK": ">= %.2f" % BAND_BLOCK},
+                "downgrade_is_earned_not_suspected": {
+                    "max_score": CHEAP_MAX_SCORE,
+                    "max_prompt_characters": CHEAP_MAX_CHARS,
+                    "max_turns": CHEAP_MAX_TURNS,
+                    "max_output_tokens": CHEAP_MAX_ASK,
+                    "tools_allowed": 0,
+                    "why": "a suspicious request is never sent to a weaker "
+                           "model. Only a genuinely small one is.",
+                },
+            },
+            "3_findings": {
+                "why": "The verdict saves money on this call. The findings "
+                       "change what the caller sends next time, which saves "
+                       "far more.",
+                "codes": ["repeating_without_recording",
+                          "varied_output_blocks_reuse",
+                          "carrying_old_turns",
+                          "unused_tool_definitions",
+                          "large_system_prompt_resent",
+                          "output_ceiling_authorised",
+                          "duplicate_turns_in_context",
+                          "budget_nearly_gone"],
+            },
+        },
+        "verdict_vocabulary": VOCABULARY,
+        "certainty_tiers": {
+            "tokens_not_bought": "exact, provider reported, the only figure "
+                                 "that enters a savings total",
+            "worst_case_tokens_avoided": "a ceiling on what a refused request "
+                                         "could have cost, reported separately",
+            "findings_tokens": "estimated from characters where marked, never "
+                               "entering any total",
+        },
+        "two_ways_to_call_it": {
+            "request": "send the provider request body. This platform sees "
+                       "your prompt.",
+            "digest": "send only a fingerprint and counts. Your prompts and "
+                      "answers never leave your building, the decision is "
+                      "identical, and the receipt is the same. The downloaded "
+                      "client uses this path by default.",
+        },
+        "honest_limits": LIMITS,
+        "routes": {
+            "public": ["spec", "stats", "verify"],
+            "keyed": ["estimate", "gate", "record", "ledger", "budget",
+                      "prices", "forget"],
+        },
+    }
+
+
+def _bundle(data):
+    """
+    A caller may send the whole request, or only a digest of it. The
+    digest path exists so a customer's prompts and answers never leave
+    their own building. Returns (measurements, request_or_None, error, code).
+    """
+    req = data.get("request")
+    if isinstance(req, dict):
+        if _prompt_chars(req) > MAX_PROMPT_CHARS:
+            return None, None, {"error": "request_too_large"}, 413
+        return _measure(req), req, None, None
+
+    dig = data.get("digest")
+    if dig is not None:
+        m, err = _measure_from_digest(dig)
+        if err:
+            return None, None, {"error": "bad_digest", "detail": err}, 400
+        return m, None, None, None
+
+    return None, None, {
+        "error": "request_or_digest_required",
+        "detail": "send the provider request body under 'request', or a "
+                  "content-free digest under 'digest' with fingerprint, "
+                  "prompt_characters, max_tokens, conversation_turns, "
+                  "tool_definitions and deterministic",
+    }, 400
+
+
+def _digest_findings(m, loop_n, has_stored, acct):
+    """
+    What can honestly be said when the content stayed at home. Anything
+    needing the actual messages is left to the client, which has them.
+    """
+    out = []
+    if loop_n >= 2 and not has_stored:
+        out.append({
+            "code": "repeating_without_recording",
+            "severity": "high",
+            "detail": "This exact request has gone out %d times in the last "
+                      "%d seconds and no answer has been recorded. Post the "
+                      "response back to record and every repeat after that "
+                      "costs nothing." % (loop_n, LOOP_WINDOW),
+            "tokens": None,
+            "certainty": "not counted",
+        })
+    if not m["deterministic"]:
+        out.append({
+            "code": "varied_output_blocks_reuse",
+            "severity": "medium",
+            "detail": "temperature is above zero, so this answer cannot be "
+                      "safely reused.",
+            "tokens": None,
+            "certainty": "not counted",
+        })
+    if m["depth"] > CTX_FLAG_TURNS:
+        out.append({
+            "code": "carrying_old_turns",
+            "severity": "medium",
+            "detail": "%d turns are being re-sent on every call. Your client "
+                      "holds the content and can size this exactly."
+                      % m["depth"],
+            "tokens": None,
+            "certainty": "not counted here; the client can measure it",
+        })
+    if m["ask"]:
+        out.append({
+            "code": "output_ceiling_authorised",
+            "severity": "low",
+            "detail": "max_tokens is set to %d, so this call is authorised "
+                      "to buy up to that many output tokens." % m["ask"],
+            "tokens": m["ask"],
+            "certainty": "exact ceiling set by the caller",
+        })
+    if acct["ceiling"] and acct["spent"] >= acct["ceiling"] * 0.8:
+        out.append({
+            "code": "budget_nearly_gone",
+            "severity": "high",
+            "detail": "This key has used %d of its %d token ceiling."
+                      % (acct["spent"], acct["ceiling"]),
+            "tokens": None,
+            "certainty": "exact, from provider-reported usage",
+        })
+    return out
+
+
+def _a_estimate(ctx, api_key, data, now):
+    """Cost a request and name its waste. Changes nothing, seals nothing."""
+    m, req, err, code = _bundle(data)
+    if err:
+        return err, code
+
+    with ctx.lock:
+        (verdict, rule, score, s, measured, fp, shape, loop_n, has_stored,
+         est_in, ceil_out, acct) = _decide(
+            ctx, api_key, m, now, bool(data.get("unattended")), False)
+        findings = (_findings(req, loop_n, has_stored, acct) if req
+                    else _digest_findings(m, loop_n, has_stored, acct))
+        stored = has_stored
+
+    money = _money(est_in, ceil_out, acct["price_in"], acct["price_out"])
+    out = {
+        "would_be": verdict,
+        "rule": rule,
+        "score": score,
+        "signals": s,
+        "measured": measured,
+        "findings": findings,
+        "fingerprint": fp,
+        "stored_answer_available": stored,
+        "worst_case_cost": {
+            "estimated_input_tokens": est_in,
+            "authorised_output_tokens": ceil_out,
+            "certainty": "input estimated from characters; output is the "
+                         "exact ceiling you set",
+        },
+        "note": "estimate changes nothing, counts towards no velocity window "
+                "and seals nothing. Use gate for the real decision.",
+    }
+    if money is not None:
+        out["worst_case_cost"]["money_at_your_prices"] = money
+        out["worst_case_cost"]["currency"] = acct["currency"]
+    return out, 200
+
+
+def _a_gate(ctx, api_key, data, now):
+    m, req, err, code = _bundle(data)
+    if err:
+        return err, code
+
+    unattended = bool(data.get("unattended"))
+    fp = m["fp"]
+
+    # ---- everything that touches the database, under the lock ----------
+    with ctx.lock:
+        row = ctx.conn.execute(
+            "SELECT response, model, input_tokens, output_tokens, hits, "
+            "expires_at FROM ts_store WHERE api_key=? AND fp=?",
+            (api_key, fp)).fetchone()
+
+        expired = False
+        if row and row[5] is not None and row[5] < now:
+            ctx.conn.execute("DELETE FROM ts_store WHERE api_key=? AND fp=?",
+                             (api_key, fp))
+            expired = True
+            row = None
+
+        acct = _account(ctx, api_key)
+        budget_gone = bool(acct["ceiling"]) and acct["spent"] >= acct["ceiling"]
+
+        client_held = False
+        if row:
+            try:
+                client_held = (json.loads(row[0]).get("held_by") == "client")
+            except (ValueError, AttributeError):
+                client_held = False
+
+        served = bool(row) and not budget_gone
+        if served:
+            ctx.conn.execute(
+                "UPDATE ts_store SET hits=hits+1, last_hit=? "
+                "WHERE api_key=? AND fp=?", (now, api_key, fp))
+            did = _record_decision(
+                ctx, api_key, fp, "SERVE",
+                "stored_by_client" if client_held else "stored_answer",
+                0.0, {"repeat": 1.0}, row[2], row[3], None, None, None, now)
+        else:
+            (verdict, rule, score, s, measured, fp, shape, loop_n, has_stored,
+             est_in, ceil_out, acct) = _decide(ctx, api_key, m, now,
+                                               unattended, True)
+            findings = (_findings(req, loop_n, has_stored, acct) if req
+                        else _digest_findings(m, loop_n, has_stored, acct))
+            ce_in = est_in if verdict == "BLOCK" else None
+            ce_out = ceil_out if verdict == "BLOCK" else None
+            did = _record_decision(ctx, api_key, fp, verdict, rule, score, s,
+                                   None, None, ce_in, ce_out, None, now)
+        ctx.conn.commit()
+
+    # ---- sealing happens with the lock RELEASED -------------------------
+    # The platform's seal takes the same lock, and it is not reentrant.
+    # Calling it from inside the block above deadlocks the request.
+    if expired:
+        ctx.seal("tokensaver_expired",
+                 {"module": "tokensaver", "fingerprint": fp}, api_key)
+
+    if served:
+        detail = {
+            "module": "tokensaver", "verdict": "SERVE", "fingerprint": fp,
+            "model": row[1],
+            "tokens_not_bought": {"input": row[2], "output": row[3]},
+            "usage_reported_by_provider": (row[2] is not None
+                                           or row[3] is not None),
+            "hit_number": row[4] + 1,
+        }
+        if client_held:
+            detail["content_held_by"] = "client"
+        seal = _seal_and_stamp(ctx, "tokensaver_serve", detail, api_key, did)
+
+        known = (row[2] is not None or row[3] is not None)
+        out = {
+            "verdict": "SERVE",
+            "meaning": VOCABULARY["SERVE"],
+            "call_the_model": False,
+            "fingerprint": fp,
+            "tokens_not_bought": {
+                "input": row[2], "output": row[3],
+                "total": ((row[2] or 0) + (row[3] or 0)) if known else None,
+                "certainty": "exact, as reported by the provider on the "
+                             "original call" if known else
+                             "the provider reported no usage on the original "
+                             "call, so this saving is real but its size is "
+                             "unknown",
+            },
+            "hit_number": row[4] + 1,
+            "receipt": seal,
+        }
+        if client_held:
+            out["content_held_by"] = "client"
+            out["serve_from_your_own_store"] = True
+        else:
+            out["response"] = json.loads(row[0])
+        money = _money(row[2], row[3], acct["price_in"], acct["price_out"])
+        if money is not None:
+            out["money_not_spent_at_your_prices"] = money
+            out["currency"] = acct["currency"]
+        return out, 200
+
+    detail = {
+        "module": "tokensaver", "verdict": verdict, "rule": rule,
+        "score": score, "fingerprint": fp, "signals": s,
+        "measured": measured, "findings": [f["code"] for f in findings],
+    }
+    seal = _seal_and_stamp(ctx, "tokensaver_decision", detail, api_key, did)
+
+    out = {
+        "verdict": verdict,
+        "meaning": VOCABULARY[verdict],
+        "decided_by": ("hard rule: " + rule) if rule else "score",
+        "rule": rule,
+        "score": score,
+        "signals": s,
+        "measured": measured,
+        "findings": findings,
+        "fingerprint": fp,
+        "call_the_model": verdict in ("ALLOW", "DOWNGRADE"),
+        "use_cheap_model": verdict == "DOWNGRADE",
+        "receipt": seal,
+    }
+    if verdict == "BLOCK":
+        money = _money(est_in, ceil_out, acct["price_in"], acct["price_out"])
+        out["worst_case_avoided"] = {
+            "estimated_input_tokens": est_in,
+            "authorised_output_tokens": ceil_out,
+            "certainty": "a ceiling, not a saving. Nobody knows what this "
+                         "call would actually have cost, so it is reported "
+                         "separately and never added to tokens not bought.",
+        }
+        if money is not None:
+            out["worst_case_avoided"]["money_at_your_prices"] = money
+    if verdict in ("ALLOW", "DOWNGRADE"):
+        out["next"] = ("call the model, then POST the response to "
+                       "/x/tokensaver/record so the next identical request "
+                       "costs nothing")
+    return out, 200
+
+
+def _a_record(ctx, api_key, data, now):
+    req = data.get("request")
+    resp = data.get("response")
+    dig = data.get("digest")
+
+    # Content-free path: the client stored the answer at home and is only
+    # reporting what it cost, so the budget and the totals stay true.
+    if not isinstance(req, dict) and isinstance(dig, dict):
+        m, err = _measure_from_digest(dig)
+        if err:
+            return {"error": "bad_digest", "detail": err}, 400
+        u = data.get("usage") or {}
+        try:
+            t_in = (int(u["input_tokens"])
+                    if u.get("input_tokens") is not None else None)
+            t_out = (int(u["output_tokens"])
+                     if u.get("output_tokens") is not None else None)
+        except (TypeError, ValueError):
+            return {"error": "usage_must_be_whole_numbers"}, 400
+        with ctx.lock:
+            if t_in is not None or t_out is not None:
+                _spend(ctx, api_key, (t_in or 0) + (t_out or 0), now)
+            ctx.conn.execute(
+                "INSERT OR REPLACE INTO ts_store (api_key, fp, model, "
+                "response, input_tokens, output_tokens, stored_at, "
+                "expires_at, hits, last_hit) VALUES (?,?,?,?,?,?,?,?,0,NULL)",
+                (api_key, m["fp"], dig.get("model"),
+                 json.dumps({"held_by": "client",
+                             "note": "the answer is stored on the customer's "
+                                     "own machine and never came here"}),
+                 t_in, t_out, now, now + DEFAULT_TTL))
+            ctx.conn.commit()
+        seal = ctx.seal("tokensaver_store", {
+            "module": "tokensaver", "fingerprint": m["fp"],
+            "model": dig.get("model"), "content_held_by": "client",
+            "usage_reported_by_provider": (t_in is not None
+                                           or t_out is not None),
+            "input_tokens": t_in, "output_tokens": t_out}, api_key)
+        return {"stored": True, "fingerprint": m["fp"],
+                "content_held_by": "client", "input_tokens": t_in,
+                "output_tokens": t_out, "receipt": seal,
+                "note": "the cost is on the record here; the answer itself "
+                        "stayed on your machine"}, 200
+
+    if not isinstance(req, dict) or not isinstance(resp, dict):
+        return {"error": "request_and_response_required",
+                "detail": "send request and response, or a digest with usage"}, 400
+
+    body = json.dumps(resp)
+    if len(body.encode("utf-8")) > MAX_STORED_BYTES:
+        return {"error": "response_too_large",
+                "limit_bytes": MAX_STORED_BYTES}, 413
+
+    fp = _fingerprint(req)
+    t_in, t_out = _usage(resp)
+
+    if not _deterministic(req) and not data.get("store_varied"):
+        with ctx.lock:
+            if t_in is not None or t_out is not None:
+                _spend(ctx, api_key, (t_in or 0) + (t_out or 0), now)
+            ctx.conn.commit()
+        ctx.seal("tokensaver_refused_to_store", {
+            "module": "tokensaver", "fingerprint": fp,
+            "reason": "temperature above zero; serving a stored answer "
+                      "would change how the system behaves"}, api_key)
+        return {
+            "stored": False,
+            "spend_recorded": (t_in is not None or t_out is not None),
+            "reason": "temperature is above zero. Serving a stored answer to "
+                      "a request that asked for varied output would change "
+                      "how your system behaves. Send store_varied true to "
+                      "override deliberately.",
+        }, 200
+
+    ttl = data.get("ttl_seconds", DEFAULT_TTL)
+    try:
+        ttl = float(ttl)
+    except (TypeError, ValueError):
+        ttl = DEFAULT_TTL
+    expires = now + ttl if ttl > 0 else None
+
+    with ctx.lock:
+        ctx.conn.execute(
+            "INSERT OR REPLACE INTO ts_store (api_key, fp, model, response, "
+            "input_tokens, output_tokens, stored_at, expires_at, hits, "
+            "last_hit) VALUES (?,?,?,?,?,?,?,?,0,NULL)",
+            (api_key, fp, req.get("model"), body, t_in, t_out, now, expires))
+        if t_in is not None or t_out is not None:
+            _spend(ctx, api_key, (t_in or 0) + (t_out or 0), now)
+        ctx.conn.commit()
+
+    seal = ctx.seal("tokensaver_store", {
+        "module": "tokensaver", "fingerprint": fp, "model": req.get("model"),
+        "usage_reported_by_provider": (t_in is not None or t_out is not None),
+        "input_tokens": t_in, "output_tokens": t_out}, api_key)
+
+    return {
+        "stored": True,
+        "fingerprint": fp,
+        "usage_reported_by_provider": (t_in is not None or t_out is not None),
+        "input_tokens": t_in,
+        "output_tokens": t_out,
+        "receipt": seal,
+        "note": "the next identical request will be served from store and "
+                "will buy nothing"
+                if (t_in is not None or t_out is not None) else
+                "stored, but the provider reported no usage, so future "
+                "savings on this request will be real without a known size",
+    }, 200
+
+
+def _spend(ctx, api_key, tokens, now):
+    ctx.conn.execute(
+        "INSERT INTO ts_account (api_key, ceiling, spent, updated) "
+        "VALUES (?,0,?,?) ON CONFLICT(api_key) DO UPDATE SET "
+        "spent = spent + ?, updated = ?",
+        (api_key, tokens, now, tokens, now))
+
+
+def _totals(ctx, api_key=None):
+    where = "WHERE api_key=?" if api_key else ""
+    args = (api_key,) if api_key else ()
+
+    rows = ctx.conn.execute(
+        "SELECT hits, input_tokens, output_tokens FROM ts_store " + where,
+        args).fetchall()
+    exact_in = exact_out = unknown = 0
+    for h, i, o in rows:
+        if i is None and o is None:
+            unknown += h
+            continue
+        exact_in += (i or 0) * h
+        exact_out += (o or 0) * h
+
+    counts = {}
+    for v, c in ctx.conn.execute(
+            "SELECT verdict, COUNT(*) FROM ts_decision " + where
+            + " GROUP BY verdict", args).fetchall():
+        counts[v] = c
+
+    crow = ctx.conn.execute(
+        "SELECT COALESCE(SUM(ceiling_in),0), COALESCE(SUM(ceiling_out),0) "
+        "FROM ts_decision " + (where + " AND " if where else "WHERE ")
+        + "verdict='BLOCK'", args).fetchone()
+
+    rules = {}
+    for r, c in ctx.conn.execute(
+            "SELECT rule, COUNT(*) FROM ts_decision "
+            + (where + " AND " if where else "WHERE ")
+            + "rule IS NOT NULL GROUP BY rule", args).fetchall():
+        rules[r] = c
+
+    total = sum(counts.values())
+    served = counts.get("SERVE", 0)
+
+    return {
+        "decisions": total,
+        "verdicts": counts,
+        "hard_rules_fired": rules,
+        "serve_rate_percent": round(100.0 * served / total, 2) if total else 0.0,
+        "tokens_not_bought": {
+            "input": exact_in,
+            "output": exact_out,
+            "total": exact_in + exact_out,
+            "certainty": "exact. Provider-reported counts on requests served "
+                         "from store.",
+        },
+        "worst_case_tokens_avoided": {
+            "estimated_input": crow[0],
+            "authorised_output": crow[1],
+            "certainty": "a ceiling on refused requests, not a saving. Never "
+                         "added to tokens not bought.",
+        },
+        "serves_with_no_usage_reported": unknown,
+        "stored_answers": len(rows),
+    }
+
+
+def _a_stats(ctx):
+    with ctx.lock:
+        t = _totals(ctx)
+    t["version"] = VERSION
+    t["model_calls_made_to_reach_a_decision"] = 0
+    t["note"] = ("No figure here is a percentage saved. Exact savings and "
+                 "worst case ceilings are reported apart and never summed.")
+    return t, 200
+
+
+def _a_ledger(ctx, api_key, data, now):
+    try:
+        limit = min(200, max(1, int(data.get("limit", 50))))
+    except (TypeError, ValueError):
+        limit = 50
+    with ctx.lock:
+        rows = ctx.conn.execute(
+            "SELECT ts, fp, verdict, rule, score, exact_in, exact_out, "
+            "ceiling_in, ceiling_out, audit_hash FROM ts_decision "
+            "WHERE api_key=? ORDER BY id DESC LIMIT ?",
+            (api_key, limit)).fetchall()
+        totals = _totals(ctx, api_key)
+        acct = _account(ctx, api_key)
+
+    out = {
+        "totals": totals,
+        "budget": {
+            "ceiling_tokens": acct["ceiling"],
+            "spent_tokens": acct["spent"],
+            "remaining_tokens": max(0, acct["ceiling"] - acct["spent"])
+                                if acct["ceiling"] else None,
+            "note": "no ceiling set; set one with budget"
+                    if not acct["ceiling"] else None,
+        },
+        "recent": [{
+            "ts": r[0], "fingerprint": r[1], "verdict": r[2], "rule": r[3],
+            "score": r[4],
+            "tokens_not_bought": ((r[5] or 0) + (r[6] or 0))
+                                 if r[2] == "SERVE" else 0,
+            "worst_case_avoided": ((r[7] or 0) + (r[8] or 0))
+                                  if r[2] == "BLOCK" else 0,
+            "receipt": r[9],
+        } for r in rows],
+    }
+    m = _money(totals["tokens_not_bought"]["input"],
+               totals["tokens_not_bought"]["output"],
+               acct["price_in"], acct["price_out"])
+    if m is not None:
+        out["money_not_spent_at_your_prices"] = m
+        out["currency"] = acct["currency"]
+        out["money_note"] = ("calculated only from provider-reported counts "
+                             "on requests served from store, at the prices "
+                             "you supplied")
+    return out, 200
+
+
+def _a_budget(ctx, api_key, data, now):
+    if "ceiling_tokens" not in data:
+        return {"error": "ceiling_tokens_required",
+                "detail": "the number of tokens this key may spend before "
+                          "every request is refused"}, 400
+    try:
+        ceiling = int(data["ceiling_tokens"])
+    except (TypeError, ValueError):
+        return {"error": "ceiling_tokens_must_be_a_whole_number"}, 400
+    if ceiling < 0:
+        return {"error": "ceiling_tokens_must_not_be_negative"}, 400
+
+    reset = bool(data.get("reset_spent"))
+    with ctx.lock:
+        ctx.conn.execute(
+            "INSERT INTO ts_account (api_key, ceiling, spent, updated) "
+            "VALUES (?,?,0,?) ON CONFLICT(api_key) DO UPDATE SET "
+            "ceiling=?, updated=?", (api_key, ceiling, now, ceiling, now))
+        if reset:
+            ctx.conn.execute("UPDATE ts_account SET spent=0 WHERE api_key=?",
+                             (api_key,))
+        acct = _account(ctx, api_key)
+        ctx.conn.commit()
+
+    seal = ctx.seal("tokensaver_budget", {
+        "module": "tokensaver", "ceiling_tokens": ceiling,
+        "spent_reset": reset}, api_key)
+
+    return {"ceiling_tokens": acct["ceiling"], "spent_tokens": acct["spent"],
+            "receipt": seal,
+            "note": "when spent reaches the ceiling, every request is refused "
+                    "before it reaches the model"}, 200
+
+
+def _a_prices(ctx, api_key, data, now):
+    """Prices come from the customer's own contract. Never assumed."""
+    pi = data.get("price_per_million_input")
+    po = data.get("price_per_million_output")
+    if pi is None and po is None:
+        return {"error": "prices_required",
+                "detail": "send price_per_million_input and/or "
+                          "price_per_million_output from your own provider "
+                          "contract. Nothing is assumed on your behalf."}, 400
+    try:
+        pi = float(pi) if pi is not None else None
+        po = float(po) if po is not None else None
+    except (TypeError, ValueError):
+        return {"error": "prices_must_be_numbers"}, 400
+    if (pi is not None and pi < 0) or (po is not None and po < 0):
+        return {"error": "prices_must_not_be_negative"}, 400
+
+    cur = (data.get("currency") or "").strip()[:8] or None
+    with ctx.lock:
+        ctx.conn.execute(
+            "INSERT INTO ts_account (api_key, ceiling, spent, price_in, "
+            "price_out, currency, updated) VALUES (?,0,0,?,?,?,?) "
+            "ON CONFLICT(api_key) DO UPDATE SET price_in=?, price_out=?, "
+            "currency=?, updated=?",
+            (api_key, pi, po, cur, now, pi, po, cur, now))
+        ctx.conn.commit()
+
+    seal = ctx.seal("tokensaver_prices", {
+        "module": "tokensaver", "price_per_million_input": pi,
+        "price_per_million_output": po, "currency": cur}, api_key)
+
+    return {"price_per_million_input": pi, "price_per_million_output": po,
+            "currency": cur, "receipt": seal,
+            "note": "money figures now appear alongside token figures. They "
+                    "are your prices applied to provider-reported counts, "
+                    "never an assumption about what you pay."}, 200
+
+
+def _a_forget(ctx, api_key, data, now):
+    fp = data.get("fingerprint")
+    req = data.get("request")
+    if not fp and isinstance(req, dict):
+        fp = _fingerprint(req)
+    if not fp:
+        return {"error": "fingerprint_or_request_required"}, 400
+
+    with ctx.lock:
+        cur = ctx.conn.execute(
+            "DELETE FROM ts_store WHERE api_key=? AND fp=?", (api_key, fp))
+        removed = cur.rowcount
+        ctx.conn.commit()
+
+    seal = ctx.seal("tokensaver_forget", {
+        "module": "tokensaver", "fingerprint": fp, "removed": removed},
+        api_key)
+
+    return {"removed": removed, "fingerprint": fp, "receipt": seal,
+            "note": "the stored answer is gone. Decisions already sealed "
+                    "stay sealed."}, 200
+
+
+def _a_verify(ctx, data):
+    h = data.get("receipt") or data.get("hash")
+    if not h:
+        return {"error": "receipt_required",
+                "detail": "pass ?receipt=<chain hash from a decision>"}, 400
+    with ctx.lock:
+        row = ctx.conn.execute(
+            "SELECT ts, verdict, rule, score, exact_in, exact_out, "
+            "ceiling_in, ceiling_out, fp FROM ts_decision WHERE audit_hash=?",
+            (h,)).fetchone()
+    if not row:
+        return {"found": False, "receipt": h,
+                "note": "no decision on this platform carries that receipt"}, 404
+    return {
+        "found": True,
+        "receipt": h,
+        "ts": row[0],
+        "verdict": row[1],
+        "meaning": VOCABULARY.get(row[1], row[1]),
+        "decided_by": ("hard rule: " + row[2]) if row[2] else "score",
+        "score": row[3],
+        "tokens_not_bought": ((row[4] or 0) + (row[5] or 0))
+                             if row[1] == "SERVE" else 0,
+        "worst_case_avoided": ((row[6] or 0) + (row[7] or 0))
+                              if row[1] == "BLOCK" else 0,
+        "fingerprint": row[8],
+        "what_this_proves": "that this decision was sealed into the chain "
+                            "with these values at this position.",
+        "what_this_does_not_prove": "that a stored answer is still correct, "
+                                    "or what a refused request would actually "
+                                    "have cost.",
+    }, 200
+
+
+# ---------------------------------------------------------------- handler
+# ---------------------------------------------------------------- the ctx
+
+def _fallback_conn():
+    global _FALLBACK_CONN
+    with _FALLBACK_LOCK:
+        if _FALLBACK_CONN is None:
+            _FALLBACK_CONN = sqlite3.connect("tokensaver.db",
+                                             check_same_thread=False)
+            _FALLBACK_CONN.execute("PRAGMA journal_mode=WAL")
+        return _FALLBACK_CONN
+
+
+class _Bridge:
+    """
+    A router may hand a module a context object, or a plain dict. Rather
+    than assume which, find what is actually needed: something that can
+    run SQL, something that can be held, and something that can seal.
+
+    Anything missing is reported honestly in the response instead of
+    being faked.
+    """
+
+    def __init__(self, raw):
+        self.raw = raw
+        self.conn = self._find(
+            lambda v: hasattr(v, "execute") and hasattr(v, "commit"),
+            ("conn", "db", "_conn", "_db", "database", "sql", "sqlite"))
+        self.lock = self._find(
+            lambda v: hasattr(v, "acquire") and hasattr(v, "release"),
+            ("lock", "db_lock", "_db_lock", "_lock", "mutex"))
+        # A sqlite3 Connection is itself callable, so "anything callable"
+        # is not a safe test for a seal function - it would quietly pick the
+        # database. Require an actual function or method.
+        self._seal = self._find(
+            lambda v: (inspect.isroutine(v)
+                       and v is not self.conn and v is not self.lock),
+            ("seal", "seal_fn", "seal_block", "add_block", "chain_seal",
+             "append_block"))
+        self.notes = []
+
+        if self.conn is None:
+            # Last resort so the module still answers rather than 500s.
+            self.conn = _fallback_conn()
+            self.notes.append("no database was found in the router context, so "
+                              "this module opened its own file")
+        if self.lock is None:
+            self.lock = _FALLBACK_LOCK
+            self.notes.append("no lock was found in the router context, so "
+                              "this module used its own")
+        if self._seal is None:
+            self.notes.append("no seal function was found in the router "
+                              "context, so decisions are recorded but not "
+                              "sealed into the platform chain")
+
+    def _find(self, test, names):
+        raw = self.raw
+        if isinstance(raw, dict):
+            for n in names:                      # preferred names first
+                if n in raw and raw[n] is not None:
+                    try:
+                        if test(raw[n]):
+                            return raw[n]
+                    except Exception:            # noqa: BLE001
+                        pass
+            for v in raw.values():               # then anything that fits
+                try:
+                    if v is not None and test(v):
+                        return v
+                except Exception:                # noqa: BLE001
+                    pass
+            return None
+        for n in names:
+            v = getattr(raw, n, None)
+            if v is not None:
+                try:
+                    if test(v):
+                        return v
+                except Exception:                # noqa: BLE001
+                    pass
+        return None
+
+    def seal(self, event, detail, api_key=None):
+        """
+        MUST NOT be called while holding self.lock. The platform's own seal
+        takes that same lock, and it is a plain Lock rather than a reentrant
+        one, so calling it from inside a held lock deadlocks the request.
+        """
+        if self._seal is None:
+            return {"sealed": False,
+                    "reason": "the platform chain was not reachable from this "
+                              "module"}
+
+        ev = {"user_id": "tokensaver", "action": str(event), "amount": 0,
+              "country": "UK", "device_id": "module", "anomaly": 0,
+              "device_risk": 0}
+        now = time.time()
+
+        attempts = (
+            lambda: self._seal(ev, detail, now, api_key),
+            lambda: self._seal(ev, detail, now),
+            lambda: self._seal(event, detail),
+            lambda: self._seal({"event": event, "detail": detail}),
+        )
+        r = None
+        last = None
+        for call in attempts:
+            try:
+                r = call()
+                break
+            except TypeError as e:
+                last = e
+                continue
+            except Exception as e:               # noqa: BLE001
+                return {"sealed": False, "reason": str(e)}
+        if r is None:
+            return {"sealed": False,
+                    "reason": "could not match the chain's seal signature: "
+                              + str(last)}
+
+        if isinstance(r, dict):
+            return r
+        if isinstance(r, str):
+            return {"hash": r}
+        if isinstance(r, (list, tuple)) and r:
+            out = {"hash": str(r[0])}
+            if len(r) > 1 and r[1] is not None:
+                out["block_index"] = r[1]
+            if len(r) > 2 and r[2] is not None:
+                out["key_seq"] = r[2]
+            return out
+        return {"sealed": True}
+
+
+_FALLBACK_LOCK = threading.RLock()
+_FALLBACK_CONN = None
+
+
+def _bridge(raw):
+    """
+    Built fresh every call on purpose. Caching it by id() is unsafe:
+    Python recycles ids once an object is collected, so a cached bridge
+    can end up serving a different request's context.
+    """
+    if isinstance(raw, _Bridge):
+        return raw
+    return _Bridge(raw)
 
 
 def handle(method, action, data, api_key, ctx):
-    if method != "GET":
-        return {"error": "unknown_action", "action": action}, 404
+    ctx = _bridge(ctx)
+    _init(ctx)
+    data = data or {}
+    now = time.time()
 
-    mods = _modules()
+    if method == "GET" and action == "spec":
+        sp = _a_spec()
+        if ctx.notes:
+            sp["wiring_notes"] = ctx.notes
+        return sp, 200
+    if method == "GET" and action == "stats":
+        return _a_stats(ctx)
+    if method == "GET" and action == "verify":
+        return _a_verify(ctx, data)
 
-    if action == "modules":
-        return {"count": len(mods), "modules": mods}, 200
+    if not api_key:
+        return {"error": "key_required"}, 401
 
-    if action in ("", "all"):
-        return {
-            "spec_version": VERSION,
-            "generated": "live - discovered at request time, not a stored list",
-            "core": {
-                "decision_engine": {
-                    "path": "/api/govern",
-                    "method": "POST",
-                    "auth": "Bearer key",
-                    "note": "deterministic scoring, verdict sealed before the response returns"
-                },
-                "notaries_public": [
-                    {"method": "POST", "path": "/api/post/seal", "auth": "none"},
-                    {"method": "GET", "path": "/api/verify-post", "auth": "none"},
-                    {"method": "POST", "path": "/api/identity/seal", "auth": "none"},
-                    {"method": "GET", "path": "/api/identity/check", "auth": "none"},
-                    {"method": "POST", "path": "/api/payment/seal", "auth": "none"},
-                    {"method": "GET", "path": "/api/payment/check", "auth": "none"}
-                ],
-                "verification_public": [
-                    {"method": "GET", "path": "/api/verify-chain",
-                     "returns": "whole-chain integrity, recomputed"},
-                    {"method": "GET", "path": "/api/inclusion",
-                     "returns": "whether a given 64-char hash is sealed"},
-                    {"method": "GET", "path": "/api/anchor-status",
-                     "returns": "current tip, OpenTimestamps proof, calendar count"},
-                    {"method": "GET", "path": "/api/regulation-map",
-                     "returns": "engine features mapped to legal obligations"}
-                ]
-            },
-            "modules": {
-                "prefix": "/x/<module>/<action>",
-                "auth": "Bearer key on every module route",
-                "count": len(mods),
-                "loaded": mods
-            },
-            "chain": {
-                "algorithm": "SHA-256 hash chain",
-                "scope": "one chain - every module seals into the same sequence as /api/govern",
-                "anchoring": "chain tip submitted to OpenTimestamps, aggregated into a Merkle root, root committed to Bitcoin by several independent calendars",
-                "receipts": "gapless per-key sequence issued in the same transaction as the chain write",
-                "verify": "/api/verify-chain and /api/anchor-status, both without a key"
-            },
-            "honest_note": "This spec is generated by reading the modules directory at request time rather than from a stored list, so it cannot describe capabilities that are not actually loaded."
-        }, 200
+    if method == "POST" and action == "estimate":
+        return _a_estimate(ctx, api_key, data, now)
+    if method == "POST" and action == "gate":
+        return _a_gate(ctx, api_key, data, now)
+    if method == "POST" and action == "record":
+        return _a_record(ctx, api_key, data, now)
+    if method == "GET" and action == "ledger":
+        return _a_ledger(ctx, api_key, data, now)
+    if method == "POST" and action == "budget":
+        return _a_budget(ctx, api_key, data, now)
+    if method == "POST" and action == "prices":
+        return _a_prices(ctx, api_key, data, now)
+    if method == "POST" and action == "forget":
+        return _a_forget(ctx, api_key, data, now)
 
-    return {"error": "unknown_action", "action": action,
-            "available": ["", "modules"]}, 404
+    return {"error": "unknown_action",
+            "actions": ["spec", "stats", "verify", "estimate", "gate",
+                        "record", "ledger", "budget", "prices", "forget"]}, 404
 
 ```
 
 
-## `modules/standard.py`
+## `modules/verifier.py`
 
-422 lines, 19423 bytes
+717 lines, 26299 bytes
 
 ```python
+#!/usr/bin/env python3
 """
-modules/standard.py  -  the Ordering Test discovery document for this domain
+modules/verifier.py  -  hand the verifier out at a URL
 
-WHAT IT SERVES
---------------
-  GET /.well-known/ordering-test.json   this operator's discovery document
-  GET /x/standard/hash                  sha256 of that document
-  GET /x/standard/status                what is installed, and honest counts
+WHY THIS EXISTS
+---------------
+A proof that can only be checked by the party who issued it is not a proof.
+So the proof bundles at /x/continuity/proof are useless unless somebody can
+easily get hold of something that checks them, and telling people to clone a
+repository is a gate.
 
-SHAPE
------
-Deliberately identical to the shape Red Flag AI Pro published first:
+This serves the standalone verifier as a plain file:
 
-    checks: { <name>: { supported, demonstrable_publicly, endpoint, note } }
+    curl -sO https://sebbi.pro/verify-authority.py
+    curl -s "https://sebbi.pro/x/continuity/proof?evaluation=e_..." \\
+        | python3 verify-authority.py -
 
-Two fields, not one, and the second is the better idea. "We built it" and
-"you can verify it without an account" are different claims, and most of this
-market blurs them. Separating them lets a vendor be honest about having
-something real that an outsider still has to take on trust.
+The script it hands out has no dependencies and makes no network calls. It
+checks the Ed25519 signature, recomputes every digest, re-runs the whole
+derivation from the published rules, and reaches its own verdict - then says
+so if that verdict disagrees with ours.
 
-WHAT THE HOST HEADER IS DOING HERE
-----------------------------------
-base_url is derived from the request rather than written into the file. An
-earlier draft had the domain hardcoded, which meant any operator running it
-would publish somebody else's domain as the source - the opposite of a mirror.
-Deriving it means this file can be lifted to any domain and tells the truth
-about wherever it is actually running.
+WHAT IT DELIBERATELY DOES NOT DO
+--------------------------------
+It does not phone home, and this module records nothing about who downloaded
+it. A verification tool that reports back to the party being verified is not
+a verification tool.
 
-EVERY PUBLISHED ENDPOINT MUST WORK AS WRITTEN
----------------------------------------------
-An endpoint marked demonstrable_publicly is a promise that a stranger can copy
-it out of this document and get an answer. If the route needs a parameter, the
-document names that parameter. If a value has to be discovered first, the
-document says where to discover it. An endpoint that errors when followed
-literally is a failed check, not a documentation detail.
-
-HONESTY RULES THIS FILE FOLLOWS
--------------------------------
-  - A check we have not built says supported: false. It does not quietly go
-    missing from the document.
-  - A check that exists but needs an account says demonstrable_publicly:
-    false, however much we would like the tick.
-  - runner is null. A runner exists in draft, but the checks have not been
-    jointly agreed with the other mirror, so publishing one as though it were
-    a settled standard would claim something neither operator has earned yet.
-
-None of that is modesty. A conformance document whose author scores full marks
-on the day they publish it is a marketing page.
+    GET /verify-authority.py   the script
+    GET /x/verifier/status     what is installed, and the script's digest
 """
 
 import hashlib
-import json
 import sys
 
-VERSION = "1.2"
-ORDERING_TEST_VERSION = "0.1"
+VERSION = "1.1"
 
-PUBLIC = {("GET", "status"), ("GET", "hash"), ("GET", "spec"),
-          ("GET", "document")}
+PUBLIC = {("GET", "status")}
 
-# Several paths on purpose. /.well-known/ is where the standard says to look,
-# but some platforms and static handlers reserve that prefix, so a plain root
-# path is served as well. /x/standard/document goes through the normal router
-# and cannot be intercepted by anything, which makes it the diagnostic.
-DISCOVERY_PATHS = ("/.well-known/ordering-test.json",
-                   "/ordering-test.json",
-                   "/well-known/ordering-test.json")
-
-VENDOR = "AILeash"
-FALLBACK_BASE = "https://sebbi.pro"
-
-RUNNER = None
-RUNNER_NOTE = (
-    "No shared runner file is published here yet. The checks themselves have "
-    "not been jointly agreed with the other mirrors as of this document's "
-    "publication. This describes AILeash's own side only, not a settled "
-    "cross-vendor standard.")
-
-# Order follows the other mirror's document so the two read side by side.
-CHECKS = {
-    "rule_binding": {
-        "supported": True,
-        "demonstrable_publicly": True,
-        "endpoint": "/x/rulebind/prove",
-        "note": ("The ruleset version is a component of a digest sealed with the "
-                 "decision, not a field beside it. POST any inputs without an "
-                 "account and the response returns the exact string that was "
-                 "hashed - SHA-256 it yourself and confirm it matches. Alter the "
-                 "ruleset hash and the digest stops recomputing; alter the digest "
-                 "and the chain breaks. Verify a past record at "
-                 "/x/rulebind/verify?receipt=... and see ruleset history at "
-                 "/x/rulebind/packs. No scoring logic is disclosed at any point - "
-                 "inputs are published as a digest, never as values."),
-    },
-    "commit_before_reveal": {
-        "supported": True,
-        "demonstrable_publicly": True,
-        "endpoint": "/x/demo/review",
-        "note": ("The reviewer receives the case with the machine verdict "
-                 "withheld. Their own call and dwell time are sealed first, "
-                 "then the verdict is revealed, and the chain fixes that order "
-                 "permanently. No account needed - open a case, commit a "
-                 "verdict, and check the block indices yourself. Commit "
-                 "endpoint is /x/demo/commit."),
-    },
-    "authority_tokens": {
-        "supported": True,
-        "demonstrable_publicly": True,
-        "endpoint": "/x/continuity/decisions",
-        "note": ("Authority is derived, not looked up. Every grant points at a "
-                 "parent and terminates at a human principal; scope, limits, "
-                 "purpose and validity must narrow at every hop; and the whole "
-                 "chain is re-derived at the instant of execution rather than "
-                 "trusted from the instant of issue. A decision beyond delegated "
-                 "authority escalates rather than executes. Issuing and exercising "
-                 "authority are keyed, but the record is not: /x/continuity/decisions "
-                 "lists real sealed evaluations without an account, and any id from "
-                 "it opens at /x/continuity/decision and /x/continuity/trace, which "
-                 "returns the full authority path with the grant and invariant that "
-                 "broke. Blocks are listed alongside allows, because a refusal with "
-                 "no public record is indistinguishable from never having been asked. "
-                 "An empty list means no authority has been exercised yet, not that "
-                 "none failed. Derivation rules at /x/continuity/spec."),
-    },
-    "mutual_witnessing": {
-        "supported": True,
-        "demonstrable_publicly": True,
-        "endpoint": "/x/witness/peers",
-        "note": ("Live, running both directions with an external peer chain "
-                 "hourly since 1 August 2026. No account needed, run it "
-                 "yourself. Our current tip is at /x/witness/tip and any party "
-                 "can submit theirs at /x/witness/observe without an account."),
-    },
-    "completeness_proof": {
-        "supported": True,
-        "demonstrable_publicly": True,
-        "endpoint": "/x/complete/root?period={period}&kind=receipts",
-        "note": ("Per-period sorted Merkle root and exact leaf count, committed "
-                 "before any export is requested. An export can then be checked "
-                 "against a number fixed before anyone knew it would be asked "
-                 "for. Committed periods are listed at /x/complete/periods - "
-                 "take a period identifier from there and substitute it. Only "
-                 "closed periods can be committed, so the current period will "
-                 "not appear until it ends. A period listed nowhere is a period "
-                 "nobody committed, which is itself the finding."),
-    },
-    "absence_proof": {
-        "supported": True,
-        "demonstrable_publicly": True,
-        "endpoint": "/x/complete/prove?period={period}&value={value}",
-        "note": ("Two adjacent leaves with consecutive indices demonstrate that "
-                 "nothing sits between them, so absence is proved rather than "
-                 "asserted. Both parameters are required: take a period from "
-                 "/x/complete/periods and supply any value you like. Try a "
-                 "value that is not there."),
-    },
-    "reconciliation": {
-        "supported": True,
-        "demonstrable_publicly": True,
-        "endpoint": "/x/reconcile/public",
-        "note": ("The sample is derived from the chain tip and sealed BEFORE any "
-                 "data is requested, so the operator cannot choose which records "
-                 "get examined or prepare only the flattering ones. Planning and "
-                 "submitting are keyed because they touch an operator's own "
-                 "records, but the part that decides whether any of it means "
-                 "anything is not: /x/reconcile/public gives run counts, match "
-                 "rates and mismatches without an account, and "
-                 "/x/reconcile/proof?id=RUN-XXXXXXXX shows the two sealed block "
-                 "indices so anyone can confirm the selection block precedes the "
-                 "result block. Abandoned runs are published too - a plan is "
-                 "sealed when it is planned, so a test that came back badly and "
-                 "was dropped stays visible forever as a plan with no result. "
-                 "What this does not prove: that the records are true. Two "
-                 "systems the operator controls agreeing with each other is "
-                 "consistency, not truth."),
-    },
-    "reproducibility": {
-        "supported": True,
-        "demonstrable_publicly": True,
-        "endpoint": "/x/replay/challenge",
-        "note": ("Determinism proved by public challenge without disclosing any "
-                 "scoring logic. Submit inputs, the run is sealed, resubmit the "
-                 "same inputs later and the verdict must be identical under an "
-                 "unchanged code fingerprint at /x/replay/fingerprint."),
-    },
-    "consistency_proof": {
-        "supported": True,
-        "demonstrable_publicly": True,
-        "endpoint": "/x/consistency/proof?first={first}&second={second}",
-        "note": ("RFC 6962 consistency proofs, deliberately unmodified so "
-                 "existing Certificate Transparency verifiers work against them "
-                 "directly. first and second are tree sizes - read the current "
-                 "size from /x/consistency/root and pick any earlier one. "
-                 "Anyone holding any earlier tip we served can show it is a "
-                 "prefix of the current log at /x/consistency/ancestor."),
-    },
-
-    # ---- proposed addition, flagged as a proposal rather than assumed ----
-    "external_anchoring": {
-        "supported": True,
-        "demonstrable_publicly": True,
-        "endpoint": "/api/anchor-status",
-        "note": ("PROPOSED AS A SEPARATE CHECK, not settled. The other mirror "
-                 "currently folds anchoring into consistency_proof, but they "
-                 "answer different questions: consistency shows the log only "
-                 "ever grew, anchoring shows the time was fixed somewhere the "
-                 "operator cannot reach. A log can be perfectly append-only and "
-                 "still have been built last week. Here the tip is submitted to "
-                 "OpenTimestamps and committed into Bitcoin; the other mirror "
-                 "uses an RFC 3161 timestamp. The spec should permit any "
-                 "external authority the operator does not control and require "
-                 "it to be named - not mandate one. Offered for the joint "
-                 "session."),
-    },
-}
-
-DOCUMENT_NOTE = (
-    "Every endpoint marked demonstrable_publicly is unauthenticated by design - "
-    "run it yourself without asking us. Where an endpoint carries a {parameter}, "
-    "the note for that check says where to get a valid value; every published "
-    "endpoint is meant to work when followed literally, and one that does not is "
-    "a failed check on our side, not a quibble. Checks marked supported but not "
-    "demonstrable_publicly are real and built, but currently need a key to see, "
-    "and say so plainly rather than passing on the day this was published. "
-    "Nothing here proves the records are true. It describes the order things "
-    "were committed in, which is a narrower claim and the only one that holds.")
+# Deliberately NOT "/verify" - that is the sealed-post verification page and
+# this module would silently hijack it, handing a visitor a Python download
+# where they expected a page. A route grab is a bug even when the code works.
+FILE_PATHS = ("/verify-authority.py", "/verify_authority.py")
 
 _patched = [False]
 
 
-def _base_from(handler):
-    """Derive our own base URL from the request. An operator running this file
-    on their own domain publishes their domain, not whoever wrote it."""
+SCRIPT = r'''#!/usr/bin/env python3
+"""
+verify_authority.py  -  check an AILeash authority proof without AILeash
+
+    python3 verify_authority.py proof.json
+    curl -s "https://sebbi.pro/x/continuity/proof?evaluation=e_..." \\
+        | python3 verify_authority.py -
+
+WHAT THIS IS FOR
+----------------
+A proof that can only be checked by the party who issued it is not a proof.
+This script takes a bundle and reaches its own conclusion using nothing but
+the Python standard library. It does not call the issuing system, it does not
+import anything you have to install, and it does not take a single field of
+the bundle at face value.
+
+It does four separate things, and each one can fail on its own:
+
+  1. SIGNATURE   Ed25519 over the canonical bundle. Confirms the bundle came
+                 from the holder of the named key and has not been edited by
+                 anybody since.
+
+  2. INTEGRITY   Recomputes every grant digest, the lineage digest and the
+                 parameter digest from the fields in front of it. Confirms
+                 the bundle is internally consistent with its own contents.
+
+  3. DERIVATION  Re-runs the authority rules from scratch: root issued by a
+                 human, an unbroken parent chain, scope covered at every hop,
+                 constraints narrowing on every axis, purpose narrowing,
+                 validity windows contained, nothing revoked, and the action
+                 itself inside the effective limits of the whole lineage.
+
+  4. AGREEMENT   Compares the verdict this script reached with the verdict the
+                 bundle claims. Disagreement is reported as a failure of the
+                 issuer, not of this script.
+
+WHAT A PASS MEANS
+-----------------
+That the authority for this action was derivable, at that time, from that
+human grant - or, for a refusal, that it genuinely was not, and that the named
+grant and invariant really are where it broke.
+
+WHAT A PASS DOES NOT MEAN
+-------------------------
+That the root grant should ever have been issued. That the parameters describe
+something that really happened. That the risk engine was right. Derivation is
+not merit and it is not truth.
+
+The risk half of a composed verdict cannot be re-derived here, because that
+needs the issuer's scoring engine. Where the bundle's authority verdict is
+BLOCK, the composed verdict stands regardless, because the composition takes
+the worse of the two.
+"""
+
+import binascii
+import hashlib
+import json
+import sys
+
+GRANT_PREFIX = b"AILEASH-GRANT-v1:"
+EVAL_PREFIX = b"AILEASH-AUTHEVAL-v1:"
+BUNDLE_PREFIX = b"AILEASH-AUTHORITY-PROOF-v1:"
+
+MAX_DEPTH = 32
+RANK = {"ALLOW": 0, "CHALLENGE": 1, "BLOCK": 2}
+
+
+# ======================================================================
+# Ed25519, RFC 8032, standard library only
+# ======================================================================
+
+_Q = 2 ** 255 - 19
+_L = 2 ** 252 + 27742317777372353535851937790883648493
+_D = -121665 * pow(121666, _Q - 2, _Q) % _Q
+_I = pow(2, (_Q - 1) // 4, _Q)
+
+
+def _h(m):
+    return hashlib.sha512(m).digest()
+
+
+def _inv(x):
+    return pow(x, _Q - 2, _Q)
+
+
+def _xrecover(y):
+    xx = (y * y - 1) * _inv(_D * y * y + 1)
+    x = pow(xx, (_Q + 3) // 8, _Q)
+    if (x * x - xx) % _Q != 0:
+        x = (x * _I) % _Q
+    if x % 2 != 0:
+        x = _Q - x
+    return x
+
+
+_BY = 4 * _inv(5) % _Q
+_BX = _xrecover(_BY)
+_B = (_BX % _Q, _BY % _Q, 1, (_BX * _BY) % _Q)
+_IDENT = (0, 1, 1, 0)
+
+
+def _add(p, q):
+    x1, y1, z1, t1 = p
+    x2, y2, z2, t2 = q
+    a = (y1 - x1) * (y2 - x2) % _Q
+    b = (y1 + x1) * (y2 + x2) % _Q
+    c = t1 * 2 * _D * t2 % _Q
+    dd = z1 * 2 * z2 % _Q
+    e, f, g, hh = b - a, dd - c, dd + c, b + a
+    return (e * f % _Q, g * hh % _Q, f * g % _Q, e * hh % _Q)
+
+
+def _scalarmult(p, e):
+    if e == 0:
+        return _IDENT
+    q = _scalarmult(p, e // 2)
+    q = _add(q, q)
+    if e & 1:
+        q = _add(q, p)
+    return q
+
+
+def _encodepoint(p):
+    x, y, z, _t = p
+    zi = _inv(z)
+    x, y = x * zi % _Q, y * zi % _Q
+    bits = [(y >> i) & 1 for i in range(255)] + [x & 1]
+    return bytes(sum(bits[i * 8 + j] << j for j in range(8)) for i in range(32))
+
+
+def _bit(h, i):
+    return (h[i // 8] >> (i % 8)) & 1
+
+
+def _hint(m):
+    h = _h(m)
+    return sum(2 ** i * _bit(h, i) for i in range(512))
+
+
+def _isoncurve(p):
+    x, y, z, t = p
+    return (z % _Q != 0 and x * y % _Q == z * t % _Q
+            and (y * y - x * x - z * z - _D * t * t) % _Q == 0)
+
+
+def _decodepoint(s):
+    y = int.from_bytes(s, "little") & ((1 << 255) - 1)
+    x = _xrecover(y)
+    if x & 1 != _bit(s, 255):
+        x = _Q - x
+    p = (x, y, 1, (x * y) % _Q)
+    if not _isoncurve(p):
+        raise ValueError("point off curve")
+    return p
+
+
+def ed25519_verify(sig, msg, pk):
+    if len(sig) != 64 or len(pk) != 32:
+        return False
     try:
-        host = handler.headers.get("X-Forwarded-Host") or handler.headers.get("Host")
-        if not host:
-            return FALLBACK_BASE
-        host = host.split(",")[0].strip()[:200]
-        proto = (handler.headers.get("X-Forwarded-Proto") or "https").split(",")[0].strip()
-        if proto not in ("http", "https"):
-            proto = "https"
-        return proto + "://" + host
+        rr = _decodepoint(sig[:32])
+        a = _decodepoint(pk)
     except Exception:
-        return FALLBACK_BASE
+        return False
+    s = int.from_bytes(sig[32:64], "little")
+    if s >= _L:
+        return False
+    hh = _hint(sig[:32] + pk + msg)
+    return _encodepoint(_scalarmult(_B, s)) == _encodepoint(_add(rr, _scalarmult(a, hh)))
 
 
-def _base_from_ctx(ctx):
-    """Same derivation for the routed /x/standard/document call.
+# ======================================================================
+# the rules, reimplemented from the published spec
+# ======================================================================
 
-    The router's ctx may or may not carry the request handler. If it does, the
-    document served through the router names the same domain as the one served
-    at /.well-known/ - which matters on a mirror, where hardcoding would make
-    this file publish somebody else's domain again."""
-    try:
-        if isinstance(ctx, dict):
-            for key in ("handler", "h", "request", "req", "self"):
-                obj = ctx.get(key)
-                if obj is not None and hasattr(obj, "headers"):
-                    return _base_from(obj)
-            headers = ctx.get("headers")
-            if headers is not None:
-                class _Shim(object):
-                    pass
-                shim = _Shim()
-                shim.headers = headers
-                return _base_from(shim)
-        elif ctx is not None and hasattr(ctx, "headers"):
-            return _base_from(ctx)
-    except Exception:
-        pass
-    return FALLBACK_BASE
+def canon(obj):
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
 
 
-def _document(base):
-    checks = {}
-    for name, c in CHECKS.items():
-        checks[name] = {
-            "supported": c["supported"],
-            "demonstrable_publicly": c["demonstrable_publicly"],
-            "endpoint": c["endpoint"],
-            "note": c["note"],
-        }
-    return {
-        "ordering_test_version": ORDERING_TEST_VERSION,
-        "vendor": VENDOR,
-        "base_url": base,
-        "runner": RUNNER,
-        "runner_note": RUNNER_NOTE,
-        "checks": checks,
-        "witness_peers": base + "/x/witness/peers",
-        "witness_tip": base + "/x/witness/tip",
-        "committed_periods": base + "/x/complete/periods",
-        "note": DOCUMENT_NOTE,
+def sha(prefix, text):
+    return hashlib.sha256(prefix + text.encode("utf-8")).hexdigest()
+
+
+def grant_digest(g):
+    material = {
+        "id": g["id"], "parent": g["parent"], "issuer": g["issuer"],
+        "issuer_kind": g["issuer_kind"], "subject": g["subject"],
+        "subject_kind": g["subject_kind"], "scope": sorted(g["scope"]),
+        "constraints": g["constraints"], "purpose": g["purpose"],
+        "purpose_tags": sorted(g["purpose_tags"]),
+        "not_before": g["not_before"], "not_after": g["not_after"],
+        "depth": g["depth"], "delegations_left": g["delegations_left"],
+        "created": g["created"], "risk_accepted_by": g.get("risk_accepted_by"),
     }
+    return sha(GRANT_PREFIX, canon(material))
 
 
-def _digest(doc):
-    return hashlib.sha256(
-        json.dumps(doc, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+def covers(held, wanted):
+    if held == wanted or held == "*":
+        return True
+    if held.endswith(".*"):
+        return wanted == held[:-2] or wanted.startswith(held[:-1])
+    return False
+
+
+def wildcard_breadth(scope, capability):
+    best = None
+    for held in scope:
+        if not covers(held, capability):
+            continue
+        if held == capability:
+            return 0
+        width = (capability.count(".") + 2 if held == "*"
+                 else capability.count(".") - held[:-2].count("."))
+        best = width if best is None else min(best, width)
+    return best
+
+
+def direction(key):
+    for p in ("max_", "min_", "allowed_", "denied_", "may_"):
+        if key.startswith(p):
+            return p
+    return None
+
+
+def num(v):
+    if isinstance(v, bool) or v is None:
+        raise ValueError("not a number")
+    return float(v)
+
+
+def as_set(v):
+    if isinstance(v, (list, tuple, set)):
+        return set(v)
+    return {v}
+
+
+def narrower(parent_c, child_c):
+    for key in sorted(child_c):
+        d = direction(key)
+        cval = child_c[key]
+        if d is None:
+            return False, "constraint '%s' has no narrowing rule" % key
+        if key not in parent_c:
+            return False, "constraint '%s' is not expressed by the parent" % key
+        pval = parent_c[key]
+        try:
+            if d == "max_" and num(cval) > num(pval):
+                return False, "%s raised from %s to %s" % (key, pval, cval)
+            if d == "min_" and num(cval) < num(pval):
+                return False, "%s lowered from %s to %s" % (key, pval, cval)
+            if d == "allowed_" and not as_set(cval) <= as_set(pval):
+                return False, "%s adds values the parent does not hold" % key
+            if d == "denied_" and not as_set(pval) <= as_set(cval):
+                return False, "%s drops values the parent denies" % key
+            if d == "may_" and bool(cval) and not bool(pval):
+                return False, "%s enabled where the parent withholds it" % key
+        except (TypeError, ValueError):
+            return False, "constraint '%s' is not comparable" % key
+    return True, None
+
+
+def effective(chain):
+    eff = {}
+    for g in chain:
+        for k, v in g["constraints"].items():
+            d = direction(k)
+            if k not in eff:
+                eff[k] = v
+                continue
+            cur = eff[k]
+            try:
+                if d == "max_":
+                    eff[k] = min(num(cur), num(v))
+                elif d == "min_":
+                    eff[k] = max(num(cur), num(v))
+                elif d == "allowed_":
+                    eff[k] = sorted(as_set(cur) & as_set(v))
+                elif d == "denied_":
+                    eff[k] = sorted(as_set(cur) | as_set(v))
+                elif d == "may_":
+                    eff[k] = bool(cur) and bool(v)
+            except (TypeError, ValueError):
+                eff[k] = v
+    return eff
+
+
+def params_against(params, eff):
+    hard, unconstrained = [], []
+    for key in sorted(params):
+        val = params[key]
+        checked = False
+        for cname, cval in eff.items():
+            d = direction(cname)
+            if not d or cname[len(d):] != key:
+                continue
+            checked = True
+            try:
+                if d == "max_" and num(val) > num(cval):
+                    hard.append("%s=%s exceeds %s=%s" % (key, val, cname, cval))
+                elif d == "min_" and num(val) < num(cval):
+                    hard.append("%s=%s is below %s=%s" % (key, val, cname, cval))
+                elif d == "allowed_" and val not in as_set(cval):
+                    hard.append("%s=%s is outside %s" % (key, val, cname))
+                elif d == "denied_" and val in as_set(cval):
+                    hard.append("%s=%s is denied by %s" % (key, val, cname))
+                elif d == "may_" and bool(val) and not bool(cval):
+                    hard.append("%s requested where %s withholds it" % (key, cname))
+            except (TypeError, ValueError):
+                hard.append("%s cannot be compared with %s" % (key, cname))
+        if not checked:
+            unconstrained.append(key)
+    return hard, unconstrained
+
+
+# ======================================================================
+# the four checks
+# ======================================================================
+
+class Report(object):
+    def __init__(self):
+        self.rows = []
+        self.failed = False
+
+    def add(self, ok, name, detail=""):
+        self.rows.append((ok, name, detail))
+        if not ok:
+            self.failed = True
+
+    def note(self, name, detail=""):
+        self.rows.append((None, name, detail))
+
+    def render(self):
+        out = []
+        for ok, name, detail in self.rows:
+            mark = "  ok  " if ok else ("FAIL  " if ok is False else "  --  ")
+            out.append(mark + name + (("\n        " + detail) if detail else ""))
+        return "\n".join(out)
+
+
+def check_signature(bundle, rep):
+    sig_hex = bundle.get("signature")
+    pk_hex = (bundle.get("issued_by") or {}).get("public_key")
+    if not sig_hex or not pk_hex:
+        rep.add(False, "Signature present", "the bundle carries no signature or no key")
+        return
+    body = dict(bundle)
+    body.pop("signature", None)
+    body.pop("verify_with", None)
+    try:
+        sig = binascii.unhexlify(sig_hex)
+        pk = binascii.unhexlify(pk_hex)
+    except Exception:
+        rep.add(False, "Signature is readable hex")
+        return
+    ok = ed25519_verify(sig, BUNDLE_PREFIX + canon(body).encode("utf-8"), pk)
+    rep.add(ok, "Ed25519 signature over the canonical bundle",
+            "key " + pk_hex[:16] + "…  Verify this key independently at the issuer's "
+            "published address before trusting who signed." if ok else
+            "the bundle was altered after signing, or it was not signed by this key")
+
+
+def check_integrity(bundle, rep):
+    lineage = bundle.get("lineage") or []
+    bad = []
+    for g in lineage:
+        try:
+            if grant_digest(g) != g.get("digest"):
+                bad.append(g.get("id"))
+        except Exception:
+            bad.append(g.get("id"))
+    rep.add(not bad, "Every grant digest recomputes from its own fields",
+            "" if not bad else "mismatched: " + ", ".join(str(b) for b in bad))
+
+    claimed = (bundle.get("decision") or {}).get("lineage_digest")
+    mine = sha(EVAL_PREFIX, canon([g.get("digest") for g in lineage]))
+    rep.add(mine == claimed, "Lineage digest matches the ordered path",
+            "" if mine == claimed else "computed " + mine[:20] + "… claimed " + str(claimed)[:20] + "…")
+
+    req = bundle.get("request") or {}
+    claimed_p = (bundle.get("decision") or {}).get("params_digest")
+    mine_p = sha(EVAL_PREFIX, canon({"action": req.get("action"),
+                                     "params": req.get("params") or {}}))
+    rep.add(mine_p == claimed_p, "Parameter digest matches the request as stated",
+            "" if mine_p == claimed_p else "the parameters shown are not the "
+            "parameters that were judged")
+
+
+def rederive(bundle, rep):
+    """Run the published rules from scratch and reach an independent verdict."""
+    lineage = bundle.get("lineage") or []
+    decision = bundle.get("decision") or {}
+    req = bundle.get("request") or {}
+    at = decision.get("evaluated_at_epoch")
+
+    hard, soft = [], []
+    broken_at = broken_invariant = None
+
+    def fail(grant, invariant, detail):
+        nonlocal broken_at, broken_invariant
+        hard.append(detail)
+        if broken_at is None:
+            broken_at, broken_invariant = grant, invariant
+
+    if not lineage:
+        fail(None, "authority_continuity", "the bundle carries no authority path")
+    else:
+        root = lineage[0]
+        if root.get("parent") is not None:
+            fail(root["id"], "authority_continuity",
+                 "the path does not begin at a parentless root")
+        if root.get("issuer_kind") != "human":
+            fail(root["id"], "identity_continuity",
+                 "the root grant was not issued by a human principal")
+
+        previous = None
+        for g in lineage:
+            if g.get("revoked_at") is not None:
+                fail(g["id"], "authority_continuity",
+                     "grant %s was revoked" % g["id"])
+            if at is not None:
+                if at < g["not_before"]:
+                    fail(g["id"], "temporal_validity",
+                         "grant %s was not yet valid at the time of the decision" % g["id"])
+                if at >= g["not_after"]:
+                    fail(g["id"], "temporal_validity",
+                         "grant %s had expired at the time of the decision" % g["id"])
+            if previous is not None:
+                if g.get("parent") != previous.get("id"):
+                    fail(g["id"], "authority_continuity",
+                         "grant %s does not point at the grant above it" % g["id"])
+                missing = [c for c in g["scope"]
+                           if not any(covers(p, c) for p in previous["scope"])]
+                if missing:
+                    fail(g["id"], "boundary_integrity",
+                         "%s holds scope its parent does not: %s"
+                         % (g["id"], ", ".join(sorted(missing))))
+                ok, why = narrower(previous["constraints"], g["constraints"])
+                if not ok:
+                    fail(g["id"], "boundary_integrity", "%s: %s" % (g["id"], why))
+                if not set(g["purpose_tags"]) <= set(previous["purpose_tags"]):
+                    fail(g["id"], "intent_continuity",
+                         "%s carries purpose tags its parent does not" % g["id"])
+                if (g["not_before"] < previous["not_before"]
+                        or g["not_after"] > previous["not_after"]):
+                    fail(g["id"], "temporal_validity",
+                         "%s is valid outside its parent's window" % g["id"])
+                if g["depth"] != previous["depth"] + 1:
+                    fail(g["id"], "authority_continuity",
+                         "%s records a depth inconsistent with its parent" % g["id"])
+            previous = g
+
+        if len(lineage) - 1 > MAX_DEPTH:
+            fail(lineage[-1]["id"], "boundary_integrity", "delegation depth exceeds the ceiling")
+
+        if not any(g.get("risk_accepted_by") for g in lineage):
+            fail(lineage[0]["id"], "identity_continuity",
+                 "no grant in this path names who accepted the risk")
+
+        leaf = lineage[-1]
+        action = req.get("action")
+        params = req.get("params") or {}
+
+        if action and not any(covers(c, action) for c in leaf["scope"]):
+            fail(leaf["id"], "boundary_integrity",
+                 "action '%s' is outside the scope of the grant exercised" % action)
+        elif action:
+            breadth = wildcard_breadth(leaf["scope"], action)
+            if breadth and breadth >= 2:
+                soft.append("action '%s' is only covered by a broad wildcard" % action)
+
+        eff = effective(lineage)
+        failures, unconstrained = params_against(params, eff)
+        for f in failures:
+            fail(leaf["id"], "boundary_integrity", f)
+        for u in unconstrained:
+            soft.append("parameter '%s' is not constrained anywhere in the path" % u)
+
+        tag = req.get("purpose_tag")
+        if tag:
+            if tag not in leaf["purpose_tags"]:
+                soft.append("declared purpose '%s' is not carried by the grant" % tag)
+        else:
+            soft.append("the action declared no purpose")
+
+    verdict = "BLOCK" if hard else ("CHALLENGE" if soft else "ALLOW")
+    return verdict, hard, soft, broken_at, broken_invariant
+
+
+def check_agreement(bundle, rep, mine, hard, soft, broken_at, broken_invariant):
+    decision = bundle.get("decision") or {}
+    claimed = decision.get("authority_verdict") or decision.get("verdict")
+
+    rep.add(mine == claimed,
+            "Independently re-derived authority verdict: " + mine,
+            "" if mine == claimed else
+            "the issuer claims " + str(claimed) + " and this script reaches " + mine +
+            " from the same path. One of us is wrong and the rules are published.")
+
+    if mine == "BLOCK":
+        same_grant = (broken_at == decision.get("broken_at"))
+        same_inv = (broken_invariant == decision.get("broken_invariant"))
+        rep.add(same_grant and same_inv,
+                "Refusal reproduces at the same grant and invariant",
+                ("grant %s, invariant %s" % (broken_at, broken_invariant))
+                if same_grant and same_inv else
+                "this script breaks at grant %s / %s, the issuer says %s / %s"
+                % (broken_at, broken_invariant,
+                   decision.get("broken_at"), decision.get("broken_invariant")))
+        rep.note("Why authority could not be derived")
+        for h in hard:
+            rep.note("  " + h)
+    elif soft:
+        rep.note("Why this could not be settled without a person")
+        for x in soft:
+            rep.note("  " + x)
+
+    risk = decision.get("risk_verdict")
+    if risk and mine != "BLOCK":
+        rep.note("Risk verdict reported as " + str(risk) + ", not re-derivable here",
+                 "the composed verdict is the worse of the two; the scoring engine "
+                 "is not part of this bundle and is not checked by this script")
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        return 2
+    src = sys.argv[1]
+    raw = sys.stdin.read() if src == "-" else open(src, "r").read()
+    try:
+        bundle = json.loads(raw)
+    except Exception as exc:
+        print("Not readable JSON: " + str(exc))
+        return 2
+
+    rep = Report()
+    print("=" * 66)
+    print("AUTHORITY PROOF  ·  independent verification")
+    print("=" * 66)
+    d = bundle.get("decision") or {}
+    print("evaluation   " + str(d.get("evaluation")))
+    print("action       " + str((bundle.get("request") or {}).get("action")))
+    print("at           " + str(d.get("evaluated_at")))
+    print("hops         " + str(max(0, len(bundle.get("lineage") or []) - 1)))
+    if bundle.get("lineage"):
+        print("authorised   " + str(bundle["lineage"][0].get("issuer")))
+        print("executed     " + str(bundle["lineage"][-1].get("subject")))
+        acc = [g.get("risk_accepted_by") for g in bundle["lineage"] if g.get("risk_accepted_by")]
+        print("risk owner   " + str(acc[-1] if acc else None))
+    print("-" * 66)
+
+    check_signature(bundle, rep)
+    check_integrity(bundle, rep)
+    mine, hard, soft, ba, bi = rederive(bundle, rep)
+    check_agreement(bundle, rep, mine, hard, soft, ba, bi)
+
+    print(rep.render())
+    print("-" * 66)
+    if rep.failed:
+        print("RESULT: NOT VERIFIED. Something above did not hold.")
+        return 1
+    print("RESULT: VERIFIED - " + mine)
+    if mine == "BLOCK":
+        print("This is a proof that the action was NOT authorised, and where it failed.")
+    print("Checked with no network access, no dependencies, and nothing taken on")
+    print("the issuer's word except the meaning of their public key.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+
+
+def _digest():
+    return hashlib.sha256(SCRIPT.encode("utf-8")).hexdigest()
 
 
 def _srv():
     m = sys.modules.get("__main__")
-    if hasattr(m, "get_bearer"):
+    if m is not None and hasattr(m, "get_bearer"):
         return m
     return sys.modules.get("server")
 
@@ -1253,7 +2327,7 @@ def _install(s):
     H = getattr(s, "Handler", None)
     if H is None or not hasattr(H, "do_GET"):
         return "no handler"
-    if getattr(H, "_standard_patched", False):
+    if getattr(H, "_verifier_patched", False):
         _patched[0] = True
         return "already installed"
 
@@ -1266,12 +2340,14 @@ def _install(s):
         except Exception:
             p = self.path or "/"
 
-        if p in DISCOVERY_PATHS:
-            body = json.dumps(_document(_base_from(self)), indent=2).encode("utf-8")
+        if p in FILE_PATHS:
+            body = SCRIPT.encode("utf-8")
             try:
                 self.send_response(200)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
+                self.send_header("Content-Disposition",
+                                 'attachment; filename="verify-authority.py"')
                 self.send_header("Cache-Control", "public, max-age=300")
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.send_header("X-Content-Type-Options", "nosniff")
@@ -1284,9 +2360,9 @@ def _install(s):
         return original(self)
 
     H.do_GET = do_GET
-    H._standard_patched = True
+    H._verifier_patched = True
     _patched[0] = True
-    print("STANDARD: /.well-known/ordering-test.json installed", flush=True)
+    print("VERIFIER: /verify-authority.py installed", flush=True)
     return "installed"
 
 
@@ -1300,215 +2376,33 @@ def handle(method, action, data, api_key, ctx):
         try:
             state = _install(s)
         except Exception as exc:
-            print("STANDARD: patch failed - " + str(exc), flush=True)
+            print("VERIFIER: patch failed - " + str(exc), flush=True)
             state = "failed: " + str(exc)
 
     action = (action or "").strip("/").lower()
-    base = _base_from_ctx(ctx)
-    doc = _document(base)
 
-    if method == "GET" and action == "document":
-        return doc, 200
-
-    if method == "GET" and action == "hash":
-        canonical = _document(FALLBACK_BASE)
-        return {
-            "sha256": _digest(canonical),
-            "of": "this operator's discovery document",
-            "canonicalisation": ("JSON, keys sorted, no whitespace, UTF-8, "
-                                 "base_url fixed to " + FALLBACK_BASE +
-                                 " so the digest does not move with the "
-                                 "requesting host"),
-            "what_this_is_for": (
-                "Confirming our own document has not changed. It is NOT the "
-                "cross-mirror check - two operators publish different documents "
-                "by design, because they list different endpoints, so their "
-                "digests should differ and a mismatch would prove nothing. The "
-                "cross-mirror comparison only means something once every mirror "
-                "serves a byte-identical runner file and hashes that instead. "
-                "No runner is agreed yet."),
-            "document": canonical,
-        }, 200
-
-    if method == "GET" and action in ("", "status", "spec"):
-        supported = [k for k, c in CHECKS.items() if c["supported"]]
-        public = [k for k, c in CHECKS.items() if c["demonstrable_publicly"]]
-        parameterised = [k for k, c in CHECKS.items()
-                         if c["endpoint"] and "{" in c["endpoint"]]
+    if method == "GET" and action in ("", "status"):
         return {
             "installed": bool(_patched[0]),
             "install_result": state,
             "module_version": VERSION,
-            "ordering_test_version": ORDERING_TEST_VERSION,
-            "serving": list(DISCOVERY_PATHS),
-            "always_available": "/x/standard/document",
-            "checks_total": len(CHECKS),
-            "checks_supported": len(supported),
-            "checks_publicly_demonstrable": len(public),
-            "publicly_demonstrable": public,
-            "supported_but_not_public": [k for k in supported if k not in public],
-            "endpoints_needing_a_parameter": parameterised,
-            "runner": RUNNER,
-            "note": ("base_url is derived from the Host header, so this file "
-                     "publishes whichever domain is actually serving it. Checks "
-                     "listed under endpoints_needing_a_parameter cannot be "
-                     "demonstrated until a real value exists to substitute - "
-                     "for the completeness and absence checks that means at "
-                     "least one committed period at /x/complete/periods."),
+            "serving": list(FILE_PATHS),
+            "script_bytes": len(SCRIPT),
+            "script_sha256": _digest(),
+            "how_to_use": [
+                "curl -sO https://sebbi.pro/verify-authority.py",
+                "curl -s 'https://sebbi.pro/x/continuity/proof?evaluation=<id>' "
+                "| python3 verify-authority.py -",
+            ],
+            "dependencies": "none - Python standard library only",
+            "network": "the script makes no network calls and reports nothing back. "
+                       "A verification tool that phones home to the party being "
+                       "verified is not a verification tool.",
+            "note": "Check script_sha256 against the file you downloaded. And read it "
+                    "before you run it, as you would with anything else handed to you "
+                    "by the party you are checking.",
         }, 200
 
-    return {"error": "unknown_action", "action": action,
-            "GET": ["status", "hash", "document"]}, 404
-
-```
-
-
-## `modules/stats.py`
-
-143 lines, 5540 bytes
-
-```python
-"""
-Live figures for the Proving Ground - /x/stats
-
-Charts on a compliance site are usually decoration. These are not, provided
-they show something a visitor could otherwise only take on trust: that the
-chain is genuinely growing, that decisions really are distributed across the
-thresholds rather than hand-picked, and that people who click through a
-review case behave exactly as the oversight argument predicts.
-
-WHAT IS PUBLISHED, AND WHAT IS NOT
-----------------------------------
-Public and no key, because a figure nobody can see proves nothing.
-
-Published: total chain height, hourly block counts, the verdict mix and score
-distribution of PUBLIC DEMO decisions only, and dwell times from public review
-cases.
-
-Never published: anything scoped to a customer key. No customer verdict mix,
-no customer volumes, no per-key anything. A visitor learns how the engine
-behaves, not how any operator's business is going. That distinction is the
-whole reason this endpoint can be open.
-
-    GET /x/stats        everything below
-    GET /x/stats/chain  chain height and hourly growth only
-"""
-
-import json, time
-from datetime import datetime, timezone
-
-VERSION = "1.0"
-PUBLIC = {("GET", ""), ("GET", "stats"), ("GET", "chain")}
-
-DEMO_KEY = "public_demo"
-
-
-def _iso(ts):
-    if not ts:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
-
-def _chain(ctx):
-    t = time.time()
-    with ctx["lock"]:
-        row = ctx["conn"].execute("SELECT COUNT(*),MIN(ts),MAX(ts) FROM audit_log").fetchone()
-        recent = ctx["conn"].execute("SELECT ts FROM audit_log WHERE ts>? ORDER BY ts ASC", (t - 86400,)).fetchall()
-    height = row[0] if row else 0
-    buckets = [0] * 24
-    for (ts,) in recent:
-        h = int((t - ts) // 3600)
-        if 0 <= h < 24:
-            buckets[23 - h] += 1
-    return {"height": height,
-            "first_block": _iso(row[1] if row else None),
-            "latest_block": _iso(row[2] if row else None),
-            "last_24h": buckets,
-            "blocks_last_24h": sum(buckets),
-            "note": "Every block, from every source. The chain is one sequence."}
-
-
-def _demo(ctx):
-    with ctx["lock"]:
-        rows = ctx["conn"].execute("SELECT result_json,ts FROM audit_log WHERE api_key=? ORDER BY id DESC LIMIT 2000", (DEMO_KEY,)).fetchall()
-    verdicts = {"ALLOW": 0, "CHALLENGE": 0, "BLOCK": 0}
-    # ten buckets of 0.1 across the score range
-    hist = [0] * 10
-    scores = []
-    for res, _ts in rows:
-        try:
-            r = json.loads(res)
-        except Exception:
-            continue
-        d = r.get("decision")
-        if d in verdicts:
-            verdicts[d] += 1
-            s = r.get("score")
-            if isinstance(s, (int, float)):
-                scores.append(s)
-                b = min(int(float(s) * 10), 9)
-                hist[b] += 1
-    total = sum(verdicts.values())
-    out = {"decisions": total, "verdicts": verdicts,
-           "score_histogram": hist,
-           "buckets": ["0.0-0.1", "0.1-0.2", "0.2-0.3", "0.3-0.4", "0.4-0.5",
-                       "0.5-0.6", "0.6-0.7", "0.7-0.8", "0.8-0.9", "0.9-1.0"],
-           "thresholds": {"allow_below": 0.35, "block_at_or_above": 0.70}}
-    if scores:
-        scores.sort()
-        out["median_score"] = round(scores[len(scores) // 2], 4)
-    return out
-
-
-def _oversight(ctx):
-    try:
-        with ctx["lock"]:
-            rows = ctx["conn"].execute("SELECT dwell,human_verdict,machine_verdict FROM demo_cases WHERE committed IS NOT NULL").fetchall()
-    except Exception:
-        rows = []
-    if not rows:
-        return {"reviews": 0,
-                "note": "Nobody has taken a review case yet."}
-    dwells = sorted(r[0] for r in rows if r[0] is not None)
-    agreed = len([r for r in rows if (r[1] or "").upper() == (r[2] or "").upper()])
-    # dwell buckets in seconds
-    edges = [2, 5, 10, 20, 45, 90]
-    labels = ["under 2s", "2-5s", "5-10s", "10-20s", "20-45s", "45-90s", "over 90s"]
-    hist = [0] * 7
-    for d in dwells:
-        placed = False
-        for i, e in enumerate(edges):
-            if d < e:
-                hist[i] += 1
-                placed = True
-                break
-        if not placed:
-            hist[6] += 1
-    n = len(dwells)
-    return {"reviews": len(rows),
-            "agreed_with_engine": agreed,
-            "agreement_rate_pct": round(100 * agreed / len(rows), 1),
-            "median_dwell_seconds": (dwells[n // 2] if n else None),
-            "under_2_seconds": hist[0],
-            "under_2_seconds_pct": (round(100 * hist[0] / n, 1) if n else 0),
-            "dwell_histogram": hist,
-            "dwell_labels": labels,
-            "note": "Visitors who committed in under two seconds did not read the case. That is the pattern the oversight record is designed to make visible."}
-
-
-def handle(method, action, data, api_key, ctx):
-    if method != "GET":
-        return {"error": "unknown_action", "action": action}, 404
-    if action == "chain":
-        return {"stats_version": VERSION, "chain": _chain(ctx)}, 200
-    if action in ("", "stats"):
-        return {"stats_version": VERSION,
-                "generated": _iso(time.time()),
-                "chain": _chain(ctx),
-                "public_decisions": _demo(ctx),
-                "public_reviews": _oversight(ctx),
-                "scope": "Public demonstration activity and total chain height only. Nothing scoped to a customer key is published here."}, 200
-    return {"error": "unknown_action", "action": action,
-            "available": ["GET stats", "GET chain"]}, 404
+    return {"error": "unknown_action", "action": action, "GET": ["status"]}, 404
 
 ```
