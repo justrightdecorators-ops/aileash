@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-125 files across 30 parts.
+126 files across 31 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -57,49 +57,53 @@ Generated automatically on every push. Do not edit by hand.
 
 - `modules/peer.py`
 - `modules/peerconsole.py`
-- `modules/publish.py`
+- `modules/praxis.py`
 
 ## [CODEBASE-10.md](CODEBASE-10.md)
 
+- `modules/publish.py`
 - `modules/ratchet.py`
 - `modules/reconcile.py`
-- `modules/register.py`
 
 ## [CODEBASE-11.md](CODEBASE-11.md)
 
+- `modules/register.py`
 - `modules/replay.py`
 - `modules/reset.py`
+
+## [CODEBASE-12.md](CODEBASE-12.md)
+
 - `modules/roster.py`
 - `modules/router.py`
 - `modules/rulebind.py`
 - `modules/run_benchmark.py`
-
-## [CODEBASE-12.md](CODEBASE-12.md)
-
 - `modules/savings.py`
 - `modules/sebbi_engine.py`
-- `modules/selfcheck.py`
 
 ## [CODEBASE-13.md](CODEBASE-13.md)
 
+- `modules/selfcheck.py`
 - `modules/signed.py`
+
+## [CODEBASE-14.md](CODEBASE-14.md)
+
 - `modules/sortition.py`
 - `modules/spec.py`
 - `modules/standard.py`
 - `modules/stats.py`
 
-## [CODEBASE-14.md](CODEBASE-14.md)
+## [CODEBASE-15.md](CODEBASE-15.md)
 
 - `modules/tokensaver.py`
 - `modules/verifier.py`
 
-## [CODEBASE-15.md](CODEBASE-15.md)
+## [CODEBASE-16.md](CODEBASE-16.md)
 
 - `modules/wallet.py`
 - `modules/warmup.py`
 - `modules/witness.py`
 
-## [CODEBASE-16.md](CODEBASE-16.md)
+## [CODEBASE-17.md](CODEBASE-17.md)
 
 - `modules/witnessed.py`
 - `Verify_ai.py`
@@ -112,21 +116,21 @@ Generated automatically on every push. Do not edit by hand.
 - `anchor.py`
 - `board_auditor.py`
 
-## [CODEBASE-17.md](CODEBASE-17.md)
+## [CODEBASE-18.md](CODEBASE-18.md)
 
 - `brain.py`
 - `gateway_proxy.py`
 - `meshwitness.py`
 - `sebbi_sdk.py`
 
-## [CODEBASE-18.md](CODEBASE-18.md)
+## [CODEBASE-19.md](CODEBASE-19.md)
 
 - `sebbi_tokensaver.py`
 - `sebdog_engine.py`
 - `sebdog_licence.py`
 - `sebdog_reporter.py`
 
-## [CODEBASE-19.md](CODEBASE-19.md)
+## [CODEBASE-20.md](CODEBASE-20.md)
 
 - `tests/attack_continuity_1.py`
 - `tests/attack_continuity_2.py`
@@ -140,7 +144,7 @@ Generated automatically on every push. Do not edit by hand.
 - `LICENCE`
 - `README.md`
 
-## [CODEBASE-20.md](CODEBASE-20.md)
+## [CODEBASE-21.md](CODEBASE-21.md)
 
 - `admin.html`
 - `ai-standard.html`
@@ -150,7 +154,7 @@ Generated automatically on every push. Do not edit by hand.
 - `brain.html`
 - `certificate.html`
 
-## [CODEBASE-21.md](CODEBASE-21.md)
+## [CODEBASE-22.md](CODEBASE-22.md)
 
 - `compliance-assistant.html`
 - `console.html`
@@ -158,7 +162,7 @@ Generated automatically on every push. Do not edit by hand.
 - `copyright.txt`
 - `data-protection.html`
 
-## [CODEBASE-22.md](CODEBASE-22.md)
+## [CODEBASE-23.md](CODEBASE-23.md)
 
 - `developers.html`
 - `dis.txt`
@@ -169,11 +173,11 @@ Generated automatically on every push. Do not edit by hand.
 - `human-oversight.html`
 - `identity.html`
 
-## [CODEBASE-23.md](CODEBASE-23.md)
+## [CODEBASE-24.md](CODEBASE-24.md)
 
 - `index.html`
 
-## [CODEBASE-24.md](CODEBASE-24.md)
+## [CODEBASE-25.md](CODEBASE-25.md)
 
 - `investor-prospectus.html`
 - `legal.txt`
@@ -182,7 +186,7 @@ Generated automatically on every push. Do not edit by hand.
 - `map.html`
 - `notary.html`
 
-## [CODEBASE-25.md](CODEBASE-25.md)
+## [CODEBASE-26.md](CODEBASE-26.md)
 
 - `pack.html`
 - `pay-check.html`
@@ -190,13 +194,13 @@ Generated automatically on every push. Do not edit by hand.
 - `report-threat.html`
 - `requirements.txt`
 
-## [CODEBASE-26.md](CODEBASE-26.md)
+## [CODEBASE-27.md](CODEBASE-27.md)
 
 - `reseller.html`
 - `risk-policy.html`
 - `robots.txt`
 
-## [CODEBASE-27.md](CODEBASE-27.md)
+## [CODEBASE-28.md](CODEBASE-28.md)
 
 - `scan.html`
 - `seal.html`
@@ -204,16 +208,16 @@ Generated automatically on every push. Do not edit by hand.
 - `signal-packs.html`
 - `sitemap.xml`
 
-## [CODEBASE-28.md](CODEBASE-28.md)
+## [CODEBASE-29.md](CODEBASE-29.md)
 
 - `sonicboom.html`
 
-## [CODEBASE-29.md](CODEBASE-29.md)
+## [CODEBASE-30.md](CODEBASE-30.md)
 
 - `tokensaver.html`
 - `verify.html`
 
-## [CODEBASE-30.md](CODEBASE-30.md)
+## [CODEBASE-31.md](CODEBASE-31.md)
 
 - `whitepaper.html`
 
