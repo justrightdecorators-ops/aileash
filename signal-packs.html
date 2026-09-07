@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Signal Packs - AILeash</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0a0f1e;color:#fff;line-height:1.55}
+.wrap{max-width:760px;margin:0 auto;padding:22px 18px 80px}
+a.back{color:#c9a84c;text-decoration:none;font-size:14px;font-family:monospace}
+h1{font-size:26px;font-weight:800;margin:14px 0 4px}h1 span{color:#c9a84c}
+.sub{color:#8a90a6;font-size:14px;margin-bottom:20px}
+.card{background:#111a30;border:1px solid #232d4a;border-radius:12px;padding:18px;margin-bottom:14px}
+.card h2{font-size:12px;color:#c9a84c;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:12px}
+input,textarea,select{width:100%;padding:11px;border-radius:8px;border:1px solid #2a3350;background:#0b1226;color:#fff;font-size:14px;margin:6px 0;font-family:inherit}
+textarea{min-height:120px;font-family:monospace;font-size:12px}
+button{background:#c9a84c;color:#0a0f1e;border:none;border-radius:8px;padding:11px 18px;font-weight:800;cursor:pointer;font-size:14px}
+button.ghost{background:transparent;border:1px solid #2a3350;color:#c9a84c}
+button.small{padding:7px 12px;font-size:12px}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.msg{font-size:13px;margin-top:8px;min-height:18px}
+.ok{color:#7fe3b0}.err{color:#ff7b6e}
+.pack{background:#0b1226;border:1px solid #2a3350;border-radius:8px;padding:12px;margin:8px 0;font-size:13px}
+.pack .nm{font-weight:700;color:#fff}
+.pack .meta{color:#8a90a6;font-size:12px}
+.badge{font-size:10px;padding:2px 8px;border-radius:10px;font-weight:700;text-transform:uppercase;margin-left:6px}
+.badge.pub{background:#0d2018;color:#7fe3b0;border:1px solid #1fae79}
+.badge.priv{background:#1a1206;color:#c9a84c;border:1px solid #c9a84c}
+.warn{background:#1a1206;border:1px solid #c9a84c;border-radius:8px;padding:12px;font-size:12.5px;color:#e8d9b0;margin:10px 0;line-height:1.6}
+.hide{display:none}
+.tiny{color:#5a6178;font-size:11px;margin-top:14px;line-height:1.6}
+.starter{cursor:pointer;color:#7fe3b0;font-size:12px;text-decoration:underline;margin-right:12px}
+
+/* ---- the door through to the open cost library ---- */
+.door{
+  display:block;text-decoration:none;color:inherit;
+  background:linear-gradient(140deg,#0d1730 0%,#111a30 55%,#171226 100%);
+  border:1px solid #3a3253;border-radius:12px;padding:18px;margin-bottom:14px;
+  position:relative;overflow:hidden;
+}
+.door:hover{border-color:#c9a84c}
+.door .halo{
+  position:absolute;right:-42px;top:-42px;width:150px;height:150px;
+  border-radius:50%;pointer-events:none;
+  background:conic-gradient(from 0deg,rgba(201,168,76,0),rgba(201,168,76,.5) 90deg,rgba(143,211,255,.45) 190deg,rgba(201,168,76,0) 320deg);
+  filter:blur(24px);opacity:.85;
+}
+.door h2{position:relative}
+.door .dh{font-size:19px;font-weight:800;margin-bottom:6px;position:relative}
+.door .dh em{font-style:normal;color:#c9a84c}
+.door .dp{font-size:13.5px;color:#8a90a6;line-height:1.6;position:relative}
+.door .dp b{color:#fff;font-weight:600}
+.door .go{
+  display:inline-block;margin-top:12px;font-family:monospace;font-size:12px;
+  color:#c9a84c;letter-spacing:.08em;position:relative;
+}
+@media (prefers-reduced-motion:no-preference){
+  .door .halo{animation:doorspin 26s linear infinite}
+  @keyframes doorspin{to{transform:rotate(360deg)}}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <a class="back" href="/">&larr; AILeash</a>
+  <h1>Signal <span>Packs</span></h1>
+  <p class="sub">Define the risks specific to your AI system, seal them, and use them per decision. Build your own, or start from a community template.</p>
+
+  <a class="door" href="/packs.html">
+    <div class="halo"></div>
+    <div class="dh">Looking for the open <em>cost pack</em> library?</div>
+    <div class="dp">Different job, same idea. Those packs decide what a model
+    request is allowed to cost, they are written over the token saver's nine
+    cost signals, and the whole library is <b>free to read, write and fork with
+    no account at all</b>. Twenty in there already.</div>
+    <div class="go">OPEN THE LIBRARY &rarr;</div>
+  </a>
+
+  <div class="card" id="loginCard">
+    <h2>Your API key</h2>
+    <input id="apikey" type="password" placeholder="Paste your AILeash API key">
+    <button onclick="loadMine()">Load my packs</button>
+    <div class="msg" id="loginMsg"></div>
+    <p class="tiny">No key? Get one free at <a href="/#signup" style="color:#c9a84c">sebbi.pro</a>. Your key stays in your browser - it is only sent to your own account.</p>
+  </div>
+
+  <div id="app" class="hide">
+    <div class="card">
+      <h2>Build a signal pack</h2>
+      <div class="row" style="margin-bottom:8px">
+        <span style="font-size:12px;color:#8a90a6">Start from a template:</span>
+        <span class="starter" onclick="loadStarter('hiring-risk')">hiring-risk</span>
+        <span class="starter" onclick="loadStarter('lending-risk')">lending-risk</span>
+        <span class="starter" onclick="loadStarter('content-safety')">content-safety</span>
+      </div>
+      <input id="packname" placeholder="Pack name, e.g. hiring-risk">
+      <textarea id="packsignals" placeholder='{"bias": 0.15, "adverse_impact": 0.15, "explainability_gap": 0.10}'></textarea>
+      <p class="tiny">Each signal has a weight from 0 to 0.30. Send raw signal values 0-1 at decision time; these weights decide how much each one counts.</p>
+      <button onclick="createPack()">Create &amp; seal pack</button>
+      <div class="msg" id="createMsg"></div>
+    </div>
+
+    <div class="card">
+      <h2>My packs</h2>
+      <div id="mypacks"><div class="meta" style="color:#5a6178">Loading...</div></div>
+    </div>
+
+    <div class="card">
+      <h2>Public library</h2>
+      <div class="warn">Community-contributed templates. <b>Unverified.</b> Always validate a pack against your own risk assessment before relying on it. Publishing your own pack is optional - your packs are private by default.</div>
+      <button class="ghost small" onclick="loadLibrary()">Browse library</button>
+      <div id="library" style="margin-top:10px"></div>
+    </div>
+  </div>
+
+  <p class="tiny">Signal packs let you evaluate the foreseeable risks specific to your system, per decision, sealed into a tamper-evident record. This supports EU AI Act risk-evaluation and record-keeping duties. It does not by itself constitute a complete Article 9 risk-management process - the documented governance around your packs is yours to maintain.</p>
+</div>
+
+<script>
+var KEY="";
+var STARTERS={
+  "hiring-risk":{"demographic_bias":0.15,"adverse_impact":0.15,"explainability_gap":0.10,"proxy_discrimination":0.10},
+  "lending-risk":{"protected_attribute_influence":0.15,"affordability_breach":0.12,"fairness_disparity":0.15,"explainability_gap":0.10},
+  "content-safety":{"child_safety_flag":0.20,"grooming_pattern":0.20,"harmful_content":0.12,"self_harm_signal":0.15}
+};
+function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]})}
+
+async function api(path,body){
+  var r=await fetch(path,{method:"POST",headers:{"Authorization":"Bearer "+KEY,"Content-Type":"application/json"},body:JSON.stringify(body||{})});
+  return await r.json();
+}
+
+async function loadMine(){
+  KEY=document.getElementById("apikey").value.trim();
+  var m=document.getElementById("loginMsg");
+  if(!KEY){m.className="msg err";m.textContent="Paste your key first.";return;}
+  m.className="msg";m.textContent="Checking...";
+  try{
+    var d=await api("/api/signal-pack/list",{});
+    if(d.error){m.className="msg err";m.textContent="Key not recognised.";return;}
+    document.getElementById("loginCard").classList.add("hide");
+    document.getElementById("app").classList.remove("hide");
+    renderMine(d.packs||[]);
+  }catch(e){m.className="msg err";m.textContent="Connection error.";}
+}
+
+function loadStarter(name){
+  document.getElementById("packname").value=name;
+  document.getElementById("packsignals").value=JSON.stringify(STARTERS[name],null,2);
+}
+
+async function createPack(){
+  var name=document.getElementById("packname").value.trim();
+  var raw=document.getElementById("packsignals").value.trim();
+  var m=document.getElementById("createMsg");
+  if(!name){m.className="msg err";m.textContent="Give the pack a name.";return;}
+  var sig;
+  try{sig=JSON.parse(raw);}catch(e){m.className="msg err";m.textContent="Signals must be valid JSON, e.g. {\"bias\": 0.15}";return;}
+  m.className="msg";m.textContent="Sealing...";
+  var d=await api("/api/signal-pack/create",{name:name,signals:sig});
+  if(d.error){m.className="msg err";m.textContent=d.error;return;}
+  m.className="msg ok";m.textContent="Pack '"+esc(d.pack.name)+"' v"+d.pack.version+" created and sealed (block "+d.pack.block_index+").";
+  var l=await api("/api/signal-pack/list",{});renderMine(l.packs||[]);
+}
+
+function renderMine(packs){
+  var el=document.getElementById("mypacks");
+  if(!packs.length){el.innerHTML='<div class="meta" style="color:#5a6178">No packs yet. Build one above.</div>';return;}
+  var h="";
+  packs.forEach(function(p){
+    h+='<div class="pack"><div class="nm">'+esc(p.name)+' <span class="meta">v'+esc(p.latest_version)+'</span></div>'
+      +'<div class="row" style="margin-top:8px">'
+      +'<button class="small ghost" onclick="publishPack(\''+esc(p.name)+'\')">Publish to library</button>'
+      +'<button class="small ghost" onclick="unpublishPack(\''+esc(p.name)+'\')">Make private</button>'
+      +'</div></div>';
+  });
+  el.innerHTML=h;
+}
+
+async function publishPack(name){
+  var author=prompt("Publish '"+name+"' to the public library.\n\nShow it as contributed by (name or company, optional):","")||"anonymous";
+  var d=await api("/api/signal-pack/publish",{name:name,author:author});
+  alert(d.error?("Error: "+d.error):"Published. It's now in the community library, marked unverified. You can make it private again any time.");
+}
+async function unpublishPack(name){
+  await api("/api/signal-pack/unpublish",{name:name});
+  alert("'"+name+"' is now private.");
+}
+
+async function loadLibrary(){
+  var el=document.getElementById("library");
+  el.innerHTML='<div class="meta" style="color:#5a6178">Loading...</div>';
+  var d=await api("/api/signal-pack/library",{});
+  var lib=d.library||[];
+  if(!lib.length){el.innerHTML='<div class="meta" style="color:#5a6178">No published packs yet. Be the first.</div>';return;}
+  var h="";
+  lib.forEach(function(p){
+    h+='<div class="pack"><div class="nm">'+esc(p.name)+' <span class="badge pub">community</span></div>'
+      +'<div class="meta">by '+esc(p.author)+' &middot; v'+esc(p.version)+' &middot; '+Object.keys(p.signals||{}).length+' signals</div>'
+      +'<button class="small ghost" style="margin-top:8px" onclick=\'useLibPack("'+esc(p.name)+'",'+JSON.stringify(JSON.stringify(p.signals))+')\'>Load into builder</button>'
+      +'</div>';
+  });
+  el.innerHTML=h;
+}
+function useLibPack(name,sigStr){
+  document.getElementById("packname").value=name;
+  var sig=JSON.parse(sigStr);
+  var flat={};for(var k in sig){flat[k]=(sig[k]&&sig[k].weight!=null)?sig[k].weight:sig[k];}
+  document.getElementById("packsignals").value=JSON.stringify(flat,null,2);
+  window.scrollTo(0,0);
+}
+</script>
+</body>
+</html>
