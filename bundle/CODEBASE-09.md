@@ -1,9 +1,9 @@
-# Codebase — part 9 of 30
+# Codebase — part 9 of 31
 
 Contains:
 - `modules/peer.py`
 - `modules/peerconsole.py`
-- `modules/publish.py`
+- `modules/praxis.py`
 
 
 ## `modules/peer.py`
@@ -1701,500 +1701,706 @@ def handle(method, action, data, api_key, ctx):
 ```
 
 
-## `modules/publish.py`
+## `modules/praxis.py`
 
-491 lines, 21976 bytes
+697 lines, 24699 bytes
 
 ```python
-#!/usr/bin/env python3
 """
-modules/publish.py  -  sealing what you published, at the moment you publish it
-===============================================================================
+modules/praxis.py  v1.0.2
 
-THE PROBLEM THIS EXISTS TO NEVER HAVE AGAIN
--------------------------------------------
-Somebody asks when a page was published. You answer from git history. They
-point out - correctly - that git commit dates are fields in the commit
-object which anyone can set to anything with an environment variable before
-committing. Your strongest evidence turns out to be the weakest thing in
-the room, and it drags the credible parts down with it.
+Outbound submitter for the PRAXIS external-witness observe endpoint (chain 4).
 
-The fix is not a better argument. It is sealing the page the moment it goes
-live, so the question never depends on anybody's word again.
+Contract implemented against the SERVED schema route, not prose:
+    GET  https://chain4.thepraesidium.ai/api/external-witness/observe/schema
+    POST https://chain4.thepraesidium.ai/api/external-witness/observe
 
-WHAT THIS DOES
---------------
-    POST /x/publish/seal {"url": "https://example.com/spec"}
+Signing:
+    preimage  = b"PRAXIS-OBSERVE-v1\\n" + canonical JSON of the envelope
+                with the "signature" field REMOVED
+    canonical = json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                           ensure_ascii=True).encode("utf-8")
+    signature = lowercase hex HMAC-SHA256, carried in the body
 
-We fetch the URL ourselves, hash exactly what was served, and seal the hash,
-the URL and the fetch time into the chain - where it is anchored externally
-and handed to peer chains like every other block.
+Secret:
+    environment variable PRAXIS_OBSERVE_SECRET
+    (never written to a file, never returned by any route)
 
-From then on:
+Routes
+    GET  /x/praxis/spec      public   what this module does and how it signs
+    GET  /x/praxis/status    public   config check + arms the /praxis page
+    GET  /x/praxis/schema    public   fetches THEIR live contract, reports version
+    GET  /x/praxis/history   keyed    past attempts from our own chain
+    POST /x/praxis/canonical keyed    dry run: envelope, preimage, signature, NO send
+    POST /x/praxis/submit    keyed    signs and sends ONE bounded submission
 
-  - "this exact content was served at this address no later than T" is
-    arithmetic rather than a claim;
-  - re-sealing the same URL later builds a permanent revision history that
-    the publisher cannot edit, because each version is its own block;
-  - and anyone can check it without an account.
+v1.0.1 fixes a real fault found on 7 Sep 2026. _seal called the host seal()
+with one argument when it requires three, so every submit reported
+sealed:false while the response still said ok:true. A remote call was being
+recorded by the peer with no matching entry in our own chain. A failed seal
+now makes the whole response ok:false and says so at the top level.
 
-Seal at publication and you never argue about a publication date again. That
-is the entire point, and it takes one call.
-
-WHAT IT HONESTLY CANNOT DO
---------------------------
-It cannot reach backwards. A seal made today proves the content existed
-today, not that it existed last week. Nothing can prove that - not this, not
-Bitcoin, not a notary. Timestamps are one-directional by nature.
-
-So for anything already published before it was sealed, the module records
-EXTERNAL REFERENCES alongside: a GitHub push event, a Wayback Machine
-snapshot, a DigiCert or OpenTimestamps proof. Those are stored and sealed as
-supplied. We do not verify them and we do not present them as ours - they
-are somebody else's record, named so a third party can check it at source.
-That distinction is stated in every response rather than left to be
-discovered.
-
-Two references are worth knowing about, because they are the ones that
-actually carry an earlier date:
-
-  GitHub push events   api.github.com/repos/<owner>/<repo>/events
-                       The push timestamp is recorded server-side by GitHub
-                       and cannot be set by the pusher, unlike commit dates.
-                       Retained roughly 90 days - so it must be captured
-                       while it still exists.
-
-  Wayback Machine      archive.org/wayback/available?url=...&timestamp=...
-                       An independent party with no stake in the dispute.
-                       If it caught the page, that settles it outright.
-
-FETCHING SAFELY
----------------
-This module makes the server fetch a URL. Done naively that is a hole worse
-than the one it closes. So the fetcher speaks only http and https, only on
-ports 80 and 443, resolves the hostname first and refuses any address that
-is private, loopback, link-local, reserved or multicast, never follows a
-redirect, times out fast, and stops reading after a cap. Sealing is keyed,
-so this is not an anonymous capability either.
-
-    POST /x/publish/seal      fetch, hash and seal a live URL     (keyed)
-    GET  /x/publish/history   every version ever sealed of a URL  (public)
-    GET  /x/publish/verify    was this exact content served, when (public)
-    GET  /x/publish/list      everything sealed                   (public)
-    GET  /x/publish/spec      how to check any of it              (public)
+v1.0.2 fixes the follow-on. The host seal() returns a tuple
+(audit_hash, block_index, key_seq); v1.0.1 only read dicts and strings and
+so reported a successful seal as "seal returned no hash".
 """
 
-import hashlib
-import ipaddress
-import re
-import socket
+import os
+import json
 import time
-import urllib.error
+import hmac
+import hashlib
+import secrets
+import sys
 import urllib.request
+import urllib.error
 from datetime import datetime, timezone
-from urllib.parse import urlparse
 
-VERSION = "1.0"
-HEX64 = re.compile(r"^[0-9a-f]{64}$")
+VERSION = "1.0.2"
 
-# Reading is open. A publication record only settles an argument if the
-# other side can check it without going through the publisher.
-PUBLIC = {("GET", "history"), ("GET", "verify"), ("GET", "list"),
-          ("GET", "spec")}
+# ---------------------------------------------------------------- constants
 
-CONTENT_PREFIX = b"AILEASH-PUBLISH-v1:"
+BASE = "https://chain4.thepraesidium.ai"
+OBSERVE_URL = BASE + "/api/external-witness/observe"
+SCHEMA_URL = BASE + "/api/external-witness/observe/schema"
 
-FETCH_TIMEOUT = 8
-MAX_FETCH_BYTES = 2 * 1024 * 1024
-ALLOWED_SCHEMES = ("http", "https")
-ALLOWED_PORTS = (80, 443)
-MAX_EXTERNAL = 8
+DOMAIN = b"PRAXIS-OBSERVE-v1\n"
+ENVELOPE_SCHEMA = "praxis_external_observe_request_v1"
 
-_ready = False
+OUR_PEER_ID = "aileash"
+OUR_TIP_URL = "https://sebbi.pro/x/witness/tip"
 
+SECRET_ENV = "PRAXIS_OBSERVE_SECRET"
 
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        c = ctx["conn"]
-        c.execute("CREATE TABLE IF NOT EXISTS publish_seal("
-                  "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,url TEXT,"
-                  "content_hash TEXT,byte_length INTEGER,http_status INTEGER,"
-                  "content_type TEXT,note TEXT,external TEXT,"
-                  "fetched REAL,audit_hash TEXT,block_index INTEGER)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_pub_url ON publish_seal(url,id)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_pub_hash ON publish_seal(content_hash)")
-        c.commit()
-    _ready = True
+TIMEOUT = 20
+MAX_RESPONSE_BYTES = 262144
+
+PUBLIC = {
+    ("GET", "spec"),
+    ("GET", "status"),
+    ("GET", "schema"),
+}
 
 
-def _iso(ts):
-    if not ts:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+# ---------------------------------------------------------------- helpers
+
+def _now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-# ----------------------------------------------------------------------
-# fetching - read the SSRF note above before touching any of this
-# ----------------------------------------------------------------------
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """A redirect is an instruction to fetch a second URL we never checked."""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
+def _canonical(obj):
+    return json.dumps(
+        obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
 
 
-_opener = urllib.request.build_opener(_NoRedirect)
+def _sha256_hex(b):
+    return hashlib.sha256(b).hexdigest()
 
 
-def _address_allowed(host, port):
+def _secret():
+    s = os.environ.get(SECRET_ENV, "")
+    return s.strip()
+
+
+def _fresh_nonce():
+    # matches ^[A-Za-z0-9_.:-]{12,128}$
+    return secrets.token_hex(20)
+
+
+def _fresh_idem():
+    # matches ^[0-9a-f]{64}(\.attempt-N)?$
+    return secrets.token_hex(32)
+
+
+def _http(method, url, body=None):
+    req = urllib.request.Request(url, data=body, method=method)
+    req.add_header("Accept", "application/json")
+    req.add_header("User-Agent", "AILeash-praxis/" + VERSION)
+    if body is not None:
+        req.add_header("Content-Type", "application/json")
     try:
-        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
-    except Exception as exc:
-        return False, "could not resolve host (%s)" % type(exc).__name__
-    if not infos:
-        return False, "host resolved to nothing"
-    for info in infos:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+            raw = r.read(MAX_RESPONSE_BYTES)
+            return r.status, dict(r.headers), raw, None
+    except urllib.error.HTTPError as e:
+        raw = b""
         try:
-            addr = ipaddress.ip_address(info[4][0])
-        except ValueError:
-            return False, "unreadable address"
-        if (addr.is_private or addr.is_loopback or addr.is_link_local
-                or addr.is_reserved or addr.is_multicast or addr.is_unspecified):
-            return False, "address is not publicly routable"
-    return True, None
+            raw = e.read(MAX_RESPONSE_BYTES)
+        except Exception:
+            pass
+        return e.code, dict(getattr(e, "headers", {}) or {}), raw, None
+    except Exception as e:
+        return 0, {}, b"", "%s: %s" % (type(e).__name__, e)
 
 
-def _url_allowed(url):
-    if not url or not isinstance(url, str) or len(url) > 500:
-        return False, "no usable url"
+def _parse_json(raw):
     try:
-        parts = urlparse(url.strip())
+        return json.loads(raw.decode("utf-8"))
     except Exception:
-        return False, "unparseable url"
-    if parts.scheme not in ALLOWED_SCHEMES:
-        return False, "scheme not allowed"
-    if not parts.hostname:
-        return False, "no host in url"
-    port = parts.port or (443 if parts.scheme == "https" else 80)
-    if port not in ALLOWED_PORTS:
-        return False, "port not allowed"
-    return _address_allowed(parts.hostname, port)
+        return None
 
 
-def _fetch(url):
-    """Returns (body_bytes, status, content_type, error)."""
-    ok, why = _url_allowed(url)
-    if not ok:
-        return None, None, None, why
-    request = urllib.request.Request(url, headers={
-        "Accept": "*/*",
-        "User-Agent": "aileash-publish/%s" % VERSION,
-    })
-    try:
-        with _opener.open(request, timeout=FETCH_TIMEOUT) as response:
-            status = response.getcode()
-            content_type = response.headers.get("Content-Type", "")
-            body = response.read(MAX_FETCH_BYTES + 1)
-    except urllib.error.HTTPError as exc:
-        return None, exc.code, None, "url answered %s" % exc.code
-    except Exception as exc:
-        return None, None, None, "could not reach url (%s)" % type(exc).__name__
-    if len(body) > MAX_FETCH_BYTES:
-        return None, status, content_type, "response larger than the %d byte cap" % MAX_FETCH_BYTES
-    return body, status, content_type, None
+def _build_envelope(tip_digest, witnessed_peer_id, source_url,
+                    receipt_digest=None, attempt=None, observed_at=None):
+    payload = {
+        "witnessed_peer_id": witnessed_peer_id,
+        "data_class": "HASH_ONLY",
+        "tip_digest": tip_digest,
+        "source_url": source_url,
+        "observed_at": observed_at or _now_iso(),
+    }
+    # receipt_digest is OPTIONAL in contract v1_1 and is omitted for a pure
+    # chain-tip observation. Never duplicate tip_digest into it.
+    if receipt_digest:
+        payload["receipt_digest"] = receipt_digest
 
+    key = _fresh_idem()
+    if attempt:
+        key = "%s.attempt-%s" % (key, attempt)
 
-def _content_hash(body):
-    """Hash exactly the bytes served. No normalisation, no cleverness -
-    a whitespace-tolerant hash would be a hash of our opinion of the page
-    rather than of the page."""
-    return hashlib.sha256(CONTENT_PREFIX + body).hexdigest()
-
-
-# ----------------------------------------------------------------------
-# seal
-# ----------------------------------------------------------------------
-
-def _clean_external(value):
-    """External references are recorded verbatim and never verified."""
-    if not isinstance(value, list):
-        return []
-    out = []
-    for item in value[:MAX_EXTERNAL]:
-        if isinstance(item, dict):
-            source = str(item.get("source", "")).strip()[:60]
-            reference = str(item.get("reference", item.get("url", ""))).strip()[:400]
-            claimed = str(item.get("claimed_time", "")).strip()[:60]
-            if source and reference:
-                out.append({"source": source, "reference": reference,
-                            "claimed_time": claimed or None})
-        elif isinstance(item, str) and item.strip():
-            out.append({"source": "unnamed", "reference": item.strip()[:400],
-                        "claimed_time": None})
-    return out
-
-
-def _seal(ctx, api_key, data):
-    url = str(data.get("url", "")).strip()
-    if not url:
-        return {"error": "url_required",
-                "message": "The address of the page you have just published."}, 400
-
-    note = str(data.get("note", "") or "").strip()[:300]
-    external = _clean_external(data.get("external"))
-
-    body, status, content_type, why = _fetch(url)
-    if why:
-        return {"error": "fetch_failed", "url": url, "message": why,
-                "note": "Nothing was sealed. A record of a page we could not read would be "
-                        "worse than no record."}, 502
-
-    digest = _content_hash(body)
-    now = time.time()
-
-    with ctx["lock"]:
-        prior = ctx["conn"].execute(
-            "SELECT content_hash,fetched,audit_hash FROM publish_seal "
-            "WHERE url=? ORDER BY id ASC", (url,)).fetchall()
-
-    unchanged = bool(prior) and prior[-1][0] == digest
-    first_of_this_version = None
-    for row in prior:
-        if row[0] == digest:
-            first_of_this_version = row[1]
-            break
-
-    external_summary = ";".join("%s=%s" % (e["source"], e["reference"][:60]) for e in external)
-    ev = {"user_id": "pub:" + digest[:16], "action": "publication_sealed", "amount": 0,
-          "country": "UK", "device_id": "publish", "anomaly": 0, "device_risk": 0}
-    res = {"decision": "PUBLICATION_SEALED", "score": 0, "publish_version": VERSION,
-           "url": url, "content_hash": digest, "bytes": len(body),
-           "http_status": status,
-           "detail": "url=%s;sha256=%s;bytes=%d%s"
-                     % (url, digest, len(body),
-                        ";external=" + external_summary if external_summary else "")}
-    audit_hash, block_index, seq = ctx["seal"](ev, res, now, api_key)
-
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "INSERT INTO publish_seal(api_key,url,content_hash,byte_length,http_status,"
-            "content_type,note,external,fetched,audit_hash,block_index) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-            (api_key, url, digest, len(body), status, content_type or None,
-             note or None,
-             "|".join("%s %s %s" % (e["source"], e["reference"], e["claimed_time"] or "")
-                      for e in external) or None,
-             now, audit_hash, block_index))
-        ctx["conn"].commit()
-
-    out = {
-        "url": url, "content_hash": digest, "bytes": len(body),
-        "http_status": status, "content_type": content_type,
-        "sealed_at": _iso(now),
-        "sealed_in_chain": audit_hash, "block_index": block_index, "receipt_seq": seq,
-        "version_number": len(prior) + 1,
-        "publish_version": VERSION,
-        "what_this_proves": "This exact content was served at this address when we fetched it, "
-                            "and the record of that cannot be altered afterwards.",
-        "what_it_does_not": "It does not prove the page existed earlier than this moment. "
-                            "Nothing can prove that after the fact - timestamps only run "
-                            "forwards. Seal at publication and the question never arises.",
-        "history": "/x/publish/history?url=" + url,
-        "verify_this_block": "/x/consistency/ancestor?tip=" + audit_hash,
+    return {
+        "schema_version": ENVELOPE_SCHEMA,
+        "peer_id": OUR_PEER_ID,
+        "ts": _now_iso(),
+        "nonce": _fresh_nonce(),
+        "idempotency_key": key,
+        "payload": payload,
     }
 
-    if unchanged:
-        out["unchanged"] = True
-        out["first_sealed_in_this_form"] = _iso(first_of_this_version)
-        out["message"] = ("Identical to the last sealed version. The page has not changed since "
-                          "%s and now has an additional dated witness." % _iso(first_of_this_version))
-    elif prior:
-        out["changed"] = True
-        out["previous_hash"] = prior[-1][0]
-        out["previous_sealed_at"] = _iso(prior[-1][1])
-        out["message"] = ("The content has changed since the last seal. Both versions remain in "
-                          "the chain - a revision history the publisher cannot edit.")
-    else:
-        out["message"] = ("First seal for this address. Every later seal builds a permanent, "
-                          "dated revision history from here.")
 
-    if external:
-        out["external_references"] = external
-        out["external_caveat"] = ("Recorded exactly as supplied and sealed with the block. We do "
-                                  "not verify them and they are not our evidence - they are "
-                                  "somebody else's record, named so you can check them at "
-                                  "source.")
-    else:
-        out["advice"] = ("If this page was published before today, add external references - a "
-                         "GitHub push event, a Wayback snapshot - and they will be sealed "
-                         "alongside. Those carry an earlier date; a seal made now cannot.")
-    return out, 200
+def _sign(envelope, secret):
+    unsigned = {k: v for k, v in envelope.items() if k != "signature"}
+    canonical = _canonical(unsigned)
+    preimage = DOMAIN + canonical
+    sig = hmac.new(secret.encode("utf-8"), preimage, hashlib.sha256).hexdigest()
+    return canonical, preimage, sig
 
 
-# ----------------------------------------------------------------------
-# reading
-# ----------------------------------------------------------------------
+def _validate(tip_digest, witnessed_peer_id, source_url, receipt_digest):
+    import re
+    if not re.fullmatch(r"[0-9a-f]{64}", tip_digest or ""):
+        return "tip_digest must be 64 lowercase hex characters"
+    if not re.fullmatch(r"[a-z][a-z0-9_.:-]{2,63}", witnessed_peer_id or ""):
+        return "witnessed_peer_id must match ^[a-z][a-z0-9_.:-]{2,63}$"
+    if not (source_url or "").startswith("https://") or (source_url or "").count("/") < 3:
+        return "source_url must be an https URL with a path"
+    if len(source_url) > 512:
+        return "source_url exceeds 512 characters"
+    if receipt_digest and not re.fullmatch(r"[0-9a-f]{64}", receipt_digest):
+        return "receipt_digest, if supplied, must be 64 lowercase hex characters"
+    if receipt_digest and receipt_digest == tip_digest:
+        return "receipt_digest must not duplicate tip_digest"
+    return None
 
-def _parse_external(blob):
-    if not blob:
-        return []
-    out = []
-    for line in blob.split("|"):
-        parts = line.strip().split(" ", 2)
-        if len(parts) >= 2:
-            out.append({"source": parts[0], "reference": parts[1],
-                        "claimed_time": parts[2] if len(parts) > 2 and parts[2] else None})
+
+def _record_seal_result(out, res):
+    """Read whatever the host seal() handed back.
+
+    This deployment's seal() returns a TUPLE: (audit_hash, block_index,
+    key_seq). v1.0.1 only understood dicts and strings, so a successful seal
+    was reported as "seal returned no hash". Tuples are handled first.
+    """
+    if isinstance(res, (tuple, list)):
+        if len(res) > 0:
+            out["audit_hash"] = res[0]
+        if len(res) > 1:
+            out["block_index"] = res[1]
+        if len(res) > 2:
+            out["key_seq"] = res[2]
+    elif isinstance(res, dict):
+        out["audit_hash"] = (res.get("audit_hash") or res.get("hash")
+                             or res.get("seal") or res.get("block_hash"))
+        out["block_index"] = res.get("block_index") or res.get("index")
+        out["key_seq"] = res.get("key_seq") or res.get("seq")
+    elif isinstance(res, str):
+        out["audit_hash"] = res
+    out["sealed"] = bool(out["audit_hash"])
     return out
 
 
-def _history(ctx, data):
-    url = str(data.get("url", "")).strip()
-    if not url:
-        return {"error": "url_required"}, 400
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT content_hash,byte_length,fetched,audit_hash,block_index,note,external "
-            "FROM publish_seal WHERE url=? ORDER BY id ASC LIMIT 500", (url,)).fetchall()
-    if not rows:
-        return {"error": "never_sealed", "url": url,
-                "message": "No seal recorded for that address."}, 404
+def _seal(ctx, event):
+    """Seal into our own chain.
 
-    versions, last_hash = [], None
-    for content_hash, length, fetched, audit_hash, block_index, note, external in rows:
-        versions.append({
-            "content_hash": content_hash, "bytes": length,
-            "sealed_at": _iso(fetched), "sealed_in_chain": audit_hash,
-            "block_index": block_index, "note": note,
-            "changed_from_previous": last_hash is not None and content_hash != last_hash,
-            "external_references": _parse_external(external),
-        })
-        last_hash = content_hash
+    The host seal() takes three positional arguments (event, result, ts).
+    v1.0.0 called it with one and every submit failed silently. We try the
+    three-argument form first and fall back only if the host is older, and
+    we record which call shape worked so this is never guesswork again.
+    """
+    out = {"sealed": False, "audit_hash": None, "error": None,
+           "call_shape": None}
+    sealer = ctx.get("seal")
+    if not sealer:
+        out["error"] = "no seal function in ctx"
+        return out
 
-    distinct = len({v["content_hash"] for v in versions})
-    return {"url": url, "seals": len(versions), "distinct_versions": distinct,
-            "first_sealed": versions[0]["sealed_at"], "latest_sealed": versions[-1]["sealed_at"],
-            "current_hash": versions[-1]["content_hash"],
-            "versions": versions,
-            "publish_version": VERSION,
-            "what_this_is": "A dated revision history the publisher cannot edit. Each version is "
-                            "its own block; altering or removing one breaks every block after it.",
-            "limit": "The first seal fixes an upper bound, not a lower one. Anything published "
-                     "before its first seal rests on external evidence, which is recorded here "
-                     "but not verified by us."}, 200
+    result_value = event.get("result") or "sent"
+    ts_value = event.get("ts") or _now_iso()
 
+    attempts = [
+        ("seal(event, result, ts)", lambda: sealer(event, result_value, ts_value)),
+        ("seal(event, result)", lambda: sealer(event, result_value)),
+        ("seal(event)", lambda: sealer(event)),
+    ]
 
-def _verify(ctx, data):
-    url = str(data.get("url", "")).strip()
-    digest = str(data.get("hash", data.get("content_hash", ""))).strip().lower()
-    if not digest or not HEX64.match(digest):
-        return {"error": "hash_required",
-                "message": "sha256 of AILEASH-PUBLISH-v1: followed by the exact bytes served"}, 400
+    errors = []
+    for shape, call in attempts:
+        try:
+            res = call()
+        except TypeError as e:
+            errors.append("%s -> TypeError: %s" % (shape, e))
+            continue
+        except Exception as e:
+            out["error"] = "%s -> %s: %s" % (shape, type(e).__name__, e)
+            out["call_shape"] = shape
+            return out
+        out["call_shape"] = shape
+        _record_seal_result(out, res)
+        if not out["sealed"]:
+            out["error"] = "seal returned no hash"
+        return out
 
-    with ctx["lock"]:
-        if url:
-            rows = ctx["conn"].execute(
-                "SELECT url,fetched,audit_hash,block_index FROM publish_seal "
-                "WHERE url=? AND content_hash=? ORDER BY id ASC", (url, digest)).fetchall()
-        else:
-            rows = ctx["conn"].execute(
-                "SELECT url,fetched,audit_hash,block_index FROM publish_seal "
-                "WHERE content_hash=? ORDER BY id ASC", (digest,)).fetchall()
-
-    if not rows:
-        return {"sealed": False, "content_hash": digest, "url": url or None,
-                "message": "We hold no seal for that exact content. Either it was never sealed, "
-                           "or the content differs from what was - a single byte is enough."}, 404
-
-    return {"sealed": True, "content_hash": digest,
-            "url": rows[0][0], "times_sealed": len(rows),
-            "first_sealed": _iso(rows[0][1]),
-            "latest_sealed": _iso(rows[-1][1]),
-            "sealed_in_chain": rows[0][2], "block_index": rows[0][3],
-            "publish_version": VERSION,
-            "what_this_proves": "Content with exactly this fingerprint was served at that "
-                                "address no later than the first sealing time, and the record "
-                                "of it has not been altered since.",
-            "verify_the_block": "/x/consistency/ancestor?tip=" + rows[0][2]}, 200
+    out["error"] = "no accepted call shape; " + " | ".join(errors)
+    return out
 
 
-def _list(ctx):
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT url,COUNT(*),MIN(fetched),MAX(fetched),COUNT(DISTINCT content_hash) "
-            "FROM publish_seal GROUP BY url ORDER BY MAX(fetched) DESC LIMIT 500").fetchall()
-    return {"count": len(rows),
-            "pages": [{"url": r[0], "seals": r[1], "first_sealed": _iso(r[2]),
-                       "latest_sealed": _iso(r[3]), "distinct_versions": r[4],
-                       "history": "/x/publish/history?url=" + r[0]} for r in rows],
-            "publish_version": VERSION,
-            "note": "Everything this platform has sealed about its own published pages. Ours is "
-                    "in here too - a publisher who seals everyone's pages but not their own is "
-                    "telling you something."}, 200
+# ---------------------------------------------------------------- page
 
+PAGE = """<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex">
+<title>PRAXIS submit</title>
+<style>
+:root{--ink:#0a0f1e;--ink2:#10182e;--gold:#c9a84c;--ok:#7fe3b0;--err:#ff8a80}
+*{box-sizing:border-box}
+body{margin:0;padding:16px;background:var(--ink);color:#e8ecf5;
+     font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+h1{font-size:18px;margin:0 0 4px;color:var(--gold)}
+p.sub{margin:0 0 18px;color:#8b96ad;font-size:13px}
+label{display:block;margin:12px 0 4px;font-size:12px;color:#8b96ad;
+      text-transform:uppercase;letter-spacing:.06em}
+input{width:100%;padding:11px;background:var(--ink2);border:1px solid #24304e;
+      border-radius:8px;color:#e8ecf5;font:14px monospace}
+input:focus{outline:none;border-color:var(--gold)}
+.row{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px}
+button{flex:1;min-width:120px;padding:13px;border:0;border-radius:8px;
+       background:var(--gold);color:#0a0f1e;font-weight:600;font-size:15px}
+button.alt{background:var(--ink2);color:#e8ecf5;border:1px solid #24304e}
+button:disabled{opacity:.45}
+pre{margin-top:16px;padding:12px;background:var(--ink2);border:1px solid #24304e;
+    border-radius:8px;white-space:pre-wrap;word-break:break-all;
+    font:12px/1.45 monospace;max-height:60vh;overflow:auto}
+.ok{color:var(--ok)}.err{color:var(--err)}
+</style></head><body>
+
+<h1>PRAXIS observe &mdash; chain 4</h1>
+<p class="sub">Signs one bounded submission and sends it. Fresh ts, nonce and
+idempotency key every press.</p>
+
+<label>API key</label>
+<input id="key" type="password" placeholder="AILeash API key" autocomplete="off">
+
+<label>Tip digest (64 hex)</label>
+<input id="tip" placeholder="press Load tip">
+
+<label>Witnessed peer id</label>
+<input id="wpid" value="aileash">
+
+<label>Source URL</label>
+<input id="src" value="https://sebbi.pro/x/witness/tip">
+
+<label>Attempt marker (optional)</label>
+<input id="att" placeholder="leave blank for a first attempt">
+
+<div class="row">
+  <button class="alt" onclick="loadTip()">Load tip</button>
+  <button class="alt" onclick="theirSchema()">Their schema</button>
+</div>
+<div class="row">
+  <button class="alt" onclick="go('canonical')">Dry run</button>
+  <button onclick="send()">Send</button>
+</div>
+
+<pre id="out">Ready.</pre>
+
+<script>
+var out = document.getElementById('out');
+function show(t, cls){ out.className = cls || ''; out.textContent = t; }
+function val(id){ return document.getElementById(id).value.trim(); }
+
+function loadTip(){
+  show('Loading our tip...');
+  fetch('/x/witness/tip').then(function(r){ return r.json(); }).then(function(j){
+    var t = j.tip || j.hash || j.head || j.chain_tip || j.latest || '';
+    document.getElementById('tip').value = t;
+    show('Tip loaded.\\n\\n' + JSON.stringify(j, null, 2), 'ok');
+  }).catch(function(e){ show('Failed: ' + e, 'err'); });
+}
+
+function theirSchema(){
+  show('Fetching their live contract...');
+  fetch('/x/praxis/schema').then(function(r){ return r.json(); }).then(function(j){
+    show(JSON.stringify(j, null, 2), j.receipt_digest_required ? 'err' : 'ok');
+  }).catch(function(e){ show('Failed: ' + e, 'err'); });
+}
+
+function body(){
+  return {
+    tip_digest: val('tip'),
+    witnessed_peer_id: val('wpid'),
+    source_url: val('src'),
+    attempt: val('att') || null
+  };
+}
+
+function go(action){
+  var k = val('key');
+  if(!k){ show('API key required.', 'err'); return; }
+  show('Working...');
+  fetch('/x/praxis/' + action, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + k },
+    body: JSON.stringify(body())
+  }).then(function(r){ return r.json(); }).then(function(j){
+    show(JSON.stringify(j, null, 2), j.ok === false ? 'err' : 'ok');
+  }).catch(function(e){ show('Failed: ' + e, 'err'); });
+}
+
+function send(){
+  if(!confirm('Send one bounded submission to chain 4 now?')) return;
+  go('submit');
+}
+</script>
+</body></html>"""
+
+
+def _install_page():
+    """Serve /praxis by wrapping the running handler's do_GET, once."""
+    for mod in list(sys.modules.values()):
+        if mod is None:
+            continue
+        try:
+            names = dir(mod)
+        except Exception:
+            continue
+        for name in names:
+            try:
+                obj = getattr(mod, name, None)
+            except Exception:
+                continue
+            if not isinstance(obj, type):
+                continue
+            if not (hasattr(obj, "do_GET") and hasattr(obj, "do_POST")):
+                continue
+            if getattr(obj, "_praxis_patched", False):
+                return True
+            original = obj.do_GET
+
+            def patched(self, _original=original):
+                try:
+                    path = self.path.split("?")[0].rstrip("/")
+                except Exception:
+                    path = ""
+                if path == "/praxis":
+                    data = PAGE.encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("X-Robots-Tag", "noindex")
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+                return _original(self)
+
+            obj.do_GET = patched
+            obj._praxis_patched = True
+            return True
+    return False
+
+
+# ---------------------------------------------------------------- actions
 
 def _spec():
     return {
-        "publish_version": VERSION,
-        "content_hash": "sha256('AILEASH-PUBLISH-v1:' || exact_bytes_served) as lowercase hex",
-        "no_normalisation": "The bytes are hashed exactly as served. Nothing is trimmed, "
-                            "reordered or cleaned up first - a whitespace-tolerant hash would "
-                            "be a hash of our opinion of the page rather than of the page.",
-        "reproduce_it": "curl the URL, pipe the raw bytes through sha256 with that prefix, and "
-                        "compare with what we sealed. If your bytes differ, the page changed.",
-        "what_a_seal_proves": "That content with this exact fingerprint was served at this "
-                              "address no later than the sealing time, and that the record has "
-                              "not been altered since - it is a chain block like any other, "
-                              "anchored externally and witnessed by peers.",
-        "what_it_cannot_prove": "That the page existed before the seal. Timestamps run forwards "
-                                "only. Any product implying otherwise is misdescribing what a "
-                                "timestamp is.",
-        "for_earlier_dates": {
-            "github_push": "api.github.com/repos/<owner>/<repo>/events - the push timestamp is "
-                           "recorded by GitHub, not the pusher, unlike commit author and "
-                           "committer dates which are settable fields. Retained around 90 days, "
-                           "so capture it while it exists.",
-            "wayback": "archive.org/wayback/available - an independent party with no stake in "
-                       "the dispute.",
-            "status": "Both are recorded and sealed as supplied, and neither is verified by us. "
-                      "They are somebody else's evidence, named so you can check them at source.",
+        "module": "praxis",
+        "version": VERSION,
+        "what_this_is": (
+            "Outbound submitter for the PRAXIS external-witness observe "
+            "endpoint. One bounded submission per press. This module sends; "
+            "it does not receive."
+        ),
+        "target": {"observe": OBSERVE_URL, "schema": SCHEMA_URL},
+        "signing": {
+            "algorithm": "hmac-sha256",
+            "domain": "PRAXIS-OBSERVE-v1\\n",
+            "canonicalization": "sort_keys=true, separators=(',',':'), ensure_ascii=true, utf-8",
+            "preimage": "domain bytes + canonical JSON of the envelope with 'signature' removed",
+            "signature_encoding": "lowercase hex",
+            "auth_transport": "body, not headers",
         },
-        "the_discipline": "Seal at publication. One call at the moment a page goes live means "
-                          "the publication date never rests on anyone's word, anyone's git "
-                          "history, or anyone's memory again.",
+        "payload_policy": (
+            "receipt_digest is optional under their contract v1_1 and is "
+            "omitted for a pure chain-tip observation. It is never filled "
+            "with a duplicate of tip_digest or a placeholder."
+        ),
+        "freshness": "fresh ts, fresh nonce and a fresh idempotency key on every submit",
+        "seal_policy": (
+            "a submit that reaches the peer but fails to seal into our own "
+            "chain returns ok:false with seal_failed true. The send is still "
+            "reported in full, because it happened and the peer may hold a "
+            "durable record of it."
+        ),
+        "not_claimed": [
+            "this lane is one-directional and does not establish mutual witnessing",
+            "their acceptance is a transport and signature outcome, not verification "
+            "of anything in our chain",
+        ],
+        "routes": {
+            "public": ["GET spec", "GET status", "GET schema"],
+            "keyed": ["GET history", "POST canonical", "POST submit"],
+        },
+    }
+
+
+def _status():
+    installed = _install_page()
+    s = _secret()
+    return {
+        "module": "praxis",
+        "version": VERSION,
+        "page": "/praxis",
+        "page_installed": installed,
+        "peer_id": OUR_PEER_ID,
+        "secret_configured": bool(s),
+        "secret_env": SECRET_ENV,
+        "secret_length": len(s) if s else 0,
+        "target": OBSERVE_URL,
+        "note": (
+            "secret_configured false means the environment variable is not set "
+            "on this replica; the secret itself is never returned by any route"
+        ),
+    }
+
+
+def _their_schema():
+    code, headers, raw, err = _http("GET", SCHEMA_URL)
+    if err:
+        return {"ok": False, "error": "fetch_failed", "detail": err}, 502
+    doc = _parse_json(raw)
+    if doc is None:
+        return {"ok": False, "error": "unparseable", "status": code}, 502
+
+    req = (((doc.get("request_schema") or {}).get("properties") or {})
+           .get("payload") or {})
+    required = req.get("required") or []
+    hdr = {}
+    for k, v in (headers or {}).items():
+        if k.lower().startswith("x-praxis") or k.lower() == "cache-control":
+            hdr[k.lower()] = v
+
+    return {
+        "ok": True,
+        "fetched_at": _now_iso(),
+        "http_status": code,
+        "contract_version": doc.get("schema_version"),
+        "payload_required": required,
+        "receipt_digest_required": "receipt_digest" in required,
+        "canonicalization": ((doc.get("signing") or {}).get("canonicalization")),
+        "domain": ((doc.get("signing") or {}).get("domain")),
+        "clock_skew_seconds": ((doc.get("freshness") or {}).get("clock_skew_seconds")),
+        "headers": hdr,
+        "body_sha256": _sha256_hex(raw),
     }, 200
 
 
-# ----------------------------------------------------------------------
-# router entry point
-# ----------------------------------------------------------------------
+def _canonical_action(data):
+    tip = (data.get("tip_digest") or "").strip().lower()
+    wpid = (data.get("witnessed_peer_id") or OUR_PEER_ID).strip().lower()
+    src = (data.get("source_url") or OUR_TIP_URL).strip()
+    rcpt = (data.get("receipt_digest") or "").strip().lower() or None
+    attempt = data.get("attempt") or None
+
+    bad = _validate(tip, wpid, src, rcpt)
+    if bad:
+        return {"ok": False, "error": "invalid_input", "detail": bad}, 400
+
+    secret = _secret()
+    if not secret:
+        return {"ok": False, "error": "secret_unconfigured",
+                "detail": "set %s in the environment" % SECRET_ENV}, 503
+
+    env = _build_envelope(tip, wpid, src, rcpt, attempt)
+    canonical, preimage, sig = _sign(env, secret)
+    signed = dict(env)
+    signed["signature"] = sig
+
+    return {
+        "ok": True,
+        "dry_run": True,
+        "sent": False,
+        "envelope": signed,
+        "canonical_json": canonical.decode("utf-8"),
+        "canonical_sha256": _sha256_hex(canonical),
+        "preimage_sha256": _sha256_hex(preimage),
+        "signature": sig,
+        "note": "nothing was sent; ts, nonce and idempotency_key here are "
+                "single-use and will be regenerated on an actual submit",
+    }, 200
+
+
+def _submit(data, ctx):
+    tip = (data.get("tip_digest") or "").strip().lower()
+    wpid = (data.get("witnessed_peer_id") or OUR_PEER_ID).strip().lower()
+    src = (data.get("source_url") or OUR_TIP_URL).strip()
+    rcpt = (data.get("receipt_digest") or "").strip().lower() or None
+    attempt = data.get("attempt") or None
+
+    bad = _validate(tip, wpid, src, rcpt)
+    if bad:
+        return {"ok": False, "error": "invalid_input", "detail": bad}, 400
+
+    secret = _secret()
+    if not secret:
+        return {"ok": False, "error": "secret_unconfigured",
+                "detail": "set %s in the environment" % SECRET_ENV}, 503
+
+    env = _build_envelope(tip, wpid, src, rcpt, attempt)
+    canonical, preimage, sig = _sign(env, secret)
+    signed = dict(env)
+    signed["signature"] = sig
+    wire = _canonical(signed)
+
+    started = time.time()
+    code, headers, raw, err = _http("POST", OBSERVE_URL, wire)
+    took = round(time.time() - started, 3)
+
+    parsed = _parse_json(raw)
+    transport_ok = err is None and code in (200, 202)
+    result = {
+        "ok": transport_ok,
+        "sent": err is None,
+        "took_seconds": took,
+        "http_status": code,
+        "transport_error": err,
+        "request": {
+            "idempotency_key": env["idempotency_key"],
+            "nonce": env["nonce"],
+            "ts": env["ts"],
+            "peer_id": env["peer_id"],
+            "payload": env["payload"],
+            "signature": sig,
+            "canonical_sha256": _sha256_hex(canonical),
+            "wire_sha256": _sha256_hex(wire),
+            "wire_bytes": len(wire),
+        },
+        "response": {
+            "body": parsed,
+            "raw_sha256": _sha256_hex(raw) if raw else None,
+            "raw_bytes": len(raw),
+            "raw_text": (raw.decode("utf-8", "replace")[:4000] if raw else None),
+        },
+    }
+
+    if isinstance(parsed, dict):
+        result["their_error"] = parsed.get("error")
+        result["their_accepted"] = parsed.get("accepted")
+        result["their_replayed"] = parsed.get("replayed")
+        result["their_request_digest"] = parsed.get("request_digest")
+        result["their_durable_event_recorded"] = parsed.get("durable_event_recorded")
+        result["their_accepted_decision_recorded"] = parsed.get(
+            "accepted_decision_recorded")
+
+    event = {
+        "user_id": "praxis:" + OUR_PEER_ID,
+        "event": "praxis_observe_submit",
+        "kind": "praxis_observe_submit",
+        "ts": _now_iso(),
+        "target": OBSERVE_URL,
+        "idempotency_key": env["idempotency_key"],
+        "request_wire_sha256": result["request"]["wire_sha256"],
+        "http_status": code,
+        "response_sha256": result["response"]["raw_sha256"],
+        "their_error": result.get("their_error"),
+        "their_accepted": result.get("their_accepted"),
+        "result": "sent" if err is None else "transport_error",
+    }
+    result["our_seal"] = _seal(ctx, event)
+
+    # A send that the peer accepted but our own chain has no entry for is a
+    # failure of this deployment, not a success. Say so at the top level.
+    if not result["our_seal"].get("sealed"):
+        result["ok"] = False
+        result["seal_failed"] = True
+        result["seal_failed_note"] = (
+            "the submission reached the peer but was NOT sealed into our "
+            "chain. The peer may hold a durable record with no counterpart "
+            "here. Do not treat this submission as evidenced on our side."
+        )
+
+    if not transport_ok:
+        status = 502 if err else 200
+    elif not result["our_seal"].get("sealed"):
+        status = 500
+    else:
+        status = 200
+    return result, status
+
+
+def _history(ctx, data):
+    limit = 20
+    try:
+        limit = max(1, min(100, int(data.get("limit") or 20)))
+    except Exception:
+        pass
+    rows = []
+    try:
+        conn = ctx.get("conn")
+        lock = ctx.get("lock")
+        sql = ("SELECT rowid, * FROM audit_log "
+               "WHERE user_id = ? ORDER BY rowid DESC LIMIT ?")
+        if lock:
+            with lock:
+                cur = conn.execute(sql, ("praxis:" + OUR_PEER_ID, limit))
+                cols = [d[0] for d in cur.description]
+                rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+        else:
+            cur = conn.execute(sql, ("praxis:" + OUR_PEER_ID, limit))
+            cols = [d[0] for d in cur.description]
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    except Exception as e:
+        return {"ok": False, "error": "query_failed",
+                "detail": "%s: %s" % (type(e).__name__, e)}, 500
+    return {"ok": True, "count": len(rows), "rows": rows}, 200
+
+
+# ---------------------------------------------------------------- router
 
 def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-    action = (action or "").strip("/").lower()
     data = data or {}
 
-    if method == "GET":
-        if action == "spec":
-            return _spec()
-        if action == "history":
-            return _history(ctx, data)
-        if action == "verify":
-            return _verify(ctx, data)
-        if action == "list":
-            return _list(ctx)
+    if method == "GET" and action == "spec":
+        return _spec(), 200
 
-    if method == "POST":
-        if not api_key:
-            return {"error": "invalid_api_key"}, 401
-        if action == "seal":
-            return _seal(ctx, api_key, data)
+    if method == "GET" and action == "status":
+        return _status(), 200
 
-    return {"error": "unknown_action", "action": action,
-            "GET": ["spec", "history", "verify", "list"],
-            "POST": ["seal (keyed)"]}, 404
+    if method == "GET" and action == "schema":
+        return _their_schema()
+
+    if method == "GET" and action == "history":
+        return _history(ctx, data)
+
+    if method == "POST" and action == "canonical":
+        return _canonical_action(data)
+
+    if method == "POST" and action == "submit":
+        return _submit(data, ctx)
+
+    return {"ok": False, "error": "unknown_action", "action": action,
+            "available": ["spec", "status", "schema", "history",
+                          "canonical", "submit"]}, 404
 
 ```
