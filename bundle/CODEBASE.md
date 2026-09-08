@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-127 files across 32 parts.
+126 files across 31 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -214,14 +214,10 @@ Generated automatically on every push. Do not edit by hand.
 
 ## [CODEBASE-30.md](CODEBASE-30.md)
 
-- `sonicboom.html`
-
-## [CODEBASE-31.md](CODEBASE-31.md)
-
 - `tokensaver.html`
 - `verify.html`
 
-## [CODEBASE-32.md](CODEBASE-32.md)
+## [CODEBASE-31.md](CODEBASE-31.md)
 
 - `whitepaper.html`
 
