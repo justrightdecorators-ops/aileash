@@ -1,472 +1,11 @@
 # Codebase — part 23 of 33
 
 Contains:
-- `certificate.html`
 - `compliance-assistant.html`
 - `console.html`
 - `contact.html`
-
-
-## `certificate.html`
-
-454 lines, 23487 bytes
-
-```html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Chain Integrity Attestation — AILeash by sebbi.pro</title>
-<meta name="description" content="Generate a factual, independently verifiable attestation of your AILeash audit chain: how many decisions are sealed, since when, and the tip hash anyone can check. A statement of record, not a compliance verdict.">
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600;700&family=IBM+Plex+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-:root{
-  --bg:#04040a;
-  --surface:#08080f;
-  --surface2:#0d0d18;
-  --border:#141428;
-  --border2:#1e1e38;
-  --gold:#c9a84c;
-  --gold2:#e8c96a;
-  --green:#00e5a0;
-  --red:#ff3d5a;
-  --blue:#4d9fff;
-  --text:#e8e8f8;
-  --muted:#4a4a6a;
-  --muted2:#6a6a8a;
-  --mono:'IBM Plex Mono',monospace;
-  --sans:'IBM Plex Sans',sans-serif;
-}
-
-html{scroll-behavior:smooth}
-body{background:var(--bg);color:var(--text);font-family:var(--sans);min-height:100vh}
-
-nav{position:fixed;top:0;left:0;right:0;z-index:100;height:52px;display:flex;align-items:center;justify-content:space-between;padding:0 32px;background:rgba(4,4,10,0.9);backdrop-filter:blur(16px);border-bottom:1px solid var(--border)}
-.nav-logo{font-family:var(--mono);font-size:13px;color:var(--gold);text-decoration:none}
-.nav-back{font-size:12px;color:var(--muted2);text-decoration:none;transition:color .2s}.nav-back:hover{color:var(--text)}
-
-.hero{padding:100px 32px 60px;max-width:800px;margin:0 auto;text-align:center}
-.eyebrow{font-family:var(--mono);font-size:10px;color:var(--green);letter-spacing:0.2em;text-transform:uppercase;margin-bottom:20px;display:flex;align-items:center;justify-content:center;gap:10px}
-.eyebrow::before,.eyebrow::after{content:'';width:24px;height:1px;background:var(--green);opacity:0.5}
-h1{font-size:clamp(32px,5vw,56px);font-weight:700;letter-spacing:-0.03em;line-height:1.05;margin-bottom:16px}
-h1 span{color:var(--gold)}
-.hero-sub{font-size:16px;color:var(--muted2);line-height:1.7;max-width:580px;margin:0 auto 20px;font-weight:300}
-.hero-note{font-size:13px;color:var(--muted);line-height:1.6;max-width:560px;margin:0 auto 48px;font-family:var(--mono)}
-
-.steps-row{display:grid;grid-template-columns:repeat(3,1fr);gap:2px;background:var(--border);border-radius:10px;overflow:hidden;margin-bottom:48px;max-width:700px;margin-left:auto;margin-right:auto}
-.step-card{background:var(--surface);padding:20px;text-align:center}
-.step-num{font-family:var(--mono);font-size:28px;color:var(--gold);font-weight:700;opacity:0.3;margin-bottom:6px}
-.step-title{font-size:13px;font-weight:600;margin-bottom:4px}
-.step-desc{font-size:11px;color:var(--muted2);line-height:1.5}
-
-.main-wrap{max-width:700px;margin:0 auto;padding:0 32px 80px}
-
-.card{background:var(--surface);border:1px solid var(--border2);border-radius:12px;overflow:hidden;position:relative}
-.card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--gold),var(--green),var(--blue))}
-.card-inner{padding:32px}
-
-.form-section{margin-bottom:24px}
-.section-label{font-family:var(--mono);font-size:10px;color:var(--muted);letter-spacing:0.15em;text-transform:uppercase;margin-bottom:16px;display:flex;align-items:center;gap:8px}
-.section-label::after{content:'';flex:1;height:1px;background:var(--border)}
-
-.field{margin-bottom:16px}
-.field-label{font-size:12px;color:var(--muted2);margin-bottom:6px;display:block;font-weight:500}
-.field-input{width:100%;background:#060610;border:1px solid var(--border2);color:var(--text);padding:12px 16px;font-size:14px;font-family:var(--sans);border-radius:6px;outline:none;transition:border-color .2s}
-.field-input:focus{border-color:var(--gold)}
-.field-input::placeholder{color:var(--muted)}
-.field-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-
-.explain{background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:18px 20px;margin-bottom:24px}
-.explain h4{font-size:12px;color:var(--gold);font-family:var(--mono);letter-spacing:0.1em;text-transform:uppercase;margin-bottom:10px}
-.explain p{font-size:13px;color:var(--muted2);line-height:1.65;margin-bottom:8px}
-.explain p:last-child{margin-bottom:0}
-.explain b{color:var(--text)}
-
-.pricing-box{background:linear-gradient(135deg,rgba(201,168,76,0.08),rgba(201,168,76,0.02));border:1px solid rgba(201,168,76,0.2);border-radius:8px;padding:20px;display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:20px}
-.pricing-left h3{font-size:15px;font-weight:600;margin-bottom:4px}
-.pricing-left p{font-size:12px;color:var(--muted2);line-height:1.5}
-.pricing-amount{font-family:var(--mono);font-size:32px;color:var(--gold);font-weight:700;white-space:nowrap}
-.pricing-amount span{font-size:13px;color:var(--muted2);font-weight:400}
-
-.generate-btn{width:100%;background:linear-gradient(135deg,var(--gold),var(--gold2));color:#000;border:none;padding:15px;font-size:15px;font-weight:700;font-family:var(--sans);border-radius:8px;cursor:pointer;transition:all .2s;display:flex;align-items:center;justify-content:center;gap:8px}
-.generate-btn:hover{transform:translateY(-1px);box-shadow:0 8px 24px rgba(201,168,76,0.25)}
-.generate-btn:disabled{opacity:0.5;cursor:not-allowed;transform:none}
-
-.error-msg{background:rgba(255,61,90,0.08);border:1px solid rgba(255,61,90,0.2);border-radius:6px;padding:12px 16px;font-size:13px;color:var(--red);margin-top:12px;display:none;font-family:var(--mono);line-height:1.6}
-.error-msg.show{display:block}
-
-.cert-wrap{display:none;margin-top:32px}
-.cert-wrap.show{display:block}
-
-.certificate{background:#fff;border-radius:10px;overflow:hidden;box-shadow:0 20px 60px rgba(0,0,0,0.5)}
-
-.cert-header{background:#0a0f1e;padding:28px 36px;display:flex;align-items:center;justify-content:space-between}
-.cert-logo{font-size:18px;font-weight:900;color:#fff;font-family:Georgia,serif}.cert-logo span{color:#c9a84c}
-.cert-header-right{text-align:right}
-.cert-type{font-family:var(--mono);font-size:9px;color:rgba(255,255,255,0.4);letter-spacing:0.15em;text-transform:uppercase;margin-bottom:2px}
-.cert-num{font-family:var(--mono);font-size:11px;color:#c9a84c}
-
-.cert-stripe{height:4px;background:linear-gradient(90deg,#c9a84c,#00e5a0,#4d9fff)}
-
-.cert-body{padding:36px}
-.cert-title{font-size:11px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:0.15em;margin-bottom:8px;font-family:var(--mono)}
-.cert-company{font-size:32px;font-weight:700;color:#0a0f1e;letter-spacing:-0.02em;margin-bottom:4px}
-.cert-domain{font-size:14px;color:#64748b;margin-bottom:24px;font-family:var(--mono)}
-
-.cert-statement{background:#f8f9fc;border-left:3px solid #c9a84c;padding:16px 20px;border-radius:0 6px 6px 0;margin-bottom:24px;font-size:13px;color:#1a202c;line-height:1.7}
-
-.cert-facts{margin-bottom:24px}
-.cert-fact{display:flex;justify-content:space-between;align-items:baseline;gap:12px;padding:12px 0;border-bottom:1px solid #e2e8f0;flex-wrap:wrap}
-.cert-fact:last-child{border-bottom:none}
-.cert-fact-key{font-size:12px;color:#64748b;font-weight:500}
-.cert-fact-val{font-family:var(--mono);font-size:13px;color:#0a0f1e;font-weight:600;text-align:right;word-break:break-all;max-width:70%}
-
-.cert-scope{background:#fff8ec;border:1px solid #f0dcae;border-radius:6px;padding:14px 18px;margin-bottom:24px;font-size:11.5px;color:#6b5a2e;line-height:1.6}
-.cert-scope b{color:#4a3d1a}
-
-.cert-chain{background:#0a0f1e;border-radius:8px;padding:16px 20px;margin-bottom:24px}
-.cert-chain-label{font-family:var(--mono);font-size:9px;color:#c9a84c;letter-spacing:0.15em;text-transform:uppercase;margin-bottom:8px}
-.cert-chain-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;flex-wrap:wrap;gap:4px}
-.cert-chain-key{font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.4)}
-.cert-chain-val{font-family:var(--mono);font-size:10px;color:#00e5a0;word-break:break-all;text-align:right;max-width:70%}
-
-.cert-footer{display:flex;justify-content:space-between;align-items:flex-end;padding-top:20px;border-top:1px solid #e2e8f0;flex-wrap:wrap;gap:16px}
-.cert-footer-label{font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:0.1em;margin-bottom:4px;font-family:var(--mono)}
-.cert-footer-val{font-size:13px;font-weight:600;color:#0a0f1e}
-.cert-seal{width:64px;height:64px;border-radius:50%;background:linear-gradient(135deg,#0a0f1e,#1a2a4a);border:2px solid #c9a84c;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center}
-.cert-seal-text{font-family:var(--mono);font-size:7px;color:#c9a84c;letter-spacing:0.1em;text-transform:uppercase;line-height:1.4}
-
-.cert-actions{display:flex;gap:12px;margin-top:20px;flex-wrap:wrap}
-.btn-download{flex:1;background:linear-gradient(135deg,var(--gold),var(--gold2));color:#000;border:none;padding:13px;font-size:14px;font-weight:700;font-family:var(--sans);border-radius:8px;cursor:pointer;transition:all .2s;display:flex;align-items:center;justify-content:center;gap:8px}
-.btn-download:hover{transform:translateY(-1px);box-shadow:0 8px 24px rgba(201,168,76,0.25)}
-.btn-share{flex:1;background:var(--surface2);border:1px solid var(--border2);color:var(--text);padding:13px;font-size:14px;font-weight:600;font-family:var(--sans);border-radius:8px;cursor:pointer;transition:all .2s;display:flex;align-items:center;justify-content:center;gap:8px}
-.btn-share:hover{border-color:var(--gold);color:var(--gold)}
-
-.trust-strip{display:flex;justify-content:center;gap:32px;padding:48px 32px;flex-wrap:wrap;max-width:700px;margin:0 auto}
-.trust-item{text-align:center}
-.trust-n{font-family:var(--mono);font-size:20px;color:var(--gold);font-weight:700}
-.trust-l{font-size:11px;color:var(--muted2);margin-top:3px}
-
-@media(max-width:600px){
-  .field-row{grid-template-columns:1fr}
-  .steps-row{grid-template-columns:1fr}
-  .cert-body{padding:24px}
-  .main-wrap{padding:0 16px 60px}
-  .hero{padding:80px 16px 40px}
-  nav{padding:0 16px}
-}
-</style>
-</head>
-<body>
-
-<nav>
-  <a href="/" class="nav-logo">sebbi.pro</a>
-  <a href="/" class="nav-back">&larr; Back to AILeash</a>
-</nav>
-
-<div class="hero">
-  <div class="eyebrow">Chain Integrity Attestation</div>
-  <h1>Prove your record.<br><span>Not our word. Yours to check.</span></h1>
-  <p class="hero-sub">Generate a dated, independently verifiable attestation of your AILeash audit chain: how many decisions are sealed, unbroken since when, and the tip hash anyone can check for themselves.</p>
-  <p class="hero-note">This attests to what your chain provably contains. It is a statement of record &mdash; not a determination of regulatory compliance.</p>
-
-  <div class="steps-row">
-    <div class="step-card">
-      <div class="step-num">01</div>
-      <div class="step-title">Enter your details</div>
-      <div class="step-desc">Organisation, domain, and your AILeash API key</div>
-    </div>
-    <div class="step-card">
-      <div class="step-num">02</div>
-      <div class="step-title">We read your chain</div>
-      <div class="step-desc">Live figures pulled from your sealed record</div>
-    </div>
-    <div class="step-card">
-      <div class="step-num">03</div>
-      <div class="step-title">Download attestation</div>
-      <div class="step-desc">Dated, with a public link anyone can verify</div>
-    </div>
-  </div>
-</div>
-
-<div class="main-wrap">
-  <div class="card">
-    <div class="card-inner">
-
-      <div class="explain">
-        <h4>What this is, and what it isn't</h4>
-        <p><b>What it is:</b> a factual statement about your audit chain on the day it is issued &mdash; the number of decisions sealed, the date the unbroken run began, and the tip hash. Every figure on it can be checked by anyone at the public verify link, with no account and without asking you.</p>
-        <p><b>What it isn't:</b> a ruling that you comply with any law. Whether you meet the EU AI Act, the Online Safety Act, GDPR or anything else is for a regulator or your own assessment to decide. This attests that your record is intact and complete &mdash; the evidence you would bring to that assessment, not the verdict.</p>
-      </div>
-
-      <div class="form-section">
-        <div class="section-label">Organisation Details</div>
-        <div class="field-row">
-          <div class="field">
-            <label class="field-label">Company / Organisation Name</label>
-            <input class="field-input" type="text" id="org-name" placeholder="Acme Financial Ltd">
-          </div>
-          <div class="field">
-            <label class="field-label">Domain</label>
-            <input class="field-input" type="text" id="org-domain" placeholder="acmefinancial.com">
-          </div>
-        </div>
-        <div class="field">
-          <label class="field-label">AILeash API Key</label>
-          <input class="field-input" type="text" id="api-key" placeholder="al_live_...">
-        </div>
-        <div class="field">
-          <label class="field-label">Contact Email</label>
-          <input class="field-input" type="email" id="contact-email" placeholder="you@yourcompany.com">
-        </div>
-      </div>
-
-      <div class="pricing-box">
-        <div class="pricing-left">
-          <h3>Chain Integrity Attestation</h3>
-          <p>Dated &middot; figures read live from your sealed chain &middot; publicly verifiable &middot; re-issue any time your record grows</p>
-        </div>
-        <div class="pricing-amount">&pound;99 <span>one-time</span></div>
-      </div>
-
-      <button class="generate-btn" id="gen-btn" onclick="generateCert()">
-        <span>Read my chain &amp; generate attestation</span>
-        <span>&rarr;</span>
-      </button>
-      <div class="error-msg" id="error-msg"></div>
-
-      <div class="cert-wrap" id="cert-wrap">
-        <div class="certificate" id="certificate">
-          <div class="cert-header">
-            <div class="cert-logo">Monop <span>Content</span></div>
-            <div class="cert-header-right">
-              <div class="cert-type">Chain Integrity Attestation</div>
-              <div class="cert-num" id="cert-num">ATT-000000</div>
-            </div>
-          </div>
-          <div class="cert-stripe"></div>
-          <div class="cert-body">
-            <div class="cert-title">This attestation concerns</div>
-            <div class="cert-company" id="cert-company">&mdash;</div>
-            <div class="cert-domain" id="cert-domain">&mdash;</div>
-
-            <div class="cert-statement" id="cert-statement">&mdash;</div>
-
-            <div class="cert-facts" id="cert-facts"></div>
-
-            <div class="cert-scope">
-              <b>Scope.</b> This attests only to the integrity and contents of the audit chain named below, as read on the issue date. It is not a determination of compliance with any law or standard, and it does not assess the correctness of any individual decision. Verify every figure yourself at the link provided.
-            </div>
-
-            <div class="cert-chain">
-              <div class="cert-chain-label">// Independent verification</div>
-              <div class="cert-chain-row">
-                <span class="cert-chain-key">Method</span>
-                <span class="cert-chain-val">SHA-256 hash chain</span>
-              </div>
-              <div class="cert-chain-row">
-                <span class="cert-chain-key">Chain state</span>
-                <span class="cert-chain-val" id="cert-chain-status">&mdash;</span>
-              </div>
-              <div class="cert-chain-row">
-                <span class="cert-chain-key">Tip hash</span>
-                <span class="cert-chain-val" id="cert-hash">&mdash;</span>
-              </div>
-              <div class="cert-chain-row">
-                <span class="cert-chain-key">Verify at</span>
-                <span class="cert-chain-val">sebbi.pro/api/verify-chain</span>
-              </div>
-            </div>
-
-            <div class="cert-footer">
-              <div>
-                <div class="cert-footer-label">Issued by</div>
-                <div class="cert-footer-val">AILeash &middot; sebbi.pro</div>
-              </div>
-              <div>
-                <div class="cert-footer-label">Issue date</div>
-                <div class="cert-footer-val" id="cert-date">&mdash;</div>
-              </div>
-              <div class="cert-seal">
-                <div class="cert-seal-text">Chain<br>Attested<br>sebbi.pro</div>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <div class="cert-actions">
-          <button class="btn-download" onclick="downloadCert()">&darr; Download attestation</button>
-          <button class="btn-share" onclick="shareCert()">&#8663; Share</button>
-        </div>
-      </div>
-
-    </div>
-  </div>
-
-  <div class="trust-strip">
-    <div class="trust-item"><div class="trust-n">SHA-256</div><div class="trust-l">Hash chain</div></div>
-    <div class="trust-item"><div class="trust-n">Public</div><div class="trust-l">Verify with no account</div></div>
-    <div class="trust-item"><div class="trust-n">Dated</div><div class="trust-l">Statement of record</div></div>
-    <div class="trust-item"><div class="trust-n">Live</div><div class="trust-l">Read from your chain</div></div>
-  </div>
-</div>
-
-<script>
-function attNum() {
-  return 'ATT-' + Date.now().toString(36).toUpperCase();
-}
-
-async function generateCert() {
-  var orgName = document.getElementById('org-name').value.trim();
-  var domain = document.getElementById('org-domain').value.trim();
-  var apiKey = document.getElementById('api-key').value.trim();
-  var email = document.getElementById('contact-email').value.trim();
-  var errEl = document.getElementById('error-msg');
-  var btn = document.getElementById('gen-btn');
-
-  errEl.classList.remove('show');
-
-  if (!orgName) { return fail('Please enter your organisation name.'); }
-  if (!domain) { return fail('Please enter your domain.'); }
-  if (!apiKey) { return fail('Please enter your AILeash API key.'); }
-  if (!email || email.indexOf('@') < 1) { return fail('Please enter a valid email address.'); }
-
-  function fail(m){ errEl.textContent = m; errEl.classList.add('show');
-    btn.textContent = 'Read my chain & generate attestation \u2192'; btn.disabled = false; return; }
-
-  btn.textContent = 'Reading your chain\u2026';
-  btn.disabled = true;
-
-  // Read the chain. NO silent success fallback: if we cannot read it, we say so.
-  var chainData = null;
-  try {
-    var r = await fetch('/api/verify-chain');
-    if (!r.ok) throw new Error('status ' + r.status);
-    chainData = await r.json();
-  } catch (e) {
-    return fail('Could not read the audit chain right now (' + e.message +
-      '). Nothing has been issued. Please try again shortly \u2014 an attestation ' +
-      'is only produced from a live reading, never from a placeholder.');
-  }
-
-  // Validate the key against the engine. NO fallback to valid.
-  var keyValid = false, keyChecked = false;
-  try {
-    var r2 = await fetch('/api/validate-engine', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json','Authorization':'Bearer ' + apiKey}
-    });
-    keyChecked = true;
-    if (r2.ok) {
-      var kd = await r2.json();
-      keyValid = kd.valid === true;
-    }
-  } catch (e) {
-    keyChecked = false;
-  }
-
-  if (keyChecked && !keyValid) {
-    return fail('That API key did not validate against the engine. Check the key ' +
-      'and try again. No attestation is issued for an unverified key.');
-  }
-  if (!keyChecked) {
-    return fail('Could not reach the engine to validate your key. Nothing has been ' +
-      'issued. Please try again shortly.');
-  }
-
-  // Record the request for follow-up (best effort, never blocks issuance).
-  fetch('/contact', {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({
-      name: orgName, email: email, phone: '', org: domain,
-      message: 'ATTESTATION REQUEST\n\nOrg: ' + orgName + '\nDomain: ' + domain +
-        '\nEmail: ' + email + '\nKey: ' + apiKey.slice(0,20) + '...'
-    })
-  }).catch(function(){});
-
-  var now = new Date();
-  var num = attNum();
-
-  // Only use figures the chain actually returned. If a field is absent, say so
-  // rather than inventing it.
-  var blocks = (typeof chainData.blocks === 'number') ? chainData.blocks : null;
-  var tip = chainData.tip || null;
-  var intact = (chainData.valid === true);
-  var since = chainData.unbroken_since || chainData.first_block_date || null;
-
-  document.getElementById('cert-num').textContent = num;
-  document.getElementById('cert-company').textContent = orgName;
-  document.getElementById('cert-domain').textContent = domain;
-  document.getElementById('cert-date').textContent =
-    now.toLocaleDateString('en-GB', {day:'numeric',month:'long',year:'numeric'});
-
-  document.getElementById('cert-statement').textContent =
-    'As of the issue date below, the AILeash audit chain associated with this key ' +
-    'was read live and its contents recorded here. Every figure shown can be ' +
-    'checked independently at the public verification link, with no account and ' +
-    'without the cooperation of sebbi.pro.';
-
-  // Build the facts from what was actually returned.
-  var facts = [];
-  facts.push(['Decisions sealed in chain',
-    blocks === null ? 'not reported by chain' : blocks.toLocaleString()]);
-  facts.push(['Unbroken since',
-    since ? since : 'not reported by chain']);
-  facts.push(['Chain state',
-    intact ? 'intact \u2014 links verified' : 'NOT confirmed intact']);
-  document.getElementById('cert-facts').innerHTML = facts.map(function(f){
-    return '<div class="cert-fact"><span class="cert-fact-key">' + f[0] +
-      '</span><span class="cert-fact-val">' + f[1] + '</span></div>';
-  }).join('');
-
-  document.getElementById('cert-chain-status').textContent =
-    intact ? 'intact \u2014 links verified' : 'not confirmed intact';
-  document.getElementById('cert-hash').textContent = tip ? tip : 'not reported';
-
-  document.getElementById('cert-wrap').classList.add('show');
-  document.getElementById('cert-wrap').scrollIntoView({behavior:'smooth', block:'start'});
-
-  btn.textContent = 'Attestation generated \u2713';
-  btn.style.background = 'linear-gradient(135deg,#00875a,#00b87d)';
-}
-
-function downloadCert() {
-  var cert = document.getElementById('certificate');
-  var num = document.getElementById('cert-num').textContent;
-  var w = window.open('', '_blank');
-  w.document.write('<html><head><title>' + num + '</title>');
-  w.document.write('<style>body{margin:0;padding:20px;font-family:IBM Plex Sans,sans-serif}');
-  w.document.write(document.querySelector('style').innerHTML);
-  w.document.write('</style></head><body>');
-  w.document.write(cert.outerHTML);
-  w.document.write('</body></html>');
-  w.document.close();
-  setTimeout(function(){ w.print(); }, 500);
-}
-
-function shareCert() {
-  var company = document.getElementById('cert-company').textContent;
-  var num = document.getElementById('cert-num').textContent;
-  var text = company + ' \u2014 AILeash chain integrity attestation ' + num +
-    '. Verify at sebbi.pro/api/verify-chain';
-  if (navigator.share) {
-    navigator.share({title: 'Chain Integrity Attestation', text: text,
-      url: 'https://sebbi.pro/certificate'});
-  } else if (navigator.clipboard) {
-    navigator.clipboard.writeText(text).then(function(){
-      alert('Attestation details copied to clipboard.');
-    });
-  }
-}
-</script>
-
-</body>
-</html>
-
-```
+- `copyright.txt`
+- `data-protection.html`
 
 
 ## `compliance-assistant.html`
@@ -1794,6 +1333,221 @@ async function doSubmit(){
   }
 }
 </script>
+</body>
+</html>
+
+```
+
+
+## `copyright.txt`
+
+76 lines, 4491 bytes
+
+```text
+# COPYRIGHT.TXT — Copyright and Originality Declaration
+# sebbi.pro | Monop Content | Justin Antony Dobson
+# Published: June 2026
+# Linked to: sebbi.pro/ai.txt | sebbi.pro/dis.txt | sebbi.pro/legal.txt
+# Verification: sebbi.pro/api/verify-chain
+
+## Automatic Copyright Notice
+
+Under the Copyright, Designs and Patents Act 1988, copyright in an original work arises automatically upon creation. No registration is required. The following original works are the intellectual property of Justin Antony Dobson, trading as Monop Content, from the date of their creation.
+
+## Original Works Declared
+
+COPYRIGHT-001: OAAS-1.0 — Open AI Audit Standard
+The concept, structure, format, and specific wording of the Open AI Audit Standard, including the ai.txt declaration format, is an original work created by Justin Antony Dobson in June 2026. First published at sebbi.pro/ai.txt.
+
+COPYRIGHT-002: dis.txt — Disinformation Protection Standard
+The concept, structure, and format of a machine-readable disinformation protection declaration file linked to a cryptographic audit chain is an original work created by Justin Antony Dobson in June 2026. First published at sebbi.pro/dis.txt.
+
+COPYRIGHT-003: legal.txt — Legal Declaration Standard
+The concept, structure, and format of a machine-readable legal declaration file linked to a cryptographic audit chain is an original work created by Justin Antony Dobson in June 2026. First published at sebbi.pro/legal.txt.
+
+COPYRIGHT-004: copyright.txt — Copyright Declaration Standard
+The concept, structure, and format of this file is an original work created by Justin Antony Dobson in June 2026. First published at sebbi.pro/copyright.txt.
+
+COPYRIGHT-005: AILeash Platform
+The AILeash platform including its governance engine, 9-signal weighted scoring system, SHA-256 Merkle audit chain implementation, trust decay model, velocity tracking system, and sovereign deployment architecture is an original work created by Justin Antony Dobson between 2021 and 2026.
+
+COPYRIGHT-006: AILeash Guardian
+The AILeash Guardian child safety platform including its grooming detection methodology, parent PWA dashboard, and evidence chain implementation is an original work created by Justin Antony Dobson.
+
+COPYRIGHT-007: SonicBoom
+The SonicBoom speed and compliance layer concept and implementation is an original work created by Justin Antony Dobson.
+
+COPYRIGHT-008: AILeash Sentinel
+The AILeash Sentinel fraud and anomaly detection platform is an original work created by Justin Antony Dobson.
+
+## What Is Protected
+
+The following are protected by copyright and may not be reproduced, copied, or distributed without permission:
+
+- The specific wording, format, and structure of ai.txt, dis.txt, legal.txt, and copyright.txt
+- The source code of server.py, engine.py, and all associated platform files
+- The specific implementation of the SHA-256 Merkle chain audit system as built by Justin Antony Dobson
+- All HTML, CSS, and JavaScript files published at sebbi.pro
+- The OAAS-1.0 standard document published at sebbi.pro/ai-standard
+
+## What Is Not Restricted
+
+Others may:
+- Build their own AI compliance products using different code and different approaches
+- Implement the general concept of AI audit chains using their own implementations
+- Reference OAAS-1.0 provided they attribute authorship to Justin Antony Dobson
+
+Others may not:
+- Copy the specific format of these declaration files and present them as their own
+- Reproduce the source code of the AILeash platform without permission
+- Claim authorship or co-authorship of OAAS-1.0 or any of the above works
+
+## Prior Art Declaration
+
+This file, combined with the SHA-256 Merkle chain at sebbi.pro/api/verify-chain, constitutes a timestamped prior art declaration. The chain provides cryptographic proof of the date and content of all original works listed above.
+
+If any third party seeks to patent, trademark, or claim ownership of concepts substantially similar to those listed above after the publication date of this file, this declaration and the associated Merkle chain evidence will be submitted as prior art.
+
+## Linked Files
+
+ai.txt: https://sebbi.pro/ai.txt
+dis.txt: https://sebbi.pro/dis.txt
+legal.txt: https://sebbi.pro/legal.txt
+copyright.txt: https://sebbi.pro/copyright.txt
+Verification: https://sebbi.pro/api/verify-chain
+
+© 2026 Justin Antony Dobson / Monop Content
+Blyth, Northumberland, United Kingdom
+All rights reserved under the Copyright, Designs and Patents Act 1988.
+
+```
+
+
+## `data-protection.html`
+
+123 lines, 12310 bytes
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Data Protection &amp; Sovereignty Statement — Monop Content / AILeash</title>
+<meta name="description" content="What data the AILeash platform processes, what it deliberately never holds, where data lives, how long it is kept, and how data subject rights are handled.">
+<style>
+  :root{--ink:#0a0f1e;--ink2:#111a30;--line:#232d4a;--gold:#c9a84c;--gold-dim:#8a7838;--ok:#7fe3b0;--text:#e8e8f0;--muted:#c2c8dc;--faint:#5a6178}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--ink);color:#fff;line-height:1.7;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:720px;margin:0 auto;padding:26px 20px 90px}
+  a.back{color:var(--gold);text-decoration:none;font-size:13px;font-family:ui-monospace,Menlo,monospace;letter-spacing:.5px}
+  .eyebrow{font-family:ui-monospace,Menlo,monospace;font-size:10.5px;letter-spacing:2px;text-transform:uppercase;color:var(--gold-dim);margin:22px 0 10px}
+  h1{font-size:28px;font-weight:800;letter-spacing:-.5px;margin-bottom:10px;line-height:1.2}
+  h1 span{color:var(--gold)}
+  .meta{font-family:ui-monospace,Menlo,monospace;font-size:12px;color:var(--faint);margin-bottom:26px;line-height:1.9}
+  h2{font-size:19px;font-weight:800;margin:40px 0 8px;letter-spacing:-.3px}
+  h2 .n{color:var(--gold);font-family:ui-monospace,Menlo,monospace;font-size:13px;margin-right:8px}
+  p{font-size:14.5px;color:var(--muted);margin-bottom:13px}
+  p b{color:#fff}
+  ul{margin:0 0 14px 0;list-style:none}
+  li{position:relative;padding-left:20px;margin-bottom:9px;font-size:14px;color:var(--muted)}
+  li::before{content:'';position:absolute;left:0;top:9px;width:6px;height:6px;border-radius:50%;background:var(--gold)}
+  li b{color:#fff}
+  .honest{border:1px solid rgba(201,168,76,.35);background:rgba(201,168,76,.05);border-radius:12px;padding:16px 20px;margin:16px 0;font-size:13.5px;color:var(--muted);line-height:1.75}
+  .honest b{color:var(--gold)}
+  .green{border:1px solid rgba(127,227,176,.3);background:rgba(127,227,176,.05);border-radius:12px;padding:16px 20px;margin:16px 0;font-size:13.5px;color:var(--muted);line-height:1.75}
+  .green b{color:var(--ok)}
+  table{width:100%;border-collapse:collapse;font-size:13px;margin:14px 0}
+  th{padding:9px 10px;text-align:left;font-size:10.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--faint);border-bottom:2px solid var(--line)}
+  td{padding:10px;border-bottom:1px solid var(--line);vertical-align:top;color:var(--muted)}
+  td:first-child{color:#fff;font-weight:600}
+  hr{border:none;height:1px;background:linear-gradient(90deg,transparent,rgba(201,168,76,.25),transparent);margin:40px 0 0}
+  footer{margin-top:30px;text-align:center;font-size:12px;color:var(--faint);font-family:ui-monospace,Menlo,monospace}
+  footer a{color:var(--gold);text-decoration:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <a class="back" href="/">&larr; sebbi.pro</a>
+  <div class="eyebrow">monop content · policy document · public</div>
+  <h1>Data Protection &amp;<br><span>Sovereignty Statement</span></h1>
+  <div class="meta">
+    Document: MC-POL-002 · Version 1.0 · Effective 20 July 2026<br>
+    Owner: Justin Dobson, Founder, Monop Content · Review cycle: quarterly, and on any material change to data handling<br>
+    Alignment: UK GDPR / EU GDPR · published at sebbi.pro/data-protection
+  </div>
+
+  <h2><span class="n">1.</span>The design principle: the safest data is the data we never hold</h2>
+  <p>AILeash is built on aggressive data minimisation. Wherever the platform can do its job with a cryptographic fingerprint instead of content, it holds only the fingerprint. This is not a bolted-on privacy feature — it is the architecture:</p>
+  <ul>
+    <li><b>The notaries</b> fingerprint content in the user's own browser. The document, post or bank details <b>never leave the user's device</b>; only the 64-character SHA-256 hash is transmitted and sealed. A hash cannot be reversed into the content it fingerprints.</li>
+    <li><b>KYC sealing</b> stores only the SHA-256 of the verification provider's reference — never the identity document, never the raw reference number, never the personal data the provider examined.</li>
+    <li><b>Guardian</b> never stores message content — only fingerprints of flagged exchanges, sufficient to prove later that a specific exchange existed in a specific form.</li>
+    <li><b>The decision engine</b> receives only the seven event fields the customer chooses to send. Customers are instructed (in the developer documentation and below) to send pseudonymous identifiers, not names or contact details.</li>
+  </ul>
+
+  <h2><span class="n">2.</span>What we process, and why</h2>
+  <table>
+    <thead><tr><th>Data</th><th>Content</th><th>Purpose · lawful basis</th></tr></thead>
+    <tbody>
+      <tr><td>Governed events</td><td>user_id (customer-supplied identifier), action label, amount, country code, device_id, two 0–1 risk signals, optional authority token</td><td>Delivering the contracted decision and evidence service · performance of contract</td></tr>
+      <tr><td>Sealed chain records</td><td>Event, verdict, reasons, jurisdiction tag, timestamp, hashes</td><td>The tamper-evident evidence record that is the product itself · performance of contract; customers' legitimate interest in verifiable records</td></tr>
+      <tr><td>Account data</td><td>E-mail address, hashed API key, plan status, device counts</td><td>Account operation, alerts, billing · performance of contract</td></tr>
+      <tr><td>Billing data</td><td>Handled by Stripe; we hold no card numbers</td><td>Payment collection · performance of contract</td></tr>
+      <tr><td>Notary seals</td><td>SHA-256 fingerprints; for identity seals marked public, the limited display fields the user chooses to include; masked payment display fields</td><td>The public notarisation service · consent (the user submits the seal)</td></tr>
+      <tr><td>Contact messages</td><td>What the sender chooses to write</td><td>Responding · legitimate interest</td></tr>
+    </tbody>
+  </table>
+  <div class="honest"><b>Pseudonymisation is a shared responsibility, stated plainly:</b> the <code style="color:#7fe3b0">user_id</code> and <code style="color:#7fe3b0">device_id</code> fields are supplied by the customer. Our documentation instructs customers to send pseudonymous identifiers (e.g. <i>user_4471</i>), never names, e-mail addresses or other direct identifiers. Where a customer follows this, chain records contain no directly identifying personal data. Customers acting as controllers remain responsible for what they choose to transmit; Monop Content acts as processor for event data processed on customers' instructions.</div>
+
+  <h2><span class="n">3.</span>What we deliberately do not hold</h2>
+  <ul>
+    <li>No notarised content — documents, posts, messages and bank details are fingerprinted client-side and never transmitted.</li>
+    <li>No identity documents and no raw KYC references — hashes only.</li>
+    <li>No message content in Guardian — fingerprints only.</li>
+    <li>No card or bank account numbers — payments are processed by Stripe; the Payment Notary stores only user-chosen masked display fields.</li>
+    <li>No behavioural profiles beyond the per-user trust score the customer's own events generate, held against the customer's pseudonymous identifier.</li>
+    <li>No advertising, no analytics resale, no third-party data sharing of any kind. The business model is the platform fee; the data is not the product.</li>
+  </ul>
+
+  <h2><span class="n">4.</span>Where data lives, and the sovereign option</h2>
+  <p>The hosted platform runs on Railway cloud infrastructure with the database on a persistent encrypted volume; connections are TLS-encrypted in transit; backups are taken daily. Sub-processors are listed in §7. Hosting region details and current sub-processor terms are available on request at justin@monopcontent.com.</p>
+  <div class="green"><b>Full data sovereignty is a product option, not a promise:</b> organisations whose data cannot leave their own network can run the sovereign engine entirely on their own hardware — decisions, chain and database inside their building, licence validation fully offline, no phone-home. Under sovereign deployment, Monop Content processes nothing at all.</div>
+
+  <h2><span class="n">5.</span>Retention — and the honest tension with an append-only chain</h2>
+  <p>Account and billing data are retained for the life of the account plus the period required by tax and accounting law. Contact messages are retained only as long as needed to respond.</p>
+  <p>Chain records require an honest explanation rather than a boilerplate one. The chain is append-only by design — its evidential value exists precisely because records cannot be deleted or altered. This is why the platform is architected so that chain records should contain <b>no directly identifying personal data</b>: fingerprints, pseudonymous identifiers and hashes are sealed; content and identities are not. Where a valid erasure request nonetheless touches sealed data (for example, display fields a user chose to make public on an identity seal), we honour it by erasing the stored display data while the cryptographic fingerprint — which identifies no one — remains in the chain. This preserves both the data subject's rights and the integrity of the record for everyone else.</p>
+
+  <h2><span class="n">6.</span>Data subject rights</h2>
+  <p>Requests for access, rectification, erasure, restriction or portability go to <b>justin@monopcontent.com</b> and are answered within one calendar month. For event data processed on a customer's behalf, requests are handled with, and routed via, the customer as controller. UK data subjects may complain to the ICO; EU data subjects to their national supervisory authority.</p>
+
+  <h2><span class="n">7.</span>Sub-processors</h2>
+  <table>
+    <thead><tr><th>Provider</th><th>Purpose</th><th>Data touched</th></tr></thead>
+    <tbody>
+      <tr><td>Railway</td><td>Application hosting and database volume</td><td>All hosted-platform data at rest and in transit</td></tr>
+      <tr><td>Stripe</td><td>Billing and payment processing</td><td>Billing identity and payment card data (held by Stripe, not by us)</td></tr>
+      <tr><td>Brevo</td><td>Transactional e-mail (alerts, receipts, contact)</td><td>E-mail addresses and message content of e-mails sent</td></tr>
+    </tbody>
+  </table>
+  <p>Sub-processors will not be added or changed without this document being updated — and each revision of this document is fingerprinted and sealed into the chain, so its history is tamper-evident.</p>
+
+  <h2><span class="n">8.</span>Security measures, summarised</h2>
+  <ul>
+    <li>TLS for all connections; secrets held in environment variables, never in code or the repository.</li>
+    <li>Bearer-key authentication with per-key rate limits; HMAC-SHA256 signed tokens for challenges, authority and licences.</li>
+    <li>Single-lock, write-ahead-journaled database writes; the sealed chain makes any tampering — including by the operator — externally detectable.</li>
+    <li>Daily automated backups; deployment exclusively through version-controlled pipeline, so every production state is attributable.</li>
+  </ul>
+
+  <div class="honest"><b>Honest maturity statement:</b> Monop Content is an early-stage, single-operator company. This statement describes practices genuinely in operation today. We do not hold ISO 27001 or SOC 2 certification at this stage and will not imply otherwise; what we offer instead, unusually, is a platform whose core integrity claims any prospect can verify from outside before trusting us with anything.</div>
+
+  <hr>
+  <footer>
+    <p style="margin-top:20px"><a href="/">sebbi.pro</a> · <a href="/risk-policy">Risk Management Policy</a> · <a href="/human-oversight">Human Oversight Policy</a> · <a href="/whitepaper">Whitepaper</a> · <a href="/contact">Contact</a></p>
+    <p style="margin-top:8px;color:var(--faint)">Monop Content · Blyth, Northumberland, UK · justin@monopcontent.com</p>
+  </footer>
+</div>
 </body>
 </html>
 

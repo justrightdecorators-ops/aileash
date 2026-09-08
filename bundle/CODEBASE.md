@@ -153,25 +153,25 @@ Generated automatically on every push. Do not edit by hand.
 - `admin.html`
 - `ai-standard.html`
 - `ai-txt-kit.html`
-- `aileash-game.html`
 - `aitxt-popup-live.html`
 - `brain.html`
+- `certificate.html`
 
 ## [CODEBASE-23.md](CODEBASE-23.md)
 
-- `certificate.html`
 - `compliance-assistant.html`
 - `console.html`
 - `contact.html`
+- `copyright.txt`
+- `data-protection.html`
 
 ## [CODEBASE-24.md](CODEBASE-24.md)
 
-- `copyright.txt`
-- `data-protection.html`
 - `developers.html`
 - `dis.txt`
 - `docs/evidential-undertaking.md`
 - `docs/spec/ai-txt.md`
+- `game.html`
 
 ## [CODEBASE-25.md](CODEBASE-25.md)
 
