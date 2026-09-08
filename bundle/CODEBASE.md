@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-127 files across 32 parts.
+126 files across 32 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -165,11 +165,10 @@ Generated automatically on every push. Do not edit by hand.
 - `contact.html`
 - `copyright.txt`
 - `data-protection.html`
+- `dis.txt`
 
 ## [CODEBASE-24.md](CODEBASE-24.md)
 
-- `developers.html`
-- `dis.txt`
 - `docs/evidential-undertaking.md`
 - `docs/spec/ai-txt.md`
 - `green.html`
