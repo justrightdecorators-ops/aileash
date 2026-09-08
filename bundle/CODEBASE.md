@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-126 files across 32 parts.
+127 files across 33 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -165,22 +165,26 @@ Generated automatically on every push. Do not edit by hand.
 - `contact.html`
 - `copyright.txt`
 - `data-protection.html`
-- `dis.txt`
 
 ## [CODEBASE-24.md](CODEBASE-24.md)
 
+- `developers.html`
+- `dis.txt`
 - `docs/evidential-undertaking.md`
 - `docs/spec/ai-txt.md`
 - `green.html`
 - `guardian-parent.html`
-- `human-oversight.html`
-- `identity.html`
 
 ## [CODEBASE-25.md](CODEBASE-25.md)
 
-- `index.html`
+- `human-oversight.html`
+- `identity.html`
 
 ## [CODEBASE-26.md](CODEBASE-26.md)
+
+- `index.html`
+
+## [CODEBASE-27.md](CODEBASE-27.md)
 
 - `investor-prospectus.html`
 - `legal.txt`
@@ -189,7 +193,7 @@ Generated automatically on every push. Do not edit by hand.
 - `map.html`
 - `notary.html`
 
-## [CODEBASE-27.md](CODEBASE-27.md)
+## [CODEBASE-28.md](CODEBASE-28.md)
 
 - `pack.html`
 - `pay-check.html`
@@ -197,13 +201,13 @@ Generated automatically on every push. Do not edit by hand.
 - `report-threat.html`
 - `requirements.txt`
 
-## [CODEBASE-28.md](CODEBASE-28.md)
+## [CODEBASE-29.md](CODEBASE-29.md)
 
 - `reseller.html`
 - `risk-policy.html`
 - `robots.txt`
 
-## [CODEBASE-29.md](CODEBASE-29.md)
+## [CODEBASE-30.md](CODEBASE-30.md)
 
 - `scan.html`
 - `seal.html`
@@ -211,16 +215,16 @@ Generated automatically on every push. Do not edit by hand.
 - `signal-packs.html`
 - `sitemap.xml`
 
-## [CODEBASE-30.md](CODEBASE-30.md)
+## [CODEBASE-31.md](CODEBASE-31.md)
 
 - `sonicboom.html`
 
-## [CODEBASE-31.md](CODEBASE-31.md)
+## [CODEBASE-32.md](CODEBASE-32.md)
 
 - `tokensaver.html`
 - `verify.html`
 
-## [CODEBASE-32.md](CODEBASE-32.md)
+## [CODEBASE-33.md](CODEBASE-33.md)
 
 - `whitepaper.html`
 
