@@ -1,0 +1,188 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 440" width="1000" height="440" role="img" aria-label="sebbi.pro — an isometric hash chain, sealed, witnessed and anchored">
+<defs>
+  <linearGradient id="topG" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0%" stop-color="#1a2betc"/>
+  </linearGradient>
+  <linearGradient id="gTop" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0%" stop-color="#1b2745"/><stop offset="100%" stop-color="#0e1730"/>
+  </linearGradient>
+  <linearGradient id="gLeft" x1="0" y1="0" x2="0" y2="1">
+    <stop offset="0%" stop-color="#101a33"/><stop offset="100%" stop-color="#080d1c"/>
+  </linearGradient>
+  <linearGradient id="gRight" x1="0" y1="0" x2="0" y2="1">
+    <stop offset="0%" stop-color="#0c1densely"/>
+  </linearGradient>
+  <linearGradient id="gR" x1="0" y1="0" x2="0" y2="1">
+    <stop offset="0%" stop-color="#0d1528"/><stop offset="100%" stop-color="#060a15"/>
+  </linearGradient>
+  <linearGradient id="gGold" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0%" stop-color="#f0d78a"/><stop offset="100%" stop-color="#c9a84c"/>
+  </linearGradient>
+  <radialGradient id="glow" cx="50%" cy="50%" r="50%">
+    <stop offset="0%" stop-color="#c9a84c" stop-opacity="0.55"/>
+    <stop offset="100%" stop-color="#c9a84c" stop-opacity="0"/>
+  </radialGradient>
+  <radialGradient id="glowC" cx="50%" cy="50%" r="50%">
+    <stop offset="0%" stop-color="#00d4ff" stop-opacity="0.5"/>
+    <stop offset="100%" stop-color="#00d4ff" stop-opacity="0"/>
+  </radialGradient>
+  <filter id="soft" x="-60%" y="-60%" width="220%" height="220%">
+    <feGaussianBlur stdDeviation="7"/>
+  </filter>
+
+  <style>
+    .mono { font-family: 'JetBrains Mono','SFMono-Regular',Consolas,monospace; }
+    .sans { font-family: 'Segoe UI',Helvetica,Arial,sans-serif; }
+
+    .blk      { animation: rise 9s ease-in-out infinite; }
+    .blk-1    { animation-delay: 0s; }
+    .blk-2    { animation-delay: .35s; }
+    .blk-3    { animation-delay: .7s; }
+    .blk-4    { animation-delay: 1.05s; }
+    .blk-5    { animation-delay: 1.4s; }
+    @keyframes rise {
+      0%, 62%, 100% { transform: translateY(0px); }
+      12%           { transform: translateY(-9px); }
+      26%           { transform: translateY(0px); }
+    }
+
+    .face     { animation: shimmer 9s ease-in-out infinite; }
+    .f-1 { animation-delay: 0s } .f-2 { animation-delay: .35s }
+    .f-3 { animation-delay: .7s } .f-4 { animation-delay: 1.05s }
+    .f-5 { animation-delay: 1.4s }
+    @keyframes shimmer {
+      0%, 55%, 100% { stroke: #26355a; }
+      10%           { stroke: #c9a84c; }
+      30%           { stroke: #26355a; }
+    }
+
+    .hash     { animation: hfade 9s ease-in-out infinite; }
+    .h-1 { animation-delay: 0s } .h-2 { animation-delay: .35s }
+    .h-3 { animation-delay: .7s } .h-4 { animation-delay: 1.05s }
+    .h-5 { animation-delay: 1.4s }
+    @keyframes hfade {
+      0%, 55%, 100% { opacity: .30; fill: #7d849a; }
+      12%           { opacity: 1;  fill: #f0d78a; }
+      32%           { opacity: .30; fill: #7d849a; }
+    }
+
+    .tipglow  { animation: pulse 3.2s ease-in-out infinite; }
+    @keyframes pulse { 0%,100% { opacity:.35 } 50% { opacity:.95 } }
+
+    .link     { stroke-dasharray: 5 7; animation: flow 1.6s linear infinite; }
+    @keyframes flow { to { stroke-dashoffset: -24; } }
+
+    .peer     { animation: breathe 4s ease-in-out infinite; }
+    .pr-2 { animation-delay: .8s } .pr-3 { animation-delay: 1.6s } .pr-4 { animation-delay: 2.4s }
+    @keyframes breathe { 0%,100% { opacity:.45 } 50% { opacity:1 } }
+
+    .btc      { animation: btcp 5s ease-in-out infinite; }
+    @keyframes btcp { 0%,100% { opacity:.5 } 50% { opacity:1 } }
+
+    .cap      { animation: capfade 9s ease-in-out infinite; }
+    @keyframes capfade { 0%,88%,100% { opacity:0 } 20%,80% { opacity:1 } }
+
+    @media (prefers-reduced-motion: reduce) {
+      .blk,.face,.hash,.tipglow,.link,.peer,.btc,.cap { animation: none; }
+      .cap { opacity: 1; }
+    }
+  </style>
+</defs>
+
+<rect width="1000" height="440" fill="#080d1a"/>
+<ellipse cx="330" cy="250" rx="300" ry="190" fill="url(#glow)" opacity="0.30"/>
+<ellipse cx="790" cy="180" rx="200" ry="150" fill="url(#glowC)" opacity="0.18"/>
+
+<!-- orbiting witness ring -->
+<g transform="translate(330,262)">
+  <ellipse rx="255" ry="86" fill="none" stroke="#1e2a45" stroke-width="1"/>
+  <g>
+    <animateTransform attributeName="transform" type="rotate" from="0" to="360" dur="26s" repeatCount="indefinite"/>
+    <g class="peer">      <circle cx="255" cy="0"  r="6" fill="#7fe3b0"/><circle cx="255" cy="0"  r="13" fill="#7fe3b0" opacity=".16"/></g>
+    <g class="peer pr-2"> <circle cx="-255" cy="0" r="6" fill="#7fe3b0"/><circle cx="-255" cy="0" r="13" fill="#7fe3b0" opacity=".16"/></g>
+    <g class="peer pr-3"> <circle cx="128" cy="74" r="5" fill="#7fe3b0"/><circle cx="128" cy="74" r="11" fill="#7fe3b0" opacity=".16"/></g>
+    <g class="peer pr-4"> <circle cx="-128" cy="-74" r="5" fill="#7fe3b0"/><circle cx="-128" cy="-74" r="11" fill="#7fe3b0" opacity=".16"/></g>
+  </g>
+</g>
+
+<!-- the isometric chain: block 1 at the bottom, tip at the top -->
+<g transform="translate(330,330)">
+
+  <!-- BLOCK 1 -->
+  <g class="blk blk-1">
+    <polygon class="face f-1" points="0,-20 118,26 0,72 -118,26" fill="url(#gTop)" stroke="#26355a" stroke-width="1.4"/>
+    <polygon points="-118,26 0,72 0,102 -118,56" fill="url(#gLeft)" stroke="#1a2542" stroke-width="1"/>
+    <polygon points="118,26 0,72 0,102 118,56" fill="url(#gR)" stroke="#1a2542" stroke-width="1"/>
+    <text class="mono hash h-1" x="0" y="32" text-anchor="middle" font-size="11">411ffd9a31a3d9f4</text>
+    <text class="mono" x="0" y="50" text-anchor="middle" font-size="8.5" fill="#4a5372">01 · system_regmap</text>
+  </g>
+
+  <!-- BLOCK 2 -->
+  <g class="blk blk-2" transform="translate(0,-52)">
+    <polygon class="face f-2" points="0,-20 118,26 0,72 -118,26" fill="url(#gTop)" stroke="#26355a" stroke-width="1.4"/>
+    <polygon points="-118,26 0,72 0,102 -118,56" fill="url(#gLeft)" stroke="#1a2542" stroke-width="1"/>
+    <polygon points="118,26 0,72 0,102 118,56" fill="url(#gR)" stroke="#1a2542" stroke-width="1"/>
+    <text class="mono hash h-2" x="0" y="32" text-anchor="middle" font-size="11">c7309616a9e92bc7</text>
+    <text class="mono" x="0" y="50" text-anchor="middle" font-size="8.5" fill="#4a5372">02 · seal_post</text>
+  </g>
+
+  <!-- BLOCK 3 — the blocked payment -->
+  <g class="blk blk-3" transform="translate(0,-104)">
+    <polygon class="face f-3" points="0,-20 118,26 0,72 -118,26" fill="url(#gTop)" stroke="#26355a" stroke-width="1.4"/>
+    <polygon points="-118,26 0,72 0,102 -118,56" fill="url(#gLeft)" stroke="#1a2542" stroke-width="1"/>
+    <polygon points="118,26 0,72 0,102 118,56" fill="url(#gR)" stroke="#1a2542" stroke-width="1"/>
+    <text class="mono hash h-3" x="0" y="32" text-anchor="middle" font-size="11">293181a2bc2dab88</text>
+    <text class="mono" x="0" y="50" text-anchor="middle" font-size="8.5" fill="#ff6b5e">03 · BLOCK · payment 9000</text>
+  </g>
+
+  <!-- BLOCK 4 -->
+  <g class="blk blk-4" transform="translate(0,-156)">
+    <polygon class="face f-4" points="0,-20 118,26 0,72 -118,26" fill="url(#gTop)" stroke="#26355a" stroke-width="1.4"/>
+    <polygon points="-118,26 0,72 0,102 -118,56" fill="url(#gLeft)" stroke="#1a2542" stroke-width="1"/>
+    <polygon points="118,26 0,72 0,102 118,56" fill="url(#gR)" stroke="#1a2542" stroke-width="1"/>
+    <text class="mono hash h-4" x="0" y="32" text-anchor="middle" font-size="11">6abba40eb964959e</text>
+    <text class="mono" x="0" y="50" text-anchor="middle" font-size="8.5" fill="#4a5372">04 · brain · approve</text>
+  </g>
+
+  <!-- TIP -->
+  <g class="blk blk-5" transform="translate(0,-208)">
+    <ellipse class="tipglow" cx="0" cy="26" rx="150" ry="58" fill="url(#glow)" filter="url(#soft)"/>
+    <polygon class="face f-5" points="0,-20 118,26 0,72 -118,26" fill="#141f3a" stroke="#c9a84c" stroke-width="1.8"/>
+    <polygon points="-118,26 0,72 0,102 -118,56" fill="url(#gLeft)" stroke="#3d3venue" stroke-width="0"/>
+    <polygon points="-118,26 0,72 0,102 -118,56" fill="#0e1730" stroke="#5c4d24" stroke-width="1"/>
+    <polygon points="118,26 0,72 0,102 118,56" fill="#0a1225" stroke="#5c4d24" stroke-width="1"/>
+    <text class="mono hash h-5" x="0" y="30" text-anchor="middle" font-size="11.5" fill="#f0d78a">TIP · 6abba40e</text>
+    <text class="mono" x="0" y="48" text-anchor="middle" font-size="8.5" fill="#c9a84c">sealed · witnessed · anchored</text>
+  </g>
+</g>
+
+<!-- links out: peers and bitcoin -->
+<g stroke-width="1.6" fill="none">
+  <path class="link" d="M448,132 C560,132 600,150 660,168" stroke="#7fe3b0" opacity=".75"/>
+  <path class="link" d="M448,150 C560,180 610,232 672,266" stroke="#f7931a" opacity=".7"/>
+</g>
+
+<g transform="translate(700,150)">
+  <circle class="peer" cx="0" cy="0" r="26" fill="#0d1a2e" stroke="#7fe3b0" stroke-width="1.4"/>
+  <text class="mono" x="0" y="4" text-anchor="middle" font-size="9" fill="#7fe3b0">PEER</text>
+  <text class="mono" x="44" y="-6" font-size="10" fill="#7fe3b0">hourly tip exchange</text>
+  <text class="mono" x="44" y="10" font-size="9" fill="#4e6b60">chains we do not control</text>
+</g>
+
+<g transform="translate(700,282)">
+  <circle class="btc" cx="0" cy="0" r="26" fill="#1a1206" stroke="#f7931a" stroke-width="1.4"/>
+  <text class="sans" x="0" y="7" text-anchor="middle" font-size="20" font-weight="700" fill="#f7931a">₿</text>
+  <text class="mono" x="44" y="-6" font-size="10" fill="#f7931a">OpenTimestamps</text>
+  <text class="mono" x="44" y="10" font-size="9" fill="#7a5a2a">time fixed where we cannot reach</text>
+</g>
+
+<!-- wordmark -->
+<g transform="translate(700,372)">
+  <text class="mono" x="-26" y="0" font-size="13" fill="#c9a84c" letter-spacing="4">s e b b i . p r o</text>
+  <text class="mono" x="-26" y="22" font-size="10.5" fill="#5b6480" letter-spacing="1.5">ONE CHAIN. EVERY PROOF.</text>
+</g>
+
+<text class="mono cap" x="500" y="424" text-anchor="middle" font-size="10.5" fill="#3f4a68">
+  alter any block and every seal above it changes — the forgery is exposed by arithmetic
+</text>
+</svg>
