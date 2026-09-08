@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-126 files across 33 parts.
+127 files across 33 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -146,36 +146,37 @@ Generated automatically on every push. Do not edit by hand.
 - `verify_authority.py`
 - `AILeash-API-Reference-v6.4.2.md`
 - `LICENCE`
-- `admin.html`
-- `ai-standard.html`
 
 ## [CODEBASE-22.md](CODEBASE-22.md)
 
+- `README.md`
+- `admin.html`
+- `ai-standard.html`
 - `ai-txt-kit.html`
 - `aileash-game.html`
 - `aitxt-popup-live.html`
 - `brain.html`
-- `certificate.html`
 
 ## [CODEBASE-23.md](CODEBASE-23.md)
 
+- `certificate.html`
 - `compliance-assistant.html`
 - `console.html`
 - `contact.html`
-- `copyright.txt`
-- `data-protection.html`
 
 ## [CODEBASE-24.md](CODEBASE-24.md)
 
+- `copyright.txt`
+- `data-protection.html`
 - `developers.html`
 - `dis.txt`
 - `docs/evidential-undertaking.md`
 - `docs/spec/ai-txt.md`
-- `green.html`
-- `guardian-parent.html`
 
 ## [CODEBASE-25.md](CODEBASE-25.md)
 
+- `green.html`
+- `guardian-parent.html`
 - `human-oversight.html`
 - `identity.html`
 

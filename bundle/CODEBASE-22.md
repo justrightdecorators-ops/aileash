@@ -1,11 +1,844 @@
 # Codebase — part 22 of 33
 
 Contains:
+- `README.md`
+- `admin.html`
+- `ai-standard.html`
 - `ai-txt-kit.html`
 - `aileash-game.html`
 - `aitxt-popup-live.html`
 - `brain.html`
-- `certificate.html`
+
+
+## `README.md`
+
+498 lines, 24821 bytes
+
+```markdown
+<div align="center">
+
+<img src="assets/hero.svg" width="100%" alt="sebbi.pro — an isometric hash chain, sealed, witnessed and anchored">
+
+### **ONE CHAIN. EVERY PROOF.**
+
+*Every event sealed the moment it happens — the decision, **and the basis it rested on** —*
+*unalterable by anyone. Including us.*
+
+<br>
+
+[![live](https://img.shields.io/badge/live-sebbi.pro-c9a84c?style=for-the-badge&labelColor=080d1a)](https://sebbi.pro)
+[![verify](https://img.shields.io/badge/verify_the_chain-open_endpoint-7fe3b0?style=for-the-badge&labelColor=080d1a)](https://sebbi.pro/api/verify-chain)
+[![seal](https://img.shields.io/badge/seal_something-free,_no_account-00d4ff?style=for-the-badge&labelColor=080d1a)](https://sebbi.pro/seal)
+[![conformance](https://img.shields.io/badge/ordering_test-9%2F10_verified-f0d78a?style=for-the-badge&labelColor=080d1a)](https://sebbi.pro/self-check)
+
+**[Try it](https://sebbi.pro/seal)** · **[Verify it](https://sebbi.pro/verify)** · **[Docs](https://sebbi.pro/developers)** · **[Packs](https://sebbi.pro/packs.html)** · **[Whitepaper](https://sebbi.pro/whitepaper)**
+
+</div>
+
+---
+
+> ### *A system that does not trust its own creator*
+> ### *is the only kind whose records qualify as evidence.*
+
+---
+
+## Don't read about it. Watch it break.
+
+A **real** four-block chain. Every hash is reproducible — same inputs, same seals, forever.
+
+```
+        ╔═══════════════════════════════════════════════════════╗
+        ║   #4  brain: approve supplier 88          ALLOW       ║ ◄── tip
+        ║       6abba40eb964959e…                               ║
+        ╚═══════════════════════════════════════════════════════╝
+             ╲                                                ╲
+              ╔═══════════════════════════════════════════════════════╗
+              ║   #3  govern: payment 9000 GBP          BLOCK         ║
+              ║       293181a2bc2dab88…                               ║
+              ╚═══════════════════════════════════════════════════════╝
+                   ╲                                                ╲
+                    ╔═══════════════════════════════════════════════════════╗
+                    ║   #2  seal_post: quarterly_report     NOTARISED       ║
+                    ║       c7309616a9e92bc7…                               ║
+                    ╚═══════════════════════════════════════════════════════╝
+                         ╲                                                ╲
+                          ╔═══════════════════════════════════════════════════════╗
+                          ║   #1  system_regmap                    ALLOW         ║
+                          ║       411ffd9a31a3d9f4…                              ║
+                          ╚═══════════════════════════════════════════════════════╝
+                                          genesis  9fd06d6fdc19761d…
+```
+
+Now watch someone cover up that blocked £9,000 payment by flipping block 3 from **BLOCK** to **ALLOW**:
+
+```diff
+- tip  6abba40eb964959e…      ← what the chain says
++ tip  5e15bc5710426088…      ← what the forgery produces
+```
+
+**The tip changed. The forgery is exposed instantly, by arithmetic, to anyone — no account, no trust required.**
+
+That is the entire product in four lines. Everything below is detail.
+
+<details>
+<summary><b>▸ Reproduce every hash yourself — 10 lines of Python</b></summary>
+
+<br>
+
+```python
+import hashlib, json
+seal = lambda prev, ts, ev, res, basis: hashlib.sha256(
+    json.dumps({"prev":prev,"ts":ts,"event":ev,"result":res,"basis":basis},
+               sort_keys=True).encode()).hexdigest()
+
+prev = hashlib.sha256(b"AILEASH_BRAIN_GENESIS|sebbi.pro|v5").hexdigest()
+chain = [("system_regmap","ALLOW","regmap-v7"),
+         ("seal_post: quarterly_report.pdf","NOTARISED","NO_BASIS"),
+         ("govern: payment 9000 GBP","BLOCK","invoice_4471|regmap-v7"),
+         ("brain: approve supplier 88","ALLOW","invoice_4471|regmap-v7")]
+ts = 1752940000
+for ev,res,basis in chain:
+    prev = seal(prev, ts, ev, res, basis); ts += 3600
+    print(prev[:16], "…", ev)
+# final line prints the tip: 6abba40eb964959e …
+```
+
+Change one character of one event and every seal after it changes. That's the whole idea.
+
+</details>
+
+---
+
+## Thirty seconds, no account
+
+```bash
+curl https://sebbi.pro/api/verify-chain
+```
+```json
+{ "valid": true, "blocks": 1874, "tip": "bf9257ab…" }
+```
+
+Now the one nobody else can do — **prove something is not there**:
+
+```bash
+curl "https://sebbi.pro/x/complete/prove?period=2026-08&value=neverhappened"
+```
+```json
+{ "absent": true,
+  "left":  { "index": 14, "leaf": "3a1f…" },
+  "right": { "index": 15, "leaf": "9c02…" },
+  "why": "consecutive indices. nothing can sit between them." }
+```
+
+Anyone can show you a log of what happened. **Absence is the one that decides disputes.**
+
+<details>
+<summary><b>▸ Four more, right now</b></summary>
+
+<br>
+
+```bash
+# Prove the log only ever grew — RFC 6962, works with existing CT verifiers
+curl "https://sebbi.pro/x/consistency/proof?first=100&second=500"
+
+# Every chain witnessing us, with first-seen dates
+curl https://sebbi.pro/x/roster/list
+
+# Determinism, without us ever disclosing the maths
+curl -X POST https://sebbi.pro/x/replay/challenge \
+  -d '{"inputs":{"action":"payment","amount":49.99,"trust":0.5,"v60":1,
+       "v5m":1,"v1h":1,"device_risk":0.05,"anomaly":0.1,
+       "country":"UK","country_shift":0}}'
+
+# The ten conformance checks, and which are publicly demonstrable
+curl https://sebbi.pro/.well-known/ordering-test.json
+```
+
+Then run the **whole suite yourself** in a browser at **[sebbi.pro/self-check](https://sebbi.pro/self-check)** — it reads the published document, runs every check in declared order, and never counts *reachable* as a pass.
+
+</details>
+
+---
+
+## Why this exists
+
+Every system keeps logs. Logs live in databases. Databases can be edited — by an attacker, an insider, or the operator itself. So an ordinary log only ever says *"this is what we currently claim happened."* It can never say *"and nobody changed it since."*
+
+Nobody notices the difference — until a regulator, a court, an insurer or a customer asks for **proof**. Then *"our system recorded it"* and *"here is proof it wasn't changed"* become two very different sentences. Only the second carries weight.
+
+**sebbi.pro produces the second sentence automatically, as a by-product of your system doing its normal work.**
+
+---
+
+## The chain, in one formula
+
+```
+seal(n) = SHA-256( seal(n−1) · timestamp · event · result · basis )
+```
+
+| Property | What it means |
+|---|---|
+| **Tamper-evident** | Each seal contains its predecessor. Alter history → every later seal fails, publicly. |
+| **Gapless receipts** | A sequence number issued in the same transaction as the write. Edited records break the chain; **missing** records break the sequence. |
+| **Truncation-evident** | The tip is anchored per-write. Chop blocks off the end and the anchor breaks. |
+| **Basis-sealed** | Not just *what* was decided — *what it rested on*: sources, versions, ruleset. Same block. |
+| **Jurisdiction-tagged** | Sealed with the frameworks that applied at that moment. |
+| **Fast** | Score, decide, seal and respond inline. **~28 ms** median. |
+| **Crash-safe** | WAL journaling, full-sync commits, single-lock seal path, no race window, daily sealed backups. |
+
+> **The one honest boundary, up front:** basis-sealing proves **what** a decision relied on — not that it was **correct**. Cryptography verifies integrity, never truth. Any product claiming to prove correctness is misdescribing what maths can do. We won't.
+
+---
+
+## The stack
+
+```mermaid
+flowchart TD
+    A["AGENT ACTS"] --> G{"BRAIN<br/>instruction gate"}
+    G --> B{"DECISION ENGINE<br/>9 weighted signals<br/>deterministic"}
+    B --> C["SEALED<br/>before the response returns"]
+    C --> D["RECEIPT<br/>gapless sequence"]
+
+    C --> E["COMPLETENESS<br/>sorted tree<br/>is it in - or provably absent"]
+    C --> F["CONSISTENCY<br/>ordered tree - RFC 6962<br/>did it only ever grow"]
+    C --> H["REPLAY<br/>identical in, identical out<br/>maths never disclosed"]
+    C --> I["LINEAGE<br/>what fed this decision"]
+
+    C --> J["WITNESS NETWORK<br/>hourly tip exchange"]
+    J --> K["PEER CHAINS<br/>we do not control these"]
+    C --> L["BITCOIN<br/>OpenTimestamps"]
+
+    K --> M["THE RECORD CANNOT<br/>BE QUIETLY REWRITTEN"]
+    L --> M
+
+    style A fill:#080d1a,stroke:#c9a84c,color:#ffffff
+    style G fill:#111a30,stroke:#a78bfa,color:#a78bfa
+    style B fill:#111a30,stroke:#c9a84c,color:#c9a84c
+    style C fill:#111a30,stroke:#00d4ff,color:#00d4ff
+    style J fill:#111a30,stroke:#7fe3b0,color:#7fe3b0
+    style K fill:#0b1226,stroke:#7fe3b0,color:#7fe3b0
+    style L fill:#0b1226,stroke:#f7931a,color:#f7931a
+    style M fill:#0b1226,stroke:#00ff88,color:#00ff88
+```
+
+| Layer | What it proves | Key |
+|:--|:--|:--:|
+| **Brain** | Instructions gated before the AI acts, basis sealed with the verdict | ○ |
+| **Decision engine** | Nine weighted signals, EWMA trust decay, deterministic below the model layer | ◐ |
+| **The chain** | Sealed before the response returns · gapless receipts | ○ |
+| **Completeness** | What is in the record — and what provably is not | ○ |
+| **Consistency** | The log only ever grew | ○ |
+| **Replay** | Identical inputs, identical verdict, maths undisclosed | ○ |
+| **Lineage** | Which receipts fed a decision, across organisations | ◐ |
+| **Authority** | Derivable from a named human, re-derived at execution | ● |
+| **Witness network** | Somebody we do not control holds a copy | ○ **forever** |
+| **Anchoring** | The time was fixed where we cannot reach | ○ |
+
+○ no key · ◐ part keyed · ● keyed
+
+---
+
+## The thing nobody else will say
+
+Our own published manifest contains this line:
+
+```yaml
+Audit-Rewritable-By-Operator-Without-External-Reference: true
+Audit-Rewrite-Prevention: external-timestamp + independent-witnesses
+```
+
+Read it again. **We publish that the operator can rewrite forward.** Every competitor claims immutability and hopes you never ask who holds the keys.
+
+Because the answer to an operator who can rewrite is not a better promise *from the operator*.
+
+**It is a copy held by somebody else.**
+
+```mermaid
+sequenceDiagram
+    participant Y as YOUR CHAIN
+    participant U as AILEASH
+    participant P as PEER CHAIN
+    participant B as BITCOIN
+
+    Note over Y,B: every hour, unattended, since 1 August
+    Y->>U: here is my head
+    U->>U: seal it, into a record I cannot edit backwards
+    U->>P: here is mine
+    P->>P: seals it into a chain I do not own
+    U->>B: anchor the tip
+    Note over P: now it exists outside my reach
+    Note over U: I can stop witnessing a peer. Only forward.<br/>And the roster publishes the gap.
+```
+
+**Joining is free and ungated. Permanently.** The protocol code never checks subscription status. There is no membership list, no seat to grant, none to revoke.
+
+If that sounds like giving the network away — **it is, deliberately.** Gating it would make the operator the party asking to be trusted, which is precisely the thing this removes.
+
+---
+
+## The products — one chain underneath all of them
+
+| | Product | What it does | Access |
+|---|---|---|---|
+| 🧠 | **Brain** | Instruction gate for AI. Blocks prompt injection, exfiltration, compliance-bypass, child-safety and destruction patterns — with unicode and homoglyph defences — and seals every decision plus its basis. Pure Python, runs on your machine. | **Free** |
+| ⚡ | **SonicBoom** | Decision engine. Any event scored in ~28 ms: ALLOW / CHALLENGE / BLOCK, plain-English reasons, sealed before it replies. Trust learned per user and lost 8× faster than earned, so burst attacks destroy their own standing. | API key |
+| 🐕 | **Sebdog** | The engine on your own hardware. **Ed25519 licence validated locally — no phone home, ever.** Serves its own `/tip`, so your record is externally witnessed while the data never leaves the building. | Licence |
+| 💰 | **Token saver** | Cost reduction over nine spend signals. Change one line — `base_url` to localhost. Fails open. Prompts never leave your machine; `--offline` needs no account at all. | 50p/device |
+| 📦 | **Cost packs** | An open library of decision rules. Free to read, write, fork and publish — publishing seals your authorship with the date, **including against us**. Running one is the metered part. | **Free to write** |
+| 🧾 | **Evidence packs** | The quarterly auditor document. Every block re-verified, links rewalked, sequence checked, with an *unbroken since* date that resets if the run breaks. | API key |
+| 🔒 | **Wallet gate** | Give an agent a budget; stop it when the budget is gone. The spend record and the decision record are **the same record**. | API key |
+| 🔐 | **Delegation layer** | Signed authority tokens — who may approve, to what limit, until when, the grant itself sealed. KYC outcome provable with zero personal data held. Article 14 human oversight as engineering. | API key |
+| 🛡️ | **Sentinel** | Fraud pattern and velocity detection: credential stuffing, card testing, country-jump takeovers. Flags sealed as evidence. | API key |
+| 👁️ | **Guardian** | Child-safety flags — grooming patterns: secrecy, isolation, channel-moving. Content never stored, only fingerprints. | Platform |
+| 📝🆔💷 | **The Notaries** | Prove exact text existed on a date · prove a profile is the genuine original · stop invoice and APP fraud, with MISMATCH stopping the payment and the check itself sealed. | **Free, no account** |
+
+**Privacy by design:** the notaries fingerprint content *locally*. Your content never leaves your device — only the 64-character hash is sealed. The KYC sealer keeps only the SHA-256 of the provider reference, never the document.
+
+---
+
+## The open standard — `ai.txt`
+
+Like `robots.txt` for crawlers and `security.txt` for researchers, **`ai.txt`** is a public, machine-readable declaration of how your AI is governed: decision model, audit method, regulations designed toward, human override. Its companion **`comply.txt`** declares the rulebook every instruction is subject to.
+
+Declarations are claims. **Sealing them into the chain makes them provable** — and their history tamper-evident.
+
+```
+   declaration   ──▶   rulebook   ──▶   enforcement
+     ai.txt          comply.txt          brain.py
+    "we claim"       "the rules"     "the code that proves it"
+```
+
+Publish yours at `/.well-known/ai.txt`. Read [ours](https://sebbi.pro/.well-known/ai.txt).
+
+---
+
+## Integrate in minutes
+
+```python
+# ── Notary: seal anything, free, no key. Content stays on your machine. ──
+import hashlib, requests
+fp = hashlib.sha256(content.encode()).hexdigest()
+requests.post("https://sebbi.pro/api/post/seal", json={"fingerprint": fp})
+#   → { sealed, seal, block_index, code }   ← keep the code; anyone can verify it
+
+# ── Decision engine: score + seal an event (API key) ──
+requests.post("https://sebbi.pro/api/govern",
+  headers={"Authorization":"Bearer YOUR_KEY"},
+  json={"user_id":"u1","action":"payment","amount":9000,
+        "country":"UK","device_id":"d1","anomaly":0,"device_risk":0})
+#   → ALLOW / CHALLENGE / BLOCK · reasons · jurisdiction tag · sealed hash · receipt_seq
+
+# ── Delegated authority: grant sealed, enforcement deterministic ──
+tok = requests.post("https://sebbi.pro/api/authority/issue",
+  headers={"Authorization":"Bearer YOUR_KEY"},
+  json={"user_id":"u1","role":"payments_approver",
+        "max_amount":5000,"ttl_hours":24}).json()["authority_token"]
+
+# ── Brain: gate an instruction and seal its basis (free, local) ──
+from brain import BrainGovernor
+BrainGovernor().evaluate("approve payment to supplier 88", basis={
+  "sources":["invoice_4471.pdf"], "source_versions":["sha256:ab12…"],
+  "ruleset":"AI-TXT/1.0 + EU-AI-Act-2024/1689", "ruleset_version":"regmap-v7"})
+```
+
+<details>
+<summary><b>▸ For agents: one decorator</b></summary>
+
+<br>
+
+```python
+from sebbi_sdk import witness
+
+@witness()
+def run_agent(prompt):
+    return model.complete(prompt)
+```
+
+Single file, zero dependencies, **~0.1 ms added per call**. Never blocks the caller, never swallows the caller's exception. Background daemon thread, batching, disk spool on outage and replay.
+
+Egress is hash-only — and there is a test that plants a secret in a payload, then greps the wire *and* the spool files to prove it never left.
+
+</details>
+
+Full reference → **[sebbi.pro/developers](https://sebbi.pro/developers)**
+
+---
+
+## Verify without us
+
+> A proof you can only check with the prover's own online tool is a reassurance, not a proof.
+
+```bash
+curl -sO https://sebbi.pro/verify-authority.py
+curl -s "https://sebbi.pro/x/continuity/proof" | python3 verify-authority.py -
+```
+
+```
+RESULT: VERIFIED - BLOCK
+This is a proof that the action was NOT authorised, and where it failed.
+Checked with no network access, no dependencies, and nothing taken on
+the issuer's word except the meaning of their public key.
+```
+
+**Standard library only** — including the Ed25519 implementation. No network. No dependencies. **No telemetry.** A verification tool that phones home to the party being verified is not a verification tool.
+
+It checks four things, each able to fail alone: the **signature**, every recomputed **digest**, the whole authority path **re-derived** from published rules, and its own verdict **against ours**. A disagreement is reported as *our* failure, not its.
+
+---
+
+## Architecture
+
+Pure Python standard library. No FastAPI. No framework. No build step.
+
+```
+server.py              the engine, the chain, the API
+modules/<name>.py      everything else  ──▶  /x/<name>/<action>
+```
+
+A module exposes exactly one function:
+
+```python
+PUBLIC = {("GET", "spec"), ("POST", "observe")}    # (METHOD, action) tuples
+
+def handle(method, action, data, api_key, ctx):
+    return {"ok": True}, 200                       # (dict, status) — that order
+```
+
+New features are new files. `server.py` does not get edited.
+
+<details>
+<summary><b>⚠️ The one that catches everybody</b></summary>
+
+<br>
+
+A **method mismatch returns 404 `unknown_action`** — not 405 — with the accepted GET and POST lists in the body.
+
+A client that reads 404 as *endpoint missing* will report false failures against every POST-only route. This has cost more debugging hours than anything else in the codebase.
+
+</details>
+
+---
+
+## The Ordering Test
+
+Ten checks, published as a discovery document **any vendor can serve from their own domain**.
+
+```
+rule_binding          commit_before_reveal   completeness_proof
+absence_proof         consistency_proof      reproducibility
+mutual_witnessing     external_anchoring     authority_tokens
+reconciliation
+```
+
+Each check declares `supported` and — separately — `demonstrable_publicly`.
+
+Because **"we built it"** and **"you can check it without an account"** are different claims, and separating them is the only thing that stops an operator marking their own homework.
+
+**Nobody owns a test.** That is the point of publishing it.
+
+---
+
+## What this evidences — stated precisely
+
+A versioned, hash-sealed **regulation map** links each capability to the obligations it helps evidence: EU AI Act record-keeping, transparency and human oversight (Articles 9, 12, 13, 14 — delegated-authority tokens directly supporting Article 14's attributable human oversight), UK Online Safety Act duty-of-care documentation, ICO Children's Code. Jurisdiction tagging extends this per decision: every sealed block records which frameworks applied at the moment.
+
+These tools help you **evidence** your obligations — tamper-evident, explainable, independently verifiable records of what your systems decided and why. **They do not, on their own, make you compliant. No software does. Anyone who says otherwise is selling you something.**
+
+---
+
+<details>
+<summary><b>🔍 Honest limits — click, because we would rather you heard it here</b></summary>
+
+<br>
+
+*A vendor who states their limits is giving you the strongest available evidence of how they'll behave when it matters.*
+
+- **Sealing proves integrity, not truth** — exact content, exact time, unchanged. Not that it was true or agreed to.
+- **Basis-sealing proves what was relied on, not that it was right** — cryptography can't verify the real world.
+- **An operator holding the file and the keys can rebuild a chain forward** with no internal gap. External timestamps and independent witnesses are what make that visible — which is exactly why both exist.
+- **Collusion resistance scales with the number of independent chains.** With a handful of peers it is thin, and the status route names that limit rather than reporting a comfortable number. Five peers is a claim. Fifty is a structure.
+- **An OpenTimestamps proof is `pending` until upgraded.** Both states are reported as what they are, everywhere — because your own verifier will say it first.
+- **Authority tokens prove the grant, not the wisdom** — who was empowered, to what limit, until when. Not that granting it was a good idea.
+- **Jurisdiction tagging records applicable frameworks; it does not decide law** — courts do that. A versioned, sealed lookup, nothing grander, deliberately.
+- **Brain's filter is a first line, not a wall** — known patterns caught, novel phrasing can pass. The guarantee is the sealed record.
+- **Fingerprints match exact content** — a re-encoded copy or a paraphrase won't match.
+- **Lineage edges are dated, non-repudiable claims** about what fed a decision. Not proof the claim is true.
+- No external security audit. Single replica, SQLite.
+- **We evidence compliance; we don't confer it.**
+
+</details>
+
+---
+
+## Deployment & pricing
+
+- **Cloud** — a few lines against the hosted API. Notaries and Brain free forever.
+- **Sovereign** — the whole engine inside your own network. **Ed25519 licence validated locally against a published public key**: we sign on our server and ship only the public half, so nothing that can mint a licence ever reaches a customer machine. No phone home, air-gap ready.
+- **50p per active device per month.** Partners set their own price above the platform fee and keep the margin.
+
+## Investors
+
+The whitepaper carries a dedicated investor section — market timing, the metered per-device model, the moat, and the stage stated honestly: **[sebbi.pro/whitepaper](https://sebbi.pro/whitepaper)** · justin@monopcontent.com
+
+---
+
+<div align="center">
+
+## Check us. Don't trust us.
+
+*That's not a slogan. It's the design requirement — and the only standard by which an evidence layer should ever be judged.*
+
+**[Verify the chain now →](https://sebbi.pro/api/verify-chain)**
+
+<br>
+
+```
+  Built by Justin Dobson · Monop Content · Blyth, Northumberland, UK
+  Solo-built, from scratch, on a phone —
+  because the evidence layer wasn't going to build itself.
+```
+
+[LinkedIn](https://www.linkedin.com/in/justin-dobson-037721217) · [sebbi.pro](https://sebbi.pro) · [developers](https://sebbi.pro/developers) · [packs](https://sebbi.pro/packs.html) · [self-check](https://sebbi.pro/self-check)
+
+</div>
+
+<!--
+Keywords: tamper-evident audit trail · AI governance · AI compliance evidence ·
+EU AI Act record keeping · hash chain audit log · provable ordering · absence proof ·
+RFC 6962 consistency proof · APP fraud prevention · invoice verification ·
+prompt injection defence · AI decision audit · delegated authority tokens ·
+KYC evidence sealing · jurisdiction tagging · ai.txt standard · comply.txt ·
+cryptographic proof of action · witness network · OpenTimestamps · Bitcoin anchoring ·
+agentic AI governance · sovereign AI deployment · token cost reduction ·
+SonicBoom · Brain · Sentinel · Guardian · Sebdog · AILeash
+-->
+
+```
+
+
+## `admin.html`
+
+212 lines, 12327 bytes
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>sebbi.pro - Admin</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0a0f1e;color:#fff;line-height:1.5}
+.wrap{max-width:1000px;margin:0 auto;padding:20px}
+h1{font-size:22px;font-weight:800;margin-bottom:4px}h1 span{color:#c9a84c}
+.sub{color:#8a90a6;font-size:13px;margin-bottom:20px}
+/* login */
+#login{max-width:360px;margin:80px auto;text-align:center}
+#login input{width:100%;padding:14px;border-radius:10px;border:1px solid #2a3350;background:#0b1226;color:#fff;font-size:16px;margin:12px 0}
+button{background:#c9a84c;color:#0a0f1e;border:none;border-radius:10px;padding:13px 22px;font-weight:800;cursor:pointer;font-size:15px;width:100%}
+button.small{width:auto;padding:8px 16px;font-size:13px}
+.err{color:#ff7b6e;font-size:13px;margin-top:8px;min-height:18px}
+/* dashboard */
+#dash{display:none}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:20px}
+.stat{background:#111a30;border:1px solid #232d4a;border-radius:12px;padding:16px}
+.stat .big{font-size:26px;font-weight:800;color:#c9a84c}
+.stat .lab{font-size:11px;color:#8a90a6;text-transform:uppercase;letter-spacing:1px;margin-top:4px}
+.stat.good .big{color:#7fe3b0}.stat.bad .big{color:#ff7b6e}
+.tabs{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap}
+.tab{background:#111a30;border:1px solid #232d4a;color:#8a90a6;padding:9px 16px;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600}
+.tab.on{background:#c9a84c;color:#0a0f1e;border-color:#c9a84c}
+.panel{display:none}.panel.on{display:block}
+.card{background:#111a30;border:1px solid #232d4a;border-radius:12px;padding:14px;margin-bottom:10px;font-size:14px}
+.card .top{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:6px}
+.card .nm{font-weight:700}
+.card .meta{color:#8a90a6;font-size:12px}
+.badge{font-size:10px;padding:2px 8px;border-radius:10px;font-weight:700;text-transform:uppercase}
+.badge.paid{background:#0d2018;color:#7fe3b0;border:1px solid #1fae79}
+.badge.free{background:#1a1206;color:#c9a84c;border:1px solid #c9a84c}
+.stripe-link{color:#7fe3b0;font-size:12px;text-decoration:none;font-family:monospace}
+.bar{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}
+.mono{font-family:monospace;font-size:12px;color:#8a90a6;word-break:break-all}
+.empty{color:#5a6178;text-align:center;padding:30px;font-size:14px}
+a.ext{display:inline-block;background:#0d2018;border:1px solid #1fae79;color:#7fe3b0;padding:10px 16px;border-radius:8px;text-decoration:none;font-size:13px;font-weight:600;margin-bottom:16px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div id="login">
+    <h1>sebbi<span>.pro</span> admin</h1>
+    <div class="sub">Private control panel</div>
+    <input id="pw" type="password" placeholder="Admin password" onkeydown="if(event.key==='Enter')doLogin()">
+    <button onclick="doLogin()">Log in</button>
+    <div class="err" id="loginerr"></div>
+  </div>
+
+  <div id="dash">
+    <div class="bar">
+      <div><h1>sebbi<span>.pro</span> admin</h1><div class="sub">Everything Stripe doesn't show you</div></div>
+      <button class="small" onclick="logout()">Log out</button>
+    </div>
+
+    <a class="ext" href="https://dashboard.stripe.com" target="_blank" rel="noopener">Open Stripe dashboard for payments, revenue &amp; billing addresses &rarr;</a>
+
+    <div class="stats" id="statgrid"></div>
+
+    <div class="tabs">
+      <div class="tab on" onclick="show('customers',this)">Customers &amp; leads</div>
+      <div class="tab" onclick="show('contacts',this)">Contact messages</div>
+      <div class="tab" onclick="show('referrals',this)">Referrals</div>
+      <div class="tab" onclick="show('audit',this)">Audit records</div>
+    </div>
+
+    <div class="panel on" id="p-customers"><div class="empty">Loading...</div></div>
+    <div class="panel" id="p-contacts"><div class="empty">Loading...</div></div>
+    <div class="panel" id="p-referrals"><div class="empty">Loading...</div></div>
+    <div class="panel" id="p-audit">
+      <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;align-items:center">
+        <input id="auditkey" placeholder="Filter by API key (optional)" style="flex:1;min-width:180px;padding:10px;border-radius:8px;border:1px solid #2a3350;background:#0b1226;color:#fff;font-size:13px">
+        <button class="small" onclick="loadAudit()">Search</button>
+        <button class="small" onclick="verifyChain()" style="background:#1fae79">Verify chain</button>
+        <button class="small" onclick="exportAudit()" style="background:#0d2018;color:#7fe3b0;border:1px solid #1fae79">Export</button>
+      </div>
+      <div id="auditchain" style="font-family:monospace;font-size:12px;color:#7fe3b0;margin-bottom:12px"></div>
+      <div id="auditlist"><div class="empty">Loading...</div></div>
+    </div>
+  </div>
+
+</div>
+<script>
+var TOKEN="";
+function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]})}
+function when(ts){if(!ts)return"";try{return new Date(ts*1000).toLocaleString()}catch(e){return""}}
+
+async function doLogin(){
+  var pw=document.getElementById("pw").value;
+  document.getElementById("loginerr").textContent="";
+  try{
+    var r=await fetch("/admin/auth",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password:pw})});
+    var d=await r.json();
+    if(d.token){TOKEN=d.token;document.getElementById("login").style.display="none";document.getElementById("dash").style.display="block";loadAll();}
+    else if(d.error==="admin_disabled"){document.getElementById("loginerr").textContent="Admin password not set. Add ADMIN_PASSWORD in Railway variables.";}
+    else if(d.error==="too_many_attempts"){document.getElementById("loginerr").textContent="Too many attempts. Wait a minute.";}
+    else{document.getElementById("loginerr").textContent="Wrong password.";}
+  }catch(e){document.getElementById("loginerr").textContent="Connection error.";}
+}
+function logout(){TOKEN="";document.getElementById("dash").style.display="none";document.getElementById("login").style.display="block";document.getElementById("pw").value="";}
+
+async function api(path){
+  var r=await fetch(path,{method:"POST",headers:{"Authorization":"Bearer "+TOKEN,"Content-Type":"application/json"},body:"{}"});
+  return await r.json();
+}
+
+async function loadAll(){
+  // stats
+  try{
+    var s=await api("/admin/stats");
+    document.getElementById("statgrid").innerHTML=
+      stat(s.total_keys,"Total signups")+
+      stat(s.paid_keys,"Paying",  "good")+
+      stat((s.total_keys||0)-(s.paid_keys||0),"Free / leads")+
+      stat(s.audit_blocks,"Audit blocks")+
+      stat(s.chain_valid?"OK":"BROKEN","Chain",s.chain_valid?"good":"bad");
+  }catch(e){}
+  loadCustomers();loadContacts();loadReferrals();loadAudit();
+}
+function stat(v,l,cls){return '<div class="stat '+(cls||"")+'"><div class="big">'+esc(v)+'</div><div class="lab">'+esc(l)+'</div></div>';}
+
+async function loadCustomers(){
+  try{
+    var d=await api("/admin/keys");var ks=d.keys||[];
+    if(!ks.length){document.getElementById("p-customers").innerHTML='<div class="empty">No signups yet.</div>';return;}
+    var h="";
+    ks.forEach(function(k){
+      var paid=k.is_paid==1;
+      h+='<div class="card"><div class="top"><span class="nm">'+esc(k.name||"(no name)")+' <span class="meta">'+esc(k.org||"")+'</span></span>'
+        +'<span class="badge '+(paid?"paid":"free")+'">'+(paid?"paying":"free")+'</span></div>'
+        +'<div class="meta">'+esc(k.email||"")+' &middot; '+esc(k.product||"")+' &middot; '+esc(k.devices||0)+' devices &middot; used '+esc(k.actions_used||0)+'/'+esc(k.free_quota||0)+'</div>'
+        +'<div class="meta">Joined '+when(k.created)+'</div>'
+        +(k.key?'<div class="mono">'+esc(k.key)+'</div>':'')
+        +'</div>';
+    });
+    document.getElementById("p-customers").innerHTML=h;
+  }catch(e){document.getElementById("p-customers").innerHTML='<div class="empty">Could not load.</div>';}
+}
+
+async function loadContacts(){
+  try{
+    var d=await api("/admin/contacts");var cs=d.contacts||[];
+    if(!cs.length){document.getElementById("p-contacts").innerHTML='<div class="empty">No messages yet.</div>';return;}
+    var h="";
+    cs.forEach(function(c){
+      h+='<div class="card"><div class="top"><span class="nm">'+esc(c.name||"(no name)")+'</span><span class="meta">'+when(c.ts)+'</span></div>'
+        +'<div class="meta">'+esc(c.email||"")+(c.phone?' &middot; '+esc(c.phone):'')+(c.org?' &middot; '+esc(c.org):'')+'</div>'
+        +'<div style="margin-top:6px">'+esc(c.message||"")+'</div></div>';
+    });
+    document.getElementById("p-contacts").innerHTML=h;
+  }catch(e){document.getElementById("p-contacts").innerHTML='<div class="empty">Could not load.</div>';}
+}
+
+async function loadReferrals(){
+  try{
+    var d=await api("/admin/referrals");var rs=d.referrals||[];
+    if(!rs.length){document.getElementById("p-referrals").innerHTML='<div class="empty">No referrals yet.</div>';return;}
+    var h="";
+    rs.forEach(function(r){
+      h+='<div class="card"><div class="top"><span class="nm">'+esc(r.referrer_name||"(no name)")+' <span class="meta">'+esc(r.code||"")+'</span></span>'
+        +'<span class="badge paid">&pound;'+((r.earnings_pence||0)/100).toFixed(2)+'</span></div>'
+        +'<div class="meta">'+esc(r.referrer_email||"")+' &middot; '+esc(r.devices_referred||0)+' devices referred</div></div>';
+    });
+    document.getElementById("p-referrals").innerHTML=h;
+  }catch(e){document.getElementById("p-referrals").innerHTML='<div class="empty">Could not load.</div>';}
+}
+
+var LAST_AUDIT=[];
+async function loadAudit(){
+  try{
+    var key=document.getElementById("auditkey").value.trim();
+    var r=await fetch("/admin/audit",{method:"POST",headers:{"Authorization":"Bearer "+TOKEN,"Content-Type":"application/json"},body:JSON.stringify({limit:500,api_key:key})});
+    var d=await r.json();LAST_AUDIT=d.records||[];
+    document.getElementById("auditchain").innerHTML=(d.chain_valid?"CHAIN INTACT":"CHAIN BROKEN")+" &middot; "+esc(d.chain_blocks)+" blocks &middot; tip "+esc(String(d.chain_tip||"").slice(0,24))+"...";
+    if(!LAST_AUDIT.length){document.getElementById("auditlist").innerHTML='<div class="empty">No sealed records'+(key?" for that key":"")+' yet.</div>';return;}
+    var h="";
+    LAST_AUDIT.forEach(function(a){
+      var dec=esc(a.decision||"");
+      var col=dec==="BLOCK"?"#ff7b6e":dec==="CHALLENGE"?"#c9a84c":"#7fe3b0";
+      h+='<div class="card"><div class="top"><span class="nm">#'+esc(a.seq)+' <span style="color:'+col+'">'+dec+'</span></span><span class="meta">'+when(a.ts)+'</span></div>'
+        +'<div class="meta">user: '+esc(a.user_id||"-")+(a.score!==""?' &middot; score '+esc(a.score):'')+(a.reasons&&a.reasons.length?' &middot; '+esc(a.reasons.join(", ")):'')+'</div>'
+        +'<div class="mono" style="margin-top:6px">seal: '+esc(String(a.audit_hash||"").slice(0,40))+'...</div>'
+        +'<div class="mono">prev: '+esc(String(a.prev_hash||"").slice(0,40))+'...</div></div>';
+    });
+    document.getElementById("auditlist").innerHTML=h;
+  }catch(e){document.getElementById("auditlist").innerHTML='<div class="empty">Could not load audit records.</div>';}
+}
+async function verifyChain(){
+  try{
+    var r=await fetch("/api/verify-chain");var d=await r.json();
+    document.getElementById("auditchain").innerHTML=(d.valid?"VERIFIED - CHAIN INTACT":"WARNING - CHAIN BROKEN")+" &middot; "+esc(d.blocks)+" blocks &middot; "+esc(d.message||"");
+  }catch(e){}
+}
+function exportAudit(){
+  var blob=new Blob([JSON.stringify(LAST_AUDIT,null,2)],{type:"application/json"});
+  var url=URL.createObjectURL(blob);var a=document.createElement("a");
+  a.href=url;a.download="sebbi-audit-export-"+Date.now()+".json";a.click();URL.revokeObjectURL(url);
+}
+function show(name,el){
+  document.querySelectorAll(".tab").forEach(function(t){t.className="tab";});el.className="tab on";
+  document.querySelectorAll(".panel").forEach(function(p){p.className="panel";});
+  document.getElementById("p-"+name).className="panel on";
+}
+</script>
+</body>
+</html>
+
+```
+
+
+## `ai-standard.html`
+
+97 lines, 4847 bytes
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#0a0f1e">
+<title>ai.txt - Free Download</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0a0f1e;color:#e8e8f0;min-height:100vh;display:flex;flex-direction:column}
+nav{border-bottom:1px solid #1e2a45;padding:16px 20px}
+nav a{color:#c9a84c;text-decoration:none;font-family:monospace;font-size:14px}
+.wrap{flex:1;display:flex;align-items:center;justify-content:center;padding:30px 20px}
+.card{max-width:560px;width:100%;background:#0d1428;border:1px solid #1e2a45;border-radius:16px;padding:36px 28px;text-align:center}
+h1{font-size:32px;font-weight:800;margin-bottom:14px;line-height:1.15}
+h1 span{color:#c9a84c}
+p{color:#8a90a6;font-size:15px;line-height:1.7;margin-bottom:14px}
+p b{color:#e8e8f0}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:10px;width:100%;background:#c9a84c;color:#0a0f1e;padding:18px;border-radius:10px;font-weight:800;font-size:17px;border:none;cursor:pointer;font-family:inherit;margin:20px 0 10px}
+.sub{font-family:monospace;font-size:12px;color:#7fe3b0;margin-bottom:24px}
+.steps{text-align:left;background:#0b1226;border:1px solid #1e2a45;border-radius:10px;padding:18px 20px;margin-top:8px}
+.steps li{color:#8a90a6;font-size:14px;margin:10px 0 10px 6px;line-height:1.6}
+.steps li b{color:#c9a84c}
+.back{margin-top:22px}
+.back a{color:#c9a84c;text-decoration:none;font-size:14px;font-weight:600}
+footer{border-top:1px solid #1e2a45;padding:20px;text-align:center;color:#5a6178;font-size:12px}
+footer a{color:#c9a84c;text-decoration:none}
+</style>
+</head>
+<body>
+<nav><a href="/">&larr; AILeash</a></nav>
+<div class="wrap">
+  <div class="card">
+    <h1>Download <span>ai.txt</span> &mdash; free</h1>
+    <div class="sub">NO KEY &middot; NO ACCOUNT &middot; NO COST</div>
+    <p>ai.txt is the free, open standard for declaring how your AI is governed. Download the file, and it shows your system exactly what it needs to become compliant.</p>
+    <button class="btn" onclick="downloadIt()">&#8681; Download ai.txt free</button>
+    <ul class="steps">
+      <li><b>1.</b> Tap download &mdash; the file saves as ai.txt</li>
+      <li><b>2.</b> Fill in your details, put it on your domain at yourdomain.com/ai.txt</li>
+      <li><b>3.</b> Want it verified and provable? <b><a href="/" style="color:#c9a84c">Come back to AILeash</a></b> to seal it into a tamper-evident chain.</li>
+    </ul>
+    <div class="back"><a href="/ai.txt">See the live ai.txt &rarr;</a></div>
+  </div>
+</div>
+<footer>ai.txt is a free, open standard by <a href="/">Monop Content</a> &middot; Blyth, UK &middot; <a href="/ai.txt">reference</a></footer>
+<script>
+var AITXT = [
+"# ============================================================================",
+"# ai.txt - AI Governance Declaration  (AI-TXT/1.0)",
+"# A free, open standard. Copy this to the root of your domain as /ai.txt",
+"# Replace the values below with your own. Delete any line that does not apply.",
+"# No key, no account, no permission, no cost. Just publish it.",
+"# See it live: https://sebbi.pro/ai.txt",
+"# ============================================================================",
+"",
+"Standard: AI-TXT/1.0",
+"Operator: YOUR COMPANY NAME",
+"Operator-Location: YOUR CITY, COUNTRY",
+"Contact: you@yourdomain.com",
+"Last-Updated: 2026-01-01",
+"",
+"# --- How your AI makes decisions ---",
+"Decision-Model: describe it (deterministic rules / ML model / human-in-loop)",
+"Decision-Outcomes: ALLOW, REVIEW, BLOCK",
+"Human-Override: yes / no",
+"Plain-Language-Reasons: yes / no",
+"",
+"# --- Your audit record (how you prove what happened) ---",
+"Audit-Chain: describe it (SHA-256 hash chain / signed logs / none)",
+"Chain-Property: tamper-evident / tamper-resistant / none",
+"Verify-Endpoint: https://yourdomain.com/your-verify-url",
+"",
+"# --- Regulations you are designing towards ---",
+"Regulation: EU AI Act 2024/1689",
+"Regulation: UK Online Safety Act 2023",
+"",
+"# --- Optional: public status surfaces ---",
+"Live-Status: https://yourdomain.com/health",
+"Whitepaper: https://yourdomain.com/whitepaper",
+"",
+"# ============================================================================",
+"# ai.txt is a free, open standard. Publish yours, share it, build on it.",
+"# ============================================================================"
+].join("\n");
+function downloadIt(){
+  var blob = new Blob([AITXT], {type:"text/plain"});
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement("a");
+  a.href = url; a.download = "ai.txt";
+  document.body.appendChild(a); a.click();
+  document.body.removeChild(a); URL.revokeObjectURL(url);
+}
+</script>
+</body>
+</html>
+
+```
 
 
 ## `ai-txt-kit.html`
@@ -1168,468 +2001,6 @@ result = brain.evaluate(<span class="s">"approve payment to supplier 88"</span>,
   }
   judge();
 </script>
-</body>
-</html>
-
-```
-
-
-## `certificate.html`
-
-454 lines, 23487 bytes
-
-```html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Chain Integrity Attestation — AILeash by sebbi.pro</title>
-<meta name="description" content="Generate a factual, independently verifiable attestation of your AILeash audit chain: how many decisions are sealed, since when, and the tip hash anyone can check. A statement of record, not a compliance verdict.">
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600;700&family=IBM+Plex+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-:root{
-  --bg:#04040a;
-  --surface:#08080f;
-  --surface2:#0d0d18;
-  --border:#141428;
-  --border2:#1e1e38;
-  --gold:#c9a84c;
-  --gold2:#e8c96a;
-  --green:#00e5a0;
-  --red:#ff3d5a;
-  --blue:#4d9fff;
-  --text:#e8e8f8;
-  --muted:#4a4a6a;
-  --muted2:#6a6a8a;
-  --mono:'IBM Plex Mono',monospace;
-  --sans:'IBM Plex Sans',sans-serif;
-}
-
-html{scroll-behavior:smooth}
-body{background:var(--bg);color:var(--text);font-family:var(--sans);min-height:100vh}
-
-nav{position:fixed;top:0;left:0;right:0;z-index:100;height:52px;display:flex;align-items:center;justify-content:space-between;padding:0 32px;background:rgba(4,4,10,0.9);backdrop-filter:blur(16px);border-bottom:1px solid var(--border)}
-.nav-logo{font-family:var(--mono);font-size:13px;color:var(--gold);text-decoration:none}
-.nav-back{font-size:12px;color:var(--muted2);text-decoration:none;transition:color .2s}.nav-back:hover{color:var(--text)}
-
-.hero{padding:100px 32px 60px;max-width:800px;margin:0 auto;text-align:center}
-.eyebrow{font-family:var(--mono);font-size:10px;color:var(--green);letter-spacing:0.2em;text-transform:uppercase;margin-bottom:20px;display:flex;align-items:center;justify-content:center;gap:10px}
-.eyebrow::before,.eyebrow::after{content:'';width:24px;height:1px;background:var(--green);opacity:0.5}
-h1{font-size:clamp(32px,5vw,56px);font-weight:700;letter-spacing:-0.03em;line-height:1.05;margin-bottom:16px}
-h1 span{color:var(--gold)}
-.hero-sub{font-size:16px;color:var(--muted2);line-height:1.7;max-width:580px;margin:0 auto 20px;font-weight:300}
-.hero-note{font-size:13px;color:var(--muted);line-height:1.6;max-width:560px;margin:0 auto 48px;font-family:var(--mono)}
-
-.steps-row{display:grid;grid-template-columns:repeat(3,1fr);gap:2px;background:var(--border);border-radius:10px;overflow:hidden;margin-bottom:48px;max-width:700px;margin-left:auto;margin-right:auto}
-.step-card{background:var(--surface);padding:20px;text-align:center}
-.step-num{font-family:var(--mono);font-size:28px;color:var(--gold);font-weight:700;opacity:0.3;margin-bottom:6px}
-.step-title{font-size:13px;font-weight:600;margin-bottom:4px}
-.step-desc{font-size:11px;color:var(--muted2);line-height:1.5}
-
-.main-wrap{max-width:700px;margin:0 auto;padding:0 32px 80px}
-
-.card{background:var(--surface);border:1px solid var(--border2);border-radius:12px;overflow:hidden;position:relative}
-.card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--gold),var(--green),var(--blue))}
-.card-inner{padding:32px}
-
-.form-section{margin-bottom:24px}
-.section-label{font-family:var(--mono);font-size:10px;color:var(--muted);letter-spacing:0.15em;text-transform:uppercase;margin-bottom:16px;display:flex;align-items:center;gap:8px}
-.section-label::after{content:'';flex:1;height:1px;background:var(--border)}
-
-.field{margin-bottom:16px}
-.field-label{font-size:12px;color:var(--muted2);margin-bottom:6px;display:block;font-weight:500}
-.field-input{width:100%;background:#060610;border:1px solid var(--border2);color:var(--text);padding:12px 16px;font-size:14px;font-family:var(--sans);border-radius:6px;outline:none;transition:border-color .2s}
-.field-input:focus{border-color:var(--gold)}
-.field-input::placeholder{color:var(--muted)}
-.field-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-
-.explain{background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:18px 20px;margin-bottom:24px}
-.explain h4{font-size:12px;color:var(--gold);font-family:var(--mono);letter-spacing:0.1em;text-transform:uppercase;margin-bottom:10px}
-.explain p{font-size:13px;color:var(--muted2);line-height:1.65;margin-bottom:8px}
-.explain p:last-child{margin-bottom:0}
-.explain b{color:var(--text)}
-
-.pricing-box{background:linear-gradient(135deg,rgba(201,168,76,0.08),rgba(201,168,76,0.02));border:1px solid rgba(201,168,76,0.2);border-radius:8px;padding:20px;display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:20px}
-.pricing-left h3{font-size:15px;font-weight:600;margin-bottom:4px}
-.pricing-left p{font-size:12px;color:var(--muted2);line-height:1.5}
-.pricing-amount{font-family:var(--mono);font-size:32px;color:var(--gold);font-weight:700;white-space:nowrap}
-.pricing-amount span{font-size:13px;color:var(--muted2);font-weight:400}
-
-.generate-btn{width:100%;background:linear-gradient(135deg,var(--gold),var(--gold2));color:#000;border:none;padding:15px;font-size:15px;font-weight:700;font-family:var(--sans);border-radius:8px;cursor:pointer;transition:all .2s;display:flex;align-items:center;justify-content:center;gap:8px}
-.generate-btn:hover{transform:translateY(-1px);box-shadow:0 8px 24px rgba(201,168,76,0.25)}
-.generate-btn:disabled{opacity:0.5;cursor:not-allowed;transform:none}
-
-.error-msg{background:rgba(255,61,90,0.08);border:1px solid rgba(255,61,90,0.2);border-radius:6px;padding:12px 16px;font-size:13px;color:var(--red);margin-top:12px;display:none;font-family:var(--mono);line-height:1.6}
-.error-msg.show{display:block}
-
-.cert-wrap{display:none;margin-top:32px}
-.cert-wrap.show{display:block}
-
-.certificate{background:#fff;border-radius:10px;overflow:hidden;box-shadow:0 20px 60px rgba(0,0,0,0.5)}
-
-.cert-header{background:#0a0f1e;padding:28px 36px;display:flex;align-items:center;justify-content:space-between}
-.cert-logo{font-size:18px;font-weight:900;color:#fff;font-family:Georgia,serif}.cert-logo span{color:#c9a84c}
-.cert-header-right{text-align:right}
-.cert-type{font-family:var(--mono);font-size:9px;color:rgba(255,255,255,0.4);letter-spacing:0.15em;text-transform:uppercase;margin-bottom:2px}
-.cert-num{font-family:var(--mono);font-size:11px;color:#c9a84c}
-
-.cert-stripe{height:4px;background:linear-gradient(90deg,#c9a84c,#00e5a0,#4d9fff)}
-
-.cert-body{padding:36px}
-.cert-title{font-size:11px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:0.15em;margin-bottom:8px;font-family:var(--mono)}
-.cert-company{font-size:32px;font-weight:700;color:#0a0f1e;letter-spacing:-0.02em;margin-bottom:4px}
-.cert-domain{font-size:14px;color:#64748b;margin-bottom:24px;font-family:var(--mono)}
-
-.cert-statement{background:#f8f9fc;border-left:3px solid #c9a84c;padding:16px 20px;border-radius:0 6px 6px 0;margin-bottom:24px;font-size:13px;color:#1a202c;line-height:1.7}
-
-.cert-facts{margin-bottom:24px}
-.cert-fact{display:flex;justify-content:space-between;align-items:baseline;gap:12px;padding:12px 0;border-bottom:1px solid #e2e8f0;flex-wrap:wrap}
-.cert-fact:last-child{border-bottom:none}
-.cert-fact-key{font-size:12px;color:#64748b;font-weight:500}
-.cert-fact-val{font-family:var(--mono);font-size:13px;color:#0a0f1e;font-weight:600;text-align:right;word-break:break-all;max-width:70%}
-
-.cert-scope{background:#fff8ec;border:1px solid #f0dcae;border-radius:6px;padding:14px 18px;margin-bottom:24px;font-size:11.5px;color:#6b5a2e;line-height:1.6}
-.cert-scope b{color:#4a3d1a}
-
-.cert-chain{background:#0a0f1e;border-radius:8px;padding:16px 20px;margin-bottom:24px}
-.cert-chain-label{font-family:var(--mono);font-size:9px;color:#c9a84c;letter-spacing:0.15em;text-transform:uppercase;margin-bottom:8px}
-.cert-chain-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;flex-wrap:wrap;gap:4px}
-.cert-chain-key{font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.4)}
-.cert-chain-val{font-family:var(--mono);font-size:10px;color:#00e5a0;word-break:break-all;text-align:right;max-width:70%}
-
-.cert-footer{display:flex;justify-content:space-between;align-items:flex-end;padding-top:20px;border-top:1px solid #e2e8f0;flex-wrap:wrap;gap:16px}
-.cert-footer-label{font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:0.1em;margin-bottom:4px;font-family:var(--mono)}
-.cert-footer-val{font-size:13px;font-weight:600;color:#0a0f1e}
-.cert-seal{width:64px;height:64px;border-radius:50%;background:linear-gradient(135deg,#0a0f1e,#1a2a4a);border:2px solid #c9a84c;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center}
-.cert-seal-text{font-family:var(--mono);font-size:7px;color:#c9a84c;letter-spacing:0.1em;text-transform:uppercase;line-height:1.4}
-
-.cert-actions{display:flex;gap:12px;margin-top:20px;flex-wrap:wrap}
-.btn-download{flex:1;background:linear-gradient(135deg,var(--gold),var(--gold2));color:#000;border:none;padding:13px;font-size:14px;font-weight:700;font-family:var(--sans);border-radius:8px;cursor:pointer;transition:all .2s;display:flex;align-items:center;justify-content:center;gap:8px}
-.btn-download:hover{transform:translateY(-1px);box-shadow:0 8px 24px rgba(201,168,76,0.25)}
-.btn-share{flex:1;background:var(--surface2);border:1px solid var(--border2);color:var(--text);padding:13px;font-size:14px;font-weight:600;font-family:var(--sans);border-radius:8px;cursor:pointer;transition:all .2s;display:flex;align-items:center;justify-content:center;gap:8px}
-.btn-share:hover{border-color:var(--gold);color:var(--gold)}
-
-.trust-strip{display:flex;justify-content:center;gap:32px;padding:48px 32px;flex-wrap:wrap;max-width:700px;margin:0 auto}
-.trust-item{text-align:center}
-.trust-n{font-family:var(--mono);font-size:20px;color:var(--gold);font-weight:700}
-.trust-l{font-size:11px;color:var(--muted2);margin-top:3px}
-
-@media(max-width:600px){
-  .field-row{grid-template-columns:1fr}
-  .steps-row{grid-template-columns:1fr}
-  .cert-body{padding:24px}
-  .main-wrap{padding:0 16px 60px}
-  .hero{padding:80px 16px 40px}
-  nav{padding:0 16px}
-}
-</style>
-</head>
-<body>
-
-<nav>
-  <a href="/" class="nav-logo">sebbi.pro</a>
-  <a href="/" class="nav-back">&larr; Back to AILeash</a>
-</nav>
-
-<div class="hero">
-  <div class="eyebrow">Chain Integrity Attestation</div>
-  <h1>Prove your record.<br><span>Not our word. Yours to check.</span></h1>
-  <p class="hero-sub">Generate a dated, independently verifiable attestation of your AILeash audit chain: how many decisions are sealed, unbroken since when, and the tip hash anyone can check for themselves.</p>
-  <p class="hero-note">This attests to what your chain provably contains. It is a statement of record &mdash; not a determination of regulatory compliance.</p>
-
-  <div class="steps-row">
-    <div class="step-card">
-      <div class="step-num">01</div>
-      <div class="step-title">Enter your details</div>
-      <div class="step-desc">Organisation, domain, and your AILeash API key</div>
-    </div>
-    <div class="step-card">
-      <div class="step-num">02</div>
-      <div class="step-title">We read your chain</div>
-      <div class="step-desc">Live figures pulled from your sealed record</div>
-    </div>
-    <div class="step-card">
-      <div class="step-num">03</div>
-      <div class="step-title">Download attestation</div>
-      <div class="step-desc">Dated, with a public link anyone can verify</div>
-    </div>
-  </div>
-</div>
-
-<div class="main-wrap">
-  <div class="card">
-    <div class="card-inner">
-
-      <div class="explain">
-        <h4>What this is, and what it isn't</h4>
-        <p><b>What it is:</b> a factual statement about your audit chain on the day it is issued &mdash; the number of decisions sealed, the date the unbroken run began, and the tip hash. Every figure on it can be checked by anyone at the public verify link, with no account and without asking you.</p>
-        <p><b>What it isn't:</b> a ruling that you comply with any law. Whether you meet the EU AI Act, the Online Safety Act, GDPR or anything else is for a regulator or your own assessment to decide. This attests that your record is intact and complete &mdash; the evidence you would bring to that assessment, not the verdict.</p>
-      </div>
-
-      <div class="form-section">
-        <div class="section-label">Organisation Details</div>
-        <div class="field-row">
-          <div class="field">
-            <label class="field-label">Company / Organisation Name</label>
-            <input class="field-input" type="text" id="org-name" placeholder="Acme Financial Ltd">
-          </div>
-          <div class="field">
-            <label class="field-label">Domain</label>
-            <input class="field-input" type="text" id="org-domain" placeholder="acmefinancial.com">
-          </div>
-        </div>
-        <div class="field">
-          <label class="field-label">AILeash API Key</label>
-          <input class="field-input" type="text" id="api-key" placeholder="al_live_...">
-        </div>
-        <div class="field">
-          <label class="field-label">Contact Email</label>
-          <input class="field-input" type="email" id="contact-email" placeholder="you@yourcompany.com">
-        </div>
-      </div>
-
-      <div class="pricing-box">
-        <div class="pricing-left">
-          <h3>Chain Integrity Attestation</h3>
-          <p>Dated &middot; figures read live from your sealed chain &middot; publicly verifiable &middot; re-issue any time your record grows</p>
-        </div>
-        <div class="pricing-amount">&pound;99 <span>one-time</span></div>
-      </div>
-
-      <button class="generate-btn" id="gen-btn" onclick="generateCert()">
-        <span>Read my chain &amp; generate attestation</span>
-        <span>&rarr;</span>
-      </button>
-      <div class="error-msg" id="error-msg"></div>
-
-      <div class="cert-wrap" id="cert-wrap">
-        <div class="certificate" id="certificate">
-          <div class="cert-header">
-            <div class="cert-logo">Monop <span>Content</span></div>
-            <div class="cert-header-right">
-              <div class="cert-type">Chain Integrity Attestation</div>
-              <div class="cert-num" id="cert-num">ATT-000000</div>
-            </div>
-          </div>
-          <div class="cert-stripe"></div>
-          <div class="cert-body">
-            <div class="cert-title">This attestation concerns</div>
-            <div class="cert-company" id="cert-company">&mdash;</div>
-            <div class="cert-domain" id="cert-domain">&mdash;</div>
-
-            <div class="cert-statement" id="cert-statement">&mdash;</div>
-
-            <div class="cert-facts" id="cert-facts"></div>
-
-            <div class="cert-scope">
-              <b>Scope.</b> This attests only to the integrity and contents of the audit chain named below, as read on the issue date. It is not a determination of compliance with any law or standard, and it does not assess the correctness of any individual decision. Verify every figure yourself at the link provided.
-            </div>
-
-            <div class="cert-chain">
-              <div class="cert-chain-label">// Independent verification</div>
-              <div class="cert-chain-row">
-                <span class="cert-chain-key">Method</span>
-                <span class="cert-chain-val">SHA-256 hash chain</span>
-              </div>
-              <div class="cert-chain-row">
-                <span class="cert-chain-key">Chain state</span>
-                <span class="cert-chain-val" id="cert-chain-status">&mdash;</span>
-              </div>
-              <div class="cert-chain-row">
-                <span class="cert-chain-key">Tip hash</span>
-                <span class="cert-chain-val" id="cert-hash">&mdash;</span>
-              </div>
-              <div class="cert-chain-row">
-                <span class="cert-chain-key">Verify at</span>
-                <span class="cert-chain-val">sebbi.pro/api/verify-chain</span>
-              </div>
-            </div>
-
-            <div class="cert-footer">
-              <div>
-                <div class="cert-footer-label">Issued by</div>
-                <div class="cert-footer-val">AILeash &middot; sebbi.pro</div>
-              </div>
-              <div>
-                <div class="cert-footer-label">Issue date</div>
-                <div class="cert-footer-val" id="cert-date">&mdash;</div>
-              </div>
-              <div class="cert-seal">
-                <div class="cert-seal-text">Chain<br>Attested<br>sebbi.pro</div>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <div class="cert-actions">
-          <button class="btn-download" onclick="downloadCert()">&darr; Download attestation</button>
-          <button class="btn-share" onclick="shareCert()">&#8663; Share</button>
-        </div>
-      </div>
-
-    </div>
-  </div>
-
-  <div class="trust-strip">
-    <div class="trust-item"><div class="trust-n">SHA-256</div><div class="trust-l">Hash chain</div></div>
-    <div class="trust-item"><div class="trust-n">Public</div><div class="trust-l">Verify with no account</div></div>
-    <div class="trust-item"><div class="trust-n">Dated</div><div class="trust-l">Statement of record</div></div>
-    <div class="trust-item"><div class="trust-n">Live</div><div class="trust-l">Read from your chain</div></div>
-  </div>
-</div>
-
-<script>
-function attNum() {
-  return 'ATT-' + Date.now().toString(36).toUpperCase();
-}
-
-async function generateCert() {
-  var orgName = document.getElementById('org-name').value.trim();
-  var domain = document.getElementById('org-domain').value.trim();
-  var apiKey = document.getElementById('api-key').value.trim();
-  var email = document.getElementById('contact-email').value.trim();
-  var errEl = document.getElementById('error-msg');
-  var btn = document.getElementById('gen-btn');
-
-  errEl.classList.remove('show');
-
-  if (!orgName) { return fail('Please enter your organisation name.'); }
-  if (!domain) { return fail('Please enter your domain.'); }
-  if (!apiKey) { return fail('Please enter your AILeash API key.'); }
-  if (!email || email.indexOf('@') < 1) { return fail('Please enter a valid email address.'); }
-
-  function fail(m){ errEl.textContent = m; errEl.classList.add('show');
-    btn.textContent = 'Read my chain & generate attestation \u2192'; btn.disabled = false; return; }
-
-  btn.textContent = 'Reading your chain\u2026';
-  btn.disabled = true;
-
-  // Read the chain. NO silent success fallback: if we cannot read it, we say so.
-  var chainData = null;
-  try {
-    var r = await fetch('/api/verify-chain');
-    if (!r.ok) throw new Error('status ' + r.status);
-    chainData = await r.json();
-  } catch (e) {
-    return fail('Could not read the audit chain right now (' + e.message +
-      '). Nothing has been issued. Please try again shortly \u2014 an attestation ' +
-      'is only produced from a live reading, never from a placeholder.');
-  }
-
-  // Validate the key against the engine. NO fallback to valid.
-  var keyValid = false, keyChecked = false;
-  try {
-    var r2 = await fetch('/api/validate-engine', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json','Authorization':'Bearer ' + apiKey}
-    });
-    keyChecked = true;
-    if (r2.ok) {
-      var kd = await r2.json();
-      keyValid = kd.valid === true;
-    }
-  } catch (e) {
-    keyChecked = false;
-  }
-
-  if (keyChecked && !keyValid) {
-    return fail('That API key did not validate against the engine. Check the key ' +
-      'and try again. No attestation is issued for an unverified key.');
-  }
-  if (!keyChecked) {
-    return fail('Could not reach the engine to validate your key. Nothing has been ' +
-      'issued. Please try again shortly.');
-  }
-
-  // Record the request for follow-up (best effort, never blocks issuance).
-  fetch('/contact', {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({
-      name: orgName, email: email, phone: '', org: domain,
-      message: 'ATTESTATION REQUEST\n\nOrg: ' + orgName + '\nDomain: ' + domain +
-        '\nEmail: ' + email + '\nKey: ' + apiKey.slice(0,20) + '...'
-    })
-  }).catch(function(){});
-
-  var now = new Date();
-  var num = attNum();
-
-  // Only use figures the chain actually returned. If a field is absent, say so
-  // rather than inventing it.
-  var blocks = (typeof chainData.blocks === 'number') ? chainData.blocks : null;
-  var tip = chainData.tip || null;
-  var intact = (chainData.valid === true);
-  var since = chainData.unbroken_since || chainData.first_block_date || null;
-
-  document.getElementById('cert-num').textContent = num;
-  document.getElementById('cert-company').textContent = orgName;
-  document.getElementById('cert-domain').textContent = domain;
-  document.getElementById('cert-date').textContent =
-    now.toLocaleDateString('en-GB', {day:'numeric',month:'long',year:'numeric'});
-
-  document.getElementById('cert-statement').textContent =
-    'As of the issue date below, the AILeash audit chain associated with this key ' +
-    'was read live and its contents recorded here. Every figure shown can be ' +
-    'checked independently at the public verification link, with no account and ' +
-    'without the cooperation of sebbi.pro.';
-
-  // Build the facts from what was actually returned.
-  var facts = [];
-  facts.push(['Decisions sealed in chain',
-    blocks === null ? 'not reported by chain' : blocks.toLocaleString()]);
-  facts.push(['Unbroken since',
-    since ? since : 'not reported by chain']);
-  facts.push(['Chain state',
-    intact ? 'intact \u2014 links verified' : 'NOT confirmed intact']);
-  document.getElementById('cert-facts').innerHTML = facts.map(function(f){
-    return '<div class="cert-fact"><span class="cert-fact-key">' + f[0] +
-      '</span><span class="cert-fact-val">' + f[1] + '</span></div>';
-  }).join('');
-
-  document.getElementById('cert-chain-status').textContent =
-    intact ? 'intact \u2014 links verified' : 'not confirmed intact';
-  document.getElementById('cert-hash').textContent = tip ? tip : 'not reported';
-
-  document.getElementById('cert-wrap').classList.add('show');
-  document.getElementById('cert-wrap').scrollIntoView({behavior:'smooth', block:'start'});
-
-  btn.textContent = 'Attestation generated \u2713';
-  btn.style.background = 'linear-gradient(135deg,#00875a,#00b87d)';
-}
-
-function downloadCert() {
-  var cert = document.getElementById('certificate');
-  var num = document.getElementById('cert-num').textContent;
-  var w = window.open('', '_blank');
-  w.document.write('<html><head><title>' + num + '</title>');
-  w.document.write('<style>body{margin:0;padding:20px;font-family:IBM Plex Sans,sans-serif}');
-  w.document.write(document.querySelector('style').innerHTML);
-  w.document.write('</style></head><body>');
-  w.document.write(cert.outerHTML);
-  w.document.write('</body></html>');
-  w.document.close();
-  setTimeout(function(){ w.print(); }, 500);
-}
-
-function shareCert() {
-  var company = document.getElementById('cert-company').textContent;
-  var num = document.getElementById('cert-num').textContent;
-  var text = company + ' \u2014 AILeash chain integrity attestation ' + num +
-    '. Verify at sebbi.pro/api/verify-chain';
-  if (navigator.share) {
-    navigator.share({title: 'Chain Integrity Attestation', text: text,
-      url: 'https://sebbi.pro/certificate'});
-  } else if (navigator.clipboard) {
-    navigator.clipboard.writeText(text).then(function(){
-      alert('Attestation details copied to clipboard.');
-    });
-  }
-}
-</script>
-
 </body>
 </html>
 
