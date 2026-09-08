@@ -1,0 +1,567 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>sebbi.pro — command centre</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#070b16;--panel:#0e1628;--panel2:#0a1120;--line:#1c2742;--line2:#26355a;
+  --gold:#c9a84c;--gold2:#f0d78a;--cyan:#00d4ff;--green:#7fe3b0;--ok:#00ff88;
+  --red:#ff6b5e;--amber:#ffb020;--txt:#e8e8f0;--mut:#6f7793;--dim:#454d69;
+  --mono:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--txt);line-height:1.5;-webkit-font-smoothing:antialiased}
+body::before{content:'';position:fixed;inset:0;pointer-events:none;z-index:0;
+  background:radial-gradient(ellipse 70% 45% at 50% 0%,rgba(201,168,76,.10),transparent 70%),
+             radial-gradient(ellipse 50% 40% at 85% 20%,rgba(0,212,255,.06),transparent 70%)}
+.wrap{max-width:1120px;margin:0 auto;padding:16px;position:relative;z-index:1}
+
+/* ---------- login ---------- */
+#login{max-width:380px;margin:14vh auto;text-align:center}
+#login input{width:100%;padding:14px;border-radius:10px;border:1px solid var(--line2);background:var(--panel2);color:#fff;font-size:16px;margin:14px 0;font-family:var(--mono)}
+#login input:focus{outline:none;border-color:var(--gold)}
+button{background:var(--gold);color:#070b16;border:none;border-radius:9px;padding:13px 22px;font-weight:800;cursor:pointer;font-size:15px;width:100%;font-family:inherit;transition:filter .15s}
+button:hover{filter:brightness(1.1)}
+button:active{transform:translateY(1px)}
+button.sm{width:auto;padding:9px 15px;font-size:12.5px;font-weight:700}
+button.ghost{background:transparent;border:1px solid var(--line2);color:var(--mut)}
+button.ghost:hover{color:#fff;border-color:var(--gold)}
+button.danger{background:#2a0f0c;border:1px solid var(--red);color:var(--red)}
+button.go{background:#07301f;border:1px solid #1fae79;color:var(--green)}
+.err{color:var(--red);font-size:13px;margin-top:10px;min-height:18px;font-family:var(--mono)}
+
+/* ---------- header ---------- */
+#dash{display:none}
+.hdr{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;margin-bottom:14px;padding-bottom:14px;border-bottom:1px solid var(--line)}
+h1{font-size:19px;font-weight:800;letter-spacing:-.3px}h1 span{color:var(--gold)}
+.sub{color:var(--dim);font-size:11px;font-family:var(--mono);letter-spacing:1.4px;text-transform:uppercase;margin-top:3px}
+.live{display:inline-flex;align-items:center;gap:6px;font-family:var(--mono);font-size:10px;letter-spacing:1.5px;color:var(--green);text-transform:uppercase}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 9px var(--ok);animation:bl 2s ease-in-out infinite}
+@keyframes bl{0%,100%{opacity:1}50%{opacity:.25}}
+
+/* ---------- stat rail ---------- */
+.rail{display:grid;grid-template-columns:repeat(auto-fit,minmax(122px,1fr));gap:9px;margin-bottom:16px}
+.st{background:linear-gradient(160deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:11px;padding:13px 14px;position:relative;overflow:hidden}
+.st::after{content:'';position:absolute;left:0;top:0;bottom:0;width:2px;background:var(--gold);opacity:.5}
+.st.good::after{background:var(--ok)}.st.bad::after{background:var(--red)}.st.cy::after{background:var(--cyan)}
+.st .big{font-size:25px;font-weight:800;color:var(--gold);font-family:var(--mono);line-height:1.15}
+.st.good .big{color:var(--ok)}.st.bad .big{color:var(--red)}.st.cy .big{color:var(--cyan)}
+.st .lab{font-size:9.5px;color:var(--dim);text-transform:uppercase;letter-spacing:1.4px;margin-top:4px;font-family:var(--mono)}
+
+/* ---------- tabs ---------- */
+.tabs{display:flex;gap:6px;margin-bottom:15px;flex-wrap:wrap}
+.tab{background:var(--panel);border:1px solid var(--line);color:var(--mut);padding:8px 14px;border-radius:8px;cursor:pointer;font-size:12px;font-weight:700;font-family:var(--mono);letter-spacing:.6px;transition:.15s}
+.tab:hover{color:#fff;border-color:var(--line2)}
+.tab.on{background:var(--gold);color:#070b16;border-color:var(--gold)}
+.panel{display:none}.panel.on{display:block;animation:fi .22s ease}
+@keyframes fi{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
+
+/* ---------- cards ---------- */
+.card{background:var(--panel);border:1px solid var(--line);border-radius:11px;padding:13px 14px;margin-bottom:9px;font-size:14px}
+.card .top{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:5px}
+.card .nm{font-weight:700}
+.meta{color:var(--mut);font-size:12px}
+.mono{font-family:var(--mono);font-size:11.5px;color:var(--dim);word-break:break-all}
+.badge{font-size:9.5px;padding:2px 8px;border-radius:10px;font-weight:800;text-transform:uppercase;font-family:var(--mono);letter-spacing:.8px}
+.badge.paid{background:#07301f;color:var(--green);border:1px solid #1fae79}
+.badge.free{background:#1a1206;color:var(--gold);border:1px solid var(--gold)}
+.empty{color:var(--dim);text-align:center;padding:34px 14px;font-size:13.5px;font-family:var(--mono)}
+.sechead{font-family:var(--mono);font-size:10px;letter-spacing:2.4px;text-transform:uppercase;color:var(--dim);margin:20px 0 9px;padding-top:14px;border-top:1px solid var(--line)}
+.sechead:first-child{margin-top:0;padding-top:0;border-top:none}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
+input.f{flex:1;min-width:170px;padding:10px 12px;border-radius:8px;border:1px solid var(--line2);background:var(--panel2);color:#fff;font-size:13px;font-family:var(--mono)}
+input.f:focus{outline:none;border-color:var(--gold)}
+a.ext{display:inline-block;background:#07301f;border:1px solid #1fae79;color:var(--green);padding:10px 15px;border-radius:9px;text-decoration:none;font-size:12.5px;font-weight:700;margin-bottom:14px}
+.out{font-family:var(--mono);font-size:11.5px;color:var(--green);margin-bottom:12px;padding:11px 13px;background:var(--panel2);border:1px solid var(--line);border-radius:9px;white-space:pre-wrap;word-break:break-all;min-height:40px;line-height:1.75}
+.out.bad{color:var(--red);border-color:rgba(255,107,94,.4);background:#1a0b09}
+.out.warn{color:var(--amber);border-color:rgba(255,176,32,.35)}
+.out.idle{color:var(--dim)}
+
+/* ---------- route grid ---------- */
+.rgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(148px,1fr));gap:7px}
+.rt{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:9px 10px;font-family:var(--mono);font-size:11px;cursor:pointer;transition:.15s;position:relative;overflow:hidden}
+.rt:hover{border-color:var(--line2)}
+.rt .rn{color:var(--txt);font-weight:600;font-size:11.5px}
+.rt .rs{font-size:9px;letter-spacing:1.2px;text-transform:uppercase;margin-top:3px;color:var(--dim)}
+.rt.armed{border-color:rgba(0,255,136,.45)}.rt.armed .rs{color:var(--ok)}
+.rt.fail{border-color:rgba(255,107,94,.45)}.rt.fail .rs{color:var(--red)}
+.rt.wait .rs{color:var(--amber)}
+.rt.armed::before{content:'';position:absolute;inset:0;background:rgba(0,255,136,.05)}
+.bar{height:3px;background:var(--line);border-radius:2px;overflow:hidden;margin:12px 0}
+.bar i{display:block;height:100%;background:linear-gradient(90deg,var(--gold),var(--ok));width:0;transition:width .3s}
+
+/* ---------- break glass ---------- */
+.glass{border:1px solid rgba(255,107,94,.35);background:linear-gradient(160deg,#170a09,#0b0709);border-radius:12px;padding:16px;margin-top:8px}
+.glass h3{font-family:var(--mono);font-size:11px;letter-spacing:2.4px;text-transform:uppercase;color:var(--red);margin-bottom:8px}
+.glass p{font-size:13px;color:var(--mut);margin-bottom:12px}
+.steps{font-family:var(--mono);font-size:11px;color:var(--dim);line-height:2;margin-bottom:13px}
+.steps b{color:var(--mut);font-weight:400}
+
+.note{border:1px solid rgba(201,168,76,.3);background:rgba(201,168,76,.05);border-radius:9px;padding:12px 14px;font-size:12.5px;color:var(--mut);margin-bottom:12px}
+.note b{color:var(--gold)}
+@media(max-width:640px){.wrap{padding:12px}.rail{grid-template-columns:repeat(2,1fr)}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div id="login">
+    <h1>sebbi<span>.pro</span></h1>
+    <div class="sub">command centre</div>
+    <input id="pw" type="password" placeholder="admin password" onkeydown="if(event.key==='Enter')doLogin()">
+    <button onclick="doLogin()">Authenticate</button>
+    <div class="err" id="loginerr"></div>
+  </div>
+
+  <div id="dash">
+    <div class="hdr">
+      <div>
+        <h1>sebbi<span>.pro</span> command centre</h1>
+        <div class="sub">Monop Content &middot; <span class="live"><span class="dot"></span>live</span></div>
+      </div>
+      <div style="display:flex;gap:7px">
+        <button class="sm ghost" onclick="loadAll()">Refresh</button>
+        <button class="sm ghost" onclick="logout()">Log out</button>
+      </div>
+    </div>
+
+    <div class="rail" id="rail"></div>
+
+    <div class="tabs">
+      <div class="tab on" onclick="show('routes',this)">Routes</div>
+      <div class="tab" onclick="show('chain',this)">Chain</div>
+      <div class="tab" onclick="show('network',this)">Network</div>
+      <div class="tab" onclick="show('audit',this)">Audit</div>
+      <div class="tab" onclick="show('traffic',this)">Traffic</div>
+      <div class="tab" onclick="show('customers',this)">Customers</div>
+      <div class="tab" onclick="show('contacts',this)">Messages</div>
+      <div class="tab" onclick="show('referrals',this)">Referrals</div>
+    </div>
+
+    <!-- ============ ROUTES ============ -->
+    <div class="panel on" id="p-routes">
+      <div class="note"><b>The arming dance, in one tap.</b> Every module 404s after a deploy until something hits its <span class="mono">/x/</span> prefix. This pings all of them at once and shows you what came back.</div>
+      <div class="row">
+        <button class="sm go" onclick="armAll()">Arm every route</button>
+        <button class="sm ghost" onclick="armAll(true)">Re-check only failures</button>
+        <input class="f" id="newroute" placeholder="add a module name, e.g. map">
+        <button class="sm ghost" onclick="addRoute()">Add</button>
+      </div>
+      <div class="bar"><i id="armbar"></i></div>
+      <div class="out idle" id="armout">not run yet</div>
+      <div class="rgrid" id="rgrid"></div>
+      <div class="sechead">Pages</div>
+      <div class="rgrid" id="pgrid"></div>
+    </div>
+
+    <!-- ============ CHAIN ============ -->
+    <div class="panel" id="p-chain">
+      <div class="row">
+        <button class="sm go" onclick="verifyChain()">Verify chain</button>
+        <button class="sm ghost" onclick="consRoot()">Consistency root</button>
+        <button class="sm ghost" onclick="otsStatus()">Anchoring status</button>
+        <button class="sm ghost" onclick="ownTip()">Current tip</button>
+      </div>
+      <div class="out idle" id="chainout">not checked yet</div>
+
+      <div class="sechead">Break glass</div>
+      <div class="glass">
+        <h3>If the chain ever breaks</h3>
+        <p>This does <b>not</b> repair anything. Repairing a broken chain is the operator rewriting the record — the one thing this whole platform exists to make impossible. What it does instead is capture the break so its exact shape is provable afterwards.</p>
+        <div class="steps">
+          <b>1.</b> freeze &mdash; read and pin the current tip<br>
+          <b>2.</b> locate &mdash; walk the links and name the first block whose prev_hash stops matching<br>
+          <b>3.</b> export &mdash; pull every record to this phone as JSON<br>
+          <b>4.</b> externalise &mdash; hand the frozen tip to the witness network so somebody outside holds it
+        </div>
+        <button class="danger" onclick="breakGlass()">Capture the break</button>
+      </div>
+      <div class="out idle" id="glassout" style="margin-top:12px">standing by</div>
+    </div>
+
+    <!-- ============ NETWORK ============ -->
+    <div class="panel" id="p-network">
+      <div class="row">
+        <button class="sm go" onclick="loadNetwork()">Refresh network</button>
+        <button class="sm ghost" onclick="openRaw('/x/roster/list')">Raw roster</button>
+        <button class="sm ghost" onclick="openRaw('/x/mutual/status')">Mutual status</button>
+      </div>
+      <div class="out idle" id="netout">not loaded</div>
+      <div id="netlist"></div>
+    </div>
+
+    <!-- ============ AUDIT ============ -->
+    <div class="panel" id="p-audit">
+      <div class="row">
+        <input class="f" id="auditkey" placeholder="filter by API key (leave empty for everything)">
+        <button class="sm" onclick="loadAudit()">Search</button>
+        <button class="sm ghost" onclick="exportAudit()">Export</button>
+      </div>
+      <div class="out idle" id="auditchain">not checked yet</div>
+      <div id="auditlist"><div class="empty">Tap Search to load sealed records.</div></div>
+    </div>
+
+    <!-- ============ TRAFFIC ============ -->
+    <div class="panel" id="p-traffic">
+      <div class="row">
+        <button class="sm go" onclick="loadTraffic()">Load traffic</button>
+        <button class="sm ghost" onclick="openRaw('/x/stats')">Raw stats</button>
+        <button class="sm ghost" onclick="openRaw('/x/demo/stats')">Proving ground</button>
+      </div>
+      <div class="out idle" id="trafout">not loaded</div>
+      <div id="traflist"></div>
+      <div class="note" style="margin-top:14px"><b>Unique visitors is not counted anywhere yet.</b> Nothing in server.py records a visit, so no route can report it. Everything above is decision and demo activity, not people. Counting uniques needs a small server-side change — say the word and it gets built.</div>
+    </div>
+
+    <!-- ============ CUSTOMERS ============ -->
+    <div class="panel" id="p-customers">
+      <a class="ext" href="https://dashboard.stripe.com" target="_blank" rel="noopener">Stripe dashboard &mdash; payments, revenue &amp; billing &rarr;</a>
+      <div id="custlist"><div class="empty">Loading&hellip;</div></div>
+    </div>
+
+    <div class="panel" id="p-contacts"><div id="contlist"><div class="empty">Loading&hellip;</div></div></div>
+    <div class="panel" id="p-referrals"><div id="reflist"><div class="empty">Loading&hellip;</div></div></div>
+
+  </div>
+</div>
+
+<script>
+var TOKEN="";
+var LAST_AUDIT=[];
+
+/* modules to arm. add more with the box on the Routes tab. */
+var ROUTES=["selfcheck","standard","savings","verifier","network","publish","continuity",
+            "praxis","roster","mutual","witness","packs","pack","packconsole","register",
+            "demo","wallet","ots","complete","consistency","replay","lineage","witnessed",
+            "codebase","identify","watch","tokensaver","signed","stats","console"];
+var PAGES=["/console","/pack","/witness","/self-check","/praxis","/packs.html","/registry.html",
+           "/developers","/whitepaper","/seal","/verify","/scan","/notary"];
+var RSTATE={};
+
+function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]})}
+function when(ts){if(!ts)return"";try{var n=Number(ts);if(n>1e12)n=n/1000;return new Date(n*1000).toLocaleString()}catch(e){return""}}
+function setOut(id,txt,cls){var e=document.getElementById(id);e.textContent=txt;e.className="out"+(cls?" "+cls:"")}
+function openRaw(p){window.open(p,"_blank")}
+
+/* ---------- auth ---------- */
+async function doLogin(){
+  var pw=document.getElementById("pw").value;
+  document.getElementById("loginerr").textContent="";
+  try{
+    var r=await fetch("/admin/auth",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password:pw})});
+    var d=await r.json();
+    if(d.token){TOKEN=d.token;document.getElementById("login").style.display="none";document.getElementById("dash").style.display="block";loadAll();}
+    else if(d.error==="admin_disabled"){document.getElementById("loginerr").textContent="Admin password not set. Add ADMIN_PASSWORD in Railway variables.";}
+    else if(d.error==="too_many_attempts"){document.getElementById("loginerr").textContent="Too many attempts. Wait a minute.";}
+    else{document.getElementById("loginerr").textContent="Wrong password.";}
+  }catch(e){document.getElementById("loginerr").textContent="Connection error.";}
+}
+function logout(){TOKEN="";document.getElementById("dash").style.display="none";document.getElementById("login").style.display="block";document.getElementById("pw").value="";}
+
+/* every admin call reports what actually came back — no silent empty states */
+async function api(path,body){
+  var r=await fetch(path,{method:"POST",
+    headers:{"Authorization":"Bearer "+TOKEN,"Content-Type":"application/json"},
+    body:JSON.stringify(body||{})});
+  var txt=await r.text();
+  var d;
+  try{ d=JSON.parse(txt); }
+  catch(e){ throw new Error("HTTP "+r.status+" — server did not return JSON: "+txt.slice(0,160)); }
+  if(!r.ok) throw new Error("HTTP "+r.status+" — "+(d.error||txt.slice(0,160)));
+  if(d && d.error) throw new Error(String(d.error));
+  return d;
+}
+
+/* ---------- overview ---------- */
+async function loadAll(){
+  try{
+    var s=await api("/admin/stats");
+    document.getElementById("rail").innerHTML=
+      st(s.total_keys,"signups")+
+      st(s.paid_keys,"paying","good")+
+      st((s.total_keys||0)-(s.paid_keys||0),"free / leads")+
+      st(s.audit_blocks,"audit blocks","cy")+
+      st(s.chain_valid?"OK":"BROKEN","chain",s.chain_valid?"good":"bad")+
+      st('<span id="armcount">—</span>',"routes armed","cy")+
+      st('<span id="peercount">—</span>',"peers","cy");
+  }catch(e){
+    document.getElementById("rail").innerHTML='<div class="st bad"><div class="big">ERR</div><div class="lab">'+esc(e.message).slice(0,60)+'</div></div>';
+  }
+  buildRoutes();
+  loadCustomers();loadContacts();loadReferrals();loadNetwork();
+}
+function st(v,l,cls){return '<div class="st '+(cls||"")+'"><div class="big">'+v+'</div><div class="lab">'+esc(l)+'</div></div>';}
+
+/* ---------- routes ---------- */
+function buildRoutes(){
+  var h="";
+  ROUTES.forEach(function(m){
+    var s=RSTATE[m]||{cls:"",txt:"not checked"};
+    h+='<div class="rt '+s.cls+'" id="rt-'+m+'" onclick="armOne(\''+m+'\')">'
+      +'<div class="rn">/x/'+esc(m)+'</div><div class="rs">'+esc(s.txt)+'</div></div>';
+  });
+  document.getElementById("rgrid").innerHTML=h;
+  var p="";
+  PAGES.forEach(function(u){
+    p+='<div class="rt" onclick="openRaw(\''+u+'\')"><div class="rn">'+esc(u)+'</div><div class="rs">open</div></div>';
+  });
+  document.getElementById("pgrid").innerHTML=p;
+}
+function addRoute(){
+  var v=document.getElementById("newroute").value.trim().replace(/[^a-z0-9_-]/gi,"");
+  if(!v)return;
+  if(ROUTES.indexOf(v)<0)ROUTES.push(v);
+  document.getElementById("newroute").value="";
+  buildRoutes();
+}
+function mark(m,cls,txt){
+  RSTATE[m]={cls:cls,txt:txt};
+  var el=document.getElementById("rt-"+m);
+  if(el){el.className="rt "+cls;el.querySelector(".rs").textContent=txt;}
+}
+async function armOne(m){
+  mark(m,"wait","pinging");
+  var t0=Date.now();
+  try{
+    var r=await fetch("/x/"+m+"/status",{cache:"no-store"});
+    var ms=Date.now()-t0;
+    var txt=await r.text();
+    // a module with no 'status' action still proves it loaded: it answers
+    // unknown_action and lists what it does have.
+    if(r.ok){ mark(m,"armed","armed "+ms+"ms"); return true; }
+    if(txt.indexOf("unknown_action")>=0){ mark(m,"armed","armed "+ms+"ms"); return true; }
+    mark(m,"fail","HTTP "+r.status);
+    return false;
+  }catch(e){ mark(m,"fail","unreachable"); return false; }
+}
+async function armAll(failsOnly){
+  var list=failsOnly?ROUTES.filter(function(m){return !RSTATE[m]||RSTATE[m].cls!=="armed"}):ROUTES.slice();
+  if(!list.length){setOut("armout","nothing to re-check — everything is armed","");return;}
+  setOut("armout","arming "+list.length+" routes…","warn");
+  var done=0,ok=0;
+  for(var i=0;i<list.length;i++){
+    var good=await armOne(list[i]);
+    done++; if(good)ok++;
+    document.getElementById("armbar").style.width=Math.round(done/list.length*100)+"%";
+  }
+  var armed=ROUTES.filter(function(m){return RSTATE[m]&&RSTATE[m].cls==="armed"}).length;
+  var ac=document.getElementById("armcount"); if(ac)ac.textContent=armed+"/"+ROUTES.length;
+  var failed=list.filter(function(m){return RSTATE[m]&&RSTATE[m].cls==="fail"});
+  if(failed.length) setOut("armout",ok+" of "+list.length+" armed.\nnot responding: "+failed.join(", "),"warn");
+  else setOut("armout","all "+ok+" routes armed.","");
+  setTimeout(function(){document.getElementById("armbar").style.width="0"},900);
+}
+
+/* ---------- chain ---------- */
+async function verifyChain(){
+  setOut("chainout","verifying…","warn");
+  try{
+    var r=await fetch("/api/verify-chain",{cache:"no-store"});var d=await r.json();
+    if(d.valid) setOut("chainout","VERIFIED — CHAIN INTACT\nblocks: "+d.blocks+"\ntip:    "+(d.tip||"")+(d.message?"\n"+d.message:""),"");
+    else setOut("chainout","CHAIN BROKEN\nblocks: "+d.blocks+"\n"+(d.message||"")+"\n\nGo to Break glass below. Do not redeploy first.","bad");
+  }catch(e){setOut("chainout","could not reach /api/verify-chain — "+e.message,"bad");}
+}
+async function consRoot(){
+  setOut("chainout","reading consistency root…","warn");
+  try{
+    var r=await fetch("/x/consistency/root",{cache:"no-store"});var t=await r.text();
+    setOut("chainout",t.slice(0,1200), r.ok?"":"bad");
+  }catch(e){setOut("chainout","unreachable — "+e.message,"bad");}
+}
+async function otsStatus(){
+  setOut("chainout","reading anchoring status…","warn");
+  try{
+    var r=await fetch("/x/ots/status",{cache:"no-store"});var t=await r.text();
+    setOut("chainout",t.slice(0,1600), r.ok?"":"bad");
+  }catch(e){setOut("chainout","unreachable — "+e.message,"bad");}
+}
+async function ownTip(){
+  setOut("chainout","reading tip…","warn");
+  try{
+    var r=await fetch("/x/witness/tip",{cache:"no-store"});var t=await r.text();
+    setOut("chainout",t.slice(0,1200), r.ok?"":"bad");
+  }catch(e){setOut("chainout","unreachable — "+e.message,"bad");}
+}
+
+/* ---------- break glass ---------- */
+async function breakGlass(){
+  var log=[];
+  function push(s){log.push(s);setOut("glassout",log.join("\n"),"warn");}
+  push("CAPTURE STARTED — "+new Date().toISOString());
+
+  var frozenTip="";
+  try{
+    var r=await fetch("/api/verify-chain",{cache:"no-store"});var d=await r.json();
+    frozenTip=d.tip||"";
+    push("1. frozen tip: "+(frozenTip||"(none returned)"));
+    push("   chain reports: "+(d.valid?"INTACT":"BROKEN")+" across "+d.blocks+" blocks");
+  }catch(e){push("1. could not read tip — "+e.message);}
+
+  var recs=[];
+  try{
+    var d2=await api("/admin/audit",{limit:1000,api_key:""});
+    recs=d2.records||[];
+    push("2. pulled "+recs.length+" records");
+    var brk=null;
+    for(var i=recs.length-1;i>0;i--){
+      // records arrive newest first, so walk backwards through time
+      var older=recs[i],newer=recs[i-1];
+      if(newer.prev_hash && older.audit_hash && newer.prev_hash!==older.audit_hash){brk={at:newer.seq,expected:older.audit_hash,found:newer.prev_hash};break;}
+    }
+    if(brk) push("3. FIRST BREAK at record #"+brk.at+"\n   expected prev: "+String(brk.expected).slice(0,32)+"…\n   found prev:    "+String(brk.found).slice(0,32)+"…");
+    else push("3. no link mismatch found in the records pulled");
+  }catch(e){push("2. could not pull records — "+e.message);}
+
+  try{
+    var blob=new Blob([JSON.stringify({captured_at:new Date().toISOString(),frozen_tip:frozenTip,record_count:recs.length,records:recs},null,2)],{type:"application/json"});
+    var url=URL.createObjectURL(blob);var a=document.createElement("a");
+    a.href=url;a.download="sebbi-break-capture-"+Date.now()+".json";a.click();URL.revokeObjectURL(url);
+    push("4. evidence file downloaded to this device");
+  }catch(e){push("4. export failed — "+e.message);}
+
+  try{
+    var rp=await fetch("/x/mutual/status",{cache:"no-store"});
+    push("5. witness network reachable: "+(rp.ok?"yes — the tip goes out on the next cycle":"NO, check /x/mutual/status"));
+  }catch(e){push("5. could not reach the witness layer — "+e.message);}
+
+  push("");
+  push("CAPTURE COMPLETE. Keep that file off this server.");
+  push("Do not redeploy or reset until it is saved somewhere else.");
+  setOut("glassout",log.join("\n"),"bad");
+}
+
+/* ---------- network ---------- */
+async function loadNetwork(){
+  setOut("netout","loading roster…","warn");
+  try{
+    var r=await fetch("/x/roster/list",{cache:"no-store"});
+    var d=await r.json();
+    var ch=d.chains||d.roster||d.peers||[];
+    setOut("netout","roster v"+(d.roster_version||"?")+" — "+(d.count!=null?d.count:ch.length)+" listed"
+      +(d.witnessable!=null?", "+d.witnessable+" witnessable":"")
+      +(d.stale!=null?", "+d.stale+" stale":"")+(d.silent!=null?", "+d.silent+" silent":""),"");
+    var pc=document.getElementById("peercount"); if(pc)pc.textContent=(d.count!=null?d.count:ch.length);
+    if(!ch.length){document.getElementById("netlist").innerHTML='<div class="empty">Roster returned no chains.</div>';return;}
+    var h="";
+    ch.forEach(function(c){
+      var stt=(c.status||c.liveness||"").toLowerCase();
+      var col=stt.indexOf("current")>=0?"var(--ok)":stt.indexOf("stale")>=0?"var(--amber)":stt.indexOf("silent")>=0?"var(--red)":"var(--mut)";
+      h+='<div class="card"><div class="top"><span class="nm">'+esc(c.chain||c.name||c.peer||"(unnamed)")+'</span>'
+        +'<span class="badge" style="color:'+col+';border:1px solid '+col+'">'+esc(c.status||c.liveness||"—")+'</span></div>'
+        +'<div class="meta">'+(c.observations!=null?esc(c.observations)+' observations · ':'')
+        +(c.hours_since!=null?esc(c.hours_since)+'h since last · ':'')
+        +'name: '+esc(c.name_status||"—")+'</div>'
+        +(c.first_seen?'<div class="meta">first seen '+esc(c.first_seen)+'</div>':'')
+        +(c.url?'<div class="mono">'+esc(c.url)+'</div>':'')+'</div>';
+    });
+    document.getElementById("netlist").innerHTML=h;
+  }catch(e){setOut("netout","could not load roster — "+e.message,"bad");}
+}
+
+/* ---------- audit ---------- */
+async function loadAudit(){
+  setOut("auditchain","loading…","warn");
+  document.getElementById("auditlist").innerHTML='<div class="empty">Loading&hellip;</div>';
+  var key=document.getElementById("auditkey").value.trim();
+  var d;
+  try{ d=await api("/admin/audit",{limit:500,api_key:key}); }
+  catch(e){
+    setOut("auditchain","REQUEST FAILED — "+e.message,"bad");
+    document.getElementById("auditlist").innerHTML='<div class="empty">The server refused this call. The message above is what it actually said &mdash; that is the fault to fix, not an empty chain.</div>';
+    return;
+  }
+  LAST_AUDIT=d.records||[];
+  setOut("auditchain",(d.chain_valid?"CHAIN INTACT":"CHAIN BROKEN")+" · "+(d.chain_blocks!=null?d.chain_blocks:"?")+" blocks · "+(d.count!=null?d.count:LAST_AUDIT.length)+" records returned\ntip "+String(d.chain_tip||"").slice(0,48),d.chain_valid?"":"bad");
+  if(!LAST_AUDIT.length){
+    document.getElementById("auditlist").innerHTML='<div class="empty">The call succeeded and returned zero records'+(key?' for that key':'')+'.<br><br>The chain reports '+(d.chain_blocks!=null?d.chain_blocks:"?")+' blocks, so if that number is above zero the rows exist and something is filtering them out.</div>';
+    return;
+  }
+  var h="";
+  LAST_AUDIT.forEach(function(a){
+    var dec=esc(a.decision||"—");
+    var col=dec==="BLOCK"?"var(--red)":dec==="CHALLENGE"?"var(--gold)":"var(--green)";
+    h+='<div class="card"><div class="top"><span class="nm">#'+esc(a.seq)+' <span style="color:'+col+'">'+dec+'</span></span><span class="meta">'+when(a.ts)+'</span></div>'
+      +'<div class="meta">user: '+esc(a.user_id||"—")+(a.score!==""&&a.score!=null?' · score '+esc(a.score):'')
+      +(a.reasons&&a.reasons.length?' · '+esc(a.reasons.join(", ")):'')+'</div>'
+      +'<div class="mono" style="margin-top:5px">seal '+esc(String(a.audit_hash||"").slice(0,44))+'…</div>'
+      +'<div class="mono">prev '+esc(String(a.prev_hash||"").slice(0,44))+'…</div></div>';
+  });
+  document.getElementById("auditlist").innerHTML=h;
+}
+function exportAudit(){
+  if(!LAST_AUDIT.length){setOut("auditchain","nothing loaded to export — run Search first","warn");return;}
+  var blob=new Blob([JSON.stringify(LAST_AUDIT,null,2)],{type:"application/json"});
+  var url=URL.createObjectURL(blob);var a=document.createElement("a");
+  a.href=url;a.download="sebbi-audit-export-"+Date.now()+".json";a.click();URL.revokeObjectURL(url);
+}
+
+/* ---------- traffic ---------- */
+async function loadTraffic(){
+  setOut("trafout","loading…","warn");
+  var out=[];
+  try{
+    var r=await fetch("/x/stats",{cache:"no-store"});var t=await r.text();
+    out.push("/x/stats\n"+t.slice(0,900));
+  }catch(e){out.push("/x/stats unreachable — "+e.message);}
+  try{
+    var r2=await fetch("/x/demo/stats",{cache:"no-store"});var t2=await r2.text();
+    out.push("\n/x/demo/stats\n"+t2.slice(0,700));
+  }catch(e){out.push("\n/x/demo/stats unreachable");}
+  setOut("trafout",out.join("\n"),"");
+}
+
+/* ---------- lists ---------- */
+async function loadCustomers(){
+  try{
+    var d=await api("/admin/keys");var ks=d.keys||[];
+    if(!ks.length){document.getElementById("custlist").innerHTML='<div class="empty">No signups yet.</div>';return;}
+    var h="";
+    ks.forEach(function(k){
+      var paid=k.is_paid==1;
+      h+='<div class="card"><div class="top"><span class="nm">'+esc(k.name||"(no name)")+' <span class="meta">'+esc(k.org||"")+'</span></span>'
+        +'<span class="badge '+(paid?"paid":"free")+'">'+(paid?"paying":"free")+'</span></div>'
+        +'<div class="meta">'+esc(k.email||"")+' · '+esc(k.product||"")+' · '+esc(k.devices||0)+' devices · used '+esc(k.actions_used||0)+'/'+esc(k.free_quota||0)+'</div>'
+        +'<div class="meta">joined '+when(k.created)+'</div>'
+        +(k.key?'<div class="mono">'+esc(k.key)+'</div>':'')+'</div>';
+    });
+    document.getElementById("custlist").innerHTML=h;
+  }catch(e){document.getElementById("custlist").innerHTML='<div class="empty">Could not load — '+esc(e.message)+'</div>';}
+}
+async function loadContacts(){
+  try{
+    var d=await api("/admin/contacts");var cs=d.contacts||[];
+    if(!cs.length){document.getElementById("contlist").innerHTML='<div class="empty">No messages yet.</div>';return;}
+    var h="";
+    cs.forEach(function(c){
+      h+='<div class="card"><div class="top"><span class="nm">'+esc(c.name||"(no name)")+'</span><span class="meta">'+when(c.ts)+'</span></div>'
+        +'<div class="meta">'+esc(c.email||"")+(c.phone?' · '+esc(c.phone):'')+(c.org?' · '+esc(c.org):'')+'</div>'
+        +'<div style="margin-top:6px">'+esc(c.message||"")+'</div></div>';
+    });
+    document.getElementById("contlist").innerHTML=h;
+  }catch(e){document.getElementById("contlist").innerHTML='<div class="empty">Could not load — '+esc(e.message)+'</div>';}
+}
+async function loadReferrals(){
+  try{
+    var d=await api("/admin/referrals");var rs=d.referrals||[];
+    if(!rs.length){document.getElementById("reflist").innerHTML='<div class="empty">No referrals yet.</div>';return;}
+    var h="";
+    rs.forEach(function(r){
+      h+='<div class="card"><div class="top"><span class="nm">'+esc(r.referrer_name||"(no name)")+' <span class="meta">'+esc(r.code||"")+'</span></span>'
+        +'<span class="badge paid">£'+((r.earnings_pence||0)/100).toFixed(2)+'</span></div>'
+        +'<div class="meta">'+esc(r.referrer_email||"")+' · '+esc(r.devices_referred||0)+' devices referred</div></div>';
+    });
+    document.getElementById("reflist").innerHTML=h;
+  }catch(e){document.getElementById("reflist").innerHTML='<div class="empty">Could not load — '+esc(e.message)+'</div>';}
+}
+
+function show(name,el){
+  document.querySelectorAll(".tab").forEach(function(t){t.className="tab"});el.className="tab on";
+  document.querySelectorAll(".panel").forEach(function(p){p.className="panel"});
+  document.getElementById("p-"+name).className="panel on";
+}
+</script>
+</body>
+</html>
