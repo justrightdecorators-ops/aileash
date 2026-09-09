@@ -1,4 +1,4 @@
-# Codebase — part 15 of 33
+# Codebase — part 15 of 32
 
 Contains:
 - `modules/sortition.py`

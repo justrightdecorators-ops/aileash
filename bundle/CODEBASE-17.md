@@ -1,4 +1,4 @@
-# Codebase — part 17 of 33
+# Codebase — part 17 of 32
 
 Contains:
 - `modules/wallet.py`

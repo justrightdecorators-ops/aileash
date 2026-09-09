@@ -1,4 +1,4 @@
-# Codebase — part 7 of 33
+# Codebase — part 7 of 32
 
 Contains:
 - `modules/investor.py`

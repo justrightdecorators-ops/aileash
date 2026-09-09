@@ -1,4 +1,4 @@
-# Codebase — part 24 of 33
+# Codebase — part 24 of 32
 
 Contains:
 - `console.html`
