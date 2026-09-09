@@ -1,10 +1,10 @@
 # Codebase — part 26 of 33
 
 Contains:
-- `index-24.html`
+- `index.html`
 
 
-## `index-24.html`
+## `index.html`
 
 3639 lines, 240777 bytes
 

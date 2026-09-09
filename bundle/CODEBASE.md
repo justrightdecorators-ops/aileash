@@ -183,7 +183,7 @@ Generated automatically on every push. Do not edit by hand.
 
 ## [CODEBASE-26.md](CODEBASE-26.md)
 
-- `index-24.html`
+- `index.html`
 
 ## [CODEBASE-27.md](CODEBASE-27.md)
 
