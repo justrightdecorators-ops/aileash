@@ -1,11 +1,206 @@
 # Codebase — part 28 of 33
 
 Contains:
+- `notary.html`
 - `pack.html`
 - `pay-check.html`
 - `registry.html`
 - `report-threat.html`
 - `requirements.txt`
+
+
+## `notary.html`
+
+186 lines, 12017 bytes
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Sovereign Profile Notary — sebbi.pro</title>
+<style>
+  :root{--ink:#0a0f1e;--ink2:#10182e;--input:#131e36;--gold:#c9a84c;--ok:#7fe3b0;--err:#ff8a80;--muted:#94a3b8;}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--ink);color:#f8fafc;font-family:system-ui,sans-serif;min-height:100vh;padding:26px 16px}
+  .container{max-width:1100px;margin:0 auto;display:grid;grid-template-columns:1fr 1fr;gap:28px}
+  @media(max-width:850px){.container{grid-template-columns:1fr}}
+  header{grid-column:1/-1;border-bottom:1px solid rgba(201,168,76,0.2);padding-bottom:16px}
+  .brand{font-family:monospace;font-size:10px;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,0.35)}
+  h1{font-family:Georgia,serif;font-size:28px;color:var(--gold);margin:8px 0 6px}
+  .tagline{color:var(--muted);font-size:13.5px;line-height:1.6;max-width:640px}
+  .panel{background:var(--ink2);border:1px solid rgba(201,168,76,0.25);border-radius:12px;padding:24px;display:flex;flex-direction:column;gap:14px}
+  h2{font-size:12px;font-family:monospace;text-transform:uppercase;letter-spacing:2px;color:var(--gold);border-bottom:1px dashed rgba(201,168,76,0.2);padding-bottom:8px}
+  label{display:block;font-size:10px;font-family:monospace;text-transform:uppercase;letter-spacing:2px;color:var(--muted);margin-bottom:5px}
+  input,textarea{width:100%;background:var(--input);border:1px solid rgba(201,168,76,0.3);color:#fff;border-radius:8px;padding:12px;font-size:14px;outline:none}
+  input:focus,textarea:focus{border-color:var(--gold);box-shadow:0 0 8px rgba(201,168,76,0.2)}
+  textarea{min-height:70px;resize:vertical;line-height:1.5}
+  .chk{display:flex;gap:10px;align-items:flex-start;font-size:12px;color:var(--muted);line-height:1.6}
+  .chk input{width:auto;margin-top:2px}
+  button{width:100%;background:var(--gold);color:var(--ink);border:none;border-radius:8px;padding:15px;font-size:14px;font-weight:800;cursor:pointer;text-transform:uppercase;letter-spacing:1px}
+  button:disabled{opacity:0.5}
+  /* preview card */
+  .preview{background:linear-gradient(135deg,#101c36 0%,#060b17 100%);border:2px solid var(--gold);border-radius:14px;padding:24px}
+  .p-name{font-size:22px;font-weight:800;color:#fff;font-family:Georgia,serif}
+  .p-title{font-size:13px;color:var(--gold);font-family:monospace;margin:2px 0 12px}
+  .p-bio{font-size:13.5px;line-height:1.6;color:#cbd5e1;margin-bottom:12px;min-height:20px}
+  .p-links{font-family:monospace;font-size:11px;color:var(--muted);word-break:break-all;line-height:1.9}
+  .p-hash{margin-top:14px;padding:12px;background:rgba(0,0,0,0.4);border-radius:8px;font-family:monospace;font-size:10.5px;color:var(--ok);word-break:break-all;line-height:1.7}
+  #sealres{display:none;margin-top:6px;padding:14px;border-radius:8px;background:rgba(127,227,176,0.08);border:1px solid rgba(127,227,176,0.4);font-family:monospace;font-size:11.5px;line-height:1.9;word-break:break-all}
+  #sealres b{color:var(--ok)}
+  #sealres .code{font-size:16px;color:var(--gold);font-weight:700}
+  /* checker */
+  #checkres{display:none;margin-top:6px;padding:16px;border-radius:10px;font-size:13px;line-height:1.8}
+  #checkres.good{display:block;background:rgba(127,227,176,0.08);border:2px solid var(--ok)}
+  #checkres.bad{display:block;background:rgba(255,138,128,0.08);border:2px solid var(--err)}
+  #checkres .big{font-weight:900;font-size:16px;margin-bottom:6px}
+  #checkres.good .big{color:var(--ok)}
+  #checkres.bad .big{color:var(--err)}
+  #checkres .mono{font-family:monospace;font-size:11px;color:var(--muted);word-break:break-all;line-height:1.9}
+  #trap{display:none;margin-top:12px;padding:16px;border-radius:10px;background:rgba(201,168,76,0.1);border:2px solid var(--gold);cursor:pointer}
+  #trap .t1{font-weight:900;font-size:14px;color:var(--gold);margin-bottom:6px}
+  #trap .t2{font-size:12.5px;color:#cbd5e1;line-height:1.7}
+  .note{font-size:11px;color:rgba(255,255,255,0.35);line-height:1.7}
+  a{color:var(--gold)}
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <div class="brand">sebbi.pro &middot; sovereign profile notary</div>
+    <h1>Seal your profile before someone clones it.</h1>
+    <div class="tagline">Fingerprint your public identity — name, bio, links — and seal it into a live, tamper-evident audit chain with an official timestamp. Put your verification code in your bio. From that moment, anyone can check in seconds whether a profile claiming to be you matches the one you sealed first.</div>
+  </header>
+
+  <!-- LEFT: builder -->
+  <div class="panel" id="builder">
+    <h2>1 &middot; Build &amp; seal your profile</h2>
+    <div><label>Full name</label><input id="nm" oninput="mirror()" placeholder="Justin Antony Dobson"></div>
+    <div><label>Title</label><input id="ttl" oninput="mirror()" placeholder="Founder, Monop Content"></div>
+    <div><label>Short bio</label><textarea id="bio" oninput="mirror()" placeholder="Building tamper-evident AI compliance from Blyth."></textarea></div>
+    <div><label>LinkedIn URL</label><input id="li" oninput="mirror()" placeholder="linkedin.com/in/yourname"></div>
+    <div><label>Other link (optional)</label><input id="fb" oninput="mirror()" placeholder="yoursite.com"></div>
+    <div class="chk"><input type="checkbox" id="pub" checked><span><b>Publish to the public registry.</b> Anyone checking your code will see these profile fields. Untick to seal privately — the checker will confirm the seal and timestamp only, and your details are never stored.</span></div>
+    <button id="go" onclick="sealProfile()">Seal this profile &mdash; free &rarr;</button>
+    <div id="sealres"></div>
+    <div class="note">Your profile is fingerprinted with SHA-256 in your own browser. Registration proves this exact profile was sealed first at this timestamp — the strongest public claim to your own words that exists on the open web.</div>
+  </div>
+
+  <!-- RIGHT: preview + checker -->
+  <div style="display:flex;flex-direction:column;gap:28px">
+    <div class="panel">
+      <h2>2 &middot; Live evidence preview</h2>
+      <div class="preview">
+        <div class="p-name" id="v-nm">Your Name</div>
+        <div class="p-title" id="v-ttl"></div>
+        <div class="p-bio" id="v-bio"></div>
+        <div class="p-links" id="v-links"></div>
+        <div class="p-hash" id="v-hash">FINGERPRINT — start typing to generate</div>
+      </div>
+    </div>
+
+    <div class="panel" id="checker">
+      <h2>3 &middot; Check a profile &middot; public scanner</h2>
+      <div><label>Paste a verification code (from a bio) or full fingerprint</label><input id="q" placeholder="e.g. 7be4d1c29a03"></div>
+      <button onclick="checkCode()">Check the chain &rarr;</button>
+      <div id="checkres"></div>
+      <div id="trap" onclick="document.getElementById('builder').scrollIntoView({behavior:'smooth'});document.getElementById('nm').focus()">
+        <div class="t1">&#9888;&#65039; This profile is unclaimed.</div>
+        <div class="t2">No seal exists for this code — which means the identity it claims is unregistered and open to AI cloning and impersonation. Sealing yours takes 60 seconds and costs nothing. <u>Tap here to claim your profile now.</u></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+async function sha256hex(s){
+  var buf=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(s));
+  return Array.from(new Uint8Array(buf)).map(function(b){return b.toString(16).padStart(2,"0");}).join("");
+}
+function fields(){
+  return {
+    name:document.getElementById("nm").value.trim(),
+    title:document.getElementById("ttl").value.trim(),
+    bio:document.getElementById("bio").value.trim(),
+    linkedin:document.getElementById("li").value.trim(),
+    facebook:document.getElementById("fb").value.trim()
+  };
+}
+function canonical(f){
+  return "profile:v1|"+f.name+"|"+f.title+"|"+f.bio+"|"+f.linkedin+"|"+f.facebook;
+}
+var mirrorTimer=null;
+function mirror(){
+  var f=fields();
+  document.getElementById("v-nm").textContent=f.name||"Your Name";
+  document.getElementById("v-ttl").textContent=f.title;
+  document.getElementById("v-bio").textContent=f.bio;
+  document.getElementById("v-links").innerHTML=[f.linkedin,f.facebook].filter(Boolean).join("<br>");
+  clearTimeout(mirrorTimer);
+  mirrorTimer=setTimeout(async function(){
+    if(!f.name){document.getElementById("v-hash").textContent="FINGERPRINT \u2014 start typing to generate";return;}
+    var h=await sha256hex(canonical(f));
+    document.getElementById("v-hash").textContent="FINGERPRINT "+h;
+  },200);
+}
+async function sealProfile(){
+  var f=fields();
+  var res=document.getElementById("sealres");
+  if(!f.name){res.style.display="block";res.innerHTML="<span style='color:var(--err)'>Enter at least your name.</span>";return;}
+  var btn=document.getElementById("go");btn.disabled=true;btn.textContent="Sealing\u2026";
+  try{
+    var fp=await sha256hex(canonical(f));
+    var body={fingerprint:fp,public:document.getElementById("pub").checked,profile:f};
+    var r=await fetch("/api/identity/seal",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    var d=await r.json();
+    if(!d.sealed){res.style.display="block";res.innerHTML="<span style='color:var(--err)'>"+(d.error||"Sealing failed")+"</span>";btn.disabled=false;btn.textContent="Seal this profile \u2014 free \u2192";return;}
+    var code=(d.code||fp.slice(0,12));
+    var when=new Date((d.sealed_at)*1000).toLocaleString("en-GB");
+    res.style.display="block";
+    res.innerHTML=(d.already_registered?"<b>Already sealed.</b> This exact profile was registered earlier \u2014 details below.<br>":"<b>\u2713 SEALED.</b> This exact profile is now locked in the chain.<br>")
+      +"Your verification code: <span class='code'>"+code+"</span><br>"
+      +"Registered: "+when+" \u00b7 block #"+d.block_index+"<br><br>"
+      +"<b>Put this line in your LinkedIn bio:</b><br>\u26D3 Profile sealed \u00b7 verify code "+code+" at sebbi.pro/identity";
+    btn.textContent="Sealed \u2713";
+  }catch(e){res.style.display="block";res.innerHTML="<span style='color:var(--err)'>Network error: "+e+"</span>";btn.disabled=false;btn.textContent="Seal this profile \u2014 free \u2192";}
+}
+async function checkCode(){
+  var q=document.getElementById("q").value.trim().toLowerCase().replace(/[^0-9a-f]/g,"");
+  var out=document.getElementById("checkres");
+  var trap=document.getElementById("trap");
+  trap.style.display="none";
+  if(q.length<12){out.className="bad";out.innerHTML="<div class='big'>Enter at least the 12-character code.</div>";return;}
+  out.className="";out.style.display="block";out.innerHTML="Checking the chain\u2026";
+  try{
+    var r=await fetch("/api/identity/check?code="+q);
+    var d=await r.json();
+    if(d.found){
+      var when=new Date(d.registered_at*1000).toLocaleString("en-GB");
+      var prof="";
+      if(d.profile){
+        prof="<br><b>"+(d.profile.name||"")+"</b>"+(d.profile.title?(" \u00b7 "+d.profile.title):"")
+          +(d.profile.bio?("<br>"+d.profile.bio):"")
+          +(d.profile.linkedin?("<br><span class='mono'>"+d.profile.linkedin+"</span>"):"");
+      }else{
+        prof="<br><span class='mono'>Sealed privately \u2014 the owner chose not to publish profile fields. The seal and timestamp below are the proof.</span>";
+      }
+      out.className="good";
+      out.innerHTML="<div class='big'>\u2713 SEALED &amp; ON THE CHAIN</div>"
+        +"Registered "+when+" \u00b7 block #"+d.block_index+prof
+        +"<br><span class='mono'>Fingerprint "+d.fingerprint+"</span>";
+    }else{
+      out.className="bad";
+      out.innerHTML="<div class='big'>\u2717 NO SEAL FOUND</div>No registration exists for this code. Either it was typed wrong \u2014 or the profile showing it was never sealed.";
+      trap.style.display="block";
+    }
+  }catch(e){out.className="bad";out.innerHTML="<div class='big'>Network error</div>"+e;}
+}
+</script>
+</body>
+</html>
+
+```
 
 
 ## `pack.html`

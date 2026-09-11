@@ -1,12 +1,371 @@
 # Codebase — part 27 of 33
 
 Contains:
+- `integration-docs.html`
 - `investor-prospectus.html`
 - `legal.txt`
 - `liability.txt`
 - `llms.txt`
 - `map.html`
-- `notary.html`
+
+
+## `integration-docs.html`
+
+351 lines, 12326 bytes
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Autonomous Systems Integration — AILeash API Reference</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', sans-serif;
+            background: linear-gradient(135deg, #0a0f1e 0%, #111a30 100%);
+            color: #ffffff;
+            line-height: 1.8;
+        }
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 48px 24px;
+        }
+        h1 {
+            font-family: Georgia, serif;
+            font-size: 36px;
+            font-weight: 900;
+            color: #c9a84c;
+            margin-bottom: 12px;
+        }
+        .lead {
+            font-size: 16px;
+            color: rgba(255, 255, 255, 0.6);
+            margin-bottom: 40px;
+            line-height: 1.7;
+        }
+        h2 {
+            font-size: 22px;
+            font-weight: 700;
+            color: #c9a84c;
+            margin-top: 40px;
+            margin-bottom: 16px;
+            border-bottom: 1px solid rgba(201, 168, 76, 0.2);
+            padding-bottom: 12px;
+        }
+        h3 {
+            font-size: 16px;
+            font-weight: 600;
+            color: #7fe3b0;
+            margin-top: 24px;
+            margin-bottom: 12px;
+        }
+        p {
+            color: rgba(255, 255, 255, 0.75);
+            margin-bottom: 16px;
+        }
+        code {
+            background: rgba(0, 0, 0, 0.3);
+            border-left: 2px solid #c9a84c;
+            padding: 2px 6px;
+            font-family: 'Monaco', 'Courier New', monospace;
+            font-size: 13px;
+            color: #7fe3b0;
+        }
+        pre {
+            background: rgba(0, 0, 0, 0.5);
+            border: 1px solid rgba(201, 168, 76, 0.2);
+            border-radius: 6px;
+            padding: 16px;
+            overflow-x: auto;
+            margin: 16px 0;
+            font-family: 'Monaco', monospace;
+            font-size: 12px;
+            line-height: 1.6;
+        }
+        pre code {
+            background: none;
+            border: none;
+            padding: 0;
+            color: #7fe3b0;
+        }
+        .endpoint {
+            background: rgba(201, 168, 76, 0.05);
+            border-left: 3px solid #c9a84c;
+            padding: 16px;
+            margin: 20px 0;
+            border-radius: 4px;
+        }
+        .method {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 3px;
+            font-weight: 600;
+            font-size: 12px;
+            margin-right: 8px;
+            font-family: monospace;
+        }
+        .method.get { background: rgba(127, 227, 176, 0.2); color: #7fe3b0; }
+        .method.post { background: rgba(201, 168, 76, 0.2); color: #c9a84c; }
+        .schema {
+            background: rgba(0, 0, 0, 0.3);
+            border: 1px solid rgba(127, 227, 176, 0.2);
+            border-radius: 4px;
+            padding: 16px;
+            margin: 16px 0;
+            font-family: monospace;
+            font-size: 12px;
+        }
+        table {
+            width: 100%;
+            margin: 20px 0;
+            border-collapse: collapse;
+        }
+        th, td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid rgba(201, 168, 76, 0.1);
+        }
+        th {
+            background: rgba(201, 168, 76, 0.1);
+            font-weight: 600;
+            color: #c9a84c;
+        }
+        .required {
+            color: #ff6b6b;
+            font-weight: 600;
+        }
+        a {
+            color: #c9a84c;
+            text-decoration: none;
+            border-bottom: 1px solid rgba(201, 168, 76, 0.3);
+        }
+        a:hover {
+            border-bottom-color: #c9a84c;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>/docs/integration</h1>
+        <div class="lead">Complete schema reference for autonomous hardware, robotics AI, and external agent integration with the AILeash decision engine.</div>
+
+        <h2>1. Overview</h2>
+        <p>The AILeash platform exposes three integration tiers for autonomous systems:</p>
+        <ul style="margin-left: 20px; color: rgba(255, 255, 255, 0.75);">
+            <li><strong>/api/v1/stream</strong> — headless JSON API for decision scoring and audit integration</li>
+            <li><strong>/telemetry/nodes</strong> — real-time hardware state and performance metrics dashboard</li>
+            <li><strong>/docs/integration</strong> — this reference. Data schemas, examples, and compliance hooks.</li>
+        </ul>
+
+        <h2>2. Stream API — /api/v1/stream</h2>
+        <p>Lightweight endpoint for autonomous systems to stream decisions into the sealed audit chain without DOM rendering overhead.</p>
+
+        <div class="endpoint">
+            <span class="method get">GET</span> <code>/api/v1/stream/nodes</code>
+            <p style="margin-top: 12px; font-size: 14px;">Fetch current state of all connected hardware nodes.</p>
+            <strong>Response:</strong>
+            <div class="schema">
+{
+  "nodes": [
+    {
+      "node_id": "bot-001",
+      "type": "robotic_arm",
+      "status": "active",
+      "last_decision_seal": "a3f9b2c...",
+      "decisions_sealed": 1247,
+      "uptime_hours": 168,
+      "next_sync": "2026-09-11T14:32:00Z"
+    }
+  ]
+}
+            </div>
+        </div>
+
+        <div class="endpoint">
+            <span class="method post">POST</span> <code>/api/v1/stream/decide</code>
+            <p style="margin-top: 12px; font-size: 14px;">Submit a decision event from an autonomous agent. Scores and seals inline.</p>
+            <strong>Request Body:</strong>
+            <div class="schema">
+{
+  "node_id": "bot-001",
+  "user_id": "agent_system",
+  "action": "pick_and_place",
+  "amount": 0,
+  "country": "UK",
+  "device_id": "bot-001-gripper",
+  "anomaly": 0.1,
+  "device_risk": 0.05,
+  "context": {
+    "task_id": "task-2847",
+    "confidence": 0.97,
+    "object_class": "component_xyz"
+  }
+}
+            </div>
+            <strong>Response (200):</strong>
+            <div class="schema">
+{
+  "decision": "ALLOW",
+  "score": 0.23,
+  "seal": "b7e2d1f9a4c6...",
+  "block_index": 18742,
+  "receipt_seq": 4891,
+  "confidence_threshold_met": true,
+  "sealed_at": 1726067520.123
+}
+            </div>
+        </div>
+
+        <h2>3. Telemetry Dashboard — /telemetry/nodes</h2>
+        <p>Real-time visualization of connected autonomous hardware, system health, and decision throughput. GPU-accelerated rendering for 60+ FPS performance.</p>
+        <p><strong>Features:</strong></p>
+        <ul style="margin-left: 20px; color: rgba(255, 255, 255, 0.75);">
+            <li>Live node status (active, syncing, offline)</li>
+            <li>System metrics: CPU, memory, latency</li>
+            <li>Decision throughput graphs (requests/sec, p50 latency)</li>
+            <li>Sealed audit chain tip displayed for verification</li>
+            <li>Export metrics to CSV for compliance audits</li>
+        </ul>
+
+        <h2>4. Data Schemas</h2>
+        <h3>Node Object</h3>
+        <table>
+            <tr>
+                <th>Field</th>
+                <th>Type</th>
+                <th>Description</th>
+            </tr>
+            <tr>
+                <td><code>node_id</code></td>
+                <td>string</td>
+                <td><span class="required">Required</span>. Unique identifier for hardware (e.g. "bot-001")</td>
+            </tr>
+            <tr>
+                <td><code>type</code></td>
+                <td>enum</td>
+                <td>"robotic_arm" | "autonomous_vehicle" | "drone" | "industrial_sensor" | "other"</td>
+            </tr>
+            <tr>
+                <td><code>status</code></td>
+                <td>enum</td>
+                <td>"active" | "idle" | "syncing" | "offline" | "error"</td>
+            </tr>
+            <tr>
+                <td><code>last_decision_seal</code></td>
+                <td>string</td>
+                <td>SHA-256 hash of most recent sealed decision</td>
+            </tr>
+            <tr>
+                <td><code>decisions_sealed</code></td>
+                <td>integer</td>
+                <td>Lifetime count of sealed decisions for this node</td>
+            </tr>
+        </table>
+
+        <h3>Decision Event (Action Context)</h3>
+        <table>
+            <tr>
+                <th>Field</th>
+                <th>Type</th>
+                <th>Description</th>
+            </tr>
+            <tr>
+                <td><code>node_id</code></td>
+                <td>string</td>
+                <td><span class="required">Required</span>. Hardware originating the decision</td>
+            </tr>
+            <tr>
+                <td><code>task_id</code></td>
+                <td>string</td>
+                <td>Autonomous task identifier (for lineage tracking)</td>
+            </tr>
+            <tr>
+                <td><code>confidence</code></td>
+                <td>float [0..1]</td>
+                <td>Agent confidence in the action (0.0–1.0)</td>
+            </tr>
+            <tr>
+                <td><code>object_class</code></td>
+                <td>string</td>
+                <td>Semantic label of object being acted upon (e.g. "component_xyz", "person", "hazard")</td>
+            </tr>
+            <tr>
+                <td><code>context</code></td>
+                <td>object</td>
+                <td>Free-form JSON for domain-specific metadata. All fields sealed with the decision.</td>
+            </tr>
+        </table>
+
+        <h2>5. Compliance & Audit Hooks</h2>
+        <p>Every decision from an autonomous system is sealed into the same tamper-evident chain as human-originated decisions. This enables:</p>
+        <ul style="margin-left: 20px; color: rgba(255, 255, 255, 0.75);">
+            <li><strong>EU AI Act Article 9:</strong> Risk management — all autonomous actions scored deterministically</li>
+            <li><strong>Article 12:</strong> Record-keeping — sealed receipts with gapless sequence numbers</li>
+            <li><strong>Article 13:</strong> Transparency — plain-language reasons for each decision</li>
+            <li><strong>Article 14:</strong> Human oversight — autonomous decisions flagged for review if confidence below threshold</li>
+        </ul>
+
+        <h2>6. Integration Example: Robotic Arm</h2>
+        <p>Scenario: A robotic arm must decide whether to pick an object. It calls AILeash before acting.</p>
+        <pre>POST /api/v1/stream/decide
+Authorization: Bearer &lt;your_api_key&gt;
+Content-Type: application/json
+
+{
+  "node_id": "factory-arm-3",
+  "user_id": "robot_agent",
+  "action": "pick_object",
+  "amount": 0,
+  "country": "DE",
+  "device_id": "factory-arm-3-gripper",
+  "anomaly": 0.12,
+  "device_risk": 0.08,
+  "context": {
+    "task_id": "assembly_batch_447",
+    "confidence": 0.96,
+    "object_class": "component_bearing",
+    "position_xyz": [234.5, 122.3, 45.1],
+    "camera_detections": 3,
+    "safety_zone_clear": true
+  }
+}
+
+→ Response:
+{
+  "decision": "ALLOW",
+  "score": 0.18,
+  "seal": "3a7b2f9c1e4d...",
+  "block_index": 18921,
+  "receipt_seq": 4903,
+  "sealed_at": 1726067684.456
+}
+
+✓ The robotic arm now holds the sealed receipt and can log it to its own
+  task history. That receipt can be verified by anyone, forever, without
+  trusting the arm's own storage.
+        </pre>
+
+        <h2>7. Performance & Reliability</h2>
+        <ul style="margin-left: 20px; color: rgba(255, 255, 255, 0.75);">
+            <li><strong>Latency:</strong> ~28ms median decision time (includes cryptographic sealing)</li>
+            <li><strong>Throughput:</strong> 800+ decisions/sec per instance</li>
+            <li><strong>Availability:</strong> 99.95% uptime SLA (confirmed in production)</li>
+            <li><strong>Determinism:</strong> Identical inputs produce identical decisions, always. Suitable for safety-critical applications.</li>
+        </ul>
+
+        <h2>8. Support</h2>
+        <p>Questions? Email <a href="mailto:justrightdecorators@gmail.com">justrightdecorators@gmail.com</a> or check the main <a href="/developers">developers portal</a>.</p>
+    </div>
+</body>
+</html>
+```
 
 
 ## `investor-prospectus.html`
@@ -1542,200 +1901,6 @@ const toast=document.getElementById("toast");
 function say(m){ toast.textContent=m; toast.classList.add("show"); setTimeout(()=>toast.classList.remove("show"),3400); }
 document.getElementById("hudn").textContent = N.length;
 setTimeout(()=>say("Start anywhere — try THE HASH CHAIN"),900);
-</script>
-</body>
-</html>
-
-```
-
-
-## `notary.html`
-
-186 lines, 12017 bytes
-
-```html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Sovereign Profile Notary — sebbi.pro</title>
-<style>
-  :root{--ink:#0a0f1e;--ink2:#10182e;--input:#131e36;--gold:#c9a84c;--ok:#7fe3b0;--err:#ff8a80;--muted:#94a3b8;}
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{background:var(--ink);color:#f8fafc;font-family:system-ui,sans-serif;min-height:100vh;padding:26px 16px}
-  .container{max-width:1100px;margin:0 auto;display:grid;grid-template-columns:1fr 1fr;gap:28px}
-  @media(max-width:850px){.container{grid-template-columns:1fr}}
-  header{grid-column:1/-1;border-bottom:1px solid rgba(201,168,76,0.2);padding-bottom:16px}
-  .brand{font-family:monospace;font-size:10px;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,0.35)}
-  h1{font-family:Georgia,serif;font-size:28px;color:var(--gold);margin:8px 0 6px}
-  .tagline{color:var(--muted);font-size:13.5px;line-height:1.6;max-width:640px}
-  .panel{background:var(--ink2);border:1px solid rgba(201,168,76,0.25);border-radius:12px;padding:24px;display:flex;flex-direction:column;gap:14px}
-  h2{font-size:12px;font-family:monospace;text-transform:uppercase;letter-spacing:2px;color:var(--gold);border-bottom:1px dashed rgba(201,168,76,0.2);padding-bottom:8px}
-  label{display:block;font-size:10px;font-family:monospace;text-transform:uppercase;letter-spacing:2px;color:var(--muted);margin-bottom:5px}
-  input,textarea{width:100%;background:var(--input);border:1px solid rgba(201,168,76,0.3);color:#fff;border-radius:8px;padding:12px;font-size:14px;outline:none}
-  input:focus,textarea:focus{border-color:var(--gold);box-shadow:0 0 8px rgba(201,168,76,0.2)}
-  textarea{min-height:70px;resize:vertical;line-height:1.5}
-  .chk{display:flex;gap:10px;align-items:flex-start;font-size:12px;color:var(--muted);line-height:1.6}
-  .chk input{width:auto;margin-top:2px}
-  button{width:100%;background:var(--gold);color:var(--ink);border:none;border-radius:8px;padding:15px;font-size:14px;font-weight:800;cursor:pointer;text-transform:uppercase;letter-spacing:1px}
-  button:disabled{opacity:0.5}
-  /* preview card */
-  .preview{background:linear-gradient(135deg,#101c36 0%,#060b17 100%);border:2px solid var(--gold);border-radius:14px;padding:24px}
-  .p-name{font-size:22px;font-weight:800;color:#fff;font-family:Georgia,serif}
-  .p-title{font-size:13px;color:var(--gold);font-family:monospace;margin:2px 0 12px}
-  .p-bio{font-size:13.5px;line-height:1.6;color:#cbd5e1;margin-bottom:12px;min-height:20px}
-  .p-links{font-family:monospace;font-size:11px;color:var(--muted);word-break:break-all;line-height:1.9}
-  .p-hash{margin-top:14px;padding:12px;background:rgba(0,0,0,0.4);border-radius:8px;font-family:monospace;font-size:10.5px;color:var(--ok);word-break:break-all;line-height:1.7}
-  #sealres{display:none;margin-top:6px;padding:14px;border-radius:8px;background:rgba(127,227,176,0.08);border:1px solid rgba(127,227,176,0.4);font-family:monospace;font-size:11.5px;line-height:1.9;word-break:break-all}
-  #sealres b{color:var(--ok)}
-  #sealres .code{font-size:16px;color:var(--gold);font-weight:700}
-  /* checker */
-  #checkres{display:none;margin-top:6px;padding:16px;border-radius:10px;font-size:13px;line-height:1.8}
-  #checkres.good{display:block;background:rgba(127,227,176,0.08);border:2px solid var(--ok)}
-  #checkres.bad{display:block;background:rgba(255,138,128,0.08);border:2px solid var(--err)}
-  #checkres .big{font-weight:900;font-size:16px;margin-bottom:6px}
-  #checkres.good .big{color:var(--ok)}
-  #checkres.bad .big{color:var(--err)}
-  #checkres .mono{font-family:monospace;font-size:11px;color:var(--muted);word-break:break-all;line-height:1.9}
-  #trap{display:none;margin-top:12px;padding:16px;border-radius:10px;background:rgba(201,168,76,0.1);border:2px solid var(--gold);cursor:pointer}
-  #trap .t1{font-weight:900;font-size:14px;color:var(--gold);margin-bottom:6px}
-  #trap .t2{font-size:12.5px;color:#cbd5e1;line-height:1.7}
-  .note{font-size:11px;color:rgba(255,255,255,0.35);line-height:1.7}
-  a{color:var(--gold)}
-</style>
-</head>
-<body>
-<div class="container">
-  <header>
-    <div class="brand">sebbi.pro &middot; sovereign profile notary</div>
-    <h1>Seal your profile before someone clones it.</h1>
-    <div class="tagline">Fingerprint your public identity — name, bio, links — and seal it into a live, tamper-evident audit chain with an official timestamp. Put your verification code in your bio. From that moment, anyone can check in seconds whether a profile claiming to be you matches the one you sealed first.</div>
-  </header>
-
-  <!-- LEFT: builder -->
-  <div class="panel" id="builder">
-    <h2>1 &middot; Build &amp; seal your profile</h2>
-    <div><label>Full name</label><input id="nm" oninput="mirror()" placeholder="Justin Antony Dobson"></div>
-    <div><label>Title</label><input id="ttl" oninput="mirror()" placeholder="Founder, Monop Content"></div>
-    <div><label>Short bio</label><textarea id="bio" oninput="mirror()" placeholder="Building tamper-evident AI compliance from Blyth."></textarea></div>
-    <div><label>LinkedIn URL</label><input id="li" oninput="mirror()" placeholder="linkedin.com/in/yourname"></div>
-    <div><label>Other link (optional)</label><input id="fb" oninput="mirror()" placeholder="yoursite.com"></div>
-    <div class="chk"><input type="checkbox" id="pub" checked><span><b>Publish to the public registry.</b> Anyone checking your code will see these profile fields. Untick to seal privately — the checker will confirm the seal and timestamp only, and your details are never stored.</span></div>
-    <button id="go" onclick="sealProfile()">Seal this profile &mdash; free &rarr;</button>
-    <div id="sealres"></div>
-    <div class="note">Your profile is fingerprinted with SHA-256 in your own browser. Registration proves this exact profile was sealed first at this timestamp — the strongest public claim to your own words that exists on the open web.</div>
-  </div>
-
-  <!-- RIGHT: preview + checker -->
-  <div style="display:flex;flex-direction:column;gap:28px">
-    <div class="panel">
-      <h2>2 &middot; Live evidence preview</h2>
-      <div class="preview">
-        <div class="p-name" id="v-nm">Your Name</div>
-        <div class="p-title" id="v-ttl"></div>
-        <div class="p-bio" id="v-bio"></div>
-        <div class="p-links" id="v-links"></div>
-        <div class="p-hash" id="v-hash">FINGERPRINT — start typing to generate</div>
-      </div>
-    </div>
-
-    <div class="panel" id="checker">
-      <h2>3 &middot; Check a profile &middot; public scanner</h2>
-      <div><label>Paste a verification code (from a bio) or full fingerprint</label><input id="q" placeholder="e.g. 7be4d1c29a03"></div>
-      <button onclick="checkCode()">Check the chain &rarr;</button>
-      <div id="checkres"></div>
-      <div id="trap" onclick="document.getElementById('builder').scrollIntoView({behavior:'smooth'});document.getElementById('nm').focus()">
-        <div class="t1">&#9888;&#65039; This profile is unclaimed.</div>
-        <div class="t2">No seal exists for this code — which means the identity it claims is unregistered and open to AI cloning and impersonation. Sealing yours takes 60 seconds and costs nothing. <u>Tap here to claim your profile now.</u></div>
-      </div>
-    </div>
-  </div>
-</div>
-
-<script>
-async function sha256hex(s){
-  var buf=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(s));
-  return Array.from(new Uint8Array(buf)).map(function(b){return b.toString(16).padStart(2,"0");}).join("");
-}
-function fields(){
-  return {
-    name:document.getElementById("nm").value.trim(),
-    title:document.getElementById("ttl").value.trim(),
-    bio:document.getElementById("bio").value.trim(),
-    linkedin:document.getElementById("li").value.trim(),
-    facebook:document.getElementById("fb").value.trim()
-  };
-}
-function canonical(f){
-  return "profile:v1|"+f.name+"|"+f.title+"|"+f.bio+"|"+f.linkedin+"|"+f.facebook;
-}
-var mirrorTimer=null;
-function mirror(){
-  var f=fields();
-  document.getElementById("v-nm").textContent=f.name||"Your Name";
-  document.getElementById("v-ttl").textContent=f.title;
-  document.getElementById("v-bio").textContent=f.bio;
-  document.getElementById("v-links").innerHTML=[f.linkedin,f.facebook].filter(Boolean).join("<br>");
-  clearTimeout(mirrorTimer);
-  mirrorTimer=setTimeout(async function(){
-    if(!f.name){document.getElementById("v-hash").textContent="FINGERPRINT \u2014 start typing to generate";return;}
-    var h=await sha256hex(canonical(f));
-    document.getElementById("v-hash").textContent="FINGERPRINT "+h;
-  },200);
-}
-async function sealProfile(){
-  var f=fields();
-  var res=document.getElementById("sealres");
-  if(!f.name){res.style.display="block";res.innerHTML="<span style='color:var(--err)'>Enter at least your name.</span>";return;}
-  var btn=document.getElementById("go");btn.disabled=true;btn.textContent="Sealing\u2026";
-  try{
-    var fp=await sha256hex(canonical(f));
-    var body={fingerprint:fp,public:document.getElementById("pub").checked,profile:f};
-    var r=await fetch("/api/identity/seal",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
-    var d=await r.json();
-    if(!d.sealed){res.style.display="block";res.innerHTML="<span style='color:var(--err)'>"+(d.error||"Sealing failed")+"</span>";btn.disabled=false;btn.textContent="Seal this profile \u2014 free \u2192";return;}
-    var code=(d.code||fp.slice(0,12));
-    var when=new Date((d.sealed_at)*1000).toLocaleString("en-GB");
-    res.style.display="block";
-    res.innerHTML=(d.already_registered?"<b>Already sealed.</b> This exact profile was registered earlier \u2014 details below.<br>":"<b>\u2713 SEALED.</b> This exact profile is now locked in the chain.<br>")
-      +"Your verification code: <span class='code'>"+code+"</span><br>"
-      +"Registered: "+when+" \u00b7 block #"+d.block_index+"<br><br>"
-      +"<b>Put this line in your LinkedIn bio:</b><br>\u26D3 Profile sealed \u00b7 verify code "+code+" at sebbi.pro/identity";
-    btn.textContent="Sealed \u2713";
-  }catch(e){res.style.display="block";res.innerHTML="<span style='color:var(--err)'>Network error: "+e+"</span>";btn.disabled=false;btn.textContent="Seal this profile \u2014 free \u2192";}
-}
-async function checkCode(){
-  var q=document.getElementById("q").value.trim().toLowerCase().replace(/[^0-9a-f]/g,"");
-  var out=document.getElementById("checkres");
-  var trap=document.getElementById("trap");
-  trap.style.display="none";
-  if(q.length<12){out.className="bad";out.innerHTML="<div class='big'>Enter at least the 12-character code.</div>";return;}
-  out.className="";out.style.display="block";out.innerHTML="Checking the chain\u2026";
-  try{
-    var r=await fetch("/api/identity/check?code="+q);
-    var d=await r.json();
-    if(d.found){
-      var when=new Date(d.registered_at*1000).toLocaleString("en-GB");
-      var prof="";
-      if(d.profile){
-        prof="<br><b>"+(d.profile.name||"")+"</b>"+(d.profile.title?(" \u00b7 "+d.profile.title):"")
-          +(d.profile.bio?("<br>"+d.profile.bio):"")
-          +(d.profile.linkedin?("<br><span class='mono'>"+d.profile.linkedin+"</span>"):"");
-      }else{
-        prof="<br><span class='mono'>Sealed privately \u2014 the owner chose not to publish profile fields. The seal and timestamp below are the proof.</span>";
-      }
-      out.className="good";
-      out.innerHTML="<div class='big'>\u2713 SEALED &amp; ON THE CHAIN</div>"
-        +"Registered "+when+" \u00b7 block #"+d.block_index+prof
-        +"<br><span class='mono'>Fingerprint "+d.fingerprint+"</span>";
-    }else{
-      out.className="bad";
-      out.innerHTML="<div class='big'>\u2717 NO SEAL FOUND</div>No registration exists for this code. Either it was typed wrong \u2014 or the profile showing it was never sealed.";
-      trap.style.display="block";
-    }
-  }catch(e){out.className="bad";out.innerHTML="<div class='big'>Network error</div>"+e;}
-}
 </script>
 </body>
 </html>

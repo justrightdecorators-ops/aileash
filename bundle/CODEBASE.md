@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-128 files across 33 parts.
+130 files across 33 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -187,15 +187,16 @@ Generated automatically on every push. Do not edit by hand.
 
 ## [CODEBASE-27.md](CODEBASE-27.md)
 
+- `integration-docs.html`
 - `investor-prospectus.html`
 - `legal.txt`
 - `liability.txt`
 - `llms.txt`
 - `map.html`
-- `notary.html`
 
 ## [CODEBASE-28.md](CODEBASE-28.md)
 
+- `notary.html`
 - `pack.html`
 - `pay-check.html`
 - `registry.html`
@@ -219,6 +220,7 @@ Generated automatically on every push. Do not edit by hand.
 ## [CODEBASE-31.md](CODEBASE-31.md)
 
 - `sonicboom.html`
+- `telemetry-dashboard.html`
 
 ## [CODEBASE-32.md](CODEBASE-32.md)
 
