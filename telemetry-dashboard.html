@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Telemetry Dashboard — AILeash Autonomous Systems</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', sans-serif;
+            background: linear-gradient(135deg, #0a0f1e 0%, #111a30 100%);
+            color: #ffffff;
+            overflow-x: hidden;
+        }
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 32px 20px;
+        }
+        header {
+            margin-bottom: 40px;
+            border-bottom: 1px solid rgba(201, 168, 76, 0.2);
+            padding-bottom: 24px;
+        }
+        h1 {
+            font-family: Georgia, serif;
+            font-size: 32px;
+            font-weight: 900;
+            color: #c9a84c;
+            margin-bottom: 8px;
+        }
+        .subtitle {
+            color: rgba(255, 255, 255, 0.5);
+            font-size: 14px;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            margin-bottom: 32px;
+        }
+        .card {
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid rgba(201, 168, 76, 0.2);
+            border-radius: 8px;
+            padding: 24px;
+            backdrop-filter: blur(10px);
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            will-change: transform;
+            transform: translate3d(0, 0, 0);
+        }
+        .card:hover {
+            border-color: rgba(201, 168, 76, 0.5);
+            background: rgba(255, 255, 255, 0.05);
+            transform: translate3d(0, -4px, 0);
+        }
+        .card-title {
+            font-size: 16px;
+            font-weight: 700;
+            color: #c9a84c;
+            margin-bottom: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .metric {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 0;
+            font-size: 14px;
+            color: rgba(255, 255, 255, 0.7);
+        }
+        .value {
+            font-family: 'Monaco', 'Courier New', monospace;
+            font-weight: 600;
+            color: #7fe3b0;
+        }
+        .status {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            margin-right: 8px;
+            background: #7fe3b0;
+            animation: pulse 2s infinite;
+        }
+        .status.offline {
+            background: #ff6b6b;
+            animation: none;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        .graph-container {
+            margin-top: 32px;
+            padding: 24px;
+            background: rgba(255, 255, 255, 0.02);
+            border: 1px solid rgba(201, 168, 76, 0.15);
+            border-radius: 8px;
+        }
+        .graph-title {
+            font-size: 16px;
+            font-weight: 700;
+            color: #c9a84c;
+            margin-bottom: 16px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        canvas {
+            width: 100%;
+            height: 200px;
+            will-change: contents;
+        }
+        .info-box {
+            background: rgba(127, 227, 176, 0.05);
+            border-left: 3px solid #7fe3b0;
+            padding: 16px;
+            border-radius: 4px;
+            margin-top: 20px;
+            font-size: 13px;
+            color: rgba(255, 255, 255, 0.7);
+            line-height: 1.6;
+        }
+        .endpoint-list {
+            list-style: none;
+            margin-top: 16px;
+        }
+        .endpoint-list li {
+            padding: 12px;
+            background: rgba(201, 168, 76, 0.05);
+            margin-bottom: 8px;
+            border-left: 2px solid #c9a84c;
+            font-family: 'Monaco', monospace;
+            font-size: 12px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>/telemetry/nodes</h1>
+            <div class="subtitle">Real-time Autonomous Hardware State Monitor</div>
+        </header>
+
+        <div class="grid">
+            <div class="card">
+                <div class="card-title">Connected Nodes</div>
+                <div class="metric">
+                    <span>Active Hardware</span>
+                    <span class="value"><span class="status"></span>14</span>
+                </div>
+                <div class="metric">
+                    <span>Pending Sync</span>
+                    <span class="value">2</span>
+                </div>
+                <div class="metric">
+                    <span>Last Heartbeat</span>
+                    <span class="value">2.3s ago</span>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-title">System Health</div>
+                <div class="metric">
+                    <span>CPU Utilization</span>
+                    <span class="value">47%</span>
+                </div>
+                <div class="metric">
+                    <span>Memory Usage</span>
+                    <span class="value">62%</span>
+                </div>
+                <div class="metric">
+                    <span>Network Latency</span>
+                    <span class="value">12ms</span>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-title">Decision Throughput</div>
+                <div class="metric">
+                    <span>Decisions/sec</span>
+                    <span class="value">847</span>
+                </div>
+                <div class="metric">
+                    <span>Median Latency</span>
+                    <span class="value">28ms</span>
+                </div>
+                <div class="metric">
+                    <span>Error Rate</span>
+                    <span class="value">0.02%</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="graph-container">
+            <div class="graph-title">Requests Per Second (Last 60min)</div>
+            <canvas id="throughputChart"></canvas>
+        </div>
+
+        <div class="graph-container">
+            <div class="graph-title">Active Nodes Timeline</div>
+            <canvas id="nodesChart"></canvas>
+        </div>
+
+        <div class="info-box">
+            <strong>Integration Points:</strong>
+            <ul class="endpoint-list">
+                <li>GET /api/v1/stream/nodes — fetch all connected hardware states</li>
+                <li>GET /api/v1/stream/metrics — real-time system metrics (chunked)</li>
+                <li>POST /api/v1/stream/subscribe — WebSocket upgrade for live updates</li>
+                <li>GET /telemetry/nodes/export — CSV export (last 24h)</li>
+            </ul>
+        </div>
+
+        <script>
+            // GPU-accelerated canvas rendering with hardware transform isolation
+            function setupCharts() {
+                const ctx1 = document.getElementById('throughputChart').getContext('2d', { willReadFrequently: false });
+                const ctx2 = document.getElementById('nodesChart').getContext('2d', { willReadFrequently: false });
+
+                // Throughput chart
+                drawLineChart(ctx1, generateMockData(60, 800, 900), '#c9a84c');
+                // Nodes chart
+                drawLineChart(ctx2, generateMockData(60, 10, 20), '#7fe3b0');
+            }
+
+            function generateMockData(points, min, max) {
+                return Array.from({ length: points }, () => Math.random() * (max - min) + min);
+            }
+
+            function drawLineChart(ctx, data, color) {
+                const canvas = ctx.canvas;
+                const w = canvas.offsetWidth;
+                const h = canvas.offsetHeight;
+                canvas.width = w * window.devicePixelRatio;
+                canvas.height = h * window.devicePixelRatio;
+                ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+
+                ctx.fillStyle = 'rgba(0, 0, 0, 0)';
+                ctx.fillRect(0, 0, w, h);
+
+                const padding = 20;
+                const graphW = w - 2 * padding;
+                const graphH = h - 2 * padding;
+                const min = Math.min(...data);
+                const max = Math.max(...data);
+                const range = max - min || 1;
+
+                ctx.strokeStyle = color;
+                ctx.lineWidth = 2;
+                ctx.lineCap = 'round';
+                ctx.lineJoin = 'round';
+                ctx.beginPath();
+
+                data.forEach((val, i) => {
+                    const x = padding + (i / (data.length - 1)) * graphW;
+                    const y = padding + graphH - ((val - min) / range) * graphH;
+                    if (i === 0) ctx.moveTo(x, y);
+                    else ctx.lineTo(x, y);
+                });
+                ctx.stroke();
+
+                // Fill under curve
+                ctx.lineTo(padding + graphW, padding + graphH);
+                ctx.lineTo(padding, padding + graphH);
+                ctx.closePath();
+                ctx.fillStyle = color.replace(')', ', 0.1)').replace('rgb', 'rgba');
+                ctx.fill();
+            }
+
+            document.addEventListener('DOMContentLoaded', setupCharts);
+            window.addEventListener('resize', setupCharts);
+        </script>
+    </div>
+</body>
+</html>

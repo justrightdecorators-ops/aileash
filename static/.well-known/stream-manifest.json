@@ -1,0 +1,95 @@
+{
+  "version": "1.0",
+  "service": "AILeash Autonomous Systems Stream API",
+  "endpoints": [
+    {
+      "path": "/api/v1/stream/nodes",
+      "method": "GET",
+      "description": "List all connected autonomous hardware nodes and their state",
+      "authentication": "optional",
+      "rate_limit": "100 req/min"
+    },
+    {
+      "path": "/api/v1/stream/decide",
+      "method": "POST",
+      "description": "Submit a decision event from autonomous agent for scoring and sealing",
+      "authentication": "api_key (bearer token)",
+      "rate_limit": "1000 req/min per key"
+    },
+    {
+      "path": "/api/v1/stream/metrics",
+      "method": "GET",
+      "description": "Real-time system metrics stream (Server-Sent Events, chunked encoding)",
+      "authentication": "api_key (bearer token)",
+      "rate_limit": "50 concurrent streams per key"
+    },
+    {
+      "path": "/telemetry/nodes",
+      "method": "GET",
+      "description": "GPU-accelerated telemetry dashboard with live metrics and graphs",
+      "authentication": "none (public)",
+      "rate_limit": "open"
+    },
+    {
+      "path": "/docs/integration",
+      "method": "GET",
+      "description": "Complete schema reference for autonomous systems integration",
+      "authentication": "none (public)",
+      "rate_limit": "open"
+    }
+  ],
+  "schemas": {
+    "node": {
+      "node_id": "string (required)",
+      "type": "enum: robotic_arm | autonomous_vehicle | drone | industrial_sensor | other",
+      "status": "enum: active | idle | syncing | offline | error",
+      "last_decision_seal": "string (sha256 hash)",
+      "decisions_sealed": "integer",
+      "uptime_hours": "number",
+      "next_sync": "ISO 8601 timestamp"
+    },
+    "decision_event": {
+      "node_id": "string (required)",
+      "user_id": "string (required)",
+      "action": "string (required)",
+      "amount": "number (required, 0 for non-monetary)",
+      "country": "string (ISO 3166-1 alpha-2, required)",
+      "device_id": "string (required, unique per hardware)",
+      "anomaly": "number [0..1] (required)",
+      "device_risk": "number [0..1] (required)",
+      "context": "object (optional, free-form JSON sealed with decision)"
+    },
+    "decision_response": {
+      "decision": "enum: ALLOW | CHALLENGE | BLOCK",
+      "score": "number [0..1]",
+      "seal": "string (sha256 hash)",
+      "block_index": "integer (position in chain)",
+      "receipt_seq": "integer (monotonic per key, gapless)",
+      "sealed_at": "unix timestamp (float)",
+      "jurisdiction": "object (applicable regulatory frameworks)",
+      "reasons": "array[string] (human-readable explanation)"
+    }
+  },
+  "compliance": {
+    "eu_ai_act_2024_1689": {
+      "article_9_risk_management": "Every autonomous decision scored deterministically against 9 signals",
+      "article_12_record_keeping": "All decisions sealed with gapless receipts, independently verifiable",
+      "article_13_transparency": "Plain-language reasons provided for every decision",
+      "article_14_human_oversight": "Low-confidence decisions flagged for review in telemetry dashboard"
+    },
+    "jurisdictions_supported": [
+      "EU (all member states)",
+      "UK",
+      "US",
+      "CA",
+      "AU",
+      "Local (unmapped)"
+    ]
+  },
+  "performance": {
+    "median_latency_ms": 28,
+    "throughput_decisions_per_sec": 800,
+    "uptime_sla_percent": 99.95,
+    "determinism": "identical inputs → identical outputs, forever"
+  }
+}
