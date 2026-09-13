@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-130 files across 34 parts.
+129 files across 34 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -159,22 +159,21 @@ Generated automatically on every push. Do not edit by hand.
 
 - `aitxt-popup-live.html`
 - `brain.html`
-- `certificate.html`
 - `compliance-assistant.html`
+- `console.html`
+- `contact.html`
 
 ## [CODEBASE-24.md](CODEBASE-24.md)
 
-- `console.html`
-- `contact.html`
 - `copyright.txt`
 - `data-protection.html`
 - `developers.html`
 - `dis.txt`
+- `docs/evidential-undertaking.md`
+- `docs/spec/ai-txt.md`
 
 ## [CODEBASE-25.md](CODEBASE-25.md)
 
-- `docs/evidential-undertaking.md`
-- `docs/spec/ai-txt.md`
 - `green.html`
 - `guardian-parent.html`
 - `human-oversight.html`

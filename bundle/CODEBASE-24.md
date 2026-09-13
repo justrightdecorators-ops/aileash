@@ -1,553 +1,12 @@
 # Codebase — part 24 of 34
 
 Contains:
-- `console.html`
-- `contact.html`
 - `copyright.txt`
 - `data-protection.html`
 - `developers.html`
 - `dis.txt`
-
-
-## `console.html`
-
-391 lines, 17987 bytes
-
-```html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
-<meta name="robots" content="noindex,nofollow">
-<title>Console — sebbi.pro</title>
-<style>
-  :root{
-    --ink:#0a0f1e; --ink2:#10182e; --gold:#c9a84c;
-    --ok:#7fe3b0; --err:#ff8a80;
-    --line:rgba(201,168,76,0.22);
-    --mute:rgba(255,255,255,0.45);
-  }
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{background:var(--ink);color:#fff;font-family:system-ui,-apple-system,sans-serif;
-       min-height:100vh;padding:18px 16px 60px;-webkit-text-size-adjust:100%}
-  .wrap{max-width:640px;margin:0 auto}
-
-  .brand{font-family:ui-monospace,monospace;font-size:10px;letter-spacing:2.5px;
-         text-transform:uppercase;color:rgba(255,255,255,0.32)}
-  h1{font-family:Georgia,serif;font-size:25px;color:var(--gold);margin:12px 0 4px}
-  .sub{font-size:13px;color:var(--mute);line-height:1.65;margin-bottom:20px}
-
-  .keybar{background:var(--ink2);border:1px solid var(--line);border-radius:10px;
-          padding:14px;margin-bottom:18px}
-  .keybar label{display:block;font-size:11px;letter-spacing:1.2px;text-transform:uppercase;
-                color:var(--mute);margin-bottom:7px}
-  .keystate{margin-top:9px;font-family:ui-monospace,monospace;font-size:11px;color:var(--mute)}
-  .keystate b{color:var(--gold);font-weight:600}
-
-  input,select,textarea{width:100%;background:#0c1424;border:1px solid var(--line);
-    color:#fff;border-radius:7px;padding:11px 12px;font-size:15px;font-family:inherit;outline:none}
-  input:focus,select,textarea:focus{border-color:var(--gold)}
-  textarea{font-family:ui-monospace,monospace;font-size:13px;line-height:1.55;min-height:74px;resize:vertical}
-  select{appearance:none;background-image:linear-gradient(45deg,transparent 50%,var(--gold) 50%),
-         linear-gradient(135deg,var(--gold) 50%,transparent 50%);
-         background-position:calc(100% - 18px) 20px,calc(100% - 13px) 20px;
-         background-size:5px 5px,5px 5px;background-repeat:no-repeat}
-
-  section{border:1px solid var(--line);border-radius:10px;margin-bottom:14px;overflow:hidden}
-  section > h2{font-family:Georgia,serif;font-size:16px;color:var(--gold);
-    padding:14px 15px;background:var(--ink2);cursor:pointer;display:flex;
-    justify-content:space-between;align-items:center;font-weight:400}
-  section > h2 .chev{font-size:12px;color:var(--mute)}
-  .body{padding:15px;display:none;border-top:1px solid var(--line)}
-  section.open .body{display:block}
-  section.open > h2 .chev{transform:rotate(180deg)}
-
-  .op{padding:13px 0;border-bottom:1px solid rgba(255,255,255,0.06)}
-  .op:last-child{border-bottom:none;padding-bottom:0}
-  .op:first-child{padding-top:0}
-  .op .name{font-family:ui-monospace,monospace;font-size:12.5px;color:#fff;margin-bottom:3px}
-  .op .name span{color:var(--mute)}
-  .op .why{font-size:12px;color:var(--mute);line-height:1.6;margin-bottom:9px}
-  .row{display:flex;gap:8px;margin-bottom:8px}
-  .row > *{flex:1;min-width:0}
-
-  button{background:var(--gold);color:var(--ink);border:none;border-radius:7px;
-    padding:12px 14px;font-size:14px;font-weight:800;cursor:pointer;width:100%;
-    font-family:inherit;letter-spacing:0.2px}
-  button:active{opacity:0.8}
-  button:disabled{opacity:0.45}
-  button.quiet{background:transparent;color:var(--gold);border:1px solid var(--line);font-weight:600}
-  button.danger{background:transparent;color:var(--err);border:1px solid rgba(255,138,128,0.4);font-weight:600}
-
-  #out{position:sticky;bottom:0;margin-top:18px;background:#070c18;
-       border:1px solid var(--line);border-radius:10px;overflow:hidden}
-  #out .head{display:flex;justify-content:space-between;align-items:center;
-    padding:10px 13px;background:var(--ink2);font-family:ui-monospace,monospace;font-size:11px}
-  #out .code{font-weight:700;letter-spacing:1px}
-  #out .code.g{color:var(--ok)} #out .code.r{color:var(--err)} #out .code.n{color:var(--mute)}
-  #out .route{color:var(--mute);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
-    max-width:62%;text-align:right}
-  #out pre{padding:13px;font-family:ui-monospace,monospace;font-size:11.5px;line-height:1.65;
-    color:rgba(255,255,255,0.85);white-space:pre-wrap;word-break:break-word;
-    max-height:44vh;overflow:auto}
-  .foot{margin-top:22px;font-size:11.5px;color:rgba(255,255,255,0.3);line-height:1.8}
-  .foot b{color:var(--gold);font-weight:600}
-</style>
-</head>
-<body>
-<div class="wrap">
-
-  <div class="brand">sebbi.pro &middot; operator console</div>
-  <h1>Console</h1>
-  <div class="sub">Keyed routes, run from a phone. The key stays in this tab and is never written to storage — closing the tab forgets it.</div>
-
-  <div class="keybar">
-    <label for="key">API key</label>
-    <input id="key" type="password" autocomplete="off" autocapitalize="off"
-           spellcheck="false" placeholder="Paste your key" oninput="keyState()">
-    <div class="keystate" id="keystate">No key set. Every route below will answer <b>401</b>.</div>
-  </div>
-
-  <!-- ================= WALLET ================= -->
-  <section id="s-wallet" class="open">
-    <h2 onclick="toggle('s-wallet')">Wallet <span class="chev">&#9660;</span></h2>
-    <div class="body">
-
-      <div class="op">
-        <div class="name">GET status <span>· quote · devices · review</span></div>
-        <div class="why">Balance, free window, live devices and any open halt.</div>
-        <div class="row">
-          <button class="quiet" onclick="go('GET','wallet','status')">Status</button>
-          <button class="quiet" onclick="go('GET','wallet','quote')">Prices</button>
-        </div>
-        <div class="row">
-          <button class="quiet" onclick="go('GET','wallet','devices')">Devices</button>
-          <button class="quiet" onclick="go('GET','wallet','review')">Open halts</button>
-        </div>
-      </div>
-
-      <div class="op">
-        <div class="name">POST charge <span>· the gate</span></div>
-        <div class="why">Simulate spends nothing and seals nothing. Charge does both. Send the same receipt twice and the key halts on purpose.</div>
-        <input id="w-device" placeholder="device_id, e.g. test-device-01" value="test-device-01">
-        <div style="height:8px"></div>
-        <input id="w-receipt" placeholder="receipt — 64 hex" autocapitalize="off" spellcheck="false">
-        <div style="height:8px"></div>
-        <div class="row">
-          <button class="quiet" onclick="newReceipt()">New receipt</button>
-          <button class="quiet" onclick="chargeCall('simulate')">Simulate</button>
-        </div>
-        <button onclick="chargeCall('charge')">Charge</button>
-      </div>
-
-      <div class="op">
-        <div class="name">POST subscribe</div>
-        <div class="why">Puts one device on the 30-day plan and takes it off the balance. Renewing early extends the existing expiry.</div>
-        <input id="w-subdev" placeholder="device_id" value="test-device-01">
-        <div style="height:8px"></div>
-        <button onclick="go('POST','wallet','subscribe',{device_id:val('w-subdev')})">Subscribe device</button>
-      </div>
-
-      <div class="op">
-        <div class="name">POST topup <span>· after a payment clears</span></div>
-        <div class="why">1000 millipence = 1 penny, so 50p is 50000. The note is required — put the Stripe payment reference in it so the ledger reconciles.</div>
-        <div class="row">
-          <input id="w-amount" inputmode="numeric" placeholder="millipence" value="50000">
-          <input id="w-note" placeholder="Stripe ref / who authorised">
-        </div>
-        <button onclick="go('POST','wallet','topup',{millipence:num('w-amount'),note:val('w-note')})">Credit balance</button>
-      </div>
-
-      <div class="op">
-        <div class="name">GET ledger</div>
-        <div class="why">Every charge, topup and subscription, newest first.</div>
-        <div class="row">
-          <input id="w-limit" inputmode="numeric" placeholder="limit" value="25">
-          <button class="quiet" onclick="go('GET','wallet','ledger',{limit:num('w-limit')})">Show ledger</button>
-        </div>
-      </div>
-
-      <div class="op">
-        <div class="name">POST clear <span>· human decision</span></div>
-        <div class="why">Releases a halted key. Your name and the reason are sealed into the chain with it.</div>
-        <div class="row">
-          <input id="w-halt" inputmode="numeric" placeholder="halt_id">
-          <input id="w-by" placeholder="cleared_by">
-        </div>
-        <input id="w-cnote" placeholder="Why this halt is safe to clear">
-        <div style="height:8px"></div>
-        <button class="danger" onclick="go('POST','wallet','clear',{halt_id:num('w-halt'),cleared_by:val('w-by'),note:val('w-cnote')})">Clear halt</button>
-      </div>
-
-    </div>
-  </section>
-
-  <!-- ================= ANCHORING ================= -->
-  <section id="s-ots">
-    <h2 onclick="toggle('s-ots')">Anchoring <span class="chev">&#9660;</span></h2>
-    <div class="body">
-      <div class="op">
-        <div class="name">GET ots/status</div>
-        <div class="why">Proof count on disk against stamps recorded. Warns if a volume was lost.</div>
-        <button class="quiet" onclick="go('GET','ots','status')">Anchor status</button>
-      </div>
-      <div class="op">
-        <div class="name">POST ots/upgrade</div>
-        <div class="why">Fetches each pending proof again from the calendars. Anything stamped more than a few hours ago should come back confirmed with a Bitcoin block height. Until this runs, pending is all you have.</div>
-        <button onclick="go('POST','ots','upgrade',{})">Upgrade proofs</button>
-      </div>
-    </div>
-  </section>
-
-  <!-- ================= NETWORK ================= -->
-  <section id="s-net">
-    <h2 onclick="toggle('s-net')">Network <span class="chev">&#9660;</span></h2>
-    <div class="body">
-      <div class="op">
-        <div class="name">Witness exchange</div>
-        <div class="why">Peers, last sync result, and the published roster.</div>
-        <div class="row">
-          <button class="quiet" onclick="go('GET','mutual','peers')">Peers</button>
-          <button class="quiet" onclick="go('GET','mutual','status')">Sync status</button>
-        </div>
-        <button class="quiet" onclick="go('GET','roster','list')">Roster</button>
-      </div>
-      <div class="op">
-        <div class="name">POST mutual/sync</div>
-        <div class="why">Runs a cycle now instead of waiting for the hourly timer.</div>
-        <button onclick="go('POST','mutual','sync',{})">Sync now</button>
-      </div>
-    </div>
-  </section>
-
-  <!-- ================= EVIDENCE ================= -->
-  <section id="s-ev">
-    <h2 onclick="toggle('s-ev')">Evidence <span class="chev">&#9660;</span></h2>
-    <div class="body">
-      <div class="op">
-        <div class="name">POST codebase/seal</div>
-        <div class="why">Hashes the deployed source tree into one manifest root and seals it with an authorship declaration. Dated evidence of what you held and when — not proof of ownership.</div>
-        <div class="row">
-          <input id="c-author" placeholder="author">
-          <input id="c-entity" placeholder="entity">
-        </div>
-        <input id="c-stmt" placeholder="statement">
-        <div style="height:8px"></div>
-        <button onclick="go('POST','codebase','seal',{author:val('c-author'),entity:val('c-entity'),statement:val('c-stmt')})">Seal codebase</button>
-      </div>
-      <div class="op">
-        <div class="name">POST publish/seal</div>
-        <div class="why">Fetches a URL, hashes the exact bytes served, and seals it. Re-sealing builds a revision history.</div>
-        <input id="p-url" placeholder="https://sebbi.pro/..." autocapitalize="off" spellcheck="false">
-        <div style="height:8px"></div>
-        <button onclick="go('POST','publish','seal',{url:val('p-url')})">Seal page</button>
-      </div>
-      <div class="op">
-        <div class="name">Evidence pack</div>
-        <div class="why">Preview re-verifies a period without issuing. Issue seals the pack's own digest so the document cannot be edited afterwards.</div>
-        <input id="k-period" placeholder="period — 2026-Q3, 2026-08, 2026-08-23" value="2026-08">
-        <div style="height:8px"></div>
-        <div class="row">
-          <button class="quiet" onclick="go('POST','pack','preview',{period:val('k-period')})">Preview</button>
-          <button onclick="go('POST','pack','issue',{period:val('k-period')})">Issue</button>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- ================= ANY ROUTE ================= -->
-  <section id="s-raw">
-    <h2 onclick="toggle('s-raw')">Any route <span class="chev">&#9660;</span></h2>
-    <div class="body">
-      <div class="op">
-        <div class="why">Every module is reachable here without waiting for a form to be built for it. GET sends the JSON as query parameters; POST sends it as the body.</div>
-        <div class="row">
-          <select id="r-method"><option>GET</option><option>POST</option></select>
-          <input id="r-module" placeholder="module" autocapitalize="off" spellcheck="false">
-          <input id="r-action" placeholder="action" autocapitalize="off" spellcheck="false">
-        </div>
-        <textarea id="r-body" placeholder='{}' spellcheck="false">{}</textarea>
-        <div style="height:8px"></div>
-        <button onclick="raw()">Send</button>
-      </div>
-    </div>
-  </section>
-
-  <div id="out">
-    <div class="head">
-      <span class="code n" id="out-code">READY</span>
-      <span class="route" id="out-route">Nothing sent yet</span>
-    </div>
-    <pre id="out-body">Set a key, then run a route. Start with Wallet → Status.</pre>
-  </div>
-
-  <div class="foot">
-    <b>Notes.</b> The key is held in a variable in this tab only — not in localStorage, not in the URL, not in a cookie.<br>
-    A 401 means no key or the wrong key. A 404 usually means the router has not been armed since the last deploy — send anything once and try again. A 423 means the wallet has halted the key and a person needs to clear it.
-  </div>
-
-</div>
-
-<script>
-var apiKey = "";
-
-function val(id){ return document.getElementById(id).value.trim(); }
-function num(id){ var n = parseInt(val(id), 10); return isNaN(n) ? null : n; }
-
-function keyState(){
-  apiKey = document.getElementById("key").value.trim();
-  var el = document.getElementById("keystate");
-  if(!apiKey){
-    el.innerHTML = "No key set. Every route below will answer <b>401</b>.";
-  } else {
-    el.innerHTML = "Key set — <b>" + apiKey.length + "</b> characters, ending <b>"
-                 + apiKey.slice(-4) + "</b>. Held in this tab only.";
-  }
-}
-
-function toggle(id){ document.getElementById(id).classList.toggle("open"); }
-
-function newReceipt(){
-  var b = new Uint8Array(32);
-  crypto.getRandomValues(b);
-  var hex = Array.from(b).map(function(x){return x.toString(16).padStart(2,"0");}).join("");
-  document.getElementById("w-receipt").value = hex;
-  show("n", "receipt generated",
-       "A fresh 64-hex value.\n\nCharge it once and it is accepted.\nCharge the same one again and the key halts — that is the replay rule working, not a fault.");
-}
-
-function chargeCall(action){
-  var r = val("w-receipt");
-  if(!r){ newReceipt(); r = val("w-receipt"); }
-  go("POST", "wallet", action, { device_id: val("w-device"), receipt: r });
-}
-
-function show(cls, route, text){
-  document.getElementById("out-code").className = "code " + cls;
-  document.getElementById("out-code").textContent =
-    (cls === "n" ? "NOTE" : document.getElementById("out-code").textContent);
-  document.getElementById("out-route").textContent = route;
-  document.getElementById("out-body").textContent = text;
-}
-
-function raw(){
-  var body = {};
-  var txt = val("r-body");
-  if(txt){
-    try { body = JSON.parse(txt); }
-    catch(e){
-      document.getElementById("out-code").className = "code r";
-      document.getElementById("out-code").textContent = "BAD JSON";
-      document.getElementById("out-route").textContent = "not sent";
-      document.getElementById("out-body").textContent =
-        "The body is not valid JSON, so nothing was sent.\n\n" + e;
-      return;
-    }
-  }
-  go(val("r-method"), val("r-module"), val("r-action"), body);
-}
-
-async function go(method, module, action, body){
-  if(!module || !action) return;
-  keyState();
-
-  var path = "/x/" + module + "/" + action;
-  var opts = { method: method, headers: {} };
-
-  if(apiKey){
-    opts.headers["Authorization"] = "Bearer " + apiKey;
-    opts.headers["X-API-Key"] = apiKey;
-  }
-
-  if(method === "GET"){
-    var qs = [];
-    for(var k in (body || {})){
-      if(body[k] === null || body[k] === undefined || body[k] === "") continue;
-      qs.push(encodeURIComponent(k) + "=" + encodeURIComponent(body[k]));
-    }
-    if(qs.length) path += "?" + qs.join("&");
-  } else {
-    opts.headers["Content-Type"] = "application/json";
-    opts.body = JSON.stringify(body || {});
-  }
-
-  var codeEl = document.getElementById("out-code");
-  codeEl.className = "code n";
-  codeEl.textContent = "···";
-  document.getElementById("out-route").textContent = method + " " + path;
-  document.getElementById("out-body").textContent = "Sending…";
-
-  try {
-    var res = await fetch(path, opts);
-    var text = await res.text();
-    var pretty = text;
-    try { pretty = JSON.stringify(JSON.parse(text), null, 2); } catch(e){}
-
-    codeEl.className = "code " + (res.ok ? "g" : "r");
-    codeEl.textContent = res.status + (res.ok ? " OK" : "");
-    document.getElementById("out-body").textContent = pretty;
-
-    if(res.status === 404){
-      document.getElementById("out-body").textContent =
-        pretty + "\n\n— The router may not have been armed since the last deploy. Send this again.";
-    }
-  } catch(e){
-    codeEl.className = "code r";
-    codeEl.textContent = "NO REPLY";
-    document.getElementById("out-body").textContent =
-      "The request never reached the server.\n\n" + e;
-  }
-}
-
-keyState();
-</script>
-</body>
-</html>
-
-```
-
-
-## `contact.html`
-
-134 lines, 7574 bytes
-
-```html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Contact &mdash; Monop Content</title>
-<meta name="description" content="Get in touch with Monop Content about AILeash, Guardian, SonicBoom or Sentinel.">
-<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;900&family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-:root{--navy:#0a0f1e;--gold:#c9a84c;--green:#00875a;--red:#cc0000;--white:#fff;--off:#f5f7fa;--border:#e2e8f0;--muted:#64748b;--text:#1a202c;--mono:'JetBrains Mono',monospace;--sans:'DM Sans',sans-serif;--display:'Playfair Display',serif}
-html,body{background:var(--off);color:var(--text);font-family:var(--sans);min-height:100vh}
-nav{background:var(--navy);padding:0 48px;height:68px;display:flex;align-items:center;justify-content:space-between}
-.nav-logo{font-family:var(--display);font-size:22px;color:var(--white);font-weight:900;text-decoration:none}.nav-logo span{color:var(--gold)}
-.nav-back{color:rgba(255,255,255,0.5);text-decoration:none;font-size:13px;font-weight:500}
-.nav-back:hover{color:var(--white)}
-.page{max-width:600px;margin:0 auto;padding:60px 24px}
-.page-label{font-family:var(--mono);font-size:10px;letter-spacing:3px;text-transform:uppercase;color:var(--gold);margin-bottom:12px}
-h1{font-family:var(--display);font-size:clamp(32px,4vw,48px);font-weight:900;color:var(--navy);margin-bottom:12px;line-height:1.1}
-h1 em{color:var(--gold);font-style:normal}
-.page-sub{font-size:15px;color:var(--muted);line-height:1.75;margin-bottom:40px}
-.form-card{background:var(--white);border:1px solid var(--border);border-radius:8px;padding:36px}
-.fg{margin-bottom:16px}
-.fg label{display:block;font-family:var(--mono);font-size:9px;color:var(--muted);letter-spacing:2px;text-transform:uppercase;margin-bottom:6px}
-.fg input,.fg select,.fg textarea{width:100%;background:var(--off);border:2px solid var(--border);color:var(--text);padding:12px 14px;font-size:14px;font-family:var(--sans);outline:none;border-radius:4px;transition:border-color .2s}
-.fg input:focus,.fg select:focus,.fg textarea:focus{border-color:var(--navy)}
-.fg input::placeholder,.fg textarea::placeholder{color:#bbb}
-.fg textarea{resize:vertical;min-height:120px;line-height:1.6}
-.fg-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-.submit-btn{width:100%;padding:14px;font-size:15px;font-weight:700;border-radius:4px;border:none;cursor:pointer;font-family:var(--sans);background:var(--gold);color:var(--navy);margin-top:8px;transition:background .2s}
-.submit-btn:hover{background:#e8c96a}
-.submit-btn:disabled{opacity:0.5;cursor:not-allowed}
-.msg-ok{display:none;color:var(--green);font-family:var(--mono);font-size:11px;margin-top:12px;padding:12px;background:#f0fff8;border-radius:4px;border:1px solid #bbf7d0}
-.msg-ok.show{display:block}
-.msg-err{display:none;color:var(--red);font-family:var(--mono);font-size:11px;margin-top:12px;padding:12px;background:#fff0f0;border-radius:4px;border:1px solid #ffcccc}
-.msg-err.show{display:block}
-.direct{margin-top:32px;background:var(--navy);border-radius:8px;padding:28px}
-.direct-label{font-family:var(--mono);font-size:9px;color:rgba(255,255,255,0.3);letter-spacing:2px;text-transform:uppercase;margin-bottom:16px}
-.direct-item{display:flex;align-items:center;gap:12px;margin-bottom:12px}
-.direct-item:last-child{margin:0}
-.di-icon{font-size:18px;flex-shrink:0}
-.di-text{font-size:14px;color:rgba(255,255,255,0.6)}
-.di-text a{color:var(--gold);text-decoration:none}
-@media(max-width:600px){
-  nav{padding:0 20px}
-  .page{padding:40px 16px}
-  .form-card{padding:24px}
-  .fg-row{grid-template-columns:1fr}
-}
-</style>
-</head>
-<body>
-
-<nav>
-  <a href="/" class="nav-logo">Monop <span>Content</span></a>
-  <a href="/" class="nav-back">&larr; Back to Platform</a>
-</nav>
-
-<div class="page">
-  <div class="page-label">Get In Touch</div>
-  <h1>Send us a <em>message.</em></h1>
-  <p class="page-sub">Questions about AILeash, Guardian, SonicBoom or Sentinel. Partnership enquiries. Press. Anything. We reply within 24 hours.</p>
-
-  <div class="form-card">
-    <div class="fg-row">
-      <div class="fg"><label>First Name</label><input type="text" id="fn" placeholder="Jane"></div>
-      <div class="fg"><label>Last Name</label><input type="text" id="ln" placeholder="Smith"></div>
-    </div>
-    <div class="fg"><label>Email Address</label><input type="email" id="em" placeholder="you@company.com"></div>
-    <div class="fg"><label>Phone (optional)</label><input type="tel" id="ph" placeholder="+44 7700 000000"></div>
-    <div class="fg"><label>Organisation</label><input type="text" id="org" placeholder="Company or platform name"></div>
-    <div class="fg"><label>Message</label><textarea id="msg" placeholder="Tell us what you need..."></textarea></div>
-    <button class="submit-btn" id="submit-btn" onclick="doSubmit()">Send Message &rarr;</button>
-    <div class="msg-ok" id="msg-ok">Message sent. We will reply within 24 hours.</div>
-    <div class="msg-err" id="msg-err">Something went wrong. Email justin@monopcontent.com directly.</div>
-  </div>
-
-  <div class="direct">
-    <div class="direct-label">Or contact directly</div>
-    <div class="direct-item">
-      <div class="di-icon">&#9993;</div>
-      <div class="di-text"><a href="mailto:justin@monopcontent.com">justin@monopcontent.com</a></div>
-    </div>
-    <div class="direct-item">
-      <div class="di-icon">&#128222;</div>
-      <div class="di-text"><a href="tel:07908269428">07908 269428</a></div>
-    </div>
-    <div class="direct-item">
-      <div class="di-icon">&#127968;</div>
-      <div class="di-text" style="color:rgba(255,255,255,0.4)">Monop Content &middot; Blyth, Northumberland, UK</div>
-    </div>
-  </div>
-</div>
-
-<script>
-async function doSubmit(){
-  var fn=document.getElementById('fn').value.trim();
-  var ln=document.getElementById('ln').value.trim();
-  var em=document.getElementById('em').value.trim();
-  var ph=document.getElementById('ph').value.trim();
-  var org=document.getElementById('org').value.trim();
-  var msg=document.getElementById('msg').value.trim();
-  var ok=document.getElementById('msg-ok');
-  var err=document.getElementById('msg-err');
-  var btn=document.getElementById('submit-btn');
-  ok.classList.remove('show');err.classList.remove('show');
-  if(!em||!em.includes('@')){err.textContent='Please enter a valid email address.';err.classList.add('show');return;}
-  if(!msg){err.textContent='Please enter a message.';err.classList.add('show');return;}
-  btn.disabled=true;btn.textContent='Sending...';
-  try{
-    var r=await fetch('/contact',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({name:fn+' '+ln,email:em,phone:ph,org:org,message:msg})});
-    var d=await r.json();
-    if(d.ok){
-      ok.classList.add('show');
-      btn.textContent='Sent';
-      document.getElementById('fn').value='';
-      document.getElementById('ln').value='';
-      document.getElementById('em').value='';
-      document.getElementById('ph').value='';
-      document.getElementById('org').value='';
-      document.getElementById('msg').value='';
-    }else{
-      err.textContent=d.error||'Something went wrong. Email justin@monopcontent.com directly.';
-      err.classList.add('show');btn.disabled=false;btn.textContent='Send Message \u2192';
-    }
-  }catch(e){
-    err.classList.add('show');btn.disabled=false;btn.textContent='Send Message \u2192';
-  }
-}
-</script>
-</body>
-</html>
-
-```
+- `docs/evidential-undertaking.md`
+- `docs/spec/ai-txt.md`
 
 
 ## `copyright.txt`
@@ -1514,5 +973,313 @@ This file and its contents are protected under the Copyright, Designs and Patent
 © 2026 Justin Antony Dobson / Monop Content
 Blyth, Northumberland, United Kingdom
 All rights reserved.
+
+```
+
+
+## `docs/evidential-undertaking.md`
+
+259 lines, 12052 bytes
+
+```markdown
+# Evidential Undertaking
+
+**AILeash — operated by Monop Content**
+**Version 1.0 · 9 August 2026 · England & Wales**
+
+Sealed into the AILeash chain on publication. The block index and receipt hash
+for this document are printed at the foot and can be verified by anyone,
+without an account and without our assistance.
+
+---
+
+## 1. Why this document exists
+
+A hash chain is a technical artifact. It becomes evidence when someone is
+willing to be held to what it says, in a forum where being wrong has
+consequences.
+
+Everything AILeash publishes about itself is currently a description. This
+document converts the descriptions into undertakings: statements the operator
+is bound by, capable of being breached, and fixed at a point in time that the
+operator cannot move afterwards.
+
+Nothing here asks anyone to trust us. It sets out what we are on the hook for,
+what we are not, and how a third party checks both without our involvement.
+
+---
+
+## 2. What the chain proves
+
+Precisely three things, and it is worth being exact because the market is not.
+
+**Order.** Every sealed record carries the digest of the record before it. The
+sequence in which events were committed is fixed and cannot be reordered
+afterwards without breaking every subsequent link. Where a human decision was
+committed before a machine verdict was revealed, the chain fixes that order
+permanently.
+
+**Integrity.** Any alteration to a sealed record changes its digest, which
+breaks the chain from that point forward. Alteration is not prevented. It is
+made evident.
+
+**Completeness of what was sealed.** At the close of each period, every leaf
+sealed in that period is sorted, a Merkle root is built over the sorted list,
+and the root and the exact leaf count are committed and anchored. An export
+from that period claiming a different total contradicts a number fixed before
+anyone asked for it. Because the list is sorted, the absence of a record can be
+proved by producing the two leaves it would have sorted between and
+demonstrating that their indices are consecutive.
+
+---
+
+## 3. What the chain does not prove
+
+Stated first-person, because a limitation buried in an appendix is a
+limitation designed not to be read.
+
+- **Not the truth of the contents.** A sealed record is a faithful record of
+  what was submitted. If what was submitted was false, the chain preserves a
+  false statement accurately.
+- **Not anything about records that were never sealed.** A decision that never
+  reached the chain is outside everything above. What changes is that the
+  operator can no longer choose which of the sealed records to disclose.
+- **Not the identity of the person behind an action** beyond the credential
+  used. The chain evidences that a key acted, not who held it.
+- **Not that the log existed when it says it did**, on the strength of the
+  chain alone. Append-only structure is compatible with a log constructed
+  yesterday. That is what external anchoring is for, and section 5 addresses
+  the limits of ours.
+
+---
+
+## 4. Legal basis relied on
+
+*The operator is not a law firm and this section is not legal advice. It sets
+out the provisions relied on so that a party's own solicitor can test them.*
+
+**Admissibility in civil proceedings.** The general rule against hearsay was
+abolished in civil proceedings by section 1 of the Civil Evidence Act 1995.
+Records forming part of a business's records may be proved by a certificate
+under section 9 of that Act. The certificate at section 7 below is drafted for
+that purpose.
+
+**Machine-produced representations.** The statutory scheme formerly in section
+69 of the Police and Criminal Evidence Act 1984 was repealed in 1999. In
+criminal proceedings, section 129 of the Criminal Justice Act 2003 governs
+representations made otherwise than by a person, and the common law presumption
+that a mechanical instrument was working properly applies unless displaced.
+Records of this kind are stronger where the mechanism's operation can be
+independently reproduced, which is the purpose of the published verification
+rules.
+
+**Timestamps.** Under Article 41 of Regulation (EU) 910/2014 as retained in UK
+law, a *qualified* electronic time stamp enjoys a presumption of the accuracy
+of the date and time it indicates and of the integrity of the data it is
+attached to. A non-qualified timestamp is not deprived of legal effect or
+admissibility, but carries no presumption and must be proved.
+
+**Accountability.** Article 5(2) UK GDPR requires a controller to be able to
+demonstrate compliance. Evidence of the order in which a decision was reviewed
+speaks directly to Article 22(3) where meaningful human review is relied on.
+
+**Adoption by a witness.** No document produced by a system speaks for itself.
+The certificate below is drafted to be adopted by a named individual with a
+statement of truth under CPR Part 22, and, in the Business and Property Courts,
+subject to Practice Direction 57AC for trial witness statements.
+
+---
+
+## 5. Anchoring: the current position, stated plainly
+
+The chain tip is submitted to OpenTimestamps and upgraded to a Bitcoin
+attestation once confirmed. This is a genuinely independent authority the
+operator cannot influence, and it is technically robust.
+
+It is **not** a qualified electronic time stamp within the meaning of Article
+41. It therefore carries no statutory presumption, and a party relying on it in
+proceedings would have to prove the timing rather than assert it.
+
+The operator undertakes to add a qualified electronic time stamp from a
+qualified trust service provider, in parallel with and not in place of the
+existing anchor, and to publish the provider's identity. Until that is live,
+this section is the disclosure of the gap rather than an account of a solved
+problem.
+
+Two anchors answer two different questions. The qualified timestamp gives legal
+presumption. The Bitcoin anchor gives an authority that no trust service
+provider, regulator, or government can retrospectively instruct. A party that
+needs both should have both.
+
+---
+
+## 6. The undertakings
+
+Each is tied to an endpoint that any person may call without an account and
+without notifying us. A published check that cannot be run by a stranger is
+marketing, and is marked as such in our discovery document rather than counted.
+
+1. **We will not withdraw a published check silently.** The discovery document
+   at `/.well-known/ordering-test.json` is sealed on every material change, and
+   the history is retrievable. A check that becomes unsupported will say so.
+
+2. **We will not mark a check publicly demonstrable unless a stranger can
+   demonstrate it.** Where a capability exists but requires a key, it is
+   published as supported and not publicly demonstrable. We accept that this
+   lowers our own score.
+
+3. **We will commit each closed period.** Commitment is automatic and
+   deployment-wide. Where a period was committed late, the delay in days is
+   published against that period rather than smoothed over.
+
+4. **We will not recommit a period.** A period is committed once. A second
+   attempt returns the existing commitment.
+
+5. **We will publish gaps.** A period that was never committed is visible as an
+   absence in the period list. We will not backfill silently to close a gap
+   that an auditor has already seen.
+
+6. **We will answer an absence request against a fixed root.** Any person may
+   ask whether a key was sealed in a committed period and receive a proof that
+   verifies against a root committed before the question was asked.
+
+7. **We will not require our own tooling for verification.** The hashing rules
+   are published at `/x/complete/spec` in sufficient detail to write an
+   independent verifier. A proof that can only be checked with the prover's
+   tool is not a proof.
+
+**Consequence of breach.** Where a party has entered into a written agreement
+with the operator, breach of any undertaking in this section is a breach of
+that agreement, and the party may terminate for material breach and require
+delivery of the full sealed record for every period in scope. Where no such
+agreement exists, this document stands as a public representation as to the
+operation of the service, on which reliance is intended and foreseeable.
+
+---
+
+## 7. Certificate of evidence
+
+*Template. To be completed and adopted by a named individual. The system
+produces the values; only a person can adopt them.*
+
+> **Certificate as to records produced by the AILeash chain**
+>
+> I, [full name], of [address], [position] at [entity], state as follows.
+>
+> 1. I am authorised to make this certificate on behalf of [entity]. The facts
+>    stated are within my own knowledge or drawn from records held by [entity]
+>    in the course of its business, and are true.
+>
+> 2. The records exhibited at [exhibit reference] were produced from the
+>    AILeash chain operated at [domain] and comprise [number] sealed records
+>    covering the period [start] to [end].
+>
+> 3. The period [period] was committed on [commit date], being [n] days after
+>    the period closed. The committed Merkle root is [root] and the sealed leaf
+>    count is [count]. That commitment is recorded in the chain at block index
+>    [index] with receipt hash [hash].
+>
+> 4. The chain tip covering that commitment was submitted to [anchor
+>    authority] on [date] and the attestation status at the date of this
+>    certificate is [status].
+>
+> 5. The number of records exhibited is [number], which [accords with / differs
+>    from] the sealed leaf count. [Where it differs, explain.]
+>
+> 6. The verification rules applied are those published at [domain]/x/complete/spec
+>    as at [date]. I am not aware of any matter affecting the reliability of the
+>    records, or of any respect in which the system was not operating properly
+>    during the period covered.
+>
+> **Statement of truth**
+> I believe that the facts stated in this certificate are true. I understand
+> that proceedings for contempt of court may be brought against anyone who
+> makes, or causes to be made, a false statement in a document verified by a
+> statement of truth without an honest belief in its truth.
+>
+> Signed: ......................  Date: ......................
+
+Paragraph 5 is the paragraph that matters, and it is deliberately the hardest
+one to complete dishonestly. A person signing a statement of truth must
+reconcile the number of records they are handing over against a number that was
+sealed and anchored before anybody asked for them.
+
+---
+
+## 8. This document is itself sealed
+
+The undertakings above are committed to the chain they describe. The terms the
+operator is bound by are therefore fixed at a point in time and cannot be
+quietly revised. A future version will be sealed as a new record; the earlier
+version remains retrievable and its receipt remains valid.
+
+Any party may verify that the version they were shown is the version that was
+sealed, by comparing the digest of the document they hold against the sealed
+record.
+
+    Document version   1.0
+    Sealed at          [block index]
+    Receipt hash       [hash]
+    Document digest    [sha256 of this file, UTF-8, as published]
+    Anchored           [anchor status at publication]
+
+---
+
+## 9. Standing limits
+
+- This is one operator's undertaking about one operator's system. It is not a
+  cross-vendor standard and does not claim to be. Where a joint conformance
+  test is agreed with another operator, it will be published separately and
+  identified as joint.
+- The qualified timestamp described at section 5 is not yet live. Until it is,
+  timing must be proved rather than presumed.
+- Nothing in this document is legal advice, and a party intending to rely on
+  these records in proceedings should take its own advice on admissibility in
+  the relevant jurisdiction and forum.
+- The operator is a single-person business. Continuity of the service is
+  addressed in the applicable agreement, not here. A party whose evidential
+  position depends on this chain should hold its own copy of every receipt it
+  may need, and is entitled to export them at any time.
+
+```
+
+
+## `docs/spec/ai-txt.md`
+
+33 lines, 1687 bytes
+
+```markdown
+# ai.txt — Verifiable AI Governance Manifest
+**Version 1.0 · Reference implementation: sebbi.pro**
+
+## The problem
+Every machine-readable file on the web is an assertion. `robots.txt` asks crawlers to behave; `security.txt` claims a contact; `sitemap.xml` claims a structure. None can be checked.
+
+AI systems now describe companies to the public and are increasingly liable when they get it wrong. They cannot tell a true claim from a false one — so they guess.
+
+## The legal backdrop
+The EU AI Act requires automatic record-keeping (Art. 12), transparency (Art. 13), and human oversight (Art. 14). The UK Online Safety Act imposes duties around automated systems. These laws require records that demonstrate what an automated system decided and why. Ordinary logs are alterable and therefore weak evidence.
+
+## The proposal
+An `ai.txt` manifest that **proves itself** — published at `/.well-known/ai.txt`, declaring governance state and carrying a cryptographic chain anchor any client can verify in one request.
+
+- Without a verifiable anchor: a **claim**.
+- With one: **evidence**.
+
+## Discovery
+- `GET /.well-known/ai.txt` — text
+- `GET /.well-known/ai-manifest.json` — JSON
+- Header: `X-AI-Manifest: https://example.com/.well-known/ai.txt`
+
+## Verification
+    GET https://sebbi.pro/verify?domain=example.com
+
+Returns verdict: `VERIFIED`, `UNVERIFIED`, `CHAIN_BROKEN`, or `NO_MANIFEST`.
+
+## For AI systems
+If you describe a company, you carry the risk of describing it wrongly. This gives you a checkable answer instead of a guess. Reading it costs one request.
+
+## Licence
+Published openly. Anyone may implement it, including competitors. The format belongs to the web.
 
 ```
