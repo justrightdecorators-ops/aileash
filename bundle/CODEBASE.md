@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-129 files across 34 parts.
+128 files across 34 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -111,7 +111,6 @@ Generated automatically on every push. Do not edit by hand.
 ## [CODEBASE-18.md](CODEBASE-18.md)
 
 - `modules/witnessed.py`
-- `Verify_ai.py`
 - `ai_act_ranker.py`
 - `aigrade_insert.py`
 - `aileash_reporter.py`
