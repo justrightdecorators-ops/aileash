@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-129 files across 34 parts.
+130 files across 34 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -38,18 +38,19 @@ Generated automatically on every push. Do not edit by hand.
 - `modules/dsr.py`
 - `modules/fingerprint.py`
 - `modules/heartbeat.py`
-- `modules/lineage.py`
 
 ## [CODEBASE-07.md](CODEBASE-07.md)
 
+- `modules/investor.py`
+- `modules/lineage.py`
 - `modules/map.py`
 - `modules/mutual.py`
 - `modules/network.py`
-- `modules/ots.py`
-- `modules/oversight.py`
 
 ## [CODEBASE-08.md](CODEBASE-08.md)
 
+- `modules/ots.py`
+- `modules/oversight.py`
 - `modules/pack.py`
 - `modules/packconsole.py`
 
