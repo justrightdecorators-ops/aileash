@@ -1,11 +1,891 @@
 # Codebase — part 7 of 34
 
 Contains:
+- `modules/heartbeat.py`
 - `modules/investor.py`
 - `modules/lineage.py`
 - `modules/map.py`
 - `modules/mutual.py`
-- `modules/network.py`
+
+
+## `modules/heartbeat.py`
+
+872 lines, 31733 bytes
+
+```python
+"""
+heartbeat.py - the two-sided clock.
+
+WHAT PROBLEM THIS SOLVES
+------------------------
+Every timestamp in this system is a number the operator wrote. External
+anchoring (OpenTimestamps) and peer witnessing both prove a record existed
+BEFORE some later public event. They are ceilings.
+
+Nothing proved a floor. Nothing stopped a record being created EARLIER than
+it claims, or a whole chain being pre-computed in advance and released
+slowly to look live. That is the fraud that actually happens: the grant
+written after the incident, the decision dated last Tuesday.
+
+A clock cannot fix this. Anyone can write down what a clock will say at
+14:32:07 tomorrow, so hashing a clock face adds a hash, not a time.
+
+WHAT DOES FIX IT
+----------------
+A public beacon: a source that ticks on a fixed cadence like a clock, but
+whose value at each tick cannot be known by anyone until the tick happens.
+drand (League of Entropy) publishes one every 30 seconds. Bitcoin publishes
+one roughly every ten minutes.
+
+Fold that value into a sealed block and the block cannot have been created
+before the tick existed. Not because we say so - because it contains a
+number that did not exist yet.
+
+THE INTERLEAVE, WHICH IS THE WHOLE TRICK
+----------------------------------------
+We do NOT stamp every decision. We seal one beat into the chain every few
+minutes. The chain is append-only and prev-hash linked, so any record
+sitting between beat A and beat B was necessarily created after A and
+before B.
+
+One beat therefore gives a floor to every record that follows it, and the
+next beat gives all of them a ceiling. Every decision gets a two-sided
+window for free, with no change to seal(), no change to server.py, and no
+extra latency on the decision path.
+
+The window width is published on every answer. It is a live public
+measurement of how much room the operator would have to lie in. It is the
+only number in this system that gets better by us doing more work, and
+worse by us doing less, which is why it is published.
+
+WHAT THIS DOES NOT DO
+---------------------
+- It does not prove the record is true. It proves when it can have been made.
+- It does not verify drand's BLS signature (not feasible in pure stdlib).
+  It records the round and the randomness verbatim, and anyone can re-fetch
+  that round from drand and confirm the value matches. Deterministic,
+  public, and does not involve us.
+- A record inside an open window (after the last beat, before the next) has
+  a floor and no ceiling yet. That is reported as open, never as closed.
+- Beats can only be sealed by whoever runs this server. What stops the
+  operator sealing a stale tick is that the tick is timestamped and public:
+  sealing round N long after round N happened widens the window and shows.
+
+Contract: handle(method, action, data, api_key, ctx) -> (dict, status)
+Routes:
+  GET  spec        public   what this is, how to verify it yourself
+  GET  latest      public   the most recent beat sealed
+  GET  ticks       public   recent beats
+  GET  window      public   ?block= or ?receipt= - the two-sided window
+  GET  verify      public   ?round= - what we sealed, and where to check it
+  GET  status      public   cadence, coverage, mean window
+  POST beat        keyed    fetch a tick now and seal it
+  POST source      keyed    add a beacon reading fetched elsewhere (air-gap)
+"""
+
+import json
+import time
+import sqlite3
+import threading
+import urllib.request
+import urllib.error
+
+VERSION = "1.3.0"
+
+PUBLIC = {
+    ("GET", "spec"),
+    ("GET", "latest"),
+    ("GET", "ticks"),
+    ("GET", "window"),
+    ("GET", "verify"),
+    ("GET", "status"),
+}
+
+# ---------------------------------------------------------------------
+# Beacon sources. Fixed hosts only - this is an allowlist, not a fetcher.
+# ---------------------------------------------------------------------
+# Each source: name, url, cadence in seconds, and a parser returning
+# (round, value, source_time_or_None).
+
+BEACON_HOSTS = {
+    "api.drand.sh",
+    "drand.cloudflare.com",
+    "mempool.space",
+}
+
+FETCH_TIMEOUT = 8
+MAX_BODY = 65536
+
+BEAT_SECONDS = 300          # one beat every five minutes
+AUTO_BEAT = True
+MIN_BEAT_GAP = 60           # refuse to beat more often than this
+
+_timer_lock = threading.Lock()
+_timer_started = False
+_beat_runs = 0
+_beat_last = None
+_beat_last_error = None
+
+
+def _parse_drand(raw):
+    d = json.loads(raw)
+    rnd = int(d["round"])
+    val = str(d["randomness"])
+    if not val or len(val) < 32:
+        raise ValueError("drand randomness missing or too short")
+    return rnd, val, None
+
+
+def _parse_btc_tip(raw):
+    val = raw.strip()
+    if len(val) != 64 or any(c not in "0123456789abcdefABCDEF" for c in val):
+        raise ValueError("bitcoin tip hash not a 64-char hex string")
+    return None, val.lower(), None
+
+
+SOURCES = [
+    {
+        "name": "drand-quicknet",
+        "url": "https://api.drand.sh/v2/beacons/quicknet/rounds/latest",
+        "cadence_seconds": 3,
+        "parse": _parse_drand,
+        "verify_url": "https://api.drand.sh/v2/beacons/quicknet/rounds/{round}",
+        "note": "League of Entropy public randomness beacon, quicknet chain",
+    },
+    {
+        "name": "drand-default",
+        "url": "https://api.drand.sh/public/latest",
+        "cadence_seconds": 30,
+        "parse": _parse_drand,
+        "verify_url": "https://api.drand.sh/public/{round}",
+        "note": "League of Entropy public randomness beacon, default chain",
+    },
+    {
+        "name": "bitcoin-tip",
+        "url": "https://mempool.space/api/blocks/tip/hash",
+        "cadence_seconds": 600,
+        "parse": _parse_btc_tip,
+        "verify_url": "https://mempool.space/block/{value}",
+        "note": "Bitcoin chain tip - slower, but the hardest to influence",
+    },
+]
+
+VOCABULARY = {
+    "floor": (
+        "The record was created after this beat, because the chain is "
+        "append-only and the record sits after a block containing a value "
+        "that did not exist before the beat."
+    ),
+    "ceiling": (
+        "The record was created before this beat, because the record sits "
+        "before it in an append-only chain."
+    ),
+    "window": (
+        "The span between floor and ceiling. The record can have been "
+        "created at any moment inside it and no moment outside it. Smaller "
+        "is stronger. This is a measurement, not a claim."
+    ),
+    "open": (
+        "There is a floor but no ceiling yet: the next beat has not been "
+        "sealed. Reported as open rather than closed. It closes on the "
+        "next beat, and nothing about the record changes when it does."
+    ),
+    "unfloored": (
+        "The record predates the first beat ever sealed. It has no floor "
+        "from this module. Its ceiling still holds."
+    ),
+}
+
+WHAT_THIS_PROVES = (
+    "A window, not a truth. Inside the window the record could have been "
+    "created at any instant. Outside it, it could not have been created at "
+    "all. It says nothing about whether the record's contents are correct."
+)
+
+DDL = [
+    """CREATE TABLE IF NOT EXISTS heartbeat_tick (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        source       TEXT NOT NULL,
+        beacon_round INTEGER,
+        value        TEXT NOT NULL,
+        fetched_at   REAL NOT NULL,
+        cadence      INTEGER,
+        chain_rowid  INTEGER,
+        audit_hash   TEXT,
+        note         TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_hb_rowid ON heartbeat_tick(chain_rowid)",
+    "CREATE INDEX IF NOT EXISTS idx_hb_round ON heartbeat_tick(source, beacon_round)",
+]
+
+
+# ---------------------------------------------------------------------
+# plumbing
+# ---------------------------------------------------------------------
+
+def _ensure(conn, lock):
+    with lock:
+        cur = conn.cursor()
+        for stmt in DDL:
+            cur.execute(stmt)
+        # diagnostic columns, added without breaking an existing table
+        cur.execute("PRAGMA table_info(heartbeat_tick)")
+        have = [r[1] for r in cur.fetchall()]
+        for col in ("seal_shape", "seal_error"):
+            if col not in have:
+                try:
+                    cur.execute("ALTER TABLE heartbeat_tick ADD COLUMN %s TEXT" % col)
+                except Exception:
+                    pass
+        conn.commit()
+
+
+def _host_of(url):
+    try:
+        rest = url.split("://", 1)[1]
+    except IndexError:
+        return ""
+    return rest.split("/", 1)[0].split(":", 1)[0].lower()
+
+
+def _fetch(url):
+    if not url.startswith("https://"):
+        raise ValueError("https only")
+    host = _host_of(url)
+    if host not in BEACON_HOSTS:
+        raise ValueError("host not on the beacon allowlist: %s" % host)
+    req = urllib.request.Request(url, headers={"User-Agent": "aileash-heartbeat/1.0"})
+    with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT) as r:
+        return r.read(MAX_BODY).decode("utf-8", "replace")
+
+
+def _read_tick(fetcher=None):
+    """Try each source in order. Returns dict or raises."""
+    fetcher = fetcher or _fetch
+    errors = []
+    for src in SOURCES:
+        try:
+            raw = fetcher(src["url"])
+            rnd, val, _ = src["parse"](raw)
+            return {
+                "source": src["name"],
+                "beacon_round": rnd,
+                "value": val,
+                "cadence": src["cadence_seconds"],
+                "note": src["note"],
+            }
+        except Exception as e:
+            errors.append("%s: %s" % (src["name"], e))
+    raise RuntimeError("no beacon reachable | " + " | ".join(errors))
+
+
+def _seal(ctx, action, payload):
+    """Seal through the host's seal().
+
+    Confirmed from server.py: seal(event, result, ts, api_key=None) where
+    EVENT IS A DICT carrying user_id (it is subscripted inside), and the
+    return is (audit_hash, block_index, key_seq). So the block position
+    comes back directly and does not have to be guessed from MAX(rowid).
+
+    Returns (ok, shape, error, audit_hash, block_index).
+    """
+    fn = ctx.get("seal")
+    if fn is None:
+        return False, None, "ctx has no seal function", None, None
+
+    ts = time.time()
+    event = {
+        "user_id": "heartbeat",
+        "action": action,
+        "amount": 0,
+        "country": "UK",
+        "device_id": "heartbeat",
+        "anomaly": 0,
+        "device_risk": 0,
+    }
+    result = dict(payload)
+    result.setdefault("decision", "BEACON_SEALED")
+    result.setdefault("score", 0)
+    result.setdefault("version", VERSION)
+    result.setdefault("timestamp", ts)
+
+    attempts = [
+        ("seal(event_dict, result, ts)", lambda: fn(event, result, ts)),
+        ("seal(event_dict, result, ts, None)", lambda: fn(event, result, ts, None)),
+        ("seal(event_dict, result)", lambda: fn(event, result)),
+    ]
+
+    errors = []
+    for shape, call in attempts:
+        try:
+            out = call()
+        except Exception as e:
+            errors.append("%s -> %s: %s" % (shape, type(e).__name__, e))
+            continue
+        h = idx = None
+        if isinstance(out, (tuple, list)):
+            for item in out:
+                if isinstance(item, str) and len(item) == 64 and h is None:
+                    h = item
+                elif isinstance(item, int) and idx is None:
+                    idx = item
+        elif isinstance(out, str):
+            h = out
+        return True, shape, None, h, idx
+    return False, None, " | ".join(errors), None, None
+
+
+def _audit_table(conn):
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='audit_log'")
+    return cur.fetchone() is not None
+
+
+def _cols(conn, table):
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(%s)" % table)
+    return [r[1] for r in cur.fetchall()]
+
+
+def _hash_col(conn):
+    c = _cols(conn, "audit_log")
+    for name in ("audit_hash", "hash", "block_hash"):
+        if name in c:
+            return name
+    return None
+
+
+def _latest_rowid(conn):
+    cur = conn.cursor()
+    cur.execute("SELECT MAX(rowid) FROM audit_log")
+    row = cur.fetchone()
+    return row[0] if row and row[0] is not None else 0
+
+
+def _backfill(conn, lock, tick_id):
+    """After a seal, learn which chain row it landed on."""
+    hcol = _hash_col(conn)
+    with lock:
+        cur = conn.cursor()
+        cur.execute("SELECT MAX(rowid) FROM audit_log")
+        row = cur.fetchone()
+        rid = row[0] if row and row[0] is not None else None
+        h = None
+        if rid is not None and hcol:
+            cur.execute("SELECT %s FROM audit_log WHERE rowid=?" % hcol, (rid,))
+            r2 = cur.fetchone()
+            h = r2[0] if r2 else None
+        cur.execute(
+            "UPDATE heartbeat_tick SET chain_rowid=?, audit_hash=? WHERE id=?",
+            (rid, h, tick_id),
+        )
+        conn.commit()
+    return rid, h
+
+
+# ---------------------------------------------------------------------
+# the beat
+# ---------------------------------------------------------------------
+
+def _do_beat(ctx, fetcher=None, forced=False):
+    global _beat_runs, _beat_last, _beat_last_error
+    conn, lock = ctx["conn"], ctx["lock"]
+    _ensure(conn, lock)
+
+    with lock:
+        cur = conn.cursor()
+        cur.execute("SELECT fetched_at FROM heartbeat_tick ORDER BY id DESC LIMIT 1")
+        row = cur.fetchone()
+    if row and not forced and (time.time() - row[0]) < MIN_BEAT_GAP:
+        return {"beat": False, "reason": "too_soon", "min_gap_seconds": MIN_BEAT_GAP}, 429
+
+    tick = _read_tick(fetcher)
+    now = time.time()
+
+    event = "heartbeat_beat"
+    result = {
+        "kind": "beacon_tick",
+        "source": tick["source"],
+        "round": tick["beacon_round"],
+        "value": tick["value"],
+        "cadence_seconds": tick["cadence"],
+        "fetched_at": now,
+        "note": (
+            "Unpredictable public value. Any block after this one in this "
+            "append-only chain was created after this tick existed."
+        ),
+    }
+
+    with lock:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO heartbeat_tick (source, beacon_round, value, fetched_at,"
+            " cadence, note) VALUES (?,?,?,?,?,?)",
+            (tick["source"], tick["beacon_round"], tick["value"], now,
+             tick["cadence"], tick["note"]),
+        )
+        tick_id = cur.lastrowid
+        conn.commit()
+
+    ok, shape, err, h, rid = _seal(ctx, event, result)
+    if ok and (rid is None or h is None):
+        try:
+            rid2, h2 = _backfill(conn, lock, tick_id)
+            rid = rid if rid is not None else rid2
+            h = h if h is not None else h2
+        except Exception:
+            pass
+    with lock:
+        conn.execute("UPDATE heartbeat_tick SET seal_shape=?, seal_error=?,"
+                     " chain_rowid=?, audit_hash=? WHERE id=?",
+                     (shape, err, rid, h, tick_id))
+        conn.commit()
+
+    _beat_runs += 1
+    _beat_last = now
+    _beat_last_error = err
+
+    return {
+        "beat": True,
+        "sealed_into_chain": bool(ok and rid),
+        "seal_shape": shape,
+        "seal_error": err,
+        "tick_id": tick_id,
+        "source": tick["source"],
+        "round": tick["beacon_round"],
+        "value": tick["value"],
+        "cadence_seconds": tick["cadence"],
+        "sealed_at_chain_rowid": rid,
+        "audit_hash": h,
+        "verify_yourself": _verify_url(tick["source"], tick["beacon_round"], tick["value"]),
+    }, 200
+
+
+def _verify_url(source, rnd, value):
+    for s in SOURCES:
+        if s["name"] == source:
+            u = s["verify_url"]
+            if rnd is not None:
+                return u.replace("{round}", str(rnd)).replace("{value}", str(value))
+            return u.replace("{value}", str(value))
+    return None
+
+
+def _start_timer(ctx):
+    global _timer_started
+    with _timer_lock:
+        if _timer_started or not AUTO_BEAT:
+            return
+        _timer_started = True
+
+    for t in threading.enumerate():
+        if t.name == "heartbeat" and t.is_alive():
+            return
+
+    def loop():
+        global _beat_last_error
+        while True:
+            try:
+                _do_beat(ctx)
+            except Exception as e:
+                _beat_last_error = str(e)
+            time.sleep(BEAT_SECONDS)
+
+    t = threading.Thread(target=loop, name="heartbeat", daemon=True)
+    t.start()
+
+
+# ---------------------------------------------------------------------
+# the window
+# ---------------------------------------------------------------------
+
+def _find_rowid(conn, block, receipt):
+    if block is not None:
+        try:
+            return int(block)
+        except (TypeError, ValueError):
+            return None
+    if receipt:
+        hcol = _hash_col(conn)
+        if not hcol:
+            return None
+        cur = conn.cursor()
+        cur.execute("SELECT rowid FROM audit_log WHERE %s=? LIMIT 1" % hcol, (receipt,))
+        r = cur.fetchone()
+        return r[0] if r else None
+    return None
+
+
+def _window_for(conn, rowid):
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, source, beacon_round, value, fetched_at, chain_rowid, audit_hash"
+        " FROM heartbeat_tick WHERE chain_rowid IS NOT NULL AND chain_rowid<=?"
+        " ORDER BY chain_rowid DESC LIMIT 1", (rowid,))
+    floor = cur.fetchone()
+    cur.execute(
+        "SELECT id, source, beacon_round, value, fetched_at, chain_rowid, audit_hash"
+        " FROM heartbeat_tick WHERE chain_rowid IS NOT NULL AND chain_rowid>?"
+        " ORDER BY chain_rowid ASC LIMIT 1", (rowid,))
+    ceil = cur.fetchone()
+    return floor, ceil
+
+
+def _beat_obj(row, err=None, shape=None):
+    if not row:
+        return None
+    out = {
+        "source": row[1],
+        "round": row[2],
+        "value": row[3],
+        "at": _iso(row[4]),
+        "at_epoch": row[4],
+        "chain_rowid": row[5],
+        "audit_hash": row[6],
+        "verify_yourself": _verify_url(row[1], row[2], row[3]),
+    }
+    if row[5] is None:
+        out["in_chain"] = False
+        out["warning"] = ("This beat is NOT sealed into the chain, so it is "
+                          "not a floor for anything. See seal_error.")
+        if err:
+            out["seal_error"] = err
+    else:
+        out["in_chain"] = True
+        if shape:
+            out["seal_shape"] = shape
+    return out
+
+
+def _iso(t):
+    if t is None:
+        return None
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+
+
+def _human(seconds):
+    if seconds is None:
+        return None
+    s = int(round(seconds))
+    if s < 60:
+        return "%d seconds" % s
+    if s < 3600:
+        return "%d minutes %d seconds" % (s // 60, s % 60)
+    return "%d hours %d minutes" % (s // 3600, (s % 3600) // 60)
+
+
+# ---------------------------------------------------------------------
+# handle
+# ---------------------------------------------------------------------
+
+def handle(method, action, data, api_key, ctx):
+    conn, lock = ctx["conn"], ctx["lock"]
+
+    if not _audit_table(conn):
+        return {"error": "audit_log_missing"}, 500
+
+    _ensure(conn, lock)
+    _start_timer(ctx)
+
+    if method == "GET" and action == "spec":
+        return _spec(), 200
+
+    if method == "GET" and action == "latest":
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, source, beacon_round, value, fetched_at, chain_rowid,"
+            " audit_hash FROM heartbeat_tick ORDER BY id DESC LIMIT 1")
+        row = cur.fetchone()
+        if not row:
+            return {"beats": 0, "message": "no beat sealed yet"}, 200
+        age = time.time() - row[4]
+        return {
+            "latest_beat": _beat_obj(row),
+            "seconds_since": round(age, 1),
+            "open_window_so_far": _human(age),
+            "meaning": (
+                "Anything sealed since this beat has this beat as its floor "
+                "and no ceiling until the next beat."
+            ),
+        }, 200
+
+    if method == "GET" and action == "ticks":
+        try:
+            limit = min(int(data.get("limit", 25)), 200)
+        except (TypeError, ValueError):
+            limit = 25
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, source, beacon_round, value, fetched_at, chain_rowid,"
+            " audit_hash, seal_error, seal_shape FROM heartbeat_tick"
+            " ORDER BY id DESC LIMIT ?", (limit,))
+        rows = cur.fetchall()
+        return {
+            "count": len(rows),
+            "beats": [_beat_obj(r, r[7], r[8]) for r in rows],
+            "cadence_target_seconds": BEAT_SECONDS,
+        }, 200
+
+    if method == "GET" and action == "window":
+        rowid = _find_rowid(conn, data.get("block"), data.get("receipt"))
+        if rowid is None:
+            return {"error": "block_or_receipt_required",
+                    "usage": "/x/heartbeat/window?block=846 or ?receipt=<audit_hash>"}, 400
+
+        floor, ceil = _window_for(conn, rowid)
+        out = {
+            "block": rowid,
+            "floor": _beat_obj(floor),
+            "ceiling": _beat_obj(ceil),
+            "what_this_proves": WHAT_THIS_PROVES,
+            "vocabulary": VOCABULARY,
+        }
+
+        if floor and ceil:
+            width = ceil[4] - floor[4]
+            out["state"] = "closed"
+            out["window_seconds"] = round(width, 1)
+            out["window"] = _human(width)
+            out["statement"] = (
+                "Block %d was created after %s and before %s. Window: %s."
+                % (rowid, _iso(floor[4]), _iso(ceil[4]), _human(width))
+            )
+        elif floor:
+            width = time.time() - floor[4]
+            out["state"] = "open"
+            out["window_seconds_so_far"] = round(width, 1)
+            out["window_so_far"] = _human(width)
+            out["statement"] = (
+                "Block %d was created after %s. The ceiling is not sealed "
+                "yet, so the window is open." % (rowid, _iso(floor[4]))
+            )
+        elif ceil:
+            out["state"] = "unfloored"
+            out["statement"] = (
+                "Block %d predates the first beat, so it has no floor from "
+                "this module. It was created before %s." % (rowid, _iso(ceil[4]))
+            )
+        else:
+            out["state"] = "no_beats"
+            out["statement"] = "No beats have been sealed, so no window exists."
+
+        out["external_ceiling"] = {
+            "note": (
+                "A second, independent ceiling comes from OpenTimestamps. "
+                "Anchoring is per proof and has its own pending/confirmed "
+                "state."
+            ),
+            "where": "/x/ots/status",
+        }
+        return out, 200
+
+    if method == "GET" and action == "verify":
+        rnd = data.get("round")
+        if rnd is None:
+            return {"error": "round_required"}, 400
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, source, beacon_round, value, fetched_at, chain_rowid,"
+            " audit_hash FROM heartbeat_tick WHERE beacon_round=?"
+            " ORDER BY id DESC LIMIT 1", (rnd,))
+        row = cur.fetchone()
+        if not row:
+            return {"error": "round_not_sealed", "round": rnd}, 404
+        return {
+            "sealed": _beat_obj(row),
+            "how_to_verify": [
+                "Fetch the round from the beacon operator at the url above.",
+                "Compare its randomness with the value we sealed. They must match.",
+                "Confirm the beat's audit_hash is in our chain at /api/verify-chain.",
+                "Nothing in these three steps requires our cooperation.",
+            ],
+            "we_do_not_verify_the_signature": (
+                "drand signs each round with BLS, which this server does not "
+                "implement. We record the round and value verbatim. The "
+                "operator's own endpoint is the authority, not us."
+            ),
+        }, 200
+
+    if method == "GET" and action == "status":
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*), MIN(fetched_at), MAX(fetched_at) FROM heartbeat_tick")
+        n, first, last = cur.fetchone()
+        cur.execute(
+            "SELECT fetched_at FROM heartbeat_tick WHERE chain_rowid IS NOT NULL"
+            " ORDER BY chain_rowid ASC")
+        times = [r[0] for r in cur.fetchall()]
+        gaps = [times[i + 1] - times[i] for i in range(len(times) - 1)]
+        mean = sum(gaps) / len(gaps) if gaps else None
+        widest = max(gaps) if gaps else None
+        cur.execute("SELECT MAX(rowid) FROM audit_log")
+        tip = cur.fetchone()[0] or 0
+        cur.execute("SELECT MIN(chain_rowid) FROM heartbeat_tick WHERE chain_rowid IS NOT NULL")
+        firstrow = cur.fetchone()[0]
+        covered = (tip - firstrow) if firstrow else 0
+        return {
+            "version": VERSION,
+            "beats_sealed": n,
+            "first_beat": _iso(first),
+            "latest_beat": _iso(last),
+            "cadence_target_seconds": BEAT_SECONDS,
+            "auto_beat": AUTO_BEAT,
+            "timer_running": _timer_started,
+            "beat_runs_this_process": _beat_runs,
+            "last_error": _beat_last_error,
+            "beats_not_in_chain": _orphans(conn),
+            "last_seal_error": _last_seal_error(conn),
+            "last_seal_shape": _last_seal_shape(conn),
+            "mean_window_seconds": round(mean, 1) if mean else None,
+            "mean_window": _human(mean),
+            "widest_window_seconds": round(widest, 1) if widest else None,
+            "widest_window": _human(widest),
+            "records_with_a_floor": covered,
+            "chain_height": tip,
+            "honest_note": (
+                "Mean window is the average distance between beats. It is the "
+                "typical amount of room a record has. Widest is the worst "
+                "case, which is the number that actually matters."
+            ),
+        }, 200
+
+    if method == "POST" and action == "beat":
+        try:
+            return _do_beat(ctx, forced=bool(data.get("force")))
+        except Exception as e:
+            return {"beat": False, "error": "beacon_unreachable", "detail": str(e)}, 503
+
+    if method == "POST" and action == "source":
+        # For an engine with no outbound network. The operator hands it a
+        # reading fetched elsewhere. Sealed exactly as supplied and marked.
+        val = data.get("value")
+        src = data.get("source") or "supplied"
+        rnd = data.get("round")
+        if not val or len(str(val)) < 32:
+            return {"error": "value_required", "note": "at least 32 characters"}, 400
+        now = time.time()
+        with lock:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO heartbeat_tick (source, beacon_round, value,"
+                " fetched_at, cadence, note) VALUES (?,?,?,?,?,?)",
+                (src, rnd, str(val), now, None,
+                 "supplied by operator, not fetched by this server"),
+            )
+            tick_id = cur.lastrowid
+            conn.commit()
+        ok, shape, err, h, rid = _seal(ctx, "heartbeat_beat", {
+            "kind": "beacon_tick_supplied",
+            "source": src, "round": rnd, "value": str(val), "fetched_at": now,
+            "note": ("Supplied by the operator rather than fetched here. The "
+                     "floor it gives is only as good as the reader's trust in "
+                     "that source, and it is marked so nobody mistakes it."),
+        })
+        if ok and (rid is None or h is None):
+            try:
+                rid2, h2 = _backfill(conn, lock, tick_id)
+                rid = rid if rid is not None else rid2
+                h = h if h is not None else h2
+            except Exception:
+                pass
+        with lock:
+            conn.execute("UPDATE heartbeat_tick SET seal_shape=?, seal_error=?,"
+                         " chain_rowid=?, audit_hash=? WHERE id=?",
+                         (shape, err, rid, h, tick_id))
+            conn.commit()
+        return {"beat": True, "supplied": True, "tick_id": tick_id,
+                "sealed_at_chain_rowid": rid, "audit_hash": h,
+                "marked": "supplied by operator, not fetched by this server"}, 200
+
+    return {"error": "unknown_action", "action": action,
+            "actions": ["spec", "latest", "ticks", "window", "verify",
+                        "status", "beat", "source"]}, 404
+
+
+def _orphans(conn):
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM heartbeat_tick WHERE chain_rowid IS NULL")
+        return cur.fetchone()[0]
+    except Exception:
+        return None
+
+
+def _last_seal_error(conn):
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT seal_error FROM heartbeat_tick WHERE seal_error IS NOT NULL"
+                    " ORDER BY id DESC LIMIT 1")
+        r = cur.fetchone()
+        return r[0] if r else None
+    except Exception:
+        return None
+
+
+def _last_seal_shape(conn):
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT seal_shape FROM heartbeat_tick WHERE seal_shape IS NOT NULL"
+                    " ORDER BY id DESC LIMIT 1")
+        r = cur.fetchone()
+        return r[0] if r else None
+    except Exception:
+        return None
+
+
+def _spec():
+    return {
+        "module": "heartbeat",
+        "version": VERSION,
+        "what_it_is": (
+            "A clock nobody can wind. Public beacon values are sealed into "
+            "the chain on a cadence. Because a beacon value cannot be known "
+            "before its tick, and because the chain is append-only, every "
+            "record between two beats has a provable earliest and latest "
+            "moment of creation."
+        ),
+        "why_a_clock_alone_fails": (
+            "Anyone can write down what a clock will read tomorrow. A clock "
+            "reading proves nothing about when it was written down. A beacon "
+            "value cannot be written down in advance by anyone."
+        ),
+        "the_interleave": (
+            "Decisions are not stamped individually. One beat every few "
+            "minutes gives a floor to everything after it and a ceiling to "
+            "everything before the next one. No change to the decision path "
+            "and no added latency."
+        ),
+        "sources": [
+            {"name": s["name"], "cadence_seconds": s["cadence_seconds"],
+             "note": s["note"], "url": s["url"]} for s in SOURCES
+        ],
+        "vocabulary": VOCABULARY,
+        "what_this_proves": WHAT_THIS_PROVES,
+        "limits": [
+            "It bounds when a record can have been made. It says nothing "
+            "about whether the record is correct.",
+            "drand signatures are BLS and are not verified here. The round "
+            "and value are recorded verbatim and are re-fetchable by anyone "
+            "from the beacon operator.",
+            "A record after the newest beat has an open window until the "
+            "next beat is sealed.",
+            "Beats sealed from a value the operator supplied by hand rather "
+            "than fetched are marked as such and are weaker.",
+            "A wide window is reported wide. The number is a measurement of "
+            "our own cadence, and it can embarrass us.",
+        ],
+        "routes": {
+            "GET /x/heartbeat/spec": "this document",
+            "GET /x/heartbeat/latest": "most recent beat and the open window so far",
+            "GET /x/heartbeat/ticks?limit=": "recent beats",
+            "GET /x/heartbeat/window?block=|?receipt=": "two-sided window for a record",
+            "GET /x/heartbeat/verify?round=": "what we sealed and where to check it",
+            "GET /x/heartbeat/status": "cadence, coverage, mean and widest window",
+            "POST /x/heartbeat/beat": "keyed - fetch and seal now",
+            "POST /x/heartbeat/source": "keyed - seal a reading fetched elsewhere",
+        },
+    }
+
+```
 
 
 ## `modules/investor.py`
@@ -1445,500 +2325,5 @@ def handle(method, action, data, api_key, ctx):
         "GET": ["peers", "status"],
         "POST": ["push", "pull", "sync"],
     }, 404)
-
-```
-
-
-## `modules/network.py`
-
-487 lines, 19842 bytes
-
-```python
-"""
-modules/network.py  -  serves the public witness network page
-
-WHY THIS IS A MODULE AND NOT A TEMPLATE
----------------------------------------
-The router hands whatever handle() returns to send_json, so a module cannot
-return HTML through it - it would arrive as a JSON string. So this does the
-same thing router.py already does for POST: it patches the request handler at
-runtime, adds a branch for the page path, and leaves every other path exactly
-as it was. The patch is idempotent and lives in memory, so a restart reverts it.
-
-THE SAME CATCH AS THE POST PATCH
---------------------------------
-A module is only imported when a request reaches the router. So after every
-deploy, one request to /x/network/status has to arrive before /witness works.
-Opening /x/network/status in a browser does it. Until then the page path falls
-through to whatever the server did before, which is a 404 - not an error page,
-just the old behaviour.
-
-If you would rather not patch anything, the same HTML works as a plain file in
-static/. This exists because the page then lives with the module it describes
-rather than drifting away from it.
-
-ROUTES
-------
-  GET /witness            the page
-  GET /witness.html       same page
-  GET /x/network/status   whether the patch is installed (public)
-
-The page itself holds no data. It reads /x/witness/tip and /x/witness/peers
-from the browser, same as any other visitor would, so it cannot show anything
-a stranger could not verify for themselves.
-"""
-
-import sys
-
-VERSION = "1.0"
-
-PUBLIC = {("GET", "status")}
-
-PAGE_PATHS = ("/witness", "/witness.html", "/network")
-
-_patched = [False]
-
-
-PAGE = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>The witness network — AILeash</title>
-<meta name="description" content="Two independent platforms recording each other's records, hourly. Checkable by anyone, without an account.">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300;9..144,600&family=Inter+Tight:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
-<style>
-:root{
-  --paper:#E9EDE4;
-  --paper-deep:#DFE5D8;
-  --ink:#18241F;
-  --ink-soft:#4A5A52;
-  --rule:#BFCCBF;
-  --rule-strong:#9AAC9C;
-  --stamp:#7C2B38;
-  --verdigris:#2F6B5E;
-  --amber:#9A6B1F;
-  --gutter:#CBD6C8;
-}
-*{box-sizing:border-box}
-html{-webkit-text-size-adjust:100%}
-body{
-  margin:0;
-  background:var(--paper);
-  color:var(--ink);
-  font-family:"Inter Tight",system-ui,sans-serif;
-  font-size:17px;
-  line-height:1.6;
-  /* ruled paper, faint */
-  background-image:repeating-linear-gradient(
-    to bottom,
-    transparent 0 31px,
-    rgba(154,172,156,.20) 31px 32px
-  );
-}
-.wrap{max-width:1080px;margin:0 auto;padding:0 22px}
-
-/* ---------- masthead ---------- */
-.masthead{padding:52px 0 30px;border-bottom:2px solid var(--ink)}
-.eyebrow{
-  font-family:"IBM Plex Mono",monospace;
-  font-size:11.5px;letter-spacing:.18em;text-transform:uppercase;
-  color:var(--ink-soft);margin:0 0 18px;
-}
-h1{
-  font-family:Fraunces,Georgia,serif;
-  font-weight:600;font-size:clamp(2.5rem,7.5vw,4.6rem);
-  line-height:1.02;letter-spacing:-.02em;margin:0 0 20px;
-}
-h1 em{font-style:italic;font-weight:300}
-.standfirst{font-size:clamp(1.05rem,2.4vw,1.28rem);max-width:40ch;color:var(--ink-soft);margin:0}
-
-/* ---------- the spread ---------- */
-.spread{
-  margin:44px 0 8px;
-  border:1px solid var(--rule-strong);
-  background:rgba(255,255,255,.4);
-}
-.spread-head{
-  display:grid;grid-template-columns:1fr 92px 1fr;
-  border-bottom:1px solid var(--rule-strong);
-}
-.spread-head div{
-  font-family:"IBM Plex Mono",monospace;
-  font-size:11px;letter-spacing:.14em;text-transform:uppercase;
-  padding:12px 16px;color:var(--ink-soft);
-}
-.spread-head .mid{text-align:center;background:var(--gutter);color:var(--ink)}
-.spread-head .right{text-align:right}
-.folio{
-  display:grid;grid-template-columns:1fr 92px 1fr;
-  border-bottom:1px solid var(--rule);
-}
-.folio:last-child{border-bottom:0}
-.side{padding:20px 16px;min-width:0}
-.side.right{text-align:right}
-.mid{
-  background:var(--gutter);
-  display:flex;align-items:center;justify-content:center;
-  font-family:"IBM Plex Mono",monospace;font-size:11px;color:var(--ink-soft);
-  border-left:1px solid var(--rule);border-right:1px solid var(--rule);
-}
-.chain-name{
-  font-family:Fraunces,Georgia,serif;font-size:1.35rem;font-weight:600;
-  margin:0 0 4px;letter-spacing:-.01em;
-}
-.role{font-family:"IBM Plex Mono",monospace;font-size:11px;letter-spacing:.12em;
-  text-transform:uppercase;color:var(--ink-soft);margin:0 0 14px}
-.hash{
-  font-family:"IBM Plex Mono",monospace;font-size:12.5px;
-  word-break:break-all;color:var(--ink);margin:0 0 3px;line-height:1.45;
-}
-.hash-label{font-family:"IBM Plex Mono",monospace;font-size:10.5px;
-  letter-spacing:.12em;text-transform:uppercase;color:var(--ink-soft);margin:0 0 5px}
-.meta{font-size:14px;color:var(--ink-soft);margin:12px 0 0}
-.meta b{color:var(--ink);font-weight:600}
-
-/* ---------- stamp ---------- */
-.stamp{
-  display:inline-block;margin-top:16px;padding:6px 13px 5px;
-  border:2.5px solid var(--stamp);color:var(--stamp);
-  font-family:"IBM Plex Mono",monospace;font-weight:500;
-  font-size:12px;letter-spacing:.16em;text-transform:uppercase;
-  transform:rotate(-3.5deg);opacity:.9;
-}
-.stamp.press{animation:press .5s cubic-bezier(.2,1.5,.4,1) both}
-@keyframes press{
-  0%{opacity:0;transform:rotate(-3.5deg) scale(1.5)}
-  70%{opacity:.95;transform:rotate(-3.5deg) scale(.97)}
-  100%{opacity:.9;transform:rotate(-3.5deg) scale(1)}
-}
-.stamp.live{border-color:var(--verdigris);color:var(--verdigris)}
-.stamp.weak{border-color:var(--amber);color:var(--amber)}
-.stamp.flag{background:var(--stamp);color:var(--paper)}
-
-/* ---------- sections ---------- */
-section{padding:56px 0;border-top:1px solid var(--rule-strong)}
-h2{
-  font-family:Fraunces,Georgia,serif;font-weight:600;
-  font-size:clamp(1.6rem,4vw,2.3rem);letter-spacing:-.015em;
-  margin:0 0 8px;line-height:1.15;
-}
-.sec-note{color:var(--ink-soft);max-width:56ch;margin:0 0 30px}
-p{max-width:62ch}
-
-.defs{display:grid;gap:0;border-top:1px solid var(--rule)}
-.def{
-  display:grid;grid-template-columns:170px 1fr;gap:20px;
-  padding:15px 0;border-bottom:1px solid var(--rule);
-}
-.def dt{
-  font-family:"IBM Plex Mono",monospace;font-size:12px;
-  letter-spacing:.1em;text-transform:uppercase;padding-top:3px;
-}
-.def dd{margin:0;color:var(--ink-soft)}
-.dot{display:inline-block;width:8px;height:8px;margin-right:8px;border-radius:50%;vertical-align:middle}
-.dot.ok{background:var(--stamp)}
-.dot.mid-c{background:var(--verdigris)}
-.dot.weak{background:var(--amber)}
-
-.limits li{max-width:62ch;margin-bottom:13px;color:var(--ink-soft)}
-.limits b{color:var(--ink)}
-
-pre{
-  font-family:"IBM Plex Mono",monospace;font-size:13px;line-height:1.7;
-  background:var(--ink);color:var(--paper);padding:20px;overflow-x:auto;
-  border:0;margin:22px 0;
-}
-pre .k{color:#9FC6B4}
-code{font-family:"IBM Plex Mono",monospace;font-size:.92em}
-
-.links{list-style:none;padding:0;margin:24px 0 0}
-.links li{border-bottom:1px solid var(--rule);padding:13px 0}
-.links a{
-  font-family:"IBM Plex Mono",monospace;font-size:13.5px;
-  color:var(--ink);text-decoration:none;word-break:break-all;
-  display:flex;justify-content:space-between;gap:16px;align-items:baseline;
-}
-.links a:hover,.links a:focus-visible{color:var(--stamp)}
-.links span{color:var(--ink-soft);font-family:"Inter Tight",sans-serif;
-  font-size:13px;flex:0 0 auto;text-align:right}
-
-footer{padding:40px 0 70px;color:var(--ink-soft);font-size:14px}
-footer a{color:var(--ink)}
-
-.loading,.errbox{
-  font-family:"IBM Plex Mono",monospace;font-size:13px;
-  color:var(--ink-soft);padding:26px 16px;
-}
-.errbox b{display:block;color:var(--ink);margin-bottom:6px;font-family:"Inter Tight",sans-serif;font-size:15px}
-
-a:focus-visible,button:focus-visible{outline:2.5px solid var(--stamp);outline-offset:3px}
-
-@media (max-width:760px){
-  body{background-image:none}
-  .spread-head,.folio{grid-template-columns:1fr}
-  .spread-head .mid,.folio .mid{
-    border-left:0;border-right:0;
-    border-top:1px solid var(--rule);border-bottom:1px solid var(--rule);
-    padding:7px 0;text-align:center;
-  }
-  .spread-head .right,.side.right{text-align:left}
-  .spread-head div{padding:9px 14px}
-  .def{grid-template-columns:1fr;gap:5px}
-}
-@media (prefers-reduced-motion:reduce){
-  *{animation:none!important;transition:none!important}
-}
-</style>
-</head>
-<body>
-
-<div class="wrap">
-
-  <header class="masthead">
-    <p class="eyebrow">AILeash · the witness network</p>
-    <h1>Two ledgers.<br><em>Neither one is the authority.</em></h1>
-    <p class="standfirst">Independent platforms record each other's records, every hour. You can check it yourself, right now, without an account.</p>
-  </header>
-
-  <div class="spread" id="spread">
-    <div class="spread-head">
-      <div>This chain</div>
-      <div class="mid">Exchange</div>
-      <div class="right">Recorded by</div>
-    </div>
-    <div id="folios">
-      <div class="loading">Reading the ledger…</div>
-    </div>
-  </div>
-
-  <section>
-    <h2>Why this exists</h2>
-    <p class="sec-note">Every platform that sells you an audit trail also holds it.</p>
-    <p>A hash chain stops anyone else altering the record. It does not stop the operator rebuilding the whole thing and presenting the result as history. Anchoring the chain externally narrows that down — you can't rewrite anything older than your last anchor — and it still leaves the keeper and the checker as the same party.</p>
-    <p>Nothing you build alone closes that. Somebody outside has to be holding a copy.</p>
-    <p>So each platform here takes the fingerprint of the others' records and seals it into its own. To rewrite your past now, everyone holding a copy would have to rewrite theirs in step, and re-obtain external timestamps that were issued days ago. The second half is the part that can't be done.</p>
-  </section>
-
-  <section>
-    <h2>What the marks mean</h2>
-    <p class="sec-note">Two checks run on every submission. Neither can reject one — everything gets sealed. What changes is how strong we say the claim is.</p>
-
-    <dl class="defs">
-      <div class="def"><dt><span class="dot ok"></span>Confirmed</dt><dd>We fetched the address given and it served exactly the tip that was submitted.</dd></div>
-      <div class="def"><dt><span class="dot mid-c"></span>Live</dt><dd>The address served a valid but different tip. A working chain moves between submitting and our looking — normal, not a failure.</dd></div>
-      <div class="def"><dt><span class="dot weak"></span>Self-declared</dt><dd>No address given, or we couldn't reach it. Taken on their word, and marked as such.</dd></div>
-      <div class="def"><dt>First-use</dt><dd>First time this name appeared. It's now bound to the address it came from.</dd></div>
-      <div class="def"><dt>Bound</dt><dd>Same address as the first time this name appeared. The same operator, consistently.</dd></div>
-      <div class="def"><dt>Conflict</dt><dd>This name has been submitted from a different address than the one it was first bound to. Still sealed, permanently flagged. Operators do move hosts — but you get to see it and decide.</dd></div>
-    </dl>
-  </section>
-
-  <section>
-    <h2>What this does not prove</h2>
-    <p class="sec-note">Said plainly, because the value of the rest depends on it.</p>
-    <ul class="limits">
-      <li><b>It doesn't prove a record was true when it was written.</b> Nothing can. No system reaches back to verify what someone was thinking or whether the data going in was honest. This proves what was recorded, when, and that it hasn't changed since.</li>
-      <li><b>It doesn't prove identity.</b> A name is self-declared. Checking the address proves someone runs a live chain producing that data — not that they're who they say. Binding a name to its first address is what makes a change visible.</li>
-      <li><b>Two platforms checking each other isn't much of a network.</b> The strength comes from breadth. This gets meaningfully harder to bend with every chain that joins, and not before.</li>
-      <li><b>A participant can go quiet.</b> Nobody can force anyone to keep publishing. Gaps show up as stale or silent rather than disappearing, which is the point.</li>
-    </ul>
-  </section>
-
-  <section>
-    <h2>Joining</h2>
-    <p class="sec-note">Chains submit their current head to the network and record the heads of others in return.</p>
-    <pre><span class="k">POST</span> https://sebbi.pro/x/witness/observe
-<span class="k">Content-Type:</span> application/json
-
-{
-  "chain": "your-chain-name",
-  "tip":   "&lt;64 hex characters — your current chain head&gt;",
-  "url":   "https://yoursite/your/tip",
-  "ts":    "2026-08-02T14:00:00Z"
-}</pre>
-    <p><code>url</code> is the address we fetch to check your tip independently — it's the difference between confirmed and self-declared. <code>ts</code> is optional, epoch or ISO.</p>
-    <p>Running a chain in the other direction, recording ours as we record yours, is what makes it mutual rather than us keeping a list. If you operate a platform in this space and you're willing to have your history held somewhere you don't control, message me and we'll talk through it and what it costs.</p>
-  </section>
-
-  <section>
-    <h2>Check it yourself</h2>
-    <p class="sec-note">Nothing here needs a login. Open any of these.</p>
-    <ul class="links">
-      <li><a href="/x/witness/tip">/x/witness/tip<span>our current head</span></a></li>
-      <li><a href="/x/witness/peers">/x/witness/peers<span>everyone we record</span></a></li>
-      <li><a href="/api/verify-chain">/api/verify-chain<span>chain checked end to end</span></a></li>
-      <li><a href="/api/anchor-status">/api/anchor-status<span>the external timestamp</span></a></li>
-    </ul>
-  </section>
-
-  <footer>
-    <p>Sealed records and their attestations are held by each participating platform independently. AILeash operates one chain in this network; it does not run the network. — <a href="https://sebbi.pro">sebbi.pro</a></p>
-  </footer>
-
-</div>
-
-<script>
-(function(){
-  var folios = document.getElementById('folios');
-
-  function esc(s){
-    return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){
-      return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
-    });
-  }
-
-  function stampFor(liveness, nameStatus){
-    var cls = 'stamp press', text = String(liveness || 'unchecked');
-    if (liveness === 'confirmed') cls += '';
-    else if (liveness === 'live') cls += ' live';
-    else cls += ' weak';
-    if (nameStatus === 'conflict'){ cls += ' flag'; text = 'conflict'; }
-    return '<span class="' + cls + '">' + esc(text) + '</span>';
-  }
-
-  function ago(hours){
-    if (hours == null) return 'unknown';
-    if (hours < 1) return 'within the hour';
-    if (hours < 2) return 'an hour ago';
-    if (hours < 48) return Math.round(hours) + ' hours ago';
-    return Math.round(hours / 24) + ' days ago';
-  }
-
-  function render(ours, peers){
-    if (!peers || !peers.length){
-      folios.innerHTML = '<div class="errbox"><b>No chains recorded yet.</b>' +
-        'Nothing has been submitted to this chain. The first tip posted to ' +
-        '/x/witness/observe appears here.</div>';
-      return;
-    }
-    var html = '';
-    peers.forEach(function(p){
-      html += '<div class="folio">' +
-        '<div class="side">' +
-          '<p class="chain-name">' + esc(ours.name) + '</p>' +
-          '<p class="role">head of chain · height ' + esc(ours.height) + '</p>' +
-          '<p class="hash-label">Current tip</p>' +
-          '<p class="hash">' + esc(ours.tip) + '</p>' +
-          '<p class="meta">Sealed <b>' + esc(ours.sealed) + '</b></p>' +
-        '</div>' +
-        '<div class="mid">↔</div>' +
-        '<div class="side right">' +
-          '<p class="chain-name">' + esc(p.peer) + '</p>' +
-          '<p class="role">' + esc(p.observations) + ' observations · ' +
-              esc(p.distinct_tips) + ' distinct tips</p>' +
-          '<p class="hash-label">Name bound to</p>' +
-          '<p class="hash">' + esc(p.bound_to || 'no address supplied') + '</p>' +
-          '<p class="meta">Last recorded <b>' + esc(ago(p.hours_since_last)) + '</b> · ' +
-              esc(p.name_status || 'unchecked') + '</p>' +
-          stampFor(p.liveness, p.name_status) +
-        '</div>' +
-      '</div>';
-    });
-    folios.innerHTML = html;
-  }
-
-  function failed(){
-    folios.innerHTML = '<div class="errbox"><b>The ledger did not answer.</b>' +
-      'The endpoints are public, so you can try them directly: ' +
-      '<a href="/x/witness/peers">/x/witness/peers</a></div>';
-  }
-
-  Promise.all([
-    fetch('/x/witness/tip').then(function(r){ return r.json(); }),
-    fetch('/x/witness/peers').then(function(r){ return r.json(); })
-  ]).then(function(res){
-    var tip = res[0] || {}, peers = res[1] || {};
-    render({
-      name: 'aileash',
-      tip: tip.tip || 'unavailable',
-      height: tip.height == null ? '—' : tip.height,
-      sealed: tip.sealed_at ? new Date(tip.sealed_at).toUTCString().replace(' GMT','  UTC') : 'unknown'
-    }, peers.peers || []);
-  }).catch(failed);
-})();
-</script>
-
-</body>
-</html>
-"""
-
-
-def _srv():
-    m = sys.modules.get("__main__")
-    if hasattr(m, "get_bearer"):
-        return m
-    return sys.modules.get("server")
-
-
-def _install(s):
-    """Add a page branch to do_GET at runtime. Idempotent and reversible."""
-    if _patched[0]:
-        return "already installed"
-    H = getattr(s, "Handler", None)
-    if H is None or not hasattr(H, "do_GET"):
-        return "no handler"
-    if getattr(H, "_page_patched", False):
-        _patched[0] = True
-        return "already installed"
-
-    original = H.do_GET
-
-    def do_GET(self):
-        try:
-            from urllib.parse import urlparse
-            p = urlparse(self.path).path.rstrip("/") or "/"
-        except Exception:
-            p = self.path or "/"
-        if p in PAGE_PATHS:
-            body = PAGE.encode("utf-8")
-            try:
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Cache-Control", "public, max-age=300")
-                self.send_header("X-Content-Type-Options", "nosniff")
-                self.send_header("Referrer-Policy", "no-referrer")
-                self.end_headers()
-                self.wfile.write(body)
-            except Exception:
-                pass
-            return
-        return original(self)
-
-    H.do_GET = do_GET
-    H._page_patched = True
-    _patched[0] = True
-    print("NETWORK: /witness page branch installed at runtime", flush=True)
-    return "installed"
-
-
-def handle(method, action, data, api_key, ctx):
-    s = _srv()
-    if s is None:
-        return {"error": "server_not_found"}, 500
-
-    state = "already installed" if _patched[0] else None
-    if not _patched[0]:
-        try:
-            state = _install(s)
-        except Exception as exc:
-            print("NETWORK: page patch failed - " + str(exc), flush=True)
-            state = "failed: " + str(exc)
-
-    if method == "GET" and (action or "") in ("", "status"):
-        return {
-            "page": "/witness",
-            "installed": bool(_patched[0]),
-            "install_result": state,
-            "paths": list(PAGE_PATHS),
-            "version": VERSION,
-            "note": "The page reads /x/witness/tip and /x/witness/peers from the browser. It holds no data of its own.",
-        }, 200
-
-    return {"error": "unknown_action", "action": action,
-            "GET": ["status"]}, 404
 
 ```
