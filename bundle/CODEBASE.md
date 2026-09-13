@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-130 files across 34 parts.
+129 files across 34 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -118,7 +118,6 @@ Generated automatically on every push. Do not edit by hand.
 - `aileash_signed_client.py`
 - `aileash_verify.py`
 - `anchor.py`
-- `board_auditor.py`
 
 ## [CODEBASE-19.md](CODEBASE-19.md)
 
