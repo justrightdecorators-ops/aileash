@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-130 files across 34 parts.
+131 files across 34 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -35,6 +35,7 @@ Generated automatically on every push. Do not edit by hand.
 
 - `modules/declare.py`
 - `modules/demo.py`
+- `modules/disclosure.py`
 - `modules/dsr.py`
 - `modules/fingerprint.py`
 - `modules/genesis.py`
