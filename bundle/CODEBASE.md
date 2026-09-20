@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-133 files across 35 parts.
+132 files across 35 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -54,11 +54,10 @@ Generated automatically on every push. Do not edit by hand.
 - `modules/map.py`
 - `modules/mutual.py`
 - `modules/network.py`
+- `modules/oversight.py`
 
 ## [CODEBASE-09.md](CODEBASE-09.md)
 
-- `modules/ots.py`
-- `modules/oversight.py`
 - `modules/pack.py`
 - `modules/packconsole.py`
 
