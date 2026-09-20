@@ -2,9 +2,9 @@
 
 Contains:
 - `modules/heartbeat.py`
+- `modules/held.py`
 - `modules/integrity.py`
 - `modules/investor.py`
-- `modules/lineage.py`
 
 
 ## `modules/heartbeat.py`
@@ -883,6 +883,159 @@ def _spec():
             "POST /x/heartbeat/source": "keyed - seal a reading fetched elsewhere",
         },
     }
+
+```
+
+
+## `modules/held.py`
+
+145 lines, 5162 bytes
+
+```python
+"""
+modules/held.py  v1.0  -  the tips sebbi.pro holds for other chains
+
+Every time a peer submits its tip, sebbi.pro seals the observation into its
+own chain as a block under user_id "wit:<peer>", with the peer's tip inside.
+Those blocks are already public in the walk. This module lists them per
+peer, so another chain can point a verifier at sebbi.pro as its witness and
+have a machine confirm it.
+
+Reads only. Seals nothing, writes nothing, creates no tables. All public.
+
+Routes:
+  https://sebbi.pro/x/held/status
+  https://sebbi.pro/x/held/peers
+  https://sebbi.pro/x/held/tips?peer=mir
+"""
+
+import json
+import re
+import time
+
+VERSION = "1.0"
+BASE = "https://sebbi.pro/x/held/"
+DEFAULT_LIMIT = 100
+MAX_LIMIT = 500
+
+PUBLIC = {("GET", "status"), ("GET", "spec"), ("GET", "peers"),
+          ("GET", "tips")}
+
+_PEER_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+
+
+def _q(data, name, default=None):
+    v = (data or {}).get(name, default)
+    if isinstance(v, list):
+        v = v[0] if v else default
+    return v
+
+
+def _iso(ts):
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(ts)))
+    except Exception:
+        return None
+
+
+def _peers(ctx):
+    conn, lock = ctx["conn"], ctx["lock"]
+    with lock:
+        rows = conn.execute(
+            "SELECT user_id, COUNT(*), MAX(id), MAX(ts) FROM audit_log "
+            "WHERE user_id LIKE 'wit:%' GROUP BY user_id").fetchall()
+    out = []
+    for uid, n, last_idx, last_ts in rows:
+        name = str(uid)[4:]
+        out.append({"peer": name, "tips_held": n,
+                    "last_block_index": last_idx,
+                    "last_observed_at": _iso(last_ts),
+                    "list": BASE + "tips?peer=" + name})
+    out.sort(key=lambda r: -(r["tips_held"] or 0))
+    return {"ok": True, "holder": "sebbi.pro", "count": len(out),
+            "peers": out}, 200
+
+
+def _tips(data, ctx):
+    peer = str(_q(data, "peer", "") or "").strip().lower()
+    if not _PEER_RE.match(peer):
+        return {"ok": False, "error": "peer_required",
+                "example": BASE + "tips?peer=mir",
+                "peers": BASE + "peers"}, 400
+    try:
+        limit = max(1, min(MAX_LIMIT, int(_q(data, "limit", DEFAULT_LIMIT))))
+    except (TypeError, ValueError):
+        limit = DEFAULT_LIMIT
+    conn, lock = ctx["conn"], ctx["lock"]
+    with lock:
+        rows = conn.execute(
+            "SELECT id, ts, audit_hash, result_json FROM audit_log "
+            "WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+            ("wit:" + peer, limit)).fetchall()
+    tips = []
+    for idx, ts, h, rj in rows:
+        try:
+            res = json.loads(rj)
+        except Exception:
+            res = {}
+        tip = str(res.get("peer_tip") or "").lower()
+        if not re.match(r"^[0-9a-f]{64}$", tip):
+            continue
+        tips.append({
+            "peer_tip": tip,
+            "observed_at": _iso(ts),
+            "liveness": res.get("liveness"),
+            "sealed_in_block": idx,
+            "sealed_block_hash": h,
+            "check_block": "https://sebbi.pro/x/walk/block?index=%d" % idx,
+        })
+    return {
+        "ok": True,
+        "holder": "sebbi.pro",
+        "peer": peer,
+        "count": len(tips),
+        "newest_first": True,
+        "tips": tips,
+        "what_this_proves": (
+            "sebbi.pro recorded each of these tips from %s and sealed the "
+            "observation into its own public chain. Open check_block to see "
+            "the sealed block, recompute its hash, and confirm peer_tip is "
+            "inside it. sebbi.pro is run independently of %s and cannot be "
+            "made to rewrite these blocks by %s." % (peer, peer, peer)),
+        "what_this_does_not_prove": (
+            "That the tip was correct when submitted - only that this is the "
+            "tip sebbi.pro was shown, and when."),
+    }, 200
+
+
+def _status():
+    return {"ok": True, "module": "held", "version": VERSION,
+            "what": "Tips sebbi.pro holds for other chains, from its own "
+                    "sealed witness blocks.",
+            "routes": {"peers": BASE + "peers",
+                       "tips": BASE + "tips?peer=mir",
+                       "status": BASE + "status"},
+            "use_as_witness": "In an AI Integrity Declaration, set a "
+                              "witness tip_endpoint to " + BASE +
+                              "tips?peer=<your peer name>. The checker at "
+                              "https://sebbi.pro/x/integrity/check then "
+                              "confirms sebbi.pro holds your tip."}
+
+
+def handle(method, action, data, api_key, ctx):
+    try:
+        if method == "GET" and action in ("status", "spec", ""):
+            return _status(), 200
+        if method == "GET" and action == "peers":
+            return _peers(ctx)
+        if method == "GET" and action == "tips":
+            return _tips(data, ctx)
+        return {"ok": False, "error": "unknown_action",
+                "get": sorted(a for m, a in PUBLIC if m == "GET"),
+                "post": []}, 404
+    except Exception as exc:
+        return {"ok": False, "error": "held_failed",
+                "detail": str(exc)[:200]}, 500
 
 ```
 
@@ -2031,343 +2184,5 @@ def handle(method, action, data, api_key, ctx):
 
 
 PUBLIC = {("GET", "status"), ("GET", "spec")}
-
-```
-
-
-## `modules/lineage.py`
-
-330 lines, 15462 bytes
-
-```python
-import re
-import time
-from datetime import datetime, timezone
-
-VERSION = "1.1"
-HEX64 = re.compile(r"^[0-9a-f]{64}$")
-
-PUBLIC = {("GET", "trace"), ("GET", "impact"), ("GET", "receipt"),
-          ("GET", "spec")}
-
-OUR_CHAIN_NAME = "aileash"
-DEFAULT_BASE = "https://sebbi.pro"
-
-MAX_INPUTS = 50
-MAX_DEPTH = 6
-MAX_NODES = 400
-ROLES = ("input", "model", "data", "policy", "document", "upstream-decision",
-         "supplier", "other")
-
-_ready = False
-
-
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        c = ctx["conn"]
-        c.execute("CREATE TABLE IF NOT EXISTS lineage_edge("
-                  "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,"
-                  "child_chain TEXT,child_receipt TEXT,"
-                  "parent_chain TEXT,parent_receipt TEXT,parent_base TEXT,"
-                  "role TEXT,note TEXT,declared REAL,"
-                  "audit_hash TEXT,block_index INTEGER)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_lin_child "
-                  "ON lineage_edge(child_receipt)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_lin_parent "
-                  "ON lineage_edge(parent_receipt)")
-        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_lin_unique "
-                  "ON lineage_edge(child_receipt,parent_chain,parent_receipt)")
-        c.commit()
-    _ready = True
-
-
-def _get_base_url(ctx):
-    if isinstance(ctx, dict):
-        base = ctx.get("base_url") or (ctx.get("config") or {}).get("base_url")
-        if base:
-            return str(base).rstrip("/")
-    return DEFAULT_BASE
-
-
-def _iso(ts):
-    if not ts:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
-
-def _clean_chain(value):
-    value = str(value or "").strip().lower()
-    return value[:80] if value else ""
-
-
-def _exists_locally(ctx, receipt):
-    try:
-        with ctx["lock"]:
-            row = ctx["conn"].execute(
-                "SELECT 1 FROM audit_log WHERE audit_hash=? LIMIT 1", (receipt,)).fetchone()
-        return bool(row)
-    except Exception:
-        return False
-
-
-def _verification_plan(chain, receipt, base=None, our_base=DEFAULT_BASE):
-    root = (base or our_base).rstrip("/") if chain != OUR_CHAIN_NAME else our_base
-    if chain != OUR_CHAIN_NAME and not base:
-        return {
-            "chain": chain, "receipt": receipt,
-            "status": "external, no address declared",
-            "how_to_check": "Ask that chain's operator for their public witness and consistency "
-                            "routes, or look for their name at %s/x/witness/peers - if we have "
-                            "ever witnessed them, the address we fetched from is recorded "
-                            "there." % our_base,
-        }
-    return {
-        "chain": chain, "receipt": receipt, "base": root,
-        "on_their_chain": "%s/x/consistency/ancestor?tip=%s" % (root, receipt),
-        "nothing_was_omitted": "%s/x/complete/periods" % root,
-        "who_witnesses_them": "%s/x/witness/peers" % root,
-        "did_we_witness_them": "%s/x/witness/attest?peer=%s&tip=%s" % (our_base, chain, receipt),
-        "note": "Run these against their host, not ours. If their answers and ours disagree, "
-                "that disagreement is the finding.",
-    }
-
-
-def _declare(ctx, api_key, data):
-    our_base = _get_base_url(ctx)
-    child = str(data.get("receipt", data.get("child", ""))).strip().lower()
-    if not HEX64.match(child):
-        return {"error": "receipt_required",
-                "message": "The audit hash of the decision whose inputs you are declaring."}, 400
-
-    child_chain = _clean_chain(data.get("chain") or OUR_CHAIN_NAME)
-    inputs = data.get("inputs")
-    if not isinstance(inputs, list) or not inputs:
-        return {"error": "inputs_required",
-                "message": "A list of what fed this decision. Each entry needs a receipt, and a "
-                           "chain if it came from someone else.",
-                "example": {"receipt": "<64 hex>", "inputs": [
-                    {"chain": "supplier-name", "receipt": "<64 hex>", "role": "data",
-                     "base": "https://supplier.example"}]}}, 400
-    if len(inputs) > MAX_INPUTS:
-        return {"error": "too_many_inputs", "message": "at most %d per declaration" % MAX_INPUTS}, 400
-
-    if child_chain == OUR_CHAIN_NAME and not _exists_locally(ctx, child):
-        return {"error": "unknown_receipt",
-                "message": "That receipt is not in this chain. Declaring inputs for a decision "
-                           "we never sealed would put an unverifiable node in the graph."}, 404
-
-    prepared = []
-    for item in inputs:
-        if not isinstance(item, dict):
-            return {"error": "bad_input", "message": "each input must be an object"}, 400
-        parent = str(item.get("receipt", "")).strip().lower()
-        if not HEX64.match(parent):
-            return {"error": "bad_input_receipt",
-                    "message": "every input needs a 64 character hex receipt"}, 400
-        parent_chain = _clean_chain(item.get("chain") or OUR_CHAIN_NAME)
-        if parent_chain == child_chain and parent == child:
-            return {"error": "self_reference",
-                    "message": "a decision cannot be its own input"}, 400
-        role = str(item.get("role", "input")).strip().lower()
-        if role not in ROLES:
-            role = "other"
-        base = str(item.get("base", item.get("url", "")) or "").strip()[:300]
-        note = str(item.get("note", "") or "").strip()[:200]
-        prepared.append((parent_chain, parent, base, role, note))
-
-    now = time.time()
-    summary = ";".join("%s/%s:%s" % (c, r[:12], role) for c, r, _b, role, _n in prepared)
-    ev = {"user_id": "lin:" + child[:16], "action": "lineage_declared", "amount": 0,
-          "country": "UK", "device_id": "lineage", "anomaly": 0, "device_risk": 0}
-    res = {"decision": "LINEAGE_SEALED", "score": 0, "lineage_version": VERSION,
-           "child_chain": child_chain, "child_receipt": child,
-           "input_count": len(prepared),
-           "detail": "child=%s;inputs=%s" % (child, summary)}
-    audit_hash, block_index, seq = ctx["seal"](ev, res, now, api_key)
-
-    written, duplicates = 0, 0
-    with ctx["lock"]:
-        for parent_chain, parent, base, role, note in prepared:
-            try:
-                ctx["conn"].execute(
-                    "INSERT INTO lineage_edge(api_key,child_chain,child_receipt,parent_chain,"
-                    "parent_receipt,parent_base,role,note,declared,audit_hash,block_index) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                    (api_key, child_chain, child, parent_chain, parent, base or None,
-                     role, note or None, now, audit_hash, block_index))
-                written += 1
-            except Exception:
-                duplicates += 1
-        ctx["conn"].commit()
-
-    return {"child_chain": child_chain, "child_receipt": child,
-            "edges_recorded": written, "already_declared": duplicates,
-            "declared_at": _iso(now),
-            "sealed_in_chain": audit_hash, "block_index": block_index, "receipt_seq": seq,
-            "lineage_version": VERSION,
-            "what_this_does": "The declaration is now a chain entry. It cannot be removed "
-                              "without breaking every block after it, and it cannot be added "
-                              "later without the timestamp showing when.",
-            "trace": "%s/x/lineage/trace?receipt=%s" % (our_base, child),
-            "portable_receipt": "%s/x/lineage/receipt?receipt=%s" % (our_base, child)}, 200
-
-
-def _walk(ctx, start, depth, upstream):
-    our_base = _get_base_url(ctx)
-    seen = {start}
-    nodes, edges, frontier = [], [], []
-    queue = [(start, 0)]
-    truncated = False
-
-    while queue:
-        receipt, level = queue.pop(0)
-        if level >= depth or len(nodes) >= MAX_NODES:
-            if queue or level >= depth:
-                truncated = truncated or bool(queue)
-            continue
-
-        rows = _parents(ctx, receipt) if upstream else _children(ctx, receipt)
-        for row in rows:
-            if upstream:
-                chain, other, base, role, note, declared, sealed = row
-            else:
-                chain, other, role, declared, sealed = row
-                base, note = None, None
-
-            edges.append({
-                "from": other if upstream else receipt,
-                "to": receipt if upstream else other,
-                "role": role, "note": note,
-                "declared_at": _iso(declared),
-                "declaration_sealed_as": sealed,
-                "chain": chain,
-            })
-
-            local = (chain == OUR_CHAIN_NAME) and _exists_locally(ctx, other)
-            if not local:
-                if not any(f["receipt"] == other for f in frontier):
-                    frontier.append({"chain": chain, "receipt": other, "depth": level + 1,
-                                     "verify": _verification_plan(chain, other, base, our_base)})
-                continue
-
-            if other in seen:
-                continue
-            seen.add(other)
-            if len(nodes) >= MAX_NODES:
-                truncated = True
-                continue
-            nodes.append({"chain": chain, "receipt": other, "depth": level + 1,
-                          "verify": _verification_plan(chain, other, base, our_base)})
-            queue.append((other, level + 1))
-
-    return nodes, edges, frontier, truncated
-
-
-def _trace(ctx, data):
-    receipt = str(data.get("receipt", "")).strip().lower()
-    if not HEX64.match(receipt):
-        return {"error": "receipt_required"}, 400
-    depth = _depth_arg(data)
-    our_base = _get_base_url(ctx)
-
-    nodes, edges, frontier, truncated = _walk(ctx, receipt, depth, upstream=True)
-    if not edges:
-        return {"receipt": receipt, "direction": "upstream", "nodes": [], "edges": [],
-                "external_frontier": [],
-                "lineage_version": VERSION,
-                "what_this_means": "No inputs have been declared for this decision. That is not "
-                                   "the same as it having none - it means nobody said. "
-                                   "Undeclared lineage is where a trail goes dark, and the party "
-                                   "who did not declare is the one to ask.",
-                "self": _verification_plan(OUR_CHAIN_NAME, receipt, our_base=our_base)}, 200
-
-    return {"receipt": receipt, "direction": "upstream", "depth_searched": depth,
-            "nodes": nodes, "edges": edges, "external_frontier": frontier,
-            "truncated": truncated,
-            "lineage_version": VERSION,
-            "self": _verification_plan(OUR_CHAIN_NAME, receipt, our_base=our_base),
-            "how_to_verify_this": "Every node carries the routes to check it on its own chain. "
-                                  "Nothing here asks you to take our word for a hop, including "
-                                  "the hops on our own chain.",
-            "what_an_edge_is": "A sealed, dated claim by the declaring party that these inputs "
-                               "fed that decision. Sealing makes it non-repudiable, not true.",
-            "frontier_note": "External entries are named but not resolved here. Run their "
-                             "verification plans against their own hosts - that is what makes "
-                             "the graph checkable without a shared database."}, 200
-
-
-def _impact(ctx, data):
-    receipt = str(data.get("receipt", "")).strip().lower()
-    if not HEX64.match(receipt):
-        return {"error": "receipt_required"}, 400
-    depth = _depth_arg(data)
-
-    nodes, edges, frontier, truncated = _walk(ctx, receipt, depth, upstream=False)
-    affected = len(nodes)
-    return {"receipt": receipt, "direction": "downstream", "depth_searched": depth,
-            "affected_decisions": affected, "nodes": nodes, "edges": edges,
-            "external_frontier": frontier, "truncated": truncated,
-            "lineage_version": VERSION,
-            "what_this_is_for": "If this input is retracted, wrong, or overturned, these are the "
-                                "decisions that declared a dependency on it. This is the answer "
-                                "to the first question asked after any upstream failure, and it "
-                                "normally takes weeks of email to assemble incompletely.",
-            "corrective_action": "The list is itself sealed and dated, so the scope of a recall "
-                                 "can be shown to have been determined honestly rather than "
-                                 "narrowed to suit.",
-            "limits": "Only covers dependencies that were declared. A downstream party who "
-                      "declared nothing does not appear - which is a fact about them rather "
-                      "than a gap here."}, 200
-
-
-def _receipt(ctx, data):
-    receipt = str(data.get("receipt", "")).strip().lower()
-    if not HEX64.match(receipt):
-        return {"error": "receipt_required"}, 400
-    if not _exists_locally(ctx, receipt):
-        return {"error": "unknown_receipt",
-                "message": "Not a decision sealed in this chain."}, 404
-
-    our_base = _get_base_url(ctx)
-    rows = _parents(ctx, receipt)
-    inputs = [{"chain": r[0], "receipt": r[1], "role": r[3],
-               "verify": _verification_plan(r[0], r[1], r[2], our_base=our_base)} for r in rows]
-
-    return {
-        "format": "aileash-portable-receipt",
-        "lineage_version": VERSION,
-        "chain": OUR_CHAIN_NAME,
-        "receipt": receipt,
-        "inputs": inputs,
-        "verify_this_decision": {
-            "still_on_our_chain": "%s/x/consistency/ancestor?tip=%s" % (our_base, receipt),
-            "our_log_is_append_only": "%s/x/consistency/proof" % our_base,
-            "nothing_was_left_out": "%s/x/complete/periods" % our_base,
-            "who_witnesses_us": "%s/x/witness/peers" % our_base,
-            "our_current_tip": "%s/x/witness/tip" % our_base,
-            "the_engine_reproduces": "%s/x/replay/spec" % our_base,
-            "trace_upstream": "%s/x/lineage/trace?receipt=%s" % (our_base, receipt),
-        },
-        "offline_verifier": "aileash_verify.py - one file, no dependencies, no network. Save "
-                            "this document and check it on your own machine, today or in four "
-                            "years.",
-        "what_you_can_establish": [
-            "this decision is in a log that has not been rewritten",
-            "that log is witnessed by parties we do not control",
-            "the period it sits in declared its total before anyone asked",
-            "the same inputs still produce the same verdict",
-            "and what fed it, hop by hop, across every company involved",
-        ],
-        "what_you_cannot": "That the decision was right, or that the inputs were honest. "
-                           "Cryptography establishes what happened and when. It does not "
-                           "establish that what happened was correct, and anybody telling you "
-                           "otherwise is selling something.",
-        "send_this_on": "Attach it to the output it describes. Whoever receives it can verify "
-                        "without an account, without contacting us, and without trusting anyone "
-                        "in the chain including the sender.",
-    }, 200
 
 ```
