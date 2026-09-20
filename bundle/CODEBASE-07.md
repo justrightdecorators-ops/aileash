@@ -1,11 +1,10 @@
-# Codebase — part 7 of 34
+# Codebase — part 7 of 35
 
 Contains:
 - `modules/heartbeat.py`
+- `modules/integrity.py`
 - `modules/investor.py`
 - `modules/lineage.py`
-- `modules/map.py`
-- `modules/mutual.py`
 
 
 ## `modules/heartbeat.py`
@@ -888,6 +887,848 @@ def _spec():
 ```
 
 
+## `modules/integrity.py`
+
+834 lines, 33978 bytes
+
+```python
+"""
+modules/integrity.py  v1.2  -  the AI Integrity Declaration, and a public checker
+
+Serves the open standard that rates every AI deployment from L0_DIARY
+(no checkable record) up to L4_OVERSIGHT_VERIFIED, and checks any domain
+against it. Reads only. Seals nothing, writes nothing, creates no tables.
+Every route is public.
+
+Routes:
+  https://sebbi.pro/x/integrity/status                    what this is
+  https://sebbi.pro/x/integrity/declaration               the standard, as JSON
+  https://sebbi.pro/x/integrity/self                      sebbi.pro's own declaration
+  https://sebbi.pro/x/integrity/check?domain=example.com  rate any domain
+
+HOW THE CHECKER DECIDES
+It looks for a declaration at https://<domain>/.well-known/ai-integrity.json,
+then https://<domain>/x/integrity/self. None found: L0_DIARY.
+It never takes the declaration's word. It walks the declared chain and
+recomputes every public block itself, asks each declared witness for its
+tip, and opens each anchor proof. A level is awarded only when every check
+that level needs has passed. Claiming more than that is OVERCLAIMED.
+
+Human-oversight checks (INV-005, INV-006) cannot be tested from outside yet,
+so this checker never awards L4. It says so rather than guessing.
+
+SAFETY
+The checker fetches addresses taken from other people's declarations, so
+it only fetches https on port 443, refuses redirects, refuses any host that
+resolves to a private, loopback or internal address, caps every response
+size and every timeout, and caps the number of fetches per check.
+"""
+
+import hashlib
+import ipaddress
+import json
+import re
+import socket
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+VERSION = "1.2"
+BASE = "https://sebbi.pro/x/integrity/"
+
+PUBLIC = {("GET", "status"), ("GET", "declaration"), ("GET", "spec"),
+          ("GET", "self"), ("GET", "check")}
+
+# ---------------------------------------------------------------- the standard
+
+DECLARATION = json.loads(r'''{
+  "spec": "ai-integrity-declaration",
+  "version": "1.0.1",
+  "declaration_id": "DEC-2026-AI-INTEGRITY",
+  "status": "open_standard",
+  "published": "2026-09-19",
+  "issuer": {
+    "name": "Monop Content",
+    "product": "sebbi.pro",
+    "url": "https://sebbi.pro"
+  },
+  "principle": "A record kept only by the party it describes is a diary, not evidence. Any AI deployment can be checked against this standard by anyone, without an account, a key, or permission.",
+  "scope": "Autonomous agents and AI systems that make or support decisions affecting people, money, access or safety.",
+  "maps_to": [
+    {
+      "framework": "EU AI Act",
+      "provisions": [
+        "Article 12 record-keeping",
+        "Article 14 human oversight"
+      ]
+    },
+    {
+      "framework": "UK Online Safety Act 2023",
+      "provisions": [
+        "record-keeping and review duties"
+      ]
+    },
+    {
+      "framework": "ICO Age Appropriate Design Code",
+      "provisions": [
+        "data minimisation",
+        "transparency"
+      ]
+    }
+  ],
+  "related": {
+    "ordering_test": "https://sebbi.pro/.well-known/ordering-test.json",
+    "relationship": "The Ordering Test lists which checks a vendor supports and which anyone can run without an account. This declaration turns those checks into levels, so every AI deployment gets a rating whether or not it publishes."
+  },
+  "discovery": {
+    "paths": [
+      "/.well-known/ai-integrity.json",
+      "/x/integrity/self"
+    ],
+    "rule": "Every AI deployment is rated. A verifier looks for a declaration at each path in order, over HTTPS, on the deployment's own domain. A deployment with no declaration at any of these paths is rated L0_DIARY. Absence is itself the result.",
+    "absence_verdict": "L0_DIARY"
+  },
+  "levels": {
+    "L0_DIARY": {
+      "badge": "GREY",
+      "meaning": "No public, independently checkable record. The operator's word is the only evidence.",
+      "requires": []
+    },
+    "L1_SEALED": {
+      "badge": "BRONZE",
+      "meaning": "Every decision is sealed into a public append-only chain that anyone can walk and recompute.",
+      "requires": [
+        "INV-001",
+        "INV-002",
+        "INV-007"
+      ]
+    },
+    "L2_WITNESSED": {
+      "badge": "SILVER",
+      "meaning": "Independent parties hold the chain's fingerprints, so the operator cannot rewrite history unnoticed.",
+      "requires": [
+        "INV-001",
+        "INV-002",
+        "INV-003",
+        "INV-007"
+      ]
+    },
+    "L3_ANCHORED": {
+      "badge": "GOLD",
+      "meaning": "The chain is also anchored to a public timestamp no single party controls.",
+      "requires": [
+        "INV-001",
+        "INV-002",
+        "INV-003",
+        "INV-004",
+        "INV-007"
+      ]
+    },
+    "L4_OVERSIGHT_VERIFIED": {
+      "badge": "GOLD_LIVE_VERIFIED",
+      "meaning": "Human oversight is itself provable: reviewers commit before seeing the machine, and rubber-stamping is detected.",
+      "requires": [
+        "INV-001",
+        "INV-002",
+        "INV-003",
+        "INV-004",
+        "INV-005",
+        "INV-006",
+        "INV-007"
+      ]
+    }
+  },
+  "invariants": {
+    "INV-001-SEALED-CHAIN": {
+      "requirement": "Every decision is sealed at the moment it is made, with what it rested on, into an append-only hash chain.",
+      "test": "Fetch the declared walk endpoint. Starting from genesis, recompute every public block from the served preimage and confirm each block names its parent.",
+      "pass": "All public blocks recompute; all links unbroken; the tip reached equals the tip published.",
+      "fail_verdict": "L0_DIARY"
+    },
+    "INV-002-FINGERPRINTS-ONLY": {
+      "requirement": "Raw prompts, documents and personal data stay with their owner. Only fingerprints are published. Short or guessable personal values are salted or keyed before hashing.",
+      "test": "Inspect public blocks. No raw personal data, secrets or credentials appear. The declaration states the hashing method for personal values.",
+      "pass": "No raw personal data in any public block; method declared.",
+      "fail_verdict": "L0_DIARY"
+    },
+    "INV-003-INDEPENDENT-WITNESS": {
+      "requirement": "At least one party independent of the operator holds the chain's tip. The declaration states how many independent parties would have to collude or fail at the same time for the history to be rewritten unnoticed.",
+      "test": "Query each declared witness. Its recorded tip must appear in the operator's chain at the position it claims.",
+      "pass": "At least one independent witness confirms; the collusion threshold is disclosed.",
+      "fail_verdict": "L1_SEALED"
+    },
+    "INV-004-PUBLIC-TIME-ANCHOR": {
+      "requirement": "Chain tips are anchored to a public timestamp no single party controls, such as OpenTimestamps on Bitcoin.",
+      "test": "Verify the anchor proof offline against the tip it names.",
+      "pass": "Proof commits to a tip present in the chain.",
+      "fail_verdict": "L2_WITNESSED"
+    },
+    "INV-005-COMMIT-BEFORE-REVEAL": {
+      "requirement": "Where a human reviews an AI decision, the reviewer's verdict is sealed before the machine's verdict is shown to them.",
+      "test": "For each reviewed case, the reviewer's sealed commitment sits in an earlier block than the reveal of the machine verdict.",
+      "pass": "Every reviewed case shows commit before reveal.",
+      "fail_verdict": "L3_ANCHORED"
+    },
+    "INV-006-ANTI-RUBBER-STAMP": {
+      "requirement": "Review behaviour that indicates rubber-stamping is detected and sealed.",
+      "parameters": {
+        "minimum_review_seconds": 1.5,
+        "maximum_agreement_rate": 0.98,
+        "window": "rolling 30 days, per reviewer"
+      },
+      "test": "Any reviewer approving in under minimum_review_seconds, or agreeing with the machine more often than maximum_agreement_rate across the window, has a flag sealed into the chain.",
+      "pass": "Flags are raised and sealed whenever the thresholds are crossed; the thresholds in use are declared.",
+      "fail_verdict": "L3_ANCHORED"
+    },
+    "INV-007-DISCLOSED-DISCONTINUITY": {
+      "requirement": "Where the chain is reset, or the meaning of a field or the referent of an identifier changes after records using it have been sealed, the change is sealed into the record itself with the date it took effect. Records sealed under the earlier meaning remain valid under that meaning and are never silently repaired.",
+      "test": "Any discontinuity in the chain, or change of meaning, has a matching disclosure block.",
+      "pass": "Every discontinuity is disclosed in the chain.",
+      "fail_verdict": "L0_DIARY"
+    }
+  },
+  "verifier_rules": [
+    "Never accept an operator's own statement that its record is valid. Recompute.",
+    "A verifier assigns the highest level whose every required invariant passes.",
+    "If a declaration claims a higher level than verification supports, the verdict is OVERCLAIMED, shown alongside the verified level.",
+    "A declaration that cannot be fetched, or cannot be parsed, is rated L0_DIARY."
+  ],
+  "declaration_template": {
+    "spec": "ai-integrity-declaration",
+    "version": "1.0.0",
+    "organisation": "",
+    "system": "",
+    "claimed_level": "",
+    "chain": {
+      "walk_endpoint": "",
+      "genesis_hash": "",
+      "seal_method_url": ""
+    },
+    "personal_data_hashing": "",
+    "witnesses": [
+      {
+        "name": "",
+        "tip_endpoint": ""
+      }
+    ],
+    "collusion_threshold": 0,
+    "anchor": {
+      "method": "",
+      "proof_endpoint": ""
+    },
+    "oversight": {
+      "commit_before_reveal": false,
+      "anti_rubber_stamp": {
+        "minimum_review_seconds": 1.5,
+        "maximum_agreement_rate": 0.98
+      }
+    },
+    "discontinuities": [
+      {
+        "date": "",
+        "disclosure_block": ""
+      }
+    ]
+  },
+  "reference_implementation": {
+    "name": "sebbi.pro",
+    "walk": "https://sebbi.pro/x/walk/status",
+    "method": "https://sebbi.pro/x/walk/spec",
+    "genesis": "https://sebbi.pro/x/walk/genesis",
+    "discontinuity_example": "https://sebbi.pro/x/walk/block?index=2013"
+  },
+  "changelog": [
+    {
+      "version": "1.0.1",
+      "date": "2026-09-20",
+      "change": "Added /x/integrity/self as a second discovery path, for deployments whose server cannot serve /.well-known. Added the public checker."
+    }
+  ],
+  "public_checker": "https://sebbi.pro/x/integrity/check?domain=example.com"
+}''')
+
+_CANONICAL = json.dumps(DECLARATION, sort_keys=True, separators=(",", ":"),
+                        ensure_ascii=False)
+DECLARATION_SHA256 = hashlib.sha256(_CANONICAL.encode("utf-8")).hexdigest()
+
+# ---------------------------------------------------------------- our own declaration
+#
+# sebbi.pro's own claim. Kept honest: it claims only what the checker can
+# confirm today. To move up a level, add a witness below - an address run
+# by someone else that returns the sebbi.pro tip they hold - and raise
+# claimed_level only once the checker agrees.
+
+SELF_WITNESSES = [
+    {"name": "Red Flag AI Pro",
+     "tip_endpoint": "https://www.redflagaipro.com/",
+     "note": "Red Flag's public witness page publishes the receipt for each "
+             "exchange, including the sebbi.pro block hash it was sealed in."},
+]
+
+SELF = {
+    "spec": "ai-integrity-declaration",
+    "version": "1.0.1",
+    "organisation": "Monop Content",
+    "system": "sebbi.pro",
+    "claimed_level": "L1_SEALED",
+    "chain": {
+        "walk_endpoint": "https://sebbi.pro/x/walk/blocks",
+        "genesis_hash": "534f9e5cefb1a48566674911262151f34eedc1e6840a094d9465af4d846972c6",
+        "seal_method_url": "https://sebbi.pro/x/walk/spec",
+    },
+    "personal_data_hashing": "Customer decisions are never published. Blocks sealed under a customer key, from non-public sources, or carrying anything secret-shaped are served without payload; only their hash and link are public.",
+    "witnesses": SELF_WITNESSES,
+    "collusion_threshold": len(SELF_WITNESSES),
+    "anchor": {
+        "method": "OpenTimestamps on Bitcoin",
+        "proof_endpoint": "",
+        "status_url": "https://sebbi.pro/x/ots/status",
+    },
+    "oversight": {
+        "commit_before_reveal": True,
+        "demonstration": "https://sebbi.pro/x/demo/review",
+        "anti_rubber_stamp": {"minimum_review_seconds": 1.5,
+                              "maximum_agreement_rate": 0.98},
+    },
+    "discontinuities": [
+        {"date": "2026-09-07", "disclosure_block": 2013},
+    ],
+}
+
+# ---------------------------------------------------------------- safe fetching
+
+FETCH_TIMEOUT = 8
+MAX_DECL_BYTES = 262144
+MAX_PAGE_BYTES = 8 * 1024 * 1024
+MAX_FETCHES = 30
+WALK_PAGE = 500
+WALK_MAX_BLOCKS = 6000
+CHECK_BUDGET_SECONDS = 45
+CACHE_SECONDS = 600
+USER_AGENT = "sebbi-integrity-checker/1.2 (+https://sebbi.pro/x/integrity/status)"
+
+_HOST_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
+_BLOCKED_SUFFIXES = (".local", ".internal", ".localhost", ".lan", ".home",
+                     ".corp", ".intranet", ".arpa")
+
+_cache = {}
+_cache_lock = threading.Lock()
+_running = threading.BoundedSemaphore(2)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code,
+                                     "redirect refused", headers, fp)
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+class _Budget(object):
+    def __init__(self):
+        self.fetches = 0
+        self.deadline = time.time() + CHECK_BUDGET_SECONDS
+
+    def spend(self):
+        self.fetches += 1
+        if self.fetches > MAX_FETCHES:
+            raise RuntimeError("fetch limit reached")
+        if time.time() > self.deadline:
+            raise RuntimeError("time limit reached")
+
+
+def _clean_domain(raw):
+    d = str(raw or "").strip().lower()
+    d = re.sub(r"^[a-z]+://", "", d)
+    d = d.split("/")[0].split("?")[0].split("#")[0]
+    if "@" in d or ":" in d:
+        return None
+    d = d.rstrip(".")
+    if not _HOST_RE.match(d):
+        return None
+    if d == "localhost" or d.endswith(_BLOCKED_SUFFIXES):
+        return None
+    return d
+
+
+def _host_is_public(host):
+    try:
+        infos = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
+    except Exception:
+        return False, "does not resolve"
+    if not infos:
+        return False, "does not resolve"
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return False, "unreadable address"
+        if (ip.is_private or ip.is_loopback or ip.is_link_local or
+                ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            return False, "resolves to a non-public address"
+    return True, None
+
+
+def _safe_url(url):
+    try:
+        p = urllib.parse.urlsplit(str(url))
+    except Exception:
+        return None, "unreadable address"
+    if p.scheme != "https":
+        return None, "only https addresses are fetched"
+    if p.port not in (None, 443):
+        return None, "only port 443 is fetched"
+    if p.username or p.password:
+        return None, "addresses with credentials are refused"
+    host = _clean_domain(p.hostname or "")
+    if not host:
+        return None, "not a public domain name"
+    ok, why = _host_is_public(host)
+    if not ok:
+        return None, why
+    return urllib.parse.urlunsplit(("https", host, p.path or "/", p.query, "")), None
+
+
+def _fetch_json(url, budget, max_bytes=MAX_DECL_BYTES, allow_text=False):
+    """Returns (data, error). Never raises.
+
+    allow_text: if the response is not JSON (an ordinary web page), return
+    {"_text": <page text>} instead of an error, so a witness can publish its
+    record as a normal page."""
+    safe, why = _safe_url(url)
+    if not safe:
+        return None, why
+    try:
+        budget.spend()
+    except RuntimeError as exc:
+        return None, str(exc)
+    req = urllib.request.Request(safe, headers={
+        "User-Agent": USER_AGENT, "Accept": "application/json"})
+    try:
+        with _OPENER.open(req, timeout=FETCH_TIMEOUT) as resp:
+            raw = resp.read(max_bytes + 1)
+    except urllib.error.HTTPError as exc:
+        return None, "HTTP %s" % exc.code
+    except Exception as exc:
+        return None, "could not fetch (%s)" % exc.__class__.__name__
+    if len(raw) > max_bytes:
+        return None, "response too large"
+    text = raw.decode("utf-8", "replace")
+    try:
+        return json.loads(text), None
+    except Exception:
+        if allow_text:
+            return {"_text": text}, None
+        return None, "not valid JSON"
+
+
+# ---------------------------------------------------------------- checks
+
+_HEX64 = re.compile(r"(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])")
+WITNESS_MAX_BYTES = 2 * 1024 * 1024
+_SECRET_SHAPES = [
+    ("api key", re.compile(r"\b(?:al|sb|se)_live_[0-9a-f]{16,}")),
+    ("api key", re.compile(r"\bsk-[A-Za-z0-9_-]{20,}")),
+    ("cloud key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("access token", re.compile(r"\b(?:ghp|gho|xox[abp])[_-][A-Za-z0-9-]{10,}")),
+    ("private key", re.compile(r"BEGIN [A-Z ]*PRIVATE KEY")),
+    ("email address", re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")),
+]
+
+
+def _walk(endpoint, budget):
+    """Walk a chain served in the sebbi.pro walk format and recompute it."""
+    out = {"endpoint": endpoint, "blocks": 0, "public_recomputed": 0,
+           "withheld_linkage_only": 0, "complete": False,
+           "genesis_prev_is_GENESIS": None, "first_problem": None,
+           "tip": None}
+    hashes = {}
+    public_text = {}
+    prev = "GENESIS"
+    after = 0
+    base = endpoint.split("?")[0]
+    while True:
+        url = "%s?after=%d&limit=%d" % (base, after, WALK_PAGE)
+        page, err = _fetch_json(url, budget, MAX_PAGE_BYTES)
+        if err:
+            out["first_problem"] = out["first_problem"] or (
+                "could not read page after block %d: %s" % (after, err))
+            break
+        blocks = page.get("blocks") if isinstance(page, dict) else None
+        if not isinstance(blocks, list):
+            out["first_problem"] = "endpoint does not serve the walk format"
+            break
+        if after == 0:
+            first_prev = page.get("previous_audit_hash")
+            out["genesis_prev_is_GENESIS"] = (first_prev == "GENESIS")
+        for b in blocks:
+            idx = b.get("block_index")
+            h = str(b.get("audit_hash") or "")
+            if "preimage" in b:
+                pre = b.get("preimage")
+                if not isinstance(pre, str) or \
+                        hashlib.sha256(pre.encode("utf-8")).hexdigest() != h:
+                    out["first_problem"] = out["first_problem"] or (
+                        "block %s does not recompute" % idx)
+                try:
+                    stated_prev = json.loads(pre).get("prev_hash")
+                except Exception:
+                    stated_prev = None
+                out["public_recomputed"] += 1
+                public_text[idx] = pre
+            else:
+                stated_prev = b.get("prev_hash")
+                out["withheld_linkage_only"] += 1
+            if stated_prev != prev:
+                out["first_problem"] = out["first_problem"] or (
+                    "block %s does not link to the block before it" % idx)
+            prev = h
+            hashes[h] = idx
+            out["blocks"] += 1
+        if out["blocks"] >= WALK_MAX_BLOCKS:
+            out["first_problem"] = out["first_problem"] or (
+                "stopped at %d blocks; the checker walks at most %d"
+                % (out["blocks"], WALK_MAX_BLOCKS))
+            break
+        if not page.get("has_more"):
+            out["complete"] = True
+            break
+        nxt = page.get("next_after")
+        if not isinstance(nxt, int) or nxt <= after:
+            out["first_problem"] = out["first_problem"] or "paging did not advance"
+            break
+        after = nxt
+    out["tip"] = prev if out["blocks"] else None
+    return out, hashes, public_text
+
+
+def _hex_values(obj, found=None):
+    found = found if found is not None else set()
+    if isinstance(obj, dict):
+        for v in obj.values():
+            _hex_values(v, found)
+    elif isinstance(obj, list):
+        for v in obj:
+            _hex_values(v, found)
+    elif isinstance(obj, str):
+        for m in _HEX64.findall(obj.lower()):
+            found.add(m)
+    return found
+
+
+def _anchor_check(proof_endpoint, hashes, budget):
+    if not proof_endpoint:
+        return "fail", "no anchor proof address declared"
+    data, err = _fetch_json(proof_endpoint, budget)
+    if err:
+        return "fail", "could not read anchor proof: %s" % err
+    tip = str(data.get("tip") or "").lower() if isinstance(data, dict) else ""
+    b64 = data.get("ots_base64") if isinstance(data, dict) else None
+    if not tip or tip not in hashes:
+        return "fail", "the anchored tip is not in the walked chain"
+    if not b64:
+        return "fail", "no proof bytes served (expected ots_base64)"
+    try:
+        import base64
+        from opentimestamps.core.serialize import BytesDeserializationContext
+        from opentimestamps.core.timestamp import DetachedTimestampFile
+        from opentimestamps.core.notary import BitcoinBlockHeaderAttestation
+    except Exception:
+        return "untested", "proof reader not available on this checker"
+    try:
+        raw = base64.b64decode(b64)
+        det = DetachedTimestampFile.deserialize(BytesDeserializationContext(raw))
+    except Exception:
+        return "fail", "anchor proof could not be read"
+    expected = hashlib.sha256(bytes.fromhex(tip)).digest()
+    if det.file_digest != expected:
+        return "fail", "anchor proof is for a different value than the tip it names"
+    heights = []
+
+    def walk(ts):
+        for att in ts.attestations:
+            if isinstance(att, BitcoinBlockHeaderAttestation):
+                heights.append(att.height)
+        for _, sub in ts.ops.items():
+            walk(sub)
+    try:
+        walk(det.timestamp)
+    except Exception:
+        return "fail", "anchor proof could not be walked"
+    if not heights:
+        return "fail", "anchor proof is still pending, not yet in Bitcoin"
+    return "pass", ("proof commits the tip to Bitcoin block %s; the block "
+                    "header itself is not re-checked here - run ots verify "
+                    "to confirm against Bitcoin" % min(heights))
+
+
+_ORDER = ["L0_DIARY", "L1_SEALED", "L2_WITNESSED", "L3_ANCHORED",
+          "L4_OVERSIGHT_VERIFIED"]
+
+
+def _check(domain):
+    budget = _Budget()
+    result = {"domain": domain, "checked_at": time.strftime(
+        "%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "checker_version": VERSION,
+        "standard": BASE + "declaration"}
+
+    decl, found_at, tried = None, None, []
+    for path in DECLARATION["discovery"]["paths"]:
+        url = "https://%s%s" % (domain, path)
+        data, err = _fetch_json(url, budget)
+        tried.append({"url": url, "result": err or "found"})
+        if data is not None and isinstance(data, dict) and \
+                data.get("spec") == "ai-integrity-declaration":
+            decl, found_at = data, url
+            break
+        if data is not None and not err:
+            tried[-1]["result"] = "not an ai-integrity-declaration"
+    result["looked_at"] = tried
+
+    if decl is None:
+        result.update({
+            "verified_level": "L0_DIARY", "badge": "GREY",
+            "verdict": "No declaration found. Under the standard, silence is "
+                       "a rating: L0_DIARY, the operator's word is the only "
+                       "evidence.",
+            "how_to_improve": "Publish a declaration at https://%s/.well-known/"
+                              "ai-integrity.json using the declaration_template "
+                              "in %s" % (domain, BASE + "declaration")})
+        return result
+
+    result["declaration_url"] = found_at
+    claimed = str(decl.get("claimed_level") or "")
+    result["claimed_level"] = claimed or None
+    checks = {}
+
+    # INV-001 and INV-007 need the chain.
+    chain = decl.get("chain") or {}
+    endpoint = chain.get("walk_endpoint")
+    hashes, public_text, walk = {}, {}, None
+    if not endpoint:
+        checks["INV-001"] = {"result": "fail", "why": "no walk_endpoint declared"}
+    else:
+        walk, hashes, public_text = _walk(endpoint, budget)
+        ok = (walk["complete"] and walk["blocks"] > 0 and
+              walk["genesis_prev_is_GENESIS"] and not walk["first_problem"])
+        genesis_ok = True
+        declared_genesis = str(chain.get("genesis_hash") or "").lower()
+        if declared_genesis and hashes:
+            first = min(hashes.items(), key=lambda kv: kv[1] if isinstance(kv[1], int) else 0)
+            genesis_ok = (first[0] == declared_genesis)
+        checks["INV-001"] = {
+            "result": "pass" if (ok and genesis_ok) else "fail",
+            "why": walk["first_problem"] or (
+                None if genesis_ok else "declared genesis_hash is not the first block"),
+            "walk": walk}
+
+    # INV-002: no secret-shaped or personal values in public blocks.
+    hits = []
+    for idx, text in public_text.items():
+        for label, rx in _SECRET_SHAPES:
+            if rx.search(text):
+                hits.append({"block_index": idx, "found": label})
+                break
+        if len(hits) >= 10:
+            break
+    if not decl.get("personal_data_hashing"):
+        checks["INV-002"] = {"result": "fail",
+                             "why": "personal_data_hashing not declared"}
+    elif not public_text:
+        checks["INV-002"] = {"result": "fail",
+                             "why": "no public blocks to inspect"}
+    elif hits:
+        checks["INV-002"] = {"result": "fail",
+                             "why": "public blocks contain values that look "
+                                    "personal or secret (values not repeated here)",
+                             "blocks": hits}
+    else:
+        checks["INV-002"] = {"result": "pass",
+                             "why": "%d public blocks inspected; nothing "
+                                    "personal or secret-shaped found"
+                                    % len(public_text)}
+
+    # INV-007: every declared discontinuity has its disclosure in the chain.
+    discs = decl.get("discontinuities") or []
+    missing = []
+    for disc in discs:
+        blk = disc.get("disclosure_block") if isinstance(disc, dict) else None
+        try:
+            blk = int(blk)
+        except (TypeError, ValueError):
+            missing.append(str(blk))
+            continue
+        if blk not in public_text:
+            missing.append(str(blk))
+    if checks["INV-001"]["result"] != "pass":
+        checks["INV-007"] = {"result": "fail", "why": "chain could not be verified"}
+    elif missing:
+        checks["INV-007"] = {"result": "fail",
+                             "why": "declared disclosure blocks not found as "
+                                    "public blocks: %s" % ", ".join(missing)}
+    else:
+        checks["INV-007"] = {"result": "pass",
+                             "why": "%d declared discontinuity disclosure(s) "
+                                    "found in the chain" % len(discs)
+                                    if discs else "no discontinuities declared; "
+                                    "the chain walked continuously from genesis"}
+
+    # INV-003: at least one declared witness holds a tip that is in our chain.
+    witnesses = decl.get("witnesses") or []
+    witness_results = []
+    for w in witnesses[:5]:
+        if not isinstance(w, dict) or not w.get("tip_endpoint"):
+            continue
+        data, err = _fetch_json(w.get("tip_endpoint"), budget,
+                                WITNESS_MAX_BYTES, allow_text=True)
+        if err:
+            witness_results.append({"name": w.get("name"), "result": "fail",
+                                    "why": err})
+            continue
+        held = _hex_values(data) & set(hashes.keys())
+        entry = {
+            "name": w.get("name"),
+            "url": w.get("tip_endpoint"),
+            "result": "pass" if held else "fail",
+            "why": "publishes %d hash(es) that are blocks in the chain"
+                   % len(held) if held else
+                   "published no value found in the chain"}
+        if held:
+            entry["matched_blocks"] = sorted(
+                hashes[h] for h in held if isinstance(hashes.get(h), int))[-5:]
+        witness_results.append(entry)
+    if any(r["result"] == "pass" for r in witness_results):
+        checks["INV-003"] = {"result": "pass", "witnesses": witness_results,
+                             "collusion_threshold_declared":
+                                 decl.get("collusion_threshold"),
+                             "note": "Independence of each witness is as "
+                                     "declared; the checker confirms they "
+                                     "hold the tip, not who runs them."}
+    else:
+        checks["INV-003"] = {"result": "fail",
+                             "why": "no declared witness confirmed a tip in "
+                                    "the chain" if witness_results else
+                                    "no witnesses declared",
+                             "witnesses": witness_results}
+
+    # INV-004: an anchor proof committing a chain tip to Bitcoin.
+    anchor = decl.get("anchor") or {}
+    res, why = _anchor_check(anchor.get("proof_endpoint"), hashes, budget)
+    checks["INV-004"] = {"result": res, "why": why}
+
+    # INV-005 / INV-006 cannot be tested from outside yet.
+    for inv in ("INV-005", "INV-006"):
+        checks[inv] = {"result": "untested",
+                       "why": "human-oversight checks cannot yet be tested "
+                              "from outside; this checker never awards L4"}
+
+    level = "L0_DIARY"
+    for name in _ORDER[1:]:
+        needs = [r.split("-")[0] + "-" + r.split("-")[1]
+                 for r in DECLARATION["levels"][name]["requires"]]
+        if all(checks.get(n, {}).get("result") == "pass" for n in needs):
+            level = name
+        else:
+            break
+
+    result["checks"] = checks
+    result["verified_level"] = level
+    result["badge"] = DECLARATION["levels"][level]["badge"]
+    if claimed in _ORDER and _ORDER.index(claimed) > _ORDER.index(level):
+        result["verdict"] = "OVERCLAIMED: declares %s, verifies as %s." % (claimed, level)
+        result["overclaimed"] = True
+    else:
+        result["verdict"] = "Verifies as %s." % level
+        result["overclaimed"] = False
+    result["rule"] = ("Nothing in the declaration was taken on trust. Every "
+                      "pass above was recomputed or fetched by this checker.")
+    return result
+
+
+def _check_route(data):
+    domain = _clean_domain((data or {}).get("domain"))
+    if not domain:
+        return {"ok": False, "error": "domain_required",
+                "example": BASE + "check?domain=example.com",
+                "detail": "Give a public domain name, e.g. domain=example.com"}, 400
+    now = time.time()
+    with _cache_lock:
+        hit = _cache.get(domain)
+        if hit and now - hit[0] < CACHE_SECONDS:
+            out = dict(hit[1])
+            out["cached_seconds_ago"] = int(now - hit[0])
+            return out, 200
+    if not _running.acquire(blocking=False):
+        return {"ok": False, "error": "busy",
+                "detail": "Two checks are already running. Try again in a "
+                          "minute."}, 429
+    try:
+        out = _check(domain)
+    except Exception as exc:
+        out = {"domain": domain, "verified_level": "L0_DIARY", "badge": "GREY",
+               "error": "check_failed", "detail": str(exc)[:200]}
+    finally:
+        _running.release()
+    out["ok"] = True
+    with _cache_lock:
+        _cache[domain] = (time.time(), out)
+        if len(_cache) > 500:
+            oldest = sorted(_cache.items(), key=lambda kv: kv[1][0])[:100]
+            for k, _ in oldest:
+                _cache.pop(k, None)
+    return out, 200
+
+
+def _status():
+    return {
+        "ok": True,
+        "module": "integrity",
+        "version": VERSION,
+        "standard": DECLARATION.get("spec"),
+        "standard_version": DECLARATION.get("version"),
+        "declaration_id": DECLARATION.get("declaration_id"),
+        "declaration_sha256": DECLARATION_SHA256,
+        "levels": list(DECLARATION.get("levels", {}).keys()),
+        "invariants": list(DECLARATION.get("invariants", {}).keys()),
+        "links": {
+            "declaration": BASE + "declaration",
+            "check_any_domain": BASE + "check?domain=example.com",
+            "sebbi_self_declaration": BASE + "self",
+            "check_sebbi": BASE + "check?domain=sebbi.pro",
+            "ordering_test": "https://sebbi.pro/.well-known/ordering-test.json",
+        },
+        "how_to_adopt": "Publish your own filled-in declaration_template at "
+                        "/.well-known/ai-integrity.json on your own domain, "
+                        "then check it at " + BASE + "check?domain=yourdomain",
+        "hash_note": "declaration_sha256 is SHA-256 of the declaration as "
+                     "compact JSON with sorted keys, so anyone can confirm "
+                     "the text they are reading is the text published.",
+    }
+
+
+def handle(method, action, data, api_key, ctx):
+    data = data or {}
+    if isinstance(data.get("domain"), list):
+        data = dict(data)
+        data["domain"] = data["domain"][0] if data["domain"] else ""
+    if method == "GET" and action in ("status", "spec", ""):
+        return _status(), 200
+    if method == "GET" and action == "declaration":
+        return DECLARATION, 200
+    if method == "GET" and action == "self":
+        return SELF, 200
+    if method == "GET" and action == "check":
+        return _check_route(data)
+    return {"ok": False, "error": "unknown_action",
+            "get": sorted(a for m, a in PUBLIC if m == "GET"),
+            "post": []}, 404
+
+```
+
+
 ## `modules/investor.py`
 
 298 lines, 23897 bytes
@@ -1528,802 +2369,5 @@ def _receipt(ctx, data):
                         "without an account, without contacting us, and without trusting anyone "
                         "in the chain including the sender.",
     }, 200
-
-```
-
-
-## `modules/map.py`
-
-238 lines, 17926 bytes
-
-```python
-"""
-modules/map.py  v1.0.0
-Serves the layer-map page at /map.
-
-Page module, same family as investor.py / console.py / network.py: a runtime
-do_GET patch puts a full HTML page at a clean URL. Armed by hitting
-/x/map/status once after each deploy. server.py is never edited. The page is
-base64-embedded so no character in the HTML can break the Python string.
-"""
-
-import base64
-import sys
-
-VERSION = "1.0.0"
-PAGE_PATH = "/map"
-
-_B64 = (
-    "PCFET0NUWVBFIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+CjxtZXRhIGNoYXJzZXQ9IlVURi04Ij4KPG1ldGEgbmFtZT0i"
-    "dmlld3BvcnQiIGNvbnRlbnQ9IndpZHRoPWRldmljZS13aWR0aCwgaW5pdGlhbC1zY2FsZT0xLCB2aWV3cG9ydC1maXQ9Y292ZXIi"
-    "Pgo8dGl0bGU+V2hlcmUgc2ViYmkucHJvIHNpdHMg4oCUIHRoZSBsYXllciBtYXA8L3RpdGxlPgo8bWV0YSBuYW1lPSJkZXNjcmlw"
-    "dGlvbiIgY29udGVudD0iQSBiaXJkJ3MtZXllIG1hcCBvZiB0aGUgc3RhY2suIE1vbml0b3Jpbmcgd2F0Y2hlcyBmcm9tIHRoZSBz"
-    "aWRlLCBhZnRlciB0aGUgZmFjdC4gQXV0b25vbW91cyBkZWNpc2lvbnMgY2FuJ3QgYmUgcHJvdmVuIGZyb20gdGhhdCBsYXllci4g"
-    "c2ViYmkucHJvIHNpdHMgdW5kZXJuZWF0aCB0aGUgZGVjaXNpb24sIHNlYWxpbmcgaXQgYXMgaXQgaGFwcGVucy4iPgo8bGluayBy"
-    "ZWw9InByZWNvbm5lY3QiIGhyZWY9Imh0dHBzOi8vZm9udHMuZ29vZ2xlYXBpcy5jb20iPgo8bGluayBocmVmPSJodHRwczovL2Zv"
-    "bnRzLmdvb2dsZWFwaXMuY29tL2NzczI/ZmFtaWx5PU5ld3NyZWFkZXI6b3Bzeix3Z2h0QDYuLjcyLDQwMDs2Li43Miw1MDA7Ni4u"
-    "NzIsNjAwJmZhbWlseT1JQk0rUGxleCtTYW5zOndnaHRANDAwOzUwMDs2MDA7NzAwJmZhbWlseT1JQk0rUGxleCtNb25vOndnaHRA"
-    "NDAwOzUwMCZkaXNwbGF5PXN3YXAiIHJlbD0ic3R5bGVzaGVldCI+CjxzdHlsZT4KOnJvb3R7CiAgLS1pbms6IzBhMGYxZTstLWlu"
-    "azI6IzEwMTgyZTstLXBhcGVyOiNGQUZBRjY7LS1saW5lOiNERURCRDE7CiAgLS1nb2xkOiNjOWE4NGM7LS1vazojMkU3RDU3Oy0t"
-    "b2stYmc6I0U0RUNFODsKICAtLXdhcm46IzlDMkYyNjstLXdhcm4tYmc6I0Y1RTZFMzstLW11dGVkOiM1QTYyNzA7LS1mYWludDoj"
-    "OEE5MEEwOwogIC0tc2FuczonSUJNIFBsZXggU2Fucycsc3lzdGVtLXVpLHNhbnMtc2VyaWY7CiAgLS1zZXJpZjonTmV3c3JlYWRl"
-    "cicsR2VvcmdpYSxzZXJpZjsKICAtLW1vbm86J0lCTSBQbGV4IE1vbm8nLHVpLW1vbm9zcGFjZSxtb25vc3BhY2U7Cn0KKntib3gt"
-    "c2l6aW5nOmJvcmRlci1ib3g7bWFyZ2luOjA7cGFkZGluZzowfQpib2R5e2ZvbnQtZmFtaWx5OnZhcigtLXNhbnMpO2JhY2tncm91"
-    "bmQ6dmFyKC0tcGFwZXIpO2NvbG9yOnZhcigtLWluayk7bGluZS1oZWlnaHQ6MS42Oy13ZWJraXQtZm9udC1zbW9vdGhpbmc6YW50"
-    "aWFsaWFzZWR9Ci53cmFwe21heC13aWR0aDo4MjBweDttYXJnaW46MCBhdXRvO3BhZGRpbmc6MCAyNHB4fQoKLyogdG9wIGJhciAq"
-    "LwoudG9we2JvcmRlci1ib3R0b206MXB4IHNvbGlkIHZhcigtLWxpbmUpO3BhZGRpbmc6MTZweCAwfQoudG9wIC53cmFwe2Rpc3Bs"
-    "YXk6ZmxleDtqdXN0aWZ5LWNvbnRlbnQ6c3BhY2UtYmV0d2VlbjthbGlnbi1pdGVtczpiYXNlbGluZTtnYXA6MTJweDtmbGV4LXdy"
-    "YXA6d3JhcH0KLmJyYW5ke2ZvbnQtZmFtaWx5OnZhcigtLW1vbm8pO2ZvbnQtc2l6ZToxM3B4O2NvbG9yOnZhcigtLWluayl9Ci5i"
-    "cmFuZCBie2NvbG9yOnZhcigtLWdvbGQpO2ZvbnQtd2VpZ2h0OjUwMH0KLnRvcCBuYXZ7Zm9udC1mYW1pbHk6dmFyKC0tbW9ubyk7"
-    "Zm9udC1zaXplOjEyLjVweH0KLnRvcCBuYXYgYXtjb2xvcjp2YXIoLS1tdXRlZCk7dGV4dC1kZWNvcmF0aW9uOm5vbmU7bWFyZ2lu"
-    "LWxlZnQ6MTZweH0KLnRvcCBuYXYgYTpob3Zlcntjb2xvcjp2YXIoLS1pbmspfQoKLyogaGVybyAqLwouaGVyb3twYWRkaW5nOjU2"
-    "cHggMCAyMHB4fQouaGVybyBoMXtmb250LWZhbWlseTp2YXIoLS1zZXJpZik7Zm9udC13ZWlnaHQ6NTAwO2ZvbnQtc2l6ZTpjbGFt"
-    "cCgzMHB4LDUuNXZ3LDUwcHgpO2xpbmUtaGVpZ2h0OjEuMDg7bGV0dGVyLXNwYWNpbmc6LTAuMDFlbTttYXgtd2lkdGg6MTdjaDtt"
-    "YXJnaW4tYm90dG9tOjE4cHh9Ci5oZXJvIHB7Zm9udC1zaXplOjE3cHg7Y29sb3I6dmFyKC0tbXV0ZWQpO21heC13aWR0aDo1NmNo"
-    "fQoKLyogdGhlIHN0YWNrIOKAlCB0aGUgaGVybyB2aXN1YWwgKi8KLnN0YWNre3BhZGRpbmc6MjRweCAwIDhweH0KLmxheWVye2Jv"
-    "cmRlcjoxcHggc29saWQgdmFyKC0tbGluZSk7Ym9yZGVyLXJhZGl1czo2cHg7cGFkZGluZzoyMHB4IDIycHg7bWFyZ2luLWJvdHRv"
-    "bToxNHB4O2JhY2tncm91bmQ6I2ZmZjtwb3NpdGlvbjpyZWxhdGl2ZX0KLmxheWVyIC50YWd7Zm9udC1mYW1pbHk6dmFyKC0tbW9u"
-    "byk7Zm9udC1zaXplOjExcHg7bGV0dGVyLXNwYWNpbmc6MC4wNGVtO2NvbG9yOnZhcigtLWZhaW50KTttYXJnaW4tYm90dG9tOjdw"
-    "eH0KLmxheWVyIGgze2ZvbnQtZmFtaWx5OnZhcigtLXNlcmlmKTtmb250LXdlaWdodDo1MDA7Zm9udC1zaXplOjIxcHg7bWFyZ2lu"
-    "LWJvdHRvbTo2cHg7bGluZS1oZWlnaHQ6MS4yfQoubGF5ZXIgcHtmb250LXNpemU6MTQuNXB4O2NvbG9yOnZhcigtLW11dGVkKTtt"
-    "YXgtd2lkdGg6NjBjaH0KLmxheWVyIC52ZXJkaWN0e2Rpc3BsYXk6aW5saW5lLWJsb2NrO2ZvbnQtZmFtaWx5OnZhcigtLW1vbm8p"
-    "O2ZvbnQtc2l6ZToxMnB4O21hcmdpbi10b3A6MTJweDtwYWRkaW5nOjRweCAxMHB4O2JvcmRlci1yYWRpdXM6M3B4fQoudi1ub3ti"
-    "YWNrZ3JvdW5kOnZhcigtLXdhcm4tYmcpO2NvbG9yOnZhcigtLXdhcm4pfQoudi15ZXN7YmFja2dyb3VuZDp2YXIoLS1vay1iZyk7"
-    "Y29sb3I6dmFyKC0tb2spfQoKLyogdGhlIHR3byB3YXRjaGVyIGxheWVycywgZHJhd24gYXMgYm9sdGVkIG9uIGJlc2lkZSAqLwou"
-    "d2F0Y2h7Ym9yZGVyLXN0eWxlOmRhc2hlZDtib3JkZXItY29sb3I6I0M5Q0JkMH0KLndhdGNoIGgze2NvbG9yOnZhcigtLW11dGVk"
-    "KX0KLmFzaWRle2ZvbnQtZmFtaWx5OnZhcigtLW1vbm8pO2ZvbnQtc2l6ZToxMXB4O2NvbG9yOnZhcigtLWZhaW50KTtwb3NpdGlv"
-    "bjphYnNvbHV0ZTt0b3A6MjBweDtyaWdodDoyMnB4fQoKLyogdGhlIGV4ZWN1dGlvbiBsYXllciDigJQgbmV1dHJhbCAqLwouZXhl"
-    "Y3tiYWNrZ3JvdW5kOnZhcigtLWluayk7Ym9yZGVyLWNvbG9yOnZhcigtLWluayl9Ci5leGVjIC50YWd7Y29sb3I6cmdiYSgyNTUs"
-    "MjU1LDI1NSwwLjUpfQouZXhlYyBoM3tjb2xvcjojZmZmfQouZXhlYyBwe2NvbG9yOnJnYmEoMjU1LDI1NSwyNTUsMC43Mil9Cgov"
-    "KiB0aGUgZXZpZGVuY2UgbGF5ZXIg4oCUIHRoZSBvbmUgdGhhdCBtYXR0ZXJzICovCi5ldmlkZW5jZXtiYWNrZ3JvdW5kOnZhcigt"
-    "LWluayk7Ym9yZGVyOjJweCBzb2xpZCB2YXIoLS1nb2xkKTtib3gtc2hhZG93OjAgOHB4IDMwcHggcmdiYSgyMDEsMTY4LDc2LDAu"
-    "MTIpfQouZXZpZGVuY2UgLnRhZ3tjb2xvcjp2YXIoLS1nb2xkKX0KLmV2aWRlbmNlIGgze2NvbG9yOiNmZmY7Zm9udC1zaXplOjIz"
-    "cHh9Ci5ldmlkZW5jZSBwe2NvbG9yOnJnYmEoMjU1LDI1NSwyNTUsMC44KX0KLmV2aWRlbmNlIC5mb3VuZGF0aW9ue2ZvbnQtZmFt"
-    "aWx5OnZhcigtLW1vbm8pO2ZvbnQtc2l6ZToxMnB4O2NvbG9yOnZhcigtLWdvbGQpO21hcmdpbi10b3A6MTRweDtkaXNwbGF5OmZs"
-    "ZXg7ZmxleC13cmFwOndyYXA7Z2FwOjhweH0KLmV2aWRlbmNlIC5mb3VuZGF0aW9uIHNwYW57Ym9yZGVyOjFweCBzb2xpZCByZ2Jh"
-    "KDIwMSwxNjgsNzYsMC4zNSk7Ym9yZGVyLXJhZGl1czozcHg7cGFkZGluZzozcHggOXB4fQoKLyogY29ubmVjdGl2ZSBub3RlIGJl"
-    "dHdlZW4gd2F0Y2hlcnMgYW5kIHRoZSByZXN0ICovCi5nYXAtbm90ZXtmb250LWZhbWlseTp2YXIoLS1tb25vKTtmb250LXNpemU6"
-    "MTJweDtjb2xvcjp2YXIoLS1mYWludCk7dGV4dC1hbGlnbjpjZW50ZXI7cGFkZGluZzo2cHggMCAxOHB4fQoKLyogYXJndW1lbnQg"
-    "c2VjdGlvbiAqLwouYXJne3BhZGRpbmc6NDRweCAwO2JvcmRlci10b3A6MXB4IHNvbGlkIHZhcigtLWxpbmUpO21hcmdpbi10b3A6"
-    "MjRweH0KLmFyZyBoMntmb250LWZhbWlseTp2YXIoLS1zZXJpZik7Zm9udC13ZWlnaHQ6NTAwO2ZvbnQtc2l6ZTpjbGFtcCgyNHB4"
-    "LDR2dywzNHB4KTtsaW5lLWhlaWdodDoxLjE1O21hcmdpbi1ib3R0b206MThweDttYXgtd2lkdGg6MjBjaH0KLmFyZyBwe2ZvbnQt"
-    "c2l6ZToxNS41cHg7Y29sb3I6dmFyKC0tbXV0ZWQpO21heC13aWR0aDo2MmNoO21hcmdpbi1ib3R0b206MTRweH0KLmFyZyBwIGJ7"
-    "Y29sb3I6dmFyKC0taW5rKTtmb250LXdlaWdodDo2MDB9CgovKiB0aGUgZm91ciBxdWVzdGlvbnMgKi8KLnF7Ym9yZGVyLWxlZnQ6"
-    "MnB4IHNvbGlkIHZhcigtLWdvbGQpO3BhZGRpbmc6NHB4IDAgNHB4IDE4cHg7bWFyZ2luOjAgMCAyMHB4fQoucSBoNHtmb250LXNp"
-    "emU6MTZweDttYXJnaW4tYm90dG9tOjVweH0KLnEgcHtmb250LXNpemU6MTQuNXB4O21hcmdpbjowfQoKLyogY2xvc2UgKi8KLmNs"
-    "b3Nle2JhY2tncm91bmQ6dmFyKC0taW5rKTtjb2xvcjp2YXIoLS1wYXBlcik7Ym9yZGVyLXJhZGl1czo4cHg7cGFkZGluZzozNHB4"
-    "O21hcmdpbjozMHB4IDAgNjBweH0KLmNsb3NlIGgye2ZvbnQtZmFtaWx5OnZhcigtLXNlcmlmKTtmb250LXdlaWdodDo1MDA7Y29s"
-    "b3I6I2ZmZjtmb250LXNpemU6MjZweDttYXJnaW4tYm90dG9tOjEycHg7bWF4LXdpZHRoOjIyY2h9Ci5jbG9zZSBwe2ZvbnQtc2l6"
-    "ZToxNXB4O2NvbG9yOnJnYmEoMjU1LDI1NSwyNTUsMC43NSk7bWF4LXdpZHRoOjU2Y2g7bWFyZ2luLWJvdHRvbToyMHB4fQouY2xv"
-    "c2UgYXtkaXNwbGF5OmlubGluZS1ibG9jaztmb250LWZhbWlseTp2YXIoLS1tb25vKTtmb250LXNpemU6MTMuNXB4O3RleHQtZGVj"
-    "b3JhdGlvbjpub25lO21hcmdpbjo0cHggMTRweCA0cHggMH0KLmNsb3NlIGEucHJpbWFyeXtiYWNrZ3JvdW5kOnZhcigtLWdvbGQp"
-    "O2NvbG9yOnZhcigtLWluayk7cGFkZGluZzoxMnB4IDIwcHg7Ym9yZGVyLXJhZGl1czo1cHg7Zm9udC13ZWlnaHQ6NTAwfQouY2xv"
-    "c2UgYS5naG9zdHtjb2xvcjp2YXIoLS1nb2xkKTtib3JkZXI6MXB4IHNvbGlkIHJnYmEoMjAxLDE2OCw3NiwwLjQpO3BhZGRpbmc6"
-    "MTJweCAyMHB4O2JvcmRlci1yYWRpdXM6NXB4fQoKZm9vdGVye2JvcmRlci10b3A6MXB4IHNvbGlkIHZhcigtLWxpbmUpO3BhZGRp"
-    "bmc6MjRweCAwIDUwcHh9CmZvb3RlciBwe2ZvbnQtZmFtaWx5OnZhcigtLW1vbm8pO2ZvbnQtc2l6ZToxMS41cHg7Y29sb3I6dmFy"
-    "KC0tZmFpbnQpO2xpbmUtaGVpZ2h0OjEuOH0KCkBtZWRpYShwcmVmZXJzLXJlZHVjZWQtbW90aW9uOnJlZHVjZSl7Knt0cmFuc2l0"
-    "aW9uOm5vbmUhaW1wb3J0YW50O2FuaW1hdGlvbjpub25lIWltcG9ydGFudH19Cjwvc3R5bGU+CjwvaGVhZD4KPGJvZHk+Cgo8aGVh"
-    "ZGVyIGNsYXNzPSJ0b3AiPgogIDxkaXYgY2xhc3M9IndyYXAiPgogICAgPGRpdiBjbGFzcz0iYnJhbmQiPnNlYmJpPGI+LnBybzwv"
-    "Yj48L2Rpdj4KICAgIDxuYXY+CiAgICAgIDxhIGhyZWY9Ii8iPkhvbWU8L2E+CiAgICAgIDxhIGhyZWY9Ii93aGl0ZXBhcGVyIj5X"
-    "aGl0ZXBhcGVyPC9hPgogICAgICA8YSBocmVmPSIvaW52ZXN0b3ItcHJvc3BlY3R1cyI+SW52ZXN0PC9hPgogICAgPC9uYXY+CiAg"
-    "PC9kaXY+CjwvaGVhZGVyPgoKPGRpdiBjbGFzcz0id3JhcCI+CgogIDxzZWN0aW9uIGNsYXNzPSJoZXJvIj4KICAgIDxoMT5FdmVy"
-    "eW9uZSBpcyB3YXRjaGluZyB0aGUgc3lzdGVtLiBBbG1vc3Qgbm9ib2R5IGlzIHVuZGVybmVhdGggaXQuPC9oMT4KICAgIDxwPlRo"
-    "aXMgaXMgdGhlIHdob2xlIHN0YWNrLCB0b3AgdG8gYm90dG9tLiBUaGUgdG9vbHMgbW9zdCBvcmdhbmlzYXRpb25zIHJlbHkgb24g"
-    "c2l0IHRvIHRoZSBzaWRlIGFuZCB3YXRjaC4gVGhlIHBsYWNlIGEgZGVjaXNpb24gYWN0dWFsbHkgaGFzIHRvIGJlIHByb3ZlbiBp"
-    "cyB0aGUgbGF5ZXIgYmVuZWF0aCBpdCDigJQgYW5kIHRoYXQgbGF5ZXIgaXMgbmVhcmx5IGFsd2F5cyBlbXB0eS48L3A+CiAgPC9z"
-    "ZWN0aW9uPgoKICA8c2VjdGlvbiBjbGFzcz0ic3RhY2siIGFyaWEtbGFiZWw9IlRoZSBzdGFjaywgdG9wIHRvIGJvdHRvbSI+Cgog"
-    "ICAgPGRpdiBjbGFzcz0ibGF5ZXIgd2F0Y2giPgogICAgICA8ZGl2IGNsYXNzPSJ0YWciPmJvbHRlZCBvbiDCtyB3YXRjaGVzIGZy"
-    "b20gdGhlIHNpZGU8L2Rpdj4KICAgICAgPHNwYW4gY2xhc3M9ImFzaWRlIj5vYnNlcnZhYmlsaXR5PC9zcGFuPgogICAgICA8aDM+"
-    "TW9uaXRvcmluZyAmYW1wOyBkYXNoYm9hcmRzPC9oMz4KICAgICAgPHA+TG9nZ2luZyBwbGF0Zm9ybXMsIGRhc2hib2FyZHMsIGFs"
-    "ZXJ0aW5nLiBUaGV5IHJlYWQgd2hhdCB0aGUgc3lzdGVtIGVtaXRzIGFuZCBzaG93IGl0IGJhY2sgdG8geW91LiBUaGUgcmVjb3Jk"
-    "IHRoZXkga2VlcCBsaXZlcyBpbiBhIGRhdGFiYXNlIHlvdXIgb3duIHRlYW0gY2FuIGVkaXQsIHNvIGl0IHNheXMgd2hhdCB5b3Ug"
-    "Y3VycmVudGx5IGNsYWltIGhhcHBlbmVkIOKAlCBub3QgdGhhdCBub3RoaW5nIGNoYW5nZWQgaXQgc2luY2UuPC9wPgogICAgICA8"
-    "c3BhbiBjbGFzcz0idmVyZGljdCB2LW5vIj53YXRjaGVzIMK3IGNhbm5vdCBwcm92ZTwvc3Bhbj4KICAgIDwvZGl2PgoKICAgIDxk"
-    "aXYgY2xhc3M9ImxheWVyIHdhdGNoIj4KICAgICAgPGRpdiBjbGFzcz0idGFnIj5ib2x0ZWQgb24gwrcgcmVhZHMgdGhlIG91dHB1"
-    "dDwvZGl2PgogICAgICA8c3BhbiBjbGFzcz0iYXNpZGUiPmd1YXJkcmFpbHM8L3NwYW4+CiAgICAgIDxoMz5GaWx0ZXJzICZhbXA7"
-    "IGd1YXJkcmFpbHM8L2gzPgogICAgICA8cD5Db250ZW50IGZpbHRlcnMgYW5kIHBvbGljeSBsYXllcnMgdGhhdCBpbnNwZWN0IHdo"
-    "YXQgYSBtb2RlbCBzYXlzLiBVc2VmdWwsIGJ1dCB0aGV5IGFjdCBvbiB0aGUgdGV4dCBhZnRlciB0aGUgbW9kZWwgaGFzIHByb2R1"
-    "Y2VkIGl0LCBhbmQgdGhleSBrZWVwIG5vIGV2aWRlbmNlIGEgcmVndWxhdG9yIGNhbiBjaGVjayB3aXRob3V0IHRydXN0aW5nIHRo"
-    "ZSB2ZW5kb3Igd2hvIHdyb3RlIHRoZW0uPC9wPgogICAgICA8c3BhbiBjbGFzcz0idmVyZGljdCB2LW5vIj5maWx0ZXJzIMK3IGNh"
-    "bm5vdCBwcm92ZTwvc3Bhbj4KICAgIDwvZGl2PgoKICAgIDxkaXYgY2xhc3M9ImdhcC1ub3RlIj7ihpEgZXZlcnl0aGluZyBhYm92"
-    "ZSB3YXRjaGVzIGFmdGVyIHRoZSBmYWN0IOKGkTwvZGl2PgoKICAgIDxkaXYgY2xhc3M9ImxheWVyIGV4ZWMiPgogICAgICA8ZGl2"
-    "IGNsYXNzPSJ0YWciPndoZXJlIHRoZSBkZWNpc2lvbiBoYXBwZW5zPC9kaXY+CiAgICAgIDxoMz5UaGUgZXhlY3V0aW9uIGxheWVy"
-    "PC9oMz4KICAgICAgPHA+VGhlIG1vZGVsLCB0aGUgYWdlbnQsIHRoZSBhdXRvbWF0ZWQgZGVjaXNpb24gaXRzZWxmIOKAlCB0aGUg"
-    "bW9tZW50IHNvbWV0aGluZyBpcyBhY3R1YWxseSBkZWNpZGVkIGFuZCBhY3RlZCBvbi4gVGhpcyBpcyB0aGUgZXZlbnQgdGhhdCBo"
-    "YXMgdG8gYmUgZXZpZGVuY2VkLiBJdCBpcyBhbHNvIHRoZSBtb21lbnQgdGhlIHdhdGNoaW5nIGxheWVycyBhYm92ZSBvbmx5IGV2"
-    "ZXIgc2VlIHNlY29uZC1oYW5kLjwvcD4KICAgIDwvZGl2PgoKICAgIDxkaXYgY2xhc3M9ImxheWVyIGV2aWRlbmNlIj4KICAgICAg"
-    "PGRpdiBjbGFzcz0idGFnIj51bmRlcm5lYXRoIHRoZSBkZWNpc2lvbiDCtyBzZWFscyBpdCBhcyBpdCBoYXBwZW5zPC9kaXY+CiAg"
-    "ICAgIDxoMz5UaGUgZXZpZGVuY2UgbGF5ZXIg4oCUIHdoZXJlIHNlYmJpLnBybyBzaXRzPC9oMz4KICAgICAgPHA+RWFjaCBkZWNp"
-    "c2lvbiBpcyBzZWFsZWQgaW50byBhIGhhc2ggY2hhaW4gYXQgdGhlIG1vbWVudCBpdCBpcyBtYWRlLCBhbmNob3JlZCB0byBhIGNs"
-    "b2NrIG5vYm9keSBjb250cm9scywgYW5kIGNyb3NzLXdpdG5lc3NlZCBieSBpbmRlcGVuZGVudCBzeXN0ZW1zLiBOb3QgYSByZWNv"
-    "cmQgeW91IGtlZXAgYW5kIGhvcGUgaXMgYmVsaWV2ZWQg4oCUIGEgcmVjb3JkIGFueW9uZSBjYW4gdmVyaWZ5IHdpdGggeW91ciBj"
-    "b21wYW55IHN3aXRjaGVkIG9mZi48L3A+CiAgICAgIDxkaXYgY2xhc3M9ImZvdW5kYXRpb24iPgogICAgICAgIDxzcGFuPmhhc2gg"
-    "Y2hhaW48L3NwYW4+PHNwYW4+ZXh0ZXJuYWwgYW5jaG9yPC9zcGFuPjxzcGFuPmluZGVwZW5kZW50IHdpdG5lc3Nlczwvc3Bhbj48"
-    "c3Bhbj5wdWJsaWMgdmVyaWZpY2F0aW9uPC9zcGFuPgogICAgICA8L2Rpdj4KICAgICAgPHNwYW4gY2xhc3M9InZlcmRpY3Qgdi15"
-    "ZXMiPnByb3ZlcyDCtyBjYW5ub3QgYmUgZWRpdGVkPC9zcGFuPgogICAgPC9kaXY+CgogIDwvc2VjdGlvbj4KCiAgPHNlY3Rpb24g"
-    "Y2xhc3M9ImFyZyI+CiAgICA8aDI+V2h5IHRoZSB3YXRjaGluZyBsYXllciBjYW4ndCBjYXJyeSBhdXRvbm9tb3VzIGRlY2lzaW9u"
-    "czwvaDI+CiAgICA8cD5XaGVuIHNvZnR3YXJlIGRpZCB3aGF0IGl0IHdhcyB0b2xkLCB3YXRjaGluZyBpdCB3YXMgZW5vdWdoIOKA"
-    "lCB0aGUgaW5wdXRzIGltcGxpZWQgdGhlIG91dHB1dHMsIGFuZCBhIGxvZyBvZiB0aGUgaW5wdXRzIHdhcyBhcyBnb29kIGFzIGEg"
-    "cmVjb3JkIG9mIHdoYXQgaGFwcGVuZWQuIFRoYXQgaXMgbm8gbG9uZ2VyIHRydWUuPC9wPgogICAgPHA+QW4gYXV0b25vbW91cyBz"
-    "eXN0ZW0gcHJvZHVjZXMgb3V0cHV0cyB5b3UgY2Fubm90IGRlcml2ZSBieSBsb29raW5nIGF0IHRoZSBpbnB1dHMuIFNvIHRoZSBv"
-    "dXRwdXQgaGFzIHRvIGJlIHJlY29yZGVkIGFzIGEgZmFjdCBpbiBpdHMgb3duIHJpZ2h0LCBhdCB0aGUgbW9tZW50IGl0IGhhcHBl"
-    "bnMsIGluIGEgZm9ybSBub2JvZHkgY2FuIHF1aWV0bHkgY2hhbmdlIGFmdGVyd2FyZHMuIDxiPkEgbGF5ZXIgdGhhdCB3YXRjaGVz"
-    "IGZyb20gdGhlIHNpZGUgY2Fubm90IGRvIHRoYXQ8L2I+IOKAlCBieSB0aGUgdGltZSBpdCBzZWVzIHRoZSBkZWNpc2lvbiwgdGhl"
-    "IGRlY2lzaW9uIGhhcyBhbHJlYWR5IGhhcHBlbmVkLCBhbmQgdGhlIG9ubHkgcmVjb3JkIGlzIG9uZSB0aGUgb3BlcmF0b3IgY2Fu"
-    "IGVkaXQuPC9wPgogICAgPHA+VGhpcyBpcyB3aHkgdGhlIHZvbHVtZSBwcm9ibGVtIGJpdGVzLiBPbmUgcmV2aWV3ZWQgZGVjaXNp"
-    "b24gYSBkYXkgY2FuIGJlIHdhdGNoZWQgYnkgYSBwZXJzb24uIE1pbGxpb25zIG9mIGF1dG9tYXRlZCBkZWNpc2lvbnMgYSBtb250"
-    "aCBjYW5ub3Qg4oCUIGFuZCB0aGUgbW9tZW50IG9uZSBpcyBjb250ZXN0ZWQsICJvdXIgZGFzaGJvYXJkIHNob3dlZCBpdCIgaXMg"
-    "bm90IGV2aWRlbmNlLiBJdCBpcyBhbiBhc3NlcnRpb24gd2l0aCBnb29kIGZvcm1hdHRpbmcuPC9wPgogIDwvc2VjdGlvbj4KCiAg"
-    "PHNlY3Rpb24gY2xhc3M9ImFyZyIgc3R5bGU9ImJvcmRlci10b3A6MXB4IHNvbGlkIHZhcigtLWxpbmUpO3BhZGRpbmctdG9wOjM2"
-    "cHgiPgogICAgPGgyPkZvdXIgcXVlc3Rpb25zIHRoZSB3YXRjaGluZyBsYXllciBhbnN3ZXJzICJubyIgdG88L2gyPgogICAgPGRp"
-    "diBjbGFzcz0icSI+PGg0PkNhbiB0aGUgcGVvcGxlIGJlaW5nIGF1ZGl0ZWQgZWRpdCB0aGUgYXVkaXQ/PC9oND48cD5PbiB0aGUg"
-    "d2F0Y2hpbmcgbGF5ZXIsIHllcyDigJQgdGhlIHJlY29yZCBzaXRzIGluIGEgZGF0YWJhc2UgdGhleSBjb250cm9sLiBPbiB0aGUg"
-    "ZXZpZGVuY2UgbGF5ZXIsIGNoYW5naW5nIG9uZSByZWNvcmQgYnJlYWtzIGV2ZXJ5IHJlY29yZCBhZnRlciBpdC48L3A+PC9kaXY+"
-    "CiAgICA8ZGl2IGNsYXNzPSJxIj48aDQ+Q2FuIGl0IGJlIGNoZWNrZWQgd2l0aCB0aGUgdmVuZG9yIHN3aXRjaGVkIG9mZj88L2g0"
-    "PjxwPk9uIHRoZSB3YXRjaGluZyBsYXllciwgbm8g4oCUIHlvdSBsb2cgaW50byB0aGUgdmVuZG9yIHRvIHNlZSBpdC4gT24gdGhl"
-    "IGV2aWRlbmNlIGxheWVyLCBhIHN0YW5kYWxvbmUgdmVyaWZpZXIgY2hlY2tzIGl0IHdpdGggbm8gYWNjb3VudCBhbmQgbm8gbmV0"
-    "d29yayBjYWxsIGJhY2suPC9wPjwvZGl2PgogICAgPGRpdiBjbGFzcz0icSI+PGg0PkNhbiB5b3UgcHJvdmUgYSByZWNvcmQgcHJl"
-    "ZGF0ZXMgdGhlIGNvbXBsYWludCBhYm91dCBpdD88L2g0PjxwPk9uIHRoZSB3YXRjaGluZyBsYXllciwgdGhlIGRhdGUgY29tZXMg"
-    "ZnJvbSBhIGZpZWxkIHRoZSBzeXN0ZW0gY291bGQgc2V0IHRvIGFueXRoaW5nLiBPbiB0aGUgZXZpZGVuY2UgbGF5ZXIsIHRoZSB0"
-    "aW1pbmcgaXMgZml4ZWQgYnkgYSBjbG9jayBub2JvZHkgaW52b2x2ZWQgY29udHJvbHMuPC9wPjwvZGl2PgogICAgPGRpdiBjbGFz"
-    "cz0icSI+PGg0PkNhbiB5b3UgcHJvdmUgdGhlIGh1bWFuIGFwcHJvdmVkIGJlZm9yZSB0aGUgbWFjaGluZSBhY3RlZD88L2g0Pjxw"
-    "Pk9uIHRoZSB3YXRjaGluZyBsYXllciwgb3JkZXIgaXMgbm90IHJlY29yZGVkLiBPbiB0aGUgZXZpZGVuY2UgbGF5ZXIsIHRoZSBy"
-    "ZXZpZXdlcidzIGRlY2lzaW9uIGlzIHNlYWxlZCBiZWZvcmUgdGhlIG1hY2hpbmUncyB2ZXJkaWN0IGlzIHNob3duIHRvIHRoZW0u"
-    "PC9wPjwvZGl2PgogIDwvc2VjdGlvbj4KCiAgPGRpdiBjbGFzcz0iY2xvc2UiPgogICAgPGgyPkRvbid0IHRha2UgdGhlIGRpYWdy"
-    "YW0ncyB3b3JkIGZvciBpdC4gQ2hlY2sgdGhlIGxheWVyIHlvdXJzZWxmLjwvaDI+CiAgICA8cD5FdmVyeSBjbGFpbSBvbiB0aGUg"
-    "ZXZpZGVuY2UgbGF5ZXIgaXMgdmVyaWZpYWJsZSByaWdodCBub3csIHdpdGggbm8gYWNjb3VudCwgd2l0aCBvdXIgY29tcGFueSBz"
-    "d2l0Y2hlZCBvZmYuIFN0YXJ0IHdpdGggdGhlIGxpdmUgY2hhaW4sIG9yIHJlYWQgdGhlIGZ1bGwgYXJjaGl0ZWN0dXJlLjwvcD4K"
-    "ICAgIDxhIGNsYXNzPSJwcmltYXJ5IiBocmVmPSIvd2hpdGVwYXBlciI+UmVhZCB0aGUgd2hpdGVwYXBlcjwvYT4KICAgIDxhIGNs"
-    "YXNzPSJnaG9zdCIgaHJlZj0iL3gvd2l0bmVzcy90aXAiPlNlZSB0aGUgbGl2ZSBjaGFpbjwvYT4KICA8L2Rpdj4KCjwvZGl2PgoK"
-    "PGZvb3Rlcj4KICA8ZGl2IGNsYXNzPSJ3cmFwIj4KICAgIDxwPnNlYmJpLnBybyDCtyBNb25vcCBDb250ZW50IMK3IEJseXRoLCBO"
-    "b3J0aHVtYmVybGFuZCwgVUs8YnI+CiAgICBUaGUgZXZpZGVuY2UgbGF5ZXIgZm9yIEFJIGRlY2lzaW9ucy4gRnJlZSBmb3IgOTAg"
-    "ZGF5cywgdGhlbiA1MHAgcGVyIGRldmljZSBwZXIgbW9udGguPC9wPgogIDwvZGl2Pgo8L2Zvb3Rlcj4KCjwvYm9keT4KPC9odG1s"
-    "Pgo="
-)
-
-_HTML = base64.b64decode("".join(_B64.split())).decode("utf-8")
-_patched = False
-
-
-def _find_handler_class(ctx):
-    if isinstance(ctx, dict):
-        for k in ("handler_class", "handler", "Handler", "h", "request_handler"):
-            v = ctx.get(k)
-            if v is None:
-                continue
-            cls = v if isinstance(v, type) else type(v)
-            if hasattr(cls, "do_GET"):
-                return cls
-    f = sys._getframe()
-    while f is not None:
-        s = f.f_locals.get("self")
-        if s is not None and hasattr(type(s), "do_GET") and hasattr(s, "wfile"):
-            return type(s)
-        f = f.f_back
-    return None
-
-
-def _install_page(ctx):
-    global _patched
-    if _patched:
-        return True
-    cls = _find_handler_class(ctx)
-    if cls is None:
-        return False
-    if getattr(cls, "_map_patched", False):
-        _patched = True
-        return True
-
-    original_do_GET = cls.do_GET
-
-    def do_GET(self):
-        path = self.path.split("?")[0].rstrip("/") or "/"
-        if path == PAGE_PATH:
-            body = _HTML.encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        return original_do_GET(self)
-
-    cls.do_GET = do_GET
-    cls._map_patched = True
-    _patched = True
-    return True
-
-
-def handle(method, action, data, api_key, ctx):
-    armed = _install_page(ctx)
-    if action == "spec":
-        return ({
-            "module": "map",
-            "version": VERSION,
-            "serves": PAGE_PATH,
-            "public": [["GET", "status"], ["GET", "spec"]],
-            "note": "Hit /x/map/status once after each deploy to arm " + PAGE_PATH + ".",
-        }, 200)
-    return ({
-        "module": "map",
-        "version": VERSION,
-        "serves": PAGE_PATH,
-        "armed": armed,
-        "page_bytes": len(_HTML),
-    }, 200)
-
-
-PUBLIC = {("GET", "status"), ("GET", "spec")}
-
-```
-
-
-## `modules/mutual.py`
-
-543 lines, 19704 bytes
-
-```python
-#!/usr/bin/env python3
-"""
-modules/mutual.py  -  the outbound half of mutual witnessing
-============================================================
-
-Why this exists
----------------
-modules/witness.py RECEIVES. Other chains hand us their tips and we seal
-them. Nothing in the platform currently SENDS our tip anywhere, so right
-now we witness other people and nobody witnesses us. This module is the
-missing direction.
-
-Drop it in as modules/mutual.py. The router picks it up automatically -
-no edits to server.py.
-
-Routes
-------
-  POST /x/mutual/push      send our current tip to every configured peer
-  POST /x/mutual/pull      fetch every peer's tip and seal it into our chain
-  POST /x/mutual/sync      pull then push (this is the one to schedule)
-  GET  /x/mutual/peers     the configured peers and what happened last time
-  GET  /x/mutual/status    last run, next run, whether the timer is alive
-
-Important design note
----------------------
-This module does not touch the database or import anything from server.py.
-It talks HTTP to routes that are already public - ours and theirs. That
-means it cannot corrupt anything, it works no matter how seal() changes,
-and every action it takes is one an outsider could audit for themselves.
-
-To read our own tip it calls our own public /x/witness/tip.
-To seal a peer's tip it calls our own public /x/witness/observe, which is
-already built to record exactly that. So a peer tip we pull is recorded by
-the same code path as a peer tip that was pushed to us.
-
-FETCH-ONLY PEERS (added 1.2)
-----------------------------
-observe_url is now OPTIONAL. A peer with a tip_url and no observe_url is
-fetch-only: we read and seal their tip, and we do not try to push ours.
-
-That is a real configuration, not a broken one. Two current cases:
-
-  A peer whose outbound submission lane is deliberately closed during
-  staging. They serve a tip for us to read; their recorder never reaches
-  out. Serving a file is not outbound submission.
-
-  A peer whose tip is a static JSON file with no server behind it. They
-  push to us on their own schedule and there is nothing on their side to
-  POST to. Perfectly valid node.
-
-Before 1.2 push_one read peer["observe_url"] unconditionally, so adding a
-fetch-only peer would have raised KeyError on every cycle - inside a
-background thread with a bare except, so it would have failed silently and
-taken the whole sync with it.
-
-CONCURRENCY - read this before changing it
-------------------------------------------
-A sync cycle makes two kinds of call, and they are treated differently on
-purpose.
-
-  OUTBOUND to other people's hosts (reading their tip, pushing ours) runs
-  in parallel. These are the slow ones - we are waiting on somebody else's
-  server, and there is no reason to wait on them one at a time. Fifty peers
-  now costs roughly what the slowest single peer costs, instead of the sum
-  of all fifty.
-
-  INBOUND to our own server (sealing what we pulled) stays sequential. Our
-  own process is handling those requests, and firing a burst of them at
-  ourselves while we are mid-cycle is asking for trouble - a queue behind a
-  single replica at best. The sealing is fast and local anyway, so there is
-  nothing to gain by parallelising it and a real risk in doing so.
-
-So: fetch everything at once, then seal one at a time.
-
-BEFORE THIS WORKS
------------------
-1. "observe" must be in the PUBLIC set of modules/witness.py. If it is not,
-   this module gets a 401 from our own server, same as Red Flag AI Pro did.
-2. After every deploy, the first /x/ request must be a GET - that is what
-   installs the POST branch. Opening /x/mutual/peers in a browser does it.
-"""
-
-import json
-import threading
-import time
-import urllib.error
-import urllib.request
-from concurrent.futures import ThreadPoolExecutor
-
-VERSION = "1.2"
-
-# ----------------------------------------------------------------------
-# ROUTER
-# ----------------------------------------------------------------------
-
-# The router reads a set of (METHOD, action) tuples. Anything not listed
-# here needs an API key - default is closed.
-#
-# peers and status are read-only. An outsider being able to see who we
-# witness with, and whether it is actually running, is the entire point.
-#
-# push, pull and sync stay keyed - they cause outbound traffic and are not
-# left open to anonymous callers.
-PUBLIC = {("GET", "peers"), ("GET", "status")}
-
-
-# ----------------------------------------------------------------------
-# CONFIG
-# ----------------------------------------------------------------------
-
-# Our own public witness routes. Left as full URLs on purpose so this
-# module never has to guess its own host.
-OUR_TIP_URL = "https://sebbi.pro/x/witness/tip"
-OUR_OBSERVE_URL = "https://sebbi.pro/x/witness/observe"
-
-# The name we go by when we hand our tip to someone else.
-OUR_CHAIN_NAME = "aileash"
-
-# Everyone we witness with. Add a dict per chain.
-#   name         what we file their tips under
-#   tip_url      where we GET their current tip          REQUIRED
-#   observe_url  where we POST ours so they record it    OPTIONAL
-#
-# Omit observe_url for a fetch-only peer - see the note at the top. It is
-# not an oversight and the module will not complain about it; /x/mutual/peers
-# reports the direction for each so it is visible rather than assumed.
-PEERS = [
-    {
-        "name": "red-flag-ai-pro",
-        "tip_url": "https://www.redflagaipro.com/api/witness/tip",
-        "observe_url": "https://www.redflagaipro.com/api/witness/anchor",
-    },
-    {
-        # Simon. Serves a static JSON file regenerated on his side, and
-        # pushes to us on his own systemd timer at :23. Nothing to POST to.
-        "name": "flavorflowstrategy.uk",
-        "tip_url": "https://www.flavorflowstrategy.uk/witness.json",
-    },
-    {
-        # PRAXIS / Praesidium, chain 4. Read-only, hash-only, currently
-        # SYNTHETIC_STAGING and regenerating every ten minutes, so expect
-        # liveness "live" rather than "self-consistent" - the tip moves
-        # between their generating it and our fetching it. That is the
-        # normal case for a working chain, not a failure.
-        #
-        # Their outbound submission lane is deliberately closed through
-        # staging, so no observe_url. They also run a signed lane at
-        # /x/peer/submit under peer_id praesidium when they are ready.
-        "name": "praesidium",
-        "tip_url": "https://chain4.thepraesidium.ai/api/witness/tip",
-    },
-]
-
-# Field names to send when pushing our tip. If a peer wants different
-# names, give that peer its own "keys" dict and it will be used instead.
-DEFAULT_PUSH_KEYS = {
-    "chain": "chain",
-    "tip": "tip",
-    "count": "count",
-    "ts": "ts",
-    "url": "url",
-}
-
-# Where peers can read our tip, included in what we push.
-OUR_PUBLIC_URL = "https://sebbi.pro/x/witness/tip"
-
-# Background timer. Set ENABLED to False if you would rather drive it
-# yourself by hitting /x/mutual/sync.
-AUTO_SYNC_ENABLED = True
-AUTO_SYNC_SECONDS = 3600
-
-TIMEOUT_SECONDS = 20
-
-# How many peers we talk to at once. Above this they queue, which is fine -
-# it stops a large network spawning a thread per peer. Eight slow peers at
-# 20s each still finishes in 20s; forty finishes in about a minute worst
-# case, and only if every one of them times out.
-MAX_PARALLEL_PEERS = 8
-
-# ----------------------------------------------------------------------
-# state - deliberately in memory only, this is not evidence
-# ----------------------------------------------------------------------
-
-_state = {
-    "last_run": None,
-    "last_result": None,
-    "runs": 0,
-    "timer_started": False,
-}
-_lock = threading.Lock()
-
-
-def _now():
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-
-def _reply(payload, status=200):
-    """The router expects (payload, status) back from handle()."""
-    return payload, status
-
-
-def _in_parallel(function, items):
-    """Run function over items concurrently, preserving input order.
-
-    Used only for calls that leave our server. Anything hitting our own
-    process goes through a plain loop instead - see the note at the top.
-    """
-    if not items:
-        return []
-    if len(items) == 1:
-        return [function(items[0])]
-    workers = min(len(items), MAX_PARALLEL_PEERS)
-    with ThreadPoolExecutor(max_workers=workers,
-                            thread_name_prefix="mutual-peer") as pool:
-        return list(pool.map(function, items))
-
-
-# ----------------------------------------------------------------------
-# http
-# ----------------------------------------------------------------------
-
-def _http(url, payload=None):
-    """POST if payload given, else GET. Returns (status, parsed_or_text)."""
-    data = None
-    headers = {"Accept": "application/json",
-               "User-Agent": "aileash-mutual/%s" % VERSION}
-    if payload is not None:
-        data = json.dumps(payload).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    request = urllib.request.Request(url, data=data, headers=headers)
-    try:
-        with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
-            body = response.read().decode("utf-8", "replace")
-            status = response.getcode()
-    except urllib.error.HTTPError as exc:
-        try:
-            body = exc.read().decode("utf-8", "replace")
-        except Exception:
-            body = ""
-        status = exc.code
-    except urllib.error.URLError as exc:
-        return 0, "unreachable: %s" % exc.reason
-    except Exception as exc:
-        return 0, "failed: %s" % exc
-    try:
-        return status, json.loads(body)
-    except ValueError:
-        return status, body
-
-
-# Field names a tip can arrive under. Different implementations name it
-# differently and being strict about a name we never published is a bug in
-# the receiver, not in the peer. Order is preference, not importance.
-TIP_FIELDS = ("tip", "hash", "head", "tip_sha256", "root", "current_tip",
-              "chain_tip", "latest")
-
-HEIGHT_FIELDS = ("height", "count", "entries", "tree_size", "size")
-
-
-def _extract_tip(body):
-    """Pull (tip, height) out of whatever shape a tip route returns."""
-    if not isinstance(body, dict):
-        return None, None
-    tip = None
-    for field in TIP_FIELDS:
-        value = body.get(field)
-        if isinstance(value, str) and value.strip():
-            tip = value.strip()
-            break
-    height = None
-    for field in HEIGHT_FIELDS:
-        if field in body:
-            height = body.get(field)
-            break
-    return tip, height
-
-
-# ----------------------------------------------------------------------
-# the two directions
-# ----------------------------------------------------------------------
-
-def our_tip():
-    status, body = _http(OUR_TIP_URL)
-    if status != 200:
-        return None, None, "our own tip route answered %s: %s" % (status, str(body)[:200])
-    tip, height = _extract_tip(body)
-    if not tip:
-        return None, None, "no tip field in our own reply: %s" % str(body)[:200]
-    return tip, height, None
-
-
-def push_one(peer, tip, height):
-    """Hand our tip to one peer so they record it. Outbound only.
-
-    A peer with no observe_url is fetch-only by configuration. Say so and
-    move on rather than treating it as a failure - and never index the key
-    blindly, which is what 1.1 did.
-    """
-    observe_url = peer.get("observe_url")
-    if not observe_url:
-        return {
-            "peer": peer["name"],
-            "direction": "push",
-            "skipped": True,
-            "ok": True,
-            "reason": "fetch-only peer - no observe_url configured",
-            "note": ("We read and seal their tip. They do not accept a push, "
-                     "either because their outbound lane is closed or because "
-                     "their tip is a static file. Not an error."),
-        }
-
-    keys = peer.get("keys", DEFAULT_PUSH_KEYS)
-    values = {
-        "chain": OUR_CHAIN_NAME,
-        "tip": tip,
-        "count": height,
-        "ts": _now(),
-        "url": OUR_PUBLIC_URL,
-    }
-    payload = {keys.get(k, k): v for k, v in values.items()}
-    status, body = _http(observe_url, payload)
-    result = {
-        "peer": peer["name"],
-        "direction": "push",
-        "url": observe_url,
-        "http": status,
-        "ok": 200 <= status < 300,
-        "response": body if isinstance(body, (dict, list)) else str(body)[:300],
-    }
-    if status == 401 or status == 403:
-        result["hint"] = "they want auth on that route, or it is not in their public set"
-    elif status == 404:
-        result["hint"] = "wrong path - check observe_url for this peer"
-    elif status == 0:
-        result["hint"] = "could not reach them at all"
-    return result
-
-
-def fetch_one(peer):
-    """Read one peer's current tip. Outbound only - no sealing here.
-
-    Returns a dict that either carries a tip ready to seal, or an error
-    already shaped like a result so it can be returned to the caller as is.
-    """
-    status, body = _http(peer["tip_url"])
-    if status != 200:
-        return {
-            "peer": peer["name"], "direction": "pull", "url": peer["tip_url"],
-            "http": status, "ok": False, "_failed": True,
-            "response": body if isinstance(body, (dict, list)) else str(body)[:300],
-            "hint": "could not read their tip",
-        }
-
-    tip, height = _extract_tip(body)
-    if not tip:
-        return {
-            "peer": peer["name"], "direction": "pull", "url": peer["tip_url"],
-            "http": status, "ok": False, "_failed": True,
-            "response": str(body)[:300],
-            "hint": ("no tip field in their reply - add the field name to "
-                     "TIP_FIELDS. Currently accepted: " + ", ".join(TIP_FIELDS)),
-        }
-
-    return {
-        "peer": peer["name"], "url": peer["tip_url"],
-        "tip": tip, "height": height, "_failed": False,
-        "fetched_at": time.time(),
-    }
-
-
-def seal_one(fetched):
-    """Seal one already-fetched peer tip into our chain.
-
-    Goes through our own public observe route so a tip we pulled is
-    recorded by exactly the same code path as a tip somebody pushed to us.
-    Called in a plain loop, never in parallel - this hits our own server.
-
-    Field names must match what modules/witness.py reads out of the body:
-    chain, tip, peer_ts, url. The url is what makes the observation
-    checkable by a third party rather than taken on our word - it is the
-    address we just fetched this tip from.
-    """
-    seal_status, seal_body = _http(OUR_OBSERVE_URL, {
-        "chain": fetched["peer"],
-        "tip": fetched["tip"],
-        "peer_ts": fetched["fetched_at"],
-        "url": fetched["url"],
-    })
-
-    out = {
-        "peer": fetched["peer"],
-        "direction": "pull",
-        "their_tip": fetched["tip"],
-        "their_height": fetched["height"],
-        "sealed_http": seal_status,
-        "ok": 200 <= seal_status < 300,
-        "response": seal_body if isinstance(seal_body, (dict, list)) else str(seal_body)[:300],
-    }
-    if seal_status in (401, 403):
-        out["hint"] = "our own observe route rejected us - check PUBLIC in modules/witness.py"
-    return out
-
-
-def do_push():
-    tip, height, error = our_tip()
-    if error:
-        return {"ok": False, "error": error}
-
-    # Outbound to everyone at once.
-    results = _in_parallel(lambda peer: push_one(peer, tip, height), PEERS)
-
-    return {
-        "ok": True,
-        "our_tip": tip,
-        "our_height": height,
-        "pushed_to": len([r for r in results if not r.get("skipped")]),
-        "fetch_only": len([r for r in results if r.get("skipped")]),
-        "results": results,
-    }
-
-
-def do_pull():
-    # Phase one: read every peer's tip at the same time. This is the slow
-    # part and none of it touches us.
-    fetched = _in_parallel(fetch_one, PEERS)
-
-    # Phase two: seal what came back, one at a time, into our own chain.
-    results = []
-    for item in fetched:
-        if item.get("_failed"):
-            item.pop("_failed", None)
-            results.append(item)
-            continue
-        results.append(seal_one(item))
-
-    return {"ok": True, "results": results}
-
-
-def do_sync():
-    """Pull first, then push. That order matters: the tip we hand out then
-    already contains the tips we just took in, so the two chains interlock
-    rather than merely sitting alongside each other."""
-    started = time.time()
-    pulled = do_pull()
-    pushed = do_push()
-    result = {
-        "ran_at": _now(),
-        "took_seconds": round(time.time() - started, 2),
-        "peers": len(PEERS),
-        "pull": pulled,
-        "push": pushed,
-        "ok": bool(pulled.get("ok")) and bool(pushed.get("ok")),
-    }
-    with _lock:
-        _state["last_run"] = result["ran_at"]
-        _state["last_result"] = result
-        _state["runs"] += 1
-    return result
-
-
-# ----------------------------------------------------------------------
-# background timer
-# ----------------------------------------------------------------------
-
-def _loop():
-    # Let the server finish coming up before the first run.
-    time.sleep(45)
-    while True:
-        try:
-            do_sync()
-        except Exception:
-            pass
-        time.sleep(AUTO_SYNC_SECONDS)
-
-
-def _start_timer():
-    with _lock:
-        if _state["timer_started"] or not AUTO_SYNC_ENABLED:
-            return
-        _state["timer_started"] = True
-    thread = threading.Thread(target=_loop, name="mutual-sync", daemon=True)
-    thread.start()
-
-
-_start_timer()
-
-
-# ----------------------------------------------------------------------
-# router entry point
-# ----------------------------------------------------------------------
-
-def handle(method, action, data, api_key, ctx):
-    action = (action or "").strip("/").lower()
-
-    if method == "GET":
-        if action == "peers":
-            return _reply({
-                "chain": OUR_CHAIN_NAME,
-                "version": VERSION,
-                "peers": [
-                    {"name": p["name"],
-                     "tip_url": p["tip_url"],
-                     "observe_url": p.get("observe_url"),
-                     "direction": ("both" if p.get("observe_url")
-                                   else "fetch-only")}
-                    for p in PEERS
-                ],
-                "parallel_fetch": MAX_PARALLEL_PEERS,
-                "tip_fields_accepted": list(TIP_FIELDS),
-                "note": ("Witnessing is only mutual if both columns are live. "
-                         "A fetch-only peer is one we read and seal but who "
-                         "does not accept a push - either their outbound lane "
-                         "is closed or their tip is a static file. Both are "
-                         "valid; the direction is published rather than "
-                         "implied."),
-            })
-        if action == "status":
-            with _lock:
-                return _reply({
-                    "version": VERSION,
-                    "auto_sync": AUTO_SYNC_ENABLED,
-                    "interval_seconds": AUTO_SYNC_SECONDS,
-                    "timer_running": _state["timer_started"],
-                    "parallel_fetch": MAX_PARALLEL_PEERS,
-                    "runs": _state["runs"],
-                    "last_run": _state["last_run"],
-                    "last_result": _state["last_result"],
-                })
-
-    if method == "POST":
-        if action == "push":
-            return _reply(do_push())
-        if action == "pull":
-            return _reply(do_pull())
-        if action == "sync":
-            return _reply(do_sync())
-
-    return _reply({
-        "error": "unknown action",
-        "GET": ["peers", "status"],
-        "POST": ["push", "pull", "sync"],
-    }, 404)
 
 ```
