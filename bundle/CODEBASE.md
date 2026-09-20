@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-134 files across 35 parts.
+133 files across 35 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -10,7 +10,6 @@ Generated automatically on every push. Do not edit by hand.
 
 - `modules/_ _ i n i t _ _ . p y`
 - `modules/backups.py`
-- `modules/bind.py`
 - `modules/binddesk.py`
 - `modules/blocks.py`
 - `modules/capture.py`
