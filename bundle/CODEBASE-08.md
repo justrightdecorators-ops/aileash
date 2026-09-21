@@ -4,8 +4,8 @@ Contains:
 - `modules/investor.py`
 - `modules/lineage.py`
 - `modules/lineagedesk.py`
+- `modules/machine.py`
 - `modules/map.py`
-- `modules/mutual.py`
 
 
 ## `modules/investor.py`
@@ -1043,6 +1043,636 @@ def handle(method, action, data, api_key, ctx):
 ```
 
 
+## `modules/machine.py`
+
+622 lines, 26089 bytes
+
+```python
+"""
+modules/machine.py  v1.0.1  -  the machine
+
+Ask it in a web address. It goes out to the internet, does the work, and
+answers in data anyone - person or program - can check.
+
+    https://sebbi.pro/x/machine/ask?q=find 35ff59fa
+    https://sebbi.pro/x/machine/ask?q=bitcoin
+    https://sebbi.pro/x/machine/ask?q=verify today
+    https://sebbi.pro/x/machine/ask?q=block 2013
+    https://sebbi.pro/x/machine/ask?q=check openai.com
+    https://sebbi.pro/x/machine/ask?q=archive today
+    https://sebbi.pro/x/machine/ask?q=witness
+    https://sebbi.pro/x/machine/ask?q=walk
+    https://sebbi.pro/x/machine/help
+
+Every command is also its own route (/x/machine/find?sha256=..., etc).
+
+Every answer carries:
+  sources   - each thing it fetched, with the SHA-256 of what came back
+  evidence  - what it computed from that
+  check_it_yourself - how to redo the same work without this machine
+
+The machine reads and checks. It never changes anything. All routes public.
+"""
+
+import base64
+import hashlib
+import ipaddress
+import json
+import re
+import socket
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+VERSION = "1.0.1"
+SITE = "https://sebbi.pro"
+BASE = SITE + "/x/machine/"
+UA = "sebbi-machine/1.0.1 (+https://sebbi.pro/x/machine/help)"
+TIMEOUT = 30
+MAX_BYTES = 96 * 1024 * 1024
+EXPLORERS = [
+    ("mempool.space", "https://mempool.space/api"),
+    ("blockstream.info", "https://blockstream.info/api"),
+]
+
+PUBLIC = {("GET", a) for a in (
+    "help", "ask", "find", "verify", "bitcoin", "block", "check",
+    "archive", "witness", "walk", "register", "status", "spec")}
+
+_busy = threading.BoundedSemaphore(3)
+
+
+# ---------------------------------------------------------------- fetching
+
+class _Trail(object):
+    """Every fetch is recorded with the hash of what came back."""
+
+    def __init__(self):
+        self.sources = []
+
+    def get(self, url, max_bytes=MAX_BYTES, accept="application/json"):
+        t0 = time.time()
+        req = urllib.request.Request(url, headers={"User-Agent": UA,
+                                                   "Accept": accept})
+        try:
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+                raw = resp.read(max_bytes + 1)
+                final = resp.geturl()
+        except urllib.error.HTTPError as exc:
+            self.sources.append({"url": url, "result": "HTTP %s" % exc.code})
+            raise
+        except Exception as exc:
+            self.sources.append({"url": url, "result": "unreachable (%s)"
+                                 % exc.__class__.__name__})
+            raise
+        if len(raw) > max_bytes:
+            self.sources.append({"url": url, "result": "too large"})
+            raise ValueError("response too large")
+        self.sources.append({"url": url, "final_url": final,
+                             "bytes": len(raw),
+                             "sha256": hashlib.sha256(raw).hexdigest(),
+                             "ms": int((time.time() - t0) * 1000)})
+        return raw
+
+    def json(self, url, **kw):
+        return json.loads(self.get(url, **kw).decode("utf-8"))
+
+    def text(self, url):
+        return self.get(url, accept="text/plain").decode("utf-8").strip()
+
+
+def _public_https(url):
+    """For addresses a caller supplies: https, port 443, public host only."""
+    try:
+        p = urllib.parse.urlsplit(url)
+    except Exception:
+        return False
+    if p.scheme != "https" or p.port not in (None, 443) or not p.hostname:
+        return False
+    if p.username or p.password:
+        return False
+    try:
+        for info in socket.getaddrinfo(p.hostname, 443,
+                                       proto=socket.IPPROTO_TCP):
+            ip = ipaddress.ip_address(info[4][0])
+            if (ip.is_private or ip.is_loopback or ip.is_link_local or
+                    ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+                return False
+    except Exception:
+        return False
+    return True
+
+
+def _canonical_sha(obj):
+    return hashlib.sha256(json.dumps(obj, sort_keys=True,
+                                     separators=(",", ":")).encode("utf-8")
+                          ).hexdigest()
+
+
+def _answer(command, answer, evidence, trail, check, ok=True, **extra):
+    out = {"ok": ok, "machine": VERSION, "command": command,
+           "answer": answer, "evidence": evidence,
+           "sources": trail.sources, "check_it_yourself": check,
+           "answered_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    out.update(extra)
+    return out
+
+
+# ---------------------------------------------------------------- the chain
+
+def _recompute(blocks, prev="GENESIS"):
+    problems, public, withheld = [], 0, 0
+    for b in blocks:
+        h = b.get("audit_hash")
+        if "preimage" in b:
+            pre = b["preimage"]
+            if hashlib.sha256(pre.encode("utf-8")).hexdigest() != h:
+                problems.append("block %s does not recompute" % b.get("block_index"))
+            try:
+                stated = json.loads(pre).get("prev_hash")
+            except Exception:
+                stated = None
+            public += 1
+        else:
+            stated = b.get("prev_hash")
+            withheld += 1
+        if stated != prev:
+            problems.append("block %s does not link to the block before it"
+                            % b.get("block_index"))
+        prev = h
+    return {"blocks": len(blocks), "recomputed_from_own_text": public,
+            "linkage_only": withheld, "tip": prev,
+            "problems": problems[:20]}
+
+
+def _walk_all(trail):
+    blocks, after = [], 0
+    while True:
+        page = trail.json("%s/x/walk/blocks?after=%d&limit=500" % (SITE, after))
+        blocks.extend(page.get("blocks") or [])
+        if not page.get("has_more"):
+            return blocks
+        nxt = page.get("next_after")
+        if not isinstance(nxt, int) or nxt <= after:
+            raise ValueError("walk paging did not advance")
+        after = nxt
+
+
+def cmd_walk(q):
+    t = _Trail()
+    blocks = _walk_all(t)
+    r = _recompute(blocks)
+    ok = not r["problems"]
+    return _answer(
+        "walk",
+        "Walked all %d blocks from genesis to tip and recomputed them: %s."
+        % (r["blocks"], "PASS" if ok else "FAIL"),
+        r, t,
+        ["Fetch https://sebbi.pro/x/walk/blocks?after=0&limit=500 and each "
+         "next page", "For every block with a preimage: SHA-256 it, compare "
+         "with audit_hash, and check its prev_hash is the block before",
+         "Method: https://sebbi.pro/x/walk/spec"], ok=ok)
+
+
+def cmd_block(q):
+    t = _Trail()
+    try:
+        n = int(q.get("n") or q.get("index"))
+    except (TypeError, ValueError):
+        return _answer("block", "Give a block number, e.g. block 2013.", {},
+                       t, [], ok=False)
+    data = t.json("%s/x/walk/block?index=%d" % (SITE, n))
+    b = data.get("block") or {}
+    ev = {"block_index": n, "audit_hash": b.get("audit_hash"),
+          "previous_block_hash": data.get("previous_audit_hash")}
+    if "preimage" in b:
+        pre = b["preimage"]
+        ev["recomputed_hash"] = hashlib.sha256(pre.encode("utf-8")).hexdigest()
+        ev["matches"] = ev["recomputed_hash"] == b.get("audit_hash")
+        try:
+            ev["sealed_text"] = json.loads(pre)
+            ev["links_to_previous"] = (ev["sealed_text"].get("prev_hash") ==
+                                       data.get("previous_audit_hash"))
+        except Exception:
+            pass
+        ans = ("Block %d recomputes from its own sealed text and links to the "
+               "block before it." % n) if ev.get("matches") and \
+            ev.get("links_to_previous") else "Block %d does NOT check out." % n
+        ok = bool(ev.get("matches") and ev.get("links_to_previous"))
+    else:
+        ev["withheld_reason"] = b.get("withheld_reason")
+        ev["links_to_previous"] = b.get("prev_hash") == data.get("previous_audit_hash")
+        ans = ("Block %d is withheld from public view (%s); its link to the "
+               "block before it checks out." % (n, b.get("withheld_reason")))
+        ok = bool(ev["links_to_previous"])
+    return _answer("block", ans, ev, t,
+                   ["Open https://sebbi.pro/x/walk/block?index=%d" % n,
+                    "SHA-256 the preimage text; it must equal audit_hash"],
+                   ok=ok)
+
+
+# ---------------------------------------------------------------- archive files
+
+def _manifest(t):
+    return t.json(SITE + "/x/archive/manifest").get("files") or []
+
+
+def _resolve_file(t, ref):
+    """ref: 'today', 'latest', a date, or a fingerprint or its prefix."""
+    files = _manifest(t)
+    ref = (ref or "latest").strip().lower()
+    if ref in ("today", "latest", ""):
+        return files[0] if files else None
+    for f in files:
+        if f.get("date") == ref:
+            return f
+        if len(ref) >= 8 and str(f.get("sha256", "")).startswith(ref):
+            return f
+    return None
+
+
+def cmd_find(q):
+    """Hunt for copies of an archive file across the internet, and prove
+    each one is the sealed file."""
+    t = _Trail()
+    ref = q.get("sha256") or q.get("ref") or "latest"
+    f = _resolve_file(t, ref)
+    if not f:
+        return _answer("find", "No sealed file matches '%s'." % ref, {}, t,
+                       ["List every sealed file: https://sebbi.pro/x/archive/manifest"],
+                       ok=False)
+    sha = f["sha256"]
+    file_url = "%s/x/archive/file?sha256=%s" % (SITE, sha)
+    copies = []
+
+    # 1. the operator's own server
+    try:
+        body = json.loads(t.get(file_url).decode("utf-8"))
+        got = _canonical_sha(body)
+        copies.append({"where": "sebbi.pro (the operator)", "url": file_url,
+                       "fingerprint": got, "is_the_sealed_file": got == sha})
+    except Exception:
+        copies.append({"where": "sebbi.pro (the operator)", "url": file_url,
+                       "found": False})
+
+    # 2. the Internet Archive - independent, owes nothing to the operator
+    try:
+        avail = t.json("https://archive.org/wayback/available?url=" +
+                       urllib.parse.quote(file_url, safe=""))
+        snap = ((avail.get("archived_snapshots") or {}).get("closest") or {})
+        if snap.get("available") and snap.get("url"):
+            stamp = str(snap.get("timestamp", ""))
+            raw_url = "https://web.archive.org/web/%sid_/%s" % (stamp, file_url)
+            try:
+                body = json.loads(t.get(raw_url).decode("utf-8"))
+                got = _canonical_sha(body)
+                copies.append({"where": "Internet Archive (independent)",
+                               "url": snap["url"], "raw_copy": raw_url,
+                               "captured": stamp, "fingerprint": got,
+                               "is_the_sealed_file": got == sha})
+            except Exception:
+                copies.append({"where": "Internet Archive (independent)",
+                               "url": snap["url"], "found": True,
+                               "note": "listed but the copy could not be read"})
+        else:
+            copies.append({"where": "Internet Archive (independent)",
+                           "found": False,
+                           "archive_it_now": "https://web.archive.org/save/" + file_url,
+                           "note": "Not archived yet. Opening archive_it_now "
+                                   "from any phone or browser makes an "
+                                   "independent copy."})
+    except Exception:
+        copies.append({"where": "Internet Archive (independent)",
+                       "found": None, "note": "archive could not be asked"})
+
+    # 3. registered holders (custody) - read if the module exists
+    try:
+        holders = t.json(SITE + "/x/custody/holders").get("holders") or []
+        for h in holders:
+            copies.append({"where": h.get("name") or "holder",
+                           "url": h.get("url"),
+                           "fingerprint": h.get("last_fingerprint"),
+                           "is_the_sealed_file": h.get("last_fingerprint") == sha,
+                           "last_verified": h.get("last_verified")})
+    except Exception:
+        pass
+
+    verified = [c for c in copies if c.get("is_the_sealed_file")]
+    independent = [c for c in verified if "operator" not in c["where"]]
+    return _answer(
+        "find",
+        "Found %d verified cop%s of file %s… (%d independent of sebbi.pro)."
+        % (len(verified), "y" if len(verified) == 1 else "ies", sha[:12],
+           len(independent)),
+        {"file": {"date": f.get("date"), "sha256": sha,
+                  "sealed_in_block": f.get("sealed_in_block"),
+                  "check_block": f.get("check_block")},
+         "copies": copies}, t,
+        ["Take any copy's raw bytes, parse the JSON, re-serialise it with "
+         "sorted keys and no spaces, SHA-256 it",
+         "It must equal the fingerprint sealed in block %s" % f.get("sealed_in_block"),
+         "Then run the checker inside the file: python3 -c \"import json,sys;"
+         "exec(json.load(open(sys.argv[1]))['verifier_py'])\" FILE.json"])
+
+
+def cmd_verify(q):
+    """Verify a whole archive file here: fingerprint, every block, every link."""
+    t = _Trail()
+    url = q.get("url")
+    sealed = {f["sha256"]: f for f in _manifest(t)}
+    if url:
+        if not _public_https(url):
+            return _answer("verify", "Only public https addresses are fetched.",
+                           {}, t, [], ok=False)
+        where = url
+    else:
+        f = _resolve_file(t, q.get("sha256") or q.get("ref") or "latest")
+        if not f:
+            return _answer("verify", "No sealed file matches that.", {}, t,
+                           [], ok=False)
+        where = "%s/x/archive/file?sha256=%s" % (SITE, f["sha256"])
+    body = json.loads(t.get(where).decode("utf-8"))
+    fp = _canonical_sha(body)
+    chain = (body.get("chain") or {})
+    r = _recompute(chain.get("blocks") or [])
+    checks = {
+        "fingerprint": fp,
+        "fingerprint_is_sealed": fp in sealed,
+        "sealed_in_block": (sealed.get(fp) or {}).get("sealed_in_block"),
+        "chain": r,
+        "tip_matches_declared": r["tip"] == chain.get("tip"),
+        "genesis_matches_declared": bool(chain.get("blocks")) and
+        chain["blocks"][0].get("audit_hash") == chain.get("genesis_hash"),
+        "previous_file": body.get("previous_file_sha256"),
+    }
+    ok = (checks["fingerprint_is_sealed"] and not r["problems"] and
+          checks["tip_matches_declared"] and checks["genesis_matches_declared"])
+    return _answer(
+        "verify",
+        "%s: file %s… is %s, and its %d blocks %s." % (
+            "PASS" if ok else "FAIL", fp[:12],
+            "a sealed file" if checks["fingerprint_is_sealed"] else "NOT a sealed file",
+            r["blocks"], "all check out" if not r["problems"] else "do not all check out"),
+        checks, t,
+        ["The same checks run with nothing from us: the program is inside the "
+         "file. python3 -c \"import json,sys;exec(json.load(open(sys.argv[1]))"
+         "['verifier_py'])\" FILE.json"], ok=ok)
+
+
+def cmd_archive(q):
+    """Ask the Internet Archive to take an independent copy, and hand back
+    a one-tap link that works from any phone if it refuses a server."""
+    t = _Trail()
+    what = (q.get("what") or "today").strip().lower()
+    if what in ("today", "latest", "file"):
+        f = _resolve_file(t, "latest")
+        target = "%s/x/archive/file?sha256=%s" % (SITE, f["sha256"]) if f else None
+    elif what.startswith("block"):
+        n = re.sub(r"[^0-9]", "", what)
+        target = "%s/x/walk/block?index=%s" % (SITE, n) if n else None
+    elif what in ("chain", "genesis"):
+        target = SITE + "/x/walk/genesis"
+    elif what in ("register", "ratings"):
+        target = SITE + "/x/integrity/register"
+    else:
+        target = None
+    if not target:
+        return _answer("archive", "Say what to archive: today, block 2013, "
+                       "genesis or register.", {}, t, [], ok=False)
+    tap = "https://web.archive.org/save/" + target
+    result = None
+    try:
+        t.get(tap, accept="*/*", max_bytes=4 * 1024 * 1024)
+        result = "the archive accepted the request from this server"
+    except Exception:
+        result = ("the archive turned this server away, as it often does "
+                  "with cloud servers - the one-tap link below works from "
+                  "any phone or browser")
+    return _answer(
+        "archive",
+        "Archive request for %s: %s." % (target, result),
+        {"target": target, "one_tap_archive": tap,
+         "then_find_it": BASE + "find?ref=latest"}, t,
+        ["Open one_tap_archive on your own device", "Then ask the machine to "
+         "find it: https://sebbi.pro/x/machine/ask?q=find today"])
+
+
+# ---------------------------------------------------------------- bitcoin
+
+def cmd_bitcoin(q):
+    """Follow the chain's anchor all the way into Bitcoin, and check it
+    against two independent Bitcoin explorers."""
+    t = _Trail()
+    a = t.json(SITE + "/x/ots/latest_confirmed")
+    if not a.get("ok"):
+        return _answer("bitcoin", "No confirmed Bitcoin proof yet.", a, t, [],
+                       ok=False)
+    tip = str(a.get("tip") or "").lower()
+    ev = {"chain_tip": tip, "tip_is_block": a.get("tip_is_block"),
+          "stamp_id": a.get("stamp_id")}
+    attest = []
+    try:
+        from opentimestamps.core.serialize import BytesDeserializationContext
+        from opentimestamps.core.timestamp import DetachedTimestampFile
+        from opentimestamps.core.notary import BitcoinBlockHeaderAttestation
+        det = DetachedTimestampFile.deserialize(BytesDeserializationContext(
+            base64.b64decode(a["ots_base64"])))
+        tb = bytes.fromhex(tip)
+        forms = {
+            "sha256 of the tip's bytes": hashlib.sha256(tb).digest(),
+            "the tip's bytes directly": tb,
+            "sha256 of the tip as text": hashlib.sha256(tip.encode("ascii")).digest(),
+            "sha256 of the tip as a line of text":
+                hashlib.sha256((tip + "\n").encode("ascii")).digest(),
+        }
+        match = [name for name, d in forms.items() if det.file_digest == d]
+        ev["proof_is_for_this_tip"] = bool(match)
+        ev["proof_commits_to"] = match[0] if match else None
+        for msg, att in det.timestamp.all_attestations():
+            if isinstance(att, BitcoinBlockHeaderAttestation):
+                attest.append((att.height, msg[::-1].hex()))
+    except ImportError:
+        ev["note"] = "proof reader not installed on this server"
+    except Exception as exc:
+        ev["note"] = "proof could not be read: %s" % exc.__class__.__name__
+    if not attest:
+        heights = a.get("bitcoin_block_heights") or []
+        attest = [(h, None) for h in heights]
+    results = []
+    for height, expected_root in attest[:2]:
+        row = {"bitcoin_block": height,
+               "proof_computes_merkle_root": expected_root, "explorers": []}
+        for name, api in EXPLORERS:
+            try:
+                bh = t.text("%s/block-height/%d" % (api, height))
+                blk = t.json("%s/block/%s" % (api, bh))
+                row["explorers"].append({
+                    "explorer": name, "block_hash": bh,
+                    "merkle_root": blk.get("merkle_root"),
+                    "time": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                          time.gmtime(blk.get("timestamp", 0))),
+                    "matches_proof": (expected_root is not None and
+                                      blk.get("merkle_root") == expected_root)})
+            except Exception:
+                row["explorers"].append({"explorer": name,
+                                         "result": "unreachable"})
+        roots = set(e.get("merkle_root") for e in row["explorers"]
+                    if e.get("merkle_root"))
+        row["explorers_agree"] = len(roots) == 1
+        row["proof_lands_on_block"] = bool(expected_root) and \
+            roots == {expected_root}
+        results.append(row)
+    ev["bitcoin"] = results
+    ok = bool(results) and all(r.get("proof_lands_on_block") for r in results) \
+        and ev.get("proof_is_for_this_tip", False)
+    first = results[0] if results else {}
+    when = next((e.get("time") for e in first.get("explorers", [])
+                 if e.get("time")), None)
+    return _answer(
+        "bitcoin",
+        ("The chain tip at block %s is committed in Bitcoin block %s (%s). "
+         "The proof lands exactly on that block's merkle root, and two "
+         "independent explorers agree on it." % (
+             a.get("tip_is_block"), first.get("bitcoin_block"), when))
+        if ok else "The Bitcoin proof could not be fully confirmed; see evidence.",
+        ev, t,
+        ["Download the proof: https://sebbi.pro/x/ots/latest_confirmed "
+         "(ots_base64)", "Run: ots verify, which checks the same merkle root "
+         "against your own Bitcoin node",
+         "Or open the block on mempool.space and blockstream.info and compare "
+         "its merkle root with proof_computes_merkle_root"], ok=ok)
+
+
+# ---------------------------------------------------------------- others
+
+def cmd_check(q):
+    t = _Trail()
+    d = (q.get("domain") or "").strip().lower()
+    if not d:
+        return _answer("check", "Give a domain, e.g. check openai.com.", {}, t,
+                       [], ok=False)
+    r = t.json(SITE + "/x/integrity/check?domain=" + urllib.parse.quote(d))
+    return _answer(
+        "check", "%s verifies as %s (%s)." % (d, r.get("verified_level"),
+                                              r.get("badge")),
+        {k: r.get(k) for k in ("domain", "verified_level", "badge",
+                               "claimed_level", "overclaimed", "verdict",
+                               "request_sealed", "verdict_sealed")}, t,
+        ["Full result: https://sebbi.pro/x/integrity/check?domain=" + d,
+         "The verdict is sealed in the block shown; recompute it with "
+         "https://sebbi.pro/x/machine/ask?q=block <number>"])
+
+
+def cmd_witness(q):
+    t = _Trail()
+    held = t.json("https://mir.events/v1/transparency/held/tips?peer=sebbi")
+    tips = [e.get("peer_tip") for e in (held.get("tips") or []) if e.get("peer_tip")]
+    found = []
+    blocks = _walk_all(t)
+    index = {b["audit_hash"]: b.get("block_index") for b in blocks}
+    for tip in tips:
+        if tip in index:
+            found.append(index[tip])
+    return _answer(
+        "witness",
+        "MIR, an independent chain, holds %d of sebbi.pro's tips; %d are "
+        "blocks in the chain as served today." % (len(tips), len(found)),
+        {"witness": "MIR (MIRegistry)", "tips_held": len(tips),
+         "matched_blocks": sorted(found)[-20:]}, t,
+        ["Fetch https://mir.events/v1/transparency/held/tips?peer=sebbi",
+         "Look each peer_tip up in the walk; every match is a block MIR holds"])
+
+
+def cmd_register(q):
+    t = _Trail()
+    r = t.json(SITE + "/x/integrity/register")
+    rows = [{"domain": e.get("domain"), "level": e.get("verified_level"),
+             "badge": e.get("badge"), "sealed_in_block": e.get("sealed_in_block")}
+            for e in r.get("entries") or []]
+    return _answer("register", "%d domains rated; every rating is sealed."
+                   % len(rows), {"entries": rows}, t,
+                   ["Recompute any rating's block: "
+                    "https://sebbi.pro/x/machine/ask?q=block <number>"])
+
+
+def cmd_help(q):
+    ex = lambda s: BASE + "ask?q=" + urllib.parse.quote(s)
+    return {"ok": True, "machine": VERSION,
+            "what": "Ask in a web address. The machine goes out to the "
+                    "internet, does the work, and answers with its sources "
+                    "and a way to check the answer without it.",
+            "commands": {
+                "find <fingerprint|today|date>": ex("find today"),
+                "verify <fingerprint|today>": ex("verify today"),
+                "bitcoin": ex("bitcoin"),
+                "block <number>": ex("block 2013"),
+                "walk": ex("walk"),
+                "check <domain>": ex("check openai.com"),
+                "witness": ex("witness"),
+                "archive <today|block N|genesis|register>": ex("archive today"),
+                "register": ex("register"),
+            },
+            "rule": "The machine reads and checks. It never changes anything."}
+
+
+COMMANDS = {"find": cmd_find, "verify": cmd_verify, "bitcoin": cmd_bitcoin,
+            "block": cmd_block, "walk": cmd_walk, "check": cmd_check,
+            "witness": cmd_witness, "archive": cmd_archive,
+            "register": cmd_register, "help": cmd_help}
+
+
+def _parse(text):
+    words = str(text or "").strip().split()
+    if not words:
+        return "help", {}
+    cmd = words[0].lower()
+    arg = " ".join(words[1:]).strip()
+    q = {}
+    if cmd in ("find", "verify"):
+        q["ref"] = arg or "latest"
+    elif cmd == "block":
+        q["n"] = arg
+    elif cmd == "check":
+        q["domain"] = arg
+    elif cmd == "archive":
+        q["what"] = arg or "today"
+    return cmd, q
+
+
+def handle(method, action, data, api_key, ctx):
+    q = {}
+    for k, v in (data or {}).items():
+        q[k] = v[0] if isinstance(v, list) and v else v
+    action = action or "help"
+    if action == "ask":
+        action, parsed = _parse(q.get("q"))
+        q.update(parsed)
+    if action in ("status", "spec"):
+        action = "help"
+    fn = COMMANDS.get(action)
+    if not fn:
+        out = cmd_help(q)
+        out.update({"ok": False, "error": "unknown command: %s" % action})
+        return out, 404
+    if action == "help":
+        return fn(q), 200
+    if not _busy.acquire(timeout=20):
+        return {"ok": False, "error": "busy",
+                "detail": "Three commands are running. Try again shortly."}, 429
+    try:
+        out = fn(q)
+        return out, 200
+    except Exception as exc:
+        return {"ok": False, "command": action,
+                "error": "%s: %s" % (exc.__class__.__name__, str(exc)[:200])}, 502
+    finally:
+        _busy.release()
+
+```
+
+
 ## `modules/map.py`
 
 238 lines, 17926 bytes
@@ -1285,556 +1915,5 @@ def handle(method, action, data, api_key, ctx):
 
 
 PUBLIC = {("GET", "status"), ("GET", "spec")}
-
-```
-
-
-## `modules/mutual.py`
-
-543 lines, 19704 bytes
-
-```python
-#!/usr/bin/env python3
-"""
-modules/mutual.py  -  the outbound half of mutual witnessing
-============================================================
-
-Why this exists
----------------
-modules/witness.py RECEIVES. Other chains hand us their tips and we seal
-them. Nothing in the platform currently SENDS our tip anywhere, so right
-now we witness other people and nobody witnesses us. This module is the
-missing direction.
-
-Drop it in as modules/mutual.py. The router picks it up automatically -
-no edits to server.py.
-
-Routes
-------
-  POST /x/mutual/push      send our current tip to every configured peer
-  POST /x/mutual/pull      fetch every peer's tip and seal it into our chain
-  POST /x/mutual/sync      pull then push (this is the one to schedule)
-  GET  /x/mutual/peers     the configured peers and what happened last time
-  GET  /x/mutual/status    last run, next run, whether the timer is alive
-
-Important design note
----------------------
-This module does not touch the database or import anything from server.py.
-It talks HTTP to routes that are already public - ours and theirs. That
-means it cannot corrupt anything, it works no matter how seal() changes,
-and every action it takes is one an outsider could audit for themselves.
-
-To read our own tip it calls our own public /x/witness/tip.
-To seal a peer's tip it calls our own public /x/witness/observe, which is
-already built to record exactly that. So a peer tip we pull is recorded by
-the same code path as a peer tip that was pushed to us.
-
-FETCH-ONLY PEERS (added 1.2)
-----------------------------
-observe_url is now OPTIONAL. A peer with a tip_url and no observe_url is
-fetch-only: we read and seal their tip, and we do not try to push ours.
-
-That is a real configuration, not a broken one. Two current cases:
-
-  A peer whose outbound submission lane is deliberately closed during
-  staging. They serve a tip for us to read; their recorder never reaches
-  out. Serving a file is not outbound submission.
-
-  A peer whose tip is a static JSON file with no server behind it. They
-  push to us on their own schedule and there is nothing on their side to
-  POST to. Perfectly valid node.
-
-Before 1.2 push_one read peer["observe_url"] unconditionally, so adding a
-fetch-only peer would have raised KeyError on every cycle - inside a
-background thread with a bare except, so it would have failed silently and
-taken the whole sync with it.
-
-CONCURRENCY - read this before changing it
-------------------------------------------
-A sync cycle makes two kinds of call, and they are treated differently on
-purpose.
-
-  OUTBOUND to other people's hosts (reading their tip, pushing ours) runs
-  in parallel. These are the slow ones - we are waiting on somebody else's
-  server, and there is no reason to wait on them one at a time. Fifty peers
-  now costs roughly what the slowest single peer costs, instead of the sum
-  of all fifty.
-
-  INBOUND to our own server (sealing what we pulled) stays sequential. Our
-  own process is handling those requests, and firing a burst of them at
-  ourselves while we are mid-cycle is asking for trouble - a queue behind a
-  single replica at best. The sealing is fast and local anyway, so there is
-  nothing to gain by parallelising it and a real risk in doing so.
-
-So: fetch everything at once, then seal one at a time.
-
-BEFORE THIS WORKS
------------------
-1. "observe" must be in the PUBLIC set of modules/witness.py. If it is not,
-   this module gets a 401 from our own server, same as Red Flag AI Pro did.
-2. After every deploy, the first /x/ request must be a GET - that is what
-   installs the POST branch. Opening /x/mutual/peers in a browser does it.
-"""
-
-import json
-import threading
-import time
-import urllib.error
-import urllib.request
-from concurrent.futures import ThreadPoolExecutor
-
-VERSION = "1.2"
-
-# ----------------------------------------------------------------------
-# ROUTER
-# ----------------------------------------------------------------------
-
-# The router reads a set of (METHOD, action) tuples. Anything not listed
-# here needs an API key - default is closed.
-#
-# peers and status are read-only. An outsider being able to see who we
-# witness with, and whether it is actually running, is the entire point.
-#
-# push, pull and sync stay keyed - they cause outbound traffic and are not
-# left open to anonymous callers.
-PUBLIC = {("GET", "peers"), ("GET", "status")}
-
-
-# ----------------------------------------------------------------------
-# CONFIG
-# ----------------------------------------------------------------------
-
-# Our own public witness routes. Left as full URLs on purpose so this
-# module never has to guess its own host.
-OUR_TIP_URL = "https://sebbi.pro/x/witness/tip"
-OUR_OBSERVE_URL = "https://sebbi.pro/x/witness/observe"
-
-# The name we go by when we hand our tip to someone else.
-OUR_CHAIN_NAME = "aileash"
-
-# Everyone we witness with. Add a dict per chain.
-#   name         what we file their tips under
-#   tip_url      where we GET their current tip          REQUIRED
-#   observe_url  where we POST ours so they record it    OPTIONAL
-#
-# Omit observe_url for a fetch-only peer - see the note at the top. It is
-# not an oversight and the module will not complain about it; /x/mutual/peers
-# reports the direction for each so it is visible rather than assumed.
-PEERS = [
-    {
-        "name": "red-flag-ai-pro",
-        "tip_url": "https://www.redflagaipro.com/api/witness/tip",
-        "observe_url": "https://www.redflagaipro.com/api/witness/anchor",
-    },
-    {
-        # Simon. Serves a static JSON file regenerated on his side, and
-        # pushes to us on his own systemd timer at :23. Nothing to POST to.
-        "name": "flavorflowstrategy.uk",
-        "tip_url": "https://www.flavorflowstrategy.uk/witness.json",
-    },
-    {
-        # PRAXIS / Praesidium, chain 4. Read-only, hash-only, currently
-        # SYNTHETIC_STAGING and regenerating every ten minutes, so expect
-        # liveness "live" rather than "self-consistent" - the tip moves
-        # between their generating it and our fetching it. That is the
-        # normal case for a working chain, not a failure.
-        #
-        # Their outbound submission lane is deliberately closed through
-        # staging, so no observe_url. They also run a signed lane at
-        # /x/peer/submit under peer_id praesidium when they are ready.
-        "name": "praesidium",
-        "tip_url": "https://chain4.thepraesidium.ai/api/witness/tip",
-    },
-]
-
-# Field names to send when pushing our tip. If a peer wants different
-# names, give that peer its own "keys" dict and it will be used instead.
-DEFAULT_PUSH_KEYS = {
-    "chain": "chain",
-    "tip": "tip",
-    "count": "count",
-    "ts": "ts",
-    "url": "url",
-}
-
-# Where peers can read our tip, included in what we push.
-OUR_PUBLIC_URL = "https://sebbi.pro/x/witness/tip"
-
-# Background timer. Set ENABLED to False if you would rather drive it
-# yourself by hitting /x/mutual/sync.
-AUTO_SYNC_ENABLED = True
-AUTO_SYNC_SECONDS = 3600
-
-TIMEOUT_SECONDS = 20
-
-# How many peers we talk to at once. Above this they queue, which is fine -
-# it stops a large network spawning a thread per peer. Eight slow peers at
-# 20s each still finishes in 20s; forty finishes in about a minute worst
-# case, and only if every one of them times out.
-MAX_PARALLEL_PEERS = 8
-
-# ----------------------------------------------------------------------
-# state - deliberately in memory only, this is not evidence
-# ----------------------------------------------------------------------
-
-_state = {
-    "last_run": None,
-    "last_result": None,
-    "runs": 0,
-    "timer_started": False,
-}
-_lock = threading.Lock()
-
-
-def _now():
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-
-def _reply(payload, status=200):
-    """The router expects (payload, status) back from handle()."""
-    return payload, status
-
-
-def _in_parallel(function, items):
-    """Run function over items concurrently, preserving input order.
-
-    Used only for calls that leave our server. Anything hitting our own
-    process goes through a plain loop instead - see the note at the top.
-    """
-    if not items:
-        return []
-    if len(items) == 1:
-        return [function(items[0])]
-    workers = min(len(items), MAX_PARALLEL_PEERS)
-    with ThreadPoolExecutor(max_workers=workers,
-                            thread_name_prefix="mutual-peer") as pool:
-        return list(pool.map(function, items))
-
-
-# ----------------------------------------------------------------------
-# http
-# ----------------------------------------------------------------------
-
-def _http(url, payload=None):
-    """POST if payload given, else GET. Returns (status, parsed_or_text)."""
-    data = None
-    headers = {"Accept": "application/json",
-               "User-Agent": "aileash-mutual/%s" % VERSION}
-    if payload is not None:
-        data = json.dumps(payload).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    request = urllib.request.Request(url, data=data, headers=headers)
-    try:
-        with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
-            body = response.read().decode("utf-8", "replace")
-            status = response.getcode()
-    except urllib.error.HTTPError as exc:
-        try:
-            body = exc.read().decode("utf-8", "replace")
-        except Exception:
-            body = ""
-        status = exc.code
-    except urllib.error.URLError as exc:
-        return 0, "unreachable: %s" % exc.reason
-    except Exception as exc:
-        return 0, "failed: %s" % exc
-    try:
-        return status, json.loads(body)
-    except ValueError:
-        return status, body
-
-
-# Field names a tip can arrive under. Different implementations name it
-# differently and being strict about a name we never published is a bug in
-# the receiver, not in the peer. Order is preference, not importance.
-TIP_FIELDS = ("tip", "hash", "head", "tip_sha256", "root", "current_tip",
-              "chain_tip", "latest")
-
-HEIGHT_FIELDS = ("height", "count", "entries", "tree_size", "size")
-
-
-def _extract_tip(body):
-    """Pull (tip, height) out of whatever shape a tip route returns."""
-    if not isinstance(body, dict):
-        return None, None
-    tip = None
-    for field in TIP_FIELDS:
-        value = body.get(field)
-        if isinstance(value, str) and value.strip():
-            tip = value.strip()
-            break
-    height = None
-    for field in HEIGHT_FIELDS:
-        if field in body:
-            height = body.get(field)
-            break
-    return tip, height
-
-
-# ----------------------------------------------------------------------
-# the two directions
-# ----------------------------------------------------------------------
-
-def our_tip():
-    status, body = _http(OUR_TIP_URL)
-    if status != 200:
-        return None, None, "our own tip route answered %s: %s" % (status, str(body)[:200])
-    tip, height = _extract_tip(body)
-    if not tip:
-        return None, None, "no tip field in our own reply: %s" % str(body)[:200]
-    return tip, height, None
-
-
-def push_one(peer, tip, height):
-    """Hand our tip to one peer so they record it. Outbound only.
-
-    A peer with no observe_url is fetch-only by configuration. Say so and
-    move on rather than treating it as a failure - and never index the key
-    blindly, which is what 1.1 did.
-    """
-    observe_url = peer.get("observe_url")
-    if not observe_url:
-        return {
-            "peer": peer["name"],
-            "direction": "push",
-            "skipped": True,
-            "ok": True,
-            "reason": "fetch-only peer - no observe_url configured",
-            "note": ("We read and seal their tip. They do not accept a push, "
-                     "either because their outbound lane is closed or because "
-                     "their tip is a static file. Not an error."),
-        }
-
-    keys = peer.get("keys", DEFAULT_PUSH_KEYS)
-    values = {
-        "chain": OUR_CHAIN_NAME,
-        "tip": tip,
-        "count": height,
-        "ts": _now(),
-        "url": OUR_PUBLIC_URL,
-    }
-    payload = {keys.get(k, k): v for k, v in values.items()}
-    status, body = _http(observe_url, payload)
-    result = {
-        "peer": peer["name"],
-        "direction": "push",
-        "url": observe_url,
-        "http": status,
-        "ok": 200 <= status < 300,
-        "response": body if isinstance(body, (dict, list)) else str(body)[:300],
-    }
-    if status == 401 or status == 403:
-        result["hint"] = "they want auth on that route, or it is not in their public set"
-    elif status == 404:
-        result["hint"] = "wrong path - check observe_url for this peer"
-    elif status == 0:
-        result["hint"] = "could not reach them at all"
-    return result
-
-
-def fetch_one(peer):
-    """Read one peer's current tip. Outbound only - no sealing here.
-
-    Returns a dict that either carries a tip ready to seal, or an error
-    already shaped like a result so it can be returned to the caller as is.
-    """
-    status, body = _http(peer["tip_url"])
-    if status != 200:
-        return {
-            "peer": peer["name"], "direction": "pull", "url": peer["tip_url"],
-            "http": status, "ok": False, "_failed": True,
-            "response": body if isinstance(body, (dict, list)) else str(body)[:300],
-            "hint": "could not read their tip",
-        }
-
-    tip, height = _extract_tip(body)
-    if not tip:
-        return {
-            "peer": peer["name"], "direction": "pull", "url": peer["tip_url"],
-            "http": status, "ok": False, "_failed": True,
-            "response": str(body)[:300],
-            "hint": ("no tip field in their reply - add the field name to "
-                     "TIP_FIELDS. Currently accepted: " + ", ".join(TIP_FIELDS)),
-        }
-
-    return {
-        "peer": peer["name"], "url": peer["tip_url"],
-        "tip": tip, "height": height, "_failed": False,
-        "fetched_at": time.time(),
-    }
-
-
-def seal_one(fetched):
-    """Seal one already-fetched peer tip into our chain.
-
-    Goes through our own public observe route so a tip we pulled is
-    recorded by exactly the same code path as a tip somebody pushed to us.
-    Called in a plain loop, never in parallel - this hits our own server.
-
-    Field names must match what modules/witness.py reads out of the body:
-    chain, tip, peer_ts, url. The url is what makes the observation
-    checkable by a third party rather than taken on our word - it is the
-    address we just fetched this tip from.
-    """
-    seal_status, seal_body = _http(OUR_OBSERVE_URL, {
-        "chain": fetched["peer"],
-        "tip": fetched["tip"],
-        "peer_ts": fetched["fetched_at"],
-        "url": fetched["url"],
-    })
-
-    out = {
-        "peer": fetched["peer"],
-        "direction": "pull",
-        "their_tip": fetched["tip"],
-        "their_height": fetched["height"],
-        "sealed_http": seal_status,
-        "ok": 200 <= seal_status < 300,
-        "response": seal_body if isinstance(seal_body, (dict, list)) else str(seal_body)[:300],
-    }
-    if seal_status in (401, 403):
-        out["hint"] = "our own observe route rejected us - check PUBLIC in modules/witness.py"
-    return out
-
-
-def do_push():
-    tip, height, error = our_tip()
-    if error:
-        return {"ok": False, "error": error}
-
-    # Outbound to everyone at once.
-    results = _in_parallel(lambda peer: push_one(peer, tip, height), PEERS)
-
-    return {
-        "ok": True,
-        "our_tip": tip,
-        "our_height": height,
-        "pushed_to": len([r for r in results if not r.get("skipped")]),
-        "fetch_only": len([r for r in results if r.get("skipped")]),
-        "results": results,
-    }
-
-
-def do_pull():
-    # Phase one: read every peer's tip at the same time. This is the slow
-    # part and none of it touches us.
-    fetched = _in_parallel(fetch_one, PEERS)
-
-    # Phase two: seal what came back, one at a time, into our own chain.
-    results = []
-    for item in fetched:
-        if item.get("_failed"):
-            item.pop("_failed", None)
-            results.append(item)
-            continue
-        results.append(seal_one(item))
-
-    return {"ok": True, "results": results}
-
-
-def do_sync():
-    """Pull first, then push. That order matters: the tip we hand out then
-    already contains the tips we just took in, so the two chains interlock
-    rather than merely sitting alongside each other."""
-    started = time.time()
-    pulled = do_pull()
-    pushed = do_push()
-    result = {
-        "ran_at": _now(),
-        "took_seconds": round(time.time() - started, 2),
-        "peers": len(PEERS),
-        "pull": pulled,
-        "push": pushed,
-        "ok": bool(pulled.get("ok")) and bool(pushed.get("ok")),
-    }
-    with _lock:
-        _state["last_run"] = result["ran_at"]
-        _state["last_result"] = result
-        _state["runs"] += 1
-    return result
-
-
-# ----------------------------------------------------------------------
-# background timer
-# ----------------------------------------------------------------------
-
-def _loop():
-    # Let the server finish coming up before the first run.
-    time.sleep(45)
-    while True:
-        try:
-            do_sync()
-        except Exception:
-            pass
-        time.sleep(AUTO_SYNC_SECONDS)
-
-
-def _start_timer():
-    with _lock:
-        if _state["timer_started"] or not AUTO_SYNC_ENABLED:
-            return
-        _state["timer_started"] = True
-    thread = threading.Thread(target=_loop, name="mutual-sync", daemon=True)
-    thread.start()
-
-
-_start_timer()
-
-
-# ----------------------------------------------------------------------
-# router entry point
-# ----------------------------------------------------------------------
-
-def handle(method, action, data, api_key, ctx):
-    action = (action or "").strip("/").lower()
-
-    if method == "GET":
-        if action == "peers":
-            return _reply({
-                "chain": OUR_CHAIN_NAME,
-                "version": VERSION,
-                "peers": [
-                    {"name": p["name"],
-                     "tip_url": p["tip_url"],
-                     "observe_url": p.get("observe_url"),
-                     "direction": ("both" if p.get("observe_url")
-                                   else "fetch-only")}
-                    for p in PEERS
-                ],
-                "parallel_fetch": MAX_PARALLEL_PEERS,
-                "tip_fields_accepted": list(TIP_FIELDS),
-                "note": ("Witnessing is only mutual if both columns are live. "
-                         "A fetch-only peer is one we read and seal but who "
-                         "does not accept a push - either their outbound lane "
-                         "is closed or their tip is a static file. Both are "
-                         "valid; the direction is published rather than "
-                         "implied."),
-            })
-        if action == "status":
-            with _lock:
-                return _reply({
-                    "version": VERSION,
-                    "auto_sync": AUTO_SYNC_ENABLED,
-                    "interval_seconds": AUTO_SYNC_SECONDS,
-                    "timer_running": _state["timer_started"],
-                    "parallel_fetch": MAX_PARALLEL_PEERS,
-                    "runs": _state["runs"],
-                    "last_run": _state["last_run"],
-                    "last_result": _state["last_result"],
-                })
-
-    if method == "POST":
-        if action == "push":
-            return _reply(do_push())
-        if action == "pull":
-            return _reply(do_pull())
-        if action == "sync":
-            return _reply(do_sync())
-
-    return _reply({
-        "error": "unknown action",
-        "GET": ["peers", "status"],
-        "POST": ["push", "pull", "sync"],
-    }, 404)
 
 ```

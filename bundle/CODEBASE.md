@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-135 files across 35 parts.
+136 files across 35 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -53,19 +53,20 @@ Generated automatically on every push. Do not edit by hand.
 - `modules/investor.py`
 - `modules/lineage.py`
 - `modules/lineagedesk.py`
+- `modules/machine.py`
 - `modules/map.py`
-- `modules/mutual.py`
 
 ## [CODEBASE-09.md](CODEBASE-09.md)
 
+- `modules/mutual.py`
 - `modules/network.py`
 - `modules/ots.py`
 - `modules/oversight.py`
 - `modules/pack.py`
-- `modules/packconsole.py`
 
 ## [CODEBASE-10.md](CODEBASE-10.md)
 
+- `modules/packconsole.py`
 - `modules/packs.py`
 
 ## [CODEBASE-11.md](CODEBASE-11.md)
