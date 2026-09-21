@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-145 files across 37 parts.
+144 files across 36 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -85,130 +85,126 @@ Generated automatically on every push. Do not edit by hand.
 
 - `modules/peerconsole.py`
 - `modules/praxis.py`
-- `modules/prove.py`
 - `modules/publish.py`
+- `modules/ratchet.py`
+- `modules/reconcile.py`
 
 ## [CODEBASE-14.md](CODEBASE-14.md)
 
-- `modules/ratchet.py`
-- `modules/reconcile.py`
 - `modules/register.py`
+- `modules/replay.py`
 
 ## [CODEBASE-15.md](CODEBASE-15.md)
 
-- `modules/replay.py`
 - `modules/roster.py`
 - `modules/router.py`
 - `modules/rulebind.py`
 - `modules/run_benchmark.py`
+- `modules/savings.py`
 
 ## [CODEBASE-16.md](CODEBASE-16.md)
 
-- `modules/savings.py`
 - `modules/sebbi_engine.py`
 - `modules/selfcheck.py`
+- `modules/signed.py`
 
 ## [CODEBASE-17.md](CODEBASE-17.md)
 
-- `modules/signed.py`
 - `modules/sortition.py`
 - `modules/spec.py`
 - `modules/standard.py`
+- `modules/standing.py`
+- `modules/stats.py`
 
 ## [CODEBASE-18.md](CODEBASE-18.md)
 
-- `modules/standing.py`
-- `modules/stats.py`
 - `modules/tokensaver.py`
+- `modules/verifier.py`
+- `modules/walk.py`
 
 ## [CODEBASE-19.md](CODEBASE-19.md)
 
-- `modules/verifier.py`
-- `modules/walk.py`
 - `modules/wallet.py`
 - `modules/warmup.py`
+- `modules/witness.py`
 
 ## [CODEBASE-20.md](CODEBASE-20.md)
 
-- `modules/witness.py`
 - `modules/witnessed.py`
 - `ai_act_ranker.py`
 - `aigrade_insert.py`
 - `aileash_reporter.py`
-
-## [CODEBASE-21.md](CODEBASE-21.md)
-
 - `aileash_signed_client.py`
 - `aileash_verify.py`
 - `anchor.py`
+
+## [CODEBASE-21.md](CODEBASE-21.md)
+
 - `brain.py`
 - `gateway_proxy.py`
 - `meshwitness.py`
 - `sebbi_agent.py`
+- `sebbi_sdk.py`
+- `sebbi_site.py`
 
 ## [CODEBASE-22.md](CODEBASE-22.md)
 
-- `sebbi_sdk.py`
-- `sebbi_site.py`
 - `sebbi_tokensaver.py`
-
-## [CODEBASE-23.md](CODEBASE-23.md)
-
 - `sebdog_engine.py`
 - `sebdog_licence.py`
 - `sebdog_reporter.py`
+
+## [CODEBASE-23.md](CODEBASE-23.md)
+
 - `tests/attack_continuity_1.py`
 - `tests/attack_continuity_2.py`
 - `tests/attack_continuity_3.py`
 - `tests/attack_continuity_4.py`
 - `tests/attack_continuity_5.py`
-
-## [CODEBASE-24.md](CODEBASE-24.md)
-
 - `tests/attack_continuity_6.py`
 - `tests/attack_witnessed.py`
 - `verify_authority.py`
 - `AILeash-API-Reference-v6.4.2.md`
 - `LICENCE`
+
+## [CODEBASE-24.md](CODEBASE-24.md)
+
 - `README.md`
 - `admin.html`
-
-## [CODEBASE-25.md](CODEBASE-25.md)
-
 - `ai-standard.html`
 - `ai-txt-kit.html`
 - `aileash-game.html`
+
+## [CODEBASE-25.md](CODEBASE-25.md)
+
 - `aitxt-popup-live.html`
 - `brain.html`
 - `certificate.html`
+- `compliance-assistant.html`
 
 ## [CODEBASE-26.md](CODEBASE-26.md)
 
-- `compliance-assistant.html`
 - `console.html`
 - `contact.html`
 - `copyright.txt`
 - `data-protection.html`
+- `developers.html`
+- `dis.txt`
 
 ## [CODEBASE-27.md](CODEBASE-27.md)
 
-- `developers.html`
-- `dis.txt`
 - `docs/evidential-undertaking.md`
 - `docs/spec/ai-txt.md`
 - `green.html`
 - `guardian-parent.html`
-
-## [CODEBASE-28.md](CODEBASE-28.md)
-
 - `human-oversight.html`
 - `identity.html`
 
-## [CODEBASE-29.md](CODEBASE-29.md)
+## [CODEBASE-28.md](CODEBASE-28.md)
 
 - `index.html`
 
-## [CODEBASE-30.md](CODEBASE-30.md)
+## [CODEBASE-29.md](CODEBASE-29.md)
 
 - `integration-docs.html`
 - `intergration-docs html`
@@ -217,26 +213,26 @@ Generated automatically on every push. Do not edit by hand.
 - `liability.txt`
 - `llms.txt`
 
-## [CODEBASE-31.md](CODEBASE-31.md)
+## [CODEBASE-30.md](CODEBASE-30.md)
 
 - `map.html`
 - `notary.html`
 - `pack.html`
 
-## [CODEBASE-32.md](CODEBASE-32.md)
+## [CODEBASE-31.md](CODEBASE-31.md)
 
 - `pay-check.html`
 - `registry.html`
 - `report-threat.html`
 - `requirements.txt`
 
-## [CODEBASE-33.md](CODEBASE-33.md)
+## [CODEBASE-32.md](CODEBASE-32.md)
 
 - `reseller.html`
 - `risk-policy.html`
 - `robots.txt`
 
-## [CODEBASE-34.md](CODEBASE-34.md)
+## [CODEBASE-33.md](CODEBASE-33.md)
 
 - `scan.html`
 - `seal.html`
@@ -244,17 +240,17 @@ Generated automatically on every push. Do not edit by hand.
 - `signal-packs.html`
 - `sitemap.xml`
 
-## [CODEBASE-35.md](CODEBASE-35.md)
+## [CODEBASE-34.md](CODEBASE-34.md)
 
 - `sonicboom.html`
 - `telemetry-dashboard.html`
 
-## [CODEBASE-36.md](CODEBASE-36.md)
+## [CODEBASE-35.md](CODEBASE-35.md)
 
 - `tokensaver.html`
 - `verify.html`
 
-## [CODEBASE-37.md](CODEBASE-37.md)
+## [CODEBASE-36.md](CODEBASE-36.md)
 
 - `whitepaper.html`
 
