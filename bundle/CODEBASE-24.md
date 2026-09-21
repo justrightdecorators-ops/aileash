@@ -1,13 +1,1061 @@
 # Codebase — part 24 of 37
 
 Contains:
+- `tests/attack_continuity_1.py`
+- `tests/attack_continuity_2.py`
+- `tests/attack_continuity_3.py`
+- `tests/attack_continuity_4.py`
+- `tests/attack_continuity_5.py`
 - `tests/attack_continuity_6.py`
 - `tests/attack_witnessed.py`
 - `verify_authority.py`
 - `AILeash-API-Reference-v6.4.2.md`
 - `LICENCE`
-- `README.md`
-- `admin.html`
+
+
+## `tests/attack_continuity_1.py`
+
+440 lines, 22747 bytes
+
+```python
+#!/usr/bin/env python3
+"""Attack harness for modules/lineage.py.
+
+Every test is written from the position of an agent that HAS some authority
+and is trying to end up with more. Passing means the attack was refused for
+the right reason, not merely refused.
+"""
+
+import hashlib
+import json
+import sqlite3
+import threading
+import time
+import sys
+
+import continuity as lineage
+# --- stand-in for the deployed engine ---------------------------------
+import types as _types
+_ENGINE = {"verdict": "ALLOW"}
+
+def install_engine(verdict="ALLOW", raises=False, shape="dict"):
+    _ENGINE["verdict"] = verdict
+    mod = _types.ModuleType("server")
+    mod.get_bearer = lambda *a, **k: None
+    def score_event(event):
+        if raises:
+            raise RuntimeError("engine down")
+        if shape == "dict":
+            return {"decision": _ENGINE["verdict"], "score": 0.1}
+        if shape == "tuple":
+            return (_ENGINE["verdict"], 0.1)
+        return _ENGINE["verdict"]
+    mod.score_event = score_event
+    sys.modules["server"] = mod
+
+def remove_engine():
+    sys.modules.pop("server", None)
+
+install_engine("ALLOW")
+
+
+PASS, FAIL = [], []
+
+
+def make_ctx():
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    lock = threading.RLock()
+    chain = {"n": 0, "prev": "0" * 64}
+
+    def seal(ev, res, ts, api_key):
+        chain["n"] += 1
+        payload = json.dumps([ev, res, ts, api_key, chain["prev"]], sort_keys=True)
+        h = hashlib.sha256(payload.encode()).hexdigest()
+        chain["prev"] = h
+        return h, chain["n"], chain["n"]
+
+    lineage._ready = False
+    ctx = {"conn": conn, "lock": lock, "seal": seal}
+    lineage._setup(ctx)
+    return ctx
+
+
+def check(name, condition, detail=""):
+    (PASS if condition else FAIL).append(name)
+    print(("  ok   " if condition else "  FAIL ") + name + (("  -> " + detail) if detail and not condition else ""))
+
+
+def issue(ctx, **kw):
+    if kw.get("parent") and int(kw.get("delegations_left", 0)) > 0 \
+            and not kw.get("risk_accepted_by"):
+        kw["risk_accepted_by"] = "owner@example.com"
+    return lineage._issue(ctx, "k", kw)
+
+
+def exercise(ctx, **kw):
+    return lineage._evaluate(ctx, "k", kw)
+
+
+NOW = time.time()
+HOUR = 3600
+
+
+def base_root(ctx, **over):
+    args = dict(
+        id="root", issuer="justin@monop", issuer_kind="human",
+        subject="orchestrator", subject_kind="agent",
+        scope=["payments.refund", "payments.read", "tickets.*"],
+        constraints={"max_amount": 5000, "allowed_currency": ["GBP", "EUR"],
+                     "denied_country": ["KP"], "may_contact_customer": True},
+        purpose="resolve customer refund complaints",
+        purpose_tags=["refunds", "support"],
+        not_before=NOW - HOUR, not_after=NOW + 10 * HOUR,
+        delegations_left=3)
+    args.update(over)
+    return issue(ctx, **args)
+
+
+print("\n=== 1. the happy path must actually work ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent",
+      subject="refund-agent", scope=["payments.refund"],
+      constraints={"max_amount": 500, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="issue refunds under 500", purpose_tags=["refunds"],
+      not_before=NOW - HOUR, not_after=NOW + 2 * HOUR, delegations_left=1)
+r, code = exercise(ctx, grant="mid", action="payments.refund",
+                   params={"amount": 100, "currency": "GBP", "country": "GB",
+                           "contact_customer": True},
+                   purpose_tag="refunds")
+check("a derivable action returns ALLOW", r["verdict"] == "ALLOW", str(r["reasons"]))
+check("lineage names the human at the root", r["authorised_by"] == "justin@monop")
+check("depth is reported", r["delegation_depth"] == 1)
+check("the decision is sealed", bool(r.get("sealed_in_chain")))
+
+print("\n=== 2. orphan root: an agent grants itself authority ===")
+ctx = make_ctx()
+r, code = issue(ctx, id="self", issuer="rogue-agent", issuer_kind="agent",
+                subject="rogue-agent", scope=["payments.refund"],
+                constraints={"max_amount": 999999}, purpose="whatever I decide",
+                purpose_tags=["anything"], not_after=NOW + HOUR)
+check("self-issued root is refused at issue", code == 409 and r.get("error") == "identity_continuity", str(r))
+
+print("\n=== 3. scope escalation in a child ===")
+ctx = make_ctx()
+base_root(ctx)
+r, code = issue(ctx, id="wide", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="rogue", scope=["payments.refund", "payments.transfer"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                             "denied_country": ["KP"], "may_contact_customer": False},
+                purpose="sneak in a transfer", purpose_tags=["refunds"],
+                not_after=NOW + HOUR, delegations_left=0)
+check("scope the parent never held is refused",
+      code == 409 and "payments.transfer" in r.get("message", ""), str(r))
+
+print("\n=== 4. constraint loosening ===")
+ctx = make_ctx()
+base_root(ctx)
+r, code = issue(ctx, id="rich", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="rogue", scope=["payments.refund"],
+                constraints={"max_amount": 50000, "allowed_currency": ["GBP"],
+                             "denied_country": ["KP"], "may_contact_customer": True},
+                purpose="bigger refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+check("raising a max_ cap is refused", code == 409 and "max_amount" in r.get("message", ""), str(r))
+
+r, code = issue(ctx, id="wide2", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="rogue", scope=["payments.refund"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP", "USD"],
+                             "denied_country": ["KP"], "may_contact_customer": True},
+                purpose="new currency", purpose_tags=["refunds"], not_after=NOW + HOUR)
+check("adding to an allowed_ set is refused", code == 409 and "USD" in r.get("message", ""), str(r))
+
+r, code = issue(ctx, id="undeny", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="rogue", scope=["payments.refund"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                             "denied_country": [], "may_contact_customer": True},
+                purpose="drop the denylist", purpose_tags=["refunds"], not_after=NOW + HOUR)
+check("dropping from a denied_ set is refused", code == 409 and "KP" in r.get("message", ""), str(r))
+
+r, code = issue(ctx, id="newkey", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="rogue", scope=["payments.refund"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                             "denied_country": ["KP"], "may_contact_customer": True,
+                             "may_export_data": True},
+                purpose="invent a permission", purpose_tags=["refunds"], not_after=NOW + HOUR)
+check("introducing a constraint key the parent never expressed is refused",
+      code == 409 and "may_export_data" in r.get("message", ""), str(r))
+
+print("\n=== 5. temporal attacks ===")
+ctx = make_ctx()
+base_root(ctx)
+r, code = issue(ctx, id="long", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="rogue", scope=["payments.refund"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                             "denied_country": ["KP"], "may_contact_customer": True},
+                purpose="outlive the parent", purpose_tags=["refunds"],
+                not_before=NOW, not_after=NOW + 100 * HOUR)
+check("a child cannot outlive its parent", code == 409 and r.get("error") == "temporal_validity", str(r))
+
+# expired ancestor, live leaf, forced in past the issue check
+ctx = make_ctx()
+base_root(ctx, not_after=NOW + HOUR)
+issue(ctx, id="child", parent="root", issuer="orchestrator", issuer_kind="agent",
+      subject="agent-b", scope=["payments.refund"],
+      constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+with ctx["lock"]:
+    ctx["conn"].execute("UPDATE auth_grant SET not_after=? WHERE id='root'", (NOW - 60,))
+    ctx["conn"].commit()
+r, _ = exercise(ctx, grant="child", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "GB",
+                        "contact_customer": True}, purpose_tag="refunds")
+check("an expired ancestor kills a live leaf", r["verdict"] == "BLOCK", str(r["reasons"]))
+check("...and it is reported as tampering, since the row no longer matches its digest",
+      r["broken_invariant"] == "evidence_continuity", r["broken_invariant"] or "")
+
+print("\n=== 6. revocation is transitive ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent",
+      subject="b", scope=["payments.refund"],
+      constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR, delegations_left=1)
+issue(ctx, id="leaf", parent="mid", issuer="b", issuer_kind="agent",
+      subject="c", scope=["payments.refund"],
+      constraints={"max_amount": 50, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+lineage._revoke(ctx, "k", {"grant": "mid", "reason": "agent compromised"})
+r, _ = exercise(ctx, grant="leaf", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "GB",
+                        "contact_customer": True}, purpose_tag="refunds")
+check("revoking the middle blocks the leaf without touching it", r["verdict"] == "BLOCK")
+check("the revoked grant is named", r["broken_at"] == "mid", str(r["broken_at"]))
+r2, _ = exercise(ctx, grant="root", action="payments.refund",
+                 params={"amount": 10, "currency": "GBP", "country": "GB",
+                         "contact_customer": True}, purpose_tag="refunds")
+check("revoking a child does not harm the parent", r2["verdict"] == "ALLOW", str(r2["reasons"]))
+
+print("\n=== 7. delegation depth cannot be manufactured ===")
+ctx = make_ctx()
+base_root(ctx, delegations_left=1)
+issue(ctx, id="d1", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.refund"],
+      constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR, delegations_left=0)
+r, code = issue(ctx, id="d2", parent="d1", issuer="b", issuer_kind="agent", subject="c",
+                scope=["payments.refund"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                             "denied_country": ["KP"], "may_contact_customer": True},
+                purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+check("an exhausted delegation budget stops the chain",
+      code == 409 and r.get("error") == "delegation_not_permitted", str(r))
+
+ctx = make_ctx()
+base_root(ctx, delegations_left=2)
+r, code = issue(ctx, id="greedy", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="b", scope=["payments.refund"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                             "denied_country": ["KP"], "may_contact_customer": True},
+                purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR,
+                delegations_left=5)
+check("a child cannot award itself more onward delegations than remained",
+      code == 409, str(r))
+
+print("\n=== 8. tampering with a stored grant ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.refund"],
+      constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+with ctx["lock"]:
+    ctx["conn"].execute(
+        "UPDATE auth_grant SET constraints=? WHERE id='mid'",
+        (json.dumps({"max_amount": 999999, "allowed_currency": ["GBP", "USD"],
+                     "denied_country": [], "may_contact_customer": True},
+                    sort_keys=True, separators=(",", ":")),))
+    ctx["conn"].commit()
+r, _ = exercise(ctx, grant="mid", action="payments.refund",
+                params={"amount": 900000, "currency": "USD", "country": "GB",
+                        "contact_customer": True}, purpose_tag="refunds")
+check("editing the database does not widen authority", r["verdict"] == "BLOCK")
+check("the tamper is reported as an evidence failure",
+      r["broken_invariant"] == "evidence_continuity", str(r["broken_invariant"]))
+
+print("\n=== 9. re-parenting onto a wider ancestor ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="narrow", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.read"],
+      constraints={"max_amount": 1, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": False},
+      purpose="read only", purpose_tags=["support"], not_after=NOW + HOUR)
+with ctx["lock"]:
+    ctx["conn"].execute("UPDATE auth_grant SET parent=NULL WHERE id='narrow'")
+    ctx["conn"].commit()
+r, _ = exercise(ctx, grant="narrow", action="payments.read",
+                params={}, purpose_tag="support")
+check("detaching a grant to make it a root fails integrity", r["verdict"] == "BLOCK",
+      str(r["reasons"]))
+
+print("\n=== 10. parent cycle ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="a", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.refund"],
+      constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR, delegations_left=1)
+issue(ctx, id="b", parent="a", issuer="b", issuer_kind="agent", subject="c",
+      scope=["payments.refund"],
+      constraints={"max_amount": 50, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+with ctx["lock"]:
+    ctx["conn"].execute("UPDATE auth_grant SET parent='b' WHERE id='a'")
+    ctx["conn"].commit()
+start = time.time()
+r, _ = exercise(ctx, grant="b", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "GB",
+                        "contact_customer": True}, purpose_tag="refunds")
+check("a parent cycle terminates rather than hangs", time.time() - start < 2)
+check("a cycle is BLOCKed as an authority failure", r["verdict"] == "BLOCK")
+
+print("\n=== 11. action parameters beyond the effective constraints ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.refund"],
+      constraints={"max_amount": 500, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+r, _ = exercise(ctx, grant="mid", action="payments.refund",
+                params={"amount": 501, "currency": "GBP", "country": "GB",
+                        "contact_customer": True}, purpose_tag="refunds")
+check("an amount over the cap is BLOCKed", r["verdict"] == "BLOCK", str(r["reasons"]))
+r, _ = exercise(ctx, grant="mid", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "KP",
+                        "contact_customer": True}, purpose_tag="refunds")
+check("a denied country is BLOCKed", r["verdict"] == "BLOCK", str(r["reasons"]))
+
+print("\n=== 12. uncertainty is challenged, not guessed ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.refund"],
+      constraints={"max_amount": 500, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="issue refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+r, _ = exercise(ctx, grant="mid", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "GB",
+                        "contact_customer": True}, purpose_tag="marketing")
+check("a purpose the grant does not carry is CHALLENGED", r["verdict"] == "CHALLENGE", str(r))
+r, _ = exercise(ctx, grant="mid", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "GB",
+                        "contact_customer": True})
+check("no declared purpose is CHALLENGED", r["verdict"] == "CHALLENGE", str(r))
+r, _ = exercise(ctx, grant="mid", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "GB",
+                        "contact_customer": True, "recipient_iban": "GB00XXXX"},
+                purpose_tag="refunds")
+check("an unconstrained parameter is CHALLENGED, not ignored",
+      r["verdict"] == "CHALLENGE" and any("recipient_iban" in x for x in r["reasons"]), str(r))
+
+print("\n=== 13. wildcard breadth ===")
+ctx = make_ctx()
+base_root(ctx)
+r, _ = exercise(ctx, grant="root", action="tickets.close.bulk.all",
+                params={}, purpose_tag="support")
+check("a broad wildcard match is CHALLENGED rather than silently allowed",
+      r["verdict"] == "CHALLENGE", str(r))
+
+ctx = make_ctx()
+base_root(ctx, scope=["*"], id="star")
+r, _ = exercise(ctx, grant="star", action="payments.transfer", params={}, purpose_tag="refunds")
+check("a bare * never reaches ALLOW", r["verdict"] == "CHALLENGE", str(r))
+
+print("\n=== 14. no union of grants ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="money", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.refund"],
+      constraints={"max_amount": 500, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": False},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+issue(ctx, id="contact", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.read"],
+      constraints={"max_amount": 0, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="contact", purpose_tags=["support"], not_after=NOW + HOUR)
+r, code = exercise(ctx, grant="money,contact", action="payments.refund",
+                   params={"amount": 10, "currency": "GBP", "contact_customer": True},
+                   purpose_tag="refunds")
+check("two grant ids cannot be combined into one exercise", r["verdict"] == "BLOCK", str(r))
+r, _ = exercise(ctx, grant="money", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "contact_customer": True},
+                purpose_tag="refunds")
+check("the capability from the sibling grant does not leak in", r["verdict"] == "BLOCK",
+      str(r["reasons"]))
+
+print("\n=== 15. time of check vs time of use ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.refund"],
+      constraints={"max_amount": 500, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+r, _ = exercise(ctx, grant="mid", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "GB",
+                        "contact_customer": True}, purpose_tag="refunds")
+eval_id = r["evaluation"]
+c, code = lineage._confirm(ctx, "k", {"evaluation": eval_id, "action": "payments.refund",
+                                      "params": {"amount": 10, "currency": "GBP",
+                                                 "country": "GB", "contact_customer": True}})
+check("executing exactly what was evaluated binds", c["bound"] is True, str(c))
+c, code = lineage._confirm(ctx, "k", {"evaluation": eval_id, "action": "payments.refund",
+                                      "params": {"amount": 400, "currency": "GBP",
+                                                 "country": "GB", "contact_customer": True}})
+check("executing different values than were evaluated is rejected", c["bound"] is False, str(c))
+check("the rejected execution is still sealed", bool(c.get("sealed_in_chain")))
+
+with ctx["lock"]:
+    ctx["conn"].execute("UPDATE auth_eval SET valid_until=? WHERE id=?", (NOW - 1, eval_id))
+    ctx["conn"].commit()
+c, _ = lineage._confirm(ctx, "k", {"evaluation": eval_id})
+check("a banked evaluation cannot be spent after its window", c["bound"] is False, str(c))
+
+print("\n=== 16. a BLOCK is evidence, not silence ===")
+ctx = make_ctx()
+base_root(ctx)
+r, _ = exercise(ctx, grant="nonexistent", action="payments.refund", params={})
+check("an unknown grant BLOCKs", r["verdict"] == "BLOCK")
+check("the block is sealed in the chain", bool(r.get("sealed_in_chain")))
+d, code = lineage._decision(ctx, {"evaluation": r["evaluation"]})
+check("the sealed decision is publicly retrievable", code == 200 and d["verdict"] == "BLOCK")
+
+print("\n=== 17. no authority without a stated purpose or an end date ===")
+ctx = make_ctx()
+r, code = issue(ctx, id="forever", issuer="justin@monop", issuer_kind="human", subject="a",
+                scope=["payments.refund"], constraints={"max_amount": 1},
+                purpose="anything", purpose_tags=["x"])
+check("a grant with no expiry is refused", code == 400 and r.get("error") == "not_after_required")
+r, code = issue(ctx, id="vague", issuer="justin@monop", issuer_kind="human", subject="a",
+                scope=["payments.refund"], constraints={"max_amount": 1},
+                purpose="", purpose_tags=["x"], not_after=NOW + HOUR)
+check("a grant with no purpose is refused", code == 400 and r.get("error") == "purpose_required")
+
+print("\n" + "=" * 60)
+print("passed %d, failed %d" % (len(PASS), len(FAIL)))
+if FAIL:
+    for f in FAIL:
+        print("  FAILED: " + f)
+    sys.exit(1)
+
+```
+
+
+## `tests/attack_continuity_2.py`
+
+228 lines, 10573 bytes
+
+```python
+#!/usr/bin/env python3
+"""Second wave. The first wave tested the obvious escalations. This one
+tests the ones that would survive a code review."""
+
+import hashlib
+import json
+import sqlite3
+import threading
+import time
+import sys
+
+import continuity as lineage
+# --- stand-in for the deployed engine ---------------------------------
+import types as _types
+_ENGINE = {"verdict": "ALLOW"}
+
+def install_engine(verdict="ALLOW", raises=False, shape="dict"):
+    _ENGINE["verdict"] = verdict
+    mod = _types.ModuleType("server")
+    mod.get_bearer = lambda *a, **k: None
+    def score_event(event):
+        if raises:
+            raise RuntimeError("engine down")
+        if shape == "dict":
+            return {"decision": _ENGINE["verdict"], "score": 0.1}
+        if shape == "tuple":
+            return (_ENGINE["verdict"], 0.1)
+        return _ENGINE["verdict"]
+    mod.score_event = score_event
+    sys.modules["server"] = mod
+
+def remove_engine():
+    sys.modules.pop("server", None)
+
+install_engine("ALLOW")
+
+
+PASS, FAIL = [], []
+NOW = time.time()
+HOUR = 3600
+
+
+def make_ctx():
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    lock = threading.RLock()
+    n = {"i": 0}
+
+    def seal(ev, res, ts, api_key):
+        n["i"] += 1
+        return hashlib.sha256(json.dumps([ev, res, ts], sort_keys=True,
+                                         default=str).encode()).hexdigest(), n["i"], n["i"]
+    lineage._ready = False
+    ctx = {"conn": conn, "lock": lock, "seal": seal}
+    lineage._setup(ctx)
+    return ctx
+
+
+def check(name, cond, detail=""):
+    (PASS if cond else FAIL).append(name)
+    print(("  ok   " if cond else "  FAIL ") + name + (("  -> " + str(detail)[:300]) if detail and not cond else ""))
+
+
+def issue(ctx, **kw):
+    if kw.get("parent") and int(kw.get("delegations_left", 0)) > 0 \
+            and not kw.get("risk_accepted_by"):
+        kw["risk_accepted_by"] = "owner@example.com"
+    return lineage._issue(ctx, "k", kw)
+
+
+def root(ctx, **over):
+    args = dict(id="root", issuer="owner@example.com", issuer_kind="human",
+                subject="orchestrator", scope=["payments.refund", "payments.read"],
+                constraints={"max_amount": 5000, "allowed_currency": ["GBP", "EUR"]},
+                purpose="refunds", purpose_tags=["refunds"],
+                not_before=NOW - HOUR, not_after=NOW + 10 * HOUR, delegations_left=10)
+    args.update(over)
+    return issue(ctx, **args)
+
+
+print("\n=== 18. double execution against one ALLOW ===")
+ctx = make_ctx()
+root(ctx)
+r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments.refund",
+                                    "params": {"amount": 100, "currency": "GBP"},
+                                    "purpose_tag": "refunds"})
+eid = r["evaluation"]
+p = {"amount": 100, "currency": "GBP"}
+c1, _ = lineage._confirm(ctx, "k", {"evaluation": eid, "action": "payments.refund", "params": p})
+c2, _ = lineage._confirm(ctx, "k", {"evaluation": eid, "action": "payments.refund", "params": p})
+check("the first execution binds", c1["bound"] is True, c1)
+check("the same evaluation cannot be spent twice", c2["bound"] is False, c2)
+
+print("\n=== 19. type confusion in constraints ===")
+ctx = make_ctx()
+root(ctx, constraints={"max_amount": 5000, "allowed_currency": "GBP"})
+r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments.refund",
+                                    "params": {"amount": 10, "currency": "G"},
+                                    "purpose_tag": "refunds"})
+check("a single character does not satisfy a string-valued allowed_ list",
+      r["verdict"] == "BLOCK", r["reasons"])
+
+ctx = make_ctx()
+root(ctx)
+r, code = issue(ctx, id="strnum", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="b", scope=["payments.refund"],
+                constraints={"max_amount": "50000", "allowed_currency": ["GBP"]},
+                purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+check("a numeric cap passed as a string cannot beat the parent", code == 409, r)
+
+ctx = make_ctx()
+root(ctx)
+r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments.refund",
+                                    "params": {"amount": "99999", "currency": "GBP"},
+                                    "purpose_tag": "refunds"})
+check("a string amount is still compared numerically", r["verdict"] == "BLOCK", r["reasons"])
+
+ctx = make_ctx()
+root(ctx)
+r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments.refund",
+                                    "params": {"amount": True, "currency": "GBP"},
+                                    "purpose_tag": "refunds"})
+check("a non-numeric amount does not slip through as unconstrained",
+      r["verdict"] in ("BLOCK", "CHALLENGE"), r)
+
+print("\n=== 20. capability prefix tricks ===")
+ctx = make_ctx()
+root(ctx, scope=["payments.refund"])
+for probe in ["payments.refunds", "payments.refund.approve", "payments.refundX",
+              "Payments.Refund", "payments.refund "]:
+    r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": probe,
+                                        "params": {}, "purpose_tag": "refunds"})
+    check("'%s' is not covered by 'payments.refund'" % probe, r["verdict"] == "BLOCK", r["reasons"])
+
+ctx = make_ctx()
+root(ctx, scope=["payments.*"])
+r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments2.transfer",
+                                    "params": {}, "purpose_tag": "refunds"})
+check("'payments.*' does not cover 'payments2.transfer'", r["verdict"] == "BLOCK", r["reasons"])
+
+print("\n=== 21. a long but legitimate chain ===")
+ctx = make_ctx()
+root(ctx, constraints={"max_amount": 10000, "allowed_currency": ["GBP", "EUR"]},
+     delegations_left=12)
+parent, cap = "root", 10000
+for i in range(10):
+    cap = cap // 2
+    gid = "d%d" % i
+    r, code = issue(ctx, id=gid, parent=parent, issuer="a%d" % i, issuer_kind="agent",
+                    subject="a%d" % (i + 1), scope=["payments.refund"],
+                    constraints={"max_amount": cap, "allowed_currency": ["GBP"]},
+                    purpose="refunds", purpose_tags=["refunds"],
+                    not_after=NOW + HOUR, delegations_left=11 - i)
+    if code != 200:
+        break
+    parent = gid
+check("ten legitimate narrowing hops are accepted", code == 200 and parent == "d9", r)
+r, _ = lineage._evaluate(ctx, "k", {"grant": "d9", "action": "payments.refund",
+                                    "params": {"amount": 5, "currency": "GBP"},
+                                    "purpose_tag": "refunds"})
+check("the deep chain still ALLOWs a derivable action", r["verdict"] == "ALLOW", r["reasons"])
+check("the effective cap is the tightest in the chain",
+      float(r["effective_constraints"]["max_amount"]) == 9, r["effective_constraints"])
+check("the human at the root is still named ten hops down",
+      r["authorised_by"] == "owner@example.com")
+r, _ = lineage._evaluate(ctx, "k", {"grant": "d9", "action": "payments.refund",
+                                    "params": {"amount": 10, "currency": "GBP"},
+                                    "purpose_tag": "refunds"})
+check("one unit over the deepest cap is BLOCKed", r["verdict"] == "BLOCK", r["reasons"])
+
+print("\n=== 22. revoking the root kills the whole tree ===")
+lineage._revoke(ctx, "k", {"grant": "root", "reason": "principal withdrew authority"})
+r, _ = lineage._evaluate(ctx, "k", {"grant": "d9", "action": "payments.refund",
+                                    "params": {"amount": 1, "currency": "GBP"},
+                                    "purpose_tag": "refunds"})
+check("revoking the root blocks a leaf ten hops away", r["verdict"] == "BLOCK")
+check("the root is named as the break point", r["broken_at"] == "root", r["broken_at"])
+
+print("\n=== 23. issuing under a revoked or expired parent ===")
+ctx = make_ctx()
+root(ctx)
+lineage._revoke(ctx, "k", {"grant": "root", "reason": "x"})
+r, code = issue(ctx, id="after", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="b", scope=["payments.refund"],
+                constraints={"max_amount": 1, "allowed_currency": ["GBP"]},
+                purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+check("no new delegation under a revoked parent", code == 409 and r.get("error") == "parent_revoked", r)
+
+print("\n=== 24. duplicate grant id cannot overwrite a grant ===")
+ctx = make_ctx()
+root(ctx)
+r, code = root(ctx, scope=["*"], constraints={"max_amount": 999999})
+check("re-issuing an existing id is refused", code == 409 and r.get("error") == "grant_exists", r)
+
+print("\n=== 25. the boundary values themselves ===")
+ctx = make_ctx()
+root(ctx, constraints={"max_amount": 100, "allowed_currency": ["GBP"]}, delegations_left=2)
+r, code = issue(ctx, id="equal", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="b", scope=["payments.refund"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP"]},
+                purpose="refunds", purpose_tags=["refunds"],
+                not_after=NOW + 10 * HOUR, delegations_left=1)
+check("an equal-not-wider child is accepted", code == 200, r)
+r, _ = lineage._evaluate(ctx, "k", {"grant": "equal", "action": "payments.refund",
+                                    "params": {"amount": 100, "currency": "GBP"},
+                                    "purpose_tag": "refunds"})
+check("exactly the cap is allowed", r["verdict"] == "ALLOW", r["reasons"])
+r, _ = lineage._evaluate(ctx, "k", {"grant": "equal", "action": "payments.refund",
+                                    "params": {"amount": 100.01, "currency": "GBP"},
+                                    "purpose_tag": "refunds"})
+check("a penny over the cap is blocked", r["verdict"] == "BLOCK", r["reasons"])
+
+print("\n=== 26. a CHALLENGE cannot be executed ===")
+ctx = make_ctx()
+root(ctx)
+r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments.refund",
+                                    "params": {"amount": 1, "currency": "GBP"}})
+check("no declared purpose gives CHALLENGE", r["verdict"] == "CHALLENGE", r["verdict"])
+c, code = lineage._confirm(ctx, "k", {"evaluation": r["evaluation"],
+                                      "action": "payments.refund",
+                                      "params": {"amount": 1, "currency": "GBP"}})
+check("a CHALLENGE cannot be bound as an execution", c["bound"] is False, c)
+
+print("\n" + "=" * 60)
+print("passed %d, failed %d" % (len(PASS), len(FAIL)))
+for f in FAIL:
+    print("  FAILED: " + f)
+sys.exit(1 if FAIL else 0)
+
+```
+
+
+## `tests/attack_continuity_3.py`
+
+114 lines, 5626 bytes
+
+```python
+#!/usr/bin/env python3
+"""Third wave: concurrency, and reconstruction from evidence alone."""
+import hashlib, json, sqlite3, threading, time, sys
+import continuity as lineage
+# --- stand-in for the deployed engine ---------------------------------
+import types as _types
+_ENGINE = {"verdict": "ALLOW"}
+
+def install_engine(verdict="ALLOW", raises=False, shape="dict"):
+    _ENGINE["verdict"] = verdict
+    mod = _types.ModuleType("server")
+    mod.get_bearer = lambda *a, **k: None
+    def score_event(event):
+        if raises:
+            raise RuntimeError("engine down")
+        if shape == "dict":
+            return {"decision": _ENGINE["verdict"], "score": 0.1}
+        if shape == "tuple":
+            return (_ENGINE["verdict"], 0.1)
+        return _ENGINE["verdict"]
+    mod.score_event = score_event
+    sys.modules["server"] = mod
+
+def remove_engine():
+    sys.modules.pop("server", None)
+
+install_engine("ALLOW")
+
+
+PASS, FAIL = [], []
+NOW, HOUR = time.time(), 3600
+
+def make_ctx():
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    lock = threading.RLock(); n = {"i": 0}
+    def seal(ev, res, ts, k):
+        with lock:
+            n["i"] += 1
+            return hashlib.sha256(json.dumps([ev,res,ts],sort_keys=True,default=str).encode()).hexdigest(), n["i"], n["i"]
+    lineage._ready = False
+    ctx = {"conn": conn, "lock": lock, "seal": seal}
+    lineage._setup(ctx); return ctx
+
+def check(n, c, d=""):
+    (PASS if c else FAIL).append(n)
+    print(("  ok   " if c else "  FAIL ") + n + (("  -> " + str(d)[:250]) if d and not c else ""))
+
+print("\n=== 27. concurrent execution of one ALLOW ===")
+ctx = make_ctx()
+lineage._issue(ctx,"k",dict(id="root",issuer="owner@example.com",issuer_kind="human",
+    subject="agent",scope=["payments.refund"],constraints={"max_amount":5000},
+    purpose="refunds",purpose_tags=["refunds"],not_after=NOW+HOUR,delegations_left=0))
+r,_ = lineage._evaluate(ctx,"k",{"grant":"root","action":"payments.refund",
+    "params":{"amount":100},"purpose_tag":"refunds"})
+eid = r["evaluation"]; results = []
+def race():
+    c,_ = lineage._confirm(ctx,"k",{"evaluation":eid,"action":"payments.refund","params":{"amount":100}})
+    results.append(c["bound"])
+ts = [threading.Thread(target=race) for _ in range(8)]
+[t.start() for t in ts]; [t.join() for t in ts]
+check("exactly one of eight concurrent executions binds", results.count(True) == 1, results)
+with ctx["lock"]:
+    rows = ctx["conn"].execute("SELECT COUNT(*) FROM auth_exec WHERE eval_id=? AND outcome<>'rejected'",(eid,)).fetchone()
+check("only one accepted binding exists in storage", rows[0] == 1, rows)
+
+print("\n=== 28. reconstruct the whole story from the sealed record ===")
+ctx = make_ctx()
+lineage._issue(ctx,"k",dict(id="r",issuer="owner@example.com",issuer_kind="human",
+    subject="orchestrator",scope=["payments.*"],constraints={"max_amount":5000},
+    purpose="close the refund backlog",purpose_tags=["refunds"],
+    not_after=NOW+HOUR,delegations_left=2))
+lineage._issue(ctx,"k",dict(id="m",parent="r",issuer="orchestrator",issuer_kind="agent",
+    subject="refund-bot",scope=["payments.refund"],constraints={"max_amount":200},
+    purpose="issue small refunds",purpose_tags=["refunds"],not_after=NOW+HOUR,delegations_left=0))
+r,_ = lineage._evaluate(ctx,"k",{"grant":"m","action":"payments.refund",
+    "params":{"amount":150},"purpose_tag":"refunds"})
+t,code = lineage._trace(ctx,{"grant":"m"})
+check("the trace names who authorised it", t["authorised_by"] == "owner@example.com")
+check("the trace names who held it at execution", t["holder"] == "refund-bot")
+check("the trace shows what changed at each hop",
+      t["lineage"][0]["scope"] == ["payments.*"] and t["lineage"][1]["scope"] == ["payments.refund"])
+check("the effective constraint is the narrowest, not the granted one",
+      float(t["effective_constraints"]["max_amount"]) == 200, t["effective_constraints"])
+d,code = lineage._decision(ctx,{"evaluation":r["evaluation"]})
+check("the decision is retrievable without a key and matches", d["verdict"] == r["verdict"])
+check("the decision carries the lineage digest", d["lineage_digest"] == r["lineage_digest"])
+check("every hop carries its own block index",
+      all(h["block_index"] for h in t["lineage"]))
+
+print("\n=== 29. widening midway is visible in the trace, not just blocked ===")
+ctx = make_ctx()
+lineage._issue(ctx,"k",dict(id="r",issuer="owner@example.com",issuer_kind="human",
+    subject="a",scope=["payments.refund"],constraints={"max_amount":100},
+    purpose="p",purpose_tags=["refunds"],not_after=NOW+HOUR,delegations_left=2))
+lineage._issue(ctx,"k",dict(id="m",parent="r",issuer="a",issuer_kind="agent",
+    subject="b",scope=["payments.refund"],constraints={"max_amount":100},
+    purpose="p",purpose_tags=["refunds"],not_after=NOW+HOUR,delegations_left=1,
+    risk_accepted_by="owner@example.com"))
+with ctx["lock"]:
+    ctx["conn"].execute("UPDATE auth_grant SET constraints=? WHERE id='m'",
+        (json.dumps({"max_amount":100000},sort_keys=True,separators=(",",":")),))
+    ctx["conn"].commit()
+t,_ = lineage._trace(ctx,{"grant":"m"})
+check("the trace flags the altered hop by name",
+      t["lineage"][1]["integrity"] == "FAILED" and t["lineage"][0]["integrity"] == "ok", t["lineage"])
+r,_ = lineage._evaluate(ctx,"k",{"grant":"m","action":"payments.refund",
+    "params":{"amount":50},"purpose_tag":"refunds"})
+check("and the exercise names the exact grant that broke", r["broken_at"] == "m", r["broken_at"])
+
+print("\n" + "="*60)
+print("passed %d, failed %d" % (len(PASS), len(FAIL)))
+for f in FAIL: print("  FAILED: "+f)
+sys.exit(1 if FAIL else 0)
+
+```
+
+
+## `tests/attack_continuity_4.py`
+
+107 lines, 4723 bytes
+
+```python
+#!/usr/bin/env python3
+"""Fourth wave: does it actually compose with the existing engine, and can
+either side be bypassed by the other?"""
+import hashlib, json, sqlite3, threading, time, sys, types
+import continuity as C
+
+PASS, FAIL = [], []
+NOW, HOUR = time.time(), 3600
+STATE = {"verdict": "ALLOW", "raises": False, "shape": "dict", "seen": []}
+
+def install(verdict="ALLOW", raises=False, shape="dict"):
+    STATE.update(verdict=verdict, raises=raises, shape=shape)
+    m = types.ModuleType("server")
+    m.get_bearer = lambda *a, **k: None
+    def score_event(event):
+        STATE["seen"].append(event)
+        if STATE["raises"]: raise RuntimeError("engine down")
+        if STATE["shape"] == "dict": return {"decision": STATE["verdict"], "score": 0.42}
+        if STATE["shape"] == "tuple": return (STATE["verdict"], 0.42)
+        if STATE["shape"] == "junk": return {"nothing": "useful"}
+        return STATE["verdict"]
+    m.score_event = score_event
+    sys.modules["server"] = m
+
+def make_ctx():
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    lock = threading.RLock(); n = {"i":0}
+    def seal(ev,res,ts,k):
+        n["i"] += 1
+        return hashlib.sha256(json.dumps([ev,res,ts],sort_keys=True,default=str).encode()).hexdigest(), n["i"], n["i"]
+    C._ready = False
+    ctx = {"conn":conn,"lock":lock,"seal":seal}; C._setup(ctx); return ctx
+
+def check(n,c,d=""):
+    (PASS if c else FAIL).append(n)
+    print(("  ok   " if c else "  FAIL ")+n+(("  -> "+str(d)[:250]) if d and not c else ""))
+
+def setup():
+    ctx = make_ctx()
+    C._issue(ctx,"k",dict(id="root",issuer="owner@example.com",issuer_kind="human",
+        subject="agent",scope=["payments.refund"],
+        constraints={"max_amount":5000,"allowed_currency":["GBP"]},
+        purpose="refunds",purpose_tags=["refunds"],not_after=NOW+HOUR,delegations_left=0))
+    return ctx
+
+def run(ctx, amount=100):
+    return C._evaluate(ctx,"k",{"grant":"root","action":"payments.refund",
+        "params":{"amount":amount,"currency":"GBP"},"purpose_tag":"refunds"})[0]
+
+print("\n=== 30. the engine is actually consulted ===")
+install("ALLOW"); STATE["seen"] = []
+r = run(setup())
+check("a clean authority plus a clean engine is ALLOW", r["verdict"]=="ALLOW", r)
+check("the engine was called with the real action and amount",
+      STATE["seen"] and STATE["seen"][-1]["action"]=="payments.refund"
+      and STATE["seen"][-1]["amount"]==100, STATE["seen"][-1] if STATE["seen"] else None)
+check("both components are reported separately",
+      r["authority_verdict"]=="ALLOW" and r["risk_verdict"]=="ALLOW", r)
+
+print("\n=== 31. neither side can wave the other through ===")
+install("BLOCK")
+r = run(setup())
+check("perfect authority does not survive an engine BLOCK", r["verdict"]=="BLOCK", r)
+check("the authority component still reads ALLOW underneath it",
+      r["authority_verdict"]=="ALLOW", r)
+install("CHALLENGE")
+r = run(setup())
+check("an engine CHALLENGE lifts a clean authority to CHALLENGE", r["verdict"]=="CHALLENGE", r)
+install("ALLOW")
+ctx = setup()
+r = C._evaluate(ctx,"k",{"grant":"root","action":"payments.transfer",
+    "params":{"amount":1},"purpose_tag":"refunds"})[0]
+check("a clean engine does not confer authority nobody granted", r["verdict"]=="BLOCK", r)
+check("and the engine is not even asked once authority has failed",
+      r["risk_engine"]["available"] is False, r["risk_engine"])
+
+print("\n=== 32. a missing or broken engine is not an ALLOW ===")
+install("ALLOW", raises=True)
+r = run(setup())
+check("an engine that throws downgrades ALLOW to CHALLENGE", r["verdict"]=="CHALLENGE", r)
+install("ALLOW", shape="junk")
+r = run(setup())
+check("an unreadable engine response downgrades to CHALLENGE", r["verdict"]=="CHALLENGE", r)
+sys.modules.pop("server", None); sys.modules.pop("__main__", None)
+r = run(setup())
+check("no engine present downgrades to CHALLENGE", r["verdict"]=="CHALLENGE", r)
+check("the reason names the missing engine",
+      any("risk engine" in x for x in r["reasons"]), r["reasons"])
+
+print("\n=== 33. it reads the engine's other return shapes ===")
+for shape in ("dict","tuple","str"):
+    install("BLOCK", shape=shape)
+    r = run(setup())
+    check("a %s return shape is understood" % shape, r["verdict"]=="BLOCK", r["risk_engine"])
+
+print("\n=== 34. an engine BLOCK cannot be executed ===")
+install("BLOCK")
+ctx = setup(); r = run(ctx)
+c,_ = C._confirm(ctx,"k",{"evaluation":r["evaluation"],"action":"payments.refund",
+    "params":{"amount":100,"currency":"GBP"}})
+check("execution is refused when the engine blocked", c["bound"] is False, c)
+
+print("\n" + "="*60)
+print("passed %d, failed %d" % (len(PASS), len(FAIL)))
+for f in FAIL: print("  FAILED: "+f)
+sys.exit(1 if FAIL else 0)
+
+```
+
+
+## `tests/attack_continuity_5.py`
+
+116 lines, 5639 bytes
+
+```python
+#!/usr/bin/env python3
+"""Fifth wave: risk acceptance. Who put their name to this capability
+existing at all - separately from who granted it and who holds it."""
+import hashlib, json, sqlite3, threading, time, sys, types
+import continuity as C
+
+PASS, FAIL = [], []
+NOW, HOUR = time.time(), 3600
+
+def install():
+    m = types.ModuleType("server")
+    m.get_bearer = lambda *a, **k: None
+    m.score_event = lambda e: {"decision": "ALLOW", "score": 0.1}
+    sys.modules["server"] = m
+install()
+
+def make_ctx():
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    lock = threading.RLock(); n = {"i":0}
+    def seal(ev,res,ts,k):
+        n["i"] += 1
+        return hashlib.sha256(json.dumps([ev,res,ts],sort_keys=True,default=str).encode()).hexdigest(), n["i"], n["i"]
+    C._ready = False
+    ctx = {"conn":conn,"lock":lock,"seal":seal}; C._setup(ctx); return ctx
+
+def check(n,c,d=""):
+    (PASS if c else FAIL).append(n)
+    print(("  ok   " if c else "  FAIL ")+n+(("  -> "+str(d)[:250]) if d and not c else ""))
+
+def root(ctx, **over):
+    args = dict(id="root", issuer="owner@example.com", issuer_kind="human",
+                subject="orchestrator", scope=["payments.refund"],
+                constraints={"max_amount":5000}, purpose="refunds",
+                purpose_tags=["refunds"], not_after=NOW+HOUR, delegations_left=3)
+    args.update(over)
+    return C._issue(ctx,"k",args)
+
+print("\n=== 35. a root accepts its own risk by default ===")
+ctx = make_ctx()
+r, code = root(ctx)
+check("a root grant records an acceptor without being asked",
+      code == 200 and r["risk_accepted_by"] == "owner@example.com", r)
+r2, _ = root(ctx, id="root2", risk_accepted_by="risk.officer@example.com")
+check("a root can name someone other than the issuer",
+      r2["risk_accepted_by"] == "risk.officer@example.com", r2)
+
+print("\n=== 36. switching on onward delegation needs a name ===")
+ctx = make_ctx(); root(ctx)
+r, code = C._issue(ctx,"k",dict(id="deleg", parent="root", issuer="orchestrator",
+    issuer_kind="agent", subject="b", scope=["payments.refund"],
+    constraints={"max_amount":100}, purpose="refunds", purpose_tags=["refunds"],
+    not_after=NOW+HOUR, delegations_left=1))
+check("a delegable child with no acceptor is refused",
+      code == 409 and r.get("error") == "risk_acceptance_required", r)
+
+r, code = C._issue(ctx,"k",dict(id="leaf", parent="root", issuer="orchestrator",
+    issuer_kind="agent", subject="b", scope=["payments.refund"],
+    constraints={"max_amount":100}, purpose="refunds", purpose_tags=["refunds"],
+    not_after=NOW+HOUR, delegations_left=0))
+check("a non-delegable child inherits the acceptor above it", code == 200, r)
+
+r, code = C._issue(ctx,"k",dict(id="deleg2", parent="root", issuer="orchestrator",
+    issuer_kind="agent", subject="b", scope=["payments.refund"],
+    constraints={"max_amount":100}, purpose="refunds", purpose_tags=["refunds"],
+    not_after=NOW+HOUR, delegations_left=1, risk_accepted_by="head.of.ops@example.com"))
+check("a delegable child with a named acceptor is accepted", code == 200, r)
+
+print("\n=== 37. the decision names the accountable person ===")
+e, _ = C._evaluate(ctx,"k",{"grant":"leaf","action":"payments.refund",
+    "params":{"amount":10},"purpose_tag":"refunds"})
+check("an evaluation reports who accepts the risk",
+      e["risk_accepted_by"] == "owner@example.com", e.get("risk_accepted_by"))
+check("...separately from who authorised it and who executed it",
+      e["authorised_by"] == "owner@example.com" and e["executed_by"] == "b", e)
+
+e2, _ = C._evaluate(ctx,"k",{"grant":"deleg2","action":"payments.refund",
+    "params":{"amount":10},"purpose_tag":"refunds"})
+check("the nearest acceptor wins, not the root one",
+      e2["risk_accepted_by"] == "head.of.ops@example.com", e2.get("risk_accepted_by"))
+
+t, _ = C._trace(ctx,{"grant":"deleg2"})
+check("the trace shows the acceptor at each hop",
+      t["risk_accepted_by"] == "head.of.ops@example.com" and
+      t["lineage"][0]["risk_accepted_by"] == "owner@example.com", t)
+
+print("\n=== 38. an unaccepted lineage cannot act ===")
+ctx = make_ctx(); root(ctx)
+C._issue(ctx,"k",dict(id="leaf", parent="root", issuer="orchestrator",
+    issuer_kind="agent", subject="b", scope=["payments.refund"],
+    constraints={"max_amount":100}, purpose="refunds", purpose_tags=["refunds"],
+    not_after=NOW+HOUR, delegations_left=0))
+with ctx["lock"]:
+    ctx["conn"].execute("UPDATE auth_grant SET risk_accepted_by=NULL")
+    ctx["conn"].commit()
+e, _ = C._evaluate(ctx,"k",{"grant":"leaf","action":"payments.refund",
+    "params":{"amount":10},"purpose_tag":"refunds"})
+check("stripping every acceptor blocks the action", e["verdict"] == "BLOCK", e["reasons"])
+check("...and says an incident would have no accountable person",
+      any("accountable" in x for x in e["reasons"]), e["reasons"])
+
+print("\n=== 39. the acceptor cannot be swapped after the fact ===")
+ctx = make_ctx(); root(ctx, risk_accepted_by="risk.officer@example.com")
+with ctx["lock"]:
+    ctx["conn"].execute("UPDATE auth_grant SET risk_accepted_by='someone.else@example.com' WHERE id='root'")
+    ctx["conn"].commit()
+e, _ = C._evaluate(ctx,"k",{"grant":"root","action":"payments.refund",
+    "params":{"amount":10},"purpose_tag":"refunds"})
+check("editing who accepted the risk fails the digest", e["verdict"] == "BLOCK", e["reasons"])
+check("...reported as an evidence failure, naming the grant",
+      e["broken_invariant"] == "evidence_continuity" and e["broken_at"] == "root", e)
+
+print("\n" + "="*60)
+print("passed %d, failed %d" % (len(PASS), len(FAIL)))
+for f in FAIL: print("  FAILED: "+f)
+sys.exit(1 if FAIL else 0)
+
+```
 
 
 ## `tests/attack_continuity_6.py`
@@ -1172,1280 +2220,5 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
-```
-
-
-## `README.md`
-
-498 lines, 24821 bytes
-
-```markdown
-<div align="center">
-
-<img src="assets/hero.svg" width="100%" alt="sebbi.pro — an isometric hash chain, sealed, witnessed and anchored">
-
-### **ONE CHAIN. EVERY PROOF.**
-
-*Every event sealed the moment it happens — the decision, **and the basis it rested on** —*
-*unalterable by anyone. Including us.*
-
-<br>
-
-[![live](https://img.shields.io/badge/live-sebbi.pro-c9a84c?style=for-the-badge&labelColor=080d1a)](https://sebbi.pro)
-[![verify](https://img.shields.io/badge/verify_the_chain-open_endpoint-7fe3b0?style=for-the-badge&labelColor=080d1a)](https://sebbi.pro/api/verify-chain)
-[![seal](https://img.shields.io/badge/seal_something-free,_no_account-00d4ff?style=for-the-badge&labelColor=080d1a)](https://sebbi.pro/seal)
-[![conformance](https://img.shields.io/badge/ordering_test-9%2F10_verified-f0d78a?style=for-the-badge&labelColor=080d1a)](https://sebbi.pro/self-check)
-
-**[Try it](https://sebbi.pro/seal)** · **[Verify it](https://sebbi.pro/verify)** · **[Docs](https://sebbi.pro/developers)** · **[Packs](https://sebbi.pro/packs.html)** · **[Whitepaper](https://sebbi.pro/whitepaper)**
-
-</div>
-
----
-
-> ### *A system that does not trust its own creator*
-> ### *is the only kind whose records qualify as evidence.*
-
----
-
-## Don't read about it. Watch it break.
-
-A **real** four-block chain. Every hash is reproducible — same inputs, same seals, forever.
-
-```
-        ╔═══════════════════════════════════════════════════════╗
-        ║   #4  brain: approve supplier 88          ALLOW       ║ ◄── tip
-        ║       6abba40eb964959e…                               ║
-        ╚═══════════════════════════════════════════════════════╝
-             ╲                                                ╲
-              ╔═══════════════════════════════════════════════════════╗
-              ║   #3  govern: payment 9000 GBP          BLOCK         ║
-              ║       293181a2bc2dab88…                               ║
-              ╚═══════════════════════════════════════════════════════╝
-                   ╲                                                ╲
-                    ╔═══════════════════════════════════════════════════════╗
-                    ║   #2  seal_post: quarterly_report     NOTARISED       ║
-                    ║       c7309616a9e92bc7…                               ║
-                    ╚═══════════════════════════════════════════════════════╝
-                         ╲                                                ╲
-                          ╔═══════════════════════════════════════════════════════╗
-                          ║   #1  system_regmap                    ALLOW         ║
-                          ║       411ffd9a31a3d9f4…                              ║
-                          ╚═══════════════════════════════════════════════════════╝
-                                          genesis  9fd06d6fdc19761d…
-```
-
-Now watch someone cover up that blocked £9,000 payment by flipping block 3 from **BLOCK** to **ALLOW**:
-
-```diff
-- tip  6abba40eb964959e…      ← what the chain says
-+ tip  5e15bc5710426088…      ← what the forgery produces
-```
-
-**The tip changed. The forgery is exposed instantly, by arithmetic, to anyone — no account, no trust required.**
-
-That is the entire product in four lines. Everything below is detail.
-
-<details>
-<summary><b>▸ Reproduce every hash yourself — 10 lines of Python</b></summary>
-
-<br>
-
-```python
-import hashlib, json
-seal = lambda prev, ts, ev, res, basis: hashlib.sha256(
-    json.dumps({"prev":prev,"ts":ts,"event":ev,"result":res,"basis":basis},
-               sort_keys=True).encode()).hexdigest()
-
-prev = hashlib.sha256(b"AILEASH_BRAIN_GENESIS|sebbi.pro|v5").hexdigest()
-chain = [("system_regmap","ALLOW","regmap-v7"),
-         ("seal_post: quarterly_report.pdf","NOTARISED","NO_BASIS"),
-         ("govern: payment 9000 GBP","BLOCK","invoice_4471|regmap-v7"),
-         ("brain: approve supplier 88","ALLOW","invoice_4471|regmap-v7")]
-ts = 1752940000
-for ev,res,basis in chain:
-    prev = seal(prev, ts, ev, res, basis); ts += 3600
-    print(prev[:16], "…", ev)
-# final line prints the tip: 6abba40eb964959e …
-```
-
-Change one character of one event and every seal after it changes. That's the whole idea.
-
-</details>
-
----
-
-## Thirty seconds, no account
-
-```bash
-curl https://sebbi.pro/api/verify-chain
-```
-```json
-{ "valid": true, "blocks": 1874, "tip": "bf9257ab…" }
-```
-
-Now the one nobody else can do — **prove something is not there**:
-
-```bash
-curl "https://sebbi.pro/x/complete/prove?period=2026-08&value=neverhappened"
-```
-```json
-{ "absent": true,
-  "left":  { "index": 14, "leaf": "3a1f…" },
-  "right": { "index": 15, "leaf": "9c02…" },
-  "why": "consecutive indices. nothing can sit between them." }
-```
-
-Anyone can show you a log of what happened. **Absence is the one that decides disputes.**
-
-<details>
-<summary><b>▸ Four more, right now</b></summary>
-
-<br>
-
-```bash
-# Prove the log only ever grew — RFC 6962, works with existing CT verifiers
-curl "https://sebbi.pro/x/consistency/proof?first=100&second=500"
-
-# Every chain witnessing us, with first-seen dates
-curl https://sebbi.pro/x/roster/list
-
-# Determinism, without us ever disclosing the maths
-curl -X POST https://sebbi.pro/x/replay/challenge \
-  -d '{"inputs":{"action":"payment","amount":49.99,"trust":0.5,"v60":1,
-       "v5m":1,"v1h":1,"device_risk":0.05,"anomaly":0.1,
-       "country":"UK","country_shift":0}}'
-
-# The ten conformance checks, and which are publicly demonstrable
-curl https://sebbi.pro/.well-known/ordering-test.json
-```
-
-Then run the **whole suite yourself** in a browser at **[sebbi.pro/self-check](https://sebbi.pro/self-check)** — it reads the published document, runs every check in declared order, and never counts *reachable* as a pass.
-
-</details>
-
----
-
-## Why this exists
-
-Every system keeps logs. Logs live in databases. Databases can be edited — by an attacker, an insider, or the operator itself. So an ordinary log only ever says *"this is what we currently claim happened."* It can never say *"and nobody changed it since."*
-
-Nobody notices the difference — until a regulator, a court, an insurer or a customer asks for **proof**. Then *"our system recorded it"* and *"here is proof it wasn't changed"* become two very different sentences. Only the second carries weight.
-
-**sebbi.pro produces the second sentence automatically, as a by-product of your system doing its normal work.**
-
----
-
-## The chain, in one formula
-
-```
-seal(n) = SHA-256( seal(n−1) · timestamp · event · result · basis )
-```
-
-| Property | What it means |
-|---|---|
-| **Tamper-evident** | Each seal contains its predecessor. Alter history → every later seal fails, publicly. |
-| **Gapless receipts** | A sequence number issued in the same transaction as the write. Edited records break the chain; **missing** records break the sequence. |
-| **Truncation-evident** | The tip is anchored per-write. Chop blocks off the end and the anchor breaks. |
-| **Basis-sealed** | Not just *what* was decided — *what it rested on*: sources, versions, ruleset. Same block. |
-| **Jurisdiction-tagged** | Sealed with the frameworks that applied at that moment. |
-| **Fast** | Score, decide, seal and respond inline. **~28 ms** median. |
-| **Crash-safe** | WAL journaling, full-sync commits, single-lock seal path, no race window, daily sealed backups. |
-
-> **The one honest boundary, up front:** basis-sealing proves **what** a decision relied on — not that it was **correct**. Cryptography verifies integrity, never truth. Any product claiming to prove correctness is misdescribing what maths can do. We won't.
-
----
-
-## The stack
-
-```mermaid
-flowchart TD
-    A["AGENT ACTS"] --> G{"BRAIN<br/>instruction gate"}
-    G --> B{"DECISION ENGINE<br/>9 weighted signals<br/>deterministic"}
-    B --> C["SEALED<br/>before the response returns"]
-    C --> D["RECEIPT<br/>gapless sequence"]
-
-    C --> E["COMPLETENESS<br/>sorted tree<br/>is it in - or provably absent"]
-    C --> F["CONSISTENCY<br/>ordered tree - RFC 6962<br/>did it only ever grow"]
-    C --> H["REPLAY<br/>identical in, identical out<br/>maths never disclosed"]
-    C --> I["LINEAGE<br/>what fed this decision"]
-
-    C --> J["WITNESS NETWORK<br/>hourly tip exchange"]
-    J --> K["PEER CHAINS<br/>we do not control these"]
-    C --> L["BITCOIN<br/>OpenTimestamps"]
-
-    K --> M["THE RECORD CANNOT<br/>BE QUIETLY REWRITTEN"]
-    L --> M
-
-    style A fill:#080d1a,stroke:#c9a84c,color:#ffffff
-    style G fill:#111a30,stroke:#a78bfa,color:#a78bfa
-    style B fill:#111a30,stroke:#c9a84c,color:#c9a84c
-    style C fill:#111a30,stroke:#00d4ff,color:#00d4ff
-    style J fill:#111a30,stroke:#7fe3b0,color:#7fe3b0
-    style K fill:#0b1226,stroke:#7fe3b0,color:#7fe3b0
-    style L fill:#0b1226,stroke:#f7931a,color:#f7931a
-    style M fill:#0b1226,stroke:#00ff88,color:#00ff88
-```
-
-| Layer | What it proves | Key |
-|:--|:--|:--:|
-| **Brain** | Instructions gated before the AI acts, basis sealed with the verdict | ○ |
-| **Decision engine** | Nine weighted signals, EWMA trust decay, deterministic below the model layer | ◐ |
-| **The chain** | Sealed before the response returns · gapless receipts | ○ |
-| **Completeness** | What is in the record — and what provably is not | ○ |
-| **Consistency** | The log only ever grew | ○ |
-| **Replay** | Identical inputs, identical verdict, maths undisclosed | ○ |
-| **Lineage** | Which receipts fed a decision, across organisations | ◐ |
-| **Authority** | Derivable from a named human, re-derived at execution | ● |
-| **Witness network** | Somebody we do not control holds a copy | ○ **forever** |
-| **Anchoring** | The time was fixed where we cannot reach | ○ |
-
-○ no key · ◐ part keyed · ● keyed
-
----
-
-## The thing nobody else will say
-
-Our own published manifest contains this line:
-
-```yaml
-Audit-Rewritable-By-Operator-Without-External-Reference: true
-Audit-Rewrite-Prevention: external-timestamp + independent-witnesses
-```
-
-Read it again. **We publish that the operator can rewrite forward.** Every competitor claims immutability and hopes you never ask who holds the keys.
-
-Because the answer to an operator who can rewrite is not a better promise *from the operator*.
-
-**It is a copy held by somebody else.**
-
-```mermaid
-sequenceDiagram
-    participant Y as YOUR CHAIN
-    participant U as AILEASH
-    participant P as PEER CHAIN
-    participant B as BITCOIN
-
-    Note over Y,B: every hour, unattended, since 1 August
-    Y->>U: here is my head
-    U->>U: seal it, into a record I cannot edit backwards
-    U->>P: here is mine
-    P->>P: seals it into a chain I do not own
-    U->>B: anchor the tip
-    Note over P: now it exists outside my reach
-    Note over U: I can stop witnessing a peer. Only forward.<br/>And the roster publishes the gap.
-```
-
-**Joining is free and ungated. Permanently.** The protocol code never checks subscription status. There is no membership list, no seat to grant, none to revoke.
-
-If that sounds like giving the network away — **it is, deliberately.** Gating it would make the operator the party asking to be trusted, which is precisely the thing this removes.
-
----
-
-## The products — one chain underneath all of them
-
-| | Product | What it does | Access |
-|---|---|---|---|
-| 🧠 | **Brain** | Instruction gate for AI. Blocks prompt injection, exfiltration, compliance-bypass, child-safety and destruction patterns — with unicode and homoglyph defences — and seals every decision plus its basis. Pure Python, runs on your machine. | **Free** |
-| ⚡ | **SonicBoom** | Decision engine. Any event scored in ~28 ms: ALLOW / CHALLENGE / BLOCK, plain-English reasons, sealed before it replies. Trust learned per user and lost 8× faster than earned, so burst attacks destroy their own standing. | API key |
-| 🐕 | **Sebdog** | The engine on your own hardware. **Ed25519 licence validated locally — no phone home, ever.** Serves its own `/tip`, so your record is externally witnessed while the data never leaves the building. | Licence |
-| 💰 | **Token saver** | Cost reduction over nine spend signals. Change one line — `base_url` to localhost. Fails open. Prompts never leave your machine; `--offline` needs no account at all. | 50p/device |
-| 📦 | **Cost packs** | An open library of decision rules. Free to read, write, fork and publish — publishing seals your authorship with the date, **including against us**. Running one is the metered part. | **Free to write** |
-| 🧾 | **Evidence packs** | The quarterly auditor document. Every block re-verified, links rewalked, sequence checked, with an *unbroken since* date that resets if the run breaks. | API key |
-| 🔒 | **Wallet gate** | Give an agent a budget; stop it when the budget is gone. The spend record and the decision record are **the same record**. | API key |
-| 🔐 | **Delegation layer** | Signed authority tokens — who may approve, to what limit, until when, the grant itself sealed. KYC outcome provable with zero personal data held. Article 14 human oversight as engineering. | API key |
-| 🛡️ | **Sentinel** | Fraud pattern and velocity detection: credential stuffing, card testing, country-jump takeovers. Flags sealed as evidence. | API key |
-| 👁️ | **Guardian** | Child-safety flags — grooming patterns: secrecy, isolation, channel-moving. Content never stored, only fingerprints. | Platform |
-| 📝🆔💷 | **The Notaries** | Prove exact text existed on a date · prove a profile is the genuine original · stop invoice and APP fraud, with MISMATCH stopping the payment and the check itself sealed. | **Free, no account** |
-
-**Privacy by design:** the notaries fingerprint content *locally*. Your content never leaves your device — only the 64-character hash is sealed. The KYC sealer keeps only the SHA-256 of the provider reference, never the document.
-
----
-
-## The open standard — `ai.txt`
-
-Like `robots.txt` for crawlers and `security.txt` for researchers, **`ai.txt`** is a public, machine-readable declaration of how your AI is governed: decision model, audit method, regulations designed toward, human override. Its companion **`comply.txt`** declares the rulebook every instruction is subject to.
-
-Declarations are claims. **Sealing them into the chain makes them provable** — and their history tamper-evident.
-
-```
-   declaration   ──▶   rulebook   ──▶   enforcement
-     ai.txt          comply.txt          brain.py
-    "we claim"       "the rules"     "the code that proves it"
-```
-
-Publish yours at `/.well-known/ai.txt`. Read [ours](https://sebbi.pro/.well-known/ai.txt).
-
----
-
-## Integrate in minutes
-
-```python
-# ── Notary: seal anything, free, no key. Content stays on your machine. ──
-import hashlib, requests
-fp = hashlib.sha256(content.encode()).hexdigest()
-requests.post("https://sebbi.pro/api/post/seal", json={"fingerprint": fp})
-#   → { sealed, seal, block_index, code }   ← keep the code; anyone can verify it
-
-# ── Decision engine: score + seal an event (API key) ──
-requests.post("https://sebbi.pro/api/govern",
-  headers={"Authorization":"Bearer YOUR_KEY"},
-  json={"user_id":"u1","action":"payment","amount":9000,
-        "country":"UK","device_id":"d1","anomaly":0,"device_risk":0})
-#   → ALLOW / CHALLENGE / BLOCK · reasons · jurisdiction tag · sealed hash · receipt_seq
-
-# ── Delegated authority: grant sealed, enforcement deterministic ──
-tok = requests.post("https://sebbi.pro/api/authority/issue",
-  headers={"Authorization":"Bearer YOUR_KEY"},
-  json={"user_id":"u1","role":"payments_approver",
-        "max_amount":5000,"ttl_hours":24}).json()["authority_token"]
-
-# ── Brain: gate an instruction and seal its basis (free, local) ──
-from brain import BrainGovernor
-BrainGovernor().evaluate("approve payment to supplier 88", basis={
-  "sources":["invoice_4471.pdf"], "source_versions":["sha256:ab12…"],
-  "ruleset":"AI-TXT/1.0 + EU-AI-Act-2024/1689", "ruleset_version":"regmap-v7"})
-```
-
-<details>
-<summary><b>▸ For agents: one decorator</b></summary>
-
-<br>
-
-```python
-from sebbi_sdk import witness
-
-@witness()
-def run_agent(prompt):
-    return model.complete(prompt)
-```
-
-Single file, zero dependencies, **~0.1 ms added per call**. Never blocks the caller, never swallows the caller's exception. Background daemon thread, batching, disk spool on outage and replay.
-
-Egress is hash-only — and there is a test that plants a secret in a payload, then greps the wire *and* the spool files to prove it never left.
-
-</details>
-
-Full reference → **[sebbi.pro/developers](https://sebbi.pro/developers)**
-
----
-
-## Verify without us
-
-> A proof you can only check with the prover's own online tool is a reassurance, not a proof.
-
-```bash
-curl -sO https://sebbi.pro/verify-authority.py
-curl -s "https://sebbi.pro/x/continuity/proof" | python3 verify-authority.py -
-```
-
-```
-RESULT: VERIFIED - BLOCK
-This is a proof that the action was NOT authorised, and where it failed.
-Checked with no network access, no dependencies, and nothing taken on
-the issuer's word except the meaning of their public key.
-```
-
-**Standard library only** — including the Ed25519 implementation. No network. No dependencies. **No telemetry.** A verification tool that phones home to the party being verified is not a verification tool.
-
-It checks four things, each able to fail alone: the **signature**, every recomputed **digest**, the whole authority path **re-derived** from published rules, and its own verdict **against ours**. A disagreement is reported as *our* failure, not its.
-
----
-
-## Architecture
-
-Pure Python standard library. No FastAPI. No framework. No build step.
-
-```
-server.py              the engine, the chain, the API
-modules/<name>.py      everything else  ──▶  /x/<name>/<action>
-```
-
-A module exposes exactly one function:
-
-```python
-PUBLIC = {("GET", "spec"), ("POST", "observe")}    # (METHOD, action) tuples
-
-def handle(method, action, data, api_key, ctx):
-    return {"ok": True}, 200                       # (dict, status) — that order
-```
-
-New features are new files. `server.py` does not get edited.
-
-<details>
-<summary><b>⚠️ The one that catches everybody</b></summary>
-
-<br>
-
-A **method mismatch returns 404 `unknown_action`** — not 405 — with the accepted GET and POST lists in the body.
-
-A client that reads 404 as *endpoint missing* will report false failures against every POST-only route. This has cost more debugging hours than anything else in the codebase.
-
-</details>
-
----
-
-## The Ordering Test
-
-Ten checks, published as a discovery document **any vendor can serve from their own domain**.
-
-```
-rule_binding          commit_before_reveal   completeness_proof
-absence_proof         consistency_proof      reproducibility
-mutual_witnessing     external_anchoring     authority_tokens
-reconciliation
-```
-
-Each check declares `supported` and — separately — `demonstrable_publicly`.
-
-Because **"we built it"** and **"you can check it without an account"** are different claims, and separating them is the only thing that stops an operator marking their own homework.
-
-**Nobody owns a test.** That is the point of publishing it.
-
----
-
-## What this evidences — stated precisely
-
-A versioned, hash-sealed **regulation map** links each capability to the obligations it helps evidence: EU AI Act record-keeping, transparency and human oversight (Articles 9, 12, 13, 14 — delegated-authority tokens directly supporting Article 14's attributable human oversight), UK Online Safety Act duty-of-care documentation, ICO Children's Code. Jurisdiction tagging extends this per decision: every sealed block records which frameworks applied at the moment.
-
-These tools help you **evidence** your obligations — tamper-evident, explainable, independently verifiable records of what your systems decided and why. **They do not, on their own, make you compliant. No software does. Anyone who says otherwise is selling you something.**
-
----
-
-<details>
-<summary><b>🔍 Honest limits — click, because we would rather you heard it here</b></summary>
-
-<br>
-
-*A vendor who states their limits is giving you the strongest available evidence of how they'll behave when it matters.*
-
-- **Sealing proves integrity, not truth** — exact content, exact time, unchanged. Not that it was true or agreed to.
-- **Basis-sealing proves what was relied on, not that it was right** — cryptography can't verify the real world.
-- **An operator holding the file and the keys can rebuild a chain forward** with no internal gap. External timestamps and independent witnesses are what make that visible — which is exactly why both exist.
-- **Collusion resistance scales with the number of independent chains.** With a handful of peers it is thin, and the status route names that limit rather than reporting a comfortable number. Five peers is a claim. Fifty is a structure.
-- **An OpenTimestamps proof is `pending` until upgraded.** Both states are reported as what they are, everywhere — because your own verifier will say it first.
-- **Authority tokens prove the grant, not the wisdom** — who was empowered, to what limit, until when. Not that granting it was a good idea.
-- **Jurisdiction tagging records applicable frameworks; it does not decide law** — courts do that. A versioned, sealed lookup, nothing grander, deliberately.
-- **Brain's filter is a first line, not a wall** — known patterns caught, novel phrasing can pass. The guarantee is the sealed record.
-- **Fingerprints match exact content** — a re-encoded copy or a paraphrase won't match.
-- **Lineage edges are dated, non-repudiable claims** about what fed a decision. Not proof the claim is true.
-- No external security audit. Single replica, SQLite.
-- **We evidence compliance; we don't confer it.**
-
-</details>
-
----
-
-## Deployment & pricing
-
-- **Cloud** — a few lines against the hosted API. Notaries and Brain free forever.
-- **Sovereign** — the whole engine inside your own network. **Ed25519 licence validated locally against a published public key**: we sign on our server and ship only the public half, so nothing that can mint a licence ever reaches a customer machine. No phone home, air-gap ready.
-- **50p per active device per month.** Partners set their own price above the platform fee and keep the margin.
-
-## Investors
-
-The whitepaper carries a dedicated investor section — market timing, the metered per-device model, the moat, and the stage stated honestly: **[sebbi.pro/whitepaper](https://sebbi.pro/whitepaper)** · justin@monopcontent.com
-
----
-
-<div align="center">
-
-## Check us. Don't trust us.
-
-*That's not a slogan. It's the design requirement — and the only standard by which an evidence layer should ever be judged.*
-
-**[Verify the chain now →](https://sebbi.pro/api/verify-chain)**
-
-<br>
-
-```
-  Built by Justin Dobson · Monop Content · Blyth, Northumberland, UK
-  Solo-built, from scratch, on a phone —
-  because the evidence layer wasn't going to build itself.
-```
-
-[LinkedIn](https://www.linkedin.com/in/justin-dobson-037721217) · [sebbi.pro](https://sebbi.pro) · [developers](https://sebbi.pro/developers) · [packs](https://sebbi.pro/packs.html) · [self-check](https://sebbi.pro/self-check)
-
-</div>
-
-<!--
-Keywords: tamper-evident audit trail · AI governance · AI compliance evidence ·
-EU AI Act record keeping · hash chain audit log · provable ordering · absence proof ·
-RFC 6962 consistency proof · APP fraud prevention · invoice verification ·
-prompt injection defence · AI decision audit · delegated authority tokens ·
-KYC evidence sealing · jurisdiction tagging · ai.txt standard · comply.txt ·
-cryptographic proof of action · witness network · OpenTimestamps · Bitcoin anchoring ·
-agentic AI governance · sovereign AI deployment · token cost reduction ·
-SonicBoom · Brain · Sentinel · Guardian · Sebdog · AILeash
--->
-
-```
-
-
-## `admin.html`
-
-761 lines, 43637 bytes
-
-```html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="robots" content="noindex,nofollow">
-<title>sebbi.pro — command centre</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-:root{
-  --bg:#070b16;--panel:#0e1628;--panel2:#0a1120;--line:#1c2742;--line2:#26355a;
-  --gold:#c9a84c;--gold2:#f0d78a;--cyan:#00d4ff;--green:#7fe3b0;--ok:#00ff88;
-  --red:#ff6b5e;--amber:#ffb020;--txt:#e8e8f0;--mut:#6f7793;--dim:#454d69;
-  --mono:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
-}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--txt);line-height:1.5;-webkit-font-smoothing:antialiased}
-body::before{content:'';position:fixed;inset:0;pointer-events:none;z-index:0;
-  background:radial-gradient(ellipse 70% 45% at 50% 0%,rgba(201,168,76,.10),transparent 70%),
-             radial-gradient(ellipse 50% 40% at 85% 20%,rgba(0,212,255,.06),transparent 70%)}
-.wrap{max-width:1120px;margin:0 auto;padding:16px;position:relative;z-index:1}
-
-#login{max-width:380px;margin:14vh auto;text-align:center}
-#login input{width:100%;padding:14px;border-radius:10px;border:1px solid var(--line2);background:var(--panel2);color:#fff;font-size:16px;margin:14px 0;font-family:var(--mono)}
-#login input:focus{outline:none;border-color:var(--gold)}
-button{background:var(--gold);color:#070b16;border:none;border-radius:9px;padding:13px 22px;font-weight:800;cursor:pointer;font-size:15px;width:100%;font-family:inherit;transition:filter .15s}
-button:hover{filter:brightness(1.1)}button:active{transform:translateY(1px)}
-button.sm{width:auto;padding:9px 15px;font-size:12.5px;font-weight:700}
-button.ghost{background:transparent;border:1px solid var(--line2);color:var(--mut)}
-button.ghost:hover{color:#fff;border-color:var(--gold)}
-button.danger{background:#2a0f0c;border:1px solid var(--red);color:var(--red)}
-button.go{background:#07301f;border:1px solid #1fae79;color:var(--green)}
-.err{color:var(--red);font-size:13px;margin-top:10px;min-height:18px;font-family:var(--mono)}
-
-#dash{display:none}
-.hdr{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;margin-bottom:14px;padding-bottom:14px;border-bottom:1px solid var(--line)}
-h1{font-size:19px;font-weight:800;letter-spacing:-.3px}h1 span{color:var(--gold)}
-.sub{color:var(--dim);font-size:11px;font-family:var(--mono);letter-spacing:1.4px;text-transform:uppercase;margin-top:3px}
-.live{display:inline-flex;align-items:center;gap:6px;font-family:var(--mono);font-size:10px;letter-spacing:1.5px;color:var(--green);text-transform:uppercase}
-.dot{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 9px var(--ok);animation:bl 2s ease-in-out infinite}
-@keyframes bl{0%,100%{opacity:1}50%{opacity:.25}}
-
-.rail{display:grid;grid-template-columns:repeat(auto-fit,minmax(122px,1fr));gap:9px;margin-bottom:16px}
-.st{background:linear-gradient(160deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:11px;padding:13px 14px;position:relative;overflow:hidden}
-.st::after{content:'';position:absolute;left:0;top:0;bottom:0;width:2px;background:var(--gold);opacity:.5}
-.st.good::after{background:var(--ok)}.st.bad::after{background:var(--red)}.st.cy::after{background:var(--cyan)}
-.st .big{font-size:25px;font-weight:800;color:var(--gold);font-family:var(--mono);line-height:1.15}
-.st.good .big{color:var(--ok)}.st.bad .big{color:var(--red)}.st.cy .big{color:var(--cyan)}
-.st .lab{font-size:9.5px;color:var(--dim);text-transform:uppercase;letter-spacing:1.4px;margin-top:4px;font-family:var(--mono)}
-
-.tabs{display:flex;gap:6px;margin-bottom:15px;flex-wrap:wrap}
-.tab{background:var(--panel);border:1px solid var(--line);color:var(--mut);padding:8px 14px;border-radius:8px;cursor:pointer;font-size:12px;font-weight:700;font-family:var(--mono);letter-spacing:.6px;transition:.15s}
-.tab:hover{color:#fff;border-color:var(--line2)}
-.tab.on{background:var(--gold);color:#070b16;border-color:var(--gold)}
-.panel{display:none}.panel.on{display:block;animation:fi .22s ease}
-@keyframes fi{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
-
-.card{background:var(--panel);border:1px solid var(--line);border-radius:11px;padding:13px 14px;margin-bottom:9px;font-size:14px}
-.card .top{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:5px}
-.card .nm{font-weight:700}
-.meta{color:var(--mut);font-size:12px}
-.mono{font-family:var(--mono);font-size:11.5px;color:var(--dim);word-break:break-all}
-.badge{font-size:9.5px;padding:2px 8px;border-radius:10px;font-weight:800;text-transform:uppercase;font-family:var(--mono);letter-spacing:.8px}
-.badge.paid{background:#07301f;color:var(--green);border:1px solid #1fae79}
-.badge.free{background:#1a1206;color:var(--gold);border:1px solid var(--gold)}
-.empty{color:var(--dim);text-align:center;padding:34px 14px;font-size:13.5px;font-family:var(--mono)}
-.sechead{font-family:var(--mono);font-size:10px;letter-spacing:2.4px;text-transform:uppercase;color:var(--dim);margin:20px 0 9px;padding-top:14px;border-top:1px solid var(--line)}
-.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
-input.f{flex:1;min-width:170px;padding:10px 12px;border-radius:8px;border:1px solid var(--line2);background:var(--panel2);color:#fff;font-size:13px;font-family:var(--mono)}
-input.f:focus{outline:none;border-color:var(--gold)}
-a.ext{display:inline-block;background:#07301f;border:1px solid #1fae79;color:var(--green);padding:10px 15px;border-radius:9px;text-decoration:none;font-size:12.5px;font-weight:700;margin-bottom:14px}
-.out{font-family:var(--mono);font-size:11.5px;color:var(--green);margin-bottom:12px;padding:11px 13px;background:var(--panel2);border:1px solid var(--line);border-radius:9px;white-space:pre-wrap;word-break:break-all;min-height:40px;line-height:1.75}
-.out.bad{color:var(--red);border-color:rgba(255,107,94,.4);background:#1a0b09}
-.out.warn{color:var(--amber);border-color:rgba(255,176,32,.35)}
-.out.idle{color:var(--dim)}
-.note{border:1px solid rgba(201,168,76,.3);background:rgba(201,168,76,.05);border-radius:9px;padding:12px 14px;font-size:12.5px;color:var(--mut);margin-bottom:12px}
-.note b{color:var(--gold)}
-
-/* ---------- route grid ---------- */
-.rgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(148px,1fr));gap:7px}
-.rt{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:9px 10px;font-family:var(--mono);font-size:11px;cursor:pointer;transition:.15s;position:relative;overflow:hidden}
-.rt:hover{border-color:var(--line2)}
-.rt .rn{color:var(--txt);font-weight:600;font-size:11.5px}
-.rt .rs{font-size:9px;letter-spacing:1.2px;text-transform:uppercase;margin-top:3px;color:var(--dim)}
-.rt.armed{border-color:rgba(0,255,136,.45)}.rt.armed .rs{color:var(--ok)}
-.rt.armed::before{content:'';position:absolute;inset:0;background:rgba(0,255,136,.05)}
-.rt.fail{border-color:rgba(255,107,94,.45)}.rt.fail .rs{color:var(--red)}
-.rt.err{border-color:rgba(255,176,32,.5)}.rt.err .rs{color:var(--amber)}
-.rt.wait .rs{color:var(--amber)}
-.bar{height:3px;background:var(--line);border-radius:2px;overflow:hidden;margin:12px 0}
-.bar i{display:block;height:100%;background:linear-gradient(90deg,var(--gold),var(--ok));width:0;transition:width .3s}
-
-/* ================= CHAIN NODE GRAPH ================= */
-.graphwrap{border:1px solid var(--line);border-radius:12px;background:linear-gradient(180deg,var(--panel),var(--panel2));overflow:hidden}
-.gtop{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;padding:11px 14px;border-bottom:1px solid var(--line);background:rgba(0,0,0,.25)}
-.gtop .gt{font-family:var(--mono);font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--dim)}
-.gtop .gv{font-family:var(--mono);font-size:11px;color:var(--green)}
-.gtop .gv.bad{color:var(--red)}
-
-.spine{position:relative;padding:16px 14px 6px 14px;max-height:70vh;overflow-y:auto;-webkit-overflow-scrolling:touch}
-.spine::-webkit-scrollbar{width:4px}
-.spine::-webkit-scrollbar-thumb{background:rgba(201,168,76,.3);border-radius:2px}
-
-.node{position:relative;padding-left:44px;padding-bottom:14px}
-/* the vertical link line */
-.node::before{content:'';position:absolute;left:15px;top:26px;bottom:-4px;width:2px;
-  background:linear-gradient(180deg,rgba(0,255,136,.55),rgba(0,255,136,.14))}
-.node:last-child::before{display:none}
-.node.broken::before{background:linear-gradient(180deg,var(--red),rgba(255,107,94,.2));width:3px;left:14.5px}
-
-/* the block itself */
-.orb{position:absolute;left:6px;top:8px;width:21px;height:21px;border-radius:6px;
-  transform:rotate(45deg);border:1.6px solid;background:var(--panel2);transition:.18s}
-.orb::after{content:'';position:absolute;inset:3px;border-radius:2px;opacity:.85}
-.node:hover .orb{transform:rotate(45deg) scale(1.16)}
-.node.broken .orb{border-color:var(--red)!important;box-shadow:0 0 14px rgba(255,107,94,.55)}
-
-.blk{background:rgba(255,255,255,.018);border:1px solid var(--line);border-radius:9px;
-  padding:9px 11px;cursor:pointer;transition:.15s}
-.blk:hover{border-color:var(--line2);background:rgba(255,255,255,.04)}
-.blk .l1{display:flex;justify-content:space-between;align-items:baseline;gap:9px;flex-wrap:wrap}
-.blk .seq{font-family:var(--mono);font-size:12.5px;font-weight:700;color:var(--gold2)}
-.blk .dec{font-family:var(--mono);font-size:10px;font-weight:800;letter-spacing:1.4px;padding:1px 7px;border-radius:4px}
-.blk .tm{font-family:var(--mono);font-size:10px;color:var(--dim);margin-left:auto}
-.blk .sl{font-family:var(--mono);font-size:10.5px;color:var(--green);margin-top:4px;word-break:break-all;opacity:.8}
-.blk .who{font-family:var(--mono);font-size:10px;color:var(--mut);margin-top:2px}
-.det{display:none;margin-top:8px;padding-top:8px;border-top:1px dashed var(--line2);
-  font-family:var(--mono);font-size:10.5px;line-height:1.9;color:var(--mut);word-break:break-all}
-.det.on{display:block}
-.det .k{color:var(--dim);display:inline-block;min-width:52px}
-.det .v{color:var(--green)}
-.det .v.p{color:var(--cyan)}
-
-.breakflag{margin:2px 0 12px 44px;font-family:var(--mono);font-size:10.5px;color:var(--red);
-  border:1px solid rgba(255,107,94,.45);background:#1a0b09;border-radius:7px;padding:8px 10px;line-height:1.8}
-.gfoot{padding:12px 14px;border-top:1px solid var(--line);display:flex;gap:8px;flex-wrap:wrap;align-items:center;background:rgba(0,0,0,.2)}
-.gcount{font-family:var(--mono);font-size:10.5px;color:var(--dim);margin-left:auto}
-.sentinel{height:1px}
-
-.glass{border:1px solid rgba(255,107,94,.35);background:linear-gradient(160deg,#170a09,#0b0709);border-radius:12px;padding:16px;margin-top:8px}
-.glass h3{font-family:var(--mono);font-size:11px;letter-spacing:2.4px;text-transform:uppercase;color:var(--red);margin-bottom:8px}
-.glass p{font-size:13px;color:var(--mut);margin-bottom:12px}
-.steps{font-family:var(--mono);font-size:11px;color:var(--dim);line-height:2;margin-bottom:13px}
-.steps b{color:var(--mut);font-weight:400}
-@media(max-width:640px){.wrap{padding:12px}.rail{grid-template-columns:repeat(2,1fr)}.spine{max-height:66vh}}
-</style>
-</head>
-<body>
-<div class="wrap">
-
-  <div id="login">
-    <h1>sebbi<span>.pro</span></h1>
-    <div class="sub">command centre</div>
-    <input id="pw" type="password" placeholder="admin password" onkeydown="if(event.key==='Enter')doLogin()">
-    <button onclick="doLogin()">Authenticate</button>
-    <div class="err" id="loginerr"></div>
-  </div>
-
-  <div id="dash">
-    <div class="hdr">
-      <div>
-        <h1>sebbi<span>.pro</span> command centre</h1>
-        <div class="sub">Monop Content &middot; <span class="live"><span class="dot"></span>live</span></div>
-      </div>
-      <div style="display:flex;gap:7px">
-        <button class="sm ghost" onclick="loadAll()">Refresh</button>
-        <button class="sm ghost" onclick="logout()">Log out</button>
-      </div>
-    </div>
-
-    <div class="rail" id="rail"></div>
-
-    <div class="tabs">
-      <div class="tab on" onclick="show('blocks',this)">Blocks</div>
-      <div class="tab" onclick="show('routes',this)">Routes</div>
-      <div class="tab" onclick="show('chain',this)">Chain</div>
-      <div class="tab" onclick="show('network',this)">Network</div>
-      <div class="tab" onclick="show('traffic',this)">Traffic</div>
-      <div class="tab" onclick="show('customers',this)">Customers</div>
-      <div class="tab" onclick="show('contacts',this)">Messages</div>
-      <div class="tab" onclick="show('referrals',this)">Referrals</div>
-    </div>
-
-    <!-- ================= BLOCKS — the node graph ================= -->
-    <div class="panel on" id="p-blocks">
-      <div class="row">
-        <input class="f" id="apikey" type="password" placeholder="your API key (al_live_…) — needed for block reads">
-        <button class="sm go" onclick="loadBlocks()">Load chain</button>
-      </div>
-      <div class="row">
-        <input class="f" id="bsearch" placeholder="search seal, user, decision…" oninput="renderGraph(true)">
-        <button class="sm ghost" onclick="checkLinks()">Check links</button>
-        <button class="sm ghost" onclick="toggleAll()">Expand all</button>
-        <button class="sm ghost" onclick="exportBlocks()">Export</button>
-      </div>
-
-      <div class="graphwrap">
-        <div class="gtop">
-          <div><div class="gt">chain integrity</div><div class="gv" id="gint">not loaded</div></div>
-          <div><div class="gt">tip</div><div class="gv" id="gtip">—</div></div>
-          <div><div class="gt">blocks</div><div class="gv" id="gblocks">—</div></div>
-        </div>
-        <div class="spine" id="spine">
-          <div class="empty">Tap <b>Load chain</b> to walk the blocks.</div>
-        </div>
-        <div class="gfoot">
-          <button class="sm ghost" onclick="more()">Show more</button>
-          <button class="sm ghost" onclick="document.getElementById('spine').scrollTop=0">Top</button>
-          <span class="gcount" id="gcount"></span>
-        </div>
-      </div>
-
-      <div class="note" style="margin-top:12px"><b>Every link is checked as it draws.</b> The connector between two nodes is green when a block's <span class="mono">prev_hash</span> equals the seal of the block below it. If it ever doesn't, that joint turns red and the exact mismatch is printed in place — you don't have to go looking for the break, it shows itself.</div>
-      <div class="note" id="depthnote" style="display:none"></div>
-    </div>
-
-    <!-- ================= ROUTES ================= -->
-    <div class="panel" id="p-routes">
-      <div class="note"><b>The arming dance, in one tap.</b> Every module 404s after a deploy until something hits its <span class="mono">/x/</span> prefix.<br><br>
-      <span style="color:var(--ok)">green</span> = armed. A <span class="mono">401</span> counts, because the router loads the module and matches the action <i>before</i> checking auth, so a key demand proves the route is live.
-      <span style="color:var(--amber)">amber</span> = loaded but its status action is throwing.
-      <span style="color:var(--red)">red</span> = genuinely missing from <span class="mono">modules/</span>.</div>
-      <div class="row">
-        <button class="sm go" onclick="armAll()">Arm every route</button>
-        <button class="sm ghost" onclick="armAll(true)">Re-check failures</button>
-        <input class="f" id="newroute" placeholder="add a module, e.g. map">
-        <button class="sm ghost" onclick="addRoute()">Add</button>
-      </div>
-      <div class="bar"><i id="armbar"></i></div>
-      <div class="out idle" id="armout">not run yet</div>
-      <div class="rgrid" id="rgrid"></div>
-      <div class="sechead">Pages</div>
-      <div class="rgrid" id="pgrid"></div>
-    </div>
-
-    <!-- ================= CHAIN ================= -->
-    <div class="panel" id="p-chain">
-      <div class="row">
-        <button class="sm go" onclick="verifyChain()">Verify chain</button>
-        <button class="sm ghost" onclick="consRoot()">Consistency root</button>
-        <button class="sm ghost" onclick="otsStatus()">Anchoring</button>
-        <button class="sm ghost" onclick="ownTip()">Tip</button>
-      </div>
-      <div class="out idle" id="chainout">not checked yet</div>
-      <div class="sechead">Break glass</div>
-      <div class="glass">
-        <h3>If the chain ever breaks</h3>
-        <p>This does <b>not</b> repair anything. Repairing a broken chain is the operator rewriting the record — the one thing this platform exists to make impossible. It captures the break instead, so its exact shape stays provable.</p>
-        <div class="steps">
-          <b>1.</b> freeze &mdash; read and pin the current tip<br>
-          <b>2.</b> locate &mdash; walk the links, name the first block whose prev_hash stops matching<br>
-          <b>3.</b> export &mdash; pull every record to this phone as JSON<br>
-          <b>4.</b> externalise &mdash; hand the frozen tip to the witness network
-        </div>
-        <button class="danger" onclick="breakGlass()">Capture the break</button>
-      </div>
-      <div class="out idle" id="glassout" style="margin-top:12px">standing by</div>
-    </div>
-
-    <!-- ================= NETWORK ================= -->
-    <div class="panel" id="p-network">
-      <div class="row">
-        <button class="sm go" onclick="loadNetwork()">Refresh network</button>
-        <button class="sm ghost" onclick="openRaw('/x/roster/list')">Raw roster</button>
-        <button class="sm ghost" onclick="openRaw('/x/mutual/status')">Mutual status</button>
-      </div>
-      <div class="out idle" id="netout">not loaded</div>
-      <div id="netlist"></div>
-    </div>
-
-    <!-- ================= TRAFFIC ================= -->
-    <div class="panel" id="p-traffic">
-      <div class="row">
-        <button class="sm go" onclick="loadTraffic()">Load traffic</button>
-        <button class="sm ghost" onclick="openRaw('/x/stats')">Raw stats</button>
-        <button class="sm ghost" onclick="openRaw('/x/demo/stats')">Proving ground</button>
-      </div>
-      <div class="out idle" id="trafout">not loaded</div>
-      <div class="note" style="margin-top:14px"><b>Unique visitors is not counted anywhere yet.</b> Nothing in server.py records a visit, so no route can report it. Everything above is decision and demo activity, not people.</div>
-    </div>
-
-    <div class="panel" id="p-customers">
-      <a class="ext" href="https://dashboard.stripe.com" target="_blank" rel="noopener">Stripe dashboard &rarr;</a>
-      <div id="custlist"><div class="empty">Loading&hellip;</div></div>
-    </div>
-    <div class="panel" id="p-contacts"><div id="contlist"><div class="empty">Loading&hellip;</div></div></div>
-    <div class="panel" id="p-referrals"><div id="reflist"><div class="empty">Loading&hellip;</div></div></div>
-
-  </div>
-</div>
-
-<script>
-var TOKEN="";
-var BLOCKS=[];          /* newest first, exactly as the server returns */
-var SHOWN=0;            /* how many are drawn */
-var PAGE=40;
-var LOADED_LIMIT=0;
-var CHAININFO={};
-var EXPANDED={};
-var ALLOPEN=false;
-
-var ROUTES=["selfcheck","standard","savings","verifier","network","publish","continuity",
-            "praxis","roster","mutual","witness","packs","pack","packconsole","register",
-            "demo","wallet","ots","complete","consistency","replay","lineage","witnessed",
-            "codebase","identify","watch","tokensaver","signed","stats","console"];
-var PAGES=["/console","/pack","/witness","/self-check","/praxis","/packs.html","/registry.html",
-           "/developers","/whitepaper","/seal","/verify","/scan","/notary"];
-var RSTATE={};
-
-function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]})}
-function when(ts){if(!ts)return"";try{var n=Number(ts);if(n>1e12)n=n/1000;return new Date(n*1000).toLocaleString()}catch(e){return""}}
-function shortT(ts){if(!ts)return"";try{var n=Number(ts);if(n>1e12)n=n/1000;var d=new Date(n*1000);
-  return d.toLocaleDateString([], {day:"2-digit",month:"short"})+" "+d.toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"});}catch(e){return""}}
-function setOut(id,txt,cls){var e=document.getElementById(id);if(!e)return;e.textContent=txt;e.className="out"+(cls?" "+cls:"")}
-function openRaw(p){window.open(p,"_blank")}
-
-/* a block's colour comes from its own seal, so identical hashes always
-   look identical and a changed hash visibly changes face */
-function hueOf(h){
-  var s=String(h||"");if(s.length<6)return 200;
-  return parseInt(s.slice(0,4),16)%360;
-}
-
-/* ---------- auth ---------- */
-async function doLogin(){
-  var pw=document.getElementById("pw").value;
-  document.getElementById("loginerr").textContent="";
-  try{
-    var r=await fetch("/admin/auth",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password:pw})});
-    var d=await r.json();
-    if(d.token){TOKEN=d.token;document.getElementById("login").style.display="none";document.getElementById("dash").style.display="block";loadAll();}
-    else if(d.error==="admin_disabled"){document.getElementById("loginerr").textContent="Admin password not set. Add ADMIN_PASSWORD in Railway variables.";}
-    else if(d.error==="too_many_attempts"){document.getElementById("loginerr").textContent="Too many attempts. Wait a minute.";}
-    else{document.getElementById("loginerr").textContent="Wrong password.";}
-  }catch(e){document.getElementById("loginerr").textContent="Connection error.";}
-}
-function logout(){TOKEN="";document.getElementById("dash").style.display="none";document.getElementById("login").style.display="block";document.getElementById("pw").value="";}
-
-async function api(path,body){
-  var r=await fetch(path,{method:"POST",
-    headers:{"Authorization":"Bearer "+TOKEN,"Content-Type":"application/json"},
-    body:JSON.stringify(body||{})});
-  var txt=await r.text();var d;
-  /* Admin tokens live in memory on the server. Any restart or redeploy wipes
-     them, so a 401 here almost always means the container bounced rather than
-     anything being wrong with the chain. Say so, and send them back to log in. */
-  if(r.status===401){ sessionLost(); throw new Error("session expired — the server restarted and dropped its in-memory tokens. Log in again."); }
-  try{ d=JSON.parse(txt); }
-  catch(e){ throw new Error("HTTP "+r.status+" — not JSON: "+txt.slice(0,150)); }
-  if(!r.ok) throw new Error("HTTP "+r.status+" — "+(d.error||txt.slice(0,150)));
-  if(d && d.error) throw new Error(String(d.error));
-  return d;
-}
-function sessionLost(){
-  if(!TOKEN)return;
-  TOKEN="";
-  document.getElementById("dash").style.display="none";
-  document.getElementById("login").style.display="block";
-  document.getElementById("loginerr").textContent="Session expired — the server restarted. Log in again.";
-}
-
-async function loadAll(){
-  try{
-    var s=await api("/admin/stats");
-    document.getElementById("rail").innerHTML=
-      st(s.total_keys,"signups")+
-      st(s.paid_keys,"paying","good")+
-      st((s.total_keys||0)-(s.paid_keys||0),"free / leads")+
-      st(s.audit_blocks,"audit blocks","cy")+
-      st(s.chain_valid?"OK":"BROKEN","chain",s.chain_valid?"good":"bad")+
-      st('<span id="armcount">—</span>',"routes armed","cy")+
-      st('<span id="peercount">—</span>',"peers","cy");
-  }catch(e){
-    document.getElementById("rail").innerHTML='<div class="st bad"><div class="big">ERR</div><div class="lab">'+esc(e.message).slice(0,60)+'</div></div>';
-  }
-  buildRoutes();loadCustomers();loadContacts();loadReferrals();loadNetwork();
-}
-function st(v,l,cls){return '<div class="st '+(cls||"")+'"><div class="big">'+v+'</div><div class="lab">'+esc(l)+'</div></div>';}
-
-/* ================= BLOCKS ================= */
-/* Reads through modules/blocks.py, not /admin/audit.
-   /admin/audit re-verifies the entire chain on every call, which is what
-   was taking the container down. This route only reads rows, and it takes
-   an offset, so the whole chain is reachable a page at a time. */
-var APIKEY="";
-var OFFSET=0;
-
-function keyBox(){
-  var k=document.getElementById("apikey");
-  APIKEY=k?k.value.trim():"";
-  return APIKEY;
-}
-
-async function xget(mod,action,params){
-  var q=[];
-  for(var k in params){ if(params[k]!==""&&params[k]!=null) q.push(encodeURIComponent(k)+"="+encodeURIComponent(params[k])); }
-  var url="/x/"+mod+"/"+action+(q.length?"?"+q.join("&"):"");
-  var r=await fetch(url,{cache:"no-store",headers:{"Authorization":"Bearer "+keyBox()}});
-  var txt=await r.text();var d;
-  try{ d=JSON.parse(txt); }catch(e){ throw new Error("HTTP "+r.status+" — not JSON: "+txt.slice(0,140)); }
-  if(r.status===401) throw new Error("401 — this route needs your API key. Paste it in the box above (al_live_…).");
-  if(!r.ok) throw new Error("HTTP "+r.status+" — "+(d.error||txt.slice(0,140)));
-  if(d&&d.error) throw new Error(String(d.error));
-  return d;
-}
-
-async function loadBlocks(reset){
-  if(reset!==false){ OFFSET=0; BLOCKS=[]; }
-  document.getElementById("spine").innerHTML='<div class="empty">Reading blocks&hellip;</div>';
-  var d;
-  try{ d=await xget("blocks","list",{limit:50,offset:OFFSET,api_key:""}); }
-  catch(e){
-    document.getElementById("spine").innerHTML='<div class="empty" style="color:var(--red)">'+esc(e.message)
-      +'<br><br>If this says 404, <span class="mono">modules/blocks.py</span> is not deployed yet.</div>';
-    document.getElementById("gint").textContent="request failed";
-    document.getElementById("gint").className="gv bad";
-    return;
-  }
-  var got=d.blocks||[];
-  BLOCKS=OFFSET?BLOCKS.concat(got):got;
-  OFFSET=d.next_offset;
-  CHAININFO={chain_blocks:d.total,has_more:d.has_more};
-  SHOWN=0;EXPANDED={};
-  document.getElementById("gint").textContent="reading — not verified";
-  document.getElementById("gint").className="gv";
-  document.getElementById("gtip").textContent=BLOCKS.length?String(BLOCKS[0].audit_hash||"").slice(0,16)+"…":"—";
-  document.getElementById("gblocks").textContent=(d.total!=null?d.total:"?");
-
-  var note=document.getElementById("depthnote");
-  if(d.total&&BLOCKS.length<d.total){
-    note.style.display="block";
-    note.innerHTML='<b>Holding '+BLOCKS.length+' of '+d.total+' blocks.</b> Scroll or tap Show more and the next page loads. This route takes an offset, so the whole chain is reachable.';
-  } else note.style.display="none";
-  renderGraph(true);
-}
-
-/* whole-chain verification stays deliberate, on its own button */
-async function checkLinks(){
-  document.getElementById("gint").textContent="checking…";
-  try{
-    var d=await xget("blocks","links",{limit:200,offset:0});
-    if(d.clean){
-      document.getElementById("gint").textContent="links hold ("+d.pairs_checked+" pairs)";
-      document.getElementById("gint").className="gv";
-    }else{
-      document.getElementById("gint").textContent="BROKEN at #"+d.broken[0].between;
-      document.getElementById("gint").className="gv bad";
-    }
-  }catch(e){
-    document.getElementById("gint").textContent="check failed";
-    document.getElementById("gint").className="gv bad";
-  }
-}
-
-function matchQ(b,q){
-  if(!q)return true;
-  q=q.toLowerCase();
-  return String(b.audit_hash||"").toLowerCase().indexOf(q)>=0
-      || String(b.prev_hash||"").toLowerCase().indexOf(q)>=0
-      || String(b.user_id||"").toLowerCase().indexOf(q)>=0
-      || String(b.decision||"").toLowerCase().indexOf(q)>=0
-      || String(b.seq||"").indexOf(q)>=0;
-}
-
-function renderGraph(reset){
-  var q=document.getElementById("bsearch").value.trim();
-  var list=BLOCKS.filter(function(b){return matchQ(b,q)});
-  if(reset)SHOWN=0;
-  SHOWN=Math.min(list.length,SHOWN?SHOWN:PAGE);
-  var spine=document.getElementById("spine");
-  if(!list.length){
-    spine.innerHTML='<div class="empty">'+(BLOCKS.length?'Nothing matches that.':'No records returned. The chain reports '+(CHAININFO.chain_blocks!=null?CHAININFO.chain_blocks:"?")+' blocks &mdash; if that is above zero the rows exist and something is filtering them out.')+'</div>';
-    document.getElementById("gcount").textContent="";
-    return;
-  }
-  var h="";
-  for(var i=0;i<SHOWN;i++){
-    var b=list[i];
-    var older=list[i+1];              /* the block below it in time */
-    /* the link holds when this block's prev_hash equals the older block's seal */
-    var linked = older ? (String(b.prev_hash||"")===String(older.audit_hash||"")) : true;
-    var broken = older && !linked;
-    var dec=String(b.decision||"—");
-    var col=dec==="BLOCK"?"var(--red)":dec==="CHALLENGE"?"var(--gold)":dec==="ALLOW"?"var(--ok)":"var(--mut)";
-    var hue=hueOf(b.audit_hash);
-    var open=(ALLOPEN||EXPANDED[b.seq])?" on":"";
-
-    h+='<div class="node'+(broken?" broken":"")+'">'
-      +'<span class="orb" style="border-color:hsl('+hue+',65%,58%)"><span style="position:absolute;inset:3px;border-radius:2px;background:hsl('+hue+',60%,45%);opacity:.8"></span></span>'
-      +'<div class="blk" onclick="tog(\''+esc(b.seq)+'\')">'
-        +'<div class="l1"><span class="seq">#'+esc(b.seq)+'</span>'
-        +'<span class="dec" style="color:'+col+';border:1px solid '+col+'">'+esc(dec)+'</span>'
-        +'<span class="tm">'+esc(shortT(b.ts))+'</span></div>'
-        +'<div class="sl">'+esc(String(b.audit_hash||"").slice(0,32))+'…</div>'
-        +'<div class="who">'+esc(b.user_id||"—")
-          +(b.score!=null&&b.score!==""?" · score "+esc(b.score):"")
-          +(b.reasons&&b.reasons.length?" · "+esc(b.reasons.slice(0,3).join(", ")):"")+'</div>'
-        +'<div class="det'+open+'" id="det-'+esc(b.seq)+'">'
-          +'<div><span class="k">seal</span> <span class="v">'+esc(b.audit_hash||"—")+'</span></div>'
-          +'<div><span class="k">prev</span> <span class="v p">'+esc(b.prev_hash||"—")+'</span></div>'
-          +'<div><span class="k">time</span> '+esc(when(b.ts))+'</div>'
-          +'<div><span class="k">user</span> '+esc(b.user_id||"—")+'</div>'
-          +(b.reasons&&b.reasons.length?'<div><span class="k">why</span> '+esc(b.reasons.join(", "))+'</div>':'')
-          +'<div><span class="k">link</span> '+(older?(linked?'<span style="color:var(--ok)">holds — prev matches #'+esc(older.seq)+'</span>':'<span style="color:var(--red)">BROKEN</span>'):'<span style="color:var(--dim)">oldest loaded</span>')+'</div>'
-        +'</div>'
-      +'</div></div>';
-
-    if(broken){
-      h+='<div class="breakflag">LINK BROKEN between #'+esc(b.seq)+' and #'+esc(older.seq)+'<br>'
-        +'expected prev: '+esc(String(older.audit_hash||"").slice(0,44))+'…<br>'
-        +'found prev:&nbsp;&nbsp;&nbsp; '+esc(String(b.prev_hash||"").slice(0,44))+'…</div>';
-    }
-  }
-  spine.innerHTML=h;
-  document.getElementById("gcount").textContent=SHOWN+" of "+list.length+(q?" matching":" loaded");
-  attachSentinel(list.length);
-}
-
-function attachSentinel(total){
-  if(SHOWN>=total)return;
-  var spine=document.getElementById("spine");
-  var s=document.createElement("div");
-  s.className="sentinel";
-  spine.appendChild(s);
-  if(!window.IntersectionObserver)return;
-  var io=new IntersectionObserver(function(en){
-    if(en[0].isIntersecting){io.disconnect();more();}
-  },{root:spine,rootMargin:"200px"});
-  io.observe(s);
-}
-function more(){
-  var q=document.getElementById("bsearch").value.trim();
-  var total=BLOCKS.filter(function(b){return matchQ(b,q)}).length;
-  if(SHOWN>=total){
-    if(CHAININFO.has_more){ loadBlocks(false); }   /* pull the next page */
-    return;
-  }
-  SHOWN=Math.min(total,SHOWN+PAGE);
-  renderGraph(false);
-}
-function tog(seq){
-  var el=document.getElementById("det-"+seq);
-  if(!el)return;
-  var on=el.className.indexOf("on")>=0;
-  el.className="det"+(on?"":" on");
-  EXPANDED[seq]=!on;
-}
-function toggleAll(){ALLOPEN=!ALLOPEN;EXPANDED={};renderGraph(false);}
-function exportBlocks(){
-  if(!BLOCKS.length)return;
-  var blob=new Blob([JSON.stringify({exported_at:new Date().toISOString(),chain:CHAININFO.chain_valid,tip:CHAININFO.chain_tip,blocks:BLOCKS},null,2)],{type:"application/json"});
-  var url=URL.createObjectURL(blob);var a=document.createElement("a");
-  a.href=url;a.download="sebbi-blocks-"+Date.now()+".json";a.click();URL.revokeObjectURL(url);
-}
-
-/* ================= ROUTES ================= */
-function buildRoutes(){
-  var h="";
-  ROUTES.forEach(function(m){
-    var s=RSTATE[m]||{cls:"",txt:"not checked"};
-    h+='<div class="rt '+s.cls+'" id="rt-'+m+'" onclick="armOne(\''+m+'\')">'
-      +'<div class="rn">/x/'+esc(m)+'</div><div class="rs">'+esc(s.txt)+'</div></div>';
-  });
-  document.getElementById("rgrid").innerHTML=h;
-  var p="";
-  PAGES.forEach(function(u){p+='<div class="rt" onclick="openRaw(\''+u+'\')"><div class="rn">'+esc(u)+'</div><div class="rs">open</div></div>';});
-  document.getElementById("pgrid").innerHTML=p;
-}
-function addRoute(){
-  var v=document.getElementById("newroute").value.trim().replace(/[^a-z0-9_-]/gi,"");
-  if(!v)return;
-  if(ROUTES.indexOf(v)<0)ROUTES.push(v);
-  document.getElementById("newroute").value="";buildRoutes();
-}
-function mark(m,cls,txt){
-  RSTATE[m]={cls:cls,txt:txt};
-  var el=document.getElementById("rt-"+m);
-  if(el){el.className="rt "+cls;el.querySelector(".rs").textContent=txt;}
-}
-async function armOne(m){
-  mark(m,"wait","pinging");
-  var t0=Date.now();
-  try{
-    var r=await fetch("/x/"+m+"/status",{cache:"no-store"});
-    var ms=Date.now()-t0;var txt=await r.text();
-    /* The router imports the module and matches the action BEFORE checking
-       auth, so anything other than "module not found" proves it loaded. */
-    if(r.ok){ mark(m,"armed","armed "+ms+"ms"); return true; }
-    if(r.status===401||r.status===403){ mark(m,"armed","armed · keyed"); return true; }
-    if(r.status===500){ mark(m,"err","armed · 500 error"); return true; }
-    if(txt.indexOf("unknown_action")>=0){ mark(m,"armed","armed "+ms+"ms"); return true; }
-    if(r.status===404){ mark(m,"fail","not deployed"); return false; }
-    mark(m,"fail","HTTP "+r.status);return false;
-  }catch(e){ mark(m,"fail","unreachable"); return false; }
-}
-async function armAll(failsOnly){
-  var list=failsOnly?ROUTES.filter(function(m){return !RSTATE[m]||RSTATE[m].cls==="fail"}):ROUTES.slice();
-  if(!list.length){setOut("armout","nothing to re-check","");return;}
-  setOut("armout","arming "+list.length+" routes…","warn");
-  var done=0;
-  for(var i=0;i<list.length;i++){
-    await armOne(list[i]);done++;
-    document.getElementById("armbar").style.width=Math.round(done/list.length*100)+"%";
-  }
-  var armed=ROUTES.filter(function(m){var s=RSTATE[m];return s&&(s.cls==="armed"||s.cls==="err")}).length;
-  var ac=document.getElementById("armcount");if(ac)ac.textContent=armed+"/"+ROUTES.length;
-  var erroring=ROUTES.filter(function(m){return RSTATE[m]&&RSTATE[m].cls==="err"});
-  var missing=ROUTES.filter(function(m){return RSTATE[m]&&RSTATE[m].cls==="fail"});
-  var msg=armed+" of "+ROUTES.length+" armed.";
-  if(erroring.length)msg+="\nloaded but throwing: "+erroring.join(", ");
-  if(missing.length)msg+="\nnot deployed — check modules/: "+missing.join(", ");
-  if(!erroring.length&&!missing.length)msg+="\neverything is up.";
-  setOut("armout",msg,(erroring.length||missing.length)?"warn":"");
-  setTimeout(function(){document.getElementById("armbar").style.width="0"},900);
-}
-
-/* ================= CHAIN ================= */
-async function verifyChain(){
-  setOut("chainout","verifying…","warn");
-  try{
-    var r=await fetch("/api/verify-chain",{cache:"no-store"});var d=await r.json();
-    if(d.valid)setOut("chainout","VERIFIED — CHAIN INTACT\nblocks: "+d.blocks+"\ntip:    "+(d.tip||"")+(d.message?"\n"+d.message:""),"");
-    else setOut("chainout","CHAIN BROKEN\nblocks: "+d.blocks+"\n"+(d.message||"")+"\n\nGo to Break glass. Do not redeploy first.","bad");
-  }catch(e){setOut("chainout","could not reach /api/verify-chain — "+e.message,"bad");}
-}
-async function grab(url,id){
-  setOut(id,"reading…","warn");
-  try{var r=await fetch(url,{cache:"no-store"});var t=await r.text();setOut(id,t.slice(0,1600),r.ok?"":"bad");}
-  catch(e){setOut(id,"unreachable — "+e.message,"bad");}
-}
-function consRoot(){grab("/x/consistency/root","chainout")}
-function otsStatus(){grab("/x/ots/status","chainout")}
-function ownTip(){grab("/x/witness/tip","chainout")}
-
-async function breakGlass(){
-  var log=[];function push(s){log.push(s);setOut("glassout",log.join("\n"),"warn");}
-  push("CAPTURE STARTED — "+new Date().toISOString());
-  var frozenTip="";
-  try{
-    var r=await fetch("/api/verify-chain",{cache:"no-store"});var d=await r.json();
-    frozenTip=d.tip||"";
-    push("1. frozen tip: "+(frozenTip||"(none)"));
-    push("   chain reports: "+(d.valid?"INTACT":"BROKEN")+" across "+d.blocks+" blocks");
-  }catch(e){push("1. could not read tip — "+e.message);}
-  var recs=[];
-  try{
-    var d2=await xget("blocks","list",{limit:200,offset:0});
-    recs=d2.blocks||[];push("2. pulled "+recs.length+" of "+(d2.total!=null?d2.total:"?")+" blocks");
-    var brk=null;
-    for(var i=0;i<recs.length-1;i++){
-      var newer=recs[i],older=recs[i+1];
-      if(newer.prev_hash&&older.audit_hash&&newer.prev_hash!==older.audit_hash){
-        brk={at:newer.seq,below:older.seq,expected:older.audit_hash,found:newer.prev_hash};break;}
-    }
-    if(brk)push("3. FIRST BREAK between #"+brk.at+" and #"+brk.below+"\n   expected prev: "+String(brk.expected).slice(0,32)+"…\n   found prev:    "+String(brk.found).slice(0,32)+"…");
-    else push("3. no link mismatch in the records pulled");
-  }catch(e){push("2. could not pull records — "+e.message);}
-  try{
-    var blob=new Blob([JSON.stringify({captured_at:new Date().toISOString(),frozen_tip:frozenTip,record_count:recs.length,records:recs},null,2)],{type:"application/json"});
-    var url=URL.createObjectURL(blob);var a=document.createElement("a");
-    a.href=url;a.download="sebbi-break-capture-"+Date.now()+".json";a.click();URL.revokeObjectURL(url);
-    push("4. evidence file downloaded to this device");
-  }catch(e){push("4. export failed — "+e.message);}
-  try{
-    var rp=await fetch("/x/mutual/status",{cache:"no-store"});
-    push("5. witness layer reachable: "+(rp.ok?"yes — the tip goes out next cycle":"NO, check /x/mutual/status"));
-  }catch(e){push("5. witness layer unreachable — "+e.message);}
-  push("");push("CAPTURE COMPLETE. Keep that file off this server.");
-  push("Do not redeploy or reset until it is saved elsewhere.");
-  setOut("glassout",log.join("\n"),"bad");
-}
-
-/* ================= NETWORK ================= */
-async function loadNetwork(){
-  setOut("netout","loading roster…","warn");
-  try{
-    var r=await fetch("/x/roster/list",{cache:"no-store"});var d=await r.json();
-    var ch=d.chains||d.roster||d.peers||[];
-    setOut("netout","roster v"+(d.roster_version||"?")+" — "+(d.count!=null?d.count:ch.length)+" listed"
-      +(d.witnessable!=null?", "+d.witnessable+" witnessable":"")
-      +(d.stale!=null?", "+d.stale+" stale":"")+(d.silent!=null?", "+d.silent+" silent":""),"");
-    var pc=document.getElementById("peercount");if(pc)pc.textContent=(d.count!=null?d.count:ch.length);
-    if(!ch.length){document.getElementById("netlist").innerHTML='<div class="empty">Roster returned no chains.</div>';return;}
-    var h="";
-    ch.forEach(function(c){
-      var stt=(c.status||c.liveness||"").toLowerCase();
-      var col=stt.indexOf("current")>=0?"var(--ok)":stt.indexOf("stale")>=0?"var(--amber)":stt.indexOf("silent")>=0?"var(--red)":"var(--mut)";
-      h+='<div class="card"><div class="top"><span class="nm">'+esc(c.chain||c.name||c.peer||"(unnamed)")+'</span>'
-        +'<span class="badge" style="color:'+col+';border:1px solid '+col+'">'+esc(c.status||c.liveness||"—")+'</span></div>'
-        +'<div class="meta">'+(c.observations!=null?esc(c.observations)+' observations · ':'')
-        +(c.hours_since!=null?esc(c.hours_since)+'h since last · ':'')+'name: '+esc(c.name_status||"—")+'</div>'
-        +(c.first_seen?'<div class="meta">first seen '+esc(c.first_seen)+'</div>':'')
-        +(c.url?'<div class="mono">'+esc(c.url)+'</div>':'')+'</div>';
-    });
-    document.getElementById("netlist").innerHTML=h;
-  }catch(e){setOut("netout","could not load roster — "+e.message,"bad");}
-}
-
-/* ================= TRAFFIC ================= */
-async function loadTraffic(){
-  setOut("trafout","loading…","warn");
-  var out=[];
-  try{var r=await fetch("/x/stats",{cache:"no-store"});out.push("/x/stats\n"+(await r.text()).slice(0,900));}
-  catch(e){out.push("/x/stats unreachable");}
-  try{var r2=await fetch("/x/demo/stats",{cache:"no-store"});out.push("\n/x/demo/stats\n"+(await r2.text()).slice(0,700));}
-  catch(e){out.push("\n/x/demo/stats unreachable");}
-  setOut("trafout",out.join("\n"),"");
-}
-
-/* ================= LISTS ================= */
-async function loadCustomers(){
-  try{
-    var d=await api("/admin/keys");var ks=d.keys||[];
-    if(!ks.length){document.getElementById("custlist").innerHTML='<div class="empty">No signups yet.</div>';return;}
-    var h="";
-    ks.forEach(function(k){
-      var paid=k.is_paid==1;
-      h+='<div class="card"><div class="top"><span class="nm">'+esc(k.name||"(no name)")+' <span class="meta">'+esc(k.org||"")+'</span></span>'
-        +'<span class="badge '+(paid?"paid":"free")+'">'+(paid?"paying":"free")+'</span></div>'
-        +'<div class="meta">'+esc(k.email||"")+' · '+esc(k.product||"")+' · '+esc(k.devices||0)+' devices · used '+esc(k.actions_used||0)+'/'+esc(k.free_quota||0)+'</div>'
-        +'<div class="meta">joined '+when(k.created)+'</div>'
-        +(k.key?'<div class="mono">'+esc(k.key)+'</div>':'')+'</div>';
-    });
-    document.getElementById("custlist").innerHTML=h;
-  }catch(e){document.getElementById("custlist").innerHTML='<div class="empty">Could not load — '+esc(e.message)+'</div>';}
-}
-async function loadContacts(){
-  try{
-    var d=await api("/admin/contacts");var cs=d.contacts||[];
-    if(!cs.length){document.getElementById("contlist").innerHTML='<div class="empty">No messages yet.</div>';return;}
-    var h="";
-    cs.forEach(function(c){
-      h+='<div class="card"><div class="top"><span class="nm">'+esc(c.name||"(no name)")+'</span><span class="meta">'+when(c.ts)+'</span></div>'
-        +'<div class="meta">'+esc(c.email||"")+(c.phone?' · '+esc(c.phone):'')+(c.org?' · '+esc(c.org):'')+'</div>'
-        +'<div style="margin-top:6px">'+esc(c.message||"")+'</div></div>';
-    });
-    document.getElementById("contlist").innerHTML=h;
-  }catch(e){document.getElementById("contlist").innerHTML='<div class="empty">Could not load — '+esc(e.message)+'</div>';}
-}
-async function loadReferrals(){
-  try{
-    var d=await api("/admin/referrals");var rs=d.referrals||[];
-    if(!rs.length){document.getElementById("reflist").innerHTML='<div class="empty">No referrals yet.</div>';return;}
-    var h="";
-    rs.forEach(function(r){
-      h+='<div class="card"><div class="top"><span class="nm">'+esc(r.referrer_name||"(no name)")+' <span class="meta">'+esc(r.code||"")+'</span></span>'
-        +'<span class="badge paid">£'+((r.earnings_pence||0)/100).toFixed(2)+'</span></div>'
-        +'<div class="meta">'+esc(r.referrer_email||"")+' · '+esc(r.devices_referred||0)+' devices referred</div></div>';
-    });
-    document.getElementById("reflist").innerHTML=h;
-  }catch(e){document.getElementById("reflist").innerHTML='<div class="empty">Could not load — '+esc(e.message)+'</div>';}
-}
-
-function show(name,el){
-  document.querySelectorAll(".tab").forEach(function(t){t.className="tab"});el.className="tab on";
-  document.querySelectorAll(".panel").forEach(function(p){p.className="panel"});
-  document.getElementById("p-"+name).className="panel on";
-}
-</script>
-</body>
-</html>
 
 ```
