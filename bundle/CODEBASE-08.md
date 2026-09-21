@@ -1,1806 +1,2581 @@
-# Codebase — part 8 of 36
+# Codebase — part 8 of 34
 
 Contains:
-- `modules/integrity.py`
-- `modules/investor.py`
+- `modules/mutual.py`
+- `modules/network.py`
+- `modules/ots.py`
+- `modules/oversight.py`
+- `modules/pack.py`
 
 
-## `modules/integrity.py`
+## `modules/mutual.py`
 
-1487 lines, 65650 bytes
+543 lines, 19704 bytes
 
 ```python
+#!/usr/bin/env python3
 """
-modules/integrity.py  v1.4.4  -  the AI Integrity Declaration, a public checker,
-                              and a sealed public register of verdicts
+modules/mutual.py  -  the outbound half of mutual witnessing
+============================================================
 
-Serves the open standard that rates every AI deployment from L0_DIARY
-(no checkable record) up to L4_OVERSIGHT_VERIFIED, and checks any domain
-against it. Reads only. Seals nothing, writes nothing, creates no tables.
-Every route is public.
+Why this exists
+---------------
+modules/witness.py RECEIVES. Other chains hand us their tips and we seal
+them. Nothing in the platform currently SENDS our tip anywhere, so right
+now we witness other people and nobody witnesses us. This module is the
+missing direction.
 
-Routes:
-  https://sebbi.pro/x/integrity/status                    what this is
-  https://sebbi.pro/x/integrity/declaration               the standard, as JSON
-  https://sebbi.pro/x/integrity/self                      sebbi.pro's own declaration
-  https://sebbi.pro/x/integrity/check?domain=example.com  rate any domain
-  https://sebbi.pro/x/integrity/register                  every sealed verdict
+Drop it in as modules/mutual.py. The router picks it up automatically -
+no edits to server.py.
 
-v1.4: THE CHECKER'S OWN VERDICTS ARE NOW EVIDENCE.
-Every fresh verdict is sealed into the sebbi.pro chain as a public block,
-so a rating cannot be quietly changed later - not by the domain rated, and
-not by sebbi.pro.
+Routes
+------
+  POST /x/mutual/push      send our current tip to every configured peer
+  POST /x/mutual/pull      fetch every peer's tip and seal it into our chain
+  POST /x/mutual/sync      pull then push (this is the one to schedule)
+  GET  /x/mutual/peers     the configured peers and what happened last time
+  GET  /x/mutual/status    last run, next run, whether the timer is alive
 
-v1.4.3: THE REQUEST IS SEALED TOO, BEFORE THE CHECK RUNS.
-A sealed verdict proves what the checker said, not what it left unsaid: an
-inconvenient result could simply go unsealed, and from outside, silence and
-never-asked look the same. Now the request is sealed first. A domain that
-was asked about and has no verdict after it shows up in the register as
-exactly that. (Raised by Richard Whitney, MIRegistry.) The register lists the latest sealed verdict per domain,
-each with the block that holds it. A checker that rates others by whether
-their records can be altered now holds its own ratings to the same rule.
+Important design note
+---------------------
+This module does not touch the database or import anything from server.py.
+It talks HTTP to routes that are already public - ours and theirs. That
+means it cannot corrupt anything, it works no matter how seal() changes,
+and every action it takes is one an outsider could audit for themselves.
 
-HOW THE CHECKER DECIDES
-It looks for a declaration at https://<domain>/.well-known/ai-integrity.json,
-then https://<domain>/x/integrity/self. None found: L0_DIARY.
-It never takes the declaration's word. It walks the declared chain and
-recomputes every public block itself, asks each declared witness for its
-tip, and opens each anchor proof. A level is awarded only when every check
-that level needs has passed. Claiming more than that is OVERCLAIMED.
+To read our own tip it calls our own public /x/witness/tip.
+To seal a peer's tip it calls our own public /x/witness/observe, which is
+already built to record exactly that. So a peer tip we pull is recorded by
+the same code path as a peer tip that was pushed to us.
 
-Human-oversight checks (INV-005, INV-006) cannot be tested from outside yet,
-so this checker never awards L4. It says so rather than guessing.
+FETCH-ONLY PEERS (added 1.2)
+----------------------------
+observe_url is now OPTIONAL. A peer with a tip_url and no observe_url is
+fetch-only: we read and seal their tip, and we do not try to push ours.
 
-SAFETY
-The checker fetches addresses taken from other people's declarations, so
-it only fetches https on port 443, refuses redirects, refuses any host that
-resolves to a private, loopback or internal address, caps every response
-size and every timeout, and caps the number of fetches per check.
+That is a real configuration, not a broken one. Two current cases:
+
+  A peer whose outbound submission lane is deliberately closed during
+  staging. They serve a tip for us to read; their recorder never reaches
+  out. Serving a file is not outbound submission.
+
+  A peer whose tip is a static JSON file with no server behind it. They
+  push to us on their own schedule and there is nothing on their side to
+  POST to. Perfectly valid node.
+
+Before 1.2 push_one read peer["observe_url"] unconditionally, so adding a
+fetch-only peer would have raised KeyError on every cycle - inside a
+background thread with a bare except, so it would have failed silently and
+taken the whole sync with it.
+
+CONCURRENCY - read this before changing it
+------------------------------------------
+A sync cycle makes two kinds of call, and they are treated differently on
+purpose.
+
+  OUTBOUND to other people's hosts (reading their tip, pushing ours) runs
+  in parallel. These are the slow ones - we are waiting on somebody else's
+  server, and there is no reason to wait on them one at a time. Fifty peers
+  now costs roughly what the slowest single peer costs, instead of the sum
+  of all fifty.
+
+  INBOUND to our own server (sealing what we pulled) stays sequential. Our
+  own process is handling those requests, and firing a burst of them at
+  ourselves while we are mid-cycle is asking for trouble - a queue behind a
+  single replica at best. The sealing is fast and local anyway, so there is
+  nothing to gain by parallelising it and a real risk in doing so.
+
+So: fetch everything at once, then seal one at a time.
+
+BEFORE THIS WORKS
+-----------------
+1. "observe" must be in the PUBLIC set of modules/witness.py. If it is not,
+   this module gets a 401 from our own server, same as Red Flag AI Pro did.
+2. After every deploy, the first /x/ request must be a GET - that is what
+   installs the POST branch. Opening /x/mutual/peers in a browser does it.
 """
 
-import hashlib
-import ipaddress
 import json
-import re
-import socket
 import threading
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "1.4.4"
-BASE = "https://sebbi.pro/x/integrity/"
+VERSION = "1.2"
 
-PUBLIC = {("GET", "status"), ("GET", "declaration"), ("GET", "spec"),
-          ("GET", "self"), ("GET", "check"), ("GET", "register")}
+# ----------------------------------------------------------------------
+# ROUTER
+# ----------------------------------------------------------------------
 
-# ---------------------------------------------------------------- the standard
-
-DECLARATION = json.loads(r'''{
-  "spec": "ai-integrity-declaration",
-  "version": "1.0.4",
-  "declaration_id": "DEC-2026-AI-INTEGRITY",
-  "status": "open_standard",
-  "published": "2026-09-19",
-  "issuer": {
-    "name": "Monop Content",
-    "product": "sebbi.pro",
-    "url": "https://sebbi.pro"
-  },
-  "principle": "A record kept only by the party it describes is a diary, not evidence. Any AI deployment can be checked against this standard by anyone, without an account, a key, or permission.",
-  "scope": "Autonomous agents and AI systems that make or support decisions affecting people, money, access or safety.",
-  "maps_to": [
-    {
-      "framework": "EU AI Act",
-      "provisions": [
-        "Article 12 record-keeping",
-        "Article 14 human oversight"
-      ]
-    },
-    {
-      "framework": "UK Online Safety Act 2023",
-      "provisions": [
-        "record-keeping and review duties"
-      ]
-    },
-    {
-      "framework": "ICO Age Appropriate Design Code",
-      "provisions": [
-        "data minimisation",
-        "transparency"
-      ]
-    }
-  ],
-  "related": {
-    "ordering_test": "https://sebbi.pro/.well-known/ordering-test.json",
-    "relationship": "The Ordering Test lists which checks a vendor supports and which anyone can run without an account. This declaration turns those checks into levels, so every AI deployment gets a rating whether or not it publishes."
-  },
-  "discovery": {
-    "paths": [
-      "/.well-known/ai-integrity.json",
-      "/x/integrity/self"
-    ],
-    "rule": "Every AI deployment is rated. A verifier looks for a declaration at each path in order, over HTTPS, on the deployment's own domain. A deployment with no declaration at any of these paths is rated L0_DIARY. Absence is itself the result.",
-    "absence_verdict": "L0_DIARY"
-  },
-  "levels": {
-    "L0_DIARY": {
-      "badge": "GREY",
-      "meaning": "No public, independently checkable record. The operator's word is the only evidence.",
-      "requires": []
-    },
-    "L1_SEALED": {
-      "badge": "BRONZE",
-      "meaning": "Every decision is sealed into a public append-only chain that anyone can walk and recompute.",
-      "requires": [
-        "INV-001",
-        "INV-002",
-        "INV-007"
-      ]
-    },
-    "L2_WITNESSED": {
-      "badge": "SILVER",
-      "meaning": "Independent parties hold the chain's fingerprints, so the operator cannot rewrite history unnoticed.",
-      "requires": [
-        "INV-001",
-        "INV-002",
-        "INV-003",
-        "INV-007"
-      ]
-    },
-    "L3_ANCHORED": {
-      "badge": "GOLD",
-      "meaning": "The chain is also anchored to a public timestamp no single party controls.",
-      "requires": [
-        "INV-001",
-        "INV-002",
-        "INV-003",
-        "INV-004",
-        "INV-007"
-      ]
-    },
-    "L4_OVERSIGHT_VERIFIED": {
-      "badge": "GOLD_LIVE_VERIFIED",
-      "meaning": "Human oversight is itself provable: reviewers commit before seeing the machine, and rubber-stamping is detected.",
-      "requires": [
-        "INV-001",
-        "INV-002",
-        "INV-003",
-        "INV-004",
-        "INV-005",
-        "INV-006",
-        "INV-007"
-      ]
-    }
-  },
-  "invariants": {
-    "INV-001-SEALED-CHAIN": {
-      "requirement": "Every decision is sealed at the moment it is made, with what it rested on, into an append-only hash chain.",
-      "test": "Fetch the declared walk endpoint. Starting from genesis, recompute every public block from the served preimage and confirm each block names its parent.",
-      "pass": "All public blocks recompute; all links unbroken; the tip reached equals the tip published.",
-      "fail_verdict": "L0_DIARY"
-    },
-    "INV-002-FINGERPRINTS-ONLY": {
-      "requirement": "Raw prompts, documents and personal data stay with their owner. Only fingerprints are published. Short or guessable personal values are salted or keyed before hashing.",
-      "test": "Inspect public blocks. No raw personal data, secrets or credentials appear. The declaration states the hashing method for personal values.",
-      "pass": "No raw personal data in any public block; method declared.",
-      "fail_verdict": "L0_DIARY"
-    },
-    "INV-003-INDEPENDENT-WITNESS": {
-      "requirement": "At least one party independent of the operator holds the chain's tip. The declaration states how many independent parties would have to collude or fail at the same time for the history to be rewritten unnoticed.",
-      "independence": "A witness is independent when the operator cannot alter, delete or withhold the witness's record of the tip. Payment does not by itself break independence; control does. Any commercial relationship between operator and witness is disclosed in the declaration.",
-      "witness_strength": {
-        "sealed": "The witness sealed the tip inside its own hash chain, and the checker recomputed that block and found the tip in it.",
-        "bound": "The witness recorded the tip against a position in its own anchored chain, which dates the record but does not seal it.",
-        "listed": "The witness publishes the tip, with nothing in its own chain binding the record.",
-        "note": "Strength is reported for every passing witness. It does not yet change the level; it will be graded from 1.1.0. A witness can climb from listed to bound to sealed, and the declaration shows which it is."
-      },
-      "test": "Query each declared witness. Its recorded tip must appear in the operator's chain at the position it claims.",
-      "pass": "At least one independent witness confirms; the collusion threshold is disclosed.",
-      "fail_verdict": "L1_SEALED"
-    },
-    "INV-004-PUBLIC-TIME-ANCHOR": {
-      "requirement": "Chain tips are anchored to a public timestamp no single party controls, such as OpenTimestamps on Bitcoin.",
-      "test": "Verify the anchor proof offline against the tip it names.",
-      "pass": "Proof commits to a tip present in the chain.",
-      "fail_verdict": "L2_WITNESSED"
-    },
-    "INV-005-COMMIT-BEFORE-REVEAL": {
-      "requirement": "Where a human reviews an AI decision, the reviewer's verdict is sealed before the machine's verdict is shown to them.",
-      "test": "For each reviewed case, the reviewer's sealed commitment sits in an earlier block than the reveal of the machine verdict.",
-      "pass": "Every reviewed case shows commit before reveal.",
-      "fail_verdict": "L3_ANCHORED"
-    },
-    "INV-006-ANTI-RUBBER-STAMP": {
-      "requirement": "Review behaviour that indicates rubber-stamping is detected and sealed.",
-      "parameters": {
-        "minimum_review_seconds": 1.5,
-        "maximum_agreement_rate": 0.98,
-        "window": "rolling 30 days, per reviewer"
-      },
-      "test": "Any reviewer approving in under minimum_review_seconds, or agreeing with the machine more often than maximum_agreement_rate across the window, has a flag sealed into the chain.",
-      "pass": "Flags are raised and sealed whenever the thresholds are crossed; the thresholds in use are declared.",
-      "fail_verdict": "L3_ANCHORED"
-    },
-    "INV-007-DISCLOSED-DISCONTINUITY": {
-      "requirement": "Where the chain is reset, or the meaning of a field or the referent of an identifier changes after records using it have been sealed, the change is sealed into the record itself with the date it took effect. Records sealed under the earlier meaning remain valid under that meaning and are never silently repaired.",
-      "test": "Every discontinuity or change of meaning is disclosed either as a block sealed in the chain, or in the declaration with the kind of change and the evidence a verifier can use to detect it. Where the checker can detect a discontinuity itself (for example records sealed long after the window they cover), an undisclosed one fails.",
-      "detection_rule": "A discontinuity that is detected rather than asserted states the rule that detected it (for example \"createdAt - rangeEnd > 2 hours\"), so any verifier can recount it and get the same number. Where a rule is declared, the checker applies that rule rather than its own and reports whether it reproduces the declared count. In 1.0.3 a missing rule is reported; from 1.1.0 it fails.",
-      "detection_rule_location": "Inside the discontinuity it describes: discontinuities[].detection_rule, beside that entry's own counts (checkpoints, through_seq). A rule anywhere else is not read.",
-      "pass": "Every discontinuity is disclosed in the chain.",
-      "fail_verdict": "L0_DIARY"
-    }
-  },
-  "verifier_rules": [
-    "Never accept an operator's own statement that its record is valid. Recompute.",
-    "A verifier assigns the highest level whose every required invariant passes.",
-    "If a declaration claims a higher level than verification supports, the verdict is OVERCLAIMED, shown alongside the verified level.",
-    "A declaration that cannot be fetched, or cannot be parsed, is rated L0_DIARY."
-  ],
-  "declaration_template": {
-    "spec": "ai-integrity-declaration",
-    "version": "1.0.0",
-    "organisation": "",
-    "system": "",
-    "claimed_level": "",
-    "chain": {
-      "walk_endpoint": "",
-      "genesis_hash": "",
-      "seal_method_url": ""
-    },
-    "personal_data_hashing": "",
-    "witnesses": [
-      {
-        "name": "",
-        "tip_endpoint": ""
-      }
-    ],
-    "collusion_threshold": 0,
-    "anchor": {
-      "method": "",
-      "proof_endpoint": ""
-    },
-    "oversight": {
-      "commit_before_reveal": false,
-      "anti_rubber_stamp": {
-        "minimum_review_seconds": 1.5,
-        "maximum_agreement_rate": 0.98
-      }
-    },
-    "discontinuities": [
-      {
-        "date": "",
-        "disclosure_block": "",
-        "kind": "",
-        "detail": ""
-      }
-    ],
-    "known_gaps": []
-  },
-  "not_yet_rated": {
-    "availability": "Every level answers 'has this been altered'. None yet answers 'will this still be served'. Until a level for availability is defined, declare availability limits in known_gaps."
-  },
-  "reference_implementation": {
-    "name": "sebbi.pro",
-    "walk": "https://sebbi.pro/x/walk/status",
-    "method": "https://sebbi.pro/x/walk/spec",
-    "genesis": "https://sebbi.pro/x/walk/genesis",
-    "discontinuity_example": "https://sebbi.pro/x/walk/block?index=2013"
-  },
-  "changelog": [
-    {
-      "version": "1.0.1",
-      "date": "2026-09-20",
-      "change": "Added /x/integrity/self as a second discovery path, for deployments whose server cannot serve /.well-known. Added the public checker."
-    },
-    {
-      "version": "1.0.4",
-      "date": "2026-09-20",
-      "change": "Fixed where detection_rule lives: inside its discontinuity, beside the counts it produces. Where a rule is declared, the checker now reports the count under that rule first and its own default second, instead of leading with its default. Check requests are now sealed before the check runs, so a request with no verdict after it is visible in the register. Both raised by Richard Whitney (MIRegistry)."
-    },
-    {
-      "version": "1.0.3",
-      "date": "2026-09-20",
-      "change": "detection_rule for detected discontinuities, applied by the checker to recount the declared figure. Witness strength (sealed, bound, listed) reported for every witness. Both raised by Richard Whitney (MIRegistry). Every fresh checker verdict is now sealed into the sebbi.pro chain and listed in a public register, so ratings themselves cannot be quietly altered."
-    },
-    {
-      "version": "1.0.2",
-      "date": "2026-09-20",
-      "change": "Defined witness independence (control, not payment). INV-007 accepts discontinuities disclosed in the declaration with detection evidence, and fails undisclosed ones the checker can detect. Added known_gaps and the unrated availability axis. All three raised by Richard Whitney (MIRegistry) while writing the first external declaration."
-    }
-  ],
-  "public_checker": "https://sebbi.pro/x/integrity/check?domain=example.com",
-  "public_register": "https://sebbi.pro/x/integrity/register"
-}''')
-
-_CANONICAL = json.dumps(DECLARATION, sort_keys=True, separators=(",", ":"),
-                        ensure_ascii=False)
-DECLARATION_SHA256 = hashlib.sha256(_CANONICAL.encode("utf-8")).hexdigest()
-
-# ---------------------------------------------------------------- our own declaration
+# The router reads a set of (METHOD, action) tuples. Anything not listed
+# here needs an API key - default is closed.
 #
-# sebbi.pro's own claim. Kept honest: it claims only what the checker can
-# confirm today. To move up a level, add a witness below - an address run
-# by someone else that returns the sebbi.pro tip they hold - and raise
-# claimed_level only once the checker agrees.
+# peers and status are read-only. An outsider being able to see who we
+# witness with, and whether it is actually running, is the entire point.
+#
+# push, pull and sync stay keyed - they cause outbound traffic and are not
+# left open to anonymous callers.
+PUBLIC = {("GET", "peers"), ("GET", "status")}
 
-SELF_WITNESSES = [
-    {"name": "MIR (MIRegistry)",
-     "tip_endpoint": "https://mir.events/v1/transparency/held/tips?peer=sebbi",
-     "note": "MIR records each sebbi.pro tip it observes against its own "
-             "anchored chain position and never refreshes an entry. As MIR "
-             "states in its own payload, these observations are bound to an "
-             "anchored MIR tip, not sealed inside MIR's merkle root."},
+
+# ----------------------------------------------------------------------
+# CONFIG
+# ----------------------------------------------------------------------
+
+# Our own public witness routes. Left as full URLs on purpose so this
+# module never has to guess its own host.
+OUR_TIP_URL = "https://sebbi.pro/x/witness/tip"
+OUR_OBSERVE_URL = "https://sebbi.pro/x/witness/observe"
+
+# The name we go by when we hand our tip to someone else.
+OUR_CHAIN_NAME = "aileash"
+
+# Everyone we witness with. Add a dict per chain.
+#   name         what we file their tips under
+#   tip_url      where we GET their current tip          REQUIRED
+#   observe_url  where we POST ours so they record it    OPTIONAL
+#
+# Omit observe_url for a fetch-only peer - see the note at the top. It is
+# not an oversight and the module will not complain about it; /x/mutual/peers
+# reports the direction for each so it is visible rather than assumed.
+PEERS = [
+    {
+        "name": "red-flag-ai-pro",
+        "tip_url": "https://www.redflagaipro.com/api/witness/tip",
+        "observe_url": "https://www.redflagaipro.com/api/witness/anchor",
+    },
+    {
+        # Simon. Serves a static JSON file regenerated on his side, and
+        # pushes to us on his own systemd timer at :23. Nothing to POST to.
+        "name": "flavorflowstrategy.uk",
+        "tip_url": "https://www.flavorflowstrategy.uk/witness.json",
+    },
+    {
+        # PRAXIS / Praesidium, chain 4. Read-only, hash-only, currently
+        # SYNTHETIC_STAGING and regenerating every ten minutes, so expect
+        # liveness "live" rather than "self-consistent" - the tip moves
+        # between their generating it and our fetching it. That is the
+        # normal case for a working chain, not a failure.
+        #
+        # Their outbound submission lane is deliberately closed through
+        # staging, so no observe_url. They also run a signed lane at
+        # /x/peer/submit under peer_id praesidium when they are ready.
+        "name": "praesidium",
+        "tip_url": "https://chain4.thepraesidium.ai/api/witness/tip",
+    },
 ]
 
-SELF = {
-    "spec": "ai-integrity-declaration",
-    "version": "1.0.3",
-    "organisation": "Monop Content",
-    "system": "sebbi.pro",
-    "claimed_level": "L3_ANCHORED",
-    "chain": {
-        "walk_endpoint": "https://sebbi.pro/x/walk/blocks",
-        "genesis_hash": "534f9e5cefb1a48566674911262151f34eedc1e6840a094d9465af4d846972c6",
-        "seal_method_url": "https://sebbi.pro/x/walk/spec",
-    },
-    "personal_data_hashing": "Customer decisions are never published. Blocks sealed under a customer key, from non-public sources, or carrying anything secret-shaped are served without payload; only their hash and link are public.",
-    "witnesses": SELF_WITNESSES,
-    "collusion_threshold": 1,
-    "collusion_note": "One: only witnesses a machine can verify are counted. Other chains witness sebbi.pro but do not yet publish a list the checker can read, so they are not counted.",
-    "held_for_others": "https://sebbi.pro/x/held/peers",
-    "anchor": {
-        "method": "OpenTimestamps on Bitcoin",
-        "proof_endpoint": "https://sebbi.pro/x/ots/latest_confirmed",
-        "status_url": "https://sebbi.pro/x/ots/status",
-        "note": "Tips are stamped hourly. proof_endpoint always serves the newest proof that is confirmed in Bitcoin and whose tip is a block in the current chain. Anchoring is not claimed until the checker verifies it.",
-    },
-    "oversight": {
-        "commit_before_reveal": True,
-        "demonstration": "https://sebbi.pro/x/demo/review",
-        "anti_rubber_stamp": {"minimum_review_seconds": 1.5,
-                              "maximum_agreement_rate": 0.98},
-    },
-    "discontinuities": [
-        {"date": "2026-09-07", "disclosure_block": 2013, "kind": "chain_reset",
-         "detail": "The chain restarted from genesis. The reset is sealed in block 2013; block indexes quoted before that date belong to the earlier chain."},
-    ],
-    "known_gaps": [
-        "Availability: every level answers 'has this been altered', none yet answers 'will this still be served'. A reader currently depends on sebbi.pro continuing to serve these endpoints.",
-        "Anchoring: tips are stamped to Bitcoin hourly and confirm a few hours later, so the newest hour or so rests on witnessing until its proof confirms.",
-    ],
+# Field names to send when pushing our tip. If a peer wants different
+# names, give that peer its own "keys" dict and it will be used instead.
+DEFAULT_PUSH_KEYS = {
+    "chain": "chain",
+    "tip": "tip",
+    "count": "count",
+    "ts": "ts",
+    "url": "url",
 }
 
-# ---------------------------------------------------------------- safe fetching
+# Where peers can read our tip, included in what we push.
+OUR_PUBLIC_URL = "https://sebbi.pro/x/witness/tip"
 
-FETCH_TIMEOUT = 8
-MAX_DECL_BYTES = 262144
-MAX_PAGE_BYTES = 8 * 1024 * 1024
-MAX_FETCHES = 45
-WALK_PAGE = 500
-WALK_MAX_BLOCKS = 20000
-CHECK_BUDGET_SECONDS = 60
-CACHE_SECONDS = 600
-USER_AGENT = "sebbi-integrity-checker/1.4.4 (+https://sebbi.pro/x/integrity/status)"
+# Background timer. Set ENABLED to False if you would rather drive it
+# yourself by hitting /x/mutual/sync.
+AUTO_SYNC_ENABLED = True
+AUTO_SYNC_SECONDS = 3600
 
-_HOST_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
-_BLOCKED_SUFFIXES = (".local", ".internal", ".localhost", ".lan", ".home",
-                     ".corp", ".intranet", ".arpa")
+TIMEOUT_SECONDS = 20
 
-_cache = {}
-_cache_lock = threading.Lock()
-_running = threading.BoundedSemaphore(2)
+# How many peers we talk to at once. Above this they queue, which is fine -
+# it stops a large network spawning a thread per peer. Eight slow peers at
+# 20s each still finishes in 20s; forty finishes in about a minute worst
+# case, and only if every one of them times out.
+MAX_PARALLEL_PEERS = 8
 
+# ----------------------------------------------------------------------
+# state - deliberately in memory only, this is not evidence
+# ----------------------------------------------------------------------
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        raise urllib.error.HTTPError(req.full_url, code,
-                                     "redirect refused", headers, fp)
-
-
-_OPENER = urllib.request.build_opener(_NoRedirect)
-
-
-class _Budget(object):
-    def __init__(self):
-        self.fetches = 0
-        self.deadline = time.time() + CHECK_BUDGET_SECONDS
-
-    def spend(self):
-        self.fetches += 1
-        if self.fetches > MAX_FETCHES:
-            raise RuntimeError("fetch limit reached")
-        if time.time() > self.deadline:
-            raise RuntimeError("time limit reached")
+_state = {
+    "last_run": None,
+    "last_result": None,
+    "runs": 0,
+    "timer_started": False,
+}
+_lock = threading.Lock()
 
 
-def _clean_domain(raw):
-    d = str(raw or "").strip().lower()
-    d = re.sub(r"^[a-z]+://", "", d)
-    d = d.split("/")[0].split("?")[0].split("#")[0]
-    if "@" in d or ":" in d:
-        return None
-    d = d.rstrip(".")
-    if not _HOST_RE.match(d):
-        return None
-    if d == "localhost" or d.endswith(_BLOCKED_SUFFIXES):
-        return None
-    return d
+def _now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def _host_is_public(host):
+def _reply(payload, status=200):
+    """The router expects (payload, status) back from handle()."""
+    return payload, status
+
+
+def _in_parallel(function, items):
+    """Run function over items concurrently, preserving input order.
+
+    Used only for calls that leave our server. Anything hitting our own
+    process goes through a plain loop instead - see the note at the top.
+    """
+    if not items:
+        return []
+    if len(items) == 1:
+        return [function(items[0])]
+    workers = min(len(items), MAX_PARALLEL_PEERS)
+    with ThreadPoolExecutor(max_workers=workers,
+                            thread_name_prefix="mutual-peer") as pool:
+        return list(pool.map(function, items))
+
+
+# ----------------------------------------------------------------------
+# http
+# ----------------------------------------------------------------------
+
+def _http(url, payload=None):
+    """POST if payload given, else GET. Returns (status, parsed_or_text)."""
+    data = None
+    headers = {"Accept": "application/json",
+               "User-Agent": "aileash-mutual/%s" % VERSION}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=data, headers=headers)
     try:
-        infos = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
-    except Exception:
-        return False, "does not resolve"
-    if not infos:
-        return False, "does not resolve"
-    for info in infos:
-        try:
-            ip = ipaddress.ip_address(info[4][0])
-        except ValueError:
-            return False, "unreadable address"
-        if (ip.is_private or ip.is_loopback or ip.is_link_local or
-                ip.is_reserved or ip.is_multicast or ip.is_unspecified):
-            return False, "resolves to a non-public address"
-    return True, None
-
-
-def _safe_url(url):
-    try:
-        p = urllib.parse.urlsplit(str(url))
-    except Exception:
-        return None, "unreadable address"
-    if p.scheme != "https":
-        return None, "only https addresses are fetched"
-    if p.port not in (None, 443):
-        return None, "only port 443 is fetched"
-    if p.username or p.password:
-        return None, "addresses with credentials are refused"
-    host = _clean_domain(p.hostname or "")
-    if not host:
-        return None, "not a public domain name"
-    ok, why = _host_is_public(host)
-    if not ok:
-        return None, why
-    return urllib.parse.urlunsplit(("https", host, p.path or "/", p.query, "")), None
-
-
-def _fetch_raw(url, budget, max_bytes=MAX_DECL_BYTES, accept="application/json"):
-    """Returns (bytes, error). Never raises."""
-    safe, why = _safe_url(url)
-    if not safe:
-        return None, why
-    try:
-        budget.spend()
-    except RuntimeError as exc:
-        return None, str(exc)
-    req = urllib.request.Request(safe, headers={
-        "User-Agent": USER_AGENT, "Accept": accept})
-    try:
-        with _OPENER.open(req, timeout=FETCH_TIMEOUT) as resp:
-            raw = resp.read(max_bytes + 1)
+        with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
+            body = response.read().decode("utf-8", "replace")
+            status = response.getcode()
     except urllib.error.HTTPError as exc:
-        return None, "HTTP %s" % exc.code
-    except Exception as exc:
-        return None, "could not fetch (%s)" % exc.__class__.__name__
-    if len(raw) > max_bytes:
-        return None, "response too large"
-    return raw, None
-
-
-def _fetch_json(url, budget, max_bytes=MAX_DECL_BYTES, allow_text=False):
-    """Returns (data, error). Never raises.
-
-    allow_text: if the response is not JSON (an ordinary web page), return
-    {"_text": <page text>} instead of an error, so a witness can publish its
-    record as a normal page."""
-    raw, err = _fetch_raw(url, budget, max_bytes)
-    if err:
-        return None, err
-    text = raw.decode("utf-8", "replace")
-    try:
-        return json.loads(text), None
-    except Exception:
-        if allow_text:
-            return {"_text": text}, None
-        return None, "not valid JSON"
-
-
-# ---------------------------------------------------------------- checks
-
-_HEX64 = re.compile(r"(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])")
-WITNESS_MAX_BYTES = 2 * 1024 * 1024
-_SECRET_SHAPES = [
-    ("api key", re.compile(r"\b(?:al|sb|se)_live_[0-9a-f]{16,}")),
-    ("api key", re.compile(r"\bsk-[A-Za-z0-9_-]{20,}")),
-    ("cloud key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
-    ("access token", re.compile(r"\b(?:ghp|gho|xox[abp])[_-][A-Za-z0-9-]{10,}")),
-    ("private key", re.compile(r"BEGIN [A-Z ]*PRIVATE KEY")),
-    ("email address", re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")),
-]
-
-
-_ZERO64 = "0" * 64
-BACKFILL_HOURS = 6
-
-_RULE_RE = re.compile(
-    r"createdAt\s*-\s*rangeEnd\s*(>=|>)\s*([0-9]+(?:\.[0-9]+)?)\s*"
-    r"(hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b", re.I)
-
-
-def _parse_rule(text):
-    """'createdAt - rangeEnd > 2 hours' -> (op, seconds) or None."""
-    m = _RULE_RE.search(str(text or ""))
-    if not m:
-        return None
-    n = float(m.group(2))
-    unit = m.group(3).lower()
-    mult = 3600 if unit.startswith("h") else 60 if unit.startswith("m") else 1
-    return m.group(1), n * mult
-
-
-def _recount(meta, op, seconds):
-    count, through = 0, None
-    for seq in sorted(meta):
-        cp = meta[seq]
-        c, r = _iso_ts(cp.get("createdAt")), _iso_ts(cp.get("rangeEnd"))
-        if c is None or r is None:
-            continue
-        lag = c - r
-        if (lag >= seconds) if op == ">=" else (lag > seconds):
-            count += 1
-            through = seq
-    return count, through
-
-
-def _iso_ts(v):
-    try:
-        return time.mktime(time.strptime(str(v)[:19], "%Y-%m-%dT%H:%M:%S")) \
-            - time.timezone
-    except Exception:
-        return None
-
-
-def _walk(endpoint, budget):
-    """Walk a declared chain and recompute it.
-
-    Two published formats are understood:
-      blocks       the sebbi.pro walk format (https://sebbi.pro/x/walk/spec)
-      checkpoints  the MIR checkpoint format (seq/tip/prevTip, newest first)
-    The format is detected from what the endpoint serves, never assumed."""
-    first, err = _fetch_json(endpoint, budget, MAX_PAGE_BYTES)
-    if err:
-        out = _empty_walk(endpoint)
-        out["first_problem"] = "could not read walk endpoint: %s" % err
-        return out, {}, {}, {}
-    if isinstance(first, dict) and isinstance(first.get("checkpoints"), list):
-        return _walk_checkpoints(endpoint, first, budget)
-    if isinstance(first, dict) and isinstance(first.get("blocks"), list):
-        return _walk_blocks(endpoint, budget)
-    out = _empty_walk(endpoint)
-    out["first_problem"] = ("endpoint serves neither the blocks nor the "
-                            "checkpoints walk format")
-    return out, {}, {}, {}
-
-
-def _empty_walk(endpoint):
-    return {"endpoint": endpoint, "format": None, "blocks": 0,
-            "public_recomputed": 0, "withheld_linkage_only": 0,
-            "complete": False, "genesis_prev_is_GENESIS": None,
-            "first_problem": None, "tip": None}
-
-
-def _walk_blocks(endpoint, budget):
-    out = _empty_walk(endpoint)
-    out["format"] = "blocks"
-    hashes = {}
-    public_text = {}
-    prev = "GENESIS"
-    after = 0
-    base = endpoint.split("?")[0]
-    while True:
-        url = "%s?after=%d&limit=%d" % (base, after, WALK_PAGE)
-        page, err = _fetch_json(url, budget, MAX_PAGE_BYTES)
-        if err:
-            out["first_problem"] = out["first_problem"] or (
-                "could not read page after block %d: %s" % (after, err))
-            break
-        blocks = page.get("blocks") if isinstance(page, dict) else None
-        if not isinstance(blocks, list):
-            out["first_problem"] = "endpoint does not serve the walk format"
-            break
-        if after == 0:
-            first_prev = page.get("previous_audit_hash")
-            out["genesis_prev_is_GENESIS"] = (first_prev == "GENESIS")
-        for b in blocks:
-            idx = b.get("block_index")
-            h = str(b.get("audit_hash") or "")
-            if "preimage" in b:
-                pre = b.get("preimage")
-                if not isinstance(pre, str) or \
-                        hashlib.sha256(pre.encode("utf-8")).hexdigest() != h:
-                    out["first_problem"] = out["first_problem"] or (
-                        "block %s does not recompute" % idx)
-                try:
-                    stated_prev = json.loads(pre).get("prev_hash")
-                except Exception:
-                    stated_prev = None
-                out["public_recomputed"] += 1
-                public_text[idx] = pre
-            else:
-                stated_prev = b.get("prev_hash")
-                out["withheld_linkage_only"] += 1
-            if stated_prev != prev:
-                out["first_problem"] = out["first_problem"] or (
-                    "block %s does not link to the block before it" % idx)
-            prev = h
-            hashes[h] = idx
-            out["blocks"] += 1
-        if out["blocks"] >= WALK_MAX_BLOCKS:
-            out["first_problem"] = out["first_problem"] or (
-                "stopped at %d blocks; the checker walks at most %d"
-                % (out["blocks"], WALK_MAX_BLOCKS))
-            break
-        if not page.get("has_more"):
-            out["complete"] = True
-            break
-        nxt = page.get("next_after")
-        if not isinstance(nxt, int) or nxt <= after:
-            out["first_problem"] = out["first_problem"] or "paging did not advance"
-            break
-        after = nxt
-    out["tip"] = prev if out["blocks"] else None
-    return out, hashes, public_text, {}
-
-
-def _walk_checkpoints(endpoint, first, budget):
-    """MIR format: tip = sha256(seq:rangeStart:rangeEnd:eventCount:
-    merkleRoot:prevTip), newest first, paged backwards with beforeSeq."""
-    out = _empty_walk(endpoint)
-    out["format"] = "checkpoints"
-    base = endpoint.split("?")[0]
-    q = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(endpoint).query))
-    limit = q.get("limit", "200")
-    rows = {}
-    page = first
-    while True:
-        cps = page.get("checkpoints") if isinstance(page, dict) else None
-        if not isinstance(cps, list) or not cps:
-            break
-        for cp in cps:
-            try:
-                rows[int(cp.get("seq"))] = cp
-            except (TypeError, ValueError):
-                out["first_problem"] = out["first_problem"] or \
-                    "a checkpoint has no readable seq"
-        lowest = min(int(c.get("seq")) for c in cps
-                     if str(c.get("seq", "")).lstrip("-").isdigit())
-        if lowest <= 0:
-            break
-        if len(rows) >= WALK_MAX_BLOCKS:
-            out["first_problem"] = out["first_problem"] or (
-                "stopped at %d checkpoints; the checker walks at most %d"
-                % (len(rows), WALK_MAX_BLOCKS))
-            break
-        url = "%s?limit=%s&beforeSeq=%d" % (base, limit, lowest)
-        page, err = _fetch_json(url, budget, MAX_PAGE_BYTES)
-        if err:
-            out["first_problem"] = out["first_problem"] or (
-                "could not read page before seq %d: %s" % (lowest, err))
-            break
-
-    hashes, public_text, meta = {}, {}, {}
-    backfilled, backfill_through = 0, None
-    prev = _ZERO64
-    seqs = sorted(rows)
-    if seqs and seqs[0] != 0:
-        out["first_problem"] = out["first_problem"] or \
-            "walk did not reach genesis (seq 0)"
-    for n, seq in enumerate(seqs):
-        cp = rows[seq]
-        if n and seq != seqs[n - 1] + 1:
-            out["first_problem"] = out["first_problem"] or \
-                "gap in seq before %d" % seq
-        tip = str(cp.get("tip") or "").lower()
-        pre = ":".join([str(seq), str(cp.get("rangeStart")),
-                        str(cp.get("rangeEnd")), str(cp.get("eventCount")),
-                        str(cp.get("merkleRoot")), str(cp.get("prevTip"))])
-        if hashlib.sha256(pre.encode("utf-8")).hexdigest() != tip:
-            out["first_problem"] = out["first_problem"] or \
-                "checkpoint %d does not recompute" % seq
-        if str(cp.get("prevTip") or "").lower() != prev:
-            out["first_problem"] = out["first_problem"] or \
-                "checkpoint %d does not link to the one before it" % seq
-        if seq == 0:
-            out["genesis_prev_is_GENESIS"] = \
-                (str(cp.get("prevTip") or "") == _ZERO64)
-        created, rend = _iso_ts(cp.get("createdAt")), _iso_ts(cp.get("rangeEnd"))
-        if created is not None and rend is not None and \
-                created - rend > BACKFILL_HOURS * 3600:
-            backfilled += 1
-            backfill_through = seq
-        prev = tip
-        hashes[tip] = seq
-        public_text[seq] = json.dumps(cp, sort_keys=True)
-        meta[seq] = cp
-        out["public_recomputed"] += 1
-        out["blocks"] += 1
-    out["complete"] = bool(seqs) and seqs[0] == 0 and not out["first_problem"]
-    out["tip"] = prev if seqs else None
-    out["backfill_detected"] = {
-        "checkpoints": backfilled, "through_seq": backfill_through,
-        "rule": "checker default: sealed more than %d hours after the window "
-                "it covers" % BACKFILL_HOURS,
-        "note": "Where the declaration states its own detection_rule, the "
-                "count under that rule is in INV-007."}
-    return out, hashes, public_text, meta
-
-
-def _hex_values(obj, found=None):
-    found = found if found is not None else set()
-    if isinstance(obj, dict):
-        for v in obj.values():
-            _hex_values(v, found)
-    elif isinstance(obj, list):
-        for v in obj:
-            _hex_values(v, found)
-    elif isinstance(obj, str):
-        for m in _HEX64.findall(obj.lower()):
-            found.add(m)
-    return found
-
-
-def _anchor_check(proof_endpoint, hashes, budget, meta=None):
-    if not proof_endpoint:
-        return "fail", "no anchor proof address declared"
-    tip, raw = None, None
-    if "{seq}" in proof_endpoint:
-        done = [sq for sq, cp in (meta or {}).items()
-                if str(cp.get("otsStatus")) in ("upgraded", "confirmed")]
-        if not done:
-            return "fail", "no checkpoint is marked as anchored"
-        seq = max(done)
-        tip = str(meta[seq].get("tip") or "").lower()
-        raw, err = _fetch_raw(proof_endpoint.replace("{seq}", str(seq)),
-                              budget, MAX_DECL_BYTES, "*/*")
-        if err:
-            return "fail", "could not read anchor proof: %s" % err
-        if raw[:1] in (b"{", b"["):
-            try:
-                data = json.loads(raw.decode("utf-8"))
-                import base64
-                raw = base64.b64decode(data.get("ots_base64") or "")
-            except Exception:
-                return "fail", "anchor proof could not be read"
-    else:
-        data, err = _fetch_json(proof_endpoint, budget)
-        if err:
-            return "fail", "could not read anchor proof: %s" % err
-        tip = str(data.get("tip") or "").lower() if isinstance(data, dict) else ""
-        b64 = data.get("ots_base64") if isinstance(data, dict) else None
-        if not b64:
-            return "fail", "no proof bytes served (expected ots_base64)"
-        import base64
         try:
-            raw = base64.b64decode(b64)
+            body = exc.read().decode("utf-8", "replace")
         except Exception:
-            return "fail", "anchor proof could not be read"
-    if not tip or tip not in hashes:
-        return "fail", "the anchored tip is not in the walked chain"
+            body = ""
+        status = exc.code
+    except urllib.error.URLError as exc:
+        return 0, "unreachable: %s" % exc.reason
+    except Exception as exc:
+        return 0, "failed: %s" % exc
     try:
-        from opentimestamps.core.serialize import BytesDeserializationContext
-        from opentimestamps.core.timestamp import DetachedTimestampFile
-        from opentimestamps.core.notary import BitcoinBlockHeaderAttestation
-    except Exception:
-        return "untested", "proof reader not available on this checker"
-    try:
-        det = DetachedTimestampFile.deserialize(BytesDeserializationContext(raw))
-    except Exception:
-        return "fail", "anchor proof could not be read"
-    tb = bytes.fromhex(tip)
-    candidates = (hashlib.sha256(tb).digest(), tb,
-                  hashlib.sha256(tip.encode("ascii")).digest())
-    if det.file_digest not in candidates:
-        return "fail", "anchor proof is for a different value than the tip it names"
-    heights = []
-
-    def walk(ts):
-        for att in ts.attestations:
-            if isinstance(att, BitcoinBlockHeaderAttestation):
-                heights.append(att.height)
-        for _, sub in ts.ops.items():
-            walk(sub)
-    try:
-        walk(det.timestamp)
-    except Exception:
-        return "fail", "anchor proof could not be walked"
-    if not heights:
-        return "fail", "anchor proof is still pending, not yet in Bitcoin"
-    return "pass", ("proof commits a chain tip to Bitcoin block %s; the block "
-                    "header itself is not re-checked here - run ots verify "
-                    "to confirm against Bitcoin" % min(heights))
+        return status, json.loads(body)
+    except ValueError:
+        return status, body
 
 
-def _is_declaration(data):
-    spec = str(data.get("spec") or "")
-    return spec == "ai-integrity-declaration" or \
-        spec.rstrip("/").endswith("/x/integrity/declaration")
+# Field names a tip can arrive under. Different implementations name it
+# differently and being strict about a name we never published is a bug in
+# the receiver, not in the peer. Order is preference, not importance.
+TIP_FIELDS = ("tip", "hash", "head", "tip_sha256", "root", "current_tip",
+              "chain_tip", "latest")
+
+HEIGHT_FIELDS = ("height", "count", "entries", "tree_size", "size")
 
 
-def _witness_strength(data, held, budget):
-    """sealed / bound / listed - how the witness binds its record."""
-    rows = []
-    if isinstance(data, dict):
-        for key in ("tips", "held", "observations", "entries"):
-            if isinstance(data.get(key), list):
-                rows = data[key]
-                break
-    row = None
-    for r in rows:
-        if isinstance(r, dict) and \
-                str(r.get("peer_tip") or r.get("tip") or "").lower() in held:
-            row = r
+def _extract_tip(body):
+    """Pull (tip, height) out of whatever shape a tip route returns."""
+    if not isinstance(body, dict):
+        return None, None
+    tip = None
+    for field in TIP_FIELDS:
+        value = body.get(field)
+        if isinstance(value, str) and value.strip():
+            tip = value.strip()
             break
-    if row is None:
-        return {"grade": "listed",
-                "why": "tip found on the witness's page; no binding record read"}
-    tip = str(row.get("peer_tip") or row.get("tip") or "").lower()
-    blk_url, blk_hash = row.get("check_block"), row.get("sealed_block_hash")
-    if blk_url and blk_hash:
-        page, err = _fetch_json(blk_url, budget)
-        blk = page.get("block") if isinstance(page, dict) else None
-        pre = blk.get("preimage") if isinstance(blk, dict) else None
-        if isinstance(pre, str) and tip in pre.lower() and \
-                hashlib.sha256(pre.encode("utf-8")).hexdigest() == \
-                str(blk_hash).lower():
-            return {"grade": "sealed",
-                    "why": "the witness's own block was recomputed and "
-                           "contains the tip",
-                    "witness_block": blk_url}
-        return {"grade": "listed",
-                "why": "a sealed block was claimed but could not be "
-                       "recomputed here (%s)" % (err or "mismatch")}
-    if row.get("our_tip_at_observation") or row.get("witness_tip_at_observation"):
-        return {"grade": "bound",
-                "why": "recorded against a position in the witness's own "
-                       "anchored chain; dated, not sealed"}
-    return {"grade": "listed",
-            "why": "published with nothing binding it in the witness's chain"}
-
-
-_ORDER = ["L0_DIARY", "L1_SEALED", "L2_WITNESSED", "L3_ANCHORED",
-          "L4_OVERSIGHT_VERIFIED"]
-
-
-def _check(domain):
-    budget = _Budget()
-    result = {"domain": domain, "checked_at": time.strftime(
-        "%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "checker_version": VERSION,
-        "standard": BASE + "declaration"}
-
-    decl, found_at, tried = None, None, []
-    for path in DECLARATION["discovery"]["paths"]:
-        url = "https://%s%s" % (domain, path)
-        data, err = _fetch_json(url, budget)
-        tried.append({"url": url, "result": err or "found"})
-        if data is not None and isinstance(data, dict) and \
-                _is_declaration(data):
-            decl, found_at = data, url
+    height = None
+    for field in HEIGHT_FIELDS:
+        if field in body:
+            height = body.get(field)
             break
-        if data is not None and not err:
-            tried[-1]["result"] = "not an ai-integrity-declaration"
-    result["looked_at"] = tried
+    return tip, height
 
-    if decl is None:
-        result.update({
-            "verified_level": "L0_DIARY", "badge": "GREY",
-            "verdict": "No declaration found. Under the standard, silence is "
-                       "a rating: L0_DIARY, the operator's word is the only "
-                       "evidence.",
-            "how_to_improve": "Publish a declaration at https://%s/.well-known/"
-                              "ai-integrity.json using the declaration_template "
-                              "in %s" % (domain, BASE + "declaration")})
-        return result
 
-    result["declaration_url"] = found_at
-    result["declaration_sha256"] = hashlib.sha256(json.dumps(
-        decl, sort_keys=True, separators=(",", ":"),
-        ensure_ascii=False).encode("utf-8")).hexdigest()
-    claimed = str(decl.get("claimed_level") or "")
-    result["claimed_level"] = claimed or None
-    checks = {}
+# ----------------------------------------------------------------------
+# the two directions
+# ----------------------------------------------------------------------
 
-    # INV-001 and INV-007 need the chain.
-    chain = decl.get("chain") or {}
-    endpoint = chain.get("walk_endpoint")
-    hashes, public_text, walk, meta = {}, {}, None, {}
-    if not endpoint:
-        checks["INV-001"] = {"result": "fail", "why": "no walk_endpoint declared"}
-    else:
-        walk, hashes, public_text, meta = _walk(endpoint, budget)
-        ok = (walk["complete"] and walk["blocks"] > 0 and
-              walk["genesis_prev_is_GENESIS"] and not walk["first_problem"])
-        genesis_ok = True
-        declared_genesis = str(chain.get("genesis_hash") or "").lower()
-        if declared_genesis and hashes:
-            first = min(hashes.items(), key=lambda kv: kv[1] if isinstance(kv[1], int) else 0)
-            genesis_ok = (first[0] == declared_genesis)
-        checks["INV-001"] = {
-            "result": "pass" if (ok and genesis_ok) else "fail",
-            "why": walk["first_problem"] or (
-                None if genesis_ok else "declared genesis_hash is not the first block"),
-            "walk": walk}
+def our_tip():
+    status, body = _http(OUR_TIP_URL)
+    if status != 200:
+        return None, None, "our own tip route answered %s: %s" % (status, str(body)[:200])
+    tip, height = _extract_tip(body)
+    if not tip:
+        return None, None, "no tip field in our own reply: %s" % str(body)[:200]
+    return tip, height, None
 
-    # INV-002: no secret-shaped or personal values in public blocks.
-    hits = []
-    for idx, text in public_text.items():
-        for label, rx in _SECRET_SHAPES:
-            if rx.search(text):
-                hits.append({"block_index": idx, "found": label})
-                break
-        if len(hits) >= 10:
-            break
-    if not decl.get("personal_data_hashing"):
-        checks["INV-002"] = {"result": "fail",
-                             "why": "personal_data_hashing not declared"}
-    elif not public_text:
-        checks["INV-002"] = {"result": "fail",
-                             "why": "no public records to inspect"}
-    elif hits:
-        checks["INV-002"] = {"result": "fail",
-                             "why": "public blocks contain values that look "
-                                    "personal or secret (values not repeated here)",
-                             "blocks": hits}
-    else:
-        checks["INV-002"] = {"result": "pass",
-                             "why": "%d public blocks inspected; nothing "
-                                    "personal or secret-shaped found"
-                                    % len(public_text)}
 
-    # INV-007: every discontinuity is disclosed - sealed in the chain, or
-    # declared with the evidence to detect it - and anything the checker
-    # can detect for itself must have been declared.
-    discs = decl.get("discontinuities") or []
-    missing, sealed, declared = [], 0, []
-    for disc in discs:
-        if not isinstance(disc, dict):
-            missing.append(str(disc))
-            continue
-        blk = disc.get("disclosure_block")
-        if blk not in (None, ""):
-            try:
-                blk = int(blk)
-            except (TypeError, ValueError):
-                missing.append(str(blk))
-                continue
-            if blk in public_text:
-                sealed += 1
-            else:
-                missing.append(str(blk))
-        elif disc.get("kind") and disc.get("detail"):
-            declared.append(str(disc.get("kind")))
-        else:
-            missing.append("an entry with neither a disclosure_block nor kind and detail")
-    undisclosed = None
-    bf = (walk or {}).get("backfill_detected") or {}
-    if bf.get("checkpoints"):
-        claimed_bf = [d for d in discs if isinstance(d, dict) and
-                      "backfill" in str(d.get("kind", "")).lower()]
-        if not claimed_bf:
-            undisclosed = ("%d checkpoints were sealed long after the window "
-                           "they cover, and no backfill is declared"
-                           % bf["checkpoints"])
-    if checks["INV-001"]["result"] != "pass":
-        checks["INV-007"] = {"result": "fail", "why": "chain could not be verified"}
-    elif missing:
-        checks["INV-007"] = {"result": "fail",
-                             "why": "declared disclosures not found: %s"
-                                    % ", ".join(missing)}
-    elif undisclosed:
-        checks["INV-007"] = {"result": "fail", "why": undisclosed}
-    else:
-        parts = []
-        if sealed:
-            parts.append("%d sealed in the chain" % sealed)
-        if declared:
-            parts.append("%d declared with detection evidence (%s)"
-                         % (len(declared), ", ".join(declared)))
-        checks["INV-007"] = {
-            "result": "pass",
-            "why": ("discontinuities disclosed: " + "; ".join(parts))
-                   if parts else "no discontinuities declared, and none detected"}
-        checker_default = None
-        if bf.get("checkpoints"):
-            checker_default = {
-                "backfilled_checkpoints": bf["checkpoints"],
-                "through_seq": bf["through_seq"],
-                "rule": str(bf.get("rule")),
-                "note": "The checker's own threshold, used only when no rule "
-                        "is declared. Shown for comparison."}
-        recounts = []
-        for d in discs:
-            if not isinstance(d, dict) or \
-                    "backfill" not in str(d.get("kind", "")).lower():
-                continue
-            rule_text = d.get("detection_rule") or d.get("detectionRule")
-            entry = {"kind": d.get("kind"), "declared_rule": rule_text,
-                     "declared_count": d.get("checkpoints") or d.get("count"),
-                     "declared_through_seq": d.get("through_seq")}
-            parsed = _parse_rule(rule_text) if rule_text else None
-            if not rule_text:
-                entry["result"] = "rule_missing"
-                entry["note"] = ("No detection_rule declared. Reported in "
-                                 "1.0.3; from 1.1.0 this fails.")
-            elif not parsed or not meta:
-                entry["result"] = "rule_unreadable"
-                entry["note"] = ("The declared rule could not be applied "
-                                 "automatically. Reported, not failed.")
-            else:
-                n, through = _recount(meta, parsed[0], parsed[1])
-                entry["recounted_under_declared_rule"] = n
-                entry["recounted_through_seq"] = through
-                try:
-                    ok = int(entry["declared_count"]) == n
-                except (TypeError, ValueError):
-                    ok = None
-                entry["reproduces"] = ok
-                entry["result"] = ("reproduced" if ok else
-                                   "differs" if ok is False else "recounted")
-            recounts.append(entry)
-        applied = [r for r in recounts
-                   if r.get("result") in ("reproduced", "differs", "recounted")]
-        if applied:
-            a = applied[0]
-            checks["INV-007"]["independently_detected"] = {
-                "backfilled_checkpoints": a.get("recounted_under_declared_rule"),
-                "through_seq": a.get("recounted_through_seq"),
-                "rule": "declared: " + str(a.get("declared_rule")),
-                "reproduces_declared_count": a.get("reproduces"),
-                "note": "Recounted by the checker from createdAt against "
-                        "rangeEnd, under the rule the declaration states. "
-                        "Nothing taken on trust."}
-            if checker_default:
-                checks["INV-007"]["checker_default_for_comparison"] = checker_default
-        elif checker_default:
-            checks["INV-007"]["independently_detected"] = checker_default
-        if recounts:
-            checks["INV-007"]["detection_rule_recount"] = recounts
+def push_one(peer, tip, height):
+    """Hand our tip to one peer so they record it. Outbound only.
 
-    # INV-003: at least one declared witness holds a tip that is in our chain.
-    witnesses = decl.get("witnesses") or []
-    witness_results = []
-    for w in witnesses[:5]:
-        if not isinstance(w, dict) or not w.get("tip_endpoint"):
-            continue
-        data, err = _fetch_json(w.get("tip_endpoint"), budget,
-                                WITNESS_MAX_BYTES, allow_text=True)
-        if err:
-            witness_results.append({"name": w.get("name"), "result": "fail",
-                                    "why": err})
-            continue
-        held = _hex_values(data) & set(hashes.keys())
-        entry = {
-            "name": w.get("name"),
-            "url": w.get("tip_endpoint"),
-            "result": "pass" if held else "fail",
-            "why": "publishes %d hash(es) that are blocks in the chain"
-                   % len(held) if held else
-                   "published no value found in the chain"}
-        if held:
-            entry["matched_blocks"] = sorted(
-                hashes[h] for h in held if isinstance(hashes.get(h), int))[-5:]
-            entry["witness_strength"] = _witness_strength(data, held, budget)
-        witness_results.append(entry)
-    if any(r["result"] == "pass" for r in witness_results):
-        checks["INV-003"] = {"result": "pass", "witnesses": witness_results,
-                             "collusion_threshold_declared":
-                                 decl.get("collusion_threshold"),
-                             "note": "Independence of each witness is as "
-                                     "declared; the checker confirms they "
-                                     "hold the tip, not who runs them."}
-    else:
-        checks["INV-003"] = {"result": "fail",
-                             "why": "no declared witness confirmed a tip in "
-                                    "the chain" if witness_results else
-                                    "no witnesses declared",
-                             "witnesses": witness_results}
+    A peer with no observe_url is fetch-only by configuration. Say so and
+    move on rather than treating it as a failure - and never index the key
+    blindly, which is what 1.1 did.
+    """
+    observe_url = peer.get("observe_url")
+    if not observe_url:
+        return {
+            "peer": peer["name"],
+            "direction": "push",
+            "skipped": True,
+            "ok": True,
+            "reason": "fetch-only peer - no observe_url configured",
+            "note": ("We read and seal their tip. They do not accept a push, "
+                     "either because their outbound lane is closed or because "
+                     "their tip is a static file. Not an error."),
+        }
 
-    # INV-004: an anchor proof committing a chain tip to Bitcoin.
-    anchor = decl.get("anchor") or {}
-    res, why = _anchor_check(anchor.get("proof_endpoint"), hashes, budget, meta)
-    checks["INV-004"] = {"result": res, "why": why}
-
-    # INV-005 / INV-006 cannot be tested from outside yet.
-    for inv in ("INV-005", "INV-006"):
-        checks[inv] = {"result": "untested",
-                       "why": "human-oversight checks cannot yet be tested "
-                              "from outside; this checker never awards L4"}
-
-    level = "L0_DIARY"
-    for name in _ORDER[1:]:
-        needs = [r.split("-")[0] + "-" + r.split("-")[1]
-                 for r in DECLARATION["levels"][name]["requires"]]
-        if all(checks.get(n, {}).get("result") == "pass" for n in needs):
-            level = name
-        else:
-            break
-
-    if decl.get("known_gaps"):
-        result["known_gaps_declared"] = decl.get("known_gaps")
-    result["checks"] = checks
-    result["verified_level"] = level
-    result["badge"] = DECLARATION["levels"][level]["badge"]
-    if claimed in _ORDER and _ORDER.index(claimed) > _ORDER.index(level):
-        result["verdict"] = "OVERCLAIMED: declares %s, verifies as %s." % (claimed, level)
-        result["overclaimed"] = True
-    else:
-        result["verdict"] = "Verifies as %s." % level
-        result["overclaimed"] = False
-    result["rule"] = ("Nothing in the declaration was taken on trust. Every "
-                      "pass above was recomputed or fetched by this checker.")
+    keys = peer.get("keys", DEFAULT_PUSH_KEYS)
+    values = {
+        "chain": OUR_CHAIN_NAME,
+        "tip": tip,
+        "count": height,
+        "ts": _now(),
+        "url": OUR_PUBLIC_URL,
+    }
+    payload = {keys.get(k, k): v for k, v in values.items()}
+    status, body = _http(observe_url, payload)
+    result = {
+        "peer": peer["name"],
+        "direction": "push",
+        "url": observe_url,
+        "http": status,
+        "ok": 200 <= status < 300,
+        "response": body if isinstance(body, (dict, list)) else str(body)[:300],
+    }
+    if status == 401 or status == 403:
+        result["hint"] = "they want auth on that route, or it is not in their public set"
+    elif status == 404:
+        result["hint"] = "wrong path - check observe_url for this peer"
+    elif status == 0:
+        result["hint"] = "could not reach them at all"
     return result
 
 
-VERDICT_USER = "system_integrity_verdict"
-VERDICT_RESEAL_SECONDS = 24 * 3600
-VERDICT_MAX_PER_HOUR = 30
-_seal_times = []
-_seal_lock = threading.Lock()
+def fetch_one(peer):
+    """Read one peer's current tip. Outbound only - no sealing here.
 
+    Returns a dict that either carries a tip ready to seal, or an error
+    already shaped like a result so it can be returned to the caller as is.
+    """
+    status, body = _http(peer["tip_url"])
+    if status != 200:
+        return {
+            "peer": peer["name"], "direction": "pull", "url": peer["tip_url"],
+            "http": status, "ok": False, "_failed": True,
+            "response": body if isinstance(body, (dict, list)) else str(body)[:300],
+            "hint": "could not read their tip",
+        }
 
-def _verdict_fingerprint(out):
-    return (out.get("verified_level"), out.get("claimed_level"),
-            out.get("overclaimed"), bool(out.get("error")))
+    tip, height = _extract_tip(body)
+    if not tip:
+        return {
+            "peer": peer["name"], "direction": "pull", "url": peer["tip_url"],
+            "http": status, "ok": False, "_failed": True,
+            "response": str(body)[:300],
+            "hint": ("no tip field in their reply - add the field name to "
+                     "TIP_FIELDS. Currently accepted: " + ", ".join(TIP_FIELDS)),
+        }
 
-
-def _verdict_ref(idx, h):
-    return {"block_index": idx, "audit_hash": h,
-            "check_block": ("https://sebbi.pro/x/walk/block?index=%s" % idx)
-            if idx is not None else None}
-
-
-def _already_sealed(conn, domain, fp, now):
-    """The chain itself is the memory: find a verdict for this domain,
-    sealed today (UTC), with the same outcome. Per UTC day, like requests,
-    so each day's first request is always followed by a verdict."""
-    rows = conn.execute(
-        "SELECT id, audit_hash, result_json FROM audit_log "
-        "WHERE user_id = ? AND ts >= ? ORDER BY id DESC LIMIT 200",
-        (VERDICT_USER, now - (now % 86400))).fetchall()
-    for idx, h, rj in rows:
-        try:
-            r = json.loads(rj)
-        except Exception:
-            continue
-        if r.get("domain") != domain:
-            continue
-        if (r.get("verified_level"), r.get("claimed_level"),
-                r.get("overclaimed")) == fp[:3]:
-            return _verdict_ref(idx, h)
-        return None   # latest verdict for this domain differs: reseal
-    return None
-
-
-REQUEST_USER = "system_integrity_request"
-
-
-def _claim(conn, domain, day, key, now):
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS integrity_verdict_claims ("
-        "domain TEXT, day TEXT, verdict TEXT, claimed_at REAL, "
-        "PRIMARY KEY (domain, day, verdict))")
-    cur = conn.execute(
-        "INSERT OR IGNORE INTO integrity_verdict_claims "
-        "(domain, day, verdict, claimed_at) VALUES (?, ?, ?, ?)",
-        (domain, day, key, now))
-    conn.commit()
-    return cur.rowcount == 1
-
-
-def _seal_request(domain, ctx):
-    """Seal that a check was asked for, before it runs. Once per domain per
-    UTC day, so the chain shows every domain that was asked about - and the
-    register can show any request with no verdict after it."""
-    seal = (ctx or {}).get("seal")
-    conn, lock = (ctx or {}).get("conn"), (ctx or {}).get("lock")
-    if not callable(seal) or conn is None or lock is None:
-        return None
-    now = time.time()
-    day = time.strftime("%Y-%m-%d", time.gmtime(now))
-    with lock:
-        won = _claim(conn, domain, day, "__request__", now)
-        if not won:
-            r = conn.execute(
-                "SELECT id, audit_hash FROM audit_log WHERE user_id = ? AND "
-                "ts > ? AND result_json LIKE ? ORDER BY id DESC LIMIT 1",
-                (REQUEST_USER, now - 86400,
-                 '%"domain": "' + domain + '"%')).fetchone()
-            ref = _verdict_ref(r[0], r[1]) if r else {}
-            return dict(ref, sealed_now=False)
-    with _seal_lock:
-        while _seal_times and now - _seal_times[0] > 3600:
-            _seal_times.pop(0)
-        if len(_seal_times) >= VERDICT_MAX_PER_HOUR:
-            return {"sealed_now": False,
-                    "note": "hourly sealing limit reached; request not sealed"}
-        _seal_times.append(now)
-    event = {"user_id": REQUEST_USER, "action": "integrity_check_requested",
-             "amount": 0, "country": "UK", "device_id": "checker",
-             "anomaly": 0, "device_risk": 0}
-    result = {"decision": "REQUESTED", "score": 0, "domain": domain,
-              "checker_version": VERSION,
-              "standard_version": DECLARATION.get("version"),
-              "requested_at": time.strftime("%Y-%m-%dT%H:%M:%SZ",
-                                            time.gmtime(now)),
-              "timestamp": now}
-    try:
-        res = seal(event, result, now)
-    except Exception as exc:
-        with lock:
-            conn.execute("DELETE FROM integrity_verdict_claims WHERE "
-                         "domain = ? AND day = ? AND verdict = ?",
-                         (domain, day, "__request__"))
-            conn.commit()
-        return {"sealed_now": False, "note": "could not seal: %s" % exc}
-    if isinstance(res, (list, tuple)):
-        h, idx = res[0], (res[1] if len(res) > 1 else None)
-    elif isinstance(res, dict):
-        h = res.get("audit_hash") or res.get("hash")
-        idx = res.get("block_index") or res.get("index")
-    else:
-        h, idx = res, None
-    return dict(_verdict_ref(idx, h), sealed_now=True)
-
-
-def _seal_verdict(domain, out, ctx):
-    """Seal a verdict into the chain at most once per domain per UTC day,
-    unless the verdict changes.
-
-    v1.4 kept that limit in server memory, so a server running several
-    copies of itself sealed once per copy. v1.4.1 asks the chain first,
-    then claims the seal in a table every copy shares, so only one copy
-    can seal a given verdict on a given day."""
-    seal = (ctx or {}).get("seal")
-    conn, lock = (ctx or {}).get("conn"), (ctx or {}).get("lock")
-    if not callable(seal) or conn is None or lock is None:
-        return None
-    if out.get("error"):
-        # A check that failed to run has no verdict to seal. Its request is
-        # already sealed, so the register shows it as asked and unanswered.
-        return {"sealed_now": False,
-                "note": "the check did not complete, so no verdict was sealed; "
-                        "the request stays on record without one"}
-    now = time.time()
-    fp = _verdict_fingerprint(out)
-    day = time.strftime("%Y-%m-%d", time.gmtime(now))
-    claim = json.dumps(list(fp))
-    with lock:
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS integrity_verdict_claims ("
-            "domain TEXT, day TEXT, verdict TEXT, claimed_at REAL, "
-            "PRIMARY KEY (domain, day, verdict))")
-        ref = _already_sealed(conn, domain, fp, now)
-        if ref:
-            conn.commit()
-            return dict(ref, sealed_now=False)
-        won = _claim(conn, domain, day, claim, now)
-    if not won:
-        return {"sealed_now": False,
-                "note": "this verdict was already sealed today"}
-    with _seal_lock:
-        while _seal_times and now - _seal_times[0] > 3600:
-            _seal_times.pop(0)
-        if len(_seal_times) >= VERDICT_MAX_PER_HOUR:
-            return {"sealed_now": False,
-                    "note": "hourly sealing limit reached; verdict not sealed"}
-        _seal_times.append(now)
-    walk = ((out.get("checks") or {}).get("INV-001") or {}).get("walk") or {}
-    event = {"user_id": VERDICT_USER, "action": "integrity_verdict",
-             "amount": 0, "country": "UK", "device_id": "checker",
-             "anomaly": 0, "device_risk": 0}
-    result = {"decision": "VERDICT", "score": 0, "domain": domain,
-              "verified_level": out.get("verified_level"),
-              "badge": out.get("badge"),
-              "claimed_level": out.get("claimed_level"),
-              "overclaimed": out.get("overclaimed"),
-              "declaration_url": out.get("declaration_url"),
-              "declaration_sha256": out.get("declaration_sha256"),
-              "chain_tip_reached": walk.get("tip"),
-              "blocks_walked": walk.get("blocks"),
-              "checker_version": VERSION,
-              "standard_version": DECLARATION.get("version"),
-              "checked_at": out.get("checked_at"),
-              "timestamp": now}
-    try:
-        res = seal(event, result, now)
-    except Exception as exc:
-        with lock:
-            conn.execute("DELETE FROM integrity_verdict_claims WHERE "
-                         "domain = ? AND day = ? AND verdict = ?",
-                         (domain, day, claim))
-            conn.commit()
-        return {"sealed_now": False, "note": "could not seal: %s" % exc}
-    if isinstance(res, (list, tuple)):
-        h, idx = res[0], (res[1] if len(res) > 1 else None)
-    elif isinstance(res, dict):
-        h = res.get("audit_hash") or res.get("hash")
-        idx = res.get("block_index") or res.get("index")
-    else:
-        h, idx = res, None
-    return dict(_verdict_ref(idx, h), sealed_now=True)
-
-
-def _register(data, ctx):
-    conn, lock = (ctx or {}).get("conn"), (ctx or {}).get("lock")
-    if conn is None or lock is None:
-        return {"ok": False, "error": "register_unavailable"}, 503
-    with lock:
-        rows = conn.execute(
-            "SELECT id, ts, audit_hash, result_json FROM audit_log "
-            "WHERE user_id = ? ORDER BY id DESC LIMIT 2000",
-            (VERDICT_USER,)).fetchall()
-    with lock:
-        req_rows = conn.execute(
-            "SELECT id, ts, result_json FROM audit_log WHERE user_id = ? "
-            "ORDER BY id DESC LIMIT 2000", (REQUEST_USER,)).fetchall()
-    last_request = {}
-    for ridx, rts, rj in req_rows:
-        try:
-            d = json.loads(rj).get("domain")
-        except Exception:
-            continue
-        if d and d not in last_request:
-            last_request[d] = (ridx, rts)
-    latest = {}
-    history = {}
-    for idx, ts, h, rj in rows:
-        try:
-            r = json.loads(rj)
-        except Exception:
-            continue
-        d = r.get("domain")
-        if not d:
-            continue
-        history[d] = history.get(d, 0) + 1
-        if d in latest:
-            continue
-        latest[d] = {"domain": d, "verified_level": r.get("verified_level"),
-                     "badge": r.get("badge"),
-                     "claimed_level": r.get("claimed_level"),
-                     "overclaimed": r.get("overclaimed"),
-                     "checked_at": r.get("checked_at"),
-                     "sealed_in_block": idx, "sealed_block_hash": h,
-                     "check_block": "https://sebbi.pro/x/walk/block?index=%d" % idx,
-                     "check_now": BASE + "check?domain=" + d}
-    order = {n: i for i, n in enumerate(_ORDER)}
-    entries = sorted(latest.values(), key=lambda e: (
-        -order.get(e.get("verified_level"), -1), e["domain"]))
-    for e in entries:
-        e["verdicts_sealed"] = history.get(e["domain"], 0)
-        lr = last_request.get(e["domain"])
-        if lr:
-            e["last_request_block"] = lr[0]
-    unanswered = []
-    for d, (ridx, rts) in sorted(last_request.items()):
-        v = latest.get(d)
-        if v is None or v["sealed_in_block"] < ridx:
-            # a verdict sealed earlier the same day still answers a request
-            # sealed later only if the verdict was unchanged; show it anyway
-            # so a reader can judge, and say which case it is.
-            unanswered.append({
-                "domain": d, "request_block": ridx,
-                "check_request": "https://sebbi.pro/x/walk/block?index=%d" % ridx,
-                "latest_verdict_block": v["sealed_in_block"] if v else None,
-                "reading": ("an unchanged verdict sealed earlier the same day "
-                            "stands for this request") if v else
-                           "asked about, and no verdict has been sealed"})
-    return {"ok": True, "register": "AI Integrity Declaration - sealed verdicts",
-            "standard": BASE + "declaration",
-            "domains": len(entries), "entries": entries,
-            "requests_without_a_later_verdict": unanswered,
-            "what_this_is": "The latest verdict the checker sealed for each "
-                            "domain, highest level first. Every row points "
-                            "at the public block that holds it, so no rating "
-                            "here can be changed after it was given - by the "
-                            "domain, or by sebbi.pro. Every request is sealed "
-                            "before its check runs, so a question that was "
-                            "asked and never answered is visible below the "
-                            "list, not hidden by it."}, 200
-
-
-def _check_route(data, ctx=None):
-    domain = _clean_domain((data or {}).get("domain"))
-    if not domain:
-        return {"ok": False, "error": "domain_required",
-                "example": BASE + "check?domain=example.com",
-                "detail": "Give a public domain name, e.g. domain=example.com"}, 400
-    now = time.time()
-    with _cache_lock:
-        hit = _cache.get(domain)
-        if hit and now - hit[0] < CACHE_SECONDS:
-            out = dict(hit[1])
-            out["cached_seconds_ago"] = int(now - hit[0])
-            return out, 200
-    if not _running.acquire(blocking=False):
-        return {"ok": False, "error": "busy",
-                "detail": "Two checks are already running. Try again in a "
-                          "minute."}, 429
-    request = _seal_request(domain, ctx)
-    try:
-        out = _check(domain)
-    except Exception as exc:
-        out = {"domain": domain, "verified_level": "L0_DIARY", "badge": "GREY",
-               "error": "check_failed", "detail": str(exc)[:200]}
-    finally:
-        _running.release()
-    out["ok"] = True
-    if request:
-        out["request_sealed"] = request
-    sealed = _seal_verdict(domain, out, ctx)
-    if sealed:
-        out["verdict_sealed"] = sealed
-    with _cache_lock:
-        _cache[domain] = (time.time(), out)
-        if len(_cache) > 500:
-            oldest = sorted(_cache.items(), key=lambda kv: kv[1][0])[:100]
-            for k, _ in oldest:
-                _cache.pop(k, None)
-    return out, 200
-
-
-def _status():
     return {
-        "ok": True,
-        "module": "integrity",
-        "version": VERSION,
-        "standard": DECLARATION.get("spec"),
-        "standard_version": DECLARATION.get("version"),
-        "declaration_id": DECLARATION.get("declaration_id"),
-        "declaration_sha256": DECLARATION_SHA256,
-        "levels": list(DECLARATION.get("levels", {}).keys()),
-        "invariants": list(DECLARATION.get("invariants", {}).keys()),
-        "links": {
-            "declaration": BASE + "declaration",
-            "check_any_domain": BASE + "check?domain=example.com",
-            "sebbi_self_declaration": BASE + "self",
-            "check_sebbi": BASE + "check?domain=sebbi.pro",
-            "register": BASE + "register",
-            "ordering_test": "https://sebbi.pro/.well-known/ordering-test.json",
-        },
-        "how_to_adopt": "Publish your own filled-in declaration_template at "
-                        "/.well-known/ai-integrity.json on your own domain, "
-                        "then check it at " + BASE + "check?domain=yourdomain",
-        "hash_note": "declaration_sha256 is SHA-256 of the declaration as "
-                     "compact JSON with sorted keys, so anyone can confirm "
-                     "the text they are reading is the text published.",
+        "peer": peer["name"], "url": peer["tip_url"],
+        "tip": tip, "height": height, "_failed": False,
+        "fetched_at": time.time(),
     }
 
 
+def seal_one(fetched):
+    """Seal one already-fetched peer tip into our chain.
+
+    Goes through our own public observe route so a tip we pulled is
+    recorded by exactly the same code path as a tip somebody pushed to us.
+    Called in a plain loop, never in parallel - this hits our own server.
+
+    Field names must match what modules/witness.py reads out of the body:
+    chain, tip, peer_ts, url. The url is what makes the observation
+    checkable by a third party rather than taken on our word - it is the
+    address we just fetched this tip from.
+    """
+    seal_status, seal_body = _http(OUR_OBSERVE_URL, {
+        "chain": fetched["peer"],
+        "tip": fetched["tip"],
+        "peer_ts": fetched["fetched_at"],
+        "url": fetched["url"],
+    })
+
+    out = {
+        "peer": fetched["peer"],
+        "direction": "pull",
+        "their_tip": fetched["tip"],
+        "their_height": fetched["height"],
+        "sealed_http": seal_status,
+        "ok": 200 <= seal_status < 300,
+        "response": seal_body if isinstance(seal_body, (dict, list)) else str(seal_body)[:300],
+    }
+    if seal_status in (401, 403):
+        out["hint"] = "our own observe route rejected us - check PUBLIC in modules/witness.py"
+    return out
+
+
+def do_push():
+    tip, height, error = our_tip()
+    if error:
+        return {"ok": False, "error": error}
+
+    # Outbound to everyone at once.
+    results = _in_parallel(lambda peer: push_one(peer, tip, height), PEERS)
+
+    return {
+        "ok": True,
+        "our_tip": tip,
+        "our_height": height,
+        "pushed_to": len([r for r in results if not r.get("skipped")]),
+        "fetch_only": len([r for r in results if r.get("skipped")]),
+        "results": results,
+    }
+
+
+def do_pull():
+    # Phase one: read every peer's tip at the same time. This is the slow
+    # part and none of it touches us.
+    fetched = _in_parallel(fetch_one, PEERS)
+
+    # Phase two: seal what came back, one at a time, into our own chain.
+    results = []
+    for item in fetched:
+        if item.get("_failed"):
+            item.pop("_failed", None)
+            results.append(item)
+            continue
+        results.append(seal_one(item))
+
+    return {"ok": True, "results": results}
+
+
+def do_sync():
+    """Pull first, then push. That order matters: the tip we hand out then
+    already contains the tips we just took in, so the two chains interlock
+    rather than merely sitting alongside each other."""
+    started = time.time()
+    pulled = do_pull()
+    pushed = do_push()
+    result = {
+        "ran_at": _now(),
+        "took_seconds": round(time.time() - started, 2),
+        "peers": len(PEERS),
+        "pull": pulled,
+        "push": pushed,
+        "ok": bool(pulled.get("ok")) and bool(pushed.get("ok")),
+    }
+    with _lock:
+        _state["last_run"] = result["ran_at"]
+        _state["last_result"] = result
+        _state["runs"] += 1
+    return result
+
+
+# ----------------------------------------------------------------------
+# background timer
+# ----------------------------------------------------------------------
+
+def _loop():
+    # Let the server finish coming up before the first run.
+    time.sleep(45)
+    while True:
+        try:
+            do_sync()
+        except Exception:
+            pass
+        time.sleep(AUTO_SYNC_SECONDS)
+
+
+def _start_timer():
+    with _lock:
+        if _state["timer_started"] or not AUTO_SYNC_ENABLED:
+            return
+        _state["timer_started"] = True
+    thread = threading.Thread(target=_loop, name="mutual-sync", daemon=True)
+    thread.start()
+
+
+_start_timer()
+
+
+# ----------------------------------------------------------------------
+# router entry point
+# ----------------------------------------------------------------------
+
 def handle(method, action, data, api_key, ctx):
-    data = data or {}
-    if isinstance(data.get("domain"), list):
-        data = dict(data)
-        data["domain"] = data["domain"][0] if data["domain"] else ""
-    if method == "GET" and action in ("status", "spec", ""):
-        return _status(), 200
-    if method == "GET" and action == "declaration":
-        return DECLARATION, 200
-    if method == "GET" and action == "self":
-        return SELF, 200
-    if method == "GET" and action == "check":
-        return _check_route(data, ctx)
-    if method == "GET" and action == "register":
-        return _register(data, ctx)
-    return {"ok": False, "error": "unknown_action",
-            "get": sorted(a for m, a in PUBLIC if m == "GET"),
-            "post": []}, 404
+    action = (action or "").strip("/").lower()
+
+    if method == "GET":
+        if action == "peers":
+            return _reply({
+                "chain": OUR_CHAIN_NAME,
+                "version": VERSION,
+                "peers": [
+                    {"name": p["name"],
+                     "tip_url": p["tip_url"],
+                     "observe_url": p.get("observe_url"),
+                     "direction": ("both" if p.get("observe_url")
+                                   else "fetch-only")}
+                    for p in PEERS
+                ],
+                "parallel_fetch": MAX_PARALLEL_PEERS,
+                "tip_fields_accepted": list(TIP_FIELDS),
+                "note": ("Witnessing is only mutual if both columns are live. "
+                         "A fetch-only peer is one we read and seal but who "
+                         "does not accept a push - either their outbound lane "
+                         "is closed or their tip is a static file. Both are "
+                         "valid; the direction is published rather than "
+                         "implied."),
+            })
+        if action == "status":
+            with _lock:
+                return _reply({
+                    "version": VERSION,
+                    "auto_sync": AUTO_SYNC_ENABLED,
+                    "interval_seconds": AUTO_SYNC_SECONDS,
+                    "timer_running": _state["timer_started"],
+                    "parallel_fetch": MAX_PARALLEL_PEERS,
+                    "runs": _state["runs"],
+                    "last_run": _state["last_run"],
+                    "last_result": _state["last_result"],
+                })
+
+    if method == "POST":
+        if action == "push":
+            return _reply(do_push())
+        if action == "pull":
+            return _reply(do_pull())
+        if action == "sync":
+            return _reply(do_sync())
+
+    return _reply({
+        "error": "unknown action",
+        "GET": ["peers", "status"],
+        "POST": ["push", "pull", "sync"],
+    }, 404)
 
 ```
 
 
-## `modules/investor.py`
+## `modules/network.py`
 
-298 lines, 23897 bytes
+487 lines, 19842 bytes
 
 ```python
 """
-modules/investor.py  v1.3.0
-Serves the investor / partner page at /investor-prospectus.
+modules/network.py  -  serves the public witness network page
 
-Page module, same family as map.py / console.py / network.py: a runtime do_GET
-patch puts the page at a clean URL, armed by hitting /x/investor/status once
-after each deploy. server.py is never edited. Page is base64-embedded.
+WHY THIS IS A MODULE AND NOT A TEMPLATE
+---------------------------------------
+The router hands whatever handle() returns to send_json, so a module cannot
+return HTML through it - it would arrive as a JSON string. So this does the
+same thing router.py already does for POST: it patches the request handler at
+runtime, adds a branch for the page path, and leaves every other path exactly
+as it was. The patch is idempotent and lives in memory, so a restart reverts it.
 
-v1.3.0 changes, all wording:
-  * "externally anchored" and "anchored to a clock nobody controls" replaced
-    with per-proof timestamping language. Anchoring is a state each individual
-    proof is in, not a property the chain has, and /x/ots/status is where an
-    investor will look it up in front of you.
-  * the /x/ots/status line now says plainly that submitted is not confirmed.
-  * contact address aligned with ai.txt v2.0.
-Founding seats language is unchanged, deliberately.
+THE SAME CATCH AS THE POST PATCH
+--------------------------------
+A module is only imported when a request reaches the router. So after every
+deploy, one request to /x/network/status has to arrive before /witness works.
+Opening /x/network/status in a browser does it. Until then the page path falls
+through to whatever the server did before, which is a 404 - not an error page,
+just the old behaviour.
 
-NOTE: investor-prospectus.html also exists at the repo root. Two investor
-pages on two paths will drift. Decide which one is canonical and delete the
-other.
+If you would rather not patch anything, the same HTML works as a plain file in
+static/. This exists because the page then lives with the module it describes
+rather than drifting away from it.
+
+ROUTES
+------
+  GET /witness            the page
+  GET /witness.html       same page
+  GET /x/network/status   whether the patch is installed (public)
+
+The page itself holds no data. It reads /x/witness/tip and /x/witness/peers
+from the browser, same as any other visitor would, so it cannot show anything
+a stranger could not verify for themselves.
 """
 
-import base64
 import sys
 
-VERSION = "1.3.0"
-PAGE_PATH = "/investor-prospectus"
+VERSION = "1.0"
 
-_B64 = (
-    "PCFET0NUWVBFIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+CjxtZXRhIGNoYXJzZXQ9IlVURi04Ij4KPG1ldGEgbmFtZT0i"
-    "dmlld3BvcnQiIGNvbnRlbnQ9IndpZHRoPWRldmljZS13aWR0aCwgaW5pdGlhbC1zY2FsZT0xLjAiPgo8dGl0bGU+c2ViYmkucHJv"
-    "IOKAlCB0aGUgZXZpZGVuY2UgbGF5ZXIgZm9yIEFJLiBQYXJ0bmVyIG9wcG9ydHVuaXR5LjwvdGl0bGU+CjxtZXRhIG5hbWU9ImRl"
-    "c2NyaXB0aW9uIiBjb250ZW50PSJBIGxpdmUsIHB1YmxpY2x5IHZlcmlmaWFibGUgZXZpZGVuY2UgbGF5ZXIgZm9yIEFJIGRlY2lz"
-    "aW9ucy4gQnVpbHQsIHJ1bm5pbmcsIGFuZCBzdHJ1Y3R1cmFsbHkgaW1wb3NzaWJsZSBmb3IgaW5jdW1iZW50cyB0byBjb3B5LiBT"
-    "ZWVraW5nIG9uZSBvcGVyYXRpbmcgcGFydG5lciB0byB0YWtlIGl0IGludG8gcmVndWxhdGVkIGVudGVycHJpc2UuIj4KPGxpbmsg"
-    "cmVsPSJwcmVjb25uZWN0IiBocmVmPSJodHRwczovL2ZvbnRzLmdvb2dsZWFwaXMuY29tIj4KPGxpbmsgaHJlZj0iaHR0cHM6Ly9m"
-    "b250cy5nb29nbGVhcGlzLmNvbS9jc3MyP2ZhbWlseT1OZXdzcmVhZGVyOm9wc3osd2dodEA2Li43Miw0MDA7Ni4uNzIsNTAwOzYu"
-    "LjcyLDYwMDs2Li43Miw3MDAmZmFtaWx5PUlCTStQbGV4K1NhbnM6d2dodEA0MDA7NTAwOzYwMDs3MDAmZmFtaWx5PUlCTStQbGV4"
-    "K01vbm86d2dodEA0MDA7NTAwOzYwMCZkaXNwbGF5PXN3YXAiIHJlbD0ic3R5bGVzaGVldCI+CjxzdHlsZT4KOnJvb3R7CiAgLS1w"
-    "YXBlcjojRkFGQUY2Oy0taW5rOiMxNDE3MUM7LS1pbmstc29mdDojNDU0QjU0Oy0tY2hhaW46IzJFNUU0RTsKICAtLWNoYWluLWxp"
-    "Z2h0OiNFNEVDRTg7LS1nb2xkOiM5QTdCMUY7LS1nb2xkLWxpZ2h0OiNGM0VDRDg7LS1saW5lOiNERURCRDE7Cn0KKntib3gtc2l6"
-    "aW5nOmJvcmRlci1ib3g7bWFyZ2luOjA7cGFkZGluZzowfQpib2R5e2ZvbnQtZmFtaWx5OidJQk0gUGxleCBTYW5zJyxzYW5zLXNl"
-    "cmlmO2JhY2tncm91bmQ6dmFyKC0tcGFwZXIpO2NvbG9yOnZhcigtLWluayk7bGluZS1oZWlnaHQ6MS42Oy13ZWJraXQtZm9udC1z"
-    "bW9vdGhpbmc6YW50aWFsaWFzZWR9CmgxLGgyLGgzLC5kaXNwbGF5e2ZvbnQtZmFtaWx5OidOZXdzcmVhZGVyJyxzZXJpZjtmb250"
-    "LXdlaWdodDo1MDA7bGV0dGVyLXNwYWNpbmc6LTAuMDFlbX0KLm1vbm97Zm9udC1mYW1pbHk6J0lCTSBQbGV4IE1vbm8nLG1vbm9z"
-    "cGFjZX0KYXtjb2xvcjp2YXIoLS1jaGFpbil9Ci53cmFwe21heC13aWR0aDo3NjBweDttYXJnaW46MCBhdXRvO3BhZGRpbmc6MCAy"
-    "OHB4fQoKaGVhZGVye3BhZGRpbmc6NTZweCAwIDQwcHg7Ym9yZGVyLWJvdHRvbToxcHggc29saWQgdmFyKC0tbGluZSl9Ci5kb2Mt"
-    "bGFiZWx7Zm9udC1mYW1pbHk6J0lCTSBQbGV4IE1vbm8nLG1vbm9zcGFjZTtmb250LXNpemU6MTFweDtsZXR0ZXItc3BhY2luZzow"
-    "LjFlbTt0ZXh0LXRyYW5zZm9ybTp1cHBlcmNhc2U7Y29sb3I6dmFyKC0taW5rLXNvZnQpO21hcmdpbi1ib3R0b206MjBweDtkaXNw"
-    "bGF5OmZsZXg7anVzdGlmeS1jb250ZW50OnNwYWNlLWJldHdlZW47ZmxleC13cmFwOndyYXA7Z2FwOjhweH0KaDF7Zm9udC1zaXpl"
-    "OmNsYW1wKDM0cHgsNXZ3LDUwcHgpO2xpbmUtaGVpZ2h0OjEuMDg7bWF4LXdpZHRoOjE3Y2g7bWFyZ2luLWJvdHRvbToxOHB4fQou"
-    "dGFnbGluZXtmb250LXNpemU6MThweDtjb2xvcjp2YXIoLS1pbmstc29mdCk7bWF4LXdpZHRoOjU0Y2h9Ci50YWdsaW5lIGJ7Y29s"
-    "b3I6dmFyKC0taW5rKX0KCi5ibG9ja3twb3NpdGlvbjpyZWxhdGl2ZTtwYWRkaW5nOjhweCAwIDQ0cHggMjRweDtib3JkZXItbGVm"
-    "dDoxcHggc29saWQgdmFyKC0tbGluZSk7bWFyZ2luLWxlZnQ6NHB4fQouYmxvY2s6bGFzdC1vZi10eXBle2JvcmRlci1sZWZ0OjFw"
-    "eCBzb2xpZCB0cmFuc3BhcmVudH0KLmJsb2NrLW51bXtmb250LWZhbWlseTonSUJNIFBsZXggTW9ubycsbW9ub3NwYWNlO2ZvbnQt"
-    "c2l6ZToxMXB4O2NvbG9yOnZhcigtLWNoYWluKTtsZXR0ZXItc3BhY2luZzowLjA4ZW07dGV4dC10cmFuc2Zvcm06dXBwZXJjYXNl"
-    "O21hcmdpbi1ib3R0b206MTBweH0KLmJsb2NrIGgye2ZvbnQtc2l6ZToyN3B4O21hcmdpbi1ib3R0b206MTZweDtsaW5lLWhlaWdo"
-    "dDoxLjE1fQouYmxvY2sgaDN7Zm9udC1zaXplOjE3cHg7bWFyZ2luOjIycHggMCA4cHh9Ci5ibG9jayBwe2ZvbnQtc2l6ZToxNS41"
-    "cHg7Y29sb3I6dmFyKC0taW5rLXNvZnQpO21hcmdpbi1ib3R0b206MTRweDttYXgtd2lkdGg6NjBjaH0KLmJsb2NrIHA6bGFzdC1j"
-    "aGlsZHttYXJnaW4tYm90dG9tOjB9Ci5ibG9jayB1bHttYXJnaW46MCAwIDE0cHggMThweH0KLmJsb2NrIGxpe2ZvbnQtc2l6ZTox"
-    "NXB4O2NvbG9yOnZhcigtLWluay1zb2Z0KTttYXJnaW4tYm90dG9tOjhweDttYXgtd2lkdGg6NThjaH0KLmJsb2NrIGxpIGIsLmJs"
-    "b2NrIHAgYntjb2xvcjp2YXIoLS1pbmspfQoKLnByb29mLWdyaWR7ZGlzcGxheTpncmlkO2dyaWQtdGVtcGxhdGUtY29sdW1uczox"
-    "ZnIgMWZyO2dhcDoxNHB4O21hcmdpbi10b3A6MThweH0KQG1lZGlhKG1heC13aWR0aDo1NjBweCl7LnByb29mLWdyaWR7Z3JpZC10"
-    "ZW1wbGF0ZS1jb2x1bW5zOjFmcn19Ci5wcm9vZntiYWNrZ3JvdW5kOndoaXRlO2JvcmRlcjoxcHggc29saWQgdmFyKC0tbGluZSk7"
-    "cGFkZGluZzoxOHB4IDIwcHg7Ym9yZGVyLXJhZGl1czo0cHh9Ci5wcm9vZi1ue2ZvbnQtZmFtaWx5OidOZXdzcmVhZGVyJyxzZXJp"
-    "Zjtmb250LXNpemU6MjZweDtmb250LXdlaWdodDo2MDA7Y29sb3I6dmFyKC0tY2hhaW4pfQoucHJvb2YtbHtmb250LXNpemU6MTIu"
-    "NXB4O2NvbG9yOnZhcigtLWluay1zb2Z0KTttYXJnaW4tdG9wOjNweH0KLnByb29mLXNyY3tmb250LWZhbWlseTonSUJNIFBsZXgg"
-    "TW9ubycsbW9ub3NwYWNlO2ZvbnQtc2l6ZToxMHB4O2NvbG9yOiM5OTk7bWFyZ2luLXRvcDo2cHh9CgouY291bnRkb3due2JhY2tn"
-    "cm91bmQ6dmFyKC0tZ29sZC1saWdodCk7Ym9yZGVyOjFweCBzb2xpZCByZ2JhKDE1NCwxMjMsMzEsMC4yNSk7Ym9yZGVyLXJhZGl1"
-    "czo0cHg7cGFkZGluZzoyMHB4IDI0cHg7bWFyZ2luOjIwcHggMH0KLmNvdW50ZG93bi1sYWJlbHtmb250LWZhbWlseTonSUJNIFBs"
-    "ZXggTW9ubycsbW9ub3NwYWNlO2ZvbnQtc2l6ZToxMXB4O2NvbG9yOnZhcigtLWdvbGQpO3RleHQtdHJhbnNmb3JtOnVwcGVyY2Fz"
-    "ZTtsZXR0ZXItc3BhY2luZzowLjA4ZW07bWFyZ2luLWJvdHRvbTo4cHh9Ci5jb3VudGRvd24tZGF5c3tmb250LWZhbWlseTonTmV3"
-    "c3JlYWRlcicsc2VyaWY7Zm9udC1zaXplOjM4cHg7Zm9udC13ZWlnaHQ6NjAwO2NvbG9yOnZhcigtLWdvbGQpO2xpbmUtaGVpZ2h0"
-    "OjF9Ci5jb3VudGRvd24tc3Vie2ZvbnQtc2l6ZToxM3B4O2NvbG9yOnZhcigtLWluay1zb2Z0KTttYXJnaW4tdG9wOjZweDtsaW5l"
-    "LWhlaWdodDoxLjZ9CgoucHVsbHtib3JkZXItbGVmdDozcHggc29saWQgdmFyKC0tY2hhaW4pO3BhZGRpbmc6NnB4IDAgNnB4IDIw"
-    "cHg7bWFyZ2luOjIwcHggMDtmb250LWZhbWlseTonTmV3c3JlYWRlcicsc2VyaWY7Zm9udC1zaXplOjIycHg7bGluZS1oZWlnaHQ6"
-    "MS4zNTtjb2xvcjp2YXIoLS1pbmspfQoKLmFzay1ib3h7YmFja2dyb3VuZDp2YXIoLS1pbmspO2NvbG9yOnZhcigtLXBhcGVyKTti"
-    "b3JkZXItcmFkaXVzOjRweDtwYWRkaW5nOjMycHg7bWFyZ2luLXRvcDoyMHB4fQouYXNrLWFtb3VudHtmb250LWZhbWlseTonTmV3"
-    "c3JlYWRlcicsc2VyaWY7Zm9udC1zaXplOjQ0cHg7Zm9udC13ZWlnaHQ6NjAwO2NvbG9yOndoaXRlO2xpbmUtaGVpZ2h0OjEuMDV9"
-    "Ci5hc2stbGFiZWx7Zm9udC1mYW1pbHk6J0lCTSBQbGV4IE1vbm8nLG1vbm9zcGFjZTtmb250LXNpemU6MTFweDtsZXR0ZXItc3Bh"
-    "Y2luZzowLjA4ZW07dGV4dC10cmFuc2Zvcm06dXBwZXJjYXNlO2NvbG9yOiM4RkE4OUM7bWFyZ2luLWJvdHRvbTo2cHh9Ci5hc2st"
-    "Ym94IHB7Zm9udC1zaXplOjE0LjVweDtjb2xvcjojQzdEMkNDO21hcmdpbi10b3A6MTRweDttYXgtd2lkdGg6NTZjaH0KLmFzay1i"
-    "b3ggcCBie2NvbG9yOiNmZmZ9CgoudXNlLW9mLWZ1bmRze21hcmdpbi10b3A6MjJweDtkaXNwbGF5OmZsZXg7ZmxleC1kaXJlY3Rp"
-    "b246Y29sdW1uO2dhcDoxMHB4fQoudWYtcm93e2Rpc3BsYXk6ZmxleDtqdXN0aWZ5LWNvbnRlbnQ6c3BhY2UtYmV0d2VlbjthbGln"
-    "bi1pdGVtczpiYXNlbGluZTtwYWRkaW5nLWJvdHRvbToxMHB4O2JvcmRlci1ib3R0b206MXB4IHNvbGlkIHJnYmEoMjU1LDI1NSwy"
-    "NTUsMC4xMik7Zm9udC1zaXplOjE0cHg7Z2FwOjE2cHh9Ci51Zi1yb3c6bGFzdC1jaGlsZHtib3JkZXItYm90dG9tOm5vbmV9Ci51"
-    "Zi1yb3cgc3BhbjpmaXJzdC1jaGlsZHtjb2xvcjojQzdEMkNDfQoudWYtcGN0e2ZvbnQtZmFtaWx5OidJQk0gUGxleCBNb25vJyxt"
-    "b25vc3BhY2U7Y29sb3I6IzhGQTg5QztmbGV4OjAgMCBhdXRvfQoKLnZlcmlmeS1ib3h7YmFja2dyb3VuZDp2YXIoLS1jaGFpbi1s"
-    "aWdodCk7Ym9yZGVyOjFweCBzb2xpZCByZ2JhKDQ2LDk0LDc4LDAuMjUpO2JvcmRlci1yYWRpdXM6NHB4O3BhZGRpbmc6MjBweCAy"
-    "NHB4O21hcmdpbi10b3A6MThweH0KLnZlcmlmeS1ib3ggaDR7Zm9udC1zaXplOjE1cHg7bWFyZ2luLWJvdHRvbToxMHB4fQoudmVy"
-    "aWZ5LWJveCBwe2ZvbnQtc2l6ZToxNHB4O21hcmdpbi1ib3R0b206OHB4fQoudmVyaWZ5LWJveCBjb2Rle2ZvbnQtZmFtaWx5OidJ"
-    "Qk0gUGxleCBNb25vJyxtb25vc3BhY2U7Zm9udC1zaXplOjEyLjVweDtiYWNrZ3JvdW5kOndoaXRlO2JvcmRlcjoxcHggc29saWQg"
-    "dmFyKC0tbGluZSk7cGFkZGluZzoycHggN3B4O2JvcmRlci1yYWRpdXM6M3B4O2NvbG9yOnZhcigtLWNoYWluKX0KCi5jb250YWN0"
-    "LWJsb2Nre3BhZGRpbmc6NDRweCAwIDY0cHh9Ci5jb250YWN0LWNhcmR7YmFja2dyb3VuZDp2YXIoLS1jaGFpbi1saWdodCk7Ym9y"
-    "ZGVyOjFweCBzb2xpZCByZ2JhKDQ2LDk0LDc4LDAuMik7Ym9yZGVyLXJhZGl1czo0cHg7cGFkZGluZzoyOHB4fQouY29udGFjdC1j"
-    "YXJkIGgze2ZvbnQtc2l6ZToyMHB4O21hcmdpbi1ib3R0b206MTBweH0KLmNvbnRhY3QtY2FyZCBwe2ZvbnQtc2l6ZToxNC41cHg7"
-    "Y29sb3I6dmFyKC0taW5rLXNvZnQpO21hcmdpbi1ib3R0b206MTZweH0KLmNvbnRhY3QtbGlua3N7ZGlzcGxheTpmbGV4O2ZsZXgt"
-    "ZGlyZWN0aW9uOmNvbHVtbjtnYXA6NnB4O2ZvbnQtZmFtaWx5OidJQk0gUGxleCBNb25vJyxtb25vc3BhY2U7Zm9udC1zaXplOjE0"
-    "cHh9Ci5jb250YWN0LWxpbmtzIGF7Y29sb3I6dmFyKC0tY2hhaW4pO3RleHQtZGVjb3JhdGlvbjpub25lO2ZvbnQtd2VpZ2h0OjUw"
-    "MH0KCmZvb3RlcntwYWRkaW5nOjAgMCA0OHB4fQpmb290ZXIgcHtmb250LWZhbWlseTonSUJNIFBsZXggTW9ubycsbW9ub3NwYWNl"
-    "O2ZvbnQtc2l6ZToxMXB4O2NvbG9yOiM5OTk7bGluZS1oZWlnaHQ6MS44fQoKQG1lZGlhKHByZWZlcnMtcmVkdWNlZC1tb3Rpb246"
-    "cmVkdWNlKXsqe3RyYW5zaXRpb246bm9uZSFpbXBvcnRhbnQ7YW5pbWF0aW9uOm5vbmUhaW1wb3J0YW50fX0KPC9zdHlsZT4KPC9o"
-    "ZWFkPgo8Ym9keT4KCjxkaXYgY2xhc3M9IndyYXAiPgoKPGhlYWRlcj4KICA8ZGl2IGNsYXNzPSJkb2MtbGFiZWwiPgogICAgPHNw"
-    "YW4+UGFydG5lciBPcHBvcnR1bml0eSAmbWlkZG90OyBzZWJiaS5wcm88L3NwYW4+CiAgICA8c3BhbiBpZD0iZG9jLWRhdGUiPiZt"
-    "ZGFzaDs8L3NwYW4+CiAgPC9kaXY+CiAgPGgxPlRoZSBldmlkZW5jZSBsYXllciBmb3IgQUkgaXMgYnVpbHQsIGxpdmUsIGFuZCBs"
-    "b29raW5nIGZvciBvbmUgcGFydG5lci48L2gxPgogIDxwIGNsYXNzPSJ0YWdsaW5lIj5zZWJiaS5wcm8gaXMgYSBwdWJsaWNseSB2"
-    "ZXJpZmlhYmxlIGV2aWRlbmNlIGxheWVyIGZvciBBSSBkZWNpc2lvbnMgJm1kYXNoOyBydW5uaW5nIGluIHByb2R1Y3Rpb24gdG9k"
-    "YXksIGNoZWNrYWJsZSBieSBhbnlvbmUgd2l0aCB0aGUgY29tcGFueSBzd2l0Y2hlZCBvZmYuIDxiPlRoZSBoYXJkIHBhcnQgaXMg"
-    "ZG9uZS4gV2hhdCdzIGxlZnQgaXMgZGlzdHJpYnV0aW9uLjwvYj48L3A+CjwvaGVhZGVyPgoKPGRpdiBjbGFzcz0iYmxvY2siPgog"
-    "IDxkaXYgY2xhc3M9ImJsb2NrLW51bSI+MDEgJm1kYXNoOyBUaGUgb3Bwb3J0dW5pdHk8L2Rpdj4KICA8aDI+RXZlcnkgQUkgZGVj"
-    "aXNpb24gaXMgYWJvdXQgdG8gbmVlZCBldmlkZW5jZS4gQWxtb3N0IG5vdGhpbmcgcHJvZHVjZXMgaXQuPC9oMj4KICA8cD5UaHJl"
-    "ZSByZWd1bGF0b3J5IHJlZ2ltZXMgYXJlIGNvbnZlcmdpbmcgb24gdGhlIHNhbWUgZGVtYW5kOiByZWNvcmRzIHRoYXQgc3Vydml2"
-    "ZSBzY3J1dGlueS4gVGhlIEVVIEFJIEFjdCwgdGhlIFVLIE9ubGluZSBTYWZldHkgQWN0LCBhbmQgdGhlIDIwMjQgUGF5bWVudCBT"
-    "ZXJ2aWNlcyByZWltYnVyc2VtZW50IHJ1bGVzIGFsbCByZXF1aXJlIGFuIG9yZ2FuaXNhdGlvbiB0byBwcm92ZSB3aGF0IGl0cyBz"
-    "eXN0ZW1zIGRpZCAmbWRhc2g7IG5vdCBhc3NlcnQgaXQsIHByb3ZlIGl0LjwvcD4KICA8cD5BbG1vc3QgZXZlcnkgb3JnYW5pc2F0"
-    "aW9uIG1lZXRzIHRoYXQgZGVtYW5kIHdpdGggZGF0YWJhc2UgbG9ncyB0aGVpciBvd24gdGVhbSBjYW4gZWRpdC4gVGhhdCBpcyBu"
-    "b3QgZXZpZGVuY2UsIGFuZCB0aGUgZGF5IGEgcmVndWxhdG9yLCBjb3VydCBvciBjdXN0b21lciBzdG9wcyB0YWtpbmcgdGhlaXIg"
-    "d29yZCBmb3IgaXQsIHRoZXkgZGlzY292ZXIgdGhlIGdhcC4gPGI+VGhlIG1hcmtldCB0aGF0IGNsb3NlcyB0aGF0IGdhcCBkb2Vz"
-    "IG5vdCByZWFsbHkgZXhpc3QgeWV0LjwvYj4gc2ViYmkucHJvIGlzIGFscmVhZHkgaW4gaXQuPC9wPgoKICA8ZGl2IGNsYXNzPSJw"
-    "dWxsIj5BIGxvZyB5b3UgY2FuIGVkaXQgdGVsbHMgcGVvcGxlIHdoYXQgeW91IGN1cnJlbnRseSBjbGFpbSBoYXBwZW5lZC4gSXQg"
-    "Y2Fubm90IHRlbGwgdGhlbSBub2JvZHkgY2hhbmdlZCBpdCBzaW5jZS4gT25seSBvbmUgb2YgdGhvc2UgaXMgd29ydGggYW55dGhp"
-    "bmcgd2hlbiBpdCBtYXR0ZXJzLjwvZGl2PgoKICA8ZGl2IGNsYXNzPSJjb3VudGRvd24iPgogICAgPGRpdiBjbGFzcz0iY291bnRk"
-    "b3duLWxhYmVsIj5VbnRpbCBoaWdoLXJpc2sgQUkgb2JsaWdhdGlvbnMgYXBwbHk8L2Rpdj4KICAgIDxkaXYgY2xhc3M9ImNvdW50"
-    "ZG93bi1kYXlzIG1vbm8iIGlkPSJjb3VudGRvd24tZGF5cyI+Jm1kYXNoOyBkYXlzPC9kaXY+CiAgICA8ZGl2IGNsYXNzPSJjb3Vu"
-    "dGRvd24tc3ViIj5Db3VudGluZyB0byAyIERlY2VtYmVyIDIwMjcuIFRoZSBldmlkZW5jZSB0aGVzZSBvYmxpZ2F0aW9ucyByZXF1"
-    "aXJlIGlzIGhpc3RvcmljYWwgJm1kYXNoOyBpdCBjYW5ub3QgYmUgY3JlYXRlZCBhZnRlciB0aGUgZmFjdC4gRXZlcnkgb3JnYW5p"
-    "c2F0aW9uIG5vdCByZWNvcmRpbmcgbm93IGlzIGFjY3J1aW5nIGEgZ2FwIGl0IGNhbiBuZXZlciBmaWxsLiBUaGF0IGlzIHRoZSBi"
-    "dXlpbmcgcHJlc3N1cmUsIGFuZCBpdCBvbmx5IGdyb3dzLjwvZGl2PgogIDwvZGl2Pgo8L2Rpdj4KCjxkaXYgY2xhc3M9ImJsb2Nr"
-    "Ij4KICA8ZGl2IGNsYXNzPSJibG9jay1udW0iPjAyICZtZGFzaDsgV2hhdCBpcyBhbHJlYWR5IGJ1aWx0PC9kaXY+CiAgPGgyPkxp"
-    "dmUgaW4gcHJvZHVjdGlvbi4gTm90IGEgZGVjaywgbm90IGEgZGVtby48L2gyPgogIDxwPlRoaXMgcnVucyB0b2RheSwgb24gcmVh"
-    "bCBpbmZyYXN0cnVjdHVyZSwgYW5kIGV2ZXJ5IGNsYWltIGJlbG93IGNhbiBiZSB2ZXJpZmllZCBieSBhIHRoaXJkIHBhcnR5IHdp"
-    "dGggbm8gYWNjb3VudCBhbmQgbm8gcGVybWlzc2lvbi4gU2l4IHByb2R1Y3RzIG9uIG9uZSBlbmdpbmUsIG9uZSB0YW1wZXItZXZp"
-    "ZGVudCBjaGFpbiB1bmRlcm5lYXRoIGFsbCBvZiB0aGVtLjwvcD4KCiAgPGRpdiBjbGFzcz0icHJvb2YtZ3JpZCI+CiAgICA8ZGl2"
-    "IGNsYXNzPSJwcm9vZiI+PGRpdiBjbGFzcz0icHJvb2YtbiBtb25vIj42PC9kaXY+PGRpdiBjbGFzcz0icHJvb2YtbCI+UHJvZHVj"
-    "dHMsIG9uZSBlbmdpbmU8L2Rpdj48ZGl2IGNsYXNzPSJwcm9vZi1zcmMiPkFJTGVhc2gsIEd1YXJkaWFuLCBTZW50aW5lbCwgU29u"
-    "aWNCb29tLCBTZWJkb2csIFRva2VuIFNhdmVyPC9kaXY+PC9kaXY+CiAgICA8ZGl2IGNsYXNzPSJwcm9vZiI+PGRpdiBjbGFzcz0i"
-    "cHJvb2YtbiBtb25vIj5+MjhtczwvZGl2PjxkaXYgY2xhc3M9InByb29mLWwiPk1lZGlhbiBkZWNpc2lvbiB0aW1lPC9kaXY+PGRp"
-    "diBjbGFzcz0icHJvb2Ytc3JjIj5EZXRlcm1pbmlzdGljLCBvbiBsaXZlIHRyYWZmaWM8L2Rpdj48L2Rpdj4KICAgIDxkaXYgY2xh"
-    "c3M9InByb29mIj48ZGl2IGNsYXNzPSJwcm9vZi1uIG1vbm8iPlNIQS0yNTY8L2Rpdj48ZGl2IGNsYXNzPSJwcm9vZi1sIj5IYXNo"
-    "LWNoYWluZWQsIHRpbWVzdGFtcGVkIHBlciBwcm9vZjwvZGl2PjxkaXYgY2xhc3M9InByb29mLXNyYyI+Q3Jvc3Mtd2l0bmVzc2Vk"
-    "IGJ5IGluZGVwZW5kZW50IHN5c3RlbXM8L2Rpdj48L2Rpdj4KICAgIDxkaXYgY2xhc3M9InByb29mIj48ZGl2IGNsYXNzPSJwcm9v"
-    "Zi1uIG1vbm8iPlB1YmxpYzwvZGl2PjxkaXYgY2xhc3M9InByb29mLWwiPlZlcmlmaWFibGUgd2l0aCB0aGUgdmVuZG9yIHN3aXRj"
-    "aGVkIG9mZjwvZGl2PjxkaXYgY2xhc3M9InByb29mLXNyYyI+U3RhbmRhbG9uZSB2ZXJpZmllciwgbm8gYWNjb3VudDwvZGl2Pjwv"
-    "ZGl2PgogIDwvZGl2PgoKICA8cCBzdHlsZT0ibWFyZ2luLXRvcDoxOHB4Ij5UaGUgd2hvbGUgcmFuZ2Ugc2hhcmVzIG9uZSBzcGlu"
-    "ZTogZXZlcnkgZGVjaXNpb24gc2VhbGVkIGFzIGl0IGhhcHBlbnMsIHN1Ym1pdHRlZCBmb3IgZXh0ZXJuYWwgdGltZXN0YW1waW5n"
-    "IHByb29mIGJ5IHByb29mLCBhbmQgd2l0bmVzc2VkIGhvdXJseSBieSBhbiBpbmRlcGVuZGVudCBwbGF0Zm9ybSAmbWRhc2g7IHVu"
-    "YXR0ZW5kZWQsIHJ1bm5pbmcgbm93LiBBIHJlZ3VsYXRvciwgYW4gYXVkaXRvciBvciBhIGN1c3RvbWVyIGNoZWNrcyBhbnkgb2Yg"
-    "aXQgdGhlbXNlbHZlcy4gVGhhdCBpcyB0aGUgcHJvZHVjdCwgYW5kIGl0IGV4aXN0cy48L3A+CjwvZGl2PgoKPGRpdiBjbGFzcz0i"
-    "YmxvY2siPgogIDxkaXYgY2xhc3M9ImJsb2NrLW51bSI+MDMgJm1kYXNoOyBXaHkgaW5jdW1iZW50cyBjYW4ndCBmb2xsb3c8L2Rp"
-    "dj4KICA8aDI+VGhlIG1vYXQgaXMgc3RydWN0dXJhbCwgbm90IGEgaGVhZCBzdGFydC48L2gyPgogIDxwPkV2ZXJ5IGxvZ2dpbmcs"
-    "IG1vbml0b3JpbmcgYW5kIGF1ZGl0IHBsYXRmb3JtIG9uIHRoZSBtYXJrZXQga2VlcHMgYSByZWNvcmQgaXRzIG93biBjdXN0b21l"
-    "ciBjb250cm9scy4gVGhhdCBpcyBub3QgYSBmbGF3IHRoZXkgY2FuIHBhdGNoICZtZGFzaDsgaXQgaXMgdGhlIGZvdW5kYXRpb24g"
-    "dGhlaXIgYnVzaW5lc3Mgc3RhbmRzIG9uLiBUbyBtYXRjaCBzZWJiaS5wcm8gdGhleSB3b3VsZCBoYXZlIHRvIGdpdmUgdGhlIGN1"
-    "c3RvbWVyIGEgcmVjb3JkIHRoZSBjdXN0b21lciBjYW5ub3QgZWRpdCwgd2hpY2ggYnJlYWtzIHRoZSB0aGluZyB0aGV5IHNlbGwu"
-    "PC9wPgogIDx1bD4KICAgIDxsaT48Yj5UaGV5IGNhbid0IGNvcHkgdGhlIHF1ZXN0aW9uLjwvYj4gIkNhbiB0aGUgcGVvcGxlIGJl"
-    "aW5nIGF1ZGl0ZWQgZWRpdCB0aGUgYXVkaXQ/IiBpbmRpY3RzIHRoZWlyIGVudGlyZSBjYXRlZ29yeS4gVGhleSBhbnN3ZXIgbm8g"
-    "YnkgYWRtaXR0aW5nIHRoZWlyIGV2aWRlbmNlIHdhcyBuZXZlciBldmlkZW5jZS48L2xpPgogICAgPGxpPjxiPlRoZXkgY2FuJ3Qg"
-    "Y29weSB0aGUgdGltZS48L2I+IEFuIHVuYnJva2VuLCBleHRlcm5hbGx5IHdpdG5lc3NlZCByZWNvcmQgaXMgdGhlIG9uZSBpbnB1"
-    "dCBub2JvZHkgY2FuIHNob3J0Y3V0LiBUaGUgb25seSB3YXkgdG8gaGF2ZSBsYXN0IHllYXIgY292ZXJlZCB3YXMgdG8gYmUgcmVj"
-    "b3JkaW5nIGxhc3QgeWVhci48L2xpPgogICAgPGxpPjxiPlRoZXkgY2FuJ3QgY29weSB0aGUgaG9uZXN0eS48L2I+IEV2ZXJ5IGNv"
-    "bXBldGl0b3Igb3ZlcmNsYWltcy4gc2ViYmkucHJvIHB1Ymxpc2hlcyBpdHMgb3duIGxpbWl0cyBvbiBldmVyeSBwYWdlIGFuZCBz"
-    "ZWFscyB0aGVtIGludG8gaXRzIG93biBjaGFpbiAmbWRhc2g7IHdoaWNoIGlzIGV4YWN0bHkgdGhlIHByb3BlcnR5IGEgYnV5ZXIg"
-    "b2YgZXZpZGVuY2UgaW5mcmFzdHJ1Y3R1cmUgaXMgcGF5aW5nIGZvci48L2xpPgogIDwvdWw+CgogIDxkaXYgY2xhc3M9InZlcmlm"
-    "eS1ib3giPgogICAgPGg0PlZlcmlmeSBpdCBiZWZvcmUgeW91IHJlYWQgYW5vdGhlciBsaW5lPC9oND4KICAgIDxwPk5vdGhpbmcg"
-    "aGVyZSBhc2tzIHRvIGJlIGJlbGlldmVkLiA8Y29kZT4veC93aXRuZXNzL3RpcDwvY29kZT4gcmV0dXJucyB0aGUgbGl2ZSBjaGFp"
-    "biB0aXAuIDxjb2RlPi94L290cy9zdGF0dXM8L2NvZGU+IHNob3dzIHRoZSBzdGF0ZSBvZiBlYWNoIGV4dGVybmFsIHRpbWVzdGFt"
-    "cCBwcm9vZiAmbWRhc2g7IHN1Ym1pdHRlZCBpcyBub3QgY29uZmlybWVkLCBhbmQgdGhlIHBhZ2Ugc2F5cyB3aGljaCBpcyB3aGlj"
-    "aC4gPGNvZGU+L3gvcm9zdGVyL2xpc3Q8L2NvZGU+IHNob3dzIHRoZSBpbmRlcGVuZGVudCBwbGF0Zm9ybXMgd2l0bmVzc2luZyBp"
-    "dC48L3A+CiAgICA8cCBzdHlsZT0ibWFyZ2luLWJvdHRvbTowIj5BbGwgcHVibGljLCBhbGwgbmVlZCBubyBhY2NvdW50LCBhbGwg"
-    "YW5zd2VyIHRvIGFueW9uZS4gVGhlIG9mZmxpbmUgdmVyaWZpZXIgcmVhY2hlcyBhIHZlcmRpY3Qgd2l0aCB0aGUgd2lmaSBvZmYu"
-    "PC9wPgogIDwvZGl2Pgo8L2Rpdj4KCjxkaXYgY2xhc3M9ImJsb2NrIj4KICA8ZGl2IGNsYXNzPSJibG9jay1udW0iPjA0ICZtZGFz"
-    "aDsgVGhlIGVjb25vbWljczwvZGl2PgogIDxoMj5aZXJvIG1hcmdpbmFsIGNvc3QuIERpc3RyaWJ1dGlvbiBzY2FsZXMgd2l0aG91"
-    "dCBoZWFkY291bnQuPC9oMj4KICA8cD5UaGUgc2FtZSBlbmdpbmUgc2VydmVzIG9uZSBjdXN0b21lciBvciB0ZW4gdGhvdXNhbmQg"
-    "Jm1kYXNoOyBtYXJnaW5hbCBjb3N0IHBlciBhZGRpdGlvbmFsIGRldmljZSBpcyBlZmZlY3RpdmVseSB6ZXJvLiBUaGF0IG1ha2Vz"
-    "IGRpc3RyaWJ1dGlvbiwgbm90IGVuZ2luZWVyaW5nLCB0aGUgZW50aXJlIGdyb3d0aCBsZXZlciwgYW5kIGl0IG1ha2VzIGEgcmVz"
-    "ZWxsZXIgY2hhbm5lbCBwdXJlIG1hcmdpbiByYXRoZXIgdGhhbiBhIGNvc3QgbGluZS48L3A+CiAgPHA+PGI+NTBwIHBlciBhY3Rp"
-    "dmUgZGV2aWNlIHBlciBtb250aDwvYj4sIG1ldGVyZWQgb24gcmVhbCB1c2FnZS4gUGFydG5lcnMgZW1iZWRkaW5nIHRoZSBwbGF0"
-    "Zm9ybSBzZXQgdGhlaXIgb3duIGN1c3RvbWVyIHByaWNlIGFuZCBrZWVwIGV2ZXJ5dGhpbmcgYWJvdmUgdGhlIHBsYXRmb3JtIGZl"
-    "ZS4gVGhlIHdpdG5lc3MgbmV0d29yayBzdGF5cyBmcmVlIGFuZCBvcGVuIGJ5IGRlc2lnbiAmbWRhc2g7IGl0IGlzIHRoZSBtZWNo"
-    "YW5pc20gdGhhdCBtYWtlcyB0aGUgZXZpZGVuY2UgY3JlZGlibGUsIGFuZCBjaGFyZ2luZyBmb3IgaXQgd291bGQgd2Vha2VuIHRo"
-    "ZSB0aGluZyBiZWluZyBzb2xkLjwvcD4KICA8cD5UaGUgcm91dGUgdG8gbWFya2V0IGlzIHRoZSBwbGF0Zm9ybXMsIG5vdCBvbmUg"
-    "Y3VzdG9tZXIgYXQgYSB0aW1lLiBPdGhlciBjb21wbGlhbmNlIHBsYXRmb3JtcyBhbHJlYWR5IGhvbGQgcmVsYXRpb25zaGlwcyB3"
-    "aXRoIHRoZSBleGFjdCBidXllcnMgd2hvIG5lZWQgdGhpcyBhbmQgYXJlIHVuaWZvcm1seSB3ZWFrIG9uIGV2aWRlbmNlLiBUaGUg"
-    "ZW5naW5lIHNpdHMgdW5kZXJuZWF0aCB0aGVpciBwcm9kdWN0IGFzIHRoZSBldmlkZW5jZSBsYXllciB0aGV5IGNhbid0IGJ1aWxk"
-    "IHRoZW1zZWx2ZXMuIEZpdmUgZm91bmRpbmcgc2VhdHM7IGZvdXIgYWxyZWFkeSB0YWtlbi48L3A+CjwvZGl2PgoKPGRpdiBjbGFz"
-    "cz0iYmxvY2siPgogIDxkaXYgY2xhc3M9ImJsb2NrLW51bSI+MDUgJm1kYXNoOyBUaGUgYXNrPC9kaXY+CiAgPGgyPk9uZSBvcGVy"
-    "YXRpbmcgcGFydG5lci4gMzAlIG9mIHRoZSBidXNpbmVzcy48L2gyPgogIDxkaXYgY2xhc3M9ImFzay1ib3giPgogICAgPGRpdiBj"
-    "bGFzcz0iYXNrLWxhYmVsIj5PZmZlcmVkPC9kaXY+CiAgICA8ZGl2IGNsYXNzPSJhc2stYW1vdW50Ij4zMCUgZm9yIHRoZSByaWdo"
-    "dDxicj5vcGVyYXRpbmcgcGFydG5lcjwvZGl2PgogICAgPHA+QnVpbHQgYW5kIHJ1biBhdCBuZWFyLXplcm8gZml4ZWQgY29zdCwg"
-    "bGl2ZSBhbmQgcHJvdmVuLiBFdmVyeXRoaW5nIHRoZSBoYXJkIG1vbmV5IHVzdWFsbHkgZnVuZHMgaXMgYWxyZWFkeSBkb25lLiBU"
-    "aGUgcGFydG5lciB3aG8gY2FuIG9wZW4gcmVndWxhdGVkIGVudGVycHJpc2UgYW5kIGdvdmVybm1lbnQgJm1kYXNoOyA8Yj5kZWZl"
-    "bmNlLCBoZWFsdGhjYXJlLCB0ZWxlY29tbXVuaWNhdGlvbnM8L2I+ICZtZGFzaDsgdGFrZXMgYSBzdWJzdGFudGlhbCBzdGFrZSBp"
-    "biBhIHBsYXRmb3JtIHRoYXQgaXMgcmVhZHkgdG8gc2NhbGUgdGhlIGRheSB0aGV5IHdhbGsgaW4uPC9wPgogICAgPGRpdiBjbGFz"
-    "cz0idXNlLW9mLWZ1bmRzIj4KICAgICAgPGRpdiBjbGFzcz0idWYtcm93Ij48c3Bhbj5SZWd1bGF0ZWQgZW50ZXJwcmlzZSAmYW1w"
-    "OyBnb3Zlcm5tZW50IGNoYW5uZWwgYWNjZXNzPC9zcGFuPjxzcGFuIGNsYXNzPSJ1Zi1wY3QiPmNvcmU8L3NwYW4+PC9kaXY+CiAg"
-    "ICAgIDxkaXYgY2xhc3M9InVmLXJvdyI+PHNwYW4+UmVzZWxsZXIgLyBNU1AgZGlzdHJpYnV0aW9uIGF0IHNjYWxlPC9zcGFuPjxz"
-    "cGFuIGNsYXNzPSJ1Zi1wY3QiPmNvcmU8L3NwYW4+PC9kaXY+CiAgICAgIDxkaXYgY2xhc3M9InVmLXJvdyI+PHNwYW4+RXh0ZXJu"
-    "YWwgc2VjdXJpdHkgYXVkaXQgJmFtcDsgbGVnYWwgcmV2aWV3IG9mIGNsYWltczwvc3Bhbj48c3BhbiBjbGFzcz0idWYtcGN0Ij5m"
-    "dW5kPC9zcGFuPjwvZGl2PgogICAgICA8ZGl2IGNsYXNzPSJ1Zi1yb3ciPjxzcGFuPkluZnJhc3RydWN0dXJlIGhhcmRlbmluZyBm"
-    "b3IgZW50ZXJwcmlzZSBsb2FkPC9zcGFuPjxzcGFuIGNsYXNzPSJ1Zi1wY3QiPmZ1bmQ8L3NwYW4+PC9kaXY+CiAgICA8L2Rpdj4K"
-    "ICA8L2Rpdj4KICA8cCBzdHlsZT0ibWFyZ2luLXRvcDoxNnB4Ij5UaGVzZSBhcmUgc2VjdG9ycyB3aGVyZSBldmlkZW5jZSBvYmxp"
-    "Z2F0aW9ucyBhcmUgaGFyZGVzdCwgcHJvY3VyZW1lbnQgcnVucyBlaWdodGVlbiBtb250aHMsIGFuZCBhIGZvdW5kZXIgYWxvbmUg"
-    "ZG9lcyBub3QgZ2V0IGluIHRoZSByb29tLiBUaGUgZWNvbm9taWNzIHN1aXQgZXhhY3RseSB0aGF0OiBoaWdoLXZhbHVlLCBsb25n"
-    "LWN5Y2xlLCBhbmQgc2VydmVkIGJ5IGFuIGVuZ2luZSB0aGF0IGNvc3RzIG5vdGhpbmcgbW9yZSB0byBydW4gYXQgYSB0aG91c2Fu"
-    "ZCBjdXN0b21lcnMgdGhhbiBhdCBvbmUuPC9wPgo8L2Rpdj4KCjwvZGl2PgoKPGRpdiBjbGFzcz0iY29udGFjdC1ibG9jayB3cmFw"
-    "Ij4KICA8ZGl2IGNsYXNzPSJjb250YWN0LWNhcmQiPgogICAgPGgzPlRhbGsgdG8gdGhlIGZvdW5kZXIgZGlyZWN0bHk8L2gzPgog"
-    "ICAgPHA+VGhlIGZ1bGwgdGVjaG5pY2FsIGRlbW9uc3RyYXRpb24gdGFrZXMgZmlmdGVlbiBtaW51dGVzLCBhbmQgZXZlcnkgY2xh"
-    "aW0gb24gdGhpcyBwYWdlIGNhbiBiZSB2ZXJpZmllZCBsaXZlIGR1cmluZyBpdC48L3A+CiAgICA8ZGl2IGNsYXNzPSJjb250YWN0"
-    "LWxpbmtzIj4KICAgICAgPGEgaHJlZj0ibWFpbHRvOmp1c3RyaWdodGRlY29yYXRvcnNAZ21haWwuY29tIj5qdXN0cmlnaHRkZWNv"
-    "cmF0b3JzQGdtYWlsLmNvbTwvYT4KICAgICAgPGEgaHJlZj0iaHR0cHM6Ly9zZWJiaS5wcm8iPnNlYmJpLnBybzwvYT4KICAgICAg"
-    "PGEgaHJlZj0iaHR0cHM6Ly9zZWJiaS5wcm8vbWFwIj5zZWJiaS5wcm8vbWFwICZtZGFzaDsgdGhlIHN5c3RlbSwgbWFwcGVkPC9h"
-    "PgogICAgICA8YSBocmVmPSJodHRwczovL3NlYmJpLnByby93aGl0ZXBhcGVyIj5zZWJiaS5wcm8vd2hpdGVwYXBlcjwvYT4KICAg"
-    "IDwvZGl2PgogIDwvZGl2Pgo8L2Rpdj4KCjxmb290ZXIgY2xhc3M9IndyYXAiPgogIDxwPkp1c3RpbiBBbnRvbnkgRG9ic29uICZt"
-    "aWRkb3Q7IE1vbm9wIENvbnRlbnQgJm1pZGRvdDsgQmx5dGgsIE5vcnRodW1iZXJsYW5kLCBVSzxicj4KICBUaGlzIGRvY3VtZW50"
-    "IGlzIGEgc3VtbWFyeSBmb3IgaW5mb3JtYXRpb24gYW5kIGRvZXMgbm90IGNvbnN0aXR1dGUgYW4gb2ZmZXIgb2Ygc2VjdXJpdGll"
-    "cy4gQWxsIGZpZ3VyZXMgc2hvdWxkIGJlIGluZGVwZW5kZW50bHkgdmVyaWZpZWQgYmVmb3JlIGFueSBpbnZlc3RtZW50IGRlY2lz"
-    "aW9uLiBSZWd1bGF0b3J5IGRhdGVzIGFyZSBzdGF0ZWQgYXMgYW1lbmRlZCBieSB0aGUgQUkgT21uaWJ1cyBhbmQgYXJlIHN1Ympl"
-    "Y3QgdG8gY2hhbmdlLjwvcD4KPC9mb290ZXI+Cgo8c2NyaXB0PgogIGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdkb2MtZGF0ZScp"
-    "LnRleHRDb250ZW50ID0gbmV3IERhdGUoKS50b0xvY2FsZURhdGVTdHJpbmcoJ2VuLUdCJyx7ZGF5OidudW1lcmljJyxtb250aDon"
-    "bG9uZycseWVhcjonbnVtZXJpYyd9KTsKICB2YXIgZGVhZGxpbmUgPSBuZXcgRGF0ZSgnMjAyNy0xMi0wMlQwMDowMDowMFonKTsK"
-    "ICB2YXIgbm93ID0gbmV3IERhdGUoKTsKICB2YXIgZGF5cyA9IE1hdGgubWF4KDAsIE1hdGguY2VpbCgoZGVhZGxpbmUgLSBub3cp"
-    "IC8gKDEwMDAqNjAqNjAqMjQpKSk7CiAgZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ2NvdW50ZG93bi1kYXlzJykudGV4dENvbnRl"
-    "bnQgPSBkYXlzLnRvTG9jYWxlU3RyaW5nKCkgKyAnIGRheXMnOwo8L3NjcmlwdD4KCjwvYm9keT4KPC9odG1sPgo="
-)
+PUBLIC = {("GET", "status")}
 
-_HTML = base64.b64decode("".join(_B64.split())).decode("utf-8")
-_patched = False
+PAGE_PATHS = ("/witness", "/witness.html", "/network")
+
+_patched = [False]
 
 
-def _find_handler_class(ctx):
-    if isinstance(ctx, dict):
-        for k in ("handler_class", "handler", "Handler", "h", "request_handler"):
-            v = ctx.get(k)
-            if v is None:
-                continue
-            cls = v if isinstance(v, type) else type(v)
-            if hasattr(cls, "do_GET"):
-                return cls
-    f = sys._getframe()
-    while f is not None:
-        s = f.f_locals.get("self")
-        if s is not None and hasattr(type(s), "do_GET") and hasattr(s, "wfile"):
-            return type(s)
-        f = f.f_back
-    return None
+PAGE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The witness network — AILeash</title>
+<meta name="description" content="Two independent platforms recording each other's records, hourly. Checkable by anyone, without an account.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300;9..144,600&family=Inter+Tight:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{
+  --paper:#E9EDE4;
+  --paper-deep:#DFE5D8;
+  --ink:#18241F;
+  --ink-soft:#4A5A52;
+  --rule:#BFCCBF;
+  --rule-strong:#9AAC9C;
+  --stamp:#7C2B38;
+  --verdigris:#2F6B5E;
+  --amber:#9A6B1F;
+  --gutter:#CBD6C8;
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{
+  margin:0;
+  background:var(--paper);
+  color:var(--ink);
+  font-family:"Inter Tight",system-ui,sans-serif;
+  font-size:17px;
+  line-height:1.6;
+  /* ruled paper, faint */
+  background-image:repeating-linear-gradient(
+    to bottom,
+    transparent 0 31px,
+    rgba(154,172,156,.20) 31px 32px
+  );
+}
+.wrap{max-width:1080px;margin:0 auto;padding:0 22px}
+
+/* ---------- masthead ---------- */
+.masthead{padding:52px 0 30px;border-bottom:2px solid var(--ink)}
+.eyebrow{
+  font-family:"IBM Plex Mono",monospace;
+  font-size:11.5px;letter-spacing:.18em;text-transform:uppercase;
+  color:var(--ink-soft);margin:0 0 18px;
+}
+h1{
+  font-family:Fraunces,Georgia,serif;
+  font-weight:600;font-size:clamp(2.5rem,7.5vw,4.6rem);
+  line-height:1.02;letter-spacing:-.02em;margin:0 0 20px;
+}
+h1 em{font-style:italic;font-weight:300}
+.standfirst{font-size:clamp(1.05rem,2.4vw,1.28rem);max-width:40ch;color:var(--ink-soft);margin:0}
+
+/* ---------- the spread ---------- */
+.spread{
+  margin:44px 0 8px;
+  border:1px solid var(--rule-strong);
+  background:rgba(255,255,255,.4);
+}
+.spread-head{
+  display:grid;grid-template-columns:1fr 92px 1fr;
+  border-bottom:1px solid var(--rule-strong);
+}
+.spread-head div{
+  font-family:"IBM Plex Mono",monospace;
+  font-size:11px;letter-spacing:.14em;text-transform:uppercase;
+  padding:12px 16px;color:var(--ink-soft);
+}
+.spread-head .mid{text-align:center;background:var(--gutter);color:var(--ink)}
+.spread-head .right{text-align:right}
+.folio{
+  display:grid;grid-template-columns:1fr 92px 1fr;
+  border-bottom:1px solid var(--rule);
+}
+.folio:last-child{border-bottom:0}
+.side{padding:20px 16px;min-width:0}
+.side.right{text-align:right}
+.mid{
+  background:var(--gutter);
+  display:flex;align-items:center;justify-content:center;
+  font-family:"IBM Plex Mono",monospace;font-size:11px;color:var(--ink-soft);
+  border-left:1px solid var(--rule);border-right:1px solid var(--rule);
+}
+.chain-name{
+  font-family:Fraunces,Georgia,serif;font-size:1.35rem;font-weight:600;
+  margin:0 0 4px;letter-spacing:-.01em;
+}
+.role{font-family:"IBM Plex Mono",monospace;font-size:11px;letter-spacing:.12em;
+  text-transform:uppercase;color:var(--ink-soft);margin:0 0 14px}
+.hash{
+  font-family:"IBM Plex Mono",monospace;font-size:12.5px;
+  word-break:break-all;color:var(--ink);margin:0 0 3px;line-height:1.45;
+}
+.hash-label{font-family:"IBM Plex Mono",monospace;font-size:10.5px;
+  letter-spacing:.12em;text-transform:uppercase;color:var(--ink-soft);margin:0 0 5px}
+.meta{font-size:14px;color:var(--ink-soft);margin:12px 0 0}
+.meta b{color:var(--ink);font-weight:600}
+
+/* ---------- stamp ---------- */
+.stamp{
+  display:inline-block;margin-top:16px;padding:6px 13px 5px;
+  border:2.5px solid var(--stamp);color:var(--stamp);
+  font-family:"IBM Plex Mono",monospace;font-weight:500;
+  font-size:12px;letter-spacing:.16em;text-transform:uppercase;
+  transform:rotate(-3.5deg);opacity:.9;
+}
+.stamp.press{animation:press .5s cubic-bezier(.2,1.5,.4,1) both}
+@keyframes press{
+  0%{opacity:0;transform:rotate(-3.5deg) scale(1.5)}
+  70%{opacity:.95;transform:rotate(-3.5deg) scale(.97)}
+  100%{opacity:.9;transform:rotate(-3.5deg) scale(1)}
+}
+.stamp.live{border-color:var(--verdigris);color:var(--verdigris)}
+.stamp.weak{border-color:var(--amber);color:var(--amber)}
+.stamp.flag{background:var(--stamp);color:var(--paper)}
+
+/* ---------- sections ---------- */
+section{padding:56px 0;border-top:1px solid var(--rule-strong)}
+h2{
+  font-family:Fraunces,Georgia,serif;font-weight:600;
+  font-size:clamp(1.6rem,4vw,2.3rem);letter-spacing:-.015em;
+  margin:0 0 8px;line-height:1.15;
+}
+.sec-note{color:var(--ink-soft);max-width:56ch;margin:0 0 30px}
+p{max-width:62ch}
+
+.defs{display:grid;gap:0;border-top:1px solid var(--rule)}
+.def{
+  display:grid;grid-template-columns:170px 1fr;gap:20px;
+  padding:15px 0;border-bottom:1px solid var(--rule);
+}
+.def dt{
+  font-family:"IBM Plex Mono",monospace;font-size:12px;
+  letter-spacing:.1em;text-transform:uppercase;padding-top:3px;
+}
+.def dd{margin:0;color:var(--ink-soft)}
+.dot{display:inline-block;width:8px;height:8px;margin-right:8px;border-radius:50%;vertical-align:middle}
+.dot.ok{background:var(--stamp)}
+.dot.mid-c{background:var(--verdigris)}
+.dot.weak{background:var(--amber)}
+
+.limits li{max-width:62ch;margin-bottom:13px;color:var(--ink-soft)}
+.limits b{color:var(--ink)}
+
+pre{
+  font-family:"IBM Plex Mono",monospace;font-size:13px;line-height:1.7;
+  background:var(--ink);color:var(--paper);padding:20px;overflow-x:auto;
+  border:0;margin:22px 0;
+}
+pre .k{color:#9FC6B4}
+code{font-family:"IBM Plex Mono",monospace;font-size:.92em}
+
+.links{list-style:none;padding:0;margin:24px 0 0}
+.links li{border-bottom:1px solid var(--rule);padding:13px 0}
+.links a{
+  font-family:"IBM Plex Mono",monospace;font-size:13.5px;
+  color:var(--ink);text-decoration:none;word-break:break-all;
+  display:flex;justify-content:space-between;gap:16px;align-items:baseline;
+}
+.links a:hover,.links a:focus-visible{color:var(--stamp)}
+.links span{color:var(--ink-soft);font-family:"Inter Tight",sans-serif;
+  font-size:13px;flex:0 0 auto;text-align:right}
+
+footer{padding:40px 0 70px;color:var(--ink-soft);font-size:14px}
+footer a{color:var(--ink)}
+
+.loading,.errbox{
+  font-family:"IBM Plex Mono",monospace;font-size:13px;
+  color:var(--ink-soft);padding:26px 16px;
+}
+.errbox b{display:block;color:var(--ink);margin-bottom:6px;font-family:"Inter Tight",sans-serif;font-size:15px}
+
+a:focus-visible,button:focus-visible{outline:2.5px solid var(--stamp);outline-offset:3px}
+
+@media (max-width:760px){
+  body{background-image:none}
+  .spread-head,.folio{grid-template-columns:1fr}
+  .spread-head .mid,.folio .mid{
+    border-left:0;border-right:0;
+    border-top:1px solid var(--rule);border-bottom:1px solid var(--rule);
+    padding:7px 0;text-align:center;
+  }
+  .spread-head .right,.side.right{text-align:left}
+  .spread-head div{padding:9px 14px}
+  .def{grid-template-columns:1fr;gap:5px}
+}
+@media (prefers-reduced-motion:reduce){
+  *{animation:none!important;transition:none!important}
+}
+</style>
+</head>
+<body>
+
+<div class="wrap">
+
+  <header class="masthead">
+    <p class="eyebrow">AILeash · the witness network</p>
+    <h1>Two ledgers.<br><em>Neither one is the authority.</em></h1>
+    <p class="standfirst">Independent platforms record each other's records, every hour. You can check it yourself, right now, without an account.</p>
+  </header>
+
+  <div class="spread" id="spread">
+    <div class="spread-head">
+      <div>This chain</div>
+      <div class="mid">Exchange</div>
+      <div class="right">Recorded by</div>
+    </div>
+    <div id="folios">
+      <div class="loading">Reading the ledger…</div>
+    </div>
+  </div>
+
+  <section>
+    <h2>Why this exists</h2>
+    <p class="sec-note">Every platform that sells you an audit trail also holds it.</p>
+    <p>A hash chain stops anyone else altering the record. It does not stop the operator rebuilding the whole thing and presenting the result as history. Anchoring the chain externally narrows that down — you can't rewrite anything older than your last anchor — and it still leaves the keeper and the checker as the same party.</p>
+    <p>Nothing you build alone closes that. Somebody outside has to be holding a copy.</p>
+    <p>So each platform here takes the fingerprint of the others' records and seals it into its own. To rewrite your past now, everyone holding a copy would have to rewrite theirs in step, and re-obtain external timestamps that were issued days ago. The second half is the part that can't be done.</p>
+  </section>
+
+  <section>
+    <h2>What the marks mean</h2>
+    <p class="sec-note">Two checks run on every submission. Neither can reject one — everything gets sealed. What changes is how strong we say the claim is.</p>
+
+    <dl class="defs">
+      <div class="def"><dt><span class="dot ok"></span>Confirmed</dt><dd>We fetched the address given and it served exactly the tip that was submitted.</dd></div>
+      <div class="def"><dt><span class="dot mid-c"></span>Live</dt><dd>The address served a valid but different tip. A working chain moves between submitting and our looking — normal, not a failure.</dd></div>
+      <div class="def"><dt><span class="dot weak"></span>Self-declared</dt><dd>No address given, or we couldn't reach it. Taken on their word, and marked as such.</dd></div>
+      <div class="def"><dt>First-use</dt><dd>First time this name appeared. It's now bound to the address it came from.</dd></div>
+      <div class="def"><dt>Bound</dt><dd>Same address as the first time this name appeared. The same operator, consistently.</dd></div>
+      <div class="def"><dt>Conflict</dt><dd>This name has been submitted from a different address than the one it was first bound to. Still sealed, permanently flagged. Operators do move hosts — but you get to see it and decide.</dd></div>
+    </dl>
+  </section>
+
+  <section>
+    <h2>What this does not prove</h2>
+    <p class="sec-note">Said plainly, because the value of the rest depends on it.</p>
+    <ul class="limits">
+      <li><b>It doesn't prove a record was true when it was written.</b> Nothing can. No system reaches back to verify what someone was thinking or whether the data going in was honest. This proves what was recorded, when, and that it hasn't changed since.</li>
+      <li><b>It doesn't prove identity.</b> A name is self-declared. Checking the address proves someone runs a live chain producing that data — not that they're who they say. Binding a name to its first address is what makes a change visible.</li>
+      <li><b>Two platforms checking each other isn't much of a network.</b> The strength comes from breadth. This gets meaningfully harder to bend with every chain that joins, and not before.</li>
+      <li><b>A participant can go quiet.</b> Nobody can force anyone to keep publishing. Gaps show up as stale or silent rather than disappearing, which is the point.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Joining</h2>
+    <p class="sec-note">Chains submit their current head to the network and record the heads of others in return.</p>
+    <pre><span class="k">POST</span> https://sebbi.pro/x/witness/observe
+<span class="k">Content-Type:</span> application/json
+
+{
+  "chain": "your-chain-name",
+  "tip":   "&lt;64 hex characters — your current chain head&gt;",
+  "url":   "https://yoursite/your/tip",
+  "ts":    "2026-08-02T14:00:00Z"
+}</pre>
+    <p><code>url</code> is the address we fetch to check your tip independently — it's the difference between confirmed and self-declared. <code>ts</code> is optional, epoch or ISO.</p>
+    <p>Running a chain in the other direction, recording ours as we record yours, is what makes it mutual rather than us keeping a list. If you operate a platform in this space and you're willing to have your history held somewhere you don't control, message me and we'll talk through it and what it costs.</p>
+  </section>
+
+  <section>
+    <h2>Check it yourself</h2>
+    <p class="sec-note">Nothing here needs a login. Open any of these.</p>
+    <ul class="links">
+      <li><a href="/x/witness/tip">/x/witness/tip<span>our current head</span></a></li>
+      <li><a href="/x/witness/peers">/x/witness/peers<span>everyone we record</span></a></li>
+      <li><a href="/api/verify-chain">/api/verify-chain<span>chain checked end to end</span></a></li>
+      <li><a href="/api/anchor-status">/api/anchor-status<span>the external timestamp</span></a></li>
+    </ul>
+  </section>
+
+  <footer>
+    <p>Sealed records and their attestations are held by each participating platform independently. AILeash operates one chain in this network; it does not run the network. — <a href="https://sebbi.pro">sebbi.pro</a></p>
+  </footer>
+
+</div>
+
+<script>
+(function(){
+  var folios = document.getElementById('folios');
+
+  function esc(s){
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){
+      return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+    });
+  }
+
+  function stampFor(liveness, nameStatus){
+    var cls = 'stamp press', text = String(liveness || 'unchecked');
+    if (liveness === 'confirmed') cls += '';
+    else if (liveness === 'live') cls += ' live';
+    else cls += ' weak';
+    if (nameStatus === 'conflict'){ cls += ' flag'; text = 'conflict'; }
+    return '<span class="' + cls + '">' + esc(text) + '</span>';
+  }
+
+  function ago(hours){
+    if (hours == null) return 'unknown';
+    if (hours < 1) return 'within the hour';
+    if (hours < 2) return 'an hour ago';
+    if (hours < 48) return Math.round(hours) + ' hours ago';
+    return Math.round(hours / 24) + ' days ago';
+  }
+
+  function render(ours, peers){
+    if (!peers || !peers.length){
+      folios.innerHTML = '<div class="errbox"><b>No chains recorded yet.</b>' +
+        'Nothing has been submitted to this chain. The first tip posted to ' +
+        '/x/witness/observe appears here.</div>';
+      return;
+    }
+    var html = '';
+    peers.forEach(function(p){
+      html += '<div class="folio">' +
+        '<div class="side">' +
+          '<p class="chain-name">' + esc(ours.name) + '</p>' +
+          '<p class="role">head of chain · height ' + esc(ours.height) + '</p>' +
+          '<p class="hash-label">Current tip</p>' +
+          '<p class="hash">' + esc(ours.tip) + '</p>' +
+          '<p class="meta">Sealed <b>' + esc(ours.sealed) + '</b></p>' +
+        '</div>' +
+        '<div class="mid">↔</div>' +
+        '<div class="side right">' +
+          '<p class="chain-name">' + esc(p.peer) + '</p>' +
+          '<p class="role">' + esc(p.observations) + ' observations · ' +
+              esc(p.distinct_tips) + ' distinct tips</p>' +
+          '<p class="hash-label">Name bound to</p>' +
+          '<p class="hash">' + esc(p.bound_to || 'no address supplied') + '</p>' +
+          '<p class="meta">Last recorded <b>' + esc(ago(p.hours_since_last)) + '</b> · ' +
+              esc(p.name_status || 'unchecked') + '</p>' +
+          stampFor(p.liveness, p.name_status) +
+        '</div>' +
+      '</div>';
+    });
+    folios.innerHTML = html;
+  }
+
+  function failed(){
+    folios.innerHTML = '<div class="errbox"><b>The ledger did not answer.</b>' +
+      'The endpoints are public, so you can try them directly: ' +
+      '<a href="/x/witness/peers">/x/witness/peers</a></div>';
+  }
+
+  Promise.all([
+    fetch('/x/witness/tip').then(function(r){ return r.json(); }),
+    fetch('/x/witness/peers').then(function(r){ return r.json(); })
+  ]).then(function(res){
+    var tip = res[0] || {}, peers = res[1] || {};
+    render({
+      name: 'aileash',
+      tip: tip.tip || 'unavailable',
+      height: tip.height == null ? '—' : tip.height,
+      sealed: tip.sealed_at ? new Date(tip.sealed_at).toUTCString().replace(' GMT','  UTC') : 'unknown'
+    }, peers.peers || []);
+  }).catch(failed);
+})();
+</script>
+
+</body>
+</html>
+"""
 
 
-def _install_page(ctx):
-    global _patched
-    if _patched:
-        return True
-    cls = _find_handler_class(ctx)
-    if cls is None:
-        return False
-    if getattr(cls, "_investor_patched", False):
-        _patched = True
-        return True
-    original_do_GET = cls.do_GET
+def _srv():
+    m = sys.modules.get("__main__")
+    if hasattr(m, "get_bearer"):
+        return m
+    return sys.modules.get("server")
+
+
+def _install(s):
+    """Add a page branch to do_GET at runtime. Idempotent and reversible."""
+    if _patched[0]:
+        return "already installed"
+    H = getattr(s, "Handler", None)
+    if H is None or not hasattr(H, "do_GET"):
+        return "no handler"
+    if getattr(H, "_page_patched", False):
+        _patched[0] = True
+        return "already installed"
+
+    original = H.do_GET
 
     def do_GET(self):
-        path = self.path.split("?")[0].rstrip("/") or "/"
-        if path == PAGE_PATH:
-            body = _HTML.encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+        try:
+            from urllib.parse import urlparse
+            p = urlparse(self.path).path.rstrip("/") or "/"
+        except Exception:
+            p = self.path or "/"
+        if p in PAGE_PATHS:
+            body = PAGE.encode("utf-8")
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "public, max-age=300")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception:
+                pass
             return
-        return original_do_GET(self)
+        return original(self)
 
-    cls.do_GET = do_GET
-    cls._investor_patched = True
-    _patched = True
-    return True
+    H.do_GET = do_GET
+    H._page_patched = True
+    _patched[0] = True
+    print("NETWORK: /witness page branch installed at runtime", flush=True)
+    return "installed"
 
 
 def handle(method, action, data, api_key, ctx):
-    armed = _install_page(ctx)
-    if action == "spec":
-        return ({
-            "module": "investor",
+    s = _srv()
+    if s is None:
+        return {"error": "server_not_found"}, 500
+
+    state = "already installed" if _patched[0] else None
+    if not _patched[0]:
+        try:
+            state = _install(s)
+        except Exception as exc:
+            print("NETWORK: page patch failed - " + str(exc), flush=True)
+            state = "failed: " + str(exc)
+
+    if method == "GET" and (action or "") in ("", "status"):
+        return {
+            "page": "/witness",
+            "installed": bool(_patched[0]),
+            "install_result": state,
+            "paths": list(PAGE_PATHS),
             "version": VERSION,
-            "serves": PAGE_PATH,
-            "public": [["GET", "status"], ["GET", "spec"]],
-            "note": "Hit /x/investor/status once after each deploy to arm " + PAGE_PATH + ".",
-        }, 200)
-    return ({
-        "module": "investor",
-        "version": VERSION,
-        "serves": PAGE_PATH,
-        "armed": armed,
-        "page_bytes": len(_HTML),
-    }, 200)
+            "note": "The page reads /x/witness/tip and /x/witness/peers from the browser. It holds no data of its own.",
+        }, 200
+
+    return {"error": "unknown_action", "action": action,
+            "GET": ["status"]}, 404
+
+```
 
 
-PUBLIC = {("GET", "status"), ("GET", "spec")}
+## `modules/ots.py`
+
+753 lines, 30216 bytes
+
+```python
+"""
+modules/ots.py  v1.2  -  serve the OpenTimestamps proofs, and upgrade them
+
+anchor.py stamps the chain tip hourly and writes the .ots proof to the
+anchor volume. Nothing served those files, so "anchored to Bitcoin" was a
+claim a third party had to take on trust.
+
+PENDING IS NOT CONFIRMED. A proof written at stamping time holds a PENDING
+attestation - a calendar's promise to commit the digest to Bitcoin. It is
+not evidence of anything on chain until it is UPGRADED, after the
+calendar's transaction lands. anchor.py never upgraded, so every proof
+written before this module is pending. Said plainly because an auditor's
+own verifier says it first.
+
+v1.1: the automatic upgrade now skips proofs that are already confirmed.
+v1.0 took the oldest 20 every run whether or not they were finished, so
+once those 20 confirmed it kept re-checking them forever and never reached
+the pending ones behind them. Confirmed counts now only count proofs that
+became confirmed in that run, not ones that already were.
+
+v1.2: the newest proofs matter most. Every run now upgrades half its batch
+from the newest end as well as half from the oldest, so tips of the chain
+running today confirm within hours instead of waiting behind the backlog.
+A new public route, latest_confirmed, serves the newest proof that is
+confirmed in Bitcoin AND whose tip is a block in the chain running now -
+the one address a verifier needs. Two more calendars are asked (bob and
+finney), because proofs name whichever calendars accepted them.
+
+Routes: spec, status, list, proof, latest_confirmed public. upgrade keyed.
+Proofs live at ANCHOR_DIR (default /data/anchors) - only durable on Railway
+if a volume is mounted there. /x/ots/status reports what is really present.
+"""
+
+import base64
+import hashlib
+import json
+import os
+import threading
+import time
+
+VERSION = "1.2"
+
+PUBLIC = {("GET", "spec"), ("GET", "status"), ("GET", "list"),
+          ("GET", "proof"), ("GET", "latest_confirmed")}
+
+ANCHOR_DIR = os.environ.get("ANCHOR_DIR", "/data/anchors")
+MAX_PROOF_BYTES = 262144
+
+CALENDARS = [
+    "https://a.pool.opentimestamps.org",
+    "https://b.pool.opentimestamps.org",
+    "https://alice.btc.calendar.opentimestamps.org",
+    "https://bob.btc.calendar.opentimestamps.org",
+    "https://finney.calendar.eternitywall.com",
+]
+
+# ---- automatic upgrading
+#
+# anchor.py stamps and walks away, which is how 767 proofs ended up pending.
+# This finishes the job on a timer so nobody has to remember to.
+#
+# The calendars are free public infrastructure run by volunteers. Firing 767
+# requests at them in one go would be rude and would probably get us rate
+# limited, so this works in small batches, oldest first, and skips anything
+# too young to have confirmed yet, and anything already confirmed. A backlog
+# clears over days rather than minutes, which is fine - nothing is lost by a
+# proof staying pending a little longer, and the stamp time is already fixed.
+AUTO_UPGRADE_ENABLED = os.environ.get("OTS_AUTO_UPGRADE", "1") == "1"
+AUTO_UPGRADE_INTERVAL = int(os.environ.get("OTS_UPGRADE_INTERVAL", "3600"))
+AUTO_UPGRADE_BATCH = int(os.environ.get("OTS_UPGRADE_BATCH", "20"))
+
+# A Bitcoin confirmation takes an hour or more, and the calendars aggregate
+# before they commit. Asking about a proof stamped ten minutes ago wastes a
+# request and gets a "not ready" every time.
+MIN_AGE_SECONDS = int(os.environ.get("OTS_MIN_AGE", "10800"))
+
+# Breathing room between calendar calls.
+CALENDAR_PAUSE = 0.5
+
+_auto = {"started": False, "runs": 0, "last_run": None, "last_result": None,
+         "upgraded_total": 0, "confirmed_total": 0}
+
+# Stamp ids already seen confirmed. A confirmed proof never goes back to
+# pending, so once seen it is never read or asked about again.
+_confirmed_seen = set()
+_file_lock = threading.Lock()
+
+
+def _read_index():
+    path = os.path.join(ANCHOR_DIR, "anchors.jsonl")
+    rows = []
+    if not os.path.exists(path):
+        return rows
+    try:
+        with open(path, "r") as handle:
+            for line in handle:
+                line = line.strip()
+                if line:
+                    try:
+                        rows.append(json.loads(line))
+                    except ValueError:
+                        continue
+    except Exception:
+        pass
+    return rows
+
+
+def _iso(ts):
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(ts)))
+    except Exception:
+        return None
+
+
+def _stamp_id(path):
+    if not path:
+        return None
+    name = os.path.basename(path)
+    if name.startswith("tip_") and name.endswith(".ots"):
+        return name[4:-4]
+    return None
+
+
+def _describe(raw):
+    """What is actually inside this proof. Never guesses."""
+    out = {"pending_calendars": [], "bitcoin_block_heights": [],
+           "state": "unknown", "read_error": None}
+    try:
+        from opentimestamps.core.serialize import BytesDeserializationContext
+        from opentimestamps.core.timestamp import DetachedTimestampFile
+        from opentimestamps.core.notary import (PendingAttestation,
+                                                BitcoinBlockHeaderAttestation)
+    except Exception as exc:
+        out["read_error"] = "opentimestamps library not available: %s" % exc
+        return out
+
+    try:
+        detached = DetachedTimestampFile.deserialize(
+            BytesDeserializationContext(raw))
+    except Exception as exc:
+        out["read_error"] = "could not parse proof: %s" % exc
+        out["state"] = "unreadable"
+        return out
+
+    def walk(timestamp):
+        for att in timestamp.attestations:
+            if isinstance(att, PendingAttestation):
+                uri = att.uri
+                if isinstance(uri, bytes):
+                    uri = uri.decode("utf-8", "replace")
+                if uri not in out["pending_calendars"]:
+                    out["pending_calendars"].append(uri)
+            elif isinstance(att, BitcoinBlockHeaderAttestation):
+                h = getattr(att, "height", None)
+                if h is not None and h not in out["bitcoin_block_heights"]:
+                    out["bitcoin_block_heights"].append(h)
+        for _, sub in timestamp.ops.items():
+            walk(sub)
+
+    try:
+        walk(detached.timestamp)
+    except Exception as exc:
+        out["read_error"] = "could not walk proof: %s" % exc
+        return out
+
+    if out["bitcoin_block_heights"]:
+        out["state"] = "confirmed"
+        out["means"] = ("Committed in Bitcoin block %s. Verifiable against "
+                        "the blockchain by anyone, with nothing from us."
+                        % ", ".join(str(h) for h in out["bitcoin_block_heights"]))
+    elif out["pending_calendars"]:
+        out["state"] = "pending"
+        out["means"] = ("A calendar has accepted this digest and promised to "
+                        "commit it to Bitcoin. NOT yet evidence of anything "
+                        "on chain. Upgrade it once the transaction confirms.")
+    else:
+        out["state"] = "empty"
+        out["means"] = "No attestations found in this proof."
+    return out
+
+
+def _proof_bytes(stamp_id):
+    path = os.path.join(ANCHOR_DIR, "tip_%s.ots" % stamp_id)
+    if not os.path.exists(path):
+        return None, path, "no proof file at %s" % path
+    try:
+        if os.path.getsize(path) > MAX_PROOF_BYTES:
+            return None, path, "proof unexpectedly large"
+        with open(path, "rb") as handle:
+            return handle.read(), path, None
+    except Exception as exc:
+        return None, path, "could not read proof: %s" % exc
+
+
+def _tip_for(stamp_id):
+    try:
+        with open(os.path.join(ANCHOR_DIR, "tip_%s.txt" % stamp_id)) as h:
+            return h.read().strip()
+    except Exception:
+        return None
+
+
+def _is_confirmed(sid):
+    """True if this proof already carries a Bitcoin attestation."""
+    if sid in _confirmed_seen:
+        return True
+    raw, _p, _e = _proof_bytes(sid)
+    if raw is None:
+        return False
+    if _describe(raw)["state"] == "confirmed":
+        _confirmed_seen.add(sid)
+        return True
+    return False
+
+
+def _pending_candidates(limit=None):
+    """Stamps old enough to be worth asking about and not yet confirmed,
+    oldest first.
+
+    Oldest first on purpose: the oldest pending proofs are the ones most
+    likely to have confirmed, so a backlog clears from the far end rather
+    than the recent end. Already-confirmed proofs are skipped, otherwise
+    they would fill every batch forever.
+    """
+    now = time.time()
+    out = []
+    for row in _read_index():
+        if not row.get("ots"):
+            continue
+        sid = _stamp_id(row.get("ots_file"))
+        if not sid or not sid.isdigit():
+            continue
+        if now - float(sid) < MIN_AGE_SECONDS:
+            continue
+        if not os.path.exists(os.path.join(ANCHOR_DIR, "tip_%s.ots" % sid)):
+            continue
+        if _is_confirmed(sid):
+            continue
+        out.append(sid)
+        if limit is not None and len(out) >= limit:
+            break
+    return out
+
+
+def _pending_count():
+    return len(_pending_candidates())
+
+
+def _newest_pending(limit):
+    """Pending proofs old enough to have confirmed, NEWEST first. These are
+    the tips of the chain running today, the ones a verifier asks about."""
+    now = time.time()
+    out = []
+    for row in reversed(_read_index()):
+        if not row.get("ots"):
+            continue
+        sid = _stamp_id(row.get("ots_file"))
+        if not sid or not sid.isdigit():
+            continue
+        if now - float(sid) < MIN_AGE_SECONDS:
+            continue
+        if not os.path.exists(os.path.join(ANCHOR_DIR, "tip_%s.ots" % sid)):
+            continue
+        if _is_confirmed(sid):
+            continue
+        out.append(sid)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _tip_in_chain(tip, ctx):
+    conn, lock = (ctx or {}).get("conn"), (ctx or {}).get("lock")
+    if conn is None or lock is None or not tip:
+        return None
+    try:
+        with lock:
+            r = conn.execute("SELECT id FROM audit_log WHERE audit_hash = ?",
+                             (tip,)).fetchone()
+        return r[0] if r else False
+    except Exception:
+        return None
+
+
+LATEST_SCAN = 500
+
+
+def _latest_confirmed(ctx):
+    """The newest proof that is confirmed in Bitcoin and whose tip is a
+    block in the chain running now. Checked in that order, newest first."""
+    rows = [r for r in reversed(_read_index()) if r.get("ots")]
+    looked = 0
+    for row in rows[:LATEST_SCAN]:
+        sid = _stamp_id(row.get("ots_file"))
+        if not sid or not sid.isdigit():
+            continue
+        looked += 1
+        raw, _p, _e = _proof_bytes(sid)
+        if raw is None:
+            continue
+        d = _describe(raw)
+        if d["state"] != "confirmed":
+            continue
+        _confirmed_seen.add(sid)
+        tip = (_tip_for(sid) or row.get("tip") or "").strip().lower()
+        block = _tip_in_chain(tip, ctx)
+        if block is False:
+            continue
+        out, status = _proof({"ts": sid})
+        if status != 200:
+            continue
+        out["tip_is_block"] = block
+        out["check_block"] = ("https://sebbi.pro/x/walk/block?index=%s" % block
+                              if block else None)
+        out["why_this_one"] = ("The newest proof that is confirmed in Bitcoin "
+                               "and whose tip is a block in the chain running "
+                               "now. Older confirmations of earlier chains are "
+                               "skipped, not hidden - they stay at /x/ots/list.")
+        return out, 200
+    return {"ok": False, "error": "no_confirmed_current_proof_yet",
+            "looked_at": looked,
+            "detail": "No proof of a current-chain tip has confirmed in Bitcoin "
+                      "yet. The upgrader works the newest end every hour, and "
+                      "a confirmation takes a few hours. Nothing is wrong; it "
+                      "is simply not there yet.",
+            "status": "https://sebbi.pro/x/ots/status"}, 404
+
+
+def _status():
+    rows = _read_index()
+    exists = os.path.isdir(ANCHOR_DIR)
+    files = []
+    if exists:
+        try:
+            files = [f for f in os.listdir(ANCHOR_DIR) if f.endswith(".ots")]
+        except Exception:
+            files = []
+
+    stamped = [r for r in rows if r.get("ots")]
+    out = {
+        "ok": True, "module": "ots", "version": VERSION,
+        "anchor_dir": ANCHOR_DIR,
+        "storage_present": exists,
+        "proof_files_on_disk": len(files),
+        "anchor_attempts_recorded": len(rows),
+        "stamped": len(stamped),
+        "failed": len(rows) - len(stamped),
+        "first_attempt": _iso(rows[0].get("ts")) if rows else None,
+        "last_attempt": _iso(rows[-1].get("ts")) if rows else None,
+    }
+
+    if not exists:
+        out["warning"] = (
+            "The anchor directory does not exist on this container. Either "
+            "no anchor has run, or no persistent volume is mounted at %s - "
+            "in which case every proof is lost on redeploy and the history "
+            "restarts silently. Check before calling this durable."
+            % ANCHOR_DIR)
+    elif len(files) < len(stamped):
+        out["warning"] = (
+            "%d successful stamps recorded but only %d proof files on disk. "
+            "Files have been lost, most likely to a redeploy without a "
+            "persistent volume." % (len(stamped), len(files)))
+
+    if stamped:
+        sid = _stamp_id(stamped[-1].get("ots_file"))
+        if sid:
+            raw, _p, err = _proof_bytes(sid)
+            if raw:
+                d = _describe(raw)
+                out["latest_proof"] = {
+                    "stamp_id": sid, "tip": stamped[-1].get("tip"),
+                    "stamped_at": _iso(stamped[-1].get("ts")),
+                    "state": d["state"],
+                    "bitcoin_block_heights": d["bitcoin_block_heights"],
+                    "pending_calendars": d["pending_calendars"],
+                    "means": d.get("means"),
+                    "read_error": d.get("read_error"),
+                }
+            else:
+                out["latest_proof"] = {"stamp_id": sid, "error": err}
+
+    out["auto_upgrade"] = {
+        "enabled": AUTO_UPGRADE_ENABLED,
+        "running": _auto["started"],
+        "every_seconds": AUTO_UPGRADE_INTERVAL,
+        "batch_size": AUTO_UPGRADE_BATCH,
+        "skips_proofs_under_hours": MIN_AGE_SECONDS // 3600,
+        "runs": _auto["runs"],
+        "last_run": _auto["last_run"],
+        "last_result": _auto["last_result"],
+        "upgraded_since_start": _auto["upgraded_total"],
+        "newly_confirmed_since_start": _auto["confirmed_total"],
+        "confirmed_seen": len(_confirmed_seen),
+        "pending_eligible_now": _pending_count(),
+        "note": ("Each run takes half its batch from the newest proofs and half "
+                 "from the oldest, skipping proofs already confirmed. The calendars are free infrastructure run by "
+                 "volunteers, so a backlog clears over days rather than "
+                 "minutes. Nothing is lost by a proof staying pending longer "
+                 "- the stamp time is already fixed."),
+    }
+
+    out["honest_note"] = (
+        "A proof written at stamping time is PENDING - a promise to commit "
+        "the digest to Bitcoin, not evidence that it has been. It becomes "
+        "confirmed only after being upgraded. The auto-upgrade does that on "
+        "a timer; until a proof is upgraded, pending is what it is.")
+    return out, 200
+
+
+def _list(data):
+    rows = _read_index()
+    try:
+        limit = min(int(data.get("limit", 50)), 500)
+    except (TypeError, ValueError):
+        limit = 50
+
+    out = []
+    for row in list(reversed(rows))[:limit]:
+        sid = _stamp_id(row.get("ots_file"))
+        entry = {"stamp_id": sid, "tip": row.get("tip"),
+                 "stamped_at": _iso(row.get("ts")),
+                 "ots_written": bool(row.get("ots")),
+                 "note": row.get("note")}
+        if sid:
+            entry["proof_on_disk"] = os.path.exists(
+                os.path.join(ANCHOR_DIR, "tip_%s.ots" % sid))
+            entry["proof"] = "https://sebbi.pro/x/ots/proof?ts=%s" % sid
+        out.append(entry)
+
+    return {"ok": True, "count": len(out), "anchors": out,
+            "note": "Newest first. ots_written false is a recorded failure, "
+                    "kept rather than hidden - a gap in anchoring is exactly "
+                    "what an auditor needs to see."}, 200
+
+
+def _proof(data):
+    stamp_id = str(data.get("ts") or data.get("stamp_id") or "").strip()
+    tip = str(data.get("tip") or "").strip().lower()
+
+    if not stamp_id and tip:
+        for row in reversed(_read_index()):
+            if str(row.get("tip", "")).lower() == tip and row.get("ots_file"):
+                stamp_id = _stamp_id(row.get("ots_file"))
+                break
+        if not stamp_id:
+            return {"ok": False, "error": "no_proof_for_tip", "tip": tip,
+                    "detail": "No successful stamp recorded for that tip. "
+                              "https://sebbi.pro/x/ots/list shows every "
+                              "attempt."}, 404
+
+    if not stamp_id:
+        return {"ok": False, "error": "ts_or_tip_required",
+                "detail": "?ts=<stamp_id> or ?tip=<64 hex>. Ids at "
+                          "https://sebbi.pro/x/ots/list"}, 400
+    if not stamp_id.isdigit():
+        return {"ok": False, "error": "bad_stamp_id"}, 400
+
+    raw, _path, err = _proof_bytes(stamp_id)
+    if raw is None:
+        return {"ok": False, "error": "proof_unavailable",
+                "detail": err, "stamp_id": stamp_id}, 404
+
+    d = _describe(raw)
+    recorded_tip = _tip_for(stamp_id)
+    return {
+        "ok": True, "stamp_id": stamp_id, "stamped_at": _iso(stamp_id),
+        "tip": recorded_tip, "digest_sha256": recorded_tip,
+        "proof_bytes": len(raw),
+        "proof_sha256": hashlib.sha256(raw).hexdigest(),
+        "ots_base64": base64.b64encode(raw).decode("ascii"),
+        "state": d["state"],
+        "bitcoin_block_heights": d["bitcoin_block_heights"],
+        "pending_calendars": d["pending_calendars"],
+        "means": d.get("means"), "read_error": d.get("read_error"),
+        "how_to_verify": {
+            "1": "base64 -d the ots_base64 field into tip.ots",
+            "2": "printf '%s' <tip> | xxd -r -p > tip.bin",
+            "3": "ots verify -f tip.bin tip.ots",
+            "4": "if pending: ots upgrade tip.ots",
+            "needs": "pip install opentimestamps-client. Nothing of ours.",
+        },
+        "note": "These are the bytes as written at stamping time, plus any "
+                "Bitcoin path added by upgrading. Nothing regenerated or "
+                "normalised.",
+    }, 200
+
+
+def _upgrade(data):
+    """Ask the calendars to complete pending proofs.
+
+    Upgrading only ADDS the path from the digest to a Bitcoin block. It
+    cannot change what was committed or when, which is why the standard
+    client overwrites the file too.
+    """
+    try:
+        from opentimestamps.calendar import RemoteCalendar
+        from opentimestamps.core.serialize import (BytesDeserializationContext,
+                                                   BytesSerializationContext)
+        from opentimestamps.core.timestamp import DetachedTimestampFile
+        from opentimestamps.core.notary import PendingAttestation
+    except Exception as exc:
+        return {"ok": False, "error": "library_unavailable", "detail": str(exc),
+                "fix": "add opentimestamps-client to requirements.txt"}, 501
+
+    try:
+        limit = min(int(data.get("limit", 25)), 200)
+    except (TypeError, ValueError):
+        limit = 25
+    only = str(data.get("ts") or "").strip()
+
+    auto = bool(data.get("auto"))
+
+    if auto:
+        # Half from the newest end (today's chain, what verifiers ask about),
+        # half from the oldest (the backlog). Never the same proof twice.
+        newest = _newest_pending(max(1, limit // 2))
+        oldest = [c for c in _pending_candidates(limit) if c not in newest]
+        candidates = newest + oldest[:max(0, limit - len(newest))]
+    elif only:
+        candidates = [only]
+    else:
+        # Manual run: newest first, which is what someone checking by hand
+        # usually wants to see.
+        candidates = [_stamp_id(r.get("ots_file"))
+                      for r in reversed(_read_index()) if r.get("ots")]
+        candidates = [c for c in candidates if c][:limit]
+
+    results = []
+    upgraded = newly_confirmed = already_confirmed = still_pending = errors = 0
+
+    for sid in candidates:
+        if not sid:
+            continue
+        with _file_lock:
+            raw, path, err = _proof_bytes(sid)
+            if raw is None:
+                results.append({"stamp_id": sid, "ok": False, "detail": err})
+                errors += 1
+                continue
+
+            before = _describe(raw)
+            if before["state"] == "confirmed":
+                _confirmed_seen.add(sid)
+                already_confirmed += 1
+                results.append({"stamp_id": sid, "ok": True,
+                                "state": "confirmed",
+                                "bitcoin_block_heights":
+                                    before["bitcoin_block_heights"],
+                                "action": "already complete, left alone"})
+                continue
+
+            try:
+                detached = DetachedTimestampFile.deserialize(
+                    BytesDeserializationContext(raw))
+            except Exception as exc:
+                results.append({"stamp_id": sid, "ok": False,
+                                "detail": "could not parse: %s" % exc})
+                errors += 1
+                continue
+
+            merged = [0]
+
+            def attempt(timestamp):
+                for att in list(timestamp.attestations):
+                    if not isinstance(att, PendingAttestation):
+                        continue
+                    uri = att.uri
+                    if isinstance(uri, bytes):
+                        uri = uri.decode("utf-8", "replace")
+                    if uri not in CALENDARS:
+                        continue
+                    try:
+                        completed = RemoteCalendar(uri).get_timestamp(
+                            timestamp.msg)
+                        timestamp.merge(completed)
+                        merged[0] += 1
+                    except Exception:
+                        # Not ready yet is the normal case, not an error.
+                        pass
+                    # Free volunteer-run infrastructure. Do not hammer it.
+                    time.sleep(CALENDAR_PAUSE)
+                for _, sub in list(timestamp.ops.items()):
+                    attempt(sub)
+
+            try:
+                attempt(detached.timestamp)
+            except Exception as exc:
+                results.append({"stamp_id": sid, "ok": False,
+                                "detail": "upgrade walk failed: %s" % exc})
+                errors += 1
+                continue
+
+            if merged[0] == 0:
+                still_pending += 1
+                results.append({"stamp_id": sid, "ok": True,
+                                "state": "pending",
+                                "action": "no calendar had it ready yet",
+                                "detail": "Normal. A Bitcoin confirmation "
+                                          "takes hours. Run again later."})
+                continue
+
+            try:
+                ctx = BytesSerializationContext()
+                detached.serialize(ctx)
+                new_bytes = ctx.getbytes()
+                tmp = path + ".tmp"
+                with open(tmp, "wb") as handle:
+                    handle.write(new_bytes)
+                os.replace(tmp, path)
+            except Exception as exc:
+                results.append({"stamp_id": sid, "ok": False,
+                                "detail": "upgraded but could not write: %s"
+                                          % exc})
+                errors += 1
+                continue
+
+        after = _describe(new_bytes)
+        upgraded += 1
+        if after["state"] == "confirmed":
+            _confirmed_seen.add(sid)
+            newly_confirmed += 1
+        results.append({"stamp_id": sid, "ok": True, "state": after["state"],
+                        "bitcoin_block_heights": after["bitcoin_block_heights"],
+                        "action": "upgraded, %d calendar response(s) merged"
+                                  % merged[0],
+                        "proof_bytes": len(new_bytes)})
+
+    return {"ok": True, "examined": len(results), "upgraded": upgraded,
+            "newly_confirmed": newly_confirmed,
+            "already_confirmed": already_confirmed,
+            "still_pending": still_pending,
+            "errors": errors, "results": results,
+            "note": "Upgrading only adds the path from digest to Bitcoin "
+                    "block. It cannot alter what was committed or when. "
+                    "Proofs not yet ready stay pending; nothing is lost by "
+                    "trying early."}, 200
+
+
+def _upgrade_loop():
+    """Finish what anchor.py starts. Quiet, slow, and never fatal."""
+    time.sleep(90)          # let the server come up
+    while True:
+        try:
+            result, _status_code = _upgrade({"limit": AUTO_UPGRADE_BATCH,
+                                             "auto": True})
+            _auto["runs"] += 1
+            _auto["last_run"] = _iso(time.time())
+            _auto["last_result"] = {
+                "examined": result.get("examined"),
+                "upgraded": result.get("upgraded"),
+                "newly_confirmed": result.get("newly_confirmed"),
+                "still_pending": result.get("still_pending"),
+                "errors": result.get("errors"),
+            }
+            _auto["upgraded_total"] += int(result.get("upgraded") or 0)
+            _auto["confirmed_total"] += int(result.get("newly_confirmed") or 0)
+            if result.get("upgraded"):
+                print("OTS: upgraded %s proof(s), %s newly confirmed"
+                      % (result.get("upgraded"),
+                         result.get("newly_confirmed")), flush=True)
+        except Exception as exc:
+            print("OTS upgrade loop error: %s" % exc, flush=True)
+        time.sleep(AUTO_UPGRADE_INTERVAL)
+
+
+def _start_auto():
+    if _auto["started"] or not AUTO_UPGRADE_ENABLED:
+        return
+    _auto["started"] = True
+    threading.Thread(target=_upgrade_loop, name="ots-upgrade",
+                     daemon=True).start()
+    print("OTS: auto-upgrade every %ds, %d per batch, skipping proofs under "
+          "%dh old and proofs already confirmed"
+          % (AUTO_UPGRADE_INTERVAL, AUTO_UPGRADE_BATCH,
+             MIN_AGE_SECONDS // 3600), flush=True)
+
+
+def _spec():
+    return {
+        "module": "ots", "version": VERSION,
+        "what": "Serves the OpenTimestamps proofs for the chain tip, and "
+                "upgrades pending ones to confirmed.",
+        "why": "anchor.py has stamped the tip hourly since July and nothing "
+               "served the proofs, so external anchoring was a claim rather "
+               "than something a third party could check.",
+        "pending_vs_confirmed": {
+            "pending": "Written when a calendar accepts the digest. A promise "
+                       "to commit it to Bitcoin. NOT evidence of anything on "
+                       "chain yet.",
+            "confirmed": "Carries the full path from digest to a Bitcoin "
+                         "block header. Verifiable by anyone against the "
+                         "blockchain, with nothing from us.",
+            "the_gap": "A proof does not become confirmed on its own. It must "
+                       "be upgraded - fetched again from the calendar after "
+                       "its transaction lands. This module does that on a "
+                       "timer, newest and oldest together, skipping ones "
+                       "already done.",
+        },
+        "routes": {
+            "status": "https://sebbi.pro/x/ots/status",
+            "list": "https://sebbi.pro/x/ots/list",
+            "proof": "https://sebbi.pro/x/ots/proof?ts=<stamp_id>",
+            "latest_confirmed": "https://sebbi.pro/x/ots/latest_confirmed",
+            "spec": "https://sebbi.pro/x/ots/spec",
+            "upgrade": "POST, keyed. asks the calendars to complete pending "
+                       "proofs.",
+        },
+        "verifying_without_us": [
+            "base64 -d the ots_base64 field into tip.ots",
+            "printf '%s' <tip> | xxd -r -p > tip.bin",
+            "ots verify -f tip.bin tip.ots",
+            "pip install opentimestamps-client - no code of ours involved",
+        ],
+        "what_this_does_not_prove": [
+            "That the records under the tip are true. It fixes when a hash "
+            "existed, nothing else.",
+            "Anything about blocks sealed since the last anchor. Anchoring is "
+            "hourly, so the most recent hour rests on peer witnessing.",
+            "That a pending proof will confirm. Calendars are free public "
+            "infrastructure and can fail.",
+        ],
+        "storage_warning": "Proofs live at %s. On Railway that is only "
+                           "durable with a persistent volume mounted there. "
+                           "https://sebbi.pro/x/ots/status reports what is "
+                           "present." % ANCHOR_DIR,
+    }
+
+
+try:
+    _start_auto()
+except Exception as exc:
+    print("OTS: could not start auto-upgrade: %s" % exc, flush=True)
+
+
+def handle(method, action, data, api_key, ctx):
+    data = data or {}
+    if action == "spec":
+        return _spec(), 200
+    if action in ("status", ""):
+        return _status()
+    if action == "list":
+        return _list(data)
+    if action == "proof":
+        return _proof(data)
+    if action == "latest_confirmed":
+        return _latest_confirmed(ctx)
+    if action == "upgrade":
+        if not api_key:
+            return {"ok": False, "error": "api_key_required"}, 401
+        return _upgrade(data)
+    return {"ok": False, "error": "unknown_action", "action": action}, 404
+
+```
+
+
+## `modules/oversight.py`
+
+249 lines, 11339 bytes
+
+```python
+"""
+Human oversight notary - /x/oversight/<action>
+
+THE PROBLEM
+-----------
+Nobody can prove a person thought about a decision. That is an internal state
+and no amount of logging reaches it. Any vendor claiming to prove genuine
+human oversight is overselling.
+
+But rubber stamping is not an internal state. It is a pattern, and patterns
+leave marks - if you record the right things, in the right order, at the time.
+
+WHAT THIS DOES
+--------------
+Three things, none of which claim to read minds.
+
+1. ORDER. The reviewer's own call is sealed BEFORE the machine's verdict is
+   revealed to them. Two blocks, in that order, in a chain that cannot be
+   reordered afterwards. So a reviewer cannot have simply agreed with an
+   answer they had already seen - the chain shows they committed while it was
+   still hidden.
+
+2. ATTENTION. The gap between opening the case and committing is recorded.
+   A 0.8 second approval sits in the record permanently, next to a two minute
+   one. Not proof of thought - but a 400-case history of sub-second calls is
+   not something anyone can explain away.
+
+3. INDEPENDENCE. Agreement rate over time. A reviewer who has never once
+   diverged from the machine is visible in the data. One who diverges
+   sometimes is demonstrably exercising judgement.
+
+WHAT IT DOES NOT DO
+-------------------
+- It cannot prove the reviewer read the material. They can leave a screen open.
+- Dwell time is measurable but gameable by anyone deliberately gaming it.
+- It does not stop a reviewer being wrong. It records that they decided.
+- If the integrating system shows its user the machine verdict before calling
+  /open, this proves nothing. The ordering guarantee is only as good as the
+  integration honouring it. That is a documented limit, not a hidden one.
+
+WHAT IT IS FOR
+--------------
+Turning "we have human oversight" from an assertion into a dataset that an
+auditor can test - and that a rubber stamper cannot hide inside.
+
+    POST /x/oversight/open      case_ref, material, machine_verdict, reviewer
+    POST /x/oversight/commit    case_id, reviewer_verdict, reasoning
+    GET  /x/oversight/case?id=OVS-XXXXXXXX
+    GET  /x/oversight/reviewer?id=<reviewer id>
+    GET  /x/oversight/list
+"""
+
+import hashlib, json, secrets, time
+from datetime import datetime, timezone
+
+VERSION = "1.0"
+VERDICTS = {"allow", "block", "challenge", "escalate"}
+
+_ready = False
+
+
+def _setup(ctx):
+    global _ready
+    if _ready:
+        return
+    with ctx["lock"]:
+        ctx["conn"].execute("CREATE TABLE IF NOT EXISTS oversight_cases(case_id TEXT PRIMARY KEY,api_key TEXT,case_ref TEXT,reviewer TEXT,material_hash TEXT,machine_verdict TEXT,opened REAL,committed REAL,reviewer_verdict TEXT,agreed INTEGER,dwell REAL,status TEXT DEFAULT 'open')")
+        ctx["conn"].execute("CREATE INDEX IF NOT EXISTS idx_ovs_key ON oversight_cases(api_key)")
+        ctx["conn"].execute("CREATE INDEX IF NOT EXISTS idx_ovs_rev ON oversight_cases(api_key,reviewer)")
+        ctx["conn"].commit()
+    _ready = True
+
+
+def _iso(ts):
+    if not ts:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+def _hash(x):
+    if not isinstance(x, str):
+        x = json.dumps(x, sort_keys=True)
+    return hashlib.sha256(x.encode()).hexdigest()
+
+
+def _seal_event(ctx, api_key, cid, action, detail):
+    ts = time.time()
+    ev = {"user_id": "ovs:" + cid, "action": "oversight_" + action, "amount": 0,
+          "country": "UK", "device_id": "oversight", "anomaly": 0, "device_risk": 0}
+    res = {"decision": "OVERSIGHT_SEALED", "score": 0, "oversight_action": action,
+           "oversight_version": VERSION, "timestamp": ts, "detail": detail}
+    h, idx, seq = ctx["seal"](ev, res, ts, api_key)
+    return h, idx, seq, ts
+
+
+def _open(ctx, api_key, data):
+    ref = str(data.get("case_ref", "")).strip()
+    if not ref:
+        return {"error": "case_ref_required"}, 400
+    reviewer = str(data.get("reviewer", "")).strip()
+    if not reviewer:
+        return {"error": "reviewer_required",
+                "message": "Oversight without a named reviewer is not oversight."}, 400
+    material = data.get("material")
+    if material is None:
+        return {"error": "material_required",
+                "message": "Send exactly what the reviewer will see. Only its hash is stored."}, 400
+    mv = str(data.get("machine_verdict", "")).strip().lower()
+    if mv and mv not in VERDICTS:
+        return {"error": "invalid_machine_verdict", "allowed": sorted(VERDICTS)}, 400
+
+    cid = "OVS-" + secrets.token_hex(4).upper()
+    mh = _hash(material)
+    detail = ("ref=" + ref[:80] + ";reviewer=" + reviewer[:60] +
+              ";material_sha256=" + mh + ";machine_verdict_sealed=" + (mv or "none"))
+    h, idx, seq, ts = _seal_event(ctx, api_key, cid, "opened", detail)
+
+    with ctx["lock"]:
+        ctx["conn"].execute("INSERT INTO oversight_cases(case_id,api_key,case_ref,reviewer,material_hash,machine_verdict,opened,committed,reviewer_verdict,agreed,dwell,status) VALUES(?,?,?,?,?,?,?,NULL,NULL,NULL,NULL,'open')",
+                            (cid, api_key, ref, reviewer, mh, mv or None, ts))
+        ctx["conn"].commit()
+
+    return {"case_id": cid, "opened": _iso(ts), "material_sha256": mh,
+            "audit_hash": h, "block_index": idx, "receipt_seq": seq,
+            "machine_verdict": "withheld until commit",
+            "message": "Clock running. Show the reviewer the material, not the verdict."}, 200
+
+
+def _commit(ctx, api_key, data):
+    cid = str(data.get("case_id", "")).strip()
+    with ctx["lock"]:
+        row = ctx["conn"].execute("SELECT reviewer,material_hash,machine_verdict,opened,status FROM oversight_cases WHERE case_id=? AND api_key=?", (cid, api_key)).fetchone()
+    if not row:
+        return {"error": "unknown_case_id"}, 404
+    if row[4] != "open":
+        return {"error": "already_committed",
+                "message": "A reviewer commits once. That is the point."}, 400
+
+    rv = str(data.get("reviewer_verdict", "")).strip().lower()
+    if rv not in VERDICTS:
+        return {"error": "invalid_reviewer_verdict", "allowed": sorted(VERDICTS)}, 400
+    reasoning = str(data.get("reasoning", "")).strip()
+    if not reasoning:
+        return {"error": "reasoning_required",
+                "message": "Sealed at commit, before the machine verdict is revealed. Blank is not permitted."}, 400
+
+    ts = time.time()
+    dwell = round(ts - row[3], 3)
+    agreed = None if not row[2] else (1 if rv == row[2] else 0)
+    detail = ("reviewer_verdict=" + rv + ";dwell_seconds=" + str(dwell) +
+              ";reasoning=" + reasoning[:600])
+    h, idx, seq, _x = _seal_event(ctx, api_key, cid, "committed", detail)
+
+    with ctx["lock"]:
+        ctx["conn"].execute("UPDATE oversight_cases SET committed=?,reviewer_verdict=?,agreed=?,dwell=?,status='committed' WHERE case_id=? AND api_key=?",
+                            (ts, rv, agreed, dwell, cid, api_key))
+        ctx["conn"].commit()
+
+    out = {"case_id": cid, "reviewer_verdict": rv, "dwell_seconds": dwell,
+           "audit_hash": h, "block_index": idx, "receipt_seq": seq,
+           "machine_verdict": row[2],
+           "note": "Your call was sealed before this line was returned. The chain shows the order."}
+    if agreed is not None:
+        out["agreed"] = bool(agreed)
+    if dwell < 2:
+        out["flag"] = "committed in under 2 seconds - recorded permanently"
+    return out, 200
+
+
+def _case(ctx, api_key, cid):
+    with ctx["lock"]:
+        row = ctx["conn"].execute("SELECT case_ref,reviewer,material_hash,machine_verdict,opened,committed,reviewer_verdict,agreed,dwell,status FROM oversight_cases WHERE case_id=? AND api_key=?", (cid, api_key)).fetchone()
+        if not row:
+            return {"error": "unknown_case_id"}, 404
+        blocks = ctx["conn"].execute("SELECT ts,result_json,audit_hash,key_seq FROM audit_log WHERE user_id=? ORDER BY id ASC", ("ovs:" + cid,)).fetchall()
+    events = []
+    for ts_, res, ah, seq in blocks:
+        try:
+            r = json.loads(res)
+            events.append({"at": _iso(ts_), "event": r.get("oversight_action"),
+                           "detail": r.get("detail"), "sealed": ah, "receipt_seq": seq})
+        except Exception:
+            pass
+    return {"case_id": cid, "case_ref": row[0], "reviewer": row[1],
+            "material_sha256": row[2], "machine_verdict": row[3],
+            "opened": _iso(row[4]), "committed": _iso(row[5]),
+            "reviewer_verdict": row[6],
+            "agreed": (None if row[7] is None else bool(row[7])),
+            "dwell_seconds": row[8], "status": row[9], "events": events,
+            "ordering_proof": "The opened block precedes the committed block in the chain. Neither can be reordered or altered without breaking every block after it."}, 200
+
+
+def _reviewer(ctx, api_key, rid):
+    with ctx["lock"]:
+        rows = ctx["conn"].execute("SELECT dwell,agreed FROM oversight_cases WHERE api_key=? AND reviewer=? AND status='committed'", (api_key, rid)).fetchall()
+    if not rows:
+        return {"reviewer": rid, "cases": 0,
+                "note": "No committed cases on record for this reviewer."}, 200
+    dwells = sorted(r[0] for r in rows if r[0] is not None)
+    scored = [r[1] for r in rows if r[1] is not None]
+    n = len(dwells)
+    median = dwells[n // 2] if n else None
+    under2 = len([d for d in dwells if d < 2])
+    out = {"reviewer": rid, "cases": len(rows),
+           "median_dwell_seconds": median,
+           "fastest_seconds": (dwells[0] if dwells else None),
+           "under_2_seconds": under2,
+           "under_2_seconds_pct": (round(100 * under2 / n, 1) if n else None)}
+    if scored:
+        agree = sum(scored)
+        out["agreement_rate_pct"] = round(100 * agree / len(scored), 1)
+        out["diverged"] = len(scored) - agree
+        if len(scored) >= 20 and agree == len(scored):
+            out["pattern"] = "never diverged from the machine across " + str(len(scored)) + " cases"
+    return out, 200
+
+
+def _list(ctx, api_key):
+    with ctx["lock"]:
+        rows = ctx["conn"].execute("SELECT case_id,case_ref,reviewer,opened,status,reviewer_verdict,dwell,agreed FROM oversight_cases WHERE api_key=? ORDER BY opened DESC LIMIT 200", (api_key,)).fetchall()
+    return {"count": len(rows),
+            "cases": [{"case_id": r[0], "case_ref": r[1], "reviewer": r[2],
+                       "opened": _iso(r[3]), "status": r[4],
+                       "reviewer_verdict": r[5], "dwell_seconds": r[6],
+                       "agreed": (None if r[7] is None else bool(r[7]))} for r in rows]}, 200
+
+
+def handle(method, action, data, api_key, ctx):
+    _setup(ctx)
+    if method == "POST":
+        if action == "open":
+            return _open(ctx, api_key, data)
+        if action == "commit":
+            return _commit(ctx, api_key, data)
+    else:
+        if action == "list":
+            return _list(ctx, api_key)
+        if action == "case":
+            cid = str(data.get("id", "")).strip()
+            if not cid:
+                return {"error": "id_required"}, 400
+            return _case(ctx, api_key, cid)
+        if action == "reviewer":
+            rid = str(data.get("id", "")).strip()
+            if not rid:
+                return {"error": "id_required"}, 400
+            return _reviewer(ctx, api_key, rid)
+    return {"error": "unknown_action", "action": action}, 404
+
+```
+
+
+## `modules/pack.py`
+
+501 lines, 20695 bytes
+
+```python
+"""
+Evidence pack - /x/pack/<action>
+
+WHAT THIS IS
+------------
+The sellable artifact. Everything else in this platform produces evidence;
+this produces the document someone hands an auditor.
+
+For a chosen period it does not summarise the chain, it RE-VERIFIES it:
+every block in the range is rehashed from its stored contents using the
+same function that sealed it, and compared to the hash recorded at the
+time. Then the links between blocks are walked, and for a single key the
+gapless receipt sequence is checked end to end.
+
+A summary is a claim. A re-verification is a check anyone can repeat.
+
+WHAT IT DOES NOT PROVE
+----------------------
+- That any decision recorded here was correct. Wrong answers seal just as
+  cleanly as right ones.
+- That an external peer's own chain is honest. That is checked at the
+  peer's host, not here.
+- Anything about periods outside the range requested.
+
+    GET  /x/pack/spec                        public - what this does
+    GET  /x/pack/preview?period=2026-Q2      keyed  - the pack as JSON
+    GET  /x/pack/render?period=2026-Q2       keyed  - the pack as one page
+    GET  /x/pack/history                     keyed  - packs issued
+    POST /x/pack/issue                       keyed  - seal it into the chain
+
+period accepts YYYY, YYYY-MM, YYYY-Qn. Add scope=me to limit the pack to
+your own key; omit scope for a deployment-wide pack.
+"""
+
+import calendar
+import datetime
+import hashlib
+import json
+import time
+
+VERSION = "1.0"
+
+# (METHOD, action). Only the spec is open - a pack is customer evidence.
+PUBLIC = {("GET", "spec")}
+
+MAX_ROWS = 200000
+
+_ready = False
+
+
+def _setup(ctx):
+    global _ready
+    if _ready:
+        return
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "CREATE TABLE IF NOT EXISTS pack_issued("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,"
+            "period TEXT,scope TEXT,digest TEXT,issued REAL,"
+            "entries INTEGER,verified INTEGER,mismatches INTEGER,"
+            "audit_hash TEXT,block_index INTEGER)")
+        ctx["conn"].execute(
+            "CREATE INDEX IF NOT EXISTS idx_pack_key "
+            "ON pack_issued(api_key)")
+        ctx["conn"].commit()
+    _ready = True
+
+
+def _sha(p):
+    """Identical to the engine's own sha(). Written out here rather than
+    imported so this module depends on no other module's internals."""
+    return hashlib.sha256(
+        json.dumps(p, sort_keys=True).encode()).hexdigest()
+
+
+def _iso(ts):
+    if ts is None:
+        return None
+    return datetime.datetime.utcfromtimestamp(
+        float(ts)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _day(ts):
+    if ts is None:
+        return None
+    return datetime.datetime.utcfromtimestamp(
+        float(ts)).strftime("%Y-%m-%d")
+
+
+def _epoch(y, m, d):
+    return float(calendar.timegm((y, m, d, 0, 0, 0, 0, 0, 0)))
+
+
+def _bounds(period):
+    """YYYY | YYYY-MM | YYYY-Qn -> (start, end, label)."""
+    p = str(period or "").strip().upper()
+    try:
+        if len(p) == 4:
+            y = int(p)
+            return _epoch(y, 1, 1), _epoch(y + 1, 1, 1), p
+        if len(p) == 7 and p[4] == "-" and p[5] == "Q":
+            y, q = int(p[:4]), int(p[6])
+            if q < 1 or q > 4:
+                return None
+            m = (q - 1) * 3 + 1
+            em, ey = m + 3, y
+            if em > 12:
+                em, ey = em - 12, y + 1
+            return _epoch(y, m, 1), _epoch(ey, em, 1), p
+        if len(p) == 7 and p[4] == "-":
+            y, m = int(p[:4]), int(p[5:])
+            em, ey = m + 1, y
+            if em > 12:
+                em, ey = 1, y + 1
+            return _epoch(y, m, 1), _epoch(ey, em, 1), p
+    except (ValueError, IndexError):
+        return None
+    return None
+
+
+# ----------------------------------------------------------------------
+# assembly - the actual re-verification
+# ----------------------------------------------------------------------
+
+def _assemble(ctx, start, end, label, scope):
+    c = ctx["conn"]
+    cols = ("id,ts,event_json,result_json,prev_hash,audit_hash,"
+            "api_key,key_seq")
+
+    with ctx["lock"]:
+        if scope:
+            rows = c.execute(
+                "SELECT " + cols + " FROM audit_log WHERE ts>=? AND ts<? "
+                "AND api_key=? ORDER BY id ASC LIMIT ?",
+                (start, end, scope, MAX_ROWS)).fetchall()
+            began = c.execute(
+                "SELECT MIN(ts) FROM audit_log WHERE api_key=?",
+                (scope,)).fetchone()
+            dev_all = c.execute(
+                "SELECT COUNT(*) FROM device_seen WHERE api_key=?",
+                (scope,)).fetchone()
+            dev_new = c.execute(
+                "SELECT COUNT(*) FROM device_seen WHERE api_key=? "
+                "AND first_seen>=? AND first_seen<?",
+                (scope, start, end)).fetchone()
+        else:
+            rows = c.execute(
+                "SELECT " + cols + " FROM audit_log WHERE ts>=? AND ts<? "
+                "ORDER BY id ASC LIMIT ?",
+                (start, end, MAX_ROWS)).fetchall()
+            began = c.execute("SELECT MIN(ts) FROM audit_log").fetchone()
+            dev_all = c.execute(
+                "SELECT COUNT(*) FROM device_seen").fetchone()
+            dev_new = c.execute(
+                "SELECT COUNT(*) FROM device_seen "
+                "WHERE first_seen>=? AND first_seen<?",
+                (start, end)).fetchone()
+        chain_total = c.execute(
+            "SELECT COUNT(*) FROM audit_log").fetchone()[0]
+
+    verdicts = {}
+    actions = {}
+    seqs = []
+    verified = 0
+    mismatched = []
+    link_breaks = []
+    expect_prev = None
+    per_day = {}
+
+    for rid, ts, ev_j, res_j, prev, ah, akey, kseq in rows:
+        try:
+            ev = json.loads(ev_j)
+            res = json.loads(res_j)
+        except Exception:
+            mismatched.append(rid)
+            expect_prev = ah
+            continue
+
+        if _sha({"prev_hash": prev, "ts": ts,
+                 "event": ev, "result": res}) == ah:
+            verified += 1
+        else:
+            mismatched.append(rid)
+
+        if expect_prev is not None and prev != expect_prev:
+            link_breaks.append(rid)
+        expect_prev = ah
+
+        d = str(res.get("decision", "UNRECORDED"))
+        verdicts[d] = verdicts.get(d, 0) + 1
+        a = str(ev.get("action", "unrecorded"))
+        actions[a] = actions.get(a, 0) + 1
+        if kseq is not None:
+            try:
+                seqs.append(int(kseq))
+            except (TypeError, ValueError):
+                pass
+        k = _day(ts)
+        per_day[k] = per_day.get(k, 0) + 1
+
+    # does the first block in the period chain to the one before it
+    entry_link = "no_entries_in_period"
+    if rows:
+        with ctx["lock"]:
+            before = c.execute(
+                "SELECT audit_hash FROM audit_log WHERE id<? "
+                "ORDER BY id DESC LIMIT 1", (rows[0][0],)).fetchone()
+        if before is None:
+            entry_link = ("intact_from_genesis"
+                          if rows[0][4] == "GENESIS" else "broken")
+        else:
+            entry_link = "intact" if rows[0][4] == before[0] else "broken"
+
+    seq = {"applicable": bool(scope and seqs)}
+    if seq["applicable"]:
+        lo, hi = min(seqs), max(seqs)
+        have = set(seqs)
+        missing = [n for n in range(lo, hi + 1) if n not in have]
+        seq.update({"first": lo, "last": hi, "received": len(seqs),
+                    "expected": hi - lo + 1,
+                    "missing": missing[:200],
+                    "gapless": not missing,
+                    "note": "Receipt numbers are issued with no gaps by "
+                            "construction. A missing number is a record "
+                            "that left this chain."})
+
+    clean = (not mismatched and not link_breaks
+             and entry_link in ("intact", "intact_from_genesis"))
+
+    p = {
+        "pack_version": VERSION,
+        "period": label,
+        "period_start": _iso(start),
+        "period_end": _iso(end),
+        "generated_at": _iso(time.time()),
+        "scope": ("key " + str(scope)[:12] + "\u2026") if scope
+                 else "deployment-wide",
+        "unbroken_since": _day(began[0] if began else None),
+        "entries_in_period": len(rows),
+        "chain_total_entries": chain_total,
+        "first_block": rows[0][0] if rows else None,
+        "first_hash": rows[0][5] if rows else None,
+        "last_block": rows[-1][0] if rows else None,
+        "last_hash": rows[-1][5] if rows else None,
+        "integrity": {
+            "clean": clean,
+            "blocks_recomputed": len(rows),
+            "hashes_verified": verified,
+            "hash_mismatches": mismatched[:50],
+            "link_breaks": link_breaks[:50],
+            "link_into_period": entry_link,
+            "method": "SHA-256 over {prev_hash, ts, event, result}, "
+                      "recomputed from the stored row and compared to "
+                      "the hash sealed at the time",
+        },
+        "receipt_sequence": seq,
+        "verdicts": verdicts,
+        "actions": dict(sorted(actions.items(), key=lambda x: -x[1])[:20]),
+        "devices": {"total_ever": dev_all[0] if dev_all else 0,
+                    "first_seen_in_period": dev_new[0] if dev_new else 0},
+        "busiest_days": [{"day": d, "entries": n} for d, n in
+                         sorted(per_day.items(), key=lambda x: -x[1])[:5]],
+        "check_this_yourself": {
+            "offline": "aileash_verify.py - stdlib only, no network",
+            "still_on_this_chain": "/x/consistency/ancestor?tip=<last_hash>",
+            "append_only": "/x/consistency/proof?first=&second=",
+            "record_included": "/x/complete/prove",
+            "who_witnessed_us": "/x/witness/peers",
+        },
+        "this_does_not_prove": [
+            "That any decision recorded here was correct.",
+            "That an external peer's own chain is honest - that is "
+            "checked at the peer's host, not here.",
+            "Anything about periods outside the dates above.",
+        ],
+    }
+    p["pack_digest"] = hashlib.sha256(
+        b"AILEASH-PACK-v1\x00" + json.dumps(
+            p, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return p
+
+
+# ----------------------------------------------------------------------
+# one page, self contained
+# ----------------------------------------------------------------------
+
+def _html(p):
+    ig = p["integrity"]
+    sq = p["receipt_sequence"]
+    good = "#7fe3b0"
+    bad = "#ff8a80"
+
+    def card(inner):
+        return ("<div style='background:#10182e;border:1px solid #223055;"
+                "border-radius:12px;padding:16px;margin-bottom:14px'>"
+                + inner + "</div>")
+
+    def row(k, v):
+        return ("<tr><td style='padding:7px 0;border-bottom:1px solid "
+                "#1d2a4a'>" + str(k) + "</td><td style='padding:7px 0;"
+                "border-bottom:1px solid #1d2a4a;text-align:right;"
+                "color:#c9a84c;font-weight:600'>" + str(v) + "</td></tr>")
+
+    def mono(v):
+        return ("<code style='font:12px ui-monospace,monospace;"
+                "color:#9fb3d9;word-break:break-all'>" + str(v)
+                + "</code>")
+
+    integ = ("<div style='font-size:26px;font-weight:600;color:"
+             + (good if ig["clean"] else bad) + "'>"
+             + str(ig["hashes_verified"]) + " of "
+             + str(ig["blocks_recomputed"]) + " blocks re-verified</div>"
+             "<div style='color:#93a0bd;font-size:13px;margin-top:6px'>"
+             + ig["method"] + "</div>")
+    if not ig["clean"]:
+        integ += ("<div style='color:" + bad + ";font-size:13px;"
+                  "margin-top:8px'>mismatched blocks "
+                  + str(ig["hash_mismatches"]) + " &middot; link breaks "
+                  + str(ig["link_breaks"]) + " &middot; entry link "
+                  + ig["link_into_period"] + "</div>")
+
+    if sq.get("applicable"):
+        seqbox = ("<div style='font-size:20px;font-weight:600;color:"
+                  + (good if sq["gapless"] else bad) + "'>"
+                  + ("Receipt sequence complete" if sq["gapless"]
+                     else "GAPS IN RECEIPT SEQUENCE") + "</div>"
+                  "<div style='color:#93a0bd;font-size:13px'>"
+                  + str(sq["received"]) + " of " + str(sq["expected"])
+                  + " received, numbers " + str(sq["first"]) + " to "
+                  + str(sq["last"]) + "</div>")
+        if not sq["gapless"]:
+            seqbox += ("<div style='color:" + bad + ";font:12px "
+                       "ui-monospace,monospace;margin-top:6px'>missing "
+                       + str(sq["missing"]) + "</div>")
+    else:
+        seqbox = ("<div style='color:#93a0bd;font-size:13px'>Receipt "
+                  "sequence applies to a single key. This pack is "
+                  "deployment-wide.</div>")
+
+    checks = "".join("<li><b>" + k.replace("_", " ") + "</b> " + mono(v)
+                     + "</li>" for k, v in
+                     p["check_this_yourself"].items())
+    nots = "".join("<li>" + x + "</li>" for x in p["this_does_not_prove"])
+
+    return (
+        "<!doctype html><meta charset=utf-8>"
+        "<meta name=viewport content='width=device-width,initial-scale=1'>"
+        "<title>Evidence Pack " + p["period"] + " - AILeash</title>"
+        "<body style='background:#0a0f1e;color:#e8ecf5;margin:0;"
+        "padding:22px;font:15px/1.55 -apple-system,system-ui,sans-serif'>"
+        "<div style='max-width:760px;margin:0 auto'>"
+        "<h1 style='font-size:21px;margin:0 0 4px;color:#c9a84c'>"
+        "Evidence Pack &mdash; " + p["period"] + "</h1>"
+        "<div style='color:#93a0bd;font-size:13px;margin-bottom:20px'>"
+        + p["scope"] + " &middot; " + str(p["period_start"]) + " to "
+        + str(p["period_end"]) + " &middot; generated "
+        + str(p["generated_at"]) + "</div>"
+        + card("<div style='color:#93a0bd;font-size:13px'>Unbroken since"
+               "</div><div style='font-size:26px;color:" + good
+               + ";font-weight:600'>" + str(p["unbroken_since"])
+               + "</div>")
+        + card(integ)
+        + card(seqbox)
+        + card("<table style='width:100%;border-collapse:collapse;"
+               "font-size:14px'>"
+               + row("Entries in period", p["entries_in_period"])
+               + row("Chain total entries", p["chain_total_entries"])
+               + row("Devices, total ever", p["devices"]["total_ever"])
+               + row("Devices first seen this period",
+                     p["devices"]["first_seen_in_period"])
+               + "".join(row(k, v) for k, v in sorted(
+                   p["verdicts"].items()))
+               + "".join(row(k, v) for k, v in p["actions"].items())
+               + "</table>")
+        + card("<div style='color:#93a0bd;font-size:13px'>First block</div>"
+               + mono("#" + str(p["first_block"]) + " "
+                      + str(p["first_hash"]))
+               + "<div style='color:#93a0bd;font-size:13px;margin-top:10px'>"
+                 "Last block</div>"
+               + mono("#" + str(p["last_block"]) + " "
+                      + str(p["last_hash"]))
+               + "<div style='color:#93a0bd;font-size:13px;margin-top:10px'>"
+                 "Pack digest</div>" + mono(p["pack_digest"]))
+        + card("<div style='color:#93a0bd;font-size:13px'>Check every "
+               "figure above yourself:</div><ul style='margin:6px 0 0 18px;"
+               "padding:0;font-size:13px'>" + checks + "</ul>"
+               "<div style='color:#93a0bd;font-size:13px;margin-top:14px'>"
+               "What this pack does not prove:</div>"
+               "<ul style='margin:6px 0 0 18px;padding:0;color:#93a0bd;"
+               "font-size:13px'>" + nots + "</ul>")
+        + "<div style='color:#6d7b99;font-size:12px;margin-top:18px'>"
+          "AILeash &middot; sebbi.pro</div></div>")
+
+
+# ----------------------------------------------------------------------
+
+def _resolve(data, api_key):
+    b = _bounds(data.get("period"))
+    if not b:
+        return None, ({"error": "period_required",
+                       "accepts": ["YYYY", "YYYY-MM", "YYYY-Qn"],
+                       "example": "/x/pack/preview?period=2026-Q2"}, 400)
+    start, end, label = b
+    if end > time.time():
+        return None, ({"error": "period_not_closed", "period": label,
+                       "message": "A pack can only cover a period that "
+                                  "has finished."}, 409)
+    scope = data.get("scope")
+    if scope == "me":
+        scope = api_key
+    return (start, end, label, scope or None), None
+
+
+def handle(method, action, data, api_key, ctx):
+    if action == "spec":
+        return {"module": "pack", "version": VERSION,
+                "purpose": "Re-verifies every block in a period against "
+                           "the hash sealed at the time, and checks the "
+                           "gapless receipt sequence for a single key.",
+                "periods": ["YYYY", "YYYY-MM", "YYYY-Qn"],
+                "routes": {"GET /x/pack/spec": "public",
+                           "GET /x/pack/preview?period=": "keyed, json",
+                           "GET /x/pack/render?period=": "keyed, one page",
+                           "GET /x/pack/history": "keyed",
+                           "POST /x/pack/issue": "keyed, seals the pack"},
+                "scope": "add scope=me for your key only; omit for "
+                         "deployment-wide",
+                "does_not_prove": [
+                    "That any decision recorded here was correct.",
+                    "That an external peer's chain is honest.",
+                ]}, 200
+
+    if not api_key:
+        return {"error": "invalid_api_key"}, 401
+
+    _setup(ctx)
+
+    if method == "GET":
+        if action == "history":
+            with ctx["lock"]:
+                rows = ctx["conn"].execute(
+                    "SELECT period,scope,digest,issued,entries,verified,"
+                    "mismatches,audit_hash,block_index FROM pack_issued "
+                    "WHERE api_key=? ORDER BY id DESC LIMIT 200",
+                    (api_key,)).fetchall()
+            return {"count": len(rows), "packs": [
+                {"period": r[0], "scope": r[1], "digest": r[2],
+                 "issued": _iso(r[3]), "entries": r[4],
+                 "hashes_verified": r[5], "mismatches": r[6],
+                 "sealed_in_chain": r[7], "block_index": r[8]}
+                for r in rows]}, 200
+
+        if action in ("preview", "render"):
+            got, err = _resolve(data, api_key)
+            if err:
+                return err
+            start, end, label, scope = got
+            p = _assemble(ctx, start, end, label, scope)
+            if action == "preview":
+                return p, 200
+            return {"period": label, "content_type": "text/html",
+                    "html": _html(p)}, 200
+
+    if method == "POST" and action == "issue":
+        got, err = _resolve(data, api_key)
+        if err:
+            return err
+        start, end, label, scope = got
+        p = _assemble(ctx, start, end, label, scope)
+        ig = p["integrity"]
+        ts = time.time()
+        ev = {"user_id": "pack:" + label, "action": "evidence_pack_issued",
+              "amount": 0, "country": "UK", "device_id": "pack",
+              "anomaly": 0, "device_risk": 0}
+        res = {"decision": "PACK_ISSUED", "score": 0, "pack_version": VERSION,
+               "timestamp": ts, "period": label, "scope": p["scope"],
+               "entries": p["entries_in_period"],
+               "blocks_recomputed": ig["blocks_recomputed"],
+               "hashes_verified": ig["hashes_verified"],
+               "clean": ig["clean"], "pack_digest": p["pack_digest"],
+               "note": "evidence pack issued; the pack's own digest is "
+                       "now sealed, so the document cannot be edited "
+                       "after the fact"}
+        h, idx, seq = ctx["seal"](ev, res, ts, api_key)
+        with ctx["lock"]:
+            ctx["conn"].execute(
+                "INSERT INTO pack_issued(api_key,period,scope,digest,"
+                "issued,entries,verified,mismatches,audit_hash,"
+                "block_index) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (api_key, label, p["scope"], p["pack_digest"], ts,
+                 p["entries_in_period"], ig["hashes_verified"],
+                 len(ig["hash_mismatches"]), h, idx))
+            ctx["conn"].commit()
+        p["sealed"] = {"audit_hash": h, "block_index": idx,
+                       "receipt_seq": seq}
+        return p, 200
+
+    return {"error": "unknown_action", "action": action,
+            "GET": ["spec", "preview", "render", "history"],
+            "POST": ["issue"]}, 404
 
 ```

@@ -1,51 +1,1097 @@
-# Codebase — part 6 of 36
+# Codebase — part 6 of 34
 
 Contains:
-- `modules/custody.py`
-- `modules/declare.py`
-- `modules/demo.py`
-- `modules/disclosure.py`
-- `modules/dsr.py`
-- `modules/fingerprint.py`
-- `modules/genesis.py`
+- `modules/heartbeat.py`
+- `modules/held.py`
+- `modules/integrity.py`
 
 
-## `modules/custody.py`
+## `modules/heartbeat.py`
 
-491 lines, 19866 bytes
+872 lines, 31733 bytes
 
 ```python
 """
-modules/custody.py  v1.0.2  -  independent copies, proven and counted
+heartbeat.py - the two-sided clock.
 
-The self-proving archive file (/x/archive) can be checked anywhere. This
-module proves WHERE it is actually held, by parties other than sebbi.pro.
+WHAT PROBLEM THIS SOLVES
+------------------------
+Every timestamp in this system is a number the operator wrote. External
+anchoring (OpenTimestamps) and peer witnessing both prove a record existed
+BEFORE some later public event. They are ceilings.
 
-Every day it:
-  1. asks the Internet Archive whether it holds each recent sealed file, and
-     if it does, fetches that copy and checks its fingerprint;
-  2. fetches every registered holder's copy and checks its fingerprint;
-  3. counts the independent holders whose copy is byte-for-byte a sealed
-     file, and SEALS that count - with every holder, address and
-     fingerprint - into the chain as a public block.
+Nothing proved a floor. Nothing stopped a record being created EARLIER than
+it claims, or a whole chain being pre-computed in advance and released
+slowly to look live. That is the fraud that actually happens: the grant
+written after the incident, the decision dated last Tuesday.
 
-A copy only counts if it matches a fingerprint sealed in the chain. A holder
-only counts if it is not sebbi.pro. The count can be checked by anyone, and
-cannot be inflated: every entry names an address you can fetch yourself.
+A clock cannot fix this. Anyone can write down what a clock will say at
+14:32:07 tomorrow, so hashing a clock face adds a hash, not a time.
 
-Anyone can become a holder:
-  - tap the Internet Archive link on /x/custody/status, or
-  - keep the file anywhere public and register the address:
-      https://sebbi.pro/x/custody/offer?url=https://your.site/sebbi.json&name=You
-    (it is fetched and checked before it is listed), or
-  - run the keeper script (/x/custody/keeper) daily to fetch, verify and keep
-    each day's file automatically.
+WHAT DOES FIX IT
+----------------
+A public beacon: a source that ticks on a fixed cadence like a clock, but
+whose value at each tick cannot be known by anyone until the tick happens.
+drand (League of Entropy) publishes one every 30 seconds. Bitcoin publishes
+one roughly every ten minutes.
 
-Routes (public): status, holders, offer, keeper, spec. run is keyed.
-Armed by the first visit to /x/custody/status.
+Fold that value into a sealed block and the block cannot have been created
+before the tick existed. Not because we say so - because it contains a
+number that did not exist yet.
+
+THE INTERLEAVE, WHICH IS THE WHOLE TRICK
+----------------------------------------
+We do NOT stamp every decision. We seal one beat into the chain every few
+minutes. The chain is append-only and prev-hash linked, so any record
+sitting between beat A and beat B was necessarily created after A and
+before B.
+
+One beat therefore gives a floor to every record that follows it, and the
+next beat gives all of them a ceiling. Every decision gets a two-sided
+window for free, with no change to seal(), no change to server.py, and no
+extra latency on the decision path.
+
+The window width is published on every answer. It is a live public
+measurement of how much room the operator would have to lie in. It is the
+only number in this system that gets better by us doing more work, and
+worse by us doing less, which is why it is published.
+
+WHAT THIS DOES NOT DO
+---------------------
+- It does not prove the record is true. It proves when it can have been made.
+- It does not verify drand's BLS signature (not feasible in pure stdlib).
+  It records the round and the randomness verbatim, and anyone can re-fetch
+  that round from drand and confirm the value matches. Deterministic,
+  public, and does not involve us.
+- A record inside an open window (after the last beat, before the next) has
+  a floor and no ceiling yet. That is reported as open, never as closed.
+- Beats can only be sealed by whoever runs this server. What stops the
+  operator sealing a stale tick is that the tick is timestamped and public:
+  sealing round N long after round N happened widens the window and shows.
+
+Contract: handle(method, action, data, api_key, ctx) -> (dict, status)
+Routes:
+  GET  spec        public   what this is, how to verify it yourself
+  GET  latest      public   the most recent beat sealed
+  GET  ticks       public   recent beats
+  GET  window      public   ?block= or ?receipt= - the two-sided window
+  GET  verify      public   ?round= - what we sealed, and where to check it
+  GET  status      public   cadence, coverage, mean window
+  POST beat        keyed    fetch a tick now and seal it
+  POST source      keyed    add a beacon reading fetched elsewhere (air-gap)
 """
 
-import gzip
+import json
+import time
+import sqlite3
+import threading
+import urllib.request
+import urllib.error
+
+VERSION = "1.3.0"
+
+PUBLIC = {
+    ("GET", "spec"),
+    ("GET", "latest"),
+    ("GET", "ticks"),
+    ("GET", "window"),
+    ("GET", "verify"),
+    ("GET", "status"),
+}
+
+# ---------------------------------------------------------------------
+# Beacon sources. Fixed hosts only - this is an allowlist, not a fetcher.
+# ---------------------------------------------------------------------
+# Each source: name, url, cadence in seconds, and a parser returning
+# (round, value, source_time_or_None).
+
+BEACON_HOSTS = {
+    "api.drand.sh",
+    "drand.cloudflare.com",
+    "mempool.space",
+}
+
+FETCH_TIMEOUT = 8
+MAX_BODY = 65536
+
+BEAT_SECONDS = 300          # one beat every five minutes
+AUTO_BEAT = True
+MIN_BEAT_GAP = 60           # refuse to beat more often than this
+
+_timer_lock = threading.Lock()
+_timer_started = False
+_beat_runs = 0
+_beat_last = None
+_beat_last_error = None
+
+
+def _parse_drand(raw):
+    d = json.loads(raw)
+    rnd = int(d["round"])
+    val = str(d["randomness"])
+    if not val or len(val) < 32:
+        raise ValueError("drand randomness missing or too short")
+    return rnd, val, None
+
+
+def _parse_btc_tip(raw):
+    val = raw.strip()
+    if len(val) != 64 or any(c not in "0123456789abcdefABCDEF" for c in val):
+        raise ValueError("bitcoin tip hash not a 64-char hex string")
+    return None, val.lower(), None
+
+
+SOURCES = [
+    {
+        "name": "drand-quicknet",
+        "url": "https://api.drand.sh/v2/beacons/quicknet/rounds/latest",
+        "cadence_seconds": 3,
+        "parse": _parse_drand,
+        "verify_url": "https://api.drand.sh/v2/beacons/quicknet/rounds/{round}",
+        "note": "League of Entropy public randomness beacon, quicknet chain",
+    },
+    {
+        "name": "drand-default",
+        "url": "https://api.drand.sh/public/latest",
+        "cadence_seconds": 30,
+        "parse": _parse_drand,
+        "verify_url": "https://api.drand.sh/public/{round}",
+        "note": "League of Entropy public randomness beacon, default chain",
+    },
+    {
+        "name": "bitcoin-tip",
+        "url": "https://mempool.space/api/blocks/tip/hash",
+        "cadence_seconds": 600,
+        "parse": _parse_btc_tip,
+        "verify_url": "https://mempool.space/block/{value}",
+        "note": "Bitcoin chain tip - slower, but the hardest to influence",
+    },
+]
+
+VOCABULARY = {
+    "floor": (
+        "The record was created after this beat, because the chain is "
+        "append-only and the record sits after a block containing a value "
+        "that did not exist before the beat."
+    ),
+    "ceiling": (
+        "The record was created before this beat, because the record sits "
+        "before it in an append-only chain."
+    ),
+    "window": (
+        "The span between floor and ceiling. The record can have been "
+        "created at any moment inside it and no moment outside it. Smaller "
+        "is stronger. This is a measurement, not a claim."
+    ),
+    "open": (
+        "There is a floor but no ceiling yet: the next beat has not been "
+        "sealed. Reported as open rather than closed. It closes on the "
+        "next beat, and nothing about the record changes when it does."
+    ),
+    "unfloored": (
+        "The record predates the first beat ever sealed. It has no floor "
+        "from this module. Its ceiling still holds."
+    ),
+}
+
+WHAT_THIS_PROVES = (
+    "A window, not a truth. Inside the window the record could have been "
+    "created at any instant. Outside it, it could not have been created at "
+    "all. It says nothing about whether the record's contents are correct."
+)
+
+DDL = [
+    """CREATE TABLE IF NOT EXISTS heartbeat_tick (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        source       TEXT NOT NULL,
+        beacon_round INTEGER,
+        value        TEXT NOT NULL,
+        fetched_at   REAL NOT NULL,
+        cadence      INTEGER,
+        chain_rowid  INTEGER,
+        audit_hash   TEXT,
+        note         TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_hb_rowid ON heartbeat_tick(chain_rowid)",
+    "CREATE INDEX IF NOT EXISTS idx_hb_round ON heartbeat_tick(source, beacon_round)",
+]
+
+
+# ---------------------------------------------------------------------
+# plumbing
+# ---------------------------------------------------------------------
+
+def _ensure(conn, lock):
+    with lock:
+        cur = conn.cursor()
+        for stmt in DDL:
+            cur.execute(stmt)
+        # diagnostic columns, added without breaking an existing table
+        cur.execute("PRAGMA table_info(heartbeat_tick)")
+        have = [r[1] for r in cur.fetchall()]
+        for col in ("seal_shape", "seal_error"):
+            if col not in have:
+                try:
+                    cur.execute("ALTER TABLE heartbeat_tick ADD COLUMN %s TEXT" % col)
+                except Exception:
+                    pass
+        conn.commit()
+
+
+def _host_of(url):
+    try:
+        rest = url.split("://", 1)[1]
+    except IndexError:
+        return ""
+    return rest.split("/", 1)[0].split(":", 1)[0].lower()
+
+
+def _fetch(url):
+    if not url.startswith("https://"):
+        raise ValueError("https only")
+    host = _host_of(url)
+    if host not in BEACON_HOSTS:
+        raise ValueError("host not on the beacon allowlist: %s" % host)
+    req = urllib.request.Request(url, headers={"User-Agent": "aileash-heartbeat/1.0"})
+    with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT) as r:
+        return r.read(MAX_BODY).decode("utf-8", "replace")
+
+
+def _read_tick(fetcher=None):
+    """Try each source in order. Returns dict or raises."""
+    fetcher = fetcher or _fetch
+    errors = []
+    for src in SOURCES:
+        try:
+            raw = fetcher(src["url"])
+            rnd, val, _ = src["parse"](raw)
+            return {
+                "source": src["name"],
+                "beacon_round": rnd,
+                "value": val,
+                "cadence": src["cadence_seconds"],
+                "note": src["note"],
+            }
+        except Exception as e:
+            errors.append("%s: %s" % (src["name"], e))
+    raise RuntimeError("no beacon reachable | " + " | ".join(errors))
+
+
+def _seal(ctx, action, payload):
+    """Seal through the host's seal().
+
+    Confirmed from server.py: seal(event, result, ts, api_key=None) where
+    EVENT IS A DICT carrying user_id (it is subscripted inside), and the
+    return is (audit_hash, block_index, key_seq). So the block position
+    comes back directly and does not have to be guessed from MAX(rowid).
+
+    Returns (ok, shape, error, audit_hash, block_index).
+    """
+    fn = ctx.get("seal")
+    if fn is None:
+        return False, None, "ctx has no seal function", None, None
+
+    ts = time.time()
+    event = {
+        "user_id": "heartbeat",
+        "action": action,
+        "amount": 0,
+        "country": "UK",
+        "device_id": "heartbeat",
+        "anomaly": 0,
+        "device_risk": 0,
+    }
+    result = dict(payload)
+    result.setdefault("decision", "BEACON_SEALED")
+    result.setdefault("score", 0)
+    result.setdefault("version", VERSION)
+    result.setdefault("timestamp", ts)
+
+    attempts = [
+        ("seal(event_dict, result, ts)", lambda: fn(event, result, ts)),
+        ("seal(event_dict, result, ts, None)", lambda: fn(event, result, ts, None)),
+        ("seal(event_dict, result)", lambda: fn(event, result)),
+    ]
+
+    errors = []
+    for shape, call in attempts:
+        try:
+            out = call()
+        except Exception as e:
+            errors.append("%s -> %s: %s" % (shape, type(e).__name__, e))
+            continue
+        h = idx = None
+        if isinstance(out, (tuple, list)):
+            for item in out:
+                if isinstance(item, str) and len(item) == 64 and h is None:
+                    h = item
+                elif isinstance(item, int) and idx is None:
+                    idx = item
+        elif isinstance(out, str):
+            h = out
+        return True, shape, None, h, idx
+    return False, None, " | ".join(errors), None, None
+
+
+def _audit_table(conn):
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='audit_log'")
+    return cur.fetchone() is not None
+
+
+def _cols(conn, table):
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(%s)" % table)
+    return [r[1] for r in cur.fetchall()]
+
+
+def _hash_col(conn):
+    c = _cols(conn, "audit_log")
+    for name in ("audit_hash", "hash", "block_hash"):
+        if name in c:
+            return name
+    return None
+
+
+def _latest_rowid(conn):
+    cur = conn.cursor()
+    cur.execute("SELECT MAX(rowid) FROM audit_log")
+    row = cur.fetchone()
+    return row[0] if row and row[0] is not None else 0
+
+
+def _backfill(conn, lock, tick_id):
+    """After a seal, learn which chain row it landed on."""
+    hcol = _hash_col(conn)
+    with lock:
+        cur = conn.cursor()
+        cur.execute("SELECT MAX(rowid) FROM audit_log")
+        row = cur.fetchone()
+        rid = row[0] if row and row[0] is not None else None
+        h = None
+        if rid is not None and hcol:
+            cur.execute("SELECT %s FROM audit_log WHERE rowid=?" % hcol, (rid,))
+            r2 = cur.fetchone()
+            h = r2[0] if r2 else None
+        cur.execute(
+            "UPDATE heartbeat_tick SET chain_rowid=?, audit_hash=? WHERE id=?",
+            (rid, h, tick_id),
+        )
+        conn.commit()
+    return rid, h
+
+
+# ---------------------------------------------------------------------
+# the beat
+# ---------------------------------------------------------------------
+
+def _do_beat(ctx, fetcher=None, forced=False):
+    global _beat_runs, _beat_last, _beat_last_error
+    conn, lock = ctx["conn"], ctx["lock"]
+    _ensure(conn, lock)
+
+    with lock:
+        cur = conn.cursor()
+        cur.execute("SELECT fetched_at FROM heartbeat_tick ORDER BY id DESC LIMIT 1")
+        row = cur.fetchone()
+    if row and not forced and (time.time() - row[0]) < MIN_BEAT_GAP:
+        return {"beat": False, "reason": "too_soon", "min_gap_seconds": MIN_BEAT_GAP}, 429
+
+    tick = _read_tick(fetcher)
+    now = time.time()
+
+    event = "heartbeat_beat"
+    result = {
+        "kind": "beacon_tick",
+        "source": tick["source"],
+        "round": tick["beacon_round"],
+        "value": tick["value"],
+        "cadence_seconds": tick["cadence"],
+        "fetched_at": now,
+        "note": (
+            "Unpredictable public value. Any block after this one in this "
+            "append-only chain was created after this tick existed."
+        ),
+    }
+
+    with lock:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO heartbeat_tick (source, beacon_round, value, fetched_at,"
+            " cadence, note) VALUES (?,?,?,?,?,?)",
+            (tick["source"], tick["beacon_round"], tick["value"], now,
+             tick["cadence"], tick["note"]),
+        )
+        tick_id = cur.lastrowid
+        conn.commit()
+
+    ok, shape, err, h, rid = _seal(ctx, event, result)
+    if ok and (rid is None or h is None):
+        try:
+            rid2, h2 = _backfill(conn, lock, tick_id)
+            rid = rid if rid is not None else rid2
+            h = h if h is not None else h2
+        except Exception:
+            pass
+    with lock:
+        conn.execute("UPDATE heartbeat_tick SET seal_shape=?, seal_error=?,"
+                     " chain_rowid=?, audit_hash=? WHERE id=?",
+                     (shape, err, rid, h, tick_id))
+        conn.commit()
+
+    _beat_runs += 1
+    _beat_last = now
+    _beat_last_error = err
+
+    return {
+        "beat": True,
+        "sealed_into_chain": bool(ok and rid),
+        "seal_shape": shape,
+        "seal_error": err,
+        "tick_id": tick_id,
+        "source": tick["source"],
+        "round": tick["beacon_round"],
+        "value": tick["value"],
+        "cadence_seconds": tick["cadence"],
+        "sealed_at_chain_rowid": rid,
+        "audit_hash": h,
+        "verify_yourself": _verify_url(tick["source"], tick["beacon_round"], tick["value"]),
+    }, 200
+
+
+def _verify_url(source, rnd, value):
+    for s in SOURCES:
+        if s["name"] == source:
+            u = s["verify_url"]
+            if rnd is not None:
+                return u.replace("{round}", str(rnd)).replace("{value}", str(value))
+            return u.replace("{value}", str(value))
+    return None
+
+
+def _start_timer(ctx):
+    global _timer_started
+    with _timer_lock:
+        if _timer_started or not AUTO_BEAT:
+            return
+        _timer_started = True
+
+    for t in threading.enumerate():
+        if t.name == "heartbeat" and t.is_alive():
+            return
+
+    def loop():
+        global _beat_last_error
+        while True:
+            try:
+                _do_beat(ctx)
+            except Exception as e:
+                _beat_last_error = str(e)
+            time.sleep(BEAT_SECONDS)
+
+    t = threading.Thread(target=loop, name="heartbeat", daemon=True)
+    t.start()
+
+
+# ---------------------------------------------------------------------
+# the window
+# ---------------------------------------------------------------------
+
+def _find_rowid(conn, block, receipt):
+    if block is not None:
+        try:
+            return int(block)
+        except (TypeError, ValueError):
+            return None
+    if receipt:
+        hcol = _hash_col(conn)
+        if not hcol:
+            return None
+        cur = conn.cursor()
+        cur.execute("SELECT rowid FROM audit_log WHERE %s=? LIMIT 1" % hcol, (receipt,))
+        r = cur.fetchone()
+        return r[0] if r else None
+    return None
+
+
+def _window_for(conn, rowid):
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, source, beacon_round, value, fetched_at, chain_rowid, audit_hash"
+        " FROM heartbeat_tick WHERE chain_rowid IS NOT NULL AND chain_rowid<=?"
+        " ORDER BY chain_rowid DESC LIMIT 1", (rowid,))
+    floor = cur.fetchone()
+    cur.execute(
+        "SELECT id, source, beacon_round, value, fetched_at, chain_rowid, audit_hash"
+        " FROM heartbeat_tick WHERE chain_rowid IS NOT NULL AND chain_rowid>?"
+        " ORDER BY chain_rowid ASC LIMIT 1", (rowid,))
+    ceil = cur.fetchone()
+    return floor, ceil
+
+
+def _beat_obj(row, err=None, shape=None):
+    if not row:
+        return None
+    out = {
+        "source": row[1],
+        "round": row[2],
+        "value": row[3],
+        "at": _iso(row[4]),
+        "at_epoch": row[4],
+        "chain_rowid": row[5],
+        "audit_hash": row[6],
+        "verify_yourself": _verify_url(row[1], row[2], row[3]),
+    }
+    if row[5] is None:
+        out["in_chain"] = False
+        out["warning"] = ("This beat is NOT sealed into the chain, so it is "
+                          "not a floor for anything. See seal_error.")
+        if err:
+            out["seal_error"] = err
+    else:
+        out["in_chain"] = True
+        if shape:
+            out["seal_shape"] = shape
+    return out
+
+
+def _iso(t):
+    if t is None:
+        return None
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+
+
+def _human(seconds):
+    if seconds is None:
+        return None
+    s = int(round(seconds))
+    if s < 60:
+        return "%d seconds" % s
+    if s < 3600:
+        return "%d minutes %d seconds" % (s // 60, s % 60)
+    return "%d hours %d minutes" % (s // 3600, (s % 3600) // 60)
+
+
+# ---------------------------------------------------------------------
+# handle
+# ---------------------------------------------------------------------
+
+def handle(method, action, data, api_key, ctx):
+    conn, lock = ctx["conn"], ctx["lock"]
+
+    if not _audit_table(conn):
+        return {"error": "audit_log_missing"}, 500
+
+    _ensure(conn, lock)
+    _start_timer(ctx)
+
+    if method == "GET" and action == "spec":
+        return _spec(), 200
+
+    if method == "GET" and action == "latest":
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, source, beacon_round, value, fetched_at, chain_rowid,"
+            " audit_hash FROM heartbeat_tick ORDER BY id DESC LIMIT 1")
+        row = cur.fetchone()
+        if not row:
+            return {"beats": 0, "message": "no beat sealed yet"}, 200
+        age = time.time() - row[4]
+        return {
+            "latest_beat": _beat_obj(row),
+            "seconds_since": round(age, 1),
+            "open_window_so_far": _human(age),
+            "meaning": (
+                "Anything sealed since this beat has this beat as its floor "
+                "and no ceiling until the next beat."
+            ),
+        }, 200
+
+    if method == "GET" and action == "ticks":
+        try:
+            limit = min(int(data.get("limit", 25)), 200)
+        except (TypeError, ValueError):
+            limit = 25
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, source, beacon_round, value, fetched_at, chain_rowid,"
+            " audit_hash, seal_error, seal_shape FROM heartbeat_tick"
+            " ORDER BY id DESC LIMIT ?", (limit,))
+        rows = cur.fetchall()
+        return {
+            "count": len(rows),
+            "beats": [_beat_obj(r, r[7], r[8]) for r in rows],
+            "cadence_target_seconds": BEAT_SECONDS,
+        }, 200
+
+    if method == "GET" and action == "window":
+        rowid = _find_rowid(conn, data.get("block"), data.get("receipt"))
+        if rowid is None:
+            return {"error": "block_or_receipt_required",
+                    "usage": "/x/heartbeat/window?block=846 or ?receipt=<audit_hash>"}, 400
+
+        floor, ceil = _window_for(conn, rowid)
+        out = {
+            "block": rowid,
+            "floor": _beat_obj(floor),
+            "ceiling": _beat_obj(ceil),
+            "what_this_proves": WHAT_THIS_PROVES,
+            "vocabulary": VOCABULARY,
+        }
+
+        if floor and ceil:
+            width = ceil[4] - floor[4]
+            out["state"] = "closed"
+            out["window_seconds"] = round(width, 1)
+            out["window"] = _human(width)
+            out["statement"] = (
+                "Block %d was created after %s and before %s. Window: %s."
+                % (rowid, _iso(floor[4]), _iso(ceil[4]), _human(width))
+            )
+        elif floor:
+            width = time.time() - floor[4]
+            out["state"] = "open"
+            out["window_seconds_so_far"] = round(width, 1)
+            out["window_so_far"] = _human(width)
+            out["statement"] = (
+                "Block %d was created after %s. The ceiling is not sealed "
+                "yet, so the window is open." % (rowid, _iso(floor[4]))
+            )
+        elif ceil:
+            out["state"] = "unfloored"
+            out["statement"] = (
+                "Block %d predates the first beat, so it has no floor from "
+                "this module. It was created before %s." % (rowid, _iso(ceil[4]))
+            )
+        else:
+            out["state"] = "no_beats"
+            out["statement"] = "No beats have been sealed, so no window exists."
+
+        out["external_ceiling"] = {
+            "note": (
+                "A second, independent ceiling comes from OpenTimestamps. "
+                "Anchoring is per proof and has its own pending/confirmed "
+                "state."
+            ),
+            "where": "/x/ots/status",
+        }
+        return out, 200
+
+    if method == "GET" and action == "verify":
+        rnd = data.get("round")
+        if rnd is None:
+            return {"error": "round_required"}, 400
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, source, beacon_round, value, fetched_at, chain_rowid,"
+            " audit_hash FROM heartbeat_tick WHERE beacon_round=?"
+            " ORDER BY id DESC LIMIT 1", (rnd,))
+        row = cur.fetchone()
+        if not row:
+            return {"error": "round_not_sealed", "round": rnd}, 404
+        return {
+            "sealed": _beat_obj(row),
+            "how_to_verify": [
+                "Fetch the round from the beacon operator at the url above.",
+                "Compare its randomness with the value we sealed. They must match.",
+                "Confirm the beat's audit_hash is in our chain at /api/verify-chain.",
+                "Nothing in these three steps requires our cooperation.",
+            ],
+            "we_do_not_verify_the_signature": (
+                "drand signs each round with BLS, which this server does not "
+                "implement. We record the round and value verbatim. The "
+                "operator's own endpoint is the authority, not us."
+            ),
+        }, 200
+
+    if method == "GET" and action == "status":
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*), MIN(fetched_at), MAX(fetched_at) FROM heartbeat_tick")
+        n, first, last = cur.fetchone()
+        cur.execute(
+            "SELECT fetched_at FROM heartbeat_tick WHERE chain_rowid IS NOT NULL"
+            " ORDER BY chain_rowid ASC")
+        times = [r[0] for r in cur.fetchall()]
+        gaps = [times[i + 1] - times[i] for i in range(len(times) - 1)]
+        mean = sum(gaps) / len(gaps) if gaps else None
+        widest = max(gaps) if gaps else None
+        cur.execute("SELECT MAX(rowid) FROM audit_log")
+        tip = cur.fetchone()[0] or 0
+        cur.execute("SELECT MIN(chain_rowid) FROM heartbeat_tick WHERE chain_rowid IS NOT NULL")
+        firstrow = cur.fetchone()[0]
+        covered = (tip - firstrow) if firstrow else 0
+        return {
+            "version": VERSION,
+            "beats_sealed": n,
+            "first_beat": _iso(first),
+            "latest_beat": _iso(last),
+            "cadence_target_seconds": BEAT_SECONDS,
+            "auto_beat": AUTO_BEAT,
+            "timer_running": _timer_started,
+            "beat_runs_this_process": _beat_runs,
+            "last_error": _beat_last_error,
+            "beats_not_in_chain": _orphans(conn),
+            "last_seal_error": _last_seal_error(conn),
+            "last_seal_shape": _last_seal_shape(conn),
+            "mean_window_seconds": round(mean, 1) if mean else None,
+            "mean_window": _human(mean),
+            "widest_window_seconds": round(widest, 1) if widest else None,
+            "widest_window": _human(widest),
+            "records_with_a_floor": covered,
+            "chain_height": tip,
+            "honest_note": (
+                "Mean window is the average distance between beats. It is the "
+                "typical amount of room a record has. Widest is the worst "
+                "case, which is the number that actually matters."
+            ),
+        }, 200
+
+    if method == "POST" and action == "beat":
+        try:
+            return _do_beat(ctx, forced=bool(data.get("force")))
+        except Exception as e:
+            return {"beat": False, "error": "beacon_unreachable", "detail": str(e)}, 503
+
+    if method == "POST" and action == "source":
+        # For an engine with no outbound network. The operator hands it a
+        # reading fetched elsewhere. Sealed exactly as supplied and marked.
+        val = data.get("value")
+        src = data.get("source") or "supplied"
+        rnd = data.get("round")
+        if not val or len(str(val)) < 32:
+            return {"error": "value_required", "note": "at least 32 characters"}, 400
+        now = time.time()
+        with lock:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO heartbeat_tick (source, beacon_round, value,"
+                " fetched_at, cadence, note) VALUES (?,?,?,?,?,?)",
+                (src, rnd, str(val), now, None,
+                 "supplied by operator, not fetched by this server"),
+            )
+            tick_id = cur.lastrowid
+            conn.commit()
+        ok, shape, err, h, rid = _seal(ctx, "heartbeat_beat", {
+            "kind": "beacon_tick_supplied",
+            "source": src, "round": rnd, "value": str(val), "fetched_at": now,
+            "note": ("Supplied by the operator rather than fetched here. The "
+                     "floor it gives is only as good as the reader's trust in "
+                     "that source, and it is marked so nobody mistakes it."),
+        })
+        if ok and (rid is None or h is None):
+            try:
+                rid2, h2 = _backfill(conn, lock, tick_id)
+                rid = rid if rid is not None else rid2
+                h = h if h is not None else h2
+            except Exception:
+                pass
+        with lock:
+            conn.execute("UPDATE heartbeat_tick SET seal_shape=?, seal_error=?,"
+                         " chain_rowid=?, audit_hash=? WHERE id=?",
+                         (shape, err, rid, h, tick_id))
+            conn.commit()
+        return {"beat": True, "supplied": True, "tick_id": tick_id,
+                "sealed_at_chain_rowid": rid, "audit_hash": h,
+                "marked": "supplied by operator, not fetched by this server"}, 200
+
+    return {"error": "unknown_action", "action": action,
+            "actions": ["spec", "latest", "ticks", "window", "verify",
+                        "status", "beat", "source"]}, 404
+
+
+def _orphans(conn):
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM heartbeat_tick WHERE chain_rowid IS NULL")
+        return cur.fetchone()[0]
+    except Exception:
+        return None
+
+
+def _last_seal_error(conn):
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT seal_error FROM heartbeat_tick WHERE seal_error IS NOT NULL"
+                    " ORDER BY id DESC LIMIT 1")
+        r = cur.fetchone()
+        return r[0] if r else None
+    except Exception:
+        return None
+
+
+def _last_seal_shape(conn):
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT seal_shape FROM heartbeat_tick WHERE seal_shape IS NOT NULL"
+                    " ORDER BY id DESC LIMIT 1")
+        r = cur.fetchone()
+        return r[0] if r else None
+    except Exception:
+        return None
+
+
+def _spec():
+    return {
+        "module": "heartbeat",
+        "version": VERSION,
+        "what_it_is": (
+            "A clock nobody can wind. Public beacon values are sealed into "
+            "the chain on a cadence. Because a beacon value cannot be known "
+            "before its tick, and because the chain is append-only, every "
+            "record between two beats has a provable earliest and latest "
+            "moment of creation."
+        ),
+        "why_a_clock_alone_fails": (
+            "Anyone can write down what a clock will read tomorrow. A clock "
+            "reading proves nothing about when it was written down. A beacon "
+            "value cannot be written down in advance by anyone."
+        ),
+        "the_interleave": (
+            "Decisions are not stamped individually. One beat every few "
+            "minutes gives a floor to everything after it and a ceiling to "
+            "everything before the next one. No change to the decision path "
+            "and no added latency."
+        ),
+        "sources": [
+            {"name": s["name"], "cadence_seconds": s["cadence_seconds"],
+             "note": s["note"], "url": s["url"]} for s in SOURCES
+        ],
+        "vocabulary": VOCABULARY,
+        "what_this_proves": WHAT_THIS_PROVES,
+        "limits": [
+            "It bounds when a record can have been made. It says nothing "
+            "about whether the record is correct.",
+            "drand signatures are BLS and are not verified here. The round "
+            "and value are recorded verbatim and are re-fetchable by anyone "
+            "from the beacon operator.",
+            "A record after the newest beat has an open window until the "
+            "next beat is sealed.",
+            "Beats sealed from a value the operator supplied by hand rather "
+            "than fetched are marked as such and are weaker.",
+            "A wide window is reported wide. The number is a measurement of "
+            "our own cadence, and it can embarrass us.",
+        ],
+        "routes": {
+            "GET /x/heartbeat/spec": "this document",
+            "GET /x/heartbeat/latest": "most recent beat and the open window so far",
+            "GET /x/heartbeat/ticks?limit=": "recent beats",
+            "GET /x/heartbeat/window?block=|?receipt=": "two-sided window for a record",
+            "GET /x/heartbeat/verify?round=": "what we sealed and where to check it",
+            "GET /x/heartbeat/status": "cadence, coverage, mean and widest window",
+            "POST /x/heartbeat/beat": "keyed - fetch and seal now",
+            "POST /x/heartbeat/source": "keyed - seal a reading fetched elsewhere",
+        },
+    }
+
+```
+
+
+## `modules/held.py`
+
+145 lines, 5162 bytes
+
+```python
+"""
+modules/held.py  v1.0  -  the tips sebbi.pro holds for other chains
+
+Every time a peer submits its tip, sebbi.pro seals the observation into its
+own chain as a block under user_id "wit:<peer>", with the peer's tip inside.
+Those blocks are already public in the walk. This module lists them per
+peer, so another chain can point a verifier at sebbi.pro as its witness and
+have a machine confirm it.
+
+Reads only. Seals nothing, writes nothing, creates no tables. All public.
+
+Routes:
+  https://sebbi.pro/x/held/status
+  https://sebbi.pro/x/held/peers
+  https://sebbi.pro/x/held/tips?peer=mir
+"""
+
+import json
+import re
+import time
+
+VERSION = "1.0"
+BASE = "https://sebbi.pro/x/held/"
+DEFAULT_LIMIT = 100
+MAX_LIMIT = 500
+
+PUBLIC = {("GET", "status"), ("GET", "spec"), ("GET", "peers"),
+          ("GET", "tips")}
+
+_PEER_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+
+
+def _q(data, name, default=None):
+    v = (data or {}).get(name, default)
+    if isinstance(v, list):
+        v = v[0] if v else default
+    return v
+
+
+def _iso(ts):
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(ts)))
+    except Exception:
+        return None
+
+
+def _peers(ctx):
+    conn, lock = ctx["conn"], ctx["lock"]
+    with lock:
+        rows = conn.execute(
+            "SELECT user_id, COUNT(*), MAX(id), MAX(ts) FROM audit_log "
+            "WHERE user_id LIKE 'wit:%' GROUP BY user_id").fetchall()
+    out = []
+    for uid, n, last_idx, last_ts in rows:
+        name = str(uid)[4:]
+        out.append({"peer": name, "tips_held": n,
+                    "last_block_index": last_idx,
+                    "last_observed_at": _iso(last_ts),
+                    "list": BASE + "tips?peer=" + name})
+    out.sort(key=lambda r: -(r["tips_held"] or 0))
+    return {"ok": True, "holder": "sebbi.pro", "count": len(out),
+            "peers": out}, 200
+
+
+def _tips(data, ctx):
+    peer = str(_q(data, "peer", "") or "").strip().lower()
+    if not _PEER_RE.match(peer):
+        return {"ok": False, "error": "peer_required",
+                "example": BASE + "tips?peer=mir",
+                "peers": BASE + "peers"}, 400
+    try:
+        limit = max(1, min(MAX_LIMIT, int(_q(data, "limit", DEFAULT_LIMIT))))
+    except (TypeError, ValueError):
+        limit = DEFAULT_LIMIT
+    conn, lock = ctx["conn"], ctx["lock"]
+    with lock:
+        rows = conn.execute(
+            "SELECT id, ts, audit_hash, result_json FROM audit_log "
+            "WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+            ("wit:" + peer, limit)).fetchall()
+    tips = []
+    for idx, ts, h, rj in rows:
+        try:
+            res = json.loads(rj)
+        except Exception:
+            res = {}
+        tip = str(res.get("peer_tip") or "").lower()
+        if not re.match(r"^[0-9a-f]{64}$", tip):
+            continue
+        tips.append({
+            "peer_tip": tip,
+            "observed_at": _iso(ts),
+            "liveness": res.get("liveness"),
+            "sealed_in_block": idx,
+            "sealed_block_hash": h,
+            "check_block": "https://sebbi.pro/x/walk/block?index=%d" % idx,
+        })
+    return {
+        "ok": True,
+        "holder": "sebbi.pro",
+        "peer": peer,
+        "count": len(tips),
+        "newest_first": True,
+        "tips": tips,
+        "what_this_proves": (
+            "sebbi.pro recorded each of these tips from %s and sealed the "
+            "observation into its own public chain. Open check_block to see "
+            "the sealed block, recompute its hash, and confirm peer_tip is "
+            "inside it. sebbi.pro is run independently of %s and cannot be "
+            "made to rewrite these blocks by %s." % (peer, peer, peer)),
+        "what_this_does_not_prove": (
+            "That the tip was correct when submitted - only that this is the "
+            "tip sebbi.pro was shown, and when."),
+    }, 200
+
+
+def _status():
+    return {"ok": True, "module": "held", "version": VERSION,
+            "what": "Tips sebbi.pro holds for other chains, from its own "
+                    "sealed witness blocks.",
+            "routes": {"peers": BASE + "peers",
+                       "tips": BASE + "tips?peer=mir",
+                       "status": BASE + "status"},
+            "use_as_witness": "In an AI Integrity Declaration, set a "
+                              "witness tip_endpoint to " + BASE +
+                              "tips?peer=<your peer name>. The checker at "
+                              "https://sebbi.pro/x/integrity/check then "
+                              "confirms sebbi.pro holds your tip."}
+
+
+def handle(method, action, data, api_key, ctx):
+    try:
+        if method == "GET" and action in ("status", "spec", ""):
+            return _status(), 200
+        if method == "GET" and action == "peers":
+            return _peers(ctx)
+        if method == "GET" and action == "tips":
+            return _tips(data, ctx)
+        return {"ok": False, "error": "unknown_action",
+                "get": sorted(a for m, a in PUBLIC if m == "GET"),
+                "post": []}, 404
+    except Exception as exc:
+        return {"ok": False, "error": "held_failed",
+                "detail": str(exc)[:200]}, 500
+
+```
+
+
+## `modules/integrity.py`
+
+1487 lines, 65650 bytes
+
+```python
+"""
+modules/integrity.py  v1.4.4  -  the AI Integrity Declaration, a public checker,
+                              and a sealed public register of verdicts
+
+Serves the open standard that rates every AI deployment from L0_DIARY
+(no checkable record) up to L4_OVERSIGHT_VERIFIED, and checks any domain
+against it. Reads only. Seals nothing, writes nothing, creates no tables.
+Every route is public.
+
+Routes:
+  https://sebbi.pro/x/integrity/status                    what this is
+  https://sebbi.pro/x/integrity/declaration               the standard, as JSON
+  https://sebbi.pro/x/integrity/self                      sebbi.pro's own declaration
+  https://sebbi.pro/x/integrity/check?domain=example.com  rate any domain
+  https://sebbi.pro/x/integrity/register                  every sealed verdict
+
+v1.4: THE CHECKER'S OWN VERDICTS ARE NOW EVIDENCE.
+Every fresh verdict is sealed into the sebbi.pro chain as a public block,
+so a rating cannot be quietly changed later - not by the domain rated, and
+not by sebbi.pro.
+
+v1.4.3: THE REQUEST IS SEALED TOO, BEFORE THE CHECK RUNS.
+A sealed verdict proves what the checker said, not what it left unsaid: an
+inconvenient result could simply go unsealed, and from outside, silence and
+never-asked look the same. Now the request is sealed first. A domain that
+was asked about and has no verdict after it shows up in the register as
+exactly that. (Raised by Richard Whitney, MIRegistry.) The register lists the latest sealed verdict per domain,
+each with the block that holds it. A checker that rates others by whether
+their records can be altered now holds its own ratings to the same rule.
+
+HOW THE CHECKER DECIDES
+It looks for a declaration at https://<domain>/.well-known/ai-integrity.json,
+then https://<domain>/x/integrity/self. None found: L0_DIARY.
+It never takes the declaration's word. It walks the declared chain and
+recomputes every public block itself, asks each declared witness for its
+tip, and opens each anchor proof. A level is awarded only when every check
+that level needs has passed. Claiming more than that is OVERCLAIMED.
+
+Human-oversight checks (INV-005, INV-006) cannot be tested from outside yet,
+so this checker never awards L4. It says so rather than guessing.
+
+SAFETY
+The checker fetches addresses taken from other people's declarations, so
+it only fetches https on port 443, refuses redirects, refuses any host that
+resolves to a private, loopback or internal address, caps every response
+size and every timeout, and caps the number of fetches per check.
+"""
+
 import hashlib
 import ipaddress
 import json
@@ -57,2476 +1103,1432 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.0.2"
-SITE = "https://sebbi.pro"
-BASE = SITE + "/x/custody/"
-USER_ID = "system_custody"
-UA = "sebbi-custody/1.0.2 (+https://sebbi.pro/x/custody/spec)"
-TIMEOUT = 60
-MAX_BYTES = 256 * 1024 * 1024
-RECENT_FILES = 3
-OPERATOR_HOSTS = ("sebbi.pro", "www.sebbi.pro")
+VERSION = "1.4.4"
+BASE = "https://sebbi.pro/x/integrity/"
 
-PUBLIC = {("GET", a) for a in ("status", "holders", "offer", "keeper", "spec")}
+PUBLIC = {("GET", "status"), ("GET", "declaration"), ("GET", "spec"),
+          ("GET", "self"), ("GET", "check"), ("GET", "register")}
 
-_state = {"armed": False, "ctx": None, "last_run": None, "last_result": None}
-_lock = threading.Lock()
-_run_lock = threading.Lock()
-_offer_busy = threading.BoundedSemaphore(2)
+# ---------------------------------------------------------------- the standard
+
+DECLARATION = json.loads(r'''{
+  "spec": "ai-integrity-declaration",
+  "version": "1.0.4",
+  "declaration_id": "DEC-2026-AI-INTEGRITY",
+  "status": "open_standard",
+  "published": "2026-09-19",
+  "issuer": {
+    "name": "Monop Content",
+    "product": "sebbi.pro",
+    "url": "https://sebbi.pro"
+  },
+  "principle": "A record kept only by the party it describes is a diary, not evidence. Any AI deployment can be checked against this standard by anyone, without an account, a key, or permission.",
+  "scope": "Autonomous agents and AI systems that make or support decisions affecting people, money, access or safety.",
+  "maps_to": [
+    {
+      "framework": "EU AI Act",
+      "provisions": [
+        "Article 12 record-keeping",
+        "Article 14 human oversight"
+      ]
+    },
+    {
+      "framework": "UK Online Safety Act 2023",
+      "provisions": [
+        "record-keeping and review duties"
+      ]
+    },
+    {
+      "framework": "ICO Age Appropriate Design Code",
+      "provisions": [
+        "data minimisation",
+        "transparency"
+      ]
+    }
+  ],
+  "related": {
+    "ordering_test": "https://sebbi.pro/.well-known/ordering-test.json",
+    "relationship": "The Ordering Test lists which checks a vendor supports and which anyone can run without an account. This declaration turns those checks into levels, so every AI deployment gets a rating whether or not it publishes."
+  },
+  "discovery": {
+    "paths": [
+      "/.well-known/ai-integrity.json",
+      "/x/integrity/self"
+    ],
+    "rule": "Every AI deployment is rated. A verifier looks for a declaration at each path in order, over HTTPS, on the deployment's own domain. A deployment with no declaration at any of these paths is rated L0_DIARY. Absence is itself the result.",
+    "absence_verdict": "L0_DIARY"
+  },
+  "levels": {
+    "L0_DIARY": {
+      "badge": "GREY",
+      "meaning": "No public, independently checkable record. The operator's word is the only evidence.",
+      "requires": []
+    },
+    "L1_SEALED": {
+      "badge": "BRONZE",
+      "meaning": "Every decision is sealed into a public append-only chain that anyone can walk and recompute.",
+      "requires": [
+        "INV-001",
+        "INV-002",
+        "INV-007"
+      ]
+    },
+    "L2_WITNESSED": {
+      "badge": "SILVER",
+      "meaning": "Independent parties hold the chain's fingerprints, so the operator cannot rewrite history unnoticed.",
+      "requires": [
+        "INV-001",
+        "INV-002",
+        "INV-003",
+        "INV-007"
+      ]
+    },
+    "L3_ANCHORED": {
+      "badge": "GOLD",
+      "meaning": "The chain is also anchored to a public timestamp no single party controls.",
+      "requires": [
+        "INV-001",
+        "INV-002",
+        "INV-003",
+        "INV-004",
+        "INV-007"
+      ]
+    },
+    "L4_OVERSIGHT_VERIFIED": {
+      "badge": "GOLD_LIVE_VERIFIED",
+      "meaning": "Human oversight is itself provable: reviewers commit before seeing the machine, and rubber-stamping is detected.",
+      "requires": [
+        "INV-001",
+        "INV-002",
+        "INV-003",
+        "INV-004",
+        "INV-005",
+        "INV-006",
+        "INV-007"
+      ]
+    }
+  },
+  "invariants": {
+    "INV-001-SEALED-CHAIN": {
+      "requirement": "Every decision is sealed at the moment it is made, with what it rested on, into an append-only hash chain.",
+      "test": "Fetch the declared walk endpoint. Starting from genesis, recompute every public block from the served preimage and confirm each block names its parent.",
+      "pass": "All public blocks recompute; all links unbroken; the tip reached equals the tip published.",
+      "fail_verdict": "L0_DIARY"
+    },
+    "INV-002-FINGERPRINTS-ONLY": {
+      "requirement": "Raw prompts, documents and personal data stay with their owner. Only fingerprints are published. Short or guessable personal values are salted or keyed before hashing.",
+      "test": "Inspect public blocks. No raw personal data, secrets or credentials appear. The declaration states the hashing method for personal values.",
+      "pass": "No raw personal data in any public block; method declared.",
+      "fail_verdict": "L0_DIARY"
+    },
+    "INV-003-INDEPENDENT-WITNESS": {
+      "requirement": "At least one party independent of the operator holds the chain's tip. The declaration states how many independent parties would have to collude or fail at the same time for the history to be rewritten unnoticed.",
+      "independence": "A witness is independent when the operator cannot alter, delete or withhold the witness's record of the tip. Payment does not by itself break independence; control does. Any commercial relationship between operator and witness is disclosed in the declaration.",
+      "witness_strength": {
+        "sealed": "The witness sealed the tip inside its own hash chain, and the checker recomputed that block and found the tip in it.",
+        "bound": "The witness recorded the tip against a position in its own anchored chain, which dates the record but does not seal it.",
+        "listed": "The witness publishes the tip, with nothing in its own chain binding the record.",
+        "note": "Strength is reported for every passing witness. It does not yet change the level; it will be graded from 1.1.0. A witness can climb from listed to bound to sealed, and the declaration shows which it is."
+      },
+      "test": "Query each declared witness. Its recorded tip must appear in the operator's chain at the position it claims.",
+      "pass": "At least one independent witness confirms; the collusion threshold is disclosed.",
+      "fail_verdict": "L1_SEALED"
+    },
+    "INV-004-PUBLIC-TIME-ANCHOR": {
+      "requirement": "Chain tips are anchored to a public timestamp no single party controls, such as OpenTimestamps on Bitcoin.",
+      "test": "Verify the anchor proof offline against the tip it names.",
+      "pass": "Proof commits to a tip present in the chain.",
+      "fail_verdict": "L2_WITNESSED"
+    },
+    "INV-005-COMMIT-BEFORE-REVEAL": {
+      "requirement": "Where a human reviews an AI decision, the reviewer's verdict is sealed before the machine's verdict is shown to them.",
+      "test": "For each reviewed case, the reviewer's sealed commitment sits in an earlier block than the reveal of the machine verdict.",
+      "pass": "Every reviewed case shows commit before reveal.",
+      "fail_verdict": "L3_ANCHORED"
+    },
+    "INV-006-ANTI-RUBBER-STAMP": {
+      "requirement": "Review behaviour that indicates rubber-stamping is detected and sealed.",
+      "parameters": {
+        "minimum_review_seconds": 1.5,
+        "maximum_agreement_rate": 0.98,
+        "window": "rolling 30 days, per reviewer"
+      },
+      "test": "Any reviewer approving in under minimum_review_seconds, or agreeing with the machine more often than maximum_agreement_rate across the window, has a flag sealed into the chain.",
+      "pass": "Flags are raised and sealed whenever the thresholds are crossed; the thresholds in use are declared.",
+      "fail_verdict": "L3_ANCHORED"
+    },
+    "INV-007-DISCLOSED-DISCONTINUITY": {
+      "requirement": "Where the chain is reset, or the meaning of a field or the referent of an identifier changes after records using it have been sealed, the change is sealed into the record itself with the date it took effect. Records sealed under the earlier meaning remain valid under that meaning and are never silently repaired.",
+      "test": "Every discontinuity or change of meaning is disclosed either as a block sealed in the chain, or in the declaration with the kind of change and the evidence a verifier can use to detect it. Where the checker can detect a discontinuity itself (for example records sealed long after the window they cover), an undisclosed one fails.",
+      "detection_rule": "A discontinuity that is detected rather than asserted states the rule that detected it (for example \"createdAt - rangeEnd > 2 hours\"), so any verifier can recount it and get the same number. Where a rule is declared, the checker applies that rule rather than its own and reports whether it reproduces the declared count. In 1.0.3 a missing rule is reported; from 1.1.0 it fails.",
+      "detection_rule_location": "Inside the discontinuity it describes: discontinuities[].detection_rule, beside that entry's own counts (checkpoints, through_seq). A rule anywhere else is not read.",
+      "pass": "Every discontinuity is disclosed in the chain.",
+      "fail_verdict": "L0_DIARY"
+    }
+  },
+  "verifier_rules": [
+    "Never accept an operator's own statement that its record is valid. Recompute.",
+    "A verifier assigns the highest level whose every required invariant passes.",
+    "If a declaration claims a higher level than verification supports, the verdict is OVERCLAIMED, shown alongside the verified level.",
+    "A declaration that cannot be fetched, or cannot be parsed, is rated L0_DIARY."
+  ],
+  "declaration_template": {
+    "spec": "ai-integrity-declaration",
+    "version": "1.0.0",
+    "organisation": "",
+    "system": "",
+    "claimed_level": "",
+    "chain": {
+      "walk_endpoint": "",
+      "genesis_hash": "",
+      "seal_method_url": ""
+    },
+    "personal_data_hashing": "",
+    "witnesses": [
+      {
+        "name": "",
+        "tip_endpoint": ""
+      }
+    ],
+    "collusion_threshold": 0,
+    "anchor": {
+      "method": "",
+      "proof_endpoint": ""
+    },
+    "oversight": {
+      "commit_before_reveal": false,
+      "anti_rubber_stamp": {
+        "minimum_review_seconds": 1.5,
+        "maximum_agreement_rate": 0.98
+      }
+    },
+    "discontinuities": [
+      {
+        "date": "",
+        "disclosure_block": "",
+        "kind": "",
+        "detail": ""
+      }
+    ],
+    "known_gaps": []
+  },
+  "not_yet_rated": {
+    "availability": "Every level answers 'has this been altered'. None yet answers 'will this still be served'. Until a level for availability is defined, declare availability limits in known_gaps."
+  },
+  "reference_implementation": {
+    "name": "sebbi.pro",
+    "walk": "https://sebbi.pro/x/walk/status",
+    "method": "https://sebbi.pro/x/walk/spec",
+    "genesis": "https://sebbi.pro/x/walk/genesis",
+    "discontinuity_example": "https://sebbi.pro/x/walk/block?index=2013"
+  },
+  "changelog": [
+    {
+      "version": "1.0.1",
+      "date": "2026-09-20",
+      "change": "Added /x/integrity/self as a second discovery path, for deployments whose server cannot serve /.well-known. Added the public checker."
+    },
+    {
+      "version": "1.0.4",
+      "date": "2026-09-20",
+      "change": "Fixed where detection_rule lives: inside its discontinuity, beside the counts it produces. Where a rule is declared, the checker now reports the count under that rule first and its own default second, instead of leading with its default. Check requests are now sealed before the check runs, so a request with no verdict after it is visible in the register. Both raised by Richard Whitney (MIRegistry)."
+    },
+    {
+      "version": "1.0.3",
+      "date": "2026-09-20",
+      "change": "detection_rule for detected discontinuities, applied by the checker to recount the declared figure. Witness strength (sealed, bound, listed) reported for every witness. Both raised by Richard Whitney (MIRegistry). Every fresh checker verdict is now sealed into the sebbi.pro chain and listed in a public register, so ratings themselves cannot be quietly altered."
+    },
+    {
+      "version": "1.0.2",
+      "date": "2026-09-20",
+      "change": "Defined witness independence (control, not payment). INV-007 accepts discontinuities disclosed in the declaration with detection evidence, and fails undisclosed ones the checker can detect. Added known_gaps and the unrated availability axis. All three raised by Richard Whitney (MIRegistry) while writing the first external declaration."
+    }
+  ],
+  "public_checker": "https://sebbi.pro/x/integrity/check?domain=example.com",
+  "public_register": "https://sebbi.pro/x/integrity/register"
+}''')
+
+_CANONICAL = json.dumps(DECLARATION, sort_keys=True, separators=(",", ":"),
+                        ensure_ascii=False)
+DECLARATION_SHA256 = hashlib.sha256(_CANONICAL.encode("utf-8")).hexdigest()
+
+# ---------------------------------------------------------------- our own declaration
+#
+# sebbi.pro's own claim. Kept honest: it claims only what the checker can
+# confirm today. To move up a level, add a witness below - an address run
+# by someone else that returns the sebbi.pro tip they hold - and raise
+# claimed_level only once the checker agrees.
+
+SELF_WITNESSES = [
+    {"name": "MIR (MIRegistry)",
+     "tip_endpoint": "https://mir.events/v1/transparency/held/tips?peer=sebbi",
+     "note": "MIR records each sebbi.pro tip it observes against its own "
+             "anchored chain position and never refreshes an entry. As MIR "
+             "states in its own payload, these observations are bound to an "
+             "anchored MIR tip, not sealed inside MIR's merkle root."},
+]
+
+SELF = {
+    "spec": "ai-integrity-declaration",
+    "version": "1.0.3",
+    "organisation": "Monop Content",
+    "system": "sebbi.pro",
+    "claimed_level": "L3_ANCHORED",
+    "chain": {
+        "walk_endpoint": "https://sebbi.pro/x/walk/blocks",
+        "genesis_hash": "534f9e5cefb1a48566674911262151f34eedc1e6840a094d9465af4d846972c6",
+        "seal_method_url": "https://sebbi.pro/x/walk/spec",
+    },
+    "personal_data_hashing": "Customer decisions are never published. Blocks sealed under a customer key, from non-public sources, or carrying anything secret-shaped are served without payload; only their hash and link are public.",
+    "witnesses": SELF_WITNESSES,
+    "collusion_threshold": 1,
+    "collusion_note": "One: only witnesses a machine can verify are counted. Other chains witness sebbi.pro but do not yet publish a list the checker can read, so they are not counted.",
+    "held_for_others": "https://sebbi.pro/x/held/peers",
+    "anchor": {
+        "method": "OpenTimestamps on Bitcoin",
+        "proof_endpoint": "https://sebbi.pro/x/ots/latest_confirmed",
+        "status_url": "https://sebbi.pro/x/ots/status",
+        "note": "Tips are stamped hourly. proof_endpoint always serves the newest proof that is confirmed in Bitcoin and whose tip is a block in the current chain. Anchoring is not claimed until the checker verifies it.",
+    },
+    "oversight": {
+        "commit_before_reveal": True,
+        "demonstration": "https://sebbi.pro/x/demo/review",
+        "anti_rubber_stamp": {"minimum_review_seconds": 1.5,
+                              "maximum_agreement_rate": 0.98},
+    },
+    "discontinuities": [
+        {"date": "2026-09-07", "disclosure_block": 2013, "kind": "chain_reset",
+         "detail": "The chain restarted from genesis. The reset is sealed in block 2013; block indexes quoted before that date belong to the earlier chain."},
+    ],
+    "known_gaps": [
+        "Availability: every level answers 'has this been altered', none yet answers 'will this still be served'. A reader currently depends on sebbi.pro continuing to serve these endpoints.",
+        "Anchoring: tips are stamped to Bitcoin hourly and confirm a few hours later, so the newest hour or so rests on witnessing until its proof confirms.",
+    ],
+}
+
+# ---------------------------------------------------------------- safe fetching
+
+FETCH_TIMEOUT = 8
+MAX_DECL_BYTES = 262144
+MAX_PAGE_BYTES = 8 * 1024 * 1024
+MAX_FETCHES = 45
+WALK_PAGE = 500
+WALK_MAX_BLOCKS = 20000
+CHECK_BUDGET_SECONDS = 60
+CACHE_SECONDS = 600
+USER_AGENT = "sebbi-integrity-checker/1.4.4 (+https://sebbi.pro/x/integrity/status)"
+
+_HOST_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
+_BLOCKED_SUFFIXES = (".local", ".internal", ".localhost", ".lan", ".home",
+                     ".corp", ".intranet", ".arpa")
+
+_cache = {}
+_cache_lock = threading.Lock()
+_running = threading.BoundedSemaphore(2)
 
 
-# ---------------------------------------------------------------- helpers
-
-def _ensure(conn):
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS custody_holders ("
-        "url TEXT PRIMARY KEY, name TEXT, host TEXT, added_at REAL, "
-        "last_checked REAL, last_verified REAL, last_fingerprint TEXT, "
-        "last_date TEXT, last_status TEXT, times_verified INTEGER DEFAULT 0)")
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS custody_runs ("
-        "day TEXT PRIMARY KEY, sealed_block INTEGER, sealed_hash TEXT, "
-        "independent_holders INTEGER, holding_latest INTEGER, "
-        "latest_sha256 TEXT, ran_at REAL)")
-    conn.commit()
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code,
+                                     "redirect refused", headers, fp)
 
 
-def _host(url):
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+class _Budget(object):
+    def __init__(self):
+        self.fetches = 0
+        self.deadline = time.time() + CHECK_BUDGET_SECONDS
+
+    def spend(self):
+        self.fetches += 1
+        if self.fetches > MAX_FETCHES:
+            raise RuntimeError("fetch limit reached")
+        if time.time() > self.deadline:
+            raise RuntimeError("time limit reached")
+
+
+def _clean_domain(raw):
+    d = str(raw or "").strip().lower()
+    d = re.sub(r"^[a-z]+://", "", d)
+    d = d.split("/")[0].split("?")[0].split("#")[0]
+    if "@" in d or ":" in d:
+        return None
+    d = d.rstrip(".")
+    if not _HOST_RE.match(d):
+        return None
+    if d == "localhost" or d.endswith(_BLOCKED_SUFFIXES):
+        return None
+    return d
+
+
+def _host_is_public(host):
     try:
-        return (urllib.parse.urlsplit(url).hostname or "").lower()
+        infos = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
     except Exception:
-        return ""
-
-
-def _public_https(url):
-    try:
-        p = urllib.parse.urlsplit(url)
-    except Exception:
-        return False
-    if p.scheme != "https" or p.port not in (None, 443) or not p.hostname:
-        return False
-    if p.username or p.password:
-        return False
-    try:
-        for info in socket.getaddrinfo(p.hostname, 443,
-                                       proto=socket.IPPROTO_TCP):
+        return False, "does not resolve"
+    if not infos:
+        return False, "does not resolve"
+    for info in infos:
+        try:
             ip = ipaddress.ip_address(info[4][0])
-            if (ip.is_private or ip.is_loopback or ip.is_link_local or
-                    ip.is_reserved or ip.is_multicast or ip.is_unspecified):
-                return False
-    except Exception:
-        return False
-    return True
+        except ValueError:
+            return False, "unreadable address"
+        if (ip.is_private or ip.is_loopback or ip.is_link_local or
+                ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            return False, "resolves to a non-public address"
+    return True, None
 
 
-def _get(url, max_bytes=MAX_BYTES):
-    req = urllib.request.Request(url, headers={"User-Agent": UA,
-                                               "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-        raw = resp.read(max_bytes + 1)
-    if len(raw) > max_bytes:
-        raise ValueError("too large")
-    if raw[:2] == b"\x1f\x8b":
-        # Archives keep a page exactly as it was sent - often zipped.
-        raw = gzip.decompress(raw)
-    return raw
-
-
-def _canonical_sha(raw):
-    obj = json.loads(raw.decode("utf-8"))
-    return hashlib.sha256(json.dumps(obj, sort_keys=True,
-                                     separators=(",", ":")).encode("utf-8")
-                          ).hexdigest()
-
-
-def _sealed_files():
-    """date -> sha256, and sha256 -> file row, from the archive manifest."""
-    data = json.loads(_get(SITE + "/x/archive/manifest").decode("utf-8"))
-    files = data.get("files") or []
-    return files, {f["sha256"]: f for f in files if f.get("sha256")}
-
-
-def _seal(ctx, action, result):
-    seal = (ctx or {}).get("seal")
-    if not callable(seal):
-        return None, None
-    now = time.time()
-    result = dict(result, decision=action.upper(), score=0, timestamp=now)
-    event = {"user_id": USER_ID, "action": action, "amount": 0,
-             "country": "UK", "device_id": "custody", "anomaly": 0,
-             "device_risk": 0}
+def _safe_url(url):
     try:
-        res = seal(event, result, now)
+        p = urllib.parse.urlsplit(str(url))
     except Exception:
-        return None, None
-    if isinstance(res, (list, tuple)):
-        return res[0], (res[1] if len(res) > 1 else None)
-    if isinstance(res, dict):
-        return (res.get("audit_hash") or res.get("hash"),
-                res.get("block_index") or res.get("index"))
-    return res, None
+        return None, "unreadable address"
+    if p.scheme != "https":
+        return None, "only https addresses are fetched"
+    if p.port not in (None, 443):
+        return None, "only port 443 is fetched"
+    if p.username or p.password:
+        return None, "addresses with credentials are refused"
+    host = _clean_domain(p.hostname or "")
+    if not host:
+        return None, "not a public domain name"
+    ok, why = _host_is_public(host)
+    if not ok:
+        return None, why
+    return urllib.parse.urlunsplit(("https", host, p.path or "/", p.query, "")), None
+
+
+def _fetch_raw(url, budget, max_bytes=MAX_DECL_BYTES, accept="application/json"):
+    """Returns (bytes, error). Never raises."""
+    safe, why = _safe_url(url)
+    if not safe:
+        return None, why
+    try:
+        budget.spend()
+    except RuntimeError as exc:
+        return None, str(exc)
+    req = urllib.request.Request(safe, headers={
+        "User-Agent": USER_AGENT, "Accept": accept})
+    try:
+        with _OPENER.open(req, timeout=FETCH_TIMEOUT) as resp:
+            raw = resp.read(max_bytes + 1)
+    except urllib.error.HTTPError as exc:
+        return None, "HTTP %s" % exc.code
+    except Exception as exc:
+        return None, "could not fetch (%s)" % exc.__class__.__name__
+    if len(raw) > max_bytes:
+        return None, "response too large"
+    return raw, None
+
+
+def _fetch_json(url, budget, max_bytes=MAX_DECL_BYTES, allow_text=False):
+    """Returns (data, error). Never raises.
+
+    allow_text: if the response is not JSON (an ordinary web page), return
+    {"_text": <page text>} instead of an error, so a witness can publish its
+    record as a normal page."""
+    raw, err = _fetch_raw(url, budget, max_bytes)
+    if err:
+        return None, err
+    text = raw.decode("utf-8", "replace")
+    try:
+        return json.loads(text), None
+    except Exception:
+        if allow_text:
+            return {"_text": text}, None
+        return None, "not valid JSON"
 
 
 # ---------------------------------------------------------------- checks
 
-def _wayback_captures(target):
-    """Every capture the Internet Archive holds of an address, newest first.
-    Uses the capture index; falls back to the availability lookup."""
-    try:
-        rows = json.loads(_get(
-            "https://web.archive.org/cdx/search/cdx?url=" +
-            urllib.parse.quote(target, safe="") +
-            "&output=json&filter=statuscode:200&limit=-10",
-            4 * 1024 * 1024).decode("utf-8"))
-        stamps = [r[1] for r in rows[1:] if len(r) > 1]
-        if stamps:
-            return sorted(stamps, reverse=True)
-    except Exception:
-        pass
-    try:
-        avail = json.loads(_get(
-            "https://archive.org/wayback/available?url=" +
-            urllib.parse.quote(target, safe=""), 1024 * 1024).decode("utf-8"))
-        snap = (avail.get("archived_snapshots") or {}).get("closest") or {}
-        if snap.get("available"):
-            return [re.sub(r"[^0-9]", "", str(snap.get("timestamp", "")))]
-        return []
-    except Exception:
-        return None
-
-
-def _check_internet_archive(files):
-    """For each recent sealed file: does the Internet Archive hold it, and
-    is its copy byte-for-byte the sealed file?"""
-    out = []
-    for f in files[:RECENT_FILES]:
-        target = "%s/x/archive/file?sha256=%s" % (SITE, f["sha256"])
-        row = {"holder": "Internet Archive", "date": f.get("date"),
-               "sealed_sha256": f["sha256"],
-               "archive_it": "https://web.archive.org/save/" + target}
-        stamps = _wayback_captures(target)
-        if stamps is None:
-            row.update({"held": None, "note": "archive could not be asked"})
-        elif not stamps:
-            row.update({"held": False})
-        else:
-            row.update({"held": False, "captures_listed": len(stamps)})
-            for stamp in stamps[:3]:
-                raw_url = "https://web.archive.org/web/%sid_/%s" % (stamp, target)
-                try:
-                    fp = _canonical_sha(_get(raw_url))
-                except Exception:
-                    continue
-                row.update({"held": fp == f["sha256"], "copy": raw_url,
-                            "captured": stamp, "fingerprint": fp})
-                if fp == f["sha256"]:
-                    break
-        out.append(row)
-    return out
-
-
-def _check_holder(url, by_sha):
-    try:
-        fp = _canonical_sha(_get(url))
-    except Exception as exc:
-        return {"fingerprint": None, "status": "unreachable (%s)"
-                % exc.__class__.__name__}
-    f = by_sha.get(fp)
-    if not f:
-        return {"fingerprint": fp,
-                "status": "serves a file that is not a sealed archive file"}
-    return {"fingerprint": fp, "date": f.get("date"), "status": "verified"}
-
-
-def _run(ctx, force=False):
-    conn, dblock = ctx.get("conn"), ctx.get("lock")
-    day = time.strftime("%Y-%m-%d", time.gmtime())
-    with dblock:
-        _ensure(conn)
-        done = conn.execute("SELECT sealed_block FROM custody_runs WHERE day = ?",
-                            (day,)).fetchone()
-        if done and not force:
-            return {"ok": True, "skipped": "already counted today",
-                    "sealed_block": done[0]}
-        holders = conn.execute("SELECT url, name FROM custody_holders").fetchall()
-
-    files, by_sha = _sealed_files()
-    if not files:
-        return {"ok": False, "error": "no sealed archive files yet"}
-    latest = files[0]["sha256"]
-
-    ia = _check_internet_archive(files)
-    results = []
-    for url, name in holders:
-        r = _check_holder(url, by_sha)
-        r.update({"holder": name, "url": url})
-        results.append(r)
-        now = time.time()
-        with dblock:
-            if r["status"] == "verified":
-                conn.execute(
-                    "UPDATE custody_holders SET last_checked = ?, "
-                    "last_verified = ?, last_fingerprint = ?, last_date = ?, "
-                    "last_status = ?, times_verified = times_verified + 1 "
-                    "WHERE url = ?", (now, now, r["fingerprint"], r.get("date"),
-                                      r["status"], url))
-            else:
-                conn.execute(
-                    "UPDATE custody_holders SET last_checked = ?, "
-                    "last_status = ? WHERE url = ?", (now, r["status"], url))
-            conn.commit()
-
-    verified = [r for r in results if r["status"] == "verified"]
-    ia_held = [r for r in ia if r.get("held")]
-    hosts = set(_host(r["url"]) for r in verified)
-    if ia_held:
-        hosts.add("web.archive.org")
-    holding_latest = len([r for r in verified if r["fingerprint"] == latest]) + \
-        (1 if any(r["sealed_sha256"] == latest for r in ia_held) else 0)
-
-    result = {"day": day, "latest_file_sha256": latest,
-              "independent_holders": len(hosts),
-              "holding_latest_file": holding_latest,
-              "internet_archive": ia, "registered_holders": results,
-              "rule": "A copy counts only if its canonical fingerprint is a "
-                      "sealed archive file, and only if it is held somewhere "
-                      "other than sebbi.pro. Every entry names an address "
-                      "anyone can fetch to check it."}
-    sealed_hash, sealed_block = _seal(ctx, "custody_counted", result)
-    with dblock:
-        conn.execute(
-            "INSERT OR REPLACE INTO custody_runs (day, sealed_block, sealed_hash, "
-            "independent_holders, holding_latest, latest_sha256, ran_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (day, sealed_block, sealed_hash, len(hosts), holding_latest,
-             latest, time.time()))
-        conn.commit()
-    return {"ok": True, "day": day, "independent_holders": len(hosts),
-            "holding_latest_file": holding_latest, "sealed_block": sealed_block,
-            "check_block": ("%s/x/walk/block?index=%s" % (SITE, sealed_block))
-            if sealed_block else None}
-
-
-def _loop():
-    time.sleep(120)
-    while True:
-        ctx = _state.get("ctx")
-        if ctx and _run_lock.acquire(blocking=False):
-            try:
-                _state["last_result"] = _run(ctx)
-            except Exception as exc:
-                _state["last_result"] = {"ok": False, "error": str(exc)[:200]}
-            finally:
-                _run_lock.release()
-            _state["last_run"] = time.strftime("%Y-%m-%dT%H:%M:%SZ",
-                                               time.gmtime())
-        time.sleep(3600)
-
-
-def _arm(ctx):
-    with _lock:
-        _state["ctx"] = ctx
-        if _state["armed"]:
-            return
-        _state["armed"] = True
-    threading.Thread(target=_loop, name="custody", daemon=True).start()
-
-
-# ---------------------------------------------------------------- routes
-
-def _q(data, k):
-    v = (data or {}).get(k)
-    return v[0] if isinstance(v, list) and v else v
-
-
-def _offer(data, ctx):
-    url = str(_q(data, "url") or "").strip()
-    name = re.sub(r"[^A-Za-z0-9 .,&'()_-]", "", str(_q(data, "name") or ""))[:60]
-    if not url:
-        return {"ok": False, "error": "url_required",
-                "example": BASE + "offer?url=https://your.site/sebbi.json&name=Your%20Name"}, 400
-    if _host(url) in OPERATOR_HOSTS:
-        return {"ok": False, "error": "operator_host",
-                "detail": "A copy on sebbi.pro is not independent of sebbi.pro."}, 400
-    if not _public_https(url):
-        return {"ok": False, "error": "not_a_public_https_address"}, 400
-    if not _offer_busy.acquire(timeout=10):
-        return {"ok": False, "error": "busy"}, 429
-    try:
-        files, by_sha = _sealed_files()
-        r = _check_holder(url, by_sha)
-    finally:
-        _offer_busy.release()
-    if r["status"] != "verified":
-        return {"ok": False, "error": "copy_not_verified", "detail": r["status"],
-                "fingerprint": r.get("fingerprint"),
-                "sealed_files": SITE + "/x/archive/manifest"}, 400
-    conn, dblock = ctx["conn"], ctx["lock"]
-    now = time.time()
-    with dblock:
-        _ensure(conn)
-        conn.execute(
-            "INSERT OR IGNORE INTO custody_holders (url, name, host, added_at, "
-            "last_checked, last_verified, last_fingerprint, last_date, "
-            "last_status, times_verified) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
-            (url, name or _host(url), _host(url), now, now, now,
-             r["fingerprint"], r.get("date"), "verified"))
-        conn.commit()
-    _, block = _seal(ctx, "custody_holder_registered", {
-        "holder": name or _host(url), "url": url,
-        "fingerprint": r["fingerprint"], "file_date": r.get("date")})
-    return {"ok": True, "registered": url, "holder": name or _host(url),
-            "fingerprint": r["fingerprint"], "file_date": r.get("date"),
-            "sealed_in_block": block,
-            "note": "Your copy was fetched and matches a sealed file. It will "
-                    "be re-checked daily and counted in the sealed custody "
-                    "count."}, 200
-
-
-def _holders(ctx):
-    conn, dblock = ctx["conn"], ctx["lock"]
-    with dblock:
-        _ensure(conn)
-        rows = conn.execute(
-            "SELECT url, name, last_verified, last_fingerprint, last_date, "
-            "last_status, times_verified FROM custody_holders "
-            "ORDER BY added_at").fetchall()
-    iso = lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t)) if t else None
-    return {"ok": True, "holders": [
-        {"url": u, "name": n, "last_verified": iso(lv),
-         "last_fingerprint": fp, "file_date": d, "status": st,
-         "times_verified": tv} for u, n, lv, fp, d, st, tv in rows]}, 200
-
-
-def _status(ctx):
-    conn, dblock = ctx["conn"], ctx["lock"]
-    with dblock:
-        _ensure(conn)
-        runs = conn.execute(
-            "SELECT day, sealed_block, independent_holders, holding_latest, "
-            "latest_sha256 FROM custody_runs ORDER BY day DESC LIMIT 14").fetchall()
-        n_holders = conn.execute("SELECT COUNT(*) FROM custody_holders").fetchone()[0]
-    latest_link = None
-    try:
-        files, _ = _sealed_files()
-        if files:
-            latest_link = ("https://web.archive.org/save/%s/x/archive/file?"
-                           "sha256=%s" % (SITE, files[0]["sha256"]))
-    except Exception:
-        pass
-    return {
-        "ok": True, "module": "custody", "version": VERSION,
-        "armed": _state["armed"], "last_run": _state["last_run"],
-        "last_result": _state["last_result"],
-        "independent_holders_today": runs[0][2] if runs else None,
-        "registered_holders": n_holders,
-        "recent_counts": [{"day": d, "sealed_block": b,
-                           "check_block": ("%s/x/walk/block?index=%s" % (SITE, b))
-                           if b else None,
-                           "independent_holders": i, "holding_latest_file": h,
-                           "latest_file": s} for d, b, i, h, s in runs],
-        "become_a_holder": {
-            "one_tap": latest_link,
-            "register_your_own_copy": BASE + "offer?url=https://your.site/sebbi.json&name=You",
-            "keep_it_automatically": BASE + "keeper"},
-        "rule": "Counted only if byte-for-byte a sealed file, and only if held "
-                "somewhere other than sebbi.pro. Each day's count is sealed.",
-    }, 200
-
-
-KEEPER = r'''#!/usr/bin/env python3
-"""sebbi.pro keeper - fetch, verify and keep each day's self-proving file.
-
-Run daily (for example from cron). Standard library only.
-    python3 keeper.py /path/to/public/folder
-Keeps every day's file that PASSES its own built-in checks, plus latest.json.
-Serve that folder publicly, then register your latest.json once at:
-    https://sebbi.pro/x/custody/offer?url=https://YOUR.SITE/latest.json&name=YOU
-"""
-import json, os, subprocess, sys, tempfile, urllib.request
-
-out = sys.argv[1] if len(sys.argv) > 1 else "."
-os.makedirs(out, exist_ok=True)
-ua = {"User-Agent": "sebbi-keeper/1.0"}
-latest = json.load(urllib.request.urlopen(urllib.request.Request(
-    "https://sebbi.pro/x/archive/latest", headers=ua), timeout=60))
-url = latest["file"]
-raw = urllib.request.urlopen(urllib.request.Request(url, headers=ua),
-                             timeout=300).read()
-fd, tmp = tempfile.mkstemp(suffix=".json")
-os.write(fd, raw); os.close(fd)
-check = subprocess.run([sys.executable, "-c",
-    "import json,sys;exec(json.load(open(sys.argv[1]))['verifier_py'])", tmp],
-    capture_output=True, text=True)
-print(check.stdout)
-if check.returncode != 0:
-    os.remove(tmp)
-    sys.exit("Not kept: the file failed its own checks.")
-name = "sebbi-chain-%s-%s.json" % (latest["date"], latest["sha256"])
-os.replace(tmp, os.path.join(out, name))
-with open(os.path.join(out, "latest.json"), "wb") as fh:
-    fh.write(raw)
-print("Kept", name, "and latest.json in", out)
-'''
-
-
-def handle(method, action, data, api_key, ctx):
-    ctx = ctx or {}
-    try:
-        _arm(ctx)
-        if action in ("status", ""):
-            return _status(ctx)
-        if action == "holders":
-            return _holders(ctx)
-        if action == "offer":
-            return _offer(data, ctx)
-        if action == "keeper":
-            return {"ok": True, "keeper_py": KEEPER,
-                    "how": "Save keeper_py as keeper.py, run it daily with a "
-                           "folder you serve publicly, then register that "
-                           "folder's latest.json once."}, 200
-        if action == "spec":
-            return {"module": "custody", "version": VERSION,
-                    "counts": "independent holders whose copy is byte-for-byte "
-                              "a sealed archive file",
-                    "sealed": "each day's count, with every holder and "
-                              "fingerprint, is sealed into the chain",
-                    "routes": {"status": BASE + "status",
-                               "holders": BASE + "holders",
-                               "offer": BASE + "offer?url=<https address>&name=<name>",
-                               "keeper": BASE + "keeper"}}, 200
-        if action == "run":
-            if not api_key:
-                return {"ok": False, "error": "api_key_required"}, 401
-            with _run_lock:
-                return _run(ctx, force=True), 200
-        return {"ok": False, "error": "unknown_action",
-                "get": sorted(a for m, a in PUBLIC if m == "GET")}, 404
-    except Exception as exc:
-        return {"ok": False, "error": "custody_failed",
-                "detail": str(exc)[:200]}, 500
-
-```
-
-
-## `modules/declare.py`
-
-345 lines, 13493 bytes
-
-```python
-"""
-Declaration notary - /x/declare/<action>
-
-THE IDEA
---------
-An operator uploads their own file saying what must always be true of their
-decisions. It is sealed, versioned, and published. Every record is then tested
-against it, and every violation is sealed.
-
-WHY THIS ISN'T CIRCULAR
------------------------
-The obvious objection: if they write their own rules AND supply their own
-data, checking one against the other proves nothing. They could declare
-nothing and pass.
-
-Two things stop that.
-
-1. THE RULES COME FIRST. A declaration is sealed before the records it judges.
-   You cannot write the rule after seeing the outcome, because the chain shows
-   which came first. Retrofitting a standard to a result is exactly what this
-   makes impossible.
-
-2. YOU CANNOT QUIETLY WEAKEN IT. Every version is kept and sealed. If you
-   published a strict rule in March and a loose one in September, both are
-   permanent and the change is dated. Nobody can pretend the strict one never
-   existed. Weakening your own standard becomes a visible act.
-
-So the file does not prove you are honest. It converts your claims into
-something that can be tested, and takes away your ability to move the goalposts
-afterwards. An auditor reads the declaration, reads the violations, and reads
-the version history. All three are sealed.
-
-RULE FORMAT
------------
-    {"rules": [
-      {"id": "no-silent-high-value",
-       "describe": "Payments over 10000 are never auto-allowed",
-       "when":    {"field": "amount",   "op": ">",  "value": 10000},
-       "require": {"field": "decision", "op": "in", "value": ["CHALLENGE","BLOCK"]}}
-    ]}
-
-    ops: == != > >= < <= in not_in exists
-
-HONEST LIMITS
--------------
-- Weak rules prove weak things. A declaration that requires nothing passes
-  everything. Publish it and let people judge the rules themselves.
-- This tests what was sealed. A decision never recorded cannot violate a rule
-  - gapless receipts are what cover that gap, not this.
-- The operator still supplies the data. This is not an external audit. It is a
-  published standard, sealed before the evidence, that they can be held to.
-
-    POST /x/declare/publish     declaration file - sealed and versioned
-    GET  /x/declare/current     the live declaration
-    GET  /x/declare/history     every version ever published
-    POST /x/declare/check       test sealed records against it, seal the result
-    GET  /x/declare/violations  what failed, and when
-"""
-
-import hashlib, json, time
-from datetime import datetime, timezone
-
-VERSION = "1.0"
-OPS = {"==", "!=", ">", ">=", "<", "<=", "in", "not_in", "exists"}
-MAX_RULES = 100
-
-_ready = False
-
-
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        ctx["conn"].execute("CREATE TABLE IF NOT EXISTS declarations(id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,version INTEGER,body TEXT,sha256 TEXT,published REAL,audit_hash TEXT,block_index INTEGER)")
-        ctx["conn"].execute("CREATE TABLE IF NOT EXISTS declare_checks(check_id TEXT PRIMARY KEY,api_key TEXT,decl_version INTEGER,ran REAL,tested INTEGER,passed INTEGER,violated INTEGER,detail TEXT,audit_hash TEXT)")
-        ctx["conn"].execute("CREATE INDEX IF NOT EXISTS idx_dec_key ON declarations(api_key,version)")
-        ctx["conn"].commit()
-    _ready = True
-
-
-def _iso(ts):
-    if not ts:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
-
-def _sha(s):
-    if not isinstance(s, str):
-        s = json.dumps(s, sort_keys=True)
-    return hashlib.sha256(s.encode()).hexdigest()
-
-
-def _seal_event(ctx, api_key, ref, action, detail):
-    ts = time.time()
-    ev = {"user_id": "dec:" + ref, "action": "declare_" + action, "amount": 0,
-          "country": "UK", "device_id": "declare", "anomaly": 0, "device_risk": 0}
-    res = {"decision": "DECLARATION_SEALED", "score": 0, "declare_action": action,
-           "declare_version": VERSION, "timestamp": ts, "detail": detail}
-    h, idx, seq = ctx["seal"](ev, res, ts, api_key)
-    return h, idx, seq, ts
-
-
-def _validate(body):
-    if not isinstance(body, dict):
-        return "declaration must be an object"
-    rules = body.get("rules")
-    if not isinstance(rules, list) or not rules:
-        return "declaration needs a non-empty rules list"
-    if len(rules) > MAX_RULES:
-        return "too many rules (max " + str(MAX_RULES) + ")"
-    seen = set()
-    for i, r in enumerate(rules):
-        if not isinstance(r, dict):
-            return "rule " + str(i) + " is not an object"
-        rid = str(r.get("id", "")).strip()
-        if not rid:
-            return "rule " + str(i) + " has no id"
-        if rid in seen:
-            return "duplicate rule id: " + rid
-        seen.add(rid)
-        req = r.get("require")
-        if not isinstance(req, dict) or not req.get("field"):
-            return "rule " + rid + " has no require.field"
-        for part in ("when", "require"):
-            c = r.get(part)
-            if c is None:
-                continue
-            if not isinstance(c, dict):
-                return "rule " + rid + ": " + part + " must be an object"
-            if c.get("op", "==") not in OPS:
-                return "rule " + rid + ": unknown op " + str(c.get("op"))
-    return None
-
-
-def _get(record, field):
-    cur = record
-    for part in str(field).split("."):
-        if isinstance(cur, dict) and part in cur:
-            cur = cur[part]
-        else:
-            return None
-    return cur
-
-
-def _test(cond, record):
-    if not cond:
-        return True
-    val = _get(record, cond["field"])
-    op = cond.get("op", "==")
-    want = cond.get("value")
-    if op == "exists":
-        return (val is not None) == bool(want if want is not None else True)
-    if val is None:
-        return False
-    try:
-        if op == "==":
-            return str(val).strip().lower() == str(want).strip().lower()
-        if op == "!=":
-            return str(val).strip().lower() != str(want).strip().lower()
-        if op == "in":
-            return str(val).strip().lower() in [str(x).strip().lower() for x in want]
-        if op == "not_in":
-            return str(val).strip().lower() not in [str(x).strip().lower() for x in want]
-        v, w = float(val), float(want)
-        if op == ">":
-            return v > w
-        if op == ">=":
-            return v >= w
-        if op == "<":
-            return v < w
-        if op == "<=":
-            return v <= w
-    except Exception:
-        return False
-    return False
-
-
-def _current(ctx, api_key):
-    with ctx["lock"]:
-        return ctx["conn"].execute("SELECT version,body,sha256,published,audit_hash FROM declarations WHERE api_key=? ORDER BY version DESC LIMIT 1", (api_key,)).fetchone()
-
-
-def _publish(ctx, api_key, data):
-    body = data.get("declaration")
-    if body is None:
-        body = {k: v for k, v in data.items() if k != "declaration"}
-    if isinstance(body, str):
-        try:
-            body = json.loads(body)
-        except Exception:
-            return {"error": "declaration_not_json"}, 400
-    err = _validate(body)
-    if err:
-        return {"error": "invalid_declaration", "detail": err}, 400
-
-    prev = _current(ctx, api_key)
-    ver = (prev[0] + 1) if prev else 1
-    sha = _sha(body)
-    if prev and prev[2] == sha:
-        return {"error": "unchanged",
-                "message": "Identical to version " + str(prev[0]) + ". Nothing to publish."}, 400
-
-    ref = "V" + str(ver)
-    ids = [str(r.get("id")) for r in body["rules"]]
-    detail = ("version=" + str(ver) + ";sha256=" + sha + ";rules=" + str(len(ids)) +
-              ";ids=" + ",".join(ids[:40]) +
-              (";replaces=" + prev[2] if prev else ";first_declaration=true"))
-    h, idx, seq, ts = _seal_event(ctx, api_key, ref, "published", detail)
-
-    with ctx["lock"]:
-        ctx["conn"].execute("INSERT INTO declarations(api_key,version,body,sha256,published,audit_hash,block_index) VALUES(?,?,?,?,?,?,?)",
-                            (api_key, ver, json.dumps(body), sha, ts, h, idx))
-        ctx["conn"].commit()
-
-    out = {"version": ver, "sha256": sha, "rules": len(ids), "rule_ids": ids,
-           "published": _iso(ts), "audit_hash": h, "block_index": idx,
-           "receipt_seq": seq,
-           "note": "Sealed. Every record from this point is judged against it, and this version cannot be removed."}
-    if prev:
-        out["replaces_version"] = prev[0]
-        out["warning"] = "Version " + str(prev[0]) + " remains sealed and readable. Changes to your own standard are permanent and dated."
-    return out, 200
-
-
-def _current_view(ctx, api_key):
-    row = _current(ctx, api_key)
-    if not row:
-        return {"error": "no_declaration",
-                "message": "Nothing published yet."}, 404
-    return {"version": row[0], "declaration": json.loads(row[1]),
-            "sha256": row[2], "published": _iso(row[3]),
-            "sealed": row[4]}, 200
-
-
-def _history(ctx, api_key):
-    with ctx["lock"]:
-        rows = ctx["conn"].execute("SELECT version,sha256,published,audit_hash,body FROM declarations WHERE api_key=? ORDER BY version ASC", (api_key,)).fetchall()
-    if not rows:
-        return {"count": 0, "versions": []}, 200
-    out = []
-    for v, sha, ts, ah, body in rows:
-        try:
-            n = len(json.loads(body).get("rules", []))
-        except Exception:
-            n = None
-        out.append({"version": v, "sha256": sha, "published": _iso(ts),
-                    "sealed": ah, "rules": n})
-    return {"count": len(out), "versions": out,
-            "note": "Every version ever published. Loosening a standard is visible here permanently."}, 200
-
-
-def _check(ctx, api_key, data):
-    row = _current(ctx, api_key)
-    if not row:
-        return {"error": "no_declaration"}, 404
-    ver, body = row[0], json.loads(row[1])
-    rules = body["rules"]
-
-    try:
-        limit = min(int(data.get("limit", 500)), 5000)
-    except Exception:
-        limit = 500
-
-    with ctx["lock"]:
-        recs = ctx["conn"].execute("SELECT id,user_id,event_json,result_json,ts FROM audit_log WHERE api_key=? AND ts>=? ORDER BY id DESC LIMIT ?", (api_key, row[3], limit)).fetchall()
-
-    violations = []
-    tested = 0
-    for bid, uid, ev_json, res_json, bts in recs:
-        try:
-            rec = {}
-            rec.update(json.loads(ev_json))
-            rec.update(json.loads(res_json))
-        except Exception:
-            continue
-        if rec.get("decision", "").endswith("_SEALED"):
-            continue
-        tested += 1
-        for r in rules:
-            if not _test(r.get("when"), rec):
-                continue
-            if not _test(r.get("require"), rec):
-                violations.append({"block_index": bid, "record_id": uid,
-                                   "rule": r.get("id"),
-                                   "describe": r.get("describe"),
-                                   "at": _iso(bts)})
-
-    ts = time.time()
-    cid = "CHK-" + _sha(str(ts) + api_key)[:8].upper()
-    detail = ("decl_version=" + str(ver) + ";tested=" + str(tested) +
-              ";violated=" + str(len(violations)) +
-              ";rules=" + ",".join(sorted({v["rule"] for v in violations})[:20]))
-    h, idx, seq, _x = _seal_event(ctx, api_key, cid, "checked", detail)
-
-    with ctx["lock"]:
-        ctx["conn"].execute("INSERT OR REPLACE INTO declare_checks(check_id,api_key,decl_version,ran,tested,passed,violated,detail,audit_hash) VALUES(?,?,?,?,?,?,?,?,?)",
-                            (cid, api_key, ver, ts, tested, tested - len({v["block_index"] for v in violations}), len(violations), json.dumps(violations[:200]), h))
-        ctx["conn"].commit()
-
-    out = {"check_id": cid, "declaration_version": ver, "records_tested": tested,
-           "violations": len(violations), "ran_at": _iso(ts),
-           "audit_hash": h, "block_index": idx, "receipt_seq": seq,
-           "note": "Result sealed whichever way it went."}
-    if violations:
-        out["failed_rules"] = sorted({v["rule"] for v in violations})
-        out["detail"] = violations[:20]
-        out["flag"] = str(len(violations)) + " record(s) violate your own published rules"
-    return out, 200
-
-
-def _violations(ctx, api_key):
-    with ctx["lock"]:
-        rows = ctx["conn"].execute("SELECT check_id,decl_version,ran,tested,violated,detail FROM declare_checks WHERE api_key=? ORDER BY ran DESC LIMIT 50", (api_key,)).fetchall()
-    if not rows:
-        return {"checks": 0, "note": "No checks run yet."}, 200
-    latest = rows[0]
-    try:
-        detail = json.loads(latest[5])
-    except Exception:
-        detail = []
-    return {"checks": len(rows),
-            "latest": {"check_id": latest[0], "declaration_version": latest[1],
-                       "ran": _iso(latest[2]), "tested": latest[3],
-                       "violations": latest[4], "detail": detail[:50]},
-            "history": [{"check_id": r[0], "ran": _iso(r[2]), "tested": r[3],
-                         "violations": r[4]} for r in rows]}, 200
-
-
-def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-    if method == "POST":
-        if action == "publish":
-            return _publish(ctx, api_key, data)
-        if action == "check":
-            return _check(ctx, api_key, data)
-    else:
-        if action == "current":
-            return _current_view(ctx, api_key)
-        if action == "history":
-            return _history(ctx, api_key)
-        if action == "violations":
-            return _violations(ctx, api_key)
-    return {"error": "unknown_action", "action": action}, 404
-
-```
-
-
-## `modules/demo.py`
-
-358 lines, 15159 bytes
-
-```python
-"""
-Public proving ground - /x/demo/<action>
-
-WHY THIS EXISTS
----------------
-Every page on this platform says "check it, don't trust it" and then asks for
-an email address before anyone can check anything. That is the same bargain
-every other vendor offers, dressed in better language.
-
-This removes the bargain. No key, no account, no email. A visitor sends a
-scenario, gets a real verdict from the live engine, and it is sealed into the
-production chain - the same chain, the same sequence, covered by the same
-external anchor. They get the block index back and can verify it themselves at
-a public endpoint that has never heard of them.
-
-The demonstration is not a simulation of the product. It IS the product, run
-once, by a stranger, for free.
-
-WHAT IS DELIBERATELY REAL
--------------------------
-  - the scoring is the engine's own arithmetic, not a mock
-  - the seal is a genuine block in the live chain
-  - the counterfactual is computed by inverting the real function
-  - the review flow really does withhold the verdict until commitment
-  - the dwell time is really measured and really sealed
-
-WHAT IS DELIBERATELY NOT REAL
------------------------------
-  - demo events do not touch any customer's trust history; user ids are
-    namespaced to demo: and scored from a neutral starting trust
-  - nothing about a visitor is recorded beyond what they typed
-
-ABUSE
------
-Public routes are rate limited per client by the router. A visitor cannot
-flood the chain, and the cost of a demo block is a few hundred bytes.
-
-    POST /x/demo/govern   scenario -> verdict, seal, counterfactual
-    POST /x/demo/review   open a review case, verdict withheld
-    POST /x/demo/commit   commit a verdict, then see what the machine said
-    GET  /x/demo/stats    how many people have tried it
-"""
-
-import json, math, secrets, time
-from datetime import datetime, timezone
-
-VERSION = "1.0"
-
-# No key required for any of these - that is the entire point.
-PUBLIC = {("POST", "govern"), ("POST", "review"), ("POST", "commit"),
-          ("GET", "stats"), ("GET", "")}
-
-DEMO_KEY = "public_demo"
-LN_CAP = math.log1p(10000)
-SAFE = {"UK", "US", "DE", "FR", "CA", "AU", "NL", "SE", "NO", "DK", "FI", "IE", "NZ"}
-
-_ready = False
-
-
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        ctx["conn"].execute("CREATE TABLE IF NOT EXISTS demo_cases(case_id TEXT PRIMARY KEY,opened REAL,material TEXT,machine_verdict TEXT,score REAL,committed REAL,human_verdict TEXT,dwell REAL)")
-        ctx["conn"].execute("CREATE TABLE IF NOT EXISTS demo_stats(k TEXT PRIMARY KEY,v INTEGER)")
-        ctx["conn"].commit()
-    _ready = True
-
-
-def _bump(ctx, k):
-    with ctx["lock"]:
-        ctx["conn"].execute("INSERT INTO demo_stats(k,v) VALUES(?,1) ON CONFLICT(k) DO UPDATE SET v=v+1", (k,))
-        ctx["conn"].commit()
-
-
-def _clamp(x, a=0.0, b=1.0):
-    return max(a, min(b, x))
-
-
-def _iso(ts):
-    if not ts:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
-
-def _f(d, k, default=0.0):
-    try:
-        return float(d.get(k, default))
-    except (TypeError, ValueError):
-        return default
-
-
-def _signals(data):
-    country = str(data.get("country", "UK")).strip().upper()[:4] or "UK"
-    return {
-        "trust": _clamp(_f(data, "trust", 0.5)),
-        "v60": max(0.0, min(_f(data, "v60"), 10000)),
-        "v5m": max(0.0, min(_f(data, "v5m"), 10000)),
-        "v1h": max(0.0, min(_f(data, "v1h"), 100000)),
-        "amount": max(0.0, min(_f(data, "amount"), 10000000)),
-        "device_risk": _clamp(_f(data, "device_risk")),
-        "anomaly": _clamp(_f(data, "anomaly")),
-        "country": country,
-        "country_shift": bool(data.get("country_shift")),
-        "unsafe_country": country not in SAFE,
-    }
-
-
-def _score(s):
-    sc = (1 - s["trust"]) * 0.30
-    sc += min(s["v60"] / 20.0, 1) * 0.15
-    sc += min(s["v5m"] / 50.0, 1) * 0.10
-    sc += min(s["v1h"] / 200.0, 1) * 0.10
-    sc += min(math.log1p(s["amount"]) / LN_CAP, 1) * 0.15
-    sc += s["device_risk"] * 0.10
-    sc += s["anomaly"] * 0.10
-    if s["country_shift"]:
-        sc += 0.10
-    if s["unsafe_country"]:
-        sc += 0.10
-    return round(_clamp(sc), 4)
-
-
-def _reasons(s):
-    r = []
-    if s["trust"] < 0.4:
-        r.append("low_trust")
-    if s["v60"] > 10:
-        r.append("velocity_spike")
-    if s["amount"] > 500:
-        r.append("high_amount")
-    if s["device_risk"] > 0.5:
-        r.append("risky_device")
-    if s["anomaly"] > 0.5:
-        r.append("behaviour_anomaly")
-    if s["country_shift"]:
-        r.append("country_shift")
-    if s["unsafe_country"]:
-        r.append("unsafe_country")
-    return r
-
-
-def _verdict(sc):
-    if sc < 0.35:
-        return "ALLOW"
-    if sc < 0.70:
-        return "CHALLENGE"
-    return "BLOCK"
-
-
-def _counterfactual(s, score, verdict):
-    """Exact inversion. Returns the cheapest single change, or None."""
-    if verdict == "ALLOW":
-        return None, "Already the most permissive verdict."
-    ceiling = 0.70 if verdict == "BLOCK" else 0.35
-    target = "CHALLENGE" if verdict == "BLOCK" else "ALLOW"
-    needed = score - ceiling + 0.0001
-
-    contribs = [
-        ("trust", (1 - s["trust"]) * 0.30),
-        ("amount", min(math.log1p(s["amount"]) / LN_CAP, 1) * 0.15),
-        ("v60", min(s["v60"] / 20.0, 1) * 0.15),
-        ("v5m", min(s["v5m"] / 50.0, 1) * 0.10),
-        ("v1h", min(s["v1h"] / 200.0, 1) * 0.10),
-        ("device_risk", s["device_risk"] * 0.10),
-        ("anomaly", s["anomaly"] * 0.10),
-        ("country_shift", 0.10 if s["country_shift"] else 0.0),
-        ("unsafe_country", 0.10 if s["unsafe_country"] else 0.0),
-    ]
-    contribs.sort(key=lambda kv: -kv[1])
-
-    for name, c in contribs:
-        if c <= 0 or c < needed:
-            continue
-        t = c - needed
-        if name == "trust":
-            v = 1 - (t / 0.30)
-            if v <= 1.0:
-                return {"factor": "trust", "required": round(_clamp(v), 3),
-                        "was": round(s["trust"], 3)}, ("a trust score of "
-                        + str(round(_clamp(v), 3)) + " instead of "
-                        + str(round(s["trust"], 3)) + " would have made this "
-                        + target)
-        if name == "amount":
-            v = math.expm1((t / 0.15) * LN_CAP)
-            return {"factor": "amount", "required": round(v, 2),
-                    "was": round(s["amount"], 2)}, ("an amount of "
-                    + str(round(v, 2)) + " instead of " + str(round(s["amount"], 2))
-                    + " would have made this " + target)
-        if name in ("v60", "v5m", "v1h"):
-            cap, w = {"v60": (20.0, 0.15), "v5m": (50.0, 0.10), "v1h": (200.0, 0.10)}[name]
-            v = (t / w) * cap
-            lbl = {"v60": "60-second", "v5m": "5-minute", "v1h": "1-hour"}[name]
-            return {"factor": name, "required": int(v), "was": int(s[name])}, (
-                "a " + lbl + " velocity of " + str(int(v)) + " instead of "
-                + str(int(s[name])) + " would have made this " + target)
-        if name in ("device_risk", "anomaly"):
-            v = t / 0.10
-            lbl = "device risk" if name == "device_risk" else "behavioural anomaly"
-            return {"factor": name, "required": round(_clamp(v), 3), "was": round(s[name], 3)}, (
-                "a " + lbl + " of " + str(round(_clamp(v), 3)) + " instead of "
-                + str(round(s[name], 3)) + " would have made this " + target)
-        if name in ("country_shift", "unsafe_country"):
-            lbl = ("no country change from the previous event" if name == "country_shift"
-                   else "an event from a jurisdiction on the safe list")
-            return {"factor": name, "required": 0, "was": 1}, (
-                lbl + " would have made this " + target)
-    return None, ("no single factor, changed alone, would have reached "
-                  + target + " - several drove this together")
-
-
-def _govern(ctx, data):
-    s = _signals(data)
-    score = _score(s)
-    verdict = _verdict(score)
-    reasons = _reasons(s)
-    cf, cf_text = _counterfactual(s, score, verdict)
-
-    ts = time.time()
-    uid = "demo:" + secrets.token_hex(3)
-    ev = {"user_id": uid, "action": str(data.get("action", "payment"))[:40],
-          "amount": s["amount"], "country": s["country"],
-          "device_id": "demo", "anomaly": s["anomaly"],
-          "device_risk": s["device_risk"]}
-    res = {"decision": verdict, "score": score, "reasons": reasons,
-           "demo": True, "demo_version": VERSION, "timestamp": ts,
-           "signals": {k: s[k] for k in ("trust", "v60", "v5m", "v1h",
-                                          "country_shift", "unsafe_country")},
-           "note": "public demonstration - sealed into the live chain like any other decision"}
-    h, idx, seq = ctx["seal"](ev, res, ts, DEMO_KEY)
-    _bump(ctx, "govern")
-
-    return {"decision": verdict, "score": score, "reasons": reasons,
-            "sealed_at": _iso(ts),
-            "audit_hash": h, "block_index": idx, "receipt_seq": seq,
-            "counterfactual": cf,
-            "counterfactual_statement": cf_text,
-            "verify": {
-                "this_block": "/api/inclusion?hash=" + h,
-                "whole_chain": "/api/verify-chain",
-                "external_anchor": "/api/anchor-status"},
-            "what_just_happened": [
-                "Your scenario was scored by the live engine, not a simulation.",
-                "The verdict was sealed into the production chain as block " + str(idx) + ".",
-                "That block is now covered by the next external timestamp.",
-                "Nothing about you was recorded. No account, no email, no key.",
-                "Verify any of it at the links above - they have never heard of you."]}, 200
-
-
-def _review(ctx, data):
-    """Open a review case. The verdict is computed and sealed - and withheld."""
-    s = _signals(data)
-    score = _score(s)
-    verdict = _verdict(score)
-    cid = "DEMO-" + secrets.token_hex(4).upper()
-    ts = time.time()
-    material = {"action": str(data.get("action", "payment"))[:40],
-                "amount": s["amount"], "country": s["country"],
-                "60_second_velocity": int(s["v60"]),
-                "5_minute_velocity": int(s["v5m"]),
-                "device_risk": s["device_risk"],
-                "behavioural_anomaly": s["anomaly"],
-                "country_changed": s["country_shift"],
-                "trust_history": round(s["trust"], 3)}
-    with ctx["lock"]:
-        ctx["conn"].execute("INSERT INTO demo_cases(case_id,opened,material,machine_verdict,score,committed,human_verdict,dwell) VALUES(?,?,?,?,?,NULL,NULL,NULL)",
-                            (cid, ts, json.dumps(material), verdict, score))
-        ctx["conn"].commit()
-    _bump(ctx, "review_opened")
-    return {"case_id": cid, "opened": _iso(ts), "material": material,
-            "machine_verdict": "withheld until you commit",
-            "your_options": ["allow", "challenge", "block"],
-            "instruction": "Decide for yourself, then POST your verdict to /x/demo/commit with this case_id. The clock is running and your answer is sealed before ours is shown."}, 200
-
-
-def _commit(ctx, data):
-    cid = str(data.get("case_id", "")).strip().upper()
-    hv = str(data.get("verdict", "")).strip().upper()
-    if hv not in ("ALLOW", "CHALLENGE", "BLOCK"):
-        return {"error": "verdict_required", "allowed": ["allow", "challenge", "block"]}, 400
-    with ctx["lock"]:
-        row = ctx["conn"].execute("SELECT opened,material,machine_verdict,score,committed FROM demo_cases WHERE case_id=?", (cid,)).fetchone()
-    if not row:
-        return {"error": "unknown_case_id"}, 404
-    if row[4]:
-        return {"error": "already_committed",
-                "message": "You commit once. That is the point of it."}, 400
-
-    ts = time.time()
-    dwell = round(ts - row[0], 2)
-    agreed = (hv == row[2])
-
-    ev = {"user_id": "demo:" + cid, "action": "demo_oversight_commit",
-          "amount": 0, "country": "UK", "device_id": "demo",
-          "anomaly": 0, "device_risk": 0}
-    res = {"decision": "DEMO_OVERSIGHT_SEALED", "score": 0, "demo": True,
-           "timestamp": ts, "human_verdict": hv, "dwell_seconds": dwell,
-           "detail": "human verdict sealed before the machine verdict was revealed"}
-    h, idx, seq = ctx["seal"](ev, res, ts, DEMO_KEY)
-
-    with ctx["lock"]:
-        ctx["conn"].execute("UPDATE demo_cases SET committed=?,human_verdict=?,dwell=? WHERE case_id=?",
-                            (ts, hv, dwell, cid))
-        ctx["conn"].commit()
-    _bump(ctx, "review_committed")
-
-    out = {"case_id": cid, "your_verdict": hv,
-           "machine_verdict": row[2], "machine_score": row[3],
-           "agreed": agreed, "dwell_seconds": dwell,
-           "audit_hash": h, "block_index": idx, "receipt_seq": seq,
-           "what_just_happened": [
-               "Your verdict was sealed as block " + str(idx) + " BEFORE this response revealed ours.",
-               "The chain fixes that order permanently and it cannot be reversed.",
-               "Your dwell time of " + str(dwell) + "s is part of the record.",
-               "That is the difference between a reviewer who decided and one who agreed."]}
-    if dwell < 2:
-        out["flag"] = ("committed in " + str(dwell) + " seconds - on a real system that would sit "
-                       "in your record permanently, and a pattern of it would be visible to an auditor")
-    if agreed:
-        out["note"] = "You agreed with the engine - but the chain shows you did so without having seen it."
-    else:
-        out["note"] = "You diverged from the engine. On a real system that is evidence of independent judgement."
-    return out, 200
-
-
-def _stats(ctx):
-    with ctx["lock"]:
-        rows = ctx["conn"].execute("SELECT k,v FROM demo_stats").fetchall()
-        cases = ctx["conn"].execute("SELECT COUNT(*),AVG(dwell) FROM demo_cases WHERE committed IS NOT NULL").fetchone()
-        fast = ctx["conn"].execute("SELECT COUNT(*) FROM demo_cases WHERE dwell IS NOT NULL AND dwell<2").fetchone()
-    d = {k: v for k, v in rows}
-    out = {"decisions_run": d.get("govern", 0),
-           "review_cases_opened": d.get("review_opened", 0),
-           "review_cases_committed": d.get("review_committed", 0)}
-    if cases and cases[0]:
-        out["median_dwell_seconds"] = round(cases[1] or 0, 2)
-        out["committed_under_2_seconds"] = fast[0] if fast else 0
-        out["note"] = ("Visitors who committed in under two seconds did not read the case. "
-                       "On a real deployment that is exactly what the record would show.")
-    return out, 200
-
-
-def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-    if method == "POST":
-        if action == "govern":
-            return _govern(ctx, data)
-        if action == "review":
-            return _review(ctx, data)
-        if action == "commit":
-            return _commit(ctx, data)
-    else:
-        if action in ("", "stats"):
-            return _stats(ctx)
-    return {"error": "unknown_action", "action": action,
-            "available": ["POST govern", "POST review", "POST commit", "GET stats"]}, 404
-
-```
-
-
-## `modules/disclosure.py`
-
-201 lines, 7648 bytes
-
-```python
-"""
-disclosure.py v1.0.0 - the chain reset, put on the record inside the chain.
-
-Lives at modules/disclosure.py and answers at https://sebbi.pro/x/disclosure/<action>.
-All routes are public.
-
-WHAT IT DOES
-The audit chain restarted from genesis on 7 September 2026. Until now that
-was said in messages and in route text, but not sealed. This module seals one
-fixed statement about the reset into the chain, exactly once, and then serves
-the block number so anyone can find it and recompute it.
-
-The first visit to /status seals it. Every visit after that returns the same
-block. Nothing is ever sealed twice, and the text cannot be changed by calling
-the route - it is fixed in this file.
-
-The statement is sealed under user_id "system_reset_disclosure", which is on
-the public list in walk.py, so its full preimage is served at /x/walk and can be
-recomputed by anyone.
-
-Module contract: handle(method, action, data, api_key, ctx) -> (dict, status).
-"""
-
-import json
-import threading
-import time
-
-VERSION = "1.0.0"
-HOST = "https://sebbi.pro"
-BASE = HOST + "/x/disclosure/"
-USER_ID = "system_reset_disclosure"
-
-RESET_DATE = "2026-09-07"
-
-# If you still hold the final tip hash or block count of the chain as it stood
-# before the reset, put them here before deploying. Left empty, the statement
-# says plainly that they are not recorded in this disclosure.
-PREVIOUS_CHAIN_FINAL_TIP = ""
-PREVIOUS_CHAIN_FINAL_HEIGHT = ""
-
-STATEMENT = (
-    "On " + RESET_DATE + " the operator of sebbi.pro reset the audit chain and "
-    "it restarted from genesis. Blocks sealed before that date are not part of "
-    "this chain and cannot be verified against it. A block index quoted before "
-    "that date belongs to the earlier chain; if the same number exists on this "
-    "chain, it is a different block. Some records kept outside the chain from "
-    "before the reset, including completeness period commitments, still quote "
-    "block indexes from the earlier chain. This disclosure is sealed into the "
-    "current chain so the break is on the record rather than something a "
-    "verifier has to ask about."
-)
-
-_lock = threading.Lock()
-
-PUBLIC = {("GET", "status"), ("GET", "statement"), ("GET", "spec")}
-
-
-def _ensure_table(conn):
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS reset_disclosure("
-        "id INTEGER PRIMARY KEY CHECK (id = 1), block_index INTEGER, "
-        "audit_hash TEXT, ts REAL, statement_json TEXT)")
-    conn.commit()
-
-
-def _stored(conn):
-    r = conn.execute(
-        "SELECT block_index, audit_hash, ts, statement_json FROM reset_disclosure "
-        "WHERE id = 1").fetchone()
-    if not r:
-        return None
-    try:
-        body = json.loads(r[3])
-    except Exception:
-        body = {}
-    return {"block_index": r[0], "audit_hash": r[1], "ts": r[2], "statement": body}
-
-
-def _genesis_hash(conn):
-    r = conn.execute(
-        "SELECT audit_hash FROM audit_log ORDER BY id ASC LIMIT 1").fetchone()
-    return r[0] if r else None
-
-
-def _links(rec):
-    idx = rec["block_index"]
-    return {
-        "block": HOST + "/x/walk/block?index=" + str(idx),
-        "verify_method": HOST + "/x/walk/spec",
-        "statement": BASE + "statement",
-    }
-
-
-def _seal_once(ctx):
-    conn, dblock = ctx["conn"], ctx["lock"]
-    with _lock:
-        with dblock:
-            _ensure_table(conn)
-            rec = _stored(conn)
-            if rec:
-                return rec, False
-            genesis = _genesis_hash(conn)
-        body = {
-            "kind": "chain_reset_disclosure",
-            "reset_date": RESET_DATE,
-            "current_chain_genesis_hash": genesis,
-            "current_chain_genesis_block_index": 1,
-            "previous_chain_final_tip": PREVIOUS_CHAIN_FINAL_TIP or "not recorded in this disclosure",
-            "previous_chain_final_height": PREVIOUS_CHAIN_FINAL_HEIGHT or "not recorded in this disclosure",
-            "statement": STATEMENT,
-            "disclosure_version": VERSION,
-        }
-        ts = time.time()
-        event = {
-            "user_id": USER_ID,
-            "action": "chain_reset_disclosed",
-            "amount": 0,
-            "country": "UK",
-            "device_id": "server",
-            "anomaly": 0,
-            "device_risk": 0,
-        }
-        result = dict(body)
-        result["decision"] = "DISCLOSED"
-        result["score"] = 0
-        result["timestamp"] = ts
-        # ctx seal takes its own lock - do not hold the db lock here.
-        out = ctx["seal"](event, result, ts)
-        if isinstance(out, (list, tuple)):
-            h = out[0]
-            idx = out[1] if len(out) > 1 else None
-        elif isinstance(out, dict):
-            h = out.get("audit_hash") or out.get("hash")
-            idx = out.get("block_index") or out.get("index")
-        else:
-            h, idx = out, None
-        with dblock:
-            conn.execute(
-                "INSERT OR IGNORE INTO reset_disclosure(id, block_index, audit_hash, ts, statement_json) "
-                "VALUES (1, ?, ?, ?, ?)", (idx, h, ts, json.dumps(body)))
-            conn.commit()
-            rec = _stored(conn)
-        return rec, True
-
-
-def _spec():
-    return {
-        "module": "disclosure",
-        "version": VERSION,
-        "purpose": "Seals one fixed statement about the " + RESET_DATE + " chain reset "
-                   "into the current chain, once, and serves where it is.",
-        "routes": {
-            "status": BASE + "status",
-            "statement": BASE + "statement",
-            "spec": BASE + "spec",
-        },
-        "behaviour": "The first call to status seals the statement. Every later call "
-                     "returns the same block. The text is fixed in the module and "
-                     "cannot be changed through any route.",
-        "verify": "Open the block link in the response. Its preimage is served in full; "
-                  "sha256 of it must equal audit_hash, and its prev_hash must equal the "
-                  "block before. Method: " + HOST + "/x/walk/spec",
-    }
-
-
-def handle(method, action, data, api_key, ctx):
-    try:
-        if method == "GET" and action == "spec":
-            return _spec(), 200
-        if method == "GET" and action == "status":
-            rec, new = _seal_once(ctx)
-            if not rec or rec.get("block_index") is None:
-                return {"error": "seal_failed", "detail": "no block index returned"}, 500
-            return {
-                "module": "disclosure",
-                "version": VERSION,
-                "sealed": True,
-                "sealed_just_now": new,
-                "block_index": rec["block_index"],
-                "audit_hash": rec["audit_hash"],
-                "sealed_at": rec["ts"],
-                "links": _links(rec),
-                "statement": rec["statement"],
-            }, 200
-        if method == "GET" and action == "statement":
-            conn, dblock = ctx["conn"], ctx["lock"]
-            with dblock:
-                _ensure_table(conn)
-                rec = _stored(conn)
-            if not rec:
-                return {"sealed": False,
-                        "note": "Not sealed yet. The first visit to " + BASE + "status seals it."}, 404
-            return {"sealed": True, "block_index": rec["block_index"],
-                    "audit_hash": rec["audit_hash"], "sealed_at": rec["ts"],
-                    "links": _links(rec), "statement": rec["statement"]}, 200
-        return {"error": "unknown_action",
-                "get": sorted(a for m, a in PUBLIC if m == "GET"),
-                "post": [], "spec": BASE + "spec"}, 404
-    except Exception as e:
-        return {"error": "disclosure_failed", "detail": str(e)[:300]}, 500
-
-```
-
-
-## `modules/dsr.py`
-
-239 lines, 10666 bytes
-
-```python
-"""
-DSR notary - /x/dsr/<action>
-
-Seals the lifecycle of a data subject request into the MAIN audit chain:
-received, assessed, extended, completed. Each is an ordinary block in
-audit_log, so /api/verify-chain and the anchor cover them automatically.
-
-The chain never holds the person's identity. The identifier is HMAC'd on
-arrival and only the fingerprint is stored - so personal data is deleted in
-your own systems as normal, and what remains is a seal resolving to nothing.
-
-Needs DSR_SECRET set in Railway (falls back to LICENCE_SECRET).
-Never change it once live - existing fingerprints become unresolvable.
-
-    POST /x/dsr/receive    subject_identifier, kind, channel, note
-    POST /x/dsr/assess     request_id, outcome, ground, reasoning, assessed_by
-    POST /x/dsr/extend     request_id, reason
-    POST /x/dsr/complete   request_id, action_taken, responded_by
-    GET  /x/dsr/request?id=DSR-XXXXXXXX
-    GET  /x/dsr/overdue
-    GET  /x/dsr/list
-"""
-
-import hashlib, hmac, json, os, secrets, time
-from datetime import datetime, timezone
-
-KINDS = {"erasure", "access", "rectification", "objection", "portability", "restriction"}
-OUTCOMES = {"granted", "refused", "partial"}
-VERSION = "1.0"
-
-_ready = False
-
-
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        ctx["conn"].execute("CREATE TABLE IF NOT EXISTS dsr_requests(request_id TEXT PRIMARY KEY,api_key TEXT,subject_fp TEXT,kind TEXT,received REAL,deadline REAL,extended INTEGER DEFAULT 0,status TEXT DEFAULT 'open',closed REAL,seal TEXT,block_index INTEGER)")
-        ctx["conn"].execute("CREATE INDEX IF NOT EXISTS idx_dsr_key ON dsr_requests(api_key)")
-        ctx["conn"].commit()
-    _ready = True
-
-
-def _secret():
-    s = os.environ.get("DSR_SECRET", "").strip() or os.environ.get("LICENCE_SECRET", "").strip()
-    return s.encode() if s else None
-
-
-def fingerprint(ident):
-    s = _secret()
-    if not s:
-        return None
-    return hmac.new(s, str(ident).strip().lower().encode(), hashlib.sha256).hexdigest()
-
-
-def _add_months(ts, n):
-    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-    mi = dt.month - 1 + n
-    y = dt.year + mi // 12
-    m = mi % 12 + 1
-    leap = (y % 4 == 0 and (y % 100 != 0 or y % 400 == 0))
-    dim = [31, 29 if leap else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m - 1]
-    return dt.replace(year=y, month=m, day=min(dt.day, dim)).timestamp()
-
-
-def _iso(ts):
-    if not ts:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
-
-def _seal_event(ctx, api_key, rid, fp, action, detail):
-    ts = time.time()
-    ev = {"user_id": "dsr:" + rid, "action": "dsr_" + action, "amount": 0,
-          "country": "UK", "device_id": "dsr", "anomaly": 0, "device_risk": 0,
-          "subject_fp": fp}
-    res = {"decision": "DSR_SEALED", "score": 0, "dsr_action": action,
-           "dsr_version": VERSION, "timestamp": ts, "detail": detail,
-           "note": "data subject request lifecycle event - no personal data in this block"}
-    h, idx, seq = ctx["seal"](ev, res, ts, api_key)
-    return h, idx, seq, ts
-
-
-def _lookup(ctx, api_key, rid):
-    with ctx["lock"]:
-        return ctx["conn"].execute("SELECT subject_fp,kind,received,deadline,extended,status,closed FROM dsr_requests WHERE request_id=? AND api_key=?", (rid, api_key)).fetchone()
-
-
-def _receive(ctx, api_key, data):
-    if not _secret():
-        return {"error": "dsr_secret_not_set", "message": "Set DSR_SECRET in Railway."}, 503
-    ident = str(data.get("subject_identifier", "")).strip()
-    if not ident:
-        return {"error": "subject_identifier_required"}, 400
-    kind = str(data.get("kind", "erasure")).strip().lower()
-    if kind not in KINDS:
-        return {"error": "invalid_kind", "allowed": sorted(KINDS)}, 400
-    fp = fingerprint(ident)
-    rid = "DSR-" + secrets.token_hex(4).upper()
-    ts = time.time()
-    deadline = _add_months(ts, 1)
-    detail = "kind=" + kind + ";channel=" + str(data.get("channel", ""))[:60] + ";note=" + str(data.get("note", ""))[:200]
-    h, idx, seq, _x = _seal_event(ctx, api_key, rid, fp, "received", detail)
-    with ctx["lock"]:
-        ctx["conn"].execute("INSERT INTO dsr_requests(request_id,api_key,subject_fp,kind,received,deadline,extended,status,closed,seal,block_index) VALUES(?,?,?,?,?,?,0,'open',NULL,?,?)",
-                            (rid, api_key, fp, kind, ts, deadline, h, idx))
-        ctx["conn"].commit()
-    return {"request_id": rid, "kind": kind, "subject_fp": fp[:16] + "...",
-            "received": _iso(ts), "respond_by": _iso(deadline),
-            "audit_hash": h, "block_index": idx, "receipt_seq": seq,
-            "message": "Clock started. One calendar month to respond."}, 200
-
-
-def _assess(ctx, api_key, data):
-    rid = str(data.get("request_id", "")).strip()
-    row = _lookup(ctx, api_key, rid)
-    if not row:
-        return {"error": "unknown_request_id"}, 404
-    outcome = str(data.get("outcome", "")).strip().lower()
-    if outcome not in OUTCOMES:
-        return {"error": "invalid_outcome", "allowed": sorted(OUTCOMES)}, 400
-    reasoning = str(data.get("reasoning", "")).strip()
-    if not reasoning:
-        return {"error": "reasoning_required", "message": "The reasoning is the part examined later. It cannot be blank."}, 400
-    detail = ("outcome=" + outcome + ";ground=" + str(data.get("ground", ""))[:120] +
-              ";by=" + str(data.get("assessed_by", ""))[:60] + ";reasoning=" + reasoning[:600])
-    h, idx, seq, ts = _seal_event(ctx, api_key, rid, row[0], "assessed", detail)
-    with ctx["lock"]:
-        ctx["conn"].execute("UPDATE dsr_requests SET status=? WHERE request_id=? AND api_key=?", ("assessed:" + outcome, rid, api_key))
-        ctx["conn"].commit()
-    return {"request_id": rid, "outcome": outcome, "audit_hash": h, "block_index": idx, "receipt_seq": seq}, 200
-
-
-def _extend(ctx, api_key, data):
-    rid = str(data.get("request_id", "")).strip()
-    row = _lookup(ctx, api_key, rid)
-    if not row:
-        return {"error": "unknown_request_id"}, 404
-    if row[4]:
-        return {"error": "already_extended", "message": "A request can be extended once."}, 400
-    reason = str(data.get("reason", "")).strip()
-    if not reason:
-        return {"error": "reason_required", "message": "An extension needs a stated reason."}, 400
-    old = row[3]
-    new = _add_months(old, 2)
-    detail = "old_deadline=" + str(_iso(old)) + ";new_deadline=" + str(_iso(new)) + ";reason=" + reason[:300]
-    h, idx, seq, ts = _seal_event(ctx, api_key, rid, row[0], "extended", detail)
-    with ctx["lock"]:
-        ctx["conn"].execute("UPDATE dsr_requests SET deadline=?,extended=1 WHERE request_id=? AND api_key=?", (new, rid, api_key))
-        ctx["conn"].commit()
-    return {"request_id": rid, "was_due": _iso(old), "respond_by": _iso(new),
-            "audit_hash": h, "block_index": idx, "receipt_seq": seq}, 200
-
-
-def _complete(ctx, api_key, data):
-    rid = str(data.get("request_id", "")).strip()
-    row = _lookup(ctx, api_key, rid)
-    if not row:
-        return {"error": "unknown_request_id"}, 404
-    action = str(data.get("action_taken", "")).strip()
-    if not action:
-        return {"error": "action_taken_required"}, 400
-    ts = time.time()
-    in_time = ts <= row[3]
-    detail = ("action=" + action[:400] + ";by=" + str(data.get("responded_by", ""))[:60] +
-              ";within_deadline=" + ("yes" if in_time else "no"))
-    h, idx, seq, _x = _seal_event(ctx, api_key, rid, row[0], "completed", detail)
-    with ctx["lock"]:
-        ctx["conn"].execute("UPDATE dsr_requests SET status='closed',closed=? WHERE request_id=? AND api_key=?", (ts, rid, api_key))
-        ctx["conn"].commit()
-    return {"request_id": rid, "closed": _iso(ts), "within_deadline": in_time,
-            "audit_hash": h, "block_index": idx, "receipt_seq": seq}, 200
-
-
-def _timeline(ctx, api_key, rid):
-    row = _lookup(ctx, api_key, rid)
-    if not row:
-        return {"error": "unknown_request_id"}, 404
-    with ctx["lock"]:
-        blocks = ctx["conn"].execute("SELECT ts,result_json,audit_hash,key_seq FROM audit_log WHERE user_id=? ORDER BY id ASC", ("dsr:" + rid,)).fetchall()
-    events = []
-    for ts_, res, ah, seq in blocks:
-        try:
-            r = json.loads(res)
-            events.append({"at": _iso(ts_), "event": r.get("dsr_action"),
-                           "detail": r.get("detail"), "sealed": ah, "receipt_seq": seq})
-        except Exception:
-            pass
-    return {"request_id": rid, "kind": row[1], "received": _iso(row[2]),
-            "respond_by": _iso(row[3]), "extended": bool(row[4]),
-            "status": row[5], "closed": _iso(row[6]), "events": events,
-            "verify": "/api/verify-chain re-checks these with the rest of the chain"}, 200
-
-
-def _overdue(ctx, api_key):
-    t = time.time()
-    with ctx["lock"]:
-        rows = ctx["conn"].execute("SELECT request_id,kind,received,deadline FROM dsr_requests WHERE api_key=? AND status!='closed' AND deadline<? ORDER BY deadline ASC", (api_key, t)).fetchall()
-    return {"count": len(rows),
-            "overdue": [{"request_id": r[0], "kind": r[1], "received": _iso(r[2]),
-                         "was_due": _iso(r[3]), "days_late": round((t - r[3]) / 86400, 1)} for r in rows]}, 200
-
-
-def _list(ctx, api_key):
-    t = time.time()
-    with ctx["lock"]:
-        rows = ctx["conn"].execute("SELECT request_id,kind,received,deadline,status,extended FROM dsr_requests WHERE api_key=? ORDER BY received DESC LIMIT 200", (api_key,)).fetchall()
-    out = []
-    for r in rows:
-        out.append({"request_id": r[0], "kind": r[1], "received": _iso(r[2]),
-                    "respond_by": _iso(r[3]), "status": r[4], "extended": bool(r[5]),
-                    "days_remaining": (round((r[3] - t) / 86400, 1) if r[4] != "closed" else None)})
-    return {"count": len(out), "requests": out}, 200
-
-
-def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-    if method == "POST":
-        if action == "receive":
-            return _receive(ctx, api_key, data)
-        if action == "assess":
-            return _assess(ctx, api_key, data)
-        if action == "extend":
-            return _extend(ctx, api_key, data)
-        if action == "complete":
-            return _complete(ctx, api_key, data)
-    else:
-        if action == "overdue":
-            return _overdue(ctx, api_key)
-        if action == "list":
-            return _list(ctx, api_key)
-        if action == "request":
-            rid = str(data.get("id", "")).strip()
-            if not rid:
-                return {"error": "id_required"}, 400
-            return _timeline(ctx, api_key, rid)
-    return {"error": "unknown_action", "action": action}, 404
-
-```
-
-
-## `modules/fingerprint.py`
-
-550 lines, 22358 bytes
-
-```python
-"""
-modules/fingerprint.py  -  is somebody else running my scoring function?
-
-THE IDEA
---------
-The scoring engine is deterministic. Identical inputs give an identical score,
-every time, forever. That is a compliance property - and it is also a
-signature.
-
-So: fire a fixed battery of carefully chosen inputs at any scoring endpoint,
-fire the same battery at our own, and compare the two sets of numbers.
-
-  identical across 24 varied vectors        it is this function
-  identical shape, different scale          it is this function, reweighted
-  same ordering, different curve            similar design, not this code
-  unrelated                                 unrelated
-
-WHY THE VECTORS ARE CHOSEN THE WAY THEY ARE
--------------------------------------------
-Random inputs would only catch a straight copy. These are picked to probe the
-specific design decisions in the function, because those are what survive
-someone renaming things or nudging a weight:
-
-  saturation points   velocity terms saturate at different counts per window,
-                      so a burst and a grind separate. Vectors sit either side
-                      of each saturation point.
-  curve shape         amount is log-scaled, so small sums move the score far
-                      more than large ones. Vectors walk that curve.
-  normalisation       the continuous weights sum to 1.00 and the boolean
-                      geography terms sit outside it. Vectors isolate that.
-  asymmetry           trust contributes inversely and dominates. Vectors sweep
-                      trust alone with everything else held flat.
-
-A copy that renamed every field and changed nothing else matches exactly. A
-copy that shifted the weights still tracks the shape, because the saturation
-points and the log curve are structural rather than parametric.
-
-WHAT IT CANNOT DO
------------------
-It only sees endpoints it can reach. A private product behind a key with no
-free tier is invisible to this, and no amount of cleverness changes that.
-
-It also proves similarity, never theft. Two people can converge on similar
-weights honestly. What this produces is a dated, sealed measurement - which is
-evidence, not a verdict, and the distinction matters if it is ever put in
-front of anyone.
-
-EVERY RUN IS SEALED
--------------------
-The probe, the target, the vectors and the result all go into the chain. So a
-comparison run today is provable as having been run today, rather than
-assembled afterwards to fit an argument.
-
-ROUTES  (all keyed - this is not a public toy)
-----------------------------------------------
-  POST /x/fingerprint/self      score the battery on our own engine
-  POST /x/fingerprint/probe     url, plus optional field mapping. Compare.
-  GET  /x/fingerprint/history   previous probes and their verdicts
-  GET  /x/fingerprint/vectors   the battery itself
-  GET  /x/fingerprint/spec      what a verdict means and does not mean
-"""
-
-import ipaddress
-import json
-import math
-import socket
-import sys
-import time
-import urllib.error
-import urllib.request
-from urllib.parse import urlparse
-
-VERSION = "1.0"
-
-PUBLIC = set()          # nothing public. deliberately.
-
-FETCH_TIMEOUT = 10
-MAX_BYTES = 200000
-POLITE_DELAY = 0.4      # do not hammer somebody else's server
-ALLOWED_SCHEMES = ("http", "https")
-ALLOWED_PORTS = (80, 443)
-
-# Where the live scorer might be found. Same approach as replay.py - look it
-# up at runtime, never import server.py.
-SCORER_NAMES = ["score_event", "score", "_score_event"]
-
-_ready = False
-
-
-# ----------------------------------------------------------------------
-# the battery
-# ----------------------------------------------------------------------
-# Each vector is (label, signals). Signals use the engine's own internal
-# names; the probe maps them to whatever the target calls things.
-
-def _v(trust=0.5, v60=0, v5m=0, v1h=0, amount=0.0,
-       device_risk=0.0, anomaly=0.0, country_shift=False, unsafe_country=False):
-    return {"trust": trust, "v60": v60, "v5m": v5m, "v1h": v1h,
-            "amount": amount, "device_risk": device_risk, "anomaly": anomaly,
-            "country_shift": country_shift, "unsafe_country": unsafe_country}
-
-
-VECTORS = [
-    # --- trust sweep, everything else flat. Isolates the dominant term.
-    ("trust-000", _v(trust=0.00)),
-    ("trust-025", _v(trust=0.25)),
-    ("trust-050", _v(trust=0.50)),
-    ("trust-075", _v(trust=0.75)),
-    ("trust-100", _v(trust=1.00)),
-
-    # --- velocity: either side of each window's saturation point.
-    ("v60-under",   _v(v60=10)),
-    ("v60-at",      _v(v60=20)),
-    ("v60-over",    _v(v60=40)),      # saturated: must equal v60-at
-    ("v5m-under",   _v(v5m=25)),
-    ("v5m-at",      _v(v5m=50)),
-    ("v5m-over",    _v(v5m=100)),     # saturated
-    ("v1h-under",   _v(v1h=100)),
-    ("v1h-at",      _v(v1h=200)),
-    ("v1h-over",    _v(v1h=400)),     # saturated
-
-    # --- burst vs grind: same total actions, different distribution.
-    ("burst",       _v(v60=20, v5m=20, v1h=20)),
-    ("grind",       _v(v60=1,  v5m=8,  v1h=200)),
-
-    # --- amount: walks the log curve. Small steps low, big steps high.
-    ("amt-10",      _v(amount=10.0)),
-    ("amt-100",     _v(amount=100.0)),
-    ("amt-1000",    _v(amount=1000.0)),
-    ("amt-10000",   _v(amount=10000.0)),
-    ("amt-50000",   _v(amount=50000.0)),   # saturated
-
-    # --- the boolean geography terms, isolated.
-    ("geo-shift",   _v(country_shift=True)),
-    ("geo-unsafe",  _v(unsafe_country=True)),
-    ("geo-both",    _v(country_shift=True, unsafe_country=True)),
-
-    # --- the other two continuous signals.
-    ("dev-risk",    _v(device_risk=1.0)),
-    ("anomaly",     _v(anomaly=1.0)),
-
-    # --- everything at once. Tests the clamp and the normalisation.
-    ("max-all",     _v(trust=0.0, v60=40, v5m=100, v1h=400, amount=50000.0,
-                       device_risk=1.0, anomaly=1.0,
-                       country_shift=True, unsafe_country=True)),
-    ("min-all",     _v(trust=1.0)),
+_HEX64 = re.compile(r"(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])")
+WITNESS_MAX_BYTES = 2 * 1024 * 1024
+_SECRET_SHAPES = [
+    ("api key", re.compile(r"\b(?:al|sb|se)_live_[0-9a-f]{16,}")),
+    ("api key", re.compile(r"\bsk-[A-Za-z0-9_-]{20,}")),
+    ("cloud key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("access token", re.compile(r"\b(?:ghp|gho|xox[abp])[_-][A-Za-z0-9-]{10,}")),
+    ("private key", re.compile(r"BEGIN [A-Z ]*PRIVATE KEY")),
+    ("email address", re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")),
 ]
 
-# Default mapping from our internal signal names to a target's request body.
-DEFAULT_FIELDS = {
-    "trust": "trust", "v60": "v60", "v5m": "v5m", "v1h": "v1h",
-    "amount": "amount", "device_risk": "device_risk", "anomaly": "anomaly",
-    "country_shift": "country_shift", "unsafe_country": "unsafe_country",
-}
-SCORE_KEYS = ["score", "risk_score", "value", "result", "rating", "confidence"]
+
+_ZERO64 = "0" * 64
+BACKFILL_HOURS = 6
+
+_RULE_RE = re.compile(
+    r"createdAt\s*-\s*rangeEnd\s*(>=|>)\s*([0-9]+(?:\.[0-9]+)?)\s*"
+    r"(hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b", re.I)
 
 
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "CREATE TABLE IF NOT EXISTS fingerprint_probe("
-            "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,target TEXT,"
-            "ran REAL,vectors INTEGER,answered INTEGER,exact INTEGER,"
-            "verdict TEXT,correlation REAL,detail TEXT,audit_hash TEXT,"
-            "block_index INTEGER)")
-        ctx["conn"].execute(
-            "CREATE INDEX IF NOT EXISTS idx_fp_target ON fingerprint_probe(target)")
-        ctx["conn"].commit()
-    _ready = True
+def _parse_rule(text):
+    """'createdAt - rangeEnd > 2 hours' -> (op, seconds) or None."""
+    m = _RULE_RE.search(str(text or ""))
+    if not m:
+        return None
+    n = float(m.group(2))
+    unit = m.group(3).lower()
+    mult = 3600 if unit.startswith("h") else 60 if unit.startswith("m") else 1
+    return m.group(1), n * mult
 
 
-# ----------------------------------------------------------------------
-# our own engine
-# ----------------------------------------------------------------------
-
-def _find_scorer():
-    for modname in ("__main__", "server"):
-        mod = sys.modules.get(modname)
-        if not mod:
+def _recount(meta, op, seconds):
+    count, through = 0, None
+    for seq in sorted(meta):
+        cp = meta[seq]
+        c, r = _iso_ts(cp.get("createdAt")), _iso_ts(cp.get("rangeEnd"))
+        if c is None or r is None:
             continue
-        for name in SCORER_NAMES:
-            fn = getattr(mod, name, None)
-            if callable(fn):
-                return fn, modname + "." + name
-    return None, None
+        lag = c - r
+        if (lag >= seconds) if op == ">=" else (lag > seconds):
+            count += 1
+            through = seq
+    return count, through
 
 
-def _score_locally():
-    """Run the battery through the live engine. Returns (scores, source, error)."""
-    fn, where = _find_scorer()
-    if not fn:
-        return None, None, ("could not find the scoring function at runtime - "
-                            "add its name to SCORER_NAMES")
-    out = []
-    for label, signals in VECTORS:
-        try:
-            result = fn(dict(signals))
-            score = result[0] if isinstance(result, (tuple, list)) else result
-            out.append((label, round(float(score), 6)))
-        except Exception as exc:
-            return None, where, "scorer raised on %s: %s" % (label, exc)
-    return out, where, None
-
-
-# ----------------------------------------------------------------------
-# reaching a target - same guards as witness.py
-# ----------------------------------------------------------------------
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
+def _iso_ts(v):
+    try:
+        return time.mktime(time.strptime(str(v)[:19], "%Y-%m-%dT%H:%M:%S")) \
+            - time.timezone
+    except Exception:
         return None
 
 
-_opener = urllib.request.build_opener(_NoRedirect)
+def _walk(endpoint, budget):
+    """Walk a declared chain and recompute it.
+
+    Two published formats are understood:
+      blocks       the sebbi.pro walk format (https://sebbi.pro/x/walk/spec)
+      checkpoints  the MIR checkpoint format (seq/tip/prevTip, newest first)
+    The format is detected from what the endpoint serves, never assumed."""
+    first, err = _fetch_json(endpoint, budget, MAX_PAGE_BYTES)
+    if err:
+        out = _empty_walk(endpoint)
+        out["first_problem"] = "could not read walk endpoint: %s" % err
+        return out, {}, {}, {}
+    if isinstance(first, dict) and isinstance(first.get("checkpoints"), list):
+        return _walk_checkpoints(endpoint, first, budget)
+    if isinstance(first, dict) and isinstance(first.get("blocks"), list):
+        return _walk_blocks(endpoint, budget)
+    out = _empty_walk(endpoint)
+    out["first_problem"] = ("endpoint serves neither the blocks nor the "
+                            "checkpoints walk format")
+    return out, {}, {}, {}
 
 
-def _url_allowed(url):
-    if not url or not isinstance(url, str) or len(url) > 500:
-        return False, "no usable url"
-    try:
-        parts = urlparse(url.strip())
-    except Exception:
-        return False, "unparseable url"
-    if parts.scheme not in ALLOWED_SCHEMES:
-        return False, "scheme not allowed"
-    host = parts.hostname
-    if not host:
-        return False, "no host in url"
-    port = parts.port or (443 if parts.scheme == "https" else 80)
-    if port not in ALLOWED_PORTS:
-        return False, "port not allowed"
-    try:
-        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
-    except Exception as exc:
-        return False, "could not resolve host (%s)" % type(exc).__name__
-    for info in infos:
-        try:
-            addr = ipaddress.ip_address(info[4][0])
-        except ValueError:
-            return False, "unreadable address"
-        if (addr.is_private or addr.is_loopback or addr.is_link_local
-                or addr.is_reserved or addr.is_multicast or addr.is_unspecified):
-            return False, "address is not publicly routable"
-    return True, None
+def _empty_walk(endpoint):
+    return {"endpoint": endpoint, "format": None, "blocks": 0,
+            "public_recomputed": 0, "withheld_linkage_only": 0,
+            "complete": False, "genesis_prev_is_GENESIS": None,
+            "first_problem": None, "tip": None}
 
 
-def _post(url, body, headers=None):
-    data = json.dumps(body).encode("utf-8")
-    h = {"Content-Type": "application/json", "Accept": "application/json",
-         "User-Agent": "aileash-fingerprint/%s" % VERSION}
-    if headers:
-        h.update(headers)
-    request = urllib.request.Request(url, data=data, headers=h, method="POST")
-    try:
-        with _opener.open(request, timeout=FETCH_TIMEOUT) as response:
-            raw = response.read(MAX_BYTES)
-            status = response.getcode()
-    except urllib.error.HTTPError as exc:
-        try:
-            raw = exc.read(MAX_BYTES)
-        except Exception:
-            raw = b""
-        status = exc.code
-    except Exception as exc:
-        return 0, "unreachable (%s)" % type(exc).__name__
-    try:
-        return status, json.loads(raw.decode("utf-8", "replace"))
-    except Exception:
-        return status, raw.decode("utf-8", "replace")[:300]
+def _walk_blocks(endpoint, budget):
+    out = _empty_walk(endpoint)
+    out["format"] = "blocks"
+    hashes = {}
+    public_text = {}
+    prev = "GENESIS"
+    after = 0
+    base = endpoint.split("?")[0]
+    while True:
+        url = "%s?after=%d&limit=%d" % (base, after, WALK_PAGE)
+        page, err = _fetch_json(url, budget, MAX_PAGE_BYTES)
+        if err:
+            out["first_problem"] = out["first_problem"] or (
+                "could not read page after block %d: %s" % (after, err))
+            break
+        blocks = page.get("blocks") if isinstance(page, dict) else None
+        if not isinstance(blocks, list):
+            out["first_problem"] = "endpoint does not serve the walk format"
+            break
+        if after == 0:
+            first_prev = page.get("previous_audit_hash")
+            out["genesis_prev_is_GENESIS"] = (first_prev == "GENESIS")
+        for b in blocks:
+            idx = b.get("block_index")
+            h = str(b.get("audit_hash") or "")
+            if "preimage" in b:
+                pre = b.get("preimage")
+                if not isinstance(pre, str) or \
+                        hashlib.sha256(pre.encode("utf-8")).hexdigest() != h:
+                    out["first_problem"] = out["first_problem"] or (
+                        "block %s does not recompute" % idx)
+                try:
+                    stated_prev = json.loads(pre).get("prev_hash")
+                except Exception:
+                    stated_prev = None
+                out["public_recomputed"] += 1
+                public_text[idx] = pre
+            else:
+                stated_prev = b.get("prev_hash")
+                out["withheld_linkage_only"] += 1
+            if stated_prev != prev:
+                out["first_problem"] = out["first_problem"] or (
+                    "block %s does not link to the block before it" % idx)
+            prev = h
+            hashes[h] = idx
+            out["blocks"] += 1
+        if out["blocks"] >= WALK_MAX_BLOCKS:
+            out["first_problem"] = out["first_problem"] or (
+                "stopped at %d blocks; the checker walks at most %d"
+                % (out["blocks"], WALK_MAX_BLOCKS))
+            break
+        if not page.get("has_more"):
+            out["complete"] = True
+            break
+        nxt = page.get("next_after")
+        if not isinstance(nxt, int) or nxt <= after:
+            out["first_problem"] = out["first_problem"] or "paging did not advance"
+            break
+        after = nxt
+    out["tip"] = prev if out["blocks"] else None
+    return out, hashes, public_text, {}
 
 
-def _extract_score(payload, key_hint=None):
-    """Pull a 0..1 style number out of whatever came back."""
-    if isinstance(payload, (int, float)):
-        return float(payload)
-    if not isinstance(payload, dict):
-        return None
-    keys = ([key_hint] if key_hint else []) + SCORE_KEYS
-    for k in keys:
-        if k and k in payload:
-            v = payload[k]
-            if isinstance(v, (int, float)):
-                return float(v)
+def _walk_checkpoints(endpoint, first, budget):
+    """MIR format: tip = sha256(seq:rangeStart:rangeEnd:eventCount:
+    merkleRoot:prevTip), newest first, paged backwards with beforeSeq."""
+    out = _empty_walk(endpoint)
+    out["format"] = "checkpoints"
+    base = endpoint.split("?")[0]
+    q = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(endpoint).query))
+    limit = q.get("limit", "200")
+    rows = {}
+    page = first
+    while True:
+        cps = page.get("checkpoints") if isinstance(page, dict) else None
+        if not isinstance(cps, list) or not cps:
+            break
+        for cp in cps:
             try:
-                return float(str(v).strip())
+                rows[int(cp.get("seq"))] = cp
             except (TypeError, ValueError):
-                pass
-    # one level down
-    for v in payload.values():
-        if isinstance(v, dict):
-            found = _extract_score(v, key_hint)
-            if found is not None:
-                return found
+                out["first_problem"] = out["first_problem"] or \
+                    "a checkpoint has no readable seq"
+        lowest = min(int(c.get("seq")) for c in cps
+                     if str(c.get("seq", "")).lstrip("-").isdigit())
+        if lowest <= 0:
+            break
+        if len(rows) >= WALK_MAX_BLOCKS:
+            out["first_problem"] = out["first_problem"] or (
+                "stopped at %d checkpoints; the checker walks at most %d"
+                % (len(rows), WALK_MAX_BLOCKS))
+            break
+        url = "%s?limit=%s&beforeSeq=%d" % (base, limit, lowest)
+        page, err = _fetch_json(url, budget, MAX_PAGE_BYTES)
+        if err:
+            out["first_problem"] = out["first_problem"] or (
+                "could not read page before seq %d: %s" % (lowest, err))
+            break
+
+    hashes, public_text, meta = {}, {}, {}
+    backfilled, backfill_through = 0, None
+    prev = _ZERO64
+    seqs = sorted(rows)
+    if seqs and seqs[0] != 0:
+        out["first_problem"] = out["first_problem"] or \
+            "walk did not reach genesis (seq 0)"
+    for n, seq in enumerate(seqs):
+        cp = rows[seq]
+        if n and seq != seqs[n - 1] + 1:
+            out["first_problem"] = out["first_problem"] or \
+                "gap in seq before %d" % seq
+        tip = str(cp.get("tip") or "").lower()
+        pre = ":".join([str(seq), str(cp.get("rangeStart")),
+                        str(cp.get("rangeEnd")), str(cp.get("eventCount")),
+                        str(cp.get("merkleRoot")), str(cp.get("prevTip"))])
+        if hashlib.sha256(pre.encode("utf-8")).hexdigest() != tip:
+            out["first_problem"] = out["first_problem"] or \
+                "checkpoint %d does not recompute" % seq
+        if str(cp.get("prevTip") or "").lower() != prev:
+            out["first_problem"] = out["first_problem"] or \
+                "checkpoint %d does not link to the one before it" % seq
+        if seq == 0:
+            out["genesis_prev_is_GENESIS"] = \
+                (str(cp.get("prevTip") or "") == _ZERO64)
+        created, rend = _iso_ts(cp.get("createdAt")), _iso_ts(cp.get("rangeEnd"))
+        if created is not None and rend is not None and \
+                created - rend > BACKFILL_HOURS * 3600:
+            backfilled += 1
+            backfill_through = seq
+        prev = tip
+        hashes[tip] = seq
+        public_text[seq] = json.dumps(cp, sort_keys=True)
+        meta[seq] = cp
+        out["public_recomputed"] += 1
+        out["blocks"] += 1
+    out["complete"] = bool(seqs) and seqs[0] == 0 and not out["first_problem"]
+    out["tip"] = prev if seqs else None
+    out["backfill_detected"] = {
+        "checkpoints": backfilled, "through_seq": backfill_through,
+        "rule": "checker default: sealed more than %d hours after the window "
+                "it covers" % BACKFILL_HOURS,
+        "note": "Where the declaration states its own detection_rule, the "
+                "count under that rule is in INV-007."}
+    return out, hashes, public_text, meta
+
+
+def _hex_values(obj, found=None):
+    found = found if found is not None else set()
+    if isinstance(obj, dict):
+        for v in obj.values():
+            _hex_values(v, found)
+    elif isinstance(obj, list):
+        for v in obj:
+            _hex_values(v, found)
+    elif isinstance(obj, str):
+        for m in _HEX64.findall(obj.lower()):
+            found.add(m)
+    return found
+
+
+def _anchor_check(proof_endpoint, hashes, budget, meta=None):
+    if not proof_endpoint:
+        return "fail", "no anchor proof address declared"
+    tip, raw = None, None
+    if "{seq}" in proof_endpoint:
+        done = [sq for sq, cp in (meta or {}).items()
+                if str(cp.get("otsStatus")) in ("upgraded", "confirmed")]
+        if not done:
+            return "fail", "no checkpoint is marked as anchored"
+        seq = max(done)
+        tip = str(meta[seq].get("tip") or "").lower()
+        raw, err = _fetch_raw(proof_endpoint.replace("{seq}", str(seq)),
+                              budget, MAX_DECL_BYTES, "*/*")
+        if err:
+            return "fail", "could not read anchor proof: %s" % err
+        if raw[:1] in (b"{", b"["):
+            try:
+                data = json.loads(raw.decode("utf-8"))
+                import base64
+                raw = base64.b64decode(data.get("ots_base64") or "")
+            except Exception:
+                return "fail", "anchor proof could not be read"
+    else:
+        data, err = _fetch_json(proof_endpoint, budget)
+        if err:
+            return "fail", "could not read anchor proof: %s" % err
+        tip = str(data.get("tip") or "").lower() if isinstance(data, dict) else ""
+        b64 = data.get("ots_base64") if isinstance(data, dict) else None
+        if not b64:
+            return "fail", "no proof bytes served (expected ots_base64)"
+        import base64
+        try:
+            raw = base64.b64decode(b64)
+        except Exception:
+            return "fail", "anchor proof could not be read"
+    if not tip or tip not in hashes:
+        return "fail", "the anchored tip is not in the walked chain"
+    try:
+        from opentimestamps.core.serialize import BytesDeserializationContext
+        from opentimestamps.core.timestamp import DetachedTimestampFile
+        from opentimestamps.core.notary import BitcoinBlockHeaderAttestation
+    except Exception:
+        return "untested", "proof reader not available on this checker"
+    try:
+        det = DetachedTimestampFile.deserialize(BytesDeserializationContext(raw))
+    except Exception:
+        return "fail", "anchor proof could not be read"
+    tb = bytes.fromhex(tip)
+    candidates = (hashlib.sha256(tb).digest(), tb,
+                  hashlib.sha256(tip.encode("ascii")).digest())
+    if det.file_digest not in candidates:
+        return "fail", "anchor proof is for a different value than the tip it names"
+    heights = []
+
+    def walk(ts):
+        for att in ts.attestations:
+            if isinstance(att, BitcoinBlockHeaderAttestation):
+                heights.append(att.height)
+        for _, sub in ts.ops.items():
+            walk(sub)
+    try:
+        walk(det.timestamp)
+    except Exception:
+        return "fail", "anchor proof could not be walked"
+    if not heights:
+        return "fail", "anchor proof is still pending, not yet in Bitcoin"
+    return "pass", ("proof commits a chain tip to Bitcoin block %s; the block "
+                    "header itself is not re-checked here - run ots verify "
+                    "to confirm against Bitcoin" % min(heights))
+
+
+def _is_declaration(data):
+    spec = str(data.get("spec") or "")
+    return spec == "ai-integrity-declaration" or \
+        spec.rstrip("/").endswith("/x/integrity/declaration")
+
+
+def _witness_strength(data, held, budget):
+    """sealed / bound / listed - how the witness binds its record."""
+    rows = []
+    if isinstance(data, dict):
+        for key in ("tips", "held", "observations", "entries"):
+            if isinstance(data.get(key), list):
+                rows = data[key]
+                break
+    row = None
+    for r in rows:
+        if isinstance(r, dict) and \
+                str(r.get("peer_tip") or r.get("tip") or "").lower() in held:
+            row = r
+            break
+    if row is None:
+        return {"grade": "listed",
+                "why": "tip found on the witness's page; no binding record read"}
+    tip = str(row.get("peer_tip") or row.get("tip") or "").lower()
+    blk_url, blk_hash = row.get("check_block"), row.get("sealed_block_hash")
+    if blk_url and blk_hash:
+        page, err = _fetch_json(blk_url, budget)
+        blk = page.get("block") if isinstance(page, dict) else None
+        pre = blk.get("preimage") if isinstance(blk, dict) else None
+        if isinstance(pre, str) and tip in pre.lower() and \
+                hashlib.sha256(pre.encode("utf-8")).hexdigest() == \
+                str(blk_hash).lower():
+            return {"grade": "sealed",
+                    "why": "the witness's own block was recomputed and "
+                           "contains the tip",
+                    "witness_block": blk_url}
+        return {"grade": "listed",
+                "why": "a sealed block was claimed but could not be "
+                       "recomputed here (%s)" % (err or "mismatch")}
+    if row.get("our_tip_at_observation") or row.get("witness_tip_at_observation"):
+        return {"grade": "bound",
+                "why": "recorded against a position in the witness's own "
+                       "anchored chain; dated, not sealed"}
+    return {"grade": "listed",
+            "why": "published with nothing binding it in the witness's chain"}
+
+
+_ORDER = ["L0_DIARY", "L1_SEALED", "L2_WITNESSED", "L3_ANCHORED",
+          "L4_OVERSIGHT_VERIFIED"]
+
+
+def _check(domain):
+    budget = _Budget()
+    result = {"domain": domain, "checked_at": time.strftime(
+        "%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "checker_version": VERSION,
+        "standard": BASE + "declaration"}
+
+    decl, found_at, tried = None, None, []
+    for path in DECLARATION["discovery"]["paths"]:
+        url = "https://%s%s" % (domain, path)
+        data, err = _fetch_json(url, budget)
+        tried.append({"url": url, "result": err or "found"})
+        if data is not None and isinstance(data, dict) and \
+                _is_declaration(data):
+            decl, found_at = data, url
+            break
+        if data is not None and not err:
+            tried[-1]["result"] = "not an ai-integrity-declaration"
+    result["looked_at"] = tried
+
+    if decl is None:
+        result.update({
+            "verified_level": "L0_DIARY", "badge": "GREY",
+            "verdict": "No declaration found. Under the standard, silence is "
+                       "a rating: L0_DIARY, the operator's word is the only "
+                       "evidence.",
+            "how_to_improve": "Publish a declaration at https://%s/.well-known/"
+                              "ai-integrity.json using the declaration_template "
+                              "in %s" % (domain, BASE + "declaration")})
+        return result
+
+    result["declaration_url"] = found_at
+    result["declaration_sha256"] = hashlib.sha256(json.dumps(
+        decl, sort_keys=True, separators=(",", ":"),
+        ensure_ascii=False).encode("utf-8")).hexdigest()
+    claimed = str(decl.get("claimed_level") or "")
+    result["claimed_level"] = claimed or None
+    checks = {}
+
+    # INV-001 and INV-007 need the chain.
+    chain = decl.get("chain") or {}
+    endpoint = chain.get("walk_endpoint")
+    hashes, public_text, walk, meta = {}, {}, None, {}
+    if not endpoint:
+        checks["INV-001"] = {"result": "fail", "why": "no walk_endpoint declared"}
+    else:
+        walk, hashes, public_text, meta = _walk(endpoint, budget)
+        ok = (walk["complete"] and walk["blocks"] > 0 and
+              walk["genesis_prev_is_GENESIS"] and not walk["first_problem"])
+        genesis_ok = True
+        declared_genesis = str(chain.get("genesis_hash") or "").lower()
+        if declared_genesis and hashes:
+            first = min(hashes.items(), key=lambda kv: kv[1] if isinstance(kv[1], int) else 0)
+            genesis_ok = (first[0] == declared_genesis)
+        checks["INV-001"] = {
+            "result": "pass" if (ok and genesis_ok) else "fail",
+            "why": walk["first_problem"] or (
+                None if genesis_ok else "declared genesis_hash is not the first block"),
+            "walk": walk}
+
+    # INV-002: no secret-shaped or personal values in public blocks.
+    hits = []
+    for idx, text in public_text.items():
+        for label, rx in _SECRET_SHAPES:
+            if rx.search(text):
+                hits.append({"block_index": idx, "found": label})
+                break
+        if len(hits) >= 10:
+            break
+    if not decl.get("personal_data_hashing"):
+        checks["INV-002"] = {"result": "fail",
+                             "why": "personal_data_hashing not declared"}
+    elif not public_text:
+        checks["INV-002"] = {"result": "fail",
+                             "why": "no public records to inspect"}
+    elif hits:
+        checks["INV-002"] = {"result": "fail",
+                             "why": "public blocks contain values that look "
+                                    "personal or secret (values not repeated here)",
+                             "blocks": hits}
+    else:
+        checks["INV-002"] = {"result": "pass",
+                             "why": "%d public blocks inspected; nothing "
+                                    "personal or secret-shaped found"
+                                    % len(public_text)}
+
+    # INV-007: every discontinuity is disclosed - sealed in the chain, or
+    # declared with the evidence to detect it - and anything the checker
+    # can detect for itself must have been declared.
+    discs = decl.get("discontinuities") or []
+    missing, sealed, declared = [], 0, []
+    for disc in discs:
+        if not isinstance(disc, dict):
+            missing.append(str(disc))
+            continue
+        blk = disc.get("disclosure_block")
+        if blk not in (None, ""):
+            try:
+                blk = int(blk)
+            except (TypeError, ValueError):
+                missing.append(str(blk))
+                continue
+            if blk in public_text:
+                sealed += 1
+            else:
+                missing.append(str(blk))
+        elif disc.get("kind") and disc.get("detail"):
+            declared.append(str(disc.get("kind")))
+        else:
+            missing.append("an entry with neither a disclosure_block nor kind and detail")
+    undisclosed = None
+    bf = (walk or {}).get("backfill_detected") or {}
+    if bf.get("checkpoints"):
+        claimed_bf = [d for d in discs if isinstance(d, dict) and
+                      "backfill" in str(d.get("kind", "")).lower()]
+        if not claimed_bf:
+            undisclosed = ("%d checkpoints were sealed long after the window "
+                           "they cover, and no backfill is declared"
+                           % bf["checkpoints"])
+    if checks["INV-001"]["result"] != "pass":
+        checks["INV-007"] = {"result": "fail", "why": "chain could not be verified"}
+    elif missing:
+        checks["INV-007"] = {"result": "fail",
+                             "why": "declared disclosures not found: %s"
+                                    % ", ".join(missing)}
+    elif undisclosed:
+        checks["INV-007"] = {"result": "fail", "why": undisclosed}
+    else:
+        parts = []
+        if sealed:
+            parts.append("%d sealed in the chain" % sealed)
+        if declared:
+            parts.append("%d declared with detection evidence (%s)"
+                         % (len(declared), ", ".join(declared)))
+        checks["INV-007"] = {
+            "result": "pass",
+            "why": ("discontinuities disclosed: " + "; ".join(parts))
+                   if parts else "no discontinuities declared, and none detected"}
+        checker_default = None
+        if bf.get("checkpoints"):
+            checker_default = {
+                "backfilled_checkpoints": bf["checkpoints"],
+                "through_seq": bf["through_seq"],
+                "rule": str(bf.get("rule")),
+                "note": "The checker's own threshold, used only when no rule "
+                        "is declared. Shown for comparison."}
+        recounts = []
+        for d in discs:
+            if not isinstance(d, dict) or \
+                    "backfill" not in str(d.get("kind", "")).lower():
+                continue
+            rule_text = d.get("detection_rule") or d.get("detectionRule")
+            entry = {"kind": d.get("kind"), "declared_rule": rule_text,
+                     "declared_count": d.get("checkpoints") or d.get("count"),
+                     "declared_through_seq": d.get("through_seq")}
+            parsed = _parse_rule(rule_text) if rule_text else None
+            if not rule_text:
+                entry["result"] = "rule_missing"
+                entry["note"] = ("No detection_rule declared. Reported in "
+                                 "1.0.3; from 1.1.0 this fails.")
+            elif not parsed or not meta:
+                entry["result"] = "rule_unreadable"
+                entry["note"] = ("The declared rule could not be applied "
+                                 "automatically. Reported, not failed.")
+            else:
+                n, through = _recount(meta, parsed[0], parsed[1])
+                entry["recounted_under_declared_rule"] = n
+                entry["recounted_through_seq"] = through
+                try:
+                    ok = int(entry["declared_count"]) == n
+                except (TypeError, ValueError):
+                    ok = None
+                entry["reproduces"] = ok
+                entry["result"] = ("reproduced" if ok else
+                                   "differs" if ok is False else "recounted")
+            recounts.append(entry)
+        applied = [r for r in recounts
+                   if r.get("result") in ("reproduced", "differs", "recounted")]
+        if applied:
+            a = applied[0]
+            checks["INV-007"]["independently_detected"] = {
+                "backfilled_checkpoints": a.get("recounted_under_declared_rule"),
+                "through_seq": a.get("recounted_through_seq"),
+                "rule": "declared: " + str(a.get("declared_rule")),
+                "reproduces_declared_count": a.get("reproduces"),
+                "note": "Recounted by the checker from createdAt against "
+                        "rangeEnd, under the rule the declaration states. "
+                        "Nothing taken on trust."}
+            if checker_default:
+                checks["INV-007"]["checker_default_for_comparison"] = checker_default
+        elif checker_default:
+            checks["INV-007"]["independently_detected"] = checker_default
+        if recounts:
+            checks["INV-007"]["detection_rule_recount"] = recounts
+
+    # INV-003: at least one declared witness holds a tip that is in our chain.
+    witnesses = decl.get("witnesses") or []
+    witness_results = []
+    for w in witnesses[:5]:
+        if not isinstance(w, dict) or not w.get("tip_endpoint"):
+            continue
+        data, err = _fetch_json(w.get("tip_endpoint"), budget,
+                                WITNESS_MAX_BYTES, allow_text=True)
+        if err:
+            witness_results.append({"name": w.get("name"), "result": "fail",
+                                    "why": err})
+            continue
+        held = _hex_values(data) & set(hashes.keys())
+        entry = {
+            "name": w.get("name"),
+            "url": w.get("tip_endpoint"),
+            "result": "pass" if held else "fail",
+            "why": "publishes %d hash(es) that are blocks in the chain"
+                   % len(held) if held else
+                   "published no value found in the chain"}
+        if held:
+            entry["matched_blocks"] = sorted(
+                hashes[h] for h in held if isinstance(hashes.get(h), int))[-5:]
+            entry["witness_strength"] = _witness_strength(data, held, budget)
+        witness_results.append(entry)
+    if any(r["result"] == "pass" for r in witness_results):
+        checks["INV-003"] = {"result": "pass", "witnesses": witness_results,
+                             "collusion_threshold_declared":
+                                 decl.get("collusion_threshold"),
+                             "note": "Independence of each witness is as "
+                                     "declared; the checker confirms they "
+                                     "hold the tip, not who runs them."}
+    else:
+        checks["INV-003"] = {"result": "fail",
+                             "why": "no declared witness confirmed a tip in "
+                                    "the chain" if witness_results else
+                                    "no witnesses declared",
+                             "witnesses": witness_results}
+
+    # INV-004: an anchor proof committing a chain tip to Bitcoin.
+    anchor = decl.get("anchor") or {}
+    res, why = _anchor_check(anchor.get("proof_endpoint"), hashes, budget, meta)
+    checks["INV-004"] = {"result": res, "why": why}
+
+    # INV-005 / INV-006 cannot be tested from outside yet.
+    for inv in ("INV-005", "INV-006"):
+        checks[inv] = {"result": "untested",
+                       "why": "human-oversight checks cannot yet be tested "
+                              "from outside; this checker never awards L4"}
+
+    level = "L0_DIARY"
+    for name in _ORDER[1:]:
+        needs = [r.split("-")[0] + "-" + r.split("-")[1]
+                 for r in DECLARATION["levels"][name]["requires"]]
+        if all(checks.get(n, {}).get("result") == "pass" for n in needs):
+            level = name
+        else:
+            break
+
+    if decl.get("known_gaps"):
+        result["known_gaps_declared"] = decl.get("known_gaps")
+    result["checks"] = checks
+    result["verified_level"] = level
+    result["badge"] = DECLARATION["levels"][level]["badge"]
+    if claimed in _ORDER and _ORDER.index(claimed) > _ORDER.index(level):
+        result["verdict"] = "OVERCLAIMED: declares %s, verifies as %s." % (claimed, level)
+        result["overclaimed"] = True
+    else:
+        result["verdict"] = "Verifies as %s." % level
+        result["overclaimed"] = False
+    result["rule"] = ("Nothing in the declaration was taken on trust. Every "
+                      "pass above was recomputed or fetched by this checker.")
+    return result
+
+
+VERDICT_USER = "system_integrity_verdict"
+VERDICT_RESEAL_SECONDS = 24 * 3600
+VERDICT_MAX_PER_HOUR = 30
+_seal_times = []
+_seal_lock = threading.Lock()
+
+
+def _verdict_fingerprint(out):
+    return (out.get("verified_level"), out.get("claimed_level"),
+            out.get("overclaimed"), bool(out.get("error")))
+
+
+def _verdict_ref(idx, h):
+    return {"block_index": idx, "audit_hash": h,
+            "check_block": ("https://sebbi.pro/x/walk/block?index=%s" % idx)
+            if idx is not None else None}
+
+
+def _already_sealed(conn, domain, fp, now):
+    """The chain itself is the memory: find a verdict for this domain,
+    sealed today (UTC), with the same outcome. Per UTC day, like requests,
+    so each day's first request is always followed by a verdict."""
+    rows = conn.execute(
+        "SELECT id, audit_hash, result_json FROM audit_log "
+        "WHERE user_id = ? AND ts >= ? ORDER BY id DESC LIMIT 200",
+        (VERDICT_USER, now - (now % 86400))).fetchall()
+    for idx, h, rj in rows:
+        try:
+            r = json.loads(rj)
+        except Exception:
+            continue
+        if r.get("domain") != domain:
+            continue
+        if (r.get("verified_level"), r.get("claimed_level"),
+                r.get("overclaimed")) == fp[:3]:
+            return _verdict_ref(idx, h)
+        return None   # latest verdict for this domain differs: reseal
     return None
 
 
-# ----------------------------------------------------------------------
-# comparison
-# ----------------------------------------------------------------------
+REQUEST_USER = "system_integrity_request"
 
-def _pearson(a, b):
-    n = len(a)
-    if n < 3:
+
+def _claim(conn, domain, day, key, now):
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS integrity_verdict_claims ("
+        "domain TEXT, day TEXT, verdict TEXT, claimed_at REAL, "
+        "PRIMARY KEY (domain, day, verdict))")
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO integrity_verdict_claims "
+        "(domain, day, verdict, claimed_at) VALUES (?, ?, ?, ?)",
+        (domain, day, key, now))
+    conn.commit()
+    return cur.rowcount == 1
+
+
+def _seal_request(domain, ctx):
+    """Seal that a check was asked for, before it runs. Once per domain per
+    UTC day, so the chain shows every domain that was asked about - and the
+    register can show any request with no verdict after it."""
+    seal = (ctx or {}).get("seal")
+    conn, lock = (ctx or {}).get("conn"), (ctx or {}).get("lock")
+    if not callable(seal) or conn is None or lock is None:
         return None
-    ma = sum(a) / n
-    mb = sum(b) / n
-    va = sum((x - ma) ** 2 for x in a)
-    vb = sum((y - mb) ** 2 for y in b)
-    if va <= 0 or vb <= 0:
-        return None
-    cov = sum((a[i] - ma) * (b[i] - mb) for i in range(n))
-    return cov / math.sqrt(va * vb)
-
-
-def _rank(values):
-    order = sorted(range(len(values)), key=lambda i: values[i])
-    ranks = [0.0] * len(values)
-    for position, index in enumerate(order):
-        ranks[index] = float(position)
-    return ranks
-
-
-def _compare(ours, theirs):
-    """ours/theirs are lists of (label, score). theirs may contain None."""
-    paired = [(l, o, t) for (l, o), (_, t) in zip(ours, theirs) if t is not None]
-    answered = len(paired)
-    if answered < 3:
-        return {"verdict": "INCONCLUSIVE", "answered": answered,
-                "why": "too few vectors came back to compare anything"}
-
-    a = [p[1] for p in paired]
-    b = [p[2] for p in paired]
-    exact = sum(1 for i in range(answered) if abs(a[i] - b[i]) < 1e-6)
-    close = sum(1 for i in range(answered) if abs(a[i] - b[i]) < 0.01)
-    pearson = _pearson(a, b)
-    spearman = _pearson(_rank(a), _rank(b))
-
-    # a linear fit: are they our scores, scaled and shifted?
-    ma, mb = sum(a) / answered, sum(b) / answered
-    va = sum((x - ma) ** 2 for x in a)
-    slope = (sum((a[i] - ma) * (b[i] - mb) for i in range(answered)) / va) if va > 0 else None
-    intercept = (mb - slope * ma) if slope is not None else None
-    residual = None
-    if slope is not None:
-        residual = max(abs(b[i] - (slope * a[i] + intercept)) for i in range(answered))
-
-    if exact == answered:
-        verdict = "IDENTICAL"
-        why = ("Every vector matched to six decimal places. Two independently "
-               "written scoring functions do not do this.")
-    elif exact >= answered * 0.8:
-        verdict = "IDENTICAL"
-        why = ("%d of %d vectors matched exactly. The rest are consistent with "
-               "a small local change on top of the same function." % (exact, answered))
-    elif residual is not None and residual < 0.02 and pearson and pearson > 0.99:
-        verdict = "DERIVED"
-        why = ("Not identical, but every score fits ours scaled by %.3f and "
-               "shifted by %.3f, within %.4f. That is this function reweighted, "
-               "not a different one." % (slope, intercept, residual))
-    elif spearman is not None and spearman > 0.95:
-        verdict = "SAME SHAPE"
-        why = ("Different numbers, but the same ordering across the battery "
-               "(rank correlation %.3f). Consistent with the same design - the "
-               "same saturation points and the same curve - rather than the "
-               "same code." % spearman)
-    elif pearson is not None and pearson > 0.8:
-        verdict = "SIMILAR"
-        why = ("Correlated (%.3f) but not tightly. Risk scorers tend to agree "
-               "roughly on what looks risky, so this is weak on its own." % pearson)
-    else:
-        verdict = "UNRELATED"
-        why = "No meaningful relationship to our scoring."
-
-    return {
-        "verdict": verdict, "why": why,
-        "vectors": len(ours), "answered": answered,
-        "exact_matches": exact, "within_0.01": close,
-        "correlation": round(pearson, 4) if pearson is not None else None,
-        "rank_correlation": round(spearman, 4) if spearman is not None else None,
-        "best_fit": ({"scale": round(slope, 4), "shift": round(intercept, 4),
-                      "worst_residual": round(residual, 5)}
-                     if slope is not None else None),
-        "per_vector": [{"vector": p[0], "ours": p[1], "theirs": p[2],
-                        "delta": round(p[2] - p[1], 6)} for p in paired],
-    }
-
-
-# ----------------------------------------------------------------------
-# routes
-# ----------------------------------------------------------------------
-
-def _self(ctx, api_key):
-    scores, where, error = _score_locally()
-    if error:
-        return {"error": "scorer_unavailable", "message": error}, 503
-    return {"source": where, "vectors": len(scores),
-            "scores": [{"vector": l, "score": s} for l, s in scores],
-            "note": ("This is the baseline every probe is compared against. It "
-                     "reveals outputs, never weights.")}, 200
-
-
-def _probe(ctx, api_key, data):
-    url = str(data.get("url", "")).strip()
-    ok, why = _url_allowed(url)
-    if not ok:
-        return {"error": "bad_target", "message": why}, 400
-
-    fields = data.get("fields") if isinstance(data.get("fields"), dict) else {}
-    mapping = dict(DEFAULT_FIELDS)
-    mapping.update({k: str(v) for k, v in fields.items() if isinstance(v, str)})
-    score_key = data.get("score_key")
-    extra = data.get("body") if isinstance(data.get("body"), dict) else {}
-    headers = data.get("headers") if isinstance(data.get("headers"), dict) else {}
-    headers = {str(k)[:60]: str(v)[:300] for k, v in list(headers.items())[:8]}
-
-    ours, where, error = _score_locally()
-    if error:
-        return {"error": "scorer_unavailable", "message": error}, 503
-
-    theirs = []
-    failures = []
-    for label, signals in VECTORS:
-        body = dict(extra)
-        for internal, external in mapping.items():
-            body[external] = signals[internal]
-        status, payload = _post(url, body, headers)
-        if status < 200 or status >= 300:
-            theirs.append((label, None))
-            if len(failures) < 5:
-                failures.append({"vector": label, "http": status,
-                                 "response": payload if isinstance(payload, (dict, list))
-                                 else str(payload)[:200]})
-        else:
-            theirs.append((label, _extract_score(payload, score_key)))
-        time.sleep(POLITE_DELAY)
-
-    result = _compare(ours, theirs)
-    ts = time.time()
-
-    detail = ("target=" + url + ";verdict=" + result["verdict"] +
-              ";exact=" + str(result.get("exact_matches", 0)) +
-              "/" + str(result.get("answered", 0)))
-    ev = {"user_id": "fp:" + urlparse(url).hostname, "action": "fingerprint_probe",
-          "amount": 0, "country": "UK", "device_id": "fingerprint",
-          "anomaly": 0, "device_risk": 0}
-    res = {"decision": "FINGERPRINT_" + result["verdict"].replace(" ", "_"),
-           "score": 0, "fingerprint_version": VERSION, "target": url,
-           "timestamp": ts, "detail": detail}
-    h, idx, seq = ctx["seal"](ev, res, ts, api_key)
-
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "INSERT INTO fingerprint_probe(api_key,target,ran,vectors,answered,"
-            "exact,verdict,correlation,detail,audit_hash,block_index)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-            (api_key, url, ts, result.get("vectors"), result.get("answered"),
-             result.get("exact_matches"), result["verdict"],
-             result.get("correlation"), detail, h, idx))
-        ctx["conn"].commit()
-
-    out = dict(result)
-    out.update({
-        "target": url,
-        "ran_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts)),
-        "sealed": {"receipt": h, "block_index": idx, "receipt_seq": seq},
-        "what_this_is": ("A dated, sealed measurement of similarity. It is "
-                         "evidence, not an accusation, and it does not "
-                         "establish that anything was copied."),
-    })
-    if failures:
-        out["failures"] = failures
-        out["failure_note"] = ("Some vectors were rejected. If the target wants "
-                               "different field names, pass a \"fields\" map and "
-                               "run it again.")
-    return out, 200
-
-
-def _history(ctx, api_key):
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT target,ran,verdict,exact,answered,correlation,audit_hash,block_index"
-            " FROM fingerprint_probe WHERE api_key=? ORDER BY id DESC LIMIT 100",
-            (api_key,)).fetchall()
-    return {"probes": [{
-        "target": r[0],
-        "ran_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(r[1])),
-        "verdict": r[2], "exact_matches": r[3], "answered": r[4],
-        "correlation": r[5], "receipt": r[6], "block_index": r[7],
-    } for r in rows], "count": len(rows)}, 200
-
-
-def _vectors():
-    return {"count": len(VECTORS),
-            "vectors": [{"label": l, "signals": s} for l, s in VECTORS],
-            "why_these": ("Chosen to sit either side of each saturation point, "
-                          "to walk the amount curve, and to isolate each term. "
-                          "Random inputs would only catch a straight copy.")}, 200
-
-
-def _spec():
-    return {
-        "module": "fingerprint", "version": VERSION,
-        "question_it_answers": "Is this endpoint running my scoring function?",
-        "verdicts": {
-            "IDENTICAL": "Every vector matches. Independently written functions do not do this.",
-            "DERIVED": "Not identical, but every score is ours scaled and shifted. Reweighted, not rewritten.",
-            "SAME SHAPE": "Different numbers, same ordering. Same design decisions, probably not the same code.",
-            "SIMILAR": "Loosely correlated. Weak - risk scorers broadly agree on what looks risky.",
-            "UNRELATED": "No meaningful relationship.",
-            "INCONCLUSIVE": "Too few vectors came back.",
-        },
-        "limits": [
-            "Only reaches endpoints it can reach. A private product with no free tier is invisible to this.",
-            "Proves similarity, never theft. Two people can converge honestly.",
-            "A target that rate limits, randomises or rounds heavily will read as INCONCLUSIVE rather than clean.",
-        ],
-        "every_run_is_sealed": ("The probe, the target and the result go into the "
-                                "chain, so a comparison run today is provable as "
-                                "having been run today."),
-        "manners": "One request per vector with a %.1fs gap. It is a measurement, not a load test." % POLITE_DELAY,
-    }, 200
-
-
-def handle(method, action, data, api_key, ctx):
-    # key first, before anything touches the database
-    if not api_key:
-        return {"error": "invalid_api_key"}, 401
-    _setup(ctx)
-    action = (action or "").strip("/").lower()
-
-    if method == "POST":
-        if action == "self":
-            return _self(ctx, api_key)
-        if action == "probe":
-            return _probe(ctx, api_key, data)
-        return {"error": "unknown_action", "action": action,
-                "POST": ["self", "probe"]}, 404
-
-    if action in ("", "spec"):
-        return _spec()
-    if action == "history":
-        return _history(ctx, api_key)
-    if action == "vectors":
-        return _vectors()
-    return {"error": "unknown_action", "action": action,
-            "GET": ["spec", "history", "vectors"]}, 404
-
-```
-
-
-## `modules/genesis.py`
-
-282 lines, 12662 bytes
-
-```python
-"""
-Chain identity - /x/genesis/<action>
-
-WHY THIS EXISTS
----------------
-A receipt that does not say which chain state it belongs to is ambiguous the
-moment a chain is ever reset, and this one was: on 7 September 2026, during
-registry work, the chain was reset. Receipts issued before that date belong to
-a state that does not continue forward. Nothing in those receipts says so, and
-a peer holding one has no way to discover it from the receipt itself.
-
-Philip Pinol (PRAXIS / ThePraesidium.ai) independently verified block 846 of
-the prior state. That verification was sound for the state it was performed
-against. It is not continuous with the chain running now, and saying so is
-this module's job.
-
-WHAT IT DOES
-------------
-Publishes the genesis hash of the current chain state and a short stable
-identifier derived from it, so any party can pin their own records to a named
-state rather than to a block number that may refer to two different things.
-
-    chain_id = first 16 characters of the genesis block's audit hash
-
-Deliberately a slice rather than a computation. Anyone can confirm the
-identifier against the genesis hash by eye, in the response that carries both,
-without running anything.
-
-WHY IT IS A SEPARATE MODULE
----------------------------
-Read-only, by construction. It opens the same database as the sealing code and
-never writes to it: no inserts, no schema changes, no seal calls. A fault here
-returns a 500 on this route and the chain carries on sealing, because the
-module that seals does not import this one and does not know it exists.
-
-That is not tidiness. Editing a file that writes an append-only chain in order
-to add a reporting route is how the 7 September reset happened.
-
-WHAT IT DOES NOT CLAIM
-----------------------
-- It does not assert when the reset occurred. It reports the sealed timestamp
-  of block 1 as the database holds it, and states the reset date separately as
-  a claim by the operator. If the two disagree, the disagreement is visible in
-  the response rather than resolved quietly here.
-- A chain_id identifies a state. It says nothing about whether the records in
-  that state are true, complete, or externally anchored. Check /x/ots/status
-  for anchoring and /api/verify-chain for internal validity.
-- Two different deployments could in principle produce the same 16-character
-  identifier. The full genesis hash is returned alongside it and is what
-  should be pinned where collision matters.
-
-    GET /x/genesis/chain    genesis hash, chain_id, height, current tip
-    GET /x/genesis/status   is this module loaded and can it read the chain
-    GET /x/genesis/spec     what the identifier is and how to pin it
-"""
-
-from datetime import datetime, timezone
-
-VERSION = "1.0.1"
-
-# Length of the genesis hash used as the chain identifier. Sixteen hex
-# characters is 64 bits - long enough that two states will not collide by
-# accident, short enough to quote in an email without wrapping.
-CHAIN_ID_LEN = 16
-
-# Routes that need no API key. A third party must be able to establish which
-# chain state a receipt belongs to without holding an account, or the receipt
-# is only checkable by customers.
-PUBLIC = {("GET", "chain"), ("GET", "status"), ("GET", "spec")}
-
-# ----------------------------------------------------------------------
-# everything a reader sees
-# ----------------------------------------------------------------------
-
-# The reset moment, stated to the second and in UTC, because a date alone was
-# ambiguous: the chain was reset just after midnight UK time, so the calendar
-# date differs between UTC and local and the route appeared to contradict
-# itself. Stated precisely rather than rounded to whichever date reads better.
-RESET_AT_UTC = "2026-09-06T23:11:12Z"
-
-RESET_RECORD = {
-    "occurred": RESET_AT_UTC,
-    "occurred_local": (
-        "00:11 on 7 September 2026, UK time. The same moment. Recorded in UTC "
-        "above because a calendar date is ambiguous within an hour of "
-        "midnight and this one falls inside that hour."),
-    "reason": "chain reset during registry work",
-    "effect": (
-        "Receipts, block indexes and audit hashes issued before this date "
-        "belong to a prior chain state. That state does not continue forward "
-        "into the chain running now. A block index from before the reset and "
-        "a block index from after it are not comparable and do not refer to "
-        "the same sequence."),
-    "prior_verification": (
-        "Block 846 of the prior state was independently verified by Philip "
-        "Pinol (PRAXIS / ThePraesidium.ai). That verification was sound for "
-        "the state it was performed against. It is not evidence about the "
-        "current state, and neither party describes it as continuous with it."),
-    "what_was_not_lost": (
-        "The prior state's records were sealed under the rules in force at "
-        "the time and were valid under them. What changed is that the "
-        "sequence does not extend. Nothing here claims the earlier records "
-        "were wrong."),
-    "disclosed_because": (
-        "A peer holding a pre-reset receipt cannot discover any of this from "
-        "the receipt itself. Published rather than left for someone to find "
-        "when their records fail to reconcile."),
-}
-
-VOCABULARY = {
-    "chain_id": (
-        "A short stable identifier for one chain state, being the first %d "
-        "characters of that state's genesis block hash. Pin your records to "
-        "this rather than to a block index. If a chain is ever reset, the "
-        "chain_id changes and the mismatch is visible immediately; a block "
-        "index silently refers to a different thing." % CHAIN_ID_LEN),
-    "genesis_hash": (
-        "The audit hash of block 1 of the current chain state. This is the "
-        "value to pin where a 16-character identifier is not enough. It does "
-        "not change for the life of the state."),
-    "genesis_sealed_at": (
-        "The timestamp stored against block 1, as the database holds it. It "
-        "is this deployment's own clock at the moment that block was written "
-        "and is not evidence of when anything happened. The external "
-        "timestamp proofs at /x/ots/status are the answer to that question."),
-    "height": (
-        "How many blocks the current state holds. Counts from block 1 of this "
-        "state, not from the beginning of any prior state."),
-    "current_tip": (
-        "The audit hash of the most recent block. Changes constantly. "
-        "Included so one call establishes the whole identity of the state; "
-        "/x/witness/tip is the route to poll."),
-}
-
-
-def _iso(ts):
-    if not ts:
-        return None
+    now = time.time()
+    day = time.strftime("%Y-%m-%d", time.gmtime(now))
+    with lock:
+        won = _claim(conn, domain, day, "__request__", now)
+        if not won:
+            r = conn.execute(
+                "SELECT id, audit_hash FROM audit_log WHERE user_id = ? AND "
+                "ts > ? AND result_json LIKE ? ORDER BY id DESC LIMIT 1",
+                (REQUEST_USER, now - 86400,
+                 '%"domain": "' + domain + '"%')).fetchone()
+            ref = _verdict_ref(r[0], r[1]) if r else {}
+            return dict(ref, sealed_now=False)
+    with _seal_lock:
+        while _seal_times and now - _seal_times[0] > 3600:
+            _seal_times.pop(0)
+        if len(_seal_times) >= VERDICT_MAX_PER_HOUR:
+            return {"sealed_now": False,
+                    "note": "hourly sealing limit reached; request not sealed"}
+        _seal_times.append(now)
+    event = {"user_id": REQUEST_USER, "action": "integrity_check_requested",
+             "amount": 0, "country": "UK", "device_id": "checker",
+             "anomaly": 0, "device_risk": 0}
+    result = {"decision": "REQUESTED", "score": 0, "domain": domain,
+              "checker_version": VERSION,
+              "standard_version": DECLARATION.get("version"),
+              "requested_at": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                            time.gmtime(now)),
+              "timestamp": now}
     try:
-        return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
-    except Exception:
-        return None
-
-
-def _first_block(ctx):
-    """Block 1 of the current state. Read-only."""
-    with ctx["lock"]:
-        return ctx["conn"].execute(
-            "SELECT audit_hash,ts,id FROM audit_log ORDER BY id ASC LIMIT 1"
-        ).fetchone()
-
-
-def _last_block(ctx):
-    """Current tip. Read-only. Same query witness.py uses, deliberately."""
-    with ctx["lock"]:
-        return ctx["conn"].execute(
-            "SELECT audit_hash,ts,id FROM audit_log ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-
-
-def _chain(ctx):
-    first = _first_block(ctx)
-    if not first:
-        return {"error": "no_genesis",
-                "message": ("The audit chain holds no blocks, so there is no "
-                            "genesis to report. This is an empty chain rather "
-                            "than a fault."),
-                "genesis_version": VERSION}, 404
-
-    genesis_hash = str(first[0])
-    chain_id = genesis_hash[:CHAIN_ID_LEN]
-    last = _last_block(ctx)
-
-    out = {
-        "chain_id": chain_id,
-        "genesis_hash": genesis_hash,
-        "genesis_block_index": first[2],
-        "genesis_sealed_at": _iso(first[1]),
-        "height": last[2] if last else first[2],
-        "current_tip": last[0] if last else genesis_hash,
-        "current_sealed_at": _iso(last[1]) if last else _iso(first[1]),
-        "genesis_version": VERSION,
-        "reset_record": RESET_RECORD,
-        "vocabulary": VOCABULARY,
-        "how_to_pin": (
-            "Record chain_id alongside every receipt you hold from this "
-            "deployment. When you later check a receipt, read this route "
-            "first: if chain_id has changed, your receipt belongs to a state "
-            "that no longer continues and no block index in it is comparable "
-            "to a current one."),
-        "verify_the_identifier": (
-            "chain_id is the first %d characters of genesis_hash. Both are in "
-            "this response. Check it by eye - nothing needs to be run."
-            % CHAIN_ID_LEN),
-        "this_does_not_establish": (
-            "That the records in this state are true, complete, or externally "
-            "anchored. /api/verify-chain checks the chain end to end. "
-            "/x/ots/status shows the state of each external timestamp proof."),
-    }
-
-    # State rather than assert. The stated reset moment and the sealed
-    # timestamp of block 1 should be the same event. If they are not, the
-    # reader sees the disagreement here rather than being told a tidy story.
-    #
-    # Compared to the minute, in UTC, on both sides. Comparing calendar dates
-    # was wrong: this chain was reset at 23:11 UTC, which is the following day
-    # locally, so a date comparison reported a contradiction that did not
-    # exist. A route that cries wolf about its own honesty is worse than one
-    # that says nothing.
-    sealed = out["genesis_sealed_at"]
-    if sealed and sealed[:16] != RESET_AT_UTC[:16]:
-        out["date_note"] = (
-            "The sealed timestamp of block 1 (%s) does not match the reset "
-            "moment stated in reset_record (%s). Both values are reported as "
-            "they are. Reconcile them against the external timestamp proofs "
-            "rather than against either party's account."
-            % (sealed, RESET_AT_UTC))
-
-    return out, 200
-
-
-def _status(ctx):
-    """Arming route. Says whether this module loaded and can read the chain."""
-    readable = False
-    detail = None
-    try:
-        readable = _first_block(ctx) is not None
-        if not readable:
-            detail = "chain is readable and holds no blocks"
+        res = seal(event, result, now)
     except Exception as exc:
-        detail = "could not read the audit chain (%s)" % type(exc).__name__
+        with lock:
+            conn.execute("DELETE FROM integrity_verdict_claims WHERE "
+                         "domain = ? AND day = ? AND verdict = ?",
+                         (domain, day, "__request__"))
+            conn.commit()
+        return {"sealed_now": False, "note": "could not seal: %s" % exc}
+    if isinstance(res, (list, tuple)):
+        h, idx = res[0], (res[1] if len(res) > 1 else None)
+    elif isinstance(res, dict):
+        h = res.get("audit_hash") or res.get("hash")
+        idx = res.get("block_index") or res.get("index")
+    else:
+        h, idx = res, None
+    return dict(_verdict_ref(idx, h), sealed_now=True)
 
-    return {"module": "genesis",
-            "version": VERSION,
-            "chain_readable": readable,
-            "detail": detail,
-            "writes": "none - this module never writes to the database",
-            "routes": sorted(a for _m, a in PUBLIC),
-            "genesis_version": VERSION}, 200
+
+def _seal_verdict(domain, out, ctx):
+    """Seal a verdict into the chain at most once per domain per UTC day,
+    unless the verdict changes.
+
+    v1.4 kept that limit in server memory, so a server running several
+    copies of itself sealed once per copy. v1.4.1 asks the chain first,
+    then claims the seal in a table every copy shares, so only one copy
+    can seal a given verdict on a given day."""
+    seal = (ctx or {}).get("seal")
+    conn, lock = (ctx or {}).get("conn"), (ctx or {}).get("lock")
+    if not callable(seal) or conn is None or lock is None:
+        return None
+    if out.get("error"):
+        # A check that failed to run has no verdict to seal. Its request is
+        # already sealed, so the register shows it as asked and unanswered.
+        return {"sealed_now": False,
+                "note": "the check did not complete, so no verdict was sealed; "
+                        "the request stays on record without one"}
+    now = time.time()
+    fp = _verdict_fingerprint(out)
+    day = time.strftime("%Y-%m-%d", time.gmtime(now))
+    claim = json.dumps(list(fp))
+    with lock:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS integrity_verdict_claims ("
+            "domain TEXT, day TEXT, verdict TEXT, claimed_at REAL, "
+            "PRIMARY KEY (domain, day, verdict))")
+        ref = _already_sealed(conn, domain, fp, now)
+        if ref:
+            conn.commit()
+            return dict(ref, sealed_now=False)
+        won = _claim(conn, domain, day, claim, now)
+    if not won:
+        return {"sealed_now": False,
+                "note": "this verdict was already sealed today"}
+    with _seal_lock:
+        while _seal_times and now - _seal_times[0] > 3600:
+            _seal_times.pop(0)
+        if len(_seal_times) >= VERDICT_MAX_PER_HOUR:
+            return {"sealed_now": False,
+                    "note": "hourly sealing limit reached; verdict not sealed"}
+        _seal_times.append(now)
+    walk = ((out.get("checks") or {}).get("INV-001") or {}).get("walk") or {}
+    event = {"user_id": VERDICT_USER, "action": "integrity_verdict",
+             "amount": 0, "country": "UK", "device_id": "checker",
+             "anomaly": 0, "device_risk": 0}
+    result = {"decision": "VERDICT", "score": 0, "domain": domain,
+              "verified_level": out.get("verified_level"),
+              "badge": out.get("badge"),
+              "claimed_level": out.get("claimed_level"),
+              "overclaimed": out.get("overclaimed"),
+              "declaration_url": out.get("declaration_url"),
+              "declaration_sha256": out.get("declaration_sha256"),
+              "chain_tip_reached": walk.get("tip"),
+              "blocks_walked": walk.get("blocks"),
+              "checker_version": VERSION,
+              "standard_version": DECLARATION.get("version"),
+              "checked_at": out.get("checked_at"),
+              "timestamp": now}
+    try:
+        res = seal(event, result, now)
+    except Exception as exc:
+        with lock:
+            conn.execute("DELETE FROM integrity_verdict_claims WHERE "
+                         "domain = ? AND day = ? AND verdict = ?",
+                         (domain, day, claim))
+            conn.commit()
+        return {"sealed_now": False, "note": "could not seal: %s" % exc}
+    if isinstance(res, (list, tuple)):
+        h, idx = res[0], (res[1] if len(res) > 1 else None)
+    elif isinstance(res, dict):
+        h = res.get("audit_hash") or res.get("hash")
+        idx = res.get("block_index") or res.get("index")
+    else:
+        h, idx = res, None
+    return dict(_verdict_ref(idx, h), sealed_now=True)
 
 
-def _spec():
-    return {"module": "genesis",
-            "genesis_version": VERSION,
-            "purpose": (
-                "Publishes which chain state this deployment is running, so a "
-                "receipt can be pinned to a named state rather than to a "
-                "block index that may refer to two different sequences."),
-            "chain_id_rule": (
-                "The first %d characters of the genesis block's audit hash. "
-                "Not a hash of a hash, not a derived key - a slice, so it can "
-                "be checked by eye against the genesis hash returned beside "
-                "it." % CHAIN_ID_LEN),
-            "routes": {
-                "GET /x/genesis/chain": "chain_id, genesis hash, height, tip",
-                "GET /x/genesis/status": "module loaded, chain readable",
-                "GET /x/genesis/spec": "this document",
-            },
-            "vocabulary": VOCABULARY,
-            "reset_record": RESET_RECORD,
-            "read_only": (
-                "This module performs no writes of any kind. It opens the "
-                "same database the sealing code uses and issues two SELECT "
-                "statements. A fault here cannot affect the chain."),
-            "related": {
-                "/x/witness/tip": "current tip, for peers to record",
-                "/api/verify-chain": "checks this chain end to end",
-                "/x/ots/status": "state of each external timestamp proof",
-            }}, 200
+def _register(data, ctx):
+    conn, lock = (ctx or {}).get("conn"), (ctx or {}).get("lock")
+    if conn is None or lock is None:
+        return {"ok": False, "error": "register_unavailable"}, 503
+    with lock:
+        rows = conn.execute(
+            "SELECT id, ts, audit_hash, result_json FROM audit_log "
+            "WHERE user_id = ? ORDER BY id DESC LIMIT 2000",
+            (VERDICT_USER,)).fetchall()
+    with lock:
+        req_rows = conn.execute(
+            "SELECT id, ts, result_json FROM audit_log WHERE user_id = ? "
+            "ORDER BY id DESC LIMIT 2000", (REQUEST_USER,)).fetchall()
+    last_request = {}
+    for ridx, rts, rj in req_rows:
+        try:
+            d = json.loads(rj).get("domain")
+        except Exception:
+            continue
+        if d and d not in last_request:
+            last_request[d] = (ridx, rts)
+    latest = {}
+    history = {}
+    for idx, ts, h, rj in rows:
+        try:
+            r = json.loads(rj)
+        except Exception:
+            continue
+        d = r.get("domain")
+        if not d:
+            continue
+        history[d] = history.get(d, 0) + 1
+        if d in latest:
+            continue
+        latest[d] = {"domain": d, "verified_level": r.get("verified_level"),
+                     "badge": r.get("badge"),
+                     "claimed_level": r.get("claimed_level"),
+                     "overclaimed": r.get("overclaimed"),
+                     "checked_at": r.get("checked_at"),
+                     "sealed_in_block": idx, "sealed_block_hash": h,
+                     "check_block": "https://sebbi.pro/x/walk/block?index=%d" % idx,
+                     "check_now": BASE + "check?domain=" + d}
+    order = {n: i for i, n in enumerate(_ORDER)}
+    entries = sorted(latest.values(), key=lambda e: (
+        -order.get(e.get("verified_level"), -1), e["domain"]))
+    for e in entries:
+        e["verdicts_sealed"] = history.get(e["domain"], 0)
+        lr = last_request.get(e["domain"])
+        if lr:
+            e["last_request_block"] = lr[0]
+    unanswered = []
+    for d, (ridx, rts) in sorted(last_request.items()):
+        v = latest.get(d)
+        if v is None or v["sealed_in_block"] < ridx:
+            # a verdict sealed earlier the same day still answers a request
+            # sealed later only if the verdict was unchanged; show it anyway
+            # so a reader can judge, and say which case it is.
+            unanswered.append({
+                "domain": d, "request_block": ridx,
+                "check_request": "https://sebbi.pro/x/walk/block?index=%d" % ridx,
+                "latest_verdict_block": v["sealed_in_block"] if v else None,
+                "reading": ("an unchanged verdict sealed earlier the same day "
+                            "stands for this request") if v else
+                           "asked about, and no verdict has been sealed"})
+    return {"ok": True, "register": "AI Integrity Declaration - sealed verdicts",
+            "standard": BASE + "declaration",
+            "domains": len(entries), "entries": entries,
+            "requests_without_a_later_verdict": unanswered,
+            "what_this_is": "The latest verdict the checker sealed for each "
+                            "domain, highest level first. Every row points "
+                            "at the public block that holds it, so no rating "
+                            "here can be changed after it was given - by the "
+                            "domain, or by sebbi.pro. Every request is sealed "
+                            "before its check runs, so a question that was "
+                            "asked and never answered is visible below the "
+                            "list, not hidden by it."}, 200
+
+
+def _check_route(data, ctx=None):
+    domain = _clean_domain((data or {}).get("domain"))
+    if not domain:
+        return {"ok": False, "error": "domain_required",
+                "example": BASE + "check?domain=example.com",
+                "detail": "Give a public domain name, e.g. domain=example.com"}, 400
+    now = time.time()
+    with _cache_lock:
+        hit = _cache.get(domain)
+        if hit and now - hit[0] < CACHE_SECONDS:
+            out = dict(hit[1])
+            out["cached_seconds_ago"] = int(now - hit[0])
+            return out, 200
+    if not _running.acquire(blocking=False):
+        return {"ok": False, "error": "busy",
+                "detail": "Two checks are already running. Try again in a "
+                          "minute."}, 429
+    request = _seal_request(domain, ctx)
+    try:
+        out = _check(domain)
+    except Exception as exc:
+        out = {"domain": domain, "verified_level": "L0_DIARY", "badge": "GREY",
+               "error": "check_failed", "detail": str(exc)[:200]}
+    finally:
+        _running.release()
+    out["ok"] = True
+    if request:
+        out["request_sealed"] = request
+    sealed = _seal_verdict(domain, out, ctx)
+    if sealed:
+        out["verdict_sealed"] = sealed
+    with _cache_lock:
+        _cache[domain] = (time.time(), out)
+        if len(_cache) > 500:
+            oldest = sorted(_cache.items(), key=lambda kv: kv[1][0])[:100]
+            for k, _ in oldest:
+                _cache.pop(k, None)
+    return out, 200
+
+
+def _status():
+    return {
+        "ok": True,
+        "module": "integrity",
+        "version": VERSION,
+        "standard": DECLARATION.get("spec"),
+        "standard_version": DECLARATION.get("version"),
+        "declaration_id": DECLARATION.get("declaration_id"),
+        "declaration_sha256": DECLARATION_SHA256,
+        "levels": list(DECLARATION.get("levels", {}).keys()),
+        "invariants": list(DECLARATION.get("invariants", {}).keys()),
+        "links": {
+            "declaration": BASE + "declaration",
+            "check_any_domain": BASE + "check?domain=example.com",
+            "sebbi_self_declaration": BASE + "self",
+            "check_sebbi": BASE + "check?domain=sebbi.pro",
+            "register": BASE + "register",
+            "ordering_test": "https://sebbi.pro/.well-known/ordering-test.json",
+        },
+        "how_to_adopt": "Publish your own filled-in declaration_template at "
+                        "/.well-known/ai-integrity.json on your own domain, "
+                        "then check it at " + BASE + "check?domain=yourdomain",
+        "hash_note": "declaration_sha256 is SHA-256 of the declaration as "
+                     "compact JSON with sorted keys, so anyone can confirm "
+                     "the text they are reading is the text published.",
+    }
 
 
 def handle(method, action, data, api_key, ctx):
-    if method == "GET":
-        if action == "chain":
-            return _chain(ctx)
-        if action == "status":
-            return _status(ctx)
-        if action == "spec":
-            return _spec()
-    return {"error": "unknown_action", "action": action,
-            "routes": sorted(a for _m, a in PUBLIC)}, 404
+    data = data or {}
+    if isinstance(data.get("domain"), list):
+        data = dict(data)
+        data["domain"] = data["domain"][0] if data["domain"] else ""
+    if method == "GET" and action in ("status", "spec", ""):
+        return _status(), 200
+    if method == "GET" and action == "declaration":
+        return DECLARATION, 200
+    if method == "GET" and action == "self":
+        return SELF, 200
+    if method == "GET" and action == "check":
+        return _check_route(data, ctx)
+    if method == "GET" and action == "register":
+        return _register(data, ctx)
+    return {"ok": False, "error": "unknown_action",
+            "get": sorted(a for m, a in PUBLIC if m == "GET"),
+            "post": []}, 404
 
 ```
