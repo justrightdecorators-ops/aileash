@@ -1,9 +1,546 @@
-# Codebase — part 18 of 36
+# Codebase — part 18 of 37
 
 Contains:
+- `modules/standing.py`
+- `modules/stats.py`
 - `modules/tokensaver.py`
-- `modules/verifier.py`
-- `modules/walk.py`
+
+
+## `modules/standing.py`
+
+378 lines, 15691 bytes
+
+```python
+#!/usr/bin/env python3
+"""
+modules/standing.py  -  Temporal Standing Test runner
+=====================================================
+
+Runs the published protocol at
+https://studio.moralclarity.ai/temporal-standing-test
+against the live authority engine (modules/continuity.py), on production,
+and preserves what was observed.
+
+    GET /x/standing/status             what is frozen, what has run    (public)
+    GET /x/standing/freeze             seal implementation + claim     (public)
+    GET /x/standing/run                run both branches, seal result  (public)
+    GET /x/standing/evidence?run=<id>  the full evidence package       (public)
+    GET /x/standing/runs               every run, pass or fail         (public)
+
+Freeze first. A run is refused unless the files deployed now are byte for
+byte the files that were frozen, so the claim cannot be adjusted after a
+result is seen. Every run is kept and listed, including failures.
+"""
+
+import hashlib
+import importlib.util
+import json
+import os
+import random
+import sys
+import time
+import uuid
+from datetime import datetime, timezone
+
+VERSION = "1.0.0"
+
+PUBLIC = {("GET", "status"), ("GET", "freeze"), ("GET", "run"),
+          ("GET", "evidence"), ("GET", "runs")}
+
+PROTOCOL = "https://studio.moralclarity.ai/temporal-standing-test"
+BASE = "https://sebbi.pro/x/standing/"
+TEST_KEY = "public-standing-test"
+CAP = "tst.record.write"
+SIBLING_CAP = "tst.record.read"
+PURPOSE = "temporal-standing-test"
+MIN_GAP = 600          # seconds between runs
+MAX_PER_DAY = 6
+
+PROPOSITION = (
+    "Execution authority established at T0 is re-established at the consequence "
+    "boundary (continuity confirm) before an action binds. A change that defeats "
+    "the exercised authority lineage prevents binding; a change outside that "
+    "lineage does not.")
+
+FALSIFIER = {
+    "case_A_standing_defeating":
+        "T0: grants G and sibling S issued by a human principal; exercise under G "
+        "returns ALLOW. dN: G is revoked. Tn: confirm must return bound=false AND the "
+        "consequence table must gain no row. Any binding or any row is a FAIL.",
+    "case_B_standing_preserving":
+        "T0: identical setup. dN: sibling S is revoked (a real authority change "
+        "outside the exercised lineage). Tn: confirm must return bound=true AND the "
+        "consequence table must gain exactly one row. A refusal is a FAIL.",
+    "malformed":
+        "If the T0 exercise in either case does not return ALLOW, standing was never "
+        "established and the run is UNRESOLVED, neither PASS nor FAIL.",
+}
+
+SCOPE = ("Authority-class dN (revocation) only, on the continuity exercise -> confirm "
+         "path of this deployment. Nothing beyond the frozen implementation and this "
+         "change class is claimed.")
+
+_ready = False
+
+
+def _iso(ts):
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat() if ts else None
+
+
+def _canon(obj):
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _sha_file(path):
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+def _continuity():
+    """The engine under test - the copy the router already loaded if possible."""
+    for m in list(sys.modules.values()):
+        f = getattr(m, "__file__", "") or ""
+        if f.endswith("continuity.py") and hasattr(m, "_confirm") and hasattr(m, "_evaluate"):
+            return m
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "continuity.py")
+    spec = importlib.util.spec_from_file_location("standing_continuity", path)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def _implementation(C):
+    return {
+        "continuity_version": getattr(C, "VERSION", None),
+        "continuity_sha256": _sha_file(C.__file__),
+        "standing_version": VERSION,
+        "standing_sha256": _sha_file(os.path.abspath(__file__)),
+        "proposition": PROPOSITION,
+        "falsifier": FALSIFIER,
+        "scope": SCOPE,
+        "protocol": PROTOCOL,
+    }
+
+
+def _setup(ctx):
+    global _ready
+    if _ready:
+        return
+    with ctx["lock"]:
+        c = ctx["conn"]
+        c.execute("CREATE TABLE IF NOT EXISTS standing_freeze(id TEXT PRIMARY KEY,"
+                  "digest TEXT UNIQUE,impl TEXT,created REAL,audit_hash TEXT,block_index INTEGER)")
+        c.execute("CREATE TABLE IF NOT EXISTS standing_run(id TEXT PRIMARY KEY,freeze_id TEXT,"
+                  "result TEXT,package TEXT,digest TEXT,created REAL,audit_hash TEXT,"
+                  "block_index INTEGER)")
+        c.execute("CREATE TABLE IF NOT EXISTS standing_effect(id INTEGER PRIMARY KEY "
+                  "AUTOINCREMENT,run_id TEXT,case_id TEXT,evaluation TEXT,created REAL)")
+        c.commit()
+    _ready = True
+
+
+def _seal(ctx, kind, detail, extra=None):
+    now = time.time()
+    ev = {"user_id": "tst:standing", "action": kind, "amount": 0, "country": "UK",
+          "device_id": "standing", "anomaly": 0, "device_risk": 0}
+    res = {"decision": kind.upper(), "score": 0, "standing_version": VERSION,
+           "detail": detail}
+    if extra:
+        res.update(extra)
+    out = ctx["seal"](ev, res, now, TEST_KEY)
+    audit_hash = out[0] if isinstance(out, (list, tuple)) else out
+    block = out[1] if isinstance(out, (list, tuple)) and len(out) > 1 else None
+    return audit_hash, block, now
+
+
+def _current_freeze(ctx, digest):
+    with ctx["lock"]:
+        return ctx["conn"].execute(
+            "SELECT id,created,audit_hash,block_index FROM standing_freeze WHERE digest=?",
+            (digest,)).fetchone()
+
+
+# ----------------------------------------------------------------------
+
+def _freeze(ctx):
+    C = _continuity()
+    impl = _implementation(C)
+    digest = hashlib.sha256(_canon(impl).encode()).hexdigest()
+    row = _current_freeze(ctx, digest)
+    if row:
+        return {"frozen": True, "already": True, "freeze": row[0], "digest": digest,
+                "sealed_at": _iso(row[1]), "sealed_in_chain": row[2], "block_index": row[3],
+                "implementation": impl, "next": BASE + "run"}, 200
+    fid = "f_" + uuid.uuid4().hex[:16]
+    audit_hash, block, now = _seal(ctx, "standing_frozen",
+                                   "freeze=%s;digest=%s" % (fid, digest),
+                                   {"freeze": fid, "freeze_digest": digest,
+                                    "continuity_sha256": impl["continuity_sha256"],
+                                    "standing_sha256": impl["standing_sha256"]})
+    with ctx["lock"]:
+        ctx["conn"].execute("INSERT INTO standing_freeze VALUES(?,?,?,?,?,?)",
+                            (fid, digest, _canon(impl), now, audit_hash, block))
+        ctx["conn"].commit()
+    return {"frozen": True, "freeze": fid, "digest": digest, "sealed_at": _iso(now),
+            "sealed_in_chain": audit_hash, "block_index": block,
+            "implementation": impl,
+            "note": "Sealed before any run. A run is refused if either file changes.",
+            "next": BASE + "run"}, 200
+
+
+def _effects(ctx, run_id, case_id):
+    with ctx["lock"]:
+        return ctx["conn"].execute(
+            "SELECT COUNT(*) FROM standing_effect WHERE run_id=? AND case_id=?",
+            (run_id, case_id)).fetchone()[0]
+
+
+def _case(ctx, C, run_id, case_id, defeat):
+    steps = []
+
+    def rec(name, req, resp, status):
+        steps.append({"step": name, "at": _iso(time.time()), "request": req,
+                      "response": resp, "http_status": status})
+
+    t0 = time.time()
+    tag = run_id[-10:] + "_" + case_id
+    base = {"issuer": "standing-principal", "issuer_kind": "human",
+            "subject": "tst-agent-" + tag, "subject_kind": "agent",
+            "constraints": {"max_amount": 100}, "purpose": "temporal standing test",
+            "purpose_tags": [PURPOSE], "not_after": t0 + 3600, "delegations_left": 0}
+    g_id, s_id = "tst_" + tag + "_G", "tst_" + tag + "_S"
+
+    g = dict(base, id=g_id, scope=[CAP])
+    r, s = C._issue(ctx, TEST_KEY, g); rec("T0 issue G (exercised grant)", g, r, s)
+    sib = dict(base, id=s_id, scope=[SIBLING_CAP])
+    r, s = C._issue(ctx, TEST_KEY, sib); rec("T0 issue S (sibling grant)", sib, r, s)
+
+    ex = {"grant": g_id, "action": CAP, "params": {"amount": 10}, "purpose_tag": PURPOSE}
+    e, s = C._evaluate(ctx, TEST_KEY, ex); rec("T0 exercise under G", ex, e, s)
+    eval_id = e.get("evaluation")
+    out = {"case": case_id,
+           "branch": "standing-defeating" if defeat else "standing-preserving",
+           "required": "DENY / NON-EXECUTABLE" if defeat else "PERMIT / EXECUTABLE",
+           "t0_evaluation": eval_id,
+           "t0_proof": "https://sebbi.pro/x/continuity/proof?evaluation=%s" % eval_id,
+           "steps": steps}
+    if e.get("verdict") != "ALLOW":
+        out["determination"] = "UNRESOLVED"
+        out["why"] = "T0 exercise returned %s, so standing was never established" % e.get("verdict")
+        return out
+
+    target = g_id if defeat else s_id
+    rv = {"grant": target, "reason": "temporal standing test dN"}
+    r, s = C._revoke(ctx, TEST_KEY, rv)
+    rec("dN revoke " + ("G (in lineage)" if defeat else "S (outside lineage)"), rv, r, s)
+
+    before = _effects(ctx, run_id, case_id)
+    cf = {"evaluation": eval_id, "action": CAP, "params": {"amount": 10},
+          "outcome": "executed"}
+    r, s = C._confirm(ctx, TEST_KEY, cf); rec("Tn confirm (consequence boundary)", cf, r, s)
+    bound = bool(r.get("bound"))
+    if bound:
+        # The consequence itself. It happens only if the engine let it bind.
+        with ctx["lock"]:
+            ctx["conn"].execute("INSERT INTO standing_effect(run_id,case_id,evaluation,created) "
+                                "VALUES(?,?,?,?)", (run_id, case_id, eval_id, time.time()))
+            ctx["conn"].commit()
+    after = _effects(ctx, run_id, case_id)
+
+    tr, s = C._trace(ctx, {"grant": g_id}); rec("Tn authoritative state of G", {"grant": g_id}, tr, s)
+
+    out["bound"] = bound
+    out["consequence_rows_before"] = before
+    out["consequence_rows_after"] = after
+    if defeat:
+        ok = (not bound) and after == before
+    else:
+        ok = bound and after == before + 1
+    out["determination"] = "PASS" if ok else "FAIL"
+    return out
+
+
+def _run(ctx):
+    C = _continuity()
+    impl = _implementation(C)
+    digest = hashlib.sha256(_canon(impl).encode()).hexdigest()
+    frz = _current_freeze(ctx, digest)
+    if not frz:
+        return {"error": "not_frozen",
+                "message": "The deployed files do not match any freeze. Freeze first; a "
+                           "new freeze is a new test.", "freeze": BASE + "freeze"}, 409
+
+    now = time.time()
+    with ctx["lock"]:
+        last = ctx["conn"].execute("SELECT MAX(created) FROM standing_run").fetchone()[0]
+        today = ctx["conn"].execute("SELECT COUNT(*) FROM standing_run WHERE created>?",
+                                    (now - 86400,)).fetchone()[0]
+    if last and now - last < MIN_GAP:
+        return {"error": "too_soon", "retry_after_seconds": int(MIN_GAP - (now - last)),
+                "runs": BASE + "runs"}, 429
+    if today >= MAX_PER_DAY:
+        return {"error": "daily_limit", "limit": MAX_PER_DAY, "runs": BASE + "runs"}, 429
+
+    run_id = "r_" + uuid.uuid4().hex[:16]
+    order = ["A", "B"]
+    random.shuffle(order)
+    cases = {}
+    for cid in order:
+        cases[cid] = _case(ctx, C, run_id, cid, defeat=(cid == "A"))
+
+    dets = [cases["A"]["determination"], cases["B"]["determination"]]
+    if "UNRESOLVED" in dets:
+        result = "UNRESOLVED"
+    elif dets == ["PASS", "PASS"]:
+        result = "PASS"
+    else:
+        result = "FAIL"
+
+    package = {
+        "protocol": PROTOCOL,
+        "run": run_id,
+        "result": result,
+        "started_at": _iso(now),
+        "finished_at": _iso(time.time()),
+        "freeze": {"id": frz[0], "digest": digest, "sealed_at": _iso(frz[1]),
+                   "sealed_in_chain": frz[2], "block_index": frz[3]},
+        "implementation": impl,
+        "case_order_as_run": order,
+        "case_A": cases["A"],
+        "case_B": cases["B"],
+        "note": ("Observed on production. Nothing here was edited after the run; the "
+                 "package digest below is sealed in the chain."),
+    }
+    pdigest = hashlib.sha256(_canon(package).encode()).hexdigest()
+    audit_hash, block, t = _seal(ctx, "standing_run",
+                                 "run=%s;result=%s;package=%s" % (run_id, result, pdigest),
+                                 {"run": run_id, "result": result, "package_digest": pdigest})
+    with ctx["lock"]:
+        ctx["conn"].execute("INSERT INTO standing_run VALUES(?,?,?,?,?,?,?,?)",
+                            (run_id, frz[0], result, _canon(package), pdigest, now,
+                             audit_hash, block))
+        ctx["conn"].commit()
+    return {"run": run_id, "result": result,
+            "case_A": cases["A"]["determination"], "case_B": cases["B"]["determination"],
+            "package_digest": pdigest, "sealed_in_chain": audit_hash, "block_index": block,
+            "evidence": BASE + "evidence?run=" + run_id}, 200
+
+
+def _evidence(ctx, data):
+    rid = str(data.get("run", "")).strip()
+    with ctx["lock"]:
+        if rid:
+            row = ctx["conn"].execute("SELECT package,digest,audit_hash,block_index FROM "
+                                      "standing_run WHERE id=?", (rid,)).fetchone()
+        else:
+            row = ctx["conn"].execute("SELECT package,digest,audit_hash,block_index FROM "
+                                      "standing_run ORDER BY created DESC LIMIT 1").fetchone()
+    if not row:
+        return {"error": "no_run", "runs": BASE + "runs"}, 404
+    pkg = json.loads(row[0])
+    pkg["package_digest"] = row[1]
+    pkg["package_sealed_in_chain"] = row[2]
+    pkg["package_block_index"] = row[3]
+    pkg["check"] = ("Remove the three package_* fields and the check field, canonicalise "
+                    "(keys sorted, separators ',' ':'), SHA-256, compare with package_digest.")
+    return pkg, 200
+
+
+def _runs(ctx):
+    with ctx["lock"]:
+        rows = ctx["conn"].execute("SELECT id,result,created,block_index FROM standing_run "
+                                   "ORDER BY created DESC").fetchall()
+    return {"count": len(rows),
+            "runs": [{"run": r[0], "result": r[1], "at": _iso(r[2]), "block_index": r[3],
+                      "evidence": BASE + "evidence?run=" + r[0]} for r in rows],
+            "note": "Every run is listed, failures included."}, 200
+
+
+def _status(ctx):
+    C = _continuity()
+    impl = _implementation(C)
+    digest = hashlib.sha256(_canon(impl).encode()).hexdigest()
+    frz = _current_freeze(ctx, digest)
+    with ctx["lock"]:
+        n = ctx["conn"].execute("SELECT COUNT(*) FROM standing_run").fetchone()[0]
+    return {"module": "standing", "version": VERSION, "protocol": PROTOCOL,
+            "continuity_version": impl["continuity_version"],
+            "frozen": bool(frz), "freeze": frz[0] if frz else None,
+            "runs": n,
+            "freeze_url": BASE + "freeze", "run_url": BASE + "run",
+            "runs_url": BASE + "runs"}, 200
+
+
+def handle(method, action, data, api_key, ctx):
+    _setup(ctx)
+    action = (action or "").strip("/").lower()
+    data = data or {}
+    if method == "GET":
+        if action == "status":
+            return _status(ctx)
+        if action == "freeze":
+            return _freeze(ctx)
+        if action == "run":
+            return _run(ctx)
+        if action == "evidence":
+            return _evidence(ctx, data)
+        if action == "runs":
+            return _runs(ctx)
+    return {"error": "unknown_action",
+            "GET": ["status", "freeze", "run", "evidence", "runs"]}, 404
+
+```
+
+
+## `modules/stats.py`
+
+143 lines, 5540 bytes
+
+```python
+"""
+Live figures for the Proving Ground - /x/stats
+
+Charts on a compliance site are usually decoration. These are not, provided
+they show something a visitor could otherwise only take on trust: that the
+chain is genuinely growing, that decisions really are distributed across the
+thresholds rather than hand-picked, and that people who click through a
+review case behave exactly as the oversight argument predicts.
+
+WHAT IS PUBLISHED, AND WHAT IS NOT
+----------------------------------
+Public and no key, because a figure nobody can see proves nothing.
+
+Published: total chain height, hourly block counts, the verdict mix and score
+distribution of PUBLIC DEMO decisions only, and dwell times from public review
+cases.
+
+Never published: anything scoped to a customer key. No customer verdict mix,
+no customer volumes, no per-key anything. A visitor learns how the engine
+behaves, not how any operator's business is going. That distinction is the
+whole reason this endpoint can be open.
+
+    GET /x/stats        everything below
+    GET /x/stats/chain  chain height and hourly growth only
+"""
+
+import json, time
+from datetime import datetime, timezone
+
+VERSION = "1.0"
+PUBLIC = {("GET", ""), ("GET", "stats"), ("GET", "chain")}
+
+DEMO_KEY = "public_demo"
+
+
+def _iso(ts):
+    if not ts:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+def _chain(ctx):
+    t = time.time()
+    with ctx["lock"]:
+        row = ctx["conn"].execute("SELECT COUNT(*),MIN(ts),MAX(ts) FROM audit_log").fetchone()
+        recent = ctx["conn"].execute("SELECT ts FROM audit_log WHERE ts>? ORDER BY ts ASC", (t - 86400,)).fetchall()
+    height = row[0] if row else 0
+    buckets = [0] * 24
+    for (ts,) in recent:
+        h = int((t - ts) // 3600)
+        if 0 <= h < 24:
+            buckets[23 - h] += 1
+    return {"height": height,
+            "first_block": _iso(row[1] if row else None),
+            "latest_block": _iso(row[2] if row else None),
+            "last_24h": buckets,
+            "blocks_last_24h": sum(buckets),
+            "note": "Every block, from every source. The chain is one sequence."}
+
+
+def _demo(ctx):
+    with ctx["lock"]:
+        rows = ctx["conn"].execute("SELECT result_json,ts FROM audit_log WHERE api_key=? ORDER BY id DESC LIMIT 2000", (DEMO_KEY,)).fetchall()
+    verdicts = {"ALLOW": 0, "CHALLENGE": 0, "BLOCK": 0}
+    # ten buckets of 0.1 across the score range
+    hist = [0] * 10
+    scores = []
+    for res, _ts in rows:
+        try:
+            r = json.loads(res)
+        except Exception:
+            continue
+        d = r.get("decision")
+        if d in verdicts:
+            verdicts[d] += 1
+            s = r.get("score")
+            if isinstance(s, (int, float)):
+                scores.append(s)
+                b = min(int(float(s) * 10), 9)
+                hist[b] += 1
+    total = sum(verdicts.values())
+    out = {"decisions": total, "verdicts": verdicts,
+           "score_histogram": hist,
+           "buckets": ["0.0-0.1", "0.1-0.2", "0.2-0.3", "0.3-0.4", "0.4-0.5",
+                       "0.5-0.6", "0.6-0.7", "0.7-0.8", "0.8-0.9", "0.9-1.0"],
+           "thresholds": {"allow_below": 0.35, "block_at_or_above": 0.70}}
+    if scores:
+        scores.sort()
+        out["median_score"] = round(scores[len(scores) // 2], 4)
+    return out
+
+
+def _oversight(ctx):
+    try:
+        with ctx["lock"]:
+            rows = ctx["conn"].execute("SELECT dwell,human_verdict,machine_verdict FROM demo_cases WHERE committed IS NOT NULL").fetchall()
+    except Exception:
+        rows = []
+    if not rows:
+        return {"reviews": 0,
+                "note": "Nobody has taken a review case yet."}
+    dwells = sorted(r[0] for r in rows if r[0] is not None)
+    agreed = len([r for r in rows if (r[1] or "").upper() == (r[2] or "").upper()])
+    # dwell buckets in seconds
+    edges = [2, 5, 10, 20, 45, 90]
+    labels = ["under 2s", "2-5s", "5-10s", "10-20s", "20-45s", "45-90s", "over 90s"]
+    hist = [0] * 7
+    for d in dwells:
+        placed = False
+        for i, e in enumerate(edges):
+            if d < e:
+                hist[i] += 1
+                placed = True
+                break
+        if not placed:
+            hist[6] += 1
+    n = len(dwells)
+    return {"reviews": len(rows),
+            "agreed_with_engine": agreed,
+            "agreement_rate_pct": round(100 * agreed / len(rows), 1),
+            "median_dwell_seconds": (dwells[n // 2] if n else None),
+            "under_2_seconds": hist[0],
+            "under_2_seconds_pct": (round(100 * hist[0] / n, 1) if n else 0),
+            "dwell_histogram": hist,
+            "dwell_labels": labels,
+            "note": "Visitors who committed in under two seconds did not read the case. That is the pattern the oversight record is designed to make visible."}
+
+
+def handle(method, action, data, api_key, ctx):
+    if method != "GET":
+        return {"error": "unknown_action", "action": action}, 404
+    if action == "chain":
+        return {"stats_version": VERSION, "chain": _chain(ctx)}, 200
+    if action in ("", "stats"):
+        return {"stats_version": VERSION,
+                "generated": _iso(time.time()),
+                "chain": _chain(ctx),
+                "public_decisions": _demo(ctx),
+                "public_reviews": _oversight(ctx),
+                "scope": "Public demonstration activity and total chain height only. Nothing scoped to a customer key is published here."}, 200
+    return {"error": "unknown_action", "action": action,
+            "available": ["GET stats", "GET chain"]}, 404
+
+```
 
 
 ## `modules/tokensaver.py`
@@ -1680,1234 +2217,5 @@ def handle(method, action, data, api_key, ctx):
     return {"error": "unknown_action",
             "actions": ["spec", "stats", "verify", "estimate", "gate",
                         "record", "ledger", "budget", "prices", "forget"]}, 404
-
-```
-
-
-## `modules/verifier.py`
-
-717 lines, 26299 bytes
-
-```python
-#!/usr/bin/env python3
-"""
-modules/verifier.py  -  hand the verifier out at a URL
-
-WHY THIS EXISTS
----------------
-A proof that can only be checked by the party who issued it is not a proof.
-So the proof bundles at /x/continuity/proof are useless unless somebody can
-easily get hold of something that checks them, and telling people to clone a
-repository is a gate.
-
-This serves the standalone verifier as a plain file:
-
-    curl -sO https://sebbi.pro/verify-authority.py
-    curl -s "https://sebbi.pro/x/continuity/proof?evaluation=e_..." \\
-        | python3 verify-authority.py -
-
-The script it hands out has no dependencies and makes no network calls. It
-checks the Ed25519 signature, recomputes every digest, re-runs the whole
-derivation from the published rules, and reaches its own verdict - then says
-so if that verdict disagrees with ours.
-
-WHAT IT DELIBERATELY DOES NOT DO
---------------------------------
-It does not phone home, and this module records nothing about who downloaded
-it. A verification tool that reports back to the party being verified is not
-a verification tool.
-
-    GET /verify-authority.py   the script
-    GET /x/verifier/status     what is installed, and the script's digest
-"""
-
-import hashlib
-import sys
-
-VERSION = "1.1"
-
-PUBLIC = {("GET", "status")}
-
-# Deliberately NOT "/verify" - that is the sealed-post verification page and
-# this module would silently hijack it, handing a visitor a Python download
-# where they expected a page. A route grab is a bug even when the code works.
-FILE_PATHS = ("/verify-authority.py", "/verify_authority.py")
-
-_patched = [False]
-
-
-SCRIPT = r'''#!/usr/bin/env python3
-"""
-verify_authority.py  -  check an AILeash authority proof without AILeash
-
-    python3 verify_authority.py proof.json
-    curl -s "https://sebbi.pro/x/continuity/proof?evaluation=e_..." \\
-        | python3 verify_authority.py -
-
-WHAT THIS IS FOR
-----------------
-A proof that can only be checked by the party who issued it is not a proof.
-This script takes a bundle and reaches its own conclusion using nothing but
-the Python standard library. It does not call the issuing system, it does not
-import anything you have to install, and it does not take a single field of
-the bundle at face value.
-
-It does four separate things, and each one can fail on its own:
-
-  1. SIGNATURE   Ed25519 over the canonical bundle. Confirms the bundle came
-                 from the holder of the named key and has not been edited by
-                 anybody since.
-
-  2. INTEGRITY   Recomputes every grant digest, the lineage digest and the
-                 parameter digest from the fields in front of it. Confirms
-                 the bundle is internally consistent with its own contents.
-
-  3. DERIVATION  Re-runs the authority rules from scratch: root issued by a
-                 human, an unbroken parent chain, scope covered at every hop,
-                 constraints narrowing on every axis, purpose narrowing,
-                 validity windows contained, nothing revoked, and the action
-                 itself inside the effective limits of the whole lineage.
-
-  4. AGREEMENT   Compares the verdict this script reached with the verdict the
-                 bundle claims. Disagreement is reported as a failure of the
-                 issuer, not of this script.
-
-WHAT A PASS MEANS
------------------
-That the authority for this action was derivable, at that time, from that
-human grant - or, for a refusal, that it genuinely was not, and that the named
-grant and invariant really are where it broke.
-
-WHAT A PASS DOES NOT MEAN
--------------------------
-That the root grant should ever have been issued. That the parameters describe
-something that really happened. That the risk engine was right. Derivation is
-not merit and it is not truth.
-
-The risk half of a composed verdict cannot be re-derived here, because that
-needs the issuer's scoring engine. Where the bundle's authority verdict is
-BLOCK, the composed verdict stands regardless, because the composition takes
-the worse of the two.
-"""
-
-import binascii
-import hashlib
-import json
-import sys
-
-GRANT_PREFIX = b"AILEASH-GRANT-v1:"
-EVAL_PREFIX = b"AILEASH-AUTHEVAL-v1:"
-BUNDLE_PREFIX = b"AILEASH-AUTHORITY-PROOF-v1:"
-
-MAX_DEPTH = 32
-RANK = {"ALLOW": 0, "CHALLENGE": 1, "BLOCK": 2}
-
-
-# ======================================================================
-# Ed25519, RFC 8032, standard library only
-# ======================================================================
-
-_Q = 2 ** 255 - 19
-_L = 2 ** 252 + 27742317777372353535851937790883648493
-_D = -121665 * pow(121666, _Q - 2, _Q) % _Q
-_I = pow(2, (_Q - 1) // 4, _Q)
-
-
-def _h(m):
-    return hashlib.sha512(m).digest()
-
-
-def _inv(x):
-    return pow(x, _Q - 2, _Q)
-
-
-def _xrecover(y):
-    xx = (y * y - 1) * _inv(_D * y * y + 1)
-    x = pow(xx, (_Q + 3) // 8, _Q)
-    if (x * x - xx) % _Q != 0:
-        x = (x * _I) % _Q
-    if x % 2 != 0:
-        x = _Q - x
-    return x
-
-
-_BY = 4 * _inv(5) % _Q
-_BX = _xrecover(_BY)
-_B = (_BX % _Q, _BY % _Q, 1, (_BX * _BY) % _Q)
-_IDENT = (0, 1, 1, 0)
-
-
-def _add(p, q):
-    x1, y1, z1, t1 = p
-    x2, y2, z2, t2 = q
-    a = (y1 - x1) * (y2 - x2) % _Q
-    b = (y1 + x1) * (y2 + x2) % _Q
-    c = t1 * 2 * _D * t2 % _Q
-    dd = z1 * 2 * z2 % _Q
-    e, f, g, hh = b - a, dd - c, dd + c, b + a
-    return (e * f % _Q, g * hh % _Q, f * g % _Q, e * hh % _Q)
-
-
-def _scalarmult(p, e):
-    if e == 0:
-        return _IDENT
-    q = _scalarmult(p, e // 2)
-    q = _add(q, q)
-    if e & 1:
-        q = _add(q, p)
-    return q
-
-
-def _encodepoint(p):
-    x, y, z, _t = p
-    zi = _inv(z)
-    x, y = x * zi % _Q, y * zi % _Q
-    bits = [(y >> i) & 1 for i in range(255)] + [x & 1]
-    return bytes(sum(bits[i * 8 + j] << j for j in range(8)) for i in range(32))
-
-
-def _bit(h, i):
-    return (h[i // 8] >> (i % 8)) & 1
-
-
-def _hint(m):
-    h = _h(m)
-    return sum(2 ** i * _bit(h, i) for i in range(512))
-
-
-def _isoncurve(p):
-    x, y, z, t = p
-    return (z % _Q != 0 and x * y % _Q == z * t % _Q
-            and (y * y - x * x - z * z - _D * t * t) % _Q == 0)
-
-
-def _decodepoint(s):
-    y = int.from_bytes(s, "little") & ((1 << 255) - 1)
-    x = _xrecover(y)
-    if x & 1 != _bit(s, 255):
-        x = _Q - x
-    p = (x, y, 1, (x * y) % _Q)
-    if not _isoncurve(p):
-        raise ValueError("point off curve")
-    return p
-
-
-def ed25519_verify(sig, msg, pk):
-    if len(sig) != 64 or len(pk) != 32:
-        return False
-    try:
-        rr = _decodepoint(sig[:32])
-        a = _decodepoint(pk)
-    except Exception:
-        return False
-    s = int.from_bytes(sig[32:64], "little")
-    if s >= _L:
-        return False
-    hh = _hint(sig[:32] + pk + msg)
-    return _encodepoint(_scalarmult(_B, s)) == _encodepoint(_add(rr, _scalarmult(a, hh)))
-
-
-# ======================================================================
-# the rules, reimplemented from the published spec
-# ======================================================================
-
-def canon(obj):
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
-
-
-def sha(prefix, text):
-    return hashlib.sha256(prefix + text.encode("utf-8")).hexdigest()
-
-
-def grant_digest(g):
-    material = {
-        "id": g["id"], "parent": g["parent"], "issuer": g["issuer"],
-        "issuer_kind": g["issuer_kind"], "subject": g["subject"],
-        "subject_kind": g["subject_kind"], "scope": sorted(g["scope"]),
-        "constraints": g["constraints"], "purpose": g["purpose"],
-        "purpose_tags": sorted(g["purpose_tags"]),
-        "not_before": g["not_before"], "not_after": g["not_after"],
-        "depth": g["depth"], "delegations_left": g["delegations_left"],
-        "created": g["created"], "risk_accepted_by": g.get("risk_accepted_by"),
-    }
-    return sha(GRANT_PREFIX, canon(material))
-
-
-def covers(held, wanted):
-    if held == wanted or held == "*":
-        return True
-    if held.endswith(".*"):
-        return wanted == held[:-2] or wanted.startswith(held[:-1])
-    return False
-
-
-def wildcard_breadth(scope, capability):
-    best = None
-    for held in scope:
-        if not covers(held, capability):
-            continue
-        if held == capability:
-            return 0
-        width = (capability.count(".") + 2 if held == "*"
-                 else capability.count(".") - held[:-2].count("."))
-        best = width if best is None else min(best, width)
-    return best
-
-
-def direction(key):
-    for p in ("max_", "min_", "allowed_", "denied_", "may_"):
-        if key.startswith(p):
-            return p
-    return None
-
-
-def num(v):
-    if isinstance(v, bool) or v is None:
-        raise ValueError("not a number")
-    return float(v)
-
-
-def as_set(v):
-    if isinstance(v, (list, tuple, set)):
-        return set(v)
-    return {v}
-
-
-def narrower(parent_c, child_c):
-    for key in sorted(child_c):
-        d = direction(key)
-        cval = child_c[key]
-        if d is None:
-            return False, "constraint '%s' has no narrowing rule" % key
-        if key not in parent_c:
-            return False, "constraint '%s' is not expressed by the parent" % key
-        pval = parent_c[key]
-        try:
-            if d == "max_" and num(cval) > num(pval):
-                return False, "%s raised from %s to %s" % (key, pval, cval)
-            if d == "min_" and num(cval) < num(pval):
-                return False, "%s lowered from %s to %s" % (key, pval, cval)
-            if d == "allowed_" and not as_set(cval) <= as_set(pval):
-                return False, "%s adds values the parent does not hold" % key
-            if d == "denied_" and not as_set(pval) <= as_set(cval):
-                return False, "%s drops values the parent denies" % key
-            if d == "may_" and bool(cval) and not bool(pval):
-                return False, "%s enabled where the parent withholds it" % key
-        except (TypeError, ValueError):
-            return False, "constraint '%s' is not comparable" % key
-    return True, None
-
-
-def effective(chain):
-    eff = {}
-    for g in chain:
-        for k, v in g["constraints"].items():
-            d = direction(k)
-            if k not in eff:
-                eff[k] = v
-                continue
-            cur = eff[k]
-            try:
-                if d == "max_":
-                    eff[k] = min(num(cur), num(v))
-                elif d == "min_":
-                    eff[k] = max(num(cur), num(v))
-                elif d == "allowed_":
-                    eff[k] = sorted(as_set(cur) & as_set(v))
-                elif d == "denied_":
-                    eff[k] = sorted(as_set(cur) | as_set(v))
-                elif d == "may_":
-                    eff[k] = bool(cur) and bool(v)
-            except (TypeError, ValueError):
-                eff[k] = v
-    return eff
-
-
-def params_against(params, eff):
-    hard, unconstrained = [], []
-    for key in sorted(params):
-        val = params[key]
-        checked = False
-        for cname, cval in eff.items():
-            d = direction(cname)
-            if not d or cname[len(d):] != key:
-                continue
-            checked = True
-            try:
-                if d == "max_" and num(val) > num(cval):
-                    hard.append("%s=%s exceeds %s=%s" % (key, val, cname, cval))
-                elif d == "min_" and num(val) < num(cval):
-                    hard.append("%s=%s is below %s=%s" % (key, val, cname, cval))
-                elif d == "allowed_" and val not in as_set(cval):
-                    hard.append("%s=%s is outside %s" % (key, val, cname))
-                elif d == "denied_" and val in as_set(cval):
-                    hard.append("%s=%s is denied by %s" % (key, val, cname))
-                elif d == "may_" and bool(val) and not bool(cval):
-                    hard.append("%s requested where %s withholds it" % (key, cname))
-            except (TypeError, ValueError):
-                hard.append("%s cannot be compared with %s" % (key, cname))
-        if not checked:
-            unconstrained.append(key)
-    return hard, unconstrained
-
-
-# ======================================================================
-# the four checks
-# ======================================================================
-
-class Report(object):
-    def __init__(self):
-        self.rows = []
-        self.failed = False
-
-    def add(self, ok, name, detail=""):
-        self.rows.append((ok, name, detail))
-        if not ok:
-            self.failed = True
-
-    def note(self, name, detail=""):
-        self.rows.append((None, name, detail))
-
-    def render(self):
-        out = []
-        for ok, name, detail in self.rows:
-            mark = "  ok  " if ok else ("FAIL  " if ok is False else "  --  ")
-            out.append(mark + name + (("\n        " + detail) if detail else ""))
-        return "\n".join(out)
-
-
-def check_signature(bundle, rep):
-    sig_hex = bundle.get("signature")
-    pk_hex = (bundle.get("issued_by") or {}).get("public_key")
-    if not sig_hex or not pk_hex:
-        rep.add(False, "Signature present", "the bundle carries no signature or no key")
-        return
-    body = dict(bundle)
-    body.pop("signature", None)
-    body.pop("verify_with", None)
-    try:
-        sig = binascii.unhexlify(sig_hex)
-        pk = binascii.unhexlify(pk_hex)
-    except Exception:
-        rep.add(False, "Signature is readable hex")
-        return
-    ok = ed25519_verify(sig, BUNDLE_PREFIX + canon(body).encode("utf-8"), pk)
-    rep.add(ok, "Ed25519 signature over the canonical bundle",
-            "key " + pk_hex[:16] + "…  Verify this key independently at the issuer's "
-            "published address before trusting who signed." if ok else
-            "the bundle was altered after signing, or it was not signed by this key")
-
-
-def check_integrity(bundle, rep):
-    lineage = bundle.get("lineage") or []
-    bad = []
-    for g in lineage:
-        try:
-            if grant_digest(g) != g.get("digest"):
-                bad.append(g.get("id"))
-        except Exception:
-            bad.append(g.get("id"))
-    rep.add(not bad, "Every grant digest recomputes from its own fields",
-            "" if not bad else "mismatched: " + ", ".join(str(b) for b in bad))
-
-    claimed = (bundle.get("decision") or {}).get("lineage_digest")
-    mine = sha(EVAL_PREFIX, canon([g.get("digest") for g in lineage]))
-    rep.add(mine == claimed, "Lineage digest matches the ordered path",
-            "" if mine == claimed else "computed " + mine[:20] + "… claimed " + str(claimed)[:20] + "…")
-
-    req = bundle.get("request") or {}
-    claimed_p = (bundle.get("decision") or {}).get("params_digest")
-    mine_p = sha(EVAL_PREFIX, canon({"action": req.get("action"),
-                                     "params": req.get("params") or {}}))
-    rep.add(mine_p == claimed_p, "Parameter digest matches the request as stated",
-            "" if mine_p == claimed_p else "the parameters shown are not the "
-            "parameters that were judged")
-
-
-def rederive(bundle, rep):
-    """Run the published rules from scratch and reach an independent verdict."""
-    lineage = bundle.get("lineage") or []
-    decision = bundle.get("decision") or {}
-    req = bundle.get("request") or {}
-    at = decision.get("evaluated_at_epoch")
-
-    hard, soft = [], []
-    broken_at = broken_invariant = None
-
-    def fail(grant, invariant, detail):
-        nonlocal broken_at, broken_invariant
-        hard.append(detail)
-        if broken_at is None:
-            broken_at, broken_invariant = grant, invariant
-
-    if not lineage:
-        fail(None, "authority_continuity", "the bundle carries no authority path")
-    else:
-        root = lineage[0]
-        if root.get("parent") is not None:
-            fail(root["id"], "authority_continuity",
-                 "the path does not begin at a parentless root")
-        if root.get("issuer_kind") != "human":
-            fail(root["id"], "identity_continuity",
-                 "the root grant was not issued by a human principal")
-
-        previous = None
-        for g in lineage:
-            if g.get("revoked_at") is not None:
-                fail(g["id"], "authority_continuity",
-                     "grant %s was revoked" % g["id"])
-            if at is not None:
-                if at < g["not_before"]:
-                    fail(g["id"], "temporal_validity",
-                         "grant %s was not yet valid at the time of the decision" % g["id"])
-                if at >= g["not_after"]:
-                    fail(g["id"], "temporal_validity",
-                         "grant %s had expired at the time of the decision" % g["id"])
-            if previous is not None:
-                if g.get("parent") != previous.get("id"):
-                    fail(g["id"], "authority_continuity",
-                         "grant %s does not point at the grant above it" % g["id"])
-                missing = [c for c in g["scope"]
-                           if not any(covers(p, c) for p in previous["scope"])]
-                if missing:
-                    fail(g["id"], "boundary_integrity",
-                         "%s holds scope its parent does not: %s"
-                         % (g["id"], ", ".join(sorted(missing))))
-                ok, why = narrower(previous["constraints"], g["constraints"])
-                if not ok:
-                    fail(g["id"], "boundary_integrity", "%s: %s" % (g["id"], why))
-                if not set(g["purpose_tags"]) <= set(previous["purpose_tags"]):
-                    fail(g["id"], "intent_continuity",
-                         "%s carries purpose tags its parent does not" % g["id"])
-                if (g["not_before"] < previous["not_before"]
-                        or g["not_after"] > previous["not_after"]):
-                    fail(g["id"], "temporal_validity",
-                         "%s is valid outside its parent's window" % g["id"])
-                if g["depth"] != previous["depth"] + 1:
-                    fail(g["id"], "authority_continuity",
-                         "%s records a depth inconsistent with its parent" % g["id"])
-            previous = g
-
-        if len(lineage) - 1 > MAX_DEPTH:
-            fail(lineage[-1]["id"], "boundary_integrity", "delegation depth exceeds the ceiling")
-
-        if not any(g.get("risk_accepted_by") for g in lineage):
-            fail(lineage[0]["id"], "identity_continuity",
-                 "no grant in this path names who accepted the risk")
-
-        leaf = lineage[-1]
-        action = req.get("action")
-        params = req.get("params") or {}
-
-        if action and not any(covers(c, action) for c in leaf["scope"]):
-            fail(leaf["id"], "boundary_integrity",
-                 "action '%s' is outside the scope of the grant exercised" % action)
-        elif action:
-            breadth = wildcard_breadth(leaf["scope"], action)
-            if breadth and breadth >= 2:
-                soft.append("action '%s' is only covered by a broad wildcard" % action)
-
-        eff = effective(lineage)
-        failures, unconstrained = params_against(params, eff)
-        for f in failures:
-            fail(leaf["id"], "boundary_integrity", f)
-        for u in unconstrained:
-            soft.append("parameter '%s' is not constrained anywhere in the path" % u)
-
-        tag = req.get("purpose_tag")
-        if tag:
-            if tag not in leaf["purpose_tags"]:
-                soft.append("declared purpose '%s' is not carried by the grant" % tag)
-        else:
-            soft.append("the action declared no purpose")
-
-    verdict = "BLOCK" if hard else ("CHALLENGE" if soft else "ALLOW")
-    return verdict, hard, soft, broken_at, broken_invariant
-
-
-def check_agreement(bundle, rep, mine, hard, soft, broken_at, broken_invariant):
-    decision = bundle.get("decision") or {}
-    claimed = decision.get("authority_verdict") or decision.get("verdict")
-
-    rep.add(mine == claimed,
-            "Independently re-derived authority verdict: " + mine,
-            "" if mine == claimed else
-            "the issuer claims " + str(claimed) + " and this script reaches " + mine +
-            " from the same path. One of us is wrong and the rules are published.")
-
-    if mine == "BLOCK":
-        same_grant = (broken_at == decision.get("broken_at"))
-        same_inv = (broken_invariant == decision.get("broken_invariant"))
-        rep.add(same_grant and same_inv,
-                "Refusal reproduces at the same grant and invariant",
-                ("grant %s, invariant %s" % (broken_at, broken_invariant))
-                if same_grant and same_inv else
-                "this script breaks at grant %s / %s, the issuer says %s / %s"
-                % (broken_at, broken_invariant,
-                   decision.get("broken_at"), decision.get("broken_invariant")))
-        rep.note("Why authority could not be derived")
-        for h in hard:
-            rep.note("  " + h)
-    elif soft:
-        rep.note("Why this could not be settled without a person")
-        for x in soft:
-            rep.note("  " + x)
-
-    risk = decision.get("risk_verdict")
-    if risk and mine != "BLOCK":
-        rep.note("Risk verdict reported as " + str(risk) + ", not re-derivable here",
-                 "the composed verdict is the worse of the two; the scoring engine "
-                 "is not part of this bundle and is not checked by this script")
-
-
-def main():
-    if len(sys.argv) < 2:
-        print(__doc__)
-        return 2
-    src = sys.argv[1]
-    raw = sys.stdin.read() if src == "-" else open(src, "r").read()
-    try:
-        bundle = json.loads(raw)
-    except Exception as exc:
-        print("Not readable JSON: " + str(exc))
-        return 2
-
-    rep = Report()
-    print("=" * 66)
-    print("AUTHORITY PROOF  ·  independent verification")
-    print("=" * 66)
-    d = bundle.get("decision") or {}
-    print("evaluation   " + str(d.get("evaluation")))
-    print("action       " + str((bundle.get("request") or {}).get("action")))
-    print("at           " + str(d.get("evaluated_at")))
-    print("hops         " + str(max(0, len(bundle.get("lineage") or []) - 1)))
-    if bundle.get("lineage"):
-        print("authorised   " + str(bundle["lineage"][0].get("issuer")))
-        print("executed     " + str(bundle["lineage"][-1].get("subject")))
-        acc = [g.get("risk_accepted_by") for g in bundle["lineage"] if g.get("risk_accepted_by")]
-        print("risk owner   " + str(acc[-1] if acc else None))
-    print("-" * 66)
-
-    check_signature(bundle, rep)
-    check_integrity(bundle, rep)
-    mine, hard, soft, ba, bi = rederive(bundle, rep)
-    check_agreement(bundle, rep, mine, hard, soft, ba, bi)
-
-    print(rep.render())
-    print("-" * 66)
-    if rep.failed:
-        print("RESULT: NOT VERIFIED. Something above did not hold.")
-        return 1
-    print("RESULT: VERIFIED - " + mine)
-    if mine == "BLOCK":
-        print("This is a proof that the action was NOT authorised, and where it failed.")
-    print("Checked with no network access, no dependencies, and nothing taken on")
-    print("the issuer's word except the meaning of their public key.")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
-'''
-
-
-def _digest():
-    return hashlib.sha256(SCRIPT.encode("utf-8")).hexdigest()
-
-
-def _srv():
-    m = sys.modules.get("__main__")
-    if m is not None and hasattr(m, "get_bearer"):
-        return m
-    return sys.modules.get("server")
-
-
-def _install(s):
-    if _patched[0]:
-        return "already installed"
-    H = getattr(s, "Handler", None)
-    if H is None or not hasattr(H, "do_GET"):
-        return "no handler"
-    if getattr(H, "_verifier_patched", False):
-        _patched[0] = True
-        return "already installed"
-
-    original = H.do_GET
-
-    def do_GET(self):
-        try:
-            from urllib.parse import urlparse
-            p = urlparse(self.path).path.rstrip("/") or "/"
-        except Exception:
-            p = self.path or "/"
-
-        if p in FILE_PATHS:
-            body = SCRIPT.encode("utf-8")
-            try:
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Content-Disposition",
-                                 'attachment; filename="verify-authority.py"')
-                self.send_header("Cache-Control", "public, max-age=300")
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.send_header("X-Content-Type-Options", "nosniff")
-                self.end_headers()
-                self.wfile.write(body)
-            except Exception:
-                pass
-            return
-
-        return original(self)
-
-    H.do_GET = do_GET
-    H._verifier_patched = True
-    _patched[0] = True
-    print("VERIFIER: /verify-authority.py installed", flush=True)
-    return "installed"
-
-
-def handle(method, action, data, api_key, ctx):
-    s = _srv()
-    if s is None:
-        return {"error": "server_not_found"}, 500
-
-    state = "already installed" if _patched[0] else None
-    if not _patched[0]:
-        try:
-            state = _install(s)
-        except Exception as exc:
-            print("VERIFIER: patch failed - " + str(exc), flush=True)
-            state = "failed: " + str(exc)
-
-    action = (action or "").strip("/").lower()
-
-    if method == "GET" and action in ("", "status"):
-        return {
-            "installed": bool(_patched[0]),
-            "install_result": state,
-            "module_version": VERSION,
-            "serving": list(FILE_PATHS),
-            "script_bytes": len(SCRIPT),
-            "script_sha256": _digest(),
-            "how_to_use": [
-                "curl -sO https://sebbi.pro/verify-authority.py",
-                "curl -s 'https://sebbi.pro/x/continuity/proof?evaluation=<id>' "
-                "| python3 verify-authority.py -",
-            ],
-            "dependencies": "none - Python standard library only",
-            "network": "the script makes no network calls and reports nothing back. "
-                       "A verification tool that phones home to the party being "
-                       "verified is not a verification tool.",
-            "note": "Check script_sha256 against the file you downloaded. And read it "
-                    "before you run it, as you would with anything else handed to you "
-                    "by the party you are checking.",
-        }, 200
-
-    return {"error": "unknown_action", "action": action, "GET": ["status"]}, 404
-
-```
-
-
-## `modules/walk.py`
-
-496 lines, 17886 bytes
-
-```python
-"""
-walk.py v1.1.0 - the whole chain, genesis to tip, readable by anyone.
-
-Lives at modules/walk.py and answers at https://sebbi.pro/x/walk/<action>.
-Every route is public. Nothing is written, nothing is sealed, no table is
-created. It only reads audit_log.
-
-WHY IT EXISTS
-Until now nobody outside could walk the chain end to end: /api/verify-chain
-returns a count and a tip, and /x/witness/chain needs a key. A verifier could
-check pieces (inclusion, consistency, witnessed tips) but never the whole run
-from the first block. This serves every block in write order, from genesis,
-in pages, so the full walk can be done from outside without asking anyone.
-
-HOW A BLOCK IS SEALED (server.py seal(), unchanged)
-    audit_hash = sha256( json.dumps(
-        {"prev_hash": prev, "ts": ts, "event": event, "result": result},
-        sort_keys=True).encode() ).hexdigest()
-    The first block's prev is the literal string "GENESIS".
-
-WHAT A VERIFIER DOES WITH THIS
-For a public block the exact preimage string is served. So, in any language:
-    1. sha256(utf8(preimage)) must equal audit_hash
-    2. parse preimage; its prev_hash must equal the previous block's audit_hash
-    3. the first block's prev_hash must be "GENESIS"
-No need to copy Python's JSON formatting - the bytes that were hashed are given.
-
-WHAT IS WITHHELD, AND WHY
-Blocks sealed under a customer's API key (any key not owned by the
-operator), blocks from sources not on the public
-list below, and any block whose payload contains a field that looks like a
-secret, are served WITHOUT their payload: index, position, time, prev_hash and
-audit_hash only. Publishing customer decisions or child-safety events to the
-open internet is not something a verification route gets to decide. For a
-withheld block an outsider can check linkage but cannot recompute the hash; the
-customer who holds the original event can. Every withheld block says why.
-
-THE RESET
-The chain restarted from genesis on 7 September 2026. A block index quoted
-before that date belongs to the earlier chain. If the same number exists here,
-it is a different block.
-
-Module contract: handle(method, action, data, api_key, ctx) -> (dict, status).
-"""
-
-import json
-import hashlib
-import os
-import re
-import threading
-
-VERSION = "1.1.0"
-HOST = "https://sebbi.pro"
-BASE = HOST + "/x/walk/"
-GENESIS_PREV = "GENESIS"
-RESET_DATE = "2026-09-07"
-DEFAULT_LIMIT = 100
-
-# Keys registered to these addresses are the operator's own. Blocks sealed
-# under them are NOT treated as customer data; they go through the public
-# list and secret checks like any other block. Override with the env var
-# WALK_OPERATOR_EMAILS (comma separated).
-OPERATOR_EMAILS = tuple(
-    e.strip().lower() for e in os.environ.get(
-        "WALK_OPERATOR_EMAILS",
-        "justrightdecorators@gmail.com,justin@monopcontent.com").split(",")
-    if e.strip())
-MAX_LIMIT = 500
-
-# user_id prefixes whose payloads are protocol traffic and safe to publish.
-# Anything not starting with one of these is withheld. Extend here, one line.
-PUBLIC_PREFIXES = (
-    "wit:",
-    "peer:",
-    "praxis:",
-    "bind:",
-    "signed:",
-    "system_",
-    "public-witness",
-)
-
-# Field names that must never be published, anywhere in a payload.
-SENSITIVE_KEY = re.compile(
-    r"(secret|password|passwd|passcode|token|api_?key|credential|private|"
-    r"seed|authori[sz]ation|bearer|cookie|session|^pin$)",
-    re.I,
-)
-# Values that look like AILeash API keys.
-SENSITIVE_VALUE = re.compile(r"^(al|sb|se)_live_[0-9a-f]{16,}")
-
-PUBLIC = {
-    ("GET", "spec"),
-    ("GET", "status"),
-    ("GET", "genesis"),
-    ("GET", "blocks"),
-    ("GET", "block"),
-    ("GET", "verify"),
-}
-
-WHAT_THIS_PROVES = (
-    "For public blocks: that each served preimage hashes to the stored "
-    "audit_hash and names the previous block's hash, from genesis forward. "
-    "For withheld blocks: only that the stored links are continuous - the "
-    "hash cannot be recomputed without the payload. Pair the tip with a "
-    "witnessed or anchored tip to show this chain is the one other parties "
-    "saw. This route is served by the operator; the evidence is the "
-    "arithmetic you do on it, not the operator's word."
-)
-
-RESET_NOTE = (
-    "This chain restarted from genesis on " + RESET_DATE + ". A block index "
-    "quoted before that date belongs to the earlier chain. If the same number "
-    "exists here, it is a different block."
-)
-
-_cache_lock = threading.Lock()
-_cache = {"key": None, "result": None}
-
-
-# ---------------------------------------------------------------- helpers
-
-def _q(data, name, default=None):
-    if not isinstance(data, dict):
-        return default
-    v = data.get(name, default)
-    if isinstance(v, list):
-        v = v[0] if v else default
-    return v
-
-
-def _int(v, default, lo, hi):
-    try:
-        return max(lo, min(hi, int(v)))
-    except (TypeError, ValueError):
-        return default
-
-
-def _sha(s):
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()
-
-
-def _preimage(prev, ts, event, result):
-    return json.dumps(
-        {"prev_hash": prev, "ts": ts, "event": event, "result": result},
-        sort_keys=True,
-    )
-
-
-def _has_api_key_col(conn):
-    cols = [r[1] for r in conn.execute("PRAGMA table_info(audit_log)").fetchall()]
-    return "api_key" in cols
-
-
-def _select(conn):
-    ak = "api_key" if _has_api_key_col(conn) else "''"
-    return ("SELECT id, ts, user_id, event_json, result_json, prev_hash, "
-            "audit_hash, " + ak + " FROM audit_log")
-
-
-def _scan(obj):
-    """True if any key or string value looks like a secret."""
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            if SENSITIVE_KEY.search(str(k)):
-                return True
-            if _scan(v):
-                return True
-    elif isinstance(obj, list):
-        for v in obj:
-            if _scan(v):
-                return True
-    elif isinstance(obj, str):
-        if SENSITIVE_VALUE.match(obj):
-            return True
-    return False
-
-
-def _customer_keys(conn):
-    """Every API key NOT owned by the operator. If the key table cannot be
-    read, return None, which makes every keyed block count as a customer's -
-    the safe direction."""
-    try:
-        marks = ",".join("?" for _ in OPERATOR_EMAILS) or "''"
-        rows = conn.execute(
-            "SELECT key FROM api_keys WHERE lower(email) NOT IN (" + marks + ")",
-            OPERATOR_EMAILS).fetchall()
-        return set(r[0] for r in rows)
-    except Exception:
-        return None
-
-
-def _is_customer(api_key, customer_keys):
-    if not api_key:
-        return False
-    if customer_keys is None:
-        return True
-    return api_key in customer_keys
-
-
-def _classify(user_id, api_key, event, result, customer_keys):
-    if _is_customer(api_key, customer_keys):
-        return False, "customer_key"
-    uid = str(user_id or "")
-    if not uid.startswith(PUBLIC_PREFIXES):
-        return False, "not_on_public_list"
-    if _scan(event) or _scan(result):
-        return False, "sensitive_field"
-    return True, None
-
-
-def _prefix(uid):
-    uid = str(uid or "")
-    return uid.split(":")[0] + ":" if ":" in uid else uid[:12]
-
-
-def _block(row, position, customer_keys):
-    bid, ts, uid, ej, rj, prev, h, ak = row
-    out = {
-        "block_index": bid,
-        "position": position,
-        "ts": ts,
-        "prev_hash": prev,
-        "audit_hash": h,
-    }
-    try:
-        event = json.loads(ej)
-        result = json.loads(rj)
-    except Exception:
-        out["payload"] = "withheld"
-        out["withheld_reason"] = "unparseable"
-        out["server_recomputes"] = False
-        return out, False, "unparseable"
-    pre = _preimage(prev, ts, event, result)
-    out["server_recomputes"] = (_sha(pre) == h)
-    public, reason = _classify(uid, ak, event, result, customer_keys)
-    if public:
-        out["preimage"] = pre
-    else:
-        out["payload"] = "withheld"
-        out["withheld_reason"] = reason
-    return out, public, reason
-
-
-def _position_of(conn, bid):
-    """Zero-based write-order position of block bid."""
-    r = conn.execute("SELECT COUNT(*) FROM audit_log WHERE id < ?", (bid,)).fetchone()
-    return r[0] if r else 0
-
-
-def _hash_before(conn, bid):
-    r = conn.execute(
-        "SELECT audit_hash FROM audit_log WHERE id < ? ORDER BY id DESC LIMIT 1",
-        (bid,)).fetchone()
-    return r[0] if r else GENESIS_PREV
-
-
-def _full_walk(ctx):
-    """Walk every block once. Cached until the chain grows."""
-    conn, lock = ctx["conn"], ctx["lock"]
-    with lock:
-        key = conn.execute("SELECT COUNT(*), MAX(id) FROM audit_log").fetchone()
-    with _cache_lock:
-        if _cache["key"] == key and _cache["result"] is not None:
-            return _cache["result"]
-    with lock:
-        rows = conn.execute(_select(conn) + " ORDER BY id ASC").fetchall()
-        ckeys = _customer_keys(conn)
-
-    withheld = {}
-    hidden_prefixes = {}
-    public_count = 0
-    links_ok = True
-    recompute_ok = True
-    first_break = None
-    prev_hash = GENESIS_PREV
-    for pos, row in enumerate(rows):
-        blk, public, reason = _block(row, pos, ckeys)
-        if public:
-            public_count += 1
-        else:
-            withheld[reason] = withheld.get(reason, 0) + 1
-            if reason == "not_on_public_list":
-                p = _prefix(row[2])
-                hidden_prefixes[p] = hidden_prefixes.get(p, 0) + 1
-        if blk["prev_hash"] != prev_hash:
-            links_ok = False
-            if first_break is None:
-                first_break = {"block_index": blk["block_index"], "position": pos,
-                               "problem": "prev_hash does not match the previous block"}
-        if not blk["server_recomputes"]:
-            recompute_ok = False
-            if first_break is None:
-                first_break = {"block_index": blk["block_index"], "position": pos,
-                               "problem": "stored payload does not recompute to audit_hash"}
-        prev_hash = blk["audit_hash"]
-
-    result = {
-        "blocks": len(rows),
-        "first_block_index": rows[0][0] if rows else None,
-        "last_block_index": rows[-1][0] if rows else None,
-        "genesis_hash": rows[0][6] if rows else None,
-        "genesis_prev_is_GENESIS": (rows[0][5] == GENESIS_PREV) if rows else None,
-        "tip": rows[-1][6] if rows else None,
-        "links_ok": links_ok,
-        "recompute_ok": recompute_ok,
-        "first_break": first_break,
-        "public_blocks": public_count,
-        "withheld_blocks": withheld,
-    }
-    if hidden_prefixes:
-        print("WALK not_on_public_list prefixes: " +
-              json.dumps(hidden_prefixes, sort_keys=True), flush=True)
-    with _cache_lock:
-        _cache["key"] = key
-        _cache["result"] = result
-    return result
-
-
-# ---------------------------------------------------------------- routes
-
-def _spec():
-    return {
-        "module": "walk",
-        "version": VERSION,
-        "purpose": "Every block of the chain, genesis to tip, in write order, "
-                   "public, so the whole chain can be walked from outside.",
-        "routes": {
-            "status": BASE + "status",
-            "genesis": BASE + "genesis",
-            "blocks": BASE + "blocks?after=0&limit=" + str(DEFAULT_LIMIT),
-            "block": BASE + "block?index=1",
-            "verify": BASE + "verify",
-            "spec": BASE + "spec",
-        },
-        "paging": "blocks?after=<block_index>&limit=<1-" + str(MAX_LIMIT) + ">. "
-                  "Start with after=0. Each page gives previous_audit_hash (the "
-                  "hash of the block just before the page) and next_after for "
-                  "the next call. has_more false means you have reached the tip.",
-        "seal_formula": "audit_hash = sha256(json.dumps({\"prev_hash\": prev, "
-                        "\"ts\": ts, \"event\": event, \"result\": result}, "
-                        "sort_keys=True)). First block prev = \"GENESIS\".",
-        "verify_steps": [
-            "sha256(utf8(preimage)) must equal audit_hash",
-            "json-parse preimage; its prev_hash must equal the previous block's audit_hash",
-            "the first block's prev_hash must be the literal string GENESIS",
-            "for withheld blocks, check prev_hash equals the previous audit_hash (linkage only)",
-        ],
-        "fields": {
-            "block_index": "the database id - the number receipts quote as block_index",
-            "position": "zero-based order in the chain. This is the leaf index in "
-                        "the RFC 6962 tree at " + HOST + "/x/consistency/root. "
-                        "block_index and position are different numbers; do not mix them",
-            "preimage": "the exact string that was hashed (public blocks only)",
-            "server_recomputes": "our own server's check that the stored row hashes "
-                                 "to audit_hash. Our word, not proof - recompute it yourself",
-            "withheld_reason": "customer_key | not_on_public_list | sensitive_field | unparseable",
-        },
-        "withholding": "Blocks sealed under a customer API key (any key not owned by the operator), blocks from sources "
-                       "not on the public list, and payloads carrying anything that "
-                       "looks like a secret are served without payload. Linkage stays "
-                       "checkable; the hash is recomputable only by whoever holds the "
-                       "original event.",
-        "public_sources": list(PUBLIC_PREFIXES),
-        "reset": RESET_NOTE,
-        "what_this_proves": WHAT_THIS_PROVES,
-    }
-
-
-def _status(ctx):
-    w = _full_walk(ctx)
-    out = {
-        "module": "walk",
-        "version": VERSION,
-        "blocks": w["blocks"],
-        "first_block_index": w["first_block_index"],
-        "last_block_index": w["last_block_index"],
-        "genesis_hash": w["genesis_hash"],
-        "tip": w["tip"],
-        "public_blocks": w["public_blocks"],
-        "withheld_blocks": w["withheld_blocks"],
-        "start_here": BASE + "blocks?after=0&limit=" + str(DEFAULT_LIMIT),
-        "reset": RESET_NOTE,
-        "what_this_proves": WHAT_THIS_PROVES,
-    }
-    return out
-
-
-def _genesis(ctx):
-    conn, lock = ctx["conn"], ctx["lock"]
-    with lock:
-        row = conn.execute(_select(conn) + " ORDER BY id ASC LIMIT 1").fetchone()
-        ckeys = _customer_keys(conn)
-    if not row:
-        return {"error": "empty_chain"}, 404
-    blk, _, _ = _block(row, 0, ckeys)
-    return {
-        "genesis": blk,
-        "prev_is_GENESIS": row[5] == GENESIS_PREV,
-        "reset": RESET_NOTE,
-        "next": BASE + "blocks?after=" + str(row[0]) + "&limit=" + str(DEFAULT_LIMIT),
-    }, 200
-
-
-def _blocks(data, ctx):
-    after = _int(_q(data, "after", 0), 0, 0, 10 ** 12)
-    limit = _int(_q(data, "limit", DEFAULT_LIMIT), DEFAULT_LIMIT, 1, MAX_LIMIT)
-    conn, lock = ctx["conn"], ctx["lock"]
-    with lock:
-        rows = conn.execute(_select(conn) + " WHERE id > ? ORDER BY id ASC LIMIT ?",
-                            (after, limit + 1)).fetchall()
-        if rows:
-            base = _position_of(conn, rows[0][0])
-            prev_hash = _hash_before(conn, rows[0][0])
-        else:
-            base, prev_hash = None, None
-        ckeys = _customer_keys(conn)
-    has_more = len(rows) > limit
-    rows = rows[:limit]
-    out_blocks = []
-    for i, row in enumerate(rows):
-        blk, _, _ = _block(row, base + i, ckeys)
-        out_blocks.append(blk)
-    out = {
-        "after": after,
-        "count": len(out_blocks),
-        "previous_audit_hash": prev_hash,
-        "blocks": out_blocks,
-        "has_more": has_more,
-    }
-    if out_blocks:
-        last = out_blocks[-1]["block_index"]
-        out["next_after"] = last
-        if has_more:
-            out["next"] = BASE + "blocks?after=" + str(last) + "&limit=" + str(limit)
-    return out, 200
-
-
-def _one(data, ctx):
-    idx = _int(_q(data, "index"), None, 0, 10 ** 12)
-    if idx is None:
-        return {"error": "index_required", "example": BASE + "block?index=1"}, 400
-    conn, lock = ctx["conn"], ctx["lock"]
-    with lock:
-        row = conn.execute(_select(conn) + " WHERE id = ?", (idx,)).fetchone()
-        if not row:
-            return {"error": "not_on_this_chain", "block_index": idx,
-                    "reset": RESET_NOTE}, 404
-        pos = _position_of(conn, idx)
-        prev_hash = _hash_before(conn, idx)
-        ckeys = _customer_keys(conn)
-    blk, _, _ = _block(row, pos, ckeys)
-    return {
-        "block": blk,
-        "previous_audit_hash": prev_hash,
-        "link_ok": blk["prev_hash"] == prev_hash,
-        "reset": RESET_NOTE,
-    }, 200
-
-
-def _verify(ctx):
-    w = _full_walk(ctx)
-    out = dict(w)
-    out["valid"] = bool(w["blocks"]) and w["links_ok"] and w["recompute_ok"] \
-        and bool(w["genesis_prev_is_GENESIS"])
-    out["note"] = ("This is our server checking itself. It is a convenience, "
-                   "not evidence. Walk " + BASE + "blocks?after=0 and do the "
-                   "arithmetic yourself.")
-    return out
-
-
-# ---------------------------------------------------------------- entry
-
-def handle(method, action, data, api_key, ctx):
-    try:
-        if method == "GET":
-            if action == "spec":
-                return _spec(), 200
-            if action == "status":
-                return _status(ctx), 200
-            if action == "genesis":
-                return _genesis(ctx)
-            if action == "blocks":
-                return _blocks(data, ctx)
-            if action == "block":
-                return _one(data, ctx)
-            if action == "verify":
-                return _verify(ctx), 200
-        return {
-            "error": "unknown_action",
-            "get": sorted(a for m, a in PUBLIC if m == "GET"),
-            "post": [],
-            "spec": BASE + "spec",
-        }, 404
-    except Exception as e:
-        return {"error": "walk_failed", "detail": str(e)[:300]}, 500
 
 ```
