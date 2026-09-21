@@ -1,2216 +1,2406 @@
-# Codebase — part 12 of 34
+# Codebase — part 12 of 36
 
 Contains:
-- `modules/register.py`
-- `modules/replay.py`
+- `modules/peer.py`
+- `modules/peerconsole.py`
+- `modules/praxis.py`
 
 
-## `modules/register.py`
+## `modules/peer.py`
 
-1517 lines, 61178 bytes
+1303 lines, 58656 bytes
 
 ```python
 """
-modules/register.py  v1.0.0  —  The Safe AI Registry
+modules/peer.py  v1.4.0  --  signed peer submission (shared secret)
 
-What makes this different from every other registry, trust mark and
-certification list:
+WHAT CHANGED IN 1.2.1 -- THE ACTUAL FAULT
+    Every seal from this module had always failed, from the day it was
+    written. Not intermittently. Every call, every action.
 
-  Ordinary registries are mutable databases. The operator can insert an
-  entry, back-date it, quietly delist someone, or revoke a seal and leave
-  no trace. You must trust the registrar absolutely.
+    server.py's seal() writes the row with event["user_id"] -- a direct key
+    lookup, not a .get(). This module's events never carried a user_id, so
+    the insert raised KeyError every time. witness.py passes
+    "user_id": "wit:<peer>" and seals fine, which is why the hourly witness
+    traffic worked either side of a peer submission that did not.
 
-  This one publishes proofs about its own behaviour:
+    Found by comparing the two modules' event shapes against seal() after
+    four consecutive failures from praesidium / PRAXIS on 2026-08-26. The
+    1.2 change is what made it findable: before that the KeyError was
+    swallowed and reported as a successful receipt.
 
-    * ABSENCE   — prove a domain was NOT listed on a given date.
-                  Not "we have no record": a sorted-tree proof showing two
-                  adjacent leaves with consecutive indices, so nothing can
-                  sit between them.
+    Every event this module seals now carries "user_id": "peer:<peer_id>",
+    following the same convention witness.py uses.
 
-    * APPEND-ONLY — RFC 6962 consistency proof that the register at any
-                  past size is a prefix of the register now. A back-dated
-                  listing is arithmetically impossible to hide, and the
-                  proof verifies with any standard Certificate Transparency
-                  verifier, not one of ours.
+    Note what this means for history: peer registrations before this version
+    were never sealed either. The credential exists in peer_registry and
+    works, but there is no audit block for it. That gap is real and is not
+    retro-fillable -- sealing it now would date it now.
 
-    * REVOCATION — a delisted entry does not vanish. The revocation is
-                  sealed and the history stays readable. "Listed from D1,
-                  revoked D2, reason R" is permanent.
+WHAT CHANGED IN 1.2
+    A failed seal no longer returns success.
 
-  The registrar is auditable against the registrar. That is the product.
+    In 1.1 the call into the audit chain was wrapped in a bare exception
+    handler that swallowed anything it threw. If sealing failed, the peer
+    still got ok=true and accepted=true, with audit_hash, block_index and
+    receipt_seq all null. The submission was counted in the registry and
+    stored, but nothing entered the chain. From the peer's side it looked
+    like a receipt. It was not one.
 
-CONSENT
-  No domain is ever listed because the operator typed it in. A domain
-  lists itself by proving it controls the domain:
+    That happened in the wild on 2026-08-26 to the first external peer to
+    use this route (praesidium / PRAXIS). Found by checking the chain for
+    a block at the submission timestamp and finding none. The peer's own
+    verifier had already refused the receipt, which is the only reason it
+    surfaced at all.
 
-    1. POST /x/register/challenge {"domain": "example.com"}
-         -> returns a one-time token, sealed.
-    2. The domain serves that token at
-         https://example.com/.well-known/aileash-register.txt
-       (or puts a `Register-Token:` line in its ai.txt).
-    3. POST /x/register/claim {"domain": "example.com"}
-         -> we fetch, verify the token, run the checks, seal the result
-            and list it.
+    Now: if the seal throws, or returns without an audit hash, submit
+    returns 500 and says so. Nothing is recorded, the nonce stays unused,
+    and the peer can resend the identical envelope once the underlying
+    fault is fixed. The exception text is returned so the peer can tell
+    the operator what actually broke.
 
-  Peers on the witness network are not auto-listed. A listing they
-  claimed themselves is better evidence than one we granted them.
+    The three operator routes (register, rotate, suspend/resume) seal an
+    audit note as a side effect. A failure there does not undo the
+    operation, but it is no longer hidden: the response carries
+    sealed=false and the exception text.
 
-VOCABULARY  (deliberately not "compliant", "covered" or "certified")
-    unverified    claimed, checks not yet run
-    checks-passed every check in the suite returned pass, on the date shown
-    checks-failed at least one check did not pass
-    stale         last successful check is older than STALE_AFTER_DAYS
-    withdrawn     the domain asked to be removed
-    revoked       the operator removed it; reason sealed
+    Also in 1.2: the stored copy of the response is now written after any
+    rotation warning is added, so the stored body is byte-identical to
+    what the peer received. Peers that hash the response to prove they
+    received it need that to hold.
 
-Module contract:
-    handle(method, action, data, api_key, ctx) -> (dict, status)
-    PUBLIC is a set of (METHOD, action) tuples
-    ctx exposes conn, lock, seal
-    every sealed event carries a user_id
-    no seal is wrapped in a bare except
+READ THIS FIRST: WHAT THIS LANE BINDS, AND WHAT IT DOES NOT
+    This lane authenticates with HMAC-SHA256 over a shared secret.
+
+    A shared secret is held by BOTH parties. So a valid signature proves
+    the submission came from someone holding that secret -- which is the
+    peer, and also the operator of this deployment.
+
+        It closes third-party submission under your name.
+        It does NOT close operator submission under your name.
+
+    That is a normal property of HMAC and not a defect. It is stated here,
+    at the top, because "signed" reads stronger than it is, and a peer
+    choosing between lanes should not have to work that out for
+    themselves. Raised by Ishaan (Shango MID), who was right.
+
+    If you need the operator excluded as well, use /x/signed/submit
+    instead. There you generate an Ed25519 keypair, keep the private half,
+    and this deployment holds only the public half -- so it can verify a
+    signature and can never produce one. That property is arithmetic
+    rather than a promise about our conduct.
+
+    Both lanes stay open. This one is simpler to implement and costs the
+    peer no key custody, which is a real advantage if a long-lived private
+    key is a liability you would rather not carry. The other is stronger.
+    Pick deliberately.
+
+WHY THIS EXISTS
+    /x/witness/observe is unauthenticated on purpose. Anyone can submit a
+    tip without an account, and that openness is what answers the
+    collusion objection -- nobody has to trust us to audit the network.
+
+    The cost of that openness is that anyone can submit a tip under any
+    name. Name binding catches most of it; it does not prevent it.
+
+    A named peer exchanging period roots wants a stronger guarantee than
+    the open endpoint gives. This module provides one WITHOUT changing the
+    open endpoint. All three run side by side.
+
+WHAT IT COVERS
+    canonicalization, HMAC-SHA256 signing, nonce, replay window, clock
+    skew, idempotency, retry semantics, suspension, key rotation with
+    overlap, and honest reporting of seal failure.
+
+AUTH LIVES IN THE BODY, NOT IN HEADERS
+    The module router hands modules a parsed body, not the raw headers,
+    so every authentication field travels in the JSON body. This also
+    makes the scheme trivial to implement from any language and easy to
+    replay in a test.
+
+THE SCHEME, IN FULL
+    Envelope:
+        {
+          "peer_id":         "prae-001",
+          "ts":              1755432000,          integer unix seconds
+          "nonce":           "<>=16 chars, unique per peer>",
+          "idempotency_key": "<optional, <=128 chars>",
+          "payload":         { ... the thing being submitted ... },
+          "signature":       "<hex hmac-sha256>"
+        }
+
+    THOSE FIELDS AND NO OTHERS. The server rebuilds the envelope from the
+    known field names before checking the signature, so any extra
+    top-level field you signed will not be part of what we verify and the
+    signature will not match. Put anything of your own inside payload.
+    This trips people up and now it is written down.
+
+    String to sign:
+        "AILEASH-PEER-v1\\n" + canonical(envelope_without_signature)
+
+    canonical() is exactly:
+        json.dumps(obj, sort_keys=True, separators=(",",":"),
+                   ensure_ascii=True)
+
+    signature = hmac_sha256(secret, string_to_sign).hexdigest()
+
+    POST /x/peer/canonical returns the exact string to sign for a given
+    envelope, so an implementer can debug canonicalization without
+    holding or revealing a secret.
+
+WHAT COMES BACK ON ACCEPTANCE
+    The full response shape, so a peer can pin a schema to it:
+
+        ok                true
+        accepted          true
+        peer_id           string
+        chain_name        string
+        payload_digest    sha256 hex of canonical(payload)
+        signed_with       "current" or "previous"
+        auth              "hmac-shared-secret"
+        auth_scope        the paragraph at the top of this file
+        received_at       ISO 8601 Z, server clock at acceptance
+        receipt           { audit_hash, block_index, receipt_seq }
+        verify            { inclusion, ancestry, append_only }
+        warning           present only when signed_with is "previous"
+        replayed          present only on an idempotent retry
+        note              present only on an idempotent retry
+
+    received_at is TOP LEVEL. It is a sibling of receipt, not a member
+    of it. The receipt object contains exactly three fields. This is
+    spelled out because pinning a schema against the wrong nesting is an
+    easy mistake to make and the earlier spec did not say where the field
+    lived.
+
+    received_at is this server's clock at the moment of acceptance. It is
+    not evidence of when anything happened. The audit_hash is.
+
+RULES
+    clock skew      +/- 300s. Outside that: 401 clock_skew.
+    nonce           unique per peer for 900s. Reused: 409 replay.
+    idempotency     same key + same payload digest returns the FIRST
+                    response verbatim, sealed once. Same key + different
+                    payload: 409 idempotency_conflict.
+    retry           safe. Retry the identical envelope; idempotency makes
+                    it a no-op that returns the original receipt.
+    suspension      403 peer_suspended. Submissions refused, nothing
+                    deleted, the peer's history stands.
+    rotation        two secrets live at once. A new secret is issued and
+                    the previous one stays valid for ROTATION_OVERLAP
+                    (default 24h) so a peer can roll without downtime.
+
+                    Note the asymmetry with the other lane: here the
+                    OPERATOR issues and rotates the secret, because the
+                    operator holds it too. At /x/signed/rotate the peer
+                    rotates their own key and the operator cannot, because
+                    a rotation must be signed by the key being replaced.
+
+    seal failure    500 seal_failed or 500 seal_incomplete. Nothing is
+                    recorded and no receipt is issued. A receipt that
+                    cannot be verified is worse than no receipt, so this
+                    lane refuses to issue one.
+
+ROUTES
+    GET  spec       public   full implementation guide
+    POST canonical  public   the exact string to sign. no secret needed.
+    GET  peers      public   peer ids, status, rotation state. no secrets.
+    POST submit     public route, SIGNATURE authenticated
+    POST register   keyed    operator issues a peer credential
+    POST rotate     keyed    issue a new secret, overlap the old
+    POST suspend    keyed
+    POST resume     keyed
+    GET  history    keyed    submissions by peer, with stored response
+
+TABLES OWNED
+    peer_registry, peer_nonce, peer_submission
 """
 
 import hashlib
-import ipaddress
+import hmac
 import json
 import os
 import re
-import secrets
-import socket
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
-from datetime import datetime, timezone
 
-VERSION = "1.2.0"
-SUITE_VERSION = "oaas-checks-1"
-
-# ---------------------------------------------------------------- constants
-
-STALE_AFTER_DAYS = 90
-CHALLENGE_TTL_SECONDS = 86400
-MAX_FETCH_BYTES = 512 * 1024
-FETCH_TIMEOUT = 8
-WELL_KNOWN_PATH = "/.well-known/aileash-register.txt"
-AI_TXT_PATHS = ["/.well-known/ai.txt", "/ai.txt"]
-AI_TXT_PATH = AI_TXT_PATHS[0]   # the one quoted in guidance
-FIELD_ALIASES = {
-    "chain_tip_url": ["chain-tip-url", "chain-head", "witness-tip", "chain-anchor"],
-    "verifier": ["verifier", "verify-chain", "consistency-proof", "self-check"],
-    "contact": ["contact", "security-contact"],
-}
-
-DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
-
-STATUS_UNVERIFIED = "unverified"
-STATUS_PASSED = "checks-passed"
-STATUS_FAILED = "checks-failed"
-STATUS_STALE = "stale"
-STATUS_WITHDRAWN = "withdrawn"
-STATUS_REVOKED = "revoked"
-
-LIVE_STATUSES = (STATUS_UNVERIFIED, STATUS_PASSED, STATUS_FAILED, STATUS_STALE)
-
-# Domain-separation prefixes. Two different trees answer two different
-# questions and their roots deliberately never match.
-LEAF_PREFIX = b"\x00"          # RFC 6962 ordered tree, over events
-NODE_PREFIX = b"\x01"
-SORTED_LEAF = b"AILEASH-REGISTER-LEAF-v1\x00"    # sorted tree, over domains
-SORTED_NODE = b"AILEASH-REGISTER-NODE-v1\x00"
-
-VOCABULARY = {
-    STATUS_UNVERIFIED: "The domain proved control and is listed. The check suite has not been run against it yet.",
-    STATUS_PASSED: "Every check in suite %s returned pass on the date shown. This describes what the checks observed on that date and nothing else." % SUITE_VERSION,
-    STATUS_FAILED: "At least one check did not pass. The failing check names are published.",
-    STATUS_STALE: "The last successful check is more than %d days old. Nothing was withdrawn; the evidence simply aged." % STALE_AFTER_DAYS,
-    STATUS_WITHDRAWN: "The domain asked to be removed. The listing history remains readable.",
-    STATUS_REVOKED: "The operator removed the listing. The reason is sealed alongside it and the history remains readable.",
-}
-
-WHAT_THIS_IS_NOT = [
-    "Not a certification. Nobody has been certified by anyone.",
-    "Not a statement that any law applies to a listed domain, or that a listed domain satisfies it. Whether a regulation applies to an organisation is a question for that organisation's own advisers.",
-    "Not an audit. No third party has audited this registry or any domain on it.",
-    "Not a claim about anything a domain did not seal. A check observes what is served at a URL at a moment in time.",
-]
-
-MESSAGES = {
-    "domain_required": "domain is required",
-    "bad_domain": "domain must be a bare hostname, e.g. example.com — no scheme, no path",
-    "no_challenge": "no live challenge for this domain. POST /x/register/challenge first.",
-    "challenge_expired": "challenge expired. Request a new one.",
-    "token_not_found": "the token was not served at either location",
-    "not_listed": "this domain has no entry in the register",
-    "already_final": "this entry is withdrawn or revoked and cannot be changed",
-    "no_checkpoint": "no checkpoint has been sealed at or before that time",
-    "seal_failed": "the register could not seal this event, so nothing was written. Retry.",
-}
+VERSION = "1.4.0"
 
 PUBLIC = {
     ("GET", "spec"),
-    ("GET", "list"),
-    ("GET", "entry"),
-    ("GET", "history"),
-    ("GET", "absence"),
-    ("GET", "consistency"),
-    ("GET", "inclusion"),
-    ("GET", "checkpoints"),
-    ("GET", "roots"),
-    ("GET", "sealcheck"),
-    ("GET", "tokens"),
-    ("GET", "vocabulary"),
-    ("POST", "challenge"),
-    ("POST", "claim"),
-    ("POST", "recheck"),
-    ("POST", "withdraw"),
+    ("GET", "schema"),
+    ("POST", "canonical"),
+    ("GET", "peers"),
+    ("POST", "submit"),
 }
 
+SIGN_PREFIX = "AILEASH-PEER-v1\n"
 
-# ---------------------------------------------------------------- utilities
+CLOCK_SKEW_SECONDS = 300
+NONCE_TTL_SECONDS = 900
+NONCE_MIN_LENGTH = 16
+ROTATION_OVERLAP_SECONDS = 86400
+MAX_PAYLOAD_BYTES = 65536
+MAX_IDEMPOTENCY_KEY = 128
+
+# The one paragraph that must appear anywhere this lane describes itself.
+# Kept as a constant so it cannot drift between the spec route, the
+# register response and the peers listing.
+SHARED_SECRET_SCOPE = (
+    "This lane authenticates with a shared secret, held by both the peer "
+    "and the operator of this deployment. A valid signature proves the "
+    "submission came from a holder of that secret. It closes third-party "
+    "submission under your name and it does not close operator submission "
+    "under your name. That is a normal property of HMAC, stated rather "
+    "than implied. For a lane where the operator is excluded too, use "
+    "/x/signed/submit - you keep the private key and we hold only the "
+    "public half, so we can verify a signature and can never produce one."
+)
+
+_PEER_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,62}$")
+
+_ready = False
+
+
+# ---------------------------------------------------------------- storage
+
+def _setup(ctx):
+    global _ready
+    if _ready:
+        return
+    conn = ctx["conn"]
+    with ctx["lock"]:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS peer_registry (
+                peer_id          TEXT PRIMARY KEY,
+                chain_name       TEXT,
+                url              TEXT,
+                secret_current   TEXT,
+                secret_previous  TEXT,
+                rotated_at       REAL,
+                status           TEXT DEFAULT 'active',
+                created          REAL,
+                submissions      INTEGER DEFAULT 0,
+                last_seen        REAL,
+                seq              INTEGER DEFAULT 0
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS peer_nonce (
+                peer_id   TEXT,
+                nonce     TEXT,
+                seen_at   REAL,
+                PRIMARY KEY (peer_id, nonce)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS peer_submission (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                peer_id          TEXT,
+                ts               REAL,
+                idempotency_key  TEXT,
+                payload_digest   TEXT,
+                response_json    TEXT,
+                audit_hash       TEXT
+            )
+        """)
+        # Added in 1.3.0. Existing rows get NULL, read as 0 by
+        # COALESCE, so the first submission after upgrading is seq 1.
+        have = set()
+        try:
+            for r in conn.execute("PRAGMA table_info(peer_registry)").fetchall():
+                have.add(r[1])
+        except Exception:
+            pass
+        if "seq" not in have:
+            try:
+                conn.execute("ALTER TABLE peer_registry ADD COLUMN seq INTEGER DEFAULT 0")
+            except Exception:
+                pass
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_peer_sub_idem "
+            "ON peer_submission(peer_id, idempotency_key)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_peer_nonce_time "
+            "ON peer_nonce(seen_at)")
+        conn.commit()
+    _ready = True
+
+
+# ------------------------------------------------------------ primitives
+
+def canonical(obj):
+    """
+    THE canonicalization. Any implementation in any language must produce
+    this byte-for-byte. Sorted keys, no whitespace, ASCII-escaped.
+    """
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=True)
+
+
+def string_to_sign(envelope):
+    """Envelope WITHOUT the signature field, prefixed and canonicalized."""
+    unsigned = {k: v for k, v in envelope.items() if k != "signature"}
+    return SIGN_PREFIX + canonical(unsigned)
+
+
+def sign(secret, envelope):
+    return hmac.new(secret.encode("utf-8"),
+                    string_to_sign(envelope).encode("utf-8"),
+                    hashlib.sha256).hexdigest()
+
+
+def _digest(payload):
+    return hashlib.sha256(canonical(payload).encode("utf-8")).hexdigest()
+
+
+def _new_secret():
+    return os.urandom(32).hex()
+
 
 def _now():
     return time.time()
 
 
 def _iso(ts):
-    return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def _parse_when(s):
-    """Accept an ISO date, an ISO datetime or an epoch. Return epoch seconds."""
-    if s is None or s == "":
-        return None
-    s = str(s).strip()
     try:
-        return float(s)
-    except (TypeError, ValueError):
-        pass
-    t = s.replace("Z", "+00:00")
-    for fmt in (None, "%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S%z"):
-        try:
-            if fmt is None:
-                d = datetime.fromisoformat(t)
-            else:
-                d = datetime.strptime(t, fmt)
-            if d.tzinfo is None:
-                d = d.replace(tzinfo=timezone.utc)
-            return d.timestamp()
-        except (TypeError, ValueError):
-            continue
-    return None
-
-
-def _canon(obj):
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
-
-
-def _sha(b):
-    return hashlib.sha256(b).hexdigest()
-
-
-def _clean_domain(raw):
-    if not raw:
-        return None
-    d = str(raw).strip().lower()
-    if "://" in d:
-        d = urllib.parse.urlsplit(d).netloc or d
-    d = d.split("/")[0].split("?")[0].split("#")[0]
-    if d.startswith("www."):
-        d = d[4:]
-    if "@" in d or ":" in d:
-        return None
-    if not DOMAIN_RE.match(d):
-        return None
-    return d
-
-
-# ------------------------------------------------------------------- fetch
-# Same posture as witness.py: http/https only, ports 80/443, resolve first,
-# reject non-public addresses, no redirects, hard timeout, size cap.
-
-def _is_public_addr(host):
-    try:
-        infos = socket.getaddrinfo(host, None)
-    except OSError as e:
-        return False, "dns_failed: %s" % e
-    if not infos:
-        return False, "dns_empty"
-    for info in infos:
-        addr = info[4][0]
-        try:
-            ip = ipaddress.ip_address(addr)
-        except ValueError:
-            return False, "unparseable_address"
-        if (ip.is_private or ip.is_loopback or ip.is_link_local
-                or ip.is_multicast or ip.is_reserved or ip.is_unspecified):
-            return False, "non_public_address"
-    return True, None
-
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-
-def _fetch(url):
-    """Return (ok, body_text_or_none, note_dict)."""
-    parts = urllib.parse.urlsplit(url)
-    note = {"url": url, "fetched_at": _iso(_now())}
-    if parts.scheme not in ("http", "https"):
-        note["error"] = "scheme_not_allowed"
-        return False, None, note
-    if parts.port not in (None, 80, 443):
-        note["error"] = "port_not_allowed"
-        return False, None, note
-    host = parts.hostname
-    if not host:
-        note["error"] = "no_host"
-        return False, None, note
-    ok, why = _is_public_addr(host)
-    if not ok:
-        note["error"] = why
-        return False, None, note
-
-    opener = urllib.request.build_opener(_NoRedirect)
-    req = urllib.request.Request(url, headers={
-        "User-Agent": "AILeash-Register/%s (+https://sebbi.pro/x/register/spec)" % VERSION,
-        "Accept": "text/plain, application/json, */*",
-    })
-    started = time.time()
-    try:
-        with opener.open(req, timeout=FETCH_TIMEOUT) as resp:
-            note["http_status"] = resp.getcode()
-            raw = resp.read(MAX_FETCH_BYTES + 1)
-    except urllib.error.HTTPError as e:
-        note["http_status"] = e.code
-        note["error"] = "http_%s" % e.code
-        note["took_ms"] = int((time.time() - started) * 1000)
-        return False, None, note
-    except Exception as e:
-        note["error"] = "fetch_failed: %s" % type(e).__name__
-        note["took_ms"] = int((time.time() - started) * 1000)
-        return False, None, note
-
-    note["took_ms"] = int((time.time() - started) * 1000)
-    if len(raw) > MAX_FETCH_BYTES:
-        note["error"] = "too_large"
-        return False, None, note
-    note["bytes"] = len(raw)
-    note["body_sha256"] = _sha(raw)
-    try:
-        text = raw.decode("utf-8", "replace")
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(ts)))
     except Exception:
-        note["error"] = "undecodable"
-        return False, None, note
-    return True, text, note
-
-
-# ------------------------------------------------------------------ merkle
-
-def _ct_leaf(data_bytes):
-    return hashlib.sha256(LEAF_PREFIX + data_bytes).digest()
-
-
-def _ct_node(l, r):
-    return hashlib.sha256(NODE_PREFIX + l + r).digest()
-
-
-def _ct_root(leaves):
-    """RFC 6962 root over an ordered list of leaf digests (bytes)."""
-    if not leaves:
-        return hashlib.sha256(b"").digest()
-    if len(leaves) == 1:
-        return leaves[0]
-    k = 1
-    while k * 2 < len(leaves):
-        k *= 2
-    return _ct_node(_ct_root(leaves[:k]), _ct_root(leaves[k:]))
-
-
-def _ct_inclusion(leaves, index):
-    """RFC 6962 inclusion proof for leaves[index]. Returns list of hex."""
-    def walk(sub, i):
-        if len(sub) <= 1:
-            return []
-        k = 1
-        while k * 2 < len(sub):
-            k *= 2
-        if i < k:
-            return walk(sub[:k], i) + [_ct_root(sub[k:])]
-        return walk(sub[k:], i - k) + [_ct_root(sub[:k])]
-    return [h.hex() for h in walk(leaves, index)]
-
-
-def _ct_consistency(leaves, m):
-    """RFC 6962 consistency proof between size m and size len(leaves)."""
-    n = len(leaves)
-    if m <= 0 or m > n:
         return None
 
-    def subproof(m_, sub, is_complete):
-        if m_ == len(sub):
-            return [] if is_complete else [_ct_root(sub)]
-        k = 1
-        while k * 2 < len(sub):
-            k *= 2
-        if m_ <= k:
-            return subproof(m_, sub[:k], is_complete) + [_ct_root(sub[k:])]
-        return subproof(m_ - k, sub[k:], False) + [_ct_root(sub[:k])]
 
-    return [h.hex() for h in subproof(m, leaves, True)]
-
-
-def _sorted_leaf(value):
-    return hashlib.sha256(SORTED_LEAF + value.encode("utf-8")).digest()
-
-
-def _sorted_root(leaves):
-    """Sorted tree. Odd nodes are promoted, never self-paired."""
-    if not leaves:
-        return hashlib.sha256(SORTED_LEAF + b"EMPTY").digest()
-    level = list(leaves)
-    while len(level) > 1:
-        nxt = []
-        i = 0
-        while i + 1 < len(level):
-            nxt.append(hashlib.sha256(SORTED_NODE + level[i] + level[i + 1]).digest())
-            i += 2
-        if i < len(level):
-            nxt.append(level[i])
-        level = nxt
-    return level[0]
-
-
-def _sorted_path(leaves, index):
-    """Audit path in the promoted-odd sorted tree."""
-    path = []
-    level = list(leaves)
-    idx = index
-    while len(level) > 1:
-        nxt = []
-        i = 0
-        new_idx = idx
-        while i + 1 < len(level):
-            pair = (level[i], level[i + 1])
-            if idx == i:
-                path.append({"side": "right", "hash": pair[1].hex()})
-                new_idx = len(nxt)
-            elif idx == i + 1:
-                path.append({"side": "left", "hash": pair[0].hex()})
-                new_idx = len(nxt)
-            nxt.append(hashlib.sha256(SORTED_NODE + pair[0] + pair[1]).digest())
-            i += 2
-        if i < len(level):
-            if idx == i:
-                new_idx = len(nxt)
-            nxt.append(level[i])
-        level = nxt
-        idx = new_idx
-    return path
-
-
-# ------------------------------------------------------------------ schema
-
-def _ensure(ctx):
-    conn = ctx["conn"]
-    with ctx["lock"]:
-        c = conn.cursor()
-        c.execute("""CREATE TABLE IF NOT EXISTS register_entry (
-            domain        TEXT PRIMARY KEY,
-            status        TEXT NOT NULL,
-            first_listed  REAL NOT NULL,
-            last_event    REAL NOT NULL,
-            last_checked  REAL,
-            last_pass     REAL,
-            checks_json   TEXT,
-            contact       TEXT,
-            claim_method  TEXT,
-            reason        TEXT
-        )""")
-        c.execute("""CREATE TABLE IF NOT EXISTS register_event (
-            seq        INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts         REAL NOT NULL,
-            domain     TEXT NOT NULL,
-            kind       TEXT NOT NULL,
-            detail     TEXT NOT NULL,
-            leaf_hex   TEXT NOT NULL,
-            audit_hash TEXT
-        )""")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_register_event_domain ON register_event(domain, seq)")
-        c.execute("""CREATE TABLE IF NOT EXISTS register_checkpoint (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts            REAL NOT NULL,
-            tree_size     INTEGER NOT NULL,
-            event_root    TEXT NOT NULL,
-            domain_root   TEXT NOT NULL,
-            domain_count  INTEGER NOT NULL,
-            domains_json  TEXT NOT NULL,
-            audit_hash    TEXT
-        )""")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_register_checkpoint_ts ON register_checkpoint(ts)")
-        c.execute("""CREATE TABLE IF NOT EXISTS register_challenge (
-            domain  TEXT PRIMARY KEY,
-            token   TEXT NOT NULL,
-            issued  REAL NOT NULL
-        )""")
-        # v1.1: every issued token stays valid until it expires, so asking
-        # for a new one never invalidates the one already published.
-        c.execute("""CREATE TABLE IF NOT EXISTS register_token (
-            token   TEXT PRIMARY KEY,
-            domain  TEXT NOT NULL,
-            issued  REAL NOT NULL
-        )""")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_register_token_domain ON register_token(domain, issued)")
-        conn.commit()
-
-
-def _event_leaves(ctx):
-    """Ordered list of leaf digests for the whole event log."""
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT leaf_hex FROM register_event ORDER BY seq ASC").fetchall()
-    return [bytes.fromhex(r[0]) for r in rows]
-
-
-def _live_domains(ctx):
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT domain FROM register_entry WHERE status IN (?,?,?,?)",
-            LIVE_STATUSES).fetchall()
-    return sorted(r[0] for r in rows)
-
-
-def _extract_hash(result):
-    """server.py's seal has returned different shapes over time. Accept them all."""
-    if result is None:
-        return None
-    if isinstance(result, str):
-        return result or None
-    if isinstance(result, dict):
-        for k in ("audit_hash", "hash", "audit", "block_hash", "sealed_hash"):
-            v = result.get(k)
-            if isinstance(v, str) and v:
-                return v
-        return None
-    if isinstance(result, (tuple, list)):
-        for item in result:
-            h = _extract_hash(item)
-            if h:
-                return h
-    return None
-
-
-def _do_seal(ctx, event, result=None):
-    """Call ctx['seal'] with the ONE correct signature and exactly once.
-
-    This is the signature witness.py uses and that is proven against this
-    server: seal(event, result, ts, api_key), returning (audit_hash,
-    block_index, seq).
-
-    WHY THIS WAS REWRITTEN (v1.2.0 -> safe):
-    The previous version tried four different argument shapes in a loop. seal
-    WRITES a block to the chain as a side effect. A shape that partially
-    succeeded — wrote a block but returned something _extract_hash could not
-    read — would fall through and the loop would call seal AGAIN, writing a
-    SECOND block. Two blocks for one logical event, or a written-then-retried
-    call, breaks the chain's prev-hash linkage. That is the fault that broke
-    the chain. This calls seal once, the correct way, and never retries a call
-    that may already have written.
+def _describe_exception(exc):
     """
-    seal = ctx["seal"]
-    ts = _now()
-    if result is None:
-        result = event.get("kind") or event.get("type") or "register"
-    if not isinstance(result, str):
-        result = _canon(result)
-
-    # Register events are not tied to a customer key. A stable module key
-    # partitions them the way witness.py partitions anonymous observations.
-    api_key = "register"
-
-    out = seal(event, result, ts, api_key)
-
-    h = _extract_hash(out)
-    if h:
-        return h
-    if isinstance(out, (tuple, list)) and out and isinstance(out[0], str) and out[0]:
-        return out[0]
-    raise RuntimeError("seal returned no audit_hash: %r" % (out,))
+    Short, safe description of what went wrong. Type and message only --
+    no traceback, no local variables, nothing that leaks a secret. The
+    peer needs enough to tell us what broke; they do not need our stack.
+    """
+    text = str(exc) or "(no message)"
+    return "%s: %s" % (type(exc).__name__, text[:400])
 
 
-def _seal_event(ctx, domain, kind, detail):
-    """Seal, then write. A failed seal writes nothing and raises."""
-    ts = _now()
-    leaf_payload = _canon({"v": 1, "ts": round(ts, 3), "domain": domain,
-                           "kind": kind, "detail": detail}).encode("utf-8")
-    leaf_hex = _ct_leaf(leaf_payload).hex()
-
-    event = {
-        "user_id": "register:%s" % domain,
-        "type": "register_event",
-        "domain": domain,
-        "kind": kind,
-        "leaf": leaf_hex,
-        "suite": SUITE_VERSION,
-        "detail": detail,
-    }
-    audit_hash = _do_seal(ctx, event, result=kind)
-
+def _sweep_nonces(ctx):
+    cutoff = _now() - NONCE_TTL_SECONDS
     with ctx["lock"]:
-        cur = ctx["conn"].execute(
-            "INSERT INTO register_event (ts, domain, kind, detail, leaf_hex, audit_hash)"
-            " VALUES (?,?,?,?,?,?)",
-            (ts, domain, kind, _canon(detail), leaf_hex, audit_hash))
-        seq = cur.lastrowid
+        ctx["conn"].execute("DELETE FROM peer_nonce WHERE seen_at < ?",
+                            (cutoff,))
         ctx["conn"].commit()
 
-    return {"seq": seq, "ts": ts, "at": _iso(ts), "leaf": leaf_hex,
-            "audit_hash": audit_hash, "kind": kind}
+
+def _try_seal(ctx, event, result, when):
+    """
+    Seal, and say plainly whether it worked.
+
+    Returns (audit_hash, block_index, receipt_seq, error) where error is
+    None on success and a short string on failure. Nothing here swallows
+    a failure silently. That was the 1.1 bug and it is the whole point of
+    this version.
+    """
+    try:
+        audit_hash, block_index, receipt_seq = ctx["seal"](
+            event, result, when, None)
+    except Exception as exc:
+        return None, None, None, _describe_exception(exc)
+
+    if not audit_hash:
+        return None, None, None, ("seal returned no audit hash")
+
+    return audit_hash, block_index, receipt_seq, None
 
 
-def _seal_checkpoint(ctx):
-    """Seal the current state: ordered event root + sorted domain root."""
-    leaves = _event_leaves(ctx)
-    domains = _live_domains(ctx)
-    event_root = _ct_root(leaves).hex()
-    domain_root = _sorted_root([_sorted_leaf(d) for d in domains]).hex()
-    ts = _now()
+# ------------------------------------------------------------ the submit
 
-    event = {
-        "user_id": "register:checkpoint",
-        "type": "register_checkpoint",
-        "tree_size": len(leaves),
-        "event_root": event_root,
-        "domain_root": domain_root,
-        "domain_count": len(domains),
-        "suite": SUITE_VERSION,
-    }
-    audit_hash = _do_seal(ctx, event, result="checkpoint")
+def _submit(ctx, data):
+    """
+    Signature-authenticated. No API key. Every rule on the list is
+    enforced here, in a fixed order, and each failure names itself.
+    """
+    _setup(ctx)
 
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "INSERT INTO register_checkpoint (ts, tree_size, event_root, domain_root,"
-            " domain_count, domains_json, audit_hash) VALUES (?,?,?,?,?,?,?)",
-            (ts, len(leaves), event_root, domain_root, len(domains),
-             _canon(domains), audit_hash))
-        ctx["conn"].commit()
+    # ---- shape
+    peer_id = (data.get("peer_id") or "").strip()
+    signature = (data.get("signature") or "").strip()
+    nonce = (data.get("nonce") or "").strip()
+    payload = data.get("payload")
+    idem = (data.get("idempotency_key") or "").strip()[:MAX_IDEMPOTENCY_KEY]
 
-    return {"at": _iso(ts), "tree_size": len(leaves), "event_root": event_root,
-            "domain_root": domain_root, "domain_count": len(domains),
-            "audit_hash": audit_hash}
-
-
-# ------------------------------------------------------------- check suite
-
-def _find_manifest(domain):
-    """Try the well-known path first, then the root. Return (path, body, note)."""
-    tried = []
-    for path in AI_TXT_PATHS:
-        ok, body, note = _fetch("https://%s%s" % (domain, path))
-        tried.append({"path": path, "ok": ok, "note": note})
-        if ok and body:
-            return path, body, {"served_at": path, "attempts": tried, "observed": note}
-    return None, None, {"served_at": None, "attempts": tried}
-
-
-def _pick(fields, key):
-    """Return (alias_used, value) for the first alias present."""
-    for alias in FIELD_ALIASES[key]:
-        if fields.get(alias):
-            return alias, fields[alias]
-    return None, None
-
-
-def _run_checks(domain):
-    """Observe what the domain serves. Every check names what it looked at."""
-    checks = []
-
-    path, body, mnote = _find_manifest(domain)
-    checks.append({
-        "id": "ai_txt_reachable",
-        "asks": "Does %s serve a manifest at %s?" % (domain, " or ".join(AI_TXT_PATHS)),
-        "pass": bool(body),
-        "observed": mnote,
-    })
-
-    fields = {}
-    if body:
-        for line in body.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or ":" not in line:
-                continue
-            k, _, v = line.partition(":")
-            k = k.strip().lower()
-            v = v.strip()
-            if k and v and k not in fields:
-                fields[k] = v
-
-    tip_alias, tip_url = _pick(fields, "chain_tip_url")
-    ver_alias, verifier = _pick(fields, "verifier")
-    con_alias, contact = _pick(fields, "contact")
-
-    missing = []
-    if not tip_url:
-        missing.append("chain tip url (%s)" % "/".join(FIELD_ALIASES["chain_tip_url"]))
-    if not verifier:
-        missing.append("verifier (%s)" % "/".join(FIELD_ALIASES["verifier"]))
-    if not contact:
-        missing.append("contact (%s)" % "/".join(FIELD_ALIASES["contact"]))
-
-    checks.append({
-        "id": "ai_txt_declares_required_fields",
-        "asks": "Does the manifest declare a chain tip url, a verifier and a contact, under any accepted field name?",
-        "pass": bool(body) and not missing,
-        "observed": {
-            "matched": {"chain_tip_url": tip_alias, "verifier": ver_alias, "contact": con_alias},
-            "missing": missing,
-            "field_count": len(fields),
-        },
-    })
-
-    tip_value = None
-    if tip_url:
-        tok, tbody, tnote = _fetch(tip_url)
-        parsed_tip = None
-        if tok and tbody:
-            try:
-                obj = json.loads(tbody)
-                for key in ("tip", "tip_sha256", "chain_tip", "head", "root",
-                            "current_tip", "latest", "hash"):
-                    if isinstance(obj.get(key), str):
-                        parsed_tip = obj[key]
-                        break
-            except Exception:
-                stripped = tbody.strip()
-                if re.fullmatch(r"[0-9a-fA-F]{64}", stripped):
-                    parsed_tip = stripped
-        tip_value = parsed_tip
-        checks.append({
-            "id": "chain_tip_served",
-            "asks": "Does the declared chain tip url return a tip value?",
-            "pass": bool(parsed_tip),
-            "observed": dict(tnote, declared_as=tip_alias, tip_field_found=bool(parsed_tip)),
-        })
-        checks.append({
-            "id": "chain_tip_is_sha256",
-            "asks": "Is the served tip a 64-character hex digest?",
-            "pass": bool(parsed_tip) and bool(re.fullmatch(r"[0-9a-fA-F]{64}", parsed_tip or "")),
-            "observed": {"tip": parsed_tip},
-        })
-    else:
-        for cid, asks in (("chain_tip_served", "Does the declared chain tip url return a tip value?"),
-                          ("chain_tip_is_sha256", "Is the served tip a 64-character hex digest?")):
-            checks.append({"id": cid, "asks": asks, "pass": False,
-                           "observed": {"error": "no chain tip url declared"}})
-
-    checks.append({
-        "id": "verifier_named",
-        "asks": "Does the manifest name instructions or a tool a third party can use to check the chain themselves?",
-        "pass": bool(verifier),
-        "observed": {"verifier": verifier, "declared_as": ver_alias},
-    })
-
-    passed = all(c["pass"] for c in checks)
-    return {
-        "suite": SUITE_VERSION,
-        "ran_at": _iso(_now()),
-        "manifest_path": path,
-        "all_passed": passed,
-        "failed": [c["id"] for c in checks if not c["pass"]],
-        "checks": checks,
-        "tip_observed": tip_value,
-        "contact": contact,
-        "declared": fields,
-    }
-
-
-# ------------------------------------------------------------------ actions
-
-def _spec(ctx):
-    return {
-        "module": "register",
-        "version": VERSION,
-        "suite_version": SUITE_VERSION,
-        "what_this_is":
-            "A registry that publishes proofs about its own behaviour. Absence proofs "
-            "show a domain was not listed on a date. RFC 6962 consistency proofs show "
-            "no entry was inserted behind an earlier position. Revocations are sealed "
-            "rather than deleted, so a removed listing stays readable.",
-        "why_that_matters":
-            "Every other registry is a mutable database whose operator can add, "
-            "back-date or quietly delete entries. Trusting the list means trusting the "
-            "registrar. This one is checkable against its own operator.",
-        "what_this_is_not": WHAT_THIS_IS_NOT,
-        "status_vocabulary": VOCABULARY,
-        "how_to_get_listed": [
-            "Simplest, nothing to edit: if your manifest already carries a `Domain: <yourdomain>` line matching the domain you are claiming, POST /x/register/claim and you are listed. A manifest served from your domain naming your domain could only have been published by you.",
-            "If your manifest does not name itself, use the token route instead:",
-            "1. POST /x/register/challenge with {\"domain\": \"example.com\"} — returns a one-time token.",
-            "2. Serve that token at https://example.com%s, or add a `Register-Token: <token>` line to your manifest at %s" % (WELL_KNOWN_PATH, " or ".join(AI_TXT_PATHS)),
-            "Any token issued in the last 24 hours will verify — asking for a new one does not invalidate one you already published. See /x/register/tokens?domain=example.com",
-            "3. POST /x/register/claim with {\"domain\": \"example.com\"} — we fetch, verify, run the checks and seal the result.",
-            "Opt out at any time with a `Register: no` line in the manifest — the register refuses the claim and says so.",
-            "Nobody is listed by the operator. A domain lists itself by proving it controls the domain.",
-        ],
-        "manifest_paths_tried": AI_TXT_PATHS,
-        "field_aliases": FIELD_ALIASES,
-        "checks_run": [
-            "ai_txt_reachable", "ai_txt_declares_required_fields",
-            "chain_tip_served", "chain_tip_is_sha256", "verifier_named",
-        ],
-        "trees": {
-            "event_tree": "RFC 6962 ordered tree over every register event in write order. Answers append-only. Verifies with any standard Certificate Transparency verifier.",
-            "domain_tree": "Sorted tree over the domains listed at a checkpoint, odd nodes promoted, domain-separated prefixes. Answers absence.",
-            "note": "The two roots answer different questions and deliberately never match.",
-        },
-        "proof_of_control": {"preferred": "manifest-self-declaration (a Domain: line naming itself)",
-                             "fallback": "one-time token served at a path we name",
-                             "opt_out": "a `Register: no` line in the manifest"},
-        "stale_after_days": STALE_AFTER_DAYS,
-        "challenge_ttl_seconds": CHALLENGE_TTL_SECONDS,
-        "routes": {
-            "public": sorted("%s /x/register/%s" % (m, a) for m, a in PUBLIC),
-            "keyed": ["POST /x/register/recheck-all", "POST /x/register/checkpoint",
-                      "POST /x/register/revoke"],
-        },
-        "honest_limits": [
-            "A check observes what a URL served at a moment in time. It cannot know what a domain did not seal.",
-            "Domain control proves control of the domain, not the truth of anything the domain declares.",
-            "Absence proofs are only as good as the checkpoint they are made against. A period with no checkpoint has nothing to prove absence from.",
-            "Nobody can be forced to keep publishing. A listing goes stale when the evidence ages, and that is the honest outcome rather than a failure of the register.",
-        ],
-    }, 200
-
-
-def _challenge(ctx, data):
-    domain = _clean_domain(data.get("domain"))
-    if not data.get("domain"):
-        return {"error": MESSAGES["domain_required"]}, 400
-    if not domain:
-        return {"error": MESSAGES["bad_domain"]}, 400
-
-    with ctx["lock"]:
-        row = ctx["conn"].execute(
-            "SELECT status FROM register_entry WHERE domain=?", (domain,)).fetchone()
-    if row and row[0] in (STATUS_REVOKED,):
-        return {"error": MESSAGES["already_final"], "domain": domain,
-                "status": row[0]}, 409
-
-    # Idempotent: if a live token already exists for this domain, return THAT
-    # one. Minting a new token on every request is how an operator ends up with
-    # a published token the register no longer recognises.
-    existing = _live_tokens(ctx, domain)
-    if existing:
-        token, issued = existing[0]
-        return {
-            "ok": True,
-            "domain": domain,
-            "token": token,
-            "reused": True,
-            "issued_at": _iso(issued),
-            "expires_at": _iso(issued + CHALLENGE_TTL_SECONDS),
-            "serve_at": ["https://%s%s" % (domain, WELL_KNOWN_PATH),
-                         "or a `Register-Token: %s` line in your manifest at %s"
-                         % (token, " or ".join(AI_TXT_PATHS))],
-            "then": "POST /x/register/claim {\"domain\": \"%s\"}" % domain,
-            "note": "This is the token already issued for this domain. Requesting "
-                    "again does not replace it, so anything you have already "
-                    "published stays valid.",
-        }, 200
-
-    token = "aileash-register-" + secrets.token_hex(16)
-    ts = _now()
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "INSERT INTO register_challenge (domain, token, issued) VALUES (?,?,?)"
-            " ON CONFLICT(domain) DO UPDATE SET token=excluded.token, issued=excluded.issued",
-            (domain, token, ts))
-        ctx["conn"].execute(
-            "INSERT OR REPLACE INTO register_token (token, domain, issued) VALUES (?,?,?)",
-            (token, domain, ts))
-        ctx["conn"].execute(
-            "DELETE FROM register_token WHERE domain=? AND issued<?",
-            (domain, ts - CHALLENGE_TTL_SECONDS))
-        ctx["conn"].commit()
+    if not peer_id or not signature or not nonce or payload is None:
+        return {"ok": False, "error": "malformed_envelope",
+                "required": ["peer_id", "ts", "nonce", "payload",
+                             "signature"]}, 400
 
     try:
-        sealed = _seal_event(ctx, domain, "challenge_issued",
-                             {"token_sha256": _sha(token.encode())})
-    except Exception as e:
-        return {"error": MESSAGES["seal_failed"], "detail": str(e)}, 500
+        ts = int(data.get("ts"))
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "malformed_ts",
+                "detail": "ts must be an integer of unix seconds"}, 400
 
+    if len(nonce) < NONCE_MIN_LENGTH:
+        return {"ok": False, "error": "nonce_too_short",
+                "minimum": NONCE_MIN_LENGTH}, 400
+
+    if len(canonical(payload).encode("utf-8")) > MAX_PAYLOAD_BYTES:
+        return {"ok": False, "error": "payload_too_large",
+                "max_bytes": MAX_PAYLOAD_BYTES}, 413
+
+    # ---- peer known and active
+    row = ctx["conn"].execute(
+        "SELECT peer_id, chain_name, secret_current, secret_previous, "
+        "rotated_at, status FROM peer_registry WHERE peer_id = ?",
+        (peer_id,)).fetchone()
+    if not row:
+        return {"ok": False, "error": "unknown_peer", "peer_id": peer_id}, 401
+    if row[5] == "suspended":
+        return {"ok": False, "error": "peer_suspended",
+                "detail": "Submissions refused. Existing history stands "
+                          "and nothing has been removed."}, 403
+
+    # ---- clock skew, before any expensive work
+    skew = abs(_now() - ts)
+    if skew > CLOCK_SKEW_SECONDS:
+        return {"ok": False, "error": "clock_skew",
+                "detail": "Timestamp is %.0fs from server time; the window "
+                          "is +/-%ds." % (skew, CLOCK_SKEW_SECONDS),
+                "server_time": int(_now())}, 401
+
+    # ---- signature, against current then previous secret
+    #
+    # Note the envelope is rebuilt from KNOWN field names only. Any extra
+    # top-level field the caller signed is not part of what we verify, so
+    # the signature will not match. Documented in the spec; the failure
+    # response points at /x/peer/canonical, which is the fastest way for
+    # an implementer to see the difference.
+    envelope = {"peer_id": peer_id, "ts": ts, "nonce": nonce,
+                "payload": payload}
+    if idem:
+        envelope["idempotency_key"] = idem
+
+    accepted_with = None
+    if row[2] and hmac.compare_digest(sign(row[2], envelope), signature):
+        accepted_with = "current"
+    elif row[3] and (row[4] or 0) + ROTATION_OVERLAP_SECONDS > _now():
+        if hmac.compare_digest(sign(row[3], envelope), signature):
+            accepted_with = "previous"
+
+    if not accepted_with:
+        return {"ok": False, "error": "bad_signature",
+                "detail": "HMAC did not match. POST the same envelope to "
+                          "/x/peer/canonical to see the exact string this "
+                          "server signs.",
+                "common_cause": "An extra top-level field in your envelope. "
+                                "Only peer_id, ts, nonce, payload and "
+                                "idempotency_key are signed; anything else "
+                                "belongs inside payload.",
+                "string_to_sign_sha256":
+                    hashlib.sha256(
+                        string_to_sign(envelope).encode()).hexdigest(),
+                }, 401
+
+    payload_digest = _digest(payload)
+
+    # ---- idempotency, before the nonce check so a retry is a clean no-op
+    if idem:
+        prior = ctx["conn"].execute(
+            "SELECT payload_digest, response_json FROM peer_submission "
+            "WHERE peer_id = ? AND idempotency_key = ?",
+            (peer_id, idem)).fetchone()
+        if prior:
+            if prior[0] != payload_digest:
+                return {"ok": False, "error": "idempotency_conflict",
+                        "detail": "That idempotency key was used with a "
+                                  "different payload."}, 409
+            out = json.loads(prior[1])
+            out["replayed"] = True
+            out["note"] = ("Idempotent retry. This is the original receipt; "
+                           "nothing was sealed twice.")
+            return out, 200
+
+    # ---- replay
+    _sweep_nonces(ctx)
+    seen = ctx["conn"].execute(
+        "SELECT seen_at FROM peer_nonce WHERE peer_id = ? AND nonce = ?",
+        (peer_id, nonce)).fetchone()
+    if seen:
+        return {"ok": False, "error": "replay",
+                "detail": "That nonce has already been used by this peer "
+                          "within the %ds window. Use a fresh nonce, or "
+                          "send an idempotency_key if you meant to retry."
+                          % NONCE_TTL_SECONDS}, 409
+
+    # ---- seal it FIRST, and only claim success if it actually sealed
+    #
+    # This ordering is deliberate. Before 1.2 the response was built and
+    # returned whether or not the seal worked, with null receipt fields
+    # and ok=true. A peer had no way to tell a real receipt from an empty
+    # one without going and looking at the chain. Now nothing is recorded
+    # and nothing is claimed unless there is an audit hash to point at.
+    now = _now()
+    event = {"user_id": "peer:" + peer_id,
+             "module": "peer", "action": "submit", "peer_id": peer_id,
+             "chain_name": row[1], "payload_digest": payload_digest,
+             "payload": payload}
+    result = {"accepted": True, "signed_with": accepted_with,
+              "auth": "hmac-shared-secret"}
+
+    audit_hash, block_index, receipt_seq, seal_error = _try_seal(
+        ctx, event, result, now)
+
+    if seal_error:
+        return {
+            "ok": False,
+            "accepted": False,
+            "error": "seal_failed",
+            "detail": "Your envelope verified correctly, but the audit "
+                      "chain did not seal it, so there is no receipt to "
+                      "give you. This is a fault on this deployment and "
+                      "not a problem with your submission.",
+            "seal_error": seal_error,
+            "recorded": False,
+            "retry": "Nothing was written. Your nonce is unused and your "
+                     "idempotency key is free, so the identical envelope "
+                     "can be resent once this is fixed.",
+            "peer_id": peer_id,
+            "payload_digest": payload_digest,
+            "received_at": _iso(now),
+        }, 500
+
+    # ---- accepted and sealed. Issue the receipt sequence.
+    #
+    # New in 1.3.0. server.py's seal() only issues its sequence number
+    # when an api_key is passed, because that counter lives on the key.
+    # This lane authenticates by signature and holds no key, so seal()
+    # returned None and the gapless property - the one that lets a peer
+    # holding N and N+2 PROVE N+1 is missing - simply did not exist here.
+    # Raised by Philip Pinol (PRAXIS) whose schema required an integer and
+    # got a null. He was right to require it.
+    #
+    # So the sequence is issued here instead, per peer, from a counter on
+    # peer_registry. It is incremented and read inside the SAME lock hold
+    # that writes the submission row, so a number is never issued for a
+    # submission that was not stored, and never skipped for one that was.
+    #
+    # Note the difference from the api_key sequence deliberately: that one
+    # counts everything a key ever sealed across all modules. This one
+    # counts what THIS peer submitted to THIS lane. Both are gapless
+    # within their own scope and they are not comparable to each other.
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "UPDATE peer_registry SET seq = COALESCE(seq, 0) + 1 "
+            "WHERE peer_id = ?", (peer_id,))
+        srow = ctx["conn"].execute(
+            "SELECT seq FROM peer_registry WHERE peer_id = ?",
+            (peer_id,)).fetchone()
+        peer_seq = int(srow[0]) if srow and srow[0] is not None else None
+
+        out = {
+            "ok": True,
+            "accepted": True,
+            "peer_id": peer_id,
+            "chain_name": row[1],
+            "payload_digest": payload_digest,
+            "signed_with": accepted_with,
+            "auth": "hmac-shared-secret",
+            "auth_scope": SHARED_SECRET_SCOPE,
+            "received_at": _iso(now),
+            "receipt": {"audit_hash": audit_hash,
+                        "block_index": block_index,
+                        "receipt_seq": peer_seq,
+                        "receipt_seq_scope": "per-peer",
+                        "key_seq": receipt_seq},
+            "verify": {
+                "inclusion": "/x/complete/prove",
+                "ancestry": "/x/consistency/ancestor?tip=<any tip we served>",
+                "append_only": "/x/consistency/proof?first=&second=",
+            },
+            # Top level, not inside verify. In 1.3.0 this sat inside the
+            # verify object, which the spec documented as exactly three
+            # keys - so the response carried a fourth key the written shape
+            # did not have. Philip Pinol (PRAXIS) caught it as
+            # verify_format_invalid. It is a property of the sequence
+            # rather than a route to call, so it never belonged in a map of
+            # verification routes.
+            "gapless": "receipt_seq increments by exactly one per accepted "
+                       "submission from this peer. Two receipts numbered N "
+                       "and N+2 prove a third exists and you did not "
+                       "receive it. The current highest is published per "
+                       "peer at /x/peer/peers.",
+        }
+
+        # Rotation warning is added BEFORE storing, so the stored copy is
+        # byte-identical to what the peer receives. A peer that hashes the
+        # response to prove what it got needs that to be true.
+        if accepted_with == "previous":
+            out["warning"] = ("Accepted with the previous secret. The "
+                              "overlap window ends %s."
+                              % _iso((row[4] or 0) +
+                                     ROTATION_OVERLAP_SECONDS))
+
+        ctx["conn"].execute(
+            "INSERT OR IGNORE INTO peer_nonce (peer_id, nonce, seen_at) "
+            "VALUES (?,?,?)", (peer_id, nonce, now))
+        ctx["conn"].execute(
+            "INSERT INTO peer_submission (peer_id, ts, idempotency_key, "
+            "payload_digest, response_json, audit_hash) VALUES (?,?,?,?,?,?)",
+            (peer_id, now, idem or None, payload_digest,
+             json.dumps(out), audit_hash))
+        ctx["conn"].execute(
+            "UPDATE peer_registry SET submissions = submissions + 1, "
+            "last_seen = ? WHERE peer_id = ?", (now, peer_id))
+        ctx["conn"].commit()
+
+    return out, 200
+
+
+# ------------------------------------------------------------- operator
+
+def _register(ctx, data):
+    _setup(ctx)
+    peer_id = (data.get("peer_id") or "").strip().lower()
+    if not _PEER_ID_RE.match(peer_id):
+        return {"ok": False, "error": "bad_peer_id",
+                "detail": "lowercase letters, digits, dot, dash, "
+                          "underscore; 2-63 chars"}, 400
+    if ctx["conn"].execute("SELECT 1 FROM peer_registry WHERE peer_id = ?",
+                           (peer_id,)).fetchone():
+        return {"ok": False, "error": "peer_exists",
+                "detail": "Use /x/peer/rotate to issue a new secret."}, 409
+
+    secret = _new_secret()
+    now = _now()
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "INSERT INTO peer_registry (peer_id, chain_name, url, "
+            "secret_current, secret_previous, rotated_at, status, created) "
+            "VALUES (?,?,?,?,NULL,NULL,'active',?)",
+            (peer_id, (data.get("chain_name") or peer_id).strip()[:120],
+             (data.get("url") or "").strip()[:400], secret, now))
+        ctx["conn"].commit()
+
+    audit_hash, _bi, _rs, seal_error = _try_seal(
+        ctx, {"user_id": "peer:" + peer_id, "module": "peer",
+              "action": "register", "peer_id": peer_id},
+        {"registered": True}, now)
+
+    out = {
+        "ok": True,
+        "peer_id": peer_id,
+        "secret": secret,
+        "warning": "This secret is shown once and is not recoverable. "
+                   "Send it to the peer over a channel you trust.",
+        "tell_the_peer_this": SHARED_SECRET_SCOPE,
+        "endpoint": "/x/peer/submit",
+        "spec": "/x/peer/spec",
+        "stronger_lane": "/x/signed/spec",
+        "sealed": seal_error is None,
+        "audit_hash": audit_hash,
+    }
+    if seal_error:
+        out["seal_error"] = seal_error
+        out["seal_note"] = ("The credential was issued and is usable. The "
+                            "audit note about issuing it did not seal. "
+                            "That is a fault worth chasing, but it does "
+                            "not affect the credential.")
+    return out, 200
+
+
+def _rotate(ctx, data):
+    _setup(ctx)
+    peer_id = (data.get("peer_id") or "").strip().lower()
+    row = ctx["conn"].execute(
+        "SELECT secret_current FROM peer_registry WHERE peer_id = ?",
+        (peer_id,)).fetchone()
+    if not row:
+        return {"ok": False, "error": "unknown_peer"}, 404
+
+    new = _new_secret()
+    now = _now()
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "UPDATE peer_registry SET secret_previous = secret_current, "
+            "secret_current = ?, rotated_at = ? WHERE peer_id = ?",
+            (new, now, peer_id))
+        ctx["conn"].commit()
+
+    audit_hash, _bi, _rs, seal_error = _try_seal(
+        ctx, {"user_id": "peer:" + peer_id, "module": "peer",
+              "action": "rotate", "peer_id": peer_id},
+        {"rotated": True}, now)
+
+    out = {
+        "ok": True,
+        "peer_id": peer_id,
+        "secret": new,
+        "previous_valid_until": _iso(now + ROTATION_OVERLAP_SECONDS),
+        "detail": "Both secrets are accepted until then, so the peer can "
+                  "roll over without downtime. Submissions signed with the "
+                  "old one come back marked.",
+        "note": "The operator rotates this credential because the operator "
+                "holds it. At /x/signed/rotate the peer rotates their own "
+                "key and the operator cannot, because a rotation there must "
+                "be signed by the key being replaced.",
+        "sealed": seal_error is None,
+        "audit_hash": audit_hash,
+    }
+    if seal_error:
+        out["seal_error"] = seal_error
+        out["seal_note"] = ("The rotation happened and the new secret is "
+                            "live. The audit note about it did not seal.")
+    return out, 200
+
+
+def _set_status(ctx, data, status):
+    _setup(ctx)
+    peer_id = (data.get("peer_id") or "").strip().lower()
+    if not ctx["conn"].execute("SELECT 1 FROM peer_registry WHERE peer_id = ?",
+                               (peer_id,)).fetchone():
+        return {"ok": False, "error": "unknown_peer"}, 404
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "UPDATE peer_registry SET status = ? WHERE peer_id = ?",
+            (status, peer_id))
+        ctx["conn"].commit()
+
+    audit_hash, _bi, _rs, seal_error = _try_seal(
+        ctx, {"user_id": "peer:" + peer_id, "module": "peer",
+              "action": status, "peer_id": peer_id},
+        {"status": status}, _now())
+
+    out = {"ok": True, "peer_id": peer_id, "status": status,
+           "sealed": seal_error is None, "audit_hash": audit_hash}
+    if seal_error:
+        out["seal_error"] = seal_error
+        out["seal_note"] = ("The status change took effect. The audit note "
+                            "about it did not seal.")
+    return out, 200
+
+
+def _peers(ctx):
+    _setup(ctx)
+    now = _now()
+    rows = ctx["conn"].execute(
+        "SELECT peer_id, chain_name, url, status, created, submissions, "
+        "last_seen, rotated_at, seq FROM peer_registry ORDER BY created"
+    ).fetchall()
     return {
         "ok": True,
-        "domain": domain,
-        "token": token,
-        "expires_at": _iso(ts + CHALLENGE_TTL_SECONDS),
-        "serve_at": ["https://%s%s" % (domain, WELL_KNOWN_PATH),
-                     "or a `Register-Token: %s` line in https://%s%s" % (token, domain, AI_TXT_PATH)],
-        "then": "POST /x/register/claim {\"domain\": \"%s\"}" % domain,
-        "sealed": sealed,
-        "note": "The token itself is not sealed — only its digest, so the challenge cannot be replayed from the public chain.",
-    }, 200
-
-
-def _live_tokens(ctx, domain):
-    """Every token issued for this domain that has not expired, newest first."""
-    cutoff = _now() - CHALLENGE_TTL_SECONDS
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT token, issued FROM register_token WHERE domain=? AND issued>=?"
-            " ORDER BY issued DESC", (domain, cutoff)).fetchall()
-    return [(r[0], r[1]) for r in rows]
-
-
-def _verify_self_declaration(domain):
-    """Proof of control with nothing to edit.
-
-    A manifest served over https from the domain, whose own `Domain:` line
-    names that same domain, was published by whoever controls the domain.
-    Nobody else can put a file there. That IS the consent a token was
-    standing in for, so a token is only needed when the manifest does not
-    name itself (or the operator has opted out).
-
-    An operator who does not want to be listed writes `Register: no`.
-    """
-    path, body, mnote = _find_manifest(domain)
-    if not body:
-        return False, {"reason": "no manifest served", "attempts": mnote}
-
-    declared = None
-    opted_out = False
-    for line in body.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or ":" not in line:
-            continue
-        k, _, v = line.partition(":")
-        k, v = k.strip().lower(), v.strip().lower()
-        if k == "domain" and declared is None:
-            declared = v.lstrip("www.")
-        if k == "register" and v in ("no", "false", "off", "opt-out"):
-            opted_out = True
-
-    if opted_out:
-        return False, {"reason": "manifest declares Register: no",
-                       "respected": True, "served_at": path}
-    if not declared:
-        return False, {"reason": "manifest does not declare a Domain: line",
-                       "served_at": path}
-    if declared != domain:
-        return False, {"reason": "manifest declares a different domain",
-                       "declared": declared, "claimed": domain, "served_at": path}
-
-    return True, {"method": "manifest-self-declaration", "served_at": path,
-                  "declared_domain": declared, "observed": mnote.get("observed"),
-                  "what_this_proves": "The manifest at this path names this domain "
-                                      "as its own. Only the party controlling the "
-                                      "domain can serve that file."}
-
-
-def _verify_any_token(ctx, domain):
-    """Accept ANY live token for this domain. Requesting a new one must never
-    invalidate one the operator has already published."""
-    tokens = _live_tokens(ctx, domain)
-    if not tokens:
-        return False, None, {"error": "no_live_token"}
-    last = None
-    for token, issued in tokens:
-        ok, evidence = _verify_token(domain, token)
-        if ok:
-            evidence["token_issued"] = _iso(issued)
-            evidence["tokens_live"] = len(tokens)
-            return True, token, evidence
-        last = evidence
-    return False, None, {"tokens_live": len(tokens), "none_matched": True,
-                         "last_attempt": last}
-
-
-def _verify_token(domain, token):
-    ok, body, note = _fetch("https://%s%s" % (domain, WELL_KNOWN_PATH))
-    if ok and body and token in body:
-        return True, {"method": "well-known", "observed": note}
-    tried = [{"path": WELL_KNOWN_PATH, "note": note}]
-    for path in AI_TXT_PATHS:
-        ok2, body2, note2 = _fetch("https://%s%s" % (domain, path))
-        tried.append({"path": path, "note": note2})
-        if ok2 and body2:
-            for line in body2.splitlines():
-                if line.strip().lower().startswith("register-token:") and token in line:
-                    return True, {"method": "manifest:%s" % path, "observed": note2}
-    return False, {"method": None, "tried": tried}
-
-
-def _claim(ctx, data):
-    domain = _clean_domain(data.get("domain"))
-    if not domain:
-        return {"error": MESSAGES["bad_domain"]}, 400
-
-    verified, evidence = _verify_self_declaration(domain)
-    if not verified:
-        self_decl_evidence = evidence
-        if evidence.get("respected"):
-            return {"ok": False, "domain": domain,
-                    "error": "this domain has opted out with a `Register: no` line",
-                    "evidence": evidence}, 403
-        if not _live_tokens(ctx, domain):
-            return {"ok": False, "domain": domain,
-                    "error": "could not prove control of this domain",
-                    "self_declaration": self_decl_evidence,
-                    "how_to_fix": [
-                        "Easiest: add a `Domain: %s` line to your manifest at %s."
-                        % (domain, " or ".join(AI_TXT_PATHS)),
-                        "Or: POST /x/register/challenge and serve the token it returns.",
-                    ]}, 400
-        verified, matched_token, tok_evidence = _verify_any_token(ctx, domain)
-        evidence = dict(tok_evidence or {}, self_declaration=self_decl_evidence)
-    if not verified:
-        try:
-            _seal_event(ctx, domain, "claim_refused", {"reason": "token_not_found",
-                                                       "evidence": evidence})
-        except Exception as e:
-            return {"error": MESSAGES["seal_failed"], "detail": str(e)}, 500
-        return {"ok": False, "domain": domain, "error": MESSAGES["token_not_found"],
-                "looked_at": ["https://%s%s" % (domain, WELL_KNOWN_PATH),
-                              "https://%s%s" % (domain, AI_TXT_PATH)],
-                "evidence": evidence,
-                "note": "The refusal is sealed. Fix the token and claim again."}, 400
-
-    checks = _run_checks(domain)
-    status = STATUS_PASSED if checks["all_passed"] else STATUS_FAILED
-    contact = checks.get("contact")
-    ts = _now()
-
-    try:
-        sealed = _seal_event(ctx, domain, "listed", {
-            "claim_method": evidence.get("method"),
-            "status": status,
-            "suite": SUITE_VERSION,
-            "failed": checks["failed"],
-            "tip_observed": checks["tip_observed"],
-        })
-    except Exception as e:
-        return {"error": MESSAGES["seal_failed"], "detail": str(e)}, 500
-
-    with ctx["lock"]:
-        existing = ctx["conn"].execute(
-            "SELECT first_listed FROM register_entry WHERE domain=?", (domain,)).fetchone()
-        first = existing[0] if existing else ts
-        ctx["conn"].execute(
-            "INSERT INTO register_entry (domain, status, first_listed, last_event,"
-            " last_checked, last_pass, checks_json, contact, claim_method, reason)"
-            " VALUES (?,?,?,?,?,?,?,?,?,NULL)"
-            " ON CONFLICT(domain) DO UPDATE SET status=excluded.status,"
-            " last_event=excluded.last_event, last_checked=excluded.last_checked,"
-            " last_pass=excluded.last_pass, checks_json=excluded.checks_json,"
-            " contact=excluded.contact, claim_method=excluded.claim_method, reason=NULL",
-            (domain, status, first, ts, ts,
-             ts if checks["all_passed"] else None,
-             _canon(checks), contact, evidence.get("method")))
-        ctx["conn"].execute("DELETE FROM register_challenge WHERE domain=?", (domain,))
-        ctx["conn"].execute("DELETE FROM register_token WHERE domain=?", (domain,))
-        ctx["conn"].commit()
-
-    cp = None
-    try:
-        cp = _seal_checkpoint(ctx)
-    except Exception as e:
-        cp = {"error": "checkpoint_failed", "detail": str(e)}
-
-    return {"ok": True, "domain": domain, "status": status,
-            "status_means": VOCABULARY[status],
-            "claim_method": evidence.get("method"),
-            "checks": checks, "sealed": sealed, "checkpoint": cp,
-            "entry_url": "/x/register/entry?domain=%s" % domain}, 200
-
-
-def _recheck(ctx, data):
-    domain = _clean_domain(data.get("domain"))
-    if not domain:
-        return {"error": MESSAGES["bad_domain"]}, 400
-    with ctx["lock"]:
-        row = ctx["conn"].execute(
-            "SELECT status, first_listed FROM register_entry WHERE domain=?",
-            (domain,)).fetchone()
-    if not row:
-        return {"error": MESSAGES["not_listed"], "domain": domain}, 404
-    if row[0] in (STATUS_WITHDRAWN, STATUS_REVOKED):
-        return {"error": MESSAGES["already_final"], "domain": domain, "status": row[0]}, 409
-
-    checks = _run_checks(domain)
-    status = STATUS_PASSED if checks["all_passed"] else STATUS_FAILED
-    ts = _now()
-
-    try:
-        sealed = _seal_event(ctx, domain, "rechecked", {
-            "status": status, "suite": SUITE_VERSION, "failed": checks["failed"],
-            "tip_observed": checks["tip_observed"],
-        })
-    except Exception as e:
-        return {"error": MESSAGES["seal_failed"], "detail": str(e)}, 500
-
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "UPDATE register_entry SET status=?, last_event=?, last_checked=?,"
-            " last_pass=COALESCE(?, last_pass), checks_json=? WHERE domain=?",
-            (status, ts, ts, ts if checks["all_passed"] else None,
-             _canon(checks), domain))
-        ctx["conn"].commit()
-
-    return {"ok": True, "domain": domain, "status": status,
-            "status_means": VOCABULARY[status], "checks": checks, "sealed": sealed}, 200
-
-
-def _withdraw(ctx, data):
-    """A domain removes itself. Proved the same way it listed itself."""
-    domain = _clean_domain(data.get("domain"))
-    if not domain:
-        return {"error": MESSAGES["bad_domain"]}, 400
-    with ctx["lock"]:
-        row = ctx["conn"].execute(
-            "SELECT status FROM register_entry WHERE domain=?", (domain,)).fetchone()
-    if not row:
-        return {"error": MESSAGES["not_listed"], "domain": domain}, 404
-    verified, evidence = _verify_self_declaration(domain)
-    if not verified:
-        if not _live_tokens(ctx, domain):
-            return {"error": MESSAGES["no_challenge"], "domain": domain,
-                    "note": "Withdrawal is proved the same way listing is."}, 404
-        verified, matched_token, evidence = _verify_any_token(ctx, domain)
-    if not verified:
-        return {"ok": False, "error": MESSAGES["token_not_found"], "evidence": evidence}, 400
-
-    ts = _now()
-    try:
-        sealed = _seal_event(ctx, domain, "withdrawn",
-                             {"by": "domain", "method": evidence.get("method")})
-    except Exception as e:
-        return {"error": MESSAGES["seal_failed"], "detail": str(e)}, 500
-
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "UPDATE register_entry SET status=?, last_event=?, reason=? WHERE domain=?",
-            (STATUS_WITHDRAWN, ts, "withdrawn by domain", domain))
-        ctx["conn"].execute("DELETE FROM register_challenge WHERE domain=?", (domain,))
-        ctx["conn"].execute("DELETE FROM register_token WHERE domain=?", (domain,))
-        ctx["conn"].commit()
-
-    cp = None
-    try:
-        cp = _seal_checkpoint(ctx)
-    except Exception as e:
-        cp = {"error": "checkpoint_failed", "detail": str(e)}
-
-    return {"ok": True, "domain": domain, "status": STATUS_WITHDRAWN,
-            "status_means": VOCABULARY[STATUS_WITHDRAWN],
-            "sealed": sealed, "checkpoint": cp,
-            "note": "The listing history remains readable at /x/register/history?domain=%s" % domain}, 200
-
-
-def _revoke(ctx, data):
-    domain = _clean_domain(data.get("domain"))
-    reason = (data.get("reason") or "").strip()
-    if not domain:
-        return {"error": MESSAGES["bad_domain"]}, 400
-    if not reason:
-        return {"error": "reason is required — a revocation with no sealed reason is exactly what this register exists to prevent"}, 400
-    with ctx["lock"]:
-        row = ctx["conn"].execute(
-            "SELECT status FROM register_entry WHERE domain=?", (domain,)).fetchone()
-    if not row:
-        return {"error": MESSAGES["not_listed"], "domain": domain}, 404
-
-    ts = _now()
-    try:
-        sealed = _seal_event(ctx, domain, "revoked", {"by": "operator", "reason": reason})
-    except Exception as e:
-        return {"error": MESSAGES["seal_failed"], "detail": str(e)}, 500
-
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "UPDATE register_entry SET status=?, last_event=?, reason=? WHERE domain=?",
-            (STATUS_REVOKED, ts, reason, domain))
-        ctx["conn"].commit()
-
-    cp = None
-    try:
-        cp = _seal_checkpoint(ctx)
-    except Exception as e:
-        cp = {"error": "checkpoint_failed", "detail": str(e)}
-
-    return {"ok": True, "domain": domain, "status": STATUS_REVOKED,
-            "reason": reason, "sealed": sealed, "checkpoint": cp,
-            "note": "Nothing was deleted. The revocation is sealed and the history stays public."}, 200
-
-
-def _recheck_all(ctx):
-    domains = _live_domains(ctx)
-    results = []
-    for d in domains:
-        body, _ = _recheck(ctx, {"domain": d})
-        results.append({"domain": d, "status": body.get("status"),
-                        "failed": (body.get("checks") or {}).get("failed")})
-    # age anything whose last pass is old
-    cutoff = _now() - STALE_AFTER_DAYS * 86400
-    aged = []
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT domain, last_pass FROM register_entry WHERE status=?",
-            (STATUS_PASSED,)).fetchall()
-    for domain, last_pass in rows:
-        if last_pass is None or last_pass < cutoff:
-            try:
-                _seal_event(ctx, domain, "stale", {"last_pass": _iso(last_pass) if last_pass else None})
-            except Exception:
-                continue
-            with ctx["lock"]:
-                ctx["conn"].execute(
-                    "UPDATE register_entry SET status=?, last_event=? WHERE domain=?",
-                    (STATUS_STALE, _now(), domain))
-                ctx["conn"].commit()
-            aged.append(domain)
-
-    cp = None
-    try:
-        cp = _seal_checkpoint(ctx)
-    except Exception as e:
-        cp = {"error": "checkpoint_failed", "detail": str(e)}
-    return {"ok": True, "rechecked": results, "moved_to_stale": aged,
-            "checkpoint": cp}, 200
-
-
-def _list(ctx, q):
-    want = (q.get("status") or "").strip().lower()
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT domain, status, first_listed, last_event, last_checked, last_pass,"
-            " checks_json, reason FROM register_entry ORDER BY domain ASC").fetchall()
-    out = []
-    for r in rows:
-        checks = {}
-        try:
-            checks = json.loads(r[6]) if r[6] else {}
-        except Exception:
-            checks = {}
-        entry = {
-            "domain": r[0],
-            "status": r[1],
-            "status_means": VOCABULARY.get(r[1], "unexplained value — treat as unverified"),
-            "first_listed": _iso(r[2]),
-            "last_event": _iso(r[3]),
-            "last_checked": _iso(r[4]) if r[4] else None,
-            "last_pass": _iso(r[5]) if r[5] else None,
-            "failed_checks": checks.get("failed") or [],
-            "reason": r[7],
-        }
-        if not want or entry["status"] == want:
-            out.append(entry)
-
-    with ctx["lock"]:
-        cp = ctx["conn"].execute(
-            "SELECT ts, tree_size, event_root, domain_root, domain_count"
-            " FROM register_checkpoint ORDER BY id DESC LIMIT 1").fetchone()
-
-    return {
-        "registry_version": VERSION,
-        "suite_version": SUITE_VERSION,
-        "count": len(out),
-        "entries": out,
-        "status_vocabulary": VOCABULARY,
-        "what_this_list_is_not": WHAT_THIS_IS_NOT,
-        "latest_checkpoint": ({
-            "at": _iso(cp[0]), "tree_size": cp[1], "event_root": cp[2],
-            "domain_root": cp[3], "domain_count": cp[4],
-        } if cp else None),
-        "prove_absence": "/x/register/absence?domain=example.com&at=2026-01-01",
-        "prove_append_only": "/x/register/consistency?first=<size>&second=<size>",
-    }, 200
-
-
-def _entry(ctx, q):
-    domain = _clean_domain(q.get("domain"))
-    if not domain:
-        return {"error": MESSAGES["bad_domain"]}, 400
-    with ctx["lock"]:
-        r = ctx["conn"].execute(
-            "SELECT domain, status, first_listed, last_event, last_checked, last_pass,"
-            " checks_json, contact, claim_method, reason FROM register_entry WHERE domain=?",
-            (domain,)).fetchone()
-    if not r:
-        return {"error": MESSAGES["not_listed"], "domain": domain,
-                "prove_it": "/x/register/absence?domain=%s&at=<date>" % domain}, 404
-    try:
-        checks = json.loads(r[6]) if r[6] else {}
-    except Exception:
-        checks = {}
-    return {
-        "domain": r[0], "status": r[1],
-        "status_means": VOCABULARY.get(r[1], "unexplained value — treat as unverified"),
-        "first_listed": _iso(r[2]), "last_event": _iso(r[3]),
-        "last_checked": _iso(r[4]) if r[4] else None,
-        "last_pass": _iso(r[5]) if r[5] else None,
-        "claim_method": r[8], "reason": r[9],
-        "checks": checks,
-        "what_this_is_not": WHAT_THIS_IS_NOT,
-        "history": "/x/register/history?domain=%s" % domain,
-    }, 200
-
-
-def _history(ctx, q):
-    domain = _clean_domain(q.get("domain"))
-    if not domain:
-        return {"error": MESSAGES["bad_domain"]}, 400
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT seq, ts, kind, detail, leaf_hex, audit_hash FROM register_event"
-            " WHERE domain=? ORDER BY seq ASC", (domain,)).fetchall()
-    events = []
-    for s, ts, kind, detail, leaf, ah in rows:
-        try:
-            d = json.loads(detail)
-        except Exception:
-            d = detail
-        events.append({"seq": s, "at": _iso(ts), "kind": kind, "detail": d,
-                       "leaf": leaf, "audit_hash": ah,
-                       "inclusion": "/x/register/inclusion?seq=%d" % s})
-    return {"domain": domain, "count": len(events), "events": events,
-            "note": "Nothing is ever removed from this history, including revocations."}, 200
-
-
-def _absence(ctx, q):
-    """Prove a domain was NOT listed at a given time."""
-    domain = _clean_domain(q.get("domain"))
-    if not domain:
-        return {"error": MESSAGES["bad_domain"]}, 400
-    at = _parse_when(q.get("at"))
-    with ctx["lock"]:
-        if at is None:
-            cp = ctx["conn"].execute(
-                "SELECT ts, tree_size, domain_root, domain_count, domains_json, audit_hash"
-                " FROM register_checkpoint ORDER BY id DESC LIMIT 1").fetchone()
-        else:
-            cp = ctx["conn"].execute(
-                "SELECT ts, tree_size, domain_root, domain_count, domains_json, audit_hash"
-                " FROM register_checkpoint WHERE ts<=? ORDER BY ts DESC LIMIT 1",
-                (at,)).fetchone()
-    if not cp:
-        return {"error": MESSAGES["no_checkpoint"], "domain": domain,
-                "asked_about": _iso(at) if at else "now"}, 404
-
-    domains = json.loads(cp[4])
-    leaves = [_sorted_leaf(d) for d in domains]
-    root = _sorted_root(leaves).hex()
-
-    if domain in domains:
-        idx = domains.index(domain)
-        return {
-            "domain": domain,
-            "present": True,
-            "at": _iso(cp[0]),
-            "checkpoint_root": root,
-            "index": idx,
-            "path": _sorted_path(leaves, idx),
-            "proves": "This domain WAS listed at the checkpoint shown. This is an inclusion proof, not an absence proof.",
-        }, 200
-
-    # find the two adjacent leaves it would sit between
-    lo, hi = None, None
-    for i, d in enumerate(domains):
-        if d < domain:
-            lo = i
-        if d > domain and hi is None:
-            hi = i
-    neighbours = []
-    if lo is not None:
-        neighbours.append({"position": "before", "index": lo, "domain": domains[lo],
-                           "leaf": leaves[lo].hex(), "path": _sorted_path(leaves, lo)})
-    if hi is not None:
-        neighbours.append({"position": "after", "index": hi, "domain": domains[hi],
-                           "leaf": leaves[hi].hex(), "path": _sorted_path(leaves, hi)})
-
-    if lo is not None and hi is not None:
-        proves = ("Indices %d and %d are consecutive in a sorted tree committed at %s. "
-                  "Nothing can sit between them, and %s sorts between them, so it was "
-                  "not listed at that checkpoint." % (lo, hi, _iso(cp[0]), domain))
-    elif not domains:
-        proves = ("The register held no listings at all at that checkpoint "
-                  "(count 0, sealed root %s), so %s was not listed." % (root, domain))
-    elif lo is None:
-        proves = ("%s sorts before the first leaf at index 0, and the leaf count was "
-                  "committed in advance, so it was not listed at that checkpoint." % domain)
-    else:
-        proves = ("%s sorts after the last leaf at index %d, and the leaf count was "
-                  "committed in advance, so it was not listed at that checkpoint." % (domain, lo))
-
-    return {
-        "domain": domain,
-        "present": False,
-        "asked_about": _iso(at) if at else "now",
-        "checkpoint_at": _iso(cp[0]),
-        "checkpoint_root": root,
-        "sealed_root": cp[2],
-        "roots_agree": root == cp[2],
-        "domain_count": cp[3],
-        "neighbours": neighbours,
-        "proves": proves,
-        "how_to_check_yourself": [
-            "leaf   = SHA256('AILEASH-REGISTER-LEAF-v1\\x00' + domain)",
-            "node   = SHA256('AILEASH-REGISTER-NODE-v1\\x00' + left + right)",
-            "Odd nodes are promoted to the next level, never paired with themselves.",
-            "Recompute each neighbour's path to the root and confirm it equals checkpoint_root.",
-        ],
-        "limit": "An absence proof is against a checkpoint. It says nothing about moments between checkpoints.",
-    }, 200
-
-
-def _consistency(ctx, q):
-    """RFC 6962 proof that the register at size `first` is a prefix of size `second`."""
-    leaves = _event_leaves(ctx)
-    n = len(leaves)
-    try:
-        first = int(q.get("first")) if q.get("first") else None
-        second = int(q.get("second")) if q.get("second") else n
-    except (TypeError, ValueError):
-        return {"error": "first and second must be integers"}, 400
-    if first is None:
-        return {"error": "first is required — the tree size you already hold",
-                "current_size": n}, 400
-    if not (0 < first <= second <= n):
-        return {"error": "need 0 < first <= second <= current size",
-                "current_size": n}, 400
-
-    proof = _ct_consistency(leaves[:second], first)
-    return {
-        "first": first,
-        "second": second,
-        "current_size": n,
-        "first_root": _ct_root(leaves[:first]).hex(),
-        "second_root": _ct_root(leaves[:second]).hex(),
-        "proof": proof,
-        "algorithm": "RFC 6962 consistency proof, SHA-256, leaf prefix 0x00, node prefix 0x01",
-        "proves": ("The register at size %d is a prefix of the register at size %d. "
-                   "No entry was inserted, altered or removed behind an earlier "
-                   "position — including by the operator." % (first, second)),
-        "verify_with": "Any standard Certificate Transparency verifier. This tree is deliberately unmodified so you do not have to use ours.",
-    }, 200
-
-
-def _inclusion(ctx, q):
-    leaves = _event_leaves(ctx)
-    try:
-        seq = int(q.get("seq"))
-    except (TypeError, ValueError):
-        return {"error": "seq is required"}, 400
-    with ctx["lock"]:
-        row = ctx["conn"].execute(
-            "SELECT seq, ts, domain, kind, leaf_hex, audit_hash FROM register_event"
-            " WHERE seq=?", (seq,)).fetchone()
-    if not row:
-        return {"error": "no event at that seq"}, 404
-    index = seq - 1
-    if index < 0 or index >= len(leaves):
-        return {"error": "seq out of range of the current tree"}, 409
-    return {
-        "seq": seq, "index": index, "at": _iso(row[1]), "domain": row[2],
-        "kind": row[3], "leaf": row[4], "audit_hash": row[5],
-        "tree_size": len(leaves),
-        "root": _ct_root(leaves).hex(),
-        "proof": _ct_inclusion(leaves, index),
-        "algorithm": "RFC 6962 inclusion proof, SHA-256",
-    }, 200
-
-
-def _checkpoints(ctx, q):
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT id, ts, tree_size, event_root, domain_root, domain_count, audit_hash"
-            " FROM register_checkpoint ORDER BY id DESC LIMIT 200").fetchall()
-    return {
         "count": len(rows),
-        "checkpoints": [{
-            "id": r[0], "at": _iso(r[1]), "tree_size": r[2],
-            "event_root": r[3], "domain_root": r[4],
-            "domain_count": r[5], "audit_hash": r[6],
+        "auth": "hmac-shared-secret",
+        "auth_scope": SHARED_SECRET_SCOPE,
+        "peers": [{
+            "peer_id": r[0], "chain_name": r[1], "url": r[2] or None,
+            "status": r[3], "registered": _iso(r[4]),
+            "submissions": r[5], "last_seen": _iso(r[6]) if r[6] else None,
+            "rotation_overlap_active":
+                bool(r[7] and r[7] + ROTATION_OVERLAP_SECONDS > now),
+            "latest_receipt_seq": r[8] or 0,
         } for r in rows],
-        "note": "event_root answers append-only. domain_root answers absence. They are different trees and never match.",
+        "note": "Secrets are never returned by any route.",
+        "receipt_seq_note":
+            "latest_receipt_seq is the highest receipt number issued to "
+            "that peer on this lane. A peer whose own highest receipt is "
+            "lower than this has not received one of them, and can say "
+            "exactly how many. Public on purpose - a gap you can only see "
+            "from the inside is not evidence of anything.",
     }, 200
 
 
-def _roots(ctx):
-    leaves = _event_leaves(ctx)
-    domains = _live_domains(ctx)
+def _history(ctx, data):
+    """
+    Keyed. Now returns the stored response body as well as the summary.
+
+    A peer that hashed the response it received can ask the operator to
+    hash the stored copy and compare. Without the body on this route
+    there is no way to settle a disagreement about what was sent, which
+    came up the first time a peer's verifier disagreed with a receipt.
+
+    Pass full=false to get the summary only.
+    """
+    _setup(ctx)
+    peer_id = (data.get("peer_id") or "").strip().lower()
+    full = data.get("full", True)
+    if isinstance(full, str):
+        full = full.strip().lower() not in ("0", "false", "no")
+    try:
+        limit = min(int(data.get("limit", 50)), 500)
+    except (TypeError, ValueError):
+        limit = 50
+
+    q = ("SELECT peer_id, ts, idempotency_key, payload_digest, audit_hash, "
+         "response_json FROM peer_submission")
+    args = []
+    if peer_id:
+        q += " WHERE peer_id = ?"
+        args.append(peer_id)
+    q += " ORDER BY id DESC LIMIT ?"
+    args.append(limit)
+    rows = ctx["conn"].execute(q, args).fetchall()
+
+    subs = []
+    for r in rows:
+        item = {
+            "peer_id": r[0], "at": _iso(r[1]), "idempotency_key": r[2],
+            "payload_digest": r[3], "audit_hash": r[4],
+            "sealed": bool(r[4]),
+        }
+        body = r[5]
+        if body:
+            try:
+                parsed = json.loads(body)
+            except Exception:
+                parsed = None
+            if parsed is not None:
+                item["response_digest"] = hashlib.sha256(
+                    canonical(parsed).encode("ascii")).hexdigest()
+                if full:
+                    item["response"] = parsed
+        subs.append(item)
+
     return {
-        "tree_size": len(leaves),
-        "event_root": _ct_root(leaves).hex(),
-        "domain_count": len(domains),
-        "domain_root": _sorted_root([_sorted_leaf(d) for d in domains]).hex(),
-        "at": _iso(_now()),
-        "note": "Live values. A root only becomes evidence once it is sealed by a checkpoint.",
+        "ok": True, "count": len(subs),
+        "response_digest_recipe":
+            "sha256(json.dumps(response, sort_keys=True, "
+            "separators=(\",\",\":\"), ensure_ascii=True).encode(\"ascii\"))",
+        "note": "response_digest is over the stored copy of exactly what "
+                "was returned to the peer. A peer that hashed what it "
+                "received the same way can compare directly.",
+        "submissions": subs,
     }, 200
 
 
-# ------------------------------------------------------------------ handle
+def _canonical_route(data):
+    """
+    Debugging aid. Give it an envelope, get back the exact string this
+    server will sign. Reveals nothing -- the secret is not involved.
+    """
+    env = dict(data or {})
+    env.pop("signature", None)
+    if "ts" in env:
+        try:
+            env["ts"] = int(env["ts"])
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "malformed_ts"}, 400
+    s = string_to_sign(env)
+    known = {"peer_id", "ts", "nonce", "payload", "idempotency_key"}
+    extra = sorted(k for k in env if k not in known)
+    out = {
+        "ok": True,
+        "string_to_sign": s,
+        "sha256": hashlib.sha256(s.encode("utf-8")).hexdigest(),
+        "byte_length": len(s.encode("utf-8")),
+        "recipe": "\"AILEASH-PEER-v1\\n\" + json.dumps(envelope_without_"
+                  "signature, sort_keys=True, separators=(\",\",\":\"), "
+                  "ensure_ascii=True)",
+        "then": "signature = hmac_sha256(secret, string_to_sign).hexdigest()",
+    }
+    if extra:
+        out["warning"] = (
+            "This route echoes whatever you sent, but /x/peer/submit "
+            "rebuilds the envelope from known fields only. These extra "
+            "top-level fields would NOT be part of what submit verifies, "
+            "so a signature over the string above would be rejected: %s. "
+            "Move them inside payload." % ", ".join(extra))
+    return out, 200
+
+
+# ------------------------------------------------------------------ spec
+
+def _spec():
+    return {
+        "module": "peer",
+        "version": VERSION,
+        "auth": "hmac-shared-secret",
+        "read_this_first": SHARED_SECRET_SCOPE,
+        "purpose":
+            "Signed submission for named peers. Sits beside the open "
+            "/x/witness/observe endpoint rather than replacing it. The "
+            "open endpoint stays unauthenticated so anyone can audit the "
+            "network without an account; this one guarantees that only a "
+            "holder of the peer secret can submit as that chain -- noting "
+            "that the operator is also a holder.",
+        "choosing_a_lane": {
+            "/x/witness/observe": "Open. No credential. Anyone can submit "
+                                  "under any name; the record says how "
+                                  "strong the claim is rather than "
+                                  "refusing it.",
+            "/x/peer/submit": "This lane. Shared secret. Excludes third "
+                              "parties, does not exclude the operator. No "
+                              "key custody burden on the peer.",
+            "/x/signed/submit": "Ed25519. The peer holds the private key "
+                                "and this deployment holds only the public "
+                                "half, so the operator is excluded too. "
+                                "Strongest, at the cost of the peer "
+                                "carrying a long-lived private key.",
+        },
+        "envelope": {
+            "peer_id": "string, issued at registration",
+            "ts": "integer unix seconds",
+            "nonce": "string, at least %d chars, unique per peer for %ds"
+                     % (NONCE_MIN_LENGTH, NONCE_TTL_SECONDS),
+            "idempotency_key": "optional string, max %d chars"
+                               % MAX_IDEMPOTENCY_KEY,
+            "payload": "object. period roots, tips, whatever is agreed. "
+                       "max %d bytes canonicalized." % MAX_PAYLOAD_BYTES,
+            "signature": "hex hmac-sha256",
+            "no_other_top_level_fields":
+                "The server rebuilds the envelope from exactly the field "
+                "names above before verifying. Any extra top-level field "
+                "you signed is not part of what we verify and your "
+                "signature will not match. Put your own data inside "
+                "payload.",
+        },
+        "canonicalization": {
+            "recipe": "json.dumps(obj, sort_keys=True, "
+                      "separators=(\",\",\":\"), ensure_ascii=True)",
+            "string_to_sign": "\"AILEASH-PEER-v1\\n\" + canonical(envelope "
+                              "with the signature field removed)",
+            "signature": "hmac_sha256(secret, string_to_sign).hexdigest()",
+            "debug": "POST the envelope to /x/peer/canonical to get the "
+                     "exact string back. No secret required.",
+        },
+        "rules": {
+            "clock_skew": "+/-%ds. Outside: 401 clock_skew, with the "
+                          "server's time in the body."
+                          % CLOCK_SKEW_SECONDS,
+            "replay": "A nonce is single-use per peer for %ds. Reused: "
+                      "409 replay." % NONCE_TTL_SECONDS,
+            "idempotency": "Same idempotency_key and same payload returns "
+                           "the original receipt verbatim with "
+                           "replayed=true; nothing is sealed twice. Same "
+                           "key with a different payload: 409 "
+                           "idempotency_conflict.",
+            "retry": "Retry the identical envelope. With an "
+                     "idempotency_key that is a safe no-op. Without one, "
+                     "a retry inside the nonce window returns 409 replay "
+                     "-- so send an idempotency_key if you intend to "
+                     "retry at all.",
+            "suspension": "403 peer_suspended. Nothing is deleted and the "
+                          "peer's sealed history stands.",
+            "rotation": "A new secret is issued and the previous one stays "
+                        "valid for %ds. Submissions accepted on the old "
+                        "secret come back with signed_with=previous and a "
+                        "warning naming the cutoff. The operator performs "
+                        "the rotation, because the operator holds the "
+                        "secret."
+                        % ROTATION_OVERLAP_SECONDS,
+            "seal_failure":
+                "If the audit chain does not seal your submission, you get "
+                "500 seal_failed with the reason, and nothing is recorded "
+                "-- no nonce, no counter, no receipt. Resend the identical "
+                "envelope once the fault is fixed. A receipt you cannot "
+                "verify is worse than no receipt, so this lane will not "
+                "issue one.",
+        },
+        "on_acceptance": {
+            "summary":
+                "The payload is sealed into the audit chain and you get a "
+                "receipt. Verify independently: inclusion at "
+                "/x/complete/prove, ancestry at /x/consistency/ancestor, "
+                "append-only at /x/consistency/proof. Both offline "
+                "verifiers (aileash_verify.py, verify_authority.py) are "
+                "stdlib only and touch no network.",
+            "response_shape": {
+                "ok": "true",
+                "accepted": "true",
+                "peer_id": "string",
+                "chain_name": "string",
+                "payload_digest": "sha256 hex of canonical(payload)",
+                "signed_with": "current | previous",
+                "auth": "hmac-shared-secret",
+                "auth_scope": "the shared-secret paragraph",
+                "received_at": "ISO 8601 Z. TOP LEVEL, beside receipt, "
+                               "not inside it.",
+                "receipt": "{ audit_hash, block_index, receipt_seq, "
+                           "receipt_seq_scope, key_seq }",
+                "verify": "{ inclusion, ancestry, append_only } "
+                          "-- exactly these three keys",
+                "gapless": "string. TOP LEVEL, not inside verify.",
+                "warning": "present only when signed_with is previous",
+                "replayed": "present only on an idempotent retry",
+                "note": "present only on an idempotent retry",
+            },
+            "where_received_at_lives":
+                "Top level. It is a sibling of receipt, not a member of "
+                "it. The receipt object holds three fields and no others. "
+                "Pin your schema accordingly -- the earlier version of "
+                "this document listed the three receipt fields without "
+                "saying where received_at sat, and a peer reasonably "
+                "pinned it in the wrong place.",
+            "receipt_seq":
+                "An integer, never null, incremented by exactly one for "
+                "each accepted submission FROM THIS PEER on this lane. "
+                "Issued inside the same lock that writes the record, so a "
+                "number is never spent on a submission that was not "
+                "stored. Two receipts numbered N and N+2 prove a third "
+                "exists that you did not receive. The current highest is "
+                "published per peer at /x/peer/peers, so the check does "
+                "not depend on asking us.",
+            "receipt_seq_scope": {'values': ['per-peer', 'per-name', 'per-chain'], 'per-peer': 'issued per registered peer_id. Used by /x/peer/submit.', 'per-name': 'issued per bound name. Used by /x/bind/submit.', 'per-chain': 'issued per enrolled chain name. Used by /x/signed/submit.', 'why_it_is_here': 'The three signed lanes each count within their own scope, so a receipt carries the scope of its own sequence rather than requiring the holder to remember which lane produced it. The set is closed: a value outside this list is an error on our side, not a new scope you should widen a schema for.', 'not_comparable_across_scopes': 'Two receipts with different scopes are counting different things and their numbers say nothing about each other.'},
+            "key_seq":
+                "The server-wide per-API-key sequence, which is null on "
+                "this lane and always will be. That counter lives on an "
+                "api_key and this lane authenticates by signature with no "
+                "key to count against. It is returned rather than omitted "
+                "so the absence is visible instead of inferred. Before "
+                "1.3.0 this null was reported as receipt_seq, which made "
+                "a missing property look like a broken field. Raised by "
+                "Philip Pinol (PRAXIS), correctly.",
+            "what_received_at_is":
+                "This server's clock at the moment of acceptance. It is "
+                "not evidence of when anything happened and should not be "
+                "relied on as such. The audit_hash is the evidence.",
+            "proving_what_you_received":
+                "The full response body is stored server side. A peer who "
+                "hashes the response with sha256 over "
+                "json.dumps(response, sort_keys=True, separators=(\",\","
+                "\":\"), ensure_ascii=True) can ask the operator to "
+                "compare against the stored copy via GET history.",
+        },
+        "routes": {
+            "GET spec": "public. this document.",
+            "GET schema": "public. the same response shape as a JSON Schema "
+                          "a validator can load directly, so nobody has to "
+                          "transcribe prose into rules.",
+            "POST canonical": "public. the exact string to sign.",
+            "GET peers": "public. peer ids and status. never secrets.",
+            "POST submit": "signature authenticated. no API key.",
+            "POST register": "keyed. operator issues a credential.",
+            "POST rotate": "keyed. new secret, old one overlaps.",
+            "POST suspend / POST resume": "keyed.",
+            "GET history": "keyed. submissions with the stored response "
+                           "body and its digest. Pass full=false for the "
+                           "summary only.",
+        },
+        "what_this_does_not_do": [
+            "It does not exclude the operator of this deployment. A shared "
+            "secret is held by both parties, so a valid signature means a "
+            "holder of the secret submitted - which is you and also us. "
+            "Use /x/signed/submit if that matters to you.",
+            "It does not make a submitted root true. It proves who "
+            "submitted it and when, and that it has not changed since.",
+            "It does not replace /x/witness/observe. Peers who prefer the "
+            "open path keep using it and lose nothing.",
+            "A shared secret authenticates a channel, not a person. If "
+            "the secret leaks, rotate it.",
+        ],
+        "worked_example": {
+            "envelope_before_signing": {
+                "peer_id": "example-001",
+                "ts": 1755432000,
+                "nonce": "0123456789abcdef",
+                "payload": {"period": "2026-Q3", "root": "ab12...", "count": 4096},
+            },
+            "note": "POST exactly that to /x/peer/canonical and you will "
+                    "get the string to sign, so you can confirm your "
+                    "implementation before you hold a secret.",
+        },
+        "machine_readable_schema": "/x/peer/schema",
+        "changed_in_1_4_0": [
+            "Added GET /x/peer/schema - the accepted-response shape as a "
+            "JSON Schema, additionalProperties false throughout, loadable "
+            "straight into a validator. Every failure this lane had in its "
+            "first week came from a peer transcribing a written description "
+            "into a closed schema and the two disagreeing. This removes the "
+            "transcription step.",
+        ],
+        "changed_in_1_3_2": [
+            "gapless moved out of the verify object to the top level. In "
+            "1.3.0 and 1.3.1 verify carried four keys while the spec "
+            "documented three, so a closed schema pinned to the written "
+            "shape refused a correct response. Caught by Philip Pinol "
+            "(PRAXIS). verify now carries exactly inclusion, ancestry and "
+            "append_only, as documented.",
+            "auth_scope is unchanged and is 535 bytes of prose on one "
+            "line. There is no published length limit on it and there "
+            "never has been - if you have been told otherwise, that rule "
+            "did not come from this spec.",
+        ],
+        "changed_in_1_3_1": [
+            "receipt_seq_scope is now a bare token from a closed set - "
+            "per-peer, per-name, per-chain - rather than a sentence. The "
+            "set is published under on_acceptance.receipt_seq_scope so a "
+            "closed schema can pin an enum rather than a bounded string. "
+            "Asked for by Philip Pinol (PRAXIS). Value change only; the "
+            "response shape is unchanged from 1.3.0.",
+        ],
+        "changed_in_1_3_0": [
+            "receipt_seq is now a real per-peer gapless sequence issued by "
+            "this module, not the api_key counter that was always null "
+            "here. The completeness property applies to this lane for the "
+            "first time.",
+            "The api_key counter is still returned, as key_seq, and is "
+            "null by design so the absence is stated rather than hidden.",
+            "/x/peer/peers publishes latest_receipt_seq per peer, so a "
+            "peer can detect a missing receipt without asking us.",
+        ],
+        "changed_in_1_2": [
+            "A failed seal returns 500 instead of a receipt with null "
+            "fields and ok=true. Found in production on 2026-08-26.",
+            "Operator routes report sealed true/false rather than "
+            "swallowing a seal failure.",
+            "GET history returns the stored response body and its digest.",
+            "The response shape is documented in full, including where "
+            "received_at lives.",
+        ],
+    }
+
+
+
+# ----------------------------------------------------------------------
+# machine-readable schema
+# ----------------------------------------------------------------------
+
+# The three scopes any lane on this deployment can issue a sequence in.
+# Referenced by the schema below AND by the spec prose, so the enum cannot
+# say one thing in one place and another somewhere else.
+SEQ_SCOPES = ("per-peer", "per-name", "per-chain")
+
+
+def _schema():
+    """JSON Schema for the accepted-submission response.
+
+    WHY THIS EXISTS
+        Every failure in this lane's first week was the same failure: a peer
+        transcribing a written description into a closed schema, and the
+        description and the bytes disagreeing. received_at in the wrong
+        place. key_seq at the wrong level. receipt_seq_scope pinned as an
+        identifier when it was prose. gapless inside verify when the prose
+        said three keys.
+
+        None of those were disagreements about behaviour. Every one was a
+        human reading a paragraph and writing a rule from it. So the
+        paragraph stops being the interface.
+
+        This route returns a schema a validator loads directly. Nobody
+        transcribes anything, and if the shape changes the schema changes
+        with it rather than a sentence somewhere needing to be noticed.
+
+    WHAT IT DOES NOT DO
+        It does not make the shape correct - it makes the shape STATED in a
+        form that cannot be misread. If this deployment returns something
+        the schema forbids, that is a fault here and your validator should
+        refuse it. That is the point.
+
+        additionalProperties is false on every object on purpose. A schema
+        that quietly tolerates unknown keys would have hidden the gapless
+        mistake instead of catching it.
+    """
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://sebbi.pro/x/peer/schema",
+        "title": "AILEASH-PEER-v1 accepted submission response",
+        "module_version": VERSION,
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["ok", "accepted", "peer_id", "chain_name",
+                     "payload_digest", "signed_with", "auth", "auth_scope",
+                     "received_at", "receipt", "verify", "gapless"],
+        "properties": {
+            "ok": {"const": True},
+            "accepted": {"const": True},
+            "peer_id": {"type": "string"},
+            "chain_name": {"type": ["string", "null"]},
+            "payload_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "signed_with": {"enum": ["current", "previous"]},
+            "auth": {"const": "hmac-shared-secret"},
+            "auth_scope": {
+                "type": "string",
+                "description": "Prose, not an identifier. The shared-secret "
+                               "scope paragraph. No length limit is defined "
+                               "and none should be assumed.",
+            },
+            "received_at": {
+                "type": ["string", "null"],
+                "description": "ISO 8601 Z, this server's clock at "
+                               "acceptance. TOP LEVEL, beside receipt. Not "
+                               "evidence of when anything happened.",
+            },
+            "receipt": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["audit_hash", "block_index", "receipt_seq",
+                             "receipt_seq_scope", "key_seq"],
+                "properties": {
+                    "audit_hash": {"type": "string",
+                                   "pattern": "^[0-9a-f]{64}$"},
+                    "block_index": {"type": "integer"},
+                    "receipt_seq": {"type": "integer", "minimum": 1},
+                    "receipt_seq_scope": {"enum": list(SEQ_SCOPES)},
+                    "key_seq": {
+                        "type": "null",
+                        "description": "Null on this lane and always will "
+                                       "be. Returned so the absence is "
+                                       "visible rather than inferred.",
+                    },
+                },
+            },
+            "verify": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["inclusion", "ancestry", "append_only"],
+                "properties": {
+                    "inclusion": {"type": "string"},
+                    "ancestry": {"type": "string"},
+                    "append_only": {"type": "string"},
+                },
+                "description": "Exactly three route hints. Strings, not "
+                               "structured objects.",
+            },
+            "gapless": {"type": "string"},
+            "warning": {
+                "type": "string",
+                "description": "Present ONLY when signed_with is previous.",
+            },
+            "replayed": {
+                "const": True,
+                "description": "Present ONLY on an idempotent retry.",
+            },
+            "note": {
+                "type": "string",
+                "description": "Present ONLY on an idempotent retry.",
+            },
+        },
+        "conditional_fields": {
+            "warning": "signed_with == previous",
+            "replayed": "idempotent retry",
+            "note": "idempotent retry",
+        },
+        "on_failure": {
+            "note": "Failure responses are NOT covered by this schema. They "
+                    "carry ok false with an error string, and a validator "
+                    "should branch on the status code before validating.",
+            "errors": ["malformed_envelope", "malformed_ts", "nonce_too_short",
+                       "payload_too_large", "unknown_peer", "peer_suspended",
+                       "clock_skew", "bad_signature", "idempotency_conflict",
+                       "replay", "seal_failed"],
+        },
+        "how_to_use_it": (
+            "Load this document into any JSON Schema validator and point it "
+            "at the response body. Do not transcribe it into your own rules "
+            "- transcription is what went wrong every time this lane broke."),
+        "if_we_break_it": (
+            "additionalProperties is false everywhere. If this deployment "
+            "returns a key not listed here, your validator refuses it and "
+            "that refusal is correct. Tell us; it is our fault, not a "
+            "schema you should widen."),
+    }, 200
+
+# ---------------------------------------------------------------- router
 
 def handle(method, action, data, api_key, ctx):
-    _ensure(ctx)
     data = data or {}
-    q = data if isinstance(data, dict) else {}
 
-    if method == "GET":
-        if action == "spec":
-            return _spec(ctx)
-        if action == "vocabulary":
-            return {"status_vocabulary": VOCABULARY,
-                    "what_this_is_not": WHAT_THIS_IS_NOT,
-                    "suite_version": SUITE_VERSION}, 200
-        if action == "list":
-            return _list(ctx, q)
-        if action == "entry":
-            return _entry(ctx, q)
-        if action == "history":
-            return _history(ctx, q)
-        if action == "absence":
-            return _absence(ctx, q)
-        if action == "consistency":
-            return _consistency(ctx, q)
-        if action == "inclusion":
-            return _inclusion(ctx, q)
-        if action == "checkpoints":
-            return _checkpoints(ctx, q)
-        if action == "roots":
-            return _roots(ctx)
-        if action == "tokens":
-            d = _clean_domain(q.get("domain"))
-            if not d:
-                return {"error": MESSAGES["bad_domain"]}, 400
-            live = _live_tokens(ctx, d)
-            return {"domain": d, "live_tokens": len(live),
-                    "tokens": [{"token": t, "issued": _iso(i),
-                                "expires": _iso(i + CHALLENGE_TTL_SECONDS)} for t, i in live],
-                    "note": "Any of these will verify. Requesting a new token does not "
-                            "invalidate one you have already published."}, 200
-        if action == "sealcheck":
-            probe = {"user_id": "register:sealcheck", "type": "register_sealcheck",
-                     "kind": "probe", "at": _iso(_now())}
-            try:
-                h = _do_seal(ctx, probe, result="sealcheck")
-                return {"ok": True, "audit_hash": h,
-                        "note": "The register can seal. This probe is a real sealed block."}, 200
-            except Exception as e:
-                return {"ok": False, "error": "seal_failed", "detail": str(e),
-                        "note": "Nothing was written. The detail names what server.py's seal did."}, 500
-        return {"error": "unknown action", "see": "/x/register/spec"}, 404
+    if action == "spec":
+        return _spec(), 200
+    if action == "schema":
+        return _schema()
+    if action == "canonical":
+        return _canonical_route(data)
+    if action == "peers":
+        return _peers(ctx)
+    if action == "submit":
+        return _submit(ctx, data)
 
-    if method == "POST":
-        if action == "challenge":
-            return _challenge(ctx, q)
-        if action == "claim":
-            return _claim(ctx, q)
-        if action == "recheck":
-            return _recheck(ctx, q)
-        if action == "withdraw":
-            return _withdraw(ctx, q)
-        # keyed below
-        if not api_key:
-            return {"error": "api key required for this action"}, 401
-        if action == "revoke":
-            return _revoke(ctx, q)
-        if action == "checkpoint":
-            try:
-                return {"ok": True, "checkpoint": _seal_checkpoint(ctx)}, 200
-            except Exception as e:
-                return {"error": MESSAGES["seal_failed"], "detail": str(e)}, 500
-        if action == "recheck-all":
-            return _recheck_all(ctx)
-        return {"error": "unknown action", "see": "/x/register/spec"}, 404
+    if not api_key:
+        return {"ok": False, "error": "api_key_required"}, 401
 
-    return {"error": "method not allowed"}, 405
+    if action == "register":
+        return _register(ctx, data)
+    if action == "rotate":
+        return _rotate(ctx, data)
+    if action == "suspend":
+        return _set_status(ctx, data, "suspended")
+    if action == "resume":
+        return _set_status(ctx, data, "active")
+    if action == "history":
+        return _history(ctx, data)
+
+    return {"ok": False, "error": "unknown_action", "action": action}, 404
 
 ```
 
 
-## `modules/replay.py`
+## `modules/peerconsole.py`
 
-678 lines, 30538 bytes
+376 lines, 15478 bytes
 
 ```python
-#!/usr/bin/env python3
 """
-modules/replay.py  -  proving the same inputs still produce the same verdict
-                      WITHOUT ever disclosing how the verdict is reached
-============================================================================
+modules/peerconsole.py  v1.0  -  the peer credential page at /peers
 
-THE QUESTION NOBODY ELSE IN THIS MARKET CAN ANSWER
---------------------------------------------------
-Every compliance platform can tell you what it decided. Not one of them can
-prove it would decide the same way again.
+Register a peer, rotate their secret, suspend them, see who is on.
+Keyed POSTs a browser address bar cannot reach.
 
-Ask any of them to re-run decision 4,117 from its sealed inputs and show the
-same verdict falls out. They cannot. Not because they will not - because
-their scoring goes through a model call, and model calls are not
-reproducible. Same inputs, different day, different answer. Their audit
-trail describes a decision that can never be performed twice.
-
-Ours is arithmetic. Deterministic below the model layer, and always has
-been. This module lets anyone establish that for themselves.
-
-THE SCORING LOGIC IS NEVER DISCLOSED
-------------------------------------
-Read this before changing anything in here.
-
-Nothing in this module publishes, returns, echoes or hints at the contents
-of the decision function. Not the source, not the weights, not the
-thresholds, not the signal names, not the intermediate values. The only
-thing that leaves the building is a SHA-256 of the deployed source, which
-is one-way and reveals nothing about what it hashes.
-
-Determinism is proved as a BLACK BOX instead: same inputs in, same verdict
-out, demonstrated repeatedly, by the challenger, on their own schedule,
-with every run sealed into the chain. That is a stronger proof than showing
-the code, because it is behaviour observed over time rather than a claim
-about a listing nobody can confirm is what actually runs in production.
-
-  A competitor who reads every route here learns exactly one thing: that
-  our verdicts are reproducible. Which is the point, and which they cannot
-  copy, because reproducibility is a property of the architecture and not a
-  feature that can be bolted on.
-
-HOW SOMEONE CHECKS US WITHOUT SEEING ANYTHING
----------------------------------------------
-  POST /x/replay/challenge   send any inputs you like. We run them, seal
-                             the run into the chain, and hand you back the
-                             verdict, the audit hash, and a fingerprint of
-                             your own inputs.
-
-Send the same inputs again - an hour later, a year later, from a different
-address. If the verdict ever moves, you have caught us, and both runs are
-independently sealed and anchored so we cannot revise either one. If it
-never moves, you have established determinism yourself, empirically,
-adversarially, without a line of our code.
-
-We also report how many times that exact input has been challenged, when it
-was first seen, and every audit hash it produced, so the whole history is
-verifiable through routes we do not control the answers to.
-
-THE HONEST COST, WHICH IS REAL
-------------------------------
-An open scoring oracle can be probed. Feed it a thousand variations, watch
-the verdicts move, and a determined party can map the decision boundary
-without ever seeing the code. That is a genuine exposure and it is the
-price of this proof.
-
-It is mitigated, not eliminated: challenges are rate limited per address,
-inputs are fingerprinted so repeat submissions are cheap and novel ones are
-not, and boundary-probing patterns are already logged elsewhere in the
-platform. Anyone systematically mapping the function leaves an obvious,
-sealed trail while doing it.
-
-The trade is deliberate. A closed engine nobody can test is worth less than
-a testable one somebody might partially map, because the first cannot be
-sold to a regulator and the second can.
-
-CONFIGURATION
--------------
-This module does not import server.py - nothing here does. It finds the
-live decision function at runtime among already-loaded modules, so it can
-only observe the engine, never change it. If your scorer is named something
-not in SCORER_NAMES below, add it there. Everything else is read from the
-audit_log schema at startup rather than assumed.
-
-    POST /x/replay/challenge     run any inputs, sealed          (public)
-    GET  /x/replay/history       every run of a given input       (public)
-    GET  /x/replay/self          reproduction rate over a sample  (public)
-    GET  /x/replay/fingerprint   hash of the deployed code        (public)
-    GET  /x/replay/spec          how to test us                   (public)
-    GET  /x/replay/check         re-run one sealed decision       (keyed)
-    POST /x/replay/attest        seal the current fingerprint     (keyed)
+Own patch attribute so it composes with console.py and packconsole.py.
+After a deploy, one /x/ request arms it: /x/peerconsole/status
 """
 
-import hashlib
-import inspect
-import json
 import sys
-import time
-from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 VERSION = "1.0"
+PUBLIC = {("GET", "status")}
+PAGE_PATHS = ("/peers", "/peers.html", "/peer-console")
 
-# Challenge, history, self, fingerprint and spec are open - a
-# reproducibility claim you need an account to test is not a claim anyone
-# should accept. check stays keyed: it reads back a specific sealed
-# decision, which belongs to whoever owns it.
-PUBLIC = {("POST", "challenge"), ("GET", "history"), ("GET", "self"),
-          ("GET", "fingerprint"), ("GET", "spec")}
+_patched = [False]
 
-# Names the live decision function might go by. Add yours if it is not
-# here - this is the one thing that has to match your code.
-SCORER_NAMES = (
-    "score_event", "decide", "score", "evaluate", "run_decision",
-    "make_decision", "assess", "score_decision", "engine_decide",
-)
+PAGE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Peers — AILeash</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--ink:#0a0f1e;--panel:#131b2e;--panel2:#1a2338;--edge:rgba(201,168,76,.22);
+--gold:#c9a84c;--text:#f2efe6;--mute:rgba(242,239,230,.42);--ok:#7fe3b0;--err:#ff8a80;
+--mono:'IBM Plex Mono',ui-monospace,monospace;--body:system-ui,-apple-system,sans-serif}
+body{background:var(--ink);color:var(--text);font-family:var(--body);font-size:16px;
+line-height:1.6;padding:0 0 60px}
+.wrap{max-width:640px;margin:0 auto;padding:0 18px}
+header{padding:30px 0 20px;border-bottom:1px solid var(--edge);margin-bottom:24px}
+.eyebrow{font-family:var(--mono);font-size:10px;letter-spacing:.24em;
+text-transform:uppercase;color:var(--gold);margin-bottom:8px}
+h1{font-size:34px;line-height:1;font-weight:800;letter-spacing:-.02em}
+h1 span{color:var(--gold)}
+.sub{color:var(--mute);font-size:14px;margin-top:10px}
+label{display:block;font-family:var(--mono);font-size:10px;letter-spacing:.16em;
+text-transform:uppercase;color:var(--mute);margin-bottom:6px}
+input{width:100%;background:var(--panel);border:1px solid var(--edge);color:var(--text);
+font-family:var(--mono);font-size:13px;padding:12px;border-radius:4px;outline:none}
+input:focus{border-color:var(--gold)}
+.keybar{background:var(--panel2);border:1px solid var(--edge);border-radius:6px;
+padding:16px;margin-bottom:24px}
+.keynote{font-size:12px;color:var(--mute);margin-top:8px}
+.op{border:1px solid var(--edge);border-radius:6px;background:var(--panel);
+margin-bottom:12px;overflow:hidden}
+.op-head{display:flex;align-items:baseline;gap:10px;padding:15px 16px;cursor:pointer}
+.op-head:hover{background:var(--panel2)}
+.op-n{font-family:var(--mono);font-size:10px;color:var(--gold);opacity:.6}
+.op-t{font-size:17px;font-weight:700}
+.op-r{margin-left:auto;font-family:var(--mono);font-size:10px;color:var(--mute)}
+.op-body{padding:0 16px 16px;display:none}
+.op.open .op-body{display:block}
+.op-why{font-size:13.5px;color:var(--mute);margin-bottom:14px}
+.field{margin-bottom:12px}
+button{width:100%;background:var(--gold);color:var(--ink);border:none;border-radius:4px;
+padding:14px;font-weight:700;font-size:14.5px;cursor:pointer}
+button:hover:not(:disabled){background:#dbbd63}
+button.quiet{background:transparent;color:var(--mute);border:1px solid var(--edge)}
+.two{display:flex;gap:10px}
+.two button{flex:1}
+#out{margin-top:24px}
+pre{font-family:var(--mono);font-size:11.5px;line-height:1.6;background:#080c16;
+color:var(--ok);padding:14px;border-radius:5px;overflow-x:auto;
+border:1px solid var(--edge);max-height:320px}
+.msg{font-family:var(--mono);font-size:12.5px;padding:13px 15px;border-radius:5px;
+border:1px solid var(--edge);color:var(--mute);margin-bottom:12px}
+.msg.bad{color:var(--err);border-color:rgba(200,54,43,.5);background:rgba(200,54,43,.08)}
+.msg.good{color:var(--ok);border-color:rgba(127,227,176,.35);background:rgba(26,158,110,.08)}
+.secret{background:#080c16;border:2px solid var(--gold);border-radius:6px;padding:18px;
+margin-bottom:14px}
+.secret .lbl{font-family:var(--mono);font-size:10px;letter-spacing:.16em;
+text-transform:uppercase;color:var(--gold);margin-bottom:10px}
+.secret .val{font-family:var(--mono);font-size:13px;color:var(--text);word-break:break-all;
+line-height:1.7;background:var(--panel);padding:12px;border-radius:4px}
+.secret .warn{color:var(--err);font-size:13px;margin-top:12px}
+.peer{padding:12px 0;border-bottom:1px solid var(--edge)}
+.peer:last-child{border-bottom:none}
+.peer .id{font-family:var(--mono);font-size:13.5px;color:var(--gold)}
+.peer .meta{font-size:12.5px;color:var(--mute);margin-top:3px}
+.pill{display:inline-block;font-family:var(--mono);font-size:10px;padding:2px 7px;
+border-radius:3px;letter-spacing:.1em;text-transform:uppercase}
+.pill.active{background:rgba(26,158,110,.18);color:var(--ok)}
+.pill.suspended{background:rgba(200,54,43,.15);color:var(--err)}
+footer{margin-top:30px;padding-top:16px;border-top:1px solid var(--edge);
+font-family:var(--mono);font-size:10.5px;color:var(--mute);line-height:1.8}
+a{color:var(--gold)}
+</style>
+</head>
+<body>
+<div class="wrap">
 
-# Columns the sealed inputs might live in. Detected, never assumed.
-INPUT_COLUMNS = ("event", "event_json", "payload", "inputs", "request",
-                 "ev", "data", "event_data")
-RESULT_COLUMNS = ("result", "result_json", "res", "decision_json", "outcome",
-                  "response")
-VERDICT_COLUMNS = ("decision", "verdict", "action_taken")
-SCORE_COLUMNS = ("score", "risk_score", "points")
+<header>
+  <p class="eyebrow">AILeash · peer credentials</p>
+  <h1>Signed <span>peers</span></h1>
+  <p class="sub">The open endpoint stays open. This issues credentials to peers who need a guarantee that only they can submit as their chain.</p>
+</header>
 
-SELF_SAMPLE_DEFAULT = 50
-SELF_SAMPLE_MAX = 500
+<div class="keybar">
+  <label for="key">API key</label>
+  <input id="key" type="password" placeholder="al_live_…" autocomplete="off" spellcheck="false">
+  <p class="keynote">Held in this tab only. Close it and the key is gone.</p>
+</div>
 
-# Challenge throttle. Repeat submissions of an input we have already seen
-# are cheap; novel inputs are what a prober needs, so those are what get
-# limited.
-NOVEL_PER_HOUR = 40
-MAX_PAYLOAD_KEYS = 40
+<div class="op open" id="op-reg">
+  <div class="op-head" onclick="tog('op-reg')">
+    <span class="op-n">01</span><span class="op-t">Register a peer</span>
+    <span class="op-r">POST /x/peer/register</span>
+  </div>
+  <div class="op-body">
+    <p class="op-why">Issues their secret. It is shown once here and never again — send it to them over a channel you trust, not the same email as everything else.</p>
+    <div class="field">
+      <label for="r-id">Peer id (lowercase, no spaces)</label>
+      <input id="r-id" placeholder="praesidium" autocomplete="off">
+    </div>
+    <div class="field">
+      <label for="r-name">Chain name</label>
+      <input id="r-name" placeholder="PRAXIS" autocomplete="off">
+    </div>
+    <div class="field">
+      <label for="r-url">Their public tip URL</label>
+      <input id="r-url" placeholder="https://example.com/api/tip" autocomplete="off">
+    </div>
+    <button onclick="run('register')">Issue the credential</button>
+  </div>
+</div>
 
-_ready = False
-_columns = []
+<div class="op" id="op-rot">
+  <div class="op-head" onclick="tog('op-rot')">
+    <span class="op-n">02</span><span class="op-t">Rotate a secret</span>
+    <span class="op-r">POST /x/peer/rotate</span>
+  </div>
+  <div class="op-body">
+    <p class="op-why">New secret now, old one keeps working for 24 hours so they can roll over without downtime.</p>
+    <div class="field">
+      <label for="o-id">Peer id</label>
+      <input id="o-id" placeholder="praesidium" autocomplete="off">
+    </div>
+    <button onclick="run('rotate')">Rotate</button>
+  </div>
+</div>
+
+<div class="op" id="op-sus">
+  <div class="op-head" onclick="tog('op-sus')">
+    <span class="op-n">03</span><span class="op-t">Suspend or resume</span>
+    <span class="op-r">POST /x/peer/suspend</span>
+  </div>
+  <div class="op-body">
+    <p class="op-why">Suspending refuses new submissions. Nothing is deleted and their sealed history stands.</p>
+    <div class="field">
+      <label for="s-id">Peer id</label>
+      <input id="s-id" placeholder="praesidium" autocomplete="off">
+    </div>
+    <div class="two">
+      <button onclick="run('suspend')">Suspend</button>
+      <button class="quiet" onclick="run('resume')">Resume</button>
+    </div>
+  </div>
+</div>
+
+<div class="op" id="op-list">
+  <div class="op-head" onclick="tog('op-list')">
+    <span class="op-n">04</span><span class="op-t">Who is registered</span>
+    <span class="op-r">GET /x/peer/peers</span>
+  </div>
+  <div class="op-body">
+    <p class="op-why">Public route. Secrets are never returned by anything.</p>
+    <button class="quiet" onclick="run('peers')">List them</button>
+  </div>
+</div>
+
+<div class="op" id="op-hist">
+  <div class="op-head" onclick="tog('op-hist')">
+    <span class="op-n">05</span><span class="op-t">Submissions</span>
+    <span class="op-r">GET /x/peer/history</span>
+  </div>
+  <div class="op-body">
+    <p class="op-why">What has come in, with the receipt for each. Leave the id blank for everything.</p>
+    <div class="field">
+      <label for="h-id">Peer id (optional)</label>
+      <input id="h-id" placeholder="leave blank for all" autocomplete="off">
+    </div>
+    <button class="quiet" onclick="run('history')">Show them</button>
+  </div>
+</div>
+
+<div id="out"></div>
+
+<footer>
+  Spec for peers to implement: <a href="/x/peer/spec">/x/peer/spec</a><br>
+  Open endpoint, unchanged: <a href="/x/witness/peers">/x/witness/peers</a><br>
+  Other consoles: <a href="/console">/console</a> · <a href="/pack">/pack</a>
+</footer>
+
+</div>
+
+<script>
+(function(){
+  var out=document.getElementById('out'), busy=false;
+  window.tog=function(id){document.getElementById(id).classList.toggle('open');};
+  function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+  function msg(t,k){out.innerHTML='<div class="msg '+(k||'')+'">'+esc(t)+'</div>';}
+  function raw(o){return '<pre>'+esc(JSON.stringify(o,null,2))+'</pre>';}
+  function val(id){return document.getElementById(id).value.trim();}
+  function key(){var k=val('key');if(!k){msg('Paste your API key at the top first.','bad');return null;}return k;}
+
+  async function call(path,method,body){
+    var k=key(); if(!k) return null;
+    var o={method:method,headers:{'Authorization':'Bearer '+k}};
+    if(body){o.headers['Content-Type']='application/json';o.body=JSON.stringify(body);}
+    var r=await fetch(path,o); var d;
+    try{d=await r.json();}catch(e){d={error:'unreadable_response'};}
+    return {status:r.status,data:d};
+  }
+
+  function showSecret(d,title,extra){
+    return '<div class="secret"><div class="lbl">'+esc(title)+' — '+esc(d.peer_id)+'</div>'
+      +'<div class="val">'+esc(d.secret)+'</div>'
+      +'<div class="warn">Shown once. Not recoverable. Copy it now and send it to them '
+      +'separately from anything else.</div>'
+      +(extra?'<div class="warn" style="color:var(--mute)">'+esc(extra)+'</div>':'')
+      +'</div>';
+  }
+
+  function showPeers(d){
+    if(!d.peers||!d.peers.length) return '<div class="msg">No peers registered yet.</div>';
+    var h='<div class="msg good">'+d.count+' registered</div><div class="op open"><div class="op-body" style="padding:16px">';
+    d.peers.forEach(function(p){
+      h+='<div class="peer"><span class="id">'+esc(p.peer_id)+'</span> '
+        +'<span class="pill '+esc(p.status)+'">'+esc(p.status)+'</span>'
+        +'<div class="meta">'+esc(p.chain_name||'')
+        +' · '+esc(p.submissions)+' submissions'
+        +(p.last_seen?' · last '+esc(p.last_seen):' · never submitted')
+        +(p.rotation_overlap_active?' · rotating':'')
+        +'</div>'
+        +(p.url?'<div class="meta">'+esc(p.url)+'</div>':'')
+        +'</div>';
+    });
+    return h+'</div></div>';
+  }
+
+  window.run=async function(what){
+    if(busy) return;
+    var path,method='POST',body=null;
+
+    if(what==='register'){
+      var id=val('r-id');
+      if(!id){msg('Give the peer an id.','bad');return;}
+      path='/x/peer/register';
+      body={peer_id:id.toLowerCase(),chain_name:val('r-name')||id,url:val('r-url')};
+    }
+    else if(what==='rotate'){
+      var oid=val('o-id');
+      if(!oid){msg('Which peer?','bad');return;}
+      path='/x/peer/rotate'; body={peer_id:oid.toLowerCase()};
+    }
+    else if(what==='suspend'||what==='resume'){
+      var sid=val('s-id');
+      if(!sid){msg('Which peer?','bad');return;}
+      path='/x/peer/'+what; body={peer_id:sid.toLowerCase()};
+    }
+    else if(what==='peers'){path='/x/peer/peers';method='GET';}
+    else if(what==='history'){
+      var hid=val('h-id');
+      path='/x/peer/history'+(hid?'?peer_id='+encodeURIComponent(hid.toLowerCase()):'');
+      method='GET';
+    }
+    else return;
+
+    busy=true;
+    out.innerHTML='<div class="msg">Working…</div>';
+    try{
+      var res=await call(path,method,body);
+      if(!res){busy=false;return;}
+      var d=res.data;
+      if(res.status===401){msg('That key was refused.','bad');}
+      else if(res.status===404&&d&&d.error==='unknown_module'){
+        msg('modules/peer.py is not deployed yet.','bad');}
+      else if(res.status>=400){
+        out.innerHTML='<div class="msg bad">'+esc((d&&(d.detail||d.error))||('HTTP '+res.status))+'</div>'+raw(d);}
+      else if(what==='register'&&d.secret){
+        out.innerHTML=showSecret(d,'Peer secret')
+          +'<div class="msg good">Registered. Send them /x/peer/spec so they can implement the signing.</div>'+raw(d);}
+      else if(what==='rotate'&&d.secret){
+        out.innerHTML=showSecret(d,'New secret','Previous secret valid until '+(d.previous_valid_until||''))+raw(d);}
+      else if(what==='peers'){out.innerHTML=showPeers(d)+raw(d);}
+      else{out.innerHTML='<div class="msg good">Done.</div>'+raw(d);}
+    }catch(e){msg('Could not reach the server.','bad');}
+    busy=false;
+  };
+})();
+</script>
+</body>
+</html>
+"""
 
 
-def _setup(ctx):
-    global _ready, _columns
-    if _ready:
-        return
-    cols = []
+def _srv():
+    m = sys.modules.get("__main__")
+    if hasattr(m, "get_bearer"):
+        return m
+    return sys.modules.get("server")
+
+
+def _install(s):
+    if _patched[0]:
+        return "already installed"
+    H = getattr(s, "Handler", None)
+    if H is None or not hasattr(H, "do_GET"):
+        return "no handler"
+    if getattr(H, "_peerconsole_patched", False):
+        _patched[0] = True
+        return "already installed"
+
+    original = H.do_GET
+
+    def do_GET(self):
+        try:
+            p = urlparse(self.path).path.rstrip("/") or "/"
+        except Exception:
+            p = self.path or "/"
+        if p in PAGE_PATHS:
+            body = PAGE.encode("utf-8")
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Robots-Tag", "noindex, nofollow")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception:
+                pass
+            return
+        return original(self)
+
+    H.do_GET = do_GET
+    H._peerconsole_patched = True
+    _patched[0] = True
+    print("PEERCONSOLE: /peers page installed at runtime", flush=True)
+    return "installed"
+
+
+def handle(method, action, data, api_key, ctx):
+    s = _srv()
+    if s is None:
+        return {"error": "server_not_found"}, 500
+
+    state = "already installed" if _patched[0] else None
+    if not _patched[0]:
+        try:
+            state = _install(s)
+        except Exception as exc:
+            print("PEERCONSOLE: patch failed - " + str(exc), flush=True)
+            state = "failed: " + str(exc)
+
+    if method == "GET" and (action or "") in ("", "status"):
+        return {
+            "page": "/peers",
+            "installed": bool(_patched[0]),
+            "install_result": state,
+            "version": VERSION,
+            "paths": list(PAGE_PATHS),
+            "note": "The page holds no credentials. Every route it calls "
+                    "checks the key itself.",
+        }, 200
+
+    return {"error": "unknown_action", "action": action, "GET": ["status"]}, 404
+
+```
+
+
+## `modules/praxis.py`
+
+697 lines, 24699 bytes
+
+```python
+"""
+modules/praxis.py  v1.0.2
+
+Outbound submitter for the PRAXIS external-witness observe endpoint (chain 4).
+
+Contract implemented against the SERVED schema route, not prose:
+    GET  https://chain4.thepraesidium.ai/api/external-witness/observe/schema
+    POST https://chain4.thepraesidium.ai/api/external-witness/observe
+
+Signing:
+    preimage  = b"PRAXIS-OBSERVE-v1\\n" + canonical JSON of the envelope
+                with the "signature" field REMOVED
+    canonical = json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                           ensure_ascii=True).encode("utf-8")
+    signature = lowercase hex HMAC-SHA256, carried in the body
+
+Secret:
+    environment variable PRAXIS_OBSERVE_SECRET
+    (never written to a file, never returned by any route)
+
+Routes
+    GET  /x/praxis/spec      public   what this module does and how it signs
+    GET  /x/praxis/status    public   config check + arms the /praxis page
+    GET  /x/praxis/schema    public   fetches THEIR live contract, reports version
+    GET  /x/praxis/history   keyed    past attempts from our own chain
+    POST /x/praxis/canonical keyed    dry run: envelope, preimage, signature, NO send
+    POST /x/praxis/submit    keyed    signs and sends ONE bounded submission
+
+v1.0.1 fixes a real fault found on 7 Sep 2026. _seal called the host seal()
+with one argument when it requires three, so every submit reported
+sealed:false while the response still said ok:true. A remote call was being
+recorded by the peer with no matching entry in our own chain. A failed seal
+now makes the whole response ok:false and says so at the top level.
+
+v1.0.2 fixes the follow-on. The host seal() returns a tuple
+(audit_hash, block_index, key_seq); v1.0.1 only read dicts and strings and
+so reported a successful seal as "seal returned no hash".
+"""
+
+import os
+import json
+import time
+import hmac
+import hashlib
+import secrets
+import sys
+import urllib.request
+import urllib.error
+from datetime import datetime, timezone
+
+VERSION = "1.0.2"
+
+# ---------------------------------------------------------------- constants
+
+BASE = "https://chain4.thepraesidium.ai"
+OBSERVE_URL = BASE + "/api/external-witness/observe"
+SCHEMA_URL = BASE + "/api/external-witness/observe/schema"
+
+DOMAIN = b"PRAXIS-OBSERVE-v1\n"
+ENVELOPE_SCHEMA = "praxis_external_observe_request_v1"
+
+OUR_PEER_ID = "aileash"
+OUR_TIP_URL = "https://sebbi.pro/x/witness/tip"
+
+SECRET_ENV = "PRAXIS_OBSERVE_SECRET"
+
+TIMEOUT = 20
+MAX_RESPONSE_BYTES = 262144
+
+PUBLIC = {
+    ("GET", "spec"),
+    ("GET", "status"),
+    ("GET", "schema"),
+}
+
+
+# ---------------------------------------------------------------- helpers
+
+def _now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _canonical(obj):
+    return json.dumps(
+        obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+
+
+def _sha256_hex(b):
+    return hashlib.sha256(b).hexdigest()
+
+
+def _secret():
+    s = os.environ.get(SECRET_ENV, "")
+    return s.strip()
+
+
+def _fresh_nonce():
+    # matches ^[A-Za-z0-9_.:-]{12,128}$
+    return secrets.token_hex(20)
+
+
+def _fresh_idem():
+    # matches ^[0-9a-f]{64}(\.attempt-N)?$
+    return secrets.token_hex(32)
+
+
+def _http(method, url, body=None):
+    req = urllib.request.Request(url, data=body, method=method)
+    req.add_header("Accept", "application/json")
+    req.add_header("User-Agent", "AILeash-praxis/" + VERSION)
+    if body is not None:
+        req.add_header("Content-Type", "application/json")
     try:
-        with ctx["lock"]:
-            for row in ctx["conn"].execute("PRAGMA table_info(audit_log)").fetchall():
-                cols.append(row[1])
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+            raw = r.read(MAX_RESPONSE_BYTES)
+            return r.status, dict(r.headers), raw, None
+    except urllib.error.HTTPError as e:
+        raw = b""
+        try:
+            raw = e.read(MAX_RESPONSE_BYTES)
+        except Exception:
+            pass
+        return e.code, dict(getattr(e, "headers", {}) or {}), raw, None
+    except Exception as e:
+        return 0, {}, b"", "%s: %s" % (type(e).__name__, e)
+
+
+def _parse_json(raw):
+    try:
+        return json.loads(raw.decode("utf-8"))
     except Exception:
-        pass
-    _columns = cols
-    with ctx["lock"]:
-        c = ctx["conn"]
-        c.execute("CREATE TABLE IF NOT EXISTS replay_attest("
-                  "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,"
-                  "fingerprint TEXT,function TEXT,taken REAL,"
-                  "audit_hash TEXT,block_index INTEGER)")
-        # One row per challenge run. The input fingerprint is stored, the
-        # input itself is not - we have no reason to keep a stranger's
-        # payload and every reason not to.
-        c.execute("CREATE TABLE IF NOT EXISTS replay_challenge("
-                  "id INTEGER PRIMARY KEY AUTOINCREMENT,input_hash TEXT,"
-                  "verdict TEXT,score TEXT,code_fingerprint TEXT,ran REAL,"
-                  "audit_hash TEXT,block_index INTEGER,client TEXT)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_rep_input "
-                  "ON replay_challenge(input_hash,id)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_rep_ran ON replay_challenge(ran)")
-        c.commit()
-    _ready = True
-
-
-def _iso(ts):
-    if not ts:
         return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
 
 
-def _pick(candidates):
-    for name in candidates:
-        if name in _columns:
-            return name
+def _build_envelope(tip_digest, witnessed_peer_id, source_url,
+                    receipt_digest=None, attempt=None, observed_at=None):
+    payload = {
+        "witnessed_peer_id": witnessed_peer_id,
+        "data_class": "HASH_ONLY",
+        "tip_digest": tip_digest,
+        "source_url": source_url,
+        "observed_at": observed_at or _now_iso(),
+    }
+    # receipt_digest is OPTIONAL in contract v1_1 and is omitted for a pure
+    # chain-tip observation. Never duplicate tip_digest into it.
+    if receipt_digest:
+        payload["receipt_digest"] = receipt_digest
+
+    key = _fresh_idem()
+    if attempt:
+        key = "%s.attempt-%s" % (key, attempt)
+
+    return {
+        "schema_version": ENVELOPE_SCHEMA,
+        "peer_id": OUR_PEER_ID,
+        "ts": _now_iso(),
+        "nonce": _fresh_nonce(),
+        "idempotency_key": key,
+        "payload": payload,
+    }
+
+
+def _sign(envelope, secret):
+    unsigned = {k: v for k, v in envelope.items() if k != "signature"}
+    canonical = _canonical(unsigned)
+    preimage = DOMAIN + canonical
+    sig = hmac.new(secret.encode("utf-8"), preimage, hashlib.sha256).hexdigest()
+    return canonical, preimage, sig
+
+
+def _validate(tip_digest, witnessed_peer_id, source_url, receipt_digest):
+    import re
+    if not re.fullmatch(r"[0-9a-f]{64}", tip_digest or ""):
+        return "tip_digest must be 64 lowercase hex characters"
+    if not re.fullmatch(r"[a-z][a-z0-9_.:-]{2,63}", witnessed_peer_id or ""):
+        return "witnessed_peer_id must match ^[a-z][a-z0-9_.:-]{2,63}$"
+    if not (source_url or "").startswith("https://") or (source_url or "").count("/") < 3:
+        return "source_url must be an https URL with a path"
+    if len(source_url) > 512:
+        return "source_url exceeds 512 characters"
+    if receipt_digest and not re.fullmatch(r"[0-9a-f]{64}", receipt_digest):
+        return "receipt_digest, if supplied, must be 64 lowercase hex characters"
+    if receipt_digest and receipt_digest == tip_digest:
+        return "receipt_digest must not duplicate tip_digest"
     return None
 
 
-def _canonical(payload):
-    """Stable rendering of an input payload, so the same inputs always
-    fingerprint to the same value regardless of key order or spacing."""
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"),
-                      ensure_ascii=False, default=str)
+def _record_seal_result(out, res):
+    """Read whatever the host seal() handed back.
 
-
-def _input_hash(payload):
-    return hashlib.sha256(("AILEASH-INPUT-v1:" + _canonical(payload)).encode("utf-8")).hexdigest()
-
-
-# ----------------------------------------------------------------------
-# finding the live decision function
-# ----------------------------------------------------------------------
-
-def _find_scorer():
-    """Locate the deployed decision function among loaded modules.
-
-    Deliberately does not import server.py. It looks at what is already
-    running, so this module can observe the engine and never alter it.
+    This deployment's seal() returns a TUPLE: (audit_hash, block_index,
+    key_seq). v1.0.1 only understood dicts and strings, so a successful seal
+    was reported as "seal returned no hash". Tuples are handled first.
     """
-    for module_name in ("__main__", "server", "app", "main"):
-        module = sys.modules.get(module_name)
-        if module is None:
-            continue
-        for name in SCORER_NAMES:
-            candidate = getattr(module, name, None)
-            if callable(candidate):
-                return candidate, "%s.%s" % (module_name, name), None
-    return None, None, ("no decision function found. Add its real name to SCORER_NAMES at the "
-                        "top of modules/replay.py.")
+    if isinstance(res, (tuple, list)):
+        if len(res) > 0:
+            out["audit_hash"] = res[0]
+        if len(res) > 1:
+            out["block_index"] = res[1]
+        if len(res) > 2:
+            out["key_seq"] = res[2]
+    elif isinstance(res, dict):
+        out["audit_hash"] = (res.get("audit_hash") or res.get("hash")
+                             or res.get("seal") or res.get("block_hash"))
+        out["block_index"] = res.get("block_index") or res.get("index")
+        out["key_seq"] = res.get("key_seq") or res.get("seq")
+    elif isinstance(res, str):
+        out["audit_hash"] = res
+    out["sealed"] = bool(out["audit_hash"])
+    return out
 
 
-def _fingerprint_of(function):
-    """SHA-256 of the deployed source. One-way: it commits to which code is
-    running without revealing any of it."""
-    try:
-        source = inspect.getsource(function)
-    except (OSError, TypeError):
-        return None, "source not readable for this callable"
-    normalised = "\n".join(line.rstrip() for line in source.splitlines()).strip()
-    return hashlib.sha256(normalised.encode("utf-8")).hexdigest(), None
+def _seal(ctx, event):
+    """Seal into our own chain.
 
-
-# ----------------------------------------------------------------------
-# running the engine
-# ----------------------------------------------------------------------
-
-def _rerun(function, inputs):
-    """Execute the live decision function against a set of inputs.
-
-    Never raises. On failure it reports that the call failed and nothing
-    about why the engine is shaped the way it is.
+    The host seal() takes three positional arguments (event, result, ts).
+    v1.0.0 called it with one and every submit failed silently. We try the
+    three-argument form first and fall back only if the host is older, and
+    we record which call shape worked so this is never guesswork again.
     """
-    if inputs is None:
-        return None, "no inputs"
-    attempts = []
-    if isinstance(inputs, dict):
-        attempts.append(lambda: function(**inputs))
-        attempts.append(lambda: function(inputs))
-    else:
-        attempts.append(lambda: function(inputs))
-    for call in attempts:
+    out = {"sealed": False, "audit_hash": None, "error": None,
+           "call_shape": None}
+    sealer = ctx.get("seal")
+    if not sealer:
+        out["error"] = "no seal function in ctx"
+        return out
+
+    result_value = event.get("result") or "sent"
+    ts_value = event.get("ts") or _now_iso()
+
+    attempts = [
+        ("seal(event, result, ts)", lambda: sealer(event, result_value, ts_value)),
+        ("seal(event, result)", lambda: sealer(event, result_value)),
+        ("seal(event)", lambda: sealer(event)),
+    ]
+
+    errors = []
+    for shape, call in attempts:
         try:
-            return call(), None
-        except TypeError:
+            res = call()
+        except TypeError as e:
+            errors.append("%s -> TypeError: %s" % (shape, e))
             continue
-        except Exception:
-            return None, "the decision function could not process those inputs"
-    return None, "those inputs do not match the shape the engine expects"
+        except Exception as e:
+            out["error"] = "%s -> %s: %s" % (shape, type(e).__name__, e)
+            out["call_shape"] = shape
+            return out
+        out["call_shape"] = shape
+        _record_seal_result(out, res)
+        if not out["sealed"]:
+            out["error"] = "seal returned no hash"
+        return out
+
+    out["error"] = "no accepted call shape; " + " | ".join(errors)
+    return out
 
 
-def _extract(output):
-    """Pull (verdict, score) out of whatever the scorer returns. Nothing
-    else from the return value is ever surfaced."""
-    if isinstance(output, dict):
-        return (output.get("decision") or output.get("verdict"), output.get("score"))
-    if isinstance(output, (tuple, list)) and len(output) >= 2:
-        return output[0], output[1]
-    return output, None
+# ---------------------------------------------------------------- page
+
+PAGE = """<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex">
+<title>PRAXIS submit</title>
+<style>
+:root{--ink:#0a0f1e;--ink2:#10182e;--gold:#c9a84c;--ok:#7fe3b0;--err:#ff8a80}
+*{box-sizing:border-box}
+body{margin:0;padding:16px;background:var(--ink);color:#e8ecf5;
+     font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+h1{font-size:18px;margin:0 0 4px;color:var(--gold)}
+p.sub{margin:0 0 18px;color:#8b96ad;font-size:13px}
+label{display:block;margin:12px 0 4px;font-size:12px;color:#8b96ad;
+      text-transform:uppercase;letter-spacing:.06em}
+input{width:100%;padding:11px;background:var(--ink2);border:1px solid #24304e;
+      border-radius:8px;color:#e8ecf5;font:14px monospace}
+input:focus{outline:none;border-color:var(--gold)}
+.row{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px}
+button{flex:1;min-width:120px;padding:13px;border:0;border-radius:8px;
+       background:var(--gold);color:#0a0f1e;font-weight:600;font-size:15px}
+button.alt{background:var(--ink2);color:#e8ecf5;border:1px solid #24304e}
+button:disabled{opacity:.45}
+pre{margin-top:16px;padding:12px;background:var(--ink2);border:1px solid #24304e;
+    border-radius:8px;white-space:pre-wrap;word-break:break-all;
+    font:12px/1.45 monospace;max-height:60vh;overflow:auto}
+.ok{color:var(--ok)}.err{color:var(--err)}
+</style></head><body>
+
+<h1>PRAXIS observe &mdash; chain 4</h1>
+<p class="sub">Signs one bounded submission and sends it. Fresh ts, nonce and
+idempotency key every press.</p>
+
+<label>API key</label>
+<input id="key" type="password" placeholder="AILeash API key" autocomplete="off">
+
+<label>Tip digest (64 hex)</label>
+<input id="tip" placeholder="press Load tip">
+
+<label>Witnessed peer id</label>
+<input id="wpid" value="aileash">
+
+<label>Source URL</label>
+<input id="src" value="https://sebbi.pro/x/witness/tip">
+
+<label>Attempt marker (optional)</label>
+<input id="att" placeholder="leave blank for a first attempt">
+
+<div class="row">
+  <button class="alt" onclick="loadTip()">Load tip</button>
+  <button class="alt" onclick="theirSchema()">Their schema</button>
+</div>
+<div class="row">
+  <button class="alt" onclick="go('canonical')">Dry run</button>
+  <button onclick="send()">Send</button>
+</div>
+
+<pre id="out">Ready.</pre>
+
+<script>
+var out = document.getElementById('out');
+function show(t, cls){ out.className = cls || ''; out.textContent = t; }
+function val(id){ return document.getElementById(id).value.trim(); }
+
+function loadTip(){
+  show('Loading our tip...');
+  fetch('/x/witness/tip').then(function(r){ return r.json(); }).then(function(j){
+    var t = j.tip || j.hash || j.head || j.chain_tip || j.latest || '';
+    document.getElementById('tip').value = t;
+    show('Tip loaded.\\n\\n' + JSON.stringify(j, null, 2), 'ok');
+  }).catch(function(e){ show('Failed: ' + e, 'err'); });
+}
+
+function theirSchema(){
+  show('Fetching their live contract...');
+  fetch('/x/praxis/schema').then(function(r){ return r.json(); }).then(function(j){
+    show(JSON.stringify(j, null, 2), j.receipt_digest_required ? 'err' : 'ok');
+  }).catch(function(e){ show('Failed: ' + e, 'err'); });
+}
+
+function body(){
+  return {
+    tip_digest: val('tip'),
+    witnessed_peer_id: val('wpid'),
+    source_url: val('src'),
+    attempt: val('att') || null
+  };
+}
+
+function go(action){
+  var k = val('key');
+  if(!k){ show('API key required.', 'err'); return; }
+  show('Working...');
+  fetch('/x/praxis/' + action, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + k },
+    body: JSON.stringify(body())
+  }).then(function(r){ return r.json(); }).then(function(j){
+    show(JSON.stringify(j, null, 2), j.ok === false ? 'err' : 'ok');
+  }).catch(function(e){ show('Failed: ' + e, 'err'); });
+}
+
+function send(){
+  if(!confirm('Send one bounded submission to chain 4 now?')) return;
+  go('submit');
+}
+</script>
+</body></html>"""
 
 
-def _same(a, b):
-    if a is None and b is None:
-        return True
-    if a is None or b is None:
-        return False
-    if isinstance(a, float) or isinstance(b, float):
+def _install_page():
+    """Serve /praxis by wrapping the running handler's do_GET, once."""
+    for mod in list(sys.modules.values()):
+        if mod is None:
+            continue
         try:
-            return abs(float(a) - float(b)) < 1e-9
-        except (TypeError, ValueError):
-            return False
-    return str(a).strip().upper() == str(b).strip().upper()
-
-
-# ----------------------------------------------------------------------
-# challenge - the public proof
-# ----------------------------------------------------------------------
-
-def _novel_recently(ctx):
-    since = time.time() - 3600
-    with ctx["lock"]:
-        row = ctx["conn"].execute(
-            "SELECT COUNT(DISTINCT input_hash) FROM replay_challenge WHERE ran>=?",
-            (since,)).fetchone()
-    return int(row[0]) if row else 0
-
-
-def _challenge(ctx, api_key, data):
-    inputs = data.get("inputs", data.get("event", data.get("payload")))
-    if not isinstance(inputs, dict) or not inputs:
-        return {"error": "inputs_required",
-                "message": "Send an inputs object. We will run it, seal the run, and hand you "
-                           "back the verdict. Send the same object again whenever you like - "
-                           "if the answer ever moves, you have caught us."}, 400
-    if len(inputs) > MAX_PAYLOAD_KEYS:
-        return {"error": "payload_too_wide", "message": "at most %d keys" % MAX_PAYLOAD_KEYS}, 400
-
-    fingerprint_in = _input_hash(inputs)
-
-    with ctx["lock"]:
-        prior = ctx["conn"].execute(
-            "SELECT verdict,score,ran,audit_hash,block_index,code_fingerprint "
-            "FROM replay_challenge WHERE input_hash=? ORDER BY id ASC",
-            (fingerprint_in,)).fetchall()
-
-    if not prior and _novel_recently(ctx) >= NOVEL_PER_HOUR:
-        return {"error": "rate_limited",
-                "message": "Too many distinct inputs in the last hour. Repeat submissions of "
-                           "inputs already seen are never limited - testing whether the answer "
-                           "moves is the whole point. Mapping the function is not.",
-                "repeat_freely": "any input_hash already in /x/replay/history"}, 429
-
-    function, name, why = _find_scorer()
-    if why:
-        return {"error": "engine_unavailable", "message": "the decision engine is not reachable "
-                                                          "from this route right now"}, 503
-
-    output, problem = _rerun(function, inputs)
-    if problem:
-        return {"error": "not_runnable", "message": problem}, 422
-
-    verdict, score = _extract(output)
-    code_fingerprint, _p = _fingerprint_of(function)
-    now = time.time()
-
-    ev = {"user_id": "chal:" + fingerprint_in[:16], "action": "replay_challenge", "amount": 0,
-          "country": "UK", "device_id": "replay", "anomaly": 0, "device_risk": 0}
-    res = {"decision": str(verdict), "score": score, "replay_version": VERSION,
-           "input_hash": fingerprint_in, "code_fingerprint": code_fingerprint,
-           "detail": "input=%s;verdict=%s;code=%s" % (fingerprint_in, verdict, code_fingerprint)}
-    audit_hash, block_index, seq = ctx["seal"](ev, res, now, api_key or "public-replay")
-
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "INSERT INTO replay_challenge(input_hash,verdict,score,code_fingerprint,ran,"
-            "audit_hash,block_index,client) VALUES(?,?,?,?,?,?,?,?)",
-            (fingerprint_in, str(verdict), str(score), code_fingerprint, now,
-             audit_hash, block_index, "keyed" if api_key else "anonymous"))
-        ctx["conn"].commit()
-
-    out = {
-        "input_hash": fingerprint_in,
-        "verdict": verdict, "score": score,
-        "ran_at": _iso(now),
-        "sealed_in_chain": audit_hash, "block_index": block_index, "receipt_seq": seq,
-        "code_fingerprint": code_fingerprint,
-        "runs_of_this_input": len(prior) + 1,
-        "replay_version": VERSION,
-        "how_to_use_this": "Send the identical inputs again, whenever you like, from wherever "
-                           "you like. Every run is sealed into a chain that is externally "
-                           "anchored and independently witnessed, so neither this answer nor "
-                           "the next one can be revised afterwards.",
-        "history": "/x/replay/history?input_hash=" + fingerprint_in,
-        "verify_this_run": "/x/consistency/ancestor?tip=" + audit_hash,
-    }
-
-    if prior:
-        first_verdict, first_score = prior[0][0], prior[0][1]
-        stable = _same(verdict, first_verdict) and _same(score, first_score)
-        out["first_seen"] = _iso(prior[0][2])
-        out["stable"] = stable
-        out["verdict_moved"] = not stable
-        if stable:
-            out["what_this_shows"] = ("Identical to the first run of these inputs on %s, and to "
-                                      "every run since. Determinism observed rather than "
-                                      "asserted." % _iso(prior[0][2]))
-        else:
-            out["what_this_shows"] = ("These inputs previously produced a different answer. "
-                                      "Either the code changed - compare the code fingerprints "
-                                      "in the history - or the engine is not deterministic. "
-                                      "Both runs are sealed and neither can be withdrawn.")
-    else:
-        out["stable"] = None
-        out["what_this_shows"] = ("First time these inputs have been seen. Send them again to "
-                                  "start building the record.")
-    return out, 200
-
-
-def _history(ctx, data):
-    input_hash = str(data.get("input_hash", data.get("hash", ""))).strip().lower()
-    if not input_hash:
-        return {"error": "input_hash_required"}, 400
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT verdict,score,ran,audit_hash,block_index,code_fingerprint,client "
-            "FROM replay_challenge WHERE input_hash=? ORDER BY id ASC LIMIT 500",
-            (input_hash,)).fetchall()
-    if not rows:
-        return {"error": "unknown_input", "input_hash": input_hash,
-                "message": "No run recorded for that input fingerprint."}, 404
-
-    verdicts = {r[0] for r in rows}
-    codes = {r[5] for r in rows if r[5]}
-    return {
-        "input_hash": input_hash,
-        "runs": len(rows),
-        "first_run": _iso(rows[0][2]), "latest_run": _iso(rows[-1][2]),
-        "distinct_verdicts": len(verdicts),
-        "stable": len(verdicts) == 1,
-        "code_versions_seen": len(codes),
-        "history": [{"verdict": r[0], "score": r[1], "ran_at": _iso(r[2]),
-                     "sealed_in_chain": r[3], "block_index": r[4],
-                     "code_fingerprint": r[5], "submitted_by": r[6]} for r in rows],
-        "what_this_is": "Every recorded run of one exact set of inputs, each sealed separately "
-                        "into the chain. Verify any of them independently at "
-                        "/x/consistency/ancestor - we cannot alter one after the fact.",
-        "note": "More than one distinct verdict across a single code fingerprint would mean the "
-                "engine is not deterministic. That is exactly what this is here to expose.",
-    }, 200
-
-
-# ----------------------------------------------------------------------
-# self audit
-# ----------------------------------------------------------------------
-
-def _fetch(ctx, where, args):
-    input_col = _pick(INPUT_COLUMNS)
-    result_col = _pick(RESULT_COLUMNS)
-    verdict_col = _pick(VERDICT_COLUMNS)
-    score_col = _pick(SCORE_COLUMNS)
-    if not input_col:
-        return None, ("audit_log does not store decision inputs on this deployment, so sealed "
-                      "decisions cannot be re-executed. Seal the event payload alongside the "
-                      "verdict and replay becomes available from that point on.")
-    fields = ["id", "audit_hash", "ts", input_col]
-    for extra in (result_col, verdict_col, score_col):
-        if extra and extra not in fields:
-            fields.append(extra)
-    sql = "SELECT %s FROM audit_log WHERE %s" % (", ".join(fields), where)
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(sql, tuple(args)).fetchall()
-    if not rows:
-        return None, "no sealed decision matched"
-    out = []
-    for row in rows:
-        record = dict(zip(fields, row))
-        raw = record.get(input_col)
-        try:
-            parsed = raw if isinstance(raw, (dict, list)) else json.loads(raw)
+            names = dir(mod)
         except Exception:
-            parsed = None
-        sealed_result = None
-        if result_col:
-            raw_result = record.get(result_col)
+            continue
+        for name in names:
             try:
-                sealed_result = raw_result if isinstance(raw_result, dict) else json.loads(raw_result)
+                obj = getattr(mod, name, None)
             except Exception:
-                sealed_result = None
-        out.append({"id": record.get("id"), "audit_hash": record.get("audit_hash"),
-                    "ts": record.get("ts"), "inputs": parsed,
-                    "sealed_result": sealed_result,
-                    "sealed_verdict": record.get(verdict_col) if verdict_col else None,
-                    "sealed_score": record.get(score_col) if score_col else None})
-    return out, None
+                continue
+            if not isinstance(obj, type):
+                continue
+            if not (hasattr(obj, "do_GET") and hasattr(obj, "do_POST")):
+                continue
+            if getattr(obj, "_praxis_patched", False):
+                return True
+            original = obj.do_GET
+
+            def patched(self, _original=original):
+                try:
+                    path = self.path.split("?")[0].rstrip("/")
+                except Exception:
+                    path = ""
+                if path == "/praxis":
+                    data = PAGE.encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("X-Robots-Tag", "noindex")
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+                return _original(self)
+
+            obj.do_GET = patched
+            obj._praxis_patched = True
+            return True
+    return False
 
 
-def _sealed_pair(record):
-    verdict = record.get("sealed_verdict")
-    score = record.get("sealed_score")
-    result = record.get("sealed_result")
-    if isinstance(result, dict):
-        if verdict is None:
-            verdict = result.get("decision") or result.get("verdict")
-        if score is None:
-            score = result.get("score")
-    return verdict, score
-
-
-def _compare(record, function):
-    output, why = _rerun(function, record.get("inputs"))
-    sealed_verdict, sealed_score = _sealed_pair(record)
-    if why:
-        return {"audit_hash": record["audit_hash"], "result": "not_replayable"}
-    verdict, score = _extract(output)
-    identical = _same(verdict, sealed_verdict) and _same(score, sealed_score)
-    return {"audit_hash": record["audit_hash"], "sealed_at": _iso(record.get("ts")),
-            "result": "identical" if identical else "divergent"}
-
-
-def _self(ctx, data):
-    try:
-        sample = int(data.get("sample", SELF_SAMPLE_DEFAULT))
-    except (TypeError, ValueError):
-        sample = SELF_SAMPLE_DEFAULT
-    sample = max(1, min(sample, SELF_SAMPLE_MAX))
-
-    function, name, why = _find_scorer()
-    if why:
-        return {"error": "engine_unavailable"}, 503
-
-    records, fetch_why = _fetch(ctx, "1=1 ORDER BY id DESC LIMIT ?", [sample])
-    if fetch_why:
-        return {"error": "cannot_replay", "message": fetch_why}, 400
-
-    identical = divergent = skipped = 0
-    divergent_hashes = []
-    started = time.time()
-    for record in records:
-        outcome = _compare(record, function)
-        if outcome["result"] == "identical":
-            identical += 1
-        elif outcome["result"] == "divergent":
-            divergent += 1
-            if len(divergent_hashes) < 10:
-                divergent_hashes.append(outcome["audit_hash"])
-        else:
-            skipped += 1
-
-    checked = identical + divergent
-    rate = round((identical / checked) * 100, 4) if checked else None
-    code_fingerprint, _p = _fingerprint_of(function)
-
-    body = {
-        "sampled": len(records), "replayable": checked,
-        "identical": identical, "divergent": divergent, "not_replayable": skipped,
-        "reproduction_rate_percent": rate,
-        "took_seconds": round(time.time() - started, 3),
-        "code_fingerprint": code_fingerprint,
-        "replay_version": VERSION,
-        "headline": ("%d of %d sealed decisions reproduce identically under the code deployed "
-                     "right now." % (identical, checked)) if checked else
-                    "Nothing replayable in this sample.",
-        "why_this_matters": "A platform whose scoring runs through a model call cannot do this "
-                            "at all. Reproducibility is a property of the architecture, not a "
-                            "feature that can be added later.",
-        "honest": "Divergences are counted here, not filtered out. A falling rate is the most "
-                  "useful thing this route can tell you.",
-        "independent_check": "Do not take our word for this - /x/replay/challenge lets you run "
-                             "your own inputs and repeat them whenever you like.",
-    }
-    if divergent_hashes:
-        body["divergent_receipts"] = divergent_hashes
-    return body, 200
-
-
-# ----------------------------------------------------------------------
-# fingerprint, keyed check, attest
-# ----------------------------------------------------------------------
-
-def _fingerprint(ctx):
-    function, name, why = _find_scorer()
-    if why:
-        return {"error": "engine_unavailable"}, 503
-    digest, problem = _fingerprint_of(function)
-    return {"code_fingerprint": digest, "problem": problem, "replay_version": VERSION,
-            "what_this_is": "A SHA-256 of the source of the code currently deciding. It commits "
-                            "to which version is running. It is one-way and discloses nothing "
-                            "about the logic, the weights or the thresholds.",
-            "what_it_is_for": "Sealed alongside verdicts via /x/replay/attest, so a change in "
-                              "behaviour can be attributed to a dated code change rather than "
-                              "looking like a fault - or hidden as one.",
-            "note": "The function name and signature are deliberately not published."}, 200
-
-
-def _check(ctx, data):
-    """Keyed. Re-runs one sealed decision and reports match or divergence."""
-    target = str(data.get("hash", data.get("receipt", ""))).strip().lower()
-    if not target:
-        return {"error": "hash_required"}, 400
-    records, why = _fetch(ctx, "audit_hash=? LIMIT 1", [target])
-    if why:
-        return {"error": "cannot_replay", "message": why}, 400
-    function, name, scorer_why = _find_scorer()
-    if scorer_why:
-        return {"error": "engine_unavailable"}, 503
-    outcome = _compare(records[0], function)
-    digest, _p = _fingerprint_of(function)
-    outcome.update({"code_fingerprint": digest, "replay_version": VERSION,
-                    "what_this_proves": "The sealed inputs were fed back through the live "
-                                        "decision function and the output compared with what "
-                                        "was sealed."})
-    return outcome, 200
-
-
-def _attest(ctx, api_key):
-    function, name, why = _find_scorer()
-    if why:
-        return {"error": "engine_unavailable"}, 503
-    digest, problem = _fingerprint_of(function)
-    if not digest:
-        return {"error": "no_fingerprint", "message": problem}, 503
-
-    now = time.time()
-    ev = {"user_id": "rep:" + digest[:16], "action": "code_fingerprint_sealed", "amount": 0,
-          "country": "UK", "device_id": "replay", "anomaly": 0, "device_risk": 0}
-    res = {"decision": "FINGERPRINT_SEALED", "score": 0, "replay_version": VERSION,
-           "fingerprint": digest, "detail": "fingerprint=%s" % digest}
-    audit_hash, block_index, seq = ctx["seal"](ev, res, now, api_key)
-
-    with ctx["lock"]:
-        ctx["conn"].execute("INSERT INTO replay_attest(api_key,fingerprint,function,taken,"
-                            "audit_hash,block_index) VALUES(?,?,?,?,?,?)",
-                            (api_key, digest, name, now, audit_hash, block_index))
-        ctx["conn"].commit()
-
-    return {"fingerprint": digest, "taken_at": _iso(now),
-            "sealed_in_chain": audit_hash, "block_index": block_index, "receipt_seq": seq,
-            "what_this_does": "Records which code was deciding at this moment, inside the chain "
-                              "the decisions are sealed in. Every verdict after this point is "
-                              "attributable to a known, timestamped version of the logic - "
-                              "without that logic being published.",
-            "do_this": "Attest on every deploy that touches scoring. A later divergence then "
-                       "reads as a dated policy change rather than an unexplained fault."}, 200
-
+# ---------------------------------------------------------------- actions
 
 def _spec():
     return {
-        "replay_version": VERSION,
-        "claim": "The same inputs produce the same verdict, and you can establish that yourself "
-                 "without an account and without seeing any of our logic.",
-        "the_logic_is_not_published": "No route here returns the scoring source, the weights, "
-                                      "the thresholds, the signal names or any intermediate "
-                                      "value. The only thing published is a SHA-256 of the "
-                                      "deployed source, which is one-way.",
-        "how_to_test_us": [
-            "POST /x/replay/challenge with any inputs object you like.",
-            "Keep the input_hash it returns.",
-            "Send the identical inputs again tomorrow, next month, next year, from anywhere.",
-            "GET /x/replay/history?input_hash=... to see every run, each sealed separately.",
-            "If the verdict ever moves under an unchanged code fingerprint, the engine is not "
-            "deterministic and you have proof of it that we cannot withdraw.",
+        "module": "praxis",
+        "version": VERSION,
+        "what_this_is": (
+            "Outbound submitter for the PRAXIS external-witness observe "
+            "endpoint. One bounded submission per press. This module sends; "
+            "it does not receive."
+        ),
+        "target": {"observe": OBSERVE_URL, "schema": SCHEMA_URL},
+        "signing": {
+            "algorithm": "hmac-sha256",
+            "domain": "PRAXIS-OBSERVE-v1\\n",
+            "canonicalization": "sort_keys=true, separators=(',',':'), ensure_ascii=true, utf-8",
+            "preimage": "domain bytes + canonical JSON of the envelope with 'signature' removed",
+            "signature_encoding": "lowercase hex",
+            "auth_transport": "body, not headers",
+        },
+        "payload_policy": (
+            "receipt_digest is optional under their contract v1_1 and is "
+            "omitted for a pure chain-tip observation. It is never filled "
+            "with a duplicate of tip_digest or a placeholder."
+        ),
+        "freshness": "fresh ts, fresh nonce and a fresh idempotency key on every submit",
+        "seal_policy": (
+            "a submit that reaches the peer but fails to seal into our own "
+            "chain returns ok:false with seal_failed true. The send is still "
+            "reported in full, because it happened and the peer may hold a "
+            "durable record of it."
+        ),
+        "not_claimed": [
+            "this lane is one-directional and does not establish mutual witnessing",
+            "their acceptance is a transport and signature outcome, not verification "
+            "of anything in our chain",
         ],
-        "why_black_box_is_stronger": "A published listing only shows what the code says. "
-                                     "Repeated challenge shows what production actually does, "
-                                     "over time, on inputs we did not choose.",
-        "what_breaks_determinism": [
-            "a wall-clock read inside the scoring path",
-            "iteration over an unordered structure",
-            "an unseeded random call",
-            "any model call in the decision path - which is why most platforms cannot do this",
-        ],
-        "what_this_does_not_prove": "That a decision was correct, or that the inputs were "
-                                    "honestly captured. Only that the same inputs still yield "
-                                    "the same output under known code. Determinism is not "
-                                    "fairness.",
-        "rate_limits": "Repeat submissions of inputs already seen are never limited - retesting "
-                       "is the point. Novel inputs are limited, because bulk novel inputs are "
-                       "how a decision boundary gets mapped rather than how a claim gets tested.",
+        "routes": {
+            "public": ["GET spec", "GET status", "GET schema"],
+            "keyed": ["GET history", "POST canonical", "POST submit"],
+        },
+    }
+
+
+def _status():
+    installed = _install_page()
+    s = _secret()
+    return {
+        "module": "praxis",
+        "version": VERSION,
+        "page": "/praxis",
+        "page_installed": installed,
+        "peer_id": OUR_PEER_ID,
+        "secret_configured": bool(s),
+        "secret_env": SECRET_ENV,
+        "secret_length": len(s) if s else 0,
+        "target": OBSERVE_URL,
+        "note": (
+            "secret_configured false means the environment variable is not set "
+            "on this replica; the secret itself is never returned by any route"
+        ),
+    }
+
+
+def _their_schema():
+    code, headers, raw, err = _http("GET", SCHEMA_URL)
+    if err:
+        return {"ok": False, "error": "fetch_failed", "detail": err}, 502
+    doc = _parse_json(raw)
+    if doc is None:
+        return {"ok": False, "error": "unparseable", "status": code}, 502
+
+    req = (((doc.get("request_schema") or {}).get("properties") or {})
+           .get("payload") or {})
+    required = req.get("required") or []
+    hdr = {}
+    for k, v in (headers or {}).items():
+        if k.lower().startswith("x-praxis") or k.lower() == "cache-control":
+            hdr[k.lower()] = v
+
+    return {
+        "ok": True,
+        "fetched_at": _now_iso(),
+        "http_status": code,
+        "contract_version": doc.get("schema_version"),
+        "payload_required": required,
+        "receipt_digest_required": "receipt_digest" in required,
+        "canonicalization": ((doc.get("signing") or {}).get("canonicalization")),
+        "domain": ((doc.get("signing") or {}).get("domain")),
+        "clock_skew_seconds": ((doc.get("freshness") or {}).get("clock_skew_seconds")),
+        "headers": hdr,
+        "body_sha256": _sha256_hex(raw),
     }, 200
 
 
-# ----------------------------------------------------------------------
-# router entry point
-# ----------------------------------------------------------------------
+def _canonical_action(data):
+    tip = (data.get("tip_digest") or "").strip().lower()
+    wpid = (data.get("witnessed_peer_id") or OUR_PEER_ID).strip().lower()
+    src = (data.get("source_url") or OUR_TIP_URL).strip()
+    rcpt = (data.get("receipt_digest") or "").strip().lower() or None
+    attempt = data.get("attempt") or None
+
+    bad = _validate(tip, wpid, src, rcpt)
+    if bad:
+        return {"ok": False, "error": "invalid_input", "detail": bad}, 400
+
+    secret = _secret()
+    if not secret:
+        return {"ok": False, "error": "secret_unconfigured",
+                "detail": "set %s in the environment" % SECRET_ENV}, 503
+
+    env = _build_envelope(tip, wpid, src, rcpt, attempt)
+    canonical, preimage, sig = _sign(env, secret)
+    signed = dict(env)
+    signed["signature"] = sig
+
+    return {
+        "ok": True,
+        "dry_run": True,
+        "sent": False,
+        "envelope": signed,
+        "canonical_json": canonical.decode("utf-8"),
+        "canonical_sha256": _sha256_hex(canonical),
+        "preimage_sha256": _sha256_hex(preimage),
+        "signature": sig,
+        "note": "nothing was sent; ts, nonce and idempotency_key here are "
+                "single-use and will be regenerated on an actual submit",
+    }, 200
+
+
+def _submit(data, ctx):
+    tip = (data.get("tip_digest") or "").strip().lower()
+    wpid = (data.get("witnessed_peer_id") or OUR_PEER_ID).strip().lower()
+    src = (data.get("source_url") or OUR_TIP_URL).strip()
+    rcpt = (data.get("receipt_digest") or "").strip().lower() or None
+    attempt = data.get("attempt") or None
+
+    bad = _validate(tip, wpid, src, rcpt)
+    if bad:
+        return {"ok": False, "error": "invalid_input", "detail": bad}, 400
+
+    secret = _secret()
+    if not secret:
+        return {"ok": False, "error": "secret_unconfigured",
+                "detail": "set %s in the environment" % SECRET_ENV}, 503
+
+    env = _build_envelope(tip, wpid, src, rcpt, attempt)
+    canonical, preimage, sig = _sign(env, secret)
+    signed = dict(env)
+    signed["signature"] = sig
+    wire = _canonical(signed)
+
+    started = time.time()
+    code, headers, raw, err = _http("POST", OBSERVE_URL, wire)
+    took = round(time.time() - started, 3)
+
+    parsed = _parse_json(raw)
+    transport_ok = err is None and code in (200, 202)
+    result = {
+        "ok": transport_ok,
+        "sent": err is None,
+        "took_seconds": took,
+        "http_status": code,
+        "transport_error": err,
+        "request": {
+            "idempotency_key": env["idempotency_key"],
+            "nonce": env["nonce"],
+            "ts": env["ts"],
+            "peer_id": env["peer_id"],
+            "payload": env["payload"],
+            "signature": sig,
+            "canonical_sha256": _sha256_hex(canonical),
+            "wire_sha256": _sha256_hex(wire),
+            "wire_bytes": len(wire),
+        },
+        "response": {
+            "body": parsed,
+            "raw_sha256": _sha256_hex(raw) if raw else None,
+            "raw_bytes": len(raw),
+            "raw_text": (raw.decode("utf-8", "replace")[:4000] if raw else None),
+        },
+    }
+
+    if isinstance(parsed, dict):
+        result["their_error"] = parsed.get("error")
+        result["their_accepted"] = parsed.get("accepted")
+        result["their_replayed"] = parsed.get("replayed")
+        result["their_request_digest"] = parsed.get("request_digest")
+        result["their_durable_event_recorded"] = parsed.get("durable_event_recorded")
+        result["their_accepted_decision_recorded"] = parsed.get(
+            "accepted_decision_recorded")
+
+    event = {
+        "user_id": "praxis:" + OUR_PEER_ID,
+        "event": "praxis_observe_submit",
+        "kind": "praxis_observe_submit",
+        "ts": _now_iso(),
+        "target": OBSERVE_URL,
+        "idempotency_key": env["idempotency_key"],
+        "request_wire_sha256": result["request"]["wire_sha256"],
+        "http_status": code,
+        "response_sha256": result["response"]["raw_sha256"],
+        "their_error": result.get("their_error"),
+        "their_accepted": result.get("their_accepted"),
+        "result": "sent" if err is None else "transport_error",
+    }
+    result["our_seal"] = _seal(ctx, event)
+
+    # A send that the peer accepted but our own chain has no entry for is a
+    # failure of this deployment, not a success. Say so at the top level.
+    if not result["our_seal"].get("sealed"):
+        result["ok"] = False
+        result["seal_failed"] = True
+        result["seal_failed_note"] = (
+            "the submission reached the peer but was NOT sealed into our "
+            "chain. The peer may hold a durable record with no counterpart "
+            "here. Do not treat this submission as evidenced on our side."
+        )
+
+    if not transport_ok:
+        status = 502 if err else 200
+    elif not result["our_seal"].get("sealed"):
+        status = 500
+    else:
+        status = 200
+    return result, status
+
+
+def _history(ctx, data):
+    limit = 20
+    try:
+        limit = max(1, min(100, int(data.get("limit") or 20)))
+    except Exception:
+        pass
+    rows = []
+    try:
+        conn = ctx.get("conn")
+        lock = ctx.get("lock")
+        sql = ("SELECT rowid, * FROM audit_log "
+               "WHERE user_id = ? ORDER BY rowid DESC LIMIT ?")
+        if lock:
+            with lock:
+                cur = conn.execute(sql, ("praxis:" + OUR_PEER_ID, limit))
+                cols = [d[0] for d in cur.description]
+                rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+        else:
+            cur = conn.execute(sql, ("praxis:" + OUR_PEER_ID, limit))
+            cols = [d[0] for d in cur.description]
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    except Exception as e:
+        return {"ok": False, "error": "query_failed",
+                "detail": "%s: %s" % (type(e).__name__, e)}, 500
+    return {"ok": True, "count": len(rows), "rows": rows}, 200
+
+
+# ---------------------------------------------------------------- router
 
 def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-    action = (action or "").strip("/").lower()
     data = data or {}
 
-    if method == "GET":
-        if action == "spec":
-            return _spec()
-        if action == "fingerprint":
-            return _fingerprint(ctx)
-        if action == "history":
-            return _history(ctx, data)
-        if action == "self":
-            return _self(ctx, data)
-        if action == "check":
-            if not api_key:
-                return {"error": "invalid_api_key"}, 401
-            return _check(ctx, data)
+    if method == "GET" and action == "spec":
+        return _spec(), 200
 
-    if method == "POST":
-        if action == "challenge":
-            return _challenge(ctx, api_key, data)
-        if not api_key:
-            return {"error": "invalid_api_key"}, 401
-        if action == "attest":
-            return _attest(ctx, api_key)
+    if method == "GET" and action == "status":
+        return _status(), 200
 
-    return {"error": "unknown_action", "action": action,
-            "GET": ["spec", "fingerprint", "history", "self", "check (keyed)"],
-            "POST": ["challenge", "attest (keyed)"]}, 404
+    if method == "GET" and action == "schema":
+        return _their_schema()
+
+    if method == "GET" and action == "history":
+        return _history(ctx, data)
+
+    if method == "POST" and action == "canonical":
+        return _canonical_action(data)
+
+    if method == "POST" and action == "submit":
+        return _submit(data, ctx)
+
+    return {"ok": False, "error": "unknown_action", "action": action,
+            "available": ["spec", "status", "schema", "history",
+                          "canonical", "submit"]}, 404
 
 ```
