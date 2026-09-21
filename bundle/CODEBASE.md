@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-142 files across 36 parts.
+143 files across 36 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -144,6 +144,7 @@ Generated automatically on every push. Do not edit by hand.
 - `meshwitness.py`
 - `sebbi_agent.py`
 - `sebbi_sdk.py`
+- `sebbi_site.py`
 
 ## [CODEBASE-22.md](CODEBASE-22.md)
 
