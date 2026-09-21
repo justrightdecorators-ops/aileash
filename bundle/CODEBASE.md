@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-146 files across 37 parts.
+147 files across 37 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -53,6 +53,7 @@ Generated automatically on every push. Do not edit by hand.
 
 - `modules/heartbeat.py`
 - `modules/held.py`
+- `modules/homelink.py`
 - `modules/integrity.py`
 
 ## [CODEBASE-09.md](CODEBASE-09.md)
