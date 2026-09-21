@@ -1,13 +1,486 @@
-# Codebase — part 6 of 35
+# Codebase — part 6 of 36
 
 Contains:
+- `modules/custody.py`
 - `modules/declare.py`
 - `modules/demo.py`
 - `modules/disclosure.py`
 - `modules/dsr.py`
 - `modules/fingerprint.py`
 - `modules/genesis.py`
-- `modules/grade.py`
+
+
+## `modules/custody.py`
+
+465 lines, 19013 bytes
+
+```python
+"""
+modules/custody.py  v1.0.1  -  independent copies, proven and counted
+
+The self-proving archive file (/x/archive) can be checked anywhere. This
+module proves WHERE it is actually held, by parties other than sebbi.pro.
+
+Every day it:
+  1. asks the Internet Archive whether it holds each recent sealed file, and
+     if it does, fetches that copy and checks its fingerprint;
+  2. fetches every registered holder's copy and checks its fingerprint;
+  3. counts the independent holders whose copy is byte-for-byte a sealed
+     file, and SEALS that count - with every holder, address and
+     fingerprint - into the chain as a public block.
+
+A copy only counts if it matches a fingerprint sealed in the chain. A holder
+only counts if it is not sebbi.pro. The count can be checked by anyone, and
+cannot be inflated: every entry names an address you can fetch yourself.
+
+Anyone can become a holder:
+  - tap the Internet Archive link on /x/custody/status, or
+  - keep the file anywhere public and register the address:
+      https://sebbi.pro/x/custody/offer?url=https://your.site/sebbi.json&name=You
+    (it is fetched and checked before it is listed), or
+  - run the keeper script (/x/custody/keeper) daily to fetch, verify and keep
+    each day's file automatically.
+
+Routes (public): status, holders, offer, keeper, spec. run is keyed.
+Armed by the first visit to /x/custody/status.
+"""
+
+import gzip
+import hashlib
+import ipaddress
+import json
+import re
+import socket
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+VERSION = "1.0.1"
+SITE = "https://sebbi.pro"
+BASE = SITE + "/x/custody/"
+USER_ID = "system_custody"
+UA = "sebbi-custody/1.0.1 (+https://sebbi.pro/x/custody/spec)"
+TIMEOUT = 60
+MAX_BYTES = 256 * 1024 * 1024
+RECENT_FILES = 3
+OPERATOR_HOSTS = ("sebbi.pro", "www.sebbi.pro")
+
+PUBLIC = {("GET", a) for a in ("status", "holders", "offer", "keeper", "spec")}
+
+_state = {"armed": False, "ctx": None, "last_run": None, "last_result": None}
+_lock = threading.Lock()
+_run_lock = threading.Lock()
+_offer_busy = threading.BoundedSemaphore(2)
+
+
+# ---------------------------------------------------------------- helpers
+
+def _ensure(conn):
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS custody_holders ("
+        "url TEXT PRIMARY KEY, name TEXT, host TEXT, added_at REAL, "
+        "last_checked REAL, last_verified REAL, last_fingerprint TEXT, "
+        "last_date TEXT, last_status TEXT, times_verified INTEGER DEFAULT 0)")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS custody_runs ("
+        "day TEXT PRIMARY KEY, sealed_block INTEGER, sealed_hash TEXT, "
+        "independent_holders INTEGER, holding_latest INTEGER, "
+        "latest_sha256 TEXT, ran_at REAL)")
+    conn.commit()
+
+
+def _host(url):
+    try:
+        return (urllib.parse.urlsplit(url).hostname or "").lower()
+    except Exception:
+        return ""
+
+
+def _public_https(url):
+    try:
+        p = urllib.parse.urlsplit(url)
+    except Exception:
+        return False
+    if p.scheme != "https" or p.port not in (None, 443) or not p.hostname:
+        return False
+    if p.username or p.password:
+        return False
+    try:
+        for info in socket.getaddrinfo(p.hostname, 443,
+                                       proto=socket.IPPROTO_TCP):
+            ip = ipaddress.ip_address(info[4][0])
+            if (ip.is_private or ip.is_loopback or ip.is_link_local or
+                    ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+                return False
+    except Exception:
+        return False
+    return True
+
+
+def _get(url, max_bytes=MAX_BYTES):
+    req = urllib.request.Request(url, headers={"User-Agent": UA,
+                                               "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+        raw = resp.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        raise ValueError("too large")
+    if raw[:2] == b"\x1f\x8b":
+        # Archives keep a page exactly as it was sent - often zipped.
+        raw = gzip.decompress(raw)
+    return raw
+
+
+def _canonical_sha(raw):
+    obj = json.loads(raw.decode("utf-8"))
+    return hashlib.sha256(json.dumps(obj, sort_keys=True,
+                                     separators=(",", ":")).encode("utf-8")
+                          ).hexdigest()
+
+
+def _sealed_files():
+    """date -> sha256, and sha256 -> file row, from the archive manifest."""
+    data = json.loads(_get(SITE + "/x/archive/manifest").decode("utf-8"))
+    files = data.get("files") or []
+    return files, {f["sha256"]: f for f in files if f.get("sha256")}
+
+
+def _seal(ctx, action, result):
+    seal = (ctx or {}).get("seal")
+    if not callable(seal):
+        return None, None
+    now = time.time()
+    result = dict(result, decision=action.upper(), score=0, timestamp=now)
+    event = {"user_id": USER_ID, "action": action, "amount": 0,
+             "country": "UK", "device_id": "custody", "anomaly": 0,
+             "device_risk": 0}
+    try:
+        res = seal(event, result, now)
+    except Exception:
+        return None, None
+    if isinstance(res, (list, tuple)):
+        return res[0], (res[1] if len(res) > 1 else None)
+    if isinstance(res, dict):
+        return (res.get("audit_hash") or res.get("hash"),
+                res.get("block_index") or res.get("index"))
+    return res, None
+
+
+# ---------------------------------------------------------------- checks
+
+def _check_internet_archive(files):
+    """For each recent sealed file: does the Internet Archive hold it, and
+    is its copy byte-for-byte the sealed file?"""
+    out = []
+    for f in files[:RECENT_FILES]:
+        target = "%s/x/archive/file?sha256=%s" % (SITE, f["sha256"])
+        row = {"holder": "Internet Archive", "date": f.get("date"),
+               "sealed_sha256": f["sha256"],
+               "archive_it": "https://web.archive.org/save/" + target}
+        try:
+            avail = json.loads(_get(
+                "https://archive.org/wayback/available?url=" +
+                urllib.parse.quote(target, safe=""), 1024 * 1024).decode("utf-8"))
+            snap = (avail.get("archived_snapshots") or {}).get("closest") or {}
+            if not snap.get("available"):
+                row.update({"held": False})
+            else:
+                stamp = re.sub(r"[^0-9]", "", str(snap.get("timestamp", "")))
+                raw_url = "https://web.archive.org/web/%sid_/%s" % (stamp, target)
+                fp = _canonical_sha(_get(raw_url))
+                row.update({"held": fp == f["sha256"], "copy": raw_url,
+                            "captured": stamp, "fingerprint": fp})
+        except Exception as exc:
+            row.update({"held": None,
+                        "note": "archive could not be asked (%s)"
+                                % exc.__class__.__name__})
+        out.append(row)
+    return out
+
+
+def _check_holder(url, by_sha):
+    try:
+        fp = _canonical_sha(_get(url))
+    except Exception as exc:
+        return {"fingerprint": None, "status": "unreachable (%s)"
+                % exc.__class__.__name__}
+    f = by_sha.get(fp)
+    if not f:
+        return {"fingerprint": fp,
+                "status": "serves a file that is not a sealed archive file"}
+    return {"fingerprint": fp, "date": f.get("date"), "status": "verified"}
+
+
+def _run(ctx, force=False):
+    conn, dblock = ctx.get("conn"), ctx.get("lock")
+    day = time.strftime("%Y-%m-%d", time.gmtime())
+    with dblock:
+        _ensure(conn)
+        done = conn.execute("SELECT sealed_block FROM custody_runs WHERE day = ?",
+                            (day,)).fetchone()
+        if done and not force:
+            return {"ok": True, "skipped": "already counted today",
+                    "sealed_block": done[0]}
+        holders = conn.execute("SELECT url, name FROM custody_holders").fetchall()
+
+    files, by_sha = _sealed_files()
+    if not files:
+        return {"ok": False, "error": "no sealed archive files yet"}
+    latest = files[0]["sha256"]
+
+    ia = _check_internet_archive(files)
+    results = []
+    for url, name in holders:
+        r = _check_holder(url, by_sha)
+        r.update({"holder": name, "url": url})
+        results.append(r)
+        now = time.time()
+        with dblock:
+            if r["status"] == "verified":
+                conn.execute(
+                    "UPDATE custody_holders SET last_checked = ?, "
+                    "last_verified = ?, last_fingerprint = ?, last_date = ?, "
+                    "last_status = ?, times_verified = times_verified + 1 "
+                    "WHERE url = ?", (now, now, r["fingerprint"], r.get("date"),
+                                      r["status"], url))
+            else:
+                conn.execute(
+                    "UPDATE custody_holders SET last_checked = ?, "
+                    "last_status = ? WHERE url = ?", (now, r["status"], url))
+            conn.commit()
+
+    verified = [r for r in results if r["status"] == "verified"]
+    ia_held = [r for r in ia if r.get("held")]
+    hosts = set(_host(r["url"]) for r in verified)
+    if ia_held:
+        hosts.add("web.archive.org")
+    holding_latest = len([r for r in verified if r["fingerprint"] == latest]) + \
+        (1 if any(r["sealed_sha256"] == latest for r in ia_held) else 0)
+
+    result = {"day": day, "latest_file_sha256": latest,
+              "independent_holders": len(hosts),
+              "holding_latest_file": holding_latest,
+              "internet_archive": ia, "registered_holders": results,
+              "rule": "A copy counts only if its canonical fingerprint is a "
+                      "sealed archive file, and only if it is held somewhere "
+                      "other than sebbi.pro. Every entry names an address "
+                      "anyone can fetch to check it."}
+    sealed_hash, sealed_block = _seal(ctx, "custody_counted", result)
+    with dblock:
+        conn.execute(
+            "INSERT OR REPLACE INTO custody_runs (day, sealed_block, sealed_hash, "
+            "independent_holders, holding_latest, latest_sha256, ran_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (day, sealed_block, sealed_hash, len(hosts), holding_latest,
+             latest, time.time()))
+        conn.commit()
+    return {"ok": True, "day": day, "independent_holders": len(hosts),
+            "holding_latest_file": holding_latest, "sealed_block": sealed_block,
+            "check_block": ("%s/x/walk/block?index=%s" % (SITE, sealed_block))
+            if sealed_block else None}
+
+
+def _loop():
+    time.sleep(120)
+    while True:
+        ctx = _state.get("ctx")
+        if ctx and _run_lock.acquire(blocking=False):
+            try:
+                _state["last_result"] = _run(ctx)
+            except Exception as exc:
+                _state["last_result"] = {"ok": False, "error": str(exc)[:200]}
+            finally:
+                _run_lock.release()
+            _state["last_run"] = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                               time.gmtime())
+        time.sleep(3600)
+
+
+def _arm(ctx):
+    with _lock:
+        _state["ctx"] = ctx
+        if _state["armed"]:
+            return
+        _state["armed"] = True
+    threading.Thread(target=_loop, name="custody", daemon=True).start()
+
+
+# ---------------------------------------------------------------- routes
+
+def _q(data, k):
+    v = (data or {}).get(k)
+    return v[0] if isinstance(v, list) and v else v
+
+
+def _offer(data, ctx):
+    url = str(_q(data, "url") or "").strip()
+    name = re.sub(r"[^A-Za-z0-9 .,&'()_-]", "", str(_q(data, "name") or ""))[:60]
+    if not url:
+        return {"ok": False, "error": "url_required",
+                "example": BASE + "offer?url=https://your.site/sebbi.json&name=Your%20Name"}, 400
+    if _host(url) in OPERATOR_HOSTS:
+        return {"ok": False, "error": "operator_host",
+                "detail": "A copy on sebbi.pro is not independent of sebbi.pro."}, 400
+    if not _public_https(url):
+        return {"ok": False, "error": "not_a_public_https_address"}, 400
+    if not _offer_busy.acquire(timeout=10):
+        return {"ok": False, "error": "busy"}, 429
+    try:
+        files, by_sha = _sealed_files()
+        r = _check_holder(url, by_sha)
+    finally:
+        _offer_busy.release()
+    if r["status"] != "verified":
+        return {"ok": False, "error": "copy_not_verified", "detail": r["status"],
+                "fingerprint": r.get("fingerprint"),
+                "sealed_files": SITE + "/x/archive/manifest"}, 400
+    conn, dblock = ctx["conn"], ctx["lock"]
+    now = time.time()
+    with dblock:
+        _ensure(conn)
+        conn.execute(
+            "INSERT OR IGNORE INTO custody_holders (url, name, host, added_at, "
+            "last_checked, last_verified, last_fingerprint, last_date, "
+            "last_status, times_verified) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
+            (url, name or _host(url), _host(url), now, now, now,
+             r["fingerprint"], r.get("date"), "verified"))
+        conn.commit()
+    _, block = _seal(ctx, "custody_holder_registered", {
+        "holder": name or _host(url), "url": url,
+        "fingerprint": r["fingerprint"], "file_date": r.get("date")})
+    return {"ok": True, "registered": url, "holder": name or _host(url),
+            "fingerprint": r["fingerprint"], "file_date": r.get("date"),
+            "sealed_in_block": block,
+            "note": "Your copy was fetched and matches a sealed file. It will "
+                    "be re-checked daily and counted in the sealed custody "
+                    "count."}, 200
+
+
+def _holders(ctx):
+    conn, dblock = ctx["conn"], ctx["lock"]
+    with dblock:
+        _ensure(conn)
+        rows = conn.execute(
+            "SELECT url, name, last_verified, last_fingerprint, last_date, "
+            "last_status, times_verified FROM custody_holders "
+            "ORDER BY added_at").fetchall()
+    iso = lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t)) if t else None
+    return {"ok": True, "holders": [
+        {"url": u, "name": n, "last_verified": iso(lv),
+         "last_fingerprint": fp, "file_date": d, "status": st,
+         "times_verified": tv} for u, n, lv, fp, d, st, tv in rows]}, 200
+
+
+def _status(ctx):
+    conn, dblock = ctx["conn"], ctx["lock"]
+    with dblock:
+        _ensure(conn)
+        runs = conn.execute(
+            "SELECT day, sealed_block, independent_holders, holding_latest, "
+            "latest_sha256 FROM custody_runs ORDER BY day DESC LIMIT 14").fetchall()
+        n_holders = conn.execute("SELECT COUNT(*) FROM custody_holders").fetchone()[0]
+    latest_link = None
+    try:
+        files, _ = _sealed_files()
+        if files:
+            latest_link = ("https://web.archive.org/save/%s/x/archive/file?"
+                           "sha256=%s" % (SITE, files[0]["sha256"]))
+    except Exception:
+        pass
+    return {
+        "ok": True, "module": "custody", "version": VERSION,
+        "armed": _state["armed"], "last_run": _state["last_run"],
+        "last_result": _state["last_result"],
+        "independent_holders_today": runs[0][2] if runs else None,
+        "registered_holders": n_holders,
+        "recent_counts": [{"day": d, "sealed_block": b,
+                           "check_block": ("%s/x/walk/block?index=%s" % (SITE, b))
+                           if b else None,
+                           "independent_holders": i, "holding_latest_file": h,
+                           "latest_file": s} for d, b, i, h, s in runs],
+        "become_a_holder": {
+            "one_tap": latest_link,
+            "register_your_own_copy": BASE + "offer?url=https://your.site/sebbi.json&name=You",
+            "keep_it_automatically": BASE + "keeper"},
+        "rule": "Counted only if byte-for-byte a sealed file, and only if held "
+                "somewhere other than sebbi.pro. Each day's count is sealed.",
+    }, 200
+
+
+KEEPER = r'''#!/usr/bin/env python3
+"""sebbi.pro keeper - fetch, verify and keep each day's self-proving file.
+
+Run daily (for example from cron). Standard library only.
+    python3 keeper.py /path/to/public/folder
+Keeps every day's file that PASSES its own built-in checks, plus latest.json.
+Serve that folder publicly, then register your latest.json once at:
+    https://sebbi.pro/x/custody/offer?url=https://YOUR.SITE/latest.json&name=YOU
+"""
+import json, os, subprocess, sys, tempfile, urllib.request
+
+out = sys.argv[1] if len(sys.argv) > 1 else "."
+os.makedirs(out, exist_ok=True)
+ua = {"User-Agent": "sebbi-keeper/1.0"}
+latest = json.load(urllib.request.urlopen(urllib.request.Request(
+    "https://sebbi.pro/x/archive/latest", headers=ua), timeout=60))
+url = latest["file"]
+raw = urllib.request.urlopen(urllib.request.Request(url, headers=ua),
+                             timeout=300).read()
+fd, tmp = tempfile.mkstemp(suffix=".json")
+os.write(fd, raw); os.close(fd)
+check = subprocess.run([sys.executable, "-c",
+    "import json,sys;exec(json.load(open(sys.argv[1]))['verifier_py'])", tmp],
+    capture_output=True, text=True)
+print(check.stdout)
+if check.returncode != 0:
+    os.remove(tmp)
+    sys.exit("Not kept: the file failed its own checks.")
+name = "sebbi-chain-%s-%s.json" % (latest["date"], latest["sha256"])
+os.replace(tmp, os.path.join(out, name))
+with open(os.path.join(out, "latest.json"), "wb") as fh:
+    fh.write(raw)
+print("Kept", name, "and latest.json in", out)
+'''
+
+
+def handle(method, action, data, api_key, ctx):
+    ctx = ctx or {}
+    try:
+        _arm(ctx)
+        if action in ("status", ""):
+            return _status(ctx)
+        if action == "holders":
+            return _holders(ctx)
+        if action == "offer":
+            return _offer(data, ctx)
+        if action == "keeper":
+            return {"ok": True, "keeper_py": KEEPER,
+                    "how": "Save keeper_py as keeper.py, run it daily with a "
+                           "folder you serve publicly, then register that "
+                           "folder's latest.json once."}, 200
+        if action == "spec":
+            return {"module": "custody", "version": VERSION,
+                    "counts": "independent holders whose copy is byte-for-byte "
+                              "a sealed archive file",
+                    "sealed": "each day's count, with every holder and "
+                              "fingerprint, is sealed into the chain",
+                    "routes": {"status": BASE + "status",
+                               "holders": BASE + "holders",
+                               "offer": BASE + "offer?url=<https address>&name=<name>",
+                               "keeper": BASE + "keeper"}}, 200
+        if action == "run":
+            if not api_key:
+                return {"ok": False, "error": "api_key_required"}, 401
+            with _run_lock:
+                return _run(ctx, force=True), 200
+        return {"ok": False, "error": "unknown_action",
+                "get": sorted(a for m, a in PUBLIC if m == "GET")}, 404
+    except Exception as exc:
+        return {"ok": False, "error": "custody_failed",
+                "detail": str(exc)[:200]}, 500
+
+```
 
 
 ## `modules/declare.py`
@@ -2029,687 +2502,5 @@ def handle(method, action, data, api_key, ctx):
             return _spec()
     return {"error": "unknown_action", "action": action,
             "routes": sorted(a for _m, a in PUBLIC)}, 404
-
-```
-
-
-## `modules/grade.py`
-
-674 lines, 26478 bytes
-
-```python
-"""
-modules/grade.py  v1.0.0  —  public transparency-file scanner
-
-WHAT IT DOES
-------------
-Fetches a domain's public convention files and reports, per file, what was
-actually found: served or not, parses or not, and the specific fields present.
-Nothing else.
-
-WHAT IT DELIBERATELY DOES NOT DO
---------------------------------
-It does not issue a letter grade, a score, or a verdict, and the words
-"compliant" and "non-compliant" appear nowhere in its output.
-
-The reason is not squeamishness. Half of these files are conventions rather
-than requirements. No law anywhere obliges a company to serve ai.txt,
-comply.txt, llms.txt or an AI-safety file, and two of those are conventions
-this operator helped write. Scoring the market against your own file format
-and publishing a letter is marking other people's homework with your own
-marking scheme. So this reports observations and lets the reader conclude.
-
-Absence is reported as absence. That is a fact about a file. It is not a
-finding about a company, and this module never converts one into the other.
-
-THE CLOAKING CHECK WAS REMOVED
-------------------------------
-An earlier version compared homepage byte-length under two user agents and
-scored a >10% difference as cloaking. Any page with a clock, a nonce or a
-rotating banner fails that; real cloaking returning a similar-length page
-passes it. It measured noise and reported it as a signal, so it is gone
-rather than reworded.
-
-ROUTES
-------
-  POST /x/grade/scan          KEYED   scan a domain, seal the result
-  GET  /x/grade/report        public  ?domain= — the last scan of that domain
-  GET  /x/grade/list          public  domains scanned, most recent first
-  GET  /x/grade/spec          public  what each check means
-  GET  /grade-badge?domain=   public  SVG, served from cache ONLY
-
-BADGE BEHAVIOUR THAT MATTERS
-----------------------------
-The badge never triggers a fetch of the target. An earlier version re-ran
-every check on every image load, so embedding the badge on a busy page would
-have pointed sustained unsolicited traffic at somebody else's server from
-this IP. The badge now renders from the stored scan or says "not scanned".
-
-SAFETY
-------
-https only, port 443, DNS resolved and checked against private, loopback,
-link-local, multicast and reserved ranges before any request, redirects not
-followed, 8s timeout, 256KB cap per file. Known limit, stated rather than
-hidden: resolve-then-connect leaves a DNS rebinding window, the same gap
-witness.py has.
-
-/robots.txt is read first and its Disallow rules for * are honoured. A
-scanner that ignores robots while grading other people on transparency
-would be a poor advertisement for the point being made.
-"""
-
-import json
-import socket
-import ssl
-import time
-import urllib.error
-import urllib.request
-from urllib.parse import urlparse
-
-VERSION = "1.0.0"
-
-PUBLIC = {("GET", "report"), ("GET", "list"), ("GET", "spec"), ("GET", "")}
-
-PAGE_PATHS = ("/grade-badge",)
-
-UA = "AILeash-Transparency-Scan/1.0 (+https://sebbi.pro/x/grade/spec)"
-TIMEOUT = 8
-MAX_BYTES = 262144
-CACHE_TTL = 3600
-
-# Files that are genuine public-web standards with an RFC or a long-standing
-# convention behind them. Absence here is still not a legal finding, but the
-# expectation is at least widely shared.
-STANDARDS = [
-    ("security_txt", "/.well-known/security.txt", "RFC 9116 security contact"),
-    ("robots_txt", "/robots.txt", "crawler directives"),
-    ("sitemap_xml", "/sitemap.xml", "site index"),
-]
-
-# Files that are emerging AI-transparency conventions. Reported as adoption
-# facts, never scored, because nobody is obliged to serve any of them.
-CONVENTIONS = [
-    ("ai_txt", "/.well-known/ai.txt", "AI system manifest"),
-    ("ai_txt_root", "/ai.txt", "AI system manifest at root"),
-    ("comply_txt", "/.well-known/comply.txt", "compliance index"),
-    ("llms_txt", "/llms.txt", "guidance for language models"),
-    ("ai_safety_txt", "/.well-known/ai-safety.txt", "AI-safety declaration"),
-]
-
-_patched = [False]
-_ready = [False]
-_cache = {}
-
-
-def _setup(ctx):
-    if _ready[0]:
-        return
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "CREATE TABLE IF NOT EXISTS grade_scan("
-            "id INTEGER PRIMARY KEY AUTOINCREMENT,domain TEXT,scanned REAL,"
-            "findings TEXT,standards_served INTEGER,conventions_served INTEGER,"
-            "audit_hash TEXT,block_index INTEGER)")
-        ctx["conn"].execute(
-            "CREATE INDEX IF NOT EXISTS idx_grade_domain ON grade_scan(domain)")
-        ctx["conn"].execute(
-            "CREATE INDEX IF NOT EXISTS idx_grade_hash ON grade_scan(audit_hash)")
-        ctx["conn"].commit()
-    _ready[0] = True
-
-
-# ----------------------------------------------------------------------
-# safety
-# ----------------------------------------------------------------------
-
-def _clean_domain(raw):
-    d = str(raw or "").strip().lower()
-    d = d.replace("https://", "").replace("http://", "")
-    d = d.split("/")[0].split("?")[0].strip().rstrip(".")
-    if "@" in d or ":" in d or " " in d:
-        return None
-    if not d or "." not in d or len(d) > 253:
-        return None
-    for ch in d:
-        if not (ch.isalnum() or ch in ".-"):
-            return None
-    return d
-
-
-def _private(ip):
-    parts = ip.split(".")
-    if len(parts) == 4:
-        try:
-            a, b = int(parts[0]), int(parts[1])
-        except ValueError:
-            return True
-        if a == 10 or a == 127 or a == 0:
-            return True
-        if a == 172 and 16 <= b <= 31:
-            return True
-        if a == 192 and b == 168:
-            return True
-        if a == 169 and b == 254:
-            return True
-        if a == 100 and 64 <= b <= 127:
-            return True
-        if a >= 224:
-            return True
-        return False
-    low = ip.lower()
-    if low in ("::1", "::", "") or low.startswith(("fc", "fd", "fe80", "::ffff:")):
-        return True
-    return False
-
-
-def _resolvable(domain):
-    try:
-        infos = socket.getaddrinfo(domain, 443, proto=socket.IPPROTO_TCP)
-    except Exception as exc:
-        return False, "dns_failed: " + type(exc).__name__
-    for info in infos:
-        ip = info[4][0]
-        if _private(ip):
-            return False, "resolves_to_non_public_address"
-    return True, None
-
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *a, **k):
-        return None
-
-
-def _get(url):
-    """One request. Returns (status, text, note). Never raises."""
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
-    opener = urllib.request.build_opener(
-        _NoRedirect, urllib.request.HTTPSHandler(context=ssl.create_default_context()))
-    try:
-        with opener.open(req, timeout=TIMEOUT) as resp:
-            raw = resp.read(MAX_BYTES + 1)
-            truncated = len(raw) > MAX_BYTES
-            text = raw[:MAX_BYTES].decode("utf-8", errors="replace")
-            return resp.status, text, ("truncated" if truncated else None)
-    except urllib.error.HTTPError as exc:
-        return exc.code, None, None
-    except Exception as exc:
-        return None, None, type(exc).__name__
-
-
-# ----------------------------------------------------------------------
-# parsing — every check states exactly what it looked at
-# ----------------------------------------------------------------------
-
-def _fields(text):
-    """Key: value lines, lowercased keys. Comments and blanks ignored."""
-    out = {}
-    for line in (text or "").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or ":" not in line:
-            continue
-        k, _, v = line.partition(":")
-        k = k.strip().lower()
-        if k and k not in out:
-            out[k] = v.strip()
-    return out
-
-
-def _check_security(text):
-    f = _fields(text)
-    return {
-        "parses_as_fields": bool(f),
-        "has_contact": "contact" in f,
-        "has_expires": "expires" in f,
-        "expires_value": f.get("expires"),
-        "note": ("RFC 9116 requires Contact and Expires. Both presence checks "
-                 "above are literal: the field is there or it is not. Whether "
-                 "the contact works is not tested."),
-    }
-
-
-def _check_robots(text):
-    lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
-    directives = [l for l in lines if ":" in l and not l.startswith("#")]
-    return {
-        "non_empty": bool(lines),
-        "directive_lines": len(directives),
-        "note": "Presence and shape only. The rules themselves are not judged.",
-    }
-
-
-def _check_sitemap(text):
-    try:
-        import xml.etree.ElementTree as ET
-        ET.fromstring(text or "")
-        return {"parses_as_xml": True,
-                "note": "Parsed as XML. Contents and freshness are not checked."}
-    except Exception as exc:
-        return {"parses_as_xml": False, "parse_error": type(exc).__name__,
-                "note": "Served but did not parse as XML."}
-
-
-def _check_ai_safety(text):
-    """The old version passed if the file contained 'ai-safe:' and the word
-    'true' anywhere in it, so 'AI-Safe: false' with 'true' elsewhere passed.
-    This reads the field's own value and reports it verbatim."""
-    f = _fields(text)
-    val = f.get("ai-safe")
-    return {
-        "has_ai_safe_field": val is not None,
-        "ai_safe_value": val,
-        "declared_safe": (val.strip().lower() == "true") if val else None,
-        "note": ("This reports what the domain declares about itself. A "
-                 "self-declaration is not a verification, and nothing here "
-                 "checks whether the declaration is true."),
-    }
-
-
-def _check_manifest(text):
-    f = _fields(text)
-    interesting = ["standard", "domain", "chain-head", "chain-tip-url", "witness-tip",
-                   "verify-chain", "consistency-proof", "self-check",
-                   "security-contact", "contact", "governance-engine"]
-    return {
-        "parses_as_fields": bool(f),
-        "field_count": len(f),
-        "fields_present": [k for k in interesting if k in f],
-        "declares_standard": f.get("standard"),
-        "note": ("Fields are reported as served. Nothing here follows the URLs "
-                 "they contain or verifies any chain they point at."),
-    }
-
-
-def _check_present(text):
-    return {"non_empty": bool(text and text.strip()),
-            "bytes": len(text or ""),
-            "note": "Presence and size only."}
-
-
-PARSERS = {
-    "security_txt": _check_security,
-    "robots_txt": _check_robots,
-    "sitemap_xml": _check_sitemap,
-    "ai_safety_txt": _check_ai_safety,
-    "ai_txt": _check_manifest,
-    "ai_txt_root": _check_manifest,
-    "comply_txt": _check_manifest,
-    "llms_txt": _check_present,
-}
-
-
-def _disallowed(robots_text):
-    """Paths Disallowed for * in robots.txt. Honoured for every other fetch."""
-    blocked = []
-    applies = False
-    for line in (robots_text or "").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        k, _, v = line.partition(":")
-        k, v = k.strip().lower(), v.strip()
-        if k == "user-agent":
-            applies = (v == "*")
-        elif k == "disallow" and applies and v:
-            blocked.append(v)
-    return blocked
-
-
-def _blocked(path, rules):
-    for rule in rules:
-        if rule == "/" or path.startswith(rule):
-            return True
-    return False
-
-
-# ----------------------------------------------------------------------
-# the scan
-# ----------------------------------------------------------------------
-
-def _scan(domain):
-    base = "https://" + domain
-    findings = {}
-
-    status, robots_text, note = _get(base + "/robots.txt")
-    rules = _disallowed(robots_text) if status == 200 else []
-    findings["robots_txt"] = {
-        "path": "/robots.txt", "http_status": status,
-        "served": status == 200, "transport_note": note,
-        "detail": _check_robots(robots_text) if status == 200 else None,
-        "kind": "standard", "description": "crawler directives",
-    }
-
-    for key, path, desc in STANDARDS + CONVENTIONS:
-        if key == "robots_txt":
-            continue
-        if _blocked(path, rules):
-            findings[key] = {
-                "path": path, "served": None, "http_status": None,
-                "skipped": "disallowed_by_robots_txt",
-                "kind": "standard" if key in [k for k, _, _ in STANDARDS] else "convention",
-                "description": desc,
-                "note": ("This domain's robots.txt disallows it, so it was not "
-                         "requested. Not requested is not the same as absent."),
-            }
-            continue
-        st, text, tnote = _get(base + path)
-        served = (st == 200 and bool(text and text.strip()))
-        findings[key] = {
-            "path": path, "http_status": st, "served": served,
-            "transport_note": tnote,
-            "detail": PARSERS[key](text) if served else None,
-            "kind": "standard" if key in [k for k, _, _ in STANDARDS] else "convention",
-            "description": desc,
-        }
-
-    std_keys = [k for k, _, _ in STANDARDS]
-    conv_keys = [k for k, _, _ in CONVENTIONS]
-    std_served = sum(1 for k in std_keys if findings.get(k, {}).get("served"))
-    conv_served = sum(1 for k in conv_keys if findings.get(k, {}).get("served"))
-
-    return findings, std_served, conv_served
-
-
-def _summary(domain, findings, std, conv, scanned, receipt=None, block=None):
-    return {
-        "domain": domain,
-        "scanned_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(scanned)),
-        "standards_served": "%d of %d" % (std, len(STANDARDS)),
-        "conventions_served": "%d of %d" % (conv, len(CONVENTIONS)),
-        "findings": findings,
-        "receipt": receipt,
-        "block_index": block,
-        "what_this_is": (
-            "A record of which public files this domain served at the time of "
-            "the scan, and what each one contained. Every check is named and "
-            "every result is what the fetch returned."),
-        "what_this_is_not": (
-            "Not a grade, not a score, and not a statement about whether this "
-            "organisation complies with anything. No law requires any of the "
-            "files above. Absence of a file is absence of a file."),
-        "conventions_disclaimer": (
-            "ai.txt and comply.txt are conventions sebbi.pro publishes and helped "
-            "shape. A domain not serving them has declined nothing and broken "
-            "nothing - it has simply not adopted a format that is not a standard."),
-        "if_you_are_the_domain_owner": (
-            "This scan requested public files over https and followed your "
-            "robots.txt. Nothing was crawled beyond the paths listed. The scan "
-            "is sealed, so exactly what was fetched and when is on record and "
-            "can be produced. Contact justrightdecorators@gmail.com to have a "
-            "scan removed from the public list."),
-    }
-
-
-# ----------------------------------------------------------------------
-# badge — cache only, never triggers a fetch of the target
-# ----------------------------------------------------------------------
-
-def _badge_svg(label, value, colour):
-    return (
-        '<svg xmlns="http://www.w3.org/2000/svg" width="260" height="20" '
-        'role="img" aria-label="%s %s">'
-        '<rect width="176" height="20" fill="#0a0f1e"/>'
-        '<rect x="176" width="84" height="20" fill="%s"/>'
-        '<text x="88" y="14" fill="#fff" font-family="Verdana,sans-serif" '
-        'font-size="10" text-anchor="middle">%s</text>'
-        '<text x="218" y="14" fill="#0a0f1e" font-family="Verdana,sans-serif" '
-        'font-size="10" font-weight="bold" text-anchor="middle">%s</text>'
-        '</svg>' % (label, value, colour, label, value))
-
-
-def _srv():
-    import sys
-    m = sys.modules.get("__main__")
-    if hasattr(m, "get_bearer"):
-        return m
-    return sys.modules.get("server")
-
-
-def _install(s, ctx):
-    if _patched[0]:
-        return "already installed"
-    H = getattr(s, "Handler", None)
-    if H is None or not hasattr(H, "do_GET"):
-        return "no handler"
-    if getattr(H, "_grade_patched", False):
-        _patched[0] = True
-        return "already installed"
-
-    conn, lock = ctx["conn"], ctx["lock"]
-    original = H.do_GET
-
-    def do_GET(self):
-        try:
-            u = urlparse(self.path)
-            p = u.path.rstrip("/") or "/"
-        except Exception:
-            p = self.path or "/"
-        if p in PAGE_PATHS:
-            domain = ""
-            try:
-                q = dict(pair.split("=", 1) for pair in (u.query or "").split("&") if "=" in pair)
-                domain = _clean_domain(q.get("domain", "")) or ""
-            except Exception:
-                domain = ""
-            label = "transparency files"
-            value, colour = "not scanned", "#6b6353"
-            if domain:
-                try:
-                    with lock:
-                        row = conn.execute(
-                            "SELECT standards_served,conventions_served FROM grade_scan "
-                            "WHERE domain=? ORDER BY id DESC LIMIT 1", (domain,)).fetchone()
-                    if row:
-                        value = "%d/%d std · %d/%d conv" % (
-                            row[0], len(STANDARDS), row[1], len(CONVENTIONS))
-                        colour = "#7fe3b0" if row[0] == len(STANDARDS) else "#c9a84c"
-                except Exception:
-                    pass
-            body = _badge_svg(label, value, colour).encode("utf-8")
-            try:
-                self.send_response(200)
-                self.send_header("Content-Type", "image/svg+xml; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Cache-Control", "public, max-age=3600")
-                self.end_headers()
-                self.wfile.write(body)
-            except Exception:
-                pass
-            return
-        return original(self)
-
-    H.do_GET = do_GET
-    H._grade_patched = True
-    _patched[0] = True
-    print("GRADE: /grade-badge installed at runtime", flush=True)
-    return "installed"
-
-
-# ----------------------------------------------------------------------
-# routes
-# ----------------------------------------------------------------------
-
-def _do_scan(ctx, api_key, data):
-    domain = _clean_domain((data or {}).get("domain"))
-    if not domain:
-        return {"error": "domain_required",
-                "message": "Send {\"domain\": \"example.com\"}."}, 400
-
-    cached = _cache.get(domain)
-    if cached and (time.time() - cached[0]) < CACHE_TTL and not (data or {}).get("force"):
-        out = dict(cached[1])
-        out["from_cache"] = True
-        out["cache_age_seconds"] = int(time.time() - cached[0])
-        return out, 200
-
-    ok, why = _resolvable(domain)
-    if not ok:
-        return {"error": "domain_refused", "domain": domain, "reason": why,
-                "message": "Only public, resolvable hosts are scanned."}, 400
-
-    scanned = time.time()
-    findings, std, conv = _scan(domain)
-
-    ev = {"user_id": "grade:" + domain, "action": "transparency_scan",
-          "amount": 0, "country": "UK", "device_id": "grade",
-          "anomaly": 0, "device_risk": 0}
-    res = {"decision": "SCAN_RECORDED", "score": 0, "grade_version": VERSION,
-           "domain": domain, "standards_served": std, "conventions_served": conv,
-           "timestamp": scanned,
-           "detail": "domain=%s;standards=%d/%d;conventions=%d/%d"
-                     % (domain, std, len(STANDARDS), conv, len(CONVENTIONS))}
-    try:
-        h, idx, seq = ctx["seal"](ev, res, scanned, api_key)
-    except Exception as exc:
-        return {"error": "seal_failed",
-                "detail": type(exc).__name__ + ": " + str(exc)[:250],
-                "message": ("The scan ran but was not recorded, so nothing is "
-                            "published. A scan nobody can audit is not published "
-                            "here.")}, 500
-    if not h:
-        return {"error": "seal_failed", "detail": "seal returned no hash"}, 500
-
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "INSERT INTO grade_scan(domain,scanned,findings,standards_served,"
-            "conventions_served,audit_hash,block_index) VALUES(?,?,?,?,?,?,?)",
-            (domain, scanned, json.dumps(findings), std, conv, h, idx))
-        ctx["conn"].commit()
-
-    out = _summary(domain, findings, std, conv, scanned, h, idx)
-    out["receipt_seq"] = seq
-    out["badge"] = "https://sebbi.pro/grade-badge?domain=" + domain
-    out["report"] = "https://sebbi.pro/x/grade/report?domain=" + domain
-    _cache[domain] = (scanned, out)
-    if len(_cache) > 500:
-        for k in sorted(_cache, key=lambda k: _cache[k][0])[:100]:
-            _cache.pop(k, None)
-    return out, 200
-
-
-def _report(ctx, data):
-    domain = _clean_domain((data or {}).get("domain"))
-    if not domain:
-        return {"error": "domain_required"}, 400
-    with ctx["lock"]:
-        row = ctx["conn"].execute(
-            "SELECT scanned,findings,standards_served,conventions_served,"
-            "audit_hash,block_index FROM grade_scan WHERE domain=? "
-            "ORDER BY id DESC LIMIT 1", (domain,)).fetchone()
-    if not row:
-        return {"found": False, "domain": domain,
-                "message": "This domain has not been scanned."}, 404
-    try:
-        findings = json.loads(row[1])
-    except Exception:
-        findings = {}
-    out = _summary(domain, findings, row[2], row[3], row[0], row[4], row[5])
-    out["found"] = True
-    out["badge"] = "https://sebbi.pro/grade-badge?domain=" + domain
-    return out, 200
-
-
-def _list(ctx, data):
-    try:
-        limit = min(200, max(1, int((data or {}).get("limit", 50))))
-    except (TypeError, ValueError):
-        limit = 50
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT domain,MAX(scanned),standards_served,conventions_served "
-            "FROM grade_scan GROUP BY domain ORDER BY MAX(scanned) DESC LIMIT ?",
-            (limit,)).fetchall()
-    return {
-        "count": len(rows),
-        "scans": [{
-            "domain": r[0],
-            "scanned_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(r[1])),
-            "standards_served": "%d of %d" % (r[2], len(STANDARDS)),
-            "conventions_served": "%d of %d" % (r[3], len(CONVENTIONS)),
-            "report": "/x/grade/report?domain=" + r[0],
-        } for r in rows],
-        "what_this_list_is": (
-            "Domains that have been scanned, with what they served. It is not a "
-            "ranking, not a shortlist and not an allegation about anyone on it."),
-    }, 200
-
-
-def _spec():
-    return {
-        "module": "grade", "version": VERSION,
-        "question": "Which public transparency files does this domain serve, and what is in them?",
-        "standards_checked": [{"key": k, "path": p, "what": d} for k, p, d in STANDARDS],
-        "conventions_checked": [{"key": k, "path": p, "what": d} for k, p, d in CONVENTIONS],
-        "no_grade": (
-            "This module issues no letter, no score and no verdict, and the word "
-            "compliant appears nowhere in its output. Half of these files are "
-            "conventions rather than requirements, two of them are conventions "
-            "sebbi.pro helped write, and grading strangers against your own "
-            "format would be marking their homework with your marking scheme."),
-        "absence": (
-            "A file that is not served is reported as not served. That is a fact "
-            "about a file and never a finding about a company."),
-        "self_declarations": (
-            "Where a file declares something about the domain - ai-safe: true, a "
-            "chain head, a standard version - the declaration is reported "
-            "verbatim and is never treated as verified. Nothing here follows the "
-            "URLs a manifest contains."),
-        "how_it_fetches": {
-            "scheme": "https only, port 443",
-            "redirects": "not followed",
-            "timeout_seconds": TIMEOUT,
-            "max_bytes_per_file": MAX_BYTES,
-            "address_check": ("DNS resolved and rejected if it points at private, "
-                              "loopback, link-local, multicast or reserved space"),
-            "known_limit": ("resolve-then-connect leaves a DNS rebinding window; "
-                            "stated rather than hidden"),
-            "robots": "/robots.txt is read first and Disallow rules for * are honoured",
-            "user_agent": UA,
-        },
-        "badge": {
-            "url": "https://sebbi.pro/grade-badge?domain=example.com",
-            "behaviour": ("renders from the stored scan only and never fetches the "
-                          "target, so embedding it cannot point traffic at anyone"),
-        },
-        "every_scan_is_sealed": (
-            "Each scan is written into the audit chain with its receipt, so a "
-            "domain owner who objects can be shown exactly what was requested "
-            "and when."),
-        "auth": "scan is keyed. report, list, spec and the badge are public.",
-    }, 200
-
-
-def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-    s = _srv()
-    if s is not None and not _patched[0]:
-        try:
-            _install(s, ctx)
-        except Exception as exc:
-            print("GRADE: patch failed - " + str(exc), flush=True)
-
-    action = (action or "").strip("/").lower()
-
-    if method == "POST":
-        if action == "scan":
-            if not api_key:
-                return {"error": "api_key_required",
-                        "message": ("Scanning fetches somebody else's server, so it "
-                                    "is keyed and attributable. Reading results is "
-                                    "public.")}, 401
-            return _do_scan(ctx, api_key, data)
-        return {"error": "unknown_action", "action": action, "POST": ["scan"]}, 404
-
-    if action in ("", "spec"):
-        return _spec()
-    if action == "report":
-        return _report(ctx, data)
-    if action == "list":
-        return _list(ctx, data)
-    if action == "status":
-        return {"module": "grade", "version": VERSION,
-                "badge_installed": bool(_patched[0]),
-                "cached_domains": len(_cache)}, 200
-    return {"error": "unknown_action", "action": action,
-            "GET": ["spec", "report", "list", "status"], "POST": ["scan"]}, 404
 
 ```
