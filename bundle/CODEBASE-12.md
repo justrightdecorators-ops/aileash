@@ -1,271 +1,9 @@
 # Codebase — part 12 of 36
 
 Contains:
-- `modules/passportpage.py`
 - `modules/peer.py`
 - `modules/peerconsole.py`
-
-
-## `modules/passportpage.py`
-
-254 lines, 19674 bytes
-
-```python
-"""
-modules/passportpage.py  v1.0.0
-Serves the Agent Passport page at /passport.
-
-Page module, same family as map.py / console.py / network.py: a runtime
-do_GET patch puts a full HTML page at a clean URL. Armed by hitting
-/x/passportpage/status once after each deploy. server.py is never edited.
-The page is base64-embedded so no character in the HTML can break the
-Python string. The live demo on the page calls /x/passport/demo.
-"""
-
-import base64
-import sys
-
-VERSION = "1.0.0"
-PAGE_PATH = "/passport"
-
-_B64 = (
-    "PCFET0NUWVBFIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+CjxtZXRhIGNoYXJzZXQ9IlVURi04Ij4KPG1ldGEgbmFtZT0i"
-    "dmlld3BvcnQiIGNvbnRlbnQ9IndpZHRoPWRldmljZS13aWR0aCwgaW5pdGlhbC1zY2FsZT0xLCB2aWV3cG9ydC1maXQ9Y292ZXIi"
-    "Pgo8dGl0bGU+QWdlbnQgUGFzc3BvcnQg4oCUIHNlYmJpLnBybzwvdGl0bGU+CjxtZXRhIG5hbWU9ImRlc2NyaXB0aW9uIiBjb250"
-    "ZW50PSJFdmVyeSBBSSBhZ2VudCBuZWVkcyBhIHBhc3Nwb3J0LiBTaWduZWQsIHNpbmdsZS11c2UgcGVybWlzc2lvbiBmb3IgQUkg"
-    "YWN0aW9ucywgY2hlY2tlZCBhdCB0aGUgbW9tZW50IG9mIGFjdGlvbiwgc2VhbGVkIG9uIGEgcHVibGljIGNoYWluLiI+CjxsaW5r"
-    "IHJlbD0icHJlY29ubmVjdCIgaHJlZj0iaHR0cHM6Ly9mb250cy5nb29nbGVhcGlzLmNvbSI+CjxsaW5rIGhyZWY9Imh0dHBzOi8v"
-    "Zm9udHMuZ29vZ2xlYXBpcy5jb20vY3NzMj9mYW1pbHk9TmV3c3JlYWRlcjpvcHN6LHdnaHRANi4uNzIsNDAwOzYuLjcyLDUwMCZm"
-    "YW1pbHk9SUJNK1BsZXgrU2Fuczp3Z2h0QDQwMDs1MDA7NjAwJmZhbWlseT1JQk0rUGxleCtNb25vOndnaHRANDAwOzUwMCZkaXNw"
-    "bGF5PXN3YXAiIHJlbD0ic3R5bGVzaGVldCI+CjxzdHlsZT4KOnJvb3R7LS1pbms6IzBhMGYxZTstLWluazI6IzEwMTgyZTstLXBh"
-    "cGVyOiNGQUZBRjY7LS1saW5lOiNERURCRDE7LS1nb2xkOiNjOWE4NGM7LS1vazojMkU3RDU3Oy0tb2tiZzojRTRFQ0U4Oy0td2Fy"
-    "bjojOUMyRjI2Oy0td2FybmJnOiNGNUU2RTM7LS1tdXRlZDojNUE2MjcwOy0tZmFpbnQ6IzhBOTBBMDsKLS1zYW5zOidJQk0gUGxl"
-    "eCBTYW5zJyxzeXN0ZW0tdWksc2Fucy1zZXJpZjstLXNlcmlmOidOZXdzcmVhZGVyJyxHZW9yZ2lhLHNlcmlmOy0tbW9ubzonSUJN"
-    "IFBsZXggTW9ubycsdWktbW9ub3NwYWNlLG1vbm9zcGFjZX0KKntib3gtc2l6aW5nOmJvcmRlci1ib3g7bWFyZ2luOjA7cGFkZGlu"
-    "ZzowfQpib2R5e2ZvbnQtZmFtaWx5OnZhcigtLXNhbnMpO2JhY2tncm91bmQ6dmFyKC0tcGFwZXIpO2NvbG9yOnZhcigtLWluayk7"
-    "bGluZS1oZWlnaHQ6MS42Oy13ZWJraXQtZm9udC1zbW9vdGhpbmc6YW50aWFsaWFzZWR9Ci53cmFwe21heC13aWR0aDo4MjBweDtt"
-    "YXJnaW46MCBhdXRvO3BhZGRpbmc6MCAyMnB4fQoudG9we2JvcmRlci1ib3R0b206MXB4IHNvbGlkIHZhcigtLWxpbmUpO3BhZGRp"
-    "bmc6MTZweCAwfQoudG9wIC53cmFwe2Rpc3BsYXk6ZmxleDtqdXN0aWZ5LWNvbnRlbnQ6c3BhY2UtYmV0d2VlbjthbGlnbi1pdGVt"
-    "czpiYXNlbGluZTtnYXA6MTJweDtmbGV4LXdyYXA6d3JhcH0KLmJyYW5ke2ZvbnQtZmFtaWx5OnZhcigtLW1vbm8pO2ZvbnQtc2l6"
-    "ZToxM3B4fS5icmFuZCBie2NvbG9yOnZhcigtLWdvbGQpO2ZvbnQtd2VpZ2h0OjUwMH0KLnRvcCBuYXYgYXtmb250LWZhbWlseTp2"
-    "YXIoLS1tb25vKTtmb250LXNpemU6MTIuNXB4O2NvbG9yOnZhcigtLW11dGVkKTt0ZXh0LWRlY29yYXRpb246bm9uZTttYXJnaW4t"
-    "bGVmdDoxNHB4fQouaGVyb3twYWRkaW5nOjU0cHggMCAyNnB4fQoua2lja3tmb250LWZhbWlseTp2YXIoLS1tb25vKTtmb250LXNp"
-    "emU6MTJweDtjb2xvcjp2YXIoLS1nb2xkKTtsZXR0ZXItc3BhY2luZzouMDZlbTttYXJnaW4tYm90dG9tOjE0cHh9Ci5oZXJvIGgx"
-    "e2ZvbnQtZmFtaWx5OnZhcigtLXNlcmlmKTtmb250LXdlaWdodDo1MDA7Zm9udC1zaXplOmNsYW1wKDM0cHgsNnZ3LDU2cHgpO2xp"
-    "bmUtaGVpZ2h0OjEuMDU7bWF4LXdpZHRoOjE1Y2g7bWFyZ2luLWJvdHRvbToxOHB4fQouaGVybyBwe2ZvbnQtc2l6ZToxNy41cHg7"
-    "Y29sb3I6dmFyKC0tbXV0ZWQpO21heC13aWR0aDo1NmNofQouY3Rhe2Rpc3BsYXk6aW5saW5lLWJsb2NrO21hcmdpbjoyNnB4IDEy"
-    "cHggMCAwO2ZvbnQtZmFtaWx5OnZhcigtLW1vbm8pO2ZvbnQtc2l6ZToxNHB4O3RleHQtZGVjb3JhdGlvbjpub25lO2JvcmRlci1y"
-    "YWRpdXM6NXB4O3BhZGRpbmc6MTNweCAyMHB4O2N1cnNvcjpwb2ludGVyO2JvcmRlcjowfQouY3RhLmdvbGR7YmFja2dyb3VuZDp2"
-    "YXIoLS1nb2xkKTtjb2xvcjp2YXIoLS1pbmspO2ZvbnQtd2VpZ2h0OjUwMH0KLmN0YS5naG9zdHtib3JkZXI6MXB4IHNvbGlkIHZh"
-    "cigtLWxpbmUpO2NvbG9yOnZhcigtLWluayk7YmFja2dyb3VuZDojZmZmfQouc3RhdHN7ZGlzcGxheTpmbGV4O2dhcDoyMnB4O2Zs"
-    "ZXgtd3JhcDp3cmFwO21hcmdpbi10b3A6MzBweDtmb250LWZhbWlseTp2YXIoLS1tb25vKTtmb250LXNpemU6MTJweDtjb2xvcjp2"
-    "YXIoLS1mYWludCl9Ci5zdGF0cyBie2NvbG9yOnZhcigtLWluayk7Zm9udC13ZWlnaHQ6NTAwO2ZvbnQtc2l6ZToxNXB4O2Rpc3Bs"
-    "YXk6YmxvY2t9CnNlY3Rpb257cGFkZGluZzo0MHB4IDA7Ym9yZGVyLXRvcDoxcHggc29saWQgdmFyKC0tbGluZSl9Cmgye2ZvbnQt"
-    "ZmFtaWx5OnZhcigtLXNlcmlmKTtmb250LXdlaWdodDo1MDA7Zm9udC1zaXplOmNsYW1wKDI2cHgsNC4ydncsMzZweCk7bGluZS1o"
-    "ZWlnaHQ6MS4xMjttYXJnaW4tYm90dG9tOjE0cHg7bWF4LXdpZHRoOjIyY2h9Ci5sZWFke2NvbG9yOnZhcigtLW11dGVkKTttYXgt"
-    "d2lkdGg6NjBjaDttYXJnaW4tYm90dG9tOjIycHh9Ci5zdGVwc3tkaXNwbGF5OmdyaWQ7Z2FwOjE0cHh9Ci5zdGVwe2JhY2tncm91"
-    "bmQ6I2ZmZjtib3JkZXI6MXB4IHNvbGlkIHZhcigtLWxpbmUpO2JvcmRlci1yYWRpdXM6N3B4O3BhZGRpbmc6MjBweCAyMnB4fQou"
-    "c3RlcCAubntmb250LWZhbWlseTp2YXIoLS1tb25vKTtmb250LXNpemU6MTFweDtjb2xvcjp2YXIoLS1nb2xkKTtsZXR0ZXItc3Bh"
-    "Y2luZzouMDVlbX0KLnN0ZXAgaDN7Zm9udC1mYW1pbHk6dmFyKC0tc2VyaWYpO2ZvbnQtd2VpZ2h0OjUwMDtmb250LXNpemU6MjFw"
-    "eDttYXJnaW46NHB4IDAgNnB4fQouc3RlcCBwe2ZvbnQtc2l6ZToxNC44cHg7Y29sb3I6dmFyKC0tbXV0ZWQpfQouZGFya3tiYWNr"
-    "Z3JvdW5kOnZhcigtLWluayk7Y29sb3I6I2ZmZjtib3JkZXItcmFkaXVzOjEwcHg7cGFkZGluZzozMHB4IDI0cHg7Ym9yZGVyOjJw"
-    "eCBzb2xpZCB2YXIoLS1nb2xkKX0KLmRhcmsgaDJ7Y29sb3I6I2ZmZn0uZGFyayAubGVhZHtjb2xvcjpyZ2JhKDI1NSwyNTUsMjU1"
-    "LC43Mil9CiNzdG9yeXttYXJnaW4tdG9wOjE4cHg7ZGlzcGxheTpncmlkO2dhcDo4cHh9Ci5yb3d7ZGlzcGxheTpmbGV4O2dhcDox"
-    "MnB4O2FsaWduLWl0ZW1zOmZsZXgtc3RhcnQ7YmFja2dyb3VuZDp2YXIoLS1pbmsyKTtib3JkZXI6MXB4IHNvbGlkIHJnYmEoMjAx"
-    "LDE2OCw3NiwuMTgpO2JvcmRlci1yYWRpdXM6NnB4O3BhZGRpbmc6MTFweCAxNHB4O2ZvbnQtc2l6ZToxNHB4O29wYWNpdHk6MDt0"
-    "cmFuc2Zvcm06dHJhbnNsYXRlWSg2cHgpO3RyYW5zaXRpb246YWxsIC4zNXN9Ci5yb3cuc2hvd3tvcGFjaXR5OjE7dHJhbnNmb3Jt"
-    "Om5vbmV9Ci5yb3cgLmlje2ZvbnQtZmFtaWx5OnZhcigtLW1vbm8pO2ZvbnQtc2l6ZToxMnB4O21pbi13aWR0aDo2NnB4O3RleHQt"
-    "YWxpZ246Y2VudGVyO3BhZGRpbmc6MnB4IDZweDtib3JkZXItcmFkaXVzOjNweH0KLmljLnBhc3N7YmFja2dyb3VuZDojMTczOTJh"
-    "O2NvbG9yOiM3ZmUzYjB9LmljLnN0b3B7YmFja2dyb3VuZDojM2QxYTE3O2NvbG9yOiNmZjhhODB9LmljLmluZm97YmFja2dyb3Vu"
-    "ZDojMmEyYTFhO2NvbG9yOnZhcigtLWdvbGQpfQoucm93IC53aHl7ZGlzcGxheTpibG9jaztmb250LWZhbWlseTp2YXIoLS1tb25v"
-    "KTtmb250LXNpemU6MTEuNXB4O2NvbG9yOnJnYmEoMjU1LDI1NSwyNTUsLjUpO21hcmdpbi10b3A6M3B4O3dvcmQtYnJlYWs6YnJl"
-    "YWstd29yZH0KI3ZlcmRpY3R7Zm9udC1mYW1pbHk6dmFyKC0tbW9ubyk7Zm9udC1zaXplOjE0cHg7Y29sb3I6dmFyKC0tZ29sZCk7"
-    "bWFyZ2luLXRvcDoxNnB4O21pbi1oZWlnaHQ6MjBweH0KLnJ1bntiYWNrZ3JvdW5kOnZhcigtLWdvbGQpO2NvbG9yOnZhcigtLWlu"
-    "ayl9Ci5ncmlkMntkaXNwbGF5OmdyaWQ7Z2FwOjE0cHg7Z3JpZC10ZW1wbGF0ZS1jb2x1bW5zOjFmcn0KQG1lZGlhKG1pbi13aWR0"
-    "aDo3MDBweCl7LmdyaWQye2dyaWQtdGVtcGxhdGUtY29sdW1uczoxZnIgMWZyfX0KLmNhcmR7YmFja2dyb3VuZDojZmZmO2JvcmRl"
-    "cjoxcHggc29saWQgdmFyKC0tbGluZSk7Ym9yZGVyLXJhZGl1czo3cHg7cGFkZGluZzoyMHB4IDIycHh9Ci5jYXJkIC50YWd7Zm9u"
-    "dC1mYW1pbHk6dmFyKC0tbW9ubyk7Zm9udC1zaXplOjExcHg7Y29sb3I6dmFyKC0tZmFpbnQpO2xldHRlci1zcGFjaW5nOi4wNWVt"
-    "fQouY2FyZCBoM3tmb250LWZhbWlseTp2YXIoLS1zZXJpZik7Zm9udC13ZWlnaHQ6NTAwO2ZvbnQtc2l6ZToyMHB4O21hcmdpbjo0"
-    "cHggMCA2cHh9Ci5jYXJkIHB7Zm9udC1zaXplOjE0LjVweDtjb2xvcjp2YXIoLS1tdXRlZCk7bWFyZ2luLWJvdHRvbToxMHB4fQou"
-    "Y2FyZCBhe2ZvbnQtZmFtaWx5OnZhcigtLW1vbm8pO2ZvbnQtc2l6ZToxMi41cHg7Y29sb3I6dmFyKC0taW5rKTt3b3JkLWJyZWFr"
-    "OmJyZWFrLWFsbH0KcHJle2JhY2tncm91bmQ6dmFyKC0taW5rKTtjb2xvcjojZThlNmRmO2ZvbnQtZmFtaWx5OnZhcigtLW1vbm8p"
-    "O2ZvbnQtc2l6ZToxMnB4O2JvcmRlci1yYWRpdXM6NnB4O3BhZGRpbmc6MTRweDtvdmVyZmxvdy14OmF1dG87bWFyZ2luLXRvcDo4"
-    "cHh9Ci5jbG9zZXtiYWNrZ3JvdW5kOnZhcigtLWluayk7Y29sb3I6I2ZmZjtib3JkZXItcmFkaXVzOjEwcHg7cGFkZGluZzozMnB4"
-    "IDI0cHg7bWFyZ2luOjM2cHggMCA1MHB4fQouY2xvc2UgaDJ7Y29sb3I6I2ZmZn0uY2xvc2UgcHtjb2xvcjpyZ2JhKDI1NSwyNTUs"
-    "MjU1LC43NSk7bWF4LXdpZHRoOjU2Y2h9CmZvb3Rlcntib3JkZXItdG9wOjFweCBzb2xpZCB2YXIoLS1saW5lKTtwYWRkaW5nOjIy"
-    "cHggMCA0NnB4O2ZvbnQtZmFtaWx5OnZhcigtLW1vbm8pO2ZvbnQtc2l6ZToxMS41cHg7Y29sb3I6dmFyKC0tZmFpbnQpfQpAbWVk"
-    "aWEocHJlZmVycy1yZWR1Y2VkLW1vdGlvbjpyZWR1Y2Upeyp7dHJhbnNpdGlvbjpub25lIWltcG9ydGFudH19Cjwvc3R5bGU+Cjwv"
-    "aGVhZD4KPGJvZHk+CjxoZWFkZXIgY2xhc3M9InRvcCI+PGRpdiBjbGFzcz0id3JhcCI+PGRpdiBjbGFzcz0iYnJhbmQiPnNlYmJp"
-    "PGI+LnBybzwvYj48L2Rpdj4KPG5hdj48YSBocmVmPSIvIj5Ib21lPC9hPjxhIGhyZWY9Ii9tYXAiPk1hcDwvYT48YSBocmVmPSIv"
-    "d2hpdGVwYXBlciI+V2hpdGVwYXBlcjwvYT48L25hdj48L2Rpdj48L2hlYWRlcj4KCjxkaXYgY2xhc3M9IndyYXAiPgo8ZGl2IGNs"
-    "YXNzPSJoZXJvIj4KICA8ZGl2IGNsYXNzPSJraWNrIj5BR0VOVCBQQVNTUE9SVDwvZGl2PgogIDxoMT5FdmVyeSBBSSBhZ2VudCBu"
-    "b3cgbmVlZHMgYSBwYXNzcG9ydC48L2gxPgogIDxwPkFJIGFnZW50cyBwYXksIGJvb2ssIHNlbmQgYW5kIGNoYW5nZSByZWNvcmRz"
-    "IG9uIHRoZWlyIG93bi4gVGhlIEFnZW50IFBhc3Nwb3J0IGxldHMgYW55IHNpdGUga25vdywgaW4gbWlsbGlzZWNvbmRzLCB0aGF0"
-    "IGEgcmVhbCBwZXJzb24gYXV0aG9yaXNlZCB0aGUgYWN0aW9uLCB0aGF0IHRoZSBhdXRob3JpdHkgc3RpbGwgc3RhbmRzIHJpZ2h0"
-    "IG5vdywgYW5kIHRoYXQgaXQgY2FuIGhhcHBlbiBleGFjdGx5IG9uY2UuPC9wPgogIDxidXR0b24gY2xhc3M9ImN0YSBnb2xkIiBv"
-    "bmNsaWNrPSJydW5EZW1vKCkiPlJ1biBpdCBsaXZlPC9idXR0b24+CiAgPGEgY2xhc3M9ImN0YSBnaG9zdCIgaHJlZj0iI3NpdGVz"
-    "Ij5SZXF1aXJlIGl0IG9uIHlvdXIgc2l0ZTwvYT4KICA8ZGl2IGNsYXNzPSJzdGF0cyI+PGRpdj48YiBpZD0icy1pc3N1ZWQiPuKA"
-    "lDwvYj5wYXNzcG9ydHMgaXNzdWVkPC9kaXY+PGRpdj48YiBpZD0icy1yZWQiPuKAlDwvYj5yZWRlZW1lZDwvZGl2PjxkaXY+PGIg"
-    "aWQ9InMtcmVmIj7igJQ8L2I+cmVmdXNlZCBhbmQgc2VhbGVkPC9kaXY+PC9kaXY+CjwvZGl2PgoKPHNlY3Rpb24+CiAgPGgyPlRo"
-    "cmVlIHN0ZXBzLiBObyB0cnVzdCByZXF1aXJlZC48L2gyPgogIDxkaXYgY2xhc3M9InN0ZXBzIj4KICAgIDxkaXYgY2xhc3M9InN0"
-    "ZXAiPjxkaXYgY2xhc3M9Im4iPjAxIMK3IFRIRSBBR0VOVCBBU0tTPC9kaXY+PGgzPkF1dGhvcml0eSB0cmFjZWQgYmFjayB0byBh"
-    "IGh1bWFuPC9oMz48cD5CZWZvcmUgYWN0aW5nLCB0aGUgYWdlbnQgYXNrcyBzZWJiaS5wcm8uIFRoZSBhdXRob3JpdHkgaXMgd2Fs"
-    "a2VkIGJhY2sgdG8gdGhlIHBlcnNvbiB3aG8gZ3JhbnRlZCBpdCwgZXZlcnkgbGluayBjaGVja2VkLCBhbmQgYSBzaWduZWQgcGFz"
-    "c3BvcnQgaXNzdWVkIGZvciBvbmUgYWN0aW9uLCBhdCBvbmUgc2l0ZSwgZm9yIG9uZSBhbW91bnQsIGZvciBtaW51dGVzLjwvcD48"
-    "L2Rpdj4KICAgIDxkaXYgY2xhc3M9InN0ZXAiPjxkaXYgY2xhc3M9Im4iPjAyIMK3IFRIRSBTSVRFIENIRUNLUzwvZGl2PjxoMz5W"
-    "ZXJpZmllZCBpbiBtaWxsaXNlY29uZHMsIG9mZmxpbmU8L2gzPjxwPlRoZSBzaXRlIGNoZWNrcyB0aGUgc2lnbmF0dXJlIHdpdGgg"
-    "YSBzdGFuZGFyZCBsaWJyYXJ5IGluIGFueSBsYW5ndWFnZS4gTm90aGluZyB0byBpbnN0YWxsLCBubyBhY2NvdW50LCBubyBjYWxs"
-    "IGhvbWUuPC9wPjwvZGl2PgogICAgPGRpdiBjbGFzcz0ic3RlcCI+PGRpdiBjbGFzcz0ibiI+MDMgwrcgVEhFIEFDVElPTiBCSU5E"
-    "UzwvZGl2PjxoMz5SZS1jaGVja2VkIGF0IHRoZSBtb21lbnQgaXQgaGFwcGVuczwvaDM+PHA+VGhlIHNpdGUgcmVkZWVtcyB0aGUg"
-    "cGFzc3BvcnQuIFJpZ2h0IHRoZW4sIHNlYmJpLnBybyBjb25maXJtcyB0aGUgaHVtYW4ncyBhdXRob3JpdHkgc3RpbGwgc3RhbmRz"
-    "LCB0aGUgYW1vdW50IG1hdGNoZXMsIGFuZCBpdCBoYXMgbmV2ZXIgYmVlbiB1c2VkLiBUaGVuIGl0IGJpbmRzLCBvbmNlLCBhbmQg"
-    "dGhlIG91dGNvbWUgaXMgc2VhbGVkLjwvcD48L2Rpdj4KICA8L2Rpdj4KPC9zZWN0aW9uPgoKPHNlY3Rpb24gc3R5bGU9ImJvcmRl"
-    "ci10b3A6MCI+CjxkaXYgY2xhc3M9ImRhcmsiPgogIDxoMj5XYXRjaCBpdCBydW4gb24gcHJvZHVjdGlvbi48L2gyPgogIDxwIGNs"
-    "YXNzPSJsZWFkIj5PbmUgdGFwIHJ1bnMgdGhlIHdob2xlIHN0b3J5IGxpdmU6IGEgcmVhbCBncmFudCwgcmVhbCBwYXNzcG9ydHMs"
-    "IHJlYWwgcmVkZW1wdGlvbnMgYW5kIHJlYWwgcmVmdXNhbHMsIGVhY2ggc2VhbGVkIGludG8gdGhlIHB1YmxpYyBjaGFpbi48L3A+"
-    "CiAgPGJ1dHRvbiBjbGFzcz0iY3RhIHJ1biIgaWQ9InJ1bmJ0biIgb25jbGljaz0icnVuRGVtbygpIj5SdW4gdGhlIGxpdmUgZGVt"
-    "bzwvYnV0dG9uPgogIDxkaXYgaWQ9InN0b3J5Ij48L2Rpdj4KICA8ZGl2IGlkPSJ2ZXJkaWN0Ij48L2Rpdj4KPC9kaXY+Cjwvc2Vj"
-    "dGlvbj4KCjxzZWN0aW9uPgogIDxoMj5XaGF0IGEgcGFzc3BvcnQgcmVmdXNlczwvaDI+CiAgPHAgY2xhc3M9ImxlYWQiPkEgc3Rv"
-    "bGVuLCByZXBsYXllZCwgcmUtYWltZWQgb3IgZWRpdGVkIHBhc3Nwb3J0IGlzIHdvcnRobGVzcy4gRXZlcnkgcmVmdXNhbCBpcyB3"
-    "cml0dGVuIHRvIHRoZSBjaGFpbiwgc28gYW4gYWdlbnQgY2FuIGV2ZW4gcHJvdmUgaXQgd2FzIDxiPm5vdDwvYj4gYWxsb3dlZC48"
-    "L3A+CiAgPGRpdiBjbGFzcz0ic3RlcHMiPgogICAgPGRpdiBjbGFzcz0ic3RlcCI+PGRpdiBjbGFzcz0ibiI+UkVQTEFZPC9kaXY+"
-    "PHA+U3BlbnQgb25jZS4gVGhlIHNlY29uZCBhdHRlbXB0IGlzIHJlZnVzZWQuPC9wPjwvZGl2PgogICAgPGRpdiBjbGFzcz0ic3Rl"
-    "cCI+PGRpdiBjbGFzcz0ibiI+UkVWT0tFRCBBIFNFQ09ORCBBR088L2Rpdj48cD5TdGlsbCBzaWduZWQsIHN0aWxsIGluIGRhdGUs"
-    "IGFuZCBzdGlsbCByZWZ1c2VkLCBiZWNhdXNlIHRoZSBodW1hbiBwdWxsZWQgdGhlIGF1dGhvcml0eS48L3A+PC9kaXY+CiAgICA8"
-    "ZGl2IGNsYXNzPSJzdGVwIj48ZGl2IGNsYXNzPSJuIj5XUk9ORyBTSVRFPC9kaXY+PHA+QSBwYXNzcG9ydCBpcyBvbmx5IGdvb2Qg"
-    "d2hlcmUgaXQgd2FzIGlzc3VlZCBmb3IuPC9wPjwvZGl2PgogICAgPGRpdiBjbGFzcz0ic3RlcCI+PGRpdiBjbGFzcz0ibiI+RURJ"
-    "VEVEIEFNT1VOVDwvZGl2PjxwPkF1dGhvcmlzZWQgZm9yIDIwLCBwcmVzZW50ZWQgZm9yIDQ5LiBSZWZ1c2VkLjwvcD48L2Rpdj4K"
-    "ICA8L2Rpdj4KPC9zZWN0aW9uPgoKPHNlY3Rpb24gaWQ9InNpdGVzIj4KICA8aDI+QnVpbHQgZm9yIGJvdGggc2lkZXMgb2YgdGhl"
-    "IGFjdGlvbjwvaDI+CiAgPGRpdiBjbGFzcz0iZ3JpZDIiPgogICAgPGRpdiBjbGFzcz0iY2FyZCI+PGRpdiBjbGFzcz0idGFnIj5G"
-    "T1IgV0VCU0lURVMgJmFtcDsgQVBJUzwvZGl2PjxoMz5SZXF1aXJlIGl0IHdpdGggb25lIGZpbGU8L2gzPjxwPkhvc3Qgb25lIHNt"
-    "YWxsIGZpbGUgYW5kIGV2ZXJ5IGFnZW50IGtub3dzIHdoaWNoIGFjdGlvbnMgbmVlZCBhIHBhc3Nwb3J0LiBObyBwYXNzcG9ydCwg"
-    "bm8gYWN0aW9uLjwvcD4KICAgICAgPGEgaHJlZj0iaHR0cHM6Ly9zZWJiaS5wcm8veC9wYXNzcG9ydC9zaXRlZmlsZT9kb21haW49"
-    "eW91ci5zaXRlJnJlcXVpcmU9cGF5bWVudHMuKiI+R2VuZXJhdGUgeW91ciBmaWxlPC9hPjwvZGl2PgogICAgPGRpdiBjbGFzcz0i"
-    "Y2FyZCI+PGRpdiBjbGFzcz0idGFnIj5GT1IgQUkgQUdFTlRTPC9kaXY+PGgzPkEgdG9vbCwgdGhyb3VnaCBNQ1A8L2gzPjxwPkFn"
-    "ZW50cyByZXF1ZXN0LCBjaGVjayBhbmQgcmVkZWVtIHBhc3Nwb3J0cyBhcyB0b29scy4gV29ya3Mgd2l0aCBldmVyeSBtb2RlbCBm"
-    "cm9tIGV2ZXJ5IHZlbmRvci48L3A+CiAgICAgIDxhIGhyZWY9Imh0dHBzOi8vc2ViYmkucHJvL3gvcGFzc3BvcnQvbWNwIj5odHRw"
-    "czovL3NlYmJpLnByby94L3Bhc3Nwb3J0L21jcDwvYT48L2Rpdj4KICAgIDxkaXYgY2xhc3M9ImNhcmQiPjxkaXYgY2xhc3M9InRh"
-    "ZyI+Rk9SIENPTVBMSUFOQ0U8L2Rpdj48aDM+UHJvb2YsIG5vdCBsb2dzPC9oMz48cD5XaG8gYXV0aG9yaXNlZCBpdCwgd2hvIGFj"
-    "dGVkLCB3aG8gYWNjZXB0cyB0aGUgcmlzaywgYW5kIHdoZXRoZXIgaXQgc3RpbGwgc3Rvb2QgYXQgdGhhdCBpbnN0YW50LiBTZWFs"
-    "ZWQsIGFuY2hvcmVkIHRvIEJpdGNvaW4sIHdpdG5lc3NlZCBpbmRlcGVuZGVudGx5LjwvcD4KICAgICAgPGEgaHJlZj0iaHR0cHM6"
-    "Ly9zZWJiaS5wcm8veC9jb250aW51aXR5L2RlY2lzaW9ucyI+U2VlIHJlYWwgc2VhbGVkIGRlY2lzaW9uczwvYT48L2Rpdj4KICAg"
-    "IDxkaXYgY2xhc3M9ImNhcmQiPjxkaXYgY2xhc3M9InRhZyI+Rk9SIERFVkVMT1BFUlM8L2Rpdj48aDM+QW4gb3BlbiB0b2tlbiBm"
-    "b3JtYXQ8L2gzPjxwPkVkMjU1MTksIGNhbm9uaWNhbCBKU09OLCBvbmUgcHJlZml4LiBWZXJpZnkgaXQgeW91cnNlbGYgYW5kIGRp"
-    "c2FncmVlIHdpdGggdXMuPC9wPgogICAgICA8YSBocmVmPSJodHRwczovL3NlYmJpLnByby94L3Bhc3Nwb3J0L3NwZWMiPlJlYWQg"
-    "dGhlIHNwZWM8L2E+PC9kaXY+CiAgPC9kaXY+CjxwcmU+QWdlbnQtUGFzc3BvcnQ6IHNicDEuZXlKaFkzUWlPaUprWlcxdkxuQmhl"
-    "U0lzSW1GMVpDSTZJbk5vYjNBdeKApjwvcHJlPgo8L3NlY3Rpb24+Cgo8ZGl2IGNsYXNzPSJjbG9zZSI+CiAgPGgyPklmIHlvdXIg"
-    "YWdlbnRzIHRvdWNoIG1vbmV5LCByZWNvcmRzIG9yIGN1c3RvbWVycywgdGhpcyBpcyBmb3IgeW91LjwvaDI+CiAgPHA+RnJlZSBm"
-    "b3IgOTAgZGF5cywgdGhlbiA1MHAgcGVyIGRldmljZSBwZXIgbW9udGguIFRlbGwgdXMgd2hhdCB5b3VyIGFnZW50cyBkbyBhbmQg"
-    "d2UnbGwgc2hvdyB5b3UgaG93IHRoZSBwYXNzcG9ydCBwbHVncyBpbnRvIHlvdXIgc3RhY2suPC9wPgogIDxhIGNsYXNzPSJjdGEg"
-    "Z29sZCIgaHJlZj0ibWFpbHRvOmp1c3RyaWdodGRlY29yYXRvcnNAZ21haWwuY29tP3N1YmplY3Q9QWdlbnQlMjBQYXNzcG9ydCI+"
-    "VGFsayB0byB1czwvYT4KICA8YSBjbGFzcz0iY3RhIGdob3N0IiBocmVmPSIvbWFwIiBzdHlsZT0iYmFja2dyb3VuZDp0cmFuc3Bh"
-    "cmVudDtjb2xvcjojZmZmO2JvcmRlci1jb2xvcjpyZ2JhKDI1NSwyNTUsMjU1LC4zKSI+U2VlIHdoZXJlIGl0IHNpdHM8L2E+Cjwv"
-    "ZGl2Pgo8L2Rpdj4KCjxmb290ZXI+PGRpdiBjbGFzcz0id3JhcCI+c2ViYmkucHJvIMK3IE1vbm9wIENvbnRlbnQgwrcgQmx5dGgs"
-    "IE5vcnRodW1iZXJsYW5kLCBVSzxicj5UaGUgdHJ1c3QgbGF5ZXIgYmV0d2VlbiBtYWNoaW5lcyB0aGF0IGFjdCBhbmQgdGhlIHdv"
-    "cmxkIHRoZXkgYWN0IG9uLjwvZGl2PjwvZm9vdGVyPgoKPHNjcmlwdD4KZnVuY3Rpb24gZXNjKHMpe3JldHVybiBTdHJpbmcocz09"
-    "bnVsbD8nJzpzKS5yZXBsYWNlKC9bJjw+Il0vZyxmdW5jdGlvbihjKXtyZXR1cm57JyYnOicmYW1wOycsJzwnOicmbHQ7JywnPic6"
-    "JyZndDsnLCciJzonJnF1b3Q7J31bY119KX0KZnVuY3Rpb24gc3RhdHMoKXtmZXRjaCgnL3gvcGFzc3BvcnQvc3RhdHVzJykudGhl"
-    "bihmdW5jdGlvbihyKXtyZXR1cm4gci5qc29uKCl9KS50aGVuKGZ1bmN0aW9uKGQpewogZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQo"
-    "J3MtaXNzdWVkJykudGV4dENvbnRlbnQ9ZC5wYXNzcG9ydHNfaXNzdWVkO2RvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdzLXJlZCcp"
-    "LnRleHRDb250ZW50PWQucmVkZWVtZWQ7ZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3MtcmVmJykudGV4dENvbnRlbnQ9ZC5yZWZ1"
-    "c2VkfSkuY2F0Y2goZnVuY3Rpb24oKXt9KX0Kc3RhdHMoKTsKZnVuY3Rpb24gcnVuRGVtbygpewogdmFyIGJveD1kb2N1bWVudC5n"
-    "ZXRFbGVtZW50QnlJZCgnc3RvcnknKSx2PWRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCd2ZXJkaWN0JyksYj1kb2N1bWVudC5nZXRF"
-    "bGVtZW50QnlJZCgncnVuYnRuJyk7CiBkb2N1bWVudC5xdWVyeVNlbGVjdG9yKCcuZGFyaycpLnNjcm9sbEludG9WaWV3KHtiZWhh"
-    "dmlvcjonc21vb3RoJ30pOwogYm94LmlubmVySFRNTD0nJzt2LnRleHRDb250ZW50PSdSdW5uaW5nIG9uIHByb2R1Y3Rpb27igKYn"
-    "O2IuZGlzYWJsZWQ9dHJ1ZTsKIGZldGNoKCcveC9wYXNzcG9ydC9kZW1vJykudGhlbihmdW5jdGlvbihyKXtyZXR1cm4gci5qc29u"
-    "KCl9KS50aGVuKGZ1bmN0aW9uKGQpewogIGlmKGQuZXJyb3I9PT0ndG9vX3Nvb24nKXt2LnRleHRDb250ZW50PSdTb21lb25lIGp1"
-    "c3QgcmFuIGl0LiBUcnkgYWdhaW4gaW4gJytkLnJldHJ5X2FmdGVyX3NlY29uZHMrJyBzZWNvbmRzLic7Yi5kaXNhYmxlZD1mYWxz"
-    "ZTtyZXR1cm59CiAgaWYoIWQuc3Rvcnkpe3YudGV4dENvbnRlbnQ9J0RlbW8gdW5hdmFpbGFibGUgcmlnaHQgbm93Lic7Yi5kaXNh"
-    "YmxlZD1mYWxzZTtyZXR1cm59CiAgZC5zdG9yeS5mb3JFYWNoKGZ1bmN0aW9uKHMsaSl7CiAgIHZhciBraW5kPSdpbmZvJyxsYWJl"
-    "bD0nU0VBTEVEJzsKICAgaWYocy5yZWRlZW1lZD09PXRydWV8fHMudmFsaWQ9PT10cnVlfHxzLmlzc3VlZD09PXRydWUpe2tpbmQ9"
-    "J3Bhc3MnO2xhYmVsPXMucmVkZWVtZWQ9PT10cnVlPydCT1VORCc6KHMudmFsaWQ9PT10cnVlPydWQUxJRCc6J0lTU1VFRCcpfQog"
-    "ICBpZihzLnJlZGVlbWVkPT09ZmFsc2V8fHMudmFsaWQ9PT1mYWxzZXx8cy5pc3N1ZWQ9PT1mYWxzZSl7a2luZD0nc3RvcCc7bGFi"
-    "ZWw9J1JFRlVTRUQnfQogICB2YXIgd2h5PXMud2h5JiZzLndoeS5sZW5ndGg/JzxzcGFuIGNsYXNzPSJ3aHkiPicrZXNjKHMud2h5"
-    "WzBdKSsnPC9zcGFuPic6Jyc7CiAgIHZhciBlbD1kb2N1bWVudC5jcmVhdGVFbGVtZW50KCdkaXYnKTtlbC5jbGFzc05hbWU9J3Jv"
-    "dyc7CiAgIGVsLmlubmVySFRNTD0nPHNwYW4gY2xhc3M9ImljICcra2luZCsnIj4nK2xhYmVsKyc8L3NwYW4+PGRpdj4nK2VzYyhz"
-    "LmFjdCkrd2h5Kyc8L2Rpdj4nOwogICBib3guYXBwZW5kQ2hpbGQoZWwpO3NldFRpbWVvdXQoZnVuY3Rpb24oKXtlbC5jbGFzc0xp"
-    "c3QuYWRkKCdzaG93Jyl9LDE2MCppKzYwKX0pOwogIHNldFRpbWVvdXQoZnVuY3Rpb24oKXt2LnRleHRDb250ZW50PWQucmVzdWx0"
-    "PT09J0FMTCBURU4gQkVIQVZFRCc/J+KckyBBbGwgdGVuIGJlaGF2ZWQuIEV2ZXJ5IHN0ZXAgaXMgb24gdGhlIGNoYWluLic6ZC5y"
-    "ZXN1bHQ7Yi5kaXNhYmxlZD1mYWxzZTtzdGF0cygpfSwxNjAqZC5zdG9yeS5sZW5ndGgrMzAwKTsKIH0pLmNhdGNoKGZ1bmN0aW9u"
-    "KCl7di50ZXh0Q29udGVudD0nQ291bGQgbm90IHJlYWNoIHRoZSBkZW1vLic7Yi5kaXNhYmxlZD1mYWxzZX0pOwp9Cjwvc2NyaXB0"
-    "Pgo8L2JvZHk+CjwvaHRtbD4K"
-)
-
-_HTML = base64.b64decode("".join(_B64.split())).decode("utf-8")
-_patched = False
-
-
-def _find_handler_class(ctx):
-    if isinstance(ctx, dict):
-        for k in ("handler_class", "handler", "Handler", "h", "request_handler"):
-            v = ctx.get(k)
-            if v is None:
-                continue
-            cls = v if isinstance(v, type) else type(v)
-            if hasattr(cls, "do_GET"):
-                return cls
-    f = sys._getframe()
-    while f is not None:
-        s = f.f_locals.get("self")
-        if s is not None and hasattr(type(s), "do_GET") and hasattr(s, "wfile"):
-            return type(s)
-        f = f.f_back
-    return None
-
-
-def _install_page(ctx):
-    global _patched
-    if _patched:
-        return True
-    cls = _find_handler_class(ctx)
-    if cls is None:
-        return False
-    if getattr(cls, "_passportpage_patched", False):
-        _patched = True
-        return True
-
-    original_do_GET = cls.do_GET
-
-    def do_GET(self):
-        path = self.path.split("?")[0].rstrip("/") or "/"
-        if path == PAGE_PATH:
-            body = _HTML.encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        return original_do_GET(self)
-
-    cls.do_GET = do_GET
-    cls._passportpage_patched = True
-    _patched = True
-    return True
-
-
-def handle(method, action, data, api_key, ctx):
-    armed = _install_page(ctx)
-    if action == "spec":
-        return ({
-            "module": "passportpage",
-            "version": VERSION,
-            "serves": PAGE_PATH,
-            "public": [["GET", "status"], ["GET", "spec"]],
-            "note": "Hit /x/passportpage/status once after each deploy to arm " + PAGE_PATH + ".",
-        }, 200)
-    return ({
-        "module": "passportpage",
-        "version": VERSION,
-        "serves": PAGE_PATH,
-        "armed": armed,
-        "page_bytes": len(_HTML),
-    }, 200)
-
-
-PUBLIC = {("GET", "status"), ("GET", "spec")}
-
-```
+- `modules/praxis.py`
 
 
 ## `modules/peer.py`
@@ -1959,5 +1697,710 @@ def handle(method, action, data, api_key, ctx):
         }, 200
 
     return {"error": "unknown_action", "action": action, "GET": ["status"]}, 404
+
+```
+
+
+## `modules/praxis.py`
+
+697 lines, 24699 bytes
+
+```python
+"""
+modules/praxis.py  v1.0.2
+
+Outbound submitter for the PRAXIS external-witness observe endpoint (chain 4).
+
+Contract implemented against the SERVED schema route, not prose:
+    GET  https://chain4.thepraesidium.ai/api/external-witness/observe/schema
+    POST https://chain4.thepraesidium.ai/api/external-witness/observe
+
+Signing:
+    preimage  = b"PRAXIS-OBSERVE-v1\\n" + canonical JSON of the envelope
+                with the "signature" field REMOVED
+    canonical = json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                           ensure_ascii=True).encode("utf-8")
+    signature = lowercase hex HMAC-SHA256, carried in the body
+
+Secret:
+    environment variable PRAXIS_OBSERVE_SECRET
+    (never written to a file, never returned by any route)
+
+Routes
+    GET  /x/praxis/spec      public   what this module does and how it signs
+    GET  /x/praxis/status    public   config check + arms the /praxis page
+    GET  /x/praxis/schema    public   fetches THEIR live contract, reports version
+    GET  /x/praxis/history   keyed    past attempts from our own chain
+    POST /x/praxis/canonical keyed    dry run: envelope, preimage, signature, NO send
+    POST /x/praxis/submit    keyed    signs and sends ONE bounded submission
+
+v1.0.1 fixes a real fault found on 7 Sep 2026. _seal called the host seal()
+with one argument when it requires three, so every submit reported
+sealed:false while the response still said ok:true. A remote call was being
+recorded by the peer with no matching entry in our own chain. A failed seal
+now makes the whole response ok:false and says so at the top level.
+
+v1.0.2 fixes the follow-on. The host seal() returns a tuple
+(audit_hash, block_index, key_seq); v1.0.1 only read dicts and strings and
+so reported a successful seal as "seal returned no hash".
+"""
+
+import os
+import json
+import time
+import hmac
+import hashlib
+import secrets
+import sys
+import urllib.request
+import urllib.error
+from datetime import datetime, timezone
+
+VERSION = "1.0.2"
+
+# ---------------------------------------------------------------- constants
+
+BASE = "https://chain4.thepraesidium.ai"
+OBSERVE_URL = BASE + "/api/external-witness/observe"
+SCHEMA_URL = BASE + "/api/external-witness/observe/schema"
+
+DOMAIN = b"PRAXIS-OBSERVE-v1\n"
+ENVELOPE_SCHEMA = "praxis_external_observe_request_v1"
+
+OUR_PEER_ID = "aileash"
+OUR_TIP_URL = "https://sebbi.pro/x/witness/tip"
+
+SECRET_ENV = "PRAXIS_OBSERVE_SECRET"
+
+TIMEOUT = 20
+MAX_RESPONSE_BYTES = 262144
+
+PUBLIC = {
+    ("GET", "spec"),
+    ("GET", "status"),
+    ("GET", "schema"),
+}
+
+
+# ---------------------------------------------------------------- helpers
+
+def _now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _canonical(obj):
+    return json.dumps(
+        obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+
+
+def _sha256_hex(b):
+    return hashlib.sha256(b).hexdigest()
+
+
+def _secret():
+    s = os.environ.get(SECRET_ENV, "")
+    return s.strip()
+
+
+def _fresh_nonce():
+    # matches ^[A-Za-z0-9_.:-]{12,128}$
+    return secrets.token_hex(20)
+
+
+def _fresh_idem():
+    # matches ^[0-9a-f]{64}(\.attempt-N)?$
+    return secrets.token_hex(32)
+
+
+def _http(method, url, body=None):
+    req = urllib.request.Request(url, data=body, method=method)
+    req.add_header("Accept", "application/json")
+    req.add_header("User-Agent", "AILeash-praxis/" + VERSION)
+    if body is not None:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+            raw = r.read(MAX_RESPONSE_BYTES)
+            return r.status, dict(r.headers), raw, None
+    except urllib.error.HTTPError as e:
+        raw = b""
+        try:
+            raw = e.read(MAX_RESPONSE_BYTES)
+        except Exception:
+            pass
+        return e.code, dict(getattr(e, "headers", {}) or {}), raw, None
+    except Exception as e:
+        return 0, {}, b"", "%s: %s" % (type(e).__name__, e)
+
+
+def _parse_json(raw):
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+
+
+def _build_envelope(tip_digest, witnessed_peer_id, source_url,
+                    receipt_digest=None, attempt=None, observed_at=None):
+    payload = {
+        "witnessed_peer_id": witnessed_peer_id,
+        "data_class": "HASH_ONLY",
+        "tip_digest": tip_digest,
+        "source_url": source_url,
+        "observed_at": observed_at or _now_iso(),
+    }
+    # receipt_digest is OPTIONAL in contract v1_1 and is omitted for a pure
+    # chain-tip observation. Never duplicate tip_digest into it.
+    if receipt_digest:
+        payload["receipt_digest"] = receipt_digest
+
+    key = _fresh_idem()
+    if attempt:
+        key = "%s.attempt-%s" % (key, attempt)
+
+    return {
+        "schema_version": ENVELOPE_SCHEMA,
+        "peer_id": OUR_PEER_ID,
+        "ts": _now_iso(),
+        "nonce": _fresh_nonce(),
+        "idempotency_key": key,
+        "payload": payload,
+    }
+
+
+def _sign(envelope, secret):
+    unsigned = {k: v for k, v in envelope.items() if k != "signature"}
+    canonical = _canonical(unsigned)
+    preimage = DOMAIN + canonical
+    sig = hmac.new(secret.encode("utf-8"), preimage, hashlib.sha256).hexdigest()
+    return canonical, preimage, sig
+
+
+def _validate(tip_digest, witnessed_peer_id, source_url, receipt_digest):
+    import re
+    if not re.fullmatch(r"[0-9a-f]{64}", tip_digest or ""):
+        return "tip_digest must be 64 lowercase hex characters"
+    if not re.fullmatch(r"[a-z][a-z0-9_.:-]{2,63}", witnessed_peer_id or ""):
+        return "witnessed_peer_id must match ^[a-z][a-z0-9_.:-]{2,63}$"
+    if not (source_url or "").startswith("https://") or (source_url or "").count("/") < 3:
+        return "source_url must be an https URL with a path"
+    if len(source_url) > 512:
+        return "source_url exceeds 512 characters"
+    if receipt_digest and not re.fullmatch(r"[0-9a-f]{64}", receipt_digest):
+        return "receipt_digest, if supplied, must be 64 lowercase hex characters"
+    if receipt_digest and receipt_digest == tip_digest:
+        return "receipt_digest must not duplicate tip_digest"
+    return None
+
+
+def _record_seal_result(out, res):
+    """Read whatever the host seal() handed back.
+
+    This deployment's seal() returns a TUPLE: (audit_hash, block_index,
+    key_seq). v1.0.1 only understood dicts and strings, so a successful seal
+    was reported as "seal returned no hash". Tuples are handled first.
+    """
+    if isinstance(res, (tuple, list)):
+        if len(res) > 0:
+            out["audit_hash"] = res[0]
+        if len(res) > 1:
+            out["block_index"] = res[1]
+        if len(res) > 2:
+            out["key_seq"] = res[2]
+    elif isinstance(res, dict):
+        out["audit_hash"] = (res.get("audit_hash") or res.get("hash")
+                             or res.get("seal") or res.get("block_hash"))
+        out["block_index"] = res.get("block_index") or res.get("index")
+        out["key_seq"] = res.get("key_seq") or res.get("seq")
+    elif isinstance(res, str):
+        out["audit_hash"] = res
+    out["sealed"] = bool(out["audit_hash"])
+    return out
+
+
+def _seal(ctx, event):
+    """Seal into our own chain.
+
+    The host seal() takes three positional arguments (event, result, ts).
+    v1.0.0 called it with one and every submit failed silently. We try the
+    three-argument form first and fall back only if the host is older, and
+    we record which call shape worked so this is never guesswork again.
+    """
+    out = {"sealed": False, "audit_hash": None, "error": None,
+           "call_shape": None}
+    sealer = ctx.get("seal")
+    if not sealer:
+        out["error"] = "no seal function in ctx"
+        return out
+
+    result_value = event.get("result") or "sent"
+    ts_value = event.get("ts") or _now_iso()
+
+    attempts = [
+        ("seal(event, result, ts)", lambda: sealer(event, result_value, ts_value)),
+        ("seal(event, result)", lambda: sealer(event, result_value)),
+        ("seal(event)", lambda: sealer(event)),
+    ]
+
+    errors = []
+    for shape, call in attempts:
+        try:
+            res = call()
+        except TypeError as e:
+            errors.append("%s -> TypeError: %s" % (shape, e))
+            continue
+        except Exception as e:
+            out["error"] = "%s -> %s: %s" % (shape, type(e).__name__, e)
+            out["call_shape"] = shape
+            return out
+        out["call_shape"] = shape
+        _record_seal_result(out, res)
+        if not out["sealed"]:
+            out["error"] = "seal returned no hash"
+        return out
+
+    out["error"] = "no accepted call shape; " + " | ".join(errors)
+    return out
+
+
+# ---------------------------------------------------------------- page
+
+PAGE = """<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex">
+<title>PRAXIS submit</title>
+<style>
+:root{--ink:#0a0f1e;--ink2:#10182e;--gold:#c9a84c;--ok:#7fe3b0;--err:#ff8a80}
+*{box-sizing:border-box}
+body{margin:0;padding:16px;background:var(--ink);color:#e8ecf5;
+     font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+h1{font-size:18px;margin:0 0 4px;color:var(--gold)}
+p.sub{margin:0 0 18px;color:#8b96ad;font-size:13px}
+label{display:block;margin:12px 0 4px;font-size:12px;color:#8b96ad;
+      text-transform:uppercase;letter-spacing:.06em}
+input{width:100%;padding:11px;background:var(--ink2);border:1px solid #24304e;
+      border-radius:8px;color:#e8ecf5;font:14px monospace}
+input:focus{outline:none;border-color:var(--gold)}
+.row{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px}
+button{flex:1;min-width:120px;padding:13px;border:0;border-radius:8px;
+       background:var(--gold);color:#0a0f1e;font-weight:600;font-size:15px}
+button.alt{background:var(--ink2);color:#e8ecf5;border:1px solid #24304e}
+button:disabled{opacity:.45}
+pre{margin-top:16px;padding:12px;background:var(--ink2);border:1px solid #24304e;
+    border-radius:8px;white-space:pre-wrap;word-break:break-all;
+    font:12px/1.45 monospace;max-height:60vh;overflow:auto}
+.ok{color:var(--ok)}.err{color:var(--err)}
+</style></head><body>
+
+<h1>PRAXIS observe &mdash; chain 4</h1>
+<p class="sub">Signs one bounded submission and sends it. Fresh ts, nonce and
+idempotency key every press.</p>
+
+<label>API key</label>
+<input id="key" type="password" placeholder="AILeash API key" autocomplete="off">
+
+<label>Tip digest (64 hex)</label>
+<input id="tip" placeholder="press Load tip">
+
+<label>Witnessed peer id</label>
+<input id="wpid" value="aileash">
+
+<label>Source URL</label>
+<input id="src" value="https://sebbi.pro/x/witness/tip">
+
+<label>Attempt marker (optional)</label>
+<input id="att" placeholder="leave blank for a first attempt">
+
+<div class="row">
+  <button class="alt" onclick="loadTip()">Load tip</button>
+  <button class="alt" onclick="theirSchema()">Their schema</button>
+</div>
+<div class="row">
+  <button class="alt" onclick="go('canonical')">Dry run</button>
+  <button onclick="send()">Send</button>
+</div>
+
+<pre id="out">Ready.</pre>
+
+<script>
+var out = document.getElementById('out');
+function show(t, cls){ out.className = cls || ''; out.textContent = t; }
+function val(id){ return document.getElementById(id).value.trim(); }
+
+function loadTip(){
+  show('Loading our tip...');
+  fetch('/x/witness/tip').then(function(r){ return r.json(); }).then(function(j){
+    var t = j.tip || j.hash || j.head || j.chain_tip || j.latest || '';
+    document.getElementById('tip').value = t;
+    show('Tip loaded.\\n\\n' + JSON.stringify(j, null, 2), 'ok');
+  }).catch(function(e){ show('Failed: ' + e, 'err'); });
+}
+
+function theirSchema(){
+  show('Fetching their live contract...');
+  fetch('/x/praxis/schema').then(function(r){ return r.json(); }).then(function(j){
+    show(JSON.stringify(j, null, 2), j.receipt_digest_required ? 'err' : 'ok');
+  }).catch(function(e){ show('Failed: ' + e, 'err'); });
+}
+
+function body(){
+  return {
+    tip_digest: val('tip'),
+    witnessed_peer_id: val('wpid'),
+    source_url: val('src'),
+    attempt: val('att') || null
+  };
+}
+
+function go(action){
+  var k = val('key');
+  if(!k){ show('API key required.', 'err'); return; }
+  show('Working...');
+  fetch('/x/praxis/' + action, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + k },
+    body: JSON.stringify(body())
+  }).then(function(r){ return r.json(); }).then(function(j){
+    show(JSON.stringify(j, null, 2), j.ok === false ? 'err' : 'ok');
+  }).catch(function(e){ show('Failed: ' + e, 'err'); });
+}
+
+function send(){
+  if(!confirm('Send one bounded submission to chain 4 now?')) return;
+  go('submit');
+}
+</script>
+</body></html>"""
+
+
+def _install_page():
+    """Serve /praxis by wrapping the running handler's do_GET, once."""
+    for mod in list(sys.modules.values()):
+        if mod is None:
+            continue
+        try:
+            names = dir(mod)
+        except Exception:
+            continue
+        for name in names:
+            try:
+                obj = getattr(mod, name, None)
+            except Exception:
+                continue
+            if not isinstance(obj, type):
+                continue
+            if not (hasattr(obj, "do_GET") and hasattr(obj, "do_POST")):
+                continue
+            if getattr(obj, "_praxis_patched", False):
+                return True
+            original = obj.do_GET
+
+            def patched(self, _original=original):
+                try:
+                    path = self.path.split("?")[0].rstrip("/")
+                except Exception:
+                    path = ""
+                if path == "/praxis":
+                    data = PAGE.encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("X-Robots-Tag", "noindex")
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+                return _original(self)
+
+            obj.do_GET = patched
+            obj._praxis_patched = True
+            return True
+    return False
+
+
+# ---------------------------------------------------------------- actions
+
+def _spec():
+    return {
+        "module": "praxis",
+        "version": VERSION,
+        "what_this_is": (
+            "Outbound submitter for the PRAXIS external-witness observe "
+            "endpoint. One bounded submission per press. This module sends; "
+            "it does not receive."
+        ),
+        "target": {"observe": OBSERVE_URL, "schema": SCHEMA_URL},
+        "signing": {
+            "algorithm": "hmac-sha256",
+            "domain": "PRAXIS-OBSERVE-v1\\n",
+            "canonicalization": "sort_keys=true, separators=(',',':'), ensure_ascii=true, utf-8",
+            "preimage": "domain bytes + canonical JSON of the envelope with 'signature' removed",
+            "signature_encoding": "lowercase hex",
+            "auth_transport": "body, not headers",
+        },
+        "payload_policy": (
+            "receipt_digest is optional under their contract v1_1 and is "
+            "omitted for a pure chain-tip observation. It is never filled "
+            "with a duplicate of tip_digest or a placeholder."
+        ),
+        "freshness": "fresh ts, fresh nonce and a fresh idempotency key on every submit",
+        "seal_policy": (
+            "a submit that reaches the peer but fails to seal into our own "
+            "chain returns ok:false with seal_failed true. The send is still "
+            "reported in full, because it happened and the peer may hold a "
+            "durable record of it."
+        ),
+        "not_claimed": [
+            "this lane is one-directional and does not establish mutual witnessing",
+            "their acceptance is a transport and signature outcome, not verification "
+            "of anything in our chain",
+        ],
+        "routes": {
+            "public": ["GET spec", "GET status", "GET schema"],
+            "keyed": ["GET history", "POST canonical", "POST submit"],
+        },
+    }
+
+
+def _status():
+    installed = _install_page()
+    s = _secret()
+    return {
+        "module": "praxis",
+        "version": VERSION,
+        "page": "/praxis",
+        "page_installed": installed,
+        "peer_id": OUR_PEER_ID,
+        "secret_configured": bool(s),
+        "secret_env": SECRET_ENV,
+        "secret_length": len(s) if s else 0,
+        "target": OBSERVE_URL,
+        "note": (
+            "secret_configured false means the environment variable is not set "
+            "on this replica; the secret itself is never returned by any route"
+        ),
+    }
+
+
+def _their_schema():
+    code, headers, raw, err = _http("GET", SCHEMA_URL)
+    if err:
+        return {"ok": False, "error": "fetch_failed", "detail": err}, 502
+    doc = _parse_json(raw)
+    if doc is None:
+        return {"ok": False, "error": "unparseable", "status": code}, 502
+
+    req = (((doc.get("request_schema") or {}).get("properties") or {})
+           .get("payload") or {})
+    required = req.get("required") or []
+    hdr = {}
+    for k, v in (headers or {}).items():
+        if k.lower().startswith("x-praxis") or k.lower() == "cache-control":
+            hdr[k.lower()] = v
+
+    return {
+        "ok": True,
+        "fetched_at": _now_iso(),
+        "http_status": code,
+        "contract_version": doc.get("schema_version"),
+        "payload_required": required,
+        "receipt_digest_required": "receipt_digest" in required,
+        "canonicalization": ((doc.get("signing") or {}).get("canonicalization")),
+        "domain": ((doc.get("signing") or {}).get("domain")),
+        "clock_skew_seconds": ((doc.get("freshness") or {}).get("clock_skew_seconds")),
+        "headers": hdr,
+        "body_sha256": _sha256_hex(raw),
+    }, 200
+
+
+def _canonical_action(data):
+    tip = (data.get("tip_digest") or "").strip().lower()
+    wpid = (data.get("witnessed_peer_id") or OUR_PEER_ID).strip().lower()
+    src = (data.get("source_url") or OUR_TIP_URL).strip()
+    rcpt = (data.get("receipt_digest") or "").strip().lower() or None
+    attempt = data.get("attempt") or None
+
+    bad = _validate(tip, wpid, src, rcpt)
+    if bad:
+        return {"ok": False, "error": "invalid_input", "detail": bad}, 400
+
+    secret = _secret()
+    if not secret:
+        return {"ok": False, "error": "secret_unconfigured",
+                "detail": "set %s in the environment" % SECRET_ENV}, 503
+
+    env = _build_envelope(tip, wpid, src, rcpt, attempt)
+    canonical, preimage, sig = _sign(env, secret)
+    signed = dict(env)
+    signed["signature"] = sig
+
+    return {
+        "ok": True,
+        "dry_run": True,
+        "sent": False,
+        "envelope": signed,
+        "canonical_json": canonical.decode("utf-8"),
+        "canonical_sha256": _sha256_hex(canonical),
+        "preimage_sha256": _sha256_hex(preimage),
+        "signature": sig,
+        "note": "nothing was sent; ts, nonce and idempotency_key here are "
+                "single-use and will be regenerated on an actual submit",
+    }, 200
+
+
+def _submit(data, ctx):
+    tip = (data.get("tip_digest") or "").strip().lower()
+    wpid = (data.get("witnessed_peer_id") or OUR_PEER_ID).strip().lower()
+    src = (data.get("source_url") or OUR_TIP_URL).strip()
+    rcpt = (data.get("receipt_digest") or "").strip().lower() or None
+    attempt = data.get("attempt") or None
+
+    bad = _validate(tip, wpid, src, rcpt)
+    if bad:
+        return {"ok": False, "error": "invalid_input", "detail": bad}, 400
+
+    secret = _secret()
+    if not secret:
+        return {"ok": False, "error": "secret_unconfigured",
+                "detail": "set %s in the environment" % SECRET_ENV}, 503
+
+    env = _build_envelope(tip, wpid, src, rcpt, attempt)
+    canonical, preimage, sig = _sign(env, secret)
+    signed = dict(env)
+    signed["signature"] = sig
+    wire = _canonical(signed)
+
+    started = time.time()
+    code, headers, raw, err = _http("POST", OBSERVE_URL, wire)
+    took = round(time.time() - started, 3)
+
+    parsed = _parse_json(raw)
+    transport_ok = err is None and code in (200, 202)
+    result = {
+        "ok": transport_ok,
+        "sent": err is None,
+        "took_seconds": took,
+        "http_status": code,
+        "transport_error": err,
+        "request": {
+            "idempotency_key": env["idempotency_key"],
+            "nonce": env["nonce"],
+            "ts": env["ts"],
+            "peer_id": env["peer_id"],
+            "payload": env["payload"],
+            "signature": sig,
+            "canonical_sha256": _sha256_hex(canonical),
+            "wire_sha256": _sha256_hex(wire),
+            "wire_bytes": len(wire),
+        },
+        "response": {
+            "body": parsed,
+            "raw_sha256": _sha256_hex(raw) if raw else None,
+            "raw_bytes": len(raw),
+            "raw_text": (raw.decode("utf-8", "replace")[:4000] if raw else None),
+        },
+    }
+
+    if isinstance(parsed, dict):
+        result["their_error"] = parsed.get("error")
+        result["their_accepted"] = parsed.get("accepted")
+        result["their_replayed"] = parsed.get("replayed")
+        result["their_request_digest"] = parsed.get("request_digest")
+        result["their_durable_event_recorded"] = parsed.get("durable_event_recorded")
+        result["their_accepted_decision_recorded"] = parsed.get(
+            "accepted_decision_recorded")
+
+    event = {
+        "user_id": "praxis:" + OUR_PEER_ID,
+        "event": "praxis_observe_submit",
+        "kind": "praxis_observe_submit",
+        "ts": _now_iso(),
+        "target": OBSERVE_URL,
+        "idempotency_key": env["idempotency_key"],
+        "request_wire_sha256": result["request"]["wire_sha256"],
+        "http_status": code,
+        "response_sha256": result["response"]["raw_sha256"],
+        "their_error": result.get("their_error"),
+        "their_accepted": result.get("their_accepted"),
+        "result": "sent" if err is None else "transport_error",
+    }
+    result["our_seal"] = _seal(ctx, event)
+
+    # A send that the peer accepted but our own chain has no entry for is a
+    # failure of this deployment, not a success. Say so at the top level.
+    if not result["our_seal"].get("sealed"):
+        result["ok"] = False
+        result["seal_failed"] = True
+        result["seal_failed_note"] = (
+            "the submission reached the peer but was NOT sealed into our "
+            "chain. The peer may hold a durable record with no counterpart "
+            "here. Do not treat this submission as evidenced on our side."
+        )
+
+    if not transport_ok:
+        status = 502 if err else 200
+    elif not result["our_seal"].get("sealed"):
+        status = 500
+    else:
+        status = 200
+    return result, status
+
+
+def _history(ctx, data):
+    limit = 20
+    try:
+        limit = max(1, min(100, int(data.get("limit") or 20)))
+    except Exception:
+        pass
+    rows = []
+    try:
+        conn = ctx.get("conn")
+        lock = ctx.get("lock")
+        sql = ("SELECT rowid, * FROM audit_log "
+               "WHERE user_id = ? ORDER BY rowid DESC LIMIT ?")
+        if lock:
+            with lock:
+                cur = conn.execute(sql, ("praxis:" + OUR_PEER_ID, limit))
+                cols = [d[0] for d in cur.description]
+                rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+        else:
+            cur = conn.execute(sql, ("praxis:" + OUR_PEER_ID, limit))
+            cols = [d[0] for d in cur.description]
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    except Exception as e:
+        return {"ok": False, "error": "query_failed",
+                "detail": "%s: %s" % (type(e).__name__, e)}, 500
+    return {"ok": True, "count": len(rows), "rows": rows}, 200
+
+
+# ---------------------------------------------------------------- router
+
+def handle(method, action, data, api_key, ctx):
+    data = data or {}
+
+    if method == "GET" and action == "spec":
+        return _spec(), 200
+
+    if method == "GET" and action == "status":
+        return _status(), 200
+
+    if method == "GET" and action == "schema":
+        return _their_schema()
+
+    if method == "GET" and action == "history":
+        return _history(ctx, data)
+
+    if method == "POST" and action == "canonical":
+        return _canonical_action(data)
+
+    if method == "POST" and action == "submit":
+        return _submit(data, ctx)
+
+    return {"ok": False, "error": "unknown_action", "action": action,
+            "available": ["spec", "status", "schema", "history",
+                          "canonical", "submit"]}, 404
 
 ```
