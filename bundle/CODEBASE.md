@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-149 files across 39 parts.
+150 files across 39 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -128,6 +128,7 @@ Generated automatically on every push. Do not edit by hand.
 ## [CODEBASE-20.md](CODEBASE-20.md)
 
 - `modules/standing.py`
+- `modules/startpage.py`
 - `modules/stats.py`
 - `modules/tokensaver.py`
 
