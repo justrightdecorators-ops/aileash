@@ -4,8 +4,8 @@ Contains:
 - `modules/roster.py`
 - `modules/router.py`
 - `modules/rulebind.py`
-- `modules/run_benchmark.py`
 - `modules/savings.py`
+- `modules/sebbi_engine.py`
 
 
 ## `modules/roster.py`
@@ -1458,152 +1458,6 @@ def handle(method, action, data, api_key, ctx):
 ```
 
 
-## `modules/run_benchmark.py`
-
-138 lines, 6143 bytes
-
-```python
-#!/usr/bin/env python3
-"""
-sebbi.pro Zero-Trust AI Engine — Instant System Benchmark
-Zero Dependencies. Standard Python 3.10+ Libraries Only.
-
-RUN THIS FILE DIRECTLY IN TERMINAL:
-  python3 run_benchmark.py
-"""
-
-import time
-import json
-import re
-import hashlib
-import hmac
-
-# =====================================================================
-# THE ENGINE CORE (Gateway, Trimmer, Redactor, Cryptographic Witness)
-# =====================================================================
-class SebbiEngine:
-    def __init__(self, secret_key: bytes = b"sebbi_network_secret"):
-        self.secret_key = secret_key
-        self.cache = {}
-
-    def process(self, prompt: str) -> dict:
-        start_time = time.perf_counter_ns()
-        input_tokens = len(prompt.split()) * 4  # Standard token estimate
-        payload_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-
-        # 1. Exact-Match Cache Check
-        if payload_hash in self.cache:
-            latency_ms = (time.perf_counter_ns() - start_time) / 1e6
-            return {
-                "verdict": "SERVE_FROM_CACHE",
-                "original_tokens": input_tokens,
-                "processed_tokens": 0,
-                "tokens_saved": input_tokens,
-                "cost_usd": 0.0,
-                "latency_ms": round(latency_ms, 3),
-                "payload": self.cache[payload_hash],
-                "hash": payload_hash
-            }
-
-        # 2. Context Trimming & Redaction
-        trimmed = re.sub(r'\s+', ' ', prompt)
-        trimmed = re.sub(r'(?i)(please|kindly|could you|would you mind|i want you to)', '', trimmed).strip()
-        redacted = re.sub(r'[a-zA-Z0-9_\-]+@[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+', '[REDACTED_EMAIL]', trimmed)
-        redacted = re.sub(r'(?i)(bearer\s+[a-zA-Z0-9_\-\.]+)', 'Bearer [REDACTED_TOKEN]', redacted)
-
-        output_tokens = len(redacted.split()) * 4
-        tokens_saved = max(0, input_tokens - output_tokens)
-        
-        # Calculate standard model pricing ($3.00 per 1M tokens vs optimized endpoint)
-        cost_usd = round(output_tokens * (3.00 / 1_000_000), 6)
-        
-        self.cache[payload_hash] = redacted
-        latency_ms = (time.perf_counter_ns() - start_time) / 1e6
-
-        # 3. Non-Repudiable Cryptographic Witness Signature
-        out_hash = hashlib.sha256(redacted.encode("utf-8")).hexdigest()
-        block = f"{payload_hash}:{out_hash}:{latency_ms}"
-        sig = hmac.new(self.secret_key, block.encode("utf-8"), hashlib.sha256).hexdigest()
-
-        return {
-            "verdict": "OPTIMIZED_AND_WITNESSED",
-            "original_tokens": input_tokens,
-            "processed_tokens": output_tokens,
-            "tokens_saved": tokens_saved,
-            "cost_usd": cost_usd,
-            "latency_ms": round(latency_ms, 3),
-            "payload": redacted,
-            "witness_signature": sig
-        }
-
-# =====================================================================
-# BENCHMARK SUITE — COMPARING CURRENT EXECUTION VS SEBBI ENGINE
-# =====================================================================
-def run_benchmark():
-    print("=" * 70)
-    print("      SEBBI.PRO CONTROL PLANE — LIVE SYSTEM BENCHMARK TEST      ")
-    print("=" * 70)
-
-    # Simulated messy production prompt containing filler, PII, and API keys
-    sample_prompt = (
-        "Please kindly summarize this internal operations brief for our team. "
-        "I want you to make sure to review all the customer logs attached. "
-        "Send the confirmation report to admin.ops@enterprise.com once finished. "
-        "Authentication Token: Bearer sk_live_998877665544332211. "
-        "Ensure every single detail is captured without missing any historical transitions."
-    )
-
-    engine = SebbiEngine()
-
-    # --- TEST 1: UNOPTIMIZED (CURRENT SYSTEM BASELINE) ---
-    raw_tokens = len(sample_prompt.split()) * 4
-    raw_cost = round(raw_tokens * (3.00 / 1_000_000), 6) # standard $3/1M rate
-    raw_latency = 14.2  # Typical raw gateway check latency (ms)
-
-    print("\n[!] 1. CURRENT SYSTEM STATE (WITHOUT SEBBI)")
-    print(f"    - Input Tokens Sent    : {raw_tokens} tokens")
-    print(f"    - Estimated Cost / Call: ${raw_cost:.6f}")
-    print(f"    - Gateway Check Time   : {raw_latency} ms")
-    print(f"    - Security Redaction   : NONE (PII & API Key Exposed to Provider)")
-    print(f"    - Proof Guarantee      : UNVERIFIED (No Cryptographic Receipt)")
-
-    # --- TEST 2: FIRST PASS THROUGH SEBBI ENGINE ---
-    result_p1 = engine.process(sample_prompt)
-
-    print("\n[+] 2. SEBBI ENGINE (PASS 1: TRIMMING + REDACTION + WITNESS)")
-    print(f"    - Tokens Sent to Model : {result_p1['processed_tokens']} tokens (Saved {result_p1['tokens_saved']} tokens)")
-    print(f"    - Optimized Cost / Call: ${result_p1['cost_usd']:.6f}")
-    print(f"    - Engine Execution Time: {result_p1['latency_ms']} ms")
-    print(f"    - Security Redaction   : ACTIVE (PII & API Key Stripped)")
-    print(f"    - Witness Signature    : {result_p1['witness_signature'][:24]}...")
-
-    # --- TEST 3: REPEAT CALL (SEBBI CACHE ENGINE) ---
-    result_p2 = engine.process(sample_prompt)
-
-    print("\n[+] 3. SEBBI ENGINE (PASS 2: ZERO-TOKEN CACHE HIT)")
-    print(f"    - Tokens Sent to Model : {result_p2['processed_tokens']} tokens (100% Saved)")
-    print(f"    - Optimized Cost / Call: ${result_p2['cost_usd']:.6f}")
-    print(f"    - Engine Execution Time: {result_p2['latency_ms']} ms")
-    print(f"    - Status               : {result_p2['verdict']}")
-
-    # --- SUMMARY COST COMPARISON ---
-    pct_saved = round((1 - (result_p1['processed_tokens'] / raw_tokens)) * 100, 1)
-    
-    print("\n" + "=" * 70)
-    print("                     BENCHMARK VERDICT SUMMARY                     ")
-    print("=" * 70)
-    print(f"  TOKEN REDUCTION   : {pct_saved}% Reduction on Pass 1 (100% on Pass 2)")
-    print(f"  LATENCY IMPACT    : Processed in {result_p1['latency_ms']}ms (Sub-millisecond)")
-    print(f"  SECURITY GAP      : SECURED (PII & API secrets neutralized)")
-    print(f"  PROOF OF STATE    : HMAC SHA-256 Anchored Witness Generated")
-    print("=" * 70 + "\n")
-
-if __name__ == "__main__":
-    run_benchmark()
-
-```
-
-
 ## `modules/savings.py`
 
 852 lines, 38047 bytes
@@ -2460,5 +2314,242 @@ def handle(method, action, data, api_key, ctx):
         return _verify(ctx, data)
     return {"error": "unknown_action", "action": action,
             "GET": ["status", "verify"], "POST": ["seal"]}, 404
+
+```
+
+
+## `modules/sebbi_engine.py`
+
+229 lines, 8776 bytes
+
+```python
+# modules/sebbi_engine.py
+"""
+Live chain-state endpoint  -  GET /x/sebbi_engine/state
+
+WHAT CHANGED IN v1.1, AND WHY
+-----------------------------
+v1.0 served this at /verify and returned "status": "sealed". It performed no
+verification: no rehash, no chain walk, no proof check. It read the last row of
+audit_log and reported that a row existed. A route called verify that returns
+sealed, having checked neither, is a word one step past what the check does -
+the same fault that has been raised against this codebase before, and the word
+an auditor will quote back.
+
+So v1.1 does the same honest job under honest names:
+
+  * action renamed  verify -> state
+  * status is now  live / unavailable, never "sealed"
+  * tip_digest removed - it was a hash of a hash, proving nothing
+  * token_budget removed - unrelated to chain state, it did not belong here
+  * every response names the routes that DO verify, and says plainly that
+    this one does not
+
+WHAT THIS ROUTE IS
+------------------
+The current tip and height, read from the database at request time. Nothing
+cached, nothing hardcoded. If the chain cannot be read it says so rather than
+reporting a reassuring value it cannot stand behind.
+
+WHAT IT IS NOT
+--------------
+It is not verification. Reading the last row proves a row exists. Verifying
+the chain means rewalking it, and confirming the tip was recorded by operators
+we do not control. Those are separate routes, listed in every response.
+
+Dual-signature handle(...) so it works with the router
+    handle(method, action, data, api_key, ctx) -> (payload, status)
+and with older direct-write callers
+    handle(handler, path, query_params=None) -> writes the response, returns True
+
+Import-safe: nothing here can crash the server on import.
+"""
+
+import os
+import json
+import time
+
+VERSION = "1.1"
+MODULE_NAME = os.environ.get("MODULE_NAME", "sebbi_engine")
+
+# GET /state is public by design - anyone can read live state without an
+# account. The old ("GET", "verify") pair is kept so existing callers get the
+# renamed answer rather than a bare 404.
+PUBLIC = {("GET", "state"), ("GET", "verify"), ("GET", "spec"), ("GET", "")}
+
+VERIFY_ELSEWHERE = {
+    "chain_tip": "https://sebbi.pro/x/witness/tip",
+    "append_only_proof": "https://sebbi.pro/x/consistency/proof",
+    "is_my_tip_still_on_this_chain": "https://sebbi.pro/x/consistency/ancestor",
+    "who_recorded_our_tip": "https://sebbi.pro/x/roster/list",
+    "timestamp_proof_state": "https://sebbi.pro/x/ots/status",
+}
+
+NOT_VERIFICATION = (
+    "This route reads the current tip and height. It does not verify anything: "
+    "it does not rewalk the chain, recompute any hash, or check any external "
+    "record. Reading the last row proves a row exists and nothing more. The "
+    "routes above are the ones that verify, and you run them yourself."
+)
+
+try:
+    print("modules.sebbi_engine: loaded (v%s, live-state mode)" % VERSION, flush=True)
+except Exception:
+    pass
+
+
+def _read_live_chain(ctx):
+    """
+    Read the real current chain tip and height from the live database via ctx.
+
+    Returns what was actually found, or a record of why it could not be read.
+    It never invents a value.
+    """
+    if not isinstance(ctx, dict):
+        return {"live": False, "reason": "no_context"}
+
+    conn = ctx.get("conn") or ctx.get("db") or ctx.get("connection")
+    lock = ctx.get("lock")
+    if conn is None:
+        return {"live": False, "reason": "no_db_handle"}
+
+    # Matched to modules/witness.py _our_tip(): the chain lives in audit_log,
+    # the sealed hash is audit_hash, the height is id.
+    query = ("SELECT audit_hash AS seal, id AS height FROM audit_log "
+             "ORDER BY id DESC LIMIT 1")
+
+    def _run():
+        try:
+            row = conn.execute(query).fetchone()
+        except Exception:
+            return {"live": False, "reason": "query_failed"}
+        if not row:
+            return {"live": False, "reason": "no_chain_rows"}
+        seal = row[0]
+        height = row[1]
+        if seal is None:
+            return {"live": False, "reason": "null_tip"}
+        return {"live": True, "tip": str(seal),
+                "height": int(height) if height is not None else None}
+
+    try:
+        if lock is not None:
+            with lock:
+                return _run()
+        return _run()
+    except Exception as e:  # noqa: BLE001
+        return {"live": False, "reason": "read_error:" + e.__class__.__name__}
+
+
+def _build_payload(ctx):
+    now = int(time.time())
+    chain = _read_live_chain(ctx)
+
+    payload = {
+        "module": MODULE_NAME,
+        "version": VERSION,
+        "read_at": now,
+        "read_at_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+    }
+
+    if chain.get("live"):
+        payload["status"] = "live"
+        payload["chain_tip"] = chain["tip"]
+        payload["chain_height"] = chain["height"]
+        payload["note"] = (
+            "Live chain state, read at request time. It changes as the chain "
+            "grows, so two reads a minute apart are expected to differ.")
+    else:
+        payload["status"] = "unavailable"
+        payload["chain_tip"] = None
+        payload["chain_height"] = None
+        payload["reason"] = chain.get("reason", "unknown")
+        payload["note"] = (
+            "The live chain could not be read for this request, so no state is "
+            "reported. This endpoint never returns a placeholder in place of "
+            "real state.")
+
+    payload["height_is_not_activity"] = (
+        "A liveness beacon seals a block every five minutes, so most of the "
+        "height is heartbeat rather than customer decisions. Do not read this "
+        "number as usage.")
+    payload["this_is_not_verification"] = NOT_VERIFICATION
+    payload["verify_it_yourself"] = VERIFY_ELSEWHERE
+    return payload
+
+
+def _spec():
+    return {
+        "module": MODULE_NAME,
+        "version": VERSION,
+        "route": "GET /x/sebbi_engine/state",
+        "what_it_returns": "The current chain tip and height, read at request time.",
+        "what_it_does_not_do": NOT_VERIFICATION,
+        "renamed_in_v1_1": (
+            "The action was called verify and returned status sealed. It "
+            "verified nothing, so both names were wrong. verify still answers, "
+            "and returns this same state payload under the honest names."),
+        "verify_it_yourself": VERIFY_ELSEWHERE,
+        "cost": "Free. No account, no key.",
+    }, 200
+
+
+def handle(*args, **kwargs):
+    """Dual-signature handler; autodetects call style from the first argument."""
+
+    # Legacy direct-write style: first arg is an HTTP handler
+    if args and hasattr(args[0], "send_response") and hasattr(args[0], "wfile"):
+        handler = args[0]
+        ctx = getattr(handler, "ctx", None)
+        payload = _build_payload(ctx if isinstance(ctx, dict) else None)
+        body = json.dumps(payload, indent=2).encode("utf-8")
+        try:
+            handler.send_response(200)
+            handler.send_header("Content-Type", "application/json")
+            handler.send_header("Content-Length", str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+        except Exception:
+            try:
+                handler.send_response(500)
+                handler.send_header("Content-Type", "text/plain")
+                handler.end_headers()
+                handler.wfile.write(b"sebbi_engine: response failed\n")
+            except Exception:
+                pass
+        return True
+
+    # Router style: handle(method, action, data, api_key, ctx)
+    method = args[0] if len(args) > 0 else kwargs.get("method")
+    action = args[1] if len(args) > 1 else kwargs.get("action", "")
+    ctx = args[4] if len(args) > 4 else kwargs.get("ctx")
+
+    # Tolerate action arriving as a full path
+    if isinstance(action, str) and action.startswith("/"):
+        parts = [x for x in action.strip("/").split("/") if x]
+        if len(parts) >= 3 and parts[1] == "sebbi_engine":
+            action = parts[2]
+
+    action = (action or "").strip("/").lower()
+
+    if method != "GET":
+        return {"error": "method_not_allowed", "GET": ["state", "spec"]}, 405
+
+    if action == "spec":
+        return _spec()
+
+    if action in ("state", ""):
+        return _build_payload(ctx if isinstance(ctx, dict) else None), 200
+
+    if action == "verify":
+        payload = _build_payload(ctx if isinstance(ctx, dict) else None)
+        payload["renamed"] = (
+            "This action is now /x/sebbi_engine/state. It was called verify and "
+            "returned status sealed, while verifying nothing. Same data, honest "
+            "names. Update your caller when convenient.")
+        return payload, 200
+
+    return {"error": "unknown_action", "action": action,
+            "GET": ["state", "spec"]}, 404
 
 ```

@@ -57,6 +57,7 @@ Generated automatically on every push. Do not edit by hand.
 
 - `modules/heartbeat.py`
 - `modules/held.py`
+- `modules/homelink.py`
 - `modules/integrity.py`
 
 ## [CODEBASE-10.md](CODEBASE-10.md)
@@ -108,12 +109,11 @@ Generated automatically on every push. Do not edit by hand.
 - `modules/roster.py`
 - `modules/router.py`
 - `modules/rulebind.py`
-- `modules/run_benchmark.py`
 - `modules/savings.py`
+- `modules/sebbi_engine.py`
 
 ## [CODEBASE-18.md](CODEBASE-18.md)
 
-- `modules/sebbi_engine.py`
 - `modules/selfcheck.py`
 - `modules/signed.py`
 
