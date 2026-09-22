@@ -1,8 +1,2033 @@
 # Codebase — part 12 of 39
 
 Contains:
+- `modules/network.py`
+- `modules/ots.py`
+- `modules/oversight.py`
+- `modules/pack.py`
 - `modules/packconsole.py`
-- `modules/packs.py`
+
+
+## `modules/network.py`
+
+487 lines, 19842 bytes
+
+```python
+"""
+modules/network.py  -  serves the public witness network page
+
+WHY THIS IS A MODULE AND NOT A TEMPLATE
+---------------------------------------
+The router hands whatever handle() returns to send_json, so a module cannot
+return HTML through it - it would arrive as a JSON string. So this does the
+same thing router.py already does for POST: it patches the request handler at
+runtime, adds a branch for the page path, and leaves every other path exactly
+as it was. The patch is idempotent and lives in memory, so a restart reverts it.
+
+THE SAME CATCH AS THE POST PATCH
+--------------------------------
+A module is only imported when a request reaches the router. So after every
+deploy, one request to /x/network/status has to arrive before /witness works.
+Opening /x/network/status in a browser does it. Until then the page path falls
+through to whatever the server did before, which is a 404 - not an error page,
+just the old behaviour.
+
+If you would rather not patch anything, the same HTML works as a plain file in
+static/. This exists because the page then lives with the module it describes
+rather than drifting away from it.
+
+ROUTES
+------
+  GET /witness            the page
+  GET /witness.html       same page
+  GET /x/network/status   whether the patch is installed (public)
+
+The page itself holds no data. It reads /x/witness/tip and /x/witness/peers
+from the browser, same as any other visitor would, so it cannot show anything
+a stranger could not verify for themselves.
+"""
+
+import sys
+
+VERSION = "1.0"
+
+PUBLIC = {("GET", "status")}
+
+PAGE_PATHS = ("/witness", "/witness.html", "/network")
+
+_patched = [False]
+
+
+PAGE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The witness network — AILeash</title>
+<meta name="description" content="Two independent platforms recording each other's records, hourly. Checkable by anyone, without an account.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300;9..144,600&family=Inter+Tight:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{
+  --paper:#E9EDE4;
+  --paper-deep:#DFE5D8;
+  --ink:#18241F;
+  --ink-soft:#4A5A52;
+  --rule:#BFCCBF;
+  --rule-strong:#9AAC9C;
+  --stamp:#7C2B38;
+  --verdigris:#2F6B5E;
+  --amber:#9A6B1F;
+  --gutter:#CBD6C8;
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{
+  margin:0;
+  background:var(--paper);
+  color:var(--ink);
+  font-family:"Inter Tight",system-ui,sans-serif;
+  font-size:17px;
+  line-height:1.6;
+  /* ruled paper, faint */
+  background-image:repeating-linear-gradient(
+    to bottom,
+    transparent 0 31px,
+    rgba(154,172,156,.20) 31px 32px
+  );
+}
+.wrap{max-width:1080px;margin:0 auto;padding:0 22px}
+
+/* ---------- masthead ---------- */
+.masthead{padding:52px 0 30px;border-bottom:2px solid var(--ink)}
+.eyebrow{
+  font-family:"IBM Plex Mono",monospace;
+  font-size:11.5px;letter-spacing:.18em;text-transform:uppercase;
+  color:var(--ink-soft);margin:0 0 18px;
+}
+h1{
+  font-family:Fraunces,Georgia,serif;
+  font-weight:600;font-size:clamp(2.5rem,7.5vw,4.6rem);
+  line-height:1.02;letter-spacing:-.02em;margin:0 0 20px;
+}
+h1 em{font-style:italic;font-weight:300}
+.standfirst{font-size:clamp(1.05rem,2.4vw,1.28rem);max-width:40ch;color:var(--ink-soft);margin:0}
+
+/* ---------- the spread ---------- */
+.spread{
+  margin:44px 0 8px;
+  border:1px solid var(--rule-strong);
+  background:rgba(255,255,255,.4);
+}
+.spread-head{
+  display:grid;grid-template-columns:1fr 92px 1fr;
+  border-bottom:1px solid var(--rule-strong);
+}
+.spread-head div{
+  font-family:"IBM Plex Mono",monospace;
+  font-size:11px;letter-spacing:.14em;text-transform:uppercase;
+  padding:12px 16px;color:var(--ink-soft);
+}
+.spread-head .mid{text-align:center;background:var(--gutter);color:var(--ink)}
+.spread-head .right{text-align:right}
+.folio{
+  display:grid;grid-template-columns:1fr 92px 1fr;
+  border-bottom:1px solid var(--rule);
+}
+.folio:last-child{border-bottom:0}
+.side{padding:20px 16px;min-width:0}
+.side.right{text-align:right}
+.mid{
+  background:var(--gutter);
+  display:flex;align-items:center;justify-content:center;
+  font-family:"IBM Plex Mono",monospace;font-size:11px;color:var(--ink-soft);
+  border-left:1px solid var(--rule);border-right:1px solid var(--rule);
+}
+.chain-name{
+  font-family:Fraunces,Georgia,serif;font-size:1.35rem;font-weight:600;
+  margin:0 0 4px;letter-spacing:-.01em;
+}
+.role{font-family:"IBM Plex Mono",monospace;font-size:11px;letter-spacing:.12em;
+  text-transform:uppercase;color:var(--ink-soft);margin:0 0 14px}
+.hash{
+  font-family:"IBM Plex Mono",monospace;font-size:12.5px;
+  word-break:break-all;color:var(--ink);margin:0 0 3px;line-height:1.45;
+}
+.hash-label{font-family:"IBM Plex Mono",monospace;font-size:10.5px;
+  letter-spacing:.12em;text-transform:uppercase;color:var(--ink-soft);margin:0 0 5px}
+.meta{font-size:14px;color:var(--ink-soft);margin:12px 0 0}
+.meta b{color:var(--ink);font-weight:600}
+
+/* ---------- stamp ---------- */
+.stamp{
+  display:inline-block;margin-top:16px;padding:6px 13px 5px;
+  border:2.5px solid var(--stamp);color:var(--stamp);
+  font-family:"IBM Plex Mono",monospace;font-weight:500;
+  font-size:12px;letter-spacing:.16em;text-transform:uppercase;
+  transform:rotate(-3.5deg);opacity:.9;
+}
+.stamp.press{animation:press .5s cubic-bezier(.2,1.5,.4,1) both}
+@keyframes press{
+  0%{opacity:0;transform:rotate(-3.5deg) scale(1.5)}
+  70%{opacity:.95;transform:rotate(-3.5deg) scale(.97)}
+  100%{opacity:.9;transform:rotate(-3.5deg) scale(1)}
+}
+.stamp.live{border-color:var(--verdigris);color:var(--verdigris)}
+.stamp.weak{border-color:var(--amber);color:var(--amber)}
+.stamp.flag{background:var(--stamp);color:var(--paper)}
+
+/* ---------- sections ---------- */
+section{padding:56px 0;border-top:1px solid var(--rule-strong)}
+h2{
+  font-family:Fraunces,Georgia,serif;font-weight:600;
+  font-size:clamp(1.6rem,4vw,2.3rem);letter-spacing:-.015em;
+  margin:0 0 8px;line-height:1.15;
+}
+.sec-note{color:var(--ink-soft);max-width:56ch;margin:0 0 30px}
+p{max-width:62ch}
+
+.defs{display:grid;gap:0;border-top:1px solid var(--rule)}
+.def{
+  display:grid;grid-template-columns:170px 1fr;gap:20px;
+  padding:15px 0;border-bottom:1px solid var(--rule);
+}
+.def dt{
+  font-family:"IBM Plex Mono",monospace;font-size:12px;
+  letter-spacing:.1em;text-transform:uppercase;padding-top:3px;
+}
+.def dd{margin:0;color:var(--ink-soft)}
+.dot{display:inline-block;width:8px;height:8px;margin-right:8px;border-radius:50%;vertical-align:middle}
+.dot.ok{background:var(--stamp)}
+.dot.mid-c{background:var(--verdigris)}
+.dot.weak{background:var(--amber)}
+
+.limits li{max-width:62ch;margin-bottom:13px;color:var(--ink-soft)}
+.limits b{color:var(--ink)}
+
+pre{
+  font-family:"IBM Plex Mono",monospace;font-size:13px;line-height:1.7;
+  background:var(--ink);color:var(--paper);padding:20px;overflow-x:auto;
+  border:0;margin:22px 0;
+}
+pre .k{color:#9FC6B4}
+code{font-family:"IBM Plex Mono",monospace;font-size:.92em}
+
+.links{list-style:none;padding:0;margin:24px 0 0}
+.links li{border-bottom:1px solid var(--rule);padding:13px 0}
+.links a{
+  font-family:"IBM Plex Mono",monospace;font-size:13.5px;
+  color:var(--ink);text-decoration:none;word-break:break-all;
+  display:flex;justify-content:space-between;gap:16px;align-items:baseline;
+}
+.links a:hover,.links a:focus-visible{color:var(--stamp)}
+.links span{color:var(--ink-soft);font-family:"Inter Tight",sans-serif;
+  font-size:13px;flex:0 0 auto;text-align:right}
+
+footer{padding:40px 0 70px;color:var(--ink-soft);font-size:14px}
+footer a{color:var(--ink)}
+
+.loading,.errbox{
+  font-family:"IBM Plex Mono",monospace;font-size:13px;
+  color:var(--ink-soft);padding:26px 16px;
+}
+.errbox b{display:block;color:var(--ink);margin-bottom:6px;font-family:"Inter Tight",sans-serif;font-size:15px}
+
+a:focus-visible,button:focus-visible{outline:2.5px solid var(--stamp);outline-offset:3px}
+
+@media (max-width:760px){
+  body{background-image:none}
+  .spread-head,.folio{grid-template-columns:1fr}
+  .spread-head .mid,.folio .mid{
+    border-left:0;border-right:0;
+    border-top:1px solid var(--rule);border-bottom:1px solid var(--rule);
+    padding:7px 0;text-align:center;
+  }
+  .spread-head .right,.side.right{text-align:left}
+  .spread-head div{padding:9px 14px}
+  .def{grid-template-columns:1fr;gap:5px}
+}
+@media (prefers-reduced-motion:reduce){
+  *{animation:none!important;transition:none!important}
+}
+</style>
+</head>
+<body>
+
+<div class="wrap">
+
+  <header class="masthead">
+    <p class="eyebrow">AILeash · the witness network</p>
+    <h1>Two ledgers.<br><em>Neither one is the authority.</em></h1>
+    <p class="standfirst">Independent platforms record each other's records, every hour. You can check it yourself, right now, without an account.</p>
+  </header>
+
+  <div class="spread" id="spread">
+    <div class="spread-head">
+      <div>This chain</div>
+      <div class="mid">Exchange</div>
+      <div class="right">Recorded by</div>
+    </div>
+    <div id="folios">
+      <div class="loading">Reading the ledger…</div>
+    </div>
+  </div>
+
+  <section>
+    <h2>Why this exists</h2>
+    <p class="sec-note">Every platform that sells you an audit trail also holds it.</p>
+    <p>A hash chain stops anyone else altering the record. It does not stop the operator rebuilding the whole thing and presenting the result as history. Anchoring the chain externally narrows that down — you can't rewrite anything older than your last anchor — and it still leaves the keeper and the checker as the same party.</p>
+    <p>Nothing you build alone closes that. Somebody outside has to be holding a copy.</p>
+    <p>So each platform here takes the fingerprint of the others' records and seals it into its own. To rewrite your past now, everyone holding a copy would have to rewrite theirs in step, and re-obtain external timestamps that were issued days ago. The second half is the part that can't be done.</p>
+  </section>
+
+  <section>
+    <h2>What the marks mean</h2>
+    <p class="sec-note">Two checks run on every submission. Neither can reject one — everything gets sealed. What changes is how strong we say the claim is.</p>
+
+    <dl class="defs">
+      <div class="def"><dt><span class="dot ok"></span>Confirmed</dt><dd>We fetched the address given and it served exactly the tip that was submitted.</dd></div>
+      <div class="def"><dt><span class="dot mid-c"></span>Live</dt><dd>The address served a valid but different tip. A working chain moves between submitting and our looking — normal, not a failure.</dd></div>
+      <div class="def"><dt><span class="dot weak"></span>Self-declared</dt><dd>No address given, or we couldn't reach it. Taken on their word, and marked as such.</dd></div>
+      <div class="def"><dt>First-use</dt><dd>First time this name appeared. It's now bound to the address it came from.</dd></div>
+      <div class="def"><dt>Bound</dt><dd>Same address as the first time this name appeared. The same operator, consistently.</dd></div>
+      <div class="def"><dt>Conflict</dt><dd>This name has been submitted from a different address than the one it was first bound to. Still sealed, permanently flagged. Operators do move hosts — but you get to see it and decide.</dd></div>
+    </dl>
+  </section>
+
+  <section>
+    <h2>What this does not prove</h2>
+    <p class="sec-note">Said plainly, because the value of the rest depends on it.</p>
+    <ul class="limits">
+      <li><b>It doesn't prove a record was true when it was written.</b> Nothing can. No system reaches back to verify what someone was thinking or whether the data going in was honest. This proves what was recorded, when, and that it hasn't changed since.</li>
+      <li><b>It doesn't prove identity.</b> A name is self-declared. Checking the address proves someone runs a live chain producing that data — not that they're who they say. Binding a name to its first address is what makes a change visible.</li>
+      <li><b>Two platforms checking each other isn't much of a network.</b> The strength comes from breadth. This gets meaningfully harder to bend with every chain that joins, and not before.</li>
+      <li><b>A participant can go quiet.</b> Nobody can force anyone to keep publishing. Gaps show up as stale or silent rather than disappearing, which is the point.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Joining</h2>
+    <p class="sec-note">Chains submit their current head to the network and record the heads of others in return.</p>
+    <pre><span class="k">POST</span> https://sebbi.pro/x/witness/observe
+<span class="k">Content-Type:</span> application/json
+
+{
+  "chain": "your-chain-name",
+  "tip":   "&lt;64 hex characters — your current chain head&gt;",
+  "url":   "https://yoursite/your/tip",
+  "ts":    "2026-08-02T14:00:00Z"
+}</pre>
+    <p><code>url</code> is the address we fetch to check your tip independently — it's the difference between confirmed and self-declared. <code>ts</code> is optional, epoch or ISO.</p>
+    <p>Running a chain in the other direction, recording ours as we record yours, is what makes it mutual rather than us keeping a list. If you operate a platform in this space and you're willing to have your history held somewhere you don't control, message me and we'll talk through it and what it costs.</p>
+  </section>
+
+  <section>
+    <h2>Check it yourself</h2>
+    <p class="sec-note">Nothing here needs a login. Open any of these.</p>
+    <ul class="links">
+      <li><a href="/x/witness/tip">/x/witness/tip<span>our current head</span></a></li>
+      <li><a href="/x/witness/peers">/x/witness/peers<span>everyone we record</span></a></li>
+      <li><a href="/api/verify-chain">/api/verify-chain<span>chain checked end to end</span></a></li>
+      <li><a href="/api/anchor-status">/api/anchor-status<span>the external timestamp</span></a></li>
+    </ul>
+  </section>
+
+  <footer>
+    <p>Sealed records and their attestations are held by each participating platform independently. AILeash operates one chain in this network; it does not run the network. — <a href="https://sebbi.pro">sebbi.pro</a></p>
+  </footer>
+
+</div>
+
+<script>
+(function(){
+  var folios = document.getElementById('folios');
+
+  function esc(s){
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){
+      return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+    });
+  }
+
+  function stampFor(liveness, nameStatus){
+    var cls = 'stamp press', text = String(liveness || 'unchecked');
+    if (liveness === 'confirmed') cls += '';
+    else if (liveness === 'live') cls += ' live';
+    else cls += ' weak';
+    if (nameStatus === 'conflict'){ cls += ' flag'; text = 'conflict'; }
+    return '<span class="' + cls + '">' + esc(text) + '</span>';
+  }
+
+  function ago(hours){
+    if (hours == null) return 'unknown';
+    if (hours < 1) return 'within the hour';
+    if (hours < 2) return 'an hour ago';
+    if (hours < 48) return Math.round(hours) + ' hours ago';
+    return Math.round(hours / 24) + ' days ago';
+  }
+
+  function render(ours, peers){
+    if (!peers || !peers.length){
+      folios.innerHTML = '<div class="errbox"><b>No chains recorded yet.</b>' +
+        'Nothing has been submitted to this chain. The first tip posted to ' +
+        '/x/witness/observe appears here.</div>';
+      return;
+    }
+    var html = '';
+    peers.forEach(function(p){
+      html += '<div class="folio">' +
+        '<div class="side">' +
+          '<p class="chain-name">' + esc(ours.name) + '</p>' +
+          '<p class="role">head of chain · height ' + esc(ours.height) + '</p>' +
+          '<p class="hash-label">Current tip</p>' +
+          '<p class="hash">' + esc(ours.tip) + '</p>' +
+          '<p class="meta">Sealed <b>' + esc(ours.sealed) + '</b></p>' +
+        '</div>' +
+        '<div class="mid">↔</div>' +
+        '<div class="side right">' +
+          '<p class="chain-name">' + esc(p.peer) + '</p>' +
+          '<p class="role">' + esc(p.observations) + ' observations · ' +
+              esc(p.distinct_tips) + ' distinct tips</p>' +
+          '<p class="hash-label">Name bound to</p>' +
+          '<p class="hash">' + esc(p.bound_to || 'no address supplied') + '</p>' +
+          '<p class="meta">Last recorded <b>' + esc(ago(p.hours_since_last)) + '</b> · ' +
+              esc(p.name_status || 'unchecked') + '</p>' +
+          stampFor(p.liveness, p.name_status) +
+        '</div>' +
+      '</div>';
+    });
+    folios.innerHTML = html;
+  }
+
+  function failed(){
+    folios.innerHTML = '<div class="errbox"><b>The ledger did not answer.</b>' +
+      'The endpoints are public, so you can try them directly: ' +
+      '<a href="/x/witness/peers">/x/witness/peers</a></div>';
+  }
+
+  Promise.all([
+    fetch('/x/witness/tip').then(function(r){ return r.json(); }),
+    fetch('/x/witness/peers').then(function(r){ return r.json(); })
+  ]).then(function(res){
+    var tip = res[0] || {}, peers = res[1] || {};
+    render({
+      name: 'aileash',
+      tip: tip.tip || 'unavailable',
+      height: tip.height == null ? '—' : tip.height,
+      sealed: tip.sealed_at ? new Date(tip.sealed_at).toUTCString().replace(' GMT','  UTC') : 'unknown'
+    }, peers.peers || []);
+  }).catch(failed);
+})();
+</script>
+
+</body>
+</html>
+"""
+
+
+def _srv():
+    m = sys.modules.get("__main__")
+    if hasattr(m, "get_bearer"):
+        return m
+    return sys.modules.get("server")
+
+
+def _install(s):
+    """Add a page branch to do_GET at runtime. Idempotent and reversible."""
+    if _patched[0]:
+        return "already installed"
+    H = getattr(s, "Handler", None)
+    if H is None or not hasattr(H, "do_GET"):
+        return "no handler"
+    if getattr(H, "_page_patched", False):
+        _patched[0] = True
+        return "already installed"
+
+    original = H.do_GET
+
+    def do_GET(self):
+        try:
+            from urllib.parse import urlparse
+            p = urlparse(self.path).path.rstrip("/") or "/"
+        except Exception:
+            p = self.path or "/"
+        if p in PAGE_PATHS:
+            body = PAGE.encode("utf-8")
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "public, max-age=300")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception:
+                pass
+            return
+        return original(self)
+
+    H.do_GET = do_GET
+    H._page_patched = True
+    _patched[0] = True
+    print("NETWORK: /witness page branch installed at runtime", flush=True)
+    return "installed"
+
+
+def handle(method, action, data, api_key, ctx):
+    s = _srv()
+    if s is None:
+        return {"error": "server_not_found"}, 500
+
+    state = "already installed" if _patched[0] else None
+    if not _patched[0]:
+        try:
+            state = _install(s)
+        except Exception as exc:
+            print("NETWORK: page patch failed - " + str(exc), flush=True)
+            state = "failed: " + str(exc)
+
+    if method == "GET" and (action or "") in ("", "status"):
+        return {
+            "page": "/witness",
+            "installed": bool(_patched[0]),
+            "install_result": state,
+            "paths": list(PAGE_PATHS),
+            "version": VERSION,
+            "note": "The page reads /x/witness/tip and /x/witness/peers from the browser. It holds no data of its own.",
+        }, 200
+
+    return {"error": "unknown_action", "action": action,
+            "GET": ["status"]}, 404
+
+```
+
+
+## `modules/ots.py`
+
+753 lines, 30216 bytes
+
+```python
+"""
+modules/ots.py  v1.2  -  serve the OpenTimestamps proofs, and upgrade them
+
+anchor.py stamps the chain tip hourly and writes the .ots proof to the
+anchor volume. Nothing served those files, so "anchored to Bitcoin" was a
+claim a third party had to take on trust.
+
+PENDING IS NOT CONFIRMED. A proof written at stamping time holds a PENDING
+attestation - a calendar's promise to commit the digest to Bitcoin. It is
+not evidence of anything on chain until it is UPGRADED, after the
+calendar's transaction lands. anchor.py never upgraded, so every proof
+written before this module is pending. Said plainly because an auditor's
+own verifier says it first.
+
+v1.1: the automatic upgrade now skips proofs that are already confirmed.
+v1.0 took the oldest 20 every run whether or not they were finished, so
+once those 20 confirmed it kept re-checking them forever and never reached
+the pending ones behind them. Confirmed counts now only count proofs that
+became confirmed in that run, not ones that already were.
+
+v1.2: the newest proofs matter most. Every run now upgrades half its batch
+from the newest end as well as half from the oldest, so tips of the chain
+running today confirm within hours instead of waiting behind the backlog.
+A new public route, latest_confirmed, serves the newest proof that is
+confirmed in Bitcoin AND whose tip is a block in the chain running now -
+the one address a verifier needs. Two more calendars are asked (bob and
+finney), because proofs name whichever calendars accepted them.
+
+Routes: spec, status, list, proof, latest_confirmed public. upgrade keyed.
+Proofs live at ANCHOR_DIR (default /data/anchors) - only durable on Railway
+if a volume is mounted there. /x/ots/status reports what is really present.
+"""
+
+import base64
+import hashlib
+import json
+import os
+import threading
+import time
+
+VERSION = "1.2"
+
+PUBLIC = {("GET", "spec"), ("GET", "status"), ("GET", "list"),
+          ("GET", "proof"), ("GET", "latest_confirmed")}
+
+ANCHOR_DIR = os.environ.get("ANCHOR_DIR", "/data/anchors")
+MAX_PROOF_BYTES = 262144
+
+CALENDARS = [
+    "https://a.pool.opentimestamps.org",
+    "https://b.pool.opentimestamps.org",
+    "https://alice.btc.calendar.opentimestamps.org",
+    "https://bob.btc.calendar.opentimestamps.org",
+    "https://finney.calendar.eternitywall.com",
+]
+
+# ---- automatic upgrading
+#
+# anchor.py stamps and walks away, which is how 767 proofs ended up pending.
+# This finishes the job on a timer so nobody has to remember to.
+#
+# The calendars are free public infrastructure run by volunteers. Firing 767
+# requests at them in one go would be rude and would probably get us rate
+# limited, so this works in small batches, oldest first, and skips anything
+# too young to have confirmed yet, and anything already confirmed. A backlog
+# clears over days rather than minutes, which is fine - nothing is lost by a
+# proof staying pending a little longer, and the stamp time is already fixed.
+AUTO_UPGRADE_ENABLED = os.environ.get("OTS_AUTO_UPGRADE", "1") == "1"
+AUTO_UPGRADE_INTERVAL = int(os.environ.get("OTS_UPGRADE_INTERVAL", "3600"))
+AUTO_UPGRADE_BATCH = int(os.environ.get("OTS_UPGRADE_BATCH", "20"))
+
+# A Bitcoin confirmation takes an hour or more, and the calendars aggregate
+# before they commit. Asking about a proof stamped ten minutes ago wastes a
+# request and gets a "not ready" every time.
+MIN_AGE_SECONDS = int(os.environ.get("OTS_MIN_AGE", "10800"))
+
+# Breathing room between calendar calls.
+CALENDAR_PAUSE = 0.5
+
+_auto = {"started": False, "runs": 0, "last_run": None, "last_result": None,
+         "upgraded_total": 0, "confirmed_total": 0}
+
+# Stamp ids already seen confirmed. A confirmed proof never goes back to
+# pending, so once seen it is never read or asked about again.
+_confirmed_seen = set()
+_file_lock = threading.Lock()
+
+
+def _read_index():
+    path = os.path.join(ANCHOR_DIR, "anchors.jsonl")
+    rows = []
+    if not os.path.exists(path):
+        return rows
+    try:
+        with open(path, "r") as handle:
+            for line in handle:
+                line = line.strip()
+                if line:
+                    try:
+                        rows.append(json.loads(line))
+                    except ValueError:
+                        continue
+    except Exception:
+        pass
+    return rows
+
+
+def _iso(ts):
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(ts)))
+    except Exception:
+        return None
+
+
+def _stamp_id(path):
+    if not path:
+        return None
+    name = os.path.basename(path)
+    if name.startswith("tip_") and name.endswith(".ots"):
+        return name[4:-4]
+    return None
+
+
+def _describe(raw):
+    """What is actually inside this proof. Never guesses."""
+    out = {"pending_calendars": [], "bitcoin_block_heights": [],
+           "state": "unknown", "read_error": None}
+    try:
+        from opentimestamps.core.serialize import BytesDeserializationContext
+        from opentimestamps.core.timestamp import DetachedTimestampFile
+        from opentimestamps.core.notary import (PendingAttestation,
+                                                BitcoinBlockHeaderAttestation)
+    except Exception as exc:
+        out["read_error"] = "opentimestamps library not available: %s" % exc
+        return out
+
+    try:
+        detached = DetachedTimestampFile.deserialize(
+            BytesDeserializationContext(raw))
+    except Exception as exc:
+        out["read_error"] = "could not parse proof: %s" % exc
+        out["state"] = "unreadable"
+        return out
+
+    def walk(timestamp):
+        for att in timestamp.attestations:
+            if isinstance(att, PendingAttestation):
+                uri = att.uri
+                if isinstance(uri, bytes):
+                    uri = uri.decode("utf-8", "replace")
+                if uri not in out["pending_calendars"]:
+                    out["pending_calendars"].append(uri)
+            elif isinstance(att, BitcoinBlockHeaderAttestation):
+                h = getattr(att, "height", None)
+                if h is not None and h not in out["bitcoin_block_heights"]:
+                    out["bitcoin_block_heights"].append(h)
+        for _, sub in timestamp.ops.items():
+            walk(sub)
+
+    try:
+        walk(detached.timestamp)
+    except Exception as exc:
+        out["read_error"] = "could not walk proof: %s" % exc
+        return out
+
+    if out["bitcoin_block_heights"]:
+        out["state"] = "confirmed"
+        out["means"] = ("Committed in Bitcoin block %s. Verifiable against "
+                        "the blockchain by anyone, with nothing from us."
+                        % ", ".join(str(h) for h in out["bitcoin_block_heights"]))
+    elif out["pending_calendars"]:
+        out["state"] = "pending"
+        out["means"] = ("A calendar has accepted this digest and promised to "
+                        "commit it to Bitcoin. NOT yet evidence of anything "
+                        "on chain. Upgrade it once the transaction confirms.")
+    else:
+        out["state"] = "empty"
+        out["means"] = "No attestations found in this proof."
+    return out
+
+
+def _proof_bytes(stamp_id):
+    path = os.path.join(ANCHOR_DIR, "tip_%s.ots" % stamp_id)
+    if not os.path.exists(path):
+        return None, path, "no proof file at %s" % path
+    try:
+        if os.path.getsize(path) > MAX_PROOF_BYTES:
+            return None, path, "proof unexpectedly large"
+        with open(path, "rb") as handle:
+            return handle.read(), path, None
+    except Exception as exc:
+        return None, path, "could not read proof: %s" % exc
+
+
+def _tip_for(stamp_id):
+    try:
+        with open(os.path.join(ANCHOR_DIR, "tip_%s.txt" % stamp_id)) as h:
+            return h.read().strip()
+    except Exception:
+        return None
+
+
+def _is_confirmed(sid):
+    """True if this proof already carries a Bitcoin attestation."""
+    if sid in _confirmed_seen:
+        return True
+    raw, _p, _e = _proof_bytes(sid)
+    if raw is None:
+        return False
+    if _describe(raw)["state"] == "confirmed":
+        _confirmed_seen.add(sid)
+        return True
+    return False
+
+
+def _pending_candidates(limit=None):
+    """Stamps old enough to be worth asking about and not yet confirmed,
+    oldest first.
+
+    Oldest first on purpose: the oldest pending proofs are the ones most
+    likely to have confirmed, so a backlog clears from the far end rather
+    than the recent end. Already-confirmed proofs are skipped, otherwise
+    they would fill every batch forever.
+    """
+    now = time.time()
+    out = []
+    for row in _read_index():
+        if not row.get("ots"):
+            continue
+        sid = _stamp_id(row.get("ots_file"))
+        if not sid or not sid.isdigit():
+            continue
+        if now - float(sid) < MIN_AGE_SECONDS:
+            continue
+        if not os.path.exists(os.path.join(ANCHOR_DIR, "tip_%s.ots" % sid)):
+            continue
+        if _is_confirmed(sid):
+            continue
+        out.append(sid)
+        if limit is not None and len(out) >= limit:
+            break
+    return out
+
+
+def _pending_count():
+    return len(_pending_candidates())
+
+
+def _newest_pending(limit):
+    """Pending proofs old enough to have confirmed, NEWEST first. These are
+    the tips of the chain running today, the ones a verifier asks about."""
+    now = time.time()
+    out = []
+    for row in reversed(_read_index()):
+        if not row.get("ots"):
+            continue
+        sid = _stamp_id(row.get("ots_file"))
+        if not sid or not sid.isdigit():
+            continue
+        if now - float(sid) < MIN_AGE_SECONDS:
+            continue
+        if not os.path.exists(os.path.join(ANCHOR_DIR, "tip_%s.ots" % sid)):
+            continue
+        if _is_confirmed(sid):
+            continue
+        out.append(sid)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _tip_in_chain(tip, ctx):
+    conn, lock = (ctx or {}).get("conn"), (ctx or {}).get("lock")
+    if conn is None or lock is None or not tip:
+        return None
+    try:
+        with lock:
+            r = conn.execute("SELECT id FROM audit_log WHERE audit_hash = ?",
+                             (tip,)).fetchone()
+        return r[0] if r else False
+    except Exception:
+        return None
+
+
+LATEST_SCAN = 500
+
+
+def _latest_confirmed(ctx):
+    """The newest proof that is confirmed in Bitcoin and whose tip is a
+    block in the chain running now. Checked in that order, newest first."""
+    rows = [r for r in reversed(_read_index()) if r.get("ots")]
+    looked = 0
+    for row in rows[:LATEST_SCAN]:
+        sid = _stamp_id(row.get("ots_file"))
+        if not sid or not sid.isdigit():
+            continue
+        looked += 1
+        raw, _p, _e = _proof_bytes(sid)
+        if raw is None:
+            continue
+        d = _describe(raw)
+        if d["state"] != "confirmed":
+            continue
+        _confirmed_seen.add(sid)
+        tip = (_tip_for(sid) or row.get("tip") or "").strip().lower()
+        block = _tip_in_chain(tip, ctx)
+        if block is False:
+            continue
+        out, status = _proof({"ts": sid})
+        if status != 200:
+            continue
+        out["tip_is_block"] = block
+        out["check_block"] = ("https://sebbi.pro/x/walk/block?index=%s" % block
+                              if block else None)
+        out["why_this_one"] = ("The newest proof that is confirmed in Bitcoin "
+                               "and whose tip is a block in the chain running "
+                               "now. Older confirmations of earlier chains are "
+                               "skipped, not hidden - they stay at /x/ots/list.")
+        return out, 200
+    return {"ok": False, "error": "no_confirmed_current_proof_yet",
+            "looked_at": looked,
+            "detail": "No proof of a current-chain tip has confirmed in Bitcoin "
+                      "yet. The upgrader works the newest end every hour, and "
+                      "a confirmation takes a few hours. Nothing is wrong; it "
+                      "is simply not there yet.",
+            "status": "https://sebbi.pro/x/ots/status"}, 404
+
+
+def _status():
+    rows = _read_index()
+    exists = os.path.isdir(ANCHOR_DIR)
+    files = []
+    if exists:
+        try:
+            files = [f for f in os.listdir(ANCHOR_DIR) if f.endswith(".ots")]
+        except Exception:
+            files = []
+
+    stamped = [r for r in rows if r.get("ots")]
+    out = {
+        "ok": True, "module": "ots", "version": VERSION,
+        "anchor_dir": ANCHOR_DIR,
+        "storage_present": exists,
+        "proof_files_on_disk": len(files),
+        "anchor_attempts_recorded": len(rows),
+        "stamped": len(stamped),
+        "failed": len(rows) - len(stamped),
+        "first_attempt": _iso(rows[0].get("ts")) if rows else None,
+        "last_attempt": _iso(rows[-1].get("ts")) if rows else None,
+    }
+
+    if not exists:
+        out["warning"] = (
+            "The anchor directory does not exist on this container. Either "
+            "no anchor has run, or no persistent volume is mounted at %s - "
+            "in which case every proof is lost on redeploy and the history "
+            "restarts silently. Check before calling this durable."
+            % ANCHOR_DIR)
+    elif len(files) < len(stamped):
+        out["warning"] = (
+            "%d successful stamps recorded but only %d proof files on disk. "
+            "Files have been lost, most likely to a redeploy without a "
+            "persistent volume." % (len(stamped), len(files)))
+
+    if stamped:
+        sid = _stamp_id(stamped[-1].get("ots_file"))
+        if sid:
+            raw, _p, err = _proof_bytes(sid)
+            if raw:
+                d = _describe(raw)
+                out["latest_proof"] = {
+                    "stamp_id": sid, "tip": stamped[-1].get("tip"),
+                    "stamped_at": _iso(stamped[-1].get("ts")),
+                    "state": d["state"],
+                    "bitcoin_block_heights": d["bitcoin_block_heights"],
+                    "pending_calendars": d["pending_calendars"],
+                    "means": d.get("means"),
+                    "read_error": d.get("read_error"),
+                }
+            else:
+                out["latest_proof"] = {"stamp_id": sid, "error": err}
+
+    out["auto_upgrade"] = {
+        "enabled": AUTO_UPGRADE_ENABLED,
+        "running": _auto["started"],
+        "every_seconds": AUTO_UPGRADE_INTERVAL,
+        "batch_size": AUTO_UPGRADE_BATCH,
+        "skips_proofs_under_hours": MIN_AGE_SECONDS // 3600,
+        "runs": _auto["runs"],
+        "last_run": _auto["last_run"],
+        "last_result": _auto["last_result"],
+        "upgraded_since_start": _auto["upgraded_total"],
+        "newly_confirmed_since_start": _auto["confirmed_total"],
+        "confirmed_seen": len(_confirmed_seen),
+        "pending_eligible_now": _pending_count(),
+        "note": ("Each run takes half its batch from the newest proofs and half "
+                 "from the oldest, skipping proofs already confirmed. The calendars are free infrastructure run by "
+                 "volunteers, so a backlog clears over days rather than "
+                 "minutes. Nothing is lost by a proof staying pending longer "
+                 "- the stamp time is already fixed."),
+    }
+
+    out["honest_note"] = (
+        "A proof written at stamping time is PENDING - a promise to commit "
+        "the digest to Bitcoin, not evidence that it has been. It becomes "
+        "confirmed only after being upgraded. The auto-upgrade does that on "
+        "a timer; until a proof is upgraded, pending is what it is.")
+    return out, 200
+
+
+def _list(data):
+    rows = _read_index()
+    try:
+        limit = min(int(data.get("limit", 50)), 500)
+    except (TypeError, ValueError):
+        limit = 50
+
+    out = []
+    for row in list(reversed(rows))[:limit]:
+        sid = _stamp_id(row.get("ots_file"))
+        entry = {"stamp_id": sid, "tip": row.get("tip"),
+                 "stamped_at": _iso(row.get("ts")),
+                 "ots_written": bool(row.get("ots")),
+                 "note": row.get("note")}
+        if sid:
+            entry["proof_on_disk"] = os.path.exists(
+                os.path.join(ANCHOR_DIR, "tip_%s.ots" % sid))
+            entry["proof"] = "https://sebbi.pro/x/ots/proof?ts=%s" % sid
+        out.append(entry)
+
+    return {"ok": True, "count": len(out), "anchors": out,
+            "note": "Newest first. ots_written false is a recorded failure, "
+                    "kept rather than hidden - a gap in anchoring is exactly "
+                    "what an auditor needs to see."}, 200
+
+
+def _proof(data):
+    stamp_id = str(data.get("ts") or data.get("stamp_id") or "").strip()
+    tip = str(data.get("tip") or "").strip().lower()
+
+    if not stamp_id and tip:
+        for row in reversed(_read_index()):
+            if str(row.get("tip", "")).lower() == tip and row.get("ots_file"):
+                stamp_id = _stamp_id(row.get("ots_file"))
+                break
+        if not stamp_id:
+            return {"ok": False, "error": "no_proof_for_tip", "tip": tip,
+                    "detail": "No successful stamp recorded for that tip. "
+                              "https://sebbi.pro/x/ots/list shows every "
+                              "attempt."}, 404
+
+    if not stamp_id:
+        return {"ok": False, "error": "ts_or_tip_required",
+                "detail": "?ts=<stamp_id> or ?tip=<64 hex>. Ids at "
+                          "https://sebbi.pro/x/ots/list"}, 400
+    if not stamp_id.isdigit():
+        return {"ok": False, "error": "bad_stamp_id"}, 400
+
+    raw, _path, err = _proof_bytes(stamp_id)
+    if raw is None:
+        return {"ok": False, "error": "proof_unavailable",
+                "detail": err, "stamp_id": stamp_id}, 404
+
+    d = _describe(raw)
+    recorded_tip = _tip_for(stamp_id)
+    return {
+        "ok": True, "stamp_id": stamp_id, "stamped_at": _iso(stamp_id),
+        "tip": recorded_tip, "digest_sha256": recorded_tip,
+        "proof_bytes": len(raw),
+        "proof_sha256": hashlib.sha256(raw).hexdigest(),
+        "ots_base64": base64.b64encode(raw).decode("ascii"),
+        "state": d["state"],
+        "bitcoin_block_heights": d["bitcoin_block_heights"],
+        "pending_calendars": d["pending_calendars"],
+        "means": d.get("means"), "read_error": d.get("read_error"),
+        "how_to_verify": {
+            "1": "base64 -d the ots_base64 field into tip.ots",
+            "2": "printf '%s' <tip> | xxd -r -p > tip.bin",
+            "3": "ots verify -f tip.bin tip.ots",
+            "4": "if pending: ots upgrade tip.ots",
+            "needs": "pip install opentimestamps-client. Nothing of ours.",
+        },
+        "note": "These are the bytes as written at stamping time, plus any "
+                "Bitcoin path added by upgrading. Nothing regenerated or "
+                "normalised.",
+    }, 200
+
+
+def _upgrade(data):
+    """Ask the calendars to complete pending proofs.
+
+    Upgrading only ADDS the path from the digest to a Bitcoin block. It
+    cannot change what was committed or when, which is why the standard
+    client overwrites the file too.
+    """
+    try:
+        from opentimestamps.calendar import RemoteCalendar
+        from opentimestamps.core.serialize import (BytesDeserializationContext,
+                                                   BytesSerializationContext)
+        from opentimestamps.core.timestamp import DetachedTimestampFile
+        from opentimestamps.core.notary import PendingAttestation
+    except Exception as exc:
+        return {"ok": False, "error": "library_unavailable", "detail": str(exc),
+                "fix": "add opentimestamps-client to requirements.txt"}, 501
+
+    try:
+        limit = min(int(data.get("limit", 25)), 200)
+    except (TypeError, ValueError):
+        limit = 25
+    only = str(data.get("ts") or "").strip()
+
+    auto = bool(data.get("auto"))
+
+    if auto:
+        # Half from the newest end (today's chain, what verifiers ask about),
+        # half from the oldest (the backlog). Never the same proof twice.
+        newest = _newest_pending(max(1, limit // 2))
+        oldest = [c for c in _pending_candidates(limit) if c not in newest]
+        candidates = newest + oldest[:max(0, limit - len(newest))]
+    elif only:
+        candidates = [only]
+    else:
+        # Manual run: newest first, which is what someone checking by hand
+        # usually wants to see.
+        candidates = [_stamp_id(r.get("ots_file"))
+                      for r in reversed(_read_index()) if r.get("ots")]
+        candidates = [c for c in candidates if c][:limit]
+
+    results = []
+    upgraded = newly_confirmed = already_confirmed = still_pending = errors = 0
+
+    for sid in candidates:
+        if not sid:
+            continue
+        with _file_lock:
+            raw, path, err = _proof_bytes(sid)
+            if raw is None:
+                results.append({"stamp_id": sid, "ok": False, "detail": err})
+                errors += 1
+                continue
+
+            before = _describe(raw)
+            if before["state"] == "confirmed":
+                _confirmed_seen.add(sid)
+                already_confirmed += 1
+                results.append({"stamp_id": sid, "ok": True,
+                                "state": "confirmed",
+                                "bitcoin_block_heights":
+                                    before["bitcoin_block_heights"],
+                                "action": "already complete, left alone"})
+                continue
+
+            try:
+                detached = DetachedTimestampFile.deserialize(
+                    BytesDeserializationContext(raw))
+            except Exception as exc:
+                results.append({"stamp_id": sid, "ok": False,
+                                "detail": "could not parse: %s" % exc})
+                errors += 1
+                continue
+
+            merged = [0]
+
+            def attempt(timestamp):
+                for att in list(timestamp.attestations):
+                    if not isinstance(att, PendingAttestation):
+                        continue
+                    uri = att.uri
+                    if isinstance(uri, bytes):
+                        uri = uri.decode("utf-8", "replace")
+                    if uri not in CALENDARS:
+                        continue
+                    try:
+                        completed = RemoteCalendar(uri).get_timestamp(
+                            timestamp.msg)
+                        timestamp.merge(completed)
+                        merged[0] += 1
+                    except Exception:
+                        # Not ready yet is the normal case, not an error.
+                        pass
+                    # Free volunteer-run infrastructure. Do not hammer it.
+                    time.sleep(CALENDAR_PAUSE)
+                for _, sub in list(timestamp.ops.items()):
+                    attempt(sub)
+
+            try:
+                attempt(detached.timestamp)
+            except Exception as exc:
+                results.append({"stamp_id": sid, "ok": False,
+                                "detail": "upgrade walk failed: %s" % exc})
+                errors += 1
+                continue
+
+            if merged[0] == 0:
+                still_pending += 1
+                results.append({"stamp_id": sid, "ok": True,
+                                "state": "pending",
+                                "action": "no calendar had it ready yet",
+                                "detail": "Normal. A Bitcoin confirmation "
+                                          "takes hours. Run again later."})
+                continue
+
+            try:
+                ctx = BytesSerializationContext()
+                detached.serialize(ctx)
+                new_bytes = ctx.getbytes()
+                tmp = path + ".tmp"
+                with open(tmp, "wb") as handle:
+                    handle.write(new_bytes)
+                os.replace(tmp, path)
+            except Exception as exc:
+                results.append({"stamp_id": sid, "ok": False,
+                                "detail": "upgraded but could not write: %s"
+                                          % exc})
+                errors += 1
+                continue
+
+        after = _describe(new_bytes)
+        upgraded += 1
+        if after["state"] == "confirmed":
+            _confirmed_seen.add(sid)
+            newly_confirmed += 1
+        results.append({"stamp_id": sid, "ok": True, "state": after["state"],
+                        "bitcoin_block_heights": after["bitcoin_block_heights"],
+                        "action": "upgraded, %d calendar response(s) merged"
+                                  % merged[0],
+                        "proof_bytes": len(new_bytes)})
+
+    return {"ok": True, "examined": len(results), "upgraded": upgraded,
+            "newly_confirmed": newly_confirmed,
+            "already_confirmed": already_confirmed,
+            "still_pending": still_pending,
+            "errors": errors, "results": results,
+            "note": "Upgrading only adds the path from digest to Bitcoin "
+                    "block. It cannot alter what was committed or when. "
+                    "Proofs not yet ready stay pending; nothing is lost by "
+                    "trying early."}, 200
+
+
+def _upgrade_loop():
+    """Finish what anchor.py starts. Quiet, slow, and never fatal."""
+    time.sleep(90)          # let the server come up
+    while True:
+        try:
+            result, _status_code = _upgrade({"limit": AUTO_UPGRADE_BATCH,
+                                             "auto": True})
+            _auto["runs"] += 1
+            _auto["last_run"] = _iso(time.time())
+            _auto["last_result"] = {
+                "examined": result.get("examined"),
+                "upgraded": result.get("upgraded"),
+                "newly_confirmed": result.get("newly_confirmed"),
+                "still_pending": result.get("still_pending"),
+                "errors": result.get("errors"),
+            }
+            _auto["upgraded_total"] += int(result.get("upgraded") or 0)
+            _auto["confirmed_total"] += int(result.get("newly_confirmed") or 0)
+            if result.get("upgraded"):
+                print("OTS: upgraded %s proof(s), %s newly confirmed"
+                      % (result.get("upgraded"),
+                         result.get("newly_confirmed")), flush=True)
+        except Exception as exc:
+            print("OTS upgrade loop error: %s" % exc, flush=True)
+        time.sleep(AUTO_UPGRADE_INTERVAL)
+
+
+def _start_auto():
+    if _auto["started"] or not AUTO_UPGRADE_ENABLED:
+        return
+    _auto["started"] = True
+    threading.Thread(target=_upgrade_loop, name="ots-upgrade",
+                     daemon=True).start()
+    print("OTS: auto-upgrade every %ds, %d per batch, skipping proofs under "
+          "%dh old and proofs already confirmed"
+          % (AUTO_UPGRADE_INTERVAL, AUTO_UPGRADE_BATCH,
+             MIN_AGE_SECONDS // 3600), flush=True)
+
+
+def _spec():
+    return {
+        "module": "ots", "version": VERSION,
+        "what": "Serves the OpenTimestamps proofs for the chain tip, and "
+                "upgrades pending ones to confirmed.",
+        "why": "anchor.py has stamped the tip hourly since July and nothing "
+               "served the proofs, so external anchoring was a claim rather "
+               "than something a third party could check.",
+        "pending_vs_confirmed": {
+            "pending": "Written when a calendar accepts the digest. A promise "
+                       "to commit it to Bitcoin. NOT evidence of anything on "
+                       "chain yet.",
+            "confirmed": "Carries the full path from digest to a Bitcoin "
+                         "block header. Verifiable by anyone against the "
+                         "blockchain, with nothing from us.",
+            "the_gap": "A proof does not become confirmed on its own. It must "
+                       "be upgraded - fetched again from the calendar after "
+                       "its transaction lands. This module does that on a "
+                       "timer, newest and oldest together, skipping ones "
+                       "already done.",
+        },
+        "routes": {
+            "status": "https://sebbi.pro/x/ots/status",
+            "list": "https://sebbi.pro/x/ots/list",
+            "proof": "https://sebbi.pro/x/ots/proof?ts=<stamp_id>",
+            "latest_confirmed": "https://sebbi.pro/x/ots/latest_confirmed",
+            "spec": "https://sebbi.pro/x/ots/spec",
+            "upgrade": "POST, keyed. asks the calendars to complete pending "
+                       "proofs.",
+        },
+        "verifying_without_us": [
+            "base64 -d the ots_base64 field into tip.ots",
+            "printf '%s' <tip> | xxd -r -p > tip.bin",
+            "ots verify -f tip.bin tip.ots",
+            "pip install opentimestamps-client - no code of ours involved",
+        ],
+        "what_this_does_not_prove": [
+            "That the records under the tip are true. It fixes when a hash "
+            "existed, nothing else.",
+            "Anything about blocks sealed since the last anchor. Anchoring is "
+            "hourly, so the most recent hour rests on peer witnessing.",
+            "That a pending proof will confirm. Calendars are free public "
+            "infrastructure and can fail.",
+        ],
+        "storage_warning": "Proofs live at %s. On Railway that is only "
+                           "durable with a persistent volume mounted there. "
+                           "https://sebbi.pro/x/ots/status reports what is "
+                           "present." % ANCHOR_DIR,
+    }
+
+
+try:
+    _start_auto()
+except Exception as exc:
+    print("OTS: could not start auto-upgrade: %s" % exc, flush=True)
+
+
+def handle(method, action, data, api_key, ctx):
+    data = data or {}
+    if action == "spec":
+        return _spec(), 200
+    if action in ("status", ""):
+        return _status()
+    if action == "list":
+        return _list(data)
+    if action == "proof":
+        return _proof(data)
+    if action == "latest_confirmed":
+        return _latest_confirmed(ctx)
+    if action == "upgrade":
+        if not api_key:
+            return {"ok": False, "error": "api_key_required"}, 401
+        return _upgrade(data)
+    return {"ok": False, "error": "unknown_action", "action": action}, 404
+
+```
+
+
+## `modules/oversight.py`
+
+249 lines, 11339 bytes
+
+```python
+"""
+Human oversight notary - /x/oversight/<action>
+
+THE PROBLEM
+-----------
+Nobody can prove a person thought about a decision. That is an internal state
+and no amount of logging reaches it. Any vendor claiming to prove genuine
+human oversight is overselling.
+
+But rubber stamping is not an internal state. It is a pattern, and patterns
+leave marks - if you record the right things, in the right order, at the time.
+
+WHAT THIS DOES
+--------------
+Three things, none of which claim to read minds.
+
+1. ORDER. The reviewer's own call is sealed BEFORE the machine's verdict is
+   revealed to them. Two blocks, in that order, in a chain that cannot be
+   reordered afterwards. So a reviewer cannot have simply agreed with an
+   answer they had already seen - the chain shows they committed while it was
+   still hidden.
+
+2. ATTENTION. The gap between opening the case and committing is recorded.
+   A 0.8 second approval sits in the record permanently, next to a two minute
+   one. Not proof of thought - but a 400-case history of sub-second calls is
+   not something anyone can explain away.
+
+3. INDEPENDENCE. Agreement rate over time. A reviewer who has never once
+   diverged from the machine is visible in the data. One who diverges
+   sometimes is demonstrably exercising judgement.
+
+WHAT IT DOES NOT DO
+-------------------
+- It cannot prove the reviewer read the material. They can leave a screen open.
+- Dwell time is measurable but gameable by anyone deliberately gaming it.
+- It does not stop a reviewer being wrong. It records that they decided.
+- If the integrating system shows its user the machine verdict before calling
+  /open, this proves nothing. The ordering guarantee is only as good as the
+  integration honouring it. That is a documented limit, not a hidden one.
+
+WHAT IT IS FOR
+--------------
+Turning "we have human oversight" from an assertion into a dataset that an
+auditor can test - and that a rubber stamper cannot hide inside.
+
+    POST /x/oversight/open      case_ref, material, machine_verdict, reviewer
+    POST /x/oversight/commit    case_id, reviewer_verdict, reasoning
+    GET  /x/oversight/case?id=OVS-XXXXXXXX
+    GET  /x/oversight/reviewer?id=<reviewer id>
+    GET  /x/oversight/list
+"""
+
+import hashlib, json, secrets, time
+from datetime import datetime, timezone
+
+VERSION = "1.0"
+VERDICTS = {"allow", "block", "challenge", "escalate"}
+
+_ready = False
+
+
+def _setup(ctx):
+    global _ready
+    if _ready:
+        return
+    with ctx["lock"]:
+        ctx["conn"].execute("CREATE TABLE IF NOT EXISTS oversight_cases(case_id TEXT PRIMARY KEY,api_key TEXT,case_ref TEXT,reviewer TEXT,material_hash TEXT,machine_verdict TEXT,opened REAL,committed REAL,reviewer_verdict TEXT,agreed INTEGER,dwell REAL,status TEXT DEFAULT 'open')")
+        ctx["conn"].execute("CREATE INDEX IF NOT EXISTS idx_ovs_key ON oversight_cases(api_key)")
+        ctx["conn"].execute("CREATE INDEX IF NOT EXISTS idx_ovs_rev ON oversight_cases(api_key,reviewer)")
+        ctx["conn"].commit()
+    _ready = True
+
+
+def _iso(ts):
+    if not ts:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+def _hash(x):
+    if not isinstance(x, str):
+        x = json.dumps(x, sort_keys=True)
+    return hashlib.sha256(x.encode()).hexdigest()
+
+
+def _seal_event(ctx, api_key, cid, action, detail):
+    ts = time.time()
+    ev = {"user_id": "ovs:" + cid, "action": "oversight_" + action, "amount": 0,
+          "country": "UK", "device_id": "oversight", "anomaly": 0, "device_risk": 0}
+    res = {"decision": "OVERSIGHT_SEALED", "score": 0, "oversight_action": action,
+           "oversight_version": VERSION, "timestamp": ts, "detail": detail}
+    h, idx, seq = ctx["seal"](ev, res, ts, api_key)
+    return h, idx, seq, ts
+
+
+def _open(ctx, api_key, data):
+    ref = str(data.get("case_ref", "")).strip()
+    if not ref:
+        return {"error": "case_ref_required"}, 400
+    reviewer = str(data.get("reviewer", "")).strip()
+    if not reviewer:
+        return {"error": "reviewer_required",
+                "message": "Oversight without a named reviewer is not oversight."}, 400
+    material = data.get("material")
+    if material is None:
+        return {"error": "material_required",
+                "message": "Send exactly what the reviewer will see. Only its hash is stored."}, 400
+    mv = str(data.get("machine_verdict", "")).strip().lower()
+    if mv and mv not in VERDICTS:
+        return {"error": "invalid_machine_verdict", "allowed": sorted(VERDICTS)}, 400
+
+    cid = "OVS-" + secrets.token_hex(4).upper()
+    mh = _hash(material)
+    detail = ("ref=" + ref[:80] + ";reviewer=" + reviewer[:60] +
+              ";material_sha256=" + mh + ";machine_verdict_sealed=" + (mv or "none"))
+    h, idx, seq, ts = _seal_event(ctx, api_key, cid, "opened", detail)
+
+    with ctx["lock"]:
+        ctx["conn"].execute("INSERT INTO oversight_cases(case_id,api_key,case_ref,reviewer,material_hash,machine_verdict,opened,committed,reviewer_verdict,agreed,dwell,status) VALUES(?,?,?,?,?,?,?,NULL,NULL,NULL,NULL,'open')",
+                            (cid, api_key, ref, reviewer, mh, mv or None, ts))
+        ctx["conn"].commit()
+
+    return {"case_id": cid, "opened": _iso(ts), "material_sha256": mh,
+            "audit_hash": h, "block_index": idx, "receipt_seq": seq,
+            "machine_verdict": "withheld until commit",
+            "message": "Clock running. Show the reviewer the material, not the verdict."}, 200
+
+
+def _commit(ctx, api_key, data):
+    cid = str(data.get("case_id", "")).strip()
+    with ctx["lock"]:
+        row = ctx["conn"].execute("SELECT reviewer,material_hash,machine_verdict,opened,status FROM oversight_cases WHERE case_id=? AND api_key=?", (cid, api_key)).fetchone()
+    if not row:
+        return {"error": "unknown_case_id"}, 404
+    if row[4] != "open":
+        return {"error": "already_committed",
+                "message": "A reviewer commits once. That is the point."}, 400
+
+    rv = str(data.get("reviewer_verdict", "")).strip().lower()
+    if rv not in VERDICTS:
+        return {"error": "invalid_reviewer_verdict", "allowed": sorted(VERDICTS)}, 400
+    reasoning = str(data.get("reasoning", "")).strip()
+    if not reasoning:
+        return {"error": "reasoning_required",
+                "message": "Sealed at commit, before the machine verdict is revealed. Blank is not permitted."}, 400
+
+    ts = time.time()
+    dwell = round(ts - row[3], 3)
+    agreed = None if not row[2] else (1 if rv == row[2] else 0)
+    detail = ("reviewer_verdict=" + rv + ";dwell_seconds=" + str(dwell) +
+              ";reasoning=" + reasoning[:600])
+    h, idx, seq, _x = _seal_event(ctx, api_key, cid, "committed", detail)
+
+    with ctx["lock"]:
+        ctx["conn"].execute("UPDATE oversight_cases SET committed=?,reviewer_verdict=?,agreed=?,dwell=?,status='committed' WHERE case_id=? AND api_key=?",
+                            (ts, rv, agreed, dwell, cid, api_key))
+        ctx["conn"].commit()
+
+    out = {"case_id": cid, "reviewer_verdict": rv, "dwell_seconds": dwell,
+           "audit_hash": h, "block_index": idx, "receipt_seq": seq,
+           "machine_verdict": row[2],
+           "note": "Your call was sealed before this line was returned. The chain shows the order."}
+    if agreed is not None:
+        out["agreed"] = bool(agreed)
+    if dwell < 2:
+        out["flag"] = "committed in under 2 seconds - recorded permanently"
+    return out, 200
+
+
+def _case(ctx, api_key, cid):
+    with ctx["lock"]:
+        row = ctx["conn"].execute("SELECT case_ref,reviewer,material_hash,machine_verdict,opened,committed,reviewer_verdict,agreed,dwell,status FROM oversight_cases WHERE case_id=? AND api_key=?", (cid, api_key)).fetchone()
+        if not row:
+            return {"error": "unknown_case_id"}, 404
+        blocks = ctx["conn"].execute("SELECT ts,result_json,audit_hash,key_seq FROM audit_log WHERE user_id=? ORDER BY id ASC", ("ovs:" + cid,)).fetchall()
+    events = []
+    for ts_, res, ah, seq in blocks:
+        try:
+            r = json.loads(res)
+            events.append({"at": _iso(ts_), "event": r.get("oversight_action"),
+                           "detail": r.get("detail"), "sealed": ah, "receipt_seq": seq})
+        except Exception:
+            pass
+    return {"case_id": cid, "case_ref": row[0], "reviewer": row[1],
+            "material_sha256": row[2], "machine_verdict": row[3],
+            "opened": _iso(row[4]), "committed": _iso(row[5]),
+            "reviewer_verdict": row[6],
+            "agreed": (None if row[7] is None else bool(row[7])),
+            "dwell_seconds": row[8], "status": row[9], "events": events,
+            "ordering_proof": "The opened block precedes the committed block in the chain. Neither can be reordered or altered without breaking every block after it."}, 200
+
+
+def _reviewer(ctx, api_key, rid):
+    with ctx["lock"]:
+        rows = ctx["conn"].execute("SELECT dwell,agreed FROM oversight_cases WHERE api_key=? AND reviewer=? AND status='committed'", (api_key, rid)).fetchall()
+    if not rows:
+        return {"reviewer": rid, "cases": 0,
+                "note": "No committed cases on record for this reviewer."}, 200
+    dwells = sorted(r[0] for r in rows if r[0] is not None)
+    scored = [r[1] for r in rows if r[1] is not None]
+    n = len(dwells)
+    median = dwells[n // 2] if n else None
+    under2 = len([d for d in dwells if d < 2])
+    out = {"reviewer": rid, "cases": len(rows),
+           "median_dwell_seconds": median,
+           "fastest_seconds": (dwells[0] if dwells else None),
+           "under_2_seconds": under2,
+           "under_2_seconds_pct": (round(100 * under2 / n, 1) if n else None)}
+    if scored:
+        agree = sum(scored)
+        out["agreement_rate_pct"] = round(100 * agree / len(scored), 1)
+        out["diverged"] = len(scored) - agree
+        if len(scored) >= 20 and agree == len(scored):
+            out["pattern"] = "never diverged from the machine across " + str(len(scored)) + " cases"
+    return out, 200
+
+
+def _list(ctx, api_key):
+    with ctx["lock"]:
+        rows = ctx["conn"].execute("SELECT case_id,case_ref,reviewer,opened,status,reviewer_verdict,dwell,agreed FROM oversight_cases WHERE api_key=? ORDER BY opened DESC LIMIT 200", (api_key,)).fetchall()
+    return {"count": len(rows),
+            "cases": [{"case_id": r[0], "case_ref": r[1], "reviewer": r[2],
+                       "opened": _iso(r[3]), "status": r[4],
+                       "reviewer_verdict": r[5], "dwell_seconds": r[6],
+                       "agreed": (None if r[7] is None else bool(r[7]))} for r in rows]}, 200
+
+
+def handle(method, action, data, api_key, ctx):
+    _setup(ctx)
+    if method == "POST":
+        if action == "open":
+            return _open(ctx, api_key, data)
+        if action == "commit":
+            return _commit(ctx, api_key, data)
+    else:
+        if action == "list":
+            return _list(ctx, api_key)
+        if action == "case":
+            cid = str(data.get("id", "")).strip()
+            if not cid:
+                return {"error": "id_required"}, 400
+            return _case(ctx, api_key, cid)
+        if action == "reviewer":
+            rid = str(data.get("id", "")).strip()
+            if not rid:
+                return {"error": "id_required"}, 400
+            return _reviewer(ctx, api_key, rid)
+    return {"error": "unknown_action", "action": action}, 404
+
+```
+
+
+## `modules/pack.py`
+
+501 lines, 20695 bytes
+
+```python
+"""
+Evidence pack - /x/pack/<action>
+
+WHAT THIS IS
+------------
+The sellable artifact. Everything else in this platform produces evidence;
+this produces the document someone hands an auditor.
+
+For a chosen period it does not summarise the chain, it RE-VERIFIES it:
+every block in the range is rehashed from its stored contents using the
+same function that sealed it, and compared to the hash recorded at the
+time. Then the links between blocks are walked, and for a single key the
+gapless receipt sequence is checked end to end.
+
+A summary is a claim. A re-verification is a check anyone can repeat.
+
+WHAT IT DOES NOT PROVE
+----------------------
+- That any decision recorded here was correct. Wrong answers seal just as
+  cleanly as right ones.
+- That an external peer's own chain is honest. That is checked at the
+  peer's host, not here.
+- Anything about periods outside the range requested.
+
+    GET  /x/pack/spec                        public - what this does
+    GET  /x/pack/preview?period=2026-Q2      keyed  - the pack as JSON
+    GET  /x/pack/render?period=2026-Q2       keyed  - the pack as one page
+    GET  /x/pack/history                     keyed  - packs issued
+    POST /x/pack/issue                       keyed  - seal it into the chain
+
+period accepts YYYY, YYYY-MM, YYYY-Qn. Add scope=me to limit the pack to
+your own key; omit scope for a deployment-wide pack.
+"""
+
+import calendar
+import datetime
+import hashlib
+import json
+import time
+
+VERSION = "1.0"
+
+# (METHOD, action). Only the spec is open - a pack is customer evidence.
+PUBLIC = {("GET", "spec")}
+
+MAX_ROWS = 200000
+
+_ready = False
+
+
+def _setup(ctx):
+    global _ready
+    if _ready:
+        return
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "CREATE TABLE IF NOT EXISTS pack_issued("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,"
+            "period TEXT,scope TEXT,digest TEXT,issued REAL,"
+            "entries INTEGER,verified INTEGER,mismatches INTEGER,"
+            "audit_hash TEXT,block_index INTEGER)")
+        ctx["conn"].execute(
+            "CREATE INDEX IF NOT EXISTS idx_pack_key "
+            "ON pack_issued(api_key)")
+        ctx["conn"].commit()
+    _ready = True
+
+
+def _sha(p):
+    """Identical to the engine's own sha(). Written out here rather than
+    imported so this module depends on no other module's internals."""
+    return hashlib.sha256(
+        json.dumps(p, sort_keys=True).encode()).hexdigest()
+
+
+def _iso(ts):
+    if ts is None:
+        return None
+    return datetime.datetime.utcfromtimestamp(
+        float(ts)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _day(ts):
+    if ts is None:
+        return None
+    return datetime.datetime.utcfromtimestamp(
+        float(ts)).strftime("%Y-%m-%d")
+
+
+def _epoch(y, m, d):
+    return float(calendar.timegm((y, m, d, 0, 0, 0, 0, 0, 0)))
+
+
+def _bounds(period):
+    """YYYY | YYYY-MM | YYYY-Qn -> (start, end, label)."""
+    p = str(period or "").strip().upper()
+    try:
+        if len(p) == 4:
+            y = int(p)
+            return _epoch(y, 1, 1), _epoch(y + 1, 1, 1), p
+        if len(p) == 7 and p[4] == "-" and p[5] == "Q":
+            y, q = int(p[:4]), int(p[6])
+            if q < 1 or q > 4:
+                return None
+            m = (q - 1) * 3 + 1
+            em, ey = m + 3, y
+            if em > 12:
+                em, ey = em - 12, y + 1
+            return _epoch(y, m, 1), _epoch(ey, em, 1), p
+        if len(p) == 7 and p[4] == "-":
+            y, m = int(p[:4]), int(p[5:])
+            em, ey = m + 1, y
+            if em > 12:
+                em, ey = 1, y + 1
+            return _epoch(y, m, 1), _epoch(ey, em, 1), p
+    except (ValueError, IndexError):
+        return None
+    return None
+
+
+# ----------------------------------------------------------------------
+# assembly - the actual re-verification
+# ----------------------------------------------------------------------
+
+def _assemble(ctx, start, end, label, scope):
+    c = ctx["conn"]
+    cols = ("id,ts,event_json,result_json,prev_hash,audit_hash,"
+            "api_key,key_seq")
+
+    with ctx["lock"]:
+        if scope:
+            rows = c.execute(
+                "SELECT " + cols + " FROM audit_log WHERE ts>=? AND ts<? "
+                "AND api_key=? ORDER BY id ASC LIMIT ?",
+                (start, end, scope, MAX_ROWS)).fetchall()
+            began = c.execute(
+                "SELECT MIN(ts) FROM audit_log WHERE api_key=?",
+                (scope,)).fetchone()
+            dev_all = c.execute(
+                "SELECT COUNT(*) FROM device_seen WHERE api_key=?",
+                (scope,)).fetchone()
+            dev_new = c.execute(
+                "SELECT COUNT(*) FROM device_seen WHERE api_key=? "
+                "AND first_seen>=? AND first_seen<?",
+                (scope, start, end)).fetchone()
+        else:
+            rows = c.execute(
+                "SELECT " + cols + " FROM audit_log WHERE ts>=? AND ts<? "
+                "ORDER BY id ASC LIMIT ?",
+                (start, end, MAX_ROWS)).fetchall()
+            began = c.execute("SELECT MIN(ts) FROM audit_log").fetchone()
+            dev_all = c.execute(
+                "SELECT COUNT(*) FROM device_seen").fetchone()
+            dev_new = c.execute(
+                "SELECT COUNT(*) FROM device_seen "
+                "WHERE first_seen>=? AND first_seen<?",
+                (start, end)).fetchone()
+        chain_total = c.execute(
+            "SELECT COUNT(*) FROM audit_log").fetchone()[0]
+
+    verdicts = {}
+    actions = {}
+    seqs = []
+    verified = 0
+    mismatched = []
+    link_breaks = []
+    expect_prev = None
+    per_day = {}
+
+    for rid, ts, ev_j, res_j, prev, ah, akey, kseq in rows:
+        try:
+            ev = json.loads(ev_j)
+            res = json.loads(res_j)
+        except Exception:
+            mismatched.append(rid)
+            expect_prev = ah
+            continue
+
+        if _sha({"prev_hash": prev, "ts": ts,
+                 "event": ev, "result": res}) == ah:
+            verified += 1
+        else:
+            mismatched.append(rid)
+
+        if expect_prev is not None and prev != expect_prev:
+            link_breaks.append(rid)
+        expect_prev = ah
+
+        d = str(res.get("decision", "UNRECORDED"))
+        verdicts[d] = verdicts.get(d, 0) + 1
+        a = str(ev.get("action", "unrecorded"))
+        actions[a] = actions.get(a, 0) + 1
+        if kseq is not None:
+            try:
+                seqs.append(int(kseq))
+            except (TypeError, ValueError):
+                pass
+        k = _day(ts)
+        per_day[k] = per_day.get(k, 0) + 1
+
+    # does the first block in the period chain to the one before it
+    entry_link = "no_entries_in_period"
+    if rows:
+        with ctx["lock"]:
+            before = c.execute(
+                "SELECT audit_hash FROM audit_log WHERE id<? "
+                "ORDER BY id DESC LIMIT 1", (rows[0][0],)).fetchone()
+        if before is None:
+            entry_link = ("intact_from_genesis"
+                          if rows[0][4] == "GENESIS" else "broken")
+        else:
+            entry_link = "intact" if rows[0][4] == before[0] else "broken"
+
+    seq = {"applicable": bool(scope and seqs)}
+    if seq["applicable"]:
+        lo, hi = min(seqs), max(seqs)
+        have = set(seqs)
+        missing = [n for n in range(lo, hi + 1) if n not in have]
+        seq.update({"first": lo, "last": hi, "received": len(seqs),
+                    "expected": hi - lo + 1,
+                    "missing": missing[:200],
+                    "gapless": not missing,
+                    "note": "Receipt numbers are issued with no gaps by "
+                            "construction. A missing number is a record "
+                            "that left this chain."})
+
+    clean = (not mismatched and not link_breaks
+             and entry_link in ("intact", "intact_from_genesis"))
+
+    p = {
+        "pack_version": VERSION,
+        "period": label,
+        "period_start": _iso(start),
+        "period_end": _iso(end),
+        "generated_at": _iso(time.time()),
+        "scope": ("key " + str(scope)[:12] + "\u2026") if scope
+                 else "deployment-wide",
+        "unbroken_since": _day(began[0] if began else None),
+        "entries_in_period": len(rows),
+        "chain_total_entries": chain_total,
+        "first_block": rows[0][0] if rows else None,
+        "first_hash": rows[0][5] if rows else None,
+        "last_block": rows[-1][0] if rows else None,
+        "last_hash": rows[-1][5] if rows else None,
+        "integrity": {
+            "clean": clean,
+            "blocks_recomputed": len(rows),
+            "hashes_verified": verified,
+            "hash_mismatches": mismatched[:50],
+            "link_breaks": link_breaks[:50],
+            "link_into_period": entry_link,
+            "method": "SHA-256 over {prev_hash, ts, event, result}, "
+                      "recomputed from the stored row and compared to "
+                      "the hash sealed at the time",
+        },
+        "receipt_sequence": seq,
+        "verdicts": verdicts,
+        "actions": dict(sorted(actions.items(), key=lambda x: -x[1])[:20]),
+        "devices": {"total_ever": dev_all[0] if dev_all else 0,
+                    "first_seen_in_period": dev_new[0] if dev_new else 0},
+        "busiest_days": [{"day": d, "entries": n} for d, n in
+                         sorted(per_day.items(), key=lambda x: -x[1])[:5]],
+        "check_this_yourself": {
+            "offline": "aileash_verify.py - stdlib only, no network",
+            "still_on_this_chain": "/x/consistency/ancestor?tip=<last_hash>",
+            "append_only": "/x/consistency/proof?first=&second=",
+            "record_included": "/x/complete/prove",
+            "who_witnessed_us": "/x/witness/peers",
+        },
+        "this_does_not_prove": [
+            "That any decision recorded here was correct.",
+            "That an external peer's own chain is honest - that is "
+            "checked at the peer's host, not here.",
+            "Anything about periods outside the dates above.",
+        ],
+    }
+    p["pack_digest"] = hashlib.sha256(
+        b"AILEASH-PACK-v1\x00" + json.dumps(
+            p, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return p
+
+
+# ----------------------------------------------------------------------
+# one page, self contained
+# ----------------------------------------------------------------------
+
+def _html(p):
+    ig = p["integrity"]
+    sq = p["receipt_sequence"]
+    good = "#7fe3b0"
+    bad = "#ff8a80"
+
+    def card(inner):
+        return ("<div style='background:#10182e;border:1px solid #223055;"
+                "border-radius:12px;padding:16px;margin-bottom:14px'>"
+                + inner + "</div>")
+
+    def row(k, v):
+        return ("<tr><td style='padding:7px 0;border-bottom:1px solid "
+                "#1d2a4a'>" + str(k) + "</td><td style='padding:7px 0;"
+                "border-bottom:1px solid #1d2a4a;text-align:right;"
+                "color:#c9a84c;font-weight:600'>" + str(v) + "</td></tr>")
+
+    def mono(v):
+        return ("<code style='font:12px ui-monospace,monospace;"
+                "color:#9fb3d9;word-break:break-all'>" + str(v)
+                + "</code>")
+
+    integ = ("<div style='font-size:26px;font-weight:600;color:"
+             + (good if ig["clean"] else bad) + "'>"
+             + str(ig["hashes_verified"]) + " of "
+             + str(ig["blocks_recomputed"]) + " blocks re-verified</div>"
+             "<div style='color:#93a0bd;font-size:13px;margin-top:6px'>"
+             + ig["method"] + "</div>")
+    if not ig["clean"]:
+        integ += ("<div style='color:" + bad + ";font-size:13px;"
+                  "margin-top:8px'>mismatched blocks "
+                  + str(ig["hash_mismatches"]) + " &middot; link breaks "
+                  + str(ig["link_breaks"]) + " &middot; entry link "
+                  + ig["link_into_period"] + "</div>")
+
+    if sq.get("applicable"):
+        seqbox = ("<div style='font-size:20px;font-weight:600;color:"
+                  + (good if sq["gapless"] else bad) + "'>"
+                  + ("Receipt sequence complete" if sq["gapless"]
+                     else "GAPS IN RECEIPT SEQUENCE") + "</div>"
+                  "<div style='color:#93a0bd;font-size:13px'>"
+                  + str(sq["received"]) + " of " + str(sq["expected"])
+                  + " received, numbers " + str(sq["first"]) + " to "
+                  + str(sq["last"]) + "</div>")
+        if not sq["gapless"]:
+            seqbox += ("<div style='color:" + bad + ";font:12px "
+                       "ui-monospace,monospace;margin-top:6px'>missing "
+                       + str(sq["missing"]) + "</div>")
+    else:
+        seqbox = ("<div style='color:#93a0bd;font-size:13px'>Receipt "
+                  "sequence applies to a single key. This pack is "
+                  "deployment-wide.</div>")
+
+    checks = "".join("<li><b>" + k.replace("_", " ") + "</b> " + mono(v)
+                     + "</li>" for k, v in
+                     p["check_this_yourself"].items())
+    nots = "".join("<li>" + x + "</li>" for x in p["this_does_not_prove"])
+
+    return (
+        "<!doctype html><meta charset=utf-8>"
+        "<meta name=viewport content='width=device-width,initial-scale=1'>"
+        "<title>Evidence Pack " + p["period"] + " - AILeash</title>"
+        "<body style='background:#0a0f1e;color:#e8ecf5;margin:0;"
+        "padding:22px;font:15px/1.55 -apple-system,system-ui,sans-serif'>"
+        "<div style='max-width:760px;margin:0 auto'>"
+        "<h1 style='font-size:21px;margin:0 0 4px;color:#c9a84c'>"
+        "Evidence Pack &mdash; " + p["period"] + "</h1>"
+        "<div style='color:#93a0bd;font-size:13px;margin-bottom:20px'>"
+        + p["scope"] + " &middot; " + str(p["period_start"]) + " to "
+        + str(p["period_end"]) + " &middot; generated "
+        + str(p["generated_at"]) + "</div>"
+        + card("<div style='color:#93a0bd;font-size:13px'>Unbroken since"
+               "</div><div style='font-size:26px;color:" + good
+               + ";font-weight:600'>" + str(p["unbroken_since"])
+               + "</div>")
+        + card(integ)
+        + card(seqbox)
+        + card("<table style='width:100%;border-collapse:collapse;"
+               "font-size:14px'>"
+               + row("Entries in period", p["entries_in_period"])
+               + row("Chain total entries", p["chain_total_entries"])
+               + row("Devices, total ever", p["devices"]["total_ever"])
+               + row("Devices first seen this period",
+                     p["devices"]["first_seen_in_period"])
+               + "".join(row(k, v) for k, v in sorted(
+                   p["verdicts"].items()))
+               + "".join(row(k, v) for k, v in p["actions"].items())
+               + "</table>")
+        + card("<div style='color:#93a0bd;font-size:13px'>First block</div>"
+               + mono("#" + str(p["first_block"]) + " "
+                      + str(p["first_hash"]))
+               + "<div style='color:#93a0bd;font-size:13px;margin-top:10px'>"
+                 "Last block</div>"
+               + mono("#" + str(p["last_block"]) + " "
+                      + str(p["last_hash"]))
+               + "<div style='color:#93a0bd;font-size:13px;margin-top:10px'>"
+                 "Pack digest</div>" + mono(p["pack_digest"]))
+        + card("<div style='color:#93a0bd;font-size:13px'>Check every "
+               "figure above yourself:</div><ul style='margin:6px 0 0 18px;"
+               "padding:0;font-size:13px'>" + checks + "</ul>"
+               "<div style='color:#93a0bd;font-size:13px;margin-top:14px'>"
+               "What this pack does not prove:</div>"
+               "<ul style='margin:6px 0 0 18px;padding:0;color:#93a0bd;"
+               "font-size:13px'>" + nots + "</ul>")
+        + "<div style='color:#6d7b99;font-size:12px;margin-top:18px'>"
+          "AILeash &middot; sebbi.pro</div></div>")
+
+
+# ----------------------------------------------------------------------
+
+def _resolve(data, api_key):
+    b = _bounds(data.get("period"))
+    if not b:
+        return None, ({"error": "period_required",
+                       "accepts": ["YYYY", "YYYY-MM", "YYYY-Qn"],
+                       "example": "/x/pack/preview?period=2026-Q2"}, 400)
+    start, end, label = b
+    if end > time.time():
+        return None, ({"error": "period_not_closed", "period": label,
+                       "message": "A pack can only cover a period that "
+                                  "has finished."}, 409)
+    scope = data.get("scope")
+    if scope == "me":
+        scope = api_key
+    return (start, end, label, scope or None), None
+
+
+def handle(method, action, data, api_key, ctx):
+    if action == "spec":
+        return {"module": "pack", "version": VERSION,
+                "purpose": "Re-verifies every block in a period against "
+                           "the hash sealed at the time, and checks the "
+                           "gapless receipt sequence for a single key.",
+                "periods": ["YYYY", "YYYY-MM", "YYYY-Qn"],
+                "routes": {"GET /x/pack/spec": "public",
+                           "GET /x/pack/preview?period=": "keyed, json",
+                           "GET /x/pack/render?period=": "keyed, one page",
+                           "GET /x/pack/history": "keyed",
+                           "POST /x/pack/issue": "keyed, seals the pack"},
+                "scope": "add scope=me for your key only; omit for "
+                         "deployment-wide",
+                "does_not_prove": [
+                    "That any decision recorded here was correct.",
+                    "That an external peer's chain is honest.",
+                ]}, 200
+
+    if not api_key:
+        return {"error": "invalid_api_key"}, 401
+
+    _setup(ctx)
+
+    if method == "GET":
+        if action == "history":
+            with ctx["lock"]:
+                rows = ctx["conn"].execute(
+                    "SELECT period,scope,digest,issued,entries,verified,"
+                    "mismatches,audit_hash,block_index FROM pack_issued "
+                    "WHERE api_key=? ORDER BY id DESC LIMIT 200",
+                    (api_key,)).fetchall()
+            return {"count": len(rows), "packs": [
+                {"period": r[0], "scope": r[1], "digest": r[2],
+                 "issued": _iso(r[3]), "entries": r[4],
+                 "hashes_verified": r[5], "mismatches": r[6],
+                 "sealed_in_chain": r[7], "block_index": r[8]}
+                for r in rows]}, 200
+
+        if action in ("preview", "render"):
+            got, err = _resolve(data, api_key)
+            if err:
+                return err
+            start, end, label, scope = got
+            p = _assemble(ctx, start, end, label, scope)
+            if action == "preview":
+                return p, 200
+            return {"period": label, "content_type": "text/html",
+                    "html": _html(p)}, 200
+
+    if method == "POST" and action == "issue":
+        got, err = _resolve(data, api_key)
+        if err:
+            return err
+        start, end, label, scope = got
+        p = _assemble(ctx, start, end, label, scope)
+        ig = p["integrity"]
+        ts = time.time()
+        ev = {"user_id": "pack:" + label, "action": "evidence_pack_issued",
+              "amount": 0, "country": "UK", "device_id": "pack",
+              "anomaly": 0, "device_risk": 0}
+        res = {"decision": "PACK_ISSUED", "score": 0, "pack_version": VERSION,
+               "timestamp": ts, "period": label, "scope": p["scope"],
+               "entries": p["entries_in_period"],
+               "blocks_recomputed": ig["blocks_recomputed"],
+               "hashes_verified": ig["hashes_verified"],
+               "clean": ig["clean"], "pack_digest": p["pack_digest"],
+               "note": "evidence pack issued; the pack's own digest is "
+                       "now sealed, so the document cannot be edited "
+                       "after the fact"}
+        h, idx, seq = ctx["seal"](ev, res, ts, api_key)
+        with ctx["lock"]:
+            ctx["conn"].execute(
+                "INSERT INTO pack_issued(api_key,period,scope,digest,"
+                "issued,entries,verified,mismatches,audit_hash,"
+                "block_index) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (api_key, label, p["scope"], p["pack_digest"], ts,
+                 p["entries_in_period"], ig["hashes_verified"],
+                 len(ig["hash_mismatches"]), h, idx))
+            ctx["conn"].commit()
+        p["sealed"] = {"audit_hash": h, "block_index": idx,
+                       "receipt_seq": seq}
+        return p, 200
+
+    return {"error": "unknown_action", "action": action,
+            "GET": ["spec", "preview", "render", "history"],
+            "POST": ["issue"]}, 404
+
+```
 
 
 ## `modules/packconsole.py`
@@ -435,2092 +2460,5 @@ def handle(method, action, data, api_key, ctx):
 
     return {"error": "unknown_action", "action": action,
             "GET": ["status"]}, 404
-
-```
-
-
-## `modules/packs.py`
-
-2079 lines, 80594 bytes
-
-```python
-"""
-Signal Packs - /x/packs/<action>
-
-WHAT THIS IS
-------------
-A public library of decision rules for the token saver, written by anyone,
-readable by anyone, runnable only through this engine.
-
-A pack is a JSON document. It contains no code. It contains conditions
-written over the nine signals the token saver already measures, and a
-verdict for each condition. Nothing in a pack can call anything, read
-anything, or reach anything. It is a list of thresholds and a list of
-answers, and that is all it will ever be.
-
-WHY IT IS BUILT THIS WAY
-------------------------
-Publishing is free and needs no account. Reading is free and needs no
-account. A pack can be forked, sealed, dated and proved to be yours
-without anyone paying anything.
-
-Running a pack needs a key.
-
-That split is deliberate and it is the whole commercial design. A pack on
-its own is a text file - it decides nothing, seals nothing and produces no
-receipt. The value is not in the thresholds. It is in what happens when
-they are executed: a measured request, a verdict, and a block in a hash
-chain that an outsider can verify without an account. That half cannot be
-copied out of the library because it is not in the library.
-
-So an author can build something genuinely theirs, publish it, prove they
-wrote it first, and have other people use it - and every one of those
-people arrives here to run it.
-
-WHAT A PACK LOOKS LIKE
-----------------------
-    {
-      "name": "Legal document review",
-      "author": "someone",
-      "version": "1.0.0",
-      "vertical": "legal",
-      "summary": "One line a buyer would understand.",
-      "rules": [
-        {"when": "loop_count >= 3 and not deterministic",
-         "then": "challenge",
-         "why": "A retried non-deterministic review is being paid for twice."},
-        {"when": "turns > 25 and tool_count == 0",
-         "then": "challenge",
-         "why": "Long review threads carry the whole document every call."}
-      ],
-      "default": "allow"
-    }
-
-Rules are tried in order. The first that matches decides. If none match,
-the pack's default decides.
-
-THE EXPRESSION LANGUAGE
------------------------
-Deliberately small. Comparisons, and, or, not, brackets, numbers, and the
-names below. No function calls, no attribute access, no assignment, no
-loops, no strings. It is parsed into a tree and walked; nothing is ever
-handed to eval, exec, or compile.
-
-Names available inside a rule:
-
-  the nine scored signals, each 0.0 to 1.0
-    exposure   worst case spend against the budget left
-    size       prompt characters, log scaled
-    ask        the output ceiling the caller authorised
-    depth      conversation turns
-    tools      tool definitions attached
-    loop       the same request going round again
-    burst      requests in the last sixty seconds
-    grind      requests in the last hour
-    novelty    first time this shape has been seen
-
-  the raw measurements the signals came from
-    chars, max_tokens, turns, tool_count,
-    loop_count, burst_count, grind_count
-
-  the engine's own overall score, 0.0 to 1.0
-    score
-
-  two flags
-    unattended      no human is watching this system
-    deterministic   temperature is zero, so the answer can be reused
-
-VERDICTS A RULE MAY RETURN
---------------------------
-    allow       send it to the model as asked
-    downgrade   small and simple enough for the cheap model
-    challenge   hold it for a person before spending
-    block       refuse it; it never reaches the model
-
-A pack can never return "serve". Serving from store is decided by whether
-an identical request has been answered before, which is a fact, not a
-policy, and no pack is allowed a say in it.
-
-WHAT A PACK CANNOT DO
----------------------
-- It cannot loosen a hard rule. If the token saver's own budget and
-  runaway rules fire, they fire. A pack runs after them and can only make
-  a decision stricter than the one the engine reached, never weaker.
-- It cannot see a prompt. Packs are evaluated against measurements, and on
-  the digest path the content never left the customer's building at all.
-- It cannot read or write anything. There is no I/O in the language.
-
-    GET  /x/packs/spec                    public  the language and the rules
-    GET  /x/packs/list                    public  browse the library
-    GET  /x/packs/get?id=                 public  one pack, whole
-    POST /x/packs/validate                public  parse it, no publishing
-    POST /x/packs/publish                 public  seal it into the chain
-    POST /x/packs/fork                    public  publish with a parent named
-    POST /x/packs/run                     KEYED   evaluate against a request
-    GET  /x/packs/status                  public  config, and arms /packs
-"""
-
-import hashlib
-import json
-import math
-import re
-import sys
-import time
-from datetime import datetime, timezone
-
-VERSION = "1.0.0"
-
-PUBLIC = {
-    ("GET", "spec"),
-    ("GET", "list"),
-    ("GET", "get"),
-    ("GET", "status"),
-    ("POST", "validate"),
-    ("POST", "publish"),
-    ("POST", "fork"),
-}
-
-# ---------------------------------------------------------------- limits
-
-MAX_RULES = 40
-MAX_EXPR_CHARS = 400
-MAX_TOKENS_PER_EXPR = 120
-MAX_NAME = 80
-MAX_SUMMARY = 240
-MAX_WHY = 300
-MAX_MANIFEST_BYTES = 32 * 1024
-LIST_LIMIT = 200
-
-VERDICTS = ("allow", "downgrade", "challenge", "block")
-
-# How strict each verdict is. A pack may raise this number, never lower it.
-STRICTNESS = {"allow": 0, "downgrade": 1, "challenge": 2, "block": 3}
-
-SIGNALS = ("exposure", "size", "ask", "depth", "tools",
-           "loop", "burst", "grind", "novelty")
-
-MEASURES = ("chars", "max_tokens", "turns", "tool_count",
-            "loop_count", "burst_count", "grind_count")
-
-FLAGS = ("unattended", "deterministic")
-
-NAMES = set(SIGNALS) | set(MEASURES) | set(FLAGS) | {"score"}
-
-VERTICALS = (
-    "legal", "medical", "support", "coding", "finance", "retail",
-    "education", "research", "translation", "moderation", "sales",
-    "recruitment", "logistics", "gaming", "media", "security",
-    "insurance", "property", "ecommerce", "public-sector", "general",
-)
-
-SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,63}$")
-SEMVER_RE = re.compile(r"^\d{1,3}\.\d{1,3}\.\d{1,4}$")
-
-
-# ---------------------------------------------------------------- helpers
-
-def _now():
-    return time.time()
-
-
-def _iso(ts):
-    if ts is None:
-        return None
-    try:
-        return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
-    except (TypeError, ValueError, OverflowError, OSError):
-        return None
-
-
-def _canonical(obj):
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
-                      ensure_ascii=True).encode("utf-8")
-
-
-def _digest(obj):
-    return hashlib.sha256(b"SEBBI-SIGNALPACK-v1\n" + _canonical(obj)).hexdigest()
-
-
-def _slug(name):
-    s = re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-")
-    return s[:64] or "pack"
-
-
-# ================================================================ language
-#
-# A tiny expression language, parsed by hand into a tuple tree and walked.
-# Nothing here reaches eval, exec or compile, and there is no syntax for
-# calling anything, so an untrusted pack cannot do anything but compare
-# numbers it was given.
-
-_TOKEN_RE = re.compile(r"""
-    \s*(?:
-        (?P<num>\d+(?:\.\d+)?)
-      | (?P<op>>=|<=|==|!=|>|<)
-      | (?P<lp>\()
-      | (?P<rp>\))
-      | (?P<word>[A-Za-z_][A-Za-z0-9_]*)
-    )
-""", re.VERBOSE)
-
-_WORD_OPS = {"and", "or", "not", "true", "false"}
-
-
-class PackError(ValueError):
-    """Anything wrong with a pack, reported to the author in plain words."""
-
-
-def _tokenise(src):
-    if len(src) > MAX_EXPR_CHARS:
-        raise PackError("expression is longer than %d characters"
-                        % MAX_EXPR_CHARS)
-    out = []
-    pos = 0
-    n = len(src)
-    while pos < n:
-        m = _TOKEN_RE.match(src, pos)
-        if not m or m.end() == m.start():
-            rest = src[pos:pos + 12]
-            raise PackError("cannot read %r - the language has numbers, "
-                            "names, brackets, and the operators "
-                            "> >= < <= == != and or not" % rest)
-        pos = m.end()
-        if m.group("num"):
-            out.append(("num", float(m.group("num"))))
-        elif m.group("op"):
-            out.append(("op", m.group("op")))
-        elif m.group("lp"):
-            out.append(("lp", "("))
-        elif m.group("rp"):
-            out.append(("rp", ")"))
-        else:
-            w = m.group("word")
-            lw = w.lower()
-            if lw in _WORD_OPS:
-                out.append(("kw", lw))
-            elif w in NAMES:
-                out.append(("name", w))
-            else:
-                raise PackError(
-                    "unknown name %r. Available: %s"
-                    % (w, ", ".join(sorted(NAMES))))
-        if len(out) > MAX_TOKENS_PER_EXPR:
-            raise PackError("expression has too many parts (limit %d)"
-                            % MAX_TOKENS_PER_EXPR)
-        if pos < n and src[pos:].strip() == "":
-            break
-    return out
-
-
-class _Parser:
-    def __init__(self, toks):
-        self.t = toks
-        self.i = 0
-
-    def peek(self):
-        return self.t[self.i] if self.i < len(self.t) else (None, None)
-
-    def take(self):
-        tok = self.peek()
-        self.i += 1
-        return tok
-
-    def expect(self, kind, val=None):
-        k, v = self.take()
-        if k != kind or (val is not None and v != val):
-            raise PackError("expected %s here" % (val or kind))
-        return v
-
-    def parse(self):
-        node = self.or_expr()
-        if self.i != len(self.t):
-            raise PackError("unexpected extra text at the end of the "
-                            "expression")
-        return node
-
-    def or_expr(self):
-        node = self.and_expr()
-        while self.peek() == ("kw", "or"):
-            self.take()
-            node = ("or", node, self.and_expr())
-        return node
-
-    def and_expr(self):
-        node = self.not_expr()
-        while self.peek() == ("kw", "and"):
-            self.take()
-            node = ("and", node, self.not_expr())
-        return node
-
-    def not_expr(self):
-        if self.peek() == ("kw", "not"):
-            self.take()
-            return ("not", self.not_expr())
-        return self.comparison()
-
-    def comparison(self):
-        left = self.primary()
-        k, v = self.peek()
-        if k == "op":
-            self.take()
-            right = self.primary()
-            return ("cmp", v, left, right)
-        return left
-
-    def primary(self):
-        k, v = self.take()
-        if k == "num":
-            return ("num", v)
-        if k == "name":
-            return ("name", v)
-        if k == "kw" and v in ("true", "false"):
-            return ("bool", v == "true")
-        if k == "kw" and v == "not":
-            return ("not", self.not_expr())
-        if k == "lp":
-            node = self.or_expr()
-            self.expect("rp")
-            return node
-        raise PackError("expected a number, a signal name, or a bracket")
-
-
-def compile_expr(src):
-    """Text to tree. Raises PackError with something an author can act on."""
-    if not isinstance(src, str) or not src.strip():
-        raise PackError("a rule needs a 'when' expression")
-    toks = _tokenise(src)
-    if not toks:
-        raise PackError("empty expression")
-    return _Parser(toks).parse()
-
-
-def _truth(v):
-    if isinstance(v, bool):
-        return v
-    return bool(v)
-
-
-def eval_expr(node, env):
-    """Walk the tree. No recursion into anything the pack controls."""
-    kind = node[0]
-    if kind == "num":
-        return node[1]
-    if kind == "bool":
-        return node[1]
-    if kind == "name":
-        return env.get(node[1], 0)
-    if kind == "not":
-        return not _truth(eval_expr(node[1], env))
-    if kind == "and":
-        return (_truth(eval_expr(node[1], env))
-                and _truth(eval_expr(node[2], env)))
-    if kind == "or":
-        return (_truth(eval_expr(node[1], env))
-                or _truth(eval_expr(node[2], env)))
-    if kind == "cmp":
-        op = node[1]
-        a = eval_expr(node[2], env)
-        b = eval_expr(node[3], env)
-        if isinstance(a, bool) or isinstance(b, bool):
-            a = 1 if a is True else 0 if a is False else a
-            b = 1 if b is True else 0 if b is False else b
-        try:
-            if op == ">":
-                return a > b
-            if op == ">=":
-                return a >= b
-            if op == "<":
-                return a < b
-            if op == "<=":
-                return a <= b
-            if op == "==":
-                return a == b
-            if op == "!=":
-                return a != b
-        except TypeError:
-            return False
-    raise PackError("unreadable expression")
-
-
-def _names_used(node, found=None):
-    """Which signals a rule actually reads. Used to draw the sigil."""
-    if found is None:
-        found = {}
-    kind = node[0]
-    if kind == "name":
-        found[node[1]] = found.get(node[1], 0) + 1
-    elif kind in ("not",):
-        _names_used(node[1], found)
-    elif kind in ("and", "or"):
-        _names_used(node[1], found)
-        _names_used(node[2], found)
-    elif kind == "cmp":
-        _names_used(node[2], found)
-        _names_used(node[3], found)
-    return found
-
-
-# ================================================================ manifest
-
-def validate(manifest):
-    """
-    Returns (clean_manifest, compiled_rules, profile).
-
-    Everything an author can get wrong is named in words they can act on,
-    because a library where publishing fails with 'invalid input' is a
-    library nobody publishes to.
-    """
-    if not isinstance(manifest, dict):
-        raise PackError("a pack is a JSON object")
-    if len(_canonical(manifest)) > MAX_MANIFEST_BYTES:
-        raise PackError("a pack must be under %d bytes" % MAX_MANIFEST_BYTES)
-
-    name = str(manifest.get("name") or "").strip()
-    if not name or len(name) > MAX_NAME:
-        raise PackError("name is required, up to %d characters" % MAX_NAME)
-
-    author = str(manifest.get("author") or "").strip()
-    if not author or len(author) > MAX_NAME:
-        raise PackError("author is required - a name, a domain or a handle")
-
-    version = str(manifest.get("version") or "1.0.0").strip()
-    if not SEMVER_RE.match(version):
-        raise PackError("version must look like 1.0.0")
-
-    summary = str(manifest.get("summary") or "").strip()
-    if len(summary) > MAX_SUMMARY:
-        raise PackError("summary must be under %d characters" % MAX_SUMMARY)
-
-    vertical = str(manifest.get("vertical") or "general").strip().lower()
-    if vertical not in VERTICALS:
-        raise PackError("vertical must be one of: %s" % ", ".join(VERTICALS))
-
-    default = str(manifest.get("default") or "allow").strip().lower()
-    if default not in VERDICTS:
-        raise PackError("default must be one of: %s" % ", ".join(VERDICTS))
-
-    rules = manifest.get("rules")
-    if not isinstance(rules, list) or not rules:
-        raise PackError("a pack needs at least one rule")
-    if len(rules) > MAX_RULES:
-        raise PackError("a pack may hold up to %d rules" % MAX_RULES)
-
-    clean_rules = []
-    compiled = []
-    usage = {}
-    for i, r in enumerate(rules):
-        if not isinstance(r, dict):
-            raise PackError("rule %d is not an object" % (i + 1))
-        when = r.get("when")
-        try:
-            tree = compile_expr(when)
-        except PackError as exc:
-            raise PackError("rule %d: %s" % (i + 1, exc))
-        then = str(r.get("then") or "").strip().lower()
-        if then not in VERDICTS:
-            raise PackError("rule %d: 'then' must be one of: %s"
-                            % (i + 1, ", ".join(VERDICTS)))
-        why = str(r.get("why") or "").strip()
-        if len(why) > MAX_WHY:
-            raise PackError("rule %d: 'why' must be under %d characters"
-                            % (i + 1, MAX_WHY))
-        if not why:
-            raise PackError("rule %d needs a 'why'. A verdict with no stated "
-                            "reason is the thing this whole platform exists "
-                            "to remove." % (i + 1))
-        clean_rules.append({"when": str(when).strip(), "then": then,
-                            "why": why})
-        compiled.append((tree, then, why))
-        for k, n in _names_used(tree).items():
-            usage[k] = usage.get(k, 0) + n
-
-    clean = {
-        "name": name,
-        "author": author,
-        "version": version,
-        "vertical": vertical,
-        "summary": summary,
-        "default": default,
-        "rules": clean_rules,
-    }
-    return clean, compiled, _profile(usage, clean_rules)
-
-
-def _profile(usage, rules):
-    """
-    The pack's signal fingerprint: how heavily it leans on each of the nine
-    signals, normalised to 0..1. Deterministic from the manifest, so the
-    same pack always draws the same sigil, and two packs that reason
-    differently never look alike.
-    """
-    raw = {}
-    for s in SIGNALS:
-        direct = usage.get(s, 0)
-        # A pack that reads a raw measure is leaning on that signal too.
-        kin = {"size": "chars", "ask": "max_tokens", "depth": "turns",
-               "tools": "tool_count", "loop": "loop_count",
-               "burst": "burst_count", "grind": "grind_count"}.get(s)
-        indirect = usage.get(kin, 0) if kin else 0
-        raw[s] = direct * 1.0 + indirect * 0.85
-    top = max(raw.values()) if raw else 0
-    prof = {s: (round(raw[s] / top, 3) if top else 0.0) for s in SIGNALS}
-    strict = max((STRICTNESS[r["then"]] for r in rules), default=0)
-    return {
-        "signals": prof,
-        "reads": sorted([s for s in SIGNALS if prof[s] > 0]),
-        "rule_count": len(rules),
-        "hardest_verdict": [k for k, v in STRICTNESS.items()
-                            if v == strict][0],
-        "note": "Each spoke is how heavily this pack leans on that signal. "
-                "Computed from the rules themselves, so the drawing is the "
-                "pack rather than a picture attached to it.",
-    }
-
-
-# ================================================================ evaluate
-
-def _env(measured, signals, score, unattended, deterministic):
-    env = {}
-    for s in SIGNALS:
-        try:
-            env[s] = float(signals.get(s, 0) or 0)
-        except (TypeError, ValueError):
-            env[s] = 0.0
-    env["score"] = float(score or 0)
-    env["chars"] = int(measured.get("prompt_characters", 0) or 0)
-    env["max_tokens"] = int(measured.get("authorised_output_tokens", 0) or 0)
-    env["turns"] = int(measured.get("conversation_turns", 0) or 0)
-    env["tool_count"] = int(measured.get("tool_definitions", 0) or 0)
-    env["loop_count"] = int(measured.get("loop_count", 0) or 0)
-    env["burst_count"] = int(measured.get("requests_in_last_60s", 0) or 0)
-    env["grind_count"] = int(measured.get("requests_in_last_hour", 0) or 0)
-    env["unattended"] = bool(unattended)
-    env["deterministic"] = bool(deterministic)
-    return env
-
-
-def apply_pack(compiled, default, env, engine_verdict):
-    """
-    Run the rules in order, first match wins.
-
-    A pack may only make the engine's own decision stricter. If the engine
-    already refused a request under a hard rule, a pack saying 'allow'
-    changes nothing - and the response says so rather than quietly
-    discarding it, because an author debugging a pack needs to see that
-    their rule fired and was capped.
-    """
-    fired = None
-    for idx, (tree, then, why) in enumerate(compiled):
-        try:
-            hit = _truth(eval_expr(tree, env))
-        except PackError:
-            hit = False
-        if hit:
-            fired = {"rule": idx + 1, "then": then, "why": why}
-            break
-
-    pack_verdict = fired["then"] if fired else default
-    base = STRICTNESS.get(engine_verdict, 0)
-    want = STRICTNESS.get(pack_verdict, 0)
-
-    if want >= base:
-        final = pack_verdict
-        capped = False
-    else:
-        final = engine_verdict
-        capped = True
-
-    return {
-        "engine_verdict": engine_verdict,
-        "pack_verdict": pack_verdict,
-        "verdict": final,
-        "matched_rule": fired,
-        "used_default": fired is None,
-        "capped_by_engine": capped,
-        "capping_note": (
-            "the pack asked for a weaker verdict than the engine had already "
-            "reached, so the engine's stands. A pack can only ever tighten."
-            if capped else None),
-    }
-
-
-# ================================================================ storage
-
-_ready = False
-
-
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        c = ctx["conn"]
-        c.execute(
-            "CREATE TABLE IF NOT EXISTS packs("
-            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
-            "pack_id TEXT UNIQUE,"
-            "slug TEXT,"
-            "name TEXT,"
-            "author TEXT,"
-            "version TEXT,"
-            "vertical TEXT,"
-            "summary TEXT,"
-            "manifest TEXT,"
-            "profile TEXT,"
-            "digest TEXT,"
-            "published REAL,"
-            "forked_from TEXT,"
-            "runs INTEGER NOT NULL DEFAULT 0,"
-            "audit_hash TEXT,"
-            "block_index INTEGER,"
-            "seeded INTEGER NOT NULL DEFAULT 0)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_packs_vert "
-                  "ON packs(vertical)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_packs_slug ON packs(slug)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_packs_dig ON packs(digest)")
-        c.commit()
-    _ready = True
-    _seed(ctx)
-
-
-def _pack_id(slug, version, digest):
-    return "%s@%s.%s" % (slug, version, digest[:8])
-
-
-def _row_to_pack(r, full=False):
-    out = {
-        "id": r[1],
-        "slug": r[2],
-        "name": r[3],
-        "author": r[4],
-        "version": r[5],
-        "vertical": r[6],
-        "summary": r[7],
-        "profile": json.loads(r[9]) if r[9] else None,
-        "digest": r[10],
-        "published": _iso(r[11]),
-        "forked_from": r[12],
-        "runs": r[13],
-        "sealed_in_chain": r[14],
-        "block_index": r[15],
-        "origin": "library seed" if r[16] else "published",
-    }
-    if full:
-        out["manifest"] = json.loads(r[8])
-    return out
-
-
-def _seal(ctx, event, result, api_key=None):
-    """Seal, tolerating whichever signature this deployment's seal has."""
-    ts = _now()
-    ev = {"user_id": "packs", "action": event, "amount": 0,
-          "country": "UK", "device_id": "packs", "anomaly": 0,
-          "device_risk": 0}
-    res = dict(result)
-    res.setdefault("decision", "PACK_EVENT")
-    res.setdefault("score", 0)
-    res.setdefault("timestamp", ts)
-    fn = ctx.get("seal")
-    if not fn:
-        return None, None, None
-    for call in (lambda: fn(ev, res, ts, api_key),
-                 lambda: fn(ev, res, ts),
-                 lambda: fn(ev, res)):
-        try:
-            out = call()
-        except TypeError:
-            continue
-        except Exception:                                    # noqa: BLE001
-            return None, None, None
-        if isinstance(out, (tuple, list)):
-            return (out[0] if len(out) > 0 else None,
-                    out[1] if len(out) > 1 else None,
-                    out[2] if len(out) > 2 else None)
-        if isinstance(out, dict):
-            return (out.get("audit_hash") or out.get("hash"),
-                    out.get("block_index"), out.get("key_seq"))
-        if isinstance(out, str):
-            return out, None, None
-    return None, None, None
-
-
-def _store(ctx, clean, profile, forked_from, api_key, seeded=False):
-    digest = _digest(clean)
-    slug = _slug(clean["name"])
-    pid = _pack_id(slug, clean["version"], digest)
-
-    with ctx["lock"]:
-        existing = ctx["conn"].execute(
-            "SELECT * FROM packs WHERE digest=?", (digest,)).fetchone()
-    if existing:
-        out = _row_to_pack(existing, full=True)
-        out["already_published"] = True
-        out["note"] = ("byte-for-byte identical to a pack already in the "
-                       "library, so the original stands. Change something "
-                       "or fork it under your own name.")
-        return out
-
-    h, idx, seq = _seal(ctx, "signalpack_published", {
-        "decision": "PACK_PUBLISHED",
-        "pack_id": pid, "name": clean["name"], "author": clean["author"],
-        "version": clean["version"], "vertical": clean["vertical"],
-        "rules": len(clean["rules"]), "digest": digest,
-        "forked_from": forked_from,
-        "note": "the pack's own digest is sealed, so the document cannot be "
-                "edited after this date without the digest changing",
-    }, api_key) if not seeded else _seal(ctx, "signalpack_seeded", {
-        "decision": "PACK_SEEDED", "pack_id": pid, "digest": digest,
-        "note": "library seed published by the deployment operator",
-    }, api_key)
-
-    now = _now()
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "INSERT OR IGNORE INTO packs(pack_id,slug,name,author,version,"
-            "vertical,summary,manifest,profile,digest,published,forked_from,"
-            "runs,audit_hash,block_index,seeded) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?)",
-            (pid, slug, clean["name"], clean["author"], clean["version"],
-             clean["vertical"], clean["summary"], json.dumps(clean),
-             json.dumps(profile), digest, now, forked_from, h, idx,
-             1 if seeded else 0))
-        ctx["conn"].commit()
-        row = ctx["conn"].execute(
-            "SELECT * FROM packs WHERE pack_id=?", (pid,)).fetchone()
-
-    out = _row_to_pack(row, full=True) if row else {"id": pid}
-    out["receipt_seq"] = seq
-    out["what_this_proves"] = (
-        "that this exact document existed at this position in the chain on "
-        "this date. It does not prove the rules are good ones.")
-    return out
-
-
-# ================================================================ the seeds
-#
-# Twenty packs so the library is not empty on the first day. They are
-# marked as seeds rather than passed off as community work, and they are
-# forkable like anything else. Every threshold in them is arguable - that
-# is the point of a library. Fork one and argue with it.
-
-SEEDS = [
-    {
-        "name": "Legal document review",
-        "author": "sebbi.pro",
-        "version": "1.0.0",
-        "vertical": "legal",
-        "summary": "Long clause-by-clause review threads carry the whole "
-                   "document on every call. This catches that before the bill "
-                   "does.",
-        "default": "allow",
-        "rules": [
-            {"when": "turns > 20 and chars > 40000",
-             "then": "challenge",
-             "why": "A twenty-turn review re-sending forty thousand "
-                    "characters is paying for the same contract on every "
-                    "question."},
-            {"when": "loop_count >= 3 and not deterministic",
-             "then": "challenge",
-             "why": "The same clause asked three times with temperature "
-                    "above zero cannot be reused, so it is bought again "
-                    "each time."},
-            {"when": "unattended and max_tokens > 4000",
-             "then": "block",
-             "why": "A four thousand token opinion generated with nobody "
-                    "reading it is a cost with no reader."},
-        ],
-    },
-    {
-        "name": "Clinical summarisation guard",
-        "author": "sebbi.pro",
-        "version": "1.0.0",
-        "vertical": "medical",
-        "summary": "Holds long unattended clinical generations for a person. "
-                   "Deliberately cautious rather than cheap.",
-        "default": "allow",
-        "rules": [
-            {"when": "unattended and max_tokens > 1500",
-             "then": "challenge",
-             "why": "Clinical text generated at length with no clinician "
-                    "watching should reach a person before it reaches a "
-                    "record."},
-            {"when": "turns > 30",
-             "then": "challenge",
-             "why": "A thirty-turn history is being re-sent whole on every "
-                    "call and is almost certainly carrying resolved "
-                    "episodes."},
-            {"when": "exposure > 0.7",
-             "then": "block",
-             "why": "One call about to consume most of the remaining budget "
-                    "stops here."},
-        ],
-    },
-    {
-        "name": "Support triage - high volume",
-        "author": "sebbi.pro",
-        "version": "1.0.0",
-        "vertical": "support",
-        "summary": "Built for inbox-shaped traffic: short, repetitive, and "
-                   "cheap when it is allowed to be.",
-        "default": "downgrade",
-        "rules": [
-            {"when": "loop_count >= 4",
-             "then": "block",
-             "why": "Four identical tickets in two minutes is a retry loop, "
-                    "not four customers."},
-            {"when": "chars < 2000 and turns <= 4 and tool_count == 0",
-             "then": "downgrade",
-             "why": "A short first-line reply does not need the expensive "
-                    "model."},
-            {"when": "burst_count > 60",
-             "then": "challenge",
-             "why": "Sixty requests a minute from one key is either a "
-                    "migration or a fault, and both want a person."},
-        ],
-    },
-    {
-        "name": "Coding agent leash",
-        "author": "sebbi.pro",
-        "version": "1.0.0",
-        "vertical": "coding",
-        "summary": "The pack for autonomous coding loops. Tight on repeats, "
-                   "hard on unattended runs.",
-        "default": "allow",
-        "rules": [
-            {"when": "unattended and loop_count >= 2",
-             "then": "block",
-             "why": "An agent retrying the same call with nobody watching is "
-                    "the most expensive failure mode there is."},
-            {"when": "tools > 0.6 and tool_count > 12",
-             "then": "challenge",
-             "why": "Twelve tool definitions on every call is a large fixed "
-                    "cost per step in a long loop."},
-            {"when": "grind_count > 400",
-             "then": "challenge",
-             "why": "Four hundred calls in an hour is a run that should be "
-                    "confirmed rather than assumed."},
-            {"when": "score > 0.7",
-             "then": "challenge",
-             "why": "The engine already rates this call as costly and "
-                    "repetitive."},
-        ],
-    },
-    {
-        "name": "Financial analysis desk",
-        "author": "sebbi.pro",
-        "version": "1.0.0",
-        "vertical": "finance",
-        "summary": "Protects a shared budget across a desk where any one "
-                   "analyst can spend it.",
-        "default": "allow",
-        "rules": [
-            {"when": "exposure > 0.5",
-             "then": "challenge",
-             "why": "One call reaching for half the remaining budget is a "
-                    "decision, not a request."},
-            {"when": "exposure > 0.85",
-             "then": "block",
-             "why": "Past this point a single call can empty the desk's "
-                    "budget."},
-            {"when": "max_tokens > 8000 and unattended",
-             "then": "block",
-             "why": "An eight thousand token report nobody asked to read."},
-        ],
-    },
-    {
-        "name": "Retail product copy",
-        "author": "sebbi.pro",
-        "version": "1.0.0",
-        "vertical": "retail",
-        "summary": "Catalogue generation at volume, where the same SKU gets "
-                   "asked for twice more often than anyone believes.",
-        "default": "downgrade",
-        "rules": [
-            {"when": "not deterministic and loop_count >= 2",
-             "then": "challenge",
-             "why": "Varied copy for the same product, generated twice, "
-                    "cannot be reused and is paid for twice."},
-            {"when": "chars < 3000 and max_tokens <= 800",
-             "then": "downgrade",
-             "why": "Short product copy is what the cheap model is for."},
-            {"when": "burst_count > 90",
-             "then": "block",
-             "why": "Ninety calls a minute against a catalogue is a runaway "
-                    "import."},
-        ],
-    },
-    {
-        "name": "Education marking assistant",
-        "author": "sebbi.pro",
-        "version": "1.0.0",
-        "vertical": "education",
-        "summary": "Batch marking runs unattended overnight. This is the "
-                   "pack that stops one bad loop eating a term's budget.",
-        "default": "allow",
-        "rules": [
-            {"when": "unattended and loop_count >= 3",
-             "then": "block",
-             "why": "The same script marked three times is a fault in the "
-                    "batch, not three submissions."},
-            {"when": "unattended and grind_count > 800",
-             "then": "challenge",
-             "why": "Eight hundred marks in an hour with nobody watching "
-                    "wants confirming before it continues."},
-            {"when": "turns > 12",
-             "then": "challenge",
-             "why": "Marking should not need a twelve-turn conversation; "
-                    "something is carrying context it does not need."},
-        ],
-    },
-    {
-        "name": "Research literature sweep",
-        "author": "sebbi.pro",
-        "version": "1.0.0",
-        "vertical": "research",
-        "summary": "Long context is the whole job here, so this pack is "
-                   "loose on size and tight on repetition.",
-        "default": "allow",
-        "rules": [
-            {"when": "loop_count >= 3",
-             "then": "challenge",
-             "why": "The same paper summarised three times in two minutes is "
-                    "a pipeline retrying, not new reading."},
-            {"when": "novelty == 0 and grind_count > 300",
-             "then": "challenge",
-             "why": "Three hundred calls of a shape already seen is a sweep "
-                    "that has stopped finding anything new."},
-        ],
-    },
-    {
-        "name": "Translation pipeline",
-        "author": "sebbi.pro",
-        "version": "1.0.0",
-        "vertical": "translation",
-        "summary": "Translation is the purest case for exact reuse: the same "
-                   "string, the same language pair, the same answer.",
-        "default": "downgrade",
-        "rules": [
-            {"when": "not deterministic",
-             "then": "challenge",
-             "why": "Temperature above zero on a translation blocks reuse for "
-                    "no benefit. The same string should give the same "
-                    "translation."},
-            {"when": "chars < 4000 and tool_count == 0",
-             "then": "downgrade",
-             "why": "Short segment translation does not need the expensive "
-                    "model."},
-            {"when": "loop_count >= 5",
-             "then": "block",
-             "why": "Five identical segments in two minutes is a stuck "
-                    "queue."},
-        ],
-    },
-    {
-        "name": "Content moderation queue",
-        "author": "sebbi.pro",
-        "version": "1.0.0",
-        "vertical": "moderation",
-        "summary": "High volume, low latency, and a hard floor under how "
-                   "cheap a decision is allowed to get.",
-        "default": "allow",
-        "rules": [
-            {"when": "burst_count > 100",
-             "then": "challenge",
-             "why": "A hundred moderation calls a minute is either a brigade "
-                    "or a loop."},
-            {"when": "unattended and max_tokens > 600",
-             "then": "challenge",
-             "why": "A moderation verdict should be short. Six hundred "
-                    "tokens suggests the model is being asked to write an "
-                    "essay nobody reads."},
-        ],
-    },
-    {
-        "name": "Sales outreach drafting",
-        "author": "sebbi.pro",
-        "version": "1.0.0",
-        "vertical": "sales",
-        "summary": "Personalised at the top, templated underneath. This "
-                   "catches the templated part being paid for at full price.",
-        "default": "downgrade",
-        "rules": [
-            {"when": "chars > 20000 and turns <= 3",
-             "then": "challenge",
-             "why": "Twenty thousand characters of context for a three-turn "
-                    "draft is a prompt carrying a library."},
-            {"when": "loop_count >= 4",
-             "then": "block",
-             "why": "The same outreach drafted four times is a queue "
-                    "repeating."},
-            {"when": "chars < 5000 and max_tokens <= 1000",
-             "then": "downgrade",
-             "why": "A short first-touch email is cheap-model work."},
-        ],
-    },
-    {
-        "name": "Recruitment screening",
-        "author": "sebbi.pro",
-        "version": "1.0.0",
-        "vertical": "recruitment",
-        "summary": "Screening runs at volume against long documents. Holds "
-                   "unattended bulk decisions for a person.",
-        "default": "allow",
-        "rules": [
-            {"when": "unattended and grind_count > 200",
-             "then": "challenge",
-             "why": "Two hundred screening decisions an hour with nobody "
-                    "watching is a process that should be confirmed."},
-            {"when": "turns > 15",
-             "then": "challenge",
-             "why": "Screening one candidate should not take fifteen turns "
-                    "of carried context."},
-            {"when": "loop_count >= 3",
-             "then": "block",
-             "why": "The same CV screened three times in two minutes."},
-        ],
-    },
-    {
-        "name": "Logistics exception handling",
-        "author": "sebbi.pro",
-        "version": "1.0.0",
-        "vertical": "logistics",
-        "summary": "Exceptions arrive in bursts when something goes wrong "
-                   "upstream. This tells a burst from a storm.",
-        "default": "allow",
-        "rules": [
-            {"when": "burst_count > 80 and loop_count >= 2",
-             "then": "block",
-             "why": "A burst of repeats is an upstream system retrying, and "
-                    "every retry is bought."},
-            {"when": "burst_count > 80",
-             "then": "challenge",
-             "why": "A genuine exception storm is worth a person seeing "
-                    "before it is worth paying for."},
-            {"when": "chars < 2500",
-             "then": "downgrade",
-             "why": "Most exception routing is short and structured."},
-        ],
-    },
-    {
-        "name": "Game NPC dialogue",
-        "author": "sebbi.pro",
-        "version": "1.0.0",
-        "vertical": "gaming",
-        "summary": "Variety is the product here, so this pack does not "
-                   "punish temperature. It punishes context bloat instead.",
-        "default": "allow",
-        "rules": [
-            {"when": "turns > 40",
-             "then": "challenge",
-             "why": "Forty turns of conversation history re-sent per line of "
-                    "dialogue is the whole session paid for on every line."},
-            {"when": "max_tokens > 500",
-             "then": "challenge",
-             "why": "NPC lines should be short. A five hundred token ceiling "
-                    "on a line of dialogue is an accident."},
-            {"when": "chars < 3000 and turns <= 10",
-             "then": "downgrade",
-             "why": "Short in-scene dialogue is cheap-model work."},
-        ],
-    },
-    {
-        "name": "Newsroom drafting",
-        "author": "sebbi.pro",
-        "version": "1.0.0",
-        "vertical": "media",
-        "summary": "Fast, long and deadline-driven. Tight on unattended, "
-                   "loose on size.",
-        "default": "allow",
-        "rules": [
-            {"when": "unattended and max_tokens > 3000",
-             "then": "block",
-             "why": "Three thousand tokens of copy generated with no editor "
-                    "attached."},
-            {"when": "loop_count >= 3 and not deterministic",
-             "then": "challenge",
-             "why": "Three regenerations of the same piece at temperature "
-                    "cannot be reused and are bought each time."},
-        ],
-    },
-    {
-        "name": "Security operations triage",
-        "author": "sebbi.pro",
-        "version": "1.0.0",
-        "vertical": "security",
-        "summary": "Alert volume is the enemy. This pack assumes the "
-                   "pipeline will misbehave before the analyst does.",
-        "default": "allow",
-        "rules": [
-            {"when": "loop_count >= 2 and unattended",
-             "then": "block",
-             "why": "A detection pipeline re-asking the same alert is a "
-                    "retry loop and every retry is billed."},
-            {"when": "burst_count > 120",
-             "then": "block",
-             "why": "A hundred and twenty alerts a minute is a flood, and "
-                    "paying a model per alert during a flood is how a "
-                    "budget disappears in an afternoon."},
-            {"when": "chars < 4000 and tool_count == 0",
-             "then": "downgrade",
-             "why": "Most alert enrichment is short and structured."},
-        ],
-    },
-    {
-        "name": "Insurance claims assistant",
-        "author": "sebbi.pro",
-        "version": "1.0.0",
-        "vertical": "insurance",
-        "summary": "Claims carry long histories and strict budgets. This "
-                   "watches both.",
-        "default": "allow",
-        "rules": [
-            {"when": "exposure > 0.6",
-             "then": "challenge",
-             "why": "One claim about to take most of the remaining budget."},
-            {"when": "turns > 25 and chars > 30000",
-             "then": "challenge",
-             "why": "The full claim file is being re-sent on every question."},
-            {"when": "unattended and max_tokens > 2000",
-             "then": "challenge",
-             "why": "A long unattended determination on a claim should reach "
-                    "a person first."},
-        ],
-    },
-    {
-        "name": "Property listing generation",
-        "author": "sebbi.pro",
-        "version": "1.0.0",
-        "vertical": "property",
-        "summary": "Listings are short, repetitive and generated in batches. "
-                   "The cheap model does most of this well.",
-        "default": "downgrade",
-        "rules": [
-            {"when": "loop_count >= 3",
-             "then": "block",
-             "why": "The same property written three times in two minutes is "
-                    "a batch repeating."},
-            {"when": "max_tokens > 1200",
-             "then": "challenge",
-             "why": "A listing longer than twelve hundred tokens is not a "
-                    "listing."},
-        ],
-    },
-    {
-        "name": "Ecommerce customer answers",
-        "author": "sebbi.pro",
-        "version": "1.0.0",
-        "vertical": "ecommerce",
-        "summary": "The same twenty questions, asked by thousands of people. "
-                   "Reuse is where the money is.",
-        "default": "downgrade",
-        "rules": [
-            {"when": "not deterministic",
-             "then": "challenge",
-             "why": "Temperature above zero on a delivery-times answer stops "
-                    "it being reused and buys the same answer again for "
-                    "every customer."},
-            {"when": "chars < 2500 and turns <= 3",
-             "then": "downgrade",
-             "why": "A stock answer to a stock question."},
-            {"when": "burst_count > 100",
-             "then": "challenge",
-             "why": "A hundred a minute is a promotion landing or a scraper "
-                    "arriving."},
-        ],
-    },
-    {
-        "name": "Public sector correspondence",
-        "author": "sebbi.pro",
-        "version": "1.0.0",
-        "vertical": "public-sector",
-        "summary": "Written for a fixed annual budget that cannot be topped "
-                   "up in March. Conservative by design.",
-        "default": "allow",
-        "rules": [
-            {"when": "exposure > 0.4",
-             "then": "challenge",
-             "why": "A budget that cannot be increased should be spent in "
-                    "deliberate steps, not in one call."},
-            {"when": "exposure > 0.75",
-             "then": "block",
-             "why": "Past this, a single call risks the remainder of the "
-                    "year."},
-            {"when": "unattended and loop_count >= 2",
-             "then": "block",
-             "why": "Unattended repetition against a fixed budget."},
-            {"when": "chars < 3000 and max_tokens <= 900",
-             "then": "downgrade",
-             "why": "Standard correspondence is cheap-model work."},
-        ],
-    },
-]
-
-
-def _seed(ctx):
-    """Publish the seeds once. Idempotent - the digest catches repeats."""
-    try:
-        with ctx["lock"]:
-            n = ctx["conn"].execute(
-                "SELECT COUNT(*) FROM packs WHERE seeded=1").fetchone()[0]
-        if n >= len(SEEDS):
-            return
-        for m in SEEDS:
-            try:
-                clean, compiled, profile = validate(m)
-                _store(ctx, clean, profile, None, None, seeded=True)
-            except Exception:                                # noqa: BLE001
-                continue
-    except Exception:                                        # noqa: BLE001
-        pass
-
-
-# ================================================================ the page
-#
-# THE SIGIL
-# ---------
-# Every pack draws itself. Nine spokes, one per signal, each as long as
-# that pack leans on that signal, joined into a shape and given a hue
-# derived from its own digest. Two packs that reason the same way look
-# alike; two that reason differently cannot be mistaken for each other.
-#
-# It is not decoration bolted onto a list. The drawing is computed from
-# the rules, so a pack that changes one threshold changes its own face.
-
-PAGE = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Signal Packs — the library</title>
-<meta name="description" content="A public library of decision packs for the
-token saver. Free to write, free to read, free to fork. Runs on the engine.">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,700;9..144,900&family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-:root{
-  --void:#05070d;
-  --deep:#0a0f1c;
-  --slab:#0e1524;
-  --slab-2:#131c30;
-  --edge:rgba(140,170,255,.14);
-  --edge-hot:rgba(201,168,76,.42);
-  --corona:#c9a84c;
-  --ice:#8fd3ff;
-  --text:#e9edf6;
-  --mute:rgba(233,237,246,.44);
-  --mute-2:rgba(233,237,246,.28);
-  --allow:#2fbf87;
-  --down:#4fa8d8;
-  --chal:#d8a13c;
-  --block:#e0574a;
-  --disp:Fraunces,Georgia,serif;
-  --mono:'IBM Plex Mono',ui-monospace,monospace;
-  --body:Inter,system-ui,-apple-system,sans-serif;
-}
-html{-webkit-text-size-adjust:100%}
-body{
-  background:var(--void);color:var(--text);font:16px/1.6 var(--body);
-  overflow-x:hidden;
-  background-image:
-    radial-gradient(120% 60% at 50% -10%,rgba(80,120,220,.18),transparent 60%),
-    radial-gradient(80% 40% at 50% 0%,rgba(201,168,76,.10),transparent 70%);
-  background-attachment:fixed;
-}
-.wrap{max-width:760px;margin:0 auto;padding:0 18px}
-a{color:var(--ice);text-decoration:none}
-a:hover{text-decoration:underline}
-:focus-visible{outline:2px solid var(--corona);outline-offset:3px}
-
-/* ---------- the eclipse ---------- */
-.sky{position:relative;padding:46px 0 34px;text-align:center;overflow:hidden}
-.eclipse{
-  position:relative;width:172px;height:172px;margin:0 auto 26px;
-}
-.eclipse .ring{
-  position:absolute;inset:0;border-radius:50%;
-  background:conic-gradient(from 0deg,
-    rgba(201,168,76,0) 0deg,
-    rgba(201,168,76,.85) 40deg,
-    rgba(143,211,255,.9) 120deg,
-    rgba(201,168,76,.55) 210deg,
-    rgba(201,168,76,0) 330deg);
-  filter:blur(7px);
-  animation:spin 34s linear infinite;
-}
-.eclipse .ring2{
-  position:absolute;inset:-16px;border-radius:50%;
-  background:conic-gradient(from 180deg,
-    rgba(143,211,255,0) 0deg,
-    rgba(143,211,255,.35) 90deg,
-    rgba(201,168,76,.25) 200deg,
-    rgba(143,211,255,0) 300deg);
-  filter:blur(20px);opacity:.75;
-  animation:spin 58s linear infinite reverse;
-}
-.eclipse .disc{
-  position:absolute;inset:9px;border-radius:50%;
-  background:radial-gradient(circle at 50% 45%,#0b1120,#05070d 70%);
-  box-shadow:0 0 0 1px rgba(201,168,76,.35),0 0 60px rgba(0,0,0,.9) inset;
-}
-.eclipse .glyph{
-  position:absolute;inset:0;display:grid;place-items:center;
-  font:600 10px/1 var(--mono);letter-spacing:.34em;color:var(--corona);
-  text-transform:uppercase;text-indent:.34em;
-}
-@keyframes spin{to{transform:rotate(360deg)}}
-@media(prefers-reduced-motion:reduce){.eclipse .ring,.eclipse .ring2{animation:none}}
-
-h1{font:900 clamp(32px,8.4vw,54px)/1.02 var(--disp);letter-spacing:-.025em}
-h1 em{font-style:normal;color:var(--corona)}
-.lede{color:var(--mute);font-size:16.5px;max-width:46ch;margin:16px auto 0}
-.lede b{color:var(--text);font-weight:600}
-
-.split{
-  display:flex;gap:0;justify-content:center;margin:26px auto 0;
-  border:1px solid var(--edge);border-radius:3px;max-width:520px;overflow:hidden;
-}
-.split div{flex:1;padding:13px 12px;font:500 12.5px/1.45 var(--mono)}
-.split div:first-child{border-right:1px solid var(--edge);
-  background:rgba(47,191,135,.07);color:#9fe6c6}
-.split div:last-child{background:rgba(201,168,76,.07);color:#e8cf8f}
-.split b{display:block;font:600 10px/1 var(--mono);letter-spacing:.2em;
-  text-transform:uppercase;color:var(--mute);margin-bottom:6px}
-
-/* ---------- controls ---------- */
-.bar{position:sticky;top:0;z-index:9;background:rgba(5,7,13,.92);
-  backdrop-filter:blur(9px);border-bottom:1px solid var(--edge);
-  padding:12px 0;margin-top:34px}
-.bar .wrap{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-input,select,textarea{
-  background:var(--slab);border:1px solid var(--edge);border-radius:3px;
-  color:var(--text);font:400 14px/1.5 var(--mono);padding:11px 12px;
-}
-input:focus,select:focus,textarea:focus{outline:none;border-color:var(--corona)}
-#q{flex:1 1 190px;min-width:0}
-select{flex:0 0 auto;max-width:46%}
-.count{font:500 11px/1 var(--mono);color:var(--mute);letter-spacing:.12em;
-  text-transform:uppercase;margin-left:auto}
-
-/* ---------- a slab ---------- */
-.shelf{padding:20px 0 10px}
-.slab{
-  border:1px solid var(--edge);border-radius:4px;background:var(--slab);
-  margin-bottom:12px;overflow:hidden;
-  transition:border-color .16s ease,transform .16s ease;
-}
-.slab:hover{border-color:var(--edge-hot)}
-.slab.open{border-color:var(--edge-hot);background:var(--slab-2)}
-.head{display:grid;grid-template-columns:74px 1fr;gap:14px;padding:14px;
-  cursor:pointer;align-items:center}
-.sig{width:74px;height:74px;display:block}
-.meta .nm{font:700 17.5px/1.25 var(--disp);letter-spacing:-.01em}
-.meta .by{font:400 11.5px/1.5 var(--mono);color:var(--mute);margin-top:3px;
-  word-break:break-all}
-.meta .sm{font-size:13.5px;color:var(--mute);margin-top:7px;line-height:1.5}
-.chips{display:flex;gap:5px;flex-wrap:wrap;margin-top:9px}
-.chip{font:500 10px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;
-  padding:4px 7px;border-radius:2px;border:1px solid var(--edge);
-  color:var(--mute)}
-.chip.v{color:#cfe0ff;border-color:rgba(140,170,255,.3)}
-.chip.allow{color:var(--allow);border-color:rgba(47,191,135,.35)}
-.chip.downgrade{color:var(--down);border-color:rgba(79,168,216,.35)}
-.chip.challenge{color:var(--chal);border-color:rgba(216,161,60,.35)}
-.chip.block{color:var(--block);border-color:rgba(224,87,74,.35)}
-
-.body{display:none;padding:0 14px 16px;border-top:1px solid var(--edge)}
-.slab.open .body{display:block}
-.rule{border-bottom:1px solid rgba(140,170,255,.08);padding:12px 0}
-.rule:last-child{border-bottom:none}
-.when{font:500 13px/1.6 var(--mono);color:#cfe0ff;word-break:break-word}
-.then{font:600 10.5px/1 var(--mono);letter-spacing:.16em;text-transform:uppercase;
-  margin:8px 0 6px;display:inline-block}
-.why{font-size:13.5px;color:var(--mute);line-height:1.55}
-.foot{display:flex;gap:14px;flex-wrap:wrap;padding-top:12px;
-  font:400 11px/1.5 var(--mono);color:var(--mute-2);word-break:break-all}
-.acts{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
-.btn{background:transparent;border:1px solid var(--edge);color:var(--text);
-  font:500 12.5px/1 var(--body);padding:10px 13px;border-radius:3px;
-  cursor:pointer}
-.btn:hover{border-color:var(--corona);color:var(--corona)}
-.btn.gold{background:var(--corona);border-color:var(--corona);color:#070a12;
-  font-weight:600}
-.btn.gold:hover{background:#ddbc63;color:#070a12}
-
-/* ---------- write ---------- */
-section.write{border-top:1px solid var(--edge);margin-top:26px;padding:30px 0 10px}
-h2{font:700 clamp(22px,5vw,30px)/1.15 var(--disp);letter-spacing:-.015em}
-.sub{color:var(--mute);font-size:14.5px;margin:8px 0 18px;max-width:56ch}
-textarea{width:100%;min-height:260px;resize:vertical;font-size:12.5px;
-  line-height:1.65}
-.out{margin-top:12px;border:1px solid var(--edge);border-radius:3px;
-  padding:13px;font:400 12.5px/1.65 var(--mono);color:var(--mute);
-  white-space:pre-wrap;word-break:break-word;min-height:52px}
-.out.ok{color:#9fe6c6;border-color:rgba(47,191,135,.35)}
-.out.bad{color:#ffb1a7;border-color:rgba(224,87,74,.4)}
-.grammar{display:grid;grid-template-columns:1fr 1fr;gap:0;margin-top:18px;
-  border:1px solid var(--edge);border-radius:3px;overflow:hidden}
-@media(max-width:560px){.grammar{grid-template-columns:1fr}}
-.gcell{padding:12px 13px;border-bottom:1px solid var(--edge)}
-.gcell:nth-child(odd){border-right:1px solid var(--edge)}
-@media(max-width:560px){.gcell:nth-child(odd){border-right:none}}
-.gcell b{display:block;font:600 10px/1 var(--mono);letter-spacing:.18em;
-  text-transform:uppercase;color:var(--corona);margin-bottom:6px}
-.gcell span{font:400 12.5px/1.55 var(--mono);color:var(--mute)}
-footer{padding:34px 0 60px;color:var(--mute-2);font:400 12px/1.8 var(--mono);
-  border-top:1px solid var(--edge);margin-top:30px}
-.empty{padding:40px 0;text-align:center;color:var(--mute);font-size:14.5px}
-</style>
-</head>
-<body>
-
-<div class="sky">
-  <div class="wrap">
-    <div class="eclipse">
-      <div class="ring2"></div><div class="ring"></div>
-      <div class="disc"></div><div class="glyph">signal packs</div>
-    </div>
-    <h1>The rules are <em>free</em>.<br>Running them isn't.</h1>
-    <p class="lede">A public library of decision packs for the token saver.
-    Anyone can write one, anyone can read one, anyone can fork one and prove
-    they wrote it first. <b>A pack decides nothing on its own</b> — it needs
-    the engine underneath it, and that is where the receipt comes from.</p>
-    <div class="split">
-      <div><b>Free forever</b>write · read · fork · seal · prove it's yours</div>
-      <div><b>Needs the engine</b>evaluate · decide · seal a receipt</div>
-    </div>
-  </div>
-</div>
-
-<div class="bar">
-  <div class="wrap">
-    <input id="q" placeholder="search the library" autocomplete="off"
-           aria-label="Search packs">
-    <select id="v" aria-label="Filter by vertical"><option value="">every vertical</option></select>
-    <span class="count" id="count">—</span>
-  </div>
-</div>
-
-<div class="wrap">
-  <div class="shelf" id="shelf"><div class="empty">Opening the library…</div></div>
-
-  <section class="write">
-    <h2>Write one</h2>
-    <p class="sub">No account. No key. Paste a pack, validate it, publish it.
-    Publishing seals its digest into the chain, so the date and the wording are
-    fixed and provable from that moment — including against me.</p>
-
-    <textarea id="src" spellcheck="false" aria-label="Your pack"></textarea>
-    <div class="acts">
-      <button class="btn" id="check">Validate</button>
-      <button class="btn gold" id="pub">Publish &amp; seal</button>
-      <button class="btn" id="reset">Reset example</button>
-    </div>
-    <div class="out" id="msg">Nothing sent yet.</div>
-
-    <div class="grammar" id="grammar"></div>
-  </section>
-</div>
-
-<footer>
-  <div class="wrap">
-    Language, limits and every route: <a href="/x/packs/spec">/x/packs/spec</a><br>
-    The engine these run on: <a href="/x/tokensaver/spec">/x/tokensaver/spec</a><br>
-    sebbi.pro
-  </div>
-</footer>
-
-<script>
-var SIGNALS = ["exposure","size","ask","depth","tools","loop","burst","grind","novelty"];
-var VERDICT_COLOUR = {allow:"#2fbf87",downgrade:"#4fa8d8",challenge:"#d8a13c",block:"#e0574a"};
-var all = [];
-
-function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){
-  return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];});}
-
-/* hue from the digest, so a pack's colour is its own and never assigned */
-function hueOf(d){
-  var h=0; d=String(d||"");
-  for(var i=0;i<16 && i<d.length;i++) h=(h*31+d.charCodeAt(i))%360;
-  return h;
-}
-
-/* the sigil: nine spokes, one per signal, drawn from the pack's own rules */
-function sigil(profile,digest,size){
-  size=size||74;
-  var c=size/2, R=c-7, hue=hueOf(digest);
-  var sig=(profile&&profile.signals)||{};
-  var pts=[], spokes="";
-  for(var i=0;i<9;i++){
-    var a=(Math.PI*2*i/9)-Math.PI/2;
-    var w=Math.max(0,Math.min(1,+sig[SIGNALS[i]]||0));
-    var r=6+R*w;
-    var x=c+Math.cos(a)*r, y=c+Math.sin(a)*r;
-    var ox=c+Math.cos(a)*R, oy=c+Math.sin(a)*R;
-    pts.push(x.toFixed(1)+","+y.toFixed(1));
-    spokes+='<line x1="'+c+'" y1="'+c+'" x2="'+ox.toFixed(1)+'" y2="'+oy.toFixed(1)+
-            '" stroke="hsla('+hue+',60%,70%,.13)" stroke-width="1"/>';
-    if(w>0) spokes+='<circle cx="'+x.toFixed(1)+'" cy="'+y.toFixed(1)+
-            '" r="'+(1.6+w*1.9).toFixed(1)+'" fill="hsl('+hue+',72%,68%)"/>';
-  }
-  return '<svg class="sig" viewBox="0 0 '+size+' '+size+'" aria-hidden="true">'+
-    '<circle cx="'+c+'" cy="'+c+'" r="'+R+'" fill="none" '+
-      'stroke="hsla('+hue+',60%,65%,.18)" stroke-width="1"/>'+
-    spokes+
-    '<polygon points="'+pts.join(" ")+'" fill="hsla('+hue+',70%,60%,.20)" '+
-      'stroke="hsl('+hue+',75%,66%)" stroke-width="1.4" stroke-linejoin="round"/>'+
-    '<circle cx="'+c+'" cy="'+c+'" r="1.8" fill="hsl('+hue+',80%,78%)"/></svg>';
-}
-
-function slab(p){
-  var m=p.manifest||{}, rules=m.rules||[];
-  var body=rules.map(function(r){
-    return '<div class="rule"><div class="when">'+esc(r.when)+'</div>'+
-      '<div class="then" style="color:'+(VERDICT_COLOUR[r.then]||"#fff")+'">→ '+
-      esc(r.then)+'</div><div class="why">'+esc(r.why)+'</div></div>';
-  }).join("");
-  var chips='<span class="chip v">'+esc(p.vertical)+'</span>'+
-    '<span class="chip">'+rules.length+' rules</span>'+
-    '<span class="chip '+esc(m.default||"allow")+'">default '+esc(m.default||"allow")+'</span>'+
-    (p.origin==="library seed"?'<span class="chip">seed</span>':"")+
-    (p.forked_from?'<span class="chip">fork</span>':"");
-  return '<article class="slab" data-id="'+esc(p.id)+'">'+
-    '<div class="head">'+sigil(p.profile,p.digest)+
-      '<div class="meta"><div class="nm">'+esc(p.name)+'</div>'+
-      '<div class="by">'+esc(p.author)+' · v'+esc(p.version)+'</div>'+
-      (p.summary?'<div class="sm">'+esc(p.summary)+'</div>':"")+
-      '<div class="chips">'+chips+'</div></div></div>'+
-    '<div class="body">'+body+
-      '<div class="foot"><span>id '+esc(p.id)+'</span>'+
-      '<span>digest '+esc(String(p.digest||"").slice(0,20))+'…</span>'+
-      (p.block_index!=null?'<span>block '+esc(p.block_index)+'</span>':"")+
-      '<span>published '+esc(String(p.published||"").slice(0,10))+'</span></div>'+
-      '<div class="acts"><button class="btn" data-fork="'+esc(p.id)+'">Fork it</button>'+
-      '<button class="btn" data-copy="'+esc(p.id)+'">Copy JSON</button></div>'+
-    '</div></article>';
-}
-
-function draw(){
-  var q=(document.getElementById("q").value||"").toLowerCase().trim();
-  var v=document.getElementById("v").value;
-  var list=all.filter(function(p){
-    if(v && p.vertical!==v) return false;
-    if(!q) return true;
-    var hay=(p.name+" "+p.author+" "+p.summary+" "+p.vertical+" "+
-      JSON.stringify(p.manifest||{})).toLowerCase();
-    return hay.indexOf(q)>=0;
-  });
-  document.getElementById("count").textContent=list.length+" of "+all.length;
-  document.getElementById("shelf").innerHTML = list.length
-    ? list.map(slab).join("")
-    : '<div class="empty">Nothing matches that yet. Write it.</div>';
-}
-
-document.addEventListener("click",function(e){
-  var h=e.target.closest(".head");
-  if(h){ h.parentNode.classList.toggle("open"); return; }
-  var f=e.target.getAttribute&&e.target.getAttribute("data-fork");
-  if(f){ forkInto(f); return; }
-  var c=e.target.getAttribute&&e.target.getAttribute("data-copy");
-  if(c){ copyOut(c); return; }
-});
-
-function find(id){ for(var i=0;i<all.length;i++) if(all[i].id===id) return all[i]; }
-
-function forkInto(id){
-  var p=find(id); if(!p) return;
-  var m=JSON.parse(JSON.stringify(p.manifest||{}));
-  m.name=m.name+" (fork)";
-  m.author="your name here";
-  m.version="1.0.0";
-  document.getElementById("src").value=JSON.stringify(m,null,2);
-  document.getElementById("src").dataset.parent=id;
-  document.getElementById("msg").className="out";
-  document.getElementById("msg").textContent=
-    "Forked "+id+" into the editor. Put your name on it, change what you "+
-    "disagree with, then publish. The parent is recorded, so the lineage is "+
-    "visible rather than claimed.";
-  document.querySelector("section.write").scrollIntoView({behavior:"smooth"});
-}
-
-function copyOut(id){
-  var p=find(id); if(!p) return;
-  var t=JSON.stringify(p.manifest,null,2);
-  if(navigator.clipboard) navigator.clipboard.writeText(t);
-  document.getElementById("msg").className="out ok";
-  document.getElementById("msg").textContent="Copied "+id+" to your clipboard.";
-}
-
-function post(action,body){
-  return fetch("/x/packs/"+action,{method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body:JSON.stringify(body)}).then(function(r){return r.json();});
-}
-
-function readSrc(){
-  try{ return JSON.parse(document.getElementById("src").value); }
-  catch(e){
-    document.getElementById("msg").className="out bad";
-    document.getElementById("msg").textContent=
-      "That is not valid JSON yet — "+e.message;
-    return null;
-  }
-}
-
-document.getElementById("check").addEventListener("click",function(){
-  var m=readSrc(); if(!m) return;
-  var out=document.getElementById("msg");
-  out.className="out"; out.textContent="Parsing every rule…";
-  post("validate",{pack:m}).then(function(d){
-    if(d.ok){
-      out.className="out ok";
-      out.textContent="Valid. "+d.rule_count+" rules, hardest verdict "+
-        d.profile.hardest_verdict+", reads: "+d.profile.reads.join(", ")+
-        ".\nDigest "+d.digest+"\nNothing published — press Publish when ready.";
-    }else{
-      out.className="out bad";
-      out.textContent=d.detail||d.error||"That did not parse.";
-    }
-  }).catch(function(e){
-    out.className="out bad"; out.textContent="Could not reach the library: "+e;
-  });
-});
-
-document.getElementById("pub").addEventListener("click",function(){
-  var m=readSrc(); if(!m) return;
-  var parent=document.getElementById("src").dataset.parent||null;
-  var out=document.getElementById("msg");
-  out.className="out"; out.textContent="Sealing…";
-  post(parent?"fork":"publish",parent?{pack:m,parent:parent}:{pack:m})
-  .then(function(d){
-    if(d.ok===false||d.error){
-      out.className="out bad";
-      out.textContent=d.detail||d.error;return;
-    }
-    out.className="out ok";
-    out.textContent="Published as "+d.id+
-      (d.block_index!=null?("\nSealed at block "+d.block_index):"")+
-      "\nDigest "+d.digest+
-      "\nIt is in the library now and anyone can fork it.";
-    load();
-  }).catch(function(e){
-    out.className="out bad"; out.textContent="Could not reach the library: "+e;
-  });
-});
-
-var EXAMPLE={
-  name:"My first pack",
-  author:"your name or domain",
-  version:"1.0.0",
-  vertical:"general",
-  summary:"One line someone paying the bill would understand.",
-  default:"allow",
-  rules:[
-    {when:"loop_count >= 3 and not deterministic",
-     then:"challenge",
-     why:"The same request three times at temperature cannot be reused, so it is bought again each time."},
-    {when:"unattended and max_tokens > 4000",
-     then:"block",
-     why:"A long generation with nobody watching is a cost with no reader."},
-    {when:"chars < 2500 and turns <= 4 and tool_count == 0",
-     then:"downgrade",
-     why:"Short and simple is what the cheap model is for."}
-  ]
-};
-function resetSrc(){
-  document.getElementById("src").value=JSON.stringify(EXAMPLE,null,2);
-  delete document.getElementById("src").dataset.parent;
-  document.getElementById("msg").className="out";
-  document.getElementById("msg").textContent="Nothing sent yet.";
-}
-document.getElementById("reset").addEventListener("click",resetSrc);
-document.getElementById("q").addEventListener("input",draw);
-document.getElementById("v").addEventListener("change",draw);
-
-function load(){
-  fetch("/x/packs/list?limit=200").then(function(r){return r.json();})
-  .then(function(d){
-    all=d.packs||[];
-    var sel=document.getElementById("v"), have={};
-    all.forEach(function(p){have[p.vertical]=1;});
-    var keep=sel.value;
-    sel.innerHTML='<option value="">every vertical</option>'+
-      Object.keys(have).sort().map(function(v){
-        return '<option value="'+esc(v)+'">'+esc(v)+'</option>';}).join("");
-    sel.value=keep;
-    if(d.grammar){
-      document.getElementById("grammar").innerHTML=
-        Object.keys(d.grammar).map(function(k){
-          return '<div class="gcell"><b>'+esc(k)+'</b><span>'+
-            esc(d.grammar[k])+'</span></div>';}).join("");
-    }
-    draw();
-  }).catch(function(){
-    document.getElementById("shelf").innerHTML=
-      '<div class="empty">The library could not be reached.</div>';
-  });
-}
-resetSrc();
-load();
-</script>
-</body>
-</html>"""
-
-
-_patched = [False]
-
-
-def _install_page():
-    """Serve /packs by wrapping the running handler's do_GET, once."""
-    if _patched[0]:
-        return True
-    for mod in list(sys.modules.values()):
-        if mod is None:
-            continue
-        try:
-            names = dir(mod)
-        except Exception:                                    # noqa: BLE001
-            continue
-        for nm in names:
-            try:
-                obj = getattr(mod, nm, None)
-            except Exception:                                # noqa: BLE001
-                continue
-            if not isinstance(obj, type):
-                continue
-            if not (hasattr(obj, "do_GET") and hasattr(obj, "do_POST")):
-                continue
-            if getattr(obj, "_packs_patched", False):
-                _patched[0] = True
-                return True
-            original = obj.do_GET
-
-            def patched(self, _original=original):
-                try:
-                    path = self.path.split("?")[0].rstrip("/") or "/"
-                except Exception:                            # noqa: BLE001
-                    path = ""
-                if path in ("/packs", "/packs.html", "/library"):
-                    data = PAGE.encode("utf-8")
-                    self.send_response(200)
-                    self.send_header("Content-Type",
-                                     "text/html; charset=utf-8")
-                    self.send_header("Content-Length", str(len(data)))
-                    self.send_header("Cache-Control", "no-store")
-                    self.end_headers()
-                    self.wfile.write(data)
-                    return
-                return _original(self)
-
-            obj.do_GET = patched
-            obj._packs_patched = True
-            _patched[0] = True
-            return True
-    return False
-
-
-# ================================================================ routes
-
-GRAMMAR = {
-    "signals, 0.0 to 1.0": "exposure size ask depth tools loop burst grind "
-                           "novelty",
-    "raw counts": "chars max_tokens turns tool_count loop_count burst_count "
-                  "grind_count",
-    "flags": "unattended deterministic",
-    "the engine's score": "score",
-    "operators": "> >= < <= == != and or not ( )",
-    "verdicts": "allow downgrade challenge block",
-}
-
-
-def _spec():
-    return {
-        "module": "packs",
-        "version": VERSION,
-        "what_this_is": (
-            "A public library of decision packs for the token saver. A pack "
-            "is data, not code: conditions over the nine signals the engine "
-            "already measures, and a verdict for each."),
-        "the_deal": {
-            "free_forever_no_account": [
-                "write a pack", "read any pack", "fork any pack",
-                "seal a pack so its date and wording are provable",
-                "validate a pack's syntax",
-            ],
-            "needs_a_key": [
-                "run a pack against a request",
-                "get a verdict",
-                "get a sealed receipt for that verdict",
-            ],
-            "why": (
-                "A pack on its own decides nothing and produces no evidence. "
-                "The thresholds are the author's and they are public. The "
-                "execution, the measurement and the receipt are the engine's, "
-                "and that is what is being sold. An author can therefore "
-                "build something genuinely theirs and prove it is theirs "
-                "without paying anything - and everyone who uses it arrives "
-                "here to run it."),
-        },
-        "language": GRAMMAR,
-        "language_notes": [
-            "There is no syntax for calling anything, reading anything, or "
-            "assigning anything. Expressions are parsed into a tree and "
-            "walked; nothing reaches eval, exec or compile.",
-            "Rules are tried in order and the first match decides. If none "
-            "match, the pack's default decides.",
-            "A pack can only make the engine's decision stricter. It can "
-            "never weaken a hard rule, and an attempt to do so is reported "
-            "rather than silently dropped.",
-            "A pack can never return 'serve'. Serving from store is a fact "
-            "about whether an identical request was answered before, not a "
-            "policy.",
-        ],
-        "limits": {
-            "rules_per_pack": MAX_RULES,
-            "characters_per_expression": MAX_EXPR_CHARS,
-            "manifest_bytes": MAX_MANIFEST_BYTES,
-        },
-        "sigil": (
-            "Every pack draws itself: nine spokes, one per signal, each as "
-            "long as the pack leans on that signal, in a hue derived from "
-            "its own digest. Computed from the rules, so the drawing is the "
-            "pack rather than a picture attached to it."),
-        "routes": {
-            "public": ["GET spec", "GET list", "GET get", "GET status",
-                       "POST validate", "POST publish", "POST fork"],
-            "keyed": ["POST run"],
-        },
-        "page": "/packs",
-        "does_not_prove": [
-            "That a pack's thresholds are good ones. Sealing fixes the "
-            "wording and the date, not the judgement.",
-            "That an author is who they say they are. Names are "
-            "self-declared, as everywhere else on this deployment.",
-        ],
-    }, 200
-
-
-def _status(ctx):
-    installed = _install_page()
-    n = seeds = 0
-    try:
-        with ctx["lock"]:
-            n = ctx["conn"].execute("SELECT COUNT(*) FROM packs").fetchone()[0]
-            seeds = ctx["conn"].execute(
-                "SELECT COUNT(*) FROM packs WHERE seeded=1").fetchone()[0]
-    except Exception:                                        # noqa: BLE001
-        pass
-    return {"module": "packs", "version": VERSION, "page": "/packs",
-            "page_installed": installed, "packs": n, "seeds": seeds,
-            "published_by_others": max(0, n - seeds),
-            "note": "publishing and reading need no key; running one does"}, 200
-
-
-def _list(ctx, data):
-    try:
-        limit = min(LIST_LIMIT, max(1, int(data.get("limit") or 100)))
-    except (TypeError, ValueError):
-        limit = 100
-    vertical = str(data.get("vertical") or "").strip().lower()
-    with ctx["lock"]:
-        if vertical:
-            rows = ctx["conn"].execute(
-                "SELECT * FROM packs WHERE vertical=? "
-                "ORDER BY runs DESC, id DESC LIMIT ?",
-                (vertical, limit)).fetchall()
-        else:
-            rows = ctx["conn"].execute(
-                "SELECT * FROM packs ORDER BY runs DESC, id DESC LIMIT ?",
-                (limit,)).fetchall()
-    return {"count": len(rows),
-            "packs": [_row_to_pack(r, full=True) for r in rows],
-            "verticals": list(VERTICALS),
-            "grammar": GRAMMAR,
-            "how_to_run_one": (
-                "POST /x/packs/run with a key, a pack id, and either a "
-                "request body or a token saver digest."),
-            "note": ("Being in this library is not endorsement. Anyone may "
-                     "publish and nothing here is reviewed.")}, 200
-
-
-def _get(ctx, data):
-    pid = str(data.get("id") or "").strip()
-    if not pid:
-        return {"error": "id_required",
-                "usage": "/x/packs/get?id=<pack id>"}, 400
-    with ctx["lock"]:
-        row = ctx["conn"].execute(
-            "SELECT * FROM packs WHERE pack_id=?", (pid,)).fetchone()
-    if not row:
-        return {"error": "unknown_pack", "id": pid}, 404
-    out = _row_to_pack(row, full=True)
-    out["grammar"] = GRAMMAR
-    return out, 200
-
-
-def _validate_action(data):
-    m = data.get("pack") or data.get("manifest") or data
-    try:
-        clean, compiled, profile = validate(m)
-    except PackError as exc:
-        return {"ok": False, "error": "invalid_pack", "detail": str(exc)}, 400
-    return {"ok": True, "rule_count": len(clean["rules"]),
-            "digest": _digest(clean), "profile": profile,
-            "normalised": clean,
-            "note": "nothing was published"}, 200
-
-
-def _publish_action(ctx, data, api_key, parent=None):
-    m = data.get("pack") or data.get("manifest")
-    if not isinstance(m, dict):
-        return {"error": "pack_required",
-                "detail": "send the pack under 'pack'"}, 400
-    try:
-        clean, compiled, profile = validate(m)
-    except PackError as exc:
-        return {"ok": False, "error": "invalid_pack", "detail": str(exc)}, 400
-
-    if parent:
-        with ctx["lock"]:
-            p = ctx["conn"].execute(
-                "SELECT pack_id FROM packs WHERE pack_id=?",
-                (parent,)).fetchone()
-        if not p:
-            return {"error": "unknown_parent", "parent": parent}, 404
-
-    out = _store(ctx, clean, profile, parent, api_key)
-    out["ok"] = True
-    return out, 200
-
-
-def _run(ctx, data, api_key):
-    """
-    Evaluate a pack. This is the keyed half and the reason the free half
-    can be free.
-    """
-    pid = str(data.get("id") or data.get("pack_id") or "").strip()
-    if not pid:
-        return {"error": "id_required",
-                "detail": "which pack should decide this?"}, 400
-    with ctx["lock"]:
-        row = ctx["conn"].execute(
-            "SELECT * FROM packs WHERE pack_id=?", (pid,)).fetchone()
-    if not row:
-        return {"error": "unknown_pack", "id": pid}, 404
-
-    manifest = json.loads(row[8])
-    try:
-        clean, compiled, profile = validate(manifest)
-    except PackError as exc:
-        return {"error": "pack_no_longer_valid", "detail": str(exc)}, 500
-
-    measured = data.get("measured")
-    signals = data.get("signals")
-    if not isinstance(measured, dict) or not isinstance(signals, dict):
-        return {"error": "measurements_required",
-                "detail": ("send 'measured' and 'signals' exactly as "
-                           "/x/tokensaver/gate returned them, plus its "
-                           "'score' and 'verdict'. Call the gate first; this "
-                           "route decides on top of it, it does not replace "
-                           "it."),
-                "example": {"id": pid, "verdict": "ALLOW", "score": 0.31,
-                            "signals": {"loop": 0.4}, "measured": {}}}, 400
-
-    engine_verdict = str(data.get("verdict") or "allow").strip().lower()
-    if engine_verdict == "serve":
-        return {"error": "already_served",
-                "detail": ("this request was answered from store, so nothing "
-                           "was bought and there is nothing for a pack to "
-                           "decide")}, 400
-    if engine_verdict not in VERDICTS:
-        engine_verdict = "allow"
-
-    env = _env(measured, signals, data.get("score"),
-               data.get("unattended"), data.get("deterministic", True))
-    result = apply_pack(compiled, clean["default"], env, engine_verdict)
-
-    h, idx, seq = _seal(ctx, "signalpack_run", {
-        "decision": "PACK_" + result["verdict"].upper(),
-        "pack_id": pid, "pack_digest": row[10],
-        "pack_version": clean["version"], "pack_author": clean["author"],
-        "engine_verdict": engine_verdict,
-        "pack_verdict": result["pack_verdict"],
-        "final_verdict": result["verdict"],
-        "matched_rule": result["matched_rule"],
-        "capped_by_engine": result["capped_by_engine"],
-        "note": ("the pack that decided this is sealed by digest, so which "
-                 "rules were in force at this moment is fixed and cannot be "
-                 "edited afterwards"),
-    }, api_key)
-
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "UPDATE packs SET runs=runs+1 WHERE pack_id=?", (pid,))
-        ctx["conn"].commit()
-
-    out = dict(result)
-    out.update({
-        "pack": {"id": pid, "name": clean["name"], "author": clean["author"],
-                 "version": clean["version"], "digest": row[10]},
-        "environment": env,
-        "receipt": {"audit_hash": h, "block_index": idx, "receipt_seq": seq},
-        "what_this_proves": (
-            "that this verdict was reached by this exact pack, against these "
-            "measurements, at this position in the chain. The pack's digest "
-            "is in the block, so nobody can later claim different rules "
-            "applied."),
-        "what_this_does_not_prove": (
-            "that the pack's thresholds were sensible ones."),
-    })
-    return out, 200
-
-
-# ---------------------------------------------------------------- handler
-
-def handle(method, action, data, api_key, ctx):
-    data = data or {}
-
-    if method == "GET" and action == "spec":
-        return _spec()
-
-    try:
-        _setup(ctx)
-    except Exception as exc:                                 # noqa: BLE001
-        return {"error": "library_unavailable",
-                "detail": "%s: %s" % (type(exc).__name__, exc)}, 500
-
-    if method == "GET":
-        if action == "status":
-            return _status(ctx)
-        if action == "list":
-            return _list(ctx, data)
-        if action == "get":
-            return _get(ctx, data)
-
-    if method == "POST":
-        if action == "validate":
-            return _validate_action(data)
-        if action == "publish":
-            return _publish_action(ctx, data, api_key)
-        if action == "fork":
-            parent = str(data.get("parent") or data.get("forked_from")
-                         or "").strip()
-            if not parent:
-                return {"error": "parent_required",
-                        "detail": "a fork names the pack it came from"}, 400
-            return _publish_action(ctx, data, api_key, parent)
-        if action == "run":
-            if not api_key:
-                return {"error": "invalid_api_key",
-                        "detail": ("running a pack needs a key. Writing, "
-                                   "reading and forking never will."),
-                        "free_routes": ["list", "get", "validate", "publish",
-                                        "fork"]}, 401
-            return _run(ctx, data, api_key)
-
-    return {"error": "unknown_action", "action": action,
-            "GET": ["spec", "status", "list", "get"],
-            "POST": ["validate", "publish", "fork", "run (keyed)"]}, 404
 
 ```
