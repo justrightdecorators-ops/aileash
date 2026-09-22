@@ -1,884 +1,10 @@
-# Codebase — part 27 of 39
+# Codebase — part 27 of 38
 
 Contains:
-- `ai-standard.html`
-- `ai-txt-kit.html`
-- `aileash-game.html`
 - `aitxt-popup-live.html`
 - `brain.html`
 - `certificate.html`
-
-
-## `ai-standard.html`
-
-97 lines, 4847 bytes
-
-```html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="theme-color" content="#0a0f1e">
-<title>ai.txt - Free Download</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0a0f1e;color:#e8e8f0;min-height:100vh;display:flex;flex-direction:column}
-nav{border-bottom:1px solid #1e2a45;padding:16px 20px}
-nav a{color:#c9a84c;text-decoration:none;font-family:monospace;font-size:14px}
-.wrap{flex:1;display:flex;align-items:center;justify-content:center;padding:30px 20px}
-.card{max-width:560px;width:100%;background:#0d1428;border:1px solid #1e2a45;border-radius:16px;padding:36px 28px;text-align:center}
-h1{font-size:32px;font-weight:800;margin-bottom:14px;line-height:1.15}
-h1 span{color:#c9a84c}
-p{color:#8a90a6;font-size:15px;line-height:1.7;margin-bottom:14px}
-p b{color:#e8e8f0}
-.btn{display:inline-flex;align-items:center;justify-content:center;gap:10px;width:100%;background:#c9a84c;color:#0a0f1e;padding:18px;border-radius:10px;font-weight:800;font-size:17px;border:none;cursor:pointer;font-family:inherit;margin:20px 0 10px}
-.sub{font-family:monospace;font-size:12px;color:#7fe3b0;margin-bottom:24px}
-.steps{text-align:left;background:#0b1226;border:1px solid #1e2a45;border-radius:10px;padding:18px 20px;margin-top:8px}
-.steps li{color:#8a90a6;font-size:14px;margin:10px 0 10px 6px;line-height:1.6}
-.steps li b{color:#c9a84c}
-.back{margin-top:22px}
-.back a{color:#c9a84c;text-decoration:none;font-size:14px;font-weight:600}
-footer{border-top:1px solid #1e2a45;padding:20px;text-align:center;color:#5a6178;font-size:12px}
-footer a{color:#c9a84c;text-decoration:none}
-</style>
-</head>
-<body>
-<nav><a href="/">&larr; AILeash</a></nav>
-<div class="wrap">
-  <div class="card">
-    <h1>Download <span>ai.txt</span> &mdash; free</h1>
-    <div class="sub">NO KEY &middot; NO ACCOUNT &middot; NO COST</div>
-    <p>ai.txt is the free, open standard for declaring how your AI is governed. Download the file, and it shows your system exactly what it needs to become compliant.</p>
-    <button class="btn" onclick="downloadIt()">&#8681; Download ai.txt free</button>
-    <ul class="steps">
-      <li><b>1.</b> Tap download &mdash; the file saves as ai.txt</li>
-      <li><b>2.</b> Fill in your details, put it on your domain at yourdomain.com/ai.txt</li>
-      <li><b>3.</b> Want it verified and provable? <b><a href="/" style="color:#c9a84c">Come back to AILeash</a></b> to seal it into a tamper-evident chain.</li>
-    </ul>
-    <div class="back"><a href="/ai.txt">See the live ai.txt &rarr;</a></div>
-  </div>
-</div>
-<footer>ai.txt is a free, open standard by <a href="/">Monop Content</a> &middot; Blyth, UK &middot; <a href="/ai.txt">reference</a></footer>
-<script>
-var AITXT = [
-"# ============================================================================",
-"# ai.txt - AI Governance Declaration  (AI-TXT/1.0)",
-"# A free, open standard. Copy this to the root of your domain as /ai.txt",
-"# Replace the values below with your own. Delete any line that does not apply.",
-"# No key, no account, no permission, no cost. Just publish it.",
-"# See it live: https://sebbi.pro/ai.txt",
-"# ============================================================================",
-"",
-"Standard: AI-TXT/1.0",
-"Operator: YOUR COMPANY NAME",
-"Operator-Location: YOUR CITY, COUNTRY",
-"Contact: you@yourdomain.com",
-"Last-Updated: 2026-01-01",
-"",
-"# --- How your AI makes decisions ---",
-"Decision-Model: describe it (deterministic rules / ML model / human-in-loop)",
-"Decision-Outcomes: ALLOW, REVIEW, BLOCK",
-"Human-Override: yes / no",
-"Plain-Language-Reasons: yes / no",
-"",
-"# --- Your audit record (how you prove what happened) ---",
-"Audit-Chain: describe it (SHA-256 hash chain / signed logs / none)",
-"Chain-Property: tamper-evident / tamper-resistant / none",
-"Verify-Endpoint: https://yourdomain.com/your-verify-url",
-"",
-"# --- Regulations you are designing towards ---",
-"Regulation: EU AI Act 2024/1689",
-"Regulation: UK Online Safety Act 2023",
-"",
-"# --- Optional: public status surfaces ---",
-"Live-Status: https://yourdomain.com/health",
-"Whitepaper: https://yourdomain.com/whitepaper",
-"",
-"# ============================================================================",
-"# ai.txt is a free, open standard. Publish yours, share it, build on it.",
-"# ============================================================================"
-].join("\n");
-function downloadIt(){
-  var blob = new Blob([AITXT], {type:"text/plain"});
-  var url = URL.createObjectURL(blob);
-  var a = document.createElement("a");
-  a.href = url; a.download = "ai.txt";
-  document.body.appendChild(a); a.click();
-  document.body.removeChild(a); URL.revokeObjectURL(url);
-}
-</script>
-</body>
-</html>
-
-```
-
-
-## `ai-txt-kit.html`
-
-86 lines, 6554 bytes
-
-```html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="theme-color" content="#0a0f1e">
-<title>ai.txt Starter Kit &mdash; publish AI governance free in 5 minutes</title>
-<meta name="description" content="Publish an ai.txt on your own domain, free. Copy the template, add the badge, make it provable. No key, no account.">
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0a0f1e;color:#e8e8f0;line-height:1.6}
-.mono{font-family:"JetBrains Mono",ui-monospace,Menlo,monospace}
-nav{position:sticky;top:0;z-index:10;background:rgba(10,15,30,.94);backdrop-filter:blur(10px);border-bottom:1px solid #1e2a45;padding:0 20px;height:54px;display:flex;align-items:center;justify-content:space-between}
-nav a.logo{display:flex;align-items:center;gap:8px;color:#c9a84c;text-decoration:none;font-family:"JetBrains Mono",monospace;font-size:13px}
-nav .links a{color:#8a90a6;text-decoration:none;font-size:13px;margin-left:16px}
-.wrap{max-width:760px;margin:0 auto;padding:44px 20px 90px}
-.eyebrow{font-family:"JetBrains Mono",monospace;font-size:11px;letter-spacing:3px;text-transform:uppercase;color:#c9a84c;margin-bottom:12px}
-h1{font-size:34px;font-weight:800;letter-spacing:-.02em;line-height:1.1;margin-bottom:14px}
-h1 span{color:#c9a84c}
-.lede{color:#8a90a6;font-size:16px;margin-bottom:8px}
-.free{display:inline-block;background:rgba(0,229,160,.1);border:1px solid #00b87d;color:#7fe3b0;font-family:"JetBrains Mono",monospace;font-size:12px;padding:5px 12px;border-radius:5px;margin:14px 0 30px}
-h2{font-size:20px;font-weight:700;margin:40px 0 8px;padding-top:26px;border-top:1px solid #1e2a45}
-.step-n{font-family:"JetBrains Mono",monospace;color:#c9a84c;font-size:13px}
-p{color:#8a90a6;margin-bottom:14px}
-p b{color:#e8e8f0}
-.box{background:#0b1226;border:1px solid #1e2a45;border-radius:10px;padding:18px;margin:16px 0;font-family:"JetBrains Mono",monospace;font-size:12.5px;color:#7fe3b0;white-space:pre-wrap;word-break:break-word;line-height:1.8;overflow-x:auto}
-.btn{display:inline-flex;align-items:center;gap:8px;background:#c9a84c;color:#0a0f1e;padding:12px 22px;border-radius:8px;font-weight:800;font-size:14px;text-decoration:none;border:none;cursor:pointer;font-family:inherit}
-.btn.ghost{background:transparent;border:1px solid #2a3350;color:#e8e8f0}
-.btnrow{display:flex;gap:10px;flex-wrap:wrap;margin:16px 0}
-.badge-demo{display:inline-flex;align-items:center;gap:8px;background:#111a30;border:1px solid #c9a84c;border-radius:8px;padding:8px 14px;font-family:"JetBrains Mono",monospace;font-size:12px;color:#c9a84c;text-decoration:none}
-.badge-demo svg{flex-shrink:0}
-.onramp{background:linear-gradient(135deg,rgba(0,229,160,.06),rgba(201,168,76,.05));border:1px solid #00b87d;border-radius:12px;padding:24px;margin-top:30px}
-.onramp h3{color:#7fe3b0;font-size:16px;margin-bottom:8px}
-.onramp p{color:#a9b0c4}
-.copied{color:#7fe3b0;font-size:12px;margin-left:10px;opacity:0;transition:opacity .2s}
-.copied.show{opacity:1}
-footer{border-top:1px solid #1e2a45;padding:26px 20px;text-align:center;color:#5a6178;font-size:12px}
-footer a{color:#c9a84c;text-decoration:none}
-</style>
-</head>
-<body>
-<nav>
-  <a class="logo" href="/"><svg width="18" height="18" viewBox="0 0 32 32"><circle cx="16" cy="16" r="13.5" fill="none" stroke="#c9a84c" stroke-width="2.6" stroke-dasharray="66 20" stroke-linecap="round" transform="rotate(-50 16 16)"/><circle cx="26.5" cy="7" r="3.1" fill="#c9a84c"/></svg>AILeash</a>
-  <div class="links"><a href="/ai.txt">Spec</a><a href="/whitepaper">Whitepaper</a></div>
-</nav>
-<div class="wrap">
-  <div class="eyebrow">// ai.txt starter kit</div>
-  <h1>Publish AI governance on your own site. <span>Free.</span></h1>
-  <p class="lede">ai.txt is the robots.txt of AI governance: one small file at your domain root that declares how your AI is governed and where anyone can verify it. Here is everything you need to publish one in about five minutes.</p>
-  <div class="free">FREE STANDARD &middot; NO KEY &middot; NO ACCOUNT &middot; NO PERMISSION</div>
-
-  <h2><span class="step-n">01 /</span> Grab the template</h2>
-  <p>A ready-to-fill ai.txt with every line commented. Download it, or read the live example on our own domain.</p>
-  <div class="btnrow">
-    <a class="btn" href="/ai-txt-template.txt" download="ai.txt">&#8681; Download template</a>
-    <a class="btn ghost" href="/ai.txt" target="_blank">Read a live example</a>
-  </div>
-
-  <h2><span class="step-n">02 /</span> Fill it in and publish</h2>
-  <p>Replace the example values with your own facts. <b>Delete any line you cannot back with a real verify endpoint</b> &mdash; an honest short ai.txt beats an aspirational long one. Then upload it to the root of your domain so it lives at:</p>
-  <div class="box">https://yourdomain.com/ai.txt</div>
-  <p>That is the whole spec. One file, at the root, readable by anyone &mdash; a regulator, a partner, or another machine deciding whether to trust you.</p>
-
-  <h2><span class="step-n">03 /</span> Add the badge</h2>
-  <p>Show visitors and crawlers that you have declared your AI governance. Copy this HTML onto your site &mdash; it renders a small badge linking to your ai.txt:</p>
-  <p>Preview:</p>
-  <a class="badge-demo" href="/ai.txt"><svg width="14" height="14" viewBox="0 0 32 32"><circle cx="16" cy="16" r="13.5" fill="none" stroke="#c9a84c" stroke-width="3" stroke-dasharray="66 20" stroke-linecap="round" transform="rotate(-50 16 16)"/><circle cx="26.5" cy="7" r="3.4" fill="#c9a84c"/></svg>AI-Governed &middot; ai.txt</a>
-  <div class="box" id="badge">&lt;a href="/ai.txt" style="display:inline-flex;align-items:center;gap:6px;font-family:monospace;font-size:12px;color:#c9a84c;text-decoration:none;border:1px solid #c9a84c;border-radius:6px;padding:6px 10px"&gt;AI-Governed &middot; ai.txt&lt;/a&gt;</div>
-  <button class="btn ghost" onclick="copyBadge()">Copy badge HTML<span class="copied" id="cp">copied</span></button>
-
-</div>
-</div>
-<footer>
-  ai.txt (AI-TXT/1.0) is a free, open standard by <a href="/">Monop Content</a> &middot; Blyth, UK &middot; <a href="/ai.txt">spec</a> &middot; <a href="/comply.txt">comply.txt</a>
-</footer>
-<script>
-function copyBadge(){
-  var t=document.getElementById('badge').textContent;
-  navigator.clipboard.writeText(t).then(function(){
-    var c=document.getElementById('cp');c.classList.add('show');setTimeout(function(){c.classList.remove('show')},1500);
-  });
-}
-</script>
-</body>
-</html>
-
-```
-
-
-## `aileash-game.html`
-
-665 lines, 26104 bytes
-
-```html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,maximum-scale=1,user-scalable=no">
-<meta name="theme-color" content="#05070f">
-<meta name="robots" content="noindex">
-<title>AILeash — Deep Run</title>
-<style>
-:root{--ink:#05070f;--ink2:#0d1424;--gold:#c9a84c;--ok:#7fe3b0;--err:#ff8a80;--mute:#7d89a8;
-  --line:rgba(201,168,76,.22)}
-*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-html,body{height:100%;margin:0;overflow:hidden;background:#05070f;color:#e8edf7;
-  font-family:"Inter","Helvetica Neue",Helvetica,Arial,sans-serif;overscroll-behavior:none}
-.num{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-variant-numeric:tabular-nums}
-#wrap{position:fixed;inset:0}
-canvas{display:block;width:100%;height:100%;touch-action:none}
-
-#hud{position:absolute;left:0;right:0;top:0;z-index:10;display:flex;align-items:flex-start;
-  gap:16px;padding:10px 14px;padding-top:calc(10px + env(safe-area-inset-top));
-  pointer-events:none}
-#hud .cell{display:flex;flex-direction:column;gap:1px}
-#hud .k{font-size:9px;letter-spacing:.1em;color:var(--mute)}
-#hud .v{font-size:15px;font-weight:700;text-shadow:0 0 10px rgba(0,0,0,.9)}
-#combo{color:var(--gold)}
-#right{margin-left:auto;display:flex;flex-direction:column;align-items:flex-end;gap:5px}
-#hull{width:88px;height:7px;border:1px solid rgba(201,168,76,.5);border-radius:3px;overflow:hidden}
-#hullF{height:100%;width:100%;background:linear-gradient(90deg,#ff8a80,#7fe3b0);
-  transition:width .2s}
-#sector{font-size:9px;letter-spacing:.1em;color:var(--mute)}
-
-.screen{position:absolute;inset:0;z-index:20;display:none;flex-direction:column;
-  align-items:center;justify-content:center;gap:16px;padding:28px 22px;text-align:center;
-  background:rgba(5,7,15,.93);overflow-y:auto}
-.screen.on{display:flex}
-h1{margin:0;font-size:36px;font-weight:800;letter-spacing:-.02em;line-height:1}
-h1 span{color:var(--gold)}
-h2{margin:0;font-size:22px;font-weight:700}
-p.lede{margin:0;max-width:32ch;font-size:14px;line-height:1.55;color:#b6c0d6}
-.btn{border:0;border-radius:11px;padding:15px 32px;font-size:15px;font-weight:700;
-  background:var(--gold);color:#05070f;cursor:pointer;min-width:210px}
-.btn.ghost{background:transparent;color:var(--gold);border:1.5px solid var(--line)}
-.stats{display:flex;gap:28px;justify-content:center;flex-wrap:wrap}
-.stats .k{font-size:9px;letter-spacing:.1em;color:var(--mute)}
-.stats .v{font-size:26px;font-weight:700}
-#lv{display:grid;grid-template-columns:repeat(5,1fr);gap:7px;width:100%;max-width:280px}
-#lv button{aspect-ratio:1;border-radius:8px;border:1px solid var(--line);cursor:pointer;
-  background:rgba(255,255,255,.03);color:#c3cbdd;font-size:14px;font-weight:700;
-  font-family:ui-monospace,monospace}
-#lv button.done{background:rgba(201,168,76,.16);color:var(--gold);border-color:var(--gold)}
-#lv button.lock{opacity:.25;cursor:not-allowed}
-#flash{position:absolute;left:0;right:0;top:30%;z-index:15;text-align:center;
-  font-size:19px;font-weight:700;pointer-events:none;opacity:0;transition:opacity .35s;
-  text-shadow:0 0 16px rgba(0,0,0,.9)}
-#hint{position:absolute;left:0;right:0;bottom:calc(12px + env(safe-area-inset-bottom));
-  z-index:10;text-align:center;font-size:11px;letter-spacing:.05em;color:var(--mute);
-  pointer-events:none}
-@media (prefers-reduced-motion:reduce){*{transition:none!important}}
-</style>
-</head>
-<body>
-<div id="wrap">
-<canvas id="cv"></canvas>
-
-<div id="hud">
-  <div class="cell"><div class="k">SCORE</div><div class="v num" id="hScore">0</div></div>
-  <div class="cell"><div class="k">SECTOR</div><div class="v num" id="hLevel">1</div></div>
-  <div class="cell"><div class="k">COMBO</div><div class="v num" id="combo">x1</div></div>
-  <div id="right">
-    <div id="hull"><div id="hullF"></div></div>
-    <div id="sector">HULL</div>
-  </div>
-</div>
-
-<div id="flash"></div>
-<div id="hint">Drag to fly</div>
-
-<div class="screen on" id="scTitle">
-  <h1>AI<span>Leash</span></h1>
-  <h2>Deep Run</h2>
-  <p class="lede">Ten sectors, out past the rings and back. Drag to fly your ship — the guns fire themselves. Don't let them reach you.</p>
-  <button class="btn" id="bStart">Launch</button>
-  <button class="btn ghost" id="bPick">Choose a sector</button>
-  <p class="lede" style="font-size:11.5px" id="bestLine"></p>
-</div>
-
-<div class="screen" id="scPick">
-  <h2>Choose a sector</h2>
-  <p class="lede" id="pickSub"></p>
-  <div id="lv"></div>
-  <button class="btn ghost" id="bBack">Back</button>
-</div>
-
-<div class="screen" id="scNext">
-  <h2 id="nextTitle">Sector clear</h2>
-  <div class="stats">
-    <div><div class="k">SCORE</div><div class="v num" id="nScore">0</div></div>
-    <div><div class="k">KILLS</div><div class="v num" id="nKills">0</div></div>
-  </div>
-  <p class="lede" id="nextNote"></p>
-  <button class="btn" id="bNext">Next sector</button>
-  <button class="btn ghost" id="bQuit">Back to start</button>
-</div>
-
-<div class="screen" id="scOver">
-  <h2>Hull breached</h2>
-  <div class="stats">
-    <div><div class="k">SCORE</div><div class="v num" id="oScore">0</div></div>
-    <div><div class="k">SECTOR</div><div class="v num" id="oLevel">1</div></div>
-    <div><div class="k">KILLS</div><div class="v num" id="oKills">0</div></div>
-  </div>
-  <p class="lede" id="overNote"></p>
-  <button class="btn" id="bRetry">Fly it again</button>
-  <button class="btn ghost" id="bHome">Back to start</button>
-</div>
-</div>
-
-<script>
-(function(){
-"use strict";
-
-var cv=document.getElementById("cv"),ctx=cv.getContext("2d");
-var W=0,H=0,dpr=1,CX=0,CY=0,F=460,MAXLV=10;
-
-/* ---------- sectors ---------- */
-var SECTORS=[
- {name:"Rings of Saturn", sky:"#0a1020", planet:"saturn",  count:26, speed:340, fire:0.30, mix:["scout","scout","hulk"]},
- {name:"Ochre Belt",      sky:"#120c14", planet:"rust",    count:30, speed:380, fire:0.45, mix:["scout","hulk","mine"]},
- {name:"Blue Giant",      sky:"#08111f", planet:"ice",     count:34, speed:420, fire:0.60, mix:["scout","darter","hulk"]},
- {name:"Ash Field",       sky:"#0d0d12", planet:"moon",    count:38, speed:455, fire:0.75, mix:["darter","mine","hulk"]},
- {name:"Green Drift",     sky:"#07130f", planet:"jade",    count:42, speed:490, fire:0.90, mix:["scout","darter","turret"]},
- {name:"Inner Rings",     sky:"#0a1020", planet:"saturn",  count:46, speed:525, fire:1.05, mix:["darter","hulk","turret"]},
- {name:"Crimson Reach",   sky:"#140a0d", planet:"ember",   count:50, speed:560, fire:1.20, mix:["darter","mine","turret"]},
- {name:"Shattered Moon",  sky:"#0b0e16", planet:"moon",    count:54, speed:600, fire:1.35, mix:["hulk","turret","darter"]},
- {name:"The Long Dark",   sky:"#050710", planet:"void",    count:60, speed:640, fire:1.55, mix:["darter","turret","mine","hulk"]},
- {name:"The Nest",        sky:"#12070c", planet:"ember",   count:26, speed:600, fire:1.30, mix:["darter","turret"], boss:true}
-];
-
-/* ---------- enemies ---------- */
-var TYPE={
- scout: {hp:1,pts:60, r:26,col:"#7fe3b0",spd:1.00,sway:1.0,shoot:0.5},
- darter:{hp:1,pts:110,r:22,col:"#8fd0ff",spd:1.55,sway:2.2,shoot:0.7},
- hulk:  {hp:4,pts:220,r:44,col:"#c9a84c",spd:0.72,sway:0.4,shoot:0.8},
- mine:  {hp:1,pts:90, r:24,col:"#ff8a80",spd:0.85,sway:0.0,shoot:0.0},
- turret:{hp:2,pts:170,r:30,col:"#f5c26b",spd:0.80,sway:0.7,shoot:2.0}
-};
-
-/* ---------- state ---------- */
-var level=1,cfg=SECTORS[0],running=false,paused=true;
-var score=0,kills=0,hull=100,streak=0,mult=1;
-var stars=[],dust=[],foes=[],bolts=[],flak=[],pops=[],rocks=[];
-var boss=null,spawned=0,spawnT=0,shotT=0,shake=0,warp=0,last=0;
-var ship={x:0,y:0,tx:0,ty:0,roll:0,inv:0};
-var prog=load();
-
-function load(){try{var r=localStorage.getItem("aileash.deeprun");
-  return r?JSON.parse(r):{lv:0,best:0};}catch(e){return{lv:0,best:0};}}
-function save(){try{localStorage.setItem("aileash.deeprun",JSON.stringify(prog));}catch(e){}}
-function clamp(v,a,b){return v<a?a:(v>b?b:v);}
-function rnd(a,b){return a+Math.random()*(b-a);}
-function pick(a){return a[(Math.random()*a.length)|0];}
-
-function resize(){
-  dpr=Math.min(window.devicePixelRatio||1,2);
-  W=window.innerWidth;H=window.innerHeight;CX=W/2;CY=H*0.46;
-  cv.width=Math.round(W*dpr);cv.height=Math.round(H*dpr);
-  ctx.setTransform(dpr,0,0,dpr,0,0);
-  F=Math.max(380,Math.min(W,H)*1.15);
-}
-window.addEventListener("resize",resize);
-window.addEventListener("orientationchange",function(){setTimeout(resize,200);});
-
-/* ---------- projection ---------- */
-function proj(x,y,z){
-  var s=F/z;
-  return {x:CX+(x-ship.x*0.45)*s, y:CY+(y-ship.y*0.45)*s, s:s};
-}
-
-/* ---------- world build ---------- */
-function fieldInit(){
-  stars=[];dust=[];rocks=[];
-  for(var i=0;i<190;i++)
-    stars.push({x:rnd(-2600,2600),y:rnd(-1800,1800),z:rnd(60,3600),b:rnd(0.35,1)});
-  for(i=0;i<70;i++)
-    dust.push({x:rnd(-1400,1400),y:rnd(-900,900),z:rnd(60,2400)});
-  if(cfg.planet==="saturn"||cfg.planet==="moon"){
-    for(i=0;i<26;i++)
-      rocks.push({x:rnd(-1600,1600),y:rnd(-700,700),z:rnd(400,3400),r:rnd(6,26),sp:rnd(0.5,1.2)});
-  }
-}
-
-function build(n){
-  level=n;cfg=SECTORS[n-1];
-  foes=[];bolts=[];flak=[];pops=[];boss=null;
-  spawned=0;spawnT=0.8;shotT=0;shake=0;warp=1.1;
-  ship.x=0;ship.y=0;ship.tx=0;ship.ty=0;ship.roll=0;ship.inv=1.4;
-  fieldInit();
-  if(cfg.boss) boss={hp:150,max:150,x:0,y:-40,z:1500,t:0,ph:0,r:190};
-  document.body.style.background=cfg.sky;
-}
-
-/* ---------- spawning ---------- */
-function spawnFoe(){
-  var t=pick(cfg.mix),d=TYPE[t];
-  foes.push({t:t,hp:d.hp,r:d.r,col:d.col,
-    x:rnd(-460,460),y:rnd(-320,300),z:rnd(2400,3000),
-    ph:rnd(0,6.3),fire:rnd(0.8,2.6),dead:false});
-  spawned++;
-}
-
-/* ---------- feedback ---------- */
-var flashEl=document.getElementById("flash"),flashT=0;
-function say(t,c){flashEl.textContent=t;flashEl.style.color=c||"#c9a84c";
-  flashEl.style.opacity="1";flashT=1.1;}
-function pop(x,y,z,col,n){
-  for(var i=0;i<n;i++)
-    pops.push({x:x,y:y,z:z,vx:rnd(-160,160),vy:rnd(-160,160),vz:rnd(-90,140),
-      life:1,col:col});
-}
-
-/* ---------- loop ---------- */
-function step(t){
-  if(!running)return;
-  var dt=Math.min((t-last)/1000,0.05);last=t;
-  if(!paused)update(dt);
-  render(dt);
-  requestAnimationFrame(step);
-}
-
-function update(dt){
-  var sp=cfg.speed*(warp>0?2.6:1);
-  if(warp>0)warp-=dt;
-  if(shake>0)shake-=dt*3;
-  if(ship.inv>0)ship.inv-=dt;
-  if(flashT>0){flashT-=dt;if(flashT<=0)flashEl.style.opacity="0";}
-
-  /* ship easing + bank */
-  ship.x+=(ship.tx-ship.x)*Math.min(1,dt*9);
-  ship.y+=(ship.ty-ship.y)*Math.min(1,dt*9);
-  ship.roll+=(clamp((ship.tx-ship.x)*0.004,-0.42,0.42)-ship.roll)*Math.min(1,dt*6);
-
-  /* starfield */
-  var i,o;
-  for(i=0;i<stars.length;i++){o=stars[i];o.z-=sp*0.9*dt;
-    if(o.z<40){o.z=3600;o.x=rnd(-2600,2600);o.y=rnd(-1800,1800);}}
-  for(i=0;i<dust.length;i++){o=dust[i];o.z-=sp*1.6*dt;
-    if(o.z<40){o.z=2400;o.x=rnd(-1400,1400);o.y=rnd(-900,900);}}
-  for(i=0;i<rocks.length;i++){o=rocks[i];o.z-=sp*o.sp*dt;
-    if(o.z<40){o.z=3400;o.x=rnd(-1600,1600);o.y=rnd(-700,700);}}
-
-  /* spawn */
-  if(spawned<cfg.count){
-    spawnT-=dt;
-    if(spawnT<=0){spawnFoe();spawnT=rnd(0.34,0.92)*(1-Math.min(0.4,level*0.03));}
-  }
-
-  /* guns */
-  shotT-=dt;
-  if(shotT<=0 && warp<=0){
-    bolts.push({x:ship.x-30,y:ship.y+8,z:70,vx:0,vy:0});
-    bolts.push({x:ship.x+30,y:ship.y+8,z:70,vx:0,vy:0});
-    shotT=0.15;
-  }
-
-  /* foes */
-  for(i=foes.length-1;i>=0;i--){
-    var f=foes[i];
-    if(f.dead){foes.splice(i,1);continue;}
-    var d=TYPE[f.t];
-    f.z-=sp*d.spd*dt;
-    f.ph+=dt*1.7;
-    if(d.sway){f.x+=Math.sin(f.ph)*d.sway*46*dt;f.y+=Math.cos(f.ph*0.7)*d.sway*26*dt;}
-    if(f.t==="mine"){f.x+=(ship.x-f.x)*0.28*dt;f.y+=(ship.y-f.y)*0.28*dt;}
-    /* they shoot */
-    if(d.shoot>0 && f.z<2100){
-      f.fire-=dt*d.shoot*cfg.fire;
-      if(f.fire<=0){
-        f.fire=rnd(1.1,2.6);
-        var ax=(ship.x-f.x),ay=(ship.y-f.y);
-        flak.push({x:f.x,y:f.y,z:f.z,vx:ax*0.30,vy:ay*0.30});
-      }
-    }
-    if(f.z<52){
-      var near=Math.abs(f.x-ship.x)<f.r+34 && Math.abs(f.y-ship.y)<f.r+30;
-      if(near) damage(f.t==="mine"?22:15);
-      else {streak=0;mult=1;}
-      pop(f.x,f.y,90,f.col,near?18:5);
-      f.dead=true;
-    }
-  }
-
-  /* boss */
-  if(boss){
-    boss.t+=dt;
-    boss.z=520+Math.sin(boss.t*0.4)*180;
-    boss.x=Math.sin(boss.t*0.55)*300;
-    boss.y=-40+Math.cos(boss.t*0.8)*70;
-    boss.ph-=dt;
-    if(boss.ph<=0){
-      boss.ph=rnd(0.35,0.8);
-      for(var k=-2;k<=2;k++)
-        flak.push({x:boss.x+k*40,y:boss.y+40,z:boss.z,
-          vx:(ship.x-boss.x)*0.3+k*30,vy:(ship.y-boss.y)*0.3});
-    }
-  }
-
-  /* our bolts */
-  for(i=bolts.length-1;i>=0;i--){
-    var b=bolts[i];b.z+=1900*dt;
-    if(b.z>3200){bolts.splice(i,1);streak=0;mult=1;continue;}
-    var hit=false;
-    for(var j=0;j<foes.length;j++){
-      var g=foes[j];if(g.dead)continue;
-      if(Math.abs(b.z-g.z)<70 && Math.abs(b.x-g.x)<g.r+16 && Math.abs(b.y-g.y)<g.r+16){
-        g.hp--;pop(g.x,g.y,g.z,g.col,4);
-        if(g.hp<=0)killFoe(g);
-        hit=true;break;
-      }
-    }
-    if(hit){bolts.splice(i,1);continue;}
-    if(boss && Math.abs(b.z-boss.z)<110 &&
-       Math.abs(b.x-boss.x)<boss.r && Math.abs(b.y-boss.y)<boss.r*0.55){
-      boss.hp--;score+=6*mult;pop(b.x,b.y,b.z,"#ff8a80",3);bolts.splice(i,1);
-      if(boss.hp<=0){
-        score+=4000;kills++;pop(boss.x,boss.y,boss.z,"#ff8a80",120);
-        shake=1.4;boss=null;say("Nest destroyed","#c9a84c");
-      }
-    }
-  }
-
-  /* their flak */
-  for(i=flak.length-1;i>=0;i--){
-    var fl=flak[i];fl.z-=(sp*0.9+520)*dt;fl.x+=fl.vx*dt;fl.y+=fl.vy*dt;
-    if(fl.z<44){
-      if(Math.abs(fl.x-ship.x)<38 && Math.abs(fl.y-ship.y)<32) damage(9);
-      flak.splice(i,1);
-    }
-  }
-
-  /* debris */
-  for(i=pops.length-1;i>=0;i--){
-    var p=pops[i];
-    p.x+=p.vx*dt;p.y+=p.vy*dt;p.z+=p.vz*dt-sp*dt;p.life-=dt*1.25;
-    if(p.life<=0||p.z<20)pops.splice(i,1);
-  }
-
-  hud();
-  if(spawned>=cfg.count && foes.length===0 && !boss && flashT<=0) clear();
-}
-
-function killFoe(g){
-  g.dead=true;kills++;streak++;
-  mult=Math.min(6,1+Math.floor(streak/6));
-  var depth=1+Math.min(1.2,g.z/2200);
-  score+=Math.round(TYPE[g.t].pts*mult*depth);
-  pop(g.x,g.y,g.z,g.col,20);
-}
-
-function damage(n){
-  if(ship.inv>0)return;
-  hull-=n;streak=0;mult=1;shake=1;ship.inv=0.7;
-  document.getElementById("hullF").style.width=Math.max(0,hull)+"%";
-  if(hull<=0)over();
-}
-
-/* ---------- render ---------- */
-function render(dt){
-  ctx.save();
-  if(shake>0)ctx.translate(rnd(-5,5)*shake,rnd(-5,5)*shake);
-
-  ctx.fillStyle=cfg.sky;ctx.fillRect(-8,-8,W+16,H+16);
-  drawBackdrop();
-
-  /* stars */
-  for(var i=0;i<stars.length;i++){
-    var s=stars[i],p=proj(s.x,s.y,s.z);
-    if(p.x<-40||p.x>W+40||p.y<-40||p.y>H+40)continue;
-    var a=Math.min(1,s.b*(1-s.z/3600)+0.12), sz=Math.max(0.6,p.s*1.6);
-    ctx.globalAlpha=a;ctx.fillStyle="#dfe8ff";
-    if(warp>0){ctx.fillRect(p.x,p.y,sz,sz+warp*26*p.s*10);}
-    else ctx.fillRect(p.x,p.y,sz,sz);
-  }
-  ctx.globalAlpha=1;
-
-  /* dust streaks give the sense of speed */
-  ctx.strokeStyle="rgba(180,205,255,.30)";ctx.lineWidth=1;
-  for(i=0;i<dust.length;i++){
-    var d=dust[i],a1=proj(d.x,d.y,d.z),a2=proj(d.x,d.y,d.z+120);
-    if(a1.x<-30||a1.x>W+30)continue;
-    ctx.beginPath();ctx.moveTo(a1.x,a1.y);ctx.lineTo(a2.x,a2.y);ctx.stroke();
-  }
-
-  /* asteroid chunks */
-  for(i=0;i<rocks.length;i++){
-    var r=rocks[i],rp=proj(r.x,r.y,r.z),rr=r.r*rp.s;
-    if(rr<0.4||rp.x<-60||rp.x>W+60)continue;
-    ctx.globalAlpha=Math.min(1,1.4-r.z/3400);
-    ctx.fillStyle="#3b3f4d";
-    ctx.beginPath();ctx.arc(rp.x,rp.y,rr,0,6.284);ctx.fill();
-    ctx.fillStyle="#4b5060";
-    ctx.beginPath();ctx.arc(rp.x-rr*0.3,rp.y-rr*0.3,rr*0.55,0,6.284);ctx.fill();
-  }
-  ctx.globalAlpha=1;
-
-  /* everything with depth, far to near */
-  var list=[];
-  for(i=0;i<foes.length;i++)list.push({k:"f",o:foes[i],z:foes[i].z});
-  if(boss)list.push({k:"B",o:boss,z:boss.z});
-  for(i=0;i<pops.length;i++)list.push({k:"p",o:pops[i],z:pops[i].z});
-  for(i=0;i<flak.length;i++)list.push({k:"x",o:flak[i],z:flak[i].z});
-  for(i=0;i<bolts.length;i++)list.push({k:"b",o:bolts[i],z:bolts[i].z});
-  list.sort(function(a,b){return b.z-a.z;});
-
-  for(i=0;i<list.length;i++){
-    var it=list[i],o=it.o,p=proj(o.x,o.y,o.z);
-    if(o.z<30)continue;
-    if(it.k==="f")drawFoe(o,p);
-    else if(it.k==="B")drawBoss(o,p);
-    else if(it.k==="p"){
-      ctx.globalAlpha=Math.max(0,o.life);ctx.fillStyle=o.col;
-      var ps=Math.max(1,4*p.s);ctx.fillRect(p.x,p.y,ps,ps);ctx.globalAlpha=1;
-    }
-    else if(it.k==="x"){
-      var xs=Math.max(2,9*p.s);
-      ctx.fillStyle="#ff8a80";
-      ctx.beginPath();ctx.arc(p.x,p.y,xs,0,6.284);ctx.fill();
-      ctx.globalAlpha=.35;ctx.beginPath();ctx.arc(p.x,p.y,xs*2.1,0,6.284);ctx.fill();
-      ctx.globalAlpha=1;
-    }
-    else{
-      var q=proj(o.x,o.y,o.z-150);
-      ctx.strokeStyle="#9ff3c8";ctx.lineWidth=Math.max(1.2,3*p.s);ctx.lineCap="round";
-      ctx.beginPath();ctx.moveTo(q.x,q.y);ctx.lineTo(p.x,p.y);ctx.stroke();
-    }
-  }
-
-  drawShip();
-  ctx.restore();
-}
-
-function drawBackdrop(){
-  var t=performance.now()/1000;
-  var px=CX-ship.x*0.14, py=CY-ship.y*0.10;
-  var k=cfg.planet;
-
-  if(k==="void"){
-    var neb=ctx.createRadialGradient(px+W*0.2,py-H*0.1,10,px+W*0.2,py-H*0.1,W*0.7);
-    neb.addColorStop(0,"rgba(60,40,90,.30)");neb.addColorStop(1,"rgba(5,7,15,0)");
-    ctx.fillStyle=neb;ctx.fillRect(0,0,W,H);
-    return;
-  }
-
-  var R=Math.min(W,H)*(k==="saturn"?0.42:0.34);
-  var cxp=px+W*0.24, cyp=py-H*0.16;
-
-  var body={saturn:["#e6d3a3","#9c8352"],rust:["#c97b4a","#5d2f1c"],
-    ice:["#9ad4ff","#2b5b86"],moon:["#c9ccd6","#4a4e5c"],
-    jade:["#8fe0b4","#27604a"],ember:["#ff9a7a","#6d2222"]}[k]||["#c9ccd6","#4a4e5c"];
-
-  if(k==="saturn"){ ctx.save();ctx.translate(cxp,cyp);ctx.rotate(-0.42);
-    ctx.strokeStyle="rgba(214,193,150,.55)";ctx.lineWidth=R*0.16;
-    ctx.beginPath();ctx.ellipse(0,0,R*1.75,R*0.42,0,Math.PI,Math.PI*2);ctx.stroke();
-    ctx.restore(); }
-
-  var g=ctx.createRadialGradient(cxp-R*0.35,cyp-R*0.35,R*0.1,cxp,cyp,R);
-  g.addColorStop(0,body[0]);g.addColorStop(1,body[1]);
-  ctx.fillStyle=g;ctx.beginPath();ctx.arc(cxp,cyp,R,0,6.284);ctx.fill();
-
-  if(k==="moon"){
-    ctx.fillStyle="rgba(0,0,0,.16)";
-    for(var i=0;i<7;i++){
-      var a=i*1.4+1, rr=R*(0.08+((i*37)%11)/60);
-      ctx.beginPath();ctx.arc(cxp+Math.cos(a)*R*0.5,cyp+Math.sin(a)*R*0.45,rr,0,6.284);ctx.fill();
-    }
-  }
-  if(k==="saturn"||k==="jade"||k==="rust"){
-    ctx.globalAlpha=.18;ctx.fillStyle="rgba(0,0,0,.6)";
-    for(var b=0;b<4;b++){
-      ctx.beginPath();
-      ctx.ellipse(cxp,cyp-R*0.5+b*R*0.34+Math.sin(t*0.2+b)*3,R*0.92,R*0.075,0,0,6.284);
-      ctx.fill();
-    }
-    ctx.globalAlpha=1;
-  }
-  ctx.fillStyle="rgba(5,7,15,.55)";
-  ctx.beginPath();ctx.arc(cxp+R*0.30,cyp+R*0.12,R,0,6.284);ctx.fill();
-
-  if(k==="saturn"){ ctx.save();ctx.translate(cxp,cyp);ctx.rotate(-0.42);
-    ctx.strokeStyle="rgba(232,214,175,.75)";ctx.lineWidth=R*0.16;
-    ctx.beginPath();ctx.ellipse(0,0,R*1.75,R*0.42,0,0,Math.PI);ctx.stroke();
-    ctx.strokeStyle="rgba(232,214,175,.30)";ctx.lineWidth=R*0.05;
-    ctx.beginPath();ctx.ellipse(0,0,R*2.05,R*0.50,0,0,Math.PI);ctx.stroke();
-    ctx.restore(); }
-}
-
-function drawFoe(f,p){
-  var r=f.r*p.s;
-  if(r<0.6)return;
-  ctx.globalAlpha=Math.min(1,(3000-f.z)/700+0.25);
-  if(f.t==="mine"){
-    ctx.strokeStyle=f.col;ctx.lineWidth=Math.max(1,r*0.16);
-    for(var i=0;i<8;i++){var a=i*0.785+f.ph;
-      ctx.beginPath();ctx.moveTo(p.x+Math.cos(a)*r*0.6,p.y+Math.sin(a)*r*0.6);
-      ctx.lineTo(p.x+Math.cos(a)*r*1.25,p.y+Math.sin(a)*r*1.25);ctx.stroke();}
-    ctx.fillStyle=f.col;ctx.beginPath();ctx.arc(p.x,p.y,r*0.6,0,6.284);ctx.fill();
-  }else{
-    ctx.fillStyle=f.col;
-    ctx.beginPath();
-    ctx.moveTo(p.x,p.y+r*0.9);
-    ctx.lineTo(p.x+r*1.15,p.y-r*0.5);
-    ctx.lineTo(p.x+r*0.4,p.y-r*0.15);
-    ctx.lineTo(p.x-r*0.4,p.y-r*0.15);
-    ctx.lineTo(p.x-r*1.15,p.y-r*0.5);
-    ctx.closePath();ctx.fill();
-    ctx.fillStyle="rgba(5,7,15,.75)";
-    ctx.beginPath();ctx.arc(p.x,p.y+r*0.05,r*0.3,0,6.284);ctx.fill();
-    if(f.t==="hulk"){ctx.strokeStyle="rgba(5,7,15,.6)";ctx.lineWidth=Math.max(1,r*0.12);
-      ctx.beginPath();ctx.moveTo(p.x-r,p.y-r*0.42);ctx.lineTo(p.x+r,p.y-r*0.42);ctx.stroke();}
-    ctx.fillStyle="rgba(255,255,255,.65)";
-    ctx.fillRect(p.x-r*0.12,p.y-r*0.62,r*0.24,r*0.2);
-  }
-  ctx.globalAlpha=1;
-}
-
-function drawBoss(b,p){
-  var r=b.r*p.s;
-  ctx.fillStyle="#7a2230";
-  ctx.beginPath();ctx.ellipse(p.x,p.y,r,r*0.44,0,0,6.284);ctx.fill();
-  ctx.fillStyle="#ff8a80";
-  ctx.beginPath();ctx.ellipse(p.x,p.y-r*0.12,r*0.62,r*0.30,0,0,6.284);ctx.fill();
-  ctx.fillStyle="#05070f";
-  for(var i=-2;i<=2;i++)ctx.fillRect(p.x+i*r*0.24-r*0.05,p.y+r*0.12,r*0.1,r*0.12);
-  var bw=Math.min(W*0.6,r*1.6);
-  ctx.fillStyle="rgba(255,255,255,.18)";ctx.fillRect(p.x-bw/2,p.y-r*0.62,bw,5);
-  ctx.fillStyle="#ff8a80";ctx.fillRect(p.x-bw/2,p.y-r*0.62,bw*(b.hp/b.max),5);
-}
-
-function drawShip(){
-  var sx=CX+ship.x*0.55, sy=H-72+ship.y*0.18;
-  if(ship.inv>0 && ((ship.inv*14)|0)%2)return;
-  ctx.save();ctx.translate(sx,sy);ctx.rotate(ship.roll);
-  ctx.fillStyle="rgba(245,194,107,.9)";
-  ctx.fillRect(-13,16,7,10+Math.random()*13);
-  ctx.fillRect(6,16,7,10+Math.random()*13);
-  ctx.fillStyle="#c9a84c";
-  ctx.beginPath();
-  ctx.moveTo(0,-26);ctx.lineTo(15,6);ctx.lineTo(40,18);ctx.lineTo(34,24);
-  ctx.lineTo(9,20);ctx.lineTo(-9,20);ctx.lineTo(-34,24);ctx.lineTo(-40,18);
-  ctx.lineTo(-15,6);ctx.closePath();ctx.fill();
-  ctx.fillStyle="#0d1424";
-  ctx.beginPath();ctx.moveTo(0,-16);ctx.lineTo(7,4);ctx.lineTo(-7,4);ctx.closePath();ctx.fill();
-  ctx.fillStyle="#7fe3b0";ctx.fillRect(-2.5,-10,5,9);
-  ctx.restore();
-}
-
-/* ---------- hud ---------- */
-function hud(){
-  document.getElementById("hScore").textContent=score;
-  document.getElementById("hLevel").textContent=level;
-  document.getElementById("combo").textContent="x"+mult;
-}
-
-/* ---------- flow ---------- */
-function show(id){
-  ["scTitle","scPick","scNext","scOver"].forEach(function(s){
-    document.getElementById(s).classList.toggle("on",s===id);});
-  paused=!!id;
-  document.getElementById("hint").style.opacity=id?"0":"1";
-}
-function startLevel(n){
-  resize();build(n);hud();show(null);
-  document.getElementById("hullF").style.width=hull+"%";
-  if(!running){running=true;last=performance.now();requestAnimationFrame(step);}
-  say(cfg.name,"#c9a84c");
-}
-function startRun(n){score=0;kills=0;hull=100;streak=0;mult=1;startLevel(n);}
-
-function clear(){
-  paused=true;
-  if(level>(prog.lv||0))prog.lv=level;
-  if(score>(prog.best||0))prog.best=score;
-  save();
-  hull=Math.min(100,hull+18);
-  document.getElementById("hullF").style.width=hull+"%";
-  document.getElementById("nScore").textContent=score;
-  document.getElementById("nKills").textContent=kills;
-  if(level>=MAXLV){
-    document.getElementById("nextTitle").textContent="You made it back";
-    document.getElementById("nextNote").textContent="All ten sectors run. Best score "+prog.best+".";
-    document.getElementById("bNext").textContent="Back to start";
-  }else{
-    document.getElementById("nextTitle").textContent=cfg.name+" clear";
-    document.getElementById("nextNote").textContent=
-      level===9?"Sector 10 is the Nest. Something big is waiting.":
-      "Hull patched. Next sector runs faster.";
-    document.getElementById("bNext").textContent="Sector "+(level+1);
-  }
-  show("scNext");
-}
-function over(){
-  paused=true;running=false;
-  if(score>(prog.best||0)){prog.best=score;save();}
-  document.getElementById("oScore").textContent=score;
-  document.getElementById("oLevel").textContent=level;
-  document.getElementById("oKills").textContent=kills;
-  document.getElementById("overNote").textContent="Best score so far "+(prog.best||0)+".";
-  show("scOver");
-}
-
-/* ---------- input ---------- */
-var drag=false,ox=0,oy=0,sx0=0,sy0=0;
-function pt(e){var t=e.touches?e.touches[0]:e;return {x:t.clientX,y:t.clientY};}
-cv.addEventListener("touchstart",function(e){
-  drag=true;var p=pt(e);ox=p.x;oy=p.y;sx0=ship.tx;sy0=ship.ty;},{passive:false});
-cv.addEventListener("touchmove",function(e){
-  if(!drag||paused)return;var p=pt(e);
-  ship.tx=clamp(sx0+(p.x-ox)*1.7,-430,430);
-  ship.ty=clamp(sy0+(p.y-oy)*1.4,-260,240);
-  if(e.cancelable)e.preventDefault();},{passive:false});
-cv.addEventListener("touchend",function(){drag=false;});
-cv.addEventListener("mousedown",function(e){drag=true;var p=pt(e);ox=p.x;oy=p.y;
-  sx0=ship.tx;sy0=ship.ty;});
-window.addEventListener("mousemove",function(e){
-  if(!drag||paused)return;var p=pt(e);
-  ship.tx=clamp(sx0+(p.x-ox)*1.7,-430,430);
-  ship.ty=clamp(sy0+(p.y-oy)*1.4,-260,240);});
-window.addEventListener("mouseup",function(){drag=false;});
-window.addEventListener("keydown",function(e){
-  if(e.key==="ArrowLeft")ship.tx=clamp(ship.tx-46,-430,430);
-  if(e.key==="ArrowRight")ship.tx=clamp(ship.tx+46,-430,430);
-  if(e.key==="ArrowUp")ship.ty=clamp(ship.ty-40,-260,240);
-  if(e.key==="ArrowDown")ship.ty=clamp(ship.ty+40,-260,240);
-});
-
-/* ---------- menus ---------- */
-document.getElementById("bStart").onclick=function(){startRun(1);};
-document.getElementById("bPick").onclick=function(){grid();show("scPick");};
-document.getElementById("bBack").onclick=function(){show("scTitle");};
-document.getElementById("bQuit").onclick=function(){running=false;show("scTitle");};
-document.getElementById("bHome").onclick=function(){show("scTitle");};
-document.getElementById("bRetry").onclick=function(){startRun(level);};
-document.getElementById("bNext").onclick=function(){
-  if(level>=MAXLV){running=false;show("scTitle");}else startLevel(level+1);};
-
-function grid(){
-  var g=document.getElementById("lv"),best=prog.lv||0,s="";
-  document.getElementById("pickSub").textContent=best+" of "+MAXLV+" cleared";
-  for(var i=1;i<=MAXLV;i++){
-    var c=i<=best?"done":(i<=best+1?"":"lock");
-    s+='<button class="'+c+'" data-n="'+i+'">'+i+'</button>';
-  }
-  g.innerHTML=s;
-  Array.prototype.forEach.call(g.querySelectorAll("button"),function(b){
-    if(b.classList.contains("lock"))return;
-    b.onclick=function(){startRun(parseInt(b.dataset.n,10));};});
-}
-
-document.getElementById("bestLine").textContent=
-  prog.best?"Best score "+prog.best+" — "+(prog.lv||0)+" of 10 sectors":"";
-resize();cfg=SECTORS[0];fieldInit();hud();render(0);
-})();
-</script>
-</body>
-</html>
-
-```
+- `compliance-assistant.html`
 
 
 ## `aitxt-popup-live.html`
@@ -1789,6 +915,796 @@ function shareCert(){
 }
 </script>
 
+</body>
+</html>
+
+```
+
+
+## `compliance-assistant.html`
+
+782 lines, 57778 bytes
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Build a recurring-revenue business from nothing &middot; 50p in, your price out</title>
+<meta name="description" content="Buy the phone safety package at 50p per device per month. Sell it at your price. No stock, no fees, no capital. Recurring revenue that becomes a book worth selling.">
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;800;900&family=DM+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--navy:#070b16;--surface:#111a30;--surface2:#0c1322;--border:#1e2a45;--gold:#c9a84c;--gold2:#f0d78a;--green:#7fe3b0;--green2:#2ee68a;--cyan:#00d4ff;--red:#ff6b6b;--mono:'JetBrains Mono',monospace;--sans:'DM Sans',sans-serif;--display:'Playfair Display',serif;--muted:#8a90a6}
+html{scroll-behavior:smooth}
+body{background:var(--navy);color:#fff;font-family:var(--sans);line-height:1.7;-webkit-font-smoothing:antialiased;overflow-x:hidden}
+
+nav{position:sticky;top:0;z-index:100;background:rgba(7,11,22,0.96);backdrop-filter:blur(14px);padding:0 18px;height:56px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid rgba(201,168,76,0.15)}
+.nav-logo{font-family:var(--display);font-size:16px;color:#fff;font-weight:900;text-decoration:none}.nav-logo span{color:var(--gold)}
+.nav-links{display:flex;gap:14px;align-items:center}
+.nav-links a{color:rgba(255,255,255,0.45);text-decoration:none;font-size:13px}.nav-links a:hover{color:#fff}
+.nav-cta{background:var(--gold)!important;color:var(--navy)!important;padding:8px 15px;font-weight:800!important;border-radius:6px}
+
+.hero{padding:50px 20px 42px;text-align:center;position:relative;overflow:hidden}
+.hero::before{content:'';position:absolute;inset:0;background:radial-gradient(ellipse at 50% -10%,rgba(201,168,76,0.14),transparent 58%)}
+.hero::after{content:'';position:absolute;left:0;right:0;bottom:0;height:1px;background:linear-gradient(90deg,transparent,rgba(201,168,76,0.4),transparent)}
+.hero-in{max-width:800px;margin:0 auto;position:relative}
+.kick{display:inline-block;font-family:var(--mono);font-size:10px;letter-spacing:2.4px;text-transform:uppercase;color:var(--gold);border:1px solid rgba(201,168,76,0.35);background:rgba(201,168,76,0.07);padding:6px 14px;border-radius:100px;margin-bottom:20px}
+h1{font-family:var(--display);font-size:clamp(33px,7.6vw,62px);line-height:1.03;font-weight:900;margin-bottom:18px;letter-spacing:-0.5px}
+h1 em{font-style:normal;background:linear-gradient(100deg,var(--gold),var(--gold2));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+.hero-sub{font-size:17px;color:rgba(255,255,255,0.58);line-height:1.72;max-width:590px;margin:0 auto}
+.hero-sub b{color:#fff;font-weight:700}
+.flow{display:flex;gap:6px;max-width:540px;margin:30px auto 0}
+.flow-b{flex:1;background:var(--surface2);border:1px solid var(--border);border-radius:11px;padding:15px 8px}
+.flow-b.hot{border-color:rgba(127,227,176,0.45);background:rgba(127,227,176,0.06)}
+.flow-b .k{font-family:var(--mono);font-size:8px;letter-spacing:1.6px;text-transform:uppercase;color:rgba(255,255,255,0.3);margin-bottom:6px}
+.flow-b .v{font-family:var(--display);font-size:clamp(18px,4.4vw,26px);font-weight:900;line-height:1.05}
+.c-dim{color:rgba(255,255,255,0.45)}.c-gold{color:var(--gold)}.c-green{color:var(--green)}
+
+section.sec{max-width:880px;margin:0 auto;padding:58px 20px 0}
+.eyebrow{font-family:var(--mono);font-size:10px;letter-spacing:2.6px;text-transform:uppercase;color:rgba(201,168,76,0.7);margin-bottom:12px;display:block}
+h2{font-family:var(--display);font-size:clamp(27px,5.4vw,42px);font-weight:900;line-height:1.07;margin-bottom:14px;letter-spacing:-0.3px}
+h2 em{font-style:normal;background:linear-gradient(100deg,var(--gold),var(--gold2));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+h2 em.g{background:linear-gradient(100deg,var(--green),var(--green2));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+.sub{font-size:15.5px;color:rgba(255,255,255,0.52);line-height:1.8;max-width:640px;margin-bottom:28px}
+.sub b{color:#fff}
+
+.panel{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:22px 19px;margin-bottom:16px}
+.ctrl{margin-bottom:20px}.ctrl:last-child{margin-bottom:0}
+.ctrl-top{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:9px;gap:12px}
+.ctrl-lbl{font-family:var(--mono);font-size:9.5px;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,0.35)}
+.ctrl-val{font-family:var(--display);font-size:24px;font-weight:900;color:var(--gold);line-height:1;white-space:nowrap}
+input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:7px;border-radius:4px;background:rgba(255,255,255,0.09);outline:none}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:30px;height:30px;border-radius:50%;background:linear-gradient(160deg,var(--gold2),var(--gold));cursor:pointer;border:4px solid var(--navy);box-shadow:0 0 0 1px rgba(201,168,76,0.6),0 0 18px rgba(201,168,76,0.3)}
+input[type=range]::-moz-range-thumb{width:30px;height:30px;border-radius:50%;background:var(--gold);cursor:pointer;border:4px solid var(--navy)}
+.hint{font-family:var(--mono);font-size:9.5px;color:rgba(255,255,255,0.26);margin-top:8px;line-height:1.7}
+
+.graph{background:var(--surface2);border:1px solid var(--border);border-radius:13px;padding:18px 12px 8px;margin-bottom:16px}
+.graph-t{font-family:var(--mono);font-size:9.5px;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,0.32);padding-left:4px}
+.graph-s{font-family:var(--mono);font-size:9px;color:rgba(255,255,255,0.22);padding-left:4px;margin-bottom:12px}
+svg.chart{width:100%;height:auto;display:block;overflow:visible}
+.legend{display:flex;gap:15px;flex-wrap:wrap;padding:11px 4px 3px;font-family:var(--mono);font-size:9px;letter-spacing:1px;color:rgba(255,255,255,0.33)}
+.legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px;vertical-align:-1px}
+
+.figs{display:grid;grid-template-columns:1fr 1fr;gap:2px;background:rgba(255,255,255,0.05);border-radius:12px;overflow:hidden;margin-bottom:14px}
+.fig{background:var(--surface2);padding:16px 12px;text-align:center}
+.fig .k{font-family:var(--mono);font-size:8.5px;letter-spacing:1.5px;text-transform:uppercase;color:rgba(255,255,255,0.28);margin-bottom:6px}
+.fig .v{font-family:var(--display);font-size:clamp(21px,5.2vw,31px);font-weight:900;line-height:1}
+.fig .s{font-family:var(--mono);font-size:8.5px;color:rgba(255,255,255,0.22);margin-top:5px}
+
+.asset{background:linear-gradient(160deg,rgba(201,168,76,0.1),rgba(127,227,176,0.05));border:2px solid rgba(201,168,76,0.3);border-radius:16px;padding:24px 20px;text-align:center;margin-bottom:14px}
+.asset .k{font-family:var(--mono);font-size:9.5px;letter-spacing:2.4px;text-transform:uppercase;color:rgba(255,255,255,0.4);margin-bottom:10px}
+.asset .v{font-family:var(--display);font-size:clamp(38px,10vw,66px);font-weight:900;line-height:1;background:linear-gradient(100deg,var(--gold),var(--gold2));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+.asset .s{font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.32);margin-top:11px;line-height:1.7;max-width:430px;margin-left:auto;margin-right:auto}
+
+.rung{display:flex;align-items:center;gap:13px;background:var(--surface2);border:1px solid var(--border);border-radius:11px;padding:13px 15px;margin-bottom:7px}
+.rung.hit{border-color:rgba(127,227,176,0.42);background:rgba(127,227,176,0.05)}
+.rung.now{border-color:var(--gold);background:rgba(201,168,76,0.09)}
+.rung-n{font-family:var(--display);font-size:19px;font-weight:900;color:rgba(255,255,255,0.35);min-width:62px;line-height:1.1}
+.rung.hit .rung-n{color:var(--green)}.rung.now .rung-n{color:var(--gold)}
+.rung-n small{display:block;font-family:var(--mono);font-size:7.5px;letter-spacing:1.3px;text-transform:uppercase;color:rgba(255,255,255,0.25);font-weight:400;margin-top:3px}
+.rung-mid{flex:1;min-width:0}
+.rung-mid .t{font-size:14px;font-weight:700;line-height:1.35}
+.rung-mid .d{font-size:12.5px;color:rgba(255,255,255,0.42);line-height:1.5;margin-top:2px}
+.rung-amt{font-family:var(--display);font-size:18px;font-weight:900;color:var(--green);text-align:right;white-space:nowrap}
+.rung-amt small{display:block;font-family:var(--mono);font-size:7.5px;color:rgba(255,255,255,0.25);font-weight:400;letter-spacing:1px;margin-top:3px}
+
+.vs{display:grid;grid-template-columns:1fr 1fr;gap:2px;background:rgba(255,255,255,0.05);border-radius:12px;overflow:hidden}
+.vs-col{background:var(--surface2);padding:23px 19px}
+.vs-col.bad h3{color:rgba(255,255,255,0.4)}
+.vs-col.good h3{background:linear-gradient(100deg,var(--green),var(--green2));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+.vs-col h3{font-family:var(--display);font-size:19px;font-weight:900;margin-bottom:14px}
+.vs-col li{list-style:none;font-size:13.5px;line-height:1.6;padding:9px 0 9px 20px;position:relative;color:rgba(255,255,255,0.5);border-bottom:1px solid rgba(255,255,255,0.04)}
+.vs-col li:last-child{border-bottom:none}
+.vs-col li b{color:#fff}
+.vs-col.bad li::before{content:'\2715';position:absolute;left:0;color:var(--red);opacity:.7}
+.vs-col.good li::before{content:'\2713';position:absolute;left:0;color:var(--green)}
+
+.packs{display:grid;grid-template-columns:1fr 1fr;gap:11px}
+.pk{background:var(--surface);border:1px solid var(--border);border-radius:13px;padding:19px}
+.pk .tag{font-family:var(--mono);font-size:8.5px;letter-spacing:1.5px;text-transform:uppercase;padding:3px 9px;border-radius:4px;display:inline-block;margin-bottom:10px}
+.tg-red{color:var(--red);background:rgba(255,107,107,0.09);border:1px solid rgba(255,107,107,0.3)}
+.tg-cyan{color:var(--cyan);background:rgba(0,212,255,0.08);border:1px solid rgba(0,212,255,0.3)}
+.tg-green{color:var(--green);background:rgba(127,227,176,0.08);border:1px solid rgba(127,227,176,0.3)}
+.pk h3{font-family:var(--display);font-size:19px;font-weight:900;margin-bottom:6px}
+.pk .one{font-size:14px;color:rgba(255,255,255,0.72);font-weight:600;margin-bottom:9px}
+.pk p{font-size:13.5px;color:rgba(255,255,255,0.47);line-height:1.7}
+.pk p b{color:rgba(255,255,255,0.82)}
+.say{background:rgba(201,168,76,0.06);border-left:3px solid var(--gold);padding:10px 13px;margin-top:12px;border-radius:0 6px 6px 0}
+.say .k{font-family:var(--mono);font-size:8px;letter-spacing:1.5px;text-transform:uppercase;color:var(--gold);margin-bottom:4px}
+.say p{font-size:13px;color:rgba(255,255,255,0.65);font-style:italic;margin:0}
+
+.spotlight{background:linear-gradient(150deg,rgba(201,168,76,0.09),rgba(0,212,255,0.04));border:2px solid rgba(201,168,76,0.28);border-radius:16px;padding:26px 22px}
+.spotlight h3{font-family:var(--display);font-size:clamp(24px,5vw,34px);font-weight:900;margin-bottom:10px;line-height:1.1}
+.spotlight h3 em{font-style:normal;color:var(--gold)}
+.spotlight>p{font-size:15px;color:rgba(255,255,255,0.58);line-height:1.75;margin-bottom:18px}
+.spotlight>p b{color:#fff}
+.sp-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:16px}
+.sp{background:rgba(0,0,0,0.28);border:1px solid rgba(255,255,255,0.07);border-radius:10px;padding:15px 17px}
+.sp .t{font-size:14px;font-weight:700;color:var(--gold);margin-bottom:5px}
+.sp p{font-size:13px;color:rgba(255,255,255,0.5);line-height:1.65;margin:0}
+
+.script{background:var(--surface);border:1px solid var(--border);border-radius:13px;padding:19px;margin-bottom:10px}
+.script-h{display:flex;justify-content:space-between;align-items:baseline;gap:12px;margin-bottom:11px;flex-wrap:wrap}
+.script-h h4{font-family:var(--display);font-size:18px;font-weight:900}
+.script-h .who{font-family:var(--mono);font-size:9px;letter-spacing:1.4px;text-transform:uppercase;color:var(--cyan)}
+.words{background:rgba(0,0,0,0.35);border:1px solid rgba(0,212,255,0.14);border-radius:8px;padding:14px 16px;font-size:14px;color:rgba(255,255,255,0.75);line-height:1.75;font-style:italic}
+.words b{color:var(--gold);font-style:normal}
+.script .after{font-size:13px;color:rgba(255,255,255,0.42);line-height:1.65;margin-top:10px}
+.script .after b{color:#fff}
+
+.claims{display:grid;grid-template-columns:1fr 1fr;gap:2px;background:rgba(255,255,255,0.05);border-radius:12px;overflow:hidden}
+.cl{background:var(--surface2);padding:21px 18px}
+.cl h4{font-family:var(--display);font-size:17px;font-weight:900;margin-bottom:12px}
+.cl.y h4{color:var(--green)}.cl.n h4{color:var(--red)}
+.cl li{list-style:none;font-size:13.5px;line-height:1.6;padding:8px 0 8px 21px;position:relative;color:rgba(255,255,255,0.52);border-bottom:1px solid rgba(255,255,255,0.04)}
+.cl li:last-child{border-bottom:none}
+.cl.y li::before{content:'\2713';position:absolute;left:0;color:var(--green);font-weight:700}
+.cl.n li::before{content:'\2715';position:absolute;left:0;color:var(--red);font-weight:700}
+
+.note{border-radius:10px;padding:14px 18px;font-size:13.5px;line-height:1.75;margin-top:14px}
+.note-cyan{background:rgba(0,212,255,0.05);border:1px solid rgba(0,212,255,0.22);color:rgba(255,255,255,0.58)}
+.note-cyan b{color:var(--cyan)}
+.note-red{background:rgba(255,107,107,0.05);border:1px solid rgba(255,107,107,0.24);color:rgba(255,255,255,0.58)}
+.note-red b{color:var(--red)}
+.note-gold{background:rgba(201,168,76,0.05);border:1px solid rgba(201,168,76,0.28);color:rgba(255,255,255,0.58)}
+.note-gold b{color:var(--gold)}
+
+/* SIGNUP */
+.signup{background:linear-gradient(160deg,rgba(201,168,76,0.08),rgba(127,227,176,0.04));border:2px solid rgba(201,168,76,0.3);border-radius:16px;padding:28px 22px}
+.signup h3{font-family:var(--display);font-size:clamp(25px,5.4vw,36px);font-weight:900;margin-bottom:8px;line-height:1.1}
+.signup>p{font-size:14.5px;color:rgba(255,255,255,0.52);line-height:1.7;margin-bottom:22px}
+.fg{margin-bottom:11px}
+.fg label{display:block;font-family:var(--mono);font-size:9px;color:rgba(255,255,255,0.3);letter-spacing:1.8px;text-transform:uppercase;margin-bottom:6px}
+.fg input,.fg select{width:100%;background:rgba(255,255,255,0.05);border:2px solid rgba(255,255,255,0.09);color:#fff;padding:13px 14px;font-size:15px;font-family:var(--sans);outline:none;border-radius:7px}
+.fg input:focus,.fg select:focus{border-color:var(--gold)}
+.fg input::placeholder{color:rgba(255,255,255,0.2)}
+.fg select option{background:var(--navy)}
+.fg2{display:grid;grid-template-columns:1fr 1fr;gap:11px}
+.btn-full{width:100%;padding:16px;font-size:16px;font-weight:800;border-radius:8px;border:none;cursor:pointer;font-family:var(--sans);background:linear-gradient(140deg,var(--gold2),var(--gold));color:var(--navy);margin-top:8px;transition:all .2s}
+.btn-full:hover{transform:translateY(-2px)}
+.btn-full:disabled{opacity:.5;transform:none}
+.err{display:none;color:var(--red);font-family:var(--mono);font-size:11.5px;margin-top:11px;padding:11px 13px;background:rgba(255,107,107,0.08);border-radius:7px;border:1px solid rgba(255,107,107,0.22);line-height:1.6}
+.err.show{display:block}
+.got{display:none;margin-top:20px;background:rgba(0,0,0,0.35);border:1px solid rgba(201,168,76,0.25);border-radius:12px;padding:20px}
+.got.show{display:block}
+.got-k{font-family:var(--mono);font-size:8.5px;letter-spacing:1.8px;color:var(--gold);text-transform:uppercase;margin-bottom:7px}
+.got-v{font-family:var(--mono);font-size:12px;color:var(--green);word-break:break-all;background:rgba(0,0,0,0.4);padding:11px 13px;border-radius:6px;margin-bottom:16px;line-height:1.6}
+.got-code{font-family:var(--display);font-size:clamp(26px,7vw,38px);font-weight:900;color:var(--green);letter-spacing:2px;margin:4px 0 8px;word-break:break-all}
+.cpy{background:rgba(0,212,255,0.09);border:1px solid rgba(0,212,255,0.25);color:var(--cyan);padding:10px 18px;border-radius:6px;font-family:var(--mono);font-size:10px;cursor:pointer;letter-spacing:1.4px;text-transform:uppercase;margin-top:6px}
+.next{margin-top:18px;padding-top:16px;border-top:1px solid rgba(255,255,255,0.08);font-size:13.5px;color:rgba(255,255,255,0.5);line-height:1.75}
+.next b{color:#fff}
+
+.faq{background:var(--surface);border:1px solid var(--border);border-radius:10px;margin-bottom:8px;overflow:hidden}
+.faq-q{padding:15px 18px;font-size:14.5px;font-weight:600;cursor:pointer;display:flex;justify-content:space-between;gap:14px;align-items:center}
+.faq-q::after{content:'+';font-family:var(--mono);color:var(--gold);font-size:18px;flex-shrink:0}
+.faq.open .faq-q::after{content:'\2013'}
+.faq-a{display:none;padding:0 18px 16px;font-size:13.5px;color:rgba(255,255,255,0.5);line-height:1.75}
+.faq.open .faq-a{display:block}
+.faq-a b{color:#fff}
+
+.honest{max-width:880px;margin:0 auto;padding:44px 20px 50px}
+.honest-box{border:1px solid rgba(201,168,76,0.28);background:rgba(201,168,76,0.04);border-radius:11px;padding:19px 21px;font-size:13.5px;color:var(--muted);line-height:1.8}
+.honest-box b{color:var(--gold)}
+
+footer{background:rgba(0,0,0,0.45);padding:30px 20px;border-top:1px solid rgba(255,255,255,0.05);text-align:center}
+.fl{display:flex;gap:17px;flex-wrap:wrap;justify-content:center;margin-bottom:12px}
+.fl a{color:rgba(255,255,255,0.35);text-decoration:none;font-size:12.5px}.fl a:hover{color:#fff}
+.fc{font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.22);line-height:1.85;max-width:620px;margin:0 auto}
+
+@media(max-width:740px){
+  .nav-links a:not(.nav-cta){display:none}
+  .packs,.vs,.claims,.sp-grid,.fg2{grid-template-columns:1fr}
+  .rung{padding:11px 12px;gap:9px}
+  .rung-n{min-width:52px;font-size:16px}
+  .rung-amt{font-size:15px}
+  .rung-mid .t{font-size:13px}
+}
+</style>
+</head>
+<body>
+
+<nav>
+  <a href="/" class="nav-logo">Monop <span>Content</span></a>
+  <div class="nav-links">
+    <a href="#numbers">The numbers</a>
+    <a href="#product">The product</a>
+    <a href="#words">The words</a>
+    <a href="#signup" class="nav-cta">Start free</a>
+  </div>
+</nav>
+
+<section class="hero">
+  <div class="hero-in">
+    <span class="kick">No capital &middot; no stock &middot; no fees &middot; start today</span>
+    <h1>Don't resell a product.<br><em>Build your own.</em></h1>
+    <p class="hero-sub">You buy the engine at <b>50p per device per month</b>. Then you decide what it is. Child safety for parents. Endpoint monitoring for a call centre. Driver checks for a haulage firm. <b>You write the rules, you name the product, you set the price</b> &mdash; and every customer pays you again next month whether you worked or not.</p>
+    <div class="flow">
+      <div class="flow-b"><div class="k">Your cost</div><div class="v c-dim">50p</div></div>
+      <div class="flow-b"><div class="k">Your price</div><div class="v c-gold">&pound;4.50</div></div>
+      <div class="flow-b hot"><div class="k">Your margin</div><div class="v c-green">&pound;4.00</div></div>
+    </div>
+  </div>
+</section>
+
+<!-- ========== NUMBERS ========== -->
+<section class="sec" id="numbers">
+  <span class="eyebrow">01 &middot; Run it like a business</span>
+  <h2>Not a wage.<br>A <em>book of revenue.</em></h2>
+  <p class="sub">Forget how much you make this month. The question a businessman asks is what the whole thing is worth in three years. Set how many customers you can add each month and what you charge them &mdash; <b>the graph stacks it up, because last month's customers are still paying.</b></p>
+
+  <div class="panel">
+    <div class="ctrl">
+      <div class="ctrl-top"><span class="ctrl-lbl">New devices you add each month</span><span class="ctrl-val" id="v-add">25</span></div>
+      <input type="range" id="s-add" min="0" max="100" value="42" oninput="draw()">
+      <div class="hint">Not total &mdash; new ones per month. Five is a slow start. Fifty means you're working at it.</div>
+    </div>
+    <div class="ctrl">
+      <div class="ctrl-top"><span class="ctrl-lbl">Your price per device, per month</span><span class="ctrl-val" id="v-price">&pound;4.50</span></div>
+      <input type="range" id="s-price" min="60" max="2000" value="450" step="10" oninput="draw()">
+      <div class="hint">Your market, your price, your currency. We take 50p of it and nothing else.</div>
+    </div>
+    <div class="ctrl">
+      <div class="ctrl-top"><span class="ctrl-lbl">Customers who stay each month</span><span class="ctrl-val" id="v-keep">97%</span></div>
+      <input type="range" id="s-keep" min="85" max="100" value="97" oninput="draw()">
+      <div class="hint">Nobody keeps everyone. 97% means three in every hundred leave each month &mdash; normal for a consumer subscription, and the number your buyer will ask for.</div>
+    </div>
+  </div>
+
+  <div class="graph">
+    <div class="graph-t">Monthly margin, three years out</div>
+    <div class="graph-s" id="g-sub">&nbsp;</div>
+    <svg class="chart" id="chart" viewBox="0 0 340 170" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Monthly margin growing over 36 months"></svg>
+    <div class="legend">
+      <span><i style="background:var(--green)"></i>Your margin</span>
+      <span><i style="background:#2a3550"></i>Our 50p</span>
+    </div>
+  </div>
+
+  <div class="figs">
+    <div class="fig"><div class="k">Month 12 margin</div><div class="v c-green" id="f-12">&pound;0</div><div class="s">per month</div></div>
+    <div class="fig"><div class="k">Month 36 margin</div><div class="v c-green" id="f-36">&pound;0</div><div class="s">per month</div></div>
+    <div class="fig"><div class="k">Devices by month 36</div><div class="v c-dim" id="f-dev">0</div><div class="s">all still paying</div></div>
+    <div class="fig"><div class="k">Earned over 3 years</div><div class="v" style="color:var(--cyan)" id="f-tot">&pound;0</div><div class="s">cumulative</div></div>
+  </div>
+
+  <div class="asset">
+    <div class="k">What the book itself is worth by year three</div>
+    <div class="v" id="f-val">&pound;0</div>
+    <div class="s">Recurring-revenue businesses typically change hands at somewhere around 2&ndash;4&times; annual revenue, depending on churn and how much of it depends on you personally. This is the middle of that range on your own numbers &mdash; an illustration, not a valuation.</div>
+  </div>
+
+  <div class="note note-cyan" id="reality">&nbsp;</div>
+</section>
+
+<!-- ========== LADDER ========== -->
+<section class="sec">
+  <span class="eyebrow">02 &middot; The climb</span>
+  <h2>It starts at <em class="g">ten devices.</em></h2>
+  <p class="sub">Every rung at the price you just set. The first takes an afternoon. Every one after is the same conversation again.</p>
+  <div id="ladder"></div>
+  <div class="note note-gold"><b>The bit people miss:</b> a job pays you once for the hour you worked. Every device you sign up pays you again next month, and the month after, while you're asleep or out signing up the next one. <b>Ten new customers a month isn't ten customers &mdash; by December it's a hundred and twenty, all still paying.</b></div>
+</section>
+
+<!-- ========== VS ========== -->
+<section class="sec">
+  <span class="eyebrow">03 &middot; Why this and not the other stuff</span>
+  <h2>You've seen the<br>dropshipping <em>adverts.</em></h2>
+  <p class="sub">The honest comparison, including the part that's harder here.</p>
+  <div class="vs">
+    <div class="vs-col bad">
+      <h3>Flipping products</h3>
+      <li>Paid <b>once</b>. Then back to zero next month.</li>
+      <li>Someone always undercuts you. Margins die.</li>
+      <li>Capital up front on stock or ads before a penny comes back.</li>
+      <li>Returns, shipping, customs, angry customers.</li>
+      <li>You can't sell the business. There isn't one.</li>
+      <li>Nobody's life is better because you sold it.</li>
+    </div>
+    <div class="vs-col good">
+      <h3>This</h3>
+      <li>Paid <b>every month</b>, for as long as they keep it.</li>
+      <li>Your cost is fixed at 50p and doesn't rise as you grow.</li>
+      <li><b>No capital.</b> No stock, no fee, no minimum.</li>
+      <li>No shipping, no returns, no warehouse. It's software.</li>
+      <li><b>A book of subscriptions is an asset you can sell.</b></li>
+      <li>Harder to sell than a phone case &mdash; you have to explain it.</li>
+    </div>
+  </div>
+</section>
+
+<!-- ========== PRODUCT ========== -->
+<section class="sec" id="product">
+  <span class="eyebrow">04 &middot; What they get for the money</span>
+  <h2>Three things<br>on the <em>phone itself.</em></h2>
+  <p class="sub">Each has the exact sentence to use. Nick them word for word &mdash; they're written to be said out loud.</p>
+
+  <div class="packs">
+    <div class="pk">
+      <span class="tag tg-red">Guardian</span>
+      <h3>Child protection</h3>
+      <p class="one">Spots the patterns that come before harm.</p>
+      <p>Watches for known warning signs of grooming &mdash; pushing for secrecy, isolating a child, moving them to a private chat &mdash; and tells the parent. <b>The messages are never stored</b>, only a fingerprint. What is kept is sealed, so it can't be edited later and it means something to a school or the police.</p>
+      <div class="say"><div class="k">Say this</div><p>&ldquo;Your kid's phone tells you when something starts going wrong &mdash; without you having to read their messages.&rdquo;</p></div>
+    </div>
+    <div class="pk">
+      <span class="tag tg-cyan">Sentinel</span>
+      <h3>Fraud alarm</h3>
+      <p class="one">Catches it during, not on the statement.</p>
+      <p>Watches speed and pattern &mdash; a run of login attempts, a burst of payments, the account surfacing in another country minutes after the last one. Classic takeover signals. Flags them live and <b>seals the evidence</b>, so there's something real to show the bank.</p>
+      <div class="say"><div class="k">Say this</div><p>&ldquo;When someone tries to get into your account, you find out while it's happening.&rdquo;</p></div>
+    </div>
+    <div class="pk">
+      <span class="tag tg-green">Sebdog</span>
+      <h3>It runs on the phone</h3>
+      <p class="one">Not on our computers. Theirs.</p>
+      <p>The engine sits on the device itself, so their data doesn't have to leave it to be protected. <b>No round trip, nobody in the middle.</b> Businesses pay serious money for this as an on-site product. Here it's part of the package.</p>
+      <div class="say"><div class="k">Say this</div><p>&ldquo;It protects you without sending your life to somebody else's computer.&rdquo;</p></div>
+    </div>
+    <div class="pk">
+      <span class="tag tg-green">The proof layer</span>
+      <h3>All of it, sealed</h3>
+      <p class="one">A record nobody can rewrite &mdash; us included.</p>
+      <p>Every alert is written into a chain where each record is locked to the one before, so altering anything past visibly breaks it. <b>That's what turns an alert into evidence</b> rather than a screenshot somebody could have faked.</p>
+      <div class="say"><div class="k">Say this</div><p>&ldquo;If it happened, you can prove it happened.&rdquo;</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- ========== SIGNAL PACKS ========== -->
+<section class="sec">
+  <span class="eyebrow">05 &middot; The part that makes you a company</span>
+  <div class="spotlight">
+    <h3>Signal Packs &mdash;<br>your product, <em>not ours.</em></h3>
+    <p>Here's what you're really buying, and it isn't a child-safety app. The engine watches events on a device, scores them against <b>a set of rules somebody wrote</b>, and seals the result so it can't be altered afterwards. Guardian is just one set of rules. <b>A Signal Pack is you writing your own set</b> &mdash; and the moment you do, it stops being our product and starts being yours.</p>
+    <div class="sp-grid">
+      <div class="sp"><div class="t">You define what's risky</div><p>Not us. You decide what the engine watches for and what it does about it. Same engine, completely different product.</p></div>
+      <div class="sp"><div class="t">You name it and brand it</div><p>Your product name, your logo, your pricing page. Your customers never need to hear of us.</p></div>
+      <div class="sp"><div class="t">One pack, sold a thousand times</div><p>Write it once for a market you understand, then sell that same pack to every firm in that market. <b>That's a product line, not a side hustle.</b></p></div>
+      <div class="sp"><div class="t">Different packs, different prices</div><p>A parent pays &pound;4. A call centre pays &pound;12 a seat for the same engine with different rules and a sealed audit trail.</p></div>
+    </div>
+    <div class="note note-gold" style="margin-top:16px"><b>And the churn angle:</b> a customer who has helped shape their own pack does not cancel in month three. Churn is the single number that decides what your book is worth &mdash; <b>every point of it you avoid raises the sale price of the whole business.</b></div>
+  </div>
+
+  <div class="note note-cyan"><b>Be straight about the boundary:</b> the engine works on the signals it can actually see on a device &mdash; patterns, timing, addresses, activity. A Signal Pack decides what to do with those signals. <b>It is a rules-and-evidence layer, not magic</b>, and you'll sell far more of it by telling a buyer exactly what it watches than by implying it watches everything.</div>
+
+  <div class="spotlight" style="margin-top:18px">
+    <h3>Twenty packs are <em>already written.</em></h3>
+    <p>You don't have to start from a blank page. There is an open library of packs at <b>sebbi.pro/packs.html</b> &mdash; legal review, clinical summarisation, support triage, coding agents, security operations, public sector correspondence. Open any of them, read every rule and the reason it exists, and <b>fork it into your own name in one tap.</b></p>
+    <div class="sp-grid">
+      <div class="sp"><div class="t">Free to read, free to publish</div><p>No account, no key, no card. Writing a pack and putting it in the library costs nothing and never will.</p></div>
+      <div class="sp"><div class="t">Publishing proves it's yours</div><p>The moment you publish, the pack's fingerprint is sealed into the chain with the date. If somebody copies your work later, <b>the record already says who wrote it first</b> &mdash; including against us.</p></div>
+      <div class="sp"><div class="t">Fork the closest one</div><p>Find the pack nearest to your market, disagree with its thresholds, change them, publish yours. The parent is recorded, so the lineage is visible rather than argued about.</p></div>
+      <div class="sp"><div class="t">Running it needs the engine</div><p>This is the bit that pays you. A pack on its own is a text file &mdash; it decides nothing and produces no evidence. <b>Every person who wants to actually run your pack needs a device on the engine</b>, and that's your 50p.</p></div>
+    </div>
+    <div class="note note-gold" style="margin-top:16px"><b>Why this matters to your book:</b> a pack you wrote and published, with your name sealed on it, is an asset you own outright. <b>Write one for a market you understand and it can be sold to every firm in that market</b> &mdash; and every one of them arrives at the engine to run it.</div>
+  </div>
+
+  <p class="sub" style="margin-top:18px"><a href="/packs.html" style="color:#c9a84c">Open the library &rarr;</a></p>
+</section>
+
+<!-- ========== MARKETS ========== -->
+<section class="sec">
+  <span class="eyebrow">06 &middot; Pick your market</span>
+  <h2>Same 50p.<br>Seven different <em>businesses.</em></h2>
+  <p class="sub">Every one of these is the same engine at the same cost to you. The only thing that changes is the pack you write and the price you charge. <b>Pick the market you already understand</b> &mdash; the one where you know how people talk.</p>
+
+  <div class="packs">
+    <div class="pk">
+      <span class="tag tg-red">Consumer</span>
+      <h3>Parents</h3>
+      <p class="one">The easiest first sale you'll ever make.</p>
+      <p>Grooming warning signs, sealed alerts, rules the parent sets. <b>Sell it at &pound;4&ndash;&pound;6 a month.</b> Low price, huge market, and the referrals do the work &mdash; parents talk to other parents about exactly this.</p>
+    </div>
+    <div class="pk">
+      <span class="tag tg-cyan">Business</span>
+      <h3>Call centres</h3>
+      <p class="one">Hundreds of seats in one signature.</p>
+      <p>Every agent's endpoint monitored against your pack, every flag sealed into a record a compliance manager can produce later. <b>&pound;8&ndash;&pound;15 a seat.</b> One five-hundred-seat floor is more revenue than two hundred parents, from one meeting.</p>
+    </div>
+    <div class="pk">
+      <span class="tag tg-cyan">Business</span>
+      <h3>Any firm with endpoints</h3>
+      <p class="one">Laptops, tablets, handsets, kiosks.</p>
+      <p>Write a pack for their policy &mdash; what's normal on a company device and what isn't &mdash; and sell it as monitored-with-evidence. <b>&pound;5&ndash;&pound;12 a device.</b> Two hundred devices is a real contract with one invoice.</p>
+    </div>
+    <div class="pk">
+      <span class="tag tg-green">Vertical</span>
+      <h3>Care &amp; support agencies</h3>
+      <p class="one">Lone workers, vulnerable clients.</p>
+      <p>A pack built around visits, hours and unusual activity, with a sealed trail for safeguarding. <b>&pound;8&ndash;&pound;20 a device.</b> They already have the duty; nobody's sold them the evidence layer for it.</p>
+    </div>
+    <div class="pk">
+      <span class="tag tg-green">Vertical</span>
+      <h3>Haulage, taxi, delivery</h3>
+      <p class="one">Drivers, handsets, disputes.</p>
+      <p>Your pack, their fleet, and a record that settles an argument about what happened and when. <b>&pound;5&ndash;&pound;10 a driver.</b> One firm with sixty drivers is &pound;400 a month from a single phone call.</p>
+    </div>
+    <div class="pk">
+      <span class="tag tg-green">Vertical</span>
+      <h3>Schools &amp; youth clubs</h3>
+      <p class="one">One conversation, a hundred families.</p>
+      <p>Sell to the institution, deploy across the families. <b>&pound;3&ndash;&pound;5 a device</b> at volume, one invoice, one relationship to maintain, and a safeguarding lead who wants the evidence trail anyway.</p>
+    </div>
+  </div>
+
+  <div class="note note-gold"><b>The move nobody makes:</b> don't sell all seven. <b>Pick one, write one really good pack, and go and own that market.</b> The firm that becomes "the endpoint evidence people for care agencies" charges four times what a generalist charges, and sells the business for more at the end because the book is concentrated and defensible.</div>
+</section>
+
+<!-- ========== SALES FORCE ========== -->
+<section class="sec">
+  <span class="eyebrow">07 &middot; Scale past yourself</span>
+  <h2>Your book.<br>Your <em>sales force.</em></h2>
+  <p class="sub">There's a ceiling on what one person can sell, and it's about five hundred devices. Past that you stop selling and start running something.</p>
+
+  <div class="vs">
+    <div class="vs-col good">
+      <h3>Put people on it</h3>
+      <li>Your cost stays at 50p <b>no matter who made the sale.</b></li>
+      <li>Pay a seller commission out of your margin &mdash; at &pound;4.50 there's room for both of you.</li>
+      <li>Give them the scripts on this page. They're written to be read out.</li>
+      <li>A pack you already wrote means <b>a new seller needs no product knowledge</b>, just the conversation.</li>
+      <li>Recurring revenue means their sale keeps paying you long after their commission is spent.</li>
+    </div>
+    <div class="vs-col good">
+      <h3>Or put a machine on it</h3>
+      <li>An existing call centre can sell this <b>tomorrow</b>, off a script, into their existing list.</li>
+      <li>A phone shop chain adds it at the counter across every branch.</li>
+      <li>An IT firm adds one line to invoices clients already pay monthly.</li>
+      <li>Any business with a customer list already owns the expensive part &mdash; <b>the customers.</b></li>
+      <li>You keep every penny above 50p on all of it.</li>
+    </div>
+  </div>
+
+  <div class="note note-cyan"><b>The honest maths on hiring:</b> at &pound;4.50 you keep &pound;4. Give a seller &pound;1 per device per month and you still hold &pound;3, on a sale you didn't make. <b>Ten sellers doing twenty a month each is 200 devices a month landing on a book you own.</b> That's the difference between a wage and a company.</div>
+</section>
+
+<!-- ========== WORDS ========== -->
+<section class="sec" id="words">
+  <span class="eyebrow">08 &middot; Your first ten customers</span>
+  <h2>You already know<br>every one of <em>them.</em></h2>
+  <p class="sub">No adverts, no website, no capital. Ten people who trust you and have kids with phones. <b>Here are the words.</b></p>
+
+  <div class="script">
+    <div class="script-h"><h4>The school gate</h4><span class="who">In person &middot; 30 seconds</span></div>
+    <div class="words">&ldquo;Can I ask you something daft &mdash; has your lad got a phone yet? Right. So I've started doing something that puts a thing on it that watches for the grooming stuff. It doesn't read his messages, it just tells you if someone starts asking him to keep secrets or move to a private chat. <b>It's a fiver a month.</b> Want me to put it on for you?&rdquo;</div>
+    <div class="after"><b>Why it works:</b> you named the fear, killed the objection they were about to make, and gave the price before they had to ask. <b>Say the price.</b> People who hide the price never sell anything.</div>
+  </div>
+
+  <div class="script">
+    <div class="script-h"><h4>The group chat</h4><span class="who">WhatsApp &middot; paste it</span></div>
+    <div class="words">&ldquo;Bit random. I've started doing a thing for kids' phones &mdash; it watches for the grooming warning signs and tells the parent, without reading their messages. Also catches someone trying to get into your bank. <b>&pound;4.50 a month, cancel whenever.</b> If anyone wants it on their kid's phone give me a shout.&rdquo;</div>
+    <div class="after"><b>Why it works:</b> no link, no sales voice, no pressure. In a group of forty parents you'll get three &mdash; and <b>those three tell other parents</b>, because this is the thing parents actually talk about.</div>
+  </div>
+
+  <div class="script">
+    <div class="script-h"><h4>The counter</h4><span class="who">If you sell or fix phones</span></div>
+    <div class="words">&ldquo;Is this one for yourself or one of the kids? For your daughter &mdash; right. Do you want me to put the safety package on before you go? It watches for grooming and tells you, and flags anyone trying to get into her accounts. <b>Five pound a month and I'll set it up now while you're stood here.</b>&rdquo;</div>
+    <div class="after"><b>Why it works:</b> they're already spending and already thinking about their kid. <b>Every handset becomes years of monthly revenue</b> instead of one margin you spend that week.</div>
+  </div>
+
+  <div class="script">
+    <div class="script-h"><h4>The business call</h4><span class="who">Clubs &middot; schools &middot; employers</span></div>
+    <div class="words">&ldquo;I supply a safety package for phones &mdash; it flags grooming warning signs to a parent and keeps a sealed record you could hand to the police if it came to it. I'm offering it to your families at <b>&pound;4 a month.</b> Could I show you what a parent actually sees? Five minutes.&rdquo;</div>
+    <div class="after"><b>Why it works:</b> one club is a hundred families in one conversation. <b>That's £350 a month from a single phone call.</b> Ask for the five minutes, not the sale.</div>
+  </div>
+
+  <div class="note note-cyan"><b>The only rule:</b> ask for the money. Nine out of ten people who fail at this never say a price out loud. Say it plainly, then stop talking and let them answer.</div>
+</section>
+
+<!-- ========== CLAIMS ========== -->
+<section class="sec">
+  <span class="eyebrow">09 &middot; How the good ones sell it</span>
+  <h2>Never oversell<br>this <em>one thing.</em></h2>
+  <p class="sub">Left column is true and provable. Right column is a promise nobody on earth can keep, us included. <b>The left closes better anyway</b> &mdash; people trust the seller who tells them what it can't do.</p>
+  <div class="claims">
+    <div class="cl y">
+      <h4>True. Say it freely.</h4>
+      <li>Flags known warning signs of grooming and alerts the parent</li>
+      <li>Never stores the messages &mdash; only a fingerprint</li>
+      <li>Keeps a sealed record nobody can quietly change later</li>
+      <li>Catches fraud patterns as they happen</li>
+      <li>Runs on the phone, so their data stays on it</li>
+      <li>Something real to hand to a school or the police</li>
+    </div>
+    <div class="cl n">
+      <h4>Never. Not once.</h4>
+      <li>&ldquo;Stops grooming&rdquo; or &ldquo;keeps your child safe&rdquo;</li>
+      <li>&ldquo;Catches every predator&rdquo; &middot; &ldquo;100% detection&rdquo;</li>
+      <li>&ldquo;Unhackable&rdquo; or &ldquo;impossible to get round&rdquo;</li>
+      <li>&ldquo;Police approved&rdquo; &middot; &ldquo;certified&rdquo; &middot; &ldquo;government backed&rdquo;</li>
+      <li>&ldquo;Makes you compliant&rdquo; with any law</li>
+      <li>Anything hinting a parent can stop paying attention</li>
+    </div>
+  </div>
+  <div class="note note-red"><b>Why we're hard on this:</b> it catches known patterns. It cannot catch every clever rewording and no honest product claims otherwise. What it guarantees is the <b>record</b>. <b>A parent promised a wall who got a smoke alarm cancels, tells forty other parents, and takes your book with them.</b> Sell it straight and they stay for years. Overclaim on child safety and your code gets pulled.</div>
+</section>
+
+<!-- ========== SIGNUP ========== -->
+<section class="sec" id="signup">
+  <span class="eyebrow">10 &middot; Start</span>
+  <div class="signup">
+    <h3>Get your reseller code</h3>
+    <p>Free. No fee, no minimum, no contract, no card. You get your code and your key on this page in about ten seconds &mdash; then go and ask the first ten people you know.</p>
+
+    <div class="fg2">
+      <div class="fg"><label>First name</label><input type="text" id="i-fn" placeholder="Jane" autocomplete="given-name"></div>
+      <div class="fg"><label>Last name</label><input type="text" id="i-ln" placeholder="Smith" autocomplete="family-name"></div>
+    </div>
+    <div class="fg"><label>Email</label><input type="email" id="i-em" placeholder="you@email.com" autocomplete="email"></div>
+    <div class="fg"><label>Phone (optional)</label><input type="tel" id="i-ph" placeholder="07700 000000" autocomplete="tel"></div>
+    <div class="fg"><label>Trading name &mdash; or just your own</label><input type="text" id="i-org" placeholder="Jane Smith" autocomplete="organization"></div>
+    <div class="fg"><label>Where will you sell it?</label>
+      <select id="i-type">
+        <option value="personal">People I know &mdash; starting from scratch</option>
+        <option value="phoneshop">Phone shop or repair shop</option>
+        <option value="school">School, club or parent group</option>
+        <option value="it">IT firm or consultancy</option>
+        <option value="operator">Network, MVNO or large rollout</option>
+        <option value="overseas">Outside the UK</option>
+        <option value="other">Something else</option>
+      </select>
+    </div>
+    <div class="fg"><label>What you plan to charge (you can change it any time)</label>
+      <select id="i-price">
+        <option value="1.50">&pound;1.50 per device</option>
+        <option value="2.99">&pound;2.99 per device</option>
+        <option value="4.50" selected>&pound;4.50 per device</option>
+        <option value="7.00">&pound;7.00 per device</option>
+        <option value="10.00">&pound;10.00 per device</option>
+        <option value="0">Not decided yet</option>
+      </select>
+    </div>
+
+    <button class="btn-full" id="btn-go" onclick="signup()">Get my reseller code &rarr;</button>
+    <div class="err" id="err"></div>
+
+    <div class="got" id="got">
+      <div class="got-k">Your reseller code &mdash; every device signed up with this is yours</div>
+      <div class="got-code" id="out-code">&mdash;</div>
+      <button class="cpy" onclick="copyIt('out-code')">Copy code</button>
+      <div style="height:18px"></div>
+      <div class="got-k">Your API key &mdash; save this somewhere safe</div>
+      <div class="got-v" id="out-key">&mdash;</div>
+      <button class="cpy" onclick="copyIt('out-key')">Copy key</button>
+      <div class="next">
+        <b>Next three things, in order:</b><br>
+        1. Save that key somewhere you won't lose it.<br>
+        2. Decide your price and stick to it for the first month.<br>
+        3. Use the school gate script on five people today. <b>Not tomorrow.</b>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ========== FAQ ========== -->
+<section class="sec">
+  <span class="eyebrow">11 &middot; Straight answers</span>
+  <h2>What everyone<br><em>asks first.</em></h2>
+  <div style="margin-top:22px">
+    <div class="faq"><div class="faq-q" onclick="tf(this)">Do I need money to start?</div><div class="faq-a">No. Not a penny. No joining fee, no stock, no minimum, no card. You pay 50p only for devices that are actually live &mdash; and by then your customer has already paid you.</div></div>
+    <div class="faq"><div class="faq-q" onclick="tf(this)">Do I need to be technical?</div><div class="faq-a">No. You get a code, they install it, that's it. If you can set up a phone for somebody, you can do this.</div></div>
+    <div class="faq"><div class="faq-q" onclick="tf(this)">Do I need a company?</div><div class="faq-a">Not to start. But once money's coming in, <b>tell HMRC</b> &mdash; this income is taxable like any other, and registering as a sole trader is free and takes ten minutes online. Don't skip it.</div></div>
+    <div class="faq"><div class="faq-q" onclick="tf(this)">Is this one of them pyramid things?</div><div class="faq-a"><b>No, and here's the test.</b> You don't recruit anybody. You don't earn from other sellers. You don't buy in and there's nothing to buy. You sell a real product to real people who use it, and you pay 50p per device. If a scheme's money comes from recruiting rather than selling, walk away &mdash; this one passes that test.</div></div>
+    <div class="faq"><div class="faq-q" onclick="tf(this)">Can I really sell the business later?</div><div class="faq-a">A book of live subscriptions is a real asset and people do buy them. What it fetches depends on churn, how many customers depend on you personally, and whether your records are clean. <b>Nobody can promise you a buyer</b> &mdash; but unlike flipping products, there's something there to sell.</div></div>
+    <div class="faq"><div class="faq-q" onclick="tf(this)">Can I sell outside the UK?</div><div class="faq-a">Yes, anywhere. Your currency, your price, your language. The 50p stays in sterling, so in plenty of markets the margin is <b>better</b>, not worse.</div></div>
+    <div class="faq"><div class="faq-q" onclick="tf(this)">What if a customer cancels?</div><div class="faq-a">Billing stops for that device &mdash; your bit and our bit. No penalty, no clawback, no notice period. Your other customers are untouched.</div></div>
+    <div class="faq"><div class="faq-q" onclick="tf(this)">Will you go behind my back to my customers?</div><div class="faq-a">No. You invoice them, you hold the relationship, and their devices are tied to your code permanently. If your ten become ten thousand, that's yours.</div></div>
+    <div class="faq"><div class="faq-q" onclick="tf(this)">How do I know any of this is real?</div><div class="faq-a">Don't take our word for it. The chain is public, the checking routes need no account, and the verifier runs on your own machine with the internet off. <b>You're meant to check rather than trust.</b> Start at <a href="/whitepaper" style="color:var(--gold)">the whitepaper</a>.</div></div>
+    <div class="faq"><div class="faq-q" onclick="tf(this)">Honestly &mdash; month one?</div><div class="faq-a">Ten to thirty devices if you actually ask everyone you know. At &pound;4.50 that's <b>&pound;40 to &pound;120 a month</b> &mdash; still arriving next January, and the January after. Anyone promising you thousands in week one is lying to you.</div></div>
+  </div>
+</section>
+
+<div class="honest">
+  <div class="honest-box"><b>About the numbers:</b> every figure comes from sliders you set yourself. It's arithmetic, not a forecast, and nobody is promising you customers or income. The valuation figure is an illustration using a common market range for recurring-revenue businesses &mdash; <b>it is not an offer, an appraisal, or a guarantee that anyone will buy your book.</b> What we promise is the price: 50p per active device per month and nothing else.<br><br><b>About the product:</b> sealing proves something happened in a particular form at a particular time and hasn't changed since. It does not prove the contents are true and it does not discharge anybody's legal duties. <b>Guardian is a safeguarding aid and an evidence layer. It supports a parent. It never replaces one.</b></div>
+</div>
+
+<footer>
+  <div class="fl">
+    <a href="/">Home</a>
+    <a href="/whitepaper">Whitepaper</a>
+    <a href="/developers">Developers</a>
+    <a href="/verify">Verify</a>
+    <a href="/contact">Contact</a>
+  </div>
+  <div class="fc">&copy; 2026 Monop Content &middot; Blyth, Northumberland, UK &middot; sebbi.pro<br>Figures are arithmetic on values you enter. Not projections, not guarantees of earnings.</div>
+</footer>
+
+<script>
+var ADD=[1,2,3,5,8,10,15,20,25,35,50,75,100,150,250,400,650,1000,1600,2500,4000];
+var COST=0.50, VAL_MULT=3, HORIZON=36;
+var RUNGS=[
+  {n:10,    t:'Your phone bill',       d:'One afternoon. Family and neighbours.'},
+  {n:50,    t:'The weekly shop',       d:'Your street, your group chat, the school gate.'},
+  {n:100,   t:'The car payment',       d:'One club, one class, one small school.'},
+  {n:250,   t:'Rent money',            d:'Word of mouth is doing some of it for you.'},
+  {n:500,   t:'A full-time wage',      d:'You could pack the day job in around here.'},
+  {n:2000,  t:"You're an employer",    d:'Somebody else is making the calls now.'},
+  {n:10000, t:'You run a company',     d:'A shop chain, an operator, a region.'}
+];
+
+function money(n){
+  if(n>=1000000) return '\u00a3'+(n/1000000).toFixed(n>=10000000?1:2)+'m';
+  if(n>=100000)  return '\u00a3'+Math.round(n/1000)+'k';
+  return '\u00a3'+Math.round(n).toLocaleString('en-GB');
+}
+function num(n){
+  if(n>=1000000) return (n/1000000).toFixed(1)+'m';
+  if(n>=10000)   return Math.round(n/1000)+'k';
+  return Math.round(n).toLocaleString('en-GB');
+}
+function addFrom(v){
+  var i=Math.round(v/100*(ADD.length-1));
+  return ADD[Math.max(0,Math.min(ADD.length-1,i))];
+}
+
+function series(add,keep){
+  var live=0,out=[];
+  for(var m=1;m<=HORIZON;m++){ live=live*keep+add; out.push(live); }
+  return out;
+}
+
+function draw(){
+  var add=addFrom(+document.getElementById('s-add').value);
+  var price=(+document.getElementById('s-price').value)/100;
+  var keepPct=+document.getElementById('s-keep').value;
+  var keep=keepPct/100;
+  var per=Math.max(0,price-COST);
+
+  document.getElementById('v-add').textContent=num(add);
+  document.getElementById('v-price').textContent='\u00a3'+price.toFixed(2);
+  document.getElementById('v-keep').textContent=keepPct+'%';
+
+  var s=series(add,keep);
+  var d12=s[11], d36=s[35];
+  var total=0; for(var i=0;i<s.length;i++) total+=s[i]*per;
+  var annual36=d36*per*12;
+
+  document.getElementById('f-12').textContent=money(d12*per);
+  document.getElementById('f-36').textContent=money(d36*per);
+  document.getElementById('f-dev').textContent=num(d36);
+  document.getElementById('f-tot').textContent=money(total);
+  document.getElementById('f-val').textContent=money(annual36*VAL_MULT);
+  document.getElementById('g-sub').textContent=num(add)+' new a month \u00b7 '+keepPct+'% stay \u00b7 \u00a3'+price.toFixed(2)+' each';
+
+  var rl=document.getElementById('reality');
+  if(per<=0){
+    rl.className='note note-red';
+    rl.innerHTML='<b>You\u2019d be working for nothing.</b> At \u00a3'+price.toFixed(2)+' you\u2019re at or below the 50p we charge. Even \u00a31.50 leaves you a pound per device per month.';
+  } else if(keepPct<=90){
+    rl.className='note note-red';
+    rl.innerHTML='<b>Churn is eating you alive.</b> At '+keepPct+'% you lose '+(100-keepPct)+' customers in every hundred, every month \u2014 you\u2019d be running to stand still, and no buyer touches a book like that. <b>Get every customer building a Signal Pack in week one</b> and this number is the one that moves.';
+  } else {
+    rl.className='note note-cyan';
+    rl.innerHTML='<b>What this actually says:</b> add '+num(add)+' a month and keep '+keepPct+'% of them, and by month 36 you hold '+num(d36)+' paying devices without ever having a bigger month than your first. <b>The stack does the work, not the heroics.</b>';
+  }
+
+  chart(s,per,keep);
+  ladder(d36,per);
+}
+
+function chart(s,per,keep){
+  var W=340,H=170,padL=6,padR=6,padT=14,padB=22;
+  var n=s.length, plotH=H-padT-padB, plotW=W-padL-padR;
+  var maxTot=s[n-1]*(per+COST); if(maxTot<=0) maxTot=1;
+  var bw=plotW/n, gap=bw*0.22;
+  var o='';
+  o+='<line x1="'+padL+'" y1="'+(H-padB)+'" x2="'+(W-padR)+'" y2="'+(H-padB)+'" stroke="#1e2a45" stroke-width="1"/>';
+  for(var i=0;i<n;i++){
+    var live=s[i], tot=live*(per+COST);
+    var totH=plotH*(tot/maxTot);
+    var costH=totH*(COST/(per+COST));
+    var keepH=totH-costH;
+    var x=padL+i*bw;
+    o+='<rect x="'+x.toFixed(1)+'" y="'+(H-padB-costH).toFixed(1)+'" width="'+(bw-gap).toFixed(1)+'" height="'+Math.max(0,costH).toFixed(1)+'" fill="#2a3550"/>';
+    o+='<rect x="'+x.toFixed(1)+'" y="'+(H-padB-totH).toFixed(1)+'" width="'+(bw-gap).toFixed(1)+'" height="'+Math.max(0,keepH).toFixed(1)+'" fill="'+(i===11||i===35?'#7fe3b0':'rgba(127,227,176,0.4)')+'"/>';
+    if(i===11||i===35){
+      o+='<text x="'+(x+(bw-gap)/2).toFixed(1)+'" y="'+(H-padB-totH-4).toFixed(1)+'" text-anchor="middle" font-family="DM Sans,sans-serif" font-size="8.5" font-weight="700" fill="#7fe3b0">'+money(live*per)+'</text>';
+    }
+  }
+  ['1','12','24','36'].forEach(function(m){
+    var i=(+m)-1, x=padL+i*bw+(bw-gap)/2;
+    o+='<text x="'+x.toFixed(1)+'" y="'+(H-padB+13)+'" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="8" fill="rgba(255,255,255,0.3)">m'+m+'</text>';
+  });
+  document.getElementById('chart').innerHTML=o;
+}
+
+function ladder(dev,per){
+  var marked=false, cls={};
+  for(var i=RUNGS.length-1;i>=0;i--){
+    var n=RUNGS[i].n;
+    cls[n]=(n<=dev&&!marked)?'rung now':(n<=dev?'rung hit':'rung');
+    if(n<=dev) marked=true;
+  }
+  var o='';
+  RUNGS.forEach(function(r){
+    o+='<div class="'+cls[r.n]+'">'+
+      '<div class="rung-n">'+num(r.n)+'<small>devices</small></div>'+
+      '<div class="rung-mid"><div class="t">'+r.t+'</div><div class="d">'+r.d+'</div></div>'+
+      '<div class="rung-amt">'+money(per*r.n)+'<small>a month</small></div>'+
+    '</div>';
+  });
+  document.getElementById('ladder').innerHTML=o;
+}
+
+function tf(el){el.parentElement.classList.toggle('open');}
+
+function copyIt(id){
+  var t=document.getElementById(id).textContent.trim();
+  if(navigator.clipboard){navigator.clipboard.writeText(t).then(function(){alert('Copied');},function(){});}
+}
+
+function clean(s){
+  // strip anything a phone keyboard may have smuggled in
+  return (s||'').replace(/[\u2018\u2019\u201c\u201d]/g,"'").replace(/[^\x20-\x7E]/g,'').trim();
+}
+
+async function signup(){
+  var fn=clean(document.getElementById('i-fn').value);
+  var ln=clean(document.getElementById('i-ln').value);
+  var em=clean(document.getElementById('i-em').value);
+  var ph=clean(document.getElementById('i-ph').value);
+  var org=clean(document.getElementById('i-org').value);
+  var type=document.getElementById('i-type').value;
+  var price=document.getElementById('i-price').value;
+  var err=document.getElementById('err'), got=document.getElementById('got'), btn=document.getElementById('btn-go');
+  err.classList.remove('show'); got.classList.remove('show');
+
+  if(!em||em.indexOf('@')<1){err.textContent='Enter a valid email address.';err.classList.add('show');return;}
+  if(!fn&&!org){err.textContent='Enter your name or a trading name.';err.classList.add('show');return;}
+
+  var label=org||((fn+' '+ln).trim());
+  btn.disabled=true; btn.textContent='Setting you up\u2026';
+  try{
+    var r=await fetch('/signup',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        email:em, phone:ph, name:(fn+' '+ln).trim(), org:label,
+        org_type:'reseller_'+type, product:'guardian-package',
+        intended_price:price, devices:1
+      })
+    });
+    var d=await r.json();
+    if(d && d.api_key){
+      document.getElementById('out-key').textContent=d.api_key;
+      document.getElementById('out-code').textContent=d.ref_code||d.referral_code||'(check your email)';
+      got.classList.add('show');
+      btn.textContent='You\u2019re in \u2713';
+      got.scrollIntoView({behavior:'smooth',block:'center'});
+    } else {
+      err.textContent=(d&&d.error)?d.error:'Something went wrong. Email justrightdecorators@gmail.com and we will set you up by hand.';
+      err.classList.add('show'); btn.disabled=false; btn.textContent='Get my reseller code \u2192';
+    }
+  }catch(e){
+    err.textContent='Could not reach the server. Email justrightdecorators@gmail.com and we will set you up by hand.';
+    err.classList.add('show'); btn.disabled=false; btn.textContent='Get my reseller code \u2192';
+  }
+}
+
+draw();
+</script>
 </body>
 </html>
 
