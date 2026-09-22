@@ -1,2095 +1,8 @@
 # Codebase — part 13 of 39
 
 Contains:
-- `modules/packs.py`
 - `modules/passport.py`
-
-
-## `modules/packs.py`
-
-2079 lines, 80594 bytes
-
-```python
-"""
-Signal Packs - /x/packs/<action>
-
-WHAT THIS IS
-------------
-A public library of decision rules for the token saver, written by anyone,
-readable by anyone, runnable only through this engine.
-
-A pack is a JSON document. It contains no code. It contains conditions
-written over the nine signals the token saver already measures, and a
-verdict for each condition. Nothing in a pack can call anything, read
-anything, or reach anything. It is a list of thresholds and a list of
-answers, and that is all it will ever be.
-
-WHY IT IS BUILT THIS WAY
-------------------------
-Publishing is free and needs no account. Reading is free and needs no
-account. A pack can be forked, sealed, dated and proved to be yours
-without anyone paying anything.
-
-Running a pack needs a key.
-
-That split is deliberate and it is the whole commercial design. A pack on
-its own is a text file - it decides nothing, seals nothing and produces no
-receipt. The value is not in the thresholds. It is in what happens when
-they are executed: a measured request, a verdict, and a block in a hash
-chain that an outsider can verify without an account. That half cannot be
-copied out of the library because it is not in the library.
-
-So an author can build something genuinely theirs, publish it, prove they
-wrote it first, and have other people use it - and every one of those
-people arrives here to run it.
-
-WHAT A PACK LOOKS LIKE
-----------------------
-    {
-      "name": "Legal document review",
-      "author": "someone",
-      "version": "1.0.0",
-      "vertical": "legal",
-      "summary": "One line a buyer would understand.",
-      "rules": [
-        {"when": "loop_count >= 3 and not deterministic",
-         "then": "challenge",
-         "why": "A retried non-deterministic review is being paid for twice."},
-        {"when": "turns > 25 and tool_count == 0",
-         "then": "challenge",
-         "why": "Long review threads carry the whole document every call."}
-      ],
-      "default": "allow"
-    }
-
-Rules are tried in order. The first that matches decides. If none match,
-the pack's default decides.
-
-THE EXPRESSION LANGUAGE
------------------------
-Deliberately small. Comparisons, and, or, not, brackets, numbers, and the
-names below. No function calls, no attribute access, no assignment, no
-loops, no strings. It is parsed into a tree and walked; nothing is ever
-handed to eval, exec, or compile.
-
-Names available inside a rule:
-
-  the nine scored signals, each 0.0 to 1.0
-    exposure   worst case spend against the budget left
-    size       prompt characters, log scaled
-    ask        the output ceiling the caller authorised
-    depth      conversation turns
-    tools      tool definitions attached
-    loop       the same request going round again
-    burst      requests in the last sixty seconds
-    grind      requests in the last hour
-    novelty    first time this shape has been seen
-
-  the raw measurements the signals came from
-    chars, max_tokens, turns, tool_count,
-    loop_count, burst_count, grind_count
-
-  the engine's own overall score, 0.0 to 1.0
-    score
-
-  two flags
-    unattended      no human is watching this system
-    deterministic   temperature is zero, so the answer can be reused
-
-VERDICTS A RULE MAY RETURN
---------------------------
-    allow       send it to the model as asked
-    downgrade   small and simple enough for the cheap model
-    challenge   hold it for a person before spending
-    block       refuse it; it never reaches the model
-
-A pack can never return "serve". Serving from store is decided by whether
-an identical request has been answered before, which is a fact, not a
-policy, and no pack is allowed a say in it.
-
-WHAT A PACK CANNOT DO
----------------------
-- It cannot loosen a hard rule. If the token saver's own budget and
-  runaway rules fire, they fire. A pack runs after them and can only make
-  a decision stricter than the one the engine reached, never weaker.
-- It cannot see a prompt. Packs are evaluated against measurements, and on
-  the digest path the content never left the customer's building at all.
-- It cannot read or write anything. There is no I/O in the language.
-
-    GET  /x/packs/spec                    public  the language and the rules
-    GET  /x/packs/list                    public  browse the library
-    GET  /x/packs/get?id=                 public  one pack, whole
-    POST /x/packs/validate                public  parse it, no publishing
-    POST /x/packs/publish                 public  seal it into the chain
-    POST /x/packs/fork                    public  publish with a parent named
-    POST /x/packs/run                     KEYED   evaluate against a request
-    GET  /x/packs/status                  public  config, and arms /packs
-"""
-
-import hashlib
-import json
-import math
-import re
-import sys
-import time
-from datetime import datetime, timezone
-
-VERSION = "1.0.0"
-
-PUBLIC = {
-    ("GET", "spec"),
-    ("GET", "list"),
-    ("GET", "get"),
-    ("GET", "status"),
-    ("POST", "validate"),
-    ("POST", "publish"),
-    ("POST", "fork"),
-}
-
-# ---------------------------------------------------------------- limits
-
-MAX_RULES = 40
-MAX_EXPR_CHARS = 400
-MAX_TOKENS_PER_EXPR = 120
-MAX_NAME = 80
-MAX_SUMMARY = 240
-MAX_WHY = 300
-MAX_MANIFEST_BYTES = 32 * 1024
-LIST_LIMIT = 200
-
-VERDICTS = ("allow", "downgrade", "challenge", "block")
-
-# How strict each verdict is. A pack may raise this number, never lower it.
-STRICTNESS = {"allow": 0, "downgrade": 1, "challenge": 2, "block": 3}
-
-SIGNALS = ("exposure", "size", "ask", "depth", "tools",
-           "loop", "burst", "grind", "novelty")
-
-MEASURES = ("chars", "max_tokens", "turns", "tool_count",
-            "loop_count", "burst_count", "grind_count")
-
-FLAGS = ("unattended", "deterministic")
-
-NAMES = set(SIGNALS) | set(MEASURES) | set(FLAGS) | {"score"}
-
-VERTICALS = (
-    "legal", "medical", "support", "coding", "finance", "retail",
-    "education", "research", "translation", "moderation", "sales",
-    "recruitment", "logistics", "gaming", "media", "security",
-    "insurance", "property", "ecommerce", "public-sector", "general",
-)
-
-SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,63}$")
-SEMVER_RE = re.compile(r"^\d{1,3}\.\d{1,3}\.\d{1,4}$")
-
-
-# ---------------------------------------------------------------- helpers
-
-def _now():
-    return time.time()
-
-
-def _iso(ts):
-    if ts is None:
-        return None
-    try:
-        return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
-    except (TypeError, ValueError, OverflowError, OSError):
-        return None
-
-
-def _canonical(obj):
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
-                      ensure_ascii=True).encode("utf-8")
-
-
-def _digest(obj):
-    return hashlib.sha256(b"SEBBI-SIGNALPACK-v1\n" + _canonical(obj)).hexdigest()
-
-
-def _slug(name):
-    s = re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-")
-    return s[:64] or "pack"
-
-
-# ================================================================ language
-#
-# A tiny expression language, parsed by hand into a tuple tree and walked.
-# Nothing here reaches eval, exec or compile, and there is no syntax for
-# calling anything, so an untrusted pack cannot do anything but compare
-# numbers it was given.
-
-_TOKEN_RE = re.compile(r"""
-    \s*(?:
-        (?P<num>\d+(?:\.\d+)?)
-      | (?P<op>>=|<=|==|!=|>|<)
-      | (?P<lp>\()
-      | (?P<rp>\))
-      | (?P<word>[A-Za-z_][A-Za-z0-9_]*)
-    )
-""", re.VERBOSE)
-
-_WORD_OPS = {"and", "or", "not", "true", "false"}
-
-
-class PackError(ValueError):
-    """Anything wrong with a pack, reported to the author in plain words."""
-
-
-def _tokenise(src):
-    if len(src) > MAX_EXPR_CHARS:
-        raise PackError("expression is longer than %d characters"
-                        % MAX_EXPR_CHARS)
-    out = []
-    pos = 0
-    n = len(src)
-    while pos < n:
-        m = _TOKEN_RE.match(src, pos)
-        if not m or m.end() == m.start():
-            rest = src[pos:pos + 12]
-            raise PackError("cannot read %r - the language has numbers, "
-                            "names, brackets, and the operators "
-                            "> >= < <= == != and or not" % rest)
-        pos = m.end()
-        if m.group("num"):
-            out.append(("num", float(m.group("num"))))
-        elif m.group("op"):
-            out.append(("op", m.group("op")))
-        elif m.group("lp"):
-            out.append(("lp", "("))
-        elif m.group("rp"):
-            out.append(("rp", ")"))
-        else:
-            w = m.group("word")
-            lw = w.lower()
-            if lw in _WORD_OPS:
-                out.append(("kw", lw))
-            elif w in NAMES:
-                out.append(("name", w))
-            else:
-                raise PackError(
-                    "unknown name %r. Available: %s"
-                    % (w, ", ".join(sorted(NAMES))))
-        if len(out) > MAX_TOKENS_PER_EXPR:
-            raise PackError("expression has too many parts (limit %d)"
-                            % MAX_TOKENS_PER_EXPR)
-        if pos < n and src[pos:].strip() == "":
-            break
-    return out
-
-
-class _Parser:
-    def __init__(self, toks):
-        self.t = toks
-        self.i = 0
-
-    def peek(self):
-        return self.t[self.i] if self.i < len(self.t) else (None, None)
-
-    def take(self):
-        tok = self.peek()
-        self.i += 1
-        return tok
-
-    def expect(self, kind, val=None):
-        k, v = self.take()
-        if k != kind or (val is not None and v != val):
-            raise PackError("expected %s here" % (val or kind))
-        return v
-
-    def parse(self):
-        node = self.or_expr()
-        if self.i != len(self.t):
-            raise PackError("unexpected extra text at the end of the "
-                            "expression")
-        return node
-
-    def or_expr(self):
-        node = self.and_expr()
-        while self.peek() == ("kw", "or"):
-            self.take()
-            node = ("or", node, self.and_expr())
-        return node
-
-    def and_expr(self):
-        node = self.not_expr()
-        while self.peek() == ("kw", "and"):
-            self.take()
-            node = ("and", node, self.not_expr())
-        return node
-
-    def not_expr(self):
-        if self.peek() == ("kw", "not"):
-            self.take()
-            return ("not", self.not_expr())
-        return self.comparison()
-
-    def comparison(self):
-        left = self.primary()
-        k, v = self.peek()
-        if k == "op":
-            self.take()
-            right = self.primary()
-            return ("cmp", v, left, right)
-        return left
-
-    def primary(self):
-        k, v = self.take()
-        if k == "num":
-            return ("num", v)
-        if k == "name":
-            return ("name", v)
-        if k == "kw" and v in ("true", "false"):
-            return ("bool", v == "true")
-        if k == "kw" and v == "not":
-            return ("not", self.not_expr())
-        if k == "lp":
-            node = self.or_expr()
-            self.expect("rp")
-            return node
-        raise PackError("expected a number, a signal name, or a bracket")
-
-
-def compile_expr(src):
-    """Text to tree. Raises PackError with something an author can act on."""
-    if not isinstance(src, str) or not src.strip():
-        raise PackError("a rule needs a 'when' expression")
-    toks = _tokenise(src)
-    if not toks:
-        raise PackError("empty expression")
-    return _Parser(toks).parse()
-
-
-def _truth(v):
-    if isinstance(v, bool):
-        return v
-    return bool(v)
-
-
-def eval_expr(node, env):
-    """Walk the tree. No recursion into anything the pack controls."""
-    kind = node[0]
-    if kind == "num":
-        return node[1]
-    if kind == "bool":
-        return node[1]
-    if kind == "name":
-        return env.get(node[1], 0)
-    if kind == "not":
-        return not _truth(eval_expr(node[1], env))
-    if kind == "and":
-        return (_truth(eval_expr(node[1], env))
-                and _truth(eval_expr(node[2], env)))
-    if kind == "or":
-        return (_truth(eval_expr(node[1], env))
-                or _truth(eval_expr(node[2], env)))
-    if kind == "cmp":
-        op = node[1]
-        a = eval_expr(node[2], env)
-        b = eval_expr(node[3], env)
-        if isinstance(a, bool) or isinstance(b, bool):
-            a = 1 if a is True else 0 if a is False else a
-            b = 1 if b is True else 0 if b is False else b
-        try:
-            if op == ">":
-                return a > b
-            if op == ">=":
-                return a >= b
-            if op == "<":
-                return a < b
-            if op == "<=":
-                return a <= b
-            if op == "==":
-                return a == b
-            if op == "!=":
-                return a != b
-        except TypeError:
-            return False
-    raise PackError("unreadable expression")
-
-
-def _names_used(node, found=None):
-    """Which signals a rule actually reads. Used to draw the sigil."""
-    if found is None:
-        found = {}
-    kind = node[0]
-    if kind == "name":
-        found[node[1]] = found.get(node[1], 0) + 1
-    elif kind in ("not",):
-        _names_used(node[1], found)
-    elif kind in ("and", "or"):
-        _names_used(node[1], found)
-        _names_used(node[2], found)
-    elif kind == "cmp":
-        _names_used(node[2], found)
-        _names_used(node[3], found)
-    return found
-
-
-# ================================================================ manifest
-
-def validate(manifest):
-    """
-    Returns (clean_manifest, compiled_rules, profile).
-
-    Everything an author can get wrong is named in words they can act on,
-    because a library where publishing fails with 'invalid input' is a
-    library nobody publishes to.
-    """
-    if not isinstance(manifest, dict):
-        raise PackError("a pack is a JSON object")
-    if len(_canonical(manifest)) > MAX_MANIFEST_BYTES:
-        raise PackError("a pack must be under %d bytes" % MAX_MANIFEST_BYTES)
-
-    name = str(manifest.get("name") or "").strip()
-    if not name or len(name) > MAX_NAME:
-        raise PackError("name is required, up to %d characters" % MAX_NAME)
-
-    author = str(manifest.get("author") or "").strip()
-    if not author or len(author) > MAX_NAME:
-        raise PackError("author is required - a name, a domain or a handle")
-
-    version = str(manifest.get("version") or "1.0.0").strip()
-    if not SEMVER_RE.match(version):
-        raise PackError("version must look like 1.0.0")
-
-    summary = str(manifest.get("summary") or "").strip()
-    if len(summary) > MAX_SUMMARY:
-        raise PackError("summary must be under %d characters" % MAX_SUMMARY)
-
-    vertical = str(manifest.get("vertical") or "general").strip().lower()
-    if vertical not in VERTICALS:
-        raise PackError("vertical must be one of: %s" % ", ".join(VERTICALS))
-
-    default = str(manifest.get("default") or "allow").strip().lower()
-    if default not in VERDICTS:
-        raise PackError("default must be one of: %s" % ", ".join(VERDICTS))
-
-    rules = manifest.get("rules")
-    if not isinstance(rules, list) or not rules:
-        raise PackError("a pack needs at least one rule")
-    if len(rules) > MAX_RULES:
-        raise PackError("a pack may hold up to %d rules" % MAX_RULES)
-
-    clean_rules = []
-    compiled = []
-    usage = {}
-    for i, r in enumerate(rules):
-        if not isinstance(r, dict):
-            raise PackError("rule %d is not an object" % (i + 1))
-        when = r.get("when")
-        try:
-            tree = compile_expr(when)
-        except PackError as exc:
-            raise PackError("rule %d: %s" % (i + 1, exc))
-        then = str(r.get("then") or "").strip().lower()
-        if then not in VERDICTS:
-            raise PackError("rule %d: 'then' must be one of: %s"
-                            % (i + 1, ", ".join(VERDICTS)))
-        why = str(r.get("why") or "").strip()
-        if len(why) > MAX_WHY:
-            raise PackError("rule %d: 'why' must be under %d characters"
-                            % (i + 1, MAX_WHY))
-        if not why:
-            raise PackError("rule %d needs a 'why'. A verdict with no stated "
-                            "reason is the thing this whole platform exists "
-                            "to remove." % (i + 1))
-        clean_rules.append({"when": str(when).strip(), "then": then,
-                            "why": why})
-        compiled.append((tree, then, why))
-        for k, n in _names_used(tree).items():
-            usage[k] = usage.get(k, 0) + n
-
-    clean = {
-        "name": name,
-        "author": author,
-        "version": version,
-        "vertical": vertical,
-        "summary": summary,
-        "default": default,
-        "rules": clean_rules,
-    }
-    return clean, compiled, _profile(usage, clean_rules)
-
-
-def _profile(usage, rules):
-    """
-    The pack's signal fingerprint: how heavily it leans on each of the nine
-    signals, normalised to 0..1. Deterministic from the manifest, so the
-    same pack always draws the same sigil, and two packs that reason
-    differently never look alike.
-    """
-    raw = {}
-    for s in SIGNALS:
-        direct = usage.get(s, 0)
-        # A pack that reads a raw measure is leaning on that signal too.
-        kin = {"size": "chars", "ask": "max_tokens", "depth": "turns",
-               "tools": "tool_count", "loop": "loop_count",
-               "burst": "burst_count", "grind": "grind_count"}.get(s)
-        indirect = usage.get(kin, 0) if kin else 0
-        raw[s] = direct * 1.0 + indirect * 0.85
-    top = max(raw.values()) if raw else 0
-    prof = {s: (round(raw[s] / top, 3) if top else 0.0) for s in SIGNALS}
-    strict = max((STRICTNESS[r["then"]] for r in rules), default=0)
-    return {
-        "signals": prof,
-        "reads": sorted([s for s in SIGNALS if prof[s] > 0]),
-        "rule_count": len(rules),
-        "hardest_verdict": [k for k, v in STRICTNESS.items()
-                            if v == strict][0],
-        "note": "Each spoke is how heavily this pack leans on that signal. "
-                "Computed from the rules themselves, so the drawing is the "
-                "pack rather than a picture attached to it.",
-    }
-
-
-# ================================================================ evaluate
-
-def _env(measured, signals, score, unattended, deterministic):
-    env = {}
-    for s in SIGNALS:
-        try:
-            env[s] = float(signals.get(s, 0) or 0)
-        except (TypeError, ValueError):
-            env[s] = 0.0
-    env["score"] = float(score or 0)
-    env["chars"] = int(measured.get("prompt_characters", 0) or 0)
-    env["max_tokens"] = int(measured.get("authorised_output_tokens", 0) or 0)
-    env["turns"] = int(measured.get("conversation_turns", 0) or 0)
-    env["tool_count"] = int(measured.get("tool_definitions", 0) or 0)
-    env["loop_count"] = int(measured.get("loop_count", 0) or 0)
-    env["burst_count"] = int(measured.get("requests_in_last_60s", 0) or 0)
-    env["grind_count"] = int(measured.get("requests_in_last_hour", 0) or 0)
-    env["unattended"] = bool(unattended)
-    env["deterministic"] = bool(deterministic)
-    return env
-
-
-def apply_pack(compiled, default, env, engine_verdict):
-    """
-    Run the rules in order, first match wins.
-
-    A pack may only make the engine's own decision stricter. If the engine
-    already refused a request under a hard rule, a pack saying 'allow'
-    changes nothing - and the response says so rather than quietly
-    discarding it, because an author debugging a pack needs to see that
-    their rule fired and was capped.
-    """
-    fired = None
-    for idx, (tree, then, why) in enumerate(compiled):
-        try:
-            hit = _truth(eval_expr(tree, env))
-        except PackError:
-            hit = False
-        if hit:
-            fired = {"rule": idx + 1, "then": then, "why": why}
-            break
-
-    pack_verdict = fired["then"] if fired else default
-    base = STRICTNESS.get(engine_verdict, 0)
-    want = STRICTNESS.get(pack_verdict, 0)
-
-    if want >= base:
-        final = pack_verdict
-        capped = False
-    else:
-        final = engine_verdict
-        capped = True
-
-    return {
-        "engine_verdict": engine_verdict,
-        "pack_verdict": pack_verdict,
-        "verdict": final,
-        "matched_rule": fired,
-        "used_default": fired is None,
-        "capped_by_engine": capped,
-        "capping_note": (
-            "the pack asked for a weaker verdict than the engine had already "
-            "reached, so the engine's stands. A pack can only ever tighten."
-            if capped else None),
-    }
-
-
-# ================================================================ storage
-
-_ready = False
-
-
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        c = ctx["conn"]
-        c.execute(
-            "CREATE TABLE IF NOT EXISTS packs("
-            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
-            "pack_id TEXT UNIQUE,"
-            "slug TEXT,"
-            "name TEXT,"
-            "author TEXT,"
-            "version TEXT,"
-            "vertical TEXT,"
-            "summary TEXT,"
-            "manifest TEXT,"
-            "profile TEXT,"
-            "digest TEXT,"
-            "published REAL,"
-            "forked_from TEXT,"
-            "runs INTEGER NOT NULL DEFAULT 0,"
-            "audit_hash TEXT,"
-            "block_index INTEGER,"
-            "seeded INTEGER NOT NULL DEFAULT 0)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_packs_vert "
-                  "ON packs(vertical)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_packs_slug ON packs(slug)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_packs_dig ON packs(digest)")
-        c.commit()
-    _ready = True
-    _seed(ctx)
-
-
-def _pack_id(slug, version, digest):
-    return "%s@%s.%s" % (slug, version, digest[:8])
-
-
-def _row_to_pack(r, full=False):
-    out = {
-        "id": r[1],
-        "slug": r[2],
-        "name": r[3],
-        "author": r[4],
-        "version": r[5],
-        "vertical": r[6],
-        "summary": r[7],
-        "profile": json.loads(r[9]) if r[9] else None,
-        "digest": r[10],
-        "published": _iso(r[11]),
-        "forked_from": r[12],
-        "runs": r[13],
-        "sealed_in_chain": r[14],
-        "block_index": r[15],
-        "origin": "library seed" if r[16] else "published",
-    }
-    if full:
-        out["manifest"] = json.loads(r[8])
-    return out
-
-
-def _seal(ctx, event, result, api_key=None):
-    """Seal, tolerating whichever signature this deployment's seal has."""
-    ts = _now()
-    ev = {"user_id": "packs", "action": event, "amount": 0,
-          "country": "UK", "device_id": "packs", "anomaly": 0,
-          "device_risk": 0}
-    res = dict(result)
-    res.setdefault("decision", "PACK_EVENT")
-    res.setdefault("score", 0)
-    res.setdefault("timestamp", ts)
-    fn = ctx.get("seal")
-    if not fn:
-        return None, None, None
-    for call in (lambda: fn(ev, res, ts, api_key),
-                 lambda: fn(ev, res, ts),
-                 lambda: fn(ev, res)):
-        try:
-            out = call()
-        except TypeError:
-            continue
-        except Exception:                                    # noqa: BLE001
-            return None, None, None
-        if isinstance(out, (tuple, list)):
-            return (out[0] if len(out) > 0 else None,
-                    out[1] if len(out) > 1 else None,
-                    out[2] if len(out) > 2 else None)
-        if isinstance(out, dict):
-            return (out.get("audit_hash") or out.get("hash"),
-                    out.get("block_index"), out.get("key_seq"))
-        if isinstance(out, str):
-            return out, None, None
-    return None, None, None
-
-
-def _store(ctx, clean, profile, forked_from, api_key, seeded=False):
-    digest = _digest(clean)
-    slug = _slug(clean["name"])
-    pid = _pack_id(slug, clean["version"], digest)
-
-    with ctx["lock"]:
-        existing = ctx["conn"].execute(
-            "SELECT * FROM packs WHERE digest=?", (digest,)).fetchone()
-    if existing:
-        out = _row_to_pack(existing, full=True)
-        out["already_published"] = True
-        out["note"] = ("byte-for-byte identical to a pack already in the "
-                       "library, so the original stands. Change something "
-                       "or fork it under your own name.")
-        return out
-
-    h, idx, seq = _seal(ctx, "signalpack_published", {
-        "decision": "PACK_PUBLISHED",
-        "pack_id": pid, "name": clean["name"], "author": clean["author"],
-        "version": clean["version"], "vertical": clean["vertical"],
-        "rules": len(clean["rules"]), "digest": digest,
-        "forked_from": forked_from,
-        "note": "the pack's own digest is sealed, so the document cannot be "
-                "edited after this date without the digest changing",
-    }, api_key) if not seeded else _seal(ctx, "signalpack_seeded", {
-        "decision": "PACK_SEEDED", "pack_id": pid, "digest": digest,
-        "note": "library seed published by the deployment operator",
-    }, api_key)
-
-    now = _now()
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "INSERT OR IGNORE INTO packs(pack_id,slug,name,author,version,"
-            "vertical,summary,manifest,profile,digest,published,forked_from,"
-            "runs,audit_hash,block_index,seeded) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?)",
-            (pid, slug, clean["name"], clean["author"], clean["version"],
-             clean["vertical"], clean["summary"], json.dumps(clean),
-             json.dumps(profile), digest, now, forked_from, h, idx,
-             1 if seeded else 0))
-        ctx["conn"].commit()
-        row = ctx["conn"].execute(
-            "SELECT * FROM packs WHERE pack_id=?", (pid,)).fetchone()
-
-    out = _row_to_pack(row, full=True) if row else {"id": pid}
-    out["receipt_seq"] = seq
-    out["what_this_proves"] = (
-        "that this exact document existed at this position in the chain on "
-        "this date. It does not prove the rules are good ones.")
-    return out
-
-
-# ================================================================ the seeds
-#
-# Twenty packs so the library is not empty on the first day. They are
-# marked as seeds rather than passed off as community work, and they are
-# forkable like anything else. Every threshold in them is arguable - that
-# is the point of a library. Fork one and argue with it.
-
-SEEDS = [
-    {
-        "name": "Legal document review",
-        "author": "sebbi.pro",
-        "version": "1.0.0",
-        "vertical": "legal",
-        "summary": "Long clause-by-clause review threads carry the whole "
-                   "document on every call. This catches that before the bill "
-                   "does.",
-        "default": "allow",
-        "rules": [
-            {"when": "turns > 20 and chars > 40000",
-             "then": "challenge",
-             "why": "A twenty-turn review re-sending forty thousand "
-                    "characters is paying for the same contract on every "
-                    "question."},
-            {"when": "loop_count >= 3 and not deterministic",
-             "then": "challenge",
-             "why": "The same clause asked three times with temperature "
-                    "above zero cannot be reused, so it is bought again "
-                    "each time."},
-            {"when": "unattended and max_tokens > 4000",
-             "then": "block",
-             "why": "A four thousand token opinion generated with nobody "
-                    "reading it is a cost with no reader."},
-        ],
-    },
-    {
-        "name": "Clinical summarisation guard",
-        "author": "sebbi.pro",
-        "version": "1.0.0",
-        "vertical": "medical",
-        "summary": "Holds long unattended clinical generations for a person. "
-                   "Deliberately cautious rather than cheap.",
-        "default": "allow",
-        "rules": [
-            {"when": "unattended and max_tokens > 1500",
-             "then": "challenge",
-             "why": "Clinical text generated at length with no clinician "
-                    "watching should reach a person before it reaches a "
-                    "record."},
-            {"when": "turns > 30",
-             "then": "challenge",
-             "why": "A thirty-turn history is being re-sent whole on every "
-                    "call and is almost certainly carrying resolved "
-                    "episodes."},
-            {"when": "exposure > 0.7",
-             "then": "block",
-             "why": "One call about to consume most of the remaining budget "
-                    "stops here."},
-        ],
-    },
-    {
-        "name": "Support triage - high volume",
-        "author": "sebbi.pro",
-        "version": "1.0.0",
-        "vertical": "support",
-        "summary": "Built for inbox-shaped traffic: short, repetitive, and "
-                   "cheap when it is allowed to be.",
-        "default": "downgrade",
-        "rules": [
-            {"when": "loop_count >= 4",
-             "then": "block",
-             "why": "Four identical tickets in two minutes is a retry loop, "
-                    "not four customers."},
-            {"when": "chars < 2000 and turns <= 4 and tool_count == 0",
-             "then": "downgrade",
-             "why": "A short first-line reply does not need the expensive "
-                    "model."},
-            {"when": "burst_count > 60",
-             "then": "challenge",
-             "why": "Sixty requests a minute from one key is either a "
-                    "migration or a fault, and both want a person."},
-        ],
-    },
-    {
-        "name": "Coding agent leash",
-        "author": "sebbi.pro",
-        "version": "1.0.0",
-        "vertical": "coding",
-        "summary": "The pack for autonomous coding loops. Tight on repeats, "
-                   "hard on unattended runs.",
-        "default": "allow",
-        "rules": [
-            {"when": "unattended and loop_count >= 2",
-             "then": "block",
-             "why": "An agent retrying the same call with nobody watching is "
-                    "the most expensive failure mode there is."},
-            {"when": "tools > 0.6 and tool_count > 12",
-             "then": "challenge",
-             "why": "Twelve tool definitions on every call is a large fixed "
-                    "cost per step in a long loop."},
-            {"when": "grind_count > 400",
-             "then": "challenge",
-             "why": "Four hundred calls in an hour is a run that should be "
-                    "confirmed rather than assumed."},
-            {"when": "score > 0.7",
-             "then": "challenge",
-             "why": "The engine already rates this call as costly and "
-                    "repetitive."},
-        ],
-    },
-    {
-        "name": "Financial analysis desk",
-        "author": "sebbi.pro",
-        "version": "1.0.0",
-        "vertical": "finance",
-        "summary": "Protects a shared budget across a desk where any one "
-                   "analyst can spend it.",
-        "default": "allow",
-        "rules": [
-            {"when": "exposure > 0.5",
-             "then": "challenge",
-             "why": "One call reaching for half the remaining budget is a "
-                    "decision, not a request."},
-            {"when": "exposure > 0.85",
-             "then": "block",
-             "why": "Past this point a single call can empty the desk's "
-                    "budget."},
-            {"when": "max_tokens > 8000 and unattended",
-             "then": "block",
-             "why": "An eight thousand token report nobody asked to read."},
-        ],
-    },
-    {
-        "name": "Retail product copy",
-        "author": "sebbi.pro",
-        "version": "1.0.0",
-        "vertical": "retail",
-        "summary": "Catalogue generation at volume, where the same SKU gets "
-                   "asked for twice more often than anyone believes.",
-        "default": "downgrade",
-        "rules": [
-            {"when": "not deterministic and loop_count >= 2",
-             "then": "challenge",
-             "why": "Varied copy for the same product, generated twice, "
-                    "cannot be reused and is paid for twice."},
-            {"when": "chars < 3000 and max_tokens <= 800",
-             "then": "downgrade",
-             "why": "Short product copy is what the cheap model is for."},
-            {"when": "burst_count > 90",
-             "then": "block",
-             "why": "Ninety calls a minute against a catalogue is a runaway "
-                    "import."},
-        ],
-    },
-    {
-        "name": "Education marking assistant",
-        "author": "sebbi.pro",
-        "version": "1.0.0",
-        "vertical": "education",
-        "summary": "Batch marking runs unattended overnight. This is the "
-                   "pack that stops one bad loop eating a term's budget.",
-        "default": "allow",
-        "rules": [
-            {"when": "unattended and loop_count >= 3",
-             "then": "block",
-             "why": "The same script marked three times is a fault in the "
-                    "batch, not three submissions."},
-            {"when": "unattended and grind_count > 800",
-             "then": "challenge",
-             "why": "Eight hundred marks in an hour with nobody watching "
-                    "wants confirming before it continues."},
-            {"when": "turns > 12",
-             "then": "challenge",
-             "why": "Marking should not need a twelve-turn conversation; "
-                    "something is carrying context it does not need."},
-        ],
-    },
-    {
-        "name": "Research literature sweep",
-        "author": "sebbi.pro",
-        "version": "1.0.0",
-        "vertical": "research",
-        "summary": "Long context is the whole job here, so this pack is "
-                   "loose on size and tight on repetition.",
-        "default": "allow",
-        "rules": [
-            {"when": "loop_count >= 3",
-             "then": "challenge",
-             "why": "The same paper summarised three times in two minutes is "
-                    "a pipeline retrying, not new reading."},
-            {"when": "novelty == 0 and grind_count > 300",
-             "then": "challenge",
-             "why": "Three hundred calls of a shape already seen is a sweep "
-                    "that has stopped finding anything new."},
-        ],
-    },
-    {
-        "name": "Translation pipeline",
-        "author": "sebbi.pro",
-        "version": "1.0.0",
-        "vertical": "translation",
-        "summary": "Translation is the purest case for exact reuse: the same "
-                   "string, the same language pair, the same answer.",
-        "default": "downgrade",
-        "rules": [
-            {"when": "not deterministic",
-             "then": "challenge",
-             "why": "Temperature above zero on a translation blocks reuse for "
-                    "no benefit. The same string should give the same "
-                    "translation."},
-            {"when": "chars < 4000 and tool_count == 0",
-             "then": "downgrade",
-             "why": "Short segment translation does not need the expensive "
-                    "model."},
-            {"when": "loop_count >= 5",
-             "then": "block",
-             "why": "Five identical segments in two minutes is a stuck "
-                    "queue."},
-        ],
-    },
-    {
-        "name": "Content moderation queue",
-        "author": "sebbi.pro",
-        "version": "1.0.0",
-        "vertical": "moderation",
-        "summary": "High volume, low latency, and a hard floor under how "
-                   "cheap a decision is allowed to get.",
-        "default": "allow",
-        "rules": [
-            {"when": "burst_count > 100",
-             "then": "challenge",
-             "why": "A hundred moderation calls a minute is either a brigade "
-                    "or a loop."},
-            {"when": "unattended and max_tokens > 600",
-             "then": "challenge",
-             "why": "A moderation verdict should be short. Six hundred "
-                    "tokens suggests the model is being asked to write an "
-                    "essay nobody reads."},
-        ],
-    },
-    {
-        "name": "Sales outreach drafting",
-        "author": "sebbi.pro",
-        "version": "1.0.0",
-        "vertical": "sales",
-        "summary": "Personalised at the top, templated underneath. This "
-                   "catches the templated part being paid for at full price.",
-        "default": "downgrade",
-        "rules": [
-            {"when": "chars > 20000 and turns <= 3",
-             "then": "challenge",
-             "why": "Twenty thousand characters of context for a three-turn "
-                    "draft is a prompt carrying a library."},
-            {"when": "loop_count >= 4",
-             "then": "block",
-             "why": "The same outreach drafted four times is a queue "
-                    "repeating."},
-            {"when": "chars < 5000 and max_tokens <= 1000",
-             "then": "downgrade",
-             "why": "A short first-touch email is cheap-model work."},
-        ],
-    },
-    {
-        "name": "Recruitment screening",
-        "author": "sebbi.pro",
-        "version": "1.0.0",
-        "vertical": "recruitment",
-        "summary": "Screening runs at volume against long documents. Holds "
-                   "unattended bulk decisions for a person.",
-        "default": "allow",
-        "rules": [
-            {"when": "unattended and grind_count > 200",
-             "then": "challenge",
-             "why": "Two hundred screening decisions an hour with nobody "
-                    "watching is a process that should be confirmed."},
-            {"when": "turns > 15",
-             "then": "challenge",
-             "why": "Screening one candidate should not take fifteen turns "
-                    "of carried context."},
-            {"when": "loop_count >= 3",
-             "then": "block",
-             "why": "The same CV screened three times in two minutes."},
-        ],
-    },
-    {
-        "name": "Logistics exception handling",
-        "author": "sebbi.pro",
-        "version": "1.0.0",
-        "vertical": "logistics",
-        "summary": "Exceptions arrive in bursts when something goes wrong "
-                   "upstream. This tells a burst from a storm.",
-        "default": "allow",
-        "rules": [
-            {"when": "burst_count > 80 and loop_count >= 2",
-             "then": "block",
-             "why": "A burst of repeats is an upstream system retrying, and "
-                    "every retry is bought."},
-            {"when": "burst_count > 80",
-             "then": "challenge",
-             "why": "A genuine exception storm is worth a person seeing "
-                    "before it is worth paying for."},
-            {"when": "chars < 2500",
-             "then": "downgrade",
-             "why": "Most exception routing is short and structured."},
-        ],
-    },
-    {
-        "name": "Game NPC dialogue",
-        "author": "sebbi.pro",
-        "version": "1.0.0",
-        "vertical": "gaming",
-        "summary": "Variety is the product here, so this pack does not "
-                   "punish temperature. It punishes context bloat instead.",
-        "default": "allow",
-        "rules": [
-            {"when": "turns > 40",
-             "then": "challenge",
-             "why": "Forty turns of conversation history re-sent per line of "
-                    "dialogue is the whole session paid for on every line."},
-            {"when": "max_tokens > 500",
-             "then": "challenge",
-             "why": "NPC lines should be short. A five hundred token ceiling "
-                    "on a line of dialogue is an accident."},
-            {"when": "chars < 3000 and turns <= 10",
-             "then": "downgrade",
-             "why": "Short in-scene dialogue is cheap-model work."},
-        ],
-    },
-    {
-        "name": "Newsroom drafting",
-        "author": "sebbi.pro",
-        "version": "1.0.0",
-        "vertical": "media",
-        "summary": "Fast, long and deadline-driven. Tight on unattended, "
-                   "loose on size.",
-        "default": "allow",
-        "rules": [
-            {"when": "unattended and max_tokens > 3000",
-             "then": "block",
-             "why": "Three thousand tokens of copy generated with no editor "
-                    "attached."},
-            {"when": "loop_count >= 3 and not deterministic",
-             "then": "challenge",
-             "why": "Three regenerations of the same piece at temperature "
-                    "cannot be reused and are bought each time."},
-        ],
-    },
-    {
-        "name": "Security operations triage",
-        "author": "sebbi.pro",
-        "version": "1.0.0",
-        "vertical": "security",
-        "summary": "Alert volume is the enemy. This pack assumes the "
-                   "pipeline will misbehave before the analyst does.",
-        "default": "allow",
-        "rules": [
-            {"when": "loop_count >= 2 and unattended",
-             "then": "block",
-             "why": "A detection pipeline re-asking the same alert is a "
-                    "retry loop and every retry is billed."},
-            {"when": "burst_count > 120",
-             "then": "block",
-             "why": "A hundred and twenty alerts a minute is a flood, and "
-                    "paying a model per alert during a flood is how a "
-                    "budget disappears in an afternoon."},
-            {"when": "chars < 4000 and tool_count == 0",
-             "then": "downgrade",
-             "why": "Most alert enrichment is short and structured."},
-        ],
-    },
-    {
-        "name": "Insurance claims assistant",
-        "author": "sebbi.pro",
-        "version": "1.0.0",
-        "vertical": "insurance",
-        "summary": "Claims carry long histories and strict budgets. This "
-                   "watches both.",
-        "default": "allow",
-        "rules": [
-            {"when": "exposure > 0.6",
-             "then": "challenge",
-             "why": "One claim about to take most of the remaining budget."},
-            {"when": "turns > 25 and chars > 30000",
-             "then": "challenge",
-             "why": "The full claim file is being re-sent on every question."},
-            {"when": "unattended and max_tokens > 2000",
-             "then": "challenge",
-             "why": "A long unattended determination on a claim should reach "
-                    "a person first."},
-        ],
-    },
-    {
-        "name": "Property listing generation",
-        "author": "sebbi.pro",
-        "version": "1.0.0",
-        "vertical": "property",
-        "summary": "Listings are short, repetitive and generated in batches. "
-                   "The cheap model does most of this well.",
-        "default": "downgrade",
-        "rules": [
-            {"when": "loop_count >= 3",
-             "then": "block",
-             "why": "The same property written three times in two minutes is "
-                    "a batch repeating."},
-            {"when": "max_tokens > 1200",
-             "then": "challenge",
-             "why": "A listing longer than twelve hundred tokens is not a "
-                    "listing."},
-        ],
-    },
-    {
-        "name": "Ecommerce customer answers",
-        "author": "sebbi.pro",
-        "version": "1.0.0",
-        "vertical": "ecommerce",
-        "summary": "The same twenty questions, asked by thousands of people. "
-                   "Reuse is where the money is.",
-        "default": "downgrade",
-        "rules": [
-            {"when": "not deterministic",
-             "then": "challenge",
-             "why": "Temperature above zero on a delivery-times answer stops "
-                    "it being reused and buys the same answer again for "
-                    "every customer."},
-            {"when": "chars < 2500 and turns <= 3",
-             "then": "downgrade",
-             "why": "A stock answer to a stock question."},
-            {"when": "burst_count > 100",
-             "then": "challenge",
-             "why": "A hundred a minute is a promotion landing or a scraper "
-                    "arriving."},
-        ],
-    },
-    {
-        "name": "Public sector correspondence",
-        "author": "sebbi.pro",
-        "version": "1.0.0",
-        "vertical": "public-sector",
-        "summary": "Written for a fixed annual budget that cannot be topped "
-                   "up in March. Conservative by design.",
-        "default": "allow",
-        "rules": [
-            {"when": "exposure > 0.4",
-             "then": "challenge",
-             "why": "A budget that cannot be increased should be spent in "
-                    "deliberate steps, not in one call."},
-            {"when": "exposure > 0.75",
-             "then": "block",
-             "why": "Past this, a single call risks the remainder of the "
-                    "year."},
-            {"when": "unattended and loop_count >= 2",
-             "then": "block",
-             "why": "Unattended repetition against a fixed budget."},
-            {"when": "chars < 3000 and max_tokens <= 900",
-             "then": "downgrade",
-             "why": "Standard correspondence is cheap-model work."},
-        ],
-    },
-]
-
-
-def _seed(ctx):
-    """Publish the seeds once. Idempotent - the digest catches repeats."""
-    try:
-        with ctx["lock"]:
-            n = ctx["conn"].execute(
-                "SELECT COUNT(*) FROM packs WHERE seeded=1").fetchone()[0]
-        if n >= len(SEEDS):
-            return
-        for m in SEEDS:
-            try:
-                clean, compiled, profile = validate(m)
-                _store(ctx, clean, profile, None, None, seeded=True)
-            except Exception:                                # noqa: BLE001
-                continue
-    except Exception:                                        # noqa: BLE001
-        pass
-
-
-# ================================================================ the page
-#
-# THE SIGIL
-# ---------
-# Every pack draws itself. Nine spokes, one per signal, each as long as
-# that pack leans on that signal, joined into a shape and given a hue
-# derived from its own digest. Two packs that reason the same way look
-# alike; two that reason differently cannot be mistaken for each other.
-#
-# It is not decoration bolted onto a list. The drawing is computed from
-# the rules, so a pack that changes one threshold changes its own face.
-
-PAGE = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Signal Packs — the library</title>
-<meta name="description" content="A public library of decision packs for the
-token saver. Free to write, free to read, free to fork. Runs on the engine.">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,700;9..144,900&family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-:root{
-  --void:#05070d;
-  --deep:#0a0f1c;
-  --slab:#0e1524;
-  --slab-2:#131c30;
-  --edge:rgba(140,170,255,.14);
-  --edge-hot:rgba(201,168,76,.42);
-  --corona:#c9a84c;
-  --ice:#8fd3ff;
-  --text:#e9edf6;
-  --mute:rgba(233,237,246,.44);
-  --mute-2:rgba(233,237,246,.28);
-  --allow:#2fbf87;
-  --down:#4fa8d8;
-  --chal:#d8a13c;
-  --block:#e0574a;
-  --disp:Fraunces,Georgia,serif;
-  --mono:'IBM Plex Mono',ui-monospace,monospace;
-  --body:Inter,system-ui,-apple-system,sans-serif;
-}
-html{-webkit-text-size-adjust:100%}
-body{
-  background:var(--void);color:var(--text);font:16px/1.6 var(--body);
-  overflow-x:hidden;
-  background-image:
-    radial-gradient(120% 60% at 50% -10%,rgba(80,120,220,.18),transparent 60%),
-    radial-gradient(80% 40% at 50% 0%,rgba(201,168,76,.10),transparent 70%);
-  background-attachment:fixed;
-}
-.wrap{max-width:760px;margin:0 auto;padding:0 18px}
-a{color:var(--ice);text-decoration:none}
-a:hover{text-decoration:underline}
-:focus-visible{outline:2px solid var(--corona);outline-offset:3px}
-
-/* ---------- the eclipse ---------- */
-.sky{position:relative;padding:46px 0 34px;text-align:center;overflow:hidden}
-.eclipse{
-  position:relative;width:172px;height:172px;margin:0 auto 26px;
-}
-.eclipse .ring{
-  position:absolute;inset:0;border-radius:50%;
-  background:conic-gradient(from 0deg,
-    rgba(201,168,76,0) 0deg,
-    rgba(201,168,76,.85) 40deg,
-    rgba(143,211,255,.9) 120deg,
-    rgba(201,168,76,.55) 210deg,
-    rgba(201,168,76,0) 330deg);
-  filter:blur(7px);
-  animation:spin 34s linear infinite;
-}
-.eclipse .ring2{
-  position:absolute;inset:-16px;border-radius:50%;
-  background:conic-gradient(from 180deg,
-    rgba(143,211,255,0) 0deg,
-    rgba(143,211,255,.35) 90deg,
-    rgba(201,168,76,.25) 200deg,
-    rgba(143,211,255,0) 300deg);
-  filter:blur(20px);opacity:.75;
-  animation:spin 58s linear infinite reverse;
-}
-.eclipse .disc{
-  position:absolute;inset:9px;border-radius:50%;
-  background:radial-gradient(circle at 50% 45%,#0b1120,#05070d 70%);
-  box-shadow:0 0 0 1px rgba(201,168,76,.35),0 0 60px rgba(0,0,0,.9) inset;
-}
-.eclipse .glyph{
-  position:absolute;inset:0;display:grid;place-items:center;
-  font:600 10px/1 var(--mono);letter-spacing:.34em;color:var(--corona);
-  text-transform:uppercase;text-indent:.34em;
-}
-@keyframes spin{to{transform:rotate(360deg)}}
-@media(prefers-reduced-motion:reduce){.eclipse .ring,.eclipse .ring2{animation:none}}
-
-h1{font:900 clamp(32px,8.4vw,54px)/1.02 var(--disp);letter-spacing:-.025em}
-h1 em{font-style:normal;color:var(--corona)}
-.lede{color:var(--mute);font-size:16.5px;max-width:46ch;margin:16px auto 0}
-.lede b{color:var(--text);font-weight:600}
-
-.split{
-  display:flex;gap:0;justify-content:center;margin:26px auto 0;
-  border:1px solid var(--edge);border-radius:3px;max-width:520px;overflow:hidden;
-}
-.split div{flex:1;padding:13px 12px;font:500 12.5px/1.45 var(--mono)}
-.split div:first-child{border-right:1px solid var(--edge);
-  background:rgba(47,191,135,.07);color:#9fe6c6}
-.split div:last-child{background:rgba(201,168,76,.07);color:#e8cf8f}
-.split b{display:block;font:600 10px/1 var(--mono);letter-spacing:.2em;
-  text-transform:uppercase;color:var(--mute);margin-bottom:6px}
-
-/* ---------- controls ---------- */
-.bar{position:sticky;top:0;z-index:9;background:rgba(5,7,13,.92);
-  backdrop-filter:blur(9px);border-bottom:1px solid var(--edge);
-  padding:12px 0;margin-top:34px}
-.bar .wrap{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-input,select,textarea{
-  background:var(--slab);border:1px solid var(--edge);border-radius:3px;
-  color:var(--text);font:400 14px/1.5 var(--mono);padding:11px 12px;
-}
-input:focus,select:focus,textarea:focus{outline:none;border-color:var(--corona)}
-#q{flex:1 1 190px;min-width:0}
-select{flex:0 0 auto;max-width:46%}
-.count{font:500 11px/1 var(--mono);color:var(--mute);letter-spacing:.12em;
-  text-transform:uppercase;margin-left:auto}
-
-/* ---------- a slab ---------- */
-.shelf{padding:20px 0 10px}
-.slab{
-  border:1px solid var(--edge);border-radius:4px;background:var(--slab);
-  margin-bottom:12px;overflow:hidden;
-  transition:border-color .16s ease,transform .16s ease;
-}
-.slab:hover{border-color:var(--edge-hot)}
-.slab.open{border-color:var(--edge-hot);background:var(--slab-2)}
-.head{display:grid;grid-template-columns:74px 1fr;gap:14px;padding:14px;
-  cursor:pointer;align-items:center}
-.sig{width:74px;height:74px;display:block}
-.meta .nm{font:700 17.5px/1.25 var(--disp);letter-spacing:-.01em}
-.meta .by{font:400 11.5px/1.5 var(--mono);color:var(--mute);margin-top:3px;
-  word-break:break-all}
-.meta .sm{font-size:13.5px;color:var(--mute);margin-top:7px;line-height:1.5}
-.chips{display:flex;gap:5px;flex-wrap:wrap;margin-top:9px}
-.chip{font:500 10px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;
-  padding:4px 7px;border-radius:2px;border:1px solid var(--edge);
-  color:var(--mute)}
-.chip.v{color:#cfe0ff;border-color:rgba(140,170,255,.3)}
-.chip.allow{color:var(--allow);border-color:rgba(47,191,135,.35)}
-.chip.downgrade{color:var(--down);border-color:rgba(79,168,216,.35)}
-.chip.challenge{color:var(--chal);border-color:rgba(216,161,60,.35)}
-.chip.block{color:var(--block);border-color:rgba(224,87,74,.35)}
-
-.body{display:none;padding:0 14px 16px;border-top:1px solid var(--edge)}
-.slab.open .body{display:block}
-.rule{border-bottom:1px solid rgba(140,170,255,.08);padding:12px 0}
-.rule:last-child{border-bottom:none}
-.when{font:500 13px/1.6 var(--mono);color:#cfe0ff;word-break:break-word}
-.then{font:600 10.5px/1 var(--mono);letter-spacing:.16em;text-transform:uppercase;
-  margin:8px 0 6px;display:inline-block}
-.why{font-size:13.5px;color:var(--mute);line-height:1.55}
-.foot{display:flex;gap:14px;flex-wrap:wrap;padding-top:12px;
-  font:400 11px/1.5 var(--mono);color:var(--mute-2);word-break:break-all}
-.acts{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
-.btn{background:transparent;border:1px solid var(--edge);color:var(--text);
-  font:500 12.5px/1 var(--body);padding:10px 13px;border-radius:3px;
-  cursor:pointer}
-.btn:hover{border-color:var(--corona);color:var(--corona)}
-.btn.gold{background:var(--corona);border-color:var(--corona);color:#070a12;
-  font-weight:600}
-.btn.gold:hover{background:#ddbc63;color:#070a12}
-
-/* ---------- write ---------- */
-section.write{border-top:1px solid var(--edge);margin-top:26px;padding:30px 0 10px}
-h2{font:700 clamp(22px,5vw,30px)/1.15 var(--disp);letter-spacing:-.015em}
-.sub{color:var(--mute);font-size:14.5px;margin:8px 0 18px;max-width:56ch}
-textarea{width:100%;min-height:260px;resize:vertical;font-size:12.5px;
-  line-height:1.65}
-.out{margin-top:12px;border:1px solid var(--edge);border-radius:3px;
-  padding:13px;font:400 12.5px/1.65 var(--mono);color:var(--mute);
-  white-space:pre-wrap;word-break:break-word;min-height:52px}
-.out.ok{color:#9fe6c6;border-color:rgba(47,191,135,.35)}
-.out.bad{color:#ffb1a7;border-color:rgba(224,87,74,.4)}
-.grammar{display:grid;grid-template-columns:1fr 1fr;gap:0;margin-top:18px;
-  border:1px solid var(--edge);border-radius:3px;overflow:hidden}
-@media(max-width:560px){.grammar{grid-template-columns:1fr}}
-.gcell{padding:12px 13px;border-bottom:1px solid var(--edge)}
-.gcell:nth-child(odd){border-right:1px solid var(--edge)}
-@media(max-width:560px){.gcell:nth-child(odd){border-right:none}}
-.gcell b{display:block;font:600 10px/1 var(--mono);letter-spacing:.18em;
-  text-transform:uppercase;color:var(--corona);margin-bottom:6px}
-.gcell span{font:400 12.5px/1.55 var(--mono);color:var(--mute)}
-footer{padding:34px 0 60px;color:var(--mute-2);font:400 12px/1.8 var(--mono);
-  border-top:1px solid var(--edge);margin-top:30px}
-.empty{padding:40px 0;text-align:center;color:var(--mute);font-size:14.5px}
-</style>
-</head>
-<body>
-
-<div class="sky">
-  <div class="wrap">
-    <div class="eclipse">
-      <div class="ring2"></div><div class="ring"></div>
-      <div class="disc"></div><div class="glyph">signal packs</div>
-    </div>
-    <h1>The rules are <em>free</em>.<br>Running them isn't.</h1>
-    <p class="lede">A public library of decision packs for the token saver.
-    Anyone can write one, anyone can read one, anyone can fork one and prove
-    they wrote it first. <b>A pack decides nothing on its own</b> — it needs
-    the engine underneath it, and that is where the receipt comes from.</p>
-    <div class="split">
-      <div><b>Free forever</b>write · read · fork · seal · prove it's yours</div>
-      <div><b>Needs the engine</b>evaluate · decide · seal a receipt</div>
-    </div>
-  </div>
-</div>
-
-<div class="bar">
-  <div class="wrap">
-    <input id="q" placeholder="search the library" autocomplete="off"
-           aria-label="Search packs">
-    <select id="v" aria-label="Filter by vertical"><option value="">every vertical</option></select>
-    <span class="count" id="count">—</span>
-  </div>
-</div>
-
-<div class="wrap">
-  <div class="shelf" id="shelf"><div class="empty">Opening the library…</div></div>
-
-  <section class="write">
-    <h2>Write one</h2>
-    <p class="sub">No account. No key. Paste a pack, validate it, publish it.
-    Publishing seals its digest into the chain, so the date and the wording are
-    fixed and provable from that moment — including against me.</p>
-
-    <textarea id="src" spellcheck="false" aria-label="Your pack"></textarea>
-    <div class="acts">
-      <button class="btn" id="check">Validate</button>
-      <button class="btn gold" id="pub">Publish &amp; seal</button>
-      <button class="btn" id="reset">Reset example</button>
-    </div>
-    <div class="out" id="msg">Nothing sent yet.</div>
-
-    <div class="grammar" id="grammar"></div>
-  </section>
-</div>
-
-<footer>
-  <div class="wrap">
-    Language, limits and every route: <a href="/x/packs/spec">/x/packs/spec</a><br>
-    The engine these run on: <a href="/x/tokensaver/spec">/x/tokensaver/spec</a><br>
-    sebbi.pro
-  </div>
-</footer>
-
-<script>
-var SIGNALS = ["exposure","size","ask","depth","tools","loop","burst","grind","novelty"];
-var VERDICT_COLOUR = {allow:"#2fbf87",downgrade:"#4fa8d8",challenge:"#d8a13c",block:"#e0574a"};
-var all = [];
-
-function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){
-  return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];});}
-
-/* hue from the digest, so a pack's colour is its own and never assigned */
-function hueOf(d){
-  var h=0; d=String(d||"");
-  for(var i=0;i<16 && i<d.length;i++) h=(h*31+d.charCodeAt(i))%360;
-  return h;
-}
-
-/* the sigil: nine spokes, one per signal, drawn from the pack's own rules */
-function sigil(profile,digest,size){
-  size=size||74;
-  var c=size/2, R=c-7, hue=hueOf(digest);
-  var sig=(profile&&profile.signals)||{};
-  var pts=[], spokes="";
-  for(var i=0;i<9;i++){
-    var a=(Math.PI*2*i/9)-Math.PI/2;
-    var w=Math.max(0,Math.min(1,+sig[SIGNALS[i]]||0));
-    var r=6+R*w;
-    var x=c+Math.cos(a)*r, y=c+Math.sin(a)*r;
-    var ox=c+Math.cos(a)*R, oy=c+Math.sin(a)*R;
-    pts.push(x.toFixed(1)+","+y.toFixed(1));
-    spokes+='<line x1="'+c+'" y1="'+c+'" x2="'+ox.toFixed(1)+'" y2="'+oy.toFixed(1)+
-            '" stroke="hsla('+hue+',60%,70%,.13)" stroke-width="1"/>';
-    if(w>0) spokes+='<circle cx="'+x.toFixed(1)+'" cy="'+y.toFixed(1)+
-            '" r="'+(1.6+w*1.9).toFixed(1)+'" fill="hsl('+hue+',72%,68%)"/>';
-  }
-  return '<svg class="sig" viewBox="0 0 '+size+' '+size+'" aria-hidden="true">'+
-    '<circle cx="'+c+'" cy="'+c+'" r="'+R+'" fill="none" '+
-      'stroke="hsla('+hue+',60%,65%,.18)" stroke-width="1"/>'+
-    spokes+
-    '<polygon points="'+pts.join(" ")+'" fill="hsla('+hue+',70%,60%,.20)" '+
-      'stroke="hsl('+hue+',75%,66%)" stroke-width="1.4" stroke-linejoin="round"/>'+
-    '<circle cx="'+c+'" cy="'+c+'" r="1.8" fill="hsl('+hue+',80%,78%)"/></svg>';
-}
-
-function slab(p){
-  var m=p.manifest||{}, rules=m.rules||[];
-  var body=rules.map(function(r){
-    return '<div class="rule"><div class="when">'+esc(r.when)+'</div>'+
-      '<div class="then" style="color:'+(VERDICT_COLOUR[r.then]||"#fff")+'">→ '+
-      esc(r.then)+'</div><div class="why">'+esc(r.why)+'</div></div>';
-  }).join("");
-  var chips='<span class="chip v">'+esc(p.vertical)+'</span>'+
-    '<span class="chip">'+rules.length+' rules</span>'+
-    '<span class="chip '+esc(m.default||"allow")+'">default '+esc(m.default||"allow")+'</span>'+
-    (p.origin==="library seed"?'<span class="chip">seed</span>':"")+
-    (p.forked_from?'<span class="chip">fork</span>':"");
-  return '<article class="slab" data-id="'+esc(p.id)+'">'+
-    '<div class="head">'+sigil(p.profile,p.digest)+
-      '<div class="meta"><div class="nm">'+esc(p.name)+'</div>'+
-      '<div class="by">'+esc(p.author)+' · v'+esc(p.version)+'</div>'+
-      (p.summary?'<div class="sm">'+esc(p.summary)+'</div>':"")+
-      '<div class="chips">'+chips+'</div></div></div>'+
-    '<div class="body">'+body+
-      '<div class="foot"><span>id '+esc(p.id)+'</span>'+
-      '<span>digest '+esc(String(p.digest||"").slice(0,20))+'…</span>'+
-      (p.block_index!=null?'<span>block '+esc(p.block_index)+'</span>':"")+
-      '<span>published '+esc(String(p.published||"").slice(0,10))+'</span></div>'+
-      '<div class="acts"><button class="btn" data-fork="'+esc(p.id)+'">Fork it</button>'+
-      '<button class="btn" data-copy="'+esc(p.id)+'">Copy JSON</button></div>'+
-    '</div></article>';
-}
-
-function draw(){
-  var q=(document.getElementById("q").value||"").toLowerCase().trim();
-  var v=document.getElementById("v").value;
-  var list=all.filter(function(p){
-    if(v && p.vertical!==v) return false;
-    if(!q) return true;
-    var hay=(p.name+" "+p.author+" "+p.summary+" "+p.vertical+" "+
-      JSON.stringify(p.manifest||{})).toLowerCase();
-    return hay.indexOf(q)>=0;
-  });
-  document.getElementById("count").textContent=list.length+" of "+all.length;
-  document.getElementById("shelf").innerHTML = list.length
-    ? list.map(slab).join("")
-    : '<div class="empty">Nothing matches that yet. Write it.</div>';
-}
-
-document.addEventListener("click",function(e){
-  var h=e.target.closest(".head");
-  if(h){ h.parentNode.classList.toggle("open"); return; }
-  var f=e.target.getAttribute&&e.target.getAttribute("data-fork");
-  if(f){ forkInto(f); return; }
-  var c=e.target.getAttribute&&e.target.getAttribute("data-copy");
-  if(c){ copyOut(c); return; }
-});
-
-function find(id){ for(var i=0;i<all.length;i++) if(all[i].id===id) return all[i]; }
-
-function forkInto(id){
-  var p=find(id); if(!p) return;
-  var m=JSON.parse(JSON.stringify(p.manifest||{}));
-  m.name=m.name+" (fork)";
-  m.author="your name here";
-  m.version="1.0.0";
-  document.getElementById("src").value=JSON.stringify(m,null,2);
-  document.getElementById("src").dataset.parent=id;
-  document.getElementById("msg").className="out";
-  document.getElementById("msg").textContent=
-    "Forked "+id+" into the editor. Put your name on it, change what you "+
-    "disagree with, then publish. The parent is recorded, so the lineage is "+
-    "visible rather than claimed.";
-  document.querySelector("section.write").scrollIntoView({behavior:"smooth"});
-}
-
-function copyOut(id){
-  var p=find(id); if(!p) return;
-  var t=JSON.stringify(p.manifest,null,2);
-  if(navigator.clipboard) navigator.clipboard.writeText(t);
-  document.getElementById("msg").className="out ok";
-  document.getElementById("msg").textContent="Copied "+id+" to your clipboard.";
-}
-
-function post(action,body){
-  return fetch("/x/packs/"+action,{method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body:JSON.stringify(body)}).then(function(r){return r.json();});
-}
-
-function readSrc(){
-  try{ return JSON.parse(document.getElementById("src").value); }
-  catch(e){
-    document.getElementById("msg").className="out bad";
-    document.getElementById("msg").textContent=
-      "That is not valid JSON yet — "+e.message;
-    return null;
-  }
-}
-
-document.getElementById("check").addEventListener("click",function(){
-  var m=readSrc(); if(!m) return;
-  var out=document.getElementById("msg");
-  out.className="out"; out.textContent="Parsing every rule…";
-  post("validate",{pack:m}).then(function(d){
-    if(d.ok){
-      out.className="out ok";
-      out.textContent="Valid. "+d.rule_count+" rules, hardest verdict "+
-        d.profile.hardest_verdict+", reads: "+d.profile.reads.join(", ")+
-        ".\nDigest "+d.digest+"\nNothing published — press Publish when ready.";
-    }else{
-      out.className="out bad";
-      out.textContent=d.detail||d.error||"That did not parse.";
-    }
-  }).catch(function(e){
-    out.className="out bad"; out.textContent="Could not reach the library: "+e;
-  });
-});
-
-document.getElementById("pub").addEventListener("click",function(){
-  var m=readSrc(); if(!m) return;
-  var parent=document.getElementById("src").dataset.parent||null;
-  var out=document.getElementById("msg");
-  out.className="out"; out.textContent="Sealing…";
-  post(parent?"fork":"publish",parent?{pack:m,parent:parent}:{pack:m})
-  .then(function(d){
-    if(d.ok===false||d.error){
-      out.className="out bad";
-      out.textContent=d.detail||d.error;return;
-    }
-    out.className="out ok";
-    out.textContent="Published as "+d.id+
-      (d.block_index!=null?("\nSealed at block "+d.block_index):"")+
-      "\nDigest "+d.digest+
-      "\nIt is in the library now and anyone can fork it.";
-    load();
-  }).catch(function(e){
-    out.className="out bad"; out.textContent="Could not reach the library: "+e;
-  });
-});
-
-var EXAMPLE={
-  name:"My first pack",
-  author:"your name or domain",
-  version:"1.0.0",
-  vertical:"general",
-  summary:"One line someone paying the bill would understand.",
-  default:"allow",
-  rules:[
-    {when:"loop_count >= 3 and not deterministic",
-     then:"challenge",
-     why:"The same request three times at temperature cannot be reused, so it is bought again each time."},
-    {when:"unattended and max_tokens > 4000",
-     then:"block",
-     why:"A long generation with nobody watching is a cost with no reader."},
-    {when:"chars < 2500 and turns <= 4 and tool_count == 0",
-     then:"downgrade",
-     why:"Short and simple is what the cheap model is for."}
-  ]
-};
-function resetSrc(){
-  document.getElementById("src").value=JSON.stringify(EXAMPLE,null,2);
-  delete document.getElementById("src").dataset.parent;
-  document.getElementById("msg").className="out";
-  document.getElementById("msg").textContent="Nothing sent yet.";
-}
-document.getElementById("reset").addEventListener("click",resetSrc);
-document.getElementById("q").addEventListener("input",draw);
-document.getElementById("v").addEventListener("change",draw);
-
-function load(){
-  fetch("/x/packs/list?limit=200").then(function(r){return r.json();})
-  .then(function(d){
-    all=d.packs||[];
-    var sel=document.getElementById("v"), have={};
-    all.forEach(function(p){have[p.vertical]=1;});
-    var keep=sel.value;
-    sel.innerHTML='<option value="">every vertical</option>'+
-      Object.keys(have).sort().map(function(v){
-        return '<option value="'+esc(v)+'">'+esc(v)+'</option>';}).join("");
-    sel.value=keep;
-    if(d.grammar){
-      document.getElementById("grammar").innerHTML=
-        Object.keys(d.grammar).map(function(k){
-          return '<div class="gcell"><b>'+esc(k)+'</b><span>'+
-            esc(d.grammar[k])+'</span></div>';}).join("");
-    }
-    draw();
-  }).catch(function(){
-    document.getElementById("shelf").innerHTML=
-      '<div class="empty">The library could not be reached.</div>';
-  });
-}
-resetSrc();
-load();
-</script>
-</body>
-</html>"""
-
-
-_patched = [False]
-
-
-def _install_page():
-    """Serve /packs by wrapping the running handler's do_GET, once."""
-    if _patched[0]:
-        return True
-    for mod in list(sys.modules.values()):
-        if mod is None:
-            continue
-        try:
-            names = dir(mod)
-        except Exception:                                    # noqa: BLE001
-            continue
-        for nm in names:
-            try:
-                obj = getattr(mod, nm, None)
-            except Exception:                                # noqa: BLE001
-                continue
-            if not isinstance(obj, type):
-                continue
-            if not (hasattr(obj, "do_GET") and hasattr(obj, "do_POST")):
-                continue
-            if getattr(obj, "_packs_patched", False):
-                _patched[0] = True
-                return True
-            original = obj.do_GET
-
-            def patched(self, _original=original):
-                try:
-                    path = self.path.split("?")[0].rstrip("/") or "/"
-                except Exception:                            # noqa: BLE001
-                    path = ""
-                if path in ("/packs", "/packs.html", "/library"):
-                    data = PAGE.encode("utf-8")
-                    self.send_response(200)
-                    self.send_header("Content-Type",
-                                     "text/html; charset=utf-8")
-                    self.send_header("Content-Length", str(len(data)))
-                    self.send_header("Cache-Control", "no-store")
-                    self.end_headers()
-                    self.wfile.write(data)
-                    return
-                return _original(self)
-
-            obj.do_GET = patched
-            obj._packs_patched = True
-            _patched[0] = True
-            return True
-    return False
-
-
-# ================================================================ routes
-
-GRAMMAR = {
-    "signals, 0.0 to 1.0": "exposure size ask depth tools loop burst grind "
-                           "novelty",
-    "raw counts": "chars max_tokens turns tool_count loop_count burst_count "
-                  "grind_count",
-    "flags": "unattended deterministic",
-    "the engine's score": "score",
-    "operators": "> >= < <= == != and or not ( )",
-    "verdicts": "allow downgrade challenge block",
-}
-
-
-def _spec():
-    return {
-        "module": "packs",
-        "version": VERSION,
-        "what_this_is": (
-            "A public library of decision packs for the token saver. A pack "
-            "is data, not code: conditions over the nine signals the engine "
-            "already measures, and a verdict for each."),
-        "the_deal": {
-            "free_forever_no_account": [
-                "write a pack", "read any pack", "fork any pack",
-                "seal a pack so its date and wording are provable",
-                "validate a pack's syntax",
-            ],
-            "needs_a_key": [
-                "run a pack against a request",
-                "get a verdict",
-                "get a sealed receipt for that verdict",
-            ],
-            "why": (
-                "A pack on its own decides nothing and produces no evidence. "
-                "The thresholds are the author's and they are public. The "
-                "execution, the measurement and the receipt are the engine's, "
-                "and that is what is being sold. An author can therefore "
-                "build something genuinely theirs and prove it is theirs "
-                "without paying anything - and everyone who uses it arrives "
-                "here to run it."),
-        },
-        "language": GRAMMAR,
-        "language_notes": [
-            "There is no syntax for calling anything, reading anything, or "
-            "assigning anything. Expressions are parsed into a tree and "
-            "walked; nothing reaches eval, exec or compile.",
-            "Rules are tried in order and the first match decides. If none "
-            "match, the pack's default decides.",
-            "A pack can only make the engine's decision stricter. It can "
-            "never weaken a hard rule, and an attempt to do so is reported "
-            "rather than silently dropped.",
-            "A pack can never return 'serve'. Serving from store is a fact "
-            "about whether an identical request was answered before, not a "
-            "policy.",
-        ],
-        "limits": {
-            "rules_per_pack": MAX_RULES,
-            "characters_per_expression": MAX_EXPR_CHARS,
-            "manifest_bytes": MAX_MANIFEST_BYTES,
-        },
-        "sigil": (
-            "Every pack draws itself: nine spokes, one per signal, each as "
-            "long as the pack leans on that signal, in a hue derived from "
-            "its own digest. Computed from the rules, so the drawing is the "
-            "pack rather than a picture attached to it."),
-        "routes": {
-            "public": ["GET spec", "GET list", "GET get", "GET status",
-                       "POST validate", "POST publish", "POST fork"],
-            "keyed": ["POST run"],
-        },
-        "page": "/packs",
-        "does_not_prove": [
-            "That a pack's thresholds are good ones. Sealing fixes the "
-            "wording and the date, not the judgement.",
-            "That an author is who they say they are. Names are "
-            "self-declared, as everywhere else on this deployment.",
-        ],
-    }, 200
-
-
-def _status(ctx):
-    installed = _install_page()
-    n = seeds = 0
-    try:
-        with ctx["lock"]:
-            n = ctx["conn"].execute("SELECT COUNT(*) FROM packs").fetchone()[0]
-            seeds = ctx["conn"].execute(
-                "SELECT COUNT(*) FROM packs WHERE seeded=1").fetchone()[0]
-    except Exception:                                        # noqa: BLE001
-        pass
-    return {"module": "packs", "version": VERSION, "page": "/packs",
-            "page_installed": installed, "packs": n, "seeds": seeds,
-            "published_by_others": max(0, n - seeds),
-            "note": "publishing and reading need no key; running one does"}, 200
-
-
-def _list(ctx, data):
-    try:
-        limit = min(LIST_LIMIT, max(1, int(data.get("limit") or 100)))
-    except (TypeError, ValueError):
-        limit = 100
-    vertical = str(data.get("vertical") or "").strip().lower()
-    with ctx["lock"]:
-        if vertical:
-            rows = ctx["conn"].execute(
-                "SELECT * FROM packs WHERE vertical=? "
-                "ORDER BY runs DESC, id DESC LIMIT ?",
-                (vertical, limit)).fetchall()
-        else:
-            rows = ctx["conn"].execute(
-                "SELECT * FROM packs ORDER BY runs DESC, id DESC LIMIT ?",
-                (limit,)).fetchall()
-    return {"count": len(rows),
-            "packs": [_row_to_pack(r, full=True) for r in rows],
-            "verticals": list(VERTICALS),
-            "grammar": GRAMMAR,
-            "how_to_run_one": (
-                "POST /x/packs/run with a key, a pack id, and either a "
-                "request body or a token saver digest."),
-            "note": ("Being in this library is not endorsement. Anyone may "
-                     "publish and nothing here is reviewed.")}, 200
-
-
-def _get(ctx, data):
-    pid = str(data.get("id") or "").strip()
-    if not pid:
-        return {"error": "id_required",
-                "usage": "/x/packs/get?id=<pack id>"}, 400
-    with ctx["lock"]:
-        row = ctx["conn"].execute(
-            "SELECT * FROM packs WHERE pack_id=?", (pid,)).fetchone()
-    if not row:
-        return {"error": "unknown_pack", "id": pid}, 404
-    out = _row_to_pack(row, full=True)
-    out["grammar"] = GRAMMAR
-    return out, 200
-
-
-def _validate_action(data):
-    m = data.get("pack") or data.get("manifest") or data
-    try:
-        clean, compiled, profile = validate(m)
-    except PackError as exc:
-        return {"ok": False, "error": "invalid_pack", "detail": str(exc)}, 400
-    return {"ok": True, "rule_count": len(clean["rules"]),
-            "digest": _digest(clean), "profile": profile,
-            "normalised": clean,
-            "note": "nothing was published"}, 200
-
-
-def _publish_action(ctx, data, api_key, parent=None):
-    m = data.get("pack") or data.get("manifest")
-    if not isinstance(m, dict):
-        return {"error": "pack_required",
-                "detail": "send the pack under 'pack'"}, 400
-    try:
-        clean, compiled, profile = validate(m)
-    except PackError as exc:
-        return {"ok": False, "error": "invalid_pack", "detail": str(exc)}, 400
-
-    if parent:
-        with ctx["lock"]:
-            p = ctx["conn"].execute(
-                "SELECT pack_id FROM packs WHERE pack_id=?",
-                (parent,)).fetchone()
-        if not p:
-            return {"error": "unknown_parent", "parent": parent}, 404
-
-    out = _store(ctx, clean, profile, parent, api_key)
-    out["ok"] = True
-    return out, 200
-
-
-def _run(ctx, data, api_key):
-    """
-    Evaluate a pack. This is the keyed half and the reason the free half
-    can be free.
-    """
-    pid = str(data.get("id") or data.get("pack_id") or "").strip()
-    if not pid:
-        return {"error": "id_required",
-                "detail": "which pack should decide this?"}, 400
-    with ctx["lock"]:
-        row = ctx["conn"].execute(
-            "SELECT * FROM packs WHERE pack_id=?", (pid,)).fetchone()
-    if not row:
-        return {"error": "unknown_pack", "id": pid}, 404
-
-    manifest = json.loads(row[8])
-    try:
-        clean, compiled, profile = validate(manifest)
-    except PackError as exc:
-        return {"error": "pack_no_longer_valid", "detail": str(exc)}, 500
-
-    measured = data.get("measured")
-    signals = data.get("signals")
-    if not isinstance(measured, dict) or not isinstance(signals, dict):
-        return {"error": "measurements_required",
-                "detail": ("send 'measured' and 'signals' exactly as "
-                           "/x/tokensaver/gate returned them, plus its "
-                           "'score' and 'verdict'. Call the gate first; this "
-                           "route decides on top of it, it does not replace "
-                           "it."),
-                "example": {"id": pid, "verdict": "ALLOW", "score": 0.31,
-                            "signals": {"loop": 0.4}, "measured": {}}}, 400
-
-    engine_verdict = str(data.get("verdict") or "allow").strip().lower()
-    if engine_verdict == "serve":
-        return {"error": "already_served",
-                "detail": ("this request was answered from store, so nothing "
-                           "was bought and there is nothing for a pack to "
-                           "decide")}, 400
-    if engine_verdict not in VERDICTS:
-        engine_verdict = "allow"
-
-    env = _env(measured, signals, data.get("score"),
-               data.get("unattended"), data.get("deterministic", True))
-    result = apply_pack(compiled, clean["default"], env, engine_verdict)
-
-    h, idx, seq = _seal(ctx, "signalpack_run", {
-        "decision": "PACK_" + result["verdict"].upper(),
-        "pack_id": pid, "pack_digest": row[10],
-        "pack_version": clean["version"], "pack_author": clean["author"],
-        "engine_verdict": engine_verdict,
-        "pack_verdict": result["pack_verdict"],
-        "final_verdict": result["verdict"],
-        "matched_rule": result["matched_rule"],
-        "capped_by_engine": result["capped_by_engine"],
-        "note": ("the pack that decided this is sealed by digest, so which "
-                 "rules were in force at this moment is fixed and cannot be "
-                 "edited afterwards"),
-    }, api_key)
-
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "UPDATE packs SET runs=runs+1 WHERE pack_id=?", (pid,))
-        ctx["conn"].commit()
-
-    out = dict(result)
-    out.update({
-        "pack": {"id": pid, "name": clean["name"], "author": clean["author"],
-                 "version": clean["version"], "digest": row[10]},
-        "environment": env,
-        "receipt": {"audit_hash": h, "block_index": idx, "receipt_seq": seq},
-        "what_this_proves": (
-            "that this verdict was reached by this exact pack, against these "
-            "measurements, at this position in the chain. The pack's digest "
-            "is in the block, so nobody can later claim different rules "
-            "applied."),
-        "what_this_does_not_prove": (
-            "that the pack's thresholds were sensible ones."),
-    })
-    return out, 200
-
-
-# ---------------------------------------------------------------- handler
-
-def handle(method, action, data, api_key, ctx):
-    data = data or {}
-
-    if method == "GET" and action == "spec":
-        return _spec()
-
-    try:
-        _setup(ctx)
-    except Exception as exc:                                 # noqa: BLE001
-        return {"error": "library_unavailable",
-                "detail": "%s: %s" % (type(exc).__name__, exc)}, 500
-
-    if method == "GET":
-        if action == "status":
-            return _status(ctx)
-        if action == "list":
-            return _list(ctx, data)
-        if action == "get":
-            return _get(ctx, data)
-
-    if method == "POST":
-        if action == "validate":
-            return _validate_action(data)
-        if action == "publish":
-            return _publish_action(ctx, data, api_key)
-        if action == "fork":
-            parent = str(data.get("parent") or data.get("forked_from")
-                         or "").strip()
-            if not parent:
-                return {"error": "parent_required",
-                        "detail": "a fork names the pack it came from"}, 400
-            return _publish_action(ctx, data, api_key, parent)
-        if action == "run":
-            if not api_key:
-                return {"error": "invalid_api_key",
-                        "detail": ("running a pack needs a key. Writing, "
-                                   "reading and forking never will."),
-                        "free_routes": ["list", "get", "validate", "publish",
-                                        "fork"]}, 401
-            return _run(ctx, data, api_key)
-
-    return {"error": "unknown_action", "action": action,
-            "GET": ["spec", "status", "list", "get"],
-            "POST": ["validate", "publish", "fork", "run (keyed)"]}, 404
-
-```
+- `modules/passportpage.py`
 
 
 ## `modules/passport.py`
@@ -2687,5 +600,490 @@ def handle(method, action, data, api_key, ctx):
     return {"error": "unknown_action",
             "GET": ["status", "spec", "demo", "verify", "sitefile", "mcp"],
             "POST": ["issue", "verify", "redeem", "mcp"]}, 404
+
+```
+
+
+## `modules/passportpage.py`
+
+477 lines, 42509 bytes
+
+```python
+"""
+modules/passportpage.py  v1.1.0
+Serves the Agent Passport page at /passport, and the Passport Kit downloads
+at /passport/sebbi_agent.py and /passport/sebbi_site.py.
+
+Page module, same family as map.py / console.py / network.py: a runtime
+do_GET patch puts full pages at clean URLs. Armed by hitting
+/x/passportpage/status once after each deploy. server.py is never edited.
+Everything is base64-embedded so no character can break the Python string.
+The live demo on the page calls /x/passport/demo.
+"""
+
+import base64
+import sys
+
+VERSION = "1.1.0"
+PAGE_PATH = "/passport"
+
+_B64 = (
+    "PCFET0NUWVBFIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+CjxtZXRhIGNoYXJzZXQ9IlVURi04Ij4KPG1ldGEgbmFtZT0i"
+    "dmlld3BvcnQiIGNvbnRlbnQ9IndpZHRoPWRldmljZS13aWR0aCwgaW5pdGlhbC1zY2FsZT0xLCB2aWV3cG9ydC1maXQ9Y292ZXIi"
+    "Pgo8dGl0bGU+QWdlbnQgUGFzc3BvcnQg4oCUIHNlYmJpLnBybzwvdGl0bGU+CjxtZXRhIG5hbWU9ImRlc2NyaXB0aW9uIiBjb250"
+    "ZW50PSJFdmVyeSBBSSBhZ2VudCBuZWVkcyBhIHBhc3Nwb3J0LiBTaWduZWQsIHNpbmdsZS11c2UgcGVybWlzc2lvbiBmb3IgQUkg"
+    "YWN0aW9ucywgY2hlY2tlZCBhdCB0aGUgbW9tZW50IG9mIGFjdGlvbiwgc2VhbGVkIG9uIGEgcHVibGljIGNoYWluLiI+CjxsaW5r"
+    "IHJlbD0icHJlY29ubmVjdCIgaHJlZj0iaHR0cHM6Ly9mb250cy5nb29nbGVhcGlzLmNvbSI+CjxsaW5rIGhyZWY9Imh0dHBzOi8v"
+    "Zm9udHMuZ29vZ2xlYXBpcy5jb20vY3NzMj9mYW1pbHk9TmV3c3JlYWRlcjpvcHN6LHdnaHRANi4uNzIsNDAwOzYuLjcyLDUwMCZm"
+    "YW1pbHk9SUJNK1BsZXgrU2Fuczp3Z2h0QDQwMDs1MDA7NjAwJmZhbWlseT1JQk0rUGxleCtNb25vOndnaHRANDAwOzUwMCZkaXNw"
+    "bGF5PXN3YXAiIHJlbD0ic3R5bGVzaGVldCI+CjxzdHlsZT4KOnJvb3R7LS1pbms6IzBhMGYxZTstLWluazI6IzEwMTgyZTstLXBh"
+    "cGVyOiNGQUZBRjY7LS1saW5lOiNERURCRDE7LS1nb2xkOiNjOWE4NGM7LS1vazojMkU3RDU3Oy0tb2tiZzojRTRFQ0U4Oy0td2Fy"
+    "bjojOUMyRjI2Oy0td2FybmJnOiNGNUU2RTM7LS1tdXRlZDojNUE2MjcwOy0tZmFpbnQ6IzhBOTBBMDsKLS1zYW5zOidJQk0gUGxl"
+    "eCBTYW5zJyxzeXN0ZW0tdWksc2Fucy1zZXJpZjstLXNlcmlmOidOZXdzcmVhZGVyJyxHZW9yZ2lhLHNlcmlmOy0tbW9ubzonSUJN"
+    "IFBsZXggTW9ubycsdWktbW9ub3NwYWNlLG1vbm9zcGFjZX0KKntib3gtc2l6aW5nOmJvcmRlci1ib3g7bWFyZ2luOjA7cGFkZGlu"
+    "ZzowfQpib2R5e2ZvbnQtZmFtaWx5OnZhcigtLXNhbnMpO2JhY2tncm91bmQ6dmFyKC0tcGFwZXIpO2NvbG9yOnZhcigtLWluayk7"
+    "bGluZS1oZWlnaHQ6MS42Oy13ZWJraXQtZm9udC1zbW9vdGhpbmc6YW50aWFsaWFzZWR9Ci53cmFwe21heC13aWR0aDo4MjBweDtt"
+    "YXJnaW46MCBhdXRvO3BhZGRpbmc6MCAyMnB4fQoudG9we2JvcmRlci1ib3R0b206MXB4IHNvbGlkIHZhcigtLWxpbmUpO3BhZGRp"
+    "bmc6MTZweCAwfQoudG9wIC53cmFwe2Rpc3BsYXk6ZmxleDtqdXN0aWZ5LWNvbnRlbnQ6c3BhY2UtYmV0d2VlbjthbGlnbi1pdGVt"
+    "czpiYXNlbGluZTtnYXA6MTJweDtmbGV4LXdyYXA6d3JhcH0KLmJyYW5ke2ZvbnQtZmFtaWx5OnZhcigtLW1vbm8pO2ZvbnQtc2l6"
+    "ZToxM3B4fS5icmFuZCBie2NvbG9yOnZhcigtLWdvbGQpO2ZvbnQtd2VpZ2h0OjUwMH0KLnRvcCBuYXYgYXtmb250LWZhbWlseTp2"
+    "YXIoLS1tb25vKTtmb250LXNpemU6MTIuNXB4O2NvbG9yOnZhcigtLW11dGVkKTt0ZXh0LWRlY29yYXRpb246bm9uZTttYXJnaW4t"
+    "bGVmdDoxNHB4fQouaGVyb3twYWRkaW5nOjU0cHggMCAyNnB4fQoua2lja3tmb250LWZhbWlseTp2YXIoLS1tb25vKTtmb250LXNp"
+    "emU6MTJweDtjb2xvcjp2YXIoLS1nb2xkKTtsZXR0ZXItc3BhY2luZzouMDZlbTttYXJnaW4tYm90dG9tOjE0cHh9Ci5oZXJvIGgx"
+    "e2ZvbnQtZmFtaWx5OnZhcigtLXNlcmlmKTtmb250LXdlaWdodDo1MDA7Zm9udC1zaXplOmNsYW1wKDM0cHgsNnZ3LDU2cHgpO2xp"
+    "bmUtaGVpZ2h0OjEuMDU7bWF4LXdpZHRoOjE1Y2g7bWFyZ2luLWJvdHRvbToxOHB4fQouaGVybyBwe2ZvbnQtc2l6ZToxNy41cHg7"
+    "Y29sb3I6dmFyKC0tbXV0ZWQpO21heC13aWR0aDo1NmNofQouY3Rhe2Rpc3BsYXk6aW5saW5lLWJsb2NrO21hcmdpbjoyNnB4IDEy"
+    "cHggMCAwO2ZvbnQtZmFtaWx5OnZhcigtLW1vbm8pO2ZvbnQtc2l6ZToxNHB4O3RleHQtZGVjb3JhdGlvbjpub25lO2JvcmRlci1y"
+    "YWRpdXM6NXB4O3BhZGRpbmc6MTNweCAyMHB4O2N1cnNvcjpwb2ludGVyO2JvcmRlcjowfQouY3RhLmdvbGR7YmFja2dyb3VuZDp2"
+    "YXIoLS1nb2xkKTtjb2xvcjp2YXIoLS1pbmspO2ZvbnQtd2VpZ2h0OjUwMH0KLmN0YS5naG9zdHtib3JkZXI6MXB4IHNvbGlkIHZh"
+    "cigtLWxpbmUpO2NvbG9yOnZhcigtLWluayk7YmFja2dyb3VuZDojZmZmfQouc3RhdHN7ZGlzcGxheTpmbGV4O2dhcDoyMnB4O2Zs"
+    "ZXgtd3JhcDp3cmFwO21hcmdpbi10b3A6MzBweDtmb250LWZhbWlseTp2YXIoLS1tb25vKTtmb250LXNpemU6MTJweDtjb2xvcjp2"
+    "YXIoLS1mYWludCl9Ci5zdGF0cyBie2NvbG9yOnZhcigtLWluayk7Zm9udC13ZWlnaHQ6NTAwO2ZvbnQtc2l6ZToxNXB4O2Rpc3Bs"
+    "YXk6YmxvY2t9CnNlY3Rpb257cGFkZGluZzo0MHB4IDA7Ym9yZGVyLXRvcDoxcHggc29saWQgdmFyKC0tbGluZSl9Cmgye2ZvbnQt"
+    "ZmFtaWx5OnZhcigtLXNlcmlmKTtmb250LXdlaWdodDo1MDA7Zm9udC1zaXplOmNsYW1wKDI2cHgsNC4ydncsMzZweCk7bGluZS1o"
+    "ZWlnaHQ6MS4xMjttYXJnaW4tYm90dG9tOjE0cHg7bWF4LXdpZHRoOjIyY2h9Ci5sZWFke2NvbG9yOnZhcigtLW11dGVkKTttYXgt"
+    "d2lkdGg6NjBjaDttYXJnaW4tYm90dG9tOjIycHh9Ci5zdGVwc3tkaXNwbGF5OmdyaWQ7Z2FwOjE0cHh9Ci5zdGVwe2JhY2tncm91"
+    "bmQ6I2ZmZjtib3JkZXI6MXB4IHNvbGlkIHZhcigtLWxpbmUpO2JvcmRlci1yYWRpdXM6N3B4O3BhZGRpbmc6MjBweCAyMnB4fQou"
+    "c3RlcCAubntmb250LWZhbWlseTp2YXIoLS1tb25vKTtmb250LXNpemU6MTFweDtjb2xvcjp2YXIoLS1nb2xkKTtsZXR0ZXItc3Bh"
+    "Y2luZzouMDVlbX0KLnN0ZXAgaDN7Zm9udC1mYW1pbHk6dmFyKC0tc2VyaWYpO2ZvbnQtd2VpZ2h0OjUwMDtmb250LXNpemU6MjFw"
+    "eDttYXJnaW46NHB4IDAgNnB4fQouc3RlcCBwe2ZvbnQtc2l6ZToxNC44cHg7Y29sb3I6dmFyKC0tbXV0ZWQpfQouZGFya3tiYWNr"
+    "Z3JvdW5kOnZhcigtLWluayk7Y29sb3I6I2ZmZjtib3JkZXItcmFkaXVzOjEwcHg7cGFkZGluZzozMHB4IDI0cHg7Ym9yZGVyOjJw"
+    "eCBzb2xpZCB2YXIoLS1nb2xkKX0KLmRhcmsgaDJ7Y29sb3I6I2ZmZn0uZGFyayAubGVhZHtjb2xvcjpyZ2JhKDI1NSwyNTUsMjU1"
+    "LC43Mil9CiNzdG9yeXttYXJnaW4tdG9wOjE4cHg7ZGlzcGxheTpncmlkO2dhcDo4cHh9Ci5yb3d7ZGlzcGxheTpmbGV4O2dhcDox"
+    "MnB4O2FsaWduLWl0ZW1zOmZsZXgtc3RhcnQ7YmFja2dyb3VuZDp2YXIoLS1pbmsyKTtib3JkZXI6MXB4IHNvbGlkIHJnYmEoMjAx"
+    "LDE2OCw3NiwuMTgpO2JvcmRlci1yYWRpdXM6NnB4O3BhZGRpbmc6MTFweCAxNHB4O2ZvbnQtc2l6ZToxNHB4O29wYWNpdHk6MDt0"
+    "cmFuc2Zvcm06dHJhbnNsYXRlWSg2cHgpO3RyYW5zaXRpb246YWxsIC4zNXN9Ci5yb3cuc2hvd3tvcGFjaXR5OjE7dHJhbnNmb3Jt"
+    "Om5vbmV9Ci5yb3cgLmlje2ZvbnQtZmFtaWx5OnZhcigtLW1vbm8pO2ZvbnQtc2l6ZToxMnB4O21pbi13aWR0aDo2NnB4O3RleHQt"
+    "YWxpZ246Y2VudGVyO3BhZGRpbmc6MnB4IDZweDtib3JkZXItcmFkaXVzOjNweH0KLmljLnBhc3N7YmFja2dyb3VuZDojMTczOTJh"
+    "O2NvbG9yOiM3ZmUzYjB9LmljLnN0b3B7YmFja2dyb3VuZDojM2QxYTE3O2NvbG9yOiNmZjhhODB9LmljLmluZm97YmFja2dyb3Vu"
+    "ZDojMmEyYTFhO2NvbG9yOnZhcigtLWdvbGQpfQoucm93IC53aHl7ZGlzcGxheTpibG9jaztmb250LWZhbWlseTp2YXIoLS1tb25v"
+    "KTtmb250LXNpemU6MTEuNXB4O2NvbG9yOnJnYmEoMjU1LDI1NSwyNTUsLjUpO21hcmdpbi10b3A6M3B4O3dvcmQtYnJlYWs6YnJl"
+    "YWstd29yZH0KI3ZlcmRpY3R7Zm9udC1mYW1pbHk6dmFyKC0tbW9ubyk7Zm9udC1zaXplOjE0cHg7Y29sb3I6dmFyKC0tZ29sZCk7"
+    "bWFyZ2luLXRvcDoxNnB4O21pbi1oZWlnaHQ6MjBweH0KLnJ1bntiYWNrZ3JvdW5kOnZhcigtLWdvbGQpO2NvbG9yOnZhcigtLWlu"
+    "ayl9Ci5ncmlkMntkaXNwbGF5OmdyaWQ7Z2FwOjE0cHg7Z3JpZC10ZW1wbGF0ZS1jb2x1bW5zOjFmcn0KQG1lZGlhKG1pbi13aWR0"
+    "aDo3MDBweCl7LmdyaWQye2dyaWQtdGVtcGxhdGUtY29sdW1uczoxZnIgMWZyfX0KLmNhcmR7YmFja2dyb3VuZDojZmZmO2JvcmRl"
+    "cjoxcHggc29saWQgdmFyKC0tbGluZSk7Ym9yZGVyLXJhZGl1czo3cHg7cGFkZGluZzoyMHB4IDIycHh9Ci5jYXJkIC50YWd7Zm9u"
+    "dC1mYW1pbHk6dmFyKC0tbW9ubyk7Zm9udC1zaXplOjExcHg7Y29sb3I6dmFyKC0tZmFpbnQpO2xldHRlci1zcGFjaW5nOi4wNWVt"
+    "fQouY2FyZCBoM3tmb250LWZhbWlseTp2YXIoLS1zZXJpZik7Zm9udC13ZWlnaHQ6NTAwO2ZvbnQtc2l6ZToyMHB4O21hcmdpbjo0"
+    "cHggMCA2cHh9Ci5jYXJkIHB7Zm9udC1zaXplOjE0LjVweDtjb2xvcjp2YXIoLS1tdXRlZCk7bWFyZ2luLWJvdHRvbToxMHB4fQou"
+    "Y2FyZCBwcmV7bWFyZ2luOjEwcHggMCAwfS5jYXJkIGEuY3Rhe2NvbG9yOnZhcigtLWluayk7d29yZC1icmVhazpub3JtYWx9LmNh"
+    "cmQgYXtmb250LWZhbWlseTp2YXIoLS1tb25vKTtmb250LXNpemU6MTIuNXB4O2NvbG9yOnZhcigtLWluayk7d29yZC1icmVhazpi"
+    "cmVhay1hbGx9CnByZXtiYWNrZ3JvdW5kOnZhcigtLWluayk7Y29sb3I6I2U4ZTZkZjtmb250LWZhbWlseTp2YXIoLS1tb25vKTtm"
+    "b250LXNpemU6MTJweDtib3JkZXItcmFkaXVzOjZweDtwYWRkaW5nOjE0cHg7b3ZlcmZsb3cteDphdXRvO21hcmdpbi10b3A6OHB4"
+    "fQouY2xvc2V7YmFja2dyb3VuZDp2YXIoLS1pbmspO2NvbG9yOiNmZmY7Ym9yZGVyLXJhZGl1czoxMHB4O3BhZGRpbmc6MzJweCAy"
+    "NHB4O21hcmdpbjozNnB4IDAgNTBweH0KLmNsb3NlIGgye2NvbG9yOiNmZmZ9LmNsb3NlIHB7Y29sb3I6cmdiYSgyNTUsMjU1LDI1"
+    "NSwuNzUpO21heC13aWR0aDo1NmNofQpmb290ZXJ7Ym9yZGVyLXRvcDoxcHggc29saWQgdmFyKC0tbGluZSk7cGFkZGluZzoyMnB4"
+    "IDAgNDZweDtmb250LWZhbWlseTp2YXIoLS1tb25vKTtmb250LXNpemU6MTEuNXB4O2NvbG9yOnZhcigtLWZhaW50KX0KQG1lZGlh"
+    "KHByZWZlcnMtcmVkdWNlZC1tb3Rpb246cmVkdWNlKXsqe3RyYW5zaXRpb246bm9uZSFpbXBvcnRhbnR9fQo8L3N0eWxlPgo8L2hl"
+    "YWQ+Cjxib2R5Pgo8aGVhZGVyIGNsYXNzPSJ0b3AiPjxkaXYgY2xhc3M9IndyYXAiPjxkaXYgY2xhc3M9ImJyYW5kIj5zZWJiaTxi"
+    "Pi5wcm88L2I+PC9kaXY+CjxuYXY+PGEgaHJlZj0iLyI+SG9tZTwvYT48YSBocmVmPSIja2l0Ij5LaXQ8L2E+PGEgaHJlZj0iL21h"
+    "cCI+TWFwPC9hPjxhIGhyZWY9Ii93aGl0ZXBhcGVyIj5XaGl0ZXBhcGVyPC9hPjwvbmF2PjwvZGl2PjwvaGVhZGVyPgoKPGRpdiBj"
+    "bGFzcz0id3JhcCI+CjxkaXYgY2xhc3M9Imhlcm8iPgogIDxkaXYgY2xhc3M9ImtpY2siPkFHRU5UIFBBU1NQT1JUPC9kaXY+CiAg"
+    "PGgxPkV2ZXJ5IEFJIGFnZW50IG5vdyBuZWVkcyBhIHBhc3Nwb3J0LjwvaDE+CiAgPHA+QUkgYWdlbnRzIHBheSwgYm9vaywgc2Vu"
+    "ZCBhbmQgY2hhbmdlIHJlY29yZHMgb24gdGhlaXIgb3duLiBUaGUgQWdlbnQgUGFzc3BvcnQgbGV0cyBhbnkgc2l0ZSBrbm93LCBp"
+    "biBtaWxsaXNlY29uZHMsIHRoYXQgYSByZWFsIHBlcnNvbiBhdXRob3Jpc2VkIHRoZSBhY3Rpb24sIHRoYXQgdGhlIGF1dGhvcml0"
+    "eSBzdGlsbCBzdGFuZHMgcmlnaHQgbm93LCBhbmQgdGhhdCBpdCBjYW4gaGFwcGVuIGV4YWN0bHkgb25jZS48L3A+CiAgPGJ1dHRv"
+    "biBjbGFzcz0iY3RhIGdvbGQiIG9uY2xpY2s9InJ1bkRlbW8oKSI+UnVuIGl0IGxpdmU8L2J1dHRvbj4KICA8YSBjbGFzcz0iY3Rh"
+    "IGdob3N0IiBocmVmPSIja2l0Ij5HZXQgdGhlIGtpdDwvYT4KICA8ZGl2IGNsYXNzPSJzdGF0cyI+PGRpdj48YiBpZD0icy1pc3N1"
+    "ZWQiPuKAlDwvYj5wYXNzcG9ydHMgaXNzdWVkPC9kaXY+PGRpdj48YiBpZD0icy1yZWQiPuKAlDwvYj5yZWRlZW1lZDwvZGl2Pjxk"
+    "aXY+PGIgaWQ9InMtcmVmIj7igJQ8L2I+cmVmdXNlZCBhbmQgc2VhbGVkPC9kaXY+PC9kaXY+CjwvZGl2PgoKPHNlY3Rpb24+CiAg"
+    "PGgyPlRocmVlIHN0ZXBzLiBObyB0cnVzdCByZXF1aXJlZC48L2gyPgogIDxkaXYgY2xhc3M9InN0ZXBzIj4KICAgIDxkaXYgY2xh"
+    "c3M9InN0ZXAiPjxkaXYgY2xhc3M9Im4iPjAxIMK3IFRIRSBBR0VOVCBBU0tTPC9kaXY+PGgzPkF1dGhvcml0eSB0cmFjZWQgYmFj"
+    "ayB0byBhIGh1bWFuPC9oMz48cD5CZWZvcmUgYWN0aW5nLCB0aGUgYWdlbnQgYXNrcyBzZWJiaS5wcm8uIFRoZSBhdXRob3JpdHkg"
+    "aXMgd2Fsa2VkIGJhY2sgdG8gdGhlIHBlcnNvbiB3aG8gZ3JhbnRlZCBpdCwgZXZlcnkgbGluayBjaGVja2VkLCBhbmQgYSBzaWdu"
+    "ZWQgcGFzc3BvcnQgaXNzdWVkIGZvciBvbmUgYWN0aW9uLCBhdCBvbmUgc2l0ZSwgZm9yIG9uZSBhbW91bnQsIGZvciBtaW51dGVz"
+    "LjwvcD48L2Rpdj4KICAgIDxkaXYgY2xhc3M9InN0ZXAiPjxkaXYgY2xhc3M9Im4iPjAyIMK3IFRIRSBTSVRFIENIRUNLUzwvZGl2"
+    "PjxoMz5WZXJpZmllZCBpbiBtaWxsaXNlY29uZHMsIG9mZmxpbmU8L2gzPjxwPlRoZSBzaXRlIGNoZWNrcyB0aGUgc2lnbmF0dXJl"
+    "IHdpdGggYSBzdGFuZGFyZCBsaWJyYXJ5IGluIGFueSBsYW5ndWFnZS4gTm90aGluZyB0byBpbnN0YWxsLCBubyBhY2NvdW50LCBu"
+    "byBjYWxsIGhvbWUuPC9wPjwvZGl2PgogICAgPGRpdiBjbGFzcz0ic3RlcCI+PGRpdiBjbGFzcz0ibiI+MDMgwrcgVEhFIEFDVElP"
+    "TiBCSU5EUzwvZGl2PjxoMz5SZS1jaGVja2VkIGF0IHRoZSBtb21lbnQgaXQgaGFwcGVuczwvaDM+PHA+VGhlIHNpdGUgcmVkZWVt"
+    "cyB0aGUgcGFzc3BvcnQuIFJpZ2h0IHRoZW4sIHNlYmJpLnBybyBjb25maXJtcyB0aGUgaHVtYW4ncyBhdXRob3JpdHkgc3RpbGwg"
+    "c3RhbmRzLCB0aGUgYW1vdW50IG1hdGNoZXMsIGFuZCBpdCBoYXMgbmV2ZXIgYmVlbiB1c2VkLiBUaGVuIGl0IGJpbmRzLCBvbmNl"
+    "LCBhbmQgdGhlIG91dGNvbWUgaXMgc2VhbGVkLjwvcD48L2Rpdj4KICA8L2Rpdj4KPC9zZWN0aW9uPgoKPHNlY3Rpb24gc3R5bGU9"
+    "ImJvcmRlci10b3A6MCI+CjxkaXYgY2xhc3M9ImRhcmsiPgogIDxoMj5XYXRjaCBpdCBydW4gb24gcHJvZHVjdGlvbi48L2gyPgog"
+    "IDxwIGNsYXNzPSJsZWFkIj5PbmUgdGFwIHJ1bnMgdGhlIHdob2xlIHN0b3J5IGxpdmU6IGEgcmVhbCBncmFudCwgcmVhbCBwYXNz"
+    "cG9ydHMsIHJlYWwgcmVkZW1wdGlvbnMgYW5kIHJlYWwgcmVmdXNhbHMsIGVhY2ggc2VhbGVkIGludG8gdGhlIHB1YmxpYyBjaGFp"
+    "bi48L3A+CiAgPGJ1dHRvbiBjbGFzcz0iY3RhIHJ1biIgaWQ9InJ1bmJ0biIgb25jbGljaz0icnVuRGVtbygpIj5SdW4gdGhlIGxp"
+    "dmUgZGVtbzwvYnV0dG9uPgogIDxkaXYgaWQ9InN0b3J5Ij48L2Rpdj4KICA8ZGl2IGlkPSJ2ZXJkaWN0Ij48L2Rpdj4KPC9kaXY+"
+    "Cjwvc2VjdGlvbj4KCjxzZWN0aW9uPgogIDxoMj5XaGF0IGEgcGFzc3BvcnQgcmVmdXNlczwvaDI+CiAgPHAgY2xhc3M9ImxlYWQi"
+    "PkEgc3RvbGVuLCByZXBsYXllZCwgcmUtYWltZWQgb3IgZWRpdGVkIHBhc3Nwb3J0IGlzIHdvcnRobGVzcy4gRXZlcnkgcmVmdXNh"
+    "bCBpcyB3cml0dGVuIHRvIHRoZSBjaGFpbiwgc28gYW4gYWdlbnQgY2FuIGV2ZW4gcHJvdmUgaXQgd2FzIDxiPm5vdDwvYj4gYWxs"
+    "b3dlZC48L3A+CiAgPGRpdiBjbGFzcz0ic3RlcHMiPgogICAgPGRpdiBjbGFzcz0ic3RlcCI+PGRpdiBjbGFzcz0ibiI+UkVQTEFZ"
+    "PC9kaXY+PHA+U3BlbnQgb25jZS4gVGhlIHNlY29uZCBhdHRlbXB0IGlzIHJlZnVzZWQuPC9wPjwvZGl2PgogICAgPGRpdiBjbGFz"
+    "cz0ic3RlcCI+PGRpdiBjbGFzcz0ibiI+UkVWT0tFRCBBIFNFQ09ORCBBR088L2Rpdj48cD5TdGlsbCBzaWduZWQsIHN0aWxsIGlu"
+    "IGRhdGUsIGFuZCBzdGlsbCByZWZ1c2VkLCBiZWNhdXNlIHRoZSBodW1hbiBwdWxsZWQgdGhlIGF1dGhvcml0eS48L3A+PC9kaXY+"
+    "CiAgICA8ZGl2IGNsYXNzPSJzdGVwIj48ZGl2IGNsYXNzPSJuIj5XUk9ORyBTSVRFPC9kaXY+PHA+QSBwYXNzcG9ydCBpcyBvbmx5"
+    "IGdvb2Qgd2hlcmUgaXQgd2FzIGlzc3VlZCBmb3IuPC9wPjwvZGl2PgogICAgPGRpdiBjbGFzcz0ic3RlcCI+PGRpdiBjbGFzcz0i"
+    "biI+RURJVEVEIEFNT1VOVDwvZGl2PjxwPkF1dGhvcmlzZWQgZm9yIDIwLCBwcmVzZW50ZWQgZm9yIDQ5LiBSZWZ1c2VkLjwvcD48"
+    "L2Rpdj4KICA8L2Rpdj4KPC9zZWN0aW9uPgoKPHNlY3Rpb24gaWQ9ImtpdCI+CiAgPGgyPkdldCB0aGUga2l0LiBPbmUgbGluZSBv"
+    "biBlYWNoIHNpZGUuPC9oMj4KICA8cCBjbGFzcz0ibGVhZCI+VHdvIHNpbmdsZSBmaWxlcywgc3RhbmRhcmQgUHl0aG9uLCBub3Ro"
+    "aW5nIHRvIGluc3RhbGwuIFRlc3RlZCBlbmQgdG8gZW5kOiB0aGUgb2ZmbGluZSBwYXNzcG9ydCBjaGVjayBydW5zIGluIGFib3V0"
+    "IDUgbWlsbGlzZWNvbmRzLjwvcD4KICA8ZGl2IGNsYXNzPSJncmlkMiI+CiAgICA8ZGl2IGNsYXNzPSJjYXJkIj48ZGl2IGNsYXNz"
+    "PSJ0YWciPkZPUiBBR0VOVCBCVUlMREVSUyDCtyBzZWJiaV9hZ2VudC5weTwvZGl2PjxoMz5Zb3VyIGFnZW50IGNhcnJpZXMgYSBw"
+    "YXNzcG9ydDwvaDM+PHA+UHV0IG9uZSBsaW5lIGFib3ZlIGFueSBhY3Rpb24uIFRoZSBwYXNzcG9ydCBpcyBmZXRjaGVkIGJlZm9y"
+    "ZSBpdCBydW5zLiBJZiBzZWJiaS5wcm8gcmVmdXNlcywgdGhlIGFjdGlvbiBuZXZlciBoYXBwZW5zLjwvcD4KPHByZT5AbmVlZHNf"
+    "cGFzc3BvcnQoInBheW1lbnRzLnNlbmQiLAogICAgYXVkaWVuY2U9InNob3AuZXhhbXBsZS5jb20iLAogICAgcGFyYW1zPVsiYW1v"
+    "dW50Il0pCmRlZiBwYXkoYW1vdW50LCBwYXNzcG9ydD1Ob25lKToKICAgIC4uLjwvcHJlPgogICAgICA8YSBjbGFzcz0iY3RhIGdv"
+    "bGQiIHN0eWxlPSJtYXJnaW4tdG9wOjE0cHgiIGhyZWY9Ii9wYXNzcG9ydC9zZWJiaV9hZ2VudC5weSIgZG93bmxvYWQ+RG93bmxv"
+    "YWQgc2ViYmlfYWdlbnQucHk8L2E+PC9kaXY+CiAgICA8ZGl2IGNsYXNzPSJjYXJkIj48ZGl2IGNsYXNzPSJ0YWciPkZPUiBXRUJT"
+    "SVRFUyAmYW1wOyBBUElTIMK3IHNlYmJpX3NpdGUucHk8L2Rpdj48aDM+WW91ciBzaXRlIGNoZWNrcyBldmVyeSBhZ2VudDwvaDM+"
+    "PHA+T25lIGxpbmUgYmVmb3JlIGFueSBhY3Rpb24gYW4gYWdlbnQgYXNrcyBmb3IuIFRoZSBzaWduYXR1cmUgaXMgY2hlY2tlZCBv"
+    "biB5b3VyIG93biBzZXJ2ZXIsIHRoZW4gdGhlIHBhc3Nwb3J0IGlzIHNwZW50IG9uY2UgYXQgdGhlIG1vbWVudCBvZiBhY3Rpb24u"
+    "PC9wPgo8cHJlPnBhc3Nwb3J0ID0gYWNjZXB0KHJlcXVlc3QuaGVhZGVycywKICAgIGF1ZGllbmNlPSJzaG9wLmV4YW1wbGUuY29t"
+    "IiwKICAgIHBhcmFtcz17ImFtb3VudCI6IGFtb3VudH0pCiMgc3RpbGwgaGVyZSA9IHNhZmUgdG8gYWN0PC9wcmU+CiAgICAgIDxh"
+    "IGNsYXNzPSJjdGEgZ29sZCIgc3R5bGU9Im1hcmdpbi10b3A6MTRweCIgaHJlZj0iL3Bhc3Nwb3J0L3NlYmJpX3NpdGUucHkiIGRv"
+    "d25sb2FkPkRvd25sb2FkIHNlYmJpX3NpdGUucHk8L2E+PC9kaXY+CiAgPC9kaXY+CiAgPGRpdiBjbGFzcz0ic3RlcHMiIHN0eWxl"
+    "PSJtYXJnaW4tdG9wOjE0cHgiPgogICAgPGRpdiBjbGFzcz0ic3RlcCI+PGRpdiBjbGFzcz0ibiI+VEVTVEVEIEVORCBUTyBFTkQ8"
+    "L2Rpdj48cD5QYWlkIDIwIGluIG9uZSBsaW5lOiBib3VuZC4gUmVwbGF5ZWQ6IHJlamVjdGVkLiBBc2tlZCBmb3IgNTAwIG9uIGEg"
+    "MTAwIGxpbWl0OiByZWZ1c2VkIGJlZm9yZSBhIHBhc3Nwb3J0IGV4aXN0ZWQuIFdyb25nIHNpdGUsIHRhbXBlcmVkIHRva2VuLCAy"
+    "MCBlZGl0ZWQgdG8gOTk6IGFsbCByZWplY3RlZC48L3A+PC9kaXY+CiAgPC9kaXY+Cjwvc2VjdGlvbj4KCjxzZWN0aW9uIGlkPSJz"
+    "aXRlcyI+CiAgPGgyPkJ1aWx0IGZvciBib3RoIHNpZGVzIG9mIHRoZSBhY3Rpb248L2gyPgogIDxkaXYgY2xhc3M9ImdyaWQyIj4K"
+    "ICAgIDxkaXYgY2xhc3M9ImNhcmQiPjxkaXYgY2xhc3M9InRhZyI+Rk9SIFdFQlNJVEVTICZhbXA7IEFQSVM8L2Rpdj48aDM+UmVx"
+    "dWlyZSBpdCB3aXRoIG9uZSBmaWxlPC9oMz48cD5Ib3N0IG9uZSBzbWFsbCBmaWxlIGFuZCBldmVyeSBhZ2VudCBrbm93cyB3aGlj"
+    "aCBhY3Rpb25zIG5lZWQgYSBwYXNzcG9ydC4gTm8gcGFzc3BvcnQsIG5vIGFjdGlvbi48L3A+CiAgICAgIDxhIGhyZWY9Imh0dHBz"
+    "Oi8vc2ViYmkucHJvL3gvcGFzc3BvcnQvc2l0ZWZpbGU/ZG9tYWluPXlvdXIuc2l0ZSZyZXF1aXJlPXBheW1lbnRzLioiPkdlbmVy"
+    "YXRlIHlvdXIgZmlsZTwvYT48L2Rpdj4KICAgIDxkaXYgY2xhc3M9ImNhcmQiPjxkaXYgY2xhc3M9InRhZyI+Rk9SIEFJIEFHRU5U"
+    "UzwvZGl2PjxoMz5BIHRvb2wsIHRocm91Z2ggTUNQPC9oMz48cD5BZ2VudHMgcmVxdWVzdCwgY2hlY2sgYW5kIHJlZGVlbSBwYXNz"
+    "cG9ydHMgYXMgdG9vbHMuIFdvcmtzIHdpdGggZXZlcnkgbW9kZWwgZnJvbSBldmVyeSB2ZW5kb3IuPC9wPgogICAgICA8YSBocmVm"
+    "PSJodHRwczovL3NlYmJpLnByby94L3Bhc3Nwb3J0L21jcCI+aHR0cHM6Ly9zZWJiaS5wcm8veC9wYXNzcG9ydC9tY3A8L2E+PC9k"
+    "aXY+CiAgICA8ZGl2IGNsYXNzPSJjYXJkIj48ZGl2IGNsYXNzPSJ0YWciPkZPUiBDT01QTElBTkNFPC9kaXY+PGgzPlByb29mLCBu"
+    "b3QgbG9nczwvaDM+PHA+V2hvIGF1dGhvcmlzZWQgaXQsIHdobyBhY3RlZCwgd2hvIGFjY2VwdHMgdGhlIHJpc2ssIGFuZCB3aGV0"
+    "aGVyIGl0IHN0aWxsIHN0b29kIGF0IHRoYXQgaW5zdGFudC4gU2VhbGVkLCBhbmNob3JlZCB0byBCaXRjb2luLCB3aXRuZXNzZWQg"
+    "aW5kZXBlbmRlbnRseS48L3A+CiAgICAgIDxhIGhyZWY9Imh0dHBzOi8vc2ViYmkucHJvL3gvY29udGludWl0eS9kZWNpc2lvbnMi"
+    "PlNlZSByZWFsIHNlYWxlZCBkZWNpc2lvbnM8L2E+PC9kaXY+CiAgICA8ZGl2IGNsYXNzPSJjYXJkIj48ZGl2IGNsYXNzPSJ0YWci"
+    "PkZPUiBERVZFTE9QRVJTPC9kaXY+PGgzPkFuIG9wZW4gdG9rZW4gZm9ybWF0PC9oMz48cD5FZDI1NTE5LCBjYW5vbmljYWwgSlNP"
+    "Tiwgb25lIHByZWZpeC4gVXNlIG91ciBraXQgb3IgYW55IEVkMjU1MTkgbGlicmFyeSBpbiBhbnkgbGFuZ3VhZ2UuPC9wPgogICAg"
+    "ICA8YSBocmVmPSJodHRwczovL3NlYmJpLnByby94L3Bhc3Nwb3J0L3NwZWMiPlJlYWQgdGhlIHNwZWM8L2E+PC9kaXY+CiAgPC9k"
+    "aXY+CjxwcmU+QWdlbnQtUGFzc3BvcnQ6IHNicDEuZXlKaFkzUWlPaUprWlcxdkxuQmhlU0lzSW1GMVpDSTZJbk5vYjNBdeKApjwv"
+    "cHJlPgo8L3NlY3Rpb24+Cgo8ZGl2IGNsYXNzPSJjbG9zZSI+CiAgPGgyPklmIHlvdXIgYWdlbnRzIHRvdWNoIG1vbmV5LCByZWNv"
+    "cmRzIG9yIGN1c3RvbWVycywgdGhpcyBpcyBmb3IgeW91LjwvaDI+CiAgPHA+RnJlZSBmb3IgOTAgZGF5cywgdGhlbiA1MHAgcGVy"
+    "IGRldmljZSBwZXIgbW9udGguIFRlbGwgdXMgd2hhdCB5b3VyIGFnZW50cyBkbyBhbmQgd2UnbGwgc2hvdyB5b3UgaG93IHRoZSBw"
+    "YXNzcG9ydCBwbHVncyBpbnRvIHlvdXIgc3RhY2suPC9wPgogIDxhIGNsYXNzPSJjdGEgZ29sZCIgaHJlZj0ibWFpbHRvOmp1c3Ry"
+    "aWdodGRlY29yYXRvcnNAZ21haWwuY29tP3N1YmplY3Q9QWdlbnQlMjBQYXNzcG9ydCI+VGFsayB0byB1czwvYT4KICA8YSBjbGFz"
+    "cz0iY3RhIGdob3N0IiBocmVmPSIvbWFwIiBzdHlsZT0iYmFja2dyb3VuZDp0cmFuc3BhcmVudDtjb2xvcjojZmZmO2JvcmRlci1j"
+    "b2xvcjpyZ2JhKDI1NSwyNTUsMjU1LC4zKSI+U2VlIHdoZXJlIGl0IHNpdHM8L2E+CjwvZGl2Pgo8L2Rpdj4KCjxmb290ZXI+PGRp"
+    "diBjbGFzcz0id3JhcCI+c2ViYmkucHJvIMK3IE1vbm9wIENvbnRlbnQgwrcgQmx5dGgsIE5vcnRodW1iZXJsYW5kLCBVSzxicj5U"
+    "aGUgdHJ1c3QgbGF5ZXIgYmV0d2VlbiBtYWNoaW5lcyB0aGF0IGFjdCBhbmQgdGhlIHdvcmxkIHRoZXkgYWN0IG9uLjwvZGl2Pjwv"
+    "Zm9vdGVyPgoKPHNjcmlwdD4KZnVuY3Rpb24gZXNjKHMpe3JldHVybiBTdHJpbmcocz09bnVsbD8nJzpzKS5yZXBsYWNlKC9bJjw+"
+    "Il0vZyxmdW5jdGlvbihjKXtyZXR1cm57JyYnOicmYW1wOycsJzwnOicmbHQ7JywnPic6JyZndDsnLCciJzonJnF1b3Q7J31bY119"
+    "KX0KZnVuY3Rpb24gc3RhdHMoKXtmZXRjaCgnL3gvcGFzc3BvcnQvc3RhdHVzJykudGhlbihmdW5jdGlvbihyKXtyZXR1cm4gci5q"
+    "c29uKCl9KS50aGVuKGZ1bmN0aW9uKGQpewogZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3MtaXNzdWVkJykudGV4dENvbnRlbnQ9"
+    "ZC5wYXNzcG9ydHNfaXNzdWVkO2RvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdzLXJlZCcpLnRleHRDb250ZW50PWQucmVkZWVtZWQ7"
+    "ZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3MtcmVmJykudGV4dENvbnRlbnQ9ZC5yZWZ1c2VkfSkuY2F0Y2goZnVuY3Rpb24oKXt9"
+    "KX0Kc3RhdHMoKTsKZnVuY3Rpb24gcnVuRGVtbygpewogdmFyIGJveD1kb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnc3RvcnknKSx2"
+    "PWRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCd2ZXJkaWN0JyksYj1kb2N1bWVudC5nZXRFbGVtZW50QnlJZCgncnVuYnRuJyk7CiBk"
+    "b2N1bWVudC5xdWVyeVNlbGVjdG9yKCcuZGFyaycpLnNjcm9sbEludG9WaWV3KHtiZWhhdmlvcjonc21vb3RoJ30pOwogYm94Lmlu"
+    "bmVySFRNTD0nJzt2LnRleHRDb250ZW50PSdSdW5uaW5nIG9uIHByb2R1Y3Rpb27igKYnO2IuZGlzYWJsZWQ9dHJ1ZTsKIGZldGNo"
+    "KCcveC9wYXNzcG9ydC9kZW1vJykudGhlbihmdW5jdGlvbihyKXtyZXR1cm4gci5qc29uKCl9KS50aGVuKGZ1bmN0aW9uKGQpewog"
+    "IGlmKGQuZXJyb3I9PT0ndG9vX3Nvb24nKXt2LnRleHRDb250ZW50PSdTb21lb25lIGp1c3QgcmFuIGl0LiBUcnkgYWdhaW4gaW4g"
+    "JytkLnJldHJ5X2FmdGVyX3NlY29uZHMrJyBzZWNvbmRzLic7Yi5kaXNhYmxlZD1mYWxzZTtyZXR1cm59CiAgaWYoIWQuc3Rvcnkp"
+    "e3YudGV4dENvbnRlbnQ9J0RlbW8gdW5hdmFpbGFibGUgcmlnaHQgbm93Lic7Yi5kaXNhYmxlZD1mYWxzZTtyZXR1cm59CiAgZC5z"
+    "dG9yeS5mb3JFYWNoKGZ1bmN0aW9uKHMsaSl7CiAgIHZhciBraW5kPSdpbmZvJyxsYWJlbD0nU0VBTEVEJzsKICAgaWYocy5yZWRl"
+    "ZW1lZD09PXRydWV8fHMudmFsaWQ9PT10cnVlfHxzLmlzc3VlZD09PXRydWUpe2tpbmQ9J3Bhc3MnO2xhYmVsPXMucmVkZWVtZWQ9"
+    "PT10cnVlPydCT1VORCc6KHMudmFsaWQ9PT10cnVlPydWQUxJRCc6J0lTU1VFRCcpfQogICBpZihzLnJlZGVlbWVkPT09ZmFsc2V8"
+    "fHMudmFsaWQ9PT1mYWxzZXx8cy5pc3N1ZWQ9PT1mYWxzZSl7a2luZD0nc3RvcCc7bGFiZWw9J1JFRlVTRUQnfQogICB2YXIgd2h5"
+    "PXMud2h5JiZzLndoeS5sZW5ndGg/JzxzcGFuIGNsYXNzPSJ3aHkiPicrZXNjKHMud2h5WzBdKSsnPC9zcGFuPic6Jyc7CiAgIHZh"
+    "ciBlbD1kb2N1bWVudC5jcmVhdGVFbGVtZW50KCdkaXYnKTtlbC5jbGFzc05hbWU9J3Jvdyc7CiAgIGVsLmlubmVySFRNTD0nPHNw"
+    "YW4gY2xhc3M9ImljICcra2luZCsnIj4nK2xhYmVsKyc8L3NwYW4+PGRpdj4nK2VzYyhzLmFjdCkrd2h5Kyc8L2Rpdj4nOwogICBi"
+    "b3guYXBwZW5kQ2hpbGQoZWwpO3NldFRpbWVvdXQoZnVuY3Rpb24oKXtlbC5jbGFzc0xpc3QuYWRkKCdzaG93Jyl9LDE2MCppKzYw"
+    "KX0pOwogIHNldFRpbWVvdXQoZnVuY3Rpb24oKXt2LnRleHRDb250ZW50PWQucmVzdWx0PT09J0FMTCBURU4gQkVIQVZFRCc/J+Kc"
+    "kyBBbGwgdGVuIGJlaGF2ZWQuIEV2ZXJ5IHN0ZXAgaXMgb24gdGhlIGNoYWluLic6ZC5yZXN1bHQ7Yi5kaXNhYmxlZD1mYWxzZTtz"
+    "dGF0cygpfSwxNjAqZC5zdG9yeS5sZW5ndGgrMzAwKTsKIH0pLmNhdGNoKGZ1bmN0aW9uKCl7di50ZXh0Q29udGVudD0nQ291bGQg"
+    "bm90IHJlYWNoIHRoZSBkZW1vLic7Yi5kaXNhYmxlZD1mYWxzZX0pOwp9Cjwvc2NyaXB0Pgo8L2JvZHk+CjwvaHRtbD4K"
+)
+
+_AGENT_B64 = (
+    "IyEvdXNyL2Jpbi9lbnYgcHl0aG9uMwoiIiIKc2ViYmlfYWdlbnQucHkgIC0gIGdpdmUgYW55IEFJIGFnZW50IGFuIEFnZW50IFBh"
+    "c3Nwb3J0IGluIG9uZSBsaW5lCj09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09"
+    "PT09PT09PT09PQoKICAgIGZyb20gc2ViYmlfYWdlbnQgaW1wb3J0IG5lZWRzX3Bhc3Nwb3J0CgogICAgQG5lZWRzX3Bhc3Nwb3J0"
+    "KCJwYXltZW50cy5zZW5kIiwgYXVkaWVuY2U9InNob3AuZXhhbXBsZS5jb20iLAogICAgICAgICAgICAgICAgICAgIGdyYW50PSJn"
+    "X3lvdXJfZ3JhbnRfaWQiLCBwYXJhbXM9WyJhbW91bnQiXSkKICAgIGRlZiBwYXkoYW1vdW50LCBwYXNzcG9ydD1Ob25lKToKICAg"
+    "ICAgICAjIHBhc3Nwb3J0IGlzIGEgc2lnbmVkIHRva2VuLiBTZW5kIGl0IHdpdGggdGhlIHJlcXVlc3Q6CiAgICAgICAgIyAgIGhl"
+    "YWRlcnMgPSB7IkFnZW50LVBhc3Nwb3J0IjogcGFzc3BvcnR9CiAgICAgICAgLi4uCgogICAgcGF5KGFtb3VudD0yMCkKCkJlZm9y"
+    "ZSB0aGUgZnVuY3Rpb24gcnVucywgc2ViYmkucHJvIHRyYWNlcyB0aGUgYWdlbnQncyBhdXRob3JpdHkgYmFjayB0byB0aGUKaHVt"
+    "YW4gd2hvIGdyYW50ZWQgaXQgYW5kIGlzc3VlcyBhIHBhc3Nwb3J0IGZvciBleGFjdGx5IHRoaXMgYWN0aW9uLCBhdCB0aGlzCnNp"
+    "dGUsIHdpdGggdGhlc2UgcGFyYW1ldGVycy4gSWYgc2ViYmkucHJvIHJlZnVzZXMsIHRoZSBmdW5jdGlvbiBuZXZlciBydW5zIGFu"
+    "ZApQYXNzcG9ydFJlZnVzZWQgaXMgcmFpc2VkIHdpdGggdGhlIHJlYXNvbnMgYW5kIGEgbGluayB0byB0aGUgc2VhbGVkIHJlZnVz"
+    "YWwuCgpGYWlscyBjbG9zZWQ6IGlmIHNlYmJpLnBybyBjYW5ub3QgYmUgcmVhY2hlZCwgdGhlIGFjdGlvbiBkb2VzIG5vdCBoYXBw"
+    "ZW4uCgpOZWVkcyB5b3VyIHNlYmJpLnBybyBBUEkga2V5IGluIHRoZSBTRUJCSV9LRVkgZW52aXJvbm1lbnQgdmFyaWFibGUuClN0"
+    "YW5kYXJkIGxpYnJhcnkgb25seS4gT25lIGZpbGUuIFB5dGhvbiAzLjgrLgoKQ29tbWFuZCBsaW5lOgogICAgcHl0aG9uIHNlYmJp"
+    "X2FnZW50LnB5IHJlcXVlc3QgLS1ncmFudCBHIC0tYWN0aW9uIHBheW1lbnRzLnNlbmQgXFwKICAgICAgICAtLWF1ZGllbmNlIHNo"
+    "b3AuZXhhbXBsZS5jb20gLS1wYXJhbXMgJ3siYW1vdW50IjogMjB9JwoiIiIKCmltcG9ydCBmdW5jdG9vbHMKaW1wb3J0IGluc3Bl"
+    "Y3QKaW1wb3J0IGpzb24KaW1wb3J0IG9zCmltcG9ydCBzeXMKaW1wb3J0IHRocmVhZGluZwppbXBvcnQgdXJsbGliLmVycm9yCmlt"
+    "cG9ydCB1cmxsaWIucmVxdWVzdAoKX192ZXJzaW9uX18gPSAiMS4wLjAiCgpCQVNFID0gb3MuZW52aXJvbi5nZXQoIlNFQkJJX0JB"
+    "U0UiLCAiaHR0cHM6Ly9zZWJiaS5wcm8iKS5yc3RyaXAoIi8iKQpIRUFERVIgPSAiQWdlbnQtUGFzc3BvcnQiClRJTUVPVVQgPSAx"
+    "MAoKX2xvY2FsID0gdGhyZWFkaW5nLmxvY2FsKCkKCgpjbGFzcyBQYXNzcG9ydEVycm9yKEV4Y2VwdGlvbik6CiAgICAiIiJCYXNl"
+    "IGNsYXNzLiBUaGUgYWN0aW9uIGRpZCBub3QgaGFwcGVuLiIiIgoKCmNsYXNzIFBhc3Nwb3J0UmVmdXNlZChQYXNzcG9ydEVycm9y"
+    "KToKICAgICIiInNlYmJpLnBybyBldmFsdWF0ZWQgdGhlIHJlcXVlc3QgYW5kIGRpZCBub3QgaXNzdWUgYSBwYXNzcG9ydC4iIiIK"
+    "CiAgICBkZWYgX19pbml0X18oc2VsZiwgdmVyZGljdCwgcmVhc29ucywgcHJvb2Y9Tm9uZSk6CiAgICAgICAgc2VsZi52ZXJkaWN0"
+    "LCBzZWxmLnJlYXNvbnMsIHNlbGYucHJvb2YgPSB2ZXJkaWN0LCByZWFzb25zLCBwcm9vZgogICAgICAgIG1zZyA9ICIlczogJXMi"
+    "ICUgKHZlcmRpY3QsICI7ICIuam9pbihyZWFzb25zKSBpZiByZWFzb25zIGVsc2UgIm5vIHJlYXNvbiBnaXZlbiIpCiAgICAgICAg"
+    "aWYgcHJvb2Y6CiAgICAgICAgICAgIG1zZyArPSAiIChzZWFsZWQgcmVmdXNhbDogJXMpIiAlIHByb29mCiAgICAgICAgc3VwZXIo"
+    "KS5fX2luaXRfXyhtc2cpCgoKY2xhc3MgUGFzc3BvcnRVbmF2YWlsYWJsZShQYXNzcG9ydEVycm9yKToKICAgICIiInNlYmJpLnBy"
+    "byBjb3VsZCBub3QgYmUgcmVhY2hlZCBvciBhbnN3ZXJlZCB3aXRoIGFuIGVycm9yLiBGYWlscyBjbG9zZWQuIiIiCgoKZGVmIF9w"
+    "b3N0KHBhdGgsIGJvZHksIGtleSk6CiAgICByZXEgPSB1cmxsaWIucmVxdWVzdC5SZXF1ZXN0KAogICAgICAgIEJBU0UgKyBwYXRo"
+    "LCBkYXRhPWpzb24uZHVtcHMoYm9keSkuZW5jb2RlKCJ1dGYtOCIpLCBtZXRob2Q9IlBPU1QiLAogICAgICAgIGhlYWRlcnM9eyJD"
+    "b250ZW50LVR5cGUiOiAiYXBwbGljYXRpb24vanNvbiIsICJBdXRob3JpemF0aW9uIjogIkJlYXJlciAiICsga2V5LAogICAgICAg"
+    "ICAgICAgICAgICJVc2VyLUFnZW50IjogInNlYmJpLWFnZW50LyIgKyBfX3ZlcnNpb25fX30pCiAgICB0cnk6CiAgICAgICAgd2l0"
+    "aCB1cmxsaWIucmVxdWVzdC51cmxvcGVuKHJlcSwgdGltZW91dD1USU1FT1VUKSBhcyByOgogICAgICAgICAgICByZXR1cm4ganNv"
+    "bi5sb2FkcyhyLnJlYWQoKS5kZWNvZGUoInV0Zi04IikpCiAgICBleGNlcHQgdXJsbGliLmVycm9yLkhUVFBFcnJvciBhcyBlOgog"
+    "ICAgICAgIHRyeToKICAgICAgICAgICAgZGV0YWlsID0ganNvbi5sb2FkcyhlLnJlYWQoKS5kZWNvZGUoInV0Zi04IikpCiAgICAg"
+    "ICAgZXhjZXB0IEV4Y2VwdGlvbjoKICAgICAgICAgICAgZGV0YWlsID0geyJlcnJvciI6ICJodHRwXyVkIiAlIGUuY29kZX0KICAg"
+    "ICAgICByYWlzZSBQYXNzcG9ydFVuYXZhaWxhYmxlKCJzZWJiaS5wcm8gYW5zd2VyZWQgJWQ6ICVzIiAlIChlLmNvZGUsIGRldGFp"
+    "bCkpCiAgICBleGNlcHQgRXhjZXB0aW9uIGFzIGU6CiAgICAgICAgcmFpc2UgUGFzc3BvcnRVbmF2YWlsYWJsZSgiY291bGQgbm90"
+    "IHJlYWNoIHNlYmJpLnBybzogJXMiICUgZSkKCgpkZWYgcmVxdWVzdF9wYXNzcG9ydChncmFudCwgYWN0aW9uLCBhdWRpZW5jZSwg"
+    "cGFyYW1zPU5vbmUsIHB1cnBvc2VfdGFnPU5vbmUsIGtleT1Ob25lKToKICAgICIiIkFzayBzZWJiaS5wcm8gZm9yIGEgcGFzc3Bv"
+    "cnQuIFJldHVybnMgdGhlIHRva2VuIHN0cmluZyBvciByYWlzZXMuIiIiCiAgICBrZXkgPSBrZXkgb3Igb3MuZW52aXJvbi5nZXQo"
+    "IlNFQkJJX0tFWSIsICIiKQogICAgaWYgbm90IGtleToKICAgICAgICByYWlzZSBQYXNzcG9ydFVuYXZhaWxhYmxlKCJzZXQgU0VC"
+    "QklfS0VZIHRvIHlvdXIgc2ViYmkucHJvIEFQSSBrZXkiKQogICAgcmVzID0gX3Bvc3QoIi94L3Bhc3Nwb3J0L2lzc3VlIiwgeyJn"
+    "cmFudCI6IGdyYW50LCAiYWN0aW9uIjogYWN0aW9uLAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgImF1ZGll"
+    "bmNlIjogYXVkaWVuY2UsICJwYXJhbXMiOiBwYXJhbXMgb3Ige30sCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+    "ICAicHVycG9zZV90YWciOiBwdXJwb3NlX3RhZ30sIGtleSkKICAgIGlmIHJlcy5nZXQoImlzc3VlZCIpOgogICAgICAgIHJldHVy"
+    "biByZXNbInBhc3Nwb3J0Il0KICAgIGlmICJ2ZXJkaWN0IiBpbiByZXM6CiAgICAgICAgcmFpc2UgUGFzc3BvcnRSZWZ1c2VkKHJl"
+    "c1sidmVyZGljdCJdLCByZXMuZ2V0KCJyZWFzb25zIiwgW10pLAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICByZXMuZ2V0"
+    "KCJwcm9vZl9vZl9yZWZ1c2FsIikpCiAgICByYWlzZSBQYXNzcG9ydFVuYXZhaWxhYmxlKCJ1bmV4cGVjdGVkIGFuc3dlcjogJXMi"
+    "ICUgcmVzKQoKCmRlZiBjdXJyZW50X3Bhc3Nwb3J0KCk6CiAgICAiIiJUaGUgcGFzc3BvcnQgZm9yIHRoZSBhY3Rpb24gY3VycmVu"
+    "dGx5IHJ1bm5pbmcgaW5zaWRlIEBuZWVkc19wYXNzcG9ydC4iIiIKICAgIHJldHVybiBnZXRhdHRyKF9sb2NhbCwgInRva2VuIiwg"
+    "Tm9uZSkKCgpkZWYgaGVhZGVycyh0b2tlbj1Ob25lKToKICAgICIiIkhUVFAgaGVhZGVycyB0byBzZW5kIHdpdGggdGhlIGFjdGlv"
+    "bi4iIiIKICAgIHJldHVybiB7SEVBREVSOiB0b2tlbiBvciBjdXJyZW50X3Bhc3Nwb3J0KCkgb3IgIiJ9CgoKZGVmIG5lZWRzX3Bh"
+    "c3Nwb3J0KGFjdGlvbiwgYXVkaWVuY2UsIGdyYW50PU5vbmUsIHBhcmFtcz1Ob25lLCBwdXJwb3NlX3RhZz1Ob25lLCBrZXk9Tm9u"
+    "ZSk6CiAgICAiIiJEZWNvcmF0b3IuIFRoZSB3cmFwcGVkIGZ1bmN0aW9uIHJ1bnMgb25seSBpZiBhIHBhc3Nwb3J0IGlzIGlzc3Vl"
+    "ZC4KCiAgICBwYXJhbXM6IGxpc3Qgb2YgYXJndW1lbnQgbmFtZXMgd2hvc2UgdmFsdWVzIGRlZmluZSB0aGUgYWN0aW9uLCBlLmcu"
+    "CiAgICAgICAgICAgIFsiYW1vdW50IiwgImN1cnJlbmN5Il0uIFRoZSBzaXRlIG11c3QgcmVkZWVtIHdpdGggdGhlIHNhbWUgdmFs"
+    "dWVzLAogICAgICAgICAgICBzbyBhIHBhc3Nwb3J0IGZvciAyMCBjYW5ub3QgYmUgc3BlbnQgb24gNDkuCiAgICBncmFudDogIHRo"
+    "ZSBncmFudCBpZC4gQ2FuIGFsc28gYmUgcGFzc2VkIGF0IGNhbGwgdGltZSBhcyBncmFudD0uLi4KICAgIFRoZSB0b2tlbiBpcyBo"
+    "YW5kZWQgdG8gdGhlIGZ1bmN0aW9uIGFzIHBhc3Nwb3J0PS4uLiBpZiBpdCBhY2NlcHRzIHRoYXQKICAgIGFyZ3VtZW50LCBhbmQg"
+    "aXMgYWx3YXlzIGF2YWlsYWJsZSB0aHJvdWdoIGN1cnJlbnRfcGFzc3BvcnQoKS4KICAgICIiIgogICAgbmFtZXMgPSBsaXN0KHBh"
+    "cmFtcyBvciBbXSkKCiAgICBkZWYgd3JhcChmbik6CiAgICAgICAgc2lnID0gaW5zcGVjdC5zaWduYXR1cmUoZm4pCiAgICAgICAg"
+    "dGFrZXNfcGFzc3BvcnQgPSAicGFzc3BvcnQiIGluIHNpZy5wYXJhbWV0ZXJzCgogICAgICAgIEBmdW5jdG9vbHMud3JhcHMoZm4p"
+    "CiAgICAgICAgZGVmIGlubmVyKCphcmdzLCAqKmt3YXJncyk6CiAgICAgICAgICAgIGcgPSBrd2FyZ3MucG9wKCJncmFudCIsIE5v"
+    "bmUpIGlmICJncmFudCIgbm90IGluIHNpZy5wYXJhbWV0ZXJzIGVsc2Uga3dhcmdzLmdldCgiZ3JhbnQiKQogICAgICAgICAgICBn"
+    "ID0gZyBvciBncmFudCBvciBvcy5lbnZpcm9uLmdldCgiU0VCQklfR1JBTlQiKQogICAgICAgICAgICBpZiBub3QgZzoKICAgICAg"
+    "ICAgICAgICAgIHJhaXNlIFBhc3Nwb3J0VW5hdmFpbGFibGUoIm5vIGdyYW50IGlkOiBwYXNzIGdyYW50PS4uLiBvciBzZXQgU0VC"
+    "QklfR1JBTlQiKQogICAgICAgICAgICBib3VuZCA9IHNpZy5iaW5kX3BhcnRpYWwoKmFyZ3MsICoqa3dhcmdzKQogICAgICAgICAg"
+    "ICBib3VuZC5hcHBseV9kZWZhdWx0cygpCiAgICAgICAgICAgIHAgPSB7bjogYm91bmQuYXJndW1lbnRzW25dIGZvciBuIGluIG5h"
+    "bWVzIGlmIG4gaW4gYm91bmQuYXJndW1lbnRzfQogICAgICAgICAgICB0b2tlbiA9IHJlcXVlc3RfcGFzc3BvcnQoZywgYWN0aW9u"
+    "LCBhdWRpZW5jZSwgcCwgcHVycG9zZV90YWcsIGtleSkKICAgICAgICAgICAgaWYgdGFrZXNfcGFzc3BvcnQ6CiAgICAgICAgICAg"
+    "ICAgICBrd2FyZ3NbInBhc3Nwb3J0Il0gPSB0b2tlbgogICAgICAgICAgICBfbG9jYWwudG9rZW4gPSB0b2tlbgogICAgICAgICAg"
+    "ICB0cnk6CiAgICAgICAgICAgICAgICByZXR1cm4gZm4oKmFyZ3MsICoqa3dhcmdzKQogICAgICAgICAgICBmaW5hbGx5OgogICAg"
+    "ICAgICAgICAgICAgX2xvY2FsLnRva2VuID0gTm9uZQogICAgICAgIHJldHVybiBpbm5lcgogICAgcmV0dXJuIHdyYXAKCgpkZWYg"
+    "X2NsaShhcmd2KToKICAgIGltcG9ydCBhcmdwYXJzZQogICAgYXAgPSBhcmdwYXJzZS5Bcmd1bWVudFBhcnNlcihwcm9nPSJzZWJi"
+    "aV9hZ2VudCIpCiAgICBzdWIgPSBhcC5hZGRfc3VicGFyc2VycyhkZXN0PSJjbWQiKQogICAgciA9IHN1Yi5hZGRfcGFyc2VyKCJy"
+    "ZXF1ZXN0IikKICAgIHIuYWRkX2FyZ3VtZW50KCItLWdyYW50IiwgcmVxdWlyZWQ9VHJ1ZSkKICAgIHIuYWRkX2FyZ3VtZW50KCIt"
+    "LWFjdGlvbiIsIHJlcXVpcmVkPVRydWUpCiAgICByLmFkZF9hcmd1bWVudCgiLS1hdWRpZW5jZSIsIHJlcXVpcmVkPVRydWUpCiAg"
+    "ICByLmFkZF9hcmd1bWVudCgiLS1wYXJhbXMiLCBkZWZhdWx0PSJ7fSIpCiAgICByLmFkZF9hcmd1bWVudCgiLS1wdXJwb3NlIiwg"
+    "ZGVmYXVsdD1Ob25lKQogICAgYSA9IGFwLnBhcnNlX2FyZ3MoYXJndikKICAgIGlmIGEuY21kICE9ICJyZXF1ZXN0IjoKICAgICAg"
+    "ICBhcC5wcmludF9oZWxwKCkKICAgICAgICByZXR1cm4gMgogICAgdHJ5OgogICAgICAgIHByaW50KHJlcXVlc3RfcGFzc3BvcnQo"
+    "YS5ncmFudCwgYS5hY3Rpb24sIGEuYXVkaWVuY2UsIGpzb24ubG9hZHMoYS5wYXJhbXMpLCBhLnB1cnBvc2UpKQogICAgICAgIHJl"
+    "dHVybiAwCiAgICBleGNlcHQgUGFzc3BvcnRFcnJvciBhcyBlOgogICAgICAgIHByaW50KCJSRUZVU0VEOiAlcyIgJSBlLCBmaWxl"
+    "PXN5cy5zdGRlcnIpCiAgICAgICAgcmV0dXJuIDEKCgppZiBfX25hbWVfXyA9PSAiX19tYWluX18iOgogICAgc3lzLmV4aXQoX2Ns"
+    "aShzeXMuYXJndlsxOl0pKQo="
+)
+
+_SITE_B64 = (
+    "IyEvdXNyL2Jpbi9lbnYgcHl0aG9uMwoiIiIKc2ViYmlfc2l0ZS5weSAgLSAgcmVxdWlyZSBhbiBBZ2VudCBQYXNzcG9ydCBvbiB5"
+    "b3VyIHNpdGUgaW4gb25lIGxpbmUKPT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09"
+    "PT09PT09PT09PT09PT0KCiAgICBmcm9tIHNlYmJpX3NpdGUgaW1wb3J0IGFjY2VwdAoKICAgIGRlZiBoYW5kbGVfcGF5bWVudChy"
+    "ZXF1ZXN0KToKICAgICAgICBwYXNzcG9ydCA9IGFjY2VwdChyZXF1ZXN0LmhlYWRlcnMsIGF1ZGllbmNlPSJzaG9wLmV4YW1wbGUu"
+    "Y29tIiwKICAgICAgICAgICAgICAgICAgICAgICAgICBhY3Rpb249InBheW1lbnRzLnNlbmQiLAogICAgICAgICAgICAgICAgICAg"
+    "ICAgICAgIHBhcmFtcz17ImFtb3VudCI6IHJlcXVlc3QuanNvblsiYW1vdW50Il19KQogICAgICAgICMgUmVhY2hpbmcgaGVyZSBt"
+    "ZWFuczogYSBodW1hbiBhdXRob3Jpc2VkIHRoaXMgYWdlbnQsIHRoYXQgYXV0aG9yaXR5CiAgICAgICAgIyBzdGlsbCBzdGFuZHMg"
+    "YXQgdGhpcyBpbnN0YW50LCB0aGUgYW1vdW50IGlzIGV4YWN0bHkgd2hhdCB3YXMKICAgICAgICAjIGF1dGhvcmlzZWQsIGFuZCB0"
+    "aGlzIHBhc3Nwb3J0IGhhcyBuZXZlciBiZWVuIHVzZWQuIERvIHRoZSBhY3Rpb24uCiAgICAgICAgLi4uCgphY2NlcHQoKSBkb2Vz"
+    "IHR3byB0aGluZ3M6CgogIDEuIENIRUNLLCBvbiB5b3VyIG93biBzZXJ2ZXIuIFRoZSBFZDI1NTE5IHNpZ25hdHVyZSBpcyB2ZXJp"
+    "ZmllZCBhZ2FpbnN0CiAgICAgc2ViYmkucHJvJ3MgcHVibGlzaGVkIGtleSwgcGx1cyBleHBpcnksIHNpdGUgYW5kIGFjdGlvbi4g"
+    "Tm90aGluZyBpcyBzZW50CiAgICAgYW55d2hlcmUgZm9yIHRoaXMgc3RlcC4gQSBmb3JnZWQsIGV4cGlyZWQgb3IgbWlzZGlyZWN0"
+    "ZWQgcGFzc3BvcnQgaXMKICAgICB0dXJuZWQgYXdheSBiZWZvcmUgc2ViYmkucHJvIGlzIGV2ZXIgYXNrZWQuCiAgMi4gUkVERUVN"
+    "LCBhdCB0aGUgbW9tZW50IG9mIGFjdGlvbi4gc2ViYmkucHJvIHJlLWNoZWNrcyB0aGUgaHVtYW4ncwogICAgIGF1dGhvcml0eSBy"
+    "aWdodCBub3csIGNvbXBhcmVzIHRoZSBleGFjdCBwYXJhbWV0ZXJzLCBhbmQgbGV0cyB0aGUgcGFzc3BvcnQKICAgICBiaW5kIG9u"
+    "Y2UuIFRoZSBvdXRjb21lIGlzIHNlYWxlZCBpbiBhIHB1YmxpYyBjaGFpbi4KCkFueXRoaW5nIHdyb25nIHJhaXNlcyBQYXNzcG9y"
+    "dFJlamVjdGVkIC0gZG8gbm90IHBlcmZvcm0gdGhlIGFjdGlvbi4KCkZvciBhIGZ1bGx5IG9mZmxpbmUgc2lnbmF0dXJlIGNoZWNr"
+    "LCBzZXQgU0VCQklfUFVCS0VZIHRvIHRoZSBoZXgga2V5IGZyb20KaHR0cHM6Ly9zZWJiaS5wcm8veC9jb250aW51aXR5L3B1Ymtl"
+    "eS4gT3RoZXJ3aXNlIGl0IGlzIGZldGNoZWQgb25jZSBhbmQgY2FjaGVkLgoKU3RhbmRhcmQgbGlicmFyeSBvbmx5LiBPbmUgZmls"
+    "ZS4gUHl0aG9uIDMuOCsuCgpDb21tYW5kIGxpbmU6CiAgICBweXRob24gc2ViYmlfc2l0ZS5weSBjaGVjayA8dG9rZW4+IFthdWRp"
+    "ZW5jZV0KIiIiCgppbXBvcnQgYmFzZTY0CmltcG9ydCBoYXNobGliCmltcG9ydCBqc29uCmltcG9ydCBvcwppbXBvcnQgc3lzCmlt"
+    "cG9ydCB0aW1lCmltcG9ydCB1cmxsaWIuZXJyb3IKaW1wb3J0IHVybGxpYi5yZXF1ZXN0CgpfX3ZlcnNpb25fXyA9ICIxLjAuMCIK"
+    "CkJBU0UgPSBvcy5lbnZpcm9uLmdldCgiU0VCQklfQkFTRSIsICJodHRwczovL3NlYmJpLnBybyIpLnJzdHJpcCgiLyIpCkhFQURF"
+    "UiA9ICJBZ2VudC1QYXNzcG9ydCIKUFJFRklYID0gYiJBSUxFQVNILVBBU1NQT1JULXYxOiIKVElNRU9VVCA9IDEwCgoKY2xhc3Mg"
+    "UGFzc3BvcnRSZWplY3RlZChFeGNlcHRpb24pOgogICAgIiIiRG8gbm90IHBlcmZvcm0gdGhlIGFjdGlvbi4gLnJlYXNvbnMgbGlz"
+    "dHMgd2h5LiIiIgoKICAgIGRlZiBfX2luaXRfXyhzZWxmLCByZWFzb25zLCBzZWFsZWQ9Tm9uZSk6CiAgICAgICAgc2VsZi5yZWFz"
+    "b25zID0gcmVhc29ucyBpZiBpc2luc3RhbmNlKHJlYXNvbnMsIGxpc3QpIGVsc2UgW3N0cihyZWFzb25zKV0KICAgICAgICBzZWxm"
+    "LnNlYWxlZCA9IHNlYWxlZAogICAgICAgIHN1cGVyKCkuX19pbml0X18oIjsgIi5qb2luKHNlbGYucmVhc29ucykpCgoKIyAtLS0t"
+    "LS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tIEVkMjU1MTkKIyBSRkMg"
+    "ODAzMiB2ZXJpZmljYXRpb24sIHN0YW5kYXJkIGxpYnJhcnkgb25seSwgc28gdGhlcmUgaXMgbm90aGluZyB0byBpbnN0YWxsLgoK"
+    "X1EgPSAyICoqIDI1NSAtIDE5Cl9MID0gMiAqKiAyNTIgKyAyNzc0MjMxNzc3NzM3MjM1MzUzNTg1MTkzNzc5MDg4MzY0ODQ5Mwpf"
+    "RCA9IC0xMjE2NjUgKiBwb3coMTIxNjY2LCBfUSAtIDIsIF9RKSAlIF9RCl9JID0gcG93KDIsIChfUSAtIDEpIC8vIDQsIF9RKQoK"
+    "CmRlZiBfaW52KHgpOgogICAgcmV0dXJuIHBvdyh4LCBfUSAtIDIsIF9RKQoKCmRlZiBfeHJlYyh5KToKICAgIHh4ID0gKHkgKiB5"
+    "IC0gMSkgKiBfaW52KF9EICogeSAqIHkgKyAxKQogICAgeCA9IHBvdyh4eCwgKF9RICsgMykgLy8gOCwgX1EpCiAgICBpZiAoeCAq"
+    "IHggLSB4eCkgJSBfUToKICAgICAgICB4ID0geCAqIF9JICUgX1EKICAgIGlmIHggJSAyOgogICAgICAgIHggPSBfUSAtIHgKICAg"
+    "IHJldHVybiB4CgoKX0JZID0gNCAqIF9pbnYoNSkgJSBfUQpfQlggPSBfeHJlYyhfQlkpCl9CID0gKF9CWCwgX0JZLCAxLCBfQlgg"
+    "KiBfQlkgJSBfUSkKCgpkZWYgX2FkZChwLCBxKToKICAgIHgxLCB5MSwgejEsIHQxID0gcAogICAgeDIsIHkyLCB6MiwgdDIgPSBx"
+    "CiAgICBhID0gKHkxIC0geDEpICogKHkyIC0geDIpICUgX1EKICAgIGIgPSAoeTEgKyB4MSkgKiAoeTIgKyB4MikgJSBfUQogICAg"
+    "YyA9IHQxICogMiAqIF9EICogdDIgJSBfUQogICAgZCA9IHoxICogMiAqIHoyICUgX1EKICAgIGUsIGYsIGcsIGggPSBiIC0gYSwg"
+    "ZCAtIGMsIGQgKyBjLCBiICsgYQogICAgcmV0dXJuIChlICogZiAlIF9RLCBnICogaCAlIF9RLCBmICogZyAlIF9RLCBlICogaCAl"
+    "IF9RKQoKCmRlZiBfbXVsKHAsIG4pOgogICAgciA9ICgwLCAxLCAxLCAwKQogICAgd2hpbGUgbjoKICAgICAgICBpZiBuICYgMToK"
+    "ICAgICAgICAgICAgciA9IF9hZGQociwgcCkKICAgICAgICBwID0gX2FkZChwLCBwKQogICAgICAgIG4gPj49IDEKICAgIHJldHVy"
+    "biByCgoKZGVmIF9lbmMocCk6CiAgICB4LCB5LCB6LCBfID0gcAogICAgemkgPSBfaW52KHopCiAgICB4LCB5ID0geCAqIHppICUg"
+    "X1EsIHkgKiB6aSAlIF9RCiAgICByZXR1cm4gKHkgfCAoKHggJiAxKSA8PCAyNTUpKS50b19ieXRlcygzMiwgImxpdHRsZSIpCgoK"
+    "ZGVmIF9kZWMocyk6CiAgICB5ID0gaW50LmZyb21fYnl0ZXMocywgImxpdHRsZSIpICYgKCgxIDw8IDI1NSkgLSAxKQogICAgeCA9"
+    "IF94cmVjKHkpCiAgICBpZiAoeCAmIDEpICE9IChzWzMxXSA+PiA3KToKICAgICAgICB4ID0gX1EgLSB4CiAgICBwID0gKHgsIHks"
+    "IDEsIHggKiB5ICUgX1EpCiAgICB4LCB5LCB6LCB0ID0gcAogICAgaWYgKHkgKiB5IC0geCAqIHggLSB6ICogeiAtIF9EICogdCAq"
+    "IHQpICUgX1E6CiAgICAgICAgcmFpc2UgVmFsdWVFcnJvcigicG9pbnQgb2ZmIGN1cnZlIikKICAgIHJldHVybiBwCgoKZGVmIF92"
+    "ZXJpZnkoc2lnLCBtc2csIHBrKToKICAgIGlmIGxlbihzaWcpICE9IDY0IG9yIGxlbihwaykgIT0gMzI6CiAgICAgICAgcmV0dXJu"
+    "IEZhbHNlCiAgICB0cnk6CiAgICAgICAgciwgYSA9IF9kZWMoc2lnWzozMl0pLCBfZGVjKHBrKQogICAgZXhjZXB0IEV4Y2VwdGlv"
+    "bjoKICAgICAgICByZXR1cm4gRmFsc2UKICAgIHMgPSBpbnQuZnJvbV9ieXRlcyhzaWdbMzI6XSwgImxpdHRsZSIpCiAgICBpZiBz"
+    "ID49IF9MOgogICAgICAgIHJldHVybiBGYWxzZQogICAgaCA9IGludC5mcm9tX2J5dGVzKGhhc2hsaWIuc2hhNTEyKHNpZ1s6MzJd"
+    "ICsgcGsgKyBtc2cpLmRpZ2VzdCgpLCAibGl0dGxlIikgJSBfTAogICAgcmV0dXJuIF9lbmMoX211bChfQiwgcykpID09IF9lbmMo"
+    "X2FkZChyLCBfbXVsKGEsIGgpKSkKCgojIC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0t"
+    "LS0tLS0tLS0tLS0tLS0gcGFzc3BvcnQKCl9rZXlfY2FjaGUgPSB7fQoKCmRlZiBwdWJsaWNfa2V5KCk6CiAgICBlbnYgPSBvcy5l"
+    "bnZpcm9uLmdldCgiU0VCQklfUFVCS0VZIiwgIiIpLnN0cmlwKCkKICAgIGlmIGVudjoKICAgICAgICByZXR1cm4gYnl0ZXMuZnJv"
+    "bWhleChlbnYpCiAgICBpZiAicGsiIG5vdCBpbiBfa2V5X2NhY2hlOgogICAgICAgIHRyeToKICAgICAgICAgICAgd2l0aCB1cmxs"
+    "aWIucmVxdWVzdC51cmxvcGVuKEJBU0UgKyAiL3gvY29udGludWl0eS9wdWJrZXkiLCB0aW1lb3V0PVRJTUVPVVQpIGFzIHI6CiAg"
+    "ICAgICAgICAgICAgICBfa2V5X2NhY2hlWyJwayJdID0gYnl0ZXMuZnJvbWhleChqc29uLmxvYWRzKHIucmVhZCgpKVsicHVibGlj"
+    "X2tleSJdKQogICAgICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMgZToKICAgICAgICAgICAgcmFpc2UgUGFzc3BvcnRSZWplY3RlZCgi"
+    "Y291bGQgbm90IGxvYWQgc2ViYmkucHJvIHB1YmxpYyBrZXk6ICVzIiAlIGUpCiAgICByZXR1cm4gX2tleV9jYWNoZVsicGsiXQoK"
+    "CmRlZiBfYjY0ZChzKToKICAgIHJldHVybiBiYXNlNjQudXJsc2FmZV9iNjRkZWNvZGUocyArICI9IiAqICgtbGVuKHMpICUgNCkp"
+    "CgoKZGVmIGNoZWNrKHRva2VuLCBhdWRpZW5jZSwgYWN0aW9uPU5vbmUpOgogICAgIiIiT2ZmbGluZSBjaGVjay4gUmV0dXJucyB0"
+    "aGUgcGFzc3BvcnQgYm9keSBvciByYWlzZXMgUGFzc3BvcnRSZWplY3RlZC4iIiIKICAgIHRyeToKICAgICAgICB0YWcsIGIsIHMg"
+    "PSBzdHIodG9rZW4pLnN0cmlwKCkuc3BsaXQoIi4iKQogICAgICAgIGlmIHRhZyAhPSAic2JwMSI6CiAgICAgICAgICAgIHJhaXNl"
+    "IFZhbHVlRXJyb3IKICAgICAgICByYXcsIHNpZyA9IF9iNjRkKGIpLCBfYjY0ZChzKQogICAgICAgIGJvZHkgPSBqc29uLmxvYWRz"
+    "KHJhdykKICAgIGV4Y2VwdCBFeGNlcHRpb246CiAgICAgICAgcmFpc2UgUGFzc3BvcnRSZWplY3RlZCgibWlzc2luZyBvciBtYWxm"
+    "b3JtZWQgcGFzc3BvcnQiKQogICAgaWYgbm90IF92ZXJpZnkoc2lnLCBQUkVGSVggKyByYXcsIHB1YmxpY19rZXkoKSk6CiAgICAg"
+    "ICAgcmFpc2UgUGFzc3BvcnRSZWplY3RlZCgic2lnbmF0dXJlIGRvZXMgbm90IHZlcmlmeSAtIGZvcmdlZCBvciBhbHRlcmVkIikK"
+    "ICAgIHByb2JsZW1zID0gW10KICAgIGlmIHRpbWUudGltZSgpID4gYm9keS5nZXQoImV4cCIsIDApOgogICAgICAgIHByb2JsZW1z"
+    "LmFwcGVuZCgiZXhwaXJlZCIpCiAgICBpZiBib2R5LmdldCgiYXVkIikgIT0gYXVkaWVuY2Uuc3RyaXAoKS5sb3dlcigpOgogICAg"
+    "ICAgIHByb2JsZW1zLmFwcGVuZCgiaXNzdWVkIGZvciAlcywgbm90ICVzIiAlIChib2R5LmdldCgiYXVkIiksIGF1ZGllbmNlKSkK"
+    "ICAgIGlmIGFjdGlvbiBhbmQgYm9keS5nZXQoImFjdCIpICE9IGFjdGlvbjoKICAgICAgICBwcm9ibGVtcy5hcHBlbmQoImlzc3Vl"
+    "ZCBmb3IgYWN0aW9uICVzLCBub3QgJXMiICUgKGJvZHkuZ2V0KCJhY3QiKSwgYWN0aW9uKSkKICAgIGlmIHByb2JsZW1zOgogICAg"
+    "ICAgIHJhaXNlIFBhc3Nwb3J0UmVqZWN0ZWQocHJvYmxlbXMpCiAgICByZXR1cm4gYm9keQoKCmRlZiByZWRlZW0odG9rZW4sIGF1"
+    "ZGllbmNlLCBwYXJhbXM9Tm9uZSk6CiAgICAiIiJTcGVuZCBpdCBvbmNlLCBhdCB0aGUgbW9tZW50IG9mIGFjdGlvbi4gUmV0dXJu"
+    "cyBzZWJiaS5wcm8ncyBzZWFsZWQgYW5zd2VyLiIiIgogICAgcmVxID0gdXJsbGliLnJlcXVlc3QuUmVxdWVzdCgKICAgICAgICBC"
+    "QVNFICsgIi94L3Bhc3Nwb3J0L3JlZGVlbSIsIG1ldGhvZD0iUE9TVCIsCiAgICAgICAgZGF0YT1qc29uLmR1bXBzKHsidG9rZW4i"
+    "OiB0b2tlbiwgImF1ZGllbmNlIjogYXVkaWVuY2Uuc3RyaXAoKS5sb3dlcigpLAogICAgICAgICAgICAgICAgICAgICAgICAgInBh"
+    "cmFtcyI6IHBhcmFtcyBvciB7fX0pLmVuY29kZSgidXRmLTgiKSwKICAgICAgICBoZWFkZXJzPXsiQ29udGVudC1UeXBlIjogImFw"
+    "cGxpY2F0aW9uL2pzb24iLAogICAgICAgICAgICAgICAgICJVc2VyLUFnZW50IjogInNlYmJpLXNpdGUvIiArIF9fdmVyc2lvbl9f"
+    "fSkKICAgIHRyeToKICAgICAgICB3aXRoIHVybGxpYi5yZXF1ZXN0LnVybG9wZW4ocmVxLCB0aW1lb3V0PVRJTUVPVVQpIGFzIHI6"
+    "CiAgICAgICAgICAgIHJlcyA9IGpzb24ubG9hZHMoci5yZWFkKCkpCiAgICBleGNlcHQgdXJsbGliLmVycm9yLkhUVFBFcnJvciBh"
+    "cyBlOgogICAgICAgIHRyeToKICAgICAgICAgICAgcmVzID0ganNvbi5sb2FkcyhlLnJlYWQoKSkKICAgICAgICBleGNlcHQgRXhj"
+    "ZXB0aW9uOgogICAgICAgICAgICByYWlzZSBQYXNzcG9ydFJlamVjdGVkKCJzZWJiaS5wcm8gYW5zd2VyZWQgJWQiICUgZS5jb2Rl"
+    "KQogICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOgogICAgICAgIHJhaXNlIFBhc3Nwb3J0UmVqZWN0ZWQoImNvdWxkIG5vdCByZWFj"
+    "aCBzZWJiaS5wcm8gdG8gcmVkZWVtOiAlcyIgJSBlKQogICAgaWYgbm90IHJlcy5nZXQoInJlZGVlbWVkIik6CiAgICAgICAgcmFp"
+    "c2UgUGFzc3BvcnRSZWplY3RlZChyZXMuZ2V0KCJwcm9ibGVtcyIpIG9yIFsicmVmdXNlZCJdLCByZXMuZ2V0KCJzZWFsZWRfaW5f"
+    "Y2hhaW4iKSkKICAgIHJldHVybiByZXMKCgpkZWYgYWNjZXB0KGhlYWRlcnNfb3JfdG9rZW4sIGF1ZGllbmNlLCBhY3Rpb249Tm9u"
+    "ZSwgcGFyYW1zPU5vbmUpOgogICAgIiIiQ2hlY2sgdGhlbiByZWRlZW0uIFJldHVybnMgdGhlIHBhc3Nwb3J0IGJvZHkuIFJhaXNl"
+    "cyBQYXNzcG9ydFJlamVjdGVkLiIiIgogICAgdG9rZW4gPSBoZWFkZXJzX29yX3Rva2VuCiAgICBpZiBub3QgaXNpbnN0YW5jZSh0"
+    "b2tlbiwgc3RyKToKICAgICAgICBnZXQgPSBnZXRhdHRyKGhlYWRlcnNfb3JfdG9rZW4sICJnZXQiLCBOb25lKQogICAgICAgIHRv"
+    "a2VuID0gKGdldChIRUFERVIpIG9yIGdldChIRUFERVIubG93ZXIoKSkgb3IgIiIpIGlmIGdldCBlbHNlICIiCiAgICBib2R5ID0g"
+    "Y2hlY2sodG9rZW4sIGF1ZGllbmNlLCBhY3Rpb24pCiAgICByZXMgPSByZWRlZW0odG9rZW4sIGF1ZGllbmNlLCBwYXJhbXMpCiAg"
+    "ICBib2R5WyJzZWFsZWRfaW5fY2hhaW4iXSA9IHJlcy5nZXQoInNlYWxlZF9pbl9jaGFpbiIpCiAgICBib2R5WyJibG9ja19pbmRl"
+    "eCJdID0gcmVzLmdldCgiYmxvY2tfaW5kZXgiKQogICAgcmV0dXJuIGJvZHkKCgppZiBfX25hbWVfXyA9PSAiX19tYWluX18iOgog"
+    "ICAgaWYgbGVuKHN5cy5hcmd2KSA8IDMgb3Igc3lzLmFyZ3ZbMV0gIT0gImNoZWNrIjoKICAgICAgICBwcmludCgidXNhZ2U6IHB5"
+    "dGhvbiBzZWJiaV9zaXRlLnB5IGNoZWNrIDx0b2tlbj4gW2F1ZGllbmNlXSIpCiAgICAgICAgc3lzLmV4aXQoMikKICAgIHRyeToK"
+    "ICAgICAgICBhdWQgPSBzeXMuYXJndlszXSBpZiBsZW4oc3lzLmFyZ3YpID4gMyBlbHNlIGpzb24ubG9hZHMoX2I2NGQoc3lzLmFy"
+    "Z3ZbMl0uc3BsaXQoIi4iKVsxXSkpWyJhdWQiXQogICAgICAgIHQwID0gdGltZS5wZXJmX2NvdW50ZXIoKQogICAgICAgIGJvZHkg"
+    "PSBjaGVjayhzeXMuYXJndlsyXSwgYXVkKQogICAgICAgIHByaW50KCJWQUxJRCAoJS4xZiBtcykgLSAlcyBhdCAlcywgZXhwaXJl"
+    "cyAlcyIgJSAoKHRpbWUucGVyZl9jb3VudGVyKCkgLSB0MCkgKiAxMDAwLAogICAgICAgICAgICAgIGJvZHlbImFjdCJdLCBib2R5"
+    "WyJhdWQiXSwgdGltZS5jdGltZShib2R5WyJleHAiXSkpKQogICAgZXhjZXB0IFBhc3Nwb3J0UmVqZWN0ZWQgYXMgZToKICAgICAg"
+    "ICBwcmludCgiUkVKRUNURUQgLSAlcyIgJSBlKQogICAgICAgIHN5cy5leGl0KDEpCg=="
+)
+
+
+def _d(b):
+    return base64.b64decode("".join(b.split()))
+
+
+_FILES = {
+    PAGE_PATH: (_d(_B64), "text/html; charset=utf-8", None),
+    PAGE_PATH + "/sebbi_agent.py": (_d(_AGENT_B64), "text/plain; charset=utf-8", "sebbi_agent.py"),
+    PAGE_PATH + "/sebbi_site.py": (_d(_SITE_B64), "text/plain; charset=utf-8", "sebbi_site.py"),
+}
+_patched = False
+
+
+def _find_handler_class(ctx):
+    if isinstance(ctx, dict):
+        for k in ("handler_class", "handler", "Handler", "h", "request_handler"):
+            v = ctx.get(k)
+            if v is None:
+                continue
+            cls = v if isinstance(v, type) else type(v)
+            if hasattr(cls, "do_GET"):
+                return cls
+    f = sys._getframe()
+    while f is not None:
+        s = f.f_locals.get("self")
+        if s is not None and hasattr(type(s), "do_GET") and hasattr(s, "wfile"):
+            return type(s)
+        f = f.f_back
+    return None
+
+
+def _install_page(ctx):
+    global _patched
+    if _patched:
+        return True
+    cls = _find_handler_class(ctx)
+    if cls is None:
+        return False
+    if getattr(cls, "_passportpage_patched", False):
+        _patched = True
+        return True
+
+    original_do_GET = cls.do_GET
+
+    def do_GET(self):
+        path = self.path.split("?")[0].split("#")[0].rstrip("/") or "/"
+        hit = _FILES.get(path)
+        if hit:
+            body, ctype, fname = hit
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            if fname:
+                self.send_header("Content-Disposition", 'inline; filename="%s"' % fname)
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        return original_do_GET(self)
+
+    cls.do_GET = do_GET
+    cls._passportpage_patched = True
+    _patched = True
+    return True
+
+
+def handle(method, action, data, api_key, ctx):
+    armed = _install_page(ctx)
+    return ({
+        "module": "passportpage",
+        "version": VERSION,
+        "serves": sorted(_FILES.keys()),
+        "armed": armed,
+        "bytes": {k: len(v[0]) for k, v in _FILES.items()},
+        "note": "Hit /x/passportpage/status once after each deploy to arm these pages.",
+    }, 200)
+
+
+PUBLIC = {("GET", "status"), ("GET", "spec")}
 
 ```
