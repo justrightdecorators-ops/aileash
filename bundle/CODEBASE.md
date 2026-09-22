@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-148 files across 38 parts.
+147 files across 38 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -253,7 +253,6 @@ Generated automatically on every push. Do not edit by hand.
 ## [CODEBASE-36.md](CODEBASE-36.md)
 
 - `sonicboom.html`
-- `telemetry-dashboard.html`
 
 ## [CODEBASE-37.md](CODEBASE-37.md)
 
