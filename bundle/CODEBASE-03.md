@@ -1,11 +1,1072 @@
-# Codebase — part 3 of 37
+# Codebase — part 3 of 38
 
 Contains:
+- `modules/bind.py`
+- `modules/binddesk.py`
 - `modules/blocks.py`
 - `modules/capture.py`
 - `modules/codebase.py`
-- `modules/complete.py`
-- `modules/conformance.py`
+
+
+## `modules/bind.py`
+
+733 lines, 35203 bytes
+
+```python
+#!/usr/bin/env python3
+"""modules/bind.py - the signed lane.
+
+A peer signs their own submission with a credential, so binding rests on
+possession of a secret rather than on a fetcher reaching a url.
+
+v1.2.0 - block indices now carry their chain epoch.
+
+A block_index on its own is not a reference. The chain restarted from
+genesis on 7 September 2026, and an index issued before that became wrong
+in the last day - not dangling, but resolving to a real, correctly-sealed
+block belonging to someone else, as the chain grew past it. A dangling
+pointer announces itself. A pointer that quietly lands on another party's
+record does not.
+
+So: every row this module writes from now on records the genesis hash of
+the chain it was sealed under, and every route publishing an index says
+which epoch it belongs to and whether that epoch is still current. Rows
+written before this version have no epoch recorded and cannot be given
+one retroactively - inventing it would be the same fault one step back -
+so they publish as epoch unknown with the index marked unresolvable
+against this chain. Raised by Ishaan (Shango MID), whose own rule is that
+a grant carries the epoch it was decided under and is refused when the
+epoch has moved.
+
+    POST /x/bind/issue      issue a credential for a name   (operator key)
+    POST /x/bind/claim      seal a dated claim marker       (operator key)
+    POST /x/bind/revoke     revoke a credential             (operator key)
+    POST /x/bind/submit     signed tip submission           (signature only)
+    GET  /x/bind/name       binding state and history       (public)
+    GET  /x/bind/conflicts  every contested name            (public)
+    GET  /x/bind/spec       how to sign, in full            (public)
+"""
+
+import hashlib
+import hmac
+import json
+import secrets
+import time
+from datetime import datetime, timezone
+
+VERSION = "1.2.0"
+
+PUBLIC = {("GET", "name"), ("GET", "conflicts"), ("GET", "spec")}
+
+SIG_PREFIX = b"AILEASH-BIND-v1:"
+CLOCK_SKEW = 300
+NONCE_KEEP = 3600
+
+RESET_DATE = "2026-09-07"
+
+SECRET_SCOPE = (
+    "A credential is a shared secret. Holding it proves the submitter had "
+    "the secret, and nothing more. This platform holds a copy, so it does "
+    "not exclude the operator. Anyone the secret has been shown to - a "
+    "screenshot, a paste into another tool, a colleague - holds it too, and "
+    "this lane cannot tell them apart. To exclude the operator, use the "
+    "Ed25519 lane at /x/signed/enroll, where the private half never leaves "
+    "the peer.")
+
+EPOCH_VOCABULARY = {
+    "what_an_epoch_is":
+        "The genesis hash of the chain a block index was issued under. An "
+        "index without it is not a reference: this chain restarted from "
+        "genesis on " + RESET_DATE + ", and an index from before that now "
+        "resolves to a real, correctly-sealed block belonging to someone "
+        "else. Published so a stale pointer is detectably stale rather "
+        "than quietly wrong.",
+    "current":
+        "Issued under the chain this deployment is serving now. The index "
+        "resolves to the block it was issued against.",
+    "retired":
+        "Issued under an earlier chain. The number may still resolve here, "
+        "but to a DIFFERENT block. Do not follow it.",
+    "unknown":
+        "Recorded before this module stored epochs, so the chain it was "
+        "issued under is not known. It cannot be resolved against this "
+        "chain and no epoch can be assigned to it after the fact.",
+}
+
+_ready = False
+_genesis_cache = {"hash": None, "blocks": 0}
+
+
+def _setup(ctx):
+    global _ready
+    if _ready:
+        return
+    with ctx["lock"]:
+        c = ctx["conn"]
+        c.execute("CREATE TABLE IF NOT EXISTS bind_credential("
+                  "key_id TEXT PRIMARY KEY,name TEXT NOT NULL,secret TEXT NOT NULL,"
+                  "issued_to TEXT,issued REAL,revoked REAL,revoke_reason TEXT,"
+                  "audit_hash TEXT,block_index INTEGER)")
+        c.execute("CREATE TABLE IF NOT EXISTS bind_claim("
+                  "id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,"
+                  "claimant TEXT,claimed_at REAL,note TEXT,"
+                  "audit_hash TEXT,block_index INTEGER)")
+        c.execute("CREATE TABLE IF NOT EXISTS bind_submission("
+                  "id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,"
+                  "tip TEXT,key_id TEXT,ts REAL,nonce TEXT,"
+                  "audit_hash TEXT,block_index INTEGER)")
+        c.execute("CREATE TABLE IF NOT EXISTS bind_nonce("
+                  "nonce TEXT PRIMARY KEY,ts REAL)")
+        c.execute("CREATE TABLE IF NOT EXISTS bind_seq("
+                  "name TEXT PRIMARY KEY,seq INTEGER DEFAULT 0)")
+        # v1.2.0. Added rather than backfilled: a row written before this
+        # version has no epoch and must not be given one now.
+        for table in ("bind_credential", "bind_claim", "bind_submission"):
+            try:
+                c.execute("ALTER TABLE %s ADD COLUMN chain_epoch TEXT" % table)
+            except Exception:
+                pass
+        c.execute("CREATE INDEX IF NOT EXISTS idx_bind_name ON bind_submission(name)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_bind_claim ON bind_claim(name)")
+        c.commit()
+    _ready = True
+
+
+def _genesis(ctx):
+    """The current chain's genesis hash, read from audit_log itself.
+
+    Cached against the block count so it costs one cheap query per change.
+    Returns None if it cannot be read, and a None epoch is recorded as
+    unknown rather than guessed.
+    """
+    try:
+        with ctx["lock"]:
+            row = ctx["conn"].execute(
+                "SELECT COUNT(*) FROM audit_log").fetchone()
+            blocks = int(row[0]) if row else 0
+            if _genesis_cache["hash"] and _genesis_cache["blocks"] == blocks:
+                return _genesis_cache["hash"]
+            g = ctx["conn"].execute(
+                "SELECT audit_hash FROM audit_log ORDER BY id ASC LIMIT 1"
+            ).fetchone()
+        h = g[0] if g else None
+        _genesis_cache["hash"] = h
+        _genesis_cache["blocks"] = blocks
+        return h
+    except Exception:
+        return None
+
+
+def _ref(ctx, block_index, stored_epoch):
+    """A block index published with the epoch it was issued under."""
+    current = _genesis(ctx)
+    if not stored_epoch:
+        state = "unknown"
+    elif current and stored_epoch == current:
+        state = "current"
+    else:
+        state = "retired"
+    out = {"block_index": block_index,
+           "chain_epoch": stored_epoch,
+           "epoch_state": state,
+           "current_chain_epoch": current,
+           "meaning": EPOCH_VOCABULARY[state]}
+    if state == "current":
+        out["resolve_at"] = ("https://sebbi.pro/x/walk/block?index=%s"
+                             % block_index)
+    else:
+        out["do_not_resolve"] = (
+            "This number may still return a block on this chain. It would "
+            "be a different block. Nothing here points at it.")
+    return out
+
+
+def _iso(ts):
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat() if ts else None
+
+
+def _canon(o):
+    return json.dumps(o, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _clean_name(n):
+    n = str(n or "").strip().lower()[:120]
+    return "".join(ch for ch in n if ch.isalnum() or ch in ".-_/:")
+
+
+def _sig(secret, name, tip, ts, nonce):
+    material = SIG_PREFIX + _canon({"name": name, "tip": tip,
+                                    "ts": int(ts), "nonce": nonce}).encode("utf-8")
+    return hmac.new(bytes.fromhex(secret), material, hashlib.sha256).hexdigest()
+
+
+def _latest_seq(ctx, name):
+    try:
+        with ctx["lock"]:
+            row = ctx["conn"].execute(
+                "SELECT seq FROM bind_seq WHERE name=?", (name,)).fetchone()
+        return int(row[0]) if row and row[0] is not None else 0
+    except Exception:
+        return 0
+
+
+def _issue(ctx, api_key, data):
+    name = _clean_name(data.get("name"))
+    if not name:
+        return {"error": "name_required"}, 400
+    to = str(data.get("issued_to", "")).strip()[:200] or None
+
+    with ctx["lock"]:
+        live = ctx["conn"].execute(
+            "SELECT key_id FROM bind_credential WHERE name=? AND revoked IS NULL",
+            (name,)).fetchone()
+    if live and not data.get("replace"):
+        return {"error": "credential_already_issued", "name": name,
+                "key_id": live[0],
+                "message": "A live credential exists for this name. Send "
+                           "replace true to revoke it and issue another, which "
+                           "is itself sealed."}, 409
+
+    secret = secrets.token_hex(32)
+    key_id = "bk_" + secrets.token_hex(8)
+    now = time.time()
+    epoch = _genesis(ctx)
+
+    ev = {"user_id": "bind:" + name[:40], "action": "credential_issued",
+          "amount": 0, "country": "UK", "device_id": "bind",
+          "anomaly": 0, "device_risk": 0}
+    res = {"decision": "CREDENTIAL_ISSUED", "score": 0, "bind_version": VERSION,
+           "name": name, "key_id": key_id, "issued_to": to,
+           "secret_sealed": False, "chain_epoch": epoch,
+           "detail": "name=%s;key_id=%s;issued_to=%s" % (name, key_id, to)}
+    h, idx, seq = ctx["seal"](ev, res, now, api_key)
+
+    with ctx["lock"]:
+        if live:
+            ctx["conn"].execute(
+                "UPDATE bind_credential SET revoked=?, revoke_reason=? "
+                "WHERE key_id=?", (now, "replaced by " + key_id, live[0]))
+        ctx["conn"].execute(
+            "INSERT INTO bind_credential(key_id,name,secret,issued_to,issued,"
+            "audit_hash,block_index,chain_epoch) VALUES(?,?,?,?,?,?,?,?)",
+            (key_id, name, secret, to, now, h, idx, epoch))
+        ctx["conn"].commit()
+
+    return {"name": name, "key_id": key_id, "secret": secret,
+            "issued_to": to, "issued_at": _iso(now),
+            "sealed_in_chain": h, "receipt_seq": seq,
+            "sealed_at": _ref(ctx, idx, epoch),
+            "current_submission_seq": _latest_seq(ctx, name),
+            "send_this_once": ("The secret is shown here and nowhere else. It "
+                               "is not sealed into the chain and cannot be "
+                               "recovered - if it is lost, revoke and reissue."),
+            "how_to_sign": "/x/bind/spec",
+            "what_it_proves": ("Possession of this secret. It does not prove "
+                               "domain ownership and this platform does not "
+                               "check that."),
+            "secret_scope": SECRET_SCOPE,
+            "note_on_sequence": ("current_submission_seq is where this name's "
+                                 "receipt numbering stands. Reissuing a "
+                                 "credential does not reset it - the sequence "
+                                 "belongs to the name's submission history, "
+                                 "not to the key."),
+            "replaced": live[0] if live else None}, 200
+
+
+def _claim(ctx, api_key, data):
+    name = _clean_name(data.get("name"))
+    claimant = str(data.get("claimant", "")).strip()[:200]
+    if not name or not claimant:
+        return {"error": "name_and_claimant_required"}, 400
+    note = str(data.get("note", "")).strip()[:500] or None
+    now = time.time()
+    epoch = _genesis(ctx)
+
+    ev = {"user_id": "bind:" + name[:40], "action": "name_claimed", "amount": 0,
+          "country": "UK", "device_id": "bind", "anomaly": 0, "device_risk": 0}
+    res = {"decision": "NAME_CLAIMED", "score": 0, "bind_version": VERSION,
+           "name": name, "claimant": claimant, "note": note,
+           "chain_epoch": epoch,
+           "detail": "name=%s;claimant=%s" % (name, claimant)}
+    h, idx, seq = ctx["seal"](ev, res, now, api_key)
+
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "INSERT INTO bind_claim(name,claimant,claimed_at,note,audit_hash,"
+            "block_index,chain_epoch) VALUES(?,?,?,?,?,?,?)",
+            (name, claimant, now, note, h, idx, epoch))
+        ctx["conn"].commit()
+
+    return {"name": name, "claimant": claimant, "claimed_at": _iso(now),
+            "sealed_in_chain": h, "receipt_seq": seq,
+            "sealed_at": _ref(ctx, idx, epoch),
+            "what_this_is": ("A dated marker, not a binding. Anyone can still "
+                             "submit under this name - but their block is "
+                             "provably later than this one, and the conflict "
+                             "is public."),
+            "what_this_is_not": ("Proof that the claimant owns the name, and "
+                                 "not a substitute for a credential.")}, 200
+
+
+def _revoke(ctx, api_key, data):
+    key_id = str(data.get("key_id", "")).strip()
+    if not key_id:
+        return {"error": "key_id_required"}, 400
+    reason = str(data.get("reason", "")).strip()[:300] or "not stated"
+    now = time.time()
+
+    with ctx["lock"]:
+        row = ctx["conn"].execute(
+            "SELECT name, revoked FROM bind_credential WHERE key_id=?",
+            (key_id,)).fetchone()
+    if not row:
+        return {"error": "unknown_key_id"}, 404
+    if row[1]:
+        return {"error": "already_revoked", "revoked_at": _iso(row[1])}, 409
+
+    epoch = _genesis(ctx)
+    ev = {"user_id": "bind:" + row[0][:40], "action": "credential_revoked",
+          "amount": 0, "country": "UK", "device_id": "bind", "anomaly": 0,
+          "device_risk": 1}
+    res = {"decision": "CREDENTIAL_REVOKED", "score": 0, "name": row[0],
+           "key_id": key_id, "reason": reason, "chain_epoch": epoch,
+           "detail": "key_id=%s;reason=%s" % (key_id, reason)}
+    h, idx, _ = ctx["seal"](ev, res, now, api_key)
+
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "UPDATE bind_credential SET revoked=?, revoke_reason=? WHERE key_id=?",
+            (now, reason, key_id))
+        ctx["conn"].commit()
+
+    return {"key_id": key_id, "name": row[0], "revoked_at": _iso(now),
+            "reason": reason, "sealed_in_chain": h,
+            "sealed_at": _ref(ctx, idx, epoch),
+            "note": "Submissions already bound stay bound. Revocation stops "
+                    "future ones and does not rewrite the past."}, 200
+
+
+def _submit(ctx, data):
+    name = _clean_name(data.get("name"))
+    tip = str(data.get("tip", "")).strip().lower()
+    key_id = str(data.get("key_id", "")).strip()
+    sig = str(data.get("signature", "")).strip().lower()
+    nonce = str(data.get("nonce", "")).strip()[:80]
+    try:
+        ts = int(data.get("ts", 0))
+    except (TypeError, ValueError):
+        ts = 0
+
+    missing = [k for k, v in (("name", name), ("tip", tip), ("key_id", key_id),
+                              ("signature", sig), ("nonce", nonce)) if not v]
+    if missing or not ts:
+        return {"error": "incomplete_submission",
+                "missing": missing + ([] if ts else ["ts"]),
+                "how_to_sign": "/x/bind/spec"}, 400
+    if len(tip) != 64:
+        return {"error": "tip_must_be_64_hex"}, 400
+
+    now = time.time()
+    if abs(now - ts) > CLOCK_SKEW:
+        return {"error": "timestamp_outside_window",
+                "your_ts": ts, "our_ts": int(now),
+                "window_seconds": CLOCK_SKEW,
+                "why": "a signature valid forever is a signature that can be "
+                       "replayed forever"}, 400
+
+    with ctx["lock"]:
+        cred = ctx["conn"].execute(
+            "SELECT secret, revoked, issued_to FROM bind_credential "
+            "WHERE key_id=? AND name=?", (key_id, name)).fetchone()
+        used = ctx["conn"].execute(
+            "SELECT 1 FROM bind_nonce WHERE nonce=?", (nonce,)).fetchone()
+
+    if not cred:
+        return {"error": "no_credential_for_that_name_and_key"}, 401
+    if cred[1]:
+        return {"error": "credential_revoked", "revoked_at": _iso(cred[1])}, 401
+    if used:
+        return {"error": "nonce_already_used",
+                "why": "each signature may be presented once"}, 409
+
+    expected = _sig(cred[0], name, tip, ts, nonce)
+    if not hmac.compare_digest(expected, sig):
+        return {"error": "signature_did_not_verify",
+                "check": "/x/bind/spec sets out the exact bytes signed"}, 401
+
+    epoch = _genesis(ctx)
+    ev = {"user_id": "bind:" + name[:40], "action": "signed_tip", "amount": 0,
+          "country": "UK", "device_id": "bind", "anomaly": 0, "device_risk": 0}
+    res = {"decision": "TIP_BOUND", "score": 0, "bind_version": VERSION,
+           "name": name, "tip": tip, "key_id": key_id, "binding": "signature",
+           "chain_epoch": epoch,
+           "detail": "name=%s;tip=%s;key_id=%s" % (name, tip, key_id)}
+
+    try:
+        h, idx, key_seq = ctx["seal"](ev, res, now, None)
+    except Exception as exc:
+        return {"ok": False, "bound": False, "error": "seal_failed",
+                "detail": "Your signature verified, but the audit chain did "
+                          "not seal the submission, so there is no receipt to "
+                          "give you. This is a fault on this deployment and "
+                          "not a problem with your submission.",
+                "seal_error": "%s: %s" % (type(exc).__name__, str(exc)[:300]),
+                "recorded": False,
+                "retry": "Nothing was written. Your nonce is unused and the "
+                         "identical submission can be resent once this is "
+                         "fixed.",
+                "name": name, "tip": tip}, 500
+    if not h:
+        return {"ok": False, "bound": False, "error": "seal_incomplete",
+                "detail": "The audit chain returned no hash, so nothing was "
+                          "sealed and no receipt exists. Fault on this "
+                          "deployment.",
+                "recorded": False, "name": name, "tip": tip}, 500
+
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "INSERT OR IGNORE INTO bind_seq(name,seq) VALUES(?,0)", (name,))
+        ctx["conn"].execute(
+            "UPDATE bind_seq SET seq = COALESCE(seq,0) + 1 WHERE name=?", (name,))
+        srow = ctx["conn"].execute(
+            "SELECT seq FROM bind_seq WHERE name=?", (name,)).fetchone()
+        receipt_seq = int(srow[0]) if srow and srow[0] is not None else None
+
+        ctx["conn"].execute(
+            "INSERT INTO bind_submission(name,tip,key_id,ts,nonce,audit_hash,"
+            "block_index,chain_epoch) VALUES(?,?,?,?,?,?,?,?)",
+            (name, tip, key_id, now, nonce, h, idx, epoch))
+        ctx["conn"].execute("INSERT OR IGNORE INTO bind_nonce(nonce,ts) "
+                            "VALUES(?,?)", (nonce, now))
+        ctx["conn"].execute("DELETE FROM bind_nonce WHERE ts < ?",
+                            (now - NONCE_KEEP,))
+        ctx["conn"].commit()
+
+    return {"bound": True, "name": name, "tip": tip, "key_id": key_id,
+            "sealed_in_chain": h,
+            "sealed_at": _ref(ctx, idx, epoch),
+            "receipt_seq": receipt_seq,
+            "receipt_seq_scope": "per-name",
+            "key_seq": key_seq,
+            "binding": "signature",
+            "gapless": ("receipt_seq increments by exactly one for each "
+                        "accepted submission under this name. Two receipts "
+                        "numbered N and N+2 prove a third exists and you did "
+                        "not receive it. The current highest is published at "
+                        "/x/bind/name?name=" + name + " so the check does not "
+                        "depend on asking us."),
+            "key_seq_note": ("The server-wide per-API-key sequence, null on "
+                             "this lane and always will be. That counter lives "
+                             "on an api_key and this lane authenticates by "
+                             "signature with no key to count against. Returned "
+                             "rather than omitted so the absence is visible "
+                             "instead of inferred."),
+            "what_this_proves": ("that a holder of the credential issued for "
+                                 "this name submitted this tip, and that the "
+                                 "submission has not been altered since it was "
+                                 "signed"),
+            "what_this_does_not_prove": ("which holder. The secret is shared, "
+                                         "so this does not exclude the "
+                                         "operator or anyone else it has been "
+                                         "disclosed to. It also does not prove "
+                                         "domain ownership, or that anything "
+                                         "in their chain is true"),
+            "secret_scope": SECRET_SCOPE,
+            "check_it": "/x/bind/name?name=" + name}, 200
+
+
+def _name(ctx, data):
+    name = _clean_name(data.get("name"))
+    if not name:
+        return {"error": "name_required"}, 400
+
+    with ctx["lock"]:
+        cred = ctx["conn"].execute(
+            "SELECT key_id, issued, revoked, issued_to, block_index, "
+            "chain_epoch FROM bind_credential WHERE name=? ORDER BY issued DESC",
+            (name,)).fetchall()
+        claims = ctx["conn"].execute(
+            "SELECT claimant, claimed_at, note, block_index, chain_epoch "
+            "FROM bind_claim WHERE name=? ORDER BY claimed_at ASC",
+            (name,)).fetchall()
+        subs = ctx["conn"].execute(
+            "SELECT tip, key_id, ts, block_index, chain_epoch "
+            "FROM bind_submission WHERE name=? ORDER BY ts DESC LIMIT 20",
+            (name,)).fetchall()
+
+    live = [c for c in cred if not c[2]]
+    state = ("bound" if live else
+             "claimed" if claims else
+             "unbound")
+
+    out = {
+        "name": name,
+        "state": state,
+        "lane": "signed (credential). The open lane records a separate "
+                "address-level binding, published per entry on "
+                "/x/roster/list. The two answer different questions and can "
+                "differ without either being wrong.",
+        "latest_receipt_seq": _latest_seq(ctx, name),
+        "credential": ({"key_id": live[0][0], "issued_at": _iso(live[0][1]),
+                        "issued_to": live[0][3],
+                        "sealed_at": _ref(ctx, live[0][4], live[0][5])}
+                       if live else None),
+        "claims": [{"claimant": c[0], "claimed_at": _iso(c[1]), "note": c[2],
+                    "sealed_at": _ref(ctx, c[3], c[4])} for c in claims],
+        "signed_submissions": [{"tip": s[0], "key_id": s[1], "at": _iso(s[2]),
+                                "sealed_at": _ref(ctx, s[3], s[4])}
+                               for s in subs],
+        "revoked_credentials": [{"key_id": c[0], "revoked_at": _iso(c[2]),
+                                 "sealed_at": _ref(ctx, c[4], c[5])}
+                                for c in cred if c[2]],
+        "chain_epoch": EPOCH_VOCABULARY,
+    }
+    out["receipt_seq_note"] = (
+        "latest_receipt_seq is the highest receipt number issued under this "
+        "name. A holder whose own highest receipt is lower than this has not "
+        "received one of them, and can say exactly how many. Public on "
+        "purpose - a gap you can only see from the inside is not evidence of "
+        "anything.")
+    if state == "bound":
+        out["meaning"] = ("A live credential exists for this name, and every "
+                          "submission under it carries a signature made with "
+                          "that credential. A submission establishes that "
+                          "SOMEONE holding the secret sent it - not which "
+                          "holder, and not that the holder is the party the "
+                          "name names.")
+        out["secret_scope"] = SECRET_SCOPE
+    elif state == "claimed":
+        out["meaning"] = ("Claimed but not bound. The dated claim above is in "
+                          "the chain, so a competing submission would be "
+                          "provably later - but nothing prevents one being "
+                          "made. Issue a credential to close that.")
+        out["flag"] = "claimable"
+    else:
+        out["meaning"] = ("Nobody holds a credential for this name and nobody "
+                          "has claimed it. It is claimable by anyone.")
+        out["flag"] = "claimable"
+    out["what_binding_never_proves"] = (
+        "domain ownership. A credential is a shared secret; it makes a name "
+        "unstealable by a third party on this network, not a claim honest, "
+        "and not unsubmittable by the operator.")
+    return out, 200
+
+
+def _conflicts(ctx):
+    with ctx["lock"]:
+        rows = ctx["conn"].execute(
+            "SELECT name, COUNT(DISTINCT claimant) FROM bind_claim "
+            "GROUP BY name HAVING COUNT(DISTINCT claimant) > 1").fetchall()
+        keys = ctx["conn"].execute(
+            "SELECT name, COUNT(DISTINCT key_id) FROM bind_credential "
+            "WHERE revoked IS NULL GROUP BY name "
+            "HAVING COUNT(DISTINCT key_id) > 1").fetchall()
+    return {"contested_claims": [{"name": r[0], "claimants": r[1]} for r in rows],
+            "names_with_multiple_live_credentials":
+                [{"name": k[0], "credentials": k[1]} for k in keys],
+            "note": ("A conflict is recorded, not arbitrated. This platform "
+                     "does not decide who owns a name and should not.")}, 200
+
+
+def _spec(ctx):
+    return {
+        "bind_version": VERSION,
+        "why_it_exists": ("Name binding used to depend on a fetcher reaching a "
+                          "URL and parsing JSON. A reachable page serving HTML "
+                          "did not bind, an unbound name was claimable by "
+                          "anyone, and the failure text asserted the URL was "
+                          "unreachable when the check had only established the "
+                          "response was not JSON. This lane removes the fetcher "
+                          "from the trust path."),
+        "signing": {
+            "material": "AILEASH-BIND-v1: || canonical JSON of "
+                        "{name, tip, ts, nonce}, keys sorted, separators "
+                        "(',',':'), UTF-8",
+            "algorithm": "HMAC-SHA256, secret as raw bytes from the hex issued",
+            "signature": "lower-case hex digest",
+            "ts": "unix seconds, must be within %d seconds of ours" % CLOCK_SKEW,
+            "nonce": "any string, once only, remembered for %d seconds"
+                     % NONCE_KEEP,
+        },
+        "worked_example": {
+            "1": "material = b'AILEASH-BIND-v1:' + "
+                 '\'{"name":"example.com","nonce":"abc123",'
+                 '"tip":"<64 hex>","ts":1787000000}\'.encode()',
+            "2": "signature = hmac.new(bytes.fromhex(secret), material, "
+                 "hashlib.sha256).hexdigest()",
+            "3": "POST /x/bind/submit with name, tip, ts, nonce, key_id, signature",
+            "note": "the JSON in step 1 has its keys sorted, which is why "
+                    "nonce appears before tip",
+        },
+        "secret_scope": SECRET_SCOPE,
+        "block_indices": dict(
+            EPOCH_VOCABULARY,
+            current_chain_epoch=_genesis(ctx),
+            shape="Every index is published as an object - block_index, "
+                  "chain_epoch, epoch_state, current_chain_epoch - never as "
+                  "a bare number. A bare number cannot be checked for "
+                  "staleness by whoever receives it.",
+            rows_before_1_2_0="Recorded without an epoch and published as "
+                              "unknown. No epoch is assigned to them now: "
+                              "guessing one would be the same fault the "
+                              "field exists to prevent.",
+        ),
+        "on_acceptance": {
+            "receipt_seq": ("An integer, never null, incremented by exactly "
+                            "one for each accepted submission UNDER THIS NAME "
+                            "on this lane. Issued inside the same lock that "
+                            "writes the record. Two receipts numbered N and "
+                            "N+2 prove a third exists that you did not "
+                            "receive. The current highest is published at "
+                            "/x/bind/name."),
+            "receipt_seq_scope": {
+                "values": ["per-peer", "per-name", "per-chain"],
+                "per-peer": "issued per registered peer_id. /x/peer/submit.",
+                "per-name": "issued per bound name. /x/bind/submit.",
+                "per-chain": "issued per enrolled chain name. /x/signed/submit.",
+                "why_it_is_here": "The three signed lanes each count within "
+                                  "their own scope, so a receipt carries the "
+                                  "scope of its own sequence. The set is "
+                                  "closed: a value outside this list is an "
+                                  "error on our side.",
+                "not_comparable_across_scopes": "Two receipts with different "
+                                                "scopes are counting different "
+                                                "things.",
+            },
+            "sealed_at": ("Where the submission landed in the chain, as an "
+                          "epoch-qualified reference rather than a bare "
+                          "index. See block_indices."),
+            "key_seq": ("The server-wide per-API-key sequence, null on this "
+                        "lane and always will be. That counter lives on an "
+                        "api_key and this lane authenticates by signature "
+                        "with no key to count against. Returned rather than "
+                        "omitted so the absence is visible."),
+            "sequence_survives_rotation": ("Reissuing or revoking a credential "
+                                           "does not reset the sequence, so a "
+                                           "rotation cannot be used to erase a "
+                                           "gap."),
+            "seal_failure": ("If the audit chain does not seal your "
+                             "submission, you get 500 seal_failed and nothing "
+                             "is recorded - no nonce, no sequence number, no "
+                             "receipt. Resend the identical submission once "
+                             "the fault is fixed."),
+        },
+        "what_a_signed_binding_proves": (
+            "that a holder of the credential issued for that name submitted, "
+            "and that the submission is unaltered since signing"),
+        "what_it_does_not_prove": [
+            "which holder. The secret is shared, so this does not exclude the "
+            "operator or anyone it has been disclosed to.",
+            "domain ownership - not checked, not implied",
+            "that the submitter is who the name suggests",
+            "that anything in their chain is true",
+        ],
+        "claims": ("A name with no credential can be given a dated claim "
+                   "marker. That is not a binding. It means a later competing "
+                   "submission is provably second and the conflict is public."),
+        "conflicts": ("Recorded at /x/bind/conflicts and never arbitrated here. "
+                      "A network that lets its operator decide who owns a name "
+                      "has replaced one trusted party with another."),
+        "honest_limits": [
+            "A credential is a shared secret. This platform holds a copy, so "
+            "in principle it could sign on a peer's behalf - which is why the "
+            "public-key lane at /x/signed/enroll is the right end state and "
+            "this is the interim.",
+            "A secret that has been screenshotted, pasted into another tool or "
+            "shown to a colleague is held by more parties than two, and this "
+            "lane cannot tell them apart. Revoke and reissue, or move to the "
+            "key lane.",
+            "Revoking a credential stops future submissions and does not "
+            "unbind past ones.",
+            "An index recorded before 1.2.0 cannot be resolved against this "
+            "chain and will never be resolvable. The epoch it was issued "
+            "under was not recorded and cannot honestly be reconstructed.",
+            "Nothing here checks DNS, TLS or WHOIS.",
+            "receipt_seq proves you are missing a receipt. It does not prove "
+            "why, and cannot distinguish a lost response from one never sent.",
+        ],
+        "changed_in_1_2_0": [
+            "Block indices now travel with the genesis hash of the chain "
+            "they were issued under, and every route publishing one reports "
+            "whether that epoch is current, retired or unknown. Before this, "
+            "an index issued under the pre-7-September chain was published "
+            "as a bare number; once the chain grew past it, it resolved to a "
+            "real, correctly-sealed block belonging to a different party. A "
+            "dangling pointer is visibly broken - a pointer that resolves to "
+            "someone else's record is not. Raised by Ishaan (Shango MID).",
+            "Rows written before this version have no epoch and publish as "
+            "unknown, marked unresolvable against this chain. They are not "
+            "backfilled.",
+            "The sealing path is unchanged except that chain_epoch now "
+            "appears in the sealed result of new blocks.",
+        ],
+        "changed_in_1_1_2": [
+            "The bound-state text no longer says only the holder can submit. "
+            "SECRET_SCOPE appears wherever a secret is issued, used or "
+            "reported. Raised by Ishaan (Shango MID).",
+        ],
+        "changed_in_1_1_1": [
+            "receipt_seq_scope is a bare token from a closed set. Asked for "
+            "by Philip Pinol (PRAXIS).",
+        ],
+        "changed_in_1_1": [
+            "receipt_seq is a real per-name gapless sequence issued by this "
+            "module, not the api_key counter that was always null here.",
+            "A failed seal returns 500 and records nothing.",
+        ],
+    }, 200
+
+
+def handle(method, action, data, api_key, ctx):
+    _setup(ctx)
+    action = (action or "").strip("/").lower()
+    data = data or {}
+
+    if method == "GET":
+        if action == "spec":
+            return _spec(ctx)
+        if action == "name":
+            return _name(ctx, data)
+        if action == "conflicts":
+            return _conflicts(ctx)
+
+    if method == "POST":
+        if action == "submit":
+            return _submit(ctx, data)
+        if not api_key:
+            return {"error": "invalid_api_key"}, 401
+        if action == "issue":
+            return _issue(ctx, api_key, data)
+        if action == "claim":
+            return _claim(ctx, api_key, data)
+        if action == "revoke":
+            return _revoke(ctx, api_key, data)
+
+    return {"error": "unknown_action", "action": action,
+            "GET": ["spec", "name", "conflicts"],
+            "POST": ["issue", "claim", "revoke", "submit"]}, 404
+
+```
+
+
+## `modules/binddesk.py`
+
+312 lines, 13381 bytes
+
+```python
+#!/usr/bin/env python3
+"""
+modules/binddesk.py  -  buttons for the signed lane
+
+modules/bind.py is the engine. It answers POST requests with a key, which is
+correct and completely unusable from a phone: a browser address bar can only
+send GET, and nothing in it can attach an Authorization header.
+
+So this is the page. Paste the key once, tap a button. Same routes underneath,
+nothing new in the trust path.
+
+Served at /bind-desk by the same runtime do_GET patch console.py uses. The
+page holds nothing - the key is typed in, kept in the tab, and sent on each
+request. Every route it calls checks that key itself.
+
+PUBLIC is empty. Nothing here is reachable without a key except the page
+itself, and the page is inert until one is pasted into it.
+"""
+
+import sys
+
+VERSION = "1.1"
+
+# ("GET", "status") is public on purpose. The page is installed by a runtime
+# patch that only runs once this module is touched, and every other route here
+# needs a key - which locked the operator out of their own page, because a
+# browser cannot send an Authorization header. The status route reveals only
+# that the desk exists and where the page is.
+PUBLIC = {("GET", "status")}
+
+PAGE_PATHS = ("/bind-desk", "/bind-desk.html", "/binddesk")
+_patched = [False]
+
+
+PAGE = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Bind desk</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0a0f1e;color:#e8ecf5;font-family:ui-monospace,Menlo,monospace;
+ font-size:14px;line-height:1.55;padding:0 0 80px}
+.w{max-width:620px;margin:0 auto;padding:22px 16px}
+h1{font-size:23px;font-weight:600;letter-spacing:-.01em;margin-bottom:4px}
+.sub{color:#6b7894;font-size:12.5px;margin-bottom:22px}
+h2{font-size:12px;letter-spacing:.18em;text-transform:uppercase;color:#c9a84c;
+ margin:0 0 12px}
+label{display:block;font-size:10px;letter-spacing:.16em;text-transform:uppercase;
+ color:#6b7894;margin:12px 0 6px}
+input{width:100%;background:#131b2e;border:1px solid #223052;color:#e8ecf5;
+ font-family:inherit;font-size:14px;padding:12px;border-radius:4px;outline:none}
+input:focus{border-color:#c9a84c}
+button{width:100%;background:#c9a84c;color:#0a0f1e;border:0;border-radius:4px;
+ padding:14px;font-family:inherit;font-weight:700;font-size:14px;margin-top:12px;
+ cursor:pointer}
+button:active{opacity:.8}
+button.q{background:transparent;color:#8f98ad;border:1px solid #223052;font-weight:400}
+button.danger{background:transparent;color:#ff8a80;border:1px solid #4a2422;font-weight:400}
+.card{background:#131b2e;border:1px solid #223052;border-radius:7px;
+ padding:18px;margin:16px 0}
+.note{color:#6b7894;font-size:11.5px;line-height:1.6;margin-top:10px}
+.out{margin-top:12px;font-size:12px;white-space:pre-wrap;word-break:break-all;
+ background:#080c16;border:1px solid #223052;border-radius:4px;padding:12px;
+ max-height:320px;overflow:auto}
+.ok{color:#7fe3b0}.bad{color:#ff8a80}.warn{color:#c9a84c}
+.secret{background:#0f1c15;border:1px solid #2c5c44;border-radius:5px;
+ padding:14px;margin-top:12px}
+.secret .lbl{font-size:10px;letter-spacing:.16em;text-transform:uppercase;
+ color:#7fe3b0;margin-bottom:6px}
+.secret .val{font-size:13px;color:#7fe3b0;word-break:break-all;line-height:1.8}
+.secret .warnline{color:#c9a84c;font-size:11.5px;margin-top:10px;line-height:1.6}
+.step{display:inline-block;background:#223052;color:#8f98ad;border-radius:3px;
+ padding:2px 8px;font-size:11px;margin-bottom:10px}
+</style></head><body><div class="w">
+
+<h1>Bind desk</h1>
+<p class="sub">Names on the witness network. Your key stays in this tab.</p>
+
+<div class="card">
+  <label for="k">Your API key</label>
+  <input id="k" type="password" placeholder="paste it here" autocomplete="off">
+  <p class="note">Typed once, used by every button below. Nothing is stored.</p>
+</div>
+
+<div class="card">
+  <span class="step">STEP 1</span>
+  <h2>Claim a name</h2>
+  <p class="note" style="margin-top:0;margin-bottom:4px">Puts a dated marker in
+  the chain. Does not stop anyone else submitting — but theirs is provably
+  later. Do this first if the name is exposed.</p>
+  <label for="cn">Name</label>
+  <input id="cn" placeholder="shango.in" autocapitalize="off" autocorrect="off">
+  <label for="cc">Who is claiming it</label>
+  <input id="cc" placeholder="Ishaan">
+  <label for="cnote">Note (optional)</label>
+  <input id="cnote" placeholder="pending credential">
+  <button onclick="doClaim()">Seal the claim</button>
+  <div id="o-claim"></div>
+</div>
+
+<div class="card">
+  <span class="step">STEP 2</span>
+  <h2>Issue a credential</h2>
+  <p class="note" style="margin-top:0;margin-bottom:4px">This is the real fix.
+  Once issued, only the holder of the secret can submit under that name.</p>
+  <label for="in">Name</label>
+  <input id="in" placeholder="shango.in" autocapitalize="off" autocorrect="off">
+  <label for="ito">Issued to</label>
+  <input id="ito" placeholder="Ishaan">
+  <button onclick="doIssue(false)">Issue it</button>
+  <button class="q" onclick="doIssue(true)">Replace the existing one</button>
+  <div id="o-issue"></div>
+</div>
+
+<div class="card">
+  <h2>Check a name</h2>
+  <label for="qn">Name</label>
+  <input id="qn" placeholder="shango.in" autocapitalize="off" autocorrect="off">
+  <button class="q" onclick="doLook()">Look it up</button>
+  <button class="q" onclick="doConflicts()">Show every contested name</button>
+  <div id="o-look"></div>
+</div>
+
+<div class="card">
+  <h2>Revoke a credential</h2>
+  <label for="rk">Key id</label>
+  <input id="rk" placeholder="bk_..." autocapitalize="off" autocorrect="off">
+  <label for="rr">Reason</label>
+  <input id="rr" placeholder="rotating">
+  <button class="danger" onclick="doRevoke()">Revoke</button>
+  <p class="note">Stops future submissions. Anything already bound stays bound.</p>
+  <div id="o-revoke"></div>
+</div>
+
+</div>
+<script>
+var $=function(i){return document.getElementById(i)};
+function key(){var k=$('k').value.trim();return k||null}
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){
+  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
+function show(id,cls,txt){$(id).innerHTML='<div class="out '+cls+'">'+esc(txt)+'</div>'}
+function shown(id,html){$(id).innerHTML=html}
+
+async function call(path,method,body){
+  var k=key();
+  if(!k){return {status:0,data:{error:'paste your key at the top first'}}}
+  var o={method:method,headers:{'Authorization':'Bearer '+k}};
+  if(body){o.headers['Content-Type']='application/json';o.body=JSON.stringify(body)}
+  try{
+    var r=await fetch(path,o);
+    var d; try{d=await r.json()}catch(e){d={error:'unreadable response'}}
+    return {status:r.status,data:d};
+  }catch(e){return {status:0,data:{error:'could not reach the server'}}}
+}
+
+async function doClaim(){
+  var n=$('cn').value.trim(), c=$('cc').value.trim();
+  if(!n||!c){show('o-claim','bad','Fill in the name and who is claiming it.');return}
+  show('o-claim','','Sealing...');
+  var r=await call('/x/bind/claim','POST',{name:n,claimant:c,note:$('cnote').value.trim()});
+  if(r.status!==200){show('o-claim','bad',r.data.error||JSON.stringify(r.data,null,1));return}
+  show('o-claim','ok','CLAIMED\\n\\nname     '+r.data.name
+    +'\\nclaimant '+r.data.claimant
+    +'\\nsealed   '+r.data.sealed_in_chain
+    +'\\nblock    '+r.data.block_index
+    +'\\n\\nThis is a dated marker, not a binding. Do step 2.');
+}
+
+async function doIssue(replace){
+  var n=$('in').value.trim(), t=$('ito').value.trim();
+  if(!n){show('o-issue','bad','Enter the name.');return}
+  show('o-issue','','Issuing...');
+  var r=await call('/x/bind/issue','POST',{name:n,issued_to:t,replace:!!replace});
+  if(r.status===409){
+    show('o-issue','warn','A credential already exists for '+n
+      +'.\\n\\nUse "Replace the existing one" if you mean to revoke it and issue another.');
+    return;
+  }
+  if(r.status!==200){show('o-issue','bad',r.data.error||JSON.stringify(r.data,null,1));return}
+  shown('o-issue','<div class="secret">'
+    +'<div class="lbl">send both of these to them privately</div>'
+    +'<div class="val">key_id&nbsp;&nbsp;'+esc(r.data.key_id)+'</div>'
+    +'<div class="val">secret&nbsp;&nbsp;'+esc(r.data.secret)+'</div>'
+    +'<div class="warnline">The secret is shown here once and is not stored '
+    +'anywhere. Copy it now. If it is lost you have to revoke and reissue.</div>'
+    +'<div class="warnline">Do not send it over LinkedIn or anywhere public.</div>'
+    +'</div>'
+    +'<div class="out ok">sealed  '+esc(r.data.sealed_in_chain)
+    +'\\nblock   '+esc(r.data.block_index)+'</div>');
+}
+
+async function doLook(){
+  var n=$('qn').value.trim();
+  if(!n){show('o-look','bad','Enter a name.');return}
+  show('o-look','','Looking...');
+  var r=await call('/x/bind/name?name='+encodeURIComponent(n),'GET');
+  if(r.status!==200){show('o-look','bad',r.data.error||'not found');return}
+  var d=r.data;
+  var cls = d.state==='bound' ? 'ok' : 'warn';
+  var t='STATE   '+d.state.toUpperCase()+'\\n\\n'+d.meaning+'\\n';
+  if(d.credential){t+='\\nkey_id     '+d.credential.key_id
+    +'\\nissued to  '+(d.credential.issued_to||'-')
+    +'\\nissued at  '+d.credential.issued_at;}
+  if(d.claims&&d.claims.length){t+='\\n\\nCLAIMS';
+    d.claims.forEach(function(c){t+='\\n  '+c.claimant+'  '+c.claimed_at
+      +'  block '+c.block_index;});}
+  if(d.signed_submissions&&d.signed_submissions.length){
+    t+='\\n\\nSIGNED SUBMISSIONS  '+d.signed_submissions.length;
+    d.signed_submissions.slice(0,5).forEach(function(s){
+      t+='\\n  '+s.at+'  block '+s.block_index;});}
+  show('o-look',cls,t);
+}
+
+async function doConflicts(){
+  show('o-look','','Checking...');
+  var r=await call('/x/bind/conflicts','GET');
+  if(r.status!==200){show('o-look','bad',r.data.error||'failed');return}
+  var d=r.data, t='';
+  if(!d.contested_claims.length && !d.names_with_multiple_live_credentials.length){
+    t='No contested names.';
+  } else {
+    d.contested_claims.forEach(function(c){t+='CONTESTED  '+c.name+'  ('+c.claimants+' claimants)\\n'});
+    d.names_with_multiple_live_credentials.forEach(function(c){
+      t+='MULTIPLE CREDENTIALS  '+c.name+'  ('+c.credentials+')\\n'});
+  }
+  show('o-look', t==='No contested names.'?'ok':'warn', t+'\\n\\n'+d.note);
+}
+
+async function doRevoke(){
+  var k=$('rk').value.trim();
+  if(!k){show('o-revoke','bad','Enter the key id.');return}
+  show('o-revoke','','Revoking...');
+  var r=await call('/x/bind/revoke','POST',{key_id:k,reason:$('rr').value.trim()});
+  if(r.status!==200){show('o-revoke','bad',r.data.error||JSON.stringify(r.data,null,1));return}
+  show('o-revoke','ok','REVOKED\\n\\nname    '+r.data.name
+    +'\\nkey_id  '+r.data.key_id
+    +'\\nsealed  '+r.data.sealed_in_chain
+    +'\\n\\n'+r.data.note);
+}
+</script></body></html>"""
+
+
+def _install():
+    if _patched[0]:
+        return "already installed"
+    m = sys.modules.get("__main__")
+    srv = m if (m is not None and hasattr(m, "get_bearer")) else sys.modules.get("server")
+    if srv is None:
+        return "no server"
+    H = getattr(srv, "Handler", None)
+    if H is None or not hasattr(H, "do_GET"):
+        return "no handler"
+    if getattr(H, "_binddesk_patched", False):
+        _patched[0] = True
+        return "already installed"
+
+    original = H.do_GET
+
+    def do_GET(self):
+        try:
+            from urllib.parse import urlparse
+            p = urlparse(self.path).path.rstrip("/") or "/"
+        except Exception:
+            p = self.path or "/"
+        if p in PAGE_PATHS:
+            body = PAGE.encode("utf-8")
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Robots-Tag", "noindex, nofollow")
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception:
+                pass
+            return
+        return original(self)
+
+    H.do_GET = do_GET
+    H._binddesk_patched = True
+    _patched[0] = True
+    print("BINDDESK: /bind-desk installed", flush=True)
+    return "installed"
+
+
+def handle(method, action, data, api_key, ctx):
+    state = _install()
+    action = (action or "").strip("/").lower()
+
+    if method == "GET" and action in ("", "status"):
+        return {"binddesk_version": VERSION,
+                "installed": bool(_patched[0]),
+                "install_result": state,
+                "page": "/bind-desk",
+                "engine": "/x/bind/spec",
+                "what_it_does": ("Buttons for the signed lane. Claim a name, "
+                                 "issue a credential, look one up, revoke one. "
+                                 "The page sends the same POST requests the "
+                                 "engine already accepts."),
+                "note": "The page is not public in any useful sense - it is "
+                        "inert until a key is pasted into it, and every route "
+                        "it calls checks that key."}, 200
+
+    if not api_key:
+        return {"error": "invalid_api_key",
+                "note": "Use the page at /bind-desk."}, 401
+
+    return {"error": "unknown_action", "GET": ["status"]}, 404
+
+```
 
 
 ## `modules/blocks.py`
@@ -1299,1221 +2360,5 @@ def handle(method, action, data, api_key, ctx):
     return {"error": "unknown_action", "action": action,
             "GET": ["spec", "history", "root", "manifest (keyed)"],
             "POST": ["seal (keyed)"]}, 404
-
-```
-
-
-## `modules/complete.py`
-
-862 lines, 37023 bytes
-
-```python
-#!/usr/bin/env python3
-"""
-modules/complete.py  -  proving what ISN'T there
-================================================
-
-THE PROBLEM NOBODY IN THIS MARKET ANSWERS
------------------------------------------
-A hash chain proves inclusion. It cannot prove exclusion.
-
-So when a firm hands an auditor four hundred decisions, nothing on earth
-shows it wasn't six hundred. Every audit ever conducted runs on the
-assumption that the sample handed over is the whole set, and that
-assumption has never once been provable. The chain says "these four
-hundred happened". It says nothing about the two hundred that also
-happened and quietly didn't make the export.
-
-Three questions follow, and none of them can be answered by an
-append-only log on its own:
-
-  1. Is this the complete set, or the flattering subset?
-  2. Do you hold a record about me? Prove the NO.
-  3. You erased my data - prove it, without holding my data to prove it.
-
-Question 3 is the contradiction sitting inside every
-blockchain-for-compliance product, this one included. Append-only and
-right-to-erasure do not obviously coexist. Most vendors disclaim it.
-
-WHAT THIS DOES
---------------
-At the end of each period we take every leaf sealed in that period, SORT
-them, build a Merkle tree over the sorted list, and seal the root plus the
-exact count into the chain. That root is then anchored externally like
-everything else.
-
-Sorting is the whole trick. In an unsorted tree you can only prove a leaf
-is present. In a sorted one you can prove a leaf is absent, by showing the
-two leaves either side of where it would have sorted and proving they are
-ADJACENT in the tree. Nothing can sit between two adjacent leaves. The
-record provably does not exist.
-
-  INCLUSION     standard Merkle path. This receipt is in the period.
-  ABSENCE       the two neighbours, and proof they are adjacent. No record
-                for that key exists in the period, and we cannot pretend
-                otherwise after the fact.
-  COMPLETENESS  the count was sealed BEFORE anyone asked for anything.
-                Hand over four hundred against a root that says six
-                hundred and the arithmetic exposes it.
-
-ERASURE
--------
-Erasing a record deletes the payload and leaves the leaf as a tombstone.
-We can then prove: a record existed, it was erased, and when - while
-holding none of the erased content. The subject gets a proof of erasure
-rather than a promise of one, and the chain does not have to be broken to
-give it to them.
-
-WHY COMMITMENTS ARE FROZEN
---------------------------
-A commitment is only worth anything if it cannot be recomputed to suit
-later circumstances. So:
-
-  - Only CLOSED periods can be committed. You cannot commit a period that
-    is still running, because more leaves could still arrive.
-  - The sorted leaf list is STORED at commit time, not recomputed on
-    demand. If rows are erased next year, the proofs from this year still
-    verify against the root that was sealed and anchored this year.
-  - A period can only be committed once. A second attempt returns the
-    existing commitment rather than a new root.
-
-WHY COMMITTING IS AUTOMATIC
----------------------------
-It was not, and that was a real hole rather than an oversight worth
-defending. Committing was a keyed POST somebody had to remember to make,
-which meant that for the first week of publication this module had zero
-committed periods while the discovery document advertised completeness and
-absence as publicly demonstrable checks. Both were true claims about code
-that existed and false claims about anything an outsider could run.
-
-A control that depends on the operator remembering to run it is the exact
-control an auditor should distrust, so the schedule now runs itself. Once
-a month closes, the first request to reach this module commits it.
-
-Two honest limits on that:
-
-  - The automatic commitment is DEPLOYMENT-WIDE. It covers every record
-    sealed in the period regardless of which key sealed it, because that
-    is what a public completeness claim has to mean. Per-tenant
-    commitments are still made by POSTing /x/complete/commit with that
-    tenant's key, and the two live side by side.
-  - A period committed late is committed at the date it was actually
-    committed, and /x/complete/periods reports the gap in days. Backfilled
-    history still proves the count was fixed before any export was asked
-    for. It does not prove the count was fixed when the period closed, and
-    nothing published here will claim it does.
-
-HONEST LIMITS
--------------
-  - This proves completeness of what was SEALED. A decision that never
-    reached the chain at all is outside anything we can see. Garbage in
-    still applies; what changes is that the operator can no longer choose
-    which of the sealed records to show.
-  - Absence proofs are scoped to a period. "No record of you, ever"
-    means checking every period, which is why the period list is public.
-  - The tree is built over key material only. It never contains payloads,
-    so a leaf reveals whether something exists, not what it said.
-  - Adjacent-leaf absence proofs disclose the two neighbouring keys. If
-    keys are themselves sensitive, hash them before they become leaves -
-    the proof still works, and we hold nothing legible.
-
-    POST /x/complete/commit    close and seal a period      (keyed)
-    POST /x/complete/erase     tombstone a leaf             (keyed)
-    GET  /x/complete/periods   every sealed period          (public)
-    GET  /x/complete/root      root, count, block index     (public)
-    GET  /x/complete/prove     inclusion or absence proof   (public)
-    POST /x/complete/verify    check a proof we handed out  (public)
-    GET  /x/complete/spec      the exact hashing rules      (public)
-"""
-
-import hashlib
-import json
-import re
-import time
-from datetime import datetime, timezone, timedelta
-
-VERSION = "1.1"
-HEX64 = re.compile(r"^[0-9a-f]{64}$")
-
-# A third party must be able to check completeness without an account. A
-# completeness claim you have to hold credentials to verify is not a
-# completeness claim, it is a marketing line.
-PUBLIC = {("GET", "periods"), ("GET", "root"), ("GET", "prove"),
-          ("GET", "spec"), ("POST", "verify")}
-
-# Domain separation. Leaf and node hashes must never be confusable, or an
-# attacker can present an internal node as though it were a leaf.
-LEAF_PREFIX = b"AILEASH-LEAF-v1:"
-NODE_PREFIX = b"AILEASH-NODE-v1:"
-
-MAX_LEAVES = 200000
-
-# ---- automatic commitment --------------------------------------------
-AUTO_COMMIT = True          # set False to go back to committing by hand
-AUTO_KINDS = ("receipts", "subjects")
-AUTO_INTERVAL = 600         # seconds between sweeps, not per request
-AUTO_MAX_MONTHS = 24        # how far back a first run will backfill
-
-# The deployment-wide commitment is stored under an empty key, which is
-# also what an unauthenticated read looks for. Not a magic value with
-# privileges - the absence of a key, meaning "everything sealed here".
-AUTO_KEY = ""
-
-_last_auto = [0.0]
-_auto_log = []              # recent sweep outcomes, surfaced on /periods
-
-_ready = False
-
-
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        c = ctx["conn"]
-        c.execute("CREATE TABLE IF NOT EXISTS complete_commit("
-                  "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,period TEXT,kind TEXT,"
-                  "root TEXT,leaf_count INTEGER,period_start REAL,period_end REAL,"
-                  "committed REAL,audit_hash TEXT,block_index INTEGER)")
-        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_cmp_unique "
-                  "ON complete_commit(api_key,period,kind)")
-        c.execute("CREATE TABLE IF NOT EXISTS complete_leaf("
-                  "commit_id INTEGER,idx INTEGER,leaf TEXT)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_cmp_leaf "
-                  "ON complete_leaf(commit_id,idx)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_cmp_leaf_val "
-                  "ON complete_leaf(commit_id,leaf)")
-        c.execute("CREATE TABLE IF NOT EXISTS complete_tomb("
-                  "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,leaf TEXT,"
-                  "reason TEXT,erased REAL,audit_hash TEXT,block_index INTEGER)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_cmp_tomb ON complete_tomb(api_key,leaf)")
-        c.commit()
-    _ready = True
-
-
-def _audit_columns(ctx):
-    """What the audit_log actually looks like on this deployment.
-
-    Read rather than assumed - the schema has moved before and will again,
-    and a completeness module that guesses column names is worse than none.
-    """
-    have = []
-    try:
-        with ctx["lock"]:
-            for row in ctx["conn"].execute("PRAGMA table_info(audit_log)").fetchall():
-                have.append(row[1])
-    except Exception:
-        pass
-    return have
-
-
-def _iso(ts):
-    if not ts:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
-
-# ----------------------------------------------------------------------
-# periods
-# ----------------------------------------------------------------------
-
-def _period_bounds(period):
-    """Turn a period label into [start, end) as epoch seconds.
-
-    Accepts  2026, 2026-08, 2026-08-02, 2026-Q3.
-    Returns (start, end, None) or (None, None, why).
-    """
-    period = (period or "").strip().upper()
-
-    def _utc(y, m, d):
-        return datetime(y, m, d, tzinfo=timezone.utc).timestamp()
-
-    try:
-        m = re.match(r"^(\d{4})$", period)
-        if m:
-            y = int(m.group(1))
-            return _utc(y, 1, 1), _utc(y + 1, 1, 1), None
-
-        m = re.match(r"^(\d{4})-Q([1-4])$", period)
-        if m:
-            y, q = int(m.group(1)), int(m.group(2))
-            start_month = (q - 1) * 3 + 1
-            end_month = start_month + 3
-            if end_month > 12:
-                return _utc(y, start_month, 1), _utc(y + 1, 1, 1), None
-            return _utc(y, start_month, 1), _utc(y, end_month, 1), None
-
-        m = re.match(r"^(\d{4})-(\d{2})$", period)
-        if m:
-            y, mo = int(m.group(1)), int(m.group(2))
-            if not 1 <= mo <= 12:
-                return None, None, "month out of range"
-            if mo == 12:
-                return _utc(y, 12, 1), _utc(y + 1, 1, 1), None
-            return _utc(y, mo, 1), _utc(y, mo + 1, 1), None
-
-        m = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", period)
-        if m:
-            y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
-            start = datetime(y, mo, d, tzinfo=timezone.utc)
-            return start.timestamp(), (start + timedelta(days=1)).timestamp(), None
-    except ValueError as exc:
-        return None, None, "unreadable period (%s)" % exc
-
-    return None, None, "period must be YYYY, YYYY-MM, YYYY-MM-DD or YYYY-Qn"
-
-
-# ----------------------------------------------------------------------
-# the tree
-# ----------------------------------------------------------------------
-
-def _leaf_hash(value):
-    return hashlib.sha256(LEAF_PREFIX + value.encode("utf-8")).hexdigest()
-
-
-def _node_hash(left, right):
-    return hashlib.sha256(NODE_PREFIX + left.encode() + right.encode()).hexdigest()
-
-
-def _build(leaves):
-    """Build the tree over already-sorted leaf VALUES.
-
-    Returns (root, levels). levels[0] is the leaf-hash level. An odd node
-    at any level is promoted unchanged to the next - it is never paired
-    with itself, which is the classic duplication weakness.
-    """
-    if not leaves:
-        return hashlib.sha256(LEAF_PREFIX + b"EMPTY").hexdigest(), []
-
-    level = [_leaf_hash(v) for v in leaves]
-    levels = [level]
-    while len(level) > 1:
-        nxt = []
-        for i in range(0, len(level) - 1, 2):
-            nxt.append(_node_hash(level[i], level[i + 1]))
-        if len(level) % 2 == 1:
-            nxt.append(level[-1])
-        levels.append(nxt)
-        level = nxt
-    return level[0], levels
-
-
-def _path(levels, index):
-    """Sibling path for a leaf index. Each step says which side to hash on."""
-    proof = []
-    idx = index
-    for level in levels[:-1]:
-        if idx % 2 == 0:
-            sibling = idx + 1
-            if sibling < len(level):
-                proof.append({"side": "right", "hash": level[sibling]})
-            # No sibling means this node was promoted - nothing to hash.
-        else:
-            proof.append({"side": "left", "hash": level[idx - 1]})
-        idx //= 2
-    return proof
-
-
-def _replay(leaf_value, proof):
-    """Recompute a root from a leaf and its path. This is what a verifier
-    runs, and it is deliberately five lines so anyone can reimplement it."""
-    current = _leaf_hash(leaf_value)
-    for step in proof:
-        if step.get("side") == "left":
-            current = _node_hash(step["hash"], current)
-        else:
-            current = _node_hash(current, step["hash"])
-    return current
-
-
-# ----------------------------------------------------------------------
-# reading leaves out of the audit log
-# ----------------------------------------------------------------------
-
-def _collect(ctx, api_key, start, end, kind, columns):
-    """Every distinct leaf sealed in [start, end).
-
-    kind = receipts  -> the audit hash of each sealed decision
-    kind = subjects  -> the distinct subject each decision was about, so
-                        "do you hold anything on me" becomes answerable
-
-    A falsy api_key means no scoping: every record sealed on this
-    deployment in the window. That is what the automatic commitment uses,
-    and what a public completeness claim has to cover.
-    """
-    if "ts" not in columns:
-        return None, "audit_log has no ts column on this deployment"
-
-    if kind == "receipts":
-        if "audit_hash" not in columns:
-            return None, "audit_log has no audit_hash column"
-        field = "audit_hash"
-    else:
-        field = None
-        for candidate in ("user_id", "subject", "subject_id", "customer_id"):
-            if candidate in columns:
-                field = candidate
-                break
-        if not field:
-            return None, "no subject column on this deployment - receipts only"
-
-    scoped = "api_key" in columns and api_key
-    sql = "SELECT DISTINCT %s FROM audit_log WHERE ts>=? AND ts<?" % field
-    args = [start, end]
-    if scoped:
-        sql += " AND api_key=?"
-        args.append(api_key)
-
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(sql, tuple(args)).fetchall()
-
-    values = sorted({str(r[0]) for r in rows if r[0] is not None})
-    if len(values) > MAX_LEAVES:
-        return None, "period holds %d leaves, above the %d cap" % (len(values), MAX_LEAVES)
-    return values, None
-
-
-# ----------------------------------------------------------------------
-# commit
-# ----------------------------------------------------------------------
-
-def _commit(ctx, api_key, data):
-    period = str(data.get("period", "")).strip()
-    kind = str(data.get("kind", "receipts")).strip().lower()
-    if kind not in ("receipts", "subjects"):
-        return {"error": "bad_kind", "message": "kind is receipts or subjects"}, 400
-
-    start, end, why = _period_bounds(period)
-    if why:
-        return {"error": "bad_period", "message": why}, 400
-
-    now = time.time()
-    if end > now:
-        return {"error": "period_open",
-                "message": "That period has not finished. Committing a live period would let "
-                           "later entries change the root, which defeats the point.",
-                "closes_at": _iso(end)}, 409
-
-    with ctx["lock"]:
-        existing = ctx["conn"].execute(
-            "SELECT root,leaf_count,committed,audit_hash,block_index FROM complete_commit "
-            "WHERE api_key=? AND period=? AND kind=?", (api_key, period, kind)).fetchone()
-    if existing:
-        return {"already_committed": True, "period": period, "kind": kind,
-                "root": existing[0], "leaf_count": existing[1],
-                "committed_at": _iso(existing[2]),
-                "sealed_in_chain": existing[3], "block_index": existing[4],
-                "message": "A period is committed once. Recommitting is how a commitment "
-                           "stops meaning anything."}, 200
-
-    columns = _audit_columns(ctx)
-    leaves, why = _collect(ctx, api_key, start, end, kind, columns)
-    if why:
-        return {"error": "cannot_collect", "message": why}, 400
-
-    root, levels = _build(leaves)
-
-    scope = "deployment" if not api_key else "key"
-    late_days = round(max(0.0, (now - end)) / 86400.0, 1)
-
-    ev = {"user_id": "cmp:" + period, "action": "completeness_committed", "amount": 0,
-          "country": "UK", "device_id": "complete", "anomaly": 0, "device_risk": 0}
-    res = {"decision": "COMPLETENESS_SEALED", "score": 0, "complete_version": VERSION,
-           "period": period, "kind": kind, "root": root, "leaf_count": len(leaves),
-           "period_start": start, "period_end": end, "scope": scope,
-           "days_after_period_end": late_days,
-           "detail": "period=%s;kind=%s;scope=%s;root=%s;count=%d;late_days=%s"
-                     % (period, kind, scope, root, len(leaves), late_days)}
-    audit_hash, block_index, seq = ctx["seal"](ev, res, now, api_key)
-
-    with ctx["lock"]:
-        c = ctx["conn"]
-        c.execute("INSERT INTO complete_commit(api_key,period,kind,root,leaf_count,"
-                  "period_start,period_end,committed,audit_hash,block_index) "
-                  "VALUES(?,?,?,?,?,?,?,?,?,?)",
-                  (api_key, period, kind, root, len(leaves), start, end, now,
-                   audit_hash, block_index))
-        commit_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
-        c.executemany("INSERT INTO complete_leaf(commit_id,idx,leaf) VALUES(?,?,?)",
-                      [(commit_id, i, v) for i, v in enumerate(leaves)])
-        c.commit()
-
-    return {"period": period, "kind": kind, "root": root, "leaf_count": len(leaves),
-            "period_start": _iso(start), "period_end": _iso(end),
-            "committed_at": _iso(now), "sealed_in_chain": audit_hash,
-            "block_index": block_index, "receipt_seq": seq,
-            "scope": scope, "days_after_period_end": late_days,
-            "frozen": "The sorted leaf list is stored as committed. Later erasures cannot "
-                      "change what this root proved.",
-            "message": "%d leaves committed. Any export from this period claiming a different "
-                       "total now contradicts a sealed, externally anchored number."
-                       % len(leaves)}, 200
-
-
-# ----------------------------------------------------------------------
-# automatic commitment
-# ----------------------------------------------------------------------
-
-def _closed_months(first_ts, now):
-    """Every whole month between the first sealed record and this one.
-
-    The current month is excluded because it is still running, which is
-    the same rule a manual commit is held to.
-    """
-    try:
-        first = datetime.fromtimestamp(first_ts, tz=timezone.utc)
-        current = datetime.fromtimestamp(now, tz=timezone.utc)
-    except Exception:
-        return []
-
-    labels = []
-    y, m = first.year, first.month
-    while (y, m) < (current.year, current.month):
-        labels.append("%04d-%02d" % (y, m))
-        m += 1
-        if m > 12:
-            m = 1
-            y += 1
-        if len(labels) > 600:
-            break
-    return labels[-AUTO_MAX_MONTHS:]
-
-
-def _auto_commit(ctx):
-    """Commit any closed month that nobody has committed yet.
-
-    Runs on request rather than on a thread. A sleeping container has no
-    timer worth trusting, and this way the sweep happens before the answer
-    that depends on it - including for the auditor whose visit to
-    /x/complete/periods is what triggered it.
-    """
-    if not AUTO_COMMIT:
-        return
-
-    now = time.time()
-    if now - _last_auto[0] < AUTO_INTERVAL:
-        return
-    _last_auto[0] = now
-
-    columns = _audit_columns(ctx)
-    if "ts" not in columns:
-        return
-
-    try:
-        with ctx["lock"]:
-            row = ctx["conn"].execute("SELECT MIN(ts) FROM audit_log").fetchone()
-    except Exception:
-        return
-    if not row or not row[0]:
-        return
-
-    months = _closed_months(row[0], now)
-    if not months:
-        return
-
-    try:
-        with ctx["lock"]:
-            done = {(r[0], r[1]) for r in ctx["conn"].execute(
-                "SELECT period,kind FROM complete_commit WHERE api_key=?",
-                (AUTO_KEY,)).fetchall()}
-    except Exception:
-        done = set()
-
-    for period in months:
-        for kind in AUTO_KINDS:
-            if (period, kind) in done:
-                continue
-            try:
-                body, code = _commit(ctx, AUTO_KEY, {"period": period, "kind": kind})
-            except Exception as exc:
-                _note_auto(period, kind, "failed: " + str(exc)[:120])
-                continue
-            if code == 200 and not body.get("already_committed"):
-                _note_auto(period, kind, "committed %d leaves %s days after the period closed"
-                           % (body.get("leaf_count", 0), body.get("days_after_period_end")))
-            elif code != 200:
-                # A deployment with no subject column cannot do kind=subjects.
-                # That is a real limit of the deployment, recorded rather than
-                # retried every ten minutes.
-                _note_auto(period, kind, "skipped: " + str(body.get("message")
-                                                           or body.get("error"))[:120])
-
-
-def _note_auto(period, kind, outcome):
-    _auto_log.append({"at": _iso(time.time()), "period": period,
-                      "kind": kind, "outcome": outcome})
-    del _auto_log[:-40]
-    print("COMPLETE: auto %s/%s - %s" % (period, kind, outcome), flush=True)
-
-
-# ----------------------------------------------------------------------
-# proofs
-# ----------------------------------------------------------------------
-
-def _load(ctx, api_key, period, kind):
-    with ctx["lock"]:
-        if api_key:
-            row = ctx["conn"].execute(
-                "SELECT id,root,leaf_count,committed,audit_hash,block_index,period_start,period_end "
-                "FROM complete_commit WHERE api_key=? AND period=? AND kind=?",
-                (api_key, period, kind)).fetchone()
-        else:
-            row = ctx["conn"].execute(
-                "SELECT id,root,leaf_count,committed,audit_hash,block_index,period_start,period_end "
-                "FROM complete_commit WHERE period=? AND kind=? ORDER BY id ASC LIMIT 1",
-                (period, kind)).fetchone()
-        if not row:
-            return None, None
-        leaves = [r[0] for r in ctx["conn"].execute(
-            "SELECT leaf FROM complete_leaf WHERE commit_id=? ORDER BY idx ASC",
-            (row[0],)).fetchall()]
-    return row, leaves
-
-
-def _tombstone_for(ctx, api_key, value):
-    with ctx["lock"]:
-        if api_key:
-            row = ctx["conn"].execute(
-                "SELECT erased,reason,audit_hash,block_index FROM complete_tomb "
-                "WHERE api_key=? AND leaf=? ORDER BY id ASC LIMIT 1",
-                (api_key, value)).fetchone()
-        else:
-            row = ctx["conn"].execute(
-                "SELECT erased,reason,audit_hash,block_index FROM complete_tomb "
-                "WHERE leaf=? ORDER BY id ASC LIMIT 1", (value,)).fetchone()
-    if not row:
-        return None
-    return {"erased_at": _iso(row[0]), "reason": row[1],
-            "sealed_in_chain": row[2], "block_index": row[3],
-            "note": "The payload is gone. This proves it existed and that it was erased, "
-                    "without holding any of it."}
-
-
-def _prove(ctx, api_key, data):
-    period = str(data.get("period", "")).strip()
-    kind = str(data.get("kind", "receipts")).strip().lower()
-    value = str(data.get("value", "")).strip()
-    if not period or not value:
-        return {"error": "period_and_value_required",
-                "message": "Both are required. Committed periods are listed at "
-                           "/x/complete/periods; value is any key you want proved "
-                           "present or absent.",
-                "example": "/x/complete/prove?period=2026-07&value=<key>"}, 400
-
-    row, leaves = _load(ctx, api_key, period, kind)
-    if not row:
-        return {"error": "not_committed", "period": period, "kind": kind,
-                "message": "No sealed commitment for that period. Nothing can be proved "
-                           "either way until the period is closed and committed."}, 404
-
-    _cid, root, count, committed, chain_hash, block_index, start, end = row
-    _r, levels = _build(leaves)
-
-    base = {"period": period, "kind": kind, "value": value, "root": root,
-            "leaf_count": count, "committed_at": _iso(committed),
-            "period_start": _iso(start), "period_end": _iso(end),
-            "sealed_in_chain": chain_hash, "block_index": block_index,
-            "complete_version": VERSION,
-            "verify": "/x/complete/verify, or reimplement it - the rules are at /x/complete/spec"}
-
-    # Present?
-    try:
-        index = leaves.index(value)
-    except ValueError:
-        index = None
-
-    if index is not None:
-        base.update({
-            "result": "present",
-            "index": index,
-            "proof": _path(levels, index),
-            "what_this_proves": "This exact record is inside the sealed set for the period. "
-                                "It cannot have been added afterwards.",
-        })
-        tomb = _tombstone_for(ctx, api_key, value)
-        if tomb:
-            base["erased"] = tomb
-        return base, 200
-
-    # Absent - find the neighbours it sorts between.
-    lower_index = None
-    upper_index = None
-    for i, leaf in enumerate(leaves):
-        if leaf < value:
-            lower_index = i
-        else:
-            upper_index = i
-            break
-
-    neighbours = {}
-    if lower_index is not None:
-        neighbours["lower"] = {"index": lower_index, "value": leaves[lower_index],
-                               "proof": _path(levels, lower_index)}
-    if upper_index is not None:
-        neighbours["upper"] = {"index": upper_index, "value": leaves[upper_index],
-                               "proof": _path(levels, upper_index)}
-
-    if not leaves:
-        adjacency = "The period is committed and empty. Nothing was sealed in it at all."
-    elif lower_index is None:
-        adjacency = ("The value sorts before every leaf in the set. The first leaf is proved, "
-                     "and nothing precedes index 0.")
-    elif upper_index is None:
-        adjacency = ("The value sorts after every leaf in the set. The last leaf is proved, "
-                     "and nothing follows the final index.")
-    else:
-        adjacency = ("The two proved leaves are adjacent - indices %d and %d, consecutive. "
-                     "Nothing can exist between two adjacent leaves of a sorted tree, so no "
-                     "record for this value exists in the period."
-                     % (lower_index, upper_index))
-
-    base.update({
-        "result": "absent",
-        "neighbours": neighbours,
-        "adjacency": adjacency,
-        "what_this_proves": "No record for this value was sealed in this period. Not that we "
-                            "declined to look - that it is not there, against a root fixed "
-                            "before you asked.",
-        "scope": "This period only. /x/complete/periods lists every committed period.",
-    })
-    tomb = _tombstone_for(ctx, api_key, value)
-    if tomb:
-        base["erased"] = tomb
-        base["note"] = ("Absent from this period AND carrying an erasure record. That is the "
-                        "expected shape after a valid erasure request.")
-    return base, 200
-
-
-def _verify(ctx, api_key, data):
-    """Check a proof we handed out. Convenience only - a verifier who
-    trusts us to check our own proof has not verified anything. The spec
-    route exists so this can be done independently."""
-    value = str(data.get("value", "")).strip()
-    root = str(data.get("root", "")).strip().lower()
-    proof = data.get("proof")
-    if not value or not HEX64.match(root) or not isinstance(proof, list):
-        return {"error": "value_root_and_proof_required"}, 400
-    try:
-        computed = _replay(value, proof)
-    except Exception as exc:
-        return {"error": "bad_proof", "message": str(exc)[:200]}, 400
-    return {"valid": computed == root, "computed_root": computed, "given_root": root,
-            "note": "Recomputed from the leaf upward. If these match, the leaf was in the tree "
-                    "when the root was sealed."}, 200
-
-
-# ----------------------------------------------------------------------
-# erasure
-# ----------------------------------------------------------------------
-
-def _erase(ctx, api_key, data):
-    value = str(data.get("value", "")).strip()
-    reason = str(data.get("reason", "erasure request")).strip()[:200]
-    if not value:
-        return {"error": "value_required",
-                "message": "The leaf being tombstoned - a receipt hash or a subject key."}, 400
-
-    now = time.time()
-    ev = {"user_id": "era:" + value[:32], "action": "erasure_recorded", "amount": 0,
-          "country": "UK", "device_id": "complete", "anomaly": 0, "device_risk": 0}
-    res = {"decision": "ERASURE_SEALED", "score": 0, "complete_version": VERSION,
-           "leaf": value, "reason": reason,
-           "detail": "leaf=%s;reason=%s" % (value, reason)}
-    audit_hash, block_index, seq = ctx["seal"](ev, res, now, api_key)
-
-    with ctx["lock"]:
-        ctx["conn"].execute("INSERT INTO complete_tomb(api_key,leaf,reason,erased,audit_hash,"
-                            "block_index) VALUES(?,?,?,?,?,?)",
-                            (api_key, value, reason, now, audit_hash, block_index))
-        ctx["conn"].commit()
-
-    return {"leaf": value, "erased_at": _iso(now), "reason": reason,
-            "sealed_in_chain": audit_hash, "block_index": block_index, "receipt_seq": seq,
-            "what_this_does": "Records the erasure as a sealed event. It does not delete the "
-                              "payload - your own system does that. This is the receipt that "
-                              "proves you did.",
-            "what_the_subject_gets": "Proof their record existed, proof it was erased, and the "
-                                     "time it happened - none of which requires anyone to still "
-                                     "hold the data.",
-            "note": "Earlier committed roots still contain the leaf. That is correct and not a "
-                    "leak: a leaf is key material, not content, and a root that changed after "
-                    "the fact would prove nothing about anything."}, 200
-
-
-# ----------------------------------------------------------------------
-# read-only
-# ----------------------------------------------------------------------
-
-def _periods(ctx, api_key):
-    with ctx["lock"]:
-        if api_key:
-            rows = ctx["conn"].execute(
-                "SELECT period,kind,root,leaf_count,committed,block_index,period_end,api_key "
-                "FROM complete_commit WHERE api_key=? ORDER BY period_start DESC",
-                (api_key,)).fetchall()
-        else:
-            rows = ctx["conn"].execute(
-                "SELECT period,kind,root,leaf_count,committed,block_index,period_end,api_key "
-                "FROM complete_commit ORDER BY period_start DESC").fetchall()
-
-    out = []
-    for r in rows:
-        late = None
-        try:
-            if r[4] and r[6]:
-                late = round(max(0.0, r[4] - r[6]) / 86400.0, 1)
-        except Exception:
-            late = None
-        out.append({"period": r[0], "kind": r[1], "root": r[2], "leaf_count": r[3],
-                    "committed_at": _iso(r[4]), "block_index": r[5],
-                    "scope": "deployment" if not r[7] else "key",
-                    "committed_days_after_period_end": late})
-
-    return {"count": len(out),
-            "periods": out,
-            "auto_commit": AUTO_COMMIT,
-            "recent_auto_activity": list(reversed(_auto_log[-10:])),
-            "on_lateness": "committed_days_after_period_end is published rather than hidden. A "
-                           "small number means the count was fixed when the period closed. A "
-                           "large one means history was backfilled later, which still proves "
-                           "the count was fixed before any export was requested and proves "
-                           "nothing more than that.",
-            "note": "Gaps are visible on purpose. A missing period is a period nobody committed, "
-                    "and that is exactly the thing an auditor should be asking about."}, 200
-
-
-def _root(ctx, api_key, data):
-    period = str(data.get("period", "")).strip()
-    kind = str(data.get("kind", "receipts")).strip().lower()
-    row, _leaves = _load(ctx, api_key, period, kind)
-    if not row:
-        return {"error": "not_committed", "period": period, "kind": kind,
-                "committed_periods": "/x/complete/periods"}, 404
-    _cid, root, count, committed, chain_hash, block_index, start, end = row
-    late = None
-    try:
-        late = round(max(0.0, committed - end) / 86400.0, 1)
-    except Exception:
-        pass
-    return {"period": period, "kind": kind, "root": root, "leaf_count": count,
-            "period_start": _iso(start), "period_end": _iso(end),
-            "committed_at": _iso(committed), "sealed_in_chain": chain_hash,
-            "block_index": block_index, "committed_days_after_period_end": late,
-            "what_this_is": "The number of records sealed in this period, fixed before anybody "
-                            "asked for an export. Any export claiming a different total is "
-                            "arguing with an externally anchored figure."}, 200
-
-
-def _spec():
-    return {
-        "complete_version": VERSION,
-        "leaf_hash": "sha256('AILEASH-LEAF-v1:' || value) as lowercase hex",
-        "node_hash": "sha256('AILEASH-NODE-v1:' || left_hex || right_hex) as lowercase hex",
-        "empty_root": hashlib.sha256(LEAF_PREFIX + b"EMPTY").hexdigest(),
-        "ordering": "leaf VALUES sorted ascending as UTF-8 strings, duplicates removed, "
-                    "before any hashing",
-        "odd_nodes": "an unpaired node at any level is promoted unchanged to the next level. "
-                     "It is never hashed with itself.",
-        "inclusion": "recompute upward from the leaf using the sibling path. Each step gives a "
-                     "side; hash the sibling on that side.",
-        "absence": "verify the two neighbouring leaves independently, check their values sort "
-                   "either side of the queried value, and check their indices are consecutive. "
-                   "Consecutive indices in a sorted tree leave no room for anything between.",
-        "completeness": "the leaf count is sealed with the root, before any export is requested",
-        "schedule": "closed months are committed automatically, deployment-wide, on the first "
-                    "request to reach this module after the month ends. Per-key commitments "
-                    "remain a keyed POST. Lateness is published per period rather than smoothed "
-                    "over.",
-        "why_published": "Anyone should be able to write their own verifier and check us without "
-                         "running our code or holding an account. A proof you can only check "
-                         "with the prover's own tool is not a proof.",
-    }, 200
-
-
-# ----------------------------------------------------------------------
-# router entry point
-# ----------------------------------------------------------------------
-
-def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-
-    # Sweep before answering, never at the cost of answering.
-    try:
-        _auto_commit(ctx)
-    except Exception as exc:
-        print("COMPLETE: auto sweep failed - " + str(exc)[:200], flush=True)
-
-    action = (action or "").strip("/").lower()
-    data = data or {}
-
-    if method == "GET":
-        if action == "spec":
-            return _spec()
-        if action == "periods":
-            return _periods(ctx, api_key)
-        if action == "root":
-            return _root(ctx, api_key, data)
-        if action == "prove":
-            return _prove(ctx, api_key, data)
-
-    if method == "POST":
-        if action == "verify":
-            return _verify(ctx, api_key, data)
-        if not api_key:
-            return {"error": "invalid_api_key"}, 401
-        if action == "commit":
-            return _commit(ctx, api_key, data)
-        if action == "erase":
-            return _erase(ctx, api_key, data)
-
-    return {"error": "unknown_action", "action": action,
-            "GET": ["spec", "periods", "root", "prove"],
-            "POST": ["verify", "commit", "erase"]}, 404
-
-```
-
-
-## `modules/conformance.py`
-
-338 lines, 14845 bytes
-
-```python
-"""
-Conformance testing - /x/conformance/<action>
-
-WHAT THIS IS FOR
-----------------
-Three limits are documented elsewhere in this platform, and all three have
-the same shape: the engine's arithmetic is sound, but the guarantee depends
-on something outside the engine.
-
-  1. Commit-before-reveal proves order - but only if the integrator does not
-     show its reviewers the machine verdict before calling /open.
-  2. Mutual witnessing gets its strength from breadth - two platforms
-     witnessing only each other prove very little.
-  3. A declaration is only as strong as the rules declared - one that
-     constrains nothing passes everything.
-
-None of these can be fixed by the engine on its own. All three can be
-MEASURED, and a measured weakness is a different animal from an unmeasured
-one. That is what this module does.
-
-1. PROBES - testing the integration, not trusting it
-----------------------------------------------------
-The idea is borrowed openly from how real audits work, and specifically from
-a point James Stokes made publicly: slip a case with a known answer into the
-queue, unannounced, and see who catches it.
-
-A probe creates a genuine oversight case whose machine verdict is
-deliberately set to a known-wrong value. The reviewer sees it exactly like
-any other case. Two things then follow:
-
-  - If they agree with the deliberately wrong verdict, they did not evaluate
-    it. That is a caught rubber stamp, sealed.
-  - If the integration is showing them the verdict before /open is called,
-    their probe agreement rate will match their normal agreement rate. If
-    they are genuinely deciding blind, it will not. The gap between the two
-    numbers is the conformance signal.
-
-A single probe proves nothing about a person. A catch rate across dozens is
-evidence about a process, which is the thing under audit.
-
-2. WITNESS BREADTH - concentration is visible
----------------------------------------------
-Reports how many distinct peers witness the chain, how concentrated the
-observations are in the largest peer, and how many peers have gone quiet.
-Below three live peers the network is reported as weak, because it is.
-
-3. DECLARATION STRENGTH - rules that never fire
-------------------------------------------------
-Runs the live declaration against sealed records and reports, per rule, how
-many records it actually CONSTRAINED - that is, how many matched its `when`
-condition and therefore had to satisfy its `require`. A rule that has never
-constrained a single record is not a standard. It is decoration, and it is
-named as such.
-
-HONEST LIMITS OF THIS MODULE
-----------------------------
-- Probes test the process, not any individual. Someone can catch a probe and
-  still rubber stamp the next hundred cases.
-- A determined integrator who identifies probe cases can treat them
-  differently. Probe case references are not marked in any way the reviewer
-  can see, but a sufficiently motivated operator controls their own UI.
-- Breadth and strength are measurements, not enforcement. Nothing here can
-  compel a platform to witness widely or declare strictly. It can only make
-  the alternative visible.
-
-    POST /x/conformance/probe        inject a probe case with a known-wrong verdict
-    GET  /x/conformance/probes       catch rate, and the conformance gap
-    GET  /x/conformance/witness      breadth, concentration, staleness
-    GET  /x/conformance/declaration  per-rule strength - what each rule constrains
-    GET  /x/conformance/report       all three, one call
-"""
-
-import importlib, json, secrets, time
-from datetime import datetime, timezone
-
-VERSION = "1.0"
-INVERT = {"allow": "block", "block": "allow",
-          "challenge": "allow", "escalate": "allow"}
-
-_ready = False
-
-
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        ctx["conn"].execute("CREATE TABLE IF NOT EXISTS conformance_probes(probe_id TEXT PRIMARY KEY,api_key TEXT,case_id TEXT,reviewer TEXT,planted_verdict TEXT,correct_verdict TEXT,injected REAL,resolved REAL,reviewer_verdict TEXT,caught INTEGER)")
-        ctx["conn"].execute("CREATE INDEX IF NOT EXISTS idx_probe_key ON conformance_probes(api_key)")
-        ctx["conn"].commit()
-    _ready = True
-
-
-def _iso(ts):
-    if not ts:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
-
-# ------------------------------------------------------------------ probes
-
-def _probe(ctx, api_key, data):
-    reviewer = str(data.get("reviewer", "")).strip()
-    if not reviewer:
-        return {"error": "reviewer_required"}, 400
-    correct = str(data.get("correct_verdict", "")).strip().lower()
-    if correct not in INVERT:
-        return {"error": "correct_verdict_required",
-                "allowed": sorted(INVERT)}, 400
-    material = data.get("material")
-    if material is None:
-        return {"error": "material_required",
-                "message": "A probe must look like a real case or it tests nothing."}, 400
-
-    planted = INVERT[correct]
-    try:
-        ovs = importlib.import_module("modules.oversight")
-    except Exception as e:
-        return {"error": "oversight_module_unavailable", "detail": str(e)}, 503
-
-    ref = str(data.get("case_ref", "")).strip() or ("CASE-" + secrets.token_hex(3).upper())
-    payload, status = ovs.handle("POST", "open",
-                                 {"case_ref": ref, "reviewer": reviewer,
-                                  "material": material,
-                                  "machine_verdict": planted},
-                                 api_key, ctx)
-    if status != 200:
-        return payload, status
-
-    pid = "PRB-" + secrets.token_hex(4).upper()
-    ts = time.time()
-    with ctx["lock"]:
-        ctx["conn"].execute("INSERT INTO conformance_probes(probe_id,api_key,case_id,reviewer,planted_verdict,correct_verdict,injected,resolved,reviewer_verdict,caught) VALUES(?,?,?,?,?,?,?,NULL,NULL,NULL)",
-                            (pid, api_key, payload["case_id"], reviewer, planted, correct, ts))
-        ctx["conn"].commit()
-
-    return {"probe_id": pid, "case_id": payload["case_id"],
-            "case_ref": ref, "reviewer": reviewer,
-            "planted_verdict": planted, "correct_verdict": correct,
-            "injected": _iso(ts),
-            "note": "This is an ordinary oversight case to the reviewer. Route it into their queue exactly like any other, or the probe is worthless."}, 200
-
-
-def _resolve_probes(ctx, api_key):
-    """Settle any probes whose oversight case has since been committed."""
-    with ctx["lock"]:
-        open_probes = ctx["conn"].execute("SELECT probe_id,case_id,planted_verdict,correct_verdict FROM conformance_probes WHERE api_key=? AND resolved IS NULL", (api_key,)).fetchall()
-        for pid, cid, planted, correct in open_probes:
-            row = ctx["conn"].execute("SELECT reviewer_verdict,committed FROM oversight_cases WHERE case_id=? AND api_key=?", (cid, api_key)).fetchone()
-            if not row or not row[1]:
-                continue
-            rv = (row[0] or "").lower()
-            caught = 1 if rv != planted else 0
-            ctx["conn"].execute("UPDATE conformance_probes SET resolved=?,reviewer_verdict=?,caught=? WHERE probe_id=?",
-                                (row[1], rv, caught, pid))
-        ctx["conn"].commit()
-
-
-def _probes(ctx, api_key):
-    try:
-        _resolve_probes(ctx, api_key)
-    except Exception:
-        pass
-    with ctx["lock"]:
-        rows = ctx["conn"].execute("SELECT reviewer,caught,resolved FROM conformance_probes WHERE api_key=? AND resolved IS NOT NULL", (api_key,)).fetchall()
-        pending = ctx["conn"].execute("SELECT COUNT(*) FROM conformance_probes WHERE api_key=? AND resolved IS NULL", (api_key,)).fetchone()[0]
-    if not rows:
-        return {"probes_resolved": 0, "probes_pending": pending,
-                "note": "No probes have come back yet."}, 200
-
-    by = {}
-    for reviewer, caught, _r in rows:
-        d = by.setdefault(reviewer, {"probes": 0, "caught": 0})
-        d["probes"] += 1
-        d["caught"] += caught
-
-    out = []
-    for reviewer, d in sorted(by.items()):
-        rate = round(100 * d["caught"] / d["probes"], 1)
-        entry = {"reviewer": reviewer, "probes": d["probes"],
-                 "caught": d["caught"], "catch_rate_pct": rate}
-        # conformance gap: probe agreement vs normal agreement
-        try:
-            ovs = importlib.import_module("modules.oversight")
-            stats, _s = ovs.handle("GET", "reviewer", {"id": reviewer}, api_key, ctx)
-            normal = stats.get("agreement_rate_pct")
-            if normal is not None and d["probes"] >= 5:
-                probe_agree = round(100 * (d["probes"] - d["caught"]) / d["probes"], 1)
-                gap = round(abs(probe_agree - normal), 1)
-                entry["normal_agreement_pct"] = normal
-                entry["probe_agreement_pct"] = probe_agree
-                entry["conformance_gap"] = gap
-                if gap < 5 and normal > 90:
-                    entry["flag"] = "probe agreement matches normal agreement at a high rate - consistent with the verdict being visible before commit"
-        except Exception:
-            pass
-        if d["probes"] >= 5 and rate == 0:
-            entry["flag"] = "caught none of " + str(d["probes"]) + " deliberately wrong verdicts"
-        out.append(entry)
-
-    total = sum(d["probes"] for d in by.values())
-    caught = sum(d["caught"] for d in by.values())
-    return {"probes_resolved": total, "probes_pending": pending,
-            "caught": caught,
-            "overall_catch_rate_pct": round(100 * caught / total, 1),
-            "by_reviewer": out,
-            "note": "A single probe proves nothing about a person. A catch rate across dozens is evidence about a process."}, 200
-
-
-# ----------------------------------------------------------------- witness
-
-def _witness(ctx, api_key):
-    t = time.time()
-    try:
-        with ctx["lock"]:
-            rows = ctx["conn"].execute("SELECT peer,COUNT(*),MAX(observed),COUNT(DISTINCT tip) FROM witness_log WHERE api_key=? GROUP BY peer", (api_key,)).fetchall()
-    except Exception:
-        rows = []
-    if not rows:
-        return {"peers": 0, "strength": "none",
-                "note": "No peers witnessed. Anchoring alone still applies; mutual witnessing does not."}, 200
-
-    total = sum(r[1] for r in rows)
-    live = [r for r in rows if (t - r[2]) < 6 * 3600]
-    stale = [r for r in rows if 6 * 3600 <= (t - r[2]) < 48 * 3600]
-    silent = [r for r in rows if (t - r[2]) >= 48 * 3600]
-    top = max(rows, key=lambda r: r[1])
-    conc = round(100 * top[1] / total, 1)
-
-    if len(live) >= 5 and conc < 50:
-        strength = "strong"
-    elif len(live) >= 3:
-        strength = "adequate"
-    elif len(live) >= 1:
-        strength = "weak"
-    else:
-        strength = "dormant"
-
-    out = {"peers": len(rows), "live": len(live), "stale": len(stale),
-           "silent": len(silent), "observations": total,
-           "largest_peer_share_pct": conc,
-           "strength": strength,
-           "distinct_tips_seen": sum(r[3] for r in rows)}
-    if len(live) < 3:
-        out["flag"] = "fewer than three live peers - breadth is what makes witnessing meaningful, and this network does not have it yet"
-    if conc > 80 and len(rows) > 1:
-        out["concentration_flag"] = "over 80% of observations come from a single peer"
-    if len(rows) == 1:
-        out["reciprocity_warning"] = "a single peer pair proves very little - two parties witnessing only each other can still collude"
-    return out, 200
-
-
-# ------------------------------------------------------------- declaration
-
-def _declaration(ctx, api_key):
-    try:
-        dec = importlib.import_module("modules.declare")
-    except Exception as e:
-        return {"error": "declare_module_unavailable", "detail": str(e)}, 503
-
-    cur, status = dec.handle("GET", "current", {}, api_key, ctx)
-    if status != 200:
-        return cur, status
-    rules = cur["declaration"]["rules"]
-    ver = cur["version"]
-
-    with ctx["lock"]:
-        recs = ctx["conn"].execute("SELECT event_json,result_json FROM audit_log WHERE api_key=? ORDER BY id DESC LIMIT 2000", (api_key,)).fetchall()
-
-    parsed = []
-    for ev, res in recs:
-        try:
-            r = {}
-            r.update(json.loads(ev))
-            r.update(json.loads(res))
-            if str(r.get("decision", "")).endswith("_SEALED"):
-                continue
-            parsed.append(r)
-        except Exception:
-            pass
-
-    report = []
-    for rule in rules:
-        constrained = 0
-        violated = 0
-        for r in parsed:
-            if not dec._test(rule.get("when"), r):
-                continue
-            constrained += 1
-            if not dec._test(rule.get("require"), r):
-                violated += 1
-        entry = {"rule": rule.get("id"), "describe": rule.get("describe"),
-                 "records_constrained": constrained,
-                 "violations": violated,
-                 "coverage_pct": (round(100 * constrained / len(parsed), 1) if parsed else 0)}
-        if constrained == 0:
-            entry["flag"] = "this rule has never constrained a single record - it is decoration, not a standard"
-        report.append(entry)
-
-    dead = len([r for r in report if r["records_constrained"] == 0])
-    covered = len({i for i, rule in enumerate(rules)
-                   if report[i]["records_constrained"] > 0})
-    out = {"declaration_version": ver, "rules": len(rules),
-           "records_examined": len(parsed),
-           "rules_that_constrain_nothing": dead,
-           "rules_with_effect": covered,
-           "per_rule": report}
-    if dead:
-        out["flag"] = str(dead) + " of " + str(len(rules)) + " rules constrain nothing"
-    if not rules:
-        out["flag"] = "an empty declaration passes everything"
-    return out, 200
-
-
-# ---------------------------------------------------------------- routing
-
-def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-    if method == "POST":
-        if action == "probe":
-            return _probe(ctx, api_key, data)
-    else:
-        if action == "probes":
-            return _probes(ctx, api_key)
-        if action == "witness":
-            return _witness(ctx, api_key)
-        if action == "declaration":
-            return _declaration(ctx, api_key)
-        if action in ("", "report"):
-            p, _a = _probes(ctx, api_key)
-            w, _b = _witness(ctx, api_key)
-            d, _c = _declaration(ctx, api_key)
-            return {"conformance_version": VERSION,
-                    "integration": p, "witness_breadth": w,
-                    "declaration_strength": d,
-                    "note": "These are measurements, not enforcement. Nothing here compels good behaviour - it only makes the alternative visible."}, 200
-    return {"error": "unknown_action", "action": action}, 404
 
 ```
