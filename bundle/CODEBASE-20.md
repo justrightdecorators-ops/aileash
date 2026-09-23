@@ -1,10 +1,10 @@
-# Codebase — part 20 of 40
+# Codebase — part 20 of 39
 
 Contains:
 - `modules/standing.py`
 - `modules/startpage.py`
 - `modules/stats.py`
-- `modules/studio.py`
+- `modules/tokensaver.py`
 
 
 ## `modules/standing.py`
@@ -838,494 +838,1679 @@ def handle(method, action, data, api_key, ctx):
 ```
 
 
-## `modules/studio.py`
+## `modules/tokensaver.py`
 
-485 lines, 44634 bytes
+1670 lines, 64529 bytes
 
 ```python
+#!/usr/bin/env python3
 """
-modules/studio.py  v2.0.0
-Monop Studio at /create. Lock a video in the browser: the file is read,
-fingerprinted and wrapped in its own player with the paywall inside it, then
-handed back as a download. The video is never uploaded anywhere. Also the demo
-film, the pricing, the earnings calculator and the form that sends a locked
-video to the cinema's 10p Wing (modules/marquee.py).
+modules/tokensaver.py  v2.0.0
+sebbi.pro - the token saver
 
-Page module, same family as map.py and passportpage.py: a runtime do_GET
-patch. Armed by /x/studio/status after each deploy.
-Everything is base64-embedded so no character can break the Python string.
+Reached at /x/tokensaver/<action>.
+
+WHAT IT IS
+----------
+A deterministic gate that sits in front of a model and decides, in
+arithmetic alone, whether a request is answered from store, sent to the
+model, sent to a cheaper one, held for a person, or refused.
+
+It also tells the caller, on every single request, exactly what in that
+request is costing money that it does not need to cost.
+
+Every decision seals into the platform chain. The saving is a receipt,
+not a claim.
+
+HOW IT IS BUILT
+---------------
+Three layers, in this order, because a cost gate that depends entirely
+on tuned weights is a cost gate nobody can defend in a meeting.
+
+  Layer 1  HARD RULES
+           Absolute, arithmetic, untunable. A budget that is spent is
+           spent. A request repeating identically eight times is a
+           runaway. These do not consult the score at all.
+
+  Layer 2  THE SCORE
+           Nine weighted signals summing to exactly 1.00, split into
+           the ones that measure what this request will SPEND and the
+           ones that measure whether that spend is WASTE.
+
+  Layer 3  FINDINGS
+           Named, itemised waste inside the request, each with a token
+           figure attached and each marked exact or estimated. This is
+           the part that saves the most money, because it changes what
+           the caller sends next time.
+
+THREE TIERS OF CERTAINTY, NEVER MIXED
+-------------------------------------
+  tokens_not_bought          EXACT. Provider-reported counts on a
+                             request that was served from store.
+                             This is the only number that goes in a
+                             savings total.
+
+  worst_case_tokens_avoided  A CEILING, not a saving. When a request
+                             is refused, max_tokens tells you the most
+                             it could have cost. Reported separately
+                             and never added to the exact figure.
+
+  findings tokens            ESTIMATED where marked. Character counts
+                             divided by four. Never enters any total.
+
+Nothing on this page is ever expressed as a percentage saved.
+
+WHAT IT DOES NOT DO
+-------------------
+- It never calls a model to reach a decision. Every signal is
+  arithmetic on the request itself.
+- It only serves a stored answer for an IDENTICAL request. Matching
+  similar prompts needs an embedding, which is a model call, which
+  would defeat the entire point.
+- It does not judge whether a stored answer is still correct.
+- It does not store answers to requests that asked for varied output,
+  unless the caller overrides that deliberately.
+
+MODULE CONTRACT
+---------------
+handle(method, action, data, api_key, ctx) -> (dict, status)
+PUBLIC is a set of (METHOD, action) tuples.
+ctx exposes conn, lock and seal.
 """
 
-import base64
-import sys
+import hashlib
+import inspect
+import json
+import math
+import sqlite3
+import threading
+import time
 
-VERSION = "2.0.0"
+VERSION = "2.2.0"
 
-_HTML_B64 = (
-    "PCFET0NUWVBFIGh0bWw+PGh0bWwgbGFuZz0iZW4iPjxoZWFkPjxtZXRhIGNoYXJzZXQ9IlVURi04Ij4KPG1ldGEgbmFtZT0idmll"
-    "d3BvcnQiIGNvbnRlbnQ9IndpZHRoPWRldmljZS13aWR0aCxpbml0aWFsLXNjYWxlPTEsdmlld3BvcnQtZml0PWNvdmVyIj4KPHRp"
-    "dGxlPk1vbm9wIFN0dWRpbyDigJQgbG9jayB5b3VyIHZpZGVvLCBrZWVwIHRoZSBtb25leTwvdGl0bGU+CjxtZXRhIG5hbWU9ImRl"
-    "c2NyaXB0aW9uIiBjb250ZW50PSJVcGxvYWQgYSB2aWRlbywgc2V0IGEgcHJpY2UsIGdldCBhIGxvY2tlZCBwbGF5ZXIgZmlsZSBi"
-    "YWNrIGluIHNlY29uZHMuIFlvdXIgdmlkZW8gaXMgbmV2ZXIgdXBsb2FkZWQgYW55d2hlcmUuIFZpZXdlcnMgcGF5IHBlbm5pZXMg"
-    "dG8gd2F0Y2ggdGhlIHJlc3QuIj4KPGxpbmsgaHJlZj0iaHR0cHM6Ly9mb250cy5nb29nbGVhcGlzLmNvbS9jc3MyP2ZhbWlseT1J"
-    "Qk0rUGxleCtNb25vOndnaHRANDAwOzUwMDs2MDAmZmFtaWx5PUlCTStQbGV4K1NhbnM6d2dodEA0MDA7NTAwOzYwMCZmYW1pbHk9"
-    "TmV3c3JlYWRlcjpvcHN6LHdnaHRANi4uNzIsNTAwJmRpc3BsYXk9c3dhcCIgcmVsPSJzdHlsZXNoZWV0Ij4KPHN0eWxlPgo6cm9v"
-    "dHstLWluazojMDUwNzBmOy0taW5rMjojMGQxNDI0Oy0tZ29sZDojYzlhODRjOy0tb2s6IzdmZTNiMDstLWJsdWU6IzhmZDBmZjst"
-    "LXBpbms6I2Q1OWJmZjstLW11dGU6IzhhOTNhZDstLWxpbmU6cmdiYSgyMDEsMTY4LDc2LC4yMik7LS1tb25vOidJQk0gUGxleCBN"
-    "b25vJyx1aS1tb25vc3BhY2UsbW9ub3NwYWNlOy0tc2FuczonSUJNIFBsZXggU2Fucycsc3lzdGVtLXVpLHNhbnMtc2VyaWY7LS1z"
-    "ZXJpZjonTmV3c3JlYWRlcicsR2VvcmdpYSxzZXJpZn0KKntib3gtc2l6aW5nOmJvcmRlci1ib3g7bWFyZ2luOjA7cGFkZGluZzow"
-    "Oy13ZWJraXQtdGFwLWhpZ2hsaWdodC1jb2xvcjp0cmFuc3BhcmVudH0KYm9keXtiYWNrZ3JvdW5kOnJhZGlhbC1ncmFkaWVudChl"
-    "bGxpcHNlIGF0IDUwJSAwJSwjMWQxMDQwIDAlLCMwNTA3MGYgNjIlKTtjb2xvcjojZThlZGY3O2ZvbnQtZmFtaWx5OnZhcigtLXNh"
-    "bnMpO2xpbmUtaGVpZ2h0OjEuNjttaW4taGVpZ2h0OjEwMHZofQoud3JhcHttYXgtd2lkdGg6OTIwcHg7bWFyZ2luOjAgYXV0bztw"
-    "YWRkaW5nOjAgMjBweCA4MHB4fQoudG9we2Rpc3BsYXk6ZmxleDtqdXN0aWZ5LWNvbnRlbnQ6c3BhY2UtYmV0d2VlbjthbGlnbi1p"
-    "dGVtczpjZW50ZXI7cGFkZGluZzpjYWxjKDE0cHggKyBlbnYoc2FmZS1hcmVhLWluc2V0LXRvcCkpIDAgMH0KLmJyYW5ke2ZvbnQt"
-    "ZmFtaWx5OnZhcigtLW1vbm8pO2ZvbnQtc2l6ZToxM3B4fS5icmFuZCBie2NvbG9yOnZhcigtLXBpbmspO2ZvbnQtd2VpZ2h0OjUw"
-    "MH0KLnRvcCBhe2ZvbnQtZmFtaWx5OnZhcigtLW1vbm8pO2ZvbnQtc2l6ZToxMnB4O2NvbG9yOnZhcigtLW11dGUpO3RleHQtZGVj"
-    "b3JhdGlvbjpub25lO21hcmdpbi1sZWZ0OjE0cHh9Ci5oZXJve3RleHQtYWxpZ246Y2VudGVyO3BhZGRpbmc6MzhweCAwIDRweH0K"
-    "LmtpY2t7Zm9udC1mYW1pbHk6dmFyKC0tbW9ubyk7Zm9udC1zaXplOjExLjVweDtsZXR0ZXItc3BhY2luZzouMmVtO2NvbG9yOnZh"
-    "cigtLXBpbmspfQpoMXtmb250LWZhbWlseTp2YXIoLS1zZXJpZik7Zm9udC13ZWlnaHQ6NTAwO2ZvbnQtc2l6ZTpjbGFtcCgzNHB4"
-    "LDcuNHZ3LDYwcHgpO2xpbmUtaGVpZ2h0OjEuMDM7bWFyZ2luOjEycHggYXV0byAxMnB4O21heC13aWR0aDoxNGNoO2JhY2tncm91"
-    "bmQ6bGluZWFyLWdyYWRpZW50KDkwZGVnLCNmZmYsI2Q1OWJmZiAzOCUsI2M5YTg0YyA2OCUsIzdmZTNiMCk7LXdlYmtpdC1iYWNr"
-    "Z3JvdW5kLWNsaXA6dGV4dDtiYWNrZ3JvdW5kLWNsaXA6dGV4dDtjb2xvcjp0cmFuc3BhcmVudH0KLmhlcm8gcHtjb2xvcjojYjZj"
-    "MGQ2O21heC13aWR0aDo1NmNoO21hcmdpbjowIGF1dG87Zm9udC1zaXplOjE2LjVweH0KLmJhZGdlc3tkaXNwbGF5OmZsZXg7Z2Fw"
-    "OjhweDtqdXN0aWZ5LWNvbnRlbnQ6Y2VudGVyO2ZsZXgtd3JhcDp3cmFwO21hcmdpbi10b3A6MTZweH0KLmJhZGdlcyBzcGFue2Zv"
-    "bnQ6NTAwIDExcHggdmFyKC0tbW9ubyk7Ym9yZGVyOjFweCBzb2xpZCB2YXIoLS1saW5lKTtib3JkZXItcmFkaXVzOjk5OXB4O3Bh"
-    "ZGRpbmc6NnB4IDEycHg7Y29sb3I6I2NmZDZlNn0Kc2VjdGlvbntwYWRkaW5nOjQ0cHggMCAwO2JvcmRlci10b3A6MXB4IHNvbGlk"
-    "IHJnYmEoMjU1LDI1NSwyNTUsLjA3KTttYXJnaW4tdG9wOjQ0cHh9Cmgye2ZvbnQtZmFtaWx5OnZhcigtLXNlcmlmKTtmb250LXdl"
-    "aWdodDo1MDA7Zm9udC1zaXplOmNsYW1wKDI1cHgsNC42dncsMzhweCk7bWFyZ2luLWJvdHRvbToxMHB4fQoubGVhZHtjb2xvcjoj"
-    "YjZjMGQ2O21heC13aWR0aDo2MmNoO21hcmdpbi1ib3R0b206MThweH0KLmdyaWR7ZGlzcGxheTpncmlkO2dhcDoxNHB4fUBtZWRp"
-    "YShtaW4td2lkdGg6NzYwcHgpey5ncmlkLnR3b3tncmlkLXRlbXBsYXRlLWNvbHVtbnM6MS4xZnIgLjlmcn0uZ3JpZC50aHJlZXtn"
-    "cmlkLXRlbXBsYXRlLWNvbHVtbnM6cmVwZWF0KDMsMWZyKX19Ci5jYXJke2JhY2tncm91bmQ6cmdiYSgxMywyMCwzNiwuODIpO2Jv"
-    "cmRlcjoxcHggc29saWQgdmFyKC0tbGluZSk7Ym9yZGVyLXJhZGl1czoxNnB4O3BhZGRpbmc6MjBweH0KLmNhcmQgaDN7Zm9udC1m"
-    "YW1pbHk6dmFyKC0tc2VyaWYpO2ZvbnQtd2VpZ2h0OjUwMDtmb250LXNpemU6MjFweDttYXJnaW4tYm90dG9tOjZweH0uY2FyZCBw"
-    "e2ZvbnQtc2l6ZToxNHB4O2NvbG9yOiNiNmMwZDZ9CmxhYmVse2Rpc3BsYXk6YmxvY2s7Zm9udDo1MDAgMTFweCB2YXIoLS1tb25v"
-    "KTtsZXR0ZXItc3BhY2luZzouMWVtO2NvbG9yOnZhcigtLW11dGUpO21hcmdpbjoxNHB4IDAgNXB4fQppbnB1dCxzZWxlY3R7d2lk"
-    "dGg6MTAwJTtiYWNrZ3JvdW5kOiMwMzA1MGI7Ym9yZGVyOjFweCBzb2xpZCB2YXIoLS1saW5lKTtib3JkZXItcmFkaXVzOjlweDtj"
-    "b2xvcjojZmZmO3BhZGRpbmc6MTJweDtmb250OjE0cHggdmFyKC0tbW9ubyl9CmlucHV0W3R5cGU9cmFuZ2Vde3BhZGRpbmc6MH0K"
-    "aW5wdXRbdHlwZT1maWxlXXtwYWRkaW5nOjEwcHg7Zm9udDoxMi41cHggdmFyKC0tbW9ubyl9Ci5idG57ZGlzcGxheTppbmxpbmUt"
-    "ZmxleDthbGlnbi1pdGVtczpjZW50ZXI7anVzdGlmeS1jb250ZW50OmNlbnRlcjtnYXA6OHB4O3BhZGRpbmc6MTRweCAyMHB4O2Jv"
-    "cmRlci1yYWRpdXM6MTFweDtmb250OjYwMCAxNHB4IHZhcigtLW1vbm8pO3RleHQtZGVjb3JhdGlvbjpub25lO2JhY2tncm91bmQ6"
-    "dmFyKC0tcGluayk7Y29sb3I6IzA1MDcwZjtib3JkZXI6MDtjdXJzb3I6cG9pbnRlcn0KLmJ0bi5nb2xke2JhY2tncm91bmQ6dmFy"
-    "KC0tZ29sZCl9LmJ0bi5naG9zdHtiYWNrZ3JvdW5kOnRyYW5zcGFyZW50O2NvbG9yOiNmZmY7Ym9yZGVyOjFweCBzb2xpZCByZ2Jh"
-    "KDI1NSwyNTUsMjU1LC4yNSl9Ci5idG5bZGlzYWJsZWRde29wYWNpdHk6LjU1fQoub3V0e21hcmdpbi10b3A6MTZweDtiYWNrZ3Jv"
-    "dW5kOiMwMzA1MGI7Ym9yZGVyOjFweCBzb2xpZCB2YXIoLS1saW5lKTtib3JkZXItcmFkaXVzOjEycHg7cGFkZGluZzoxNnB4O2Zv"
-    "bnQ6MTNweCB2YXIoLS1tb25vKTtjb2xvcjojY2ZlNmQ5O2Rpc3BsYXk6bm9uZX0KLm91dC5vbntkaXNwbGF5OmJsb2NrfQoub3V0"
-    "IC5iaWd7ZGlzcGxheTpibG9jaztmb250LXNpemU6MjRweDtjb2xvcjp2YXIoLS1vayk7bWFyZ2luLWJvdHRvbTo2cHh9Ci5wcm9n"
-    "e2hlaWdodDo2cHg7YmFja2dyb3VuZDpyZ2JhKDI1NSwyNTUsMjU1LC4xKTtib3JkZXItcmFkaXVzOjNweDtvdmVyZmxvdzpoaWRk"
-    "ZW47bWFyZ2luOjEwcHggMH0KLnByb2cgaXtkaXNwbGF5OmJsb2NrO2hlaWdodDoxMDAlO3dpZHRoOjA7YmFja2dyb3VuZDpsaW5l"
-    "YXItZ3JhZGllbnQoOTBkZWcsdmFyKC0tcGluayksdmFyKC0tZ29sZCksdmFyKC0tb2spKTt0cmFuc2l0aW9uOndpZHRoIC4zc30K"
-    "Lm1pbml7Zm9udDo1MDAgMTFweCB2YXIoLS1tb25vKTtjb2xvcjp2YXIoLS1tdXRlKX0KLyogZGVtbyBwbGF5ZXIgKi8KLnBsYXll"
-    "cntwb3NpdGlvbjpyZWxhdGl2ZTttYXJnaW46MjRweCBhdXRvIDA7bWF4LXdpZHRoOjcyMHB4O2FzcGVjdC1yYXRpbzoxNi85O2Jv"
-    "cmRlci1yYWRpdXM6MTZweDtvdmVyZmxvdzpoaWRkZW47YmFja2dyb3VuZDojMDMwNTBiO2JvcmRlcjoxcHggc29saWQgdmFyKC0t"
-    "bGluZSk7Ym94LXNoYWRvdzowIDI2cHggNjZweCByZ2JhKDAsMCwwLC42KX0KLnBsYXllciBjYW52YXN7d2lkdGg6MTAwJTtoZWln"
-    "aHQ6MTAwJTtkaXNwbGF5OmJsb2NrfQoucGJhcntwb3NpdGlvbjphYnNvbHV0ZTtsZWZ0OjA7cmlnaHQ6MDtib3R0b206MDtoZWln"
-    "aHQ6NXB4O2JhY2tncm91bmQ6cmdiYSgyNTUsMjU1LDI1NSwuMTIpfQoucGJhciBpe2Rpc3BsYXk6YmxvY2s7aGVpZ2h0OjEwMCU7"
-    "d2lkdGg6MDtiYWNrZ3JvdW5kOmxpbmVhci1ncmFkaWVudCg5MGRlZyx2YXIoLS1waW5rKSx2YXIoLS1nb2xkKSx2YXIoLS1vaykp"
-    "fQoucGJ0bntwb3NpdGlvbjphYnNvbHV0ZTtsZWZ0OjEycHg7Ym90dG9tOjE0cHg7YmFja2dyb3VuZDpyZ2JhKDUsNywxNSwuNyk7"
-    "Ym9yZGVyOjFweCBzb2xpZCByZ2JhKDI1NSwyNTUsMjU1LC4yNSk7Y29sb3I6I2ZmZjtib3JkZXItcmFkaXVzOjk5OXB4O3dpZHRo"
-    "OjM4cHg7aGVpZ2h0OjM4cHg7Zm9udC1zaXplOjE0cHg7Y3Vyc29yOnBvaW50ZXJ9Ci5wdGltZXtwb3NpdGlvbjphYnNvbHV0ZTty"
-    "aWdodDoxNHB4O2JvdHRvbToyMHB4O2ZvbnQ6NTAwIDExcHggdmFyKC0tbW9ubyk7Y29sb3I6I2NmZDZlNjt0ZXh0LXNoYWRvdzow"
-    "IDFweCA0cHggIzAwMH0KLmxvY2t7cG9zaXRpb246YWJzb2x1dGU7aW5zZXQ6MDtkaXNwbGF5Om5vbmU7ZmxleC1kaXJlY3Rpb246"
-    "Y29sdW1uO2FsaWduLWl0ZW1zOmNlbnRlcjtqdXN0aWZ5LWNvbnRlbnQ6Y2VudGVyO2dhcDoxMHB4O3RleHQtYWxpZ246Y2VudGVy"
-    "O3BhZGRpbmc6MjRweDtiYWNrZ3JvdW5kOnJnYmEoNSw3LDE1LC44NCk7YmFja2Ryb3AtZmlsdGVyOmJsdXIoN3B4KX0KLmxvY2su"
-    "b257ZGlzcGxheTpmbGV4fQp0YWJsZXt3aWR0aDoxMDAlO2JvcmRlci1jb2xsYXBzZTpjb2xsYXBzZTttYXJnaW4tdG9wOjEwcHg7"
-    "Zm9udC1zaXplOjE0cHh9CnRkLHRoe3RleHQtYWxpZ246bGVmdDtwYWRkaW5nOjlweCA2cHg7Ym9yZGVyLWJvdHRvbToxcHggc29s"
-    "aWQgcmdiYSgyNTUsMjU1LDI1NSwuMDgpfQp0aHtmb250OjUwMCAxMC41cHggdmFyKC0tbW9ubyk7bGV0dGVyLXNwYWNpbmc6LjFl"
-    "bTtjb2xvcjp2YXIoLS1tdXRlKX10ZCBie2NvbG9yOnZhcigtLW9rKX0KLnN0cHtkaXNwbGF5OmZsZXg7Z2FwOjE0cHg7cGFkZGlu"
-    "ZzoxMnB4IDA7Ym9yZGVyLWJvdHRvbToxcHggc29saWQgcmdiYSgyNTUsMjU1LDI1NSwuMDYpfQouc3RwIC5ue2ZsZXg6bm9uZTt3"
-    "aWR0aDozNHB4O2hlaWdodDozNHB4O2JvcmRlci1yYWRpdXM6NTAlO2JhY2tncm91bmQ6Y29uaWMtZ3JhZGllbnQodmFyKC0tcGlu"
-    "ayksdmFyKC0tZ29sZCksdmFyKC0tb2spLHZhcigtLXBpbmspKTtjb2xvcjojMDUwNzBmO2Rpc3BsYXk6ZmxleDthbGlnbi1pdGVt"
-    "czpjZW50ZXI7anVzdGlmeS1jb250ZW50OmNlbnRlcjtmb250OjcwMCAxNHB4IHZhcigtLW1vbm8pfQouc3RwIGg0e2ZvbnQtc2l6"
-    "ZToxNS41cHh9LnN0cCBwe2ZvbnQtc2l6ZToxMy41cHg7Y29sb3I6I2I2YzBkNn0KcHJle2JhY2tncm91bmQ6IzAzMDUwYjtib3Jk"
-    "ZXI6MXB4IHNvbGlkIHZhcigtLWxpbmUpO2JvcmRlci1yYWRpdXM6OXB4O3BhZGRpbmc6MTJweDtmb250OjEycHggdmFyKC0tbW9u"
-    "byk7Y29sb3I6I2NmZTZkOTtvdmVyZmxvdy14OmF1dG87d2hpdGUtc3BhY2U6cHJlLXdyYXA7d29yZC1icmVhazpicmVhay1hbGw7"
-    "bWFyZ2luLXRvcDo4cHh9Ci5ub3Rle2ZvbnQtc2l6ZToxMnB4O2NvbG9yOnZhcigtLW11dGUpO21hcmdpbi10b3A6MTBweH0KPC9z"
-    "dHlsZT48L2hlYWQ+PGJvZHk+PGRpdiBjbGFzcz0id3JhcCI+CjxkaXYgY2xhc3M9InRvcCI+PGRpdiBjbGFzcz0iYnJhbmQiPm1v"
-    "bm9wPGI+IHN0dWRpbzwvYj4gwrcgYnkgc2ViYmkucHJvPC9kaXY+PG5hdj48YSBocmVmPSIvIj5Ib21lPC9hPjxhIGhyZWY9Ii9j"
-    "aW5lbWEiPkNpbmVtYTwvYT48YSBocmVmPSIvdG9vbHMiPlRvb2xzPC9hPjwvbmF2PjwvZGl2PgoKPGRpdiBjbGFzcz0iaGVybyI+"
-    "PGRpdiBjbGFzcz0ia2ljayI+TU9OT1BPTElTRSBZT1VSIENPTlRFTlQ8L2Rpdj4KPGgxPkxvY2sgeW91ciB2aWRlbyBpbiAxMCBz"
-    "ZWNvbmRzLjwvaDE+CjxwPlBpY2sgYSB2aWRlbywgc2V0IGEgcHJpY2UsIHRhcCBvbmNlLiBZb3UgZ2V0IGEgZmluaXNoZWQgcGxh"
-    "eWVyIGJhY2sgd2l0aCB0aGUgbG9jayBhbHJlYWR5IGluIGl0LiBZb3VyIHZpZGVvIG5ldmVyIGxlYXZlcyB5b3VyIHBob25lOiB3"
-    "ZSBoYW5kIGl0IHN0cmFpZ2h0IGJhY2ssIGxvY2tlZC48L3A+CjxkaXYgY2xhc3M9ImJhZGdlcyI+PHNwYW4+8J+UkiBOb3RoaW5n"
-    "IHVwbG9hZGVkPC9zcGFuPjxzcGFuPvCfkrcgWW91IGtlZXAgNzAlPC9zcGFuPjxzcGFuPuKaoSBSZWFkeSBpbiBzZWNvbmRzPC9z"
-    "cGFuPjxzcGFuPvCfjqwgU2hhcmUgYW55d2hlcmU8L3NwYW4+PC9kaXY+CjwvZGl2PgoKPHNlY3Rpb24gaWQ9ImxvY2tpdCIgc3R5"
-    "bGU9ImJvcmRlci10b3A6MDttYXJnaW4tdG9wOjIwcHg7cGFkZGluZy10b3A6MTBweCI+CiA8aDI+TG9jayBhIHZpZGVvIG5vdzwv"
-    "aDI+CiA8cCBjbGFzcz0ibGVhZCI+RXZlcnl0aGluZyBoYXBwZW5zIG9uIHlvdXIgb3duIGRldmljZS4gVGhlIHZpZGVvIGlzIHJl"
-    "YWQsIGZpbmdlcnByaW50ZWQgYW5kIHdyYXBwZWQgaW4gaXRzIG93biBwbGF5ZXIsIHRoZW4gaGFuZGVkIGJhY2sgdG8geW91IGFz"
-    "IG9uZSBmaWxlLjwvcD4KIDxkaXYgY2xhc3M9ImdyaWQgdHdvIj4KICA8ZGl2IGNsYXNzPSJjYXJkIj4KICAgPGxhYmVsPllvdXIg"
-    "dmlkZW88L2xhYmVsPjxpbnB1dCB0eXBlPSJmaWxlIiBpZD0idUZpbGUiIGFjY2VwdD0idmlkZW8vKiI+CiAgIDxsYWJlbD5UaXRs"
-    "ZTwvbGFiZWw+PGlucHV0IGlkPSJ1VGl0bGUiIHBsYWNlaG9sZGVyPSJXaGF0IGlzIGl0IGNhbGxlZD8iPgogICA8bGFiZWw+RnJl"
-    "ZSBwcmV2aWV3PC9sYWJlbD48aW5wdXQgaWQ9InVGcmVlIiB0eXBlPSJyYW5nZSIgbWluPSIxMCIgbWF4PSI4MCIgdmFsdWU9IjUw"
-    "Ij4KICAgPGRpdiBjbGFzcz0ibWluaSIgaWQ9InVGcmVlTGFiIj5GaXJzdCA1MCUgcGxheXMgZnJlZTwvZGl2PgogICA8bGFiZWw+"
-    "UHJpY2UgdG8gdW5sb2NrIChwZW5jZSk8L2xhYmVsPjxpbnB1dCBpZD0idVByaWNlIiBpbnB1dG1vZGU9ImRlY2ltYWwiIHZhbHVl"
-    "PSIxMCI+CiAgIDxsYWJlbD5Zb3VyIHBheW1lbnQgbGluayAob3B0aW9uYWwpPC9sYWJlbD48aW5wdXQgaWQ9InVQYXkiIHBsYWNl"
-    "aG9sZGVyPSJodHRwczovL2J1eS5zdHJpcGUuY29tL+KApiI+CiAgIDxkaXYgY2xhc3M9Im1pbmkiPlBhc3RlIHlvdXIgb3duIHBh"
-    "eW1lbnQgbGluayBhbmQgdGhlIHVubG9jayBidXR0b24gc2VuZHMgdmlld2VycyB0byBpdC4gTGVhdmUgaXQgYmxhbmsgYW5kIHRo"
-    "ZSBsb2NrIHJ1bnMgaW4gZGVtbyBtb2RlIHNvIHlvdSBjYW4gdGVzdCBpdC48L2Rpdj4KICAgPGJ1dHRvbiBjbGFzcz0iYnRuIiBp"
-    "ZD0idUdvIiBzdHlsZT0id2lkdGg6MTAwJTttYXJnaW4tdG9wOjE4cHgiPvCflJIgTG9jayBpdDwvYnV0dG9uPgogICA8ZGl2IGNs"
-    "YXNzPSJwcm9nIiBpZD0idVByb2dXcmFwIiBzdHlsZT0iZGlzcGxheTpub25lIj48aSBpZD0idVByb2ciPjwvaT48L2Rpdj4KICAg"
-    "PGRpdiBjbGFzcz0ib3V0IiBpZD0idU91dCI+PC9kaXY+CiAgPC9kaXY+CiAgPGRpdiBjbGFzcz0iY2FyZCI+CiAgIDxoMz5XaGF0"
-    "IGNvbWVzIGJhY2s8L2gzPgogICA8cD5PbmUgZmlsZTogPGI+eW91ci10aXRsZS1sb2NrZWQuaHRtbDwvYj4uIE9wZW4gaXQgb24g"
-    "YW55IHBob25lIG9yIGNvbXB1dGVyLCBlbWFpbCBpdCwgcHV0IGl0IG9uIHlvdXIgd2Vic2l0ZSwgb3IgcG9zdCB0aGUgbGluayBh"
-    "bnl3aGVyZS48L3A+CiAgIDxkaXYgc3R5bGU9Im1hcmdpbi10b3A6MTJweCI+CiAgICA8ZGl2IGNsYXNzPSJzdHAiPjxkaXYgY2xh"
-    "c3M9Im4iPjE8L2Rpdj48ZGl2PjxoND5QbGF5cyBmcmVlIHRvIHlvdXIgY3V0LW9mZjwvaDQ+PHA+WW91ciB2aWV3ZXIgd2F0Y2hl"
-    "cyB0aGUgcHJldmlldyBleGFjdGx5IGFzIG5vcm1hbC48L3A+PC9kaXY+PC9kaXY+CiAgICA8ZGl2IGNsYXNzPSJzdHAiPjxkaXYg"
-    "Y2xhc3M9Im4iPjI8L2Rpdj48ZGl2PjxoND5UaGUgbG9jayBkcm9wcyBpbjwvaDQ+PHA+Qmx1cnJlZCwgd2l0aCB5b3VyIHByaWNl"
-    "IG9uIGl0LiBTa2lwcGluZyBhaGVhZCBpcyBibG9ja2VkLjwvcD48L2Rpdj48L2Rpdj4KICAgIDxkaXYgY2xhc3M9InN0cCI+PGRp"
-    "diBjbGFzcz0ibiI+MzwvZGl2PjxkaXY+PGg0PlRoZXkgcGF5LCBpdCBwbGF5czwvaDQ+PHA+WW91ciBwYXltZW50IGxpbmsgb3Bl"
-    "bnM7IHdoZW4gdGhleSBjb21lIGJhY2sgaXQgdW5sb2NrcyBhbmQgc3RheXMgdW5sb2NrZWQgb24gdGhhdCBkZXZpY2UuPC9wPjwv"
-    "ZGl2PjwvZGl2PgogICA8L2Rpdj4KICAgPHAgY2xhc3M9Im5vdGUiPkJlc3QgdXAgdG8gYWJvdXQgMjUgTUIsIHdoaWNoIGlzIHR3"
-    "byBvciB0aHJlZSBtaW51dGVzIG9mIHBob25lIHZpZGVvLiBCaWdnZXIgZmlsbXMgc3RpbGwgd29yayBidXQgdGFrZSBsb25nZXIg"
-    "dG8gYnVpbGQuPC9wPgogIDwvZGl2PgogPC9kaXY+Cjwvc2VjdGlvbj4KCjxzZWN0aW9uIGlkPSJkZW1vIj4KIDxoMj5TZWUgZXhh"
-    "Y3RseSB3aGF0IGEgdmlld2VyIHNlZXM8L2gyPgogPHAgY2xhc3M9ImxlYWQiPlRoaXMgaXMgYSByZWFsIDM4LXNlY29uZCBmaWxt"
-    "IGFib3V0IHNlYmJpLnBybywgcGxheWluZyBpbiB0aGUgc2FtZSBsb2NrLiBJdCBzdG9wcyBoYWxmd2F5LCBqdXN0IGxpa2UgeW91"
-    "cnMgd2lsbC48L3A+CiA8ZGl2IGNsYXNzPSJwbGF5ZXIiIGlkPSJwbGF5ZXIiPgogIDxjYW52YXMgaWQ9ImN2IiB3aWR0aD0iMTI4"
-    "MCIgaGVpZ2h0PSI3MjAiPjwvY2FudmFzPgogIDxidXR0b24gY2xhc3M9InBidG4iIGlkPSJwYiI+4pa2PC9idXR0b24+PGRpdiBj"
-    "bGFzcz0icHRpbWUiIGlkPSJwdCI+MDowMCAvIDA6Mzg8L2Rpdj4KICA8ZGl2IGNsYXNzPSJwYmFyIj48aSBpZD0icGYiPjwvaT48"
-    "L2Rpdj4KICA8ZGl2IGNsYXNzPSJsb2NrIiBpZD0ibG9jayI+CiAgIDxkaXYgc3R5bGU9ImZvbnQtc2l6ZTozMHB4Ij7wn5SSPC9k"
-    "aXY+CiAgIDxoMyBzdHlsZT0iZm9udC1mYW1pbHk6dmFyKC0tc2VyaWYpO2ZvbnQtd2VpZ2h0OjUwMDtmb250LXNpemU6Y2xhbXAo"
-    "MjBweCw0dncsMzBweCkiPjEwcCB0byB3YXRjaCB0aGUgcmVzdDwvaDM+CiAgIDxwIHN0eWxlPSJjb2xvcjojYjZjMGQ2O2ZvbnQt"
-    "c2l6ZToxMy41cHg7bWF4LXdpZHRoOjQwY2giPllvdSBoYXZlIGhhZCB0aGUgZnJlZSBoYWxmLiBVbmxvY2sgdGhlIGZ1bGwgdmlk"
-    "ZW8gZm9yIDEwcCwgb25lIHRhcC48L3A+CiAgIDxidXR0b24gY2xhc3M9ImJ0biBnb2xkIiBpZD0icGF5QnRuIj5VbmxvY2sgZm9y"
-    "IDEwcDwvYnV0dG9uPgogICA8ZGl2IGNsYXNzPSJtaW5pIj5EZW1vIG9ubHkg4oCUIG5vIHBheW1lbnQgaXMgdGFrZW48L2Rpdj4K"
-    "ICAgPGRpdiBpZD0icmNwdCIgc3R5bGU9ImZvbnQ6NTAwIDExLjVweCB2YXIoLS1tb25vKTtjb2xvcjp2YXIoLS1vaykiPjwvZGl2"
-    "PgogIDwvZGl2PgogPC9kaXY+Cjwvc2VjdGlvbj4KCjxzZWN0aW9uIGlkPSJjaW5lbWEiPgogPGgyPlB1dCBpdCBpbiB0aGUgMTBw"
-    "IFdpbmc8L2gyPgogPHAgY2xhc3M9ImxlYWQiPlRoZSBzZWJiaS5wcm8gY2luZW1hIGhhcyB0d28gd2luZ3M6IGdvdmVybmFuY2Ug"
-    "b24gb25lIHNpZGUsIGFuZCB0aGUgMTBwIFdpbmcgb24gdGhlIG90aGVyLCB3aGVyZSBjcmVhdG9ycycgbG9ja2VkIHZpZGVvcyBw"
-    "bGF5LiBTZW5kIHVzIHRoZSBsaW5rIHRvIHlvdXIgbG9ja2VkIHBsYXllciBhbmQgaXQgdGFrZXMgYSBzY3JlZW4uPC9wPgogPGRp"
-    "diBjbGFzcz0iZ3JpZCB0d28iPgogIDxkaXYgY2xhc3M9ImNhcmQiPgogICA8bGFiZWw+TGluayB0byB5b3VyIGxvY2tlZCB2aWRl"
-    "bzwvbGFiZWw+PGlucHV0IGlkPSJtVXJsIiBwbGFjZWhvbGRlcj0iaHR0cHM6Ly/igKYiPgogICA8bGFiZWw+VGl0bGU8L2xhYmVs"
-    "PjxpbnB1dCBpZD0ibVRpdGxlIiBwbGFjZWhvbGRlcj0iV2hhdCBpcyBpdCBjYWxsZWQ/Ij4KICAgPGxhYmVsPllvdXIgbmFtZSBv"
-    "ciBjaGFubmVsPC9sYWJlbD48aW5wdXQgaWQ9Im1XaG8iIHBsYWNlaG9sZGVyPSJXaG8gbWFkZSBpdD8iPgogICA8bGFiZWw+UHJp"
-    "Y2UgKHBlbmNlKTwvbGFiZWw+PGlucHV0IGlkPSJtUHJpY2UiIGlucHV0bW9kZT0ibnVtZXJpYyIgdmFsdWU9IjEwIj4KICAgPGJ1"
-    "dHRvbiBjbGFzcz0iYnRuIiBpZD0ibUdvIiBzdHlsZT0id2lkdGg6MTAwJTttYXJnaW4tdG9wOjE2cHgiPvCfjqwgU2VuZCBpdCB0"
-    "byB0aGUgMTBwIFdpbmc8L2J1dHRvbj4KICAgPGRpdiBjbGFzcz0ib3V0IiBpZD0ibU91dCI+PC9kaXY+CiAgPC9kaXY+CiAgPGRp"
-    "diBjbGFzcz0iY2FyZCI+CiAgIDxoMz5Ib3VzZSBydWxlczwvaDM+CiAgIDxwPk9ubHkgeW91ciBvd24gd29yay4gQnkgc2VuZGlu"
-    "ZyBpdCB5b3UgY29uZmlybSB5b3UgaG9sZCB0aGUgcmlnaHRzIHRvIHRoZSB2aWRlbyBhbmQgZXZlcnl0aGluZyBpbiBpdC48L3A+"
-    "CiAgIDxwIHN0eWxlPSJtYXJnaW4tdG9wOjEwcHgiPldlIG5ldmVyIGhvbGQgeW91ciB2aWRlbywgb25seSB0aGUgbGluayB5b3Ug"
-    "Z2l2ZSB1cyBhbmQgdGhlIHRpdGxlLiBFdmVyeSBzdWJtaXNzaW9uIGlzIHNlYWxlZCBvbiB0aGUgY2hhaW4gd2hlbiBpdCBsYW5k"
-    "cywgc28gdGhlIGRhdGUgeW91IHNlbnQgaXQgaXMgcHJvdmFibGUuPC9wPgogICA8cCBzdHlsZT0ibWFyZ2luLXRvcDoxMHB4Ij5T"
-    "Y3JlZW5zIGFyZSByZXZpZXdlZCBiZWZvcmUgdGhleSBnbyB1cC48L3A+CiAgIDxhIGNsYXNzPSJidG4gZ2hvc3QiIGhyZWY9Ii9j"
-    "aW5lbWEiIHN0eWxlPSJtYXJnaW4tdG9wOjE0cHgiPlZpc2l0IHRoZSBjaW5lbWEg4oaSPC9hPgogIDwvZGl2PgogPC9kaXY+Cjwv"
-    "c2VjdGlvbj4KCjxzZWN0aW9uIGlkPSJwcmljZSI+CiA8aDI+V2hhdCBpdCBjb3N0czwvaDI+CiA8ZGl2IGNsYXNzPSJncmlkIHR3"
-    "byI+CiAgPGRpdiBjbGFzcz0iY2FyZCI+PGgzPjUwcCBwZXIgdmlkZW8sIHBlciBtb250aDwvaDM+PHA+VGhlIGtlZXAtaXQtbG9j"
-    "a2VkIGZlZS4gU3RvcCBwYXlpbmcgYW5kIHRoZSBsb2NrIGxpZnRzLiBUaGUgdmlkZW8gc3RheXMgeW91cnMgYW5kIGV2ZXJ5IHBl"
-    "bm55IHlvdSBoYXZlIG1hZGUgc3RheXMgeW91cnMuPC9wPjwvZGl2PgogIDxkaXYgY2xhc3M9ImNhcmQiPjxoMz5Zb3Uga2VlcCA3"
-    "cCBvZiBldmVyeSAxMHA8L2gzPjxwPlRocmVlIHBlbmNlIG9mIGVhY2ggdW5sb2NrIGNvdmVycyB0aGUgbG9jaywgdGhlIHBheW1l"
-    "bnQgYW5kIHRoZSBzZWFsZWQgcmVjZWlwdC4gVGhhdCBpcyA3MCUgdG8geW91LjwvcD48L2Rpdj4KIDwvZGl2PgogPHRhYmxlPjx0"
-    "cj48dGg+WW91ciBwcmljZTwvdGg+PHRoPllvdSBrZWVwPC90aD48dGg+c2ViYmkucHJvPC90aD48dGg+MSwwMDAgdmlld3M8L3Ro"
-    "PjwvdHI+CiA8dHI+PHRkPjVwPC90ZD48dGQ+PGI+My41cDwvYj48L3RkPjx0ZD4xLjVwPC90ZD48dGQ+PGI+wqMzNTwvYj48L3Rk"
-    "PjwvdHI+CiA8dHI+PHRkPjEwcDwvdGQ+PHRkPjxiPjdwPC9iPjwvdGQ+PHRkPjNwPC90ZD48dGQ+PGI+wqM3MDwvYj48L3RkPjwv"
-    "dHI+CiA8dHI+PHRkPjI1cDwvdGQ+PHRkPjxiPjE3LjVwPC9iPjwvdGQ+PHRkPjcuNXA8L3RkPjx0ZD48Yj7CozE3NTwvYj48L3Rk"
-    "PjwvdHI+CiA8dHI+PHRkPjUwcDwvdGQ+PHRkPjxiPjM1cDwvYj48L3RkPjx0ZD4xNXA8L3RkPjx0ZD48Yj7CozM1MDwvYj48L3Rk"
-    "PjwvdHI+PC90YWJsZT4KIDxkaXYgY2xhc3M9ImdyaWQgdHdvIiBzdHlsZT0ibWFyZ2luLXRvcDoxNnB4Ij4KICA8ZGl2IGNsYXNz"
-    "PSJjYXJkIj4KICAgPGgzPldvcmsgb3V0IHlvdXIgbW9udGg8L2gzPgogICA8bGFiZWw+UHJpY2UgcGVyIHZpZXcgKHBlbmNlKTwv"
-    "bGFiZWw+PGlucHV0IGlkPSJjUHJpY2UiIGlucHV0bW9kZT0iZGVjaW1hbCIgdmFsdWU9IjEwIj4KICAgPGxhYmVsPlZpZGVvcyBs"
-    "b2NrZWQ8L2xhYmVsPjxpbnB1dCBpZD0iY1ZpZHMiIGlucHV0bW9kZT0ibnVtZXJpYyIgdmFsdWU9IjQiPgogICA8bGFiZWw+UGFp"
-    "ZCB2aWV3cyBwZXIgdmlkZW8sIHBlciBtb250aDwvbGFiZWw+PGlucHV0IGlkPSJjVmlld3MiIGlucHV0bW9kZT0ibnVtZXJpYyIg"
-    "dmFsdWU9IjUwMCI+CiAgIDxkaXYgY2xhc3M9Im91dCBvbiIgc3R5bGU9Im1hcmdpbi10b3A6MTRweCI+PHNwYW4gY2xhc3M9ImJp"
-    "ZyIgaWQ9ImNPdXQiPsKjMDwvc3Bhbj55b3VycyBhZnRlciB0aGUgbW9udGhseSBmZWU8ZGl2IGlkPSJjRGV0YWlsIiBzdHlsZT0i"
-    "Y29sb3I6IzhhOTNhZDttYXJnaW4tdG9wOjZweCI+PC9kaXY+PC9kaXY+CiAgPC9kaXY+CiAgPGRpdiBjbGFzcz0iY2FyZCI+PGgz"
-    "PldoeSBwZW9wbGUgdGFwPC9oMz48cD5Ob2JvZHkgcGF5cyBmb3IgYSB2aWRlbyB0aGV5IGhhdmUgbm90IHNlZW4uIEFsbW9zdCBl"
-    "dmVyeW9uZSB0YXBzIDEwcCBvbmNlIHRoZXkgYXJlIGhvb2tlZCBoYWxmd2F5IHRocm91Z2guIFRoZSBmcmVlIGhhbGYgc2VsbHMg"
-    "aXQ7IHRoZSBsb2NrIGVhcm5zIGZyb20gaXQuPC9wPgogIDxwIHN0eWxlPSJtYXJnaW4tdG9wOjEwcHgiPkFuZCBiZWNhdXNlIGV2"
-    "ZXJ5IHBhaWQgdmlldyBjYW4gYmUgc2VhbGVkIG9uIGEgcHVibGljIGNoYWluLCB5b3UgY2FuIHNob3cgYSBzcG9uc29yIGEgdmll"
-    "dyBjb3VudCB0aGV5IGNhbiBjaGVjayB0aGVtc2VsdmVzLiBObyBvdGhlciBwbGF0Zm9ybSBnaXZlcyB5b3UgdGhhdC48L3A+PC9k"
-    "aXY+CiA8L2Rpdj4KPC9zZWN0aW9uPgoKPHNlY3Rpb24gaWQ9ImNlbnRyZSI+CiA8aDI+WW91ciBjb250cm9sIGNlbnRyZTwvaDI+"
-    "CiA8ZGl2IGNsYXNzPSJncmlkIHRocmVlIj4KICA8ZGl2IGNsYXNzPSJjYXJkIj48aDM+TG9jayBidWlsZGVyPC9oMz48cD5DdXQt"
-    "b2ZmIHBvaW50LCBwcmljZSBhbmQgcGF5bWVudCBsaW5rLiBQcmV2aWV3IGV4YWN0bHkgd2hhdCBhIHZpZXdlciBzZWVzLjwvcD48"
-    "L2Rpdj4KICA8ZGl2IGNsYXNzPSJjYXJkIj48aDM+U2hhcmUgcGFjazwvaDM+PHA+T25lIGZpbGUsIG9uZSBsaW5rLCBhbmQgYW4g"
-    "ZW1iZWQgc25pcHBldCBmb3IgeW91ciBvd24gc2l0ZS48L3A+PC9kaXY+CiAgPGRpdiBjbGFzcz0iY2FyZCI+PGgzPlNlYWxlZCBy"
-    "ZWNlaXB0czwvaDM+PHA+UGFpZCB2aWV3cyB3aXRoIGJsb2NrIG51bWJlcnMsIGV4cG9ydGFibGUgZm9yIGEgc3BvbnNvciBvciBh"
-    "biBhY2NvdW50YW50LjwvcD48L2Rpdj4KICA8ZGl2IGNsYXNzPSJjYXJkIj48aDM+VGhlIDEwcCBXaW5nPC9oMz48cD5Zb3VyIGxv"
-    "Y2tlZCB2aWRlb3Mgb24gdGhlIGNpbmVtYSdzIGNyZWF0b3Igc2NyZWVucy48L3A+PC9kaXY+CiAgPGRpdiBjbGFzcz0iY2FyZCI+"
-    "PGgzPkZpbmdlcnByaW50czwvaDM+PHA+RXZlcnkgZmlsZSBjYXJyaWVzIGEgaGFzaCBvZiB5b3VyIGV4YWN0IGN1dCwgc28geW91"
-    "IGNhbiBwcm92ZSB3aGljaCB2ZXJzaW9uIGlzIHlvdXJzLjwvcD48L2Rpdj4KICA8ZGl2IGNsYXNzPSJjYXJkIj48aDM+UHJvb2Yg"
-    "YmFkZ2U8L2gzPjxwPlNob3cgYSB2ZXJpZmllZCB2aWV3IGNvdW50IG9uIHlvdXIgb3duIHNpdGUsIGxpdmUuPC9wPjwvZGl2Pgog"
-    "PC9kaXY+CiA8cHJlPiZsdDtpZnJhbWUgc3JjPSJodHRwczovL3lvdXItc2l0ZS5jb20veW91ci12aWRlby1sb2NrZWQuaHRtbCIg"
-    "d2lkdGg9IjEwMCUiIGhlaWdodD0iNDIwIiBhbGxvd2Z1bGxzY3JlZW4mZ3Q7Jmx0Oy9pZnJhbWUmZ3Q7PC9wcmU+CiA8YSBjbGFz"
-    "cz0iYnRuIiBocmVmPSIjbG9ja2l0Ij5Mb2NrIHlvdXIgZmlyc3QgdmlkZW8g4oaSPC9hPgo8L3NlY3Rpb24+CjwvZGl2Pgo8c2Ny"
-    "aXB0IGlkPSJ0cGwiIHR5cGU9InRleHQvcGxhaW4iPlBDRkVUME5VV1ZCRklHaDBiV3crUEdoMGJXd2diR0Z1WnowaVpXNGlQanhv"
-    "WldGa1BqeHRaWFJoSUdOb1lYSnpaWFE5SWxWVVJpMDRJajRLUEcxbGRHRWdibUZ0WlQwaWRtbGxkM0J2Y25RaUlHTnZiblJsYm5R"
-    "OUluZHBaSFJvUFdSbGRtbGpaUzEzYVdSMGFDeHBibWwwYVdGc0xYTmpZV3hsUFRFc2RtbGxkM0J2Y25RdFptbDBQV052ZG1WeUlq"
-    "NEtQSFJwZEd4bFBsOWZWRWxVVEVWZlh6d3ZkR2wwYkdVK0NqeHRaWFJoSUc1aGJXVTlJbVJsYzJOeWFYQjBhVzl1SWlCamIyNTBa"
-    "VzUwUFNKZlgxUkpWRXhGWDE4ZzRvQ1VJR3h2WTJ0bFpDQjNhWFJvSUUxdmJtOXdJRk4wZFdScGJ5SStDanh6ZEhsc1pUNEtLbnRp"
-    "YjNndGMybDZhVzVuT21KdmNtUmxjaTFpYjNnN2JXRnlaMmx1T2pBN2NHRmtaR2x1Wnpvd2ZRcGliMlI1ZTJKaFkydG5jbTkxYm1R"
-    "NmNtRmthV0ZzTFdkeVlXUnBaVzUwS0dWc2JHbHdjMlVnWVhRZ05UQWxJREFsTENNeFlURXdNemdzSXpBMU1EY3daaUEyTlNVcE8y"
-    "TnZiRzl5T2lObE9HVmtaamM3Wm05dWRDMW1ZVzFwYkhrNmMzbHpkR1Z0TFhWcExDMWhjSEJzWlMxemVYTjBaVzBzSWxObFoyOWxJ"
-    "RlZKSWl4ellXNXpMWE5sY21sbU8yMXBiaTFvWldsbmFIUTZNVEF3ZG1nN1pHbHpjR3hoZVRwbWJHVjRPMkZzYVdkdUxXbDBaVzF6"
-    "T21ObGJuUmxjanRxZFhOMGFXWjVMV052Ym5SbGJuUTZZMlZ1ZEdWeU8zQmhaR1JwYm1jNk1UWndlSDBLTG5kN2QybGtkR2c2TVRB"
-    "d0pUdHRZWGd0ZDJsa2RHZzZPRFl3Y0hoOUNtZ3hlMlp2Ym5RdGMybDZaVHBqYkdGdGNDZ3hPSEI0TERSMmR5d3lObkI0S1R0bWIy"
-    "NTBMWGRsYVdkb2REbzJNREE3YldGeVoybHVMV0p2ZEhSdmJUb3hNSEI0ZlFvdWNIdHdiM05wZEdsdmJqcHlaV3hoZEdsMlpUdGli"
-    "M0prWlhJdGNtRmthWFZ6T2pFMmNIZzdiM1psY21ac2IzYzZhR2xrWkdWdU8ySmhZMnRuY205MWJtUTZJekF3TUR0aWIzSmtaWEk2"
-    "TVhCNElITnZiR2xrSUhKblltRW9NakF4TERFMk9DdzNOaXd1TXpVcE8ySnZlQzF6YUdGa2IzYzZNQ0F5Tm5CNElEY3djSGdnY21k"
-    "aVlTZ3dMREFzTUN3dU5qVXBMREFnTUNBME5IQjRJSEpuWW1Fb01qRXpMREUxTlN3eU5UVXNMakV5S1gwS2RtbGtaVzk3ZDJsa2RH"
-    "ZzZNVEF3SlR0a2FYTndiR0Y1T21Kc2IyTnJmUW91Ykd0N2NHOXphWFJwYjI0NllXSnpiMngxZEdVN2FXNXpaWFE2TUR0a2FYTndi"
-    "R0Y1T201dmJtVTdabXhsZUMxa2FYSmxZM1JwYjI0NlkyOXNkVzF1TzJGc2FXZHVMV2wwWlcxek9tTmxiblJsY2p0cWRYTjBhV1o1"
-    "TFdOdmJuUmxiblE2WTJWdWRHVnlPMmRoY0RveE1uQjRPM1JsZUhRdFlXeHBaMjQ2WTJWdWRHVnlPM0JoWkdScGJtYzZNakp3ZUR0"
-    "aVlXTnJaM0p2ZFc1a09uSm5ZbUVvTlN3M0xERTFMQzQ0TmlrN1ltRmphMlJ5YjNBdFptbHNkR1Z5T21Kc2RYSW9PWEI0S1gwS0xt"
-    "eHJMbTl1ZTJScGMzQnNZWGs2Wm14bGVIMEtMbWxqZTJadmJuUXRjMmw2WlRvek1uQjRmUW91YkdzZ2FESjdabTl1ZEMxemFYcGxP"
-    "bU5zWVcxd0tERTVjSGdzTkM0MmRuY3NNekJ3ZUNrN1ptOXVkQzEzWldsbmFIUTZOakF3ZlFvdWJHc2djSHRqYjJ4dmNqb2pZalpq"
-    "TUdRMk8yWnZiblF0YzJsNlpUb3hOSEI0TzIxaGVDMTNhV1IwYURvek9HTm9mUW91WW50aVlXTnJaM0p2ZFc1a09pTmpPV0U0TkdN"
-    "N1kyOXNiM0k2SXpBMU1EY3daanRpYjNKa1pYSTZNRHRpYjNKa1pYSXRjbUZrYVhWek9qRXhjSGc3Y0dGa1pHbHVaem94TkhCNElE"
-    "STBjSGc3Wm05dWREbzJNREFnTVRWd2VDQjFhUzF0YjI1dmMzQmhZMlVzVFdWdWJHOHNiVzl1YjNOd1lXTmxPMk4xY25OdmNqcHdi"
-    "Mmx1ZEdWeU8zUmxlSFF0WkdWamIzSmhkR2x2YmpwdWIyNWxPMkp2ZUMxemFHRmtiM2M2TUNBd0lESTRjSGdnY21kaVlTZ3lNREVz"
-    "TVRZNExEYzJMQzQwTlNsOUNpNXRlMlp2Ym5RNk5UQXdJREV4Y0hnZ2RXa3RiVzl1YjNOd1lXTmxMRzF2Ym05emNHRmpaVHRqYjJ4"
-    "dmNqb2pPR0U1TTJGa2ZRb3VZbUZ5ZTNCdmMybDBhVzl1T21GaWMyOXNkWFJsTzJ4bFpuUTZNRHR5YVdkb2REb3dPMkp2ZEhSdmJU"
-    "b3dPMmhsYVdkb2REbzBjSGc3WW1GamEyZHliM1Z1WkRweVoySmhLREkxTlN3eU5UVXNNalUxTEM0eE1pbDlDaTVpWVhJZ2FYdGth"
-    "WE53YkdGNU9tSnNiMk5yTzJobGFXZG9kRG94TURBbE8zZHBaSFJvT2pBN1ltRmphMmR5YjNWdVpEcHNhVzVsWVhJdFozSmhaR2xs"
-    "Ym5Rb09UQmtaV2NzSTJRMU9XSm1aaXdqWXpsaE9EUmpMQ00zWm1VellqQXBmUW91Wm5KbFpYdHdiM05wZEdsdmJqcGhZbk52YkhW"
-    "MFpUdDBiM0E2TVRCd2VEdHNaV1owT2pFeWNIZzdZbUZqYTJkeWIzVnVaRHB5WjJKaEtEVXNOeXd4TlN3dU56VXBPMkp2Y21SbGNq"
-    "b3hjSGdnYzI5c2FXUWdjbWRpWVNneU1ERXNNVFk0TERjMkxDNDBLVHRpYjNKa1pYSXRjbUZrYVhWek9qazVPWEI0TzNCaFpHUnBi"
-    "bWM2TlhCNElERXdjSGc3Wm05dWREbzJNREFnTVRBdU5YQjRJSFZwTFcxdmJtOXpjR0ZqWlN4dGIyNXZjM0JoWTJVN1kyOXNiM0k2"
-    "STJNNVlUZzBZMzBLTG5SN2JXRnlaMmx1TFhSdmNEb3hNbkI0TzJadmJuUTZOVEF3SURFeExqVndlQ0IxYVMxdGIyNXZjM0JoWTJV"
-    "c2JXOXViM053WVdObE8yTnZiRzl5T2lNNFlUa3pZV1E3ZEdWNGRDMWhiR2xuYmpwalpXNTBaWEk3YkdsdVpTMW9aV2xuYUhRNk1T"
-    "NDNmUW91ZENCaGUyTnZiRzl5T2lOak9XRTROR003ZEdWNGRDMWtaV052Y21GMGFXOXVPbTV2Ym1WOUNqd3ZjM1I1YkdVK1BDOW9a"
-    "V0ZrUGp4aWIyUjVQanhrYVhZZ1kyeGhjM005SW5jaVBnbzhhREUrWDE5VVNWUk1SVjlmUEM5b01UNEtQR1JwZGlCamJHRnpjejBp"
-    "Y0NJK0NpQThkbWxrWlc4Z2FXUTlJbllpSUhCc1lYbHphVzVzYVc1bElHTnZiblJ5YjJ4eklHTnZiblJ5YjJ4elRHbHpkRDBpYm05"
-    "a2IzZHViRzloWkNJZ1pHbHpZV0pzWlhCcFkzUjFjbVZwYm5CcFkzUjFjbVVnYzNKalBTSmZYMU5TUTE5ZklqNDhMM1pwWkdWdlBn"
-    "b2dQR1JwZGlCamJHRnpjejBpWm5KbFpTSWdhV1E5SW1aeVpXVlVZV2NpUGtaU1JVVWdVRkpGVmtsRlZ6d3ZaR2wyUGdvZ1BHUnBk"
-    "aUJqYkdGemN6MGlZbUZ5SWo0OGFTQnBaRDBpY0dZaVBqd3ZhVDQ4TDJScGRqNEtJRHhrYVhZZ1kyeGhjM005SW14cklpQnBaRDBp"
-    "YkdzaVBnb2dJRHhrYVhZZ1kyeGhjM005SW1saklqNG1JekV5T0RJM05EczhMMlJwZGo0S0lDQThhREkrWDE5UVVrbERSVjlmY0NC"
-    "MGJ5QjNZWFJqYUNCMGFHVWdjbVZ6ZER3dmFESStDaUFnUEhBK1ZHaGhkQ0IzWVhNZ2RHaGxJR1p5WldVZ2NISmxkbWxsZHk0Z1ZX"
-    "NXNiMk5ySUhSb1pTQm1kV3hzSUhacFpHVnZJR0Z1WkNCclpXVndJSGRoZEdOb2FXNW5Mand2Y0Q0S0lDQmZYMUJCV1VKVVRsOWZD"
-    "aUE4TDJScGRqNEtQQzlrYVhZK0NqeGthWFlnWTJ4aGMzTTlJblFpUGt4dlkydGxaQ0IzYVhSb0lEeGhJR2h5WldZOUltaDBkSEJ6"
-    "T2k4dmMyVmlZbWt1Y0hKdkwyTnlaV0YwWlNJZ2RHRnlaMlYwUFNKZllteGhibXNpSUhKbGJEMGlibTl2Y0dWdVpYSWlQazF2Ym05"
-    "d0lGTjBkV1JwYnp3dllUNGdKbTFwWkdSdmREc2dabWx1WjJWeWNISnBiblFnWDE5VFNFOVNWRWhCVTBoZlh5Wm9aV3hzYVhBN1BH"
-    "SnlQZ3BVYUdseklIWnBaR1Z2SUhkaGN5QnVaWFpsY2lCMWNHeHZZV1JsWkNCaGJubDNhR1Z5WlM0Z1NYUWdiR2wyWlhNZ2FXNXph"
-    "V1JsSUhSb2FYTWdabWxzWlM0OEwyUnBkajRLUEM5a2FYWStDanh6WTNKcGNIUStDaWhtZFc1amRHbHZiaWdwZXdvaWRYTmxJSE4w"
-    "Y21samRDSTdDblpoY2lCMlBXUnZZM1Z0Wlc1MExtZGxkRVZzWlcxbGJuUkNlVWxrS0NKMklpa3NiR3M5Wkc5amRXMWxiblF1WjJW"
-    "MFJXeGxiV1Z1ZEVKNVNXUW9JbXhySWlrc2NHWTlaRzlqZFcxbGJuUXVaMlYwUld4bGJXVnVkRUo1U1dRb0luQm1JaWtzQ2lBZ0lD"
-    "QjBZV2M5Wkc5amRXMWxiblF1WjJWMFJXeGxiV1Z1ZEVKNVNXUW9JbVp5WldWVVlXY2lLU3huYnoxa2IyTjFiV1Z1ZEM1blpYUkZi"
-    "R1Z0Wlc1MFFubEpaQ2dpWjI4aUtTd0tJQ0FnSUVaU1JVVTlYMTlHVWtWRlgxOHNJRXRGV1QwaWJXOXViM0E2WDE5VFNFOVNWRWhC"
-    "VTBoZlh5SXNJSEJoYVdROVptRnNjMlU3Q25SeWVYc2dhV1lvYkc5allXeFRkRzl5WVdkbExtZGxkRWwwWlcwb1MwVlpLVDA5UFNJ"
-    "eElpa2djR0ZwWkQxMGNuVmxPeUI5WTJGMFkyZ29aU2w3ZlFwcFppaHNiMk5oZEdsdmJpNXpaV0Z5WTJndWFXNWtaWGhQWmlnaWNH"
-    "RnBaRDB4SWlrK1BUQXBleUJ3WVdsa1BYUnlkV1U3SUhSeWVYdHNiMk5oYkZOMGIzSmhaMlV1YzJWMFNYUmxiU2hMUlZrc0lqRWlL"
-    "WDFqWVhSamFDaGxLWHQ5SUgwS2FXWW9jR0ZwWkNrZ2RHRm5Mbk4wZVd4bExtUnBjM0JzWVhrOUltNXZibVVpT3dwMkxtRmtaRVYy"
-    "Wlc1MFRHbHpkR1Z1WlhJb0luUnBiV1YxY0dSaGRHVWlMR1oxYm1OMGFXOXVLQ2w3Q2lBZ2FXWW9JWFl1WkhWeVlYUnBiMjRwSUhK"
-    "bGRIVnlianNLSUNCd1ppNXpkSGxzWlM1M2FXUjBhRDBvZGk1amRYSnlaVzUwVkdsdFpTOTJMbVIxY21GMGFXOXVLakV3TUNrcklp"
-    "VWlPd29nSUdsbUtIQmhhV1FwSUhKbGRIVnlianNLSUNCcFppaDJMbU4xY25KbGJuUlVhVzFsSUQ0OUlIWXVaSFZ5WVhScGIyNHFS"
-    "bEpGUlNsN0lIWXVjR0YxYzJVb0tUc2dkaTVqZFhKeVpXNTBWR2x0WlQxMkxtUjFjbUYwYVc5dUtrWlNSVVU3SUd4ckxtTnNZWE56"
-    "VEdsemRDNWhaR1FvSW05dUlpazdJSDBLZlNrN0NuWXVZV1JrUlhabGJuUk1hWE4wWlc1bGNpZ2ljMlZsYTJsdVp5SXNablZ1WTNS"
-    "cGIyNG9LWHNnYVdZb0lYQmhhV1FnSmlZZ2RpNWtkWEpoZEdsdmJpQW1KaUIyTG1OMWNuSmxiblJVYVcxbElENGdkaTVrZFhKaGRH"
-    "bHZiaXBHVWtWRktYc2dkaTVqZFhKeVpXNTBWR2x0WlQxMkxtUjFjbUYwYVc5dUtrWlNSVVU3SUd4ckxtTnNZWE56VEdsemRDNWha"
-    "R1FvSW05dUlpazdJSDBnZlNrN0NtbG1LR2R2S1NCbmJ5NWhaR1JGZG1WdWRFeHBjM1JsYm1WeUtDSmpiR2xqYXlJc1puVnVZM1Jw"
-    "YjI0b0tYc2dYMTlRUVZsS1UxOWZJSDBwT3dwOUtTZ3BPd284TDNOamNtbHdkRDQ4TDJKdlpIaytQQzlvZEcxc1Bnbz08L3Njcmlw"
-    "dD4KPHNjcmlwdD4KKGZ1bmN0aW9uKCl7CiJ1c2Ugc3RyaWN0IjsKLyogLS0tLS0tLS0tLS0tLS0tLSBkZW1vIGZpbG0gLS0tLS0t"
-    "LS0tLS0tLS0tLSAqLwp2YXIgY3Y9ZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoImN2IiksZz1jdi5nZXRDb250ZXh0KCIyZCIpLFc9"
-    "MTI4MCxIPTcyMDsKdmFyIERVUj0zOCxGUkVFPS41LHQ9MCxwbGF5aW5nPWZhbHNlLGxhc3Q9MCx1bmxvY2tlZD1mYWxzZTsKdmFy"
-    "IEdPTEQ9IiNjOWE4NGMiLE9LPSIjN2ZlM2IwIixCTFVFPSIjOGZkMGZmIixQSU5LPSIjZDU5YmZmIjsKZnVuY3Rpb24gYmcoKXt2"
-    "YXIgZD1nLmNyZWF0ZUxpbmVhckdyYWRpZW50KDAsMCxXLEgpO2QuYWRkQ29sb3JTdG9wKDAsIiMwYjEwMjYiKTtkLmFkZENvbG9y"
-    "U3RvcCgxLCIjMDMwNTBiIik7Zy5maWxsU3R5bGU9ZDtnLmZpbGxSZWN0KDAsMCxXLEgpOwogZy5nbG9iYWxBbHBoYT0uMjI7Zy5z"
-    "dHJva2VTdHlsZT0iIzFkMmE1MiI7Zy5saW5lV2lkdGg9MTtmb3IodmFyIHg9MDt4PFc7eCs9NjQpe2cuYmVnaW5QYXRoKCk7Zy5t"
-    "b3ZlVG8oeCwwKTtnLmxpbmVUbyh4LEgpO2cuc3Ryb2tlKCl9CiBmb3IodmFyIHk9MDt5PEg7eSs9NjQpe2cuYmVnaW5QYXRoKCk7"
-    "Zy5tb3ZlVG8oMCx5KTtnLmxpbmVUbyhXLHkpO2cuc3Ryb2tlKCl9Zy5nbG9iYWxBbHBoYT0xfQpmdW5jdGlvbiB0eHQocyx5LHNp"
-    "emUsY29sKXtnLmZpbGxTdHlsZT1jb2x8fCIjZmZmIjtnLnRleHRBbGlnbj0iY2VudGVyIjtnLmZvbnQ9IjYwMCAiK3NpemUrInB4"
-    "ICdJQk0gUGxleCBTYW5zJyxzeXN0ZW0tdWksc2Fucy1zZXJpZiI7Zy5maWxsVGV4dChzLFcvMix5KX0KZnVuY3Rpb24gc2VyaWYo"
-    "cyx5LHNpemUsY29sKXtnLmZpbGxTdHlsZT1jb2x8fCIjZmZmIjtnLnRleHRBbGlnbj0iY2VudGVyIjtnLmZvbnQ9IjUwMCAiK3Np"
-    "emUrInB4IE5ld3NyZWFkZXIsR2VvcmdpYSxzZXJpZiI7Zy5maWxsVGV4dChzLFcvMix5KX0KZnVuY3Rpb24gbW9ubyhzLHksc2l6"
-    "ZSxjb2wpe2cuZmlsbFN0eWxlPWNvbHx8R09MRDtnLnRleHRBbGlnbj0iY2VudGVyIjtnLmZvbnQ9IjUwMCAiK3NpemUrInB4IHVp"
-    "LW1vbm9zcGFjZSxNZW5sbyxtb25vc3BhY2UiO2cuZmlsbFRleHQocyxXLzIseSl9CmZ1bmN0aW9uIGJsb2NrKHgseSx3LGgsY29s"
-    "LGdsb3cpe2cuc2F2ZSgpO2cuc2hhZG93Q29sb3I9Y29sO2cuc2hhZG93Qmx1cj1nbG93fHwxODtnLmZpbGxTdHlsZT0iIzBkMTQy"
-    "NCI7Zy5zdHJva2VTdHlsZT1jb2w7Zy5saW5lV2lkdGg9MzsKIGcuYmVnaW5QYXRoKCk7Zy5yb3VuZFJlY3QoeCx5LHcsaCwxMCk7"
-    "Zy5maWxsKCk7Zy5zdHJva2UoKTtnLnJlc3RvcmUoKX0KZnVuY3Rpb24gcm9ib3QoeCx5LHMsY29sKXtnLnNhdmUoKTtnLnRyYW5z"
-    "bGF0ZSh4LHkpO2cuc2NhbGUocyxzKTtnLmZpbGxTdHlsZT0iI2Q4ZGRlNiI7CiBnLmJlZ2luUGF0aCgpO2cucm91bmRSZWN0KC0y"
-    "NiwtNzAsNTIsNDAsOCk7Zy5maWxsKCk7Zy5maWxsU3R5bGU9Y29sO2cuZmlsbFJlY3QoLTE4LC01OCwzNiw5KTsKIGcuZmlsbFN0"
-    "eWxlPSIjYzNjOWQ0IjtnLmJlZ2luUGF0aCgpO2cucm91bmRSZWN0KC0zMiwtMjYsNjQsNTQsMTApO2cuZmlsbCgpOwogZy5maWxs"
-    "U3R5bGU9IiNhZWI2YzQiO2cuZmlsbFJlY3QoLTI0LDMwLDE4LDQyKTtnLmZpbGxSZWN0KDYsMzAsMTgsNDIpO2cucmVzdG9yZSgp"
-    "fQpmdW5jdGlvbiBzY2VuZShpLHApewogaWYoaT09PTApe3ZhciBhPU1hdGgubWluKDEscCozKTtnLmdsb2JhbEFscGhhPWE7c2Vy"
-    "aWYoInNlYmJpLnBybyIsSC8yLTQwLDk2KTttb25vKCJQUk9PRiBGT1IgVEhFIE1BQ0hJTkUgQUdFIixILzIrMzAsMjYsR09MRCk7"
-    "CiAgZy5zdHJva2VTdHlsZT1HT0xEO2cuZ2xvYmFsQWxwaGE9YSouNjtnLmxpbmVXaWR0aD0yO2cuYmVnaW5QYXRoKCk7Zy5hcmMo"
-    "Vy8yLEgvMi0xMCwxODArcCo0MCwwLDYuMjgzKTtnLnN0cm9rZSgpO2cuZ2xvYmFsQWxwaGE9MX0KIGVsc2UgaWYoaT09PTEpe3R4"
-    "dCgiWW91ciBBSSBqdXN0IGRpZCBzb21ldGhpbmcuIiwxMjAsNTQpO21vbm8oIldITyBTQUlEIElUIENPVUxEPyIsMTc2LDI0LFBJ"
-    "TkspOwogIHJvYm90KFcvMi0yNjAsSC8yKzE0MCwxLjYsT0spOwogIGcuc3Ryb2tlU3R5bGU9R09MRDtnLmxpbmVXaWR0aD00O2cu"
-    "c2V0TGluZURhc2goWzEyLDEwXSk7Zy5iZWdpblBhdGgoKTtnLm1vdmVUbyhXLzItMjAwLEgvMis0MCk7Zy5saW5lVG8oVy8yKzE2"
-    "MCtwKjgwLEgvMis0MCk7Zy5zdHJva2UoKTtnLnNldExpbmVEYXNoKFtdKTsKICBibG9jayhXLzIrMjAwLEgvMi00MCwyMjAsMTYw"
-    "LEdPTEQpO3R4dCgiwqM0LDAwMCIsSC8yKzUwLDQ0LEdPTEQpO21vbm8oIlBBWU1FTlQiLEgvMis5MCwyMCwiIzhhOTNhZCIpfQog"
-    "ZWxzZSBpZihpPT09Mil7dHh0KCJzZWJiaS5wcm8gY2hlY2tzIGF0IHRoZSBtb21lbnQgaXQgaGFwcGVucy4iLDExMCw0Nik7CiAg"
-    "dmFyIG49TWF0aC5mbG9vcihwKjQpKzEsTD1bIkh1bWFuIGF1dGhvcml0eT8iLCJTdGlsbCB2YWxpZCBub3c/IiwiUmlnaHQgYW1v"
-    "dW50PyIsIlVzZWQgYmVmb3JlPyJdOwogIGZvcih2YXIgaz0wO2s8NDtrKyspe3ZhciBvbj1rPG47Zy5nbG9iYWxBbHBoYT1vbj8x"
-    "Oi4yNTtibG9jaygxODArayoyNDAsMzAwLDIwMCwxMjAsb24/T0s6IiMzMzQiLG9uPzIyOjYpOwogICBnLmZpbGxTdHlsZT1vbj9P"
-    "SzoiIzY2NyI7Zy50ZXh0QWxpZ249ImNlbnRlciI7Zy5mb250PSI2MDAgMjJweCAnSUJNIFBsZXggU2Fucycsc2Fucy1zZXJpZiI7"
-    "Zy5maWxsVGV4dChMW2tdLDI4MCtrKjI0MCwzNTIpOwogICBnLmZvbnQ9IjYwMCAzNHB4IHVpLW1vbm9zcGFjZSxtb25vc3BhY2Ui"
-    "O2cuZmlsbFRleHQob24/IuKckyI6IsK3IiwyODArayoyNDAsMzk4KTtnLmdsb2JhbEFscGhhPTF9CiAgbW9ubygiTUlMTElTRUNP"
-    "TkRTIMK3IE5PIFNFQ09ORCBBSSBNT0RFTCIsNTIwLDI0LEdPTEQpfQogZWxzZSBpZihpPT09Myl7dHh0KCJUaGVuIGl0IGlzIHNl"
-    "YWxlZC4gRm9yZXZlci4iLDExMCw1MCk7CiAgZm9yKHZhciBiPTA7Yjw2O2IrKyl7aWYocCo2PGIpY29udGludWU7YmxvY2soMTIw"
-    "K2IqMTgwLDI4MCwxNTAsMTQwLEdPTEQsMTYpO21vbm8oIiMiKygyNTEwK2IpLDM1MCwyMCxHT0xEKTsKICAgZy5maWxsU3R5bGU9"
-    "T0s7Zy50ZXh0QWxpZ249ImNlbnRlciI7Zy5mb250PSI1MDAgMTVweCB1aS1tb25vc3BhY2UsbW9ub3NwYWNlIjtnLmZpbGxUZXh0"
-    "KCJhNGY54oCmIisoYio3KzExKSwxMjArYioxODArNzUsMzMwKTsKICAgaWYoYil7Zy5zdHJva2VTdHlsZT1HT0xEO2cubGluZVdp"
-    "ZHRoPTM7Zy5iZWdpblBhdGgoKTtnLm1vdmVUbygxMjArYioxODAtMzAsMzUwKTtnLmxpbmVUbygxMjArYioxODAsMzUwKTtnLnN0"
-    "cm9rZSgpfX0KICBtb25vKCJDSEFOR0UgT05FIEFORCBFVkVSWSBPTkUgQUZURVIgSVQgQlJFQUtTIiw1MjAsMjQsIiM4YTkzYWQi"
-    "KX0KIGVsc2UgaWYoaT09PTQpe3R4dCgiVGltZXN0YW1wZWQgaW4gQml0Y29pbi4iLDExMCw1MCk7CiAgZy5zYXZlKCk7Zy50cmFu"
-    "c2xhdGUoVy8yLDM2MCk7Zy5yb3RhdGUocCoxLjYpO2cuc3Ryb2tlU3R5bGU9IiNmNzkzMWEiO2cubGluZVdpZHRoPTY7Zy5iZWdp"
-    "blBhdGgoKTtnLmFyYygwLDAsMTEwLDAsNi4yODMpO2cuc3Ryb2tlKCk7Zy5yZXN0b3JlKCk7CiAgZy5maWxsU3R5bGU9IiNmNzkz"
-    "MWEiO2cudGV4dEFsaWduPSJjZW50ZXIiO2cuZm9udD0iNjAwIDkwcHggJ0lCTSBQbGV4IFNhbnMnLHNhbnMtc2VyaWYiO2cuZmls"
-    "bFRleHQoIuKCvyIsVy8yLDM5MCk7CiAgbW9ubygiQSBDTE9DSyBOT0JPRFkgSU5WT0xWRUQgQ09OVFJPTFMiLDUyMCwyNCwiI2Y3"
-    "OTMxYSIpfQogZWxzZSBpZihpPT09NSl7dHh0KCJIZWxkIGJ5IHBlb3BsZSB5b3UgZG8gbm90IGNvbnRyb2wuIiwxMTAsNDgpOwog"
-    "IGZvcih2YXIgdz0wO3c8NTt3Kyspe3ZhciBhbmc9LU1hdGguUEkvMisody0yKSouNSx4PVcvMitNYXRoLmNvcyhhbmcpKjI2MCx5"
-    "PTQyMCtNYXRoLnNpbihhbmcpKjEyMDsKICAgZy5zdHJva2VTdHlsZT1CTFVFO2cuZ2xvYmFsQWxwaGE9LjU7Zy5saW5lV2lkdGg9"
-    "MjtnLmJlZ2luUGF0aCgpO2cubW92ZVRvKFcvMiwzMDApO2cubGluZVRvKHgseSk7Zy5zdHJva2UoKTtnLmdsb2JhbEFscGhhPTE7"
-    "CiAgIGcuZmlsbFN0eWxlPUJMVUU7Zy5iZWdpblBhdGgoKTtnLmFyYyh4LHksMjIsMCw2LjI4Myk7Zy5maWxsKCl9CiAgYmxvY2so"
-    "Vy8yLTkwLDI0MCwxODAsMTEwLEdPTEQpO21vbm8oIllPVVIgQ0hBSU4iLDMwNSwyMixHT0xEKTttb25vKCJJTkRFUEVOREVOVCBX"
-    "SVRORVNTRVMiLDYwMCwyNCxCTFVFKX0KIGVsc2V7dHh0KCJFdmVyeSBkZWNpc2lvbi4gUHJvdmFibGUuIixILzItNjAsNjApO21v"
-    "bm8oIlNFQkJJLlBSTyIsSC8yKzIwLDQwLEdPTEQpO21vbm8oIkZSRUUgRk9SIDkwIERBWVMgwrcgNTBwIFBFUiBERVZJQ0UiLEgv"
-    "Mis4MCwyMiwiIzhhOTNhZCIpfX0KZnVuY3Rpb24gZHJhdygpe2JnKCk7dmFyIHBlcj1EVVIvNyxpPU1hdGgubWluKDYsTWF0aC5m"
-    "bG9vcih0L3BlcikpO3NjZW5lKGksKHQtaSpwZXIpL3Blcik7CiBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgicGYiKS5zdHlsZS53"
-    "aWR0aD0odC9EVVIqMTAwKSsiJSI7CiB2YXIgcz1NYXRoLmZsb29yKHQlNjApO2RvY3VtZW50LmdldEVsZW1lbnRCeUlkKCJwdCIp"
-    "LnRleHRDb250ZW50PSIwOiIrKHM8MTA/IjAiOiIiKStzKyIgLyAwOjM4In0KZnVuY3Rpb24gbG9vcChub3cpe2lmKCFwbGF5aW5n"
-    "KXJldHVybjt2YXIgZHQ9KG5vdy1sYXN0KS8xMDAwO2xhc3Q9bm93O3QrPWR0OwogaWYoIXVubG9ja2VkJiZ0Pj1EVVIqRlJFRSl7"
-    "dD1EVVIqRlJFRTtwbGF5aW5nPWZhbHNlO2RvY3VtZW50LmdldEVsZW1lbnRCeUlkKCJwYiIpLnRleHRDb250ZW50PSLilrYiO2Rv"
-    "Y3VtZW50LmdldEVsZW1lbnRCeUlkKCJsb2NrIikuY2xhc3NMaXN0LmFkZCgib24iKTtkcmF3KCk7cmV0dXJufQogaWYodD49RFVS"
-    "KXt0PURVUjtwbGF5aW5nPWZhbHNlO2RvY3VtZW50LmdldEVsZW1lbnRCeUlkKCJwYiIpLnRleHRDb250ZW50PSLihrsifQogZHJh"
-    "dygpO3JlcXVlc3RBbmltYXRpb25GcmFtZShsb29wKX0KZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoInBiIikub25jbGljaz1mdW5j"
-    "dGlvbigpe2lmKHQ+PURVUil0PTA7cGxheWluZz0hcGxheWluZzt0aGlzLnRleHRDb250ZW50PXBsYXlpbmc/IuKdmuKdmiI6IuKW"
-    "tiI7bGFzdD1wZXJmb3JtYW5jZS5ub3coKTtpZihwbGF5aW5nKXJlcXVlc3RBbmltYXRpb25GcmFtZShsb29wKX07CmRvY3VtZW50"
-    "LmdldEVsZW1lbnRCeUlkKCJwYXlCdG4iKS5vbmNsaWNrPWZ1bmN0aW9uKCl7dW5sb2NrZWQ9dHJ1ZTsKIGRvY3VtZW50LmdldEVs"
-    "ZW1lbnRCeUlkKCJyY3B0IikudGV4dENvbnRlbnQ9IuKckyBVbmxvY2tlZCDCtyBwYWlkIHZpZXcgc2VhbGVkIGluIGJsb2NrICIr"
-    "KDI1MDArTWF0aC5mbG9vcihNYXRoLnJhbmRvbSgpKjQwMCkpKyIgwrcgY3JlYXRvciBlYXJucyA3cCI7CiB0aGlzLnRleHRDb250"
-    "ZW50PSJVbmxvY2tlZCDinJMiO3ZhciBzZWxmPXRoaXM7CiBzZXRUaW1lb3V0KGZ1bmN0aW9uKCl7ZG9jdW1lbnQuZ2V0RWxlbWVu"
-    "dEJ5SWQoImxvY2siKS5jbGFzc0xpc3QucmVtb3ZlKCJvbiIpO3BsYXlpbmc9dHJ1ZTtkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgi"
-    "cGIiKS50ZXh0Q29udGVudD0i4p2a4p2aIjtsYXN0PXBlcmZvcm1hbmNlLm5vdygpO3JlcXVlc3RBbmltYXRpb25GcmFtZShsb29w"
-    "KX0sMTEwMCl9OwpkcmF3KCk7CgovKiAtLS0tLS0tLS0tLS0tLS0tIGxvY2sgYSB2aWRlbyAtLS0tLS0tLS0tLS0tLS0tICovCnZh"
-    "ciBUUEw9YXRvYihkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgidHBsIikudGV4dENvbnRlbnQudHJpbSgpKTsKdmFyIEY9ZG9jdW1l"
-    "bnQuZ2V0RWxlbWVudEJ5SWQoInVGcmVlIiksRkw9ZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoInVGcmVlTGFiIik7CkYuYWRkRXZl"
-    "bnRMaXN0ZW5lcigiaW5wdXQiLGZ1bmN0aW9uKCl7RkwudGV4dENvbnRlbnQ9IkZpcnN0ICIrRi52YWx1ZSsiJSBwbGF5cyBmcmVl"
-    "In0pOwpmdW5jdGlvbiBlc2Mocyl7cmV0dXJuIFN0cmluZyhzKS5yZXBsYWNlKC9bJjw+IiddL2csZnVuY3Rpb24oYyl7cmV0dXJu"
-    "eyImIjoiJmFtcDsiLCI8IjoiJmx0OyIsIj4iOiImZ3Q7IiwnIic6IiZxdW90OyIsIiciOiImIzM5OyJ9W2NdfSl9CmZ1bmN0aW9u"
-    "IHNoYShidWYpe3JldHVybiBjcnlwdG8uc3VidGxlLmRpZ2VzdCgiU0hBLTI1NiIsYnVmKS50aGVuKGZ1bmN0aW9uKGgpewogcmV0"
-    "dXJuIEFycmF5LnByb3RvdHlwZS5tYXAuY2FsbChuZXcgVWludDhBcnJheShoKSxmdW5jdGlvbihiKXtyZXR1cm4gYi50b1N0cmlu"
-    "ZygxNikucGFkU3RhcnQoMiwiMCIpfSkuam9pbigiIil9KX0KZnVuY3Rpb24gYnVpbGQobyl7CiB2YXIgcGF5QnRuID0gby5wYXkK"
-    "ICAgPyAnPGEgY2xhc3M9ImIiIGlkPSJnbyIgaHJlZj0iJytlc2Moby5wYXkpKyciIHRhcmdldD0iX2JsYW5rIiByZWw9Im5vb3Bl"
-    "bmVyIj5VbmxvY2sgZm9yICcrby5wcmljZSsncDwvYT48ZGl2IGNsYXNzPSJtIj5Zb3Ugd2lsbCBjb21lIGJhY2sgaGVyZSBhZnRl"
-    "ciBwYXlpbmc8L2Rpdj4nCiAgIDogJzxidXR0b24gY2xhc3M9ImIiIGlkPSJnbyI+VW5sb2NrIGZvciAnK28ucHJpY2UrJ3A8L2J1"
-    "dHRvbj48ZGl2IGNsYXNzPSJtIj5EZW1vIG1vZGUgJm1pZGRvdDsgbm8gcGF5bWVudCB0YWtlbjwvZGl2Pic7CiB2YXIgcGF5SnMg"
-    "PSBvLnBheQogICA/ICd0cnl7bG9jYWxTdG9yYWdlLnNldEl0ZW0oS0VZLCIxIil9Y2F0Y2goZSl7fScKICAgOiAncGFpZD10cnVl"
-    "O2xrLmNsYXNzTGlzdC5yZW1vdmUoIm9uIik7dGFnLnN0eWxlLmRpc3BsYXk9Im5vbmUiO3YucGxheSgpOyc7CiByZXR1cm4gVFBM"
-    "LnNwbGl0KCJfX1RJVExFX18iKS5qb2luKGVzYyhvLnRpdGxlKSkKICAgLnNwbGl0KCJfX1BSSUNFX18iKS5qb2luKFN0cmluZyhv"
-    "LnByaWNlKSkKICAgLnNwbGl0KCJfX0ZSRUVfXyIpLmpvaW4oU3RyaW5nKG8uZnJlZSkpCiAgIC5zcGxpdCgiX19TSE9SVEhBU0hf"
-    "XyIpLmpvaW4oby5oYXNoLnNsaWNlKDAsMTYpKQogICAuc3BsaXQoIl9fUEFZQlROX18iKS5qb2luKHBheUJ0bikKICAgLnNwbGl0"
-    "KCJfX1BBWUpTX18iKS5qb2luKHBheUpzKQogICAuc3BsaXQoIl9fU1JDX18iKS5qb2luKG8uc3JjKTsKfQp2YXIgb3V0PWRvY3Vt"
-    "ZW50LmdldEVsZW1lbnRCeUlkKCJ1T3V0IikscHc9ZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoInVQcm9nV3JhcCIpLHByPWRvY3Vt"
-    "ZW50LmdldEVsZW1lbnRCeUlkKCJ1UHJvZyIpLGJ0bj1kb2N1bWVudC5nZXRFbGVtZW50QnlJZCgidUdvIik7CmZ1bmN0aW9uIHN0"
-    "ZXAocGN0LG1zZyl7cHcuc3R5bGUuZGlzcGxheT0iYmxvY2siO3ByLnN0eWxlLndpZHRoPXBjdCsiJSI7b3V0LmNsYXNzTGlzdC5h"
-    "ZGQoIm9uIik7b3V0LmlubmVySFRNTD1tc2d9CmJ0bi5vbmNsaWNrPWZ1bmN0aW9uKCl7CiB2YXIgZj1kb2N1bWVudC5nZXRFbGVt"
-    "ZW50QnlJZCgidUZpbGUiKS5maWxlc1swXTsKIGlmKCFmKXtvdXQuY2xhc3NMaXN0LmFkZCgib24iKTtvdXQuaW5uZXJIVE1MPSJQ"
-    "aWNrIGEgdmlkZW8gZmlyc3QuIjtyZXR1cm59CiB2YXIgdGl0bGU9KGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCJ1VGl0bGUiKS52"
-    "YWx1ZXx8Zi5uYW1lLnJlcGxhY2UoL1wuW14uXSskLywiIikpLnRyaW0oKS5zbGljZSgwLDgwKTsKIHZhciBwcmljZT1NYXRoLm1h"
-    "eCgxLE1hdGgucm91bmQocGFyc2VGbG9hdChkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgidVByaWNlIikudmFsdWUpfHwxMCkpOwog"
-    "dmFyIGZyZWU9KHBhcnNlSW50KEYudmFsdWUsMTApfHw1MCkvMTAwOwogdmFyIHBheT1kb2N1bWVudC5nZXRFbGVtZW50QnlJZCgi"
-    "dVBheSIpLnZhbHVlLnRyaW0oKTsKIGlmKHBheSAmJiAhL15odHRwczpcL1wvLy50ZXN0KHBheSkpe291dC5jbGFzc0xpc3QuYWRk"
-    "KCJvbiIpO291dC5pbm5lckhUTUw9IllvdXIgcGF5bWVudCBsaW5rIG5lZWRzIHRvIHN0YXJ0IHdpdGggaHR0cHM6Ly8iO3JldHVy"
-    "bn0KIGJ0bi5kaXNhYmxlZD10cnVlO3N0ZXAoMTAsIlJlYWRpbmcgeW91ciB2aWRlbyAoIisoZi5zaXplLzEwNDg1NzYpLnRvRml4"
-    "ZWQoMSkrIiBNQinigKYgbm90aGluZyBpcyBiZWluZyB1cGxvYWRlZC4iKTsKIGYuYXJyYXlCdWZmZXIoKS50aGVuKGZ1bmN0aW9u"
-    "KGJ1Zil7c3RlcCgzNSwiRmluZ2VycHJpbnRpbmcgeW91ciBleGFjdCBjdXTigKYiKTtyZXR1cm4gc2hhKGJ1Zil9KQogLnRoZW4o"
-    "ZnVuY3Rpb24oaCl7c3RlcCg1NSwiV3JhcHBpbmcgaXQgaW4gaXRzIG93biBwbGF5ZXLigKYiKTsKICByZXR1cm4gbmV3IFByb21p"
-    "c2UoZnVuY3Rpb24ocmVzLHJlail7dmFyIHI9bmV3IEZpbGVSZWFkZXIoKTtyLm9ubG9hZD1mdW5jdGlvbigpe3JlcyhbaCxTdHJp"
-    "bmcoci5yZXN1bHQpXSl9O3Iub25lcnJvcj1yZWo7ci5yZWFkQXNEYXRhVVJMKGYpfSl9KQogLnRoZW4oZnVuY3Rpb24ocGFpcil7"
-    "CiAgdmFyIGg9cGFpclswXSxzcmM9cGFpclsxXTsKICBzdGVwKDg1LCJCdWlsZGluZyB5b3VyIGZpbGXigKYiKTsKICB2YXIgaHRt"
-    "bD1idWlsZCh7dGl0bGU6dGl0bGUscHJpY2U6cHJpY2UsZnJlZTpmcmVlLHBheTpwYXksaGFzaDpoLHNyYzpzcmN9KTsKICB2YXIg"
-    "dXJsPVVSTC5jcmVhdGVPYmplY3RVUkwobmV3IEJsb2IoW2h0bWxdLHt0eXBlOiJ0ZXh0L2h0bWwifSkpOwogIHZhciBuYW1lPSh0"
-    "aXRsZS5yZXBsYWNlKC9bXkEtWmEtejAtOSBfLV0vZywiIikudHJpbSgpLnJlcGxhY2UoL1xzKy9nLCItIikudG9Mb3dlckNhc2Uo"
-    "KXx8InZpZGVvIikrIi1sb2NrZWQuaHRtbCI7CiAgc3RlcCgxMDAsJzxzcGFuIGNsYXNzPSJiaWciPkxvY2tlZCDinJM8L3NwYW4+"
-    "JysKICAgIkZpbmdlcnByaW50ICIraC5zbGljZSgwLDMyKSsi4oCmPGJyPkZyZWUgcHJldmlldzogZmlyc3QgIitNYXRoLnJvdW5k"
-    "KGZyZWUqMTAwKSsiJSDCtyBVbmxvY2s6ICIrcHJpY2UrInAgwrcgIisocGF5PyJwYXlpbmcgdGhyb3VnaCB5b3VyIGxpbmsiOiJk"
-    "ZW1vIG1vZGUiKSsKICAgJzxicj48YSBjbGFzcz0iYnRuIGdvbGQiIHN0eWxlPSJtYXJnaW4tdG9wOjE0cHgiIGhyZWY9IicrdXJs"
-    "KyciIGRvd25sb2FkPSInK25hbWUrJyI+4qyHIERvd25sb2FkIHlvdXIgbG9ja2VkIHZpZGVvPC9hPicrCiAgICc8ZGl2IGNsYXNz"
-    "PSJub3RlIj5Zb3VyIHZpZGVvIG5ldmVyIGxlZnQgdGhpcyBkZXZpY2UuIE9wZW4gdGhlIGZpbGUsIHNoYXJlIGl0LCBvciBzZW5k"
-    "IHRoZSBsaW5rIHRvIHRoZSAxMHAgV2luZyBiZWxvdy48L2Rpdj4nKTsKICBidG4uZGlzYWJsZWQ9ZmFsc2U7CiB9KS5jYXRjaChm"
-    "dW5jdGlvbihlKXtzdGVwKDAsIkNvdWxkIG5vdCBidWlsZCBpdDogIitTdHJpbmcoZSkuc2xpY2UoMCwxNDApKTtidG4uZGlzYWJs"
-    "ZWQ9ZmFsc2V9KTsKfTsKCi8qIC0tLS0tLS0tLS0tLS0tLS0gc2VuZCB0byB0aGUgMTBwIFdpbmcgLS0tLS0tLS0tLS0tLS0tLSAq"
-    "Lwpkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgibUdvIikub25jbGljaz1mdW5jdGlvbigpewogdmFyIG89ZG9jdW1lbnQuZ2V0RWxl"
-    "bWVudEJ5SWQoIm1PdXQiKSx1cmw9ZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoIm1VcmwiKS52YWx1ZS50cmltKCk7CiBvLmNsYXNz"
-    "TGlzdC5hZGQoIm9uIik7CiBpZighL15odHRwczpcL1wvLy50ZXN0KHVybCkpe28uaW5uZXJIVE1MPSJHaXZlIHRoZSBodHRwczov"
-    "LyBsaW5rIHRvIHlvdXIgbG9ja2VkIHZpZGVvLiI7cmV0dXJufQogby5pbm5lckhUTUw9IlNlbmRpbmfigKYiOwogZmV0Y2goIi94"
-    "L21hcnF1ZWUvc3VibWl0Iix7bWV0aG9kOiJQT1NUIixoZWFkZXJzOnsiQ29udGVudC1UeXBlIjoiYXBwbGljYXRpb24vanNvbiJ9"
-    "LAogIGJvZHk6SlNPTi5zdHJpbmdpZnkoe3VybDp1cmwsdGl0bGU6ZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoIm1UaXRsZSIpLnZh"
-    "bHVlLAogICBjcmVhdG9yOmRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCJtV2hvIikudmFsdWUscHJpY2U6ZG9jdW1lbnQuZ2V0RWxl"
-    "bWVudEJ5SWQoIm1QcmljZSIpLnZhbHVlfSl9KQogLnRoZW4oZnVuY3Rpb24ocil7cmV0dXJuIHIuanNvbigpfSkudGhlbihmdW5j"
-    "dGlvbihkKXsKICBvLmlubmVySFRNTCA9IGQucmVjZWl2ZWQKICAgPyAnPHNwYW4gY2xhc3M9ImJpZyI+U2VudCDinJM8L3NwYW4+"
-    "U2VhbGVkIGluIGJsb2NrICcrZC5ibG9ja19pbmRleCsnLiBJdCBnb2VzIHVwIG9uY2UgaXQgaGFzIGJlZW4gbG9va2VkIGF0LicK"
-    "ICAgOiAoZC5tZXNzYWdlfHwiQ291bGQgbm90IHNlbmQgaXQuIik7CiB9KS5jYXRjaChmdW5jdGlvbigpe28uaW5uZXJIVE1MPSJD"
-    "b3VsZCBub3QgcmVhY2ggdGhlIGNpbmVtYS4ifSk7Cn07CgovKiAtLS0tLS0tLS0tLS0tLS0tIGNhbGN1bGF0b3IgLS0tLS0tLS0t"
-    "LS0tLS0tLSAqLwpmdW5jdGlvbiBjYWxjKCl7dmFyIHA9cGFyc2VGbG9hdChkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgiY1ByaWNl"
-    "IikudmFsdWUpfHwwLHY9cGFyc2VJbnQoZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoImNWaWRzIikudmFsdWUpfHwwLG49cGFyc2VJ"
-    "bnQoZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoImNWaWV3cyIpLnZhbHVlKXx8MDsKIHZhciBrZWVwPXAqLjcsZ3Jvc3M9a2VlcCp2"
-    "Km4vMTAwLGZlZT0uNSp2LG5ldD1ncm9zcy1mZWU7CiBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgiY091dCIpLnRleHRDb250ZW50"
-    "PSLCoyIrKG5ldD4wP25ldC50b0ZpeGVkKDIpOiIwLjAwIik7CiBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgiY0RldGFpbCIpLnRl"
-    "eHRDb250ZW50PSh2Km4pKyIgcGFpZCB2aWV3cyDDlyAiK2tlZXAudG9GaXhlZCgxKSsicCA9IMKjIitncm9zcy50b0ZpeGVkKDIp"
-    "KyIgIMK3ICBtb250aGx5IGxvY2sgZmVlIMKjIitmZWUudG9GaXhlZCgyKX0KWyJjUHJpY2UiLCJjVmlkcyIsImNWaWV3cyJdLmZv"
-    "ckVhY2goZnVuY3Rpb24oaWQpe2RvY3VtZW50LmdldEVsZW1lbnRCeUlkKGlkKS5hZGRFdmVudExpc3RlbmVyKCJpbnB1dCIsY2Fs"
-    "Yyl9KTtjYWxjKCk7Cn0pKCk7Cjwvc2NyaXB0PjwvYm9keT48L2h0bWw+Cg=="
+PUBLIC = {
+    ("GET", "spec"),
+    ("GET", "stats"),
+    ("GET", "verify"),
+}
+
+# ============================================================ layer 1
+# Hard rules. Absolute. Not weights, not tunable by score band.
+
+LOOP_WINDOW = 120          # seconds a repeat still counts as a repeat
+LOOP_HARD = 8              # identical repeats in the window = runaway
+LOOP_HARD_UNATTENDED = 4   # lower bar when no human is watching
+BURST_HARD = 120           # requests in 60s from one key = runaway
+
+# ============================================================ layer 2
+# Nine signals. Base weights MUST sum to exactly 1.00.
+#
+# What this request will SPEND ......................... 0.62
+W_EXPOSURE = 0.18   # worst case spend against remaining budget
+W_SIZE = 0.14       # prompt characters
+W_ASK = 0.14        # max_tokens ceiling the caller authorised
+W_DEPTH = 0.10      # conversation turns, re-sent on every call
+W_TOOLS = 0.06      # tool definitions, re-sent on every call
+#
+# Whether that spend is WASTE .......................... 0.38
+W_LOOP = 0.16       # the same request going round again
+W_BURST = 0.09      # requests in the last 60 seconds
+W_GRIND = 0.07      # requests in the last hour
+W_NOVELTY = 0.06    # first time this shape has been seen
+
+BASE_SUM = (W_EXPOSURE + W_SIZE + W_ASK + W_DEPTH + W_TOOLS
+            + W_LOOP + W_BURST + W_GRIND + W_NOVELTY)
+
+# Sits outside the base sum, deliberately.
+W_UNATTENDED = 0.10
+
+BAND_CHALLENGE = 0.55
+BAND_BLOCK = 0.80
+
+SAT_LOOP = 5
+SAT_BURST = 20
+SAT_GRIND = 200
+SAT_SIZE = 100_000
+SAT_ASK = 8_000
+SAT_DEPTH = 40
+SAT_TOOLS = 24
+
+# A request only earns the cheap model by being genuinely small.
+# Suspicion never routes a request to a weaker model.
+CHEAP_MAX_CHARS = 4_000
+CHEAP_MAX_TURNS = 6
+CHEAP_MAX_ASK = 1_000
+CHEAP_MAX_SCORE = 0.30
+
+W60 = 60
+W1H = 3600
+
+# ============================================================ layer 3
+CTX_KEEP_TURNS = 8          # turns beyond this are flagged as carried
+CTX_FLAG_TURNS = 12         # only flag once the conversation is this deep
+SYSTEM_FLAG_CHARS = 2_000
+CHARS_PER_TOKEN = 4.0       # the estimate, used only in findings
+
+DEFAULT_TTL = 30 * 24 * 3600
+MAX_STORED_BYTES = 512 * 1024
+MAX_PROMPT_CHARS = 2_000_000
+
+KEYED_FIELDS = (
+    "model", "messages", "system", "prompt", "input",
+    "temperature", "top_p", "top_k",
+    "max_tokens", "max_completion_tokens",
+    "stop", "stop_sequences",
+    "tools", "tool_choice", "response_format", "seed",
 )
 
-
-def _d(b):
-    return base64.b64decode("".join(b.split()))
-
-
-_FILES = {
-    '/create': (_d(_HTML_B64), "text/html; charset=utf-8"),
+VOCABULARY = {
+    "SERVE": "answered from an identical earlier request; nothing was bought",
+    "ALLOW": "send it to the model as asked",
+    "DOWNGRADE": "small and simple enough for the cheap model",
+    "CHALLENGE": "hold it for a person before spending",
+    "BLOCK": "refused; it never reaches the model, so no completion is paid for",
 }
-_patched = False
+
+LIMITS = [
+    "Matching is exact. A reworded prompt is a different request and goes "
+    "to the model.",
+    "Savings totals use only token counts the provider itself reported. "
+    "Nothing in a total is estimated.",
+    "A refused request has a worst case cost, not a known cost. It is "
+    "reported separately and never added to the savings total.",
+    "Token figures inside findings are estimated from character counts and "
+    "are marked as estimates. They never enter a total.",
+    "A stored answer is returned unchanged. This module does not judge "
+    "whether it is still correct.",
+    "No model is called to reach any decision here.",
+]
 
 
-def _find_handler_class(ctx):
-    if isinstance(ctx, dict):
-        for k in ("handler_class", "handler", "Handler", "h", "request_handler"):
-            v = ctx.get(k)
-            if v is None:
-                continue
-            cls = v if isinstance(v, type) else type(v)
-            if hasattr(cls, "do_GET"):
-                return cls
-    f = sys._getframe()
-    while f is not None:
-        s = f.f_locals.get("self")
-        if s is not None and hasattr(type(s), "do_GET") and hasattr(s, "wfile"):
-            return type(s)
-        f = f.f_back
-    return None
+# --------------------------------------------------------------- helpers
+
+def _canonical(obj):
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=True).encode("utf-8")
 
 
-def _install_page(ctx):
-    global _patched
-    if _patched:
+def _sha(data):
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    return hashlib.sha256(data).hexdigest()
+
+
+def _fingerprint(req):
+    keyed = {k: req[k] for k in KEYED_FIELDS if k in req}
+    return _sha(b"SEBBI-TOKENSAVER-v2\n" + _canonical(keyed))
+
+
+def _content_chars(v):
+    if v is None:
+        return 0
+    if isinstance(v, str):
+        return len(v)
+    return len(_canonical(v))
+
+
+def _prompt_chars(req):
+    total = 0
+    for key in ("prompt", "input", "system"):
+        total += _content_chars(req.get(key))
+    msgs = req.get("messages")
+    if isinstance(msgs, list):
+        for m in msgs:
+            total += _content_chars(m.get("content") if isinstance(m, dict) else m)
+    tools = req.get("tools")
+    if tools is not None:
+        total += _content_chars(tools)
+    return total
+
+
+def _est_tokens(chars):
+    """Estimate only. Marked as such everywhere it appears."""
+    return int(chars / CHARS_PER_TOKEN)
+
+
+def _ask_ceiling(req):
+    """The caller's own authorised output ceiling. Exact, not estimated."""
+    v = req.get("max_tokens")
+    if v is None:
+        v = req.get("max_completion_tokens")
+    try:
+        return int(v) if v is not None else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _shape(req):
+    n = len(req.get("messages") or [])
+    t = len(req.get("tools") or [])
+    band = int(math.log10(max(_prompt_chars(req), 1)) * 2)
+    return _sha("%s|%d|%d|%d" % (req.get("model") or "", n, t, band))
+
+
+def _measure(req):
+    """Everything the decision needs, taken from a full request."""
+    return {
+        "fp": _fingerprint(req),
+        "shape": _shape(req),
+        "chars": _prompt_chars(req),
+        "ask": _ask_ceiling(req),
+        "depth": len(req.get("messages") or []),
+        "tools": len(req.get("tools") or []),
+        "deterministic": _deterministic(req),
+        "from_digest": False,
+    }
+
+
+def _measure_from_digest(d):
+    """
+    The same measurements, supplied by a client that kept its content at
+    home. The client is measuring its own spend against its own budget,
+    so there is nothing to gain by misreporting.
+    """
+    if not isinstance(d, dict):
+        return None, "digest must be an object"
+    fp = d.get("fingerprint")
+    if not isinstance(fp, str) or len(fp) != 64:
+        return None, "digest needs a 64 character fingerprint"
+    try:
+        int(fp, 16)
+    except ValueError:
+        return None, "fingerprint must be hexadecimal"
+
+    def _n(key, cap):
+        v = d.get(key, 0)
+        try:
+            v = int(v)
+        except (TypeError, ValueError):
+            return 0
+        return max(0, min(v, cap))
+
+    m = {
+        "fp": fp,
+        "chars": _n("prompt_characters", MAX_PROMPT_CHARS),
+        "ask": _n("max_tokens", 10_000_000),
+        "depth": _n("conversation_turns", 100_000),
+        "tools": _n("tool_definitions", 100_000),
+        "deterministic": bool(d.get("deterministic", True)),
+        "from_digest": True,
+    }
+    band = int(math.log10(max(m["chars"], 1)) * 2)
+    m["shape"] = _sha("%s|%d|%d|%d" % (d.get("model") or "", m["depth"],
+                                       m["tools"], band))
+    return m, None
+
+
+def _log_scale(value, saturation):
+    if value <= 0:
+        return 0.0
+    if value >= saturation:
+        return 1.0
+    return math.log1p(value) / math.log1p(saturation)
+
+
+def _linear(value, saturation):
+    if value <= 0:
+        return 0.0
+    return min(1.0, float(value) / float(saturation))
+
+
+def _deterministic(req):
+    t = req.get("temperature")
+    if t is None:
         return True
-    cls = _find_handler_class(ctx)
-    if cls is None:
+    try:
+        return float(t) == 0.0
+    except (TypeError, ValueError):
         return False
-    if getattr(cls, "_studio_patched", False):
-        _patched = True
-        return True
 
-    original_do_GET = cls.do_GET
 
-    def do_GET(self):
-        path = self.path.split("?")[0].split("#")[0].rstrip("/") or "/"
-        hit = _FILES.get(path)
-        if hit:
-            body, ctype = hit
-            self.send_response(200)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        return original_do_GET(self)
+def _usage(resp):
+    if not isinstance(resp, dict):
+        return (None, None)
+    u = resp.get("usage")
+    if not isinstance(u, dict):
+        return (None, None)
+    i = u.get("input_tokens", u.get("prompt_tokens"))
+    o = u.get("output_tokens", u.get("completion_tokens"))
+    try:
+        return (int(i) if i is not None else None,
+                int(o) if o is not None else None)
+    except (TypeError, ValueError):
+        return (None, None)
 
-    cls.do_GET = do_GET
-    cls._studio_patched = True
-    _patched = True
-    return True
+
+def _money(tokens_in, tokens_out, price_in, price_out):
+    if price_in is None and price_out is None:
+        return None
+    m = 0.0
+    if price_in:
+        m += (tokens_in or 0) / 1_000_000.0 * price_in
+    if price_out:
+        m += (tokens_out or 0) / 1_000_000.0 * price_out
+    return round(m, 4)
+
+
+# --------------------------------------------------------------- storage
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS ts_store (
+    api_key       TEXT NOT NULL,
+    fp            TEXT NOT NULL,
+    model         TEXT,
+    response      TEXT NOT NULL,
+    input_tokens  INTEGER,
+    output_tokens INTEGER,
+    stored_at     REAL NOT NULL,
+    expires_at    REAL,
+    hits          INTEGER NOT NULL DEFAULT 0,
+    last_hit      REAL,
+    PRIMARY KEY (api_key, fp)
+);
+
+CREATE TABLE IF NOT EXISTS ts_seen (
+    api_key  TEXT NOT NULL,
+    fp       TEXT NOT NULL,
+    ts       REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ts_shape (
+    api_key  TEXT NOT NULL,
+    shape    TEXT NOT NULL,
+    first_ts REAL NOT NULL,
+    PRIMARY KEY (api_key, shape)
+);
+
+CREATE TABLE IF NOT EXISTS ts_decision (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    api_key     TEXT NOT NULL,
+    ts          REAL NOT NULL,
+    fp          TEXT NOT NULL,
+    verdict     TEXT NOT NULL,
+    rule        TEXT,
+    score       REAL NOT NULL,
+    signals     TEXT NOT NULL,
+    exact_in    INTEGER,
+    exact_out   INTEGER,
+    ceiling_in  INTEGER,
+    ceiling_out INTEGER,
+    audit_hash  TEXT
+);
+
+CREATE TABLE IF NOT EXISTS ts_account (
+    api_key    TEXT PRIMARY KEY,
+    ceiling    INTEGER NOT NULL DEFAULT 0,
+    spent      INTEGER NOT NULL DEFAULT 0,
+    price_in   REAL,
+    price_out  REAL,
+    currency   TEXT,
+    updated    REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ts_seen_key ON ts_seen(api_key, ts);
+CREATE INDEX IF NOT EXISTS ts_seen_fp ON ts_seen(api_key, fp, ts);
+CREATE INDEX IF NOT EXISTS ts_dec_key ON ts_decision(api_key, id);
+CREATE INDEX IF NOT EXISTS ts_dec_hash ON ts_decision(audit_hash);
+CREATE INDEX IF NOT EXISTS ts_store_exp ON ts_store(expires_at);
+"""
+
+_ready = {}
+
+
+def _init(ctx):
+    # Keyed by id, but the connection itself is kept as the value so the
+    # id cannot be recycled while we still believe in it.
+    k = id(ctx.conn)
+    if _ready.get(k) is ctx.conn:
+        return
+    with ctx.lock:
+        ctx.conn.executescript(_SCHEMA)
+        ctx.conn.commit()
+    _ready[k] = ctx.conn
+
+
+def _account(ctx, api_key):
+    row = ctx.conn.execute(
+        "SELECT ceiling, spent, price_in, price_out, currency "
+        "FROM ts_account WHERE api_key=?", (api_key,)
+    ).fetchone()
+    if not row:
+        return {"ceiling": 0, "spent": 0, "price_in": None,
+                "price_out": None, "currency": None}
+    return {"ceiling": row[0], "spent": row[1], "price_in": row[2],
+            "price_out": row[3], "currency": row[4]}
+
+
+def _prune(ctx, api_key, now):
+    ctx.conn.execute("DELETE FROM ts_seen WHERE api_key=? AND ts < ?",
+                     (api_key, now - W1H))
+
+
+# ================================================================ layer 3
+
+def _findings(req, loop_n, has_stored, acct):
+    """
+    Named waste inside this request. Every item carries a token figure
+    and says whether that figure is exact or estimated. This never
+    feeds a total.
+    """
+    out = []
+    msgs = req.get("messages") or []
+    depth = len(msgs)
+    tools = req.get("tools") or []
+    ask = _ask_ceiling(req)
+
+    # The biggest one in agent systems: the same request going round
+    # and nobody recording the answer.
+    if loop_n >= 2 and not has_stored:
+        out.append({
+            "code": "repeating_without_recording",
+            "severity": "high",
+            "detail": "This exact request has gone out %d times in the last "
+                      "%d seconds and no answer has been recorded. Post the "
+                      "response back to record and every repeat after that "
+                      "costs nothing."
+                      % (loop_n, LOOP_WINDOW),
+            "tokens": None,
+            "certainty": "not counted",
+        })
+
+    if not _deterministic(req):
+        out.append({
+            "code": "varied_output_blocks_reuse",
+            "severity": "medium",
+            "detail": "temperature is above zero, so this answer cannot be "
+                      "safely reused. If this request does not genuinely need "
+                      "varied output, setting temperature to zero makes every "
+                      "repeat free.",
+            "tokens": None,
+            "certainty": "not counted",
+        })
+
+    if depth > CTX_FLAG_TURNS:
+        carried = msgs[:-CTX_KEEP_TURNS] if CTX_KEEP_TURNS < depth else []
+        chars = sum(_content_chars(m.get("content") if isinstance(m, dict)
+                                   else m) for m in carried)
+        out.append({
+            "code": "carrying_old_turns",
+            "severity": "high" if chars > 20_000 else "medium",
+            "detail": "%d turns are being re-sent on every call. The oldest "
+                      "%d of them account for roughly the tokens below, paid "
+                      "again each time this conversation continues."
+                      % (depth, len(carried)),
+            "tokens": _est_tokens(chars),
+            "certainty": "estimated from character count",
+        })
+
+    if tools:
+        used = False
+        for m in msgs:
+            if not isinstance(m, dict):
+                continue
+            c = m.get("content")
+            blob = c if isinstance(c, str) else _canonical(c).decode("utf-8", "ignore")
+            if "tool_use" in blob or "tool_call" in blob:
+                used = True
+                break
+        if not used:
+            chars = _content_chars(tools)
+            out.append({
+                "code": "unused_tool_definitions",
+                "severity": "high" if chars > 8_000 else "medium",
+                "detail": "%d tool definitions are attached and nothing in "
+                          "this conversation has called one. They are sent in "
+                          "full on every request."
+                          % len(tools),
+                "tokens": _est_tokens(chars),
+                "certainty": "estimated from character count",
+            })
+
+    sys_chars = _content_chars(req.get("system"))
+    if sys_chars > SYSTEM_FLAG_CHARS and depth > 4:
+        out.append({
+            "code": "large_system_prompt_resent",
+            "severity": "low",
+            "detail": "The system prompt is re-sent on every call in this "
+                      "conversation. If your provider offers prompt caching, "
+                      "this is the block to cache.",
+            "tokens": _est_tokens(sys_chars),
+            "certainty": "estimated from character count",
+        })
+
+    if ask:
+        out.append({
+            "code": "output_ceiling_authorised",
+            "severity": "low",
+            "detail": "max_tokens is set to %d, so this single call is "
+                      "authorised to buy up to that many output tokens." % ask,
+            "tokens": ask,
+            "certainty": "exact ceiling set by the caller",
+        })
+
+    seen = {}
+    for m in msgs:
+        if not isinstance(m, dict):
+            continue
+        k = _sha(_canonical(m.get("content")))
+        seen[k] = seen.get(k, 0) + 1
+    dupes = sum(n - 1 for n in seen.values() if n > 1)
+    if dupes >= 2:
+        out.append({
+            "code": "duplicate_turns_in_context",
+            "severity": "medium",
+            "detail": "%d turns inside this conversation are byte-identical "
+                      "to an earlier turn. They are being paid for twice."
+                      % dupes,
+            "tokens": None,
+            "certainty": "not counted",
+        })
+
+    if acct["ceiling"] and acct["spent"] >= acct["ceiling"] * 0.8:
+        out.append({
+            "code": "budget_nearly_gone",
+            "severity": "high",
+            "detail": "This key has used %d of its %d token ceiling."
+                      % (acct["spent"], acct["ceiling"]),
+            "tokens": None,
+            "certainty": "exact, from provider-reported usage",
+        })
+
+    return out
+
+
+# ================================================================ layers 1+2
+
+def _decide(ctx, api_key, m, now, unattended, count_it):
+    """
+    Takes a measurement bundle from _measure or _measure_from_digest, so
+    the same decision runs whether the caller sent the request or kept it
+    at home and sent only its shape.
+
+    rule is set only when a hard rule fired, in which case the score is
+    still computed and reported but did not decide anything.
+    """
+    fp = m["fp"]
+    shape = m["shape"]
+    acct = _account(ctx, api_key)
+
+    loop_n = ctx.conn.execute(
+        "SELECT COUNT(*) FROM ts_seen WHERE api_key=? AND fp=? AND ts > ?",
+        (api_key, fp, now - LOOP_WINDOW)).fetchone()[0]
+    burst_n = ctx.conn.execute(
+        "SELECT COUNT(*) FROM ts_seen WHERE api_key=? AND ts > ?",
+        (api_key, now - W60)).fetchone()[0]
+    grind_n = ctx.conn.execute(
+        "SELECT COUNT(*) FROM ts_seen WHERE api_key=? AND ts > ?",
+        (api_key, now - W1H)).fetchone()[0]
+    seen_shape = ctx.conn.execute(
+        "SELECT 1 FROM ts_shape WHERE api_key=? AND shape=?",
+        (api_key, shape)).fetchone()
+    has_stored = ctx.conn.execute(
+        "SELECT 1 FROM ts_store WHERE api_key=? AND fp=?",
+        (api_key, fp)).fetchone() is not None
+
+    chars = m["chars"]
+    ask = m["ask"]
+    depth = m["depth"]
+    tools = m["tools"]
+
+    # Worst case this one call could cost: an exact ceiling on output,
+    # an estimate on input. Kept apart accordingly.
+    ceiling_out = ask
+    est_in = _est_tokens(chars)
+    remaining = max(0, acct["ceiling"] - acct["spent"]) if acct["ceiling"] else 0
+    if remaining:
+        exposure = _linear(est_in + ceiling_out, remaining)
+    else:
+        exposure = 0.0
+
+    s = {
+        "exposure": round(exposure, 4),
+        "size": round(_log_scale(chars, SAT_SIZE), 4),
+        "ask": round(_log_scale(ask, SAT_ASK), 4),
+        "depth": round(_linear(depth, SAT_DEPTH), 4),
+        "tools": round(_linear(tools, SAT_TOOLS), 4),
+        "loop": round(_linear(loop_n, SAT_LOOP), 4),
+        "burst": round(_linear(burst_n, SAT_BURST), 4),
+        "grind": round(_linear(grind_n, SAT_GRIND), 4),
+        "novelty": 0.0 if seen_shape else 1.0,
+    }
+
+    score = (W_EXPOSURE * s["exposure"] + W_SIZE * s["size"]
+             + W_ASK * s["ask"] + W_DEPTH * s["depth"]
+             + W_TOOLS * s["tools"] + W_LOOP * s["loop"]
+             + W_BURST * s["burst"] + W_GRIND * s["grind"]
+             + W_NOVELTY * s["novelty"])
+
+    s["unattended"] = bool(unattended)
+    if unattended:
+        score += W_UNATTENDED
+    score = round(min(1.0, score), 4)
+
+    measured = {
+        "prompt_characters": chars,
+        "estimated_input_tokens": est_in,
+        "estimated_input_tokens_note": "estimated from characters, never "
+                                       "counted in a savings total",
+        "authorised_output_tokens": ceiling_out,
+        "conversation_turns": depth,
+        "tool_definitions": tools,
+        "same_request_in_last_%ds" % LOOP_WINDOW: loop_n,
+        "requests_in_last_60s": burst_n,
+        "requests_in_last_hour": grind_n,
+        "budget_ceiling_tokens": acct["ceiling"],
+        "budget_spent_tokens": acct["spent"],
+    }
+
+    # ---- layer 1: hard rules, in order, no appeal to the score --------
+    rule = None
+    verdict = None
+
+    if acct["ceiling"] and acct["spent"] >= acct["ceiling"]:
+        rule, verdict = "budget_exhausted", "BLOCK"
+    elif acct["ceiling"] and (est_in + ceiling_out) > remaining:
+        # An overdraft. Catching this after the fact is too late: the
+        # money is already gone. A person may raise the ceiling, so an
+        # attended call is held rather than refused.
+        rule = "exceeds_remaining_budget"
+        verdict = "BLOCK" if unattended else "CHALLENGE"
+    elif loop_n >= LOOP_HARD:
+        rule, verdict = "runaway_loop", "BLOCK"
+    elif unattended and loop_n >= LOOP_HARD_UNATTENDED:
+        rule, verdict = "runaway_loop_unattended", "BLOCK"
+    elif burst_n >= BURST_HARD:
+        rule, verdict = "runaway_burst", "BLOCK"
+
+    # ---- layer 2: the score -------------------------------------------
+    if verdict is None:
+        if score >= BAND_BLOCK:
+            verdict = "BLOCK"
+        elif score >= BAND_CHALLENGE:
+            verdict = "CHALLENGE"
+        elif (score < CHEAP_MAX_SCORE and chars <= CHEAP_MAX_CHARS
+              and depth <= CHEAP_MAX_TURNS and ask <= CHEAP_MAX_ASK
+              and tools == 0):
+            verdict = "DOWNGRADE"
+        else:
+            verdict = "ALLOW"
+
+    if count_it:
+        ctx.conn.execute("INSERT INTO ts_seen (api_key, fp, ts) VALUES (?,?,?)",
+                         (api_key, fp, now))
+        ctx.conn.execute(
+            "INSERT OR IGNORE INTO ts_shape (api_key, shape, first_ts) "
+            "VALUES (?,?,?)", (api_key, shape, now))
+        _prune(ctx, api_key, now)
+
+    measured["measured_from"] = ("a digest supplied by the client; the "
+                                "content stayed on their side"
+                                if m.get("from_digest") else
+                                "the request body")
+    return (verdict, rule, score, s, measured, fp, shape, loop_n, has_stored,
+            est_in, ceiling_out, acct)
+
+
+def _record_decision(ctx, api_key, fp, verdict, rule, score, signals,
+                     ex_in, ex_out, ce_in, ce_out, seal_hash, now):
+    """Writes the row and returns its id, so the receipt can be stamped on
+    afterwards once the lock has been released."""
+    cur = ctx.conn.execute(
+        "INSERT INTO ts_decision (api_key, ts, fp, verdict, rule, score, "
+        "signals, exact_in, exact_out, ceiling_in, ceiling_out, audit_hash) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        (api_key, now, fp, verdict, rule, score,
+         json.dumps(signals, sort_keys=True), ex_in, ex_out, ce_in, ce_out,
+         seal_hash))
+    return cur.lastrowid
+
+
+def _seal_and_stamp(ctx, event, detail, api_key, decision_id):
+    """
+    Seal with the lock released, then write the receipt back onto the row
+    in a second short lock. Splitting it this way is what keeps the
+    platform's non-reentrant lock from deadlocking the request.
+    """
+    seal = ctx.seal(event, detail, api_key)
+    h = seal.get("hash") if isinstance(seal, dict) else None
+    if h and decision_id:
+        try:
+            with ctx.lock:
+                ctx.conn.execute(
+                    "UPDATE ts_decision SET audit_hash=? WHERE id=?",
+                    (h, decision_id))
+                ctx.conn.commit()
+        except Exception:                        # noqa: BLE001
+            pass
+    return seal
+
+
+# --------------------------------------------------------------- actions
+
+def _a_spec():
+    return {
+        "module": "tokensaver",
+        "version": VERSION,
+        "what_it_is": "A deterministic gate in front of a model. It decides "
+                      "whether a request is answered from store, sent to the "
+                      "model, sent to a cheaper model, held for a person, or "
+                      "refused. It also names the waste inside every request "
+                      "it sees.",
+        "model_calls_made_to_reach_a_decision": 0,
+        "layers": {
+            "1_hard_rules": {
+                "why": "A cost gate that depends only on tuned weights is a "
+                       "cost gate nobody can defend. These are absolute.",
+                "rules": {
+                    "budget_exhausted": "spend has reached the key's ceiling",
+                    "exceeds_remaining_budget":
+                        "this one call could cost more than the budget left. "
+                        "Output uses the exact ceiling you set; input is "
+                        "estimated from characters, so this rule is "
+                        "deliberately cautious. Held for a person when a "
+                        "human is declared, refused when one is not.",
+                    "runaway_loop": "the same request %d times in %d seconds"
+                                    % (LOOP_HARD, LOOP_WINDOW),
+                    "runaway_loop_unattended": "the same request %d times in "
+                                               "%d seconds with no human "
+                                               "declared"
+                                               % (LOOP_HARD_UNATTENDED,
+                                                  LOOP_WINDOW),
+                    "runaway_burst": "%d requests from one key in 60 seconds"
+                                     % BURST_HARD,
+                },
+            },
+            "2_the_score": {
+                "spend_signals": {
+                    "exposure": {"weight": W_EXPOSURE,
+                                 "measures": "worst case cost of this call "
+                                             "against the budget left"},
+                    "size": {"weight": W_SIZE, "saturates_at": SAT_SIZE,
+                             "measures": "prompt characters, log scaled"},
+                    "ask": {"weight": W_ASK, "saturates_at": SAT_ASK,
+                            "measures": "the max_tokens ceiling the caller set"},
+                    "depth": {"weight": W_DEPTH, "saturates_at": SAT_DEPTH,
+                              "measures": "turns re-sent on every call"},
+                    "tools": {"weight": W_TOOLS, "saturates_at": SAT_TOOLS,
+                              "measures": "tool definitions re-sent on every call"},
+                },
+                "waste_signals": {
+                    "loop": {"weight": W_LOOP, "saturates_at": SAT_LOOP},
+                    "burst": {"weight": W_BURST, "saturates_at": SAT_BURST},
+                    "grind": {"weight": W_GRIND, "saturates_at": SAT_GRIND},
+                    "novelty": {"weight": W_NOVELTY},
+                },
+                "spend_weight_total": round(W_EXPOSURE + W_SIZE + W_ASK
+                                            + W_DEPTH + W_TOOLS, 4),
+                "waste_weight_total": round(W_LOOP + W_BURST + W_GRIND
+                                            + W_NOVELTY, 4),
+                "base_weights_sum_to": round(BASE_SUM, 4),
+                "outside_the_base_sum": {"unattended": W_UNATTENDED},
+                "bands": {"CHALLENGE": ">= %.2f" % BAND_CHALLENGE,
+                          "BLOCK": ">= %.2f" % BAND_BLOCK},
+                "downgrade_is_earned_not_suspected": {
+                    "max_score": CHEAP_MAX_SCORE,
+                    "max_prompt_characters": CHEAP_MAX_CHARS,
+                    "max_turns": CHEAP_MAX_TURNS,
+                    "max_output_tokens": CHEAP_MAX_ASK,
+                    "tools_allowed": 0,
+                    "why": "a suspicious request is never sent to a weaker "
+                           "model. Only a genuinely small one is.",
+                },
+            },
+            "3_findings": {
+                "why": "The verdict saves money on this call. The findings "
+                       "change what the caller sends next time, which saves "
+                       "far more.",
+                "codes": ["repeating_without_recording",
+                          "varied_output_blocks_reuse",
+                          "carrying_old_turns",
+                          "unused_tool_definitions",
+                          "large_system_prompt_resent",
+                          "output_ceiling_authorised",
+                          "duplicate_turns_in_context",
+                          "budget_nearly_gone"],
+            },
+        },
+        "verdict_vocabulary": VOCABULARY,
+        "certainty_tiers": {
+            "tokens_not_bought": "exact, provider reported, the only figure "
+                                 "that enters a savings total",
+            "worst_case_tokens_avoided": "a ceiling on what a refused request "
+                                         "could have cost, reported separately",
+            "findings_tokens": "estimated from characters where marked, never "
+                               "entering any total",
+        },
+        "two_ways_to_call_it": {
+            "request": "send the provider request body. This platform sees "
+                       "your prompt.",
+            "digest": "send only a fingerprint and counts. Your prompts and "
+                      "answers never leave your building, the decision is "
+                      "identical, and the receipt is the same. The downloaded "
+                      "client uses this path by default.",
+        },
+        "honest_limits": LIMITS,
+        "routes": {
+            "public": ["spec", "stats", "verify"],
+            "keyed": ["estimate", "gate", "record", "ledger", "budget",
+                      "prices", "forget"],
+        },
+    }
+
+
+def _bundle(data):
+    """
+    A caller may send the whole request, or only a digest of it. The
+    digest path exists so a customer's prompts and answers never leave
+    their own building. Returns (measurements, request_or_None, error, code).
+    """
+    req = data.get("request")
+    if isinstance(req, dict):
+        if _prompt_chars(req) > MAX_PROMPT_CHARS:
+            return None, None, {"error": "request_too_large"}, 413
+        return _measure(req), req, None, None
+
+    dig = data.get("digest")
+    if dig is not None:
+        m, err = _measure_from_digest(dig)
+        if err:
+            return None, None, {"error": "bad_digest", "detail": err}, 400
+        return m, None, None, None
+
+    return None, None, {
+        "error": "request_or_digest_required",
+        "detail": "send the provider request body under 'request', or a "
+                  "content-free digest under 'digest' with fingerprint, "
+                  "prompt_characters, max_tokens, conversation_turns, "
+                  "tool_definitions and deterministic",
+    }, 400
+
+
+def _digest_findings(m, loop_n, has_stored, acct):
+    """
+    What can honestly be said when the content stayed at home. Anything
+    needing the actual messages is left to the client, which has them.
+    """
+    out = []
+    if loop_n >= 2 and not has_stored:
+        out.append({
+            "code": "repeating_without_recording",
+            "severity": "high",
+            "detail": "This exact request has gone out %d times in the last "
+                      "%d seconds and no answer has been recorded. Post the "
+                      "response back to record and every repeat after that "
+                      "costs nothing." % (loop_n, LOOP_WINDOW),
+            "tokens": None,
+            "certainty": "not counted",
+        })
+    if not m["deterministic"]:
+        out.append({
+            "code": "varied_output_blocks_reuse",
+            "severity": "medium",
+            "detail": "temperature is above zero, so this answer cannot be "
+                      "safely reused.",
+            "tokens": None,
+            "certainty": "not counted",
+        })
+    if m["depth"] > CTX_FLAG_TURNS:
+        out.append({
+            "code": "carrying_old_turns",
+            "severity": "medium",
+            "detail": "%d turns are being re-sent on every call. Your client "
+                      "holds the content and can size this exactly."
+                      % m["depth"],
+            "tokens": None,
+            "certainty": "not counted here; the client can measure it",
+        })
+    if m["ask"]:
+        out.append({
+            "code": "output_ceiling_authorised",
+            "severity": "low",
+            "detail": "max_tokens is set to %d, so this call is authorised "
+                      "to buy up to that many output tokens." % m["ask"],
+            "tokens": m["ask"],
+            "certainty": "exact ceiling set by the caller",
+        })
+    if acct["ceiling"] and acct["spent"] >= acct["ceiling"] * 0.8:
+        out.append({
+            "code": "budget_nearly_gone",
+            "severity": "high",
+            "detail": "This key has used %d of its %d token ceiling."
+                      % (acct["spent"], acct["ceiling"]),
+            "tokens": None,
+            "certainty": "exact, from provider-reported usage",
+        })
+    return out
+
+
+def _a_estimate(ctx, api_key, data, now):
+    """Cost a request and name its waste. Changes nothing, seals nothing."""
+    m, req, err, code = _bundle(data)
+    if err:
+        return err, code
+
+    with ctx.lock:
+        (verdict, rule, score, s, measured, fp, shape, loop_n, has_stored,
+         est_in, ceil_out, acct) = _decide(
+            ctx, api_key, m, now, bool(data.get("unattended")), False)
+        findings = (_findings(req, loop_n, has_stored, acct) if req
+                    else _digest_findings(m, loop_n, has_stored, acct))
+        stored = has_stored
+
+    money = _money(est_in, ceil_out, acct["price_in"], acct["price_out"])
+    out = {
+        "would_be": verdict,
+        "rule": rule,
+        "score": score,
+        "signals": s,
+        "measured": measured,
+        "findings": findings,
+        "fingerprint": fp,
+        "stored_answer_available": stored,
+        "worst_case_cost": {
+            "estimated_input_tokens": est_in,
+            "authorised_output_tokens": ceil_out,
+            "certainty": "input estimated from characters; output is the "
+                         "exact ceiling you set",
+        },
+        "note": "estimate changes nothing, counts towards no velocity window "
+                "and seals nothing. Use gate for the real decision.",
+    }
+    if money is not None:
+        out["worst_case_cost"]["money_at_your_prices"] = money
+        out["worst_case_cost"]["currency"] = acct["currency"]
+    return out, 200
+
+
+def _a_gate(ctx, api_key, data, now):
+    m, req, err, code = _bundle(data)
+    if err:
+        return err, code
+
+    unattended = bool(data.get("unattended"))
+    fp = m["fp"]
+
+    # ---- everything that touches the database, under the lock ----------
+    with ctx.lock:
+        row = ctx.conn.execute(
+            "SELECT response, model, input_tokens, output_tokens, hits, "
+            "expires_at FROM ts_store WHERE api_key=? AND fp=?",
+            (api_key, fp)).fetchone()
+
+        expired = False
+        if row and row[5] is not None and row[5] < now:
+            ctx.conn.execute("DELETE FROM ts_store WHERE api_key=? AND fp=?",
+                             (api_key, fp))
+            expired = True
+            row = None
+
+        acct = _account(ctx, api_key)
+        budget_gone = bool(acct["ceiling"]) and acct["spent"] >= acct["ceiling"]
+
+        client_held = False
+        if row:
+            try:
+                client_held = (json.loads(row[0]).get("held_by") == "client")
+            except (ValueError, AttributeError):
+                client_held = False
+
+        served = bool(row) and not budget_gone
+        if served:
+            ctx.conn.execute(
+                "UPDATE ts_store SET hits=hits+1, last_hit=? "
+                "WHERE api_key=? AND fp=?", (now, api_key, fp))
+            did = _record_decision(
+                ctx, api_key, fp, "SERVE",
+                "stored_by_client" if client_held else "stored_answer",
+                0.0, {"repeat": 1.0}, row[2], row[3], None, None, None, now)
+        else:
+            (verdict, rule, score, s, measured, fp, shape, loop_n, has_stored,
+             est_in, ceil_out, acct) = _decide(ctx, api_key, m, now,
+                                               unattended, True)
+            findings = (_findings(req, loop_n, has_stored, acct) if req
+                        else _digest_findings(m, loop_n, has_stored, acct))
+            ce_in = est_in if verdict == "BLOCK" else None
+            ce_out = ceil_out if verdict == "BLOCK" else None
+            did = _record_decision(ctx, api_key, fp, verdict, rule, score, s,
+                                   None, None, ce_in, ce_out, None, now)
+        ctx.conn.commit()
+
+    # ---- sealing happens with the lock RELEASED -------------------------
+    # The platform's seal takes the same lock, and it is not reentrant.
+    # Calling it from inside the block above deadlocks the request.
+    if expired:
+        ctx.seal("tokensaver_expired",
+                 {"module": "tokensaver", "fingerprint": fp}, api_key)
+
+    if served:
+        detail = {
+            "module": "tokensaver", "verdict": "SERVE", "fingerprint": fp,
+            "model": row[1],
+            "tokens_not_bought": {"input": row[2], "output": row[3]},
+            "usage_reported_by_provider": (row[2] is not None
+                                           or row[3] is not None),
+            "hit_number": row[4] + 1,
+        }
+        if client_held:
+            detail["content_held_by"] = "client"
+        seal = _seal_and_stamp(ctx, "tokensaver_serve", detail, api_key, did)
+
+        known = (row[2] is not None or row[3] is not None)
+        out = {
+            "verdict": "SERVE",
+            "meaning": VOCABULARY["SERVE"],
+            "call_the_model": False,
+            "fingerprint": fp,
+            "tokens_not_bought": {
+                "input": row[2], "output": row[3],
+                "total": ((row[2] or 0) + (row[3] or 0)) if known else None,
+                "certainty": "exact, as reported by the provider on the "
+                             "original call" if known else
+                             "the provider reported no usage on the original "
+                             "call, so this saving is real but its size is "
+                             "unknown",
+            },
+            "hit_number": row[4] + 1,
+            "receipt": seal,
+        }
+        if client_held:
+            out["content_held_by"] = "client"
+            out["serve_from_your_own_store"] = True
+        else:
+            out["response"] = json.loads(row[0])
+        money = _money(row[2], row[3], acct["price_in"], acct["price_out"])
+        if money is not None:
+            out["money_not_spent_at_your_prices"] = money
+            out["currency"] = acct["currency"]
+        return out, 200
+
+    detail = {
+        "module": "tokensaver", "verdict": verdict, "rule": rule,
+        "score": score, "fingerprint": fp, "signals": s,
+        "measured": measured, "findings": [f["code"] for f in findings],
+    }
+    seal = _seal_and_stamp(ctx, "tokensaver_decision", detail, api_key, did)
+
+    out = {
+        "verdict": verdict,
+        "meaning": VOCABULARY[verdict],
+        "decided_by": ("hard rule: " + rule) if rule else "score",
+        "rule": rule,
+        "score": score,
+        "signals": s,
+        "measured": measured,
+        "findings": findings,
+        "fingerprint": fp,
+        "call_the_model": verdict in ("ALLOW", "DOWNGRADE"),
+        "use_cheap_model": verdict == "DOWNGRADE",
+        "receipt": seal,
+    }
+    if verdict == "BLOCK":
+        money = _money(est_in, ceil_out, acct["price_in"], acct["price_out"])
+        out["worst_case_avoided"] = {
+            "estimated_input_tokens": est_in,
+            "authorised_output_tokens": ceil_out,
+            "certainty": "a ceiling, not a saving. Nobody knows what this "
+                         "call would actually have cost, so it is reported "
+                         "separately and never added to tokens not bought.",
+        }
+        if money is not None:
+            out["worst_case_avoided"]["money_at_your_prices"] = money
+    if verdict in ("ALLOW", "DOWNGRADE"):
+        out["next"] = ("call the model, then POST the response to "
+                       "/x/tokensaver/record so the next identical request "
+                       "costs nothing")
+    return out, 200
+
+
+def _a_record(ctx, api_key, data, now):
+    req = data.get("request")
+    resp = data.get("response")
+    dig = data.get("digest")
+
+    # Content-free path: the client stored the answer at home and is only
+    # reporting what it cost, so the budget and the totals stay true.
+    if not isinstance(req, dict) and isinstance(dig, dict):
+        m, err = _measure_from_digest(dig)
+        if err:
+            return {"error": "bad_digest", "detail": err}, 400
+        u = data.get("usage") or {}
+        try:
+            t_in = (int(u["input_tokens"])
+                    if u.get("input_tokens") is not None else None)
+            t_out = (int(u["output_tokens"])
+                     if u.get("output_tokens") is not None else None)
+        except (TypeError, ValueError):
+            return {"error": "usage_must_be_whole_numbers"}, 400
+        with ctx.lock:
+            if t_in is not None or t_out is not None:
+                _spend(ctx, api_key, (t_in or 0) + (t_out or 0), now)
+            ctx.conn.execute(
+                "INSERT OR REPLACE INTO ts_store (api_key, fp, model, "
+                "response, input_tokens, output_tokens, stored_at, "
+                "expires_at, hits, last_hit) VALUES (?,?,?,?,?,?,?,?,0,NULL)",
+                (api_key, m["fp"], dig.get("model"),
+                 json.dumps({"held_by": "client",
+                             "note": "the answer is stored on the customer's "
+                                     "own machine and never came here"}),
+                 t_in, t_out, now, now + DEFAULT_TTL))
+            ctx.conn.commit()
+        seal = ctx.seal("tokensaver_store", {
+            "module": "tokensaver", "fingerprint": m["fp"],
+            "model": dig.get("model"), "content_held_by": "client",
+            "usage_reported_by_provider": (t_in is not None
+                                           or t_out is not None),
+            "input_tokens": t_in, "output_tokens": t_out}, api_key)
+        return {"stored": True, "fingerprint": m["fp"],
+                "content_held_by": "client", "input_tokens": t_in,
+                "output_tokens": t_out, "receipt": seal,
+                "note": "the cost is on the record here; the answer itself "
+                        "stayed on your machine"}, 200
+
+    if not isinstance(req, dict) or not isinstance(resp, dict):
+        return {"error": "request_and_response_required",
+                "detail": "send request and response, or a digest with usage"}, 400
+
+    body = json.dumps(resp)
+    if len(body.encode("utf-8")) > MAX_STORED_BYTES:
+        return {"error": "response_too_large",
+                "limit_bytes": MAX_STORED_BYTES}, 413
+
+    fp = _fingerprint(req)
+    t_in, t_out = _usage(resp)
+
+    if not _deterministic(req) and not data.get("store_varied"):
+        with ctx.lock:
+            if t_in is not None or t_out is not None:
+                _spend(ctx, api_key, (t_in or 0) + (t_out or 0), now)
+            ctx.conn.commit()
+        ctx.seal("tokensaver_refused_to_store", {
+            "module": "tokensaver", "fingerprint": fp,
+            "reason": "temperature above zero; serving a stored answer "
+                      "would change how the system behaves"}, api_key)
+        return {
+            "stored": False,
+            "spend_recorded": (t_in is not None or t_out is not None),
+            "reason": "temperature is above zero. Serving a stored answer to "
+                      "a request that asked for varied output would change "
+                      "how your system behaves. Send store_varied true to "
+                      "override deliberately.",
+        }, 200
+
+    ttl = data.get("ttl_seconds", DEFAULT_TTL)
+    try:
+        ttl = float(ttl)
+    except (TypeError, ValueError):
+        ttl = DEFAULT_TTL
+    expires = now + ttl if ttl > 0 else None
+
+    with ctx.lock:
+        ctx.conn.execute(
+            "INSERT OR REPLACE INTO ts_store (api_key, fp, model, response, "
+            "input_tokens, output_tokens, stored_at, expires_at, hits, "
+            "last_hit) VALUES (?,?,?,?,?,?,?,?,0,NULL)",
+            (api_key, fp, req.get("model"), body, t_in, t_out, now, expires))
+        if t_in is not None or t_out is not None:
+            _spend(ctx, api_key, (t_in or 0) + (t_out or 0), now)
+        ctx.conn.commit()
+
+    seal = ctx.seal("tokensaver_store", {
+        "module": "tokensaver", "fingerprint": fp, "model": req.get("model"),
+        "usage_reported_by_provider": (t_in is not None or t_out is not None),
+        "input_tokens": t_in, "output_tokens": t_out}, api_key)
+
+    return {
+        "stored": True,
+        "fingerprint": fp,
+        "usage_reported_by_provider": (t_in is not None or t_out is not None),
+        "input_tokens": t_in,
+        "output_tokens": t_out,
+        "receipt": seal,
+        "note": "the next identical request will be served from store and "
+                "will buy nothing"
+                if (t_in is not None or t_out is not None) else
+                "stored, but the provider reported no usage, so future "
+                "savings on this request will be real without a known size",
+    }, 200
+
+
+def _spend(ctx, api_key, tokens, now):
+    ctx.conn.execute(
+        "INSERT INTO ts_account (api_key, ceiling, spent, updated) "
+        "VALUES (?,0,?,?) ON CONFLICT(api_key) DO UPDATE SET "
+        "spent = spent + ?, updated = ?",
+        (api_key, tokens, now, tokens, now))
+
+
+def _totals(ctx, api_key=None):
+    where = "WHERE api_key=?" if api_key else ""
+    args = (api_key,) if api_key else ()
+
+    rows = ctx.conn.execute(
+        "SELECT hits, input_tokens, output_tokens FROM ts_store " + where,
+        args).fetchall()
+    exact_in = exact_out = unknown = 0
+    for h, i, o in rows:
+        if i is None and o is None:
+            unknown += h
+            continue
+        exact_in += (i or 0) * h
+        exact_out += (o or 0) * h
+
+    counts = {}
+    for v, c in ctx.conn.execute(
+            "SELECT verdict, COUNT(*) FROM ts_decision " + where
+            + " GROUP BY verdict", args).fetchall():
+        counts[v] = c
+
+    crow = ctx.conn.execute(
+        "SELECT COALESCE(SUM(ceiling_in),0), COALESCE(SUM(ceiling_out),0) "
+        "FROM ts_decision " + (where + " AND " if where else "WHERE ")
+        + "verdict='BLOCK'", args).fetchone()
+
+    rules = {}
+    for r, c in ctx.conn.execute(
+            "SELECT rule, COUNT(*) FROM ts_decision "
+            + (where + " AND " if where else "WHERE ")
+            + "rule IS NOT NULL GROUP BY rule", args).fetchall():
+        rules[r] = c
+
+    total = sum(counts.values())
+    served = counts.get("SERVE", 0)
+
+    return {
+        "decisions": total,
+        "verdicts": counts,
+        "hard_rules_fired": rules,
+        "serve_rate_percent": round(100.0 * served / total, 2) if total else 0.0,
+        "tokens_not_bought": {
+            "input": exact_in,
+            "output": exact_out,
+            "total": exact_in + exact_out,
+            "certainty": "exact. Provider-reported counts on requests served "
+                         "from store.",
+        },
+        "worst_case_tokens_avoided": {
+            "estimated_input": crow[0],
+            "authorised_output": crow[1],
+            "certainty": "a ceiling on refused requests, not a saving. Never "
+                         "added to tokens not bought.",
+        },
+        "serves_with_no_usage_reported": unknown,
+        "stored_answers": len(rows),
+    }
+
+
+def _a_stats(ctx):
+    with ctx.lock:
+        t = _totals(ctx)
+    t["version"] = VERSION
+    t["model_calls_made_to_reach_a_decision"] = 0
+    t["note"] = ("No figure here is a percentage saved. Exact savings and "
+                 "worst case ceilings are reported apart and never summed.")
+    return t, 200
+
+
+def _a_ledger(ctx, api_key, data, now):
+    try:
+        limit = min(200, max(1, int(data.get("limit", 50))))
+    except (TypeError, ValueError):
+        limit = 50
+    with ctx.lock:
+        rows = ctx.conn.execute(
+            "SELECT ts, fp, verdict, rule, score, exact_in, exact_out, "
+            "ceiling_in, ceiling_out, audit_hash FROM ts_decision "
+            "WHERE api_key=? ORDER BY id DESC LIMIT ?",
+            (api_key, limit)).fetchall()
+        totals = _totals(ctx, api_key)
+        acct = _account(ctx, api_key)
+
+    out = {
+        "totals": totals,
+        "budget": {
+            "ceiling_tokens": acct["ceiling"],
+            "spent_tokens": acct["spent"],
+            "remaining_tokens": max(0, acct["ceiling"] - acct["spent"])
+                                if acct["ceiling"] else None,
+            "note": "no ceiling set; set one with budget"
+                    if not acct["ceiling"] else None,
+        },
+        "recent": [{
+            "ts": r[0], "fingerprint": r[1], "verdict": r[2], "rule": r[3],
+            "score": r[4],
+            "tokens_not_bought": ((r[5] or 0) + (r[6] or 0))
+                                 if r[2] == "SERVE" else 0,
+            "worst_case_avoided": ((r[7] or 0) + (r[8] or 0))
+                                  if r[2] == "BLOCK" else 0,
+            "receipt": r[9],
+        } for r in rows],
+    }
+    m = _money(totals["tokens_not_bought"]["input"],
+               totals["tokens_not_bought"]["output"],
+               acct["price_in"], acct["price_out"])
+    if m is not None:
+        out["money_not_spent_at_your_prices"] = m
+        out["currency"] = acct["currency"]
+        out["money_note"] = ("calculated only from provider-reported counts "
+                             "on requests served from store, at the prices "
+                             "you supplied")
+    return out, 200
+
+
+def _a_budget(ctx, api_key, data, now):
+    if "ceiling_tokens" not in data:
+        return {"error": "ceiling_tokens_required",
+                "detail": "the number of tokens this key may spend before "
+                          "every request is refused"}, 400
+    try:
+        ceiling = int(data["ceiling_tokens"])
+    except (TypeError, ValueError):
+        return {"error": "ceiling_tokens_must_be_a_whole_number"}, 400
+    if ceiling < 0:
+        return {"error": "ceiling_tokens_must_not_be_negative"}, 400
+
+    reset = bool(data.get("reset_spent"))
+    with ctx.lock:
+        ctx.conn.execute(
+            "INSERT INTO ts_account (api_key, ceiling, spent, updated) "
+            "VALUES (?,?,0,?) ON CONFLICT(api_key) DO UPDATE SET "
+            "ceiling=?, updated=?", (api_key, ceiling, now, ceiling, now))
+        if reset:
+            ctx.conn.execute("UPDATE ts_account SET spent=0 WHERE api_key=?",
+                             (api_key,))
+        acct = _account(ctx, api_key)
+        ctx.conn.commit()
+
+    seal = ctx.seal("tokensaver_budget", {
+        "module": "tokensaver", "ceiling_tokens": ceiling,
+        "spent_reset": reset}, api_key)
+
+    return {"ceiling_tokens": acct["ceiling"], "spent_tokens": acct["spent"],
+            "receipt": seal,
+            "note": "when spent reaches the ceiling, every request is refused "
+                    "before it reaches the model"}, 200
+
+
+def _a_prices(ctx, api_key, data, now):
+    """Prices come from the customer's own contract. Never assumed."""
+    pi = data.get("price_per_million_input")
+    po = data.get("price_per_million_output")
+    if pi is None and po is None:
+        return {"error": "prices_required",
+                "detail": "send price_per_million_input and/or "
+                          "price_per_million_output from your own provider "
+                          "contract. Nothing is assumed on your behalf."}, 400
+    try:
+        pi = float(pi) if pi is not None else None
+        po = float(po) if po is not None else None
+    except (TypeError, ValueError):
+        return {"error": "prices_must_be_numbers"}, 400
+    if (pi is not None and pi < 0) or (po is not None and po < 0):
+        return {"error": "prices_must_not_be_negative"}, 400
+
+    cur = (data.get("currency") or "").strip()[:8] or None
+    with ctx.lock:
+        ctx.conn.execute(
+            "INSERT INTO ts_account (api_key, ceiling, spent, price_in, "
+            "price_out, currency, updated) VALUES (?,0,0,?,?,?,?) "
+            "ON CONFLICT(api_key) DO UPDATE SET price_in=?, price_out=?, "
+            "currency=?, updated=?",
+            (api_key, pi, po, cur, now, pi, po, cur, now))
+        ctx.conn.commit()
+
+    seal = ctx.seal("tokensaver_prices", {
+        "module": "tokensaver", "price_per_million_input": pi,
+        "price_per_million_output": po, "currency": cur}, api_key)
+
+    return {"price_per_million_input": pi, "price_per_million_output": po,
+            "currency": cur, "receipt": seal,
+            "note": "money figures now appear alongside token figures. They "
+                    "are your prices applied to provider-reported counts, "
+                    "never an assumption about what you pay."}, 200
+
+
+def _a_forget(ctx, api_key, data, now):
+    fp = data.get("fingerprint")
+    req = data.get("request")
+    if not fp and isinstance(req, dict):
+        fp = _fingerprint(req)
+    if not fp:
+        return {"error": "fingerprint_or_request_required"}, 400
+
+    with ctx.lock:
+        cur = ctx.conn.execute(
+            "DELETE FROM ts_store WHERE api_key=? AND fp=?", (api_key, fp))
+        removed = cur.rowcount
+        ctx.conn.commit()
+
+    seal = ctx.seal("tokensaver_forget", {
+        "module": "tokensaver", "fingerprint": fp, "removed": removed},
+        api_key)
+
+    return {"removed": removed, "fingerprint": fp, "receipt": seal,
+            "note": "the stored answer is gone. Decisions already sealed "
+                    "stay sealed."}, 200
+
+
+def _a_verify(ctx, data):
+    h = data.get("receipt") or data.get("hash")
+    if not h:
+        return {"error": "receipt_required",
+                "detail": "pass ?receipt=<chain hash from a decision>"}, 400
+    with ctx.lock:
+        row = ctx.conn.execute(
+            "SELECT ts, verdict, rule, score, exact_in, exact_out, "
+            "ceiling_in, ceiling_out, fp FROM ts_decision WHERE audit_hash=?",
+            (h,)).fetchone()
+    if not row:
+        return {"found": False, "receipt": h,
+                "note": "no decision on this platform carries that receipt"}, 404
+    return {
+        "found": True,
+        "receipt": h,
+        "ts": row[0],
+        "verdict": row[1],
+        "meaning": VOCABULARY.get(row[1], row[1]),
+        "decided_by": ("hard rule: " + row[2]) if row[2] else "score",
+        "score": row[3],
+        "tokens_not_bought": ((row[4] or 0) + (row[5] or 0))
+                             if row[1] == "SERVE" else 0,
+        "worst_case_avoided": ((row[6] or 0) + (row[7] or 0))
+                              if row[1] == "BLOCK" else 0,
+        "fingerprint": row[8],
+        "what_this_proves": "that this decision was sealed into the chain "
+                            "with these values at this position.",
+        "what_this_does_not_prove": "that a stored answer is still correct, "
+                                    "or what a refused request would actually "
+                                    "have cost.",
+    }, 200
+
+
+# ---------------------------------------------------------------- handler
+# ---------------------------------------------------------------- the ctx
+
+def _fallback_conn():
+    global _FALLBACK_CONN
+    with _FALLBACK_LOCK:
+        if _FALLBACK_CONN is None:
+            _FALLBACK_CONN = sqlite3.connect("tokensaver.db",
+                                             check_same_thread=False)
+            _FALLBACK_CONN.execute("PRAGMA journal_mode=WAL")
+        return _FALLBACK_CONN
+
+
+class _Bridge:
+    """
+    A router may hand a module a context object, or a plain dict. Rather
+    than assume which, find what is actually needed: something that can
+    run SQL, something that can be held, and something that can seal.
+
+    Anything missing is reported honestly in the response instead of
+    being faked.
+    """
+
+    def __init__(self, raw):
+        self.raw = raw
+        self.conn = self._find(
+            lambda v: hasattr(v, "execute") and hasattr(v, "commit"),
+            ("conn", "db", "_conn", "_db", "database", "sql", "sqlite"))
+        self.lock = self._find(
+            lambda v: hasattr(v, "acquire") and hasattr(v, "release"),
+            ("lock", "db_lock", "_db_lock", "_lock", "mutex"))
+        # A sqlite3 Connection is itself callable, so "anything callable"
+        # is not a safe test for a seal function - it would quietly pick the
+        # database. Require an actual function or method.
+        self._seal = self._find(
+            lambda v: (inspect.isroutine(v)
+                       and v is not self.conn and v is not self.lock),
+            ("seal", "seal_fn", "seal_block", "add_block", "chain_seal",
+             "append_block"))
+        self.notes = []
+
+        if self.conn is None:
+            # Last resort so the module still answers rather than 500s.
+            self.conn = _fallback_conn()
+            self.notes.append("no database was found in the router context, so "
+                              "this module opened its own file")
+        if self.lock is None:
+            self.lock = _FALLBACK_LOCK
+            self.notes.append("no lock was found in the router context, so "
+                              "this module used its own")
+        if self._seal is None:
+            self.notes.append("no seal function was found in the router "
+                              "context, so decisions are recorded but not "
+                              "sealed into the platform chain")
+
+    def _find(self, test, names):
+        raw = self.raw
+        if isinstance(raw, dict):
+            for n in names:                      # preferred names first
+                if n in raw and raw[n] is not None:
+                    try:
+                        if test(raw[n]):
+                            return raw[n]
+                    except Exception:            # noqa: BLE001
+                        pass
+            for v in raw.values():               # then anything that fits
+                try:
+                    if v is not None and test(v):
+                        return v
+                except Exception:                # noqa: BLE001
+                    pass
+            return None
+        for n in names:
+            v = getattr(raw, n, None)
+            if v is not None:
+                try:
+                    if test(v):
+                        return v
+                except Exception:                # noqa: BLE001
+                    pass
+        return None
+
+    def seal(self, event, detail, api_key=None):
+        """
+        MUST NOT be called while holding self.lock. The platform's own seal
+        takes that same lock, and it is a plain Lock rather than a reentrant
+        one, so calling it from inside a held lock deadlocks the request.
+        """
+        if self._seal is None:
+            return {"sealed": False,
+                    "reason": "the platform chain was not reachable from this "
+                              "module"}
+
+        ev = {"user_id": "tokensaver", "action": str(event), "amount": 0,
+              "country": "UK", "device_id": "module", "anomaly": 0,
+              "device_risk": 0}
+        now = time.time()
+
+        attempts = (
+            lambda: self._seal(ev, detail, now, api_key),
+            lambda: self._seal(ev, detail, now),
+            lambda: self._seal(event, detail),
+            lambda: self._seal({"event": event, "detail": detail}),
+        )
+        r = None
+        last = None
+        for call in attempts:
+            try:
+                r = call()
+                break
+            except TypeError as e:
+                last = e
+                continue
+            except Exception as e:               # noqa: BLE001
+                return {"sealed": False, "reason": str(e)}
+        if r is None:
+            return {"sealed": False,
+                    "reason": "could not match the chain's seal signature: "
+                              + str(last)}
+
+        if isinstance(r, dict):
+            return r
+        if isinstance(r, str):
+            return {"hash": r}
+        if isinstance(r, (list, tuple)) and r:
+            out = {"hash": str(r[0])}
+            if len(r) > 1 and r[1] is not None:
+                out["block_index"] = r[1]
+            if len(r) > 2 and r[2] is not None:
+                out["key_seq"] = r[2]
+            return out
+        return {"sealed": True}
+
+
+_FALLBACK_LOCK = threading.RLock()
+_FALLBACK_CONN = None
+
+
+def _bridge(raw):
+    """
+    Built fresh every call on purpose. Caching it by id() is unsafe:
+    Python recycles ids once an object is collected, so a cached bridge
+    can end up serving a different request's context.
+    """
+    if isinstance(raw, _Bridge):
+        return raw
+    return _Bridge(raw)
 
 
 def handle(method, action, data, api_key, ctx):
-    armed = _install_page(ctx)
-    return ({"module": "studio", "version": VERSION, "armed": armed,
-             "serves": sorted(_FILES.keys())}, 200)
+    ctx = _bridge(ctx)
+    _init(ctx)
+    data = data or {}
+    now = time.time()
 
+    if method == "GET" and action == "spec":
+        sp = _a_spec()
+        if ctx.notes:
+            sp["wiring_notes"] = ctx.notes
+        return sp, 200
+    if method == "GET" and action == "stats":
+        return _a_stats(ctx)
+    if method == "GET" and action == "verify":
+        return _a_verify(ctx, data)
 
-PUBLIC = {("GET", "status"), ("GET", "spec")}
+    if not api_key:
+        return {"error": "key_required"}, 401
+
+    if method == "POST" and action == "estimate":
+        return _a_estimate(ctx, api_key, data, now)
+    if method == "POST" and action == "gate":
+        return _a_gate(ctx, api_key, data, now)
+    if method == "POST" and action == "record":
+        return _a_record(ctx, api_key, data, now)
+    if method == "GET" and action == "ledger":
+        return _a_ledger(ctx, api_key, data, now)
+    if method == "POST" and action == "budget":
+        return _a_budget(ctx, api_key, data, now)
+    if method == "POST" and action == "prices":
+        return _a_prices(ctx, api_key, data, now)
+    if method == "POST" and action == "forget":
+        return _a_forget(ctx, api_key, data, now)
+
+    return {"error": "unknown_action",
+            "actions": ["spec", "stats", "verify", "estimate", "gate",
+                        "record", "ledger", "budget", "prices", "forget"]}, 404
 
 ```
