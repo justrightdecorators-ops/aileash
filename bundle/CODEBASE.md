@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-154 files across 40 parts.
+155 files across 40 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -43,6 +43,7 @@ Generated automatically on every push. Do not edit by hand.
 ## [CODEBASE-07.md](CODEBASE-07.md)
 
 - `modules/credits.py`
+- `modules/creditspage.py`
 - `modules/custody.py`
 - `modules/declare.py`
 - `modules/demo.py`
