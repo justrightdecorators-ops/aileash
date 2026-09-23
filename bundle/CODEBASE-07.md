@@ -1,353 +1,13 @@
 # Codebase — part 7 of 40
 
 Contains:
-- `modules/credits.py`
 - `modules/creditspage.py`
 - `modules/custody.py`
 - `modules/declare.py`
 - `modules/demo.py`
 - `modules/disclosure.py`
 - `modules/dsr.py`
-
-
-## `modules/credits.py`
-
-332 lines, 13878 bytes
-
-```python
-"""
-modules/credits.py  v1.0.0
-Credits: the money side of Monop Studio, running on the chain.
-
-A viewer tops up once. Every unlock spends a few pence of that balance, the
-creator's share lands in their balance, and both sides are sealed into the
-chain. Creators paste no payment links, viewers set nothing up, and a card is
-touched once per top-up instead of once per view.
-
-Served with permissive CORS from a clean /c/ prefix, because locked players
-live on other people's sites and call in from there:
-
-    GET  /c/hello?viewer=            balance, or a new viewer id     (public)
-    GET  /c/check?viewer=&video=     is this already unlocked         (public)
-    POST /c/unlock                   spend the credit, seal it        (public)
-    POST /c/topup                    add credit (see STRIPE below)    (public)
-    GET  /c/earnings?creator=        a creator's balance and views    (public)
-    GET  /x/credits/status           counts                           (public)
-
-THE ONE THING LEFT TO WIRE: _checkout_url() below. Set the environment
-variable STRIPE_TOPUP_LINK to a Stripe payment link and /credits sends buyers
-there; until then, TEST_MODE hands out test credit so the whole flow runs end
-to end. Nothing else in this file changes when Stripe goes in.
-"""
-
-import json
-import os
-import re
-import sys
-import time
-import urllib.parse
-
-VERSION = "1.0.0"
-PUBLIC = {("GET", "status"), ("GET", "spec")}
-
-TEST_MODE = os.environ.get("CREDITS_TEST_MODE", "1") != "0"
-TEST_GRANT = 100          # pence handed to a new viewer while in test mode
-CREATOR_SHARE = 0.70      # 7p of every 10p
-MAX_PRICE = 500
-KEY = "public-credits"
-ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
-VID_RE = re.compile(r"^[A-Za-z0-9_.:-]{4,120}$")
-NAME_RE = re.compile(r"[^A-Za-z0-9 ._-]")
-
-_ready = False
-_patched = False
-_ctx = {}
-
-
-def _checkout_url(pence):
-    """The only Stripe-shaped hole. Return a URL to send a buyer to, or None."""
-    link = os.environ.get("STRIPE_TOPUP_LINK", "").strip()
-    return (link + ("&" if "?" in link else "?") + "client_reference_id=topup_%d" % pence) if link else None
-
-
-def _setup():
-    global _ready
-    if _ready or "conn" not in _ctx:
-        return
-    with _ctx["lock"]:
-        c = _ctx["conn"]
-        c.execute("CREATE TABLE IF NOT EXISTS credit_viewer(id TEXT PRIMARY KEY,balance INTEGER,"
-                  "spent INTEGER DEFAULT 0,created REAL)")
-        c.execute("CREATE TABLE IF NOT EXISTS credit_unlock(id INTEGER PRIMARY KEY AUTOINCREMENT,"
-                  "viewer TEXT,video TEXT,creator TEXT,price INTEGER,at REAL,audit_hash TEXT,"
-                  "block_index INTEGER,UNIQUE(viewer,video))")
-        c.execute("CREATE TABLE IF NOT EXISTS credit_creator(name TEXT PRIMARY KEY,balance INTEGER,"
-                  "views INTEGER DEFAULT 0)")
-        c.commit()
-    _ready = True
-
-
-def _seal(kind, detail, extra):
-    now = time.time()
-    ev = {"user_id": "crd:" + kind[:20], "action": kind, "amount": 0, "country": "UK",
-          "device_id": "credits", "anomaly": 0, "device_risk": 0}
-    res = {"decision": kind.upper(), "score": 0, "credits_version": VERSION, "detail": detail}
-    res.update(extra or {})
-    out = _ctx["seal"](ev, res, now, KEY)
-    if isinstance(out, (list, tuple)):
-        return out[0], (out[1] if len(out) > 1 else None)
-    return out, None
-
-
-def _viewer(vid, make=True):
-    with _ctx["lock"]:
-        row = _ctx["conn"].execute("SELECT balance,spent FROM credit_viewer WHERE id=?", (vid,)).fetchone()
-        if row:
-            return {"balance": row[0], "spent": row[1]}
-        if not make:
-            return None
-        start = TEST_GRANT if TEST_MODE else 0
-        _ctx["conn"].execute("INSERT INTO credit_viewer(id,balance,spent,created) VALUES(?,?,0,?)",
-                             (vid, start, time.time()))
-        _ctx["conn"].commit()
-    return {"balance": start, "spent": 0}
-
-
-# ---------------------------------------------------------------- commands
-
-def c_hello(q, body):
-    vid = (q.get("viewer") or body.get("viewer") or "").strip()
-    if not ID_RE.match(vid):
-        return {"error": "viewer id needed (8 to 64 characters, letters and numbers)"}, 400
-    v = _viewer(vid)
-    return {"viewer": vid, "balance_pence": v["balance"], "spent_pence": v["spent"],
-            "test_mode": TEST_MODE, "topup": "https://sebbi.pro/credits"}, 200
-
-
-def c_check(q, body):
-    vid = (q.get("viewer") or body.get("viewer") or "").strip()
-    video = (q.get("video") or body.get("video") or "").strip()
-    if not ID_RE.match(vid) or not VID_RE.match(video):
-        return {"unlocked": False, "error": "viewer and video needed"}, 400
-    with _ctx["lock"]:
-        row = _ctx["conn"].execute("SELECT block_index,at FROM credit_unlock WHERE viewer=? AND video=?",
-                                   (vid, video)).fetchone()
-    v = _viewer(vid)
-    return {"unlocked": bool(row), "block_index": row[0] if row else None,
-            "balance_pence": v["balance"]}, 200
-
-
-def c_unlock(q, body):
-    vid = str(body.get("viewer") or q.get("viewer") or "").strip()
-    video = str(body.get("video") or q.get("video") or "").strip()
-    creator = NAME_RE.sub("", str(body.get("creator") or "Anonymous"))[:40] or "Anonymous"
-    try:
-        price = max(1, min(MAX_PRICE, int(float(body.get("price") or q.get("price") or 10))))
-    except (TypeError, ValueError):
-        price = 10
-    if not ID_RE.match(vid) or not VID_RE.match(video):
-        return {"unlocked": False, "error": "viewer and video needed"}, 400
-
-    with _ctx["lock"]:
-        row = _ctx["conn"].execute("SELECT block_index FROM credit_unlock WHERE viewer=? AND video=?",
-                                   (vid, video)).fetchone()
-    if row:
-        v = _viewer(vid)
-        return {"unlocked": True, "already": True, "block_index": row[0],
-                "balance_pence": v["balance"]}, 200
-
-    v = _viewer(vid)
-    if v["balance"] < price:
-        return {"unlocked": False, "reason": "not_enough_credit", "price_pence": price,
-                "balance_pence": v["balance"], "topup": "https://sebbi.pro/credits",
-                "message": "You need %dp and have %dp. Top up and it unlocks straight away."
-                           % (price, v["balance"])}, 402
-
-    share = int(round(price * CREATOR_SHARE))
-    audit_hash, block = _seal("paid_view", "video=%s;creator=%s;price=%d;creator_share=%d"
-                              % (video, creator, price, share),
-                              {"video": video, "creator": creator, "price_pence": price,
-                               "creator_pence": share, "platform_pence": price - share})
-    with _ctx["lock"]:
-        c = _ctx["conn"]
-        c.execute("UPDATE credit_viewer SET balance=balance-?, spent=spent+? WHERE id=?", (price, price, vid))
-        c.execute("INSERT OR IGNORE INTO credit_creator(name,balance,views) VALUES(?,0,0)", (creator,))
-        c.execute("UPDATE credit_creator SET balance=balance+?, views=views+1 WHERE name=?", (share, creator))
-        c.execute("INSERT OR IGNORE INTO credit_unlock(viewer,video,creator,price,at,audit_hash,block_index)"
-                  " VALUES(?,?,?,?,?,?,?)", (vid, video, creator, price, time.time(), audit_hash, block))
-        c.commit()
-    v = _viewer(vid)
-    return {"unlocked": True, "price_pence": price, "creator_pence": share,
-            "balance_pence": v["balance"], "sealed_in_chain": audit_hash, "block_index": block,
-            "verify": "https://sebbi.pro/x/walk/block?index=%s" % block}, 200
-
-
-def c_topup(q, body):
-    vid = str(body.get("viewer") or q.get("viewer") or "").strip()
-    try:
-        pence = max(50, min(10000, int(float(body.get("pence") or q.get("pence") or 500))))
-    except (TypeError, ValueError):
-        pence = 500
-    if not ID_RE.match(vid):
-        return {"error": "viewer id needed"}, 400
-    url = _checkout_url(pence)
-    if url:
-        return {"paid": False, "checkout": url, "pence": pence,
-                "message": "Pay there and your credit lands when you come back."}, 200
-    if not TEST_MODE:
-        return {"paid": False, "error": "no_checkout_configured",
-                "message": "Card top-ups are not switched on yet."}, 503
-    _viewer(vid)
-    audit_hash, block = _seal("test_topup", "viewer=%s;pence=%d" % (vid[:12], pence),
-                              {"pence": pence, "test_mode": True})
-    with _ctx["lock"]:
-        _ctx["conn"].execute("UPDATE credit_viewer SET balance=balance+? WHERE id=?", (pence, vid))
-        _ctx["conn"].commit()
-    v = _viewer(vid)
-    return {"paid": True, "test_mode": True, "added_pence": pence, "balance_pence": v["balance"],
-            "sealed_in_chain": audit_hash, "block_index": block}, 200
-
-
-def c_earnings(q, body):
-    name = NAME_RE.sub("", str(q.get("creator") or body.get("creator") or ""))[:40]
-    if not name:
-        return {"error": "creator needed"}, 400
-    with _ctx["lock"]:
-        row = _ctx["conn"].execute("SELECT balance,views FROM credit_creator WHERE name=?", (name,)).fetchone()
-        recent = _ctx["conn"].execute("SELECT video,price,at,block_index FROM credit_unlock WHERE creator=?"
-                                      " ORDER BY id DESC LIMIT 25", (name,)).fetchall()
-    return {"creator": name, "balance_pence": row[0] if row else 0, "paid_views": row[1] if row else 0,
-            "recent": [{"video": r[0], "price_pence": r[1],
-                        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(r[2])),
-                        "block_index": r[3]} for r in recent]}, 200
-
-
-CMDS = {"hello": c_hello, "check": c_check, "unlock": c_unlock, "topup": c_topup, "earnings": c_earnings}
-
-
-# ---------------------------------------------------------------- transport
-
-def _send(h, obj, code=200):
-    body = json.dumps(obj).encode("utf-8")
-    h.send_response(code)
-    h.send_header("Content-Type", "application/json; charset=utf-8")
-    h.send_header("Content-Length", str(len(body)))
-    h.send_header("Access-Control-Allow-Origin", "*")
-    h.send_header("Access-Control-Allow-Headers", "Content-Type")
-    h.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-    h.send_header("Cache-Control", "no-store")
-    h.end_headers()
-    h.wfile.write(body)
-
-
-def _find_handler_class(ctx):
-    if isinstance(ctx, dict):
-        for k in ("handler_class", "handler", "Handler", "h", "request_handler"):
-            v = ctx.get(k)
-            if v is None:
-                continue
-            cls = v if isinstance(v, type) else type(v)
-            if hasattr(cls, "do_GET"):
-                return cls
-    f = sys._getframe()
-    while f is not None:
-        s = f.f_locals.get("self")
-        if s is not None and hasattr(type(s), "do_GET") and hasattr(s, "wfile"):
-            return type(s)
-        f = f.f_back
-    return None
-
-
-def _run(h, method):
-    u = urllib.parse.urlparse(h.path)
-    name = u.path[3:].strip("/").lower()
-    if name not in CMDS:
-        return False
-    if "conn" not in _ctx:
-        _send(h, {"error": "not_armed", "message": "open /x/credits/status once"}, 503)
-        return True
-    _setup()
-    q = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
-    body = {}
-    if method == "POST":
-        try:
-            n = int(h.headers.get("Content-Length") or 0)
-            if n:
-                body = json.loads(h.rfile.read(n).decode("utf-8") or "{}")
-            if not isinstance(body, dict):
-                body = {}
-        except Exception:
-            body = {}
-    try:
-        out, code = CMDS[name](q, body)
-    except Exception as e:
-        out, code = {"error": "failed", "detail": str(e)[:160]}, 500
-    _send(h, out, code)
-    return True
-
-
-def _install(ctx):
-    global _patched
-    if isinstance(ctx, dict) and "conn" in ctx:
-        _ctx.update(ctx)
-        _setup()
-    if _patched:
-        return True
-    cls = _find_handler_class(ctx)
-    if cls is None:
-        return False
-    if getattr(cls, "_credits_patched", False):
-        _patched = True
-        return True
-    og, op = cls.do_GET, getattr(cls, "do_POST", None)
-    oo = getattr(cls, "do_OPTIONS", None)
-
-    def do_GET(self):
-        if self.path.startswith("/c/") and _run(self, "GET"):
-            return
-        return og(self)
-
-    def do_POST(self):
-        if self.path.startswith("/c/") and _run(self, "POST"):
-            return
-        return op(self) if op else None
-
-    def do_OPTIONS(self):
-        if self.path.startswith("/c/"):
-            self.send_response(204)
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type")
-            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
-        return oo(self) if oo else None
-
-    cls.do_GET = do_GET
-    if op:
-        cls.do_POST = do_POST
-    cls.do_OPTIONS = do_OPTIONS
-    cls._credits_patched = True
-    _patched = True
-    return True
-
-
-def handle(method, action, data, api_key, ctx):
-    armed = _install(ctx)
-    counts = {}
-    if "conn" in _ctx:
-        with _ctx["lock"]:
-            c = _ctx["conn"]
-            counts = {"viewers": c.execute("SELECT COUNT(*) FROM credit_viewer").fetchone()[0],
-                      "paid_views": c.execute("SELECT COUNT(*) FROM credit_unlock").fetchone()[0],
-                      "creators": c.execute("SELECT COUNT(*) FROM credit_creator").fetchone()[0],
-                      "creator_balances_pence": c.execute("SELECT COALESCE(SUM(balance),0) FROM credit_creator").fetchone()[0]}
-    return {"module": "credits", "version": VERSION, "armed": armed,
-            "test_mode": TEST_MODE, "card_topups_ready": bool(_checkout_url(500)),
-            "creator_share": CREATOR_SHARE, "counts": counts,
-            "endpoints": ["/c/hello", "/c/check", "/c/unlock", "/c/topup", "/c/earnings"]}, 200
-
-```
+- `modules/fingerprint.py`
 
 
 ## `modules/creditspage.py`
@@ -2201,5 +1861,563 @@ def handle(method, action, data, api_key, ctx):
                 return {"error": "id_required"}, 400
             return _timeline(ctx, api_key, rid)
     return {"error": "unknown_action", "action": action}, 404
+
+```
+
+
+## `modules/fingerprint.py`
+
+550 lines, 22358 bytes
+
+```python
+"""
+modules/fingerprint.py  -  is somebody else running my scoring function?
+
+THE IDEA
+--------
+The scoring engine is deterministic. Identical inputs give an identical score,
+every time, forever. That is a compliance property - and it is also a
+signature.
+
+So: fire a fixed battery of carefully chosen inputs at any scoring endpoint,
+fire the same battery at our own, and compare the two sets of numbers.
+
+  identical across 24 varied vectors        it is this function
+  identical shape, different scale          it is this function, reweighted
+  same ordering, different curve            similar design, not this code
+  unrelated                                 unrelated
+
+WHY THE VECTORS ARE CHOSEN THE WAY THEY ARE
+-------------------------------------------
+Random inputs would only catch a straight copy. These are picked to probe the
+specific design decisions in the function, because those are what survive
+someone renaming things or nudging a weight:
+
+  saturation points   velocity terms saturate at different counts per window,
+                      so a burst and a grind separate. Vectors sit either side
+                      of each saturation point.
+  curve shape         amount is log-scaled, so small sums move the score far
+                      more than large ones. Vectors walk that curve.
+  normalisation       the continuous weights sum to 1.00 and the boolean
+                      geography terms sit outside it. Vectors isolate that.
+  asymmetry           trust contributes inversely and dominates. Vectors sweep
+                      trust alone with everything else held flat.
+
+A copy that renamed every field and changed nothing else matches exactly. A
+copy that shifted the weights still tracks the shape, because the saturation
+points and the log curve are structural rather than parametric.
+
+WHAT IT CANNOT DO
+-----------------
+It only sees endpoints it can reach. A private product behind a key with no
+free tier is invisible to this, and no amount of cleverness changes that.
+
+It also proves similarity, never theft. Two people can converge on similar
+weights honestly. What this produces is a dated, sealed measurement - which is
+evidence, not a verdict, and the distinction matters if it is ever put in
+front of anyone.
+
+EVERY RUN IS SEALED
+-------------------
+The probe, the target, the vectors and the result all go into the chain. So a
+comparison run today is provable as having been run today, rather than
+assembled afterwards to fit an argument.
+
+ROUTES  (all keyed - this is not a public toy)
+----------------------------------------------
+  POST /x/fingerprint/self      score the battery on our own engine
+  POST /x/fingerprint/probe     url, plus optional field mapping. Compare.
+  GET  /x/fingerprint/history   previous probes and their verdicts
+  GET  /x/fingerprint/vectors   the battery itself
+  GET  /x/fingerprint/spec      what a verdict means and does not mean
+"""
+
+import ipaddress
+import json
+import math
+import socket
+import sys
+import time
+import urllib.error
+import urllib.request
+from urllib.parse import urlparse
+
+VERSION = "1.0"
+
+PUBLIC = set()          # nothing public. deliberately.
+
+FETCH_TIMEOUT = 10
+MAX_BYTES = 200000
+POLITE_DELAY = 0.4      # do not hammer somebody else's server
+ALLOWED_SCHEMES = ("http", "https")
+ALLOWED_PORTS = (80, 443)
+
+# Where the live scorer might be found. Same approach as replay.py - look it
+# up at runtime, never import server.py.
+SCORER_NAMES = ["score_event", "score", "_score_event"]
+
+_ready = False
+
+
+# ----------------------------------------------------------------------
+# the battery
+# ----------------------------------------------------------------------
+# Each vector is (label, signals). Signals use the engine's own internal
+# names; the probe maps them to whatever the target calls things.
+
+def _v(trust=0.5, v60=0, v5m=0, v1h=0, amount=0.0,
+       device_risk=0.0, anomaly=0.0, country_shift=False, unsafe_country=False):
+    return {"trust": trust, "v60": v60, "v5m": v5m, "v1h": v1h,
+            "amount": amount, "device_risk": device_risk, "anomaly": anomaly,
+            "country_shift": country_shift, "unsafe_country": unsafe_country}
+
+
+VECTORS = [
+    # --- trust sweep, everything else flat. Isolates the dominant term.
+    ("trust-000", _v(trust=0.00)),
+    ("trust-025", _v(trust=0.25)),
+    ("trust-050", _v(trust=0.50)),
+    ("trust-075", _v(trust=0.75)),
+    ("trust-100", _v(trust=1.00)),
+
+    # --- velocity: either side of each window's saturation point.
+    ("v60-under",   _v(v60=10)),
+    ("v60-at",      _v(v60=20)),
+    ("v60-over",    _v(v60=40)),      # saturated: must equal v60-at
+    ("v5m-under",   _v(v5m=25)),
+    ("v5m-at",      _v(v5m=50)),
+    ("v5m-over",    _v(v5m=100)),     # saturated
+    ("v1h-under",   _v(v1h=100)),
+    ("v1h-at",      _v(v1h=200)),
+    ("v1h-over",    _v(v1h=400)),     # saturated
+
+    # --- burst vs grind: same total actions, different distribution.
+    ("burst",       _v(v60=20, v5m=20, v1h=20)),
+    ("grind",       _v(v60=1,  v5m=8,  v1h=200)),
+
+    # --- amount: walks the log curve. Small steps low, big steps high.
+    ("amt-10",      _v(amount=10.0)),
+    ("amt-100",     _v(amount=100.0)),
+    ("amt-1000",    _v(amount=1000.0)),
+    ("amt-10000",   _v(amount=10000.0)),
+    ("amt-50000",   _v(amount=50000.0)),   # saturated
+
+    # --- the boolean geography terms, isolated.
+    ("geo-shift",   _v(country_shift=True)),
+    ("geo-unsafe",  _v(unsafe_country=True)),
+    ("geo-both",    _v(country_shift=True, unsafe_country=True)),
+
+    # --- the other two continuous signals.
+    ("dev-risk",    _v(device_risk=1.0)),
+    ("anomaly",     _v(anomaly=1.0)),
+
+    # --- everything at once. Tests the clamp and the normalisation.
+    ("max-all",     _v(trust=0.0, v60=40, v5m=100, v1h=400, amount=50000.0,
+                       device_risk=1.0, anomaly=1.0,
+                       country_shift=True, unsafe_country=True)),
+    ("min-all",     _v(trust=1.0)),
+]
+
+# Default mapping from our internal signal names to a target's request body.
+DEFAULT_FIELDS = {
+    "trust": "trust", "v60": "v60", "v5m": "v5m", "v1h": "v1h",
+    "amount": "amount", "device_risk": "device_risk", "anomaly": "anomaly",
+    "country_shift": "country_shift", "unsafe_country": "unsafe_country",
+}
+SCORE_KEYS = ["score", "risk_score", "value", "result", "rating", "confidence"]
+
+
+def _setup(ctx):
+    global _ready
+    if _ready:
+        return
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "CREATE TABLE IF NOT EXISTS fingerprint_probe("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,target TEXT,"
+            "ran REAL,vectors INTEGER,answered INTEGER,exact INTEGER,"
+            "verdict TEXT,correlation REAL,detail TEXT,audit_hash TEXT,"
+            "block_index INTEGER)")
+        ctx["conn"].execute(
+            "CREATE INDEX IF NOT EXISTS idx_fp_target ON fingerprint_probe(target)")
+        ctx["conn"].commit()
+    _ready = True
+
+
+# ----------------------------------------------------------------------
+# our own engine
+# ----------------------------------------------------------------------
+
+def _find_scorer():
+    for modname in ("__main__", "server"):
+        mod = sys.modules.get(modname)
+        if not mod:
+            continue
+        for name in SCORER_NAMES:
+            fn = getattr(mod, name, None)
+            if callable(fn):
+                return fn, modname + "." + name
+    return None, None
+
+
+def _score_locally():
+    """Run the battery through the live engine. Returns (scores, source, error)."""
+    fn, where = _find_scorer()
+    if not fn:
+        return None, None, ("could not find the scoring function at runtime - "
+                            "add its name to SCORER_NAMES")
+    out = []
+    for label, signals in VECTORS:
+        try:
+            result = fn(dict(signals))
+            score = result[0] if isinstance(result, (tuple, list)) else result
+            out.append((label, round(float(score), 6)))
+        except Exception as exc:
+            return None, where, "scorer raised on %s: %s" % (label, exc)
+    return out, where, None
+
+
+# ----------------------------------------------------------------------
+# reaching a target - same guards as witness.py
+# ----------------------------------------------------------------------
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_opener = urllib.request.build_opener(_NoRedirect)
+
+
+def _url_allowed(url):
+    if not url or not isinstance(url, str) or len(url) > 500:
+        return False, "no usable url"
+    try:
+        parts = urlparse(url.strip())
+    except Exception:
+        return False, "unparseable url"
+    if parts.scheme not in ALLOWED_SCHEMES:
+        return False, "scheme not allowed"
+    host = parts.hostname
+    if not host:
+        return False, "no host in url"
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    if port not in ALLOWED_PORTS:
+        return False, "port not allowed"
+    try:
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+    except Exception as exc:
+        return False, "could not resolve host (%s)" % type(exc).__name__
+    for info in infos:
+        try:
+            addr = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return False, "unreadable address"
+        if (addr.is_private or addr.is_loopback or addr.is_link_local
+                or addr.is_reserved or addr.is_multicast or addr.is_unspecified):
+            return False, "address is not publicly routable"
+    return True, None
+
+
+def _post(url, body, headers=None):
+    data = json.dumps(body).encode("utf-8")
+    h = {"Content-Type": "application/json", "Accept": "application/json",
+         "User-Agent": "aileash-fingerprint/%s" % VERSION}
+    if headers:
+        h.update(headers)
+    request = urllib.request.Request(url, data=data, headers=h, method="POST")
+    try:
+        with _opener.open(request, timeout=FETCH_TIMEOUT) as response:
+            raw = response.read(MAX_BYTES)
+            status = response.getcode()
+    except urllib.error.HTTPError as exc:
+        try:
+            raw = exc.read(MAX_BYTES)
+        except Exception:
+            raw = b""
+        status = exc.code
+    except Exception as exc:
+        return 0, "unreachable (%s)" % type(exc).__name__
+    try:
+        return status, json.loads(raw.decode("utf-8", "replace"))
+    except Exception:
+        return status, raw.decode("utf-8", "replace")[:300]
+
+
+def _extract_score(payload, key_hint=None):
+    """Pull a 0..1 style number out of whatever came back."""
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    if not isinstance(payload, dict):
+        return None
+    keys = ([key_hint] if key_hint else []) + SCORE_KEYS
+    for k in keys:
+        if k and k in payload:
+            v = payload[k]
+            if isinstance(v, (int, float)):
+                return float(v)
+            try:
+                return float(str(v).strip())
+            except (TypeError, ValueError):
+                pass
+    # one level down
+    for v in payload.values():
+        if isinstance(v, dict):
+            found = _extract_score(v, key_hint)
+            if found is not None:
+                return found
+    return None
+
+
+# ----------------------------------------------------------------------
+# comparison
+# ----------------------------------------------------------------------
+
+def _pearson(a, b):
+    n = len(a)
+    if n < 3:
+        return None
+    ma = sum(a) / n
+    mb = sum(b) / n
+    va = sum((x - ma) ** 2 for x in a)
+    vb = sum((y - mb) ** 2 for y in b)
+    if va <= 0 or vb <= 0:
+        return None
+    cov = sum((a[i] - ma) * (b[i] - mb) for i in range(n))
+    return cov / math.sqrt(va * vb)
+
+
+def _rank(values):
+    order = sorted(range(len(values)), key=lambda i: values[i])
+    ranks = [0.0] * len(values)
+    for position, index in enumerate(order):
+        ranks[index] = float(position)
+    return ranks
+
+
+def _compare(ours, theirs):
+    """ours/theirs are lists of (label, score). theirs may contain None."""
+    paired = [(l, o, t) for (l, o), (_, t) in zip(ours, theirs) if t is not None]
+    answered = len(paired)
+    if answered < 3:
+        return {"verdict": "INCONCLUSIVE", "answered": answered,
+                "why": "too few vectors came back to compare anything"}
+
+    a = [p[1] for p in paired]
+    b = [p[2] for p in paired]
+    exact = sum(1 for i in range(answered) if abs(a[i] - b[i]) < 1e-6)
+    close = sum(1 for i in range(answered) if abs(a[i] - b[i]) < 0.01)
+    pearson = _pearson(a, b)
+    spearman = _pearson(_rank(a), _rank(b))
+
+    # a linear fit: are they our scores, scaled and shifted?
+    ma, mb = sum(a) / answered, sum(b) / answered
+    va = sum((x - ma) ** 2 for x in a)
+    slope = (sum((a[i] - ma) * (b[i] - mb) for i in range(answered)) / va) if va > 0 else None
+    intercept = (mb - slope * ma) if slope is not None else None
+    residual = None
+    if slope is not None:
+        residual = max(abs(b[i] - (slope * a[i] + intercept)) for i in range(answered))
+
+    if exact == answered:
+        verdict = "IDENTICAL"
+        why = ("Every vector matched to six decimal places. Two independently "
+               "written scoring functions do not do this.")
+    elif exact >= answered * 0.8:
+        verdict = "IDENTICAL"
+        why = ("%d of %d vectors matched exactly. The rest are consistent with "
+               "a small local change on top of the same function." % (exact, answered))
+    elif residual is not None and residual < 0.02 and pearson and pearson > 0.99:
+        verdict = "DERIVED"
+        why = ("Not identical, but every score fits ours scaled by %.3f and "
+               "shifted by %.3f, within %.4f. That is this function reweighted, "
+               "not a different one." % (slope, intercept, residual))
+    elif spearman is not None and spearman > 0.95:
+        verdict = "SAME SHAPE"
+        why = ("Different numbers, but the same ordering across the battery "
+               "(rank correlation %.3f). Consistent with the same design - the "
+               "same saturation points and the same curve - rather than the "
+               "same code." % spearman)
+    elif pearson is not None and pearson > 0.8:
+        verdict = "SIMILAR"
+        why = ("Correlated (%.3f) but not tightly. Risk scorers tend to agree "
+               "roughly on what looks risky, so this is weak on its own." % pearson)
+    else:
+        verdict = "UNRELATED"
+        why = "No meaningful relationship to our scoring."
+
+    return {
+        "verdict": verdict, "why": why,
+        "vectors": len(ours), "answered": answered,
+        "exact_matches": exact, "within_0.01": close,
+        "correlation": round(pearson, 4) if pearson is not None else None,
+        "rank_correlation": round(spearman, 4) if spearman is not None else None,
+        "best_fit": ({"scale": round(slope, 4), "shift": round(intercept, 4),
+                      "worst_residual": round(residual, 5)}
+                     if slope is not None else None),
+        "per_vector": [{"vector": p[0], "ours": p[1], "theirs": p[2],
+                        "delta": round(p[2] - p[1], 6)} for p in paired],
+    }
+
+
+# ----------------------------------------------------------------------
+# routes
+# ----------------------------------------------------------------------
+
+def _self(ctx, api_key):
+    scores, where, error = _score_locally()
+    if error:
+        return {"error": "scorer_unavailable", "message": error}, 503
+    return {"source": where, "vectors": len(scores),
+            "scores": [{"vector": l, "score": s} for l, s in scores],
+            "note": ("This is the baseline every probe is compared against. It "
+                     "reveals outputs, never weights.")}, 200
+
+
+def _probe(ctx, api_key, data):
+    url = str(data.get("url", "")).strip()
+    ok, why = _url_allowed(url)
+    if not ok:
+        return {"error": "bad_target", "message": why}, 400
+
+    fields = data.get("fields") if isinstance(data.get("fields"), dict) else {}
+    mapping = dict(DEFAULT_FIELDS)
+    mapping.update({k: str(v) for k, v in fields.items() if isinstance(v, str)})
+    score_key = data.get("score_key")
+    extra = data.get("body") if isinstance(data.get("body"), dict) else {}
+    headers = data.get("headers") if isinstance(data.get("headers"), dict) else {}
+    headers = {str(k)[:60]: str(v)[:300] for k, v in list(headers.items())[:8]}
+
+    ours, where, error = _score_locally()
+    if error:
+        return {"error": "scorer_unavailable", "message": error}, 503
+
+    theirs = []
+    failures = []
+    for label, signals in VECTORS:
+        body = dict(extra)
+        for internal, external in mapping.items():
+            body[external] = signals[internal]
+        status, payload = _post(url, body, headers)
+        if status < 200 or status >= 300:
+            theirs.append((label, None))
+            if len(failures) < 5:
+                failures.append({"vector": label, "http": status,
+                                 "response": payload if isinstance(payload, (dict, list))
+                                 else str(payload)[:200]})
+        else:
+            theirs.append((label, _extract_score(payload, score_key)))
+        time.sleep(POLITE_DELAY)
+
+    result = _compare(ours, theirs)
+    ts = time.time()
+
+    detail = ("target=" + url + ";verdict=" + result["verdict"] +
+              ";exact=" + str(result.get("exact_matches", 0)) +
+              "/" + str(result.get("answered", 0)))
+    ev = {"user_id": "fp:" + urlparse(url).hostname, "action": "fingerprint_probe",
+          "amount": 0, "country": "UK", "device_id": "fingerprint",
+          "anomaly": 0, "device_risk": 0}
+    res = {"decision": "FINGERPRINT_" + result["verdict"].replace(" ", "_"),
+           "score": 0, "fingerprint_version": VERSION, "target": url,
+           "timestamp": ts, "detail": detail}
+    h, idx, seq = ctx["seal"](ev, res, ts, api_key)
+
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "INSERT INTO fingerprint_probe(api_key,target,ran,vectors,answered,"
+            "exact,verdict,correlation,detail,audit_hash,block_index)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (api_key, url, ts, result.get("vectors"), result.get("answered"),
+             result.get("exact_matches"), result["verdict"],
+             result.get("correlation"), detail, h, idx))
+        ctx["conn"].commit()
+
+    out = dict(result)
+    out.update({
+        "target": url,
+        "ran_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts)),
+        "sealed": {"receipt": h, "block_index": idx, "receipt_seq": seq},
+        "what_this_is": ("A dated, sealed measurement of similarity. It is "
+                         "evidence, not an accusation, and it does not "
+                         "establish that anything was copied."),
+    })
+    if failures:
+        out["failures"] = failures
+        out["failure_note"] = ("Some vectors were rejected. If the target wants "
+                               "different field names, pass a \"fields\" map and "
+                               "run it again.")
+    return out, 200
+
+
+def _history(ctx, api_key):
+    with ctx["lock"]:
+        rows = ctx["conn"].execute(
+            "SELECT target,ran,verdict,exact,answered,correlation,audit_hash,block_index"
+            " FROM fingerprint_probe WHERE api_key=? ORDER BY id DESC LIMIT 100",
+            (api_key,)).fetchall()
+    return {"probes": [{
+        "target": r[0],
+        "ran_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(r[1])),
+        "verdict": r[2], "exact_matches": r[3], "answered": r[4],
+        "correlation": r[5], "receipt": r[6], "block_index": r[7],
+    } for r in rows], "count": len(rows)}, 200
+
+
+def _vectors():
+    return {"count": len(VECTORS),
+            "vectors": [{"label": l, "signals": s} for l, s in VECTORS],
+            "why_these": ("Chosen to sit either side of each saturation point, "
+                          "to walk the amount curve, and to isolate each term. "
+                          "Random inputs would only catch a straight copy.")}, 200
+
+
+def _spec():
+    return {
+        "module": "fingerprint", "version": VERSION,
+        "question_it_answers": "Is this endpoint running my scoring function?",
+        "verdicts": {
+            "IDENTICAL": "Every vector matches. Independently written functions do not do this.",
+            "DERIVED": "Not identical, but every score is ours scaled and shifted. Reweighted, not rewritten.",
+            "SAME SHAPE": "Different numbers, same ordering. Same design decisions, probably not the same code.",
+            "SIMILAR": "Loosely correlated. Weak - risk scorers broadly agree on what looks risky.",
+            "UNRELATED": "No meaningful relationship.",
+            "INCONCLUSIVE": "Too few vectors came back.",
+        },
+        "limits": [
+            "Only reaches endpoints it can reach. A private product with no free tier is invisible to this.",
+            "Proves similarity, never theft. Two people can converge honestly.",
+            "A target that rate limits, randomises or rounds heavily will read as INCONCLUSIVE rather than clean.",
+        ],
+        "every_run_is_sealed": ("The probe, the target and the result go into the "
+                                "chain, so a comparison run today is provable as "
+                                "having been run today."),
+        "manners": "One request per vector with a %.1fs gap. It is a measurement, not a load test." % POLITE_DELAY,
+    }, 200
+
+
+def handle(method, action, data, api_key, ctx):
+    # key first, before anything touches the database
+    if not api_key:
+        return {"error": "invalid_api_key"}, 401
+    _setup(ctx)
+    action = (action or "").strip("/").lower()
+
+    if method == "POST":
+        if action == "self":
+            return _self(ctx, api_key)
+        if action == "probe":
+            return _probe(ctx, api_key, data)
+        return {"error": "unknown_action", "action": action,
+                "POST": ["self", "probe"]}, 404
+
+    if action in ("", "spec"):
+        return _spec()
+    if action == "history":
+        return _history(ctx, api_key)
+    if action == "vectors":
+        return _vectors()
+    return {"error": "unknown_action", "action": action,
+            "GET": ["spec", "history", "vectors"]}, 404
 
 ```
