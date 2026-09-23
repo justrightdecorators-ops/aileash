@@ -5,8 +5,7 @@ Contains:
 - `modules/binddesk.py`
 - `modules/blocks.py`
 - `modules/capture.py`
-- `modules/cinemafeed.py`
-- `modules/codebase.py`
+- `modules/cinema.py`
 
 
 ## `modules/bind.py`
@@ -1868,586 +1867,310 @@ def handle(method, action, data, api_key, ctx):
 ```
 
 
-## `modules/cinemafeed.py`
+## `modules/cinema.py`
 
-80 lines, 4430 bytes
-
-```python
-"""
-modules/cinemafeed.py  v1.0.0
-The video feed for the sebbi.pro Cinema (/cinema).
-
-    GET /x/cinemafeed/list     every video, grouped by channel   (public)
-    GET /x/cinemafeed/status   count and channels                (public)
-
-To add or remove a video, edit the VIDEOS list below: one line per video,
-(YouTube id, title, channel). The id is the 11 characters after "v=" in a
-YouTube link. Nothing else needs changing; the cinema page reads this feed.
-"""
-
-VERSION = "1.0.0"
-PUBLIC = {("GET", "list"), ("GET", "status"), ("GET", "spec")}
-
-VIDEOS = [
-    # NVIDIA and IBM
-    ("gM1dLdpDR50", "What Is Trustworthy AI?", "NVIDIA"),
-    ("f6dx3Yh-Tww", "What is AI governance?", "IBM Research"),
-    ("Q020C-Jw0o8", "The Importance of AI Governance", "IBM Technology"),
-    ("0oeD2Wf25wY", "Mastering AI Risk: NIST's Framework Explained", "IBM Technology"),
-    # EU AI Act
-    ("ya5uBFs41Ug", "EU's AI Act explained for everyone", "EU AI Act"),
-    ("oWHCyLfUgUw", "EU AI Act Explained: Everything You Must Know", "EU AI Act"),
-    ("s_rxOnCt3HQ", "The EU's AI Act Explained", "EU AI Act"),
-    ("xUHuR5qXbMY", "EU AI Act explained for your business", "EU AI Act"),
-    ("1Z6NA7Chkn4", "The EU AI Act explained in the time of a coffee", "EU AI Act"),
-    ("GELAXU9XReI", "Understanding the EU AI Act: key facts", "EU AI Act"),
-    ("lwJXCPsBJfc", "The EU AI Act: what it means for AI and DevOps", "EU AI Act"),
-    ("4A33y0B9V0k", "The EU AI Act: what you need to know", "EU AI Act"),
-    # AI safety
-    ("qe9QSCF-d88", "The Catastrophic Risks of AI and a Safer Path", "Yoshua Bengio · TED"),
-    ("dc3R_G5DJ50", "Yoshua Bengio's warning on AI safety", "Yoshua Bengio"),
-    ("95xpd9FadVk", "We need AI systems to be 10 million times safer", "Stuart Russell"),
-    ("qrvK_KuIeJk", "Godfather of AI: the 60 Minutes interview", "Geoffrey Hinton"),
-    ("AUGHMx7iAxk", "AI safety risks and the future of AI", "Geoffrey Hinton"),
-    ("eHSn50wnBRQ", "Hinton warns about the future of AI", "Geoffrey Hinton"),
-    ("5qBDQgfeB6s", "AI has progressed even faster than I thought", "Geoffrey Hinton"),
-    ("giT0ytynSqg", "Godfather of AI: trying to warn them", "Geoffrey Hinton"),
-    ("hrnQ7chut7A", "Mapping the catastrophic risks of AI", "AI Safety"),
-    # Microsoft responsible AI
-    ("poMZXS6iQeU", "Responsible AI: Microsoft's AI principles", "Microsoft"),
-    ("8Ra5L1aQ5YM", "Responsible AI Principles, episode 3", "Microsoft"),
-    ("dnC8-uUZXSc", "Our approach to responsible AI", "Microsoft"),
-    ("lkIlsgrIMtU", "Developing Microsoft's Responsible AI Standard", "Microsoft"),
-    ("7Mv9VZEDBC4", "How Microsoft drives responsible AI", "Microsoft"),
-    ("XWpXxUc-GJY", "Responsible AI in action: principles to engineering", "Microsoft"),
-    # NIST AI RMF
-    ("CkplyRCYuco", "NIST AI Risk Management Framework explained simply", "NIST AI RMF"),
-    ("y3foG0ALLVc", "NIST AI Risk Management Framework explained", "NIST AI RMF"),
-    ("3B0ELJTViMs", "NIST AI RMF: a practical guide", "NIST AI RMF"),
-    ("7xcM_edGNyE", "NIST AI RMF: the full guide", "NIST AI RMF"),
-    ("rbFt34UmngY", "The NIST AI Risk Management Framework", "NIST AI RMF"),
-    ("Ufr3aklALVo", "AI risk management explained", "NIST AI RMF"),
-    # Agentic AI
-    ("mJjTLRQtJdo", "Agent risk, security and AI sprawl in 2026", "Agentic AI"),
-    ("YtgQ0q53GV4", "Agentic AI will redefine risk", "Agentic AI"),
-    # ISO 42001
-    ("YdPyeVvYtzs", "ISO/IEC 42001:2023 explained", "ISO 42001"),
-    ("0BXySa973Q4", "ISO 42001 explained in 5 minutes", "ISO 42001"),
-    ("FAQhV3iG6Fg", "Navigating the ISO 42001 standard", "ISO 42001"),
-    ("O4iKEr5AIi4", "What is ISO/IEC 42001?", "ISO 42001"),
-    ("hSz71vISZMA", "What is the AI management system standard?", "ISO 42001"),
-    ("yxE3bCP3aTg", "ISO 42001: simple explanation with examples", "ISO 42001"),
-    ("jhQRtCO_5n0", "ISO/IEC 42001 AI governance bootcamp", "ISO 42001"),
-]
-
-
-def handle(method, action, data, api_key, ctx):
-    action = (action or "").strip("/").lower()
-    vids = [{"id": i, "title": t, "channel": c} for i, t, c in VIDEOS]
-    if action == "list":
-        return {"count": len(vids), "videos": vids}, 200
-    chans = []
-    for v in vids:
-        if v["channel"] not in chans:
-            chans.append(v["channel"])
-    return {"module": "cinemafeed", "version": VERSION, "count": len(vids),
-            "channels": chans, "list": "https://sebbi.pro/x/cinemafeed/list"}, 200
-
-```
-
-
-## `modules/codebase.py`
-
-489 lines, 21403 bytes
+301 lines, 24979 bytes
 
 ```python
-#!/usr/bin/env python3
 """
-modules/codebase.py  -  dated evidence of what you held, and when
-=================================================================
+modules/cinema.py  v2.0.0
+The sebbi.pro Cinema at /cinema, in two wings. GOVERNANCE spins the videos in
+modules/cinemafeed.py; THE 10p WING spins creators' locked videos approved in
+modules/marquee.py. Both share the screening room with its spinning TV.
 
-WHAT THIS IS, STATED HONESTLY FIRST
------------------------------------
-This does not prove ownership. Nothing cryptographic can. Ownership of
-software is a legal fact established by authorship, company records and
-signed assignment - not by a hash.
-
-What it does produce is the evidence that decides most disputes about
-software in practice: a dated, tamper-evident, externally anchored record
-that a specific person held a specific body of code, in a specific form, at
-a specific moment. When two parties later disagree about who had what
-first, that is the question a court, a mediator or an investor actually
-asks - and it is normally answered with commit dates, which are settable
-fields that prove nothing.
-
-This answers it with arithmetic instead.
-
-WHAT IT DOES
-------------
-    POST /x/codebase/seal
-
-Walks the deployed source tree, hashes every file, builds one manifest root
-over all of them, and seals that root - together with a declaration of
-authorship you supply - into the chain. From there it is anchored
-externally and handed to peer chains like every other block.
-
-Run it again next week and you get a second dated point. Run it on every
-deploy and you accumulate a continuous, uneditable record of the codebase
-evolving under your hand, which is a far stronger thing than a single
-snapshot: a body of work with a history is much harder to dispute than a
-file that appeared once.
-
-WHAT THE MANIFEST CONTAINS - AND WHAT IT DOES NOT
--------------------------------------------------
-For each file: its path and the SHA-256 of its exact bytes. Nothing else.
-No contents leave the server, ever, by any route here. The hashes are
-one-way, so the manifest reveals nothing about what the code does; it only
-lets you demonstrate later that a file you hold now is byte-identical to
-the file you held then.
-
-The manifest route is deliberately KEYED rather than public. Only the root,
-the file count and the total byte size are public. A public file listing
-would hand an attacker a map of the deployment for no gain - the root is
-all a third party needs in order to check a manifest you show them.
-
-Excluded by default and never hashed: version control internals, caches,
-databases, and anything that looks like a secret. Sealing a hash of your
-own credentials file would be a poor way to protect them.
-
-HOW YOU USE IT IN A DISPUTE
----------------------------
-  1. You produce the sealed root, its block index, and the chain's
-     external anchor.
-  2. You produce your copy of the code.
-  3. Anyone recomputes the manifest from your copy - the rules are
-     published at /x/codebase/spec - and compares.
-
-If it matches, you demonstrably held exactly that code no later than the
-sealing time, and the record of it has not been altered since, because it
-is a block in an anchored chain that peers also hold.
-
-WHAT STILL HAS TO HAPPEN OUTSIDE THIS FILE
-------------------------------------------
-Stated plainly, because a module that let you believe it had settled your
-legal position would be doing you harm:
-
-  - Copyright arises on authorship. Sealing evidences it; it does not
-    create or register it.
-  - If a company operates the platform, the IP needs to sit with the right
-    entity in writing, or the position is muddier than it looks.
-  - Where two parties have collaborated, the only reliable answer is an
-    agreement saying who owns what, signed before it matters rather than
-    after.
-
-This module makes the factual record unarguable. The legal position is a
-separate job and needs a solicitor, not a hash.
-
-    POST /x/codebase/seal      hash the tree, seal the root      (keyed)
-    GET  /x/codebase/manifest  the full file list for a seal     (keyed)
-    GET  /x/codebase/history   every seal, with root changes     (public)
-    GET  /x/codebase/root      the latest sealed root            (public)
-    GET  /x/codebase/spec      how to recompute it yourself      (public)
+Page module, same family as map.py and passportpage.py: a runtime do_GET
+patch. Armed by /x/cinema/status after each deploy.
+Everything is base64-embedded so no character can break the Python string.
 """
 
-import hashlib
-import json
-import os
-import re
-import time
-from datetime import datetime, timezone
+import base64
+import sys
 
-VERSION = "1.0"
-HEX64 = re.compile(r"^[0-9a-f]{64}$")
+VERSION = "2.0.0"
 
-# Roots and history are public - a dated claim nobody can check is not
-# evidence. The file listing is keyed, because it is a map of the
-# deployment and a third party never needs it to verify a manifest.
-PUBLIC = {("GET", "history"), ("GET", "root"), ("GET", "spec")}
+_HTML_B64 = (
+    "PCFET0NUWVBFIGh0bWw+PGh0bWwgbGFuZz0iZW4iPjxoZWFkPjxtZXRhIGNoYXJzZXQ9IlVURi04Ij4KPG1ldGEgbmFtZT0idmll"
+    "d3BvcnQiIGNvbnRlbnQ9IndpZHRoPWRldmljZS13aWR0aCxpbml0aWFsLXNjYWxlPTEsdmlld3BvcnQtZml0PWNvdmVyIj4KPHRp"
+    "dGxlPnNlYmJpLnBybyBDaW5lbWEg4oCUIHR3byB3aW5ncywgb25lIGF4bGU8L3RpdGxlPgo8bWV0YSBuYW1lPSJkZXNjcmlwdGlv"
+    "biIgY29udGVudD0iVGhlIGdvdmVybmFuY2Ugd2luZzogNDIgdmlkZW9zIG9uIEFJIGdvdmVybmFuY2UuIFRoZSAxMHAgV2luZzog"
+    "Y3JlYXRvcnMnIGxvY2tlZCB2aWRlb3MuIFNwaW4gdGhlIHNjcmVlbnMgYW5kIHN0ZXAgaW50byB0aGUgc2NyZWVuaW5nIHJvb20u"
+    "Ij4KPGxpbmsgaHJlZj0iaHR0cHM6Ly9mb250cy5nb29nbGVhcGlzLmNvbS9jc3MyP2ZhbWlseT1JQk0rUGxleCtNb25vOndnaHRA"
+    "NDAwOzUwMDs2MDAmZmFtaWx5PU5ld3NyZWFkZXI6b3Bzeix3Z2h0QDYuLjcyLDUwMCZkaXNwbGF5PXN3YXAiIHJlbD0ic3R5bGVz"
+    "aGVldCI+CjxzdHlsZT4KOnJvb3R7LS1pbms6IzA1MDcwZjstLWluazI6IzBkMTQyNDstLWdvbGQ6I2M5YTg0YzstLW9rOiM3ZmUz"
+    "YjA7LS1ibHVlOiM4ZmQwZmY7LS1waW5rOiNkNTliZmY7LS1tdXRlOiM4YTkzYWR9Cip7Ym94LXNpemluZzpib3JkZXItYm94O21h"
+    "cmdpbjowO3BhZGRpbmc6MDstd2Via2l0LXRhcC1oaWdobGlnaHQtY29sb3I6dHJhbnNwYXJlbnR9Cmh0bWwsYm9keXtoZWlnaHQ6"
+    "MTAwJTtiYWNrZ3JvdW5kOnJhZGlhbC1ncmFkaWVudChlbGxpcHNlIGF0IDUwJSAyNiUsIzE0MWQ0MiAwJSwjMDUwNzBmIDcyJSk7"
+    "Y29sb3I6I2U4ZWRmNztmb250LWZhbWlseTonSUJNIFBsZXggTW9ubycsdWktbW9ub3NwYWNlLG1vbm9zcGFjZTtvdmVyZmxvdzpo"
+    "aWRkZW59Ci52aWV3e3Bvc2l0aW9uOmZpeGVkO2luc2V0OjA7ZGlzcGxheTpmbGV4O2ZsZXgtZGlyZWN0aW9uOmNvbHVtbjthbGln"
+    "bi1pdGVtczpjZW50ZXI7dHJhbnNpdGlvbjpvcGFjaXR5IC41c30KLmhpZGRlbntvcGFjaXR5OjA7cG9pbnRlci1ldmVudHM6bm9u"
+    "ZX0KaGVhZGVye3dpZHRoOjEwMCU7cGFkZGluZzpjYWxjKDEycHggKyBlbnYoc2FmZS1hcmVhLWluc2V0LXRvcCkpIDE2cHggMDt0"
+    "ZXh0LWFsaWduOmNlbnRlcn0KLmJyYW5ke2ZvbnQtc2l6ZToxMnB4O2NvbG9yOnZhcigtLW11dGUpfS5icmFuZCBie2NvbG9yOnZh"
+    "cigtLWdvbGQpO2ZvbnQtd2VpZ2h0OjUwMH0KaDF7Zm9udC1mYW1pbHk6J05ld3NyZWFkZXInLEdlb3JnaWEsc2VyaWY7Zm9udC13"
+    "ZWlnaHQ6NTAwO2ZvbnQtc2l6ZTpjbGFtcCgyNXB4LDUuNnZ3LDQycHgpO21hcmdpbjo0cHggMCAycHg7YmFja2dyb3VuZDpsaW5l"
+    "YXItZ3JhZGllbnQoOTBkZWcsI2M5YTg0YywjN2ZlM2IwLCM4ZmQwZmYpOy13ZWJraXQtYmFja2dyb3VuZC1jbGlwOnRleHQ7YmFj"
+    "a2dyb3VuZC1jbGlwOnRleHQ7Y29sb3I6dHJhbnNwYXJlbnR9Ci5zdWJ7Zm9udC1zaXplOjExcHg7Y29sb3I6dmFyKC0tbXV0ZSk7"
+    "bGV0dGVyLXNwYWNpbmc6LjA2ZW19Ci53aW5nc3tkaXNwbGF5OmZsZXg7Z2FwOjhweDtqdXN0aWZ5LWNvbnRlbnQ6Y2VudGVyO21h"
+    "cmdpbi10b3A6MTBweH0KLndpbmdzIGJ1dHRvbntiYWNrZ3JvdW5kOnJnYmEoMTMsMjAsMzYsLjg1KTtib3JkZXI6MS41cHggc29s"
+    "aWQgcmdiYSgyNTUsMjU1LDI1NSwuMTYpO2NvbG9yOiNjZmQ2ZTY7Ym9yZGVyLXJhZGl1czo5OTlweDtwYWRkaW5nOjlweCAxNXB4"
+    "O2ZvbnQ6NjAwIDEycHggJ0lCTSBQbGV4IE1vbm8nLG1vbm9zcGFjZTtjdXJzb3I6cG9pbnRlcn0KLndpbmdzIGJ1dHRvbi5vbnti"
+    "b3JkZXItY29sb3I6dmFyKC0tZ29sZCk7Y29sb3I6dmFyKC0tZ29sZCk7Ym94LXNoYWRvdzowIDAgMThweCByZ2JhKDIwMSwxNjgs"
+    "NzYsLjM1KX0KLndpbmdzIGJ1dHRvbi50ZW5wLm9ue2JvcmRlci1jb2xvcjp2YXIoLS1waW5rKTtjb2xvcjp2YXIoLS1waW5rKTti"
+    "b3gtc2hhZG93OjAgMCAxOHB4IHJnYmEoMjEzLDE1NSwyNTUsLjQpfQouc3RhZ2V7ZmxleDoxO3dpZHRoOjEwMCU7cGVyc3BlY3Rp"
+    "dmU6MTE1MHB4O2Rpc3BsYXk6ZmxleDthbGlnbi1pdGVtczpjZW50ZXI7anVzdGlmeS1jb250ZW50OmNlbnRlcjt0b3VjaC1hY3Rp"
+    "b246cGFuLXl9Ci5yaW5ne3Bvc2l0aW9uOnJlbGF0aXZlO3dpZHRoOjI1MHB4O2hlaWdodDoxNTZweDt0cmFuc2Zvcm0tc3R5bGU6"
+    "cHJlc2VydmUtM2R9Ci5heGxle3Bvc2l0aW9uOmFic29sdXRlO2xlZnQ6NTAlO3RvcDo1MCU7d2lkdGg6NnB4O2hlaWdodDoyNTBw"
+    "eDttYXJnaW46LTEyNXB4IDAgMCAtM3B4O2JhY2tncm91bmQ6bGluZWFyLWdyYWRpZW50KHZhcigtLWdvbGQpLCM1YTRhMWMpO2Jv"
+    "cmRlci1yYWRpdXM6M3B4O2JveC1zaGFkb3c6MCAwIDE4cHggcmdiYSgyMDEsMTY4LDc2LC41NSl9Ci5zY3JlZW57cG9zaXRpb246"
+    "YWJzb2x1dGU7aW5zZXQ6MDtib3JkZXItcmFkaXVzOjExcHg7b3ZlcmZsb3c6aGlkZGVuO2JhY2tncm91bmQ6IzBiMTIyNDtib3Jk"
+    "ZXI6MS41cHggc29saWQgcmdiYSgyMDEsMTY4LDc2LC40NSk7Ym94LXNoYWRvdzowIDAgMzJweCByZ2JhKDE0MywyMDgsMjU1LC4x"
+    "OCk7Y3Vyc29yOnBvaW50ZXI7YmFja2ZhY2UtdmlzaWJpbGl0eTpoaWRkZW47dHJhbnNpdGlvbjpib3JkZXItY29sb3IgLjNzLGJv"
+    "eC1zaGFkb3cgLjNzfQouc2NyZWVuLnRlbnB7Ym9yZGVyLWNvbG9yOnJnYmEoMjEzLDE1NSwyNTUsLjU1KTtib3gtc2hhZG93OjAg"
+    "MCAzMnB4IHJnYmEoMjEzLDE1NSwyNTUsLjI1KX0KLnNjcmVlbiBpbWd7d2lkdGg6MTAwJTtoZWlnaHQ6MTAwJTtvYmplY3QtZml0"
+    "OmNvdmVyO29wYWNpdHk6Ljg1fQouc2NyZWVuIC5mYWxsYmFja3tkaXNwbGF5OmZsZXg7YWxpZ24taXRlbXM6Y2VudGVyO2p1c3Rp"
+    "ZnktY29udGVudDpjZW50ZXI7aGVpZ2h0OjEwMCU7Zm9udC1zaXplOjM0cHg7Y29sb3I6dmFyKC0tcGluayk7YmFja2dyb3VuZDps"
+    "aW5lYXItZ3JhZGllbnQoMTYwZGVnLCMxYTEwMzgsIzBiMTIyNCl9Ci5zY3JlZW4gLmxhYntwb3NpdGlvbjphYnNvbHV0ZTtsZWZ0"
+    "OjA7cmlnaHQ6MDtib3R0b206MDtwYWRkaW5nOjE4cHggOXB4IDdweDtmb250LXNpemU6MTAuNXB4O2JhY2tncm91bmQ6bGluZWFy"
+    "LWdyYWRpZW50KHRyYW5zcGFyZW50LHJnYmEoNSw3LDE1LC45MikpfQouc2NyZWVuIC5jaHtwb3NpdGlvbjphYnNvbHV0ZTt0b3A6"
+    "N3B4O2xlZnQ6OHB4O2ZvbnQtc2l6ZTo5LjVweDtsZXR0ZXItc3BhY2luZzouMDllbTtjb2xvcjp2YXIoLS1nb2xkKTtiYWNrZ3Jv"
+    "dW5kOnJnYmEoNSw3LDE1LC43NSk7cGFkZGluZzoycHggNnB4O2JvcmRlci1yYWRpdXM6M3B4fQouc2NyZWVuIC5wcmljZXtwb3Np"
+    "dGlvbjphYnNvbHV0ZTt0b3A6N3B4O3JpZ2h0OjhweDtmb250LXNpemU6OS41cHg7Y29sb3I6IzA1MDcwZjtiYWNrZ3JvdW5kOnZh"
+    "cigtLXBpbmspO3BhZGRpbmc6MnB4IDdweDtib3JkZXItcmFkaXVzOjk5OXB4O2ZvbnQtd2VpZ2h0OjYwMH0KLnNjcmVlbi5vbnti"
+    "b3JkZXItY29sb3I6dmFyKC0tb2spO2JveC1zaGFkb3c6MCAwIDQycHggcmdiYSgxMjcsMjI3LDE3NiwuNDUpfQouY3Jvd2R7ZGlz"
+    "cGxheTpmbGV4O2dhcDo2cHg7anVzdGlmeS1jb250ZW50OmNlbnRlcjtoZWlnaHQ6NzBweDthbGlnbi1pdGVtczpmbGV4LWVuZDtt"
+    "YXJnaW4tYm90dG9tOjZweH0KLmJvdHt3aWR0aDozOHB4O2hlaWdodDo2MnB4O3Bvc2l0aW9uOnJlbGF0aXZlO2FuaW1hdGlvbjpi"
+    "b2IgM3MgZWFzZS1pbi1vdXQgaW5maW5pdGV9Ci5ib3Q6bnRoLWNoaWxkKDJuKXthbmltYXRpb24tZGVsYXk6LjZzfS5ib3Q6bnRo"
+    "LWNoaWxkKDNuKXthbmltYXRpb24tZGVsYXk6MS4yc30KQGtleWZyYW1lcyBib2J7NTAle3RyYW5zZm9ybTp0cmFuc2xhdGVZKC0y"
+    "cHgpfX0KLmJvdCAuaGVhZHtwb3NpdGlvbjphYnNvbHV0ZTt0b3A6MDtsZWZ0OjlweDt3aWR0aDoyMXB4O2hlaWdodDoxN3B4O2Jv"
+    "cmRlci1yYWRpdXM6NXB4O2JhY2tncm91bmQ6I2Q4ZGRlNn0KLmJvdCAudmlzb3J7cG9zaXRpb246YWJzb2x1dGU7dG9wOjZweDts"
+    "ZWZ0OjNweDt3aWR0aDoxNXB4O2hlaWdodDo1cHg7Ym9yZGVyLXJhZGl1czoycHg7YmFja2dyb3VuZDp2YXIoLS1nb2xkKTtib3gt"
+    "c2hhZG93OjAgMCA4cHggdmFyKC0tZ29sZCk7dHJhbnNpdGlvbjpiYWNrZ3JvdW5kIC40cyxib3gtc2hhZG93IC40c30KLmJvdCAu"
+    "Ym9keXtwb3NpdGlvbjphYnNvbHV0ZTt0b3A6MTlweDtsZWZ0OjZweDt3aWR0aDoyNnB4O2hlaWdodDoyM3B4O2JvcmRlci1yYWRp"
+    "dXM6NXB4O2JhY2tncm91bmQ6I2MzYzlkNH0KLmJvdCAuc2VhdHtwb3NpdGlvbjphYnNvbHV0ZTtib3R0b206MDtsZWZ0OjA7d2lk"
+    "dGg6MzhweDtoZWlnaHQ6MjJweDtib3JkZXItcmFkaXVzOjZweCA2cHggM3B4IDNweDtiYWNrZ3JvdW5kOiMxYjIzMzY7Ym9yZGVy"
+    "LXRvcDoycHggc29saWQgIzJhMzU1Mn0KLm5vd3tmb250LXNpemU6MTJweDt0ZXh0LWFsaWduOmNlbnRlcjttaW4taGVpZ2h0OjE3"
+    "cHg7bWFyZ2luLWJvdHRvbTo2cHg7Y29sb3I6dmFyKC0tb2spO3BhZGRpbmc6MCAxMnB4fQouYmFye2Rpc3BsYXk6ZmxleDtnYXA6"
+    "OHB4O2ZsZXgtd3JhcDp3cmFwO2p1c3RpZnktY29udGVudDpjZW50ZXI7cGFkZGluZzowIDEycHggY2FsYygxNHB4ICsgZW52KHNh"
+    "ZmUtYXJlYS1pbnNldC1ib3R0b20pKX0KLmJ0bntib3JkZXI6MDtib3JkZXItcmFkaXVzOjlweDtwYWRkaW5nOjExcHggMTVweDtm"
+    "b250OjYwMCAxMi41cHggJ0lCTSBQbGV4IE1vbm8nLG1vbm9zcGFjZTtiYWNrZ3JvdW5kOnZhcigtLWdvbGQpO2NvbG9yOiMwNTA3"
+    "MGY7Y3Vyc29yOnBvaW50ZXI7dGV4dC1kZWNvcmF0aW9uOm5vbmU7ZGlzcGxheTppbmxpbmUtYmxvY2t9Ci5idG4uZ2hvc3R7YmFj"
+    "a2dyb3VuZDp0cmFuc3BhcmVudDtjb2xvcjojZThlZGY3O2JvcmRlcjoxcHggc29saWQgcmdiYSgyNTUsMjU1LDI1NSwuMjQpfQou"
+    "YnRuLnBpbmt7YmFja2dyb3VuZDp2YXIoLS1waW5rKX0KLmZsb29ye3Bvc2l0aW9uOmFic29sdXRlO2xlZnQ6LTUwJTtyaWdodDot"
+    "NTAlO2JvdHRvbTotOCU7aGVpZ2h0OjU2JTtiYWNrZ3JvdW5kOnJlcGVhdGluZy1saW5lYXItZ3JhZGllbnQoOTBkZWcscmdiYSgy"
+    "MDEsMTY4LDc2LC4xNikgMCAxcHgsdHJhbnNwYXJlbnQgMXB4IDYwcHgpLHJlcGVhdGluZy1saW5lYXItZ3JhZGllbnQoMGRlZyxy"
+    "Z2JhKDIwMSwxNjgsNzYsLjE2KSAwIDFweCx0cmFuc3BhcmVudCAxcHggNjBweCk7dHJhbnNmb3JtOnJvdGF0ZVgoNzJkZWcpO3Ry"
+    "YW5zZm9ybS1vcmlnaW46Ym90dG9tO3BvaW50ZXItZXZlbnRzOm5vbmV9Ci50dndyYXB7ZmxleDoxO2Rpc3BsYXk6ZmxleDtmbGV4"
+    "LWRpcmVjdGlvbjpjb2x1bW47YWxpZ24taXRlbXM6Y2VudGVyO2p1c3RpZnktY29udGVudDpjZW50ZXI7d2lkdGg6MTAwJTtwZXJz"
+    "cGVjdGl2ZToxMDAwcHh9Ci50dnt3aWR0aDptaW4oOTR2dyw3NjBweCk7YXNwZWN0LXJhdGlvOjE2Lzk7Ym9yZGVyLXJhZGl1czox"
+    "NHB4O2JhY2tncm91bmQ6IzAwMDtib3JkZXI6MTBweCBzb2xpZCAjMWIyMzM2O291dGxpbmU6MnB4IHNvbGlkIHJnYmEoMjAxLDE2"
+    "OCw3NiwuNSk7Ym94LXNoYWRvdzowIDAgNjBweCByZ2JhKDE0MywyMDgsMjU1LC4yMiksMCAzMHB4IDYwcHggcmdiYSgwLDAsMCwu"
+    "Nik7dHJhbnNpdGlvbjp0cmFuc2Zvcm0gLjhzfQoudHYuaWRsZXthbmltYXRpb246c3dheSA5cyBlYXNlLWluLW91dCBpbmZpbml0"
+    "ZX0udHYuc3BpbnthbmltYXRpb246ZnVsbHNwaW4gMTRzIGxpbmVhciBpbmZpbml0ZX0KQGtleWZyYW1lcyBzd2F5ezAlLDEwMCV7"
+    "dHJhbnNmb3JtOnJvdGF0ZVkoLTlkZWcpIHJvdGF0ZVgoM2RlZyl9NTAle3RyYW5zZm9ybTpyb3RhdGVZKDlkZWcpIHJvdGF0ZVgo"
+    "LTJkZWcpfX0KQGtleWZyYW1lcyBmdWxsc3Bpbnt0b3t0cmFuc2Zvcm06cm90YXRlWSgzNjBkZWcpfX0KLnR2IGlmcmFtZXt3aWR0"
+    "aDoxMDAlO2hlaWdodDoxMDAlO2JvcmRlcjowO2JvcmRlci1yYWRpdXM6NHB4O2Rpc3BsYXk6YmxvY2t9Ci50dmxpbmt7Zm9udC1z"
+    "aXplOjExcHg7Y29sb3I6dmFyKC0tYmx1ZSk7bWFyZ2luLXRvcDo4cHg7dGV4dC1kZWNvcmF0aW9uOm5vbmU7dGV4dC1hbGlnbjpj"
+    "ZW50ZXJ9Ci5jaGFuc3tkaXNwbGF5OmZsZXg7Z2FwOjZweDtvdmVyZmxvdy14OmF1dG87bWF4LXdpZHRoOjEwMCU7cGFkZGluZzo4"
+    "cHggMTJweDtzY3JvbGxiYXItd2lkdGg6bm9uZX0KLmNoYW5zIGJ1dHRvbntmbGV4Om5vbmU7Ym9yZGVyOjFweCBzb2xpZCByZ2Jh"
+    "KDIwMSwxNjgsNzYsLjM1KTtiYWNrZ3JvdW5kOnJnYmEoMTMsMjAsMzYsLjgpO2NvbG9yOiNlOGVkZjc7Ym9yZGVyLXJhZGl1czo3"
+    "cHg7cGFkZGluZzo4cHggMTFweDtmb250OjUwMCAxMS41cHggJ0lCTSBQbGV4IE1vbm8nLG1vbm9zcGFjZTtjdXJzb3I6cG9pbnRl"
+    "cjt3aGl0ZS1zcGFjZTpub3dyYXB9Ci5jaGFucyBidXR0b24ub257Ym9yZGVyLWNvbG9yOnZhcigtLW9rKTtjb2xvcjp2YXIoLS1v"
+    "ayl9Ci5lbXB0eXttYXgtd2lkdGg6MzgwcHg7dGV4dC1hbGlnbjpjZW50ZXI7Y29sb3I6dmFyKC0tbXV0ZSk7Zm9udC1zaXplOjEz"
+    "cHg7bGluZS1oZWlnaHQ6MS43O3BhZGRpbmc6MjBweH0KLmVtcHR5IGF7Y29sb3I6dmFyKC0tcGluayl9Cjwvc3R5bGU+PC9oZWFk"
+    "Pjxib2R5PgoKPHNlY3Rpb24gY2xhc3M9InZpZXciIGlkPSJsb2JieSI+CiA8aGVhZGVyPjxkaXYgY2xhc3M9ImJyYW5kIj5zZWJi"
+    "aTxiPi5wcm88L2I+IMK3IENJTkVNQTwvZGl2PjxoMSBpZD0id2luZ1RpdGxlIj5BSSBnb3Zlcm5hbmNlLCBvbiBldmVyeSBzY3Jl"
+    "ZW4uPC9oMT4KIDxkaXYgY2xhc3M9InN1YiIgaWQ9IndpbmdTdWIiPkRSQUcgVE8gU1BJTiDCtyBUQVAgQSBTQ1JFRU4gwrcgRU5U"
+    "RVIgVEhFIFJPT00gVE8gV0FUQ0g8L2Rpdj4KIDxkaXYgY2xhc3M9IndpbmdzIj48YnV0dG9uIGlkPSJ3RyIgY2xhc3M9Im9uIj7w"
+    "n4+bIEdvdmVybmFuY2U8L2J1dHRvbj48YnV0dG9uIGlkPSJ3VCIgY2xhc3M9InRlbnAiPvCfjqwgVGhlIDEwcCBXaW5nPC9idXR0"
+    "b24+PC9kaXY+PC9oZWFkZXI+CiA8ZGl2IGNsYXNzPSJzdGFnZSIgaWQ9InN0YWdlIj48ZGl2IGNsYXNzPSJyaW5nIiBpZD0icmlu"
+    "ZyI+PGRpdiBjbGFzcz0iYXhsZSI+PC9kaXY+PC9kaXY+PC9kaXY+CiA8ZGl2IGNsYXNzPSJub3ciIGlkPSJub3ciPjwvZGl2Pgog"
+    "PGRpdiBjbGFzcz0iYmFyIiBzdHlsZT0icGFkZGluZy1ib3R0b206NnB4Ij48YnV0dG9uIGNsYXNzPSJidG4gZ2hvc3QiIG9uY2xp"
+    "Y2s9InJlZWxTdGVwKC0xKSI+4peAIFJlZWw8L2J1dHRvbj48c3BhbiBjbGFzcz0ic3ViIiBpZD0icmVlbExhYiIgc3R5bGU9ImFs"
+    "aWduLXNlbGY6Y2VudGVyIj48L3NwYW4+PGJ1dHRvbiBjbGFzcz0iYnRuIGdob3N0IiBvbmNsaWNrPSJyZWVsU3RlcCgxKSI+UmVl"
+    "bCDilrY8L2J1dHRvbj48L2Rpdj4KIDxkaXYgY2xhc3M9ImNyb3dkIiBpZD0iY3Jvd2QiPjwvZGl2PgogPGRpdiBjbGFzcz0iYmFy"
+    "Ij48YnV0dG9uIGNsYXNzPSJidG4iIG9uY2xpY2s9ImVudGVyKCkiPkVudGVyIHRoZSByb29tIOKWtjwvYnV0dG9uPjxhIGNsYXNz"
+    "PSJidG4gcGluayIgaHJlZj0iL2NyZWF0ZSI+TG9jayB5b3VyIG93biB2aWRlbzwvYT48YSBjbGFzcz0iYnRuIGdob3N0IiBocmVm"
+    "PSIvIj5Ib21lPC9hPjwvZGl2Pgo8L3NlY3Rpb24+Cgo8c2VjdGlvbiBjbGFzcz0idmlldyBoaWRkZW4iIGlkPSJyb29tIj4KIDxk"
+    "aXYgY2xhc3M9ImZsb29yIj48L2Rpdj4KIDxoZWFkZXI+PGRpdiBjbGFzcz0iYnJhbmQiPnNlYmJpPGI+LnBybzwvYj4gwrcgVEhF"
+    "IFNDUkVFTklORyBST09NPC9kaXY+PGRpdiBjbGFzcz0ic3ViIiBpZD0icm9vbU5vdyI+PC9kaXY+PC9oZWFkZXI+CiA8ZGl2IGNs"
+    "YXNzPSJ0dndyYXAiPjxkaXYgY2xhc3M9InR2IiBpZD0idHYiPjwvZGl2PjxhIGNsYXNzPSJ0dmxpbmsiIGlkPSJ0dmxpbmsiIHRh"
+    "cmdldD0iX2JsYW5rIiByZWw9Im5vb3BlbmVyIj48L2E+PC9kaXY+CiA8ZGl2IGNsYXNzPSJjaGFucyIgaWQ9ImNoYW5zIj48L2Rp"
+    "dj4KIDxkaXYgY2xhc3M9ImNyb3dkIiBpZD0iY3Jvd2QyIj48L2Rpdj4KIDxkaXYgY2xhc3M9ImJhciI+PGJ1dHRvbiBjbGFzcz0i"
+    "YnRuIGdob3N0IiBvbmNsaWNrPSJzdGVwKC0xKSI+4peAPC9idXR0b24+PGJ1dHRvbiBjbGFzcz0iYnRuIGdob3N0IiBvbmNsaWNr"
+    "PSJzdGVwKDEpIj7ilrY8L2J1dHRvbj48YnV0dG9uIGNsYXNzPSJidG4gZ2hvc3QiIGlkPSJzcGluQnRuIiBvbmNsaWNrPSJ0b2dn"
+    "bGVTcGluKCkiPlNwaW4gdGhlIFRWPC9idXR0b24+PGJ1dHRvbiBjbGFzcz0iYnRuIiBvbmNsaWNrPSJsZWF2ZSgpIj5CYWNrIHRv"
+    "IHRoZSBsb2JieTwvYnV0dG9uPjwvZGl2Pgo8L3NlY3Rpb24+Cgo8c2NyaXB0PgooZnVuY3Rpb24oKXsKInVzZSBzdHJpY3QiOwp2"
+    "YXIgR09WPVt7aWQ6ImdNMWRMZHBEUjUwIix0aXRsZToiV2hhdCBJcyBUcnVzdHdvcnRoeSBBST8iLGNoYW5uZWw6Ik5WSURJQSJ9"
+    "LAoge2lkOiJmNmR4M1loLVR3dyIsdGl0bGU6IldoYXQgaXMgQUkgZ292ZXJuYW5jZT8iLGNoYW5uZWw6IklCTSBSZXNlYXJjaCJ9"
+    "LAoge2lkOiJRMDIwQy1KdzBvOCIsdGl0bGU6IlRoZSBJbXBvcnRhbmNlIG9mIEFJIEdvdmVybmFuY2UiLGNoYW5uZWw6IklCTSBU"
+    "ZWNobm9sb2d5In1dOwp2YXIgVEVOPVtdOwp2YXIgd2luZz0iZ292IixMSVNUPUdPVixjdXI9MCxhbmdsZT0wLHZlbD0uMTIsZHJh"
+    "Zz1udWxsLGxhc3RYPTAsc3Bpbm5pbmc9ZmFsc2UscmVlbD0wLFBFUj0xMDsKdmFyIHJpbmc9ZG9jdW1lbnQuZ2V0RWxlbWVudEJ5"
+    "SWQoInJpbmciKSxub3c9ZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoIm5vdyIpOwpmdW5jdGlvbiBlc2Mocyl7cmV0dXJuIFN0cmlu"
+    "ZyhzKS5yZXBsYWNlKC9bJjw+Il0vZyxmdW5jdGlvbihjKXtyZXR1cm57IiYiOiImYW1wOyIsIjwiOiImbHQ7IiwiPiI6IiZndDsi"
+    "LCciJzoiJnF1b3Q7In1bY119KX0KZnVuY3Rpb24gY3Jvd2QoaWQsbil7dmFyIGg9IiI7Zm9yKHZhciBpPTA7aTxuO2krKyloKz0n"
+    "PGRpdiBjbGFzcz0iYm90Ij48ZGl2IGNsYXNzPSJoZWFkIj48ZGl2IGNsYXNzPSJ2aXNvciI+PC9kaXY+PC9kaXY+PGRpdiBjbGFz"
+    "cz0iYm9keSI+PC9kaXY+PGRpdiBjbGFzcz0ic2VhdCI+PC9kaXY+PC9kaXY+Jztkb2N1bWVudC5nZXRFbGVtZW50QnlJZChpZCku"
+    "aW5uZXJIVE1MPWh9CmNyb3dkKCJjcm93ZCIsTWF0aC5taW4oOSxNYXRoLmZsb29yKGlubmVyV2lkdGgvNDgpKSk7Y3Jvd2QoImNy"
+    "b3dkMiIsTWF0aC5taW4oOSxNYXRoLmZsb29yKGlubmVyV2lkdGgvNDgpKSk7CnZhciBWSVM9WyIjYzlhODRjIiwiIzdmZTNiMCIs"
+    "IiM4ZmQwZmYiLCIjZmY4YTgwIiwiI2Q1OWJmZiJdOwpmdW5jdGlvbiB2aXNvcigpe3ZhciBjPXdpbmc9PT0idGVuIj8iI2Q1OWJm"
+    "ZiI6VklTW2N1ciVWSVMubGVuZ3RoXTsKIEFycmF5LnByb3RvdHlwZS5mb3JFYWNoLmNhbGwoZG9jdW1lbnQucXVlcnlTZWxlY3Rv"
+    "ckFsbCgiLnZpc29yIiksZnVuY3Rpb24odil7di5zdHlsZS5iYWNrZ3JvdW5kPWM7di5zdHlsZS5ib3hTaGFkb3c9IjAgMCA4cHgg"
+    "IitjfSl9CmZ1bmN0aW9uIHRodW1iKHYpeyByZXR1cm4gdi55b3V0dWJlID8gJzxpbWcgYWx0PSIiIGxvYWRpbmc9ImxhenkiIHNy"
+    "Yz0iaHR0cHM6Ly9pbWcueW91dHViZS5jb20vdmkvJytlbmNvZGVVUklDb21wb25lbnQodi5pZCkrJy9ocWRlZmF1bHQuanBnIj4n"
+    "IDogJzxkaXYgY2xhc3M9ImZhbGxiYWNrIj7wn46sPC9kaXY+JzsgfQpmdW5jdGlvbiBidWlsZCgpewogQXJyYXkucHJvdG90eXBl"
+    "LmZvckVhY2guY2FsbChyaW5nLnF1ZXJ5U2VsZWN0b3JBbGwoIi5zY3JlZW4iKSxmdW5jdGlvbihzKXtzLnJlbW92ZSgpfSk7CiBp"
+    "ZighTElTVC5sZW5ndGgpe2RvY3VtZW50LmdldEVsZW1lbnRCeUlkKCJyZWVsTGFiIikudGV4dENvbnRlbnQ9IiI7bm93LmlubmVy"
+    "SFRNTD0nPHNwYW4gc3R5bGU9ImNvbG9yOiM4YTkzYWQiPk5vIHNjcmVlbnMgaW4gdGhpcyB3aW5nIHlldC4gPGEgaHJlZj0iL2Ny"
+    "ZWF0ZSIgc3R5bGU9ImNvbG9yOiNkNTliZmYiPkxvY2sgYSB2aWRlbzwvYT4gYW5kIHNlbmQgaXQgaW4uPC9zcGFuPic7cmV0dXJu"
+    "fQogdmFyIHJlZWxzPU1hdGgubWF4KDEsTWF0aC5jZWlsKExJU1QubGVuZ3RoL1BFUikpO3JlZWw9TWF0aC5taW4ocmVlbCxyZWVs"
+    "cy0xKTsKIHZhciBpdGVtcz1MSVNULnNsaWNlKHJlZWwqUEVSLHJlZWwqUEVSK1BFUiksYmFzZT1yZWVsKlBFUixuPU1hdGgubWF4"
+    "KGl0ZW1zLmxlbmd0aCw1KSxyPU1hdGgucm91bmQoMTQwL01hdGgudGFuKE1hdGguUEkvbikpKzQwOwogZm9yKHZhciBpPTA7aTxu"
+    "O2krKyl7dmFyIGs9YmFzZSsoaSVpdGVtcy5sZW5ndGgpLHY9TElTVFtrXSxkPWRvY3VtZW50LmNyZWF0ZUVsZW1lbnQoImRpdiIp"
+    "OwogIGQuY2xhc3NOYW1lPSJzY3JlZW4iKyh3aW5nPT09InRlbiI/IiB0ZW5wIjoiIik7ZC5kYXRhc2V0Lmk9azsKICBkLnN0eWxl"
+    "LnRyYW5zZm9ybT0icm90YXRlWSgiKygzNjAvbippKSsiZGVnKSB0cmFuc2xhdGVaKCIrcisicHgpIjsKICBkLmlubmVySFRNTD10"
+    "aHVtYih2KSsnPGRpdiBjbGFzcz0iY2giPkNIICcrKGsrMSkrJyDCtyAnK2VzYyh2LmNoYW5uZWwpKyc8L2Rpdj4nKwogICAodi5w"
+    "cmljZT8nPGRpdiBjbGFzcz0icHJpY2UiPicrZXNjKFN0cmluZyh2LnByaWNlKSkrJ3A8L2Rpdj4nOicnKSsKICAgJzxkaXYgY2xh"
+    "c3M9ImxhYiI+Jytlc2Modi50aXRsZSkrJzwvZGl2Pic7CiAgZC5vbmNsaWNrPWZ1bmN0aW9uKCl7cGljaygrdGhpcy5kYXRhc2V0"
+    "LmkpfTtyaW5nLmFwcGVuZENoaWxkKGQpfQogZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoInJlZWxMYWIiKS50ZXh0Q29udGVudD0i"
+    "UmVlbCAiKyhyZWVsKzEpKyIgb2YgIityZWVscysiIMK3ICIrTElTVC5sZW5ndGgrKHdpbmc9PT0idGVuIj8iIGxvY2tlZCB2aWRl"
+    "b3MiOiIgdmlkZW9zIik7CiBpZihjdXI8YmFzZXx8Y3VyPj1iYXNlK2l0ZW1zLmxlbmd0aCljdXI9YmFzZTsKIG1hcmsoKTtjaGFu"
+    "cygpfQpmdW5jdGlvbiBtYXJrKCl7QXJyYXkucHJvdG90eXBlLmZvckVhY2guY2FsbChyaW5nLnF1ZXJ5U2VsZWN0b3JBbGwoIi5z"
+    "Y3JlZW4iKSxmdW5jdGlvbihzKXtzLmNsYXNzTGlzdC50b2dnbGUoIm9uIiwrcy5kYXRhc2V0Lmk9PT1jdXIpfSk7CiB2YXIgdj1M"
+    "SVNUW2N1cl07aWYoIXYpcmV0dXJuOwogbm93LnRleHRDb250ZW50PSJDSCAiKyhjdXIrMSkrIiDCtyAiK3YuY2hhbm5lbCsiIMK3"
+    "ICIrdi50aXRsZSsodi5wcmljZT8iIMK3ICIrdi5wcmljZSsicCB0byB1bmxvY2siOiIiKTt2aXNvcigpfQpmdW5jdGlvbiBwaWNr"
+    "KGkpe2N1cj1pO21hcmsoKTt2ZWw9LjAzfQp3aW5kb3cucmVlbFN0ZXA9ZnVuY3Rpb24oZCl7aWYoIUxJU1QubGVuZ3RoKXJldHVy"
+    "bjt2YXIgcmVlbHM9TWF0aC5tYXgoMSxNYXRoLmNlaWwoTElTVC5sZW5ndGgvUEVSKSk7cmVlbD0ocmVlbCtkK3JlZWxzKSVyZWVs"
+    "cztjdXI9cmVlbCpQRVI7YnVpbGQoKX07CmZ1bmN0aW9uIGxvb3AoKXtpZihkcmFnPT09bnVsbCl7YW5nbGUrPXZlbDt2ZWwrPSgu"
+    "MTItdmVsKSouMDF9cmluZy5zdHlsZS50cmFuc2Zvcm09InJvdGF0ZVkoIithbmdsZSsiZGVnKSI7cmVxdWVzdEFuaW1hdGlvbkZy"
+    "YW1lKGxvb3ApfWxvb3AoKTsKdmFyIHN0PWRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCJzdGFnZSIpOwpzdC5hZGRFdmVudExpc3Rl"
+    "bmVyKCJwb2ludGVyZG93biIsZnVuY3Rpb24oZSl7ZHJhZz1lLmNsaWVudFg7bGFzdFg9ZS5jbGllbnRYfSk7CmFkZEV2ZW50TGlz"
+    "dGVuZXIoInBvaW50ZXJtb3ZlIixmdW5jdGlvbihlKXtpZihkcmFnIT09bnVsbCl7dmFyIGR4PWUuY2xpZW50WC1sYXN0WDthbmds"
+    "ZSs9ZHgqLjQ7dmVsPWR4Ki40O2xhc3RYPWUuY2xpZW50WH19KTsKYWRkRXZlbnRMaXN0ZW5lcigicG9pbnRlcnVwIixmdW5jdGlv"
+    "bigpe2RyYWc9bnVsbH0pOwpmdW5jdGlvbiBzZXRXaW5nKHcpe3dpbmc9dztMSVNUPSh3PT09ImdvdiIpP0dPVjpURU47cmVlbD0w"
+    "O2N1cj0wOwogZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoIndHIikuY2xhc3NMaXN0LnRvZ2dsZSgib24iLHc9PT0iZ292Iik7CiBk"
+    "b2N1bWVudC5nZXRFbGVtZW50QnlJZCgid1QiKS5jbGFzc0xpc3QudG9nZ2xlKCJvbiIsdz09PSJ0ZW4iKTsKIGRvY3VtZW50Lmdl"
+    "dEVsZW1lbnRCeUlkKCJ3aW5nVGl0bGUiKS50ZXh0Q29udGVudD0odz09PSJnb3YiKT8iQUkgZ292ZXJuYW5jZSwgb24gZXZlcnkg"
+    "c2NyZWVuLiI6IlRoZSAxMHAgV2luZy4iOwogZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoIndpbmdTdWIiKS50ZXh0Q29udGVudD0o"
+    "dz09PSJnb3YiKT8iRFJBRyBUTyBTUElOIMK3IFRBUCBBIFNDUkVFTiDCtyBFTlRFUiBUSEUgUk9PTSBUTyBXQVRDSCI6IkNSRUFU"
+    "T1JTJyBMT0NLRUQgVklERU9TIMK3IEZSRUUgUFJFVklFVywgVEhFTiBBIEZFVyBQRU5DRSI7CiBidWlsZCgpfQpkb2N1bWVudC5n"
+    "ZXRFbGVtZW50QnlJZCgid0ciKS5vbmNsaWNrPWZ1bmN0aW9uKCl7c2V0V2luZygiZ292Iil9Owpkb2N1bWVudC5nZXRFbGVtZW50"
+    "QnlJZCgid1QiKS5vbmNsaWNrPWZ1bmN0aW9uKCl7c2V0V2luZygidGVuIil9OwpmdW5jdGlvbiB0digpe3ZhciB2PUxJU1RbY3Vy"
+    "XTtpZighdilyZXR1cm47dmFyIHQ9ZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoInR2Iik7CiBpZihzcGlubmluZyl7c3Bpbm5pbmc9"
+    "ZmFsc2U7dC5jbGFzc0xpc3QucmVtb3ZlKCJzcGluIik7ZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoInNwaW5CdG4iKS50ZXh0Q29u"
+    "dGVudD0iU3BpbiB0aGUgVFYifQogdC5jbGFzc0xpc3QucmVtb3ZlKCJpZGxlIik7CiB2YXIgc3JjID0gdi55b3V0dWJlCiAgPyAi"
+    "aHR0cHM6Ly93d3cueW91dHViZS5jb20vZW1iZWQvIitlbmNvZGVVUklDb21wb25lbnQodi5pZCkrIj9hdXRvcGxheT0xJm11dGU9"
+    "MSZyZWw9MCZwbGF5c2lubGluZT0xJm1vZGVzdGJyYW5kaW5nPTEiCiAgOiB2LnVybDsKIHQuaW5uZXJIVE1MPSc8aWZyYW1lIHNy"
+    "Yz0iJytlc2Moc3JjKSsnIiByZWZlcnJlcnBvbGljeT0ic3RyaWN0LW9yaWdpbi13aGVuLWNyb3NzLW9yaWdpbiIgYWxsb3c9ImFj"
+    "Y2VsZXJvbWV0ZXI7IGF1dG9wbGF5OyBjbGlwYm9hcmQtd3JpdGU7IGVuY3J5cHRlZC1tZWRpYTsgZ3lyb3Njb3BlOyBwaWN0dXJl"
+    "LWluLXBpY3R1cmU7IHdlYi1zaGFyZTsgZnVsbHNjcmVlbiIgYWxsb3dmdWxsc2NyZWVuIHRpdGxlPSInK2VzYyh2LnRpdGxlKSsn"
+    "Ij48L2lmcmFtZT4nOwogdmFyIGE9ZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoInR2bGluayIpOwogYS5ocmVmPXYueW91dHViZT8o"
+    "Imh0dHBzOi8vd3d3LnlvdXR1YmUuY29tL3dhdGNoP3Y9IitlbmNvZGVVUklDb21wb25lbnQodi5pZCkpOnYudXJsOwogYS50ZXh0"
+    "Q29udGVudD12LnlvdXR1YmU/IlBsYXlpbmcgbXV0ZWQgwrcgdGFwIHRoZSB2aWRlbyB0byB1bm11dGUgwrcgb3Igd2F0Y2ggb24g"
+    "WW91VHViZSDihpciOigiQnkgIit2LmNoYW5uZWwrIiDCtyBmcmVlIHByZXZpZXcsIHRoZW4gIit2LnByaWNlKyJwIMK3IG9wZW4g"
+    "aXQgb24gaXRzIG93biBwYWdlIOKGlyIpOwogZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoInJvb21Ob3ciKS50ZXh0Q29udGVudD0i"
+    "Tk9XIFNIT1dJTkcgwrcgQ0ggIisoY3VyKzEpKyIgwrcgIit2LmNoYW5uZWwrIiDCtyAiK3YudGl0bGU7CiBjaGFucygpO3Zpc29y"
+    "KCl9CmZ1bmN0aW9uIGNoYW5zKCl7ZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoImNoYW5zIikuaW5uZXJIVE1MPUxJU1QubWFwKGZ1"
+    "bmN0aW9uKHYsaSl7cmV0dXJuICc8YnV0dG9uIGNsYXNzPSInKyhpPT09Y3VyPyJvbiI6IiIpKyciIGRhdGEtaT0iJytpKyciPkNI"
+    "ICcrKGkrMSkrJyDCtyAnK2VzYyh2LmNoYW5uZWwpKyc8L2J1dHRvbj4nfSkuam9pbigiIik7CiBBcnJheS5wcm90b3R5cGUuZm9y"
+    "RWFjaC5jYWxsKGRvY3VtZW50LnF1ZXJ5U2VsZWN0b3JBbGwoIiNjaGFucyBidXR0b24iKSxmdW5jdGlvbihiKXtiLm9uY2xpY2s9"
+    "ZnVuY3Rpb24oKXtjdXI9K2IuZGF0YXNldC5pO3JlZWw9TWF0aC5mbG9vcihjdXIvUEVSKTt0digpO2J1aWxkKCl9fSl9CndpbmRv"
+    "dy5lbnRlcj1mdW5jdGlvbigpe2lmKCFMSVNULmxlbmd0aCl7bG9jYXRpb24uaHJlZj0iL2NyZWF0ZSI7cmV0dXJufQogZG9jdW1l"
+    "bnQuZ2V0RWxlbWVudEJ5SWQoImxvYmJ5IikuY2xhc3NMaXN0LmFkZCgiaGlkZGVuIik7ZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQo"
+    "InJvb20iKS5jbGFzc0xpc3QucmVtb3ZlKCJoaWRkZW4iKTt0digpfTsKd2luZG93LmxlYXZlPWZ1bmN0aW9uKCl7ZG9jdW1lbnQu"
+    "Z2V0RWxlbWVudEJ5SWQoInR2IikuaW5uZXJIVE1MPSIiO2RvY3VtZW50LmdldEVsZW1lbnRCeUlkKCJyb29tIikuY2xhc3NMaXN0"
+    "LmFkZCgiaGlkZGVuIik7ZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoImxvYmJ5IikuY2xhc3NMaXN0LnJlbW92ZSgiaGlkZGVuIik7"
+    "bWFyaygpfTsKd2luZG93LnN0ZXA9ZnVuY3Rpb24oZCl7aWYoIUxJU1QubGVuZ3RoKXJldHVybjtjdXI9KGN1citkK0xJU1QubGVu"
+    "Z3RoKSVMSVNULmxlbmd0aDtyZWVsPU1hdGguZmxvb3IoY3VyL1BFUik7dHYoKTtidWlsZCgpfTsKd2luZG93LnRvZ2dsZVNwaW49"
+    "ZnVuY3Rpb24oKXt2YXIgdD1kb2N1bWVudC5nZXRFbGVtZW50QnlJZCgidHYiKSx2PUxJU1RbY3VyXTtzcGlubmluZz0hc3Bpbm5p"
+    "bmc7CiBpZihzcGlubmluZyl7dC5pbm5lckhUTUw9di55b3V0dWJlPyc8aW1nIGFsdD0iIiBzdHlsZT0id2lkdGg6MTAwJTtoZWln"
+    "aHQ6MTAwJTtvYmplY3QtZml0OmNvdmVyO2JvcmRlci1yYWRpdXM6NHB4IiBzcmM9Imh0dHBzOi8vaW1nLnlvdXR1YmUuY29tL3Zp"
+    "LycrZW5jb2RlVVJJQ29tcG9uZW50KHYuaWQpKycvaHFkZWZhdWx0LmpwZyI+JzonPGRpdiBzdHlsZT0iZGlzcGxheTpmbGV4O2Fs"
+    "aWduLWl0ZW1zOmNlbnRlcjtqdXN0aWZ5LWNvbnRlbnQ6Y2VudGVyO2hlaWdodDoxMDAlO2ZvbnQtc2l6ZTo2MHB4O2NvbG9yOiNk"
+    "NTliZmYiPvCfjqw8L2Rpdj4nOwogIHQuY2xhc3NMaXN0LmFkZCgic3BpbiIpO2RvY3VtZW50LmdldEVsZW1lbnRCeUlkKCJ0dmxp"
+    "bmsiKS50ZXh0Q29udGVudD0iVGhlIFRWIGlzIHNwaW5uaW5nIMK3IHRhcCBTdG9wIHNwaW5uaW5nIHRvIHdhdGNoIn0KIGVsc2V7"
+    "dC5jbGFzc0xpc3QucmVtb3ZlKCJzcGluIik7dHYoKX0KIGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCJzcGluQnRuIikudGV4dENv"
+    "bnRlbnQ9c3Bpbm5pbmc/IlN0b3Agc3Bpbm5pbmciOiJTcGluIHRoZSBUViJ9OwpidWlsZCgpOwpmZXRjaCgiL3gvY2luZW1hZmVl"
+    "ZC9saXN0Iix7Y2FjaGU6Im5vLXN0b3JlIn0pLnRoZW4oZnVuY3Rpb24ocil7cmV0dXJuIHIuanNvbigpfSkudGhlbihmdW5jdGlv"
+    "bihkKXsKIGlmKGQmJmQudmlkZW9zJiZkLnZpZGVvcy5sZW5ndGgpe0dPVj1kLnZpZGVvcy5tYXAoZnVuY3Rpb24odil7di55b3V0"
+    "dWJlPXRydWU7cmV0dXJuIHZ9KTsKICB2YXIgZXh0cmE9W107dHJ5e2V4dHJhPUpTT04ucGFyc2UobG9jYWxTdG9yYWdlLmdldEl0"
+    "ZW0oInNlYmJpLmNpbmVtYSIpfHwiW10iKX1jYXRjaChlKXt9CiAgaWYoQXJyYXkuaXNBcnJheShleHRyYSkpR09WPUdPVi5jb25j"
+    "YXQoZXh0cmEubWFwKGZ1bmN0aW9uKHYpe3YueW91dHViZT10cnVlO3JldHVybiB2fSkpOwogIGlmKHdpbmc9PT0iZ292Iil7TElT"
+    "VD1HT1Y7YnVpbGQoKX19fSkuY2F0Y2goZnVuY3Rpb24oKXt9KTsKZmV0Y2goIi94L21hcnF1ZWUvbGlzdCIse2NhY2hlOiJuby1z"
+    "dG9yZSJ9KS50aGVuKGZ1bmN0aW9uKHIpe3JldHVybiByLmpzb24oKX0pLnRoZW4oZnVuY3Rpb24oZCl7CiBpZihkJiZkLnNjcmVl"
+    "bnMpe1RFTj1kLnNjcmVlbnMubWFwKGZ1bmN0aW9uKHMpe3JldHVybiB7aWQ6U3RyaW5nKHMuaWQpLHRpdGxlOnMudGl0bGUsY2hh"
+    "bm5lbDpzLmNyZWF0b3IscHJpY2U6cy5wcmljZSx1cmw6cy51cmwseW91dHViZTpmYWxzZX19KTsKICBkb2N1bWVudC5nZXRFbGVt"
+    "ZW50QnlJZCgid1QiKS50ZXh0Q29udGVudD0i8J+OrCBUaGUgMTBwIFdpbmcgKCIrVEVOLmxlbmd0aCsiKSI7CiAgaWYod2luZz09"
+    "PSJ0ZW4iKXtMSVNUPVRFTjtidWlsZCgpfX19KS5jYXRjaChmdW5jdGlvbigpe30pOwp9KSgpOwo8L3NjcmlwdD48L2JvZHk+PC9o"
+    "dG1sPgo="
+)
 
-FILE_PREFIX = b"AILEASH-FILE-v1:"
-MANIFEST_PREFIX = b"AILEASH-MANIFEST-v1:"
 
-MAX_FILES = 5000
-MAX_FILE_BYTES = 8 * 1024 * 1024
-
-# Never walked into.
-SKIP_DIRS = {".git", ".hg", ".svn", "__pycache__", "node_modules", ".venv",
-             "venv", ".mypy_cache", ".pytest_cache", ".idea", ".vscode",
-             "dist", "build", ".cache", "backups"}
-
-# Never hashed. Secrets and databases are excluded on purpose - a hash of
-# your credentials file is not evidence of anything you want to prove.
-SKIP_SUFFIXES = (".db", ".sqlite", ".sqlite3", ".db-journal", ".db-wal",
-                 ".db-shm", ".pyc", ".pyo", ".log", ".ots", ".pem", ".key",
-                 ".crt", ".p12", ".pfx")
-SKIP_NAMES = {".env", ".env.local", ".env.production", "secrets.json",
-              "credentials.json", ".netrc", "id_rsa", ".DS_Store"}
-
-_ready = False
+def _d(b):
+    return base64.b64decode("".join(b.split()))
 
 
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        c = ctx["conn"]
-        c.execute("CREATE TABLE IF NOT EXISTS codebase_seal("
-                  "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,"
-                  "manifest_root TEXT,file_count INTEGER,total_bytes INTEGER,"
-                  "declaration TEXT,manifest TEXT,sealed REAL,"
-                  "audit_hash TEXT,block_index INTEGER)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_cb_root ON codebase_seal(manifest_root)")
-        c.commit()
-    _ready = True
+_FILES = {
+    '/cinema': (_d(_HTML_B64), "text/html; charset=utf-8"),
+}
+_patched = False
 
 
-def _iso(ts):
-    if not ts:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+def _find_handler_class(ctx):
+    if isinstance(ctx, dict):
+        for k in ("handler_class", "handler", "Handler", "h", "request_handler"):
+            v = ctx.get(k)
+            if v is None:
+                continue
+            cls = v if isinstance(v, type) else type(v)
+            if hasattr(cls, "do_GET"):
+                return cls
+    f = sys._getframe()
+    while f is not None:
+        s = f.f_locals.get("self")
+        if s is not None and hasattr(type(s), "do_GET") and hasattr(s, "wfile"):
+            return type(s)
+        f = f.f_back
+    return None
 
 
-def _app_root():
-    """The directory the application is deployed from.
-
-    This module lives in modules/, so the parent of that directory is the
-    tree we want. Resolved rather than assumed, so it is correct whatever
-    the working directory happens to be when the server starts.
-    """
-    here = os.path.dirname(os.path.abspath(__file__))
-    parent = os.path.dirname(here)
-    return parent if parent else here
-
-
-def _skip(name):
-    if name in SKIP_NAMES:
+def _install_page(ctx):
+    global _patched
+    if _patched:
         return True
-    lower = name.lower()
-    return any(lower.endswith(suffix) for suffix in SKIP_SUFFIXES)
+    cls = _find_handler_class(ctx)
+    if cls is None:
+        return False
+    if getattr(cls, "_cinema_patched", False):
+        _patched = True
+        return True
 
+    original_do_GET = cls.do_GET
 
-def _file_hash(path):
-    """SHA-256 of the exact bytes, read in chunks so a large file cannot
-    exhaust memory."""
-    digest = hashlib.sha256()
-    digest.update(FILE_PREFIX)
-    size = 0
-    with open(path, "rb") as handle:
-        while True:
-            chunk = handle.read(65536)
-            if not chunk:
-                break
-            size += len(chunk)
-            if size > MAX_FILE_BYTES:
-                return None, size
-            digest.update(chunk)
-    return digest.hexdigest(), size
+    def do_GET(self):
+        path = self.path.split("?")[0].split("#")[0].rstrip("/") or "/"
+        hit = _FILES.get(path)
+        if hit:
+            body, ctype = hit
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        return original_do_GET(self)
 
+    cls.do_GET = do_GET
+    cls._cinema_patched = True
+    _patched = True
+    return True
 
-def _walk(root):
-    """Every file under root, sorted by relative path.
-
-    Sorting matters: the manifest must be reproducible by anyone holding
-    the same files, and directory order is not stable across systems.
-    """
-    entries, skipped, total = [], [], 0
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS and not d.startswith("."))
-        for filename in sorted(filenames):
-            if _skip(filename):
-                skipped.append(os.path.relpath(os.path.join(dirpath, filename), root))
-                continue
-            full = os.path.join(dirpath, filename)
-            relative = os.path.relpath(full, root).replace(os.sep, "/")
-            try:
-                digest, size = _file_hash(full)
-            except OSError:
-                skipped.append(relative)
-                continue
-            if digest is None:
-                skipped.append(relative)
-                continue
-            entries.append({"path": relative, "sha256": digest, "bytes": size})
-            total += size
-            if len(entries) >= MAX_FILES:
-                return entries, skipped, total, True
-    return entries, skipped, total, False
-
-
-def _manifest_root(entries):
-    """One root over the whole tree.
-
-    Deliberately a flat, ordered digest rather than a Merkle tree: there is
-    no need for per-file proofs here, and a rule anyone can reimplement in
-    four lines is worth more than a clever structure nobody checks.
-    """
-    digest = hashlib.sha256()
-    digest.update(MANIFEST_PREFIX)
-    for entry in entries:
-        digest.update(("%s\0%s\n" % (entry["path"], entry["sha256"])).encode("utf-8"))
-    return digest.hexdigest()
-
-
-# ----------------------------------------------------------------------
-# seal
-# ----------------------------------------------------------------------
-
-def _seal(ctx, api_key, data):
-    author = str(data.get("author", "") or "").strip()[:120]
-    entity = str(data.get("entity", "") or "").strip()[:120]
-    statement = str(data.get("statement", "") or "").strip()[:1000]
-
-    if not author:
-        return {"error": "author_required",
-                "message": "The name of the person declaring authorship. This is sealed "
-                           "verbatim and becomes part of the permanent record."}, 400
-
-    root_path = _app_root()
-    started = time.time()
-    entries, skipped, total_bytes, truncated = _walk(root_path)
-    if not entries:
-        return {"error": "nothing_to_seal",
-                "message": "No files found to hash under the application root."}, 500
-
-    manifest_root = _manifest_root(entries)
-    now = time.time()
-
-    declaration = {
-        "author": author,
-        "entity": entity or None,
-        "statement": statement or None,
-        "declared_at": _iso(now),
-    }
-
-    ev = {"user_id": "cb:" + manifest_root[:16], "action": "codebase_sealed", "amount": 0,
-          "country": "UK", "device_id": "codebase", "anomaly": 0, "device_risk": 0}
-    res = {"decision": "CODEBASE_SEALED", "score": 0, "codebase_version": VERSION,
-           "manifest_root": manifest_root, "file_count": len(entries),
-           "total_bytes": total_bytes, "author": author, "entity": entity or None,
-           "statement": statement or None,
-           "detail": "root=%s;files=%d;bytes=%d;author=%s"
-                     % (manifest_root, len(entries), total_bytes, author)}
-    audit_hash, block_index, seq = ctx["seal"](ev, res, now, api_key)
-
-    with ctx["lock"]:
-        prior = ctx["conn"].execute(
-            "SELECT manifest_root,sealed FROM codebase_seal ORDER BY id ASC").fetchall()
-        ctx["conn"].execute(
-            "INSERT INTO codebase_seal(api_key,manifest_root,file_count,total_bytes,"
-            "declaration,manifest,sealed,audit_hash,block_index) VALUES(?,?,?,?,?,?,?,?,?)",
-            (api_key, manifest_root, len(entries), total_bytes,
-             json.dumps(declaration), json.dumps(entries), now, audit_hash, block_index))
-        ctx["conn"].commit()
-
-    out = {
-        "manifest_root": manifest_root,
-        "file_count": len(entries), "total_bytes": total_bytes,
-        "files_skipped": len(skipped),
-        "sealed_at": _iso(now),
-        "took_seconds": round(now - started, 2),
-        "sealed_in_chain": audit_hash, "block_index": block_index, "receipt_seq": seq,
-        "declaration": declaration,
-        "seal_number": len(prior) + 1,
-        "codebase_version": VERSION,
-        "what_this_establishes": ("That the person named above held a body of code producing "
-                                  "exactly this manifest root, no later than this moment, and "
-                                  "that the record cannot be altered afterwards - it is a block "
-                                  "in a chain that is externally anchored and held by peers."),
-        "what_it_does_not": ("It does not establish legal ownership. Ownership comes from "
-                             "authorship, company records and signed assignment. This is the "
-                             "dated factual record those arguments rest on, not a substitute "
-                             "for them."),
-        "how_to_use_it": ("Keep this response. To demonstrate the claim later, produce your copy "
-                          "of the code and let anyone recompute the manifest root from it using "
-                          "the published rules. If it matches, you held exactly that code by "
-                          "this date."),
-        "verify_the_block": "/x/consistency/ancestor?tip=" + audit_hash,
-        "spec": "/x/codebase/spec",
-    }
-
-    if truncated:
-        out["truncated"] = ("Hit the %d file cap. The root covers the files listed and no more - "
-                            "raise MAX_FILES if the tree is genuinely larger." % MAX_FILES)
-    if prior:
-        last_root, last_time = prior[-1]
-        if last_root == manifest_root:
-            out["unchanged_since"] = _iso(last_time)
-            out["message"] = ("Identical to the previous seal. The codebase has not changed "
-                              "since %s and now carries an additional dated witness."
-                              % _iso(last_time))
-        else:
-            out["previous_root"] = last_root
-            out["previous_sealed_at"] = _iso(last_time)
-            out["message"] = ("The codebase has changed since the last seal. Both roots remain "
-                              "in the chain - a dated history of the work, which is stronger "
-                              "evidence than any single snapshot.")
-    else:
-        out["message"] = ("First seal. Run this on every deploy and the history becomes a "
-                          "continuous record of the work developing under one hand.")
-    return out, 200
-
-
-# ----------------------------------------------------------------------
-# reading
-# ----------------------------------------------------------------------
-
-def _manifest(ctx, data):
-    root = str(data.get("root", data.get("manifest_root", ""))).strip().lower()
-    with ctx["lock"]:
-        if root:
-            row = ctx["conn"].execute(
-                "SELECT manifest_root,file_count,total_bytes,declaration,manifest,sealed,"
-                "audit_hash,block_index FROM codebase_seal WHERE manifest_root=? LIMIT 1",
-                (root,)).fetchone()
-        else:
-            row = ctx["conn"].execute(
-                "SELECT manifest_root,file_count,total_bytes,declaration,manifest,sealed,"
-                "audit_hash,block_index FROM codebase_seal ORDER BY id DESC LIMIT 1").fetchone()
-    if not row:
-        return {"error": "not_found", "root": root or None}, 404
-
-    try:
-        files = json.loads(row[4])
-    except Exception:
-        files = []
-    try:
-        declaration = json.loads(row[3])
-    except Exception:
-        declaration = None
-
-    return {"manifest_root": row[0], "file_count": row[1], "total_bytes": row[2],
-            "declaration": declaration, "sealed_at": _iso(row[5]),
-            "sealed_in_chain": row[6], "block_index": row[7],
-            "files": files,
-            "codebase_version": VERSION,
-            "note": "Paths and hashes only. No file contents are held or returned by any route "
-                    "in this module."}, 200
-
-
-def _history(ctx):
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT manifest_root,file_count,total_bytes,declaration,sealed,audit_hash,"
-            "block_index FROM codebase_seal ORDER BY id ASC LIMIT 500").fetchall()
-    if not rows:
-        return {"count": 0, "seals": [],
-                "message": "No codebase seal recorded yet."}, 200
-
-    seals, last = [], None
-    for root, count, total, declaration, sealed, audit_hash, block_index in rows:
-        try:
-            parsed = json.loads(declaration)
-            author = parsed.get("author")
-        except Exception:
-            author = None
-        seals.append({"manifest_root": root, "file_count": count, "total_bytes": total,
-                      "author": author, "sealed_at": _iso(sealed),
-                      "sealed_in_chain": audit_hash, "block_index": block_index,
-                      "changed_from_previous": last is not None and root != last})
-        last = root
-
-    authors = {s["author"] for s in seals if s["author"]}
-    return {"count": len(seals),
-            "first_sealed": seals[0]["sealed_at"], "latest_sealed": seals[-1]["sealed_at"],
-            "distinct_roots": len({s["manifest_root"] for s in seals}),
-            "declared_authors": sorted(authors),
-            "seals": seals,
-            "codebase_version": VERSION,
-            "what_this_is": "A dated, uneditable record of one body of code developing over "
-                            "time under a declared author. A continuous history is materially "
-                            "harder to dispute than a single snapshot.",
-            "file_list": "Keyed - /x/codebase/manifest. The root is all anyone needs to check a "
-                         "manifest you show them."}, 200
-
-
-def _root(ctx):
-    with ctx["lock"]:
-        row = ctx["conn"].execute(
-            "SELECT manifest_root,file_count,total_bytes,sealed,audit_hash,block_index,"
-            "declaration FROM codebase_seal ORDER BY id DESC LIMIT 1").fetchone()
-    if not row:
-        return {"error": "never_sealed"}, 404
-    try:
-        author = json.loads(row[6]).get("author")
-    except Exception:
-        author = None
-    return {"manifest_root": row[0], "file_count": row[1], "total_bytes": row[2],
-            "sealed_at": _iso(row[3]), "sealed_in_chain": row[4], "block_index": row[5],
-            "declared_author": author,
-            "codebase_version": VERSION,
-            "verify_the_block": "/x/consistency/ancestor?tip=" + row[4],
-            "recompute_it": "/x/codebase/spec"}, 200
-
-
-def _spec():
-    return {
-        "codebase_version": VERSION,
-        "purpose": "Dated, tamper-evident evidence that a named person held a specific body of "
-                   "code at a specific moment.",
-        "not_ownership": "This does not establish legal ownership and is not offered as though "
-                         "it does. Ownership comes from authorship, company records and signed "
-                         "assignment. This is the factual record those arguments rest on.",
-        "file_hash": "sha256('AILEASH-FILE-v1:' || exact_file_bytes) as lowercase hex",
-        "manifest_root": "sha256('AILEASH-MANIFEST-v1:' || for each file in path order: "
-                         "path + NUL + file_hash + newline) as lowercase hex",
-        "ordering": "files sorted by relative path, forward slashes, relative to the "
-                    "application root",
-        "excluded": {
-            "directories": sorted(SKIP_DIRS),
-            "suffixes": list(SKIP_SUFFIXES),
-            "names": sorted(SKIP_NAMES),
-            "why": "Version control internals and caches are not the work. Databases and "
-                   "anything resembling a secret are excluded because hashing them proves "
-                   "nothing worth proving and risks something worth protecting.",
-        },
-        "recompute_it_yourself": [
-            "Take your copy of the source tree.",
-            "Drop the excluded directories, suffixes and names above.",
-            "Hash each remaining file with the file rule.",
-            "Sort by relative path and apply the manifest rule.",
-            "Compare with the sealed root. A match means byte-identical code.",
-        ],
-        "privacy": "No file contents are stored or returned by any route. The manifest holds "
-                   "paths and one-way hashes only, and the file list itself is keyed.",
-        "the_discipline": "Seal on every deploy. A single snapshot is a claim about one day; a "
-                          "continuous dated history is a record of the work.",
-        "what_to_do_as_well": "Get the legal position in writing - entity ownership of the IP, "
-                              "and a signed agreement with any collaborator saying who owns "
-                              "what. Do it before it matters. This module makes the facts "
-                              "unarguable; it cannot make the paperwork exist.",
-    }, 200
-
-
-# ----------------------------------------------------------------------
-# router entry point
-# ----------------------------------------------------------------------
 
 def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-    action = (action or "").strip("/").lower()
-    data = data or {}
+    armed = _install_page(ctx)
+    return ({"module": "cinema", "version": VERSION, "armed": armed,
+             "serves": sorted(_FILES.keys())}, 200)
 
-    if method == "GET":
-        if action == "spec":
-            return _spec()
-        if action == "history":
-            return _history(ctx)
-        if action == "root":
-            return _root(ctx)
-        if action == "manifest":
-            if not api_key:
-                return {"error": "invalid_api_key"}, 401
-            return _manifest(ctx, data)
 
-    if method == "POST":
-        if not api_key:
-            return {"error": "invalid_api_key"}, 401
-        if action == "seal":
-            return _seal(ctx, api_key, data)
-
-    return {"error": "unknown_action", "action": action,
-            "GET": ["spec", "history", "root", "manifest (keyed)"],
-            "POST": ["seal (keyed)"]}, 404
+PUBLIC = {("GET", "status"), ("GET", "spec")}
 
 ```
