@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-155 files across 41 parts.
+156 files across 41 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -65,77 +65,78 @@ Generated automatically on every push. Do not edit by hand.
 
 - `modules/heartbeat.py`
 - `modules/held.py`
-- `modules/integrity.py`
+- `modules/homelink.py`
 
 ## [CODEBASE-11.md](CODEBASE-11.md)
 
+- `modules/integrity.py`
 - `modules/investor.py`
+
+## [CODEBASE-12.md](CODEBASE-12.md)
+
 - `modules/lineage.py`
 - `modules/lineagedesk.py`
 - `modules/machine.py`
 - `modules/map.py`
 - `modules/marquee.py`
-
-## [CODEBASE-12.md](CODEBASE-12.md)
-
 - `modules/mutual.py`
+
+## [CODEBASE-13.md](CODEBASE-13.md)
+
 - `modules/network.py`
 - `modules/ots.py`
 - `modules/oversight.py`
 - `modules/pack.py`
-
-## [CODEBASE-13.md](CODEBASE-13.md)
-
 - `modules/packconsole.py`
-- `modules/packs.py`
 
 ## [CODEBASE-14.md](CODEBASE-14.md)
 
+- `modules/packs.py`
 - `modules/passport.py`
-- `modules/passportpage.py`
 
 ## [CODEBASE-15.md](CODEBASE-15.md)
 
+- `modules/passportpage.py`
 - `modules/peer.py`
-- `modules/peerconsole.py`
-- `modules/praxis.py`
 
 ## [CODEBASE-16.md](CODEBASE-16.md)
 
+- `modules/peerconsole.py`
+- `modules/praxis.py`
 - `modules/prove.py`
 - `modules/publish.py`
-- `modules/ratchet.py`
-- `modules/reconcile.py`
 
 ## [CODEBASE-17.md](CODEBASE-17.md)
 
+- `modules/ratchet.py`
+- `modules/reconcile.py`
 - `modules/register.py`
-- `modules/replay.py`
 
 ## [CODEBASE-18.md](CODEBASE-18.md)
 
+- `modules/replay.py`
 - `modules/roster.py`
 - `modules/router.py`
 - `modules/rulebind.py`
-- `modules/savings.py`
-- `modules/sebbi_engine.py`
 
 ## [CODEBASE-19.md](CODEBASE-19.md)
 
+- `modules/savings.py`
+- `modules/sebbi_engine.py`
 - `modules/selfcheck.py`
-- `modules/signed.py`
 
 ## [CODEBASE-20.md](CODEBASE-20.md)
 
+- `modules/signed.py`
 - `modules/sortition.py`
 - `modules/spec.py`
 - `modules/standard.py`
-- `modules/standing.py`
-- `modules/startpage.py`
-- `modules/stats.py`
 
 ## [CODEBASE-21.md](CODEBASE-21.md)
 
+- `modules/standing.py`
+- `modules/startpage.py`
+- `modules/stats.py`
 - `modules/studio.py`
 
 ## [CODEBASE-22.md](CODEBASE-22.md)
