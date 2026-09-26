@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-157 files across 41 parts.
+156 files across 41 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -104,7 +104,6 @@ Generated automatically on every push. Do not edit by hand.
 - `modules/peerconsole.py`
 - `modules/praxis.py`
 - `modules/prove.py`
-- `modules/public_proof.py`
 - `modules/publish.py`
 
 ## [CODEBASE-17.md](CODEBASE-17.md)
