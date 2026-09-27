@@ -1,8 +1,856 @@
 # Codebase — part 20 of 42
 
 Contains:
+- `modules/sebbi_adapter.py`
+- `modules/sebbi_engine.py`
 - `modules/selfcheck.py`
-- `modules/signed.py`
+
+
+## `modules/sebbi_adapter.py`
+
+602 lines, 24915 bytes
+
+```python
+"""
+sebbi_adapter.py  v1.0.0 - drop-in state anchoring for legacy applications.
+
+Your application keeps its database, its logic and its infrastructure. This
+file sits beside it: every state change you point it at is turned into a
+SHA-256 fingerprint, queued locally, and sent in the background to the
+sebbi.pro public proof log, which returns a receipt proving the fingerprint
+is in an append-only RFC 6962 Merkle tree whose tree heads are sealed into the
+sebbi.pro chain and timestamped in Bitcoin.
+
+Only the fingerprint leaves your machine. The data itself never does.
+
+TWO LINES
+---------
+    export SEBBI_API_KEY=your-key          (once, in the environment)
+
+    from sebbi_adapter import anchor_state
+    @anchor_state("orders.update")
+    def update_order(order_id, status):
+        ...                                 # unchanged
+        return {"order_id": order_id, "status": status}
+
+The return value is fingerprinted after the function succeeds. The call is
+never slowed down by the network and never fails because of this file:
+fingerprints go into a local append-only queue (sqlite) and a background
+thread sends them. If sebbi.pro is unreachable they wait, and are sent when it
+comes back, in order, with no duplicates.
+
+OTHER WAYS IN
+-------------
+    from sebbi_adapter import record, AnchorLogHandler
+    record({"account": 42, "balance": 1250})          # anywhere, returns the hash
+    logging.getLogger("payments").addHandler(AnchorLogHandler())   # every log line
+
+    @anchor_state("ledger.post", capture="args")      # fingerprint the inputs instead
+    @anchor_state("user.save", extract=lambda result, args, kwargs: result.to_dict())
+
+Async functions work the same way.
+
+CHECKING
+--------
+    python sebbi_adapter.py status            queue and receipt counts
+    python sebbi_adapter.py flush             send what is waiting, now
+    python sebbi_adapter.py receipt <hash>    the receipt for one fingerprint
+    python sebbi_adapter.py verify            re-check every stored receipt locally
+    python sebbi_adapter.py hash '<json>'     fingerprint a JSON value exactly as the adapter would
+
+Every receipt is checked on arrival with an RFC 6962 inclusion check, so the
+server's answer is verified, not trusted. A receipt that fails the check is
+kept (as evidence) and flagged.
+
+FINGERPRINT RULE (so anyone can recompute it)
+---------------------------------------------
+SHA-256 over canonical JSON: keys sorted, separators "," and ":", UTF-8, no
+extra whitespace. datetime/date -> ISO 8601 string, Decimal -> string,
+bytes -> hex, set -> sorted list, UUID -> string, dataclass -> its fields,
+objects with to_dict()/_asdict() -> that. Floats use Python's repr. Anything
+else is refused (and logged) rather than guessed at - pass extract= for those.
+
+SETTINGS (environment or Anchor(...) arguments)
+-----------------------------------------------
+    SEBBI_API_KEY        your key (without it, fingerprints queue and wait)
+    SEBBI_ENDPOINT       default https://sebbi.pro
+    SEBBI_DB             default ./sebbi_anchor.db
+    SEBBI_DISABLED=1     record nothing (kill switch)
+
+Standard library only. Python 3.8+.
+"""
+
+import asyncio
+import atexit
+import dataclasses
+import datetime
+import decimal
+import functools
+import hashlib
+import inspect
+import json
+import logging
+import os
+import sqlite3
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+import uuid
+
+__version__ = "1.0.0"
+__all__ = ["anchor_state", "record", "Anchor", "AnchorLogHandler", "canonical_json", "state_hash",
+           "verify_inclusion", "verify_consistency", "get_default"]
+
+log = logging.getLogger("sebbi_adapter")
+
+
+# ---------------------------------------------------------------- fingerprints
+
+def _default(o):
+    if isinstance(o, (datetime.datetime, datetime.date, datetime.time)):
+        return o.isoformat()
+    if isinstance(o, decimal.Decimal):
+        return str(o)
+    if isinstance(o, (bytes, bytearray, memoryview)):
+        return bytes(o).hex()
+    if isinstance(o, (set, frozenset)):
+        return sorted(o, key=lambda x: canonical_json(x))
+    if isinstance(o, uuid.UUID):
+        return str(o)
+    if dataclasses.is_dataclass(o) and not isinstance(o, type):
+        return dataclasses.asdict(o)
+    for attr in ("to_dict", "_asdict"):
+        fn = getattr(o, attr, None)
+        if callable(fn):
+            return fn()
+    raise TypeError("cannot fingerprint %s - pass extract= to choose what to record" % type(o).__name__)
+
+
+def canonical_json(obj):
+    """The exact bytes the fingerprint is taken over."""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                      allow_nan=False, default=_default).encode("utf-8")
+
+
+def state_hash(obj):
+    """SHA-256 of canonical JSON, as 64 lowercase hex characters."""
+    return hashlib.sha256(canonical_json(obj)).hexdigest()
+
+
+# ---------------------------------------------------------------- RFC 6962 checks
+
+def _h(b):
+    return hashlib.sha256(b).digest()
+
+
+def leaf_hash(entry_hex):
+    return _h(b"\x00" + bytes.fromhex(entry_hex)).hex()
+
+
+def verify_inclusion(entry_hex, index, tree_size, path, root):
+    """RFC 9162 section 2.1.3.2: is entry at `index` in the tree of `tree_size` with `root`?"""
+    try:
+        index, tree_size = int(index), int(tree_size)
+        if index < 0 or index >= tree_size:
+            return False
+        fn, sn = index, tree_size - 1
+        r = _h(b"\x00" + bytes.fromhex(entry_hex))
+        for p_hex in path:
+            p = bytes.fromhex(p_hex)
+            if sn == 0:
+                return False
+            if (fn & 1) or fn == sn:
+                r = _h(b"\x01" + p + r)
+                if not (fn & 1):
+                    while not (fn & 1) and fn != 0:
+                        fn >>= 1
+                        sn >>= 1
+            else:
+                r = _h(b"\x01" + r + p)
+            fn >>= 1
+            sn >>= 1
+        return sn == 0 and r == bytes.fromhex(root)
+    except (ValueError, TypeError):
+        return False
+
+
+def verify_consistency(first, second, first_root, second_root, proof):
+    """RFC 9162 section 2.1.4.2: is the tree of size `second` an append-only extension of `first`?"""
+    try:
+        first, second = int(first), int(second)
+        fr_b, sr_b = bytes.fromhex(first_root), bytes.fromhex(second_root)
+        path = [bytes.fromhex(p) for p in proof]
+        if first == second:
+            return not path and fr_b == sr_b
+        if first < 1 or first > second or not path:
+            return False
+        if first & (first - 1) == 0:
+            path = [fr_b] + path
+        fn, sn = first - 1, second - 1
+        while fn & 1:
+            fn >>= 1
+            sn >>= 1
+        fr = sr = path[0]
+        for c in path[1:]:
+            if sn == 0:
+                return False
+            if (fn & 1) or fn == sn:
+                fr = _h(b"\x01" + c + fr)
+                sr = _h(b"\x01" + c + sr)
+                if not (fn & 1):
+                    while not (fn & 1) and fn != 0:
+                        fn >>= 1
+                        sn >>= 1
+            else:
+                sr = _h(b"\x01" + sr + c)
+            fn >>= 1
+            sn >>= 1
+        return fr == fr_b and sr == sr_b and sn == 0
+    except (ValueError, TypeError):
+        return False
+
+
+# ---------------------------------------------------------------- the sidecar
+
+class Anchor(object):
+    """Local append-only queue + background sender. Safe across threads, processes and forks."""
+
+    def __init__(self, api_key=None, endpoint=None, db_path=None, batch_size=200,
+                 flush_interval=2.0, timeout=10.0, check_chain=True, start=True):
+        self.api_key = (api_key if api_key is not None else os.environ.get("SEBBI_API_KEY", "")).strip()
+        self.endpoint = (endpoint or os.environ.get("SEBBI_ENDPOINT", "https://sebbi.pro")).rstrip("/")
+        self.db_path = db_path or os.environ.get("SEBBI_DB", "sebbi_anchor.db")
+        self.batch_size = max(1, min(500, int(batch_size)))
+        self.flush_interval = float(flush_interval)
+        self.timeout = float(timeout)
+        self.check_chain = bool(check_chain)
+        self.disabled = os.environ.get("SEBBI_DISABLED", "0") == "1"
+        self._autostart = start
+        self._warned_no_key = False
+        if not self.endpoint.startswith("https://") and "127.0.0.1" not in self.endpoint \
+                and "localhost" not in self.endpoint:
+            log.warning("sebbi_adapter: endpoint %s is not https", self.endpoint)
+        self._init_process()
+
+    # -- process-local state (rebuilt after fork) --
+    def _init_process(self):
+        self._pid = os.getpid()
+        self._wid = "%d-%s" % (self._pid, uuid.uuid4().hex[:8])
+        self._lk = threading.Lock()
+        self._wake = threading.Event()
+        self._stop = threading.Event()
+        self._backoff = 0.0
+        self._tried = {}
+        self._db = sqlite3.connect(self.db_path, timeout=30, isolation_level=None, check_same_thread=False)
+        self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.execute("PRAGMA synchronous=NORMAL")
+        self._db.execute("CREATE TABLE IF NOT EXISTS entries(seq INTEGER PRIMARY KEY AUTOINCREMENT,"
+                         "cid TEXT UNIQUE NOT NULL,hash TEXT NOT NULL,label TEXT,created REAL)")
+        self._db.execute("CREATE TABLE IF NOT EXISTS receipts(id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                         "cid TEXT NOT NULL,leaf_index INTEGER,receipt TEXT,verified INTEGER,"
+                         "checkpointed INTEGER DEFAULT 0,in_chain INTEGER,received REAL)")
+        self._db.execute("CREATE INDEX IF NOT EXISTS receipts_cid ON receipts(cid)")
+        self._db.execute("CREATE INDEX IF NOT EXISTS entries_hash ON entries(hash)")
+        self._db.execute("CREATE TABLE IF NOT EXISTS claims(cid TEXT PRIMARY KEY,worker TEXT,until REAL)")
+        self._thread = None
+        if self._autostart:
+            self._start_thread()
+
+    def _ensure_process(self):
+        if os.getpid() != self._pid:
+            self._init_process()
+
+    def _start_thread(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(target=self._run, name="sebbi-anchor", daemon=True)
+        self._thread.start()
+
+    # -- recording (host side: local only, never raises) --
+    def record(self, payload, label=None):
+        """Fingerprint `payload` and queue it. Returns the hash, or None if it could not be recorded."""
+        if self.disabled:
+            return None
+        try:
+            return self.record_hash(state_hash(payload), label=label)
+        except Exception as e:
+            log.warning("sebbi_adapter: not recorded (%s)", e)
+            return None
+
+    def record_hash(self, hash_hex, label=None):
+        """Queue a fingerprint you computed yourself (64 hex characters)."""
+        if self.disabled:
+            return None
+        try:
+            h = str(hash_hex).strip().lower()
+            if len(h) != 64 or any(ch not in "0123456789abcdef" for ch in h):
+                raise ValueError("hash must be 64 hex characters")
+            self._ensure_process()
+            with self._lk:
+                self._db.execute("INSERT INTO entries(cid,hash,label,created) VALUES(?,?,?,?)",
+                                 (uuid.uuid4().hex, h, (str(label)[:120] if label else None), time.time()))
+            self._wake.set()
+            return h
+        except Exception as e:
+            log.warning("sebbi_adapter: not recorded (%s)", e)
+            return None
+
+    # -- lookups --
+    def receipt(self, hash_hex):
+        """Latest receipt for a fingerprint (the most recent entry with that hash), or None."""
+        self._ensure_process()
+        with self._lk:
+            row = self._db.execute(
+                "SELECT r.receipt,r.verified,r.checkpointed,r.in_chain,e.label,e.created FROM entries e "
+                "JOIN receipts r ON r.cid=e.cid WHERE e.hash=? ORDER BY e.seq DESC, r.id DESC LIMIT 1",
+                (str(hash_hex).lower(),)).fetchone()
+        if not row:
+            return None
+        rec = json.loads(row[0])
+        rec["verified_locally"] = bool(row[1])
+        rec["checkpointed"] = bool(row[2])
+        rec["tree_head_seen_in_chain"] = None if row[3] is None else bool(row[3])
+        rec["label"] = row[4]
+        return rec
+
+    def counts(self):
+        self._ensure_process()
+        with self._lk:
+            c = self._db
+            total = c.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+            sent = c.execute("SELECT COUNT(DISTINCT cid) FROM receipts").fetchone()[0]
+            cp = c.execute("SELECT COUNT(DISTINCT cid) FROM receipts WHERE checkpointed=1").fetchone()[0]
+            bad = c.execute("SELECT COUNT(DISTINCT cid) FROM receipts WHERE verified=0").fetchone()[0]
+        return {"recorded": total, "receipted": sent, "waiting": total - sent,
+                "sealed_in_chain": cp, "failed_local_check": bad}
+
+    def pending(self):
+        return self.counts()["waiting"]
+
+    # -- network --
+    def _http(self, method, path, body=None):
+        data = json.dumps(body).encode("utf-8") if body is not None else None
+        req = urllib.request.Request(self.endpoint + path, data=data, method=method)
+        req.add_header("Content-Type", "application/json")
+        req.add_header("User-Agent", "sebbi-adapter/" + __version__)
+        if self.api_key:
+            req.add_header("X-Sebbi-Key", self.api_key)
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                return r.status, json.loads(r.read().decode("utf-8") or "{}")
+        except urllib.error.HTTPError as e:
+            try:
+                return e.code, json.loads(e.read().decode("utf-8") or "{}")
+            except Exception:
+                return e.code, {}
+
+    def _claim(self, n):
+        now = time.time()
+        with self._lk:
+            c = self._db
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                rows = c.execute(
+                    "SELECT e.cid,e.hash FROM entries e WHERE NOT EXISTS (SELECT 1 FROM receipts r WHERE r.cid=e.cid) "
+                    "AND NOT EXISTS (SELECT 1 FROM claims k WHERE k.cid=e.cid AND k.until>? AND k.worker<>?) "
+                    "ORDER BY e.seq LIMIT ?", (now, self._wid, n)).fetchall()
+                for cid, _ in rows:
+                    c.execute("INSERT OR REPLACE INTO claims(cid,worker,until) VALUES(?,?,?)",
+                              (cid, self._wid, now + max(60.0, self.timeout * 3)))
+                c.execute("COMMIT")
+            except Exception:
+                c.execute("ROLLBACK")
+                raise
+        return rows
+
+    def _release(self, cids):
+        with self._lk:
+            self._db.executemany("DELETE FROM claims WHERE cid=? AND worker=?", [(c, self._wid) for c in cids])
+
+    def _store(self, cid, rec, checkpointed=False, in_chain=None):
+        ok = verify_inclusion(rec.get("entry_hash", ""), rec.get("leaf_index", -1), rec.get("tree_size", 0),
+                              rec.get("audit_path", []), rec.get("root", ""))
+        if checkpointed and ok and rec.get("checkpoint"):
+            ok = rec["checkpoint"].get("root") == rec.get("root")
+        if not ok:
+            log.error("sebbi_adapter: receipt for leaf %s FAILED the local inclusion check - kept and flagged",
+                      rec.get("leaf_index"))
+        with self._lk:
+            self._db.execute("INSERT INTO receipts(cid,leaf_index,receipt,verified,checkpointed,in_chain,received) "
+                             "VALUES(?,?,?,?,?,?,?)",
+                             (cid, rec.get("leaf_index"), json.dumps(rec, sort_keys=True), 1 if ok else 0,
+                              1 if checkpointed else 0, in_chain, time.time()))
+        return ok
+
+    def _send_batch(self):
+        """Send one batch. Returns number receipted; raises on network failure."""
+        if not self.api_key:
+            if not self._warned_no_key:
+                log.warning("sebbi_adapter: SEBBI_API_KEY not set - fingerprints are queued locally and will "
+                            "be sent once it is")
+                self._warned_no_key = True
+            return 0
+        rows = self._claim(self.batch_size)
+        if not rows:
+            return 0
+        wanted = {cid: h for cid, h in rows}
+        try:
+            code, out = self._http("POST", "/p/submit", {"items": [{"hash": h, "cid": cid} for cid, h in rows]})
+        except Exception:
+            self._release(list(wanted))
+            raise
+        if code != 200:
+            self._release(list(wanted))
+            raise IOError("sebbi.pro answered %s: %s" % (code, out.get("error") or out.get("message") or ""))
+        done = 0
+        for rec in out.get("receipts") or []:
+            cid = rec.get("cid")
+            if cid not in wanted:
+                continue
+            if rec.get("error"):
+                log.error("sebbi_adapter: entry %s refused: %s", cid, rec["error"])
+                continue
+            if rec.get("entry_hash") != wanted[cid]:
+                log.error("sebbi_adapter: server returned a different hash for %s - not stored", cid)
+                continue
+            self._store(cid, rec)
+            done += 1
+        self._release(list(wanted))
+        return done
+
+    def _upgrade(self, limit=50):
+        """Fetch sealed receipts for leaves whose tree head should now be in the chain."""
+        cutoff = time.time() - 30
+        with self._lk:
+            rows = self._db.execute(
+                "SELECT r.cid,r.leaf_index FROM receipts r WHERE r.verified=1 AND r.received<? AND "
+                "NOT EXISTS (SELECT 1 FROM receipts r2 WHERE r2.cid=r.cid AND r2.checkpointed=1) "
+                "GROUP BY r.cid ORDER BY MIN(r.id) LIMIT ?", (cutoff, limit)).fetchall()
+        blocks = {}
+        now = time.time()
+        for cid, idx in rows:
+            if now - self._tried.get(cid, 0) < 30:
+                continue
+            self._tried[cid] = now
+            code, rec = self._http("GET", "/p/receipt?leaf=%d" % idx)
+            if code != 200 or not rec.get("checkpoint"):
+                continue
+            in_chain = None
+            if self.check_chain:
+                blk = rec["checkpoint"].get("block_index")
+                if blk not in blocks:
+                    try:
+                        _, body = self._http("GET", "/x/walk/block?index=%s" % blk)
+                        blocks[blk] = json.dumps(body)
+                    except Exception:
+                        blocks[blk] = None
+                if blocks[blk] is not None:
+                    in_chain = 1 if rec["checkpoint"].get("root", "~") in blocks[blk] else 0
+                    if not in_chain:
+                        log.error("sebbi_adapter: tree head for leaf %s not found in chain block %s", idx, blk)
+            self._store(cid, rec, checkpointed=True, in_chain=in_chain)
+            self._tried.pop(cid, None)
+
+    def flush(self, timeout=30.0):
+        """Send everything waiting, now. Returns how many were receipted. Never raises."""
+        self._ensure_process()
+        end, sent = time.time() + timeout, 0
+        while time.time() < end:
+            try:
+                n = self._send_batch()
+            except Exception as e:
+                log.warning("sebbi_adapter: flush stopped (%s); entries stay queued", e)
+                break
+            sent += n
+            if n == 0:
+                break
+        return sent
+
+    def _run(self):
+        while not self._stop.is_set():
+            self._wake.wait(self._backoff or self.flush_interval)
+            self._wake.clear()
+            if self._stop.is_set():
+                break
+            try:
+                while self._send_batch() >= self.batch_size:
+                    pass
+                self._upgrade()
+                self._backoff = 0.0
+            except Exception as e:
+                self._backoff = min(300.0, max(2.0, self._backoff * 2))
+                log.info("sebbi_adapter: sebbi.pro unreachable (%s); retrying in %ds", e, self._backoff)
+
+    def close(self, flush_timeout=2.0):
+        try:
+            if flush_timeout:
+                self.flush(timeout=flush_timeout)
+        finally:
+            self._stop.set()
+            self._wake.set()
+
+
+# ---------------------------------------------------------------- the default instance
+
+_default_anchor = None
+_default_lock = threading.Lock()
+
+
+def get_default():
+    global _default_anchor
+    if _default_anchor is None:
+        with _default_lock:
+            if _default_anchor is None:
+                _default_anchor = Anchor()
+                atexit.register(_default_anchor.close)
+    return _default_anchor
+
+
+def record(payload, label=None, anchor=None):
+    """Fingerprint and queue any JSON-able value. Returns the hash. Never raises."""
+    try:
+        return (anchor or get_default()).record(payload, label=label)
+    except Exception as e:
+        log.warning("sebbi_adapter: not recorded (%s)", e)
+        return None
+
+
+def anchor_state(label=None, capture="result", extract=None, anchor=None):
+    """Decorator. After the wrapped function succeeds, fingerprint its state and queue it.
+
+    capture:  "result" (default) - the return value
+              "args"             - the arguments it was called with
+              "both"             - {"args": ..., "kwargs": ..., "result": ...}
+    extract:  f(result, args, kwargs) -> the value to fingerprint (overrides capture)
+    The wrapped function's behaviour, return value and exceptions are unchanged.
+    """
+    if callable(label) and not isinstance(label, str):
+        return anchor_state()(label)
+
+    def deco(fn):
+        name = label or getattr(fn, "__qualname__", getattr(fn, "__name__", "call"))
+
+        def _state(args, kwargs, result):
+            if extract is not None:
+                return extract(result, args, kwargs)
+            if capture == "args":
+                return {"args": list(args), "kwargs": kwargs}
+            if capture == "both":
+                return {"args": list(args), "kwargs": kwargs, "result": result}
+            return result
+
+        def _anchor(args, kwargs, result):
+            try:
+                record(_state(args, kwargs, result), label=name, anchor=anchor)
+            except Exception as e:
+                log.warning("sebbi_adapter: %s not recorded (%s)", name, e)
+
+        if inspect.iscoroutinefunction(fn):
+            @functools.wraps(fn)
+            async def awrapper(*args, **kwargs):
+                result = await fn(*args, **kwargs)
+                _anchor(args, kwargs, result)
+                return result
+            return awrapper
+
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            result = fn(*args, **kwargs)
+            _anchor(args, kwargs, result)
+            return result
+        return wrapper
+    return deco
+
+
+class AnchorLogHandler(logging.Handler):
+    """Fingerprints every log record it sees: logger, level, message and time."""
+
+    def __init__(self, anchor=None, level=logging.INFO):
+        logging.Handler.__init__(self, level)
+        self._anchor = anchor
+
+    def emit(self, rec):
+        if rec.name.startswith("sebbi_adapter"):
+            return
+        try:
+            record({"logger": rec.name, "level": rec.levelname, "message": rec.getMessage(),
+                    "time": round(rec.created, 6)}, label="log:" + rec.name, anchor=self._anchor)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------- command line
+
+def _main(argv):
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    cmd = argv[1] if len(argv) > 1 else "status"
+    if cmd == "hash" and len(argv) > 2:
+        print(state_hash(json.loads(argv[2])))
+        return 0
+    a = Anchor(start=False)
+    if cmd == "status":
+        print(json.dumps(dict(a.counts(), endpoint=a.endpoint, db=a.db_path, key_set=bool(a.api_key)), indent=2))
+    elif cmd == "flush":
+        print("receipted %d" % a.flush(timeout=120))
+        a._upgrade(limit=500)
+        print(json.dumps(a.counts(), indent=2))
+    elif cmd == "receipt" and len(argv) > 2:
+        print(json.dumps(a.receipt(argv[2]), indent=2))
+    elif cmd == "verify":
+        with a._lk:
+            rows = a._db.execute("SELECT receipt FROM receipts").fetchall()
+        good = sum(1 for (r,) in rows if (lambda d: verify_inclusion(d.get("entry_hash", ""), d.get("leaf_index", -1),
+                                                                      d.get("tree_size", 0), d.get("audit_path", []),
+                                                                      d.get("root", "")))(json.loads(r)))
+        print("%d of %d stored receipts pass the RFC 6962 inclusion check" % (good, len(rows)))
+    else:
+        print(__doc__)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_main(sys.argv))
+
+```
+
+
+## `modules/sebbi_engine.py`
+
+229 lines, 8776 bytes
+
+```python
+# modules/sebbi_engine.py
+"""
+Live chain-state endpoint  -  GET /x/sebbi_engine/state
+
+WHAT CHANGED IN v1.1, AND WHY
+-----------------------------
+v1.0 served this at /verify and returned "status": "sealed". It performed no
+verification: no rehash, no chain walk, no proof check. It read the last row of
+audit_log and reported that a row existed. A route called verify that returns
+sealed, having checked neither, is a word one step past what the check does -
+the same fault that has been raised against this codebase before, and the word
+an auditor will quote back.
+
+So v1.1 does the same honest job under honest names:
+
+  * action renamed  verify -> state
+  * status is now  live / unavailable, never "sealed"
+  * tip_digest removed - it was a hash of a hash, proving nothing
+  * token_budget removed - unrelated to chain state, it did not belong here
+  * every response names the routes that DO verify, and says plainly that
+    this one does not
+
+WHAT THIS ROUTE IS
+------------------
+The current tip and height, read from the database at request time. Nothing
+cached, nothing hardcoded. If the chain cannot be read it says so rather than
+reporting a reassuring value it cannot stand behind.
+
+WHAT IT IS NOT
+--------------
+It is not verification. Reading the last row proves a row exists. Verifying
+the chain means rewalking it, and confirming the tip was recorded by operators
+we do not control. Those are separate routes, listed in every response.
+
+Dual-signature handle(...) so it works with the router
+    handle(method, action, data, api_key, ctx) -> (payload, status)
+and with older direct-write callers
+    handle(handler, path, query_params=None) -> writes the response, returns True
+
+Import-safe: nothing here can crash the server on import.
+"""
+
+import os
+import json
+import time
+
+VERSION = "1.1"
+MODULE_NAME = os.environ.get("MODULE_NAME", "sebbi_engine")
+
+# GET /state is public by design - anyone can read live state without an
+# account. The old ("GET", "verify") pair is kept so existing callers get the
+# renamed answer rather than a bare 404.
+PUBLIC = {("GET", "state"), ("GET", "verify"), ("GET", "spec"), ("GET", "")}
+
+VERIFY_ELSEWHERE = {
+    "chain_tip": "https://sebbi.pro/x/witness/tip",
+    "append_only_proof": "https://sebbi.pro/x/consistency/proof",
+    "is_my_tip_still_on_this_chain": "https://sebbi.pro/x/consistency/ancestor",
+    "who_recorded_our_tip": "https://sebbi.pro/x/roster/list",
+    "timestamp_proof_state": "https://sebbi.pro/x/ots/status",
+}
+
+NOT_VERIFICATION = (
+    "This route reads the current tip and height. It does not verify anything: "
+    "it does not rewalk the chain, recompute any hash, or check any external "
+    "record. Reading the last row proves a row exists and nothing more. The "
+    "routes above are the ones that verify, and you run them yourself."
+)
+
+try:
+    print("modules.sebbi_engine: loaded (v%s, live-state mode)" % VERSION, flush=True)
+except Exception:
+    pass
+
+
+def _read_live_chain(ctx):
+    """
+    Read the real current chain tip and height from the live database via ctx.
+
+    Returns what was actually found, or a record of why it could not be read.
+    It never invents a value.
+    """
+    if not isinstance(ctx, dict):
+        return {"live": False, "reason": "no_context"}
+
+    conn = ctx.get("conn") or ctx.get("db") or ctx.get("connection")
+    lock = ctx.get("lock")
+    if conn is None:
+        return {"live": False, "reason": "no_db_handle"}
+
+    # Matched to modules/witness.py _our_tip(): the chain lives in audit_log,
+    # the sealed hash is audit_hash, the height is id.
+    query = ("SELECT audit_hash AS seal, id AS height FROM audit_log "
+             "ORDER BY id DESC LIMIT 1")
+
+    def _run():
+        try:
+            row = conn.execute(query).fetchone()
+        except Exception:
+            return {"live": False, "reason": "query_failed"}
+        if not row:
+            return {"live": False, "reason": "no_chain_rows"}
+        seal = row[0]
+        height = row[1]
+        if seal is None:
+            return {"live": False, "reason": "null_tip"}
+        return {"live": True, "tip": str(seal),
+                "height": int(height) if height is not None else None}
+
+    try:
+        if lock is not None:
+            with lock:
+                return _run()
+        return _run()
+    except Exception as e:  # noqa: BLE001
+        return {"live": False, "reason": "read_error:" + e.__class__.__name__}
+
+
+def _build_payload(ctx):
+    now = int(time.time())
+    chain = _read_live_chain(ctx)
+
+    payload = {
+        "module": MODULE_NAME,
+        "version": VERSION,
+        "read_at": now,
+        "read_at_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+    }
+
+    if chain.get("live"):
+        payload["status"] = "live"
+        payload["chain_tip"] = chain["tip"]
+        payload["chain_height"] = chain["height"]
+        payload["note"] = (
+            "Live chain state, read at request time. It changes as the chain "
+            "grows, so two reads a minute apart are expected to differ.")
+    else:
+        payload["status"] = "unavailable"
+        payload["chain_tip"] = None
+        payload["chain_height"] = None
+        payload["reason"] = chain.get("reason", "unknown")
+        payload["note"] = (
+            "The live chain could not be read for this request, so no state is "
+            "reported. This endpoint never returns a placeholder in place of "
+            "real state.")
+
+    payload["height_is_not_activity"] = (
+        "A liveness beacon seals a block every five minutes, so most of the "
+        "height is heartbeat rather than customer decisions. Do not read this "
+        "number as usage.")
+    payload["this_is_not_verification"] = NOT_VERIFICATION
+    payload["verify_it_yourself"] = VERIFY_ELSEWHERE
+    return payload
+
+
+def _spec():
+    return {
+        "module": MODULE_NAME,
+        "version": VERSION,
+        "route": "GET /x/sebbi_engine/state",
+        "what_it_returns": "The current chain tip and height, read at request time.",
+        "what_it_does_not_do": NOT_VERIFICATION,
+        "renamed_in_v1_1": (
+            "The action was called verify and returned status sealed. It "
+            "verified nothing, so both names were wrong. verify still answers, "
+            "and returns this same state payload under the honest names."),
+        "verify_it_yourself": VERIFY_ELSEWHERE,
+        "cost": "Free. No account, no key.",
+    }, 200
+
+
+def handle(*args, **kwargs):
+    """Dual-signature handler; autodetects call style from the first argument."""
+
+    # Legacy direct-write style: first arg is an HTTP handler
+    if args and hasattr(args[0], "send_response") and hasattr(args[0], "wfile"):
+        handler = args[0]
+        ctx = getattr(handler, "ctx", None)
+        payload = _build_payload(ctx if isinstance(ctx, dict) else None)
+        body = json.dumps(payload, indent=2).encode("utf-8")
+        try:
+            handler.send_response(200)
+            handler.send_header("Content-Type", "application/json")
+            handler.send_header("Content-Length", str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+        except Exception:
+            try:
+                handler.send_response(500)
+                handler.send_header("Content-Type", "text/plain")
+                handler.end_headers()
+                handler.wfile.write(b"sebbi_engine: response failed\n")
+            except Exception:
+                pass
+        return True
+
+    # Router style: handle(method, action, data, api_key, ctx)
+    method = args[0] if len(args) > 0 else kwargs.get("method")
+    action = args[1] if len(args) > 1 else kwargs.get("action", "")
+    ctx = args[4] if len(args) > 4 else kwargs.get("ctx")
+
+    # Tolerate action arriving as a full path
+    if isinstance(action, str) and action.startswith("/"):
+        parts = [x for x in action.strip("/").split("/") if x]
+        if len(parts) >= 3 and parts[1] == "sebbi_engine":
+            action = parts[2]
+
+    action = (action or "").strip("/").lower()
+
+    if method != "GET":
+        return {"error": "method_not_allowed", "GET": ["state", "spec"]}, 405
+
+    if action == "spec":
+        return _spec()
+
+    if action in ("state", ""):
+        return _build_payload(ctx if isinstance(ctx, dict) else None), 200
+
+    if action == "verify":
+        payload = _build_payload(ctx if isinstance(ctx, dict) else None)
+        payload["renamed"] = (
+            "This action is now /x/sebbi_engine/state. It was called verify and "
+            "returned status sealed, while verifying nothing. Same data, honest "
+            "names. Update your caller when convenient.")
+        return payload, 200
+
+    return {"error": "unknown_action", "action": action,
+            "GET": ["state", "spec"]}, 404
+
+```
 
 
 ## `modules/selfcheck.py`
@@ -1100,966 +1948,5 @@ def handle(method, action, data, api_key, ctx):
                         "tests one operator's own document and is not a joint runner."}, 200
 
     return {"error": "unknown_action", "action": action, "GET": ["status"]}, 404
-
-```
-
-
-## `modules/signed.py`
-
-953 lines, 44350 bytes
-
-```python
-"""
-Peer-signed submissions - /x/signed/<action>
-
-WHAT CHANGED IN 1.1
--------------------
-Three things, all of the same kind: a field that read stronger than it was.
-
-1. receipt_seq is a real number now.
-
-   This lane returned whatever server.py's seal() gave back for the
-   sequence, and passed the literal string "public-signed" as the api_key.
-   That is not a row in api_keys, so the UPDATE matched nothing, the SELECT
-   returned nothing, and the value was always null. The field sat in the
-   response named as though it were a receipt sequence, carrying nothing.
-
-   The point of a sequence is that a holder of receipts N and N+2 can PROVE
-   N+1 exists and was not received. A null cannot do that, so this lane had
-   no completeness property while appearing to offer one.
-
-   Found on the sibling lane at /x/peer/submit by Philip Pinol (PRAXIS),
-   whose schema required an integer and got a null. Same fault here, fixed
-   before anybody hit it. The sequence is now issued by this module, per
-   enrolled name, inside the same lock hold that writes the row.
-
-2. A failed seal no longer returns a receipt.
-
-   ctx["seal"] was called and its result used without checking. If it
-   raised or came back without a hash, this lane would have returned a
-   success body with nothing behind it - the exact hollow receipt that
-   turned up on the peer lane on 2026-08-26. It now returns 500, records
-   nothing, and says why.
-
-3. Enrolment and rotation report whether they sealed.
-
-   Both were sealing as a side effect and ignoring the outcome. The
-   operation still happens - a key is a database row and a failed audit
-   note does not un-enrol it - but the response says sealed true or false
-   with the error, rather than leaving it to be assumed.
-
-The server-wide key counter is still returned, as key_seq, and is still
-null. Reported rather than omitted so the absence is visible instead of
-inferred, which is the confusion that made this worth fixing at all.
-
-THE GAP THIS CLOSES
--------------------
-Two people arrived at the same missing piece from opposite directions on the
-same day.
-
-Ishaan (Shango MID) read the existing signed lane and said, correctly, that
-"binds a name to a secret rather than to an address" reads stronger than it
-is. An HMAC uses a shared secret. A shared secret is held by both parties. So
-it proves the submission came from SOMEONE HOLDING THE SECRET - which is the
-peer and also the operator of this deployment. It closes third-party
-submission under a peer's name. It does not close operator submission under a
-peer's name.
-
-Chidi (ViriSIM) came at it from the regulator's side: for the evidence to mean
-anything to a third party, the customer has to sign, not the platform holding
-the customer's records.
-
-Same gap. This module closes it.
-
-HOW
----
-The peer generates an Ed25519 keypair and keeps the private half. This
-deployment is given ONLY the public half. A public key is not a secret and
-grants nothing: it verifies a signature and cannot produce one.
-
-From then on, a submission under that name is accepted only if it carries a
-signature this deployment can verify against that public key - and this
-deployment CANNOT create such a signature, because it does not hold the
-private key and never has. The property is not a promise about our conduct.
-It is arithmetic.
-
-WHAT THIS MEANS FOR THE RECORD
-------------------------------
-The other lanes answer "did somebody hand us this tip". This lane answers
-"did the holder of this key hand us this tip", and the difference matters
-precisely when the operator is the party you are worried about.
-
-A regulator or auditor reading a signed observation does not have to trust
-this deployment about who submitted it. They can take the public key from
-/x/signed/keys, take the canonical message and the signature from the record,
-and check it themselves with any Ed25519 library in any language.
-
-WHAT IT STILL DOES NOT DO
--------------------------
-- It does not prove the records behind the tip are true. Nothing here does.
-- It does not prove completeness of the peer's own chain. A signed chain can
-  still omit records. Catching that needs an audit protocol, not
-  cryptography - see Chidi's incognito-user test, which is the only thing
-  anyone has proposed that attacks it. Note this is a different claim from
-  the receipt sequence below, which is about completeness of the receipts WE
-  issued, not of the records THEY sealed.
-- It does not prove who the keyholder IS. It proves the same party signed
-  each time. Identity is a separate problem and this does not solve it.
-- Enrolment is open, so the first party to enrol a name gets it. Same as
-  everywhere else in this standard, that is detection rather than
-  prevention: an enrolment is sealed, permanent and public, and an enrolment
-  placed over a name already seen in the witness log is flagged as such.
-
-WHY THE OPERATOR CANNOT QUIETLY SWAP A KEY
-------------------------------------------
-The obvious attack on the whole idea: the operator replaces the peer's public
-key with one of their own, then signs freely. So there is no route that
-overwrites a key. Rotation exists, and a rotation must itself be signed by
-the key being replaced. An operator who does not hold the current private key
-cannot rotate it, and every rotation is sealed into the chain with both keys
-recorded. A peer who has lost their key cannot rotate either - they enrol a
-new name, and the abandoned one stays visible.
-
-CANONICAL MESSAGE
------------------
-Exactly this, UTF-8, no trailing newline, four lines joined by \\n:
-
-    aileash-signed-v1
-    <chain>
-    <tip>
-    <ts>
-
-  chain  the peer name, lowercase, as enrolled
-  tip    64 lowercase hex characters
-  ts     integer epoch seconds, no decimal point
-
-Sign those bytes with the Ed25519 private key. Send the 64-byte signature as
-128 lowercase hex characters. The message is deliberately short, positional
-and free of JSON so that two implementations cannot disagree about how to
-build it.
-
-Rotation signs a different message with the SAME shape:
-
-    aileash-rotate-v1
-    <chain>
-    <new public key, 64 hex>
-    <ts>
-
-REPLAY
-------
-A signature is a bearer token for the statement it signs. Anyone who sees one
-can send it again. So: ts must be within SKEW_PAST seconds behind and
-SKEW_FUTURE ahead of our clock, ts must be strictly greater than the last ts
-we accepted for that name, and an exact repeat of a signature already stored
-is refused. None of that is exotic - it is the ordinary set, written down so
-nobody has to guess which of them we do.
-
-WHY THIS LANE REJECTS, WHEN THE OPEN LANE NEVER DOES
-----------------------------------------------------
-/x/witness/observe seals everything and describes what it sealed, because
-refusing an anonymous submission would mean deciding who is allowed to be
-recorded. This lane is the opposite case. A submission whose signature does
-not verify has no business being written into a name's history at all - the
-harm is exactly that it would sit in the record looking like an event
-involving that peer. So this lane refuses, says why, and seals nothing.
-
-    GET  /x/signed/spec                  the protocol
-    GET  /x/signed/keys                  every enrolled name and public key
-    POST /x/signed/enroll                chain, pubkey
-    POST /x/signed/submit                chain, tip, ts, signature
-    POST /x/signed/rotate                chain, new_pubkey, ts, signature
-    GET  /x/signed/verify?peer=&tip=     the receipt, with everything a third
-                                         party needs to check it themselves
-"""
-
-import hashlib
-import re
-import time
-from datetime import datetime, timezone
-
-VERSION = "1.1.1"
-HEX64 = re.compile(r"^[0-9a-f]{64}$")
-HEX128 = re.compile(r"^[0-9a-f]{128}$")
-
-MSG_PREFIX = "aileash-signed-v1"
-ROTATE_PREFIX = "aileash-rotate-v1"
-
-# Replay window. Generous enough for a batch job on a slow link, tight enough
-# that a captured signature is not useful for long.
-SKEW_PAST = 900
-SKEW_FUTURE = 120
-
-# Everything here is readable and usable without an account. A verification
-# lane that only account holders can check is not a verification lane.
-PUBLIC = {("GET", "spec"), ("GET", "keys"), ("GET", "verify"),
-          ("POST", "enroll"), ("POST", "submit"), ("POST", "rotate")}
-
-MAX_LIST = 500
-
-# What this lane files its own audit rows under. Deliberately not a real
-# api_key - it is a label, and it is exactly why server.py's per-key
-# sequence comes back null here. See _seq_note.
-FILED_UNDER = "public-signed"
-
-MESSAGES = {
-    "what_this_proves": (
-        "That the holder of the enrolled private key produced this exact "
-        "statement - name, tip and timestamp - and that we sealed it at the "
-        "recorded time. This deployment holds only the public key and cannot "
-        "produce such a signature, so it is not a claim you have to take on "
-        "our word. Recheck it yourself with any Ed25519 library."),
-    "what_this_does_not_prove": (
-        "Nothing about whether the records behind the tip are true, nothing "
-        "about whether the peer's chain is complete, and nothing about who "
-        "the keyholder is in the world. It proves the same party signed each "
-        "time."),
-    "enrolled": (
-        "This name is now bound to this public key permanently. We cannot "
-        "change it - rotation requires a signature from the key being "
-        "replaced, which we do not hold."),
-    "keys_note": (
-        "Public keys are not secrets. They are published so that anyone can "
-        "verify a signed observation without asking us for anything."),
-    "seq": (
-        "An integer, never null, incremented by exactly one for each accepted "
-        "submission UNDER THIS NAME on this lane. Issued inside the same lock "
-        "that writes the record, so a number is never spent on a submission "
-        "that was not stored. Two receipts numbered N and N+2 prove a third "
-        "exists that you did not receive. The current highest is published at "
-        "/x/signed/keys, so the check does not depend on asking us."),
-    "key_seq": (
-        "The server-wide per-API-key sequence, which is null on this lane and "
-        "always will be. That counter lives on an api_key row, and this lane "
-        "files under a label rather than a key because it authenticates by "
-        "signature and issues nobody an account. It is returned rather than "
-        "omitted so the absence is visible instead of inferred. Before 1.1 "
-        "this null was reported as receipt_seq, which made a missing property "
-        "look like a broken field."),
-    "seq_survives_rotation": (
-        "Rotating the key does not reset the sequence. It belongs to the "
-        "name's submission history rather than to the key, so a rotation "
-        "cannot be used to erase a gap."),
-}
-
-_ready = False
-
-
-# ----------------------------------------------------------------------
-# Ed25519 verification, RFC 8032, pure standard library
-#
-# Deliberately no third-party dependency. This deployment runs on a small
-# box and a verification routine that needs a native extension is a
-# verification routine that stops working on a platform migration. Extended
-# homogeneous coordinates so a verify is milliseconds rather than seconds.
-#
-# Verify only. There is no signing function in this file, and that is not an
-# oversight - there is nothing here that could be turned into a way for this
-# deployment to produce a peer's signature.
-# ----------------------------------------------------------------------
-
-_P = 2 ** 255 - 19
-_L = 2 ** 252 + 27742317777372353535851937790883648493
-_D = -121665 * pow(121666, _P - 2, _P) % _P
-_I = pow(2, (_P - 1) // 4, _P)
-
-
-def _xrecover(y):
-    xx = (y * y - 1) * pow(_D * y * y + 1, _P - 2, _P)
-    x = pow(xx, (_P + 3) // 8, _P)
-    if (x * x - xx) % _P != 0:
-        x = (x * _I) % _P
-    if x % 2 != 0:
-        x = _P - x
-    return x
-
-
-_BY = 4 * pow(5, _P - 2, _P) % _P
-_BX = _xrecover(_BY)
-_B = (_BX % _P, _BY % _P, 1, _BX * _BY % _P)
-
-
-def _add(p, q):
-    x1, y1, z1, t1 = p
-    x2, y2, z2, t2 = q
-    a = (y1 - x1) * (y2 - x2) % _P
-    b = (y1 + x1) * (y2 + x2) % _P
-    c = t1 * 2 * _D * t2 % _P
-    dd = z1 * 2 * z2 % _P
-    e = b - a
-    f = dd - c
-    g = dd + c
-    h = b + a
-    return (e * f % _P, g * h % _P, f * g % _P, e * h % _P)
-
-
-def _double(p):
-    return _add(p, p)
-
-
-def _scalarmult(p, e):
-    if e == 0:
-        return (0, 1, 1, 0)
-    q = _scalarmult(p, e >> 1)
-    q = _double(q)
-    if e & 1:
-        q = _add(q, p)
-    return q
-
-
-def _decodepoint(raw):
-    y = int.from_bytes(raw, "little") & ((1 << 255) - 1)
-    if y >= _P:
-        return None
-    x = _xrecover(y)
-    if x & 1 != (raw[31] >> 7) & 1:
-        x = _P - x
-    point = (x, y, 1, x * y % _P)
-    # on-curve check: -x^2 + y^2 = 1 + d x^2 y^2
-    if (-x * x + y * y - 1 - _D * x * x * y * y) % _P != 0:
-        return None
-    return point
-
-
-def _equal(p, q):
-    x1, y1, z1, _t1 = p
-    x2, y2, z2, _t2 = q
-    if (x1 * z2 - x2 * z1) % _P != 0:
-        return False
-    if (y1 * z2 - y2 * z1) % _P != 0:
-        return False
-    return True
-
-
-def ed25519_verify(public_key, message, signature):
-    """True if signature is a valid Ed25519 signature of message under
-    public_key. Bytes in, bool out, never raises."""
-    try:
-        if len(public_key) != 32 or len(signature) != 64:
-            return False
-        a = _decodepoint(public_key)
-        if a is None:
-            return False
-        r_raw = signature[:32]
-        r = _decodepoint(r_raw)
-        if r is None:
-            return False
-        s = int.from_bytes(signature[32:], "little")
-        if s >= _L:
-            return False
-        h = int.from_bytes(
-            hashlib.sha512(r_raw + public_key + message).digest(), "little") % _L
-        left = _scalarmult(_B, s)
-        right = _add(r, _scalarmult(a, h))
-        return _equal(left, right)
-    except Exception:
-        return False
-
-
-# ----------------------------------------------------------------------
-# storage
-# ----------------------------------------------------------------------
-
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        c = ctx["conn"]
-        c.execute("CREATE TABLE IF NOT EXISTS signed_keys("
-                  "peer TEXT PRIMARY KEY,pubkey TEXT,enrolled REAL,"
-                  "audit_hash TEXT,block_index INTEGER,"
-                  "rotations INTEGER DEFAULT 0,last_ts REAL,note TEXT)")
-        c.execute("CREATE TABLE IF NOT EXISTS signed_log("
-                  "id INTEGER PRIMARY KEY AUTOINCREMENT,peer TEXT,tip TEXT,"
-                  "peer_ts REAL,observed REAL,signature TEXT,pubkey TEXT,"
-                  "audit_hash TEXT,block_index INTEGER)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_sig_peer ON signed_log(peer,id)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_sig_tip ON signed_log(tip)")
-
-        # Added in 1.1. The receipt counter, per enrolled name, in its own
-        # table so the counter survives anything that happens to the key row
-        # - including a rotation. A rotation that reset the sequence could be
-        # used to erase a gap, which is the one thing the sequence exists to
-        # make impossible.
-        c.execute("CREATE TABLE IF NOT EXISTS signed_seq("
-                  "peer TEXT PRIMARY KEY, last_seq INTEGER DEFAULT 0)")
-        c.commit()
-    _ready = True
-
-
-def _iso(ts):
-    if not ts:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
-
-def _peer_name(data):
-    return str(data.get("chain") or data.get("peer") or "").strip().lower()
-
-
-def _key_row(ctx, peer):
-    with ctx["lock"]:
-        return ctx["conn"].execute(
-            "SELECT pubkey,enrolled,audit_hash,block_index,rotations,last_ts "
-            "FROM signed_keys WHERE peer=?", (peer,)).fetchone()
-
-
-def _latest_seq(ctx, peer):
-    """Highest receipt number issued to this name. 0 if none."""
-    try:
-        with ctx["lock"]:
-            row = ctx["conn"].execute(
-                "SELECT last_seq FROM signed_seq WHERE peer=?", (peer,)).fetchone()
-        return int(row[0]) if row and row[0] is not None else 0
-    except Exception:
-        return 0
-
-
-def _try_seal(ctx, event, result, when, api_key):
-    """Seal, and say plainly whether it worked.
-
-    Returns (audit_hash, block_index, key_seq, error). Nothing here swallows
-    a failure. Before 1.1 the result was used without checking, which is how
-    a hollow receipt gets issued.
-    """
-    try:
-        h, idx, seq = ctx["seal"](event, result, when, api_key)
-    except Exception as exc:
-        return None, None, None, "%s: %s" % (type(exc).__name__, str(exc)[:300])
-    if not h:
-        return None, None, None, "seal returned no audit hash"
-    return h, idx, seq, None
-
-
-def _seen_in_open_lane(ctx, peer):
-    """Has this name already appeared in the open witness log?
-
-    An enrolment over a name somebody else has been using is the same shape as
-    the url squat, and gets the same treatment: we cannot prevent it, so we
-    record it permanently at the moment it happens.
-    """
-    try:
-        with ctx["lock"]:
-            row = ctx["conn"].execute(
-                "SELECT COUNT(*) FROM witness_log WHERE peer=?", (peer,)).fetchone()
-        return int(row[0]) if row else 0
-    except Exception:
-        return 0
-
-
-def _check_ts(ts, last_ts):
-    now = time.time()
-    if ts > now + SKEW_FUTURE:
-        return False, ("timestamp is %d seconds in the future; limit is %d"
-                       % (int(ts - now), SKEW_FUTURE))
-    if ts < now - SKEW_PAST:
-        return False, ("timestamp is %d seconds old; limit is %d"
-                       % (int(now - ts), SKEW_PAST))
-    if last_ts is not None and ts <= last_ts:
-        return False, ("timestamp %d is not later than the last one accepted "
-                       "for this name (%d) - a signature cannot be replayed "
-                       "and submissions must move forward"
-                       % (int(ts), int(last_ts)))
-    return True, None
-
-
-# ----------------------------------------------------------------------
-# routes
-# ----------------------------------------------------------------------
-
-def _enroll(ctx, data):
-    peer = _peer_name(data)
-    if not peer or len(peer) > 80:
-        return {"error": "chain_required",
-                "message": "A short stable identifier - a domain works well."}, 400
-    pubkey = str(data.get("pubkey") or data.get("public_key") or "").strip().lower()
-    if not HEX64.match(pubkey):
-        return {"error": "invalid_pubkey",
-                "message": "An Ed25519 public key is 32 bytes - 64 lowercase "
-                           "hex characters. Send the public half only. Never "
-                           "send us a private key; we have no use for one and "
-                           "no route that accepts one."}, 400
-    if _decodepoint(bytes.fromhex(pubkey)) is None:
-        return {"error": "invalid_pubkey",
-                "message": "That value is 64 hex characters but is not a "
-                           "point on the curve, so it is not an Ed25519 "
-                           "public key."}, 400
-
-    existing = _key_row(ctx, peer)
-    if existing:
-        if existing[0] == pubkey:
-            return {"already_enrolled": True, "chain": peer, "pubkey": pubkey,
-                    "enrolled_at": _iso(existing[1]),
-                    "block_index": existing[3],
-                    "latest_receipt_seq": _latest_seq(ctx, peer),
-                    "message": "This name is already bound to this key. "
-                               "Nothing changed."}, 200
-        return {"error": "name_already_enrolled", "chain": peer,
-                "enrolled_pubkey": existing[0],
-                "enrolled_at": _iso(existing[1]),
-                "message": "This name is bound to a different key. We do not "
-                           "overwrite a binding. If you hold the enrolled "
-                           "private key, use /x/signed/rotate. If you do not, "
-                           "this name is not available to you and this "
-                           "attempt is not sealed."}, 409
-
-    prior = _seen_in_open_lane(ctx, peer)
-    ts = time.time()
-    note = "enrolled"
-    if prior:
-        note = ("WARNING: this name had already been submitted %d time(s) to "
-                "the open witness lane before this key was enrolled, so it "
-                "was not a fresh name when it was claimed" % prior)
-
-    ev = {"user_id": "sig:" + peer, "action": "signed_key_enrolled", "amount": 0,
-          "country": "UK", "device_id": "signed", "anomaly": 0, "device_risk": 0}
-    res = {"decision": "KEY_ENROLLED", "score": 0, "signed_version": VERSION,
-           "peer": peer, "pubkey": pubkey, "timestamp": ts, "detail": note}
-    h, idx, _seq, seal_error = _try_seal(ctx, ev, res, ts, FILED_UNDER)
-
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "INSERT INTO signed_keys(peer,pubkey,enrolled,audit_hash,"
-            "block_index,rotations,last_ts,note) VALUES(?,?,?,?,?,0,NULL,?)",
-            (peer, pubkey, ts, h, idx, note))
-        ctx["conn"].execute(
-            "INSERT OR IGNORE INTO signed_seq(peer,last_seq) VALUES(?,0)", (peer,))
-        ctx["conn"].commit()
-
-    out = {"enrolled": True, "chain": peer, "pubkey": pubkey,
-           "enrolled_at": _iso(ts), "sealed_in_our_chain": h,
-           "block_index": idx, "signed_version": VERSION,
-           "sealed": seal_error is None,
-           "latest_receipt_seq": 0,
-           "message": MESSAGES["enrolled"],
-           "canonical_message": _canonical_help(peer),
-           "submit": "/x/signed/submit"}
-    if seal_error:
-        out["seal_error"] = seal_error
-        out["seal_note"] = ("The key is enrolled and usable - it is a database "
-                            "row and a failed audit note does not un-enrol it. "
-                            "But the record of the enrolment did not seal, "
-                            "which is a fault worth chasing and is reported "
-                            "rather than hidden.")
-    if prior:
-        out["flag"] = note
-    return out, 200
-
-
-def _canonical_help(peer):
-    return {"format": MSG_PREFIX + "\\n<chain>\\n<tip>\\n<ts>",
-            "example_for_this_name": MSG_PREFIX + "\\n" + peer +
-                                     "\\n<64 hex tip>\\n<integer epoch seconds>",
-            "encoding": "UTF-8, no trailing newline, lines joined with a "
-                        "single \\n",
-            "signature": "Ed25519 over those bytes, sent as 128 lowercase hex"}
-
-
-def _submit(ctx, data):
-    peer = _peer_name(data)
-    if not peer:
-        return {"error": "chain_required"}, 400
-    row = _key_row(ctx, peer)
-    if not row:
-        return {"error": "not_enrolled", "chain": peer,
-                "message": "No public key is enrolled for this name. Enrol at "
-                           "/x/signed/enroll, or use the open lane at "
-                           "/x/witness/observe which needs nothing."}, 404
-    pubkey, _enrolled, _h, _idx, _rot, last_ts = row
-
-    tip = str(data.get("tip", "")).strip().lower()
-    if not HEX64.match(tip):
-        return {"error": "invalid_tip",
-                "message": "A tip is 64 hex characters - a SHA-256 chain head."}, 400
-    signature = str(data.get("signature") or data.get("sig") or "").strip().lower()
-    if not HEX128.match(signature):
-        return {"error": "invalid_signature_format",
-                "message": "An Ed25519 signature is 64 bytes - 128 lowercase "
-                           "hex characters."}, 400
-    raw_ts = data.get("ts", data.get("peer_ts"))
-    try:
-        ts_int = int(raw_ts)
-    except (TypeError, ValueError):
-        return {"error": "invalid_ts",
-                "message": "ts must be integer epoch seconds, and must be the "
-                           "same value you signed."}, 400
-
-    ok, why = _check_ts(ts_int, last_ts)
-    if not ok:
-        return {"error": "timestamp_rejected", "message": why,
-                "our_time": int(time.time())}, 400
-
-    with ctx["lock"]:
-        dup = ctx["conn"].execute(
-            "SELECT observed FROM signed_log WHERE peer=? AND signature=? LIMIT 1",
-            (peer, signature)).fetchone()
-    if dup:
-        return {"error": "replayed_signature",
-                "message": "This exact signature was already accepted at %s."
-                           % _iso(dup[0])}, 409
-
-    message = "\n".join([MSG_PREFIX, peer, tip, str(ts_int)]).encode("utf-8")
-    if not ed25519_verify(bytes.fromhex(pubkey), message, bytes.fromhex(signature)):
-        return {"error": "signature_did_not_verify",
-                "chain": peer,
-                "message": "Nothing has been sealed. The signature does not "
-                           "verify against the key enrolled for this name. "
-                           "The usual cause is a canonical message built "
-                           "differently - check it byte for byte below.",
-                "we_verified_against": _canonical_help(peer),
-                "the_exact_bytes_we_hashed":
-                    "\n".join([MSG_PREFIX, peer, tip, str(ts_int)]),
-                "enrolled_pubkey": pubkey}, 400
-
-    observed = time.time()
-    detail = ("peer=" + peer + ";tip=" + tip + ";ts=" + str(ts_int) +
-              ";pubkey=" + pubkey + ";sig=" + signature)
-    ev = {"user_id": "sig:" + peer, "action": "signed_tip_observed", "amount": 0,
-          "country": "UK", "device_id": "signed", "anomaly": 0, "device_risk": 0}
-    res = {"decision": "SIGNED_TIP_SEALED", "score": 0, "signed_version": VERSION,
-           "peer": peer, "peer_tip": tip, "timestamp": observed,
-           "verification": "peer-signed", "detail": detail}
-
-    # Seal FIRST, and only claim success if it produced a hash. A signed
-    # submission that returns a receipt with no block behind it is worse than
-    # a refusal, because the peer has no way to tell the difference without
-    # going and looking at the chain.
-    h, idx, key_seq, seal_error = _try_seal(ctx, ev, res, observed, FILED_UNDER)
-    if seal_error:
-        return {"ok": False, "accepted": False, "error": "seal_failed",
-                "chain": peer, "tip": tip,
-                "detail": "Your signature verified correctly, but the audit "
-                          "chain did not seal the submission, so there is no "
-                          "receipt to give you. This is a fault on this "
-                          "deployment and not a problem with your submission.",
-                "seal_error": seal_error,
-                "recorded": False,
-                "retry": "Nothing was written. No sequence number was spent "
-                         "and your signature is not recorded as used, so a "
-                         "fresh submission with a later ts can be sent once "
-                         "this is fixed.",
-                "observed_at": _iso(observed)}, 500
-
-    # Issue the receipt number inside the same lock hold that writes the row.
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "INSERT OR IGNORE INTO signed_seq(peer,last_seq) VALUES(?,0)", (peer,))
-        ctx["conn"].execute(
-            "UPDATE signed_seq SET last_seq = COALESCE(last_seq,0) + 1 "
-            "WHERE peer=?", (peer,))
-        srow = ctx["conn"].execute(
-            "SELECT last_seq FROM signed_seq WHERE peer=?", (peer,)).fetchone()
-        receipt_seq = int(srow[0]) if srow and srow[0] is not None else None
-
-        ctx["conn"].execute(
-            "INSERT INTO signed_log(peer,tip,peer_ts,observed,signature,"
-            "pubkey,audit_hash,block_index) VALUES(?,?,?,?,?,?,?,?)",
-            (peer, tip, float(ts_int), observed, signature, pubkey, h, idx))
-        ctx["conn"].execute("UPDATE signed_keys SET last_ts=? WHERE peer=?",
-                            (float(ts_int), peer))
-        ctx["conn"].commit()
-
-    # Mirror into the open witness log so the peer appears on the public
-    # roster alongside everyone else. Guarded: the roster is a convenience
-    # and the seal above is the evidence, so a failure here must not turn a
-    # good submission into an error.
-    mirrored = False
-    try:
-        with ctx["lock"]:
-            ctx["conn"].execute(
-                "INSERT INTO witness_log(api_key,peer,tip,peer_ts,observed,"
-                "audit_hash,block_index,note,url,liveness,name_status) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                (FILED_UNDER, peer, tip, float(ts_int), observed, h, idx,
-                 "signed submission - verified against enrolled Ed25519 key",
-                 None, "peer-signed", "key-bound"))
-            ctx["conn"].commit()
-        mirrored = True
-    except Exception:
-        pass
-
-    return {"chain": peer, "witnessed_tip": tip, "observed_at": _iso(observed),
-            "peer_claimed_time": _iso(ts_int),
-            "sealed_in_our_chain": h, "block_index": idx,
-            "receipt_seq": receipt_seq,
-            "receipt_seq_scope": "per-chain",
-            "key_seq": key_seq,
-            "verification": "peer-signed",
-            "verified_against_pubkey": pubkey,
-            "on_public_roster": mirrored,
-            "signed_version": VERSION,
-            "verify": "/x/signed/verify?peer=" + peer + "&tip=" + tip,
-            "gapless": MESSAGES["seq"],
-            "key_seq_note": MESSAGES["key_seq"],
-            "what_this_proves": MESSAGES["what_this_proves"],
-            "what_this_does_not_prove": MESSAGES["what_this_does_not_prove"]}, 200
-
-
-def _rotate(ctx, data):
-    peer = _peer_name(data)
-    row = _key_row(ctx, peer)
-    if not row:
-        return {"error": "not_enrolled", "chain": peer}, 404
-    current, _enrolled, _h, _idx, rotations, last_ts = row
-
-    new_pubkey = str(data.get("new_pubkey") or data.get("pubkey") or "").strip().lower()
-    if not HEX64.match(new_pubkey) or _decodepoint(bytes.fromhex(new_pubkey)) is None:
-        return {"error": "invalid_pubkey",
-                "message": "new_pubkey must be an Ed25519 public key - 64 "
-                           "lowercase hex characters."}, 400
-    if new_pubkey == current:
-        return {"error": "no_change",
-                "message": "That is already the enrolled key."}, 400
-    signature = str(data.get("signature") or data.get("sig") or "").strip().lower()
-    if not HEX128.match(signature):
-        return {"error": "invalid_signature_format"}, 400
-    try:
-        ts_int = int(data.get("ts"))
-    except (TypeError, ValueError):
-        return {"error": "invalid_ts"}, 400
-    ok, why = _check_ts(ts_int, last_ts)
-    if not ok:
-        return {"error": "timestamp_rejected", "message": why,
-                "our_time": int(time.time())}, 400
-
-    message = "\n".join([ROTATE_PREFIX, peer, new_pubkey, str(ts_int)]).encode("utf-8")
-    if not ed25519_verify(bytes.fromhex(current), message, bytes.fromhex(signature)):
-        return {"error": "signature_did_not_verify",
-                "message": "Nothing has been changed. A rotation must be "
-                           "signed by the key being replaced. This is what "
-                           "stops anyone - including the operator of this "
-                           "deployment - swapping a peer's key.",
-                "we_verified_against": {
-                    "format": ROTATE_PREFIX + "\\n<chain>\\n<new pubkey>\\n<ts>",
-                    "the_exact_bytes_we_hashed":
-                        "\n".join([ROTATE_PREFIX, peer, new_pubkey,
-                                   str(ts_int)])},
-                "signed_by_key_expected": current}, 400
-
-    ts = time.time()
-    ev = {"user_id": "sig:" + peer, "action": "signed_key_rotated", "amount": 0,
-          "country": "UK", "device_id": "signed", "anomaly": 0, "device_risk": 0}
-    res = {"decision": "KEY_ROTATED", "score": 0, "signed_version": VERSION,
-           "peer": peer, "timestamp": ts,
-           "detail": "from=" + current + ";to=" + new_pubkey +
-                     ";authorised_by=" + current}
-    h, idx, _seq, seal_error = _try_seal(ctx, ev, res, ts, FILED_UNDER)
-
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "UPDATE signed_keys SET pubkey=?,rotations=?,last_ts=? WHERE peer=?",
-            (new_pubkey, (rotations or 0) + 1, float(ts_int), peer))
-        ctx["conn"].commit()
-
-    out = {"rotated": True, "chain": peer, "previous_pubkey": current,
-           "pubkey": new_pubkey, "rotations": (rotations or 0) + 1,
-           "sealed_in_our_chain": h, "block_index": idx,
-           "sealed": seal_error is None,
-           "latest_receipt_seq": _latest_seq(ctx, peer),
-           "signed_version": VERSION,
-           "sequence_note": MESSAGES["seq_survives_rotation"],
-           "message": "Rotation sealed. Both keys are permanently in the "
-                      "chain, so the history of this name's keys is public "
-                      "and cannot be tidied up later."}
-    if seal_error:
-        out["seal_error"] = seal_error
-        out["message"] = ("The rotation took effect and the new key is live. "
-                          "The audit note about it did not seal, which is "
-                          "reported rather than hidden.")
-    return out, 200
-
-
-def _keys(ctx):
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT k.peer,k.pubkey,k.enrolled,k.block_index,k.rotations,k.note,"
-            "COALESCE(s.last_seq,0) FROM signed_keys k "
-            "LEFT JOIN signed_seq s ON s.peer = k.peer "
-            "ORDER BY k.enrolled ASC LIMIT ?", (MAX_LIST,)).fetchall()
-    out = []
-    for peer, pubkey, enrolled, idx, rotations, note, seq in rows:
-        entry = {"chain": peer, "pubkey": pubkey, "algorithm": "ed25519",
-                 "enrolled_at": _iso(enrolled), "enrolment_block": idx,
-                 "rotations": rotations or 0,
-                 "latest_receipt_seq": seq or 0}
-        if note and note.startswith("WARNING"):
-            entry["flag"] = note
-        out.append(entry)
-    return {"count": len(out), "keys": out, "signed_version": VERSION,
-            "note": MESSAGES["keys_note"],
-            "receipt_seq_note": (
-                "latest_receipt_seq is the highest receipt number issued to "
-                "that name on this lane. A keyholder whose own highest "
-                "receipt is lower than this has not received one of them, and "
-                "can say exactly how many. Public on purpose - a gap you can "
-                "only see from the inside is not evidence of anything."),
-            "how_to_check_a_record": (
-                "Take the pubkey from here, rebuild the canonical message "
-                "from the record at /x/signed/verify, and check the signature "
-                "with any Ed25519 implementation. You do not need anything "
-                "from us to do it and you do not have to believe us.")}, 200
-
-
-def _verify(ctx, data):
-    peer = str(data.get("peer", "")).strip().lower()
-    tip = str(data.get("tip", "")).strip().lower()
-    if not peer or not tip:
-        return {"error": "peer_and_tip_required",
-                "usage": "/x/signed/verify?peer=<name>&tip=<64 hex>"}, 400
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT observed,peer_ts,signature,pubkey,audit_hash,block_index "
-            "FROM signed_log WHERE peer=? AND tip=? ORDER BY id ASC",
-            (peer, tip)).fetchall()
-    if not rows:
-        return {"signed_observation": False, "peer": peer, "tip": tip,
-                "message": "We hold no signed observation of this tip from "
-                           "this name. It may still be in the open lane - "
-                           "check /x/witness/attest."}, 404
-    observed, peer_ts, signature, pubkey, h, idx = rows[0]
-    ts_int = int(peer_ts)
-    return {"signed_observation": True, "chain": peer, "tip": tip,
-            "observed_at": _iso(observed), "peer_claimed_time": _iso(peer_ts),
-            "sealed_in_our_chain": h, "block_index": idx,
-            "times_observed": len(rows),
-            "latest_receipt_seq": _latest_seq(ctx, peer),
-            "signature": signature, "pubkey": pubkey, "algorithm": "ed25519",
-            "canonical_message": "\n".join([MSG_PREFIX, peer, tip, str(ts_int)]),
-            "canonical_message_bytes_note": (
-                "Those four lines joined by a single newline, UTF-8, no "
-                "trailing newline. Hash nothing yourself - Ed25519 takes the "
-                "message, not a digest of it."),
-            "signed_version": VERSION,
-            "what_this_proves": MESSAGES["what_this_proves"],
-            "what_this_does_not_prove": MESSAGES["what_this_does_not_prove"],
-            "recheck_it_yourself": (
-                "python: pip install pynacl, then "
-                "nacl.signing.VerifyKey(bytes.fromhex(pubkey))"
-                ".verify(canonical_message.encode(), bytes.fromhex(signature))")}, 200
-
-
-def _spec():
-    return {"signed_version": VERSION,
-            "what_this_lane_is": (
-                "Submissions signed by a key this deployment does not hold. "
-                "The open lane at /x/witness/observe proves somebody handed "
-                "us a tip. This lane proves the holder of a specific private "
-                "key did - including against us, because we only ever hold "
-                "the public half."),
-            "why_it_exists": (
-                "The HMAC lane binds a name to a shared secret, and a shared "
-                "secret is held by both parties. It closes third-party "
-                "submission under your name and does not close operator "
-                "submission under your name. This lane closes both, and it "
-                "does so by arithmetic rather than by our promise."),
-            "steps": [
-                "1. Generate an Ed25519 keypair. Keep the private half. It "
-                "never leaves your side and we have no route that accepts one.",
-                "2. POST /x/signed/enroll with {\"chain\":\"<name>\","
-                "\"pubkey\":\"<64 hex>\"}.",
-                "3. Build the canonical message, sign it, and POST "
-                "/x/signed/submit with {\"chain\",\"tip\",\"ts\",\"signature\"}.",
-                "4. GET /x/signed/verify?peer=&tip= for the receipt, which "
-                "carries everything a third party needs to recheck it "
-                "without us.",
-            ],
-            "canonical_message": {
-                "submit": MSG_PREFIX + "\\n<chain>\\n<tip>\\n<ts>",
-                "rotate": ROTATE_PREFIX + "\\n<chain>\\n<new pubkey>\\n<ts>",
-                "encoding": "UTF-8, single \\n between lines, no trailing "
-                            "newline. ts is integer epoch seconds.",
-            },
-            "replay_controls": {
-                "max_age_seconds": SKEW_PAST,
-                "max_future_seconds": SKEW_FUTURE,
-                "monotonic": "ts must be strictly greater than the last ts "
-                             "accepted for the name",
-                "duplicate_signatures": "refused",
-            },
-            "on_acceptance": {
-                "receipt_seq": MESSAGES["seq"],
-                "receipt_seq_scope": {'values': ['per-peer', 'per-name', 'per-chain'], 'per-peer': 'issued per registered peer_id. Used by /x/peer/submit.', 'per-name': 'issued per bound name. Used by /x/bind/submit.', 'per-chain': 'issued per enrolled chain name. Used by /x/signed/submit.', 'why_it_is_here': 'The three signed lanes each count within their own scope, so a receipt carries the scope of its own sequence rather than requiring the holder to remember which lane produced it. The set is closed: a value outside this list is an error on our side, not a new scope you should widen a schema for.', 'not_comparable_across_scopes': 'Two receipts with different scopes are counting different things and their numbers say nothing about each other.'},
-                "key_seq": MESSAGES["key_seq"],
-                "sequence_survives_rotation": MESSAGES["seq_survives_rotation"],
-                "seal_failure": (
-                    "If the audit chain does not seal your submission you get "
-                    "500 seal_failed with the reason, and nothing is "
-                    "recorded - no sequence number, no log row, no receipt. "
-                    "Send a fresh submission with a later ts once the fault "
-                    "is fixed. A receipt you cannot verify is worse than no "
-                    "receipt, so this lane will not issue one."),
-                "two_different_completeness_claims": (
-                    "receipt_seq is about completeness of the receipts WE "
-                    "issued to you. It says nothing about completeness of the "
-                    "records YOUR chain sealed, which no signature can reach "
-                    "and which is listed under honest_limits."),
-            },
-            "this_lane_rejects": (
-                "Unlike the open lane, a submission that does not verify is "
-                "refused and nothing is sealed. Writing an unverifiable "
-                "signature into a name's history is the harm, not the "
-                "protection."),
-            "key_rotation": (
-                "A rotation must be signed by the key being replaced. Nobody "
-                "who lacks the current private key can rotate it, this "
-                "deployment included, and every rotation is sealed with both "
-                "keys recorded."),
-            "honest_limits": [
-                "Does not prove the records behind the tip are true.",
-                "Does not prove the peer's own chain is complete. Catching an "
-                "omission there needs an audit protocol, not cryptography.",
-                "Does not prove who the keyholder is in the world - only that "
-                "the same party signed each time.",
-                "Enrolment is open, so the first party to enrol a name gets "
-                "it. An enrolment over a name already seen in the open lane "
-                "is flagged permanently, which is detection and not "
-                "prevention.",
-                "receipt_seq proves you are missing a receipt. It does not "
-                "prove why, and it cannot distinguish a lost response from "
-                "one that was never sent.",
-            ],
-            "changed_in_1_1_1": [
-                "receipt_seq_scope is now a bare token from a closed set - "
-                "per-peer, per-name, per-chain - rather than a sentence, "
-                "and the set is published so a closed schema can pin an "
-                "enum. Asked for by Philip Pinol (PRAXIS). Value change "
-                "only; the response shape is unchanged from 1.1.",
-            ],
-            "changed_in_1_1": [
-                "receipt_seq is a real per-chain gapless sequence issued by "
-                "this module, not the api_key counter that was always null "
-                "here because this lane files under a label rather than a "
-                "key. The completeness property applies to this lane for the "
-                "first time.",
-                "The api_key counter is still returned, as key_seq, and is "
-                "null by design so the absence is stated rather than hidden.",
-                "A failed seal returns 500 and records nothing, instead of "
-                "returning a receipt with no block behind it.",
-                "Enrolment and rotation report sealed true or false with the "
-                "error, rather than sealing as a side effect and ignoring "
-                "the outcome.",
-                "/x/signed/keys publishes latest_receipt_seq per name.",
-            ],
-            "what_this_proves": MESSAGES["what_this_proves"],
-            "what_this_does_not_prove": MESSAGES["what_this_does_not_prove"]}, 200
-
-
-def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-    if method == "POST":
-        if action == "enroll":
-            return _enroll(ctx, data)
-        if action == "submit":
-            return _submit(ctx, data)
-        if action == "rotate":
-            return _rotate(ctx, data)
-    else:
-        if action == "spec":
-            return _spec()
-        if action == "keys":
-            return _keys(ctx)
-        if action == "verify":
-            return _verify(ctx, data)
-    return {"error": "unknown_action", "action": action}, 404
 
 ```

@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-157 files across 42 parts.
+158 files across 42 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -123,24 +123,25 @@ Generated automatically on every push. Do not edit by hand.
 - `modules/router.py`
 - `modules/rulebind.py`
 - `modules/savings.py`
-- `modules/sebbi_engine.py`
 
 ## [CODEBASE-20.md](CODEBASE-20.md)
 
+- `modules/sebbi_adapter.py`
+- `modules/sebbi_engine.py`
 - `modules/selfcheck.py`
-- `modules/signed.py`
 
 ## [CODEBASE-21.md](CODEBASE-21.md)
 
+- `modules/signed.py`
 - `modules/sortition.py`
 - `modules/spec.py`
 - `modules/standard.py`
-- `modules/standing.py`
-- `modules/startpage.py`
-- `modules/stats.py`
 
 ## [CODEBASE-22.md](CODEBASE-22.md)
 
+- `modules/standing.py`
+- `modules/startpage.py`
+- `modules/stats.py`
 - `modules/studio.py`
 
 ## [CODEBASE-23.md](CODEBASE-23.md)
