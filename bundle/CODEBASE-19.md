@@ -1,1460 +1,9 @@
 # Codebase — part 19 of 42
 
 Contains:
-- `modules/roster.py`
-- `modules/router.py`
-- `modules/rulebind.py`
 - `modules/savings.py`
-
-
-## `modules/roster.py`
-
-604 lines, 26550 bytes
-
-```python
-"""modules/roster.py v1.4 - the canonical network list.
-
-Publishes every party that has submitted a tip here, so a peer's sync can
-witness everybody rather than just whoever introduced them. Witnesses
-nothing itself.
-
-v1.4 - the decaying fields.
-hours_since and status are computed when the response is generated and
-are wrong the moment the document is cached. A stale copy served every
-peer at hours_since 0.0 and status current, against this route's own
-six-hour definition, while how_to_use tells peers to poll it. Rewording
-does not reach that. So the response now carries the epoch it was
-generated at, an explicit freshness block, and every decaying field is
-marked as computed-at-generation. A reader can compare generated_epoch
-against their own clock and discard a document that has aged.
-Found by Ishaan (Shango MID) in a stale read of this route.
-
-v1.3 fixed three read-side faults from the same reviewer: the bound /
-unbound disagreement with /x/bind/name, witnessable claiming more than it
-checked, and the unbound wording asserting unreachability.
-
-Nothing here seals. This module only reads.
-"""
-
-import time
-
-VERSION = "1.4"
-
-PUBLIC = {("GET", "list"), ("GET", "spec"), ("GET", "health")}
-
-CURRENT_UNDER_HOURS = 6
-SILENT_AFTER_HOURS = 48
-
-# How long this document's decaying fields stay meaningful. Past this, a
-# reader should refetch rather than believe hours_since.
-FRESH_FOR_SECONDS = 120
-
-SELF_CHAIN = "sebbi.pro"
-SELF_TIP = "https://sebbi.pro/x/witness/tip"
-SELF_OBSERVE = "https://sebbi.pro/x/witness/observe"
-SELF_SIGNED = "https://sebbi.pro/x/signed/submit"
-
-DECAYING_FIELDS = ("hours_since", "status", "generated", "generated_epoch")
-
-LIVENESS_VOCABULARY = {
-    "self-consistent": "The url the submitter gave served exactly the tip "
-        "the submitter sent. Both halves came from the submitter, so this "
-        "records self-consistency - NOT verification by us or anyone else.",
-    "confirmed": "The same check as self-consistent, under the name used "
-        "before witness v1.2. Sealed blocks cannot be altered, so older "
-        "records still carry the original word.",
-    "live": "The url served a valid but different tip. A chain that moves "
-        "between submitting and our fetching is normal, not a failure.",
-    "self-declared": "Either no url was given, or the url did not return "
-        "JSON we could read a tip from. Taken on the submitter's word and "
-        "checked by nobody. Not a finding about reachability - a page "
-        "serving HTML is reachable and still lands here.",
-    "peer-signed": "Submitted through /x/signed/submit and verified against "
-        "an Ed25519 public key the submitter enrolled. We hold only the "
-        "public half, so we could not have produced that signature.",
-    "self": "This deployment's own entry. Not a check of anything.",
-    "unchecked": "Recorded before liveness checking existed.",
-}
-
-NAME_VOCABULARY = {
-    "first-use": "First time this name was seen with a url that returned a "
-        "tip in JSON, so the name is bound to that address network-wide. A "
-        "later submission from a different address records as conflict.",
-    "bound": "Submitted from the same url this name was first bound to.",
-    "conflict": "Submitted from a different address than the one it was "
-        "first bound to. Not proof of theft - operators move hosts - but "
-        "it is the event an auditor needs to see.",
-    "unbound": "No url has yet returned a tip in JSON under this name on "
-        "the open lane, so there is nothing here to bind the name to an "
-        "address. This says nothing about whether the url is reachable: a "
-        "url serving HTML is reachable and still leaves a name unbound. An "
-        "unbound name stays claimable on the open lane by whoever next "
-        "submits it WITH a url that returns JSON - unless a credential or "
-        "key is held for it, which the binding block reports separately.",
-    "key-bound": "Bound to an Ed25519 public key rather than a host "
-        "address. Only the holder of the private key can submit under it, "
-        "and that holder is not us.",
-    "publisher": "The deployment publishing this roster.",
-    "unchecked": "Recorded before name binding existed.",
-}
-
-STATUS_VOCABULARY = {
-    "current": "observed within the last %dh" % CURRENT_UNDER_HOURS,
-    "stale": "last observed between %dh and %dh ago"
-             % (CURRENT_UNDER_HOURS, SILENT_AFTER_HOURS),
-    "silent": "not observed for more than %dh" % SILENT_AFTER_HOURS,
-    "unknown": "we hold no usable timestamp for this entry",
-    "read_this": "These describe elapsed time since we last recorded an "
-        "observation, and nothing else. A peer publishing on a human "
-        "schedule reads stale between sessions, correctly. It is not a "
-        "claim that anyone's endpoint was unavailable.",
-    "computed_when": "At generation. If this document has been cached, "
-        "every one of these words is as old as the document. Check "
-        "freshness.generated_epoch against your own clock before using "
-        "them.",
-}
-
-BINDING_VOCABULARY = {
-    "open_lane": "What witness.py recorded: whether a url served back the "
-        "tip it was sent with. An address-level fact.",
-    "signed_lane": "What bind.py holds: a live credential, a dated claim, "
-        "or nothing. A possession-level fact. /x/bind/name is authority.",
-    "agree": "true when both lanes say the name is held, false when they "
-        "disagree, null when the signed lane has no record. A false is not "
-        "a fault - the lanes check different things.",
-    "none": "bind.py holds no credential and no claim for this name.",
-    "claimed": "bind.py holds a dated claim but no live credential.",
-    "credential": "bind.py holds a live credential for this name.",
-    "unavailable": "bind.py is not deployed here or its tables cannot be "
-        "read. Absence of an answer, not an answer.",
-}
-
-SUBMIT_NOTE = ("Unknown. This deployment records where it can FETCH a "
-    "peer's tip. It has no record of whether that peer runs an endpoint "
-    "you can POST to, so it does not tell you to post to one.")
-
-
-def _freshness(generated_epoch):
-    return {
-        "generated_epoch": int(generated_epoch),
-        "fresh_for_seconds": FRESH_FOR_SECONDS,
-        "decaying_fields": list(DECAYING_FIELDS),
-        "read_this":
-            "hours_since and status are computed at generation, not when "
-            "you read this. If this document was served from a cache, "
-            "those fields are as old as the document and can say current "
-            "about a peer that has since gone silent. Compare "
-            "generated_epoch against your own clock: if the difference "
-            "exceeds fresh_for_seconds, refetch before relying on them. "
-            "Everything else here - chain names, tip urls, first_seen, "
-            "last_seen, observations, binding - does not decay.",
-        "how_to_defeat_a_cache":
-            "Append a changing query parameter, for example "
-            "/x/roster/list?t=<unix seconds>. This route ignores unknown "
-            "parameters.",
-        "why_this_is_here":
-            "A stale copy of this route was read with every peer at "
-            "hours_since 0.0 and status current, contradicting this same "
-            "document's six-hour definition, while how_to_use tells peers "
-            "to poll it. Found by Ishaan (Shango MID).",
-    }
-
-
-def _epoch(ts):
-    if ts is None:
-        return None
-    if isinstance(ts, (int, float)):
-        return float(ts)
-    s = str(ts).strip()
-    if not s:
-        return None
-    try:
-        return float(s)
-    except ValueError:
-        pass
-    try:
-        import datetime
-        return datetime.datetime.fromisoformat(
-            s.replace("Z", "+00:00")).timestamp()
-    except Exception:
-        return None
-
-
-def _iso(ts):
-    e = _epoch(ts)
-    if e is None:
-        return None
-    try:
-        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(e))
-    except Exception:
-        return None
-
-
-def _cols(conn, table):
-    try:
-        return [r[1] for r in conn.execute(
-            "PRAGMA table_info(%s)" % table).fetchall()]
-    except Exception:
-        return []
-
-
-def _status_for(hours):
-    if hours is None:
-        return "unknown"
-    if hours <= CURRENT_UNDER_HOURS:
-        return "current"
-    if hours <= SILENT_AFTER_HOURS:
-        return "stale"
-    return "silent"
-
-
-def _signed_keys(ctx):
-    keys = {}
-    try:
-        rows = ctx["conn"].execute(
-            "SELECT peer, pubkey, rotations FROM signed_keys").fetchall()
-        for peer, pubkey, rot in rows:
-            if peer:
-                keys[peer.strip()] = {"pubkey": pubkey, "rotations": rot or 0}
-    except Exception:
-        pass
-    return keys
-
-
-def _bind_state(ctx):
-    """Returns None when bind.py is absent, so the response can say
-    unavailable rather than none. Different answers."""
-    state = {}
-    try:
-        rows = ctx["conn"].execute(
-            "SELECT name, key_id, issued FROM bind_credential "
-            "WHERE revoked IS NULL").fetchall()
-    except Exception:
-        return None
-    for name, key_id, issued in rows:
-        if not name:
-            continue
-        cur = state.setdefault(str(name).strip(),
-            {"signed_lane": "none", "key_id": None, "issued_at": None,
-             "claims": 0})
-        cur["signed_lane"] = "credential"
-        cur["key_id"] = key_id
-        cur["issued_at"] = _iso(issued)
-    try:
-        claims = ctx["conn"].execute(
-            "SELECT name, COUNT(*) FROM bind_claim GROUP BY name").fetchall()
-    except Exception:
-        claims = []
-    for name, count in claims:
-        if not name:
-            continue
-        cur = state.setdefault(str(name).strip(),
-            {"signed_lane": "none", "key_id": None, "issued_at": None,
-             "claims": 0})
-        cur["claims"] = int(count or 0)
-        if cur["signed_lane"] == "none":
-            cur["signed_lane"] = "claimed"
-    return state
-
-
-def _binding_block(name_status, row, has_key, available):
-    if not available:
-        return {"open_lane": name_status, "signed_lane": "unavailable",
-                "agree": None, "read_this": BINDING_VOCABULARY["unavailable"],
-                "authority_for_signed_lane": "/x/bind/name"}
-    signed = (row or {}).get("signed_lane", "none")
-    if has_key and signed == "none":
-        signed = "credential"
-    open_held = name_status in ("bound", "first-use", "key-bound", "publisher")
-    agree = None if signed == "none" else (
-        bool(open_held) == bool(signed == "credential"))
-    block = {"open_lane": name_status, "signed_lane": signed, "agree": agree,
-             "authority_for_signed_lane": "/x/bind/name"}
-    if row:
-        if row.get("key_id"):
-            block["credential_key_id"] = row["key_id"]
-            block["credential_issued_at"] = row.get("issued_at")
-        if row.get("claims"):
-            block["dated_claims"] = row["claims"]
-    if agree is False:
-        block["why_they_differ"] = (
-            "One lane says this name is held and the other does not. "
-            "Expected rather than broken: a credential can exist for a name "
-            "that never served a tip in JSON, and a url can bind a name "
-            "holding no credential. Neither corrects the other.")
-    return block
-
-
-def _gather(ctx, now):
-    conn = ctx["conn"]
-    out = {}
-    cols = _cols(conn, "witness_log")
-    if not cols:
-        return out
-    chain_col = None
-    for c in ("chain", "peer", "chain_name", "name"):
-        if c in cols:
-            chain_col = c
-            break
-    if not chain_col:
-        return out
-    ts_col = None
-    for c in ("observed", "ts", "seen", "peer_ts"):
-        if c in cols:
-            ts_col = c
-            break
-    url_col = "url" if "url" in cols else None
-    live_col = "liveness" if "liveness" in cols else None
-    name_col = "name_status" if "name_status" in cols else None
-    sel = [chain_col]
-    for c in (ts_col, url_col, live_col, name_col):
-        sel.append(c if c else "NULL")
-    try:
-        rows = conn.execute("SELECT %s FROM witness_log ORDER BY rowid"
-                            % ", ".join(sel)).fetchall()
-    except Exception:
-        return out
-    for r in rows:
-        chain = (r[0] or "").strip()
-        if not chain:
-            continue
-        e = out.setdefault(chain, {"chain": chain, "observations": 0,
-            "first_seen": None, "last_seen": None, "url": None,
-            "liveness": None, "name_status": None})
-        e["observations"] += 1
-        ts = _epoch(r[1])
-        if ts is not None:
-            if e["first_seen"] is None or ts < e["first_seen"]:
-                e["first_seen"] = ts
-            if e["last_seen"] is None or ts > e["last_seen"]:
-                e["last_seen"] = ts
-        if r[2]:
-            e["url"] = r[2]
-        if r[3]:
-            e["liveness"] = r[3]
-        if r[4]:
-            e["name_status"] = r[4]
-    for e in out.values():
-        last = e["last_seen"]
-        hours = ((now - last) / 3600.0) if last else None
-        e["hours_since"] = round(hours, 1) if hours is not None else None
-        e["status"] = _status_for(hours)
-    return out
-
-
-def _entries(ctx, now):
-    peers = _gather(ctx, now)
-    keys = _signed_keys(ctx)
-    binds = _bind_state(ctx)
-    available = binds is not None
-    listed = []
-    for chain, e in sorted(peers.items(), key=lambda kv: kv[0]):
-        fetchable = bool(e["url"])
-        entry = {
-            "chain": e["chain"],
-            "tip_url": e["url"],
-            "observations": e["observations"],
-            "first_seen": _iso(e["first_seen"]),
-            "last_seen": _iso(e["last_seen"]),
-            "last_seen_epoch": int(e["last_seen"]) if e["last_seen"] else None,
-            "hours_since": e["hours_since"],
-            "hours_since_computed_at": int(now),
-            "status": e["status"],
-            "liveness": e["liveness"],
-            "name_status": e["name_status"],
-            "fetchable": fetchable,
-            "witnessable": fetchable,
-            "submit_endpoint": None,
-            "submit_endpoint_known": False,
-            "binding": _binding_block(e["name_status"],
-                                      (binds or {}).get(chain),
-                                      chain in keys, available),
-        }
-        key = keys.get(chain)
-        if key:
-            entry["signing_key"] = {
-                "algorithm": "ed25519", "pubkey": key["pubkey"],
-                "rotations": key["rotations"],
-                "means": "Only the holder of the matching private key can "
-                         "submit under this name. This deployment holds the "
-                         "public half only and cannot sign for them.",
-                "verify_at": "/x/signed/keys"}
-        listed.append(entry)
-    listed.insert(0, {
-        "chain": SELF_CHAIN, "tip_url": SELF_TIP, "observations": None,
-        "first_seen": None, "last_seen": _iso(now),
-        "last_seen_epoch": int(now), "hours_since": 0,
-        "hours_since_computed_at": int(now),
-        "status": "current", "liveness": "self", "name_status": "publisher",
-        "fetchable": True, "witnessable": True,
-        "submit_endpoint": SELF_OBSERVE, "submit_endpoint_known": True,
-        "binding": {"open_lane": "publisher", "signed_lane": "n/a",
-                    "agree": None,
-                    "authority_for_signed_lane": "/x/bind/name"},
-        "note": "The publisher of this roster. Its hours_since is zero by "
-                "construction and is not an observation."})
-    return listed
-
-
-def _used_vocabulary(entries):
-    live, names, stats, binds = {}, {}, {}, {}
-    for e in entries:
-        v = e.get("liveness")
-        if v:
-            live[v] = LIVENESS_VOCABULARY.get(v,
-                "Undefined in roster v%s - introduced by another module and "
-                "not described here. Treat as unexplained." % VERSION)
-        n = e.get("name_status")
-        if n:
-            names[n] = NAME_VOCABULARY.get(n,
-                "Undefined in roster v%s - see above." % VERSION)
-        s = e.get("status")
-        if s:
-            stats[s] = STATUS_VOCABULARY.get(s, "")
-        b = (e.get("binding") or {}).get("signed_lane")
-        if b and b in BINDING_VOCABULARY:
-            binds[b] = BINDING_VOCABULARY[b]
-    stats["read_this"] = STATUS_VOCABULARY["read_this"]
-    stats["computed_when"] = STATUS_VOCABULARY["computed_when"]
-    binds["open_lane"] = BINDING_VOCABULARY["open_lane"]
-    binds["signed_lane"] = BINDING_VOCABULARY["signed_lane"]
-    binds["agree"] = BINDING_VOCABULARY["agree"]
-    return {"liveness": live, "name_status": names, "status": stats,
-            "binding": binds}
-
-
-def _list(ctx):
-    now = time.time()
-    entries = _entries(ctx, now)
-    fetchable = [e for e in entries if e["fetchable"]]
-    signed = [e for e in entries if e.get("signing_key")]
-    disagree = [e["chain"] for e in entries
-                if (e.get("binding") or {}).get("agree") is False]
-    return {
-        "ok": True,
-        "roster_version": VERSION,
-        "generated": _iso(now),
-        "generated_epoch": int(now),
-        "freshness": _freshness(now),
-        "submit_to": SELF_OBSERVE,
-        "submit_signed_to": SELF_SIGNED,
-        "count": len(entries),
-        "fetchable": len(fetchable),
-        "witnessable": len(fetchable),
-        "stale": len([e for e in entries if e["status"] == "stale"]),
-        "silent": len([e for e in entries if e["status"] == "silent"]),
-        "with_signing_key": len(signed),
-        "lanes_disagree": disagree,
-        "peers": entries,
-        "vocabulary": _used_vocabulary(entries),
-        "what_this_list_is":
-            "Parties that have submitted a tip to this deployment. That is "
-            "all it records. Not a membership list, not partners, not "
-            "participants in anything AILeash is building. Being listed "
-            "implies no relationship beyond having sent a hash.",
-        "how_to_use":
-            "Poll this route on your own schedule, with a changing query "
-            "parameter so you are not served a cached copy. Check "
-            "generated_epoch against your own clock before trusting "
-            "hours_since or status. For every entry with fetchable=true, "
-            "fetch tip_url and seal the tip in your own chain. Whether that "
-            "peer accepts your tip in return is not recorded here - "
-            "submit_endpoint is unknown for every entry but ours. Ask the "
-            "operator before posting to anything.",
-        "witnessable_note":
-            "witnessable is an alias of fetchable, kept so existing sync "
-            "code keeps working. It means we hold a tip url for this "
-            "entry. It has never meant the peer accepts submissions.",
-        "note":
-            "Quiet chains stay listed and are marked stale or silent. "
-            "Removing them would make this a claim rather than a record. "
-            "An entry with fetchable=false has no tip url here, which is "
-            "not a statement about their infrastructure.",
-    }, 200
-
-
-def _health(ctx):
-    now = time.time()
-    entries = _entries(ctx, now)
-    others = [e for e in entries if e["chain"] != SELF_CHAIN]
-    return {
-        "ok": True,
-        "generated": _iso(now),
-        "generated_epoch": int(now),
-        "freshness": _freshness(now),
-        "chains_listed": len(entries),
-        "submitting_currently": len([e for e in others
-                                     if e["status"] == "current"]),
-        "stale": len([e for e in others if e["status"] == "stale"]),
-        "silent": len([e for e in others if e["status"] == "silent"]),
-        "with_signing_key": len([e for e in others if e.get("signing_key")]),
-        "lanes_disagree": [e["chain"] for e in others
-                           if (e.get("binding") or {}).get("agree") is False],
-        "status_vocabulary": STATUS_VOCABULARY,
-        "what_this_counts":
-            "Parties that have submitted a tip to this deployment, and how "
-            "recently. Nothing more. The counts of current, stale and "
-            "silent are computed at generation and decay with this "
-            "document.",
-        "what_this_does_not_tell_you": [
-            "Whether any of these parties witness each other.",
-            "Whether any of them has agreed to anything.",
-            "Whether the records behind any of these tips are true.",
-            "Whether a peer was reachable. Stale or silent is a fact about "
-            "this list, not about their infrastructure.",
-        ],
-    }, 200
-
-
-def _spec():
-    return {
-        "module": "roster",
-        "version": VERSION,
-        "what": "A list of parties that have submitted a tip to this "
-                "deployment, with the tip url each supplied.",
-        "what_it_is_not":
-            "Not a membership list. Not partners, adopters, validators or "
-            "participants. Appearing here means a party posted a hash to an "
-            "open endpoint. Being sealed in the chain and being named on "
-            "this list are two things; neither is consent to the other.",
-        "routes": {
-            "GET list": "public. the roster. poll this.",
-            "GET health": "public. one-line network summary.",
-            "GET spec": "public. this document.",
-        },
-        "freshness": {
-            "decaying_fields": list(DECAYING_FIELDS),
-            "fresh_for_seconds": FRESH_FOR_SECONDS,
-            "read_this":
-                "hours_since and status are computed at generation. A "
-                "cached copy of this route serves them unchanged, so they "
-                "can contradict this document's own definitions - every "
-                "peer reading current at hours_since 0.0, for instance. "
-                "Every response carries generated_epoch; compare it "
-                "against your own clock and refetch past "
-                "fresh_for_seconds. Rewording cannot fix this, so the "
-                "response states its own age instead.",
-            "stable_fields":
-                "chain, tip_url, first_seen, last_seen, last_seen_epoch, "
-                "observations, liveness, name_status, binding and "
-                "signing_key do not decay. last_seen_epoch is published so "
-                "a reader can compute elapsed time against their own clock "
-                "rather than trusting ours.",
-        },
-        "entry_fields": {
-            "chain": "the chain's name as it submitted it",
-            "tip_url": "where to fetch their current tip. null if none.",
-            "fetchable": "true when tip_url is present. Means we can fetch "
-                         "from them. Says nothing about what they accept.",
-            "witnessable": "alias of fetchable, kept for existing sync code",
-            "submit_endpoint": "null for every entry but ours. " + SUBMIT_NOTE,
-            "last_seen_epoch": "unix seconds of our last observation. Does "
-                               "not decay - compute elapsed time yourself.",
-            "hours_since": "elapsed time at generation. Decays.",
-            "hours_since_computed_at": "the unix second hours_since was "
-                                       "computed at.",
-            "status": "current, stale, silent or unknown, computed at "
-                      "generation. Decays. Matches the bands on "
-                      "/x/witness/peers.",
-            "observations": "how many tips they have submitted to us",
-            "liveness": "as recorded at submission - see vocabulary",
-            "name_status": "open-lane binding as recorded at submission",
-            "binding": "both binding lanes side by side, with agree saying "
-                       "whether they match. /x/bind/name is the authority "
-                       "for the signed lane.",
-            "signing_key": "present only when an Ed25519 key is enrolled",
-        },
-        "liveness_vocabulary": LIVENESS_VOCABULARY,
-        "name_vocabulary": NAME_VOCABULARY,
-        "status_vocabulary": STATUS_VOCABULARY,
-        "binding_vocabulary": BINDING_VOCABULARY,
-        "joining": {
-            "open": "POST a tip to %s with {\"chain\", \"tip\", \"url\"}. No "
-                    "account, no key." % SELF_OBSERVE,
-            "signed": "To make sure nobody - including this operator - can "
-                      "submit under your name, enrol an Ed25519 public key "
-                      "at /x/signed/enroll and submit at %s." % SELF_SIGNED,
-        },
-        "what_this_does_not_do": [
-            "It does not witness anything. It is a phone book.",
-            "It does not establish that anyone listed is a peer of anyone.",
-            "It does not prove a listed chain is honest.",
-            "It cannot make another operator witness you.",
-            "It reflects submissions to this deployment only.",
-            "The status word is not a statement about anyone's uptime.",
-            "It cannot stop an intermediary caching it. It can only state "
-            "when it was generated, which it now does.",
-        ],
-        "changed_in_1_4": [
-            "Every response carries generated_epoch and a freshness block "
-            "naming the fields that decay, so a cached copy can be "
-            "detected as cached by whoever reads it.",
-            "last_seen_epoch added per entry, so elapsed time can be "
-            "computed against the reader's own clock rather than ours.",
-            "hours_since_computed_at added per entry.",
-            "Found by Ishaan (Shango MID) in a stale read that showed every "
-            "peer at hours_since 0.0 and status current.",
-        ],
-        "changed_in_1_3": [
-            "Both binding lanes published per entry with an agree boolean.",
-            "witnessable split into fetchable; submit_endpoint reported as "
-            "unknown rather than implied by how_to_use.",
-            "The unbound wording no longer asserts a url was unreachable.",
-        ],
-        "drop_in":
-            "meshwitness.py reads this route and fetches every entry on it. "
-            "Standard library, one file, one cron line.",
-    }
-
-
-def handle(method, action, data, api_key, ctx):
-    if action == "spec":
-        return _spec(), 200
-    if action == "health":
-        return _health(ctx)
-    if action in ("list", "", "status"):
-        return _list(ctx)
-    return {"ok": False, "error": "unknown_action", "action": action}, 404
-
-```
-
-
-## `modules/router.py`
-
-234 lines, 7196 bytes
-
-```python
-"""
-Module router - /x/<module>/<action>
-
-Dispatches to modules/<module>.py, which exposes:
-
-    def handle(method, action, data, api_key, ctx): return payload, status
-
-A module may declare PUBLIC = {("GET","attest"), ...} for routes that need no
-API key. Default is closed - a route has to be opted open deliberately.
-
-RATE LIMITING
--------------
-Authenticated routes reuse the server's own check_rate (60/min, 1000/hour per
-key), so module traffic counts against the same budget as /api/govern rather
-than sitting outside it.
-
-Public routes have no key to meter, so they are metered per client address on
-a deliberately tighter budget. Without this, an unauthenticated endpoint is an
-open invitation. The window store is bounded and self-pruning.
-
-PAYLOAD CAP
------------
-Module bodies are capped. Nothing here needs a megabyte of JSON, and an
-uncapped body on a public route is a memory exhaustion vector.
-
-POST SUPPORT WITHOUT EDITING server.py
---------------------------------------
-server.py has an /x/ branch in do_GET but not in do_POST, so POST routes
-return the server's 404. The correct fix is four lines in do_POST. This is
-the fix for when that is not practical.
-
-On first import, this module patches Handler.do_POST to check for /x/ before
-falling through to the original. The patch is idempotent, keeps the original
-behaviour for every other path, and reverts on restart because it lives in
-memory rather than on disk.
-
-The catch, stated plainly: a module is only imported when a request reaches
-the router, and the only working entry point is do_GET. So after every deploy
-the first /x/ request must be a GET - after that, POST works until the next
-restart. Anything hitting /x/ with a GET does it, including a browser.
-
-This is a workaround for an editing constraint, not good architecture. If the
-four lines ever go into do_POST, this patch detects the branch is already
-there and does nothing.
-"""
-
-import importlib, json, sys, time
-from collections import defaultdict, deque
-
-VERSION = "3.2"
-
-MAX_BODY_KEYS = 200
-MAX_BODY_CHARS = 200000
-
-PUBLIC_PER_MIN = 30
-PUBLIC_PER_HOUR = 300
-_ip_wins = defaultdict(lambda: {"min": deque(), "hour": deque()})
-_ip_last_prune = [0.0]
-
-_c = {}
-_patched = [False]
-
-
-def _install_post(s):
-    """Add an /x/ branch to do_POST at runtime. Idempotent and reversible."""
-    if _patched[0]:
-        return "already installed"
-    H = getattr(s, "Handler", None)
-    if H is None or not hasattr(H, "do_POST"):
-        return "no handler"
-    if getattr(H, "_x_post_patched", False):
-        _patched[0] = True
-        return "already installed"
-    original = H.do_POST
-
-    def do_POST(self):
-        try:
-            from urllib.parse import urlparse
-            p = urlparse(self.path).path
-        except Exception:
-            p = self.path or ""
-        if p.startswith("/x/"):
-            try:
-                body = s.read_body(self)
-            except Exception:
-                body = {}
-            payload, status = route(self, p, body)
-            s.send_json(self, payload, status)
-            return
-        return original(self)
-
-    H.do_POST = do_POST
-    H._x_post_patched = True
-    _patched[0] = True
-    print("ROUTER: /x/ POST branch installed at runtime", flush=True)
-    return "installed"
-
-
-def _srv():
-    m = sys.modules.get("__main__")
-    if hasattr(m, "get_bearer"):
-        return m
-    return sys.modules.get("server")
-
-
-def _load(name):
-    m = _c.get(name)
-    if m is None:
-        m = importlib.import_module("modules." + name)
-        _c[name] = m
-    return m
-
-
-def _client(h):
-    """Prefer the forwarded address - behind a proxy the socket address is
-    the proxy, which would meter every visitor as one client."""
-    try:
-        xff = h.headers.get("X-Forwarded-For", "")
-        if xff:
-            return xff.split(",")[0].strip()[:64]
-    except Exception:
-        pass
-    try:
-        return str(h.client_address[0])[:64]
-    except Exception:
-        return "unknown"
-
-
-def _prune_ips(t):
-    if t - _ip_last_prune[0] < 300:
-        return
-    _ip_last_prune[0] = t
-    dead = [k for k, w in _ip_wins.items()
-            if (not w["hour"]) or w["hour"][-1] < t - 3600]
-    for k in dead:
-        del _ip_wins[k]
-
-
-def _check_ip(ip):
-    t = time.time()
-    _prune_ips(t)
-    w = _ip_wins[ip]
-    while w["min"] and w["min"][0] < t - 60:
-        w["min"].popleft()
-    while w["hour"] and w["hour"][0] < t - 3600:
-        w["hour"].popleft()
-    if len(w["min"]) >= PUBLIC_PER_MIN:
-        return False, "rate_limit_minute"
-    if len(w["hour"]) >= PUBLIC_PER_HOUR:
-        return False, "rate_limit_hour"
-    w["min"].append(t)
-    w["hour"].append(t)
-    return True, None
-
-
-def _too_big(data):
-    if not isinstance(data, dict):
-        return False
-    if len(data) > MAX_BODY_KEYS:
-        return True
-    try:
-        return len(json.dumps(data)) > MAX_BODY_CHARS
-    except Exception:
-        return True
-
-
-def route(h, path, data):
-    try:
-        s = _srv()
-        if s is None:
-            return {"error": "server_not_found"}, 500
-
-        if not _patched[0]:
-            try:
-                _install_post(s)
-            except Exception as _e:
-                print("ROUTER: post patch failed - " + str(_e), flush=True)
-
-        parts = [x for x in path.strip("/").split("/") if x]
-        if len(parts) < 2:
-            return {"error": "bad_path",
-                    "expected": "/x/<module>/<action>"}, 404
-        name = parts[1]
-        act = parts[2] if len(parts) > 2 else ""
-
-        if isinstance(data, dict) and data and isinstance(list(data.values())[0], list):
-            data = {k: v[0] for k, v in data.items()}
-
-        if _too_big(data):
-            return {"error": "payload_too_large",
-                    "limit_chars": MAX_BODY_CHARS,
-                    "limit_keys": MAX_BODY_KEYS}, 413
-
-        try:
-            m = _load(name)
-        except Exception:
-            return {"error": "unknown_module", "module": name}, 404
-        if not hasattr(m, "handle"):
-            return {"error": "module_has_no_handle"}, 500
-
-        method = h.command
-        public = getattr(m, "PUBLIC", set())
-        is_public = (method, act) in public or (method, "") in public
-
-        a = s.get_bearer(h)
-
-        if is_public:
-            if a and not s.get_key(a):
-                a = None
-            if not a:
-                ok, why = _check_ip(_client(h))
-                if not ok:
-                    return {"error": why,
-                            "message": "Public endpoints are rate limited per client. Use an API key for the normal budget."}, 429
-        else:
-            if not a or not s.get_key(a):
-                return {"error": "invalid_api_key"}, 401
-
-        if a:
-            try:
-                ok, why = s.check_rate(a)
-                if not ok:
-                    return {"error": why}, 429
-            except Exception:
-                pass
-
-        ctx = {"conn": s._conn, "lock": s._db_lock,
-               "seal": s.seal, "get_key": s.get_key}
-        return m.handle(method, act, data, a, ctx)
-
-    except Exception as e:
-        print("ROUTER ERR: " + str(e), flush=True)
-        return {"error": "router_failed", "detail": str(e)}, 500
-
-```
-
-
-## `modules/rulebind.py`
-
-588 lines, 24701 bytes
-
-```python
-"""
-modules/rulebind.py  v1.2.0  —  rule binding, verifiable without an account
-
-THE QUESTION THIS ANSWERS
--------------------------
-Eighteen months after a decision, nobody asks what was decided. They ask which
-rules were live at that instant. Most systems answer with a changelog somebody
-could have edited, or with a version number sitting beside the record rather
-than inside it - which proves nothing, because anything beside a record can be
-changed afterwards to suit.
-
-The claim worth making is narrower and harder: the ruleset version was
-committed at the moment of the decision, in the same sealed object, and a
-verdict cannot later be reattributed to different rules.
-
-HOW IT IS PROVED WITHOUT TRUSTING US
-------------------------------------
-Every decision here produces a binding digest:
-
-    AILEASH-RULEBIND-v1|<pack_id>|<pack_hash>|<inputs_digest>|<verdict>|<score>|<sealed_at>
-
-SHA-256 of that string is what gets sealed into the chain. Every component is
-published. So anyone can take the components we return, rebuild the string
-themselves, hash it, and check it equals the binding in the sealed record.
-
-WHAT IT DOES NOT PROVE
-----------------------
-That the rules were good ones. That the verdict was correct. It proves which
-ruleset produced which verdict and that the pairing was fixed at the time
-rather than asserted later. Narrow, and the only part that is actually
-provable.
-
-THE v1.1 MISTAKE, AND WHAT v1.2 DOES ABOUT IT
----------------------------------------------
-v1.0 let anyone POST arbitrary inputs and returned a six-decimal score,
-unlimited. That is a scoring oracle: enough calls and the decision boundary
-can be mapped without the weights ever being disclosed.
-
-v1.1 closed it by keying prove. That was right about the oracle and wrong
-about the consequence: the published ordering-test document declares this
-check demonstrable_publicly, and after v1.1 no stranger could complete it.
-The self-check runner went from PASS to INCONCLUSIVE, correctly, because a
-browser holds no key. A check nobody outside can run is not a public check,
-and leaving the document claiming otherwise would have been exactly the fault
-this codebase keeps getting caught on - a statement one step past what the
-thing beneath it does.
-
-v1.2 gives the demonstration back without reopening the oracle:
-
-  1. GET or POST /x/rulebind/demo - PUBLIC. Runs ONE fixed input set, the same
-     one every time, hardcoded below. A fixed input cannot map a boundary: you
-     learn one point on a curve, and it is the same point on every call. The
-     response carries every component and the full binding_material, so anyone
-     can recompute the digest with a shell command and check it.
-
-  2. POST /x/rulebind/prove with NO key - allowed only when that exact input
-     set is ALREADY on record. A repeat discloses nothing new; its score is
-     already public through /verify. Novel input sets still need a key, and
-     are still capped per key per hour.
-
-The rule underneath both: what is already public stays public, and what would
-make the boundary mappable stays keyed.
-
-ROUTES
-------
-  GET/POST /x/rulebind/demo             public  fixed fixture, full material
-  POST     /x/rulebind/prove            public for repeats, keyed for novel
-  GET      /x/rulebind/verify?receipt=  public  recompute a sealed binding
-  GET      /x/rulebind/packs            public  ruleset versions and dates
-  GET      /x/rulebind/spec             public  what this proves and what it does not
-"""
-
-import hashlib
-import json
-import re
-import sys
-import time
-
-VERSION = "1.2.0"
-BINDING_PREFIX = "AILEASH-RULEBIND-v1"
-
-PUBLIC = {("GET", "verify"), ("GET", "packs"), ("GET", "spec"), ("GET", ""),
-          ("GET", "demo"), ("POST", "demo"), ("POST", "prove")}
-
-HEX64 = re.compile(r"^[0-9a-f]{64}$")
-MAX_INPUT_KEYS = 40
-
-# Cap on NOVEL input sets per key per hour. Repeats are never limited.
-NOVEL_PER_HOUR = 40
-
-# The demo fixture. One input set, fixed, using the engine's real signal names.
-# Deliberately unremarkable: an ordinary allow-shaped request, so the single
-# point it discloses is the least informative point available.
-DEMO_INPUTS = {
-    "action": "purchase",
-    "amount": 40.00,
-    "trust": 0.80,
-    "v60": 1,
-    "v5m": 2,
-    "v1h": 3,
-    "device_risk": 0.10,
-    "anomaly": 0.05,
-    "country": "GB",
-    "country_shift": 0,
-}
-DEMO_RESEAL_AFTER = 3600   # seal the fixture at most once an hour
-
-SCORER_NAMES = ["score_event", "score", "_score_event"]
-DECIDER_NAMES = ["decide", "verdict_for", "_decide"]
-
-FALLBACK_ALLOW_BELOW = 0.35
-FALLBACK_CHALLENGE_BELOW = 0.70
-
-ANCHOR_NOTE = ("External timestamping is per proof, not a property of the "
-               "chain. A proof is submitted first and confirmed later, and "
-               "submitted is not confirmed. Check the state of any individual "
-               "proof at /x/ots/status.")
-
-_ready = False
-_novel = {}
-
-
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        c = ctx["conn"]
-        c.execute(
-            "CREATE TABLE IF NOT EXISTS rulebind_log("
-            "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,pack_id TEXT,"
-            "pack_hash TEXT,inputs_digest TEXT,verdict TEXT,score REAL,"
-            "sealed_at REAL,binding TEXT,audit_hash TEXT,block_index INTEGER)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_rb_hash ON rulebind_log(audit_hash)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_rb_pack ON rulebind_log(pack_hash)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_rb_inputs ON rulebind_log(inputs_digest)")
-        c.commit()
-    _ready = True
-
-
-def _sha(text):
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
-def _iso(ts):
-    if not ts:
-        return None
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
-
-
-# ----------------------------------------------------------------------
-# the engine, found at runtime
-# ----------------------------------------------------------------------
-
-def _find(names):
-    for modname in ("__main__", "server"):
-        mod = sys.modules.get(modname)
-        if not mod:
-            continue
-        for name in names:
-            fn = getattr(mod, name, None)
-            if callable(fn):
-                return fn, modname + "." + name
-    return None, None
-
-
-def _find_bands():
-    for modname in ("__main__", "server"):
-        mod = sys.modules.get(modname)
-        if not mod:
-            continue
-        a = getattr(mod, "ALLOW_BELOW", None)
-        c = getattr(mod, "CHALLENGE_BELOW", None)
-        if isinstance(a, (int, float)) and isinstance(c, (int, float)):
-            return float(a), float(c), modname + ".ALLOW_BELOW/CHALLENGE_BELOW"
-    return (FALLBACK_ALLOW_BELOW, FALLBACK_CHALLENGE_BELOW,
-            "rulebind fallback constants")
-
-
-def _active_pack(ctx):
-    try:
-        with ctx["lock"]:
-            row = ctx["conn"].execute(
-                "SELECT pack_id,version,pack_hash FROM signal_packs "
-                "ORDER BY id DESC LIMIT 1").fetchone()
-        if row and row[2]:
-            return str(row[0] or "core"), str(row[2])
-        if row:
-            return str(row[0] or "core"), _sha("pack:%s:v%s" % (row[0], row[1]))
-    except Exception:
-        pass
-    fn, where = _find(SCORER_NAMES)
-    if fn:
-        try:
-            import inspect
-            return "core-nine", _sha(inspect.getsource(fn))
-        except Exception:
-            return "core-nine", _sha("core-nine|" + str(where))
-    return "unknown", _sha("unknown")
-
-
-def _canonical_inputs(data):
-    clean = {}
-    for k, v in list(data.items())[:MAX_INPUT_KEYS]:
-        if k in ("api_key", "token", "key"):
-            continue
-        if isinstance(v, (int, float, bool)) or v is None:
-            clean[str(k)[:40]] = v
-        else:
-            clean[str(k)[:40]] = str(v)[:120]
-    return json.dumps(clean, sort_keys=True, separators=(",", ":"))
-
-
-def _binding(pack_id, pack_hash, inputs_digest, verdict, score, sealed_at):
-    material = "|".join([BINDING_PREFIX, str(pack_id), str(pack_hash),
-                         str(inputs_digest), str(verdict), ("%.6f" % float(score)),
-                         ("%.3f" % float(sealed_at))])
-    return material, _sha(material)
-
-
-def _last_for_inputs(ctx, inputs_digest):
-    try:
-        with ctx["lock"]:
-            return ctx["conn"].execute(
-                "SELECT pack_id,pack_hash,verdict,score,sealed_at,binding,"
-                "audit_hash,block_index FROM rulebind_log WHERE inputs_digest=? "
-                "ORDER BY id DESC LIMIT 1", (inputs_digest,)).fetchone()
-    except Exception:
-        return None
-
-
-def _novel_allowed(api_key):
-    now = time.time()
-    cutoff = now - 3600
-    for k in list(_novel.keys()):
-        kept = [t for t in _novel[k] if t > cutoff]
-        if kept:
-            _novel[k] = kept
-        else:
-            del _novel[k]
-    hits = _novel.get(api_key, [])
-    if len(hits) >= NOVEL_PER_HOUR:
-        return False, int(3600 - (now - min(hits))) + 1
-    hits.append(now)
-    _novel[api_key] = hits
-    return True, 0
-
-
-# ----------------------------------------------------------------------
-# scoring and sealing
-# ----------------------------------------------------------------------
-
-def _score_and_seal(ctx, api_key, inputs, inputs_digest):
-    scorer, _ = _find(SCORER_NAMES)
-    if not scorer:
-        return None, ({"error": "engine_unavailable",
-                       "message": "The scoring function could not be found at runtime."}, 503)
-    try:
-        result = scorer(dict(inputs))
-        score = float(result[0] if isinstance(result, (tuple, list)) else result)
-    except Exception as exc:
-        return None, ({"error": "scoring_failed", "message": str(exc)[:200]}, 400)
-
-    decider, decider_where = _find(DECIDER_NAMES)
-    verdict, verdict_source = None, None
-    if decider:
-        try:
-            v = decider(score)
-            verdict = v[0] if isinstance(v, (tuple, list)) else v
-            verdict_source = "engine (" + str(decider_where) + ")"
-        except Exception:
-            verdict = None
-    if verdict is None:
-        a, c, band_source = _find_bands()
-        verdict = "ALLOW" if score < a else ("CHALLENGE" if score < c else "BLOCK")
-        verdict_source = "banded by rulebind using " + band_source
-
-    pack_id, pack_hash = _active_pack(ctx)
-    sealed_at = time.time()
-    material, binding = _binding(pack_id, pack_hash, inputs_digest,
-                                 verdict, score, sealed_at)
-
-    detail = ("rulebind=" + binding + ";pack=" + pack_id + ";pack_hash=" + pack_hash +
-              ";inputs=" + inputs_digest + ";verdict=" + str(verdict) +
-              ";score=%.6f" % score)
-    ev = {"user_id": "rb:" + pack_id, "action": "rule_binding_sealed", "amount": 0,
-          "country": "UK", "device_id": "rulebind", "anomaly": 0, "device_risk": 0}
-    res = {"decision": "RULEBIND_" + str(verdict), "score": round(score, 6),
-           "rulebind_version": VERSION, "pack_id": pack_id, "pack_hash": pack_hash,
-           "binding": binding, "timestamp": sealed_at, "detail": detail}
-
-    try:
-        h, idx, seq = ctx["seal"](ev, res, sealed_at, api_key)
-    except Exception as exc:
-        return None, ({"error": "seal_failed",
-                       "detail": type(exc).__name__ + ": " + str(exc)[:250],
-                       "note": "Nothing was written. Send the identical inputs again."}, 500)
-    if not h:
-        return None, ({"error": "seal_failed", "detail": "seal returned no hash"}, 500)
-
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "INSERT INTO rulebind_log(api_key,pack_id,pack_hash,inputs_digest,"
-            "verdict,score,sealed_at,binding,audit_hash,block_index)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?)",
-            (api_key, pack_id, pack_hash, inputs_digest, str(verdict),
-             round(score, 6), sealed_at, binding, h, idx))
-        ctx["conn"].commit()
-
-    return {
-        "verdict": verdict, "verdict_source": verdict_source,
-        "score": round(score, 6),
-        "ruleset": {"pack_id": pack_id, "pack_hash": pack_hash},
-        "inputs_digest": inputs_digest,
-        "sealed_at": sealed_at, "sealed_at_iso": _iso(sealed_at),
-        "binding": binding, "binding_material": material,
-        "sealed": {"receipt": h, "block_index": idx, "receipt_seq": seq},
-    }, None
-
-
-RECOMPUTE = {
-    "step_1": ("Take binding_material exactly as returned - it is the string "
-               "that was hashed, printed in full."),
-    "step_2": "SHA-256 it. You should get the value in binding.",
-    "step_3": ("Confirm the ruleset hash appears inside that string. It is a "
-               "component of the digest, not a field beside it - change it and "
-               "the digest no longer recomputes."),
-    "step_4": ("Check the block sits in the chain, that our tip was recorded by "
-               "operators we do not control at /x/roster/list, and the state of "
-               "the timestamp proof covering it at /x/ots/status."),
-    "shell": "printf '%s' \"$MATERIAL\" | shasum -a 256",
-}
-
-PROVES = ("That this verdict and this ruleset version were committed together, "
-          "at this time, in one object. The pairing cannot be altered afterwards "
-          "without breaking the digest, and the digest cannot be altered without "
-          "breaking the chain.")
-
-NOT_PROVES = ("That the rules were good, or the verdict correct. Only which "
-              "ruleset produced it and that the pairing was fixed at the time.")
-
-
-# ----------------------------------------------------------------------
-# routes
-# ----------------------------------------------------------------------
-
-def _demo(ctx):
-    """Public. One fixed input set, the same on every call.
-
-    Fixed inputs are not an oracle: every caller learns the same single point,
-    and that point is published here on purpose. Sealed at most once an hour so
-    the route cannot be used to write blocks."""
-    inputs_digest = _sha(_canonical_inputs(DEMO_INPUTS))
-    row = _last_for_inputs(ctx, inputs_digest)
-
-    fresh = False
-    if row and (time.time() - float(row[4])) < DEMO_RESEAL_AFTER:
-        pack_id, pack_hash, verdict, score, sealed_at, binding, receipt, block = row
-        material, _ = _binding(pack_id, pack_hash, inputs_digest,
-                               verdict, score, sealed_at)
-        body = {
-            "verdict": verdict, "score": score,
-            "ruleset": {"pack_id": pack_id, "pack_hash": pack_hash},
-            "inputs_digest": inputs_digest,
-            "sealed_at": sealed_at, "sealed_at_iso": _iso(sealed_at),
-            "binding": binding, "binding_material": material,
-            "sealed": {"receipt": receipt, "block_index": block},
-        }
-    else:
-        body, err = _score_and_seal(ctx, "public-rulebind-demo",
-                                    DEMO_INPUTS, inputs_digest)
-        if err:
-            return err
-        fresh = True
-
-    body.update({
-        "demo": True,
-        "freshly_sealed": fresh,
-        "inputs_used": DEMO_INPUTS,
-        "why_the_inputs_are_fixed": (
-            "This route runs one input set and always the same one, so it "
-            "cannot be used to map the decision boundary - every caller learns "
-            "the same single point, and that point is published above. Running "
-            "your own inputs needs a key, which is what keeps the boundary "
-            "closed while leaving this check demonstrable by anyone."),
-        "reseal_after_seconds": DEMO_RESEAL_AFTER,
-        "recompute_it_yourself": RECOMPUTE,
-        "what_this_proves": PROVES,
-        "what_it_does_not_prove": NOT_PROVES,
-        "anchoring": ANCHOR_NOTE,
-        "verify": "/x/rulebind/verify?receipt=" + str(
-            (body.get("sealed") or {}).get("receipt")),
-    })
-    return body, 200
-
-
-def _prove(ctx, api_key, data):
-    if not isinstance(data, dict) or not data:
-        return {"error": "inputs_required",
-                "message": ("POST any decision inputs as JSON. They are hashed, "
-                            "never stored as values. Without a key, only input "
-                            "sets already on record are accepted - see "
-                            "/x/rulebind/demo for one anyone can run.")}, 400
-
-    inputs_digest = _sha(_canonical_inputs(data))
-    repeat = _last_for_inputs(ctx, inputs_digest) is not None
-
-    if not api_key:
-        if not repeat:
-            return {
-                "error": "api_key_required_for_novel_inputs",
-                "message": ("This input set is not on record. Running the live "
-                            "scorer on new inputs needs a key, because unlimited "
-                            "public scoring of arbitrary inputs would map the "
-                            "decision boundary."),
-                "what_you_can_do_without_a_key": {
-                    "run_the_check": "/x/rulebind/demo",
-                    "recompute_any_sealed_binding": "/x/rulebind/verify?receipt=...",
-                    "ruleset_history": "/x/rulebind/packs",
-                },
-            }, 401
-        api_key = "public-rulebind-repeat"
-    else:
-        if not repeat:
-            ok, retry_after = _novel_allowed(api_key)
-            if not ok:
-                return {"error": "novel_input_rate_limited",
-                        "novel_inputs_per_hour": NOVEL_PER_HOUR,
-                        "retry_after_seconds": retry_after,
-                        "note": ("Input sets already on record are never "
-                                 "limited. Only new ones are capped.")}, 429
-
-    body, err = _score_and_seal(ctx, api_key, data, inputs_digest)
-    if err:
-        return err
-
-    body.update({
-        "inputs_already_on_record": repeat,
-        "authenticated": not str(api_key).startswith("public-"),
-        "recompute_it_yourself": RECOMPUTE,
-        "what_this_proves": PROVES,
-        "what_it_does_not_prove": NOT_PROVES,
-        "anchoring": ANCHOR_NOTE,
-        "verify": "/x/rulebind/verify?receipt=" + body["sealed"]["receipt"],
-    })
-    return body, 200
-
-
-def _verify(ctx, data):
-    receipt = str((data or {}).get("receipt", "")).strip().lower()
-    if not receipt:
-        return {"error": "receipt_required",
-                "use": "/x/rulebind/verify?receipt=<audit hash>"}, 400
-    if not HEX64.match(receipt):
-        return {"error": "receipt_malformed",
-                "expected": "64 lowercase hex characters"}, 400
-    with ctx["lock"]:
-        row = ctx["conn"].execute(
-            "SELECT pack_id,pack_hash,inputs_digest,verdict,score,sealed_at,"
-            "binding,block_index FROM rulebind_log WHERE audit_hash=? LIMIT 1",
-            (receipt,)).fetchone()
-    if not row:
-        return {"found": False, "receipt": receipt,
-                "message": "No rule-binding record with that receipt."}, 404
-
-    pack_id, pack_hash, inputs_digest, verdict, score, sealed_at, stored, block = row
-    material, recomputed = _binding(pack_id, pack_hash, inputs_digest,
-                                    verdict, score, sealed_at)
-    matches = (recomputed == stored)
-
-    return {
-        "found": True, "receipt": receipt, "block_index": block,
-        "ruleset": {"pack_id": pack_id, "pack_hash": pack_hash},
-        "verdict": verdict, "score": score, "inputs_digest": inputs_digest,
-        "sealed_at": sealed_at, "sealed_at_iso": _iso(sealed_at),
-        "binding_stored": stored, "binding_material": material,
-        "binding_recomputed": recomputed, "binding_matches": matches,
-        "result": ("The ruleset version recomputes into the binding that was "
-                   "sealed with this decision. It was bound at the time, not "
-                   "attached afterwards."
-                   if matches else
-                   "MISMATCH. The stored binding does not recompute from the "
-                   "stored components. Something has been altered and this "
-                   "record should not be relied upon."),
-        "what_this_check_is": (
-            "A recomputation of the binding from its own published components. "
-            "It does not by itself verify the chain, the witnesses or the "
-            "timestamp proof - those are separate checks at the links below, "
-            "run by you."),
-        "chain_tip": "/x/witness/tip",
-        "witnessed_by": "/x/roster/list",
-        "timestamp_proofs": "/x/ots/status",
-        "anchoring": ANCHOR_NOTE,
-    }, 200
-
-
-def _packs(ctx):
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT pack_id,pack_hash,COUNT(*),MIN(sealed_at),MAX(sealed_at)"
-            " FROM rulebind_log GROUP BY pack_id,pack_hash ORDER BY MAX(sealed_at) DESC"
-        ).fetchall()
-    current_id, current_hash = _active_pack(ctx)
-    return {
-        "current": {"pack_id": current_id, "pack_hash": current_hash},
-        "history": [{
-            "pack_id": r[0], "pack_hash": r[1], "decisions_bound": r[2],
-            "first_sealed": _iso(r[3]), "last_sealed": _iso(r[4]),
-            "current": (r[1] == current_hash),
-        } for r in rows],
-        "note": ("Each ruleset version has its own hash. Changing a weight, a "
-                 "threshold or a signal produces a new hash and a new dated "
-                 "entry here, so a change to the rules is an event in the "
-                 "record rather than a silent edit."),
-        "limit_of_this_list": (
-            "It shows versions that have bound at least one decision through "
-            "this module. A ruleset that was live but never used here does not "
-            "appear."),
-    }, 200
-
-
-def _spec():
-    return {
-        "module": "rulebind", "version": VERSION,
-        "check": "rule_binding",
-        "question": ("Was the ruleset version bound at decision time, or "
-                     "attached to the record afterwards?"),
-        "binding_format": (BINDING_PREFIX +
-                           "|<pack_id>|<pack_hash>|<inputs_digest>|<verdict>|"
-                           "<score:.6f>|<sealed_at:.3f>"),
-        "digest": "SHA-256 of that string, UTF-8, no trailing newline",
-        "demonstrable_publicly": True,
-        "public_demonstration": "/x/rulebind/demo",
-        "routes": {
-            "GET or POST /x/rulebind/demo": "public - one fixed input set, full material",
-            "POST /x/rulebind/prove": ("public for input sets already on record, "
-                                       "keyed for new ones"),
-            "GET /x/rulebind/verify?receipt=": "public - recomputes a sealed binding",
-            "GET /x/rulebind/packs": "public - ruleset versions and dates",
-            "GET /x/rulebind/spec": "public - this document",
-        },
-        "how_the_oracle_is_closed_without_closing_the_check": (
-            "Running arbitrary inputs against the live scorer returns a numeric "
-            "score, and unlimited public access to that maps the decision "
-            "boundary without any weight being disclosed. So new input sets need "
-            "a key and are capped at %d per key per hour. What stays public is "
-            "everything that discloses nothing new: one fixed demo input set, "
-            "repeats of input sets already on record, and recomputation of any "
-            "sealed binding." % NOVEL_PER_HOUR),
-        "how_to_test_it_with_no_account": [
-            "GET /x/rulebind/demo",
-            "Take binding_material from the response and SHA-256 it yourself.",
-            "Confirm it equals binding.",
-            "GET /x/rulebind/verify?receipt=... and confirm it still recomputes.",
-            "Check the witnesses at /x/roster/list and the proof state at /x/ots/status.",
-        ],
-        "what_is_never_disclosed": (
-            "Weights, thresholds, signal names beyond the fixed demo input set, "
-            "and intermediate values. Submitted inputs are published as a digest, "
-            "not as values."),
-        "what_it_does_not_prove": NOT_PROVES,
-        "anchoring": ANCHOR_NOTE,
-        "cost": "Free. The public demonstration needs no account.",
-    }, 200
-
-
-def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-    action = (action or "").strip("/").lower()
-
-    if action == "demo":
-        return _demo(ctx)
-
-    if method == "POST":
-        if action == "prove":
-            return _prove(ctx, api_key, data)
-        return {"error": "unknown_action", "action": action,
-                "POST": ["prove", "demo"]}, 404
-
-    if action in ("", "spec"):
-        return _spec()
-    if action == "verify":
-        return _verify(ctx, data)
-    if action == "packs":
-        return _packs(ctx)
-    return {"error": "unknown_action", "action": action,
-            "GET": ["spec", "demo", "verify", "packs"], "POST": ["prove", "demo"]}, 404
-
-```
+- `modules/sebbi_adapter.py`
+- `modules/sebbi_engine.py`
 
 
 ## `modules/savings.py`
@@ -2313,5 +862,852 @@ def handle(method, action, data, api_key, ctx):
         return _verify(ctx, data)
     return {"error": "unknown_action", "action": action,
             "GET": ["status", "verify"], "POST": ["seal"]}, 404
+
+```
+
+
+## `modules/sebbi_adapter.py`
+
+602 lines, 24915 bytes
+
+```python
+"""
+sebbi_adapter.py  v1.0.0 - drop-in state anchoring for legacy applications.
+
+Your application keeps its database, its logic and its infrastructure. This
+file sits beside it: every state change you point it at is turned into a
+SHA-256 fingerprint, queued locally, and sent in the background to the
+sebbi.pro public proof log, which returns a receipt proving the fingerprint
+is in an append-only RFC 6962 Merkle tree whose tree heads are sealed into the
+sebbi.pro chain and timestamped in Bitcoin.
+
+Only the fingerprint leaves your machine. The data itself never does.
+
+TWO LINES
+---------
+    export SEBBI_API_KEY=your-key          (once, in the environment)
+
+    from sebbi_adapter import anchor_state
+    @anchor_state("orders.update")
+    def update_order(order_id, status):
+        ...                                 # unchanged
+        return {"order_id": order_id, "status": status}
+
+The return value is fingerprinted after the function succeeds. The call is
+never slowed down by the network and never fails because of this file:
+fingerprints go into a local append-only queue (sqlite) and a background
+thread sends them. If sebbi.pro is unreachable they wait, and are sent when it
+comes back, in order, with no duplicates.
+
+OTHER WAYS IN
+-------------
+    from sebbi_adapter import record, AnchorLogHandler
+    record({"account": 42, "balance": 1250})          # anywhere, returns the hash
+    logging.getLogger("payments").addHandler(AnchorLogHandler())   # every log line
+
+    @anchor_state("ledger.post", capture="args")      # fingerprint the inputs instead
+    @anchor_state("user.save", extract=lambda result, args, kwargs: result.to_dict())
+
+Async functions work the same way.
+
+CHECKING
+--------
+    python sebbi_adapter.py status            queue and receipt counts
+    python sebbi_adapter.py flush             send what is waiting, now
+    python sebbi_adapter.py receipt <hash>    the receipt for one fingerprint
+    python sebbi_adapter.py verify            re-check every stored receipt locally
+    python sebbi_adapter.py hash '<json>'     fingerprint a JSON value exactly as the adapter would
+
+Every receipt is checked on arrival with an RFC 6962 inclusion check, so the
+server's answer is verified, not trusted. A receipt that fails the check is
+kept (as evidence) and flagged.
+
+FINGERPRINT RULE (so anyone can recompute it)
+---------------------------------------------
+SHA-256 over canonical JSON: keys sorted, separators "," and ":", UTF-8, no
+extra whitespace. datetime/date -> ISO 8601 string, Decimal -> string,
+bytes -> hex, set -> sorted list, UUID -> string, dataclass -> its fields,
+objects with to_dict()/_asdict() -> that. Floats use Python's repr. Anything
+else is refused (and logged) rather than guessed at - pass extract= for those.
+
+SETTINGS (environment or Anchor(...) arguments)
+-----------------------------------------------
+    SEBBI_API_KEY        your key (without it, fingerprints queue and wait)
+    SEBBI_ENDPOINT       default https://sebbi.pro
+    SEBBI_DB             default ./sebbi_anchor.db
+    SEBBI_DISABLED=1     record nothing (kill switch)
+
+Standard library only. Python 3.8+.
+"""
+
+import asyncio
+import atexit
+import dataclasses
+import datetime
+import decimal
+import functools
+import hashlib
+import inspect
+import json
+import logging
+import os
+import sqlite3
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+import uuid
+
+__version__ = "1.0.0"
+__all__ = ["anchor_state", "record", "Anchor", "AnchorLogHandler", "canonical_json", "state_hash",
+           "verify_inclusion", "verify_consistency", "get_default"]
+
+log = logging.getLogger("sebbi_adapter")
+
+
+# ---------------------------------------------------------------- fingerprints
+
+def _default(o):
+    if isinstance(o, (datetime.datetime, datetime.date, datetime.time)):
+        return o.isoformat()
+    if isinstance(o, decimal.Decimal):
+        return str(o)
+    if isinstance(o, (bytes, bytearray, memoryview)):
+        return bytes(o).hex()
+    if isinstance(o, (set, frozenset)):
+        return sorted(o, key=lambda x: canonical_json(x))
+    if isinstance(o, uuid.UUID):
+        return str(o)
+    if dataclasses.is_dataclass(o) and not isinstance(o, type):
+        return dataclasses.asdict(o)
+    for attr in ("to_dict", "_asdict"):
+        fn = getattr(o, attr, None)
+        if callable(fn):
+            return fn()
+    raise TypeError("cannot fingerprint %s - pass extract= to choose what to record" % type(o).__name__)
+
+
+def canonical_json(obj):
+    """The exact bytes the fingerprint is taken over."""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                      allow_nan=False, default=_default).encode("utf-8")
+
+
+def state_hash(obj):
+    """SHA-256 of canonical JSON, as 64 lowercase hex characters."""
+    return hashlib.sha256(canonical_json(obj)).hexdigest()
+
+
+# ---------------------------------------------------------------- RFC 6962 checks
+
+def _h(b):
+    return hashlib.sha256(b).digest()
+
+
+def leaf_hash(entry_hex):
+    return _h(b"\x00" + bytes.fromhex(entry_hex)).hex()
+
+
+def verify_inclusion(entry_hex, index, tree_size, path, root):
+    """RFC 9162 section 2.1.3.2: is entry at `index` in the tree of `tree_size` with `root`?"""
+    try:
+        index, tree_size = int(index), int(tree_size)
+        if index < 0 or index >= tree_size:
+            return False
+        fn, sn = index, tree_size - 1
+        r = _h(b"\x00" + bytes.fromhex(entry_hex))
+        for p_hex in path:
+            p = bytes.fromhex(p_hex)
+            if sn == 0:
+                return False
+            if (fn & 1) or fn == sn:
+                r = _h(b"\x01" + p + r)
+                if not (fn & 1):
+                    while not (fn & 1) and fn != 0:
+                        fn >>= 1
+                        sn >>= 1
+            else:
+                r = _h(b"\x01" + r + p)
+            fn >>= 1
+            sn >>= 1
+        return sn == 0 and r == bytes.fromhex(root)
+    except (ValueError, TypeError):
+        return False
+
+
+def verify_consistency(first, second, first_root, second_root, proof):
+    """RFC 9162 section 2.1.4.2: is the tree of size `second` an append-only extension of `first`?"""
+    try:
+        first, second = int(first), int(second)
+        fr_b, sr_b = bytes.fromhex(first_root), bytes.fromhex(second_root)
+        path = [bytes.fromhex(p) for p in proof]
+        if first == second:
+            return not path and fr_b == sr_b
+        if first < 1 or first > second or not path:
+            return False
+        if first & (first - 1) == 0:
+            path = [fr_b] + path
+        fn, sn = first - 1, second - 1
+        while fn & 1:
+            fn >>= 1
+            sn >>= 1
+        fr = sr = path[0]
+        for c in path[1:]:
+            if sn == 0:
+                return False
+            if (fn & 1) or fn == sn:
+                fr = _h(b"\x01" + c + fr)
+                sr = _h(b"\x01" + c + sr)
+                if not (fn & 1):
+                    while not (fn & 1) and fn != 0:
+                        fn >>= 1
+                        sn >>= 1
+            else:
+                sr = _h(b"\x01" + sr + c)
+            fn >>= 1
+            sn >>= 1
+        return fr == fr_b and sr == sr_b and sn == 0
+    except (ValueError, TypeError):
+        return False
+
+
+# ---------------------------------------------------------------- the sidecar
+
+class Anchor(object):
+    """Local append-only queue + background sender. Safe across threads, processes and forks."""
+
+    def __init__(self, api_key=None, endpoint=None, db_path=None, batch_size=200,
+                 flush_interval=2.0, timeout=10.0, check_chain=True, start=True):
+        self.api_key = (api_key if api_key is not None else os.environ.get("SEBBI_API_KEY", "")).strip()
+        self.endpoint = (endpoint or os.environ.get("SEBBI_ENDPOINT", "https://sebbi.pro")).rstrip("/")
+        self.db_path = db_path or os.environ.get("SEBBI_DB", "sebbi_anchor.db")
+        self.batch_size = max(1, min(500, int(batch_size)))
+        self.flush_interval = float(flush_interval)
+        self.timeout = float(timeout)
+        self.check_chain = bool(check_chain)
+        self.disabled = os.environ.get("SEBBI_DISABLED", "0") == "1"
+        self._autostart = start
+        self._warned_no_key = False
+        if not self.endpoint.startswith("https://") and "127.0.0.1" not in self.endpoint \
+                and "localhost" not in self.endpoint:
+            log.warning("sebbi_adapter: endpoint %s is not https", self.endpoint)
+        self._init_process()
+
+    # -- process-local state (rebuilt after fork) --
+    def _init_process(self):
+        self._pid = os.getpid()
+        self._wid = "%d-%s" % (self._pid, uuid.uuid4().hex[:8])
+        self._lk = threading.Lock()
+        self._wake = threading.Event()
+        self._stop = threading.Event()
+        self._backoff = 0.0
+        self._tried = {}
+        self._db = sqlite3.connect(self.db_path, timeout=30, isolation_level=None, check_same_thread=False)
+        self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.execute("PRAGMA synchronous=NORMAL")
+        self._db.execute("CREATE TABLE IF NOT EXISTS entries(seq INTEGER PRIMARY KEY AUTOINCREMENT,"
+                         "cid TEXT UNIQUE NOT NULL,hash TEXT NOT NULL,label TEXT,created REAL)")
+        self._db.execute("CREATE TABLE IF NOT EXISTS receipts(id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                         "cid TEXT NOT NULL,leaf_index INTEGER,receipt TEXT,verified INTEGER,"
+                         "checkpointed INTEGER DEFAULT 0,in_chain INTEGER,received REAL)")
+        self._db.execute("CREATE INDEX IF NOT EXISTS receipts_cid ON receipts(cid)")
+        self._db.execute("CREATE INDEX IF NOT EXISTS entries_hash ON entries(hash)")
+        self._db.execute("CREATE TABLE IF NOT EXISTS claims(cid TEXT PRIMARY KEY,worker TEXT,until REAL)")
+        self._thread = None
+        if self._autostart:
+            self._start_thread()
+
+    def _ensure_process(self):
+        if os.getpid() != self._pid:
+            self._init_process()
+
+    def _start_thread(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(target=self._run, name="sebbi-anchor", daemon=True)
+        self._thread.start()
+
+    # -- recording (host side: local only, never raises) --
+    def record(self, payload, label=None):
+        """Fingerprint `payload` and queue it. Returns the hash, or None if it could not be recorded."""
+        if self.disabled:
+            return None
+        try:
+            return self.record_hash(state_hash(payload), label=label)
+        except Exception as e:
+            log.warning("sebbi_adapter: not recorded (%s)", e)
+            return None
+
+    def record_hash(self, hash_hex, label=None):
+        """Queue a fingerprint you computed yourself (64 hex characters)."""
+        if self.disabled:
+            return None
+        try:
+            h = str(hash_hex).strip().lower()
+            if len(h) != 64 or any(ch not in "0123456789abcdef" for ch in h):
+                raise ValueError("hash must be 64 hex characters")
+            self._ensure_process()
+            with self._lk:
+                self._db.execute("INSERT INTO entries(cid,hash,label,created) VALUES(?,?,?,?)",
+                                 (uuid.uuid4().hex, h, (str(label)[:120] if label else None), time.time()))
+            self._wake.set()
+            return h
+        except Exception as e:
+            log.warning("sebbi_adapter: not recorded (%s)", e)
+            return None
+
+    # -- lookups --
+    def receipt(self, hash_hex):
+        """Latest receipt for a fingerprint (the most recent entry with that hash), or None."""
+        self._ensure_process()
+        with self._lk:
+            row = self._db.execute(
+                "SELECT r.receipt,r.verified,r.checkpointed,r.in_chain,e.label,e.created FROM entries e "
+                "JOIN receipts r ON r.cid=e.cid WHERE e.hash=? ORDER BY e.seq DESC, r.id DESC LIMIT 1",
+                (str(hash_hex).lower(),)).fetchone()
+        if not row:
+            return None
+        rec = json.loads(row[0])
+        rec["verified_locally"] = bool(row[1])
+        rec["checkpointed"] = bool(row[2])
+        rec["tree_head_seen_in_chain"] = None if row[3] is None else bool(row[3])
+        rec["label"] = row[4]
+        return rec
+
+    def counts(self):
+        self._ensure_process()
+        with self._lk:
+            c = self._db
+            total = c.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+            sent = c.execute("SELECT COUNT(DISTINCT cid) FROM receipts").fetchone()[0]
+            cp = c.execute("SELECT COUNT(DISTINCT cid) FROM receipts WHERE checkpointed=1").fetchone()[0]
+            bad = c.execute("SELECT COUNT(DISTINCT cid) FROM receipts WHERE verified=0").fetchone()[0]
+        return {"recorded": total, "receipted": sent, "waiting": total - sent,
+                "sealed_in_chain": cp, "failed_local_check": bad}
+
+    def pending(self):
+        return self.counts()["waiting"]
+
+    # -- network --
+    def _http(self, method, path, body=None):
+        data = json.dumps(body).encode("utf-8") if body is not None else None
+        req = urllib.request.Request(self.endpoint + path, data=data, method=method)
+        req.add_header("Content-Type", "application/json")
+        req.add_header("User-Agent", "sebbi-adapter/" + __version__)
+        if self.api_key:
+            req.add_header("X-Sebbi-Key", self.api_key)
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                return r.status, json.loads(r.read().decode("utf-8") or "{}")
+        except urllib.error.HTTPError as e:
+            try:
+                return e.code, json.loads(e.read().decode("utf-8") or "{}")
+            except Exception:
+                return e.code, {}
+
+    def _claim(self, n):
+        now = time.time()
+        with self._lk:
+            c = self._db
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                rows = c.execute(
+                    "SELECT e.cid,e.hash FROM entries e WHERE NOT EXISTS (SELECT 1 FROM receipts r WHERE r.cid=e.cid) "
+                    "AND NOT EXISTS (SELECT 1 FROM claims k WHERE k.cid=e.cid AND k.until>? AND k.worker<>?) "
+                    "ORDER BY e.seq LIMIT ?", (now, self._wid, n)).fetchall()
+                for cid, _ in rows:
+                    c.execute("INSERT OR REPLACE INTO claims(cid,worker,until) VALUES(?,?,?)",
+                              (cid, self._wid, now + max(60.0, self.timeout * 3)))
+                c.execute("COMMIT")
+            except Exception:
+                c.execute("ROLLBACK")
+                raise
+        return rows
+
+    def _release(self, cids):
+        with self._lk:
+            self._db.executemany("DELETE FROM claims WHERE cid=? AND worker=?", [(c, self._wid) for c in cids])
+
+    def _store(self, cid, rec, checkpointed=False, in_chain=None):
+        ok = verify_inclusion(rec.get("entry_hash", ""), rec.get("leaf_index", -1), rec.get("tree_size", 0),
+                              rec.get("audit_path", []), rec.get("root", ""))
+        if checkpointed and ok and rec.get("checkpoint"):
+            ok = rec["checkpoint"].get("root") == rec.get("root")
+        if not ok:
+            log.error("sebbi_adapter: receipt for leaf %s FAILED the local inclusion check - kept and flagged",
+                      rec.get("leaf_index"))
+        with self._lk:
+            self._db.execute("INSERT INTO receipts(cid,leaf_index,receipt,verified,checkpointed,in_chain,received) "
+                             "VALUES(?,?,?,?,?,?,?)",
+                             (cid, rec.get("leaf_index"), json.dumps(rec, sort_keys=True), 1 if ok else 0,
+                              1 if checkpointed else 0, in_chain, time.time()))
+        return ok
+
+    def _send_batch(self):
+        """Send one batch. Returns number receipted; raises on network failure."""
+        if not self.api_key:
+            if not self._warned_no_key:
+                log.warning("sebbi_adapter: SEBBI_API_KEY not set - fingerprints are queued locally and will "
+                            "be sent once it is")
+                self._warned_no_key = True
+            return 0
+        rows = self._claim(self.batch_size)
+        if not rows:
+            return 0
+        wanted = {cid: h for cid, h in rows}
+        try:
+            code, out = self._http("POST", "/p/submit", {"items": [{"hash": h, "cid": cid} for cid, h in rows]})
+        except Exception:
+            self._release(list(wanted))
+            raise
+        if code != 200:
+            self._release(list(wanted))
+            raise IOError("sebbi.pro answered %s: %s" % (code, out.get("error") or out.get("message") or ""))
+        done = 0
+        for rec in out.get("receipts") or []:
+            cid = rec.get("cid")
+            if cid not in wanted:
+                continue
+            if rec.get("error"):
+                log.error("sebbi_adapter: entry %s refused: %s", cid, rec["error"])
+                continue
+            if rec.get("entry_hash") != wanted[cid]:
+                log.error("sebbi_adapter: server returned a different hash for %s - not stored", cid)
+                continue
+            self._store(cid, rec)
+            done += 1
+        self._release(list(wanted))
+        return done
+
+    def _upgrade(self, limit=50):
+        """Fetch sealed receipts for leaves whose tree head should now be in the chain."""
+        cutoff = time.time() - 30
+        with self._lk:
+            rows = self._db.execute(
+                "SELECT r.cid,r.leaf_index FROM receipts r WHERE r.verified=1 AND r.received<? AND "
+                "NOT EXISTS (SELECT 1 FROM receipts r2 WHERE r2.cid=r.cid AND r2.checkpointed=1) "
+                "GROUP BY r.cid ORDER BY MIN(r.id) LIMIT ?", (cutoff, limit)).fetchall()
+        blocks = {}
+        now = time.time()
+        for cid, idx in rows:
+            if now - self._tried.get(cid, 0) < 30:
+                continue
+            self._tried[cid] = now
+            code, rec = self._http("GET", "/p/receipt?leaf=%d" % idx)
+            if code != 200 or not rec.get("checkpoint"):
+                continue
+            in_chain = None
+            if self.check_chain:
+                blk = rec["checkpoint"].get("block_index")
+                if blk not in blocks:
+                    try:
+                        _, body = self._http("GET", "/x/walk/block?index=%s" % blk)
+                        blocks[blk] = json.dumps(body)
+                    except Exception:
+                        blocks[blk] = None
+                if blocks[blk] is not None:
+                    in_chain = 1 if rec["checkpoint"].get("root", "~") in blocks[blk] else 0
+                    if not in_chain:
+                        log.error("sebbi_adapter: tree head for leaf %s not found in chain block %s", idx, blk)
+            self._store(cid, rec, checkpointed=True, in_chain=in_chain)
+            self._tried.pop(cid, None)
+
+    def flush(self, timeout=30.0):
+        """Send everything waiting, now. Returns how many were receipted. Never raises."""
+        self._ensure_process()
+        end, sent = time.time() + timeout, 0
+        while time.time() < end:
+            try:
+                n = self._send_batch()
+            except Exception as e:
+                log.warning("sebbi_adapter: flush stopped (%s); entries stay queued", e)
+                break
+            sent += n
+            if n == 0:
+                break
+        return sent
+
+    def _run(self):
+        while not self._stop.is_set():
+            self._wake.wait(self._backoff or self.flush_interval)
+            self._wake.clear()
+            if self._stop.is_set():
+                break
+            try:
+                while self._send_batch() >= self.batch_size:
+                    pass
+                self._upgrade()
+                self._backoff = 0.0
+            except Exception as e:
+                self._backoff = min(300.0, max(2.0, self._backoff * 2))
+                log.info("sebbi_adapter: sebbi.pro unreachable (%s); retrying in %ds", e, self._backoff)
+
+    def close(self, flush_timeout=2.0):
+        try:
+            if flush_timeout:
+                self.flush(timeout=flush_timeout)
+        finally:
+            self._stop.set()
+            self._wake.set()
+
+
+# ---------------------------------------------------------------- the default instance
+
+_default_anchor = None
+_default_lock = threading.Lock()
+
+
+def get_default():
+    global _default_anchor
+    if _default_anchor is None:
+        with _default_lock:
+            if _default_anchor is None:
+                _default_anchor = Anchor()
+                atexit.register(_default_anchor.close)
+    return _default_anchor
+
+
+def record(payload, label=None, anchor=None):
+    """Fingerprint and queue any JSON-able value. Returns the hash. Never raises."""
+    try:
+        return (anchor or get_default()).record(payload, label=label)
+    except Exception as e:
+        log.warning("sebbi_adapter: not recorded (%s)", e)
+        return None
+
+
+def anchor_state(label=None, capture="result", extract=None, anchor=None):
+    """Decorator. After the wrapped function succeeds, fingerprint its state and queue it.
+
+    capture:  "result" (default) - the return value
+              "args"             - the arguments it was called with
+              "both"             - {"args": ..., "kwargs": ..., "result": ...}
+    extract:  f(result, args, kwargs) -> the value to fingerprint (overrides capture)
+    The wrapped function's behaviour, return value and exceptions are unchanged.
+    """
+    if callable(label) and not isinstance(label, str):
+        return anchor_state()(label)
+
+    def deco(fn):
+        name = label or getattr(fn, "__qualname__", getattr(fn, "__name__", "call"))
+
+        def _state(args, kwargs, result):
+            if extract is not None:
+                return extract(result, args, kwargs)
+            if capture == "args":
+                return {"args": list(args), "kwargs": kwargs}
+            if capture == "both":
+                return {"args": list(args), "kwargs": kwargs, "result": result}
+            return result
+
+        def _anchor(args, kwargs, result):
+            try:
+                record(_state(args, kwargs, result), label=name, anchor=anchor)
+            except Exception as e:
+                log.warning("sebbi_adapter: %s not recorded (%s)", name, e)
+
+        if inspect.iscoroutinefunction(fn):
+            @functools.wraps(fn)
+            async def awrapper(*args, **kwargs):
+                result = await fn(*args, **kwargs)
+                _anchor(args, kwargs, result)
+                return result
+            return awrapper
+
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            result = fn(*args, **kwargs)
+            _anchor(args, kwargs, result)
+            return result
+        return wrapper
+    return deco
+
+
+class AnchorLogHandler(logging.Handler):
+    """Fingerprints every log record it sees: logger, level, message and time."""
+
+    def __init__(self, anchor=None, level=logging.INFO):
+        logging.Handler.__init__(self, level)
+        self._anchor = anchor
+
+    def emit(self, rec):
+        if rec.name.startswith("sebbi_adapter"):
+            return
+        try:
+            record({"logger": rec.name, "level": rec.levelname, "message": rec.getMessage(),
+                    "time": round(rec.created, 6)}, label="log:" + rec.name, anchor=self._anchor)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------- command line
+
+def _main(argv):
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    cmd = argv[1] if len(argv) > 1 else "status"
+    if cmd == "hash" and len(argv) > 2:
+        print(state_hash(json.loads(argv[2])))
+        return 0
+    a = Anchor(start=False)
+    if cmd == "status":
+        print(json.dumps(dict(a.counts(), endpoint=a.endpoint, db=a.db_path, key_set=bool(a.api_key)), indent=2))
+    elif cmd == "flush":
+        print("receipted %d" % a.flush(timeout=120))
+        a._upgrade(limit=500)
+        print(json.dumps(a.counts(), indent=2))
+    elif cmd == "receipt" and len(argv) > 2:
+        print(json.dumps(a.receipt(argv[2]), indent=2))
+    elif cmd == "verify":
+        with a._lk:
+            rows = a._db.execute("SELECT receipt FROM receipts").fetchall()
+        good = sum(1 for (r,) in rows if (lambda d: verify_inclusion(d.get("entry_hash", ""), d.get("leaf_index", -1),
+                                                                      d.get("tree_size", 0), d.get("audit_path", []),
+                                                                      d.get("root", "")))(json.loads(r)))
+        print("%d of %d stored receipts pass the RFC 6962 inclusion check" % (good, len(rows)))
+    else:
+        print(__doc__)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_main(sys.argv))
+
+```
+
+
+## `modules/sebbi_engine.py`
+
+229 lines, 8776 bytes
+
+```python
+# modules/sebbi_engine.py
+"""
+Live chain-state endpoint  -  GET /x/sebbi_engine/state
+
+WHAT CHANGED IN v1.1, AND WHY
+-----------------------------
+v1.0 served this at /verify and returned "status": "sealed". It performed no
+verification: no rehash, no chain walk, no proof check. It read the last row of
+audit_log and reported that a row existed. A route called verify that returns
+sealed, having checked neither, is a word one step past what the check does -
+the same fault that has been raised against this codebase before, and the word
+an auditor will quote back.
+
+So v1.1 does the same honest job under honest names:
+
+  * action renamed  verify -> state
+  * status is now  live / unavailable, never "sealed"
+  * tip_digest removed - it was a hash of a hash, proving nothing
+  * token_budget removed - unrelated to chain state, it did not belong here
+  * every response names the routes that DO verify, and says plainly that
+    this one does not
+
+WHAT THIS ROUTE IS
+------------------
+The current tip and height, read from the database at request time. Nothing
+cached, nothing hardcoded. If the chain cannot be read it says so rather than
+reporting a reassuring value it cannot stand behind.
+
+WHAT IT IS NOT
+--------------
+It is not verification. Reading the last row proves a row exists. Verifying
+the chain means rewalking it, and confirming the tip was recorded by operators
+we do not control. Those are separate routes, listed in every response.
+
+Dual-signature handle(...) so it works with the router
+    handle(method, action, data, api_key, ctx) -> (payload, status)
+and with older direct-write callers
+    handle(handler, path, query_params=None) -> writes the response, returns True
+
+Import-safe: nothing here can crash the server on import.
+"""
+
+import os
+import json
+import time
+
+VERSION = "1.1"
+MODULE_NAME = os.environ.get("MODULE_NAME", "sebbi_engine")
+
+# GET /state is public by design - anyone can read live state without an
+# account. The old ("GET", "verify") pair is kept so existing callers get the
+# renamed answer rather than a bare 404.
+PUBLIC = {("GET", "state"), ("GET", "verify"), ("GET", "spec"), ("GET", "")}
+
+VERIFY_ELSEWHERE = {
+    "chain_tip": "https://sebbi.pro/x/witness/tip",
+    "append_only_proof": "https://sebbi.pro/x/consistency/proof",
+    "is_my_tip_still_on_this_chain": "https://sebbi.pro/x/consistency/ancestor",
+    "who_recorded_our_tip": "https://sebbi.pro/x/roster/list",
+    "timestamp_proof_state": "https://sebbi.pro/x/ots/status",
+}
+
+NOT_VERIFICATION = (
+    "This route reads the current tip and height. It does not verify anything: "
+    "it does not rewalk the chain, recompute any hash, or check any external "
+    "record. Reading the last row proves a row exists and nothing more. The "
+    "routes above are the ones that verify, and you run them yourself."
+)
+
+try:
+    print("modules.sebbi_engine: loaded (v%s, live-state mode)" % VERSION, flush=True)
+except Exception:
+    pass
+
+
+def _read_live_chain(ctx):
+    """
+    Read the real current chain tip and height from the live database via ctx.
+
+    Returns what was actually found, or a record of why it could not be read.
+    It never invents a value.
+    """
+    if not isinstance(ctx, dict):
+        return {"live": False, "reason": "no_context"}
+
+    conn = ctx.get("conn") or ctx.get("db") or ctx.get("connection")
+    lock = ctx.get("lock")
+    if conn is None:
+        return {"live": False, "reason": "no_db_handle"}
+
+    # Matched to modules/witness.py _our_tip(): the chain lives in audit_log,
+    # the sealed hash is audit_hash, the height is id.
+    query = ("SELECT audit_hash AS seal, id AS height FROM audit_log "
+             "ORDER BY id DESC LIMIT 1")
+
+    def _run():
+        try:
+            row = conn.execute(query).fetchone()
+        except Exception:
+            return {"live": False, "reason": "query_failed"}
+        if not row:
+            return {"live": False, "reason": "no_chain_rows"}
+        seal = row[0]
+        height = row[1]
+        if seal is None:
+            return {"live": False, "reason": "null_tip"}
+        return {"live": True, "tip": str(seal),
+                "height": int(height) if height is not None else None}
+
+    try:
+        if lock is not None:
+            with lock:
+                return _run()
+        return _run()
+    except Exception as e:  # noqa: BLE001
+        return {"live": False, "reason": "read_error:" + e.__class__.__name__}
+
+
+def _build_payload(ctx):
+    now = int(time.time())
+    chain = _read_live_chain(ctx)
+
+    payload = {
+        "module": MODULE_NAME,
+        "version": VERSION,
+        "read_at": now,
+        "read_at_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+    }
+
+    if chain.get("live"):
+        payload["status"] = "live"
+        payload["chain_tip"] = chain["tip"]
+        payload["chain_height"] = chain["height"]
+        payload["note"] = (
+            "Live chain state, read at request time. It changes as the chain "
+            "grows, so two reads a minute apart are expected to differ.")
+    else:
+        payload["status"] = "unavailable"
+        payload["chain_tip"] = None
+        payload["chain_height"] = None
+        payload["reason"] = chain.get("reason", "unknown")
+        payload["note"] = (
+            "The live chain could not be read for this request, so no state is "
+            "reported. This endpoint never returns a placeholder in place of "
+            "real state.")
+
+    payload["height_is_not_activity"] = (
+        "A liveness beacon seals a block every five minutes, so most of the "
+        "height is heartbeat rather than customer decisions. Do not read this "
+        "number as usage.")
+    payload["this_is_not_verification"] = NOT_VERIFICATION
+    payload["verify_it_yourself"] = VERIFY_ELSEWHERE
+    return payload
+
+
+def _spec():
+    return {
+        "module": MODULE_NAME,
+        "version": VERSION,
+        "route": "GET /x/sebbi_engine/state",
+        "what_it_returns": "The current chain tip and height, read at request time.",
+        "what_it_does_not_do": NOT_VERIFICATION,
+        "renamed_in_v1_1": (
+            "The action was called verify and returned status sealed. It "
+            "verified nothing, so both names were wrong. verify still answers, "
+            "and returns this same state payload under the honest names."),
+        "verify_it_yourself": VERIFY_ELSEWHERE,
+        "cost": "Free. No account, no key.",
+    }, 200
+
+
+def handle(*args, **kwargs):
+    """Dual-signature handler; autodetects call style from the first argument."""
+
+    # Legacy direct-write style: first arg is an HTTP handler
+    if args and hasattr(args[0], "send_response") and hasattr(args[0], "wfile"):
+        handler = args[0]
+        ctx = getattr(handler, "ctx", None)
+        payload = _build_payload(ctx if isinstance(ctx, dict) else None)
+        body = json.dumps(payload, indent=2).encode("utf-8")
+        try:
+            handler.send_response(200)
+            handler.send_header("Content-Type", "application/json")
+            handler.send_header("Content-Length", str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+        except Exception:
+            try:
+                handler.send_response(500)
+                handler.send_header("Content-Type", "text/plain")
+                handler.end_headers()
+                handler.wfile.write(b"sebbi_engine: response failed\n")
+            except Exception:
+                pass
+        return True
+
+    # Router style: handle(method, action, data, api_key, ctx)
+    method = args[0] if len(args) > 0 else kwargs.get("method")
+    action = args[1] if len(args) > 1 else kwargs.get("action", "")
+    ctx = args[4] if len(args) > 4 else kwargs.get("ctx")
+
+    # Tolerate action arriving as a full path
+    if isinstance(action, str) and action.startswith("/"):
+        parts = [x for x in action.strip("/").split("/") if x]
+        if len(parts) >= 3 and parts[1] == "sebbi_engine":
+            action = parts[2]
+
+    action = (action or "").strip("/").lower()
+
+    if method != "GET":
+        return {"error": "method_not_allowed", "GET": ["state", "spec"]}, 405
+
+    if action == "spec":
+        return _spec()
+
+    if action in ("state", ""):
+        return _build_payload(ctx if isinstance(ctx, dict) else None), 200
+
+    if action == "verify":
+        payload = _build_payload(ctx if isinstance(ctx, dict) else None)
+        payload["renamed"] = (
+            "This action is now /x/sebbi_engine/state. It was called verify and "
+            "returned status sealed, while verifying nothing. Same data, honest "
+            "names. Update your caller when convenient.")
+        return payload, 200
+
+    return {"error": "unknown_action", "action": action,
+            "GET": ["state", "spec"]}, 404
 
 ```
