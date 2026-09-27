@@ -1,4 +1,4 @@
-# Codebase — part 5 of 44
+# Codebase — part 5 of 42
 
 Contains:
 - `modules/console.py`

@@ -1,4 +1,4 @@
-# Codebase — part 7 of 44
+# Codebase — part 7 of 42
 
 Contains:
 - `modules/credits.py`
