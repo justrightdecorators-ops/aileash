@@ -1,1284 +1,713 @@
-# Codebase — part 17 of 42
+# Codebase — part 17 of 41
 
 Contains:
-- `modules/public_proof_adapter.py`
-- `modules/publish.py`
+- `modules/ratchet.py`
+- `modules/reconcile.py`
+- `modules/register.py`
 
 
-## `modules/public_proof_adapter.py`
+## `modules/ratchet.py`
 
-1158 lines, 77508 bytes
+615 lines, 25928 bytes
 
 ```python
 """
-modules/public_proof_adapter.py  v1.1.0
-The public proof log: legacy systems send sebbi.pro the SHA-256 of a state
-change, and get back a receipt proving that hash is in an append-only log.
+ratchet.py - time only runs one way for the machine.
 
-  * An RFC 6962 Merkle tree (the Certificate Transparency construction):
-        leaf hash  = SHA-256(0x00 || entry)      entry = the 32-byte state hash
-        node hash  = SHA-256(0x01 || left || right)
-    so any receipt can be checked by anyone, with any RFC 6962 verifier,
-    without trusting this server.
-  * Receipts come back straight away: leaf index, tree size, root and the
-    inclusion (audit) path.
-  * Tree heads are sealed into the sebbi.pro chain on a schedule (every 60s or
-    every 1,000 leaves, whichever comes first). That chain is walkable at
-    /x/walk and its tip is timestamped in Bitcoin with OpenTimestamps by the
-    existing anchor, so a leaf becomes Bitcoin-anchored once a confirmed
-    anchored tip is at or after the block that sealed its tree head.
-  * Hash-only. No payloads, labels or customer data are sent or stored.
-  * Idempotent: the client sends its own id with each hash, so a retry after a
-    lost response returns the original leaf instead of adding a duplicate.
+WHAT THIS IS FOR
+----------------
+heartbeat.py proves WHEN a record can have been made. sortition.py proves
+NOBODY CHOSE what got reviewed. This one proves an actor cannot move
+backwards through time.
 
-Routes (clean /p/ prefix, armed by /x/public_proof_adapter/status):
+Every action an agent takes is bound to the beacon round current at the
+moment it acted. Beacon rounds only ever increase. So an actor's actions
+form a strictly rising ladder, and the rule is one line:
 
-    POST /p/submit        {"items":[{"hash":"<64 hex>","cid":"<client id>"}]}
-                          or {"hash":"<64 hex>"}      needs an API key
-    GET  /p/receipt?leaf=N        receipt against the sealed tree head
-    GET  /p/proof?leaf=N&size=M   inclusion path at tree size M
-    GET  /p/consistency?first=M&second=N   RFC 6962 consistency proof
-    GET  /p/sth                   latest sealed tree head + current size
-    GET  /p/find?hash=<64 hex>    leaf indexes holding that entry hash
-    GET  /p/                      what this log is and how to check it
+    an action carrying a beacon round at or below the actor's last
+    recorded round is REFUSED.
 
-Pages and downloads (1.1.0), reached from the "plug in" bubble on the homepage:
+WHAT THAT KILLS, WITHOUT A POLICY, A PROMPT OR A PROMISE
+--------------------------------------------------------
+BACKDATING     An agent cannot produce an action claiming to sit earlier
+               than one it already took. The earlier round is already
+               spent.
+REPLAY         Capture a valid action and fire it again later: the round
+               is stale and the digest is already on the ladder.
+PRE-COMPUTATION
+               An agent cannot prepare a batch of actions in advance,
+               because it cannot know tomorrow's beacon values today. A
+               round that has not been sealed here yet is refused.
+REWIND         Restore an agent from an old snapshot to undo its history
+               and its next action lands below the recorded floor. The
+               ladder is in a chain the agent does not control, so
+               restoring the agent does not restore its position.
 
-    GET  /plugin                  the customer page: two lines, downloads,
-                                  live log counts, check a receipt in the browser
-    GET  /p/sebbi_adapter.py      the client file customers drop beside their app
-    GET  /p/example_legacy_app.py the worked example
+REFUSALS ARE SEALED, NOT DROPPED
+--------------------------------
+This is the part that matters. A refused action is written into the chain
+with the reason. An agent trying to rewind is the single most interesting
+event this system can observe, and throwing it away as a 409 would be
+throwing away the evidence. /x/ratchet/refusals is public.
 
-The API key goes in the X-Sebbi-Key header (or "key" in the body). Set
-ADAPTER_OPEN=1 in Railway to accept submissions without a key (not advised).
+HONEST LIMITS
+-------------
+- It binds an actor's actions to an order. It says nothing about whether
+  any action was correct, authorised, or wise.
+- An actor that simply stops acting cannot be forced to continue. Silence
+  is visible (last_seen goes stale) but is not prevented.
+- Two different actor ids are two different ladders. Anyone able to mint
+  new actor ids can start a fresh ladder; that is an identity problem,
+  handled by whatever issues the ids, not here.
+- The floor is only as fine-grained as the beat cadence. At a five
+  minute cadence, two actions inside the same beat are ordered by
+  sequence, not by beacon time, and that is reported rather than dressed
+  up.
+- It depends on heartbeat. With no beats sealed, nothing can be admitted,
+  and this module says so rather than waving actions through.
 
-Loading: the live server loads modules through modules/router.py and calls
-handle(). ALIASES and register(MODULE_MAP) are also provided so a loader that
-maps modules by name (e.g. brain.py) can pick it up under "adapter",
-"sidecar" or "anchor".
-
-Assumes one server process (as on Railway today). If a second process ever
-writes the same database, appends detect it and reload before continuing.
+Contract: handle(method, action, data, api_key, ctx) -> (dict, status)
+Routes:
+  GET  spec      public  what this is and the exact admission rules
+  GET  actor     public  ?id= - one actor's current rung and ladder
+  GET  actors    public  every ladder, with staleness
+  GET  refusals  public  every refused attempt, with reason. The good bit.
+  GET  verify    public  ?id= - re-walk a ladder and report any break
+  GET  status    public  coverage, admission and refusal counts
+  POST act       keyed   submit an action. Admitted or refused; both sealed.
 """
 
-import base64
-import hashlib
 import json
-import os
-import re
-import sqlite3
-import sys
-import threading
 import time
-import urllib.parse
+import hashlib
 
-VERSION = "1.1.0"
-ALIASES = ["adapter", "sidecar", "anchor"]
-PUBLIC = {("GET", "status"), ("GET", "spec"), ("GET", "sth"), ("GET", "proof"),
-          ("GET", "receipt"), ("GET", "consistency"), ("GET", "find")}
+VERSION = "1.0.0"
 
-KEY = "public-proof-adapter"
-SITE = "https://sebbi.pro"
-MAX_ITEMS = 500
-MAX_BODY = 262144
-CHECKPOINT_SECONDS = max(10, int(os.environ.get("ADAPTER_CHECKPOINT_SECONDS", "60") or 60))
-CHECKPOINT_EVERY = max(1, int(os.environ.get("ADAPTER_CHECKPOINT_EVERY", "1000") or 1000))
-OPEN = os.environ.get("ADAPTER_OPEN", "0") == "1"
-HEX64 = re.compile(r"^[0-9a-f]{64}$")
-CID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,80}$")
-SPEC = ("RFC 6962 Merkle tree, SHA-256. leaf_hash = SHA256(0x00 || entry); "
-        "node = SHA256(0x01 || left || right); entry = the 32 raw bytes of the submitted hash.")
-
-_PAGE_B64 = (
-    "PCFET0NUWVBFIGh0bWw+PGh0bWwgbGFuZz0iZW4iPjxoZWFkPjxtZXRhIGNoYXJzZXQ9IlVURi04Ij4KPG1ldGEgbmFtZT0idmll"
-    "d3BvcnQiIGNvbnRlbnQ9IndpZHRoPWRldmljZS13aWR0aCxpbml0aWFsLXNjYWxlPTEsdmlld3BvcnQtZml0PWNvdmVyIj4KPHRp"
-    "dGxlPlBsdWcgaW4g4oCUIHNlYmJpLnBybzwvdGl0bGU+CjxtZXRhIG5hbWU9ImRlc2NyaXB0aW9uIiBjb250ZW50PSJUd28gbGlu"
-    "ZXMgb2YgUHl0aG9uIGFuZCBldmVyeSBjaGFuZ2UgeW91ciBzeXN0ZW0gbWFrZXMgZ2V0cyBhIHJlY2VpcHQgYW55b25lIGNhbiBj"
-    "aGVjay4gS2VlcCB5b3VyIHN0YWNrLiBBZGQgdGhlIHByb29mLiI+CjxsaW5rIGhyZWY9Imh0dHBzOi8vZm9udHMuZ29vZ2xlYXBp"
-    "cy5jb20vY3NzMj9mYW1pbHk9SUJNK1BsZXgrTW9ubzp3Z2h0QDQwMDs1MDA7NjAwJmZhbWlseT1JQk0rUGxleCtTYW5zOndnaHRA"
-    "NDAwOzUwMDs2MDAmZmFtaWx5PU5ld3NyZWFkZXI6b3Bzeix3Z2h0QDYuLjcyLDUwMCZkaXNwbGF5PXN3YXAiIHJlbD0ic3R5bGVz"
-    "aGVldCI+CjxzdHlsZT4KOnJvb3R7LS1pbms6IzA1MDcwZjstLWdvbGQ6I2M5YTg0YzstLW9rOiM3ZmUzYjA7LS1ibHVlOiM4ZmQw"
-    "ZmY7LS1tdXRlOiM4YTkzYWQ7LS1saW5lOnJnYmEoMTQzLDIwOCwyNTUsLjIyKTsKLS1tb25vOidJQk0gUGxleCBNb25vJyx1aS1t"
-    "b25vc3BhY2UsbW9ub3NwYWNlOy0tc2FuczonSUJNIFBsZXggU2Fucycsc3lzdGVtLXVpLHNhbnMtc2VyaWY7LS1zZXJpZjonTmV3"
-    "c3JlYWRlcicsR2VvcmdpYSxzZXJpZn0KKntib3gtc2l6aW5nOmJvcmRlci1ib3g7bWFyZ2luOjA7cGFkZGluZzowOy13ZWJraXQt"
-    "dGFwLWhpZ2hsaWdodC1jb2xvcjp0cmFuc3BhcmVudH0KYm9keXtiYWNrZ3JvdW5kOnJhZGlhbC1ncmFkaWVudChlbGxpcHNlIGF0"
-    "IDUwJSAwJSwjMTAyMzNlLCMwNTA3MGYgNjIlKTtjb2xvcjojZThlZGY3O2ZvbnQtZmFtaWx5OnZhcigtLXNhbnMpO2xpbmUtaGVp"
-    "Z2h0OjEuNjttaW4taGVpZ2h0OjEwMHZofQoud3JhcHttYXgtd2lkdGg6NzYwcHg7bWFyZ2luOjAgYXV0bztwYWRkaW5nOjAgMjBw"
-    "eCA4MHB4fQoudG9we2Rpc3BsYXk6ZmxleDtqdXN0aWZ5LWNvbnRlbnQ6c3BhY2UtYmV0d2VlbjthbGlnbi1pdGVtczpjZW50ZXI7"
-    "cGFkZGluZzpjYWxjKDE0cHggKyBlbnYoc2FmZS1hcmVhLWluc2V0LXRvcCkpIDAgMH0KLmJyYW5ke2ZvbnQtZmFtaWx5OnZhcigt"
-    "LW1vbm8pO2ZvbnQtc2l6ZToxM3B4fS5icmFuZCBie2NvbG9yOnZhcigtLWJsdWUpO2ZvbnQtd2VpZ2h0OjUwMH0KLnRvcCBhe2Zv"
-    "bnQtZmFtaWx5OnZhcigtLW1vbm8pO2ZvbnQtc2l6ZToxMnB4O2NvbG9yOnZhcigtLW11dGUpO3RleHQtZGVjb3JhdGlvbjpub25l"
-    "O21hcmdpbi1sZWZ0OjE0cHh9Cmgxe2ZvbnQtZmFtaWx5OnZhcigtLXNlcmlmKTtmb250LXdlaWdodDo1MDA7Zm9udC1zaXplOmNs"
-    "YW1wKDMycHgsN3Z3LDU0cHgpO2xpbmUtaGVpZ2h0OjEuMDg7bWFyZ2luOjMwcHggMCAxMnB4fQpoMntmb250LWZhbWlseTp2YXIo"
-    "LS1zZXJpZik7Zm9udC13ZWlnaHQ6NTAwO2ZvbnQtc2l6ZToyNHB4O21hcmdpbjowIDAgOHB4fQpwLmxlYWR7Y29sb3I6I2I2YzBk"
-    "Njtmb250LXNpemU6MTdweDttYXgtd2lkdGg6NTRjaH0KLmxpdmV7ZGlzcGxheTpmbGV4O2dhcDoxMHB4O21hcmdpbjoyNHB4IDAg"
-    "OHB4O2ZsZXgtd3JhcDp3cmFwfQouc3RhdHtmbGV4OjE7bWluLXdpZHRoOjE0MHB4O2JhY2tncm91bmQ6cmdiYSgxMywyMCwzNiwu"
-    "ODUpO2JvcmRlcjoxcHggc29saWQgdmFyKC0tbGluZSk7Ym9yZGVyLXJhZGl1czoxNHB4O3BhZGRpbmc6MTRweCAxNnB4fQouc3Rh"
-    "dCBie2Rpc3BsYXk6YmxvY2s7Zm9udDo2MDAgMjZweCB2YXIoLS1tb25vKTtjb2xvcjp2YXIoLS1vayk7Zm9udC12YXJpYW50LW51"
-    "bWVyaWM6dGFidWxhci1udW1zfQouc3RhdCBzcGFue2ZvbnQ6NTAwIDEycHggdmFyKC0tbW9ubyk7Y29sb3I6dmFyKC0tbXV0ZSl9"
-    "Ci5jYXJke2JhY2tncm91bmQ6cmdiYSgxMywyMCwzNiwuOCk7Ym9yZGVyOjFweCBzb2xpZCB2YXIoLS1saW5lKTtib3JkZXItcmFk"
-    "aXVzOjE2cHg7cGFkZGluZzoyMHB4O21hcmdpbi10b3A6MTZweH0KLmNhcmQgcHtjb2xvcjojYjZjMGQ2O2ZvbnQtc2l6ZToxNXB4"
-    "fQpwcmV7bWFyZ2luLXRvcDoxMnB4O2JhY2tncm91bmQ6IzAzMDUwYjtib3JkZXI6MXB4IHNvbGlkIHJnYmEoMjU1LDI1NSwyNTUs"
-    "LjA4KTtib3JkZXItcmFkaXVzOjEycHg7cGFkZGluZzoxNHB4IDE2cHg7b3ZlcmZsb3cteDphdXRvOwpmb250OjEzLjVweC8xLjYg"
-    "dmFyKC0tbW9ubyk7Y29sb3I6I2RmZThmNX0KcHJlIC5je2NvbG9yOnZhcigtLW11dGUpfXByZSAua3tjb2xvcjp2YXIoLS1ibHVl"
-    "KX1wcmUgLnN7Y29sb3I6dmFyKC0tb2spfQouc3RlcHN7Y291bnRlci1yZXNldDpzO2xpc3Qtc3R5bGU6bm9uZTttYXJnaW4tdG9w"
-    "OjEwcHh9Ci5zdGVwcyBsaXtjb3VudGVyLWluY3JlbWVudDpzO3Bvc2l0aW9uOnJlbGF0aXZlO3BhZGRpbmc6MTBweCAwIDEwcHgg"
-    "NDBweDtib3JkZXItdG9wOjFweCBzb2xpZCByZ2JhKDI1NSwyNTUsMjU1LC4wNik7Y29sb3I6I2NmZDhlYTtmb250LXNpemU6MTVw"
-    "eH0KLnN0ZXBzIGxpOmZpcnN0LWNoaWxke2JvcmRlci10b3A6MH0KLnN0ZXBzIGxpOmJlZm9yZXtjb250ZW50OmNvdW50ZXIocyk7"
-    "cG9zaXRpb246YWJzb2x1dGU7bGVmdDowO3RvcDoxMHB4O3dpZHRoOjI2cHg7aGVpZ2h0OjI2cHg7Ym9yZGVyLXJhZGl1czo4cHg7"
-    "YmFja2dyb3VuZDp2YXIoLS1ibHVlKTsKY29sb3I6IzA1MDcwZjtmb250OjYwMCAxM3B4IHZhcigtLW1vbm8pO2Rpc3BsYXk6Z3Jp"
-    "ZDtwbGFjZS1pdGVtczpjZW50ZXJ9Ci5idG5ze2Rpc3BsYXk6ZmxleDtmbGV4LXdyYXA6d3JhcDtnYXA6MTBweDttYXJnaW4tdG9w"
-    "OjE2cHh9Ci5idG57ZGlzcGxheTppbmxpbmUtZmxleDthbGlnbi1pdGVtczpjZW50ZXI7Z2FwOjhweDtwYWRkaW5nOjEzcHggMThw"
-    "eDtib3JkZXItcmFkaXVzOjEycHg7Zm9udDo2MDAgMTMuNXB4IHZhcigtLW1vbm8pO3RleHQtZGVjb3JhdGlvbjpub25lOwpiYWNr"
-    "Z3JvdW5kOnZhcigtLWJsdWUpO2NvbG9yOiMwNTA3MGY7Ym9yZGVyOjA7Y3Vyc29yOnBvaW50ZXJ9Ci5idG4uZ2hvc3R7YmFja2dy"
-    "b3VuZDp0cmFuc3BhcmVudDtjb2xvcjojZmZmO2JvcmRlcjoxcHggc29saWQgcmdiYSgyNTUsMjU1LDI1NSwuMjQpfQouYnRuOmZv"
-    "Y3VzLXZpc2libGUsaW5wdXQ6Zm9jdXMtdmlzaWJsZXtvdXRsaW5lOjJweCBzb2xpZCB2YXIoLS1vayk7b3V0bGluZS1vZmZzZXQ6"
-    "M3B4fQouZ3JpZHtkaXNwbGF5OmdyaWQ7Z3JpZC10ZW1wbGF0ZS1jb2x1bW5zOjFmcjtnYXA6MTJweDttYXJnaW4tdG9wOjEycHh9"
-    "CkBtZWRpYShtaW4td2lkdGg6NjIwcHgpey5ncmlke2dyaWQtdGVtcGxhdGUtY29sdW1uczoxZnIgMWZyfX0KLmdyaWQgZGl2e2Jh"
-    "Y2tncm91bmQ6cmdiYSgyNTUsMjU1LDI1NSwuMDMpO2JvcmRlcjoxcHggc29saWQgcmdiYSgyNTUsMjU1LDI1NSwuMDcpO2JvcmRl"
-    "ci1yYWRpdXM6MTJweDtwYWRkaW5nOjE0cHh9Ci5ncmlkIGJ7ZGlzcGxheTpibG9jaztmb250OjYwMCAxNHB4IHZhcigtLW1vbm8p"
-    "O2NvbG9yOiNmZmY7bWFyZ2luLWJvdHRvbTo0cHh9LmdyaWQgc3Bhbntmb250LXNpemU6MTRweDtjb2xvcjojYjZjMGQ2fQoucm93"
-    "e2Rpc3BsYXk6ZmxleDtnYXA6MTBweDttYXJnaW4tdG9wOjEycHh9CmlucHV0e2ZsZXg6MTttaW4td2lkdGg6MDtwYWRkaW5nOjEz"
-    "cHggMTRweDtib3JkZXItcmFkaXVzOjEycHg7Ym9yZGVyOjFweCBzb2xpZCByZ2JhKDI1NSwyNTUsMjU1LC4xOCk7YmFja2dyb3Vu"
-    "ZDojMDMwNTBiO2NvbG9yOiNmZmY7Zm9udDoxNXB4IHZhcigtLW1vbm8pfQoub3V0e21hcmdpbi10b3A6MTRweDtmb250OjEzcHgv"
-    "MS42IHZhcigtLW1vbm8pO2NvbG9yOiNjZmU2ZDk7ZGlzcGxheTpub25lO3dvcmQtYnJlYWs6YnJlYWstYWxsfQoub3V0Lm9ue2Rp"
-    "c3BsYXk6YmxvY2t9LnBhc3N7Y29sb3I6dmFyKC0tb2spO2ZvbnQtd2VpZ2h0OjYwMH0uZmFpbHtjb2xvcjojZmY4YTgwO2ZvbnQt"
-    "d2VpZ2h0OjYwMH0KLm91dCBhe2NvbG9yOnZhcigtLWJsdWUpfQo8L3N0eWxlPjwvaGVhZD48Ym9keT48ZGl2IGNsYXNzPSJ3cmFw"
-    "Ij4KPGRpdiBjbGFzcz0idG9wIj48ZGl2IGNsYXNzPSJicmFuZCI+c2ViYmk8Yj4ucHJvPC9iPiDCtyBQTFVHIElOPC9kaXY+PG5h"
-    "dj48YSBocmVmPSIvc3RhcnQiPlN0YXJ0PC9hPjxhIGhyZWY9Ii9wcm92ZSI+UHJvb2Y8L2E+PGEgaHJlZj0iLyI+SG9tZTwvYT48"
-    "L25hdj48L2Rpdj4KCjxoMT5LZWVwIHlvdXIgc3lzdGVtLjxicj5BZGQgdGhlIHByb29mLjwvaDE+CjxwIGNsYXNzPSJsZWFkIj5U"
-    "d28gbGluZXMgb2YgUHl0aG9uIGFuZCBldmVyeSBjaGFuZ2UgeW91ciBzeXN0ZW0gbWFrZXMgZ2V0cyBhIHJlY2VpcHQgYW55b25l"
-    "IGNhbiBjaGVjay4gU2FtZSBkYXRhYmFzZSwgc2FtZSBjb2RlLCBzYW1lIHNlcnZlcnMuIE9ubHkgYSBmaW5nZXJwcmludCB0cmF2"
-    "ZWxzOyB5b3VyIGRhdGEgc3RheXMgZXhhY3RseSB3aGVyZSBpdCBpcy48L3A+Cgo8ZGl2IGNsYXNzPSJsaXZlIiBpZD0ibGl2ZSI+"
-    "CiA8ZGl2IGNsYXNzPSJzdGF0Ij48YiBpZD0ic2l6ZSI+4oCUPC9iPjxzcGFuPmVudHJpZXMgaW4gdGhlIHB1YmxpYyBsb2c8L3Nw"
-    "YW4+PC9kaXY+CiA8ZGl2IGNsYXNzPSJzdGF0Ij48YiBpZD0ic2VhbGVkIj7igJQ8L2I+PHNwYW4+bGFzdCB0cmVlIGhlYWQgc2Vh"
-    "bGVkIGluIGJsb2NrPC9zcGFuPjwvZGl2Pgo8L2Rpdj4KCjxkaXYgY2xhc3M9ImNhcmQiPgogPGgyPlRoZSB0d28gbGluZXM8L2gy"
-    "PgogPHA+UHV0IHRoZSBpbXBvcnQgYXQgdGhlIHRvcCBhbmQgdGhlIGxpbmUgYWJvdmUgYW55IGZ1bmN0aW9uIHRoYXQgY2hhbmdl"
-    "cyBzb21ldGhpbmcgaW1wb3J0YW50LiBJdCBjYXJyaWVzIG9uIHdvcmtpbmcgZXhhY3RseSBhcyBiZWZvcmUuPC9wPgo8cHJlPjxz"
-    "cGFuIGNsYXNzPSJrIj5mcm9tPC9zcGFuPiBzZWJiaV9hZGFwdGVyIDxzcGFuIGNsYXNzPSJrIj5pbXBvcnQ8L3NwYW4+IGFuY2hv"
-    "cl9zdGF0ZQo8c3BhbiBjbGFzcz0iayI+QGFuY2hvcl9zdGF0ZTwvc3Bhbj4oPHNwYW4gY2xhc3M9InMiPiJvcmRlcnMudXBkYXRl"
-    "Ijwvc3Bhbj4pCjxzcGFuIGNsYXNzPSJrIj5kZWY8L3NwYW4+IHVwZGF0ZV9vcmRlcihvcmRlcl9pZCwgc3RhdHVzKToKICAgIC4u"
-    "LiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIDxzcGFuIGNsYXNzPSJjIj4jIHlvdXIgY29kZSwgdW5jaGFuZ2VkPC9zcGFu"
-    "PgogICAgPHNwYW4gY2xhc3M9ImsiPnJldHVybjwvc3Bhbj4gezxzcGFuIGNsYXNzPSJzIj4ib3JkZXJfaWQiPC9zcGFuPjogb3Jk"
-    "ZXJfaWQsIDxzcGFuIGNsYXNzPSJzIj4ic3RhdHVzIjwvc3Bhbj46IHN0YXR1c308L3ByZT4KIDxvbCBjbGFzcz0ic3RlcHMiPgog"
-    "IDxsaT5Eb3dubG9hZCA8Yj5zZWJiaV9hZGFwdGVyLnB5PC9iPiBhbmQgcHV0IGl0IG5leHQgdG8geW91ciBjb2RlLiBObyBpbnN0"
-    "YWxscywgbm90aGluZyBlbHNlIHRvIGFkZC48L2xpPgogIDxsaT5TZXQgeW91ciBzZWJiaS5wcm8ga2V5OiA8Y29kZT5TRUJCSV9B"
-    "UElfS0VZPXlvdXIta2V5PC9jb2RlPjwvbGk+CiAgPGxpPkFkZCB0aGUgZGVjb3JhdG9yLiBSZWNlaXB0cyBhcnJpdmUgaW4gdGhl"
-    "IGJhY2tncm91bmQgZnJvbSB0aGVuIG9uLjwvbGk+CiA8L29sPgogPGRpdiBjbGFzcz0iYnRucyI+CiAgPGEgY2xhc3M9ImJ0biIg"
-    "aHJlZj0iL3Avc2ViYmlfYWRhcHRlci5weSIgZG93bmxvYWQ+RG93bmxvYWQgc2ViYmlfYWRhcHRlci5weTwvYT4KICA8YSBjbGFz"
-    "cz0iYnRuIGdob3N0IiBocmVmPSIvcC9leGFtcGxlX2xlZ2FjeV9hcHAucHkiIGRvd25sb2FkPldvcmtlZCBleGFtcGxlPC9hPgog"
-    "IDxhIGNsYXNzPSJidG4gZ2hvc3QiIGhyZWY9Ii9zdGFydCI+R2V0IGEga2V5PC9hPgogPC9kaXY+CjwvZGl2PgoKPGRpdiBjbGFz"
-    "cz0iY2FyZCI+CiA8aDI+V2hhdCB5b3UgZ2V0PC9oMj4KIDxkaXYgY2xhc3M9ImdyaWQiPgogIDxkaXY+PGI+TmV2ZXIgc2xvd3Mg"
-    "eW91IGRvd248L2I+PHNwYW4+RmluZ2VycHJpbnRzIHF1ZXVlIG9uIHlvdXIgb3duIG1hY2hpbmUgYW5kIHNlbmQgaW4gdGhlIGJh"
-    "Y2tncm91bmQuIFlvdXIgYXBwIG5ldmVyIHdhaXRzIG9uIHRoZSBuZXR3b3JrLjwvc3Bhbj48L2Rpdj4KICA8ZGl2PjxiPktlZXBz"
-    "IGdvaW5nIG9mZmxpbmU8L2I+PHNwYW4+SWYgc2ViYmkucHJvIGNhbid0IGJlIHJlYWNoZWQsIGV2ZXJ5dGhpbmcgd2FpdHMgc2Fm"
-    "ZWx5IGFuZCBzZW5kcyBpbiBvcmRlciB3aGVuIGl0J3MgYmFjay4gTm90aGluZyBsb3N0LCBub3RoaW5nIGRvdWJsZWQuPC9zcGFu"
-    "PjwvZGl2PgogIDxkaXY+PGI+Q2hlY2tzIHRoZSBhbnN3ZXI8L2I+PHNwYW4+RXZlcnkgcmVjZWlwdCBpcyB2ZXJpZmllZCBvbiB5"
-    "b3VyIHNpZGUgdGhlIG1vbWVudCBpdCBhcnJpdmVzLCBzbyB5b3UncmUgbm90IHRha2luZyBvdXIgd29yZCBmb3IgaXQuPC9zcGFu"
-    "PjwvZGl2PgogIDxkaXY+PGI+QW5jaG9yZWQgaW4gQml0Y29pbjwvYj48c3Bhbj5UaGUgbG9nIGlzIHNlYWxlZCBpbnRvIHRoZSBz"
-    "ZWJiaS5wcm8gY2hhaW4gZXZlcnkgbWludXRlLCBhbmQgdGhlIGNoYWluIGlzIHRpbWVzdGFtcGVkIGluIEJpdGNvaW4uPC9zcGFu"
-    "PjwvZGl2PgogIDxkaXY+PGI+U3RhbmRhcmQgcHJvb2ZzPC9iPjxzcGFuPlRoZSBzYW1lIE1lcmtsZS10cmVlIHJlY2VpcHRzIHRo"
-    "YXQgc2VjdXJlIHdlYiBjZXJ0aWZpY2F0ZXMgKFJGQyA2OTYyKS4gQW55IGNvbXBhdGlibGUgY2hlY2tlciBjYW4gdmVyaWZ5IHRo"
-    "ZW0uPC9zcGFuPjwvZGl2PgogIDxkaXY+PGI+V29ya3Mgd2l0aCBhbnl0aGluZzwvYj48c3Bhbj5EYXRhYmFzZSB3cml0ZXMsIEFQ"
-    "SSBoYW5kbGVycywgYXN5bmMgY29kZSBhbmQgeW91ciBleGlzdGluZyBsb2dnZXJzLiBQeXRob24gMy44IGFuZCB1cC48L3NwYW4+"
-    "PC9kaXY+CiA8L2Rpdj4KPC9kaXY+Cgo8ZGl2IGNsYXNzPSJjYXJkIiBpZD0iY2hlY2siPgogPGgyPkNoZWNrIGEgcmVjZWlwdDwv"
-    "aDI+CiA8cD5UeXBlIGFuIGVudHJ5IG51bWJlci4gWW91ciBicm93c2VyIGZldGNoZXMgdGhlIHJlY2VpcHQgYW5kIGNoZWNrcyB0"
-    "aGUgbWF0aHMgaXRzZWxmLjwvcD4KIDxkaXYgY2xhc3M9InJvdyI+PGlucHV0IGlkPSJsZWFmIiBpbnB1dG1vZGU9Im51bWVyaWMi"
-    "IHBsYWNlaG9sZGVyPSJFbnRyeSBudW1iZXIsIGUuZy4gMCIgYXJpYS1sYWJlbD0iRW50cnkgbnVtYmVyIj48YnV0dG9uIGNsYXNz"
-    "PSJidG4iIGlkPSJnbyI+Q2hlY2s8L2J1dHRvbj48L2Rpdj4KIDxkaXYgY2xhc3M9Im91dCIgaWQ9Im91dCI+PC9kaXY+CjwvZGl2"
-    "Pgo8L2Rpdj4KPHNjcmlwdD4KKGZ1bmN0aW9uKCl7CiJ1c2Ugc3RyaWN0IjsKZnVuY3Rpb24gJChpKXtyZXR1cm4gZG9jdW1lbnQu"
-    "Z2V0RWxlbWVudEJ5SWQoaSl9CmZ1bmN0aW9uIGhleDJiKGgpe3ZhciBhPW5ldyBVaW50OEFycmF5KGgubGVuZ3RoLzIpO2Zvcih2"
-    "YXIgaT0wO2k8YS5sZW5ndGg7aSsrKWFbaV09cGFyc2VJbnQoaC5zdWJzdHIoaSoyLDIpLDE2KTtyZXR1cm4gYX0KZnVuY3Rpb24g"
-    "YjJoZXgoYil7cmV0dXJuIEFycmF5LnByb3RvdHlwZS5tYXAuY2FsbChuZXcgVWludDhBcnJheShiKSxmdW5jdGlvbih4KXtyZXR1"
-    "cm4oIjAiK3gudG9TdHJpbmcoMTYpKS5zbGljZSgtMil9KS5qb2luKCIiKX0KZnVuY3Rpb24gY2F0KCl7dmFyIG49MCxpO2Zvcihp"
-    "PTA7aTxhcmd1bWVudHMubGVuZ3RoO2krKyluKz1hcmd1bWVudHNbaV0ubGVuZ3RoO3ZhciBvPW5ldyBVaW50OEFycmF5KG4pLHA9"
-    "MDtmb3IoaT0wO2k8YXJndW1lbnRzLmxlbmd0aDtpKyspe28uc2V0KGFyZ3VtZW50c1tpXSxwKTtwKz1hcmd1bWVudHNbaV0ubGVu"
-    "Z3RofXJldHVybiBvfQpmdW5jdGlvbiBIKGIpe3JldHVybiBjcnlwdG8uc3VidGxlLmRpZ2VzdCgiU0hBLTI1NiIsYikudGhlbihm"
-    "dW5jdGlvbihkKXtyZXR1cm4gbmV3IFVpbnQ4QXJyYXkoZCl9KX0KZnVuY3Rpb24gdmVyaWZ5KGVudHJ5LGlkeCxzaXplLHBhdGgs"
-    "cm9vdCl7CiBpZihpZHg8MHx8aWR4Pj1zaXplKXJldHVybiBQcm9taXNlLnJlc29sdmUoZmFsc2UpOwogdmFyIGZuPWlkeCxzbj1z"
-    "aXplLTE7CiByZXR1cm4gSChjYXQobmV3IFVpbnQ4QXJyYXkoWzBdKSxoZXgyYihlbnRyeSkpKS50aGVuKGZ1bmN0aW9uKHIpewog"
-    "IHZhciBjaGFpbj1Qcm9taXNlLnJlc29sdmUociksYmFkPWZhbHNlOwogIHBhdGguZm9yRWFjaChmdW5jdGlvbihwaCl7CiAgIGNo"
-    "YWluPWNoYWluLnRoZW4oZnVuY3Rpb24ocil7CiAgICB2YXIgcD1oZXgyYihwaCk7CiAgICBpZihzbj09PTApe2JhZD10cnVlO3Jl"
-    "dHVybiByfQogICAgdmFyIHByOwogICAgaWYoKGZuJjEpfHxmbj09PXNuKXtwcj1IKGNhdChuZXcgVWludDhBcnJheShbMV0pLHAs"
-    "cikpO2lmKCEoZm4mMSkpe3doaWxlKCEoZm4mMSkmJmZuIT09MCl7Zm4+Pj0xO3NuPj49MX19fQogICAgZWxzZSBwcj1IKGNhdChu"
-    "ZXcgVWludDhBcnJheShbMV0pLHIscCkpOwogICAgZm4+Pj0xO3NuPj49MTtyZXR1cm4gcHJ9KTsKICB9KTsKICByZXR1cm4gY2hh"
-    "aW4udGhlbihmdW5jdGlvbihyKXtyZXR1cm4gIWJhZCYmc249PT0wJiZiMmhleChyKT09PXJvb3R9KTsKIH0pOwp9CmZldGNoKCIv"
-    "cC9zdGgiLHtjYWNoZToibm8tc3RvcmUifSkudGhlbihmdW5jdGlvbihyKXtyZXR1cm4gci5qc29uKCl9KS50aGVuKGZ1bmN0aW9u"
-    "KGQpewogJCgic2l6ZSIpLnRleHRDb250ZW50PShkLnRyZWVfc2l6ZXx8MCkudG9Mb2NhbGVTdHJpbmcoImVuLUdCIik7CiB2YXIg"
-    "cz1kLmxhdGVzdF9zZWFsZWRfdHJlZV9oZWFkOyQoInNlYWxlZCIpLnRleHRDb250ZW50PXMmJnMuYmxvY2tfaW5kZXghPW51bGw/"
-    "cy5ibG9ja19pbmRleDoi4oCUIjsKfSkuY2F0Y2goZnVuY3Rpb24oKXt9KTsKZnVuY3Rpb24gcnVuKCl7CiB2YXIgbj1wYXJzZUlu"
-    "dCgkKCJsZWFmIikudmFsdWUsMTApLG89JCgib3V0Iik7by5jbGFzc05hbWU9Im91dCBvbiI7CiBpZihpc05hTihuKXx8bjwwKXtv"
-    "LnRleHRDb250ZW50PSJUeXBlIGFuIGVudHJ5IG51bWJlciAoMCBvciBtb3JlKS4iO3JldHVybn0KIG8udGV4dENvbnRlbnQ9IkZl"
-    "dGNoaW5nIGVudHJ5ICIrbisi4oCmIjsKIGZldGNoKCIvcC9yZWNlaXB0P2xlYWY9IituLHtjYWNoZToibm8tc3RvcmUifSkudGhl"
-    "bihmdW5jdGlvbihyKXtyZXR1cm4gci5qc29uKCl9KS50aGVuKGZ1bmN0aW9uKGQpewogIGlmKGQuZXJyb3Ipe28udGV4dENvbnRl"
-    "bnQ9Ik5vIGVudHJ5ICIrbisiIHlldC4iO3JldHVybn0KICByZXR1cm4gdmVyaWZ5KGQuZW50cnlfaGFzaCxkLmxlYWZfaW5kZXgs"
-    "ZC50cmVlX3NpemUsZC5hdWRpdF9wYXRoLGQucm9vdCkudGhlbihmdW5jdGlvbihvayl7CiAgIHZhciBjcD1kLmNoZWNrcG9pbnQ7"
-    "CiAgIG8uaW5uZXJIVE1MPShvaz8nPHNwYW4gY2xhc3M9InBhc3MiPlBBU1M8L3NwYW4+IGNoZWNrZWQgaW4geW91ciBicm93c2Vy"
-    "OiBlbnRyeSAnOic8c3BhbiBjbGFzcz0iZmFpbCI+RkFJTDwvc3Bhbj4gdGhlIG1hdGhzIGRvZXMgbm90IGFkZCB1cCBmb3IgZW50"
-    "cnkgJykrbisKICAgIiBpcyBpbiB0aGUgbG9nIG9mICIrZC50cmVlX3NpemUrIiBlbnRyaWVzLjxicj5GaW5nZXJwcmludDogIitk"
-    "LmVudHJ5X2hhc2grIjxicj5Sb290OiAiK2Qucm9vdCsKICAgKGNwJiZjcC5ibG9ja19pbmRleCE9bnVsbD8nPGJyPlNlYWxlZCBp"
-    "biBjaGFpbiBibG9jayA8YSBocmVmPSIveC93YWxrL2Jsb2NrP2luZGV4PScrY3AuYmxvY2tfaW5kZXgrJyI+JytjcC5ibG9ja19p"
-    "bmRleCsiPC9hPiI6Ijxicj5TZWFsaW5nIGludG8gdGhlIGNoYWluIHdpdGhpbiB0aGUgbWludXRlLiIpOwogIH0pOwogfSkuY2F0"
-    "Y2goZnVuY3Rpb24oKXtvLnRleHRDb250ZW50PSJDb3VsZG4ndCByZWFjaCB0aGUgbG9nLiJ9KTsKfQokKCJnbyIpLm9uY2xpY2s9"
-    "cnVuOyQoImxlYWYiKS5hZGRFdmVudExpc3RlbmVyKCJrZXlkb3duIixmdW5jdGlvbihlKXtpZihlLmtleT09PSJFbnRlciIpcnVu"
-    "KCl9KTsKaWYobG9jYXRpb24uaGFzaD09PSIjY2hlY2siKSQoImxlYWYiKS5mb2N1cygpOwp9KSgpOwo8L3NjcmlwdD48L2JvZHk+"
-    "PC9odG1sPgo="
-)
-_ADAPTER_B64 = (
-    "IiIiCnNlYmJpX2FkYXB0ZXIucHkgIHYxLjAuMCAtIGRyb3AtaW4gc3RhdGUgYW5jaG9yaW5nIGZvciBsZWdhY3kgYXBwbGljYXRp"
-    "b25zLgoKWW91ciBhcHBsaWNhdGlvbiBrZWVwcyBpdHMgZGF0YWJhc2UsIGl0cyBsb2dpYyBhbmQgaXRzIGluZnJhc3RydWN0dXJl"
-    "LiBUaGlzCmZpbGUgc2l0cyBiZXNpZGUgaXQ6IGV2ZXJ5IHN0YXRlIGNoYW5nZSB5b3UgcG9pbnQgaXQgYXQgaXMgdHVybmVkIGlu"
-    "dG8gYQpTSEEtMjU2IGZpbmdlcnByaW50LCBxdWV1ZWQgbG9jYWxseSwgYW5kIHNlbnQgaW4gdGhlIGJhY2tncm91bmQgdG8gdGhl"
-    "CnNlYmJpLnBybyBwdWJsaWMgcHJvb2YgbG9nLCB3aGljaCByZXR1cm5zIGEgcmVjZWlwdCBwcm92aW5nIHRoZSBmaW5nZXJwcmlu"
-    "dAppcyBpbiBhbiBhcHBlbmQtb25seSBSRkMgNjk2MiBNZXJrbGUgdHJlZSB3aG9zZSB0cmVlIGhlYWRzIGFyZSBzZWFsZWQgaW50"
-    "byB0aGUKc2ViYmkucHJvIGNoYWluIGFuZCB0aW1lc3RhbXBlZCBpbiBCaXRjb2luLgoKT25seSB0aGUgZmluZ2VycHJpbnQgbGVh"
-    "dmVzIHlvdXIgbWFjaGluZS4gVGhlIGRhdGEgaXRzZWxmIG5ldmVyIGRvZXMuCgpUV08gTElORVMKLS0tLS0tLS0tCiAgICBleHBv"
-    "cnQgU0VCQklfQVBJX0tFWT15b3VyLWtleSAgICAgICAgICAob25jZSwgaW4gdGhlIGVudmlyb25tZW50KQoKICAgIGZyb20gc2Vi"
-    "YmlfYWRhcHRlciBpbXBvcnQgYW5jaG9yX3N0YXRlCiAgICBAYW5jaG9yX3N0YXRlKCJvcmRlcnMudXBkYXRlIikKICAgIGRlZiB1"
-    "cGRhdGVfb3JkZXIob3JkZXJfaWQsIHN0YXR1cyk6CiAgICAgICAgLi4uICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
-    "IyB1bmNoYW5nZWQKICAgICAgICByZXR1cm4geyJvcmRlcl9pZCI6IG9yZGVyX2lkLCAic3RhdHVzIjogc3RhdHVzfQoKVGhlIHJl"
-    "dHVybiB2YWx1ZSBpcyBmaW5nZXJwcmludGVkIGFmdGVyIHRoZSBmdW5jdGlvbiBzdWNjZWVkcy4gVGhlIGNhbGwgaXMKbmV2ZXIg"
-    "c2xvd2VkIGRvd24gYnkgdGhlIG5ldHdvcmsgYW5kIG5ldmVyIGZhaWxzIGJlY2F1c2Ugb2YgdGhpcyBmaWxlOgpmaW5nZXJwcmlu"
-    "dHMgZ28gaW50byBhIGxvY2FsIGFwcGVuZC1vbmx5IHF1ZXVlIChzcWxpdGUpIGFuZCBhIGJhY2tncm91bmQKdGhyZWFkIHNlbmRz"
-    "IHRoZW0uIElmIHNlYmJpLnBybyBpcyB1bnJlYWNoYWJsZSB0aGV5IHdhaXQsIGFuZCBhcmUgc2VudCB3aGVuIGl0CmNvbWVzIGJh"
-    "Y2ssIGluIG9yZGVyLCB3aXRoIG5vIGR1cGxpY2F0ZXMuCgpPVEhFUiBXQVlTIElOCi0tLS0tLS0tLS0tLS0KICAgIGZyb20gc2Vi"
-    "YmlfYWRhcHRlciBpbXBvcnQgcmVjb3JkLCBBbmNob3JMb2dIYW5kbGVyCiAgICByZWNvcmQoeyJhY2NvdW50IjogNDIsICJiYWxh"
-    "bmNlIjogMTI1MH0pICAgICAgICAgICMgYW55d2hlcmUsIHJldHVybnMgdGhlIGhhc2gKICAgIGxvZ2dpbmcuZ2V0TG9nZ2VyKCJw"
-    "YXltZW50cyIpLmFkZEhhbmRsZXIoQW5jaG9yTG9nSGFuZGxlcigpKSAgICMgZXZlcnkgbG9nIGxpbmUKCiAgICBAYW5jaG9yX3N0"
-    "YXRlKCJsZWRnZXIucG9zdCIsIGNhcHR1cmU9ImFyZ3MiKSAgICAgICMgZmluZ2VycHJpbnQgdGhlIGlucHV0cyBpbnN0ZWFkCiAg"
-    "ICBAYW5jaG9yX3N0YXRlKCJ1c2VyLnNhdmUiLCBleHRyYWN0PWxhbWJkYSByZXN1bHQsIGFyZ3MsIGt3YXJnczogcmVzdWx0LnRv"
-    "X2RpY3QoKSkKCkFzeW5jIGZ1bmN0aW9ucyB3b3JrIHRoZSBzYW1lIHdheS4KCkNIRUNLSU5HCi0tLS0tLS0tCiAgICBweXRob24g"
-    "c2ViYmlfYWRhcHRlci5weSBzdGF0dXMgICAgICAgICAgICBxdWV1ZSBhbmQgcmVjZWlwdCBjb3VudHMKICAgIHB5dGhvbiBzZWJi"
-    "aV9hZGFwdGVyLnB5IGZsdXNoICAgICAgICAgICAgIHNlbmQgd2hhdCBpcyB3YWl0aW5nLCBub3cKICAgIHB5dGhvbiBzZWJiaV9h"
-    "ZGFwdGVyLnB5IHJlY2VpcHQgPGhhc2g+ICAgIHRoZSByZWNlaXB0IGZvciBvbmUgZmluZ2VycHJpbnQKICAgIHB5dGhvbiBzZWJi"
-    "aV9hZGFwdGVyLnB5IHZlcmlmeSAgICAgICAgICAgIHJlLWNoZWNrIGV2ZXJ5IHN0b3JlZCByZWNlaXB0IGxvY2FsbHkKICAgIHB5"
-    "dGhvbiBzZWJiaV9hZGFwdGVyLnB5IGhhc2ggJzxqc29uPicgICAgIGZpbmdlcnByaW50IGEgSlNPTiB2YWx1ZSBleGFjdGx5IGFz"
-    "IHRoZSBhZGFwdGVyIHdvdWxkCgpFdmVyeSByZWNlaXB0IGlzIGNoZWNrZWQgb24gYXJyaXZhbCB3aXRoIGFuIFJGQyA2OTYyIGlu"
-    "Y2x1c2lvbiBjaGVjaywgc28gdGhlCnNlcnZlcidzIGFuc3dlciBpcyB2ZXJpZmllZCwgbm90IHRydXN0ZWQuIEEgcmVjZWlwdCB0"
-    "aGF0IGZhaWxzIHRoZSBjaGVjayBpcwprZXB0IChhcyBldmlkZW5jZSkgYW5kIGZsYWdnZWQuCgpGSU5HRVJQUklOVCBSVUxFIChz"
-    "byBhbnlvbmUgY2FuIHJlY29tcHV0ZSBpdCkKLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tClNI"
-    "QS0yNTYgb3ZlciBjYW5vbmljYWwgSlNPTjoga2V5cyBzb3J0ZWQsIHNlcGFyYXRvcnMgIiwiIGFuZCAiOiIsIFVURi04LCBubwpl"
-    "eHRyYSB3aGl0ZXNwYWNlLiBkYXRldGltZS9kYXRlIC0+IElTTyA4NjAxIHN0cmluZywgRGVjaW1hbCAtPiBzdHJpbmcsCmJ5dGVz"
-    "IC0+IGhleCwgc2V0IC0+IHNvcnRlZCBsaXN0LCBVVUlEIC0+IHN0cmluZywgZGF0YWNsYXNzIC0+IGl0cyBmaWVsZHMsCm9iamVj"
-    "dHMgd2l0aCB0b19kaWN0KCkvX2FzZGljdCgpIC0+IHRoYXQuIEZsb2F0cyB1c2UgUHl0aG9uJ3MgcmVwci4gQW55dGhpbmcKZWxz"
-    "ZSBpcyByZWZ1c2VkIChhbmQgbG9nZ2VkKSByYXRoZXIgdGhhbiBndWVzc2VkIGF0IC0gcGFzcyBleHRyYWN0PSBmb3IgdGhvc2Uu"
-    "CgpTRVRUSU5HUyAoZW52aXJvbm1lbnQgb3IgQW5jaG9yKC4uLikgYXJndW1lbnRzKQotLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0t"
-    "LS0tLS0tLS0tLS0tLS0tLS0tLS0tLQogICAgU0VCQklfQVBJX0tFWSAgICAgICAgeW91ciBrZXkgKHdpdGhvdXQgaXQsIGZpbmdl"
-    "cnByaW50cyBxdWV1ZSBhbmQgd2FpdCkKICAgIFNFQkJJX0VORFBPSU5UICAgICAgIGRlZmF1bHQgaHR0cHM6Ly9zZWJiaS5wcm8K"
-    "ICAgIFNFQkJJX0RCICAgICAgICAgICAgIGRlZmF1bHQgLi9zZWJiaV9hbmNob3IuZGIKICAgIFNFQkJJX0RJU0FCTEVEPTEgICAg"
-    "IHJlY29yZCBub3RoaW5nIChraWxsIHN3aXRjaCkKClN0YW5kYXJkIGxpYnJhcnkgb25seS4gUHl0aG9uIDMuOCsuCiIiIgoKaW1w"
-    "b3J0IGFzeW5jaW8KaW1wb3J0IGF0ZXhpdAppbXBvcnQgZGF0YWNsYXNzZXMKaW1wb3J0IGRhdGV0aW1lCmltcG9ydCBkZWNpbWFs"
-    "CmltcG9ydCBmdW5jdG9vbHMKaW1wb3J0IGhhc2hsaWIKaW1wb3J0IGluc3BlY3QKaW1wb3J0IGpzb24KaW1wb3J0IGxvZ2dpbmcK"
-    "aW1wb3J0IG9zCmltcG9ydCBzcWxpdGUzCmltcG9ydCBzeXMKaW1wb3J0IHRocmVhZGluZwppbXBvcnQgdGltZQppbXBvcnQgdXJs"
-    "bGliLmVycm9yCmltcG9ydCB1cmxsaWIucmVxdWVzdAppbXBvcnQgdXVpZAoKX192ZXJzaW9uX18gPSAiMS4wLjAiCl9fYWxsX18g"
-    "PSBbImFuY2hvcl9zdGF0ZSIsICJyZWNvcmQiLCAiQW5jaG9yIiwgIkFuY2hvckxvZ0hhbmRsZXIiLCAiY2Fub25pY2FsX2pzb24i"
-    "LCAic3RhdGVfaGFzaCIsCiAgICAgICAgICAgInZlcmlmeV9pbmNsdXNpb24iLCAidmVyaWZ5X2NvbnNpc3RlbmN5IiwgImdldF9k"
-    "ZWZhdWx0Il0KCmxvZyA9IGxvZ2dpbmcuZ2V0TG9nZ2VyKCJzZWJiaV9hZGFwdGVyIikKCgojIC0tLS0tLS0tLS0tLS0tLS0tLS0t"
-    "LS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0gZmluZ2VycHJpbnRzCgpkZWYgX2RlZmF1bHQobyk6"
-    "CiAgICBpZiBpc2luc3RhbmNlKG8sIChkYXRldGltZS5kYXRldGltZSwgZGF0ZXRpbWUuZGF0ZSwgZGF0ZXRpbWUudGltZSkpOgog"
-    "ICAgICAgIHJldHVybiBvLmlzb2Zvcm1hdCgpCiAgICBpZiBpc2luc3RhbmNlKG8sIGRlY2ltYWwuRGVjaW1hbCk6CiAgICAgICAg"
-    "cmV0dXJuIHN0cihvKQogICAgaWYgaXNpbnN0YW5jZShvLCAoYnl0ZXMsIGJ5dGVhcnJheSwgbWVtb3J5dmlldykpOgogICAgICAg"
-    "IHJldHVybiBieXRlcyhvKS5oZXgoKQogICAgaWYgaXNpbnN0YW5jZShvLCAoc2V0LCBmcm96ZW5zZXQpKToKICAgICAgICByZXR1"
-    "cm4gc29ydGVkKG8sIGtleT1sYW1iZGEgeDogY2Fub25pY2FsX2pzb24oeCkpCiAgICBpZiBpc2luc3RhbmNlKG8sIHV1aWQuVVVJ"
-    "RCk6CiAgICAgICAgcmV0dXJuIHN0cihvKQogICAgaWYgZGF0YWNsYXNzZXMuaXNfZGF0YWNsYXNzKG8pIGFuZCBub3QgaXNpbnN0"
-    "YW5jZShvLCB0eXBlKToKICAgICAgICByZXR1cm4gZGF0YWNsYXNzZXMuYXNkaWN0KG8pCiAgICBmb3IgYXR0ciBpbiAoInRvX2Rp"
-    "Y3QiLCAiX2FzZGljdCIpOgogICAgICAgIGZuID0gZ2V0YXR0cihvLCBhdHRyLCBOb25lKQogICAgICAgIGlmIGNhbGxhYmxlKGZu"
-    "KToKICAgICAgICAgICAgcmV0dXJuIGZuKCkKICAgIHJhaXNlIFR5cGVFcnJvcigiY2Fubm90IGZpbmdlcnByaW50ICVzIC0gcGFz"
-    "cyBleHRyYWN0PSB0byBjaG9vc2Ugd2hhdCB0byByZWNvcmQiICUgdHlwZShvKS5fX25hbWVfXykKCgpkZWYgY2Fub25pY2FsX2pz"
-    "b24ob2JqKToKICAgICIiIlRoZSBleGFjdCBieXRlcyB0aGUgZmluZ2VycHJpbnQgaXMgdGFrZW4gb3Zlci4iIiIKICAgIHJldHVy"
-    "biBqc29uLmR1bXBzKG9iaiwgc29ydF9rZXlzPVRydWUsIHNlcGFyYXRvcnM9KCIsIiwgIjoiKSwgZW5zdXJlX2FzY2lpPUZhbHNl"
-    "LAogICAgICAgICAgICAgICAgICAgICAgYWxsb3dfbmFuPUZhbHNlLCBkZWZhdWx0PV9kZWZhdWx0KS5lbmNvZGUoInV0Zi04IikK"
-    "CgpkZWYgc3RhdGVfaGFzaChvYmopOgogICAgIiIiU0hBLTI1NiBvZiBjYW5vbmljYWwgSlNPTiwgYXMgNjQgbG93ZXJjYXNlIGhl"
-    "eCBjaGFyYWN0ZXJzLiIiIgogICAgcmV0dXJuIGhhc2hsaWIuc2hhMjU2KGNhbm9uaWNhbF9qc29uKG9iaikpLmhleGRpZ2VzdCgp"
-    "CgoKIyAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tIFJGQyA2"
-    "OTYyIGNoZWNrcwoKZGVmIF9oKGIpOgogICAgcmV0dXJuIGhhc2hsaWIuc2hhMjU2KGIpLmRpZ2VzdCgpCgoKZGVmIGxlYWZfaGFz"
-    "aChlbnRyeV9oZXgpOgogICAgcmV0dXJuIF9oKGIiXHgwMCIgKyBieXRlcy5mcm9taGV4KGVudHJ5X2hleCkpLmhleCgpCgoKZGVm"
-    "IHZlcmlmeV9pbmNsdXNpb24oZW50cnlfaGV4LCBpbmRleCwgdHJlZV9zaXplLCBwYXRoLCByb290KToKICAgICIiIlJGQyA5MTYy"
-    "IHNlY3Rpb24gMi4xLjMuMjogaXMgZW50cnkgYXQgYGluZGV4YCBpbiB0aGUgdHJlZSBvZiBgdHJlZV9zaXplYCB3aXRoIGByb290"
-    "YD8iIiIKICAgIHRyeToKICAgICAgICBpbmRleCwgdHJlZV9zaXplID0gaW50KGluZGV4KSwgaW50KHRyZWVfc2l6ZSkKICAgICAg"
-    "ICBpZiBpbmRleCA8IDAgb3IgaW5kZXggPj0gdHJlZV9zaXplOgogICAgICAgICAgICByZXR1cm4gRmFsc2UKICAgICAgICBmbiwg"
-    "c24gPSBpbmRleCwgdHJlZV9zaXplIC0gMQogICAgICAgIHIgPSBfaChiIlx4MDAiICsgYnl0ZXMuZnJvbWhleChlbnRyeV9oZXgp"
-    "KQogICAgICAgIGZvciBwX2hleCBpbiBwYXRoOgogICAgICAgICAgICBwID0gYnl0ZXMuZnJvbWhleChwX2hleCkKICAgICAgICAg"
-    "ICAgaWYgc24gPT0gMDoKICAgICAgICAgICAgICAgIHJldHVybiBGYWxzZQogICAgICAgICAgICBpZiAoZm4gJiAxKSBvciBmbiA9"
-    "PSBzbjoKICAgICAgICAgICAgICAgIHIgPSBfaChiIlx4MDEiICsgcCArIHIpCiAgICAgICAgICAgICAgICBpZiBub3QgKGZuICYg"
-    "MSk6CiAgICAgICAgICAgICAgICAgICAgd2hpbGUgbm90IChmbiAmIDEpIGFuZCBmbiAhPSAwOgogICAgICAgICAgICAgICAgICAg"
-    "ICAgICBmbiA+Pj0gMQogICAgICAgICAgICAgICAgICAgICAgICBzbiA+Pj0gMQogICAgICAgICAgICBlbHNlOgogICAgICAgICAg"
-    "ICAgICAgciA9IF9oKGIiXHgwMSIgKyByICsgcCkKICAgICAgICAgICAgZm4gPj49IDEKICAgICAgICAgICAgc24gPj49IDEKICAg"
-    "ICAgICByZXR1cm4gc24gPT0gMCBhbmQgciA9PSBieXRlcy5mcm9taGV4KHJvb3QpCiAgICBleGNlcHQgKFZhbHVlRXJyb3IsIFR5"
-    "cGVFcnJvcik6CiAgICAgICAgcmV0dXJuIEZhbHNlCgoKZGVmIHZlcmlmeV9jb25zaXN0ZW5jeShmaXJzdCwgc2Vjb25kLCBmaXJz"
-    "dF9yb290LCBzZWNvbmRfcm9vdCwgcHJvb2YpOgogICAgIiIiUkZDIDkxNjIgc2VjdGlvbiAyLjEuNC4yOiBpcyB0aGUgdHJlZSBv"
-    "ZiBzaXplIGBzZWNvbmRgIGFuIGFwcGVuZC1vbmx5IGV4dGVuc2lvbiBvZiBgZmlyc3RgPyIiIgogICAgdHJ5OgogICAgICAgIGZp"
-    "cnN0LCBzZWNvbmQgPSBpbnQoZmlyc3QpLCBpbnQoc2Vjb25kKQogICAgICAgIGZyX2IsIHNyX2IgPSBieXRlcy5mcm9taGV4KGZp"
-    "cnN0X3Jvb3QpLCBieXRlcy5mcm9taGV4KHNlY29uZF9yb290KQogICAgICAgIHBhdGggPSBbYnl0ZXMuZnJvbWhleChwKSBmb3Ig"
-    "cCBpbiBwcm9vZl0KICAgICAgICBpZiBmaXJzdCA9PSBzZWNvbmQ6CiAgICAgICAgICAgIHJldHVybiBub3QgcGF0aCBhbmQgZnJf"
-    "YiA9PSBzcl9iCiAgICAgICAgaWYgZmlyc3QgPCAxIG9yIGZpcnN0ID4gc2Vjb25kIG9yIG5vdCBwYXRoOgogICAgICAgICAgICBy"
-    "ZXR1cm4gRmFsc2UKICAgICAgICBpZiBmaXJzdCAmIChmaXJzdCAtIDEpID09IDA6CiAgICAgICAgICAgIHBhdGggPSBbZnJfYl0g"
-    "KyBwYXRoCiAgICAgICAgZm4sIHNuID0gZmlyc3QgLSAxLCBzZWNvbmQgLSAxCiAgICAgICAgd2hpbGUgZm4gJiAxOgogICAgICAg"
-    "ICAgICBmbiA+Pj0gMQogICAgICAgICAgICBzbiA+Pj0gMQogICAgICAgIGZyID0gc3IgPSBwYXRoWzBdCiAgICAgICAgZm9yIGMg"
-    "aW4gcGF0aFsxOl06CiAgICAgICAgICAgIGlmIHNuID09IDA6CiAgICAgICAgICAgICAgICByZXR1cm4gRmFsc2UKICAgICAgICAg"
-    "ICAgaWYgKGZuICYgMSkgb3IgZm4gPT0gc246CiAgICAgICAgICAgICAgICBmciA9IF9oKGIiXHgwMSIgKyBjICsgZnIpCiAgICAg"
-    "ICAgICAgICAgICBzciA9IF9oKGIiXHgwMSIgKyBjICsgc3IpCiAgICAgICAgICAgICAgICBpZiBub3QgKGZuICYgMSk6CiAgICAg"
-    "ICAgICAgICAgICAgICAgd2hpbGUgbm90IChmbiAmIDEpIGFuZCBmbiAhPSAwOgogICAgICAgICAgICAgICAgICAgICAgICBmbiA+"
-    "Pj0gMQogICAgICAgICAgICAgICAgICAgICAgICBzbiA+Pj0gMQogICAgICAgICAgICBlbHNlOgogICAgICAgICAgICAgICAgc3Ig"
-    "PSBfaChiIlx4MDEiICsgc3IgKyBjKQogICAgICAgICAgICBmbiA+Pj0gMQogICAgICAgICAgICBzbiA+Pj0gMQogICAgICAgIHJl"
-    "dHVybiBmciA9PSBmcl9iIGFuZCBzciA9PSBzcl9iIGFuZCBzbiA9PSAwCiAgICBleGNlcHQgKFZhbHVlRXJyb3IsIFR5cGVFcnJv"
-    "cik6CiAgICAgICAgcmV0dXJuIEZhbHNlCgoKIyAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0t"
-    "LS0tLS0tLS0tLS0tLS0tLS0tIHRoZSBzaWRlY2FyCgpjbGFzcyBBbmNob3Iob2JqZWN0KToKICAgICIiIkxvY2FsIGFwcGVuZC1v"
-    "bmx5IHF1ZXVlICsgYmFja2dyb3VuZCBzZW5kZXIuIFNhZmUgYWNyb3NzIHRocmVhZHMsIHByb2Nlc3NlcyBhbmQgZm9ya3MuIiIi"
-    "CgogICAgZGVmIF9faW5pdF9fKHNlbGYsIGFwaV9rZXk9Tm9uZSwgZW5kcG9pbnQ9Tm9uZSwgZGJfcGF0aD1Ob25lLCBiYXRjaF9z"
-    "aXplPTIwMCwKICAgICAgICAgICAgICAgICBmbHVzaF9pbnRlcnZhbD0yLjAsIHRpbWVvdXQ9MTAuMCwgY2hlY2tfY2hhaW49VHJ1"
-    "ZSwgc3RhcnQ9VHJ1ZSk6CiAgICAgICAgc2VsZi5hcGlfa2V5ID0gKGFwaV9rZXkgaWYgYXBpX2tleSBpcyBub3QgTm9uZSBlbHNl"
-    "IG9zLmVudmlyb24uZ2V0KCJTRUJCSV9BUElfS0VZIiwgIiIpKS5zdHJpcCgpCiAgICAgICAgc2VsZi5lbmRwb2ludCA9IChlbmRw"
-    "b2ludCBvciBvcy5lbnZpcm9uLmdldCgiU0VCQklfRU5EUE9JTlQiLCAiaHR0cHM6Ly9zZWJiaS5wcm8iKSkucnN0cmlwKCIvIikK"
-    "ICAgICAgICBzZWxmLmRiX3BhdGggPSBkYl9wYXRoIG9yIG9zLmVudmlyb24uZ2V0KCJTRUJCSV9EQiIsICJzZWJiaV9hbmNob3Iu"
-    "ZGIiKQogICAgICAgIHNlbGYuYmF0Y2hfc2l6ZSA9IG1heCgxLCBtaW4oNTAwLCBpbnQoYmF0Y2hfc2l6ZSkpKQogICAgICAgIHNl"
-    "bGYuZmx1c2hfaW50ZXJ2YWwgPSBmbG9hdChmbHVzaF9pbnRlcnZhbCkKICAgICAgICBzZWxmLnRpbWVvdXQgPSBmbG9hdCh0aW1l"
-    "b3V0KQogICAgICAgIHNlbGYuY2hlY2tfY2hhaW4gPSBib29sKGNoZWNrX2NoYWluKQogICAgICAgIHNlbGYuZGlzYWJsZWQgPSBv"
-    "cy5lbnZpcm9uLmdldCgiU0VCQklfRElTQUJMRUQiLCAiMCIpID09ICIxIgogICAgICAgIHNlbGYuX2F1dG9zdGFydCA9IHN0YXJ0"
-    "CiAgICAgICAgc2VsZi5fd2FybmVkX25vX2tleSA9IEZhbHNlCiAgICAgICAgaWYgbm90IHNlbGYuZW5kcG9pbnQuc3RhcnRzd2l0"
-    "aCgiaHR0cHM6Ly8iKSBhbmQgIjEyNy4wLjAuMSIgbm90IGluIHNlbGYuZW5kcG9pbnQgXAogICAgICAgICAgICAgICAgYW5kICJs"
-    "b2NhbGhvc3QiIG5vdCBpbiBzZWxmLmVuZHBvaW50OgogICAgICAgICAgICBsb2cud2FybmluZygic2ViYmlfYWRhcHRlcjogZW5k"
-    "cG9pbnQgJXMgaXMgbm90IGh0dHBzIiwgc2VsZi5lbmRwb2ludCkKICAgICAgICBzZWxmLl9pbml0X3Byb2Nlc3MoKQoKICAgICMg"
-    "LS0gcHJvY2Vzcy1sb2NhbCBzdGF0ZSAocmVidWlsdCBhZnRlciBmb3JrKSAtLQogICAgZGVmIF9pbml0X3Byb2Nlc3Moc2VsZik6"
-    "CiAgICAgICAgc2VsZi5fcGlkID0gb3MuZ2V0cGlkKCkKICAgICAgICBzZWxmLl93aWQgPSAiJWQtJXMiICUgKHNlbGYuX3BpZCwg"
-    "dXVpZC51dWlkNCgpLmhleFs6OF0pCiAgICAgICAgc2VsZi5fbGsgPSB0aHJlYWRpbmcuTG9jaygpCiAgICAgICAgc2VsZi5fd2Fr"
-    "ZSA9IHRocmVhZGluZy5FdmVudCgpCiAgICAgICAgc2VsZi5fc3RvcCA9IHRocmVhZGluZy5FdmVudCgpCiAgICAgICAgc2VsZi5f"
-    "YmFja29mZiA9IDAuMAogICAgICAgIHNlbGYuX3RyaWVkID0ge30KICAgICAgICBzZWxmLl9kYiA9IHNxbGl0ZTMuY29ubmVjdChz"
-    "ZWxmLmRiX3BhdGgsIHRpbWVvdXQ9MzAsIGlzb2xhdGlvbl9sZXZlbD1Ob25lLCBjaGVja19zYW1lX3RocmVhZD1GYWxzZSkKICAg"
-    "ICAgICBzZWxmLl9kYi5leGVjdXRlKCJQUkFHTUEgam91cm5hbF9tb2RlPVdBTCIpCiAgICAgICAgc2VsZi5fZGIuZXhlY3V0ZSgi"
-    "UFJBR01BIHN5bmNocm9ub3VzPU5PUk1BTCIpCiAgICAgICAgc2VsZi5fZGIuZXhlY3V0ZSgiQ1JFQVRFIFRBQkxFIElGIE5PVCBF"
-    "WElTVFMgZW50cmllcyhzZXEgSU5URUdFUiBQUklNQVJZIEtFWSBBVVRPSU5DUkVNRU5ULCIKICAgICAgICAgICAgICAgICAgICAg"
-    "ICAgICJjaWQgVEVYVCBVTklRVUUgTk9UIE5VTEwsaGFzaCBURVhUIE5PVCBOVUxMLGxhYmVsIFRFWFQsY3JlYXRlZCBSRUFMKSIp"
-    "CiAgICAgICAgc2VsZi5fZGIuZXhlY3V0ZSgiQ1JFQVRFIFRBQkxFIElGIE5PVCBFWElTVFMgcmVjZWlwdHMoaWQgSU5URUdFUiBQ"
-    "UklNQVJZIEtFWSBBVVRPSU5DUkVNRU5ULCIKICAgICAgICAgICAgICAgICAgICAgICAgICJjaWQgVEVYVCBOT1QgTlVMTCxsZWFm"
-    "X2luZGV4IElOVEVHRVIscmVjZWlwdCBURVhULHZlcmlmaWVkIElOVEVHRVIsIgogICAgICAgICAgICAgICAgICAgICAgICAgImNo"
-    "ZWNrcG9pbnRlZCBJTlRFR0VSIERFRkFVTFQgMCxpbl9jaGFpbiBJTlRFR0VSLHJlY2VpdmVkIFJFQUwpIikKICAgICAgICBzZWxm"
-    "Ll9kYi5leGVjdXRlKCJDUkVBVEUgSU5ERVggSUYgTk9UIEVYSVNUUyByZWNlaXB0c19jaWQgT04gcmVjZWlwdHMoY2lkKSIpCiAg"
-    "ICAgICAgc2VsZi5fZGIuZXhlY3V0ZSgiQ1JFQVRFIElOREVYIElGIE5PVCBFWElTVFMgZW50cmllc19oYXNoIE9OIGVudHJpZXMo"
-    "aGFzaCkiKQogICAgICAgIHNlbGYuX2RiLmV4ZWN1dGUoIkNSRUFURSBUQUJMRSBJRiBOT1QgRVhJU1RTIGNsYWltcyhjaWQgVEVY"
-    "VCBQUklNQVJZIEtFWSx3b3JrZXIgVEVYVCx1bnRpbCBSRUFMKSIpCiAgICAgICAgc2VsZi5fdGhyZWFkID0gTm9uZQogICAgICAg"
-    "IGlmIHNlbGYuX2F1dG9zdGFydDoKICAgICAgICAgICAgc2VsZi5fc3RhcnRfdGhyZWFkKCkKCiAgICBkZWYgX2Vuc3VyZV9wcm9j"
-    "ZXNzKHNlbGYpOgogICAgICAgIGlmIG9zLmdldHBpZCgpICE9IHNlbGYuX3BpZDoKICAgICAgICAgICAgc2VsZi5faW5pdF9wcm9j"
-    "ZXNzKCkKCiAgICBkZWYgX3N0YXJ0X3RocmVhZChzZWxmKToKICAgICAgICBpZiBzZWxmLl90aHJlYWQgYW5kIHNlbGYuX3RocmVh"
-    "ZC5pc19hbGl2ZSgpOgogICAgICAgICAgICByZXR1cm4KICAgICAgICBzZWxmLl90aHJlYWQgPSB0aHJlYWRpbmcuVGhyZWFkKHRh"
-    "cmdldD1zZWxmLl9ydW4sIG5hbWU9InNlYmJpLWFuY2hvciIsIGRhZW1vbj1UcnVlKQogICAgICAgIHNlbGYuX3RocmVhZC5zdGFy"
-    "dCgpCgogICAgIyAtLSByZWNvcmRpbmcgKGhvc3Qgc2lkZTogbG9jYWwgb25seSwgbmV2ZXIgcmFpc2VzKSAtLQogICAgZGVmIHJl"
-    "Y29yZChzZWxmLCBwYXlsb2FkLCBsYWJlbD1Ob25lKToKICAgICAgICAiIiJGaW5nZXJwcmludCBgcGF5bG9hZGAgYW5kIHF1ZXVl"
-    "IGl0LiBSZXR1cm5zIHRoZSBoYXNoLCBvciBOb25lIGlmIGl0IGNvdWxkIG5vdCBiZSByZWNvcmRlZC4iIiIKICAgICAgICBpZiBz"
-    "ZWxmLmRpc2FibGVkOgogICAgICAgICAgICByZXR1cm4gTm9uZQogICAgICAgIHRyeToKICAgICAgICAgICAgcmV0dXJuIHNlbGYu"
-    "cmVjb3JkX2hhc2goc3RhdGVfaGFzaChwYXlsb2FkKSwgbGFiZWw9bGFiZWwpCiAgICAgICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBl"
-    "OgogICAgICAgICAgICBsb2cud2FybmluZygic2ViYmlfYWRhcHRlcjogbm90IHJlY29yZGVkICglcykiLCBlKQogICAgICAgICAg"
-    "ICByZXR1cm4gTm9uZQoKICAgIGRlZiByZWNvcmRfaGFzaChzZWxmLCBoYXNoX2hleCwgbGFiZWw9Tm9uZSk6CiAgICAgICAgIiIi"
-    "UXVldWUgYSBmaW5nZXJwcmludCB5b3UgY29tcHV0ZWQgeW91cnNlbGYgKDY0IGhleCBjaGFyYWN0ZXJzKS4iIiIKICAgICAgICBp"
-    "ZiBzZWxmLmRpc2FibGVkOgogICAgICAgICAgICByZXR1cm4gTm9uZQogICAgICAgIHRyeToKICAgICAgICAgICAgaCA9IHN0ciho"
-    "YXNoX2hleCkuc3RyaXAoKS5sb3dlcigpCiAgICAgICAgICAgIGlmIGxlbihoKSAhPSA2NCBvciBhbnkoY2ggbm90IGluICIwMTIz"
-    "NDU2Nzg5YWJjZGVmIiBmb3IgY2ggaW4gaCk6CiAgICAgICAgICAgICAgICByYWlzZSBWYWx1ZUVycm9yKCJoYXNoIG11c3QgYmUg"
-    "NjQgaGV4IGNoYXJhY3RlcnMiKQogICAgICAgICAgICBzZWxmLl9lbnN1cmVfcHJvY2VzcygpCiAgICAgICAgICAgIHdpdGggc2Vs"
-    "Zi5fbGs6CiAgICAgICAgICAgICAgICBzZWxmLl9kYi5leGVjdXRlKCJJTlNFUlQgSU5UTyBlbnRyaWVzKGNpZCxoYXNoLGxhYmVs"
-    "LGNyZWF0ZWQpIFZBTFVFUyg/LD8sPyw/KSIsCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICh1dWlkLnV1aWQ0KCku"
-    "aGV4LCBoLCAoc3RyKGxhYmVsKVs6MTIwXSBpZiBsYWJlbCBlbHNlIE5vbmUpLCB0aW1lLnRpbWUoKSkpCiAgICAgICAgICAgIHNl"
-    "bGYuX3dha2Uuc2V0KCkKICAgICAgICAgICAgcmV0dXJuIGgKICAgICAgICBleGNlcHQgRXhjZXB0aW9uIGFzIGU6CiAgICAgICAg"
-    "ICAgIGxvZy53YXJuaW5nKCJzZWJiaV9hZGFwdGVyOiBub3QgcmVjb3JkZWQgKCVzKSIsIGUpCiAgICAgICAgICAgIHJldHVybiBO"
-    "b25lCgogICAgIyAtLSBsb29rdXBzIC0tCiAgICBkZWYgcmVjZWlwdChzZWxmLCBoYXNoX2hleCk6CiAgICAgICAgIiIiTGF0ZXN0"
-    "IHJlY2VpcHQgZm9yIGEgZmluZ2VycHJpbnQgKHRoZSBtb3N0IHJlY2VudCBlbnRyeSB3aXRoIHRoYXQgaGFzaCksIG9yIE5vbmUu"
-    "IiIiCiAgICAgICAgc2VsZi5fZW5zdXJlX3Byb2Nlc3MoKQogICAgICAgIHdpdGggc2VsZi5fbGs6CiAgICAgICAgICAgIHJvdyA9"
-    "IHNlbGYuX2RiLmV4ZWN1dGUoCiAgICAgICAgICAgICAgICAiU0VMRUNUIHIucmVjZWlwdCxyLnZlcmlmaWVkLHIuY2hlY2twb2lu"
-    "dGVkLHIuaW5fY2hhaW4sZS5sYWJlbCxlLmNyZWF0ZWQgRlJPTSBlbnRyaWVzIGUgIgogICAgICAgICAgICAgICAgIkpPSU4gcmVj"
-    "ZWlwdHMgciBPTiByLmNpZD1lLmNpZCBXSEVSRSBlLmhhc2g9PyBPUkRFUiBCWSBlLnNlcSBERVNDLCByLmlkIERFU0MgTElNSVQg"
-    "MSIsCiAgICAgICAgICAgICAgICAoc3RyKGhhc2hfaGV4KS5sb3dlcigpLCkpLmZldGNob25lKCkKICAgICAgICBpZiBub3Qgcm93"
-    "OgogICAgICAgICAgICByZXR1cm4gTm9uZQogICAgICAgIHJlYyA9IGpzb24ubG9hZHMocm93WzBdKQogICAgICAgIHJlY1sidmVy"
-    "aWZpZWRfbG9jYWxseSJdID0gYm9vbChyb3dbMV0pCiAgICAgICAgcmVjWyJjaGVja3BvaW50ZWQiXSA9IGJvb2wocm93WzJdKQog"
-    "ICAgICAgIHJlY1sidHJlZV9oZWFkX3NlZW5faW5fY2hhaW4iXSA9IE5vbmUgaWYgcm93WzNdIGlzIE5vbmUgZWxzZSBib29sKHJv"
-    "d1szXSkKICAgICAgICByZWNbImxhYmVsIl0gPSByb3dbNF0KICAgICAgICByZXR1cm4gcmVjCgogICAgZGVmIGNvdW50cyhzZWxm"
-    "KToKICAgICAgICBzZWxmLl9lbnN1cmVfcHJvY2VzcygpCiAgICAgICAgd2l0aCBzZWxmLl9sazoKICAgICAgICAgICAgYyA9IHNl"
-    "bGYuX2RiCiAgICAgICAgICAgIHRvdGFsID0gYy5leGVjdXRlKCJTRUxFQ1QgQ09VTlQoKikgRlJPTSBlbnRyaWVzIikuZmV0Y2hv"
-    "bmUoKVswXQogICAgICAgICAgICBzZW50ID0gYy5leGVjdXRlKCJTRUxFQ1QgQ09VTlQoRElTVElOQ1QgY2lkKSBGUk9NIHJlY2Vp"
-    "cHRzIikuZmV0Y2hvbmUoKVswXQogICAgICAgICAgICBjcCA9IGMuZXhlY3V0ZSgiU0VMRUNUIENPVU5UKERJU1RJTkNUIGNpZCkg"
-    "RlJPTSByZWNlaXB0cyBXSEVSRSBjaGVja3BvaW50ZWQ9MSIpLmZldGNob25lKClbMF0KICAgICAgICAgICAgYmFkID0gYy5leGVj"
-    "dXRlKCJTRUxFQ1QgQ09VTlQoRElTVElOQ1QgY2lkKSBGUk9NIHJlY2VpcHRzIFdIRVJFIHZlcmlmaWVkPTAiKS5mZXRjaG9uZSgp"
-    "WzBdCiAgICAgICAgcmV0dXJuIHsicmVjb3JkZWQiOiB0b3RhbCwgInJlY2VpcHRlZCI6IHNlbnQsICJ3YWl0aW5nIjogdG90YWwg"
-    "LSBzZW50LAogICAgICAgICAgICAgICAgInNlYWxlZF9pbl9jaGFpbiI6IGNwLCAiZmFpbGVkX2xvY2FsX2NoZWNrIjogYmFkfQoK"
-    "ICAgIGRlZiBwZW5kaW5nKHNlbGYpOgogICAgICAgIHJldHVybiBzZWxmLmNvdW50cygpWyJ3YWl0aW5nIl0KCiAgICAjIC0tIG5l"
-    "dHdvcmsgLS0KICAgIGRlZiBfaHR0cChzZWxmLCBtZXRob2QsIHBhdGgsIGJvZHk9Tm9uZSk6CiAgICAgICAgZGF0YSA9IGpzb24u"
-    "ZHVtcHMoYm9keSkuZW5jb2RlKCJ1dGYtOCIpIGlmIGJvZHkgaXMgbm90IE5vbmUgZWxzZSBOb25lCiAgICAgICAgcmVxID0gdXJs"
-    "bGliLnJlcXVlc3QuUmVxdWVzdChzZWxmLmVuZHBvaW50ICsgcGF0aCwgZGF0YT1kYXRhLCBtZXRob2Q9bWV0aG9kKQogICAgICAg"
-    "IHJlcS5hZGRfaGVhZGVyKCJDb250ZW50LVR5cGUiLCAiYXBwbGljYXRpb24vanNvbiIpCiAgICAgICAgcmVxLmFkZF9oZWFkZXIo"
-    "IlVzZXItQWdlbnQiLCAic2ViYmktYWRhcHRlci8iICsgX192ZXJzaW9uX18pCiAgICAgICAgaWYgc2VsZi5hcGlfa2V5OgogICAg"
-    "ICAgICAgICByZXEuYWRkX2hlYWRlcigiWC1TZWJiaS1LZXkiLCBzZWxmLmFwaV9rZXkpCiAgICAgICAgdHJ5OgogICAgICAgICAg"
-    "ICB3aXRoIHVybGxpYi5yZXF1ZXN0LnVybG9wZW4ocmVxLCB0aW1lb3V0PXNlbGYudGltZW91dCkgYXMgcjoKICAgICAgICAgICAg"
-    "ICAgIHJldHVybiByLnN0YXR1cywganNvbi5sb2FkcyhyLnJlYWQoKS5kZWNvZGUoInV0Zi04Iikgb3IgInt9IikKICAgICAgICBl"
-    "eGNlcHQgdXJsbGliLmVycm9yLkhUVFBFcnJvciBhcyBlOgogICAgICAgICAgICB0cnk6CiAgICAgICAgICAgICAgICByZXR1cm4g"
-    "ZS5jb2RlLCBqc29uLmxvYWRzKGUucmVhZCgpLmRlY29kZSgidXRmLTgiKSBvciAie30iKQogICAgICAgICAgICBleGNlcHQgRXhj"
-    "ZXB0aW9uOgogICAgICAgICAgICAgICAgcmV0dXJuIGUuY29kZSwge30KCiAgICBkZWYgX2NsYWltKHNlbGYsIG4pOgogICAgICAg"
-    "IG5vdyA9IHRpbWUudGltZSgpCiAgICAgICAgd2l0aCBzZWxmLl9sazoKICAgICAgICAgICAgYyA9IHNlbGYuX2RiCiAgICAgICAg"
-    "ICAgIGMuZXhlY3V0ZSgiQkVHSU4gSU1NRURJQVRFIikKICAgICAgICAgICAgdHJ5OgogICAgICAgICAgICAgICAgcm93cyA9IGMu"
-    "ZXhlY3V0ZSgKICAgICAgICAgICAgICAgICAgICAiU0VMRUNUIGUuY2lkLGUuaGFzaCBGUk9NIGVudHJpZXMgZSBXSEVSRSBOT1Qg"
-    "RVhJU1RTIChTRUxFQ1QgMSBGUk9NIHJlY2VpcHRzIHIgV0hFUkUgci5jaWQ9ZS5jaWQpICIKICAgICAgICAgICAgICAgICAgICAi"
-    "QU5EIE5PVCBFWElTVFMgKFNFTEVDVCAxIEZST00gY2xhaW1zIGsgV0hFUkUgay5jaWQ9ZS5jaWQgQU5EIGsudW50aWw+PyBBTkQg"
-    "ay53b3JrZXI8Pj8pICIKICAgICAgICAgICAgICAgICAgICAiT1JERVIgQlkgZS5zZXEgTElNSVQgPyIsIChub3csIHNlbGYuX3dp"
-    "ZCwgbikpLmZldGNoYWxsKCkKICAgICAgICAgICAgICAgIGZvciBjaWQsIF8gaW4gcm93czoKICAgICAgICAgICAgICAgICAgICBj"
-    "LmV4ZWN1dGUoIklOU0VSVCBPUiBSRVBMQUNFIElOVE8gY2xhaW1zKGNpZCx3b3JrZXIsdW50aWwpIFZBTFVFUyg/LD8sPykiLAog"
-    "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAoY2lkLCBzZWxmLl93aWQsIG5vdyArIG1heCg2MC4wLCBzZWxmLnRpbWVvdXQg"
-    "KiAzKSkpCiAgICAgICAgICAgICAgICBjLmV4ZWN1dGUoIkNPTU1JVCIpCiAgICAgICAgICAgIGV4Y2VwdCBFeGNlcHRpb246CiAg"
-    "ICAgICAgICAgICAgICBjLmV4ZWN1dGUoIlJPTExCQUNLIikKICAgICAgICAgICAgICAgIHJhaXNlCiAgICAgICAgcmV0dXJuIHJv"
-    "d3MKCiAgICBkZWYgX3JlbGVhc2Uoc2VsZiwgY2lkcyk6CiAgICAgICAgd2l0aCBzZWxmLl9sazoKICAgICAgICAgICAgc2VsZi5f"
-    "ZGIuZXhlY3V0ZW1hbnkoIkRFTEVURSBGUk9NIGNsYWltcyBXSEVSRSBjaWQ9PyBBTkQgd29ya2VyPT8iLCBbKGMsIHNlbGYuX3dp"
-    "ZCkgZm9yIGMgaW4gY2lkc10pCgogICAgZGVmIF9zdG9yZShzZWxmLCBjaWQsIHJlYywgY2hlY2twb2ludGVkPUZhbHNlLCBpbl9j"
-    "aGFpbj1Ob25lKToKICAgICAgICBvayA9IHZlcmlmeV9pbmNsdXNpb24ocmVjLmdldCgiZW50cnlfaGFzaCIsICIiKSwgcmVjLmdl"
-    "dCgibGVhZl9pbmRleCIsIC0xKSwgcmVjLmdldCgidHJlZV9zaXplIiwgMCksCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
-    "IHJlYy5nZXQoImF1ZGl0X3BhdGgiLCBbXSksIHJlYy5nZXQoInJvb3QiLCAiIikpCiAgICAgICAgaWYgY2hlY2twb2ludGVkIGFu"
-    "ZCBvayBhbmQgcmVjLmdldCgiY2hlY2twb2ludCIpOgogICAgICAgICAgICBvayA9IHJlY1siY2hlY2twb2ludCJdLmdldCgicm9v"
-    "dCIpID09IHJlYy5nZXQoInJvb3QiKQogICAgICAgIGlmIG5vdCBvazoKICAgICAgICAgICAgbG9nLmVycm9yKCJzZWJiaV9hZGFw"
-    "dGVyOiByZWNlaXB0IGZvciBsZWFmICVzIEZBSUxFRCB0aGUgbG9jYWwgaW5jbHVzaW9uIGNoZWNrIC0ga2VwdCBhbmQgZmxhZ2dl"
-    "ZCIsCiAgICAgICAgICAgICAgICAgICAgICByZWMuZ2V0KCJsZWFmX2luZGV4IikpCiAgICAgICAgd2l0aCBzZWxmLl9sazoKICAg"
-    "ICAgICAgICAgc2VsZi5fZGIuZXhlY3V0ZSgiSU5TRVJUIElOVE8gcmVjZWlwdHMoY2lkLGxlYWZfaW5kZXgscmVjZWlwdCx2ZXJp"
-    "ZmllZCxjaGVja3BvaW50ZWQsaW5fY2hhaW4scmVjZWl2ZWQpICIKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAiVkFMVUVT"
-    "KD8sPyw/LD8sPyw/LD8pIiwKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAoY2lkLCByZWMuZ2V0KCJsZWFmX2luZGV4Iiks"
-    "IGpzb24uZHVtcHMocmVjLCBzb3J0X2tleXM9VHJ1ZSksIDEgaWYgb2sgZWxzZSAwLAogICAgICAgICAgICAgICAgICAgICAgICAg"
-    "ICAgICAxIGlmIGNoZWNrcG9pbnRlZCBlbHNlIDAsIGluX2NoYWluLCB0aW1lLnRpbWUoKSkpCiAgICAgICAgcmV0dXJuIG9rCgog"
-    "ICAgZGVmIF9zZW5kX2JhdGNoKHNlbGYpOgogICAgICAgICIiIlNlbmQgb25lIGJhdGNoLiBSZXR1cm5zIG51bWJlciByZWNlaXB0"
-    "ZWQ7IHJhaXNlcyBvbiBuZXR3b3JrIGZhaWx1cmUuIiIiCiAgICAgICAgaWYgbm90IHNlbGYuYXBpX2tleToKICAgICAgICAgICAg"
-    "aWYgbm90IHNlbGYuX3dhcm5lZF9ub19rZXk6CiAgICAgICAgICAgICAgICBsb2cud2FybmluZygic2ViYmlfYWRhcHRlcjogU0VC"
-    "QklfQVBJX0tFWSBub3Qgc2V0IC0gZmluZ2VycHJpbnRzIGFyZSBxdWV1ZWQgbG9jYWxseSBhbmQgd2lsbCAiCiAgICAgICAgICAg"
-    "ICAgICAgICAgICAgICAgICAiYmUgc2VudCBvbmNlIGl0IGlzIikKICAgICAgICAgICAgICAgIHNlbGYuX3dhcm5lZF9ub19rZXkg"
-    "PSBUcnVlCiAgICAgICAgICAgIHJldHVybiAwCiAgICAgICAgcm93cyA9IHNlbGYuX2NsYWltKHNlbGYuYmF0Y2hfc2l6ZSkKICAg"
-    "ICAgICBpZiBub3Qgcm93czoKICAgICAgICAgICAgcmV0dXJuIDAKICAgICAgICB3YW50ZWQgPSB7Y2lkOiBoIGZvciBjaWQsIGgg"
-    "aW4gcm93c30KICAgICAgICB0cnk6CiAgICAgICAgICAgIGNvZGUsIG91dCA9IHNlbGYuX2h0dHAoIlBPU1QiLCAiL3Avc3VibWl0"
-    "IiwgeyJpdGVtcyI6IFt7Imhhc2giOiBoLCAiY2lkIjogY2lkfSBmb3IgY2lkLCBoIGluIHJvd3NdfSkKICAgICAgICBleGNlcHQg"
-    "RXhjZXB0aW9uOgogICAgICAgICAgICBzZWxmLl9yZWxlYXNlKGxpc3Qod2FudGVkKSkKICAgICAgICAgICAgcmFpc2UKICAgICAg"
-    "ICBpZiBjb2RlICE9IDIwMDoKICAgICAgICAgICAgc2VsZi5fcmVsZWFzZShsaXN0KHdhbnRlZCkpCiAgICAgICAgICAgIHJhaXNl"
-    "IElPRXJyb3IoInNlYmJpLnBybyBhbnN3ZXJlZCAlczogJXMiICUgKGNvZGUsIG91dC5nZXQoImVycm9yIikgb3Igb3V0LmdldCgi"
-    "bWVzc2FnZSIpIG9yICIiKSkKICAgICAgICBkb25lID0gMAogICAgICAgIGZvciByZWMgaW4gb3V0LmdldCgicmVjZWlwdHMiKSBv"
-    "ciBbXToKICAgICAgICAgICAgY2lkID0gcmVjLmdldCgiY2lkIikKICAgICAgICAgICAgaWYgY2lkIG5vdCBpbiB3YW50ZWQ6CiAg"
-    "ICAgICAgICAgICAgICBjb250aW51ZQogICAgICAgICAgICBpZiByZWMuZ2V0KCJlcnJvciIpOgogICAgICAgICAgICAgICAgbG9n"
-    "LmVycm9yKCJzZWJiaV9hZGFwdGVyOiBlbnRyeSAlcyByZWZ1c2VkOiAlcyIsIGNpZCwgcmVjWyJlcnJvciJdKQogICAgICAgICAg"
-    "ICAgICAgY29udGludWUKICAgICAgICAgICAgaWYgcmVjLmdldCgiZW50cnlfaGFzaCIpICE9IHdhbnRlZFtjaWRdOgogICAgICAg"
-    "ICAgICAgICAgbG9nLmVycm9yKCJzZWJiaV9hZGFwdGVyOiBzZXJ2ZXIgcmV0dXJuZWQgYSBkaWZmZXJlbnQgaGFzaCBmb3IgJXMg"
-    "LSBub3Qgc3RvcmVkIiwgY2lkKQogICAgICAgICAgICAgICAgY29udGludWUKICAgICAgICAgICAgc2VsZi5fc3RvcmUoY2lkLCBy"
-    "ZWMpCiAgICAgICAgICAgIGRvbmUgKz0gMQogICAgICAgIHNlbGYuX3JlbGVhc2UobGlzdCh3YW50ZWQpKQogICAgICAgIHJldHVy"
-    "biBkb25lCgogICAgZGVmIF91cGdyYWRlKHNlbGYsIGxpbWl0PTUwKToKICAgICAgICAiIiJGZXRjaCBzZWFsZWQgcmVjZWlwdHMg"
-    "Zm9yIGxlYXZlcyB3aG9zZSB0cmVlIGhlYWQgc2hvdWxkIG5vdyBiZSBpbiB0aGUgY2hhaW4uIiIiCiAgICAgICAgY3V0b2ZmID0g"
-    "dGltZS50aW1lKCkgLSAzMAogICAgICAgIHdpdGggc2VsZi5fbGs6CiAgICAgICAgICAgIHJvd3MgPSBzZWxmLl9kYi5leGVjdXRl"
-    "KAogICAgICAgICAgICAgICAgIlNFTEVDVCByLmNpZCxyLmxlYWZfaW5kZXggRlJPTSByZWNlaXB0cyByIFdIRVJFIHIudmVyaWZp"
-    "ZWQ9MSBBTkQgci5yZWNlaXZlZDw/IEFORCAiCiAgICAgICAgICAgICAgICAiTk9UIEVYSVNUUyAoU0VMRUNUIDEgRlJPTSByZWNl"
-    "aXB0cyByMiBXSEVSRSByMi5jaWQ9ci5jaWQgQU5EIHIyLmNoZWNrcG9pbnRlZD0xKSAiCiAgICAgICAgICAgICAgICAiR1JPVVAg"
-    "Qlkgci5jaWQgT1JERVIgQlkgTUlOKHIuaWQpIExJTUlUID8iLCAoY3V0b2ZmLCBsaW1pdCkpLmZldGNoYWxsKCkKICAgICAgICBi"
-    "bG9ja3MgPSB7fQogICAgICAgIG5vdyA9IHRpbWUudGltZSgpCiAgICAgICAgZm9yIGNpZCwgaWR4IGluIHJvd3M6CiAgICAgICAg"
-    "ICAgIGlmIG5vdyAtIHNlbGYuX3RyaWVkLmdldChjaWQsIDApIDwgMzA6CiAgICAgICAgICAgICAgICBjb250aW51ZQogICAgICAg"
-    "ICAgICBzZWxmLl90cmllZFtjaWRdID0gbm93CiAgICAgICAgICAgIGNvZGUsIHJlYyA9IHNlbGYuX2h0dHAoIkdFVCIsICIvcC9y"
-    "ZWNlaXB0P2xlYWY9JWQiICUgaWR4KQogICAgICAgICAgICBpZiBjb2RlICE9IDIwMCBvciBub3QgcmVjLmdldCgiY2hlY2twb2lu"
-    "dCIpOgogICAgICAgICAgICAgICAgY29udGludWUKICAgICAgICAgICAgaW5fY2hhaW4gPSBOb25lCiAgICAgICAgICAgIGlmIHNl"
-    "bGYuY2hlY2tfY2hhaW46CiAgICAgICAgICAgICAgICBibGsgPSByZWNbImNoZWNrcG9pbnQiXS5nZXQoImJsb2NrX2luZGV4IikK"
-    "ICAgICAgICAgICAgICAgIGlmIGJsayBub3QgaW4gYmxvY2tzOgogICAgICAgICAgICAgICAgICAgIHRyeToKICAgICAgICAgICAg"
-    "ICAgICAgICAgICAgXywgYm9keSA9IHNlbGYuX2h0dHAoIkdFVCIsICIveC93YWxrL2Jsb2NrP2luZGV4PSVzIiAlIGJsaykKICAg"
-    "ICAgICAgICAgICAgICAgICAgICAgYmxvY2tzW2Jsa10gPSBqc29uLmR1bXBzKGJvZHkpCiAgICAgICAgICAgICAgICAgICAgZXhj"
-    "ZXB0IEV4Y2VwdGlvbjoKICAgICAgICAgICAgICAgICAgICAgICAgYmxvY2tzW2Jsa10gPSBOb25lCiAgICAgICAgICAgICAgICBp"
-    "ZiBibG9ja3NbYmxrXSBpcyBub3QgTm9uZToKICAgICAgICAgICAgICAgICAgICBpbl9jaGFpbiA9IDEgaWYgcmVjWyJjaGVja3Bv"
-    "aW50Il0uZ2V0KCJyb290IiwgIn4iKSBpbiBibG9ja3NbYmxrXSBlbHNlIDAKICAgICAgICAgICAgICAgICAgICBpZiBub3QgaW5f"
-    "Y2hhaW46CiAgICAgICAgICAgICAgICAgICAgICAgIGxvZy5lcnJvcigic2ViYmlfYWRhcHRlcjogdHJlZSBoZWFkIGZvciBsZWFm"
-    "ICVzIG5vdCBmb3VuZCBpbiBjaGFpbiBibG9jayAlcyIsIGlkeCwgYmxrKQogICAgICAgICAgICBzZWxmLl9zdG9yZShjaWQsIHJl"
-    "YywgY2hlY2twb2ludGVkPVRydWUsIGluX2NoYWluPWluX2NoYWluKQogICAgICAgICAgICBzZWxmLl90cmllZC5wb3AoY2lkLCBO"
-    "b25lKQoKICAgIGRlZiBmbHVzaChzZWxmLCB0aW1lb3V0PTMwLjApOgogICAgICAgICIiIlNlbmQgZXZlcnl0aGluZyB3YWl0aW5n"
-    "LCBub3cuIFJldHVybnMgaG93IG1hbnkgd2VyZSByZWNlaXB0ZWQuIE5ldmVyIHJhaXNlcy4iIiIKICAgICAgICBzZWxmLl9lbnN1"
-    "cmVfcHJvY2VzcygpCiAgICAgICAgZW5kLCBzZW50ID0gdGltZS50aW1lKCkgKyB0aW1lb3V0LCAwCiAgICAgICAgd2hpbGUgdGlt"
-    "ZS50aW1lKCkgPCBlbmQ6CiAgICAgICAgICAgIHRyeToKICAgICAgICAgICAgICAgIG4gPSBzZWxmLl9zZW5kX2JhdGNoKCkKICAg"
-    "ICAgICAgICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOgogICAgICAgICAgICAgICAgbG9nLndhcm5pbmcoInNlYmJpX2FkYXB0ZXI6"
-    "IGZsdXNoIHN0b3BwZWQgKCVzKTsgZW50cmllcyBzdGF5IHF1ZXVlZCIsIGUpCiAgICAgICAgICAgICAgICBicmVhawogICAgICAg"
-    "ICAgICBzZW50ICs9IG4KICAgICAgICAgICAgaWYgbiA9PSAwOgogICAgICAgICAgICAgICAgYnJlYWsKICAgICAgICByZXR1cm4g"
-    "c2VudAoKICAgIGRlZiBfcnVuKHNlbGYpOgogICAgICAgIHdoaWxlIG5vdCBzZWxmLl9zdG9wLmlzX3NldCgpOgogICAgICAgICAg"
-    "ICBzZWxmLl93YWtlLndhaXQoc2VsZi5fYmFja29mZiBvciBzZWxmLmZsdXNoX2ludGVydmFsKQogICAgICAgICAgICBzZWxmLl93"
-    "YWtlLmNsZWFyKCkKICAgICAgICAgICAgaWYgc2VsZi5fc3RvcC5pc19zZXQoKToKICAgICAgICAgICAgICAgIGJyZWFrCiAgICAg"
-    "ICAgICAgIHRyeToKICAgICAgICAgICAgICAgIHdoaWxlIHNlbGYuX3NlbmRfYmF0Y2goKSA+PSBzZWxmLmJhdGNoX3NpemU6CiAg"
-    "ICAgICAgICAgICAgICAgICAgcGFzcwogICAgICAgICAgICAgICAgc2VsZi5fdXBncmFkZSgpCiAgICAgICAgICAgICAgICBzZWxm"
-    "Ll9iYWNrb2ZmID0gMC4wCiAgICAgICAgICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMgZToKICAgICAgICAgICAgICAgIHNlbGYuX2Jh"
-    "Y2tvZmYgPSBtaW4oMzAwLjAsIG1heCgyLjAsIHNlbGYuX2JhY2tvZmYgKiAyKSkKICAgICAgICAgICAgICAgIGxvZy5pbmZvKCJz"
-    "ZWJiaV9hZGFwdGVyOiBzZWJiaS5wcm8gdW5yZWFjaGFibGUgKCVzKTsgcmV0cnlpbmcgaW4gJWRzIiwgZSwgc2VsZi5fYmFja29m"
-    "ZikKCiAgICBkZWYgY2xvc2Uoc2VsZiwgZmx1c2hfdGltZW91dD0yLjApOgogICAgICAgIHRyeToKICAgICAgICAgICAgaWYgZmx1"
-    "c2hfdGltZW91dDoKICAgICAgICAgICAgICAgIHNlbGYuZmx1c2godGltZW91dD1mbHVzaF90aW1lb3V0KQogICAgICAgIGZpbmFs"
-    "bHk6CiAgICAgICAgICAgIHNlbGYuX3N0b3Auc2V0KCkKICAgICAgICAgICAgc2VsZi5fd2FrZS5zZXQoKQoKCiMgLS0tLS0tLS0t"
-    "LS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLSB0aGUgZGVmYXVsdCBpbnN0YW5j"
-    "ZQoKX2RlZmF1bHRfYW5jaG9yID0gTm9uZQpfZGVmYXVsdF9sb2NrID0gdGhyZWFkaW5nLkxvY2soKQoKCmRlZiBnZXRfZGVmYXVs"
-    "dCgpOgogICAgZ2xvYmFsIF9kZWZhdWx0X2FuY2hvcgogICAgaWYgX2RlZmF1bHRfYW5jaG9yIGlzIE5vbmU6CiAgICAgICAgd2l0"
-    "aCBfZGVmYXVsdF9sb2NrOgogICAgICAgICAgICBpZiBfZGVmYXVsdF9hbmNob3IgaXMgTm9uZToKICAgICAgICAgICAgICAgIF9k"
-    "ZWZhdWx0X2FuY2hvciA9IEFuY2hvcigpCiAgICAgICAgICAgICAgICBhdGV4aXQucmVnaXN0ZXIoX2RlZmF1bHRfYW5jaG9yLmNs"
-    "b3NlKQogICAgcmV0dXJuIF9kZWZhdWx0X2FuY2hvcgoKCmRlZiByZWNvcmQocGF5bG9hZCwgbGFiZWw9Tm9uZSwgYW5jaG9yPU5v"
-    "bmUpOgogICAgIiIiRmluZ2VycHJpbnQgYW5kIHF1ZXVlIGFueSBKU09OLWFibGUgdmFsdWUuIFJldHVybnMgdGhlIGhhc2guIE5l"
-    "dmVyIHJhaXNlcy4iIiIKICAgIHRyeToKICAgICAgICByZXR1cm4gKGFuY2hvciBvciBnZXRfZGVmYXVsdCgpKS5yZWNvcmQocGF5"
-    "bG9hZCwgbGFiZWw9bGFiZWwpCiAgICBleGNlcHQgRXhjZXB0aW9uIGFzIGU6CiAgICAgICAgbG9nLndhcm5pbmcoInNlYmJpX2Fk"
-    "YXB0ZXI6IG5vdCByZWNvcmRlZCAoJXMpIiwgZSkKICAgICAgICByZXR1cm4gTm9uZQoKCmRlZiBhbmNob3Jfc3RhdGUobGFiZWw9"
-    "Tm9uZSwgY2FwdHVyZT0icmVzdWx0IiwgZXh0cmFjdD1Ob25lLCBhbmNob3I9Tm9uZSk6CiAgICAiIiJEZWNvcmF0b3IuIEFmdGVy"
-    "IHRoZSB3cmFwcGVkIGZ1bmN0aW9uIHN1Y2NlZWRzLCBmaW5nZXJwcmludCBpdHMgc3RhdGUgYW5kIHF1ZXVlIGl0LgoKICAgIGNh"
-    "cHR1cmU6ICAicmVzdWx0IiAoZGVmYXVsdCkgLSB0aGUgcmV0dXJuIHZhbHVlCiAgICAgICAgICAgICAgImFyZ3MiICAgICAgICAg"
-    "ICAgIC0gdGhlIGFyZ3VtZW50cyBpdCB3YXMgY2FsbGVkIHdpdGgKICAgICAgICAgICAgICAiYm90aCIgICAgICAgICAgICAgLSB7"
-    "ImFyZ3MiOiAuLi4sICJrd2FyZ3MiOiAuLi4sICJyZXN1bHQiOiAuLi59CiAgICBleHRyYWN0OiAgZihyZXN1bHQsIGFyZ3MsIGt3"
-    "YXJncykgLT4gdGhlIHZhbHVlIHRvIGZpbmdlcnByaW50IChvdmVycmlkZXMgY2FwdHVyZSkKICAgIFRoZSB3cmFwcGVkIGZ1bmN0"
-    "aW9uJ3MgYmVoYXZpb3VyLCByZXR1cm4gdmFsdWUgYW5kIGV4Y2VwdGlvbnMgYXJlIHVuY2hhbmdlZC4KICAgICIiIgogICAgaWYg"
-    "Y2FsbGFibGUobGFiZWwpIGFuZCBub3QgaXNpbnN0YW5jZShsYWJlbCwgc3RyKToKICAgICAgICByZXR1cm4gYW5jaG9yX3N0YXRl"
-    "KCkobGFiZWwpCgogICAgZGVmIGRlY28oZm4pOgogICAgICAgIG5hbWUgPSBsYWJlbCBvciBnZXRhdHRyKGZuLCAiX19xdWFsbmFt"
-    "ZV9fIiwgZ2V0YXR0cihmbiwgIl9fbmFtZV9fIiwgImNhbGwiKSkKCiAgICAgICAgZGVmIF9zdGF0ZShhcmdzLCBrd2FyZ3MsIHJl"
-    "c3VsdCk6CiAgICAgICAgICAgIGlmIGV4dHJhY3QgaXMgbm90IE5vbmU6CiAgICAgICAgICAgICAgICByZXR1cm4gZXh0cmFjdChy"
-    "ZXN1bHQsIGFyZ3MsIGt3YXJncykKICAgICAgICAgICAgaWYgY2FwdHVyZSA9PSAiYXJncyI6CiAgICAgICAgICAgICAgICByZXR1"
-    "cm4geyJhcmdzIjogbGlzdChhcmdzKSwgImt3YXJncyI6IGt3YXJnc30KICAgICAgICAgICAgaWYgY2FwdHVyZSA9PSAiYm90aCI6"
-    "CiAgICAgICAgICAgICAgICByZXR1cm4geyJhcmdzIjogbGlzdChhcmdzKSwgImt3YXJncyI6IGt3YXJncywgInJlc3VsdCI6IHJl"
-    "c3VsdH0KICAgICAgICAgICAgcmV0dXJuIHJlc3VsdAoKICAgICAgICBkZWYgX2FuY2hvcihhcmdzLCBrd2FyZ3MsIHJlc3VsdCk6"
-    "CiAgICAgICAgICAgIHRyeToKICAgICAgICAgICAgICAgIHJlY29yZChfc3RhdGUoYXJncywga3dhcmdzLCByZXN1bHQpLCBsYWJl"
-    "bD1uYW1lLCBhbmNob3I9YW5jaG9yKQogICAgICAgICAgICBleGNlcHQgRXhjZXB0aW9uIGFzIGU6CiAgICAgICAgICAgICAgICBs"
-    "b2cud2FybmluZygic2ViYmlfYWRhcHRlcjogJXMgbm90IHJlY29yZGVkICglcykiLCBuYW1lLCBlKQoKICAgICAgICBpZiBpbnNw"
-    "ZWN0LmlzY29yb3V0aW5lZnVuY3Rpb24oZm4pOgogICAgICAgICAgICBAZnVuY3Rvb2xzLndyYXBzKGZuKQogICAgICAgICAgICBh"
-    "c3luYyBkZWYgYXdyYXBwZXIoKmFyZ3MsICoqa3dhcmdzKToKICAgICAgICAgICAgICAgIHJlc3VsdCA9IGF3YWl0IGZuKCphcmdz"
-    "LCAqKmt3YXJncykKICAgICAgICAgICAgICAgIF9hbmNob3IoYXJncywga3dhcmdzLCByZXN1bHQpCiAgICAgICAgICAgICAgICBy"
-    "ZXR1cm4gcmVzdWx0CiAgICAgICAgICAgIHJldHVybiBhd3JhcHBlcgoKICAgICAgICBAZnVuY3Rvb2xzLndyYXBzKGZuKQogICAg"
-    "ICAgIGRlZiB3cmFwcGVyKCphcmdzLCAqKmt3YXJncyk6CiAgICAgICAgICAgIHJlc3VsdCA9IGZuKCphcmdzLCAqKmt3YXJncykK"
-    "ICAgICAgICAgICAgX2FuY2hvcihhcmdzLCBrd2FyZ3MsIHJlc3VsdCkKICAgICAgICAgICAgcmV0dXJuIHJlc3VsdAogICAgICAg"
-    "IHJldHVybiB3cmFwcGVyCiAgICByZXR1cm4gZGVjbwoKCmNsYXNzIEFuY2hvckxvZ0hhbmRsZXIobG9nZ2luZy5IYW5kbGVyKToK"
-    "ICAgICIiIkZpbmdlcnByaW50cyBldmVyeSBsb2cgcmVjb3JkIGl0IHNlZXM6IGxvZ2dlciwgbGV2ZWwsIG1lc3NhZ2UgYW5kIHRp"
-    "bWUuIiIiCgogICAgZGVmIF9faW5pdF9fKHNlbGYsIGFuY2hvcj1Ob25lLCBsZXZlbD1sb2dnaW5nLklORk8pOgogICAgICAgIGxv"
-    "Z2dpbmcuSGFuZGxlci5fX2luaXRfXyhzZWxmLCBsZXZlbCkKICAgICAgICBzZWxmLl9hbmNob3IgPSBhbmNob3IKCiAgICBkZWYg"
-    "ZW1pdChzZWxmLCByZWMpOgogICAgICAgIGlmIHJlYy5uYW1lLnN0YXJ0c3dpdGgoInNlYmJpX2FkYXB0ZXIiKToKICAgICAgICAg"
-    "ICAgcmV0dXJuCiAgICAgICAgdHJ5OgogICAgICAgICAgICByZWNvcmQoeyJsb2dnZXIiOiByZWMubmFtZSwgImxldmVsIjogcmVj"
-    "LmxldmVsbmFtZSwgIm1lc3NhZ2UiOiByZWMuZ2V0TWVzc2FnZSgpLAogICAgICAgICAgICAgICAgICAgICJ0aW1lIjogcm91bmQo"
-    "cmVjLmNyZWF0ZWQsIDYpfSwgbGFiZWw9ImxvZzoiICsgcmVjLm5hbWUsIGFuY2hvcj1zZWxmLl9hbmNob3IpCiAgICAgICAgZXhj"
-    "ZXB0IEV4Y2VwdGlvbjoKICAgICAgICAgICAgcGFzcwoKCiMgLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0t"
-    "LS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLSBjb21tYW5kIGxpbmUKCmRlZiBfbWFpbihhcmd2KToKICAgIGxvZ2dpbmcuYmFzaWND"
-    "b25maWcobGV2ZWw9bG9nZ2luZy5JTkZPLCBmb3JtYXQ9IiUobWVzc2FnZSlzIikKICAgIGNtZCA9IGFyZ3ZbMV0gaWYgbGVuKGFy"
-    "Z3YpID4gMSBlbHNlICJzdGF0dXMiCiAgICBpZiBjbWQgPT0gImhhc2giIGFuZCBsZW4oYXJndikgPiAyOgogICAgICAgIHByaW50"
-    "KHN0YXRlX2hhc2goanNvbi5sb2Fkcyhhcmd2WzJdKSkpCiAgICAgICAgcmV0dXJuIDAKICAgIGEgPSBBbmNob3Ioc3RhcnQ9RmFs"
-    "c2UpCiAgICBpZiBjbWQgPT0gInN0YXR1cyI6CiAgICAgICAgcHJpbnQoanNvbi5kdW1wcyhkaWN0KGEuY291bnRzKCksIGVuZHBv"
-    "aW50PWEuZW5kcG9pbnQsIGRiPWEuZGJfcGF0aCwga2V5X3NldD1ib29sKGEuYXBpX2tleSkpLCBpbmRlbnQ9MikpCiAgICBlbGlm"
-    "IGNtZCA9PSAiZmx1c2giOgogICAgICAgIHByaW50KCJyZWNlaXB0ZWQgJWQiICUgYS5mbHVzaCh0aW1lb3V0PTEyMCkpCiAgICAg"
-    "ICAgYS5fdXBncmFkZShsaW1pdD01MDApCiAgICAgICAgcHJpbnQoanNvbi5kdW1wcyhhLmNvdW50cygpLCBpbmRlbnQ9MikpCiAg"
-    "ICBlbGlmIGNtZCA9PSAicmVjZWlwdCIgYW5kIGxlbihhcmd2KSA+IDI6CiAgICAgICAgcHJpbnQoanNvbi5kdW1wcyhhLnJlY2Vp"
-    "cHQoYXJndlsyXSksIGluZGVudD0yKSkKICAgIGVsaWYgY21kID09ICJ2ZXJpZnkiOgogICAgICAgIHdpdGggYS5fbGs6CiAgICAg"
-    "ICAgICAgIHJvd3MgPSBhLl9kYi5leGVjdXRlKCJTRUxFQ1QgcmVjZWlwdCBGUk9NIHJlY2VpcHRzIikuZmV0Y2hhbGwoKQogICAg"
-    "ICAgIGdvb2QgPSBzdW0oMSBmb3IgKHIsKSBpbiByb3dzIGlmIChsYW1iZGEgZDogdmVyaWZ5X2luY2x1c2lvbihkLmdldCgiZW50"
-    "cnlfaGFzaCIsICIiKSwgZC5nZXQoImxlYWZfaW5kZXgiLCAtMSksCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
-    "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBkLmdldCgidHJlZV9zaXplIiwgMCksIGQuZ2V0KCJhdWRpdF9wYXRo"
-    "IiwgW10pLAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
-    "ICAgZC5nZXQoInJvb3QiLCAiIikpKShqc29uLmxvYWRzKHIpKSkKICAgICAgICBwcmludCgiJWQgb2YgJWQgc3RvcmVkIHJlY2Vp"
-    "cHRzIHBhc3MgdGhlIFJGQyA2OTYyIGluY2x1c2lvbiBjaGVjayIgJSAoZ29vZCwgbGVuKHJvd3MpKSkKICAgIGVsc2U6CiAgICAg"
-    "ICAgcHJpbnQoX19kb2NfXykKICAgIHJldHVybiAwCgoKaWYgX19uYW1lX18gPT0gIl9fbWFpbl9fIjoKICAgIHN5cy5leGl0KF9t"
-    "YWluKHN5cy5hcmd2KSkK"
-)
-_EXAMPLE_B64 = (
-    "IiIiCmV4YW1wbGVfbGVnYWN5X2FwcC5weSAtIGhvdyBhbiBleGlzdGluZyBhcHBsaWNhdGlvbiBwbHVncyBpbiBzZWJiaV9hZGFw"
-    "dGVyLgoKTm90aGluZyBpbiB0aGUgYnVzaW5lc3MgbG9naWMgY2hhbmdlcy4gRWFjaCBleGFtcGxlIGlzIHRoZSBvcmlnaW5hbCBj"
-    "b2RlIHBsdXMKdGhlIGFkYXB0ZXIgbGluZXMgbWFya2VkICAjIDwtIHNlYmJpLgoKUnVuIGl0OiAgIFNFQkJJX0FQSV9LRVk9eW91"
-    "ci1rZXkgcHl0aG9uIGV4YW1wbGVfbGVnYWN5X2FwcC5weQpUaGVuOiAgICAgcHl0aG9uIHNlYmJpX2FkYXB0ZXIucHkgc3RhdHVz"
-    "CiIiIgoKaW1wb3J0IGFzeW5jaW8KaW1wb3J0IGxvZ2dpbmcKaW1wb3J0IHNxbGl0ZTMKCmZyb20gc2ViYmlfYWRhcHRlciBpbXBv"
-    "cnQgYW5jaG9yX3N0YXRlLCByZWNvcmQsIEFuY2hvckxvZ0hhbmRsZXIgICAjIDwtIHNlYmJpIChsaW5lIDEpCgoKIyAtLS0tIDEu"
-    "IEEgZGF0YWJhc2Ugd3JpdGUuIFR3byBsaW5lczogdGhlIGltcG9ydCBhYm92ZSBhbmQgdGhlIGRlY29yYXRvci4gLS0tLQoKZGIg"
-    "PSBzcWxpdGUzLmNvbm5lY3QoIjptZW1vcnk6IikKZGIuZXhlY3V0ZSgiQ1JFQVRFIFRBQkxFIGFjY291bnRzKGlkIElOVEVHRVIg"
-    "UFJJTUFSWSBLRVksIGJhbGFuY2UgSU5URUdFUikiKQpkYi5leGVjdXRlKCJJTlNFUlQgSU5UTyBhY2NvdW50cyBWQUxVRVMoNDIs"
-    "IDEwMDApIikKCgpAYW5jaG9yX3N0YXRlKCJhY2NvdW50cy5kZWJpdCIpICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
-    "ICAgIyA8LSBzZWJiaSAobGluZSAyKQpkZWYgZGViaXQoYWNjb3VudF9pZCwgYW1vdW50KToKICAgIGRiLmV4ZWN1dGUoIlVQREFU"
-    "RSBhY2NvdW50cyBTRVQgYmFsYW5jZSA9IGJhbGFuY2UgLSA/IFdIRVJFIGlkID0gPyIsIChhbW91bnQsIGFjY291bnRfaWQpKQog"
-    "ICAgZGIuY29tbWl0KCkKICAgIGJhbGFuY2UgPSBkYi5leGVjdXRlKCJTRUxFQ1QgYmFsYW5jZSBGUk9NIGFjY291bnRzIFdIRVJF"
-    "IGlkID0gPyIsIChhY2NvdW50X2lkLCkpLmZldGNob25lKClbMF0KICAgIHJldHVybiB7ImFjY291bnQiOiBhY2NvdW50X2lkLCAi"
-    "ZGViaXRlZCI6IGFtb3VudCwgImJhbGFuY2UiOiBiYWxhbmNlfQoKCiMgLS0tLSAyLiBBbiBBUEkgaGFuZGxlciAoRmxhc2ssIEZh"
-    "c3RBUEksIERqYW5nbyB2aWV3IC0gYW55IGZ1bmN0aW9uKS4gLS0tLQoKQGFuY2hvcl9zdGF0ZSgib3JkZXJzLnBsYWNlIiwgY2Fw"
-    "dHVyZT0iYm90aCIpICAgICMgZmluZ2VycHJpbnRzIHRoZSByZXF1ZXN0IGFuZCB0aGUgcmVzcG9uc2UKZGVmIHBsYWNlX29yZGVy"
-    "KGN1c3RvbWVyLCBpdGVtcyk6CiAgICByZXR1cm4geyJvcmRlcl9pZCI6IDcwMDEsICJjdXN0b21lciI6IGN1c3RvbWVyLCAiaXRl"
-    "bXMiOiBpdGVtcywgInN0YXR1cyI6ICJhY2NlcHRlZCJ9CgoKIyAtLS0tIDMuIEFuIGFzeW5jIGhhbmRsZXIuIFNhbWUgZGVjb3Jh"
-    "dG9yLiAtLS0tCgpAYW5jaG9yX3N0YXRlKCJwYXltZW50cy5yZWZ1bmQiKQphc3luYyBkZWYgcmVmdW5kKHBheW1lbnRfaWQpOgog"
-    "ICAgYXdhaXQgYXN5bmNpby5zbGVlcCgwKQogICAgcmV0dXJuIHsicGF5bWVudCI6IHBheW1lbnRfaWQsICJzdGF0dXMiOiAicmVm"
-    "dW5kZWQifQoKCiMgLS0tLSA0LiBBIHZhbHVlIHlvdSBvbmx5IHdhbnQgcGFydCBvZjogY2hvb3NlIGl0IHdpdGggZXh0cmFjdD0u"
-    "IC0tLS0KCmNsYXNzIFVzZXIob2JqZWN0KToKICAgIGRlZiBfX2luaXRfXyhzZWxmLCB1aWQsIGVtYWlsLCByb2xlKToKICAgICAg"
-    "ICBzZWxmLnVpZCwgc2VsZi5lbWFpbCwgc2VsZi5yb2xlID0gdWlkLCBlbWFpbCwgcm9sZQoKCkBhbmNob3Jfc3RhdGUoInVzZXJz"
-    "LnNldF9yb2xlIiwgZXh0cmFjdD1sYW1iZGEgcmVzdWx0LCBhcmdzLCBrd2FyZ3M6IHsidWlkIjogcmVzdWx0LnVpZCwgInJvbGUi"
-    "OiByZXN1bHQucm9sZX0pCmRlZiBzZXRfcm9sZSh1c2VyLCByb2xlKToKICAgIHVzZXIucm9sZSA9IHJvbGUKICAgIHJldHVybiB1"
-    "c2VyCgoKIyAtLS0tIDUuIEFuIGV4aXN0aW5nIGxvZ2dlcjogZXZlcnkgSU5GTyBsaW5lIGFuZCBhYm92ZSBpcyBmaW5nZXJwcmlu"
-    "dGVkLiAtLS0tCgphdWRpdCA9IGxvZ2dpbmcuZ2V0TG9nZ2VyKCJhdWRpdCIpCmF1ZGl0LnNldExldmVsKGxvZ2dpbmcuSU5GTykK"
-    "YXVkaXQuYWRkSGFuZGxlcihBbmNob3JMb2dIYW5kbGVyKCkpICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICMgPC0gc2Vi"
-    "YmkKCgppZiBfX25hbWVfXyA9PSAiX19tYWluX18iOgogICAgZGViaXQoNDIsIDI1MCkKICAgIHBsYWNlX29yZGVyKCJhY21lIiwg"
-    "WyJ3aWRnZXQiLCAiZ2VhciJdKQogICAgYXN5bmNpby5ydW4ocmVmdW5kKCJwYXlfODgxIikpCiAgICBzZXRfcm9sZShVc2VyKDUs"
-    "ICJhQGV4YW1wbGUuY29tIiwgInZpZXdlciIpLCAiYWRtaW4iKQogICAgYXVkaXQuaW5mbygibW9udGgtZW5kIGNsb3NlIGNvbXBs"
-    "ZXRlZCIpCiAgICBoID0gcmVjb3JkKHsiYmF0Y2giOiAiMjAyNi0wOSIsICJyb3dzIjogMTIwNH0pICAgICAgICAgICAgICAgICMg"
-    "YSBvbmUtb2ZmLCBhbnl3aGVyZQogICAgcHJpbnQoInJlY29yZGVkLCBmaW5nZXJwcmludCBvZiB0aGUgYmF0Y2g6IiwgaCkKICAg"
-    "IHByaW50KCJyZWNlaXB0cyBhcnJpdmUgaW4gdGhlIGJhY2tncm91bmQ7IGNoZWNrIHdpdGg6ICBweXRob24gc2ViYmlfYWRhcHRl"
-    "ci5weSBzdGF0dXMiKQo="
-)
-
-
-def _d(b):
-    return base64.b64decode("".join(b.split()))
-
-
-_FILES = {
-    "/plugin": (_d(_PAGE_B64), "text/html; charset=utf-8", None),
-    "/p/sebbi_adapter.py": (_d(_ADAPTER_B64), "text/x-python; charset=utf-8", "sebbi_adapter.py"),
-    "/p/example_legacy_app.py": (_d(_EXAMPLE_B64), "text/x-python; charset=utf-8", "example_legacy_app.py"),
+PUBLIC = {
+    ("GET", "spec"),
+    ("GET", "actor"),
+    ("GET", "actors"),
+    ("GET", "refusals"),
+    ("GET", "verify"),
+    ("GET", "status"),
 }
 
-_ctx = {}
-_ready = False
-_patched = False
-_loaded = False
-_leaves = []            # leaf hashes (bytes), index = leaf index
-_cache = {}             # (start, size) -> hash, for complete power-of-two subtrees
-_tree_lock = threading.Lock()
-_cp_lock = threading.Lock()
-_loop_started = False
+MAX_LAG_BEATS = 3          # how far behind the newest beat an action may be
+MAX_ACTOR_LEN = 120
+STALE_SECONDS = 3600
+
+REASONS = {
+    "ok": "Admitted. The round is ahead of this actor's last rung.",
+    "no_beats": (
+        "Refused: no beacon has been sealed on this server, so there is no "
+        "time to bind to. Nothing is admitted on trust."),
+    "round_unknown": (
+        "Refused: that beacon round has not been sealed here. Either it has "
+        "not happened yet - which would mean the actor knew a value before "
+        "it existed - or this server has not observed it."),
+    "round_not_advanced": (
+        "Refused: the round is at or below this actor's last rung. This is "
+        "the ratchet. An actor cannot move backwards through beacon time, "
+        "whether by backdating, by replay, or by being restored from an "
+        "older snapshot."),
+    "round_too_stale": (
+        "Refused: the round is further behind the current beat than the "
+        "permitted lag. An action bound to old time is a replay or a very "
+        "slow actor; both are refused and both are recorded."),
+    "digest_replayed": (
+        "Refused: this exact action digest is already on this actor's "
+        "ladder. Identical work resubmitted is a replay by definition."),
+    "bad_request": "Refused: malformed submission.",
+}
+
+WHAT_THIS_PROVES = (
+    "That an actor's recorded actions only ever moved forward in a public "
+    "time nobody controls. It does not prove any action was correct, "
+    "authorised, or sensible."
+)
+
+DDL = [
+    """CREATE TABLE IF NOT EXISTS ratchet_rung (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        actor         TEXT NOT NULL,
+        seq           INTEGER NOT NULL,
+        beacon_round  INTEGER NOT NULL,
+        beacon_value  TEXT,
+        digest        TEXT NOT NULL,
+        label         TEXT,
+        at            REAL NOT NULL,
+        chain_rowid   INTEGER,
+        audit_hash    TEXT
+    )""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_rat_seq ON ratchet_rung(actor, seq)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_rat_dig ON ratchet_rung(actor, digest)",
+    "CREATE INDEX IF NOT EXISTS idx_rat_actor ON ratchet_rung(actor)",
+    """CREATE TABLE IF NOT EXISTS ratchet_refusal (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        actor         TEXT NOT NULL,
+        claimed_round INTEGER,
+        last_round    INTEGER,
+        digest        TEXT,
+        reason        TEXT NOT NULL,
+        at            REAL NOT NULL,
+        chain_rowid   INTEGER,
+        audit_hash    TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_rat_ref ON ratchet_refusal(actor)",
+]
 
 
-# ---------------------------------------------------------------- RFC 6962
+# ---------------------------------------------------------------------
+# plumbing
+# ---------------------------------------------------------------------
 
-def _h(b):
-    return hashlib.sha256(b).digest()
-
-
-def _leaf_hash(entry):
-    return _h(b"\x00" + entry)
-
-
-def _node(left, right):
-    return _h(b"\x01" + left + right)
+def _ensure(conn, lock):
+    with lock:
+        cur = conn.cursor()
+        for stmt in DDL:
+            cur.execute(stmt)
+        conn.commit()
 
 
-def _split(n):
-    """Largest power of two strictly less than n (n >= 2)."""
-    k = 1
-    while k * 2 < n:
-        k *= 2
-    return k
+def _iso(t):
+    if t is None:
+        return None
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
 
 
-def _mth(start, n):
-    """Merkle Tree Hash of leaves[start:start+n]."""
-    if n == 0:
-        return _h(b"")
-    if n == 1:
-        return _leaves[start]
-    full = n >= 16 and (n & (n - 1)) == 0
-    if full:
-        hit = _cache.get((start, n))
-        if hit is not None:
-            return hit
-    k = _split(n)
-    out = _node(_mth(start, k), _mth(start + k, n - k))
-    if full:
-        _cache[(start, n)] = out
+def _human(seconds):
+    if seconds is None:
+        return None
+    s = int(round(seconds))
+    if s < 60:
+        return "%d seconds" % s
+    if s < 3600:
+        return "%d minutes" % (s // 60)
+    if s < 86400:
+        return "%d hours" % (s // 3600)
+    return "%d days" % (s // 86400)
+
+
+def _seal(ctx, action, payload):
+    """server.py: seal(event, result, ts, api_key=None); event is a DICT
+    carrying user_id; returns (audit_hash, block_index, key_seq)."""
+    fn = ctx.get("seal")
+    if fn is None:
+        return None, None
+    ts = time.time()
+    event = {"user_id": "ratchet", "action": action, "amount": 0,
+             "country": "UK", "device_id": "ratchet", "anomaly": 0,
+             "device_risk": 0}
+    result = dict(payload)
+    result.setdefault("decision", "RATCHET")
+    result.setdefault("score", 0)
+    result.setdefault("version", VERSION)
+    result.setdefault("timestamp", ts)
+    for call in (lambda: fn(event, result, ts),
+                 lambda: fn(event, result, ts, None),
+                 lambda: fn(event, result)):
+        try:
+            out = call()
+        except TypeError:
+            continue
+        except Exception:
+            return None, None
+        h = idx = None
+        if isinstance(out, (tuple, list)):
+            for item in out:
+                if isinstance(item, str) and len(item) == 64 and h is None:
+                    h = item
+                elif isinstance(item, int) and idx is None:
+                    idx = item
+        elif isinstance(out, str):
+            h = out
+        return h, idx
+    return None, None
+
+
+def _newest_beat(conn):
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT beacon_round, value, fetched_at FROM heartbeat_tick"
+                    " WHERE chain_rowid IS NOT NULL AND beacon_round IS NOT NULL"
+                    " ORDER BY beacon_round DESC LIMIT 1")
+        return cur.fetchone()
+    except Exception:
+        return None
+
+
+def _beat(conn, rnd):
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT beacon_round, value, fetched_at FROM heartbeat_tick"
+                    " WHERE beacon_round=? AND chain_rowid IS NOT NULL LIMIT 1",
+                    (rnd,))
+        return cur.fetchone()
+    except Exception:
+        return None
+
+
+def _beats_between(conn, low, high):
+    """How many sealed beats sit in (low, high]. Used for the lag check."""
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM heartbeat_tick WHERE chain_rowid IS"
+                    " NOT NULL AND beacon_round>? AND beacon_round<=?",
+                    (low, high))
+        return cur.fetchone()[0]
+    except Exception:
+        return 0
+
+
+def _top(conn, actor):
+    cur = conn.cursor()
+    cur.execute("SELECT seq, beacon_round, digest, at FROM ratchet_rung"
+                " WHERE actor=? ORDER BY seq DESC LIMIT 1", (actor,))
+    return cur.fetchone()
+
+
+def _refuse(ctx, conn, lock, actor, rnd, last, digest, reason, extra=None):
+    now = time.time()
+    with lock:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO ratchet_refusal (actor, claimed_round,"
+                    " last_round, digest, reason, at) VALUES (?,?,?,?,?,?)",
+                    (actor, rnd, last, digest, reason, now))
+        rid = cur.lastrowid
+        conn.commit()
+    h, idx = _seal(ctx, "ratchet_refused", {
+        "kind": "ratchet_refusal", "actor": actor, "claimed_round": rnd,
+        "last_admitted_round": last, "digest": digest, "reason": reason,
+        "explanation": REASONS.get(reason, reason),
+        "note": ("A refused action is sealed rather than discarded. An actor "
+                 "attempting to move backwards is the most interesting event "
+                 "this module can observe."),
+    })
+    if h or idx:
+        with lock:
+            conn.execute("UPDATE ratchet_refusal SET chain_rowid=?,"
+                         " audit_hash=? WHERE id=?", (idx, h, rid))
+            conn.commit()
+    out = {
+        "admitted": False,
+        "reason": reason,
+        "explanation": REASONS.get(reason, reason),
+        "actor": actor,
+        "claimed_round": rnd,
+        "last_admitted_round": last,
+        "refusal_sealed_at_block": idx,
+        "refusal_audit_hash": h,
+        "this_refusal_is_permanent": True,
+        "public_record": "/x/ratchet/refusals",
+    }
+    if extra:
+        out.update(extra)
     return out
 
 
-def _path(m, start, n):
-    """Audit path for leaf m within leaves[start:start+n]."""
-    if n <= 1:
-        return []
-    k = _split(n)
-    if m < k:
-        return _path(m, start, k) + [_mth(start + k, n - k)]
-    return _path(m - k, start + k, n - k) + [_mth(start, k)]
-
-
-def _subproof(m, start, n, b):
-    if m == n:
-        return [] if b else [_mth(start, n)]
-    k = _split(n)
-    if m <= k:
-        return _subproof(m, start, k, b) + [_mth(start + k, n - k)]
-    return _subproof(m - k, start + k, n - k, False) + [_mth(start, k)]
-
-
-def _consistency(m, n):
-    if m <= 0 or m >= n:
-        return []
-    return _subproof(m, 0, n, True)
-
-
-# ---------------------------------------------------------------- storage
-
-def _setup():
-    global _ready
-    if _ready or "conn" not in _ctx:
-        return
-    with _ctx["lock"]:
-        c = _ctx["conn"]
-        c.execute("CREATE TABLE IF NOT EXISTS ppa_leaf(idx INTEGER PRIMARY KEY,entry_hash TEXT NOT NULL,"
-                  "leaf_hash TEXT NOT NULL,client TEXT,cid TEXT,ts REAL,UNIQUE(client,cid))")
-        c.execute("CREATE INDEX IF NOT EXISTS ppa_leaf_entry ON ppa_leaf(entry_hash)")
-        c.execute("CREATE TABLE IF NOT EXISTS ppa_sth(tree_size INTEGER PRIMARY KEY,root TEXT NOT NULL,"
-                  "ts REAL,audit_hash TEXT,block_index INTEGER)")
-        c.commit()
-    _ready = True
-
-
-def _reload_locked(c):
-    """Rebuild the in-memory tree from the database. Caller holds _ctx['lock']."""
-    rows = c.execute("SELECT idx,leaf_hash FROM ppa_leaf ORDER BY idx").fetchall()
-    fresh = []
-    for i, (idx, lh) in enumerate(rows):
-        if idx != i:
-            raise RuntimeError("leaf index gap at %d" % i)
-        fresh.append(bytes.fromhex(lh))
-    _cache.clear()
-    _leaves[:] = fresh
-
-
-def _load():
-    global _loaded
-    if _loaded:
-        return
-    with _tree_lock:
-        if _loaded:
-            return
-        with _ctx["lock"]:
-            _reload_locked(_ctx["conn"])
-        _loaded = True
-
-
-def _seal(kind, detail, extra):
-    ev = {"user_id": "ppa:" + kind[:20], "action": kind, "amount": 0, "country": "UK",
-          "device_id": "public-proof-adapter", "anomaly": 0, "device_risk": 0}
-    res = {"decision": kind.upper(), "score": 0, "adapter_version": VERSION, "detail": detail}
-    res.update(extra or {})
-    out = _ctx["seal"](ev, res, time.time(), KEY)
-    if isinstance(out, (list, tuple)):
-        return out[0], (out[1] if len(out) > 1 else None)
-    return out, None
-
-
-def _sth_rows(sql, args=()):
-    with _ctx["lock"]:
-        return _ctx["conn"].execute(sql, args).fetchall()
-
-
-def _latest_sth():
-    r = _sth_rows("SELECT tree_size,root,ts,audit_hash,block_index FROM ppa_sth ORDER BY tree_size DESC LIMIT 1")
-    return _sth_dict(r[0]) if r else None
-
-
-def _covering_sth(idx):
-    r = _sth_rows("SELECT tree_size,root,ts,audit_hash,block_index FROM ppa_sth WHERE tree_size>? "
-                  "ORDER BY tree_size ASC LIMIT 1", (idx,))
-    return _sth_dict(r[0]) if r else None
-
-
-def _sth_dict(r):
-    return {"tree_size": r[0], "root": r[1],
-            "sealed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(r[2] or 0)),
-            "audit_hash": r[3], "block_index": r[4],
-            "walk": SITE + "/x/walk/block?index=%s" % r[4] if r[4] is not None else None,
-            "ts": r[2] or 0}
-
-
-# ---------------------------------------------------------------- appends and checkpoints
-
-def _append(client, items):
-    """items: list of (entry_hex, cid or None). Returns list of (idx, entry_hex, replayed, error)."""
-    for attempt in range(3):
-        out = []
-        with _ctx["lock"]:
-            c = _ctx["conn"]
-            top = c.execute("SELECT COALESCE(MAX(idx),-1) FROM ppa_leaf").fetchone()[0]
-            if top + 1 != len(_leaves):
-                _reload_locked(c)
-            start_len = len(_leaves)
-            try:
-                for eh, cid in items:
-                    if cid:
-                        row = c.execute("SELECT idx,entry_hash FROM ppa_leaf WHERE client=? AND cid=?",
-                                        (client, cid)).fetchone()
-                        if row:
-                            if row[1] != eh:
-                                out.append((None, eh, False, "cid_reused_for_a_different_hash"))
-                            else:
-                                out.append((row[0], eh, True, None))
-                            continue
-                    idx = len(_leaves)
-                    lh = _leaf_hash(bytes.fromhex(eh))
-                    c.execute("INSERT INTO ppa_leaf(idx,entry_hash,leaf_hash,client,cid,ts) VALUES(?,?,?,?,?,?)",
-                              (idx, eh, lh.hex(), client, cid or None, time.time()))
-                    _leaves.append(lh)
-                    out.append((idx, eh, False, None))
-                c.commit()
-                return out
-            except sqlite3.IntegrityError:
-                c.rollback()
-                del _leaves[start_len:]
-                _reload_locked(c)
-            except Exception:
-                c.rollback()
-                del _leaves[start_len:]
-                raise
-    raise RuntimeError("could not append after retries")
-
-
-def _checkpoint(force=False):
-    """Seal the current tree head into the chain if it is due. Never runs twice at once."""
-    if "conn" not in _ctx or not _cp_lock.acquire(blocking=False):
-        return None
-    try:
-        _load()
-        n = len(_leaves)
-        last = _latest_sth()
-        last_size = last["tree_size"] if last else 0
-        if n == 0 or n == last_size:
-            return last
-        due = force or (n - last_size) >= CHECKPOINT_EVERY or \
-            (time.time() - (last["ts"] if last else 0)) >= CHECKPOINT_SECONDS
-        if not due:
-            return last
-        root = _mth(0, n).hex()
-        ah, blk = _seal("tree_head", "size=%d;root=%s" % (n, root),
-                        {"tree_size": n, "root": root, "prev_tree_size": last_size,
-                         "log": "sebbi public proof log", "spec": "RFC6962-SHA256"})
-        with _ctx["lock"]:
-            _ctx["conn"].execute("INSERT OR IGNORE INTO ppa_sth(tree_size,root,ts,audit_hash,block_index) "
-                                 "VALUES(?,?,?,?,?)", (n, root, time.time(), ah, blk))
-            _ctx["conn"].commit()
-        return _latest_sth()
-    finally:
-        _cp_lock.release()
-
-
-def _loop():
-    while True:
-        time.sleep(10)
-        try:
-            _checkpoint()
-        except Exception as e:
-            print("public_proof_adapter checkpoint: " + str(e)[:160], flush=True)
-
-
-def _start_loop():
-    global _loop_started
-    if _loop_started:
-        return
-    _loop_started = True
-    threading.Thread(target=_loop, name="ppa-checkpoint", daemon=True).start()
-
-
-# ---------------------------------------------------------------- receipts
-
-def _anchoring_note(cp):
-    if not cp:
-        return ("pending: this leaf is covered by the next tree head, sealed into the chain within about "
-                "%d seconds. Fetch /p/receipt?leaf=N again after that." % CHECKPOINT_SECONDS)
-    return ("tree head sealed in chain block %s. The chain tip is timestamped in Bitcoin via OpenTimestamps; "
-            "once a confirmed anchored tip is at or after that block, this leaf is Bitcoin-anchored. "
-            "Check: %s/x/ots/latest_confirmed" % (cp["block_index"], SITE))
-
-
-def _receipt(idx, size=None):
-    _load()
-    n = len(_leaves)
-    if idx < 0 or idx >= n:
-        return None
-    with _ctx["lock"]:
-        row = _ctx["conn"].execute("SELECT entry_hash FROM ppa_leaf WHERE idx=?", (idx,)).fetchone()
-    cp = _covering_sth(idx) if size is None else None
-    tsize = size if size is not None else (cp["tree_size"] if cp else n)
-    tsize = max(idx + 1, min(tsize, n))
-    root = _mth(0, tsize).hex()
-    rec = {"log": "sebbi.pro public proof log", "spec": SPEC,
-           "entry_hash": row[0] if row else None, "leaf_index": idx,
-           "leaf_hash": _leaves[idx].hex(), "tree_size": tsize, "root": root,
-           "audit_path": [p.hex() for p in _path(idx, 0, tsize)],
-           "checkpoint": None, "anchoring": _anchoring_note(cp)}
-    if cp:
-        c2 = dict(cp)
-        c2.pop("ts", None)
-        c2["root_matches"] = (cp["root"] == root)
-        rec["checkpoint"] = c2
-    return rec
-
-
-# ---------------------------------------------------------------- commands
-
-def _client_for(key):
-    key = str(key or "").strip()
-    if key:
-        try:
-            with _ctx["lock"]:
-                row = _ctx["conn"].execute("SELECT active FROM api_keys WHERE key=?", (key,)).fetchone()
-        except Exception:
-            row = None
-        if row and row[0] in (1, None):
-            return "k_" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
-    return "open" if OPEN else None
-
-
-def c_submit(q, body, key):
-    client = _client_for(key)
-    if not client:
-        return {"error": "api_key_required",
-                "message": "Send your sebbi.pro API key in the X-Sebbi-Key header."}, 401
-    raw = body.get("items")
-    if raw is None and body.get("hashes") is not None:
-        raw = [{"hash": h} for h in body.get("hashes") or []]
-    if raw is None and body.get("hash") is not None:
-        raw = [{"hash": body.get("hash"), "cid": body.get("cid")}]
-    if not isinstance(raw, list) or not raw:
-        return {"error": "nothing_to_submit", "message": 'Send {"items":[{"hash":"<64 hex>","cid":"..."}]}'}, 400
-    if len(raw) > MAX_ITEMS:
-        return {"error": "too_many", "max_items": MAX_ITEMS}, 413
-    items, bad = [], []
-    for i, it in enumerate(raw):
-        it = it if isinstance(it, dict) else {"hash": it}
-        h = str(it.get("hash") or "").strip().lower()
-        cid = str(it.get("cid") or "").strip() or None
-        if not HEX64.match(h):
-            bad.append({"position": i, "error": "hash must be 64 hex characters (SHA-256)"})
-        elif cid and not CID_RE.match(cid):
-            bad.append({"position": i, "error": "cid must be 1-80 letters, numbers, _ . : -"})
-        else:
-            items.append((h, cid))
-    if bad:
-        return {"error": "bad_items", "items": bad}, 400
-    _load()
-    placed = _append(client, items)
-    n = len(_leaves)
-    last = _latest_sth()
-    if n - (last["tree_size"] if last else 0) >= CHECKPOINT_EVERY:
-        threading.Thread(target=_checkpoint, daemon=True).start()
-    receipts = []
-    for (idx, eh, replayed, err), (_, cid) in zip(placed, items):
-        if err:
-            receipts.append({"cid": cid, "entry_hash": eh, "error": err})
-            continue
-        r = _receipt(idx, size=n)
-        r["cid"] = cid
-        r["replayed"] = replayed
-        r["anchoring"] = _anchoring_note(None)
-        receipts.append(r)
-    return {"accepted": sum(1 for r in receipts if "error" not in r), "tree_size": n,
-            "root": _mth(0, n).hex(), "receipts": receipts}, 200
-
-
-def _int(q, name, default=None):
-    try:
-        return int(str(q.get(name, default)))
-    except (TypeError, ValueError):
-        return None
-
-
-def c_receipt(q, body, key):
-    idx = _int(q, "leaf")
-    if idx is None:
-        return {"error": "leaf needed"}, 400
-    r = _receipt(idx)
-    return (r, 200) if r else ({"error": "no such leaf"}, 404)
-
-
-def c_proof(q, body, key):
-    idx, size = _int(q, "leaf"), _int(q, "size", 0)
-    if idx is None:
-        return {"error": "leaf needed"}, 400
-    r = _receipt(idx, size=size or len(_leaves))
-    return (r, 200) if r else ({"error": "no such leaf"}, 404)
-
-
-def c_consistency(q, body, key):
-    _load()
-    m, n = _int(q, "first"), _int(q, "second", len(_leaves))
-    if m is None or n is None or m < 1 or m > n or n > len(_leaves):
-        return {"error": "need 1 <= first <= second <= tree size", "tree_size": len(_leaves)}, 400
-    return {"first": m, "second": n, "first_root": _mth(0, m).hex(), "second_root": _mth(0, n).hex(),
-            "proof": [p.hex() for p in _consistency(m, n)], "spec": SPEC}, 200
-
-
-def c_sth(q, body, key):
-    _load()
-    last = _latest_sth()
-    if last:
-        last.pop("ts", None)
-    return {"tree_size": len(_leaves), "latest_sealed_tree_head": last,
-            "checkpoint_every_seconds": CHECKPOINT_SECONDS, "spec": SPEC}, 200
-
-
-def c_find(q, body, key):
-    h = str(q.get("hash") or "").strip().lower()
-    if not HEX64.match(h):
-        return {"error": "hash must be 64 hex characters"}, 400
-    rows = _sth_rows("SELECT idx FROM ppa_leaf WHERE entry_hash=? ORDER BY idx LIMIT 50", (h,))
-    return {"entry_hash": h, "leaf_indexes": [r[0] for r in rows]}, 200
-
-
-def c_index(q, body, key):
-    return {"log": "sebbi.pro public proof log", "version": VERSION, "spec": SPEC,
-            "submit": "POST " + SITE + "/p/submit with X-Sebbi-Key",
-            "check": ["GET " + SITE + "/p/receipt?leaf=N", "GET " + SITE + "/p/consistency?first=M&second=N",
-                      "GET " + SITE + "/p/sth"],
-            "hash_only": True}, 200
-
-
-GETS = {"receipt": c_receipt, "proof": c_proof, "consistency": c_consistency, "sth": c_sth,
-        "find": c_find, "": c_index}
-POSTS = {"submit": c_submit}
-
-
-# ---------------------------------------------------------------- transport
-
-def _send(h, obj, code=200):
-    body = json.dumps(obj).encode("utf-8")
-    h.send_response(code)
-    h.send_header("Content-Type", "application/json; charset=utf-8")
-    h.send_header("Content-Length", str(len(body)))
-    h.send_header("Access-Control-Allow-Origin", "*")
-    h.send_header("Access-Control-Allow-Headers", "Content-Type, X-Sebbi-Key")
-    h.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-    h.send_header("Cache-Control", "no-store")
-    h.end_headers()
-    h.wfile.write(body)
-
-
-def _run(h, method):
-    u = urllib.parse.urlparse(h.path)
-    name = u.path[3:].strip("/").lower()
-    table = GETS if method == "GET" else POSTS
-    if name not in table:
-        return False
-    if "conn" not in _ctx:
-        _send(h, {"error": "not_armed", "message": "open /x/public_proof_adapter/status once"}, 503)
-        return True
-    _setup()
-    q = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
-    body = {}
-    if method == "POST":
-        try:
-            n = int(h.headers.get("Content-Length") or 0)
-        except ValueError:
-            n = 0
-        if n > MAX_BODY:
-            _send(h, {"error": "body_too_large", "max_bytes": MAX_BODY}, 413)
-            return True
-        try:
-            body = json.loads(h.rfile.read(n).decode("utf-8") or "{}") if n else {}
-            if not isinstance(body, dict):
-                body = {}
-        except Exception:
-            _send(h, {"error": "bad_json"}, 400)
-            return True
-    key = h.headers.get("X-Sebbi-Key") or body.get("key") or q.get("key")
-    try:
-        out, code = table[name](q, body, key)
-    except Exception as e:
-        out, code = {"error": "failed", "detail": str(e)[:160]}, 500
-    _send(h, out, code)
-    return True
-
-
-def _find_handler_class(ctx):
-    if isinstance(ctx, dict):
-        for k in ("handler_class", "handler", "Handler", "h", "request_handler"):
-            v = ctx.get(k)
-            if v is None:
-                continue
-            cls = v if isinstance(v, type) else type(v)
-            if hasattr(cls, "do_GET"):
-                return cls
-    f = sys._getframe()
-    while f is not None:
-        s = f.f_locals.get("self")
-        if s is not None and hasattr(type(s), "do_GET") and hasattr(s, "wfile"):
-            return type(s)
-        f = f.f_back
-    return None
-
-
-def _install(ctx):
-    global _patched
-    if isinstance(ctx, dict) and "conn" in ctx:
-        _ctx.update(ctx)
-        _setup()
-        _load()
-        _start_loop()
-    if _patched:
-        return True
-    cls = _find_handler_class(ctx)
-    if cls is None:
-        return False
-    if getattr(cls, "_ppa_patched", False):
-        _patched = True
-        return True
-    og, op, oo = cls.do_GET, getattr(cls, "do_POST", None), getattr(cls, "do_OPTIONS", None)
-
-    def do_GET(self):
-        path = self.path.split("?")[0].split("#")[0].rstrip("/") or "/"
-        hit = _FILES.get(path)
-        if hit:
-            body, ctype, fname = hit
-            self.send_response(200)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(body)))
-            if fname:
-                self.send_header("Content-Disposition", 'attachment; filename="%s"' % fname)
-            self.send_header("Cache-Control", "no-cache")
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        if (self.path == "/p" or self.path.startswith("/p/")) and _run(self, "GET"):
-            return
-        return og(self)
-
-    def do_POST(self):
-        if self.path.startswith("/p/") and _run(self, "POST"):
-            return
-        return op(self) if op else None
-
-    def do_OPTIONS(self):
-        if self.path.startswith("/p/"):
-            self.send_response(204)
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Sebbi-Key")
-            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
-        return oo(self) if oo else None
-
-    cls.do_GET = do_GET
-    if op:
-        cls.do_POST = do_POST
-    cls.do_OPTIONS = do_OPTIONS
-    cls._ppa_patched = True
-    _patched = True
-    return True
-
-
-def _flat(d):
-    if not isinstance(d, dict):
-        return {}
-    return {k: (v[0] if isinstance(v, list) and v else v) for k, v in d.items()}
-
+# ---------------------------------------------------------------------
+# handle
+# ---------------------------------------------------------------------
 
 def handle(method, action, data, api_key, ctx):
-    armed = _install(ctx)
-    action = (action or "status").strip("/").lower()
-    data = _flat(data)
-    if "conn" in _ctx and action in POSTS and method == "POST":
-        return POSTS[action](data, data, api_key or data.get("key"))
-    if "conn" in _ctx and action in GETS and action not in ("",):
-        return GETS[action](data, data, api_key)
-    last = _latest_sth() if "conn" in _ctx else None
-    if last:
-        last.pop("ts", None)
-    return {"module": "public_proof_adapter", "version": VERSION, "armed": armed,
-            "aliases": ALIASES, "tree_size": len(_leaves), "latest_sealed_tree_head": last,
-            "checkpoint_every_seconds": CHECKPOINT_SECONDS, "checkpoint_every_leaves": CHECKPOINT_EVERY,
-            "open_submissions": OPEN, "spec": SPEC,
-            "pages": sorted(_FILES.keys()),
-            "endpoints": ["POST /p/submit", "/p/receipt", "/p/proof", "/p/consistency", "/p/sth", "/p/find"]}, 200
+    conn, lock = ctx["conn"], ctx["lock"]
+    _ensure(conn, lock)
+
+    if method == "GET" and action == "spec":
+        return _spec(), 200
+
+    # -------------------------------------------------- act
+    if method == "POST" and action == "act":
+        actor = str(data.get("actor") or "").strip().lower()[:MAX_ACTOR_LEN]
+        digest = str(data.get("digest") or "").strip().lower()
+        label = str(data.get("label") or "")[:200] or None
+        rnd = data.get("round")
+
+        if not actor:
+            return {"error": "actor_required",
+                    "note": "A stable identifier for the acting agent."}, 400
+        if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            return {"error": "digest_required",
+                    "note": ("A SHA-256 of the action. The action itself never "
+                             "leaves your system.")}, 400
+
+        newest = _newest_beat(conn)
+        if not newest:
+            top = _top(conn, actor)
+            return _refuse(ctx, conn, lock, actor, rnd,
+                           top[1] if top else None, digest, "no_beats"), 503
+
+        newest_round = newest[0]
+        if rnd is None:
+            rnd = newest_round          # bind to now if the caller does not say
+        try:
+            rnd = int(rnd)
+        except (TypeError, ValueError):
+            return {"error": "round_invalid"}, 400
+
+        top = _top(conn, actor)
+        last_round = top[1] if top else None
+        last_seq = top[0] if top else 0
+
+        if not _beat(conn, rnd):
+            return _refuse(ctx, conn, lock, actor, rnd, last_round, digest,
+                           "round_unknown",
+                           {"newest_sealed_round": newest_round}), 409
+
+        if last_round is not None and rnd <= last_round:
+            return _refuse(ctx, conn, lock, actor, rnd, last_round, digest,
+                           "round_not_advanced",
+                           {"the_rule": ("beacon round must be strictly greater "
+                                         "than the actor's last rung")}), 409
+
+        lag = _beats_between(conn, rnd, newest_round)
+        if lag > MAX_LAG_BEATS:
+            return _refuse(ctx, conn, lock, actor, rnd, last_round, digest,
+                           "round_too_stale",
+                           {"beats_behind": lag,
+                            "max_lag_beats": MAX_LAG_BEATS,
+                            "newest_sealed_round": newest_round}), 409
+
+        cur = conn.cursor()
+        cur.execute("SELECT seq FROM ratchet_rung WHERE actor=? AND digest=?",
+                    (actor, digest))
+        if cur.fetchone():
+            return _refuse(ctx, conn, lock, actor, rnd, last_round, digest,
+                           "digest_replayed"), 409
+
+        beat = _beat(conn, rnd)
+        now = time.time()
+        seq = last_seq + 1
+        with lock:
+            cur = conn.cursor()
+            cur.execute("INSERT INTO ratchet_rung (actor, seq, beacon_round,"
+                        " beacon_value, digest, label, at)"
+                        " VALUES (?,?,?,?,?,?,?)",
+                        (actor, seq, rnd, beat[1], digest, label, now))
+            rid = cur.lastrowid
+            conn.commit()
+
+        h, idx = _seal(ctx, "ratchet_step", {
+            "kind": "ratchet_step", "actor": actor, "seq": seq,
+            "beacon_round": rnd, "beacon_value": beat[1], "digest": digest,
+            "label": label, "previous_round": last_round,
+            "note": ("Bound to a public beacon value the actor could not have "
+                     "known before that round existed."),
+        })
+        if h or idx:
+            with lock:
+                conn.execute("UPDATE ratchet_rung SET chain_rowid=?,"
+                             " audit_hash=? WHERE id=?", (idx, h, rid))
+                conn.commit()
+
+        return {
+            "admitted": True, "actor": actor, "seq": seq,
+            "beacon_round": rnd, "beacon_value": beat[1],
+            "previous_round": last_round, "digest": digest,
+            "sealed_at_block": idx, "audit_hash": h,
+            "floor": ("This action cannot have been created before beacon "
+                      "round %d at %s." % (rnd, _iso(beat[2]))),
+            "ratchet": ("This actor can no longer act at or below round %d. "
+                        "That door is shut permanently." % rnd),
+            "verify_beacon": "/x/heartbeat/verify?round=%d" % rnd,
+        }, 200
+
+    # -------------------------------------------------- actor
+    if method == "GET" and action == "actor":
+        actor = str(data.get("id") or "").strip().lower()
+        if not actor:
+            return {"error": "id_required",
+                    "usage": "/x/ratchet/actor?id=<actor>"}, 400
+        cur = conn.cursor()
+        cur.execute("SELECT seq, beacon_round, digest, label, at, chain_rowid,"
+                    " audit_hash FROM ratchet_rung WHERE actor=? ORDER BY seq",
+                    (actor,))
+        rungs = cur.fetchall()
+        if not rungs:
+            return {"actor": actor, "rungs": 0,
+                    "message": "No ladder for this actor."}, 404
+        cur.execute("SELECT COUNT(*) FROM ratchet_refusal WHERE actor=?", (actor,))
+        refused = cur.fetchone()[0]
+        last = rungs[-1]
+        age = time.time() - last[4]
+        return {
+            "actor": actor,
+            "rungs": len(rungs),
+            "current_round": last[1],
+            "current_seq": last[0],
+            "last_action_at": _iso(last[4]),
+            "seconds_since": round(age, 1),
+            "status": "current" if age < STALE_SECONDS else "silent",
+            "refusals": refused,
+            "ladder": [{"seq": r[0], "round": r[1], "digest": r[2],
+                        "label": r[3], "at": _iso(r[4]), "block": r[5],
+                        "audit_hash": r[6]} for r in rungs[-50:]],
+            "floor_now": ("This actor cannot act at or below round %d."
+                          % last[1]),
+            "what_this_proves": WHAT_THIS_PROVES,
+        }, 200
+
+    # -------------------------------------------------- actors
+    if method == "GET" and action == "actors":
+        now = time.time()
+        cur = conn.cursor()
+        cur.execute("SELECT actor, COUNT(*), MAX(beacon_round), MAX(at)"
+                    " FROM ratchet_rung GROUP BY actor ORDER BY MAX(at) DESC")
+        out = []
+        for a, n, rnd, at in cur.fetchall():
+            cur2 = conn.cursor()
+            cur2.execute("SELECT COUNT(*) FROM ratchet_refusal WHERE actor=?", (a,))
+            out.append({"actor": a, "rungs": n, "current_round": rnd,
+                        "last_action": _iso(at),
+                        "silent_for": _human(now - at) if now - at > STALE_SECONDS else None,
+                        "refusals": cur2.fetchone()[0]})
+        return {"count": len(out), "actors": out,
+                "note": ("Silence is visible but not prevented. An actor that "
+                         "stops acting simply stops, and no design fixes "
+                         "that.")}, 200
+
+    # -------------------------------------------------- refusals
+    if method == "GET" and action == "refusals":
+        try:
+            limit = min(int(data.get("limit", 100)), 500)
+        except (TypeError, ValueError):
+            limit = 100
+        cur = conn.cursor()
+        cur.execute("SELECT actor, claimed_round, last_round, digest, reason,"
+                    " at, chain_rowid, audit_hash FROM ratchet_refusal"
+                    " ORDER BY id DESC LIMIT ?", (limit,))
+        rows = cur.fetchall()
+        mix = {}
+        for r in rows:
+            mix[r[4]] = mix.get(r[4], 0) + 1
+        return {
+            "count": len(rows),
+            "by_reason": mix,
+            "refusals": [{"actor": r[0], "claimed_round": r[1],
+                          "last_admitted_round": r[2], "digest": r[3],
+                          "reason": r[4], "explanation": REASONS.get(r[4], r[4]),
+                          "at": _iso(r[5]), "block": r[6], "audit_hash": r[7]}
+                         for r in rows],
+            "why_this_is_public": (
+                "A refused action is sealed rather than discarded, and the "
+                "list is open. An actor attempting to move backwards through "
+                "time is the single most interesting thing this system can "
+                "see, and hiding it would defeat the point of building it."),
+        }, 200
+
+    # -------------------------------------------------- verify
+    if method == "GET" and action == "verify":
+        actor = str(data.get("id") or "").strip().lower()
+        if not actor:
+            return {"error": "id_required"}, 400
+        cur = conn.cursor()
+        cur.execute("SELECT seq, beacon_round, beacon_value, digest FROM"
+                    " ratchet_rung WHERE actor=? ORDER BY seq", (actor,))
+        rungs = cur.fetchall()
+        if not rungs:
+            return {"error": "unknown_actor", "actor": actor}, 404
+        breaks = []
+        prev_seq = 0
+        prev_round = None
+        seen = set()
+        for seq, rnd, val, dig in rungs:
+            if seq != prev_seq + 1:
+                breaks.append({"at_seq": seq, "fault": "sequence_gap",
+                               "expected": prev_seq + 1})
+            if prev_round is not None and rnd <= prev_round:
+                breaks.append({"at_seq": seq, "fault": "round_did_not_advance",
+                               "round": rnd, "previous": prev_round})
+            if dig in seen:
+                breaks.append({"at_seq": seq, "fault": "duplicate_digest"})
+            b = _beat(conn, rnd)
+            if not b:
+                breaks.append({"at_seq": seq, "fault": "beacon_round_not_sealed",
+                               "round": rnd})
+            elif b[1] != val:
+                breaks.append({"at_seq": seq, "fault": "beacon_value_mismatch",
+                               "round": rnd})
+            seen.add(dig)
+            prev_seq, prev_round = seq, rnd
+        return {
+            "actor": actor, "rungs": len(rungs), "intact": not breaks,
+            "breaks": breaks,
+            "checked": ["sequence has no gaps",
+                        "beacon round strictly increases",
+                        "no digest appears twice",
+                        "each rung's beacon value matches the sealed beat"],
+            "do_it_without_us": (
+                "Every beacon round on the ladder is re-fetchable from the "
+                "beacon operator. Confirm each value there, then confirm each "
+                "audit_hash is in the chain at /api/verify-chain. Neither step "
+                "needs our cooperation."),
+            "what_this_proves": WHAT_THIS_PROVES,
+        }, 200
+
+    # -------------------------------------------------- status
+    if method == "GET" and action == "status":
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*), COUNT(DISTINCT actor) FROM ratchet_rung")
+        rungs, actors = cur.fetchone()
+        cur.execute("SELECT COUNT(*) FROM ratchet_refusal")
+        refused = cur.fetchone()[0]
+        cur.execute("SELECT reason, COUNT(*) FROM ratchet_refusal GROUP BY reason")
+        mix = {r[0]: r[1] for r in cur.fetchall()}
+        newest = _newest_beat(conn)
+        return {
+            "version": VERSION,
+            "actors": actors, "rungs_admitted": rungs,
+            "actions_refused": refused,
+            "refusals_by_reason": mix,
+            "current_beacon_round": newest[0] if newest else None,
+            "beacon_available": newest is not None,
+            "max_lag_beats": MAX_LAG_BEATS,
+            "depends_on": {
+                "heartbeat": ("supplies the time. With no beats sealed, "
+                              "nothing is admitted - actions are refused "
+                              "rather than waved through on trust."),
+            },
+            "what_this_proves": WHAT_THIS_PROVES,
+        }, 200
+
+    return {"error": "unknown_action", "action": action,
+            "actions": ["spec", "actor", "actors", "refusals", "verify",
+                        "status", "act"]}, 404
 
 
-def register(MODULE_MAP):
-    """For name-based loaders: map this module under its own name and its aliases."""
-    mod = sys.modules[__name__]
-    for name in ["public_proof_adapter"] + ALIASES:
-        MODULE_MAP.setdefault(name, mod)
-    return MODULE_MAP
+def _spec():
+    return {
+        "module": "ratchet",
+        "version": VERSION,
+        "one_line": "Time only runs one way for the machine.",
+        "the_rule": (
+            "An action carrying a beacon round at or below the actor's last "
+            "recorded round is refused. Beacon rounds only increase, so an "
+            "actor's ladder only rises."),
+        "what_it_kills": {
+            "backdating": "the earlier round is already spent",
+            "replay": "stale round, and the digest is already on the ladder",
+            "pre_computation": ("an unsealed future round is refused, and "
+                                "nobody can know a beacon value early"),
+            "rewind": ("the ladder lives in a chain the actor does not "
+                       "control, so restoring an agent from a snapshot does "
+                       "not restore its position"),
+        },
+        "admission_rules_in_order": [
+            "1. A beat must exist. No beats, nothing admitted.",
+            "2. The claimed round must already be sealed here.",
+            "3. The round must be strictly above the actor's last rung.",
+            "4. The round must be within %d beats of the newest." % MAX_LAG_BEATS,
+            "5. The digest must not already be on this actor's ladder.",
+        ],
+        "refusals_are_sealed": (
+            "A refused action is written into the chain with its reason and "
+            "published at /x/ratchet/refusals. Discarding it would throw away "
+            "the most interesting evidence the system can produce."),
+        "privacy": (
+            "Only a SHA-256 of the action is submitted. The action itself, "
+            "its inputs and its outputs never leave the caller's system."),
+        "what_this_proves": WHAT_THIS_PROVES,
+        "limits": [
+            "It proves order, not correctness, authority or good judgement.",
+            "An actor that stops acting is visible but not prevented.",
+            "New actor ids start new ladders; identity is not this module's "
+            "problem and it does not pretend otherwise.",
+            "Within a single beat, actions are ordered by sequence rather "
+            "than by beacon time. At a five minute cadence that is a five "
+            "minute grain, and it is reported rather than dressed up.",
+        ],
+        "routes": {
+            "POST /x/ratchet/act": "keyed - submit an action digest",
+            "GET /x/ratchet/actor?id=": "one ladder",
+            "GET /x/ratchet/actors": "every ladder",
+            "GET /x/ratchet/refusals": "every refused attempt and why",
+            "GET /x/ratchet/verify?id=": "re-walk a ladder",
+            "GET /x/ratchet/status": "counts and current round",
+        },
+    }
 
 ```
 
 
-## `modules/publish.py`
+## `modules/reconcile.py`
 
-491 lines, 21976 bytes
+440 lines, 20123 bytes
 
 ```python
-#!/usr/bin/env python3
 """
-modules/publish.py  -  sealing what you published, at the moment you publish it
-===============================================================================
+Reconciliation notary - /x/reconcile/<action>
 
-THE PROBLEM THIS EXISTS TO NEVER HAVE AGAIN
--------------------------------------------
-Somebody asks when a page was published. You answer from git history. They
-point out - correctly - that git commit dates are fields in the commit
-object which anyone can set to anything with an environment variable before
-committing. Your strongest evidence turns out to be the weakest thing in
-the room, and it drags the credible parts down with it.
+THE PROBLEM THIS ATTACKS
+------------------------
+A sealed chain proves records were not altered after the fact. It does not
+prove they were true when written. An operator who seals fiction on time has
+a tamper-evident chain of fiction. Every honest person in this market knows
+that, and almost nobody says it.
 
-The fix is not a better argument. It is sealing the page the moment it goes
-live, so the question never depends on anybody's word again.
+You cannot prove truth from outside a system. What you CAN do is what real
+auditors do: substantive testing. Take the sealed claim, go to the operator's
+own live system, and check whether the two agree - then seal the result of
+that check, including the failures.
 
-WHAT THIS DOES
---------------
-    POST /x/publish/seal {"url": "https://example.com/spec"}
+WHY THIS ONE IS DIFFERENT
+-------------------------
+The sample is fixed before the operator sees it.
 
-We fetch the URL ourselves, hash exactly what was served, and seal the hash,
-the URL and the fetch time into the chain - where it is anchored externally
-and handed to peer chains like every other block.
+/plan derives a selection seed from the current chain tip - a value the
+operator cannot predict in advance and cannot change afterwards without
+breaking the chain - picks the records to be tested, and seals that selection
+BEFORE any data is requested. Only then are the record identifiers returned.
 
-From then on:
+So the operator cannot choose which records get examined, cannot prepare only
+the flattering ones, and cannot quietly drop a test that came back badly:
+every planned run is sealed at the moment it is planned, and a plan with no
+submitted result is visible forever as an abandoned test.
 
-  - "this exact content was served at this address no later than T" is
-    arithmetic rather than a claim;
-  - re-sealing the same URL later builds a permanent revision history that
-    the publisher cannot edit, because each version is its own block;
-  - and anyone can check it without an account.
+Mismatches are sealed with the same permanence as matches. That is the whole
+design. A reconciliation system that can bury its own failures is decoration.
 
-Seal at publication and you never argue about a publication date again. That
-is the entire point, and it takes one call.
-
-WHAT IT HONESTLY CANNOT DO
+WHAT A PASS ACTUALLY MEANS
 --------------------------
-It cannot reach backwards. A seal made today proves the content existed
-today, not that it existed last week. Nothing can prove that - not this, not
-Bitcoin, not a notary. Timestamps are one-directional by nature.
+That two systems the operator controls agree with each other, on records the
+operator could not choose, at a time the operator could not pick.
 
-So for anything already published before it was sealed, the module records
-EXTERNAL REFERENCES alongside: a GitHub push event, a Wayback Machine
-snapshot, a DigiCert or OpenTimestamps proof. Those are stored and sealed as
-supplied. We do not verify them and we do not present them as ours - they
-are somebody else's record, named so a third party can check it at source.
-That distinction is stated in every response rather than left to be
-discovered.
+That is not proof of truth. An operator who fabricates consistently across
+every system, in real time, without knowing what will be sampled, will pass.
+What it does is raise the cost of lying from "edit one database" to
+"maintain a coherent parallel reality across independent systems indefinitely,
+under unpredictable sampling, with every failure sealed permanently."
 
-Two references are worth knowing about, because they are the ones that
-actually carry an earlier date:
+That is the honest claim. It is also, as far as I know, more than anyone else
+in this market is doing.
 
-  GitHub push events   api.github.com/repos/<owner>/<repo>/events
-                       The push timestamp is recorded server-side by GitHub
-                       and cannot be set by the pusher, unlike commit dates.
-                       Retained roughly 90 days - so it must be captured
-                       while it still exists.
+HONEST LIMITS
+-------------
+- Consistency is not truth. Two agreeing systems can both be wrong.
+- The operator supplies the comparison data. This tests their systems against
+  each other, not against the world.
+- Sampling only covers what has been sealed. It cannot find a decision that
+  was never recorded at all - gapless receipts are what cover that.
+- A high match rate on a badly chosen field proves nothing. Reconcile the
+  fields that would hurt to get wrong.
 
-  Wayback Machine      archive.org/wayback/available?url=...&timestamp=...
-                       An independent party with no stake in the dispute.
-                       If it caught the page, that settles it outright.
-
-FETCHING SAFELY
----------------
-This module makes the server fetch a URL. Done naively that is a hole worse
-than the one it closes. So the fetcher speaks only http and https, only on
-ports 80 and 443, resolves the hostname first and refuses any address that
-is private, loopback, link-local, reserved or multicast, never follows a
-redirect, times out fast, and stops reading after a cap. Sealing is keyed,
-so this is not an anonymous capability either.
-
-    POST /x/publish/seal      fetch, hash and seal a live URL     (keyed)
-    GET  /x/publish/history   every version ever sealed of a URL  (public)
-    GET  /x/publish/verify    was this exact content served, when (public)
-    GET  /x/publish/list      everything sealed                   (public)
-    GET  /x/publish/spec      how to check any of it              (public)
+    POST /x/reconcile/plan     sample_size, field  - seals the selection first
+    POST /x/reconcile/submit   run_id, results     - seals the comparison
+    GET  /x/reconcile/run?id=RUN-XXXXXXXX
+    GET  /x/reconcile/score
+    GET  /x/reconcile/list
 """
 
-import hashlib
-import ipaddress
-import re
-import socket
-import time
-import urllib.error
-import urllib.request
+import hashlib, json, time
 from datetime import datetime, timezone
-from urllib.parse import urlparse
 
-VERSION = "1.0"
-HEX64 = re.compile(r"^[0-9a-f]{64}$")
+VERSION = "1.1"
+MAX_SAMPLE = 200
 
-# Reading is open. A publication record only settles an argument if the
-# other side can check it without going through the publisher.
-PUBLIC = {("GET", "history"), ("GET", "verify"), ("GET", "list"),
-          ("GET", "spec")}
-
-CONTENT_PREFIX = b"AILEASH-PUBLISH-v1:"
-
-FETCH_TIMEOUT = 8
-MAX_FETCH_BYTES = 2 * 1024 * 1024
-ALLOWED_SCHEMES = ("http", "https")
-ALLOWED_PORTS = (80, 443)
-MAX_EXTERNAL = 8
+# Planning and submitting stay keyed - they touch an operator's own records.
+# What is public is the part that decides whether any of it means anything:
+# that the sample was fixed before the data was asked for, and that failures
+# were sealed as permanently as passes.
+PUBLIC = {("GET", "public"), ("GET", "proof")}
 
 _ready = False
 
@@ -1288,15 +717,9 @@ def _setup(ctx):
     if _ready:
         return
     with ctx["lock"]:
-        c = ctx["conn"]
-        c.execute("CREATE TABLE IF NOT EXISTS publish_seal("
-                  "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,url TEXT,"
-                  "content_hash TEXT,byte_length INTEGER,http_status INTEGER,"
-                  "content_type TEXT,note TEXT,external TEXT,"
-                  "fetched REAL,audit_hash TEXT,block_index INTEGER)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_pub_url ON publish_seal(url,id)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_pub_hash ON publish_seal(content_hash)")
-        c.commit()
+        ctx["conn"].execute("CREATE TABLE IF NOT EXISTS reconcile_runs(run_id TEXT PRIMARY KEY,api_key TEXT,field TEXT,seed TEXT,planned REAL,submitted REAL,sample_size INTEGER,matched INTEGER,mismatched INTEGER,missing INTEGER,status TEXT DEFAULT 'planned',block_ids TEXT,detail TEXT)")
+        ctx["conn"].execute("CREATE INDEX IF NOT EXISTS idx_rec_key ON reconcile_runs(api_key)")
+        ctx["conn"].commit()
     _ready = True
 
 
@@ -1306,365 +729,1874 @@ def _iso(ts):
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
 
 
-# ----------------------------------------------------------------------
-# fetching - read the SSRF note above before touching any of this
-# ----------------------------------------------------------------------
+def _sha(s):
+    return hashlib.sha256(s.encode()).hexdigest()
+
+
+def _seal_event(ctx, api_key, rid, action, detail):
+    ts = time.time()
+    ev = {"user_id": "rec:" + rid, "action": "reconcile_" + action, "amount": 0,
+          "country": "UK", "device_id": "reconcile", "anomaly": 0, "device_risk": 0}
+    res = {"decision": "RECONCILE_SEALED", "score": 0, "reconcile_action": action,
+           "reconcile_version": VERSION, "timestamp": ts, "detail": detail}
+    h, idx, seq = ctx["seal"](ev, res, ts, api_key)
+    return h, idx, seq, ts
+
+
+def _plan(ctx, api_key, data):
+    try:
+        n = int(data.get("sample_size", 25))
+    except Exception:
+        return {"error": "invalid_sample_size"}, 400
+    if n < 1 or n > MAX_SAMPLE:
+        return {"error": "sample_size_out_of_range", "max": MAX_SAMPLE}, 400
+    field = str(data.get("field", "decision")).strip()[:60] or "decision"
+
+    with ctx["lock"]:
+        tiprow = ctx["conn"].execute("SELECT audit_hash FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()
+        rows = ctx["conn"].execute("SELECT id,user_id,result_json,ts FROM audit_log WHERE api_key=? ORDER BY id ASC", (api_key,)).fetchall()
+
+    if not rows:
+        return {"error": "nothing_to_reconcile",
+                "message": "No sealed records under this key yet."}, 400
+
+    tip = tiprow[0] if tiprow else "GENESIS"
+    ts = time.time()
+    # Seed is bound to the chain tip. The operator cannot know it before the
+    # records exist, and cannot alter it afterwards without breaking the chain.
+    seed = _sha(tip + ":" + str(int(ts)) + ":" + field + ":" + str(n))
+
+    # Deterministic selection from the seed - reproducible by anyone holding it.
+    scored = sorted(rows, key=lambda r: _sha(seed + ":" + str(r[0])))
+    picked = scored[:min(n, len(scored))]
+
+    rid = "RUN-" + seed[:8].upper()
+    block_ids = [p[0] for p in picked]
+
+    sample = []
+    for bid, uid, res_json, bts in picked:
+        try:
+            r = json.loads(res_json)
+            sealed_val = r.get(field)
+        except Exception:
+            sealed_val = None
+        sample.append({"block_index": bid, "record_id": uid,
+                       "sealed_at": _iso(bts),
+                       "sealed_value_sha256": _sha(str(sealed_val))})
+
+    detail = ("field=" + field + ";sample_size=" + str(len(picked)) +
+              ";seed=" + seed + ";from_tip=" + tip +
+              ";blocks=" + ",".join(str(b) for b in block_ids[:60]))
+    h, idx, seq, _x = _seal_event(ctx, api_key, rid, "planned", detail)
+
+    with ctx["lock"]:
+        ctx["conn"].execute("INSERT OR REPLACE INTO reconcile_runs(run_id,api_key,field,seed,planned,submitted,sample_size,matched,mismatched,missing,status,block_ids,detail) VALUES(?,?,?,?,?,NULL,?,NULL,NULL,NULL,'planned',?,NULL)",
+                            (rid, api_key, field, seed, ts, len(picked), json.dumps(block_ids)))
+        ctx["conn"].commit()
+
+    return {"run_id": rid, "field": field, "sample_size": len(picked),
+            "seed": seed, "derived_from_tip": tip, "planned_at": _iso(ts),
+            "audit_hash": h, "block_index": idx, "receipt_seq": seq,
+            "sample": sample,
+            "next": "Fetch these record_ids from your own live system and POST them to /x/reconcile/submit",
+            "note": "This selection is now sealed. It cannot be changed, and an unsubmitted plan stays visible as an abandoned test."}, 200
+
+
+def _submit(ctx, api_key, data):
+    rid = str(data.get("run_id", "")).strip().upper()
+    with ctx["lock"]:
+        row = ctx["conn"].execute("SELECT field,seed,status,block_ids FROM reconcile_runs WHERE run_id=? AND api_key=?", (rid, api_key)).fetchone()
+    if not row:
+        return {"error": "unknown_run_id"}, 404
+    if row[2] != "planned":
+        return {"error": "already_submitted",
+                "message": "A run is reconciled once. Re-running until it passes is not reconciliation."}, 400
+
+    results = data.get("results")
+    if not isinstance(results, dict) or not results:
+        return {"error": "results_required",
+                "message": "Send {block_index: live_value} from your own system."}, 400
+
+    field = row[0]
+    block_ids = json.loads(row[3])
+
+    with ctx["lock"]:
+        rows = ctx["conn"].execute("SELECT id,user_id,result_json FROM audit_log WHERE id IN (" + ",".join("?" * len(block_ids)) + ")", block_ids).fetchall()
+
+    sealed = {}
+    for bid, uid, res_json in rows:
+        try:
+            sealed[bid] = json.loads(res_json).get(field)
+        except Exception:
+            sealed[bid] = None
+
+    matched, mismatched, missing = [], [], []
+    for bid in block_ids:
+        key = str(bid)
+        if key not in results:
+            missing.append({"block_index": bid})
+            continue
+        live = results[key]
+        want = sealed.get(bid)
+        if str(live).strip().lower() == str(want).strip().lower():
+            matched.append(bid)
+        else:
+            mismatched.append({"block_index": bid,
+                               "sealed_value": want,
+                               "live_value": live})
+
+    ts = time.time()
+    rate = round(100 * len(matched) / len(block_ids), 2) if block_ids else 0
+    detail = ("field=" + field + ";matched=" + str(len(matched)) +
+              ";mismatched=" + str(len(mismatched)) + ";missing=" + str(len(missing)) +
+              ";match_rate=" + str(rate) +
+              ";mismatch_blocks=" + ",".join(str(m["block_index"]) for m in mismatched[:40]))
+    h, idx, seq, _x = _seal_event(ctx, api_key, rid, "reconciled", detail)
+
+    with ctx["lock"]:
+        ctx["conn"].execute("UPDATE reconcile_runs SET submitted=?,matched=?,mismatched=?,missing=?,status='reconciled',detail=? WHERE run_id=? AND api_key=?",
+                            (ts, len(matched), len(mismatched), len(missing), json.dumps({"mismatched": mismatched[:100], "missing": missing[:100]}), rid, api_key))
+        ctx["conn"].commit()
+
+    out = {"run_id": rid, "field": field, "sample_size": len(block_ids),
+           "matched": len(matched), "mismatched": len(mismatched),
+           "missing": len(missing), "match_rate_pct": rate,
+           "reconciled_at": _iso(ts), "audit_hash": h, "block_index": idx,
+           "receipt_seq": seq,
+           "note": "This result is sealed whichever way it went. It cannot be withdrawn."}
+    if mismatched:
+        out["mismatches"] = mismatched[:20]
+        out["flag"] = "sealed records and live system disagree on " + str(len(mismatched)) + " of " + str(len(block_ids))
+    if missing:
+        out["missing_detail"] = "records the live system did not return - a gap, not a match"
+    return out, 200
+
+
+def _run(ctx, api_key, rid):
+    with ctx["lock"]:
+        row = ctx["conn"].execute("SELECT field,seed,planned,submitted,sample_size,matched,mismatched,missing,status,detail FROM reconcile_runs WHERE run_id=? AND api_key=?", (rid.upper(), api_key)).fetchone()
+        if not row:
+            return {"error": "unknown_run_id"}, 404
+        blocks = ctx["conn"].execute("SELECT ts,result_json,audit_hash FROM audit_log WHERE user_id=? ORDER BY id ASC", ("rec:" + rid.upper(),)).fetchall()
+    events = []
+    for bts, res, ah in blocks:
+        try:
+            r = json.loads(res)
+            events.append({"at": _iso(bts), "event": r.get("reconcile_action"),
+                           "detail": r.get("detail"), "sealed": ah})
+        except Exception:
+            pass
+    total = row[4] or 0
+    out = {"run_id": rid.upper(), "field": row[0], "seed": row[1],
+           "planned": _iso(row[2]), "submitted": _iso(row[3]),
+           "sample_size": total, "matched": row[5], "mismatched": row[6],
+           "missing": row[7], "status": row[8], "events": events,
+           "ordering_proof": "The plan block precedes the result block. The sample was fixed before any data was requested."}
+    if row[9]:
+        try:
+            out["detail"] = json.loads(row[9])
+        except Exception:
+            pass
+    if row[8] == "planned":
+        out["flag"] = "planned but never submitted - an abandoned test, visible permanently"
+    return out, 200
+
+
+def _score(ctx, api_key):
+    with ctx["lock"]:
+        rows = ctx["conn"].execute("SELECT sample_size,matched,mismatched,missing,status,planned FROM reconcile_runs WHERE api_key=? ORDER BY planned DESC LIMIT 500", (api_key,)).fetchall()
+    if not rows:
+        return {"runs": 0, "note": "No reconciliation runs on record."}, 200
+    done = [r for r in rows if r[4] == "reconciled"]
+    abandoned = len(rows) - len(done)
+    tested = sum(r[0] or 0 for r in done)
+    ok = sum(r[1] or 0 for r in done)
+    bad = sum(r[2] or 0 for r in done)
+    gone = sum(r[3] or 0 for r in done)
+    out = {"runs": len(rows), "reconciled": len(done), "abandoned": abandoned,
+           "records_tested": tested, "matched": ok, "mismatched": bad,
+           "missing": gone,
+           "match_rate_pct": (round(100 * ok / tested, 2) if tested else None),
+           "last_run": _iso(rows[0][5])}
+    if abandoned:
+        out["flag"] = str(abandoned) + " planned run(s) never submitted"
+    return out, 200
+
+
+def _list(ctx, api_key):
+    with ctx["lock"]:
+        rows = ctx["conn"].execute("SELECT run_id,field,planned,submitted,sample_size,matched,mismatched,missing,status FROM reconcile_runs WHERE api_key=? ORDER BY planned DESC LIMIT 200", (api_key,)).fetchall()
+    return {"count": len(rows),
+            "runs": [{"run_id": r[0], "field": r[1], "planned": _iso(r[2]),
+                      "submitted": _iso(r[3]), "sample_size": r[4],
+                      "matched": r[5], "mismatched": r[6], "missing": r[7],
+                      "status": r[8]} for r in rows]}, 200
+
+
+def _public(ctx):
+    """The reconciliation record, readable without a key.
+
+    Counts only. No record identifiers, no field values, no operator
+    identity. What a stranger gets is the three numbers that cannot be
+    flattered: how many runs were reconciled, how many disagreed, and how
+    many were planned and then quietly abandoned.
+
+    Abandoned runs are the important one. A planned run is sealed at the
+    moment it is planned, so a test that came back badly and was dropped
+    cannot be deleted - it sits here forever as a plan with no result.
+    """
+    with ctx["lock"]:
+        rows = ctx["conn"].execute(
+            "SELECT run_id,field,planned,submitted,sample_size,matched,mismatched,"
+            "missing,status FROM reconcile_runs ORDER BY planned DESC LIMIT 200").fetchall()
+
+    done = [r for r in rows if r[8] == "reconciled"]
+    abandoned = [r for r in rows if r[8] != "reconciled"]
+    tested = sum(r[4] or 0 for r in done)
+    ok = sum(r[5] or 0 for r in done)
+    bad = sum(r[6] or 0 for r in done)
+    gone = sum(r[7] or 0 for r in done)
+
+    out = {
+        "runs": len(rows),
+        "reconciled": len(done),
+        "abandoned": len(abandoned),
+        "records_tested": tested,
+        "matched": ok,
+        "mismatched": bad,
+        "missing": gone,
+        "match_rate_pct": (round(100 * ok / tested, 2) if tested else None),
+        "recent": [{"run_id": r[0], "field": r[1], "planned": _iso(r[2]),
+                    "submitted": _iso(r[3]), "sample_size": r[4],
+                    "matched": r[5], "mismatched": r[6], "missing": r[7],
+                    "status": r[8]} for r in rows[:50]],
+        "check_any_of_them": "/x/reconcile/proof?id=RUN-XXXXXXXX",
+        "what_is_being_shown": "Not that the records are true. That the sample was fixed "
+                               "before the data was requested, and that what came back was "
+                               "sealed either way.",
+        "what_a_mismatch_means": "The sealed record and the operator's own live system "
+                                 "disagreed. It is published because a reconciliation system "
+                                 "that can bury its own failures is decoration.",
+    }
+    if abandoned:
+        out["flag"] = (str(len(abandoned)) + " run(s) planned and never submitted. A sample was "
+                       "fixed, and no result was ever sealed against it.")
+    return out, 200
+
+
+def _proof(ctx, rid):
+    """The ordering, straight out of the chain, without a key.
+
+    Both events are already sealed under a public identifier, so this route
+    reveals nothing the chain does not already carry. It just makes the one
+    claim that matters legible: the plan block comes before the result block.
+    """
+    rid = (rid or "").strip().upper()
+    if not rid:
+        return {"error": "id_required"}, 400
+
+    with ctx["lock"]:
+        row = ctx["conn"].execute(
+            "SELECT field,seed,planned,submitted,sample_size,matched,mismatched,missing,status "
+            "FROM reconcile_runs WHERE run_id=?", (rid,)).fetchone()
+        blocks = ctx["conn"].execute(
+            "SELECT id,ts,result_json,audit_hash FROM audit_log WHERE user_id=? ORDER BY id ASC",
+            ("rec:" + rid,)).fetchall()
+    if not row:
+        return {"error": "unknown_run_id", "list": "/x/reconcile/public"}, 404
+
+    events = []
+    plan_block = result_block = None
+    for bid, bts, res, ah in blocks:
+        try:
+            r = json.loads(res)
+        except Exception:
+            continue
+        what = r.get("reconcile_action")
+        events.append({"event": what, "at": _iso(bts), "block_index": bid,
+                       "sealed_in_chain": ah, "sealed_detail": r.get("detail")})
+        if what == "planned" and plan_block is None:
+            plan_block = bid
+        if what == "reconciled" and result_block is None:
+            result_block = bid
+
+    ordered = (plan_block is not None and result_block is not None
+               and plan_block < result_block)
+
+    out = {"run_id": rid, "field": row[0], "status": row[8],
+           "seed": row[1], "planned_at": _iso(row[2]), "submitted_at": _iso(row[3]),
+           "sample_size": row[4], "matched": row[5], "mismatched": row[6],
+           "missing": row[7],
+           "plan_block_index": plan_block, "result_block_index": result_block,
+           "selection_precedes_result": ordered,
+           "events": events,
+           "how_to_check_this_yourself": [
+               "The seed is derived from the chain tip at planning time, which the operator "
+               "cannot predict in advance or change afterwards without breaking the chain.",
+               "The plan block seals which records were selected, and its detail is above.",
+               "The result block seals what came back. Compare the two block indices.",
+               "A lower plan index than result index means the sample was fixed before any "
+               "data was requested. That is the whole claim, and it is the only one made."],
+           "what_this_does_not_prove": "That the records are true. Two systems the operator "
+                                       "controls agreeing with each other is consistency, not "
+                                       "truth."}
+    if row[8] != "reconciled":
+        out["flag"] = ("planned and never submitted. The selection is sealed and no result "
+                       "was ever put against it.")
+    elif not ordered:
+        out["flag"] = ("the plan block does not precede the result block. That should be "
+                       "impossible and it is the finding.")
+    return out, 200
+
+
+def handle(method, action, data, api_key, ctx):
+    _setup(ctx)
+    if method == "POST":
+        if action == "plan":
+            return _plan(ctx, api_key, data)
+        if action == "submit":
+            return _submit(ctx, api_key, data)
+    else:
+        if action == "public":
+            return _public(ctx)
+        if action == "proof":
+            return _proof(ctx, str((data or {}).get("id", "")))
+        if action == "score":
+            return _score(ctx, api_key)
+        if action == "list":
+            return _list(ctx, api_key)
+        if action == "run":
+            rid = str(data.get("id", "")).strip()
+            if not rid:
+                return {"error": "id_required"}, 400
+            return _run(ctx, api_key, rid)
+    return {"error": "unknown_action", "action": action,
+            "GET": ["public", "proof", "score", "list", "run"],
+            "POST": ["plan", "submit"]}, 404
+
+```
+
+
+## `modules/register.py`
+
+1517 lines, 61178 bytes
+
+```python
+"""
+modules/register.py  v1.0.0  —  The Safe AI Registry
+
+What makes this different from every other registry, trust mark and
+certification list:
+
+  Ordinary registries are mutable databases. The operator can insert an
+  entry, back-date it, quietly delist someone, or revoke a seal and leave
+  no trace. You must trust the registrar absolutely.
+
+  This one publishes proofs about its own behaviour:
+
+    * ABSENCE   — prove a domain was NOT listed on a given date.
+                  Not "we have no record": a sorted-tree proof showing two
+                  adjacent leaves with consecutive indices, so nothing can
+                  sit between them.
+
+    * APPEND-ONLY — RFC 6962 consistency proof that the register at any
+                  past size is a prefix of the register now. A back-dated
+                  listing is arithmetically impossible to hide, and the
+                  proof verifies with any standard Certificate Transparency
+                  verifier, not one of ours.
+
+    * REVOCATION — a delisted entry does not vanish. The revocation is
+                  sealed and the history stays readable. "Listed from D1,
+                  revoked D2, reason R" is permanent.
+
+  The registrar is auditable against the registrar. That is the product.
+
+CONSENT
+  No domain is ever listed because the operator typed it in. A domain
+  lists itself by proving it controls the domain:
+
+    1. POST /x/register/challenge {"domain": "example.com"}
+         -> returns a one-time token, sealed.
+    2. The domain serves that token at
+         https://example.com/.well-known/aileash-register.txt
+       (or puts a `Register-Token:` line in its ai.txt).
+    3. POST /x/register/claim {"domain": "example.com"}
+         -> we fetch, verify the token, run the checks, seal the result
+            and list it.
+
+  Peers on the witness network are not auto-listed. A listing they
+  claimed themselves is better evidence than one we granted them.
+
+VOCABULARY  (deliberately not "compliant", "covered" or "certified")
+    unverified    claimed, checks not yet run
+    checks-passed every check in the suite returned pass, on the date shown
+    checks-failed at least one check did not pass
+    stale         last successful check is older than STALE_AFTER_DAYS
+    withdrawn     the domain asked to be removed
+    revoked       the operator removed it; reason sealed
+
+Module contract:
+    handle(method, action, data, api_key, ctx) -> (dict, status)
+    PUBLIC is a set of (METHOD, action) tuples
+    ctx exposes conn, lock, seal
+    every sealed event carries a user_id
+    no seal is wrapped in a bare except
+"""
+
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import secrets
+import socket
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+
+VERSION = "1.2.0"
+SUITE_VERSION = "oaas-checks-1"
+
+# ---------------------------------------------------------------- constants
+
+STALE_AFTER_DAYS = 90
+CHALLENGE_TTL_SECONDS = 86400
+MAX_FETCH_BYTES = 512 * 1024
+FETCH_TIMEOUT = 8
+WELL_KNOWN_PATH = "/.well-known/aileash-register.txt"
+AI_TXT_PATHS = ["/.well-known/ai.txt", "/ai.txt"]
+AI_TXT_PATH = AI_TXT_PATHS[0]   # the one quoted in guidance
+FIELD_ALIASES = {
+    "chain_tip_url": ["chain-tip-url", "chain-head", "witness-tip", "chain-anchor"],
+    "verifier": ["verifier", "verify-chain", "consistency-proof", "self-check"],
+    "contact": ["contact", "security-contact"],
+}
+
+DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
+
+STATUS_UNVERIFIED = "unverified"
+STATUS_PASSED = "checks-passed"
+STATUS_FAILED = "checks-failed"
+STATUS_STALE = "stale"
+STATUS_WITHDRAWN = "withdrawn"
+STATUS_REVOKED = "revoked"
+
+LIVE_STATUSES = (STATUS_UNVERIFIED, STATUS_PASSED, STATUS_FAILED, STATUS_STALE)
+
+# Domain-separation prefixes. Two different trees answer two different
+# questions and their roots deliberately never match.
+LEAF_PREFIX = b"\x00"          # RFC 6962 ordered tree, over events
+NODE_PREFIX = b"\x01"
+SORTED_LEAF = b"AILEASH-REGISTER-LEAF-v1\x00"    # sorted tree, over domains
+SORTED_NODE = b"AILEASH-REGISTER-NODE-v1\x00"
+
+VOCABULARY = {
+    STATUS_UNVERIFIED: "The domain proved control and is listed. The check suite has not been run against it yet.",
+    STATUS_PASSED: "Every check in suite %s returned pass on the date shown. This describes what the checks observed on that date and nothing else." % SUITE_VERSION,
+    STATUS_FAILED: "At least one check did not pass. The failing check names are published.",
+    STATUS_STALE: "The last successful check is more than %d days old. Nothing was withdrawn; the evidence simply aged." % STALE_AFTER_DAYS,
+    STATUS_WITHDRAWN: "The domain asked to be removed. The listing history remains readable.",
+    STATUS_REVOKED: "The operator removed the listing. The reason is sealed alongside it and the history remains readable.",
+}
+
+WHAT_THIS_IS_NOT = [
+    "Not a certification. Nobody has been certified by anyone.",
+    "Not a statement that any law applies to a listed domain, or that a listed domain satisfies it. Whether a regulation applies to an organisation is a question for that organisation's own advisers.",
+    "Not an audit. No third party has audited this registry or any domain on it.",
+    "Not a claim about anything a domain did not seal. A check observes what is served at a URL at a moment in time.",
+]
+
+MESSAGES = {
+    "domain_required": "domain is required",
+    "bad_domain": "domain must be a bare hostname, e.g. example.com — no scheme, no path",
+    "no_challenge": "no live challenge for this domain. POST /x/register/challenge first.",
+    "challenge_expired": "challenge expired. Request a new one.",
+    "token_not_found": "the token was not served at either location",
+    "not_listed": "this domain has no entry in the register",
+    "already_final": "this entry is withdrawn or revoked and cannot be changed",
+    "no_checkpoint": "no checkpoint has been sealed at or before that time",
+    "seal_failed": "the register could not seal this event, so nothing was written. Retry.",
+}
+
+PUBLIC = {
+    ("GET", "spec"),
+    ("GET", "list"),
+    ("GET", "entry"),
+    ("GET", "history"),
+    ("GET", "absence"),
+    ("GET", "consistency"),
+    ("GET", "inclusion"),
+    ("GET", "checkpoints"),
+    ("GET", "roots"),
+    ("GET", "sealcheck"),
+    ("GET", "tokens"),
+    ("GET", "vocabulary"),
+    ("POST", "challenge"),
+    ("POST", "claim"),
+    ("POST", "recheck"),
+    ("POST", "withdraw"),
+}
+
+
+# ---------------------------------------------------------------- utilities
+
+def _now():
+    return time.time()
+
+
+def _iso(ts):
+    return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _parse_when(s):
+    """Accept an ISO date, an ISO datetime or an epoch. Return epoch seconds."""
+    if s is None or s == "":
+        return None
+    s = str(s).strip()
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        pass
+    t = s.replace("Z", "+00:00")
+    for fmt in (None, "%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S%z"):
+        try:
+            if fmt is None:
+                d = datetime.fromisoformat(t)
+            else:
+                d = datetime.strptime(t, fmt)
+            if d.tzinfo is None:
+                d = d.replace(tzinfo=timezone.utc)
+            return d.timestamp()
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _canon(obj):
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def _sha(b):
+    return hashlib.sha256(b).hexdigest()
+
+
+def _clean_domain(raw):
+    if not raw:
+        return None
+    d = str(raw).strip().lower()
+    if "://" in d:
+        d = urllib.parse.urlsplit(d).netloc or d
+    d = d.split("/")[0].split("?")[0].split("#")[0]
+    if d.startswith("www."):
+        d = d[4:]
+    if "@" in d or ":" in d:
+        return None
+    if not DOMAIN_RE.match(d):
+        return None
+    return d
+
+
+# ------------------------------------------------------------------- fetch
+# Same posture as witness.py: http/https only, ports 80/443, resolve first,
+# reject non-public addresses, no redirects, hard timeout, size cap.
+
+def _is_public_addr(host):
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError as e:
+        return False, "dns_failed: %s" % e
+    if not infos:
+        return False, "dns_empty"
+    for info in infos:
+        addr = info[4][0]
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            return False, "unparseable_address"
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_multicast or ip.is_reserved or ip.is_unspecified):
+            return False, "non_public_address"
+    return True, None
+
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """A redirect is an instruction to fetch a second URL we never checked."""
-
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
 
 
-_opener = urllib.request.build_opener(_NoRedirect)
-
-
-def _address_allowed(host, port):
-    try:
-        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
-    except Exception as exc:
-        return False, "could not resolve host (%s)" % type(exc).__name__
-    if not infos:
-        return False, "host resolved to nothing"
-    for info in infos:
-        try:
-            addr = ipaddress.ip_address(info[4][0])
-        except ValueError:
-            return False, "unreadable address"
-        if (addr.is_private or addr.is_loopback or addr.is_link_local
-                or addr.is_reserved or addr.is_multicast or addr.is_unspecified):
-            return False, "address is not publicly routable"
-    return True, None
-
-
-def _url_allowed(url):
-    if not url or not isinstance(url, str) or len(url) > 500:
-        return False, "no usable url"
-    try:
-        parts = urlparse(url.strip())
-    except Exception:
-        return False, "unparseable url"
-    if parts.scheme not in ALLOWED_SCHEMES:
-        return False, "scheme not allowed"
-    if not parts.hostname:
-        return False, "no host in url"
-    port = parts.port or (443 if parts.scheme == "https" else 80)
-    if port not in ALLOWED_PORTS:
-        return False, "port not allowed"
-    return _address_allowed(parts.hostname, port)
-
-
 def _fetch(url):
-    """Returns (body_bytes, status, content_type, error)."""
-    ok, why = _url_allowed(url)
+    """Return (ok, body_text_or_none, note_dict)."""
+    parts = urllib.parse.urlsplit(url)
+    note = {"url": url, "fetched_at": _iso(_now())}
+    if parts.scheme not in ("http", "https"):
+        note["error"] = "scheme_not_allowed"
+        return False, None, note
+    if parts.port not in (None, 80, 443):
+        note["error"] = "port_not_allowed"
+        return False, None, note
+    host = parts.hostname
+    if not host:
+        note["error"] = "no_host"
+        return False, None, note
+    ok, why = _is_public_addr(host)
     if not ok:
-        return None, None, None, why
-    request = urllib.request.Request(url, headers={
-        "Accept": "*/*",
-        "User-Agent": "aileash-publish/%s" % VERSION,
+        note["error"] = why
+        return False, None, note
+
+    opener = urllib.request.build_opener(_NoRedirect)
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "AILeash-Register/%s (+https://sebbi.pro/x/register/spec)" % VERSION,
+        "Accept": "text/plain, application/json, */*",
     })
+    started = time.time()
     try:
-        with _opener.open(request, timeout=FETCH_TIMEOUT) as response:
-            status = response.getcode()
-            content_type = response.headers.get("Content-Type", "")
-            body = response.read(MAX_FETCH_BYTES + 1)
-    except urllib.error.HTTPError as exc:
-        return None, exc.code, None, "url answered %s" % exc.code
-    except Exception as exc:
-        return None, None, None, "could not reach url (%s)" % type(exc).__name__
-    if len(body) > MAX_FETCH_BYTES:
-        return None, status, content_type, "response larger than the %d byte cap" % MAX_FETCH_BYTES
-    return body, status, content_type, None
+        with opener.open(req, timeout=FETCH_TIMEOUT) as resp:
+            note["http_status"] = resp.getcode()
+            raw = resp.read(MAX_FETCH_BYTES + 1)
+    except urllib.error.HTTPError as e:
+        note["http_status"] = e.code
+        note["error"] = "http_%s" % e.code
+        note["took_ms"] = int((time.time() - started) * 1000)
+        return False, None, note
+    except Exception as e:
+        note["error"] = "fetch_failed: %s" % type(e).__name__
+        note["took_ms"] = int((time.time() - started) * 1000)
+        return False, None, note
+
+    note["took_ms"] = int((time.time() - started) * 1000)
+    if len(raw) > MAX_FETCH_BYTES:
+        note["error"] = "too_large"
+        return False, None, note
+    note["bytes"] = len(raw)
+    note["body_sha256"] = _sha(raw)
+    try:
+        text = raw.decode("utf-8", "replace")
+    except Exception:
+        note["error"] = "undecodable"
+        return False, None, note
+    return True, text, note
 
 
-def _content_hash(body):
-    """Hash exactly the bytes served. No normalisation, no cleverness -
-    a whitespace-tolerant hash would be a hash of our opinion of the page
-    rather than of the page."""
-    return hashlib.sha256(CONTENT_PREFIX + body).hexdigest()
+# ------------------------------------------------------------------ merkle
+
+def _ct_leaf(data_bytes):
+    return hashlib.sha256(LEAF_PREFIX + data_bytes).digest()
 
 
-# ----------------------------------------------------------------------
-# seal
-# ----------------------------------------------------------------------
-
-def _clean_external(value):
-    """External references are recorded verbatim and never verified."""
-    if not isinstance(value, list):
-        return []
-    out = []
-    for item in value[:MAX_EXTERNAL]:
-        if isinstance(item, dict):
-            source = str(item.get("source", "")).strip()[:60]
-            reference = str(item.get("reference", item.get("url", ""))).strip()[:400]
-            claimed = str(item.get("claimed_time", "")).strip()[:60]
-            if source and reference:
-                out.append({"source": source, "reference": reference,
-                            "claimed_time": claimed or None})
-        elif isinstance(item, str) and item.strip():
-            out.append({"source": "unnamed", "reference": item.strip()[:400],
-                        "claimed_time": None})
-    return out
+def _ct_node(l, r):
+    return hashlib.sha256(NODE_PREFIX + l + r).digest()
 
 
-def _seal(ctx, api_key, data):
-    url = str(data.get("url", "")).strip()
-    if not url:
-        return {"error": "url_required",
-                "message": "The address of the page you have just published."}, 400
+def _ct_root(leaves):
+    """RFC 6962 root over an ordered list of leaf digests (bytes)."""
+    if not leaves:
+        return hashlib.sha256(b"").digest()
+    if len(leaves) == 1:
+        return leaves[0]
+    k = 1
+    while k * 2 < len(leaves):
+        k *= 2
+    return _ct_node(_ct_root(leaves[:k]), _ct_root(leaves[k:]))
 
-    note = str(data.get("note", "") or "").strip()[:300]
-    external = _clean_external(data.get("external"))
 
-    body, status, content_type, why = _fetch(url)
-    if why:
-        return {"error": "fetch_failed", "url": url, "message": why,
-                "note": "Nothing was sealed. A record of a page we could not read would be "
-                        "worse than no record."}, 502
+def _ct_inclusion(leaves, index):
+    """RFC 6962 inclusion proof for leaves[index]. Returns list of hex."""
+    def walk(sub, i):
+        if len(sub) <= 1:
+            return []
+        k = 1
+        while k * 2 < len(sub):
+            k *= 2
+        if i < k:
+            return walk(sub[:k], i) + [_ct_root(sub[k:])]
+        return walk(sub[k:], i - k) + [_ct_root(sub[:k])]
+    return [h.hex() for h in walk(leaves, index)]
 
-    digest = _content_hash(body)
-    now = time.time()
+
+def _ct_consistency(leaves, m):
+    """RFC 6962 consistency proof between size m and size len(leaves)."""
+    n = len(leaves)
+    if m <= 0 or m > n:
+        return None
+
+    def subproof(m_, sub, is_complete):
+        if m_ == len(sub):
+            return [] if is_complete else [_ct_root(sub)]
+        k = 1
+        while k * 2 < len(sub):
+            k *= 2
+        if m_ <= k:
+            return subproof(m_, sub[:k], is_complete) + [_ct_root(sub[k:])]
+        return subproof(m_ - k, sub[k:], False) + [_ct_root(sub[:k])]
+
+    return [h.hex() for h in subproof(m, leaves, True)]
+
+
+def _sorted_leaf(value):
+    return hashlib.sha256(SORTED_LEAF + value.encode("utf-8")).digest()
+
+
+def _sorted_root(leaves):
+    """Sorted tree. Odd nodes are promoted, never self-paired."""
+    if not leaves:
+        return hashlib.sha256(SORTED_LEAF + b"EMPTY").digest()
+    level = list(leaves)
+    while len(level) > 1:
+        nxt = []
+        i = 0
+        while i + 1 < len(level):
+            nxt.append(hashlib.sha256(SORTED_NODE + level[i] + level[i + 1]).digest())
+            i += 2
+        if i < len(level):
+            nxt.append(level[i])
+        level = nxt
+    return level[0]
+
+
+def _sorted_path(leaves, index):
+    """Audit path in the promoted-odd sorted tree."""
+    path = []
+    level = list(leaves)
+    idx = index
+    while len(level) > 1:
+        nxt = []
+        i = 0
+        new_idx = idx
+        while i + 1 < len(level):
+            pair = (level[i], level[i + 1])
+            if idx == i:
+                path.append({"side": "right", "hash": pair[1].hex()})
+                new_idx = len(nxt)
+            elif idx == i + 1:
+                path.append({"side": "left", "hash": pair[0].hex()})
+                new_idx = len(nxt)
+            nxt.append(hashlib.sha256(SORTED_NODE + pair[0] + pair[1]).digest())
+            i += 2
+        if i < len(level):
+            if idx == i:
+                new_idx = len(nxt)
+            nxt.append(level[i])
+        level = nxt
+        idx = new_idx
+    return path
+
+
+# ------------------------------------------------------------------ schema
+
+def _ensure(ctx):
+    conn = ctx["conn"]
+    with ctx["lock"]:
+        c = conn.cursor()
+        c.execute("""CREATE TABLE IF NOT EXISTS register_entry (
+            domain        TEXT PRIMARY KEY,
+            status        TEXT NOT NULL,
+            first_listed  REAL NOT NULL,
+            last_event    REAL NOT NULL,
+            last_checked  REAL,
+            last_pass     REAL,
+            checks_json   TEXT,
+            contact       TEXT,
+            claim_method  TEXT,
+            reason        TEXT
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS register_event (
+            seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts         REAL NOT NULL,
+            domain     TEXT NOT NULL,
+            kind       TEXT NOT NULL,
+            detail     TEXT NOT NULL,
+            leaf_hex   TEXT NOT NULL,
+            audit_hash TEXT
+        )""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_register_event_domain ON register_event(domain, seq)")
+        c.execute("""CREATE TABLE IF NOT EXISTS register_checkpoint (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts            REAL NOT NULL,
+            tree_size     INTEGER NOT NULL,
+            event_root    TEXT NOT NULL,
+            domain_root   TEXT NOT NULL,
+            domain_count  INTEGER NOT NULL,
+            domains_json  TEXT NOT NULL,
+            audit_hash    TEXT
+        )""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_register_checkpoint_ts ON register_checkpoint(ts)")
+        c.execute("""CREATE TABLE IF NOT EXISTS register_challenge (
+            domain  TEXT PRIMARY KEY,
+            token   TEXT NOT NULL,
+            issued  REAL NOT NULL
+        )""")
+        # v1.1: every issued token stays valid until it expires, so asking
+        # for a new one never invalidates the one already published.
+        c.execute("""CREATE TABLE IF NOT EXISTS register_token (
+            token   TEXT PRIMARY KEY,
+            domain  TEXT NOT NULL,
+            issued  REAL NOT NULL
+        )""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_register_token_domain ON register_token(domain, issued)")
+        conn.commit()
+
+
+def _event_leaves(ctx):
+    """Ordered list of leaf digests for the whole event log."""
+    with ctx["lock"]:
+        rows = ctx["conn"].execute(
+            "SELECT leaf_hex FROM register_event ORDER BY seq ASC").fetchall()
+    return [bytes.fromhex(r[0]) for r in rows]
+
+
+def _live_domains(ctx):
+    with ctx["lock"]:
+        rows = ctx["conn"].execute(
+            "SELECT domain FROM register_entry WHERE status IN (?,?,?,?)",
+            LIVE_STATUSES).fetchall()
+    return sorted(r[0] for r in rows)
+
+
+def _extract_hash(result):
+    """server.py's seal has returned different shapes over time. Accept them all."""
+    if result is None:
+        return None
+    if isinstance(result, str):
+        return result or None
+    if isinstance(result, dict):
+        for k in ("audit_hash", "hash", "audit", "block_hash", "sealed_hash"):
+            v = result.get(k)
+            if isinstance(v, str) and v:
+                return v
+        return None
+    if isinstance(result, (tuple, list)):
+        for item in result:
+            h = _extract_hash(item)
+            if h:
+                return h
+    return None
+
+
+def _do_seal(ctx, event, result=None):
+    """Call ctx['seal'] with the ONE correct signature and exactly once.
+
+    This is the signature witness.py uses and that is proven against this
+    server: seal(event, result, ts, api_key), returning (audit_hash,
+    block_index, seq).
+
+    WHY THIS WAS REWRITTEN (v1.2.0 -> safe):
+    The previous version tried four different argument shapes in a loop. seal
+    WRITES a block to the chain as a side effect. A shape that partially
+    succeeded — wrote a block but returned something _extract_hash could not
+    read — would fall through and the loop would call seal AGAIN, writing a
+    SECOND block. Two blocks for one logical event, or a written-then-retried
+    call, breaks the chain's prev-hash linkage. That is the fault that broke
+    the chain. This calls seal once, the correct way, and never retries a call
+    that may already have written.
+    """
+    seal = ctx["seal"]
+    ts = _now()
+    if result is None:
+        result = event.get("kind") or event.get("type") or "register"
+    if not isinstance(result, str):
+        result = _canon(result)
+
+    # Register events are not tied to a customer key. A stable module key
+    # partitions them the way witness.py partitions anonymous observations.
+    api_key = "register"
+
+    out = seal(event, result, ts, api_key)
+
+    h = _extract_hash(out)
+    if h:
+        return h
+    if isinstance(out, (tuple, list)) and out and isinstance(out[0], str) and out[0]:
+        return out[0]
+    raise RuntimeError("seal returned no audit_hash: %r" % (out,))
+
+
+def _seal_event(ctx, domain, kind, detail):
+    """Seal, then write. A failed seal writes nothing and raises."""
+    ts = _now()
+    leaf_payload = _canon({"v": 1, "ts": round(ts, 3), "domain": domain,
+                           "kind": kind, "detail": detail}).encode("utf-8")
+    leaf_hex = _ct_leaf(leaf_payload).hex()
+
+    event = {
+        "user_id": "register:%s" % domain,
+        "type": "register_event",
+        "domain": domain,
+        "kind": kind,
+        "leaf": leaf_hex,
+        "suite": SUITE_VERSION,
+        "detail": detail,
+    }
+    audit_hash = _do_seal(ctx, event, result=kind)
 
     with ctx["lock"]:
-        prior = ctx["conn"].execute(
-            "SELECT content_hash,fetched,audit_hash FROM publish_seal "
-            "WHERE url=? ORDER BY id ASC", (url,)).fetchall()
+        cur = ctx["conn"].execute(
+            "INSERT INTO register_event (ts, domain, kind, detail, leaf_hex, audit_hash)"
+            " VALUES (?,?,?,?,?,?)",
+            (ts, domain, kind, _canon(detail), leaf_hex, audit_hash))
+        seq = cur.lastrowid
+        ctx["conn"].commit()
 
-    unchanged = bool(prior) and prior[-1][0] == digest
-    first_of_this_version = None
-    for row in prior:
-        if row[0] == digest:
-            first_of_this_version = row[1]
-            break
+    return {"seq": seq, "ts": ts, "at": _iso(ts), "leaf": leaf_hex,
+            "audit_hash": audit_hash, "kind": kind}
 
-    external_summary = ";".join("%s=%s" % (e["source"], e["reference"][:60]) for e in external)
-    ev = {"user_id": "pub:" + digest[:16], "action": "publication_sealed", "amount": 0,
-          "country": "UK", "device_id": "publish", "anomaly": 0, "device_risk": 0}
-    res = {"decision": "PUBLICATION_SEALED", "score": 0, "publish_version": VERSION,
-           "url": url, "content_hash": digest, "bytes": len(body),
-           "http_status": status,
-           "detail": "url=%s;sha256=%s;bytes=%d%s"
-                     % (url, digest, len(body),
-                        ";external=" + external_summary if external_summary else "")}
-    audit_hash, block_index, seq = ctx["seal"](ev, res, now, api_key)
+
+def _seal_checkpoint(ctx):
+    """Seal the current state: ordered event root + sorted domain root."""
+    leaves = _event_leaves(ctx)
+    domains = _live_domains(ctx)
+    event_root = _ct_root(leaves).hex()
+    domain_root = _sorted_root([_sorted_leaf(d) for d in domains]).hex()
+    ts = _now()
+
+    event = {
+        "user_id": "register:checkpoint",
+        "type": "register_checkpoint",
+        "tree_size": len(leaves),
+        "event_root": event_root,
+        "domain_root": domain_root,
+        "domain_count": len(domains),
+        "suite": SUITE_VERSION,
+    }
+    audit_hash = _do_seal(ctx, event, result="checkpoint")
 
     with ctx["lock"]:
         ctx["conn"].execute(
-            "INSERT INTO publish_seal(api_key,url,content_hash,byte_length,http_status,"
-            "content_type,note,external,fetched,audit_hash,block_index) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-            (api_key, url, digest, len(body), status, content_type or None,
-             note or None,
-             "|".join("%s %s %s" % (e["source"], e["reference"], e["claimed_time"] or "")
-                      for e in external) or None,
-             now, audit_hash, block_index))
+            "INSERT INTO register_checkpoint (ts, tree_size, event_root, domain_root,"
+            " domain_count, domains_json, audit_hash) VALUES (?,?,?,?,?,?,?)",
+            (ts, len(leaves), event_root, domain_root, len(domains),
+             _canon(domains), audit_hash))
         ctx["conn"].commit()
 
-    out = {
-        "url": url, "content_hash": digest, "bytes": len(body),
-        "http_status": status, "content_type": content_type,
-        "sealed_at": _iso(now),
-        "sealed_in_chain": audit_hash, "block_index": block_index, "receipt_seq": seq,
-        "version_number": len(prior) + 1,
-        "publish_version": VERSION,
-        "what_this_proves": "This exact content was served at this address when we fetched it, "
-                            "and the record of that cannot be altered afterwards.",
-        "what_it_does_not": "It does not prove the page existed earlier than this moment. "
-                            "Nothing can prove that after the fact - timestamps only run "
-                            "forwards. Seal at publication and the question never arises.",
-        "history": "/x/publish/history?url=" + url,
-        "verify_this_block": "/x/consistency/ancestor?tip=" + audit_hash,
+    return {"at": _iso(ts), "tree_size": len(leaves), "event_root": event_root,
+            "domain_root": domain_root, "domain_count": len(domains),
+            "audit_hash": audit_hash}
+
+
+# ------------------------------------------------------------- check suite
+
+def _find_manifest(domain):
+    """Try the well-known path first, then the root. Return (path, body, note)."""
+    tried = []
+    for path in AI_TXT_PATHS:
+        ok, body, note = _fetch("https://%s%s" % (domain, path))
+        tried.append({"path": path, "ok": ok, "note": note})
+        if ok and body:
+            return path, body, {"served_at": path, "attempts": tried, "observed": note}
+    return None, None, {"served_at": None, "attempts": tried}
+
+
+def _pick(fields, key):
+    """Return (alias_used, value) for the first alias present."""
+    for alias in FIELD_ALIASES[key]:
+        if fields.get(alias):
+            return alias, fields[alias]
+    return None, None
+
+
+def _run_checks(domain):
+    """Observe what the domain serves. Every check names what it looked at."""
+    checks = []
+
+    path, body, mnote = _find_manifest(domain)
+    checks.append({
+        "id": "ai_txt_reachable",
+        "asks": "Does %s serve a manifest at %s?" % (domain, " or ".join(AI_TXT_PATHS)),
+        "pass": bool(body),
+        "observed": mnote,
+    })
+
+    fields = {}
+    if body:
+        for line in body.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or ":" not in line:
+                continue
+            k, _, v = line.partition(":")
+            k = k.strip().lower()
+            v = v.strip()
+            if k and v and k not in fields:
+                fields[k] = v
+
+    tip_alias, tip_url = _pick(fields, "chain_tip_url")
+    ver_alias, verifier = _pick(fields, "verifier")
+    con_alias, contact = _pick(fields, "contact")
+
+    missing = []
+    if not tip_url:
+        missing.append("chain tip url (%s)" % "/".join(FIELD_ALIASES["chain_tip_url"]))
+    if not verifier:
+        missing.append("verifier (%s)" % "/".join(FIELD_ALIASES["verifier"]))
+    if not contact:
+        missing.append("contact (%s)" % "/".join(FIELD_ALIASES["contact"]))
+
+    checks.append({
+        "id": "ai_txt_declares_required_fields",
+        "asks": "Does the manifest declare a chain tip url, a verifier and a contact, under any accepted field name?",
+        "pass": bool(body) and not missing,
+        "observed": {
+            "matched": {"chain_tip_url": tip_alias, "verifier": ver_alias, "contact": con_alias},
+            "missing": missing,
+            "field_count": len(fields),
+        },
+    })
+
+    tip_value = None
+    if tip_url:
+        tok, tbody, tnote = _fetch(tip_url)
+        parsed_tip = None
+        if tok and tbody:
+            try:
+                obj = json.loads(tbody)
+                for key in ("tip", "tip_sha256", "chain_tip", "head", "root",
+                            "current_tip", "latest", "hash"):
+                    if isinstance(obj.get(key), str):
+                        parsed_tip = obj[key]
+                        break
+            except Exception:
+                stripped = tbody.strip()
+                if re.fullmatch(r"[0-9a-fA-F]{64}", stripped):
+                    parsed_tip = stripped
+        tip_value = parsed_tip
+        checks.append({
+            "id": "chain_tip_served",
+            "asks": "Does the declared chain tip url return a tip value?",
+            "pass": bool(parsed_tip),
+            "observed": dict(tnote, declared_as=tip_alias, tip_field_found=bool(parsed_tip)),
+        })
+        checks.append({
+            "id": "chain_tip_is_sha256",
+            "asks": "Is the served tip a 64-character hex digest?",
+            "pass": bool(parsed_tip) and bool(re.fullmatch(r"[0-9a-fA-F]{64}", parsed_tip or "")),
+            "observed": {"tip": parsed_tip},
+        })
+    else:
+        for cid, asks in (("chain_tip_served", "Does the declared chain tip url return a tip value?"),
+                          ("chain_tip_is_sha256", "Is the served tip a 64-character hex digest?")):
+            checks.append({"id": cid, "asks": asks, "pass": False,
+                           "observed": {"error": "no chain tip url declared"}})
+
+    checks.append({
+        "id": "verifier_named",
+        "asks": "Does the manifest name instructions or a tool a third party can use to check the chain themselves?",
+        "pass": bool(verifier),
+        "observed": {"verifier": verifier, "declared_as": ver_alias},
+    })
+
+    passed = all(c["pass"] for c in checks)
+    return {
+        "suite": SUITE_VERSION,
+        "ran_at": _iso(_now()),
+        "manifest_path": path,
+        "all_passed": passed,
+        "failed": [c["id"] for c in checks if not c["pass"]],
+        "checks": checks,
+        "tip_observed": tip_value,
+        "contact": contact,
+        "declared": fields,
     }
 
-    if unchanged:
-        out["unchanged"] = True
-        out["first_sealed_in_this_form"] = _iso(first_of_this_version)
-        out["message"] = ("Identical to the last sealed version. The page has not changed since "
-                          "%s and now has an additional dated witness." % _iso(first_of_this_version))
-    elif prior:
-        out["changed"] = True
-        out["previous_hash"] = prior[-1][0]
-        out["previous_sealed_at"] = _iso(prior[-1][1])
-        out["message"] = ("The content has changed since the last seal. Both versions remain in "
-                          "the chain - a revision history the publisher cannot edit.")
-    else:
-        out["message"] = ("First seal for this address. Every later seal builds a permanent, "
-                          "dated revision history from here.")
 
-    if external:
-        out["external_references"] = external
-        out["external_caveat"] = ("Recorded exactly as supplied and sealed with the block. We do "
-                                  "not verify them and they are not our evidence - they are "
-                                  "somebody else's record, named so you can check them at "
-                                  "source.")
-    else:
-        out["advice"] = ("If this page was published before today, add external references - a "
-                         "GitHub push event, a Wayback snapshot - and they will be sealed "
-                         "alongside. Those carry an earlier date; a seal made now cannot.")
-    return out, 200
+# ------------------------------------------------------------------ actions
 
-
-# ----------------------------------------------------------------------
-# reading
-# ----------------------------------------------------------------------
-
-def _parse_external(blob):
-    if not blob:
-        return []
-    out = []
-    for line in blob.split("|"):
-        parts = line.strip().split(" ", 2)
-        if len(parts) >= 2:
-            out.append({"source": parts[0], "reference": parts[1],
-                        "claimed_time": parts[2] if len(parts) > 2 and parts[2] else None})
-    return out
-
-
-def _history(ctx, data):
-    url = str(data.get("url", "")).strip()
-    if not url:
-        return {"error": "url_required"}, 400
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT content_hash,byte_length,fetched,audit_hash,block_index,note,external "
-            "FROM publish_seal WHERE url=? ORDER BY id ASC LIMIT 500", (url,)).fetchall()
-    if not rows:
-        return {"error": "never_sealed", "url": url,
-                "message": "No seal recorded for that address."}, 404
-
-    versions, last_hash = [], None
-    for content_hash, length, fetched, audit_hash, block_index, note, external in rows:
-        versions.append({
-            "content_hash": content_hash, "bytes": length,
-            "sealed_at": _iso(fetched), "sealed_in_chain": audit_hash,
-            "block_index": block_index, "note": note,
-            "changed_from_previous": last_hash is not None and content_hash != last_hash,
-            "external_references": _parse_external(external),
-        })
-        last_hash = content_hash
-
-    distinct = len({v["content_hash"] for v in versions})
-    return {"url": url, "seals": len(versions), "distinct_versions": distinct,
-            "first_sealed": versions[0]["sealed_at"], "latest_sealed": versions[-1]["sealed_at"],
-            "current_hash": versions[-1]["content_hash"],
-            "versions": versions,
-            "publish_version": VERSION,
-            "what_this_is": "A dated revision history the publisher cannot edit. Each version is "
-                            "its own block; altering or removing one breaks every block after it.",
-            "limit": "The first seal fixes an upper bound, not a lower one. Anything published "
-                     "before its first seal rests on external evidence, which is recorded here "
-                     "but not verified by us."}, 200
-
-
-def _verify(ctx, data):
-    url = str(data.get("url", "")).strip()
-    digest = str(data.get("hash", data.get("content_hash", ""))).strip().lower()
-    if not digest or not HEX64.match(digest):
-        return {"error": "hash_required",
-                "message": "sha256 of AILEASH-PUBLISH-v1: followed by the exact bytes served"}, 400
-
-    with ctx["lock"]:
-        if url:
-            rows = ctx["conn"].execute(
-                "SELECT url,fetched,audit_hash,block_index FROM publish_seal "
-                "WHERE url=? AND content_hash=? ORDER BY id ASC", (url, digest)).fetchall()
-        else:
-            rows = ctx["conn"].execute(
-                "SELECT url,fetched,audit_hash,block_index FROM publish_seal "
-                "WHERE content_hash=? ORDER BY id ASC", (digest,)).fetchall()
-
-    if not rows:
-        return {"sealed": False, "content_hash": digest, "url": url or None,
-                "message": "We hold no seal for that exact content. Either it was never sealed, "
-                           "or the content differs from what was - a single byte is enough."}, 404
-
-    return {"sealed": True, "content_hash": digest,
-            "url": rows[0][0], "times_sealed": len(rows),
-            "first_sealed": _iso(rows[0][1]),
-            "latest_sealed": _iso(rows[-1][1]),
-            "sealed_in_chain": rows[0][2], "block_index": rows[0][3],
-            "publish_version": VERSION,
-            "what_this_proves": "Content with exactly this fingerprint was served at that "
-                                "address no later than the first sealing time, and the record "
-                                "of it has not been altered since.",
-            "verify_the_block": "/x/consistency/ancestor?tip=" + rows[0][2]}, 200
-
-
-def _list(ctx):
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT url,COUNT(*),MIN(fetched),MAX(fetched),COUNT(DISTINCT content_hash) "
-            "FROM publish_seal GROUP BY url ORDER BY MAX(fetched) DESC LIMIT 500").fetchall()
-    return {"count": len(rows),
-            "pages": [{"url": r[0], "seals": r[1], "first_sealed": _iso(r[2]),
-                       "latest_sealed": _iso(r[3]), "distinct_versions": r[4],
-                       "history": "/x/publish/history?url=" + r[0]} for r in rows],
-            "publish_version": VERSION,
-            "note": "Everything this platform has sealed about its own published pages. Ours is "
-                    "in here too - a publisher who seals everyone's pages but not their own is "
-                    "telling you something."}, 200
-
-
-def _spec():
+def _spec(ctx):
     return {
-        "publish_version": VERSION,
-        "content_hash": "sha256('AILEASH-PUBLISH-v1:' || exact_bytes_served) as lowercase hex",
-        "no_normalisation": "The bytes are hashed exactly as served. Nothing is trimmed, "
-                            "reordered or cleaned up first - a whitespace-tolerant hash would "
-                            "be a hash of our opinion of the page rather than of the page.",
-        "reproduce_it": "curl the URL, pipe the raw bytes through sha256 with that prefix, and "
-                        "compare with what we sealed. If your bytes differ, the page changed.",
-        "what_a_seal_proves": "That content with this exact fingerprint was served at this "
-                              "address no later than the sealing time, and that the record has "
-                              "not been altered since - it is a chain block like any other, "
-                              "anchored externally and witnessed by peers.",
-        "what_it_cannot_prove": "That the page existed before the seal. Timestamps run forwards "
-                                "only. Any product implying otherwise is misdescribing what a "
-                                "timestamp is.",
-        "for_earlier_dates": {
-            "github_push": "api.github.com/repos/<owner>/<repo>/events - the push timestamp is "
-                           "recorded by GitHub, not the pusher, unlike commit author and "
-                           "committer dates which are settable fields. Retained around 90 days, "
-                           "so capture it while it exists.",
-            "wayback": "archive.org/wayback/available - an independent party with no stake in "
-                       "the dispute.",
-            "status": "Both are recorded and sealed as supplied, and neither is verified by us. "
-                      "They are somebody else's evidence, named so you can check them at source.",
+        "module": "register",
+        "version": VERSION,
+        "suite_version": SUITE_VERSION,
+        "what_this_is":
+            "A registry that publishes proofs about its own behaviour. Absence proofs "
+            "show a domain was not listed on a date. RFC 6962 consistency proofs show "
+            "no entry was inserted behind an earlier position. Revocations are sealed "
+            "rather than deleted, so a removed listing stays readable.",
+        "why_that_matters":
+            "Every other registry is a mutable database whose operator can add, "
+            "back-date or quietly delete entries. Trusting the list means trusting the "
+            "registrar. This one is checkable against its own operator.",
+        "what_this_is_not": WHAT_THIS_IS_NOT,
+        "status_vocabulary": VOCABULARY,
+        "how_to_get_listed": [
+            "Simplest, nothing to edit: if your manifest already carries a `Domain: <yourdomain>` line matching the domain you are claiming, POST /x/register/claim and you are listed. A manifest served from your domain naming your domain could only have been published by you.",
+            "If your manifest does not name itself, use the token route instead:",
+            "1. POST /x/register/challenge with {\"domain\": \"example.com\"} — returns a one-time token.",
+            "2. Serve that token at https://example.com%s, or add a `Register-Token: <token>` line to your manifest at %s" % (WELL_KNOWN_PATH, " or ".join(AI_TXT_PATHS)),
+            "Any token issued in the last 24 hours will verify — asking for a new one does not invalidate one you already published. See /x/register/tokens?domain=example.com",
+            "3. POST /x/register/claim with {\"domain\": \"example.com\"} — we fetch, verify, run the checks and seal the result.",
+            "Opt out at any time with a `Register: no` line in the manifest — the register refuses the claim and says so.",
+            "Nobody is listed by the operator. A domain lists itself by proving it controls the domain.",
+        ],
+        "manifest_paths_tried": AI_TXT_PATHS,
+        "field_aliases": FIELD_ALIASES,
+        "checks_run": [
+            "ai_txt_reachable", "ai_txt_declares_required_fields",
+            "chain_tip_served", "chain_tip_is_sha256", "verifier_named",
+        ],
+        "trees": {
+            "event_tree": "RFC 6962 ordered tree over every register event in write order. Answers append-only. Verifies with any standard Certificate Transparency verifier.",
+            "domain_tree": "Sorted tree over the domains listed at a checkpoint, odd nodes promoted, domain-separated prefixes. Answers absence.",
+            "note": "The two roots answer different questions and deliberately never match.",
         },
-        "the_discipline": "Seal at publication. One call at the moment a page goes live means "
-                          "the publication date never rests on anyone's word, anyone's git "
-                          "history, or anyone's memory again.",
+        "proof_of_control": {"preferred": "manifest-self-declaration (a Domain: line naming itself)",
+                             "fallback": "one-time token served at a path we name",
+                             "opt_out": "a `Register: no` line in the manifest"},
+        "stale_after_days": STALE_AFTER_DAYS,
+        "challenge_ttl_seconds": CHALLENGE_TTL_SECONDS,
+        "routes": {
+            "public": sorted("%s /x/register/%s" % (m, a) for m, a in PUBLIC),
+            "keyed": ["POST /x/register/recheck-all", "POST /x/register/checkpoint",
+                      "POST /x/register/revoke"],
+        },
+        "honest_limits": [
+            "A check observes what a URL served at a moment in time. It cannot know what a domain did not seal.",
+            "Domain control proves control of the domain, not the truth of anything the domain declares.",
+            "Absence proofs are only as good as the checkpoint they are made against. A period with no checkpoint has nothing to prove absence from.",
+            "Nobody can be forced to keep publishing. A listing goes stale when the evidence ages, and that is the honest outcome rather than a failure of the register.",
+        ],
     }, 200
 
 
-# ----------------------------------------------------------------------
-# router entry point
-# ----------------------------------------------------------------------
+def _challenge(ctx, data):
+    domain = _clean_domain(data.get("domain"))
+    if not data.get("domain"):
+        return {"error": MESSAGES["domain_required"]}, 400
+    if not domain:
+        return {"error": MESSAGES["bad_domain"]}, 400
+
+    with ctx["lock"]:
+        row = ctx["conn"].execute(
+            "SELECT status FROM register_entry WHERE domain=?", (domain,)).fetchone()
+    if row and row[0] in (STATUS_REVOKED,):
+        return {"error": MESSAGES["already_final"], "domain": domain,
+                "status": row[0]}, 409
+
+    # Idempotent: if a live token already exists for this domain, return THAT
+    # one. Minting a new token on every request is how an operator ends up with
+    # a published token the register no longer recognises.
+    existing = _live_tokens(ctx, domain)
+    if existing:
+        token, issued = existing[0]
+        return {
+            "ok": True,
+            "domain": domain,
+            "token": token,
+            "reused": True,
+            "issued_at": _iso(issued),
+            "expires_at": _iso(issued + CHALLENGE_TTL_SECONDS),
+            "serve_at": ["https://%s%s" % (domain, WELL_KNOWN_PATH),
+                         "or a `Register-Token: %s` line in your manifest at %s"
+                         % (token, " or ".join(AI_TXT_PATHS))],
+            "then": "POST /x/register/claim {\"domain\": \"%s\"}" % domain,
+            "note": "This is the token already issued for this domain. Requesting "
+                    "again does not replace it, so anything you have already "
+                    "published stays valid.",
+        }, 200
+
+    token = "aileash-register-" + secrets.token_hex(16)
+    ts = _now()
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "INSERT INTO register_challenge (domain, token, issued) VALUES (?,?,?)"
+            " ON CONFLICT(domain) DO UPDATE SET token=excluded.token, issued=excluded.issued",
+            (domain, token, ts))
+        ctx["conn"].execute(
+            "INSERT OR REPLACE INTO register_token (token, domain, issued) VALUES (?,?,?)",
+            (token, domain, ts))
+        ctx["conn"].execute(
+            "DELETE FROM register_token WHERE domain=? AND issued<?",
+            (domain, ts - CHALLENGE_TTL_SECONDS))
+        ctx["conn"].commit()
+
+    try:
+        sealed = _seal_event(ctx, domain, "challenge_issued",
+                             {"token_sha256": _sha(token.encode())})
+    except Exception as e:
+        return {"error": MESSAGES["seal_failed"], "detail": str(e)}, 500
+
+    return {
+        "ok": True,
+        "domain": domain,
+        "token": token,
+        "expires_at": _iso(ts + CHALLENGE_TTL_SECONDS),
+        "serve_at": ["https://%s%s" % (domain, WELL_KNOWN_PATH),
+                     "or a `Register-Token: %s` line in https://%s%s" % (token, domain, AI_TXT_PATH)],
+        "then": "POST /x/register/claim {\"domain\": \"%s\"}" % domain,
+        "sealed": sealed,
+        "note": "The token itself is not sealed — only its digest, so the challenge cannot be replayed from the public chain.",
+    }, 200
+
+
+def _live_tokens(ctx, domain):
+    """Every token issued for this domain that has not expired, newest first."""
+    cutoff = _now() - CHALLENGE_TTL_SECONDS
+    with ctx["lock"]:
+        rows = ctx["conn"].execute(
+            "SELECT token, issued FROM register_token WHERE domain=? AND issued>=?"
+            " ORDER BY issued DESC", (domain, cutoff)).fetchall()
+    return [(r[0], r[1]) for r in rows]
+
+
+def _verify_self_declaration(domain):
+    """Proof of control with nothing to edit.
+
+    A manifest served over https from the domain, whose own `Domain:` line
+    names that same domain, was published by whoever controls the domain.
+    Nobody else can put a file there. That IS the consent a token was
+    standing in for, so a token is only needed when the manifest does not
+    name itself (or the operator has opted out).
+
+    An operator who does not want to be listed writes `Register: no`.
+    """
+    path, body, mnote = _find_manifest(domain)
+    if not body:
+        return False, {"reason": "no manifest served", "attempts": mnote}
+
+    declared = None
+    opted_out = False
+    for line in body.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        k, _, v = line.partition(":")
+        k, v = k.strip().lower(), v.strip().lower()
+        if k == "domain" and declared is None:
+            declared = v.lstrip("www.")
+        if k == "register" and v in ("no", "false", "off", "opt-out"):
+            opted_out = True
+
+    if opted_out:
+        return False, {"reason": "manifest declares Register: no",
+                       "respected": True, "served_at": path}
+    if not declared:
+        return False, {"reason": "manifest does not declare a Domain: line",
+                       "served_at": path}
+    if declared != domain:
+        return False, {"reason": "manifest declares a different domain",
+                       "declared": declared, "claimed": domain, "served_at": path}
+
+    return True, {"method": "manifest-self-declaration", "served_at": path,
+                  "declared_domain": declared, "observed": mnote.get("observed"),
+                  "what_this_proves": "The manifest at this path names this domain "
+                                      "as its own. Only the party controlling the "
+                                      "domain can serve that file."}
+
+
+def _verify_any_token(ctx, domain):
+    """Accept ANY live token for this domain. Requesting a new one must never
+    invalidate one the operator has already published."""
+    tokens = _live_tokens(ctx, domain)
+    if not tokens:
+        return False, None, {"error": "no_live_token"}
+    last = None
+    for token, issued in tokens:
+        ok, evidence = _verify_token(domain, token)
+        if ok:
+            evidence["token_issued"] = _iso(issued)
+            evidence["tokens_live"] = len(tokens)
+            return True, token, evidence
+        last = evidence
+    return False, None, {"tokens_live": len(tokens), "none_matched": True,
+                         "last_attempt": last}
+
+
+def _verify_token(domain, token):
+    ok, body, note = _fetch("https://%s%s" % (domain, WELL_KNOWN_PATH))
+    if ok and body and token in body:
+        return True, {"method": "well-known", "observed": note}
+    tried = [{"path": WELL_KNOWN_PATH, "note": note}]
+    for path in AI_TXT_PATHS:
+        ok2, body2, note2 = _fetch("https://%s%s" % (domain, path))
+        tried.append({"path": path, "note": note2})
+        if ok2 and body2:
+            for line in body2.splitlines():
+                if line.strip().lower().startswith("register-token:") and token in line:
+                    return True, {"method": "manifest:%s" % path, "observed": note2}
+    return False, {"method": None, "tried": tried}
+
+
+def _claim(ctx, data):
+    domain = _clean_domain(data.get("domain"))
+    if not domain:
+        return {"error": MESSAGES["bad_domain"]}, 400
+
+    verified, evidence = _verify_self_declaration(domain)
+    if not verified:
+        self_decl_evidence = evidence
+        if evidence.get("respected"):
+            return {"ok": False, "domain": domain,
+                    "error": "this domain has opted out with a `Register: no` line",
+                    "evidence": evidence}, 403
+        if not _live_tokens(ctx, domain):
+            return {"ok": False, "domain": domain,
+                    "error": "could not prove control of this domain",
+                    "self_declaration": self_decl_evidence,
+                    "how_to_fix": [
+                        "Easiest: add a `Domain: %s` line to your manifest at %s."
+                        % (domain, " or ".join(AI_TXT_PATHS)),
+                        "Or: POST /x/register/challenge and serve the token it returns.",
+                    ]}, 400
+        verified, matched_token, tok_evidence = _verify_any_token(ctx, domain)
+        evidence = dict(tok_evidence or {}, self_declaration=self_decl_evidence)
+    if not verified:
+        try:
+            _seal_event(ctx, domain, "claim_refused", {"reason": "token_not_found",
+                                                       "evidence": evidence})
+        except Exception as e:
+            return {"error": MESSAGES["seal_failed"], "detail": str(e)}, 500
+        return {"ok": False, "domain": domain, "error": MESSAGES["token_not_found"],
+                "looked_at": ["https://%s%s" % (domain, WELL_KNOWN_PATH),
+                              "https://%s%s" % (domain, AI_TXT_PATH)],
+                "evidence": evidence,
+                "note": "The refusal is sealed. Fix the token and claim again."}, 400
+
+    checks = _run_checks(domain)
+    status = STATUS_PASSED if checks["all_passed"] else STATUS_FAILED
+    contact = checks.get("contact")
+    ts = _now()
+
+    try:
+        sealed = _seal_event(ctx, domain, "listed", {
+            "claim_method": evidence.get("method"),
+            "status": status,
+            "suite": SUITE_VERSION,
+            "failed": checks["failed"],
+            "tip_observed": checks["tip_observed"],
+        })
+    except Exception as e:
+        return {"error": MESSAGES["seal_failed"], "detail": str(e)}, 500
+
+    with ctx["lock"]:
+        existing = ctx["conn"].execute(
+            "SELECT first_listed FROM register_entry WHERE domain=?", (domain,)).fetchone()
+        first = existing[0] if existing else ts
+        ctx["conn"].execute(
+            "INSERT INTO register_entry (domain, status, first_listed, last_event,"
+            " last_checked, last_pass, checks_json, contact, claim_method, reason)"
+            " VALUES (?,?,?,?,?,?,?,?,?,NULL)"
+            " ON CONFLICT(domain) DO UPDATE SET status=excluded.status,"
+            " last_event=excluded.last_event, last_checked=excluded.last_checked,"
+            " last_pass=excluded.last_pass, checks_json=excluded.checks_json,"
+            " contact=excluded.contact, claim_method=excluded.claim_method, reason=NULL",
+            (domain, status, first, ts, ts,
+             ts if checks["all_passed"] else None,
+             _canon(checks), contact, evidence.get("method")))
+        ctx["conn"].execute("DELETE FROM register_challenge WHERE domain=?", (domain,))
+        ctx["conn"].execute("DELETE FROM register_token WHERE domain=?", (domain,))
+        ctx["conn"].commit()
+
+    cp = None
+    try:
+        cp = _seal_checkpoint(ctx)
+    except Exception as e:
+        cp = {"error": "checkpoint_failed", "detail": str(e)}
+
+    return {"ok": True, "domain": domain, "status": status,
+            "status_means": VOCABULARY[status],
+            "claim_method": evidence.get("method"),
+            "checks": checks, "sealed": sealed, "checkpoint": cp,
+            "entry_url": "/x/register/entry?domain=%s" % domain}, 200
+
+
+def _recheck(ctx, data):
+    domain = _clean_domain(data.get("domain"))
+    if not domain:
+        return {"error": MESSAGES["bad_domain"]}, 400
+    with ctx["lock"]:
+        row = ctx["conn"].execute(
+            "SELECT status, first_listed FROM register_entry WHERE domain=?",
+            (domain,)).fetchone()
+    if not row:
+        return {"error": MESSAGES["not_listed"], "domain": domain}, 404
+    if row[0] in (STATUS_WITHDRAWN, STATUS_REVOKED):
+        return {"error": MESSAGES["already_final"], "domain": domain, "status": row[0]}, 409
+
+    checks = _run_checks(domain)
+    status = STATUS_PASSED if checks["all_passed"] else STATUS_FAILED
+    ts = _now()
+
+    try:
+        sealed = _seal_event(ctx, domain, "rechecked", {
+            "status": status, "suite": SUITE_VERSION, "failed": checks["failed"],
+            "tip_observed": checks["tip_observed"],
+        })
+    except Exception as e:
+        return {"error": MESSAGES["seal_failed"], "detail": str(e)}, 500
+
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "UPDATE register_entry SET status=?, last_event=?, last_checked=?,"
+            " last_pass=COALESCE(?, last_pass), checks_json=? WHERE domain=?",
+            (status, ts, ts, ts if checks["all_passed"] else None,
+             _canon(checks), domain))
+        ctx["conn"].commit()
+
+    return {"ok": True, "domain": domain, "status": status,
+            "status_means": VOCABULARY[status], "checks": checks, "sealed": sealed}, 200
+
+
+def _withdraw(ctx, data):
+    """A domain removes itself. Proved the same way it listed itself."""
+    domain = _clean_domain(data.get("domain"))
+    if not domain:
+        return {"error": MESSAGES["bad_domain"]}, 400
+    with ctx["lock"]:
+        row = ctx["conn"].execute(
+            "SELECT status FROM register_entry WHERE domain=?", (domain,)).fetchone()
+    if not row:
+        return {"error": MESSAGES["not_listed"], "domain": domain}, 404
+    verified, evidence = _verify_self_declaration(domain)
+    if not verified:
+        if not _live_tokens(ctx, domain):
+            return {"error": MESSAGES["no_challenge"], "domain": domain,
+                    "note": "Withdrawal is proved the same way listing is."}, 404
+        verified, matched_token, evidence = _verify_any_token(ctx, domain)
+    if not verified:
+        return {"ok": False, "error": MESSAGES["token_not_found"], "evidence": evidence}, 400
+
+    ts = _now()
+    try:
+        sealed = _seal_event(ctx, domain, "withdrawn",
+                             {"by": "domain", "method": evidence.get("method")})
+    except Exception as e:
+        return {"error": MESSAGES["seal_failed"], "detail": str(e)}, 500
+
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "UPDATE register_entry SET status=?, last_event=?, reason=? WHERE domain=?",
+            (STATUS_WITHDRAWN, ts, "withdrawn by domain", domain))
+        ctx["conn"].execute("DELETE FROM register_challenge WHERE domain=?", (domain,))
+        ctx["conn"].execute("DELETE FROM register_token WHERE domain=?", (domain,))
+        ctx["conn"].commit()
+
+    cp = None
+    try:
+        cp = _seal_checkpoint(ctx)
+    except Exception as e:
+        cp = {"error": "checkpoint_failed", "detail": str(e)}
+
+    return {"ok": True, "domain": domain, "status": STATUS_WITHDRAWN,
+            "status_means": VOCABULARY[STATUS_WITHDRAWN],
+            "sealed": sealed, "checkpoint": cp,
+            "note": "The listing history remains readable at /x/register/history?domain=%s" % domain}, 200
+
+
+def _revoke(ctx, data):
+    domain = _clean_domain(data.get("domain"))
+    reason = (data.get("reason") or "").strip()
+    if not domain:
+        return {"error": MESSAGES["bad_domain"]}, 400
+    if not reason:
+        return {"error": "reason is required — a revocation with no sealed reason is exactly what this register exists to prevent"}, 400
+    with ctx["lock"]:
+        row = ctx["conn"].execute(
+            "SELECT status FROM register_entry WHERE domain=?", (domain,)).fetchone()
+    if not row:
+        return {"error": MESSAGES["not_listed"], "domain": domain}, 404
+
+    ts = _now()
+    try:
+        sealed = _seal_event(ctx, domain, "revoked", {"by": "operator", "reason": reason})
+    except Exception as e:
+        return {"error": MESSAGES["seal_failed"], "detail": str(e)}, 500
+
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "UPDATE register_entry SET status=?, last_event=?, reason=? WHERE domain=?",
+            (STATUS_REVOKED, ts, reason, domain))
+        ctx["conn"].commit()
+
+    cp = None
+    try:
+        cp = _seal_checkpoint(ctx)
+    except Exception as e:
+        cp = {"error": "checkpoint_failed", "detail": str(e)}
+
+    return {"ok": True, "domain": domain, "status": STATUS_REVOKED,
+            "reason": reason, "sealed": sealed, "checkpoint": cp,
+            "note": "Nothing was deleted. The revocation is sealed and the history stays public."}, 200
+
+
+def _recheck_all(ctx):
+    domains = _live_domains(ctx)
+    results = []
+    for d in domains:
+        body, _ = _recheck(ctx, {"domain": d})
+        results.append({"domain": d, "status": body.get("status"),
+                        "failed": (body.get("checks") or {}).get("failed")})
+    # age anything whose last pass is old
+    cutoff = _now() - STALE_AFTER_DAYS * 86400
+    aged = []
+    with ctx["lock"]:
+        rows = ctx["conn"].execute(
+            "SELECT domain, last_pass FROM register_entry WHERE status=?",
+            (STATUS_PASSED,)).fetchall()
+    for domain, last_pass in rows:
+        if last_pass is None or last_pass < cutoff:
+            try:
+                _seal_event(ctx, domain, "stale", {"last_pass": _iso(last_pass) if last_pass else None})
+            except Exception:
+                continue
+            with ctx["lock"]:
+                ctx["conn"].execute(
+                    "UPDATE register_entry SET status=?, last_event=? WHERE domain=?",
+                    (STATUS_STALE, _now(), domain))
+                ctx["conn"].commit()
+            aged.append(domain)
+
+    cp = None
+    try:
+        cp = _seal_checkpoint(ctx)
+    except Exception as e:
+        cp = {"error": "checkpoint_failed", "detail": str(e)}
+    return {"ok": True, "rechecked": results, "moved_to_stale": aged,
+            "checkpoint": cp}, 200
+
+
+def _list(ctx, q):
+    want = (q.get("status") or "").strip().lower()
+    with ctx["lock"]:
+        rows = ctx["conn"].execute(
+            "SELECT domain, status, first_listed, last_event, last_checked, last_pass,"
+            " checks_json, reason FROM register_entry ORDER BY domain ASC").fetchall()
+    out = []
+    for r in rows:
+        checks = {}
+        try:
+            checks = json.loads(r[6]) if r[6] else {}
+        except Exception:
+            checks = {}
+        entry = {
+            "domain": r[0],
+            "status": r[1],
+            "status_means": VOCABULARY.get(r[1], "unexplained value — treat as unverified"),
+            "first_listed": _iso(r[2]),
+            "last_event": _iso(r[3]),
+            "last_checked": _iso(r[4]) if r[4] else None,
+            "last_pass": _iso(r[5]) if r[5] else None,
+            "failed_checks": checks.get("failed") or [],
+            "reason": r[7],
+        }
+        if not want or entry["status"] == want:
+            out.append(entry)
+
+    with ctx["lock"]:
+        cp = ctx["conn"].execute(
+            "SELECT ts, tree_size, event_root, domain_root, domain_count"
+            " FROM register_checkpoint ORDER BY id DESC LIMIT 1").fetchone()
+
+    return {
+        "registry_version": VERSION,
+        "suite_version": SUITE_VERSION,
+        "count": len(out),
+        "entries": out,
+        "status_vocabulary": VOCABULARY,
+        "what_this_list_is_not": WHAT_THIS_IS_NOT,
+        "latest_checkpoint": ({
+            "at": _iso(cp[0]), "tree_size": cp[1], "event_root": cp[2],
+            "domain_root": cp[3], "domain_count": cp[4],
+        } if cp else None),
+        "prove_absence": "/x/register/absence?domain=example.com&at=2026-01-01",
+        "prove_append_only": "/x/register/consistency?first=<size>&second=<size>",
+    }, 200
+
+
+def _entry(ctx, q):
+    domain = _clean_domain(q.get("domain"))
+    if not domain:
+        return {"error": MESSAGES["bad_domain"]}, 400
+    with ctx["lock"]:
+        r = ctx["conn"].execute(
+            "SELECT domain, status, first_listed, last_event, last_checked, last_pass,"
+            " checks_json, contact, claim_method, reason FROM register_entry WHERE domain=?",
+            (domain,)).fetchone()
+    if not r:
+        return {"error": MESSAGES["not_listed"], "domain": domain,
+                "prove_it": "/x/register/absence?domain=%s&at=<date>" % domain}, 404
+    try:
+        checks = json.loads(r[6]) if r[6] else {}
+    except Exception:
+        checks = {}
+    return {
+        "domain": r[0], "status": r[1],
+        "status_means": VOCABULARY.get(r[1], "unexplained value — treat as unverified"),
+        "first_listed": _iso(r[2]), "last_event": _iso(r[3]),
+        "last_checked": _iso(r[4]) if r[4] else None,
+        "last_pass": _iso(r[5]) if r[5] else None,
+        "claim_method": r[8], "reason": r[9],
+        "checks": checks,
+        "what_this_is_not": WHAT_THIS_IS_NOT,
+        "history": "/x/register/history?domain=%s" % domain,
+    }, 200
+
+
+def _history(ctx, q):
+    domain = _clean_domain(q.get("domain"))
+    if not domain:
+        return {"error": MESSAGES["bad_domain"]}, 400
+    with ctx["lock"]:
+        rows = ctx["conn"].execute(
+            "SELECT seq, ts, kind, detail, leaf_hex, audit_hash FROM register_event"
+            " WHERE domain=? ORDER BY seq ASC", (domain,)).fetchall()
+    events = []
+    for s, ts, kind, detail, leaf, ah in rows:
+        try:
+            d = json.loads(detail)
+        except Exception:
+            d = detail
+        events.append({"seq": s, "at": _iso(ts), "kind": kind, "detail": d,
+                       "leaf": leaf, "audit_hash": ah,
+                       "inclusion": "/x/register/inclusion?seq=%d" % s})
+    return {"domain": domain, "count": len(events), "events": events,
+            "note": "Nothing is ever removed from this history, including revocations."}, 200
+
+
+def _absence(ctx, q):
+    """Prove a domain was NOT listed at a given time."""
+    domain = _clean_domain(q.get("domain"))
+    if not domain:
+        return {"error": MESSAGES["bad_domain"]}, 400
+    at = _parse_when(q.get("at"))
+    with ctx["lock"]:
+        if at is None:
+            cp = ctx["conn"].execute(
+                "SELECT ts, tree_size, domain_root, domain_count, domains_json, audit_hash"
+                " FROM register_checkpoint ORDER BY id DESC LIMIT 1").fetchone()
+        else:
+            cp = ctx["conn"].execute(
+                "SELECT ts, tree_size, domain_root, domain_count, domains_json, audit_hash"
+                " FROM register_checkpoint WHERE ts<=? ORDER BY ts DESC LIMIT 1",
+                (at,)).fetchone()
+    if not cp:
+        return {"error": MESSAGES["no_checkpoint"], "domain": domain,
+                "asked_about": _iso(at) if at else "now"}, 404
+
+    domains = json.loads(cp[4])
+    leaves = [_sorted_leaf(d) for d in domains]
+    root = _sorted_root(leaves).hex()
+
+    if domain in domains:
+        idx = domains.index(domain)
+        return {
+            "domain": domain,
+            "present": True,
+            "at": _iso(cp[0]),
+            "checkpoint_root": root,
+            "index": idx,
+            "path": _sorted_path(leaves, idx),
+            "proves": "This domain WAS listed at the checkpoint shown. This is an inclusion proof, not an absence proof.",
+        }, 200
+
+    # find the two adjacent leaves it would sit between
+    lo, hi = None, None
+    for i, d in enumerate(domains):
+        if d < domain:
+            lo = i
+        if d > domain and hi is None:
+            hi = i
+    neighbours = []
+    if lo is not None:
+        neighbours.append({"position": "before", "index": lo, "domain": domains[lo],
+                           "leaf": leaves[lo].hex(), "path": _sorted_path(leaves, lo)})
+    if hi is not None:
+        neighbours.append({"position": "after", "index": hi, "domain": domains[hi],
+                           "leaf": leaves[hi].hex(), "path": _sorted_path(leaves, hi)})
+
+    if lo is not None and hi is not None:
+        proves = ("Indices %d and %d are consecutive in a sorted tree committed at %s. "
+                  "Nothing can sit between them, and %s sorts between them, so it was "
+                  "not listed at that checkpoint." % (lo, hi, _iso(cp[0]), domain))
+    elif not domains:
+        proves = ("The register held no listings at all at that checkpoint "
+                  "(count 0, sealed root %s), so %s was not listed." % (root, domain))
+    elif lo is None:
+        proves = ("%s sorts before the first leaf at index 0, and the leaf count was "
+                  "committed in advance, so it was not listed at that checkpoint." % domain)
+    else:
+        proves = ("%s sorts after the last leaf at index %d, and the leaf count was "
+                  "committed in advance, so it was not listed at that checkpoint." % (domain, lo))
+
+    return {
+        "domain": domain,
+        "present": False,
+        "asked_about": _iso(at) if at else "now",
+        "checkpoint_at": _iso(cp[0]),
+        "checkpoint_root": root,
+        "sealed_root": cp[2],
+        "roots_agree": root == cp[2],
+        "domain_count": cp[3],
+        "neighbours": neighbours,
+        "proves": proves,
+        "how_to_check_yourself": [
+            "leaf   = SHA256('AILEASH-REGISTER-LEAF-v1\\x00' + domain)",
+            "node   = SHA256('AILEASH-REGISTER-NODE-v1\\x00' + left + right)",
+            "Odd nodes are promoted to the next level, never paired with themselves.",
+            "Recompute each neighbour's path to the root and confirm it equals checkpoint_root.",
+        ],
+        "limit": "An absence proof is against a checkpoint. It says nothing about moments between checkpoints.",
+    }, 200
+
+
+def _consistency(ctx, q):
+    """RFC 6962 proof that the register at size `first` is a prefix of size `second`."""
+    leaves = _event_leaves(ctx)
+    n = len(leaves)
+    try:
+        first = int(q.get("first")) if q.get("first") else None
+        second = int(q.get("second")) if q.get("second") else n
+    except (TypeError, ValueError):
+        return {"error": "first and second must be integers"}, 400
+    if first is None:
+        return {"error": "first is required — the tree size you already hold",
+                "current_size": n}, 400
+    if not (0 < first <= second <= n):
+        return {"error": "need 0 < first <= second <= current size",
+                "current_size": n}, 400
+
+    proof = _ct_consistency(leaves[:second], first)
+    return {
+        "first": first,
+        "second": second,
+        "current_size": n,
+        "first_root": _ct_root(leaves[:first]).hex(),
+        "second_root": _ct_root(leaves[:second]).hex(),
+        "proof": proof,
+        "algorithm": "RFC 6962 consistency proof, SHA-256, leaf prefix 0x00, node prefix 0x01",
+        "proves": ("The register at size %d is a prefix of the register at size %d. "
+                   "No entry was inserted, altered or removed behind an earlier "
+                   "position — including by the operator." % (first, second)),
+        "verify_with": "Any standard Certificate Transparency verifier. This tree is deliberately unmodified so you do not have to use ours.",
+    }, 200
+
+
+def _inclusion(ctx, q):
+    leaves = _event_leaves(ctx)
+    try:
+        seq = int(q.get("seq"))
+    except (TypeError, ValueError):
+        return {"error": "seq is required"}, 400
+    with ctx["lock"]:
+        row = ctx["conn"].execute(
+            "SELECT seq, ts, domain, kind, leaf_hex, audit_hash FROM register_event"
+            " WHERE seq=?", (seq,)).fetchone()
+    if not row:
+        return {"error": "no event at that seq"}, 404
+    index = seq - 1
+    if index < 0 or index >= len(leaves):
+        return {"error": "seq out of range of the current tree"}, 409
+    return {
+        "seq": seq, "index": index, "at": _iso(row[1]), "domain": row[2],
+        "kind": row[3], "leaf": row[4], "audit_hash": row[5],
+        "tree_size": len(leaves),
+        "root": _ct_root(leaves).hex(),
+        "proof": _ct_inclusion(leaves, index),
+        "algorithm": "RFC 6962 inclusion proof, SHA-256",
+    }, 200
+
+
+def _checkpoints(ctx, q):
+    with ctx["lock"]:
+        rows = ctx["conn"].execute(
+            "SELECT id, ts, tree_size, event_root, domain_root, domain_count, audit_hash"
+            " FROM register_checkpoint ORDER BY id DESC LIMIT 200").fetchall()
+    return {
+        "count": len(rows),
+        "checkpoints": [{
+            "id": r[0], "at": _iso(r[1]), "tree_size": r[2],
+            "event_root": r[3], "domain_root": r[4],
+            "domain_count": r[5], "audit_hash": r[6],
+        } for r in rows],
+        "note": "event_root answers append-only. domain_root answers absence. They are different trees and never match.",
+    }, 200
+
+
+def _roots(ctx):
+    leaves = _event_leaves(ctx)
+    domains = _live_domains(ctx)
+    return {
+        "tree_size": len(leaves),
+        "event_root": _ct_root(leaves).hex(),
+        "domain_count": len(domains),
+        "domain_root": _sorted_root([_sorted_leaf(d) for d in domains]).hex(),
+        "at": _iso(_now()),
+        "note": "Live values. A root only becomes evidence once it is sealed by a checkpoint.",
+    }, 200
+
+
+# ------------------------------------------------------------------ handle
 
 def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-    action = (action or "").strip("/").lower()
+    _ensure(ctx)
     data = data or {}
+    q = data if isinstance(data, dict) else {}
 
     if method == "GET":
         if action == "spec":
-            return _spec()
-        if action == "history":
-            return _history(ctx, data)
-        if action == "verify":
-            return _verify(ctx, data)
+            return _spec(ctx)
+        if action == "vocabulary":
+            return {"status_vocabulary": VOCABULARY,
+                    "what_this_is_not": WHAT_THIS_IS_NOT,
+                    "suite_version": SUITE_VERSION}, 200
         if action == "list":
-            return _list(ctx)
+            return _list(ctx, q)
+        if action == "entry":
+            return _entry(ctx, q)
+        if action == "history":
+            return _history(ctx, q)
+        if action == "absence":
+            return _absence(ctx, q)
+        if action == "consistency":
+            return _consistency(ctx, q)
+        if action == "inclusion":
+            return _inclusion(ctx, q)
+        if action == "checkpoints":
+            return _checkpoints(ctx, q)
+        if action == "roots":
+            return _roots(ctx)
+        if action == "tokens":
+            d = _clean_domain(q.get("domain"))
+            if not d:
+                return {"error": MESSAGES["bad_domain"]}, 400
+            live = _live_tokens(ctx, d)
+            return {"domain": d, "live_tokens": len(live),
+                    "tokens": [{"token": t, "issued": _iso(i),
+                                "expires": _iso(i + CHALLENGE_TTL_SECONDS)} for t, i in live],
+                    "note": "Any of these will verify. Requesting a new token does not "
+                            "invalidate one you have already published."}, 200
+        if action == "sealcheck":
+            probe = {"user_id": "register:sealcheck", "type": "register_sealcheck",
+                     "kind": "probe", "at": _iso(_now())}
+            try:
+                h = _do_seal(ctx, probe, result="sealcheck")
+                return {"ok": True, "audit_hash": h,
+                        "note": "The register can seal. This probe is a real sealed block."}, 200
+            except Exception as e:
+                return {"ok": False, "error": "seal_failed", "detail": str(e),
+                        "note": "Nothing was written. The detail names what server.py's seal did."}, 500
+        return {"error": "unknown action", "see": "/x/register/spec"}, 404
 
     if method == "POST":
+        if action == "challenge":
+            return _challenge(ctx, q)
+        if action == "claim":
+            return _claim(ctx, q)
+        if action == "recheck":
+            return _recheck(ctx, q)
+        if action == "withdraw":
+            return _withdraw(ctx, q)
+        # keyed below
         if not api_key:
-            return {"error": "invalid_api_key"}, 401
-        if action == "seal":
-            return _seal(ctx, api_key, data)
+            return {"error": "api key required for this action"}, 401
+        if action == "revoke":
+            return _revoke(ctx, q)
+        if action == "checkpoint":
+            try:
+                return {"ok": True, "checkpoint": _seal_checkpoint(ctx)}, 200
+            except Exception as e:
+                return {"error": MESSAGES["seal_failed"], "detail": str(e)}, 500
+        if action == "recheck-all":
+            return _recheck_all(ctx)
+        return {"error": "unknown action", "see": "/x/register/spec"}, 404
 
-    return {"error": "unknown_action", "action": action,
-            "GET": ["spec", "history", "verify", "list"],
-            "POST": ["seal (keyed)"]}, 404
+    return {"error": "method not allowed"}, 405
 
 ```
