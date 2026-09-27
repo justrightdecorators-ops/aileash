@@ -1,1349 +1,1576 @@
-# Codebase — part 18 of 44
+# Codebase — part 18 of 43
 
 Contains:
-- `modules/public_proof_adapter.py`
+- `modules/publish.py`
+- `modules/ratchet.py`
+- `modules/reconcile.py`
 
 
-## `modules/public_proof_adapter.py`
+## `modules/publish.py`
 
-1337 lines, 90239 bytes
+491 lines, 21976 bytes
 
 ```python
+#!/usr/bin/env python3
 """
-modules/public_proof_adapter.py  v1.4.0
-The public proof log: legacy systems send sebbi.pro the SHA-256 of a state
-change, and get back a receipt proving that hash is in an append-only log.
+modules/publish.py  -  sealing what you published, at the moment you publish it
+===============================================================================
 
-  * An RFC 6962 Merkle tree (the Certificate Transparency construction):
-        leaf hash  = SHA-256(0x00 || entry)      entry = the 32-byte state hash
-        node hash  = SHA-256(0x01 || left || right)
-    so any receipt can be checked by anyone, with any RFC 6962 verifier,
-    without trusting this server.
-  * Receipts come back straight away: leaf index, tree size, root and the
-    inclusion (audit) path.
-  * Tree heads are sealed into the sebbi.pro chain on a schedule (every 60s or
-    every 1,000 leaves, whichever comes first). That chain is walkable at
-    /x/walk and its tip is timestamped in Bitcoin with OpenTimestamps by the
-    existing anchor, so a leaf becomes Bitcoin-anchored once a confirmed
-    anchored tip is at or after the block that sealed its tree head.
-  * Hash-only. No payloads, labels or customer data are sent or stored.
-  * Idempotent: the client sends its own id with each hash, so a retry after a
-    lost response returns the original leaf instead of adding a duplicate.
+THE PROBLEM THIS EXISTS TO NEVER HAVE AGAIN
+-------------------------------------------
+Somebody asks when a page was published. You answer from git history. They
+point out - correctly - that git commit dates are fields in the commit
+object which anyone can set to anything with an environment variable before
+committing. Your strongest evidence turns out to be the weakest thing in
+the room, and it drags the credible parts down with it.
 
-Routes (clean /p/ prefix, armed by /x/public_proof_adapter/status):
+The fix is not a better argument. It is sealing the page the moment it goes
+live, so the question never depends on anybody's word again.
 
-    POST /p/submit        {"items":[{"hash":"<64 hex>","cid":"<client id>"}]}
-                          or {"hash":"<64 hex>"}      needs an API key
-    GET  /p/receipt?leaf=N        receipt against the sealed tree head
-    GET  /p/proof?leaf=N&size=M   inclusion path at tree size M
-    GET  /p/consistency?first=M&second=N   RFC 6962 consistency proof
-    GET  /p/sth                   latest sealed tree head + current size
-    GET  /p/find?hash=<64 hex>    leaf indexes holding that entry hash
-    GET  /p/                      what this log is and how to check it
+WHAT THIS DOES
+--------------
+    POST /x/publish/seal {"url": "https://example.com/spec"}
 
-Pages and downloads (1.1.0), reached from the "plug in" bubble on the homepage:
+We fetch the URL ourselves, hash exactly what was served, and seal the hash,
+the URL and the fetch time into the chain - where it is anchored externally
+and handed to peer chains like every other block.
 
-    GET  /plugin                  the customer page: two lines, downloads,
-                                  live log counts, check a receipt in the browser
-    GET  /p/sebbi_adapter.py      the client file customers drop beside their app
-    GET  /p/example_legacy_app.py the worked example
+From then on:
 
-Billing (1.4.0): the same meter as the engine - 50p per device per month.
-Each fingerprint can say which device it is about (a phone, terminal, till,
-car...), sent as a one-way hash. Every distinct device seen on the key in a
-calendar month counts once, through server.py's own record_device(), so a
-customer running one central server for 20 million phones is billed for 20
-million devices. Fingerprints with no device named count the installation
-that sent them. Free for the key's 90-day trial. When a key's trial ends unpaid, /p/submit
-answers 402 with the same Stripe checkout the engine gives (server.py's own
-trial_checkout, quantity = real devices). Receipts, proofs and every GET route
-stay free for good; the client keeps queuing and sends once paid.
+  - "this exact content was served at this address no later than T" is
+    arithmetic rather than a claim;
+  - re-sealing the same URL later builds a permanent revision history that
+    the publisher cannot edit, because each version is its own block;
+  - and anyone can check it without an account.
 
-The API key goes in the X-Sebbi-Key header (or "key" in the body). Set
-ADAPTER_OPEN=1 in Railway to accept submissions without a key (not advised).
+Seal at publication and you never argue about a publication date again. That
+is the entire point, and it takes one call.
 
-Loading: the live server loads modules through modules/router.py and calls
-handle(). ALIASES and register(MODULE_MAP) are also provided so a loader that
-maps modules by name (e.g. brain.py) can pick it up under "adapter",
-"sidecar" or "anchor".
+WHAT IT HONESTLY CANNOT DO
+--------------------------
+It cannot reach backwards. A seal made today proves the content existed
+today, not that it existed last week. Nothing can prove that - not this, not
+Bitcoin, not a notary. Timestamps are one-directional by nature.
 
-Assumes one server process (as on Railway today). If a second process ever
-writes the same database, appends detect it and reload before continuing.
+So for anything already published before it was sealed, the module records
+EXTERNAL REFERENCES alongside: a GitHub push event, a Wayback Machine
+snapshot, a DigiCert or OpenTimestamps proof. Those are stored and sealed as
+supplied. We do not verify them and we do not present them as ours - they
+are somebody else's record, named so a third party can check it at source.
+That distinction is stated in every response rather than left to be
+discovered.
+
+Two references are worth knowing about, because they are the ones that
+actually carry an earlier date:
+
+  GitHub push events   api.github.com/repos/<owner>/<repo>/events
+                       The push timestamp is recorded server-side by GitHub
+                       and cannot be set by the pusher, unlike commit dates.
+                       Retained roughly 90 days - so it must be captured
+                       while it still exists.
+
+  Wayback Machine      archive.org/wayback/available?url=...&timestamp=...
+                       An independent party with no stake in the dispute.
+                       If it caught the page, that settles it outright.
+
+FETCHING SAFELY
+---------------
+This module makes the server fetch a URL. Done naively that is a hole worse
+than the one it closes. So the fetcher speaks only http and https, only on
+ports 80 and 443, resolves the hostname first and refuses any address that
+is private, loopback, link-local, reserved or multicast, never follows a
+redirect, times out fast, and stops reading after a cap. Sealing is keyed,
+so this is not an anonymous capability either.
+
+    POST /x/publish/seal      fetch, hash and seal a live URL     (keyed)
+    GET  /x/publish/history   every version ever sealed of a URL  (public)
+    GET  /x/publish/verify    was this exact content served, when (public)
+    GET  /x/publish/list      everything sealed                   (public)
+    GET  /x/publish/spec      how to check any of it              (public)
 """
 
-import base64
 import hashlib
-import json
-import os
+import ipaddress
 import re
-import sqlite3
-import sys
-import threading
+import socket
 import time
-import urllib.parse
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from urllib.parse import urlparse
 
-VERSION = "1.4.0"
-ALIASES = ["adapter", "sidecar", "anchor"]
-PUBLIC = {("GET", "status"), ("GET", "spec"), ("GET", "sth"), ("GET", "proof"),
-          ("GET", "receipt"), ("GET", "consistency"), ("GET", "find")}
-
-KEY = "public-proof-adapter"
-SITE = "https://sebbi.pro"
-MAX_ITEMS = 500
-MAX_BODY = 262144
-CHECKPOINT_SECONDS = max(10, int(os.environ.get("ADAPTER_CHECKPOINT_SECONDS", "60") or 60))
-CHECKPOINT_EVERY = max(1, int(os.environ.get("ADAPTER_CHECKPOINT_EVERY", "1000") or 1000))
-OPEN = os.environ.get("ADAPTER_OPEN", "0") == "1"
+VERSION = "1.0"
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
-CID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,80}$")
-SPEC = ("RFC 6962 Merkle tree, SHA-256. leaf_hash = SHA256(0x00 || entry); "
-        "node = SHA256(0x01 || left || right); entry = the 32 raw bytes of the submitted hash.")
 
-_PAGE_B64 = (
-    "PCFET0NUWVBFIGh0bWw+PGh0bWwgbGFuZz0iZW4iPjxoZWFkPjxtZXRhIGNoYXJzZXQ9IlVURi04Ij4KPG1ldGEgbmFtZT0idmll"
-    "d3BvcnQiIGNvbnRlbnQ9IndpZHRoPWRldmljZS13aWR0aCxpbml0aWFsLXNjYWxlPTEsdmlld3BvcnQtZml0PWNvdmVyIj4KPHRp"
-    "dGxlPlBsdWcgaW4g4oCUIHNlYmJpLnBybzwvdGl0bGU+CjxtZXRhIG5hbWU9ImRlc2NyaXB0aW9uIiBjb250ZW50PSJUd28gbGlu"
-    "ZXMgb2YgUHl0aG9uIGFuZCBldmVyeSBjaGFuZ2UgeW91ciBzeXN0ZW0gbWFrZXMgZ2V0cyBhIHJlY2VpcHQgYW55b25lIGNhbiBj"
-    "aGVjay4gS2VlcCB5b3VyIHN0YWNrLiBBZGQgdGhlIHByb29mLiI+CjxsaW5rIGhyZWY9Imh0dHBzOi8vZm9udHMuZ29vZ2xlYXBp"
-    "cy5jb20vY3NzMj9mYW1pbHk9SUJNK1BsZXgrTW9ubzp3Z2h0QDQwMDs1MDA7NjAwJmZhbWlseT1JQk0rUGxleCtTYW5zOndnaHRA"
-    "NDAwOzUwMDs2MDAmZmFtaWx5PU5ld3NyZWFkZXI6b3Bzeix3Z2h0QDYuLjcyLDUwMCZkaXNwbGF5PXN3YXAiIHJlbD0ic3R5bGVz"
-    "aGVldCI+CjxzdHlsZT4KOnJvb3R7LS1pbms6IzA1MDcwZjstLWdvbGQ6I2M5YTg0YzstLW9rOiM3ZmUzYjA7LS1ibHVlOiM4ZmQw"
-    "ZmY7LS1tdXRlOiM4YTkzYWQ7LS1saW5lOnJnYmEoMTQzLDIwOCwyNTUsLjIyKTsKLS1tb25vOidJQk0gUGxleCBNb25vJyx1aS1t"
-    "b25vc3BhY2UsbW9ub3NwYWNlOy0tc2FuczonSUJNIFBsZXggU2Fucycsc3lzdGVtLXVpLHNhbnMtc2VyaWY7LS1zZXJpZjonTmV3"
-    "c3JlYWRlcicsR2VvcmdpYSxzZXJpZn0KKntib3gtc2l6aW5nOmJvcmRlci1ib3g7bWFyZ2luOjA7cGFkZGluZzowOy13ZWJraXQt"
-    "dGFwLWhpZ2hsaWdodC1jb2xvcjp0cmFuc3BhcmVudH0KYm9keXtiYWNrZ3JvdW5kOnJhZGlhbC1ncmFkaWVudChlbGxpcHNlIGF0"
-    "IDUwJSAwJSwjMTAyMzNlLCMwNTA3MGYgNjIlKTtjb2xvcjojZThlZGY3O2ZvbnQtZmFtaWx5OnZhcigtLXNhbnMpO2xpbmUtaGVp"
-    "Z2h0OjEuNjttaW4taGVpZ2h0OjEwMHZofQoud3JhcHttYXgtd2lkdGg6NzYwcHg7bWFyZ2luOjAgYXV0bztwYWRkaW5nOjAgMjBw"
-    "eCA4MHB4fQoudG9we2Rpc3BsYXk6ZmxleDtqdXN0aWZ5LWNvbnRlbnQ6c3BhY2UtYmV0d2VlbjthbGlnbi1pdGVtczpjZW50ZXI7"
-    "cGFkZGluZzpjYWxjKDE0cHggKyBlbnYoc2FmZS1hcmVhLWluc2V0LXRvcCkpIDAgMH0KLmJyYW5ke2ZvbnQtZmFtaWx5OnZhcigt"
-    "LW1vbm8pO2ZvbnQtc2l6ZToxM3B4fS5icmFuZCBie2NvbG9yOnZhcigtLWJsdWUpO2ZvbnQtd2VpZ2h0OjUwMH0KLnRvcCBhe2Zv"
-    "bnQtZmFtaWx5OnZhcigtLW1vbm8pO2ZvbnQtc2l6ZToxMnB4O2NvbG9yOnZhcigtLW11dGUpO3RleHQtZGVjb3JhdGlvbjpub25l"
-    "O21hcmdpbi1sZWZ0OjE0cHh9Cmgxe2ZvbnQtZmFtaWx5OnZhcigtLXNlcmlmKTtmb250LXdlaWdodDo1MDA7Zm9udC1zaXplOmNs"
-    "YW1wKDMycHgsN3Z3LDU0cHgpO2xpbmUtaGVpZ2h0OjEuMDg7bWFyZ2luOjMwcHggMCAxMnB4fQpoMntmb250LWZhbWlseTp2YXIo"
-    "LS1zZXJpZik7Zm9udC13ZWlnaHQ6NTAwO2ZvbnQtc2l6ZToyNHB4O21hcmdpbjowIDAgOHB4fQpwLmxlYWR7Y29sb3I6I2I2YzBk"
-    "Njtmb250LXNpemU6MTdweDttYXgtd2lkdGg6NTRjaH0KLmxpdmV7ZGlzcGxheTpmbGV4O2dhcDoxMHB4O21hcmdpbjoyNHB4IDAg"
-    "OHB4O2ZsZXgtd3JhcDp3cmFwfQouc3RhdHtmbGV4OjE7bWluLXdpZHRoOjE0MHB4O2JhY2tncm91bmQ6cmdiYSgxMywyMCwzNiwu"
-    "ODUpO2JvcmRlcjoxcHggc29saWQgdmFyKC0tbGluZSk7Ym9yZGVyLXJhZGl1czoxNHB4O3BhZGRpbmc6MTRweCAxNnB4fQouc3Rh"
-    "dCBie2Rpc3BsYXk6YmxvY2s7Zm9udDo2MDAgMjZweCB2YXIoLS1tb25vKTtjb2xvcjp2YXIoLS1vayk7Zm9udC12YXJpYW50LW51"
-    "bWVyaWM6dGFidWxhci1udW1zfQouc3RhdCBzcGFue2ZvbnQ6NTAwIDEycHggdmFyKC0tbW9ubyk7Y29sb3I6dmFyKC0tbXV0ZSl9"
-    "Ci5jYXJke2JhY2tncm91bmQ6cmdiYSgxMywyMCwzNiwuOCk7Ym9yZGVyOjFweCBzb2xpZCB2YXIoLS1saW5lKTtib3JkZXItcmFk"
-    "aXVzOjE2cHg7cGFkZGluZzoyMHB4O21hcmdpbi10b3A6MTZweH0KLmNhcmQgcHtjb2xvcjojYjZjMGQ2O2ZvbnQtc2l6ZToxNXB4"
-    "fQpwcmV7bWFyZ2luLXRvcDoxMnB4O2JhY2tncm91bmQ6IzAzMDUwYjtib3JkZXI6MXB4IHNvbGlkIHJnYmEoMjU1LDI1NSwyNTUs"
-    "LjA4KTtib3JkZXItcmFkaXVzOjEycHg7cGFkZGluZzoxNHB4IDE2cHg7b3ZlcmZsb3cteDphdXRvOwpmb250OjEzLjVweC8xLjYg"
-    "dmFyKC0tbW9ubyk7Y29sb3I6I2RmZThmNX0KcHJlIC5je2NvbG9yOnZhcigtLW11dGUpfXByZSAua3tjb2xvcjp2YXIoLS1ibHVl"
-    "KX1wcmUgLnN7Y29sb3I6dmFyKC0tb2spfQouc3RlcHN7Y291bnRlci1yZXNldDpzO2xpc3Qtc3R5bGU6bm9uZTttYXJnaW4tdG9w"
-    "OjEwcHh9Ci5zdGVwcyBsaXtjb3VudGVyLWluY3JlbWVudDpzO3Bvc2l0aW9uOnJlbGF0aXZlO3BhZGRpbmc6MTBweCAwIDEwcHgg"
-    "NDBweDtib3JkZXItdG9wOjFweCBzb2xpZCByZ2JhKDI1NSwyNTUsMjU1LC4wNik7Y29sb3I6I2NmZDhlYTtmb250LXNpemU6MTVw"
-    "eH0KLnN0ZXBzIGxpOmZpcnN0LWNoaWxke2JvcmRlci10b3A6MH0KLnN0ZXBzIGxpOmJlZm9yZXtjb250ZW50OmNvdW50ZXIocyk7"
-    "cG9zaXRpb246YWJzb2x1dGU7bGVmdDowO3RvcDoxMHB4O3dpZHRoOjI2cHg7aGVpZ2h0OjI2cHg7Ym9yZGVyLXJhZGl1czo4cHg7"
-    "YmFja2dyb3VuZDp2YXIoLS1ibHVlKTsKY29sb3I6IzA1MDcwZjtmb250OjYwMCAxM3B4IHZhcigtLW1vbm8pO2Rpc3BsYXk6Z3Jp"
-    "ZDtwbGFjZS1pdGVtczpjZW50ZXJ9Ci5idG5ze2Rpc3BsYXk6ZmxleDtmbGV4LXdyYXA6d3JhcDtnYXA6MTBweDttYXJnaW4tdG9w"
-    "OjE2cHh9Ci5idG57ZGlzcGxheTppbmxpbmUtZmxleDthbGlnbi1pdGVtczpjZW50ZXI7Z2FwOjhweDtwYWRkaW5nOjEzcHggMThw"
-    "eDtib3JkZXItcmFkaXVzOjEycHg7Zm9udDo2MDAgMTMuNXB4IHZhcigtLW1vbm8pO3RleHQtZGVjb3JhdGlvbjpub25lOwpiYWNr"
-    "Z3JvdW5kOnZhcigtLWJsdWUpO2NvbG9yOiMwNTA3MGY7Ym9yZGVyOjA7Y3Vyc29yOnBvaW50ZXJ9Ci5idG4uZ2hvc3R7YmFja2dy"
-    "b3VuZDp0cmFuc3BhcmVudDtjb2xvcjojZmZmO2JvcmRlcjoxcHggc29saWQgcmdiYSgyNTUsMjU1LDI1NSwuMjQpfQouYnRuOmZv"
-    "Y3VzLXZpc2libGUsaW5wdXQ6Zm9jdXMtdmlzaWJsZXtvdXRsaW5lOjJweCBzb2xpZCB2YXIoLS1vayk7b3V0bGluZS1vZmZzZXQ6"
-    "M3B4fQouZ3JpZHtkaXNwbGF5OmdyaWQ7Z3JpZC10ZW1wbGF0ZS1jb2x1bW5zOjFmcjtnYXA6MTJweDttYXJnaW4tdG9wOjEycHh9"
-    "CkBtZWRpYShtaW4td2lkdGg6NjIwcHgpey5ncmlke2dyaWQtdGVtcGxhdGUtY29sdW1uczoxZnIgMWZyfX0KLmdyaWQgZGl2e2Jh"
-    "Y2tncm91bmQ6cmdiYSgyNTUsMjU1LDI1NSwuMDMpO2JvcmRlcjoxcHggc29saWQgcmdiYSgyNTUsMjU1LDI1NSwuMDcpO2JvcmRl"
-    "ci1yYWRpdXM6MTJweDtwYWRkaW5nOjE0cHh9Ci5ncmlkIGJ7ZGlzcGxheTpibG9jaztmb250OjYwMCAxNHB4IHZhcigtLW1vbm8p"
-    "O2NvbG9yOiNmZmY7bWFyZ2luLWJvdHRvbTo0cHh9LmdyaWQgc3Bhbntmb250LXNpemU6MTRweDtjb2xvcjojYjZjMGQ2fQoucm93"
-    "e2Rpc3BsYXk6ZmxleDtnYXA6MTBweDttYXJnaW4tdG9wOjEycHh9CmlucHV0e2ZsZXg6MTttaW4td2lkdGg6MDtwYWRkaW5nOjEz"
-    "cHggMTRweDtib3JkZXItcmFkaXVzOjEycHg7Ym9yZGVyOjFweCBzb2xpZCByZ2JhKDI1NSwyNTUsMjU1LC4xOCk7YmFja2dyb3Vu"
-    "ZDojMDMwNTBiO2NvbG9yOiNmZmY7Zm9udDoxNXB4IHZhcigtLW1vbm8pfQoub3V0e21hcmdpbi10b3A6MTRweDtmb250OjEzcHgv"
-    "MS42IHZhcigtLW1vbm8pO2NvbG9yOiNjZmU2ZDk7ZGlzcGxheTpub25lO3dvcmQtYnJlYWs6YnJlYWstYWxsfQoub3V0Lm9ue2Rp"
-    "c3BsYXk6YmxvY2t9LnBhc3N7Y29sb3I6dmFyKC0tb2spO2ZvbnQtd2VpZ2h0OjYwMH0uZmFpbHtjb2xvcjojZmY4YTgwO2ZvbnQt"
-    "d2VpZ2h0OjYwMH0KLm91dCBhe2NvbG9yOnZhcigtLWJsdWUpfQoucHJpY2V7ZGlzcGxheTpmbGV4O2FsaWduLWl0ZW1zOmNlbnRl"
-    "cjtnYXA6MTRweDtmbGV4LXdyYXA6d3JhcDttYXJnaW46MjBweCAwIDRweDtwYWRkaW5nOjE2cHggMThweDtib3JkZXItcmFkaXVz"
-    "OjE2cHg7CmJhY2tncm91bmQ6cmdiYSgxNDMsMjA4LDI1NSwuMDgpO2JvcmRlcjoxcHggc29saWQgdmFyKC0tbGluZSl9Ci5wcmlj"
-    "ZSBie2ZvbnQ6NjAwIDQwcHggdmFyKC0tbW9ubyk7Y29sb3I6dmFyKC0tb2spO2xpbmUtaGVpZ2h0OjF9LnByaWNlIHNwYW57Zm9u"
-    "dDo1MDAgMTNweC8xLjQgdmFyKC0tbW9ubyk7Y29sb3I6I2NmZDhlYTtmbGV4OjE7bWluLXdpZHRoOjE1MHB4fQoucHJpY2UgLmJ0"
-    "bnttYXJnaW46MH0KLmNhbGN7bWFyZ2luLXRvcDoxNHB4O2ZvbnQ6MTVweCB2YXIoLS1tb25vKTtjb2xvcjojY2ZkOGVhfS5jYWxj"
-    "IGxhYmVse2Rpc3BsYXk6YmxvY2s7Zm9udC1zaXplOjEycHg7Y29sb3I6dmFyKC0tbXV0ZSk7bWFyZ2luLWJvdHRvbTo2cHh9Ci5j"
-    "YWxjIGlucHV0e3dpZHRoOjEwMCU7YWNjZW50LWNvbG9yOiM4ZmQwZmY7cGFkZGluZzowO2JvcmRlcjowO2JhY2tncm91bmQ6bm9u"
-    "ZX0uY2FsYyBie2NvbG9yOnZhcigtLW9rKX0KLnNtYWxse2ZvbnQtc2l6ZToxM3B4IWltcG9ydGFudDtjb2xvcjp2YXIoLS1tdXRl"
-    "KSFpbXBvcnRhbnQ7bWFyZ2luLXRvcDoxMHB4fQo8L3N0eWxlPjwvaGVhZD48Ym9keT48ZGl2IGNsYXNzPSJ3cmFwIj4KPGRpdiBj"
-    "bGFzcz0idG9wIj48ZGl2IGNsYXNzPSJicmFuZCI+c2ViYmk8Yj4ucHJvPC9iPiDCtyBQTFVHIElOPC9kaXY+PG5hdj48YSBocmVm"
-    "PSIvc3RhcnQiPlN0YXJ0PC9hPjxhIGhyZWY9Ii9wcm92ZSI+UHJvb2Y8L2E+PGEgaHJlZj0iLyI+SG9tZTwvYT48L25hdj48L2Rp"
-    "dj4KCjxoMT5LZWVwIHlvdXIgc3lzdGVtLjxicj5BZGQgdGhlIHByb29mLjwvaDE+CjxwIGNsYXNzPSJsZWFkIj5Ud28gbGluZXMg"
-    "b2YgUHl0aG9uIGFuZCBldmVyeSBjaGFuZ2UgeW91ciBzeXN0ZW0gbWFrZXMgZ2V0cyBhIHJlY2VpcHQgYW55b25lIGNhbiBjaGVj"
-    "ay4gU2FtZSBkYXRhYmFzZSwgc2FtZSBjb2RlLCBzYW1lIHNlcnZlcnMuIE9ubHkgYSBmaW5nZXJwcmludCB0cmF2ZWxzOyB5b3Vy"
-    "IGRhdGEgc3RheXMgZXhhY3RseSB3aGVyZSBpdCBpcy48L3A+CjxkaXYgY2xhc3M9InByaWNlIj48Yj41MHA8L2I+PHNwYW4+cGVy"
-    "IGRldmljZSBwZXIgbW9udGg8YnI+ZXZlcnkgcGhvbmUsIHRpbGwgb3IgbWFjaGluZSB5b3UgcmVjb3JkIGZvcjxicj5mcmVlIGZv"
-    "ciB5b3VyIGZpcnN0IDkwIGRheXM8L3NwYW4+PGEgY2xhc3M9ImJ0biIgaHJlZj0iL3N0YXJ0Ij5TdGFydCBmcmVlPC9hPjwvZGl2"
-    "PgoKPGRpdiBjbGFzcz0ibGl2ZSIgaWQ9ImxpdmUiPgogPGRpdiBjbGFzcz0ic3RhdCI+PGIgaWQ9InNpemUiPuKAlDwvYj48c3Bh"
-    "bj5lbnRyaWVzIGluIHRoZSBwdWJsaWMgbG9nPC9zcGFuPjwvZGl2PgogPGRpdiBjbGFzcz0ic3RhdCI+PGIgaWQ9InNlYWxlZCI+"
-    "4oCUPC9iPjxzcGFuPmxhc3QgdHJlZSBoZWFkIHNlYWxlZCBpbiBibG9jazwvc3Bhbj48L2Rpdj4KPC9kaXY+Cgo8ZGl2IGNsYXNz"
-    "PSJjYXJkIj4KIDxoMj5UaGUgdHdvIGxpbmVzPC9oMj4KIDxwPlB1dCB0aGUgaW1wb3J0IGF0IHRoZSB0b3AgYW5kIHRoZSBsaW5l"
-    "IGFib3ZlIGFueSBmdW5jdGlvbiB0aGF0IGNoYW5nZXMgc29tZXRoaW5nIGltcG9ydGFudC4gSXQgY2FycmllcyBvbiB3b3JraW5n"
-    "IGV4YWN0bHkgYXMgYmVmb3JlLjwvcD4KPHByZT48c3BhbiBjbGFzcz0iayI+ZnJvbTwvc3Bhbj4gc2ViYmlfYWRhcHRlciA8c3Bh"
-    "biBjbGFzcz0iayI+aW1wb3J0PC9zcGFuPiBhbmNob3Jfc3RhdGUKPHNwYW4gY2xhc3M9ImsiPkBhbmNob3Jfc3RhdGU8L3NwYW4+"
-    "KDxzcGFuIGNsYXNzPSJzIj4ib3JkZXJzLnVwZGF0ZSI8L3NwYW4+LCBkZXZpY2U9PHNwYW4gY2xhc3M9InMiPiJoYW5kc2V0Ijwv"
-    "c3Bhbj4pCjxzcGFuIGNsYXNzPSJrIj5kZWY8L3NwYW4+IHVwZGF0ZV9vcmRlcihvcmRlcl9pZCwgc3RhdHVzLCBoYW5kc2V0KToK"
-    "ICAgIC4uLiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIDxzcGFuIGNsYXNzPSJjIj4jIHlvdXIgY29kZSwgdW5jaGFuZ2Vk"
-    "PC9zcGFuPgogICAgPHNwYW4gY2xhc3M9ImsiPnJldHVybjwvc3Bhbj4gezxzcGFuIGNsYXNzPSJzIj4ib3JkZXJfaWQiPC9zcGFu"
-    "Pjogb3JkZXJfaWQsIDxzcGFuIGNsYXNzPSJzIj4ic3RhdHVzIjwvc3Bhbj46IHN0YXR1c308L3ByZT4KIDxvbCBjbGFzcz0ic3Rl"
-    "cHMiPgogIDxsaT5Eb3dubG9hZCA8Yj5zZWJiaV9hZGFwdGVyLnB5PC9iPiBhbmQgcHV0IGl0IG5leHQgdG8geW91ciBjb2RlLiBO"
-    "byBpbnN0YWxscywgbm90aGluZyBlbHNlIHRvIGFkZC48L2xpPgogIDxsaT5TZXQgeW91ciBzZWJiaS5wcm8ga2V5OiA8Y29kZT5T"
-    "RUJCSV9BUElfS0VZPXlvdXIta2V5PC9jb2RlPjwvbGk+CiAgPGxpPkFkZCB0aGUgZGVjb3JhdG9yLCBhbmQgbmFtZSB0aGUgZGV2"
-    "aWNlIGVhY2ggY2hhbmdlIGlzIGFib3V0LiBSZWNlaXB0cyBhcnJpdmUgaW4gdGhlIGJhY2tncm91bmQgZnJvbSB0aGVuIG9uLjwv"
-    "bGk+CiA8L29sPgogPGRpdiBjbGFzcz0iYnRucyI+CiAgPGEgY2xhc3M9ImJ0biIgaHJlZj0iL3Avc2ViYmlfYWRhcHRlci5weSIg"
-    "ZG93bmxvYWQ+RG93bmxvYWQgc2ViYmlfYWRhcHRlci5weTwvYT4KICA8YSBjbGFzcz0iYnRuIGdob3N0IiBocmVmPSIvcC9leGFt"
-    "cGxlX2xlZ2FjeV9hcHAucHkiIGRvd25sb2FkPldvcmtlZCBleGFtcGxlPC9hPgogIDxhIGNsYXNzPSJidG4gZ2hvc3QiIGhyZWY9"
-    "Ii9zdGFydCI+R2V0IGEga2V5PC9hPgogPC9kaXY+CjwvZGl2PgoKPGRpdiBjbGFzcz0iY2FyZCI+CiA8aDI+QnVpbHQgZm9yIHRo"
-    "ZSByZWNvcmRzIHRoYXQgbWF0dGVyPC9oMj4KIDxkaXYgY2xhc3M9ImdyaWQiPgogIDxkaXY+PGI+UGF5bWVudHMgJmFtcDsgYmFs"
-    "YW5jZXM8L2I+PHNwYW4+RXZlcnkgZGViaXQsIGNyZWRpdCBhbmQgcmVmdW5kIGNhcnJpZXMgaXRzIG93biByZWNlaXB0LiBQcm92"
-    "ZSB3aGF0IGEgYmFsYW5jZSB3YXMsIGFuZCB3aGVuLjwvc3Bhbj48L2Rpdj4KICA8ZGl2PjxiPkFJIGRlY2lzaW9uczwvYj48c3Bh"
-    "bj5GaW5nZXJwcmludCB3aGF0IHRoZSBtb2RlbCBkZWNpZGVkIGFuZCB3aHksIHRoZSBtb21lbnQgaXQgZGVjaWRlcy4gVGhlIEVV"
-    "IEFJIEFjdCBhc2tzIGZvciBleGFjdGx5IHRoaXMgcmVjb3JkLjwvc3Bhbj48L2Rpdj4KICA8ZGl2PjxiPk9yZGVycyAmYW1wOyBz"
-    "dG9jazwvYj48c3Bhbj5FdmVyeSBzdGF0dXMgY2hhbmdlIG9uIHRoZSByZWNvcmQsIGluIG9yZGVyLCBwcm92YWJsZSB0byBhIGN1"
-    "c3RvbWVyLCBzdXBwbGllciBvciBjb3VydC48L3NwYW4+PC9kaXY+CiAgPGRpdj48Yj5IZWFsdGggJmFtcDsgbGVnYWwgZmlsZXM8"
-    "L2I+PHNwYW4+UHJvdmUgYSByZWNvcmQgaGFzbid0IGNoYW5nZWQgc2luY2UgdGhlIGRheSBpdCB3YXMgd3JpdHRlbiwgd2l0aG91"
-    "dCBldmVyIHNlbmRpbmcgdGhlIHJlY29yZCBhbnl3aGVyZS48L3NwYW4+PC9kaXY+CiAgPGRpdj48Yj5Mb2dzICZhbXA7IGF1ZGl0"
-    "IHRyYWlsczwvYj48c3Bhbj5QbHVnIGl0IGludG8geW91ciBleGlzdGluZyBsb2dnZXIgYW5kIGV2ZXJ5IGxpbmUgYmVjb21lcyBl"
-    "dmlkZW5jZSBub2JvZHkgY2FuIHF1aWV0bHkgZWRpdC48L3NwYW4+PC9kaXY+CiAgPGRpdj48Yj5Bbnl0aGluZyB5b3UnZCBkZWZl"
-    "bmQ8L2I+PHNwYW4+SWYgeW91J2QgZXZlciBuZWVkIHRvIHNob3cgd2hhdCB5b3VyIHN5c3RlbSBkaWQsIGFuZCB3aGVuLCBpdCBi"
-    "ZWxvbmdzIGhlcmUuPC9zcGFuPjwvZGl2PgogPC9kaXY+CjwvZGl2PgoKPGRpdiBjbGFzcz0iY2FyZCI+CiA8aDI+T25lIHByaWNl"
-    "IHBlciBkZXZpY2UsIGhvd2V2ZXIgbXVjaCBpdCByZWNvcmRzPC9oMj4KIDxwPkV2ZXJ5IHBob25lLCB0aWxsLCB0ZXJtaW5hbCBv"
-    "ciBtYWNoaW5lIHlvdXIgc3lzdGVtIHJlY29yZHMgZm9yIGlzIG9uZSBkZXZpY2UsIGNvdW50ZWQgb25jZSBhIG1vbnRoLCB3aGV0"
-    "aGVyIGl0IG1ha2VzIHRlbiBjaGFuZ2VzIG9yIHRlbiBtaWxsaW9uLiBSdW4gaXQgb24gb25lIHNlcnZlciBvciBhIHRob3VzYW5k"
-    "OiB0aGUgY291bnQgaXMgdGhlIGRldmljZXMsIG5vdCB0aGUgc2VydmVycy48L3A+CiA8ZGl2IGNsYXNzPSJjYWxjIj48bGFiZWwg"
-    "Zm9yPSJkZXYiPkRldmljZXM8L2xhYmVsPjxpbnB1dCBpZD0iZGV2IiB0eXBlPSJyYW5nZSIgbWluPSIwIiBtYXg9IjEwMCIgdmFs"
-    "dWU9IjMwIiBhcmlhLWxhYmVsPSJEZXZpY2VzIj48ZGl2PjxiIGlkPSJkZXZuIj4yMDwvYj4gZGV2aWNlcyA9IDxiIGlkPSJjb3N0"
-    "Ij7CozEwLjAwPC9iPiBhIG1vbnRoPC9kaXY+PC9kaXY+CiA8cCBjbGFzcz0ic21hbGwiPkZyb20gb25lIGRldmljZSB0byB0ZW4g"
-    "bWlsbGlvbi4gRnJlZSBmb3IgdGhlIGZpcnN0IDkwIGRheXMgb24gYSBuZXcga2V5LCBubyBjYXJkIHRvIHN0YXJ0LiBSZWNlaXB0"
-    "cyBhbmQgcHJvb2ZzIHN0YXkgeW91cnMgZm9yIGdvb2QuPC9wPgo8L2Rpdj4KCjxkaXYgY2xhc3M9ImNhcmQiPgogPGgyPldoYXQg"
-    "eW91IGdldDwvaDI+CiA8ZGl2IGNsYXNzPSJncmlkIj4KICA8ZGl2PjxiPk5ldmVyIHNsb3dzIHlvdSBkb3duPC9iPjxzcGFuPkZp"
-    "bmdlcnByaW50cyBxdWV1ZSBvbiB5b3VyIG93biBtYWNoaW5lIGFuZCBzZW5kIGluIHRoZSBiYWNrZ3JvdW5kLiBZb3VyIGFwcCBu"
-    "ZXZlciB3YWl0cyBvbiB0aGUgbmV0d29yay48L3NwYW4+PC9kaXY+CiAgPGRpdj48Yj5LZWVwcyBnb2luZyBvZmZsaW5lPC9iPjxz"
-    "cGFuPklmIHNlYmJpLnBybyBjYW4ndCBiZSByZWFjaGVkLCBldmVyeXRoaW5nIHdhaXRzIHNhZmVseSBhbmQgc2VuZHMgaW4gb3Jk"
-    "ZXIgd2hlbiBpdCdzIGJhY2suIE5vdGhpbmcgbG9zdCwgbm90aGluZyBkb3VibGVkLjwvc3Bhbj48L2Rpdj4KICA8ZGl2PjxiPkNo"
-    "ZWNrcyB0aGUgYW5zd2VyPC9iPjxzcGFuPkV2ZXJ5IHJlY2VpcHQgaXMgdmVyaWZpZWQgb24geW91ciBzaWRlIHRoZSBtb21lbnQg"
-    "aXQgYXJyaXZlcywgc28geW91J3JlIG5vdCB0YWtpbmcgb3VyIHdvcmQgZm9yIGl0Ljwvc3Bhbj48L2Rpdj4KICA8ZGl2PjxiPkFu"
-    "Y2hvcmVkIGluIEJpdGNvaW48L2I+PHNwYW4+VGhlIGxvZyBpcyBzZWFsZWQgaW50byB0aGUgc2ViYmkucHJvIGNoYWluIGV2ZXJ5"
-    "IG1pbnV0ZSwgYW5kIHRoZSBjaGFpbiBpcyB0aW1lc3RhbXBlZCBpbiBCaXRjb2luLjwvc3Bhbj48L2Rpdj4KICA8ZGl2PjxiPlN0"
-    "YW5kYXJkIHByb29mczwvYj48c3Bhbj5UaGUgc2FtZSBNZXJrbGUtdHJlZSByZWNlaXB0cyB0aGF0IHNlY3VyZSB3ZWIgY2VydGlm"
-    "aWNhdGVzIChSRkMgNjk2MikuIEFueSBjb21wYXRpYmxlIGNoZWNrZXIgY2FuIHZlcmlmeSB0aGVtLjwvc3Bhbj48L2Rpdj4KICA8"
-    "ZGl2PjxiPldvcmtzIHdpdGggYW55dGhpbmc8L2I+PHNwYW4+RGF0YWJhc2Ugd3JpdGVzLCBBUEkgaGFuZGxlcnMsIGFzeW5jIGNv"
-    "ZGUgYW5kIHlvdXIgZXhpc3RpbmcgbG9nZ2Vycy4gUHl0aG9uIDMuOCBhbmQgdXAuPC9zcGFuPjwvZGl2PgogPC9kaXY+CjwvZGl2"
-    "PgoKPGRpdiBjbGFzcz0iY2FyZCIgaWQ9ImNoZWNrIj4KIDxoMj5DaGVjayBhIHJlY2VpcHQ8L2gyPgogPHA+VHlwZSBhbiBlbnRy"
-    "eSBudW1iZXIuIFlvdXIgYnJvd3NlciBmZXRjaGVzIHRoZSByZWNlaXB0IGFuZCBjaGVja3MgdGhlIG1hdGhzIGl0c2VsZi48L3A+"
-    "CiA8ZGl2IGNsYXNzPSJyb3ciPjxpbnB1dCBpZD0ibGVhZiIgaW5wdXRtb2RlPSJudW1lcmljIiBwbGFjZWhvbGRlcj0iRW50cnkg"
-    "bnVtYmVyLCBlLmcuIDAiIGFyaWEtbGFiZWw9IkVudHJ5IG51bWJlciI+PGJ1dHRvbiBjbGFzcz0iYnRuIiBpZD0iZ28iPkNoZWNr"
-    "PC9idXR0b24+PC9kaXY+CiA8ZGl2IGNsYXNzPSJvdXQiIGlkPSJvdXQiPjwvZGl2Pgo8L2Rpdj4KPC9kaXY+CjxzY3JpcHQ+Cihm"
-    "dW5jdGlvbigpewoidXNlIHN0cmljdCI7CmZ1bmN0aW9uICQoaSl7cmV0dXJuIGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKGkpfQpm"
-    "dW5jdGlvbiBoZXgyYihoKXt2YXIgYT1uZXcgVWludDhBcnJheShoLmxlbmd0aC8yKTtmb3IodmFyIGk9MDtpPGEubGVuZ3RoO2kr"
-    "KylhW2ldPXBhcnNlSW50KGguc3Vic3RyKGkqMiwyKSwxNik7cmV0dXJuIGF9CmZ1bmN0aW9uIGIyaGV4KGIpe3JldHVybiBBcnJh"
-    "eS5wcm90b3R5cGUubWFwLmNhbGwobmV3IFVpbnQ4QXJyYXkoYiksZnVuY3Rpb24oeCl7cmV0dXJuKCIwIit4LnRvU3RyaW5nKDE2"
-    "KSkuc2xpY2UoLTIpfSkuam9pbigiIil9CmZ1bmN0aW9uIGNhdCgpe3ZhciBuPTAsaTtmb3IoaT0wO2k8YXJndW1lbnRzLmxlbmd0"
-    "aDtpKyspbis9YXJndW1lbnRzW2ldLmxlbmd0aDt2YXIgbz1uZXcgVWludDhBcnJheShuKSxwPTA7Zm9yKGk9MDtpPGFyZ3VtZW50"
-    "cy5sZW5ndGg7aSsrKXtvLnNldChhcmd1bWVudHNbaV0scCk7cCs9YXJndW1lbnRzW2ldLmxlbmd0aH1yZXR1cm4gb30KZnVuY3Rp"
-    "b24gSChiKXtyZXR1cm4gY3J5cHRvLnN1YnRsZS5kaWdlc3QoIlNIQS0yNTYiLGIpLnRoZW4oZnVuY3Rpb24oZCl7cmV0dXJuIG5l"
-    "dyBVaW50OEFycmF5KGQpfSl9CmZ1bmN0aW9uIHZlcmlmeShlbnRyeSxpZHgsc2l6ZSxwYXRoLHJvb3QpewogaWYoaWR4PDB8fGlk"
-    "eD49c2l6ZSlyZXR1cm4gUHJvbWlzZS5yZXNvbHZlKGZhbHNlKTsKIHZhciBmbj1pZHgsc249c2l6ZS0xOwogcmV0dXJuIEgoY2F0"
-    "KG5ldyBVaW50OEFycmF5KFswXSksaGV4MmIoZW50cnkpKSkudGhlbihmdW5jdGlvbihyKXsKICB2YXIgY2hhaW49UHJvbWlzZS5y"
-    "ZXNvbHZlKHIpLGJhZD1mYWxzZTsKICBwYXRoLmZvckVhY2goZnVuY3Rpb24ocGgpewogICBjaGFpbj1jaGFpbi50aGVuKGZ1bmN0"
-    "aW9uKHIpewogICAgdmFyIHA9aGV4MmIocGgpOwogICAgaWYoc249PT0wKXtiYWQ9dHJ1ZTtyZXR1cm4gcn0KICAgIHZhciBwcjsK"
-    "ICAgIGlmKChmbiYxKXx8Zm49PT1zbil7cHI9SChjYXQobmV3IFVpbnQ4QXJyYXkoWzFdKSxwLHIpKTtpZighKGZuJjEpKXt3aGls"
-    "ZSghKGZuJjEpJiZmbiE9PTApe2ZuPj49MTtzbj4+PTF9fX0KICAgIGVsc2UgcHI9SChjYXQobmV3IFVpbnQ4QXJyYXkoWzFdKSxy"
-    "LHApKTsKICAgIGZuPj49MTtzbj4+PTE7cmV0dXJuIHByfSk7CiAgfSk7CiAgcmV0dXJuIGNoYWluLnRoZW4oZnVuY3Rpb24ocil7"
-    "cmV0dXJuICFiYWQmJnNuPT09MCYmYjJoZXgocik9PT1yb290fSk7CiB9KTsKfQp2YXIgZHY9JCgiZGV2Iik7ZnVuY3Rpb24gcHJp"
-    "Y2UoKXt2YXIgdj0rZHYudmFsdWUsbj1NYXRoLm1heCgxLE1hdGgucm91bmQoTWF0aC5wb3coMTAsdi8xMDAqNykpKTsKIG49bjwx"
-    "MDA/bjoobjwxMDAwMD9NYXRoLnJvdW5kKG4vMTApKjEwOk1hdGgucm91bmQobi8xMDAwKSoxMDAwKTskKCJkZXZuIikudGV4dENv"
-    "bnRlbnQ9bi50b0xvY2FsZVN0cmluZygiZW4tR0IiKTsKICQoImNvc3QiKS50ZXh0Q29udGVudD0iwqMiKyhuKjAuNSkudG9Mb2Nh"
-    "bGVTdHJpbmcoImVuLUdCIix7bWluaW11bUZyYWN0aW9uRGlnaXRzOjIsbWF4aW11bUZyYWN0aW9uRGlnaXRzOjJ9KX0KZHYuYWRk"
-    "RXZlbnRMaXN0ZW5lcigiaW5wdXQiLHByaWNlKTtwcmljZSgpOwpmZXRjaCgiL3Avc3RoIix7Y2FjaGU6Im5vLXN0b3JlIn0pLnRo"
-    "ZW4oZnVuY3Rpb24ocil7cmV0dXJuIHIuanNvbigpfSkudGhlbihmdW5jdGlvbihkKXsKICQoInNpemUiKS50ZXh0Q29udGVudD0o"
-    "ZC50cmVlX3NpemV8fDApLnRvTG9jYWxlU3RyaW5nKCJlbi1HQiIpOwogdmFyIHM9ZC5sYXRlc3Rfc2VhbGVkX3RyZWVfaGVhZDsk"
-    "KCJzZWFsZWQiKS50ZXh0Q29udGVudD1zJiZzLmJsb2NrX2luZGV4IT1udWxsP3MuYmxvY2tfaW5kZXg6IuKAlCI7Cn0pLmNhdGNo"
-    "KGZ1bmN0aW9uKCl7fSk7CmZ1bmN0aW9uIHJ1bigpewogdmFyIG49cGFyc2VJbnQoJCgibGVhZiIpLnZhbHVlLDEwKSxvPSQoIm91"
-    "dCIpO28uY2xhc3NOYW1lPSJvdXQgb24iOwogaWYoaXNOYU4obil8fG48MCl7by50ZXh0Q29udGVudD0iVHlwZSBhbiBlbnRyeSBu"
-    "dW1iZXIgKDAgb3IgbW9yZSkuIjtyZXR1cm59CiBvLnRleHRDb250ZW50PSJGZXRjaGluZyBlbnRyeSAiK24rIuKApiI7CiBmZXRj"
-    "aCgiL3AvcmVjZWlwdD9sZWFmPSIrbix7Y2FjaGU6Im5vLXN0b3JlIn0pLnRoZW4oZnVuY3Rpb24ocil7cmV0dXJuIHIuanNvbigp"
-    "fSkudGhlbihmdW5jdGlvbihkKXsKICBpZihkLmVycm9yKXtvLnRleHRDb250ZW50PSJObyBlbnRyeSAiK24rIiB5ZXQuIjtyZXR1"
-    "cm59CiAgcmV0dXJuIHZlcmlmeShkLmVudHJ5X2hhc2gsZC5sZWFmX2luZGV4LGQudHJlZV9zaXplLGQuYXVkaXRfcGF0aCxkLnJv"
-    "b3QpLnRoZW4oZnVuY3Rpb24ob2spewogICB2YXIgY3A9ZC5jaGVja3BvaW50OwogICBvLmlubmVySFRNTD0ob2s/JzxzcGFuIGNs"
-    "YXNzPSJwYXNzIj5QQVNTPC9zcGFuPiBjaGVja2VkIGluIHlvdXIgYnJvd3NlcjogZW50cnkgJzonPHNwYW4gY2xhc3M9ImZhaWwi"
-    "PkZBSUw8L3NwYW4+IHRoZSBtYXRocyBkb2VzIG5vdCBhZGQgdXAgZm9yIGVudHJ5ICcpK24rCiAgICIgaXMgaW4gdGhlIGxvZyBv"
-    "ZiAiK2QudHJlZV9zaXplKyIgZW50cmllcy48YnI+RmluZ2VycHJpbnQ6ICIrZC5lbnRyeV9oYXNoKyI8YnI+Um9vdDogIitkLnJv"
-    "b3QrCiAgIChjcCYmY3AuYmxvY2tfaW5kZXghPW51bGw/Jzxicj5TZWFsZWQgaW4gY2hhaW4gYmxvY2sgPGEgaHJlZj0iL3gvd2Fs"
-    "ay9ibG9jaz9pbmRleD0nK2NwLmJsb2NrX2luZGV4KyciPicrY3AuYmxvY2tfaW5kZXgrIjwvYT4iOiI8YnI+U2VhbGluZyBpbnRv"
-    "IHRoZSBjaGFpbiB3aXRoaW4gdGhlIG1pbnV0ZS4iKTsKICB9KTsKIH0pLmNhdGNoKGZ1bmN0aW9uKCl7by50ZXh0Q29udGVudD0i"
-    "Q291bGRuJ3QgcmVhY2ggdGhlIGxvZy4ifSk7Cn0KJCgiZ28iKS5vbmNsaWNrPXJ1bjskKCJsZWFmIikuYWRkRXZlbnRMaXN0ZW5l"
-    "cigia2V5ZG93biIsZnVuY3Rpb24oZSl7aWYoZS5rZXk9PT0iRW50ZXIiKXJ1bigpfSk7CmlmKGxvY2F0aW9uLmhhc2g9PT0iI2No"
-    "ZWNrIikkKCJsZWFmIikuZm9jdXMoKTsKfSkoKTsKPC9zY3JpcHQ+PC9ib2R5PjwvaHRtbD4K"
-)
-_ADAPTER_B64 = (
-    "IiIiCnNlYmJpX2FkYXB0ZXIucHkgIHYxLjEuMCAtIGRyb3AtaW4gc3RhdGUgYW5jaG9yaW5nIGZvciBsZWdhY3kgYXBwbGljYXRp"
-    "b25zLgoKWW91ciBhcHBsaWNhdGlvbiBrZWVwcyBpdHMgZGF0YWJhc2UsIGl0cyBsb2dpYyBhbmQgaXRzIGluZnJhc3RydWN0dXJl"
-    "LiBUaGlzCmZpbGUgc2l0cyBiZXNpZGUgaXQ6IGV2ZXJ5IHN0YXRlIGNoYW5nZSB5b3UgcG9pbnQgaXQgYXQgaXMgdHVybmVkIGlu"
-    "dG8gYQpTSEEtMjU2IGZpbmdlcnByaW50LCBxdWV1ZWQgbG9jYWxseSwgYW5kIHNlbnQgaW4gdGhlIGJhY2tncm91bmQgdG8gdGhl"
-    "CnNlYmJpLnBybyBwdWJsaWMgcHJvb2YgbG9nLCB3aGljaCByZXR1cm5zIGEgcmVjZWlwdCBwcm92aW5nIHRoZSBmaW5nZXJwcmlu"
-    "dAppcyBpbiBhbiBhcHBlbmQtb25seSBSRkMgNjk2MiBNZXJrbGUgdHJlZSB3aG9zZSB0cmVlIGhlYWRzIGFyZSBzZWFsZWQgaW50"
-    "byB0aGUKc2ViYmkucHJvIGNoYWluIGFuZCB0aW1lc3RhbXBlZCBpbiBCaXRjb2luLgoKT25seSB0aGUgZmluZ2VycHJpbnQgbGVh"
-    "dmVzIHlvdXIgbWFjaGluZS4gVGhlIGRhdGEgaXRzZWxmIG5ldmVyIGRvZXMuCgpUV08gTElORVMKLS0tLS0tLS0tCiAgICBleHBv"
-    "cnQgU0VCQklfQVBJX0tFWT15b3VyLWtleSAgICAgICAgICAob25jZSwgaW4gdGhlIGVudmlyb25tZW50KQoKICAgIGZyb20gc2Vi"
-    "YmlfYWRhcHRlciBpbXBvcnQgYW5jaG9yX3N0YXRlCiAgICBAYW5jaG9yX3N0YXRlKCJvcmRlcnMudXBkYXRlIikKICAgIGRlZiB1"
-    "cGRhdGVfb3JkZXIob3JkZXJfaWQsIHN0YXR1cyk6CiAgICAgICAgLi4uICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
-    "IyB1bmNoYW5nZWQKICAgICAgICByZXR1cm4geyJvcmRlcl9pZCI6IG9yZGVyX2lkLCAic3RhdHVzIjogc3RhdHVzfQoKTmFtZSB0"
-    "aGUgZGV2aWNlIGVhY2ggY2hhbmdlIGlzIGFib3V0IChhIHBob25lLCB0aWxsLCB0ZXJtaW5hbCwgY2FyKSBhbmQgaXQgaXMKbWV0"
-    "ZXJlZCBwZXIgZGV2aWNlLCB0aGUgc2FtZSBhcyB0aGUgc2ViYmkucHJvIGVuZ2luZToKCiAgICBAYW5jaG9yX3N0YXRlKCJjYWxs"
-    "cy5yb3V0ZSIsIGRldmljZT0iaGFuZHNldF9pZCIpICAgICMgYSBmaWVsZCBpbiB0aGUgcmVzdWx0CiAgICBAYW5jaG9yX3N0YXRl"
-    "KCJwb3Muc2FsZSIsIGRldmljZT1sYW1iZGEgcmVzdWx0LCBhcmdzLCBrd2FyZ3M6IHJlc3VsdFsidGlsbCJdKQogICAgcmVjb3Jk"
-    "KHsiYWNjb3VudCI6IDQyLCAiYmFsYW5jZSI6IDEyNTB9LCBkZXZpY2U9IklNRUktMzUuLi4iKQoKRGV2aWNlIG5hbWVzIGFyZSBv"
-    "bmUtd2F5IGhhc2hlZCBvbiB5b3VyIG1hY2hpbmUgYmVmb3JlIHRoZXkgYXJlIHNlbnQuCgpUaGUgcmV0dXJuIHZhbHVlIGlzIGZp"
-    "bmdlcnByaW50ZWQgYWZ0ZXIgdGhlIGZ1bmN0aW9uIHN1Y2NlZWRzLiBUaGUgY2FsbCBpcwpuZXZlciBzbG93ZWQgZG93biBieSB0"
-    "aGUgbmV0d29yayBhbmQgbmV2ZXIgZmFpbHMgYmVjYXVzZSBvZiB0aGlzIGZpbGU6CmZpbmdlcnByaW50cyBnbyBpbnRvIGEgbG9j"
-    "YWwgYXBwZW5kLW9ubHkgcXVldWUgKHNxbGl0ZSkgYW5kIGEgYmFja2dyb3VuZAp0aHJlYWQgc2VuZHMgdGhlbS4gSWYgc2ViYmku"
-    "cHJvIGlzIHVucmVhY2hhYmxlIHRoZXkgd2FpdCwgYW5kIGFyZSBzZW50IHdoZW4gaXQKY29tZXMgYmFjaywgaW4gb3JkZXIsIHdp"
-    "dGggbm8gZHVwbGljYXRlcy4KCk9USEVSIFdBWVMgSU4KLS0tLS0tLS0tLS0tLQogICAgZnJvbSBzZWJiaV9hZGFwdGVyIGltcG9y"
-    "dCByZWNvcmQsIEFuY2hvckxvZ0hhbmRsZXIKICAgIHJlY29yZCh7ImFjY291bnQiOiA0MiwgImJhbGFuY2UiOiAxMjUwfSkgICAg"
-    "ICAgICAgIyBhbnl3aGVyZSwgcmV0dXJucyB0aGUgaGFzaAogICAgbG9nZ2luZy5nZXRMb2dnZXIoInBheW1lbnRzIikuYWRkSGFu"
-    "ZGxlcihBbmNob3JMb2dIYW5kbGVyKCkpICAgIyBldmVyeSBsb2cgbGluZQoKICAgIEBhbmNob3Jfc3RhdGUoImxlZGdlci5wb3N0"
-    "IiwgY2FwdHVyZT0iYXJncyIpICAgICAgIyBmaW5nZXJwcmludCB0aGUgaW5wdXRzIGluc3RlYWQKICAgIEBhbmNob3Jfc3RhdGUo"
-    "InVzZXIuc2F2ZSIsIGV4dHJhY3Q9bGFtYmRhIHJlc3VsdCwgYXJncywga3dhcmdzOiByZXN1bHQudG9fZGljdCgpKQoKQXN5bmMg"
-    "ZnVuY3Rpb25zIHdvcmsgdGhlIHNhbWUgd2F5LgoKQ0hFQ0tJTkcKLS0tLS0tLS0KICAgIHB5dGhvbiBzZWJiaV9hZGFwdGVyLnB5"
-    "IHN0YXR1cyAgICAgICAgICAgIHF1ZXVlIGFuZCByZWNlaXB0IGNvdW50cwogICAgcHl0aG9uIHNlYmJpX2FkYXB0ZXIucHkgZmx1"
-    "c2ggICAgICAgICAgICAgc2VuZCB3aGF0IGlzIHdhaXRpbmcsIG5vdwogICAgcHl0aG9uIHNlYmJpX2FkYXB0ZXIucHkgcmVjZWlw"
-    "dCA8aGFzaD4gICAgdGhlIHJlY2VpcHQgZm9yIG9uZSBmaW5nZXJwcmludAogICAgcHl0aG9uIHNlYmJpX2FkYXB0ZXIucHkgdmVy"
-    "aWZ5ICAgICAgICAgICAgcmUtY2hlY2sgZXZlcnkgc3RvcmVkIHJlY2VpcHQgbG9jYWxseQogICAgcHl0aG9uIHNlYmJpX2FkYXB0"
-    "ZXIucHkgaGFzaCAnPGpzb24+JyAgICAgZmluZ2VycHJpbnQgYSBKU09OIHZhbHVlIGV4YWN0bHkgYXMgdGhlIGFkYXB0ZXIgd291"
-    "bGQKCkV2ZXJ5IHJlY2VpcHQgaXMgY2hlY2tlZCBvbiBhcnJpdmFsIHdpdGggYW4gUkZDIDY5NjIgaW5jbHVzaW9uIGNoZWNrLCBz"
-    "byB0aGUKc2VydmVyJ3MgYW5zd2VyIGlzIHZlcmlmaWVkLCBub3QgdHJ1c3RlZC4gQSByZWNlaXB0IHRoYXQgZmFpbHMgdGhlIGNo"
-    "ZWNrIGlzCmtlcHQgKGFzIGV2aWRlbmNlKSBhbmQgZmxhZ2dlZC4KCkZJTkdFUlBSSU5UIFJVTEUgKHNvIGFueW9uZSBjYW4gcmVj"
-    "b21wdXRlIGl0KQotLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KU0hBLTI1NiBvdmVyIGNhbm9u"
-    "aWNhbCBKU09OOiBrZXlzIHNvcnRlZCwgc2VwYXJhdG9ycyAiLCIgYW5kICI6IiwgVVRGLTgsIG5vCmV4dHJhIHdoaXRlc3BhY2Uu"
-    "IGRhdGV0aW1lL2RhdGUgLT4gSVNPIDg2MDEgc3RyaW5nLCBEZWNpbWFsIC0+IHN0cmluZywKYnl0ZXMgLT4gaGV4LCBzZXQgLT4g"
-    "c29ydGVkIGxpc3QsIFVVSUQgLT4gc3RyaW5nLCBkYXRhY2xhc3MgLT4gaXRzIGZpZWxkcywKb2JqZWN0cyB3aXRoIHRvX2RpY3Qo"
-    "KS9fYXNkaWN0KCkgLT4gdGhhdC4gRmxvYXRzIHVzZSBQeXRob24ncyByZXByLiBBbnl0aGluZwplbHNlIGlzIHJlZnVzZWQgKGFu"
-    "ZCBsb2dnZWQpIHJhdGhlciB0aGFuIGd1ZXNzZWQgYXQgLSBwYXNzIGV4dHJhY3Q9IGZvciB0aG9zZS4KClBSSUNFCi0tLS0tCkZy"
-    "ZWUgZm9yIDkwIGRheXMgb24gYSBuZXcgc2ViYmkucHJvIGtleSwgdGhlbiA1MHAgcGVyIGRldmljZSBwZXIgbW9udGg6CmV2ZXJ5"
-    "IGRpc3RpbmN0IGRldmljZSB5b3VyIHJlY29yZHMgYXJlIGFib3V0LCBjb3VudGVkIG9uY2UgaW4gYSBjYWxlbmRhcgptb250aCBo"
-    "b3dldmVyIG1hbnkgY2hhbmdlcyBpdCBtYWtlcy4gUmVjb3JkcyB3aXRoIG5vIGRldmljZSBuYW1lZCBjb3VudCB0aGUKbWFjaGlu"
-    "ZSBydW5uaW5nIHRoaXMgZmlsZS4KClNFVFRJTkdTIChlbnZpcm9ubWVudCBvciBBbmNob3IoLi4uKSBhcmd1bWVudHMpCi0tLS0t"
-    "LS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCiAgICBTRUJCSV9BUElfS0VZICAgICAgICB5b3VyIGtl"
-    "eSAod2l0aG91dCBpdCwgZmluZ2VycHJpbnRzIHF1ZXVlIGFuZCB3YWl0KQogICAgU0VCQklfRU5EUE9JTlQgICAgICAgZGVmYXVs"
-    "dCBodHRwczovL3NlYmJpLnBybwogICAgU0VCQklfREIgICAgICAgICAgICAgZGVmYXVsdCAuL3NlYmJpX2FuY2hvci5kYgogICAg"
-    "U0VCQklfREVWSUNFX0lEICAgICAgbmFtZSB0aGlzIG1hY2hpbmUgeW91cnNlbGYgKGRlZmF1bHQ6IG1hZGUgb25jZSBhbmQga2Vw"
-    "dCBpbiBTRUJCSV9EQikKICAgIFNFQkJJX0RJU0FCTEVEPTEgICAgIHJlY29yZCBub3RoaW5nIChraWxsIHN3aXRjaCkKClN0YW5k"
-    "YXJkIGxpYnJhcnkgb25seS4gUHl0aG9uIDMuOCsuCiIiIgoKaW1wb3J0IGFzeW5jaW8KaW1wb3J0IGF0ZXhpdAppbXBvcnQgZGF0"
-    "YWNsYXNzZXMKaW1wb3J0IGRhdGV0aW1lCmltcG9ydCBkZWNpbWFsCmltcG9ydCBmdW5jdG9vbHMKaW1wb3J0IGhhc2hsaWIKaW1w"
-    "b3J0IGluc3BlY3QKaW1wb3J0IGpzb24KaW1wb3J0IGxvZ2dpbmcKaW1wb3J0IG9zCmltcG9ydCBzcWxpdGUzCmltcG9ydCBzeXMK"
-    "aW1wb3J0IHRocmVhZGluZwppbXBvcnQgdGltZQppbXBvcnQgdXJsbGliLmVycm9yCmltcG9ydCB1cmxsaWIucmVxdWVzdAppbXBv"
-    "cnQgdXVpZAoKX192ZXJzaW9uX18gPSAiMS4xLjAiCl9fYWxsX18gPSBbImFuY2hvcl9zdGF0ZSIsICJyZWNvcmQiLCAiQW5jaG9y"
-    "IiwgIkFuY2hvckxvZ0hhbmRsZXIiLCAiY2Fub25pY2FsX2pzb24iLCAic3RhdGVfaGFzaCIsCiAgICAgICAgICAgInZlcmlmeV9p"
-    "bmNsdXNpb24iLCAidmVyaWZ5X2NvbnNpc3RlbmN5IiwgImdldF9kZWZhdWx0Il0KCmxvZyA9IGxvZ2dpbmcuZ2V0TG9nZ2VyKCJz"
-    "ZWJiaV9hZGFwdGVyIikKCgojIC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0t"
-    "LS0tLS0tLS0gZmluZ2VycHJpbnRzCgpkZWYgX2RlZmF1bHQobyk6CiAgICBpZiBpc2luc3RhbmNlKG8sIChkYXRldGltZS5kYXRl"
-    "dGltZSwgZGF0ZXRpbWUuZGF0ZSwgZGF0ZXRpbWUudGltZSkpOgogICAgICAgIHJldHVybiBvLmlzb2Zvcm1hdCgpCiAgICBpZiBp"
-    "c2luc3RhbmNlKG8sIGRlY2ltYWwuRGVjaW1hbCk6CiAgICAgICAgcmV0dXJuIHN0cihvKQogICAgaWYgaXNpbnN0YW5jZShvLCAo"
-    "Ynl0ZXMsIGJ5dGVhcnJheSwgbWVtb3J5dmlldykpOgogICAgICAgIHJldHVybiBieXRlcyhvKS5oZXgoKQogICAgaWYgaXNpbnN0"
-    "YW5jZShvLCAoc2V0LCBmcm96ZW5zZXQpKToKICAgICAgICByZXR1cm4gc29ydGVkKG8sIGtleT1sYW1iZGEgeDogY2Fub25pY2Fs"
-    "X2pzb24oeCkpCiAgICBpZiBpc2luc3RhbmNlKG8sIHV1aWQuVVVJRCk6CiAgICAgICAgcmV0dXJuIHN0cihvKQogICAgaWYgZGF0"
-    "YWNsYXNzZXMuaXNfZGF0YWNsYXNzKG8pIGFuZCBub3QgaXNpbnN0YW5jZShvLCB0eXBlKToKICAgICAgICByZXR1cm4gZGF0YWNs"
-    "YXNzZXMuYXNkaWN0KG8pCiAgICBmb3IgYXR0ciBpbiAoInRvX2RpY3QiLCAiX2FzZGljdCIpOgogICAgICAgIGZuID0gZ2V0YXR0"
-    "cihvLCBhdHRyLCBOb25lKQogICAgICAgIGlmIGNhbGxhYmxlKGZuKToKICAgICAgICAgICAgcmV0dXJuIGZuKCkKICAgIHJhaXNl"
-    "IFR5cGVFcnJvcigiY2Fubm90IGZpbmdlcnByaW50ICVzIC0gcGFzcyBleHRyYWN0PSB0byBjaG9vc2Ugd2hhdCB0byByZWNvcmQi"
-    "ICUgdHlwZShvKS5fX25hbWVfXykKCgpkZWYgY2Fub25pY2FsX2pzb24ob2JqKToKICAgICIiIlRoZSBleGFjdCBieXRlcyB0aGUg"
-    "ZmluZ2VycHJpbnQgaXMgdGFrZW4gb3Zlci4iIiIKICAgIHJldHVybiBqc29uLmR1bXBzKG9iaiwgc29ydF9rZXlzPVRydWUsIHNl"
-    "cGFyYXRvcnM9KCIsIiwgIjoiKSwgZW5zdXJlX2FzY2lpPUZhbHNlLAogICAgICAgICAgICAgICAgICAgICAgYWxsb3dfbmFuPUZh"
-    "bHNlLCBkZWZhdWx0PV9kZWZhdWx0KS5lbmNvZGUoInV0Zi04IikKCgpkZWYgc3RhdGVfaGFzaChvYmopOgogICAgIiIiU0hBLTI1"
-    "NiBvZiBjYW5vbmljYWwgSlNPTiwgYXMgNjQgbG93ZXJjYXNlIGhleCBjaGFyYWN0ZXJzLiIiIgogICAgcmV0dXJuIGhhc2hsaWIu"
-    "c2hhMjU2KGNhbm9uaWNhbF9qc29uKG9iaikpLmhleGRpZ2VzdCgpCgoKIyAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0t"
-    "LS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tIFJGQyA2OTYyIGNoZWNrcwoKZGVmIF9oKGIpOgogICAgcmV0dXJuIGhh"
-    "c2hsaWIuc2hhMjU2KGIpLmRpZ2VzdCgpCgoKZGVmIGxlYWZfaGFzaChlbnRyeV9oZXgpOgogICAgcmV0dXJuIF9oKGIiXHgwMCIg"
-    "KyBieXRlcy5mcm9taGV4KGVudHJ5X2hleCkpLmhleCgpCgoKZGVmIHZlcmlmeV9pbmNsdXNpb24oZW50cnlfaGV4LCBpbmRleCwg"
-    "dHJlZV9zaXplLCBwYXRoLCByb290KToKICAgICIiIlJGQyA5MTYyIHNlY3Rpb24gMi4xLjMuMjogaXMgZW50cnkgYXQgYGluZGV4"
-    "YCBpbiB0aGUgdHJlZSBvZiBgdHJlZV9zaXplYCB3aXRoIGByb290YD8iIiIKICAgIHRyeToKICAgICAgICBpbmRleCwgdHJlZV9z"
-    "aXplID0gaW50KGluZGV4KSwgaW50KHRyZWVfc2l6ZSkKICAgICAgICBpZiBpbmRleCA8IDAgb3IgaW5kZXggPj0gdHJlZV9zaXpl"
-    "OgogICAgICAgICAgICByZXR1cm4gRmFsc2UKICAgICAgICBmbiwgc24gPSBpbmRleCwgdHJlZV9zaXplIC0gMQogICAgICAgIHIg"
-    "PSBfaChiIlx4MDAiICsgYnl0ZXMuZnJvbWhleChlbnRyeV9oZXgpKQogICAgICAgIGZvciBwX2hleCBpbiBwYXRoOgogICAgICAg"
-    "ICAgICBwID0gYnl0ZXMuZnJvbWhleChwX2hleCkKICAgICAgICAgICAgaWYgc24gPT0gMDoKICAgICAgICAgICAgICAgIHJldHVy"
-    "biBGYWxzZQogICAgICAgICAgICBpZiAoZm4gJiAxKSBvciBmbiA9PSBzbjoKICAgICAgICAgICAgICAgIHIgPSBfaChiIlx4MDEi"
-    "ICsgcCArIHIpCiAgICAgICAgICAgICAgICBpZiBub3QgKGZuICYgMSk6CiAgICAgICAgICAgICAgICAgICAgd2hpbGUgbm90IChm"
-    "biAmIDEpIGFuZCBmbiAhPSAwOgogICAgICAgICAgICAgICAgICAgICAgICBmbiA+Pj0gMQogICAgICAgICAgICAgICAgICAgICAg"
-    "ICBzbiA+Pj0gMQogICAgICAgICAgICBlbHNlOgogICAgICAgICAgICAgICAgciA9IF9oKGIiXHgwMSIgKyByICsgcCkKICAgICAg"
-    "ICAgICAgZm4gPj49IDEKICAgICAgICAgICAgc24gPj49IDEKICAgICAgICByZXR1cm4gc24gPT0gMCBhbmQgciA9PSBieXRlcy5m"
-    "cm9taGV4KHJvb3QpCiAgICBleGNlcHQgKFZhbHVlRXJyb3IsIFR5cGVFcnJvcik6CiAgICAgICAgcmV0dXJuIEZhbHNlCgoKZGVm"
-    "IHZlcmlmeV9jb25zaXN0ZW5jeShmaXJzdCwgc2Vjb25kLCBmaXJzdF9yb290LCBzZWNvbmRfcm9vdCwgcHJvb2YpOgogICAgIiIi"
-    "UkZDIDkxNjIgc2VjdGlvbiAyLjEuNC4yOiBpcyB0aGUgdHJlZSBvZiBzaXplIGBzZWNvbmRgIGFuIGFwcGVuZC1vbmx5IGV4dGVu"
-    "c2lvbiBvZiBgZmlyc3RgPyIiIgogICAgdHJ5OgogICAgICAgIGZpcnN0LCBzZWNvbmQgPSBpbnQoZmlyc3QpLCBpbnQoc2Vjb25k"
-    "KQogICAgICAgIGZyX2IsIHNyX2IgPSBieXRlcy5mcm9taGV4KGZpcnN0X3Jvb3QpLCBieXRlcy5mcm9taGV4KHNlY29uZF9yb290"
-    "KQogICAgICAgIHBhdGggPSBbYnl0ZXMuZnJvbWhleChwKSBmb3IgcCBpbiBwcm9vZl0KICAgICAgICBpZiBmaXJzdCA9PSBzZWNv"
-    "bmQ6CiAgICAgICAgICAgIHJldHVybiBub3QgcGF0aCBhbmQgZnJfYiA9PSBzcl9iCiAgICAgICAgaWYgZmlyc3QgPCAxIG9yIGZp"
-    "cnN0ID4gc2Vjb25kIG9yIG5vdCBwYXRoOgogICAgICAgICAgICByZXR1cm4gRmFsc2UKICAgICAgICBpZiBmaXJzdCAmIChmaXJz"
-    "dCAtIDEpID09IDA6CiAgICAgICAgICAgIHBhdGggPSBbZnJfYl0gKyBwYXRoCiAgICAgICAgZm4sIHNuID0gZmlyc3QgLSAxLCBz"
-    "ZWNvbmQgLSAxCiAgICAgICAgd2hpbGUgZm4gJiAxOgogICAgICAgICAgICBmbiA+Pj0gMQogICAgICAgICAgICBzbiA+Pj0gMQog"
-    "ICAgICAgIGZyID0gc3IgPSBwYXRoWzBdCiAgICAgICAgZm9yIGMgaW4gcGF0aFsxOl06CiAgICAgICAgICAgIGlmIHNuID09IDA6"
-    "CiAgICAgICAgICAgICAgICByZXR1cm4gRmFsc2UKICAgICAgICAgICAgaWYgKGZuICYgMSkgb3IgZm4gPT0gc246CiAgICAgICAg"
-    "ICAgICAgICBmciA9IF9oKGIiXHgwMSIgKyBjICsgZnIpCiAgICAgICAgICAgICAgICBzciA9IF9oKGIiXHgwMSIgKyBjICsgc3Ip"
-    "CiAgICAgICAgICAgICAgICBpZiBub3QgKGZuICYgMSk6CiAgICAgICAgICAgICAgICAgICAgd2hpbGUgbm90IChmbiAmIDEpIGFu"
-    "ZCBmbiAhPSAwOgogICAgICAgICAgICAgICAgICAgICAgICBmbiA+Pj0gMQogICAgICAgICAgICAgICAgICAgICAgICBzbiA+Pj0g"
-    "MQogICAgICAgICAgICBlbHNlOgogICAgICAgICAgICAgICAgc3IgPSBfaChiIlx4MDEiICsgc3IgKyBjKQogICAgICAgICAgICBm"
-    "biA+Pj0gMQogICAgICAgICAgICBzbiA+Pj0gMQogICAgICAgIHJldHVybiBmciA9PSBmcl9iIGFuZCBzciA9PSBzcl9iIGFuZCBz"
-    "biA9PSAwCiAgICBleGNlcHQgKFZhbHVlRXJyb3IsIFR5cGVFcnJvcik6CiAgICAgICAgcmV0dXJuIEZhbHNlCgoKZGVmIGRldmlj"
-    "ZV90b2tlbihkZXZpY2UpOgogICAgIiIiT25lLXdheSBkZXZpY2UgbmFtZSBzZW50IGZvciBtZXRlcmluZzogdGhlIHNhbWUgZGV2"
-    "aWNlIGFsd2F5cyBnaXZlcyB0aGUgc2FtZSB0b2tlbi4iIiIKICAgIGlmIGRldmljZSBpcyBOb25lIG9yIGRldmljZSA9PSAiIjoK"
-    "ICAgICAgICByZXR1cm4gTm9uZQogICAgcmV0dXJuICJkXyIgKyBoYXNobGliLnNoYTI1NigoInNlYmJpLWRldmljZToiICsgc3Ry"
-    "KGRldmljZSkpLmVuY29kZSgidXRmLTgiKSkuaGV4ZGlnZXN0KClbOjMyXQoKCiMgLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0t"
-    "LS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLSB0aGUgc2lkZWNhcgoKY2xhc3MgQW5jaG9yKG9iamVjdCk6CiAg"
-    "ICAiIiJMb2NhbCBhcHBlbmQtb25seSBxdWV1ZSArIGJhY2tncm91bmQgc2VuZGVyLiBTYWZlIGFjcm9zcyB0aHJlYWRzLCBwcm9j"
-    "ZXNzZXMgYW5kIGZvcmtzLiIiIgoKICAgIGRlZiBfX2luaXRfXyhzZWxmLCBhcGlfa2V5PU5vbmUsIGVuZHBvaW50PU5vbmUsIGRi"
-    "X3BhdGg9Tm9uZSwgYmF0Y2hfc2l6ZT0yMDAsCiAgICAgICAgICAgICAgICAgZmx1c2hfaW50ZXJ2YWw9Mi4wLCB0aW1lb3V0PTEw"
-    "LjAsIGNoZWNrX2NoYWluPVRydWUsIHN0YXJ0PVRydWUpOgogICAgICAgIHNlbGYuYXBpX2tleSA9IChhcGlfa2V5IGlmIGFwaV9r"
-    "ZXkgaXMgbm90IE5vbmUgZWxzZSBvcy5lbnZpcm9uLmdldCgiU0VCQklfQVBJX0tFWSIsICIiKSkuc3RyaXAoKQogICAgICAgIHNl"
-    "bGYuZW5kcG9pbnQgPSAoZW5kcG9pbnQgb3Igb3MuZW52aXJvbi5nZXQoIlNFQkJJX0VORFBPSU5UIiwgImh0dHBzOi8vc2ViYmku"
-    "cHJvIikpLnJzdHJpcCgiLyIpCiAgICAgICAgc2VsZi5kYl9wYXRoID0gZGJfcGF0aCBvciBvcy5lbnZpcm9uLmdldCgiU0VCQklf"
-    "REIiLCAic2ViYmlfYW5jaG9yLmRiIikKICAgICAgICBzZWxmLmJhdGNoX3NpemUgPSBtYXgoMSwgbWluKDUwMCwgaW50KGJhdGNo"
-    "X3NpemUpKSkKICAgICAgICBzZWxmLmZsdXNoX2ludGVydmFsID0gZmxvYXQoZmx1c2hfaW50ZXJ2YWwpCiAgICAgICAgc2VsZi50"
-    "aW1lb3V0ID0gZmxvYXQodGltZW91dCkKICAgICAgICBzZWxmLmNoZWNrX2NoYWluID0gYm9vbChjaGVja19jaGFpbikKICAgICAg"
-    "ICBzZWxmLmRpc2FibGVkID0gb3MuZW52aXJvbi5nZXQoIlNFQkJJX0RJU0FCTEVEIiwgIjAiKSA9PSAiMSIKICAgICAgICBzZWxm"
-    "Ll9hdXRvc3RhcnQgPSBzdGFydAogICAgICAgIHNlbGYuX3dhcm5lZF9ub19rZXkgPSBGYWxzZQogICAgICAgIGlmIG5vdCBzZWxm"
-    "LmVuZHBvaW50LnN0YXJ0c3dpdGgoImh0dHBzOi8vIikgYW5kICIxMjcuMC4wLjEiIG5vdCBpbiBzZWxmLmVuZHBvaW50IFwKICAg"
-    "ICAgICAgICAgICAgIGFuZCAibG9jYWxob3N0IiBub3QgaW4gc2VsZi5lbmRwb2ludDoKICAgICAgICAgICAgbG9nLndhcm5pbmco"
-    "InNlYmJpX2FkYXB0ZXI6IGVuZHBvaW50ICVzIGlzIG5vdCBodHRwcyIsIHNlbGYuZW5kcG9pbnQpCiAgICAgICAgc2VsZi5faW5p"
-    "dF9wcm9jZXNzKCkKCiAgICAjIC0tIHByb2Nlc3MtbG9jYWwgc3RhdGUgKHJlYnVpbHQgYWZ0ZXIgZm9yaykgLS0KICAgIGRlZiBf"
-    "aW5pdF9wcm9jZXNzKHNlbGYpOgogICAgICAgIHNlbGYuX3BpZCA9IG9zLmdldHBpZCgpCiAgICAgICAgc2VsZi5fd2lkID0gIiVk"
-    "LSVzIiAlIChzZWxmLl9waWQsIHV1aWQudXVpZDQoKS5oZXhbOjhdKQogICAgICAgIHNlbGYuX2xrID0gdGhyZWFkaW5nLkxvY2so"
-    "KQogICAgICAgIHNlbGYuX3dha2UgPSB0aHJlYWRpbmcuRXZlbnQoKQogICAgICAgIHNlbGYuX3N0b3AgPSB0aHJlYWRpbmcuRXZl"
-    "bnQoKQogICAgICAgIHNlbGYuX2JhY2tvZmYgPSAwLjAKICAgICAgICBzZWxmLl90cmllZCA9IHt9CiAgICAgICAgc2VsZi5fZGIg"
-    "PSBzcWxpdGUzLmNvbm5lY3Qoc2VsZi5kYl9wYXRoLCB0aW1lb3V0PTMwLCBpc29sYXRpb25fbGV2ZWw9Tm9uZSwgY2hlY2tfc2Ft"
-    "ZV90aHJlYWQ9RmFsc2UpCiAgICAgICAgc2VsZi5fZGIuZXhlY3V0ZSgiUFJBR01BIGpvdXJuYWxfbW9kZT1XQUwiKQogICAgICAg"
-    "IHNlbGYuX2RiLmV4ZWN1dGUoIlBSQUdNQSBzeW5jaHJvbm91cz1OT1JNQUwiKQogICAgICAgIHNlbGYuX2RiLmV4ZWN1dGUoIkNS"
-    "RUFURSBUQUJMRSBJRiBOT1QgRVhJU1RTIGVudHJpZXMoc2VxIElOVEVHRVIgUFJJTUFSWSBLRVkgQVVUT0lOQ1JFTUVOVCwiCiAg"
-    "ICAgICAgICAgICAgICAgICAgICAgICAiY2lkIFRFWFQgVU5JUVVFIE5PVCBOVUxMLGhhc2ggVEVYVCBOT1QgTlVMTCxsYWJlbCBU"
-    "RVhULGNyZWF0ZWQgUkVBTCkiKQogICAgICAgIHNlbGYuX2RiLmV4ZWN1dGUoIkNSRUFURSBUQUJMRSBJRiBOT1QgRVhJU1RTIHJl"
-    "Y2VpcHRzKGlkIElOVEVHRVIgUFJJTUFSWSBLRVkgQVVUT0lOQ1JFTUVOVCwiCiAgICAgICAgICAgICAgICAgICAgICAgICAiY2lk"
-    "IFRFWFQgTk9UIE5VTEwsbGVhZl9pbmRleCBJTlRFR0VSLHJlY2VpcHQgVEVYVCx2ZXJpZmllZCBJTlRFR0VSLCIKICAgICAgICAg"
-    "ICAgICAgICAgICAgICAgICJjaGVja3BvaW50ZWQgSU5URUdFUiBERUZBVUxUIDAsaW5fY2hhaW4gSU5URUdFUixyZWNlaXZlZCBS"
-    "RUFMKSIpCiAgICAgICAgc2VsZi5fZGIuZXhlY3V0ZSgiQ1JFQVRFIElOREVYIElGIE5PVCBFWElTVFMgcmVjZWlwdHNfY2lkIE9O"
-    "IHJlY2VpcHRzKGNpZCkiKQogICAgICAgIHNlbGYuX2RiLmV4ZWN1dGUoIkNSRUFURSBJTkRFWCBJRiBOT1QgRVhJU1RTIGVudHJp"
-    "ZXNfaGFzaCBPTiBlbnRyaWVzKGhhc2gpIikKICAgICAgICBzZWxmLl9kYi5leGVjdXRlKCJDUkVBVEUgVEFCTEUgSUYgTk9UIEVY"
-    "SVNUUyBjbGFpbXMoY2lkIFRFWFQgUFJJTUFSWSBLRVksd29ya2VyIFRFWFQsdW50aWwgUkVBTCkiKQogICAgICAgIHNlbGYuX2Ri"
-    "LmV4ZWN1dGUoIkNSRUFURSBUQUJMRSBJRiBOT1QgRVhJU1RTIG1ldGEoayBURVhUIFBSSU1BUlkgS0VZLHYgVEVYVCkiKQogICAg"
-    "ICAgIHRyeToKICAgICAgICAgICAgc2VsZi5fZGIuZXhlY3V0ZSgiQUxURVIgVEFCTEUgZW50cmllcyBBREQgQ09MVU1OIGRldmlj"
-    "ZSBURVhUIikKICAgICAgICBleGNlcHQgc3FsaXRlMy5PcGVyYXRpb25hbEVycm9yOgogICAgICAgICAgICBwYXNzCiAgICAgICAg"
-    "c2VsZi5fZGIuZXhlY3V0ZSgiSU5TRVJUIE9SIElHTk9SRSBJTlRPIG1ldGEoayx2KSBWQUxVRVMoJ2RldmljZScsPykiLCAoImRl"
-    "dl8iICsgdXVpZC51dWlkNCgpLmhleFs6MjBdLCkpCiAgICAgICAgc2VsZi5kZXZpY2UgPSAob3MuZW52aXJvbi5nZXQoIlNFQkJJ"
-    "X0RFVklDRV9JRCIsICIiKS5zdHJpcCgpWzo2MF0gb3IKICAgICAgICAgICAgICAgICAgICAgICBzZWxmLl9kYi5leGVjdXRlKCJT"
-    "RUxFQ1QgdiBGUk9NIG1ldGEgV0hFUkUgaz0nZGV2aWNlJyIpLmZldGNob25lKClbMF0pCiAgICAgICAgc2VsZi5fdGhyZWFkID0g"
-    "Tm9uZQogICAgICAgIGlmIHNlbGYuX2F1dG9zdGFydDoKICAgICAgICAgICAgc2VsZi5fc3RhcnRfdGhyZWFkKCkKCiAgICBkZWYg"
-    "X2Vuc3VyZV9wcm9jZXNzKHNlbGYpOgogICAgICAgIGlmIG9zLmdldHBpZCgpICE9IHNlbGYuX3BpZDoKICAgICAgICAgICAgc2Vs"
-    "Zi5faW5pdF9wcm9jZXNzKCkKCiAgICBkZWYgX3N0YXJ0X3RocmVhZChzZWxmKToKICAgICAgICBpZiBzZWxmLl90aHJlYWQgYW5k"
-    "IHNlbGYuX3RocmVhZC5pc19hbGl2ZSgpOgogICAgICAgICAgICByZXR1cm4KICAgICAgICBzZWxmLl90aHJlYWQgPSB0aHJlYWRp"
-    "bmcuVGhyZWFkKHRhcmdldD1zZWxmLl9ydW4sIG5hbWU9InNlYmJpLWFuY2hvciIsIGRhZW1vbj1UcnVlKQogICAgICAgIHNlbGYu"
-    "X3RocmVhZC5zdGFydCgpCgogICAgIyAtLSByZWNvcmRpbmcgKGhvc3Qgc2lkZTogbG9jYWwgb25seSwgbmV2ZXIgcmFpc2VzKSAt"
-    "LQogICAgZGVmIHJlY29yZChzZWxmLCBwYXlsb2FkLCBsYWJlbD1Ob25lLCBkZXZpY2U9Tm9uZSk6CiAgICAgICAgIiIiRmluZ2Vy"
-    "cHJpbnQgYHBheWxvYWRgIGFuZCBxdWV1ZSBpdC4gYGRldmljZWAgbmFtZXMgd2hhdCBpdCBpcyBhYm91dCAocGhvbmUsIHRpbGwu"
-    "Li4pLgogICAgICAgIFJldHVybnMgdGhlIGhhc2gsIG9yIE5vbmUgaWYgaXQgY291bGQgbm90IGJlIHJlY29yZGVkLiIiIgogICAg"
-    "ICAgIGlmIHNlbGYuZGlzYWJsZWQ6CiAgICAgICAgICAgIHJldHVybiBOb25lCiAgICAgICAgdHJ5OgogICAgICAgICAgICByZXR1"
-    "cm4gc2VsZi5yZWNvcmRfaGFzaChzdGF0ZV9oYXNoKHBheWxvYWQpLCBsYWJlbD1sYWJlbCwgZGV2aWNlPWRldmljZSkKICAgICAg"
-    "ICBleGNlcHQgRXhjZXB0aW9uIGFzIGU6CiAgICAgICAgICAgIGxvZy53YXJuaW5nKCJzZWJiaV9hZGFwdGVyOiBub3QgcmVjb3Jk"
-    "ZWQgKCVzKSIsIGUpCiAgICAgICAgICAgIHJldHVybiBOb25lCgogICAgZGVmIHJlY29yZF9oYXNoKHNlbGYsIGhhc2hfaGV4LCBs"
-    "YWJlbD1Ob25lLCBkZXZpY2U9Tm9uZSk6CiAgICAgICAgIiIiUXVldWUgYSBmaW5nZXJwcmludCB5b3UgY29tcHV0ZWQgeW91cnNl"
-    "bGYgKDY0IGhleCBjaGFyYWN0ZXJzKS4iIiIKICAgICAgICBpZiBzZWxmLmRpc2FibGVkOgogICAgICAgICAgICByZXR1cm4gTm9u"
-    "ZQogICAgICAgIHRyeToKICAgICAgICAgICAgaCA9IHN0cihoYXNoX2hleCkuc3RyaXAoKS5sb3dlcigpCiAgICAgICAgICAgIGlm"
-    "IGxlbihoKSAhPSA2NCBvciBhbnkoY2ggbm90IGluICIwMTIzNDU2Nzg5YWJjZGVmIiBmb3IgY2ggaW4gaCk6CiAgICAgICAgICAg"
-    "ICAgICByYWlzZSBWYWx1ZUVycm9yKCJoYXNoIG11c3QgYmUgNjQgaGV4IGNoYXJhY3RlcnMiKQogICAgICAgICAgICBzZWxmLl9l"
-    "bnN1cmVfcHJvY2VzcygpCiAgICAgICAgICAgIHdpdGggc2VsZi5fbGs6CiAgICAgICAgICAgICAgICBzZWxmLl9kYi5leGVjdXRl"
-    "KCJJTlNFUlQgSU5UTyBlbnRyaWVzKGNpZCxoYXNoLGxhYmVsLGNyZWF0ZWQsZGV2aWNlKSBWQUxVRVMoPyw/LD8sPyw/KSIsCiAg"
-    "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICh1dWlkLnV1aWQ0KCkuaGV4LCBoLCAoc3RyKGxhYmVsKVs6MTIwXSBpZiBs"
-    "YWJlbCBlbHNlIE5vbmUpLCB0aW1lLnRpbWUoKSwKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIGRldmljZV90b2tl"
-    "bihkZXZpY2UpKSkKICAgICAgICAgICAgc2VsZi5fd2FrZS5zZXQoKQogICAgICAgICAgICByZXR1cm4gaAogICAgICAgIGV4Y2Vw"
-    "dCBFeGNlcHRpb24gYXMgZToKICAgICAgICAgICAgbG9nLndhcm5pbmcoInNlYmJpX2FkYXB0ZXI6IG5vdCByZWNvcmRlZCAoJXMp"
-    "IiwgZSkKICAgICAgICAgICAgcmV0dXJuIE5vbmUKCiAgICAjIC0tIGxvb2t1cHMgLS0KICAgIGRlZiByZWNlaXB0KHNlbGYsIGhh"
-    "c2hfaGV4KToKICAgICAgICAiIiJMYXRlc3QgcmVjZWlwdCBmb3IgYSBmaW5nZXJwcmludCAodGhlIG1vc3QgcmVjZW50IGVudHJ5"
-    "IHdpdGggdGhhdCBoYXNoKSwgb3IgTm9uZS4iIiIKICAgICAgICBzZWxmLl9lbnN1cmVfcHJvY2VzcygpCiAgICAgICAgd2l0aCBz"
-    "ZWxmLl9sazoKICAgICAgICAgICAgcm93ID0gc2VsZi5fZGIuZXhlY3V0ZSgKICAgICAgICAgICAgICAgICJTRUxFQ1Qgci5yZWNl"
-    "aXB0LHIudmVyaWZpZWQsci5jaGVja3BvaW50ZWQsci5pbl9jaGFpbixlLmxhYmVsLGUuY3JlYXRlZCBGUk9NIGVudHJpZXMgZSAi"
-    "CiAgICAgICAgICAgICAgICAiSk9JTiByZWNlaXB0cyByIE9OIHIuY2lkPWUuY2lkIFdIRVJFIGUuaGFzaD0/IE9SREVSIEJZIGUu"
-    "c2VxIERFU0MsIHIuaWQgREVTQyBMSU1JVCAxIiwKICAgICAgICAgICAgICAgIChzdHIoaGFzaF9oZXgpLmxvd2VyKCksKSkuZmV0"
-    "Y2hvbmUoKQogICAgICAgIGlmIG5vdCByb3c6CiAgICAgICAgICAgIHJldHVybiBOb25lCiAgICAgICAgcmVjID0ganNvbi5sb2Fk"
-    "cyhyb3dbMF0pCiAgICAgICAgcmVjWyJ2ZXJpZmllZF9sb2NhbGx5Il0gPSBib29sKHJvd1sxXSkKICAgICAgICByZWNbImNoZWNr"
-    "cG9pbnRlZCJdID0gYm9vbChyb3dbMl0pCiAgICAgICAgcmVjWyJ0cmVlX2hlYWRfc2Vlbl9pbl9jaGFpbiJdID0gTm9uZSBpZiBy"
-    "b3dbM10gaXMgTm9uZSBlbHNlIGJvb2wocm93WzNdKQogICAgICAgIHJlY1sibGFiZWwiXSA9IHJvd1s0XQogICAgICAgIHJldHVy"
-    "biByZWMKCiAgICBkZWYgY291bnRzKHNlbGYpOgogICAgICAgIHNlbGYuX2Vuc3VyZV9wcm9jZXNzKCkKICAgICAgICB3aXRoIHNl"
-    "bGYuX2xrOgogICAgICAgICAgICBjID0gc2VsZi5fZGIKICAgICAgICAgICAgdG90YWwgPSBjLmV4ZWN1dGUoIlNFTEVDVCBDT1VO"
-    "VCgqKSBGUk9NIGVudHJpZXMiKS5mZXRjaG9uZSgpWzBdCiAgICAgICAgICAgIHNlbnQgPSBjLmV4ZWN1dGUoIlNFTEVDVCBDT1VO"
-    "VChESVNUSU5DVCBjaWQpIEZST00gcmVjZWlwdHMiKS5mZXRjaG9uZSgpWzBdCiAgICAgICAgICAgIGNwID0gYy5leGVjdXRlKCJT"
-    "RUxFQ1QgQ09VTlQoRElTVElOQ1QgY2lkKSBGUk9NIHJlY2VpcHRzIFdIRVJFIGNoZWNrcG9pbnRlZD0xIikuZmV0Y2hvbmUoKVsw"
-    "XQogICAgICAgICAgICBiYWQgPSBjLmV4ZWN1dGUoIlNFTEVDVCBDT1VOVChESVNUSU5DVCBjaWQpIEZST00gcmVjZWlwdHMgV0hF"
-    "UkUgdmVyaWZpZWQ9MCIpLmZldGNob25lKClbMF0KICAgICAgICByZXR1cm4geyJyZWNvcmRlZCI6IHRvdGFsLCAicmVjZWlwdGVk"
-    "Ijogc2VudCwgIndhaXRpbmciOiB0b3RhbCAtIHNlbnQsCiAgICAgICAgICAgICAgICAic2VhbGVkX2luX2NoYWluIjogY3AsICJm"
-    "YWlsZWRfbG9jYWxfY2hlY2siOiBiYWR9CgogICAgZGVmIHBlbmRpbmcoc2VsZik6CiAgICAgICAgcmV0dXJuIHNlbGYuY291bnRz"
-    "KClbIndhaXRpbmciXQoKICAgICMgLS0gbmV0d29yayAtLQogICAgZGVmIF9odHRwKHNlbGYsIG1ldGhvZCwgcGF0aCwgYm9keT1O"
-    "b25lKToKICAgICAgICBkYXRhID0ganNvbi5kdW1wcyhib2R5KS5lbmNvZGUoInV0Zi04IikgaWYgYm9keSBpcyBub3QgTm9uZSBl"
-    "bHNlIE5vbmUKICAgICAgICByZXEgPSB1cmxsaWIucmVxdWVzdC5SZXF1ZXN0KHNlbGYuZW5kcG9pbnQgKyBwYXRoLCBkYXRhPWRh"
-    "dGEsIG1ldGhvZD1tZXRob2QpCiAgICAgICAgcmVxLmFkZF9oZWFkZXIoIkNvbnRlbnQtVHlwZSIsICJhcHBsaWNhdGlvbi9qc29u"
-    "IikKICAgICAgICByZXEuYWRkX2hlYWRlcigiVXNlci1BZ2VudCIsICJzZWJiaS1hZGFwdGVyLyIgKyBfX3ZlcnNpb25fXykKICAg"
-    "ICAgICBpZiBzZWxmLmFwaV9rZXk6CiAgICAgICAgICAgIHJlcS5hZGRfaGVhZGVyKCJYLVNlYmJpLUtleSIsIHNlbGYuYXBpX2tl"
-    "eSkKICAgICAgICB0cnk6CiAgICAgICAgICAgIHdpdGggdXJsbGliLnJlcXVlc3QudXJsb3BlbihyZXEsIHRpbWVvdXQ9c2VsZi50"
-    "aW1lb3V0KSBhcyByOgogICAgICAgICAgICAgICAgcmV0dXJuIHIuc3RhdHVzLCBqc29uLmxvYWRzKHIucmVhZCgpLmRlY29kZSgi"
-    "dXRmLTgiKSBvciAie30iKQogICAgICAgIGV4Y2VwdCB1cmxsaWIuZXJyb3IuSFRUUEVycm9yIGFzIGU6CiAgICAgICAgICAgIHRy"
-    "eToKICAgICAgICAgICAgICAgIHJldHVybiBlLmNvZGUsIGpzb24ubG9hZHMoZS5yZWFkKCkuZGVjb2RlKCJ1dGYtOCIpIG9yICJ7"
-    "fSIpCiAgICAgICAgICAgIGV4Y2VwdCBFeGNlcHRpb246CiAgICAgICAgICAgICAgICByZXR1cm4gZS5jb2RlLCB7fQoKICAgIGRl"
-    "ZiBfY2xhaW0oc2VsZiwgbik6CiAgICAgICAgbm93ID0gdGltZS50aW1lKCkKICAgICAgICB3aXRoIHNlbGYuX2xrOgogICAgICAg"
-    "ICAgICBjID0gc2VsZi5fZGIKICAgICAgICAgICAgYy5leGVjdXRlKCJCRUdJTiBJTU1FRElBVEUiKQogICAgICAgICAgICB0cnk6"
-    "CiAgICAgICAgICAgICAgICByb3dzID0gYy5leGVjdXRlKAogICAgICAgICAgICAgICAgICAgICJTRUxFQ1QgZS5jaWQsZS5oYXNo"
-    "LGUuZGV2aWNlIEZST00gZW50cmllcyBlIFdIRVJFIE5PVCBFWElTVFMgKFNFTEVDVCAxIEZST00gcmVjZWlwdHMgciBXSEVSRSBy"
-    "LmNpZD1lLmNpZCkgIgogICAgICAgICAgICAgICAgICAgICJBTkQgTk9UIEVYSVNUUyAoU0VMRUNUIDEgRlJPTSBjbGFpbXMgayBX"
-    "SEVSRSBrLmNpZD1lLmNpZCBBTkQgay51bnRpbD4/IEFORCBrLndvcmtlcjw+PykgIgogICAgICAgICAgICAgICAgICAgICJPUkRF"
-    "UiBCWSBlLnNlcSBMSU1JVCA/IiwgKG5vdywgc2VsZi5fd2lkLCBuKSkuZmV0Y2hhbGwoKQogICAgICAgICAgICAgICAgZm9yIGNp"
-    "ZCwgXywgXyBpbiByb3dzOgogICAgICAgICAgICAgICAgICAgIGMuZXhlY3V0ZSgiSU5TRVJUIE9SIFJFUExBQ0UgSU5UTyBjbGFp"
-    "bXMoY2lkLHdvcmtlcix1bnRpbCkgVkFMVUVTKD8sPyw/KSIsCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIChjaWQsIHNl"
-    "bGYuX3dpZCwgbm93ICsgbWF4KDYwLjAsIHNlbGYudGltZW91dCAqIDMpKSkKICAgICAgICAgICAgICAgIGMuZXhlY3V0ZSgiQ09N"
-    "TUlUIikKICAgICAgICAgICAgZXhjZXB0IEV4Y2VwdGlvbjoKICAgICAgICAgICAgICAgIGMuZXhlY3V0ZSgiUk9MTEJBQ0siKQog"
-    "ICAgICAgICAgICAgICAgcmFpc2UKICAgICAgICByZXR1cm4gcm93cwoKICAgIGRlZiBfcmVsZWFzZShzZWxmLCBjaWRzKToKICAg"
-    "ICAgICB3aXRoIHNlbGYuX2xrOgogICAgICAgICAgICBzZWxmLl9kYi5leGVjdXRlbWFueSgiREVMRVRFIEZST00gY2xhaW1zIFdI"
-    "RVJFIGNpZD0/IEFORCB3b3JrZXI9PyIsIFsoYywgc2VsZi5fd2lkKSBmb3IgYyBpbiBjaWRzXSkKCiAgICBkZWYgX3N0b3JlKHNl"
-    "bGYsIGNpZCwgcmVjLCBjaGVja3BvaW50ZWQ9RmFsc2UsIGluX2NoYWluPU5vbmUpOgogICAgICAgIG9rID0gdmVyaWZ5X2luY2x1"
-    "c2lvbihyZWMuZ2V0KCJlbnRyeV9oYXNoIiwgIiIpLCByZWMuZ2V0KCJsZWFmX2luZGV4IiwgLTEpLCByZWMuZ2V0KCJ0cmVlX3Np"
-    "emUiLCAwKSwKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgcmVjLmdldCgiYXVkaXRfcGF0aCIsIFtdKSwgcmVjLmdldCgi"
-    "cm9vdCIsICIiKSkKICAgICAgICBpZiBjaGVja3BvaW50ZWQgYW5kIG9rIGFuZCByZWMuZ2V0KCJjaGVja3BvaW50Iik6CiAgICAg"
-    "ICAgICAgIG9rID0gcmVjWyJjaGVja3BvaW50Il0uZ2V0KCJyb290IikgPT0gcmVjLmdldCgicm9vdCIpCiAgICAgICAgaWYgbm90"
-    "IG9rOgogICAgICAgICAgICBsb2cuZXJyb3IoInNlYmJpX2FkYXB0ZXI6IHJlY2VpcHQgZm9yIGxlYWYgJXMgRkFJTEVEIHRoZSBs"
-    "b2NhbCBpbmNsdXNpb24gY2hlY2sgLSBrZXB0IGFuZCBmbGFnZ2VkIiwKICAgICAgICAgICAgICAgICAgICAgIHJlYy5nZXQoImxl"
-    "YWZfaW5kZXgiKSkKICAgICAgICB3aXRoIHNlbGYuX2xrOgogICAgICAgICAgICBzZWxmLl9kYi5leGVjdXRlKCJJTlNFUlQgSU5U"
-    "TyByZWNlaXB0cyhjaWQsbGVhZl9pbmRleCxyZWNlaXB0LHZlcmlmaWVkLGNoZWNrcG9pbnRlZCxpbl9jaGFpbixyZWNlaXZlZCkg"
-    "IgogICAgICAgICAgICAgICAgICAgICAgICAgICAgICJWQUxVRVMoPyw/LD8sPyw/LD8sPykiLAogICAgICAgICAgICAgICAgICAg"
-    "ICAgICAgICAgIChjaWQsIHJlYy5nZXQoImxlYWZfaW5kZXgiKSwganNvbi5kdW1wcyhyZWMsIHNvcnRfa2V5cz1UcnVlKSwgMSBp"
-    "ZiBvayBlbHNlIDAsCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIDEgaWYgY2hlY2twb2ludGVkIGVsc2UgMCwgaW5fY2hh"
-    "aW4sIHRpbWUudGltZSgpKSkKICAgICAgICByZXR1cm4gb2sKCiAgICBkZWYgX3NlbmRfYmF0Y2goc2VsZik6CiAgICAgICAgIiIi"
-    "U2VuZCBvbmUgYmF0Y2guIFJldHVybnMgbnVtYmVyIHJlY2VpcHRlZDsgcmFpc2VzIG9uIG5ldHdvcmsgZmFpbHVyZS4iIiIKICAg"
-    "ICAgICBpZiBub3Qgc2VsZi5hcGlfa2V5OgogICAgICAgICAgICBpZiBub3Qgc2VsZi5fd2FybmVkX25vX2tleToKICAgICAgICAg"
-    "ICAgICAgIGxvZy53YXJuaW5nKCJzZWJiaV9hZGFwdGVyOiBTRUJCSV9BUElfS0VZIG5vdCBzZXQgLSBmaW5nZXJwcmludHMgYXJl"
-    "IHF1ZXVlZCBsb2NhbGx5IGFuZCB3aWxsICIKICAgICAgICAgICAgICAgICAgICAgICAgICAgICJiZSBzZW50IG9uY2UgaXQgaXMi"
-    "KQogICAgICAgICAgICAgICAgc2VsZi5fd2FybmVkX25vX2tleSA9IFRydWUKICAgICAgICAgICAgcmV0dXJuIDAKICAgICAgICBy"
-    "b3dzID0gc2VsZi5fY2xhaW0oc2VsZi5iYXRjaF9zaXplKQogICAgICAgIGlmIG5vdCByb3dzOgogICAgICAgICAgICByZXR1cm4g"
-    "MAogICAgICAgIHdhbnRlZCA9IHtjaWQ6IGggZm9yIGNpZCwgaCwgXyBpbiByb3dzfQogICAgICAgIGl0ZW1zID0gW10KICAgICAg"
-    "ICBmb3IgY2lkLCBoLCBkZXYgaW4gcm93czoKICAgICAgICAgICAgaXQgPSB7Imhhc2giOiBoLCAiY2lkIjogY2lkfQogICAgICAg"
-    "ICAgICBpZiBkZXY6CiAgICAgICAgICAgICAgICBpdFsiZGV2aWNlIl0gPSBkZXYKICAgICAgICAgICAgaXRlbXMuYXBwZW5kKGl0"
-    "KQogICAgICAgIHRyeToKICAgICAgICAgICAgY29kZSwgb3V0ID0gc2VsZi5faHR0cCgiUE9TVCIsICIvcC9zdWJtaXQiLCB7ImRl"
-    "dmljZSI6IHNlbGYuZGV2aWNlLCAiaXRlbXMiOiBpdGVtc30pCiAgICAgICAgZXhjZXB0IEV4Y2VwdGlvbjoKICAgICAgICAgICAg"
-    "c2VsZi5fcmVsZWFzZShsaXN0KHdhbnRlZCkpCiAgICAgICAgICAgIHJhaXNlCiAgICAgICAgaWYgY29kZSAhPSAyMDA6CiAgICAg"
-    "ICAgICAgIHNlbGYuX3JlbGVhc2UobGlzdCh3YW50ZWQpKQogICAgICAgICAgICBpZiBjb2RlID09IDQwMjoKICAgICAgICAgICAg"
-    "ICAgIGxvZy53YXJuaW5nKCJzZWJiaV9hZGFwdGVyOiB5b3VyIGZyZWUgdHJpYWwgaGFzIGVuZGVkIC0gZmluZ2VycHJpbnRzIGFy"
-    "ZSBxdWV1ZWQgc2FmZWx5IGFuZCB3aWxsICIKICAgICAgICAgICAgICAgICAgICAgICAgICAgICJzZW5kIG9uY2UgdGhlIGtleSBp"
-    "cyBwYWlkOiAlcyIsIG91dC5nZXQoImNoZWNrb3V0X3VybCIsICJodHRwczovL3NlYmJpLnByby9zdGFydCIpKQogICAgICAgICAg"
-    "ICByYWlzZSBJT0Vycm9yKCJzZWJiaS5wcm8gYW5zd2VyZWQgJXM6ICVzIiAlIChjb2RlLCBvdXQuZ2V0KCJlcnJvciIpIG9yIG91"
-    "dC5nZXQoIm1lc3NhZ2UiKSBvciAiIikpCiAgICAgICAgZG9uZSA9IDAKICAgICAgICBmb3IgcmVjIGluIG91dC5nZXQoInJlY2Vp"
-    "cHRzIikgb3IgW106CiAgICAgICAgICAgIGNpZCA9IHJlYy5nZXQoImNpZCIpCiAgICAgICAgICAgIGlmIGNpZCBub3QgaW4gd2Fu"
-    "dGVkOgogICAgICAgICAgICAgICAgY29udGludWUKICAgICAgICAgICAgaWYgcmVjLmdldCgiZXJyb3IiKToKICAgICAgICAgICAg"
-    "ICAgIGxvZy5lcnJvcigic2ViYmlfYWRhcHRlcjogZW50cnkgJXMgcmVmdXNlZDogJXMiLCBjaWQsIHJlY1siZXJyb3IiXSkKICAg"
-    "ICAgICAgICAgICAgIGNvbnRpbnVlCiAgICAgICAgICAgIGlmIHJlYy5nZXQoImVudHJ5X2hhc2giKSAhPSB3YW50ZWRbY2lkXToK"
-    "ICAgICAgICAgICAgICAgIGxvZy5lcnJvcigic2ViYmlfYWRhcHRlcjogc2VydmVyIHJldHVybmVkIGEgZGlmZmVyZW50IGhhc2gg"
-    "Zm9yICVzIC0gbm90IHN0b3JlZCIsIGNpZCkKICAgICAgICAgICAgICAgIGNvbnRpbnVlCiAgICAgICAgICAgIHNlbGYuX3N0b3Jl"
-    "KGNpZCwgcmVjKQogICAgICAgICAgICBkb25lICs9IDEKICAgICAgICBzZWxmLl9yZWxlYXNlKGxpc3Qod2FudGVkKSkKICAgICAg"
-    "ICByZXR1cm4gZG9uZQoKICAgIGRlZiBfdXBncmFkZShzZWxmLCBsaW1pdD01MCk6CiAgICAgICAgIiIiRmV0Y2ggc2VhbGVkIHJl"
-    "Y2VpcHRzIGZvciBsZWF2ZXMgd2hvc2UgdHJlZSBoZWFkIHNob3VsZCBub3cgYmUgaW4gdGhlIGNoYWluLiIiIgogICAgICAgIGN1"
-    "dG9mZiA9IHRpbWUudGltZSgpIC0gMzAKICAgICAgICB3aXRoIHNlbGYuX2xrOgogICAgICAgICAgICByb3dzID0gc2VsZi5fZGIu"
-    "ZXhlY3V0ZSgKICAgICAgICAgICAgICAgICJTRUxFQ1Qgci5jaWQsci5sZWFmX2luZGV4IEZST00gcmVjZWlwdHMgciBXSEVSRSBy"
-    "LnZlcmlmaWVkPTEgQU5EIHIucmVjZWl2ZWQ8PyBBTkQgIgogICAgICAgICAgICAgICAgIk5PVCBFWElTVFMgKFNFTEVDVCAxIEZS"
-    "T00gcmVjZWlwdHMgcjIgV0hFUkUgcjIuY2lkPXIuY2lkIEFORCByMi5jaGVja3BvaW50ZWQ9MSkgIgogICAgICAgICAgICAgICAg"
-    "IkdST1VQIEJZIHIuY2lkIE9SREVSIEJZIE1JTihyLmlkKSBMSU1JVCA/IiwgKGN1dG9mZiwgbGltaXQpKS5mZXRjaGFsbCgpCiAg"
-    "ICAgICAgYmxvY2tzID0ge30KICAgICAgICBub3cgPSB0aW1lLnRpbWUoKQogICAgICAgIGZvciBjaWQsIGlkeCBpbiByb3dzOgog"
-    "ICAgICAgICAgICBpZiBub3cgLSBzZWxmLl90cmllZC5nZXQoY2lkLCAwKSA8IDMwOgogICAgICAgICAgICAgICAgY29udGludWUK"
-    "ICAgICAgICAgICAgc2VsZi5fdHJpZWRbY2lkXSA9IG5vdwogICAgICAgICAgICBjb2RlLCByZWMgPSBzZWxmLl9odHRwKCJHRVQi"
-    "LCAiL3AvcmVjZWlwdD9sZWFmPSVkIiAlIGlkeCkKICAgICAgICAgICAgaWYgY29kZSAhPSAyMDAgb3Igbm90IHJlYy5nZXQoImNo"
-    "ZWNrcG9pbnQiKToKICAgICAgICAgICAgICAgIGNvbnRpbnVlCiAgICAgICAgICAgIGluX2NoYWluID0gTm9uZQogICAgICAgICAg"
-    "ICBpZiBzZWxmLmNoZWNrX2NoYWluOgogICAgICAgICAgICAgICAgYmxrID0gcmVjWyJjaGVja3BvaW50Il0uZ2V0KCJibG9ja19p"
-    "bmRleCIpCiAgICAgICAgICAgICAgICBpZiBibGsgbm90IGluIGJsb2NrczoKICAgICAgICAgICAgICAgICAgICB0cnk6CiAgICAg"
-    "ICAgICAgICAgICAgICAgICAgIF8sIGJvZHkgPSBzZWxmLl9odHRwKCJHRVQiLCAiL3gvd2Fsay9ibG9jaz9pbmRleD0lcyIgJSBi"
-    "bGspCiAgICAgICAgICAgICAgICAgICAgICAgIGJsb2Nrc1tibGtdID0ganNvbi5kdW1wcyhib2R5KQogICAgICAgICAgICAgICAg"
-    "ICAgIGV4Y2VwdCBFeGNlcHRpb246CiAgICAgICAgICAgICAgICAgICAgICAgIGJsb2Nrc1tibGtdID0gTm9uZQogICAgICAgICAg"
-    "ICAgICAgaWYgYmxvY2tzW2Jsa10gaXMgbm90IE5vbmU6CiAgICAgICAgICAgICAgICAgICAgaW5fY2hhaW4gPSAxIGlmIHJlY1si"
-    "Y2hlY2twb2ludCJdLmdldCgicm9vdCIsICJ+IikgaW4gYmxvY2tzW2Jsa10gZWxzZSAwCiAgICAgICAgICAgICAgICAgICAgaWYg"
-    "bm90IGluX2NoYWluOgogICAgICAgICAgICAgICAgICAgICAgICBsb2cuZXJyb3IoInNlYmJpX2FkYXB0ZXI6IHRyZWUgaGVhZCBm"
-    "b3IgbGVhZiAlcyBub3QgZm91bmQgaW4gY2hhaW4gYmxvY2sgJXMiLCBpZHgsIGJsaykKICAgICAgICAgICAgc2VsZi5fc3RvcmUo"
-    "Y2lkLCByZWMsIGNoZWNrcG9pbnRlZD1UcnVlLCBpbl9jaGFpbj1pbl9jaGFpbikKICAgICAgICAgICAgc2VsZi5fdHJpZWQucG9w"
-    "KGNpZCwgTm9uZSkKCiAgICBkZWYgZmx1c2goc2VsZiwgdGltZW91dD0zMC4wKToKICAgICAgICAiIiJTZW5kIGV2ZXJ5dGhpbmcg"
-    "d2FpdGluZywgbm93LiBSZXR1cm5zIGhvdyBtYW55IHdlcmUgcmVjZWlwdGVkLiBOZXZlciByYWlzZXMuIiIiCiAgICAgICAgc2Vs"
-    "Zi5fZW5zdXJlX3Byb2Nlc3MoKQogICAgICAgIGVuZCwgc2VudCA9IHRpbWUudGltZSgpICsgdGltZW91dCwgMAogICAgICAgIHdo"
-    "aWxlIHRpbWUudGltZSgpIDwgZW5kOgogICAgICAgICAgICB0cnk6CiAgICAgICAgICAgICAgICBuID0gc2VsZi5fc2VuZF9iYXRj"
-    "aCgpCiAgICAgICAgICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMgZToKICAgICAgICAgICAgICAgIGxvZy53YXJuaW5nKCJzZWJiaV9h"
-    "ZGFwdGVyOiBmbHVzaCBzdG9wcGVkICglcyk7IGVudHJpZXMgc3RheSBxdWV1ZWQiLCBlKQogICAgICAgICAgICAgICAgYnJlYWsK"
-    "ICAgICAgICAgICAgc2VudCArPSBuCiAgICAgICAgICAgIGlmIG4gPT0gMDoKICAgICAgICAgICAgICAgIGJyZWFrCiAgICAgICAg"
-    "cmV0dXJuIHNlbnQKCiAgICBkZWYgX3J1bihzZWxmKToKICAgICAgICB3aGlsZSBub3Qgc2VsZi5fc3RvcC5pc19zZXQoKToKICAg"
-    "ICAgICAgICAgc2VsZi5fd2FrZS53YWl0KHNlbGYuX2JhY2tvZmYgb3Igc2VsZi5mbHVzaF9pbnRlcnZhbCkKICAgICAgICAgICAg"
-    "c2VsZi5fd2FrZS5jbGVhcigpCiAgICAgICAgICAgIGlmIHNlbGYuX3N0b3AuaXNfc2V0KCk6CiAgICAgICAgICAgICAgICBicmVh"
-    "awogICAgICAgICAgICB0cnk6CiAgICAgICAgICAgICAgICB3aGlsZSBzZWxmLl9zZW5kX2JhdGNoKCkgPj0gc2VsZi5iYXRjaF9z"
-    "aXplOgogICAgICAgICAgICAgICAgICAgIHBhc3MKICAgICAgICAgICAgICAgIHNlbGYuX3VwZ3JhZGUoKQogICAgICAgICAgICAg"
-    "ICAgc2VsZi5fYmFja29mZiA9IDAuMAogICAgICAgICAgICBleGNlcHQgRXhjZXB0aW9uIGFzIGU6CiAgICAgICAgICAgICAgICBz"
-    "ZWxmLl9iYWNrb2ZmID0gbWluKDMwMC4wLCBtYXgoMi4wLCBzZWxmLl9iYWNrb2ZmICogMikpCiAgICAgICAgICAgICAgICBsb2cu"
-    "aW5mbygic2ViYmlfYWRhcHRlcjogc2ViYmkucHJvIHVucmVhY2hhYmxlICglcyk7IHJldHJ5aW5nIGluICVkcyIsIGUsIHNlbGYu"
-    "X2JhY2tvZmYpCgogICAgZGVmIGNsb3NlKHNlbGYsIGZsdXNoX3RpbWVvdXQ9Mi4wKToKICAgICAgICB0cnk6CiAgICAgICAgICAg"
-    "IGlmIGZsdXNoX3RpbWVvdXQ6CiAgICAgICAgICAgICAgICBzZWxmLmZsdXNoKHRpbWVvdXQ9Zmx1c2hfdGltZW91dCkKICAgICAg"
-    "ICBmaW5hbGx5OgogICAgICAgICAgICBzZWxmLl9zdG9wLnNldCgpCiAgICAgICAgICAgIHNlbGYuX3dha2Uuc2V0KCkKCgojIC0t"
-    "LS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0gdGhlIGRlZmF1bHQg"
-    "aW5zdGFuY2UKCl9kZWZhdWx0X2FuY2hvciA9IE5vbmUKX2RlZmF1bHRfbG9jayA9IHRocmVhZGluZy5Mb2NrKCkKCgpkZWYgZ2V0"
-    "X2RlZmF1bHQoKToKICAgIGdsb2JhbCBfZGVmYXVsdF9hbmNob3IKICAgIGlmIF9kZWZhdWx0X2FuY2hvciBpcyBOb25lOgogICAg"
-    "ICAgIHdpdGggX2RlZmF1bHRfbG9jazoKICAgICAgICAgICAgaWYgX2RlZmF1bHRfYW5jaG9yIGlzIE5vbmU6CiAgICAgICAgICAg"
-    "ICAgICBfZGVmYXVsdF9hbmNob3IgPSBBbmNob3IoKQogICAgICAgICAgICAgICAgYXRleGl0LnJlZ2lzdGVyKF9kZWZhdWx0X2Fu"
-    "Y2hvci5jbG9zZSkKICAgIHJldHVybiBfZGVmYXVsdF9hbmNob3IKCgpkZWYgcmVjb3JkKHBheWxvYWQsIGxhYmVsPU5vbmUsIGFu"
-    "Y2hvcj1Ob25lLCBkZXZpY2U9Tm9uZSk6CiAgICAiIiJGaW5nZXJwcmludCBhbmQgcXVldWUgYW55IEpTT04tYWJsZSB2YWx1ZS4g"
-    "UmV0dXJucyB0aGUgaGFzaC4gTmV2ZXIgcmFpc2VzLiIiIgogICAgdHJ5OgogICAgICAgIHJldHVybiAoYW5jaG9yIG9yIGdldF9k"
-    "ZWZhdWx0KCkpLnJlY29yZChwYXlsb2FkLCBsYWJlbD1sYWJlbCwgZGV2aWNlPWRldmljZSkKICAgIGV4Y2VwdCBFeGNlcHRpb24g"
-    "YXMgZToKICAgICAgICBsb2cud2FybmluZygic2ViYmlfYWRhcHRlcjogbm90IHJlY29yZGVkICglcykiLCBlKQogICAgICAgIHJl"
-    "dHVybiBOb25lCgoKZGVmIGFuY2hvcl9zdGF0ZShsYWJlbD1Ob25lLCBjYXB0dXJlPSJyZXN1bHQiLCBleHRyYWN0PU5vbmUsIGFu"
-    "Y2hvcj1Ob25lLCBkZXZpY2U9Tm9uZSk6CiAgICAiIiJEZWNvcmF0b3IuIEFmdGVyIHRoZSB3cmFwcGVkIGZ1bmN0aW9uIHN1Y2Nl"
-    "ZWRzLCBmaW5nZXJwcmludCBpdHMgc3RhdGUgYW5kIHF1ZXVlIGl0LgoKICAgIGNhcHR1cmU6ICAicmVzdWx0IiAoZGVmYXVsdCkg"
-    "LSB0aGUgcmV0dXJuIHZhbHVlCiAgICAgICAgICAgICAgImFyZ3MiICAgICAgICAgICAgIC0gdGhlIGFyZ3VtZW50cyBpdCB3YXMg"
-    "Y2FsbGVkIHdpdGgKICAgICAgICAgICAgICAiYm90aCIgICAgICAgICAgICAgLSB7ImFyZ3MiOiAuLi4sICJrd2FyZ3MiOiAuLi4s"
-    "ICJyZXN1bHQiOiAuLi59CiAgICBleHRyYWN0OiAgZihyZXN1bHQsIGFyZ3MsIGt3YXJncykgLT4gdGhlIHZhbHVlIHRvIGZpbmdl"
-    "cnByaW50IChvdmVycmlkZXMgY2FwdHVyZSkKICAgIGRldmljZTogICB3aGF0IHRoZSBjaGFuZ2UgaXMgYWJvdXQsIGZvciB0aGUg"
-    "cGVyLWRldmljZSBtZXRlcjogYSBmaWVsZCBuYW1lIGluIHRoZSByZXN1bHQKICAgICAgICAgICAgICAob3IgYSBrZXl3b3JkIGFy"
-    "Z3VtZW50KSwgb3IgZihyZXN1bHQsIGFyZ3MsIGt3YXJncykgLT4gZGV2aWNlIG5hbWUKICAgIFRoZSB3cmFwcGVkIGZ1bmN0aW9u"
-    "J3MgYmVoYXZpb3VyLCByZXR1cm4gdmFsdWUgYW5kIGV4Y2VwdGlvbnMgYXJlIHVuY2hhbmdlZC4KICAgICIiIgogICAgaWYgY2Fs"
-    "bGFibGUobGFiZWwpIGFuZCBub3QgaXNpbnN0YW5jZShsYWJlbCwgc3RyKToKICAgICAgICByZXR1cm4gYW5jaG9yX3N0YXRlKCko"
-    "bGFiZWwpCgogICAgZGVmIGRlY28oZm4pOgogICAgICAgIG5hbWUgPSBsYWJlbCBvciBnZXRhdHRyKGZuLCAiX19xdWFsbmFtZV9f"
-    "IiwgZ2V0YXR0cihmbiwgIl9fbmFtZV9fIiwgImNhbGwiKSkKCiAgICAgICAgZGVmIF9zdGF0ZShhcmdzLCBrd2FyZ3MsIHJlc3Vs"
-    "dCk6CiAgICAgICAgICAgIGlmIGV4dHJhY3QgaXMgbm90IE5vbmU6CiAgICAgICAgICAgICAgICByZXR1cm4gZXh0cmFjdChyZXN1"
-    "bHQsIGFyZ3MsIGt3YXJncykKICAgICAgICAgICAgaWYgY2FwdHVyZSA9PSAiYXJncyI6CiAgICAgICAgICAgICAgICByZXR1cm4g"
-    "eyJhcmdzIjogbGlzdChhcmdzKSwgImt3YXJncyI6IGt3YXJnc30KICAgICAgICAgICAgaWYgY2FwdHVyZSA9PSAiYm90aCI6CiAg"
-    "ICAgICAgICAgICAgICByZXR1cm4geyJhcmdzIjogbGlzdChhcmdzKSwgImt3YXJncyI6IGt3YXJncywgInJlc3VsdCI6IHJlc3Vs"
-    "dH0KICAgICAgICAgICAgcmV0dXJuIHJlc3VsdAoKICAgICAgICBkZWYgX2RldmljZShhcmdzLCBrd2FyZ3MsIHJlc3VsdCk6CiAg"
-    "ICAgICAgICAgIGlmIGRldmljZSBpcyBOb25lOgogICAgICAgICAgICAgICAgcmV0dXJuIE5vbmUKICAgICAgICAgICAgaWYgY2Fs"
-    "bGFibGUoZGV2aWNlKToKICAgICAgICAgICAgICAgIHJldHVybiBkZXZpY2UocmVzdWx0LCBhcmdzLCBrd2FyZ3MpCiAgICAgICAg"
-    "ICAgIGlmIGlzaW5zdGFuY2UocmVzdWx0LCBkaWN0KSBhbmQgZGV2aWNlIGluIHJlc3VsdDoKICAgICAgICAgICAgICAgIHJldHVy"
-    "biByZXN1bHRbZGV2aWNlXQogICAgICAgICAgICBpZiBkZXZpY2UgaW4ga3dhcmdzOgogICAgICAgICAgICAgICAgcmV0dXJuIGt3"
-    "YXJnc1tkZXZpY2VdCiAgICAgICAgICAgIHJldHVybiBnZXRhdHRyKHJlc3VsdCwgZGV2aWNlLCBOb25lKQoKICAgICAgICBkZWYg"
-    "X2FuY2hvcihhcmdzLCBrd2FyZ3MsIHJlc3VsdCk6CiAgICAgICAgICAgIHRyeToKICAgICAgICAgICAgICAgIHRyeToKICAgICAg"
-    "ICAgICAgICAgICAgICBkZXYgPSBfZGV2aWNlKGFyZ3MsIGt3YXJncywgcmVzdWx0KQogICAgICAgICAgICAgICAgZXhjZXB0IEV4"
-    "Y2VwdGlvbjoKICAgICAgICAgICAgICAgICAgICBkZXYgPSBOb25lCiAgICAgICAgICAgICAgICByZWNvcmQoX3N0YXRlKGFyZ3Ms"
-    "IGt3YXJncywgcmVzdWx0KSwgbGFiZWw9bmFtZSwgYW5jaG9yPWFuY2hvciwgZGV2aWNlPWRldikKICAgICAgICAgICAgZXhjZXB0"
-    "IEV4Y2VwdGlvbiBhcyBlOgogICAgICAgICAgICAgICAgbG9nLndhcm5pbmcoInNlYmJpX2FkYXB0ZXI6ICVzIG5vdCByZWNvcmRl"
-    "ZCAoJXMpIiwgbmFtZSwgZSkKCiAgICAgICAgaWYgaW5zcGVjdC5pc2Nvcm91dGluZWZ1bmN0aW9uKGZuKToKICAgICAgICAgICAg"
-    "QGZ1bmN0b29scy53cmFwcyhmbikKICAgICAgICAgICAgYXN5bmMgZGVmIGF3cmFwcGVyKCphcmdzLCAqKmt3YXJncyk6CiAgICAg"
-    "ICAgICAgICAgICByZXN1bHQgPSBhd2FpdCBmbigqYXJncywgKiprd2FyZ3MpCiAgICAgICAgICAgICAgICBfYW5jaG9yKGFyZ3Ms"
-    "IGt3YXJncywgcmVzdWx0KQogICAgICAgICAgICAgICAgcmV0dXJuIHJlc3VsdAogICAgICAgICAgICByZXR1cm4gYXdyYXBwZXIK"
-    "CiAgICAgICAgQGZ1bmN0b29scy53cmFwcyhmbikKICAgICAgICBkZWYgd3JhcHBlcigqYXJncywgKiprd2FyZ3MpOgogICAgICAg"
-    "ICAgICByZXN1bHQgPSBmbigqYXJncywgKiprd2FyZ3MpCiAgICAgICAgICAgIF9hbmNob3IoYXJncywga3dhcmdzLCByZXN1bHQp"
-    "CiAgICAgICAgICAgIHJldHVybiByZXN1bHQKICAgICAgICByZXR1cm4gd3JhcHBlcgogICAgcmV0dXJuIGRlY28KCgpjbGFzcyBB"
-    "bmNob3JMb2dIYW5kbGVyKGxvZ2dpbmcuSGFuZGxlcik6CiAgICAiIiJGaW5nZXJwcmludHMgZXZlcnkgbG9nIHJlY29yZCBpdCBz"
-    "ZWVzOiBsb2dnZXIsIGxldmVsLCBtZXNzYWdlIGFuZCB0aW1lLiIiIgoKICAgIGRlZiBfX2luaXRfXyhzZWxmLCBhbmNob3I9Tm9u"
-    "ZSwgbGV2ZWw9bG9nZ2luZy5JTkZPKToKICAgICAgICBsb2dnaW5nLkhhbmRsZXIuX19pbml0X18oc2VsZiwgbGV2ZWwpCiAgICAg"
-    "ICAgc2VsZi5fYW5jaG9yID0gYW5jaG9yCgogICAgZGVmIGVtaXQoc2VsZiwgcmVjKToKICAgICAgICBpZiByZWMubmFtZS5zdGFy"
-    "dHN3aXRoKCJzZWJiaV9hZGFwdGVyIik6CiAgICAgICAgICAgIHJldHVybgogICAgICAgIHRyeToKICAgICAgICAgICAgcmVjb3Jk"
-    "KHsibG9nZ2VyIjogcmVjLm5hbWUsICJsZXZlbCI6IHJlYy5sZXZlbG5hbWUsICJtZXNzYWdlIjogcmVjLmdldE1lc3NhZ2UoKSwK"
-    "ICAgICAgICAgICAgICAgICAgICAidGltZSI6IHJvdW5kKHJlYy5jcmVhdGVkLCA2KX0sIGxhYmVsPSJsb2c6IiArIHJlYy5uYW1l"
-    "LCBhbmNob3I9c2VsZi5fYW5jaG9yKQogICAgICAgIGV4Y2VwdCBFeGNlcHRpb246CiAgICAgICAgICAgIHBhc3MKCgojIC0tLS0t"
-    "LS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0gY29tbWFuZCBsaW5lCgpk"
-    "ZWYgX21haW4oYXJndik6CiAgICBsb2dnaW5nLmJhc2ljQ29uZmlnKGxldmVsPWxvZ2dpbmcuSU5GTywgZm9ybWF0PSIlKG1lc3Nh"
-    "Z2UpcyIpCiAgICBjbWQgPSBhcmd2WzFdIGlmIGxlbihhcmd2KSA+IDEgZWxzZSAic3RhdHVzIgogICAgaWYgY21kID09ICJoYXNo"
-    "IiBhbmQgbGVuKGFyZ3YpID4gMjoKICAgICAgICBwcmludChzdGF0ZV9oYXNoKGpzb24ubG9hZHMoYXJndlsyXSkpKQogICAgICAg"
-    "IHJldHVybiAwCiAgICBhID0gQW5jaG9yKHN0YXJ0PUZhbHNlKQogICAgaWYgY21kID09ICJzdGF0dXMiOgogICAgICAgIHByaW50"
-    "KGpzb24uZHVtcHMoZGljdChhLmNvdW50cygpLCBlbmRwb2ludD1hLmVuZHBvaW50LCBkYj1hLmRiX3BhdGgsIGRldmljZT1hLmRl"
-    "dmljZSwKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAga2V5X3NldD1ib29sKGEuYXBpX2tleSkpLCBpbmRlbnQ9MikpCiAg"
-    "ICBlbGlmIGNtZCA9PSAiZmx1c2giOgogICAgICAgIHByaW50KCJyZWNlaXB0ZWQgJWQiICUgYS5mbHVzaCh0aW1lb3V0PTEyMCkp"
-    "CiAgICAgICAgYS5fdXBncmFkZShsaW1pdD01MDApCiAgICAgICAgcHJpbnQoanNvbi5kdW1wcyhhLmNvdW50cygpLCBpbmRlbnQ9"
-    "MikpCiAgICBlbGlmIGNtZCA9PSAicmVjZWlwdCIgYW5kIGxlbihhcmd2KSA+IDI6CiAgICAgICAgcHJpbnQoanNvbi5kdW1wcyhh"
-    "LnJlY2VpcHQoYXJndlsyXSksIGluZGVudD0yKSkKICAgIGVsaWYgY21kID09ICJ2ZXJpZnkiOgogICAgICAgIHdpdGggYS5fbGs6"
-    "CiAgICAgICAgICAgIHJvd3MgPSBhLl9kYi5leGVjdXRlKCJTRUxFQ1QgcmVjZWlwdCBGUk9NIHJlY2VpcHRzIikuZmV0Y2hhbGwo"
-    "KQogICAgICAgIGdvb2QgPSBzdW0oMSBmb3IgKHIsKSBpbiByb3dzIGlmIChsYW1iZGEgZDogdmVyaWZ5X2luY2x1c2lvbihkLmdl"
-    "dCgiZW50cnlfaGFzaCIsICIiKSwgZC5nZXQoImxlYWZfaW5kZXgiLCAtMSksCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
-    "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBkLmdldCgidHJlZV9zaXplIiwgMCksIGQuZ2V0KCJhdWRp"
-    "dF9wYXRoIiwgW10pLAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
-    "ICAgICAgICAgZC5nZXQoInJvb3QiLCAiIikpKShqc29uLmxvYWRzKHIpKSkKICAgICAgICBwcmludCgiJWQgb2YgJWQgc3RvcmVk"
-    "IHJlY2VpcHRzIHBhc3MgdGhlIFJGQyA2OTYyIGluY2x1c2lvbiBjaGVjayIgJSAoZ29vZCwgbGVuKHJvd3MpKSkKICAgIGVsc2U6"
-    "CiAgICAgICAgcHJpbnQoX19kb2NfXykKICAgIHJldHVybiAwCgoKaWYgX19uYW1lX18gPT0gIl9fbWFpbl9fIjoKICAgIHN5cy5l"
-    "eGl0KF9tYWluKHN5cy5hcmd2KSkK"
-)
-_EXAMPLE_B64 = (
-    "IiIiCmV4YW1wbGVfbGVnYWN5X2FwcC5weSAtIGhvdyBhbiBleGlzdGluZyBhcHBsaWNhdGlvbiBwbHVncyBpbiBzZWJiaV9hZGFw"
-    "dGVyLgoKTm90aGluZyBpbiB0aGUgYnVzaW5lc3MgbG9naWMgY2hhbmdlcy4gRWFjaCBleGFtcGxlIGlzIHRoZSBvcmlnaW5hbCBj"
-    "b2RlIHBsdXMKdGhlIGFkYXB0ZXIgbGluZXMgbWFya2VkICAjIDwtIHNlYmJpLgoKUnVuIGl0OiAgIFNFQkJJX0FQSV9LRVk9eW91"
-    "ci1rZXkgcHl0aG9uIGV4YW1wbGVfbGVnYWN5X2FwcC5weQpUaGVuOiAgICAgcHl0aG9uIHNlYmJpX2FkYXB0ZXIucHkgc3RhdHVz"
-    "CiIiIgoKaW1wb3J0IGFzeW5jaW8KaW1wb3J0IGxvZ2dpbmcKaW1wb3J0IHNxbGl0ZTMKCmZyb20gc2ViYmlfYWRhcHRlciBpbXBv"
-    "cnQgYW5jaG9yX3N0YXRlLCByZWNvcmQsIEFuY2hvckxvZ0hhbmRsZXIgICAjIDwtIHNlYmJpIChsaW5lIDEpCgoKIyAtLS0tIDEu"
-    "IEEgZGF0YWJhc2Ugd3JpdGUuIFR3byBsaW5lczogdGhlIGltcG9ydCBhYm92ZSBhbmQgdGhlIGRlY29yYXRvci4gLS0tLQoKZGIg"
-    "PSBzcWxpdGUzLmNvbm5lY3QoIjptZW1vcnk6IikKZGIuZXhlY3V0ZSgiQ1JFQVRFIFRBQkxFIGFjY291bnRzKGlkIElOVEVHRVIg"
-    "UFJJTUFSWSBLRVksIGJhbGFuY2UgSU5URUdFUikiKQpkYi5leGVjdXRlKCJJTlNFUlQgSU5UTyBhY2NvdW50cyBWQUxVRVMoNDIs"
-    "IDEwMDApIikKCgpAYW5jaG9yX3N0YXRlKCJhY2NvdW50cy5kZWJpdCIpICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
-    "ICAgIyA8LSBzZWJiaSAobGluZSAyKQpkZWYgZGViaXQoYWNjb3VudF9pZCwgYW1vdW50KToKICAgIGRiLmV4ZWN1dGUoIlVQREFU"
-    "RSBhY2NvdW50cyBTRVQgYmFsYW5jZSA9IGJhbGFuY2UgLSA/IFdIRVJFIGlkID0gPyIsIChhbW91bnQsIGFjY291bnRfaWQpKQog"
-    "ICAgZGIuY29tbWl0KCkKICAgIGJhbGFuY2UgPSBkYi5leGVjdXRlKCJTRUxFQ1QgYmFsYW5jZSBGUk9NIGFjY291bnRzIFdIRVJF"
-    "IGlkID0gPyIsIChhY2NvdW50X2lkLCkpLmZldGNob25lKClbMF0KICAgIHJldHVybiB7ImFjY291bnQiOiBhY2NvdW50X2lkLCAi"
-    "ZGViaXRlZCI6IGFtb3VudCwgImJhbGFuY2UiOiBiYWxhbmNlfQoKCiMgLS0tLSAyLiBBbiBBUEkgaGFuZGxlciwgbWV0ZXJlZCBw"
-    "ZXIgZGV2aWNlOiBuYW1lIHRoZSBoYW5kc2V0IGVhY2ggY2hhbmdlIGlzIGFib3V0LiAtLS0tCgpAYW5jaG9yX3N0YXRlKCJvcmRl"
-    "cnMucGxhY2UiLCBjYXB0dXJlPSJib3RoIiwgZGV2aWNlPSJoYW5kc2V0IikgICAjIDUwcCBwZXIgaGFuZHNldCBwZXIgbW9udGgK"
-    "ZGVmIHBsYWNlX29yZGVyKGN1c3RvbWVyLCBpdGVtcywgaGFuZHNldCk6CiAgICByZXR1cm4geyJvcmRlcl9pZCI6IDcwMDEsICJj"
-    "dXN0b21lciI6IGN1c3RvbWVyLCAiaXRlbXMiOiBpdGVtcywgInN0YXR1cyI6ICJhY2NlcHRlZCJ9CgoKIyAtLS0tIDMuIEFuIGFz"
-    "eW5jIGhhbmRsZXIuIFNhbWUgZGVjb3JhdG9yLiAtLS0tCgpAYW5jaG9yX3N0YXRlKCJwYXltZW50cy5yZWZ1bmQiKQphc3luYyBk"
-    "ZWYgcmVmdW5kKHBheW1lbnRfaWQpOgogICAgYXdhaXQgYXN5bmNpby5zbGVlcCgwKQogICAgcmV0dXJuIHsicGF5bWVudCI6IHBh"
-    "eW1lbnRfaWQsICJzdGF0dXMiOiAicmVmdW5kZWQifQoKCiMgLS0tLSA0LiBBIHZhbHVlIHlvdSBvbmx5IHdhbnQgcGFydCBvZjog"
-    "Y2hvb3NlIGl0IHdpdGggZXh0cmFjdD0uIC0tLS0KCmNsYXNzIFVzZXIob2JqZWN0KToKICAgIGRlZiBfX2luaXRfXyhzZWxmLCB1"
-    "aWQsIGVtYWlsLCByb2xlKToKICAgICAgICBzZWxmLnVpZCwgc2VsZi5lbWFpbCwgc2VsZi5yb2xlID0gdWlkLCBlbWFpbCwgcm9s"
-    "ZQoKCkBhbmNob3Jfc3RhdGUoInVzZXJzLnNldF9yb2xlIiwgZXh0cmFjdD1sYW1iZGEgcmVzdWx0LCBhcmdzLCBrd2FyZ3M6IHsi"
-    "dWlkIjogcmVzdWx0LnVpZCwgInJvbGUiOiByZXN1bHQucm9sZX0pCmRlZiBzZXRfcm9sZSh1c2VyLCByb2xlKToKICAgIHVzZXIu"
-    "cm9sZSA9IHJvbGUKICAgIHJldHVybiB1c2VyCgoKIyAtLS0tIDUuIEFuIGV4aXN0aW5nIGxvZ2dlcjogZXZlcnkgSU5GTyBsaW5l"
-    "IGFuZCBhYm92ZSBpcyBmaW5nZXJwcmludGVkLiAtLS0tCgphdWRpdCA9IGxvZ2dpbmcuZ2V0TG9nZ2VyKCJhdWRpdCIpCmF1ZGl0"
-    "LnNldExldmVsKGxvZ2dpbmcuSU5GTykKYXVkaXQuYWRkSGFuZGxlcihBbmNob3JMb2dIYW5kbGVyKCkpICAgICAgICAgICAgICAg"
-    "ICAgICAgICAgICAgICAgICMgPC0gc2ViYmkKCgppZiBfX25hbWVfXyA9PSAiX19tYWluX18iOgogICAgZGViaXQoNDIsIDI1MCkK"
-    "ICAgIHBsYWNlX29yZGVyKCJhY21lIiwgWyJ3aWRnZXQiLCAiZ2VhciJdLCBoYW5kc2V0PSJJTUVJLTM1NjkzODAzNTY0MzgwOSIp"
-    "CiAgICBhc3luY2lvLnJ1bihyZWZ1bmQoInBheV84ODEiKSkKICAgIHNldF9yb2xlKFVzZXIoNSwgImFAZXhhbXBsZS5jb20iLCAi"
-    "dmlld2VyIiksICJhZG1pbiIpCiAgICBhdWRpdC5pbmZvKCJtb250aC1lbmQgY2xvc2UgY29tcGxldGVkIikKICAgIGggPSByZWNv"
-    "cmQoeyJiYXRjaCI6ICIyMDI2LTA5IiwgInJvd3MiOiAxMjA0fSkgICAgICAgICAgICAgICAgIyBhIG9uZS1vZmYsIGFueXdoZXJl"
-    "CiAgICByZWNvcmQoeyJ0aWxsIjogNCwgInNhbGUiOiAxMi41MH0sIGRldmljZT0idGlsbC00IikgICAgICAgICAgICMgYSBvbmUt"
-    "b2ZmIGFib3V0IGEgZGV2aWNlCiAgICBwcmludCgicmVjb3JkZWQsIGZpbmdlcnByaW50IG9mIHRoZSBiYXRjaDoiLCBoKQogICAg"
-    "cHJpbnQoInJlY2VpcHRzIGFycml2ZSBpbiB0aGUgYmFja2dyb3VuZDsgY2hlY2sgd2l0aDogIHB5dGhvbiBzZWJiaV9hZGFwdGVy"
-    "LnB5IHN0YXR1cyIpCg=="
-)
+# Reading is open. A publication record only settles an argument if the
+# other side can check it without going through the publisher.
+PUBLIC = {("GET", "history"), ("GET", "verify"), ("GET", "list"),
+          ("GET", "spec")}
 
+CONTENT_PREFIX = b"AILEASH-PUBLISH-v1:"
 
-def _d(b):
-    return base64.b64decode("".join(b.split()))
+FETCH_TIMEOUT = 8
+MAX_FETCH_BYTES = 2 * 1024 * 1024
+ALLOWED_SCHEMES = ("http", "https")
+ALLOWED_PORTS = (80, 443)
+MAX_EXTERNAL = 8
 
-
-_FILES = {
-    "/plugin": (_d(_PAGE_B64), "text/html; charset=utf-8", None),
-    "/p/sebbi_adapter.py": (_d(_ADAPTER_B64), "text/x-python; charset=utf-8", "sebbi_adapter.py"),
-    "/p/example_legacy_app.py": (_d(_EXAMPLE_B64), "text/x-python; charset=utf-8", "example_legacy_app.py"),
-}
-
-_ctx = {}
 _ready = False
-_patched = False
-_loaded = False
-_leaves = []            # leaf hashes (bytes), index = leaf index
-_cache = {}             # (start, size) -> hash, for complete power-of-two subtrees
-_tree_lock = threading.Lock()
-_cp_lock = threading.Lock()
-_loop_started = False
 
 
-# ---------------------------------------------------------------- RFC 6962
-
-def _h(b):
-    return hashlib.sha256(b).digest()
-
-
-def _leaf_hash(entry):
-    return _h(b"\x00" + entry)
-
-
-def _node(left, right):
-    return _h(b"\x01" + left + right)
-
-
-def _split(n):
-    """Largest power of two strictly less than n (n >= 2)."""
-    k = 1
-    while k * 2 < n:
-        k *= 2
-    return k
-
-
-def _mth(start, n):
-    """Merkle Tree Hash of leaves[start:start+n]."""
-    if n == 0:
-        return _h(b"")
-    if n == 1:
-        return _leaves[start]
-    full = n >= 16 and (n & (n - 1)) == 0
-    if full:
-        hit = _cache.get((start, n))
-        if hit is not None:
-            return hit
-    k = _split(n)
-    out = _node(_mth(start, k), _mth(start + k, n - k))
-    if full:
-        _cache[(start, n)] = out
-    return out
-
-
-def _path(m, start, n):
-    """Audit path for leaf m within leaves[start:start+n]."""
-    if n <= 1:
-        return []
-    k = _split(n)
-    if m < k:
-        return _path(m, start, k) + [_mth(start + k, n - k)]
-    return _path(m - k, start + k, n - k) + [_mth(start, k)]
-
-
-def _subproof(m, start, n, b):
-    if m == n:
-        return [] if b else [_mth(start, n)]
-    k = _split(n)
-    if m <= k:
-        return _subproof(m, start, k, b) + [_mth(start + k, n - k)]
-    return _subproof(m - k, start + k, n - k, False) + [_mth(start, k)]
-
-
-def _consistency(m, n):
-    if m <= 0 or m >= n:
-        return []
-    return _subproof(m, 0, n, True)
-
-
-# ---------------------------------------------------------------- storage
-
-def _setup():
+def _setup(ctx):
     global _ready
-    if _ready or "conn" not in _ctx:
+    if _ready:
         return
-    with _ctx["lock"]:
-        c = _ctx["conn"]
-        c.execute("CREATE TABLE IF NOT EXISTS ppa_leaf(idx INTEGER PRIMARY KEY,entry_hash TEXT NOT NULL,"
-                  "leaf_hash TEXT NOT NULL,client TEXT,cid TEXT,ts REAL,UNIQUE(client,cid))")
-        c.execute("CREATE INDEX IF NOT EXISTS ppa_leaf_entry ON ppa_leaf(entry_hash)")
-        c.execute("CREATE TABLE IF NOT EXISTS ppa_sth(tree_size INTEGER PRIMARY KEY,root TEXT NOT NULL,"
-                  "ts REAL,audit_hash TEXT,block_index INTEGER)")
+    with ctx["lock"]:
+        c = ctx["conn"]
+        c.execute("CREATE TABLE IF NOT EXISTS publish_seal("
+                  "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,url TEXT,"
+                  "content_hash TEXT,byte_length INTEGER,http_status INTEGER,"
+                  "content_type TEXT,note TEXT,external TEXT,"
+                  "fetched REAL,audit_hash TEXT,block_index INTEGER)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_pub_url ON publish_seal(url,id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_pub_hash ON publish_seal(content_hash)")
         c.commit()
     _ready = True
 
 
-def _reload_locked(c):
-    """Rebuild the in-memory tree from the database. Caller holds _ctx['lock']."""
-    rows = c.execute("SELECT idx,leaf_hash FROM ppa_leaf ORDER BY idx").fetchall()
-    fresh = []
-    for i, (idx, lh) in enumerate(rows):
-        if idx != i:
-            raise RuntimeError("leaf index gap at %d" % i)
-        fresh.append(bytes.fromhex(lh))
-    _cache.clear()
-    _leaves[:] = fresh
-
-
-def _load():
-    global _loaded
-    if _loaded:
-        return
-    with _tree_lock:
-        if _loaded:
-            return
-        with _ctx["lock"]:
-            _reload_locked(_ctx["conn"])
-        _loaded = True
-
-
-def _seal(kind, detail, extra):
-    ev = {"user_id": "ppa:" + kind[:20], "action": kind, "amount": 0, "country": "UK",
-          "device_id": "public-proof-adapter", "anomaly": 0, "device_risk": 0}
-    res = {"decision": kind.upper(), "score": 0, "adapter_version": VERSION, "detail": detail}
-    res.update(extra or {})
-    out = _ctx["seal"](ev, res, time.time(), KEY)
-    if isinstance(out, (list, tuple)):
-        return out[0], (out[1] if len(out) > 1 else None)
-    return out, None
-
-
-def _sth_rows(sql, args=()):
-    with _ctx["lock"]:
-        return _ctx["conn"].execute(sql, args).fetchall()
-
-
-def _latest_sth():
-    r = _sth_rows("SELECT tree_size,root,ts,audit_hash,block_index FROM ppa_sth ORDER BY tree_size DESC LIMIT 1")
-    return _sth_dict(r[0]) if r else None
-
-
-def _covering_sth(idx):
-    r = _sth_rows("SELECT tree_size,root,ts,audit_hash,block_index FROM ppa_sth WHERE tree_size>? "
-                  "ORDER BY tree_size ASC LIMIT 1", (idx,))
-    return _sth_dict(r[0]) if r else None
-
-
-def _sth_dict(r):
-    return {"tree_size": r[0], "root": r[1],
-            "sealed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(r[2] or 0)),
-            "audit_hash": r[3], "block_index": r[4],
-            "walk": SITE + "/x/walk/block?index=%s" % r[4] if r[4] is not None else None,
-            "ts": r[2] or 0}
-
-
-# ---------------------------------------------------------------- appends and checkpoints
-
-def _append(client, items):
-    """items: list of (entry_hex, cid or None). Returns list of (idx, entry_hex, replayed, error)."""
-    for attempt in range(3):
-        out = []
-        with _ctx["lock"]:
-            c = _ctx["conn"]
-            top = c.execute("SELECT COALESCE(MAX(idx),-1) FROM ppa_leaf").fetchone()[0]
-            if top + 1 != len(_leaves):
-                _reload_locked(c)
-            start_len = len(_leaves)
-            try:
-                for eh, cid in items:
-                    if cid:
-                        row = c.execute("SELECT idx,entry_hash FROM ppa_leaf WHERE client=? AND cid=?",
-                                        (client, cid)).fetchone()
-                        if row:
-                            if row[1] != eh:
-                                out.append((None, eh, False, "cid_reused_for_a_different_hash"))
-                            else:
-                                out.append((row[0], eh, True, None))
-                            continue
-                    idx = len(_leaves)
-                    lh = _leaf_hash(bytes.fromhex(eh))
-                    c.execute("INSERT INTO ppa_leaf(idx,entry_hash,leaf_hash,client,cid,ts) VALUES(?,?,?,?,?,?)",
-                              (idx, eh, lh.hex(), client, cid or None, time.time()))
-                    _leaves.append(lh)
-                    out.append((idx, eh, False, None))
-                c.commit()
-                return out
-            except sqlite3.IntegrityError:
-                c.rollback()
-                del _leaves[start_len:]
-                _reload_locked(c)
-            except Exception:
-                c.rollback()
-                del _leaves[start_len:]
-                raise
-    raise RuntimeError("could not append after retries")
-
-
-def _checkpoint(force=False):
-    """Seal the current tree head into the chain if it is due. Never runs twice at once."""
-    if "conn" not in _ctx or not _cp_lock.acquire(blocking=False):
+def _iso(ts):
+    if not ts:
         return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+# ----------------------------------------------------------------------
+# fetching - read the SSRF note above before touching any of this
+# ----------------------------------------------------------------------
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect is an instruction to fetch a second URL we never checked."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_opener = urllib.request.build_opener(_NoRedirect)
+
+
+def _address_allowed(host, port):
     try:
-        _load()
-        n = len(_leaves)
-        last = _latest_sth()
-        last_size = last["tree_size"] if last else 0
-        if n == 0 or n == last_size:
-            return last
-        due = force or (n - last_size) >= CHECKPOINT_EVERY or \
-            (time.time() - (last["ts"] if last else 0)) >= CHECKPOINT_SECONDS
-        if not due:
-            return last
-        root = _mth(0, n).hex()
-        ah, blk = _seal("tree_head", "size=%d;root=%s" % (n, root),
-                        {"tree_size": n, "root": root, "prev_tree_size": last_size,
-                         "log": "sebbi public proof log", "spec": "RFC6962-SHA256"})
-        with _ctx["lock"]:
-            _ctx["conn"].execute("INSERT OR IGNORE INTO ppa_sth(tree_size,root,ts,audit_hash,block_index) "
-                                 "VALUES(?,?,?,?,?)", (n, root, time.time(), ah, blk))
-            _ctx["conn"].commit()
-        return _latest_sth()
-    finally:
-        _cp_lock.release()
-
-
-def _loop():
-    while True:
-        time.sleep(10)
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+    except Exception as exc:
+        return False, "could not resolve host (%s)" % type(exc).__name__
+    if not infos:
+        return False, "host resolved to nothing"
+    for info in infos:
         try:
-            _checkpoint()
-        except Exception as e:
-            print("public_proof_adapter checkpoint: " + str(e)[:160], flush=True)
-
-
-def _start_loop():
-    global _loop_started
-    if _loop_started:
-        return
-    _loop_started = True
-    threading.Thread(target=_loop, name="ppa-checkpoint", daemon=True).start()
-
-
-# ---------------------------------------------------------------- receipts
-
-def _anchoring_note(cp):
-    if not cp:
-        return ("pending: this leaf is covered by the next tree head, sealed into the chain within about "
-                "%d seconds. Fetch /p/receipt?leaf=N again after that." % CHECKPOINT_SECONDS)
-    return ("tree head sealed in chain block %s. The chain tip is timestamped in Bitcoin via OpenTimestamps; "
-            "once a confirmed anchored tip is at or after that block, this leaf is Bitcoin-anchored. "
-            "Check: %s/x/ots/latest_confirmed" % (cp["block_index"], SITE))
-
-
-def _receipt(idx, size=None):
-    _load()
-    n = len(_leaves)
-    if idx < 0 or idx >= n:
-        return None
-    with _ctx["lock"]:
-        row = _ctx["conn"].execute("SELECT entry_hash FROM ppa_leaf WHERE idx=?", (idx,)).fetchone()
-    cp = _covering_sth(idx) if size is None else None
-    tsize = size if size is not None else (cp["tree_size"] if cp else n)
-    tsize = max(idx + 1, min(tsize, n))
-    root = _mth(0, tsize).hex()
-    rec = {"log": "sebbi.pro public proof log", "spec": SPEC,
-           "entry_hash": row[0] if row else None, "leaf_index": idx,
-           "leaf_hash": _leaves[idx].hex(), "tree_size": tsize, "root": root,
-           "audit_path": [p.hex() for p in _path(idx, 0, tsize)],
-           "checkpoint": None, "anchoring": _anchoring_note(cp)}
-    if cp:
-        c2 = dict(cp)
-        c2.pop("ts", None)
-        c2["root_matches"] = (cp["root"] == root)
-        rec["checkpoint"] = c2
-    return rec
-
-
-# ---------------------------------------------------------------- commands
-
-def _meter(key, devices):
-    """Count each distinct device on the key's monthly meter - the engine's own record_device()."""
-    key = str(key or "").strip()
-    devices = [d for d in dict.fromkeys(devices) if d and CID_RE.match(d)]
-    if not key or not devices:
-        return None
-    rd = _server_fn("record_device")
-    n = None
-    for d in devices:
-        dev_id = "adapter:" + d
-        if rd:
-            try:
-                n = rd(key, dev_id)
-                continue
-            except Exception:
-                pass
-        try:
-            with _ctx["lock"]:
-                c = _ctx["conn"]
-                c.execute("INSERT OR IGNORE INTO device_seen(api_key,device_id,first_seen) VALUES(?,?,?)",
-                          (key, dev_id, time.time()))
-                c.commit()
-                n = c.execute("SELECT COUNT(*) FROM device_seen WHERE api_key=?", (key,)).fetchone()[0]
-        except Exception:
-            try:
-                _ctx["conn"].rollback()
-            except Exception:
-                pass
-    return n
-
-
-TRIAL_DAYS = 90
-
-
-def _server_fn(name):
-    """Borrow a function from the running server (server.py) if it is there."""
-    for modname in ("__main__", "server"):
-        m = sys.modules.get(modname)
-        fn = getattr(m, name, None) if m else None
-        if callable(fn):
-            return fn
-    return None
-
-
-def _trial_gate(key):
-    """None if the key may submit; otherwise the same 402 answer the engine gives at trial end."""
-    try:
-        with _ctx["lock"]:
-            row = _ctx["conn"].execute("SELECT email,is_paid,created,product FROM api_keys WHERE key=?",
-                                       (key,)).fetchone()
-    except Exception:
-        return None
-    if not row:
-        return None
-    email, is_paid, created, product = row
-    ts = _server_fn("trial_state")
-    in_trial = ts(created, is_paid)[0] if ts else (bool(is_paid) or time.time() - (created or 0) <= TRIAL_DAYS * 86400)
-    if in_trial:
-        return None
-    dc = _server_fn("device_count")
-    tc = _server_fn("trial_checkout")
-    try:
-        devices = dc(key) if dc else None
-    except Exception:
-        devices = None
-    try:
-        url = tc(key, email, product or "aileash") if tc else SITE + "/#signup"
-    except Exception:
-        url = SITE + "/#signup"
-    return {"error": "trial_expired",
-            "message": "Your 90-day free trial has ended. Your receipts, proofs and queued fingerprints are "
-                       "untouched - pay to continue exactly where you left off. The bill is 50p for each real "
-                       "device that used your key.",
-            "billable_devices": devices, "rate_per_device_gbp": 0.50, "checkout_url": url}
-
-
-def _client_for(key):
-    key = str(key or "").strip()
-    if key:
-        try:
-            with _ctx["lock"]:
-                row = _ctx["conn"].execute("SELECT active FROM api_keys WHERE key=?", (key,)).fetchone()
-        except Exception:
-            row = None
-        if row and row[0] in (1, None):
-            return "k_" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
-    return "open" if OPEN else None
-
-
-def c_submit(q, body, key):
-    client = _client_for(key)
-    if not client:
-        return {"error": "api_key_required",
-                "message": "Send your sebbi.pro API key in the X-Sebbi-Key header."}, 401
-    if client != "open":
-        gate = _trial_gate(str(key).strip())
-        if gate:
-            return gate, 402
-    raw = body.get("items")
-    if raw is None and body.get("hashes") is not None:
-        raw = [{"hash": h} for h in body.get("hashes") or []]
-    if raw is None and body.get("hash") is not None:
-        raw = [{"hash": body.get("hash"), "cid": body.get("cid")}]
-    if not isinstance(raw, list) or not raw:
-        return {"error": "nothing_to_submit", "message": 'Send {"items":[{"hash":"<64 hex>","cid":"..."}]}'}, 400
-    if len(raw) > MAX_ITEMS:
-        return {"error": "too_many", "max_items": MAX_ITEMS}, 413
-    items, bad, devs = [], [], []
-    install = str(body.get("device") or "").strip()
-    for i, it in enumerate(raw):
-        it = it if isinstance(it, dict) else {"hash": it}
-        h = str(it.get("hash") or "").strip().lower()
-        cid = str(it.get("cid") or "").strip() or None
-        dev = str(it.get("device") or "").strip() or install
-        if not HEX64.match(h):
-            bad.append({"position": i, "error": "hash must be 64 hex characters (SHA-256)"})
-        elif cid and not CID_RE.match(cid):
-            bad.append({"position": i, "error": "cid must be 1-80 letters, numbers, _ . : -"})
-        elif dev and not CID_RE.match(dev):
-            bad.append({"position": i, "error": "device must be 1-80 letters, numbers, _ . : -"})
-        else:
-            items.append((h, cid))
-            devs.append(dev)
-    if bad:
-        return {"error": "bad_items", "items": bad}, 400
-    _load()
-    devices = _meter(key, devs) if client != "open" else None
-    placed = _append(client, items)
-    n = len(_leaves)
-    last = _latest_sth()
-    if n - (last["tree_size"] if last else 0) >= CHECKPOINT_EVERY:
-        threading.Thread(target=_checkpoint, daemon=True).start()
-    receipts = []
-    for (idx, eh, replayed, err), (_, cid) in zip(placed, items):
-        if err:
-            receipts.append({"cid": cid, "entry_hash": eh, "error": err})
-            continue
-        r = _receipt(idx, size=n)
-        r["cid"] = cid
-        r["replayed"] = replayed
-        r["anchoring"] = _anchoring_note(None)
-        receipts.append(r)
-    return {"accepted": sum(1 for r in receipts if "error" not in r), "tree_size": n,
-            "devices_this_month": devices,
-            "root": _mth(0, n).hex(), "receipts": receipts}, 200
-
-
-def _int(q, name, default=None):
-    try:
-        return int(str(q.get(name, default)))
-    except (TypeError, ValueError):
-        return None
-
-
-def c_receipt(q, body, key):
-    idx = _int(q, "leaf")
-    if idx is None:
-        return {"error": "leaf needed"}, 400
-    r = _receipt(idx)
-    return (r, 200) if r else ({"error": "no such leaf"}, 404)
-
-
-def c_proof(q, body, key):
-    idx, size = _int(q, "leaf"), _int(q, "size", 0)
-    if idx is None:
-        return {"error": "leaf needed"}, 400
-    r = _receipt(idx, size=size or len(_leaves))
-    return (r, 200) if r else ({"error": "no such leaf"}, 404)
-
-
-def c_consistency(q, body, key):
-    _load()
-    m, n = _int(q, "first"), _int(q, "second", len(_leaves))
-    if m is None or n is None or m < 1 or m > n or n > len(_leaves):
-        return {"error": "need 1 <= first <= second <= tree size", "tree_size": len(_leaves)}, 400
-    return {"first": m, "second": n, "first_root": _mth(0, m).hex(), "second_root": _mth(0, n).hex(),
-            "proof": [p.hex() for p in _consistency(m, n)], "spec": SPEC}, 200
-
-
-def c_sth(q, body, key):
-    _load()
-    last = _latest_sth()
-    if last:
-        last.pop("ts", None)
-    return {"tree_size": len(_leaves), "latest_sealed_tree_head": last,
-            "checkpoint_every_seconds": CHECKPOINT_SECONDS, "spec": SPEC}, 200
-
-
-def c_find(q, body, key):
-    h = str(q.get("hash") or "").strip().lower()
-    if not HEX64.match(h):
-        return {"error": "hash must be 64 hex characters"}, 400
-    rows = _sth_rows("SELECT idx FROM ppa_leaf WHERE entry_hash=? ORDER BY idx LIMIT 50", (h,))
-    return {"entry_hash": h, "leaf_indexes": [r[0] for r in rows]}, 200
-
-
-def c_index(q, body, key):
-    return {"log": "sebbi.pro public proof log", "version": VERSION, "spec": SPEC,
-            "submit": "POST " + SITE + "/p/submit with X-Sebbi-Key",
-            "check": ["GET " + SITE + "/p/receipt?leaf=N", "GET " + SITE + "/p/consistency?first=M&second=N",
-                      "GET " + SITE + "/p/sth"],
-            "hash_only": True}, 200
-
-
-GETS = {"receipt": c_receipt, "proof": c_proof, "consistency": c_consistency, "sth": c_sth,
-        "find": c_find, "": c_index}
-POSTS = {"submit": c_submit}
-
-
-# ---------------------------------------------------------------- transport
-
-def _send(h, obj, code=200):
-    body = json.dumps(obj).encode("utf-8")
-    h.send_response(code)
-    h.send_header("Content-Type", "application/json; charset=utf-8")
-    h.send_header("Content-Length", str(len(body)))
-    h.send_header("Access-Control-Allow-Origin", "*")
-    h.send_header("Access-Control-Allow-Headers", "Content-Type, X-Sebbi-Key")
-    h.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-    h.send_header("Cache-Control", "no-store")
-    h.end_headers()
-    h.wfile.write(body)
-
-
-def _run(h, method):
-    u = urllib.parse.urlparse(h.path)
-    name = u.path[3:].strip("/").lower()
-    table = GETS if method == "GET" else POSTS
-    if name not in table:
-        return False
-    if "conn" not in _ctx:
-        _send(h, {"error": "not_armed", "message": "open /x/public_proof_adapter/status once"}, 503)
-        return True
-    _setup()
-    q = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
-    body = {}
-    if method == "POST":
-        try:
-            n = int(h.headers.get("Content-Length") or 0)
+            addr = ipaddress.ip_address(info[4][0])
         except ValueError:
-            n = 0
-        if n > MAX_BODY:
-            _send(h, {"error": "body_too_large", "max_bytes": MAX_BODY}, 413)
-            return True
-        try:
-            body = json.loads(h.rfile.read(n).decode("utf-8") or "{}") if n else {}
-            if not isinstance(body, dict):
-                body = {}
-        except Exception:
-            _send(h, {"error": "bad_json"}, 400)
-            return True
-    key = h.headers.get("X-Sebbi-Key") or body.get("key") or q.get("key")
+            return False, "unreadable address"
+        if (addr.is_private or addr.is_loopback or addr.is_link_local
+                or addr.is_reserved or addr.is_multicast or addr.is_unspecified):
+            return False, "address is not publicly routable"
+    return True, None
+
+
+def _url_allowed(url):
+    if not url or not isinstance(url, str) or len(url) > 500:
+        return False, "no usable url"
     try:
-        out, code = table[name](q, body, key)
-    except Exception as e:
-        out, code = {"error": "failed", "detail": str(e)[:160]}, 500
-    _send(h, out, code)
-    return True
+        parts = urlparse(url.strip())
+    except Exception:
+        return False, "unparseable url"
+    if parts.scheme not in ALLOWED_SCHEMES:
+        return False, "scheme not allowed"
+    if not parts.hostname:
+        return False, "no host in url"
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    if port not in ALLOWED_PORTS:
+        return False, "port not allowed"
+    return _address_allowed(parts.hostname, port)
 
 
-def _find_handler_class(ctx):
-    if isinstance(ctx, dict):
-        for k in ("handler_class", "handler", "Handler", "h", "request_handler"):
-            v = ctx.get(k)
-            if v is None:
-                continue
-            cls = v if isinstance(v, type) else type(v)
-            if hasattr(cls, "do_GET"):
-                return cls
-    f = sys._getframe()
-    while f is not None:
-        s = f.f_locals.get("self")
-        if s is not None and hasattr(type(s), "do_GET") and hasattr(s, "wfile"):
-            return type(s)
-        f = f.f_back
-    return None
+def _fetch(url):
+    """Returns (body_bytes, status, content_type, error)."""
+    ok, why = _url_allowed(url)
+    if not ok:
+        return None, None, None, why
+    request = urllib.request.Request(url, headers={
+        "Accept": "*/*",
+        "User-Agent": "aileash-publish/%s" % VERSION,
+    })
+    try:
+        with _opener.open(request, timeout=FETCH_TIMEOUT) as response:
+            status = response.getcode()
+            content_type = response.headers.get("Content-Type", "")
+            body = response.read(MAX_FETCH_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        return None, exc.code, None, "url answered %s" % exc.code
+    except Exception as exc:
+        return None, None, None, "could not reach url (%s)" % type(exc).__name__
+    if len(body) > MAX_FETCH_BYTES:
+        return None, status, content_type, "response larger than the %d byte cap" % MAX_FETCH_BYTES
+    return body, status, content_type, None
 
 
-def _install(ctx):
-    global _patched
-    if isinstance(ctx, dict) and "conn" in ctx:
-        _ctx.update(ctx)
-        _setup()
-        _load()
-        _start_loop()
-    if _patched:
-        return True
-    cls = _find_handler_class(ctx)
-    if cls is None:
-        return False
-    if getattr(cls, "_ppa_patched", False):
-        _patched = True
-        return True
-    og, op, oo = cls.do_GET, getattr(cls, "do_POST", None), getattr(cls, "do_OPTIONS", None)
-
-    def do_GET(self):
-        path = self.path.split("?")[0].split("#")[0].rstrip("/") or "/"
-        hit = _FILES.get(path)
-        if hit:
-            body, ctype, fname = hit
-            self.send_response(200)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(body)))
-            if fname:
-                self.send_header("Content-Disposition", 'attachment; filename="%s"' % fname)
-            self.send_header("Cache-Control", "no-cache")
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        if (self.path == "/p" or self.path.startswith("/p/")) and _run(self, "GET"):
-            return
-        return og(self)
-
-    def do_POST(self):
-        if self.path.startswith("/p/") and _run(self, "POST"):
-            return
-        return op(self) if op else None
-
-    def do_OPTIONS(self):
-        if self.path.startswith("/p/"):
-            self.send_response(204)
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Sebbi-Key")
-            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
-        return oo(self) if oo else None
-
-    cls.do_GET = do_GET
-    if op:
-        cls.do_POST = do_POST
-    cls.do_OPTIONS = do_OPTIONS
-    cls._ppa_patched = True
-    _patched = True
-    return True
+def _content_hash(body):
+    """Hash exactly the bytes served. No normalisation, no cleverness -
+    a whitespace-tolerant hash would be a hash of our opinion of the page
+    rather than of the page."""
+    return hashlib.sha256(CONTENT_PREFIX + body).hexdigest()
 
 
-def _flat(d):
-    if not isinstance(d, dict):
-        return {}
-    return {k: (v[0] if isinstance(v, list) and v else v) for k, v in d.items()}
+# ----------------------------------------------------------------------
+# seal
+# ----------------------------------------------------------------------
+
+def _clean_external(value):
+    """External references are recorded verbatim and never verified."""
+    if not isinstance(value, list):
+        return []
+    out = []
+    for item in value[:MAX_EXTERNAL]:
+        if isinstance(item, dict):
+            source = str(item.get("source", "")).strip()[:60]
+            reference = str(item.get("reference", item.get("url", ""))).strip()[:400]
+            claimed = str(item.get("claimed_time", "")).strip()[:60]
+            if source and reference:
+                out.append({"source": source, "reference": reference,
+                            "claimed_time": claimed or None})
+        elif isinstance(item, str) and item.strip():
+            out.append({"source": "unnamed", "reference": item.strip()[:400],
+                        "claimed_time": None})
+    return out
+
+
+def _seal(ctx, api_key, data):
+    url = str(data.get("url", "")).strip()
+    if not url:
+        return {"error": "url_required",
+                "message": "The address of the page you have just published."}, 400
+
+    note = str(data.get("note", "") or "").strip()[:300]
+    external = _clean_external(data.get("external"))
+
+    body, status, content_type, why = _fetch(url)
+    if why:
+        return {"error": "fetch_failed", "url": url, "message": why,
+                "note": "Nothing was sealed. A record of a page we could not read would be "
+                        "worse than no record."}, 502
+
+    digest = _content_hash(body)
+    now = time.time()
+
+    with ctx["lock"]:
+        prior = ctx["conn"].execute(
+            "SELECT content_hash,fetched,audit_hash FROM publish_seal "
+            "WHERE url=? ORDER BY id ASC", (url,)).fetchall()
+
+    unchanged = bool(prior) and prior[-1][0] == digest
+    first_of_this_version = None
+    for row in prior:
+        if row[0] == digest:
+            first_of_this_version = row[1]
+            break
+
+    external_summary = ";".join("%s=%s" % (e["source"], e["reference"][:60]) for e in external)
+    ev = {"user_id": "pub:" + digest[:16], "action": "publication_sealed", "amount": 0,
+          "country": "UK", "device_id": "publish", "anomaly": 0, "device_risk": 0}
+    res = {"decision": "PUBLICATION_SEALED", "score": 0, "publish_version": VERSION,
+           "url": url, "content_hash": digest, "bytes": len(body),
+           "http_status": status,
+           "detail": "url=%s;sha256=%s;bytes=%d%s"
+                     % (url, digest, len(body),
+                        ";external=" + external_summary if external_summary else "")}
+    audit_hash, block_index, seq = ctx["seal"](ev, res, now, api_key)
+
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "INSERT INTO publish_seal(api_key,url,content_hash,byte_length,http_status,"
+            "content_type,note,external,fetched,audit_hash,block_index) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (api_key, url, digest, len(body), status, content_type or None,
+             note or None,
+             "|".join("%s %s %s" % (e["source"], e["reference"], e["claimed_time"] or "")
+                      for e in external) or None,
+             now, audit_hash, block_index))
+        ctx["conn"].commit()
+
+    out = {
+        "url": url, "content_hash": digest, "bytes": len(body),
+        "http_status": status, "content_type": content_type,
+        "sealed_at": _iso(now),
+        "sealed_in_chain": audit_hash, "block_index": block_index, "receipt_seq": seq,
+        "version_number": len(prior) + 1,
+        "publish_version": VERSION,
+        "what_this_proves": "This exact content was served at this address when we fetched it, "
+                            "and the record of that cannot be altered afterwards.",
+        "what_it_does_not": "It does not prove the page existed earlier than this moment. "
+                            "Nothing can prove that after the fact - timestamps only run "
+                            "forwards. Seal at publication and the question never arises.",
+        "history": "/x/publish/history?url=" + url,
+        "verify_this_block": "/x/consistency/ancestor?tip=" + audit_hash,
+    }
+
+    if unchanged:
+        out["unchanged"] = True
+        out["first_sealed_in_this_form"] = _iso(first_of_this_version)
+        out["message"] = ("Identical to the last sealed version. The page has not changed since "
+                          "%s and now has an additional dated witness." % _iso(first_of_this_version))
+    elif prior:
+        out["changed"] = True
+        out["previous_hash"] = prior[-1][0]
+        out["previous_sealed_at"] = _iso(prior[-1][1])
+        out["message"] = ("The content has changed since the last seal. Both versions remain in "
+                          "the chain - a revision history the publisher cannot edit.")
+    else:
+        out["message"] = ("First seal for this address. Every later seal builds a permanent, "
+                          "dated revision history from here.")
+
+    if external:
+        out["external_references"] = external
+        out["external_caveat"] = ("Recorded exactly as supplied and sealed with the block. We do "
+                                  "not verify them and they are not our evidence - they are "
+                                  "somebody else's record, named so you can check them at "
+                                  "source.")
+    else:
+        out["advice"] = ("If this page was published before today, add external references - a "
+                         "GitHub push event, a Wayback snapshot - and they will be sealed "
+                         "alongside. Those carry an earlier date; a seal made now cannot.")
+    return out, 200
+
+
+# ----------------------------------------------------------------------
+# reading
+# ----------------------------------------------------------------------
+
+def _parse_external(blob):
+    if not blob:
+        return []
+    out = []
+    for line in blob.split("|"):
+        parts = line.strip().split(" ", 2)
+        if len(parts) >= 2:
+            out.append({"source": parts[0], "reference": parts[1],
+                        "claimed_time": parts[2] if len(parts) > 2 and parts[2] else None})
+    return out
+
+
+def _history(ctx, data):
+    url = str(data.get("url", "")).strip()
+    if not url:
+        return {"error": "url_required"}, 400
+    with ctx["lock"]:
+        rows = ctx["conn"].execute(
+            "SELECT content_hash,byte_length,fetched,audit_hash,block_index,note,external "
+            "FROM publish_seal WHERE url=? ORDER BY id ASC LIMIT 500", (url,)).fetchall()
+    if not rows:
+        return {"error": "never_sealed", "url": url,
+                "message": "No seal recorded for that address."}, 404
+
+    versions, last_hash = [], None
+    for content_hash, length, fetched, audit_hash, block_index, note, external in rows:
+        versions.append({
+            "content_hash": content_hash, "bytes": length,
+            "sealed_at": _iso(fetched), "sealed_in_chain": audit_hash,
+            "block_index": block_index, "note": note,
+            "changed_from_previous": last_hash is not None and content_hash != last_hash,
+            "external_references": _parse_external(external),
+        })
+        last_hash = content_hash
+
+    distinct = len({v["content_hash"] for v in versions})
+    return {"url": url, "seals": len(versions), "distinct_versions": distinct,
+            "first_sealed": versions[0]["sealed_at"], "latest_sealed": versions[-1]["sealed_at"],
+            "current_hash": versions[-1]["content_hash"],
+            "versions": versions,
+            "publish_version": VERSION,
+            "what_this_is": "A dated revision history the publisher cannot edit. Each version is "
+                            "its own block; altering or removing one breaks every block after it.",
+            "limit": "The first seal fixes an upper bound, not a lower one. Anything published "
+                     "before its first seal rests on external evidence, which is recorded here "
+                     "but not verified by us."}, 200
+
+
+def _verify(ctx, data):
+    url = str(data.get("url", "")).strip()
+    digest = str(data.get("hash", data.get("content_hash", ""))).strip().lower()
+    if not digest or not HEX64.match(digest):
+        return {"error": "hash_required",
+                "message": "sha256 of AILEASH-PUBLISH-v1: followed by the exact bytes served"}, 400
+
+    with ctx["lock"]:
+        if url:
+            rows = ctx["conn"].execute(
+                "SELECT url,fetched,audit_hash,block_index FROM publish_seal "
+                "WHERE url=? AND content_hash=? ORDER BY id ASC", (url, digest)).fetchall()
+        else:
+            rows = ctx["conn"].execute(
+                "SELECT url,fetched,audit_hash,block_index FROM publish_seal "
+                "WHERE content_hash=? ORDER BY id ASC", (digest,)).fetchall()
+
+    if not rows:
+        return {"sealed": False, "content_hash": digest, "url": url or None,
+                "message": "We hold no seal for that exact content. Either it was never sealed, "
+                           "or the content differs from what was - a single byte is enough."}, 404
+
+    return {"sealed": True, "content_hash": digest,
+            "url": rows[0][0], "times_sealed": len(rows),
+            "first_sealed": _iso(rows[0][1]),
+            "latest_sealed": _iso(rows[-1][1]),
+            "sealed_in_chain": rows[0][2], "block_index": rows[0][3],
+            "publish_version": VERSION,
+            "what_this_proves": "Content with exactly this fingerprint was served at that "
+                                "address no later than the first sealing time, and the record "
+                                "of it has not been altered since.",
+            "verify_the_block": "/x/consistency/ancestor?tip=" + rows[0][2]}, 200
+
+
+def _list(ctx):
+    with ctx["lock"]:
+        rows = ctx["conn"].execute(
+            "SELECT url,COUNT(*),MIN(fetched),MAX(fetched),COUNT(DISTINCT content_hash) "
+            "FROM publish_seal GROUP BY url ORDER BY MAX(fetched) DESC LIMIT 500").fetchall()
+    return {"count": len(rows),
+            "pages": [{"url": r[0], "seals": r[1], "first_sealed": _iso(r[2]),
+                       "latest_sealed": _iso(r[3]), "distinct_versions": r[4],
+                       "history": "/x/publish/history?url=" + r[0]} for r in rows],
+            "publish_version": VERSION,
+            "note": "Everything this platform has sealed about its own published pages. Ours is "
+                    "in here too - a publisher who seals everyone's pages but not their own is "
+                    "telling you something."}, 200
+
+
+def _spec():
+    return {
+        "publish_version": VERSION,
+        "content_hash": "sha256('AILEASH-PUBLISH-v1:' || exact_bytes_served) as lowercase hex",
+        "no_normalisation": "The bytes are hashed exactly as served. Nothing is trimmed, "
+                            "reordered or cleaned up first - a whitespace-tolerant hash would "
+                            "be a hash of our opinion of the page rather than of the page.",
+        "reproduce_it": "curl the URL, pipe the raw bytes through sha256 with that prefix, and "
+                        "compare with what we sealed. If your bytes differ, the page changed.",
+        "what_a_seal_proves": "That content with this exact fingerprint was served at this "
+                              "address no later than the sealing time, and that the record has "
+                              "not been altered since - it is a chain block like any other, "
+                              "anchored externally and witnessed by peers.",
+        "what_it_cannot_prove": "That the page existed before the seal. Timestamps run forwards "
+                                "only. Any product implying otherwise is misdescribing what a "
+                                "timestamp is.",
+        "for_earlier_dates": {
+            "github_push": "api.github.com/repos/<owner>/<repo>/events - the push timestamp is "
+                           "recorded by GitHub, not the pusher, unlike commit author and "
+                           "committer dates which are settable fields. Retained around 90 days, "
+                           "so capture it while it exists.",
+            "wayback": "archive.org/wayback/available - an independent party with no stake in "
+                       "the dispute.",
+            "status": "Both are recorded and sealed as supplied, and neither is verified by us. "
+                      "They are somebody else's evidence, named so you can check them at source.",
+        },
+        "the_discipline": "Seal at publication. One call at the moment a page goes live means "
+                          "the publication date never rests on anyone's word, anyone's git "
+                          "history, or anyone's memory again.",
+    }, 200
+
+
+# ----------------------------------------------------------------------
+# router entry point
+# ----------------------------------------------------------------------
+
+def handle(method, action, data, api_key, ctx):
+    _setup(ctx)
+    action = (action or "").strip("/").lower()
+    data = data or {}
+
+    if method == "GET":
+        if action == "spec":
+            return _spec()
+        if action == "history":
+            return _history(ctx, data)
+        if action == "verify":
+            return _verify(ctx, data)
+        if action == "list":
+            return _list(ctx)
+
+    if method == "POST":
+        if not api_key:
+            return {"error": "invalid_api_key"}, 401
+        if action == "seal":
+            return _seal(ctx, api_key, data)
+
+    return {"error": "unknown_action", "action": action,
+            "GET": ["spec", "history", "verify", "list"],
+            "POST": ["seal (keyed)"]}, 404
+
+```
+
+
+## `modules/ratchet.py`
+
+615 lines, 25928 bytes
+
+```python
+"""
+ratchet.py - time only runs one way for the machine.
+
+WHAT THIS IS FOR
+----------------
+heartbeat.py proves WHEN a record can have been made. sortition.py proves
+NOBODY CHOSE what got reviewed. This one proves an actor cannot move
+backwards through time.
+
+Every action an agent takes is bound to the beacon round current at the
+moment it acted. Beacon rounds only ever increase. So an actor's actions
+form a strictly rising ladder, and the rule is one line:
+
+    an action carrying a beacon round at or below the actor's last
+    recorded round is REFUSED.
+
+WHAT THAT KILLS, WITHOUT A POLICY, A PROMPT OR A PROMISE
+--------------------------------------------------------
+BACKDATING     An agent cannot produce an action claiming to sit earlier
+               than one it already took. The earlier round is already
+               spent.
+REPLAY         Capture a valid action and fire it again later: the round
+               is stale and the digest is already on the ladder.
+PRE-COMPUTATION
+               An agent cannot prepare a batch of actions in advance,
+               because it cannot know tomorrow's beacon values today. A
+               round that has not been sealed here yet is refused.
+REWIND         Restore an agent from an old snapshot to undo its history
+               and its next action lands below the recorded floor. The
+               ladder is in a chain the agent does not control, so
+               restoring the agent does not restore its position.
+
+REFUSALS ARE SEALED, NOT DROPPED
+--------------------------------
+This is the part that matters. A refused action is written into the chain
+with the reason. An agent trying to rewind is the single most interesting
+event this system can observe, and throwing it away as a 409 would be
+throwing away the evidence. /x/ratchet/refusals is public.
+
+HONEST LIMITS
+-------------
+- It binds an actor's actions to an order. It says nothing about whether
+  any action was correct, authorised, or wise.
+- An actor that simply stops acting cannot be forced to continue. Silence
+  is visible (last_seen goes stale) but is not prevented.
+- Two different actor ids are two different ladders. Anyone able to mint
+  new actor ids can start a fresh ladder; that is an identity problem,
+  handled by whatever issues the ids, not here.
+- The floor is only as fine-grained as the beat cadence. At a five
+  minute cadence, two actions inside the same beat are ordered by
+  sequence, not by beacon time, and that is reported rather than dressed
+  up.
+- It depends on heartbeat. With no beats sealed, nothing can be admitted,
+  and this module says so rather than waving actions through.
+
+Contract: handle(method, action, data, api_key, ctx) -> (dict, status)
+Routes:
+  GET  spec      public  what this is and the exact admission rules
+  GET  actor     public  ?id= - one actor's current rung and ladder
+  GET  actors    public  every ladder, with staleness
+  GET  refusals  public  every refused attempt, with reason. The good bit.
+  GET  verify    public  ?id= - re-walk a ladder and report any break
+  GET  status    public  coverage, admission and refusal counts
+  POST act       keyed   submit an action. Admitted or refused; both sealed.
+"""
+
+import json
+import time
+import hashlib
+
+VERSION = "1.0.0"
+
+PUBLIC = {
+    ("GET", "spec"),
+    ("GET", "actor"),
+    ("GET", "actors"),
+    ("GET", "refusals"),
+    ("GET", "verify"),
+    ("GET", "status"),
+}
+
+MAX_LAG_BEATS = 3          # how far behind the newest beat an action may be
+MAX_ACTOR_LEN = 120
+STALE_SECONDS = 3600
+
+REASONS = {
+    "ok": "Admitted. The round is ahead of this actor's last rung.",
+    "no_beats": (
+        "Refused: no beacon has been sealed on this server, so there is no "
+        "time to bind to. Nothing is admitted on trust."),
+    "round_unknown": (
+        "Refused: that beacon round has not been sealed here. Either it has "
+        "not happened yet - which would mean the actor knew a value before "
+        "it existed - or this server has not observed it."),
+    "round_not_advanced": (
+        "Refused: the round is at or below this actor's last rung. This is "
+        "the ratchet. An actor cannot move backwards through beacon time, "
+        "whether by backdating, by replay, or by being restored from an "
+        "older snapshot."),
+    "round_too_stale": (
+        "Refused: the round is further behind the current beat than the "
+        "permitted lag. An action bound to old time is a replay or a very "
+        "slow actor; both are refused and both are recorded."),
+    "digest_replayed": (
+        "Refused: this exact action digest is already on this actor's "
+        "ladder. Identical work resubmitted is a replay by definition."),
+    "bad_request": "Refused: malformed submission.",
+}
+
+WHAT_THIS_PROVES = (
+    "That an actor's recorded actions only ever moved forward in a public "
+    "time nobody controls. It does not prove any action was correct, "
+    "authorised, or sensible."
+)
+
+DDL = [
+    """CREATE TABLE IF NOT EXISTS ratchet_rung (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        actor         TEXT NOT NULL,
+        seq           INTEGER NOT NULL,
+        beacon_round  INTEGER NOT NULL,
+        beacon_value  TEXT,
+        digest        TEXT NOT NULL,
+        label         TEXT,
+        at            REAL NOT NULL,
+        chain_rowid   INTEGER,
+        audit_hash    TEXT
+    )""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_rat_seq ON ratchet_rung(actor, seq)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_rat_dig ON ratchet_rung(actor, digest)",
+    "CREATE INDEX IF NOT EXISTS idx_rat_actor ON ratchet_rung(actor)",
+    """CREATE TABLE IF NOT EXISTS ratchet_refusal (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        actor         TEXT NOT NULL,
+        claimed_round INTEGER,
+        last_round    INTEGER,
+        digest        TEXT,
+        reason        TEXT NOT NULL,
+        at            REAL NOT NULL,
+        chain_rowid   INTEGER,
+        audit_hash    TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_rat_ref ON ratchet_refusal(actor)",
+]
+
+
+# ---------------------------------------------------------------------
+# plumbing
+# ---------------------------------------------------------------------
+
+def _ensure(conn, lock):
+    with lock:
+        cur = conn.cursor()
+        for stmt in DDL:
+            cur.execute(stmt)
+        conn.commit()
+
+
+def _iso(t):
+    if t is None:
+        return None
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+
+
+def _human(seconds):
+    if seconds is None:
+        return None
+    s = int(round(seconds))
+    if s < 60:
+        return "%d seconds" % s
+    if s < 3600:
+        return "%d minutes" % (s // 60)
+    if s < 86400:
+        return "%d hours" % (s // 3600)
+    return "%d days" % (s // 86400)
+
+
+def _seal(ctx, action, payload):
+    """server.py: seal(event, result, ts, api_key=None); event is a DICT
+    carrying user_id; returns (audit_hash, block_index, key_seq)."""
+    fn = ctx.get("seal")
+    if fn is None:
+        return None, None
+    ts = time.time()
+    event = {"user_id": "ratchet", "action": action, "amount": 0,
+             "country": "UK", "device_id": "ratchet", "anomaly": 0,
+             "device_risk": 0}
+    result = dict(payload)
+    result.setdefault("decision", "RATCHET")
+    result.setdefault("score", 0)
+    result.setdefault("version", VERSION)
+    result.setdefault("timestamp", ts)
+    for call in (lambda: fn(event, result, ts),
+                 lambda: fn(event, result, ts, None),
+                 lambda: fn(event, result)):
+        try:
+            out = call()
+        except TypeError:
+            continue
+        except Exception:
+            return None, None
+        h = idx = None
+        if isinstance(out, (tuple, list)):
+            for item in out:
+                if isinstance(item, str) and len(item) == 64 and h is None:
+                    h = item
+                elif isinstance(item, int) and idx is None:
+                    idx = item
+        elif isinstance(out, str):
+            h = out
+        return h, idx
+    return None, None
+
+
+def _newest_beat(conn):
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT beacon_round, value, fetched_at FROM heartbeat_tick"
+                    " WHERE chain_rowid IS NOT NULL AND beacon_round IS NOT NULL"
+                    " ORDER BY beacon_round DESC LIMIT 1")
+        return cur.fetchone()
+    except Exception:
+        return None
+
+
+def _beat(conn, rnd):
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT beacon_round, value, fetched_at FROM heartbeat_tick"
+                    " WHERE beacon_round=? AND chain_rowid IS NOT NULL LIMIT 1",
+                    (rnd,))
+        return cur.fetchone()
+    except Exception:
+        return None
+
+
+def _beats_between(conn, low, high):
+    """How many sealed beats sit in (low, high]. Used for the lag check."""
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM heartbeat_tick WHERE chain_rowid IS"
+                    " NOT NULL AND beacon_round>? AND beacon_round<=?",
+                    (low, high))
+        return cur.fetchone()[0]
+    except Exception:
+        return 0
+
+
+def _top(conn, actor):
+    cur = conn.cursor()
+    cur.execute("SELECT seq, beacon_round, digest, at FROM ratchet_rung"
+                " WHERE actor=? ORDER BY seq DESC LIMIT 1", (actor,))
+    return cur.fetchone()
+
+
+def _refuse(ctx, conn, lock, actor, rnd, last, digest, reason, extra=None):
+    now = time.time()
+    with lock:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO ratchet_refusal (actor, claimed_round,"
+                    " last_round, digest, reason, at) VALUES (?,?,?,?,?,?)",
+                    (actor, rnd, last, digest, reason, now))
+        rid = cur.lastrowid
+        conn.commit()
+    h, idx = _seal(ctx, "ratchet_refused", {
+        "kind": "ratchet_refusal", "actor": actor, "claimed_round": rnd,
+        "last_admitted_round": last, "digest": digest, "reason": reason,
+        "explanation": REASONS.get(reason, reason),
+        "note": ("A refused action is sealed rather than discarded. An actor "
+                 "attempting to move backwards is the most interesting event "
+                 "this module can observe."),
+    })
+    if h or idx:
+        with lock:
+            conn.execute("UPDATE ratchet_refusal SET chain_rowid=?,"
+                         " audit_hash=? WHERE id=?", (idx, h, rid))
+            conn.commit()
+    out = {
+        "admitted": False,
+        "reason": reason,
+        "explanation": REASONS.get(reason, reason),
+        "actor": actor,
+        "claimed_round": rnd,
+        "last_admitted_round": last,
+        "refusal_sealed_at_block": idx,
+        "refusal_audit_hash": h,
+        "this_refusal_is_permanent": True,
+        "public_record": "/x/ratchet/refusals",
+    }
+    if extra:
+        out.update(extra)
+    return out
+
+
+# ---------------------------------------------------------------------
+# handle
+# ---------------------------------------------------------------------
+
+def handle(method, action, data, api_key, ctx):
+    conn, lock = ctx["conn"], ctx["lock"]
+    _ensure(conn, lock)
+
+    if method == "GET" and action == "spec":
+        return _spec(), 200
+
+    # -------------------------------------------------- act
+    if method == "POST" and action == "act":
+        actor = str(data.get("actor") or "").strip().lower()[:MAX_ACTOR_LEN]
+        digest = str(data.get("digest") or "").strip().lower()
+        label = str(data.get("label") or "")[:200] or None
+        rnd = data.get("round")
+
+        if not actor:
+            return {"error": "actor_required",
+                    "note": "A stable identifier for the acting agent."}, 400
+        if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            return {"error": "digest_required",
+                    "note": ("A SHA-256 of the action. The action itself never "
+                             "leaves your system.")}, 400
+
+        newest = _newest_beat(conn)
+        if not newest:
+            top = _top(conn, actor)
+            return _refuse(ctx, conn, lock, actor, rnd,
+                           top[1] if top else None, digest, "no_beats"), 503
+
+        newest_round = newest[0]
+        if rnd is None:
+            rnd = newest_round          # bind to now if the caller does not say
+        try:
+            rnd = int(rnd)
+        except (TypeError, ValueError):
+            return {"error": "round_invalid"}, 400
+
+        top = _top(conn, actor)
+        last_round = top[1] if top else None
+        last_seq = top[0] if top else 0
+
+        if not _beat(conn, rnd):
+            return _refuse(ctx, conn, lock, actor, rnd, last_round, digest,
+                           "round_unknown",
+                           {"newest_sealed_round": newest_round}), 409
+
+        if last_round is not None and rnd <= last_round:
+            return _refuse(ctx, conn, lock, actor, rnd, last_round, digest,
+                           "round_not_advanced",
+                           {"the_rule": ("beacon round must be strictly greater "
+                                         "than the actor's last rung")}), 409
+
+        lag = _beats_between(conn, rnd, newest_round)
+        if lag > MAX_LAG_BEATS:
+            return _refuse(ctx, conn, lock, actor, rnd, last_round, digest,
+                           "round_too_stale",
+                           {"beats_behind": lag,
+                            "max_lag_beats": MAX_LAG_BEATS,
+                            "newest_sealed_round": newest_round}), 409
+
+        cur = conn.cursor()
+        cur.execute("SELECT seq FROM ratchet_rung WHERE actor=? AND digest=?",
+                    (actor, digest))
+        if cur.fetchone():
+            return _refuse(ctx, conn, lock, actor, rnd, last_round, digest,
+                           "digest_replayed"), 409
+
+        beat = _beat(conn, rnd)
+        now = time.time()
+        seq = last_seq + 1
+        with lock:
+            cur = conn.cursor()
+            cur.execute("INSERT INTO ratchet_rung (actor, seq, beacon_round,"
+                        " beacon_value, digest, label, at)"
+                        " VALUES (?,?,?,?,?,?,?)",
+                        (actor, seq, rnd, beat[1], digest, label, now))
+            rid = cur.lastrowid
+            conn.commit()
+
+        h, idx = _seal(ctx, "ratchet_step", {
+            "kind": "ratchet_step", "actor": actor, "seq": seq,
+            "beacon_round": rnd, "beacon_value": beat[1], "digest": digest,
+            "label": label, "previous_round": last_round,
+            "note": ("Bound to a public beacon value the actor could not have "
+                     "known before that round existed."),
+        })
+        if h or idx:
+            with lock:
+                conn.execute("UPDATE ratchet_rung SET chain_rowid=?,"
+                             " audit_hash=? WHERE id=?", (idx, h, rid))
+                conn.commit()
+
+        return {
+            "admitted": True, "actor": actor, "seq": seq,
+            "beacon_round": rnd, "beacon_value": beat[1],
+            "previous_round": last_round, "digest": digest,
+            "sealed_at_block": idx, "audit_hash": h,
+            "floor": ("This action cannot have been created before beacon "
+                      "round %d at %s." % (rnd, _iso(beat[2]))),
+            "ratchet": ("This actor can no longer act at or below round %d. "
+                        "That door is shut permanently." % rnd),
+            "verify_beacon": "/x/heartbeat/verify?round=%d" % rnd,
+        }, 200
+
+    # -------------------------------------------------- actor
+    if method == "GET" and action == "actor":
+        actor = str(data.get("id") or "").strip().lower()
+        if not actor:
+            return {"error": "id_required",
+                    "usage": "/x/ratchet/actor?id=<actor>"}, 400
+        cur = conn.cursor()
+        cur.execute("SELECT seq, beacon_round, digest, label, at, chain_rowid,"
+                    " audit_hash FROM ratchet_rung WHERE actor=? ORDER BY seq",
+                    (actor,))
+        rungs = cur.fetchall()
+        if not rungs:
+            return {"actor": actor, "rungs": 0,
+                    "message": "No ladder for this actor."}, 404
+        cur.execute("SELECT COUNT(*) FROM ratchet_refusal WHERE actor=?", (actor,))
+        refused = cur.fetchone()[0]
+        last = rungs[-1]
+        age = time.time() - last[4]
+        return {
+            "actor": actor,
+            "rungs": len(rungs),
+            "current_round": last[1],
+            "current_seq": last[0],
+            "last_action_at": _iso(last[4]),
+            "seconds_since": round(age, 1),
+            "status": "current" if age < STALE_SECONDS else "silent",
+            "refusals": refused,
+            "ladder": [{"seq": r[0], "round": r[1], "digest": r[2],
+                        "label": r[3], "at": _iso(r[4]), "block": r[5],
+                        "audit_hash": r[6]} for r in rungs[-50:]],
+            "floor_now": ("This actor cannot act at or below round %d."
+                          % last[1]),
+            "what_this_proves": WHAT_THIS_PROVES,
+        }, 200
+
+    # -------------------------------------------------- actors
+    if method == "GET" and action == "actors":
+        now = time.time()
+        cur = conn.cursor()
+        cur.execute("SELECT actor, COUNT(*), MAX(beacon_round), MAX(at)"
+                    " FROM ratchet_rung GROUP BY actor ORDER BY MAX(at) DESC")
+        out = []
+        for a, n, rnd, at in cur.fetchall():
+            cur2 = conn.cursor()
+            cur2.execute("SELECT COUNT(*) FROM ratchet_refusal WHERE actor=?", (a,))
+            out.append({"actor": a, "rungs": n, "current_round": rnd,
+                        "last_action": _iso(at),
+                        "silent_for": _human(now - at) if now - at > STALE_SECONDS else None,
+                        "refusals": cur2.fetchone()[0]})
+        return {"count": len(out), "actors": out,
+                "note": ("Silence is visible but not prevented. An actor that "
+                         "stops acting simply stops, and no design fixes "
+                         "that.")}, 200
+
+    # -------------------------------------------------- refusals
+    if method == "GET" and action == "refusals":
+        try:
+            limit = min(int(data.get("limit", 100)), 500)
+        except (TypeError, ValueError):
+            limit = 100
+        cur = conn.cursor()
+        cur.execute("SELECT actor, claimed_round, last_round, digest, reason,"
+                    " at, chain_rowid, audit_hash FROM ratchet_refusal"
+                    " ORDER BY id DESC LIMIT ?", (limit,))
+        rows = cur.fetchall()
+        mix = {}
+        for r in rows:
+            mix[r[4]] = mix.get(r[4], 0) + 1
+        return {
+            "count": len(rows),
+            "by_reason": mix,
+            "refusals": [{"actor": r[0], "claimed_round": r[1],
+                          "last_admitted_round": r[2], "digest": r[3],
+                          "reason": r[4], "explanation": REASONS.get(r[4], r[4]),
+                          "at": _iso(r[5]), "block": r[6], "audit_hash": r[7]}
+                         for r in rows],
+            "why_this_is_public": (
+                "A refused action is sealed rather than discarded, and the "
+                "list is open. An actor attempting to move backwards through "
+                "time is the single most interesting thing this system can "
+                "see, and hiding it would defeat the point of building it."),
+        }, 200
+
+    # -------------------------------------------------- verify
+    if method == "GET" and action == "verify":
+        actor = str(data.get("id") or "").strip().lower()
+        if not actor:
+            return {"error": "id_required"}, 400
+        cur = conn.cursor()
+        cur.execute("SELECT seq, beacon_round, beacon_value, digest FROM"
+                    " ratchet_rung WHERE actor=? ORDER BY seq", (actor,))
+        rungs = cur.fetchall()
+        if not rungs:
+            return {"error": "unknown_actor", "actor": actor}, 404
+        breaks = []
+        prev_seq = 0
+        prev_round = None
+        seen = set()
+        for seq, rnd, val, dig in rungs:
+            if seq != prev_seq + 1:
+                breaks.append({"at_seq": seq, "fault": "sequence_gap",
+                               "expected": prev_seq + 1})
+            if prev_round is not None and rnd <= prev_round:
+                breaks.append({"at_seq": seq, "fault": "round_did_not_advance",
+                               "round": rnd, "previous": prev_round})
+            if dig in seen:
+                breaks.append({"at_seq": seq, "fault": "duplicate_digest"})
+            b = _beat(conn, rnd)
+            if not b:
+                breaks.append({"at_seq": seq, "fault": "beacon_round_not_sealed",
+                               "round": rnd})
+            elif b[1] != val:
+                breaks.append({"at_seq": seq, "fault": "beacon_value_mismatch",
+                               "round": rnd})
+            seen.add(dig)
+            prev_seq, prev_round = seq, rnd
+        return {
+            "actor": actor, "rungs": len(rungs), "intact": not breaks,
+            "breaks": breaks,
+            "checked": ["sequence has no gaps",
+                        "beacon round strictly increases",
+                        "no digest appears twice",
+                        "each rung's beacon value matches the sealed beat"],
+            "do_it_without_us": (
+                "Every beacon round on the ladder is re-fetchable from the "
+                "beacon operator. Confirm each value there, then confirm each "
+                "audit_hash is in the chain at /api/verify-chain. Neither step "
+                "needs our cooperation."),
+            "what_this_proves": WHAT_THIS_PROVES,
+        }, 200
+
+    # -------------------------------------------------- status
+    if method == "GET" and action == "status":
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*), COUNT(DISTINCT actor) FROM ratchet_rung")
+        rungs, actors = cur.fetchone()
+        cur.execute("SELECT COUNT(*) FROM ratchet_refusal")
+        refused = cur.fetchone()[0]
+        cur.execute("SELECT reason, COUNT(*) FROM ratchet_refusal GROUP BY reason")
+        mix = {r[0]: r[1] for r in cur.fetchall()}
+        newest = _newest_beat(conn)
+        return {
+            "version": VERSION,
+            "actors": actors, "rungs_admitted": rungs,
+            "actions_refused": refused,
+            "refusals_by_reason": mix,
+            "current_beacon_round": newest[0] if newest else None,
+            "beacon_available": newest is not None,
+            "max_lag_beats": MAX_LAG_BEATS,
+            "depends_on": {
+                "heartbeat": ("supplies the time. With no beats sealed, "
+                              "nothing is admitted - actions are refused "
+                              "rather than waved through on trust."),
+            },
+            "what_this_proves": WHAT_THIS_PROVES,
+        }, 200
+
+    return {"error": "unknown_action", "action": action,
+            "actions": ["spec", "actor", "actors", "refusals", "verify",
+                        "status", "act"]}, 404
+
+
+def _spec():
+    return {
+        "module": "ratchet",
+        "version": VERSION,
+        "one_line": "Time only runs one way for the machine.",
+        "the_rule": (
+            "An action carrying a beacon round at or below the actor's last "
+            "recorded round is refused. Beacon rounds only increase, so an "
+            "actor's ladder only rises."),
+        "what_it_kills": {
+            "backdating": "the earlier round is already spent",
+            "replay": "stale round, and the digest is already on the ladder",
+            "pre_computation": ("an unsealed future round is refused, and "
+                                "nobody can know a beacon value early"),
+            "rewind": ("the ladder lives in a chain the actor does not "
+                       "control, so restoring an agent from a snapshot does "
+                       "not restore its position"),
+        },
+        "admission_rules_in_order": [
+            "1. A beat must exist. No beats, nothing admitted.",
+            "2. The claimed round must already be sealed here.",
+            "3. The round must be strictly above the actor's last rung.",
+            "4. The round must be within %d beats of the newest." % MAX_LAG_BEATS,
+            "5. The digest must not already be on this actor's ladder.",
+        ],
+        "refusals_are_sealed": (
+            "A refused action is written into the chain with its reason and "
+            "published at /x/ratchet/refusals. Discarding it would throw away "
+            "the most interesting evidence the system can produce."),
+        "privacy": (
+            "Only a SHA-256 of the action is submitted. The action itself, "
+            "its inputs and its outputs never leave the caller's system."),
+        "what_this_proves": WHAT_THIS_PROVES,
+        "limits": [
+            "It proves order, not correctness, authority or good judgement.",
+            "An actor that stops acting is visible but not prevented.",
+            "New actor ids start new ladders; identity is not this module's "
+            "problem and it does not pretend otherwise.",
+            "Within a single beat, actions are ordered by sequence rather "
+            "than by beacon time. At a five minute cadence that is a five "
+            "minute grain, and it is reported rather than dressed up.",
+        ],
+        "routes": {
+            "POST /x/ratchet/act": "keyed - submit an action digest",
+            "GET /x/ratchet/actor?id=": "one ladder",
+            "GET /x/ratchet/actors": "every ladder",
+            "GET /x/ratchet/refusals": "every refused attempt and why",
+            "GET /x/ratchet/verify?id=": "re-walk a ladder",
+            "GET /x/ratchet/status": "counts and current round",
+        },
+    }
+
+```
+
+
+## `modules/reconcile.py`
+
+440 lines, 20123 bytes
+
+```python
+"""
+Reconciliation notary - /x/reconcile/<action>
+
+THE PROBLEM THIS ATTACKS
+------------------------
+A sealed chain proves records were not altered after the fact. It does not
+prove they were true when written. An operator who seals fiction on time has
+a tamper-evident chain of fiction. Every honest person in this market knows
+that, and almost nobody says it.
+
+You cannot prove truth from outside a system. What you CAN do is what real
+auditors do: substantive testing. Take the sealed claim, go to the operator's
+own live system, and check whether the two agree - then seal the result of
+that check, including the failures.
+
+WHY THIS ONE IS DIFFERENT
+-------------------------
+The sample is fixed before the operator sees it.
+
+/plan derives a selection seed from the current chain tip - a value the
+operator cannot predict in advance and cannot change afterwards without
+breaking the chain - picks the records to be tested, and seals that selection
+BEFORE any data is requested. Only then are the record identifiers returned.
+
+So the operator cannot choose which records get examined, cannot prepare only
+the flattering ones, and cannot quietly drop a test that came back badly:
+every planned run is sealed at the moment it is planned, and a plan with no
+submitted result is visible forever as an abandoned test.
+
+Mismatches are sealed with the same permanence as matches. That is the whole
+design. A reconciliation system that can bury its own failures is decoration.
+
+WHAT A PASS ACTUALLY MEANS
+--------------------------
+That two systems the operator controls agree with each other, on records the
+operator could not choose, at a time the operator could not pick.
+
+That is not proof of truth. An operator who fabricates consistently across
+every system, in real time, without knowing what will be sampled, will pass.
+What it does is raise the cost of lying from "edit one database" to
+"maintain a coherent parallel reality across independent systems indefinitely,
+under unpredictable sampling, with every failure sealed permanently."
+
+That is the honest claim. It is also, as far as I know, more than anyone else
+in this market is doing.
+
+HONEST LIMITS
+-------------
+- Consistency is not truth. Two agreeing systems can both be wrong.
+- The operator supplies the comparison data. This tests their systems against
+  each other, not against the world.
+- Sampling only covers what has been sealed. It cannot find a decision that
+  was never recorded at all - gapless receipts are what cover that.
+- A high match rate on a badly chosen field proves nothing. Reconcile the
+  fields that would hurt to get wrong.
+
+    POST /x/reconcile/plan     sample_size, field  - seals the selection first
+    POST /x/reconcile/submit   run_id, results     - seals the comparison
+    GET  /x/reconcile/run?id=RUN-XXXXXXXX
+    GET  /x/reconcile/score
+    GET  /x/reconcile/list
+"""
+
+import hashlib, json, time
+from datetime import datetime, timezone
+
+VERSION = "1.1"
+MAX_SAMPLE = 200
+
+# Planning and submitting stay keyed - they touch an operator's own records.
+# What is public is the part that decides whether any of it means anything:
+# that the sample was fixed before the data was asked for, and that failures
+# were sealed as permanently as passes.
+PUBLIC = {("GET", "public"), ("GET", "proof")}
+
+_ready = False
+
+
+def _setup(ctx):
+    global _ready
+    if _ready:
+        return
+    with ctx["lock"]:
+        ctx["conn"].execute("CREATE TABLE IF NOT EXISTS reconcile_runs(run_id TEXT PRIMARY KEY,api_key TEXT,field TEXT,seed TEXT,planned REAL,submitted REAL,sample_size INTEGER,matched INTEGER,mismatched INTEGER,missing INTEGER,status TEXT DEFAULT 'planned',block_ids TEXT,detail TEXT)")
+        ctx["conn"].execute("CREATE INDEX IF NOT EXISTS idx_rec_key ON reconcile_runs(api_key)")
+        ctx["conn"].commit()
+    _ready = True
+
+
+def _iso(ts):
+    if not ts:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+def _sha(s):
+    return hashlib.sha256(s.encode()).hexdigest()
+
+
+def _seal_event(ctx, api_key, rid, action, detail):
+    ts = time.time()
+    ev = {"user_id": "rec:" + rid, "action": "reconcile_" + action, "amount": 0,
+          "country": "UK", "device_id": "reconcile", "anomaly": 0, "device_risk": 0}
+    res = {"decision": "RECONCILE_SEALED", "score": 0, "reconcile_action": action,
+           "reconcile_version": VERSION, "timestamp": ts, "detail": detail}
+    h, idx, seq = ctx["seal"](ev, res, ts, api_key)
+    return h, idx, seq, ts
+
+
+def _plan(ctx, api_key, data):
+    try:
+        n = int(data.get("sample_size", 25))
+    except Exception:
+        return {"error": "invalid_sample_size"}, 400
+    if n < 1 or n > MAX_SAMPLE:
+        return {"error": "sample_size_out_of_range", "max": MAX_SAMPLE}, 400
+    field = str(data.get("field", "decision")).strip()[:60] or "decision"
+
+    with ctx["lock"]:
+        tiprow = ctx["conn"].execute("SELECT audit_hash FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()
+        rows = ctx["conn"].execute("SELECT id,user_id,result_json,ts FROM audit_log WHERE api_key=? ORDER BY id ASC", (api_key,)).fetchall()
+
+    if not rows:
+        return {"error": "nothing_to_reconcile",
+                "message": "No sealed records under this key yet."}, 400
+
+    tip = tiprow[0] if tiprow else "GENESIS"
+    ts = time.time()
+    # Seed is bound to the chain tip. The operator cannot know it before the
+    # records exist, and cannot alter it afterwards without breaking the chain.
+    seed = _sha(tip + ":" + str(int(ts)) + ":" + field + ":" + str(n))
+
+    # Deterministic selection from the seed - reproducible by anyone holding it.
+    scored = sorted(rows, key=lambda r: _sha(seed + ":" + str(r[0])))
+    picked = scored[:min(n, len(scored))]
+
+    rid = "RUN-" + seed[:8].upper()
+    block_ids = [p[0] for p in picked]
+
+    sample = []
+    for bid, uid, res_json, bts in picked:
+        try:
+            r = json.loads(res_json)
+            sealed_val = r.get(field)
+        except Exception:
+            sealed_val = None
+        sample.append({"block_index": bid, "record_id": uid,
+                       "sealed_at": _iso(bts),
+                       "sealed_value_sha256": _sha(str(sealed_val))})
+
+    detail = ("field=" + field + ";sample_size=" + str(len(picked)) +
+              ";seed=" + seed + ";from_tip=" + tip +
+              ";blocks=" + ",".join(str(b) for b in block_ids[:60]))
+    h, idx, seq, _x = _seal_event(ctx, api_key, rid, "planned", detail)
+
+    with ctx["lock"]:
+        ctx["conn"].execute("INSERT OR REPLACE INTO reconcile_runs(run_id,api_key,field,seed,planned,submitted,sample_size,matched,mismatched,missing,status,block_ids,detail) VALUES(?,?,?,?,?,NULL,?,NULL,NULL,NULL,'planned',?,NULL)",
+                            (rid, api_key, field, seed, ts, len(picked), json.dumps(block_ids)))
+        ctx["conn"].commit()
+
+    return {"run_id": rid, "field": field, "sample_size": len(picked),
+            "seed": seed, "derived_from_tip": tip, "planned_at": _iso(ts),
+            "audit_hash": h, "block_index": idx, "receipt_seq": seq,
+            "sample": sample,
+            "next": "Fetch these record_ids from your own live system and POST them to /x/reconcile/submit",
+            "note": "This selection is now sealed. It cannot be changed, and an unsubmitted plan stays visible as an abandoned test."}, 200
+
+
+def _submit(ctx, api_key, data):
+    rid = str(data.get("run_id", "")).strip().upper()
+    with ctx["lock"]:
+        row = ctx["conn"].execute("SELECT field,seed,status,block_ids FROM reconcile_runs WHERE run_id=? AND api_key=?", (rid, api_key)).fetchone()
+    if not row:
+        return {"error": "unknown_run_id"}, 404
+    if row[2] != "planned":
+        return {"error": "already_submitted",
+                "message": "A run is reconciled once. Re-running until it passes is not reconciliation."}, 400
+
+    results = data.get("results")
+    if not isinstance(results, dict) or not results:
+        return {"error": "results_required",
+                "message": "Send {block_index: live_value} from your own system."}, 400
+
+    field = row[0]
+    block_ids = json.loads(row[3])
+
+    with ctx["lock"]:
+        rows = ctx["conn"].execute("SELECT id,user_id,result_json FROM audit_log WHERE id IN (" + ",".join("?" * len(block_ids)) + ")", block_ids).fetchall()
+
+    sealed = {}
+    for bid, uid, res_json in rows:
+        try:
+            sealed[bid] = json.loads(res_json).get(field)
+        except Exception:
+            sealed[bid] = None
+
+    matched, mismatched, missing = [], [], []
+    for bid in block_ids:
+        key = str(bid)
+        if key not in results:
+            missing.append({"block_index": bid})
+            continue
+        live = results[key]
+        want = sealed.get(bid)
+        if str(live).strip().lower() == str(want).strip().lower():
+            matched.append(bid)
+        else:
+            mismatched.append({"block_index": bid,
+                               "sealed_value": want,
+                               "live_value": live})
+
+    ts = time.time()
+    rate = round(100 * len(matched) / len(block_ids), 2) if block_ids else 0
+    detail = ("field=" + field + ";matched=" + str(len(matched)) +
+              ";mismatched=" + str(len(mismatched)) + ";missing=" + str(len(missing)) +
+              ";match_rate=" + str(rate) +
+              ";mismatch_blocks=" + ",".join(str(m["block_index"]) for m in mismatched[:40]))
+    h, idx, seq, _x = _seal_event(ctx, api_key, rid, "reconciled", detail)
+
+    with ctx["lock"]:
+        ctx["conn"].execute("UPDATE reconcile_runs SET submitted=?,matched=?,mismatched=?,missing=?,status='reconciled',detail=? WHERE run_id=? AND api_key=?",
+                            (ts, len(matched), len(mismatched), len(missing), json.dumps({"mismatched": mismatched[:100], "missing": missing[:100]}), rid, api_key))
+        ctx["conn"].commit()
+
+    out = {"run_id": rid, "field": field, "sample_size": len(block_ids),
+           "matched": len(matched), "mismatched": len(mismatched),
+           "missing": len(missing), "match_rate_pct": rate,
+           "reconciled_at": _iso(ts), "audit_hash": h, "block_index": idx,
+           "receipt_seq": seq,
+           "note": "This result is sealed whichever way it went. It cannot be withdrawn."}
+    if mismatched:
+        out["mismatches"] = mismatched[:20]
+        out["flag"] = "sealed records and live system disagree on " + str(len(mismatched)) + " of " + str(len(block_ids))
+    if missing:
+        out["missing_detail"] = "records the live system did not return - a gap, not a match"
+    return out, 200
+
+
+def _run(ctx, api_key, rid):
+    with ctx["lock"]:
+        row = ctx["conn"].execute("SELECT field,seed,planned,submitted,sample_size,matched,mismatched,missing,status,detail FROM reconcile_runs WHERE run_id=? AND api_key=?", (rid.upper(), api_key)).fetchone()
+        if not row:
+            return {"error": "unknown_run_id"}, 404
+        blocks = ctx["conn"].execute("SELECT ts,result_json,audit_hash FROM audit_log WHERE user_id=? ORDER BY id ASC", ("rec:" + rid.upper(),)).fetchall()
+    events = []
+    for bts, res, ah in blocks:
+        try:
+            r = json.loads(res)
+            events.append({"at": _iso(bts), "event": r.get("reconcile_action"),
+                           "detail": r.get("detail"), "sealed": ah})
+        except Exception:
+            pass
+    total = row[4] or 0
+    out = {"run_id": rid.upper(), "field": row[0], "seed": row[1],
+           "planned": _iso(row[2]), "submitted": _iso(row[3]),
+           "sample_size": total, "matched": row[5], "mismatched": row[6],
+           "missing": row[7], "status": row[8], "events": events,
+           "ordering_proof": "The plan block precedes the result block. The sample was fixed before any data was requested."}
+    if row[9]:
+        try:
+            out["detail"] = json.loads(row[9])
+        except Exception:
+            pass
+    if row[8] == "planned":
+        out["flag"] = "planned but never submitted - an abandoned test, visible permanently"
+    return out, 200
+
+
+def _score(ctx, api_key):
+    with ctx["lock"]:
+        rows = ctx["conn"].execute("SELECT sample_size,matched,mismatched,missing,status,planned FROM reconcile_runs WHERE api_key=? ORDER BY planned DESC LIMIT 500", (api_key,)).fetchall()
+    if not rows:
+        return {"runs": 0, "note": "No reconciliation runs on record."}, 200
+    done = [r for r in rows if r[4] == "reconciled"]
+    abandoned = len(rows) - len(done)
+    tested = sum(r[0] or 0 for r in done)
+    ok = sum(r[1] or 0 for r in done)
+    bad = sum(r[2] or 0 for r in done)
+    gone = sum(r[3] or 0 for r in done)
+    out = {"runs": len(rows), "reconciled": len(done), "abandoned": abandoned,
+           "records_tested": tested, "matched": ok, "mismatched": bad,
+           "missing": gone,
+           "match_rate_pct": (round(100 * ok / tested, 2) if tested else None),
+           "last_run": _iso(rows[0][5])}
+    if abandoned:
+        out["flag"] = str(abandoned) + " planned run(s) never submitted"
+    return out, 200
+
+
+def _list(ctx, api_key):
+    with ctx["lock"]:
+        rows = ctx["conn"].execute("SELECT run_id,field,planned,submitted,sample_size,matched,mismatched,missing,status FROM reconcile_runs WHERE api_key=? ORDER BY planned DESC LIMIT 200", (api_key,)).fetchall()
+    return {"count": len(rows),
+            "runs": [{"run_id": r[0], "field": r[1], "planned": _iso(r[2]),
+                      "submitted": _iso(r[3]), "sample_size": r[4],
+                      "matched": r[5], "mismatched": r[6], "missing": r[7],
+                      "status": r[8]} for r in rows]}, 200
+
+
+def _public(ctx):
+    """The reconciliation record, readable without a key.
+
+    Counts only. No record identifiers, no field values, no operator
+    identity. What a stranger gets is the three numbers that cannot be
+    flattered: how many runs were reconciled, how many disagreed, and how
+    many were planned and then quietly abandoned.
+
+    Abandoned runs are the important one. A planned run is sealed at the
+    moment it is planned, so a test that came back badly and was dropped
+    cannot be deleted - it sits here forever as a plan with no result.
+    """
+    with ctx["lock"]:
+        rows = ctx["conn"].execute(
+            "SELECT run_id,field,planned,submitted,sample_size,matched,mismatched,"
+            "missing,status FROM reconcile_runs ORDER BY planned DESC LIMIT 200").fetchall()
+
+    done = [r for r in rows if r[8] == "reconciled"]
+    abandoned = [r for r in rows if r[8] != "reconciled"]
+    tested = sum(r[4] or 0 for r in done)
+    ok = sum(r[5] or 0 for r in done)
+    bad = sum(r[6] or 0 for r in done)
+    gone = sum(r[7] or 0 for r in done)
+
+    out = {
+        "runs": len(rows),
+        "reconciled": len(done),
+        "abandoned": len(abandoned),
+        "records_tested": tested,
+        "matched": ok,
+        "mismatched": bad,
+        "missing": gone,
+        "match_rate_pct": (round(100 * ok / tested, 2) if tested else None),
+        "recent": [{"run_id": r[0], "field": r[1], "planned": _iso(r[2]),
+                    "submitted": _iso(r[3]), "sample_size": r[4],
+                    "matched": r[5], "mismatched": r[6], "missing": r[7],
+                    "status": r[8]} for r in rows[:50]],
+        "check_any_of_them": "/x/reconcile/proof?id=RUN-XXXXXXXX",
+        "what_is_being_shown": "Not that the records are true. That the sample was fixed "
+                               "before the data was requested, and that what came back was "
+                               "sealed either way.",
+        "what_a_mismatch_means": "The sealed record and the operator's own live system "
+                                 "disagreed. It is published because a reconciliation system "
+                                 "that can bury its own failures is decoration.",
+    }
+    if abandoned:
+        out["flag"] = (str(len(abandoned)) + " run(s) planned and never submitted. A sample was "
+                       "fixed, and no result was ever sealed against it.")
+    return out, 200
+
+
+def _proof(ctx, rid):
+    """The ordering, straight out of the chain, without a key.
+
+    Both events are already sealed under a public identifier, so this route
+    reveals nothing the chain does not already carry. It just makes the one
+    claim that matters legible: the plan block comes before the result block.
+    """
+    rid = (rid or "").strip().upper()
+    if not rid:
+        return {"error": "id_required"}, 400
+
+    with ctx["lock"]:
+        row = ctx["conn"].execute(
+            "SELECT field,seed,planned,submitted,sample_size,matched,mismatched,missing,status "
+            "FROM reconcile_runs WHERE run_id=?", (rid,)).fetchone()
+        blocks = ctx["conn"].execute(
+            "SELECT id,ts,result_json,audit_hash FROM audit_log WHERE user_id=? ORDER BY id ASC",
+            ("rec:" + rid,)).fetchall()
+    if not row:
+        return {"error": "unknown_run_id", "list": "/x/reconcile/public"}, 404
+
+    events = []
+    plan_block = result_block = None
+    for bid, bts, res, ah in blocks:
+        try:
+            r = json.loads(res)
+        except Exception:
+            continue
+        what = r.get("reconcile_action")
+        events.append({"event": what, "at": _iso(bts), "block_index": bid,
+                       "sealed_in_chain": ah, "sealed_detail": r.get("detail")})
+        if what == "planned" and plan_block is None:
+            plan_block = bid
+        if what == "reconciled" and result_block is None:
+            result_block = bid
+
+    ordered = (plan_block is not None and result_block is not None
+               and plan_block < result_block)
+
+    out = {"run_id": rid, "field": row[0], "status": row[8],
+           "seed": row[1], "planned_at": _iso(row[2]), "submitted_at": _iso(row[3]),
+           "sample_size": row[4], "matched": row[5], "mismatched": row[6],
+           "missing": row[7],
+           "plan_block_index": plan_block, "result_block_index": result_block,
+           "selection_precedes_result": ordered,
+           "events": events,
+           "how_to_check_this_yourself": [
+               "The seed is derived from the chain tip at planning time, which the operator "
+               "cannot predict in advance or change afterwards without breaking the chain.",
+               "The plan block seals which records were selected, and its detail is above.",
+               "The result block seals what came back. Compare the two block indices.",
+               "A lower plan index than result index means the sample was fixed before any "
+               "data was requested. That is the whole claim, and it is the only one made."],
+           "what_this_does_not_prove": "That the records are true. Two systems the operator "
+                                       "controls agreeing with each other is consistency, not "
+                                       "truth."}
+    if row[8] != "reconciled":
+        out["flag"] = ("planned and never submitted. The selection is sealed and no result "
+                       "was ever put against it.")
+    elif not ordered:
+        out["flag"] = ("the plan block does not precede the result block. That should be "
+                       "impossible and it is the finding.")
+    return out, 200
 
 
 def handle(method, action, data, api_key, ctx):
-    armed = _install(ctx)
-    action = (action or "status").strip("/").lower()
-    data = _flat(data)
-    if "conn" in _ctx and action in POSTS and method == "POST":
-        return POSTS[action](data, data, api_key or data.get("key"))
-    if "conn" in _ctx and action in GETS and action not in ("",):
-        return GETS[action](data, data, api_key)
-    last = _latest_sth() if "conn" in _ctx else None
-    if last:
-        last.pop("ts", None)
-    return {"module": "public_proof_adapter", "version": VERSION, "armed": armed,
-            "aliases": ALIASES, "tree_size": len(_leaves), "latest_sealed_tree_head": last,
-            "checkpoint_every_seconds": CHECKPOINT_SECONDS, "checkpoint_every_leaves": CHECKPOINT_EVERY,
-            "open_submissions": OPEN, "spec": SPEC,
-            "pages": sorted(_FILES.keys()),
-            "endpoints": ["POST /p/submit", "/p/receipt", "/p/proof", "/p/consistency", "/p/sth", "/p/find"]}, 200
-
-
-def register(MODULE_MAP):
-    """For name-based loaders: map this module under its own name and its aliases."""
-    mod = sys.modules[__name__]
-    for name in ["public_proof_adapter"] + ALIASES:
-        MODULE_MAP.setdefault(name, mod)
-    return MODULE_MAP
+    _setup(ctx)
+    if method == "POST":
+        if action == "plan":
+            return _plan(ctx, api_key, data)
+        if action == "submit":
+            return _submit(ctx, api_key, data)
+    else:
+        if action == "public":
+            return _public(ctx)
+        if action == "proof":
+            return _proof(ctx, str((data or {}).get("id", "")))
+        if action == "score":
+            return _score(ctx, api_key)
+        if action == "list":
+            return _list(ctx, api_key)
+        if action == "run":
+            rid = str(data.get("id", "")).strip()
+            if not rid:
+                return {"error": "id_required"}, 400
+            return _run(ctx, api_key, rid)
+    return {"error": "unknown_action", "action": action,
+            "GET": ["public", "proof", "score", "list", "run"],
+            "POST": ["plan", "submit"]}, 404
 
 ```
