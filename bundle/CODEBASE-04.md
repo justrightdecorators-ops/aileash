@@ -1,9 +1,1288 @@
 # Codebase — part 4 of 43
 
 Contains:
+- `modules/cinema.py`
+- `modules/cinemafeed.py`
+- `modules/codebase.py`
 - `modules/complete.py`
-- `modules/conformance.py`
-- `modules/consistency.py`
+
+
+## `modules/cinema.py`
+
+685 lines, 37850 bytes
+
+```python
+"""
+modules/cinema.py  v3.0.0
+The sebbi.pro Cinema at /cinema, in two wings.
+
+GOVERNANCE spins the videos in modules/cinemafeed.py on the ring and plays
+them in the screening room, as before.
+
+THE 10p WING is the creators' channel. Every video made on Monop Studio
+(/create, modules/studio.py) plays here:
+
+  * one tap from TikTok, Instagram, Facebook or YouTube (the creator's link,
+    https://sebbi.pro/v/<id>) opens that video on the Wing's TV;
+  * the free teaser plays, then 10p unlocks the rest - one tap on Google Pay
+    or Apple Pay when there's no credit on the phone yet;
+  * a searchable library (video name or creator name), Trending / New /
+    Most watched, a spinning ring of screens, likes, comments from people who
+    have actually paid to watch, and a Top Creators board;
+  * every paid view is sealed into the chain, so the board and each creator's
+    earnings link to the block that proves them, with a live ticker;
+  * a channel page per creator at https://sebbi.pro/cinema/@<name>.
+
+Page routes (runtime do_GET / do_POST patch):
+  GET  /cinema   /cinema/v/<id>   /cinema/@<name>
+  GET  /cinema/api/list?q=&sort=trending|new|top&creator=&offset=
+  GET  /cinema/api/video?id=&viewer=
+  GET  /cinema/api/comments?id=
+  GET  /cinema/api/leaders      GET /cinema/api/ticker
+  POST /cinema/api/like  {id, viewer}
+  POST /cinema/api/comment {id, viewer, name, text}
+  POST /cinema/api/flag  {comment}
+  GET  /cinema/api/admin?key=&do=hide&comment=      (CREDITS_ADMIN_KEY)
+  GET  /x/cinema/status  arms the routes after a deploy
+"""
+
+import base64
+import gzip
+import hashlib
+import hmac
+import html
+import importlib
+import json
+import os
+import re
+import sys
+import threading
+import time
+import urllib.parse
+from collections import defaultdict, deque
+
+VERSION = "3.0.0"
+PUBLIC = {("GET", "status"), ("GET", "spec")}
+SITE = (os.environ.get("HOST") or "https://sebbi.pro").strip().rstrip("/")
+
+VIEWER_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+ID_RE = re.compile(r"^[a-z0-9]{8}$")
+CLEAN = re.compile(r"[<>\\\x00-\x08\x0b-\x1f]")
+PAGE = 24
+
+_ctx = {}
+_st = None
+_ready = False
+_patched = False
+_wins = defaultdict(deque)
+_wins_lock = threading.Lock()
+
+_CINEMA_GZ = (
+    "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"
+    "33x4dDBLFvPh3v8Dm1JjdJyUAAA="
+)
+
+
+def _page(b):
+    return gzip.decompress(base64.b64decode("".join(b.split()))).decode("utf-8")
+
+
+CINEMA_HTML = _page(_CINEMA_GZ)
+
+
+def _studio():
+    global _st
+    if _st is None:
+        _st = sys.modules.get("modules.studio") or importlib.import_module("modules.studio")
+    if "conn" in _ctx and not _st._ready:
+        _st._ctx.update(_ctx)
+        _st._setup()
+    return _st
+
+
+def _setup():
+    global _ready
+    if _ready or "conn" not in _ctx:
+        return
+    _studio()
+    with _ctx["lock"]:
+        c = _ctx["conn"]
+        c.execute("CREATE TABLE IF NOT EXISTS cinema_like(video TEXT,viewer TEXT,at REAL,PRIMARY KEY(video,viewer))")
+        c.execute("CREATE TABLE IF NOT EXISTS cinema_comment(id INTEGER PRIMARY KEY AUTOINCREMENT,video TEXT,"
+                  "viewer TEXT,name TEXT,text TEXT,at REAL,hidden INTEGER DEFAULT 0,flags INTEGER DEFAULT 0)")
+        c.execute("CREATE INDEX IF NOT EXISTS cinema_comment_video ON cinema_comment(video,id)")
+        c.execute("CREATE INDEX IF NOT EXISTS credit_unlock_video ON credit_unlock(video,at)")
+        c.commit()
+    _ready = True
+
+
+def _limit(who, group, per_min, per_hour):
+    t = time.time()
+    k = group + "|" + who
+    with _wins_lock:
+        w = _wins[k]
+        while w and w[0] < t - 3600:
+            w.popleft()
+        if len(w) >= per_hour or sum(1 for x in w if x > t - 60) >= per_min:
+            return False
+        w.append(t)
+        if len(_wins) > 20000:
+            for key in [x for x, v in _wins.items() if not v or v[-1] < t - 3600][:5000]:
+                del _wins[key]
+    return True
+
+
+def _ip(h):
+    try:
+        xff = h.headers.get("X-Forwarded-For", "")
+        return (xff.split(",")[0].strip() if xff else str(h.client_address[0]))[:64]
+    except Exception:
+        return "unknown"
+
+
+def _ago(t):
+    s = max(0, int(time.time() - (t or 0)))
+    if s < 60:
+        return "just now"
+    if s < 3600:
+        return "%dm ago" % (s // 60)
+    if s < 86400:
+        return "%dh ago" % (s // 3600)
+    return "%dd ago" % (s // 86400)
+
+
+def _rows(sql, args=()):
+    with _ctx["lock"]:
+        return _ctx["conn"].execute(sql, args).fetchall()
+
+
+def _cards(rows):
+    st = _studio()
+    cols = st.COLS.split(",")
+    return [st._public(dict(zip(cols, r))) for r in rows]
+
+
+# ------------------------------------------------------------------ reads
+
+def a_list(q, b, h):
+    st = _studio()
+    sort = str(q.get("sort") or "trending")
+    term = CLEAN.sub("", str(q.get("q") or "")).strip()[:60]
+    creator = CLEAN.sub("", str(q.get("creator") or "")).strip()[:40]
+    try:
+        off = max(0, min(5000, int(q.get("offset") or 0)))
+    except ValueError:
+        off = 0
+    where, args = ["v.status='live'"], []
+    if term:
+        like = "%" + term.replace("%", "").replace("_", "") + "%"
+        where.append("(v.title LIKE ? OR v.creator LIKE ? OR v.tags LIKE ?)")
+        args += [like, like, like]
+    if creator:
+        where.append("(v.creator=? COLLATE NOCASE OR replace(v.creator,' ','_')=? COLLATE NOCASE)")
+        args += [creator, creator]
+    cols = ",".join("v." + c for c in st.COLS.split(","))
+    sql = "SELECT " + cols + " FROM studio_video v WHERE " + " AND ".join(where)
+    extra = []
+    if sort == "new":
+        sql += " ORDER BY v.live_at DESC"
+    elif sort == "top":
+        sql += " ORDER BY v.unlocks DESC, v.likes DESC, v.live_at DESC"
+    else:
+        sort = "trending"
+        sql += (" ORDER BY (SELECT COUNT(*) FROM credit_unlock u WHERE u.video='st:'||v.id AND u.at>?)*3"
+                " + v.likes + v.plays/20.0 DESC, v.live_at DESC")
+        extra = [time.time() - 7 * 86400]
+    rows = _rows(sql + " LIMIT ? OFFSET ?", tuple(args + extra + [PAGE + 1, off]))
+    return {"sort": sort, "q": term, "creator": creator, "videos": _cards(rows[:PAGE]),
+            "more": len(rows) > PAGE, "next": off + PAGE}, 200
+
+
+def a_video(q, b, h):
+    st = _studio()
+    v = st._video(str(q.get("id") or ""))
+    if not v or v["status"] != "live":
+        return {"error": "not_found", "message": "That video isn't here any more."}, 404
+    out = {"video": st._public(v)}
+    viewer = str(q.get("viewer") or "")
+    if VIEWER_RE.match(viewer):
+        out["liked"] = bool(_rows("SELECT 1 FROM cinema_like WHERE video=? AND viewer=?", (v["id"], viewer)))
+        out["can_comment"] = st._unlocked(v["id"], viewer)[0]
+    return out, 200
+
+
+def a_comments(q, b, h):
+    vid = str(q.get("id") or "")
+    if not ID_RE.match(vid):
+        return {"comments": []}, 200
+    rows = _rows("SELECT id,name,text,at FROM cinema_comment WHERE video=? AND hidden=0 ORDER BY id DESC LIMIT 100",
+                 (vid,))
+    return {"comments": [{"id": r[0], "name": r[1], "text": r[2], "ago": _ago(r[3])} for r in rows]}, 200
+
+
+def a_leaders(q, b, h):
+    rows = _rows("SELECT creator,SUM(unlocks),SUM(earned),SUM(status='live'),SUM(likes) FROM studio_video "
+                 "WHERE status IN ('live','removed') GROUP BY creator COLLATE NOCASE "
+                 "ORDER BY SUM(earned) DESC, SUM(unlocks) DESC LIMIT 25")
+    out = []
+    for r in rows:
+        if not r[1] and not r[4]:
+            continue
+        proof = _rows("SELECT block_index FROM credit_unlock WHERE creator=? AND video LIKE 'st:%' "
+                      "AND block_index IS NOT NULL ORDER BY id DESC LIMIT 1", (r[0],))
+        blk = proof[0][0] if proof else None
+        out.append({"creator": r[0], "paid_views": r[1] or 0, "earned_pence": r[2] or 0,
+                    "videos": r[3], "likes": r[4] or 0,
+                    "channel": SITE + "/cinema/@" + _studio()._slug(r[0]),
+                    "proof_block": blk,
+                    "proof": (SITE + "/x/walk/block?index=%s" % blk) if blk else None})
+    tot = _rows("SELECT COALESCE(SUM(unlocks),0),COALESCE(SUM(earned),0),COUNT(DISTINCT creator) "
+                "FROM studio_video WHERE status IN ('live','removed')")[0]
+    return {"leaders": out, "total_paid_views": tot[0], "total_earned_pence": tot[1], "creators": tot[2]}, 200
+
+
+def a_ticker(q, b, h):
+    rows = _rows("SELECT u.creator,u.at,u.block_index,v.title,v.id FROM credit_unlock u "
+                 "LEFT JOIN studio_video v ON v.id=substr(u.video,4) WHERE u.video LIKE 'st:%' "
+                 "ORDER BY u.id DESC LIMIT 20")
+    return {"ticker": [{"creator": r[0], "ago": _ago(r[1]), "block": r[2], "title": r[3] or "",
+                        "id": r[4], "proof": (SITE + "/x/walk/block?index=%s" % r[2]) if r[2] else None}
+                       for r in rows]}, 200
+
+
+def a_creator(q, b, h):
+    name = CLEAN.sub("", str(q.get("name") or "")).strip()[:40]
+    if not name:
+        return {"error": "not_found"}, 404
+    r = _rows("SELECT creator,COALESCE(SUM(unlocks),0),COALESCE(SUM(earned),0),COALESCE(SUM(status='live'),0),"
+              "COALESCE(SUM(likes),0) "
+              "FROM studio_video WHERE (creator=? COLLATE NOCASE OR replace(creator,' ','_')=? COLLATE NOCASE) "
+              "AND status IN ('live','removed')", (name, name))[0]
+    if not r[0]:
+        return {"error": "not_found", "message": "No channel called that yet."}, 404
+    return {"creator": r[0], "paid_views": r[1], "earned_pence": r[2], "videos": r[3], "likes": r[4],
+            "channel": SITE + "/cinema/@" + _studio()._slug(r[0])}, 200
+
+
+# ------------------------------------------------------------------ writes
+
+def a_like(q, b, h):
+    st = _studio()
+    v = st._video(str(b.get("id") or ""))
+    viewer = str(b.get("viewer") or "")
+    if not v or v["status"] != "live" or not VIEWER_RE.match(viewer):
+        return {"error": "not_found"}, 404
+    if not _limit(viewer, "like", 30, 400) or not _limit(_ip(h), "likeip", 60, 1500):
+        return {"error": "slow_down"}, 429
+    with _ctx["lock"]:
+        c = _ctx["conn"]
+        if c.execute("SELECT 1 FROM cinema_like WHERE video=? AND viewer=?", (v["id"], viewer)).fetchone():
+            c.execute("DELETE FROM cinema_like WHERE video=? AND viewer=?", (v["id"], viewer))
+            c.execute("UPDATE studio_video SET likes=MAX(0,likes-1) WHERE id=?", (v["id"],))
+            liked = False
+        else:
+            c.execute("INSERT INTO cinema_like(video,viewer,at) VALUES(?,?,?)", (v["id"], viewer, time.time()))
+            c.execute("UPDATE studio_video SET likes=likes+1 WHERE id=?", (v["id"],))
+            liked = True
+        n = c.execute("SELECT likes FROM studio_video WHERE id=?", (v["id"],)).fetchone()[0]
+        c.commit()
+    return {"liked": liked, "likes": n}, 200
+
+
+def a_comment(q, b, h):
+    st = _studio()
+    v = st._video(str(b.get("id") or ""))
+    viewer = str(b.get("viewer") or "")
+    if not v or v["status"] != "live" or not VIEWER_RE.match(viewer):
+        return {"error": "not_found"}, 404
+    if not st._unlocked(v["id"], viewer)[0]:
+        return {"error": "watch_first", "message": "Unlock the video to join the chat."}, 403
+    name = CLEAN.sub("", str(b.get("name") or "")).strip()[:24]
+    text = CLEAN.sub("", str(b.get("text") or "")).strip()[:400]
+    if len(name) < 2:
+        return {"error": "name", "message": "Add a name (2 letters or more)."}, 400
+    if len(text) < 1:
+        return {"error": "empty", "message": "Write something first."}, 400
+    if not _limit(viewer, "comment", 2, 30) or not _limit(_ip(h), "commentip", 6, 120):
+        return {"error": "slow_down", "message": "Easy - wait a few seconds between comments."}, 429
+    with _ctx["lock"]:
+        c = _ctx["conn"]
+        cur = c.execute("INSERT INTO cinema_comment(video,viewer,name,text,at) VALUES(?,?,?,?,?)",
+                        (v["id"], viewer, name, text, time.time()))
+        c.execute("UPDATE studio_video SET comments=comments+1 WHERE id=?", (v["id"],))
+        c.commit()
+        cid = cur.lastrowid
+    return {"posted": True, "comment": {"id": cid, "name": name, "text": text, "ago": "just now"}}, 200
+
+
+def a_flag(q, b, h):
+    try:
+        cid = int(b.get("comment") or 0)
+    except (TypeError, ValueError):
+        return {"error": "bad"}, 400
+    if not _limit(_ip(h), "flag", 5, 40):
+        return {"received": True}, 200
+    with _ctx["lock"]:
+        c = _ctx["conn"]
+        c.execute("UPDATE cinema_comment SET flags=flags+1,hidden=CASE WHEN flags+1>=3 THEN 1 ELSE hidden END "
+                  "WHERE id=?", (cid,))
+        c.commit()
+    return {"received": True}, 200
+
+
+def a_admin(q, b, h):
+    key = os.environ.get("CREDITS_ADMIN_KEY", "").strip()
+    if not key or not hmac.compare_digest(key, str(q.get("key") or "")):
+        return {"error": "not_allowed"}, 403
+    do = str(q.get("do") or "list")
+    if do == "hide":
+        try:
+            cid = int(q.get("comment") or 0)
+        except ValueError:
+            return {"error": "bad"}, 400
+        with _ctx["lock"]:
+            _ctx["conn"].execute("UPDATE cinema_comment SET hidden=1 WHERE id=?", (cid,))
+            _ctx["conn"].commit()
+        return {"hidden": cid}, 200
+    rows = _rows("SELECT id,video,name,text,flags,hidden,at FROM cinema_comment ORDER BY flags DESC, id DESC LIMIT 100")
+    return {"comments": [{"id": r[0], "video": SITE + "/v/" + r[1], "name": r[2], "text": r[3], "flags": r[4],
+                          "hidden": bool(r[5]), "ago": _ago(r[6]),
+                          "hide": SITE + "/cinema/api/admin?key=KEY&do=hide&comment=%d" % r[0]} for r in rows]}, 200
+
+
+GETS = {"list": a_list, "video": a_video, "comments": a_comments, "leaders": a_leaders,
+        "ticker": a_ticker, "creator": a_creator, "admin": a_admin}
+POSTS = {"like": a_like, "comment": a_comment, "flag": a_flag}
+
+
+# ------------------------------------------------------------------ pages
+
+def _esc(s):
+    return html.escape(str(s or ""), quote=True)
+
+
+def _render(path):
+    st = _studio()
+    boot = {"route": "wing", "site": SITE}
+    title = "sebbi.pro Cinema — the 10p Wing"
+    desc = "Watch creators' videos free, then 10p for the rest. No followers needed to earn. Every penny proven."
+    image, video, url = "", None, SITE + "/cinema"
+    parts = [p for p in path.split("/") if p]
+    if len(parts) >= 3 and parts[1] == "v":
+        v = st._video(parts[2].lower())
+        if v and v["status"] == "live":
+            pub = st._public(v)
+            boot.update({"route": "video", "video": pub})
+            title = "%s — by %s · 10p Wing" % (v["title"], v["creator"])
+            desc = "Watch the start free, then %s for the rest. 7p of every 10p goes to %s." % (
+                pub["price_label"], v["creator"])
+            image, url = SITE + pub["poster"], SITE + "/cinema/v/" + v["id"]
+            if (v["teaser_mime"] or "").endswith("mp4"):
+                video = SITE + pub["teaser"]
+    elif len(parts) >= 2 and parts[1].startswith("@"):
+        name = CLEAN.sub("", urllib.parse.unquote(parts[1][1:])).strip()[:40]
+        boot.update({"route": "channel", "creator": name})
+        title = "%s on the 10p Wing" % name
+        desc = "Every video by %s. Watch free, then 10p for the rest." % name
+        url = SITE + "/cinema/@" + _studio()._slug(name)
+    elif len(parts) >= 2 and parts[1] == "governance":
+        boot["route"] = "gov"
+    og = ['<title>%s</title>' % _esc(title),
+          '<meta name="description" content="%s">' % _esc(desc),
+          '<meta property="og:site_name" content="sebbi.pro">',
+          '<meta property="og:title" content="%s">' % _esc(title),
+          '<meta property="og:description" content="%s">' % _esc(desc),
+          '<meta property="og:url" content="%s">' % _esc(url),
+          '<meta property="og:type" content="%s">' % ("video.other" if video else "website"),
+          '<meta name="twitter:card" content="summary_large_image">',
+          '<meta name="twitter:title" content="%s">' % _esc(title),
+          '<meta name="twitter:description" content="%s">' % _esc(desc)]
+    if boot["route"] == "video":
+        og += ['<meta property="og:image" content="%s">' % _esc(image),
+               '<meta name="twitter:image" content="%s">' % _esc(image)]
+    if video:
+        og += ['<meta property="og:video" content="%s">' % _esc(video),
+               '<meta property="og:video:secure_url" content="%s">' % _esc(video),
+               '<meta property="og:video:type" content="video/mp4">']
+    data = json.dumps(boot).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+    return CINEMA_HTML.replace("<!--OG-->", "\n".join(og)).replace("__BOOT__", data).encode("utf-8")
+
+
+# ------------------------------------------------------------------ transport
+
+def _send(h, obj, code=200):
+    body = json.dumps(obj).encode("utf-8")
+    h.send_response(code)
+    h.send_header("Content-Type", "application/json; charset=utf-8")
+    h.send_header("Content-Length", str(len(body)))
+    h.send_header("Cache-Control", "no-store")
+    h.end_headers()
+    h.wfile.write(body)
+
+
+def _serve(h, method):
+    u = urllib.parse.urlparse(h.path)
+    path = u.path.rstrip("/") or "/"
+    if path != "/cinema" and not path.startswith("/cinema/"):
+        return False
+    if "conn" not in _ctx:
+        _send(h, {"error": "not_armed", "message": "Open /x/cinema/status once."}, 503)
+        return True
+    _setup()
+    q = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
+    if path.startswith("/cinema/api/"):
+        name = path[12:].strip("/")
+        table = GETS if method == "GET" else POSTS
+        fn = table.get(name)
+        if not fn:
+            _send(h, {"error": "not_found"}, 404)
+            return True
+        body = {}
+        if method == "POST":
+            try:
+                n = min(int(h.headers.get("Content-Length") or 0), 20000)
+                raw = h.rfile.read(n) if n else b""
+                body = json.loads(raw.decode("utf-8") or "{}")
+                if not isinstance(body, dict):
+                    body = {}
+            except Exception:
+                body = {}
+        try:
+            out, code = fn(q, body, h)
+        except Exception as e:
+            print("CINEMA ERR %s: %s" % (name, e), flush=True)
+            out, code = {"error": "failed"}, 500
+        _send(h, out, code)
+        return True
+    if method != "GET":
+        return False
+    body = _render(path)
+    h.send_response(200)
+    h.send_header("Content-Type", "text/html; charset=utf-8")
+    h.send_header("Content-Length", str(len(body)))
+    h.send_header("Cache-Control", "no-cache")
+    h.end_headers()
+    h.wfile.write(body)
+    return True
+
+
+def _find_handler_class(ctx):
+    if isinstance(ctx, dict):
+        for k in ("handler_class", "handler", "Handler", "h", "request_handler"):
+            v = ctx.get(k)
+            if v is None:
+                continue
+            cls = v if isinstance(v, type) else type(v)
+            if hasattr(cls, "do_GET"):
+                return cls
+    f = sys._getframe()
+    while f is not None:
+        s = f.f_locals.get("self")
+        if s is not None and hasattr(type(s), "do_GET") and hasattr(s, "wfile"):
+            return type(s)
+        f = f.f_back
+    return None
+
+
+def _install(ctx):
+    global _patched
+    if isinstance(ctx, dict) and "conn" in ctx:
+        _ctx.update(ctx)
+        _setup()
+    if _patched:
+        return True
+    cls = _find_handler_class(ctx)
+    if cls is None:
+        return False
+    if getattr(cls, "_cinema3_patched", False):
+        _patched = True
+        return True
+    og = cls.do_GET
+    op = getattr(cls, "do_POST", None)
+
+    def do_GET(self):
+        try:
+            if _serve(self, "GET"):
+                return
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        return og(self)
+
+    def do_POST(self):
+        try:
+            if _serve(self, "POST"):
+                return
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        return op(self) if op else None
+
+    cls.do_GET = do_GET
+    if op:
+        cls.do_POST = do_POST
+    cls._cinema3_patched = True
+    _patched = True
+    return True
+
+
+def handle(method, action, data, api_key, ctx):
+    armed = _install(ctx)
+    counts = {}
+    if "conn" in _ctx:
+        try:
+            r = _rows("SELECT COUNT(*),COALESCE(SUM(unlocks),0),COALESCE(SUM(likes),0),COALESCE(SUM(comments),0) "
+                      "FROM studio_video WHERE status='live'")[0]
+            counts = {"videos": r[0], "paid_views": r[1], "likes": r[2], "comments": r[3]}
+        except Exception:
+            pass
+    return {"module": "cinema", "version": VERSION, "armed": armed,
+            "serves": ["/cinema", "/cinema/v/<id>", "/cinema/@<name>", "/cinema/api/*"],
+            "counts": counts, "wing": SITE + "/cinema"}, 200
+
+```
+
+
+## `modules/cinemafeed.py`
+
+80 lines, 4430 bytes
+
+```python
+"""
+modules/cinemafeed.py  v1.0.0
+The video feed for the sebbi.pro Cinema (/cinema).
+
+    GET /x/cinemafeed/list     every video, grouped by channel   (public)
+    GET /x/cinemafeed/status   count and channels                (public)
+
+To add or remove a video, edit the VIDEOS list below: one line per video,
+(YouTube id, title, channel). The id is the 11 characters after "v=" in a
+YouTube link. Nothing else needs changing; the cinema page reads this feed.
+"""
+
+VERSION = "1.0.0"
+PUBLIC = {("GET", "list"), ("GET", "status"), ("GET", "spec")}
+
+VIDEOS = [
+    # NVIDIA and IBM
+    ("gM1dLdpDR50", "What Is Trustworthy AI?", "NVIDIA"),
+    ("f6dx3Yh-Tww", "What is AI governance?", "IBM Research"),
+    ("Q020C-Jw0o8", "The Importance of AI Governance", "IBM Technology"),
+    ("0oeD2Wf25wY", "Mastering AI Risk: NIST's Framework Explained", "IBM Technology"),
+    # EU AI Act
+    ("ya5uBFs41Ug", "EU's AI Act explained for everyone", "EU AI Act"),
+    ("oWHCyLfUgUw", "EU AI Act Explained: Everything You Must Know", "EU AI Act"),
+    ("s_rxOnCt3HQ", "The EU's AI Act Explained", "EU AI Act"),
+    ("xUHuR5qXbMY", "EU AI Act explained for your business", "EU AI Act"),
+    ("1Z6NA7Chkn4", "The EU AI Act explained in the time of a coffee", "EU AI Act"),
+    ("GELAXU9XReI", "Understanding the EU AI Act: key facts", "EU AI Act"),
+    ("lwJXCPsBJfc", "The EU AI Act: what it means for AI and DevOps", "EU AI Act"),
+    ("4A33y0B9V0k", "The EU AI Act: what you need to know", "EU AI Act"),
+    # AI safety
+    ("qe9QSCF-d88", "The Catastrophic Risks of AI and a Safer Path", "Yoshua Bengio · TED"),
+    ("dc3R_G5DJ50", "Yoshua Bengio's warning on AI safety", "Yoshua Bengio"),
+    ("95xpd9FadVk", "We need AI systems to be 10 million times safer", "Stuart Russell"),
+    ("qrvK_KuIeJk", "Godfather of AI: the 60 Minutes interview", "Geoffrey Hinton"),
+    ("AUGHMx7iAxk", "AI safety risks and the future of AI", "Geoffrey Hinton"),
+    ("eHSn50wnBRQ", "Hinton warns about the future of AI", "Geoffrey Hinton"),
+    ("5qBDQgfeB6s", "AI has progressed even faster than I thought", "Geoffrey Hinton"),
+    ("giT0ytynSqg", "Godfather of AI: trying to warn them", "Geoffrey Hinton"),
+    ("hrnQ7chut7A", "Mapping the catastrophic risks of AI", "AI Safety"),
+    # Microsoft responsible AI
+    ("poMZXS6iQeU", "Responsible AI: Microsoft's AI principles", "Microsoft"),
+    ("8Ra5L1aQ5YM", "Responsible AI Principles, episode 3", "Microsoft"),
+    ("dnC8-uUZXSc", "Our approach to responsible AI", "Microsoft"),
+    ("lkIlsgrIMtU", "Developing Microsoft's Responsible AI Standard", "Microsoft"),
+    ("7Mv9VZEDBC4", "How Microsoft drives responsible AI", "Microsoft"),
+    ("XWpXxUc-GJY", "Responsible AI in action: principles to engineering", "Microsoft"),
+    # NIST AI RMF
+    ("CkplyRCYuco", "NIST AI Risk Management Framework explained simply", "NIST AI RMF"),
+    ("y3foG0ALLVc", "NIST AI Risk Management Framework explained", "NIST AI RMF"),
+    ("3B0ELJTViMs", "NIST AI RMF: a practical guide", "NIST AI RMF"),
+    ("7xcM_edGNyE", "NIST AI RMF: the full guide", "NIST AI RMF"),
+    ("rbFt34UmngY", "The NIST AI Risk Management Framework", "NIST AI RMF"),
+    ("Ufr3aklALVo", "AI risk management explained", "NIST AI RMF"),
+    # Agentic AI
+    ("mJjTLRQtJdo", "Agent risk, security and AI sprawl in 2026", "Agentic AI"),
+    ("YtgQ0q53GV4", "Agentic AI will redefine risk", "Agentic AI"),
+    # ISO 42001
+    ("YdPyeVvYtzs", "ISO/IEC 42001:2023 explained", "ISO 42001"),
+    ("0BXySa973Q4", "ISO 42001 explained in 5 minutes", "ISO 42001"),
+    ("FAQhV3iG6Fg", "Navigating the ISO 42001 standard", "ISO 42001"),
+    ("O4iKEr5AIi4", "What is ISO/IEC 42001?", "ISO 42001"),
+    ("hSz71vISZMA", "What is the AI management system standard?", "ISO 42001"),
+    ("yxE3bCP3aTg", "ISO 42001: simple explanation with examples", "ISO 42001"),
+    ("jhQRtCO_5n0", "ISO/IEC 42001 AI governance bootcamp", "ISO 42001"),
+]
+
+
+def handle(method, action, data, api_key, ctx):
+    action = (action or "").strip("/").lower()
+    vids = [{"id": i, "title": t, "channel": c} for i, t, c in VIDEOS]
+    if action == "list":
+        return {"count": len(vids), "videos": vids}, 200
+    chans = []
+    for v in vids:
+        if v["channel"] not in chans:
+            chans.append(v["channel"])
+    return {"module": "cinemafeed", "version": VERSION, "count": len(vids),
+            "channels": chans, "list": "https://sebbi.pro/x/cinemafeed/list"}, 200
+
+```
+
+
+## `modules/codebase.py`
+
+489 lines, 21403 bytes
+
+```python
+#!/usr/bin/env python3
+"""
+modules/codebase.py  -  dated evidence of what you held, and when
+=================================================================
+
+WHAT THIS IS, STATED HONESTLY FIRST
+-----------------------------------
+This does not prove ownership. Nothing cryptographic can. Ownership of
+software is a legal fact established by authorship, company records and
+signed assignment - not by a hash.
+
+What it does produce is the evidence that decides most disputes about
+software in practice: a dated, tamper-evident, externally anchored record
+that a specific person held a specific body of code, in a specific form, at
+a specific moment. When two parties later disagree about who had what
+first, that is the question a court, a mediator or an investor actually
+asks - and it is normally answered with commit dates, which are settable
+fields that prove nothing.
+
+This answers it with arithmetic instead.
+
+WHAT IT DOES
+------------
+    POST /x/codebase/seal
+
+Walks the deployed source tree, hashes every file, builds one manifest root
+over all of them, and seals that root - together with a declaration of
+authorship you supply - into the chain. From there it is anchored
+externally and handed to peer chains like every other block.
+
+Run it again next week and you get a second dated point. Run it on every
+deploy and you accumulate a continuous, uneditable record of the codebase
+evolving under your hand, which is a far stronger thing than a single
+snapshot: a body of work with a history is much harder to dispute than a
+file that appeared once.
+
+WHAT THE MANIFEST CONTAINS - AND WHAT IT DOES NOT
+-------------------------------------------------
+For each file: its path and the SHA-256 of its exact bytes. Nothing else.
+No contents leave the server, ever, by any route here. The hashes are
+one-way, so the manifest reveals nothing about what the code does; it only
+lets you demonstrate later that a file you hold now is byte-identical to
+the file you held then.
+
+The manifest route is deliberately KEYED rather than public. Only the root,
+the file count and the total byte size are public. A public file listing
+would hand an attacker a map of the deployment for no gain - the root is
+all a third party needs in order to check a manifest you show them.
+
+Excluded by default and never hashed: version control internals, caches,
+databases, and anything that looks like a secret. Sealing a hash of your
+own credentials file would be a poor way to protect them.
+
+HOW YOU USE IT IN A DISPUTE
+---------------------------
+  1. You produce the sealed root, its block index, and the chain's
+     external anchor.
+  2. You produce your copy of the code.
+  3. Anyone recomputes the manifest from your copy - the rules are
+     published at /x/codebase/spec - and compares.
+
+If it matches, you demonstrably held exactly that code no later than the
+sealing time, and the record of it has not been altered since, because it
+is a block in an anchored chain that peers also hold.
+
+WHAT STILL HAS TO HAPPEN OUTSIDE THIS FILE
+------------------------------------------
+Stated plainly, because a module that let you believe it had settled your
+legal position would be doing you harm:
+
+  - Copyright arises on authorship. Sealing evidences it; it does not
+    create or register it.
+  - If a company operates the platform, the IP needs to sit with the right
+    entity in writing, or the position is muddier than it looks.
+  - Where two parties have collaborated, the only reliable answer is an
+    agreement saying who owns what, signed before it matters rather than
+    after.
+
+This module makes the factual record unarguable. The legal position is a
+separate job and needs a solicitor, not a hash.
+
+    POST /x/codebase/seal      hash the tree, seal the root      (keyed)
+    GET  /x/codebase/manifest  the full file list for a seal     (keyed)
+    GET  /x/codebase/history   every seal, with root changes     (public)
+    GET  /x/codebase/root      the latest sealed root            (public)
+    GET  /x/codebase/spec      how to recompute it yourself      (public)
+"""
+
+import hashlib
+import json
+import os
+import re
+import time
+from datetime import datetime, timezone
+
+VERSION = "1.0"
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
+
+# Roots and history are public - a dated claim nobody can check is not
+# evidence. The file listing is keyed, because it is a map of the
+# deployment and a third party never needs it to verify a manifest.
+PUBLIC = {("GET", "history"), ("GET", "root"), ("GET", "spec")}
+
+FILE_PREFIX = b"AILEASH-FILE-v1:"
+MANIFEST_PREFIX = b"AILEASH-MANIFEST-v1:"
+
+MAX_FILES = 5000
+MAX_FILE_BYTES = 8 * 1024 * 1024
+
+# Never walked into.
+SKIP_DIRS = {".git", ".hg", ".svn", "__pycache__", "node_modules", ".venv",
+             "venv", ".mypy_cache", ".pytest_cache", ".idea", ".vscode",
+             "dist", "build", ".cache", "backups"}
+
+# Never hashed. Secrets and databases are excluded on purpose - a hash of
+# your credentials file is not evidence of anything you want to prove.
+SKIP_SUFFIXES = (".db", ".sqlite", ".sqlite3", ".db-journal", ".db-wal",
+                 ".db-shm", ".pyc", ".pyo", ".log", ".ots", ".pem", ".key",
+                 ".crt", ".p12", ".pfx")
+SKIP_NAMES = {".env", ".env.local", ".env.production", "secrets.json",
+              "credentials.json", ".netrc", "id_rsa", ".DS_Store"}
+
+_ready = False
+
+
+def _setup(ctx):
+    global _ready
+    if _ready:
+        return
+    with ctx["lock"]:
+        c = ctx["conn"]
+        c.execute("CREATE TABLE IF NOT EXISTS codebase_seal("
+                  "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,"
+                  "manifest_root TEXT,file_count INTEGER,total_bytes INTEGER,"
+                  "declaration TEXT,manifest TEXT,sealed REAL,"
+                  "audit_hash TEXT,block_index INTEGER)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_cb_root ON codebase_seal(manifest_root)")
+        c.commit()
+    _ready = True
+
+
+def _iso(ts):
+    if not ts:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+def _app_root():
+    """The directory the application is deployed from.
+
+    This module lives in modules/, so the parent of that directory is the
+    tree we want. Resolved rather than assumed, so it is correct whatever
+    the working directory happens to be when the server starts.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    parent = os.path.dirname(here)
+    return parent if parent else here
+
+
+def _skip(name):
+    if name in SKIP_NAMES:
+        return True
+    lower = name.lower()
+    return any(lower.endswith(suffix) for suffix in SKIP_SUFFIXES)
+
+
+def _file_hash(path):
+    """SHA-256 of the exact bytes, read in chunks so a large file cannot
+    exhaust memory."""
+    digest = hashlib.sha256()
+    digest.update(FILE_PREFIX)
+    size = 0
+    with open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(65536)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > MAX_FILE_BYTES:
+                return None, size
+            digest.update(chunk)
+    return digest.hexdigest(), size
+
+
+def _walk(root):
+    """Every file under root, sorted by relative path.
+
+    Sorting matters: the manifest must be reproducible by anyone holding
+    the same files, and directory order is not stable across systems.
+    """
+    entries, skipped, total = [], [], 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS and not d.startswith("."))
+        for filename in sorted(filenames):
+            if _skip(filename):
+                skipped.append(os.path.relpath(os.path.join(dirpath, filename), root))
+                continue
+            full = os.path.join(dirpath, filename)
+            relative = os.path.relpath(full, root).replace(os.sep, "/")
+            try:
+                digest, size = _file_hash(full)
+            except OSError:
+                skipped.append(relative)
+                continue
+            if digest is None:
+                skipped.append(relative)
+                continue
+            entries.append({"path": relative, "sha256": digest, "bytes": size})
+            total += size
+            if len(entries) >= MAX_FILES:
+                return entries, skipped, total, True
+    return entries, skipped, total, False
+
+
+def _manifest_root(entries):
+    """One root over the whole tree.
+
+    Deliberately a flat, ordered digest rather than a Merkle tree: there is
+    no need for per-file proofs here, and a rule anyone can reimplement in
+    four lines is worth more than a clever structure nobody checks.
+    """
+    digest = hashlib.sha256()
+    digest.update(MANIFEST_PREFIX)
+    for entry in entries:
+        digest.update(("%s\0%s\n" % (entry["path"], entry["sha256"])).encode("utf-8"))
+    return digest.hexdigest()
+
+
+# ----------------------------------------------------------------------
+# seal
+# ----------------------------------------------------------------------
+
+def _seal(ctx, api_key, data):
+    author = str(data.get("author", "") or "").strip()[:120]
+    entity = str(data.get("entity", "") or "").strip()[:120]
+    statement = str(data.get("statement", "") or "").strip()[:1000]
+
+    if not author:
+        return {"error": "author_required",
+                "message": "The name of the person declaring authorship. This is sealed "
+                           "verbatim and becomes part of the permanent record."}, 400
+
+    root_path = _app_root()
+    started = time.time()
+    entries, skipped, total_bytes, truncated = _walk(root_path)
+    if not entries:
+        return {"error": "nothing_to_seal",
+                "message": "No files found to hash under the application root."}, 500
+
+    manifest_root = _manifest_root(entries)
+    now = time.time()
+
+    declaration = {
+        "author": author,
+        "entity": entity or None,
+        "statement": statement or None,
+        "declared_at": _iso(now),
+    }
+
+    ev = {"user_id": "cb:" + manifest_root[:16], "action": "codebase_sealed", "amount": 0,
+          "country": "UK", "device_id": "codebase", "anomaly": 0, "device_risk": 0}
+    res = {"decision": "CODEBASE_SEALED", "score": 0, "codebase_version": VERSION,
+           "manifest_root": manifest_root, "file_count": len(entries),
+           "total_bytes": total_bytes, "author": author, "entity": entity or None,
+           "statement": statement or None,
+           "detail": "root=%s;files=%d;bytes=%d;author=%s"
+                     % (manifest_root, len(entries), total_bytes, author)}
+    audit_hash, block_index, seq = ctx["seal"](ev, res, now, api_key)
+
+    with ctx["lock"]:
+        prior = ctx["conn"].execute(
+            "SELECT manifest_root,sealed FROM codebase_seal ORDER BY id ASC").fetchall()
+        ctx["conn"].execute(
+            "INSERT INTO codebase_seal(api_key,manifest_root,file_count,total_bytes,"
+            "declaration,manifest,sealed,audit_hash,block_index) VALUES(?,?,?,?,?,?,?,?,?)",
+            (api_key, manifest_root, len(entries), total_bytes,
+             json.dumps(declaration), json.dumps(entries), now, audit_hash, block_index))
+        ctx["conn"].commit()
+
+    out = {
+        "manifest_root": manifest_root,
+        "file_count": len(entries), "total_bytes": total_bytes,
+        "files_skipped": len(skipped),
+        "sealed_at": _iso(now),
+        "took_seconds": round(now - started, 2),
+        "sealed_in_chain": audit_hash, "block_index": block_index, "receipt_seq": seq,
+        "declaration": declaration,
+        "seal_number": len(prior) + 1,
+        "codebase_version": VERSION,
+        "what_this_establishes": ("That the person named above held a body of code producing "
+                                  "exactly this manifest root, no later than this moment, and "
+                                  "that the record cannot be altered afterwards - it is a block "
+                                  "in a chain that is externally anchored and held by peers."),
+        "what_it_does_not": ("It does not establish legal ownership. Ownership comes from "
+                             "authorship, company records and signed assignment. This is the "
+                             "dated factual record those arguments rest on, not a substitute "
+                             "for them."),
+        "how_to_use_it": ("Keep this response. To demonstrate the claim later, produce your copy "
+                          "of the code and let anyone recompute the manifest root from it using "
+                          "the published rules. If it matches, you held exactly that code by "
+                          "this date."),
+        "verify_the_block": "/x/consistency/ancestor?tip=" + audit_hash,
+        "spec": "/x/codebase/spec",
+    }
+
+    if truncated:
+        out["truncated"] = ("Hit the %d file cap. The root covers the files listed and no more - "
+                            "raise MAX_FILES if the tree is genuinely larger." % MAX_FILES)
+    if prior:
+        last_root, last_time = prior[-1]
+        if last_root == manifest_root:
+            out["unchanged_since"] = _iso(last_time)
+            out["message"] = ("Identical to the previous seal. The codebase has not changed "
+                              "since %s and now carries an additional dated witness."
+                              % _iso(last_time))
+        else:
+            out["previous_root"] = last_root
+            out["previous_sealed_at"] = _iso(last_time)
+            out["message"] = ("The codebase has changed since the last seal. Both roots remain "
+                              "in the chain - a dated history of the work, which is stronger "
+                              "evidence than any single snapshot.")
+    else:
+        out["message"] = ("First seal. Run this on every deploy and the history becomes a "
+                          "continuous record of the work developing under one hand.")
+    return out, 200
+
+
+# ----------------------------------------------------------------------
+# reading
+# ----------------------------------------------------------------------
+
+def _manifest(ctx, data):
+    root = str(data.get("root", data.get("manifest_root", ""))).strip().lower()
+    with ctx["lock"]:
+        if root:
+            row = ctx["conn"].execute(
+                "SELECT manifest_root,file_count,total_bytes,declaration,manifest,sealed,"
+                "audit_hash,block_index FROM codebase_seal WHERE manifest_root=? LIMIT 1",
+                (root,)).fetchone()
+        else:
+            row = ctx["conn"].execute(
+                "SELECT manifest_root,file_count,total_bytes,declaration,manifest,sealed,"
+                "audit_hash,block_index FROM codebase_seal ORDER BY id DESC LIMIT 1").fetchone()
+    if not row:
+        return {"error": "not_found", "root": root or None}, 404
+
+    try:
+        files = json.loads(row[4])
+    except Exception:
+        files = []
+    try:
+        declaration = json.loads(row[3])
+    except Exception:
+        declaration = None
+
+    return {"manifest_root": row[0], "file_count": row[1], "total_bytes": row[2],
+            "declaration": declaration, "sealed_at": _iso(row[5]),
+            "sealed_in_chain": row[6], "block_index": row[7],
+            "files": files,
+            "codebase_version": VERSION,
+            "note": "Paths and hashes only. No file contents are held or returned by any route "
+                    "in this module."}, 200
+
+
+def _history(ctx):
+    with ctx["lock"]:
+        rows = ctx["conn"].execute(
+            "SELECT manifest_root,file_count,total_bytes,declaration,sealed,audit_hash,"
+            "block_index FROM codebase_seal ORDER BY id ASC LIMIT 500").fetchall()
+    if not rows:
+        return {"count": 0, "seals": [],
+                "message": "No codebase seal recorded yet."}, 200
+
+    seals, last = [], None
+    for root, count, total, declaration, sealed, audit_hash, block_index in rows:
+        try:
+            parsed = json.loads(declaration)
+            author = parsed.get("author")
+        except Exception:
+            author = None
+        seals.append({"manifest_root": root, "file_count": count, "total_bytes": total,
+                      "author": author, "sealed_at": _iso(sealed),
+                      "sealed_in_chain": audit_hash, "block_index": block_index,
+                      "changed_from_previous": last is not None and root != last})
+        last = root
+
+    authors = {s["author"] for s in seals if s["author"]}
+    return {"count": len(seals),
+            "first_sealed": seals[0]["sealed_at"], "latest_sealed": seals[-1]["sealed_at"],
+            "distinct_roots": len({s["manifest_root"] for s in seals}),
+            "declared_authors": sorted(authors),
+            "seals": seals,
+            "codebase_version": VERSION,
+            "what_this_is": "A dated, uneditable record of one body of code developing over "
+                            "time under a declared author. A continuous history is materially "
+                            "harder to dispute than a single snapshot.",
+            "file_list": "Keyed - /x/codebase/manifest. The root is all anyone needs to check a "
+                         "manifest you show them."}, 200
+
+
+def _root(ctx):
+    with ctx["lock"]:
+        row = ctx["conn"].execute(
+            "SELECT manifest_root,file_count,total_bytes,sealed,audit_hash,block_index,"
+            "declaration FROM codebase_seal ORDER BY id DESC LIMIT 1").fetchone()
+    if not row:
+        return {"error": "never_sealed"}, 404
+    try:
+        author = json.loads(row[6]).get("author")
+    except Exception:
+        author = None
+    return {"manifest_root": row[0], "file_count": row[1], "total_bytes": row[2],
+            "sealed_at": _iso(row[3]), "sealed_in_chain": row[4], "block_index": row[5],
+            "declared_author": author,
+            "codebase_version": VERSION,
+            "verify_the_block": "/x/consistency/ancestor?tip=" + row[4],
+            "recompute_it": "/x/codebase/spec"}, 200
+
+
+def _spec():
+    return {
+        "codebase_version": VERSION,
+        "purpose": "Dated, tamper-evident evidence that a named person held a specific body of "
+                   "code at a specific moment.",
+        "not_ownership": "This does not establish legal ownership and is not offered as though "
+                         "it does. Ownership comes from authorship, company records and signed "
+                         "assignment. This is the factual record those arguments rest on.",
+        "file_hash": "sha256('AILEASH-FILE-v1:' || exact_file_bytes) as lowercase hex",
+        "manifest_root": "sha256('AILEASH-MANIFEST-v1:' || for each file in path order: "
+                         "path + NUL + file_hash + newline) as lowercase hex",
+        "ordering": "files sorted by relative path, forward slashes, relative to the "
+                    "application root",
+        "excluded": {
+            "directories": sorted(SKIP_DIRS),
+            "suffixes": list(SKIP_SUFFIXES),
+            "names": sorted(SKIP_NAMES),
+            "why": "Version control internals and caches are not the work. Databases and "
+                   "anything resembling a secret are excluded because hashing them proves "
+                   "nothing worth proving and risks something worth protecting.",
+        },
+        "recompute_it_yourself": [
+            "Take your copy of the source tree.",
+            "Drop the excluded directories, suffixes and names above.",
+            "Hash each remaining file with the file rule.",
+            "Sort by relative path and apply the manifest rule.",
+            "Compare with the sealed root. A match means byte-identical code.",
+        ],
+        "privacy": "No file contents are stored or returned by any route. The manifest holds "
+                   "paths and one-way hashes only, and the file list itself is keyed.",
+        "the_discipline": "Seal on every deploy. A single snapshot is a claim about one day; a "
+                          "continuous dated history is a record of the work.",
+        "what_to_do_as_well": "Get the legal position in writing - entity ownership of the IP, "
+                              "and a signed agreement with any collaborator saying who owns "
+                              "what. Do it before it matters. This module makes the facts "
+                              "unarguable; it cannot make the paperwork exist.",
+    }, 200
+
+
+# ----------------------------------------------------------------------
+# router entry point
+# ----------------------------------------------------------------------
+
+def handle(method, action, data, api_key, ctx):
+    _setup(ctx)
+    action = (action or "").strip("/").lower()
+    data = data or {}
+
+    if method == "GET":
+        if action == "spec":
+            return _spec()
+        if action == "history":
+            return _history(ctx)
+        if action == "root":
+            return _root(ctx)
+        if action == "manifest":
+            if not api_key:
+                return {"error": "invalid_api_key"}, 401
+            return _manifest(ctx, data)
+
+    if method == "POST":
+        if not api_key:
+            return {"error": "invalid_api_key"}, 401
+        if action == "seal":
+            return _seal(ctx, api_key, data)
+
+    return {"error": "unknown_action", "action": action,
+            "GET": ["spec", "history", "root", "manifest (keyed)"],
+            "POST": ["seal (keyed)"]}, 404
+
+```
 
 
 ## `modules/complete.py`
@@ -872,820 +2151,5 @@ def handle(method, action, data, api_key, ctx):
     return {"error": "unknown_action", "action": action,
             "GET": ["spec", "periods", "root", "prove"],
             "POST": ["verify", "commit", "erase"]}, 404
-
-```
-
-
-## `modules/conformance.py`
-
-338 lines, 14845 bytes
-
-```python
-"""
-Conformance testing - /x/conformance/<action>
-
-WHAT THIS IS FOR
-----------------
-Three limits are documented elsewhere in this platform, and all three have
-the same shape: the engine's arithmetic is sound, but the guarantee depends
-on something outside the engine.
-
-  1. Commit-before-reveal proves order - but only if the integrator does not
-     show its reviewers the machine verdict before calling /open.
-  2. Mutual witnessing gets its strength from breadth - two platforms
-     witnessing only each other prove very little.
-  3. A declaration is only as strong as the rules declared - one that
-     constrains nothing passes everything.
-
-None of these can be fixed by the engine on its own. All three can be
-MEASURED, and a measured weakness is a different animal from an unmeasured
-one. That is what this module does.
-
-1. PROBES - testing the integration, not trusting it
-----------------------------------------------------
-The idea is borrowed openly from how real audits work, and specifically from
-a point James Stokes made publicly: slip a case with a known answer into the
-queue, unannounced, and see who catches it.
-
-A probe creates a genuine oversight case whose machine verdict is
-deliberately set to a known-wrong value. The reviewer sees it exactly like
-any other case. Two things then follow:
-
-  - If they agree with the deliberately wrong verdict, they did not evaluate
-    it. That is a caught rubber stamp, sealed.
-  - If the integration is showing them the verdict before /open is called,
-    their probe agreement rate will match their normal agreement rate. If
-    they are genuinely deciding blind, it will not. The gap between the two
-    numbers is the conformance signal.
-
-A single probe proves nothing about a person. A catch rate across dozens is
-evidence about a process, which is the thing under audit.
-
-2. WITNESS BREADTH - concentration is visible
----------------------------------------------
-Reports how many distinct peers witness the chain, how concentrated the
-observations are in the largest peer, and how many peers have gone quiet.
-Below three live peers the network is reported as weak, because it is.
-
-3. DECLARATION STRENGTH - rules that never fire
-------------------------------------------------
-Runs the live declaration against sealed records and reports, per rule, how
-many records it actually CONSTRAINED - that is, how many matched its `when`
-condition and therefore had to satisfy its `require`. A rule that has never
-constrained a single record is not a standard. It is decoration, and it is
-named as such.
-
-HONEST LIMITS OF THIS MODULE
-----------------------------
-- Probes test the process, not any individual. Someone can catch a probe and
-  still rubber stamp the next hundred cases.
-- A determined integrator who identifies probe cases can treat them
-  differently. Probe case references are not marked in any way the reviewer
-  can see, but a sufficiently motivated operator controls their own UI.
-- Breadth and strength are measurements, not enforcement. Nothing here can
-  compel a platform to witness widely or declare strictly. It can only make
-  the alternative visible.
-
-    POST /x/conformance/probe        inject a probe case with a known-wrong verdict
-    GET  /x/conformance/probes       catch rate, and the conformance gap
-    GET  /x/conformance/witness      breadth, concentration, staleness
-    GET  /x/conformance/declaration  per-rule strength - what each rule constrains
-    GET  /x/conformance/report       all three, one call
-"""
-
-import importlib, json, secrets, time
-from datetime import datetime, timezone
-
-VERSION = "1.0"
-INVERT = {"allow": "block", "block": "allow",
-          "challenge": "allow", "escalate": "allow"}
-
-_ready = False
-
-
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        ctx["conn"].execute("CREATE TABLE IF NOT EXISTS conformance_probes(probe_id TEXT PRIMARY KEY,api_key TEXT,case_id TEXT,reviewer TEXT,planted_verdict TEXT,correct_verdict TEXT,injected REAL,resolved REAL,reviewer_verdict TEXT,caught INTEGER)")
-        ctx["conn"].execute("CREATE INDEX IF NOT EXISTS idx_probe_key ON conformance_probes(api_key)")
-        ctx["conn"].commit()
-    _ready = True
-
-
-def _iso(ts):
-    if not ts:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
-
-# ------------------------------------------------------------------ probes
-
-def _probe(ctx, api_key, data):
-    reviewer = str(data.get("reviewer", "")).strip()
-    if not reviewer:
-        return {"error": "reviewer_required"}, 400
-    correct = str(data.get("correct_verdict", "")).strip().lower()
-    if correct not in INVERT:
-        return {"error": "correct_verdict_required",
-                "allowed": sorted(INVERT)}, 400
-    material = data.get("material")
-    if material is None:
-        return {"error": "material_required",
-                "message": "A probe must look like a real case or it tests nothing."}, 400
-
-    planted = INVERT[correct]
-    try:
-        ovs = importlib.import_module("modules.oversight")
-    except Exception as e:
-        return {"error": "oversight_module_unavailable", "detail": str(e)}, 503
-
-    ref = str(data.get("case_ref", "")).strip() or ("CASE-" + secrets.token_hex(3).upper())
-    payload, status = ovs.handle("POST", "open",
-                                 {"case_ref": ref, "reviewer": reviewer,
-                                  "material": material,
-                                  "machine_verdict": planted},
-                                 api_key, ctx)
-    if status != 200:
-        return payload, status
-
-    pid = "PRB-" + secrets.token_hex(4).upper()
-    ts = time.time()
-    with ctx["lock"]:
-        ctx["conn"].execute("INSERT INTO conformance_probes(probe_id,api_key,case_id,reviewer,planted_verdict,correct_verdict,injected,resolved,reviewer_verdict,caught) VALUES(?,?,?,?,?,?,?,NULL,NULL,NULL)",
-                            (pid, api_key, payload["case_id"], reviewer, planted, correct, ts))
-        ctx["conn"].commit()
-
-    return {"probe_id": pid, "case_id": payload["case_id"],
-            "case_ref": ref, "reviewer": reviewer,
-            "planted_verdict": planted, "correct_verdict": correct,
-            "injected": _iso(ts),
-            "note": "This is an ordinary oversight case to the reviewer. Route it into their queue exactly like any other, or the probe is worthless."}, 200
-
-
-def _resolve_probes(ctx, api_key):
-    """Settle any probes whose oversight case has since been committed."""
-    with ctx["lock"]:
-        open_probes = ctx["conn"].execute("SELECT probe_id,case_id,planted_verdict,correct_verdict FROM conformance_probes WHERE api_key=? AND resolved IS NULL", (api_key,)).fetchall()
-        for pid, cid, planted, correct in open_probes:
-            row = ctx["conn"].execute("SELECT reviewer_verdict,committed FROM oversight_cases WHERE case_id=? AND api_key=?", (cid, api_key)).fetchone()
-            if not row or not row[1]:
-                continue
-            rv = (row[0] or "").lower()
-            caught = 1 if rv != planted else 0
-            ctx["conn"].execute("UPDATE conformance_probes SET resolved=?,reviewer_verdict=?,caught=? WHERE probe_id=?",
-                                (row[1], rv, caught, pid))
-        ctx["conn"].commit()
-
-
-def _probes(ctx, api_key):
-    try:
-        _resolve_probes(ctx, api_key)
-    except Exception:
-        pass
-    with ctx["lock"]:
-        rows = ctx["conn"].execute("SELECT reviewer,caught,resolved FROM conformance_probes WHERE api_key=? AND resolved IS NOT NULL", (api_key,)).fetchall()
-        pending = ctx["conn"].execute("SELECT COUNT(*) FROM conformance_probes WHERE api_key=? AND resolved IS NULL", (api_key,)).fetchone()[0]
-    if not rows:
-        return {"probes_resolved": 0, "probes_pending": pending,
-                "note": "No probes have come back yet."}, 200
-
-    by = {}
-    for reviewer, caught, _r in rows:
-        d = by.setdefault(reviewer, {"probes": 0, "caught": 0})
-        d["probes"] += 1
-        d["caught"] += caught
-
-    out = []
-    for reviewer, d in sorted(by.items()):
-        rate = round(100 * d["caught"] / d["probes"], 1)
-        entry = {"reviewer": reviewer, "probes": d["probes"],
-                 "caught": d["caught"], "catch_rate_pct": rate}
-        # conformance gap: probe agreement vs normal agreement
-        try:
-            ovs = importlib.import_module("modules.oversight")
-            stats, _s = ovs.handle("GET", "reviewer", {"id": reviewer}, api_key, ctx)
-            normal = stats.get("agreement_rate_pct")
-            if normal is not None and d["probes"] >= 5:
-                probe_agree = round(100 * (d["probes"] - d["caught"]) / d["probes"], 1)
-                gap = round(abs(probe_agree - normal), 1)
-                entry["normal_agreement_pct"] = normal
-                entry["probe_agreement_pct"] = probe_agree
-                entry["conformance_gap"] = gap
-                if gap < 5 and normal > 90:
-                    entry["flag"] = "probe agreement matches normal agreement at a high rate - consistent with the verdict being visible before commit"
-        except Exception:
-            pass
-        if d["probes"] >= 5 and rate == 0:
-            entry["flag"] = "caught none of " + str(d["probes"]) + " deliberately wrong verdicts"
-        out.append(entry)
-
-    total = sum(d["probes"] for d in by.values())
-    caught = sum(d["caught"] for d in by.values())
-    return {"probes_resolved": total, "probes_pending": pending,
-            "caught": caught,
-            "overall_catch_rate_pct": round(100 * caught / total, 1),
-            "by_reviewer": out,
-            "note": "A single probe proves nothing about a person. A catch rate across dozens is evidence about a process."}, 200
-
-
-# ----------------------------------------------------------------- witness
-
-def _witness(ctx, api_key):
-    t = time.time()
-    try:
-        with ctx["lock"]:
-            rows = ctx["conn"].execute("SELECT peer,COUNT(*),MAX(observed),COUNT(DISTINCT tip) FROM witness_log WHERE api_key=? GROUP BY peer", (api_key,)).fetchall()
-    except Exception:
-        rows = []
-    if not rows:
-        return {"peers": 0, "strength": "none",
-                "note": "No peers witnessed. Anchoring alone still applies; mutual witnessing does not."}, 200
-
-    total = sum(r[1] for r in rows)
-    live = [r for r in rows if (t - r[2]) < 6 * 3600]
-    stale = [r for r in rows if 6 * 3600 <= (t - r[2]) < 48 * 3600]
-    silent = [r for r in rows if (t - r[2]) >= 48 * 3600]
-    top = max(rows, key=lambda r: r[1])
-    conc = round(100 * top[1] / total, 1)
-
-    if len(live) >= 5 and conc < 50:
-        strength = "strong"
-    elif len(live) >= 3:
-        strength = "adequate"
-    elif len(live) >= 1:
-        strength = "weak"
-    else:
-        strength = "dormant"
-
-    out = {"peers": len(rows), "live": len(live), "stale": len(stale),
-           "silent": len(silent), "observations": total,
-           "largest_peer_share_pct": conc,
-           "strength": strength,
-           "distinct_tips_seen": sum(r[3] for r in rows)}
-    if len(live) < 3:
-        out["flag"] = "fewer than three live peers - breadth is what makes witnessing meaningful, and this network does not have it yet"
-    if conc > 80 and len(rows) > 1:
-        out["concentration_flag"] = "over 80% of observations come from a single peer"
-    if len(rows) == 1:
-        out["reciprocity_warning"] = "a single peer pair proves very little - two parties witnessing only each other can still collude"
-    return out, 200
-
-
-# ------------------------------------------------------------- declaration
-
-def _declaration(ctx, api_key):
-    try:
-        dec = importlib.import_module("modules.declare")
-    except Exception as e:
-        return {"error": "declare_module_unavailable", "detail": str(e)}, 503
-
-    cur, status = dec.handle("GET", "current", {}, api_key, ctx)
-    if status != 200:
-        return cur, status
-    rules = cur["declaration"]["rules"]
-    ver = cur["version"]
-
-    with ctx["lock"]:
-        recs = ctx["conn"].execute("SELECT event_json,result_json FROM audit_log WHERE api_key=? ORDER BY id DESC LIMIT 2000", (api_key,)).fetchall()
-
-    parsed = []
-    for ev, res in recs:
-        try:
-            r = {}
-            r.update(json.loads(ev))
-            r.update(json.loads(res))
-            if str(r.get("decision", "")).endswith("_SEALED"):
-                continue
-            parsed.append(r)
-        except Exception:
-            pass
-
-    report = []
-    for rule in rules:
-        constrained = 0
-        violated = 0
-        for r in parsed:
-            if not dec._test(rule.get("when"), r):
-                continue
-            constrained += 1
-            if not dec._test(rule.get("require"), r):
-                violated += 1
-        entry = {"rule": rule.get("id"), "describe": rule.get("describe"),
-                 "records_constrained": constrained,
-                 "violations": violated,
-                 "coverage_pct": (round(100 * constrained / len(parsed), 1) if parsed else 0)}
-        if constrained == 0:
-            entry["flag"] = "this rule has never constrained a single record - it is decoration, not a standard"
-        report.append(entry)
-
-    dead = len([r for r in report if r["records_constrained"] == 0])
-    covered = len({i for i, rule in enumerate(rules)
-                   if report[i]["records_constrained"] > 0})
-    out = {"declaration_version": ver, "rules": len(rules),
-           "records_examined": len(parsed),
-           "rules_that_constrain_nothing": dead,
-           "rules_with_effect": covered,
-           "per_rule": report}
-    if dead:
-        out["flag"] = str(dead) + " of " + str(len(rules)) + " rules constrain nothing"
-    if not rules:
-        out["flag"] = "an empty declaration passes everything"
-    return out, 200
-
-
-# ---------------------------------------------------------------- routing
-
-def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-    if method == "POST":
-        if action == "probe":
-            return _probe(ctx, api_key, data)
-    else:
-        if action == "probes":
-            return _probes(ctx, api_key)
-        if action == "witness":
-            return _witness(ctx, api_key)
-        if action == "declaration":
-            return _declaration(ctx, api_key)
-        if action in ("", "report"):
-            p, _a = _probes(ctx, api_key)
-            w, _b = _witness(ctx, api_key)
-            d, _c = _declaration(ctx, api_key)
-            return {"conformance_version": VERSION,
-                    "integration": p, "witness_breadth": w,
-                    "declaration_strength": d,
-                    "note": "These are measurements, not enforcement. Nothing here compels good behaviour - it only makes the alternative visible."}, 200
-    return {"error": "unknown_action", "action": action}, 404
-
-```
-
-
-## `modules/consistency.py`
-
-461 lines, 19146 bytes
-
-```python
-#!/usr/bin/env python3
-"""
-modules/consistency.py  -  proving we have never run two histories
-==================================================================
-
-THE ATTACK NOTHING ELSE HERE STOPS
-----------------------------------
-Mutual witnessing means several parties hold hashes of our chain. What
-none of them can currently check is whether they are all holding hashes of
-the SAME chain.
-
-Nothing in the design so far stops an operator running two histories in
-parallel. Serve chain A to one witness, chain B to an auditor. Both get a
-valid-looking tip. Both anchor it. Both verify perfectly against the copy
-they were given. Neither can tell, because there is no way to ask the
-question that would expose it:
-
-    is the tip you are holding actually an ancestor of my current head?
-
-That is the split-view attack. Witnessing does not stop it. Anchoring does
-not stop it - two forks can both be anchored. It is the last place an
-operator can lie, and it is the one nobody in compliance has closed,
-because the defence came out of Certificate Transparency and has not
-crossed over.
-
-WHAT THIS DOES
---------------
-Builds an ordered Merkle tree over the audit chain and answers one
-question for anybody, forever, without our cooperation:
-
-    GET /x/consistency/ancestor?tip=<any tip we ever served>
-
-If that tip is on our chain, we return its position and a proof, against
-our current head, that it is still there and still in the same place. If
-it is not on our chain, we say so - and the party holding it knows they
-were served a history we no longer stand behind.
-
-Every witness can check every tip they have ever held, automatically, on a
-timer, for as long as they keep the tips. Which means we cannot show two
-faces to the network: the moment any holder of any old tip checks it, a
-fork stops being hidden and becomes provable arithmetic.
-
-APPEND-ONLY, PROVED RATHER THAN ASSERTED
-----------------------------------------
-    GET /x/consistency/proof?first=21&second=48
-
-Proves the log at size 21 is a PREFIX of the log at size 48. Not that both
-exist - that the second was reached from the first by appending only, with
-nothing inserted, removed or reordered in between. That is the actual
-meaning of "append-only", and until now it has been a claim rather than
-something a stranger could check.
-
-WHY THE MATHS IS BORROWED, NOT INVENTED
----------------------------------------
-The tree here follows RFC 6962 - Certificate Transparency - deliberately,
-including its leaf and node prefixes and its split at the largest power of
-two. Anyone who has implemented a CT verifier can point it at this and it
-will work. Inventing a bespoke tree would mean nobody could check us
-without writing new code first, which is the opposite of the point.
-
-Note this tree is ORDERED, unlike the sorted tree in modules/complete.py.
-The two answer different questions. Sorted proves what is absent. Ordered
-proves nothing was reordered. They are not interchangeable and both are
-needed.
-
-HONEST LIMITS
--------------
-  - This proves our published chain is internally append-only and that a
-    given tip belongs to it. It says nothing about whether an entry should
-    have been written in the first place.
-  - A fork is only DETECTED if someone actually checks a tip they were
-    given. The network has to do its half. That is why the route is public
-    and needs no account - so checking costs nothing and can be automated.
-  - If nobody ever holds an old tip of ours, there is nothing to check us
-    against. Detection scales with how many witnesses keep history, which
-    is another reason breadth matters more than depth.
-  - Recomputation is O(n) hashing over the chain. Cached per size. On a
-    very large log a checkpoint-based approach would be better; that is
-    written down rather than hidden.
-
-    GET  /x/consistency/root         current size and root      (public)
-    GET  /x/consistency/ancestor     is this tip on our chain    (public)
-    GET  /x/consistency/proof        prefix proof between sizes  (public)
-    GET  /x/consistency/spec         the exact hashing rules     (public)
-    POST /x/consistency/verify       check a proof we gave out   (public)
-    POST /x/consistency/checkpoint   seal the current root       (keyed)
-"""
-
-import hashlib
-import re
-import threading
-import time
-from datetime import datetime, timezone
-
-VERSION = "1.0"
-HEX64 = re.compile(r"^[0-9a-f]{64}$")
-
-# All the read routes are open. A consistency check you need an account to
-# run is worthless - the party most likely to want it is the one who has
-# stopped trusting us.
-PUBLIC = {("GET", "root"), ("GET", "ancestor"), ("GET", "proof"),
-          ("GET", "spec"), ("POST", "verify")}
-
-# RFC 6962 domain separation. Leaf and internal hashes must never be
-# confusable or an internal node can be passed off as a leaf.
-LEAF_BYTE = b"\x00"
-NODE_BYTE = b"\x01"
-
-MAX_LEAVES = 500000
-
-_ready = False
-_cache = {"size": -1, "leaves": [], "root": None, "built": 0}
-_cache_lock = threading.Lock()
-
-
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        c = ctx["conn"]
-        c.execute("CREATE TABLE IF NOT EXISTS consistency_checkpoint("
-                  "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,tree_size INTEGER,"
-                  "root TEXT,taken REAL,audit_hash TEXT,block_index INTEGER)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_cons_size "
-                  "ON consistency_checkpoint(tree_size)")
-        c.commit()
-    _ready = True
-
-
-def _iso(ts):
-    if not ts:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
-
-# ----------------------------------------------------------------------
-# RFC 6962 tree
-# ----------------------------------------------------------------------
-
-def _leaf(value):
-    return hashlib.sha256(LEAF_BYTE + value.encode("utf-8")).digest()
-
-
-def _node(left, right):
-    return hashlib.sha256(NODE_BYTE + left + right).digest()
-
-
-def _split(n):
-    """Largest power of two strictly less than n. RFC 6962 splits here."""
-    k = 1
-    while k * 2 < n:
-        k *= 2
-    return k
-
-
-def _mth(leaves):
-    """Merkle Tree Hash over an ordered slice. Returns raw bytes."""
-    n = len(leaves)
-    if n == 0:
-        return hashlib.sha256(b"").digest()
-    if n == 1:
-        return _leaf(leaves[0])
-    k = _split(n)
-    return _node(_mth(leaves[:k]), _mth(leaves[k:]))
-
-
-def _inclusion(index, leaves):
-    """Audit path for leaf at index within this slice. Raw bytes list."""
-    n = len(leaves)
-    if n <= 1:
-        return []
-    k = _split(n)
-    if index < k:
-        return _inclusion(index, leaves[:k]) + [_mth(leaves[k:])]
-    return _inclusion(index - k, leaves[k:]) + [_mth(leaves[:k])]
-
-
-def _subproof(m, leaves, is_root):
-    n = len(leaves)
-    if m == n:
-        return [] if is_root else [_mth(leaves)]
-    k = _split(n)
-    if m <= k:
-        return _subproof(m, leaves[:k], is_root) + [_mth(leaves[k:])]
-    return _subproof(m - k, leaves[k:], False) + [_mth(leaves[:k])]
-
-
-def _consistency(m, leaves):
-    """Proof that the tree of the first m leaves is a prefix of this one."""
-    if m <= 0 or m > len(leaves):
-        return None
-    if m == len(leaves):
-        return []
-    return _subproof(m, leaves, True)
-
-
-def _hexed(nodes):
-    return [n.hex() for n in nodes]
-
-
-# ----------------------------------------------------------------------
-# reading the chain
-# ----------------------------------------------------------------------
-
-def _load(ctx):
-    """Every audit hash in order, cached until the chain grows.
-
-    Order is the point here - this is not the sorted tree from
-    modules/complete.py and the two must never be confused.
-    """
-    with ctx["lock"]:
-        row = ctx["conn"].execute("SELECT COUNT(*) FROM audit_log").fetchone()
-    size = int(row[0]) if row else 0
-
-    with _cache_lock:
-        if _cache["size"] == size and _cache["root"] is not None:
-            return _cache["leaves"], _cache["root"], size, None
-
-    if size > MAX_LEAVES:
-        return None, None, size, "chain holds %d entries, above the %d cap for live recomputation" % (size, MAX_LEAVES)
-
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT audit_hash FROM audit_log ORDER BY id ASC").fetchall()
-    leaves = [str(r[0]) for r in rows if r[0]]
-    root = _mth(leaves)
-
-    with _cache_lock:
-        _cache["size"] = len(leaves)
-        _cache["leaves"] = leaves
-        _cache["root"] = root
-        _cache["built"] = time.time()
-
-    return leaves, root, len(leaves), None
-
-
-# ----------------------------------------------------------------------
-# routes
-# ----------------------------------------------------------------------
-
-def _root(ctx):
-    leaves, root, size, why = _load(ctx)
-    if why:
-        return {"error": "too_large", "message": why, "tree_size": size}, 503
-    return {"tree_size": size, "root": root.hex(), "consistency_version": VERSION,
-            "algorithm": "RFC 6962 Merkle Tree Hash over audit hashes in write order",
-            "note": "Record this alongside any tip you hold. Later you can ask us to prove the "
-                    "log you saw is a prefix of the log we serve today.",
-            "check": "/x/consistency/proof?first=<your size>&second=%d" % size,
-            "spec": "/x/consistency/spec"}, 200
-
-
-def _ancestor(ctx, data):
-    tip = str(data.get("tip", "")).strip().lower()
-    if not tip:
-        return {"error": "tip_required",
-                "message": "Any tip we ever served you. We will prove whether it is still on "
-                           "the chain we serve now."}, 400
-
-    leaves, root, size, why = _load(ctx)
-    if why:
-        return {"error": "too_large", "message": why, "tree_size": size}, 503
-
-    try:
-        index = leaves.index(tip)
-    except ValueError:
-        return {"on_chain": False, "tip": tip, "tree_size": size, "root": root.hex(),
-                "what_this_means": "This tip is not in the chain we serve. Either it was never "
-                                   "ours, or it belongs to a history we are no longer publishing. "
-                                   "If we gave you this tip, that is a fork and you now have "
-                                   "evidence of it.",
-                "keep_this": "This response, the tip, and whatever we originally sent you with "
-                             "it. Together they are the record of the discrepancy.",
-                "consistency_version": VERSION}, 409
-
-    path = _inclusion(index, leaves)
-    return {"on_chain": True, "tip": tip, "leaf_index": index, "height": index + 1,
-            "tree_size": size, "root": root.hex(),
-            "inclusion_proof": _hexed(path),
-            "consistency_version": VERSION,
-            "what_this_proves": "This tip sits at position %d of a chain of %d, and the current "
-                                "root recomputes from it. It has not been moved, removed or "
-                                "reordered since we gave it to you." % (index, size),
-            "verify_yourself": "/x/consistency/spec has the rules. Recompute upward from the "
-                               "leaf and compare with the root above.",
-            "prefix_proof": "/x/consistency/proof?first=%d&second=%d" % (index + 1, size)}, 200
-
-
-def _proof(ctx, data):
-    try:
-        first = int(data.get("first", 0))
-        second = int(data.get("second", 0) or 0)
-    except (TypeError, ValueError):
-        return {"error": "bad_sizes", "message": "first and second are tree sizes, as integers"}, 400
-
-    leaves, root, size, why = _load(ctx)
-    if why:
-        return {"error": "too_large", "message": why, "tree_size": size}, 503
-    if not second:
-        second = size
-    if first < 1 or first > second or second > size:
-        return {"error": "bad_range",
-                "message": "Need 1 <= first <= second <= %d" % size,
-                "tree_size": size}, 400
-
-    older = leaves[:first]
-    newer = leaves[:second]
-    proof = _consistency(first, newer)
-    if proof is None:
-        return {"error": "no_proof", "message": "could not build a proof for that range"}, 400
-
-    return {"first": first, "second": second,
-            "first_root": _mth(older).hex(),
-            "second_root": _mth(newer).hex(),
-            "consistency_proof": _hexed(proof),
-            "consistency_version": VERSION,
-            "what_this_proves": "The log at size %d is a prefix of the log at size %d. Nothing "
-                                "was inserted, removed or reordered between them - only "
-                                "appended. That is what append-only actually means, and this is "
-                                "it demonstrated rather than asserted." % (first, second),
-            "algorithm": "RFC 6962 section 2.1.2",
-            "spec": "/x/consistency/spec"}, 200
-
-
-def _verify(data):
-    """Recompute an inclusion proof. Convenience only - anyone relying on
-    us to check our own proof has not checked anything."""
-    leaf_value = str(data.get("leaf", data.get("tip", ""))).strip().lower()
-    index = data.get("index", data.get("leaf_index"))
-    size = data.get("tree_size")
-    root = str(data.get("root", "")).strip().lower()
-    proof = data.get("inclusion_proof", data.get("proof"))
-
-    if not leaf_value or not HEX64.match(root) or not isinstance(proof, list):
-        return {"error": "leaf_root_and_proof_required"}, 400
-    try:
-        index = int(index)
-        size = int(size)
-    except (TypeError, ValueError):
-        return {"error": "index_and_tree_size_required"}, 400
-    if index < 0 or size <= 0 or index >= size:
-        return {"error": "index_out_of_range"}, 400
-
-    current = _leaf(leaf_value)
-    node_index, last_index = index, size - 1
-    try:
-        for step in proof:
-            sibling = bytes.fromhex(str(step))
-            if node_index % 2 == 1 or node_index == last_index:
-                if node_index % 2 == 1:
-                    current = _node(sibling, current)
-                else:
-                    current = _node(sibling, current)
-                while node_index % 2 == 0 and node_index != 0:
-                    node_index //= 2
-                    last_index //= 2
-            else:
-                current = _node(current, sibling)
-            node_index //= 2
-            last_index //= 2
-    except Exception as exc:
-        return {"error": "bad_proof", "message": str(exc)[:200]}, 400
-
-    return {"valid": current.hex() == root,
-            "computed_root": current.hex(), "given_root": root,
-            "note": "Recomputed from the leaf upward using RFC 6962 audit path rules."}, 200
-
-
-def _checkpoint(ctx, api_key):
-    """Seal the current size and root into the chain itself.
-
-    A checkpoint is our own signature on 'this is what the log looked like
-    at this moment'. Once anchored, publishing a different history for that
-    size contradicts something we already sealed and externally timestamped.
-    """
-    leaves, root, size, why = _load(ctx)
-    if why:
-        return {"error": "too_large", "message": why, "tree_size": size}, 503
-
-    now = time.time()
-    root_hex = root.hex()
-    ev = {"user_id": "cons:%d" % size, "action": "consistency_checkpoint", "amount": 0,
-          "country": "UK", "device_id": "consistency", "anomaly": 0, "device_risk": 0}
-    res = {"decision": "CHECKPOINT_SEALED", "score": 0, "consistency_version": VERSION,
-           "tree_size": size, "root": root_hex,
-           "detail": "size=%d;root=%s" % (size, root_hex)}
-    audit_hash, block_index, seq = ctx["seal"](ev, res, now, api_key)
-
-    with ctx["lock"]:
-        ctx["conn"].execute("INSERT INTO consistency_checkpoint(api_key,tree_size,root,taken,"
-                            "audit_hash,block_index) VALUES(?,?,?,?,?,?)",
-                            (api_key, size, root_hex, now, audit_hash, block_index))
-        ctx["conn"].commit()
-
-    return {"tree_size": size, "root": root_hex, "taken_at": _iso(now),
-            "sealed_in_chain": audit_hash, "block_index": block_index, "receipt_seq": seq,
-            "what_this_does": "Commits our own view of the log at this size, inside the log, "
-                              "where it gets anchored with everything else. Serving a different "
-                              "history for this size now contradicts a sealed, timestamped "
-                              "record of our own making.",
-            "note": "The checkpoint itself becomes an entry, so the next size is larger. That is "
-                    "expected and does not affect the proof for this one."}, 200
-
-
-def _spec():
-    return {
-        "consistency_version": VERSION,
-        "based_on": "RFC 6962 (Certificate Transparency), deliberately unmodified so existing "
-                    "verifiers work against this without new code",
-        "leaves": "the audit_hash of every chain entry, in write order (id ascending), as "
-                  "lowercase hex strings encoded UTF-8",
-        "empty_root": hashlib.sha256(b"").hexdigest(),
-        "leaf_hash": "sha256(0x00 || leaf_value_utf8)",
-        "node_hash": "sha256(0x01 || left || right)",
-        "split": "for n > 1 leaves, split at k = the largest power of two strictly less than n",
-        "inclusion": "RFC 6962 section 2.1.1 audit path",
-        "consistency": "RFC 6962 section 2.1.2 - proves the tree at size m is a prefix of the "
-                       "tree at size n",
-        "ordered_not_sorted": "This tree is in write order. /x/complete uses a SORTED tree, "
-                              "which answers a different question (absence). Do not confuse the "
-                              "two - the roots will not match and are not meant to.",
-        "how_to_catch_us": "Keep every tip and root we ever hand you. Ask /x/consistency/ancestor "
-                           "about the old ones on a timer. If one ever comes back on_chain false, "
-                           "or a prefix proof fails to verify, we have served two histories and "
-                           "you can prove it without our help.",
-        "why_published": "Because a log nobody can check is a log you are being asked to trust.",
-    }, 200
-
-
-# ----------------------------------------------------------------------
-# router entry point
-# ----------------------------------------------------------------------
-
-def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-    action = (action or "").strip("/").lower()
-    data = data or {}
-
-    if method == "GET":
-        if action == "spec":
-            return _spec()
-        if action == "root":
-            return _root(ctx)
-        if action == "ancestor":
-            return _ancestor(ctx, data)
-        if action == "proof":
-            return _proof(ctx, data)
-
-    if method == "POST":
-        if action == "verify":
-            return _verify(data)
-        if not api_key:
-            return {"error": "invalid_api_key"}, 401
-        if action == "checkpoint":
-            return _checkpoint(ctx, api_key)
-
-    return {"error": "unknown_action", "action": action,
-            "GET": ["spec", "root", "ancestor", "proof"],
-            "POST": ["verify", "checkpoint"]}, 404
 
 ```
