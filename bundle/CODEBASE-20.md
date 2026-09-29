@@ -1,2216 +1,930 @@
-# Codebase — part 20 of 45
+# Codebase — part 20 of 46
 
 Contains:
-- `modules/register.py`
-- `modules/replay.py`
+- `modules/pwa.py`
 
 
-## `modules/register.py`
+## `modules/pwa.py`
 
-1517 lines, 61178 bytes
-
-```python
-"""
-modules/register.py  v1.0.0  —  The Safe AI Registry
-
-What makes this different from every other registry, trust mark and
-certification list:
-
-  Ordinary registries are mutable databases. The operator can insert an
-  entry, back-date it, quietly delist someone, or revoke a seal and leave
-  no trace. You must trust the registrar absolutely.
-
-  This one publishes proofs about its own behaviour:
-
-    * ABSENCE   — prove a domain was NOT listed on a given date.
-                  Not "we have no record": a sorted-tree proof showing two
-                  adjacent leaves with consecutive indices, so nothing can
-                  sit between them.
-
-    * APPEND-ONLY — RFC 6962 consistency proof that the register at any
-                  past size is a prefix of the register now. A back-dated
-                  listing is arithmetically impossible to hide, and the
-                  proof verifies with any standard Certificate Transparency
-                  verifier, not one of ours.
-
-    * REVOCATION — a delisted entry does not vanish. The revocation is
-                  sealed and the history stays readable. "Listed from D1,
-                  revoked D2, reason R" is permanent.
-
-  The registrar is auditable against the registrar. That is the product.
-
-CONSENT
-  No domain is ever listed because the operator typed it in. A domain
-  lists itself by proving it controls the domain:
-
-    1. POST /x/register/challenge {"domain": "example.com"}
-         -> returns a one-time token, sealed.
-    2. The domain serves that token at
-         https://example.com/.well-known/aileash-register.txt
-       (or puts a `Register-Token:` line in its ai.txt).
-    3. POST /x/register/claim {"domain": "example.com"}
-         -> we fetch, verify the token, run the checks, seal the result
-            and list it.
-
-  Peers on the witness network are not auto-listed. A listing they
-  claimed themselves is better evidence than one we granted them.
-
-VOCABULARY  (deliberately not "compliant", "covered" or "certified")
-    unverified    claimed, checks not yet run
-    checks-passed every check in the suite returned pass, on the date shown
-    checks-failed at least one check did not pass
-    stale         last successful check is older than STALE_AFTER_DAYS
-    withdrawn     the domain asked to be removed
-    revoked       the operator removed it; reason sealed
-
-Module contract:
-    handle(method, action, data, api_key, ctx) -> (dict, status)
-    PUBLIC is a set of (METHOD, action) tuples
-    ctx exposes conn, lock, seal
-    every sealed event carries a user_id
-    no seal is wrapped in a bare except
-"""
-
-import hashlib
-import ipaddress
-import json
-import os
-import re
-import secrets
-import socket
-import time
-import urllib.error
-import urllib.parse
-import urllib.request
-from datetime import datetime, timezone
-
-VERSION = "1.2.0"
-SUITE_VERSION = "oaas-checks-1"
-
-# ---------------------------------------------------------------- constants
-
-STALE_AFTER_DAYS = 90
-CHALLENGE_TTL_SECONDS = 86400
-MAX_FETCH_BYTES = 512 * 1024
-FETCH_TIMEOUT = 8
-WELL_KNOWN_PATH = "/.well-known/aileash-register.txt"
-AI_TXT_PATHS = ["/.well-known/ai.txt", "/ai.txt"]
-AI_TXT_PATH = AI_TXT_PATHS[0]   # the one quoted in guidance
-FIELD_ALIASES = {
-    "chain_tip_url": ["chain-tip-url", "chain-head", "witness-tip", "chain-anchor"],
-    "verifier": ["verifier", "verify-chain", "consistency-proof", "self-check"],
-    "contact": ["contact", "security-contact"],
-}
-
-DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
-
-STATUS_UNVERIFIED = "unverified"
-STATUS_PASSED = "checks-passed"
-STATUS_FAILED = "checks-failed"
-STATUS_STALE = "stale"
-STATUS_WITHDRAWN = "withdrawn"
-STATUS_REVOKED = "revoked"
-
-LIVE_STATUSES = (STATUS_UNVERIFIED, STATUS_PASSED, STATUS_FAILED, STATUS_STALE)
-
-# Domain-separation prefixes. Two different trees answer two different
-# questions and their roots deliberately never match.
-LEAF_PREFIX = b"\x00"          # RFC 6962 ordered tree, over events
-NODE_PREFIX = b"\x01"
-SORTED_LEAF = b"AILEASH-REGISTER-LEAF-v1\x00"    # sorted tree, over domains
-SORTED_NODE = b"AILEASH-REGISTER-NODE-v1\x00"
-
-VOCABULARY = {
-    STATUS_UNVERIFIED: "The domain proved control and is listed. The check suite has not been run against it yet.",
-    STATUS_PASSED: "Every check in suite %s returned pass on the date shown. This describes what the checks observed on that date and nothing else." % SUITE_VERSION,
-    STATUS_FAILED: "At least one check did not pass. The failing check names are published.",
-    STATUS_STALE: "The last successful check is more than %d days old. Nothing was withdrawn; the evidence simply aged." % STALE_AFTER_DAYS,
-    STATUS_WITHDRAWN: "The domain asked to be removed. The listing history remains readable.",
-    STATUS_REVOKED: "The operator removed the listing. The reason is sealed alongside it and the history remains readable.",
-}
-
-WHAT_THIS_IS_NOT = [
-    "Not a certification. Nobody has been certified by anyone.",
-    "Not a statement that any law applies to a listed domain, or that a listed domain satisfies it. Whether a regulation applies to an organisation is a question for that organisation's own advisers.",
-    "Not an audit. No third party has audited this registry or any domain on it.",
-    "Not a claim about anything a domain did not seal. A check observes what is served at a URL at a moment in time.",
-]
-
-MESSAGES = {
-    "domain_required": "domain is required",
-    "bad_domain": "domain must be a bare hostname, e.g. example.com — no scheme, no path",
-    "no_challenge": "no live challenge for this domain. POST /x/register/challenge first.",
-    "challenge_expired": "challenge expired. Request a new one.",
-    "token_not_found": "the token was not served at either location",
-    "not_listed": "this domain has no entry in the register",
-    "already_final": "this entry is withdrawn or revoked and cannot be changed",
-    "no_checkpoint": "no checkpoint has been sealed at or before that time",
-    "seal_failed": "the register could not seal this event, so nothing was written. Retry.",
-}
-
-PUBLIC = {
-    ("GET", "spec"),
-    ("GET", "list"),
-    ("GET", "entry"),
-    ("GET", "history"),
-    ("GET", "absence"),
-    ("GET", "consistency"),
-    ("GET", "inclusion"),
-    ("GET", "checkpoints"),
-    ("GET", "roots"),
-    ("GET", "sealcheck"),
-    ("GET", "tokens"),
-    ("GET", "vocabulary"),
-    ("POST", "challenge"),
-    ("POST", "claim"),
-    ("POST", "recheck"),
-    ("POST", "withdraw"),
-}
-
-
-# ---------------------------------------------------------------- utilities
-
-def _now():
-    return time.time()
-
-
-def _iso(ts):
-    return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def _parse_when(s):
-    """Accept an ISO date, an ISO datetime or an epoch. Return epoch seconds."""
-    if s is None or s == "":
-        return None
-    s = str(s).strip()
-    try:
-        return float(s)
-    except (TypeError, ValueError):
-        pass
-    t = s.replace("Z", "+00:00")
-    for fmt in (None, "%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S%z"):
-        try:
-            if fmt is None:
-                d = datetime.fromisoformat(t)
-            else:
-                d = datetime.strptime(t, fmt)
-            if d.tzinfo is None:
-                d = d.replace(tzinfo=timezone.utc)
-            return d.timestamp()
-        except (TypeError, ValueError):
-            continue
-    return None
-
-
-def _canon(obj):
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
-
-
-def _sha(b):
-    return hashlib.sha256(b).hexdigest()
-
-
-def _clean_domain(raw):
-    if not raw:
-        return None
-    d = str(raw).strip().lower()
-    if "://" in d:
-        d = urllib.parse.urlsplit(d).netloc or d
-    d = d.split("/")[0].split("?")[0].split("#")[0]
-    if d.startswith("www."):
-        d = d[4:]
-    if "@" in d or ":" in d:
-        return None
-    if not DOMAIN_RE.match(d):
-        return None
-    return d
-
-
-# ------------------------------------------------------------------- fetch
-# Same posture as witness.py: http/https only, ports 80/443, resolve first,
-# reject non-public addresses, no redirects, hard timeout, size cap.
-
-def _is_public_addr(host):
-    try:
-        infos = socket.getaddrinfo(host, None)
-    except OSError as e:
-        return False, "dns_failed: %s" % e
-    if not infos:
-        return False, "dns_empty"
-    for info in infos:
-        addr = info[4][0]
-        try:
-            ip = ipaddress.ip_address(addr)
-        except ValueError:
-            return False, "unparseable_address"
-        if (ip.is_private or ip.is_loopback or ip.is_link_local
-                or ip.is_multicast or ip.is_reserved or ip.is_unspecified):
-            return False, "non_public_address"
-    return True, None
-
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-
-def _fetch(url):
-    """Return (ok, body_text_or_none, note_dict)."""
-    parts = urllib.parse.urlsplit(url)
-    note = {"url": url, "fetched_at": _iso(_now())}
-    if parts.scheme not in ("http", "https"):
-        note["error"] = "scheme_not_allowed"
-        return False, None, note
-    if parts.port not in (None, 80, 443):
-        note["error"] = "port_not_allowed"
-        return False, None, note
-    host = parts.hostname
-    if not host:
-        note["error"] = "no_host"
-        return False, None, note
-    ok, why = _is_public_addr(host)
-    if not ok:
-        note["error"] = why
-        return False, None, note
-
-    opener = urllib.request.build_opener(_NoRedirect)
-    req = urllib.request.Request(url, headers={
-        "User-Agent": "AILeash-Register/%s (+https://sebbi.pro/x/register/spec)" % VERSION,
-        "Accept": "text/plain, application/json, */*",
-    })
-    started = time.time()
-    try:
-        with opener.open(req, timeout=FETCH_TIMEOUT) as resp:
-            note["http_status"] = resp.getcode()
-            raw = resp.read(MAX_FETCH_BYTES + 1)
-    except urllib.error.HTTPError as e:
-        note["http_status"] = e.code
-        note["error"] = "http_%s" % e.code
-        note["took_ms"] = int((time.time() - started) * 1000)
-        return False, None, note
-    except Exception as e:
-        note["error"] = "fetch_failed: %s" % type(e).__name__
-        note["took_ms"] = int((time.time() - started) * 1000)
-        return False, None, note
-
-    note["took_ms"] = int((time.time() - started) * 1000)
-    if len(raw) > MAX_FETCH_BYTES:
-        note["error"] = "too_large"
-        return False, None, note
-    note["bytes"] = len(raw)
-    note["body_sha256"] = _sha(raw)
-    try:
-        text = raw.decode("utf-8", "replace")
-    except Exception:
-        note["error"] = "undecodable"
-        return False, None, note
-    return True, text, note
-
-
-# ------------------------------------------------------------------ merkle
-
-def _ct_leaf(data_bytes):
-    return hashlib.sha256(LEAF_PREFIX + data_bytes).digest()
-
-
-def _ct_node(l, r):
-    return hashlib.sha256(NODE_PREFIX + l + r).digest()
-
-
-def _ct_root(leaves):
-    """RFC 6962 root over an ordered list of leaf digests (bytes)."""
-    if not leaves:
-        return hashlib.sha256(b"").digest()
-    if len(leaves) == 1:
-        return leaves[0]
-    k = 1
-    while k * 2 < len(leaves):
-        k *= 2
-    return _ct_node(_ct_root(leaves[:k]), _ct_root(leaves[k:]))
-
-
-def _ct_inclusion(leaves, index):
-    """RFC 6962 inclusion proof for leaves[index]. Returns list of hex."""
-    def walk(sub, i):
-        if len(sub) <= 1:
-            return []
-        k = 1
-        while k * 2 < len(sub):
-            k *= 2
-        if i < k:
-            return walk(sub[:k], i) + [_ct_root(sub[k:])]
-        return walk(sub[k:], i - k) + [_ct_root(sub[:k])]
-    return [h.hex() for h in walk(leaves, index)]
-
-
-def _ct_consistency(leaves, m):
-    """RFC 6962 consistency proof between size m and size len(leaves)."""
-    n = len(leaves)
-    if m <= 0 or m > n:
-        return None
-
-    def subproof(m_, sub, is_complete):
-        if m_ == len(sub):
-            return [] if is_complete else [_ct_root(sub)]
-        k = 1
-        while k * 2 < len(sub):
-            k *= 2
-        if m_ <= k:
-            return subproof(m_, sub[:k], is_complete) + [_ct_root(sub[k:])]
-        return subproof(m_ - k, sub[k:], False) + [_ct_root(sub[:k])]
-
-    return [h.hex() for h in subproof(m, leaves, True)]
-
-
-def _sorted_leaf(value):
-    return hashlib.sha256(SORTED_LEAF + value.encode("utf-8")).digest()
-
-
-def _sorted_root(leaves):
-    """Sorted tree. Odd nodes are promoted, never self-paired."""
-    if not leaves:
-        return hashlib.sha256(SORTED_LEAF + b"EMPTY").digest()
-    level = list(leaves)
-    while len(level) > 1:
-        nxt = []
-        i = 0
-        while i + 1 < len(level):
-            nxt.append(hashlib.sha256(SORTED_NODE + level[i] + level[i + 1]).digest())
-            i += 2
-        if i < len(level):
-            nxt.append(level[i])
-        level = nxt
-    return level[0]
-
-
-def _sorted_path(leaves, index):
-    """Audit path in the promoted-odd sorted tree."""
-    path = []
-    level = list(leaves)
-    idx = index
-    while len(level) > 1:
-        nxt = []
-        i = 0
-        new_idx = idx
-        while i + 1 < len(level):
-            pair = (level[i], level[i + 1])
-            if idx == i:
-                path.append({"side": "right", "hash": pair[1].hex()})
-                new_idx = len(nxt)
-            elif idx == i + 1:
-                path.append({"side": "left", "hash": pair[0].hex()})
-                new_idx = len(nxt)
-            nxt.append(hashlib.sha256(SORTED_NODE + pair[0] + pair[1]).digest())
-            i += 2
-        if i < len(level):
-            if idx == i:
-                new_idx = len(nxt)
-            nxt.append(level[i])
-        level = nxt
-        idx = new_idx
-    return path
-
-
-# ------------------------------------------------------------------ schema
-
-def _ensure(ctx):
-    conn = ctx["conn"]
-    with ctx["lock"]:
-        c = conn.cursor()
-        c.execute("""CREATE TABLE IF NOT EXISTS register_entry (
-            domain        TEXT PRIMARY KEY,
-            status        TEXT NOT NULL,
-            first_listed  REAL NOT NULL,
-            last_event    REAL NOT NULL,
-            last_checked  REAL,
-            last_pass     REAL,
-            checks_json   TEXT,
-            contact       TEXT,
-            claim_method  TEXT,
-            reason        TEXT
-        )""")
-        c.execute("""CREATE TABLE IF NOT EXISTS register_event (
-            seq        INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts         REAL NOT NULL,
-            domain     TEXT NOT NULL,
-            kind       TEXT NOT NULL,
-            detail     TEXT NOT NULL,
-            leaf_hex   TEXT NOT NULL,
-            audit_hash TEXT
-        )""")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_register_event_domain ON register_event(domain, seq)")
-        c.execute("""CREATE TABLE IF NOT EXISTS register_checkpoint (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts            REAL NOT NULL,
-            tree_size     INTEGER NOT NULL,
-            event_root    TEXT NOT NULL,
-            domain_root   TEXT NOT NULL,
-            domain_count  INTEGER NOT NULL,
-            domains_json  TEXT NOT NULL,
-            audit_hash    TEXT
-        )""")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_register_checkpoint_ts ON register_checkpoint(ts)")
-        c.execute("""CREATE TABLE IF NOT EXISTS register_challenge (
-            domain  TEXT PRIMARY KEY,
-            token   TEXT NOT NULL,
-            issued  REAL NOT NULL
-        )""")
-        # v1.1: every issued token stays valid until it expires, so asking
-        # for a new one never invalidates the one already published.
-        c.execute("""CREATE TABLE IF NOT EXISTS register_token (
-            token   TEXT PRIMARY KEY,
-            domain  TEXT NOT NULL,
-            issued  REAL NOT NULL
-        )""")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_register_token_domain ON register_token(domain, issued)")
-        conn.commit()
-
-
-def _event_leaves(ctx):
-    """Ordered list of leaf digests for the whole event log."""
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT leaf_hex FROM register_event ORDER BY seq ASC").fetchall()
-    return [bytes.fromhex(r[0]) for r in rows]
-
-
-def _live_domains(ctx):
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT domain FROM register_entry WHERE status IN (?,?,?,?)",
-            LIVE_STATUSES).fetchall()
-    return sorted(r[0] for r in rows)
-
-
-def _extract_hash(result):
-    """server.py's seal has returned different shapes over time. Accept them all."""
-    if result is None:
-        return None
-    if isinstance(result, str):
-        return result or None
-    if isinstance(result, dict):
-        for k in ("audit_hash", "hash", "audit", "block_hash", "sealed_hash"):
-            v = result.get(k)
-            if isinstance(v, str) and v:
-                return v
-        return None
-    if isinstance(result, (tuple, list)):
-        for item in result:
-            h = _extract_hash(item)
-            if h:
-                return h
-    return None
-
-
-def _do_seal(ctx, event, result=None):
-    """Call ctx['seal'] with the ONE correct signature and exactly once.
-
-    This is the signature witness.py uses and that is proven against this
-    server: seal(event, result, ts, api_key), returning (audit_hash,
-    block_index, seq).
-
-    WHY THIS WAS REWRITTEN (v1.2.0 -> safe):
-    The previous version tried four different argument shapes in a loop. seal
-    WRITES a block to the chain as a side effect. A shape that partially
-    succeeded — wrote a block but returned something _extract_hash could not
-    read — would fall through and the loop would call seal AGAIN, writing a
-    SECOND block. Two blocks for one logical event, or a written-then-retried
-    call, breaks the chain's prev-hash linkage. That is the fault that broke
-    the chain. This calls seal once, the correct way, and never retries a call
-    that may already have written.
-    """
-    seal = ctx["seal"]
-    ts = _now()
-    if result is None:
-        result = event.get("kind") or event.get("type") or "register"
-    if not isinstance(result, str):
-        result = _canon(result)
-
-    # Register events are not tied to a customer key. A stable module key
-    # partitions them the way witness.py partitions anonymous observations.
-    api_key = "register"
-
-    out = seal(event, result, ts, api_key)
-
-    h = _extract_hash(out)
-    if h:
-        return h
-    if isinstance(out, (tuple, list)) and out and isinstance(out[0], str) and out[0]:
-        return out[0]
-    raise RuntimeError("seal returned no audit_hash: %r" % (out,))
-
-
-def _seal_event(ctx, domain, kind, detail):
-    """Seal, then write. A failed seal writes nothing and raises."""
-    ts = _now()
-    leaf_payload = _canon({"v": 1, "ts": round(ts, 3), "domain": domain,
-                           "kind": kind, "detail": detail}).encode("utf-8")
-    leaf_hex = _ct_leaf(leaf_payload).hex()
-
-    event = {
-        "user_id": "register:%s" % domain,
-        "type": "register_event",
-        "domain": domain,
-        "kind": kind,
-        "leaf": leaf_hex,
-        "suite": SUITE_VERSION,
-        "detail": detail,
-    }
-    audit_hash = _do_seal(ctx, event, result=kind)
-
-    with ctx["lock"]:
-        cur = ctx["conn"].execute(
-            "INSERT INTO register_event (ts, domain, kind, detail, leaf_hex, audit_hash)"
-            " VALUES (?,?,?,?,?,?)",
-            (ts, domain, kind, _canon(detail), leaf_hex, audit_hash))
-        seq = cur.lastrowid
-        ctx["conn"].commit()
-
-    return {"seq": seq, "ts": ts, "at": _iso(ts), "leaf": leaf_hex,
-            "audit_hash": audit_hash, "kind": kind}
-
-
-def _seal_checkpoint(ctx):
-    """Seal the current state: ordered event root + sorted domain root."""
-    leaves = _event_leaves(ctx)
-    domains = _live_domains(ctx)
-    event_root = _ct_root(leaves).hex()
-    domain_root = _sorted_root([_sorted_leaf(d) for d in domains]).hex()
-    ts = _now()
-
-    event = {
-        "user_id": "register:checkpoint",
-        "type": "register_checkpoint",
-        "tree_size": len(leaves),
-        "event_root": event_root,
-        "domain_root": domain_root,
-        "domain_count": len(domains),
-        "suite": SUITE_VERSION,
-    }
-    audit_hash = _do_seal(ctx, event, result="checkpoint")
-
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "INSERT INTO register_checkpoint (ts, tree_size, event_root, domain_root,"
-            " domain_count, domains_json, audit_hash) VALUES (?,?,?,?,?,?,?)",
-            (ts, len(leaves), event_root, domain_root, len(domains),
-             _canon(domains), audit_hash))
-        ctx["conn"].commit()
-
-    return {"at": _iso(ts), "tree_size": len(leaves), "event_root": event_root,
-            "domain_root": domain_root, "domain_count": len(domains),
-            "audit_hash": audit_hash}
-
-
-# ------------------------------------------------------------- check suite
-
-def _find_manifest(domain):
-    """Try the well-known path first, then the root. Return (path, body, note)."""
-    tried = []
-    for path in AI_TXT_PATHS:
-        ok, body, note = _fetch("https://%s%s" % (domain, path))
-        tried.append({"path": path, "ok": ok, "note": note})
-        if ok and body:
-            return path, body, {"served_at": path, "attempts": tried, "observed": note}
-    return None, None, {"served_at": None, "attempts": tried}
-
-
-def _pick(fields, key):
-    """Return (alias_used, value) for the first alias present."""
-    for alias in FIELD_ALIASES[key]:
-        if fields.get(alias):
-            return alias, fields[alias]
-    return None, None
-
-
-def _run_checks(domain):
-    """Observe what the domain serves. Every check names what it looked at."""
-    checks = []
-
-    path, body, mnote = _find_manifest(domain)
-    checks.append({
-        "id": "ai_txt_reachable",
-        "asks": "Does %s serve a manifest at %s?" % (domain, " or ".join(AI_TXT_PATHS)),
-        "pass": bool(body),
-        "observed": mnote,
-    })
-
-    fields = {}
-    if body:
-        for line in body.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or ":" not in line:
-                continue
-            k, _, v = line.partition(":")
-            k = k.strip().lower()
-            v = v.strip()
-            if k and v and k not in fields:
-                fields[k] = v
-
-    tip_alias, tip_url = _pick(fields, "chain_tip_url")
-    ver_alias, verifier = _pick(fields, "verifier")
-    con_alias, contact = _pick(fields, "contact")
-
-    missing = []
-    if not tip_url:
-        missing.append("chain tip url (%s)" % "/".join(FIELD_ALIASES["chain_tip_url"]))
-    if not verifier:
-        missing.append("verifier (%s)" % "/".join(FIELD_ALIASES["verifier"]))
-    if not contact:
-        missing.append("contact (%s)" % "/".join(FIELD_ALIASES["contact"]))
-
-    checks.append({
-        "id": "ai_txt_declares_required_fields",
-        "asks": "Does the manifest declare a chain tip url, a verifier and a contact, under any accepted field name?",
-        "pass": bool(body) and not missing,
-        "observed": {
-            "matched": {"chain_tip_url": tip_alias, "verifier": ver_alias, "contact": con_alias},
-            "missing": missing,
-            "field_count": len(fields),
-        },
-    })
-
-    tip_value = None
-    if tip_url:
-        tok, tbody, tnote = _fetch(tip_url)
-        parsed_tip = None
-        if tok and tbody:
-            try:
-                obj = json.loads(tbody)
-                for key in ("tip", "tip_sha256", "chain_tip", "head", "root",
-                            "current_tip", "latest", "hash"):
-                    if isinstance(obj.get(key), str):
-                        parsed_tip = obj[key]
-                        break
-            except Exception:
-                stripped = tbody.strip()
-                if re.fullmatch(r"[0-9a-fA-F]{64}", stripped):
-                    parsed_tip = stripped
-        tip_value = parsed_tip
-        checks.append({
-            "id": "chain_tip_served",
-            "asks": "Does the declared chain tip url return a tip value?",
-            "pass": bool(parsed_tip),
-            "observed": dict(tnote, declared_as=tip_alias, tip_field_found=bool(parsed_tip)),
-        })
-        checks.append({
-            "id": "chain_tip_is_sha256",
-            "asks": "Is the served tip a 64-character hex digest?",
-            "pass": bool(parsed_tip) and bool(re.fullmatch(r"[0-9a-fA-F]{64}", parsed_tip or "")),
-            "observed": {"tip": parsed_tip},
-        })
-    else:
-        for cid, asks in (("chain_tip_served", "Does the declared chain tip url return a tip value?"),
-                          ("chain_tip_is_sha256", "Is the served tip a 64-character hex digest?")):
-            checks.append({"id": cid, "asks": asks, "pass": False,
-                           "observed": {"error": "no chain tip url declared"}})
-
-    checks.append({
-        "id": "verifier_named",
-        "asks": "Does the manifest name instructions or a tool a third party can use to check the chain themselves?",
-        "pass": bool(verifier),
-        "observed": {"verifier": verifier, "declared_as": ver_alias},
-    })
-
-    passed = all(c["pass"] for c in checks)
-    return {
-        "suite": SUITE_VERSION,
-        "ran_at": _iso(_now()),
-        "manifest_path": path,
-        "all_passed": passed,
-        "failed": [c["id"] for c in checks if not c["pass"]],
-        "checks": checks,
-        "tip_observed": tip_value,
-        "contact": contact,
-        "declared": fields,
-    }
-
-
-# ------------------------------------------------------------------ actions
-
-def _spec(ctx):
-    return {
-        "module": "register",
-        "version": VERSION,
-        "suite_version": SUITE_VERSION,
-        "what_this_is":
-            "A registry that publishes proofs about its own behaviour. Absence proofs "
-            "show a domain was not listed on a date. RFC 6962 consistency proofs show "
-            "no entry was inserted behind an earlier position. Revocations are sealed "
-            "rather than deleted, so a removed listing stays readable.",
-        "why_that_matters":
-            "Every other registry is a mutable database whose operator can add, "
-            "back-date or quietly delete entries. Trusting the list means trusting the "
-            "registrar. This one is checkable against its own operator.",
-        "what_this_is_not": WHAT_THIS_IS_NOT,
-        "status_vocabulary": VOCABULARY,
-        "how_to_get_listed": [
-            "Simplest, nothing to edit: if your manifest already carries a `Domain: <yourdomain>` line matching the domain you are claiming, POST /x/register/claim and you are listed. A manifest served from your domain naming your domain could only have been published by you.",
-            "If your manifest does not name itself, use the token route instead:",
-            "1. POST /x/register/challenge with {\"domain\": \"example.com\"} — returns a one-time token.",
-            "2. Serve that token at https://example.com%s, or add a `Register-Token: <token>` line to your manifest at %s" % (WELL_KNOWN_PATH, " or ".join(AI_TXT_PATHS)),
-            "Any token issued in the last 24 hours will verify — asking for a new one does not invalidate one you already published. See /x/register/tokens?domain=example.com",
-            "3. POST /x/register/claim with {\"domain\": \"example.com\"} — we fetch, verify, run the checks and seal the result.",
-            "Opt out at any time with a `Register: no` line in the manifest — the register refuses the claim and says so.",
-            "Nobody is listed by the operator. A domain lists itself by proving it controls the domain.",
-        ],
-        "manifest_paths_tried": AI_TXT_PATHS,
-        "field_aliases": FIELD_ALIASES,
-        "checks_run": [
-            "ai_txt_reachable", "ai_txt_declares_required_fields",
-            "chain_tip_served", "chain_tip_is_sha256", "verifier_named",
-        ],
-        "trees": {
-            "event_tree": "RFC 6962 ordered tree over every register event in write order. Answers append-only. Verifies with any standard Certificate Transparency verifier.",
-            "domain_tree": "Sorted tree over the domains listed at a checkpoint, odd nodes promoted, domain-separated prefixes. Answers absence.",
-            "note": "The two roots answer different questions and deliberately never match.",
-        },
-        "proof_of_control": {"preferred": "manifest-self-declaration (a Domain: line naming itself)",
-                             "fallback": "one-time token served at a path we name",
-                             "opt_out": "a `Register: no` line in the manifest"},
-        "stale_after_days": STALE_AFTER_DAYS,
-        "challenge_ttl_seconds": CHALLENGE_TTL_SECONDS,
-        "routes": {
-            "public": sorted("%s /x/register/%s" % (m, a) for m, a in PUBLIC),
-            "keyed": ["POST /x/register/recheck-all", "POST /x/register/checkpoint",
-                      "POST /x/register/revoke"],
-        },
-        "honest_limits": [
-            "A check observes what a URL served at a moment in time. It cannot know what a domain did not seal.",
-            "Domain control proves control of the domain, not the truth of anything the domain declares.",
-            "Absence proofs are only as good as the checkpoint they are made against. A period with no checkpoint has nothing to prove absence from.",
-            "Nobody can be forced to keep publishing. A listing goes stale when the evidence ages, and that is the honest outcome rather than a failure of the register.",
-        ],
-    }, 200
-
-
-def _challenge(ctx, data):
-    domain = _clean_domain(data.get("domain"))
-    if not data.get("domain"):
-        return {"error": MESSAGES["domain_required"]}, 400
-    if not domain:
-        return {"error": MESSAGES["bad_domain"]}, 400
-
-    with ctx["lock"]:
-        row = ctx["conn"].execute(
-            "SELECT status FROM register_entry WHERE domain=?", (domain,)).fetchone()
-    if row and row[0] in (STATUS_REVOKED,):
-        return {"error": MESSAGES["already_final"], "domain": domain,
-                "status": row[0]}, 409
-
-    # Idempotent: if a live token already exists for this domain, return THAT
-    # one. Minting a new token on every request is how an operator ends up with
-    # a published token the register no longer recognises.
-    existing = _live_tokens(ctx, domain)
-    if existing:
-        token, issued = existing[0]
-        return {
-            "ok": True,
-            "domain": domain,
-            "token": token,
-            "reused": True,
-            "issued_at": _iso(issued),
-            "expires_at": _iso(issued + CHALLENGE_TTL_SECONDS),
-            "serve_at": ["https://%s%s" % (domain, WELL_KNOWN_PATH),
-                         "or a `Register-Token: %s` line in your manifest at %s"
-                         % (token, " or ".join(AI_TXT_PATHS))],
-            "then": "POST /x/register/claim {\"domain\": \"%s\"}" % domain,
-            "note": "This is the token already issued for this domain. Requesting "
-                    "again does not replace it, so anything you have already "
-                    "published stays valid.",
-        }, 200
-
-    token = "aileash-register-" + secrets.token_hex(16)
-    ts = _now()
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "INSERT INTO register_challenge (domain, token, issued) VALUES (?,?,?)"
-            " ON CONFLICT(domain) DO UPDATE SET token=excluded.token, issued=excluded.issued",
-            (domain, token, ts))
-        ctx["conn"].execute(
-            "INSERT OR REPLACE INTO register_token (token, domain, issued) VALUES (?,?,?)",
-            (token, domain, ts))
-        ctx["conn"].execute(
-            "DELETE FROM register_token WHERE domain=? AND issued<?",
-            (domain, ts - CHALLENGE_TTL_SECONDS))
-        ctx["conn"].commit()
-
-    try:
-        sealed = _seal_event(ctx, domain, "challenge_issued",
-                             {"token_sha256": _sha(token.encode())})
-    except Exception as e:
-        return {"error": MESSAGES["seal_failed"], "detail": str(e)}, 500
-
-    return {
-        "ok": True,
-        "domain": domain,
-        "token": token,
-        "expires_at": _iso(ts + CHALLENGE_TTL_SECONDS),
-        "serve_at": ["https://%s%s" % (domain, WELL_KNOWN_PATH),
-                     "or a `Register-Token: %s` line in https://%s%s" % (token, domain, AI_TXT_PATH)],
-        "then": "POST /x/register/claim {\"domain\": \"%s\"}" % domain,
-        "sealed": sealed,
-        "note": "The token itself is not sealed — only its digest, so the challenge cannot be replayed from the public chain.",
-    }, 200
-
-
-def _live_tokens(ctx, domain):
-    """Every token issued for this domain that has not expired, newest first."""
-    cutoff = _now() - CHALLENGE_TTL_SECONDS
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT token, issued FROM register_token WHERE domain=? AND issued>=?"
-            " ORDER BY issued DESC", (domain, cutoff)).fetchall()
-    return [(r[0], r[1]) for r in rows]
-
-
-def _verify_self_declaration(domain):
-    """Proof of control with nothing to edit.
-
-    A manifest served over https from the domain, whose own `Domain:` line
-    names that same domain, was published by whoever controls the domain.
-    Nobody else can put a file there. That IS the consent a token was
-    standing in for, so a token is only needed when the manifest does not
-    name itself (or the operator has opted out).
-
-    An operator who does not want to be listed writes `Register: no`.
-    """
-    path, body, mnote = _find_manifest(domain)
-    if not body:
-        return False, {"reason": "no manifest served", "attempts": mnote}
-
-    declared = None
-    opted_out = False
-    for line in body.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or ":" not in line:
-            continue
-        k, _, v = line.partition(":")
-        k, v = k.strip().lower(), v.strip().lower()
-        if k == "domain" and declared is None:
-            declared = v.lstrip("www.")
-        if k == "register" and v in ("no", "false", "off", "opt-out"):
-            opted_out = True
-
-    if opted_out:
-        return False, {"reason": "manifest declares Register: no",
-                       "respected": True, "served_at": path}
-    if not declared:
-        return False, {"reason": "manifest does not declare a Domain: line",
-                       "served_at": path}
-    if declared != domain:
-        return False, {"reason": "manifest declares a different domain",
-                       "declared": declared, "claimed": domain, "served_at": path}
-
-    return True, {"method": "manifest-self-declaration", "served_at": path,
-                  "declared_domain": declared, "observed": mnote.get("observed"),
-                  "what_this_proves": "The manifest at this path names this domain "
-                                      "as its own. Only the party controlling the "
-                                      "domain can serve that file."}
-
-
-def _verify_any_token(ctx, domain):
-    """Accept ANY live token for this domain. Requesting a new one must never
-    invalidate one the operator has already published."""
-    tokens = _live_tokens(ctx, domain)
-    if not tokens:
-        return False, None, {"error": "no_live_token"}
-    last = None
-    for token, issued in tokens:
-        ok, evidence = _verify_token(domain, token)
-        if ok:
-            evidence["token_issued"] = _iso(issued)
-            evidence["tokens_live"] = len(tokens)
-            return True, token, evidence
-        last = evidence
-    return False, None, {"tokens_live": len(tokens), "none_matched": True,
-                         "last_attempt": last}
-
-
-def _verify_token(domain, token):
-    ok, body, note = _fetch("https://%s%s" % (domain, WELL_KNOWN_PATH))
-    if ok and body and token in body:
-        return True, {"method": "well-known", "observed": note}
-    tried = [{"path": WELL_KNOWN_PATH, "note": note}]
-    for path in AI_TXT_PATHS:
-        ok2, body2, note2 = _fetch("https://%s%s" % (domain, path))
-        tried.append({"path": path, "note": note2})
-        if ok2 and body2:
-            for line in body2.splitlines():
-                if line.strip().lower().startswith("register-token:") and token in line:
-                    return True, {"method": "manifest:%s" % path, "observed": note2}
-    return False, {"method": None, "tried": tried}
-
-
-def _claim(ctx, data):
-    domain = _clean_domain(data.get("domain"))
-    if not domain:
-        return {"error": MESSAGES["bad_domain"]}, 400
-
-    verified, evidence = _verify_self_declaration(domain)
-    if not verified:
-        self_decl_evidence = evidence
-        if evidence.get("respected"):
-            return {"ok": False, "domain": domain,
-                    "error": "this domain has opted out with a `Register: no` line",
-                    "evidence": evidence}, 403
-        if not _live_tokens(ctx, domain):
-            return {"ok": False, "domain": domain,
-                    "error": "could not prove control of this domain",
-                    "self_declaration": self_decl_evidence,
-                    "how_to_fix": [
-                        "Easiest: add a `Domain: %s` line to your manifest at %s."
-                        % (domain, " or ".join(AI_TXT_PATHS)),
-                        "Or: POST /x/register/challenge and serve the token it returns.",
-                    ]}, 400
-        verified, matched_token, tok_evidence = _verify_any_token(ctx, domain)
-        evidence = dict(tok_evidence or {}, self_declaration=self_decl_evidence)
-    if not verified:
-        try:
-            _seal_event(ctx, domain, "claim_refused", {"reason": "token_not_found",
-                                                       "evidence": evidence})
-        except Exception as e:
-            return {"error": MESSAGES["seal_failed"], "detail": str(e)}, 500
-        return {"ok": False, "domain": domain, "error": MESSAGES["token_not_found"],
-                "looked_at": ["https://%s%s" % (domain, WELL_KNOWN_PATH),
-                              "https://%s%s" % (domain, AI_TXT_PATH)],
-                "evidence": evidence,
-                "note": "The refusal is sealed. Fix the token and claim again."}, 400
-
-    checks = _run_checks(domain)
-    status = STATUS_PASSED if checks["all_passed"] else STATUS_FAILED
-    contact = checks.get("contact")
-    ts = _now()
-
-    try:
-        sealed = _seal_event(ctx, domain, "listed", {
-            "claim_method": evidence.get("method"),
-            "status": status,
-            "suite": SUITE_VERSION,
-            "failed": checks["failed"],
-            "tip_observed": checks["tip_observed"],
-        })
-    except Exception as e:
-        return {"error": MESSAGES["seal_failed"], "detail": str(e)}, 500
-
-    with ctx["lock"]:
-        existing = ctx["conn"].execute(
-            "SELECT first_listed FROM register_entry WHERE domain=?", (domain,)).fetchone()
-        first = existing[0] if existing else ts
-        ctx["conn"].execute(
-            "INSERT INTO register_entry (domain, status, first_listed, last_event,"
-            " last_checked, last_pass, checks_json, contact, claim_method, reason)"
-            " VALUES (?,?,?,?,?,?,?,?,?,NULL)"
-            " ON CONFLICT(domain) DO UPDATE SET status=excluded.status,"
-            " last_event=excluded.last_event, last_checked=excluded.last_checked,"
-            " last_pass=excluded.last_pass, checks_json=excluded.checks_json,"
-            " contact=excluded.contact, claim_method=excluded.claim_method, reason=NULL",
-            (domain, status, first, ts, ts,
-             ts if checks["all_passed"] else None,
-             _canon(checks), contact, evidence.get("method")))
-        ctx["conn"].execute("DELETE FROM register_challenge WHERE domain=?", (domain,))
-        ctx["conn"].execute("DELETE FROM register_token WHERE domain=?", (domain,))
-        ctx["conn"].commit()
-
-    cp = None
-    try:
-        cp = _seal_checkpoint(ctx)
-    except Exception as e:
-        cp = {"error": "checkpoint_failed", "detail": str(e)}
-
-    return {"ok": True, "domain": domain, "status": status,
-            "status_means": VOCABULARY[status],
-            "claim_method": evidence.get("method"),
-            "checks": checks, "sealed": sealed, "checkpoint": cp,
-            "entry_url": "/x/register/entry?domain=%s" % domain}, 200
-
-
-def _recheck(ctx, data):
-    domain = _clean_domain(data.get("domain"))
-    if not domain:
-        return {"error": MESSAGES["bad_domain"]}, 400
-    with ctx["lock"]:
-        row = ctx["conn"].execute(
-            "SELECT status, first_listed FROM register_entry WHERE domain=?",
-            (domain,)).fetchone()
-    if not row:
-        return {"error": MESSAGES["not_listed"], "domain": domain}, 404
-    if row[0] in (STATUS_WITHDRAWN, STATUS_REVOKED):
-        return {"error": MESSAGES["already_final"], "domain": domain, "status": row[0]}, 409
-
-    checks = _run_checks(domain)
-    status = STATUS_PASSED if checks["all_passed"] else STATUS_FAILED
-    ts = _now()
-
-    try:
-        sealed = _seal_event(ctx, domain, "rechecked", {
-            "status": status, "suite": SUITE_VERSION, "failed": checks["failed"],
-            "tip_observed": checks["tip_observed"],
-        })
-    except Exception as e:
-        return {"error": MESSAGES["seal_failed"], "detail": str(e)}, 500
-
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "UPDATE register_entry SET status=?, last_event=?, last_checked=?,"
-            " last_pass=COALESCE(?, last_pass), checks_json=? WHERE domain=?",
-            (status, ts, ts, ts if checks["all_passed"] else None,
-             _canon(checks), domain))
-        ctx["conn"].commit()
-
-    return {"ok": True, "domain": domain, "status": status,
-            "status_means": VOCABULARY[status], "checks": checks, "sealed": sealed}, 200
-
-
-def _withdraw(ctx, data):
-    """A domain removes itself. Proved the same way it listed itself."""
-    domain = _clean_domain(data.get("domain"))
-    if not domain:
-        return {"error": MESSAGES["bad_domain"]}, 400
-    with ctx["lock"]:
-        row = ctx["conn"].execute(
-            "SELECT status FROM register_entry WHERE domain=?", (domain,)).fetchone()
-    if not row:
-        return {"error": MESSAGES["not_listed"], "domain": domain}, 404
-    verified, evidence = _verify_self_declaration(domain)
-    if not verified:
-        if not _live_tokens(ctx, domain):
-            return {"error": MESSAGES["no_challenge"], "domain": domain,
-                    "note": "Withdrawal is proved the same way listing is."}, 404
-        verified, matched_token, evidence = _verify_any_token(ctx, domain)
-    if not verified:
-        return {"ok": False, "error": MESSAGES["token_not_found"], "evidence": evidence}, 400
-
-    ts = _now()
-    try:
-        sealed = _seal_event(ctx, domain, "withdrawn",
-                             {"by": "domain", "method": evidence.get("method")})
-    except Exception as e:
-        return {"error": MESSAGES["seal_failed"], "detail": str(e)}, 500
-
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "UPDATE register_entry SET status=?, last_event=?, reason=? WHERE domain=?",
-            (STATUS_WITHDRAWN, ts, "withdrawn by domain", domain))
-        ctx["conn"].execute("DELETE FROM register_challenge WHERE domain=?", (domain,))
-        ctx["conn"].execute("DELETE FROM register_token WHERE domain=?", (domain,))
-        ctx["conn"].commit()
-
-    cp = None
-    try:
-        cp = _seal_checkpoint(ctx)
-    except Exception as e:
-        cp = {"error": "checkpoint_failed", "detail": str(e)}
-
-    return {"ok": True, "domain": domain, "status": STATUS_WITHDRAWN,
-            "status_means": VOCABULARY[STATUS_WITHDRAWN],
-            "sealed": sealed, "checkpoint": cp,
-            "note": "The listing history remains readable at /x/register/history?domain=%s" % domain}, 200
-
-
-def _revoke(ctx, data):
-    domain = _clean_domain(data.get("domain"))
-    reason = (data.get("reason") or "").strip()
-    if not domain:
-        return {"error": MESSAGES["bad_domain"]}, 400
-    if not reason:
-        return {"error": "reason is required — a revocation with no sealed reason is exactly what this register exists to prevent"}, 400
-    with ctx["lock"]:
-        row = ctx["conn"].execute(
-            "SELECT status FROM register_entry WHERE domain=?", (domain,)).fetchone()
-    if not row:
-        return {"error": MESSAGES["not_listed"], "domain": domain}, 404
-
-    ts = _now()
-    try:
-        sealed = _seal_event(ctx, domain, "revoked", {"by": "operator", "reason": reason})
-    except Exception as e:
-        return {"error": MESSAGES["seal_failed"], "detail": str(e)}, 500
-
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "UPDATE register_entry SET status=?, last_event=?, reason=? WHERE domain=?",
-            (STATUS_REVOKED, ts, reason, domain))
-        ctx["conn"].commit()
-
-    cp = None
-    try:
-        cp = _seal_checkpoint(ctx)
-    except Exception as e:
-        cp = {"error": "checkpoint_failed", "detail": str(e)}
-
-    return {"ok": True, "domain": domain, "status": STATUS_REVOKED,
-            "reason": reason, "sealed": sealed, "checkpoint": cp,
-            "note": "Nothing was deleted. The revocation is sealed and the history stays public."}, 200
-
-
-def _recheck_all(ctx):
-    domains = _live_domains(ctx)
-    results = []
-    for d in domains:
-        body, _ = _recheck(ctx, {"domain": d})
-        results.append({"domain": d, "status": body.get("status"),
-                        "failed": (body.get("checks") or {}).get("failed")})
-    # age anything whose last pass is old
-    cutoff = _now() - STALE_AFTER_DAYS * 86400
-    aged = []
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT domain, last_pass FROM register_entry WHERE status=?",
-            (STATUS_PASSED,)).fetchall()
-    for domain, last_pass in rows:
-        if last_pass is None or last_pass < cutoff:
-            try:
-                _seal_event(ctx, domain, "stale", {"last_pass": _iso(last_pass) if last_pass else None})
-            except Exception:
-                continue
-            with ctx["lock"]:
-                ctx["conn"].execute(
-                    "UPDATE register_entry SET status=?, last_event=? WHERE domain=?",
-                    (STATUS_STALE, _now(), domain))
-                ctx["conn"].commit()
-            aged.append(domain)
-
-    cp = None
-    try:
-        cp = _seal_checkpoint(ctx)
-    except Exception as e:
-        cp = {"error": "checkpoint_failed", "detail": str(e)}
-    return {"ok": True, "rechecked": results, "moved_to_stale": aged,
-            "checkpoint": cp}, 200
-
-
-def _list(ctx, q):
-    want = (q.get("status") or "").strip().lower()
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT domain, status, first_listed, last_event, last_checked, last_pass,"
-            " checks_json, reason FROM register_entry ORDER BY domain ASC").fetchall()
-    out = []
-    for r in rows:
-        checks = {}
-        try:
-            checks = json.loads(r[6]) if r[6] else {}
-        except Exception:
-            checks = {}
-        entry = {
-            "domain": r[0],
-            "status": r[1],
-            "status_means": VOCABULARY.get(r[1], "unexplained value — treat as unverified"),
-            "first_listed": _iso(r[2]),
-            "last_event": _iso(r[3]),
-            "last_checked": _iso(r[4]) if r[4] else None,
-            "last_pass": _iso(r[5]) if r[5] else None,
-            "failed_checks": checks.get("failed") or [],
-            "reason": r[7],
-        }
-        if not want or entry["status"] == want:
-            out.append(entry)
-
-    with ctx["lock"]:
-        cp = ctx["conn"].execute(
-            "SELECT ts, tree_size, event_root, domain_root, domain_count"
-            " FROM register_checkpoint ORDER BY id DESC LIMIT 1").fetchone()
-
-    return {
-        "registry_version": VERSION,
-        "suite_version": SUITE_VERSION,
-        "count": len(out),
-        "entries": out,
-        "status_vocabulary": VOCABULARY,
-        "what_this_list_is_not": WHAT_THIS_IS_NOT,
-        "latest_checkpoint": ({
-            "at": _iso(cp[0]), "tree_size": cp[1], "event_root": cp[2],
-            "domain_root": cp[3], "domain_count": cp[4],
-        } if cp else None),
-        "prove_absence": "/x/register/absence?domain=example.com&at=2026-01-01",
-        "prove_append_only": "/x/register/consistency?first=<size>&second=<size>",
-    }, 200
-
-
-def _entry(ctx, q):
-    domain = _clean_domain(q.get("domain"))
-    if not domain:
-        return {"error": MESSAGES["bad_domain"]}, 400
-    with ctx["lock"]:
-        r = ctx["conn"].execute(
-            "SELECT domain, status, first_listed, last_event, last_checked, last_pass,"
-            " checks_json, contact, claim_method, reason FROM register_entry WHERE domain=?",
-            (domain,)).fetchone()
-    if not r:
-        return {"error": MESSAGES["not_listed"], "domain": domain,
-                "prove_it": "/x/register/absence?domain=%s&at=<date>" % domain}, 404
-    try:
-        checks = json.loads(r[6]) if r[6] else {}
-    except Exception:
-        checks = {}
-    return {
-        "domain": r[0], "status": r[1],
-        "status_means": VOCABULARY.get(r[1], "unexplained value — treat as unverified"),
-        "first_listed": _iso(r[2]), "last_event": _iso(r[3]),
-        "last_checked": _iso(r[4]) if r[4] else None,
-        "last_pass": _iso(r[5]) if r[5] else None,
-        "claim_method": r[8], "reason": r[9],
-        "checks": checks,
-        "what_this_is_not": WHAT_THIS_IS_NOT,
-        "history": "/x/register/history?domain=%s" % domain,
-    }, 200
-
-
-def _history(ctx, q):
-    domain = _clean_domain(q.get("domain"))
-    if not domain:
-        return {"error": MESSAGES["bad_domain"]}, 400
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT seq, ts, kind, detail, leaf_hex, audit_hash FROM register_event"
-            " WHERE domain=? ORDER BY seq ASC", (domain,)).fetchall()
-    events = []
-    for s, ts, kind, detail, leaf, ah in rows:
-        try:
-            d = json.loads(detail)
-        except Exception:
-            d = detail
-        events.append({"seq": s, "at": _iso(ts), "kind": kind, "detail": d,
-                       "leaf": leaf, "audit_hash": ah,
-                       "inclusion": "/x/register/inclusion?seq=%d" % s})
-    return {"domain": domain, "count": len(events), "events": events,
-            "note": "Nothing is ever removed from this history, including revocations."}, 200
-
-
-def _absence(ctx, q):
-    """Prove a domain was NOT listed at a given time."""
-    domain = _clean_domain(q.get("domain"))
-    if not domain:
-        return {"error": MESSAGES["bad_domain"]}, 400
-    at = _parse_when(q.get("at"))
-    with ctx["lock"]:
-        if at is None:
-            cp = ctx["conn"].execute(
-                "SELECT ts, tree_size, domain_root, domain_count, domains_json, audit_hash"
-                " FROM register_checkpoint ORDER BY id DESC LIMIT 1").fetchone()
-        else:
-            cp = ctx["conn"].execute(
-                "SELECT ts, tree_size, domain_root, domain_count, domains_json, audit_hash"
-                " FROM register_checkpoint WHERE ts<=? ORDER BY ts DESC LIMIT 1",
-                (at,)).fetchone()
-    if not cp:
-        return {"error": MESSAGES["no_checkpoint"], "domain": domain,
-                "asked_about": _iso(at) if at else "now"}, 404
-
-    domains = json.loads(cp[4])
-    leaves = [_sorted_leaf(d) for d in domains]
-    root = _sorted_root(leaves).hex()
-
-    if domain in domains:
-        idx = domains.index(domain)
-        return {
-            "domain": domain,
-            "present": True,
-            "at": _iso(cp[0]),
-            "checkpoint_root": root,
-            "index": idx,
-            "path": _sorted_path(leaves, idx),
-            "proves": "This domain WAS listed at the checkpoint shown. This is an inclusion proof, not an absence proof.",
-        }, 200
-
-    # find the two adjacent leaves it would sit between
-    lo, hi = None, None
-    for i, d in enumerate(domains):
-        if d < domain:
-            lo = i
-        if d > domain and hi is None:
-            hi = i
-    neighbours = []
-    if lo is not None:
-        neighbours.append({"position": "before", "index": lo, "domain": domains[lo],
-                           "leaf": leaves[lo].hex(), "path": _sorted_path(leaves, lo)})
-    if hi is not None:
-        neighbours.append({"position": "after", "index": hi, "domain": domains[hi],
-                           "leaf": leaves[hi].hex(), "path": _sorted_path(leaves, hi)})
-
-    if lo is not None and hi is not None:
-        proves = ("Indices %d and %d are consecutive in a sorted tree committed at %s. "
-                  "Nothing can sit between them, and %s sorts between them, so it was "
-                  "not listed at that checkpoint." % (lo, hi, _iso(cp[0]), domain))
-    elif not domains:
-        proves = ("The register held no listings at all at that checkpoint "
-                  "(count 0, sealed root %s), so %s was not listed." % (root, domain))
-    elif lo is None:
-        proves = ("%s sorts before the first leaf at index 0, and the leaf count was "
-                  "committed in advance, so it was not listed at that checkpoint." % domain)
-    else:
-        proves = ("%s sorts after the last leaf at index %d, and the leaf count was "
-                  "committed in advance, so it was not listed at that checkpoint." % (domain, lo))
-
-    return {
-        "domain": domain,
-        "present": False,
-        "asked_about": _iso(at) if at else "now",
-        "checkpoint_at": _iso(cp[0]),
-        "checkpoint_root": root,
-        "sealed_root": cp[2],
-        "roots_agree": root == cp[2],
-        "domain_count": cp[3],
-        "neighbours": neighbours,
-        "proves": proves,
-        "how_to_check_yourself": [
-            "leaf   = SHA256('AILEASH-REGISTER-LEAF-v1\\x00' + domain)",
-            "node   = SHA256('AILEASH-REGISTER-NODE-v1\\x00' + left + right)",
-            "Odd nodes are promoted to the next level, never paired with themselves.",
-            "Recompute each neighbour's path to the root and confirm it equals checkpoint_root.",
-        ],
-        "limit": "An absence proof is against a checkpoint. It says nothing about moments between checkpoints.",
-    }, 200
-
-
-def _consistency(ctx, q):
-    """RFC 6962 proof that the register at size `first` is a prefix of size `second`."""
-    leaves = _event_leaves(ctx)
-    n = len(leaves)
-    try:
-        first = int(q.get("first")) if q.get("first") else None
-        second = int(q.get("second")) if q.get("second") else n
-    except (TypeError, ValueError):
-        return {"error": "first and second must be integers"}, 400
-    if first is None:
-        return {"error": "first is required — the tree size you already hold",
-                "current_size": n}, 400
-    if not (0 < first <= second <= n):
-        return {"error": "need 0 < first <= second <= current size",
-                "current_size": n}, 400
-
-    proof = _ct_consistency(leaves[:second], first)
-    return {
-        "first": first,
-        "second": second,
-        "current_size": n,
-        "first_root": _ct_root(leaves[:first]).hex(),
-        "second_root": _ct_root(leaves[:second]).hex(),
-        "proof": proof,
-        "algorithm": "RFC 6962 consistency proof, SHA-256, leaf prefix 0x00, node prefix 0x01",
-        "proves": ("The register at size %d is a prefix of the register at size %d. "
-                   "No entry was inserted, altered or removed behind an earlier "
-                   "position — including by the operator." % (first, second)),
-        "verify_with": "Any standard Certificate Transparency verifier. This tree is deliberately unmodified so you do not have to use ours.",
-    }, 200
-
-
-def _inclusion(ctx, q):
-    leaves = _event_leaves(ctx)
-    try:
-        seq = int(q.get("seq"))
-    except (TypeError, ValueError):
-        return {"error": "seq is required"}, 400
-    with ctx["lock"]:
-        row = ctx["conn"].execute(
-            "SELECT seq, ts, domain, kind, leaf_hex, audit_hash FROM register_event"
-            " WHERE seq=?", (seq,)).fetchone()
-    if not row:
-        return {"error": "no event at that seq"}, 404
-    index = seq - 1
-    if index < 0 or index >= len(leaves):
-        return {"error": "seq out of range of the current tree"}, 409
-    return {
-        "seq": seq, "index": index, "at": _iso(row[1]), "domain": row[2],
-        "kind": row[3], "leaf": row[4], "audit_hash": row[5],
-        "tree_size": len(leaves),
-        "root": _ct_root(leaves).hex(),
-        "proof": _ct_inclusion(leaves, index),
-        "algorithm": "RFC 6962 inclusion proof, SHA-256",
-    }, 200
-
-
-def _checkpoints(ctx, q):
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT id, ts, tree_size, event_root, domain_root, domain_count, audit_hash"
-            " FROM register_checkpoint ORDER BY id DESC LIMIT 200").fetchall()
-    return {
-        "count": len(rows),
-        "checkpoints": [{
-            "id": r[0], "at": _iso(r[1]), "tree_size": r[2],
-            "event_root": r[3], "domain_root": r[4],
-            "domain_count": r[5], "audit_hash": r[6],
-        } for r in rows],
-        "note": "event_root answers append-only. domain_root answers absence. They are different trees and never match.",
-    }, 200
-
-
-def _roots(ctx):
-    leaves = _event_leaves(ctx)
-    domains = _live_domains(ctx)
-    return {
-        "tree_size": len(leaves),
-        "event_root": _ct_root(leaves).hex(),
-        "domain_count": len(domains),
-        "domain_root": _sorted_root([_sorted_leaf(d) for d in domains]).hex(),
-        "at": _iso(_now()),
-        "note": "Live values. A root only becomes evidence once it is sealed by a checkpoint.",
-    }, 200
-
-
-# ------------------------------------------------------------------ handle
-
-def handle(method, action, data, api_key, ctx):
-    _ensure(ctx)
-    data = data or {}
-    q = data if isinstance(data, dict) else {}
-
-    if method == "GET":
-        if action == "spec":
-            return _spec(ctx)
-        if action == "vocabulary":
-            return {"status_vocabulary": VOCABULARY,
-                    "what_this_is_not": WHAT_THIS_IS_NOT,
-                    "suite_version": SUITE_VERSION}, 200
-        if action == "list":
-            return _list(ctx, q)
-        if action == "entry":
-            return _entry(ctx, q)
-        if action == "history":
-            return _history(ctx, q)
-        if action == "absence":
-            return _absence(ctx, q)
-        if action == "consistency":
-            return _consistency(ctx, q)
-        if action == "inclusion":
-            return _inclusion(ctx, q)
-        if action == "checkpoints":
-            return _checkpoints(ctx, q)
-        if action == "roots":
-            return _roots(ctx)
-        if action == "tokens":
-            d = _clean_domain(q.get("domain"))
-            if not d:
-                return {"error": MESSAGES["bad_domain"]}, 400
-            live = _live_tokens(ctx, d)
-            return {"domain": d, "live_tokens": len(live),
-                    "tokens": [{"token": t, "issued": _iso(i),
-                                "expires": _iso(i + CHALLENGE_TTL_SECONDS)} for t, i in live],
-                    "note": "Any of these will verify. Requesting a new token does not "
-                            "invalidate one you have already published."}, 200
-        if action == "sealcheck":
-            probe = {"user_id": "register:sealcheck", "type": "register_sealcheck",
-                     "kind": "probe", "at": _iso(_now())}
-            try:
-                h = _do_seal(ctx, probe, result="sealcheck")
-                return {"ok": True, "audit_hash": h,
-                        "note": "The register can seal. This probe is a real sealed block."}, 200
-            except Exception as e:
-                return {"ok": False, "error": "seal_failed", "detail": str(e),
-                        "note": "Nothing was written. The detail names what server.py's seal did."}, 500
-        return {"error": "unknown action", "see": "/x/register/spec"}, 404
-
-    if method == "POST":
-        if action == "challenge":
-            return _challenge(ctx, q)
-        if action == "claim":
-            return _claim(ctx, q)
-        if action == "recheck":
-            return _recheck(ctx, q)
-        if action == "withdraw":
-            return _withdraw(ctx, q)
-        # keyed below
-        if not api_key:
-            return {"error": "api key required for this action"}, 401
-        if action == "revoke":
-            return _revoke(ctx, q)
-        if action == "checkpoint":
-            try:
-                return {"ok": True, "checkpoint": _seal_checkpoint(ctx)}, 200
-            except Exception as e:
-                return {"error": MESSAGES["seal_failed"], "detail": str(e)}, 500
-        if action == "recheck-all":
-            return _recheck_all(ctx)
-        return {"error": "unknown action", "see": "/x/register/spec"}, 404
-
-    return {"error": "method not allowed"}, 405
-
-```
-
-
-## `modules/replay.py`
-
-678 lines, 30538 bytes
+918 lines, 100001 bytes
 
 ```python
 #!/usr/bin/env python3
 """
-modules/replay.py  -  proving the same inputs still produce the same verdict
-                      WITHOUT ever disclosing how the verdict is reached
-============================================================================
+modules/pwa.py  v1.0.0
+Makes sebbi.pro installable: an app on the home screen, full-screen, its own
+icon. No app store, no fees, payments stay exactly as they are.
 
-THE QUESTION NOBODY ELSE IN THIS MARKET CAN ANSWER
---------------------------------------------------
-Every compliance platform can tell you what it decided. Not one of them can
-prove it would decide the same way again.
+Arm after each deploy:  https://sebbi.pro/x/pwa/status
 
-Ask any of them to re-run decision 4,117 from its sealed inputs and show the
-same verdict falls out. They cannot. Not because they will not - because
-their scoring goes through a model call, and model calls are not
-reproducible. Same inputs, different day, different answer. Their audit
-trail describes a decision that can never be performed twice.
-
-Ours is arithmetic. Deterministic below the model layer, and always has
-been. This module lets anyone establish that for themselves.
-
-THE SCORING LOGIC IS NEVER DISCLOSED
-------------------------------------
-Read this before changing anything in here.
-
-Nothing in this module publishes, returns, echoes or hints at the contents
-of the decision function. Not the source, not the weights, not the
-thresholds, not the signal names, not the intermediate values. The only
-thing that leaves the building is a SHA-256 of the deployed source, which
-is one-way and reveals nothing about what it hashes.
-
-Determinism is proved as a BLACK BOX instead: same inputs in, same verdict
-out, demonstrated repeatedly, by the challenger, on their own schedule,
-with every run sealed into the chain. That is a stronger proof than showing
-the code, because it is behaviour observed over time rather than a claim
-about a listing nobody can confirm is what actually runs in production.
-
-  A competitor who reads every route here learns exactly one thing: that
-  our verdicts are reproducible. Which is the point, and which they cannot
-  copy, because reproducibility is a property of the architecture and not a
-  feature that can be bolted on.
-
-HOW SOMEONE CHECKS US WITHOUT SEEING ANYTHING
----------------------------------------------
-  POST /x/replay/challenge   send any inputs you like. We run them, seal
-                             the run into the chain, and hand you back the
-                             verdict, the audit hash, and a fingerprint of
-                             your own inputs.
-
-Send the same inputs again - an hour later, a year later, from a different
-address. If the verdict ever moves, you have caught us, and both runs are
-independently sealed and anchored so we cannot revise either one. If it
-never moves, you have established determinism yourself, empirically,
-adversarially, without a line of our code.
-
-We also report how many times that exact input has been challenged, when it
-was first seen, and every audit hash it produced, so the whole history is
-verifiable through routes we do not control the answers to.
-
-THE HONEST COST, WHICH IS REAL
-------------------------------
-An open scoring oracle can be probed. Feed it a thousand variations, watch
-the verdicts move, and a determined party can map the decision boundary
-without ever seeing the code. That is a genuine exposure and it is the
-price of this proof.
-
-It is mitigated, not eliminated: challenges are rate limited per address,
-inputs are fingerprinted so repeat submissions are cheap and novel ones are
-not, and boundary-probing patterns are already logged elsewhere in the
-platform. Anyone systematically mapping the function leaves an obvious,
-sealed trail while doing it.
-
-The trade is deliberate. A closed engine nobody can test is worth less than
-a testable one somebody might partially map, because the first cannot be
-sold to a regulator and the second can.
-
-CONFIGURATION
--------------
-This module does not import server.py - nothing here does. It finds the
-live decision function at runtime among already-loaded modules, so it can
-only observe the engine, never change it. If your scorer is named something
-not in SCORER_NAMES below, add it there. Everything else is read from the
-audit_log schema at startup rather than assumed.
-
-    POST /x/replay/challenge     run any inputs, sealed          (public)
-    GET  /x/replay/history       every run of a given input       (public)
-    GET  /x/replay/self          reproduction rate over a sample  (public)
-    GET  /x/replay/fingerprint   hash of the deployed code        (public)
-    GET  /x/replay/spec          how to test us                   (public)
-    GET  /x/replay/check         re-run one sealed decision       (keyed)
-    POST /x/replay/attest        seal the current fingerprint     (keyed)
+Serves, at clean URLs:
+    /manifest.webmanifest   the app definition
+    /sw.js                  the service worker (needed to be installable)
+    /app-icon-192.png       icon
+    /app-icon-512.png       icon
+    /app-icon-maskable.png  icon (Android adaptive)
+The install button and <link rel=manifest> live in the pages themselves.
 """
 
-import hashlib
-import inspect
-import json
+import base64
 import sys
-import time
-from datetime import datetime, timezone
 
-VERSION = "1.0"
-
-# Challenge, history, self, fingerprint and spec are open - a
-# reproducibility claim you need an account to test is not a claim anyone
-# should accept. check stays keyed: it reads back a specific sealed
-# decision, which belongs to whoever owns it.
-PUBLIC = {("POST", "challenge"), ("GET", "history"), ("GET", "self"),
-          ("GET", "fingerprint"), ("GET", "spec")}
-
-# Names the live decision function might go by. Add yours if it is not
-# here - this is the one thing that has to match your code.
-SCORER_NAMES = (
-    "score_event", "decide", "score", "evaluate", "run_decision",
-    "make_decision", "assess", "score_decision", "engine_decide",
-)
-
-# Columns the sealed inputs might live in. Detected, never assumed.
-INPUT_COLUMNS = ("event", "event_json", "payload", "inputs", "request",
-                 "ev", "data", "event_data")
-RESULT_COLUMNS = ("result", "result_json", "res", "decision_json", "outcome",
-                  "response")
-VERDICT_COLUMNS = ("decision", "verdict", "action_taken")
-SCORE_COLUMNS = ("score", "risk_score", "points")
-
-SELF_SAMPLE_DEFAULT = 50
-SELF_SAMPLE_MAX = 500
-
-# Challenge throttle. Repeat submissions of an input we have already seen
-# are cheap; novel inputs are what a prober needs, so those are what get
-# limited.
-NOVEL_PER_HOUR = 40
-MAX_PAYLOAD_KEYS = 40
-
-_ready = False
-_columns = []
-
-
-def _setup(ctx):
-    global _ready, _columns
-    if _ready:
-        return
-    cols = []
-    try:
-        with ctx["lock"]:
-            for row in ctx["conn"].execute("PRAGMA table_info(audit_log)").fetchall():
-                cols.append(row[1])
-    except Exception:
-        pass
-    _columns = cols
-    with ctx["lock"]:
-        c = ctx["conn"]
-        c.execute("CREATE TABLE IF NOT EXISTS replay_attest("
-                  "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,"
-                  "fingerprint TEXT,function TEXT,taken REAL,"
-                  "audit_hash TEXT,block_index INTEGER)")
-        # One row per challenge run. The input fingerprint is stored, the
-        # input itself is not - we have no reason to keep a stranger's
-        # payload and every reason not to.
-        c.execute("CREATE TABLE IF NOT EXISTS replay_challenge("
-                  "id INTEGER PRIMARY KEY AUTOINCREMENT,input_hash TEXT,"
-                  "verdict TEXT,score TEXT,code_fingerprint TEXT,ran REAL,"
-                  "audit_hash TEXT,block_index INTEGER,client TEXT)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_rep_input "
-                  "ON replay_challenge(input_hash,id)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_rep_ran ON replay_challenge(ran)")
-        c.commit()
-    _ready = True
-
-
-def _iso(ts):
-    if not ts:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
-
-def _pick(candidates):
-    for name in candidates:
-        if name in _columns:
-            return name
-    return None
-
-
-def _canonical(payload):
-    """Stable rendering of an input payload, so the same inputs always
-    fingerprint to the same value regardless of key order or spacing."""
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"),
-                      ensure_ascii=False, default=str)
-
-
-def _input_hash(payload):
-    return hashlib.sha256(("AILEASH-INPUT-v1:" + _canonical(payload)).encode("utf-8")).hexdigest()
-
-
-# ----------------------------------------------------------------------
-# finding the live decision function
-# ----------------------------------------------------------------------
-
-def _find_scorer():
-    """Locate the deployed decision function among loaded modules.
-
-    Deliberately does not import server.py. It looks at what is already
-    running, so this module can observe the engine and never alter it.
-    """
-    for module_name in ("__main__", "server", "app", "main"):
-        module = sys.modules.get(module_name)
-        if module is None:
-            continue
-        for name in SCORER_NAMES:
-            candidate = getattr(module, name, None)
-            if callable(candidate):
-                return candidate, "%s.%s" % (module_name, name), None
-    return None, None, ("no decision function found. Add its real name to SCORER_NAMES at the "
-                        "top of modules/replay.py.")
-
-
-def _fingerprint_of(function):
-    """SHA-256 of the deployed source. One-way: it commits to which code is
-    running without revealing any of it."""
-    try:
-        source = inspect.getsource(function)
-    except (OSError, TypeError):
-        return None, "source not readable for this callable"
-    normalised = "\n".join(line.rstrip() for line in source.splitlines()).strip()
-    return hashlib.sha256(normalised.encode("utf-8")).hexdigest(), None
-
-
-# ----------------------------------------------------------------------
-# running the engine
-# ----------------------------------------------------------------------
-
-def _rerun(function, inputs):
-    """Execute the live decision function against a set of inputs.
-
-    Never raises. On failure it reports that the call failed and nothing
-    about why the engine is shaped the way it is.
-    """
-    if inputs is None:
-        return None, "no inputs"
-    attempts = []
-    if isinstance(inputs, dict):
-        attempts.append(lambda: function(**inputs))
-        attempts.append(lambda: function(inputs))
-    else:
-        attempts.append(lambda: function(inputs))
-    for call in attempts:
-        try:
-            return call(), None
-        except TypeError:
-            continue
-        except Exception:
-            return None, "the decision function could not process those inputs"
-    return None, "those inputs do not match the shape the engine expects"
-
-
-def _extract(output):
-    """Pull (verdict, score) out of whatever the scorer returns. Nothing
-    else from the return value is ever surfaced."""
-    if isinstance(output, dict):
-        return (output.get("decision") or output.get("verdict"), output.get("score"))
-    if isinstance(output, (tuple, list)) and len(output) >= 2:
-        return output[0], output[1]
-    return output, None
-
-
-def _same(a, b):
-    if a is None and b is None:
-        return True
-    if a is None or b is None:
-        return False
-    if isinstance(a, float) or isinstance(b, float):
-        try:
-            return abs(float(a) - float(b)) < 1e-9
-        except (TypeError, ValueError):
-            return False
-    return str(a).strip().upper() == str(b).strip().upper()
-
-
-# ----------------------------------------------------------------------
-# challenge - the public proof
-# ----------------------------------------------------------------------
-
-def _novel_recently(ctx):
-    since = time.time() - 3600
-    with ctx["lock"]:
-        row = ctx["conn"].execute(
-            "SELECT COUNT(DISTINCT input_hash) FROM replay_challenge WHERE ran>=?",
-            (since,)).fetchone()
-    return int(row[0]) if row else 0
-
-
-def _challenge(ctx, api_key, data):
-    inputs = data.get("inputs", data.get("event", data.get("payload")))
-    if not isinstance(inputs, dict) or not inputs:
-        return {"error": "inputs_required",
-                "message": "Send an inputs object. We will run it, seal the run, and hand you "
-                           "back the verdict. Send the same object again whenever you like - "
-                           "if the answer ever moves, you have caught us."}, 400
-    if len(inputs) > MAX_PAYLOAD_KEYS:
-        return {"error": "payload_too_wide", "message": "at most %d keys" % MAX_PAYLOAD_KEYS}, 400
-
-    fingerprint_in = _input_hash(inputs)
-
-    with ctx["lock"]:
-        prior = ctx["conn"].execute(
-            "SELECT verdict,score,ran,audit_hash,block_index,code_fingerprint "
-            "FROM replay_challenge WHERE input_hash=? ORDER BY id ASC",
-            (fingerprint_in,)).fetchall()
-
-    if not prior and _novel_recently(ctx) >= NOVEL_PER_HOUR:
-        return {"error": "rate_limited",
-                "message": "Too many distinct inputs in the last hour. Repeat submissions of "
-                           "inputs already seen are never limited - testing whether the answer "
-                           "moves is the whole point. Mapping the function is not.",
-                "repeat_freely": "any input_hash already in /x/replay/history"}, 429
-
-    function, name, why = _find_scorer()
-    if why:
-        return {"error": "engine_unavailable", "message": "the decision engine is not reachable "
-                                                          "from this route right now"}, 503
-
-    output, problem = _rerun(function, inputs)
-    if problem:
-        return {"error": "not_runnable", "message": problem}, 422
-
-    verdict, score = _extract(output)
-    code_fingerprint, _p = _fingerprint_of(function)
-    now = time.time()
-
-    ev = {"user_id": "chal:" + fingerprint_in[:16], "action": "replay_challenge", "amount": 0,
-          "country": "UK", "device_id": "replay", "anomaly": 0, "device_risk": 0}
-    res = {"decision": str(verdict), "score": score, "replay_version": VERSION,
-           "input_hash": fingerprint_in, "code_fingerprint": code_fingerprint,
-           "detail": "input=%s;verdict=%s;code=%s" % (fingerprint_in, verdict, code_fingerprint)}
-    audit_hash, block_index, seq = ctx["seal"](ev, res, now, api_key or "public-replay")
-
-    with ctx["lock"]:
-        ctx["conn"].execute(
-            "INSERT INTO replay_challenge(input_hash,verdict,score,code_fingerprint,ran,"
-            "audit_hash,block_index,client) VALUES(?,?,?,?,?,?,?,?)",
-            (fingerprint_in, str(verdict), str(score), code_fingerprint, now,
-             audit_hash, block_index, "keyed" if api_key else "anonymous"))
-        ctx["conn"].commit()
-
-    out = {
-        "input_hash": fingerprint_in,
-        "verdict": verdict, "score": score,
-        "ran_at": _iso(now),
-        "sealed_in_chain": audit_hash, "block_index": block_index, "receipt_seq": seq,
-        "code_fingerprint": code_fingerprint,
-        "runs_of_this_input": len(prior) + 1,
-        "replay_version": VERSION,
-        "how_to_use_this": "Send the identical inputs again, whenever you like, from wherever "
-                           "you like. Every run is sealed into a chain that is externally "
-                           "anchored and independently witnessed, so neither this answer nor "
-                           "the next one can be revised afterwards.",
-        "history": "/x/replay/history?input_hash=" + fingerprint_in,
-        "verify_this_run": "/x/consistency/ancestor?tip=" + audit_hash,
-    }
-
-    if prior:
-        first_verdict, first_score = prior[0][0], prior[0][1]
-        stable = _same(verdict, first_verdict) and _same(score, first_score)
-        out["first_seen"] = _iso(prior[0][2])
-        out["stable"] = stable
-        out["verdict_moved"] = not stable
-        if stable:
-            out["what_this_shows"] = ("Identical to the first run of these inputs on %s, and to "
-                                      "every run since. Determinism observed rather than "
-                                      "asserted." % _iso(prior[0][2]))
-        else:
-            out["what_this_shows"] = ("These inputs previously produced a different answer. "
-                                      "Either the code changed - compare the code fingerprints "
-                                      "in the history - or the engine is not deterministic. "
-                                      "Both runs are sealed and neither can be withdrawn.")
-    else:
-        out["stable"] = None
-        out["what_this_shows"] = ("First time these inputs have been seen. Send them again to "
-                                  "start building the record.")
-    return out, 200
-
-
-def _history(ctx, data):
-    input_hash = str(data.get("input_hash", data.get("hash", ""))).strip().lower()
-    if not input_hash:
-        return {"error": "input_hash_required"}, 400
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT verdict,score,ran,audit_hash,block_index,code_fingerprint,client "
-            "FROM replay_challenge WHERE input_hash=? ORDER BY id ASC LIMIT 500",
-            (input_hash,)).fetchall()
-    if not rows:
-        return {"error": "unknown_input", "input_hash": input_hash,
-                "message": "No run recorded for that input fingerprint."}, 404
-
-    verdicts = {r[0] for r in rows}
-    codes = {r[5] for r in rows if r[5]}
-    return {
-        "input_hash": input_hash,
-        "runs": len(rows),
-        "first_run": _iso(rows[0][2]), "latest_run": _iso(rows[-1][2]),
-        "distinct_verdicts": len(verdicts),
-        "stable": len(verdicts) == 1,
-        "code_versions_seen": len(codes),
-        "history": [{"verdict": r[0], "score": r[1], "ran_at": _iso(r[2]),
-                     "sealed_in_chain": r[3], "block_index": r[4],
-                     "code_fingerprint": r[5], "submitted_by": r[6]} for r in rows],
-        "what_this_is": "Every recorded run of one exact set of inputs, each sealed separately "
-                        "into the chain. Verify any of them independently at "
-                        "/x/consistency/ancestor - we cannot alter one after the fact.",
-        "note": "More than one distinct verdict across a single code fingerprint would mean the "
-                "engine is not deterministic. That is exactly what this is here to expose.",
-    }, 200
-
-
-# ----------------------------------------------------------------------
-# self audit
-# ----------------------------------------------------------------------
-
-def _fetch(ctx, where, args):
-    input_col = _pick(INPUT_COLUMNS)
-    result_col = _pick(RESULT_COLUMNS)
-    verdict_col = _pick(VERDICT_COLUMNS)
-    score_col = _pick(SCORE_COLUMNS)
-    if not input_col:
-        return None, ("audit_log does not store decision inputs on this deployment, so sealed "
-                      "decisions cannot be re-executed. Seal the event payload alongside the "
-                      "verdict and replay becomes available from that point on.")
-    fields = ["id", "audit_hash", "ts", input_col]
-    for extra in (result_col, verdict_col, score_col):
-        if extra and extra not in fields:
-            fields.append(extra)
-    sql = "SELECT %s FROM audit_log WHERE %s" % (", ".join(fields), where)
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(sql, tuple(args)).fetchall()
-    if not rows:
-        return None, "no sealed decision matched"
-    out = []
-    for row in rows:
-        record = dict(zip(fields, row))
-        raw = record.get(input_col)
-        try:
-            parsed = raw if isinstance(raw, (dict, list)) else json.loads(raw)
-        except Exception:
-            parsed = None
-        sealed_result = None
-        if result_col:
-            raw_result = record.get(result_col)
-            try:
-                sealed_result = raw_result if isinstance(raw_result, dict) else json.loads(raw_result)
-            except Exception:
-                sealed_result = None
-        out.append({"id": record.get("id"), "audit_hash": record.get("audit_hash"),
-                    "ts": record.get("ts"), "inputs": parsed,
-                    "sealed_result": sealed_result,
-                    "sealed_verdict": record.get(verdict_col) if verdict_col else None,
-                    "sealed_score": record.get(score_col) if score_col else None})
-    return out, None
-
-
-def _sealed_pair(record):
-    verdict = record.get("sealed_verdict")
-    score = record.get("sealed_score")
-    result = record.get("sealed_result")
-    if isinstance(result, dict):
-        if verdict is None:
-            verdict = result.get("decision") or result.get("verdict")
-        if score is None:
-            score = result.get("score")
-    return verdict, score
-
-
-def _compare(record, function):
-    output, why = _rerun(function, record.get("inputs"))
-    sealed_verdict, sealed_score = _sealed_pair(record)
-    if why:
-        return {"audit_hash": record["audit_hash"], "result": "not_replayable"}
-    verdict, score = _extract(output)
-    identical = _same(verdict, sealed_verdict) and _same(score, sealed_score)
-    return {"audit_hash": record["audit_hash"], "sealed_at": _iso(record.get("ts")),
-            "result": "identical" if identical else "divergent"}
-
-
-def _self(ctx, data):
-    try:
-        sample = int(data.get("sample", SELF_SAMPLE_DEFAULT))
-    except (TypeError, ValueError):
-        sample = SELF_SAMPLE_DEFAULT
-    sample = max(1, min(sample, SELF_SAMPLE_MAX))
-
-    function, name, why = _find_scorer()
-    if why:
-        return {"error": "engine_unavailable"}, 503
-
-    records, fetch_why = _fetch(ctx, "1=1 ORDER BY id DESC LIMIT ?", [sample])
-    if fetch_why:
-        return {"error": "cannot_replay", "message": fetch_why}, 400
-
-    identical = divergent = skipped = 0
-    divergent_hashes = []
-    started = time.time()
-    for record in records:
-        outcome = _compare(record, function)
-        if outcome["result"] == "identical":
-            identical += 1
-        elif outcome["result"] == "divergent":
-            divergent += 1
-            if len(divergent_hashes) < 10:
-                divergent_hashes.append(outcome["audit_hash"])
-        else:
-            skipped += 1
-
-    checked = identical + divergent
-    rate = round((identical / checked) * 100, 4) if checked else None
-    code_fingerprint, _p = _fingerprint_of(function)
-
-    body = {
-        "sampled": len(records), "replayable": checked,
-        "identical": identical, "divergent": divergent, "not_replayable": skipped,
-        "reproduction_rate_percent": rate,
-        "took_seconds": round(time.time() - started, 3),
-        "code_fingerprint": code_fingerprint,
-        "replay_version": VERSION,
-        "headline": ("%d of %d sealed decisions reproduce identically under the code deployed "
-                     "right now." % (identical, checked)) if checked else
-                    "Nothing replayable in this sample.",
-        "why_this_matters": "A platform whose scoring runs through a model call cannot do this "
-                            "at all. Reproducibility is a property of the architecture, not a "
-                            "feature that can be added later.",
-        "honest": "Divergences are counted here, not filtered out. A falling rate is the most "
-                  "useful thing this route can tell you.",
-        "independent_check": "Do not take our word for this - /x/replay/challenge lets you run "
-                             "your own inputs and repeat them whenever you like.",
-    }
-    if divergent_hashes:
-        body["divergent_receipts"] = divergent_hashes
-    return body, 200
-
-
-# ----------------------------------------------------------------------
-# fingerprint, keyed check, attest
-# ----------------------------------------------------------------------
-
-def _fingerprint(ctx):
-    function, name, why = _find_scorer()
-    if why:
-        return {"error": "engine_unavailable"}, 503
-    digest, problem = _fingerprint_of(function)
-    return {"code_fingerprint": digest, "problem": problem, "replay_version": VERSION,
-            "what_this_is": "A SHA-256 of the source of the code currently deciding. It commits "
-                            "to which version is running. It is one-way and discloses nothing "
-                            "about the logic, the weights or the thresholds.",
-            "what_it_is_for": "Sealed alongside verdicts via /x/replay/attest, so a change in "
-                              "behaviour can be attributed to a dated code change rather than "
-                              "looking like a fault - or hidden as one.",
-            "note": "The function name and signature are deliberately not published."}, 200
-
-
-def _check(ctx, data):
-    """Keyed. Re-runs one sealed decision and reports match or divergence."""
-    target = str(data.get("hash", data.get("receipt", ""))).strip().lower()
-    if not target:
-        return {"error": "hash_required"}, 400
-    records, why = _fetch(ctx, "audit_hash=? LIMIT 1", [target])
-    if why:
-        return {"error": "cannot_replay", "message": why}, 400
-    function, name, scorer_why = _find_scorer()
-    if scorer_why:
-        return {"error": "engine_unavailable"}, 503
-    outcome = _compare(records[0], function)
-    digest, _p = _fingerprint_of(function)
-    outcome.update({"code_fingerprint": digest, "replay_version": VERSION,
-                    "what_this_proves": "The sealed inputs were fed back through the live "
-                                        "decision function and the output compared with what "
-                                        "was sealed."})
-    return outcome, 200
-
-
-def _attest(ctx, api_key):
-    function, name, why = _find_scorer()
-    if why:
-        return {"error": "engine_unavailable"}, 503
-    digest, problem = _fingerprint_of(function)
-    if not digest:
-        return {"error": "no_fingerprint", "message": problem}, 503
-
-    now = time.time()
-    ev = {"user_id": "rep:" + digest[:16], "action": "code_fingerprint_sealed", "amount": 0,
-          "country": "UK", "device_id": "replay", "anomaly": 0, "device_risk": 0}
-    res = {"decision": "FINGERPRINT_SEALED", "score": 0, "replay_version": VERSION,
-           "fingerprint": digest, "detail": "fingerprint=%s" % digest}
-    audit_hash, block_index, seq = ctx["seal"](ev, res, now, api_key)
-
-    with ctx["lock"]:
-        ctx["conn"].execute("INSERT INTO replay_attest(api_key,fingerprint,function,taken,"
-                            "audit_hash,block_index) VALUES(?,?,?,?,?,?)",
-                            (api_key, digest, name, now, audit_hash, block_index))
-        ctx["conn"].commit()
-
-    return {"fingerprint": digest, "taken_at": _iso(now),
-            "sealed_in_chain": audit_hash, "block_index": block_index, "receipt_seq": seq,
-            "what_this_does": "Records which code was deciding at this moment, inside the chain "
-                              "the decisions are sealed in. Every verdict after this point is "
-                              "attributable to a known, timestamped version of the logic - "
-                              "without that logic being published.",
-            "do_this": "Attest on every deploy that touches scoring. A later divergence then "
-                       "reads as a dated policy change rather than an unexplained fault."}, 200
-
-
-def _spec():
-    return {
-        "replay_version": VERSION,
-        "claim": "The same inputs produce the same verdict, and you can establish that yourself "
-                 "without an account and without seeing any of our logic.",
-        "the_logic_is_not_published": "No route here returns the scoring source, the weights, "
-                                      "the thresholds, the signal names or any intermediate "
-                                      "value. The only thing published is a SHA-256 of the "
-                                      "deployed source, which is one-way.",
-        "how_to_test_us": [
-            "POST /x/replay/challenge with any inputs object you like.",
-            "Keep the input_hash it returns.",
-            "Send the identical inputs again tomorrow, next month, next year, from anywhere.",
-            "GET /x/replay/history?input_hash=... to see every run, each sealed separately.",
-            "If the verdict ever moves under an unchanged code fingerprint, the engine is not "
-            "deterministic and you have proof of it that we cannot withdraw.",
-        ],
-        "why_black_box_is_stronger": "A published listing only shows what the code says. "
-                                     "Repeated challenge shows what production actually does, "
-                                     "over time, on inputs we did not choose.",
-        "what_breaks_determinism": [
-            "a wall-clock read inside the scoring path",
-            "iteration over an unordered structure",
-            "an unseeded random call",
-            "any model call in the decision path - which is why most platforms cannot do this",
-        ],
-        "what_this_does_not_prove": "That a decision was correct, or that the inputs were "
-                                    "honestly captured. Only that the same inputs still yield "
-                                    "the same output under known code. Determinism is not "
-                                    "fairness.",
-        "rate_limits": "Repeat submissions of inputs already seen are never limited - retesting "
-                       "is the point. Novel inputs are limited, because bulk novel inputs are "
-                       "how a decision boundary gets mapped rather than how a claim gets tested.",
-    }, 200
-
-
-# ----------------------------------------------------------------------
-# router entry point
-# ----------------------------------------------------------------------
-
-def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-    action = (action or "").strip("/").lower()
-    data = data or {}
-
-    if method == "GET":
-        if action == "spec":
-            return _spec()
-        if action == "fingerprint":
-            return _fingerprint(ctx)
-        if action == "history":
-            return _history(ctx, data)
-        if action == "self":
-            return _self(ctx, data)
-        if action == "check":
-            if not api_key:
-                return {"error": "invalid_api_key"}, 401
-            return _check(ctx, data)
-
-    if method == "POST":
-        if action == "challenge":
-            return _challenge(ctx, api_key, data)
-        if not api_key:
-            return {"error": "invalid_api_key"}, 401
-        if action == "attest":
-            return _attest(ctx, api_key)
-
-    return {"error": "unknown_action", "action": action,
-            "GET": ["spec", "fingerprint", "history", "self", "check (keyed)"],
-            "POST": ["challenge", "attest (keyed)"]}, 404
+VERSION = "1.0.0"
+PUBLIC = {("GET", "status"), ("GET", "spec")}
+
+MANIFEST = '{"name":"sebbi.pro \\u2014 10p Wing","short_name":"10p Wing","description":"Watch free, then 10p for the rest. 7p goes to the creator.","start_url":"/cinema?src=pwa","scope":"/","display":"standalone","background_color":"#0a0f1e","theme_color":"#0a0f1e","orientation":"portrait-primary","categories":["entertainment","video"],"icons":[{"src":"/app-icon-192.png","sizes":"192x192","type":"image/png","purpose":"any"},{"src":"/app-icon-512.png","sizes":"512x512","type":"image/png","purpose":"any"},{"src":"/app-icon-maskable.png","sizes":"512x512","type":"image/png","purpose":"maskable"}]}'
+SW = "const C='sebbi-shell-v1';\nself.addEventListener('install',function(e){self.skipWaiting()});\nself.addEventListener('activate',function(e){e.waitUntil(self.clients.claim())});\nself.addEventListener('fetch',function(e){\n  if(e.request.method!=='GET')return;\n  e.respondWith(fetch(e.request).catch(function(){return caches.match(e.request)}));\n});\n"
+
+_ICONS_B64 = {
+    '192': (
+        "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"
+        "8QAAAABJRU5ErkJggg=="
+    ),
+    '512': (
+        "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"
+        "mmP0vbbwr8nRbPYc1nUcnGxNw/3hYv3aqVwUyl+spmimitmYaTbuP9SyrLLXyv2Xj8fj/sKJHEOM4v6ouT/0TNpet8xa10Lc3+GX"
+        "DXH4W8xJMANjaHXXeHfQybh0EQqXBCGUsxBkJhIbKluFZZI8ttRy20p6xLXr3SemZSd6Tk6i8up0E0wFFQ9EVrpRhgpAJ+Yue8qy"
+        "MmsrZpylJHvUx4NkJ27HeGS36HTY9XLNF/MAco06ema/I4+1P3g4ghj5lOt4BUbruGfLi6U9Mty1Uyps8rRdV7CUKb7ve4pVjeZz"
+        "SEZQ5m6PaAR6a4L7u/5uvfHqqrWEo/mn0xFq6jnF/Z1oe7vgubbNFI/c8U5Wx+Y0J4/ojJfe+qhWwJ/1u4MWVekuB32W/HF94Lmm"
+        "yyK337dsP+/lA5Y1kO2bCpgfMPST+xP2tQMA8gbI+hvn9Vy1sfJq/at4d2E6DUdm7p+aGq1PELWxg3Y8ZlPX8X0Yfj6wbtUobb4R"
+        "e7F+8yqUjWZhK7wvjvWXfUQU90dKdoOWd8sbxs6G1Zn1n4r7A731Rty/WQvpGEXMJ7g/RL1gkm/4LKGtcjD2jQ1b/0zLED9AuKEg"
+        "RI0w9b2TEWypwUbSM2yV9Hy03aSXZDuFDNvpFi8BjYR1B923Uv57GzpxxPnAmkxcW3d/uUbHuDvf27A8Qzy2j1cBz7Vf0qlbP42l"
+        "PrHJ5Q5A5zfWozzvvKttaYnqalv0LLnuOawTGXsZM5NeimZzW28FGEuyY8HjWJtXs5PnWWxrF0PF2gL81TgkB5IMy02snjHQRuaE"
+        "mU90Xab4ez0O60A/Wi2nCIHYOuut15XbtfAip/HXa5efc3+N1U5NfWNTS34NhDE2wu1EQ5KMsBUMtRJ1FCDXr3a0ZRb+Fo/8oiur"
+        "CNLVxFNPFchnxkm55speZOLj+nUH6Mufxgy720K+NLBImd6KjqUqf/dsNDtvoFOLKYjHGXtrlVmuSo0GJ0b6+67uCltlrnC0pk+9"
+        "pyMZVGKLegJj/KC5Kmy9/kDwWzWn9VpuOpIPH0l7FpuLPUiLvHy6uZnzZr58eXPz0qXLFy5vXrx4+c1Ll99889LZc5e2lnH04N4D"
+        "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"
+        "EsvbtdwAWXph8WhyA1Vboniw+KaL9FXtXMfisVK8vv/u2LwcbQSm1iVRSJUD3SIrxfoHRiNvZ+JWhg1o9xc+7n/zTenEbW8+8dyT"
+        "z7786uXL1/1huF7K5ct47pU3z1089+779y4Wi/PnEx8vr5mkaZBT7Lj2SFyb7J3TBDq/bQw9k1ZnVDYkNzmJrDH0Yg4wKychHBw+"
+        "KwnS0haPzg47UiYgd3LhTqW+0J44DFbxui3pnls/OewTX9JDYTs+NsRyP6Td7zVrnKztggGr+wSpio/7LkOTePf8dsvZd9KOCBYI"
+        "fx7pRL1thXZyyvMVYv3h0xEf4vZb92D/a3/+w2dvWP2rW7Z05T33H714/sCzz3PMuh/XDkqO9CDk/j1eXN5u2IM/iCHXpuxXPCbG"
+        "PQA0+N0EMGs2kpOg7gmGh+W5Ap7rqVQeQOwHBN6AGVv7reO8TsiOY2rNETTOCbd5gqY2XrNdyCcgf8XVihDEzQHqPqOdV+zv2zyv"
+        "w1OjpZeJH7lVj8nHvqeqYv2prSnylpzFb7m/ALzrjsW+w2f+8pmnXtgKQNwoV7+kF09feOW1c/fdnY4f2XPmdfY+zaKxT+y4tnqo"
+        "oidNnL3WCs+d26hObUkaL4G+KaKT6DySRDyG/BJ4Nui0V+ZK3ka1njpiVDWepFZuxE+6nrn/UIoHwHYn+ZtcDG2e4uLOsnd6VzZo"
+        "Cpz/XmiFN3c27xUunrU77pXmcwovmZ3G+qPfVT/lU/fsefmNl558/hXcKNdqOXX7gWMbh77/ZDbGMMb9oazWP0kdD2CiJ3H/Ua6d"
+        "1ov+r4tqDE+qUOnsI3gE+Qqn9Zote9X6x3Htxg/I9LUv5waifECbG7B8AN+iIk2/HamblY3a9i6WA7HXEnkw4nte1XaAk/GTTzpP"
+        "Dia3MozT1CrWn1M/1q/tofutJ/a8iZf+8Acv43oo+/ct7rzl0ImbNg4d3Hd4Y9+hjb2HD+49dGC7Pryx98jBfQc39mw9PLSx55Zj"
+        "G1vM7+suAAAQAElEQVTLe/nM+TfOXxr+9/q5i69tNc5ttbcb57aeLB++fObNZ186d+HitX7gn3ruTeDN++/cwObG8y/WJ5csXe87"
+        "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"
+        "ScaEpKd5rpCRtIScXWuzrajwJH0X1Q2x9CE
 
 ```
