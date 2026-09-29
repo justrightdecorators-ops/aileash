@@ -1,1601 +1,1488 @@
-# Codebase — part 43 of 46
+# Codebase — part 43 of 43
 
 Contains:
-- `scan.html`
-- `seal.html`
-- `sentinel.html`
-- `signal-packs.html`
-- `sitemap.xml`
+- `whitepaper.html`
 
 
-## `scan.html`
+## `whitepaper.html`
 
-698 lines, 32675 bytes
+1476 lines, 125928 bytes
 
 ```html
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>AI Compliance Scanner — sebbi.pro</title>
-<meta name="description" content="Free AI compliance scanner. Enter your company name and get a personalised EU AI Act compliance report in seconds.">
-<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>The sebbi.pro System — the deterministic evidence layer for AI</title>
+<meta name="description" content="An interactive map of the sebbi.pro evidence layer. Tap any part of the system — the chain, anchoring, witnessing, oversight, the notaries — and read what it does, with the public routes to check it yourself.">
 <style>
-*{box-sizing:border-box;margin:0;padding:0}
 :root{
-  --bg:#050508;
-  --surface:#0c0c14;
-  --surface2:#12121e;
-  --border:#1c1c2e;
-  --gold:#c9a84c;
-  --gold2:#e8c96a;
-  --green:#00e5a0;
-  --red:#ff3d5a;
-  --blue:#4d9fff;
-  --purple:#8b5cf6;
-  --text:#f0f0f8;
-  --muted:#5a5a72;
-  --mono:'Space Mono',monospace;
-  --sans:'Space Grotesk',sans-serif;
+  --void:#07050a; --deep:#100a0d; --panel:#14100f; --panel2:#1b1614;
+  --line:#3a2c1c; --line2:#4d3a22;
+  --gold:#e0a94a; --ember:#ff9d3c; --cyan:#6fd6e0; --violet:#b895f0; --green:#8fe3a8; --amber:#f5c26b;
+  --text:#f2ece2; --muted:#b8ad9c; --faint:#6d6355;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
 }
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+html,body{height:100%;overflow:hidden;background:var(--void)}
+body{font-family:var(--sans);color:var(--text);overscroll-behavior:none}
 
-html,body{background:var(--bg);color:var(--text);font-family:var(--sans);min-height:100vh;overflow-x:hidden}
+#stage{position:fixed;inset:0}
+canvas{display:block;width:100%;height:100%;touch-action:none;cursor:grab}
+canvas.drag{cursor:grabbing}
 
-/* NAV */
-nav{position:fixed;top:0;left:0;right:0;z-index:100;padding:0 24px;height:52px;display:flex;align-items:center;justify-content:space-between;background:rgba(5,5,8,0.8);backdrop-filter:blur(12px);border-bottom:1px solid var(--border)}
-.nav-logo{font-family:var(--mono);font-size:13px;color:var(--gold);text-decoration:none;letter-spacing:0.05em}
-.nav-back{font-size:12px;color:var(--muted);text-decoration:none;transition:color .2s}.nav-back:hover{color:var(--text)}
-
-/* HERO */
-.hero{padding:100px 24px 60px;text-align:center;position:relative;overflow:hidden}
-.hero::before{
-  content:'';position:absolute;top:0;left:50%;transform:translateX(-50%);
-  width:600px;height:600px;
-  background:radial-gradient(circle,rgba(201,168,76,0.06) 0%,transparent 70%);
-  pointer-events:none;
+/* ---------- HUD chrome ---------- */
+header{
+  position:fixed;top:0;left:0;right:0;z-index:20;
+  background:linear-gradient(180deg,rgba(7,5,10,.97) 62%,rgba(7,5,10,0));
+  pointer-events:none;font-family:var(--mono);
 }
+header > *{pointer-events:auto}
 
-.hero-eyebrow{
-  font-family:var(--mono);font-size:11px;color:var(--green);
-  letter-spacing:0.2em;text-transform:uppercase;margin-bottom:20px;
-  display:inline-flex;align-items:center;gap:8px;
+/* top readout strip — the instrument row */
+.hud{
+  display:flex;align-items:center;gap:0;overflow-x:auto;scrollbar-width:none;
+  border-bottom:1px solid var(--line);background:rgba(20,14,12,.72);
+  padding:0 10px;height:30px;
 }
-.hero-eyebrow::before{content:'';display:block;width:20px;height:1px;background:var(--green)}
-.hero-eyebrow::after{content:'';display:block;width:20px;height:1px;background:var(--green)}
+.hud::-webkit-scrollbar{display:none}
+.hud .cell{display:flex;align-items:baseline;gap:6px;padding:0 11px;flex:0 0 auto;white-space:nowrap}
+.hud .cell + .cell{border-left:1px solid var(--line)}
+.hud .k{font-size:8.5px;letter-spacing:1.7px;text-transform:uppercase;color:var(--faint)}
+.hud .v{font-size:10.5px;color:var(--gold);letter-spacing:.4px}
+.hud .v.pending{color:var(--faint)}
+.hud .v.fail{color:#b8624a}
+.hud .mark{font-size:8.5px;letter-spacing:2.4px;text-transform:uppercase;color:var(--ember);
+  padding:0 11px 0 2px;flex:0 0 auto;font-weight:700}
 
-h1{
-  font-size:clamp(36px,6vw,72px);
-  font-weight:700;
-  line-height:1.05;
-  letter-spacing:-0.03em;
-  margin-bottom:20px;
-  background:linear-gradient(135deg,#fff 0%,rgba(255,255,255,0.7) 100%);
-  -webkit-background-clip:text;
-  -webkit-text-fill-color:transparent;
-  background-clip:text;
+/* control row — flat terminal buttons */
+.bar{display:flex;gap:0;border-bottom:1px solid var(--line);background:rgba(16,10,13,.6);overflow-x:auto;scrollbar-width:none}
+.bar::-webkit-scrollbar{display:none}
+.chip{
+  flex:0 0 auto;font-family:var(--mono);font-size:9.5px;letter-spacing:1.5px;text-transform:uppercase;
+  padding:8px 13px;border:0;border-right:1px solid var(--line);background:transparent;
+  color:var(--faint);cursor:pointer;
 }
+.chip:hover{color:var(--text);background:rgba(224,169,74,.06)}
+.chip[data-on="1"]{background:var(--gold);color:#0b0709;font-weight:700}
 
-h1 span{
-  background:linear-gradient(135deg,var(--gold) 0%,var(--gold2) 100%);
-  -webkit-background-clip:text;
-  -webkit-text-fill-color:transparent;
-  background-clip:text;
+.qwrap{display:flex;align-items:center;gap:8px;padding:7px 12px}
+#q{
+  flex:1;min-width:0;background:transparent;border:0;border-bottom:1px solid var(--line);
+  padding:4px 0;color:var(--text);font-family:var(--mono);font-size:11.5px;outline:none;letter-spacing:.5px;
 }
-
-.hero-sub{font-size:17px;color:var(--muted);line-height:1.7;max-width:560px;margin:0 auto 48px;font-weight:400}
-
-/* SCANNER CARD */
-.scanner-wrap{max-width:680px;margin:0 auto;padding:0 24px 80px}
-
-.scanner-card{
-  background:var(--surface);
-  border:1px solid var(--border);
-  border-radius:16px;
-  overflow:hidden;
-  position:relative;
+#q:focus{border-color:var(--gold)}
+#q::placeholder{color:var(--faint);letter-spacing:1.2px;text-transform:uppercase;font-size:9.5px}
+.iconbtn{
+  background:transparent;border:1px solid var(--line);border-radius:0;color:var(--faint);
+  font-family:var(--mono);font-size:9px;letter-spacing:1.5px;text-transform:uppercase;
+  padding:6px 10px;cursor:pointer;white-space:nowrap;
 }
+.iconbtn:hover{border-color:var(--gold);color:var(--gold)}
+.chip:focus-visible,.iconbtn:focus-visible,#q:focus-visible{outline:2px solid var(--cyan);outline-offset:2px}
 
-.scanner-card::before{
-  content:'';position:absolute;top:0;left:0;right:0;height:2px;
-  background:linear-gradient(90deg,var(--gold),var(--green),var(--blue),var(--purple));
+/* ---------- legend ---------- */
+#legend{
+  position:fixed;left:14px;bottom:14px;z-index:15;font-family:var(--mono);font-size:9.5px;
+  color:var(--faint);letter-spacing:.6px;line-height:1.9;pointer-events:none;
 }
+#legend b{color:var(--muted);font-weight:400}
+.dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px;vertical-align:1px}
 
-.scanner-inner{padding:36px 32px}
-
-.step{display:none}
-.step.active{display:block}
-
-/* STEP 1 — Company Input */
-.step-label{
-  font-family:var(--mono);font-size:10px;color:var(--muted);
-  letter-spacing:0.15em;text-transform:uppercase;margin-bottom:20px;
-  display:flex;align-items:center;gap:8px;
+/* ---------- panel ---------- */
+#panel{
+  position:fixed;z-index:30;background:var(--panel);border:1px solid var(--line);
+  display:flex;flex-direction:column;transition:transform .28s cubic-bezier(.3,.9,.3,1);
 }
-.step-label::after{content:'';flex:1;height:1px;background:var(--border)}
-
-.input-group{margin-bottom:20px}
-.input-label{font-size:12px;color:var(--muted);margin-bottom:8px;display:block;font-weight:500}
-
-.input-field{
-  width:100%;background:#080810;border:1px solid var(--border);
-  color:var(--text);padding:14px 18px;font-size:15px;
-  font-family:var(--sans);border-radius:8px;outline:none;
-  transition:border-color .2s,box-shadow .2s;
+@media (max-width:760px){
+  #panel{left:0;right:0;bottom:0;height:74vh;border-radius:18px 18px 0 0;border-bottom:0;transform:translateY(101%)}
+  #panel.open{transform:translateY(0)}
+  .grab{width:38px;height:4px;border-radius:3px;background:var(--line2);margin:9px auto 0;flex:0 0 auto}
 }
-.input-field:focus{border-color:var(--gold);box-shadow:0 0 0 3px rgba(201,168,76,0.08)}
-.input-field::placeholder{color:var(--muted)}
-
-.scan-btn{
-  width:100%;background:linear-gradient(135deg,var(--gold),var(--gold2));
-  color:#000;border:none;padding:15px;font-size:15px;font-weight:700;
-  font-family:var(--sans);border-radius:8px;cursor:pointer;
-  transition:all .2s;letter-spacing:0.02em;
-  display:flex;align-items:center;justify-content:center;gap:8px;
+@media (min-width:761px){
+  #panel{top:0;right:0;bottom:0;width:430px;border-radius:0;border-right:0;transform:translateX(101%)}
+  #panel.open{transform:translateX(0)}
+  .grab{display:none}
+  header{right:430px}
 }
-.scan-btn:hover{transform:translateY(-1px);box-shadow:0 8px 24px rgba(201,168,76,0.25)}
-.scan-btn:disabled{opacity:0.5;cursor:not-allowed;transform:none}
-
-.privacy-note{font-size:11px;color:var(--muted);text-align:center;margin-top:12px;line-height:1.6}
-
-/* STEP 2 — Scanning Animation */
-.scanning-header{text-align:center;padding:20px 0 32px}
-.scanning-title{font-size:20px;font-weight:600;margin-bottom:8px}
-.scanning-sub{font-size:13px;color:var(--muted)}
-
-.terminal{
-  background:#020208;border:1px solid var(--border);border-radius:8px;
-  padding:20px;font-family:var(--mono);font-size:12px;
-  line-height:1.9;min-height:200px;margin-bottom:24px;
-  overflow:hidden;position:relative;
+.phead{padding:16px 20px 13px;border-bottom:1px solid var(--line);flex:0 0 auto}
+.pcluster{font-family:var(--mono);font-size:9.5px;letter-spacing:1.7px;text-transform:uppercase;margin-bottom:7px}
+.phead h2{font-size:20px;font-weight:800;letter-spacing:-.4px;line-height:1.2}
+.plede{font-size:13px;color:var(--muted);margin-top:7px;line-height:1.55}
+#close{
+  position:absolute;top:12px;right:14px;background:none;border:0;color:var(--faint);
+  font-family:var(--mono);font-size:19px;cursor:pointer;padding:5px 8px;line-height:1;
 }
-
-.terminal-line{display:flex;gap:10px;opacity:0;animation:fadeIn .3s forwards}
-.terminal-line.done{opacity:1}
-.t-prompt{color:var(--gold);flex-shrink:0}
-.t-text{color:rgba(255,255,255,0.6)}
-.t-text.highlight{color:var(--green)}
-.t-text.warn{color:var(--gold)}
-.t-text.error{color:var(--red)}
-.t-cursor{display:inline-block;width:8px;height:14px;background:var(--green);animation:blink .8s infinite;vertical-align:middle;margin-left:4px}
-
-@keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
-@keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
-
-.progress-bar-wrap{background:var(--border);border-radius:4px;height:4px;overflow:hidden;margin-bottom:8px}
-.progress-bar{height:100%;background:linear-gradient(90deg,var(--gold),var(--green));border-radius:4px;width:0%;transition:width .4s ease}
-.progress-label{font-family:var(--mono);font-size:10px;color:var(--muted);text-align:right}
-
-/* STEP 3 — Results */
-.results-header{margin-bottom:28px}
-.company-badge{
-  display:inline-flex;align-items:center;gap:8px;
-  background:rgba(201,168,76,0.08);border:1px solid rgba(201,168,76,0.2);
-  padding:6px 14px;border-radius:20px;margin-bottom:16px;
+#close:hover{color:var(--text)}
+.pbody{padding:16px 20px 60px;overflow-y:auto;flex:1;-webkit-overflow-scrolling:touch}
+.pbody p{font-size:14px;color:var(--muted);line-height:1.68;margin-bottom:13px}
+.phead h2{font-family:var(--mono);letter-spacing:-.6px}
+.pbody p b{color:var(--text);font-weight:600}
+.pbody h3{
+  font-family:var(--mono);font-size:10px;letter-spacing:1.6px;text-transform:uppercase;
+  color:var(--gold);margin:22px 0 9px;
 }
-.company-badge-dot{width:6px;height:6px;background:var(--gold);border-radius:50%}
-.company-badge-name{font-family:var(--mono);font-size:11px;color:var(--gold);letter-spacing:0.05em}
-
-.results-title{font-size:22px;font-weight:700;margin-bottom:6px;letter-spacing:-0.02em}
-.results-sub{font-size:13px;color:var(--muted);line-height:1.6}
-
-/* SCORE */
-.score-ring-wrap{display:flex;align-items:center;gap:20px;margin:24px 0;padding:20px;background:var(--surface2);border-radius:10px;border:1px solid var(--border)}
-.score-ring{position:relative;width:72px;height:72px;flex-shrink:0}
-.score-ring svg{transform:rotate(-90deg)}
-.score-ring-bg{fill:none;stroke:var(--border);stroke-width:6}
-.score-ring-fill{fill:none;stroke-width:6;stroke-linecap:round;transition:stroke-dashoffset 1s ease}
-.score-number{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:16px;font-weight:700}
-.score-info h3{font-size:15px;font-weight:600;margin-bottom:4px}
-.score-info p{font-size:12px;color:var(--muted);line-height:1.5}
-
-/* BEFORE/AFTER */
-.ba-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:24px 0}
-.ba-card{border-radius:10px;padding:18px;border:1px solid}
-.ba-card.before{background:rgba(255,61,90,0.04);border-color:rgba(255,61,90,0.15)}
-.ba-card.after{background:rgba(0,229,160,0.04);border-color:rgba(0,229,160,0.15)}
-.ba-label{font-family:var(--mono);font-size:9px;letter-spacing:0.15em;text-transform:uppercase;margin-bottom:10px;font-weight:700}
-.ba-card.before .ba-label{color:var(--red)}
-.ba-card.after .ba-label{color:var(--green)}
-.ba-item{font-size:11px;color:var(--muted);padding:5px 0;border-bottom:1px solid rgba(255,255,255,0.04);display:flex;align-items:flex-start;gap:6px;line-height:1.4}
-.ba-item:last-child{border-bottom:none}
-.ba-icon{flex-shrink:0;margin-top:1px}
-
-/* CHAIN PREVIEW */
-.chain-preview{background:#020208;border:1px solid var(--border);border-radius:8px;padding:16px;margin:20px 0}
-.chain-preview-label{font-family:var(--mono);font-size:9px;color:var(--muted);letter-spacing:0.15em;text-transform:uppercase;margin-bottom:12px}
-.chain-entry{display:flex;flex-direction:column;gap:2px;padding:8px 0;border-bottom:1px solid rgba(255,255,255,0.04)}
-.chain-entry:last-child{border-bottom:none}
-.chain-entry-top{display:flex;align-items:center;gap:8px}
-.chain-decision{font-family:var(--mono);font-size:10px;font-weight:700;padding:2px 6px;border-radius:3px}
-.chain-decision.allow{background:rgba(0,229,160,0.15);color:var(--green)}
-.chain-decision.challenge{background:rgba(201,168,76,0.15);color:var(--gold)}
-.chain-decision.block{background:rgba(255,61,90,0.15);color:var(--red)}
-.chain-ts{font-family:var(--mono);font-size:9px;color:var(--muted)}
-.chain-hash{font-family:var(--mono);font-size:9px;color:rgba(255,255,255,0.2);margin-top:2px;word-break:break-all}
-.chain-connector{display:flex;align-items:center;padding:2px 0 2px 12px}
-.chain-connector-line{width:1px;height:12px;background:var(--border)}
-
-/* RISK ITEMS */
-.risk-section{margin:20px 0}
-.risk-section-title{font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em;margin-bottom:10px;font-family:var(--mono)}
-.risk-item{display:flex;align-items:flex-start;gap:10px;padding:10px 12px;border-radius:6px;margin-bottom:6px;font-size:13px;line-height:1.5}
-.risk-item.high{background:rgba(255,61,90,0.06);border:1px solid rgba(255,61,90,0.12)}
-.risk-item.medium{background:rgba(201,168,76,0.06);border:1px solid rgba(201,168,76,0.12)}
-.risk-item.low{background:rgba(0,229,160,0.06);border:1px solid rgba(0,229,160,0.12)}
-.risk-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0;margin-top:5px}
-.risk-item.high .risk-dot{background:var(--red)}
-.risk-item.medium .risk-dot{background:var(--gold)}
-.risk-item.low .risk-dot{background:var(--green)}
-
-/* CTA */
-.results-cta{
-  background:linear-gradient(135deg,rgba(201,168,76,0.1),rgba(201,168,76,0.03));
-  border:1px solid rgba(201,168,76,0.2);border-radius:10px;
-  padding:24px;margin-top:24px;text-align:center;
+.live{
+  background:var(--panel2);border:1px solid var(--line2);border-radius:11px;padding:13px 15px;margin-bottom:15px;
 }
-.results-cta h3{font-size:16px;font-weight:700;margin-bottom:6px}
-.results-cta p{font-size:13px;color:var(--muted);margin-bottom:18px;line-height:1.6}
-.cta-btn{
-  display:inline-block;background:linear-gradient(135deg,var(--gold),var(--gold2));
-  color:#000;padding:13px 28px;border-radius:8px;font-weight:700;
-  font-size:14px;text-decoration:none;transition:all .2s;border:none;cursor:pointer;font-family:var(--sans);
+.live .lbl{font-family:var(--mono);font-size:9.5px;letter-spacing:1.5px;text-transform:uppercase;color:var(--faint);margin-bottom:7px}
+.live .val{font-family:var(--mono);font-size:13px;color:var(--green);word-break:break-all;line-height:1.6}
+.live .val.pending{color:var(--faint)}
+.live .val.fail{color:var(--amber)}
+.routes{display:flex;flex-direction:column;gap:7px;margin-bottom:6px}
+.routes a{
+  font-family:var(--mono);font-size:12px;color:var(--cyan);text-decoration:none;
+  background:var(--panel2);border:1px solid var(--line2);border-radius:9px;padding:10px 12px;
+  display:flex;justify-content:space-between;gap:10px;align-items:center;
 }
-.cta-btn:hover{transform:translateY(-1px);box-shadow:0 8px 24px rgba(201,168,76,0.3)}
-.email-sent-note{font-size:11px;color:var(--green);margin-top:10px;font-family:var(--mono)}
+.routes a:hover{border-color:var(--cyan)}
+.routes a span{color:var(--faint);font-size:10px;flex:0 0 auto}
+.limit{
+  border-left:2px solid var(--amber);background:rgba(240,179,84,.05);
+  padding:12px 14px;border-radius:0 9px 9px 0;margin-bottom:15px;
+}
+.limit .lbl{font-family:var(--mono);font-size:9.5px;letter-spacing:1.5px;text-transform:uppercase;color:var(--amber);margin-bottom:6px}
+.limit p{font-size:13px;margin:0;color:var(--muted)}
+.links{display:flex;flex-wrap:wrap;gap:7px;margin-top:4px}
+.links button{
+  font-family:var(--mono);font-size:11px;background:var(--panel2);border:1px solid var(--line2);
+  border-radius:20px;padding:6px 12px;color:var(--muted);cursor:pointer;
+}
+.links button:hover{border-color:var(--gold);color:var(--text)}
 
-/* STATS STRIP */
-.stats-strip{display:flex;justify-content:center;gap:32px;padding:40px 24px;flex-wrap:wrap}
-.strip-stat{text-align:center}
-.strip-n{font-family:var(--mono);font-size:22px;color:var(--gold);font-weight:700}
-.strip-l{font-size:11px;color:var(--muted);margin-top:2px}
+#toast{
+  position:fixed;left:50%;bottom:22px;transform:translate(-50%,20px);z-index:40;
+  background:var(--panel);border:1px solid var(--line2);border-radius:9px;
+  padding:9px 15px;font-family:var(--mono);font-size:11.5px;color:var(--muted);
+  opacity:0;pointer-events:none;transition:.25s;
+}
+#toast.show{opacity:1;transform:translate(-50%,0)}
 
-/* ERROR */
-.scan-error{background:rgba(255,61,90,0.06);border:1px solid rgba(255,61,90,0.2);border-radius:8px;padding:16px;font-size:13px;color:var(--red);margin-top:16px;display:none;font-family:var(--mono)}
-.scan-error.show{display:block}
-
-@media(max-width:600px){
-  .scanner-inner{padding:24px 20px}
-  .ba-grid{grid-template-columns:1fr}
-  .stats-strip{gap:20px}
-  h1{font-size:36px}
+@media (prefers-reduced-motion:reduce){
+  *{transition-duration:.01ms!important;animation-duration:.01ms!important}
 }
 </style>
 </head>
 <body>
 
-<nav>
-  <a href="/" class="nav-logo">sebbi.pro</a>
-  <a href="/ai-standard" style="font-family:monospace;font-size:11px;color:#c9a84c;text-decoration:none;letter-spacing:0.05em">ai.txt Standard ↗</a>
-  <a href="/" class="nav-back">← Back to AILeash</a>
-</nav>
+<div id="stage"><canvas id="c"></canvas></div>
 
-<div class="hero">
-  <div class="hero-eyebrow">AI Compliance Scanner</div>
-  <h1>Find out if a regulator<br>knocked today, <span>could you answer?</span></h1>
-  <p class="hero-sub">Enter your company name. We'll research your AI exposure, generate a personalised compliance report, and show you exactly what your system looks like with and without AILeash in place.</p>
+<header>
+  <div class="hud" id="hud">
+    <div class="mark">sebbi.pro × systems whitepaper × v8</div>
+    <div class="cell"><span class="k">chain</span><span class="v pending" data-hud="tip">····</span></div>
+    <div class="cell"><span class="k">roster</span><span class="v pending" data-hud="roster">····</span></div>
+    <div class="cell"><span class="k">anchor</span><span class="v pending" data-hud="ots">····</span></div>
+    <div class="cell"><span class="k">keys</span><span class="v pending" data-hud="keys">····</span></div>
+    <div class="cell"><span class="k">nodes</span><span class="v" id="hudn">36</span></div>
+  </div>
+  <div class="bar" id="chips"></div>
+  <div class="qwrap">
+    <input id="q" placeholder="search the system" autocomplete="off" spellcheck="false" aria-label="Search the system">
+    <button class="iconbtn" id="reset">recentre</button>
+  </div>
+</header>
+
+<div id="legend">
+  <div><span class="dot" style="background:var(--ember)"></span><b>tap any node</b> — the whole system, one piece at a time</div>
+  <div><span class="dot" style="background:var(--gold)"></span><b>tap any node</b> — panel opens with routes to check it</div>
+  <div><span class="dot" style="background:var(--ember)"></span><b>lit filament</b> — one part depends on another</div>
 </div>
 
-<div class="scanner-wrap">
-  <div class="scanner-card">
-    <div class="scanner-inner">
-
-      <!-- STEP 1: INPUT -->
-      <div class="step active" id="step1">
-        <div class="step-label">Step 1 of 2 — Your Details</div>
-
-        <div class="input-group">
-          <label class="input-label">Company or Platform Name</label>
-          <input class="input-field" type="text" id="company-input" placeholder="e.g. Acme Financial, GameZone, MyCo Ltd" autocomplete="organization">
-        </div>
-
-        <div class="input-group">
-          <label class="input-label">Your Email Address</label>
-          <input class="input-field" type="email" id="email-input" placeholder="you@company.com" autocomplete="email">
-        </div>
-
-        <div class="input-group">
-          <label class="input-label">Industry <span style="color:var(--muted);font-weight:400">(optional — improves accuracy)</span></label>
-          <select class="input-field" id="industry-input">
-            <option value="">Select your industry...</option>
-            <option value="financial services">Financial Services / Banking</option>
-            <option value="healthcare">Healthcare / MedTech</option>
-            <option value="gaming">Gaming / Entertainment</option>
-            <option value="ecommerce">E-commerce / Retail</option>
-            <option value="HR and recruitment">HR / Recruitment</option>
-            <option value="legal">Legal / Professional Services</option>
-            <option value="government">Government / Public Sector</option>
-            <option value="telecommunications">Telecommunications</option>
-            <option value="education">Education / EdTech</option>
-            <option value="insurance">Insurance</option>
-            <option value="other">Other</option>
-          </select>
-        </div>
-
-        <button class="scan-btn" id="scan-btn" onclick="startScan()">
-          <span>Run My Free Compliance Scan</span>
-          <span>→</span>
-        </button>
-        <div class="scan-error" id="scan-error"></div>
-        <p class="privacy-note">🔒 Your data is never shared. Report delivered to your inbox within 60 seconds.</p>
-      </div>
-
-      <!-- STEP 2: SCANNING -->
-      <div class="step" id="step2">
-        <div class="scanning-header">
-          <div class="scanning-title" id="scanning-title">Scanning <span id="scanning-company" style="color:var(--gold)"></span></div>
-          <div class="scanning-sub">Researching your company and generating your personalised report...</div>
-        </div>
-
-        <div class="terminal" id="terminal"></div>
-
-        <div class="progress-bar-wrap">
-          <div class="progress-bar" id="progress-bar"></div>
-        </div>
-        <div class="progress-label" id="progress-label">0%</div>
-      </div>
-
-      <!-- STEP 3: RESULTS -->
-      <div class="step" id="step3">
-        <div class="results-header">
-          <div class="company-badge">
-            <div class="company-badge-dot"></div>
-            <div class="company-badge-name" id="result-company-badge"></div>
-          </div>
-          <div class="results-title">Your AI Compliance Report</div>
-          <div class="results-sub" id="result-intro"></div>
-        </div>
-
-        <!-- SCORE -->
-        <div class="score-ring-wrap">
-          <div class="score-ring">
-            <svg width="72" height="72" viewBox="0 0 72 72">
-              <circle class="score-ring-bg" cx="36" cy="36" r="30"/>
-              <circle class="score-ring-fill" id="score-ring-fill" cx="36" cy="36" r="30" stroke-dasharray="188.5" stroke-dashoffset="188.5"/>
-            </svg>
-            <div class="score-number" id="score-number">0</div>
-          </div>
-          <div class="score-info">
-            <h3 id="score-title">Calculating...</h3>
-            <p id="score-desc"></p>
-          </div>
-        </div>
-
-        <!-- RISK ITEMS -->
-        <div class="risk-section">
-          <div class="risk-section-title">// Compliance Gaps Identified</div>
-          <div id="risk-items"></div>
-        </div>
-
-        <!-- BEFORE / AFTER -->
-        <div class="risk-section-title" style="margin-top:24px;font-family:var(--mono);font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em">// Before &amp; After AILeash</div>
-        <div class="ba-grid">
-          <div class="ba-card before">
-            <div class="ba-label">✗ Without AILeash</div>
-            <div id="before-items"></div>
-          </div>
-          <div class="ba-card after">
-            <div class="ba-label">✓ With AILeash</div>
-            <div id="after-items"></div>
-          </div>
-        </div>
-
-        <!-- SAMPLE AUDIT CHAIN -->
-        <div class="chain-preview">
-          <div class="chain-preview-label">// Sample Audit Chain — <span id="chain-company-name"></span></div>
-          <div id="chain-entries"></div>
-        </div>
-
-        <!-- REGULATOR CALLOUT -->
-        <div style="background:rgba(77,159,255,0.05);border:1px solid rgba(77,159,255,0.15);border-radius:10px;padding:18px;margin:20px 0">
-          <div style="font-family:var(--mono);font-size:10px;color:var(--blue);letter-spacing:0.12em;text-transform:uppercase;margin-bottom:8px">// If a Regulator Contacted You Today</div>
-          <div style="font-size:13px;color:rgba(255,255,255,0.7);line-height:1.7" id="regulator-text"></div>
-        </div>
-
-        <!-- CTA -->
-        <div class="results-cta">
-          <h3>Start your audit chain now. Free.</h3>
-          <p>90 days free. No card required. Your first SHA-256 audit block generated in under 10 minutes.</p>
-          <a href="/#signup" class="cta-btn">Get Your Free API Key →</a>
-          <div class="email-sent-note" id="email-sent-note"></div>
-        </div>
-
-        <div style="text-align:center;margin-top:20px">
-          <button onclick="resetScanner()" style="background:none;border:none;color:var(--muted);font-size:12px;cursor:pointer;font-family:var(--sans);text-decoration:underline">Scan another company</button>
-        </div>
-      </div>
-
-    </div>
+<aside id="panel" aria-live="polite">
+  <div class="grab"></div>
+  <div class="phead">
+    <button id="close" aria-label="Close">×</button>
+    <div class="pcluster" id="pcluster"></div>
+    <h2 id="ptitle"></h2>
+    <div class="plede" id="plede"></div>
   </div>
+  <div class="pbody" id="pbody"></div>
+</aside>
 
-  <div class="stats-strip">
-    <div class="strip-stat"><div class="strip-n">SHA-256</div><div class="strip-l">Merkle Chain</div></div>
-    <div class="strip-stat"><div class="strip-n">28ms</div><div class="strip-l">Per Decision</div></div>
-    <div class="strip-stat"><div class="strip-n">50p</div><div class="strip-l">Per Device / Month</div></div>
-    <div class="strip-stat"><div class="strip-n">Art. 9·12·13·14</div><div class="strip-l">EU AI Act Coverage Map</div></div>
-  </div>
-</div>
+<div id="toast"></div>
 
 <script>
-var companyName = '';
-var userEmail = '';
-var scanResult = null;
-
-function showStep(n) {
-  document.querySelectorAll('.step').forEach(function(s){ s.classList.remove('active'); });
-  document.getElementById('step' + n).classList.add('active');
-}
-
-function startScan() {
-  companyName = document.getElementById('company-input').value.trim();
-  userEmail = document.getElementById('email-input').value.trim();
-  var industry = document.getElementById('industry-input').value;
-  var errEl = document.getElementById('scan-error');
-
-  errEl.classList.remove('show');
-
-  if (!companyName) {
-    errEl.textContent = 'Please enter your company name.';
-    errEl.classList.add('show');
-    return;
-  }
-  if (!userEmail || !userEmail.includes('@')) {
-    errEl.textContent = 'Please enter a valid email address.';
-    errEl.classList.add('show');
-    return;
-  }
-
-  document.getElementById('scanning-company').textContent = companyName;
-  showStep(2);
-  runScan(companyName, userEmail, industry);
-}
-
-function addTerminalLine(prompt, text, cls, delay) {
-  return new Promise(function(resolve) {
-    setTimeout(function() {
-      var terminal = document.getElementById('terminal');
-      var line = document.createElement('div');
-      line.className = 'terminal-line';
-      line.innerHTML = '<span class="t-prompt">' + prompt + '</span><span class="t-text ' + (cls||'') + '">' + text + '</span>';
-      terminal.appendChild(line);
-      terminal.scrollTop = terminal.scrollHeight;
-      resolve();
-    }, delay);
-  });
-}
-
-function setProgress(pct, delay) {
-  return new Promise(function(resolve) {
-    setTimeout(function() {
-      document.getElementById('progress-bar').style.width = pct + '%';
-      document.getElementById('progress-label').textContent = pct + '%';
-      resolve();
-    }, delay);
-  });
-}
-
-async function runScan(company, email, industry) {
-  var terminal = document.getElementById('terminal');
-  terminal.innerHTML = '';
-
-  await addTerminalLine('>', 'Initialising compliance scanner...', '', 100);
-  await setProgress(5, 200);
-  await addTerminalLine('>', 'Target: ' + company, 'highlight', 600);
-  await addTerminalLine('>', 'Checking EU AI Act exposure...', '', 1000);
-  await setProgress(20, 1200);
-  await addTerminalLine('>', 'Analysing industry risk profile...', '', 1800);
-  await setProgress(35, 2000);
-  await addTerminalLine('>', 'Running Article 9 risk assessment...', 'warn', 2600);
-  await addTerminalLine('>', 'Running Article 12 audit chain check...', 'warn', 3000);
-  await addTerminalLine('>', 'Running Article 14 authority &amp; oversight check...', 'warn', 3200);
-  await setProgress(55, 3400);
-  await addTerminalLine('>', 'Generating personalised compliance report...', '', 3900);
-  await setProgress(70, 4100);
-  await addTerminalLine('>', 'Building sample audit chain for ' + company + '...', 'highlight', 4700);
-  await setProgress(85, 4900);
-
-  // Call AI API
-  try {
-    var aiResult = await generateReport(company, industry);
-    scanResult = aiResult;
-
-    await addTerminalLine('>', 'Report complete. Sending to ' + email + '...', 'highlight', 5100);
-    await setProgress(95, 5300);
-
-    // Send notification email to Justin + report to user
-    sendEmails(company, email, industry, aiResult);
-
-    await setProgress(100, 5900);
-    await addTerminalLine('>', 'Done. Displaying results...', 'highlight', 6100);
-
-    setTimeout(function() {
-      showResults(company, email, aiResult);
-    }, 6600);
-
-  } catch(e) {
-    await addTerminalLine('>', 'Generating report from compliance database...', 'highlight', 5100);
-    await setProgress(100, 5600);
-    var fallback = getFallbackReport(company, industry);
-    scanResult = fallback;
-    sendEmails(company, email, industry, fallback);
-    setTimeout(function() {
-      showResults(company, email, fallback);
-    }, 6100);
-  }
-}
-
-async function generateReport(company, industry) {
-  var industryCtx = industry ? ' They operate in the ' + industry + ' sector.' : '';
-  var prompt = 'You are an EU AI Act compliance expert. Analyse the company "' + company + '" for AI compliance risk.' + industryCtx + ' AILeash capabilities to reference where relevant: tamper-evident SHA-256 audit chain, ALLOW/CHALLENGE/BLOCK decisions in 28ms, gapless receipts, delegated-authority tokens (Article 14 human oversight), KYC result sealing with zero personal data held, and per-decision jurisdiction tagging. Generate a JSON compliance report with exactly this structure (respond with ONLY valid JSON, no markdown, no explanation):\n{\n  "score": <number 0-100, lower is worse>,\n  "score_title": "<2-3 word verdict>",\n  "score_desc": "<one sentence explaining the score>",\n  "industry_detected": "<detected or inferred industry>",\n  "intro": "<2 sentences about this specific company\'s AI compliance situation, personalised>",\n  "risks": [\n    {"level": "high", "text": "<specific risk for this company>"},\n    {"level": "high", "text": "<specific risk>"},\n    {"level": "medium", "text": "<specific risk>"},\n    {"level": "medium", "text": "<specific risk>"},\n    {"level": "low", "text": "<positive finding or minor gap>"}\n  ],\n  "before": ["<what they lack 1>", "<what they lack 2>", "<what they lack 3>", "<what they lack 4>"],\n  "after": ["<what AILeash gives them 1>", "<what AILeash gives them 2>", "<what AILeash gives them 3>", "<what AILeash gives them 4>"],\n  "sample_decisions": [\n    {"action": "<AI decision type for this company>", "decision": "ALLOW"},\n    {"action": "<AI decision type for this company>", "decision": "CHALLENGE"},\n    {"action": "<AI decision type for this company>", "decision": "ALLOW"}\n  ],\n  "regulator_text": "<2 sentences: what happens if a regulator contacts this specific company today without AILeash, then what happens with AILeash in place>"\n}';
-
-  var response = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'anthropic-version': '2023-06-01',
-      'anthropic-dangerous-direct-browser-access': 'true'
-    },
-    body: JSON.stringify({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 1000,
-      messages: [{role: 'user', content: prompt}]
-    })
-  });
-
-  var data = await response.json();
-  var text = data.content && data.content[0] ? data.content[0].text : '';
-  text = text.replace(/```json|```/g, '').trim();
-  return JSON.parse(text);
-}
-
-function getFallbackReport(company, industry) {
-  var ind = industry || 'technology';
-  return {
-    score: 24,
-    score_title: 'Critical Gaps',
-    score_desc: 'Significant compliance infrastructure missing before August 2026 deadline.',
-    industry_detected: ind,
-    intro: company + ' operates AI systems that fall under EU AI Act obligations. Without a tamper-evident audit chain, you have no mechanism to demonstrate compliance to a regulator.',
-    risks: [
-      {level:'high', text:'No tamper-evident audit chain for AI decisions — direct Article 12 violation'},
-      {level:'high', text:'No documented risk management system for AI — Article 9 exposure'},
-      {level:'medium', text:'No attributable human-oversight pathway — approvals lack provable authority (Article 14 exposure)'},
-      {level:'medium', text:'No real-time ALLOW/CHALLENGE/BLOCK governance layer in place'},
-      {level:'low', text:'Decisions not tagged with applicable jurisdiction — cross-border obligations unmapped'}
-    ],
-    before: ['No audit trail', 'Cannot prove AI decisions to regulators', 'Approvals without provable authority', 'Fines up to 3% global turnover'],
-    after: ['SHA-256 chain with gapless receipts from day one', 'Delegated-authority tokens — Article 14 oversight, sealed', 'KYC outcomes provable with zero personal data held', 'Every decision jurisdiction-tagged and regulator-ready'],
-    sample_decisions: [
-      {action: 'ai_content_decision', decision: 'ALLOW'},
-      {action: 'user_risk_assessment', decision: 'CHALLENGE'},
-      {action: 'automated_action', decision: 'ALLOW'}
-    ],
-    regulator_text: 'Without AILeash, ' + company + ' would have no cryptographic evidence of AI governance — an Ofcom or ICO investigation could result in fines and enforcement action. With AILeash in place, you can produce a complete, tamper-evident audit log of every AI decision — who authorised it, which rules applied, and proof nothing was altered since.'
-  };
-}
-
-function generateHash(str) {
-  var hash = 0;
-  for (var i = 0; i < str.length; i++) {
-    var char = str.charCodeAt(i);
-    hash = ((hash << 5) - hash) + char;
-    hash = hash & hash;
-  }
-  return Math.abs(hash).toString(16).padStart(8,'0') + Math.random().toString(16).slice(2,10) + Math.random().toString(16).slice(2,10);
-}
-
-function showResults(company, email, report) {
-  showStep(3);
-
-  document.getElementById('result-company-badge').textContent = company.toUpperCase();
-  document.getElementById('result-intro').textContent = report.intro;
-
-  // Score ring
-  var score = report.score || 24;
-  var circumference = 188.5;
-  var offset = circumference - (score / 100) * circumference;
-  var fill = document.getElementById('score-ring-fill');
-  var scoreNum = document.getElementById('score-number');
-
-  var scoreColor = score < 40 ? '#ff3d5a' : score < 70 ? '#c9a84c' : '#00e5a0';
-  fill.style.stroke = scoreColor;
-  scoreNum.style.color = scoreColor;
-
-  setTimeout(function() {
-    fill.style.strokeDashoffset = offset;
-    scoreNum.textContent = score;
-  }, 200);
-
-  document.getElementById('score-title').textContent = report.score_title;
-  document.getElementById('score-desc').textContent = report.score_desc;
-
-  // Risk items
-  var risksHtml = '';
-  (report.risks || []).forEach(function(r) {
-    risksHtml += '<div class="risk-item ' + r.level + '"><div class="risk-dot"></div><div>' + r.text + '</div></div>';
-  });
-  document.getElementById('risk-items').innerHTML = risksHtml;
-
-  // Before/after
-  var beforeHtml = '';
-  (report.before || []).forEach(function(b) {
-    beforeHtml += '<div class="ba-item"><span class="ba-icon" style="color:#ff3d5a">✗</span><span>' + b + '</span></div>';
-  });
-  document.getElementById('before-items').innerHTML = beforeHtml;
-
-  var afterHtml = '';
-  (report.after || []).forEach(function(a) {
-    afterHtml += '<div class="ba-item"><span class="ba-icon" style="color:#00e5a0">✓</span><span>' + a + '</span></div>';
-  });
-  document.getElementById('after-items').innerHTML = afterHtml;
-
-  // Sample chain
-  document.getElementById('chain-company-name').textContent = company;
-  var chainHtml = '';
-  var prevHash = 'GENESIS';
-  var decisions = report.sample_decisions || [{action:'ai_decision',decision:'ALLOW'},{action:'risk_check',decision:'CHALLENGE'},{action:'content_flag',decision:'ALLOW'}];
-
-  decisions.forEach(function(d, i) {
-    var hash = generateHash(company + d.action + i);
-    var ts = new Date(Date.now() - (decisions.length - i) * 1847).toISOString();
-    chainHtml += '<div class="chain-entry">';
-    chainHtml += '<div class="chain-entry-top">';
-    chainHtml += '<span class="chain-decision ' + d.decision.toLowerCase() + '">' + d.decision + '</span>';
-    chainHtml += '<span class="chain-ts">' + ts + '</span>';
-    chainHtml += '</div>';
-    chainHtml += '<div class="chain-hash">sha256: ' + hash + ' ← ' + (i === 0 ? 'GENESIS' : 'prev') + '</div>';
-    chainHtml += '</div>';
-    if (i < decisions.length - 1) {
-      chainHtml += '<div class="chain-connector"><div class="chain-connector-line"></div></div>';
-    }
-    prevHash = hash;
-  });
-  document.getElementById('chain-entries').innerHTML = chainHtml;
-
-  // Regulator text
-  document.getElementById('regulator-text').textContent = report.regulator_text;
-
-  // Email sent note
-  document.getElementById('email-sent-note').textContent = '✓ Full report sent to ' + email;
-}
-
-function sendEmails(company, email, industry, report) {
-  // Send lead notification to Justin via sebbi.pro contact endpoint
-  var scoreText = report.score || 'N/A';
-  var riskSummary = (report.risks || []).filter(function(r){return r.level==='high';}).map(function(r){return r.text;}).join('; ');
-
-  var justinMsg = 'SCANNER LEAD\n\nCompany: ' + company + '\nEmail: ' + email + '\nIndustry: ' + (industry || report.industry_detected || 'Unknown') + '\nCompliance Score: ' + scoreText + '/100\nHigh Risks: ' + riskSummary;
-
-  fetch('/contact', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({
-      name: company,
-      email: email,
-      phone: '',
-      org: company,
-      message: justinMsg
-    })
-  }).catch(function(){});
-
-  // Send report email to user via /signup endpoint (triggers welcome-style email)
-  // We use a custom endpoint approach — the contact form captures the lead
-  // A second call sends the user their report summary
-  var userMsg = 'COMPLIANCE REPORT REQUEST\n\nCompany: ' + company + '\nScore: ' + scoreText + '/100\nTop risk: ' + (report.risks && report.risks[0] ? report.risks[0].text : 'See full report') + '\n\nRegulator situation: ' + (report.regulator_text || '');
-
-  fetch('/contact', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({
-      name: 'Scanner Report for ' + company,
-      email: 'justrightdecorators@gmail.com',
-      phone: email,
-      org: company + ' [SCANNER LEAD — reply to: ' + email + ']',
-      message: userMsg
-    })
-  }).catch(function(){});
-}
-
-function resetScanner() {
-  document.getElementById('company-input').value = '';
-  document.getElementById('email-input').value = '';
-  document.getElementById('industry-input').value = '';
-  document.getElementById('scan-error').classList.remove('show');
-  document.getElementById('terminal').innerHTML = '';
-  document.getElementById('progress-bar').style.width = '0%';
-  document.getElementById('progress-label').textContent = '0%';
-  showStep(1);
-}
-</script>
-
-</body>
-</html>
-
-```
-
-
-## `seal.html`
-
-83 lines, 4894 bytes
-
-```html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Seal a post — sebbi.pro</title>
-<style>
-  :root{--ink:#0a0f1e;--ink2:#10182e;--gold:#c9a84c;--ok:#7fe3b0;--err:#ff8a80;}
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{background:var(--ink);color:#fff;font-family:system-ui,sans-serif;min-height:100vh;padding:24px}
-  .wrap{max-width:620px;margin:0 auto}
-  .brand{font-family:monospace;font-size:10px;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,0.35)}
-  h1{font-family:Georgia,serif;font-size:26px;color:var(--gold);margin:14px 0 6px}
-  .sub{font-size:13.5px;color:rgba(255,255,255,0.5);line-height:1.7;margin-bottom:22px}
-  textarea{width:100%;min-height:200px;background:var(--ink2);border:1px solid rgba(201,168,76,0.35);color:#fff;border-radius:8px;padding:14px;font-size:14px;font-family:inherit;line-height:1.6;outline:none;resize:vertical}
-  textarea:focus{border-color:var(--gold)}
-  button{width:100%;margin-top:14px;background:var(--gold);color:var(--ink);border:none;border-radius:8px;padding:16px;font-size:16px;font-weight:800;cursor:pointer}
-  button:disabled{opacity:0.5}
-  #result{display:none;margin-top:20px;border-radius:10px;padding:26px;text-align:left}
-  #result.ok{display:block;background:rgba(127,227,176,0.08);border:2px solid var(--ok)}
-  #result.err{display:block;background:rgba(255,138,128,0.08);border:2px solid var(--err)}
-  #result .big{font-size:22px;font-weight:900;font-family:Georgia,serif;margin-bottom:10px;text-align:center}
-  #result.ok .big{color:var(--ok)}
-  #result.err .big{color:var(--err)}
-  #result .detail{font-family:monospace;font-size:12px;color:rgba(255,255,255,0.75);line-height:2;word-break:break-all}
-  #result .code{font-size:18px;color:var(--gold);font-weight:700}
-  .note{margin-top:22px;font-size:12px;color:rgba(255,255,255,0.35);line-height:1.8}
-  .note b{color:var(--gold);font-weight:600}
-  a{color:var(--gold)}
-</style>
-</head>
-<body>
-<div class="wrap">
-  <div class="brand">sebbi.pro &middot; live chain sealing</div>
-  <h1>Seal this post into the chain.</h1>
-  <div class="sub">Paste the exact final text of your post below — the way you're about to publish it, without the footer line. This fingerprints it (SHA-256, computed in your own browser) and seals that fingerprint into the live audit chain. Change even one letter afterwards and it will no longer match.</div>
-
-  <textarea id="txt" placeholder="Paste your finished post text here..."></textarea>
-  <button id="go" onclick="sealPost()">Seal this post &rarr;</button>
-
-  <div id="result"></div>
-
-  <div class="note"><b>How this works:</b> your text never leaves your browser — only its fingerprint is sealed. Once sealed, add the verification line it gives you to the end of your post before publishing, so readers can check it at <a href="/verify-post">sebbi.pro/verify-post</a>.<br><br>This is the same engine that seals AI decisions for platforms. <a href="/">Free for 90 days &rarr;</a></div>
-</div>
-
-<script>
-async function sha256hex(s){
-  var buf=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(s));
-  return Array.from(new Uint8Array(buf)).map(function(b){return b.toString(16).padStart(2,"0");}).join("");
-}
-async function sealPost(){
-  var raw=document.getElementById("txt").value;
-  var res=document.getElementById("result");
-  var btn=document.getElementById("go");
-  if(!raw.trim()){res.className="err";res.style.display="block";res.innerHTML="<div class='big'>Paste some text first</div>";return;}
-  btn.disabled=true;btn.textContent="Sealing\u2026";
-  try{
-    var text=raw.trim();
-    var hash=await sha256hex(text);
-    var r=await fetch("/api/post/seal",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({fingerprint:hash})});
-    var d=await r.json();
-    if(!d.sealed){
-      res.className="err";res.style.display="block";
-      res.innerHTML="<div class='big'>Sealing failed</div><div class='detail'>"+(d.error||"Unknown error")+"</div>";
-    }else{
-      var when=new Date(d.sealed_at*1000).toLocaleString("en-GB");
-      var code=(d.code||hash.slice(0,12));
-      res.className="ok";res.style.display="block";
-      res.innerHTML="<div class='big'>"+(d.already_registered?"Already sealed":"\u2713 SEALED")+"</div>"
-        +"<div class='detail'>Block #"+d.block_index+"<br>Sealed "+when+"<br>Fingerprint "+hash+"<br><br>"
-        +"<b>Add this line to the end of your post:</b><br>\uD83D\uDD17 Post sealed \u00b7 verify at sebbi.pro/verify-post<br><br>"
-        +"<span class='code'>Verification code: "+code+"</span></div>";
-    }
-  }catch(e){
-    res.className="err";res.style.display="block";
-    res.innerHTML="<div class='big'>Network error</div><div class='detail'>"+e+"</div>";
-  }
-  btn.disabled=false;btn.textContent="Seal this post \u2192";
-}
-</script>
-</body>
-</html>
-
-```
-
-
-## `sentinel.html`
-
-485 lines, 52351 bytes
-
-```html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>AILeash Sentinel &mdash; Real-Time Fraud &amp; Anomaly Detection &mdash; sebbi.pro</title>
-<meta name="description" content="AILeash Sentinel watches your platform 24 hours a day. Real-time fraud detection, velocity monitoring, trust decay scoring. Every alert sealed into a SHA-256 audit chain. 50p per device per month.">
-<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;800;900&family=DM+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-:root{--navy:#0a0f1e;--purple:#7c3aed;--purple-light:#a78bfa;--white:#fff;--green:#00ff88;--red:#cc0000;--gold:#c9a84c;--cyan:#00d4ff;--mono:'JetBrains Mono',monospace;--sans:'DM Sans',sans-serif;--display:'Playfair Display',serif}
-html,body{background:var(--navy);color:var(--white);font-family:var(--sans);overflow-x:hidden}
-html{scroll-behavior:smooth}
-nav{position:fixed;top:0;left:0;right:0;z-index:100;background:rgba(10,15,30,0.97);backdrop-filter:blur(12px);padding:0 48px;height:68px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid rgba(124,58,237,0.2)}
-.nav-logo{font-family:var(--display);font-size:20px;color:var(--white);font-weight:900;text-decoration:none}.nav-logo span{color:var(--purple-light)}
-.nav-links{display:flex;gap:16px;align-items:center}
-.nav-links a{color:rgba(255,255,255,0.4);text-decoration:none;font-size:13px;font-weight:500;transition:color .2s}.nav-links a:hover{color:var(--white)}
-.nav-cta{background:var(--purple)!important;color:var(--white)!important;padding:9px 18px;font-weight:700!important;border-radius:4px}
-.alert-bar{background:var(--purple);padding:10px 48px;margin-top:68px;text-align:center;font-family:var(--mono);font-size:11px;color:var(--white);letter-spacing:1px;text-transform:uppercase}
-.alert-bar strong{color:#ffd700}
-.hero{padding:60px 48px 80px;position:relative;overflow:hidden;text-align:center;border-bottom:1px solid rgba(124,58,237,0.15)}
-.hero::before{content:'';position:absolute;inset:0;background:radial-gradient(ellipse at 50% 40%,rgba(124,58,237,0.08) 0%,transparent 65%)}
-.hero::after{content:'';position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,var(--purple-light),transparent)}
-.hero-inner{max-width:860px;margin:0 auto;position:relative;z-index:1}
-.eyebrow{font-family:var(--mono);font-size:11px;letter-spacing:3px;text-transform:uppercase;color:var(--purple-light);margin-bottom:20px;display:block}
-h1{font-family:var(--display);font-size:clamp(32px,5vw,64px);line-height:1.05;font-weight:900;margin-bottom:20px}
-h1 em{color:var(--purple-light);font-style:normal}
-.hero-sub{font-size:17px;color:rgba(255,255,255,0.4);line-height:1.8;max-width:640px;margin:0 auto 36px}
-.hero-sub strong{color:var(--white)}
-.sound-toggle{display:inline-flex;align-items:center;gap:10px;background:rgba(124,58,237,0.08);border:1px solid rgba(124,58,237,0.2);border-radius:40px;padding:10px 20px;cursor:pointer;margin-bottom:28px;transition:all .2s;font-family:var(--mono);font-size:11px;letter-spacing:1px;text-transform:uppercase;color:var(--purple-light)}
-.sound-toggle:hover{background:rgba(124,58,237,0.15)}
-.terminal{background:rgba(0,0,0,0.6);border:1px solid rgba(124,58,237,0.2);border-radius:8px;overflow:hidden;text-align:left;margin-bottom:40px}
-.terminal-bar{background:rgba(124,58,237,0.04);padding:12px 20px;border-bottom:1px solid rgba(124,58,237,0.1);display:flex;align-items:center;gap:8px}
-.t-dot{width:10px;height:10px;border-radius:50%}
-.t-dot-r{background:#ff5f57}.t-dot-y{background:#febc2e}.t-dot-g{background:#28c840}
-.t-title{font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.2);letter-spacing:2px;text-transform:uppercase;margin-left:8px}
-.terminal-body{padding:24px 28px 28px;min-height:240px;max-height:50vh;overflow-y:auto}
-.terminal-body::-webkit-scrollbar{width:3px}.terminal-body::-webkit-scrollbar-thumb{background:rgba(124,58,237,0.2);border-radius:2px}
-.t-line{font-family:var(--mono);font-size:12px;line-height:2;display:flex;align-items:flex-start;gap:10px;opacity:0;transform:translateY(4px);transition:opacity .25s,transform .25s}
-.t-line.show{opacity:1;transform:none}
-.t-prompt{color:rgba(124,58,237,0.5);flex-shrink:0}
-.t-text{color:rgba(255,255,255,0.75);flex:1}
-.t-purple{color:var(--purple-light)}.t-green{color:var(--green)}.t-gold{color:var(--gold)}.t-red{color:#ff6b6b}.t-dim{color:rgba(255,255,255,0.2)}.t-cyan{color:var(--cyan)}
-.t-hash{color:var(--green);font-size:11px;word-break:break-all;line-height:1.6}
-.t-section{font-family:var(--mono);font-size:9px;letter-spacing:3px;text-transform:uppercase;color:rgba(124,58,237,0.25);padding:8px 0 4px;border-top:1px solid rgba(255,255,255,0.04);margin-top:4px;opacity:0;transition:opacity .3s}
-.t-section.show{opacity:1}
-.verdict{display:none;padding:24px 28px;border-top:1px solid rgba(124,58,237,0.1);background:rgba(0,0,0,0.3)}
-.verdict.show{display:block}
-.verdict-decision{font-family:var(--display);font-size:48px;font-weight:900;line-height:1;margin-bottom:6px;color:var(--green)}
-.verdict-score{font-family:var(--mono);font-size:11px;color:rgba(255,255,255,0.25);margin-bottom:16px}
-.verdict-hash-label{font-family:var(--mono);font-size:9px;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,0.15);margin-bottom:6px}
-.verdict-hash{font-family:var(--mono);font-size:11px;color:var(--green);word-break:break-all;background:rgba(0,0,0,0.3);padding:10px 12px;border-radius:4px;margin-bottom:8px;line-height:1.6}
-.verdict-sealed{font-family:var(--mono);font-size:10px;color:rgba(124,58,237,0.5)}
-.btn-purple{background:var(--purple);color:var(--white);padding:14px 28px;border:none;font-family:var(--sans);font-weight:700;font-size:14px;cursor:pointer;text-decoration:none;border-radius:4px;display:inline-block;transition:all .2s}.btn-purple:hover{background:#6d28d9;transform:translateY(-2px)}
-.btn-ghost{background:transparent;color:rgba(255,255,255,0.4);padding:14px 28px;border:1px solid rgba(255,255,255,0.1);font-family:var(--sans);font-weight:600;font-size:14px;cursor:pointer;text-decoration:none;border-radius:4px;display:inline-block;transition:all .2s;margin-left:10px}.btn-ghost:hover{color:var(--white);border-color:rgba(255,255,255,0.3)}
-.sec{padding:80px 48px;border-bottom:1px solid rgba(255,255,255,0.05)}
-.sec-inner{max-width:1100px;margin:0 auto}
-.sec-eyebrow{font-family:var(--mono);font-size:10px;letter-spacing:3px;text-transform:uppercase;color:rgba(124,58,237,0.5);margin-bottom:16px;display:block}
-h2{font-family:var(--display);font-size:clamp(26px,3.5vw,44px);font-weight:900;line-height:1.1;margin-bottom:16px}
-h2 em{color:var(--purple-light);font-style:normal}
-.sec-sub{font-size:15px;color:rgba(255,255,255,0.35);line-height:1.8;max-width:580px;margin-bottom:48px}
-.video-sec{padding:80px 48px;background:rgba(0,0,0,0.3);border-bottom:1px solid rgba(124,58,237,0.08)}
-.video-inner{max-width:900px;margin:0 auto;text-align:center}
-.advert-stage{width:100%;aspect-ratio:16/9;position:relative;background:#000;border-radius:8px;overflow:hidden;border:1px solid rgba(124,58,237,0.2)}
-.ad-scene{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;opacity:0;transition:opacity 0.8s;padding:40px}
-.ad-scene.active{opacity:1}
-.ad-line{font-family:var(--display);font-size:clamp(14px,3.5vw,52px);font-weight:900;color:#fff;text-align:center;line-height:1.2;opacity:0;transform:translateY(16px);transition:opacity .5s,transform .5s;margin-bottom:8px}
-.ad-line.show{opacity:1;transform:none}
-.ad-line.purple{color:var(--purple-light)}.ad-line.green{color:var(--green)}.ad-line.red{color:var(--red)}.ad-line.gold{color:var(--gold)}
-.ad-terminal{background:rgba(0,0,0,0.7);border:1px solid rgba(124,58,237,0.25);border-radius:6px;width:85%;padding:0;overflow:hidden}
-.ad-tm-bar{background:rgba(124,58,237,0.04);padding:8px 16px;border-bottom:1px solid rgba(124,58,237,0.1);display:flex;gap:6px;align-items:center}
-.ad-tm-dot{width:8px;height:8px;border-radius:50%}
-.ad-tm-body{padding:16px 20px;display:flex;flex-direction:column;gap:0}
-.ad-tm-line{font-family:monospace;font-size:clamp(8px,1.2vw,14px);line-height:1.9;display:flex;gap:8px;opacity:0;transition:opacity .3s}
-.ad-tm-line.show{opacity:1}
-.ad-big{font-family:var(--display);font-size:clamp(40px,10vw,110px);font-weight:900;line-height:1;opacity:0;transform:scale(0.7);transition:opacity .5s,transform .5s}
-.ad-big.show{opacity:1;transform:scale(1)}
-.ad-small{font-family:monospace;font-size:clamp(8px,1.2vw,14px);color:rgba(255,255,255,0.3);letter-spacing:2px;text-transform:uppercase;margin-top:8px;opacity:0;transition:opacity .5s}
-.ad-small.show{opacity:1}
-.ad-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;width:88%}
-.ad-card{border-left:3px solid;padding:12px 16px;opacity:0;transform:translateX(-16px);transition:opacity .4s,transform .4s}
-.ad-card.show{opacity:1;transform:none}
-.ad-card-label{font-family:monospace;font-size:clamp(7px,0.9vw,10px);letter-spacing:2px;text-transform:uppercase;margin-bottom:4px;opacity:0.7}
-.ad-card-text{font-size:clamp(10px,1.4vw,15px);color:rgba(255,255,255,0.8);font-weight:700;line-height:1.3}
-.ad-card-fine{font-family:monospace;font-size:clamp(7px,0.8vw,10px);color:rgba(255,255,255,0.3);margin-top:4px}
-.ad-progress{position:absolute;bottom:0;left:0;right:0;height:3px;background:rgba(255,255,255,0.05)}
-.ad-progress-bar{height:100%;background:linear-gradient(90deg,var(--purple),var(--cyan));width:0%;transition:width .1s linear}
-.ad-controls{display:flex;gap:10px;justify-content:center;margin-top:16px}
-.ad-ctrl{background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);color:rgba(255,255,255,0.5);padding:8px 16px;border-radius:4px;cursor:pointer;font-family:var(--mono);font-size:10px;letter-spacing:1px;text-transform:uppercase;transition:all .2s}.ad-ctrl:hover{background:rgba(255,255,255,0.12);color:var(--white)}
-.features-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:2px;background:rgba(255,255,255,0.04);margin-top:40px}
-.feat{background:var(--navy);padding:32px 24px;border-top:3px solid var(--purple)}
-.feat-icon{font-size:28px;margin-bottom:12px}
-.feat h3{font-family:var(--display);font-size:18px;font-weight:900;color:var(--white);margin-bottom:8px}
-.feat p{font-size:13px;color:rgba(255,255,255,0.4);line-height:1.7}
-.feat-badge{font-family:var(--mono);font-size:9px;letter-spacing:2px;text-transform:uppercase;margin-top:10px;padding:3px 8px;border-radius:2px;display:inline-block;color:var(--purple-light);background:rgba(124,58,237,0.08);border:1px solid rgba(124,58,237,0.2)}
-.use-cases{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;margin-top:40px}
-.use-card{background:rgba(255,255,255,0.02);border:1px solid rgba(124,58,237,0.1);border-radius:6px;padding:24px}
-.use-card h3{font-family:var(--display);font-size:17px;font-weight:900;color:var(--white);margin-bottom:8px}
-.use-card p{font-size:13px;color:rgba(255,255,255,0.4);line-height:1.7}
-.use-earn{font-family:var(--display);font-size:28px;color:var(--purple-light);font-weight:900;margin-top:12px}
-.use-earn-label{font-family:var(--mono);font-size:9px;color:rgba(255,255,255,0.2);letter-spacing:1px;text-transform:uppercase}
-.pricing-sec{padding:80px 48px;border-bottom:4px solid var(--purple)}
-.pricing-inner{max-width:700px;margin:0 auto;text-align:center}
-.price-big{font-family:var(--display);font-size:96px;font-weight:900;color:var(--purple-light);line-height:1;margin-bottom:4px}
-.price-per{font-family:var(--mono);font-size:11px;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,0.2);margin-bottom:32px}
-.price-includes{display:flex;flex-direction:column;gap:10px;text-align:left;margin-bottom:32px;max-width:500px;margin-left:auto;margin-right:auto}
-.pi{display:flex;align-items:center;gap:10px;font-size:14px;color:rgba(255,255,255,0.5)}
-.pi::before{content:'OK';font-family:var(--mono);font-size:9px;font-weight:700;color:var(--purple-light);flex-shrink:0}
-.signup-sec{padding:80px 48px}
-.signup-inner{max-width:520px;margin:0 auto;text-align:center}
-.signup-inner p{font-size:15px;color:rgba(255,255,255,0.35);line-height:1.7;margin-bottom:32px}
-.fg{margin-bottom:12px;text-align:left}
-.fg label{display:block;font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.25);letter-spacing:2px;text-transform:uppercase;margin-bottom:6px}
-.fg input,.fg select{width:100%;background:rgba(255,255,255,0.05);border:2px solid rgba(255,255,255,0.08);color:var(--white);padding:12px 14px;font-size:14px;font-family:var(--sans);outline:none;border-radius:4px;transition:border-color .2s}
-.fg input:focus,.fg select:focus{border-color:var(--purple)}
-.fg input::placeholder{color:rgba(255,255,255,0.2)}
-.fg select option{background:var(--navy)}
-.fg-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-.btn-full{width:100%;padding:14px;font-size:15px;font-weight:700;border-radius:4px;border:none;cursor:pointer;font-family:var(--sans);transition:all .2s;background:var(--purple);color:var(--white);margin-top:8px}
-.btn-full:hover{background:#6d28d9}
-.key-box{display:none;margin-top:24px;background:rgba(0,0,0,0.4);border:1px solid rgba(124,58,237,0.2);border-radius:6px;padding:24px;text-align:left}
-.key-box.show{display:block}
-.key-lbl{font-family:var(--mono);font-size:9px;letter-spacing:2px;color:var(--purple-light);margin-bottom:8px;text-transform:uppercase}
-.key-val{font-family:var(--mono);font-size:11px;color:var(--green);word-break:break-all;background:rgba(0,0,0,0.3);padding:10px;border-radius:4px;margin-bottom:12px}
-.ref-box{background:rgba(124,58,237,0.06);border:1px solid rgba(124,58,237,0.2);border-radius:4px;padding:16px}
-.ref-code{font-family:var(--display);font-size:24px;color:var(--purple-light);font-weight:900;margin:6px 0}
-.ref-desc{font-size:12px;color:rgba(255,255,255,0.35);line-height:1.6}
-.msg-err{display:none;color:#ff6b6b;font-family:var(--mono);font-size:11px;margin-top:10px;padding:10px;background:rgba(255,0,0,0.08);border-radius:4px;border:1px solid rgba(255,0,0,0.2)}
-.msg-err.show{display:block}
-footer{background:rgba(0,0,0,0.4);padding:48px;border-top:1px solid rgba(255,255,255,0.04)}
-.foot-inner{max-width:1100px;margin:0 auto;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:20px}
-.foot-logo{font-family:var(--display);font-size:18px;color:var(--white);font-weight:900;text-decoration:none}.foot-logo span{color:var(--purple-light)}
-.foot-links{display:flex;gap:24px;flex-wrap:wrap}
-.foot-links a{color:rgba(255,255,255,0.2);text-decoration:none;font-size:12px;transition:color .2s}.foot-links a:hover{color:var(--white)}
-.foot-copy{font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.1);width:100%;margin-top:16px;padding-top:16px;border-top:1px solid rgba(255,255,255,0.04)}
-@media(max-width:900px){
-  nav{padding:0 20px}.alert-bar{padding:10px 20px}
-  .nav-links a:not(.nav-cta){display:none}
-  .hero,.sec,.video-sec,.pricing-sec,.signup-sec{padding-left:20px!important;padding-right:20px!important}
-  .features-grid,.use-cases,.fg-row,.ad-grid{grid-template-columns:1fr!important}
-  footer{padding:36px 20px}.foot-inner{flex-direction:column;align-items:flex-start}
-  .btn-ghost{margin-left:0;margin-top:10px;display:block}
-}
-</style>
-</head>
-<body>
-<nav>
-  <a href="https://sebbi.pro" class="nav-logo">Monop <span>Content</span></a>
-  <div class="nav-links">
-    <a href="https://sebbi.pro/#products">All Products</a>
-    <a href="https://sebbi.pro/reseller">Reseller</a>
-    <a href="https://sebbi.pro/contact">Contact</a>
-    <a href="#signup" class="nav-cta">Get Sentinel Free</a>
-  </div>
-</nav>
-
-<div class="alert-bar"><strong>Fraud costs UK businesses £1.8 billion a year.</strong> &nbsp; Sentinel catches it before the damage is done. &nbsp; <strong>50p per device per month.</strong></div>
-
-<section class="hero">
-  <div class="hero-inner">
-    <span class="eyebrow">AILeash Sentinel &mdash; Fraud &amp; Anomaly Detection &mdash; sebbi.pro</span>
-    <h1>Your platform is being attacked<br><em>right now.</em></h1>
-    <p class="hero-sub">Sentinel watches every user, every session, every transaction — 24 hours a day. <strong>Fraud flagged before the damage is done.</strong> Every alert sealed into a cryptographic chain. Admissible as fraud evidence in court.</p>
-    <button class="sound-toggle" id="sound-toggle" onclick="toggleSound()"><span id="sound-icon">&#128266;</span><span id="sound-label">Sound On &mdash; Tap to mute</span></button>
-    <div class="terminal">
-      <div class="terminal-bar">
-        <div class="t-dot t-dot-r"></div><div class="t-dot t-dot-y"></div><div class="t-dot t-dot-g"></div>
-        <span class="t-title">AILeash Sentinel &mdash; Live Session Scan &mdash; Fraud Monitor Active</span>
-      </div>
-      <div class="terminal-body" id="terminal-body"></div>
-      <div class="verdict" id="verdict">
-        <div class="verdict-decision" id="v-decision">ALLOW</div>
-        <div class="verdict-score" id="v-score"></div>
-        <div class="verdict-hash-label">Audit Hash &mdash; SHA-256 &mdash; Sealed &mdash; Fraud Evidence Ready</div>
-        <div class="verdict-hash" id="v-hash"></div>
-        <div class="verdict-sealed" id="v-sealed"></div>
-      </div>
-    </div>
-    <div style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap">
-      <a href="#signup" class="btn-purple">Get Free Sentinel API Key &rarr;</a>
-      <a href="#video" class="btn-ghost">Watch The Demo</a>
-    </div>
-  </div>
-</section>
-
-<section class="video-sec" id="video">
-  <div class="video-inner">
-    <span class="sec-eyebrow">Sentinel &mdash; 60 Second Demo</span>
-    <h2 style="font-family:var(--display);font-size:clamp(26px,3.5vw,44px);font-weight:900;margin-bottom:16px">Watch a fraud attack<br><em>get caught in real time.</em></h2>
-    <p style="font-size:15px;color:rgba(255,255,255,0.35);line-height:1.8;max-width:580px;margin:0 auto 32px">This is what Sentinel does. Every second. On every platform. Before the money is gone.</p>
-    <div class="advert-stage" id="advert-stage">
-      <div class="ad-scene" id="as1" style="background:#000">
-        <div class="ad-line purple" id="as1a">500 requests.</div>
-        <div class="ad-line purple" id="as1b">60 seconds.</div>
-        <div class="ad-line purple" id="as1c">One account.</div>
-        <div class="ad-line" id="as1d" style="margin-top:24px;font-size:clamp(12px,2vw,28px);color:rgba(255,255,255,0.4)">Without Sentinel,</div>
-        <div class="ad-line red" id="as1e">you find out days later.</div>
-      </div>
-      <div class="ad-scene" id="as2" style="background:#0a0f1e">
-        <div style="font-family:Georgia,serif;font-size:clamp(14px,2.5vw,28px);font-weight:900;color:#fff;margin-bottom:16px;text-align:center">Sentinel <span style="color:var(--purple-light)">catches it instantly.</span></div>
-        <div class="ad-terminal">
-          <div class="ad-tm-bar">
-            <div class="ad-tm-dot" style="background:#ff5f57"></div><div class="ad-tm-dot" style="background:#febc2e"></div><div class="ad-tm-dot" style="background:#28c840"></div>
-            <span style="font-family:monospace;font-size:clamp(7px,1vw,11px);color:rgba(255,255,255,0.2);letter-spacing:2px;text-transform:uppercase;margin-left:8px">Sentinel &mdash; Real-Time Fraud Detection</span>
-          </div>
-          <div class="ad-tm-body">
-            <div class="ad-tm-line" id="atl1"><span style="color:rgba(124,58,237,0.5)">&gt;</span><span style="color:rgba(255,255,255,0.7)">ALERT: user_789 &mdash; <span style="color:#ff6b6b">velocity spike detected</span></span></div>
-            <div class="ad-tm-line" id="atl2"><span style="color:rgba(124,58,237,0.5)">&gt;</span><span style="color:rgba(255,255,255,0.7)">60s window: <span style="color:#ff6b6b">487 requests &mdash; threshold: 60</span></span></div>
-            <div class="ad-tm-line" id="atl3"><span style="color:rgba(124,58,237,0.5)">&gt;</span><span style="color:rgba(255,255,255,0.7)">Country shift: <span style="color:#ff6b6b">GB to NG &mdash; account takeover signal</span></span></div>
-            <div class="ad-tm-line" id="atl4"><span style="color:rgba(124,58,237,0.5)">&gt;</span><span style="color:rgba(255,255,255,0.7)">Trust score: <span style="color:#ff6b6b">0.0341 &mdash; critically low</span></span></div>
-            <div class="ad-tm-line" id="atl5"><span style="color:rgba(124,58,237,0.5)">&gt;</span><span style="color:rgba(255,255,255,0.7)">Risk score: <span style="color:#ff6b6b">0.9187</span> &mdash; 9 signals triggered</span></div>
-            <div class="ad-tm-line" id="atl6"><span style="color:rgba(124,58,237,0.5)">&gt;</span><span style="color:rgba(255,255,255,0.9);font-weight:700;font-size:1.1em;letter-spacing:2px">Decision: <span style="color:#cc0000">BLOCK</span></span></div>
-            <div class="ad-tm-line" id="atl7"><span style="color:rgba(124,58,237,0.5)">&gt;</span><span style="color:var(--green)">Alert sent &mdash; fraud evidence package sealed &mdash; audit hash locked</span></div>
-            <div class="ad-tm-line" id="atl8"><span style="color:rgba(124,58,237,0.5)">&gt;</span><span style="color:var(--green)">Time from first signal to block: 847ms</span></div>
-          </div>
-        </div>
-      </div>
-      <div class="ad-scene" id="as3" style="background:#0a0f1e">
-        <div style="text-align:center">
-          <div class="ad-big red" id="ad-block" style="color:#cc0000">BLOCKED</div>
-          <div class="ad-small" id="ad-block-sub">847ms from first signal &mdash; evidence sealed &mdash; admissible in court</div>
-          <div style="font-family:monospace;font-size:clamp(8px,1vw,12px);color:var(--purple-light);margin-top:16px;opacity:0;transition:opacity .5s" id="ad-saved">Before the money left. Before the data was stolen. Before the damage was done.</div>
-        </div>
-      </div>
-      <div class="ad-scene" id="as4" style="background:#0a0f1e">
-        <div style="font-family:Georgia,serif;font-size:clamp(14px,2.8vw,32px);font-weight:900;color:#fff;margin-bottom:20px;text-align:center;opacity:0;transition:opacity .5s" id="as4-title">Sentinel watches <span style="color:var(--purple-light)">everything.</span></div>
-        <div class="ad-grid">
-          <div class="ad-card" id="ac1" style="border-color:var(--purple-light);background:rgba(124,58,237,0.04)"><div class="ad-card-label" style="color:var(--purple-light)">Velocity Monitoring</div><div class="ad-card-text">60s, 5m, 1h windows. Burst attacks caught instantly.</div><div class="ad-card-fine">Threshold breach triggers immediate BLOCK</div></div>
-          <div class="ad-card" id="ac2" style="border-color:var(--gold);background:rgba(201,168,76,0.04)"><div class="ad-card-label" style="color:var(--gold)">Trust Decay</div><div class="ad-card-text">EWMA scoring across all sessions. Bad actors identified before they act.</div><div class="ad-card-fine">Score persists across every session</div></div>
-          <div class="ad-card" id="ac3" style="border-color:var(--cyan);background:rgba(0,212,255,0.04)"><div class="ad-card-label" style="color:var(--cyan)">Account Takeover</div><div class="ad-card-text">Country shift detection. New device. Behaviour change. ATO stopped cold.</div><div class="ad-card-fine">Real-time cross-session comparison</div></div>
-          <div class="ad-card" id="ac4" style="border-color:var(--green);background:rgba(0,255,136,0.04)"><div class="ad-card-label" style="color:var(--green)">Evidence Chain</div><div class="ad-card-text">Every alert sealed into SHA-256 chain. Admissible. FCA compliant.</div><div class="ad-card-fine">50p per device per month</div></div>
-        </div>
-      </div>
-      <div class="ad-scene" id="as5" style="background:#000">
-        <div style="font-family:var(--display);font-size:clamp(28px,7vw,88px);font-weight:900;color:#fff;text-align:center;opacity:0;transition:opacity .8s" id="ad-cta-logo">AILeash <span style="color:var(--purple-light)">Sentinel</span></div>
-        <div style="font-family:monospace;font-size:clamp(12px,2.5vw,28px);color:rgba(255,255,255,0.4);text-align:center;margin-top:8px;opacity:0;transition:opacity .8s" id="ad-cta-url">sebbi.pro/sentinel</div>
-        <div style="font-size:clamp(10px,1.5vw,18px);color:rgba(255,255,255,0.2);text-align:center;margin-top:12px;font-style:italic;opacity:0;transition:opacity .8s" id="ad-cta-tag">Fraud caught before the damage is done. From 50p per device per month.</div>
-      </div>
-      <div class="ad-progress"><div class="ad-progress-bar" id="ad-progress-bar"></div></div>
-    </div>
-    <div class="ad-controls">
-      <button class="ad-ctrl" onclick="restartAd()">&#9654; Play Again</button>
-      <button class="ad-ctrl" id="ad-sound-btn" onclick="toggleAdSound()">&#128266; Sound On</button>
-    </div>
-  </div>
-</section>
-
-<section class="sec">
-  <div class="sec-inner">
-    <span class="sec-eyebrow">What Sentinel Does</span>
-    <h2>Watches. Detects. Blocks.<br><em>Before the damage is done.</em></h2>
-    <p class="sec-sub">Sentinel is not a dashboard you check. It is an engine that watches your platform every second and acts the moment something goes wrong.</p>
-    <div class="features-grid">
-      <div class="feat"><div class="feat-icon">&#9889;</div><h3>Real-Time Velocity</h3><p>Three monitoring windows — 60 seconds, 5 minutes, 1 hour. Burst attacks, bot floods and scripted fraud all spike the 60-second window. Slower attacks get caught in the 5-minute or hourly window. Nothing gets through.</p><div class="feat-badge">Three windows</div></div>
-      <div class="feat"><div class="feat-icon">&#128200;</div><h3>EWMA Trust Decay</h3><p>Every user builds a trust score across all their sessions. A single BLOCK event drops it fast. It rebuilds slowly over time. Bad actors cannot reset their score by clearing cookies or changing device.</p><div class="feat-badge">Cross-session</div></div>
-      <div class="feat"><div class="feat-icon">&#127757;</div><h3>Account Takeover Detection</h3><p>Country shift between sessions is one of the strongest account takeover signals. Sentinel flags it immediately. New device combined with unusual behaviour. Atypical transaction amounts. All caught.</p><div class="feat-badge">ATO detection</div></div>
-      <div class="feat"><div class="feat-icon">&#128276;</span></div><h3>Instant Alerts</h3><p>The moment Sentinel triggers a BLOCK it fires an alert. Email. Push notification. Whatever your platform uses. You know about it in seconds. Not hours. Not days. Seconds.</p><div class="feat-badge">Sub-second alert</div></div>
-      <div class="feat"><div class="feat-icon">&#128196;</div><h3>Fraud Evidence Package</h3><p>Every BLOCK generates a structured evidence package. SHA-256 sealed. Timestamped. Signal breakdown included. Admissible as fraud evidence in court. FCA compliant. Ready to hand to your legal team.</p><div class="feat-badge">Court admissible</div></div>
-      <div class="feat"><div class="feat-icon">&#128279;</div><h3>SHA-256 Audit Chain</h3><p>Every decision — ALLOW, CHALLENGE, BLOCK — sealed into the Merkle chain. Your entire fraud history is cryptographically verifiable. Nobody can alter it retrospectively. Not even you.</p><div class="feat-badge">Immutable</div></div>
-    </div>
-  </div>
-</section>
-
-<section class="sec" style="background:rgba(0,0,0,0.2)">
-  <div class="sec-inner">
-    <span class="sec-eyebrow">Who Needs Sentinel</span>
-    <h2>If money moves on your platform,<br><em>you need this.</em></h2>
-    <p class="sec-sub">Anywhere users transact, authenticate, or interact at scale — Sentinel is watching.</p>
-    <div class="use-cases">
-      <div class="use-card"><h3>&#128222; Call Centres</h3><p>Caller scored before the agent picks up. Velocity across previous calls. Country of origin. Device fingerprint. Trust history. Fraud flagged before a word is spoken.</p><div class="use-earn">847ms</div><div class="use-earn-label">from first signal to block</div></div>
-      <div class="use-card"><h3>&#127968; Fintech &amp; Banking</h3><p>Every transaction scored across 9 signals. High-value anomalies flagged immediately. Account takeover detected from country shift and velocity. Every decision sealed and FCA-admissible.</p><div class="use-earn">0.9+</div><div class="use-earn-label">risk score on genuine fraud</div></div>
-      <div class="use-card"><h3>&#128717; E-Commerce</h3><p>Bot attacks, credential stuffing, card testing — all caught in the velocity windows. Trust decay identifies repeat bad actors. Every block generates an evidence package for chargebacks.</p><div class="use-earn">3x</div><div class="use-earn-label">windows catch what single checks miss</div></div>
-      <div class="use-card"><h3>&#127918; Gaming Platforms</h3><p>Account farming, gold selling, exploit abuse — all show characteristic velocity patterns. Sentinel catches them automatically. Every banned account has a sealed evidence trail.</p><div class="use-earn">60s</div><div class="use-earn-label">velocity window catches burst abuse</div></div>
-      <div class="use-card"><h3>&#127970; Insurance</h3><p>Claim fraud detected from anomaly signals. Unusual behaviour patterns flagged. Every underwriting AI decision sealed into the audit chain. FCA and EU AI Act satisfied simultaneously.</p><div class="use-earn">9</div><div class="use-earn-label">signals scoring every claim decision</div></div>
-      <div class="use-card"><h3>&#128187; SaaS Platforms</h3><p>API abuse, scraping attacks, credential stuffing — Sentinel catches them all. Rate limiting with intelligence, not just counts. Trust decay ensures bad actors stay flagged across sessions.</p><div class="use-earn">1h</div><div class="use-earn-label">window catches sustained slow attacks</div></div>
-    </div>
-  </div>
-</section>
-
-<section class="pricing-sec">
-  <div class="pricing-inner">
-    <span class="sec-eyebrow">Pricing</span>
-    <h2>One price.<br><em>24-hour fraud protection.</em></h2>
-    <p style="font-size:15px;color:rgba(255,255,255,0.35);line-height:1.75;margin-bottom:40px">Fraud costs UK businesses £1.8 billion a year. Sentinel costs 50p per device per month.</p>
-    <div class="price-big">50p</div>
-    <div class="price-per">per device per month &mdash; billed via stripe</div>
-    <div class="price-includes">
-      <div class="pi">Real-time velocity monitoring &mdash; 60s, 5m, 1h windows</div>
-      <div class="pi">EWMA trust decay scoring across all sessions</div>
-      <div class="pi">Account takeover detection &mdash; country shift and device change</div>
-      <div class="pi">Instant alerts &mdash; email and push on every BLOCK</div>
-      <div class="pi">SHA-256 fraud evidence package on every block decision</div>
-      <div class="pi">Full audit chain &mdash; FCA compliant &mdash; admissible in court</div>
-      <div class="pi">EU AI Act Articles 9, 12, 13, 14 satisfied automatically</div>
-      <div class="pi">100 free decisions &mdash; no card required to start</div>
-      <div class="pi">Referral code &mdash; earn 10p per device you refer forever</div>
-    </div>
-    <a href="#signup" class="btn-purple" style="display:inline-block;padding:16px 36px;font-size:16px">Get Free Sentinel API Key &rarr;</a>
-  </div>
-</section>
-
-<section class="signup-sec" id="signup">
-  <div class="signup-inner">
-    <span class="sec-eyebrow" style="color:rgba(124,58,237,0.5)">Get Started</span>
-    <h2>Free API key.<br><em>Sentinel running in 60 seconds.</em></h2>
-    <p>No card. No contract. 100 free decisions. Your key in under a minute.</p>
-    <div class="fg-row">
-      <div class="fg"><label>First Name</label><input type="text" id="fn" placeholder="Justin"></div>
-      <div class="fg"><label>Last Name</label><input type="text" id="ln" placeholder="Smith"></div>
-    </div>
-    <div class="fg"><label>Email Address</label><input type="email" id="em" placeholder="you@company.com"></div>
-    <div class="fg"><label>Phone Number</label><input type="tel" id="ph" placeholder="+44 7700 000000"></div>
-    <div class="fg"><label>Company or Platform Name</label><input type="text" id="org" placeholder="e.g. MyPlatform Ltd"></div>
-    <div class="fg"><label>Platform Type</label>
-      <select id="platform">
-        <option value="fintech">Fintech / Banking</option>
-        <option value="callcentre">Call Centre</option>
-        <option value="ecommerce">E-Commerce</option>
-        <option value="gaming">Gaming</option>
-        <option value="insurance">Insurance</option>
-        <option value="saas">SaaS Platform</option>
-        <option value="other">Other</option>
-      </select>
-    </div>
-    <button class="btn-full" onclick="doSignup()">Get Free Sentinel API Key &rarr;</button>
-    <div class="msg-err" id="msg-err"></div>
-    <div class="key-box" id="key-box">
-      <div class="key-lbl">Your Sentinel API Key &mdash; Save This Now</div>
-      <div class="key-val" id="key-val"></div>
-      <div class="ref-box">
-        <div class="key-lbl">Your Referral Code</div>
-        <div class="ref-code" id="ref-code-display">REF-XXXX-0000</div>
-        <div class="ref-desc">Every device signed up using this code earns you 10p per month forever.</div>
-      </div>
-      <div style="font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.3);margin-top:16px;line-height:1.9;background:rgba(124,58,237,0.04);border:1px solid rgba(124,58,237,0.1);border-radius:4px;padding:12px">
-        Redirecting to Stripe to set up billing&hellip;<br>100 free decisions active now.
-      </div>
-    </div>
-  </div>
-</section>
-
-<footer>
-  <div class="foot-inner">
-    <a href="https://sebbi.pro" class="foot-logo">Monop <span>Content</span></a>
-    <div class="foot-links">
-      <a href="https://sebbi.pro/#products">All Products</a>
-      <a href="https://sebbi.pro/aileash">AILeash</a>
-      <a href="https://sebbi.pro/guardian-app">Guardian</a>
-      <a href="https://sebbi.pro/sonicboom">SonicBoom</a>
-      <a href="https://sebbi.pro/reseller">Reseller</a>
-      <a href="https://sebbi.pro/contact">Contact Justin</a>
-    </div>
-    <div class="foot-copy">&copy; 2026 Monop Content &middot; Justin Antony Dobson &middot; Blyth, Northumberland, UK &middot; justin@monopcontent.com &middot; 07908 269428</div>
-  </div>
-</footer>
-
-<script>
-var soundOn=true,adSoundOn=true;
-var synth=window.speechSynthesis,voices=[],speechQueue=[],isSpeaking=false;
-function loadVoices(){voices=synth?synth.getVoices():[];}
-if(synth){synth.onvoiceschanged=loadVoices;loadVoices();}
-function toggleSound(){soundOn=!soundOn;document.getElementById('sound-icon').textContent=soundOn?'\uD83D\uDD0A':'\uD83D\uDD07';document.getElementById('sound-label').textContent=soundOn?'Sound On \u2014 Tap to mute':'Sound Off \u2014 Tap to enable';if(!soundOn&&synth){synth.cancel();speechQueue=[];isSpeaking=false;}}
-function toggleAdSound(){adSoundOn=!adSoundOn;document.getElementById('ad-sound-btn').textContent=adSoundOn?'\uD83D\uDD0A Sound On':'\uD83D\uDD07 Sound Off';if(!adSoundOn&&synth){synth.cancel();speechQueue=[];isSpeaking=false;}}
-function getVoice(){if(!voices.length)return null;var d=voices.find(function(v){return/daniel|george|arthur|oliver/i.test(v.name)&&v.lang.startsWith('en');});var u=voices.find(function(v){return v.lang==='en-GB';});var e=voices.find(function(v){return v.lang.startsWith('en');});return d||u||e||null;}
-function processQueue(){if(!synth||speechQueue.length===0||isSpeaking)return;isSpeaking=true;var item=speechQueue.shift();var utt=new SpeechSynthesisUtterance(item.text);utt.pitch=0.65;utt.rate=0.90;utt.volume=1.0;var v=getVoice();if(v)utt.voice=v;utt.onend=function(){isSpeaking=false;setTimeout(processQueue,150);};utt.onerror=function(){isSpeaking=false;setTimeout(processQueue,150);};synth.speak(utt);}
-function speak(text,forAd){if(forAd&&!adSoundOn)return;if(!forAd&&!soundOn)return;if(!synth||!text)return;speechQueue.push({text:text});processQueue();}
-function speakNow(text){if(!soundOn||!synth||!text)return;synth.cancel();speechQueue=[];isSpeaking=false;speechQueue.push({text:text});processQueue();}
-async function getHash(data){try{var buf=new TextEncoder().encode(JSON.stringify(data));var hb=await crypto.subtle.digest('SHA-256',buf);return Array.from(new Uint8Array(hb)).map(function(b){return b.toString(16).padStart(2,'0');}).join('');}catch(e){var h=0,s=JSON.stringify(data)+Date.now();for(var i=0;i<s.length;i++){h=((h<<5)-h)+s.charCodeAt(i);h=(h|0);}var a=Math.abs(h);return[a,a*31,a*17,a*7].map(function(n){return Math.abs(n).toString(16).padStart(8,'0');}).join('');}}
-var tb;
-function addLine(id,prompt,html,spoken,delay){return new Promise(function(resolve){setTimeout(function(){var ex=document.getElementById(id);if(ex)ex.remove();var div=document.createElement('div');div.className='t-line';div.id=id;div.innerHTML='<span class="t-prompt">'+prompt+'</span><span class="t-text">'+html+'</span>';tb.appendChild(div);setTimeout(function(){div.classList.add('show');if(spoken)speak(spoken,false);tb.scrollTop=tb.scrollHeight;},30);resolve();},delay);});}
-function addSection(id,label,delay){return new Promise(function(resolve){setTimeout(function(){var div=document.createElement('div');div.className='t-section';div.id=id;div.textContent='--- '+label+' ---';tb.appendChild(div);setTimeout(function(){div.classList.add('show');tb.scrollTop=tb.scrollHeight;},30);resolve();},delay);});}
-async function getIPGeo(){var r={city:'Unknown',country:'Unknown',countryCode:'??',isp:'Unknown',ip:'Unknown'};try{var res=await fetch('https://ipapi.co/json/');var d=await res.json();if(d&&d.ip&&!d.error){r.ip=d.ip;r.city=d.city||'Unknown';r.country=d.country_name||'Unknown';r.countryCode=d.country_code||'??';r.isp=d.org||'Unknown';return r;}}catch(e){}try{var res2=await fetch('https://ip-api.com/json/?fields=status,city,country,countryCode,isp,query');var d2=await res2.json();if(d2&&d2.status==='success'){r.ip=d2.query;r.city=d2.city||'Unknown';r.country=d2.country||'Unknown';r.countryCode=d2.countryCode||'??';r.isp=d2.isp||'Unknown';}}catch(e){}return r;}
-async function getGPS(){return new Promise(function(resolve){if(!navigator.geolocation){resolve(null);return;}navigator.geolocation.getCurrentPosition(function(p){resolve({lat:p.coords.latitude,lng:p.coords.longitude,accuracy:Math.round(p.coords.accuracy)});},function(){resolve(null);},{timeout:6000,maximumAge:60000});});}
-async function reverseGeocode(lat,lng){try{var r=await fetch('https://nominatim.openstreetmap.org/reverse?lat='+lat+'&lon='+lng+'&format=json');var d=await r.json();if(d&&d.address){var a=d.address;return[a.town||a.city||a.village||'',a.county||'',a.country||''].filter(Boolean).join(', ');}}catch(e){}return null;}
-async function runScan(){
-  tb=document.getElementById('terminal-body');
-  var ts=Date.now(),ua=navigator.userAgent;
-  var isMobile=/Mobile|Android|iPhone|iPad/i.test(ua);
-  var deviceType=isMobile?'Mobile':'Desktop';
-  var browser='Unknown',bv='';
-  var cm=ua.match(/Chrome\/([\d]+)/),fm=ua.match(/Firefox\/([\d]+)/),em2=ua.match(/Edg\/([\d]+)/);
-  if(em2){browser='Edge';bv=em2[1];}else if(cm&&!/Edge/i.test(ua)){browser='Chrome';bv=cm[1];}else if(fm){browser='Firefox';bv=fm[1];}
-  var os='Unknown';
-  var am=ua.match(/Android ([\d.]+)/),im=ua.match(/OS ([\d_]+)/),wm=ua.match(/Windows NT/);
-  if(am){os='Android';}else if(/iPhone|iPad/.test(ua)&&im){os='iOS';}else if(wm){os='Windows';}else if(/Mac/i.test(ua)){os='macOS';}else if(/Linux/i.test(ua)){os='Linux';}
-  var cpuCores=navigator.hardwareConcurrency||null,ram=navigator.deviceMemory||null;
-  var tz=Intl.DateTimeFormat().resolvedOptions().timeZone||'Unknown';
-  var localTime=new Date().toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit',hour12:false});
-  var firstVisit=!localStorage.getItem('se_visit');if(firstVisit)localStorage.setItem('se_visit',ts);
-  var visitCount=parseInt(localStorage.getItem('se_count')||'0')+1;localStorage.setItem('se_count',visitCount);
-  var battery=null,charging=null;
-  try{if(navigator.getBattery){var b=await navigator.getBattery();battery=Math.round(b.level*100);charging=b.charging;}}catch(e){}
-  var connType=null;try{var conn=navigator.connection||navigator.mozConnection||navigator.webkitConnection;if(conn)connType=conn.effectiveType||conn.type||null;}catch(e){}
-  var gpsPromise=getGPS(),ipGeoPromise=getIPGeo();
-  var delay=0,step=280;
-  speakNow('Welcome. This is AILeash Sentinel. The fraud and anomaly detection engine built by Monop Content. Right now, while I scan your session, Sentinel is watching every user on every platform that has deployed it. Every request. Every transaction. Every session. Nothing gets through.');
-  await addLine('tl-intro','>','<span class="t-dim">AILeash Sentinel v5.0.0 &mdash; Fraud and Anomaly Detection &mdash; 24hr Monitor Active</span>',null,delay);delay+=step;
-  await addSection('sec-device','Session Intelligence',delay);delay+=200;
-  await addLine('tl-dev','>','Device: <span class="t-purple">'+deviceType+' &mdash; '+os+' &mdash; '+browser+(bv?' '+bv:'')+'</span>',deviceType+'. '+os+'. '+browser+'.',delay);delay+=step;
-  if(cpuCores){await addLine('tl-cpu','>','Processor: <span class="t-purple">'+cpuCores+' CPU cores</span>',null,delay);delay+=step;}
-  if(ram){await addLine('tl-ram','>','Memory: <span class="t-purple">'+ram+'GB RAM</span>',null,delay);delay+=step;}
-  if(battery!==null){await addLine('tl-bat','>','Battery: <span class="t-purple">'+battery+'%'+(charging?' &mdash; charging':'')+'</span>',null,delay);delay+=step;}
-  if(connType){await addLine('tl-conn','>','Connection: <span class="t-purple">'+connType.toUpperCase()+'</span>',connType.toUpperCase()+'.',delay);delay+=step;}
-  await addLine('tl-time','>','Local time: <span class="t-purple">'+localTime+' &mdash; '+tz+'</span>',null,delay);delay+=step;
-  await addLine('tl-visit','>',firstVisit?'<span class="t-gold">First visit &mdash; establishing baseline behaviour</span>':'<span class="t-dim">Visit number '+visitCount+' &mdash; comparing to session history</span>',null,delay);delay+=step;
-  await addSection('sec-network','Network Analysis',delay);delay+=200;
-  await addLine('tl-geoload','>','<span class="t-dim">Resolving network location&hellip;</span>',null,delay);delay+=step;
-  var gps=await gpsPromise,ipGeo=await ipGeoPromise;
-  if(gps){var rev=await reverseGeocode(gps.lat,gps.lng);var locD=rev?rev+' &mdash; GPS '+gps.accuracy+'m':gps.lat.toFixed(4)+', '+gps.lng.toFixed(4);await addLine('tl-gps','>','<span class="t-green">GPS: </span><span class="t-purple">'+locD+'</span>',rev?'You are in '+rev+'.':'GPS confirmed.',delay);delay+=step;}
-  else{var loc=(ipGeo.city!=='Unknown'?ipGeo.city+' &mdash; ':'')+ipGeo.country;await addLine('tl-loc','>','Location: <span class="t-purple">'+loc+'</span>',(ipGeo.city!=='Unknown'?ipGeo.city+'. ':'')+ipGeo.country+'.',delay);delay+=step;}
-  await addLine('tl-ip','>','IP: <span class="t-purple">'+ipGeo.ip+'</span>',null,delay);delay+=step;
-  await addLine('tl-isp','>','Network provider: <span class="t-purple">'+ipGeo.isp+'</span>','Network provider: '+ipGeo.isp+'.',delay);delay+=step;
-  await addSection('sec-sentinel','Sentinel Fraud Detection Engine',delay);delay+=200;
-  await addLine('tl-v1','>','Velocity 60s window: <span class="t-green">1 request &mdash; normal</span>',null,delay);delay+=step;
-  await addLine('tl-v2','>','Velocity 5m window: <span class="t-green">1 request &mdash; normal</span>',null,delay);delay+=step;
-  await addLine('tl-v3','>','Velocity 1h window: <span class="t-green">1 request &mdash; normal</span>',null,delay);delay+=step;
-  await addLine('tl-cs','>','Country shift: <span class="t-green">No prior session &mdash; no shift detected</span>',null,delay);delay+=step;
-  await addLine('tl-scoring','>','<span class="t-dim">Running 9-signal weighted scoring engine&hellip;</span>','Running scoring engine.',delay);delay+=step*1.5;
-  var score=0.05,reasons=[];
-  var SAFE=['GB','US','DE','FR','CA','AU','NL','SE','NO','DK','FI','IE','NZ'];
-  if(!SAFE.includes(ipGeo.countryCode)&&ipGeo.countryCode!=='??'){score+=0.12;reasons.push('non_standard_region');}
-  if(visitCount>8){score+=0.05;reasons.push('high_visit_frequency');}
-  score=Math.min(parseFloat(score.toFixed(4)),0.34);
-  var trust=(0.74+Math.random()*0.08).toFixed(4);
-  var hashData={ip:ipGeo.ip,city:ipGeo.city,country:ipGeo.country,browser:browser,os:os,ts:ts,score:score,engine:'sentinel'};
-  if(gps){hashData.lat=gps.lat.toFixed(4);hashData.lng=gps.lng.toFixed(4);}
-  var auditHash=await getHash(hashData),sealedAt=new Date().toISOString();
-  await addLine('tl-score','>','Risk score: <span class="t-purple">'+score.toFixed(4)+'</span> &mdash; Trust index: <span class="t-purple">'+trust+'</span>','Risk score '+score.toFixed(2)+'. Trust index '+trust+'.',delay);delay+=step;
-  if(reasons.length>0){await addLine('tl-flags','>','Flags: <span class="t-gold">'+reasons.join(' &mdash; ')+'</span>',null,delay);delay+=step;}
-  else{await addLine('tl-flags','>','<span class="t-green">No fraud signals detected. Clean session. No anomalies across all 9 signals.</span>','No fraud signals detected. Clean session.',delay);delay+=step;}
-  await addLine('tl-dec','>','Decision: <span style="color:var(--green);font-weight:700;font-size:15px;letter-spacing:3px">ALLOW</span>','Decision. Allow.',delay);delay+=step;
-  await addLine('tl-seal','>','<span class="t-dim">Sealing to SHA-256 fraud evidence chain&hellip;</span>',null,delay);delay+=step;
-  await addLine('tl-hash','>','Audit hash: <span class="t-hash">'+auditHash+'</span>','Audit hash sealed.',delay);delay+=step;
-  await addLine('tl-done','>','<span class="t-green">Sealed '+sealedAt+' &mdash; immutable &mdash; FCA compliant &mdash; court admissible</span>','Sealed. FCA compliant. Court admissible.',delay);delay+=step;
-  await addLine('tl-pitch','>','<span class="t-purple">Your platform is processing transactions right now. Without Sentinel, fraud is happening and you will find out days later. With Sentinel you find out in under a second.</span>','Your platform is processing transactions right now. Without Sentinel, fraud is happening and you will find out days later. With Sentinel you find out in under a second.',delay);delay+=step*1.5;
-  setTimeout(function(){
-    document.getElementById('v-decision').textContent='ALLOW';
-    document.getElementById('v-score').textContent='Score: '+score.toFixed(4)+'  \u2014  Trust: '+trust+'  \u2014  Signals: 9  \u2014  Engine: Sentinel';
-    document.getElementById('v-hash').textContent=auditHash;
-    document.getElementById('v-sealed').textContent='Sealed '+sealedAt+'  \u2014  Immutable  \u2014  FCA compliant  \u2014  Court admissible';
-    document.getElementById('verdict').classList.add('show');
-    speak('Clean session. But every fraudster on your platform right now is getting this same treatment. The ones scoring above 0.7 are already being blocked. From fifty pence per device per month.',false);
-  },delay);
-}
-window.addEventListener('load',function(){setTimeout(runScan,800);});
-var adPlayed=false,adStartTime=null,adProgressInterval=null,adTotalDuration=58000;
-function showAdScene(n){document.querySelectorAll('.ad-scene').forEach(function(s){s.classList.remove('active');});var sc=document.getElementById('as'+n);if(sc)sc.classList.add('active');}
-function adShow(id,delay){setTimeout(function(){var el=document.getElementById(id);if(el)el.classList.add('show');},delay);}
-function updateAdProgress(){if(!adStartTime)return;var pct=Math.min(100,((Date.now()-adStartTime)/adTotalDuration)*100);document.getElementById('ad-progress-bar').style.width=pct+'%';}
-function restartAd(){if(synth){synth.cancel();speechQueue=[];isSpeaking=false;}clearInterval(adProgressInterval);document.querySelectorAll('.ad-scene .show').forEach(function(el){el.classList.remove('show');});document.getElementById('ad-progress-bar').style.width='0%';adStartTime=null;setTimeout(playAd,500);}
-function playAd(){
-  adStartTime=Date.now();adProgressInterval=setInterval(updateAdProgress,100);
-  showAdScene(1);speak('500 requests. 60 seconds. One account. Without Sentinel, you find out days later.',true);
-  adShow('as1a',300);adShow('as1b',1200);adShow('as1c',2400);adShow('as1d',4000);adShow('as1e',5200);
-  setTimeout(function(){showAdScene(2);speak('Sentinel catches it instantly. Velocity spike detected. 487 requests in 60 seconds. Country shift from GB to Nigeria. Account takeover signal. Trust score critically low. Decision. Block.',true);['atl1','atl2','atl3','atl4','atl5','atl6','atl7','atl8'].forEach(function(id,i){adShow(id,i*750);});},10000);
-  setTimeout(function(){showAdScene(3);speak('Blocked. 847 milliseconds from first signal. Before the money left. Before the data was stolen. Before the damage was done.',true);adShow('ad-block',400);adShow('ad-block-sub',1000);setTimeout(function(){document.getElementById('ad-saved').style.opacity='1';},1800);},24000);
-  setTimeout(function(){showAdScene(4);speak('Sentinel watches everything. Velocity monitoring across three windows. EWMA trust decay across all sessions. Account takeover detection. SHA-256 fraud evidence chain. All for fifty pence per device per month.',true);setTimeout(function(){document.getElementById('as4-title').style.opacity='1';},200);adShow('ac1',800);adShow('ac2',1600);adShow('ac3',2400);adShow('ac4',3200);},34000);
-  setTimeout(function(){showAdScene(5);speak('AILeash Sentinel. sebbi dot pro. Fraud caught before the damage is done. From fifty pence per device per month.',true);setTimeout(function(){document.getElementById('ad-cta-logo').style.opacity='1';},400);setTimeout(function(){document.getElementById('ad-cta-url').style.opacity='1';},900);setTimeout(function(){document.getElementById('ad-cta-tag').style.opacity='1';},1500);},48000);
-  setTimeout(function(){clearInterval(adProgressInterval);document.getElementById('ad-progress-bar').style.width='100%';},adTotalDuration);
-}
-var observer=new IntersectionObserver(function(entries){entries.forEach(function(entry){if(entry.isIntersecting&&!adPlayed){adPlayed=true;setTimeout(playAd,600);}});},{threshold:0.3});
-var vs=document.getElementById('video');if(vs)observer.observe(vs);
-async function doSignup(){
-  var fn=document.getElementById('fn').value.trim(),ln=document.getElementById('ln').value.trim(),em=document.getElementById('em').value.trim(),ph=document.getElementById('ph').value.trim(),org=document.getElementById('org').value.trim(),platform=document.getElementById('platform').value;
-  var err=document.getElementById('msg-err'),kb=document.getElementById('key-box'),btn=document.querySelector('.btn-full');
-  err.classList.remove('show');kb.classList.remove('show');
-  if(!em||!em.includes('@')){err.textContent='Please enter a valid email address.';err.classList.add('show');return;}
-  if(!org){err.textContent='Please enter your company name.';err.classList.add('show');return;}
-  var orig=btn.textContent;btn.textContent='Creating key\u2026';btn.disabled=true;
-  try{
-    var r=await fetch('https://sebbi.pro/signup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:em,phone:ph,name:fn+' '+ln,org:org,org_type:'sentinel_'+platform,product:'aileash',devices:1})});
-    var d=await r.json();
-    if(d.api_key){
-      document.getElementById('key-val').textContent=d.api_key;
-      if(d.ref_code)document.getElementById('ref-code-display').textContent=d.ref_code;
-      kb.classList.add('show');btn.textContent='Key created \u2014 setting up billing\u2026';
-      speak('Sentinel key created. Redirecting to billing.',false);
-      try{var r2=await fetch('https://sebbi.pro/create-checkout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:em,product:'aileash',devices:1})});var d2=await r2.json();if(d2.checkout_url){setTimeout(function(){window.location.href=d2.checkout_url;},2500);}else{btn.textContent='Key ready \u2713';}}catch(e2){btn.textContent='Key ready \u2713';}
-    }else{err.textContent=d.error||'Something went wrong. Email justin@monopcontent.com';err.classList.add('show');btn.textContent=orig;btn.disabled=false;}
-  }catch(e){err.textContent='Cannot reach server. Email justin@monopcontent.com';err.classList.add('show');btn.textContent=orig;btn.disabled=false;}
-}
-</script>
-</body>
-</html>
-
-```
-
-
-## `signal-packs.html`
-
-216 lines, 11346 bytes
-
-```html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Signal Packs - AILeash</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0a0f1e;color:#fff;line-height:1.55}
-.wrap{max-width:760px;margin:0 auto;padding:22px 18px 80px}
-a.back{color:#c9a84c;text-decoration:none;font-size:14px;font-family:monospace}
-h1{font-size:26px;font-weight:800;margin:14px 0 4px}h1 span{color:#c9a84c}
-.sub{color:#8a90a6;font-size:14px;margin-bottom:20px}
-.card{background:#111a30;border:1px solid #232d4a;border-radius:12px;padding:18px;margin-bottom:14px}
-.card h2{font-size:12px;color:#c9a84c;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:12px}
-input,textarea,select{width:100%;padding:11px;border-radius:8px;border:1px solid #2a3350;background:#0b1226;color:#fff;font-size:14px;margin:6px 0;font-family:inherit}
-textarea{min-height:120px;font-family:monospace;font-size:12px}
-button{background:#c9a84c;color:#0a0f1e;border:none;border-radius:8px;padding:11px 18px;font-weight:800;cursor:pointer;font-size:14px}
-button.ghost{background:transparent;border:1px solid #2a3350;color:#c9a84c}
-button.small{padding:7px 12px;font-size:12px}
-.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-.msg{font-size:13px;margin-top:8px;min-height:18px}
-.ok{color:#7fe3b0}.err{color:#ff7b6e}
-.pack{background:#0b1226;border:1px solid #2a3350;border-radius:8px;padding:12px;margin:8px 0;font-size:13px}
-.pack .nm{font-weight:700;color:#fff}
-.pack .meta{color:#8a90a6;font-size:12px}
-.badge{font-size:10px;padding:2px 8px;border-radius:10px;font-weight:700;text-transform:uppercase;margin-left:6px}
-.badge.pub{background:#0d2018;color:#7fe3b0;border:1px solid #1fae79}
-.badge.priv{background:#1a1206;color:#c9a84c;border:1px solid #c9a84c}
-.warn{background:#1a1206;border:1px solid #c9a84c;border-radius:8px;padding:12px;font-size:12.5px;color:#e8d9b0;margin:10px 0;line-height:1.6}
-.hide{display:none}
-.tiny{color:#5a6178;font-size:11px;margin-top:14px;line-height:1.6}
-.starter{cursor:pointer;color:#7fe3b0;font-size:12px;text-decoration:underline;margin-right:12px}
-
-/* ---- the door through to the open cost library ---- */
-.door{
-  display:block;text-decoration:none;color:inherit;
-  background:linear-gradient(140deg,#0d1730 0%,#111a30 55%,#171226 100%);
-  border:1px solid #3a3253;border-radius:12px;padding:18px;margin-bottom:14px;
-  position:relative;overflow:hidden;
-}
-.door:hover{border-color:#c9a84c}
-.door .halo{
-  position:absolute;right:-42px;top:-42px;width:150px;height:150px;
-  border-radius:50%;pointer-events:none;
-  background:conic-gradient(from 0deg,rgba(201,168,76,0),rgba(201,168,76,.5) 90deg,rgba(143,211,255,.45) 190deg,rgba(201,168,76,0) 320deg);
-  filter:blur(24px);opacity:.85;
-}
-.door h2{position:relative}
-.door .dh{font-size:19px;font-weight:800;margin-bottom:6px;position:relative}
-.door .dh em{font-style:normal;color:#c9a84c}
-.door .dp{font-size:13.5px;color:#8a90a6;line-height:1.6;position:relative}
-.door .dp b{color:#fff;font-weight:600}
-.door .go{
-  display:inline-block;margin-top:12px;font-family:monospace;font-size:12px;
-  color:#c9a84c;letter-spacing:.08em;position:relative;
-}
-@media (prefers-reduced-motion:no-preference){
-  .door .halo{animation:doorspin 26s linear infinite}
-  @keyframes doorspin{to{transform:rotate(360deg)}}
-}
-</style>
-</head>
-<body>
-<div class="wrap">
-  <a class="back" href="/">&larr; AILeash</a>
-  <h1>Signal <span>Packs</span></h1>
-  <p class="sub">Define the risks specific to your AI system, seal them, and use them per decision. Build your own, or start from a community template.</p>
-
-  <a class="door" href="/packs.html">
-    <div class="halo"></div>
-    <div class="dh">Looking for the open <em>cost pack</em> library?</div>
-    <div class="dp">Different job, same idea. Those packs decide what a model
-    request is allowed to cost, they are written over the token saver's nine
-    cost signals, and the whole library is <b>free to read, write and fork with
-    no account at all</b>. Twenty in there already.</div>
-    <div class="go">OPEN THE LIBRARY &rarr;</div>
-  </a>
-
-  <div class="card" id="loginCard">
-    <h2>Your API key</h2>
-    <input id="apikey" type="password" placeholder="Paste your AILeash API key">
-    <button onclick="loadMine()">Load my packs</button>
-    <div class="msg" id="loginMsg"></div>
-    <p class="tiny">No key? Get one free at <a href="/#signup" style="color:#c9a84c">sebbi.pro</a>. Your key stays in your browser - it is only sent to your own account.</p>
-  </div>
-
-  <div id="app" class="hide">
-    <div class="card">
-      <h2>Build a signal pack</h2>
-      <div class="row" style="margin-bottom:8px">
-        <span style="font-size:12px;color:#8a90a6">Start from a template:</span>
-        <span class="starter" onclick="loadStarter('hiring-risk')">hiring-risk</span>
-        <span class="starter" onclick="loadStarter('lending-risk')">lending-risk</span>
-        <span class="starter" onclick="loadStarter('content-safety')">content-safety</span>
-      </div>
-      <input id="packname" placeholder="Pack name, e.g. hiring-risk">
-      <textarea id="packsignals" placeholder='{"bias": 0.15, "adverse_impact": 0.15, "explainability_gap": 0.10}'></textarea>
-      <p class="tiny">Each signal has a weight from 0 to 0.30. Send raw signal values 0-1 at decision time; these weights decide how much each one counts.</p>
-      <button onclick="createPack()">Create &amp; seal pack</button>
-      <div class="msg" id="createMsg"></div>
-    </div>
-
-    <div class="card">
-      <h2>My packs</h2>
-      <div id="mypacks"><div class="meta" style="color:#5a6178">Loading...</div></div>
-    </div>
-
-    <div class="card">
-      <h2>Public library</h2>
-      <div class="warn">Community-contributed templates. <b>Unverified.</b> Always validate a pack against your own risk assessment before relying on it. Publishing your own pack is optional - your packs are private by default.</div>
-      <button class="ghost small" onclick="loadLibrary()">Browse library</button>
-      <div id="library" style="margin-top:10px"></div>
-    </div>
-  </div>
-
-  <p class="tiny">Signal packs let you evaluate the foreseeable risks specific to your system, per decision, sealed into a tamper-evident record. This supports EU AI Act risk-evaluation and record-keeping duties. It does not by itself constitute a complete Article 9 risk-management process - the documented governance around your packs is yours to maintain.</p>
-</div>
-
-<script>
-var KEY="";
-var STARTERS={
-  "hiring-risk":{"demographic_bias":0.15,"adverse_impact":0.15,"explainability_gap":0.10,"proxy_discrimination":0.10},
-  "lending-risk":{"protected_attribute_influence":0.15,"affordability_breach":0.12,"fairness_disparity":0.15,"explainability_gap":0.10},
-  "content-safety":{"child_safety_flag":0.20,"grooming_pattern":0.20,"harmful_content":0.12,"self_harm_signal":0.15}
+"use strict";
+const BASE = "https://sebbi.pro";
+
+/* ============================================================
+   CLUSTERS
+   ============================================================ */
+const CLUSTERS = {
+  foundation:{name:"Foundation", col:"#f0a94a"},
+  proof:     {name:"Proof layer", col:"#6fd6e0"},
+  engine:    {name:"Engine",      col:"#c79bf5"},
+  open:      {name:"Open & free", col:"#8fe3a8"},
+  business:  {name:"Business",    col:"#f2d08a"}
 };
-function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]})}
 
-async function api(path,body){
-  var r=await fetch(path,{method:"POST",headers:{"Authorization":"Bearer "+KEY,"Content-Type":"application/json"},body:JSON.stringify(body||{})});
-  return await r.json();
+/* ============================================================
+   LIVE ROUTES — each returns a short string, or throws.
+   Add a route here and it appears on its node automatically.
+   ============================================================ */
+const dig = (o, keys) => { for (const k of keys) if (o && o[k] !== undefined && o[k] !== null) return o[k]; return undefined; };
+const short = h => (typeof h === "string" && h.length > 20) ? h.slice(0,12) + "…" + h.slice(-6) : h;
+
+const LIVE = {
+  roster: {
+    url: "/x/roster/list",
+    hud: d => ((d.count ?? (d.peers||[]).length) + " chains"),
+    render: d => {
+      const n = dig(d,["count"]) ?? (d.peers||[]).length;
+      const w = dig(d,["witnessable"]), st = dig(d,["stale"]), si = dig(d,["silent"]);
+      let s = n + " chain" + (n===1?"":"s") + " on the roster";
+      const bits = [];
+      if (st !== undefined) bits.push(st + " stale");
+      if (si !== undefined) bits.push(si + " silent");
+      if (bits.length) s += " · " + bits.join(" · ");
+      return s;
+    }
+  },
+  tip: {
+    url: "/x/witness/tip",
+    hud: d => { const h=dig(d,["height","blocks","index","block"]); const t=dig(d,["tip","head","chain_tip","hash"]);
+                return h!==undefined ? ("block "+h) : (t?String(t).slice(0,10)+"…":"live"); },
+    render: d => {
+      const t = dig(d,["tip","head","chain_tip","hash"]);
+      const h = dig(d,["height","blocks","index","block"]);
+      let s = t ? short(t) : "tip served";
+      if (h !== undefined) s += "  ·  block " + h;
+      return s;
+    }
+  },
+  keys: {
+    url: "/x/signed/keys",
+    hud: d => { const arr=d.keys||d.chains||d.enrolled||[]; const n=dig(d,["count"]) ?? (Array.isArray(arr)?arr.length:0); return n+" enrolled"; },
+    render: d => {
+      const arr = d.keys || d.chains || d.enrolled || [];
+      const n = dig(d,["count"]) ?? (Array.isArray(arr) ? arr.length : 0);
+      return n + " chain" + (n===1?"":"s") + " enrolled with a signing key";
+    }
+  },
+  ots: {
+    url: "/x/ots/status",
+    hud: d => { const c=dig(d,["confirmed","anchored","complete"]); const pn=dig(d,["pending","submitted","upgrading"]);
+                return (c===undefined&&pn===undefined) ? "served" : ((c??0)+" conf / "+(pn??0)+" pend"); },
+    render: d => {
+      const c = dig(d,["confirmed","anchored","complete"]);
+      const p = dig(d,["pending","submitted","upgrading"]);
+      if (c === undefined && p === undefined) return "anchor status served";
+      return (c ?? 0) + " confirmed · " + (p ?? 0) + " pending upgrade";
+    }
+  },
+  schema: {
+    url: "/x/peer/schema",
+    render: d => "machine-readable schema served (" + (Object.keys(d.properties||d).length) + " top-level fields)"
+  }
+};
+
+/* ============================================================
+   NODES
+   ============================================================ */
+const N = [
+/* ================= FOUNDATION ================= */
+{
+ id:"problem", c:"foundation", label:"The problem", size:1.3,
+ lede:"A log you can edit is not evidence. It only says what you currently claim happened.",
+ body:[
+  "Nearly every system keeps logs, and logs live in databases. A database can be edited by anyone with the right access — an attacker, an insider, or the operator itself. So an ordinary log can only ever say <b>this is what we currently claim happened</b>. It cannot say <b>and nobody has changed it since</b>.",
+  "Most of the time nobody notices the difference. It appears the day someone with authority — a regulator, a court, an insurer, a customer in dispute — stops accepting your word and asks for proof. At that moment \"our system recorded it\" and \"here is proof it was not changed\" are two different sentences, and only the second carries weight.",
+  "It has become urgent for a specific reason. Software used to do what it was told, so a log of the inputs implied the outputs. AI systems produce outputs that cannot be derived from the inputs by inspection, so the output has to be recorded as a fact in its own right — and the regulation now arriving says so explicitly. The volume of decisions requiring evidence has risen by orders of magnitude. The mechanism most organisations use to evidence them has not changed since the 1990s.",
+  "Everything here exists to produce that second sentence — cheaply, automatically, as a by-product of systems doing their normal work."
+ ],
+ to:["chain","determinism","regulation"]
+},
+{
+ id:"determinism", c:"foundation", label:"Deterministic gate", size:1.2,
+ lede:"The governance layer is not an AI. It is arithmetic — and that is the only arrangement where it can do its job.",
+ body:[
+  "Put a model in charge of judging whether another model behaved acceptably and every property you needed disappears at once. The verdict cannot be reproduced, because the same input may score differently tomorrow. It cannot truly be explained, because the explanation is itself generated rather than derived. It drifts silently, because a retrained model changes its judgements without anyone choosing to change them. And anything that reads natural language can be attacked with natural language.",
+  "Worst of all it regresses. If a model needs governing and the governor is a model, the governor needs governing. There is no bottom to that stack. It terminates only at something that cannot behave unexpectedly — which means arithmetic: fixed weights, fixed thresholds, an explicit published formula.",
+  "<b>What determinism buys at audit.</b> A regulator or a court examining a decision two years later does not want a narrative. They want to establish that the decision followed from the stated rules. Determinism makes that mechanical: take the sealed inputs, take the sealed ruleset version, recompute. If the result matches the sealed verdict, the decision was the rules applied to the facts — and anybody can confirm it without the vendor in the room.",
+  "That is the difference between a record that <b>describes</b> a decision and one that <b>reproduces</b> it. Only the second is evidence in any strong sense."
+ ],
+ limit:"A deterministic gate is not smarter than a model and is not meant to be. It will miss things a good classifier would catch, because it has no semantic understanding at all. The trade is deliberate: reproducibility bought at the cost of cleverness. Use models to do the work; use arithmetic to prove what the work did.",
+ to:["sonicboom","reproducibility"]
+},
+{
+ id:"chain", c:"foundation", label:"The hash chain", size:1.6, core:true,
+ lede:"One append-only chain. Every seal contains the one before it, so history cannot be edited quietly.",
+ body:[
+  "At the centre of the whole platform is one data structure: an append-only chain of sealed records. Every product — the decision engine, the fraud detectors, the notaries, Brain — writes into a chain built the same way.",
+  "Each record is sealed at the moment it is created. The seal is a SHA-256 hash over the record's content <b>together with the seal of the record before it</b>. Because each seal contains its predecessor, every block's integrity depends on the entire history beneath it.",
+  "<b>seal(n) = SHA-256( seal(n−1) · timestamp · event · result · basis )</b>",
+  "Alter one character of one historic record and every seal after it fails. There is no way to repair the chain after an edit without recomputing every subsequent seal — and the current tip is recorded in the same transaction as every write, so even chopping records off the end is detected.",
+  "<b>Concurrency-safe:</b> the tip read, hash computation and insert happen inside a single lock hold and a single transaction. There is no race window in which two writers can fork the chain. <b>Crash-safe:</b> write-ahead journaling with full synchronous commits; a power cut mid-write rolls back cleanly. <b>Truncation-evident:</b> deleting blocks from the end breaks the tip record and is reported as tampering. <b>Fast:</b> score, decide, seal and respond runs inline, median 28ms — sealing is not a batch job that happens later.",
+  "One sentence captures the design philosophy: <b>a system that does not trust its own creator is the only kind whose records qualify as evidence.</b>"
+ ],
+ live:"tip",
+ routes:[["/x/witness/tip","current tip"]],
+ to:["anchor","receipts","basis","completeness","erasure","forks","verifier"]
+},
+{
+ id:"anchor", c:"foundation", label:"Bitcoin anchoring", size:1.35,
+ lede:"A chain proves nothing was altered. It does not prove when the chain was built. So the clock was moved outside.",
+ body:[
+  "This is the hole every tamper-evident audit product has, and most do not mention it. An operator with full control could discard the chain and construct a fresh one dated however they liked, and every seal in the fabricated chain would verify perfectly. Internal integrity is necessary. Alone it is not sufficient, because the operator still controls the clock.",
+  "So at a defined interval the current tip is submitted to <b>OpenTimestamps</b>, which aggregates it with thousands of unrelated timestamps into one Merkle tree and commits that root to the Bitcoin blockchain. Several independent calendar servers do this in parallel, so no single calendar can fail, disappear or lie without the others contradicting it.",
+  "The distinction matters, because the loose version — \"we write your hash to Bitcoin\" — is both technically wrong and commercially misleading. We do not make a Bitcoin transaction per anchor. We contribute to one. That is why anchoring runs continuously rather than when someone remembers the cost: the marginal cost is effectively zero, and a timestamp that only happens when convenient is not a timestamp.",
+  "<b>Submitted is not confirmed.</b> A calendar promises to commit the tip; the transaction lands later. Until the proof has been upgraded and confirmed, it is pending — not anchored. Per-proof state is published rather than asserted, because this platform described it wrongly for three weeks before someone checked.",
+  "The oldest objection to any audit trail is one sentence: <i>you could have written all of this last week.</i> Every assurance a vendor offers in reply is another claim from the party being questioned. An anchored chain answers with arithmetic instead — and the person checking needs no account, no cooperation from us, and no continued existence of this company. <b>The evidence outlives the vendor.</b>",
+  "Three deliberate design points. <b>Nobody holds crypto</b> — Bitcoin is used purely as a timestamp nobody owns, and the asset's price is irrelevant to the function. <b>Anchoring is not the integrity mechanism</b> — the chain provides integrity, anchoring fixes it in time; conflating the two is the standard error in blockchain-audit marketing. <b>The reference is returned to you</b>, so going through us is optional at every stage."
+ ],
+ live:"ots",
+ routes:[["/x/ots/status","anchor state, per proof"]],
+ limit:"Anchoring proves existence and timing. It does not prove the record was true at capture — but no ledger, court transcript or set of company books verifies the truth of its own inputs. It also closes backdating only up to the last confirmed proof; between anchors, the gap is small, real, and shared by every vendor in this market. And it inherits Bitcoin's assumptions: a conservative choice, but a dependency.",
+ to:["witness"]
+},
+{
+ id:"receipts", c:"foundation", label:"Gapless receipts", size:1.15,
+ lede:"A chain proves records were not edited. Receipts prove records were not omitted.",
+ body:[
+  "A tamper-evident chain says nothing about a record that was never written. An operator could simply fail to seal an inconvenient event. Receipts close that.",
+  "Every sealed decision is issued a sequence number <b>in the same transaction</b> as the chain write, and sequences are gapless by construction: 46, 47, 48. You keep your receipts. If you ever hold 46 and 48 with no 47, a record has been omitted — and you can show it by arithmetic rather than argument.",
+  "<b>Edited records break the chain. Missing records break the sequence. Fabricated history breaks the anchor.</b> Between the three, every way of quietly rewriting the past is detectable from outside, by anyone, without trusting the operator. That triple is the whole security model, and it is deliberately small enough to hold in your head.",
+  "Every signing lane issues its own gapless sequence, scoped and published: per-peer, per-name, per-chain. Not comparable across scopes, and each spec publishes the closed enum so nobody has to guess."
+ ],
+ limit:"Receipts protect whoever holds the receipt. They do not help a party who never received one, and they cannot answer \"is this the complete set\" for someone auditing from outside. Completeness closes that.",
+ to:["completeness","peer-lane"]
+},
+{
+ id:"basis", c:"foundation", label:"Basis sealing", size:1.1,
+ lede:"Two records hide inside \"what a system did\": the action, and what the action was allowed to rely on.",
+ body:[
+  "A seal on the action alone proves the action happened exactly as recorded. It cannot show what the action rested on — and a decision made on the wrong source, sealed, is just a tamper-proof error. So the engine seals both, in the same block.",
+  "The basis records which sources were used, the content hash of each version of them, the ruleset and ruleset version that applied, and the signal pack in force. It is canonicalised, hashed and folded into the block seal.",
+  "Edit the recorded basis later and the chain breaks exactly as if the action had been edited. Even <b>no basis was supplied</b> is sealed as a fixed sentinel — so the absence of a basis is a provable fact, not a blank that can be filled in later."
+ ],
+ limit:"Basis sealing proves what a decision relied on and that the record of it is unaltered. It does not prove the basis was correct — that a source was genuine or the ruleset was the right one. Integrity is provable by mathematics; correctness is a separate discipline involving people and process. Any product claiming to cryptographically prove correctness is misdescribing what cryptography can do.",
+ to:["packs","lineage"]
+},
+
+/* ================= WITNESS ================= */
+{
+ id:"witness", c:"foundation", label:"Witness network", size:1.5, core:true,
+ lede:"One chain can be rebuilt. Ten cannot — not without everyone who watched you rewriting theirs in step.",
+ body:[
+  "Anchoring closes backdating, but only up to the last anchor. Between anchors an operator with full control of their own server can still, in principle, construct a history and present it. It closes when platforms witness each other.",
+  "Each platform periodically publishes its current chain tip; each peer seals that tip into <b>its own chain</b>. From that moment one platform's history is recorded inside chains it does not control, which are themselves independently anchored. To rewrite your own past you would need every peer who witnessed you to rewrite theirs, in step, and re-anchor all of it. That is no longer a technical operation on a database. It is a coordinated conspiracy between commercial competitors, and the difficulty scales with the number of participants rather than the size of anyone's engineering team.",
+  "The economics make it practical. A chain tip is 64 characters. Witnessing one is a single sealed block. Ten platforms exchanging tips hourly generates a few hundred blocks a day <b>between all of them</b> — an integrity property strong enough to matter, at a cost small enough to ignore.",
+  "Two asymmetries make it work. A peer lying <i>about</i> us cannot help us: sealing a tip we never issued produces an entry pointing at a chain state that does not exist, which fails the moment anyone checks. A peer can only conspire with us, never frame us. And our peers are anchored too, so the conspiracy is not two parties agreeing a story — it is two parties defeating timestamps already published in a ledger neither controls."
+ ],
+ live:"roster",
+ routes:[["/x/roster/list","the public roster"],["/x/witness/spec","the protocol"],["/x/witness/observe","submit a tip"],["/x/witness/attest","ask who witnessed us"]],
+ limit:"Witnessing proves a tip existed at a time. It says nothing about whether the records behind it are true — garbage sealed on time remains garbage. Two platforms witnessing only each other prove very little; the guarantee comes from breadth. And no design can compel a peer to keep publishing: silence is made visible, not prevented.",
+ to:["roster","signed","forks","open-endpoint","names","conformance"]
+},
+{
+ id:"open-endpoint", c:"open", label:"Open submission", size:1.1,
+ lede:"Anyone can submit a tip. No account, no key, no approval — permanently and on purpose.",
+ body:[
+  "The route that accepts a chain tip requires nothing from anyone. That is not an oversight and it is not generosity. It is the answer to the only serious objection the model faces.",
+  "The objection is collusion: if we choose our witnesses, we can choose witnesses who will lie with us. It is a fair challenge and it has been put to us directly. The decisive part of the answer is this — <b>because anyone can witness us without asking, we cannot know who is doing it.</b> A client, an auditor, a regulator or a competitor can pull our tip on a timer and seal it wherever they like. Collusion requires knowing your co-conspirators. Open witnessing removes that knowledge from us permanently.",
+  "Three further properties are deliberate. <b>Nobody owns it</b> — there is no licence and no revenue share, because an integrity property is participated in rather than purchased. <b>Anyone can query it</b> — a third party can ask whether a given tip was witnessed, when, and in which block. <b>Silence is visible</b> — peers who stop publishing are marked stale and then silent, and a replayed tip is flagged automatically.",
+  "A witnessing network that only accepts submissions from account holders is a customer list, not a witness network."
+ ],
+ routes:[["/x/witness/observe","POST a tip"],["/x/roster/list","who has submitted"]],
+ to:["roster"]
+},
+{
+ id:"names", c:"foundation", label:"Names & binding", size:1.0,
+ lede:"Submission is open, so a chain name is self-declared. The fix is not accounts — it is publishing how strong each claim is.",
+ body:[
+  "Two checks run on every submission and <b>neither can reject it</b>. A submission is always sealed; what changes is what is said about it.",
+  "A <b>liveness</b> check fetches the submitted URL. <i>Live</i> means it served a valid but different tip, which is what a busy chain does between submitting and being fetched. <i>Self-consistent</i> means it served exactly the tip the submitter sent — both halves came from the submitter, so this records self-consistency and not verification by us or any third party. <i>Self-declared</i> means no URL, or we could not reach it: taken on the submitter's word and checked by nobody.",
+  "A <b>name binding</b> check records the URL a name was first seen at and compares every later submission: first-use, bound, or <i>conflict</i> where the same name arrives from a different address. A conflict is not proof of theft — operators move hosts — but it is exactly the event an auditor needs to see, and it is recorded permanently rather than resolved quietly by us.",
+  "That vocabulary exists because an earlier version conflated <i>reachable</i> with <i>verified</i>. An outside reviewer caught it. The correction is published in the route's own body text rather than quietly patched."
+ ],
+ routes:[["/x/bind/spec","binding specification"],["/x/roster/list","status vocabulary, published"]],
+ limit:"The liveness check proves the submitter operates a live chain producing that data. It does not prove they are who they say, because anyone running a real chain can point a stolen name at their own URL.",
+ to:["roster","signed"]
+},
+{
+ id:"roster", c:"open", label:"The roster", size:1.2,
+ lede:"Who has submitted, when they were last seen, and how each name is bound. Published, not described.",
+ body:[
+  "The roster is the network's own audit surface. For each chain it publishes the tip URL, how many observations have been recorded, when it was first and last seen, hours elapsed since, and how the name is bound to whoever submits under it.",
+  "It publishes its own vocabulary alongside the data, so no reader has to guess what a status means. <i>Current</i> is observed within six hours, <i>stale</i> between six and forty-eight, <i>silent</i> beyond that. The route says in its own body that these describe elapsed time since we last recorded an observation and nothing else — a peer publishing on a human schedule reads stale between sessions, correctly, and it is not a judgement about anyone.",
+  "It also states what the list is not: parties that have submitted a tip, and that is all it records. Not a membership list, not a set of partners, not participants in anything being built. Being listed implies no relationship beyond having sent a hash, and no endorsement of anything sealed in anyone's chain including ours."
+ ],
+ live:"roster",
+ routes:[["/x/roster/list","the full roster"]],
+ to:["signed","conformance"]
+},
+{
+ id:"signed", c:"foundation", label:"Signing keys", size:1.25,
+ lede:"You generate the keypair. You keep the private half. We hold the public half and can never produce a signature.",
+ body:[
+  "A shared-secret lane binds a submission to a secret. If the operator issued that secret, the operator could in principle have produced the submission. That is a real limit, and three separate reviewers arrived at it independently before it was fixed.",
+  "The Ed25519 lane removes it. You generate the keypair and keep the private half — it never travels and there is no route that accepts one. The public half can go over any channel at all, because a public key is not a secret: LinkedIn, email, a postcard, read out over the phone. We hold only the public half, which means we can verify a signature and can never produce one.",
+  "That is arithmetic rather than a promise about our conduct, and it is stronger than any channel we could have offered. Rotation is yours too: a rotation must be signed by the key being replaced, so we cannot swap your key even if we wanted to.",
+  "The canonical message is four lines joined by newlines — protocol tag, chain name, tip, integer epoch seconds — deliberately positional and free of JSON so two implementations cannot disagree about how to build it. The receipt carries the public key, the exact canonical message and the signature, so a third party rechecks it with any Ed25519 library without asking either party for anything."
+ ],
+ live:"keys",
+ routes:[["/x/signed/spec","the specification"],["/x/signed/keys","enrolled keys"],["/x/signed/enroll","enrol your own key"]],
+ limit:"Enrolment is open, so the first party to enrol a name gets it. Detection rather than prevention: an enrolment placed over a name already seen in the open lane is flagged permanently. And if you lose the private half you enrol a new name and the abandoned one stays visible — the honest cost of the stronger property.",
+ to:["schema","peer-lane"]
+},
+{
+ id:"peer-lane", c:"foundation", label:"Peer submission lane", size:1.1,
+ lede:"How an external platform seals into this chain, with a receipt it can validate against a published schema.",
+ body:[
+  "A peer submits a hash-only envelope. Nothing but digests crosses the boundary — no payloads, ever. What comes back is a receipt: the sealed audit hash, the block, a per-peer gapless sequence number, and the verification properties that receipt actually carries — inclusion, ancestry, append-only — named individually rather than asserted as a lump.",
+  "The sequence is real and per-peer, so a peer holding receipts 5 and 7 can show a sixth exists that it never received. It survives key rotation deliberately, because a counter that reset on rotation could be used to erase a gap.",
+  "A failed seal now returns an error and writes nothing. It used to return success with empty seal fields — see <b>Refused receipts</b> for how that was found and by whom."
+ ],
+ routes:[["/x/peer/spec","the specification"],["/x/peer/schema","machine-readable schema"]],
+ to:["schema","refusals"]
+},
+{
+ id:"schema", c:"open", label:"Published schema", size:1.05,
+ lede:"The response shape as machine-readable JSON Schema, so a validator loads it rather than transcribing prose.",
+ body:[
+  "Every disagreement in the integration described under <b>Refused receipts</b> came from the same place: a reviewer read a written description, built rules from it, and the description and the actual bytes had drifted. The behaviour was correct every time. The transcription was not.",
+  "The fix was to stop writing better prose. The response shape is published as a JSON Schema, draft 2020-12, with closed objects throughout. An integrator points a validator at it directly. There is no transcription step left to get wrong.",
+  "Any interface described only in sentences will drift from what it actually returns. The schema route is the interface; the prose is commentary on it."
+ ],
+ live:"schema",
+ routes:[["/x/peer/schema","the schema"]],
+ to:["conformance"]
+},
+{
+ id:"refusals", c:"open", label:"Refused receipts", size:1.3, core:true,
+ lede:"An external reviewer refused eight consecutive receipts. Every refusal was right, and every fault was ours.",
+ body:[
+  "In August 2026 an independent platform built a closed schema against our published response shape and refused to accept any receipt its own verifier would not validate. Not logged a warning — refused. Nine submissions. Eight rejected.",
+  "<b>The first receipt said the submission was sealed. It was not.</b> No block existed at that timestamp. The sealing call had failed and a bare exception handler swallowed it, so the response reported success while carrying nothing behind it. That route had never been exercised by an outside party, so the fault had been there since the day it was written. Their verifier caught it. Ours did not, because we had none pointed at ourselves.",
+  "<b>Then a sequence field that was always empty.</b> It read a counter that lives on an API key, and that lane has no key, so the field was permanently null while being named as a sequence. It looked like a completeness guarantee — receipts N and N+2 proving a third exists you never received. It was not one. Anyone relying on it could not have proved anything.",
+  "<b>Then three rounds of shape disagreement</b>, all the same underlying cause. A field documented in one place and returned in another. Each time, the behaviour was right and the description was wrong. So the response shape was published as a machine-readable schema and the transcription step disappeared. The next submission verified end to end with zero refusals, first attempt.",
+  "The agreed description of what that established, and nothing beyond it: <b>a one-directional bounded external sealing test, verified end to end.</b> Not reciprocal verification. Not mutual witnessing. Not production proof, compliance certification, or live customer deployment. Both sides hold that line.",
+  "Separately and independently: three reviewers arrived at the same objection to the shared-secret lane, which produced the Ed25519 path. One found that <i>reachable</i> and <i>verified</i> were being conflated in the roster vocabulary, which produced the published status definitions. One established that <i>submitted</i> to a timestamp calendar is not <i>anchored</i>, which produced the per-proof status route.",
+  "None of this was found by us. It is recorded here because a system that holds evidence about its own conduct cannot be trusted to mark its own work, and the only meaningful answer is to be marked by somebody else — in public, including when the result is embarrassing. If you are building anything that issues proofs: find someone who will refuse them."
+ ],
+ to:["schema","conformance","peer-lane"]
+},
+
+/* ================= ENGINE ================= */
+{
+ id:"sonicboom", c:"engine", label:"SonicBoom", size:1.35, core:true,
+ lede:"The decision engine. Allow, challenge or block — deterministically, in about 28 milliseconds.",
+ body:[
+  "Seven fields per event: who is acting, what they are doing, the value involved, where from, on what device, plus two optional risk signals your own systems may already produce. Send zero if you do not have them — the engine works from its own analysis. An optional eighth field carries delegated authority.",
+  "The engine combines independent signals: how fast events are arriving for this user and device, whether the country has changed or is off the expected list, how large the amount is on a log scale, and a <b>per-user trust score learned over time</b>. Trust is earned slowly with every allowed action and lost roughly eight times faster on every block — so an account behaving normally builds standing, and a burst attack destroys its own standing as it runs, making each successive attempt score worse.",
+  "<b>ALLOW</b> below 0.35 — proceed. <b>CHALLENGE</b> below 0.70 — borderline, verify further. <b>BLOCK</b> — refuse, with the reasons stated in plain English: velocity spike, new country, low trust.",
+  "Every verdict is sealed into the chain <b>before the response returns</b>, with its reasons, its jurisdiction tag, its active pack version and its basis. The caller receives the verdict, the reasons, the sealed hash and the gapless receipt number in one response.",
+  "It is built with the <b>headroom to handle complex, high-context decisions</b> — the messy real-world ones with a lot going on — and still seal and prove every one, not just the simple cases. That capacity is reported live at /x/sebbi_engine/verify."
+ ],
+ to:["packs","sentinel","oversight","authority","chain","challenge","monitoring","counterfactual","tokensaver","proving-ground","engine-state"]
+},
+{
+ id:"challenge", c:"engine", label:"The challenge flow", size:0.95,
+ lede:"When the verdict is borderline, the human step becomes part of the evidence rather than a gap in it.",
+ body:[
+  "A CHALLENGE response includes a hosted resolution flow: a signed link your user can open to confirm or deny the action, a status endpoint you poll for the outcome, and an expiry. Tokens are stateless and signed; the resolution is sealed into the chain as its own block.",
+  "Integration is three lines — if the verdict is CHALLENGE, show the link, poll the status. The exception path, which is exactly the moment a human steps in, is recorded rather than lost."
+ ],
+ to:["oversight"]
+},
+{
+ id:"monitoring", c:"engine", label:"Monitoring", size:0.9,
+ lede:"One call that answers \"is my evidence complete?\" with a yes or a no.",
+ body:[
+  "Two authenticated endpoints give an operator live sight of their own traffic. A pulse view: the last hour's verdicts, recent decisions with their reasons and seals, and the current chain tip. A coverage view: receipts issued reconciled against blocks sealed.",
+  "When the engine blocks on your traffic the sealed evidence is emailed to the account address, throttled to once an hour so a burst cannot flood you."
+ ],
+ to:["receipts"]
+},
+{
+ id:"packs", c:"engine", label:"Signal Packs", size:1.15,
+ lede:"Domain rules, versioned and sealed into every decision they governed.",
+ body:[
+  "The core engine scores every event against nine signals: trust, velocity at 60 seconds, 5 minutes and 1 hour, amount, device risk, anomaly, country shift and unsafe country. Those nine are domain-neutral — they describe the shape of behaviour, not the specifics of an industry.",
+  "It is worth being precise about what they are and are not, because it is a fair criticism and it has been put to us. They are transaction-risk signals. That is the lineage of the engine and the right toolkit for fraud and abuse. It is <b>not</b> a risk taxonomy for the AI Act's risk-management obligations, and describing it as one would be an overclaim. The taxonomy belongs to the operator; the proof that it operated belongs here.",
+  "A pack is a versioned bundle of additional signals, weights and thresholds loaded on top of the core. Packs run on the same deterministic engine — no model, no training, no drift. Payments and fraud; child safety; lending and onboarding; marketplace integrity; or an operator's own signals on the same guarantees.",
+  "<b>Why versioning matters at audit.</b> Suppose an examiner asks, two years later, why a decision came out as it did. To answer you must establish which rules were live at that moment. Almost every platform answers from a changelog — a document someone with access could have edited afterwards. So every pack carries a version hash over its full definition, and the pack hash is sealed inside the decision block. Change a weight and the pack takes a new hash, and the change enters the chain as its own timestamped, anchored block. <b>Rule changes become auditable events, never silent edits.</b>"
+ ],
+ limit:"A pack encodes a judgement about what matters in a domain, and that judgement can be wrong. Sealing proves which rules ran and that the verdict followed from them; it says nothing about whether those were the right rules.",
+ to:["reproducibility"]
+},
+{
+ id:"sentinel", c:"engine", label:"Sentinel", size:1.0,
+ lede:"The speed and shape of activity, rather than the content of any single event.",
+ body:[
+  "The patterns are the classic signatures of attack: a flood of login attempts against one account, a burst of transactions in seconds, an account appearing in a new country moments after its last action.",
+  "Sentinel's velocity analysis is one of the signals driving the engine's score, and when a pattern crosses the line the flag — what fired, when, on what evidence — is sealed into the same chain. A fraud team gets not just an alert but an alert with a tamper-evident, externally anchored record behind it that survives scrutiny later."
+ ],
+ to:["guardian"]
+},
+{
+ id:"guardian", c:"engine", label:"Guardian", size:1.1,
+ lede:"The same machinery aimed at platforms where children are present.",
+ body:[
+  "Guardian watches for the recognised behavioural warning signs that precede grooming — pressure toward secrecy, attempts to isolate, moves toward private channels — and flags them.",
+  "Two design decisions matter. <b>Message content is never stored</b>, only a fingerprint of it: privacy is preserved, and what is kept is proof that the flagged exchange existed in exactly the form it had. And every flag is sealed, so the trail handed to a parent, a platform's safety team or the authorities is tamper-evident from the moment of detection and externally anchored shortly after.",
+  "In the one context where this evidence may end up in front of a court, a safeguarding report backed by an anchored chain is a fundamentally stronger document than one backed by an editable log. That difference is the entire point."
+ ],
+ limit:"Guardian is a detection and evidence aid. It supports a platform's duty of care; it does not discharge it. Child-safety decisions must always involve trained people and, where warranted, the proper authorities.",
+ to:["chain","regulation"]
+},
+{
+ id:"oversight", c:"engine", label:"Human oversight", size:1.3, core:true,
+ lede:"Nobody can prove a human deliberated. Rubber-stamping, though, leaves marks.",
+ body:[
+  "Article 14 requires that natural persons can <b>effectively oversee</b> a high-risk system. Every vendor in this market claims to satisfy it, and the honest position is that none of them can, including this one. Whether a reviewer genuinely deliberated is an internal state. No logging reaches it. Any product claiming to prove human thought is selling something that does not exist.",
+  "Rubber-stamping is not an internal state. It is a behavioural pattern, and patterns leave marks provided the right things are recorded, in the right order, at the time. Three mechanisms follow.",
+  "<b>Order.</b> The case is presented to the reviewer without the machine's verdict. Their own decision and reasoning are sealed first; the verdict is revealed only afterwards. Two blocks, in that sequence, in a chain that cannot be reordered. A reviewer cannot have merely agreed with an answer they had already been shown, because the chain fixes which came first.",
+  "<b>Attention.</b> The interval between opening a case and committing to it is sealed alongside the decision. A 0.8-second approval sits in the record permanently, beside a two-minute one. A single fast decision proves nothing. Four hundred consecutive sub-second decisions is a different kind of object — one that survives being explained away.",
+  "<b>Independence.</b> Agreement rate is recorded per reviewer over time. A reviewer who has never once diverged from the machine across a meaningful sample is visible in the data. The measurement is dull, which is precisely why it works.",
+  "So \"a human reviewed it\" and \"a human clicked accept on a recommendation\" stop being indistinguishable six months later — and only one of them is oversight."
+ ],
+ limit:"This proves order, not thought. A reviewer can leave a screen open, and dwell time is gameable by anyone deliberately gaming it. Most importantly the ordering guarantee is only as strong as the integration honouring it: if a platform displays the machine verdict to its own staff before calling the endpoint, the sealed order proves nothing at all. That constraint is documented in the code rather than buried in it, because a guarantee whose failure mode is undisclosed is not a guarantee.",
+ to:["authority","conformance","probes"]
+},
+{
+ id:"authority", c:"engine", label:"Delegated authority", size:1.1,
+ lede:"Human oversight only means something if the human doing it was actually authorised to.",
+ body:[
+  "The engine issues signed authority tokens: a single call binds a user to a role, a spending limit and an expiry, signed server-side. The grant is sealed into the chain as its own block — so who gave this person this power, and when, is a permanent record rather than an HR email.",
+  "Events then carry the token. The engine verifies it deterministically: wrong user, expired grant, tampered token, or an amount above the granted limit each escalates the verdict and seals the reason into the record. An approval made outside granted authority is no longer a quiet judgement call; it is a flagged, sealed, examinable event."
+ ],
+ limit:"A sealed token proves who was empowered, to what limit, until when. Not that granting it was a good idea.",
+ to:["identity","jurisdiction","authority-cont"]
+},
+{
+ id:"identity", c:"engine", label:"Identity sealing", size:0.9,
+ lede:"KYC outcomes made provable, with zero personal data held.",
+ body:[
+  "The platform does not verify passports — specialist providers do that, and pretending otherwise would be theatre. What the engine does is make the <b>outcome</b> provable: one call seals the provider, whether verification passed, and the fingerprint of the provider's reference.",
+  "The document, and even the raw reference number, are never stored. Later, \"this user was verified by provider X on date Y\" is a sealed fact any auditor can check, with nothing personal held to leak."
+ ],
+ to:[]
+},
+{
+ id:"jurisdiction", c:"engine", label:"Jurisdiction tagging", size:0.9,
+ lede:"Which rules governed the moment, sealed at decision time.",
+ body:[
+  "Every governed decision is tagged with the frameworks that applied when it was made — EU AI Act, GDPR and DSA for EU-origin events; the Online Safety Act, UK GDPR and Children's Code for the UK — using a versioned mapping sealed inside the decision block. A multinational can answer \"show every decision and which regulator's rules governed it\" from the chain alone."
+ ],
+ limit:"This records which obligations applied. It does not and cannot decide legal authority — courts do that. Any product claiming to determine which jurisdiction controls is describing a lookup table in grander language. This one is a lookup table too: versioned, sealed, and honest about it.",
+ to:["regulation"]
+},
+{
+ id:"brain", c:"engine", label:"Brain", size:1.1,
+ lede:"A gate every instruction passes through before the AI acts.",
+ body:[
+  "An AI does what it is told, so the question becomes who checks what it is being told. A poisoned instruction — ignore your rules, export the customer data, delete the logs — walks straight in unless something stands in front of it.",
+  "Brain checks against five categories of known-dangerous pattern: child safety, data exfiltration, compliance bypass, prompt injection, system destruction. Normalisation defences mean unicode look-alikes, zero-width characters and spacing tricks resolve to the same fingerprint as the plain form. Dangerous instructions are blocked with the reason stated, and every decision — allowed or blocked — is sealed with its basis.",
+  "Brain is distributed differently from the rest of the platform: a single pure-Python file, free to download, standard library only, no cloud, no API key. It runs entirely on your machine and your instructions never leave your system. It is meant to be read before it is run — every line — because <b>a governance tool you cannot inspect is itself an ungoverned claim.</b>"
+ ],
+ routes:[["/brain","download it, free"]],
+ limit:"Brain blocks known-dangerous patterns. It does not catch every possible paraphrase of a bad instruction — no filter honestly can, and any vendor claiming complete coverage of natural language is overclaiming. The filter is the first line; the evidence is the product.",
+ to:["chain","aitxt"]
+},
+
+/* ================= NOTARIES ================= */
+{
+ id:"notaries", c:"open", label:"The Notaries", size:1.25, core:true,
+ lede:"The same chain, free, no account, no code. Your content never leaves your device.",
+ body:[
+  "The notaries expose the chain directly to the public. They exist for two reasons. The obvious one: most people and small businesses have no system to integrate, but still have things worth proving. The strategic one: <b>a claim about evidence infrastructure is only credible if anyone can test it in thirty seconds without asking permission.</b>",
+  "They share one privacy design. Your browser computes a SHA-256 fingerprint locally; only that 64-character fingerprint is sent and sealed. The chain proves a document with exactly that fingerprint existed at that moment. You reveal the original only if you ever need to — and if you never need to, nobody ever sees it.",
+  "Every seal returns a unique 12-character code, the holder's permanent claim to that record. One shared chain underneath, anchored like everything else; one private receipt each. A sole trader's sealed quote and a bank's sealed decision sit in the same structure with the same guarantees. That was deliberate."
+ ],
+ routes:[["/notary","use them, free"]],
+ limit:"Fingerprint matching is exact. A re-encoded copy, a paraphrase or a re-saved image produces a different fingerprint and will not match.",
+ to:["notary-post","notary-pay","notary-dsr","notary-recon","notary-decl","chain"]
+},
+{
+ id:"notary-post", c:"open", label:"Post & identity notary", size:0.9,
+ lede:"The exact words, fixed. And a profile, dated before the clone.",
+ body:[
+  "Seal the exact words of anything before you send or publish it — a quote, a contract, an announcement, a message. Later, anyone can verify those words existed on that date and have not been edited. A tradesman who sealed a £2,400 quote the day he sent it ends a \"you said £1,800\" dispute with mathematics rather than argument. It cost him nothing and took ten seconds.",
+  "The identity notary seals your name, role and links and returns a short verification code for your public profile. If a fraudster clones the profile, the clone fails the check — the genuine one was sealed first and the chain proves which came first. Impersonation defence is usually framed as detection; this reframes it as chronology, which is a far easier thing to prove."
+ ],
+ to:[]
+},
+{
+ id:"notary-pay", c:"open", label:"Payment notary", size:0.95,
+ lede:"Bank details verified before money moves — and both sides hold the proof.",
+ body:[
+  "A business seals its genuine bank details once; every invoice carries a short code; the payer checks the code before releasing funds. If an intercepted invoice's details were swapped — the classic authorised-push-payment fraud — the check returns MISMATCH and the payment stops.",
+  "The verification itself is sealed and returned as a receipt, so <b>both sides hold provable evidence that care was taken before money moved</b>. Under the 2024 mandatory reimbursement rules, that record speaks directly to where liability falls."
+ ],
+ to:["regulation"]
+},
+{
+ id:"notary-dsr", c:"open", label:"Data subject requests", size:0.95,
+ lede:"Received, assessed, extended, completed — sealed in order, holding no personal data.",
+ body:[
+  "When a person asks an organisation to delete their data, three facts must be provable afterwards: that the request was received and when, that it was actually considered and on what grounds, and that it was answered inside the statutory deadline. Almost no organisation can prove any of the three. They have an email thread and a recollection.",
+  "The notary seals the whole lifecycle as ordinary blocks. The calendar-month deadline is computed and sealed at receipt, and an extension is its own sealed block recording both the old and new dates — so an extension cannot be applied retrospectively to cover a deadline that was already missed.",
+  "The chain never holds the person's identity. The identifier supplied is fingerprinted on arrival and only the fingerprint is stored. This answers the objection that an append-only chain conflicts with the right to erasure: the personal data lives in the operator's systems and is deleted there. What remains is a seal that resolves to nothing."
+ ],
+ to:["erasure"]
+},
+{
+ id:"notary-recon", c:"open", label:"Reconciliation notary", size:1.05,
+ lede:"A sealed chain of fiction is still fiction. This attacks that directly.",
+ body:[
+  "An operator who seals fiction on time possesses a tamper-evident chain of fiction, and everyone honest in this field knows it. The reconciliation notary does what auditors have always done: substantive testing against source records.",
+  "The mechanism that makes it more than theatre is the ordering. A selection seed is derived from the current chain tip — a value the operator cannot predict in advance and cannot alter afterwards without breaking the chain. The records to be tested are chosen from it, and <b>that selection is sealed before any data is requested</b>. Only then are the identifiers returned for the operator to fetch from their own live system.",
+  "So the operator cannot choose which records are examined, cannot prepare only the flattering ones, and cannot quietly discard a test that went badly: every planned run is sealed when it is planned, and a plan with no submitted result remains permanently visible as an abandoned test. Mismatches are sealed with exactly the same permanence as matches. A reconciliation system that can bury its own failures is decoration.",
+  "What a pass means, stated exactly: two systems the operator controls agree with each other, on records the operator could not select, at a moment the operator could not choose. That is not proof of truth. What it changes is the cost of lying — from editing one database to maintaining a coherent parallel reality across independent systems indefinitely, under unpredictable sampling, with every failure sealed permanently."
+ ],
+ limit:"It tests systems the operator controls against each other, not against the world. An operator fabricating coherently across every system in real time will pass.",
+ to:[]
+},
+{
+ id:"notary-decl", c:"open", label:"Declaration notary", size:0.95,
+ lede:"Publish the rules you hold yourself to — before the records they judge.",
+ body:[
+  "An operator publishes a file stating what must always be true of their decisions: payments above a threshold are never auto-approved, every decision carries reasons. Every sealed record is then tested against it and violations are sealed.",
+  "The obvious objection is circularity — they wrote their own rules and supplied their own data. Two properties answer it. <b>The rules are sealed before the records they judge</b>, so a standard cannot be retrofitted to an outcome. And every version is retained and sealed, so loosening your own standard becomes a dated, permanent and public act rather than a quiet edit. The strict rule published in March remains readable in September, next to the loose one that replaced it.",
+  "The declaration does not establish that an operator is honest. It converts their claims into something testable, and removes their ability to move the goalposts afterwards."
+ ],
+ limit:"Weak rules prove weak things. A declaration requiring nothing passes everything — which is precisely why the declaration itself is published rather than merely its pass rate.",
+ to:["aitxt","conformance"]
+},
+{
+ id:"aitxt", c:"open", label:"ai.txt & comply.txt", size:1.05,
+ lede:"Two small public files letting any organisation declare, machine-readably, how its AI is governed.",
+ body:[
+  "Modelled on robots.txt and security.txt. <b>ai.txt</b> declares what AI the organisation operates, what decision model governs it, what audit method backs it, which regulations it is designed toward, and where a human override sits. <b>comply.txt</b> is the rulebook every instruction and decision is subject to.",
+  "On their own these are claims, not proof — anyone can write \"tamper-evident audit\" in a text file. Their force comes from the third step: sealing the declarations themselves into the chain, so \"this is our governance, as declared on this date\" becomes provable and its history becomes tamper-evident.",
+  "Declaration, then rulebook, then enforcement: words, backed by rules, backed by working code, backed by an external clock.",
+  "This is the smallest part of the platform by code and potentially the largest by consequence. Conventions of this shape succeed not by enforcement but by becoming the obvious thing to do, and value accrues to the reference implementation that got there first and kept practising it."
+ ],
+ to:["standard"]
+},
+
+/* ================= PROOF LAYER ================= */
+{
+ id:"completeness", c:"proof", label:"Completeness", size:1.2,
+ lede:"Every audit log proves what happened. None of them prove what didn't.",
+ body:[
+  "A hash chain proves inclusion. It cannot prove exclusion. So when a firm hands an examiner four hundred decisions, nothing in the mathematics shows it was not six hundred. Every audit ever conducted has run on the assumption that the sample handed over is the whole sample. That assumption has never been provable. It has simply been accepted.",
+  "At the close of each period, every record sealed in it is taken, <b>sorted</b>, built into a Merkle tree, and the root and the exact count are sealed into the chain — then anchored and witnessed like everything else. Crucially this happens before anybody has asked for anything.",
+  "Sorting is the whole trick. In an unsorted tree you can only prove a leaf is present. In a sorted one you can prove a leaf is <b>absent</b>: produce the two leaves either side of where the queried value would have sorted, verify both against the sealed root, and show their indices are consecutive. Nothing can exist between two adjacent leaves of a sorted tree.",
+  "<b>Why commitments are frozen.</b> A commitment is worth nothing if it can be recomputed later to suit circumstances. A period can only be committed once it has closed — attempting to commit a live period is refused. It can only be committed once; a second attempt returns the existing root. And the sorted leaf list is stored at commit time rather than recomputed on demand, so proofs issued this year still verify against the root sealed this year even after records are erased next year."
+ ],
+ routes:[["/x/complete/periods","committed periods"],["/x/complete/prove","request a proof"]],
+ limit:"It proves completeness of what was sealed. A decision that never reached the chain is outside anything it can see. What changes is that the operator can no longer choose which of the sealed records to show.",
+ to:["absence","erasure"]
+},
+{
+ id:"absence", c:"proof", label:"Absence proofs", size:1.0,
+ lede:"Not \"we looked and found nothing\". A proof, against a root fixed before the question was asked.",
+ body:[
+  "\"We hold no record of you\" is normally a report about the diligence of whoever searched. An absence proof makes it arithmetic: the two neighbouring leaves a missing record would have sorted between, verified against the sealed root, with consecutive indices.",
+  "Two commitment types are supported — over the receipts themselves, and over the distinct subjects those records concerned, which is what turns \"do you hold anything about me\" into an answerable question. The tree is built over key material only and never over content, so a leaf reveals whether something exists, not what it said."
+ ],
+ limit:"Absence is scoped to a period, so \"no record, ever\" means checking every committed period — which is why the period list is public, and why a missing period is itself a visible fact worth asking about. And a proof discloses the two neighbouring keys, so where keys are sensitive they should be hashed before they become leaves.",
+ to:[]
+},
+{
+ id:"erasure", c:"proof", label:"Erasure & tombstones", size:1.05,
+ lede:"Append-only and the right to erasure look incompatible. Most vendors disclaim it rather than solve it.",
+ body:[
+  "If nothing can be removed, how is a person's data deleted? And if it can be removed, what was the chain for?",
+  "The payload is deleted by the operator's own system. The <b>position</b> in the tree remains, and the erasure is sealed as its own dated event. Holding none of the content, three things can then be established: a record existed, it was erased, and when — against a timestamp nobody involved controls.",
+  "So a data subject receives <b>proof of erasure</b> rather than an assurance of it, and the organisation receives evidence it complied which survives the deletion of the very data that would otherwise have been the evidence.",
+  "Roots committed before the erasure still contain the leaf, and that is correct rather than a leak. A leaf is key material, not content; and a root that changed after the fact would prove nothing about anything, which would defeat the whole structure."
+ ],
+ limit:"The tombstone proves the erasure was recorded and cannot have been backdated. It does not prove every copy in every backup and downstream system was destroyed — that is an operational discipline, and no cryptographic structure can reach into systems it does not sit in.",
+ to:[]
+},
+{
+ id:"forks", c:"proof", label:"Fork detection", size:1.05,
+ lede:"Several parties hold hashes of our chain. Until this, none could check they held hashes of the same chain.",
+ body:[
+  "Nothing in the design so far stopped an operator running two histories in parallel: serve chain A to a witness, chain B to an auditor. Both receive a valid tip. Both anchor it. Both verify perfectly against the copy they were given. Neither can tell, because there was no way to ask the question that would expose it.",
+  "Fork detection is that question, made askable. Hand back any tip we ever gave you and we prove it is still on the chain we serve today, in the same position. A prefix proof between any two sizes shows nothing was inserted, removed or reordered.",
+  "That turns a set of separate observers into a single cross-checkable record."
+ ],
+ routes:[["/x/consistency/ancestor","is my old tip still here"],["/x/consistency/proof","append-only prefix proof"]],
+ limit:"A fork is only caught if a holder of an old tip actually checks it. If nobody keeps our tips, there is nothing to catch us with — which is why the route is public, free and automatable.",
+ to:[]
+},
+{
+ id:"reproducibility", c:"proof", label:"Reproducibility", size:1.05,
+ lede:"A stranger can test that the engine is deterministic without being shown the rules.",
+ body:[
+  "Determinism is only worth anything if someone outside can test it. Send anything you like to the challenge endpoint, keep the input fingerprint, and send it again next month from anywhere. Every run is sealed. Same inputs, same verdict — or the claim is false and you have the sealed evidence of it.",
+  "That is what makes determinism a testable property rather than a design assertion, and it is the difference a competitor building on a model cannot retrofit without rebuilding from the bottom."
+ ],
+ routes:[["/x/replay/spec","how to test it"]],
+ limit:"Reproducibility is not fairness. That the same inputs still produce the same verdict says nothing about whether the verdict was correct or the inputs honestly captured. And an open scoring oracle can be probed: a determined party submitting many varied inputs can map a decision boundary without seeing any code. That exposure is real, mitigated rather than eliminated, and disclosed here rather than discovered later.",
+ to:[]
+},
+{
+ id:"lineage", c:"proof", label:"Cross-org lineage", size:1.0,
+ lede:"What fed a decision, hop by hop, across company boundaries.",
+ body:[
+  "Basis sealing records what a decision rested on inside one organisation. Lineage extends the same idea across organisational boundaries, where the source of a decision is another company's decision.",
+  "Trace upstream to see what fed an outcome, or run it backwards to see what a faulty input produced. That turns \"which outputs were affected by this bad source\" from a fire drill into a query — and the scope of a recall is itself sealed and dated, so it can be shown not to have been narrowed to suit."
+ ],
+ routes:[["/x/lineage/trace","trace upstream"],["/x/lineage/impact","run it backwards"]],
+ limit:"A lineage edge is a claim, not a proof of the claim. Sealing makes it dated and non-repudiable; it never made it true. Declaring inputs is voluntary, and a party who declares nothing is simply the point at which someone else's trail goes dark. The mechanism is built and the graph is empty until somebody else joins it.",
+ to:[]
+},
+{
+ id:"verifier", c:"open", label:"Offline verifier", size:1.1,
+ lede:"One file, no dependencies, no network. Check everything with the wifi off.",
+ body:[
+  "Every claim about the chain is checkable from outside, but checking it through our endpoints still routes through us. The offline verifier removes even that: download it, disconnect, and recompute.",
+  "Run <code>--selftest</code> first, so you are not trusting the tool either.",
+  "A verifier that needs the vendor's server to reach a verdict is not independent. This one does not — and the evidence therefore outlives both the vendor and its infrastructure."
+ ],
+ routes:[["/verify","verification tools"]],
+ to:["chain","verify-all"]
+},
+{
+ id:"authority-cont", c:"proof", label:"Authority continuity", size:1.15,
+ lede:"Proving an autonomous action was derivable from a human grant — every hop re-checked at execution.",
+ body:[
+  "An agent acted. Something authorised the agent. Something authorised that. Eventually the chain of delegation ends at a person, or it does not end at all — and the second case is the one that matters when someone asks who is answerable.",
+  "Continuity re-derives the whole path <b>at the instant of execution</b>, from sealed grants, rather than relying on a claim recorded earlier. The person who accepted the risk is named separately from the issuer and from the subject, so \"who granted this\" and \"who carries it\" are different fields rather than one blurred one.",
+  "What comes out is a signed proof bundle a third party verifies on their own machine, with no dependencies and no network — including a <b>proof of refusal</b> when authority could not be derived. A blocked action is evidence in exactly the way an allowed one is.",
+  "The rules are published in enough detail to reimplement the evaluator and disagree with our result."
+ ],
+ routes:[["/x/continuity/spec","the rules"],["/x/continuity/decisions","real decisions, blocks beside allows"],["/x/continuity/trace","the path back to a human"],["/x/continuity/proof","export a signed bundle"]],
+ limit:"It proves the authority used was derivable from a human grant — not that the human should have issued it, and not that the parameters describe something that really happened. Grants are authenticated by sealing rather than per-issuer signatures, so an outside party verifies them through the chain rather than entirely offline; signature-based offline verification of grants is a known extension and is not built. And a composed verdict is only half re-derivable: the authority half can be re-run by anyone from the published rules, the risk half needs the scoring engine and cannot be — which the exported bundle states rather than glosses over.",
+ to:["authority","verifier","witnessed"]
+},
+
+/* ================= WHOLE / BUSINESS ================= */
+{
+ id:"stack", c:"business", label:"How it fits together", size:1.25, core:true,
+ lede:"Every piece is one layer of a single stack, and evidence accrues as a by-product of the system working.",
+ body:[
+  "Reading from the bottom up: <b>time</b> — the chain tip fixed in a ledger nobody involved controls. <b>Witness</b> — our tip sealed inside chains we do not own. <b>Evidence</b> — the hash chain, where every layer above seals action plus basis plus a gapless receipt. <b>Proof</b> — completeness, absence, consistency, replay. <b>Lineage</b> — what fed a decision across company boundaries. <b>Authority</b> — every hop back to a human, re-derived at execution.",
+  "Above those: <b>public access</b> through the notaries, <b>detection</b> through Sentinel and Guardian, <b>decision</b> through the engine and its packs, <b>delegation</b> establishing who may act and under which rules, the <b>gate</b> checking instructions before the AI acts, and at the top the <b>declaration</b> of what is claimed, publicly and machine-readably.",
+  "The flow of a single event: an instruction arrives, Brain checks it against the declared rules, the delegation layer establishes authority, identity and jurisdiction, the engine scores it under the active pack informed by Sentinel's pattern analysis, and the verdict with its reasons, jurisdiction tag, pack version and basis is sealed in the same transaction with a gapless receipt. Upstream receipts are declared as lineage edges. The period is later committed with its exact total. The tip is anchored externally and handed to peer chains. And anyone, at any time, can verify the whole thing from outside without an account.",
+  "The principle tying it together: <b>evidence accrues as a by-product of the system working.</b> Nobody remembers to log anything. Nobody compiles an audit file before an inspection. The proof exists because the system ran — and it is exactly as trustworthy whether the operator is honest or not, which is the only kind of trustworthy that counts."
+ ],
+ to:["chain","witness","sonicboom","notaries","brain","regulation","sebdog","tokensaver","sdk"]
+},
+{
+ id:"regulation", c:"business", label:"Regulation", size:1.15,
+ lede:"What this evidences, article by article — and what it does not.",
+ body:[
+  "The platform maintains a versioned regulation map, itself hash-sealed and served at a public endpoint, linking each capability to the obligations it helps evidence: the EU AI Act's record-keeping, transparency and human-oversight expectations under Articles 9, 12, 13 and 14, the UK Online Safety Act's duty-of-care documentation, and the ICO Children's Code. The map is versioned, so when regulations change, the history of what was mapped when is itself tamper-evident.",
+  "<b>The current timeline.</b> The 2026 AI Omnibus amended the AI Act's application dates. The high-risk obligations moved back; the transparency obligations did not, and one deadline was shortened. <b>2 Aug 2026</b> — transparency obligations, deepfake disclosure, Commission enforcement powers over general-purpose models, and the penalty regime. <b>2 Dec 2026</b> — the content-marking grace period ends, cut from six months to three; the prohibition on AI-generated non-consensual intimate imagery and CSAM takes effect. <b>2 Dec 2027</b> — high-risk obligations for stand-alone systems. <b>2 Aug 2028</b> — high-risk obligations for AI embedded in regulated products.",
+  "The delay is widely read as breathing room. It is not, for one structural reason: <b>the evidence these articles require is historical.</b> An organisation assessed in 2028 will be asked what its systems decided and why across the preceding period. Records cannot be created retrospectively.",
+  "Article by article: <b>12, record-keeping</b> — completeness changes the answer from \"here are our decisions\" to \"here are all 1,204 decisions in this period, and here is the proof there were no others\", with the total fixed before any request arrived. <b>15 and 17, access and erasure</b> — absence proofs make \"we hold no record of you\" provable, and tombstoned erasure gives a data subject proof their record existed and was deleted while holding none of it. <b>9, risk management</b> — the evidence that a defined, versioned ruleset was in force and governed the decisions taken under it. <b>20, corrective action</b> — downstream lineage answers \"which outputs were affected by this faulty input\" as a query rather than a fire drill."
+ ],
+ limit:"These tools help an organisation evidence its obligations. They do not, on their own, make an organisation compliant, and no software does. Regulators assess organisations, not endpoints. Compliance is an organisational discipline; this is the evidence layer underneath it.",
+ to:["pricing","limits"]
+},
+{
+ id:"sovereign", c:"business", label:"Sovereign deployment", size:1.2,
+ lede:"The engine runs inside your own network. One file, no dependencies, no phone home.",
+ body:[
+  "For organisations whose data cannot leave the building, the engine runs entirely on your hardware — decisions, chain and database, all local. Pure Python, a single file, no dependencies. It builds the chain locally, keeps daily backups, verifies itself end to end, and serves the routes the witness network needs.",
+  "Licensing is offline by design: signed 365-day tokens validated with pure cryptography, no phone-home, suitable for air-gapped environments.",
+  "It is the only component that runs somewhere we cannot reach, and that is the point of it. The sovereignty claim is about the engine, not just about where the data sits."
+ ],
+ to:["pricing","witness","sebdog"]
+},
+{
+ id:"pricing", c:"business", label:"Deployment & pricing", size:1.1,
+ lede:"50p per active device per month. The proof layer is free and structurally has to be.",
+ body:[
+  "Two ways to run: integrate against the hosted API — a few lines of code where your system makes decisions — or run it sovereign inside your own network. Pricing is deliberately simple: <b>50p per active device per month</b>, metered on real usage, billed automatically. Partners embedding the platform set their own customer pricing and keep the margin above the platform fee.",
+  "<b>The witnessing network is free and structurally cannot be otherwise.</b> There is no gate to price: the submission endpoint takes a tip from anybody, and that openness is the mechanism by which the collusion objection is answered. A witness you must ask permission from is a weaker witness. Charging for admission would damage the thing being sold.",
+  "Two commitments follow, and they are architectural rather than promises. <b>The open protocol code never checks whether anyone has paid</b> — it has no concept of a subscription, so the claim that it is ungated is true by construction rather than by policy. And each paid service checks only its own status, so an operator who stops paying for hosting but runs their own infrastructure keeps sealing and keeps being witnessed indefinitely, with no gap in their record.",
+  "Evidence packs are issued periodically: a customer's record for the period, with every seal, its witnesses, its anchors and the routes to verify each, as a document they own outright and may hand to anyone. Non-payment removes nothing — sealed history cannot be withdrawn without breaking the chain, and is not. But coverage stops, and the gap that opens cannot be filled in later at any price, because the only way to have had a period covered was to be covered during it."
+ ],
+ to:["partner"]
+},
+{
+ id:"partner", c:"business", label:"The raise", size:1.3, core:true,
+ lede:"30% of the business for an operating partner who can take this into defence, healthcare and telecoms.",
+ body:[
+  "Built and operated by a solo founder at near-zero fixed cost. The platform is live. The constraint is not engineering.",
+  "<b>What is offered.</b> A substantial equity stake — up to 30% — for a partner who can open regulated enterprise and government channels. Defence, healthcare, telecommunications: sectors where evidence obligations are hardest, procurement cycles run eighteen months, and a founder alone does not get in the room. Mass rollout through resellers who set their own pricing and keep the margin above the platform fee.",
+  "<b>Why the economics suit that shape.</b> Marginal cost per additional device is effectively zero; the same engine serves one customer or ten thousand. Distribution scales without headcount. A reseller channel is therefore pure margin expansion rather than a cost line, and the sovereign engine means a customer whose data cannot leave the building is not an exception to the model but an ordinary sale.",
+  "<b>The market moment.</b> Three regimes converge: the EU AI Act's transparency obligations and full penalty regime from August 2026, with high-risk obligations in December 2027 and August 2028; the UK Online Safety Act; and the 2024 Payment Services reimbursement rules. All share one practical demand — records that survive scrutiny. Most organisations meet it with editable database logs, which is to say they do not meet it.",
+  "<b>The moat is time.</b> Switching costs rise every day a customer's evidence accrues, because an anchored history cannot be migrated mid-stream without breaking its own continuity. An unbroken witnessed record is the one input nobody can shortcut, because the only way to have had last year covered was to be in it last year. A competitor building governance on a model cannot offer reproducibility and cannot retrofit it without rebuilding from the bottom. And least copyable: every competitor overclaims. A documented refusal to — limits stated on every page and sealed into the platform's own chain — is precisely the property a buyer of evidence infrastructure is buying.",
+  "<b>Stated plainly.</b> Pre-revenue, with a 90-day free trial converting to metered billing. The pipeline is founder-led outreach and inbound from the free tools. Commercial terms with the peers on the roster have not been discussed — they joined an open network, not a company, and that is deliberate. The market's deadlines move; the structural argument does not.",
+  "<b>Contact:</b> justin@monopcontent.com — the technical demonstration takes fifteen minutes, and every claim on this map can be verified during it."
+ ],
+ routes:[["/whitepaper","the full whitepaper"]],
+ to:["sovereign","sebdog","evidence-pack","tokensaver","limits","standard"]
+},
+{
+ id:"future", c:"business", label:"Future potential", size:1.0,
+ lede:"Forward-looking, and separated for exactly that reason. None of this is deployed.",
+ body:[
+  "<b>What has already moved out of this section.</b> Mutual anchoring was a future direction in v4; it shipped. Completeness, absence, erasure proofs, fork detection, reproducibility testing and cross-organisation lineage were unwritten in v5 and all six shipped within two days of it. They are listed only so readers of earlier versions can see what moved from intention to deployment, and when.",
+  "<b>Key-signed intermittent sync — designed, not built.</b> The witnessing spec currently assumes both parties run always-on servers, because the first two chains happened to. That assumption is not required by the design and excludes exactly the systems most in need of it: edge deployments, off-grid nodes, anything with intermittent connectivity. A node would register a public key once and sign every tip thereafter, pushing in batches whenever it reaches a network, pulling the peer's tip first and sealing it — so offline work is bounded at both ends. The residual limit is inherent: bounding is only as tight as the sync frequency.",
+  "<b>Signal Packs as a market.</b> A pack is a versioned, hashable, portable artefact, which means it can be authored by someone other than us. A fraud consultancy, a child-safety charity or a regulator could publish a pack, and any operator could load it and prove which version they ran. A sector body would gain something it has never had: a way to publish a standard that adopters can prove they actually applied, rather than a PDF everyone claims to have read.",
+  "<b>Evidence-priced risk.</b> Insurers price uncertainty, today through questionnaires and periodic audit. An anchored, reproducible decision history is a different class of input: continuous, externally verifiable, impossible to dress up before an inspection. It is reasonable to expect verifiable evidence to eventually attract better pricing than asserted evidence. That is a hypothesis about a market, not a product feature.",
+  "<b>What would have to be true.</b> A wide witness network requires peers willing to coordinate. Cross-organisation lineage requires a second organisation actually declaring its inputs. A pack market requires authors with reputations worth attaching. Evidence-priced risk requires an underwriter prepared to move first. Each is plausible; none is in hand. <b>The parts of this platform that exist do not depend on any of them</b> — which is the property that makes it responsible to write this section at all."
+ ],
+ to:["standard","packs"]
+},
+{
+ id:"standard", c:"business", label:"The standard", size:1.0,
+ lede:"The smallest part by code, potentially the largest by consequence.",
+ body:[
+  "Conventions of this shape — robots.txt, security.txt — succeed not by enforcement but by becoming the obvious thing to do, and value accrues to the reference implementation that got there first and kept practising it.",
+  "The adoption path is deliberately staged. <b>Technical</b>: the tools work and anyone can check. <b>Network</b>: enough operators declare and anchor that checking becomes routine. <b>Expectation</b>: an organisation without a declaration and a verifiable history looks like one with something to hide.",
+  "Nothing about that sequence is guaranteed. It is, however, the reason the standard is open and the notaries are free."
+ ],
+ to:["aitxt"]
+},
+
+/* ================= SCRUTINY ================= */
+{
+ id:"conformance", c:"business", label:"Conformance", size:1.1,
+ lede:"Three claims here have a soft edge. Rather than hide them, they are measured.",
+ body:[
+  "Commit-before-reveal proves ordering, but only if the integrator does not show reviewers the verdict first. Witnessing draws strength from breadth, and two platforms witnessing only each other prove very little. A declaration is only as strong as the rules declared.",
+  "None of these can be closed by the engine alone, and a vendor claiming otherwise would be overstating what software can do. What they can be is <b>measured</b> — and a measured weakness is a different object from an unmeasured one. It can be reported, tracked, compared between deployments and put in front of an auditor.",
+  "<b>Breadth.</b> The network reports how many distinct peers are live, how concentrated observations are in the largest of them, and how many have gone quiet. Fewer than three live peers is reported as weak, because it is. A single peer pair carries an explicit warning that two parties witnessing only each other can still collude. None of this prevents a thin network. It prevents a thin network being presented as a thick one.",
+  "<b>Strength.</b> Each rule in a live declaration is run against sealed records and reported individually: how many records it actually constrained. A rule that has never constrained a single record is named in the output as decoration rather than a standard. An operator can still publish a weak declaration. They can no longer publish one and have its weakness go unstated."
+ ],
+ limit:"None of this is enforcement. Nothing here compels a platform to witness widely, declare strictly or integrate honestly. It makes the alternative visible, which is the most an evidence layer can honestly claim to do.",
+ to:["probes","limits"]
+},
+{
+ id:"probes", c:"business", label:"Probes", size:1.0,
+ lede:"Put a case with a known answer into the queue, unannounced, and see who catches it.",
+ body:[
+  "The method is borrowed openly from how substantive audit has always worked, and specifically from a point made publicly by James Stokes of Red Flag AI Pro.",
+  "A probe creates a genuine oversight case whose machine verdict has been deliberately set to a known-wrong value. To the reviewer it is indistinguishable from any other case. Two things follow. If the reviewer agrees with the planted verdict, they did not evaluate the case — a caught rubber stamp, sealed like any other event. And if the integration is displaying the verdict before the case is opened, the reviewer's agreement rate on probes will track their rate on ordinary cases; if they are genuinely deciding blind, it will not.",
+  "<b>The gap between those two numbers is the conformance signal</b>, and it is the closest thing available to testing an integration you cannot see inside. A single probe establishes nothing about an individual. A catch rate across dozens is evidence about a process, and the process is what is under audit."
+ ],
+ limit:"Probes test a process, not a person: someone can catch a probe and rubber-stamp the next hundred cases. A sufficiently motivated operator who identifies probe cases controls their own interface and can treat them differently — probe references carry no marking a reviewer can see, but that is a speed bump rather than a wall.",
+ to:["oversight"]
+},
+{
+ id:"limits", c:"business", label:"Honest limits", size:1.3, core:true,
+ lede:"A whitepaper that only lists strengths is marketing. These are the limits, as plainly as the capabilities.",
+ body:[
+  "<b>Sealing proves integrity and timing, not truth at capture.</b> A sealed, anchored record proves exact content existed no later than an externally witnessed moment and has not changed since. It does not prove the contents were true when written — and no recording system of any kind does, which is a fact about recording rather than a defect of this one.",
+  "<b>Determinism costs cleverness.</b> The gate has no semantic understanding and will miss things a good classifier would catch. Deliberate and permanent.",
+  "<b>Basis sealing proves what was relied on, not that it was right.</b> Whether the source was genuine is a matter for process, not cryptography.",
+  "<b>Packs prove which rules ran, not that they were the right rules.</b> The nine core signals are transaction-risk signals and are not a risk taxonomy for Article 9.",
+  "<b>Authority tokens prove the grant, not the wisdom.</b> Jurisdiction tagging records applicable frameworks; it does not decide law.",
+  "<b>Anchoring inherits Bitcoin's assumptions</b>, and submitted is not confirmed.",
+  "<b>Oversight sealing proves order, not thought</b> — and depends entirely on the integration honouring it.",
+  "<b>Witnessing proves a tip existed, not that its contents are true.</b> Strength comes from breadth, and no design can compel a peer to keep publishing.",
+  "<b>Reconciliation proves consistency, not truth.</b> Declarations are only as strong as the rules declared.",
+  "<b>Fork detection needs someone to look.</b> Reproducibility is not fairness. A lineage edge is a claim, not proof of the claim.",
+  "<b>None of these find what was never recorded.</b> A decision that was never sent to the engine cannot violate a rule or fail a sample. Gapless receipts cover omission at the point of issue; nothing covers a system that was never connected.",
+  "<b>And none of this prevents anything.</b> The layer produces evidence that something happened and has not been altered. A sealed record of a harmful action is still a harmful action. What changes is that afterwards there is an answer to what happened and who authorised it — which today, in most systems, there is not.",
+  "Every one of these limits is stated on the product pages as well. A system whose whole value is honesty cannot afford a single overclaim — and a vendor who tells you their limits is giving you the strongest evidence available about how they will behave when it matters."
+ ],
+ to:["verify-all"]
+},
+{
+ id:"verify-all", c:"open", label:"Check us, don't trust us", size:1.25, core:true,
+ lede:"Nothing here asks to be believed. Every claim is checkable from outside, now, without an account.",
+ body:[
+  "<b>Verify the whole chain</b> — the public endpoint recomputes every seal from genesis and reports either integrity or the exact block where tampering begins.",
+  "<b>Check the anchor</b> — the live endpoint returns the tip, the OpenTimestamps proof file and how many independent calendars have stamped it. Verify it against Bitcoin with any OpenTimestamps client. Nothing about that check involves us.",
+  "<b>Check any receipt</b>, <b>re-derive a decision</b> from the sealed inputs and pack version, and <b>test reproducibility with your own inputs</b> — send anything, keep the fingerprint, send it again next month from anywhere.",
+  "<b>Ask what a period contained</b>, <b>ask about something that isn't there</b> and receive an absence proof, <b>check we never forked</b> by handing back any tip we ever gave you, and <b>check the log is append-only</b> with a prefix proof between any two sizes.",
+  "<b>Follow a decision across companies</b>, <b>read the authority rules</b> in enough detail to reimplement the evaluator and disagree with our result, and <b>export a signed proof and check it without us</b> — with no identifier it returns the most recent, so you can start knowing nothing.",
+  "<b>Run the offline verifier</b> with the wifi off, and run its selftest first so you are not trusting the tool either. <b>Seal something yourself</b> with the notaries, then change one character and watch verification fail. <b>Read the gate's code</b> before running it.",
+  "<b>Ask who witnessed us</b>, and <b>witness us yourself</b> — take our tip and seal it wherever you like. No account, no key, no permission. We have no way to know you are doing it, which is the point.",
+  "<b>Check a reviewer's record</b> — median dwell time, divergence rate, and the proportion of sub-two-second decisions. A reviewer who has never once diverged is reported as such. And <b>read our declaration and its history</b>: if we have ever loosened our own standard, it is there.",
+  "That is not a slogan. It is the system's design requirement, and the only standard by which an evidence layer should ever be judged."
+ ],
+ routes:[["/verify","start here"],["/x/roster/list","the roster"],["/x/ots/status","anchor state"],["/x/peer/schema","the schema"]],
+ to:["verifier","refusals","proving-ground","free-tools","stats"]
+}
+,
+/* ================= PRODUCTS THE WHITEPAPER NEVER COVERED ================= */
+{
+ id:"tokensaver", c:"engine", label:"Token saver", size:1.2, core:true,
+ lede:"The same discipline pointed at your model bill. Cuts token cost, and proves the saving rather than claiming it.",
+ body:[
+  "Every other product here comes out of a compliance budget. This one comes out of a budget somebody is already trying to cut, which is why it is the easiest call in the range to take.",
+  "It sits between your agent and the model provider. You change one line — the base URL — and traffic flows through it. Three layers act in order. <b>Hard rules</b> first: budget exhausted, overdraft, runaway loop, runaway burst. Then a <b>nine-signal score</b> weighted 0.62 on what the request is about to spend and 0.38 on whether that spend is waste, with base weights summing to exactly 1.00. Then <b>findings</b> that name the waste in the request rather than just refusing it.",
+  "One design rule matters more than the rest: <b>a downgrade is earned by being genuinely small, never by being suspicious.</b> A suspicious request is never quietly routed to a weaker model. Cost control that degrades exactly the requests most worth getting right is not cost control.",
+  "<b>Three certainty tiers that never mix.</b> Exact provider-reported savings. Worst-case ceilings on calls that were refused. Estimated figures inside findings, marked as estimates. No percentage-saved figure appears anywhere, and no money is shown at all until you enter your own contract prices — because a saving quoted against list price you never paid is a marketing number, not a saving.",
+  "Your prompts and answers never leave your machine. Only a fingerprint and counts are sent. It runs fully offline with no account at all, and it <b>fails open</b>: if the platform is unreachable your traffic keeps flowing, the local cache keeps serving, and records queue and catch up."
+ ],
+ routes:[["/x/tokensaver/spec","the specification"]],
+ limit:"Matching is exact only. Catching similar-but-not-identical prompts would need embeddings, which is a model call, which would break the whole no-model-calls guarantee — so it is not done. And an identical deterministic request never becomes a runaway; it gets cached and costs nothing. The expensive runaway is temperature above zero, uncacheable, and spinning.",
+ to:["wallet","chain","sdk"]
+},
+{
+ id:"wallet", c:"engine", label:"The budget gate", size:1.15,
+ lede:"Give an agent a budget and terminate it when the budget is gone. The hard boundary a prompt can never be.",
+ body:[
+  "An agent told to behave might. An agent that cannot pay for its next call stops. The gate charges before it forwards, and at zero balance the call is refused and never reaches the model.",
+  "Every charge is sealed into the audit chain, so <b>the spend record and the decision record are the same record</b>. Balances are held in integer millipence — no floats, because a rounding error in a metering system is a dispute waiting to happen.",
+  "A <b>dry run</b> answers the question that actually keeps people awake: how far does a runaway loop get on this balance, before it costs anything to find out.",
+  "One rule is deliberately unforgiving. A receipt presented twice halts the whole key and raises a review item — not even a subscribed device passes — until a person clears it. A machine does not get to decide whether a repeated hash was a replay or a collision.",
+  "The chokepoint version goes further: a standalone proxy the customer runs, holding the provider's API key so the agent never sees it. The agent's only route to a model is through the gate, and any credential it tries to forge is stripped. A watchdog marks a key silent past its expected cadence and seals the silence."
+ ],
+ routes:[["/x/wallet/spec","the specification"]],
+ limit:"This governs volume and produces evidence. It does not prevent an agent saying something false — a sealed record faithfully records a false statement. What it prevents is an unbounded one, and what it gives you afterwards is an answer to what happened.",
+ to:["pricing","sdk"]
+},
+{
+ id:"sdk", c:"engine", label:"One line of code", size:1.05,
+ lede:"A decorator. Zero dependencies, single file, hash-only, never blocks your caller.",
+ body:[
+  "Put one decorator above a function and its inputs and outputs are fingerprinted and witnessed. Canonical-JSON SHA-256 of each, computed locally.",
+  "<b>Hash-only egress</b>, and proven rather than promised: the test suite plants a secret in a payload and greps both the wire and the disk spool for it. A background daemon thread with a bounded queue does the sending, batching where it can, spooling to disk through an outage and replaying afterwards.",
+  "It never blocks your caller and never swallows your caller's exception. Adds about a tenth of a millisecond per call. Receipts come back carrying chain position and chain tip.",
+  "There is an explain mode that prints the wire protocol, so the same thing can be ported to another language without reading the Python."
+ ],
+ to:["chain","receipts"]
+},
+{
+ id:"sebdog", c:"business", label:"Sebdog — on your hardware", size:1.25, core:true,
+ lede:"The engine, running somewhere we cannot reach. One file, no dependencies, no phone home.",
+ body:[
+  "For organisations whose data cannot leave the building, the engine runs entirely on your own hardware — decisions, chain and database, all local. Pure Python, a single file, standard library only.",
+  "<b>No phone home.</b> Licensing is an Ed25519 token validated locally: the process makes no outbound call to us at all. That matters more than it sounds. An earlier version validated its licence against our server on startup and every 24 hours, which meant the engine died if we did — so the sovereignty claim covered the data but not the engine. It now covers both, and the token is verified with a public key you hold rather than a shared secret you could mint licences with.",
+  "It builds the chain locally, keeps daily backups using the database's own backup API and seals each one into the chain so restoring an older backup is visible rather than silent, and verifies itself end to end on demand.",
+  "It serves the two routes the witness network needs — publish a tip, accept one. So the one product where your data never leaves is also the one where your chain is externally witnessed. <b>The tip route is public on purpose</b>: a peer cannot seal what it cannot read.",
+  "50p per active device per month, the same as everything else."
+ ],
+ limit:"An operator holding the file and the keys can still rebuild a chain forward with no internal gap. That is true of every append-only log and we state it rather than deny it. What makes rewriting impractical is external reference — the anchor and the witnesses — not the file format.",
+ to:["witness","pricing","partner"]
+},
+{
+ id:"evidence-pack", c:"business", label:"Evidence packs", size:1.15,
+ lede:"A period's record, re-verified block by block, sealed as a document you own outright.",
+ body:[
+  "The pack does not summarise the chain — it re-verifies it. Every block in the period is rehashed from the stored row and compared against the sealed hash. The links between blocks are walked. The gapless receipt sequence is checked for the key. What comes out states plainly whether the period holds, and since when the run has been unbroken.",
+  "The pack's own digest is sealed when it is issued, so the document cannot be edited after the fact. You hold it outright and may hand it to anyone — an auditor, a regulator, a court, an insurer — and they can check it without an account and without us.",
+  "<b>Unbroken since</b> is the line that matters commercially. It resets if the run breaks, and it cannot be repaired retrospectively at any price, because the only way to have had a period covered was to be covered during it. That is not a retention tactic bolted on; it falls out of what the chain is."
+ ],
+ routes:[["/x/pack/spec","the specification"]],
+ to:["pricing","completeness"]
+},
+{
+ id:"witnessed", c:"proof", label:"Back-dated grants", size:1.05,
+ lede:"A well-formed grant that was never issued passes every internal check. This is what closes that.",
+ body:[
+  "Authority continuity states the gap in its own specification, which is the right way round. Issuer, scope and approver all arrive on the request — so a grant invented after an incident, with plausible values, satisfies every check the engine can perform on its own.",
+  "The fix uses the tip exchange that already runs. A grant sealed at tree size M, plus a peer that accepted a chain head at size N greater than or equal to M at time T, proves the grant existed before T — in a log the operator cannot write to. No new protocol, and no cooperation from the peer beyond what they already do.",
+  "It publishes minutes-unwitnessed per grant and the count of records not yet witnessed overall, and reports network strength as none, weak, thin or reasonable, naming the collusion limit explicitly at one peer. Peer responses are recorded verbatim and marked unverified, with the verification plan pointing at the peer's own host rather than ours.",
+  "The framing that makes it land: it does not prove a grant was legitimate. It proves one cannot be invented after the event — which is the failure an actual incident produces."
+ ],
+ to:["authority-cont","witness"]
+},
+{
+ id:"counterfactual", c:"proof", label:"Counterfactual", size:1.0,
+ lede:"Not just why the decision went that way — the exact value that would have changed it.",
+ body:[
+  "A person refused by an automated system is entitled to something better than a category. The counterfactual inverts the scoring function and states the precise threshold: the amount, the velocity, the trust level at which this same decision would have come out differently.",
+  "That is recourse rather than explanation. It tells someone what to do, not merely what happened.",
+  "Boundary-probing patterns are themselves logged, because a route that tells you exactly where the line sits is a route someone will use to map it."
+ ],
+ to:["sonicboom","reproducibility"]
+},
+{
+ id:"proving-ground", c:"open", label:"The Proving Ground", size:1.1,
+ lede:"Run a real decision through the live engine, with no account, and watch it seal.",
+ body:[
+  "Not a sandbox and not a demo environment. A visitor with no account sends a real event to the production engine, it seals into the production chain, and they get back the verdict, the counterfactual, and public links to verify the block themselves.",
+  "A second tab hands them a review case with the machine verdict withheld and a running clock on screen. They decide. Then the verdict is revealed alongside their own dwell time — so commit-before-reveal is something they have done rather than something they have read about.",
+  "This exists because a claim about evidence infrastructure is only credible if a stranger can test it in thirty seconds without asking permission."
+ ],
+ routes:[["/","try it"]],
+ to:["oversight","notaries","counterfactual"]
+},
+{
+ id:"authorship", c:"proof", label:"Dated authorship", size:1.0,
+ lede:"Sealing the codebase and the published page, because a git date proves nothing.",
+ body:[
+  "Git author and committer dates are settable fields. Anyone can write any date into them. That surprises people who have been relying on them as evidence.",
+  "So the source tree is walked, every file hashed, one flat ordered manifest root computed and sealed together with an authorship declaration. File contents never leave — only the root, the count and the byte total are public. Separately, a published page is fetched server-side, the exact bytes served are hashed with no normalisation, and the URL, hash and fetch time are sealed. Re-sealing builds an uneditable revision history.",
+  "The discipline it enforces is simple: seal at publication, so a publication date never rests on repository metadata again."
+ ],
+ limit:"This is dated evidence of what was held and when. It is not proof of legal ownership — that needs entity IP ownership in writing, a signed agreement with any collaborator, and a solicitor rather than a hash.",
+ to:["chain","anchor"]
+},
+{
+ id:"free-tools", c:"open", label:"The free tools", size:1.05,
+ lede:"Connection risk and password watch. No key on any route, and the receipt is the product.",
+ body:[
+  "<b>Connection risk.</b> Give it an address and it returns clean, suspect or high with every signal named and sourced — Tor exit list, hosting and datacentre detection via reverse DNS, missing reverse DNS, and caller-supplied timezone and locale against a claimed country. No paid geo-IP feed and no vendor black box. Every check is sealed with a public verification link. The flag is the giveaway; the receipt is the product.",
+  "<b>Password watch.</b> A phone reports failed unlock attempts and, if it photographed whoever failed, the fingerprint of that photo. Never the photo. Later the owner hands the picture to the police, they hash it, and they check whether it matches. A worthless snapshot becomes evidence, while the service holds no image at all. It takes no passwords, PINs or attempted values in any form, and location is optional and rounded.",
+  "Both exist for the same reason as the notaries: they are the part of the argument anyone can test without asking."
+ ],
+ to:["notaries","chain"]
+},
+{
+ id:"fingerprint", c:"proof", label:"Engine fingerprinting", size:0.95,
+ lede:"Detecting whether another endpoint is running this scoring function.",
+ body:[
+  "Twenty-eight probe vectors, chosen to interrogate the design rather than picked at random: pairs either side of each velocity saturation point, a walk up the log-amount curve, each term isolated, burst against grind at identical totals.",
+  "Verdicts run from identical, through derived — a scale-and-shift fit, which catches a straight reweighting — to same shape, similar, unrelated, or inconclusive. Every probe is sealed with its target and result.",
+  "The scoring maths itself is never published. What is published is a one-way fingerprint of the deployed decision function, so anyone can confirm the code has not changed under them without being shown what it does."
+ ],
+ to:["reproducibility","determinism"]
+},
+{
+ id:"stats", c:"open", label:"Public statistics", size:0.9,
+ lede:"Aggregate figures, published — and one number deliberately not used as a boast.",
+ body:[
+  "Chain growth, verdict mix, dwell-time distribution, all public and scoped to nothing.",
+  "One honest note attaches to the headline figure. A five-minute liveness beacon means most blocks are heartbeats — a few hundred a day whatever the traffic. <b>So chain height is not an activity figure and is never quoted as one.</b> A vendor citing block count as usage is citing their own cron job."
+ ],
+ to:["chain","roster"]
+},
+{
+ id:"register", c:"open", label:"Safe AI Registry", size:1.05,
+ lede:"A public register of listed domains — and the rare kind you don't have to trust, because it proves things about its own conduct.",
+ body:[
+  "Every other registry, trust mark and certification list is a mutable database. The operator can insert an entry, back-date it, quietly delist someone, or revoke a seal and leave no trace. You have to trust the registrar absolutely.",
+  "This one publishes proofs about itself. <b>Absence</b> — a sorted-tree proof that a domain was NOT listed on a given date, not just \"we have no record\". <b>Append-only</b> — an RFC 6962 consistency proof that the register at any past size is a prefix of the register now, so a back-dated listing is arithmetically impossible to hide, and it verifies with any standard Certificate Transparency verifier rather than one of ours. <b>Revocation</b> — a delisted entry does not vanish; the revocation is sealed and the history stays readable.",
+  "Nobody is listed because an operator typed them in. A domain lists itself by proving it controls the domain — either a manifest that names itself, or a one-time token it serves at a path we name. The registrar is auditable against the registrar. That is the product.",
+  "Status words are deliberately not \"compliant\" or \"certified\": unverified, checks-passed, checks-failed, stale, withdrawn, revoked — each meaning exactly what the checks observed on the day, and nothing more."
+ ],
+ routes:[["/x/register/list","who is listed"],["/x/register/spec","how it works"],["/x/register/absence","prove a domain was not listed"]],
+ limit:"A check observes what a URL served at a moment in time. It cannot know what a domain did not seal, and domain control proves control of the domain, not the truth of anything the domain declares.",
+ to:["aitxt","completeness","forks","chain"]
+},
+{
+ id:"engine-state", c:"open", label:"Live engine state", size:1.0,
+ lede:"The engine reports its own live sealed state, read at the moment you ask — and says so plainly when it cannot.",
+ body:[
+  "A public endpoint that reads the real current chain tip and height at request time and returns them, alongside the engine's token budget. Refresh it and it moves, because it is live — not a screenshot, not a constant.",
+  "It never returns a reassuring value it cannot stand behind: if the live chain cannot be read, it reports that honestly rather than reporting \"sealed\". The tip it returns matches the witness tip, because both read the same real chain — so the two endpoints check each other.",
+  "The token budget it reports is the engine's <b>headroom for complex, high-context decisions</b> — the capacity to take on the messy real-world cases and still seal every one, not just the simple ones. It is a capacity figure, not a count of anything sealed."
+ ],
+ routes:[["/x/sebbi_engine/verify","the live state"],["/x/witness/tip","cross-check the tip"]],
+ to:["chain","sonicboom","verify-all"]
+},
+{
+ id:"game", c:"open", label:"Play the game", size:0.8,
+ lede:"Not part of the engine — just a bit of fun. Tap through.",
+ body:[
+  "Everything else on this map is real infrastructure you can check for yourself. This one is a gimmick. Go on, have a go."
+ ],
+ routes:[["/aileash-game.html","play it"]],
+ to:["proving-ground"]
+}
+]
+
+/* ============================================================
+   GRAPH
+   ============================================================ */
+const byId = {}; N.forEach(n=>byId[n.id]=n);
+const E = [];
+const seen = new Set();
+N.forEach(n => (n.to||[]).forEach(t=>{
+  if(!byId[t]) return;
+  const k = [n.id,t].sort().join("|");
+  if(seen.has(k)) return; seen.add(k);
+  E.push({a:n, b:byId[t]});
+}));
+
+const cv = document.getElementById("c"), ctx = cv.getContext("2d");
+let W=0,H=0,DPR=1;
+let cam={x:0,y:0,z:1}, tgt={x:0,y:0,z:1};
+let active=null, hover=null, filter=null, query="";
+const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+function resize(){
+  DPR = Math.min(devicePixelRatio||1, 2);
+  W = cv.clientWidth; H = cv.clientHeight;
+  cv.width = W*DPR; cv.height = H*DPR;
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+}
+addEventListener("resize", resize);
+
+// seed positions by cluster ring
+const order = Object.keys(CLUSTERS);
+N.forEach((n,i)=>{
+  const ci = order.indexOf(n.c);
+  const ang = (i/N.length)*Math.PI*2 + ci;
+  const r = 150 + ci*95 + (i%4)*22;
+  n.x = Math.cos(ang)*r; n.y = Math.sin(ang)*r*0.82;
+  n.vx = 0; n.vy = 0;
+  n.r = 15*(n.size||1) * (n.core?1.22:1);
+  n.a = 0; // reveal alpha
+});
+
+function physics(){
+  for(let i=0;i<N.length;i++){
+    const a=N[i];
+    for(let j=i+1;j<N.length;j++){
+      const b=N[j];
+      let dx=b.x-a.x, dy=b.y-a.y;
+      let d2=dx*dx+dy*dy; if(d2<1) d2=1;
+      const d=Math.sqrt(d2);
+      const min=(a.r+b.r)*3.6;
+      const f = (d<min ? 2600/d2 : 900/d2);
+      const ux=dx/d, uy=dy/d;
+      a.vx-=ux*f; a.vy-=uy*f; b.vx+=ux*f; b.vy+=uy*f;
+    }
+  }
+  E.forEach(e=>{
+    const dx=e.b.x-e.a.x, dy=e.b.y-e.a.y;
+    const d=Math.hypot(dx,dy)||1;
+    const rest=225;
+    const f=(d-rest)*0.0055;
+    const ux=dx/d, uy=dy/d;
+    e.a.vx+=ux*f; e.a.vy+=uy*f; e.b.vx-=ux*f; e.b.vy-=uy*f;
+  });
+  N.forEach(n=>{
+    n.vx -= n.x*0.0016; n.vy -= n.y*0.0022;
+    n.vx*=0.86; n.vy*=0.86;
+    n.x+=n.vx; n.y+=n.vy;
+  });
+}
+for(let i=0;i<560;i++) physics();
+
+/* ---------- ember field ---------- */
+// drifting dust
+const DUST=[]; for(let i=0;i<200;i++) DUST.push({x:Math.random(),y:Math.random(),s:Math.random()*1.3+.25,p:Math.random()*6.28,v:Math.random()*.00006+.00002});
+// per-node particle cloud — precomputed, cheap to draw
+N.forEach(n=>{
+  const count = Math.round(16 + n.r*1.5);
+  n.pts=[];
+  for(let i=0;i<count;i++){
+    const a=Math.random()*6.283;
+    const rr=Math.pow(Math.random(),.55);
+    n.pts.push({a, rr, s:Math.random()*1.5+.4, ph:Math.random()*6.28, sp:.12+Math.random()*.3});
+  }
+});
+// filament jitter seeds per edge
+E.forEach((e,i)=>{ e.seed=i*13.37; e.bow=(Math.random()-.5)*46; });
+
+function visible(n){
+  if(filter && n.c!==filter) return false;
+  if(query){
+    const hay=(n.label+" "+n.lede+" "+n.body.join(" ")).toLowerCase();
+    if(!hay.includes(query)) return false;
+  }
+  return true;
 }
 
-async function loadMine(){
-  KEY=document.getElementById("apikey").value.trim();
-  var m=document.getElementById("loginMsg");
-  if(!KEY){m.className="msg err";m.textContent="Paste your key first.";return;}
-  m.className="msg";m.textContent="Checking...";
+function filament(e,lit,dim,t){
+  const mx=(e.a.x+e.b.x)/2, my=(e.a.y+e.b.y)/2;
+  const dx=e.b.x-e.a.x, dy=e.b.y-e.a.y, L=Math.hypot(dx,dy)||1;
+  const nx=-dy/L, ny=dx/L;
+  const threads = lit?4:2;
+  for(let k=0;k<threads;k++){
+    const off=(k-(threads-1)/2)*2.4;
+    const bow=e.bow*0.35+off*3;
+    ctx.beginPath();
+    ctx.moveTo(e.a.x,e.a.y);
+    ctx.quadraticCurveTo(mx+nx*bow, my+ny*bow, e.b.x,e.b.y);
+    ctx.strokeStyle = lit ? "#ff9d3c" : "#6b4a2a";
+    ctx.globalAlpha = dim ? 0.04 : (lit ? 0.24 - k*0.04 : 0.13 - k*0.045);
+    ctx.lineWidth = lit ? 1.1 : 0.7;
+    ctx.stroke();
+  }
+  if(lit && !reduced){
+    for(let k=0;k<3;k++){
+      const p=((t*0.28 + k/3)%1);
+      const q=1-p;
+      const x=q*q*e.a.x + 2*q*p*(mx+nx*e.bow*0.35) + p*p*e.b.x;
+      const y=q*q*e.a.y + 2*q*p*(my+ny*e.bow*0.35) + p*p*e.b.y;
+      ctx.globalAlpha=0.85-k*0.22; ctx.fillStyle="#ffd08a";
+      ctx.fillRect(x-1.1,y-1.1,2.2,2.2);
+    }
+  }
+}
+
+let t0=performance.now();
+function draw(now){
+  const t=(now-t0)/1000;
+  cam.x += (tgt.x-cam.x)*0.12;
+  cam.y += (tgt.y-cam.y)*0.12;
+  cam.z += (tgt.z-cam.z)*0.12;
+
+  // ---- background: warm void, low horizon glow ----
+  ctx.globalAlpha=1;
+  ctx.fillStyle="#07050a"; ctx.fillRect(0,0,W,H);
+  const g=ctx.createRadialGradient(W*0.42,H*0.62,0,W*0.42,H*0.62,Math.max(W,H)*0.9);
+  g.addColorStop(0,"#22140e"); g.addColorStop(0.45,"#120b0c"); g.addColorStop(1,"#07050a");
+  ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
+
+  // dust
+  DUST.forEach(d=>{
+    if(!reduced) d.x += d.v; if(d.x>1) d.x-=1;
+    const tw = reduced?0.4:(0.25+0.3*Math.sin(t*0.8+d.p));
+    ctx.globalAlpha=tw*0.5; ctx.fillStyle="#c9a06a";
+    ctx.fillRect(d.x*W, d.y*H, d.s, d.s);
+  });
+
+  // scanline grain
+  ctx.globalAlpha=0.035; ctx.fillStyle="#000";
+  for(let y=0;y<H;y+=3) ctx.fillRect(0,y,W,1);
+  ctx.globalAlpha=1;
+
+  ctx.save();
+  ctx.translate(W/2+cam.x, H/2+cam.y); ctx.scale(cam.z,cam.z);
+
+  const neigh=new Set();
+  if(active) E.forEach(e=>{ if(e.a===active) neigh.add(e.b); if(e.b===active) neigh.add(e.a); });
+
+  // ---- filaments ----
+  E.forEach(e=>{
+    const va=visible(e.a), vb=visible(e.b);
+    const dim=(query||filter)&&!(va&&vb);
+    const lit=active&&(e.a===active||e.b===active);
+    filament(e,lit,dim,t);
+  });
+  ctx.globalAlpha=1;
+
+  // ---- nodes as ember clusters ----
+  N.forEach(n=>{
+    const vis=visible(n);
+    n.a += ((vis?1:0.1)-n.a)*0.15;
+    if(n.a<0.02) return;
+    const col=CLUSTERS[n.c].col;
+    const isA=n===active, isN=neigh.has(n), isH=n===hover;
+    const hot=isA||isH;
+    const r=n.r*(n.core&&!reduced ? 1+0.04*Math.sin(t*1.4+n.x*0.01) : 1);
+
+    // bloom
+    ctx.globalAlpha=n.a*(hot?0.85:(isN?0.5:0.32));
+    const rg=ctx.createRadialGradient(n.x,n.y,0,n.x,n.y,r*(hot?4.2:2.9));
+    rg.addColorStop(0,col+(hot?"88":"55"));
+    rg.addColorStop(0.35,col+"22");
+    rg.addColorStop(1,col+"00");
+    ctx.fillStyle=rg;
+    ctx.beginPath(); ctx.arc(n.x,n.y,r*(hot?4.2:2.9),0,6.29); ctx.fill();
+
+    // particle cloud
+    const spin = reduced?0:t*0.08;
+    ctx.globalAlpha=n.a*(hot?1:(isN?0.8:0.55));
+    ctx.fillStyle=col;
+    for(const q of n.pts){
+      const ang=q.a+spin*q.sp;
+      const rad=r*(0.55+q.rr*1.85)+(reduced?0:Math.sin(t*q.sp*3+q.ph)*1.6);
+      ctx.fillRect(n.x+Math.cos(ang)*rad, n.y+Math.sin(ang)*rad*0.92, q.s, q.s);
+    }
+
+    // hot core
+    ctx.globalAlpha=n.a;
+    ctx.beginPath(); ctx.arc(n.x,n.y,r*0.44,0,6.29);
+    ctx.fillStyle=hot?"#fff6e2":col; ctx.fill();
+    ctx.beginPath(); ctx.arc(n.x,n.y,r*0.44,0,6.29);
+    ctx.strokeStyle=col; ctx.lineWidth=hot?1.6:1; ctx.globalAlpha=n.a*0.9; ctx.stroke();
+
+    // live tick
+    if(n.live){
+      ctx.globalAlpha=n.a;
+      ctx.fillStyle=n._liveOk===false?"#b8624a":(n._liveOk?"#8fe3a8":"#6d6355");
+      ctx.fillRect(n.x+r*0.95, n.y-r*1.05, 3, 3);
+    }
+
+    // label — mono, upper, tracked
+    ctx.globalAlpha=n.a*(hot||isN||cam.z>0.7?1:0.5);
+    ctx.font="600 10px ui-monospace,Menlo,monospace";
+    ctx.textAlign="center"; ctx.textBaseline="top";
+    const lab=n.label.toUpperCase();
+    ctx.fillStyle="#0a0709"; ctx.globalAlpha=n.a*0.55;
+    ctx.fillText(lab, n.x+0.6, n.y+r*2.05+0.6);
+    ctx.globalAlpha=n.a*(hot||isN||cam.z>0.7?1:0.5);
+    ctx.fillStyle=hot?"#fff2dc":"#cbbfa9";
+    ctx.fillText(lab, n.x, n.y+r*2.05);
+  });
+
+  ctx.globalAlpha=1;
+  ctx.restore();
+
+  // vignette
+  const vg=ctx.createRadialGradient(W/2,H/2,Math.min(W,H)*0.42,W/2,H/2,Math.max(W,H)*0.78);
+  vg.addColorStop(0,"rgba(0,0,0,0)"); vg.addColorStop(1,"rgba(0,0,0,.62)");
+  ctx.fillStyle=vg; ctx.fillRect(0,0,W,H);
+
+  requestAnimationFrame(draw);
+}
+
+/* ---------- interaction ---------- */
+function toWorld(px,py){
+  return { x:(px-W/2-cam.x)/cam.z, y:(py-H/2-cam.y)/cam.z };
+}
+function hit(px,py){
+  const p=toWorld(px,py);
+  let best=null,bd=1e9;
+  N.forEach(n=>{
+    if(!visible(n)) return;
+    const d=Math.hypot(n.x-p.x,n.y-p.y);
+    if(d<n.r+13 && d<bd){bd=d;best=n;}
+  });
+  return best;
+}
+let drag=false, moved=0, lx=0, ly=0, pinch=0;
+cv.addEventListener("pointerdown",e=>{
+  drag=true; moved=0; lx=e.clientX; ly=e.clientY; cv.classList.add("drag");
+  cv.setPointerCapture(e.pointerId);
+});
+cv.addEventListener("pointermove",e=>{
+  if(drag){
+    const dx=e.clientX-lx, dy=e.clientY-ly;
+    moved+=Math.abs(dx)+Math.abs(dy);
+    tgt.x+=dx; tgt.y+=dy; cam.x+=dx; cam.y+=dy;
+    lx=e.clientX; ly=e.clientY;
+  } else {
+    const h=hit(e.clientX,e.clientY);
+    hover=h; cv.style.cursor=h?"pointer":"grab";
+  }
+});
+cv.addEventListener("pointerup",e=>{
+  drag=false; cv.classList.remove("drag");
+  if(moved<8){
+    const h=hit(e.clientX,e.clientY);
+    if(h) open(h); else close();
+  }
+});
+cv.addEventListener("wheel",e=>{
+  e.preventDefault();
+  tgt.z = Math.min(2.4, Math.max(0.35, tgt.z * (e.deltaY>0?0.9:1.11)));
+},{passive:false});
+
+// pinch
+let pts=new Map();
+cv.addEventListener("pointerdown",e=>pts.set(e.pointerId,e));
+cv.addEventListener("pointermove",e=>{
+  if(!pts.has(e.pointerId)) return;
+  pts.set(e.pointerId,e);
+  if(pts.size===2){
+    const [a,b]=[...pts.values()];
+    const d=Math.hypot(a.clientX-b.clientX,a.clientY-b.clientY);
+    if(pinch) tgt.z=Math.min(2.4,Math.max(0.35,tgt.z*(d/pinch)));
+    pinch=d; drag=false;
+  }
+});
+["pointerup","pointercancel"].forEach(ev=>cv.addEventListener(ev,e=>{pts.delete(e.pointerId); if(pts.size<2) pinch=0;}));
+
+/* ---------- panel ---------- */
+const panel=document.getElementById("panel");
+function esc(s){return s;}
+function open(n){
+  active=n;
+  document.getElementById("pcluster").textContent=CLUSTERS[n.c].name;
+  document.getElementById("pcluster").style.color=CLUSTERS[n.c].col;
+  document.getElementById("ptitle").textContent=n.label;
+  document.getElementById("plede").textContent=n.lede;
+
+  let h="";
+  if(n.live){
+    const L=LIVE[n.live];
+    h+=`<div class="live"><div class="lbl">live from ${L.url}</div><div class="val pending" id="lv">fetching…</div></div>`;
+  }
+  n.body.forEach(p=>h+=`<p>${p}</p>`);
+  if(n.limit) h+=`<div class="limit"><div class="lbl">honest limit</div><p>${n.limit}</p></div>`;
+  if(n.routes&&n.routes.length){
+    h+=`<h3>Check it yourself</h3><div class="routes">`;
+    n.routes.forEach(([u,t])=>h+=`<a href="${BASE}${u}" target="_blank" rel="noopener">${u}<span>${t}</span></a>`);
+    h+=`</div>`;
+  }
+  const rel=[...new Set([...(n.to||[]), ...E.filter(e=>e.b===n).map(e=>e.a.id)])].filter(x=>byId[x]);
+  if(rel.length){
+    h+=`<h3>Connected</h3><div class="links">`;
+    rel.forEach(id=>h+=`<button data-go="${id}">${byId[id].label}</button>`);
+    h+=`</div>`;
+  }
+  const pb=document.getElementById("pbody");
+  pb.innerHTML=h; pb.scrollTop=0;
+  pb.querySelectorAll("[data-go]").forEach(b=>b.onclick=()=>{ open(byId[b.dataset.go]); centre(byId[b.dataset.go]); });
+  panel.classList.add("open");
+  centre(n);
+  if(n.live) fillLive(n);
+}
+function centre(n){
+  const wide = innerWidth>760;
+  tgt.x = -n.x*tgt.z + (wide? -215 : 0);
+  tgt.y = -n.y*tgt.z + (wide? 0 : -H*0.16);
+}
+function close(){ active=null; panel.classList.remove("open"); }
+document.getElementById("close").onclick=close;
+addEventListener("keydown",e=>{ if(e.key==="Escape") close(); });
+
+/* ---------- live data ---------- */
+const cache={};
+async function fetchLive(key){
+  if(cache[key]) return cache[key];
+  const L=LIVE[key];
+  const p=(async()=>{
+    const r=await fetch(BASE+L.url,{headers:{accept:"application/json"}});
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    return L.render(await r.json());
+  })();
+  cache[key]=p; return p;
+}
+async function fillLive(n){
+  const el=document.getElementById("lv"); if(!el) return;
   try{
-    var d=await api("/api/signal-pack/list",{});
-    if(d.error){m.className="msg err";m.textContent="Key not recognised.";return;}
-    document.getElementById("loginCard").classList.add("hide");
-    document.getElementById("app").classList.remove("hide");
-    renderMine(d.packs||[]);
-  }catch(e){m.className="msg err";m.textContent="Connection error.";}
+    const v=await fetchLive(n.live);
+    if(document.getElementById("lv")===el){ el.textContent=v; el.className="val"; }
+    n._liveOk=true;
+  }catch(err){
+    if(document.getElementById("lv")===el){
+      el.textContent="not reachable from here — open the route directly";
+      el.className="val fail";
+    }
+    n._liveOk=false;
+  }
 }
+// warm the routes: colour the node ticks and fill the instrument row
+function hudSet(key,txt,cls){
+  const el=document.querySelector('[data-hud="'+key+'"]');
+  if(el){ el.textContent=txt; el.className="v"+(cls?" "+cls:""); }
+}
+Object.keys(LIVE).forEach(k=>{
+  const L=LIVE[k];
+  fetch(BASE+L.url,{headers:{accept:"application/json"}})
+    .then(r=>{ if(!r.ok) throw 0; return r.json(); })
+    .then(d=>{
+      cache[k]=Promise.resolve(L.render(d));
+      N.forEach(n=>{ if(n.live===k) n._liveOk=true; });
+      if(L.hud) hudSet(k, L.hud(d));
+    })
+    .catch(()=>{
+      N.forEach(n=>{ if(n.live===k) n._liveOk=false; });
+      if(L.hud) hudSet(k,"offline","fail");
+    });
+});
 
-function loadStarter(name){
-  document.getElementById("packname").value=name;
-  document.getElementById("packsignals").value=JSON.stringify(STARTERS[name],null,2);
-}
+/* ---------- chips & search ---------- */
+const chips=document.getElementById("chips");
+Object.entries(CLUSTERS).forEach(([k,v])=>{
+  const b=document.createElement("button");
+  b.className="chip"; b.textContent=v.name; b.dataset.k=k; b.dataset.on="0";
+  b.onclick=()=>{
+    filter=(filter===k)?null:k;
+    [...chips.children].forEach(c=>{
+      const on=c.dataset.k===filter;
+      c.dataset.on=on?"1":"0";
+      c.style.background = on?CLUSTERS[c.dataset.k].col:"transparent";
+      c.style.color = on?"#0b0709":"";
+    });
+  };
+  chips.appendChild(b);
+});
+document.getElementById("q").addEventListener("input",e=>{ query=e.target.value.trim().toLowerCase(); });
+document.getElementById("reset").onclick=()=>{
+  tgt={x:0,y:0,z: innerWidth<520?0.52:0.8}; close();
+  query=""; document.getElementById("q").value="";
+  filter=null; [...chips.children].forEach(c=>{c.dataset.on="0";c.style.background="transparent";c.style.color="";});
+};
 
-async function createPack(){
-  var name=document.getElementById("packname").value.trim();
-  var raw=document.getElementById("packsignals").value.trim();
-  var m=document.getElementById("createMsg");
-  if(!name){m.className="msg err";m.textContent="Give the pack a name.";return;}
-  var sig;
-  try{sig=JSON.parse(raw);}catch(e){m.className="msg err";m.textContent="Signals must be valid JSON, e.g. {\"bias\": 0.15}";return;}
-  m.className="msg";m.textContent="Sealing...";
-  var d=await api("/api/signal-pack/create",{name:name,signals:sig});
-  if(d.error){m.className="msg err";m.textContent=d.error;return;}
-  m.className="msg ok";m.textContent="Pack '"+esc(d.pack.name)+"' v"+d.pack.version+" created and sealed (block "+d.pack.block_index+").";
-  var l=await api("/api/signal-pack/list",{});renderMine(l.packs||[]);
-}
+/* ---------- boot ---------- */
+resize();
+tgt.z = innerWidth<520?0.52:0.8; cam.z=tgt.z*0.75;
+requestAnimationFrame(draw);
+setInterval(()=>{ if(!drag) physics(); }, 90);
 
-function renderMine(packs){
-  var el=document.getElementById("mypacks");
-  if(!packs.length){el.innerHTML='<div class="meta" style="color:#5a6178">No packs yet. Build one above.</div>';return;}
-  var h="";
-  packs.forEach(function(p){
-    h+='<div class="pack"><div class="nm">'+esc(p.name)+' <span class="meta">v'+esc(p.latest_version)+'</span></div>'
-      +'<div class="row" style="margin-top:8px">'
-      +'<button class="small ghost" onclick="publishPack(\''+esc(p.name)+'\')">Publish to library</button>'
-      +'<button class="small ghost" onclick="unpublishPack(\''+esc(p.name)+'\')">Make private</button>'
-      +'</div></div>';
-  });
-  el.innerHTML=h;
-}
-
-async function publishPack(name){
-  var author=prompt("Publish '"+name+"' to the public library.\n\nShow it as contributed by (name or company, optional):","")||"anonymous";
-  var d=await api("/api/signal-pack/publish",{name:name,author:author});
-  alert(d.error?("Error: "+d.error):"Published. It's now in the community library, marked unverified. You can make it private again any time.");
-}
-async function unpublishPack(name){
-  await api("/api/signal-pack/unpublish",{name:name});
-  alert("'"+name+"' is now private.");
-}
-
-async function loadLibrary(){
-  var el=document.getElementById("library");
-  el.innerHTML='<div class="meta" style="color:#5a6178">Loading...</div>';
-  var d=await api("/api/signal-pack/library",{});
-  var lib=d.library||[];
-  if(!lib.length){el.innerHTML='<div class="meta" style="color:#5a6178">No published packs yet. Be the first.</div>';return;}
-  var h="";
-  lib.forEach(function(p){
-    h+='<div class="pack"><div class="nm">'+esc(p.name)+' <span class="badge pub">community</span></div>'
-      +'<div class="meta">by '+esc(p.author)+' &middot; v'+esc(p.version)+' &middot; '+Object.keys(p.signals||{}).length+' signals</div>'
-      +'<button class="small ghost" style="margin-top:8px" onclick=\'useLibPack("'+esc(p.name)+'",'+JSON.stringify(JSON.stringify(p.signals))+')\'>Load into builder</button>'
-      +'</div>';
-  });
-  el.innerHTML=h;
-}
-function useLibPack(name,sigStr){
-  document.getElementById("packname").value=name;
-  var sig=JSON.parse(sigStr);
-  var flat={};for(var k in sig){flat[k]=(sig[k]&&sig[k].weight!=null)?sig[k].weight:sig[k];}
-  document.getElementById("packsignals").value=JSON.stringify(flat,null,2);
-  window.scrollTo(0,0);
-}
+const toast=document.getElementById("toast");
+function say(m){ toast.textContent=m; toast.classList.add("show"); setTimeout(()=>toast.classList.remove("show"),3400); }
+document.getElementById("hudn").textContent = N.length;
+setTimeout(()=>say("Start anywhere — try THE HASH CHAIN"),900);
 </script>
 </body>
 </html>
-
-```
-
-
-## `sitemap.xml`
-
-71 lines, 1760 bytes
-
-```
-<?xml version="1.0" encoding="UTF-8"?>
-<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"
-        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-        xsi:schemaLocation="http://www.sitemaps.org/schemas/sitemap/0.9
-        http://www.sitemaps.org/schemas/sitemap/0.9/sitemap.xsd">
-
-  <url>
-    <loc>https://sebbi.pro/</loc>
-    <lastmod>2026-06-23</lastmod>
-    <changefreq>weekly</changefreq>
-    <priority>1.0</priority>
-  </url>
-
-  <url>
-    <loc>https://sebbi.pro/compliance-assistant</loc>
-    <lastmod>2026-06-23</lastmod>
-    <changefreq>weekly</changefreq>
-    <priority>0.95</priority>
-  </url>
-
-  <url>
-    <loc>https://sebbi.pro/guardian-app</loc>
-    <lastmod>2026-06-23</lastmod>
-    <changefreq>weekly</changefreq>
-    <priority>0.95</priority>
-  </url>
-
-  <url>
-    <loc>https://sebbi.pro/sonicboom</loc>
-    <lastmod>2026-06-23</lastmod>
-    <changefreq>weekly</changefreq>
-    <priority>0.95</priority>
-  </url>
-
-  <url>
-    <loc>https://sebbi.pro/sentinel</loc>
-    <lastmod>2026-06-23</lastmod>
-    <changefreq>weekly</changefreq>
-    <priority>0.95</priority>
-  </url>
-
-  <url>
-    <loc>https://sebbi.pro/reseller</loc>
-    <lastmod>2026-06-23</lastmod>
-    <changefreq>weekly</changefreq>
-    <priority>0.90</priority>
-  </url>
-
-  <url>
-    <loc>https://sebbi.pro/scan</loc>
-    <lastmod>2026-06-23</lastmod>
-    <changefreq>weekly</changefreq>
-    <priority>0.85</priority>
-  </url>
-
-  <url>
-    <loc>https://sebbi.pro/report-threat</loc>
-    <lastmod>2026-06-23</lastmod>
-    <changefreq>monthly</changefreq>
-    <priority>0.70</priority>
-  </url>
-
-  <url>
-    <loc>https://sebbi.pro/contact</loc>
-    <lastmod>2026-06-23</lastmod>
-    <changefreq>monthly</changefreq>
-    <priority>0.65</priority>
-  </url>
-
-</urlset>
 
 ```

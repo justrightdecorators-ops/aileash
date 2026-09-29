@@ -1,1393 +1,1460 @@
-# Codebase — part 30 of 46
+# Codebase — part 30 of 43
 
 Contains:
-- `modules/witnessed.py`
-- `ai_act_ranker.py`
-- `aigrade_insert.py`
-- `aileash_reporter.py`
-- `aileash_signed_client.py`
-- `aileash_verify.py`
-- `anchor.py`
+- `tests/attack_continuity_1.py`
+- `tests/attack_continuity_2.py`
+- `tests/attack_continuity_3.py`
+- `tests/attack_continuity_4.py`
+- `tests/attack_continuity_5.py`
+- `tests/attack_continuity_6.py`
+- `tests/attack_witnessed.py`
+- `verify_authority.py`
+- `AILeash-API-Reference-v6.4.2.md`
+- `LICENCE`
 
 
-## `modules/witnessed.py`
+## `tests/attack_continuity_1.py`
 
-600 lines, 26111 bytes
+440 lines, 22747 bytes
 
 ```python
 #!/usr/bin/env python3
-"""
-modules/witnessed.py  -  what an outside party had already seen, and when
+"""Attack harness for modules/lineage.py.
 
-THE HOLE THIS CLOSES
---------------------
-Authority continuity (modules/continuity.py) derives an action back to a human
-grant and re-checks every hop at execution. It is the strongest thing on this
-platform and it has one gap, which is stated plainly in its own spec and is
-worth restating here because it is the whole reason this module exists:
-
-    the authorising principal, the scope and the approver all arrive on the
-    request. There is no external source to ask. A well-formed grant that
-    was never issued would pass every check we run.
-
-Nothing inside a system can close that, because every term in the check is
-produced by the party being checked. An auditor does not ask a company for its
-cash balance. They ask the bank.
-
-We have a bank. Since 1 August 2026 independent chains have been sealing this
-chain's tip hourly into logs this operator cannot write to. That machinery was
-built for a different purpose - stopping us backdating the decision record -
-and it turns out to answer a question nobody pointed it at:
-
-    a grant sealed at tree size M, and a peer that sealed our root at tree
-    size N >= M at time T, means the grant existed before T, in a record
-    the operator cannot reach.
-
-That does not make a grant legitimate. It makes it impossible to invent one
-afterwards - which is the attack that actually matters. When something goes
-wrong, the tempting move is not to forge a signature. It is to produce a
-perfectly well-formed authorisation dated last Tuesday. This is the thing that
-stops that, and it needs no new protocol, no consortium and no cooperation
-beyond the tip exchange already running.
-
-WHAT IT ADDS
-------------
-  - an attestation record: our tree size and root, submitted to a named peer,
-    with whatever that peer returned, sealed into our own chain
-  - for any grant or any sealed record, the EARLIEST external attestation
-    that covers it, and the exact routes a third party runs to check that
-    against the peer's own host rather than ours
-  - a latency figure nobody publishes: how long a grant sat unwitnessed. A
-    grant witnessed nine seconds after issue is a different object from one
-    witnessed nine days after, and both are stated
-
-WHAT IT REFUSES TO DO
----------------------
-  - it never certifies a peer's answer. Every response is recorded verbatim
-    and marked unverified; the verification plan points at the peer's host
-  - it never rewrites the meaning of an old attestation. A submission is
-    sealed when it is made and is not amended
-  - it does not claim a witnessed grant is a legitimate grant, anywhere, in
-    any wording. Existence before a time is the entire claim
-
-    POST /x/witnessed/submit    push the current head to a peer   (keyed)
-    GET  /x/witnessed/grant     earliest cover for a grant        (public)
-    GET  /x/witnessed/record    earliest cover for any receipt    (public)
-    GET  /x/witnessed/heads     every attestation on record       (public)
-    GET  /x/witnessed/status    coverage, and the honest gaps     (public)
-    GET  /x/witnessed/spec      the rules, in full                (public)
+Every test is written from the position of an agent that HAS some authority
+and is trying to end up with more. Passing means the attack was refused for
+the right reason, not merely refused.
 """
 
 import hashlib
 import json
-import re
-import socket
+import sqlite3
+import threading
 import time
-import urllib.request
-from datetime import datetime, timezone
-from urllib.parse import urlparse
+import sys
 
-VERSION = "1.0"
+import continuity as lineage
+# --- stand-in for the deployed engine ---------------------------------
+import types as _types
+_ENGINE = {"verdict": "ALLOW"}
 
-PUBLIC = {("GET", "grant"), ("GET", "record"), ("GET", "heads"),
-          ("GET", "status"), ("GET", "spec")}
+def install_engine(verdict="ALLOW", raises=False, shape="dict"):
+    _ENGINE["verdict"] = verdict
+    mod = _types.ModuleType("server")
+    mod.get_bearer = lambda *a, **k: None
+    def score_event(event):
+        if raises:
+            raise RuntimeError("engine down")
+        if shape == "dict":
+            return {"decision": _ENGINE["verdict"], "score": 0.1}
+        if shape == "tuple":
+            return (_ENGINE["verdict"], 0.1)
+        return _ENGINE["verdict"]
+    mod.score_event = score_event
+    sys.modules["server"] = mod
 
-HEAD_PREFIX = b"AILEASH-WITNESSED-HEAD-v1:"
-TIMEOUT = 8
-MAX_BYTES = 256 * 1024
+def remove_engine():
+    sys.modules.pop("server", None)
 
-_ready = False
+install_engine("ALLOW")
 
 
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
+PASS, FAIL = [], []
+
+
+def make_ctx():
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    lock = threading.RLock()
+    chain = {"n": 0, "prev": "0" * 64}
+
+    def seal(ev, res, ts, api_key):
+        chain["n"] += 1
+        payload = json.dumps([ev, res, ts, api_key, chain["prev"]], sort_keys=True)
+        h = hashlib.sha256(payload.encode()).hexdigest()
+        chain["prev"] = h
+        return h, chain["n"], chain["n"]
+
+    lineage._ready = False
+    ctx = {"conn": conn, "lock": lock, "seal": seal}
+    lineage._setup(ctx)
+    return ctx
+
+
+def check(name, condition, detail=""):
+    (PASS if condition else FAIL).append(name)
+    print(("  ok   " if condition else "  FAIL ") + name + (("  -> " + detail) if detail and not condition else ""))
+
+
+def issue(ctx, **kw):
+    if kw.get("parent") and int(kw.get("delegations_left", 0)) > 0 \
+            and not kw.get("risk_accepted_by"):
+        kw["risk_accepted_by"] = "owner@example.com"
+    return lineage._issue(ctx, "k", kw)
+
+
+def exercise(ctx, **kw):
+    return lineage._evaluate(ctx, "k", kw)
+
+
+NOW = time.time()
+HOUR = 3600
+
+
+def base_root(ctx, **over):
+    args = dict(
+        id="root", issuer="justin@monop", issuer_kind="human",
+        subject="orchestrator", subject_kind="agent",
+        scope=["payments.refund", "payments.read", "tickets.*"],
+        constraints={"max_amount": 5000, "allowed_currency": ["GBP", "EUR"],
+                     "denied_country": ["KP"], "may_contact_customer": True},
+        purpose="resolve customer refund complaints",
+        purpose_tags=["refunds", "support"],
+        not_before=NOW - HOUR, not_after=NOW + 10 * HOUR,
+        delegations_left=3)
+    args.update(over)
+    return issue(ctx, **args)
+
+
+print("\n=== 1. the happy path must actually work ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent",
+      subject="refund-agent", scope=["payments.refund"],
+      constraints={"max_amount": 500, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="issue refunds under 500", purpose_tags=["refunds"],
+      not_before=NOW - HOUR, not_after=NOW + 2 * HOUR, delegations_left=1)
+r, code = exercise(ctx, grant="mid", action="payments.refund",
+                   params={"amount": 100, "currency": "GBP", "country": "GB",
+                           "contact_customer": True},
+                   purpose_tag="refunds")
+check("a derivable action returns ALLOW", r["verdict"] == "ALLOW", str(r["reasons"]))
+check("lineage names the human at the root", r["authorised_by"] == "justin@monop")
+check("depth is reported", r["delegation_depth"] == 1)
+check("the decision is sealed", bool(r.get("sealed_in_chain")))
+
+print("\n=== 2. orphan root: an agent grants itself authority ===")
+ctx = make_ctx()
+r, code = issue(ctx, id="self", issuer="rogue-agent", issuer_kind="agent",
+                subject="rogue-agent", scope=["payments.refund"],
+                constraints={"max_amount": 999999}, purpose="whatever I decide",
+                purpose_tags=["anything"], not_after=NOW + HOUR)
+check("self-issued root is refused at issue", code == 409 and r.get("error") == "identity_continuity", str(r))
+
+print("\n=== 3. scope escalation in a child ===")
+ctx = make_ctx()
+base_root(ctx)
+r, code = issue(ctx, id="wide", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="rogue", scope=["payments.refund", "payments.transfer"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                             "denied_country": ["KP"], "may_contact_customer": False},
+                purpose="sneak in a transfer", purpose_tags=["refunds"],
+                not_after=NOW + HOUR, delegations_left=0)
+check("scope the parent never held is refused",
+      code == 409 and "payments.transfer" in r.get("message", ""), str(r))
+
+print("\n=== 4. constraint loosening ===")
+ctx = make_ctx()
+base_root(ctx)
+r, code = issue(ctx, id="rich", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="rogue", scope=["payments.refund"],
+                constraints={"max_amount": 50000, "allowed_currency": ["GBP"],
+                             "denied_country": ["KP"], "may_contact_customer": True},
+                purpose="bigger refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+check("raising a max_ cap is refused", code == 409 and "max_amount" in r.get("message", ""), str(r))
+
+r, code = issue(ctx, id="wide2", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="rogue", scope=["payments.refund"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP", "USD"],
+                             "denied_country": ["KP"], "may_contact_customer": True},
+                purpose="new currency", purpose_tags=["refunds"], not_after=NOW + HOUR)
+check("adding to an allowed_ set is refused", code == 409 and "USD" in r.get("message", ""), str(r))
+
+r, code = issue(ctx, id="undeny", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="rogue", scope=["payments.refund"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                             "denied_country": [], "may_contact_customer": True},
+                purpose="drop the denylist", purpose_tags=["refunds"], not_after=NOW + HOUR)
+check("dropping from a denied_ set is refused", code == 409 and "KP" in r.get("message", ""), str(r))
+
+r, code = issue(ctx, id="newkey", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="rogue", scope=["payments.refund"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                             "denied_country": ["KP"], "may_contact_customer": True,
+                             "may_export_data": True},
+                purpose="invent a permission", purpose_tags=["refunds"], not_after=NOW + HOUR)
+check("introducing a constraint key the parent never expressed is refused",
+      code == 409 and "may_export_data" in r.get("message", ""), str(r))
+
+print("\n=== 5. temporal attacks ===")
+ctx = make_ctx()
+base_root(ctx)
+r, code = issue(ctx, id="long", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="rogue", scope=["payments.refund"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                             "denied_country": ["KP"], "may_contact_customer": True},
+                purpose="outlive the parent", purpose_tags=["refunds"],
+                not_before=NOW, not_after=NOW + 100 * HOUR)
+check("a child cannot outlive its parent", code == 409 and r.get("error") == "temporal_validity", str(r))
+
+# expired ancestor, live leaf, forced in past the issue check
+ctx = make_ctx()
+base_root(ctx, not_after=NOW + HOUR)
+issue(ctx, id="child", parent="root", issuer="orchestrator", issuer_kind="agent",
+      subject="agent-b", scope=["payments.refund"],
+      constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+with ctx["lock"]:
+    ctx["conn"].execute("UPDATE auth_grant SET not_after=? WHERE id='root'", (NOW - 60,))
+    ctx["conn"].commit()
+r, _ = exercise(ctx, grant="child", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "GB",
+                        "contact_customer": True}, purpose_tag="refunds")
+check("an expired ancestor kills a live leaf", r["verdict"] == "BLOCK", str(r["reasons"]))
+check("...and it is reported as tampering, since the row no longer matches its digest",
+      r["broken_invariant"] == "evidence_continuity", r["broken_invariant"] or "")
+
+print("\n=== 6. revocation is transitive ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent",
+      subject="b", scope=["payments.refund"],
+      constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR, delegations_left=1)
+issue(ctx, id="leaf", parent="mid", issuer="b", issuer_kind="agent",
+      subject="c", scope=["payments.refund"],
+      constraints={"max_amount": 50, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+lineage._revoke(ctx, "k", {"grant": "mid", "reason": "agent compromised"})
+r, _ = exercise(ctx, grant="leaf", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "GB",
+                        "contact_customer": True}, purpose_tag="refunds")
+check("revoking the middle blocks the leaf without touching it", r["verdict"] == "BLOCK")
+check("the revoked grant is named", r["broken_at"] == "mid", str(r["broken_at"]))
+r2, _ = exercise(ctx, grant="root", action="payments.refund",
+                 params={"amount": 10, "currency": "GBP", "country": "GB",
+                         "contact_customer": True}, purpose_tag="refunds")
+check("revoking a child does not harm the parent", r2["verdict"] == "ALLOW", str(r2["reasons"]))
+
+print("\n=== 7. delegation depth cannot be manufactured ===")
+ctx = make_ctx()
+base_root(ctx, delegations_left=1)
+issue(ctx, id="d1", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.refund"],
+      constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR, delegations_left=0)
+r, code = issue(ctx, id="d2", parent="d1", issuer="b", issuer_kind="agent", subject="c",
+                scope=["payments.refund"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                             "denied_country": ["KP"], "may_contact_customer": True},
+                purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+check("an exhausted delegation budget stops the chain",
+      code == 409 and r.get("error") == "delegation_not_permitted", str(r))
+
+ctx = make_ctx()
+base_root(ctx, delegations_left=2)
+r, code = issue(ctx, id="greedy", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="b", scope=["payments.refund"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                             "denied_country": ["KP"], "may_contact_customer": True},
+                purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR,
+                delegations_left=5)
+check("a child cannot award itself more onward delegations than remained",
+      code == 409, str(r))
+
+print("\n=== 8. tampering with a stored grant ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.refund"],
+      constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+with ctx["lock"]:
+    ctx["conn"].execute(
+        "UPDATE auth_grant SET constraints=? WHERE id='mid'",
+        (json.dumps({"max_amount": 999999, "allowed_currency": ["GBP", "USD"],
+                     "denied_country": [], "may_contact_customer": True},
+                    sort_keys=True, separators=(",", ":")),))
+    ctx["conn"].commit()
+r, _ = exercise(ctx, grant="mid", action="payments.refund",
+                params={"amount": 900000, "currency": "USD", "country": "GB",
+                        "contact_customer": True}, purpose_tag="refunds")
+check("editing the database does not widen authority", r["verdict"] == "BLOCK")
+check("the tamper is reported as an evidence failure",
+      r["broken_invariant"] == "evidence_continuity", str(r["broken_invariant"]))
+
+print("\n=== 9. re-parenting onto a wider ancestor ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="narrow", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.read"],
+      constraints={"max_amount": 1, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": False},
+      purpose="read only", purpose_tags=["support"], not_after=NOW + HOUR)
+with ctx["lock"]:
+    ctx["conn"].execute("UPDATE auth_grant SET parent=NULL WHERE id='narrow'")
+    ctx["conn"].commit()
+r, _ = exercise(ctx, grant="narrow", action="payments.read",
+                params={}, purpose_tag="support")
+check("detaching a grant to make it a root fails integrity", r["verdict"] == "BLOCK",
+      str(r["reasons"]))
+
+print("\n=== 10. parent cycle ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="a", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.refund"],
+      constraints={"max_amount": 100, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR, delegations_left=1)
+issue(ctx, id="b", parent="a", issuer="b", issuer_kind="agent", subject="c",
+      scope=["payments.refund"],
+      constraints={"max_amount": 50, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+with ctx["lock"]:
+    ctx["conn"].execute("UPDATE auth_grant SET parent='b' WHERE id='a'")
+    ctx["conn"].commit()
+start = time.time()
+r, _ = exercise(ctx, grant="b", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "GB",
+                        "contact_customer": True}, purpose_tag="refunds")
+check("a parent cycle terminates rather than hangs", time.time() - start < 2)
+check("a cycle is BLOCKed as an authority failure", r["verdict"] == "BLOCK")
+
+print("\n=== 11. action parameters beyond the effective constraints ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.refund"],
+      constraints={"max_amount": 500, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+r, _ = exercise(ctx, grant="mid", action="payments.refund",
+                params={"amount": 501, "currency": "GBP", "country": "GB",
+                        "contact_customer": True}, purpose_tag="refunds")
+check("an amount over the cap is BLOCKed", r["verdict"] == "BLOCK", str(r["reasons"]))
+r, _ = exercise(ctx, grant="mid", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "KP",
+                        "contact_customer": True}, purpose_tag="refunds")
+check("a denied country is BLOCKed", r["verdict"] == "BLOCK", str(r["reasons"]))
+
+print("\n=== 12. uncertainty is challenged, not guessed ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.refund"],
+      constraints={"max_amount": 500, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="issue refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+r, _ = exercise(ctx, grant="mid", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "GB",
+                        "contact_customer": True}, purpose_tag="marketing")
+check("a purpose the grant does not carry is CHALLENGED", r["verdict"] == "CHALLENGE", str(r))
+r, _ = exercise(ctx, grant="mid", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "GB",
+                        "contact_customer": True})
+check("no declared purpose is CHALLENGED", r["verdict"] == "CHALLENGE", str(r))
+r, _ = exercise(ctx, grant="mid", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "GB",
+                        "contact_customer": True, "recipient_iban": "GB00XXXX"},
+                purpose_tag="refunds")
+check("an unconstrained parameter is CHALLENGED, not ignored",
+      r["verdict"] == "CHALLENGE" and any("recipient_iban" in x for x in r["reasons"]), str(r))
+
+print("\n=== 13. wildcard breadth ===")
+ctx = make_ctx()
+base_root(ctx)
+r, _ = exercise(ctx, grant="root", action="tickets.close.bulk.all",
+                params={}, purpose_tag="support")
+check("a broad wildcard match is CHALLENGED rather than silently allowed",
+      r["verdict"] == "CHALLENGE", str(r))
+
+ctx = make_ctx()
+base_root(ctx, scope=["*"], id="star")
+r, _ = exercise(ctx, grant="star", action="payments.transfer", params={}, purpose_tag="refunds")
+check("a bare * never reaches ALLOW", r["verdict"] == "CHALLENGE", str(r))
+
+print("\n=== 14. no union of grants ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="money", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.refund"],
+      constraints={"max_amount": 500, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": False},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+issue(ctx, id="contact", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.read"],
+      constraints={"max_amount": 0, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="contact", purpose_tags=["support"], not_after=NOW + HOUR)
+r, code = exercise(ctx, grant="money,contact", action="payments.refund",
+                   params={"amount": 10, "currency": "GBP", "contact_customer": True},
+                   purpose_tag="refunds")
+check("two grant ids cannot be combined into one exercise", r["verdict"] == "BLOCK", str(r))
+r, _ = exercise(ctx, grant="money", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "contact_customer": True},
+                purpose_tag="refunds")
+check("the capability from the sibling grant does not leak in", r["verdict"] == "BLOCK",
+      str(r["reasons"]))
+
+print("\n=== 15. time of check vs time of use ===")
+ctx = make_ctx()
+base_root(ctx)
+issue(ctx, id="mid", parent="root", issuer="orchestrator", issuer_kind="agent", subject="b",
+      scope=["payments.refund"],
+      constraints={"max_amount": 500, "allowed_currency": ["GBP"],
+                   "denied_country": ["KP"], "may_contact_customer": True},
+      purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+r, _ = exercise(ctx, grant="mid", action="payments.refund",
+                params={"amount": 10, "currency": "GBP", "country": "GB",
+                        "contact_customer": True}, purpose_tag="refunds")
+eval_id = r["evaluation"]
+c, code = lineage._confirm(ctx, "k", {"evaluation": eval_id, "action": "payments.refund",
+                                      "params": {"amount": 10, "currency": "GBP",
+                                                 "country": "GB", "contact_customer": True}})
+check("executing exactly what was evaluated binds", c["bound"] is True, str(c))
+c, code = lineage._confirm(ctx, "k", {"evaluation": eval_id, "action": "payments.refund",
+                                      "params": {"amount": 400, "currency": "GBP",
+                                                 "country": "GB", "contact_customer": True}})
+check("executing different values than were evaluated is rejected", c["bound"] is False, str(c))
+check("the rejected execution is still sealed", bool(c.get("sealed_in_chain")))
+
+with ctx["lock"]:
+    ctx["conn"].execute("UPDATE auth_eval SET valid_until=? WHERE id=?", (NOW - 1, eval_id))
+    ctx["conn"].commit()
+c, _ = lineage._confirm(ctx, "k", {"evaluation": eval_id})
+check("a banked evaluation cannot be spent after its window", c["bound"] is False, str(c))
+
+print("\n=== 16. a BLOCK is evidence, not silence ===")
+ctx = make_ctx()
+base_root(ctx)
+r, _ = exercise(ctx, grant="nonexistent", action="payments.refund", params={})
+check("an unknown grant BLOCKs", r["verdict"] == "BLOCK")
+check("the block is sealed in the chain", bool(r.get("sealed_in_chain")))
+d, code = lineage._decision(ctx, {"evaluation": r["evaluation"]})
+check("the sealed decision is publicly retrievable", code == 200 and d["verdict"] == "BLOCK")
+
+print("\n=== 17. no authority without a stated purpose or an end date ===")
+ctx = make_ctx()
+r, code = issue(ctx, id="forever", issuer="justin@monop", issuer_kind="human", subject="a",
+                scope=["payments.refund"], constraints={"max_amount": 1},
+                purpose="anything", purpose_tags=["x"])
+check("a grant with no expiry is refused", code == 400 and r.get("error") == "not_after_required")
+r, code = issue(ctx, id="vague", issuer="justin@monop", issuer_kind="human", subject="a",
+                scope=["payments.refund"], constraints={"max_amount": 1},
+                purpose="", purpose_tags=["x"], not_after=NOW + HOUR)
+check("a grant with no purpose is refused", code == 400 and r.get("error") == "purpose_required")
+
+print("\n" + "=" * 60)
+print("passed %d, failed %d" % (len(PASS), len(FAIL)))
+if FAIL:
+    for f in FAIL:
+        print("  FAILED: " + f)
+    sys.exit(1)
+
+```
+
+
+## `tests/attack_continuity_2.py`
+
+228 lines, 10573 bytes
+
+```python
+#!/usr/bin/env python3
+"""Second wave. The first wave tested the obvious escalations. This one
+tests the ones that would survive a code review."""
+
+import hashlib
+import json
+import sqlite3
+import threading
+import time
+import sys
+
+import continuity as lineage
+# --- stand-in for the deployed engine ---------------------------------
+import types as _types
+_ENGINE = {"verdict": "ALLOW"}
+
+def install_engine(verdict="ALLOW", raises=False, shape="dict"):
+    _ENGINE["verdict"] = verdict
+    mod = _types.ModuleType("server")
+    mod.get_bearer = lambda *a, **k: None
+    def score_event(event):
+        if raises:
+            raise RuntimeError("engine down")
+        if shape == "dict":
+            return {"decision": _ENGINE["verdict"], "score": 0.1}
+        if shape == "tuple":
+            return (_ENGINE["verdict"], 0.1)
+        return _ENGINE["verdict"]
+    mod.score_event = score_event
+    sys.modules["server"] = mod
+
+def remove_engine():
+    sys.modules.pop("server", None)
+
+install_engine("ALLOW")
+
+
+PASS, FAIL = [], []
+NOW = time.time()
+HOUR = 3600
+
+
+def make_ctx():
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    lock = threading.RLock()
+    n = {"i": 0}
+
+    def seal(ev, res, ts, api_key):
+        n["i"] += 1
+        return hashlib.sha256(json.dumps([ev, res, ts], sort_keys=True,
+                                         default=str).encode()).hexdigest(), n["i"], n["i"]
+    lineage._ready = False
+    ctx = {"conn": conn, "lock": lock, "seal": seal}
+    lineage._setup(ctx)
+    return ctx
+
+
+def check(name, cond, detail=""):
+    (PASS if cond else FAIL).append(name)
+    print(("  ok   " if cond else "  FAIL ") + name + (("  -> " + str(detail)[:300]) if detail and not cond else ""))
+
+
+def issue(ctx, **kw):
+    if kw.get("parent") and int(kw.get("delegations_left", 0)) > 0 \
+            and not kw.get("risk_accepted_by"):
+        kw["risk_accepted_by"] = "owner@example.com"
+    return lineage._issue(ctx, "k", kw)
+
+
+def root(ctx, **over):
+    args = dict(id="root", issuer="owner@example.com", issuer_kind="human",
+                subject="orchestrator", scope=["payments.refund", "payments.read"],
+                constraints={"max_amount": 5000, "allowed_currency": ["GBP", "EUR"]},
+                purpose="refunds", purpose_tags=["refunds"],
+                not_before=NOW - HOUR, not_after=NOW + 10 * HOUR, delegations_left=10)
+    args.update(over)
+    return issue(ctx, **args)
+
+
+print("\n=== 18. double execution against one ALLOW ===")
+ctx = make_ctx()
+root(ctx)
+r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments.refund",
+                                    "params": {"amount": 100, "currency": "GBP"},
+                                    "purpose_tag": "refunds"})
+eid = r["evaluation"]
+p = {"amount": 100, "currency": "GBP"}
+c1, _ = lineage._confirm(ctx, "k", {"evaluation": eid, "action": "payments.refund", "params": p})
+c2, _ = lineage._confirm(ctx, "k", {"evaluation": eid, "action": "payments.refund", "params": p})
+check("the first execution binds", c1["bound"] is True, c1)
+check("the same evaluation cannot be spent twice", c2["bound"] is False, c2)
+
+print("\n=== 19. type confusion in constraints ===")
+ctx = make_ctx()
+root(ctx, constraints={"max_amount": 5000, "allowed_currency": "GBP"})
+r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments.refund",
+                                    "params": {"amount": 10, "currency": "G"},
+                                    "purpose_tag": "refunds"})
+check("a single character does not satisfy a string-valued allowed_ list",
+      r["verdict"] == "BLOCK", r["reasons"])
+
+ctx = make_ctx()
+root(ctx)
+r, code = issue(ctx, id="strnum", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="b", scope=["payments.refund"],
+                constraints={"max_amount": "50000", "allowed_currency": ["GBP"]},
+                purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+check("a numeric cap passed as a string cannot beat the parent", code == 409, r)
+
+ctx = make_ctx()
+root(ctx)
+r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments.refund",
+                                    "params": {"amount": "99999", "currency": "GBP"},
+                                    "purpose_tag": "refunds"})
+check("a string amount is still compared numerically", r["verdict"] == "BLOCK", r["reasons"])
+
+ctx = make_ctx()
+root(ctx)
+r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments.refund",
+                                    "params": {"amount": True, "currency": "GBP"},
+                                    "purpose_tag": "refunds"})
+check("a non-numeric amount does not slip through as unconstrained",
+      r["verdict"] in ("BLOCK", "CHALLENGE"), r)
+
+print("\n=== 20. capability prefix tricks ===")
+ctx = make_ctx()
+root(ctx, scope=["payments.refund"])
+for probe in ["payments.refunds", "payments.refund.approve", "payments.refundX",
+              "Payments.Refund", "payments.refund "]:
+    r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": probe,
+                                        "params": {}, "purpose_tag": "refunds"})
+    check("'%s' is not covered by 'payments.refund'" % probe, r["verdict"] == "BLOCK", r["reasons"])
+
+ctx = make_ctx()
+root(ctx, scope=["payments.*"])
+r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments2.transfer",
+                                    "params": {}, "purpose_tag": "refunds"})
+check("'payments.*' does not cover 'payments2.transfer'", r["verdict"] == "BLOCK", r["reasons"])
+
+print("\n=== 21. a long but legitimate chain ===")
+ctx = make_ctx()
+root(ctx, constraints={"max_amount": 10000, "allowed_currency": ["GBP", "EUR"]},
+     delegations_left=12)
+parent, cap = "root", 10000
+for i in range(10):
+    cap = cap // 2
+    gid = "d%d" % i
+    r, code = issue(ctx, id=gid, parent=parent, issuer="a%d" % i, issuer_kind="agent",
+                    subject="a%d" % (i + 1), scope=["payments.refund"],
+                    constraints={"max_amount": cap, "allowed_currency": ["GBP"]},
+                    purpose="refunds", purpose_tags=["refunds"],
+                    not_after=NOW + HOUR, delegations_left=11 - i)
+    if code != 200:
+        break
+    parent = gid
+check("ten legitimate narrowing hops are accepted", code == 200 and parent == "d9", r)
+r, _ = lineage._evaluate(ctx, "k", {"grant": "d9", "action": "payments.refund",
+                                    "params": {"amount": 5, "currency": "GBP"},
+                                    "purpose_tag": "refunds"})
+check("the deep chain still ALLOWs a derivable action", r["verdict"] == "ALLOW", r["reasons"])
+check("the effective cap is the tightest in the chain",
+      float(r["effective_constraints"]["max_amount"]) == 9, r["effective_constraints"])
+check("the human at the root is still named ten hops down",
+      r["authorised_by"] == "owner@example.com")
+r, _ = lineage._evaluate(ctx, "k", {"grant": "d9", "action": "payments.refund",
+                                    "params": {"amount": 10, "currency": "GBP"},
+                                    "purpose_tag": "refunds"})
+check("one unit over the deepest cap is BLOCKed", r["verdict"] == "BLOCK", r["reasons"])
+
+print("\n=== 22. revoking the root kills the whole tree ===")
+lineage._revoke(ctx, "k", {"grant": "root", "reason": "principal withdrew authority"})
+r, _ = lineage._evaluate(ctx, "k", {"grant": "d9", "action": "payments.refund",
+                                    "params": {"amount": 1, "currency": "GBP"},
+                                    "purpose_tag": "refunds"})
+check("revoking the root blocks a leaf ten hops away", r["verdict"] == "BLOCK")
+check("the root is named as the break point", r["broken_at"] == "root", r["broken_at"])
+
+print("\n=== 23. issuing under a revoked or expired parent ===")
+ctx = make_ctx()
+root(ctx)
+lineage._revoke(ctx, "k", {"grant": "root", "reason": "x"})
+r, code = issue(ctx, id="after", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="b", scope=["payments.refund"],
+                constraints={"max_amount": 1, "allowed_currency": ["GBP"]},
+                purpose="refunds", purpose_tags=["refunds"], not_after=NOW + HOUR)
+check("no new delegation under a revoked parent", code == 409 and r.get("error") == "parent_revoked", r)
+
+print("\n=== 24. duplicate grant id cannot overwrite a grant ===")
+ctx = make_ctx()
+root(ctx)
+r, code = root(ctx, scope=["*"], constraints={"max_amount": 999999})
+check("re-issuing an existing id is refused", code == 409 and r.get("error") == "grant_exists", r)
+
+print("\n=== 25. the boundary values themselves ===")
+ctx = make_ctx()
+root(ctx, constraints={"max_amount": 100, "allowed_currency": ["GBP"]}, delegations_left=2)
+r, code = issue(ctx, id="equal", parent="root", issuer="orchestrator", issuer_kind="agent",
+                subject="b", scope=["payments.refund"],
+                constraints={"max_amount": 100, "allowed_currency": ["GBP"]},
+                purpose="refunds", purpose_tags=["refunds"],
+                not_after=NOW + 10 * HOUR, delegations_left=1)
+check("an equal-not-wider child is accepted", code == 200, r)
+r, _ = lineage._evaluate(ctx, "k", {"grant": "equal", "action": "payments.refund",
+                                    "params": {"amount": 100, "currency": "GBP"},
+                                    "purpose_tag": "refunds"})
+check("exactly the cap is allowed", r["verdict"] == "ALLOW", r["reasons"])
+r, _ = lineage._evaluate(ctx, "k", {"grant": "equal", "action": "payments.refund",
+                                    "params": {"amount": 100.01, "currency": "GBP"},
+                                    "purpose_tag": "refunds"})
+check("a penny over the cap is blocked", r["verdict"] == "BLOCK", r["reasons"])
+
+print("\n=== 26. a CHALLENGE cannot be executed ===")
+ctx = make_ctx()
+root(ctx)
+r, _ = lineage._evaluate(ctx, "k", {"grant": "root", "action": "payments.refund",
+                                    "params": {"amount": 1, "currency": "GBP"}})
+check("no declared purpose gives CHALLENGE", r["verdict"] == "CHALLENGE", r["verdict"])
+c, code = lineage._confirm(ctx, "k", {"evaluation": r["evaluation"],
+                                      "action": "payments.refund",
+                                      "params": {"amount": 1, "currency": "GBP"}})
+check("a CHALLENGE cannot be bound as an execution", c["bound"] is False, c)
+
+print("\n" + "=" * 60)
+print("passed %d, failed %d" % (len(PASS), len(FAIL)))
+for f in FAIL:
+    print("  FAILED: " + f)
+sys.exit(1 if FAIL else 0)
+
+```
+
+
+## `tests/attack_continuity_3.py`
+
+114 lines, 5626 bytes
+
+```python
+#!/usr/bin/env python3
+"""Third wave: concurrency, and reconstruction from evidence alone."""
+import hashlib, json, sqlite3, threading, time, sys
+import continuity as lineage
+# --- stand-in for the deployed engine ---------------------------------
+import types as _types
+_ENGINE = {"verdict": "ALLOW"}
+
+def install_engine(verdict="ALLOW", raises=False, shape="dict"):
+    _ENGINE["verdict"] = verdict
+    mod = _types.ModuleType("server")
+    mod.get_bearer = lambda *a, **k: None
+    def score_event(event):
+        if raises:
+            raise RuntimeError("engine down")
+        if shape == "dict":
+            return {"decision": _ENGINE["verdict"], "score": 0.1}
+        if shape == "tuple":
+            return (_ENGINE["verdict"], 0.1)
+        return _ENGINE["verdict"]
+    mod.score_event = score_event
+    sys.modules["server"] = mod
+
+def remove_engine():
+    sys.modules.pop("server", None)
+
+install_engine("ALLOW")
+
+
+PASS, FAIL = [], []
+NOW, HOUR = time.time(), 3600
+
+def make_ctx():
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    lock = threading.RLock(); n = {"i": 0}
+    def seal(ev, res, ts, k):
+        with lock:
+            n["i"] += 1
+            return hashlib.sha256(json.dumps([ev,res,ts],sort_keys=True,default=str).encode()).hexdigest(), n["i"], n["i"]
+    lineage._ready = False
+    ctx = {"conn": conn, "lock": lock, "seal": seal}
+    lineage._setup(ctx); return ctx
+
+def check(n, c, d=""):
+    (PASS if c else FAIL).append(n)
+    print(("  ok   " if c else "  FAIL ") + n + (("  -> " + str(d)[:250]) if d and not c else ""))
+
+print("\n=== 27. concurrent execution of one ALLOW ===")
+ctx = make_ctx()
+lineage._issue(ctx,"k",dict(id="root",issuer="owner@example.com",issuer_kind="human",
+    subject="agent",scope=["payments.refund"],constraints={"max_amount":5000},
+    purpose="refunds",purpose_tags=["refunds"],not_after=NOW+HOUR,delegations_left=0))
+r,_ = lineage._evaluate(ctx,"k",{"grant":"root","action":"payments.refund",
+    "params":{"amount":100},"purpose_tag":"refunds"})
+eid = r["evaluation"]; results = []
+def race():
+    c,_ = lineage._confirm(ctx,"k",{"evaluation":eid,"action":"payments.refund","params":{"amount":100}})
+    results.append(c["bound"])
+ts = [threading.Thread(target=race) for _ in range(8)]
+[t.start() for t in ts]; [t.join() for t in ts]
+check("exactly one of eight concurrent executions binds", results.count(True) == 1, results)
+with ctx["lock"]:
+    rows = ctx["conn"].execute("SELECT COUNT(*) FROM auth_exec WHERE eval_id=? AND outcome<>'rejected'",(eid,)).fetchone()
+check("only one accepted binding exists in storage", rows[0] == 1, rows)
+
+print("\n=== 28. reconstruct the whole story from the sealed record ===")
+ctx = make_ctx()
+lineage._issue(ctx,"k",dict(id="r",issuer="owner@example.com",issuer_kind="human",
+    subject="orchestrator",scope=["payments.*"],constraints={"max_amount":5000},
+    purpose="close the refund backlog",purpose_tags=["refunds"],
+    not_after=NOW+HOUR,delegations_left=2))
+lineage._issue(ctx,"k",dict(id="m",parent="r",issuer="orchestrator",issuer_kind="agent",
+    subject="refund-bot",scope=["payments.refund"],constraints={"max_amount":200},
+    purpose="issue small refunds",purpose_tags=["refunds"],not_after=NOW+HOUR,delegations_left=0))
+r,_ = lineage._evaluate(ctx,"k",{"grant":"m","action":"payments.refund",
+    "params":{"amount":150},"purpose_tag":"refunds"})
+t,code = lineage._trace(ctx,{"grant":"m"})
+check("the trace names who authorised it", t["authorised_by"] == "owner@example.com")
+check("the trace names who held it at execution", t["holder"] == "refund-bot")
+check("the trace shows what changed at each hop",
+      t["lineage"][0]["scope"] == ["payments.*"] and t["lineage"][1]["scope"] == ["payments.refund"])
+check("the effective constraint is the narrowest, not the granted one",
+      float(t["effective_constraints"]["max_amount"]) == 200, t["effective_constraints"])
+d,code = lineage._decision(ctx,{"evaluation":r["evaluation"]})
+check("the decision is retrievable without a key and matches", d["verdict"] == r["verdict"])
+check("the decision carries the lineage digest", d["lineage_digest"] == r["lineage_digest"])
+check("every hop carries its own block index",
+      all(h["block_index"] for h in t["lineage"]))
+
+print("\n=== 29. widening midway is visible in the trace, not just blocked ===")
+ctx = make_ctx()
+lineage._issue(ctx,"k",dict(id="r",issuer="owner@example.com",issuer_kind="human",
+    subject="a",scope=["payments.refund"],constraints={"max_amount":100},
+    purpose="p",purpose_tags=["refunds"],not_after=NOW+HOUR,delegations_left=2))
+lineage._issue(ctx,"k",dict(id="m",parent="r",issuer="a",issuer_kind="agent",
+    subject="b",scope=["payments.refund"],constraints={"max_amount":100},
+    purpose="p",purpose_tags=["refunds"],not_after=NOW+HOUR,delegations_left=1,
+    risk_accepted_by="owner@example.com"))
+with ctx["lock"]:
+    ctx["conn"].execute("UPDATE auth_grant SET constraints=? WHERE id='m'",
+        (json.dumps({"max_amount":100000},sort_keys=True,separators=(",",":")),))
+    ctx["conn"].commit()
+t,_ = lineage._trace(ctx,{"grant":"m"})
+check("the trace flags the altered hop by name",
+      t["lineage"][1]["integrity"] == "FAILED" and t["lineage"][0]["integrity"] == "ok", t["lineage"])
+r,_ = lineage._evaluate(ctx,"k",{"grant":"m","action":"payments.refund",
+    "params":{"amount":50},"purpose_tag":"refunds"})
+check("and the exercise names the exact grant that broke", r["broken_at"] == "m", r["broken_at"])
+
+print("\n" + "="*60)
+print("passed %d, failed %d" % (len(PASS), len(FAIL)))
+for f in FAIL: print("  FAILED: "+f)
+sys.exit(1 if FAIL else 0)
+
+```
+
+
+## `tests/attack_continuity_4.py`
+
+107 lines, 4723 bytes
+
+```python
+#!/usr/bin/env python3
+"""Fourth wave: does it actually compose with the existing engine, and can
+either side be bypassed by the other?"""
+import hashlib, json, sqlite3, threading, time, sys, types
+import continuity as C
+
+PASS, FAIL = [], []
+NOW, HOUR = time.time(), 3600
+STATE = {"verdict": "ALLOW", "raises": False, "shape": "dict", "seen": []}
+
+def install(verdict="ALLOW", raises=False, shape="dict"):
+    STATE.update(verdict=verdict, raises=raises, shape=shape)
+    m = types.ModuleType("server")
+    m.get_bearer = lambda *a, **k: None
+    def score_event(event):
+        STATE["seen"].append(event)
+        if STATE["raises"]: raise RuntimeError("engine down")
+        if STATE["shape"] == "dict": return {"decision": STATE["verdict"], "score": 0.42}
+        if STATE["shape"] == "tuple": return (STATE["verdict"], 0.42)
+        if STATE["shape"] == "junk": return {"nothing": "useful"}
+        return STATE["verdict"]
+    m.score_event = score_event
+    sys.modules["server"] = m
+
+def make_ctx():
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    lock = threading.RLock(); n = {"i":0}
+    def seal(ev,res,ts,k):
+        n["i"] += 1
+        return hashlib.sha256(json.dumps([ev,res,ts],sort_keys=True,default=str).encode()).hexdigest(), n["i"], n["i"]
+    C._ready = False
+    ctx = {"conn":conn,"lock":lock,"seal":seal}; C._setup(ctx); return ctx
+
+def check(n,c,d=""):
+    (PASS if c else FAIL).append(n)
+    print(("  ok   " if c else "  FAIL ")+n+(("  -> "+str(d)[:250]) if d and not c else ""))
+
+def setup():
+    ctx = make_ctx()
+    C._issue(ctx,"k",dict(id="root",issuer="owner@example.com",issuer_kind="human",
+        subject="agent",scope=["payments.refund"],
+        constraints={"max_amount":5000,"allowed_currency":["GBP"]},
+        purpose="refunds",purpose_tags=["refunds"],not_after=NOW+HOUR,delegations_left=0))
+    return ctx
+
+def run(ctx, amount=100):
+    return C._evaluate(ctx,"k",{"grant":"root","action":"payments.refund",
+        "params":{"amount":amount,"currency":"GBP"},"purpose_tag":"refunds"})[0]
+
+print("\n=== 30. the engine is actually consulted ===")
+install("ALLOW"); STATE["seen"] = []
+r = run(setup())
+check("a clean authority plus a clean engine is ALLOW", r["verdict"]=="ALLOW", r)
+check("the engine was called with the real action and amount",
+      STATE["seen"] and STATE["seen"][-1]["action"]=="payments.refund"
+      and STATE["seen"][-1]["amount"]==100, STATE["seen"][-1] if STATE["seen"] else None)
+check("both components are reported separately",
+      r["authority_verdict"]=="ALLOW" and r["risk_verdict"]=="ALLOW", r)
+
+print("\n=== 31. neither side can wave the other through ===")
+install("BLOCK")
+r = run(setup())
+check("perfect authority does not survive an engine BLOCK", r["verdict"]=="BLOCK", r)
+check("the authority component still reads ALLOW underneath it",
+      r["authority_verdict"]=="ALLOW", r)
+install("CHALLENGE")
+r = run(setup())
+check("an engine CHALLENGE lifts a clean authority to CHALLENGE", r["verdict"]=="CHALLENGE", r)
+install("ALLOW")
+ctx = setup()
+r = C._evaluate(ctx,"k",{"grant":"root","action":"payments.transfer",
+    "params":{"amount":1},"purpose_tag":"refunds"})[0]
+check("a clean engine does not confer authority nobody granted", r["verdict"]=="BLOCK", r)
+check("and the engine is not even asked once authority has failed",
+      r["risk_engine"]["available"] is False, r["risk_engine"])
+
+print("\n=== 32. a missing or broken engine is not an ALLOW ===")
+install("ALLOW", raises=True)
+r = run(setup())
+check("an engine that throws downgrades ALLOW to CHALLENGE", r["verdict"]=="CHALLENGE", r)
+install("ALLOW", shape="junk")
+r = run(setup())
+check("an unreadable engine response downgrades to CHALLENGE", r["verdict"]=="CHALLENGE", r)
+sys.modules.pop("server", None); sys.modules.pop("__main__", None)
+r = run(setup())
+check("no engine present downgrades to CHALLENGE", r["verdict"]=="CHALLENGE", r)
+check("the reason names the missing engine",
+      any("risk engine" in x for x in r["reasons"]), r["reasons"])
+
+print("\n=== 33. it reads the engine's other return shapes ===")
+for shape in ("dict","tuple","str"):
+    install("BLOCK", shape=shape)
+    r = run(setup())
+    check("a %s return shape is understood" % shape, r["verdict"]=="BLOCK", r["risk_engine"])
+
+print("\n=== 34. an engine BLOCK cannot be executed ===")
+install("BLOCK")
+ctx = setup(); r = run(ctx)
+c,_ = C._confirm(ctx,"k",{"evaluation":r["evaluation"],"action":"payments.refund",
+    "params":{"amount":100,"currency":"GBP"}})
+check("execution is refused when the engine blocked", c["bound"] is False, c)
+
+print("\n" + "="*60)
+print("passed %d, failed %d" % (len(PASS), len(FAIL)))
+for f in FAIL: print("  FAILED: "+f)
+sys.exit(1 if FAIL else 0)
+
+```
+
+
+## `tests/attack_continuity_5.py`
+
+116 lines, 5639 bytes
+
+```python
+#!/usr/bin/env python3
+"""Fifth wave: risk acceptance. Who put their name to this capability
+existing at all - separately from who granted it and who holds it."""
+import hashlib, json, sqlite3, threading, time, sys, types
+import continuity as C
+
+PASS, FAIL = [], []
+NOW, HOUR = time.time(), 3600
+
+def install():
+    m = types.ModuleType("server")
+    m.get_bearer = lambda *a, **k: None
+    m.score_event = lambda e: {"decision": "ALLOW", "score": 0.1}
+    sys.modules["server"] = m
+install()
+
+def make_ctx():
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    lock = threading.RLock(); n = {"i":0}
+    def seal(ev,res,ts,k):
+        n["i"] += 1
+        return hashlib.sha256(json.dumps([ev,res,ts],sort_keys=True,default=str).encode()).hexdigest(), n["i"], n["i"]
+    C._ready = False
+    ctx = {"conn":conn,"lock":lock,"seal":seal}; C._setup(ctx); return ctx
+
+def check(n,c,d=""):
+    (PASS if c else FAIL).append(n)
+    print(("  ok   " if c else "  FAIL ")+n+(("  -> "+str(d)[:250]) if d and not c else ""))
+
+def root(ctx, **over):
+    args = dict(id="root", issuer="owner@example.com", issuer_kind="human",
+                subject="orchestrator", scope=["payments.refund"],
+                constraints={"max_amount":5000}, purpose="refunds",
+                purpose_tags=["refunds"], not_after=NOW+HOUR, delegations_left=3)
+    args.update(over)
+    return C._issue(ctx,"k",args)
+
+print("\n=== 35. a root accepts its own risk by default ===")
+ctx = make_ctx()
+r, code = root(ctx)
+check("a root grant records an acceptor without being asked",
+      code == 200 and r["risk_accepted_by"] == "owner@example.com", r)
+r2, _ = root(ctx, id="root2", risk_accepted_by="risk.officer@example.com")
+check("a root can name someone other than the issuer",
+      r2["risk_accepted_by"] == "risk.officer@example.com", r2)
+
+print("\n=== 36. switching on onward delegation needs a name ===")
+ctx = make_ctx(); root(ctx)
+r, code = C._issue(ctx,"k",dict(id="deleg", parent="root", issuer="orchestrator",
+    issuer_kind="agent", subject="b", scope=["payments.refund"],
+    constraints={"max_amount":100}, purpose="refunds", purpose_tags=["refunds"],
+    not_after=NOW+HOUR, delegations_left=1))
+check("a delegable child with no acceptor is refused",
+      code == 409 and r.get("error") == "risk_acceptance_required", r)
+
+r, code = C._issue(ctx,"k",dict(id="leaf", parent="root", issuer="orchestrator",
+    issuer_kind="agent", subject="b", scope=["payments.refund"],
+    constraints={"max_amount":100}, purpose="refunds", purpose_tags=["refunds"],
+    not_after=NOW+HOUR, delegations_left=0))
+check("a non-delegable child inherits the acceptor above it", code == 200, r)
+
+r, code = C._issue(ctx,"k",dict(id="deleg2", parent="root", issuer="orchestrator",
+    issuer_kind="agent", subject="b", scope=["payments.refund"],
+    constraints={"max_amount":100}, purpose="refunds", purpose_tags=["refunds"],
+    not_after=NOW+HOUR, delegations_left=1, risk_accepted_by="head.of.ops@example.com"))
+check("a delegable child with a named acceptor is accepted", code == 200, r)
+
+print("\n=== 37. the decision names the accountable person ===")
+e, _ = C._evaluate(ctx,"k",{"grant":"leaf","action":"payments.refund",
+    "params":{"amount":10},"purpose_tag":"refunds"})
+check("an evaluation reports who accepts the risk",
+      e["risk_accepted_by"] == "owner@example.com", e.get("risk_accepted_by"))
+check("...separately from who authorised it and who executed it",
+      e["authorised_by"] == "owner@example.com" and e["executed_by"] == "b", e)
+
+e2, _ = C._evaluate(ctx,"k",{"grant":"deleg2","action":"payments.refund",
+    "params":{"amount":10},"purpose_tag":"refunds"})
+check("the nearest acceptor wins, not the root one",
+      e2["risk_accepted_by"] == "head.of.ops@example.com", e2.get("risk_accepted_by"))
+
+t, _ = C._trace(ctx,{"grant":"deleg2"})
+check("the trace shows the acceptor at each hop",
+      t["risk_accepted_by"] == "head.of.ops@example.com" and
+      t["lineage"][0]["risk_accepted_by"] == "owner@example.com", t)
+
+print("\n=== 38. an unaccepted lineage cannot act ===")
+ctx = make_ctx(); root(ctx)
+C._issue(ctx,"k",dict(id="leaf", parent="root", issuer="orchestrator",
+    issuer_kind="agent", subject="b", scope=["payments.refund"],
+    constraints={"max_amount":100}, purpose="refunds", purpose_tags=["refunds"],
+    not_after=NOW+HOUR, delegations_left=0))
+with ctx["lock"]:
+    ctx["conn"].execute("UPDATE auth_grant SET risk_accepted_by=NULL")
+    ctx["conn"].commit()
+e, _ = C._evaluate(ctx,"k",{"grant":"leaf","action":"payments.refund",
+    "params":{"amount":10},"purpose_tag":"refunds"})
+check("stripping every acceptor blocks the action", e["verdict"] == "BLOCK", e["reasons"])
+check("...and says an incident would have no accountable person",
+      any("accountable" in x for x in e["reasons"]), e["reasons"])
+
+print("\n=== 39. the acceptor cannot be swapped after the fact ===")
+ctx = make_ctx(); root(ctx, risk_accepted_by="risk.officer@example.com")
+with ctx["lock"]:
+    ctx["conn"].execute("UPDATE auth_grant SET risk_accepted_by='someone.else@example.com' WHERE id='root'")
+    ctx["conn"].commit()
+e, _ = C._evaluate(ctx,"k",{"grant":"root","action":"payments.refund",
+    "params":{"amount":10},"purpose_tag":"refunds"})
+check("editing who accepted the risk fails the digest", e["verdict"] == "BLOCK", e["reasons"])
+check("...reported as an evidence failure, naming the grant",
+      e["broken_invariant"] == "evidence_continuity" and e["broken_at"] == "root", e)
+
+print("\n" + "="*60)
+print("passed %d, failed %d" % (len(PASS), len(FAIL)))
+for f in FAIL: print("  FAILED: "+f)
+sys.exit(1 if FAIL else 0)
+
+```
+
+
+## `tests/attack_continuity_6.py`
+
+92 lines, 3965 bytes
+
+```python
+"""End to end: issue, delegate, exercise, export a proof, verify it elsewhere,
+then try to forge one."""
+import hashlib, json, sqlite3, threading, time, sys, types, subprocess, copy
+import continuity as C
+
+m = types.ModuleType("server")
+m.get_bearer = lambda *a, **k: None
+m.score_event = lambda e: 0.12          # bare score, like the real engine
+sys.modules["server"] = m
+
+conn = sqlite3.connect(":memory:", check_same_thread=False)
+lock = threading.RLock(); n = {"i": 0}
+def seal(ev, res, ts, k):
+    n["i"] += 1
+    return hashlib.sha256(json.dumps([ev, res, ts], sort_keys=True, default=str).encode()).hexdigest(), n["i"], n["i"]
+ctx = {"conn": conn, "lock": lock, "seal": seal}
+C._ready = False; C._setup(ctx)
+
+NOW, HOUR = time.time(), 3600
+C._issue(ctx, "k", dict(id="root", issuer="justin@monopcontent.com", issuer_kind="human",
+    subject="orchestrator", scope=["payments.refund", "payments.read"],
+    constraints={"max_amount": 5000, "allowed_currency": ["GBP", "EUR"]},
+    purpose="resolve customer refund complaints", purpose_tags=["refunds", "support"],
+    not_after=NOW + 10 * HOUR, delegations_left=2))
+C._issue(ctx, "k", dict(id="mid", parent="root", issuer="orchestrator", issuer_kind="agent",
+    subject="refund-agent", scope=["payments.refund"],
+    constraints={"max_amount": 200, "allowed_currency": ["GBP"]},
+    purpose="issue small refunds", purpose_tags=["refunds"],
+    not_after=NOW + 2 * HOUR, delegations_left=0))
+
+def run(params, tag="refunds", action="payments.refund"):
+    r, _ = C._evaluate(ctx, "k", {"grant": "mid", "action": action,
+                                  "params": params, "purpose_tag": tag})
+    return r
+
+allow = run({"amount": 150, "currency": "GBP"})
+block = run({"amount": 900, "currency": "GBP"})
+print("allow verdict:", allow["verdict"], "| block verdict:", block["verdict"],
+      "->", block["broken_invariant"])
+
+def bundle_for(ev):
+    b, code = C._proof(ctx, {"evaluation": ev})
+    assert code == 200, b
+    return b
+
+for label, ev in (("ALLOW", allow["evaluation"]), ("BLOCK", block["evaluation"])):
+    b = bundle_for(ev)
+    open("/tmp/%s.json" % label, "w").write(json.dumps(b, indent=1))
+    print("\n" + "#" * 66 + "\n# %s bundle\n" % label + "#" * 66)
+    out = subprocess.run([sys.executable, "verify_authority.py", "/tmp/%s.json" % label],
+                         capture_output=True, text=True)
+    print(out.stdout.strip()); print("exit:", out.returncode)
+
+print("\n" + "#" * 66 + "\n# forgeries\n" + "#" * 66)
+good = json.load(open("/tmp/BLOCK.json"))
+
+def forge(name, mutate):
+    b = copy.deepcopy(good)
+    mutate(b)
+    open("/tmp/forged.json", "w").write(json.dumps(b))
+    out = subprocess.run([sys.executable, "verify_authority.py", "/tmp/forged.json"],
+                         capture_output=True, text=True)
+    caught = out.returncode != 0
+    line = [l for l in out.stdout.splitlines() if l.startswith("FAIL")]
+    print(("  ok   " if caught else "  MISS ") + name)
+    for l in line[:2]:
+        print("         " + l.strip())
+
+def flip_verdict(b):
+    b["decision"]["verdict"] = "ALLOW"; b["decision"]["authority_verdict"] = "ALLOW"
+def raise_cap(b):
+    pass_idx = 1
+    b["lineage"][1]["constraints"]["max_amount"] = 100000
+def widen_scope(b):
+    b["lineage"][1]["scope"] = ["payments.refund", "payments.transfer"]
+def swap_human(b):
+    b["lineage"][0]["issuer_kind"] = "agent"
+def change_params(b):
+    b["request"]["params"]["amount"] = 1
+def drop_acceptor(b):
+    for g in b["lineage"]: g["risk_accepted_by"] = None
+def restamp(b):
+    b["decision"]["evaluated_at_epoch"] = NOW + 9 * HOUR
+
+forge("claimed ALLOW on a bundle that blocks", flip_verdict)
+forge("cap raised inside the lineage", raise_cap)
+forge("scope widened inside the lineage", widen_scope)
+forge("root demoted from human", swap_human)
+forge("parameters swapped after the fact", change_params)
+forge("risk acceptor stripped", drop_acceptor)
+forge("timestamp moved past the leaf's expiry", restamp)
+
+```
+
+
+## `tests/attack_witnessed.py`
+
+160 lines, 7875 bytes
+
+```python
+"""Attack it the same way as everything else: from the position of an operator
+trying to make a grant look older than it is."""
+import hashlib, json, sqlite3, threading, time, sys, types
+import witnessed as W
+
+P, F = [], []
+def check(n, c, d=""):
+    (P if c else F).append(n)
+    print(("  ok   " if c else "  FAIL ") + n + (("  -> " + str(d)[:200]) if d and not c else ""))
+
+def make():
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    lock = threading.RLock(); n = {"i": 0}
+    conn.execute("CREATE TABLE audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                 "ts REAL,user_id TEXT,api_key TEXT,result_json TEXT,audit_hash TEXT)")
+    # the real grant table shape, including columns added later
+    conn.execute("CREATE TABLE auth_grant(id TEXT PRIMARY KEY,parent TEXT,root TEXT,"
+                 "issuer TEXT,subject TEXT,created REAL,digest TEXT,audit_hash TEXT,"
+                 "block_index INTEGER,risk_accepted_by TEXT)")
+    def seal(ev, res, ts, key):
+        n["i"] += 1
+        h = hashlib.sha256(json.dumps([ev,res,ts,n["i"]],sort_keys=True,default=str).encode()).hexdigest()
+        conn.execute("INSERT INTO audit_log(ts,user_id,api_key,result_json,audit_hash) "
+                     "VALUES(?,?,?,?,?)", (ts, ev.get("user_id"), key, json.dumps(res), h))
+        conn.commit()
+        return h, n["i"], n["i"]
+    W._ready = False
+    ctx = {"conn": conn, "lock": lock, "seal": seal}
+    W._setup(ctx)
+    return ctx
+
+def seal_grant(ctx, gid, created):
+    h, idx, _ = ctx["seal"]({"user_id": "lin:"+gid}, {"decision":"AUTHORITY_GRANTED","grant":gid}, created, "k")
     with ctx["lock"]:
-        c = ctx["conn"]
-        c.execute("CREATE TABLE IF NOT EXISTS witnessed_head("
-                  "id INTEGER PRIMARY KEY AUTOINCREMENT,peer TEXT,peer_url TEXT,"
-                  "tree_size INTEGER,tip TEXT,head_digest TEXT,submitted REAL,"
-                  "accepted INTEGER,peer_response TEXT,peer_block TEXT,"
-                  "audit_hash TEXT,block_index INTEGER,api_key TEXT)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_wit_size "
-                  "ON witnessed_head(tree_size)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_wit_peer "
-                  "ON witnessed_head(peer)")
-        c.commit()
-    _ready = True
+        ctx["conn"].execute("INSERT INTO auth_grant(id,issuer,subject,created,audit_hash,block_index) "
+                            "VALUES(?,?,?,?,?,?)", (gid,"owner@example.com","agent",created,h,idx))
+        ctx["conn"].commit()
+    return h
 
+def noise(ctx, k=5):
+    for i in range(k):
+        ctx["seal"]({"user_id":"n%d"%i},{"decision":"ALLOW"},time.time(),"k")
 
-def _iso(ts):
-    if not ts:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
-
-def _cols(ctx, table):
-    try:
-        with ctx["lock"]:
-            return [r[1] for r in ctx["conn"].execute(
-                "PRAGMA table_info(%s)" % table).fetchall()]
-    except Exception:
-        return []
-
-
-# ----------------------------------------------------------------------
-# where a record sits in the chain
-# ----------------------------------------------------------------------
-
-def _head(ctx):
-    """Current tree size and tip, read the same way consistency.py orders it:
-    audit_log in write order."""
-    with ctx["lock"]:
-        row = ctx["conn"].execute(
-            "SELECT COUNT(*), MAX(id) FROM audit_log").fetchone()
-        tip = ctx["conn"].execute(
-            "SELECT audit_hash FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()
-    size = (row[0] if row else 0) or 0
-    return size, (tip[0] if tip else None)
-
-
-def _size_at(ctx, row_id):
-    """The tree size at which the record with this audit_log id is included."""
-    with ctx["lock"]:
-        row = ctx["conn"].execute(
-            "SELECT COUNT(*) FROM audit_log WHERE id<=?", (row_id,)).fetchone()
-    return row[0] if row else None
-
-
-def _locate_hash(ctx, audit_hash):
-    with ctx["lock"]:
-        row = ctx["conn"].execute(
-            "SELECT id,ts FROM audit_log WHERE audit_hash=? ORDER BY id ASC LIMIT 1",
-            (audit_hash,)).fetchone()
-    if not row:
-        return None, None, None
-    return row[0], row[1], _size_at(ctx, row[0])
-
-
-def _locate_grant(ctx, grant_id):
-    """A grant's own sealed block. Read defensively - the column set has moved
-    before and a module that assumes a schema is a module that breaks."""
-    cols = _cols(ctx, "auth_grant")
-    if not cols:
-        return None
-    want = [c for c in ("id", "audit_hash", "created", "issuer", "subject",
-                        "risk_accepted_by", "parent", "root") if c in cols]
-    if "audit_hash" not in want:
-        return None
-    with ctx["lock"]:
-        row = ctx["conn"].execute(
-            "SELECT %s FROM auth_grant WHERE id=?" % ",".join(want),
-            (grant_id,)).fetchone()
-    if not row:
-        return None
-    return dict(zip(want, row))
-
-
-# ----------------------------------------------------------------------
-# the earliest outside party to have seen it
-# ----------------------------------------------------------------------
-
-def _earliest_cover(ctx, size):
-    """The first attestation whose tree size reaches this record.
-
-    Accepted submissions only. A peer that refused, timed out or answered
-    with something unreadable has not seen anything, and counting it would be
-    the exact self-flattery this module exists to remove.
-    """
-    if not size:
-        return None
-    with ctx["lock"]:
-        row = ctx["conn"].execute(
-            "SELECT peer,peer_url,tree_size,tip,submitted,peer_block,audit_hash,"
-            "block_index FROM witnessed_head WHERE accepted=1 AND tree_size>=? "
-            "ORDER BY submitted ASC LIMIT 1", (size,)).fetchone()
-    if not row:
-        return None
-    return {"peer": row[0], "peer_url": row[1], "tree_size": row[2],
-            "tip": row[3], "witnessed_at": _iso(row[4]),
-            "witnessed_at_epoch": row[4], "peer_block": row[5],
-            "our_seal_of_the_submission": row[6], "our_block_index": row[7]}
-
-
-def _all_covers(ctx, size, limit=10):
-    if not size:
-        return []
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT peer,tree_size,submitted,peer_block FROM witnessed_head "
-            "WHERE accepted=1 AND tree_size>=? ORDER BY submitted ASC LIMIT ?",
-            (size, limit)).fetchall()
-    return [{"peer": r[0], "tree_size": r[1], "witnessed_at": _iso(r[2]),
-             "peer_block": r[3]} for r in rows]
-
-
-def _plan(size, cover):
-    """What a third party runs, and where. Every step that can be checked
-    against the peer rather than against us is pointed at the peer."""
-    if not cover:
-        return None
-    return [
-        {"step": 1,
-         "what": "Confirm the peer holds that tip, and when they sealed it",
-         "where": "the peer's own host",
-         "run": (cover.get("peer_url") or ("https://" + str(cover.get("peer"))))
-                + "/x/witness/attest?peer=<this chain>&tip=" + str(cover.get("tip"))},
-        {"step": 2,
-         "what": "Confirm the tip they hold is a genuine head of this log",
-         "where": "here, but re-derivable by anyone",
-         "run": "/x/consistency/ancestor?tip=" + str(cover.get("tip"))},
-        {"step": 3,
-         "what": "Confirm the record is inside the log that tip commits to",
-         "where": "here, and checkable offline with the published rules",
-         "run": "/x/consistency/proof?first=" + str(size) + "&second="
-                + str(cover.get("tree_size"))},
-        {"step": 4,
-         "what": "Conclude",
-         "where": "your own arithmetic",
-         "run": "the record sat at size " + str(size) + "; the peer sealed a root "
-                "at size " + str(cover.get("tree_size")) + " on "
-                + str(cover.get("witnessed_at")) + ". It existed before then, in a "
-                "log this operator cannot write to."},
-    ]
-
-
-# ----------------------------------------------------------------------
-# submitting a head to a peer
-# ----------------------------------------------------------------------
-
-def _safe_url(url):
-    """Same posture as witness.py: http/https, standard ports, resolve first
-    and refuse anything that lands on a private address."""
-    try:
-        u = urlparse(url)
-    except Exception:
-        return None, "unparseable url"
-    if u.scheme not in ("http", "https"):
-        return None, "only http and https"
-    if u.port and u.port not in (80, 443):
-        return None, "only ports 80 and 443"
-    host = u.hostname
-    if not host:
-        return None, "no host"
-    try:
-        infos = socket.getaddrinfo(host, None)
-    except Exception as exc:
-        return None, "cannot resolve (%s)" % str(exc)[:80]
-    for info in infos:
-        addr = info[4][0]
-        if _private(addr):
-            return None, "resolves to a non-public address"
-    return u, None
-
-
-def _private(addr):
-    try:
-        import ipaddress
-        ip = ipaddress.ip_address(addr)
-        return (ip.is_private or ip.is_loopback or ip.is_link_local
-                or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
-    except Exception:
-        return True
-
-
-def _submit(ctx, api_key, data):
-    peer = str(data.get("peer", "")).strip()[:120]
-    url = str(data.get("url", "")).strip()
-    chain = str(data.get("chain", "")).strip()[:120] or None
-    if not peer or not url:
-        return {"error": "peer_and_url_required",
-                "message": "peer is the name they publish under; url is their "
-                           "witness endpoint, e.g. https://example.com"}, 400
-
-    u, why = _safe_url(url)
-    if why:
-        return {"error": "url_refused", "message": why}, 400
-
-    size, tip = _head(ctx)
-    if not size or not tip:
-        return {"error": "nothing_to_witness",
-                "message": "The chain is empty. There is no head to submit."}, 409
-
-    head_digest = hashlib.sha256(
-        HEAD_PREFIX + json.dumps({"tree_size": size, "tip": tip},
-                                 sort_keys=True, separators=(",", ":")
-                                 ).encode("utf-8")).hexdigest()
-
-    body = json.dumps({"chain": chain or "sebbi.pro", "tip": tip,
-                       "tree_size": size, "peer_ts": time.time()}).encode("utf-8")
-    endpoint = url.rstrip("/") + "/x/witness/observe"
-
-    accepted = 0
-    response_text = ""
-    peer_block = None
-    try:
-        req = urllib.request.Request(
-            endpoint, data=body,
-            headers={"Content-Type": "application/json",
-                     "User-Agent": "aileash-witnessed/" + VERSION},
-            method="POST")
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
-            raw = r.read(MAX_BYTES)
-            response_text = raw.decode("utf-8", "replace")[:4000]
-            accepted = 1 if 200 <= r.status < 300 else 0
-        try:
-            parsed = json.loads(response_text)
-            for k in ("sealed_in_our_chain", "block_index", "audit_hash", "seal"):
-                if isinstance(parsed, dict) and parsed.get(k) is not None:
-                    peer_block = str(parsed[k])
-                    break
-        except Exception:
-            pass
-    except Exception as exc:
-        response_text = "request failed: " + str(exc)[:300]
-        accepted = 0
-
-    now = time.time()
-    ev = {"user_id": "wit:" + peer[:40], "action": "head_submitted", "amount": 0,
-          "country": "UK", "device_id": "witnessed", "anomaly": 0,
-          "device_risk": 0 if accepted else 1}
-    res = {"decision": "HEAD_SUBMITTED" if accepted else "HEAD_SUBMISSION_FAILED",
-           "score": 0, "witnessed_version": VERSION, "peer": peer,
-           "tree_size": size, "tip": tip, "head_digest": head_digest,
-           "accepted": bool(accepted), "peer_block": peer_block,
-           "detail": "peer=%s;size=%d;tip=%s;accepted=%s"
-                     % (peer, size, tip, bool(accepted))}
-    audit_hash, block_index, seq = ctx["seal"](ev, res, now, api_key)
-
+def record_head(ctx, peer, accepted=1, when=None, size=None, tip=None):
+    """Insert an attestation directly, standing in for a live peer."""
+    s, t = W._head(ctx)
+    when = when or time.time()
     with ctx["lock"]:
         ctx["conn"].execute(
             "INSERT INTO witnessed_head(peer,peer_url,tree_size,tip,head_digest,"
-            "submitted,accepted,peer_response,peer_block,audit_hash,block_index,"
-            "api_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-            (peer, url, size, tip, head_digest, now, accepted,
-             response_text, peer_block, audit_hash, block_index, api_key))
+            "submitted,accepted,peer_response,peer_block,audit_hash,block_index,api_key)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (peer,"https://%s"%peer, size or s, tip or t,"d",when,accepted,"{}","b1","ah",1,"k"))
         ctx["conn"].commit()
 
-    out = {"peer": peer, "tree_size": size, "tip": tip,
-           "head_digest": head_digest, "accepted": bool(accepted),
-           "peer_block": peer_block, "submitted_at": _iso(now),
-           "sealed_in_chain": audit_hash, "block_index": block_index,
-           "receipt_seq": seq,
-           "peer_response": response_text[:800],
-           "peer_response_is_unverified": True,
-           "note": ("The failure is sealed too. A submission a peer refused is "
-                    "part of the record, and coverage never counts it.")}
-    if accepted:
-        out["what_this_now_proves"] = (
-            "Every record at or below tree size " + str(size) + " existed before "
-            + _iso(now) + " in a log this operator cannot write to. It says nothing "
-            "about whether those records are true.")
-    return out, (200 if accepted else 502)
+NOW = time.time()
 
+print("\n=== 1. a grant witnessed after issue ===")
+ctx = make()
+noise(ctx, 3)
+g = seal_grant(ctx, "root", NOW - 3600)
+noise(ctx, 4)
+record_head(ctx, "redflagai.pro", when=NOW - 1800)
+r, code = W._grant(ctx, {"id": "root"})
+check("witnessed grant reports externally_witnessed", code==200 and r["externally_witnessed"], r)
+check("names the peer and the time", r["earliest_external_witness"]["peer"]=="redflagai.pro", r)
+check("gives a four-step plan pointed at the peer",
+      len(r["verification_plan"])==4 and "attest" in r["verification_plan"][0]["run"], r["verification_plan"][0])
+check("states what it does not prove", "should ever have been issued" in r["what_this_does_not_prove"])
+check("reports how long it sat unwitnessed", r["minutes_unwitnessed"] is not None, r.get("minutes_unwitnessed"))
 
-# ----------------------------------------------------------------------
-# read
-# ----------------------------------------------------------------------
+print("\n=== 2. THE ATTACK: a grant back-dated after the fact ===")
+# operator invents a root grant now, and writes created= last week
+ctx = make()
+noise(ctx, 3)
+record_head(ctx, "redflagai.pro", when=NOW - 86400)      # peer saw the log yesterday
+forged = seal_grant(ctx, "forged", NOW - 7*86400)        # grant CLAIMS to be a week old
+r, code = W._grant(ctx, {"id": "forged"})
+check("a grant sealed after the last witness is NOT covered", not r["externally_witnessed"], r)
+check("and says so plainly rather than staying quiet", "rests on this operator's own record" in r.get("flag",""), r.get("flag"))
+# now a peer witnesses; from here it is covered, but only from here
+record_head(ctx, "redflagai.pro", when=NOW)
+r2, _ = W._grant(ctx, {"id": "forged"})
+check("after a later witness it becomes covered", r2["externally_witnessed"])
+gapdays = round(r2["minutes_unwitnessed"]/1440.0, 1)
+check("the seven-day claim-to-witness gap is published, not hidden",
+      r2.get("flag") and "days" in r2["flag"] and gapdays >= 6.9, {"gap_days":gapdays,"flag":r2.get("flag")})
 
-def _grant(ctx, data):
-    gid = str(data.get("id") or data.get("grant") or "").strip()
-    if not gid:
-        return {"error": "grant_required",
-                "list": "/x/continuity/decisions"}, 400
+print("\n=== 3. coverage counts only what a peer accepted ===")
+ctx = make()
+noise(ctx, 2); g = seal_grant(ctx, "g1", NOW); noise(ctx, 2)
+record_head(ctx, "peer-that-refused", accepted=0)
+r, _ = W._grant(ctx, {"id": "g1"})
+check("a refused submission gives no coverage", not r["externally_witnessed"], r.get("earliest_external_witness"))
+h, _ = W._heads(ctx, {})
+check("but the refusal is still on the public record", h["count"]==1 and h["heads"][0]["accepted"] is False, h)
 
-    g = _locate_grant(ctx, gid)
-    if not g:
-        return {"error": "grant_not_found", "grant": gid}, 404
+print("\n=== 4. a head that predates the grant does not cover it ===")
+ctx = make()
+record_head(ctx, "early-peer", when=NOW-9999)   # size 0
+noise(ctx, 3)
+seal_grant(ctx, "later", NOW)
+r, _ = W._grant(ctx, {"id": "later"})
+check("an earlier, smaller head cannot reach a later record", not r["externally_witnessed"], r)
 
-    row_id, sealed_ts, size = _locate_hash(ctx, g.get("audit_hash"))
-    if size is None:
-        return {"error": "grant_not_in_chain", "grant": gid,
-                "message": "The grant record carries a seal that is not in the "
-                           "audit log. That is a finding, not a lookup failure."}, 409
+print("\n=== 5. the earliest witness wins, not the most convenient ===")
+ctx = make()
+noise(ctx, 2); seal_grant(ctx, "g", NOW - 600); noise(ctx, 2)
+record_head(ctx, "second-peer", when=NOW - 100)
+record_head(ctx, "first-peer",  when=NOW - 400)
+r, _ = W._grant(ctx, {"id": "g"})
+check("earliest accepted attestation is the one reported",
+      r["earliest_external_witness"]["peer"]=="first-peer", r["earliest_external_witness"])
+check("the others are listed too", any(c["peer"]=="second-peer" for c in r["also_witnessed_by"]), r["also_witnessed_by"])
 
-    cover = _earliest_cover(ctx, size)
-    out = {
-        "grant": gid,
-        "sealed_at": _iso(sealed_ts),
-        "tree_size_at_seal": size,
-        "externally_witnessed": bool(cover),
-        "earliest_external_witness": cover,
-        "also_witnessed_by": _all_covers(ctx, size)[1:] if cover else [],
-        "verification_plan": _plan(size, cover),
-        "what_this_proves": None,
-        "what_this_does_not_prove": (
-            "That the grant should ever have been issued, or that the person "
-            "named as issuing it did. It proves the grant existed at a time, in "
-            "a record we cannot reach. Legitimacy is an organisational question "
-            "and no witness answers it."),
-    }
+print("\n=== 6. status is honest about thin networks ===")
+ctx = make(); noise(ctx, 3)
+s, _ = W._status(ctx)
+check("no peers at all reports strength none", s["strength"]=="none" and "rests on our own record" in s["flag"], s)
+record_head(ctx, "only-peer")
+s, _ = W._status(ctx)
+check("one peer reports weak and names collusion", s["strength"]=="weak" and "collude" in s["flag"], s)
+for p in ("p2","p3"): record_head(ctx, p)
+s, _ = W._status(ctx)
+check("three peers reports reasonable", s["strength"]=="reasonable", s)
+noise(ctx, 6)
+s, _ = W._status(ctx)
+check("records sealed since the last head are counted as unwitnessed",
+      s["records_not_yet_witnessed"]==6, s)
 
-    if cover:
-        gap = None
-        try:
-            if g.get("created") and cover.get("witnessed_at_epoch"):
-                gap = round((cover["witnessed_at_epoch"] - float(g["created"])) / 60.0, 1)
-        except Exception:
-            gap = None
-        out["minutes_unwitnessed"] = gap
-        out["what_this_proves"] = (
-            "This grant was already sealed when <b>" + str(cover["peer"]) +
-            "</b> took a copy of this log's head at " + str(cover["witnessed_at"]) +
-            ". It cannot have been written afterwards to justify anything, "
-            "because that would require them to rewrite their own chain.").replace("<b>", "").replace("</b>", "")
-        if gap is not None and gap > 1440:
-            out["flag"] = ("this grant sat unwitnessed for " + str(round(gap / 1440.0, 1))
-                           + " days. Everything above still holds from the moment it "
-                           "was witnessed; the window before that rests on our word "
-                           "alone, and is published rather than smoothed over.")
-    else:
-        out["flag"] = ("no external attestation covers this grant yet. Until a peer "
-                       "seals a head at or beyond tree size " + str(size) +
-                       ", its existence before now rests on this operator's own "
-                       "record. That is the ordinary state of a grant issued "
-                       "moments ago, and it is the honest state of one issued "
-                       "long ago with no peer running.")
-    return out, 200
+print("\n=== 7. tampering with the grant row ===")
+ctx = make(); noise(ctx,2); seal_grant(ctx,"t",NOW); record_head(ctx,"peer")
+with ctx["lock"]:
+    ctx["conn"].execute("UPDATE auth_grant SET audit_hash='0'*64 WHERE id='t'")
+    ctx["conn"].commit()
+r, code = W._grant(ctx, {"id":"t"})
+check("a grant whose seal is not in the log is a finding, not a 404",
+      code==409 and "finding" in r.get("message",""), (code, r))
 
+print("\n=== 8. url safety on submit ===")
+ctx = make(); noise(ctx,2)
+for bad, why in [("http://127.0.0.1/x","loopback"),("http://10.0.0.5/x","private"),
+                 ("ftp://example.com","scheme"),("https://example.com:8443/x","port")]:
+    r, code = W._submit(ctx, "k", {"peer":"p","url":bad})
+    check("refuses %s" % why, code==400 and r.get("error")=="url_refused", (bad,code,r))
 
-def _record(ctx, data):
-    h = str(data.get("hash") or data.get("receipt") or "").strip().lower()
-    if not re.match(r"^[0-9a-f]{64}$", h):
-        return {"error": "sha256_hash_required"}, 400
-    row_id, sealed_ts, size = _locate_hash(ctx, h)
-    if size is None:
-        return {"error": "not_in_chain", "hash": h}, 404
-    cover = _earliest_cover(ctx, size)
-    return {"hash": h, "sealed_at": _iso(sealed_ts), "tree_size_at_seal": size,
-            "externally_witnessed": bool(cover),
-            "earliest_external_witness": cover,
-            "verification_plan": _plan(size, cover),
-            "what_this_proves": (
-                "This record existed before " + str(cover["witnessed_at"]) +
-                ", in a log held by " + str(cover["peer"]) + " which this operator "
-                "cannot write to.") if cover else None,
-            "what_this_does_not_prove":
-                "That the record is true. Existence and timing only."}, 200
+print("\n=== 9. any sealed record, not just grants ===")
+ctx = make(); noise(ctx,2)
+h,_ ,_ = ctx["seal"]({"user_id":"x"},{"decision":"ALLOW"},NOW,"k")
+noise(ctx,1); record_head(ctx,"peer")
+r, code = W._record(ctx, {"hash": h})
+check("a decision receipt gets the same treatment", code==200 and r["externally_witnessed"], r)
+r, code = W._record(ctx, {"hash": "zz"})
+check("a malformed hash is refused", code==400, (code,r))
 
-
-def _heads(ctx, data):
-    try:
-        limit = max(1, min(int(data.get("limit", 50)), 200))
-    except (TypeError, ValueError):
-        limit = 50
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(
-            "SELECT peer,tree_size,tip,submitted,accepted,peer_block,block_index "
-            "FROM witnessed_head ORDER BY submitted DESC LIMIT ?", (limit,)).fetchall()
-    return {"count": len(rows),
-            "heads": [{"peer": r[0], "tree_size": r[1], "tip": r[2],
-                       "submitted_at": _iso(r[3]), "accepted": bool(r[4]),
-                       "peer_block": r[5], "our_block_index": r[6]} for r in rows],
-            "note": ("Refused and failed submissions are listed alongside accepted "
-                     "ones. A witness network that only publishes its successes is "
-                     "reporting on itself.")}, 200
-
-
-def _status(ctx):
-    size, tip = _head(ctx)
-    with ctx["lock"]:
-        agg = ctx["conn"].execute(
-            "SELECT COUNT(*),SUM(accepted),MAX(CASE WHEN accepted=1 THEN tree_size END),"
-            "MAX(CASE WHEN accepted=1 THEN submitted END) FROM witnessed_head").fetchone()
-        peers = ctx["conn"].execute(
-            "SELECT peer,COUNT(*),MAX(submitted) FROM witnessed_head "
-            "WHERE accepted=1 GROUP BY peer").fetchall()
-
-    total, ok, covered_to, last = (agg or (0, 0, None, None))
-    ok = ok or 0
-    covered_to = covered_to or 0
-    uncovered = max(0, size - covered_to)
-
-    out = {"tree_size_now": size, "tip": tip,
-           "covered_to_tree_size": covered_to,
-           "records_not_yet_witnessed": uncovered,
-           "submissions": total or 0, "accepted": ok,
-           "distinct_peers": len(peers),
-           "last_accepted_at": _iso(last),
-           "peers": [{"peer": p[0], "accepted_submissions": p[1],
-                      "last_at": _iso(p[2])} for p in peers]}
-
-    if len(peers) == 0:
-        out["strength"] = "none"
-        out["flag"] = ("no peer has ever accepted a head. Nothing on this chain "
-                       "has external attestation, and every claim about when a "
-                       "grant was issued currently rests on our own record.")
-    elif len(peers) == 1:
-        out["strength"] = "weak"
-        out["flag"] = ("one peer. Two parties attesting only each other can still "
-                       "collude, and this number is the honest measure of that. It "
-                       "improves with breadth, not with volume.")
-    elif len(peers) < 3:
-        out["strength"] = "thin"
-    else:
-        out["strength"] = "reasonable"
-
-    out["why_this_matters"] = (
-        "Authority derivation proves an action was derivable from a grant. It "
-        "cannot prove the grant was ever issued, because every term in that check "
-        "arrives from the party being checked. This is the outside source. It does "
-        "not establish that a grant was legitimate - it establishes that it was "
-        "not written after the fact, which is the failure an incident actually "
-        "produces.")
-    return out, 200
-
-
-def _spec():
-    return {
-        "witnessed_version": VERSION,
-        "the_claim": ("A record sealed at tree size M, and a peer that accepted a "
-                      "head at tree size N >= M at time T, means the record existed "
-                      "before T in a log this operator cannot write to."),
-        "the_gap_it_closes": ("Authority continuity derives an action back to a "
-                              "grant, but the issuer, scope and approver all arrive "
-                              "on the request and there is no external source to "
-                              "ask. A well-formed grant that was never issued passes "
-                              "every internal check. This does not make such a grant "
-                              "detectable - it makes one impossible to create after "
-                              "the event."),
-        "ordering": ("audit_log in write order, the same ordering "
-                     "/x/consistency/ uses. Tree size at a record is the count of "
-                     "rows at or before it."),
-        "head_digest": ("sha256('AILEASH-WITNESSED-HEAD-v1:' || canonical JSON of "
-                        "{tree_size, tip}, keys sorted, no whitespace)"),
-        "coverage_rule": ("accepted submissions only. A refused, timed-out or "
-                          "unreadable response is recorded and never counted."),
-        "peer_responses": ("recorded verbatim and never verified by us. The "
-                           "verification plan on every answer points at the peer's "
-                           "own host, because an attestation checked only by the "
-                           "party it flatters is not an attestation."),
-        "what_it_never_claims": [
-            "that a witnessed grant is a legitimate grant",
-            "that a witnessed record is a true record",
-            "that a peer is who they say they are - name binding is witness.py's "
-            "job and is reported there, unverified, as first-use, bound or conflict",
-        ],
-        "honest_limits": [
-            "One peer is one peer. Two parties attesting only each other can "
-            "collude, and /x/witnessed/status reports the count rather than "
-            "describing the network as strong.",
-            "Everything sealed since the last accepted head is unwitnessed, and "
-            "the count is published.",
-            "A peer who stops answering leaves coverage frozen at the last size "
-            "they took. That shows as a growing records_not_yet_witnessed figure "
-            "rather than as silence.",
-            "This proves existence before a time. Nothing here reaches whether a "
-            "grant should have been issued, which is an organisational question "
-            "no cryptography answers.",
-        ],
-        "why_published": ("Anyone should be able to reimplement this and check us "
-                          "with it. The steps are four HTTP requests and one "
-                          "comparison of two integers."),
-    }, 200
-
-
-# ----------------------------------------------------------------------
-# router entry point
-# ----------------------------------------------------------------------
-
-def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-    action = (action or "").strip("/").lower()
-    data = data or {}
-
-    if method == "GET":
-        if action == "spec":
-            return _spec()
-        if action in ("", "status"):
-            return _status(ctx)
-        if action == "grant":
-            return _grant(ctx, data)
-        if action == "record":
-            return _record(ctx, data)
-        if action == "heads":
-            return _heads(ctx, data)
-
-    if method == "POST":
-        if not api_key:
-            return {"error": "invalid_api_key"}, 401
-        if action == "submit":
-            return _submit(ctx, api_key, data)
-
-    return {"error": "unknown_action", "action": action,
-            "GET": ["spec", "status", "grant", "record", "heads"],
-            "POST": ["submit"]}, 404
+print("\n" + "="*62)
+print("passed %d, failed %d" % (len(P), len(F)))
+for f in F: print("  FAILED: " + f)
+sys.exit(1 if F else 0)
 
 ```
 
 
-## `ai_act_ranker.py`
+## `verify_authority.py`
 
-262 lines, 4930 bytes
-
-```python
-"""
-AILeash Compliance Intelligence Engine
-Standalone AI Act Ranking & Risk Mapping Engine
-
-Version: 1.0.0
-"""
-
-import json
-import datetime
-
-
-VERSION = "1.0.0"
-
-
-# EU AI Act knowledge base
-AI_ACT_DATABASE = {
-
-    "Article 5": {
-        "title": "Prohibited AI Practices",
-        "phrases": [
-            "EU AI Act Article 5",
-            "prohibited AI practices",
-            "AI Act banned systems",
-            "AI regulation prohibited AI"
-        ],
-        "controls": [
-            "Prohibited use detection",
-            "Policy enforcement",
-            "AI behaviour screening"
-        ]
-    },
-
-
-    "Article 6": {
-        "title": "Classification of High Risk AI Systems",
-        "phrases": [
-            "high risk AI system",
-            "EU AI Act high risk classification",
-            "AI Act risk categories"
-        ],
-        "controls": [
-            "Risk classification",
-            "System assessment",
-            "Impact evaluation"
-        ]
-    },
-
-
-    "Article 9": {
-        "title": "Risk Management System",
-        "phrases": [
-            "EU AI Act Article 9",
-            "AI risk management system",
-            "AI Act compliance framework",
-            "continuous AI risk monitoring"
-        ],
-        "controls": [
-            "Risk identification",
-            "Risk scoring",
-            "Risk mitigation",
-            "Continuous monitoring"
-        ]
-    },
-
-
-    "Article 12": {
-        "title": "Record Keeping and Logging",
-        "phrases": [
-            "AI audit trail",
-            "AI logging requirements",
-            "AI evidence records",
-            "machine learning audit logs"
-        ],
-        "controls": [
-            "Immutable logs",
-            "Evidence storage",
-            "Traceability",
-            "Hash verification"
-        ]
-    },
-
-
-    "Article 14": {
-        "title": "Human Oversight",
-        "phrases": [
-            "AI human oversight",
-            "human in the loop AI",
-            "AI intervention controls"
-        ],
-        "controls": [
-            "Human review",
-            "Override capability",
-            "Decision supervision"
-        ]
-    },
-
-
-    "Article 15": {
-        "title": "Accuracy Robustness Cybersecurity",
-        "phrases": [
-            "AI cybersecurity",
-            "AI accuracy monitoring",
-            "AI robustness requirements"
-        ],
-        "controls": [
-            "Security testing",
-            "Performance monitoring",
-            "Failure detection"
-        ]
-    }
-
-}
-
-
-def search_ai_act(query):
-
-    results = []
-
-    query = query.lower()
-
-    for article, data in AI_ACT_DATABASE.items():
-
-        for phrase in data["phrases"]:
-
-            if query in phrase.lower():
-
-                results.append({
-                    "article": article,
-                    "title": data["title"],
-                    "matched_phrase": phrase,
-                    "controls": data["controls"]
-                })
-
-    return results
-
-
-
-def calculate_compliance_score(system):
-
-    score = 0
-    missing = []
-
-    requirements = {
-
-        "risk_management": "Article 9",
-        "logging": "Article 12",
-        "human_oversight": "Article 14",
-        "security": "Article 15"
-
-    }
-
-
-    for control, article in requirements.items():
-
-        if system.get(control):
-            score += 25
-        else:
-            missing.append(article)
-
-
-    return {
-        "score": score,
-        "rating": risk_rating(score),
-        "missing_articles": missing
-    }
-
-
-
-def risk_rating(score):
-
-    if score >= 90:
-        return "LOW RISK"
-
-    if score >= 70:
-        return "MODERATE RISK"
-
-    if score >= 40:
-        return "HIGH RISK"
-
-    return "CRITICAL RISK"
-
-
-
-def generate_report(system):
-
-    return {
-
-        "engine": "AILeash Compliance Intelligence Engine",
-
-        "version": VERSION,
-
-        "timestamp":
-            datetime.datetime.utcnow().isoformat(),
-
-        "assessment":
-            calculate_compliance_score(system)
-
-    }
-
-
-
-def save_report(report):
-
-    filename = (
-        "aileash_report_"
-        + datetime.datetime.now()
-        .strftime("%Y%m%d_%H%M%S")
-        + ".json"
-    )
-
-    with open(filename, "w") as file:
-        json.dump(
-            report,
-            file,
-            indent=4
-        )
-
-    return filename
-
-
-
-if __name__ == "__main__":
-
-    print(
-        "\nAILeash AI Act Ranking Engine "
-        + VERSION
-    )
-
-    print("\nExample search:")
-    
-    results = search_ai_act(
-        "Article 9"
-    )
-
-    for result in results:
-        print("\nMATCH:")
-        print(result)
-
-
-    test_system = {
-
-        "risk_management": True,
-        "logging": True,
-        "human_oversight": False,
-        "security": True
-
-    }
-
-
-    report = generate_report(test_system)
-
-    print("\nCOMPLIANCE REPORT")
-    print(json.dumps(report, indent=4))
-
-
-    file = save_report(report)
-
-    print(
-        "\nSaved:",
-        file
-    )
-
-```
-
-
-## `aigrade_insert.py`
-
-136 lines, 5663 bytes
-
-```python
-# ============================================================
-# AI-SAFETY GRADE SCANNER - stdlib version for server.py
-# (converted from the FastAPI/httpx draft - no new dependencies)
-#
-# HOW TO INSTALL - two pastes into server.py:
-#
-# PASTE 1: everything between "BEGIN FUNCTIONS" and "END FUNCTIONS"
-#          goes near your other helper functions (e.g. just above
-#          the JURIS_VERSION block).
-#
-# PASTE 2: everything between "BEGIN ROUTES" and "END ROUTES"
-#          goes inside do_GET, as new elif branches alongside the
-#          other GET routes (match their indentation: 8 spaces).
-#
-# Endpoints added:
-#   GET /api/aigrade?domain=example.com        -> JSON grade report
-#   GET /api/aigrade/badge?domain=example.com  -> embeddable SVG badge
-# ============================================================
-
-# ---------------- BEGIN FUNCTIONS ----------------
-AIGRADE_TIMEOUT=6
-AIGRADE_UA="Mozilla/5.0 (compatible; AILeashScanner/1.0; +https://sebbi.pro/scan)"
-AIGRADE_UA_AGENT="AILeash-Agent-Check/1.0 (+https://sebbi.pro/scan)"
-AIGRADE_CHECKS=[
-    ("ai_safety","/.well-known/ai-safety.txt",20,"ai_safety"),
-    ("security","/.well-known/security.txt",15,"security"),
-    ("robots","/robots.txt",10,"present"),
-    ("sitemap","/sitemap.xml",10,"sitemap"),
-    ("ai_txt","/.well-known/ai.txt",15,"present"),
-    ("comply","/.well-known/comply.txt",15,"present"),
-    ("llms","/llms.txt",10,"present"),
-]
-AIGRADE_RENDER_POINTS=5
-AIGRADE_MAX=sum(c[2] for c in AIGRADE_CHECKS)+AIGRADE_RENDER_POINTS
-AIGRADE_COLORS={"A":"#7fe3b0","B":"#a8d95f","C":"#c9a84c","D":"#ff9a4a","F":"#ff8a80"}
-
-def _aigrade_fetch(url,ua=AIGRADE_UA):
-    try:
-        req=urllib.request.Request(url,headers={"User-Agent":ua})
-        with urllib.request.urlopen(req,timeout=AIGRADE_TIMEOUT) as r:
-            if r.status==200:
-                return r.read(500000).decode("utf-8","replace")
-    except Exception:
-        pass
-    return None
-
-def _aigrade_valid(kind,text):
-    if kind=="present":
-        return bool(text and text.strip())
-    if kind=="ai_safety":
-        if not text:return False
-        low=text.lower()
-        return "ai-safe:" in low and "true" in low
-    if kind=="security":
-        if not text:return False
-        low=text.lower()
-        return "contact:" in low and "expires:" in low
-    if kind=="sitemap":
-        if not text:return False
-        try:
-            import xml.etree.ElementTree as _ET
-            _ET.fromstring(text)
-            return True
-        except Exception:
-            return False
-    return False
-
-def _aigrade_letter(score):
-    if score>=90:return"A"
-    if score>=75:return"B"
-    if score>=60:return"C"
-    if score>=40:return"D"
-    return"F"
-
-def aigrade_run(domain):
-    domain=str(domain or "").strip().lower().replace("https://","").replace("http://","").rstrip("/")
-    domain=domain.split("/")[0]
-    if not domain or "." not in domain or len(domain)>200:
-        return None
-    base="https://"+domain
-    results={};score=0
-    for key,path,points,kind in AIGRADE_CHECKS:
-        text=_aigrade_fetch(base+path)
-        passed=_aigrade_valid(kind,text)
-        results[key]={"path":path,"found":bool(text),"passed":passed,"points":points if passed else 0}
-        if passed:score+=points
-    human=_aigrade_fetch(base,AIGRADE_UA)
-    agent=_aigrade_fetch(base,AIGRADE_UA_AGENT)
-    render_ok=False
-    if human and agent:
-        ratio=min(len(human),len(agent))/max(len(human),len(agent),1)
-        render_ok=ratio>0.9
-    results["consistent_rendering"]={"passed":render_ok,"points":AIGRADE_RENDER_POINTS if render_ok else 0}
-    if render_ok:score+=AIGRADE_RENDER_POINTS
-    return{"domain":domain,"score":score,"max_score":AIGRADE_MAX,
-        "grade":_aigrade_letter(score),"checks":results,
-        "verified_by":"sebbi.pro",
-        "badge_url":HOST+"/api/aigrade/badge?domain="+domain,
-        "report_url":HOST+"/api/aigrade?domain="+domain,
-        "note":"External-signal check of published AI-transparency files; not an audit of internal systems"}
-
-def aigrade_badge_svg(domain):
-    r=aigrade_run(domain)
-    grade=r["grade"] if r else "F"
-    color=AIGRADE_COLORS.get(grade,"#ff8a80")
-    return('<svg xmlns="http://www.w3.org/2000/svg" width="180" height="20">'
-        '<rect width="120" height="20" fill="#0a0f1e"/>'
-        '<rect x="120" width="60" height="20" fill="'+color+'"/>'
-        '<text x="60" y="14" fill="#fff" font-family="Verdana,sans-serif" font-size="11" text-anchor="middle">AI-Safety Grade</text>'
-        '<text x="150" y="14" fill="#0a0f1e" font-family="Verdana,sans-serif" font-size="12" font-weight="bold" text-anchor="middle">'+grade+'</text>'
-        '</svg>')
-# ---------------- END FUNCTIONS ----------------
-
-
-# ---------------- BEGIN ROUTES (paste inside do_GET) ----------------
-        elif path=="/api/aigrade":
-            qs=parse_qs(parsed.query)
-            dom=(qs.get("domain",[""])[0] or "").strip()
-            rep=aigrade_run(dom)
-            if not rep:
-                send_json(self,{"error":"valid domain required, e.g. ?domain=example.com"},400)
-            else:
-                send_json(self,rep)
-        elif path=="/api/aigrade/badge":
-            qs=parse_qs(parsed.query)
-            dom=(qs.get("domain",[""])[0] or "").strip()
-            svg=aigrade_badge_svg(dom)
-            body=svg.encode()
-            self.send_response(200)
-            self.send_header("Content-Type","image/svg+xml")
-            self.send_header("Cache-Control","max-age=3600")
-            self.send_header("Content-Length",str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-# ---------------- END ROUTES ----------------
-
-```
-
-
-## `aileash_reporter.py`
-
-232 lines, 9377 bytes
-
-```python
-"""
-AILEASH DECISION REPORTER v1.0.0
-Generates readable audit reports for all AILeash products.
-Shows exactly why each decision was made.
-Copyright (c) 2026 Justin Antony Dobson / Monop Content, Blyth, UK
-"""
-
-import sqlite3, json, os
-from datetime import datetime
-
-DB_FILE = "aileash.db"
-
-PRODUCTS = {
-    "aileash": "AILeash",
-    "guardian": "AILeash Guardian",
-    "sonicboom": "SonicBoom",
-    "sentinel": "AILeash Sentinel"
-}
-
-REASON_EXPLANATIONS = {
-    "velocity_spike": "User made more than 10 requests in 60 seconds",
-    "high_amount": "Transaction amount exceeded threshold",
-    "risky_device": "Device risk score was above acceptable limit",
-    "behaviour_anomaly": "Unusual behaviour pattern detected",
-    "country_shift": "Request came from a different country than usual",
-    "unsafe_country": "Request came from outside approved country list",
-    "low_trust": "User trust score has dropped due to previous decisions",
-}
-
-def get_decisions(db_path=DB_FILE, limit=200):
-    if not os.path.exists(db_path):
-        return []
-    try:
-        conn = sqlite3.connect(db_path)
-        rows = conn.execute("""
-            SELECT a.ts, a.user_id, a.event_json, a.result_json, a.audit_hash,
-                   COALESCE(k.product, 'aileash') as product
-            FROM audit_log a
-            LEFT JOIN api_keys k ON json_extract(a.event_json, '$.api_key') = k.key
-            ORDER BY a.id DESC LIMIT ?
-        """, (limit,)).fetchall()
-        conn.close()
-    except:
-        try:
-            conn = sqlite3.connect(db_path)
-            rows = conn.execute("""
-                SELECT ts, user_id, event_json, result_json, audit_hash, 'aileash'
-                FROM audit_log ORDER BY id DESC LIMIT ?
-            """, (limit,)).fetchall()
-            conn.close()
-        except:
-            return []
-    
-    results = []
-    for row in rows:
-        try:
-            event = json.loads(row[2])
-            result = json.loads(row[3])
-            results.append({
-                "ts": row[0],
-                "user_id": row[1],
-                "event": event,
-                "result": result,
-                "audit_hash": row[4],
-                "product": row[5] or "aileash"
-            })
-        except:
-            pass
-    return results
-
-def explain_reason(r):
-    return REASON_EXPLANATIONS.get(r, r.replace("_", " ").capitalize())
-
-def decision_color(d):
-    return {"ALLOW": "#00875a", "CHALLENGE": "#b45309", "BLOCK": "#cc0000"}.get(d, "#555")
-
-def product_color(p):
-    return {
-        "aileash": "#c9a84c",
-        "guardian": "#cc0000",
-        "sonicboom": "#00d4ff",
-        "sentinel": "#7c3aed"
-    }.get(p, "#c9a84c")
-
-def generate_html_report(db_path=DB_FILE, limit=200, output="aileash_report.html"):
-    decisions = get_decisions(db_path, limit)
-
-    allow = sum(1 for d in decisions if d["result"].get("decision") == "ALLOW")
-    challenge = sum(1 for d in decisions if d["result"].get("decision") == "CHALLENGE")
-    block = sum(1 for d in decisions if d["result"].get("decision") == "BLOCK")
-
-    rows = ""
-    for d in decisions:
-        result = d["result"]
-        event = d["event"]
-        ts = datetime.fromtimestamp(d["ts"]).strftime('%Y-%m-%d %H:%M:%S')
-        decision = result.get("decision", "?")
-        score = result.get("score", 0)
-        reasons = result.get("reasons", [])
-        product = d.get("product", "aileash")
-        pc = product_color(product)
-        dc = decision_color(decision)
-        pname = PRODUCTS.get(product, product)
-
-        reason_html = ""
-        if reasons:
-            reason_html = "<ul>" + "".join(
-                f"<li>{explain_reason(r)}</li>" for r in reasons
-            ) + "</ul>"
-        else:
-            reason_html = "<span style='color:#888'>No risk factors detected</span>"
-
-        rows += f"""<tr>
-            <td>{ts}</td>
-            <td><span style="font-size:10px;background:{pc}22;color:{pc};border:1px solid {pc}44;padding:2px 6px;border-radius:3px">{pname}</span></td>
-            <td><code>{d['user_id']}</code></td>
-            <td>{event.get('action','?')}</td>
-            <td>{event.get('country','?')}</td>
-            <td>£{event.get('amount',0)}</td>
-            <td><strong style="color:{dc}">{decision}</strong></td>
-            <td>{score}</td>
-            <td>{result.get('trust',0)}</td>
-            <td>{reason_html}</td>
-            <td><code style="font-size:10px">{d['audit_hash'][:16]}...</code></td>
-        </tr>"""
-
-    html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>AILeash Audit Report</title>
-<style>
-*{{box-sizing:border-box;margin:0;padding:0}}
-body{{font-family:sans-serif;background:#f5f7fa;color:#1a202c;padding:20px}}
-.header{{background:#0a0f1e;color:#fff;padding:24px 32px;border-radius:8px;margin-bottom:20px;display:flex;justify-content:space-between;align-items:center}}
-.header h1{{font-size:22px;color:#c9a84c;margin:0}}
-.header p{{font-size:12px;color:rgba(255,255,255,0.4);margin-top:4px}}
-.logo{{font-size:13px;color:rgba(255,255,255,0.2)}}
-.stats{{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px}}
-.stat{{background:#fff;border-radius:8px;padding:16px;text-align:center;border:1px solid #e2e8f0}}
-.stat-n{{font-size:28px;font-weight:700}}
-.stat-l{{font-size:11px;color:#64748b;margin-top:4px;text-transform:uppercase;letter-spacing:1px}}
-.allow{{color:#00875a}}.challenge{{color:#b45309}}.block{{color:#cc0000}}.total{{color:#0a0f1e}}
-.table-wrap{{background:#fff;border-radius:8px;overflow:hidden;border:1px solid #e2e8f0;overflow-x:auto}}
-table{{width:100%;border-collapse:collapse;min-width:900px}}
-th{{background:#0a0f1e;color:#c9a84c;padding:10px 12px;text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:1px;white-space:nowrap}}
-td{{padding:10px 12px;border-bottom:1px solid #e2e8f0;font-size:12px;vertical-align:top}}
-tr:last-child td{{border:none}}
-tr:hover td{{background:#f8fafc}}
-ul{{margin:4px 0;padding-left:16px}}
-li{{margin:2px 0;color:#64748b;font-size:11px}}
-code{{background:#f1f5f9;padding:2px 4px;border-radius:3px;font-size:10px}}
-.empty{{text-align:center;color:#888;padding:40px}}
-footer{{text-align:center;font-size:11px;color:#94a3b8;margin-top:20px}}
-</style>
-</head>
-<body>
-<div class="header">
-  <div>
-    <h1>AILeash Audit Report</h1>
-    <p>Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} &nbsp;|&nbsp; Last {len(decisions)} decisions</p>
-  </div>
-  <div class="logo">sebbi.pro &nbsp;|&nbsp; OAAS-1.0</div>
-</div>
-<div class="stats">
-  <div class="stat"><div class="stat-n total">{len(decisions)}</div><div class="stat-l">Total</div></div>
-  <div class="stat"><div class="stat-n allow">{allow}</div><div class="stat-l">Allowed</div></div>
-  <div class="stat"><div class="stat-n challenge">{challenge}</div><div class="stat-l">Challenged</div></div>
-  <div class="stat"><div class="stat-n block">{block}</div><div class="stat-l">Blocked</div></div>
-</div>
-<div class="table-wrap">
-<table>
-<thead><tr>
-  <th>Time</th><th>Product</th><th>User</th><th>Action</th><th>Country</th>
-  <th>Amount</th><th>Decision</th><th>Score</th><th>Trust</th><th>Reasons</th><th>Audit Hash</th>
-</tr></thead>
-<tbody>
-{''.join([rows]) if rows else f'<tr><td colspan="11" class="empty">No decisions recorded yet</td></tr>'}
-</tbody>
-</table>
-</div>
-<footer>AILeash &nbsp;|&nbsp; Monop Content &nbsp;|&nbsp; Justin Antony Dobson &nbsp;|&nbsp; sebbi.pro &nbsp;|&nbsp; SHA-256 Merkle Chain</footer>
-</body>
-</html>"""
-
-    with open(output, "w") as f:
-        f.write(html)
-    print(f"Report saved: {output} ({len(decisions)} decisions)")
-    return output
-
-def generate_json_report(db_path=DB_FILE, limit=200, output="aileash_report.json"):
-    decisions = get_decisions(db_path, limit)
-    report = {
-        "generated": datetime.now().isoformat(),
-        "standard": "OAAS-1.0",
-        "source": "sebbi.pro",
-        "total": len(decisions),
-        "summary": {
-            "allow": sum(1 for d in decisions if d["result"].get("decision") == "ALLOW"),
-            "challenge": sum(1 for d in decisions if d["result"].get("decision") == "CHALLENGE"),
-            "block": sum(1 for d in decisions if d["result"].get("decision") == "BLOCK")
-        },
-        "decisions": [{
-            "timestamp": datetime.fromtimestamp(d["ts"]).isoformat(),
-            "product": PRODUCTS.get(d["product"], d["product"]),
-            "user_id": d["user_id"],
-            "action": d["event"].get("action"),
-            "country": d["event"].get("country"),
-            "amount": d["event"].get("amount"),
-            "decision": d["result"].get("decision"),
-            "score": d["result"].get("score"),
-            "trust": d["result"].get("trust"),
-            "reasons": d["result"].get("reasons", []),
-            "reasons_explained": [explain_reason(r) for r in d["result"].get("reasons", [])],
-            "audit_hash": d["audit_hash"]
-        } for d in decisions]
-    }
-    with open(output, "w") as f:
-        json.dump(report, f, indent=2)
-    print(f"Report saved: {output}")
-    return output
-
-if __name__ == "__main__":
-    import sys
-    fmt = sys.argv[1] if len(sys.argv) > 1 else "html"
-    db = sys.argv[2] if len(sys.argv) > 2 else DB_FILE
-    if fmt == "json":
-        generate_json_report(db)
-    else:
-        generate_html_report(db)
-
-```
-
-
-## `aileash_signed_client.py`
-
-415 lines, 14196 bytes
+596 lines, 22636 bytes
 
 ```python
 #!/usr/bin/env python3
 """
-aileash_signed_client.py  -  reference client for the signed witness lane
+verify_authority.py  -  check an AILeash authority proof without AILeash
 
-Standard library only. No pip install, no dependencies, runs anywhere
-Python 3 runs including a phone.
+    python3 verify_authority.py proof.json
+    curl -s "https://sebbi.pro/x/continuity/proof?evaluation=e_..." \\
+        | python3 verify_authority.py -
 
-WHAT IT IS FOR
-    Two jobs, and it is the same code for both.
+WHAT THIS IS FOR
+----------------
+A proof that can only be checked by the party who issued it is not a proof.
+This script takes a bundle and reaches its own conclusion using nothing but
+the Python standard library. It does not call the issuing system, it does not
+import anything you have to install, and it does not take a single field of
+the bundle at face value.
 
-    1. Testing. Run it with --test against your own deployment and it
-       generates a throwaway keypair, enrols it, submits a tip, fetches
-       the receipt, and rechecks the signature in the receipt against the
-       published public key. If all four steps pass, the lane works end
-       to end.
+It does four separate things, and each one can fail on its own:
 
-    2. Giving to a peer. This is the file you send someone who asks how
-       to join the signed lane. It contains a complete, readable Ed25519
-       implementation and the exact canonical message, so they can copy
-       the approach into any language without guessing.
+  1. SIGNATURE   Ed25519 over the canonical bundle. Confirms the bundle came
+                 from the holder of the named key and has not been edited by
+                 anybody since.
 
-USAGE
-    Generate a keypair and keep it:
-        python3 aileash_signed_client.py --keygen
+  2. INTEGRITY   Recomputes every grant digest, the lineage digest and the
+                 parameter digest from the fields in front of it. Confirms
+                 the bundle is internally consistent with its own contents.
 
-    Enrol a name:
-        python3 aileash_signed_client.py --enroll --chain you.example \\
-            --secret <hex from keygen>
+  3. DERIVATION  Re-runs the authority rules from scratch: root issued by a
+                 human, an unbroken parent chain, scope covered at every hop,
+                 constraints narrowing on every axis, purpose narrowing,
+                 validity windows contained, nothing revoked, and the action
+                 itself inside the effective limits of the whole lineage.
 
-    Submit a tip:
-        python3 aileash_signed_client.py --submit --chain you.example \\
-            --secret <hex> --tip <64 hex>
+  4. AGREEMENT   Compares the verdict this script reached with the verdict the
+                 bundle claims. Disagreement is reported as a failure of the
+                 issuer, not of this script.
 
-    Full round trip with a throwaway name and key:
-        python3 aileash_signed_client.py --test
+WHAT A PASS MEANS
+-----------------
+That the authority for this action was derivable, at that time, from that
+human grant - or, for a refusal, that it genuinely was not, and that the named
+grant and invariant really are where it broke.
 
-    Point at somewhere else:
-        --host https://sebbi.pro
+WHAT A PASS DOES NOT MEAN
+-------------------------
+That the root grant should ever have been issued. That the parameters describe
+something that really happened. That the risk engine was right. Derivation is
+not merit and it is not truth.
 
-THE PRIVATE KEY
-    --keygen prints a 64-hex seed. That is the private key. Whoever holds
-    it can submit under your enrolled name and nobody else can, including
-    the operator of the deployment. Do not send it anywhere. There is no
-    route on the server that accepts one, and if a route ever asks you
-    for one, something is wrong.
+The risk half of a composed verdict cannot be re-derived here, because that
+needs the issuer's scoring engine. Where the bundle's authority verdict is
+BLOCK, the composed verdict stands regardless, because the composition takes
+the worse of the two.
 
-    Losing it is not catastrophic and it is not recoverable either. You
-    cannot rotate without it - rotation must be signed by the key being
-    replaced, which is exactly what stops anyone else rotating it. If it
-    is lost, enrol a new name; the old one stays visible and unused.
+THE SIGNED MATERIAL
+-------------------
+Exactly one field is removed before checking: signature. Everything else the
+bundle carries, including verify_with, is inside the signature, which is what
+the bundle's own instruction says. A verifier that quietly strips more fields
+than the published method does is checking a different document from the one
+the issuer told the world to check.
 """
 
-import argparse
+import binascii
 import hashlib
 import json
-import os
 import sys
-import time
-import urllib.error
-import urllib.request
 
-DEFAULT_HOST = "https://sebbi.pro"
-MSG_PREFIX = "aileash-signed-v1"
-ROTATE_PREFIX = "aileash-rotate-v1"
+GRANT_PREFIX = b"AILEASH-GRANT-v1:"
+EVAL_PREFIX = b"AILEASH-AUTHEVAL-v1:"
+BUNDLE_PREFIX = b"AILEASH-AUTHORITY-PROOF-v1:"
+
+MAX_DEPTH = 32
+RANK = {"ALLOW": 0, "CHALLENGE": 1, "BLOCK": 2}
 
 
-# ----------------------------------------------------------------------
-# Ed25519, RFC 8032. Sign and verify. Standard library only.
-#
-# This is here so the file is self-contained and so a peer can read what
-# is actually happening rather than trusting a library they also have to
-# install. It is the textbook reference implementation with extended
-# coordinates for the scalar multiplication.
-# ----------------------------------------------------------------------
+# ======================================================================
+# Ed25519, RFC 8032, standard library only
+# ======================================================================
 
-_P = 2 ** 255 - 19
+_Q = 2 ** 255 - 19
 _L = 2 ** 252 + 27742317777372353535851937790883648493
-_D = -121665 * pow(121666, _P - 2, _P) % _P
-_I = pow(2, (_P - 1) // 4, _P)
+_D = -121665 * pow(121666, _Q - 2, _Q) % _Q
+_I = pow(2, (_Q - 1) // 4, _Q)
+
+
+def _h(m):
+    return hashlib.sha512(m).digest()
+
+
+def _inv(x):
+    return pow(x, _Q - 2, _Q)
 
 
 def _xrecover(y):
-    xx = (y * y - 1) * pow(_D * y * y + 1, _P - 2, _P)
-    x = pow(xx, (_P + 3) // 8, _P)
-    if (x * x - xx) % _P != 0:
-        x = (x * _I) % _P
+    xx = (y * y - 1) * _inv(_D * y * y + 1)
+    x = pow(xx, (_Q + 3) // 8, _Q)
+    if (x * x - xx) % _Q != 0:
+        x = (x * _I) % _Q
     if x % 2 != 0:
-        x = _P - x
+        x = _Q - x
     return x
 
 
-_BY = 4 * pow(5, _P - 2, _P) % _P
+_BY = 4 * _inv(5) % _Q
 _BX = _xrecover(_BY)
-_B = (_BX % _P, _BY % _P, 1, _BX * _BY % _P)
+_B = (_BX % _Q, _BY % _Q, 1, (_BX * _BY) % _Q)
+_IDENT = (0, 1, 1, 0)
 
 
 def _add(p, q):
     x1, y1, z1, t1 = p
     x2, y2, z2, t2 = q
-    a = (y1 - x1) * (y2 - x2) % _P
-    b = (y1 + x1) * (y2 + x2) % _P
-    c = t1 * 2 * _D * t2 % _P
-    dd = z1 * 2 * z2 % _P
-    e, f, g, h = b - a, dd - c, dd + c, b + a
-    return (e * f % _P, g * h % _P, f * g % _P, e * h % _P)
+    a = (y1 - x1) * (y2 - x2) % _Q
+    b = (y1 + x1) * (y2 + x2) % _Q
+    c = t1 * 2 * _D * t2 % _Q
+    dd = z1 * 2 * z2 % _Q
+    e, f, g, hh = b - a, dd - c, dd + c, b + a
+    return (e * f % _Q, g * hh % _Q, f * g % _Q, e * hh % _Q)
 
 
 def _scalarmult(p, e):
     if e == 0:
-        return (0, 1, 1, 0)
-    q = _scalarmult(p, e >> 1)
+        return _IDENT
+    q = _scalarmult(p, e // 2)
     q = _add(q, q)
     if e & 1:
         q = _add(q, p)
@@ -1396,1062 +1463,762 @@ def _scalarmult(p, e):
 
 def _encodepoint(p):
     x, y, z, _t = p
-    zi = pow(z, _P - 2, _P)
-    x = x * zi % _P
-    y = y * zi % _P
-    raw = bytearray(y.to_bytes(32, "little"))
-    raw[31] |= (x & 1) << 7
-    return bytes(raw)
+    zi = _inv(z)
+    x, y = x * zi % _Q, y * zi % _Q
+    bits = [(y >> i) & 1 for i in range(255)] + [x & 1]
+    return bytes(sum(bits[i * 8 + j] << j for j in range(8)) for i in range(32))
 
 
-def _decodepoint(raw):
-    y = int.from_bytes(raw, "little") & ((1 << 255) - 1)
-    if y >= _P:
-        return None
+def _bit(h, i):
+    return (h[i // 8] >> (i % 8)) & 1
+
+
+def _hint(m):
+    h = _h(m)
+    return sum(2 ** i * _bit(h, i) for i in range(512))
+
+
+def _isoncurve(p):
+    x, y, z, t = p
+    return (z % _Q != 0 and x * y % _Q == z * t % _Q
+            and (y * y - x * x - z * z - _D * t * t) % _Q == 0)
+
+
+def _decodepoint(s):
+    y = int.from_bytes(s, "little") & ((1 << 255) - 1)
     x = _xrecover(y)
-    if x & 1 != (raw[31] >> 7) & 1:
-        x = _P - x
-    if (-x * x + y * y - 1 - _D * x * x * y * y) % _P != 0:
-        return None
-    return (x, y, 1, x * y % _P)
+    if x & 1 != _bit(s, 255):
+        x = _Q - x
+    p = (x, y, 1, (x * y) % _Q)
+    if not _isoncurve(p):
+        raise ValueError("point off curve")
+    return p
 
 
-def _secret_scalar(seed):
-    h = hashlib.sha512(seed).digest()
-    a = int.from_bytes(h[:32], "little")
-    a &= (1 << 254) - 8
-    a |= 1 << 254
-    return a, h[32:]
-
-
-def public_key(seed):
-    """32-byte public key from a 32-byte seed."""
-    a, _ = _secret_scalar(seed)
-    return _encodepoint(_scalarmult(_B, a))
-
-
-def sign(seed, message):
-    """64-byte Ed25519 signature."""
-    a, prefix = _secret_scalar(seed)
-    pk = _encodepoint(_scalarmult(_B, a))
-    r = int.from_bytes(hashlib.sha512(prefix + message).digest(), "little") % _L
-    rp = _encodepoint(_scalarmult(_B, r))
-    k = int.from_bytes(hashlib.sha512(rp + pk + message).digest(), "little") % _L
-    s = (r + k * a) % _L
-    return rp + s.to_bytes(32, "little")
-
-
-def verify(pk, message, signature):
-    """True if signature is valid. Never raises."""
+def ed25519_verify(sig, msg, pk):
+    if len(sig) != 64 or len(pk) != 32:
+        return False
     try:
-        if len(pk) != 32 or len(signature) != 64:
-            return False
+        rr = _decodepoint(sig[:32])
         a = _decodepoint(pk)
-        if a is None:
-            return False
-        r = _decodepoint(signature[:32])
-        if r is None:
-            return False
-        s = int.from_bytes(signature[32:], "little")
-        if s >= _L:
-            return False
-        k = int.from_bytes(
-            hashlib.sha512(signature[:32] + pk + message).digest(),
-            "little") % _L
-        left = _scalarmult(_B, s)
-        right = _add(r, _scalarmult(a, k))
-        lx, ly, lz, _lt = left
-        rx, ry, rz, _rt = right
-        return ((lx * rz - rx * lz) % _P == 0
-                and (ly * rz - ry * lz) % _P == 0)
     except Exception:
         return False
+    s = int.from_bytes(sig[32:64], "little")
+    if s >= _L:
+        return False
+    hh = _hint(sig[:32] + pk + msg)
+    return _encodepoint(_scalarmult(_B, s)) == _encodepoint(_add(rr, _scalarmult(a, hh)))
 
 
-# ----------------------------------------------------------------------
-# the canonical message - the only part a reimplementer must match
-# ----------------------------------------------------------------------
+# ======================================================================
+# the rules, reimplemented from the published spec
+# ======================================================================
 
-def canonical_submit(chain, tip, ts):
-    """Four lines, single \\n, UTF-8, no trailing newline."""
-    return "\n".join([MSG_PREFIX, chain, tip, str(int(ts))]).encode("utf-8")
-
-
-def canonical_rotate(chain, new_pubkey_hex, ts):
-    return "\n".join([ROTATE_PREFIX, chain, new_pubkey_hex,
-                      str(int(ts))]).encode("utf-8")
+def canon(obj):
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
 
 
-# ----------------------------------------------------------------------
-# http
-# ----------------------------------------------------------------------
+def sha(prefix, text):
+    return hashlib.sha256(prefix + text.encode("utf-8")).hexdigest()
 
-def _call(host, path, body=None, timeout=20):
-    url = host.rstrip("/") + path
-    data = None
-    headers = {"Accept": "application/json"}
-    if body is not None:
-        data = json.dumps(body).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=data, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode("utf-8", "replace")), r.getcode()
-    except urllib.error.HTTPError as e:
-        raw = e.read().decode("utf-8", "replace")
+
+def grant_digest(g):
+    material = {
+        "id": g["id"], "parent": g["parent"], "issuer": g["issuer"],
+        "issuer_kind": g["issuer_kind"], "subject": g["subject"],
+        "subject_kind": g["subject_kind"], "scope": sorted(g["scope"]),
+        "constraints": g["constraints"], "purpose": g["purpose"],
+        "purpose_tags": sorted(g["purpose_tags"]),
+        "not_before": g["not_before"], "not_after": g["not_after"],
+        "depth": g["depth"], "delegations_left": g["delegations_left"],
+        "created": g["created"], "risk_accepted_by": g.get("risk_accepted_by"),
+    }
+    return sha(GRANT_PREFIX, canon(material))
+
+
+def covers(held, wanted):
+    if held == wanted or held == "*":
+        return True
+    if held.endswith(".*"):
+        return wanted == held[:-2] or wanted.startswith(held[:-1])
+    return False
+
+
+def wildcard_breadth(scope, capability):
+    best = None
+    for held in scope:
+        if not covers(held, capability):
+            continue
+        if held == capability:
+            return 0
+        width = (capability.count(".") + 2 if held == "*"
+                 else capability.count(".") - held[:-2].count("."))
+        best = width if best is None else min(best, width)
+    return best
+
+
+def direction(key):
+    for p in ("max_", "min_", "allowed_", "denied_", "may_"):
+        if key.startswith(p):
+            return p
+    return None
+
+
+def num(v):
+    if isinstance(v, bool) or v is None:
+        raise ValueError("not a number")
+    return float(v)
+
+
+def as_set(v):
+    if isinstance(v, (list, tuple, set)):
+        return set(v)
+    return {v}
+
+
+def narrower(parent_c, child_c):
+    for key in sorted(child_c):
+        d = direction(key)
+        cval = child_c[key]
+        if d is None:
+            return False, "constraint '%s' has no narrowing rule" % key
+        if key not in parent_c:
+            return False, "constraint '%s' is not expressed by the parent" % key
+        pval = parent_c[key]
         try:
-            return json.loads(raw), e.code
+            if d == "max_" and num(cval) > num(pval):
+                return False, "%s raised from %s to %s" % (key, pval, cval)
+            if d == "min_" and num(cval) < num(pval):
+                return False, "%s lowered from %s to %s" % (key, pval, cval)
+            if d == "allowed_" and not as_set(cval) <= as_set(pval):
+                return False, "%s adds values the parent does not hold" % key
+            if d == "denied_" and not as_set(pval) <= as_set(cval):
+                return False, "%s drops values the parent denies" % key
+            if d == "may_" and bool(cval) and not bool(pval):
+                return False, "%s enabled where the parent withholds it" % key
+        except (TypeError, ValueError):
+            return False, "constraint '%s' is not comparable" % key
+    return True, None
+
+
+def effective(chain):
+    eff = {}
+    for g in chain:
+        for k, v in g["constraints"].items():
+            d = direction(k)
+            if k not in eff:
+                eff[k] = v
+                continue
+            cur = eff[k]
+            try:
+                if d == "max_":
+                    eff[k] = min(num(cur), num(v))
+                elif d == "min_":
+                    eff[k] = max(num(cur), num(v))
+                elif d == "allowed_":
+                    eff[k] = sorted(as_set(cur) & as_set(v))
+                elif d == "denied_":
+                    eff[k] = sorted(as_set(cur) | as_set(v))
+                elif d == "may_":
+                    eff[k] = bool(cur) and bool(v)
+            except (TypeError, ValueError):
+                eff[k] = v
+    return eff
+
+
+def params_against(params, eff):
+    hard, unconstrained = [], []
+    for key in sorted(params):
+        val = params[key]
+        checked = False
+        for cname, cval in eff.items():
+            d = direction(cname)
+            if not d or cname[len(d):] != key:
+                continue
+            checked = True
+            try:
+                if d == "max_" and num(val) > num(cval):
+                    hard.append("%s=%s exceeds %s=%s" % (key, val, cname, cval))
+                elif d == "min_" and num(val) < num(cval):
+                    hard.append("%s=%s is below %s=%s" % (key, val, cname, cval))
+                elif d == "allowed_" and val not in as_set(cval):
+                    hard.append("%s=%s is outside %s" % (key, val, cname))
+                elif d == "denied_" and val in as_set(cval):
+                    hard.append("%s=%s is denied by %s" % (key, val, cname))
+                elif d == "may_" and bool(val) and not bool(cval):
+                    hard.append("%s requested where %s withholds it" % (key, cname))
+            except (TypeError, ValueError):
+                hard.append("%s cannot be compared with %s" % (key, cname))
+        if not checked:
+            unconstrained.append(key)
+    return hard, unconstrained
+
+
+# ======================================================================
+# the four checks
+# ======================================================================
+
+class Report(object):
+    def __init__(self):
+        self.rows = []
+        self.failed = False
+
+    def add(self, ok, name, detail=""):
+        self.rows.append((ok, name, detail))
+        if not ok:
+            self.failed = True
+
+    def note(self, name, detail=""):
+        self.rows.append((None, name, detail))
+
+    def render(self):
+        out = []
+        for ok, name, detail in self.rows:
+            mark = "  ok  " if ok else ("FAIL  " if ok is False else "  --  ")
+            out.append(mark + name + (("\n        " + detail) if detail else ""))
+        return "\n".join(out)
+
+
+def check_signature(bundle, rep):
+    sig_hex = bundle.get("signature")
+    pk_hex = (bundle.get("issued_by") or {}).get("public_key")
+    if not sig_hex or not pk_hex:
+        rep.add(False, "Signature present", "the bundle carries no signature or no key")
+        return
+    # Only the signature itself is removed. Every other field the bundle
+    # carries is inside the signed material, exactly as the bundle's own
+    # verify_with instruction states.
+    body = dict(bundle)
+    body.pop("signature", None)
+    try:
+        sig = binascii.unhexlify(sig_hex)
+        pk = binascii.unhexlify(pk_hex)
+    except Exception:
+        rep.add(False, "Signature is readable hex")
+        return
+    ok = ed25519_verify(sig, BUNDLE_PREFIX + canon(body).encode("utf-8"), pk)
+    rep.add(ok, "Ed25519 signature over the canonical bundle",
+            "key " + pk_hex[:16] + "…  Verify this key independently at the issuer's "
+            "published address before trusting who signed." if ok else
+            "the bundle was altered after signing, or it was not signed by this key")
+
+
+def check_integrity(bundle, rep):
+    lineage = bundle.get("lineage") or []
+    bad = []
+    for g in lineage:
+        try:
+            if grant_digest(g) != g.get("digest"):
+                bad.append(g.get("id"))
         except Exception:
-            return {"raw": raw[:400]}, e.code
-    except Exception as e:
-        return {"error": "unreachable", "detail": str(e)}, 0
+            bad.append(g.get("id"))
+    rep.add(not bad, "Every grant digest recomputes from its own fields",
+            "" if not bad else "mismatched: " + ", ".join(str(b) for b in bad))
+
+    claimed = (bundle.get("decision") or {}).get("lineage_digest")
+    mine = sha(EVAL_PREFIX, canon([g.get("digest") for g in lineage]))
+    rep.add(mine == claimed, "Lineage digest matches the ordered path",
+            "" if mine == claimed else "computed " + mine[:20] + "… claimed " + str(claimed)[:20] + "…")
+
+    req = bundle.get("request") or {}
+    claimed_p = (bundle.get("decision") or {}).get("params_digest")
+    mine_p = sha(EVAL_PREFIX, canon({"action": req.get("action"),
+                                     "params": req.get("params") or {}}))
+    rep.add(mine_p == claimed_p, "Parameter digest matches the request as stated",
+            "" if mine_p == claimed_p else "the parameters shown are not the "
+            "parameters that were judged")
+
+    # The decision records its own action separately from the request block.
+    # Everything downstream - the scope check, the wildcard breadth - is run
+    # against the request's action, so if the two ever disagreed this script
+    # would be checking one action while the issuer decided another.
+    decided_action = (bundle.get("decision") or {}).get("action")
+    shown_action = req.get("action")
+    rep.add(decided_action == shown_action,
+            "The action shown is the action that was decided",
+            "" if decided_action == shown_action else
+            "the decision names '" + str(decided_action) + "' and the request shows '"
+            + str(shown_action) + "' - the bundle describes one action and was judged "
+            "on another")
 
 
-def _wake(host):
-    """The router only imports a module when a request arrives, and only
-    GET reaches it after a restart. So GET something before POSTing."""
-    _call(host, "/x/witness/tip")
+def rederive(bundle, rep):
+    """Run the published rules from scratch and reach an independent verdict."""
+    lineage = bundle.get("lineage") or []
+    decision = bundle.get("decision") or {}
+    req = bundle.get("request") or {}
+    at = decision.get("evaluated_at_epoch")
+
+    hard, soft = [], []
+    broken_at = broken_invariant = None
+
+    def fail(grant, invariant, detail):
+        nonlocal broken_at, broken_invariant
+        hard.append(detail)
+        if broken_at is None:
+            broken_at, broken_invariant = grant, invariant
+
+    if not lineage:
+        fail(None, "authority_continuity", "the bundle carries no authority path")
+    else:
+        root = lineage[0]
+        if root.get("parent") is not None:
+            fail(root["id"], "authority_continuity",
+                 "the path does not begin at a parentless root")
+        if root.get("issuer_kind") != "human":
+            fail(root["id"], "identity_continuity",
+                 "the root grant was not issued by a human principal")
+
+        previous = None
+        for g in lineage:
+            if g.get("revoked_at") is not None:
+                fail(g["id"], "authority_continuity",
+                     "grant %s was revoked" % g["id"])
+            if at is not None:
+                if at < g["not_before"]:
+                    fail(g["id"], "temporal_validity",
+                         "grant %s was not yet valid at the time of the decision" % g["id"])
+                if at >= g["not_after"]:
+                    fail(g["id"], "temporal_validity",
+                         "grant %s had expired at the time of the decision" % g["id"])
+            if previous is not None:
+                if g.get("parent") != previous.get("id"):
+                    fail(g["id"], "authority_continuity",
+                         "grant %s does not point at the grant above it" % g["id"])
+                missing = [c for c in g["scope"]
+                           if not any(covers(p, c) for p in previous["scope"])]
+                if missing:
+                    fail(g["id"], "boundary_integrity",
+                         "%s holds scope its parent does not: %s"
+                         % (g["id"], ", ".join(sorted(missing))))
+                ok, why = narrower(previous["constraints"], g["constraints"])
+                if not ok:
+                    fail(g["id"], "boundary_integrity", "%s: %s" % (g["id"], why))
+                if not set(g["purpose_tags"]) <= set(previous["purpose_tags"]):
+                    fail(g["id"], "intent_continuity",
+                         "%s carries purpose tags its parent does not" % g["id"])
+                if (g["not_before"] < previous["not_before"]
+                        or g["not_after"] > previous["not_after"]):
+                    fail(g["id"], "temporal_validity",
+                         "%s is valid outside its parent's window" % g["id"])
+                if g["depth"] != previous["depth"] + 1:
+                    fail(g["id"], "authority_continuity",
+                         "%s records a depth inconsistent with its parent" % g["id"])
+            previous = g
+
+        if len(lineage) - 1 > MAX_DEPTH:
+            fail(lineage[-1]["id"], "boundary_integrity", "delegation depth exceeds the ceiling")
+
+        if not any(g.get("risk_accepted_by") for g in lineage):
+            fail(lineage[0]["id"], "identity_continuity",
+                 "no grant in this path names who accepted the risk")
+
+        leaf = lineage[-1]
+        action = req.get("action")
+        params = req.get("params") or {}
+
+        if action and not any(covers(c, action) for c in leaf["scope"]):
+            fail(leaf["id"], "boundary_integrity",
+                 "action '%s' is outside the scope of the grant exercised" % action)
+        elif action:
+            breadth = wildcard_breadth(leaf["scope"], action)
+            if breadth and breadth >= 2:
+                soft.append("action '%s' is only covered by a broad wildcard" % action)
+
+        eff = effective(lineage)
+        failures, unconstrained = params_against(params, eff)
+        for f in failures:
+            fail(leaf["id"], "boundary_integrity", f)
+        for u in unconstrained:
+            soft.append("parameter '%s' is not constrained anywhere in the path" % u)
+
+        tag = req.get("purpose_tag")
+        if tag:
+            if tag not in leaf["purpose_tags"]:
+                soft.append("declared purpose '%s' is not carried by the grant" % tag)
+        else:
+            soft.append("the action declared no purpose")
+
+    verdict = "BLOCK" if hard else ("CHALLENGE" if soft else "ALLOW")
+    return verdict, hard, soft, broken_at, broken_invariant
 
 
-# ----------------------------------------------------------------------
-# operations
-# ----------------------------------------------------------------------
+def check_agreement(bundle, rep, mine, hard, soft, broken_at, broken_invariant):
+    decision = bundle.get("decision") or {}
+    claimed = decision.get("authority_verdict") or decision.get("verdict")
 
-def do_keygen():
-    seed = os.urandom(32)
-    print("private seed (KEEP THIS, send it nowhere):")
-    print("  " + seed.hex())
-    print("public key (this is what you enrol):")
-    print("  " + public_key(seed).hex())
+    rep.add(mine == claimed,
+            "Independently re-derived authority verdict: " + mine,
+            "" if mine == claimed else
+            "the issuer claims " + str(claimed) + " and this script reaches " + mine +
+            " from the same path. One of us is wrong and the rules are published.")
 
+    if mine == "BLOCK":
+        same_grant = (broken_at == decision.get("broken_at"))
+        same_inv = (broken_invariant == decision.get("broken_invariant"))
+        rep.add(same_grant and same_inv,
+                "Refusal reproduces at the same grant and invariant",
+                ("grant %s, invariant %s" % (broken_at, broken_invariant))
+                if same_grant and same_inv else
+                "this script breaks at grant %s / %s, the issuer says %s / %s"
+                % (broken_at, broken_invariant,
+                   decision.get("broken_at"), decision.get("broken_invariant")))
+        rep.note("Why authority could not be derived")
+        for h in hard:
+            rep.note("  " + h)
+    elif soft:
+        rep.note("Why this could not be settled without a person")
+        for x in soft:
+            rep.note("  " + x)
 
-def do_enroll(host, chain, seed):
-    _wake(host)
-    pk = public_key(seed).hex()
-    body, code = _call(host, "/x/signed/enroll",
-                       {"chain": chain, "pubkey": pk})
-    print(json.dumps(body, indent=2))
-    return code == 200
-
-
-def do_submit(host, chain, seed, tip):
-    _wake(host)
-    ts = int(time.time())
-    sig = sign(seed, canonical_submit(chain, tip, ts)).hex()
-    body, code = _call(host, "/x/signed/submit",
-                       {"chain": chain, "tip": tip, "ts": ts,
-                        "signature": sig})
-    print(json.dumps(body, indent=2))
-    return code == 200
-
-
-def do_verify(host, chain, tip):
-    body, code = _call(host,
-                       "/x/signed/verify?peer=%s&tip=%s" % (chain, tip))
-    print(json.dumps(body, indent=2))
-    return body, code
-
-
-def do_test(host):
-    """Full round trip on a throwaway name and key, then an independent
-    recheck of the receipt. Prints a pass or fail per step."""
-    results = []
-
-    def step(label, ok, detail=""):
-        results.append(ok)
-        print("[%s] %s%s" % ("PASS" if ok else "FAIL", label,
-                             ("  -- " + detail) if detail else ""))
-
-    seed = os.urandom(32)
-    pk = public_key(seed)
-    chain = "selftest-%s.invalid" % os.urandom(4).hex()
-    tip = hashlib.sha256(os.urandom(32)).hexdigest()
-
-    print("host   %s" % host)
-    print("chain  %s   (throwaway, .invalid never resolves)" % chain)
-    print("tip    %s\n" % tip)
-
-    _wake(host)
-
-    body, code = _call(host, "/x/signed/spec")
-    step("lane is deployed", code == 200 and body.get("signed_version"),
-         "signed_version %s" % body.get("signed_version", "?"))
-    if code != 200:
-        print("\nStopping: the signed lane is not answering.")
-        return 1
-
-    body, code = _call(host, "/x/signed/enroll",
-                       {"chain": chain, "pubkey": pk.hex()})
-    step("enrol", code == 200 and body.get("enrolled"),
-         body.get("error") or "block %s" % body.get("block_index"))
-
-    # the operator cannot forge: a wrong signature must be refused
-    body, code = _call(host, "/x/signed/submit",
-                       {"chain": chain, "tip": tip,
-                        "ts": int(time.time()), "signature": "00" * 64})
-    step("forged signature refused", code == 400
-         and body.get("error") == "signature_did_not_verify",
-         "got %s %s" % (code, body.get("error")))
-
-    ts = int(time.time())
-    sig = sign(seed, canonical_submit(chain, tip, ts)).hex()
-    body, code = _call(host, "/x/signed/submit",
-                       {"chain": chain, "tip": tip, "ts": ts,
-                        "signature": sig})
-    step("submit", code == 200 and body.get("verification") == "peer-signed",
-         body.get("error") or "block %s" % body.get("block_index"))
-    on_roster = bool(body.get("on_public_roster"))
-    step("mirrored to public roster", on_roster,
-         "" if on_roster else "sealed, but not visible on /x/roster/list")
-
-    body, code = _call(host, "/x/signed/submit",
-                       {"chain": chain, "tip": tip, "ts": ts,
-                        "signature": sig})
-    step("replay refused", code in (400, 409),
-         "got %s %s" % (code, body.get("error")))
-
-    receipt, code = _call(host,
-                          "/x/signed/verify?peer=%s&tip=%s" % (chain, tip))
-    step("receipt readable", code == 200
-         and receipt.get("signed_observation") is True,
-         receipt.get("message") or "block %s" % receipt.get("block_index"))
-
-    if code == 200:
-        # the whole point: recheck using ONLY what the receipt returned
-        cm = receipt.get("canonical_message", "")
-        rebuilt = canonical_submit(chain, tip, ts).decode("utf-8")
-        step("receipt's canonical message matches ours", cm == rebuilt,
-             "" if cm == rebuilt else "receipt gave %r" % cm[:60])
-        ok = verify(bytes.fromhex(receipt.get("pubkey", "")),
-                    cm.encode("utf-8"),
-                    bytes.fromhex(receipt.get("signature", "")))
-        step("signature in the receipt verifies independently", ok)
-
-        keys, kcode = _call(host, "/x/signed/keys")
-        listed = any(k.get("chain") == chain
-                     and k.get("pubkey") == pk.hex()
-                     for k in (keys.get("keys") or []))
-        step("public key published at /x/signed/keys", listed)
-
-    print("\n%d of %d passed" % (sum(1 for r in results if r), len(results)))
-    print("\nNote: this left a real, permanent enrolment and observation "
-          "for %s in the chain.\nThat is correct - nothing in this system "
-          "can be tidied up afterwards, which is\nthe property being "
-          "tested. The name is a throwaway on a .invalid domain." % chain)
-    return 0 if all(results) else 1
+    risk = decision.get("risk_verdict")
+    if risk and mine != "BLOCK":
+        rep.note("Risk verdict reported as " + str(risk) + ", not re-derivable here",
+                 "the composed verdict is the worse of the two; the scoring engine "
+                 "is not part of this bundle and is not checked by this script")
 
 
 def main():
-    ap = argparse.ArgumentParser(
-        description="Reference client for the AILeash signed witness lane.")
-    ap.add_argument("--host", default=DEFAULT_HOST)
-    ap.add_argument("--chain")
-    ap.add_argument("--secret", help="private seed, 64 hex, from --keygen")
-    ap.add_argument("--tip", help="your chain head, 64 hex")
-    ap.add_argument("--keygen", action="store_true")
-    ap.add_argument("--enroll", action="store_true")
-    ap.add_argument("--submit", action="store_true")
-    ap.add_argument("--check", action="store_true", help="fetch a receipt")
-    ap.add_argument("--test", action="store_true",
-                    help="full round trip on a throwaway key")
-    a = ap.parse_args()
-
-    if a.keygen:
-        do_keygen()
-        return 0
-    if a.test:
-        return do_test(a.host)
-
-    if a.check:
-        if not (a.chain and a.tip):
-            ap.error("--check needs --chain and --tip")
-        do_verify(a.host, a.chain, a.tip)
-        return 0
-
-    if not (a.enroll or a.submit):
-        ap.print_help()
-        return 0
-    if not (a.chain and a.secret):
-        ap.error("--chain and --secret are required")
+    if len(sys.argv) < 2:
+        print(__doc__)
+        return 2
+    src = sys.argv[1]
+    raw = sys.stdin.read() if src == "-" else open(src, "r").read()
     try:
-        seed = bytes.fromhex(a.secret.strip())
-        assert len(seed) == 32
-    except Exception:
-        ap.error("--secret must be 64 hex characters from --keygen")
+        bundle = json.loads(raw)
+    except Exception as exc:
+        print("Not readable JSON: " + str(exc))
+        return 2
 
-    if a.enroll:
-        do_enroll(a.host, a.chain, seed)
-    if a.submit:
-        if not a.tip:
-            ap.error("--submit needs --tip")
-        do_submit(a.host, a.chain, seed, a.tip.strip().lower())
+    rep = Report()
+    print("=" * 66)
+    print("AUTHORITY PROOF  ·  independent verification")
+    print("=" * 66)
+    d = bundle.get("decision") or {}
+    print("evaluation   " + str(d.get("evaluation")))
+    print("action       " + str((bundle.get("request") or {}).get("action")))
+    print("at           " + str(d.get("evaluated_at")))
+    print("hops         " + str(max(0, len(bundle.get("lineage") or []) - 1)))
+    if bundle.get("lineage"):
+        print("authorised   " + str(bundle["lineage"][0].get("issuer")))
+        print("executed     " + str(bundle["lineage"][-1].get("subject")))
+        acc = [g.get("risk_accepted_by") for g in bundle["lineage"] if g.get("risk_accepted_by")]
+        print("risk owner   " + str(acc[-1] if acc else None))
+    print("-" * 66)
+
+    check_signature(bundle, rep)
+    check_integrity(bundle, rep)
+    mine, hard, soft, ba, bi = rederive(bundle, rep)
+    check_agreement(bundle, rep, mine, hard, soft, ba, bi)
+
+    print(rep.render())
+    print("-" * 66)
+    if rep.failed:
+        print("RESULT: NOT VERIFIED. Something above did not hold.")
+        return 1
+    print("RESULT: VERIFIED - " + mine)
+    if mine == "BLOCK":
+        print("This is a proof that the action was NOT authorised, and where it failed.")
+    print("Checked with no network access, no dependencies, and nothing taken on")
+    print("the issuer's word except the meaning of their public key.")
     return 0
 
 
 if __name__ == "__main__":
     sys.exit(main())
-aileash_signed_client.py
 
 ```
 
 
-## `aileash_verify.py`
-
-580 lines, 21445 bytes
-
-```python
-#!/usr/bin/env python3
-"""
-aileash_verify.py  -  an independent verifier for AILeash proofs
-================================================================
-
-WHAT THIS IS
-------------
-A single file that checks AILeash's proofs without AILeash.
-
-No dependencies. No network calls. It never contacts sebbi.pro or anything
-else - it takes proof documents you already hold and does the arithmetic
-locally. Run it on a laptop with the wifi off and it works exactly the same.
-
-That is deliberate. A proof you can only check with the prover's own online
-tool is not a proof, it is a reassurance. If this file cannot confirm a
-claim from the numbers alone, the claim does not hold, and the honest thing
-is for you to find that out from your own machine rather than from us.
-
-WHAT IT CHECKS
---------------
-  Inclusion    a record is inside a sealed period, against the sealed root
-  Absence      a record is NOT there - the two neighbouring leaves are
-               verified and shown to be adjacent, leaving nowhere for it
-  Ancestry     a tip you were handed is still on the chain being served,
-               at the same position, under the current root
-  Prefix       the log at one size is contained in the log at a later size,
-               with nothing inserted, removed or reordered in between
-  Stability    across a set of replay runs, identical inputs produced
-               identical verdicts under an unchanged code fingerprint
-
-USAGE
------
-    python3 aileash_verify.py proof.json [another.json ...]
-    cat proof.json | python3 aileash_verify.py
-    python3 aileash_verify.py --selftest
-
-Exit code 0 if everything checked passed, 1 if anything failed, 2 on bad
-input. Suitable for dropping into an audit script or a CI job.
-
-Each proof document is whatever the relevant AILeash route returned. Save
-the JSON, keep it, and check it whenever you like - next week, or in four
-years when the original system is long gone.
-
-HOW TO GET PROOFS
------------------
-    /x/complete/prove?period=&value=       inclusion or absence
-    /x/consistency/ancestor?tip=           ancestry
-    /x/consistency/proof?first=&second=    prefix
-    /x/replay/history?input_hash=          stability
-
-WHAT IT DOES NOT CHECK
-----------------------
-  - That a sealed record is TRUE. Cryptography proves a record existed at a
-    time and has not moved since. It says nothing about whether the record
-    was honest when it was written. Nothing can.
-  - That a root was anchored. That is a separate check against the
-    OpenTimestamps proof and a Bitcoin node - out of scope for a file with
-    no dependencies, and it should be done independently anyway.
-  - Whether a decision was correct or fair. Determinism is not fairness.
-
-The two hash schemes below are different on purpose and must not be mixed.
-The completeness tree is SORTED, which is what makes absence provable. The
-consistency tree is in WRITE ORDER, which is what makes reordering
-detectable. Their roots will never match and are not meant to.
-
-Public domain / MIT - copy it, fork it, audit it, ship it inside your own
-tooling. The more independent copies of this exist, the less any of it
-depends on us.
-"""
-
-import hashlib
-import json
-import sys
-
-VERSION = "1.0"
-
-# --- completeness tree (sorted) -------------------------------------------
-CMP_LEAF = b"AILEASH-LEAF-v1:"
-CMP_NODE = b"AILEASH-NODE-v1:"
-
-# --- consistency tree (write order, RFC 6962) -----------------------------
-CT_LEAF = b"\x00"
-CT_NODE = b"\x01"
-
-
-# ==========================================================================
-# completeness: sorted tree
-# ==========================================================================
-
-def cmp_leaf(value):
-    return hashlib.sha256(CMP_LEAF + value.encode("utf-8")).hexdigest()
-
-
-def cmp_node(left_hex, right_hex):
-    return hashlib.sha256(CMP_NODE + left_hex.encode() + right_hex.encode()).hexdigest()
-
-
-def cmp_replay(value, proof):
-    """Recompute a root from a leaf value and its sibling path.
-
-    Each step carries the side its sibling sits on. Five lines, so that
-    reimplementing this in another language is an afternoon rather than a
-    project.
-    """
-    current = cmp_leaf(value)
-    for step in proof:
-        side = (step or {}).get("side")
-        sibling = (step or {}).get("hash")
-        if not sibling:
-            raise ValueError("proof step missing a hash")
-        if side == "left":
-            current = cmp_node(sibling, current)
-        elif side == "right":
-            current = cmp_node(current, sibling)
-        else:
-            raise ValueError("proof step missing a side")
-    return current
-
-
-# ==========================================================================
-# consistency: RFC 6962 write-order tree
-# ==========================================================================
-
-def ct_leaf(value):
-    return hashlib.sha256(CT_LEAF + value.encode("utf-8")).digest()
-
-
-def ct_node(left, right):
-    return hashlib.sha256(CT_NODE + left + right).digest()
-
-
-def _decompose(index, size):
-    """Split an inclusion proof into its inner and border parts.
-
-    This is the standard decomposition used by every RFC 6962
-    implementation. inner is the number of steps where the path is still
-    inside a complete subtree; border is the number of right-hand
-    stragglers above it.
-    """
-    inner = (index ^ (size - 1)).bit_length()
-    border = bin(index >> inner).count("1")
-    return inner, border
-
-
-def _chain_inner(seed, proof, index):
-    for i, step in enumerate(proof):
-        if (index >> i) & 1 == 0:
-            seed = ct_node(seed, step)
-        else:
-            seed = ct_node(step, seed)
-    return seed
-
-
-def _chain_inner_right(seed, proof, index):
-    for i, step in enumerate(proof):
-        if (index >> i) & 1 == 1:
-            seed = ct_node(step, seed)
-    return seed
-
-
-def _chain_border_right(seed, proof):
-    for step in proof:
-        seed = ct_node(step, seed)
-    return seed
-
-
-def ct_verify_inclusion(index, size, leaf_value, proof_hex, root_hex):
-    """Is leaf_value at position index of a tree of this size and root?"""
-    if index < 0 or size <= 0 or index >= size:
-        return False, "index outside the tree"
-    try:
-        proof = [bytes.fromhex(h) for h in proof_hex]
-        root = bytes.fromhex(root_hex)
-    except (ValueError, TypeError):
-        return False, "proof or root is not hex"
-
-    inner, border = _decompose(index, size)
-    if len(proof) != inner + border:
-        return False, ("proof has %d nodes, a tree of size %d needs %d for index %d"
-                       % (len(proof), size, inner + border, index))
-
-    result = _chain_inner(ct_leaf(leaf_value), proof[:inner], index)
-    result = _chain_border_right(result, proof[inner:])
-    if result != root:
-        return False, "recomputed root does not match (%s)" % result.hex()
-    return True, None
-
-
-def ct_verify_consistency(size1, size2, proof_hex, root1_hex, root2_hex):
-    """Is the tree of size1 a prefix of the tree of size2?"""
-    if size1 < 0 or size2 < 0 or size1 > size2:
-        return False, "sizes must satisfy 0 <= first <= second"
-    try:
-        proof = [bytes.fromhex(h) for h in proof_hex]
-        root1 = bytes.fromhex(root1_hex)
-        root2 = bytes.fromhex(root2_hex)
-    except (ValueError, TypeError):
-        return False, "proof or roots are not hex"
-
-    if size1 == size2:
-        if proof:
-            return False, "no proof nodes expected when the sizes are equal"
-        return (root1 == root2), (None if root1 == root2 else "roots differ at equal size")
-    if size1 == 0:
-        return True, None
-    if not proof:
-        return False, "a proof is required for these sizes"
-
-    inner, border = _decompose(size1 - 1, size2)
-    shift = (size1 & -size1).bit_length() - 1
-    inner -= shift
-
-    if size1 == (1 << shift):
-        seed, start = root1, 0
-    else:
-        seed, start = proof[0], 1
-
-    if len(proof) != start + inner + border:
-        return False, ("proof has %d nodes, expected %d" % (len(proof), start + inner + border))
-
-    body = proof[start:]
-    mask = (size1 - 1) >> shift
-
-    hash1 = _chain_inner_right(seed, body[:inner], mask)
-    hash1 = _chain_border_right(hash1, body[inner:])
-    if hash1 != root1:
-        return False, "the earlier root does not recompute (%s)" % hash1.hex()
-
-    hash2 = _chain_inner(seed, body[:inner], mask)
-    hash2 = _chain_border_right(hash2, body[inner:])
-    if hash2 != root2:
-        return False, "the later root does not recompute (%s)" % hash2.hex()
-    return True, None
-
-
-# ==========================================================================
-# document checkers
-# ==========================================================================
-
-class Check(object):
-    def __init__(self, kind):
-        self.kind = kind
-        self.lines = []
-        self.ok = True
-
-    def add(self, passed, text):
-        self.lines.append((passed, text))
-        if not passed:
-            self.ok = False
-        return passed
-
-
-def check_inclusion(doc):
-    c = Check("inclusion (completeness)")
-    value = doc.get("value")
-    root = doc.get("root")
-    proof = doc.get("proof")
-    if not (value and root and isinstance(proof, list)):
-        c.add(False, "document is missing value, root or proof")
-        return c
-    try:
-        computed = cmp_replay(value, proof)
-    except ValueError as exc:
-        c.add(False, "malformed proof: %s" % exc)
-        return c
-    c.add(computed == root, "leaf recomputes to the sealed root")
-    if doc.get("leaf_count") is not None:
-        c.add(True, "period sealed %s records, committed before any export was requested"
-                    % doc["leaf_count"])
-    if doc.get("index") is not None:
-        c.add(True, "record sits at index %s" % doc["index"])
-    return c
-
-
-def check_absence(doc):
-    c = Check("absence (completeness)")
-    value = doc.get("value")
-    root = doc.get("root")
-    neighbours = doc.get("neighbours") or {}
-    count = doc.get("leaf_count")
-    if not (value and root):
-        c.add(False, "document is missing value or root")
-        return c
-
-    lower = neighbours.get("lower")
-    upper = neighbours.get("upper")
-
-    if not lower and not upper:
-        c.add(count == 0, "period is committed and empty, so nothing can be in it")
-        return c
-
-    if lower:
-        try:
-            computed = cmp_replay(lower["value"], lower["proof"])
-        except (ValueError, KeyError, TypeError) as exc:
-            c.add(False, "lower neighbour proof is malformed: %s" % exc)
-            return c
-        c.add(computed == root, "lower neighbour verifies against the sealed root")
-        c.add(str(lower["value"]) < str(value), "lower neighbour sorts before the queried value")
-
-    if upper:
-        try:
-            computed = cmp_replay(upper["value"], upper["proof"])
-        except (ValueError, KeyError, TypeError) as exc:
-            c.add(False, "upper neighbour proof is malformed: %s" % exc)
-            return c
-        c.add(computed == root, "upper neighbour verifies against the sealed root")
-        c.add(str(upper["value"]) > str(value), "upper neighbour sorts after the queried value")
-
-    if lower and upper:
-        adjacent = int(upper["index"]) == int(lower["index"]) + 1
-        c.add(adjacent, "neighbours are adjacent (index %s then %s) - nothing can sit between"
-                        % (lower["index"], upper["index"]))
-    elif upper:
-        c.add(int(upper["index"]) == 0, "value sorts before the first leaf, and nothing precedes index 0")
-    elif lower:
-        if count is None:
-            c.add(True, "value sorts after the last leaf (leaf_count not supplied to confirm)")
-        else:
-            c.add(int(lower["index"]) == int(count) - 1,
-                  "value sorts after the final leaf of %s" % count)
-    return c
-
-
-def check_ancestry(doc):
-    c = Check("ancestry (consistency)")
-    if doc.get("on_chain") is False:
-        c.add(False, "THIS TIP IS NOT ON THE CHAIN BEING SERVED - if it was issued to you, "
-                     "that is evidence of a fork. Keep this document.")
-        return c
-    tip = doc.get("tip")
-    index = doc.get("leaf_index")
-    size = doc.get("tree_size")
-    root = doc.get("root")
-    proof = doc.get("inclusion_proof")
-    if tip is None or index is None or size is None or not root or not isinstance(proof, list):
-        c.add(False, "document is missing tip, leaf_index, tree_size, root or inclusion_proof")
-        return c
-    ok, why = ct_verify_inclusion(int(index), int(size), tip, proof, root)
-    c.add(ok, why or "tip verifies at position %s of a chain of %s" % (index, size))
-    return c
-
-
-def check_prefix(doc):
-    c = Check("prefix (consistency)")
-    first = doc.get("first")
-    second = doc.get("second")
-    proof = doc.get("consistency_proof")
-    root1 = doc.get("first_root")
-    root2 = doc.get("second_root")
-    if first is None or second is None or not isinstance(proof, list) or not root1 or not root2:
-        c.add(False, "document is missing first, second, consistency_proof or the roots")
-        return c
-    ok, why = ct_verify_consistency(int(first), int(second), proof, root1, root2)
-    c.add(ok, why or ("the log at size %s is contained in the log at size %s - append only, "
-                      "nothing inserted, removed or reordered" % (first, second)))
-    return c
-
-
-def check_stability(doc):
-    c = Check("stability (replay)")
-    history = doc.get("history")
-    if not isinstance(history, list) or not history:
-        c.add(False, "document has no replay history")
-        return c
-
-    by_code = {}
-    for run in history:
-        by_code.setdefault(run.get("code_fingerprint"), set()).add(
-            (str(run.get("verdict")), str(run.get("score"))))
-
-    stable = True
-    for fingerprint, outcomes in by_code.items():
-        short = (fingerprint or "unknown")[:12]
-        if len(outcomes) > 1:
-            stable = False
-            c.add(False, "code %s produced %d different verdicts for identical inputs - "
-                         "the engine is not deterministic under that version"
-                         % (short, len(outcomes)))
-        else:
-            c.add(True, "code %s produced one verdict across every run" % short)
-
-    c.add(True, "%d runs recorded, %d distinct code versions"
-                % (len(history), len(by_code)))
-    if stable and len(by_code) > 1:
-        c.add(True, "verdicts changed only alongside a changed code fingerprint, which is "
-                    "a policy change rather than nondeterminism")
-    c.add(True, "each run carries its own audit hash - check them independently with "
-                "an ancestry proof")
-    return c
-
-
-def identify(doc):
-    if not isinstance(doc, dict):
-        return None
-    if "consistency_proof" in doc:
-        return check_prefix
-    if "inclusion_proof" in doc or doc.get("on_chain") is not None:
-        return check_ancestry
-    if doc.get("result") == "absent" or "neighbours" in doc:
-        return check_absence
-    if doc.get("result") == "present" or ("proof" in doc and "value" in doc):
-        return check_inclusion
-    if "history" in doc and "input_hash" in doc:
-        return check_stability
-    return None
-
-
-# ==========================================================================
-# self test - known vectors built here, so the verifier checks itself
-# ==========================================================================
-
-def _selftest():
-    """Builds small trees in this file and confirms the verifier agrees.
-
-    Run this before trusting a result. If it fails, the fault is in this
-    file rather than in anything it was checking.
-    """
-    failures = []
-
-    # sorted tree, five leaves
-    values = sorted(["alpha", "bravo", "charlie", "delta", "echo"])
-
-    def build(vals):
-        level = [cmp_leaf(v) for v in vals]
-        levels = [level]
-        while len(level) > 1:
-            nxt = [cmp_node(level[i], level[i + 1]) for i in range(0, len(level) - 1, 2)]
-            if len(level) % 2 == 1:
-                nxt.append(level[-1])
-            levels.append(nxt)
-            level = nxt
-        return level[0], levels
-
-    def path(levels, index):
-        out, idx = [], index
-        for level in levels[:-1]:
-            if idx % 2 == 0:
-                if idx + 1 < len(level):
-                    out.append({"side": "right", "hash": level[idx + 1]})
-            else:
-                out.append({"side": "left", "hash": level[idx - 1]})
-            idx //= 2
-        return out
-
-    root, levels = build(values)
-    for i, value in enumerate(values):
-        if cmp_replay(value, path(levels, i)) != root:
-            failures.append("sorted inclusion failed for leaf %d" % i)
-    if cmp_replay("not-a-leaf", path(levels, 0)) == root:
-        failures.append("sorted tree accepted a wrong leaf")
-
-    # RFC 6962 tree, sizes 1..17
-    def mth(leaves):
-        n = len(leaves)
-        if n == 0:
-            return hashlib.sha256(b"").digest()
-        if n == 1:
-            return ct_leaf(leaves[0])
-        k = 1
-        while k * 2 < n:
-            k *= 2
-        return ct_node(mth(leaves[:k]), mth(leaves[k:]))
-
-    def incl(index, leaves):
-        n = len(leaves)
-        if n <= 1:
-            return []
-        k = 1
-        while k * 2 < n:
-            k *= 2
-        if index < k:
-            return incl(index, leaves[:k]) + [mth(leaves[k:])]
-        return incl(index - k, leaves[k:]) + [mth(leaves[:k])]
-
-    def subproof(m, leaves, is_root):
-        n = len(leaves)
-        if m == n:
-            return [] if is_root else [mth(leaves)]
-        k = 1
-        while k * 2 < n:
-            k *= 2
-        if m <= k:
-            return subproof(m, leaves[:k], is_root) + [mth(leaves[k:])]
-        return subproof(m - k, leaves[k:], False) + [mth(leaves[:k])]
-
-    for size in range(1, 18):
-        leaves = ["entry-%03d" % i for i in range(size)]
-        root_hex = mth(leaves).hex()
-        for index in range(size):
-            proof = [h.hex() for h in incl(index, leaves)]
-            ok, why = ct_verify_inclusion(index, size, leaves[index], proof, root_hex)
-            if not ok:
-                failures.append("ct inclusion failed size=%d index=%d (%s)" % (size, index, why))
-            bad, _ = ct_verify_inclusion(index, size, "tampered", proof, root_hex)
-            if bad:
-                failures.append("ct inclusion accepted a wrong leaf size=%d index=%d" % (size, index))
-        for first in range(1, size + 1):
-            proof = [h.hex() for h in (subproof(first, leaves, True) if first != size else [])]
-            ok, why = ct_verify_consistency(first, size, proof,
-                                            mth(leaves[:first]).hex(), root_hex)
-            if not ok:
-                failures.append("ct consistency failed %d -> %d (%s)" % (first, size, why))
-
-    # a fabricated prefix must be rejected
-    leaves = ["entry-%03d" % i for i in range(8)]
-    forged = leaves[:4] + ["swapped"] + leaves[5:]
-    proof = [h.hex() for h in subproof(4, forged, True)]
-    ok, _ = ct_verify_consistency(4, 8, proof, mth(leaves[:4]).hex(), mth(leaves).hex())
-    if ok:
-        failures.append("ct consistency accepted a forged prefix")
-
-    if failures:
-        print("SELF TEST FAILED")
-        for line in failures:
-            print("   " + line)
-        return 1
-    print("Self test passed. Sorted-tree and RFC 6962 verification both behave correctly,")
-    print("and tampered proofs were rejected in every case.")
-    return 0
-
-
-# ==========================================================================
-# cli
-# ==========================================================================
-
-def _run(doc, label):
-    checker = identify(doc)
-    if checker is None:
-        print("%s\n   UNRECOGNISED - not an AILeash proof document this version knows about\n" % label)
-        return False
-    result = checker(doc)
-    print("%s\n   type: %s" % (label, result.kind))
-    for passed, text in result.lines:
-        print("   %s %s" % ("PASS" if passed else "FAIL", text))
-    print("   => %s\n" % ("VERIFIED" if result.ok else "NOT VERIFIED"))
-    return result.ok
-
-
-def main(argv):
-    args = [a for a in argv[1:] if not a.startswith("--")]
-    flags = set(a for a in argv[1:] if a.startswith("--"))
-
-    if "--selftest" in flags:
-        return _selftest()
-    if "--version" in flags:
-        print("aileash_verify %s" % VERSION)
-        return 0
-
-    print("aileash_verify %s - offline, no network calls made\n" % VERSION)
-
-    documents = []
-    if args:
-        for path in args:
-            try:
-                with open(path, "r", encoding="utf-8") as handle:
-                    documents.append((path, json.load(handle)))
-            except (OSError, ValueError) as exc:
-                print("%s\n   COULD NOT READ: %s\n" % (path, exc))
-                return 2
-    else:
-        try:
-            documents.append(("(stdin)", json.load(sys.stdin)))
-        except ValueError as exc:
-            print("Could not read JSON from stdin: %s" % exc)
-            return 2
-
-    results = [_run(doc, label) for label, doc in documents]
-    passed = sum(1 for r in results if r)
-    print("%d of %d documents verified." % (passed, len(results)))
-    if passed != len(results):
-        print("Something did not check out. That is what this file is for - keep the "
-              "document and the response that produced it.")
-        return 1
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main(sys.argv))
+## `AILeash-API-Reference-v6.4.2.md`
+
+256 lines, 6799 bytes
+
+```markdown
+# AILeash v6.4.2 — Complete API Reference
+
+## Core Decision Endpoint
+
+### POST /api/govern
+**The engine. Every action scores here.**
+
+Auth: `Bearer YOUR_API_KEY`
+
+**Request:**
+```json
+{
+  "user_id": "string (required)",
+  "action": "string (required) — payment/login/message/transfer/checkout/api_call",
+  "amount": "number (optional, default 0) — monetary value in GBP",
+  "country": "string (required) — ISO 3166-1 alpha-2 code",
+  "device_id": "string (required) — unique device identifier",
+  "anomaly": "number 0..1 (optional) — behavioural anomaly score",
+  "device_risk": "number 0..1 (optional) — device risk score"
+}
+```
+
+**Response (200 OK):**
+```json
+{
+  "decision": "ALLOW|CHALLENGE|BLOCK",
+  "score": 0.0..1.0,
+  "trust": 0.05..1.0,
+  "reasons": ["velocity_spike", "high_amount", "country_shift"],
+  "audit_hash": "sha256_hex_string",
+  "block_index": 12345,
+  "receipt_seq": 42,
+  "timestamp": 1719072000.0,
+  "challenge_url": "https://sebbi.pro/verify-challenge?token=...",
+  "challenge_expires_in": 900
+}
+```
+
+**Error responses:**
+- `401 Unauthorized` — Missing or invalid API key
+- `403 Forbidden` — Account inactive or over quota
+- `429 Too Many Requests` — Rate limited
+- `503 Service Unavailable` — Server overloaded
+
+---
+
+## Account Management
+
+### POST /api/keys or /signup
+**Create a new API key. Instant. No card. No humans in the loop.**
+
+No auth required.
+
+**Request:**
+```json
+{
+  "email": "user@example.com (required)",
+  "name": "John Doe (optional)",
+  "phone": "+441234567890 (optional)",
+  "org": "Acme Corp (optional)",
+  "product": "aileash|guardian|sonicboom|sentinel (default: aileash)",
+  "devices": 1..1000000 (default: 1),
+  "ref_code": "REF-XXXX-1234 (optional)"
+}
+```
+
+**Response (200 OK):**
+```json
+{
+  "api_key": "al_live_...",
+  "email": "user@example.com",
+  "product": "aileash",
+  "devices": 1,
+  "monthly_cost": 0.50,
+  "quota": 100,
+  "ref_code": "REF-JOHN-5678",
+  "badge_id": "abc123def456",
+  "message": "100 free decisions. Then 50p per device per month via Stripe."
+}
+```
+
+---
+
+## Verification & Public Endpoints
+
+### GET /api/spec
+**Engine specification. Public. No auth.**
+
+**Response (200 OK):**
+```json
+{
+  "engine": "AILeash v6.4.2",
+  "version": "6.4.2",
+  "signals": 9,
+  "decision_latency_ms": 28,
+  "threshold_allow": 0.35,
+  "threshold_challenge": 0.70,
+  "threshold_block": 1.0,
+  "features": ["deterministic scoring", "tamper-evident chain", "real-time alerts", "gapless receipts", "sovereign deployment"]
+}
+```
+
+### GET /api/verify-chain
+**Full audit chain integrity proof. Public. No auth.**
+
+**Response (200 OK):**
+```json
+{
+  "valid": true,
+  "blocks": 45678,
+  "genesis": "GENESIS",
+  "tip": "abc123...",
+  "message": "Chain intact. No tampering detected.",
+  "verifiable_by": "anyone, anywhere"
+}
+```
+
+### GET /api/health
+**Server health and load. Public. No auth.**
+
+**Response (200 OK):**
+```json
+{
+  "status": "ok",
+  "version": "6.4.2",
+  "uptime_seconds": 864000,
+  "rps": 42,
+  "timestamp": 1719072000.0
+}
+```
+
+---
+
+## Real-time Dashboards
+
+### GET /api/pulse
+**Live risk posture. Your current state.**
+
+Auth: `Bearer YOUR_API_KEY`
+
+**Response (200 OK):**
+```json
+{
+  "last_hour": {
+    "ALLOW": 486,
+    "CHALLENGE": 23,
+    "BLOCK": 4
+  },
+  "recent": [
+    {
+      "ts": 1719072000,
+      "user_id": "u_7f2",
+      "action": "payment",
+      "decision": "ALLOW",
+      "score": 0.12,
+      "reasons": [],
+      "audit_hash": "abc123..."
+    }
+  ],
+  "chain_tip": "abc123...",
+  "message": "All green. Chain tip sealed."
+}
+```
+
+---
+
+## Billing & Webhooks
+
+### POST /stripe-webhook
+**Stripe webhook receiver. Signature verified automatically.**
+
+Supports events:
+- `checkout.session.completed` — User upgraded
+- `invoice.paid` — Monthly subscription paid
+- `customer.subscription.deleted` — User cancelled
+- `invoice.payment_failed` — Payment failed
+
+---
+
+## Four Products. One Engine.
+
+### AILeash
+- **What:** Every AI decision your platform makes about a person gets scored, explained, and sealed.
+- **Who:** Platforms using AI for any regulated decision (lending, hiring, content moderation, fraud, access control).
+- **Price:** 50p per device per month + your margin.
+- **Free tier:** 100 decisions/month, no card.
+
+### Guardian
+- **What:** Free message checker for families. Child pastes a message in, gets instant plain-English assessment against grooming patterns.
+- **Who:** Families. Free forever. No card. No catch.
+- **Price:** Free. Always.
+- **Built for:** ICO Children's Code, Online Safety Act, child safety.
+
+### SonicBoom
+- **What:** One line of code. Drops into AWS, Azure, GCP, OpenAI, Anthropic. Adds full compliance audit chain to every call.
+- **Who:** Platforms already running AI in the cloud.
+- **Price:** 50p per device per month + your margin.
+- **Latency:** No impact. Chain sealing is asynchronous.
+
+### Sentinel
+- **What:** Fraud and anomaly alerting. Scores unusual patterns (500 messages in a minute, login from new country, velocity spikes) in real-time.
+- **Who:** Platforms managing fraud, abuse, takeovers.
+- **Price:** 50p per device per month + your margin.
+- **Real-time:** Alerts the moment thresholds trip.
+
+---
+
+## The Score Formula (Immutable)
+
+**Raw weighted sum (Σ_raw):**
+```
+Σ_raw =
+  (1 − trust) × 0.30
+  + min(velocity_60s / 20, 1) × 0.15
+  + min(velocity_5m / 50, 1) × 0.10
+  + min(velocity_1h / 200, 1) × 0.10
+  + min(ln(1+amount) / ln(1+10000), 1) × 0.15
+  + device_risk × 0.10
+  + behavioural_anomaly × 0.10
+  + country_shift × 0.10
+  + unsafe_country × 0.10
+```
+
+**Normalization:** the nine weights above sum to 1.20, not 1.0. To keep every signal's *relative* importance exactly as designed while guaranteeing the score behaves as a true 0–1 weighted average (not one that can reach BLOCK-level values from fewer combined signals than intended), divide by the actual weight total before clamping:
+
+```
+WEIGHT_TOTAL = 0.30 + 0.15 + 0.10 + 0.10 + 0.15 + 0.10 + 0.10 + 0.10 + 0.10   # = 1.20
+
+score = clamp( Σ_raw / WEIGHT_TOTAL , 0, 1 )
+
+decision = ALLOW if score < 0.35
+         = CHALLENGE if score < 0.70
+         = BLOCK otherwise
+```
+
+No machine learning. No drift. No retraining. Weights are written in code and cannot change without a new release. `WEIGHT_TOTAL` is a fixed constant (1.20) recomputed only if a signal is added, removed, or reweighted in a future release — never at runtime.
+
+---
+
+## Rate Limits
+
+- **Free tier:** 100 decisions/month
+- **Paid:** Unlimited (or by plan)
+- **Public endpoints:** No rate limit
+
+---
+
+## Documentation
+
+- **Homepage:** https://sebbi.pro
+- **Whitepaper:** https://sebbi.pro/whitepaper
+- **Developers:** https://sebbi.pro/developers
+- **Scanner (free):** https://sebbi.pro/scan
+- **Guardian:** https://sebbi.pro/guardian-app
+- **Contact:** justrightdecorators@gmail.com
 
 ```
 
 
-## `anchor.py`
+## `LICENCE`
 
-166 lines, 6009 bytes
+22 lines, 1074 bytes
 
-```python
-"""
-anchor.py  -  External anchoring for the AILeash chain.
+```
+MIT License
 
-WHAT IT DOES (plain words):
-  Every ANCHOR_INTERVAL seconds it takes the current chain tip (one hash) and
-  timestamps it against an external source you do NOT control - so anyone can
-  prove your chain's timestamps are real without trusting sebbi.pro.
+Copyright (c) 2026 Monop (Blyth, UK)
 
-  It tries OpenTimestamps first (commits the hash into Bitcoin, free, gold
-  standard). It ALSO records the tip + time to a local append-only anchor log
-  on your persistent volume as a second record. If OTS is unavailable for any
-  reason, the server keeps running normally - anchoring never blocks or
-  crashes your live engine.
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
 
-SAFETY:
-  - Only READS the chain tip. Never writes to the chain, never touches scoring.
-  - Runs on a background daemon thread.
-  - Every failure is caught and logged; your govern path is never affected.
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
 
-SETUP ON RAILWAY:
-  - requirements.txt:  opentimestamps-client
-  - Variable ANCHOR_DIR = /data/anchors   (on your persistent volume)
-  - Variable ANCHOR_INTERVAL = 3600       (once an hour; optional)
-  - Variable ANCHOR_ENABLED = 1           (set 0 to switch off)
-"""
-
-import os
-import time
-import json
-import hashlib
-import threading
-
-ANCHOR_INTERVAL = int(os.environ.get("ANCHOR_INTERVAL", "3600"))
-ANCHOR_DIR      = os.environ.get("ANCHOR_DIR", "/data/anchors")
-ANCHOR_ENABLED  = os.environ.get("ANCHOR_ENABLED", "1") == "1"
-
-_last = {"ts": None, "tip": None, "ots_file": None, "ots_ok": False, "status": "not_started"}
-_lock = threading.Lock()
-
-
-def _ensure_dir():
-    try:
-        os.makedirs(ANCHOR_DIR, exist_ok=True)
-        return True
-    except Exception as e:
-        print("ANCHOR: cannot create " + ANCHOR_DIR + " : " + str(e), flush=True)
-        return False
-
-
-def _ots_stamp(tip_hash):
-    """Timestamp the tip hash with OpenTimestamps (-> Bitcoin). Returns
-    (ok, proof_path, message). Uses the opentimestamps library directly, so
-    there is no command-line tool to find on PATH."""
-    try:
-        from opentimestamps.calendar import RemoteCalendar
-        from opentimestamps.core.timestamp import Timestamp, DetachedTimestampFile
-        from opentimestamps.core.op import OpSHA256
-        from opentimestamps.core.serialize import BytesSerializationContext
-    except Exception as e:
-        return False, None, "opentimestamps library not available: " + str(e)
-
-    try:
-        # The digest we anchor is the tip hash (hex -> bytes).
-        digest = bytes.fromhex(tip_hash)
-        ts = Timestamp(digest)
-
-        # Ask public (free) calendar servers to commit this digest.
-        calendars = [
-            "https://a.pool.opentimestamps.org",
-            "https://b.pool.opentimestamps.org",
-            "https://alice.btc.calendar.opentimestamps.org",
-        ]
-        got = 0
-        for url in calendars:
-            try:
-                cal = RemoteCalendar(url)
-                result = cal.submit(digest)
-                ts.merge(result)
-                got += 1
-            except Exception as ce:
-                print("ANCHOR: calendar " + url + " failed: " + str(ce), flush=True)
-        if got == 0:
-            return False, None, "no calendar server accepted the stamp"
-
-        # Save the .ots proof next to a record of the tip.
-        stamp_id = str(int(time.time()))
-        base = os.path.join(ANCHOR_DIR, "tip_" + stamp_id)
-        with open(base + ".txt", "w") as f:
-            f.write(tip_hash + "\n")
-        detached = DetachedTimestampFile(OpSHA256(), ts)
-        ctx = BytesSerializationContext()
-        detached.serialize(ctx)
-        with open(base + ".ots", "wb") as f:
-            f.write(ctx.getbytes())
-        return True, base + ".ots", "stamped by " + str(got) + " calendar(s)"
-    except Exception as e:
-        return False, None, "ots stamp error: " + str(e)
-
-
-def _record_local(tip_hash, ots_ok, ots_file, msg):
-    """Append-only local record of every anchor attempt, on the volume."""
-    try:
-        idx = os.path.join(ANCHOR_DIR, "anchors.jsonl")
-        with open(idx, "a") as f:
-            f.write(json.dumps({
-                "ts": time.time(),
-                "tip": tip_hash,
-                "ots": ots_ok,
-                "ots_file": ots_file,
-                "note": msg
-            }) + "\n")
-    except Exception as e:
-        print("ANCHOR: local record failed: " + str(e), flush=True)
-
-
-def anchor_once(get_tip):
-    if not _ensure_dir():
-        return
-    try:
-        tip = get_tip()
-    except Exception as e:
-        print("ANCHOR: cannot read tip: " + str(e), flush=True)
-        return
-    if not tip or tip == "GENESIS":
-        print("ANCHOR: chain empty, nothing to anchor", flush=True)
-        return
-
-    ok, proof, msg = _ots_stamp(tip)
-    _record_local(tip, ok, proof, msg)
-    with _lock:
-        _last["ts"] = time.time()
-        _last["tip"] = tip
-        _last["ots_file"] = proof
-        _last["ots_ok"] = ok
-        _last["status"] = ("anchored: " + msg) if ok else ("ots_unavailable: " + msg)
-    if ok:
-        print("ANCHOR: tip " + tip[:16] + "... -> " + msg + " -> " + str(proof), flush=True)
-    else:
-        print("ANCHOR: OTS not available (" + msg + ") - local record written, will retry", flush=True)
-
-
-def _loop(get_tip):
-    time.sleep(30)  # let the server finish booting
-    while True:
-        try:
-            anchor_once(get_tip)
-        except Exception as e:
-            print("ANCHOR loop error: " + str(e), flush=True)
-        time.sleep(ANCHOR_INTERVAL)
-
-
-def start_anchoring(get_tip):
-    """Call ONCE at startup, passing your chain_tip function. Spawns a daemon
-    thread that anchors forever. Safe: only logs on failure, never affects the
-    live engine."""
-    if not ANCHOR_ENABLED:
-        print("ANCHOR: disabled (ANCHOR_ENABLED=0)", flush=True)
-        return
-    threading.Thread(target=_loop, args=(get_tip,), daemon=True).start()
-    print("ANCHOR: started - external anchoring every " + str(ANCHOR_INTERVAL) + "s to " + ANCHOR_DIR, flush=True)
-
-
-def anchor_status():
-    with _lock:
-        return dict(_last)
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 
 ```

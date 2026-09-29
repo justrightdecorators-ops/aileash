@@ -1,15 +1,12 @@
-# Codebase — part 41 of 46
+# Codebase — part 41 of 43
 
 Contains:
-- `pay-check.html`
-- `registry.html`
-- `report-threat.html`
-- `requirements.txt`
+- `sonicboom.html`
 
 
-## `pay-check.html`
+## `sonicboom.html`
 
-159 lines, 11880 bytes
+951 lines, 64288 bytes
 
 ```html
 <!DOCTYPE html>
@@ -17,989 +14,950 @@ Contains:
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Payment Notary — verify before you pay — sebbi.pro</title>
-<style>
-  :root{--ink:#0a0f1e;--ink2:#10182e;--input:#131e36;--gold:#c9a84c;--ok:#7fe3b0;--err:#ff8a80;--muted:#94a3b8;}
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{background:var(--ink);color:#f8fafc;font-family:system-ui,sans-serif;min-height:100vh;padding:26px 16px}
-  .container{max-width:1100px;margin:0 auto;display:grid;grid-template-columns:1fr 1fr;gap:28px}
-  @media(max-width:850px){.container{grid-template-columns:1fr}}
-  header{grid-column:1/-1;border-bottom:1px solid rgba(201,168,76,0.2);padding-bottom:16px}
-  .brand{font-family:monospace;font-size:10px;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,0.35)}
-  h1{font-family:Georgia,serif;font-size:28px;color:var(--gold);margin:8px 0 6px}
-  .tagline{color:var(--muted);font-size:13.5px;line-height:1.6;max-width:660px}
-  .panel{background:var(--ink2);border:1px solid rgba(201,168,76,0.25);border-radius:12px;padding:24px;display:flex;flex-direction:column;gap:14px}
-  h2{font-size:12px;font-family:monospace;text-transform:uppercase;letter-spacing:2px;color:var(--gold);border-bottom:1px dashed rgba(201,168,76,0.2);padding-bottom:8px}
-  label{display:block;font-size:10px;font-family:monospace;text-transform:uppercase;letter-spacing:2px;color:var(--muted);margin-bottom:5px}
-  input{width:100%;background:var(--input);border:1px solid rgba(201,168,76,0.3);color:#fff;border-radius:8px;padding:12px;font-size:15px;outline:none;font-family:inherit}
-  input:focus{border-color:var(--gold);box-shadow:0 0 8px rgba(201,168,76,0.2)}
-  button{width:100%;background:var(--gold);color:var(--ink);border:none;border-radius:8px;padding:15px;font-size:14px;font-weight:800;cursor:pointer;text-transform:uppercase;letter-spacing:1px}
-  button:disabled{opacity:0.5}
-  #sealres{display:none;margin-top:6px;padding:14px;border-radius:8px;background:rgba(127,227,176,0.08);border:1px solid rgba(127,227,176,0.4);font-family:monospace;font-size:11.5px;line-height:1.9;word-break:break-all}
-  #sealres b{color:var(--ok)}
-  #sealres .code{font-size:17px;color:var(--gold);font-weight:700}
-  #checkres{display:none;margin-top:6px;padding:18px;border-radius:10px;font-size:13.5px;line-height:1.8}
-  #checkres.good{display:block;background:rgba(127,227,176,0.08);border:2px solid var(--ok)}
-  #checkres.bad{display:block;background:rgba(255,138,128,0.1);border:3px solid var(--err)}
-  #checkres .big{font-weight:900;font-size:17px;margin-bottom:6px}
-  #checkres.good .big{color:var(--ok)}
-  #checkres.bad .big{color:var(--err)}
-  #checkres .mono{font-family:monospace;font-size:11px;color:var(--muted);word-break:break-all;line-height:1.9}
-  .note{font-size:11px;color:rgba(255,255,255,0.35);line-height:1.7}
-  .warnbox{background:rgba(255,138,128,0.06);border:1px solid rgba(255,138,128,0.3);border-radius:8px;padding:12px;font-size:12px;color:#f1b9b3;line-height:1.7}
-  a{color:var(--gold)}
-</style>
-</head>
-<body>
-<div class="container">
-  <header>
-    <div class="brand">sebbi.pro &middot; payment notary</div>
-    <h1>Never pay a switched invoice again.</h1>
-    <div class="tagline">Invoice fraud costs the UK &pound;450m a year: criminals intercept a real invoice and switch the bank details. Since October 2024, UK banks must reimburse victims up to &pound;85,000 &mdash; <b>unless the payer failed to take reasonable care.</b> The Payment Notary is how both sides prove care: the business seals its true details once, every invoice carries a short code, and every check you run is itself sealed into the chain &mdash; a timestamped <b style="color:var(--gold)">Verification Receipt</b> proving you checked before you paid. If the details don't match the sealed original &mdash; <b style="color:var(--err)">you don't pay, and your receipt proves you caught it.</b></div>
-  </header>
-
-  <!-- LEFT: business seals details -->
-  <div class="panel">
-    <h2>For businesses &middot; seal your payment details</h2>
-    <div><label>Business name</label><input id="biz" placeholder="JustRight Decorators Ltd"></div>
-    <div><label>Sort code</label><input id="sort" inputmode="numeric" placeholder="12-34-56"></div>
-    <div><label>Account number</label><input id="acct" inputmode="numeric" placeholder="12345678"></div>
-    <button id="go" onclick="sealPay()">Seal these details &mdash; free &rarr;</button>
-    <div id="sealres"></div>
-    <div class="note">Fingerprinted with SHA-256 in your own browser. Your full sort code and account number are <b style="color:var(--gold)">never sent to us and never stored</b> &mdash; only the fingerprint plus a masked display (last digits) so customers can eyeball a match. Print the code on every invoice, email footer and quote.</div>
-  </div>
-
-  <!-- RIGHT: customer checks before paying -->
-  <div class="panel">
-    <h2>Before you pay &middot; check the invoice</h2>
-    <div><label>Verification code from the invoice</label><input id="q" placeholder="e.g. 7be4d1c29a03"></div>
-    <div><label>Sort code shown on the invoice</label><input id="csort" inputmode="numeric" placeholder="12-34-56"></div>
-    <div><label>Account number shown on the invoice</label><input id="cacct" inputmode="numeric" placeholder="12345678"></div>
-    <div><label>Business name on the invoice</label><input id="cbiz" placeholder="JustRight Decorators Ltd"></div>
-    <button onclick="checkPay()">Check before I pay &rarr;</button>
-    <div id="checkres"></div>
-    <div class="warnbox">If the check fails, <b>do not send the payment.</b> Phone the business on a number you already know &mdash; not one from the invoice &mdash; and confirm the details by voice. Report suspected fraud to Action Fraud on 0300 123 2040.</div>
-  </div>
-</div>
-
-<script>
-async function sha256hex(s){
-  var buf=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(s));
-  return Array.from(new Uint8Array(buf)).map(function(b){return b.toString(16).padStart(2,"0");}).join("");
-}
-function receiptHtml(rc){
-  if(!rc)return "";
-  var when=new Date(rc.checked_at*1000).toLocaleString("en-GB");
-  return "<div style='margin-top:14px;padding:12px;border:1px dashed rgba(201,168,76,0.5);border-radius:8px;background:rgba(201,168,76,0.06)'>"
-    +"<b style='color:var(--gold)'>\u26D3 YOUR VERIFICATION RECEIPT \u2014 keep this</b><br>"
-    +"<span class='mono'>Checked: "+when+" \u00b7 result: "+rc.result+"<br>Sealed in block #"+rc.block_index+"<br>Receipt seal: "+rc.seal+"<br>Verify any time: sebbi.pro/api/inclusion?hash="+rc.seal+"</span><br>"
-    +"<span style='font-size:11px;color:var(--muted);line-height:1.6'>This receipt is tamper-evident proof that you verified the payee\u2019s details before paying \u2014 the kind of evidence banks consider when assessing reimbursement claims under the 2024 mandatory reimbursement rules. Screenshot it or save the seal.</span></div>";
-}
-function normSort(s){return (s||"").replace(/[^0-9]/g,"");}
-function normAcct(s){return (s||"").replace(/[^0-9]/g,"");}
-function canonicalPay(biz,sort,acct){
-  return "payment:v1|"+biz.trim().toLowerCase()+"|"+normSort(sort)+"|"+normAcct(acct);
-}
-async function sealPay(){
-  var biz=document.getElementById("biz").value.trim();
-  var sort=document.getElementById("sort").value;
-  var acct=document.getElementById("acct").value;
-  var res=document.getElementById("sealres");
-  if(!biz||normSort(sort).length!==6||normAcct(acct).length<7){
-    res.style.display="block";res.innerHTML="<span style='color:var(--err)'>Business name, 6-digit sort code and account number required.</span>";return;
-  }
-  var btn=document.getElementById("go");btn.disabled=true;btn.textContent="Sealing\u2026";
-  try{
-    var fp=await sha256hex(canonicalPay(biz,sort,acct));
-    var ns=normSort(sort),na=normAcct(acct);
-    var display={business:biz,sort_masked:"**-**-"+ns.slice(4),account_masked:"****"+na.slice(-4)};
-    var r=await fetch("/api/payment/seal",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({fingerprint:fp,display:display})});
-    var d=await r.json();
-    if(!d.sealed){res.style.display="block";res.innerHTML="<span style='color:var(--err)'>"+(d.error||"Sealing failed")+"</span>";btn.disabled=false;btn.textContent="Seal these details \u2014 free \u2192";return;}
-    var when=new Date(d.sealed_at*1000).toLocaleString("en-GB");
-    res.style.display="block";
-    res.innerHTML=(d.already_registered?"<b>Already sealed.</b> These exact details were registered earlier.<br>":"<b>\u2713 SEALED.</b> Your true payment details are now locked in the chain.<br>")
-      +"Registered: "+when+" \u00b7 block #"+d.block_index+"<br><br>"
-      +"<b>Print this on every invoice:</b><br>"
-      +"\u26D3 Verify our bank details before paying:<br>sebbi.pro/pay-check \u00b7 code <span class='code'>"+d.code+"</span>";
-    btn.textContent="Sealed \u2713";
-  }catch(e){res.style.display="block";res.innerHTML="<span style='color:var(--err)'>Network error: "+e+"</span>";btn.disabled=false;btn.textContent="Seal these details \u2014 free \u2192";}
-}
-async function checkPay(){
-  var code=document.getElementById("q").value.trim().toLowerCase().replace(/[^0-9a-f]/g,"");
-  var biz=document.getElementById("cbiz").value.trim();
-  var sort=document.getElementById("csort").value;
-  var acct=document.getElementById("cacct").value;
-  var out=document.getElementById("checkres");
-  if(code.length<12){out.className="bad";out.innerHTML="<div class='big'>Enter the 12-character code from the invoice.</div>";return;}
-  if(!biz||normSort(sort).length!==6||normAcct(acct).length<7){
-    out.className="bad";out.innerHTML="<div class='big'>Enter the business name, sort code and account number exactly as shown on the invoice.</div>";return;
-  }
-  out.className="";out.style.display="block";out.innerHTML="Checking the chain\u2026";
-  try{
-    var fp=await sha256hex(canonicalPay(biz,sort,acct));
-    var r=await fetch("/api/payment/check?code="+code+"&fp="+fp);
-    var d=await r.json();
-    if(!d.found){
-      out.className="bad";
-      out.innerHTML="<div class='big'>\u2717 NO SEAL FOUND \u2014 DO NOT PAY</div>No business has sealed payment details under this code. Either the code is mistyped \u2014 or the invoice is fraudulent. Phone the business on a number you already know before sending anything."
-        +receiptHtml(d.receipt);
-      return;
-    }
-    if(d.match){
-      var when=new Date(d.registered_at*1000).toLocaleString("en-GB");
-      var disp=d.display||{};
-      out.className="good";
-      out.innerHTML="<div class='big'>\u2713 DETAILS MATCH THE SEALED ORIGINAL</div>"
-        +"The details on this invoice are identical to the ones <b>"+(disp.business||"this business")+"</b> sealed on "+when+" (block #"+d.block_index+").<br>"
-        +"<span class='mono'>Sealed record: "+(disp.business||"")+" \u00b7 "+(disp.sort_masked||"")+" \u00b7 "+(disp.account_masked||"")+"</span><br>"
-        +"Safe to proceed \u2014 nothing has been switched."
-        +receiptHtml(d.receipt);
-    }else{
-      var disp2=d.display||{};
-      out.className="bad";
-      out.innerHTML="<div class='big'>\u26A0\uFE0F DETAILS DO NOT MATCH \u2014 DO NOT PAY</div>"
-        +"A seal exists under this code, but the details on your invoice are <b>different from the sealed original</b>. This is exactly what invoice fraud looks like \u2014 the bank details may have been switched.<br>"
-        +"<span class='mono'>Sealed original: "+(disp2.business||"")+" \u00b7 "+(disp2.sort_masked||"")+" \u00b7 "+(disp2.account_masked||"")+"</span><br>"
-        +"Phone the business on a number you already know. Report to Action Fraud: 0300 123 2040."
-        +receiptHtml(d.receipt);
-    }
-  }catch(e){out.className="bad";out.innerHTML="<div class='big'>Network error</div>"+e;}
-}
-</script>
-</body>
-</html>
-
-```
-
-
-## `registry.html`
-
-533 lines, 29846 bytes
-
-```html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Safe AI Registry — a registry you don't have to trust</title>
-<meta name="description" content="The register that publishes proofs about its own behaviour. Absence proofs, RFC 6962 append-only proofs, sealed revocations. Checkable against its own operator.">
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600;700&family=IBM+Plex+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<title>SonicBoom &mdash; Your Own AI Compliance Engine. Runs Local. Sub-20ms.</title>
+<meta name="description" content="SonicBoom gives you your own AILeash compliance engine. Runs inside your infrastructure. Every decision is local. No round trip. Sub-20ms.">
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;800;900&family=DM+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 :root{
-  --bg:#04040a;
-  --surface:#08080f;
-  --surface2:#0d0d18;
-  --border:#141428;
-  --border2:#1e1e38;
-  --gold:#c9a84c;
-  --gold2:#e8c96a;
-  --green:#00e5a0;
-  --red:#ff3d5a;
-  --blue:#4d9fff;
-  --purple:#8b5cf6;
-  --text:#e8e8f8;
-  --muted:#4a4a6a;
-  --muted2:#6a6a8a;
-  --mono:'IBM Plex Mono',monospace;
-  --sans:'IBM Plex Sans',sans-serif;
+  --navy:#0a0f1e;--cyan:#00d4ff;--gold:#c9a84c;--white:#fff;
+  --green:#00ff88;--red:#cc0000;--purple:#7c3aed;
+  --mono:'JetBrains Mono',monospace;--sans:'DM Sans',sans-serif;--display:'Playfair Display',serif
 }
-
+html,body{background:var(--navy);color:var(--white);font-family:var(--sans);overflow-x:hidden}
 html{scroll-behavior:smooth}
-body{background:var(--bg);color:var(--text);font-family:var(--sans);min-height:100vh}
-
-nav{position:fixed;top:0;left:0;right:0;z-index:100;height:52px;display:flex;align-items:center;justify-content:space-between;padding:0 32px;background:rgba(4,4,10,0.9);backdrop-filter:blur(16px);border-bottom:1px solid var(--border)}
-.nav-logo{font-family:var(--mono);font-size:13px;color:var(--gold);text-decoration:none}
-.nav-links{display:flex;gap:20px;align-items:center}
-.nav-links a{font-family:var(--mono);font-size:11px;color:var(--muted2);text-decoration:none;transition:color .2s}.nav-links a:hover{color:var(--text)}
-.nav-cta{color:var(--gold)!important}
-
-.hero{padding:100px 32px 60px;max-width:1000px;margin:0 auto;text-align:center}
-.eyebrow{font-family:var(--mono);font-size:10px;color:var(--green);letter-spacing:0.2em;text-transform:uppercase;margin-bottom:20px;display:flex;align-items:center;justify-content:center;gap:10px}
-.eyebrow::before,.eyebrow::after{content:'';width:24px;height:1px;background:var(--green);opacity:0.5}
-
-h1{font-size:clamp(32px,5vw,56px);font-weight:700;letter-spacing:-0.03em;line-height:1.05;margin-bottom:16px}
-h1 span{color:var(--gold)}
-.hero-sub{font-size:16px;color:var(--muted2);line-height:1.7;max-width:620px;margin:0 auto 40px;font-weight:300}
-
-/* STATS */
-.stats-row{display:flex;justify-content:center;gap:48px;margin-bottom:48px;flex-wrap:wrap}
-.stat-item{text-align:center}
-.stat-n{font-family:var(--mono);font-size:36px;color:var(--gold);font-weight:700;line-height:1}
-.stat-l{font-size:11px;color:var(--muted2);margin-top:4px;text-transform:uppercase;letter-spacing:0.1em}
-
-/* LIVE TICKER */
-.ticker-wrap{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:12px 20px;display:flex;align-items:center;gap:12px;max-width:640px;margin:0 auto 48px;overflow:hidden}
-.ticker-dot{width:8px;height:8px;background:var(--green);border-radius:50%;animation:pulse 2s infinite;flex-shrink:0}
-@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:0.5;transform:scale(0.8)}}
-.ticker-text{font-family:var(--mono);font-size:11px;color:var(--green);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-
-/* MAIN */
-.main{max-width:1000px;margin:0 auto;padding:0 32px 80px}
-
-.section-title{font-family:var(--mono);font-size:11px;color:var(--gold);letter-spacing:0.1em;text-transform:uppercase;margin-bottom:14px}
-
-/* SEARCH */
-.search-wrap{margin-bottom:32px;position:relative}
-.search-input{width:100%;background:var(--surface);border:1px solid var(--border2);color:var(--text);padding:14px 20px 14px 48px;font-size:14px;font-family:var(--sans);border-radius:8px;outline:none;transition:border-color .2s}
-.search-input:focus{border-color:var(--gold)}
-.search-icon{position:absolute;left:16px;top:50%;transform:translateY(-50%);color:var(--muted);font-size:16px}
-
-/* FILTER TABS */
-.filter-tabs{display:flex;gap:8px;margin-bottom:24px;flex-wrap:wrap}
-.filter-tab{font-family:var(--mono);font-size:11px;padding:6px 14px;border-radius:20px;border:1px solid var(--border);color:var(--muted2);cursor:pointer;transition:all .2s;background:none}
-.filter-tab.active{background:rgba(201,168,76,0.1);border-color:var(--gold);color:var(--gold)}
-.filter-tab:hover{border-color:var(--muted2);color:var(--text)}
-
-/* REGISTRY TABLE */
-.registry-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden;margin-bottom:32px}
-.registry-header{padding:14px 20px;background:var(--surface2);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
-.registry-header-title{font-family:var(--mono);font-size:11px;color:var(--gold);letter-spacing:0.1em;text-transform:uppercase}
-.registry-count{font-family:var(--mono);font-size:11px;color:var(--muted)}
-
-.reg-table{width:100%;border-collapse:collapse}
-.reg-table th{padding:10px 16px;text-align:left;font-family:var(--mono);font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:0.1em;border-bottom:1px solid var(--border);background:rgba(0,0,0,0.2)}
-.reg-table td{padding:14px 16px;border-bottom:1px solid rgba(255,255,255,0.03);vertical-align:middle}
-.reg-table tr:last-child td{border-bottom:none}
-.reg-table tr:hover td{background:rgba(255,255,255,0.01)}
-
-.domain-cell{font-family:var(--mono);font-size:13px;color:var(--text);display:flex;align-items:center;gap:8px}
-.domain-verified{width:16px;height:16px;background:var(--green);border-radius:50%;display:flex;align-items:center;justify-content:center;color:#000;font-size:9px;font-weight:700;flex-shrink:0}
-.domain-unverified{width:16px;height:16px;background:var(--gold);border-radius:50%;display:flex;align-items:center;justify-content:center;color:#000;font-size:9px;font-weight:700;flex-shrink:0}
-.domain-gone{width:16px;height:16px;background:var(--muted);border-radius:50%;display:flex;align-items:center;justify-content:center;color:#000;font-size:9px;font-weight:700;flex-shrink:0}
-
-.status-badge{font-family:var(--mono);font-size:9px;padding:3px 8px;border-radius:3px;font-weight:600;letter-spacing:0.05em;cursor:help}
-.status-verified{background:rgba(0,229,160,0.12);color:var(--green);border:1px solid rgba(0,229,160,0.2)}
-.status-self{background:rgba(201,168,76,0.12);color:var(--gold);border:1px solid rgba(201,168,76,0.2)}
-.status-pending{background:rgba(74,74,106,0.2);color:var(--muted2);border:1px solid var(--border)}
-.status-bad{background:rgba(255,61,90,0.1);color:var(--red);border:1px solid rgba(255,61,90,0.2)}
-
-.reg-flags{display:flex;gap:4px;flex-wrap:wrap}
-.reg-flag{font-family:var(--mono);font-size:9px;color:var(--blue);background:rgba(77,159,255,0.08);border:1px solid rgba(77,159,255,0.15);padding:1px 5px;border-radius:2px}
-.reg-flag-bad{color:var(--red);background:rgba(255,61,90,0.07);border-color:rgba(255,61,90,0.15)}
-
-.hash-cell{font-family:var(--mono);font-size:10px;color:var(--muted);max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-
-/* PROOF DESK */
-.proof-section{background:var(--surface);border:1px solid var(--border2);border-radius:12px;padding:28px;margin-bottom:32px}
-.proof-section h2{font-size:22px;font-weight:700;letter-spacing:-0.02em;margin-bottom:8px}
-.proof-lead{font-size:14px;color:var(--muted2);line-height:1.7;margin-bottom:20px}
-.proof-row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
-.proof-input{flex:1;min-width:180px;background:rgba(0,0,0,0.35);border:1px solid var(--border2);color:var(--text);padding:11px 14px;font-size:13px;font-family:var(--mono);border-radius:6px;outline:none}
-.proof-input:focus{border-color:var(--gold)}
-.proof-btn{background:rgba(201,168,76,0.12);border:1px solid var(--gold);color:var(--gold);padding:11px 18px;font-size:12px;font-family:var(--mono);border-radius:6px;cursor:pointer;transition:all .2s;white-space:nowrap}
-.proof-btn:hover{background:rgba(201,168,76,0.2)}
-.proof-out{background:#000;border:1px solid var(--border);border-radius:6px;padding:14px;font-family:var(--mono);font-size:11px;color:var(--muted2);line-height:1.6;white-space:pre-wrap;word-break:break-all;max-height:320px;overflow:auto;display:none}
-.proof-out.show{display:block}
-.proof-verdict{font-family:var(--mono);font-size:12px;font-weight:700;margin-bottom:10px;display:block}
-.verdict-absent{color:var(--green)}
-.verdict-present{color:var(--gold)}
-.verdict-err{color:var(--red)}
-
-/* APPLY SECTION */
-.apply-section{background:linear-gradient(135deg,rgba(0,229,160,0.06),rgba(0,229,160,0.01));border:1px solid rgba(0,229,160,0.15);border-radius:12px;padding:36px;text-align:center;margin-bottom:32px}
-.apply-section h2{font-size:24px;font-weight:700;letter-spacing:-0.02em;margin-bottom:8px}
-.apply-section p{font-size:14px;color:var(--muted2);line-height:1.7;max-width:520px;margin:0 auto 24px}
-
-.apply-form{max-width:520px;margin:0 auto;text-align:left}
-.apply-step{font-family:var(--mono);font-size:10px;color:var(--green);letter-spacing:0.1em;text-transform:uppercase;margin-bottom:8px}
-.apply-input{width:100%;background:rgba(0,0,0,0.3);border:1px solid rgba(0,229,160,0.2);color:var(--text);padding:12px 16px;font-size:14px;font-family:var(--mono);border-radius:6px;outline:none;margin-bottom:10px;transition:border-color .2s}
-.apply-input:focus{border-color:var(--green)}
-.apply-input::placeholder{color:var(--muted)}
-.apply-btn{width:100%;background:linear-gradient(135deg,var(--green),#00b87d);color:#000;border:none;padding:13px;font-size:14px;font-weight:700;font-family:var(--sans);border-radius:6px;cursor:pointer;transition:all .2s}
-.apply-btn:hover{transform:translateY(-1px);box-shadow:0 8px 24px rgba(0,229,160,0.2)}
-.apply-btn:disabled{opacity:.4;cursor:not-allowed;transform:none;box-shadow:none}
-.apply-panel{display:none;margin-top:18px;padding-top:18px;border-top:1px solid rgba(0,229,160,0.15)}
-.apply-panel.show{display:block}
-.token-box{background:#000;border:1px solid rgba(0,229,160,0.25);border-radius:6px;padding:12px;font-family:var(--mono);font-size:11px;color:var(--green);word-break:break-all;margin-bottom:10px}
-.apply-note{font-family:var(--mono);font-size:11px;color:var(--muted2);line-height:1.7;margin-bottom:12px}
-.apply-result{font-family:var(--mono);font-size:11px;line-height:1.6;white-space:pre-wrap;word-break:break-all;color:var(--muted2);margin-top:10px;display:none}
-.apply-result.show{display:block}
-
-/* WHAT VERIFIED MEANS */
-.verified-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:32px}
-.verified-card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:20px}
-.verified-card-icon{font-size:20px;margin-bottom:10px}
-.verified-card-title{font-size:13px;font-weight:600;margin-bottom:6px}
-.verified-card-desc{font-size:12px;color:var(--muted2);line-height:1.6}
-
-/* NOT SECTION */
-.not-card{background:var(--surface2);border:1px solid var(--border2);border-radius:10px;padding:24px;margin-bottom:32px}
-.not-card h3{font-size:14px;font-weight:600;margin-bottom:12px}
-.not-card ul{list-style:none}
-.not-card li{font-size:12px;color:var(--muted2);line-height:1.7;padding-left:18px;position:relative;margin-bottom:6px}
-.not-card li::before{content:'—';position:absolute;left:0;color:var(--muted)}
-
-.footnote{font-family:var(--mono);font-size:10px;color:var(--muted);line-height:1.8;text-align:center}
-.footnote a{color:var(--muted2);text-decoration:none;border-bottom:1px solid var(--border2)}
-.footnote a:hover{color:var(--gold)}
-
-@media(max-width:700px){
-  nav{padding:0 16px}
-  .hero{padding:80px 16px 40px}
-  .main{padding:0 16px 60px}
-  .verified-grid{grid-template-columns:1fr}
-  .stats-row{gap:24px}
-  .proof-section{padding:20px}
-  .apply-section{padding:24px 18px}
-  .reg-table th:nth-child(4),.reg-table td:nth-child(4){display:none}
-  .reg-table th:nth-child(5),.reg-table td:nth-child(5){display:none}
+nav{position:fixed;top:0;left:0;right:0;z-index:100;background:rgba(10,15,30,0.97);backdrop-filter:blur(12px);padding:0 48px;height:68px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid rgba(0,212,255,0.1)}
+.nav-logo{font-family:var(--display);font-size:20px;color:var(--white);font-weight:900;text-decoration:none}.nav-logo span{color:var(--cyan)}
+.nav-links{display:flex;gap:16px;align-items:center}
+.nav-links a{color:rgba(255,255,255,0.4);text-decoration:none;font-size:13px;font-weight:500;transition:color .2s}.nav-links a:hover{color:var(--white)}
+.nav-cta{background:var(--cyan)!important;color:var(--navy)!important;padding:9px 18px;font-weight:700!important;border-radius:4px}
+.scan-sec{padding:140px 48px 80px;position:relative;overflow:hidden;text-align:center;border-bottom:1px solid rgba(0,212,255,0.1)}
+.scan-sec::before{content:'';position:absolute;inset:0;background:radial-gradient(ellipse at 50% 40%,rgba(0,212,255,0.06) 0%,transparent 65%)}
+.scan-sec::after{content:'';position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,var(--cyan),transparent)}
+.scan-inner{max-width:820px;margin:0 auto;position:relative;z-index:1}
+.scan-eyebrow{font-family:var(--mono);font-size:11px;letter-spacing:3px;text-transform:uppercase;color:var(--cyan);margin-bottom:20px;display:block}
+.scan-title{font-family:var(--display);font-size:clamp(36px,5vw,64px);line-height:1.05;font-weight:900;margin-bottom:16px}
+.scan-title em{color:var(--cyan);font-style:normal}
+.scan-sub{font-size:16px;color:rgba(255,255,255,0.35);line-height:1.7;margin-bottom:16px}
+.data-note{font-family:var(--mono);font-size:11px;color:rgba(0,255,136,0.55);margin-bottom:32px;line-height:1.7}
+.sound-toggle{display:inline-flex;align-items:center;gap:10px;background:rgba(0,212,255,0.08);border:1px solid rgba(0,212,255,0.2);border-radius:40px;padding:10px 20px;cursor:pointer;margin-bottom:32px;transition:all .2s;font-family:var(--mono);font-size:11px;letter-spacing:1px;text-transform:uppercase;color:var(--cyan)}
+.sound-toggle:hover{background:rgba(0,212,255,0.15)}
+.category-badge{display:none;margin:0 auto 24px;padding:10px 24px;border-radius:40px;font-family:var(--mono);font-size:11px;letter-spacing:2px;text-transform:uppercase;font-weight:700;width:fit-content}
+.category-badge.show{display:block}
+.cat-enterprise{background:rgba(201,168,76,0.1);border:1px solid rgba(201,168,76,0.3);color:var(--gold)}
+.cat-developer{background:rgba(0,212,255,0.1);border:1px solid rgba(0,212,255,0.3);color:var(--cyan)}
+.cat-callcentre{background:rgba(0,135,90,0.1);border:1px solid rgba(0,135,90,0.3);color:#00ff88}
+.cat-lawenforcement{background:rgba(124,58,237,0.1);border:1px solid rgba(124,58,237,0.3);color:#a78bfa}
+.cat-consumer{background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);color:rgba(255,255,255,0.5)}
+.terminal{background:rgba(0,0,0,0.55);border:1px solid rgba(0,212,255,0.2);border-radius:8px;overflow:hidden;text-align:left;margin-bottom:40px;box-shadow:0 0 60px rgba(0,212,255,0.05)}
+.terminal-bar{background:rgba(0,212,255,0.05);padding:12px 20px;border-bottom:1px solid rgba(0,212,255,0.1);display:flex;align-items:center;gap:8px}
+.t-dot{width:10px;height:10px;border-radius:50%}
+.t-dot-r{background:#ff5f57}.t-dot-y{background:#febc2e}.t-dot-g{background:#28c840}
+.t-title{font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.2);letter-spacing:2px;text-transform:uppercase;margin-left:8px}
+.terminal-body{padding:28px 28px 32px;min-height:320px;max-height:70vh;overflow-y:auto}
+.terminal-body::-webkit-scrollbar{width:3px}.terminal-body::-webkit-scrollbar-thumb{background:rgba(0,212,255,0.2);border-radius:2px}
+.t-line{font-family:var(--mono);font-size:13px;line-height:2.1;display:flex;align-items:flex-start;gap:10px;opacity:0;transform:translateY(4px);transition:opacity .25s,transform .25s}
+.t-line.show{opacity:1;transform:none}
+.t-prompt{color:rgba(0,212,255,0.3);flex-shrink:0;user-select:none}
+.t-text{color:rgba(255,255,255,0.75);flex:1}
+.t-cyan{color:var(--cyan)}.t-green{color:var(--green)}.t-gold{color:var(--gold)}.t-red{color:#ff6b6b}.t-dim{color:rgba(255,255,255,0.2)}.t-purple{color:#a78bfa}
+.t-hash{color:var(--green);font-size:11px;word-break:break-all;line-height:1.6}
+.t-section{font-family:var(--mono);font-size:9px;letter-spacing:3px;text-transform:uppercase;color:rgba(0,212,255,0.2);padding:10px 0 4px;border-top:1px solid rgba(255,255,255,0.04);margin-top:6px;opacity:0;transition:opacity .3s}
+.t-section.show{opacity:1}
+.t-sales{font-family:var(--mono);font-size:12px;line-height:1.8;opacity:0;transform:translateY(4px);transition:opacity .3s,transform .3s;padding:12px 16px;border-radius:4px;margin:4px 0}
+.t-sales.show{opacity:1;transform:none}
+.t-sales-enterprise{background:rgba(201,168,76,0.06);border-left:3px solid var(--gold);color:rgba(255,255,255,0.6)}
+.t-sales-developer{background:rgba(0,212,255,0.04);border-left:3px solid var(--cyan);color:rgba(255,255,255,0.6)}
+.t-sales-callcentre{background:rgba(0,255,136,0.04);border-left:3px solid var(--green);color:rgba(255,255,255,0.6)}
+.t-sales-law{background:rgba(124,58,237,0.06);border-left:3px solid #7c3aed;color:rgba(255,255,255,0.6)}
+.t-sales-consumer{background:rgba(255,255,255,0.03);border-left:3px solid rgba(255,255,255,0.15);color:rgba(255,255,255,0.5)}
+.verdict{display:none;padding:28px 28px 32px;border-top:1px solid rgba(0,212,255,0.1);background:rgba(0,0,0,0.3)}
+.verdict.show{display:block}
+.verdict-decision{font-family:var(--display);font-size:56px;font-weight:900;line-height:1;margin-bottom:6px;letter-spacing:2px;color:var(--green)}
+.verdict-score{font-family:var(--mono);font-size:11px;color:rgba(255,255,255,0.25);letter-spacing:1px;margin-bottom:20px}
+.verdict-hash-label{font-family:var(--mono);font-size:9px;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,0.15);margin-bottom:6px}
+.verdict-hash{font-family:var(--mono);font-size:11px;color:var(--green);word-break:break-all;background:rgba(0,0,0,0.3);padding:10px 12px;border-radius:4px;margin-bottom:12px;line-height:1.6}
+.verdict-sealed{font-family:var(--mono);font-size:10px;color:rgba(0,212,255,0.35);letter-spacing:1px}
+.verdict-verify{display:inline-block;margin-top:12px;font-family:var(--mono);font-size:10px;color:var(--cyan);text-decoration:none;border-bottom:1px solid rgba(0,212,255,0.3)}
+.fear-sec{display:none;padding:0 48px 80px;text-align:center}
+.fear-sec.show{display:block}
+.fear-inner{max-width:720px;margin:0 auto}
+.fear-line{font-family:var(--display);font-size:clamp(20px,3vw,34px);font-weight:900;line-height:1.3;margin-bottom:20px;opacity:0;transform:translateY(24px);transition:opacity .7s,transform .7s}
+.fear-line.show{opacity:1;transform:none}
+.fear-line em{color:var(--cyan);font-style:normal}
+.fear-line strong{color:var(--red)}
+.fear-divider{width:60px;height:3px;background:linear-gradient(90deg,var(--cyan),var(--gold));margin:36px auto;opacity:0;transition:opacity .7s;border-radius:2px}
+.fear-divider.show{opacity:1}
+.fear-cta{margin-top:52px;opacity:0;transform:translateY(24px);transition:opacity .7s,transform .7s}
+.fear-cta.show{opacity:1;transform:none}
+.fear-price{font-family:var(--display);font-size:clamp(56px,10vw,110px);font-weight:900;color:var(--cyan);line-height:1;margin-bottom:4px}
+.fear-price-label{font-family:var(--mono);font-size:11px;letter-spacing:2px;color:rgba(255,255,255,0.2);margin-bottom:36px;text-transform:uppercase}
+.btn-cyan{background:var(--cyan);color:var(--navy);padding:16px 36px;border:none;font-family:var(--sans);font-weight:700;font-size:16px;cursor:pointer;text-decoration:none;border-radius:4px;display:inline-block;transition:all .2s}.btn-cyan:hover{background:#33ddff;transform:translateY(-2px)}
+.btn-ghost{background:transparent;color:rgba(255,255,255,0.4);padding:16px 36px;border:1px solid rgba(255,255,255,0.1);font-family:var(--sans);font-weight:600;font-size:16px;cursor:pointer;text-decoration:none;border-radius:4px;display:inline-block;transition:all .2s;margin-left:12px}.btn-ghost:hover{color:var(--white);border-color:rgba(255,255,255,0.3)}
+.divider{height:1px;background:linear-gradient(90deg,transparent,rgba(0,212,255,0.3),transparent)}
+.what-sec{padding:80px 48px;border-bottom:1px solid rgba(255,255,255,0.05)}
+.what-inner,.engine-inner,.how-inner,.pricing-inner{max-width:1100px;margin:0 auto}
+.sec-eyebrow{font-family:var(--mono);font-size:10px;letter-spacing:3px;text-transform:uppercase;color:rgba(0,212,255,0.5);margin-bottom:16px;display:block}
+h2{font-family:var(--display);font-size:clamp(28px,3.5vw,48px);font-weight:900;line-height:1.1;margin-bottom:16px}
+h2 em{color:var(--cyan);font-style:normal}
+.sec-sub{font-size:15px;color:rgba(255,255,255,0.35);line-height:1.8;max-width:580px;margin-bottom:52px}
+.two-col{display:grid;grid-template-columns:1fr 1fr;gap:2px;background:rgba(255,255,255,0.04)}
+.col{background:var(--navy);padding:40px 36px}
+.col-label{font-family:var(--mono);font-size:9px;letter-spacing:2px;text-transform:uppercase;margin-bottom:20px;padding:4px 10px;border-radius:2px;display:inline-block}
+.col-old .col-label{color:rgba(255,255,255,0.2);background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08)}
+.col-new .col-label{color:var(--cyan);background:rgba(0,212,255,0.06);border:1px solid rgba(0,212,255,0.2)}
+.col h3{font-family:var(--display);font-size:22px;font-weight:900;margin-bottom:12px}
+.col-old h3{color:rgba(255,255,255,0.3)}.col-new h3{color:var(--white)}
+.col p{font-size:14px;line-height:1.75;margin-bottom:20px}
+.col-old p{color:rgba(255,255,255,0.2)}.col-new p{color:rgba(255,255,255,0.5)}
+.col-stat{font-family:var(--display);font-size:52px;font-weight:900;line-height:1;margin-bottom:4px}
+.col-old .col-stat{color:rgba(255,255,255,0.1)}.col-new .col-stat{color:var(--cyan)}
+.col-stat-label{font-family:var(--mono);font-size:9px;letter-spacing:2px;color:rgba(255,255,255,0.2);text-transform:uppercase}
+.engine-sec{padding:80px 48px;background:rgba(0,212,255,0.02);border-bottom:1px solid rgba(0,212,255,0.08)}
+.engine-card{background:rgba(255,255,255,0.03);border:1px solid rgba(0,212,255,0.15);border-radius:8px;overflow:hidden;margin-top:40px}
+.engine-card-header{background:rgba(0,212,255,0.06);border-bottom:1px solid rgba(0,212,255,0.1);padding:24px 32px;display:flex;align-items:center;justify-content:space-between}
+.engine-card-title{font-family:var(--display);font-size:24px;font-weight:900;color:var(--white)}.engine-card-title span{color:var(--cyan)}
+.engine-badge{font-family:var(--mono);font-size:9px;letter-spacing:2px;text-transform:uppercase;color:var(--cyan);background:rgba(0,212,255,0.1);border:1px solid rgba(0,212,255,0.2);padding:5px 12px;border-radius:2px}
+.engine-body{padding:32px;display:grid;grid-template-columns:1fr 1fr;gap:40px}
+.engine-features{display:flex;flex-direction:column;gap:16px}
+.ef{display:flex;align-items:flex-start;gap:12px}
+.ef-icon{font-family:var(--mono);font-size:9px;font-weight:700;color:var(--cyan);flex-shrink:0;margin-top:2px}
+.ef-text h4{font-size:14px;font-weight:700;color:var(--white);margin-bottom:3px}
+.ef-text p{font-size:13px;color:rgba(255,255,255,0.35);line-height:1.6}
+.engine-download{background:rgba(0,0,0,0.3);border:1px solid rgba(0,212,255,0.1);border-radius:6px;padding:28px;display:flex;flex-direction:column;gap:16px}
+.dl-label{font-family:var(--mono);font-size:9px;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,0.2);margin-bottom:4px}
+.dl-filename{font-family:var(--mono);font-size:16px;color:var(--cyan);font-weight:600}
+.dl-size{font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.15);margin-top:2px}
+.dl-steps{display:flex;flex-direction:column;gap:8px}
+.dl-step{font-family:var(--mono);font-size:12px;color:rgba(255,255,255,0.4);line-height:1.5}
+.dl-step strong{color:var(--cyan)}
+.code-block{background:rgba(0,0,0,0.4);border:1px solid rgba(0,212,255,0.1);border-radius:6px;padding:20px;font-family:var(--mono);font-size:12px;line-height:1.8;color:rgba(255,255,255,0.5);overflow-x:auto;white-space:pre}
+.code-block .c-cyan{color:var(--cyan)}.code-block .c-green{color:var(--green)}.code-block .c-gold{color:var(--gold)}.code-block .c-dim{color:rgba(255,255,255,0.2)}
+.dl-btn{display:block;text-align:center;background:rgba(0,212,255,0.1);border:1px solid rgba(0,212,255,0.3);color:var(--cyan);padding:12px;border-radius:4px;font-family:var(--mono);font-size:12px;font-weight:600;text-decoration:none;transition:all .2s;cursor:pointer}.dl-btn:hover{background:rgba(0,212,255,0.2)}
+.how-sec{padding:80px 48px;border-bottom:1px solid rgba(255,255,255,0.05)}
+.steps{display:grid;grid-template-columns:repeat(4,1fr);gap:2px;background:rgba(255,255,255,0.04);margin-top:40px}
+.step{background:var(--navy);padding:32px 24px}
+.step-n{font-family:var(--display);font-size:56px;font-weight:900;color:var(--cyan);opacity:0.15;line-height:1;margin-bottom:12px}
+.step h3{font-family:var(--display);font-size:18px;font-weight:900;color:var(--white);margin-bottom:10px}
+.step p{font-size:13px;color:rgba(255,255,255,0.35);line-height:1.7}
+.pricing-sec{padding:80px 48px;border-bottom:1px solid rgba(255,255,255,0.05)}
+.price-card{background:rgba(255,255,255,0.03);border:1px solid rgba(0,212,255,0.15);border-radius:8px;padding:48px;margin-top:40px;text-align:center;max-width:600px;margin-left:auto;margin-right:auto}
+.price-big{font-family:var(--display);font-size:96px;font-weight:900;color:var(--cyan);line-height:1;margin-bottom:4px}
+.price-per{font-family:var(--mono);font-size:11px;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,0.2);margin-bottom:32px}
+.price-includes{display:flex;flex-direction:column;gap:10px;text-align:left;margin-bottom:32px}
+.pi{display:flex;align-items:center;gap:10px;font-size:14px;color:rgba(255,255,255,0.5)}
+.pi::before{content:'OK';font-family:var(--mono);font-size:9px;font-weight:700;color:var(--cyan);flex-shrink:0}
+.signup-sec{padding:80px 48px}
+.signup-inner{max-width:520px;margin:0 auto;text-align:center}
+.signup-inner p{font-size:15px;color:rgba(255,255,255,0.35);line-height:1.7;margin-bottom:32px}
+.fg{margin-bottom:12px;text-align:left}
+.fg label{display:block;font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.25);letter-spacing:2px;text-transform:uppercase;margin-bottom:6px}
+.fg input,.fg select{width:100%;background:rgba(255,255,255,0.05);border:2px solid rgba(255,255,255,0.08);color:var(--white);padding:12px 14px;font-size:14px;font-family:var(--sans);outline:none;border-radius:4px;transition:border-color .2s}
+.fg input:focus,.fg select:focus{border-color:var(--cyan)}
+.fg input::placeholder{color:rgba(255,255,255,0.2)}
+.fg select option{background:var(--navy)}
+.fg-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.btn-full{width:100%;padding:14px;font-size:15px;font-weight:700;border-radius:4px;border:none;cursor:pointer;font-family:var(--sans);transition:all .2s;background:var(--cyan);color:var(--navy);margin-top:8px}
+.btn-full:hover{background:#33ddff}
+.key-box{display:none;margin-top:24px;background:rgba(0,0,0,0.4);border:1px solid rgba(0,212,255,0.2);border-radius:6px;padding:24px;text-align:left}
+.key-box.show{display:block}
+.key-lbl{font-family:var(--mono);font-size:9px;letter-spacing:2px;color:var(--cyan);margin-bottom:8px;text-transform:uppercase}
+.key-val{font-family:var(--mono);font-size:11px;color:var(--green);word-break:break-all;background:rgba(0,0,0,0.3);padding:10px;border-radius:4px;margin-bottom:16px}
+.msg-err{display:none;color:#ff6b6b;font-family:var(--mono);font-size:11px;margin-top:10px;padding:10px;background:rgba(255,0,0,0.08);border-radius:4px;border:1px solid rgba(255,0,0,0.2)}
+.msg-err.show{display:block}
+footer{background:rgba(0,0,0,0.4);padding:48px;border-top:1px solid rgba(255,255,255,0.04)}
+.foot-inner{max-width:1100px;margin:0 auto;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:20px}
+.foot-logo{font-family:var(--display);font-size:18px;color:var(--white);font-weight:900;text-decoration:none}.foot-logo span{color:var(--cyan)}
+.foot-links{display:flex;gap:24px;flex-wrap:wrap}
+.foot-links a{color:rgba(255,255,255,0.2);text-decoration:none;font-size:12px;transition:color .2s}.foot-links a:hover{color:var(--white)}
+.foot-copy{font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.1);width:100%;margin-top:16px;padding-top:16px;border-top:1px solid rgba(255,255,255,0.04)}
+@media(max-width:900px){
+  nav{padding:0 20px}.nav-links a:not(.nav-cta){display:none}
+  .scan-sec,.what-sec,.engine-sec,.how-sec,.pricing-sec,.signup-sec,.fear-sec{padding-left:20px!important;padding-right:20px!important}
+  .two-col,.engine-body,.steps,.fg-row{grid-template-columns:1fr!important}
+  footer{padding:36px 20px}.foot-inner{flex-direction:column;align-items:flex-start}
+  .btn-ghost{margin-left:0;margin-top:12px}
 }
 </style>
 </head>
 <body>
 
 <nav>
-  <a href="/" class="nav-logo">sebbi.pro</a>
+  <a href="https://sebbi.pro" class="nav-logo">Monop <span>Content</span></a>
   <div class="nav-links">
-    <a href="/ai-standard">ai.txt Standard</a>
-    <a href="/x/register/spec">Spec</a>
-    <a href="/#signup" class="nav-cta">Get API Key →</a>
+    <a href="https://sebbi.pro/#products">All Products</a>
+    <a href="https://sebbi.pro/scan">Free Scanner</a>
+    <a href="https://sebbi.pro/contact">Contact</a>
+    <a href="#signup" class="nav-cta">Get SonicBoom Free</a>
   </div>
 </nav>
 
-<div class="hero">
-  <div class="eyebrow">Safe AI Registry</div>
-  <h1>A registry you<br><span>don't have to trust.</span></h1>
-  <p class="hero-sub">Every other registry is a database its operator can edit. Entries get back-dated, listings get quietly dropped, and you have to take the registrar's word for all of it. This one publishes proofs about its own behaviour — including proof of what it hasn't done.</p>
-
-  <div class="stats-row">
-    <div class="stat-item"><div class="stat-n" id="stat-listed">—</div><div class="stat-l">Listed Domains</div></div>
-    <div class="stat-item"><div class="stat-n" id="stat-passed">—</div><div class="stat-l">Checks Passed</div></div>
-    <div class="stat-item"><div class="stat-n" id="stat-events">—</div><div class="stat-l">Register Events</div></div>
-    <div class="stat-item"><div class="stat-n" id="stat-suite">OAAS-1.0</div><div class="stat-l">Standard Version</div></div>
-  </div>
-
-  <div class="ticker-wrap">
-    <div class="ticker-dot"></div>
-    <div class="ticker-text" id="ticker-text">Loading register state…</div>
-  </div>
-</div>
-
-<div class="main">
-
-  <!-- WHAT THIS DOES THAT NOTHING ELSE DOES -->
-  <div class="section-title">// What this register proves about itself</div>
-  <div class="verified-grid">
-    <div class="verified-card">
-      <div class="verified-card-icon">🚫</div>
-      <div class="verified-card-title">Proof of absence</div>
-      <div class="verified-card-desc">Ask whether a domain was listed on a given date and get a cryptographic answer, not a lookup. Two adjacent leaves with consecutive indices in a sorted tree sealed at that date — nothing can sit between them. A false claim of past certification is disproved by arithmetic.</div>
-    </div>
-    <div class="verified-card">
-      <div class="verified-card-icon">⛓️</div>
-      <div class="verified-card-title">Append-only, provably</div>
-      <div class="verified-card-desc">An RFC 6962 consistency proof shows the register at any past size is a prefix of the register now. No entry has been inserted behind an earlier position — including by the operator. It verifies with any standard Certificate Transparency verifier, not one of ours.</div>
-    </div>
-    <div class="verified-card">
-      <div class="verified-card-icon">📌</div>
-      <div class="verified-card-title">Revocations stay readable</div>
-      <div class="verified-card-desc">A delisted entry is not deleted. The revocation is sealed with its reason and the full history stays public. Listed from one date, revoked on another, and why — permanently. No badge scheme does this, because quietly dropping customers is the point of a badge.</div>
-    </div>
-    <div class="verified-card">
-      <div class="verified-card-icon">🔑</div>
-      <div class="verified-card-title">Nobody is listed by us</div>
-      <div class="verified-card-desc">A domain lists itself by serving a one-time token at its own address. The operator cannot add you, and cannot claim you asked. Domain control is proved the same way withdrawal is proved.</div>
-    </div>
-  </div>
-
-  <!-- PROOF DESK -->
-  <div class="proof-section" id="proofs">
-    <h2>Check the register against itself.</h2>
-    <p class="proof-lead">No account, no key. Type any domain — one that is listed, one that never was, one that was removed. The answer comes back as a proof you can recompute yourself.</p>
-
-    <div class="proof-row">
-      <input class="proof-input" id="absence-domain" placeholder="example.com" spellcheck="false">
-      <input class="proof-input" id="absence-date" placeholder="2026-01-01 (optional)" spellcheck="false" style="max-width:200px">
-      <button class="proof-btn" onclick="runAbsence()">Prove listed or not →</button>
-    </div>
-    <div class="proof-out" id="absence-out"></div>
-
-    <div style="height:18px"></div>
-
-    <div class="proof-row">
-      <input class="proof-input" id="cons-first" placeholder="tree size you already hold" spellcheck="false">
-      <button class="proof-btn" onclick="runConsistency()">Prove append-only →</button>
-    </div>
-    <div class="proof-out" id="cons-out"></div>
-  </div>
-
-  <!-- SEARCH -->
-  <div class="search-wrap">
-    <span class="search-icon">🔍</span>
-    <input class="search-input" type="text" id="search-input" placeholder="Search the register..." oninput="renderRegistry()">
-  </div>
-
-  <!-- FILTER TABS -->
-  <div class="filter-tabs">
-    <button class="filter-tab active" onclick="setFilter('all',this)">All</button>
-    <button class="filter-tab" onclick="setFilter('checks-passed',this)">Checks passed</button>
-    <button class="filter-tab" onclick="setFilter('checks-failed',this)">Checks failed</button>
-    <button class="filter-tab" onclick="setFilter('stale',this)">Stale</button>
-    <button class="filter-tab" onclick="setFilter('gone',this)">Withdrawn / revoked</button>
-  </div>
-
-  <!-- REGISTRY TABLE -->
-  <div class="registry-card">
-    <div class="registry-header">
-      <div class="registry-header-title">// Register</div>
-      <div class="registry-count" id="registry-count">loading…</div>
-    </div>
-    <div style="overflow-x:auto">
-      <table class="reg-table">
-        <thead>
-          <tr>
-            <th>Domain</th>
-            <th>Status</th>
-            <th>Failing checks</th>
-            <th>Last checked</th>
-            <th>Listed since</th>
-          </tr>
-        </thead>
-        <tbody id="registry-tbody">
-          <tr><td colspan="5" style="padding:32px;text-align:center;color:var(--muted);font-family:var(--mono);font-size:12px">Loading register…</td></tr>
-        </tbody>
-      </table>
-    </div>
-  </div>
-
-  <!-- WHAT THIS IS NOT -->
-  <div class="not-card">
-    <h3>What a listing is not</h3>
-    <ul>
-      <li>Not a certification. Nobody has been certified by anyone.</li>
-      <li>Not a statement that any law applies to a listed domain, or that a listed domain satisfies it. Whether a regulation applies to an organisation is a question for that organisation's own advisers.</li>
-      <li>Not an audit. No third party has audited this register or any domain on it.</li>
-      <li>Not a claim about anything a domain did not seal. A check observes what a URL served at a moment in time.</li>
-      <li>Being listed and being sealed are separate things, and neither is consent to the other.</li>
-    </ul>
-  </div>
-
-  <!-- APPLY -->
-  <div class="apply-section" id="join">
-    <h2>List your own domain.</h2>
-    <p>Two steps, no account, no approval queue. You prove you control the domain and the register runs its checks in the open. Free.</p>
-    <div class="apply-form">
-      <div class="apply-step">Step 1 — request a token</div>
-      <input class="apply-input" type="text" id="apply-domain" placeholder="yourdomain.com" spellcheck="false">
-      <button class="apply-btn" onclick="getChallenge()" id="challenge-btn">Request token →</button>
-
-      <div class="apply-panel" id="apply-panel">
-        <div class="apply-step">Step 2 — serve it, then claim</div>
-        <div class="token-box" id="token-box"></div>
-        <div class="apply-note" id="token-note"></div>
-        <button class="apply-btn" onclick="doClaim()" id="claim-btn">I've served it — claim my listing →</button>
+<section class="scan-sec">
+  <div class="scan-inner">
+    <span class="scan-eyebrow">SonicBoom &mdash; sebbi.pro &mdash; Live Engine</span>
+    <h1 class="scan-title" style="font-family:var(--display);font-size:clamp(36px,5vw,64px);line-height:1.05;font-weight:900;margin-bottom:16px">Hello.<br><em>We already know who you are.</em></h1>
+    <p class="scan-sub">Welcome to sebbi.pro. We are Monop Content. This is our AI compliance engine. It has been scanning you since the moment you arrived.</p>
+    <p class="data-note">Everything below is real: your real device, your real approximate location, and a real decision from our live governance engine &mdash; not a simulation.</p>
+    <button class="sound-toggle" id="sound-toggle" onclick="toggleSound()">
+      <span id="sound-icon">&#128266;</span>
+      <span id="sound-label">Sound On &mdash; Tap to mute</span>
+    </button>
+    <div class="category-badge" id="category-badge"></div>
+    <div class="terminal">
+      <div class="terminal-bar">
+        <div class="t-dot t-dot-r"></div><div class="t-dot t-dot-y"></div><div class="t-dot t-dot-g"></div>
+        <span class="t-title">AILeash Engine v5.0.0 &mdash; sebbi.pro &mdash; Live Session Scan</span>
       </div>
-      <div class="apply-result" id="apply-result"></div>
+      <div class="terminal-body" id="terminal-body"></div>
+      <div class="verdict" id="verdict">
+        <div class="verdict-decision" id="v-decision">ALLOW</div>
+        <div class="verdict-score" id="v-score"></div>
+        <div class="verdict-hash-label">Audit Hash &mdash; SHA-256 &mdash; Sealed Into the Real Chain Just Now</div>
+        <div class="verdict-hash" id="v-hash"></div>
+        <div class="verdict-sealed" id="v-sealed"></div>
+        <a href="https://sebbi.pro/x/consistency/root" target="_blank" class="verdict-verify">Verify the chain integrity yourself &rarr;</a>
+      </div>
     </div>
   </div>
+</section>
 
-  <div class="footnote">
-    Suite <span id="foot-suite">—</span> · every route on this page is public and unauthenticated ·
-    <a href="/x/register/spec">spec</a> ·
-    <a href="/x/register/list">raw list</a> ·
-    <a href="/x/register/checkpoints">checkpoints</a> ·
-    <a href="/x/register/roots">live roots</a> ·
-    <a href="/x/register/sealcheck">seal check</a>
+<section class="fear-sec" id="fear-sec">
+  <div class="fear-inner">
+    <div class="fear-line" id="f1">We did that <em>using our real engine, live.</em></div>
+    <div class="fear-line" id="f2">Every single user on your platform<br>could be scored like that. <em>In real time.</em></div>
+    <div class="fear-divider" id="fd1"></div>
+    <div class="fear-line" id="f3">When a regulator knocks on your door and asks you to prove<br>your AI treated someone fairly on a specific date &mdash;</div>
+    <div class="fear-line" id="f4"><strong>what exactly are you going to show them?</strong></div>
+    <div class="fear-divider" id="fd2"></div>
+    <div class="fear-line" id="f5">Your session was just sealed into our real audit chain.<br><em>Tamper-evident. Verifiable. Yours to check.</em></div>
+    <div class="fear-line" id="f6">Most AI has <strong>none of this.</strong></div>
+    <div class="fear-cta" id="fear-cta">
+      <div class="fear-price">50p</div>
+      <div class="fear-price-label">per device per month &mdash; your own engine &mdash; your data never leaves your network</div>
+      <a href="#signup" class="btn-cyan">Get The Engine Free &rarr;</a>
+      <a href="https://sebbi.pro/#products" class="btn-ghost">See All Products</a>
+    </div>
   </div>
+</section>
 
-</div>
+<div class="divider"></div>
+
+<section class="what-sec">
+  <div class="what-inner">
+    <span class="sec-eyebrow">The Problem</span>
+    <h2>Every API call is a<br><em>round trip you pay for.</em></h2>
+    <p class="sec-sub">Standard cloud AI compliance tools make you send every decision to their server and wait for a response. That latency adds up. That data leaves your network. That dependency is their leverage over you.</p>
+    <div class="two-col">
+      <div class="col col-old">
+        <div class="col-label">The old way</div>
+        <h3>Call someone else's server</h3>
+        <p>Your platform makes a decision. You send it to a remote API. You wait. They respond. You act. Every single time. Your data leaves your network on every call.</p>
+        <div class="col-stat">200ms</div>
+        <div class="col-stat-label">typical round trip latency</div>
+      </div>
+      <div class="col col-new">
+        <div class="col-label">SonicBoom</div>
+        <h3>Your engine. Your server. Your speed.</h3>
+        <p>The Sebdog Engine runs inside your own infrastructure. Every compliance decision happens locally. Nothing leaves your network. The audit chain builds on your own machine.</p>
+        <div class="col-stat">&lt;20ms</div>
+        <div class="col-stat-label">local decision &mdash; no network hop</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="engine-sec" id="engine">
+  <div class="engine-inner">
+    <span class="sec-eyebrow">The Engine</span>
+    <h2>Sebdog Engine &mdash;<br><em>everything AILeash does,</em> running on yours.</h2>
+    <p class="sec-sub">One Python file. Runs anywhere Python runs. Licensed by a cryptographic token you hold, validated on your own machine. It makes no outbound call to us at all.</p>
+    <div class="engine-card">
+      <div class="engine-card-header">
+        <div class="engine-card-title">sebdog_engine<span>.py</span></div>
+        <div class="engine-badge">Included with SonicBoom</div>
+      </div>
+      <div class="engine-body">
+        <div class="engine-features">
+          <div class="ef"><div class="ef-icon">OK</div><div class="ef-text"><h4>9-signal weighted scoring engine</h4><p>The full AILeash algorithm running on your machine. EWMA trust decay, velocity windows, anomaly detection.</p></div></div>
+          <div class="ef"><div class="ef-icon">OK</div><div class="ef-text"><h4>SHA-256 Merkle audit chain</h4><p>Every decision sealed into a tamper-evident chain in your own SQLite database. Nobody can alter it.</p></div></div>
+          <div class="ef"><div class="ef-icon">OK</div><div class="ef-text"><h4>No phone home. Ever.</h4><p>Your licence is an Ed25519 token validated locally against a public key. The engine never calls sebbi.pro, so it keeps running whether we are up, down, or gone.</p></div></div>
+          <div class="ef"><div class="ef-icon">OK</div><div class="ef-text"><h4>Witnessed by chains you choose</h4><p>Serves its own tip endpoint, so other organisations can hold proof of your record without ever seeing what is in it.</p></div></div>
+          <div class="ef"><div class="ef-icon">OK</div><div class="ef-text"><h4>Data sovereignty</h4><p>Your users' data never leaves your network. Ever. Regulators love this.</p></div></div>
+          <div class="ef"><div class="ef-icon">OK</div><div class="ef-text"><h4>EU AI Act Articles 9, 12, 13, 14 alignment</h4><p>Full compliance audit trail generated automatically. Regulator-ready from day one.</p></div></div>
+          <div class="ef"><div class="ef-icon">OK</div><div class="ef-text"><h4>Zero external dependencies</h4><p>Pure Python standard library only. No pip install. Runs anywhere.</p></div></div>
+        </div>
+        <div class="engine-download">
+          <div>
+            <div class="dl-label">Engine File</div>
+            <div class="dl-filename">sebdog_engine.py</div>
+            <div class="dl-size">Pure Python &mdash; zero dependencies &mdash; runs anywhere</div>
+          </div>
+          <div class="dl-steps">
+            <div class="dl-step"><strong>1.</strong> Get your free API key below</div>
+            <div class="dl-step"><strong>2.</strong> Download the engine with your key</div>
+            <div class="dl-step"><strong>3.</strong> Run it on your own server</div>
+            <div class="dl-step"><strong>4.</strong> Call localhost instead of sebbi.pro</div>
+          </div>
+          <div class="code-block"><span class="c-dim"># Run the engine on your server</span>
+<span class="c-cyan">python</span> sebdog_engine.py \
+  <span class="c-gold">--token-file</span> licence.token \
+  <span class="c-gold">--port</span> 9090
+
+<span class="c-dim"># Every decision is now local</span>
+<span class="c-cyan">POST</span> http://localhost:9090/govern
+<span class="c-green">-> ALLOW / CHALLENGE / BLOCK</span>
+<span class="c-green">-> audit_hash sealed locally</span>
+<span class="c-green">-> under 20ms. No network hop.</span></div>
+          <a href="#signup" class="dl-btn">Get API Key and Download Engine</a>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="how-sec" id="how">
+  <div class="how-inner">
+    <span class="sec-eyebrow">How It Works</span>
+    <h2>Four steps.<br><em>Then it runs forever.</em></h2>
+    <p class="sec-sub">From signup to local engine running in under five minutes.</p>
+    <div class="steps">
+      <div class="step"><div class="step-n">01</div><h3>Get your free API key</h3><p>Sign up below. No card. 100 free decisions included. Takes 60 seconds.</p></div>
+      <div class="step"><div class="step-n">02</div><h3>Download the Sebdog Engine</h3><p>One Python file. Download it with your API key. Drop it on your server.</p></div>
+      <div class="step"><div class="step-n">03</div><h3>Run it on your infrastructure</h3><p>One command. Validates your licence locally and starts listening on any port you choose.</p></div>
+      <div class="step"><div class="step-n">04</div><h3>Point your platform at localhost</h3><p>Change one URL in your code. Sub-20ms local compliance decisions forever.</p></div>
+    </div>
+  </div>
+</section>
+
+<section class="pricing-sec">
+  <div class="pricing-inner">
+    <span class="sec-eyebrow">Pricing</span>
+    <h2>Same model.<br><em>Your own engine included.</em></h2>
+    <div class="price-card">
+      <div class="price-big">50p</div>
+      <div class="price-per">per device per month &mdash; billed via stripe</div>
+      <div class="price-includes">
+        <div class="pi">Sebdog Engine file runs on your own server</div>
+        <div class="pi">Full 9-signal scoring algorithm included</div>
+        <div class="pi">SHA-256 local audit chain your database</div>
+        <div class="pi">EU AI Act Articles 9 12 13 14 alignment</div>
+        <div class="pi">100 free decisions to test before you commit</div>
+        <div class="pi">Zero dependencies pure Python standard library</div>
+        <div class="pi">Referral code included earn 10p per device you refer</div>
+      </div>
+      <a href="#signup" class="btn-cyan" style="display:block;text-align:center;padding:14px">Get Free API Key and Engine</a>
+    </div>
+  </div>
+</section>
+
+<section class="signup-sec" id="signup">
+  <div class="signup-inner">
+    <span class="sec-eyebrow">Get Started</span>
+    <h2>Free API key.<br><em>Engine download. Now.</em></h2>
+    <p>Sign up. Get your key. Download the Sebdog Engine. Running in under five minutes.</p>
+    <div class="fg-row">
+      <div class="fg"><label>First Name</label><input type="text" id="fn" placeholder="Justin"></div>
+      <div class="fg"><label>Last Name</label><input type="text" id="ln" placeholder="Smith"></div>
+    </div>
+    <div class="fg"><label>Email Address</label><input type="email" id="em" placeholder="you@company.com"></div>
+    <div class="fg"><label>Phone Number</label><input type="tel" id="ph" placeholder="+44 7700 000000"></div>
+    <div class="fg"><label>Platform or Company Name</label><input type="text" id="org" placeholder="e.g. MyPlatform Ltd"></div>
+    <div class="fg"><label>Estimated Devices</label>
+      <select id="dv">
+        <option value="100">Under 100</option>
+        <option value="500">100 to 500</option>
+        <option value="1000">500 to 1,000</option>
+        <option value="5000">1,000 to 5,000</option>
+        <option value="10000">5,000 to 10,000</option>
+        <option value="50000">10,000 plus</option>
+      </select>
+    </div>
+    <button class="btn-full" onclick="doSignup()">Get Free API Key and Download Engine</button>
+    <div class="msg-err" id="msg-err"></div>
+    <div class="key-box" id="key-box">
+      <div class="key-lbl">Your API Key &mdash; Save This Now</div>
+      <div class="key-val" id="key-val"></div>
+      <div style="font-family:var(--mono);font-size:10px;color:rgba(255,255,255,0.3);margin-top:16px;line-height:1.9;background:rgba(0,212,255,0.05);border:1px solid rgba(0,212,255,0.1);border-radius:4px;padding:12px">
+        Redirecting to Stripe to set up billing&hellip;<br>
+        Engine download unlocks after payment.<br>
+        100 free decisions active now.
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="foot-inner">
+    <a href="https://sebbi.pro" class="foot-logo">Monop <span>Content</span></a>
+    <div class="foot-links">
+      <a href="https://sebbi.pro/#products">All Products</a>
+      <a href="https://sebbi.pro/#signup">AILeash</a>
+      <a href="https://sebbi.pro/#signup">Guardian</a>
+      <a href="https://sebbi.pro/#signup">Sentinel</a>
+      <a href="https://sebbi.pro/scan">Free Scanner</a>
+      <a href="https://sebbi.pro/contact">Contact Justin</a>
+    </div>
+    <div class="foot-copy">&copy; 2026 Monop Content &middot; Justin Antony Dobson &middot; Blyth, Northumberland, UK &middot; justrightdecorators@gmail.com &middot; 07908 269428</div>
+  </div>
+</footer>
 
 <script>
-var REG = { entries: [], filter: 'all', token: null, domain: null };
+// ============================================================
+// SOUND ENGINE — smooth deep man's voice with queue
+// ============================================================
+var soundOn = true;
+var synth = window.speechSynthesis;
+var voices = [];
+var speechQueue = [];
+var isSpeaking = false;
 
-function esc(s){ return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){
-  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+function loadVoices() { voices = synth ? synth.getVoices() : []; }
+if (synth) { synth.onvoiceschanged = loadVoices; loadVoices(); }
 
-function shortDate(iso){ return iso ? String(iso).slice(0,10) : '—'; }
+function toggleSound() {
+  soundOn = !soundOn;
+  document.getElementById('sound-icon').textContent = soundOn ? '\uD83D\uDD0A' : '\uD83D\uDD07';
+  document.getElementById('sound-label').textContent = soundOn ? 'Sound On \u2014 Tap to mute' : 'Sound Off \u2014 Tap to enable';
+  if (!soundOn && synth) { synth.cancel(); speechQueue = []; isSpeaking = false; }
+}
 
-// ---------------------------------------------------------------- load
-function loadRegister(){
-  fetch('/x/register/list').then(function(r){ return r.json(); }).then(function(d){
-    REG.entries = d.entries || [];
-    var passed = REG.entries.filter(function(e){ return e.status === 'checks-passed'; }).length;
-    var live = REG.entries.filter(function(e){
-      return ['unverified','checks-passed','checks-failed','stale'].indexOf(e.status) >= 0; }).length;
-    document.getElementById('stat-listed').textContent = live;
-    document.getElementById('stat-passed').textContent = passed;
-    document.getElementById('foot-suite').textContent = d.suite_version || '—';
+function getVoice() {
+  if (!voices.length) return null;
+  var deepMale = voices.find(function(v){ return /daniel|george|arthur|oliver|thomas/i.test(v.name) && v.lang.startsWith('en'); });
+  var ukMale = voices.find(function(v){ return v.lang === 'en-GB'; });
+  var enAny = voices.find(function(v){ return v.lang.startsWith('en'); });
+  return deepMale || ukMale || enAny || null;
+}
 
-    var cp = d.latest_checkpoint;
-    if (cp) {
-      document.getElementById('stat-events').textContent = cp.tree_size;
-      document.getElementById('ticker-text').textContent =
-        'Register live · ' + live + ' listed · ' + cp.tree_size + ' sealed events · checkpoint ' +
-        shortDate(cp.at) + ' · event root ' + String(cp.event_root).slice(0,16) + '…';
-      if (!document.getElementById('cons-first').value) {
-        document.getElementById('cons-first').value = Math.max(1, cp.tree_size - 1);
-      }
-    } else {
-      document.getElementById('stat-events').textContent = '0';
-      document.getElementById('ticker-text').textContent =
-        'Register live · no checkpoint sealed yet · absence proofs available once the first checkpoint is sealed';
+function processQueue() {
+  if (!soundOn || !synth || speechQueue.length === 0 || isSpeaking) return;
+  isSpeaking = true;
+  var item = speechQueue.shift();
+  var utt = new SpeechSynthesisUtterance(item.text);
+  utt.pitch = 0.65;
+  utt.rate = 0.90;
+  utt.volume = 1.0;
+  var v = getVoice();
+  if (v) utt.voice = v;
+  utt.onend = function() { isSpeaking = false; setTimeout(processQueue, 150); };
+  utt.onerror = function() { isSpeaking = false; setTimeout(processQueue, 150); };
+  synth.speak(utt);
+}
+
+function speak(text) {
+  if (!soundOn || !synth || !text) return;
+  speechQueue.push({ text: text });
+  processQueue();
+}
+
+function speakNow(text) {
+  if (!soundOn || !synth || !text) return;
+  synth.cancel(); speechQueue = []; isSpeaking = false;
+  speechQueue.push({ text: text });
+  processQueue();
+}
+
+// ============================================================
+// TERMINAL
+// ============================================================
+var tb;
+function addLine(id, prompt, html, spoken, delay, pitch, rate) {
+  return new Promise(function(resolve) {
+    setTimeout(function() {
+      var ex = document.getElementById(id);
+      if (ex) ex.remove();
+      var div = document.createElement('div');
+      div.className = 't-line'; div.id = id;
+      div.innerHTML = '<span class="t-prompt">'+prompt+'</span><span class="t-text">'+html+'</span>';
+      tb.appendChild(div);
+      setTimeout(function(){ div.classList.add('show'); if(spoken) speak(spoken, pitch, rate); tb.scrollTop=tb.scrollHeight; }, 30);
+      resolve();
+    }, delay);
+  });
+}
+
+function addSalesLine(id, html, spoken, cssClass, delay) {
+  return new Promise(function(resolve) {
+    setTimeout(function() {
+      var div = document.createElement('div');
+      div.className = 't-sales ' + (cssClass||'t-sales-consumer'); div.id = id;
+      div.innerHTML = html;
+      tb.appendChild(div);
+      setTimeout(function(){ div.classList.add('show'); if(spoken) speak(spoken); tb.scrollTop=tb.scrollHeight; }, 30);
+      resolve();
+    }, delay);
+  });
+}
+
+function addSection(id, label, delay) {
+  return new Promise(function(resolve) {
+    setTimeout(function() {
+      var div = document.createElement('div');
+      div.className = 't-section'; div.id = id;
+      div.textContent = '--- '+label+' ---';
+      tb.appendChild(div);
+      setTimeout(function(){ div.classList.add('show'); tb.scrollTop=tb.scrollHeight; }, 30);
+      resolve();
+    }, delay);
+  });
+}
+
+// ============================================================
+// GEO
+// ============================================================
+async function getGPS() {
+  return new Promise(function(resolve) {
+    if (!navigator.geolocation) { resolve(null); return; }
+    navigator.geolocation.getCurrentPosition(
+      function(p){ resolve({ lat:p.coords.latitude, lng:p.coords.longitude, accuracy:Math.round(p.coords.accuracy) }); },
+      function(){ resolve(null); },
+      { timeout:6000, maximumAge:60000 }
+    );
+  });
+}
+
+async function reverseGeocode(lat, lng) {
+  try {
+    var r = await fetch('https://nominatim.openstreetmap.org/reverse?lat='+lat+'&lon='+lng+'&format=json');
+    var d = await r.json();
+    if (d && d.address) {
+      var a = d.address;
+      var town = a.town||a.city||a.village||a.hamlet||a.county||'';
+      var county = a.county||a.state_district||'';
+      var country = a.country||'';
+      return { town:town, county:county, country:country, display:[town,county,country].filter(Boolean).join(', ') };
     }
-    renderRegistry();
-  }).catch(function(){
-    document.getElementById('ticker-text').textContent = 'Register unreachable — try /x/register/list directly';
-    document.getElementById('registry-tbody').innerHTML =
-      '<tr><td colspan="5" style="padding:32px;text-align:center;color:var(--red);font-family:var(--mono);font-size:12px">Could not reach /x/register/list</td></tr>';
-    document.getElementById('registry-count').textContent = '—';
-  });
+  } catch(e) {}
+  return null;
 }
 
-// ---------------------------------------------------------------- table
-function setFilter(f, btn){
-  REG.filter = f;
-  var tabs = document.querySelectorAll('.filter-tab');
-  for (var i=0;i<tabs.length;i++) tabs[i].classList.remove('active');
-  btn.classList.add('active');
-  renderRegistry();
+async function getIPGeo() {
+  var r = { city:'Unknown', country:'Unknown', countryCode:'??', region:'Unknown', isp:'Unknown', ip:'Unknown' };
+  try {
+    var res = await fetch('https://ipapi.co/json/');
+    var d = await res.json();
+    if (d&&d.ip&&!d.error) { r.ip=d.ip; r.city=d.city||'Unknown'; r.region=d.region||''; r.country=d.country_name||'Unknown'; r.countryCode=d.country_code||'??'; r.isp=d.org||'Unknown'; return r; }
+  } catch(e) {}
+  try {
+    var res2 = await fetch('https://ip-api.com/json/?fields=status,city,country,countryCode,regionName,isp,query');
+    var d2 = await res2.json();
+    if (d2&&d2.status==='success') { r.ip=d2.query; r.city=d2.city||'Unknown'; r.region=d2.regionName||''; r.country=d2.country||'Unknown'; r.countryCode=d2.countryCode||'??'; r.isp=d2.isp||'Unknown'; }
+  } catch(e) {}
+  return r;
 }
 
-function renderRegistry(){
-  var search = (document.getElementById('search-input').value || '').toLowerCase();
-  var f = REG.filter;
-  var rows = REG.entries.filter(function(e){
-    if (search && e.domain.indexOf(search) < 0) return false;
-    if (f === 'all') return true;
-    if (f === 'gone') return e.status === 'withdrawn' || e.status === 'revoked';
-    return e.status === f;
-  });
+// ============================================================
+// CATEGORISE VISITOR
+// ============================================================
+function categorise(ua, isp, hour, isMobile, connType) {
+  var ispL = isp.toLowerCase();
+  var uaL = ua.toLowerCase();
+  if (ispL.includes('police')||ispL.includes('gov')||ispL.includes('nhs')||ispL.includes('council')||ispL.includes('home office')) {
+    return 'lawenforcement';
+  }
+  if (!isMobile && hour>=8 && hour<=18 && (ispL.includes('business')||ispL.includes('enterprise')||ispL.includes('bt')||ispL.includes('virgin')||ispL.includes('vodafone')||ispL.includes('talktalk'))) {
+    return 'callcentre';
+  }
+  if ((uaL.includes('linux')||uaL.includes('x11')) && !isMobile) { return 'developer'; }
+  if (!isMobile && (uaL.includes('firefox')||uaL.includes('chrome')) && hour>=9 && hour<=17) { return 'enterprise'; }
+  return 'consumer';
+}
 
-  document.getElementById('registry-count').textContent =
-    rows.length + ' entr' + (rows.length === 1 ? 'y' : 'ies');
+var SALES = {
+  enterprise: {
+    badge: 'Enterprise — Compliance Officer Detected',
+    badgeClass: 'cat-enterprise',
+    lines: [
+      { html: '<span class="t-gold">We just scanned you. Your AI may not be doing this for your users. Every one without it is a blind spot.</span>', spoken: 'We just scanned you. Your AI may not be doing this for your users. Every one without it is a blind spot.' },
+      { html: 'EU AI Act enforcement is coming for high-risk systems. Article 12 calls for a tamper-evident audit chain for AI decisions that affect a person. <span class="t-gold">A standard log file your own team can edit does not satisfy that. You need a SHA-256 Merkle chain. You need AILeash.</span>', spoken: 'EU AI Act enforcement is coming for high-risk systems. Article 12 calls for a tamper-evident audit chain. A log file your team can edit will not satisfy that. You need AILeash.' },
+      { html: '<span class="t-gold">When a regulator asks, you have two choices. Show them years of cryptographic proof. Or show them nothing.</span> Organisations that build this in now will have that history. The ones that wait will not.', spoken: 'When a regulator asks, you have two choices. Show them years of cryptographic proof. Or show them nothing. Organisations that build this in now will have that history.' },
+      { html: 'EU AI Act Articles 9, 12, 13 and 14. <span class="t-gold">AILeash is built around all four. From 50 pence per device per month. Not fifty thousand pounds a year. Fifty pence per device.</span>', spoken: 'EU AI Act Articles 9, 12, 13 and 14. AILeash is built around all four. From fifty pence per device per month.' }
+    ],
+    css: 't-sales-enterprise'
+  },
+  callcentre: {
+    badge: 'Call Centre — Business Network Detected',
+    badgeClass: 'cat-callcentre',
+    lines: [
+      { html: '<span class="t-green">Before your agent picks up the phone, AILeash can already score the caller. Device. Location signals. Velocity. Behaviour pattern. Trust index.</span>', spoken: 'Before your agent picks up the phone, AILeash can already score the caller. Device. Location signals. Velocity. Behaviour pattern. Trust index.' },
+      { html: 'Your agents can see the risk score the moment the call connects. <span class="t-green">Fraud flagged early. Account takeovers caught faster. Every decision sealed into a tamper-proof audit chain.</span>', spoken: 'Your agents can see the risk score the moment the call connects. Fraud flagged early. Every decision sealed into a tamper-proof audit chain.' },
+      { html: '<span class="t-green">That audit chain is tamper-evident by design. If a caller later disputes a decision, you have a cryptographic record of exactly what the system knew and decided at that moment.</span>', spoken: 'That audit chain is tamper-evident by design. If a caller later disputes a decision, you have a cryptographic record of what the system knew and decided.' },
+      { html: '<span class="t-green">Fifty pence per device per month.</span> Contact Justin at Monop Content for volume pricing.', spoken: 'Fifty pence per device per month. Contact Justin at Monop Content for volume pricing.' }
+    ],
+    css: 't-sales-callcentre'
+  },
+  developer: {
+    badge: 'Developer — Technical User Detected',
+    badgeClass: 'cat-developer',
+    lines: [
+      { html: '<span class="t-cyan">One Python file. Zero dependencies. Pure standard library. Runs anywhere Python runs. No pip install. No framework. No bloat.</span>', spoken: 'One Python file. Zero dependencies. Pure standard library. Runs anywhere Python runs. No pip install. No framework. No bloat.' },
+      { html: 'Drop sebdog underscore engine dot py on your server. Point your platform at localhost. <span class="t-cyan">Sub-20 millisecond compliance decisions. SHA-256 Merkle audit chain built locally. No external calls on the hot path.</span>', spoken: 'Drop the Sebdog engine on your server. Point your platform at localhost. Sub 20 millisecond compliance decisions. SHA-256 Merkle audit chain built locally.' },
+      { html: '<span class="t-cyan">Built around the EU AI Act, the Online Safety Act, and the ICO Childrens Code.</span> One hundred free decisions. No credit card. Get the engine now.', spoken: 'Built around the EU AI Act, the Online Safety Act, and the ICO Childrens Code. Get the engine now.' }
+    ],
+    css: 't-sales-developer'
+  },
+  lawenforcement: {
+    badge: 'Public Sector — Government Network Detected',
+    badgeClass: 'cat-lawenforcement',
+    lines: [
+      { html: '<span class="t-purple">Every interaction. Every decision. Every override. Every timestamp. Sealed into a cryptographic chain nobody can alter without it being detectable. Not even the operator.</span>', spoken: 'Every interaction. Every decision. Every override. Every timestamp. Sealed into a cryptographic chain nobody can alter without it being detectable.' },
+      { html: 'SHA-256 Merkle chain. <span class="t-purple">Each block contains the event, the decision, the timestamp, and the hash of the block before it. Alter any record and the chain visibly breaks.</span>', spoken: 'SHA-256 Merkle chain. Each block contains the event, the decision, the timestamp, and the hash of the block before it. Alter any record and the chain visibly breaks.' },
+      { html: 'Velocity monitoring. Trust decay scoring. <span class="t-purple">Every BLOCK or CHALLENGE comes with a plain-language reason list.</span>', spoken: 'Velocity monitoring. Trust decay scoring. Every block or challenge comes with a plain language reason list.' }
+    ],
+    css: 't-sales-law'
+  },
+  consumer: {
+    badge: 'Visitor — Session Identified',
+    badgeClass: 'cat-consumer',
+    lines: [
+      { html: 'We just scanned you the way your bank or insurer arguably should be. <span class="t-dim">Most platforms making decisions about people are not doing this yet.</span>', spoken: 'We just scanned you the way your bank or insurer arguably should be. Most platforms making decisions about people are not doing this yet.' },
+      { html: 'If you run a platform that uses AI to make decisions about people, <span class="t-cyan">what you just experienced is close to what a regulator will expect. From 50 pence per device per month.</span>', spoken: 'If you run a platform that uses AI to make decisions about people, what you just experienced is close to what a regulator will expect. From fifty pence per device per month.' }
+    ],
+    css: 't-sales-consumer'
+  }
+};
 
-  var tbody = document.getElementById('registry-tbody');
-  if (!rows.length){
-    tbody.innerHTML = '<tr><td colspan="5" style="padding:32px;text-align:center;color:var(--muted);font-family:var(--mono);font-size:12px">Nothing matches this filter. You can still prove a domain\'s absence above.</td></tr>';
+// ============================================================
+// REAL GOVERNANCE CALL
+//
+// FIXED: this used to POST to /api/govern, which requires a
+// bearer API key and returns 401 api_key_required to a visitor.
+// Every scan failed at the last step. The demo module exists
+// exactly for this - no key on any route - so the call now goes
+// to /x/demo/govern. /api/govern is kept as a second attempt in
+// case a key is ever added to this page.
+//
+// Response fields are read defensively: whichever names the
+// module returns, the terminal narrates them. Nothing is
+// invented in the browser - if the engine cannot be reached,
+// the page says so instead of showing a made-up verdict.
+// ============================================================
+var ENGINE_ENDPOINTS = [
+  'https://sebbi.pro/x/demo/govern',
+  'https://sebbi.pro/api/govern'
+];
+
+function pick(obj, names, fallback) {
+  for (var i = 0; i < names.length; i++) {
+    var v = obj[names[i]];
+    if (v !== undefined && v !== null && v !== '') return v;
+  }
+  return fallback;
+}
+
+function normalise(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  var body = raw;
+  // Some modules wrap the verdict in result / decision / verdict.
+  if (raw.result && typeof raw.result === 'object') body = raw.result;
+  else if (raw.verdict && typeof raw.verdict === 'object') body = raw.verdict;
+  else if (raw.decision && typeof raw.decision === 'object') body = raw.decision;
+
+  var decision = pick(body, ['decision','verdict','outcome','action'], null);
+  if (decision === null) decision = pick(raw, ['decision','verdict','outcome','action'], null);
+  if (decision === null) return null;
+  decision = String(decision).toUpperCase();
+
+  var score = pick(body, ['score','risk_score','risk'], pick(raw, ['score','risk_score','risk'], null));
+  var trust = pick(body, ['trust','trust_index','trust_score'], pick(raw, ['trust','trust_index','trust_score'], null));
+  var hash  = pick(body, ['audit_hash','hash','receipt','receipt_hash','block_hash'],
+                   pick(raw, ['audit_hash','hash','receipt','receipt_hash','block_hash'], null));
+  var ver   = pick(body, ['version','engine_version','engine'], pick(raw, ['version','engine_version','engine'], 'live'));
+
+  var reasons = pick(body, ['reasons','signals','flags','findings'], pick(raw, ['reasons','signals','flags','findings'], []));
+  if (!Array.isArray(reasons)) reasons = reasons ? [String(reasons)] : [];
+  reasons = reasons.map(function(x){ return typeof x === 'string' ? x : (x && x.name) ? x.name : String(x); });
+
+  return {
+    decision: decision,
+    score: (score === null ? 'n/a' : score),
+    trust: (trust === null ? 'n/a' : trust),
+    audit_hash: hash,
+    version: ver,
+    reasons: reasons
+  };
+}
+
+async function callRealEngine(signals) {
+  var event = {
+    user_id: 'sonicboom_'+Math.random().toString(36).slice(2,10),
+    action: 'sonicboom_scan',
+    amount: 0,
+    country: signals.countryCode || 'GB',
+    country_shift: 0,
+    device_id: (signals.deviceType||'device')+'_'+(signals.os||'unknown'),
+    device_risk: signals.deviceRisk,
+    anomaly: signals.anomaly,
+    trust: 0.5,
+    v60: 1,
+    v5m: 1,
+    v1h: 1
+  };
+  // Sent both flat and wrapped, so whichever shape the route
+  // expects, it finds what it needs. Extra keys are ignored.
+  var payload = JSON.stringify(Object.assign({}, event, { inputs: event }));
+
+  var lastErr = null;
+  for (var i = 0; i < ENGINE_ENDPOINTS.length; i++) {
+    try {
+      var res = await fetch(ENGINE_ENDPOINTS[i], {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: payload
+      });
+      var data = await res.json();
+      if (!res.ok || data.error) { lastErr = new Error(data.error || ('http_'+res.status)); continue; }
+      var out = normalise(data);
+      if (out) return out;
+      lastErr = new Error('unrecognised_response');
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw (lastErr || new Error('engine_unreachable'));
+}
+
+// ============================================================
+// MAIN SCAN
+// ============================================================
+async function runScan() {
+  tb = document.getElementById('terminal-body');
+  var ts = Date.now();
+  var ua = navigator.userAgent;
+  var lang = navigator.language||'en';
+  var langNames = {'en':'English','en-GB':'English','en-US':'English','fr':'French','de':'German','es':'Spanish','pt':'Portuguese','nl':'Dutch','it':'Italian','pl':'Polish','ru':'Russian','zh':'Chinese','ja':'Japanese','ko':'Korean','ar':'Arabic'};
+  var langFull = langNames[lang]||lang;
+  var sw = window.screen.width, sh = window.screen.height;
+  var dpr = window.devicePixelRatio||1;
+  var tz = Intl.DateTimeFormat().resolvedOptions().timeZone||'Unknown';
+  var now = new Date();
+  var localTime = now.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit',hour12:false});
+  var hour = now.getHours();
+  var firstVisit = !localStorage.getItem('sb_visit');
+  if(firstVisit) localStorage.setItem('sb_visit',ts);
+  var visitCount = parseInt(localStorage.getItem('sb_count')||'0')+1;
+  localStorage.setItem('sb_count',visitCount);
+  var isMobile = /Mobile|Android|iPhone|iPad/i.test(ua);
+  var isTablet = /iPad|Tablet/i.test(ua);
+  var deviceType = isTablet?'Tablet':isMobile?'Mobile':'Desktop';
+  var browser='Unknown', bv='';
+  var em=ua.match(/Edg\/([\d]+)/),cm=ua.match(/Chrome\/([\d]+)/),fm=ua.match(/Firefox\/([\d]+)/),sm=ua.match(/Version\/([\d]+).*Safari/);
+  if(em){browser='Edge';bv=em[1];}else if(cm&&!/Edge/i.test(ua)){browser='Chrome';bv=cm[1];}else if(fm){browser='Firefox';bv=fm[1];}else if(sm){browser='Safari';bv=sm[1];}
+  var os='Unknown',ov='';
+  var am=ua.match(/Android ([\d.]+)/),im=ua.match(/OS ([\d_]+)/),wm=ua.match(/Windows NT ([\d.]+)/);
+  var wmap={'10.0':'10 or 11','6.3':'8.1','6.2':'8','6.1':'7'};
+  if(am){os='Android';ov=am[1];}else if(/iPhone|iPad/.test(ua)&&im){os='iOS';ov=im[1].replace(/_/g,'.');}else if(wm){os='Windows';ov=wmap[wm[1]]||wm[1];}else if(/Mac/i.test(ua)){os='macOS';}else if(/Linux/i.test(ua)){os='Linux';}
+  var cpuCores=navigator.hardwareConcurrency||null;
+  var ram=navigator.deviceMemory||null;
+  var touchPoints=navigator.maxTouchPoints||0;
+  var dnt=navigator.doNotTrack==='1'||window.doNotTrack==='1';
+  var referrer=document.referrer, refHost='';
+  if(referrer){try{refHost=new URL(referrer).hostname.replace('www.','');}catch(e){}}
+  var hasAdBlocker=false;
+  try{var at=document.createElement('div');at.className='adsbox pub_300x250';at.style.cssText='width:1px;height:1px;position:absolute;left:-9999px;';document.body.appendChild(at);hasAdBlocker=at.offsetHeight===0;document.body.removeChild(at);}catch(e){}
+  var battery=null,charging=null;
+  try{if(navigator.getBattery){var b=await navigator.getBattery();battery=Math.round(b.level*100);charging=b.charging;}}catch(e){}
+  var connType=null,connSpeed=null;
+  try{var conn=navigator.connection||navigator.mozConnection||navigator.webkitConnection;if(conn){connType=conn.effectiveType||conn.type||null;connSpeed=conn.downlink||null;}}catch(e){}
+
+  var gpsPromise=getGPS();
+  var ipGeoPromise=getIPGeo();
+
+  var delay=0, step=280, P=1.9, R=1.1;
+
+  setTimeout(function(){
+    speakNow('Welcome to sebbi dot pro. This is the AILeash engine, built by Monop Content in Blyth, United Kingdom. I have been scanning your session since the moment you arrived.');
+  }, 600);
+
+  await addLine('tl-intro','>', '<span class="t-dim">Hello. Welcome to sebbi.pro. This is the AILeash Engine, built by Monop Content, Blyth, UK.</span>', null, delay); delay+=step;
+  await addLine('tl-intro2','>', '<span class="t-dim">I have been scanning your session since the moment you arrived. Here is what I found.</span>', null, delay); delay+=step*1.2;
+
+  await addSection('sec-device','Device Intelligence', delay); delay+=200;
+  await addLine('tl-dev','>','Device: <span class="t-cyan">'+deviceType+' &mdash; '+os+(ov?' '+ov:'')+' &mdash; '+browser+(bv?' '+bv:'')+'</span>', deviceType+'. '+os+'. '+browser+'.', delay, P, R); delay+=step;
+  await addLine('tl-screen','>','Display: <span class="t-cyan">'+sw+' by '+sh+(dpr>1?' &mdash; Retina '+dpr+'x':' &mdash; Standard resolution')+'</span>', sw+' by '+sh+' display.', delay, P, R); delay+=step;
+  if(cpuCores){ await addLine('tl-cpu','>','Processor: <span class="t-cyan">'+cpuCores+' CPU core'+(cpuCores>1?'s':'')+' detected</span>', cpuCores+' CPU cores detected.', delay, P, R); delay+=step; }
+  if(ram){ await addLine('tl-ram','>','Memory: <span class="t-cyan">'+ram+' gigabyte'+(ram>1?'s':'')+' RAM</span>', ram+' gigabytes of RAM.', delay, P, R); delay+=step; }
+  await addLine('tl-touch','>',touchPoints>0?'Input: <span class="t-cyan">Touchscreen &mdash; '+touchPoints+' touch points</span>':'Input: <span class="t-dim">Mouse and keyboard &mdash; no touchscreen</span>', touchPoints>0?'Touchscreen. '+touchPoints+' touch points.':'Mouse and keyboard.', delay, P, R); delay+=step;
+  if(battery!==null){
+    var bd=battery+'%'+(charging?' &mdash; charging':battery<20?' &mdash; low battery':'');
+    var bs=battery+' percent battery'+(charging?'. Charging.':battery<20?'. Battery is low.':'.');
+    await addLine('tl-bat','>','Power: <span class="t-cyan">'+bd+'</span>', bs, delay, P, R); delay+=step;
+  }
+  if(connType){
+    var ct=connType.toUpperCase()+(connSpeed?' &mdash; '+connSpeed+' Mbps':'');
+    await addLine('tl-conn','>','Connection: <span class="t-cyan">'+ct+'</span>', connType.toUpperCase()+' connection.', delay, P, R); delay+=step;
+  }
+
+  await addSection('sec-identity','Session Identity', delay); delay+=200;
+  await addLine('tl-time','>','Local time: <span class="t-cyan">'+localTime+' &mdash; '+tz+'</span>', 'Local time '+localTime+'.', delay, P, R); delay+=step;
+  await addLine('tl-lang','>','Language: <span class="t-cyan">'+langFull+'</span>', 'Language: '+langFull+'.', delay, P, R); delay+=step;
+  if(dnt){ await addLine('tl-dnt','>','<span class="t-gold">Do Not Track enabled &mdash; privacy-conscious user</span>','Do Not Track is enabled.',delay,P,R); delay+=step; }
+  if(hasAdBlocker){ await addLine('tl-adb','>','<span class="t-gold">Ad blocker active &mdash; privacy tools detected</span>','Ad blocker detected.',delay,P,R); delay+=step; }
+  if(refHost){ await addLine('tl-ref','>','Arrived from: <span class="t-cyan">'+refHost+'</span>','You arrived from '+refHost+'.',delay,P,R); delay+=step; }
+  await addLine('tl-visit','>',firstVisit?'<span class="t-gold">First visit &mdash; no prior session history on this device</span>':'<span class="t-dim">Visit number '+visitCount+' &mdash; returning visitor</span>', firstVisit?'This is your first visit.':'This is visit number '+visitCount+'. Welcome back.', delay, P, R); delay+=step;
+
+  await addSection('sec-network','Network Location', delay); delay+=200;
+  await addLine('tl-geoload','>','<span class="t-dim">Resolving your approximate location&hellip;</span>','Resolving your approximate location.',delay,P,R); delay+=step;
+
+  var gps=await gpsPromise;
+  var ipGeo=await ipGeoPromise;
+  var locDisplay='', locSpoken='';
+
+  if(gps){
+    var rev=await reverseGeocode(gps.lat,gps.lng);
+    if(rev&&rev.display){ locDisplay=rev.display+' &mdash; GPS accurate to '+gps.accuracy+'m'; locSpoken='You are in '+rev.display+'. GPS accurate to '+gps.accuracy+' metres.'; }
+    else { locDisplay=gps.lat.toFixed(4)+', '+gps.lng.toFixed(4); locSpoken='Location confirmed by G.P.S.'; }
+    await addLine('tl-gps','>','<span class="t-green">GPS confirmed: </span><span class="t-cyan">'+locDisplay+'</span>',locSpoken,delay,P,R); delay+=step;
+  } else {
+    locDisplay=(ipGeo.city!=='Unknown'?ipGeo.city+(ipGeo.region?', '+ipGeo.region:'')+ ' &mdash; ':'')+ipGeo.country;
+    locSpoken='Location: '+(ipGeo.city!=='Unknown'?ipGeo.city+'. ':'')+ipGeo.country+'.';
+    await addLine('tl-loc','>','Location: <span class="t-cyan">'+locDisplay+'</span>',locSpoken,delay,P,R); delay+=step;
+  }
+  await addLine('tl-ip','>','IP address: <span class="t-cyan">'+ipGeo.ip+'</span>','I.P. address: '+ipGeo.ip+'.',delay,P,R); delay+=step;
+  await addLine('tl-isp','>','Network provider: <span class="t-cyan">'+ipGeo.isp+'</span>','Network provider: '+ipGeo.isp+'.',delay,P,R); delay+=step;
+
+  var cat=categorise(ua, ipGeo.isp, hour, isMobile, connType);
+  var salesData=SALES[cat];
+  var badge=document.getElementById('category-badge');
+  badge.textContent=salesData.badge;
+  badge.className='category-badge '+salesData.badgeClass;
+  badge.classList.add('show');
+
+  await addSection('sec-sales','AILeash &mdash; What This Means For You', delay); delay+=200;
+  for(var i=0;i<salesData.lines.length;i++){
+    await addSalesLine('tl-sales'+i, salesData.lines[i].html, salesData.lines[i].spoken, salesData.css, delay);
+    delay+=step*1.4;
+  }
+
+  await addSection('sec-scoring','Live Governance Engine', delay); delay+=200;
+  await addLine('tl-scoring','>','<span class="t-dim">Sending real signals to the live 9-signal governance engine&hellip;</span>','Sending real signals to the live governance engine.',delay,P,R); delay+=step*1.4;
+
+  // Build REAL signals from what was actually detected — no invented values.
+  var anomaly=0.05;
+  if(hasAdBlocker) anomaly+=0.05;
+  if(dnt) anomaly+=0.05;
+  if(visitCount>8) anomaly+=0.10;
+  anomaly=Math.min(anomaly,1);
+  var deviceRisk=(battery!==null && battery<15 && !charging) ? 0.2 : 0.05;
+
+  var engineResult=null, engineError=null;
+  try{
+    engineResult = await callRealEngine({
+      countryCode: ipGeo.countryCode!=='??' ? ipGeo.countryCode : 'GB',
+      deviceType: deviceType,
+      os: os,
+      anomaly: anomaly,
+      deviceRisk: deviceRisk
+    });
+  }catch(e){
+    engineError = e;
+  }
+
+  if(engineError || !engineResult){
+    await addLine('tl-err','>','<span class="t-red">Could not reach the live engine just now &mdash; showing an honest error, not a fallback result.</span>','Could not reach the live engine just now.',delay,P,R); delay+=step;
     return;
   }
 
-  tbody.innerHTML = rows.map(function(e){
-    var cls = 'status-pending', icon = 'domain-unverified', ic = '~';
-    if (e.status === 'checks-passed'){ cls='status-verified'; icon='domain-verified'; ic='✓'; }
-    else if (e.status === 'checks-failed'){ cls='status-bad'; icon='domain-unverified'; ic='!'; }
-    else if (e.status === 'withdrawn' || e.status === 'revoked'){ cls='status-pending'; icon='domain-gone'; ic='×'; }
-
-    var failed = (e.failed_checks || []);
-    var flags = failed.length
-      ? failed.map(function(x){ return '<span class="reg-flag reg-flag-bad">'+esc(x)+'</span>'; }).join('')
-      : (e.status === 'checks-passed' ? '<span class="reg-flag">all checks passed</span>' : '<span class="reg-flag">—</span>');
-    if (e.reason) flags += '<span class="reg-flag reg-flag-bad">'+esc(e.reason)+'</span>';
-
-    return '<tr>'
-      + '<td><div class="domain-cell"><div class="'+icon+'">'+ic+'</div>'
-      +   '<a href="/x/register/entry?domain='+encodeURIComponent(e.domain)+'" style="color:inherit;text-decoration:none">'+esc(e.domain)+'</a></div></td>'
-      + '<td><span class="status-badge '+cls+'" title="'+esc(e.status_means||'')+'">'+esc(e.status.toUpperCase())+'</span></td>'
-      + '<td><div class="reg-flags">'+flags+'</div></td>'
-      + '<td class="hash-cell">'+shortDate(e.last_checked)+'</td>'
-      + '<td style="font-family:var(--mono);font-size:11px;color:var(--muted)">'+shortDate(e.first_listed)+'</td>'
-      + '</tr>';
-  }).join('');
-}
-
-// ---------------------------------------------------------------- proofs
-function runAbsence(){
-  var d = (document.getElementById('absence-domain').value || '').trim().toLowerCase();
-  var at = (document.getElementById('absence-date').value || '').trim();
-  var out = document.getElementById('absence-out');
-  if (!d){ out.className='proof-out show'; out.innerHTML='<span class="proof-verdict verdict-err">Enter a domain.</span>'; return; }
-
-  out.className = 'proof-out show';
-  out.textContent = 'Checking…';
-
-  var url = '/x/register/absence?domain=' + encodeURIComponent(d) + (at ? '&at=' + encodeURIComponent(at) : '');
-  fetch(url).then(function(r){ return r.json(); }).then(function(j){
-    if (j.error){
-      out.innerHTML = '<span class="proof-verdict verdict-err">' + esc(j.error) + '</span>'
-        + esc(JSON.stringify(j, null, 2));
-      return;
-    }
-    var head = j.present
-      ? '<span class="proof-verdict verdict-present">LISTED at the checkpoint shown — inclusion proof below</span>'
-      : '<span class="proof-verdict verdict-absent">NOT LISTED — absence proof below</span>';
-    out.innerHTML = head + esc(j.proves || '') + '\n\n' + esc(JSON.stringify(j, null, 2));
-  }).catch(function(){
-    out.innerHTML = '<span class="proof-verdict verdict-err">Request failed.</span>';
-  });
-}
-
-function runConsistency(){
-  var first = (document.getElementById('cons-first').value || '').trim();
-  var out = document.getElementById('cons-out');
-  if (!first){ out.className='proof-out show'; out.innerHTML='<span class="proof-verdict verdict-err">Enter a tree size.</span>'; return; }
-  out.className = 'proof-out show';
-  out.textContent = 'Building proof…';
-  fetch('/x/register/consistency?first=' + encodeURIComponent(first)).then(function(r){ return r.json(); }).then(function(j){
-    if (j.error){
-      out.innerHTML = '<span class="proof-verdict verdict-err">' + esc(j.error) + '</span>' + esc(JSON.stringify(j,null,2));
-      return;
-    }
-    out.innerHTML = '<span class="proof-verdict verdict-absent">APPEND-ONLY PROOF</span>'
-      + esc(j.proves || '') + '\n\n' + esc(JSON.stringify(j, null, 2));
-  }).catch(function(){
-    out.innerHTML = '<span class="proof-verdict verdict-err">Request failed.</span>';
-  });
-}
-
-// ---------------------------------------------------------------- join
-function getChallenge(){
-  var d = (document.getElementById('apply-domain').value || '').trim().toLowerCase();
-  var res = document.getElementById('apply-result');
-  if (!d){ res.className='apply-result show'; res.textContent='Enter a domain.'; return; }
-
-  var btn = document.getElementById('challenge-btn');
-  btn.disabled = true; btn.textContent = 'Requesting…';
-
-  fetch('/x/register/challenge', {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({domain: d})
-  }).then(function(r){ return r.json(); }).then(function(j){
-    btn.disabled = false; btn.textContent = 'Request token →';
-    if (j.error){
-      res.className='apply-result show';
-      res.textContent = j.error + (j.detail ? '\n\n' + j.detail : '') + '\n\n' + JSON.stringify(j, null, 2);
-      return;
-    }
-    REG.token = j.token; REG.domain = j.domain;
-    document.getElementById('token-box').textContent = j.token;
-    document.getElementById('token-note').innerHTML =
-      'Serve that exact string at <strong>https://' + esc(j.domain) + '/.well-known/aileash-register.txt</strong><br>'
-      + 'or add the line <strong>Register-Token: ' + esc(j.token) + '</strong> to <strong>https://' + esc(j.domain) + '/ai.txt</strong><br><br>'
-      + 'Expires ' + esc(j.expires_at) + '. Only the token\'s digest is sealed, never the token itself.';
-    document.getElementById('apply-panel').classList.add('show');
-    res.className = 'apply-result';
-  }).catch(function(){
-    btn.disabled = false; btn.textContent = 'Request token →';
-    res.className='apply-result show'; res.textContent = 'Request failed.';
-  });
-}
-
-function doClaim(){
-  var res = document.getElementById('apply-result');
-  var btn = document.getElementById('claim-btn');
-  if (!REG.domain){ res.className='apply-result show'; res.textContent='Request a token first.'; return; }
-  btn.disabled = true; btn.textContent = 'Fetching your token and running checks…';
-
-  fetch('/x/register/claim', {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({domain: REG.domain})
-  }).then(function(r){ return r.json(); }).then(function(j){
-    btn.disabled = false; btn.textContent = "I've served it — claim my listing →";
-    res.className = 'apply-result show';
-    if (!j.ok){
-      res.textContent = (j.error || 'Claim refused') + '\n\n' + JSON.stringify(j, null, 2);
-      return;
-    }
-    res.textContent = 'Listed as ' + j.status + '.\n' + (j.status_means || '')
-      + '\n\nSealed: ' + (j.sealed && j.sealed.audit_hash ? j.sealed.audit_hash : '—')
-      + '\n\n' + JSON.stringify(j.checks, null, 2);
-    loadRegister();
-  }).catch(function(){
-    btn.disabled = false; btn.textContent = "I've served it — claim my listing →";
-    res.className='apply-result show'; res.textContent = 'Request failed.';
-  });
-}
-
-loadRegister();
-</script>
-
-</body>
-</html>
-
-```
-
-
-## `report-threat.html`
-
-272 lines, 14806 bytes
-
-```html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>AILeash Guardian &mdash; Report a Threat</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0a0f1e;color:#fff;min-height:100vh;padding:24px;max-width:600px;margin:0 auto}
-.logo{font-size:22px;font-weight:900;text-align:center;margin-bottom:4px}.logo span{color:#c9a84c}
-.sub{font-family:monospace;font-size:10px;color:rgba(255,255,255,0.3);letter-spacing:2px;text-transform:uppercase;text-align:center;margin-bottom:8px}
-
-.nav-links{display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-bottom:28px}
-.nav-links a{font-family:monospace;font-size:10px;color:rgba(255,255,255,0.4);text-decoration:none;padding:5px 10px;border:1px solid rgba(255,255,255,0.1);border-radius:4px;letter-spacing:1px;text-transform:uppercase;transition:all .2s}
-.nav-links a:hover{color:#c9a84c;border-color:rgba(201,168,76,0.4)}
-
-.intro{background:rgba(201,168,76,0.06);border:1px solid rgba(201,168,76,0.2);border-radius:8px;padding:18px;margin-bottom:20px;font-size:13px;color:rgba(255,255,255,0.7);line-height:1.75}
-.intro strong{color:#c9a84c;display:block;margin-bottom:6px;font-size:14px}
-
-.card{background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:20px;margin-bottom:16px}
-.card-title{font-family:monospace;font-size:10px;color:#c9a84c;letter-spacing:2px;text-transform:uppercase;margin-bottom:4px}
-.card-desc{font-size:12px;color:rgba(255,255,255,0.4);margin-bottom:14px;line-height:1.6}
-
-.field{margin-bottom:12px}
-.field label{display:block;font-family:monospace;font-size:10px;color:rgba(255,255,255,0.4);letter-spacing:1px;text-transform:uppercase;margin-bottom:6px}
-.field input,.field textarea,.field select{width:100%;background:rgba(255,255,255,0.07);border:1px solid rgba(255,255,255,0.12);color:#fff;padding:12px 14px;font-size:14px;border-radius:6px;outline:none;font-family:inherit;transition:border-color .2s}
-.field input:focus,.field textarea:focus,.field select:focus{border-color:rgba(201,168,76,0.5)}
-.field textarea{height:100px;resize:vertical}
-.field input::placeholder,.field textarea::placeholder{color:rgba(255,255,255,0.25)}
-.field select option{background:#0a0f1e}
-
-.evidence-label{font-family:monospace;font-size:9px;color:#ff6b6b;letter-spacing:2px;text-transform:uppercase;margin-bottom:6px;margin-top:10px}
-.evidence-box{background:rgba(0,0,0,0.3);border:1px solid rgba(255,107,107,0.2);border-radius:6px;padding:12px;font-family:monospace;font-size:11px;color:rgba(255,255,255,0.6);line-height:1.8;word-break:break-all;margin-bottom:4px}
-
-.severity{display:inline-block;padding:4px 12px;border-radius:4px;font-family:monospace;font-size:11px;font-weight:700;letter-spacing:1px;text-transform:uppercase;margin:10px 0}
-.sev-critical{background:rgba(204,0,0,0.2);border:1px solid rgba(204,0,0,0.4);color:#ff6b6b}
-.sev-high{background:rgba(201,168,76,0.2);border:1px solid rgba(201,168,76,0.4);color:#c9a84c}
-
-.steps{margin-bottom:0}
-.step{display:flex;gap:12px;align-items:flex-start;margin-bottom:16px;padding-bottom:16px;border-bottom:1px solid rgba(255,255,255,0.06)}
-.step:last-child{border-bottom:none;margin-bottom:0;padding-bottom:0}
-.step-n{background:#c9a84c;color:#0a0f1e;width:26px;height:26px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:900;font-size:12px;flex-shrink:0;margin-top:2px}
-.step-text{font-size:13px;color:rgba(255,255,255,0.6);line-height:1.65}
-.step-text strong{color:#fff;display:block;margin-bottom:3px;font-size:14px}
-.step-text a{color:#c9a84c;text-decoration:none}
-
-.btn{width:100%;padding:15px;border:none;border-radius:8px;font-size:15px;font-weight:700;cursor:pointer;margin-bottom:10px;font-family:inherit;transition:all .2s;text-align:center;text-decoration:none;display:block}
-.btn-red{background:#cc0000;color:#fff}.btn-red:hover{background:#aa0000}
-.btn-blue{background:#1a4fa0;color:#fff}.btn-blue:hover{background:#153d80}
-.btn-purple{background:#6b21a8;color:#fff}.btn-purple:hover{background:#581c87}
-.btn-ghost{background:rgba(255,255,255,0.06);color:rgba(255,255,255,0.6);border:1px solid rgba(255,255,255,0.12)}.btn-ghost:hover{color:#fff;border-color:rgba(255,255,255,0.3)}
-
-.msg{display:none;padding:14px;border-radius:6px;font-family:monospace;font-size:12px;margin-bottom:12px;line-height:1.7}
-.msg.show{display:block}
-.msg-ok{background:rgba(0,135,90,0.15);border:1px solid rgba(0,135,90,0.3);color:#00ff88}
-.msg-err{background:rgba(204,0,0,0.15);border:1px solid rgba(204,0,0,0.3);color:#ff6b6b}
-
-.divider{height:1px;background:rgba(255,255,255,0.06);margin:20px 0}
-.footer-note{font-family:monospace;font-size:10px;color:rgba(255,255,255,0.2);text-align:center;margin-top:24px;line-height:1.8}
-</style>
-</head>
-<body>
-
-<div class="logo">AILeash <span>Guardian</span></div>
-<div class="sub">Threat Reporting &amp; Evidence Preservation</div>
-
-<div class="nav-links">
-  <a href="/">Home</a>
-  <a href="/certificate">Certificate</a>
-  <a href="/registry">Safe AI Registry</a>
-  <a href="/admin">Admin</a>
-  <a href="/scan">AI Scanner</a>
-</div>
-
-<div class="intro">
-  <strong>What is this page for?</strong>
-  If AILeash Guardian has detected a threat — grooming behaviour, suspicious contact, or any harmful activity involving a child — this page lets you preserve the evidence and report it to the right authorities. Fill in your details below, copy the evidence package, and follow the steps to report. The SHA-256 audit hash is cryptographically sealed and admissible in UK courts.
-</div>
-
-<div class="card">
-  <div class="card-title">Evidence Package</div>
-  <div class="card-desc">This evidence was automatically captured and sealed by AILeash Guardian. Do not edit it.</div>
-  <div class="evidence-label">SHA-256 Audit Hash</div>
-  <div class="evidence-box" id="ev-hash">Loading...</div>
-  <div class="evidence-label">Incident Record</div>
-  <div class="evidence-box" id="ev-record">Loading...</div>
-  <div id="ev-severity"></div>
-</div>
-
-<div class="card">
-  <div class="card-title">Your Details</div>
-  <div class="card-desc">This information is sent securely to AILeash and to the relevant authority when you submit your report.</div>
-  <div class="field"><label>Your Full Name</label><input type="text" id="reporter-name" placeholder="e.g. Jane Smith"></div>
-  <div class="field"><label>Your Email Address</label><input type="email" id="reporter-email" placeholder="your@email.com"></div>
-  <div class="field"><label>Your Phone Number</label><input type="tel" id="reporter-phone" placeholder="+44 7700 000000"></div>
-  <div class="field"><label>Child's Approximate Age</label>
-    <select id="child-age">
-      <option value="">Select age group</option>
-      <option>Under 5</option>
-      <option>5 to 7</option>
-      <option>8 to 10</option>
-      <option>11 to 13</option>
-      <option>14 to 16</option>
-      <option>17</option>
-    </select>
-  </div>
-  <div class="field"><label>Additional Details</label><textarea id="extra-details" placeholder="Describe anything else relevant to this incident. Include dates, times, platform names, usernames, or any other context that might help investigators."></textarea></div>
-</div>
-
-<div class="card">
-  <div class="card-title">How to Report</div>
-  <div class="card-desc">Follow these steps in order. Start with Step 1 immediately. If a child is in immediate danger, call 999 first.</div>
-  <div class="steps">
-    <div class="step">
-      <div class="step-n">1</div>
-      <div class="step-text">
-        <strong>Action Fraud &mdash; UK's National Fraud Reporting Centre</strong>
-        Call <strong>0300 123 2040</strong> or visit <a href="https://www.actionfraud.police.uk" target="_blank">actionfraud.police.uk</a>. Give them the SHA-256 hash above. They will issue a crime reference number — keep it safe.
-      </div>
-    </div>
-    <div class="step">
-      <div class="step-n">2</div>
-      <div class="step-text">
-        <strong>CEOP &mdash; Child Exploitation and Online Protection</strong>
-        For grooming or child sexual exploitation, report directly at <a href="https://www.ceop.police.uk/safety-centre/" target="_blank">ceop.police.uk/safety-centre</a>. Available 24 hours a day, 7 days a week. CEOP works directly with police to investigate and arrest offenders.
-      </div>
-    </div>
-    <div class="step">
-      <div class="step-n">3</div>
-      <div class="step-text">
-        <strong>Internet Watch Foundation &mdash; For Illegal Images</strong>
-        If the incident involved child sexual abuse material, report it at <a href="https://report.iwf.org.uk" target="_blank">report.iwf.org.uk</a>. The IWF works with police to remove content and prosecute offenders globally.
-      </div>
-    </div>
-    <div class="step">
-      <div class="step-n">4</div>
-      <div class="step-text">
-        <strong>Local Police</strong>
-        For immediate danger call <strong>999</strong>. For non-emergency situations call <strong>101</strong>. Provide the SHA-256 hash and your crime reference number from Action Fraud.
-      </div>
-    </div>
-  </div>
-</div>
-
-<div class="msg msg-ok" id="msg-ok"></div>
-<div class="msg msg-err" id="msg-err"></div>
-
-<button class="btn btn-ghost" onclick="copyEvidence()">Copy Full Evidence Package to Clipboard</button>
-<a href="https://www.actionfraud.police.uk/reporting-fraud-and-cyber-crime" target="_blank" class="btn btn-blue">Report to Action Fraud &rarr;</a>
-<a href="https://www.ceop.police.uk/safety-centre/" target="_blank" class="btn btn-purple">Report to CEOP &rarr;</a>
-<button class="btn btn-red" onclick="submitReport()">Submit to AILeash &mdash; Preserve Evidence Permanently &rarr;</button>
-
-<div class="footer-note">
-  AILeash Guardian &middot; Monop Content &middot; Blyth, Northumberland<br>
-  justrightdecorators@gmail.com &middot; 07908 269428<br>
-  Evidence sealed with SHA-256 &middot; Admissible in UK courts
-</div>
-
-<script>
-var incidentData = {};
-
-function init() {
-  var params = new URLSearchParams(window.location.search);
-  var hash    = params.get('hash')    || localStorage.getItem('last_block_hash')    || 'NOT PROVIDED';
-  var score   = params.get('score')   || localStorage.getItem('last_score')         || 'N/A';
-  var reasons = params.get('reasons') || localStorage.getItem('last_reasons')       || 'N/A';
-  var ts      = params.get('ts')      || new Date().toISOString();
-  var device  = localStorage.getItem('guardian_device') || 'Unknown Device';
-  var apiKey  = localStorage.getItem('guardian_key')    || '';
-
-  incidentData = { hash:hash, score:score, reasons:reasons, ts:ts, device:device, apiKey:apiKey };
-
-  document.getElementById('ev-hash').textContent = hash;
-  document.getElementById('ev-record').textContent = ts + ' | ' + device + ' | score: ' + score + ' | signals: ' + reasons;
-
-  var sev = parseFloat(score) >= 0.9 ? 'CRITICAL' : 'HIGH';
-  document.getElementById('ev-severity').innerHTML = '<span class="severity ' + (sev==='CRITICAL'?'sev-critical':'sev-high') + '">' + sev + ' SEVERITY</span>';
-}
-
-function buildPackage() {
-  var name  = document.getElementById('reporter-name').value.trim();
-  var email = document.getElementById('reporter-email').value.trim();
-  var phone = document.getElementById('reporter-phone').value.trim();
-  var age   = document.getElementById('child-age').value;
-  var extra = document.getElementById('extra-details').value.trim();
-  return [
-    'AILEASH GUARDIAN — LAW ENFORCEMENT EVIDENCE PACKAGE',
-    '=====================================================',
-    'Generated: ' + new Date().toISOString(),
-    '',
-    'EVIDENCE HASH (SHA-256):',
-    incidentData.hash,
-    '',
-    'INCIDENT RECORD:',
-    incidentData.ts + ' | Device: ' + incidentData.device,
-    'Risk Score: ' + incidentData.score,
-    'Threat Signals: ' + incidentData.reasons,
-    '',
-    'REPORTER DETAILS:',
-    'Name:  ' + (name  || 'Not provided'),
-    'Email: ' + (email || 'Not provided'),
-    'Phone: ' + (phone || 'Not provided'),
-    'Child age group: ' + (age || 'Not provided'),
-    '',
-    'ADDITIONAL DETAILS:',
-    extra || 'None provided',
-    '',
-    'REPORTING CONTACTS:',
-    'Action Fraud: 0300 123 2040 | actionfraud.police.uk',
-    'CEOP: ceop.police.uk/safety-centre',
-    'IWF: report.iwf.org.uk',
-    'Emergency: 999 | Non-emergency: 101',
-    '',
-    'This evidence package was generated by AILeash Guardian.',
-    'The SHA-256 audit hash is cryptographically sealed and',
-    'admissible as evidence in UK courts.',
-    'sebbi.pro | justrightdecorators@gmail.com | 07908 269428'
-  ].join('\n');
-}
-
-function copyEvidence() {
-  navigator.clipboard.writeText(buildPackage()).then(function() {
-    var btn = document.querySelectorAll('.btn-ghost')[0];
-    btn.textContent = 'Copied \u2713';
-    setTimeout(function(){ btn.textContent = 'Copy Full Evidence Package to Clipboard'; }, 2500);
-  });
-}
-
-async function submitReport() {
-  var ok  = document.getElementById('msg-ok');
-  var err = document.getElementById('msg-err');
-  ok.classList.remove('show'); err.classList.remove('show');
-  var email = document.getElementById('reporter-email').value.trim();
-  if (!email || !email.includes('@')) {
-    err.textContent = 'Please enter your email address before submitting.';
-    err.classList.add('show'); return;
+  await addLine('tl-score','>','Risk score: <span class="t-cyan">'+engineResult.score+'</span> &mdash; Trust index: <span class="t-cyan">'+engineResult.trust+'</span>','Risk score '+engineResult.score+'. Trust index '+engineResult.trust+'.',delay,P,R); delay+=step;
+  if(engineResult.reasons && engineResult.reasons.length>0){
+    await addLine('tl-flags','>','Signals raised: <span class="t-gold">'+engineResult.reasons.join(' &mdash; ')+'</span>','Signals raised: '+engineResult.reasons.join('. ')+'.',delay,P,R); delay+=step;
+  } else {
+    await addLine('tl-flags','>','<span class="t-dim">No risk signals raised on this session</span>','No risk signals raised on this session.',delay,P,R); delay+=step;
   }
-  try {
-    var r = await fetch('https://sebbi.pro/report-threat', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json','Authorization':'Bearer '+incidentData.apiKey},
-      body: JSON.stringify({
-        hash: incidentData.hash, score: incidentData.score,
-        reasons: incidentData.reasons, device: incidentData.device,
-        ts: incidentData.ts,
-        reporter_name:  document.getElementById('reporter-name').value.trim(),
-        reporter_email: email,
-        reporter_phone: document.getElementById('reporter-phone').value.trim(),
-        child_age:      document.getElementById('child-age').value,
-        extra_details:  document.getElementById('extra-details').value.trim(),
-        evidence_package: buildPackage()
-      })
-    });
-    var d = await r.json();
-    if (d.ok) {
-      ok.textContent = 'Report submitted. Reference: ' + (d.reference || 'AIDX-' + Date.now()) + '. Evidence is permanently preserved. Justin has been notified.';
-      ok.classList.add('show');
+  var decColour = engineResult.decision==='ALLOW' ? 'var(--green)' : engineResult.decision==='CHALLENGE' ? 'var(--gold)' : '#ff6b6b';
+  await addLine('tl-dec','>','Decision: <span style="color:'+decColour+';font-weight:700;font-size:16px;letter-spacing:3px">'+engineResult.decision+'</span>','Decision. '+engineResult.decision+'.',delay,P,R); delay+=step;
+
+  if(engineResult.audit_hash){
+    await addLine('tl-seal','>','<span class="t-dim">Writing to the real SHA-256 Merkle audit chain&hellip;</span>','Writing to the real audit chain.',delay,P,R); delay+=step;
+    await addLine('tl-hash','>','Audit hash: <span class="t-hash">'+engineResult.audit_hash+'</span>','Audit hash generated and sealed for real.',delay,P,R); delay+=step;
+    await addLine('tl-done','>','<span class="t-green">Sealed &mdash; tamper-evident &mdash; you can verify this chain yourself, right now.</span>','Sealed. Tamper-evident. You can verify this chain yourself, right now.',delay,P,R); delay+=step;
+  } else {
+    await addLine('tl-done','>','<span class="t-green">Decision returned by the live engine &mdash; you can verify the chain yourself, right now.</span>','Decision returned by the live engine. You can verify the chain yourself, right now.',delay,P,R); delay+=step;
+  }
+
+  setTimeout(function(){
+    document.getElementById('v-decision').textContent=engineResult.decision;
+    document.getElementById('v-decision').style.color=decColour;
+    document.getElementById('v-score').textContent='Score: '+engineResult.score+'  \u2014  Trust: '+engineResult.trust+'  \u2014  Version: '+engineResult.version;
+    if(engineResult.audit_hash){
+      document.getElementById('v-hash').textContent=engineResult.audit_hash;
+      document.getElementById('v-sealed').textContent='Sealed just now  \u2014  Real chain entry  \u2014  Verifiable  \u2014  Not a simulation';
     } else {
-      err.textContent = 'Submission failed. Copy the evidence package above and report to Action Fraud directly on 0300 123 2040.';
-      err.classList.add('show');
+      document.getElementById('v-hash').textContent='\u2014';
+      document.getElementById('v-sealed').textContent='Live decision from the production engine  \u2014  Not a simulation';
     }
-  } catch(e) {
-    err.textContent = 'Cannot reach server. Copy the evidence package and call Action Fraud: 0300 123 2040.';
-    err.classList.add('show');
-  }
+    document.getElementById('verdict').classList.add('show');
+  }, delay);
+  delay+=step*2;
+
+  setTimeout(function(){
+    var fs=document.getElementById('fear-sec');
+    fs.classList.add('show');
+    var items=[
+      {id:'f1',spoken:'We did that. Using our real engine, live.'},
+      {id:'f2',spoken:'Every single user on your platform could be scored like that. In real time.'},
+      {id:'fd1',spoken:null},
+      {id:'f3',spoken:'When a regulator asks you to prove your AI treated someone fairly on a specific date.'},
+      {id:'f4',spoken:'What exactly are you going to show them?'},
+      {id:'fd2',spoken:null},
+      {id:'f5',spoken:'Your session was just sealed into our real audit chain. Tamper-evident. Verifiable. Yours to check.'},
+      {id:'f6',spoken:'Most AI has none of this.'},
+      {id:'fear-cta',spoken:'Fifty pence. Per device. Per month. Get the engine free right now.'}
+    ];
+    items.forEach(function(item,i){
+      setTimeout(function(){
+        var el=document.getElementById(item.id);
+        if(el) el.classList.add('show');
+        if(item.spoken) speak(item.spoken);
+      }, i*900);
+    });
+  }, delay);
 }
 
-init();
+window.addEventListener('load', function(){ setTimeout(runScan, 1000); });
+
+// ============================================================
+// SIGNUP
+// ============================================================
+async function doSignup(){
+  var fn=document.getElementById('fn').value.trim();
+  var ln=document.getElementById('ln').value.trim();
+  var em=document.getElementById('em').value.trim();
+  var ph=document.getElementById('ph').value.trim();
+  var org=document.getElementById('org').value.trim();
+  var dv=parseInt(document.getElementById('dv').value)||1;
+  var err=document.getElementById('msg-err');
+  var kb=document.getElementById('key-box');
+  var btn=document.querySelector('.btn-full');
+  err.classList.remove('show');kb.classList.remove('show');
+  if(!em||!em.includes('@')){err.textContent='Please enter a valid email address.';err.classList.add('show');return;}
+  if(!org){err.textContent='Please enter your company or platform name.';err.classList.add('show');return;}
+  var orig=btn.textContent;btn.textContent='Creating key\u2026';btn.disabled=true;
+  try{
+    var r=await fetch('https://sebbi.pro/signup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:em,phone:ph,name:fn+' '+ln,org:org,org_type:'sonicboom',product:'aileash',devices:dv})});
+    var d=await r.json();
+    if(d.api_key){
+      document.getElementById('key-val').textContent=d.api_key;
+      kb.classList.add('show');
+      btn.textContent='Key created \u2014 setting up billing\u2026';
+      speak('Key created! Redirecting to billing now.');
+      try{
+        var r2=await fetch('https://sebbi.pro/create-checkout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:em,product:'aileash',devices:dv})});
+        var d2=await r2.json();
+        if(d2.checkout_url){setTimeout(function(){window.location.href=d2.checkout_url;},2500);}
+        else{btn.textContent='Key ready \u2713';}
+      }catch(e2){btn.textContent='Key ready \u2713';}
+    }else{
+      err.textContent=d.error||'Something went wrong. Email justrightdecorators@gmail.com';
+      err.classList.add('show');btn.textContent=orig;btn.disabled=false;
+    }
+  }catch(e){
+    err.textContent='Cannot reach server. Email justrightdecorators@gmail.com';
+    err.classList.add('show');btn.textContent=orig;btn.disabled=false;
+  }
+}
 </script>
 </body>
 </html>
-
-```
-
-
-## `requirements.txt`
-
-2 lines, 22 bytes
-
-```text
-opentimestamps-client
 
 ```
