@@ -1,10 +1,969 @@
-# Codebase — part 23 of 43
+# Codebase — part 23 of 44
 
 Contains:
+- `modules/signed.py`
 - `modules/sortition.py`
-- `modules/sound.py`
-- `modules/spec.py`
-- `modules/standard.py`
+
+
+## `modules/signed.py`
+
+953 lines, 44350 bytes
+
+```python
+"""
+Peer-signed submissions - /x/signed/<action>
+
+WHAT CHANGED IN 1.1
+-------------------
+Three things, all of the same kind: a field that read stronger than it was.
+
+1. receipt_seq is a real number now.
+
+   This lane returned whatever server.py's seal() gave back for the
+   sequence, and passed the literal string "public-signed" as the api_key.
+   That is not a row in api_keys, so the UPDATE matched nothing, the SELECT
+   returned nothing, and the value was always null. The field sat in the
+   response named as though it were a receipt sequence, carrying nothing.
+
+   The point of a sequence is that a holder of receipts N and N+2 can PROVE
+   N+1 exists and was not received. A null cannot do that, so this lane had
+   no completeness property while appearing to offer one.
+
+   Found on the sibling lane at /x/peer/submit by Philip Pinol (PRAXIS),
+   whose schema required an integer and got a null. Same fault here, fixed
+   before anybody hit it. The sequence is now issued by this module, per
+   enrolled name, inside the same lock hold that writes the row.
+
+2. A failed seal no longer returns a receipt.
+
+   ctx["seal"] was called and its result used without checking. If it
+   raised or came back without a hash, this lane would have returned a
+   success body with nothing behind it - the exact hollow receipt that
+   turned up on the peer lane on 2026-08-26. It now returns 500, records
+   nothing, and says why.
+
+3. Enrolment and rotation report whether they sealed.
+
+   Both were sealing as a side effect and ignoring the outcome. The
+   operation still happens - a key is a database row and a failed audit
+   note does not un-enrol it - but the response says sealed true or false
+   with the error, rather than leaving it to be assumed.
+
+The server-wide key counter is still returned, as key_seq, and is still
+null. Reported rather than omitted so the absence is visible instead of
+inferred, which is the confusion that made this worth fixing at all.
+
+THE GAP THIS CLOSES
+-------------------
+Two people arrived at the same missing piece from opposite directions on the
+same day.
+
+Ishaan (Shango MID) read the existing signed lane and said, correctly, that
+"binds a name to a secret rather than to an address" reads stronger than it
+is. An HMAC uses a shared secret. A shared secret is held by both parties. So
+it proves the submission came from SOMEONE HOLDING THE SECRET - which is the
+peer and also the operator of this deployment. It closes third-party
+submission under a peer's name. It does not close operator submission under a
+peer's name.
+
+Chidi (ViriSIM) came at it from the regulator's side: for the evidence to mean
+anything to a third party, the customer has to sign, not the platform holding
+the customer's records.
+
+Same gap. This module closes it.
+
+HOW
+---
+The peer generates an Ed25519 keypair and keeps the private half. This
+deployment is given ONLY the public half. A public key is not a secret and
+grants nothing: it verifies a signature and cannot produce one.
+
+From then on, a submission under that name is accepted only if it carries a
+signature this deployment can verify against that public key - and this
+deployment CANNOT create such a signature, because it does not hold the
+private key and never has. The property is not a promise about our conduct.
+It is arithmetic.
+
+WHAT THIS MEANS FOR THE RECORD
+------------------------------
+The other lanes answer "did somebody hand us this tip". This lane answers
+"did the holder of this key hand us this tip", and the difference matters
+precisely when the operator is the party you are worried about.
+
+A regulator or auditor reading a signed observation does not have to trust
+this deployment about who submitted it. They can take the public key from
+/x/signed/keys, take the canonical message and the signature from the record,
+and check it themselves with any Ed25519 library in any language.
+
+WHAT IT STILL DOES NOT DO
+-------------------------
+- It does not prove the records behind the tip are true. Nothing here does.
+- It does not prove completeness of the peer's own chain. A signed chain can
+  still omit records. Catching that needs an audit protocol, not
+  cryptography - see Chidi's incognito-user test, which is the only thing
+  anyone has proposed that attacks it. Note this is a different claim from
+  the receipt sequence below, which is about completeness of the receipts WE
+  issued, not of the records THEY sealed.
+- It does not prove who the keyholder IS. It proves the same party signed
+  each time. Identity is a separate problem and this does not solve it.
+- Enrolment is open, so the first party to enrol a name gets it. Same as
+  everywhere else in this standard, that is detection rather than
+  prevention: an enrolment is sealed, permanent and public, and an enrolment
+  placed over a name already seen in the witness log is flagged as such.
+
+WHY THE OPERATOR CANNOT QUIETLY SWAP A KEY
+------------------------------------------
+The obvious attack on the whole idea: the operator replaces the peer's public
+key with one of their own, then signs freely. So there is no route that
+overwrites a key. Rotation exists, and a rotation must itself be signed by
+the key being replaced. An operator who does not hold the current private key
+cannot rotate it, and every rotation is sealed into the chain with both keys
+recorded. A peer who has lost their key cannot rotate either - they enrol a
+new name, and the abandoned one stays visible.
+
+CANONICAL MESSAGE
+-----------------
+Exactly this, UTF-8, no trailing newline, four lines joined by \\n:
+
+    aileash-signed-v1
+    <chain>
+    <tip>
+    <ts>
+
+  chain  the peer name, lowercase, as enrolled
+  tip    64 lowercase hex characters
+  ts     integer epoch seconds, no decimal point
+
+Sign those bytes with the Ed25519 private key. Send the 64-byte signature as
+128 lowercase hex characters. The message is deliberately short, positional
+and free of JSON so that two implementations cannot disagree about how to
+build it.
+
+Rotation signs a different message with the SAME shape:
+
+    aileash-rotate-v1
+    <chain>
+    <new public key, 64 hex>
+    <ts>
+
+REPLAY
+------
+A signature is a bearer token for the statement it signs. Anyone who sees one
+can send it again. So: ts must be within SKEW_PAST seconds behind and
+SKEW_FUTURE ahead of our clock, ts must be strictly greater than the last ts
+we accepted for that name, and an exact repeat of a signature already stored
+is refused. None of that is exotic - it is the ordinary set, written down so
+nobody has to guess which of them we do.
+
+WHY THIS LANE REJECTS, WHEN THE OPEN LANE NEVER DOES
+----------------------------------------------------
+/x/witness/observe seals everything and describes what it sealed, because
+refusing an anonymous submission would mean deciding who is allowed to be
+recorded. This lane is the opposite case. A submission whose signature does
+not verify has no business being written into a name's history at all - the
+harm is exactly that it would sit in the record looking like an event
+involving that peer. So this lane refuses, says why, and seals nothing.
+
+    GET  /x/signed/spec                  the protocol
+    GET  /x/signed/keys                  every enrolled name and public key
+    POST /x/signed/enroll                chain, pubkey
+    POST /x/signed/submit                chain, tip, ts, signature
+    POST /x/signed/rotate                chain, new_pubkey, ts, signature
+    GET  /x/signed/verify?peer=&tip=     the receipt, with everything a third
+                                         party needs to check it themselves
+"""
+
+import hashlib
+import re
+import time
+from datetime import datetime, timezone
+
+VERSION = "1.1.1"
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
+HEX128 = re.compile(r"^[0-9a-f]{128}$")
+
+MSG_PREFIX = "aileash-signed-v1"
+ROTATE_PREFIX = "aileash-rotate-v1"
+
+# Replay window. Generous enough for a batch job on a slow link, tight enough
+# that a captured signature is not useful for long.
+SKEW_PAST = 900
+SKEW_FUTURE = 120
+
+# Everything here is readable and usable without an account. A verification
+# lane that only account holders can check is not a verification lane.
+PUBLIC = {("GET", "spec"), ("GET", "keys"), ("GET", "verify"),
+          ("POST", "enroll"), ("POST", "submit"), ("POST", "rotate")}
+
+MAX_LIST = 500
+
+# What this lane files its own audit rows under. Deliberately not a real
+# api_key - it is a label, and it is exactly why server.py's per-key
+# sequence comes back null here. See _seq_note.
+FILED_UNDER = "public-signed"
+
+MESSAGES = {
+    "what_this_proves": (
+        "That the holder of the enrolled private key produced this exact "
+        "statement - name, tip and timestamp - and that we sealed it at the "
+        "recorded time. This deployment holds only the public key and cannot "
+        "produce such a signature, so it is not a claim you have to take on "
+        "our word. Recheck it yourself with any Ed25519 library."),
+    "what_this_does_not_prove": (
+        "Nothing about whether the records behind the tip are true, nothing "
+        "about whether the peer's chain is complete, and nothing about who "
+        "the keyholder is in the world. It proves the same party signed each "
+        "time."),
+    "enrolled": (
+        "This name is now bound to this public key permanently. We cannot "
+        "change it - rotation requires a signature from the key being "
+        "replaced, which we do not hold."),
+    "keys_note": (
+        "Public keys are not secrets. They are published so that anyone can "
+        "verify a signed observation without asking us for anything."),
+    "seq": (
+        "An integer, never null, incremented by exactly one for each accepted "
+        "submission UNDER THIS NAME on this lane. Issued inside the same lock "
+        "that writes the record, so a number is never spent on a submission "
+        "that was not stored. Two receipts numbered N and N+2 prove a third "
+        "exists that you did not receive. The current highest is published at "
+        "/x/signed/keys, so the check does not depend on asking us."),
+    "key_seq": (
+        "The server-wide per-API-key sequence, which is null on this lane and "
+        "always will be. That counter lives on an api_key row, and this lane "
+        "files under a label rather than a key because it authenticates by "
+        "signature and issues nobody an account. It is returned rather than "
+        "omitted so the absence is visible instead of inferred. Before 1.1 "
+        "this null was reported as receipt_seq, which made a missing property "
+        "look like a broken field."),
+    "seq_survives_rotation": (
+        "Rotating the key does not reset the sequence. It belongs to the "
+        "name's submission history rather than to the key, so a rotation "
+        "cannot be used to erase a gap."),
+}
+
+_ready = False
+
+
+# ----------------------------------------------------------------------
+# Ed25519 verification, RFC 8032, pure standard library
+#
+# Deliberately no third-party dependency. This deployment runs on a small
+# box and a verification routine that needs a native extension is a
+# verification routine that stops working on a platform migration. Extended
+# homogeneous coordinates so a verify is milliseconds rather than seconds.
+#
+# Verify only. There is no signing function in this file, and that is not an
+# oversight - there is nothing here that could be turned into a way for this
+# deployment to produce a peer's signature.
+# ----------------------------------------------------------------------
+
+_P = 2 ** 255 - 19
+_L = 2 ** 252 + 27742317777372353535851937790883648493
+_D = -121665 * pow(121666, _P - 2, _P) % _P
+_I = pow(2, (_P - 1) // 4, _P)
+
+
+def _xrecover(y):
+    xx = (y * y - 1) * pow(_D * y * y + 1, _P - 2, _P)
+    x = pow(xx, (_P + 3) // 8, _P)
+    if (x * x - xx) % _P != 0:
+        x = (x * _I) % _P
+    if x % 2 != 0:
+        x = _P - x
+    return x
+
+
+_BY = 4 * pow(5, _P - 2, _P) % _P
+_BX = _xrecover(_BY)
+_B = (_BX % _P, _BY % _P, 1, _BX * _BY % _P)
+
+
+def _add(p, q):
+    x1, y1, z1, t1 = p
+    x2, y2, z2, t2 = q
+    a = (y1 - x1) * (y2 - x2) % _P
+    b = (y1 + x1) * (y2 + x2) % _P
+    c = t1 * 2 * _D * t2 % _P
+    dd = z1 * 2 * z2 % _P
+    e = b - a
+    f = dd - c
+    g = dd + c
+    h = b + a
+    return (e * f % _P, g * h % _P, f * g % _P, e * h % _P)
+
+
+def _double(p):
+    return _add(p, p)
+
+
+def _scalarmult(p, e):
+    if e == 0:
+        return (0, 1, 1, 0)
+    q = _scalarmult(p, e >> 1)
+    q = _double(q)
+    if e & 1:
+        q = _add(q, p)
+    return q
+
+
+def _decodepoint(raw):
+    y = int.from_bytes(raw, "little") & ((1 << 255) - 1)
+    if y >= _P:
+        return None
+    x = _xrecover(y)
+    if x & 1 != (raw[31] >> 7) & 1:
+        x = _P - x
+    point = (x, y, 1, x * y % _P)
+    # on-curve check: -x^2 + y^2 = 1 + d x^2 y^2
+    if (-x * x + y * y - 1 - _D * x * x * y * y) % _P != 0:
+        return None
+    return point
+
+
+def _equal(p, q):
+    x1, y1, z1, _t1 = p
+    x2, y2, z2, _t2 = q
+    if (x1 * z2 - x2 * z1) % _P != 0:
+        return False
+    if (y1 * z2 - y2 * z1) % _P != 0:
+        return False
+    return True
+
+
+def ed25519_verify(public_key, message, signature):
+    """True if signature is a valid Ed25519 signature of message under
+    public_key. Bytes in, bool out, never raises."""
+    try:
+        if len(public_key) != 32 or len(signature) != 64:
+            return False
+        a = _decodepoint(public_key)
+        if a is None:
+            return False
+        r_raw = signature[:32]
+        r = _decodepoint(r_raw)
+        if r is None:
+            return False
+        s = int.from_bytes(signature[32:], "little")
+        if s >= _L:
+            return False
+        h = int.from_bytes(
+            hashlib.sha512(r_raw + public_key + message).digest(), "little") % _L
+        left = _scalarmult(_B, s)
+        right = _add(r, _scalarmult(a, h))
+        return _equal(left, right)
+    except Exception:
+        return False
+
+
+# ----------------------------------------------------------------------
+# storage
+# ----------------------------------------------------------------------
+
+def _setup(ctx):
+    global _ready
+    if _ready:
+        return
+    with ctx["lock"]:
+        c = ctx["conn"]
+        c.execute("CREATE TABLE IF NOT EXISTS signed_keys("
+                  "peer TEXT PRIMARY KEY,pubkey TEXT,enrolled REAL,"
+                  "audit_hash TEXT,block_index INTEGER,"
+                  "rotations INTEGER DEFAULT 0,last_ts REAL,note TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS signed_log("
+                  "id INTEGER PRIMARY KEY AUTOINCREMENT,peer TEXT,tip TEXT,"
+                  "peer_ts REAL,observed REAL,signature TEXT,pubkey TEXT,"
+                  "audit_hash TEXT,block_index INTEGER)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_sig_peer ON signed_log(peer,id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_sig_tip ON signed_log(tip)")
+
+        # Added in 1.1. The receipt counter, per enrolled name, in its own
+        # table so the counter survives anything that happens to the key row
+        # - including a rotation. A rotation that reset the sequence could be
+        # used to erase a gap, which is the one thing the sequence exists to
+        # make impossible.
+        c.execute("CREATE TABLE IF NOT EXISTS signed_seq("
+                  "peer TEXT PRIMARY KEY, last_seq INTEGER DEFAULT 0)")
+        c.commit()
+    _ready = True
+
+
+def _iso(ts):
+    if not ts:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+def _peer_name(data):
+    return str(data.get("chain") or data.get("peer") or "").strip().lower()
+
+
+def _key_row(ctx, peer):
+    with ctx["lock"]:
+        return ctx["conn"].execute(
+            "SELECT pubkey,enrolled,audit_hash,block_index,rotations,last_ts "
+            "FROM signed_keys WHERE peer=?", (peer,)).fetchone()
+
+
+def _latest_seq(ctx, peer):
+    """Highest receipt number issued to this name. 0 if none."""
+    try:
+        with ctx["lock"]:
+            row = ctx["conn"].execute(
+                "SELECT last_seq FROM signed_seq WHERE peer=?", (peer,)).fetchone()
+        return int(row[0]) if row and row[0] is not None else 0
+    except Exception:
+        return 0
+
+
+def _try_seal(ctx, event, result, when, api_key):
+    """Seal, and say plainly whether it worked.
+
+    Returns (audit_hash, block_index, key_seq, error). Nothing here swallows
+    a failure. Before 1.1 the result was used without checking, which is how
+    a hollow receipt gets issued.
+    """
+    try:
+        h, idx, seq = ctx["seal"](event, result, when, api_key)
+    except Exception as exc:
+        return None, None, None, "%s: %s" % (type(exc).__name__, str(exc)[:300])
+    if not h:
+        return None, None, None, "seal returned no audit hash"
+    return h, idx, seq, None
+
+
+def _seen_in_open_lane(ctx, peer):
+    """Has this name already appeared in the open witness log?
+
+    An enrolment over a name somebody else has been using is the same shape as
+    the url squat, and gets the same treatment: we cannot prevent it, so we
+    record it permanently at the moment it happens.
+    """
+    try:
+        with ctx["lock"]:
+            row = ctx["conn"].execute(
+                "SELECT COUNT(*) FROM witness_log WHERE peer=?", (peer,)).fetchone()
+        return int(row[0]) if row else 0
+    except Exception:
+        return 0
+
+
+def _check_ts(ts, last_ts):
+    now = time.time()
+    if ts > now + SKEW_FUTURE:
+        return False, ("timestamp is %d seconds in the future; limit is %d"
+                       % (int(ts - now), SKEW_FUTURE))
+    if ts < now - SKEW_PAST:
+        return False, ("timestamp is %d seconds old; limit is %d"
+                       % (int(now - ts), SKEW_PAST))
+    if last_ts is not None and ts <= last_ts:
+        return False, ("timestamp %d is not later than the last one accepted "
+                       "for this name (%d) - a signature cannot be replayed "
+                       "and submissions must move forward"
+                       % (int(ts), int(last_ts)))
+    return True, None
+
+
+# ----------------------------------------------------------------------
+# routes
+# ----------------------------------------------------------------------
+
+def _enroll(ctx, data):
+    peer = _peer_name(data)
+    if not peer or len(peer) > 80:
+        return {"error": "chain_required",
+                "message": "A short stable identifier - a domain works well."}, 400
+    pubkey = str(data.get("pubkey") or data.get("public_key") or "").strip().lower()
+    if not HEX64.match(pubkey):
+        return {"error": "invalid_pubkey",
+                "message": "An Ed25519 public key is 32 bytes - 64 lowercase "
+                           "hex characters. Send the public half only. Never "
+                           "send us a private key; we have no use for one and "
+                           "no route that accepts one."}, 400
+    if _decodepoint(bytes.fromhex(pubkey)) is None:
+        return {"error": "invalid_pubkey",
+                "message": "That value is 64 hex characters but is not a "
+                           "point on the curve, so it is not an Ed25519 "
+                           "public key."}, 400
+
+    existing = _key_row(ctx, peer)
+    if existing:
+        if existing[0] == pubkey:
+            return {"already_enrolled": True, "chain": peer, "pubkey": pubkey,
+                    "enrolled_at": _iso(existing[1]),
+                    "block_index": existing[3],
+                    "latest_receipt_seq": _latest_seq(ctx, peer),
+                    "message": "This name is already bound to this key. "
+                               "Nothing changed."}, 200
+        return {"error": "name_already_enrolled", "chain": peer,
+                "enrolled_pubkey": existing[0],
+                "enrolled_at": _iso(existing[1]),
+                "message": "This name is bound to a different key. We do not "
+                           "overwrite a binding. If you hold the enrolled "
+                           "private key, use /x/signed/rotate. If you do not, "
+                           "this name is not available to you and this "
+                           "attempt is not sealed."}, 409
+
+    prior = _seen_in_open_lane(ctx, peer)
+    ts = time.time()
+    note = "enrolled"
+    if prior:
+        note = ("WARNING: this name had already been submitted %d time(s) to "
+                "the open witness lane before this key was enrolled, so it "
+                "was not a fresh name when it was claimed" % prior)
+
+    ev = {"user_id": "sig:" + peer, "action": "signed_key_enrolled", "amount": 0,
+          "country": "UK", "device_id": "signed", "anomaly": 0, "device_risk": 0}
+    res = {"decision": "KEY_ENROLLED", "score": 0, "signed_version": VERSION,
+           "peer": peer, "pubkey": pubkey, "timestamp": ts, "detail": note}
+    h, idx, _seq, seal_error = _try_seal(ctx, ev, res, ts, FILED_UNDER)
+
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "INSERT INTO signed_keys(peer,pubkey,enrolled,audit_hash,"
+            "block_index,rotations,last_ts,note) VALUES(?,?,?,?,?,0,NULL,?)",
+            (peer, pubkey, ts, h, idx, note))
+        ctx["conn"].execute(
+            "INSERT OR IGNORE INTO signed_seq(peer,last_seq) VALUES(?,0)", (peer,))
+        ctx["conn"].commit()
+
+    out = {"enrolled": True, "chain": peer, "pubkey": pubkey,
+           "enrolled_at": _iso(ts), "sealed_in_our_chain": h,
+           "block_index": idx, "signed_version": VERSION,
+           "sealed": seal_error is None,
+           "latest_receipt_seq": 0,
+           "message": MESSAGES["enrolled"],
+           "canonical_message": _canonical_help(peer),
+           "submit": "/x/signed/submit"}
+    if seal_error:
+        out["seal_error"] = seal_error
+        out["seal_note"] = ("The key is enrolled and usable - it is a database "
+                            "row and a failed audit note does not un-enrol it. "
+                            "But the record of the enrolment did not seal, "
+                            "which is a fault worth chasing and is reported "
+                            "rather than hidden.")
+    if prior:
+        out["flag"] = note
+    return out, 200
+
+
+def _canonical_help(peer):
+    return {"format": MSG_PREFIX + "\\n<chain>\\n<tip>\\n<ts>",
+            "example_for_this_name": MSG_PREFIX + "\\n" + peer +
+                                     "\\n<64 hex tip>\\n<integer epoch seconds>",
+            "encoding": "UTF-8, no trailing newline, lines joined with a "
+                        "single \\n",
+            "signature": "Ed25519 over those bytes, sent as 128 lowercase hex"}
+
+
+def _submit(ctx, data):
+    peer = _peer_name(data)
+    if not peer:
+        return {"error": "chain_required"}, 400
+    row = _key_row(ctx, peer)
+    if not row:
+        return {"error": "not_enrolled", "chain": peer,
+                "message": "No public key is enrolled for this name. Enrol at "
+                           "/x/signed/enroll, or use the open lane at "
+                           "/x/witness/observe which needs nothing."}, 404
+    pubkey, _enrolled, _h, _idx, _rot, last_ts = row
+
+    tip = str(data.get("tip", "")).strip().lower()
+    if not HEX64.match(tip):
+        return {"error": "invalid_tip",
+                "message": "A tip is 64 hex characters - a SHA-256 chain head."}, 400
+    signature = str(data.get("signature") or data.get("sig") or "").strip().lower()
+    if not HEX128.match(signature):
+        return {"error": "invalid_signature_format",
+                "message": "An Ed25519 signature is 64 bytes - 128 lowercase "
+                           "hex characters."}, 400
+    raw_ts = data.get("ts", data.get("peer_ts"))
+    try:
+        ts_int = int(raw_ts)
+    except (TypeError, ValueError):
+        return {"error": "invalid_ts",
+                "message": "ts must be integer epoch seconds, and must be the "
+                           "same value you signed."}, 400
+
+    ok, why = _check_ts(ts_int, last_ts)
+    if not ok:
+        return {"error": "timestamp_rejected", "message": why,
+                "our_time": int(time.time())}, 400
+
+    with ctx["lock"]:
+        dup = ctx["conn"].execute(
+            "SELECT observed FROM signed_log WHERE peer=? AND signature=? LIMIT 1",
+            (peer, signature)).fetchone()
+    if dup:
+        return {"error": "replayed_signature",
+                "message": "This exact signature was already accepted at %s."
+                           % _iso(dup[0])}, 409
+
+    message = "\n".join([MSG_PREFIX, peer, tip, str(ts_int)]).encode("utf-8")
+    if not ed25519_verify(bytes.fromhex(pubkey), message, bytes.fromhex(signature)):
+        return {"error": "signature_did_not_verify",
+                "chain": peer,
+                "message": "Nothing has been sealed. The signature does not "
+                           "verify against the key enrolled for this name. "
+                           "The usual cause is a canonical message built "
+                           "differently - check it byte for byte below.",
+                "we_verified_against": _canonical_help(peer),
+                "the_exact_bytes_we_hashed":
+                    "\n".join([MSG_PREFIX, peer, tip, str(ts_int)]),
+                "enrolled_pubkey": pubkey}, 400
+
+    observed = time.time()
+    detail = ("peer=" + peer + ";tip=" + tip + ";ts=" + str(ts_int) +
+              ";pubkey=" + pubkey + ";sig=" + signature)
+    ev = {"user_id": "sig:" + peer, "action": "signed_tip_observed", "amount": 0,
+          "country": "UK", "device_id": "signed", "anomaly": 0, "device_risk": 0}
+    res = {"decision": "SIGNED_TIP_SEALED", "score": 0, "signed_version": VERSION,
+           "peer": peer, "peer_tip": tip, "timestamp": observed,
+           "verification": "peer-signed", "detail": detail}
+
+    # Seal FIRST, and only claim success if it produced a hash. A signed
+    # submission that returns a receipt with no block behind it is worse than
+    # a refusal, because the peer has no way to tell the difference without
+    # going and looking at the chain.
+    h, idx, key_seq, seal_error = _try_seal(ctx, ev, res, observed, FILED_UNDER)
+    if seal_error:
+        return {"ok": False, "accepted": False, "error": "seal_failed",
+                "chain": peer, "tip": tip,
+                "detail": "Your signature verified correctly, but the audit "
+                          "chain did not seal the submission, so there is no "
+                          "receipt to give you. This is a fault on this "
+                          "deployment and not a problem with your submission.",
+                "seal_error": seal_error,
+                "recorded": False,
+                "retry": "Nothing was written. No sequence number was spent "
+                         "and your signature is not recorded as used, so a "
+                         "fresh submission with a later ts can be sent once "
+                         "this is fixed.",
+                "observed_at": _iso(observed)}, 500
+
+    # Issue the receipt number inside the same lock hold that writes the row.
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "INSERT OR IGNORE INTO signed_seq(peer,last_seq) VALUES(?,0)", (peer,))
+        ctx["conn"].execute(
+            "UPDATE signed_seq SET last_seq = COALESCE(last_seq,0) + 1 "
+            "WHERE peer=?", (peer,))
+        srow = ctx["conn"].execute(
+            "SELECT last_seq FROM signed_seq WHERE peer=?", (peer,)).fetchone()
+        receipt_seq = int(srow[0]) if srow and srow[0] is not None else None
+
+        ctx["conn"].execute(
+            "INSERT INTO signed_log(peer,tip,peer_ts,observed,signature,"
+            "pubkey,audit_hash,block_index) VALUES(?,?,?,?,?,?,?,?)",
+            (peer, tip, float(ts_int), observed, signature, pubkey, h, idx))
+        ctx["conn"].execute("UPDATE signed_keys SET last_ts=? WHERE peer=?",
+                            (float(ts_int), peer))
+        ctx["conn"].commit()
+
+    # Mirror into the open witness log so the peer appears on the public
+    # roster alongside everyone else. Guarded: the roster is a convenience
+    # and the seal above is the evidence, so a failure here must not turn a
+    # good submission into an error.
+    mirrored = False
+    try:
+        with ctx["lock"]:
+            ctx["conn"].execute(
+                "INSERT INTO witness_log(api_key,peer,tip,peer_ts,observed,"
+                "audit_hash,block_index,note,url,liveness,name_status) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (FILED_UNDER, peer, tip, float(ts_int), observed, h, idx,
+                 "signed submission - verified against enrolled Ed25519 key",
+                 None, "peer-signed", "key-bound"))
+            ctx["conn"].commit()
+        mirrored = True
+    except Exception:
+        pass
+
+    return {"chain": peer, "witnessed_tip": tip, "observed_at": _iso(observed),
+            "peer_claimed_time": _iso(ts_int),
+            "sealed_in_our_chain": h, "block_index": idx,
+            "receipt_seq": receipt_seq,
+            "receipt_seq_scope": "per-chain",
+            "key_seq": key_seq,
+            "verification": "peer-signed",
+            "verified_against_pubkey": pubkey,
+            "on_public_roster": mirrored,
+            "signed_version": VERSION,
+            "verify": "/x/signed/verify?peer=" + peer + "&tip=" + tip,
+            "gapless": MESSAGES["seq"],
+            "key_seq_note": MESSAGES["key_seq"],
+            "what_this_proves": MESSAGES["what_this_proves"],
+            "what_this_does_not_prove": MESSAGES["what_this_does_not_prove"]}, 200
+
+
+def _rotate(ctx, data):
+    peer = _peer_name(data)
+    row = _key_row(ctx, peer)
+    if not row:
+        return {"error": "not_enrolled", "chain": peer}, 404
+    current, _enrolled, _h, _idx, rotations, last_ts = row
+
+    new_pubkey = str(data.get("new_pubkey") or data.get("pubkey") or "").strip().lower()
+    if not HEX64.match(new_pubkey) or _decodepoint(bytes.fromhex(new_pubkey)) is None:
+        return {"error": "invalid_pubkey",
+                "message": "new_pubkey must be an Ed25519 public key - 64 "
+                           "lowercase hex characters."}, 400
+    if new_pubkey == current:
+        return {"error": "no_change",
+                "message": "That is already the enrolled key."}, 400
+    signature = str(data.get("signature") or data.get("sig") or "").strip().lower()
+    if not HEX128.match(signature):
+        return {"error": "invalid_signature_format"}, 400
+    try:
+        ts_int = int(data.get("ts"))
+    except (TypeError, ValueError):
+        return {"error": "invalid_ts"}, 400
+    ok, why = _check_ts(ts_int, last_ts)
+    if not ok:
+        return {"error": "timestamp_rejected", "message": why,
+                "our_time": int(time.time())}, 400
+
+    message = "\n".join([ROTATE_PREFIX, peer, new_pubkey, str(ts_int)]).encode("utf-8")
+    if not ed25519_verify(bytes.fromhex(current), message, bytes.fromhex(signature)):
+        return {"error": "signature_did_not_verify",
+                "message": "Nothing has been changed. A rotation must be "
+                           "signed by the key being replaced. This is what "
+                           "stops anyone - including the operator of this "
+                           "deployment - swapping a peer's key.",
+                "we_verified_against": {
+                    "format": ROTATE_PREFIX + "\\n<chain>\\n<new pubkey>\\n<ts>",
+                    "the_exact_bytes_we_hashed":
+                        "\n".join([ROTATE_PREFIX, peer, new_pubkey,
+                                   str(ts_int)])},
+                "signed_by_key_expected": current}, 400
+
+    ts = time.time()
+    ev = {"user_id": "sig:" + peer, "action": "signed_key_rotated", "amount": 0,
+          "country": "UK", "device_id": "signed", "anomaly": 0, "device_risk": 0}
+    res = {"decision": "KEY_ROTATED", "score": 0, "signed_version": VERSION,
+           "peer": peer, "timestamp": ts,
+           "detail": "from=" + current + ";to=" + new_pubkey +
+                     ";authorised_by=" + current}
+    h, idx, _seq, seal_error = _try_seal(ctx, ev, res, ts, FILED_UNDER)
+
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "UPDATE signed_keys SET pubkey=?,rotations=?,last_ts=? WHERE peer=?",
+            (new_pubkey, (rotations or 0) + 1, float(ts_int), peer))
+        ctx["conn"].commit()
+
+    out = {"rotated": True, "chain": peer, "previous_pubkey": current,
+           "pubkey": new_pubkey, "rotations": (rotations or 0) + 1,
+           "sealed_in_our_chain": h, "block_index": idx,
+           "sealed": seal_error is None,
+           "latest_receipt_seq": _latest_seq(ctx, peer),
+           "signed_version": VERSION,
+           "sequence_note": MESSAGES["seq_survives_rotation"],
+           "message": "Rotation sealed. Both keys are permanently in the "
+                      "chain, so the history of this name's keys is public "
+                      "and cannot be tidied up later."}
+    if seal_error:
+        out["seal_error"] = seal_error
+        out["message"] = ("The rotation took effect and the new key is live. "
+                          "The audit note about it did not seal, which is "
+                          "reported rather than hidden.")
+    return out, 200
+
+
+def _keys(ctx):
+    with ctx["lock"]:
+        rows = ctx["conn"].execute(
+            "SELECT k.peer,k.pubkey,k.enrolled,k.block_index,k.rotations,k.note,"
+            "COALESCE(s.last_seq,0) FROM signed_keys k "
+            "LEFT JOIN signed_seq s ON s.peer = k.peer "
+            "ORDER BY k.enrolled ASC LIMIT ?", (MAX_LIST,)).fetchall()
+    out = []
+    for peer, pubkey, enrolled, idx, rotations, note, seq in rows:
+        entry = {"chain": peer, "pubkey": pubkey, "algorithm": "ed25519",
+                 "enrolled_at": _iso(enrolled), "enrolment_block": idx,
+                 "rotations": rotations or 0,
+                 "latest_receipt_seq": seq or 0}
+        if note and note.startswith("WARNING"):
+            entry["flag"] = note
+        out.append(entry)
+    return {"count": len(out), "keys": out, "signed_version": VERSION,
+            "note": MESSAGES["keys_note"],
+            "receipt_seq_note": (
+                "latest_receipt_seq is the highest receipt number issued to "
+                "that name on this lane. A keyholder whose own highest "
+                "receipt is lower than this has not received one of them, and "
+                "can say exactly how many. Public on purpose - a gap you can "
+                "only see from the inside is not evidence of anything."),
+            "how_to_check_a_record": (
+                "Take the pubkey from here, rebuild the canonical message "
+                "from the record at /x/signed/verify, and check the signature "
+                "with any Ed25519 implementation. You do not need anything "
+                "from us to do it and you do not have to believe us.")}, 200
+
+
+def _verify(ctx, data):
+    peer = str(data.get("peer", "")).strip().lower()
+    tip = str(data.get("tip", "")).strip().lower()
+    if not peer or not tip:
+        return {"error": "peer_and_tip_required",
+                "usage": "/x/signed/verify?peer=<name>&tip=<64 hex>"}, 400
+    with ctx["lock"]:
+        rows = ctx["conn"].execute(
+            "SELECT observed,peer_ts,signature,pubkey,audit_hash,block_index "
+            "FROM signed_log WHERE peer=? AND tip=? ORDER BY id ASC",
+            (peer, tip)).fetchall()
+    if not rows:
+        return {"signed_observation": False, "peer": peer, "tip": tip,
+                "message": "We hold no signed observation of this tip from "
+                           "this name. It may still be in the open lane - "
+                           "check /x/witness/attest."}, 404
+    observed, peer_ts, signature, pubkey, h, idx = rows[0]
+    ts_int = int(peer_ts)
+    return {"signed_observation": True, "chain": peer, "tip": tip,
+            "observed_at": _iso(observed), "peer_claimed_time": _iso(peer_ts),
+            "sealed_in_our_chain": h, "block_index": idx,
+            "times_observed": len(rows),
+            "latest_receipt_seq": _latest_seq(ctx, peer),
+            "signature": signature, "pubkey": pubkey, "algorithm": "ed25519",
+            "canonical_message": "\n".join([MSG_PREFIX, peer, tip, str(ts_int)]),
+            "canonical_message_bytes_note": (
+                "Those four lines joined by a single newline, UTF-8, no "
+                "trailing newline. Hash nothing yourself - Ed25519 takes the "
+                "message, not a digest of it."),
+            "signed_version": VERSION,
+            "what_this_proves": MESSAGES["what_this_proves"],
+            "what_this_does_not_prove": MESSAGES["what_this_does_not_prove"],
+            "recheck_it_yourself": (
+                "python: pip install pynacl, then "
+                "nacl.signing.VerifyKey(bytes.fromhex(pubkey))"
+                ".verify(canonical_message.encode(), bytes.fromhex(signature))")}, 200
+
+
+def _spec():
+    return {"signed_version": VERSION,
+            "what_this_lane_is": (
+                "Submissions signed by a key this deployment does not hold. "
+                "The open lane at /x/witness/observe proves somebody handed "
+                "us a tip. This lane proves the holder of a specific private "
+                "key did - including against us, because we only ever hold "
+                "the public half."),
+            "why_it_exists": (
+                "The HMAC lane binds a name to a shared secret, and a shared "
+                "secret is held by both parties. It closes third-party "
+                "submission under your name and does not close operator "
+                "submission under your name. This lane closes both, and it "
+                "does so by arithmetic rather than by our promise."),
+            "steps": [
+                "1. Generate an Ed25519 keypair. Keep the private half. It "
+                "never leaves your side and we have no route that accepts one.",
+                "2. POST /x/signed/enroll with {\"chain\":\"<name>\","
+                "\"pubkey\":\"<64 hex>\"}.",
+                "3. Build the canonical message, sign it, and POST "
+                "/x/signed/submit with {\"chain\",\"tip\",\"ts\",\"signature\"}.",
+                "4. GET /x/signed/verify?peer=&tip= for the receipt, which "
+                "carries everything a third party needs to recheck it "
+                "without us.",
+            ],
+            "canonical_message": {
+                "submit": MSG_PREFIX + "\\n<chain>\\n<tip>\\n<ts>",
+                "rotate": ROTATE_PREFIX + "\\n<chain>\\n<new pubkey>\\n<ts>",
+                "encoding": "UTF-8, single \\n between lines, no trailing "
+                            "newline. ts is integer epoch seconds.",
+            },
+            "replay_controls": {
+                "max_age_seconds": SKEW_PAST,
+                "max_future_seconds": SKEW_FUTURE,
+                "monotonic": "ts must be strictly greater than the last ts "
+                             "accepted for the name",
+                "duplicate_signatures": "refused",
+            },
+            "on_acceptance": {
+                "receipt_seq": MESSAGES["seq"],
+                "receipt_seq_scope": {'values': ['per-peer', 'per-name', 'per-chain'], 'per-peer': 'issued per registered peer_id. Used by /x/peer/submit.', 'per-name': 'issued per bound name. Used by /x/bind/submit.', 'per-chain': 'issued per enrolled chain name. Used by /x/signed/submit.', 'why_it_is_here': 'The three signed lanes each count within their own scope, so a receipt carries the scope of its own sequence rather than requiring the holder to remember which lane produced it. The set is closed: a value outside this list is an error on our side, not a new scope you should widen a schema for.', 'not_comparable_across_scopes': 'Two receipts with different scopes are counting different things and their numbers say nothing about each other.'},
+                "key_seq": MESSAGES["key_seq"],
+                "sequence_survives_rotation": MESSAGES["seq_survives_rotation"],
+                "seal_failure": (
+                    "If the audit chain does not seal your submission you get "
+                    "500 seal_failed with the reason, and nothing is "
+                    "recorded - no sequence number, no log row, no receipt. "
+                    "Send a fresh submission with a later ts once the fault "
+                    "is fixed. A receipt you cannot verify is worse than no "
+                    "receipt, so this lane will not issue one."),
+                "two_different_completeness_claims": (
+                    "receipt_seq is about completeness of the receipts WE "
+                    "issued to you. It says nothing about completeness of the "
+                    "records YOUR chain sealed, which no signature can reach "
+                    "and which is listed under honest_limits."),
+            },
+            "this_lane_rejects": (
+                "Unlike the open lane, a submission that does not verify is "
+                "refused and nothing is sealed. Writing an unverifiable "
+                "signature into a name's history is the harm, not the "
+                "protection."),
+            "key_rotation": (
+                "A rotation must be signed by the key being replaced. Nobody "
+                "who lacks the current private key can rotate it, this "
+                "deployment included, and every rotation is sealed with both "
+                "keys recorded."),
+            "honest_limits": [
+                "Does not prove the records behind the tip are true.",
+                "Does not prove the peer's own chain is complete. Catching an "
+                "omission there needs an audit protocol, not cryptography.",
+                "Does not prove who the keyholder is in the world - only that "
+                "the same party signed each time.",
+                "Enrolment is open, so the first party to enrol a name gets "
+                "it. An enrolment over a name already seen in the open lane "
+                "is flagged permanently, which is detection and not "
+                "prevention.",
+                "receipt_seq proves you are missing a receipt. It does not "
+                "prove why, and it cannot distinguish a lost response from "
+                "one that was never sent.",
+            ],
+            "changed_in_1_1_1": [
+                "receipt_seq_scope is now a bare token from a closed set - "
+                "per-peer, per-name, per-chain - rather than a sentence, "
+                "and the set is published so a closed schema can pin an "
+                "enum. Asked for by Philip Pinol (PRAXIS). Value change "
+                "only; the response shape is unchanged from 1.1.",
+            ],
+            "changed_in_1_1": [
+                "receipt_seq is a real per-chain gapless sequence issued by "
+                "this module, not the api_key counter that was always null "
+                "here because this lane files under a label rather than a "
+                "key. The completeness property applies to this lane for the "
+                "first time.",
+                "The api_key counter is still returned, as key_seq, and is "
+                "null by design so the absence is stated rather than hidden.",
+                "A failed seal returns 500 and records nothing, instead of "
+                "returning a receipt with no block behind it.",
+                "Enrolment and rotation report sealed true or false with the "
+                "error, rather than sealing as a side effect and ignoring "
+                "the outcome.",
+                "/x/signed/keys publishes latest_receipt_seq per name.",
+            ],
+            "what_this_proves": MESSAGES["what_this_proves"],
+            "what_this_does_not_prove": MESSAGES["what_this_does_not_prove"]}, 200
+
+
+def handle(method, action, data, api_key, ctx):
+    _setup(ctx)
+    if method == "POST":
+        if action == "enroll":
+            return _enroll(ctx, data)
+        if action == "submit":
+            return _submit(ctx, data)
+        if action == "rotate":
+            return _rotate(ctx, data)
+    else:
+        if action == "spec":
+            return _spec()
+        if action == "keys":
+            return _keys(ctx)
+        if action == "verify":
+            return _verify(ctx, data)
+    return {"error": "unknown_action", "action": action}, 404
+
+```
 
 
 ## `modules/sortition.py`
@@ -800,1089 +1759,5 @@ def _spec():
             "GET /x/sortition/status": "coverage and response rate",
         },
     }
-
-```
-
-
-## `modules/sound.py`
-
-517 lines, 37833 bytes
-
-```python
-"""
-modules/sound.py  v5.0.0
-Background music and button pops across sebbi.pro.
-
-Arm after each deploy:  https://sebbi.pro/x/sound/status
-(or everything at once:  https://sebbi.pro/x/arm/status)
-
-What visitors get on every page:
-  - Twenty original electro/rave tunes, each a different style, rotating:
-    acid house, electro, hoover rave, breakbeat, trance, minimal acid,
-    hard-kick acid with sirens, 168 bpm gabber, 172 bpm jungle, half-time
-    wobble, bleep techno, psytrance, UK garage, stutter-gated acid,
-    hardcore, electro acid, trance hoovers, wobbly electro, and an
-    everything-at-once finale. Lasers, air-raid sirens, stutter gates,
-    wobble bass, impacts on every drop, snare rolls and risers.
-  - Real tracks: put audio files (mp3, m4a, ogg, wav) in modules/music/ in
-    GitHub and the player plays those instead, shuffled.
-  - A soft "pop" whenever a button or link is pressed.
-  - A small music button under MY EARNINGS: play/pause, next, volume,
-    pops on/off. Choices are remembered.
-  - Starts on the visitor's first tap (browsers allow nothing before that),
-    fades out while any video plays, pauses when the tab is hidden.
-
-Nothing in server.py is edited.
-"""
-
-import io
-import json
-import os
-import re
-import sys
-from urllib.parse import quote, unquote
-
-VERSION = "5.0.0"
-PUBLIC = {("GET", "status"), ("GET", "spec")}
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-MUSIC_DIR = os.path.join(HERE, "music")
-AUDIO_TYPES = {".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".aac": "audio/aac", ".ogg": "audio/ogg",
-               ".oga": "audio/ogg", ".opus": "audio/ogg", ".wav": "audio/wav", ".webm": "audio/webm",
-               ".flac": "audio/flac"}
-
-TAG = b'<script src="/sound.js?v=' + VERSION.encode() + b'" defer id="sebbi-sound-js"></script>'
-MARK = b'id="sebbi-sound-js"'
-SKIP_PREFIX = ("/api", "/x/", "/p/", "/sound", "/admin", "/webhook", "/stripe", "/.well-known", "/static")
-
-JS = r"""
-(function(){
-if(window.__sebbiSound)return;window.__sebbiSound=1;
-var AC=window.AudioContext||window.webkitAudioContext;if(!AC)return;
-function lg(k,d){try{var v=localStorage.getItem('sbs_'+k);return v===null?d:JSON.parse(v)}catch(e){return d}}
-function ls(k,v){try{localStorage.setItem('sbs_'+k,JSON.stringify(v))}catch(e){}}
-function sg(k,d){try{var v=sessionStorage.getItem('sbs_'+k);return v===null?d:JSON.parse(v)}catch(e){return d}}
-function ss(k,v){try{sessionStorage.setItem('sbs_'+k,JSON.stringify(v))}catch(e){}}
-var st={music:lg('music',true),pops:lg('pops',true),vol:lg('vol',0.7)};
-var SH={m:[0,3,7,12],M:[0,4,7,12],s:[0,5,7,12]};
-// acid patterns: 16 steps, [semitone offset or null, accent, slide]
-function A(s){return s.split(' ').map(function(x){if(x==='.')return null;var a=x.indexOf('!')>=0,sl=x.indexOf('~')>=0;return [parseInt(x.replace(/[!~]/g,''),10),a,sl]})}
-var AC_=["0! 0 12 0 . 0 3~ 0 0! . 12 10~ 0 . 7 0", "0! . 0 12~ 0 . 0! 3 . 0 10 0 12! . 0 7~", "0! 0 . 0 12! 0 . 5~ 7 . 0 0! . 3 0 12~", "0! 12 0 . 0 12~ 13 0 0! . 0 12 . 10~ 0 .", "0! . 3 0 . 0! 7~ 0 . 12 0 . 0! 10 . 7~", "0! . . 0 . . 0 12~ . 0! . . 3 . 0 ."].map(A);
-var PR=[[[0,'m'],[0,'m'],[-4,'M'],[-2,'M']],[[0,'m'],[3,'M'],[-2,'M'],[0,'m']],[[0,'m'],[-4,'M'],[-7,'m'],[-5,'M']],[[0,'m'],[1,'M'],[0,'m'],[-2,'M']],[[0,'m'],[-4,'M'],[3,'M'],[-2,'M']],[[0,'m'],[0,'m'],[0,'m'],[-2,'M']],[[0,'s'],[0,'m'],[-2,'s'],[-2,'M']]];
-function T(name,k,bpm,drums,bass,lead,stab,hats,pr,ac,fx,o){var t={name:name,k:k,bpm:bpm,drums:drums,bass:bass,lead:lead,stab:stab,hats:hats,prog:PR[pr],acid:AC_[ac],fx:fx,sw:0,kick:'soft',arp:[0,2,1,3,2,1,0,3]};if(o)for(var x in o)t[x]=o[x];return t}
-var TUNES=[
- T('Night Shift',45,128,'four','acid','none','saw',2,0,0,'I',{g:1.0}),
- T('Robot Talk',43,116,'electro','square','sqarp','none',1,1,0,'IL'),
- T('Warehouse',47,138,'four','offbeat','none','hoover',3,2,0,'IS'),
- T('Breakbeat Heart',44,136,'breaks','reese','none','saw',1,3,0,'I'),
- T('Laser Lights',50,134,'four','offbeat','arp','none',2,4,0,'IL',{arp:[0,1,2,3,2,1,2,3],g:1.2}),
- T('Low Tide',48,124,'four','acid','none','none',1,5,5,'I',{g:0.9}),
- T('Air Raid',46,140,'four','acid','none','saw',3,2,1,'ISL',{kick:'hard'}),
- T('Gabber Guard',44,168,'gabber','offbeat','none','hoover',3,0,0,'ILS',{kick:'gabber',g:1.2}),
- T('Jungle Proof',45,172,'dnb','reese','bleep','none',2,1,0,'IS',{g:0.7}),
- T('Wobble Chain',43,140,'half','wobble','none','none',2,3,0,'IL',{g:0.55}),
- T('Bleep Test',48,126,'four','square','bleep','none',2,5,0,'I',{g:0.5}),
- T('Psy Ledger',46,142,'four','roll','acidlead','none',2,0,3,'IL'),
- T('Two Step Witness',49,132,'twostep','offbeat','bleep','saw',2,4,0,'I',{sw:.14,g:1.4}),
- T('Stutter Gate',47,130,'four','acid','arp','saw',2,1,2,'IT',{g:1.0}),
- T('Hardcore Hash',45,150,'breaks','offbeat','none','hoover',3,2,0,'ISL',{kick:'hard',g:1.2}),
- T('Chain Reaction',44,128,'electro','acid','none','none',2,6,4,'ILT',{g:1.3}),
- T('Ultraviolet',50,136,'four','roll','arp','hoover',2,4,0,'IL'),
- T('Block Height',43,124,'electro','wobble','bleep','none',1,5,0,'I',{wdiv:8,g:0.5}),
- T('Final Seal',46,145,'four','acid','acidlead','saw',3,0,1,'ISLT',{kick:'hard'}),
- T('After Hours',48,128,'four','square','sqarp','saw',2,6,0,'IL')
-];
-var BARS=64;
-
-var padGate,ctx=null,master,musicBus,popBus,scBus,padBus,padLP,stabBus,acidBus,acidLP,acidLFO,drumBus,lp,lpVal=4000,dly,started=false,playing=false,timer=null,switching=false;
-var cur=null,ti=0,step=0,nextT=0,duck=1,BUF={},lastAcidHz=0;
-var FILES=null,fi=0,audio=null,fileBus=null,mode='gen',curName='';
-
-function mk(len,fn){var sr=ctx.sampleRate,n=Math.floor(sr*len),b=ctx.createBuffer(1,n,sr);fn(b.getChannelData(0),sr,n);return b}
-function impulse(sec,pre){var r=ctx.sampleRate,n=Math.floor(r*sec),p=Math.floor(r*pre),b=ctx.createBuffer(2,n,r);for(var c=0;c<2;c++){var d=b.getChannelData(c),l=0;for(var i=p;i<n;i++){l+=((Math.random()*2-1)-l)*.5;d[i]=l*Math.pow(1-(i-p)/(n-p),3)}}return b}
-function drums(){
- BUF.kick=mk(.5,function(d,sr,n){var ph=0;for(var i=0;i<n;i++){var t=i/sr,f=48+190*Math.exp(-t*45);ph+=6.2832*f/sr;var a=t<.002?t/.002:Math.exp(-(t-.002)*6.5);d[i]=Math.tanh(2.2*Math.sin(ph)*a)*.9+(t<.004?(Math.random()*2-1)*.3*(1-t/.004):0)}});
- BUF.clap=mk(.4,function(d,sr,n){var a=0,p=0;for(var i=0;i<n;i++){var t=i/sr;a+=((Math.random()*2-1)-a)*.55;var h=a-p;p=a;var e=Math.exp(-t*13)+(t<.03?Math.exp(-((t*1000)%10)*.5)*.7:0);d[i]=h*e*1.2}});
- BUF.snare=mk(.25,function(d,sr,n){var a=0,p=0,ph=0;for(var i=0;i<n;i++){var t=i/sr;a+=((Math.random()*2-1)-a)*.6;var h=a-p;p=a;ph+=6.2832*200/sr;d[i]=h*Math.exp(-t*20)+Math.sin(ph)*Math.exp(-t*35)*.35}});
- BUF.ch=mk(.07,function(d,sr,n){var p=0;for(var i=0;i<n;i++){var r=Math.random()*2-1,t=i/sr;d[i]=(r-p)*Math.exp(-t*65)*.5;p=r}});
- BUF.oh=mk(.35,function(d,sr,n){var p=0;for(var i=0;i<n;i++){var r=Math.random()*2-1,t=i/sr;d[i]=(r-p)*(t<.002?t/.002:Math.exp(-t*11))*.42;p=r}});
- BUF.hkick=mk(.55,function(d,sr,n){var ph=0;for(var i=0;i<n;i++){var t=i/sr,f=46+260*Math.exp(-t*40);ph+=6.2832*f/sr;var a=t<.002?t/.002:Math.exp(-(t-.002)*5);d[i]=Math.tanh(4*Math.sin(ph)*a)*.8}});
- BUF.gkick=mk(.4,function(d,sr,n){var ph=0;for(var i=0;i<n;i++){var t=i/sr,f=55+300*Math.exp(-t*30);ph+=6.2832*f/sr;var a=t<.002?t/.002:Math.exp(-(t-.002)*7);d[i]=Math.tanh(9*Math.sin(ph)*a)*.62}});
- BUF.noise=mk(2,function(d){for(var i=0;i<d.length;i++)d[i]=Math.random()*2-1});
-}
-function init(){
- if(ctx)return;
- try{ctx=new AC()}catch(e){ctx=null;return}
- var comp=ctx.createDynamicsCompressor();comp.threshold.value=-14;comp.ratio.value=4;comp.attack.value=.005;comp.release.value=.15;comp.connect(ctx.destination);
- master=ctx.createGain();master.gain.value=1;master.connect(comp);
- popBus=ctx.createGain();popBus.gain.value=.3;popBus.connect(master);
- musicBus=ctx.createGain();musicBus.gain.value=0;
- lp=ctx.createBiquadFilter();lp.type='lowpass';lp.frequency.value=lpVal;lp.Q.value=.8;musicBus.connect(lp);
- var dry=ctx.createGain();dry.gain.value=.9;lp.connect(dry);dry.connect(master);
- var verb=ctx.createConvolver();verb.buffer=impulse(3,.02);var wet=ctx.createGain();wet.gain.value=.22;lp.connect(verb);verb.connect(wet);wet.connect(master);
- scBus=ctx.createGain();scBus.connect(musicBus);
- padLP=ctx.createBiquadFilter();padLP.type='lowpass';padLP.frequency.value=1800;padBus=ctx.createGain();padGate=ctx.createGain();padBus.connect(padGate);padGate.connect(padLP);padLP.connect(scBus);
- stabBus=ctx.createGain();stabBus.connect(scBus);
- // acid: resonant filter with slow LFO opening/closing, then drive
- acidLP=ctx.createBiquadFilter();acidLP.type='lowpass';acidLP.Q.value=14;acidLP.frequency.value=600;
- var al=ctx.createOscillator(),ag=ctx.createGain();al.frequency.value=1/15;ag.gain.value=450;al.connect(ag);ag.connect(acidLP.frequency);al.start();acidLFO=ag;
- var drv=ctx.createWaveShaper(),cv=new Float32Array(1024);for(var i=0;i<1024;i++){var x=i/511.5-1;cv[i]=Math.tanh(2.5*x)/Math.tanh(2.5)}drv.curve=cv;
- acidBus=ctx.createGain();acidBus.gain.value=.55;acidLP.connect(drv);drv.connect(acidBus);acidBus.connect(scBus);
- dly=ctx.createDelay(2);var fb=ctx.createGain();fb.gain.value=.35;var dl=ctx.createBiquadFilter();dl.type='lowpass';dl.frequency.value=2800;var dh=ctx.createBiquadFilter();dh.type='highpass';dh.frequency.value=400;
- var send=ctx.createGain();send.gain.value=.35;var dOut=ctx.createGain();dOut.gain.value=.45;
- stabBus.connect(send);acidBus.connect(send);send.connect(dh);dh.connect(dly);dly.connect(dl);dl.connect(fb);fb.connect(dly);
- if(ctx.createStereoPanner){var dp=ctx.createStereoPanner();dp.pan.value=.45;dl.connect(dp);dp.connect(dOut)}else dl.connect(dOut);dOut.connect(scBus);
- drumBus=ctx.createGain();drumBus.gain.value=1;drumBus.connect(musicBus);
- drums();
- document.addEventListener('visibilitychange',function(){if(!ctx)return;if(document.hidden){save();if(audio&&!audio.paused)audio.pause();if(ctx.state==='running')ctx.suspend()}else if(started){ctx.resume();if(mode==='file'&&playing&&audio)audio.play().catch(function(){})}});
-}
-function hz(m){return 440*Math.pow(2,(m-69)/12)}
-function level(){return playing?(.8*st.vol*duck*(cur&&cur.g||1)):0}
-function setLevel(sec){if(!ctx)return;var t=ctx.currentTime,g=mode==='file'&&fileBus?fileBus.gain:musicBus.gain,o=mode==='file'?musicBus.gain:(fileBus?fileBus.gain:null),lv=mode==='file'?.5*st.vol*duck*(playing?1:0):level();
- g.cancelScheduledValues(t);g.setValueAtTime(g.value,t);g.linearRampToValueAtTime(lv,t+(sec||.6));if(o){o.cancelScheduledValues(t);o.setValueAtTime(o.value,t);o.linearRampToValueAtTime(0,t+.5)}}
-
-function voice(root,shape){var out=[];for(var i=0;i<shape.length;i++){var n=root+shape[i];while(n<57)n+=12;while(n>74)n-=12;out.push(n)}return out.sort(function(a,b){return a-b})}
-function supersaw(ns,t,dur,peak,dest,att,filt){
- var f=ctx.createBiquadFilter(),g=ctx.createGain();f.type='lowpass';f.Q.value=1;f.frequency.setValueAtTime(filt[0],t);f.frequency.exponentialRampToValueAtTime(filt[1],t+Math.min(dur,.5));
- g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(peak,t+att);g.gain.setValueAtTime(peak,t+Math.max(att,dur*.4));g.gain.exponentialRampToValueAtTime(.0001,t+dur);
- f.connect(g);g.connect(dest);
- var det=[-24,-13,-5,0,6,14,25];
- for(var i=0;i<ns.length;i++){for(var j=0;j<det.length;j++){var o=ctx.createOscillator();o.type='sawtooth';o.frequency.value=hz(ns[i]);o.detune.value=det[j]+(Math.random()*3);var pg=ctx.createGain();pg.gain.value=.14;o.connect(pg);pg.connect(f);o.start(t);o.stop(t+dur+.05)}}
-}
-function acid(m,t,len,acc,slide){
- var o=ctx.createOscillator(),g=ctx.createGain(),f=hz(m);o.type='sawtooth';
- if(slide&&lastAcidHz){o.frequency.setValueAtTime(lastAcidHz,t);o.frequency.exponentialRampToValueAtTime(f,t+.06)}else o.frequency.setValueAtTime(f,t);
- lastAcidHz=f;
- var pk=acc?.34:.22;g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(pk,t+.004);g.gain.setValueAtTime(pk*.8,t+len*.7);g.gain.exponentialRampToValueAtTime(.0001,t+len+(slide?.04:.01));
- // per-note filter squelch on top of the slow sweep
- var fe=ctx.createGain();fe.gain.value=0;var eo=ctx.createConstantSource?ctx.createConstantSource():null;
- if(eo){eo.offset.setValueAtTime(acc?1500:800,t);eo.offset.exponentialRampToValueAtTime(1,t+(acc?.18:.12));eo.connect(acidLP.frequency);eo.start(t);eo.stop(t+len+.05)}
- o.connect(g);g.connect(acidLP);o.start(t);o.stop(t+len+.06);
-}
-function hit(n,t,v,rate){var s=ctx.createBufferSource(),g=ctx.createGain();s.buffer=BUF[n];if(rate)s.playbackRate.value=rate;g.gain.value=v;s.connect(g);g.connect(drumBus);s.start(t)}
-function kick(t){var kt=cur.kick==='gabber'?'gkick':(cur.kick==='hard'?'hkick':'kick');hit(kt,t,kt==='kick'?.62:.5);scBus.gain.cancelScheduledValues(t);scBus.gain.setValueAtTime(.3,t);scBus.gain.setTargetAtTime(1,t+.01,.07)}
-function riser(t,dur){var s=ctx.createBufferSource(),f=ctx.createBiquadFilter(),g=ctx.createGain();s.buffer=BUF.noise;s.loop=true;f.type='bandpass';f.Q.value=1.6;
- f.frequency.setValueAtTime(300,t);f.frequency.exponentialRampToValueAtTime(9000,t+dur);g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(.09,t+dur);g.gain.linearRampToValueAtTime(0,t+dur+.03);
- s.connect(f);f.connect(g);g.connect(musicBus);s.start(t);s.stop(t+dur+.05)}
-function sweep(t,from,to,dur){lp.frequency.cancelScheduledValues(t);lp.frequency.setValueAtTime(from||lpVal,t);lp.frequency.exponentialRampToValueAtTime(to,t+dur);lpVal=to}
-function e16(){return 60/cur.bpm/4}
-
-function pluckSaw(m,t,peak,type,dec,cut){var o=ctx.createOscillator(),f=ctx.createBiquadFilter(),g=ctx.createGain();o.type=type;o.frequency.value=hz(m);f.type='lowpass';f.Q.value=4;f.frequency.setValueAtTime(cut,t);f.frequency.exponentialRampToValueAtTime(400,t+dec);
- g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(peak,t+.003);g.gain.exponentialRampToValueAtTime(.0001,t+dec);o.connect(f);f.connect(g);g.connect(stabBus);o.start(t);o.stop(t+dec+.02)}
-function hoover(ns,t,dur){for(var i=0;i<ns.length;i++){for(var j=0;j<3;j++){var o=ctx.createOscillator(),g=ctx.createGain(),f=hz(ns[i]);o.type='sawtooth';o.frequency.setValueAtTime(f*.7,t);o.frequency.exponentialRampToValueAtTime(f,t+.07);o.detune.value=(j-1)*22;
- g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(.022,t+.01);g.gain.exponentialRampToValueAtTime(.0001,t+dur);var pw=ctx.createBiquadFilter();pw.type='bandpass';pw.frequency.value=f*2;pw.Q.value=.6;o.connect(pw);pw.connect(g);g.connect(stabBus);o.start(t);o.stop(t+dur+.02)}}}
-function reese(m,t,dur){var f=ctx.createBiquadFilter(),g=ctx.createGain();f.type='lowpass';f.frequency.setValueAtTime(260,t);f.frequency.linearRampToValueAtTime(700,t+dur*.5);f.frequency.linearRampToValueAtTime(300,t+dur);
- g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(.2,t+.03);g.gain.setValueAtTime(.2,t+dur-.08);g.gain.exponentialRampToValueAtTime(.0001,t+dur);f.connect(g);g.connect(scBus);
- [-9,9].forEach(function(d){var o=ctx.createOscillator();o.type='sawtooth';o.frequency.value=hz(m);o.detune.value=d;o.connect(f);o.start(t);o.stop(t+dur+.02)});var s=ctx.createOscillator(),sg=ctx.createGain();s.frequency.value=hz(m-12);sg.gain.value=.5;s.connect(sg);sg.connect(g);s.start(t);s.stop(t+dur+.02)}
-function obass(m,t,len,type){var o=ctx.createOscillator(),o2=ctx.createOscillator(),f=ctx.createBiquadFilter(),g=ctx.createGain(),g2=ctx.createGain();o.frequency.value=hz(m);o2.type=type||'sawtooth';o2.frequency.value=hz(m);g2.gain.value=.35;f.type='lowpass';f.frequency.value=900;f.Q.value=1.5;
- g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(.3,t+.006);g.gain.exponentialRampToValueAtTime(.12,t+len);g.gain.exponentialRampToValueAtTime(.0001,t+len+.04);
- o.connect(f);o2.connect(g2);g2.connect(f);f.connect(g);g.connect(scBus);o.start(t);o2.start(t);o.stop(t+len+.06);o2.stop(t+len+.06)}
-var DR={four:{k:[0,4,8,12],c:[4,12],g:[],sn:0},gabber:{k:[0,4,8,12],c:[4,12],g:[],sn:0},electro:{k:[0,6,10],c:[4,12],g:[14],sn:0},breaks:{k:[0,10],c:[4,12],g:[7,15],sn:1},dnb:{k:[0,10],c:[4,12],g:[7,14],sn:1},half:{k:[0,11],c:[8],g:[14],sn:1},twostep:{k:[0,7,10],c:[4,12],g:[],sn:1}};
-function laser(t){var o=ctx.createOscillator(),g=ctx.createGain(),f0=1500+Math.random()*2500;o.type=Math.random()<.5?'sawtooth':'square';o.frequency.setValueAtTime(f0,t);o.frequency.exponentialRampToValueAtTime(70,t+.28);
- g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(.045,t+.005);g.gain.exponentialRampToValueAtTime(.0001,t+.3);var bp=ctx.createBiquadFilter();bp.type='lowpass';bp.frequency.value=5000;o.connect(bp);bp.connect(g);g.connect(stabBus);o.start(t);o.stop(t+.32)}
-function siren(t,dur,m){var o=ctx.createOscillator(),l=ctx.createOscillator(),lg_=ctx.createGain(),g=ctx.createGain(),f=ctx.createBiquadFilter();o.type='sawtooth';o.frequency.value=hz(m);l.frequency.value=5.5;lg_.gain.value=500;l.connect(lg_);lg_.connect(o.detune);
- f.type='bandpass';f.frequency.value=hz(m)*2;f.Q.value=.7;g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(.05,t+.2);g.gain.setValueAtTime(.05,t+dur-.25);g.gain.exponentialRampToValueAtTime(.0001,t+dur);
- o.connect(f);f.connect(g);g.connect(stabBus);o.start(t);l.start(t);o.stop(t+dur+.02);l.stop(t+dur+.02)}
-function bleep(m,t){var o=ctx.createOscillator(),g=ctx.createGain();o.type='square';o.frequency.value=hz(m);g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(.035,t+.003);g.gain.exponentialRampToValueAtTime(.0001,t+.09);var f=ctx.createBiquadFilter();f.type='lowpass';f.frequency.value=3500;o.connect(f);f.connect(g);g.connect(stabBus);o.start(t);o.stop(t+.1)}
-function wbass(m,t,len,per){var f=ctx.createBiquadFilter(),g=ctx.createGain();f.type='lowpass';f.Q.value=9;for(var x=t;x<t+len-.01;x+=per){f.frequency.setValueAtTime(160,x);f.frequency.exponentialRampToValueAtTime(1700,x+per*.45);f.frequency.exponentialRampToValueAtTime(160,x+per*.95)}
- g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(.24,t+.02);g.gain.setValueAtTime(.24,t+len-.05);g.gain.exponentialRampToValueAtTime(.0001,t+len);f.connect(g);g.connect(scBus);
- [['sawtooth',0],['square',-8]].forEach(function(v){var o=ctx.createOscillator();o.type=v[0];o.frequency.value=hz(m);o.detune.value=v[1];o.connect(f);o.start(t);o.stop(t+len+.02)});var s=ctx.createOscillator(),sg=ctx.createGain();s.frequency.value=hz(m-12);sg.gain.value=.6;s.connect(sg);sg.connect(g);s.start(t);s.stop(t+len+.02)}
-function impact(t){var o=ctx.createOscillator(),g=ctx.createGain();o.frequency.setValueAtTime(90,t);o.frequency.exponentialRampToValueAtTime(28,t+1.2);g.gain.setValueAtTime(.4,t);g.gain.exponentialRampToValueAtTime(.0001,t+1.3);o.connect(g);g.connect(musicBus);o.start(t);o.stop(t+1.35);
- var s=ctx.createBufferSource(),f=ctx.createBiquadFilter(),ng=ctx.createGain();s.buffer=BUF.noise;f.type='lowpass';f.frequency.setValueAtTime(8000,t);f.frequency.exponentialRampToValueAtTime(200,t+1.5);ng.gain.setValueAtTime(.09,t);ng.gain.exponentialRampToValueAtTime(.0001,t+1.6);s.connect(f);f.connect(ng);ng.connect(musicBus);s.start(t);s.stop(t+1.7)}
-function schedule(s,t){
- var b=Math.floor(s/16),k=s%16,e=e16(),bd=e*16,ch=cur.prog[b%cur.prog.length],ns=voice(cur.k+ch[0],SH[ch[1]]),root=cur.k-12+ch[0],fx=cur.fx;
- var intro=b<4,brk=b>=32&&b<40,roll=b>=38&&b<40,outro=b>=58,dp=DR[cur.drums];
- var drumsOn=b>=4&&!brk&&b<62,full=(b>=16&&b<32)||(b>=40&&!outro),bassOn=!(b>=32&&b<36)&&b<62,leadOn=(b>=8&&!brk&&!outro)||(b>=36&&b<40);
- if(k===0){
-  if(b===0)sweep(t,700,2500,bd*4);
-  if(b===4)sweep(t,0,4000,bd*.5);
-  if(b===16){sweep(t,0,9000,bd*.25);if(fx.indexOf('I')>=0)impact(t)}
-  if(b===32)sweep(t,0,1400,bd*2);
-  if(b===36)sweep(t,0,6000,bd*4);
-  if(b===38)riser(t,bd*2);
-  if(b===40){sweep(t,0,9000,bd*.1);if(fx.indexOf('I')>=0)impact(t)}
-  if(b===58)sweep(t,0,700,bd*4);
- }
- if(bassOn){
-  var bt=cur.bass;
-  if(bt==='acid'){var st_=cur.acid[k];if(st_){var nx=cur.acid[(k+1)%16];acid(root+st_[0],t,e*(nx&&nx[2]?1.02:.55),st_[1],st_[2])}}
-  else if(bt==='reese'){if(k===0)reese(root,t,bd*.98)}
-  else if(bt==='wobble'){if(k===0||k===8)wbass(root,t,e*8,e*(cur.wdiv||4))}
-  else if(bt==='square'){var pat=[0,null,0,12,null,0,null,7,0,null,12,0,null,3,null,0];if(pat[k]!==null)obass(root+pat[k],t,e*.8,'square')}
-  else if(bt==='roll'){if(k%4!==0)obass(root+(k%4===3&&b%2?12:0),t,e*.7,'sawtooth')}
-  else if(bt==='offbeat'&&k%4===2)obass(root+(k===14&&b%2?12:0),t,e*1.5);
- }
- if(leadOn){
-  var ld=cur.lead;
-  if(ld==='arp'){var an=ns[cur.arp[(k>>1)%8]%ns.length]+12;if(k%2===0||full)pluckSaw(an+(k%2?12:0),t,full?.07:.05,'sawtooth',.14,full?5000:2500)}
-  else if(ld==='sqarp'&&(k%2===0||(full&&k%4===3))){var sn=ns[cur.arp[(k>>1)%8]%ns.length]+(k%4===0?0:12);pluckSaw(sn,t,.06,'square',.1,3500)}
-  else if(ld==='bleep'){var bp=[1,0,0,1,0,0,1,0,0,0,1,0,1,0,0,0];if(bp[k]&&(full||k<8))bleep(ns[(k+b)%ns.length]+24,t)}
-  else if(ld==='acidlead'&&full){var al=cur.acid[(k+8)%16];if(al)acid(root+24+al[0],t,e*.5,al[1],al[2])}
- }
- if(fx.indexOf('L')>=0&&(full||brk)&&((k===14&&b%2===1)||(k===6&&b%4===3)||(Math.random()<.02)))laser(t);
- if(fx.indexOf('S')>=0&&k===0&&((b===36)||(full&&b%16===8)))siren(t,bd*(b===36?4:2),cur.k+12);
- if(fx.indexOf('T')>=0)padGate.gain.setValueAtTime(full?(k%2?.1:1):1,t);
- if(brk&&k===0&&b%2===0)supersaw(ns,t,bd*2,.05,padBus,.6,[900,2600]);
- if(cur.stab==='saw'&&(full||(b>=36&&b<40))&&(k===2||k===6||k===10||k===14||(k===7&&b%2===1)))supersaw(ns,t,.2,.05,stabBus,.004,[4200,900]);
- if(cur.stab==='hoover'&&(full||(b>=36&&b<40))&&(k===0||k===6||k===12)&&b%2===0)hoover(ns,t,.45);
- if(full&&k===0&&b%4===0&&cur.lead!=='sqarp')supersaw(ns,t,bd*4,.016,padBus,.8,[1200,2000]);
- if(drumsOn){
-  if(dp.k.indexOf(k)>=0||(cur.drums==='electro'&&k===14&&b%2))kick(t);
-  if(dp.c.indexOf(k)>=0&&(full||cur.drums!=='four'))hit(dp.sn?'snare':'clap',t,dp.sn?.26:.2);
-  if(dp.g.indexOf(k)>=0&&dp.sn)hit('snare',t,.07);
-  if((cur.drums==='four'||cur.drums==='gabber')&&!outro&&k%4===2)hit('oh',t,full?.14:.09);
- }
- if(!brk&&b<62&&!(intro&&b<2)){var hv=[.55,.25,.4,.25][k%4],on=cur.hats===3||(cur.hats===2)||(cur.hats===1&&k%2===0);if(on)hit('ch',t,hv*(full?.14:.09)*(cur.hats===3?1.1:1))}
- if(roll){var i=(b-38)*16+k,den=i<16?(k%4===0):(i<24?k%2===0:true);if(den)hit('snare',t,.05+.2*(i/32))}
-}
-function tick(){
- if(!ctx||!playing||switching||mode!=='gen')return;
- var e=e16();
- while(nextT<ctx.currentTime+.3){schedule(step,nextT);nextT+=e*(1+(step%2?-cur.sw:cur.sw));step++;if(step>=BARS*16){nextTune(1);return}}
-}
-function loadTune(i,skip){
- ti=((i%TUNES.length)+TUNES.length)%TUNES.length;cur=TUNES[ti];curName=cur.name;step=skip?64:0;if(skip)lpVal=4000;lastAcidHz=0;if(padGate)padGate.gain.setValueAtTime(1,ctx.currentTime);
- dly.delayTime.setValueAtTime(60/cur.bpm*.75,ctx.currentTime);
- nextT=ctx.currentTime+.1;ss('ti',ti);ui();
-}
-function nextTune(dir){
- if(switching)return;switching=true;var t=ctx.currentTime;
- musicBus.gain.cancelScheduledValues(t);musicBus.gain.setValueAtTime(musicBus.gain.value,t);musicBus.gain.linearRampToValueAtTime(0,t+1.5);
- setTimeout(function(){switching=false;loadTune(ti+(dir||1),true);setLevel(1)},1600);
-}
-function playFile(i){
- fi=((i%FILES.length)+FILES.length)%FILES.length;
- if(!audio){audio=new Audio();audio.preload='auto';var src=ctx.createMediaElementSource(audio);fileBus=ctx.createGain();fileBus.gain.value=0;src.connect(fileBus);fileBus.connect(master);
-  audio.addEventListener('ended',function(){playFile(fi+1)});audio.addEventListener('error',function(){setTimeout(function(){if(FILES.length>1)playFile(fi+1)},800)})}
- var resume=sg('fpos',null);audio.src=FILES[fi].url;
- if(resume&&resume.i===fi){audio.addEventListener('loadedmetadata',function h(){audio.removeEventListener('loadedmetadata',h);try{audio.currentTime=resume.t}catch(e){}})}
- ss('fpos',null);curName=FILES[fi].name;ss('fi',fi);var p=audio.play();if(p&&p.catch)p.catch(function(){});ui();
-}
-function play(){
- init();if(!ctx)return;ctx.resume();playing=true;
- if(mode==='file'){if(!audio||!audio.src)playFile(sg('fi',0));else{audio.play().catch(function(){})}setLevel(1.5);ui();return}
- if(!cur)loadTune(sg('ti',Math.floor(Math.random()*TUNES.length)),true);
- nextT=Math.max(nextT,ctx.currentTime+.1);if(!timer)timer=setInterval(tick,50);setLevel(2);ui();
-}
-function pause(){playing=false;setLevel(.7);if(mode==='file'&&audio){setTimeout(function(){if(!playing)audio.pause()},800)}ui()}
-function next(){if(!playing){play();return}if(mode==='file'){var t=ctx.currentTime;fileBus.gain.setValueAtTime(fileBus.gain.value,t);fileBus.gain.linearRampToValueAtTime(0,t+.6);setTimeout(function(){playFile(fi+1);setLevel(1)},650)}else nextTune(1)}
-function save(){if(mode==='file'&&audio&&!isNaN(audio.currentTime))ss('fpos',{i:fi,t:audio.currentTime});else if(cur)ss('ti',ti)}
-window.addEventListener('pagehide',save);
-try{fetch('/sound/tracks').then(function(r){return r.json()}).then(function(j){if(j&&j.tracks&&j.tracks.length){FILES=j.tracks;if(!playing)mode='file';ui()}}).catch(function(){})}catch(e){}
-
-function pop(){
- if(!ctx||ctx.state!=='running')return;
- var t=ctx.currentTime,o=ctx.createOscillator(),g=ctx.createGain(),f=480+Math.random()*320;
- o.frequency.setValueAtTime(f*2,t);o.frequency.exponentialRampToValueAtTime(f*.55,t+.07);
- g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(.55,t+.004);g.gain.exponentialRampToValueAtTime(.0001,t+.11);
- o.connect(g);g.connect(popBus);o.start(t);o.stop(t+.13);
-}
-function mediaPlaying(){var m=document.querySelectorAll('video,audio');for(var i=0;i<m.length;i++){if(!m[i].paused&&!m[i].ended&&!m[i].muted&&m[i].volume>0)return true}return false}
-function recheck(){var d=mediaPlaying()?0:1;if(d!==duck){duck=d;setLevel(1.2)}}
-['play','playing','pause','ended','volumechange'].forEach(function(ev){document.addEventListener(ev,function(){setTimeout(recheck,50)},true)});
-function unlock(){
- init();if(!ctx)return;var p=ctx.resume();
- if(!started){started=true;hint();if(st.music)play()}
- if(p&&p.then)p.then(function(){if(ctx.state==='running')['pointerdown','touchend','click','keydown'].forEach(function(ev){document.removeEventListener(ev,unlock,true)})});
-}
-['pointerdown','touchend','click','keydown'].forEach(function(ev){document.addEventListener(ev,unlock,true)});
-var SEL='a,button,[role=button],summary,label,input[type=submit],input[type=button],input[type=checkbox],input[type=radio],select,[onclick]';
-document.addEventListener('pointerdown',function(e){if(!st.pops)return;var el=e.target&&e.target.closest?e.target.closest(SEL):null;if(!el)return;init();if(ctx&&ctx.state!=='running')ctx.resume();pop()},true);
-
-var css='#sebbi-snd{position:fixed;right:12px;top:calc(104px + env(safe-area-inset-top,0px));z-index:2147483000;width:36px;height:36px;border-radius:50%;'+
-'background:rgba(10,15,30,.9);border:1.5px solid #8fd0ff;box-shadow:0 0 16px rgba(143,208,255,.35);display:flex;align-items:flex-end;justify-content:center;gap:3px;padding:0 0 10px;box-sizing:border-box;cursor:pointer;-webkit-tap-highlight-color:transparent}'+
-'#sebbi-snd i{display:block;width:3px;background:#8fd0ff;border-radius:2px;height:5px;transition:height .3s}'+
-'#sebbi-snd.on i{animation:sbsnd 1.1s ease-in-out infinite}#sebbi-snd.on i:nth-child(2){animation-delay:-.4s}#sebbi-snd.on i:nth-child(3){animation-delay:-.75s}'+
-'#sebbi-snd.off{border-color:rgba(255,255,255,.3);box-shadow:none}#sebbi-snd.off i{background:rgba(255,255,255,.45);height:3px}'+
-'@keyframes sbsnd{0%,100%{height:4px}50%{height:15px}}'+
-'#sebbi-sndhint{position:fixed;right:54px;top:calc(111px + env(safe-area-inset-top,0px));z-index:2147483000;font:600 10.5px/1 "IBM Plex Mono",monospace;color:#8fd0ff;background:rgba(10,15,30,.85);padding:6px 9px;border-radius:999px;transition:opacity .6s;pointer-events:none}'+
-'#sebbi-sndp{position:fixed;right:12px;top:calc(148px + env(safe-area-inset-top,0px));z-index:2147483001;width:232px;background:rgba(10,15,30,.96);color:#fff;border:1px solid rgba(143,208,255,.45);border-radius:14px;padding:12px 14px;box-shadow:0 10px 30px rgba(0,0,0,.45);font:500 12px/1.4 "IBM Plex Mono",monospace;display:none;box-sizing:border-box}'+
-'#sebbi-sndp .l{font-size:9.5px;letter-spacing:.14em;color:#8fd0ff;opacity:.8}#sebbi-sndp .n{font-size:14px;font-weight:700;margin:3px 0 10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}'+
-'#sebbi-sndp .r{display:flex;gap:8px;align-items:center;margin-bottom:10px}'+
-'#sebbi-sndp button{flex:1;background:transparent;color:#fff;border:1px solid rgba(255,255,255,.3);border-radius:999px;padding:7px 0;font:600 12px "IBM Plex Mono",monospace;cursor:pointer}'+
-'#sebbi-sndp input[type=range]{flex:1;accent-color:#8fd0ff}#sebbi-sndp label{display:flex;gap:8px;align-items:center;cursor:pointer;font-size:11.5px}#sebbi-sndp input[type=checkbox]{accent-color:#8fd0ff}'+
-'#sebbi-sndp .f{margin-top:9px;font-size:9.5px;opacity:.55}';
-var btn,panel,hintEl,nameEl,ppBtn,foot;
-function build(){
- var s=document.createElement('style');s.textContent=css;document.head.appendChild(s);
- btn=document.createElement('div');btn.id='sebbi-snd';btn.setAttribute('role','button');btn.setAttribute('aria-label','Music');btn.innerHTML='<i></i><i></i><i></i>';
- panel=document.createElement('div');panel.id='sebbi-sndp';
- panel.innerHTML='<div class="l">NOW PLAYING</div><div class="n" id="sebbi-sndn">&nbsp;</div>'+
- '<div class="r"><button type="button" id="sebbi-sndpp">Play</button><button type="button" id="sebbi-sndnx">Next &#9654;&#9654;</button></div>'+
- '<div class="r"><span>&#128264;</span><input type="range" min="0" max="100" id="sebbi-sndv"><span>&#128266;</span></div>'+
- '<label><input type="checkbox" id="sebbi-sndpo"> Button pops</label><div class="f" id="sebbi-sndf">Original music by sebbi.pro</div>';
- document.body.appendChild(btn);document.body.appendChild(panel);
- nameEl=panel.querySelector('#sebbi-sndn');ppBtn=panel.querySelector('#sebbi-sndpp');foot=panel.querySelector('#sebbi-sndf');
- var v=panel.querySelector('#sebbi-sndv'),po=panel.querySelector('#sebbi-sndpo');v.value=Math.round(st.vol*100);po.checked=!!st.pops;
- btn.addEventListener('click',function(e){e.stopPropagation();panel.style.display=panel.style.display==='block'?'none':'block'});
- ppBtn.addEventListener('click',function(){if(playing){pause();st.music=false}else{play();st.music=true}ls('music',st.music)});
- panel.querySelector('#sebbi-sndnx').addEventListener('click',function(){st.music=true;ls('music',true);next()});
- v.addEventListener('input',function(){st.vol=v.value/100;ls('vol',st.vol);setLevel(.2)});
- po.addEventListener('change',function(){st.pops=po.checked;ls('pops',st.pops)});
- document.addEventListener('click',function(e){if(panel.style.display==='block'&&!panel.contains(e.target)&&!btn.contains(e.target))panel.style.display='none'});
- if(st.music){hintEl=document.createElement('div');hintEl.id='sebbi-sndhint';hintEl.textContent='♪ tap anywhere for music';document.body.appendChild(hintEl);setTimeout(hint,5000)}
- ui();
-}
-function hint(){if(hintEl){hintEl.style.opacity='0';var h=hintEl;hintEl=null;setTimeout(function(){h.remove()},700)}}
-function ui(){if(!btn)return;btn.className=playing?'on':'off';ppBtn.textContent=playing?'Pause':'Play';
- nameEl.textContent=curName||(mode==='file'&&FILES?FILES[sg('fi',0)%FILES.length].name:(TUNES[sg('ti',0)]||TUNES[0]).name);
- foot.textContent=mode==='file'?'sebbi.pro radio':'Original music by sebbi.pro'}
-if(document.body)build();else document.addEventListener('DOMContentLoaded',build);
-})();
-""".strip().encode("utf-8")
-
-_patched = False
-_wrapper = [None]
-_rewraps = [0]
-
-
-def _find_handler_class(ctx):
-    if isinstance(ctx, dict):
-        for k in ("handler_class", "handler", "Handler", "h", "request_handler"):
-            v = ctx.get(k)
-            if v is None:
-                continue
-            cls = v if isinstance(v, type) else type(v)
-            if hasattr(cls, "do_GET"):
-                return cls
-    f = sys._getframe()
-    while f is not None:
-        s = f.f_locals.get("self")
-        if s is not None and hasattr(type(s), "do_GET") and hasattr(s, "wfile"):
-            return type(s)
-        f = f.f_back
-    return None
-
-
-def _tracks():
-    try:
-        names = sorted(os.listdir(MUSIC_DIR))
-    except Exception:
-        return []
-    out = []
-    for f in names:
-        ext = os.path.splitext(f)[1].lower()
-        if f.startswith(".") or ext not in AUDIO_TYPES:
-            continue
-        title = re.sub(r"[_\-]+", " ", os.path.splitext(f)[0]).strip()
-        title = re.sub(r"^\d+\s+", "", title) or f
-        out.append({"name": title[:60], "url": "/sound/track/" + quote(f)})
-    return out
-
-
-def _is_page(path):
-    if path.startswith(SKIP_PREFIX):
-        return False
-    last = path.rsplit("/", 1)[-1]
-    return "." not in last or last.endswith((".html", ".htm"))
-
-
-def _inject(raw):
-    """Return modified response bytes, or None to send the original."""
-    head, sep, body = raw.partition(b"\r\n\r\n")
-    if not sep:
-        return None
-    lines = head.split(b"\r\n")
-    if not lines or b" 200" not in lines[0]:
-        return None
-    lower = head.lower()
-    if b"text/html" not in lower or b"content-encoding" in lower or b"chunked" in lower:
-        return None
-    if MARK in body:
-        return None
-    at = body.rfind(b"</body>")
-    if at < 0:
-        at = body.rfind(b"</BODY>")
-    if at < 0:
-        return None
-    new_body = body[:at] + TAG + body[at:]
-    out = []
-    for ln in lines:
-        if ln.lower().startswith(b"content-length:"):
-            ln = b"Content-Length: " + str(len(new_body)).encode()
-        out.append(ln)
-    return b"\r\n".join(out) + b"\r\n\r\n" + new_body
-
-
-def _send(h, status, ctype, body, cache="no-store"):
-    h.send_response(status)
-    h.send_header("Content-Type", ctype)
-    h.send_header("Content-Length", str(len(body)))
-    h.send_header("Cache-Control", cache)
-    h.end_headers()
-    h.wfile.write(body)
-
-
-def _send_track(h, name):
-    name = unquote(name)
-    ext = os.path.splitext(name)[1].lower()
-    path = os.path.join(MUSIC_DIR, name)
-    if ("/" in name or "\\" in name or name.startswith(".") or ext not in AUDIO_TYPES
-            or not os.path.isfile(path)):
-        return _send(h, 404, "application/json", b'{"error":"not found"}')
-    size = os.path.getsize(path)
-    start, end, status = 0, size - 1, 200
-    m = re.match(r"bytes=(\d*)-(\d*)$", (h.headers.get("Range") or "").strip())
-    if m and (m.group(1) or m.group(2)):
-        if m.group(1):
-            start = int(m.group(1))
-            end = int(m.group(2)) if m.group(2) else size - 1
-        else:
-            start = max(0, size - int(m.group(2)))
-        end = min(end, size - 1)
-        if start > end:
-            h.send_response(416)
-            h.send_header("Content-Range", "bytes */%d" % size)
-            h.send_header("Content-Length", "0")
-            h.end_headers()
-            return
-        status = 206
-    h.send_response(status)
-    h.send_header("Content-Type", AUDIO_TYPES[ext])
-    h.send_header("Content-Length", str(end - start + 1))
-    h.send_header("Accept-Ranges", "bytes")
-    h.send_header("Cache-Control", "public, max-age=86400")
-    if status == 206:
-        h.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
-    h.end_headers()
-    try:
-        with open(path, "rb") as f:
-            f.seek(start)
-            left = end - start + 1
-            while left > 0:
-                chunk = f.read(min(65536, left))
-                if not chunk:
-                    break
-                h.wfile.write(chunk)
-                left -= len(chunk)
-    except (BrokenPipeError, ConnectionResetError):
-        pass
-
-
-def _wrap(cls):
-    original_do_GET = cls.do_GET
-
-    def do_GET(self):
-        # Stay the outermost page hook even if another module is armed after
-        # this one, so every page gets the music whatever order things are armed in.
-        c = type(self)
-        if c.do_GET is not _wrapper[0] and _rewraps[0] < 20:
-            _rewraps[0] += 1
-            _wrap(c)
-        path = self.path.split("?")[0]
-        if path == "/sound.js":
-            return _send(self, 200, "application/javascript; charset=utf-8", JS, "public, max-age=86400")
-        if path == "/sound/tracks":
-            return _send(self, 200, "application/json", json.dumps({"tracks": _tracks()}).encode("utf-8"))
-        if path.startswith("/sound/track/"):
-            return _send_track(self, path[len("/sound/track/"):])
-        if not _is_page(path):
-            return original_do_GET(self)
-        real = self.wfile
-        buf = io.BytesIO()
-        self.wfile = buf
-        try:
-            original_do_GET(self)
-            if getattr(self, "_headers_buffer", None):
-                self.flush_headers()
-        finally:
-            self.wfile = real
-        raw = buf.getvalue()
-        try:
-            changed = _inject(raw)
-        except Exception:
-            changed = None
-        real.write(changed if changed is not None else raw)
-
-    cls.do_GET = do_GET
-    _wrapper[0] = do_GET
-
-
-def _install(ctx):
-    global _patched
-    if _patched:
-        return True
-    cls = _find_handler_class(ctx)
-    if cls is None:
-        return False
-    if getattr(cls, "_sound_patched", False):
-        _patched = True
-        return True
-    _wrap(cls)
-    cls._sound_patched = True
-    _patched = True
-    return True
-
-
-def handle(method, action, data, api_key, ctx):
-    armed = _install(ctx)
-    tracks = _tracks()
-    return ({"module": "sound", "version": VERSION, "armed": armed,
-             "playing": ("your %d tracks from modules/music/" % len(tracks)) if tracks
-                        else "built-in music: 20 original electro/rave tunes, each a different style",
-             "tracks": [t["name"] for t in tracks],
-             "adds": "Music on every page, a pop on every button press, and a small music button under MY EARNINGS "
-                     "with play/pause, next, volume and pops on/off",
-             "starts": "on the visitor's first tap (browsers do not allow sound before that)",
-             "fades_for_video": True}, 200)
-
-```
-
-
-## `modules/spec.py`
-
-121 lines, 5086 bytes
-
-```python
-"""
-Live API specification - /x/spec
-
-/api/spec is a hardcoded constant. It describes the API as it was when
-somebody last remembered to update it, which is a documentation problem
-pretending to be a feature.
-
-This discovers what is actually loaded, right now, by reading the modules
-directory and each module's own docstring. Add a module and the spec
-updates itself. Delete one and it disappears. There is no separate list to
-maintain and therefore no list that can drift.
-
-That matters here more than it would elsewhere: a platform whose pitch is
-"check it, don't trust it" should not ship a self-description that is
-quietly out of date.
-
-    GET /x/spec           everything currently live
-    GET /x/spec/modules   just the module list
-"""
-
-import importlib, os, pkgutil, re
-
-VERSION = "1.0"
-
-_EP = re.compile(r"^\s*(GET|POST|PUT|DELETE)\s+(/\S+)\s*(.*)$")
-
-
-def _describe(name):
-    """Pull a module's summary and endpoint list out of its own docstring."""
-    try:
-        m = importlib.import_module("modules." + name)
-    except Exception as e:
-        return {"module": name, "loaded": False, "error": str(e)}
-    doc = (m.__doc__ or "").strip()
-    lines = doc.splitlines()
-    summary = ""
-    for ln in lines:
-        t = ln.strip()
-        if t and not t.startswith("-") and not _EP.match(ln):
-            summary = t
-            break
-    endpoints = []
-    for ln in lines:
-        mm = _EP.match(ln)
-        if mm:
-            endpoints.append({"method": mm.group(1),
-                              "path": mm.group(2),
-                              "takes": mm.group(3).strip() or None})
-    out = {"module": name, "loaded": True, "summary": summary,
-           "endpoints": endpoints,
-           "version": getattr(m, "VERSION", None)}
-    if not hasattr(m, "handle"):
-        out["warning"] = "module has no handle() - it will not route"
-    return out
-
-
-def _modules():
-    d = os.path.dirname(__file__)
-    names = sorted(x.name for x in pkgutil.iter_modules([d])
-                   if x.name not in ("router", "spec"))
-    return [_describe(n) for n in names]
-
-
-def handle(method, action, data, api_key, ctx):
-    if method != "GET":
-        return {"error": "unknown_action", "action": action}, 404
-
-    mods = _modules()
-
-    if action == "modules":
-        return {"count": len(mods), "modules": mods}, 200
-
-    if action in ("", "all"):
-        return {
-            "spec_version": VERSION,
-            "generated": "live - discovered at request time, not a stored list",
-            "core": {
-                "decision_engine": {
-                    "path": "/api/govern",
-                    "method": "POST",
-                    "auth": "Bearer key",
-                    "note": "deterministic scoring, verdict sealed before the response returns"
-                },
-                "notaries_public": [
-                    {"method": "POST", "path": "/api/post/seal", "auth": "none"},
-                    {"method": "GET", "path": "/api/verify-post", "auth": "none"},
-                    {"method": "POST", "path": "/api/identity/seal", "auth": "none"},
-                    {"method": "GET", "path": "/api/identity/check", "auth": "none"},
-                    {"method": "POST", "path": "/api/payment/seal", "auth": "none"},
-                    {"method": "GET", "path": "/api/payment/check", "auth": "none"}
-                ],
-                "verification_public": [
-                    {"method": "GET", "path": "/api/verify-chain",
-                     "returns": "whole-chain integrity, recomputed"},
-                    {"method": "GET", "path": "/api/inclusion",
-                     "returns": "whether a given 64-char hash is sealed"},
-                    {"method": "GET", "path": "/api/anchor-status",
-                     "returns": "current tip, OpenTimestamps proof, calendar count"},
-                    {"method": "GET", "path": "/api/regulation-map",
-                     "returns": "engine features mapped to legal obligations"}
-                ]
-            },
-            "modules": {
-                "prefix": "/x/<module>/<action>",
-                "auth": "Bearer key on every module route",
-                "count": len(mods),
-                "loaded": mods
-            },
-            "chain": {
-                "algorithm": "SHA-256 hash chain",
-                "scope": "one chain - every module seals into the same sequence as /api/govern",
-                "anchoring": "chain tip submitted to OpenTimestamps, aggregated into a Merkle root, root committed to Bitcoin by several independent calendars",
-                "receipts": "gapless per-key sequence issued in the same transaction as the chain write",
-                "verify": "/api/verify-chain and /api/anchor-status, both without a key"
-            },
-            "honest_note": "This spec is generated by reading the modules directory at request time rather than from a stored list, so it cannot describe capabilities that are not actually loaded."
-        }, 200
-
-    return {"error": "unknown_action", "action": action,
-            "available": ["", "modules"]}, 404
-
-```
-
-
-## `modules/standard.py`
-
-422 lines, 19423 bytes
-
-```python
-"""
-modules/standard.py  -  the Ordering Test discovery document for this domain
-
-WHAT IT SERVES
---------------
-  GET /.well-known/ordering-test.json   this operator's discovery document
-  GET /x/standard/hash                  sha256 of that document
-  GET /x/standard/status                what is installed, and honest counts
-
-SHAPE
------
-Deliberately identical to the shape Red Flag AI Pro published first:
-
-    checks: { <name>: { supported, demonstrable_publicly, endpoint, note } }
-
-Two fields, not one, and the second is the better idea. "We built it" and
-"you can verify it without an account" are different claims, and most of this
-market blurs them. Separating them lets a vendor be honest about having
-something real that an outsider still has to take on trust.
-
-WHAT THE HOST HEADER IS DOING HERE
-----------------------------------
-base_url is derived from the request rather than written into the file. An
-earlier draft had the domain hardcoded, which meant any operator running it
-would publish somebody else's domain as the source - the opposite of a mirror.
-Deriving it means this file can be lifted to any domain and tells the truth
-about wherever it is actually running.
-
-EVERY PUBLISHED ENDPOINT MUST WORK AS WRITTEN
----------------------------------------------
-An endpoint marked demonstrable_publicly is a promise that a stranger can copy
-it out of this document and get an answer. If the route needs a parameter, the
-document names that parameter. If a value has to be discovered first, the
-document says where to discover it. An endpoint that errors when followed
-literally is a failed check, not a documentation detail.
-
-HONESTY RULES THIS FILE FOLLOWS
--------------------------------
-  - A check we have not built says supported: false. It does not quietly go
-    missing from the document.
-  - A check that exists but needs an account says demonstrable_publicly:
-    false, however much we would like the tick.
-  - runner is null. A runner exists in draft, but the checks have not been
-    jointly agreed with the other mirror, so publishing one as though it were
-    a settled standard would claim something neither operator has earned yet.
-
-None of that is modesty. A conformance document whose author scores full marks
-on the day they publish it is a marketing page.
-"""
-
-import hashlib
-import json
-import sys
-
-VERSION = "1.2"
-ORDERING_TEST_VERSION = "0.1"
-
-PUBLIC = {("GET", "status"), ("GET", "hash"), ("GET", "spec"),
-          ("GET", "document")}
-
-# Several paths on purpose. /.well-known/ is where the standard says to look,
-# but some platforms and static handlers reserve that prefix, so a plain root
-# path is served as well. /x/standard/document goes through the normal router
-# and cannot be intercepted by anything, which makes it the diagnostic.
-DISCOVERY_PATHS = ("/.well-known/ordering-test.json",
-                   "/ordering-test.json",
-                   "/well-known/ordering-test.json")
-
-VENDOR = "AILeash"
-FALLBACK_BASE = "https://sebbi.pro"
-
-RUNNER = None
-RUNNER_NOTE = (
-    "No shared runner file is published here yet. The checks themselves have "
-    "not been jointly agreed with the other mirrors as of this document's "
-    "publication. This describes AILeash's own side only, not a settled "
-    "cross-vendor standard.")
-
-# Order follows the other mirror's document so the two read side by side.
-CHECKS = {
-    "rule_binding": {
-        "supported": True,
-        "demonstrable_publicly": True,
-        "endpoint": "/x/rulebind/prove",
-        "note": ("The ruleset version is a component of a digest sealed with the "
-                 "decision, not a field beside it. POST any inputs without an "
-                 "account and the response returns the exact string that was "
-                 "hashed - SHA-256 it yourself and confirm it matches. Alter the "
-                 "ruleset hash and the digest stops recomputing; alter the digest "
-                 "and the chain breaks. Verify a past record at "
-                 "/x/rulebind/verify?receipt=... and see ruleset history at "
-                 "/x/rulebind/packs. No scoring logic is disclosed at any point - "
-                 "inputs are published as a digest, never as values."),
-    },
-    "commit_before_reveal": {
-        "supported": True,
-        "demonstrable_publicly": True,
-        "endpoint": "/x/demo/review",
-        "note": ("The reviewer receives the case with the machine verdict "
-                 "withheld. Their own call and dwell time are sealed first, "
-                 "then the verdict is revealed, and the chain fixes that order "
-                 "permanently. No account needed - open a case, commit a "
-                 "verdict, and check the block indices yourself. Commit "
-                 "endpoint is /x/demo/commit."),
-    },
-    "authority_tokens": {
-        "supported": True,
-        "demonstrable_publicly": True,
-        "endpoint": "/x/continuity/decisions",
-        "note": ("Authority is derived, not looked up. Every grant points at a "
-                 "parent and terminates at a human principal; scope, limits, "
-                 "purpose and validity must narrow at every hop; and the whole "
-                 "chain is re-derived at the instant of execution rather than "
-                 "trusted from the instant of issue. A decision beyond delegated "
-                 "authority escalates rather than executes. Issuing and exercising "
-                 "authority are keyed, but the record is not: /x/continuity/decisions "
-                 "lists real sealed evaluations without an account, and any id from "
-                 "it opens at /x/continuity/decision and /x/continuity/trace, which "
-                 "returns the full authority path with the grant and invariant that "
-                 "broke. Blocks are listed alongside allows, because a refusal with "
-                 "no public record is indistinguishable from never having been asked. "
-                 "An empty list means no authority has been exercised yet, not that "
-                 "none failed. Derivation rules at /x/continuity/spec."),
-    },
-    "mutual_witnessing": {
-        "supported": True,
-        "demonstrable_publicly": True,
-        "endpoint": "/x/witness/peers",
-        "note": ("Live, running both directions with an external peer chain "
-                 "hourly since 1 August 2026. No account needed, run it "
-                 "yourself. Our current tip is at /x/witness/tip and any party "
-                 "can submit theirs at /x/witness/observe without an account."),
-    },
-    "completeness_proof": {
-        "supported": True,
-        "demonstrable_publicly": True,
-        "endpoint": "/x/complete/root?period={period}&kind=receipts",
-        "note": ("Per-period sorted Merkle root and exact leaf count, committed "
-                 "before any export is requested. An export can then be checked "
-                 "against a number fixed before anyone knew it would be asked "
-                 "for. Committed periods are listed at /x/complete/periods - "
-                 "take a period identifier from there and substitute it. Only "
-                 "closed periods can be committed, so the current period will "
-                 "not appear until it ends. A period listed nowhere is a period "
-                 "nobody committed, which is itself the finding."),
-    },
-    "absence_proof": {
-        "supported": True,
-        "demonstrable_publicly": True,
-        "endpoint": "/x/complete/prove?period={period}&value={value}",
-        "note": ("Two adjacent leaves with consecutive indices demonstrate that "
-                 "nothing sits between them, so absence is proved rather than "
-                 "asserted. Both parameters are required: take a period from "
-                 "/x/complete/periods and supply any value you like. Try a "
-                 "value that is not there."),
-    },
-    "reconciliation": {
-        "supported": True,
-        "demonstrable_publicly": True,
-        "endpoint": "/x/reconcile/public",
-        "note": ("The sample is derived from the chain tip and sealed BEFORE any "
-                 "data is requested, so the operator cannot choose which records "
-                 "get examined or prepare only the flattering ones. Planning and "
-                 "submitting are keyed because they touch an operator's own "
-                 "records, but the part that decides whether any of it means "
-                 "anything is not: /x/reconcile/public gives run counts, match "
-                 "rates and mismatches without an account, and "
-                 "/x/reconcile/proof?id=RUN-XXXXXXXX shows the two sealed block "
-                 "indices so anyone can confirm the selection block precedes the "
-                 "result block. Abandoned runs are published too - a plan is "
-                 "sealed when it is planned, so a test that came back badly and "
-                 "was dropped stays visible forever as a plan with no result. "
-                 "What this does not prove: that the records are true. Two "
-                 "systems the operator controls agreeing with each other is "
-                 "consistency, not truth."),
-    },
-    "reproducibility": {
-        "supported": True,
-        "demonstrable_publicly": True,
-        "endpoint": "/x/replay/challenge",
-        "note": ("Determinism proved by public challenge without disclosing any "
-                 "scoring logic. Submit inputs, the run is sealed, resubmit the "
-                 "same inputs later and the verdict must be identical under an "
-                 "unchanged code fingerprint at /x/replay/fingerprint."),
-    },
-    "consistency_proof": {
-        "supported": True,
-        "demonstrable_publicly": True,
-        "endpoint": "/x/consistency/proof?first={first}&second={second}",
-        "note": ("RFC 6962 consistency proofs, deliberately unmodified so "
-                 "existing Certificate Transparency verifiers work against them "
-                 "directly. first and second are tree sizes - read the current "
-                 "size from /x/consistency/root and pick any earlier one. "
-                 "Anyone holding any earlier tip we served can show it is a "
-                 "prefix of the current log at /x/consistency/ancestor."),
-    },
-
-    # ---- proposed addition, flagged as a proposal rather than assumed ----
-    "external_anchoring": {
-        "supported": True,
-        "demonstrable_publicly": True,
-        "endpoint": "/api/anchor-status",
-        "note": ("PROPOSED AS A SEPARATE CHECK, not settled. The other mirror "
-                 "currently folds anchoring into consistency_proof, but they "
-                 "answer different questions: consistency shows the log only "
-                 "ever grew, anchoring shows the time was fixed somewhere the "
-                 "operator cannot reach. A log can be perfectly append-only and "
-                 "still have been built last week. Here the tip is submitted to "
-                 "OpenTimestamps and committed into Bitcoin; the other mirror "
-                 "uses an RFC 3161 timestamp. The spec should permit any "
-                 "external authority the operator does not control and require "
-                 "it to be named - not mandate one. Offered for the joint "
-                 "session."),
-    },
-}
-
-DOCUMENT_NOTE = (
-    "Every endpoint marked demonstrable_publicly is unauthenticated by design - "
-    "run it yourself without asking us. Where an endpoint carries a {parameter}, "
-    "the note for that check says where to get a valid value; every published "
-    "endpoint is meant to work when followed literally, and one that does not is "
-    "a failed check on our side, not a quibble. Checks marked supported but not "
-    "demonstrable_publicly are real and built, but currently need a key to see, "
-    "and say so plainly rather than passing on the day this was published. "
-    "Nothing here proves the records are true. It describes the order things "
-    "were committed in, which is a narrower claim and the only one that holds.")
-
-_patched = [False]
-
-
-def _base_from(handler):
-    """Derive our own base URL from the request. An operator running this file
-    on their own domain publishes their domain, not whoever wrote it."""
-    try:
-        host = handler.headers.get("X-Forwarded-Host") or handler.headers.get("Host")
-        if not host:
-            return FALLBACK_BASE
-        host = host.split(",")[0].strip()[:200]
-        proto = (handler.headers.get("X-Forwarded-Proto") or "https").split(",")[0].strip()
-        if proto not in ("http", "https"):
-            proto = "https"
-        return proto + "://" + host
-    except Exception:
-        return FALLBACK_BASE
-
-
-def _base_from_ctx(ctx):
-    """Same derivation for the routed /x/standard/document call.
-
-    The router's ctx may or may not carry the request handler. If it does, the
-    document served through the router names the same domain as the one served
-    at /.well-known/ - which matters on a mirror, where hardcoding would make
-    this file publish somebody else's domain again."""
-    try:
-        if isinstance(ctx, dict):
-            for key in ("handler", "h", "request", "req", "self"):
-                obj = ctx.get(key)
-                if obj is not None and hasattr(obj, "headers"):
-                    return _base_from(obj)
-            headers = ctx.get("headers")
-            if headers is not None:
-                class _Shim(object):
-                    pass
-                shim = _Shim()
-                shim.headers = headers
-                return _base_from(shim)
-        elif ctx is not None and hasattr(ctx, "headers"):
-            return _base_from(ctx)
-    except Exception:
-        pass
-    return FALLBACK_BASE
-
-
-def _document(base):
-    checks = {}
-    for name, c in CHECKS.items():
-        checks[name] = {
-            "supported": c["supported"],
-            "demonstrable_publicly": c["demonstrable_publicly"],
-            "endpoint": c["endpoint"],
-            "note": c["note"],
-        }
-    return {
-        "ordering_test_version": ORDERING_TEST_VERSION,
-        "vendor": VENDOR,
-        "base_url": base,
-        "runner": RUNNER,
-        "runner_note": RUNNER_NOTE,
-        "checks": checks,
-        "witness_peers": base + "/x/witness/peers",
-        "witness_tip": base + "/x/witness/tip",
-        "committed_periods": base + "/x/complete/periods",
-        "note": DOCUMENT_NOTE,
-    }
-
-
-def _digest(doc):
-    return hashlib.sha256(
-        json.dumps(doc, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-
-
-def _srv():
-    m = sys.modules.get("__main__")
-    if hasattr(m, "get_bearer"):
-        return m
-    return sys.modules.get("server")
-
-
-def _install(s):
-    if _patched[0]:
-        return "already installed"
-    H = getattr(s, "Handler", None)
-    if H is None or not hasattr(H, "do_GET"):
-        return "no handler"
-    if getattr(H, "_standard_patched", False):
-        _patched[0] = True
-        return "already installed"
-
-    original = H.do_GET
-
-    def do_GET(self):
-        try:
-            from urllib.parse import urlparse
-            p = urlparse(self.path).path.rstrip("/") or "/"
-        except Exception:
-            p = self.path or "/"
-
-        if p in DISCOVERY_PATHS:
-            body = json.dumps(_document(_base_from(self)), indent=2).encode("utf-8")
-            try:
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Cache-Control", "public, max-age=300")
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.send_header("X-Content-Type-Options", "nosniff")
-                self.end_headers()
-                self.wfile.write(body)
-            except Exception:
-                pass
-            return
-
-        return original(self)
-
-    H.do_GET = do_GET
-    H._standard_patched = True
-    _patched[0] = True
-    print("STANDARD: /.well-known/ordering-test.json installed", flush=True)
-    return "installed"
-
-
-def handle(method, action, data, api_key, ctx):
-    s = _srv()
-    if s is None:
-        return {"error": "server_not_found"}, 500
-
-    state = "already installed" if _patched[0] else None
-    if not _patched[0]:
-        try:
-            state = _install(s)
-        except Exception as exc:
-            print("STANDARD: patch failed - " + str(exc), flush=True)
-            state = "failed: " + str(exc)
-
-    action = (action or "").strip("/").lower()
-    base = _base_from_ctx(ctx)
-    doc = _document(base)
-
-    if method == "GET" and action == "document":
-        return doc, 200
-
-    if method == "GET" and action == "hash":
-        canonical = _document(FALLBACK_BASE)
-        return {
-            "sha256": _digest(canonical),
-            "of": "this operator's discovery document",
-            "canonicalisation": ("JSON, keys sorted, no whitespace, UTF-8, "
-                                 "base_url fixed to " + FALLBACK_BASE +
-                                 " so the digest does not move with the "
-                                 "requesting host"),
-            "what_this_is_for": (
-                "Confirming our own document has not changed. It is NOT the "
-                "cross-mirror check - two operators publish different documents "
-                "by design, because they list different endpoints, so their "
-                "digests should differ and a mismatch would prove nothing. The "
-                "cross-mirror comparison only means something once every mirror "
-                "serves a byte-identical runner file and hashes that instead. "
-                "No runner is agreed yet."),
-            "document": canonical,
-        }, 200
-
-    if method == "GET" and action in ("", "status", "spec"):
-        supported = [k for k, c in CHECKS.items() if c["supported"]]
-        public = [k for k, c in CHECKS.items() if c["demonstrable_publicly"]]
-        parameterised = [k for k, c in CHECKS.items()
-                         if c["endpoint"] and "{" in c["endpoint"]]
-        return {
-            "installed": bool(_patched[0]),
-            "install_result": state,
-            "module_version": VERSION,
-            "ordering_test_version": ORDERING_TEST_VERSION,
-            "serving": list(DISCOVERY_PATHS),
-            "always_available": "/x/standard/document",
-            "checks_total": len(CHECKS),
-            "checks_supported": len(supported),
-            "checks_publicly_demonstrable": len(public),
-            "publicly_demonstrable": public,
-            "supported_but_not_public": [k for k in supported if k not in public],
-            "endpoints_needing_a_parameter": parameterised,
-            "runner": RUNNER,
-            "note": ("base_url is derived from the Host header, so this file "
-                     "publishes whichever domain is actually serving it. Checks "
-                     "listed under endpoints_needing_a_parameter cannot be "
-                     "demonstrated until a real value exists to substitute - "
-                     "for the completeness and absence checks that means at "
-                     "least one committed period at /x/complete/periods."),
-        }, 200
-
-    return {"error": "unknown_action", "action": action,
-            "GET": ["status", "hash", "document"]}, 404
 
 ```
