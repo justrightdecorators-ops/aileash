@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-161 files across 43 parts.
+160 files across 43 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -98,7 +98,6 @@ Generated automatically on every push. Do not edit by hand.
 ## [CODEBASE-15.md](CODEBASE-15.md)
 
 - `modules/packs.py`
-- `modules/passport.py`
 
 ## [CODEBASE-16.md](CODEBASE-16.md)
 
